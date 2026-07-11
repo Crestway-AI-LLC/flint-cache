@@ -401,7 +401,7 @@ impl<'a> Dispatcher<'a> {
         let withscores = match args.len() {
             4 => false,
             5 if args[4].eq_ignore_ascii_case(b"WITHSCORES") => true,
-            4..=5 => return err("ERR syntax error"),
+            5 => return err("ERR syntax error"),
             _ => return arity_err("zrange"),
         };
         match (parse_i64(&args[2]), parse_i64(&args[3])) {

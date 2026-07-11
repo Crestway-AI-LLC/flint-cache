@@ -7,8 +7,8 @@
 
 use crate::Kv;
 use crate::encoding::{
-    Cf, ComplexMeta, MetaHeader, ValueType, VersionGen, decode_score, encode_score, envelope,
-    subkey_envelope, subkey_prefix, zscore_envelope, zscore_prefix,
+    Cf, ComplexMeta, MetaHeader, ValueType, VersionGen, decode_score, envelope, subkey_envelope,
+    zscore_envelope, zscore_prefix,
 };
 use crate::strings::{Clock, StoreError};
 
