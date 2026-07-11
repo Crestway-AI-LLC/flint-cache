@@ -70,7 +70,6 @@ fn main() {
         100 - cfg.read_pct,
         cfg.phase
     );
-    println!("host=macOS? numbers are non-representative — decision runs happen on EC2 NVMe\n");
 
     let _ = std::fs::remove_dir_all(&cfg.dir);
     let mut opts = Options::default();
@@ -118,8 +117,13 @@ fn main() {
     }
 }
 
-fn value(size: usize) -> Vec<u8> {
-    vec![0xA5; size]
+/// Incompressible pseudorandom value — constant-byte values compress ~15:1
+/// and let the whole dataset hide in RAM, silently invalidating any
+/// beyond-RAM read measurement.
+fn rand_value(rng: &mut SmallRng, size: usize) -> Vec<u8> {
+    let mut v = vec![0u8; size];
+    rng.fill(&mut v[..]);
+    v
 }
 
 fn key(i: u64) -> Vec<u8> {
@@ -128,10 +132,10 @@ fn key(i: u64) -> Vec<u8> {
 
 fn phase_fill(db: &Arc<DB>, cfg: &Config) {
     let started = Instant::now();
-    let val = value(cfg.value_size);
+    let mut rng = SmallRng::seed_from_u64(7);
     let mut batch = WriteBatch::default();
     for i in 0..cfg.keys {
-        batch.put(key(i), &val);
+        batch.put(key(i), rand_value(&mut rng, cfg.value_size));
         if batch.len() >= 500 {
             db.write(std::mem::take(&mut batch)).expect("fill write");
         }
@@ -168,15 +172,16 @@ fn phase_mixed(
             let mut rng = SmallRng::seed_from_u64(42 + t as u64);
             let mut reads = Histogram::<u64>::new(3).expect("hist");
             let mut writes = Histogram::<u64>::new(3).expect("hist");
-            let val = value(vsize);
             while !stop.load(Ordering::Relaxed) {
                 let k = key(rng.random_range(0..keys));
                 let is_read = rng.random_range(0..100) < read_pct;
-                let t0 = Instant::now();
                 if is_read {
+                    let t0 = Instant::now();
                     let _ = db.get(&k);
                     record(&mut reads, t0);
                 } else {
+                    let val = rand_value(&mut rng, vsize);
+                    let t0 = Instant::now();
                     db.put(&k, &val).expect("put");
                     record(&mut writes, t0);
                 }
@@ -220,11 +225,11 @@ fn phase_sync(db: &Arc<DB>, cfg: &Config) {
         workers.push(std::thread::spawn(move || {
             let mut rng = SmallRng::seed_from_u64(1042 + t as u64);
             let mut hist = Histogram::<u64>::new(3).expect("hist");
-            let val = value(vsize);
             let mut wo = WriteOptions::default();
             wo.set_sync(true);
             while !stop.load(Ordering::Relaxed) {
                 let k = key(rng.random_range(0..keys));
+                let val = rand_value(&mut rng, vsize);
                 let mut batch = WriteBatch::default();
                 batch.put(&k, &val);
                 let t0 = Instant::now();
