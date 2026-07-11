@@ -1,8 +1,86 @@
 //! flint-server: the data-plane node binary.
 //!
-//! M0 scope: single-node RESP endpoint serving strings + TTL against
-//! flint-storage. Networking lands after the codec and storage spike.
+//! v0: a blocking TCP server (thread per connection) speaking RESP2 over
+//! `MemKv`. Deliberately simple — it exists so the conformance oracle has a
+//! target from day one. The real engine (RocksDB-backed, thread-per-core)
+//! replaces the internals without changing the wire behavior; the async
+//! runtime choice is a recorded-later ADR.
 
-fn main() {
-    println!("flint-server 0.0.1 (pre-alpha; see docs/roadmap.md M0)");
+mod commands;
+
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::sync::Arc;
+
+use flint_resp::{Decoded, Value, decode, encode};
+use flint_storage::{Kv, MemKv};
+
+fn main() -> std::io::Result<()> {
+    let port = std::env::args()
+        .skip_while(|a| a != "--port")
+        .nth(1)
+        .and_then(|p| p.parse::<u16>().ok())
+        .unwrap_or(6380);
+    let store: Arc<MemKv> = Arc::new(MemKv::new());
+    let listener = TcpListener::bind(("127.0.0.1", port))?;
+    eprintln!("flint-server listening on 127.0.0.1:{port}");
+    for stream in listener.incoming() {
+        let Ok(stream) = stream else { continue };
+        let store = Arc::clone(&store);
+        std::thread::spawn(move || {
+            let _ = serve(stream, store.as_ref());
+        });
+    }
+    Ok(())
+}
+
+fn serve(mut stream: TcpStream, store: &dyn Kv) -> std::io::Result<()> {
+    let mut buf: Vec<u8> = Vec::with_capacity(16 * 1024);
+    let mut chunk = [0u8; 16 * 1024];
+    let mut out: Vec<u8> = Vec::with_capacity(4 * 1024);
+    loop {
+        // Drain every complete frame already buffered (pipelining).
+        let mut consumed = 0;
+        out.clear();
+        loop {
+            match decode(&buf[consumed..]) {
+                Ok(Decoded::Complete(frame, used)) => {
+                    consumed += used;
+                    let reply = handle_frame(store, frame);
+                    encode(&reply, &mut out);
+                }
+                Ok(Decoded::NeedMore) => break,
+                Err(_) => {
+                    // Protocol error: report and drop the connection, like Redis.
+                    encode(&Value::Error("ERR Protocol error".into()), &mut out);
+                    stream.write_all(&out)?;
+                    return Ok(());
+                }
+            }
+        }
+        if consumed > 0 {
+            buf.drain(..consumed);
+            stream.write_all(&out)?;
+        }
+        let n = stream.read(&mut chunk)?;
+        if n == 0 {
+            return Ok(()); // client closed
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+}
+
+fn handle_frame(store: &dyn Kv, frame: Value) -> Value {
+    // Commands arrive as arrays of bulk strings.
+    let Value::Array(Some(items)) = frame else {
+        return Value::Error("ERR Protocol error: expected array".into());
+    };
+    let mut args = Vec::with_capacity(items.len());
+    for item in items {
+        match item {
+            Value::Bulk(Some(bytes)) => args.push(bytes),
+            _ => return Value::Error("ERR Protocol error: expected bulk string".into()),
+        }
+    }
+    commands::dispatch(store, &args)
 }

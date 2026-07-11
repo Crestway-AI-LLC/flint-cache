@@ -1,9 +1,14 @@
 [package]
 name = "flint-server"
+description = "Flint data-plane node (v0: single-node RESP string server)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+
+[dependencies]
+flint-resp = { path = "../flint-resp" }
+flint-storage = { path = "../flint-storage" }
 
 [lints]
 workspace = true
