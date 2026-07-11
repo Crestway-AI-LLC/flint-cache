@@ -16,6 +16,9 @@
 //! arrives with the storage spike; `TypeStore` arrives with the encoding
 //! layer.
 
+#[cfg(feature = "rocksdb")]
+pub mod rocks;
+
 use std::collections::BTreeMap;
 use std::ops::Bound;
 use std::sync::RwLock;

@@ -1,0 +1,15 @@
+[package]
+name = "flint-bench"
+description = "Storage benchmark rig: p50/p99/p99.9 under steady state, compaction, checkpoint, and sync-write phases"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rocksdb = "0.24.0"
+hdrhistogram = "7"
+rand = { version = "0.9", features = ["small_rng"] }
+
+[lints]
+workspace = true
