@@ -23,9 +23,20 @@ pub struct RocksKv {
 }
 
 impl RocksKv {
+    /// Crate-internal handle for the replication module.
+    pub(crate) fn db(&self) -> &DB {
+        &self.db
+    }
+}
+
+impl RocksKv {
     pub fn open(path: &Path) -> Result<Self, rocksdb::Error> {
         let mut opts = Options::default();
         opts.create_if_missing(true);
+        // Retain WAL long enough for replicas to tail it (v0: 1h / 1GB;
+        // beyond that a replica must full-sync from a checkpoint).
+        opts.set_wal_ttl_seconds(3600);
+        opts.set_wal_size_limit_mb(1024);
         // Expired metadata rows are dropped organically as compaction
         // rewrites them (subkey orphans are reclaimed by gc::sweep until
         // the filter gains a metadata-lookup handle).

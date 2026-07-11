@@ -16,6 +16,39 @@ use flint_storage::sets::SetStore;
 use flint_storage::strings::{Clock, SetExpiry, SetOptions, SetOutcome, StoreError, StringStore};
 use flint_storage::zsets::ZSetStore;
 
+/// True for commands that mutate the keyspace (rejected on replicas).
+pub fn is_write_command(name: &[u8]) -> bool {
+    matches!(
+        name.to_ascii_uppercase().as_slice(),
+        b"SET"
+            | b"SETNX"
+            | b"SETEX"
+            | b"MSET"
+            | b"DEL"
+            | b"EXPIRE"
+            | b"PEXPIRE"
+            | b"PERSIST"
+            | b"INCR"
+            | b"DECR"
+            | b"INCRBY"
+            | b"DECRBY"
+            | b"APPEND"
+            | b"FLUSHALL"
+            | b"HSET"
+            | b"HDEL"
+            | b"HINCRBY"
+            | b"SADD"
+            | b"SREM"
+            | b"LPUSH"
+            | b"RPUSH"
+            | b"LPOP"
+            | b"RPOP"
+            | b"ZADD"
+            | b"ZREM"
+            | b"ZINCRBY"
+    )
+}
+
 /// v0 runs a single default namespace; tenancy arrives with the proxy.
 const NS: &[u8] = b"0";
 

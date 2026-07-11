@@ -26,6 +26,8 @@ pub mod strings;
 pub mod zsets;
 
 #[cfg(feature = "rocksdb")]
+pub mod repl;
+#[cfg(feature = "rocksdb")]
 pub mod rocks;
 
 use std::collections::BTreeMap;
