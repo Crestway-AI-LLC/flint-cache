@@ -84,6 +84,8 @@ fn main() -> std::io::Result<()> {
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
         let store: Arc<dyn Kv> = Arc::clone(&store);
+        // Option<Arc<RocksKv>> with the feature; Option<()> (Copy) without.
+        #[allow(clippy::clone_on_copy)]
         let rocks = rocks.clone();
         std::thread::spawn(move || {
             let _ = serve(stream, store.as_ref(), read_only, rocks);
