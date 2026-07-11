@@ -14,14 +14,15 @@ BIN="$(dirname "$0")/../target/release/flint-server"
 cleanup() {
   pkill -f "flint-server --port $MPORT" 2>/dev/null || true
   pkill -f "flint-server --port $RPORT" 2>/dev/null || true
-  rm -rf "$MDIR" "$RDIR"
+  rm -rf "$MDIR" "$RDIR" "${RLOG:-}"
 }
 trap cleanup EXIT
 
 echo "== master :$MPORT, replica :$RPORT, $KEYS keys"
 "$BIN" --port "$MPORT" --engine rocks --data-dir "$MDIR" &
 sleep 0.4
-"$BIN" --port "$RPORT" --engine rocks --data-dir "$RDIR" --replica-of "127.0.0.1:$MPORT" &
+RLOG="$(mktemp /tmp/flint-replica-log.XXXXXX)"
+"$BIN" --port "$RPORT" --engine rocks --data-dir "$RDIR" --replica-of "127.0.0.1:$MPORT" 2> "$RLOG" &
 sleep 0.6
 
 echo "== loading $KEYS strings + 500 hashes into the master"
@@ -58,6 +59,18 @@ HM=$(valkey-cli -p "$MPORT" HGET hash:0250 f1)
 HR=$(valkey-cli -p "$RPORT" HGET hash:0250 f1)
 [ "$HM" = "$HR" ] || { echo "FAIL: hash mismatch ('$HM' vs '$HR')"; exit 1; }
 echo "parity OK (strings + hashes)"
+
+echo "== full sync path used by the fresh replica"
+grep -q "full sync: received" "$RLOG" || { echo "FAIL: replica did not full-sync"; cat "$RLOG"; exit 1; }
+grep "full sync" "$RLOG" | head -2
+
+echo "== FLINTINFO"
+MINFO=$(valkey-cli -p "$MPORT" FLINTINFO)
+RINFO=$(valkey-cli -p "$RPORT" FLINTINFO)
+echo "$MINFO" | grep -q "role:master" || { echo "FAIL: master role"; exit 1; }
+echo "$MINFO" | grep -q "live_replica:1" || { echo "FAIL: master does not see live replica"; echo "$MINFO"; exit 1; }
+echo "$RINFO" | grep -q "role:replica" || { echo "FAIL: replica role"; exit 1; }
+echo "$MINFO" | tr '\r' ' '
 
 echo "== replica rejects writes"
 RO=$(valkey-cli -p "$RPORT" SET should-fail x 2>&1 || true)

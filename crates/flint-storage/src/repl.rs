@@ -120,6 +120,19 @@ impl RocksKv {
             .map_err(|e| ReplError::Storage(e.to_string()))
     }
 
+    /// The engine's newest sequence number (master-side lag reference).
+    pub fn latest_seq(&self) -> u64 {
+        self.db().latest_sequence_number()
+    }
+
+    /// Set the replica cursor directly (after a checkpoint full sync, the
+    /// copied DB's own latest sequence IS the master cursor).
+    pub fn set_last_applied(&self, seq: u64) -> Result<(), ReplError> {
+        self.db()
+            .put(REPL_STATE_KEY, seq.to_be_bytes())
+            .map_err(|e| ReplError::Storage(e.to_string()))
+    }
+
     /// Replica cursor, surviving restarts. 0 = nothing applied.
     pub fn last_applied(&self) -> u64 {
         self.db()

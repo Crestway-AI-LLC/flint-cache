@@ -57,6 +57,12 @@ impl RocksKv {
         })
     }
 
+    /// Create a RocksDB checkpoint (hard-linked consistent copy) at `path`.
+    /// The parent directory must exist; `path` itself must not.
+    pub fn checkpoint_to(&self, path: &Path) -> Result<(), rocksdb::Error> {
+        rocksdb::checkpoint::Checkpoint::new(&self.db)?.create_checkpoint(path)
+    }
+
     /// Force a full compaction (tests, admin).
     pub fn compact_all(&self) {
         self.db.compact_range(None::<&[u8]>, None::<&[u8]>);
