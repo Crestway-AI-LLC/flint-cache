@@ -11,6 +11,9 @@ use crate::encoding::{
 };
 use crate::strings::{Clock, StoreError};
 
+/// (field, value) pairs.
+pub type Pairs = Vec<(Vec<u8>, Vec<u8>)>;
+
 pub struct HashStore<'a> {
     kv: &'a dyn Kv,
     ns: Vec<u8>,
@@ -133,7 +136,7 @@ impl<'a> HashStore<'a> {
     }
 
     /// All (field, value) pairs in lexicographic field order.
-    pub fn hgetall(&self, slot: u16, key: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StoreError> {
+    pub fn hgetall(&self, slot: u16, key: &[u8]) -> Result<Pairs, StoreError> {
         let Some(meta) = self.read_meta(slot, key)? else {
             return Ok(Vec::new());
         };
