@@ -90,6 +90,139 @@ pub fn slot_prefix(cf: Cf, ns: &[u8], slot: u16) -> Vec<u8> {
     envelope(cf, ns, slot, b"")
 }
 
+/// The header every metadata row starts with, regardless of type:
+/// `flags(1B) | expire_ms(8B BE)`. Generic keyspace ops (DEL, EXISTS, TYPE,
+/// EXPIRE/TTL/PERSIST) parse only this header and work on any value type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetaHeader {
+    pub flags: u8,
+    pub expire_ms: u64,
+}
+
+pub const HEADER_LEN: usize = 9;
+
+impl MetaHeader {
+    pub fn decode(row: &[u8]) -> Option<Self> {
+        if row.len() < HEADER_LEN {
+            return None;
+        }
+        Some(Self {
+            flags: row[0],
+            expire_ms: u64::from_be_bytes(row[1..9].try_into().ok()?),
+        })
+    }
+
+    pub fn encode_into(&self, out: &mut Vec<u8>) {
+        out.push(self.flags);
+        out.extend_from_slice(&self.expire_ms.to_be_bytes());
+    }
+
+    pub fn write_expire(row: &mut [u8], expire_ms: u64) {
+        row[1..9].copy_from_slice(&expire_ms.to_be_bytes());
+    }
+
+    pub fn is_expired(&self, now_ms: u64) -> bool {
+        self.expire_ms != 0 && self.expire_ms <= now_ms
+    }
+
+    pub fn value_type(&self) -> Option<ValueType> {
+        ValueType::from_flags(self.flags)
+    }
+}
+
+/// Metadata row value for complex types (hash/set/zset/list):
+/// `header(9B) | version(8B BE) | size(4B BE)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ComplexMeta {
+    pub header: MetaHeader,
+    pub version: u64,
+    pub size: u32,
+}
+
+impl ComplexMeta {
+    pub fn new(t: ValueType, version: u64) -> Self {
+        Self {
+            header: MetaHeader {
+                flags: make_flags(t, ENCODING_V1),
+                expire_ms: 0,
+            },
+            version,
+            size: 0,
+        }
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(HEADER_LEN + 12);
+        self.header.encode_into(&mut out);
+        out.extend_from_slice(&self.version.to_be_bytes());
+        out.extend_from_slice(&self.size.to_be_bytes());
+        out
+    }
+
+    pub fn decode(row: &[u8]) -> Option<Self> {
+        let header = MetaHeader::decode(row)?;
+        if row.len() < HEADER_LEN + 12 {
+            return None;
+        }
+        Some(Self {
+            header,
+            version: u64::from_be_bytes(row[9..17].try_into().ok()?),
+            size: u32::from_be_bytes(row[17..21].try_into().ok()?),
+        })
+    }
+}
+
+/// Subkey row key:
+/// `S | ns_len | ns | slot(BE) | key_len(2B BE) | user_key | version(8B BE) | field`.
+///
+/// The key-length framing is required here (unlike the metadata envelope,
+/// where user_key is the suffix): without it, `(key="ab", field="c")` and
+/// `(key="a", field="bc")` would collide.
+pub fn subkey_envelope(
+    ns: &[u8],
+    slot: u16,
+    user_key: &[u8],
+    version: u64,
+    field: &[u8],
+) -> Vec<u8> {
+    let mut k = subkey_prefix(ns, slot, user_key, version);
+    k.extend_from_slice(field);
+    k
+}
+
+/// Prefix covering every subkey row of one (key, version) — the unit of a
+/// full-collection scan (HGETALL) and of orphan identification.
+pub fn subkey_prefix(ns: &[u8], slot: u16, user_key: &[u8], version: u64) -> Vec<u8> {
+    debug_assert!(user_key.len() <= u16::MAX as usize);
+    let mut k = Vec::with_capacity(1 + 1 + ns.len() + 2 + 2 + user_key.len() + 8);
+    k.push(Cf::Subkey as u8);
+    k.push(ns.len() as u8);
+    k.extend_from_slice(ns);
+    k.extend_from_slice(&slot.to_be_bytes());
+    k.extend_from_slice(&(user_key.len() as u16).to_be_bytes());
+    k.extend_from_slice(user_key);
+    k.extend_from_slice(&version.to_be_bytes());
+    k
+}
+
+/// Monotonic version numbers: unique per key incarnation, process-wide,
+/// seeded from the clock so versions keep increasing across restarts.
+pub struct VersionGen;
+
+impl VersionGen {
+    pub fn next(now_ms: u64) -> u64 {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static LAST: AtomicU64 = AtomicU64::new(0);
+        let floor = now_ms << 20;
+        let prev = LAST
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |prev| {
+                Some(prev.max(floor) + 1)
+            })
+            .unwrap_or(floor);
+        prev.max(floor) + 1
+    }
+}
+
 /// A string's metadata row value.
 #[derive(Debug, PartialEq, Eq)]
 pub struct StringMeta {
@@ -195,5 +328,54 @@ mod tests {
         assert!(m.is_expired(1001));
         let never = StringMeta::new(b"v".to_vec(), 0);
         assert!(!never.is_expired(u64::MAX));
+    }
+}
+
+#[cfg(test)]
+mod complex_tests {
+    use super::*;
+
+    #[test]
+    fn complex_meta_roundtrip() {
+        let mut m = ComplexMeta::new(ValueType::Hash, 42);
+        m.size = 7;
+        m.header.expire_ms = 123456;
+        assert_eq!(ComplexMeta::decode(&m.encode()), Some(m));
+        assert_eq!(ComplexMeta::decode(&[0u8; 20]), None);
+    }
+
+    #[test]
+    fn header_is_common_prefix_of_both_layouts() {
+        let s = StringMeta::new(b"v".to_vec(), 99);
+        let c = ComplexMeta::new(ValueType::Hash, 1);
+        let hs = MetaHeader::decode(&s.encode()).expect("string header");
+        let hc = MetaHeader::decode(&c.encode()).expect("complex header");
+        assert_eq!(hs.expire_ms, 99);
+        assert_eq!(hs.value_type(), Some(ValueType::String));
+        assert_eq!(hc.value_type(), Some(ValueType::Hash));
+    }
+
+    #[test]
+    fn subkey_framing_prevents_collisions() {
+        // (key="ab", field="c") vs (key="a", field="bc") must differ.
+        let a = subkey_envelope(b"t", 1, b"ab", 5, b"c");
+        let b = subkey_envelope(b"t", 1, b"a", 5, b"bc");
+        assert_ne!(a, b);
+        // Same (key, version): field ordering under the prefix.
+        let p = subkey_prefix(b"t", 1, b"ab", 5);
+        assert!(a.starts_with(&p));
+        assert!(!b.starts_with(&p));
+        // Different version, same key: disjoint prefixes (orphan isolation).
+        let p2 = subkey_prefix(b"t", 1, b"ab", 6);
+        assert!(!a.starts_with(&p2));
+    }
+
+    #[test]
+    fn versions_are_monotonic_and_unique() {
+        let a = VersionGen::next(1_000);
+        let b = VersionGen::next(1_000);
+        let c = VersionGen::next(999);
+        assert!(b > a);
+        assert!(c > b, "version must grow even if clock goes backward");
     }
 }

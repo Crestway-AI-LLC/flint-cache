@@ -17,18 +17,42 @@ use flint_storage::{Kv, MemKv};
 
 use crate::commands::Dispatcher;
 
+fn arg(name: &str) -> Option<String> {
+    std::env::args().skip_while(|a| a != name).nth(1)
+}
+
 fn main() -> std::io::Result<()> {
-    let port = std::env::args()
-        .skip_while(|a| a != "--port")
-        .nth(1)
+    let port = arg("--port")
         .and_then(|p| p.parse::<u16>().ok())
         .unwrap_or(6380);
-    let store: Arc<MemKv> = Arc::new(MemKv::new());
+    let engine = arg("--engine").unwrap_or_else(|| "mem".into());
+    let store: Arc<dyn Kv> = match engine.as_str() {
+        "mem" => Arc::new(MemKv::new()),
+        #[cfg(feature = "rocks")]
+        "rocks" => {
+            let dir = arg("--data-dir").unwrap_or_else(|| "./flint-data".into());
+            let kv = flint_storage::rocks::RocksKv::open(std::path::Path::new(&dir))
+                .map_err(|e| std::io::Error::other(format!("rocksdb open: {e}")))?;
+            eprintln!("engine=rocks data-dir={dir}");
+            Arc::new(kv)
+        }
+        other => {
+            eprintln!(
+                "unknown --engine '{other}' (built-in: mem{})",
+                if cfg!(feature = "rocks") {
+                    ", rocks"
+                } else {
+                    "; build with --features rocks for rocks"
+                }
+            );
+            std::process::exit(2);
+        }
+    };
     let listener = TcpListener::bind(("127.0.0.1", port))?;
     eprintln!("flint-server listening on 127.0.0.1:{port}");
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
-        let store = Arc::clone(&store);
+        let store: Arc<dyn Kv> = Arc::clone(&store);
         std::thread::spawn(move || {
             let _ = serve(stream, store.as_ref());
         });

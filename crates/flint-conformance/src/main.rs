@@ -27,6 +27,11 @@ enum Expect {
     Str(&'static [u8]),   // $len\r\n<bytes>
     Bytes(Vec<u8>),       // like Str, for computed payloads
     AnyError,             // -...
+    /// Exact array, in order (HMGET etc. where order is defined).
+    Arr(Vec<Expect>),
+    /// Flat field/value reply compared as an unordered map (HGETALL —
+    /// Redis hash iteration order is unspecified).
+    UnorderedPairs(Vec<(&'static [u8], &'static [u8])>),
 }
 
 struct Case {
@@ -337,6 +342,92 @@ fn corpus() -> Vec<Case> {
                 s(&[b"GET", b"y3"], Expect::Nil),
             ],
         },
+        Case {
+            family: "hashes",
+            name: "hset counts new fields, hget reads",
+            steps: vec![
+                s(&[b"HSET", b"h1", b"a", b"1", b"b", b"2"], Expect::Int(2)),
+                s(&[b"HSET", b"h1", b"a", b"9", b"c", b"3"], Expect::Int(1)),
+                s(&[b"HGET", b"h1", b"a"], Expect::Str(b"9")),
+                s(&[b"HGET", b"h1", b"nope"], Expect::Nil),
+                s(&[b"HGET", b"nosuch", b"f"], Expect::Nil),
+                s(&[b"HLEN", b"h1"], Expect::Int(3)),
+                s(&[b"HEXISTS", b"h1", b"b"], Expect::Int(1)),
+                s(&[b"HEXISTS", b"h1", b"zz"], Expect::Int(0)),
+            ],
+        },
+        Case {
+            family: "hashes",
+            name: "hdel to empty removes the key",
+            steps: vec![
+                s(&[b"HSET", b"h2", b"a", b"1", b"b", b"2"], Expect::Int(2)),
+                s(&[b"HDEL", b"h2", b"a", b"nope"], Expect::Int(1)),
+                s(&[b"HDEL", b"h2", b"b"], Expect::Int(1)),
+                s(&[b"EXISTS", b"h2"], Expect::Int(0)),
+                s(&[b"TYPE", b"h2"], Expect::Simple("none")),
+                s(&[b"HDEL", b"nosuch", b"f"], Expect::Int(0)),
+            ],
+        },
+        Case {
+            family: "hashes",
+            name: "hgetall hmget hkeys hvals",
+            steps: vec![
+                s(&[b"HSET", b"h3", b"x", b"10", b"y", b"20"], Expect::Int(2)),
+                s(
+                    &[b"HGETALL", b"h3"],
+                    Expect::UnorderedPairs(vec![(b"x", b"10"), (b"y", b"20")]),
+                ),
+                s(&[b"HGETALL", b"nosuch"], Expect::UnorderedPairs(vec![])),
+                s(
+                    &[b"HMGET", b"h3", b"y", b"zz", b"x"],
+                    Expect::Arr(vec![Expect::Str(b"20"), Expect::Nil, Expect::Str(b"10")]),
+                ),
+                s(
+                    &[b"HMGET", b"nosuch", b"a", b"b"],
+                    Expect::Arr(vec![Expect::Nil, Expect::Nil]),
+                ),
+            ],
+        },
+        Case {
+            family: "hashes",
+            name: "hash respects ttl machinery",
+            steps: vec![
+                s(&[b"HSET", b"h4", b"f", b"v"], Expect::Int(1)),
+                s(&[b"EXPIRE", b"h4", b"100"], Expect::Int(1)),
+                s(&[b"TTL", b"h4"], Expect::IntRange(95, 100)),
+                s(&[b"PERSIST", b"h4"], Expect::Int(1)),
+                s(&[b"HGET", b"h4", b"f"], Expect::Str(b"v")),
+                s(&[b"DEL", b"h4"], Expect::Int(1)),
+                s(&[b"HGETALL", b"h4"], Expect::UnorderedPairs(vec![])),
+            ],
+        },
+        Case {
+            family: "hashes",
+            name: "recreate after del is a fresh hash",
+            steps: vec![
+                s(&[b"HSET", b"h5", b"old", b"x"], Expect::Int(1)),
+                s(&[b"DEL", b"h5"], Expect::Int(1)),
+                s(&[b"HSET", b"h5", b"new", b"y"], Expect::Int(1)),
+                s(&[b"HGET", b"h5", b"old"], Expect::Nil),
+                s(&[b"HLEN", b"h5"], Expect::Int(1)),
+            ],
+        },
+        Case {
+            family: "protocol",
+            name: "wrongtype in both directions",
+            steps: vec![
+                s(&[b"SET", b"wt-s", b"v"], Expect::Ok),
+                s(&[b"HSET", b"wt-h", b"f", b"v"], Expect::Int(1)),
+                s(&[b"HGET", b"wt-s", b"f"], Expect::AnyError),
+                s(&[b"HSET", b"wt-s", b"f", b"v"], Expect::AnyError),
+                s(&[b"GET", b"wt-h"], Expect::AnyError),
+                s(&[b"INCR", b"wt-h"], Expect::AnyError),
+                s(&[b"APPEND", b"wt-h", b"x"], Expect::AnyError),
+                s(&[b"STRLEN", b"wt-h"], Expect::AnyError),
+                s(&[b"SET", b"wt-h", b"overwritten"], Expect::Ok),
+                s(&[b"GET", b"wt-h"], Expect::Str(b"overwritten")),
+            ],
+        },
     ]
 }
 
@@ -399,6 +490,33 @@ fn matches(expect: &Expect, got: &Value) -> bool {
         Expect::Str(s) => *got == Value::Bulk(Some(s.to_vec())),
         Expect::Bytes(b) => *got == Value::Bulk(Some(b.clone())),
         Expect::AnyError => matches!(got, Value::Error(_)),
+        Expect::Arr(items) => match got {
+            Value::Array(Some(vals)) if vals.len() == items.len() => {
+                items.iter().zip(vals).all(|(e, v)| matches(e, v))
+            }
+            _ => false,
+        },
+        Expect::UnorderedPairs(pairs) => match got {
+            Value::Array(Some(vals)) if vals.len() == pairs.len() * 2 => {
+                let mut got_pairs: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+                for chunk in vals.chunks(2) {
+                    match (&chunk[0], &chunk[1]) {
+                        (Value::Bulk(Some(f)), Value::Bulk(Some(v))) => {
+                            got_pairs.push((f.clone(), v.clone()));
+                        }
+                        _ => return false,
+                    }
+                }
+                got_pairs.sort();
+                let mut want: Vec<(Vec<u8>, Vec<u8>)> = pairs
+                    .iter()
+                    .map(|(f, v)| (f.to_vec(), v.to_vec()))
+                    .collect();
+                want.sort();
+                got_pairs == want
+            }
+            _ => false,
+        },
     }
 }
 

@@ -13,3 +13,6 @@ flint-storage = { path = "../flint-storage" }
 
 [lints]
 workspace = true
+
+[features]
+rocks = ["flint-storage/rocksdb"]

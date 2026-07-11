@@ -17,6 +17,8 @@
 //! layer.
 
 pub mod encoding;
+pub mod hashes;
+pub mod keyspace;
 pub mod strings;
 
 #[cfg(feature = "rocksdb")]
