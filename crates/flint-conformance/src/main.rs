@@ -18,19 +18,33 @@ use flint_resp::{Decoded, Value, decode, encode};
 /// What a step's reply must look like.
 #[derive(Debug, Clone)]
 enum Expect {
-    Ok,                 // +OK
-    Pong,               // +PONG
-    Nil,                // $-1
-    Int(i64),           // :n
-    Str(&'static [u8]), // $len\r\n<bytes>
-    Bytes(Vec<u8>),     // like Str, for computed payloads
-    AnyError,           // -...
+    Ok,                   // +OK
+    Pong,                 // +PONG
+    Nil,                  // $-1
+    Int(i64),             // :n
+    IntRange(i64, i64),   // :n where lo <= n <= hi (TTL imprecision)
+    Simple(&'static str), // +text
+    Str(&'static [u8]),   // $len\r\n<bytes>
+    Bytes(Vec<u8>),       // like Str, for computed payloads
+    AnyError,             // -...
 }
 
 struct Case {
     family: &'static str,
     name: &'static str,
-    steps: Vec<(Vec<Vec<u8>>, Expect)>,
+    /// (command, expected reply, delay after step in ms)
+    steps: Vec<(Vec<Vec<u8>>, Expect, u64)>,
+}
+
+/// Step with no delay.
+fn s(parts: &[&[u8]], expect: Expect) -> (Vec<Vec<u8>>, Expect, u64) {
+    (cmd(parts), expect, 0)
+}
+
+/// Step followed by a real-time delay (used only where semantics require
+/// actual expiration; kept rare to avoid slow, flaky runs).
+fn sd(parts: &[&[u8]], expect: Expect, delay_ms: u64) -> (Vec<Vec<u8>>, Expect, u64) {
+    (cmd(parts), expect, delay_ms)
 }
 
 fn cmd(parts: &[&[u8]]) -> Vec<Vec<u8>> {
@@ -44,140 +58,283 @@ fn corpus() -> Vec<Case> {
             family: "connection",
             name: "ping and echo",
             steps: vec![
-                (cmd(&[b"PING"]), Expect::Pong),
-                (cmd(&[b"PING", b"hello"]), Expect::Str(b"hello")),
-                (cmd(&[b"ECHO", b"abc"]), Expect::Str(b"abc")),
-                (cmd(&[b"ECHO"]), Expect::AnyError),
+                s(&[b"PING"], Expect::Pong),
+                s(&[b"PING", b"hello"], Expect::Str(b"hello")),
+                s(&[b"ECHO", b"abc"], Expect::Str(b"abc")),
+                s(&[b"ECHO"], Expect::AnyError),
             ],
         },
         Case {
             family: "strings",
             name: "set then get",
             steps: vec![
-                (cmd(&[b"SET", b"k1", b"v1"]), Expect::Ok),
-                (cmd(&[b"GET", b"k1"]), Expect::Str(b"v1")),
+                s(&[b"SET", b"k1", b"v1"], Expect::Ok),
+                s(&[b"GET", b"k1"], Expect::Str(b"v1")),
             ],
         },
         Case {
             family: "strings",
             name: "get missing is nil",
-            steps: vec![(cmd(&[b"GET", b"missing"]), Expect::Nil)],
+            steps: vec![s(&[b"GET", b"missing"], Expect::Nil)],
         },
         Case {
             family: "strings",
             name: "set overwrites",
             steps: vec![
-                (cmd(&[b"SET", b"k2", b"a"]), Expect::Ok),
-                (cmd(&[b"SET", b"k2", b"b"]), Expect::Ok),
-                (cmd(&[b"GET", b"k2"]), Expect::Str(b"b")),
+                s(&[b"SET", b"k2", b"a"], Expect::Ok),
+                s(&[b"SET", b"k2", b"b"], Expect::Ok),
+                s(&[b"GET", b"k2"], Expect::Str(b"b")),
             ],
         },
         Case {
             family: "strings",
             name: "set nx",
             steps: vec![
-                (cmd(&[b"SET", b"k3", b"a", b"NX"]), Expect::Ok),
-                (cmd(&[b"SET", b"k3", b"b", b"NX"]), Expect::Nil),
-                (cmd(&[b"GET", b"k3"]), Expect::Str(b"a")),
-                (cmd(&[b"SET", b"k3", b"c", b"nx"]), Expect::Nil),
+                s(&[b"SET", b"k3", b"a", b"NX"], Expect::Ok),
+                s(&[b"SET", b"k3", b"b", b"NX"], Expect::Nil),
+                s(&[b"GET", b"k3"], Expect::Str(b"a")),
+                s(&[b"SET", b"k3", b"c", b"nx"], Expect::Nil),
             ],
         },
         Case {
             family: "strings",
             name: "set xx",
             steps: vec![
-                (cmd(&[b"SET", b"k4", b"a", b"XX"]), Expect::Nil),
-                (cmd(&[b"GET", b"k4"]), Expect::Nil),
-                (cmd(&[b"SET", b"k4", b"a"]), Expect::Ok),
-                (cmd(&[b"SET", b"k4", b"b", b"XX"]), Expect::Ok),
-                (cmd(&[b"GET", b"k4"]), Expect::Str(b"b")),
+                s(&[b"SET", b"k4", b"a", b"XX"], Expect::Nil),
+                s(&[b"GET", b"k4"], Expect::Nil),
+                s(&[b"SET", b"k4", b"a"], Expect::Ok),
+                s(&[b"SET", b"k4", b"b", b"XX"], Expect::Ok),
+                s(&[b"GET", b"k4"], Expect::Str(b"b")),
             ],
         },
         Case {
             family: "strings",
             name: "set nx xx together is an error",
-            steps: vec![(cmd(&[b"SET", b"k5", b"v", b"NX", b"XX"]), Expect::AnyError)],
+            steps: vec![s(&[b"SET", b"k5", b"v", b"NX", b"XX"], Expect::AnyError)],
         },
         Case {
             family: "strings",
             name: "empty value roundtrips",
             steps: vec![
-                (cmd(&[b"SET", b"k6", b""]), Expect::Ok),
-                (cmd(&[b"GET", b"k6"]), Expect::Str(b"")),
+                s(&[b"SET", b"k6", b""], Expect::Ok),
+                s(&[b"GET", b"k6"], Expect::Str(b"")),
             ],
         },
         Case {
             family: "strings",
             name: "binary value roundtrips",
             steps: vec![
-                (cmd(&[b"SET", b"k7", b"\x00\xff\r\n\x00"]), Expect::Ok),
-                (cmd(&[b"GET", b"k7"]), Expect::Str(b"\x00\xff\r\n\x00")),
+                s(&[b"SET", b"k7", b"\x00\xff\r\n\x00"], Expect::Ok),
+                s(&[b"GET", b"k7"], Expect::Str(b"\x00\xff\r\n\x00")),
             ],
         },
         Case {
             family: "strings",
             name: "1kb value roundtrips",
             steps: vec![
-                (cmd(&[b"SET", b"k8", &big]), Expect::Ok),
-                (cmd(&[b"GET", b"k8"]), Expect::Bytes(big.clone())),
+                s(&[b"SET", b"k8", &big], Expect::Ok),
+                s(&[b"GET", b"k8"], Expect::Bytes(big.clone())),
             ],
         },
         Case {
             family: "strings",
             name: "binary-safe keys",
             steps: vec![
-                (cmd(&[b"SET", b"k\x00\x01", b"v"]), Expect::Ok),
-                (cmd(&[b"GET", b"k\x00\x01"]), Expect::Str(b"v")),
-                (cmd(&[b"GET", b"k"]), Expect::Nil),
+                s(&[b"SET", b"k\x00\x01", b"v"], Expect::Ok),
+                s(&[b"GET", b"k\x00\x01"], Expect::Str(b"v")),
+                s(&[b"GET", b"k"], Expect::Nil),
             ],
         },
         Case {
             family: "keyspace",
             name: "del returns removal count",
             steps: vec![
-                (cmd(&[b"SET", b"d1", b"x"]), Expect::Ok),
-                (cmd(&[b"SET", b"d2", b"y"]), Expect::Ok),
-                (cmd(&[b"DEL", b"d1", b"d2", b"d3"]), Expect::Int(2)),
-                (cmd(&[b"GET", b"d1"]), Expect::Nil),
+                s(&[b"SET", b"d1", b"x"], Expect::Ok),
+                s(&[b"SET", b"d2", b"y"], Expect::Ok),
+                s(&[b"DEL", b"d1", b"d2", b"d3"], Expect::Int(2)),
+                s(&[b"GET", b"d1"], Expect::Nil),
             ],
         },
         Case {
             family: "keyspace",
             name: "del counts a key once",
             steps: vec![
-                (cmd(&[b"SET", b"d4", b"x"]), Expect::Ok),
-                (cmd(&[b"DEL", b"d4", b"d4"]), Expect::Int(1)),
+                s(&[b"SET", b"d4", b"x"], Expect::Ok),
+                s(&[b"DEL", b"d4", b"d4"], Expect::Int(1)),
             ],
         },
         Case {
             family: "keyspace",
             name: "exists counts duplicates",
             steps: vec![
-                (cmd(&[b"SET", b"e1", b"x"]), Expect::Ok),
-                (cmd(&[b"EXISTS", b"e1", b"e1", b"nope"]), Expect::Int(2)),
-                (cmd(&[b"EXISTS", b"nope"]), Expect::Int(0)),
+                s(&[b"SET", b"e1", b"x"], Expect::Ok),
+                s(&[b"EXISTS", b"e1", b"e1", b"nope"], Expect::Int(2)),
+                s(&[b"EXISTS", b"nope"], Expect::Int(0)),
             ],
         },
         Case {
             family: "protocol",
             name: "arity errors",
             steps: vec![
-                (cmd(&[b"GET"]), Expect::AnyError),
-                (cmd(&[b"SET", b"only-key"]), Expect::AnyError),
-                (cmd(&[b"DEL"]), Expect::AnyError),
+                s(&[b"GET"], Expect::AnyError),
+                s(&[b"SET", b"only-key"], Expect::AnyError),
+                s(&[b"DEL"], Expect::AnyError),
             ],
         },
         Case {
             family: "protocol",
             name: "unknown command errors",
-            steps: vec![(cmd(&[b"FLINTNOSUCH", b"x"]), Expect::AnyError)],
+            steps: vec![s(&[b"FLINTNOSUCH", b"x"], Expect::AnyError)],
         },
         Case {
             family: "protocol",
             name: "command name is case-insensitive",
             steps: vec![
-                (cmd(&[b"set", b"c1", b"v"]), Expect::Ok),
-                (cmd(&[b"gEt", b"c1"]), Expect::Str(b"v")),
+                s(&[b"set", b"c1", b"v"], Expect::Ok),
+                s(&[b"gEt", b"c1"], Expect::Str(b"v")),
+            ],
+        },
+        Case {
+            family: "ttl",
+            name: "expire ttl persist lifecycle",
+            steps: vec![
+                s(&[b"SET", b"t1", b"v"], Expect::Ok),
+                s(&[b"TTL", b"t1"], Expect::Int(-1)),
+                s(&[b"EXPIRE", b"t1", b"100"], Expect::Int(1)),
+                s(&[b"TTL", b"t1"], Expect::IntRange(95, 100)),
+                s(&[b"PTTL", b"t1"], Expect::IntRange(95_000, 100_000)),
+                s(&[b"PERSIST", b"t1"], Expect::Int(1)),
+                s(&[b"TTL", b"t1"], Expect::Int(-1)),
+                s(&[b"PERSIST", b"t1"], Expect::Int(0)),
+            ],
+        },
+        Case {
+            family: "ttl",
+            name: "missing keys",
+            steps: vec![
+                s(&[b"TTL", b"nope"], Expect::Int(-2)),
+                s(&[b"PTTL", b"nope"], Expect::Int(-2)),
+                s(&[b"EXPIRE", b"nope", b"10"], Expect::Int(0)),
+                s(&[b"PERSIST", b"nope"], Expect::Int(0)),
+            ],
+        },
+        Case {
+            family: "ttl",
+            name: "set with ex and px",
+            steps: vec![
+                s(&[b"SET", b"t2", b"v", b"EX", b"100"], Expect::Ok),
+                s(&[b"TTL", b"t2"], Expect::IntRange(95, 100)),
+                s(&[b"SET", b"t3", b"v", b"PX", b"100000"], Expect::Ok),
+                s(&[b"TTL", b"t3"], Expect::IntRange(95, 100)),
+                s(&[b"SET", b"t4", b"v", b"EX", b"0"], Expect::AnyError),
+                s(&[b"SET", b"t4", b"v", b"EX", b"abc"], Expect::AnyError),
+            ],
+        },
+        Case {
+            family: "ttl",
+            name: "plain set clears ttl, keepttl keeps it",
+            steps: vec![
+                s(&[b"SET", b"t5", b"v", b"EX", b"100"], Expect::Ok),
+                s(&[b"SET", b"t5", b"v2"], Expect::Ok),
+                s(&[b"TTL", b"t5"], Expect::Int(-1)),
+                s(&[b"SET", b"t5", b"v3", b"EX", b"100"], Expect::Ok),
+                s(&[b"SET", b"t5", b"v4", b"KEEPTTL"], Expect::Ok),
+                s(&[b"TTL", b"t5"], Expect::IntRange(1, 100)),
+                s(&[b"GET", b"t5"], Expect::Str(b"v4")),
+            ],
+        },
+        Case {
+            family: "ttl",
+            name: "keys really expire",
+            steps: vec![
+                sd(&[b"SET", b"t6", b"v", b"PX", b"60"], Expect::Ok, 140),
+                s(&[b"GET", b"t6"], Expect::Nil),
+                s(&[b"TTL", b"t6"], Expect::Int(-2)),
+                s(&[b"EXISTS", b"t6"], Expect::Int(0)),
+            ],
+        },
+        Case {
+            family: "ttl",
+            name: "setex and setnx",
+            steps: vec![
+                s(&[b"SETEX", b"t7", b"100", b"v"], Expect::Ok),
+                s(&[b"TTL", b"t7"], Expect::IntRange(95, 100)),
+                s(&[b"SETEX", b"t8", b"0", b"v"], Expect::AnyError),
+                s(&[b"SETNX", b"t9", b"a"], Expect::Int(1)),
+                s(&[b"SETNX", b"t9", b"b"], Expect::Int(0)),
+                s(&[b"GET", b"t9"], Expect::Str(b"a")),
+            ],
+        },
+        Case {
+            family: "strings",
+            name: "incr decr family",
+            steps: vec![
+                s(&[b"INCR", b"c1"], Expect::Int(1)),
+                s(&[b"INCR", b"c1"], Expect::Int(2)),
+                s(&[b"INCRBY", b"c1", b"10"], Expect::Int(12)),
+                s(&[b"DECR", b"c1"], Expect::Int(11)),
+                s(&[b"DECRBY", b"c1", b"5"], Expect::Int(6)),
+                s(&[b"INCRBY", b"c1", b"-2"], Expect::Int(4)),
+            ],
+        },
+        Case {
+            family: "strings",
+            name: "incr on non-integer errors",
+            steps: vec![
+                s(&[b"SET", b"c2", b"abc"], Expect::Ok),
+                s(&[b"INCR", b"c2"], Expect::AnyError),
+                s(&[b"SET", b"c3", b"9223372036854775807"], Expect::Ok),
+                s(&[b"INCR", b"c3"], Expect::AnyError),
+                s(&[b"INCRBY", b"c4", b"notanum"], Expect::AnyError),
+            ],
+        },
+        Case {
+            family: "strings",
+            name: "incr preserves ttl",
+            steps: vec![
+                s(&[b"SET", b"c5", b"5", b"EX", b"100"], Expect::Ok),
+                s(&[b"INCR", b"c5"], Expect::Int(6)),
+                s(&[b"TTL", b"c5"], Expect::IntRange(1, 100)),
+            ],
+        },
+        Case {
+            family: "strings",
+            name: "append and strlen",
+            steps: vec![
+                s(&[b"APPEND", b"a1", b"he"], Expect::Int(2)),
+                s(&[b"APPEND", b"a1", b"llo"], Expect::Int(5)),
+                s(&[b"GET", b"a1"], Expect::Str(b"hello")),
+                s(&[b"STRLEN", b"a1"], Expect::Int(5)),
+                s(&[b"STRLEN", b"missing"], Expect::Int(0)),
+            ],
+        },
+        Case {
+            family: "keyspace",
+            name: "type command",
+            steps: vec![
+                s(&[b"SET", b"y1", b"v"], Expect::Ok),
+                s(&[b"TYPE", b"y1"], Expect::Simple("string")),
+                s(&[b"TYPE", b"missing"], Expect::Simple("none")),
+            ],
+        },
+        Case {
+            family: "keyspace",
+            name: "del removes ttl state too",
+            steps: vec![
+                s(&[b"SET", b"y2", b"v", b"EX", b"100"], Expect::Ok),
+                s(&[b"DEL", b"y2"], Expect::Int(1)),
+                s(&[b"SET", b"y2", b"v2"], Expect::Ok),
+                s(&[b"TTL", b"y2"], Expect::Int(-1)),
+            ],
+        },
+        Case {
+            family: "ttl",
+            name: "expire with past time deletes",
+            steps: vec![
+                s(&[b"SET", b"y3", b"v"], Expect::Ok),
+                s(&[b"EXPIRE", b"y3", b"-1"], Expect::Int(1)),
+                s(&[b"EXISTS", b"y3"], Expect::Int(0)),
+                s(&[b"GET", b"y3"], Expect::Nil),
             ],
         },
     ]
@@ -237,6 +394,8 @@ fn matches(expect: &Expect, got: &Value) -> bool {
         Expect::Pong => *got == Value::Simple("PONG".into()),
         Expect::Nil => *got == Value::Bulk(None),
         Expect::Int(i) => *got == Value::Integer(*i),
+        Expect::IntRange(lo, hi) => matches!(got, Value::Integer(n) if n >= lo && n <= hi),
+        Expect::Simple(t) => *got == Value::Simple((*t).into()),
         Expect::Str(s) => *got == Value::Bulk(Some(s.to_vec())),
         Expect::Bytes(b) => *got == Value::Bulk(Some(b.clone())),
         Expect::AnyError => matches!(got, Value::Error(_)),
@@ -302,7 +461,7 @@ fn run_case(target: &str, case: &Case) -> std::io::Result<Option<String>> {
     if flushed != Value::Simple("OK".into()) {
         return Ok(Some(format!("FLUSHALL failed: {flushed:?}")));
     }
-    for (step_no, (args, expect)) in case.steps.iter().enumerate() {
+    for (step_no, (args, expect, delay_ms)) in case.steps.iter().enumerate() {
         let got = client.call(args)?;
         if !matches(expect, &got) {
             return Ok(Some(format!(
@@ -312,6 +471,9 @@ fn run_case(target: &str, case: &Case) -> std::io::Result<Option<String>> {
                 expect,
                 got
             )));
+        }
+        if *delay_ms > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(*delay_ms));
         }
     }
     Ok(None)

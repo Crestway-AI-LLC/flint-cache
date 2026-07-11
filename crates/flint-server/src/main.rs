@@ -15,6 +15,8 @@ use std::sync::Arc;
 use flint_resp::{Decoded, Value, decode, encode};
 use flint_storage::{Kv, MemKv};
 
+use crate::commands::Dispatcher;
+
 fn main() -> std::io::Result<()> {
     let port = std::env::args()
         .skip_while(|a| a != "--port")
@@ -82,5 +84,5 @@ fn handle_frame(store: &dyn Kv, frame: Value) -> Value {
             _ => return Value::Error("ERR Protocol error: expected bulk string".into()),
         }
     }
-    commands::dispatch(store, &args)
+    Dispatcher::new(store, flint_storage::strings::system_clock).dispatch(&args)
 }

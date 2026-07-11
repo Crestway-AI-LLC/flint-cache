@@ -16,6 +16,9 @@
 //! arrives with the storage spike; `TypeStore` arrives with the encoding
 //! layer.
 
+pub mod encoding;
+pub mod strings;
+
 #[cfg(feature = "rocksdb")]
 pub mod rocks;
 
