@@ -69,7 +69,31 @@ fn serve(mut stream: TcpStream, store: &dyn Kv) -> std::io::Result<()> {
         let mut consumed = 0;
         out.clear();
         loop {
-            match decode(&buf[consumed..]) {
+            let pending = &buf[consumed..];
+            let Some(&first) = pending.first() else { break };
+            // Inline commands (redis-cli --pipe handshakes, telnet): any
+            // line not starting with a RESP array marker, split on spaces.
+            if first != b'*' {
+                let Some(nl) = pending.iter().position(|&b| b == b'\n') else {
+                    break; // incomplete inline line
+                };
+                let line = &pending[..nl];
+                let line = line.strip_suffix(b"\r").unwrap_or(line);
+                consumed += nl + 1;
+                let args: Vec<Vec<u8>> = line
+                    .split(|&b| b == b' ')
+                    .filter(|part| !part.is_empty())
+                    .map(|part| part.to_vec())
+                    .collect();
+                if args.is_empty() {
+                    continue; // empty inline line: no reply, like Redis
+                }
+                let reply =
+                    Dispatcher::new(store, flint_storage::strings::system_clock).dispatch(&args);
+                encode(&reply, &mut out);
+                continue;
+            }
+            match decode(pending) {
                 Ok(Decoded::Complete(frame, used)) => {
                     consumed += used;
                     let reply = handle_frame(store, frame);

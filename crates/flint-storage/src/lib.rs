@@ -17,6 +17,7 @@
 //! layer.
 
 pub mod encoding;
+pub mod gc;
 pub mod hashes;
 pub mod keyspace;
 pub mod lists;

@@ -580,6 +580,61 @@ fn corpus() -> Vec<Case> {
                 s(&[b"DEL", b"wt2-l"], Expect::Int(1)),
             ],
         },
+        Case {
+            family: "strings",
+            name: "mset mget with missing and wrongtype",
+            steps: vec![
+                s(&[b"MSET", b"m1", b"a", b"m2", b"b"], Expect::Ok),
+                s(&[b"RPUSH", b"m3", b"x"], Expect::Int(1)),
+                s(
+                    &[b"MGET", b"m1", b"nosuch", b"m2", b"m3"],
+                    Expect::Arr(vec![
+                        Expect::Str(b"a"),
+                        Expect::Nil,
+                        Expect::Str(b"b"),
+                        Expect::Nil,
+                    ]),
+                ),
+                s(&[b"MSET", b"m4"], Expect::AnyError),
+            ],
+        },
+        Case {
+            family: "hashes",
+            name: "hincrby",
+            steps: vec![
+                s(&[b"HINCRBY", b"hi", b"f", b"5"], Expect::Int(5)),
+                s(&[b"HINCRBY", b"hi", b"f", b"-2"], Expect::Int(3)),
+                s(&[b"HGET", b"hi", b"f"], Expect::Str(b"3")),
+                s(&[b"HSET", b"hi", b"txt", b"abc"], Expect::Int(1)),
+                s(&[b"HINCRBY", b"hi", b"txt", b"1"], Expect::AnyError),
+            ],
+        },
+        Case {
+            family: "zsets",
+            name: "zincrby creates and reorders",
+            steps: vec![
+                s(&[b"ZADD", b"zi", b"5", b"a"], Expect::Int(1)),
+                s(&[b"ZINCRBY", b"zi", b"3", b"a"], Expect::Str(b"8")),
+                s(&[b"ZINCRBY", b"zi", b"2", b"new"], Expect::Str(b"2")),
+                s(&[b"ZCARD", b"zi"], Expect::Int(2)),
+                s(
+                    &[b"ZRANGE", b"zi", b"0", b"-1"],
+                    Expect::Arr(vec![Expect::Str(b"new"), Expect::Str(b"a")]),
+                ),
+            ],
+        },
+        Case {
+            family: "lists",
+            name: "lindex",
+            steps: vec![
+                s(&[b"RPUSH", b"li", b"a", b"b", b"c"], Expect::Int(3)),
+                s(&[b"LINDEX", b"li", b"0"], Expect::Str(b"a")),
+                s(&[b"LINDEX", b"li", b"-1"], Expect::Str(b"c")),
+                s(&[b"LINDEX", b"li", b"99"], Expect::Nil),
+                s(&[b"LINDEX", b"li", b"-99"], Expect::Nil),
+                s(&[b"LINDEX", b"nosuch", b"0"], Expect::Nil),
+            ],
+        },
     ]
 }
 

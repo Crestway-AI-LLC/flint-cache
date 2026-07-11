@@ -131,6 +131,20 @@ impl<'a> ZSetStore<'a> {
         Ok(removed)
     }
 
+    /// ZINCRBY: returns the new score; missing member starts at 0.
+    pub fn zincr_by(
+        &self,
+        slot: u16,
+        key: &[u8],
+        delta: f64,
+        member: &[u8],
+    ) -> Result<f64, StoreError> {
+        let current = self.zscore(slot, key, member)?.unwrap_or(0.0);
+        let next = current + delta;
+        self.zadd(slot, key, &[(next, member.to_vec())])?;
+        Ok(next)
+    }
+
     pub fn zcard(&self, slot: u16, key: &[u8]) -> Result<u64, StoreError> {
         Ok(self.read_meta(slot, key)?.map_or(0, |m| m.size as u64))
     }

@@ -114,6 +114,35 @@ impl<'a> Dispatcher<'a> {
                 })
             }),
 
+            b"MSET" => {
+                if args.len() < 3 || !(args.len() - 1).is_multiple_of(2) {
+                    return arity_err("mset");
+                }
+                for chunk in args[1..].chunks(2) {
+                    if let Err(e) = self.strings.set(
+                        slot_for_key(&chunk[0]),
+                        &chunk[0],
+                        &chunk[1],
+                        SetOptions::default(),
+                    ) {
+                        return store_err(e);
+                    }
+                }
+                Value::Simple("OK".into())
+            }
+            b"MGET" => {
+                if args.len() < 2 {
+                    return arity_err("mget");
+                }
+                // Redis MGET yields nil (not an error) for wrong-type keys.
+                Value::Array(Some(
+                    args[1..]
+                        .iter()
+                        .map(|k| Value::Bulk(self.strings.get(slot_for_key(k), k).unwrap_or(None)))
+                        .collect(),
+                ))
+            }
+
             // hashes
             b"HSET" => self.cmd_hset(args),
             b"HGET" => exact(args, 3, "hget", |a| {
@@ -132,6 +161,14 @@ impl<'a> Dispatcher<'a> {
                     |n| Value::Integer(n as i64),
                 )
             }
+            b"HINCRBY" => exact(args, 4, "hincrby", |a| match parse_i64(&a[3]) {
+                Ok(delta) => reply(
+                    self.hashes
+                        .hincr_by(slot_for_key(&a[1]), &a[1], &a[2], delta),
+                    Value::Integer,
+                ),
+                Err(_) => err("ERR value is not an integer or out of range"),
+            }),
             b"HLEN" => exact(args, 2, "hlen", |a| {
                 reply(self.hashes.hlen(slot_for_key(&a[1]), &a[1]), |n| {
                     Value::Integer(n as i64)
@@ -243,6 +280,13 @@ impl<'a> Dispatcher<'a> {
                     Value::Bulk,
                 )
             }),
+            b"LINDEX" => exact(args, 3, "lindex", |a| match parse_i64(&a[2]) {
+                Ok(rank) => reply(
+                    self.lists.lindex(slot_for_key(&a[1]), &a[1], rank),
+                    Value::Bulk,
+                ),
+                Err(_) => err("ERR value is not an integer or out of range"),
+            }),
             b"LLEN" => exact(args, 2, "llen", |a| {
                 reply(self.lists.llen(slot_for_key(&a[1]), &a[1]), |n| {
                     Value::Integer(n as i64)
@@ -268,6 +312,14 @@ impl<'a> Dispatcher<'a> {
                 reply(self.zsets.zscore(slot_for_key(&a[1]), &a[1], &a[2]), |s| {
                     Value::Bulk(s.map(fmt_score))
                 })
+            }),
+            b"ZINCRBY" => exact(args, 4, "zincrby", |a| match parse_f64(&a[2]) {
+                Ok(delta) => reply(
+                    self.zsets
+                        .zincr_by(slot_for_key(&a[1]), &a[1], delta, &a[3]),
+                    |sc| Value::Bulk(Some(fmt_score(sc))),
+                ),
+                Err(_) => err("ERR value is not a valid float"),
             }),
             b"ZREM" => {
                 if args.len() < 3 {

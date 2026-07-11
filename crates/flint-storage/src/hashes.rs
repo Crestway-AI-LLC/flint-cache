@@ -109,6 +109,30 @@ impl<'a> HashStore<'a> {
         Ok(removed)
     }
 
+    /// HINCRBY: field must hold an integer string; creates key/field at 0.
+    pub fn hincr_by(
+        &self,
+        slot: u16,
+        key: &[u8],
+        field: &[u8],
+        delta: i64,
+    ) -> Result<i64, StoreError> {
+        let current = match self.hget(slot, key, field)? {
+            None => 0i64,
+            Some(raw) => std::str::from_utf8(&raw)
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .ok_or(StoreError::NotInteger)?,
+        };
+        let next = current.checked_add(delta).ok_or(StoreError::Overflow)?;
+        self.hset(
+            slot,
+            key,
+            &[(field.to_vec(), next.to_string().into_bytes())],
+        )?;
+        Ok(next)
+    }
+
     pub fn hlen(&self, slot: u16, key: &[u8]) -> Result<u64, StoreError> {
         Ok(self.read_meta(slot, key)?.map_or(0, |m| m.size as u64))
     }

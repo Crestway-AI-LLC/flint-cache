@@ -123,6 +123,21 @@ impl<'a> ListStore<'a> {
             .map_or(0, |m| (m.tail - m.head) as u64))
     }
 
+    /// LINDEX: rank with negatives from end; None when out of range.
+    pub fn lindex(&self, slot: u16, key: &[u8], rank: i64) -> Result<Option<Vec<u8>>, StoreError> {
+        let Some(meta) = self.read_meta(slot, key)? else {
+            return Ok(None);
+        };
+        let len = meta.tail - meta.head;
+        let rank = if rank < 0 { len + rank } else { rank };
+        if rank < 0 || rank >= len {
+            return Ok(None);
+        }
+        Ok(self
+            .kv
+            .get(&self.elem_key(slot, key, meta.base.version, meta.head + rank)))
+    }
+
     /// LRANGE with Redis index semantics (inclusive, negatives from end).
     pub fn lrange(
         &self,

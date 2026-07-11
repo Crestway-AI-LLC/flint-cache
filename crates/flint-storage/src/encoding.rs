@@ -505,3 +505,43 @@ mod order_tests {
         assert_eq!(decode_score(encode_score(-7.25)), -7.25);
     }
 }
+
+/// Parse a subkey/zscore row key back into (ns, slot, user_key, version).
+/// Returns None on malformed keys (wrong tag, truncated).
+pub fn parse_subkey_envelope(k: &[u8]) -> Option<(&[u8], u16, &[u8], u64)> {
+    if k.len() < 2 || (k[0] != Cf::Subkey as u8 && k[0] != Cf::ZScore as u8) {
+        return None;
+    }
+    let ns_len = k[1] as usize;
+    let mut off = 2;
+    let ns = k.get(off..off + ns_len)?;
+    off += ns_len;
+    let slot = u16::from_be_bytes(k.get(off..off + 2)?.try_into().ok()?);
+    off += 2;
+    let key_len = u16::from_be_bytes(k.get(off..off + 2)?.try_into().ok()?) as usize;
+    off += 2;
+    let user_key = k.get(off..off + key_len)?;
+    off += key_len;
+    let version = u64::from_be_bytes(k.get(off..off + 8)?.try_into().ok()?);
+    Some((ns, slot, user_key, version))
+}
+
+#[cfg(test)]
+mod parse_tests {
+    use super::*;
+
+    #[test]
+    fn subkey_envelope_roundtrips_through_parse() {
+        let k = subkey_envelope(b"ns9", 1234, b"user-key", 77, b"field");
+        let (ns, slot, key, version) = parse_subkey_envelope(&k).expect("parse");
+        assert_eq!(
+            (ns, slot, key, version),
+            (&b"ns9"[..], 1234, &b"user-key"[..], 77)
+        );
+        let z = zscore_envelope(b"n", 7, b"k", 5, 1.5, b"m");
+        let (ns, slot, key, version) = parse_subkey_envelope(&z).expect("parse z");
+        assert_eq!((ns, slot, key, version), (&b"n"[..], 7, &b"k"[..], 5));
+        assert_eq!(parse_subkey_envelope(b"Mxx"), None);
+        assert_eq!(parse_subkey_envelope(&k[..6]), None);
+    }
+}

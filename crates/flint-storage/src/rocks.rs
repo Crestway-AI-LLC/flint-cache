@@ -26,9 +26,36 @@ impl RocksKv {
     pub fn open(path: &Path) -> Result<Self, rocksdb::Error> {
         let mut opts = Options::default();
         opts.create_if_missing(true);
+        // Expired metadata rows are dropped organically as compaction
+        // rewrites them (subkey orphans are reclaimed by gc::sweep until
+        // the filter gains a metadata-lookup handle).
+        opts.set_compaction_filter("flint-meta-expiry", |_level, key, value| {
+            use crate::encoding::{Cf, MetaHeader};
+            use rocksdb::compaction_filter::Decision;
+            if key.first() == Some(&(Cf::Metadata as u8))
+                && MetaHeader::decode(value)
+                    .is_some_and(|h| h.is_expired(crate::strings::system_clock()))
+            {
+                Decision::Remove
+            } else {
+                Decision::Keep
+            }
+        });
         Ok(Self {
             db: DB::open(&opts, path)?,
         })
+    }
+
+    /// Force a full compaction (tests, admin).
+    pub fn compact_all(&self) {
+        self.db.compact_range(None::<&[u8]>, None::<&[u8]>);
+        // Rows in memtables are not seen by the compaction filter until
+        // flushed; flush first for deterministic tests.
+    }
+
+    /// Flush memtables to SSTs.
+    pub fn flush(&self) {
+        let _ = self.db.flush();
     }
 }
 
@@ -297,5 +324,48 @@ mod audit {
         batch.put(b"durable", b"yes");
         db.write_opt(batch, &wo).expect("sync write");
         assert_eq!(db.get(b"durable").expect("get"), Some(b"yes".to_vec()));
+    }
+}
+
+#[cfg(test)]
+mod gc_integration {
+    use super::*;
+    use crate::encoding::Cf;
+    use crate::strings::{SetExpiry, SetOptions, StringStore};
+
+    #[test]
+    fn compaction_filter_drops_expired_metadata_rows() {
+        let dir = {
+            let p = std::env::temp_dir().join(format!("flint-gcint-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&p);
+            p
+        };
+        let kv = RocksKv::open(&dir).expect("open");
+        fn past() -> u64 {
+            1 // far in the past relative to system_clock
+        }
+        let _ = past;
+        // Write a string that expired long ago (expire_ms = 1).
+        let s = StringStore::new(&kv, b"t", crate::strings::system_clock);
+        s.set(
+            1,
+            b"dead",
+            b"v",
+            SetOptions {
+                expiry: SetExpiry::AtMs(1),
+                ..Default::default()
+            },
+        )
+        .expect("set");
+        s.set(1, b"live", b"v", SetOptions::default()).expect("set");
+        // Physically present before compaction (2 metadata rows).
+        assert_eq!(kv.scan_prefix(&[Cf::Metadata as u8]).len(), 2);
+        kv.flush();
+        kv.compact_all();
+        // The expired row is physically gone; the live one remains.
+        let remaining = kv.scan_prefix(&[Cf::Metadata as u8]);
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(s.get(1, b"live"), Ok(Some(b"v".to_vec())));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
