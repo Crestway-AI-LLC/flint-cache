@@ -32,6 +32,8 @@ enum Expect {
     /// Flat field/value reply compared as an unordered map (HGETALL —
     /// Redis hash iteration order is unspecified).
     UnorderedPairs(Vec<(&'static [u8], &'static [u8])>),
+    /// Array of bulk strings compared as an unordered set (SMEMBERS).
+    UnorderedStrs(Vec<&'static [u8]>),
 }
 
 struct Case {
@@ -428,6 +430,156 @@ fn corpus() -> Vec<Case> {
                 s(&[b"GET", b"wt-h"], Expect::Str(b"overwritten")),
             ],
         },
+        Case {
+            family: "sets",
+            name: "sadd srem sismember smembers scard",
+            steps: vec![
+                s(&[b"SADD", b"s1", b"a", b"b", b"a"], Expect::Int(2)),
+                s(&[b"SADD", b"s1", b"b", b"c"], Expect::Int(1)),
+                s(&[b"SCARD", b"s1"], Expect::Int(3)),
+                s(&[b"SISMEMBER", b"s1", b"a"], Expect::Int(1)),
+                s(&[b"SISMEMBER", b"s1", b"zz"], Expect::Int(0)),
+                s(
+                    &[b"SMEMBERS", b"s1"],
+                    Expect::UnorderedStrs(vec![b"a", b"b", b"c"]),
+                ),
+                s(&[b"SMEMBERS", b"nosuch"], Expect::UnorderedStrs(vec![])),
+                s(&[b"SREM", b"s1", b"a", b"zz"], Expect::Int(1)),
+                s(&[b"SREM", b"s1", b"b", b"c"], Expect::Int(2)),
+                s(&[b"EXISTS", b"s1"], Expect::Int(0)),
+                s(&[b"TYPE", b"s1"], Expect::Simple("none")),
+            ],
+        },
+        Case {
+            family: "lists",
+            name: "push pop order",
+            steps: vec![
+                s(&[b"RPUSH", b"l1", b"a", b"b"], Expect::Int(2)),
+                s(&[b"LPUSH", b"l1", b"c"], Expect::Int(3)),
+                s(&[b"TYPE", b"l1"], Expect::Simple("list")),
+                s(
+                    &[b"LRANGE", b"l1", b"0", b"-1"],
+                    Expect::Arr(vec![
+                        Expect::Str(b"c"),
+                        Expect::Str(b"a"),
+                        Expect::Str(b"b"),
+                    ]),
+                ),
+                s(&[b"LPOP", b"l1"], Expect::Str(b"c")),
+                s(&[b"RPOP", b"l1"], Expect::Str(b"b")),
+                s(&[b"LLEN", b"l1"], Expect::Int(1)),
+                s(&[b"LPOP", b"l1"], Expect::Str(b"a")),
+                s(&[b"EXISTS", b"l1"], Expect::Int(0)),
+                s(&[b"LPOP", b"l1"], Expect::Nil),
+            ],
+        },
+        Case {
+            family: "lists",
+            name: "lpush multi reverses",
+            steps: vec![
+                s(&[b"LPUSH", b"l2", b"a", b"b", b"c"], Expect::Int(3)),
+                s(
+                    &[b"LRANGE", b"l2", b"0", b"-1"],
+                    Expect::Arr(vec![
+                        Expect::Str(b"c"),
+                        Expect::Str(b"b"),
+                        Expect::Str(b"a"),
+                    ]),
+                ),
+            ],
+        },
+        Case {
+            family: "lists",
+            name: "lrange negative indices and clamping",
+            steps: vec![
+                s(&[b"RPUSH", b"l3", b"a", b"b", b"c", b"d"], Expect::Int(4)),
+                s(
+                    &[b"LRANGE", b"l3", b"-2", b"-1"],
+                    Expect::Arr(vec![Expect::Str(b"c"), Expect::Str(b"d")]),
+                ),
+                s(
+                    &[b"LRANGE", b"l3", b"0", b"99"],
+                    Expect::Arr(vec![
+                        Expect::Str(b"a"),
+                        Expect::Str(b"b"),
+                        Expect::Str(b"c"),
+                        Expect::Str(b"d"),
+                    ]),
+                ),
+                s(&[b"LRANGE", b"l3", b"3", b"1"], Expect::Arr(vec![])),
+                s(&[b"LRANGE", b"nosuch", b"0", b"-1"], Expect::Arr(vec![])),
+            ],
+        },
+        Case {
+            family: "zsets",
+            name: "zadd zscore zrange ordering",
+            steps: vec![
+                s(
+                    &[b"ZADD", b"z1", b"2", b"b", b"1", b"a", b"3", b"c"],
+                    Expect::Int(3),
+                ),
+                s(&[b"ZSCORE", b"z1", b"b"], Expect::Str(b"2")),
+                s(&[b"ZSCORE", b"z1", b"missing"], Expect::Nil),
+                s(&[b"ZCARD", b"z1"], Expect::Int(3)),
+                s(
+                    &[b"ZRANGE", b"z1", b"0", b"-1"],
+                    Expect::Arr(vec![
+                        Expect::Str(b"a"),
+                        Expect::Str(b"b"),
+                        Expect::Str(b"c"),
+                    ]),
+                ),
+                s(
+                    &[b"ZRANGE", b"z1", b"0", b"1", b"WITHSCORES"],
+                    Expect::Arr(vec![
+                        Expect::Str(b"a"),
+                        Expect::Str(b"1"),
+                        Expect::Str(b"b"),
+                        Expect::Str(b"2"),
+                    ]),
+                ),
+            ],
+        },
+        Case {
+            family: "zsets",
+            name: "score update reorders without double count",
+            steps: vec![
+                s(&[b"ZADD", b"z2", b"1", b"a", b"2", b"b"], Expect::Int(2)),
+                s(&[b"ZADD", b"z2", b"5", b"a"], Expect::Int(0)),
+                s(&[b"ZCARD", b"z2"], Expect::Int(2)),
+                s(
+                    &[b"ZRANGE", b"z2", b"0", b"-1"],
+                    Expect::Arr(vec![Expect::Str(b"b"), Expect::Str(b"a")]),
+                ),
+                s(&[b"ZSCORE", b"z2", b"a"], Expect::Str(b"5")),
+            ],
+        },
+        Case {
+            family: "zsets",
+            name: "zrem to empty removes key; decimal scores",
+            steps: vec![
+                s(&[b"ZADD", b"z3", b"1.5", b"a"], Expect::Int(1)),
+                s(&[b"ZSCORE", b"z3", b"a"], Expect::Str(b"1.5")),
+                s(&[b"ZREM", b"z3", b"a", b"zz"], Expect::Int(1)),
+                s(&[b"EXISTS", b"z3"], Expect::Int(0)),
+                s(&[b"ZADD", b"z3", b"nope", b"a"], Expect::AnyError),
+            ],
+        },
+        Case {
+            family: "protocol",
+            name: "wrongtype across new families",
+            steps: vec![
+                s(&[b"SET", b"wt2-s", b"v"], Expect::Ok),
+                s(&[b"SADD", b"wt2-s", b"m"], Expect::AnyError),
+                s(&[b"LPUSH", b"wt2-s", b"m"], Expect::AnyError),
+                s(&[b"ZADD", b"wt2-s", b"1", b"m"], Expect::AnyError),
+                s(&[b"RPUSH", b"wt2-l", b"x"], Expect::Int(1)),
+                s(&[b"GET", b"wt2-l"], Expect::AnyError),
+                s(&[b"SMEMBERS", b"wt2-l"], Expect::AnyError),
+                s(&[b"HGET", b"wt2-l", b"f"], Expect::AnyError),
+                s(&[b"DEL", b"wt2-l"], Expect::Int(1)),
+            ],
+        },
     ]
 }
 
@@ -493,6 +645,22 @@ fn matches(expect: &Expect, got: &Value) -> bool {
         Expect::Arr(items) => match got {
             Value::Array(Some(vals)) if vals.len() == items.len() => {
                 items.iter().zip(vals).all(|(e, v)| matches(e, v))
+            }
+            _ => false,
+        },
+        Expect::UnorderedStrs(items) => match got {
+            Value::Array(Some(vals)) if vals.len() == items.len() => {
+                let mut got_s: Vec<Vec<u8>> = Vec::new();
+                for v in vals {
+                    match v {
+                        Value::Bulk(Some(b)) => got_s.push(b.clone()),
+                        _ => return false,
+                    }
+                }
+                got_s.sort();
+                let mut want: Vec<Vec<u8>> = items.iter().map(|i| i.to_vec()).collect();
+                want.sort();
+                got_s == want
             }
             _ => false,
         },

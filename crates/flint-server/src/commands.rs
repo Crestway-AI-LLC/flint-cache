@@ -11,7 +11,10 @@ use flint_slot::slot_for_key;
 use flint_storage::Kv;
 use flint_storage::hashes::HashStore;
 use flint_storage::keyspace::{Keyspace, Ttl};
+use flint_storage::lists::ListStore;
+use flint_storage::sets::SetStore;
 use flint_storage::strings::{Clock, SetExpiry, SetOptions, SetOutcome, StoreError, StringStore};
+use flint_storage::zsets::ZSetStore;
 
 /// v0 runs a single default namespace; tenancy arrives with the proxy.
 const NS: &[u8] = b"0";
@@ -20,6 +23,9 @@ pub struct Dispatcher<'a> {
     keyspace: Keyspace<'a>,
     strings: StringStore<'a>,
     hashes: HashStore<'a>,
+    sets: SetStore<'a>,
+    lists: ListStore<'a>,
+    zsets: ZSetStore<'a>,
     kv: &'a dyn Kv,
     clock: Clock,
 }
@@ -30,6 +36,9 @@ impl<'a> Dispatcher<'a> {
             keyspace: Keyspace::new(kv, NS, clock),
             strings: StringStore::new(kv, NS, clock),
             hashes: HashStore::new(kv, NS, clock),
+            sets: SetStore::new(kv, NS, clock),
+            lists: ListStore::new(kv, NS, clock),
+            zsets: ZSetStore::new(kv, NS, clock),
             kv,
             clock,
         }
@@ -175,6 +184,108 @@ impl<'a> Dispatcher<'a> {
                 })
             }),
 
+            // sets
+            b"SADD" => {
+                if args.len() < 3 {
+                    return arity_err("sadd");
+                }
+                reply(
+                    self.sets.sadd(slot_for_key(&args[1]), &args[1], &args[2..]),
+                    |n| Value::Integer(n as i64),
+                )
+            }
+            b"SREM" => {
+                if args.len() < 3 {
+                    return arity_err("srem");
+                }
+                reply(
+                    self.sets.srem(slot_for_key(&args[1]), &args[1], &args[2..]),
+                    |n| Value::Integer(n as i64),
+                )
+            }
+            b"SISMEMBER" => exact(args, 3, "sismember", |a| {
+                reply(
+                    self.sets.sismember(slot_for_key(&a[1]), &a[1], &a[2]),
+                    |b| Value::Integer(b as i64),
+                )
+            }),
+            b"SMEMBERS" => exact(args, 2, "smembers", |a| {
+                reply(self.sets.smembers(slot_for_key(&a[1]), &a[1]), |ms| {
+                    Value::Array(Some(ms.into_iter().map(|m| Value::Bulk(Some(m))).collect()))
+                })
+            }),
+            b"SCARD" => exact(args, 2, "scard", |a| {
+                reply(self.sets.scard(slot_for_key(&a[1]), &a[1]), |n| {
+                    Value::Integer(n as i64)
+                })
+            }),
+
+            // lists
+            b"LPUSH" | b"RPUSH" => {
+                if args.len() < 3 {
+                    return arity_err(if name.eq_ignore_ascii_case(b"LPUSH") {
+                        "lpush"
+                    } else {
+                        "rpush"
+                    });
+                }
+                let left = name.eq_ignore_ascii_case(b"LPUSH");
+                reply(
+                    self.lists
+                        .push(slot_for_key(&args[1]), &args[1], &args[2..], left),
+                    |n| Value::Integer(n as i64),
+                )
+            }
+            b"LPOP" | b"RPOP" => exact(args, 2, "lpop", |a| {
+                let left = name.eq_ignore_ascii_case(b"LPOP");
+                reply(
+                    self.lists.pop(slot_for_key(&a[1]), &a[1], left),
+                    Value::Bulk,
+                )
+            }),
+            b"LLEN" => exact(args, 2, "llen", |a| {
+                reply(self.lists.llen(slot_for_key(&a[1]), &a[1]), |n| {
+                    Value::Integer(n as i64)
+                })
+            }),
+            b"LRANGE" => exact(args, 4, "lrange", |a| {
+                match (parse_i64(&a[2]), parse_i64(&a[3])) {
+                    (Ok(start), Ok(stop)) => reply(
+                        self.lists.lrange(slot_for_key(&a[1]), &a[1], start, stop),
+                        |vs| {
+                            Value::Array(Some(
+                                vs.into_iter().map(|v| Value::Bulk(Some(v))).collect(),
+                            ))
+                        },
+                    ),
+                    _ => err("ERR value is not an integer or out of range"),
+                }
+            }),
+
+            // zsets
+            b"ZADD" => self.cmd_zadd(args),
+            b"ZSCORE" => exact(args, 3, "zscore", |a| {
+                reply(self.zsets.zscore(slot_for_key(&a[1]), &a[1], &a[2]), |s| {
+                    Value::Bulk(s.map(fmt_score))
+                })
+            }),
+            b"ZREM" => {
+                if args.len() < 3 {
+                    return arity_err("zrem");
+                }
+                reply(
+                    self.zsets
+                        .zrem(slot_for_key(&args[1]), &args[1], &args[2..]),
+                    |n| Value::Integer(n as i64),
+                )
+            }
+            b"ZCARD" => exact(args, 2, "zcard", |a| {
+                reply(self.zsets.zcard(slot_for_key(&a[1]), &a[1]), |n| {
+                    Value::Integer(n as i64)
+                })
+            }),
+            b"ZRANGE" => self.cmd_zrange(args),
+
             // keyspace (type-agnostic)
             b"DEL" => multi_key(args, "del", |k| self.keyspace.del(slot_for_key(k), k)),
             b"EXISTS" => multi_key(args, "exists", |k| self.keyspace.exists(slot_for_key(k), k)),
@@ -269,6 +380,49 @@ impl<'a> Dispatcher<'a> {
         )
     }
 
+    fn cmd_zadd(&self, args: &[Vec<u8>]) -> Value {
+        if args.len() < 4 || !(args.len() - 2).is_multiple_of(2) {
+            return arity_err("zadd");
+        }
+        let mut pairs = Vec::with_capacity((args.len() - 2) / 2);
+        for chunk in args[2..].chunks(2) {
+            let Ok(score) = parse_f64(&chunk[0]) else {
+                return err("ERR value is not a valid float");
+            };
+            pairs.push((score, chunk[1].clone()));
+        }
+        reply(
+            self.zsets.zadd(slot_for_key(&args[1]), &args[1], &pairs),
+            |n| Value::Integer(n as i64),
+        )
+    }
+
+    fn cmd_zrange(&self, args: &[Vec<u8>]) -> Value {
+        let withscores = match args.len() {
+            4 => false,
+            5 if args[4].eq_ignore_ascii_case(b"WITHSCORES") => true,
+            4..=5 => return err("ERR syntax error"),
+            _ => return arity_err("zrange"),
+        };
+        match (parse_i64(&args[2]), parse_i64(&args[3])) {
+            (Ok(start), Ok(stop)) => reply(
+                self.zsets
+                    .zrange(slot_for_key(&args[1]), &args[1], start, stop),
+                |ranked| {
+                    let mut out = Vec::new();
+                    for (member, score) in ranked {
+                        out.push(Value::Bulk(Some(member)));
+                        if withscores {
+                            out.push(Value::Bulk(Some(fmt_score(score))));
+                        }
+                    }
+                    Value::Array(Some(out))
+                },
+            ),
+            _ => err("ERR value is not an integer or out of range"),
+        }
+    }
+
     fn cmd_expire(&self, args: &[Vec<u8>], name: &str, unit_ms: u64) -> Value {
         exact(args, 3, name, |a| match parse_i64(&a[2]) {
             Ok(n) => {
@@ -337,6 +491,22 @@ fn multi_key(args: &[Vec<u8>], name: &str, mut f: impl FnMut(&[u8]) -> bool) -> 
         return arity_err(name);
     }
     Value::Integer(args[1..].iter().filter(|k| f(k)).count() as i64)
+}
+
+/// Redis-compatible score formatting: integers print without a decimal
+/// point; everything else uses shortest-roundtrip.
+fn fmt_score(s: f64) -> Vec<u8> {
+    if s.fract() == 0.0 && s.is_finite() && s.abs() < 1e17 {
+        format!("{}", s as i64).into_bytes()
+    } else {
+        format!("{s}").into_bytes()
+    }
+}
+
+fn parse_f64(raw: &[u8]) -> Result<f64, ()> {
+    let s = std::str::from_utf8(raw).map_err(|_| ())?;
+    let v: f64 = s.parse().map_err(|_| ())?;
+    if v.is_nan() { Err(()) } else { Ok(v) }
 }
 
 fn parse_i64(raw: &[u8]) -> Result<i64, ()> {

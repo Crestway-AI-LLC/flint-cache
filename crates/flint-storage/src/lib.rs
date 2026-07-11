@@ -19,7 +19,10 @@
 pub mod encoding;
 pub mod hashes;
 pub mod keyspace;
+pub mod lists;
+pub mod sets;
 pub mod strings;
+pub mod zsets;
 
 #[cfg(feature = "rocksdb")]
 pub mod rocks;

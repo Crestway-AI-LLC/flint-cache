@@ -379,3 +379,129 @@ mod complex_tests {
         assert!(c > b, "version must grow even if clock goes backward");
     }
 }
+
+/// List metadata: `header | version | size | head(8B BE, biased) | tail`.
+/// Elements live at indices head..tail (exclusive tail); size = tail - head.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ListMeta {
+    pub base: ComplexMeta,
+    pub head: i64,
+    pub tail: i64,
+}
+
+impl ListMeta {
+    pub fn new(version: u64) -> Self {
+        Self {
+            base: ComplexMeta::new(ValueType::List, version),
+            head: 0,
+            tail: 0,
+        }
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = self.base.encode();
+        out.extend_from_slice(&bias_index(self.head).to_be_bytes());
+        out.extend_from_slice(&bias_index(self.tail).to_be_bytes());
+        out
+    }
+
+    pub fn decode(row: &[u8]) -> Option<Self> {
+        let base = ComplexMeta::decode(row)?;
+        if row.len() < HEADER_LEN + 12 + 16 {
+            return None;
+        }
+        let off = HEADER_LEN + 12;
+        Some(Self {
+            base,
+            head: unbias_index(u64::from_be_bytes(row[off..off + 8].try_into().ok()?)),
+            tail: unbias_index(u64::from_be_bytes(row[off + 8..off + 16].try_into().ok()?)),
+        })
+    }
+}
+
+/// Bias a signed list index so the unsigned BE bytes sort in index order.
+pub fn bias_index(i: i64) -> u64 {
+    (i as u64) ^ (1u64 << 63)
+}
+
+pub fn unbias_index(b: u64) -> i64 {
+    (b ^ (1u64 << 63)) as i64
+}
+
+/// Order-preserving f64 encoding: the BE bytes of the result sort exactly
+/// like the doubles (including negatives). Standard sign-flip trick.
+pub fn encode_score(s: f64) -> u64 {
+    let bits = s.to_bits();
+    if bits & (1u64 << 63) != 0 {
+        !bits
+    } else {
+        bits | (1u64 << 63)
+    }
+}
+
+pub fn decode_score(e: u64) -> f64 {
+    let bits = if e & (1u64 << 63) != 0 {
+        e & !(1u64 << 63)
+    } else {
+        !e
+    };
+    f64::from_bits(bits)
+}
+
+/// Score-index row key in the ZScore CF:
+/// `Z | ns_len | ns | slot | key_len | user_key | version | score(8B) | member`.
+pub fn zscore_envelope(
+    ns: &[u8],
+    slot: u16,
+    user_key: &[u8],
+    version: u64,
+    score: f64,
+    member: &[u8],
+) -> Vec<u8> {
+    let mut k = zscore_prefix(ns, slot, user_key, version);
+    k.extend_from_slice(&encode_score(score).to_be_bytes());
+    k.extend_from_slice(member);
+    k
+}
+
+pub fn zscore_prefix(ns: &[u8], slot: u16, user_key: &[u8], version: u64) -> Vec<u8> {
+    let mut k = Vec::with_capacity(1 + 1 + ns.len() + 2 + 2 + user_key.len() + 8);
+    k.push(Cf::ZScore as u8);
+    k.push(ns.len() as u8);
+    k.extend_from_slice(ns);
+    k.extend_from_slice(&slot.to_be_bytes());
+    k.extend_from_slice(&(user_key.len() as u16).to_be_bytes());
+    k.extend_from_slice(user_key);
+    k.extend_from_slice(&version.to_be_bytes());
+    k
+}
+
+#[cfg(test)]
+mod order_tests {
+    use super::*;
+
+    #[test]
+    fn list_meta_roundtrip_and_bias_order() {
+        let mut m = ListMeta::new(9);
+        m.head = -3;
+        m.tail = 4;
+        assert_eq!(ListMeta::decode(&m.encode()), Some(m));
+        let idx = [-5i64, -1, 0, 1, 7];
+        let enc: Vec<u64> = idx.iter().map(|&i| bias_index(i)).collect();
+        let mut sorted = enc.clone();
+        sorted.sort();
+        assert_eq!(enc, sorted, "biased indices must sort in index order");
+        assert_eq!(unbias_index(bias_index(-42)), -42);
+    }
+
+    #[test]
+    fn score_encoding_orders_like_f64() {
+        let scores = [-1000.5, -1.0, -0.0, 0.0, 0.25, 1.0, 99999.0];
+        let enc: Vec<u64> = scores.iter().map(|&s| encode_score(s)).collect();
+        let mut sorted = enc.clone();
+        sorted.sort();
+        assert_eq!(enc, sorted, "encoded scores must sort like doubles");
+        assert_eq!(decode_score(encode_score(2.5)), 2.5);
+        assert_eq!(decode_score(encode_score(-7.25)), -7.25);
+    }
+}
