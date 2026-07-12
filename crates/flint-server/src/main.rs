@@ -257,10 +257,11 @@ fn flintinfo(read_only: bool, rocks: &Option<RocksHandle>, hub: &Arc<ReplHub>) -
     let latest = rocks.as_ref().map(|kv| kv.latest_seq()).unwrap_or(0);
     let last_applied = rocks.as_ref().map(|kv| kv.last_applied()).unwrap_or(0);
     let info = format!(
-        "role:{}\r\nlatest_seq:{latest}\r\nlast_applied:{last_applied}\r\nacked_seq:{}\r\nlive_replica:{}\r\nlag_ms:{}\r\nlag_soft_ms:{soft}\r\nlag_hard_ms:{hard}\r\n",
+        "role:{}\r\nlatest_seq:{latest}\r\nlast_applied:{last_applied}\r\nacked_seq:{}\r\nlive_replicas:{}\r\nlag_ms:{}\r\nlag_soft_ms:{soft}\r\nlag_hard_ms:{hard}\r\n",
         if read_only { "replica" } else { "master" },
-        hub.acked(),
-        hub.has_live_replica(now) as u8,
+        hub.effective_acked(now)
+            .map_or_else(|| "none".into(), |a| a.to_string()),
+        hub.live_replica_count(now),
         hub.lag_ms(now)
             .map_or_else(|| "none".into(), |l| l.to_string()),
         soft = hub.lag_soft_ms,
@@ -323,10 +324,14 @@ fn flintsync(
     stream.write_all(&out)?;
     eprintln!("replica connected, streaming from seq {cursor}");
     // ACK reader: the replica confirms applied sequences on the same socket.
+    let replica_id = hub.register_replica();
     {
         let reader = stream.try_clone()?;
         let hub = Arc::clone(hub);
-        std::thread::spawn(move || ack_reader(reader, &hub));
+        std::thread::spawn(move || {
+            ack_reader(reader, &hub, replica_id);
+            hub.unregister_replica(replica_id);
+        });
     }
     loop {
         hub.record_sample(kv.latest_seq(), flint_storage::strings::system_clock());
@@ -377,7 +382,7 @@ fn flintsync(
 }
 
 #[cfg(feature = "rocks")]
-fn ack_reader(mut stream: TcpStream, hub: &Arc<ReplHub>) {
+fn ack_reader(mut stream: TcpStream, hub: &Arc<ReplHub>, replica_id: u64) {
     let mut buf: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 4096];
     loop {
@@ -389,7 +394,7 @@ fn ack_reader(mut stream: TcpStream, hub: &Arc<ReplHub>) {
                     && tag.eq_ignore_ascii_case(b"ACK")
                     && let Some(seq) = std::str::from_utf8(raw).ok().and_then(|s| s.parse().ok())
                 {
-                    hub.record_ack(seq, flint_storage::strings::system_clock());
+                    hub.record_ack(replica_id, seq, flint_storage::strings::system_clock());
                 }
             }
             Ok(Decoded::NeedMore) => {

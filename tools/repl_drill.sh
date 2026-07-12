@@ -68,7 +68,7 @@ echo "== FLINTINFO"
 MINFO=$(valkey-cli -p "$MPORT" FLINTINFO)
 RINFO=$(valkey-cli -p "$RPORT" FLINTINFO)
 echo "$MINFO" | grep -q "role:master" || { echo "FAIL: master role"; exit 1; }
-echo "$MINFO" | grep -q "live_replica:1" || { echo "FAIL: master does not see live replica"; echo "$MINFO"; exit 1; }
+echo "$MINFO" | grep -q "live_replicas:1" || { echo "FAIL: master does not see live replica"; echo "$MINFO"; exit 1; }
 echo "$RINFO" | grep -q "role:replica" || { echo "FAIL: replica role"; exit 1; }
 echo "$MINFO" | tr '\r' ' '
 

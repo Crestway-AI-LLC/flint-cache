@@ -9,7 +9,7 @@
 //! means no backpressure — the degraded window is governed by the snapshot
 //! bound, not the lag cap (docs/design.md §2.5).
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -31,10 +31,11 @@ pub struct ReplHub {
     pub lag_soft_ms: u64,
     /// Hard cap (ms): shed writes beyond this lag — the RPO bound.
     pub lag_hard_ms: u64,
-    /// Freshest replica-acknowledged master sequence.
-    acked: AtomicU64,
-    /// Wall time of the most recent ACK.
-    last_ack_ms: AtomicU64,
+    next_id: AtomicU64,
+    /// Per-replica ack state: id -> (acked_seq, last_ack_ms). The RPO
+    /// reference is the freshest LIVE replica: a dead replica's cursor
+    /// must not count, because promotion can only choose among the living.
+    replicas: Mutex<HashMap<u64, (u64, u64)>>,
     /// (master_seq, wall_ms) samples, ascending in both.
     samples: Mutex<VecDeque<(u64, u64)>>,
 }
@@ -51,10 +52,24 @@ impl ReplHub {
         Self {
             lag_soft_ms,
             lag_hard_ms: lag_hard_ms.max(lag_soft_ms),
-            acked: AtomicU64::new(0),
-            last_ack_ms: AtomicU64::new(0),
+            next_id: AtomicU64::new(1),
+            replicas: Mutex::new(HashMap::new()),
             samples: Mutex::new(VecDeque::new()),
         }
+    }
+
+    /// A replication connection announces itself; ACKs carry its id.
+    pub fn register_replica(&self) -> u64 {
+        self.next_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Connection teardown. A crashed link that never unregisters is
+    /// equally handled by the liveness window.
+    pub fn unregister_replica(&self, id: u64) {
+        self.replicas
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&id);
     }
 
     /// Record "master was at `seq` at time `now_ms`" (stream loop cadence).
@@ -69,28 +84,44 @@ impl ReplHub {
         }
     }
 
-    pub fn record_ack(&self, seq: u64, now_ms: u64) {
-        self.acked.fetch_max(seq, Ordering::Relaxed);
-        self.last_ack_ms.fetch_max(now_ms, Ordering::Relaxed);
+    pub fn record_ack(&self, id: u64, seq: u64, now_ms: u64) {
+        let mut replicas = self.replicas.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = replicas.entry(id).or_insert((0, 0));
+        entry.0 = entry.0.max(seq);
+        entry.1 = entry.1.max(now_ms);
     }
 
-    pub fn acked(&self) -> u64 {
-        self.acked.load(Ordering::Relaxed)
+    /// Freshest cursor among LIVE replicas — the promotion candidate's
+    /// cursor, and therefore the RPO reference. None = no live replica.
+    pub fn effective_acked(&self, now_ms: u64) -> Option<u64> {
+        self.replicas
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .filter(|(_, last)| *last != 0 && now_ms.saturating_sub(*last) <= LIVENESS_WINDOW_MS)
+            .map(|(acked, _)| *acked)
+            .max()
+    }
+
+    pub fn live_replica_count(&self, now_ms: u64) -> usize {
+        self.replicas
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .filter(|(_, last)| *last != 0 && now_ms.saturating_sub(*last) <= LIVENESS_WINDOW_MS)
+            .count()
     }
 
     pub fn has_live_replica(&self, now_ms: u64) -> bool {
-        let last = self.last_ack_ms.load(Ordering::Relaxed);
-        last != 0 && now_ms.saturating_sub(last) <= LIVENESS_WINDOW_MS
+        self.effective_acked(now_ms).is_some()
     }
 
-    /// Time-lag of the freshest replica. None = no live replica (no cap).
+    /// Time-lag of the freshest LIVE replica (the smallest gap). None = no
+    /// live replica (no cap; the degraded window is snapshot-bounded).
     pub fn lag_ms(&self, now_ms: u64) -> Option<u64> {
-        if !self.has_live_replica(now_ms) {
-            return None;
-        }
-        let acked = self.acked();
+        let acked = self.effective_acked(now_ms)?;
         let samples = self.samples.lock().unwrap_or_else(|e| e.into_inner());
-        // Earliest sample the replica has NOT confirmed yet.
+        // Earliest sample the freshest replica has NOT confirmed yet.
         match samples.iter().find(|&&(seq, _)| seq > acked) {
             Some(&(_, ts)) => Some(now_ms.saturating_sub(ts)),
             None => Some(0),
@@ -103,18 +134,41 @@ mod tests {
     use super::*;
 
     #[test]
-    fn lag_is_age_of_oldest_unacked_write() {
+    fn lag_tracks_the_freshest_live_replica() {
         let hub = ReplHub::default();
         hub.record_sample(10, 1_000);
         hub.record_sample(20, 1_400);
         hub.record_sample(30, 1_800);
-        hub.record_ack(10, 1_900);
-        // Oldest unacked sample is seq 20 at t=1400.
-        assert_eq!(hub.lag_ms(2_000), Some(600));
-        hub.record_ack(20, 2_000);
-        assert_eq!(hub.lag_ms(2_050), Some(250));
-        hub.record_ack(30, 2_100);
-        assert_eq!(hub.lag_ms(2_100), Some(0), "fully caught up");
+        let fast = hub.register_replica();
+        let slow = hub.register_replica();
+        hub.record_ack(slow, 10, 1_900);
+        hub.record_ack(fast, 20, 1_900);
+        // Freshest (fast, acked 20) governs: oldest unacked is seq 30 @1800.
+        assert_eq!(hub.effective_acked(2_000), Some(20));
+        assert_eq!(hub.lag_ms(2_000), Some(200));
+        hub.record_ack(fast, 30, 2_000);
+        assert_eq!(hub.lag_ms(2_050), Some(0), "freshest fully caught up");
+        assert_eq!(hub.live_replica_count(2_050), 2);
+    }
+
+    #[test]
+    fn dead_freshest_replica_stops_counting() {
+        let hub = ReplHub::default();
+        hub.record_sample(10, 1_000);
+        hub.record_sample(30, 1_500);
+        let fast = hub.register_replica();
+        let slow = hub.register_replica();
+        hub.record_ack(fast, 30, 1_600);
+        hub.record_ack(slow, 10, 1_600);
+        assert_eq!(hub.effective_acked(1_700), Some(30));
+        // The fast replica dies; the slow one keeps acking its old cursor.
+        let later = 1_600 + LIVENESS_WINDOW_MS + 500;
+        hub.record_ack(slow, 10, later);
+        // RPO reference falls back to the best LIVE replica (acked 10):
+        // lag is now measured against seq 30 written at t=1500.
+        assert_eq!(hub.effective_acked(later), Some(10));
+        assert_eq!(hub.lag_ms(later), Some(later - 1_500));
+        assert_eq!(hub.live_replica_count(later), 1);
     }
 
     #[test]
@@ -122,10 +176,16 @@ mod tests {
         let hub = ReplHub::default();
         hub.record_sample(10, 1_000);
         assert_eq!(hub.lag_ms(1_500), None, "never acked = not live");
-        hub.record_ack(5, 1_500);
+        let r = hub.register_replica();
+        hub.record_ack(r, 5, 1_500);
         assert!(hub.lag_ms(1_600).is_some());
         // Liveness window expires.
         assert_eq!(hub.lag_ms(1_500 + LIVENESS_WINDOW_MS + 1), None);
+        // Unregister removes immediately.
+        hub.record_ack(r, 6, 5_000);
+        assert!(hub.has_live_replica(5_001));
+        hub.unregister_replica(r);
+        assert!(!hub.has_live_replica(5_001));
     }
 
     #[test]
