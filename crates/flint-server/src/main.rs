@@ -332,6 +332,14 @@ fn serve(
                         stream.write_all(&out)?;
                         return flintfullsync(stream, rocks);
                     }
+                    if args
+                        .first()
+                        .is_some_and(|n| n.eq_ignore_ascii_case(b"FLINTMIGRATEOUT"))
+                    {
+                        buf.drain(..consumed);
+                        stream.write_all(&out)?;
+                        return flintmigrateout(stream, rocks, &args);
+                    }
                     let reply = execute(
                         store,
                         read_only,
@@ -426,6 +434,18 @@ fn execute(
         .is_some_and(|n| n.eq_ignore_ascii_case(b"FLINTDEMOTE"))
     {
         return flintdemote(read_only, rocks, args);
+    }
+    // FLINTMIGRATEIN <src host:port> <slot>: pull a slot's data from a live
+    // source into this master (bulk snapshot + slot-filtered tail). Rejected
+    // on a replica — the imported slot must land on the destination's master.
+    if args
+        .first()
+        .is_some_and(|n| n.eq_ignore_ascii_case(b"FLINTMIGRATEIN"))
+    {
+        if ro {
+            return Value::Error("READONLY cannot migrate into a replica".into());
+        }
+        return flintmigratein(rocks, args);
     }
     // Lag-cap backpressure: the write path enforces the RPO bound. The
     // min-replicas gate comes first — with no live replica there is no lag
@@ -742,6 +762,254 @@ fn flintsync(
     }
 }
 
+/// Source side of a slot move: ship every row of `slot` (all CFs) as a bulk
+/// snapshot, then stream the slot-filtered live tail so writes that landed
+/// during the copy also reach the destination. Ownership does NOT change here
+/// — this is the data-shipping half; the atomic cutover (IMPORTING/MIGRATING
+/// plus -MOVED routing) is a separate step (ADR-0004). The destination
+/// decides when it is drained and closes the connection.
+#[cfg(feature = "rocks")]
+fn flintmigrateout(
+    mut stream: TcpStream,
+    rocks: Option<RocksHandle>,
+    args: &[Vec<u8>],
+) -> std::io::Result<()> {
+    use flint_storage::encoding::{Cf, slot_prefix};
+    use flint_storage::repl::{ReplError, ReplOp};
+
+    let mut out = Vec::new();
+    let Some(kv) = rocks else {
+        encode(
+            &Value::Error("ERR FLINTMIGRATEOUT requires the rocks engine".into()),
+            &mut out,
+        );
+        return stream.write_all(&out);
+    };
+    let Some(slot) = args
+        .get(1)
+        .and_then(|r| std::str::from_utf8(r).ok())
+        .and_then(|s| s.parse::<u16>().ok())
+    else {
+        encode(&Value::Error("ERR FLINTMIGRATEOUT <slot>".into()), &mut out);
+        return stream.write_all(&out);
+    };
+    let ns: &[u8] = b"0";
+    let prefixes: Vec<Vec<u8>> = [Cf::Metadata, Cf::Subkey, Cf::ZScore]
+        .iter()
+        .map(|&cf| slot_prefix(cf, ns, slot))
+        .collect();
+    let matches = |key: &[u8]| prefixes.iter().any(|p| key.starts_with(p));
+
+    // Snapshot BEFORE scanning: any write after this point reappears in the
+    // tail (Put is idempotent, so double-shipping a row is harmless).
+    let snapshot = kv.latest_seq();
+    encode(&Value::Simple("MIGRATEOUT-OK".into()), &mut out);
+    stream.write_all(&out)?;
+
+    // Bulk phase: every row of the slot, across all CFs.
+    let mut bulk_rows: u64 = 0;
+    for prefix in &prefixes {
+        out.clear();
+        for (k, v) in kv.scan_prefix(prefix) {
+            encode(
+                &Value::Array(Some(vec![
+                    Value::Bulk(Some(b"P".to_vec())),
+                    Value::Bulk(Some(k)),
+                    Value::Bulk(Some(v)),
+                ])),
+                &mut out,
+            );
+            bulk_rows += 1;
+        }
+        if !out.is_empty() {
+            stream.write_all(&out)?;
+        }
+    }
+    out.clear();
+    encode(
+        &Value::Array(Some(vec![
+            Value::Bulk(Some(b"BULK-END".to_vec())),
+            Value::Integer(snapshot as i64),
+            Value::Integer(bulk_rows as i64),
+        ])),
+        &mut out,
+    );
+    stream.write_all(&out)?;
+
+    // Tail phase: slot-filtered live ops from the snapshot, plus a CAUGHTUP
+    // heartbeat carrying (cursor, head) so the destination knows when it has
+    // drained. Loops until the destination closes (write error) — same
+    // lifetime model as flintsync.
+    let mut cursor = snapshot;
+    loop {
+        match kv.updates_since(cursor) {
+            Ok(batches) => {
+                out.clear();
+                for batch in &batches {
+                    for op in &batch.ops {
+                        match op {
+                            ReplOp::Put { key, value } if matches(key) => encode(
+                                &Value::Array(Some(vec![
+                                    Value::Bulk(Some(b"P".to_vec())),
+                                    Value::Bulk(Some(key.clone())),
+                                    Value::Bulk(Some(value.clone())),
+                                ])),
+                                &mut out,
+                            ),
+                            ReplOp::Delete { key } if matches(key) => encode(
+                                &Value::Array(Some(vec![
+                                    Value::Bulk(Some(b"D".to_vec())),
+                                    Value::Bulk(Some(key.clone())),
+                                ])),
+                                &mut out,
+                            ),
+                            _ => {}
+                        }
+                    }
+                    cursor = batch.last_seq;
+                }
+                encode(
+                    &Value::Array(Some(vec![
+                        Value::Bulk(Some(b"CAUGHTUP".to_vec())),
+                        Value::Integer(cursor as i64),
+                        Value::Integer(kv.latest_seq() as i64),
+                    ])),
+                    &mut out,
+                );
+                if stream.write_all(&out).is_err() {
+                    return Ok(());
+                }
+                if batches.is_empty() {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+            }
+            Err(ReplError::WalGap(_)) => {
+                out.clear();
+                encode(
+                    &Value::Error("WALGAP migration restart required".into()),
+                    &mut out,
+                );
+                let _ = stream.write_all(&out);
+                return Ok(());
+            }
+            Err(e) => {
+                eprintln!("migrateout stream error: {e:?}");
+                return Ok(());
+            }
+        }
+    }
+}
+
+/// Destination side of a slot move (drives FLINTMIGRATEOUT on the source):
+/// apply the bulk snapshot as local writes, then the slot-filtered tail,
+/// until the source reports the slot drained (cursor >= head). Applying via
+/// the normal write path means the imported slot becomes part of THIS node's
+/// replicated data, so its own replicas receive it too.
+#[cfg(feature = "rocks")]
+fn migrate_in(kv: &Arc<RocksKv>, src: &str, slot: u16) -> Value {
+    let mut stream = match TcpStream::connect(src) {
+        Ok(s) => s,
+        Err(e) => return Value::Error(format!("ERR migrate connect {src}: {e}")),
+    };
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
+    let mut out = Vec::new();
+    encode(
+        &Value::Array(Some(vec![
+            Value::Bulk(Some(b"FLINTMIGRATEOUT".to_vec())),
+            Value::Bulk(Some(slot.to_string().into_bytes())),
+        ])),
+        &mut out,
+    );
+    if stream.write_all(&out).is_err() {
+        return Value::Error("ERR migrate send failed".into());
+    }
+
+    let mut buf: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 64 * 1024];
+    let mut applied: u64 = 0;
+    let mut past_bulk = false;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    loop {
+        match decode(&buf) {
+            Ok(Decoded::Complete(frame, used)) => {
+                buf.drain(..used);
+                match frame {
+                    Value::Simple(s) if s == "MIGRATEOUT-OK" => {}
+                    Value::Error(e) => return Value::Error(format!("ERR migrate source: {e}")),
+                    Value::Array(Some(items)) => match items.as_slice() {
+                        [
+                            Value::Bulk(Some(t)),
+                            Value::Bulk(Some(k)),
+                            Value::Bulk(Some(v)),
+                        ] if t == b"P" => {
+                            kv.put(k, v);
+                            applied += 1;
+                        }
+                        [Value::Bulk(Some(t)), Value::Bulk(Some(k))] if t == b"D" => {
+                            kv.delete(k);
+                        }
+                        [
+                            Value::Bulk(Some(t)),
+                            Value::Integer(_snap),
+                            Value::Integer(_rows),
+                        ] if t == b"BULK-END" => {
+                            past_bulk = true;
+                        }
+                        // Drained: bulk done and the tail reached the source
+                        // head. (A clean cutover would freeze the slot on the
+                        // source first; here writes are expected to have
+                        // quiesced.)
+                        [
+                            Value::Bulk(Some(t)),
+                            Value::Integer(cursor),
+                            Value::Integer(head),
+                        ] if t == b"CAUGHTUP" && past_bulk && cursor >= head => {
+                            return Value::Simple(format!("MIGRATEIN-OK {applied}"));
+                        }
+                        _ => {}
+                    },
+                    _ => {}
+                }
+            }
+            Ok(Decoded::NeedMore) => {
+                if std::time::Instant::now() > deadline {
+                    return Value::Error("ERR migrate timed out before drain".into());
+                }
+                match stream.read(&mut chunk) {
+                    Ok(0) => return Value::Error("ERR migrate source closed".into()),
+                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    Err(ref e)
+                        if e.kind() == std::io::ErrorKind::WouldBlock
+                            || e.kind() == std::io::ErrorKind::TimedOut => {}
+                    Err(e) => return Value::Error(format!("ERR migrate read: {e}")),
+                }
+            }
+            Err(_) => return Value::Error("ERR migrate decode".into()),
+        }
+    }
+}
+
+#[cfg(feature = "rocks")]
+fn flintmigratein(rocks: &Option<RocksHandle>, args: &[Vec<u8>]) -> Value {
+    let Some(kv) = rocks else {
+        return Value::Error("ERR FLINTMIGRATEIN requires the rocks engine".into());
+    };
+    let (Some(src), Some(slot)) = (
+        args.get(1).and_then(|r| std::str::from_utf8(r).ok()),
+        args.get(2)
+            .and_then(|r| std::str::from_utf8(r).ok())
+            .and_then(|s| s.parse::<u16>().ok()),
+    ) else {
+        return Value::Error("ERR FLINTMIGRATEIN <host:port> <slot>".into());
+    };
+    migrate_in(kv, src, slot)
+}
+
+#[cfg(not(feature = "rocks"))]
+fn flintmigratein(_rocks: &Option<RocksHandle>, _args: &[Vec<u8>]) -> Value {
+    Value::Error("ERR FLINTMIGRATEIN requires a build with --features rocks".into())
+}
+
 #[cfg(feature = "rocks")]
 fn ack_reader(mut stream: TcpStream, hub: &Arc<ReplHub>, replica_id: u64) {
     let mut buf: Vec<u8> = Vec::new();
@@ -840,6 +1108,20 @@ fn flintsync(
     let mut out = Vec::new();
     encode(
         &Value::Error("ERR FLINTSYNC requires a build with --features rocks".into()),
+        &mut out,
+    );
+    stream.write_all(&out)
+}
+
+#[cfg(not(feature = "rocks"))]
+fn flintmigrateout(
+    mut stream: TcpStream,
+    _rocks: Option<RocksHandle>,
+    _args: &[Vec<u8>],
+) -> std::io::Result<()> {
+    let mut out = Vec::new();
+    encode(
+        &Value::Error("ERR FLINTMIGRATEOUT requires a build with --features rocks".into()),
         &mut out,
     );
     stream.write_all(&out)
