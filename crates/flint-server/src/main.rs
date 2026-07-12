@@ -510,6 +510,7 @@ fn flintsync(
                         })
                         .collect();
                     let frame = Value::Array(Some(vec![
+                        Value::Integer(batch.first_seq as i64),
                         Value::Integer(batch.last_seq as i64),
                         Value::Array(Some(ops)),
                     ]));
@@ -836,7 +837,12 @@ mod replica {
         let Value::Array(Some(items)) = frame else {
             return None;
         };
-        let [Value::Integer(last_seq), Value::Array(Some(raw_ops))] = items.as_slice() else {
+        let [
+            Value::Integer(first_seq),
+            Value::Integer(last_seq),
+            Value::Array(Some(raw_ops)),
+        ] = items.as_slice()
+        else {
             return None;
         };
         let mut ops = Vec::with_capacity(raw_ops.len());
@@ -862,6 +868,7 @@ mod replica {
             }
         }
         Some(ReplBatch {
+            first_seq: *first_seq as u64,
             last_seq: *last_seq as u64,
             ops,
         })

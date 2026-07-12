@@ -30,10 +30,13 @@ pub enum ReplOp {
     Delete { key: Vec<u8> },
 }
 
-/// One master WriteBatch worth of ops. `last_seq` is the sequence number of
-/// the final op in the batch — the replica's cursor after applying it.
+/// One master WriteBatch worth of ops (after floor-trimming and
+/// system-row filtering). `first_seq..=last_seq` is the master sequence
+/// span this batch covers — ops may be fewer than the span (filtered
+/// system rows still consume sequence numbers).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplBatch {
+    pub first_seq: u64,
     pub last_seq: u64,
     pub ops: Vec<ReplOp>,
 }
@@ -43,8 +46,20 @@ pub enum ReplError {
     /// The WAL no longer reaches back to the requested sequence (purged).
     /// The replica must full-sync from a checkpoint.
     WalGap(String),
+    /// A batch does not start where the cursor ends: frames were lost or
+    /// reordered. The replica must drop the link and re-request from its
+    /// durable cursor.
+    SequenceGap {
+        expected: u64,
+        got: u64,
+    },
     Storage(String),
 }
+
+/// Node-local system rows (manifest role/claims, the repl cursor itself)
+/// must NOT replicate: they are this node's identity, not data. They still
+/// consume sequence numbers, so filtering keeps the span but drops the op.
+const SYSTEM_PREFIX: &[u8] = b"\x00flint\x00";
 
 struct OpCollector {
     /// Sequence of the op about to be visited (pre-incremented).
@@ -57,7 +72,7 @@ struct OpCollector {
 impl WriteBatchIterator for OpCollector {
     fn put(&mut self, key: &[u8], value: &[u8]) {
         self.seq += 1;
-        if self.seq > self.floor {
+        if self.seq > self.floor && !key.starts_with(SYSTEM_PREFIX) {
             self.ops.push(ReplOp::Put {
                 key: key.to_vec(),
                 value: value.to_vec(),
@@ -67,7 +82,7 @@ impl WriteBatchIterator for OpCollector {
 
     fn delete(&mut self, key: &[u8]) {
         self.seq += 1;
-        if self.seq > self.floor {
+        if self.seq > self.floor && !key.starts_with(SYSTEM_PREFIX) {
             self.ops.push(ReplOp::Delete { key: key.to_vec() });
         }
     }
@@ -97,7 +112,12 @@ impl RocksKv {
             if last_seq <= last_applied {
                 continue; // entire batch already applied
             }
+            // The span starts after the floor even when the batch began
+            // below it (partial batch at the cursor boundary). A batch whose
+            // ops were ALL filtered still ships (empty) so the cursor
+            // advances and contiguity holds.
             out.push(ReplBatch {
+                first_seq: first_seq.max(last_applied + 1),
                 last_seq,
                 ops: collector.ops,
             });
@@ -106,7 +126,23 @@ impl RocksKv {
     }
 
     /// Replica side: apply one batch atomically together with the cursor.
+    ///
+    /// Idempotence is enforced here, not assumed: physical replay is only
+    /// safe when monotonic (re-applying an OLD batch would regress
+    /// overwritten keys and the cursor with them). Stale batches are
+    /// no-ops; a batch that does not start exactly at cursor+1 is a
+    /// SequenceGap — the replica must re-request from its durable cursor.
     pub fn apply_batch(&self, batch: &ReplBatch) -> Result<(), ReplError> {
+        let cursor = self.last_applied();
+        if batch.last_seq <= cursor {
+            return Ok(()); // already applied: idempotent no-op
+        }
+        if batch.first_seq != cursor + 1 {
+            return Err(ReplError::SequenceGap {
+                expected: cursor + 1,
+                got: batch.first_seq,
+            });
+        }
         let mut wb = WriteBatch::default();
         for op in &batch.ops {
             match op {
@@ -288,5 +324,97 @@ mod tests {
         assert_eq!(reopened.last_applied(), cursor, "cursor is durable");
         // And catch-up from the durable cursor finds nothing new.
         assert_eq!(catch_up(&master, &reopened), 0);
+    }
+
+    #[test]
+    fn stale_batch_replay_is_a_guarded_noop() {
+        let (md, rd) = (TempDir::new("m5"), TempDir::new("r5"));
+        let master = RocksKv::open(&md.0).expect("open");
+        let replica = RocksKv::open(&rd.0).expect("open");
+        let s = StringStore::new(&master, b"0", system_clock);
+        s.set(1, b"k", b"v1", SetOptions::default()).expect("set");
+        let old_batches = master.updates_since(0).expect("tail");
+        s.set(1, b"k", b"v2", SetOptions::default()).expect("set");
+        catch_up(&master, &replica);
+        let cursor = replica.last_applied();
+        let rs = StringStore::new(&replica, b"0", system_clock);
+        assert_eq!(rs.get(1, b"k"), Ok(Some(b"v2".to_vec())));
+        // Replaying the OLD batch (k=v1) must not regress state or cursor.
+        for b in &old_batches {
+            replica.apply_batch(b).expect("stale apply is a no-op");
+        }
+        assert_eq!(rs.get(1, b"k"), Ok(Some(b"v2".to_vec())), "no regression");
+        assert_eq!(replica.last_applied(), cursor, "cursor did not move");
+    }
+
+    #[test]
+    fn sequence_gaps_are_rejected() {
+        let (md, rd) = (TempDir::new("m6"), TempDir::new("r6"));
+        let master = RocksKv::open(&md.0).expect("open");
+        let replica = RocksKv::open(&rd.0).expect("open");
+        let s = StringStore::new(&master, b"0", system_clock);
+        s.set(1, b"a", b"1", SetOptions::default()).expect("set");
+        s.set(1, b"b", b"2", SetOptions::default()).expect("set");
+        s.set(1, b"c", b"3", SetOptions::default()).expect("set");
+        let batches = master.updates_since(0).expect("tail");
+        assert!(batches.len() >= 3);
+        replica.apply_batch(&batches[0]).expect("first");
+        // Skipping a batch must be detected, not silently absorbed.
+        let err = replica.apply_batch(&batches[2]).expect_err("gap");
+        assert!(matches!(err, ReplError::SequenceGap { .. }), "{err:?}");
+        // Applying in order proceeds normally.
+        replica.apply_batch(&batches[1]).expect("second");
+        replica.apply_batch(&batches[2]).expect("third");
+    }
+
+    #[test]
+    fn system_rows_do_not_replicate_but_advance_the_cursor() {
+        use crate::manifest::{self, Epoch, Role, RoleClaim};
+        let (md, rd) = (TempDir::new("m7"), TempDir::new("r7"));
+        let master = RocksKv::open(&md.0).expect("open");
+        let replica = RocksKv::open(&rd.0).expect("open");
+        // Master writes its own manifest (role) — a system row.
+        manifest::set_role(
+            &master,
+            RoleClaim {
+                role: Role::Master,
+                epoch: Epoch {
+                    generation: 0,
+                    counter: 1,
+                },
+            },
+        )
+        .expect("role");
+        let s = StringStore::new(&master, b"0", system_clock);
+        s.set(1, b"k", b"v", SetOptions::default()).expect("set");
+        // Replica has its own identity that must survive tailing.
+        manifest::set_role(
+            &replica,
+            RoleClaim {
+                role: Role::Replica,
+                epoch: Epoch {
+                    generation: 0,
+                    counter: 1,
+                },
+            },
+        )
+        .expect("replica role");
+        catch_up(&master, &replica);
+        // Data replicated; the master's role row did NOT overwrite ours.
+        let rs = StringStore::new(&replica, b"0", system_clock);
+        assert_eq!(rs.get(1, b"k"), Ok(Some(b"v".to_vec())));
+        assert_eq!(
+            manifest::read_role(&replica).expect("role").role,
+            Role::Replica,
+            "master identity must not leak through the stream"
+        );
+        // Cursor covers the filtered rows too (span preserved).
+        assert_eq!(replica.last_applied(), master.latest_seq());
+        assert!(
+            master
+                .updates_since(replica.last_applied())
+                .expect("tail")
+                .is_empty()
+        );
     }
 }
