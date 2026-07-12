@@ -1,0 +1,15 @@
+[package]
+name = "flint-chaos"
+description = "Chaos harness: random kill of master/replica under load with a ledger-verified no-loss/no-corruption oracle"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+flint-resp = { path = "../flint-resp" }
+flint-slot = { path = "../flint-slot" }
+rand = { version = "0.9", features = ["small_rng"] }
+
+[lints]
+workspace = true

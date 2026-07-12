@@ -66,7 +66,15 @@ fn main() -> std::io::Result<()> {
             }
             let kv = RocksKv::open(std::path::Path::new(&dir))
                 .map_err(|e| std::io::Error::other(format!("rocksdb open: {e}")))?;
-            if fresh && replica_of.is_some() && kv.last_applied() == 0 {
+            if fresh && replica_of.is_some() {
+                // The checkpoint copies the SOURCE's system rows — including
+                // its replication cursor, which is the source's OLD upstream
+                // position (frozen at its promotion), not ours. Like the
+                // role row, the cursor is node-local identity and must be
+                // reasserted at seed time: our true cursor is the copied
+                // DB's own latest sequence. (Found by chaos: the inherited
+                // marker caused a permanent SequenceGap loop against
+                // promoted masters, leaving pairs unreplicated.)
                 let cursor = kv.latest_seq();
                 kv.set_last_applied(cursor)
                     .map_err(|e| std::io::Error::other(format!("cursor init: {e:?}")))?;
