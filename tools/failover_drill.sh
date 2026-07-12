@@ -84,4 +84,34 @@ W2=$(valkey-cli -p "$RPORT" SET after-restart still-master)
 [ "$W2" = "OK" ] || { echo "FAIL: promoted role lost after restart: $W2"; exit 1; }
 [ "$(valkey-cli -p "$RPORT" GET after-failover)" = "works" ] || { echo "FAIL: post-promotion data lost"; exit 1; }
 
-echo "PASS: epoch-fenced promotion, durable role, data intact"
+echo "== ZOMBIE: restart the OLD master on its old data dir"
+"$BIN" --port "$MPORT" --engine rocks --data-dir "$MDIR" &
+sleep 0.6
+# Hazard demonstrated: it still believes it is master (accepts a write).
+Z=$(valkey-cli -p "$MPORT" SET zombie-write bad 2>&1)
+[ "$Z" = "OK" ] || { echo "FAIL: expected the zombie hazard (write accepted), got: $Z"; exit 1; }
+echo "zombie accepts writes (hazard confirmed; the trio's lease will close this window)"
+
+echo "== fence the zombie with FLINTDEMOTE at a higher epoch"
+CUR=$(valkey-cli -p "$RPORT" FLINTINFO | tr '\r' ' ' | grep -oE 'role_epoch:\([0-9]+,[0-9]+\)' | grep -oE '[0-9]+\)' | tr -d ')')
+NEXT=$((CUR + 1))
+D=$(valkey-cli -p "$MPORT" FLINTDEMOTE 0 "$NEXT")
+echo "$D" | grep -q "OK demoted" || { echo "FAIL: demotion refused: $D"; exit 1; }
+echo "$D"
+RO=$(valkey-cli -p "$MPORT" SET should-fail x 2>&1 || true)
+echo "$RO" | grep -q "READONLY" || { echo "FAIL: zombie still writable after demote: $RO"; exit 1; }
+
+echo "== stale demotion epoch is FENCED"
+F4=$(valkey-cli -p "$MPORT" FLINTDEMOTE 0 "$NEXT" 2>&1 || true)
+echo "$F4" | grep -q "FENCED" || { echo "FAIL: equal-epoch demotion accepted: $F4"; exit 1; }
+
+echo "== demotion survives restart (durable fencing)"
+pkill -f "flint-server --port $MPORT"
+sleep 0.4
+"$BIN" --port "$MPORT" --engine rocks --data-dir "$MDIR" &
+sleep 0.6
+RO2=$(valkey-cli -p "$MPORT" SET should-fail x 2>&1 || true)
+echo "$RO2" | grep -q "READONLY" || { echo "FAIL: zombie writable again after restart: $RO2"; exit 1; }
+echo "demoted role held across restart"
+
+echo "PASS: epoch-fenced promotion + demotion, durable roles, zombie fenced, data intact"

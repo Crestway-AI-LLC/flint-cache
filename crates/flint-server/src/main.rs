@@ -141,6 +141,13 @@ fn main() -> std::io::Result<()> {
                         eprintln!("manifest role is master (durable); ignoring --replica-of");
                         tailer_stop.store(true, Ordering::Relaxed);
                     }
+                    // ZOMBIE HAZARD (until the trio's leases land): if this
+                    // node was replaced while down, it will serve writes
+                    // alongside its successor until FLINTDEMOTE fences it.
+                    // The trio will demote returning masters automatically.
+                    eprintln!(
+                        "booting as MASTER from durable role; if a successor was promoted while this node was down, fence it with FLINTDEMOTE"
+                    );
                     read_only.store(false, Ordering::Relaxed);
                 }
                 Some(Role::Replica) => read_only.store(true, Ordering::Relaxed),
@@ -329,6 +336,12 @@ fn execute(
     {
         return flintpromote(read_only, tailer_stop, rocks, args);
     }
+    if args
+        .first()
+        .is_some_and(|n| n.eq_ignore_ascii_case(b"FLINTDEMOTE"))
+    {
+        return flintdemote(read_only, rocks, args);
+    }
     // Lag-cap backpressure: the write path enforces the RPO bound.
     if is_write && !ro {
         let now = flint_storage::strings::system_clock();
@@ -418,6 +431,74 @@ fn flintpromote(
     _args: &[Vec<u8>],
 ) -> Value {
     Value::Error("ERR FLINTPROMOTE requires a build with --features rocks".into())
+}
+
+/// FLINTDEMOTE <generation> <counter>: epoch-fenced fencing of a (possibly
+/// stale, possibly returning) master. The counterpart of FLINTPROMOTE and
+/// the tool the trio (or an operator) uses to silence a zombie: a killed
+/// master restarted on its old data dir still holds role:Master durably and
+/// would accept writes alongside the promoted successor. Demotion persists
+/// role:Replica at a strictly higher epoch — surviving restarts — and flips
+/// the node read-only immediately.
+///
+/// Demotion does NOT start tailing: the node's data may hold a divergent
+/// suffix (writes the successor never saw). v0 resync is the spare pattern
+/// — wipe the data dir and restart with --replica-of for a fresh full sync.
+/// The delta-rejoin with divergence quarantine is trio-era work.
+#[cfg(feature = "rocks")]
+fn flintdemote(
+    read_only: &Arc<AtomicBool>,
+    rocks: &Option<RocksHandle>,
+    args: &[Vec<u8>],
+) -> Value {
+    use flint_storage::manifest::{self, Epoch, ManifestError, Role, RoleClaim};
+    let Some(kv) = rocks else {
+        return Value::Error("ERR FLINTDEMOTE requires the rocks engine".into());
+    };
+    let (Some(generation), Some(counter)) = (
+        args.get(1)
+            .and_then(|raw| std::str::from_utf8(raw).ok())
+            .and_then(|s| s.parse().ok()),
+        args.get(2)
+            .and_then(|raw| std::str::from_utf8(raw).ok())
+            .and_then(|s| s.parse().ok()),
+    ) else {
+        return Value::Error("ERR usage: FLINTDEMOTE <generation> <counter>".into());
+    };
+    let epoch = Epoch {
+        generation,
+        counter,
+    };
+    match manifest::set_role(
+        kv.as_ref(),
+        RoleClaim {
+            role: Role::Replica,
+            epoch,
+        },
+    ) {
+        Ok(()) => {
+            // Durable role first, then flip runtime state: no window where a
+            // crash resurrects a writable master.
+            read_only.store(true, Ordering::Relaxed);
+            eprintln!(
+                "demoted to replica at role epoch {epoch} (fenced; wipe + --replica-of to resync)"
+            );
+            Value::Simple(format!("OK demoted at {epoch}"))
+        }
+        Err(ManifestError::Fenced { current }) => Value::Error(format!(
+            "FENCED current role epoch is {current}, demotion epoch must exceed it"
+        )),
+        Err(e) => Value::Error(format!("ERR manifest: {e:?}")),
+    }
+}
+
+#[cfg(not(feature = "rocks"))]
+fn flintdemote(
+    _read_only: &Arc<AtomicBool>,
+    _rocks: &Option<RocksHandle>,
+    _args: &[Vec<u8>],
+) -> Value {
+    Value::Error("ERR FLINTDEMOTE requires a build with --features rocks".into())
 }
 
 #[cfg(feature = "rocks")]
