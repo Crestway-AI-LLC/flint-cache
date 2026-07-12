@@ -14,4 +14,7 @@ for seed in $SEEDS; do
   pkill -9 -f flint-server 2>/dev/null || true
   sleep 0.3
 done
+echo "== chain traversal (200k elements) under failover"
+./target/release/chain --elements "${ELEMENTS:-200000}" --kills 12 --seed 13
+pkill -9 -f flint-server 2>/dev/null || true
 echo "ALL SEEDS PASSED"

@@ -1,6 +1,29 @@
-# BUG-0001: full-sync loses data under concurrent load (OPEN)
+# BUG-0001: promotion of an unconverged replica loses data (RESOLVED)
 
-Status: OPEN · Found: 2026-07-13 by flint-chaos `chain` workload · Severity: high (data loss)
+Status: RESOLVED 2026-07-13 · Found by flint-chaos `chain` workload · Severity: high (data loss)
+
+## Root cause (confirmed)
+NOT checkpoint streaming. `wait_healthy`/promotion-readiness gated on
+`lag_ms` (time-lag = age of the oldest un-acked write). When a write burst
+ends and the master goes idle, time-lag instantly falls to ~0 even while the
+replica still has a large SEQUENCE backlog to drain. A replica ~35k keys
+behind reported "caught up" (live + lag_ms:0), was promoted mid-backlog, and
+froze an incomplete dataset — which then propagated through every subsequent
+promotion. Direct evidence: instrumented DBSIZE probe showed
+`master=200000 replica=164896` at the first "healthy" check.
+
+## Fix
+Added `seq_lag = latest_seq - effective_acked` to FLINTINFO — the
+promotion-READINESS signal. A replica is promotion-eligible only when
+seq_lag == 0 (fully converged) in addition to the time-lag cap (which stays
+for the RPO bound, where time is the correct unit). `wait_healthy` now
+requires live && seq_lag==0 && lag_ms<cap. The real trio will gate
+promotion on the same seq convergence. After the fix, chain passes at 200k
+across all seeds and at 1,000,000 elements through 15 kills; DBSIZE probes
+read master==replica at every attach.
+
+## Original triage notes
+
 
 ## Symptom
 The chain-traversal chaos test (build a 200k-element linked list, then walk

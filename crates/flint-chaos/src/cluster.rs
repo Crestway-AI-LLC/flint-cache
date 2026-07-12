@@ -168,6 +168,14 @@ pub fn wait_for_pong(port: u16, budget: Duration) -> bool {
     false
 }
 
+pub fn dbsize(port: u16) -> Option<i64> {
+    let mut c = Client::connect(port).ok()?;
+    match c.call(&[b"DBSIZE"]).ok()? {
+        Value::Integer(n) => Some(n),
+        _ => None,
+    }
+}
+
 fn flintinfo_field(port: u16, field: &str) -> Option<String> {
     let mut c = Client::connect(port).ok()?;
     let Value::Bulk(Some(info)) = c.call(&[b"FLINTINFO"]).ok()? else {
@@ -220,17 +228,28 @@ impl Cluster {
         self.master_port
     }
 
-    /// True once the replica is live and lag is under the cap — the healthy
-    /// regime where steady-state failover loses nothing.
+    pub fn replica(&self) -> u16 {
+        self.replica_port
+    }
+
+    /// True once the replica is live AND has fully converged in sequence
+    /// (seq_lag == 0) AND is within the time-lag cap. Sequence convergence
+    /// is the promotion-readiness signal: a replica draining a backlog can
+    /// show time-lag ~0 (no recent writes) while still missing tens of
+    /// thousands of keys — promoting it then freezes an incomplete dataset
+    /// (BUG-0001). Requiring seq_lag == 0 is what makes failover safe.
     pub fn wait_healthy(&self, budget: Duration) -> bool {
         let start = Instant::now();
         while start.elapsed() < budget {
             let live = flintinfo_field(self.master_port, "live_replicas:")
                 .is_some_and(|v| v.trim() != "0");
-            let caught_up = flintinfo_field(self.master_port, "lag_ms:")
+            let converged = flintinfo_field(self.master_port, "seq_lag:")
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .is_some_and(|lag| lag == 0);
+            let in_time = flintinfo_field(self.master_port, "lag_ms:")
                 .and_then(|v| v.trim().parse::<u64>().ok())
                 .is_some_and(|lag| lag < 400);
-            if live && caught_up {
+            if live && converged && in_time {
                 return true;
             }
             std::thread::sleep(Duration::from_millis(50));

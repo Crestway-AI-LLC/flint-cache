@@ -19,7 +19,7 @@
 
 use std::time::Duration;
 
-use flint_chaos::cluster::{Client, Cluster, arg};
+use flint_chaos::cluster::{Client, Cluster, arg, dbsize};
 use flint_resp::Value;
 use rand::{Rng, SeedableRng, rngs::SmallRng};
 
@@ -64,6 +64,11 @@ fn main() {
         cluster.wait_healthy(Duration::from_secs(60)),
         "replica must fully catch up before traversal"
     );
+    eprintln!(
+        "  [integrity] post-build: master={:?} replica={:?}",
+        dbsize(cluster.master()),
+        dbsize(cluster.replica())
+    );
 
     // --- Traverse phase: follow pointers, killing at random intervals.
     // Schedule kills at distinct random hop positions across the walk.
@@ -90,6 +95,23 @@ fn main() {
             } else {
                 cluster.kill_replica();
                 eprintln!("  hop {hops}: killed REPLICA");
+            }
+            // Integrity probe: once the replacement reports healthy, its
+            // key count must match the master's exactly (no writes are in
+            // flight during traversal). Catches truncation at the attach
+            // where it happens instead of thousands of hops later.
+            if cluster.wait_healthy(Duration::from_secs(30)) {
+                let (m, r) = (dbsize(cluster.master()), dbsize(cluster.replica()));
+                eprintln!("  [integrity] master={m:?} replica={r:?}");
+                assert_eq!(
+                    m,
+                    r,
+                    "TRUNCATED SEED at hop {hops}: master :{} has {m:?} keys, replica :{} has {r:?}",
+                    cluster.master(),
+                    cluster.replica()
+                );
+            } else {
+                eprintln!("  [integrity] replacement never became healthy");
             }
             c = Client::connect(cluster.master()).expect("reconnect after kill");
             kill_idx += 1;

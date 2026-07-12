@@ -419,8 +419,17 @@ fn flintinfo(read_only: bool, rocks: &Option<RocksHandle>, hub: &Arc<ReplHub>) -
         .and_then(|kv| flint_storage::manifest::read_role(kv.as_ref()))
         .map(|c| c.epoch.to_string())
         .unwrap_or_else(|| "none".into());
+    // Sequence lag: how many master sequence numbers the freshest live
+    // replica still trails. Unlike time-lag (age of the oldest un-acked
+    // write, which the RPO cap uses), this stays large while a replica
+    // drains a backlog even after writes stop — so it is the correct
+    // promotion-READINESS signal. "none" when no live replica.
+    let seq_lag = match hub.effective_acked(now) {
+        Some(acked) => latest.saturating_sub(acked).to_string(),
+        None => "none".into(),
+    };
     let info = format!(
-        "role:{}\r\nrole_epoch:{role_epoch}\r\nlatest_seq:{latest}\r\nlast_applied:{last_applied}\r\nacked_seq:{}\r\nlive_replicas:{}\r\nlag_ms:{}\r\nlag_soft_ms:{soft}\r\nlag_hard_ms:{hard}\r\n",
+        "role:{}\r\nrole_epoch:{role_epoch}\r\nlatest_seq:{latest}\r\nlast_applied:{last_applied}\r\nacked_seq:{}\r\nseq_lag:{seq_lag}\r\nlive_replicas:{}\r\nlag_ms:{}\r\nlag_soft_ms:{soft}\r\nlag_hard_ms:{hard}\r\n",
         if read_only { "replica" } else { "master" },
         hub.effective_acked(now)
             .map_or_else(|| "none".into(), |a| a.to_string()),

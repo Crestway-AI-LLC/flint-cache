@@ -635,6 +635,19 @@ fn corpus() -> Vec<Case> {
                 s(&[b"LINDEX", b"nosuch", b"0"], Expect::Nil),
             ],
         },
+        Case {
+            family: "keyspace",
+            name: "dbsize counts live keys",
+            steps: vec![
+                s(&[b"DBSIZE"], Expect::Int(0)),
+                s(&[b"SET", b"d1", b"v"], Expect::Ok),
+                s(&[b"SET", b"d2", b"v"], Expect::Ok),
+                s(&[b"HSET", b"d3", b"f", b"v"], Expect::Int(1)),
+                s(&[b"DBSIZE"], Expect::Int(3)),
+                s(&[b"DEL", b"d1"], Expect::Int(1)),
+                s(&[b"DBSIZE"], Expect::Int(2)),
+            ],
+        },
     ]
 }
 

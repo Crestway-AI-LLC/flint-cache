@@ -389,6 +389,22 @@ impl<'a> Dispatcher<'a> {
             }),
 
             // admin
+            b"DBSIZE" => {
+                // O(n) scan of metadata rows, skipping expired ones. Fine at
+                // v0 scale; becomes a maintained counter with per-slot
+                // accounting later. Doubles as the full-sync integrity probe.
+                let now = (self.clock)();
+                let live = self
+                    .kv
+                    .scan_prefix(&[flint_storage::encoding::Cf::Metadata as u8])
+                    .into_iter()
+                    .filter(|(_, row)| {
+                        flint_storage::encoding::MetaHeader::decode(row)
+                            .is_some_and(|h| !h.is_expired(now))
+                    })
+                    .count();
+                Value::Integer(live as i64)
+            }
             b"FLUSHALL" => {
                 self.kv.clear();
                 Value::Simple("OK".into())
