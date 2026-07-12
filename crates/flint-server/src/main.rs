@@ -15,6 +15,7 @@ mod repl_hub;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use flint_resp::{Decoded, Value, decode, encode};
 use flint_storage::{Kv, MemKv};
@@ -40,7 +41,9 @@ fn main() -> std::io::Result<()> {
         .unwrap_or(6380);
     let engine = arg("--engine").unwrap_or_else(|| "mem".into());
     let replica_of = arg("--replica-of");
-    let read_only = replica_of.is_some();
+    // Role is dynamic: FLINTPROMOTE flips a replica to master at runtime.
+    let read_only = Arc::new(AtomicBool::new(replica_of.is_some()));
+    let tailer_stop = Arc::new(AtomicBool::new(false));
 
     #[allow(unused_mut)]
     let mut rocks: Option<RocksHandle> = None;
@@ -69,6 +72,72 @@ fn main() -> std::io::Result<()> {
                     .map_err(|e| std::io::Error::other(format!("cursor init: {e:?}")))?;
                 eprintln!("full sync complete; tailing from seq {cursor}");
             }
+            // Initialize the manifest on first boot: default slot claim
+            // and a role claim at epoch (0,1).
+            use flint_storage::manifest::{self, Epoch, Role, RoleClaim, SlotClaim};
+            if manifest::read_claim(&kv, b"0").is_none() {
+                manifest::set_claim(
+                    &kv,
+                    &SlotClaim {
+                        ns: b"0".to_vec(),
+                        start: 0,
+                        end: 16383,
+                        epoch: Epoch {
+                            generation: 0,
+                            counter: 1,
+                        },
+                    },
+                )
+                .map_err(|e| std::io::Error::other(format!("manifest claim: {e:?}")))?;
+            }
+            if manifest::read_role(&kv).is_none() {
+                let role = if replica_of.is_some() {
+                    Role::Replica
+                } else {
+                    Role::Master
+                };
+                manifest::set_role(
+                    &kv,
+                    RoleClaim {
+                        role,
+                        epoch: Epoch {
+                            generation: 0,
+                            counter: 1,
+                        },
+                    },
+                )
+                .map_err(|e| std::io::Error::other(format!("manifest role: {e:?}")))?;
+            }
+            // A checkpoint full sync copied the MASTER's manifest; the
+            // seeded replica reasserts its own identity (same epoch, so
+            // promotion fencing still measures against the copied history).
+            if fresh && replica_of.is_some() {
+                let epoch = manifest::read_role(&kv).map(|c| c.epoch).unwrap_or(Epoch {
+                    generation: 0,
+                    counter: 1,
+                });
+                manifest::force_role(
+                    &kv,
+                    RoleClaim {
+                        role: Role::Replica,
+                        epoch,
+                    },
+                );
+            }
+            // The DURABLE role is authoritative over CLI flags: a promoted
+            // master restarted with a stale --replica-of must stay master
+            // (and must not tail its old peer).
+            match manifest::read_role(&kv).map(|c| c.role) {
+                Some(Role::Master) => {
+                    if replica_of.is_some() {
+                        eprintln!("manifest role is master (durable); ignoring --replica-of");
+                        tailer_stop.store(true, Ordering::Relaxed);
+                    }
+                    read_only.store(false, Ordering::Relaxed);
+                }
+                Some(Role::Replica) => read_only.store(true, Ordering::Relaxed),
+                None => {}
+            }
             let kv = Arc::new(kv);
             rocks = Some(Arc::clone(&kv));
             eprintln!("engine=rocks data-dir={dir}");
@@ -90,7 +159,8 @@ fn main() -> std::io::Result<()> {
     #[cfg(feature = "rocks")]
     if let (Some(target), Some(kv)) = (replica_of.clone(), rocks.clone()) {
         eprintln!("replica-of={target} (writes rejected with -READONLY)");
-        std::thread::spawn(move || replica::run(&target, &kv));
+        let stop = Arc::clone(&tailer_stop);
+        std::thread::spawn(move || replica::run(&target, &kv, &stop));
     }
 
     // RPO knobs: --lag-soft-ms delays writes, --lag-hard-ms sheds them.
@@ -115,8 +185,17 @@ fn main() -> std::io::Result<()> {
         #[allow(clippy::clone_on_copy)]
         let rocks = rocks.clone();
         let hub = Arc::clone(&hub);
+        let read_only = Arc::clone(&read_only);
+        let tailer_stop = Arc::clone(&tailer_stop);
         std::thread::spawn(move || {
-            let _ = serve(stream, store.as_ref(), read_only, rocks, &hub);
+            let _ = serve(
+                stream,
+                store.as_ref(),
+                &read_only,
+                &tailer_stop,
+                rocks,
+                &hub,
+            );
         });
     }
     Ok(())
@@ -125,7 +204,8 @@ fn main() -> std::io::Result<()> {
 fn serve(
     mut stream: TcpStream,
     store: &dyn Kv,
-    read_only: bool,
+    read_only: &Arc<AtomicBool>,
+    tailer_stop: &Arc<AtomicBool>,
     rocks: Option<RocksHandle>,
     hub: &Arc<ReplHub>,
 ) -> std::io::Result<()> {
@@ -155,7 +235,7 @@ fn serve(
                 if args.is_empty() {
                     continue;
                 }
-                let reply = execute(store, read_only, &rocks, hub, &args);
+                let reply = execute(store, read_only, tailer_stop, &rocks, hub, &args);
                 encode(&reply, &mut out);
                 continue;
             }
@@ -189,7 +269,7 @@ fn serve(
                         stream.write_all(&out)?;
                         return flintfullsync(stream, rocks);
                     }
-                    let reply = execute(store, read_only, &rocks, hub, &args);
+                    let reply = execute(store, read_only, tailer_stop, &rocks, hub, &args);
                     encode(&reply, &mut out);
                 }
                 Ok(Decoded::NeedMore) => break,
@@ -216,25 +296,33 @@ fn serve(
 
 fn execute(
     store: &dyn Kv,
-    read_only: bool,
+    read_only: &Arc<AtomicBool>,
+    tailer_stop: &Arc<AtomicBool>,
     rocks: &Option<RocksHandle>,
     hub: &Arc<ReplHub>,
     args: &[Vec<u8>],
 ) -> Value {
+    let ro = read_only.load(Ordering::Relaxed);
     let is_write = args
         .first()
         .is_some_and(|name| commands::is_write_command(name));
-    if read_only && is_write {
+    if ro && is_write {
         return Value::Error("READONLY You can't write against a read only replica.".into());
     }
     if args
         .first()
         .is_some_and(|n| n.eq_ignore_ascii_case(b"FLINTINFO"))
     {
-        return flintinfo(read_only, rocks, hub);
+        return flintinfo(ro, rocks, hub);
+    }
+    if args
+        .first()
+        .is_some_and(|n| n.eq_ignore_ascii_case(b"FLINTPROMOTE"))
+    {
+        return flintpromote(read_only, tailer_stop, rocks, args);
     }
     // Lag-cap backpressure: the write path enforces the RPO bound.
-    if is_write && !read_only {
+    if is_write && !ro {
         let now = flint_storage::strings::system_clock();
         match hub.lag_ms(now) {
             Some(lag) if lag >= hub.lag_hard_ms => {
@@ -251,13 +339,80 @@ fn execute(
     Dispatcher::new(store, flint_storage::strings::system_clock).dispatch(args)
 }
 
+/// FLINTPROMOTE <generation> <counter>: epoch-fenced promotion of a
+/// replica to master. The epoch must strictly exceed the stored role
+/// epoch (manifest fencing) — a stale promoter gets -FENCED with the
+/// current epoch. On success: role persisted first, then the tailer is
+/// stopped and writes open. Until the trio exists this is invoked by an
+/// operator (or a drill); the trio will call the same path.
+#[cfg(feature = "rocks")]
+fn flintpromote(
+    read_only: &Arc<AtomicBool>,
+    tailer_stop: &Arc<AtomicBool>,
+    rocks: &Option<RocksHandle>,
+    args: &[Vec<u8>],
+) -> Value {
+    use flint_storage::manifest::{self, Epoch, ManifestError, Role, RoleClaim};
+    let Some(kv) = rocks else {
+        return Value::Error("ERR FLINTPROMOTE requires the rocks engine".into());
+    };
+    let (Some(generation), Some(counter)) = (
+        args.get(1)
+            .and_then(|raw| std::str::from_utf8(raw).ok())
+            .and_then(|s| s.parse().ok()),
+        args.get(2)
+            .and_then(|raw| std::str::from_utf8(raw).ok())
+            .and_then(|s| s.parse().ok()),
+    ) else {
+        return Value::Error("ERR usage: FLINTPROMOTE <generation> <counter>".into());
+    };
+    let epoch = Epoch {
+        generation,
+        counter,
+    };
+    match manifest::set_role(
+        kv.as_ref(),
+        RoleClaim {
+            role: Role::Master,
+            epoch,
+        },
+    ) {
+        Ok(()) => {
+            // Durable role first; only then flip runtime state.
+            tailer_stop.store(true, Ordering::Relaxed);
+            read_only.store(false, Ordering::Relaxed);
+            eprintln!("promoted to master at role epoch {epoch}");
+            Value::Simple(format!("OK promoted at {epoch}"))
+        }
+        Err(ManifestError::Fenced { current }) => Value::Error(format!(
+            "FENCED current role epoch is {current}, promotion epoch must exceed it"
+        )),
+        Err(e) => Value::Error(format!("ERR manifest: {e:?}")),
+    }
+}
+
+#[cfg(not(feature = "rocks"))]
+fn flintpromote(
+    _read_only: &Arc<AtomicBool>,
+    _tailer_stop: &Arc<AtomicBool>,
+    _rocks: &Option<RocksHandle>,
+    _args: &[Vec<u8>],
+) -> Value {
+    Value::Error("ERR FLINTPROMOTE requires a build with --features rocks".into())
+}
+
 #[cfg(feature = "rocks")]
 fn flintinfo(read_only: bool, rocks: &Option<RocksHandle>, hub: &Arc<ReplHub>) -> Value {
     let now = flint_storage::strings::system_clock();
     let latest = rocks.as_ref().map(|kv| kv.latest_seq()).unwrap_or(0);
     let last_applied = rocks.as_ref().map(|kv| kv.last_applied()).unwrap_or(0);
+    let role_epoch = rocks
+        .as_ref()
+        .and_then(|kv| flint_storage::manifest::read_role(kv.as_ref()))
+        .map(|c| c.epoch.to_string())
+        .unwrap_or_else(|| "none".into());
     let info = format!(
-        "role:{}\r\nlatest_seq:{latest}\r\nlast_applied:{last_applied}\r\nacked_seq:{}\r\nlive_replicas:{}\r\nlag_ms:{}\r\nlag_soft_ms:{soft}\r\nlag_hard_ms:{hard}\r\n",
+        "role:{}\r\nrole_epoch:{role_epoch}\r\nlatest_seq:{latest}\r\nlast_applied:{last_applied}\r\nacked_seq:{}\r\nlive_replicas:{}\r\nlag_ms:{}\r\nlag_soft_ms:{soft}\r\nlag_hard_ms:{hard}\r\n",
         if read_only { "replica" } else { "master" },
         hub.effective_acked(now)
             .map_or_else(|| "none".into(), |a| a.to_string()),
@@ -491,10 +646,16 @@ mod replica {
     use super::*;
     use flint_storage::repl::{ReplBatch, ReplOp};
 
-    pub fn run(target: &str, kv: &Arc<RocksKv>) {
+    pub fn run(target: &str, kv: &Arc<RocksKv>, stop: &Arc<AtomicBool>) {
         loop {
-            if let Err(e) = tail_once(target, kv) {
-                eprintln!("replication link lost ({e}); reconnecting in 1s");
+            if stop.load(Ordering::Relaxed) {
+                eprintln!("tailer stopped (promoted)");
+                return;
+            }
+            if let Err(e) = tail_once(target, kv, stop) {
+                if !stop.load(Ordering::Relaxed) {
+                    eprintln!("replication link lost ({e}); reconnecting in 1s");
+                }
             }
             std::thread::sleep(std::time::Duration::from_secs(1));
         }
@@ -582,8 +743,10 @@ mod replica {
         }
     }
 
-    fn tail_once(target: &str, kv: &Arc<RocksKv>) -> std::io::Result<()> {
+    fn tail_once(target: &str, kv: &Arc<RocksKv>, stop: &Arc<AtomicBool>) -> std::io::Result<()> {
         let mut stream = TcpStream::connect(target)?;
+        // Short read timeout so the stop flag is honored promptly.
+        stream.set_read_timeout(Some(std::time::Duration::from_millis(300)))?;
         let cursor = kv.last_applied();
         let mut out = Vec::new();
         encode(
@@ -639,14 +802,25 @@ mod replica {
                     }
                 }
                 Ok(Decoded::NeedMore) => {
-                    let n = stream.read(&mut chunk)?;
-                    if n == 0 {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::UnexpectedEof,
-                            "master closed",
-                        ));
+                    if stop.load(Ordering::Relaxed) {
+                        return Ok(());
                     }
-                    buf.extend_from_slice(&chunk[..n]);
+                    match stream.read(&mut chunk) {
+                        Ok(0) => {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::UnexpectedEof,
+                                "master closed",
+                            ));
+                        }
+                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                        Err(e)
+                            if e.kind() == std::io::ErrorKind::WouldBlock
+                                || e.kind() == std::io::ErrorKind::TimedOut =>
+                        {
+                            continue; // timeout tick: loop re-checks stop
+                        }
+                        Err(e) => return Err(e),
+                    }
                 }
                 Err(e) => {
                     return Err(std::io::Error::new(
