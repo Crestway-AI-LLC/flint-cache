@@ -37,7 +37,7 @@ echo "== load 15000 keys into the current master"
 M=$(master_port)
 awk 'BEGIN{for(i=0;i<15000;i++){k=sprintf("key:%07d",i);v=sprintf("value-%07d",i);printf "*3\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n",length(k),k,length(v),v}}' \
   | valkey-cli -p $M --pipe | tail -1
-sleep 1.5   # let the replica converge
+sleep 2.0   # let the replica converge and the controller observe it
 
 for round in 1 2 3; do
   M=$(master_port)
@@ -63,6 +63,11 @@ for round in 1 2 3; do
     sleep 0.2
   done
   [ "$RECONVERGED" = "1" ] || { echo "FAIL: controller did not respawn+reconverge a replica"; tail -12 /tmp/flint-mng.log; exit 1; }
+  # Let the controller independently observe the converged pair before the
+  # next kill — it promotes only survivors IT has confirmed caught up
+  # (killing faster than any monitor polls is a degraded window, correctly
+  # refused; that is not the scenario under test here).
+  sleep 1.0
 
   # Data intact across the failover.
   [ "$(valkey-cli -p $OTHER GET key:0000000)" = "value-0000000" ] || { echo "FAIL: head lost"; exit 1; }
