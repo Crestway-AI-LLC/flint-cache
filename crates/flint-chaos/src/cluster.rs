@@ -136,6 +136,14 @@ fn spawn_node(port: u16, dir: &str, replica_of: Option<u16>) -> Child {
     if let Some(master) = replica_of {
         cmd.args(["--replica-of", &format!("127.0.0.1:{master}")]);
     }
+    // Optional write-quorum gate for every node the harness spawns (set by
+    // workloads exercising min-replicas-to-write under failover). Env-based
+    // so it reaches all spawn sites — bootstrap, promote-replace, respawn.
+    if let Ok(n) = std::env::var("FLINT_CHAOS_MIN_REPLICAS")
+        && n != "0"
+    {
+        cmd.args(["--min-replicas-to-write", &n]);
+    }
     let log = std::fs::File::create(format!("{dir}.log")).expect("node log");
     cmd.stderr(log)
         .stdout(std::process::Stdio::null())
@@ -357,11 +365,40 @@ impl Cluster {
         self.master_port
     }
 
+    /// Wait for the pair to be *sustainably* converged before a controlled
+    /// master kill. The controller resets its converged flag on each
+    /// promotion and re-promotes only a survivor it has independently
+    /// re-observed at seq_lag==0; wait_healthy proves the master's view, but
+    /// killing the instant it flips can outrun the controller's poll. Holding
+    /// that view stable for a window comfortably beyond confirm*poll
+    /// guarantees the controller's next sweep records it. (This is the
+    /// steady-state regime under test, not the degraded window.)
+    fn await_controller_observed(&self) {
+        let need = Duration::from_millis(1_300);
+        let deadline = Instant::now() + Duration::from_secs(12);
+        let mut converged_since: Option<Instant> = None;
+        while Instant::now() < deadline {
+            let converged = flintinfo_field(self.master_port, "seq_lag:")
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .is_some_and(|l| l == 0)
+                && flintinfo_field(self.master_port, "live_replicas:")
+                    .is_some_and(|v| v.trim() != "0");
+            match (converged, converged_since) {
+                (true, None) => converged_since = Some(Instant::now()),
+                (true, Some(t)) if t.elapsed() >= need => return,
+                (false, _) => converged_since = None,
+                _ => {}
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
     /// Controlled mode: kill the master, then WAIT for the external
     /// controller to promote the survivor (the harness does not promote).
     /// Re-attach a fresh replacement replica on the dead node's fixed port.
     pub fn kill_master_await_controller(&mut self) -> u16 {
         assert!(self.controlled, "use bootstrap_controlled");
+        self.await_controller_observed();
         self.master_kills += 1;
         let dead = self.master_port;
         let survivor = self.replica_port;

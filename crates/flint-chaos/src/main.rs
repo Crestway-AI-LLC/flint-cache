@@ -46,13 +46,31 @@ fn main() {
     let iterations: u32 = arg("--iterations", 12);
     let key_count: u64 = arg("--keys", 400);
     let mode: String = arg("--mode", "mixed".to_string());
-    println!("chaos-kv: {iterations} kills, {key_count} keys, mode={mode}");
+    let controller_driven = arg("--driver", "harness".to_string()) == "controller";
+    let min_replicas: u32 = arg("--min-replicas", 0);
+    if min_replicas > 0 {
+        // Gate every node the harness spawns; workloads must retry -THROTTLED.
+        unsafe { std::env::set_var("FLINT_CHAOS_MIN_REPLICAS", min_replicas.to_string()) };
+    }
+    println!(
+        "chaos-kv: {iterations} kills, {key_count} keys, mode={mode}, driver={}, min_replicas={min_replicas}",
+        if controller_driven {
+            "controller"
+        } else {
+            "harness"
+        }
+    );
 
-    let mut cluster = Cluster::bootstrap();
+    let mut cluster = if controller_driven {
+        Cluster::bootstrap_controlled(150, 3, 3_000)
+    } else {
+        Cluster::bootstrap()
+    };
     let mut ledger: HashMap<String, KeyLedger> = HashMap::new();
     let mut rng = SmallRng::seed_from_u64(arg("--seed", 42));
     let mut seq = 0u64;
     let mut acked_lost_total = 0u64;
+    let mut throttled_total = 0u64;
     let mut writer = Client::connect(cluster.master()).expect("writer connect");
 
     for iteration in 1..=iterations {
@@ -69,6 +87,10 @@ fn main() {
             match writer.call(&[b"SET", key.as_bytes(), value.as_bytes()]) {
                 Ok(Value::Simple(s)) if s == "OK" => entry.last_acked = seq,
                 Ok(Value::Error(e)) if e.starts_with("THROTTLED") => {
+                    // Widowed/lagging master shed this write; the client
+                    // contract is retry-with-backoff. It was never acked, so
+                    // the ledger does not count it — no false loss.
+                    throttled_total += 1;
                     std::thread::sleep(Duration::from_millis(20));
                 }
                 Ok(_) | Err(_) => {
@@ -88,7 +110,11 @@ fn main() {
         // Steady-state guard: only kill a master with a live, caught-up
         // replica — that tests the ≤1s RPO regime, not degraded-window loss.
         if want_master && cluster.wait_healthy(Duration::from_secs(8)) {
-            cluster.kill_master();
+            if controller_driven {
+                cluster.kill_master_await_controller();
+            } else {
+                cluster.kill_master();
+            }
             let mut c = Client::connect(cluster.master()).expect("new master");
             let mut lost_here = 0u64;
             for (key, entry) in ledger.iter_mut() {
@@ -117,7 +143,11 @@ fn main() {
             println!("iter {iteration}: killed MASTER; acked keys regressed: {lost_here}");
             writer = Client::connect(cluster.master()).expect("reconnect");
         } else {
-            cluster.kill_replica();
+            if controller_driven {
+                cluster.kill_replica_fixed();
+            } else {
+                cluster.kill_replica();
+            }
             let mut c = Client::connect(cluster.master()).expect("master");
             for (key, entry) in &ledger {
                 if entry.last_acked == 0 {
@@ -170,6 +200,9 @@ fn main() {
     println!("  corruption: 0  time-travel: 0  cross-key: 0");
     println!(
         "  acked keys regressed across master kills: {acked_lost_total} (async contract; replica kills: zero)"
+    );
+    println!(
+        "  writes shed -THROTTLED (retried): {throttled_total} (widowed/lag gate exercised when > 0)"
     );
     println!("  final walk: {present} present, {missing} missing-or-regressed");
 }

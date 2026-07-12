@@ -69,7 +69,12 @@ fn kill_port(port: u16) {
 /// data dir is wiped first — "spawn a fresh node" always seeds from scratch
 /// (full sync), never resurrects stale bytes. Returns the child so the
 /// supervisor can reap it on the next respawn (no defunct accumulation).
-fn spawn_slot(bin: &str, slot: &Slot, master: Option<&str>) -> std::process::Child {
+fn spawn_slot(
+    bin: &str,
+    slot: &Slot,
+    master: Option<&str>,
+    min_replicas: u32,
+) -> std::process::Child {
     kill_port(slot.port);
     let _ = std::fs::remove_dir_all(&slot.dir);
     let mut cmd = Command::new(bin);
@@ -83,6 +88,11 @@ fn spawn_slot(bin: &str, slot: &Slot, master: Option<&str>) -> std::process::Chi
     ]);
     if let Some(m) = master {
         cmd.args(["--replica-of", m]);
+    }
+    // Every managed node carries the write-quorum gate: roles float, so a
+    // replica promoted after a kill must also shed writes while widowed.
+    if min_replicas > 0 {
+        cmd.args(["--min-replicas-to-write", &min_replicas.to_string()]);
     }
     cmd.stderr(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -213,6 +223,11 @@ fn main() {
         })
         .unwrap_or_default();
     let managed = !slots.is_empty();
+    // Passed to every managed node so a promoted-then-widowed master sheds
+    // writes (Redis min-replicas-to-write). 0 = disabled.
+    let min_replicas: u32 = arg("--min-replicas-to-write")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
     let bin = server_bin();
     let nodes: Vec<String> = if managed {
         slots
@@ -256,12 +271,12 @@ fn main() {
         // rest as fresh replicas of it.
         if managed && states.iter().all(|n| !n.reachable) {
             eprintln!("[{id}] bootstrapping managed pair");
-            let c0 = spawn_slot(&bin, &slots[0], None);
+            let c0 = spawn_slot(&bin, &slots[0], None, min_replicas);
             reap(0, c0, &mut slot_child);
             let master_addr = nodes[0].clone();
             std::thread::sleep(Duration::from_millis(600));
             for (i, slot) in slots.iter().enumerate().skip(1) {
-                let c = spawn_slot(&bin, slot, Some(&master_addr));
+                let c = spawn_slot(&bin, slot, Some(&master_addr), min_replicas);
                 reap(i, c, &mut slot_child);
             }
             std::thread::sleep(Duration::from_millis(400));
@@ -323,7 +338,7 @@ fn main() {
                             "[{id}] slot :{} dead — respawning as fresh replica of {}",
                             slot.port, legit.addr
                         );
-                        let c = spawn_slot(&bin, slot, Some(&legit.addr));
+                        let c = spawn_slot(&bin, slot, Some(&legit.addr), min_replicas);
                         reap(i, c, &mut slot_child);
                         slot_miss[i] = 0;
                         slot_cooldown[i] = Instant::now() + Duration::from_secs(20);
