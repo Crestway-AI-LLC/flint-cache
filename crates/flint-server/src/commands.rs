@@ -53,7 +53,8 @@ pub fn is_write_command(name: &[u8]) -> bool {
 /// for commands that don't target one key. v0 commands all place their key at
 /// args[1]; FLINT* admin/replication commands are intercepted before this, so
 /// only the no-key data/util commands need excluding. Used to check per-slot
-/// ownership and answer -MOVED after a migration.
+/// ownership and answer -MOVED after a migration (rocks builds only).
+#[cfg_attr(not(feature = "rocks"), allow(dead_code))]
 pub fn command_key(args: &[Vec<u8>]) -> Option<&[u8]> {
     let name = args.first()?;
     const NO_KEY: &[&[u8]] = &[
