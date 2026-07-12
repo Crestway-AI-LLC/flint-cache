@@ -101,7 +101,7 @@ mod tests {
             let slot = slot_for_key(key.as_bytes());
             write
                 .set(slot, key.as_bytes(), val.as_bytes(), SetOptions::default())
-                .unwrap();
+                .expect("seed set");
             keys_by_slot.entry(slot).or_default().push((key, val));
         }
 
@@ -133,12 +133,18 @@ mod tests {
         for slot in &moving {
             for (key, val) in &keys_by_slot[slot] {
                 assert_eq!(
-                    on_dst.get(*slot, key.as_bytes()).unwrap().as_deref(),
+                    on_dst
+                        .get(*slot, key.as_bytes())
+                        .expect("store read")
+                        .as_deref(),
                     Some(val.as_bytes()),
                     "moved key {key} not readable on destination"
                 );
                 assert!(
-                    on_src.get(*slot, key.as_bytes()).unwrap().is_none(),
+                    on_src
+                        .get(*slot, key.as_bytes())
+                        .expect("store read")
+                        .is_none(),
                     "moved key {key} still on source (cross-slot leak or missed delete)"
                 );
             }
@@ -147,12 +153,18 @@ mod tests {
         for slot in &staying {
             for (key, val) in &keys_by_slot[slot] {
                 assert_eq!(
-                    on_src.get(*slot, key.as_bytes()).unwrap().as_deref(),
+                    on_src
+                        .get(*slot, key.as_bytes())
+                        .expect("store read")
+                        .as_deref(),
                     Some(val.as_bytes()),
                     "stayed key {key} disturbed on source"
                 );
                 assert!(
-                    on_dst.get(*slot, key.as_bytes()).unwrap().is_none(),
+                    on_dst
+                        .get(*slot, key.as_bytes())
+                        .expect("store read")
+                        .is_none(),
                     "stayed key {key} leaked to destination"
                 );
             }
@@ -176,7 +188,7 @@ mod tests {
             .collect();
         {
             let h = HashStore::new(&src, NS, system_clock);
-            h.hset(slot, key, &fields).unwrap();
+            h.hset(slot, key, &fields).expect("hset");
         }
         // Meta row (M) + 50 field rows (S) = 51 rows for this one slot.
         assert_eq!(count_rows(&src), 51);
@@ -188,7 +200,7 @@ mod tests {
         let on_dst = HashStore::new(&dst, NS, system_clock);
         for (f, v) in &fields {
             assert_eq!(
-                on_dst.hget(slot, key, f).unwrap().as_deref(),
+                on_dst.hget(slot, key, f).expect("store read").as_deref(),
                 Some(v.as_slice()),
                 "hash field lost in migration"
             );
@@ -206,7 +218,9 @@ mod tests {
         let write = StringStore::new(&src, NS, system_clock);
         let key = b"k";
         let slot = slot_for_key(key);
-        write.set(slot, key, b"v", SetOptions::default()).unwrap();
+        write
+            .set(slot, key, b"v", SetOptions::default())
+            .expect("set");
 
         let first = migrate_slots(&src, &dst, NS, &[slot]);
         assert_eq!(first.rows_moved, 1);
@@ -234,18 +248,28 @@ mod tests {
         let sa = slot_for_key(a);
         let sb = slot_for_key(b);
         assert_ne!(sa, sb, "test needs two keys in different slots");
-        write.set(sa, a, b"A", SetOptions::default()).unwrap();
-        write.set(sb, b, b"B", SetOptions::default()).unwrap();
+        write
+            .set(sa, a, b"A", SetOptions::default())
+            .expect("set a");
+        write
+            .set(sb, b, b"B", SetOptions::default())
+            .expect("set b");
 
         migrate_slots(&src, &dst, NS, &[sa]);
 
         let on_src = StringStore::new(&src, NS, system_clock);
         let on_dst = StringStore::new(&dst, NS, system_clock);
         // Only slot sa moved.
-        assert_eq!(on_dst.get(sa, a).unwrap().as_deref(), Some(b"A".as_ref()));
-        assert!(on_src.get(sa, a).unwrap().is_none());
+        assert_eq!(
+            on_dst.get(sa, a).expect("store read").as_deref(),
+            Some(b"A".as_ref())
+        );
+        assert!(on_src.get(sa, a).expect("store read").is_none());
         // Slot sb untouched.
-        assert_eq!(on_src.get(sb, b).unwrap().as_deref(), Some(b"B".as_ref()));
-        assert!(on_dst.get(sb, b).unwrap().is_none());
+        assert_eq!(
+            on_src.get(sb, b).expect("store read").as_deref(),
+            Some(b"B".as_ref())
+        );
+        assert!(on_dst.get(sb, b).expect("store read").is_none());
     }
 }

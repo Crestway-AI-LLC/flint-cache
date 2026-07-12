@@ -18,6 +18,12 @@ use crate::Kv;
 /// System rows live outside the user envelope space ('M'/'S'/'Z').
 pub const ROLE_KEY: &[u8] = b"\x00flint\x00role";
 pub const CLAIM_KEY_PREFIX: &[u8] = b"\x00flint\x00claim\x00";
+/// In-flight slot migrations. Durable, node-local (a system row, so not
+/// shipped on the replication stream): the persisted phase is what lets a
+/// move survive a node restart, a controller restart, or a whole-cluster
+/// redeploy — on recovery a controller re-derives the move purely from the
+/// two participating nodes' records (docs/design.md §2.3, ADR-0004).
+pub const MIGRATION_KEY_PREFIX: &[u8] = b"\x00flint\x00migration\x00";
 
 /// Fencing epoch: lexicographic (generation, counter).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -74,6 +80,30 @@ pub struct SlotClaim {
     pub ns: Vec<u8>,
     pub start: u16,
     pub end: u16, // inclusive
+    pub epoch: Epoch,
+}
+
+/// A node's role in an in-flight slot move.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MigrationPhase {
+    /// The DESTINATION is pulling this slot and does not own it yet.
+    Importing = 1,
+    /// The SOURCE is shedding this slot: it still owns and serves it until
+    /// the cutover, after which it answers -MOVED.
+    Migrating = 2,
+}
+
+/// Durable record of one slot being moved, stamped with the move's slot-epoch
+/// and the counterparty node. Persisted on each participant so the move is
+/// recoverable by observation after any interruption.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigrationRecord {
+    pub ns: Vec<u8>,
+    pub slot: u16,
+    pub phase: MigrationPhase,
+    /// The other node in the move (host:port): for Importing, the source;
+    /// for Migrating, the destination.
+    pub peer: String,
     pub epoch: Epoch,
 }
 
@@ -161,6 +191,87 @@ pub fn set_claim(kv: &dyn Kv, claim: &SlotClaim) -> Result<(), ManifestError> {
     raw.extend_from_slice(&claim.epoch.encode());
     kv.put(&claim_key(&claim.ns), &raw);
     Ok(())
+}
+
+fn migration_key(ns: &[u8], slot: u16) -> Vec<u8> {
+    // prefix | ns_len(1) | ns | slot(2 BE) — length-prefixed ns so scanning
+    // one namespace's migrations is an unambiguous prefix.
+    let mut k = MIGRATION_KEY_PREFIX.to_vec();
+    k.push(ns.len() as u8);
+    k.extend_from_slice(ns);
+    k.extend_from_slice(&slot.to_be_bytes());
+    k
+}
+
+fn migration_ns_prefix(ns: &[u8]) -> Vec<u8> {
+    let mut k = MIGRATION_KEY_PREFIX.to_vec();
+    k.push(ns.len() as u8);
+    k.extend_from_slice(ns);
+    k
+}
+
+fn decode_migration(ns: &[u8], slot: u16, raw: &[u8]) -> Option<MigrationRecord> {
+    // phase(1) | epoch(8) | peer(rest, UTF-8)
+    if raw.len() < 9 {
+        return None;
+    }
+    let phase = match raw[0] {
+        1 => MigrationPhase::Importing,
+        2 => MigrationPhase::Migrating,
+        _ => return None,
+    };
+    Some(MigrationRecord {
+        ns: ns.to_vec(),
+        slot,
+        phase,
+        epoch: Epoch::decode(&raw[1..9])?,
+        peer: String::from_utf8(raw[9..].to_vec()).ok()?,
+    })
+}
+
+pub fn read_migration(kv: &dyn Kv, ns: &[u8], slot: u16) -> Option<MigrationRecord> {
+    let raw = kv.get(&migration_key(ns, slot))?;
+    decode_migration(ns, slot, &raw)
+}
+
+/// Fenced migration write: a record must carry a STRICTLY greater epoch than
+/// any stored record for this (ns, slot). Two controllers racing to start or
+/// advance the same slot's move cannot both win — the loser is fenced, same
+/// rule as roles and claims.
+pub fn set_migration(kv: &dyn Kv, rec: &MigrationRecord) -> Result<(), ManifestError> {
+    let current = read_migration(kv, &rec.ns, rec.slot)
+        .map(|r| r.epoch)
+        .unwrap_or(Epoch::ZERO);
+    if rec.epoch <= current {
+        return Err(ManifestError::Fenced { current });
+    }
+    let mut raw = Vec::with_capacity(9 + rec.peer.len());
+    raw.push(rec.phase as u8);
+    raw.extend_from_slice(&rec.epoch.encode());
+    raw.extend_from_slice(rec.peer.as_bytes());
+    kv.put(&migration_key(&rec.ns, rec.slot), &raw);
+    Ok(())
+}
+
+/// Clear the record — the move completed (cutover done) or rolled back. Not
+/// epoch-fenced: clearing is idempotent and only ever removes THIS node's
+/// own in-flight marker once the move is resolved.
+pub fn clear_migration(kv: &dyn Kv, ns: &[u8], slot: u16) {
+    kv.delete(&migration_key(ns, slot));
+}
+
+/// Every in-flight migration record for a namespace — what a recovering
+/// controller enumerates to resume or roll back moves after an interruption.
+pub fn scan_migrations(kv: &dyn Kv, ns: &[u8]) -> Vec<MigrationRecord> {
+    let prefix = migration_ns_prefix(ns);
+    kv.scan_prefix(&prefix)
+        .into_iter()
+        .filter_map(|(k, v)| {
+            // slot = the trailing 2 bytes of the key.
+            let slot = u16::from_be_bytes(k.get(k.len() - 2..)?.try_into().ok()?);
+            decode_migration(ns, slot, &v)
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -335,5 +446,117 @@ mod tests {
         assert_eq!(read_claim(&kv, b"0").expect("claim").end, 8191);
         // Claims are per-namespace.
         assert_eq!(read_claim(&kv, b"other"), None);
+    }
+
+    #[test]
+    fn migration_records_roundtrip_and_fence() {
+        let kv = MemKv::new();
+        let e = |g, c| Epoch {
+            generation: g,
+            counter: c,
+        };
+        assert_eq!(read_migration(&kv, b"0", 13624), None);
+
+        // Destination marks the slot Importing at the move's slot-epoch.
+        let importing = MigrationRecord {
+            ns: b"0".to_vec(),
+            slot: 13624,
+            phase: MigrationPhase::Importing,
+            peer: "127.0.0.1:6530".into(),
+            epoch: e(0, 5),
+        };
+        set_migration(&kv, &importing).expect("first record");
+        assert_eq!(read_migration(&kv, b"0", 13624), Some(importing.clone()));
+
+        // Equal epoch is fenced — two controllers cannot both start the move.
+        let dup = MigrationRecord {
+            peer: "127.0.0.1:9999".into(),
+            ..importing.clone()
+        };
+        assert_eq!(
+            set_migration(&kv, &dup),
+            Err(ManifestError::Fenced { current: e(0, 5) })
+        );
+        // Lower epoch is fenced.
+        let stale = MigrationRecord {
+            epoch: e(0, 1),
+            ..importing.clone()
+        };
+        assert!(matches!(
+            set_migration(&kv, &stale),
+            Err(ManifestError::Fenced { .. })
+        ));
+        // Strictly greater advances it (e.g. a re-planned move).
+        let advanced = MigrationRecord {
+            phase: MigrationPhase::Migrating,
+            epoch: e(0, 6),
+            ..importing.clone()
+        };
+        set_migration(&kv, &advanced).expect("advance at higher epoch");
+        assert_eq!(
+            read_migration(&kv, b"0", 13624).map(|r| (r.phase, r.epoch)),
+            Some((MigrationPhase::Migrating, e(0, 6)))
+        );
+    }
+
+    #[test]
+    fn migration_clear_removes_the_record() {
+        let kv = MemKv::new();
+        let rec = MigrationRecord {
+            ns: b"0".to_vec(),
+            slot: 42,
+            phase: MigrationPhase::Importing,
+            peer: "h:1".into(),
+            epoch: Epoch {
+                generation: 0,
+                counter: 1,
+            },
+        };
+        set_migration(&kv, &rec).expect("set migration");
+        assert!(read_migration(&kv, b"0", 42).is_some());
+        clear_migration(&kv, b"0", 42);
+        assert_eq!(read_migration(&kv, b"0", 42), None);
+    }
+
+    #[test]
+    fn scan_migrations_enumerates_all_inflight_for_recovery() {
+        let kv = MemKv::new();
+        let ep = Epoch {
+            generation: 0,
+            counter: 3,
+        };
+        for slot in [7u16, 300, 16000] {
+            set_migration(
+                &kv,
+                &MigrationRecord {
+                    ns: b"0".to_vec(),
+                    slot,
+                    phase: MigrationPhase::Importing,
+                    peer: format!("h:{slot}"),
+                    epoch: ep,
+                },
+            )
+            .expect("set migration");
+        }
+        // A record in another namespace must not show up.
+        set_migration(
+            &kv,
+            &MigrationRecord {
+                ns: b"other".to_vec(),
+                slot: 7,
+                phase: MigrationPhase::Migrating,
+                peer: "x:1".into(),
+                epoch: ep,
+            },
+        )
+        .expect("set other-ns migration");
+
+        let mut found: Vec<u16> = scan_migrations(&kv, b"0")
+            .into_iter()
+            .map(|r| r.slot)
+            .collect();
+        found.sort_unstable();
+        assert_eq!(found, vec![7, 300, 16000]);
+        assert_eq!(scan_migrations(&kv, b"other").len(), 1);
     }
 }
