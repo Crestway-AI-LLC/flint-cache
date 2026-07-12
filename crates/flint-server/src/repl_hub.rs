@@ -31,6 +31,14 @@ pub struct ReplHub {
     pub lag_soft_ms: u64,
     /// Hard cap (ms): shed writes beyond this lag — the RPO bound.
     pub lag_hard_ms: u64,
+    /// Writes are shed while fewer than this many replicas are LIVE
+    /// (Redis min-replicas-to-write semantics). This closes the widowed-
+    /// master hole the lag cap alone leaves open: with no live replica
+    /// there is no lag to measure, so without this gate an isolated master
+    /// would accept unbounded at-risk writes — e.g. when a partition
+    /// strands it with a controller that keeps renewing its lease. 0
+    /// (default) disables the gate: a standalone master must serve freely.
+    pub min_replicas_to_write: u32,
     next_id: AtomicU64,
     /// Per-replica ack state: id -> (acked_seq, last_ack_ms). The RPO
     /// reference is the freshest LIVE replica: a dead replica's cursor
@@ -42,20 +50,31 @@ pub struct ReplHub {
 
 impl Default for ReplHub {
     fn default() -> Self {
-        Self::new(DEFAULT_LAG_SOFT_MS, DEFAULT_LAG_HARD_MS)
+        Self::new(DEFAULT_LAG_SOFT_MS, DEFAULT_LAG_HARD_MS, 0)
     }
 }
 
 #[cfg_attr(not(feature = "rocks"), allow(dead_code))]
 impl ReplHub {
-    pub fn new(lag_soft_ms: u64, lag_hard_ms: u64) -> Self {
+    pub fn new(lag_soft_ms: u64, lag_hard_ms: u64, min_replicas_to_write: u32) -> Self {
         Self {
             lag_soft_ms,
             lag_hard_ms: lag_hard_ms.max(lag_soft_ms),
+            min_replicas_to_write,
             next_id: AtomicU64::new(1),
             replicas: Mutex::new(HashMap::new()),
             samples: Mutex::new(VecDeque::new()),
         }
+    }
+
+    /// True when the write path must shed because fewer replicas are live
+    /// than the configured minimum. Liveness is "acking recently", not
+    /// "converged": a respawned replica lifts the gate as soon as it starts
+    /// acking, so the unavailability window after losing a replica is
+    /// detect + respawn + first ack, not a full resync.
+    pub fn below_write_quorum(&self, now_ms: u64) -> bool {
+        self.min_replicas_to_write > 0
+            && (self.live_replica_count(now_ms) as u32) < self.min_replicas_to_write
     }
 
     /// A replication connection announces itself; ACKs carry its id.
@@ -209,15 +228,55 @@ mod cap_tests {
 
     #[test]
     fn caps_are_configurable_and_ordered() {
-        let hub = ReplHub::new(200, 800);
+        let hub = ReplHub::new(200, 800, 0);
         assert_eq!((hub.lag_soft_ms, hub.lag_hard_ms), (200, 800));
         // Hard cap can never sit below the soft cap.
-        let clamped = ReplHub::new(900, 300);
+        let clamped = ReplHub::new(900, 300, 0);
         assert_eq!(clamped.lag_hard_ms, 900);
         let d = ReplHub::default();
         assert_eq!(
             (d.lag_soft_ms, d.lag_hard_ms),
             (DEFAULT_LAG_SOFT_MS, DEFAULT_LAG_HARD_MS)
         );
+    }
+
+    #[test]
+    fn min_replicas_gate() {
+        // Default 0: standalone masters are never gated.
+        let open = ReplHub::default();
+        assert!(!open.below_write_quorum(1_000));
+
+        // min=1: gated until a replica acks; open while it is live;
+        // gated again the moment it unregisters (connection teardown)
+        // or falls out of the liveness window (silent death).
+        let hub = ReplHub::new(500, 1_000, 1);
+        assert!(hub.below_write_quorum(1_000), "no replica yet");
+        let r = hub.register_replica();
+        assert!(hub.below_write_quorum(1_000), "registered but never acked");
+        hub.record_ack(r, 5, 1_000);
+        assert!(
+            !hub.below_write_quorum(1_001),
+            "acking replica lifts the gate"
+        );
+        assert!(
+            hub.below_write_quorum(1_000 + LIVENESS_WINDOW_MS + 1),
+            "silent replica death re-engages the gate after the window"
+        );
+        hub.record_ack(r, 6, 5_000);
+        assert!(!hub.below_write_quorum(5_001));
+        hub.unregister_replica(r);
+        assert!(
+            hub.below_write_quorum(5_001),
+            "teardown re-engages immediately"
+        );
+
+        // min=2 with only one live replica: still gated.
+        let two = ReplHub::new(500, 1_000, 2);
+        let a = two.register_replica();
+        two.record_ack(a, 5, 1_000);
+        assert!(two.below_write_quorum(1_001));
+        let b = two.register_replica();
+        two.record_ack(b, 5, 1_002);
+        assert!(!two.below_write_quorum(1_003));
     }
 }

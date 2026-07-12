@@ -196,7 +196,14 @@ fn main() -> std::io::Result<()> {
     if lag_soft != repl_hub::DEFAULT_LAG_SOFT_MS || lag_hard != repl_hub::DEFAULT_LAG_HARD_MS {
         eprintln!("lag caps: soft={lag_soft}ms hard={lag_hard}ms");
     }
-    let hub = Arc::new(ReplHub::new(lag_soft, lag_hard));
+    // Safety gate: shed writes while live replicas < this (Redis
+    // min-replicas-to-write). Set to 1 on replicated pairs so a widowed or
+    // isolated master cannot accept unbounded at-risk writes; leave 0 for
+    // standalone nodes.
+    let min_replicas: u32 = arg("--min-replicas-to-write")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let hub = Arc::new(ReplHub::new(lag_soft, lag_hard, min_replicas));
 
     // Lease watchdog: self-fence on expiry. Runtime-only (read-only flip);
     // durable fencing is FLINTDEMOTE. Never un-fences — a master that
@@ -420,9 +427,17 @@ fn execute(
     {
         return flintdemote(read_only, rocks, args);
     }
-    // Lag-cap backpressure: the write path enforces the RPO bound.
+    // Lag-cap backpressure: the write path enforces the RPO bound. The
+    // min-replicas gate comes first — with no live replica there is no lag
+    // to measure, and that widowed state is exactly where accepted writes
+    // are most at risk (isolated master, dead pair peer).
     if is_write && !ro {
         let now = flint_storage::strings::system_clock();
+        if hub.below_write_quorum(now) {
+            return Value::Error(
+                "THROTTLED live replicas below min-replicas-to-write, retry with backoff".into(),
+            );
+        }
         match hub.lag_ms(now) {
             Some(lag) if lag >= hub.lag_hard_ms => {
                 return Value::Error(
@@ -599,7 +614,7 @@ fn flintinfo(read_only: bool, rocks: &Option<RocksHandle>, hub: &Arc<ReplHub>) -
         None => "none".into(),
     };
     let info = format!(
-        "role:{}\r\nrole_epoch:{role_epoch}\r\nlatest_seq:{latest}\r\nlast_applied:{last_applied}\r\nacked_seq:{}\r\nseq_lag:{seq_lag}\r\nlive_replicas:{}\r\nlag_ms:{}\r\nlag_soft_ms:{soft}\r\nlag_hard_ms:{hard}\r\n",
+        "role:{}\r\nrole_epoch:{role_epoch}\r\nlatest_seq:{latest}\r\nlast_applied:{last_applied}\r\nacked_seq:{}\r\nseq_lag:{seq_lag}\r\nlive_replicas:{}\r\nlag_ms:{}\r\nlag_soft_ms:{soft}\r\nlag_hard_ms:{hard}\r\nmin_replicas_to_write:{minr}\r\n",
         if read_only { "replica" } else { "master" },
         hub.effective_acked(now)
             .map_or_else(|| "none".into(), |a| a.to_string()),
@@ -608,6 +623,7 @@ fn flintinfo(read_only: bool, rocks: &Option<RocksHandle>, hub: &Arc<ReplHub>) -
             .map_or_else(|| "none".into(), |l| l.to_string()),
         soft = hub.lag_soft_ms,
         hard = hub.lag_hard_ms,
+        minr = hub.min_replicas_to_write,
     );
     Value::Bulk(Some(info.into_bytes()))
 }

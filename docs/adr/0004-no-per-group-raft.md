@@ -53,7 +53,12 @@ survivor available — whereas any single live stateless controller suffices.
 1. *Partitioned old master*: keeps accepting writes for at most the lease
    TTL, then self-fences. Writes in that window are lost on rejoin — inside
    the product's time-boxed-loss contract for cache failover. Raft would not
-   shrink this window; only self-fencing can.
+   shrink this window; only self-fencing can. Edge case: a partition that
+   strands the master *with* a controller keeps the lease renewed
+   indefinitely — closed on the master side by min-replicas-to-write (an
+   isolated master loses its replica links and sheds writes within the
+   liveness window), which also makes controller count and placement pure
+   availability choices with no safety weight.
 2. *Two controllers promoting different survivors* (multi-replica case):
    both promotions can land in different per-node manifests. Next tick,
    every controller applies the same rule — legitimate master = highest
