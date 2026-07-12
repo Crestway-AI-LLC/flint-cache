@@ -15,18 +15,22 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 /// ACKs older than this mean the replica link is down.
 pub const LIVENESS_WINDOW_MS: u64 = 2_000;
-/// Soft cap: writes are briefly delayed.
-pub const LAG_SOFT_MS: u64 = 500;
-/// Hard cap: writes are shed with a retriable -THROTTLED error.
-pub const LAG_HARD_MS: u64 = 1_000;
+/// Default soft cap: writes are briefly delayed.
+pub const DEFAULT_LAG_SOFT_MS: u64 = 500;
+/// Default hard cap: writes are shed with a retriable -THROTTLED error.
+/// The hard cap IS the advertised worst-case failover RPO.
+pub const DEFAULT_LAG_HARD_MS: u64 = 1_000;
 
 // Producers (flintsync stream loop, ack reader) are compiled only with
 // the rocks feature; the hub itself stays feature-independent.
 #[cfg_attr(not(feature = "rocks"), allow(dead_code))]
 const MAX_SAMPLES: usize = 512;
 
-#[derive(Default)]
 pub struct ReplHub {
+    /// Soft cap (ms): delay writes beyond this lag.
+    pub lag_soft_ms: u64,
+    /// Hard cap (ms): shed writes beyond this lag — the RPO bound.
+    pub lag_hard_ms: u64,
     /// Freshest replica-acknowledged master sequence.
     acked: AtomicU64,
     /// Wall time of the most recent ACK.
@@ -35,10 +39,22 @@ pub struct ReplHub {
     samples: Mutex<VecDeque<(u64, u64)>>,
 }
 
+impl Default for ReplHub {
+    fn default() -> Self {
+        Self::new(DEFAULT_LAG_SOFT_MS, DEFAULT_LAG_HARD_MS)
+    }
+}
+
 #[cfg_attr(not(feature = "rocks"), allow(dead_code))]
 impl ReplHub {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(lag_soft_ms: u64, lag_hard_ms: u64) -> Self {
+        Self {
+            lag_soft_ms,
+            lag_hard_ms: lag_hard_ms.max(lag_soft_ms),
+            acked: AtomicU64::new(0),
+            last_ack_ms: AtomicU64::new(0),
+            samples: Mutex::new(VecDeque::new()),
+        }
     }
 
     /// Record "master was at `seq` at time `now_ms`" (stream loop cadence).
@@ -88,7 +104,7 @@ mod tests {
 
     #[test]
     fn lag_is_age_of_oldest_unacked_write() {
-        let hub = ReplHub::new();
+        let hub = ReplHub::default();
         hub.record_sample(10, 1_000);
         hub.record_sample(20, 1_400);
         hub.record_sample(30, 1_800);
@@ -103,7 +119,7 @@ mod tests {
 
     #[test]
     fn no_live_replica_means_no_cap() {
-        let hub = ReplHub::new();
+        let hub = ReplHub::default();
         hub.record_sample(10, 1_000);
         assert_eq!(hub.lag_ms(1_500), None, "never acked = not live");
         hub.record_ack(5, 1_500);
@@ -114,7 +130,7 @@ mod tests {
 
     #[test]
     fn samples_dedupe_and_cap() {
-        let hub = ReplHub::new();
+        let hub = ReplHub::default();
         hub.record_sample(7, 100);
         hub.record_sample(7, 200); // same seq: dropped
         for i in 0..2 * MAX_SAMPLES as u64 {
@@ -122,5 +138,24 @@ mod tests {
         }
         let n = hub.samples.lock().unwrap_or_else(|e| e.into_inner()).len();
         assert!(n <= MAX_SAMPLES);
+    }
+}
+
+#[cfg(test)]
+mod cap_tests {
+    use super::*;
+
+    #[test]
+    fn caps_are_configurable_and_ordered() {
+        let hub = ReplHub::new(200, 800);
+        assert_eq!((hub.lag_soft_ms, hub.lag_hard_ms), (200, 800));
+        // Hard cap can never sit below the soft cap.
+        let clamped = ReplHub::new(900, 300);
+        assert_eq!(clamped.lag_hard_ms, 900);
+        let d = ReplHub::default();
+        assert_eq!(
+            (d.lag_soft_ms, d.lag_hard_ms),
+            (DEFAULT_LAG_SOFT_MS, DEFAULT_LAG_HARD_MS)
+        );
     }
 }

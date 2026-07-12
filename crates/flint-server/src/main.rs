@@ -93,7 +93,19 @@ fn main() -> std::io::Result<()> {
         std::thread::spawn(move || replica::run(&target, &kv));
     }
 
-    let hub = Arc::new(ReplHub::new());
+    // RPO knobs: --lag-soft-ms delays writes, --lag-hard-ms sheds them.
+    // The hard cap is the advertised worst-case failover RPO (per-tenant
+    // tiers arrive with the control plane).
+    let lag_soft = arg("--lag-soft-ms")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(repl_hub::DEFAULT_LAG_SOFT_MS);
+    let lag_hard = arg("--lag-hard-ms")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(repl_hub::DEFAULT_LAG_HARD_MS);
+    if lag_soft != repl_hub::DEFAULT_LAG_SOFT_MS || lag_hard != repl_hub::DEFAULT_LAG_HARD_MS {
+        eprintln!("lag caps: soft={lag_soft}ms hard={lag_hard}ms");
+    }
+    let hub = Arc::new(ReplHub::new(lag_soft, lag_hard));
     let listener = TcpListener::bind(("127.0.0.1", port))?;
     eprintln!("flint-server listening on 127.0.0.1:{port}");
     for stream in listener.incoming() {
@@ -225,12 +237,12 @@ fn execute(
     if is_write && !read_only {
         let now = flint_storage::strings::system_clock();
         match hub.lag_ms(now) {
-            Some(lag) if lag >= repl_hub::LAG_HARD_MS => {
+            Some(lag) if lag >= hub.lag_hard_ms => {
                 return Value::Error(
                     "THROTTLED replication lag exceeds limit, retry with backoff".into(),
                 );
             }
-            Some(lag) if lag >= repl_hub::LAG_SOFT_MS => {
+            Some(lag) if lag >= hub.lag_soft_ms => {
                 std::thread::sleep(std::time::Duration::from_millis(2));
             }
             _ => {}
@@ -245,12 +257,14 @@ fn flintinfo(read_only: bool, rocks: &Option<RocksHandle>, hub: &Arc<ReplHub>) -
     let latest = rocks.as_ref().map(|kv| kv.latest_seq()).unwrap_or(0);
     let last_applied = rocks.as_ref().map(|kv| kv.last_applied()).unwrap_or(0);
     let info = format!(
-        "role:{}\r\nlatest_seq:{latest}\r\nlast_applied:{last_applied}\r\nacked_seq:{}\r\nlive_replica:{}\r\nlag_ms:{}\r\n",
+        "role:{}\r\nlatest_seq:{latest}\r\nlast_applied:{last_applied}\r\nacked_seq:{}\r\nlive_replica:{}\r\nlag_ms:{}\r\nlag_soft_ms:{soft}\r\nlag_hard_ms:{hard}\r\n",
         if read_only { "replica" } else { "master" },
         hub.acked(),
         hub.has_live_replica(now) as u8,
         hub.lag_ms(now)
             .map_or_else(|| "none".into(), |l| l.to_string()),
+        soft = hub.lag_soft_ms,
+        hard = hub.lag_hard_ms,
     );
     Value::Bulk(Some(info.into_bytes()))
 }
