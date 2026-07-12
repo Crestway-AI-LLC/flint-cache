@@ -31,9 +31,16 @@
 //! owning the whole failover cycle. --nodes (addresses only) is
 //! decision-only, for when node lifecycle is external.
 //!
+//! Multi-pair: one controller drives N pairs (a group), each with its own
+//! failover state, ticked independently every sweep. Pairs are separated by
+//! ';'. Equal-epoch ties in master selection break to the lowest address so
+//! concurrent controllers in the HA set agree (ADR-0004).
+//!
 //! Usage:
 //!   flint-controller --nodes 127.0.0.1:6460,127.0.0.1:6470 [--id A]
+//!   flint-controller --pairs "a1,b1;a2,b2" [--id A]
 //!   flint-controller --manage-slots 6460:/data/a,6470:/data/b [--id A]
+//!   flint-controller --manage-pairs "6500:/d/a,6501:/d/b;6510:/d/c,6511:/d/d"
 //!   common: [--poll-ms 200] [--confirm 3] [--max-stale-ms 5000] [--lease-ttl-ms 3000]
 
 use std::io::{Read, Write};
@@ -193,94 +200,109 @@ fn observe(addr: &str) -> Node {
     node
 }
 
-fn main() {
-    let poll = Duration::from_millis(arg_or("--poll-ms", 200));
-    let confirm: u32 = arg_or("--confirm", 3);
-    let max_stale = Duration::from_millis(arg_or("--max-stale-ms", 5_000));
-    // Lease TTL handed to the master on each renewal. Generous vs the poll
-    // interval so transient controller unavailability never trips a healthy
-    // master; a master self-fences only after this long with NO controller
-    // (of any in the HA set) reaching it. 0 disables lease renewal.
-    let lease_ttl: u64 = arg_or("--lease-ttl-ms", 3_000);
-    let id = arg("--id").unwrap_or_else(|| "ctl".into());
+/// Read-only knobs shared by every pair this controller drives.
+struct Config {
+    poll: Duration,
+    confirm: u32,
+    max_stale: Duration,
+    lease_ttl: u64,
+    min_replicas: u32,
+    bin: String,
+    id: String,
+}
 
-    // Managed mode: --manage-slots PORT:DIR,PORT:DIR — the controller
-    // SUPERVISES these nodes (bootstraps them, and respawns a dead
-    // non-master slot as a fresh replica of the current master), owning the
-    // full failover cycle. Otherwise --nodes gives addresses only and node
-    // lifecycle is external (decision-only mode).
-    let slots: Vec<Slot> = arg("--manage-slots")
-        .map(|s| {
-            s.split(',')
-                .map(|pair| {
-                    let (p, d) = pair.split_once(':').expect("PORT:DIR");
-                    Slot {
-                        port: p.parse().expect("port"),
-                        dir: d.to_string(),
-                    }
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    let managed = !slots.is_empty();
-    // Passed to every managed node so a promoted-then-widowed master sheds
-    // writes (Redis min-replicas-to-write). 0 = disabled.
-    let min_replicas: u32 = arg("--min-replicas-to-write")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
-    let bin = server_bin();
-    let nodes: Vec<String> = if managed {
-        slots
+/// One replica set the controller drives, with its own failover state. The
+/// controller ticks each pair independently every sweep; a group is just N
+/// pairs. Decision-only pairs have empty `slots` (external node lifecycle);
+/// managed pairs are supervised (bootstrap + spare respawn).
+struct Pair {
+    label: String,
+    nodes: Vec<String>,
+    slots: Vec<Slot>,
+    managed: bool,
+    last_converged: Instant,
+    converged_ever: bool,
+    no_master_streak: u32,
+    slot_miss: Vec<u32>,
+    slot_cooldown: Vec<Instant>,
+    slot_child: Vec<Option<std::process::Child>>,
+    last_page: Option<Instant>,
+}
+
+impl Pair {
+    fn new(label: String, nodes: Vec<String>, slots: Vec<Slot>, managed: bool) -> Self {
+        let n = slots.len();
+        Self {
+            label,
+            nodes,
+            managed,
+            last_converged: Instant::now(),
+            converged_ever: false,
+            no_master_streak: 0,
+            slot_miss: vec![0; n],
+            slot_cooldown: vec![Instant::now(); n],
+            slot_child: (0..n).map(|_| None).collect(),
+            last_page: None,
+            slots,
+        }
+    }
+
+    fn decision(label: String, nodes: Vec<String>) -> Self {
+        Self::new(label, nodes, Vec::new(), false)
+    }
+
+    fn managed(label: String, slots: Vec<Slot>) -> Self {
+        let nodes = slots
             .iter()
             .map(|s| format!("127.0.0.1:{}", s.port))
-            .collect()
-    } else {
-        arg("--nodes")
-            .expect("--nodes a,b[,c] or --manage-slots PORT:DIR,... required")
-            .split(',')
-            .map(|s| s.to_string())
-            .collect()
-    };
+            .collect();
+        Self::new(label, nodes, slots, true)
+    }
 
-    eprintln!(
-        "[{id}] flint-controller: nodes={nodes:?} managed={managed} poll={poll:?} confirm={confirm} max-stale={max_stale:?}"
-    );
+    /// Reap the previous child in slot `i` before recording the new one, so a
+    /// long-running supervisor never accumulates defunct processes.
+    fn reap(&mut self, i: usize, child: std::process::Child) {
+        if let Some(mut old) = self.slot_child[i].replace(child) {
+            let _ = old.kill();
+            let _ = old.wait();
+        }
+    }
 
-    let mut last_converged = Instant::now();
-    let mut converged_ever = false;
-    let mut no_master_streak = 0u32;
-    // Per-slot dead-streak and respawn cooldown (managed mode).
-    let mut slot_miss = vec![0u32; slots.len()];
-    let mut slot_cooldown = vec![Instant::now(); slots.len()];
-    // Child handles of supervised nodes, reaped on respawn so a long-running
-    // supervisor never accumulates defunct processes.
-    let mut slot_child: Vec<Option<std::process::Child>> = slots.iter().map(|_| None).collect();
-    let reap =
-        |i: usize, child: std::process::Child, handles: &mut Vec<Option<std::process::Child>>| {
-            if let Some(mut old) = handles[i].replace(child) {
-                let _ = old.kill();
-                let _ = old.wait();
-            }
-        };
+    /// Page at most every 2s per pair, so a persistently degraded pair does
+    /// not spam the log or (via a blocking sleep) starve the other pairs.
+    fn page(&mut self, msg: std::fmt::Arguments) {
+        if self
+            .last_page
+            .is_none_or(|t| t.elapsed() > Duration::from_secs(2))
+        {
+            eprintln!("{msg}");
+            self.last_page = Some(Instant::now());
+        }
+    }
 
-    loop {
-        std::thread::sleep(poll);
-        let states: Vec<Node> = nodes.iter().map(|a| observe(a)).collect();
+    /// One observe→decide pass for this pair.
+    fn tick(&mut self, cfg: &Config) {
+        let states: Vec<Node> = self.nodes.iter().map(|a| observe(a)).collect();
 
-        // Managed bootstrap: nothing is up → launch slot0 as master, the
-        // rest as fresh replicas of it.
-        if managed && states.iter().all(|n| !n.reachable) {
-            eprintln!("[{id}] bootstrapping managed pair");
-            let c0 = spawn_slot(&bin, &slots[0], None, min_replicas);
-            reap(0, c0, &mut slot_child);
-            let master_addr = nodes[0].clone();
+        // Managed bootstrap: nothing up → launch slot0 as master, rest as
+        // fresh replicas of it.
+        if self.managed && states.iter().all(|n| !n.reachable) {
+            eprintln!("[{}][{}] bootstrapping managed pair", cfg.id, self.label);
+            let c0 = spawn_slot(&cfg.bin, &self.slots[0], None, cfg.min_replicas);
+            self.reap(0, c0);
+            let master_addr = self.nodes[0].clone();
             std::thread::sleep(Duration::from_millis(600));
-            for (i, slot) in slots.iter().enumerate().skip(1) {
-                let c = spawn_slot(&bin, slot, Some(&master_addr), min_replicas);
-                reap(i, c, &mut slot_child);
+            for i in 1..self.slots.len() {
+                let c = spawn_slot(
+                    &cfg.bin,
+                    &self.slots[i],
+                    Some(&master_addr),
+                    cfg.min_replicas,
+                );
+                self.reap(i, c);
             }
             std::thread::sleep(Duration::from_millis(400));
-            continue;
+            return;
         }
 
         let masters: Vec<&Node> = states
@@ -289,91 +311,108 @@ fn main() {
             .collect();
         let max_epoch = states.iter().map(|n| n.epoch).max().unwrap_or(0);
 
-        if let Some(legit) = masters.iter().max_by_key(|n| n.epoch).copied() {
-            no_master_streak = 0;
-            // Renew the legitimate master's lease (idempotent across the HA
-            // set; only extends life, never un-fences).
-            if lease_ttl > 0 {
+        // Legitimate master = reachable master with the highest epoch; ties
+        // broken by LOWEST address so every controller in the HA set picks
+        // the same winner (ADR-0004 tie-break, applied identically here and
+        // in the fence rule below).
+        let legit = masters
+            .iter()
+            .max_by_key(|n| (n.epoch, std::cmp::Reverse(n.addr.as_str())))
+            .copied();
+
+        if let Some(legit) = legit {
+            let legit_addr = legit.addr.clone();
+            let legit_converged = legit.live_replicas >= 1 && legit.seq_lag == Some(0);
+            self.no_master_streak = 0;
+            // Renew the legit master's lease (idempotent across the HA set;
+            // only extends life, never un-fences).
+            if cfg.lease_ttl > 0 {
                 let _ = call(
-                    &legit.addr,
-                    &[b"FLINTLEASE", lease_ttl.to_string().as_bytes()],
+                    &legit_addr,
+                    &[b"FLINTLEASE", cfg.lease_ttl.to_string().as_bytes()],
                 );
             }
             // Any other reachable master-claimer is a zombie: fence it.
             for m in &masters {
-                if m.addr != legit.addr {
-                    let next = max_epoch + 1;
-                    fence(&id, &m.addr, next);
+                if m.addr != legit_addr {
+                    fence(&cfg.id, &m.addr, max_epoch + 1);
                 }
             }
-            // Track convergence of the legitimate master's pair.
-            if legit.live_replicas >= 1 && legit.seq_lag == Some(0) {
-                last_converged = Instant::now();
-                converged_ever = true;
+            if legit_converged {
+                self.last_converged = Instant::now();
+                self.converged_ever = true;
             }
 
-            // Redundancy repair (managed mode): a non-master slot that is
-            // dead for `confirm` ticks is respawned as a FRESH replica of
-            // the current master — the spawn-a-fresh-node spare model. A
-            // cooldown after a respawn avoids thrashing while it full-syncs.
-            if managed {
-                for (i, slot) in slots.iter().enumerate() {
-                    if format!("127.0.0.1:{}", slot.port) == legit.addr {
-                        slot_miss[i] = 0;
+            // Redundancy repair (managed): a non-master slot dead for
+            // `confirm` ticks is respawned as a FRESH replica of the current
+            // master. A cooldown after a respawn avoids thrash while it syncs.
+            if self.managed {
+                for i in 0..self.slots.len() {
+                    let slot_addr = format!("127.0.0.1:{}", self.slots[i].port);
+                    if slot_addr == legit_addr {
+                        self.slot_miss[i] = 0;
                         continue;
                     }
                     let reachable = states
                         .iter()
-                        .find(|n| n.addr == format!("127.0.0.1:{}", slot.port))
+                        .find(|n| n.addr == slot_addr)
                         .is_some_and(|n| n.reachable);
-                    if reachable || Instant::now() < slot_cooldown[i] {
+                    if reachable || Instant::now() < self.slot_cooldown[i] {
                         if reachable {
-                            slot_miss[i] = 0;
+                            self.slot_miss[i] = 0;
                         }
                         continue;
                     }
-                    slot_miss[i] += 1;
-                    if slot_miss[i] >= confirm {
+                    self.slot_miss[i] += 1;
+                    if self.slot_miss[i] >= cfg.confirm {
                         eprintln!(
-                            "[{id}] slot :{} dead — respawning as fresh replica of {}",
-                            slot.port, legit.addr
+                            "[{}][{}] slot :{} dead — respawning as fresh replica of {legit_addr}",
+                            cfg.id, self.label, self.slots[i].port
                         );
-                        let c = spawn_slot(&bin, slot, Some(&legit.addr), min_replicas);
-                        reap(i, c, &mut slot_child);
-                        slot_miss[i] = 0;
-                        slot_cooldown[i] = Instant::now() + Duration::from_secs(20);
+                        let c = spawn_slot(
+                            &cfg.bin,
+                            &self.slots[i],
+                            Some(&legit_addr),
+                            cfg.min_replicas,
+                        );
+                        self.reap(i, c);
+                        self.slot_miss[i] = 0;
+                        self.slot_cooldown[i] = Instant::now() + Duration::from_secs(20);
                     }
                 }
             }
-            continue;
+            return;
         }
 
         // No reachable master. Confirm across `confirm` ticks before acting.
-        no_master_streak += 1;
-        if no_master_streak < confirm {
-            continue;
+        self.no_master_streak += 1;
+        if self.no_master_streak < cfg.confirm {
+            return;
         }
 
         // Degraded-window gate: only auto-promote a recently-converged pair.
-        if !converged_ever || last_converged.elapsed() > max_stale {
-            eprintln!(
-                "[{id}] no master and pair not converged within {max_stale:?} — REFUSING (degraded window; needs spare/S3). PAGE."
-            );
-            no_master_streak = 0;
-            std::thread::sleep(Duration::from_secs(1));
-            continue;
+        if !self.converged_ever || self.last_converged.elapsed() > cfg.max_stale {
+            let (id, label, ms) = (cfg.id.clone(), self.label.clone(), cfg.max_stale);
+            self.page(format_args!(
+                "[{id}][{label}] no master and pair not converged within {ms:?} — REFUSING (degraded window; needs spare/S3). PAGE."
+            ));
+            self.no_master_streak = 0;
+            return;
         }
 
-        // The survivor is the reachable node with the highest epoch.
+        // Survivor = reachable node with the highest epoch; ties by lowest
+        // address (deterministic across the HA set).
         let Some(survivor) = states
             .iter()
             .filter(|n| n.reachable)
-            .max_by_key(|n| n.epoch)
+            .max_by_key(|n| (n.epoch, std::cmp::Reverse(n.addr.as_str())))
         else {
-            eprintln!("[{id}] no reachable node in the pair — cannot fail over. PAGE.");
-            no_master_streak = 0;
-            std::thread::sleep(Duration::from_secs(1));
-            continue;
+            let (id, label) = (cfg.id.clone(), self.label.clone());
+            self.page(format_args!(
+                "[{id}][{label}] no reachable node in the pair — cannot fail over. PAGE."
+            ));
+            self.no_master_streak = 0;
+            return;
         };
 
         let next = max_epoch + 1;
@@ -382,17 +421,112 @@ fn main() {
             &[b"FLINTPROMOTE", b"0", next.to_string().as_bytes()],
         ) {
             Ok(Value::Simple(s)) => {
-                eprintln!("[{id}] PROMOTED {} at (0,{next}): {s}", survivor.addr);
-                converged_ever = false; // new master has no replica yet
-                no_master_streak = 0;
+                eprintln!(
+                    "[{}][{}] PROMOTED {} at (0,{next}): {s}",
+                    cfg.id, self.label, survivor.addr
+                );
+                self.converged_ever = false; // new master has no replica yet
+                self.no_master_streak = 0;
             }
             // -FENCED here means another controller already promoted at this
             // or a higher epoch: the desired outcome exists, so it's fine.
             Ok(Value::Error(e)) if e.starts_with("FENCED") => {
-                eprintln!("[{id}] promotion fenced (another controller won): {e}");
-                no_master_streak = 0;
+                eprintln!(
+                    "[{}][{}] promotion fenced (another controller won): {e}",
+                    cfg.id, self.label
+                );
+                self.no_master_streak = 0;
             }
-            other => eprintln!("[{id}] promotion of {} failed: {other:?}", survivor.addr),
+            other => eprintln!(
+                "[{}][{}] promotion of {} failed: {other:?}",
+                cfg.id, self.label, survivor.addr
+            ),
+        }
+    }
+}
+
+/// Parse "PORT:DIR,PORT:DIR" into a pair's slots.
+fn parse_slots(spec: &str) -> Vec<Slot> {
+    spec.split(',')
+        .map(|pair| {
+            let (p, d) = pair.split_once(':').expect("PORT:DIR");
+            Slot {
+                port: p.parse().expect("port"),
+                dir: d.to_string(),
+            }
+        })
+        .collect()
+}
+
+/// Build the pairs from CLI. Single-pair flags (--nodes / --manage-slots) are
+/// preserved; multi-pair flags (--pairs / --manage-pairs) separate pairs with
+/// ';'. A group is expressed as several pairs to one controller.
+fn build_pairs() -> Vec<Pair> {
+    if let Some(spec) = arg("--manage-pairs") {
+        return spec
+            .split(';')
+            .enumerate()
+            .map(|(i, p)| Pair::managed(format!("g{i}"), parse_slots(p)))
+            .collect();
+    }
+    if let Some(spec) = arg("--manage-slots") {
+        return vec![Pair::managed("g0".into(), parse_slots(&spec))];
+    }
+    if let Some(spec) = arg("--pairs") {
+        return spec
+            .split(';')
+            .enumerate()
+            .map(|(i, p)| Pair::decision(format!("g{i}"), p.split(',').map(String::from).collect()))
+            .collect();
+    }
+    if let Some(spec) = arg("--nodes") {
+        return vec![Pair::decision(
+            "g0".into(),
+            spec.split(',').map(String::from).collect(),
+        )];
+    }
+    Vec::new()
+}
+
+fn main() {
+    let cfg = Config {
+        poll: Duration::from_millis(arg_or("--poll-ms", 200)),
+        confirm: arg_or("--confirm", 3),
+        max_stale: Duration::from_millis(arg_or("--max-stale-ms", 5_000)),
+        // Lease TTL handed to each master per renewal. Generous vs the poll
+        // interval so transient controller unavailability never trips a
+        // healthy master; a master self-fences only after this long with NO
+        // controller (of any in the HA set) reaching it. 0 disables leases.
+        lease_ttl: arg_or("--lease-ttl-ms", 3_000),
+        // Passed to every managed node so a promoted-then-widowed master
+        // sheds writes (Redis min-replicas-to-write). 0 = disabled.
+        min_replicas: arg("--min-replicas-to-write")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
+        bin: server_bin(),
+        id: arg("--id").unwrap_or_else(|| "ctl".into()),
+    };
+
+    let mut pairs = build_pairs();
+    assert!(
+        !pairs.is_empty(),
+        "need --nodes/--pairs (decision-only) or --manage-slots/--manage-pairs (managed)"
+    );
+
+    eprintln!(
+        "[{}] flint-controller: {} pair(s) managed={} poll={:?} confirm={} max-stale={:?}",
+        cfg.id,
+        pairs.len(),
+        pairs[0].managed,
+        cfg.poll,
+        cfg.confirm,
+        cfg.max_stale
+    );
+
+    loop {
+        std::thread::sleep(cfg.poll);
+        for pair in pairs.iter_mut() {
+            pair.tick(&cfg);
         }
     }
 }
