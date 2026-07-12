@@ -764,7 +764,23 @@ mod replica {
 
         let mut buf: Vec<u8> = Vec::new();
         let mut chunk = [0u8; 64 * 1024];
+        // Heartbeat: an idle replica must still prove liveness — ACKs only
+        // after applied batches would make a healthy idle pair look dead
+        // after the liveness window.
+        let mut last_ack_sent = std::time::Instant::now();
         loop {
+            if last_ack_sent.elapsed() >= std::time::Duration::from_millis(500) {
+                out.clear();
+                encode(
+                    &Value::Array(Some(vec![
+                        Value::Bulk(Some(b"ACK".to_vec())),
+                        Value::Bulk(Some(kv.last_applied().to_string().into_bytes())),
+                    ])),
+                    &mut out,
+                );
+                stream.write_all(&out)?;
+                last_ack_sent = std::time::Instant::now();
+            }
             match decode(&buf) {
                 Ok(Decoded::Complete(frame, used)) => {
                     buf.drain(..used);

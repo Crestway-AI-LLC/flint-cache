@@ -72,6 +72,12 @@ echo "$MINFO" | grep -q "live_replicas:1" || { echo "FAIL: master does not see l
 echo "$RINFO" | grep -q "role:replica" || { echo "FAIL: replica role"; exit 1; }
 echo "$MINFO" | tr '\r' ' '
 
+echo "== idle liveness: healthy-but-idle replica must stay live"
+sleep 3
+IDLE=$(valkey-cli -p "$MPORT" FLINTINFO | tr '\r' ' ')
+echo "$IDLE" | grep -q "live_replicas:1" || { echo "FAIL: idle replica declared dead"; echo "$IDLE"; exit 1; }
+echo "idle liveness OK"
+
 echo "== replica rejects writes"
 RO=$(valkey-cli -p "$RPORT" SET should-fail x 2>&1 || true)
 echo "$RO" | grep -q "READONLY" || { echo "FAIL: expected READONLY, got '$RO'"; exit 1; }
