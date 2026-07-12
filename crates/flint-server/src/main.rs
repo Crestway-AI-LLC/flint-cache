@@ -529,8 +529,10 @@ fn flintsync(
                 stream.write_all(&out)?;
                 return Ok(());
             }
-            Err(ReplError::Storage(e)) => {
-                eprintln!("replication stream error: {e}");
+            // SequenceGap is apply-side; a master seeing it is a bug —
+            // fail the stream loudly rather than continue.
+            Err(e @ (ReplError::Storage(_) | ReplError::SequenceGap { .. })) => {
+                eprintln!("replication stream error: {e:?}");
                 return Ok(());
             }
         }
