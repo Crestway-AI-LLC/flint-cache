@@ -64,8 +64,35 @@ survivor available — whereas any single live stateless controller suffices.
 
 **Invariant this rests on (protect in review):** every structural change is
 (a) epoch-fenced by the manifests it affects and (b) idempotent under
-re-observation. Any new structural operation (migration cutover, spare
-assignment) must satisfy both before it ships.
+re-observation — and every structural *state*, including in-flight ones,
+is observable from manifests. Any new structural operation (migration
+cutover, spare assignment) must satisfy all three before it ships.
+
+## Two-level metadata is preserved
+
+The trio's second job — being level 2 of the metadata hierarchy, so the
+global plane stores only coarse slot→group ranges and never absorbs
+intra-group churn — survives the removal; only its mechanism changes:
+
+- **Truth**: intra-group slot→pair lives in the data nodes' own manifests
+  (SlotClaim + slot-epoch), durable and fenced, sharded across the nodes it
+  describes. No quorum needed for the mapping to exist.
+- **Serving**: the group routing table is *derived* state — any controller
+  computes it by observing manifests, versions it by max epoch, and
+  publishes it; proxies cache it. Authoritative correction sits below even
+  that: a node answers `-MOVED` from its own manifest for a slot it does
+  not own, so stale caches self-correct (the Redis Cluster pattern, which
+  routes with zero consensus — ours is stronger: durable fenced manifests,
+  not gossip).
+- **In-flight intra-group migration intent** is made observable rather than
+  Raft-held: the protocol records its phase in the participating pairs'
+  manifests (destination claims the slot at a higher epoch in `IMPORTING`
+  state; source marks `MIGRATING` and serves until handoff), so a crashed
+  controller re-observes the phase and resumes or rolls back.
+
+Consequently nothing intra-group ever rises to the global layer: its Raft
+holds *inter*-group intent only (migrations across groups, tenant
+placement, spare allocation), exactly as in the two-level design.
 
 **Carried-forward requirement:** promotion at equal epochs on two nodes is a
 tie the "highest epoch wins" rule cannot break. The multi-replica controller
