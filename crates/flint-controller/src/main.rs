@@ -43,6 +43,8 @@
 //!   flint-controller --manage-pairs "6500:/d/a,6501:/d/b;6510:/d/c,6511:/d/d"
 //!   common: [--poll-ms 200] [--confirm 3] [--max-stale-ms 5000] [--lease-ttl-ms 3000]
 
+mod planner;
+
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::process::Command;
@@ -207,6 +209,9 @@ struct Config {
     max_stale: Duration,
     lease_ttl: u64,
     min_replicas: u32,
+    /// Positive enables the rebalance planner (dry-run: logs the plan). The
+    /// value is the deadband fraction — imbalance below it is left alone.
+    rebalance_deadband: f64,
     bin: String,
     id: String,
 }
@@ -266,6 +271,24 @@ impl Pair {
             let _ = old.kill();
             let _ = old.wait();
         }
+    }
+
+    /// Observe this pair's load for the rebalance planner: the reachable
+    /// master's key count (DBSIZE). None if no master answers.
+    fn observe_fill(&self) -> Option<planner::PairLoad> {
+        for addr in &self.nodes {
+            let n = observe(addr);
+            if n.reachable
+                && n.role == "master"
+                && let Ok(Value::Integer(fill)) = call(addr, &[b"DBSIZE"])
+            {
+                return Some(planner::PairLoad {
+                    label: self.label.clone(),
+                    fill: fill.max(0) as u64,
+                });
+            }
+        }
+        None
     }
 
     /// Page at most every 2s per pair, so a persistently degraded pair does
@@ -503,6 +526,9 @@ fn main() {
         min_replicas: arg("--min-replicas-to-write")
             .and_then(|v| v.parse().ok())
             .unwrap_or(0),
+        rebalance_deadband: arg("--rebalance-deadband")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.0),
         bin: server_bin(),
         id: arg("--id").unwrap_or_else(|| "ctl".into()),
     };
@@ -523,10 +549,38 @@ fn main() {
         cfg.max_stale
     );
 
+    let mut last_rebalance = Instant::now();
     loop {
         std::thread::sleep(cfg.poll);
         for pair in pairs.iter_mut() {
             pair.tick(&cfg);
+        }
+
+        // Rebalance planning (dry-run): every 5s, observe each pair's fill
+        // and log the deterministic-hysteresis plan. Execution via
+        // FLINTMIGRATEIN, gated by the safety rules, is a follow-on.
+        if cfg.rebalance_deadband > 0.0 && last_rebalance.elapsed() > Duration::from_secs(5) {
+            last_rebalance = Instant::now();
+            let loads: Vec<planner::PairLoad> =
+                pairs.iter().filter_map(|p| p.observe_fill()).collect();
+            if loads.len() >= 2 {
+                let fills: Vec<(String, u64)> =
+                    loads.iter().map(|l| (l.label.clone(), l.fill)).collect();
+                let plan = planner::plan_moves(&loads, cfg.rebalance_deadband);
+                if plan.is_empty() {
+                    eprintln!(
+                        "[{}] rebalance: balanced within deadband {:.2} — fills={fills:?}",
+                        cfg.id, cfg.rebalance_deadband
+                    );
+                } else {
+                    for m in &plan {
+                        eprintln!(
+                            "[{}] rebalance PLAN (dry-run): move ~{} load from {} to {} — fills={fills:?}",
+                            cfg.id, m.approx, m.from, m.to
+                        );
+                    }
+                }
+            }
         }
     }
 }
