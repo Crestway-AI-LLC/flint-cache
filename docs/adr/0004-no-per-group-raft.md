@@ -94,10 +94,17 @@ Consequently nothing intra-group ever rises to the global layer: its Raft
 holds *inter*-group intent only (migrations across groups, tenant
 placement, spare allocation), exactly as in the two-level design.
 
-**Carried-forward requirement:** promotion at equal epochs on two nodes is a
-tie the "highest epoch wins" rule cannot break. The multi-replica controller
-must apply a deterministic tie-break (equal epoch → lowest address wins)
-identically in leader selection and zombie fencing.
+**Carried-forward requirements:**
+1. Promotion at equal epochs on two nodes is a tie the "highest epoch wins"
+   rule cannot break. The multi-replica controller must apply a
+   deterministic tie-break (equal epoch → lowest address wins) identically
+   in leader selection and zombie fencing.
+2. The rebalancing planner must be deterministic with hysteresis (same
+   inputs → same plan; act only beyond a deadband). Fencing prevents
+   conflicting moves; only planner determinism prevents oscillation between
+   concurrent controllers. If chaos testing still shows thrash, restrict
+   planning (not execution) to the lease-holding controller — a lock, not
+   consensus.
 
 ## Consequences
 
