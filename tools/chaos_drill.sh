@@ -17,4 +17,7 @@ done
 echo "== chain traversal (200k elements) under failover"
 ./target/release/chain --elements "${ELEMENTS:-200000}" --kills 12 --seed 13
 pkill -9 -f flint-server 2>/dev/null || true
+echo "== chain traversal (200k) with the CONTROLLER driving failovers"
+./target/release/chain --elements 200000 --kills 8 --seed 13 --driver controller
+pkill -9 -f flint-server 2>/dev/null || true; pkill -9 -f flint-controller 2>/dev/null || true
 echo "ALL SEEDS PASSED"

@@ -187,14 +187,45 @@ fn flintinfo_field(port: u16, field: &str) -> Option<String> {
         .map(|f| f.trim_start_matches(field).to_string())
 }
 
+fn controller_bin() -> String {
+    std::env::var("FLINT_CONTROLLER_BIN").unwrap_or_else(|_| {
+        format!(
+            "{}/../../target/release/flint-controller",
+            env!("CARGO_MANIFEST_DIR")
+        )
+    })
+}
+
+/// Poll until `port` reports the given role, or the budget elapses.
+fn wait_until_role(port: u16, role: &str, budget: Duration) -> bool {
+    let start = Instant::now();
+    while start.elapsed() < budget {
+        if flintinfo_field(port, "role:").is_some_and(|v| v.trim() == role) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    false
+}
+
 /// A master + one replica, managed like the trio will: promote-on-master-
 /// kill, replace-on-any-kill. Topology mechanics only — each workload owns
 /// its own data oracle.
+///
+/// Two modes:
+///   - default (`bootstrap`): the harness IS the trio — it promotes on a
+///     master kill and attaches replacements on fresh ports.
+///   - controlled (`bootstrap_controlled`): a real flint-controller process
+///     makes the failover decisions; the harness only kills nodes and
+///     re-attaches replacements. Ports are FIXED (a replacement reuses the
+///     dead node's port with a fresh data dir) so the controller watches
+///     stable addresses while roles float between them.
 pub struct Cluster {
     fleet: Fleet,
     master_port: u16,
     replica_port: u16,
     next_id: u32,
+    controlled: bool,
     pub master_kills: u32,
     pub replica_kills: u32,
 }
@@ -219,9 +250,37 @@ impl Cluster {
             master_port,
             replica_port,
             next_id: 2,
+            controlled: false,
             master_kills: 0,
             replica_kills: 0,
         }
+    }
+
+    /// Bootstrap with a real flint-controller making failover decisions.
+    /// Fixed ports; the controller watches both forever.
+    pub fn bootstrap_controlled(poll_ms: u64, confirm: u32, lease_ttl_ms: u64) -> Self {
+        let mut c = Self::bootstrap();
+        c.controlled = true;
+        let nodes = format!("127.0.0.1:{},127.0.0.1:{}", c.master_port, c.replica_port);
+        let child = Command::new(controller_bin())
+            .args([
+                "--nodes",
+                &nodes,
+                "--id",
+                "chaos-ctl",
+                "--poll-ms",
+                &poll_ms.to_string(),
+                "--confirm",
+                &confirm.to_string(),
+                "--lease-ttl-ms",
+                &lease_ttl_ms.to_string(),
+            ])
+            .stderr(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn flint-controller");
+        c.fleet.track(child);
+        c
     }
 
     pub fn master(&self) -> u16 {
@@ -296,6 +355,51 @@ impl Cluster {
             "replacement replica up"
         );
         self.master_port
+    }
+
+    /// Controlled mode: kill the master, then WAIT for the external
+    /// controller to promote the survivor (the harness does not promote).
+    /// Re-attach a fresh replacement replica on the dead node's fixed port.
+    pub fn kill_master_await_controller(&mut self) -> u16 {
+        assert!(self.controlled, "use bootstrap_controlled");
+        self.master_kills += 1;
+        let dead = self.master_port;
+        let survivor = self.replica_port;
+        kill_by_port(dead);
+        assert!(
+            wait_until_role(survivor, "master", Duration::from_secs(20)),
+            "controller did not promote survivor :{survivor} within 20s"
+        );
+        // Bring the dead port back as a fresh replica of the new master.
+        self.fleet
+            .track(spawn_node(dead, &fresh_dir(self.next_id), Some(survivor)));
+        self.next_id += 1;
+        self.master_port = survivor;
+        self.replica_port = dead;
+        assert!(
+            wait_for_pong(dead, Duration::from_secs(15)),
+            "replacement replica up on :{dead}"
+        );
+        self.master_port
+    }
+
+    /// Controlled mode: kill the replica, re-attach a fresh one on the same
+    /// fixed port.
+    pub fn kill_replica_fixed(&mut self) {
+        assert!(self.controlled, "use bootstrap_controlled");
+        self.replica_kills += 1;
+        let dead = self.replica_port;
+        kill_by_port(dead);
+        self.fleet.track(spawn_node(
+            dead,
+            &fresh_dir(self.next_id),
+            Some(self.master_port),
+        ));
+        self.next_id += 1;
+        assert!(
+            wait_for_pong(dead, Duration::from_secs(15)),
+            "replacement replica up on :{dead}"
+        );
     }
 
     /// Kill the replica and attach a fresh replacement.

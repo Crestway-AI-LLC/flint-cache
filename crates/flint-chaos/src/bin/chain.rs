@@ -32,10 +32,24 @@ const END: &[u8] = b"END";
 fn main() {
     let n: u64 = arg("--elements", 1_000_000);
     let kills: u32 = arg("--kills", 12);
+    let controller_driven = arg("--driver", "harness".to_string()) == "controller";
     let mut rng = SmallRng::seed_from_u64(arg("--seed", 42));
-    println!("chaos-chain: {n} elements, {kills} kills");
+    println!(
+        "chaos-chain: {n} elements, {kills} kills, driver={}",
+        if controller_driven {
+            "controller"
+        } else {
+            "harness"
+        }
+    );
 
-    let mut cluster = Cluster::bootstrap();
+    let mut cluster = if controller_driven {
+        // A real flint-controller makes every failover decision; the harness
+        // only kills nodes and re-attaches replacements on fixed ports.
+        Cluster::bootstrap_controlled(150, 3, 3_000)
+    } else {
+        Cluster::bootstrap()
+    };
 
     // --- Build phase: pipelined SETs, key{i} -> key{i+1}, key{N} -> END.
     let build_start = std::time::Instant::now();
@@ -87,11 +101,24 @@ fn main() {
         if kill_idx < kill_at.len() && hops == kill_at[kill_idx] {
             let kill_master = rng.random_bool(0.5);
             if kill_master && cluster.wait_healthy(Duration::from_secs(8)) {
-                cluster.kill_master();
-                eprintln!(
-                    "  hop {hops}: killed MASTER, promoted; new master :{}",
-                    cluster.master()
-                );
+                if controller_driven {
+                    // Kill and WAIT for the controller to promote — the
+                    // harness does not decide the failover.
+                    cluster.kill_master_await_controller();
+                    eprintln!(
+                        "  hop {hops}: killed MASTER, CONTROLLER promoted; new master :{}",
+                        cluster.master()
+                    );
+                } else {
+                    cluster.kill_master();
+                    eprintln!(
+                        "  hop {hops}: killed MASTER, promoted; new master :{}",
+                        cluster.master()
+                    );
+                }
+            } else if controller_driven {
+                cluster.kill_replica_fixed();
+                eprintln!("  hop {hops}: killed REPLICA");
             } else {
                 cluster.kill_replica();
                 eprintln!("  hop {hops}: killed REPLICA");
