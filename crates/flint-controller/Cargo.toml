@@ -1,0 +1,13 @@
+[package]
+name = "flint-controller"
+description = "v0 failover controller: automatic detect -> verify-safe -> promote -> fence, driving the FLINTPROMOTE/FLINTDEMOTE primitives (single-node; Raft-HA + push leases are follow-on)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+flint-resp = { path = "../flint-resp" }
+
+[lints]
+workspace = true
