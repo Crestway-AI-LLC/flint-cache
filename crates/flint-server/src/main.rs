@@ -205,6 +205,18 @@ fn main() -> std::io::Result<()> {
         .unwrap_or(0);
     let hub = Arc::new(ReplHub::new(lag_soft, lag_hard, min_replicas));
 
+    // Fast-path guard for per-slot ownership: only consult ownership (an
+    // extra manifest read) when at least one migration override exists.
+    // Set at boot from durable records and by FLINTSLOTMOVED; false is the
+    // common case, so normal traffic pays nothing.
+    let migration_active = Arc::new(AtomicBool::new(false));
+    #[cfg(feature = "rocks")]
+    if let Some(kv) = &rocks
+        && !flint_storage::manifest::scan_migrations(kv.as_ref(), b"0").is_empty()
+    {
+        migration_active.store(true, Ordering::Relaxed);
+    }
+
     // Lease watchdog: self-fence on expiry. Runtime-only (read-only flip);
     // durable fencing is FLINTDEMOTE. Never un-fences — a master that
     // self-fenced during a partition must not resume writing (a successor
@@ -240,6 +252,7 @@ fn main() -> std::io::Result<()> {
         let read_only = Arc::clone(&read_only);
         let tailer_stop = Arc::clone(&tailer_stop);
         let lease_deadline = Arc::clone(&lease_deadline);
+        let migration_active = Arc::clone(&migration_active);
         std::thread::spawn(move || {
             let _ = serve(
                 stream,
@@ -249,12 +262,14 @@ fn main() -> std::io::Result<()> {
                 &lease_deadline,
                 rocks,
                 &hub,
+                &migration_active,
             );
         });
     }
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn serve(
     mut stream: TcpStream,
     store: &dyn Kv,
@@ -263,6 +278,7 @@ fn serve(
     lease_deadline: &Arc<std::sync::atomic::AtomicU64>,
     rocks: Option<RocksHandle>,
     hub: &Arc<ReplHub>,
+    migration_active: &Arc<AtomicBool>,
 ) -> std::io::Result<()> {
     let mut buf: Vec<u8> = Vec::with_capacity(16 * 1024);
     let mut chunk = [0u8; 16 * 1024];
@@ -297,6 +313,7 @@ fn serve(
                     lease_deadline,
                     &rocks,
                     hub,
+                    migration_active,
                     &args,
                 );
                 encode(&reply, &mut out);
@@ -347,6 +364,7 @@ fn serve(
                         lease_deadline,
                         &rocks,
                         hub,
+                        migration_active,
                         &args,
                     );
                     encode(&reply, &mut out);
@@ -373,6 +391,7 @@ fn serve(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute(
     store: &dyn Kv,
     read_only: &Arc<AtomicBool>,
@@ -380,6 +399,7 @@ fn execute(
     lease_deadline: &Arc<std::sync::atomic::AtomicU64>,
     rocks: &Option<RocksHandle>,
     hub: &Arc<ReplHub>,
+    migration_active: &Arc<AtomicBool>,
     args: &[Vec<u8>],
 ) -> Value {
     if args
@@ -446,6 +466,27 @@ fn execute(
             return Value::Error("READONLY cannot migrate into a replica".into());
         }
         return flintmigratein(rocks, args);
+    }
+    // FLINTSLOTMOVED <slot> <host:port>: durably mark this slot handed off to
+    // `peer`; subsequent commands for a key in it answer -MOVED. The cutover
+    // step that makes the source disown a moved slot (protocol wiring next).
+    if args
+        .first()
+        .is_some_and(|n| n.eq_ignore_ascii_case(b"FLINTSLOTMOVED"))
+    {
+        if ro {
+            return Value::Error("READONLY cannot change slot ownership on a replica".into());
+        }
+        return flintslotmoved(rocks, migration_active, args);
+    }
+    // Per-slot ownership: after a migration, a command for a key in a slot
+    // this node no longer owns is redirected with -MOVED (Redis Cluster
+    // semantics). Guarded by `migration_active` so ordinary traffic — the
+    // case with no overrides — never pays the extra manifest read.
+    if migration_active.load(Ordering::Relaxed)
+        && let Some(moved) = check_slot_ownership(rocks, args)
+    {
+        return moved;
     }
     // Lag-cap backpressure: the write path enforces the RPO bound. The
     // min-replicas gate comes first — with no live replica there is no lag
@@ -1008,6 +1049,86 @@ fn flintmigratein(rocks: &Option<RocksHandle>, args: &[Vec<u8>]) -> Value {
 #[cfg(not(feature = "rocks"))]
 fn flintmigratein(_rocks: &Option<RocksHandle>, _args: &[Vec<u8>]) -> Value {
     Value::Error("ERR FLINTMIGRATEIN requires a build with --features rocks".into())
+}
+
+/// FLINTSLOTMOVED <slot> <host:port>: write a durable Moved override so this
+/// node redirects the slot with -MOVED. Epoch is bumped past any existing
+/// record/claim so the write is monotonic and fence-safe.
+#[cfg(feature = "rocks")]
+fn flintslotmoved(
+    rocks: &Option<RocksHandle>,
+    migration_active: &Arc<AtomicBool>,
+    args: &[Vec<u8>],
+) -> Value {
+    use flint_storage::manifest::{self, Epoch, MigrationPhase, MigrationRecord};
+    let Some(kv) = rocks else {
+        return Value::Error("ERR FLINTSLOTMOVED requires the rocks engine".into());
+    };
+    let (Some(slot), Some(peer)) = (
+        args.get(1)
+            .and_then(|r| std::str::from_utf8(r).ok())
+            .and_then(|s| s.parse::<u16>().ok()),
+        args.get(2).and_then(|r| std::str::from_utf8(r).ok()),
+    ) else {
+        return Value::Error("ERR FLINTSLOTMOVED <slot> <host:port>".into());
+    };
+    // Next epoch: strictly above the current override and the base claim.
+    let base = manifest::read_claim(kv.as_ref(), b"0")
+        .map(|c| c.epoch)
+        .unwrap_or(Epoch::ZERO);
+    let cur = manifest::read_migration(kv.as_ref(), b"0", slot)
+        .map(|r| r.epoch)
+        .unwrap_or(Epoch::ZERO);
+    let hi = base.max(cur);
+    let next = Epoch {
+        generation: hi.generation,
+        counter: hi.counter + 1,
+    };
+    match manifest::set_migration(
+        kv.as_ref(),
+        &MigrationRecord {
+            ns: b"0".to_vec(),
+            slot,
+            phase: MigrationPhase::Moved,
+            peer: peer.to_string(),
+            epoch: next,
+        },
+    ) {
+        Ok(()) => {
+            migration_active.store(true, Ordering::Relaxed);
+            Value::Simple(format!("OK slot {slot} moved to {peer}"))
+        }
+        Err(e) => Value::Error(format!("ERR slot move fenced: {e:?}")),
+    }
+}
+
+#[cfg(not(feature = "rocks"))]
+fn flintslotmoved(
+    _rocks: &Option<RocksHandle>,
+    _migration_active: &Arc<AtomicBool>,
+    _args: &[Vec<u8>],
+) -> Value {
+    Value::Error("ERR FLINTSLOTMOVED requires a build with --features rocks".into())
+}
+
+/// If the command targets a key in a slot this node has handed off (or is
+/// importing), return the -MOVED redirect; otherwise None (serve normally).
+#[cfg(feature = "rocks")]
+fn check_slot_ownership(rocks: &Option<RocksHandle>, args: &[Vec<u8>]) -> Option<Value> {
+    use flint_storage::manifest::{self, SlotOwnership};
+    let kv = rocks.as_ref()?;
+    let key = commands::command_key(args)?;
+    let slot = flint_slot::slot_for_key(key);
+    let base = manifest::read_claim(kv.as_ref(), b"0")?;
+    match manifest::slot_ownership(kv.as_ref(), b"0", slot, &base) {
+        SlotOwnership::MovedTo(addr) => Some(Value::Error(format!("MOVED {slot} {addr}"))),
+        SlotOwnership::Owned | SlotOwnership::NotInRange => None,
+    }
+}
+
+#[cfg(not(feature = "rocks"))]
+fn check_slot_ownership(_rocks: &Option<RocksHandle>, _args: &[Vec<u8>]) -> Option<Value> {
+    None
 }
 
 #[cfg(feature = "rocks")]

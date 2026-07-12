@@ -83,14 +83,62 @@ pub struct SlotClaim {
     pub epoch: Epoch,
 }
 
-/// A node's role in an in-flight slot move.
+/// A node's relationship to a slot that is (or was) being moved. Importing
+/// and Migrating are in-flight; Moved is terminal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MigrationPhase {
-    /// The DESTINATION is pulling this slot and does not own it yet.
+    /// The DESTINATION is pulling this slot and does not own it yet — it
+    /// redirects clients to the source.
     Importing = 1,
     /// The SOURCE is shedding this slot: it still owns and serves it until
-    /// the cutover, after which it answers -MOVED.
+    /// the cutover flip.
     Migrating = 2,
+    /// Terminal on the SOURCE after cutover: this node has permanently handed
+    /// the slot to `peer` and answers -MOVED. Persisted because the v0
+    /// whole-range base claim cannot exclude one interior slot; this override
+    /// is how a moved-away slot is represented.
+    Moved = 3,
+}
+
+impl MigrationPhase {
+    /// In-flight phases a recovering controller must resume or roll back;
+    /// Moved is a settled ownership override, not an in-flight move.
+    pub fn is_inflight(self) -> bool {
+        matches!(self, MigrationPhase::Importing | MigrationPhase::Migrating)
+    }
+}
+
+/// This node's ownership of a slot, derived from the base claim plus any
+/// per-slot migration override. This is what the write/read path consults to
+/// decide whether to serve or answer -MOVED.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SlotOwnership {
+    /// This node owns and serves the slot.
+    Owned,
+    /// Not owned; redirect the client to `peer` with -MOVED. Covers both the
+    /// destination mid-import (redirect to the still-owning source) and the
+    /// source after cutover (redirect to the new-owner destination).
+    MovedTo(String),
+    /// The base claim does not cover this slot at all.
+    NotInRange,
+}
+
+/// Resolve ownership of `slot` for this node: base claim, overridden per-slot
+/// by any migration record. Owned unless the slot is outside the range or has
+/// an Importing/Moved override (both of which redirect to the record's peer).
+/// Migrating still counts as Owned — the source serves until the cutover flip.
+pub fn slot_ownership(kv: &dyn Kv, ns: &[u8], slot: u16, base: &SlotClaim) -> SlotOwnership {
+    if slot < base.start || slot > base.end {
+        return SlotOwnership::NotInRange;
+    }
+    match read_migration(kv, ns, slot) {
+        None
+        | Some(MigrationRecord {
+            phase: MigrationPhase::Migrating,
+            ..
+        }) => SlotOwnership::Owned,
+        Some(rec) => SlotOwnership::MovedTo(rec.peer),
+    }
 }
 
 /// Durable record of one slot being moved, stamped with the move's slot-epoch
@@ -218,6 +266,7 @@ fn decode_migration(ns: &[u8], slot: u16, raw: &[u8]) -> Option<MigrationRecord>
     let phase = match raw[0] {
         1 => MigrationPhase::Importing,
         2 => MigrationPhase::Migrating,
+        3 => MigrationPhase::Moved,
         _ => return None,
     };
     Some(MigrationRecord {
@@ -558,5 +607,91 @@ mod tests {
         found.sort_unstable();
         assert_eq!(found, vec![7, 300, 16000]);
         assert_eq!(scan_migrations(&kv, b"other").len(), 1);
+    }
+
+    #[test]
+    fn slot_ownership_reflects_base_claim_and_overrides() {
+        let kv = MemKv::new();
+        let ep = Epoch {
+            generation: 0,
+            counter: 2,
+        };
+        let base = SlotClaim {
+            ns: b"0".to_vec(),
+            start: 0,
+            end: 16383,
+            epoch: Epoch {
+                generation: 0,
+                counter: 1,
+            },
+        };
+
+        // No override: the base range owns everything.
+        assert_eq!(slot_ownership(&kv, b"0", 100, &base), SlotOwnership::Owned);
+
+        // Source mid-move still owns (serves until the flip).
+        set_migration(
+            &kv,
+            &MigrationRecord {
+                ns: b"0".to_vec(),
+                slot: 100,
+                phase: MigrationPhase::Migrating,
+                peer: "dst:1".into(),
+                epoch: ep,
+            },
+        )
+        .expect("migrating");
+        assert_eq!(slot_ownership(&kv, b"0", 100, &base), SlotOwnership::Owned);
+
+        // After cutover the source is Moved: redirect to the destination.
+        set_migration(
+            &kv,
+            &MigrationRecord {
+                ns: b"0".to_vec(),
+                slot: 100,
+                phase: MigrationPhase::Moved,
+                peer: "dst:1".into(),
+                epoch: Epoch {
+                    generation: 0,
+                    counter: 3,
+                },
+            },
+        )
+        .expect("moved");
+        assert_eq!(
+            slot_ownership(&kv, b"0", 100, &base),
+            SlotOwnership::MovedTo("dst:1".into())
+        );
+
+        // The destination mid-import does not own it: redirect to the source.
+        let kv2 = MemKv::new();
+        set_migration(
+            &kv2,
+            &MigrationRecord {
+                ns: b"0".to_vec(),
+                slot: 100,
+                phase: MigrationPhase::Importing,
+                peer: "src:1".into(),
+                epoch: ep,
+            },
+        )
+        .expect("importing");
+        assert_eq!(
+            slot_ownership(&kv2, b"0", 100, &base),
+            SlotOwnership::MovedTo("src:1".into())
+        );
+
+        // Outside the base range: not this node's slot at all.
+        let narrow = SlotClaim {
+            end: 8191,
+            ..base.clone()
+        };
+        assert_eq!(
+            slot_ownership(&kv, b"0", 9000, &narrow),
+            SlotOwnership::NotInRange
+        );
+
+        assert!(MigrationPhase::Importing.is_inflight());
+        assert!(!MigrationPhase::Moved.is_inflight());
     }
 }

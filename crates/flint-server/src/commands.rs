@@ -49,6 +49,31 @@ pub fn is_write_command(name: &[u8]) -> bool {
     )
 }
 
+/// The single key a command addresses (its slot-determining key), or None
+/// for commands that don't target one key. v0 commands all place their key at
+/// args[1]; FLINT* admin/replication commands are intercepted before this, so
+/// only the no-key data/util commands need excluding. Used to check per-slot
+/// ownership and answer -MOVED after a migration.
+pub fn command_key(args: &[Vec<u8>]) -> Option<&[u8]> {
+    let name = args.first()?;
+    const NO_KEY: &[&[u8]] = &[
+        b"PING",
+        b"ECHO",
+        b"DBSIZE",
+        b"FLUSHALL",
+        b"COMMAND",
+        b"CLUSTER",
+        b"INFO",
+        b"SELECT",
+        b"QUIT",
+        b"HELLO",
+    ];
+    if NO_KEY.iter().any(|c| name.eq_ignore_ascii_case(c)) {
+        return None;
+    }
+    args.get(1).map(|k| k.as_slice())
+}
+
 /// v0 runs a single default namespace; tenancy arrives with the proxy.
 const NS: &[u8] = b"0";
 
