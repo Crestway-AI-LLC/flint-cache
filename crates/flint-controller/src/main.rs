@@ -21,13 +21,20 @@
 //!   - a survivor that was NOT recently converged is a degraded-window
 //!     failure → refuse and page (spare/S3 recovery is deferred).
 //!
-//! NOT yet (follow-on): push leases (a partitioned master self-fencing on
-//! TTL without the controller reaching it) and replacement-replica attach
-//! (restoring redundancy after a promotion — a node-lifecycle concern).
+//! Push leases: the controller renews the master's lease each tick
+//! (FLINTLEASE); a master partitioned from every controller self-fences on
+//! TTL expiry on its own.
+//!
+//! Managed mode (--manage-slots PORT:DIR,...): the controller also SUPERVISES
+//! nodes — bootstraps the pair and respawns a dead non-master slot as a
+//! fresh replica of the current master (spawn-a-fresh-node spare model),
+//! owning the whole failover cycle. --nodes (addresses only) is
+//! decision-only, for when node lifecycle is external.
 //!
 //! Usage:
-//!   flint-controller --nodes 127.0.0.1:6460,127.0.0.1:6470 \
-//!     [--poll-ms 200] [--confirm 3] [--max-stale-ms 5000] [--id A]
+//!   flint-controller --nodes 127.0.0.1:6460,127.0.0.1:6470 [--id A]
+//!   flint-controller --manage-slots 6460:/data/a,6470:/data/b [--id A]
+//!   common: [--poll-ms 200] [--confirm 3] [--max-stale-ms 5000] [--lease-ttl-ms 3000]
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -60,8 +67,9 @@ fn kill_port(port: u16) {
 /// Launch a flint-server for `slot`. `master` = None spawns a fresh master
 /// (bootstrap only); Some(addr) spawns a fresh replica of that master. The
 /// data dir is wiped first — "spawn a fresh node" always seeds from scratch
-/// (full sync), never resurrects stale bytes.
-fn spawn_slot(bin: &str, slot: &Slot, master: Option<&str>) {
+/// (full sync), never resurrects stale bytes. Returns the child so the
+/// supervisor can reap it on the next respawn (no defunct accumulation).
+fn spawn_slot(bin: &str, slot: &Slot, master: Option<&str>) -> std::process::Child {
     kill_port(slot.port);
     let _ = std::fs::remove_dir_all(&slot.dir);
     let mut cmd = Command::new(bin);
@@ -79,7 +87,7 @@ fn spawn_slot(bin: &str, slot: &Slot, master: Option<&str>) {
     cmd.stderr(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .spawn()
-        .expect("spawn flint-server");
+        .expect("spawn flint-server")
 }
 
 fn arg(name: &str) -> Option<String> {
@@ -229,6 +237,16 @@ fn main() {
     // Per-slot dead-streak and respawn cooldown (managed mode).
     let mut slot_miss = vec![0u32; slots.len()];
     let mut slot_cooldown = vec![Instant::now(); slots.len()];
+    // Child handles of supervised nodes, reaped on respawn so a long-running
+    // supervisor never accumulates defunct processes.
+    let mut slot_child: Vec<Option<std::process::Child>> = slots.iter().map(|_| None).collect();
+    let reap =
+        |i: usize, child: std::process::Child, handles: &mut Vec<Option<std::process::Child>>| {
+            if let Some(mut old) = handles[i].replace(child) {
+                let _ = old.kill();
+                let _ = old.wait();
+            }
+        };
 
     loop {
         std::thread::sleep(poll);
@@ -238,11 +256,13 @@ fn main() {
         // rest as fresh replicas of it.
         if managed && states.iter().all(|n| !n.reachable) {
             eprintln!("[{id}] bootstrapping managed pair");
-            spawn_slot(&bin, &slots[0], None);
+            let c0 = spawn_slot(&bin, &slots[0], None);
+            reap(0, c0, &mut slot_child);
             let master_addr = nodes[0].clone();
             std::thread::sleep(Duration::from_millis(600));
-            for slot in &slots[1..] {
-                spawn_slot(&bin, slot, Some(&master_addr));
+            for (i, slot) in slots.iter().enumerate().skip(1) {
+                let c = spawn_slot(&bin, slot, Some(&master_addr));
+                reap(i, c, &mut slot_child);
             }
             std::thread::sleep(Duration::from_millis(400));
             continue;
@@ -303,7 +323,8 @@ fn main() {
                             "[{id}] slot :{} dead — respawning as fresh replica of {}",
                             slot.port, legit.addr
                         );
-                        spawn_slot(&bin, slot, Some(&legit.addr));
+                        let c = spawn_slot(&bin, slot, Some(&legit.addr));
+                        reap(i, c, &mut slot_child);
                         slot_miss[i] = 0;
                         slot_cooldown[i] = Instant::now() + Duration::from_secs(20);
                     }
