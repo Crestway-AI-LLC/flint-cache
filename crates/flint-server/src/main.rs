@@ -44,6 +44,12 @@ fn main() -> std::io::Result<()> {
     // Role is dynamic: FLINTPROMOTE flips a replica to master at runtime.
     let read_only = Arc::new(AtomicBool::new(replica_of.is_some()));
     let tailer_stop = Arc::new(AtomicBool::new(false));
+    // Lease deadline (unix-ms). 0 = unmanaged (standalone: never self-fences).
+    // Once a controller sends FLINTLEASE, the node is lease-managed and
+    // self-fences to read-only if the deadline passes without renewal — so a
+    // master partitioned from ALL controllers stops accepting writes on its
+    // own, closing the split-brain window without anyone reaching it.
+    let lease_deadline = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
     #[allow(unused_mut)]
     let mut rocks: Option<RocksHandle> = None;
@@ -191,6 +197,30 @@ fn main() -> std::io::Result<()> {
         eprintln!("lag caps: soft={lag_soft}ms hard={lag_hard}ms");
     }
     let hub = Arc::new(ReplHub::new(lag_soft, lag_hard));
+
+    // Lease watchdog: self-fence on expiry. Runtime-only (read-only flip);
+    // durable fencing is FLINTDEMOTE. Never un-fences — a master that
+    // self-fenced during a partition must not resume writing (a successor
+    // may have been promoted); recovery is FLINTDEMOTE + resync.
+    {
+        let read_only = Arc::clone(&read_only);
+        let lease_deadline = Arc::clone(&lease_deadline);
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                let d = lease_deadline.load(Ordering::Relaxed);
+                if d != 0
+                    && flint_storage::strings::system_clock() > d
+                    && !read_only.load(Ordering::Relaxed)
+                {
+                    read_only.store(true, Ordering::Relaxed);
+                    eprintln!(
+                        "lease expired: self-fenced to read-only (partitioned from controllers)"
+                    );
+                }
+            }
+        });
+    }
     let listener = TcpListener::bind(("127.0.0.1", port))?;
     eprintln!("flint-server listening on 127.0.0.1:{port}");
     for stream in listener.incoming() {
@@ -202,12 +232,14 @@ fn main() -> std::io::Result<()> {
         let hub = Arc::clone(&hub);
         let read_only = Arc::clone(&read_only);
         let tailer_stop = Arc::clone(&tailer_stop);
+        let lease_deadline = Arc::clone(&lease_deadline);
         std::thread::spawn(move || {
             let _ = serve(
                 stream,
                 store.as_ref(),
                 &read_only,
                 &tailer_stop,
+                &lease_deadline,
                 rocks,
                 &hub,
             );
@@ -221,6 +253,7 @@ fn serve(
     store: &dyn Kv,
     read_only: &Arc<AtomicBool>,
     tailer_stop: &Arc<AtomicBool>,
+    lease_deadline: &Arc<std::sync::atomic::AtomicU64>,
     rocks: Option<RocksHandle>,
     hub: &Arc<ReplHub>,
 ) -> std::io::Result<()> {
@@ -250,7 +283,15 @@ fn serve(
                 if args.is_empty() {
                     continue;
                 }
-                let reply = execute(store, read_only, tailer_stop, &rocks, hub, &args);
+                let reply = execute(
+                    store,
+                    read_only,
+                    tailer_stop,
+                    lease_deadline,
+                    &rocks,
+                    hub,
+                    &args,
+                );
                 encode(&reply, &mut out);
                 continue;
             }
@@ -284,7 +325,15 @@ fn serve(
                         stream.write_all(&out)?;
                         return flintfullsync(stream, rocks);
                     }
-                    let reply = execute(store, read_only, tailer_stop, &rocks, hub, &args);
+                    let reply = execute(
+                        store,
+                        read_only,
+                        tailer_stop,
+                        lease_deadline,
+                        &rocks,
+                        hub,
+                        &args,
+                    );
                     encode(&reply, &mut out);
                 }
                 Ok(Decoded::NeedMore) => break,
@@ -313,10 +362,39 @@ fn execute(
     store: &dyn Kv,
     read_only: &Arc<AtomicBool>,
     tailer_stop: &Arc<AtomicBool>,
+    lease_deadline: &Arc<std::sync::atomic::AtomicU64>,
     rocks: &Option<RocksHandle>,
     hub: &Arc<ReplHub>,
     args: &[Vec<u8>],
 ) -> Value {
+    if args
+        .first()
+        .is_some_and(|n| n.eq_ignore_ascii_case(b"FLINTLEASE"))
+    {
+        // FLINTLEASE <ttl_ms>: renew the lease. Idempotent — any controller
+        // may renew; renewal only extends life, it never un-fences a node
+        // that already self-fenced or was demoted.
+        let ttl: u64 = args
+            .get(1)
+            .and_then(|raw| std::str::from_utf8(raw).ok())
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        if ttl == 0 {
+            return Value::Error("ERR usage: FLINTLEASE <ttl_ms>".into());
+        }
+        lease_deadline.store(
+            flint_storage::strings::system_clock() + ttl,
+            Ordering::Relaxed,
+        );
+        return Value::Simple(format!(
+            "OK lease {}",
+            if read_only.load(Ordering::Relaxed) {
+                "renewed (node is read-only)"
+            } else {
+                "renewed"
+            }
+        ));
+    }
     let ro = read_only.load(Ordering::Relaxed);
     let is_write = args
         .first()

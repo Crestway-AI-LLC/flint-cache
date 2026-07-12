@@ -137,6 +137,11 @@ fn main() {
     let poll = Duration::from_millis(arg_or("--poll-ms", 200));
     let confirm: u32 = arg_or("--confirm", 3);
     let max_stale = Duration::from_millis(arg_or("--max-stale-ms", 5_000));
+    // Lease TTL handed to the master on each renewal. Generous vs the poll
+    // interval so transient controller unavailability never trips a healthy
+    // master; a master self-fences only after this long with NO controller
+    // (of any in the HA set) reaching it. 0 disables lease renewal.
+    let lease_ttl: u64 = arg_or("--lease-ttl-ms", 3_000);
     let id = arg("--id").unwrap_or_else(|| "ctl".into());
 
     eprintln!(
@@ -159,6 +164,14 @@ fn main() {
 
         if let Some(legit) = masters.iter().max_by_key(|n| n.epoch).copied() {
             no_master_streak = 0;
+            // Renew the legitimate master's lease (idempotent across the HA
+            // set; only extends life, never un-fences).
+            if lease_ttl > 0 {
+                let _ = call(
+                    &legit.addr,
+                    &[b"FLINTLEASE", lease_ttl.to_string().as_bytes()],
+                );
+            }
             // Any other reachable master-claimer is a zombie: fence it.
             for m in &masters {
                 if m.addr != legit.addr {
