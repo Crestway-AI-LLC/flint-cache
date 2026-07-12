@@ -344,7 +344,18 @@ fn execute(
             _ => {}
         }
     }
-    Dispatcher::new(store, flint_storage::strings::system_clock).dispatch(args)
+    // On a replica, wrap the store so lazy-expiry deletes buried in read
+    // paths become no-ops: a replica must not write to its own store (that
+    // would diverge it from the master); the master's replicated DELETE and
+    // the compaction filter reclaim expired rows. Reads still return None
+    // for expired keys — correctness is unchanged, only the local write is
+    // suppressed.
+    if ro {
+        let ro_store = flint_storage::ReadOnlyKv(store);
+        Dispatcher::new(&ro_store, flint_storage::strings::system_clock).dispatch(args)
+    } else {
+        Dispatcher::new(store, flint_storage::strings::system_clock).dispatch(args)
+    }
 }
 
 /// FLINTPROMOTE <generation> <counter>: epoch-fenced promotion of a

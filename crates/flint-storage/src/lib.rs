@@ -51,6 +51,33 @@ pub trait Kv: Send + Sync {
     fn clear(&self);
 }
 
+/// A write-suppressing view of another `Kv`, used on replicas.
+///
+/// A replica rejects mutating commands at dispatch, so the ONLY writes that
+/// would otherwise reach its store are the lazy-expiry deletes buried inside
+/// read paths (`GET` of an expired key calls `delete`). Those local writes
+/// are wrong on a replica: they advance the replica's own sequence space,
+/// diverge its physical bytes from the master, and violate the read-only
+/// invariant — while the master's replicated `DELETE` (and the compaction
+/// filter) already reclaim the row. This view makes reads pass through and
+/// every write a no-op, so an expired key still reads as absent (the store
+/// returns `None` regardless of the delete's outcome) without any write.
+pub struct ReadOnlyKv<'a>(pub &'a dyn Kv);
+
+impl Kv for ReadOnlyKv<'_> {
+    fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+        self.0.get(key)
+    }
+    fn put(&self, _key: &[u8], _value: &[u8]) {}
+    fn delete(&self, _key: &[u8]) -> bool {
+        false
+    }
+    fn scan_prefix(&self, prefix: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
+        self.0.scan_prefix(prefix)
+    }
+    fn clear(&self) {}
+}
+
 /// In-memory `Kv` for tests and the v0 server.
 #[derive(Default)]
 pub struct MemKv {
@@ -140,5 +167,60 @@ mod tests {
         let val = [1u8, 0, 2, 255];
         kv.put(&key, &val);
         assert_eq!(kv.get(&key), Some(val.to_vec()));
+    }
+
+    #[test]
+    fn readonly_view_passes_reads_suppresses_writes() {
+        let backing = MemKv::new();
+        backing.put(b"k", b"v");
+        let ro = ReadOnlyKv(&backing);
+        assert_eq!(ro.get(b"k"), Some(b"v".to_vec()));
+        assert_eq!(ro.scan_prefix(b"k").len(), 1);
+        // Writes are silently dropped; the backing store is untouched.
+        ro.put(b"k", b"other");
+        assert!(!ro.delete(b"k"));
+        ro.clear();
+        assert_eq!(backing.get(b"k"), Some(b"v".to_vec()));
+    }
+
+    #[test]
+    fn replica_read_of_expired_key_does_not_write() {
+        use crate::strings::{SetExpiry, SetOptions, StringStore};
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NOW: AtomicU64 = AtomicU64::new(1_000);
+        fn now() -> u64 {
+            NOW.load(Ordering::Relaxed)
+        }
+        let backing = MemKv::new();
+        // Master-side: write a key that will expire.
+        StringStore::new(&backing, b"0", now)
+            .set(
+                1,
+                b"k",
+                b"v",
+                SetOptions {
+                    expiry: SetExpiry::AtMs(1_100),
+                    ..Default::default()
+                },
+            )
+            .expect("set");
+        let rows_before = backing.scan_prefix(b"").len();
+
+        // Replica-side: read after expiry through the read-only view.
+        NOW.store(1_200, Ordering::Relaxed);
+        let ro = ReadOnlyKv(&backing);
+        let replica = StringStore::new(&ro, b"0", now);
+        assert_eq!(
+            replica.get(1, b"k"),
+            Ok(None),
+            "expired key reads as absent"
+        );
+        // The physical row was NOT deleted by the replica read.
+        assert_eq!(
+            backing.scan_prefix(b"").len(),
+            rows_before,
+            "replica read must not physically delete (master's DELETE / compaction reclaims it)"
+        );
+        NOW.store(1_000, Ordering::Relaxed);
     }
 }
