@@ -652,10 +652,10 @@ mod replica {
                 eprintln!("tailer stopped (promoted)");
                 return;
             }
-            if let Err(e) = tail_once(target, kv, stop) {
-                if !stop.load(Ordering::Relaxed) {
-                    eprintln!("replication link lost ({e}); reconnecting in 1s");
-                }
+            if let Err(e) = tail_once(target, kv, stop)
+                && !stop.load(Ordering::Relaxed)
+            {
+                eprintln!("replication link lost ({e}); reconnecting in 1s");
             }
             std::thread::sleep(std::time::Duration::from_secs(1));
         }

@@ -112,6 +112,8 @@ impl ReplHub {
             .count()
     }
 
+    /// Used by tests and (soon) the trio's health view.
+    #[allow(dead_code)]
     pub fn has_live_replica(&self, now_ms: u64) -> bool {
         self.effective_acked(now_ms).is_some()
     }
