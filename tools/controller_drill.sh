@@ -26,7 +26,7 @@ awk 'BEGIN{for(i=0;i<20000;i++){k=sprintf("key:%07d",i);v=sprintf("value-%07d",i
   | valkey-cli -p $MPORT --pipe | tail -1
 
 echo "== starting controller"
-./target/release/flint-controller --master 127.0.0.1:$MPORT --replica 127.0.0.1:$RPORT \
+./target/release/flint-controller --nodes 127.0.0.1:$MPORT,127.0.0.1:$RPORT --id ctl \
   --poll-ms 150 --confirm 3 2> /tmp/flint-ctl.log &
 sleep 1.5   # let it observe convergence
 

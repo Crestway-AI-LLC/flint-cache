@@ -1,30 +1,33 @@
-//! flint-controller (v0): the meta trio's DECISION LOGIC, single-node.
+//! flint-controller (v0): the meta trio's DECISION LOGIC.
 //!
-//! Watches one master/replica pair and, on master death, automatically:
-//!   1. confirms death with repeated probes (not one flaky poll),
-//!   2. verifies the survivor is SAFE to promote — the pair must have been
-//!      sequence-converged (seq_lag == 0) within a recency window; a replica
-//!      that was badly behind is a degraded-window failure, NOT an
-//!      automatic promotion (that path needs the S3/spare seed, deferred),
-//!   3. promotes the survivor with a read-then-bumped epoch (FLINTPROMOTE),
-//!   4. fences the old master if it returns (FLINTDEMOTE at a higher epoch).
+//! Discovery-based and STATELESS about roles: every tick it re-observes all
+//! nodes of a pair and derives the current truth (who is master, at what
+//! epoch, is the replica converged) rather than tracking role state
+//! internally. That has two payoffs:
+//!   - Correctness is a pure function of observed reality, so a controller
+//!     that missed an event simply rediscovers it next tick.
+//!   - Multiple controllers can run concurrently for HA: they all observe
+//!     the same reality and reach the same conclusions, and every action is
+//!     epoch-fenced by the data nodes' manifests — a duplicate or racing
+//!     decision is rejected with -FENCED, never corrupts. Redundant work is
+//!     the only cost, which a future Raft coordinator removes.
 //!
-//! What this is NOT yet (both follow-on):
-//!   - HA: this is ONE controller. A partitioned/crashed controller stops
-//!     making decisions. The trio makes the DECIDER a 3-node Raft quorum so
-//!     it survives its own failures and can't be split by a partition.
-//!   - Push leases: detection here is poll-based. The trio adds a lease the
-//!     master renews, so a partitioned master self-fences on TTL expiry even
-//!     without the controller reaching it.
+//! Per tick:
+//!   - legitimate master = reachable node claiming `role:master` with the
+//!     highest epoch;
+//!   - any OTHER node claiming master is a zombie → FLINTDEMOTE it;
+//!   - if no master is reachable but a survivor exists and the pair was
+//!     sequence-converged (seq_lag==0) recently → FLINTPROMOTE the survivor;
+//!   - a survivor that was NOT recently converged is a degraded-window
+//!     failure → refuse and page (spare/S3 recovery is deferred).
 //!
-//! Why a single controller is not reckless in the meantime: every action it
-//! takes is epoch-fenced by the data nodes' manifests. A wrong or duplicate
-//! decision is rejected with -FENCED; the blast radius of a bad controller
-//! is bounded by machinery that already exists and is chaos-tested.
+//! NOT yet (follow-on): push leases (a partitioned master self-fencing on
+//! TTL without the controller reaching it) and replacement-replica attach
+//! (restoring redundancy after a promotion — a node-lifecycle concern).
 //!
 //! Usage:
-//!   flint-controller --master 127.0.0.1:6460 --replica 127.0.0.1:6470 \
-//!     [--poll-ms 200] [--confirm 3] [--max-stale-ms 5000]
+//!   flint-controller --nodes 127.0.0.1:6460,127.0.0.1:6470 \
+//!     [--poll-ms 200] [--confirm 3] [--max-stale-ms 5000] [--id A]
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -40,8 +43,6 @@ fn arg_or<T: std::str::FromStr>(name: &str, default: T) -> T {
     arg(name).and_then(|v| v.parse().ok()).unwrap_or(default)
 }
 
-/// One-shot RESP call: connect, send, read one reply. Cheap and stateless —
-/// the controller polls, it does not hold long connections.
 fn call(addr: &str, args: &[&[u8]]) -> std::io::Result<Value> {
     let mut stream = TcpStream::connect(addr)?;
     stream.set_read_timeout(Some(Duration::from_millis(800)))?;
@@ -77,31 +78,44 @@ fn call(addr: &str, args: &[&[u8]]) -> std::io::Result<Value> {
     }
 }
 
-#[derive(Debug, Default)]
-struct Info {
-    role: String,
-    role_epoch_counter: u32,
+#[derive(Debug, Clone)]
+struct Node {
+    addr: String,
+    reachable: bool,
+    role: String, // "master" | "replica" | "" (unknown/unreachable)
+    epoch: u32,
     live_replicas: u32,
-    seq_lag: Option<u64>, // None = no live replica / not reported
+    seq_lag: Option<u64>,
 }
 
-fn flintinfo(addr: &str) -> Option<Info> {
-    let Value::Bulk(Some(raw)) = call(addr, &[b"FLINTINFO"]).ok()? else {
-        return None;
+fn observe(addr: &str) -> Node {
+    let mut node = Node {
+        addr: addr.to_string(),
+        reachable: false,
+        role: String::new(),
+        epoch: 0,
+        live_replicas: 0,
+        seq_lag: None,
     };
-    let text = String::from_utf8_lossy(&raw);
-    let mut info = Info::default();
-    for line in text.split(['\r', '\n']).filter(|l| !l.is_empty()) {
+    let Ok(Value::Bulk(Some(raw))) = call(addr, &[b"FLINTINFO"]) else {
+        // Distinguish "down" from "up but FLINTINFO hiccup" with a PING.
+        node.reachable = matches!(call(addr, &[b"PING"]), Ok(Value::Simple(s)) if s == "PONG");
+        return node;
+    };
+    node.reachable = true;
+    for line in String::from_utf8_lossy(&raw)
+        .split(['\r', '\n'])
+        .filter(|l| !l.is_empty())
+    {
         let Some((k, v)) = line.split_once(':') else {
             continue;
         };
         match k {
-            "role" => info.role = v.to_string(),
-            "live_replicas" => info.live_replicas = v.parse().unwrap_or(0),
-            "seq_lag" => info.seq_lag = v.parse().ok(),
+            "role" => node.role = v.to_string(),
+            "live_replicas" => node.live_replicas = v.parse().unwrap_or(0),
+            "seq_lag" => node.seq_lag = v.parse().ok(),
             "role_epoch" => {
-                // (0,2) -> 2
-                info.role_epoch_counter = v
+                node.epoch = v
                     .trim_matches(|c| c == '(' || c == ')')
                     .split(',')
                     .nth(1)
@@ -111,130 +125,113 @@ fn flintinfo(addr: &str) -> Option<Info> {
             _ => {}
         }
     }
-    Some(info)
-}
-
-fn reachable(addr: &str) -> bool {
-    matches!(call(addr, &[b"PING"]), Ok(Value::Simple(s)) if s == "PONG")
+    node
 }
 
 fn main() {
-    let master = arg("--master").expect("--master HOST:PORT required");
-    let replica = arg("--replica").expect("--replica HOST:PORT required");
+    let nodes: Vec<String> = arg("--nodes")
+        .expect("--nodes a,b[,c] required")
+        .split(',')
+        .map(|s| s.to_string())
+        .collect();
     let poll = Duration::from_millis(arg_or("--poll-ms", 200));
     let confirm: u32 = arg_or("--confirm", 3);
     let max_stale = Duration::from_millis(arg_or("--max-stale-ms", 5_000));
+    let id = arg("--id").unwrap_or_else(|| "ctl".into());
 
     eprintln!(
-        "flint-controller: watching master={master} replica={replica} \
-         (poll={poll:?} confirm={confirm} max-stale={max_stale:?})"
-    );
-    eprintln!(
-        "NOTE: single-node decider; epoch fencing on the data nodes bounds any wrong decision."
+        "[{id}] flint-controller: nodes={nodes:?} poll={poll:?} confirm={confirm} max-stale={max_stale:?}"
     );
 
-    // Current roles as the controller understands them. On a master kill,
-    // the survivor is promoted and the roles swap; the old master, if it
-    // returns, is fenced.
-    let mut master = master;
-    let mut replica = replica;
-    let mut miss = 0u32;
-    // Last time the pair was sequence-converged — the safety gate for
-    // automatic promotion.
     let mut last_converged = Instant::now();
     let mut converged_ever = false;
+    let mut no_master_streak = 0u32;
 
     loop {
         std::thread::sleep(poll);
+        let states: Vec<Node> = nodes.iter().map(|a| observe(a)).collect();
 
-        // Track convergence health from the master's view.
-        if let Some(m) = flintinfo(&master) {
-            if m.live_replicas >= 1 && m.seq_lag == Some(0) {
+        let masters: Vec<&Node> = states
+            .iter()
+            .filter(|n| n.reachable && n.role == "master")
+            .collect();
+        let max_epoch = states.iter().map(|n| n.epoch).max().unwrap_or(0);
+
+        if let Some(legit) = masters.iter().max_by_key(|n| n.epoch).copied() {
+            no_master_streak = 0;
+            // Any other reachable master-claimer is a zombie: fence it.
+            for m in &masters {
+                if m.addr != legit.addr {
+                    let next = max_epoch + 1;
+                    fence(&id, &m.addr, next);
+                }
+            }
+            // Track convergence of the legitimate master's pair.
+            if legit.live_replicas >= 1 && legit.seq_lag == Some(0) {
                 last_converged = Instant::now();
                 converged_ever = true;
             }
-            miss = 0;
-            // Zombie check: if the node we believe is the REPLICA now claims
-            // master (a returned old master, or a mis-start), fence it.
-            if let Some(r) = flintinfo(&replica)
-                && r.role == "master"
-            {
-                fence_zombie(&master, &replica, &r);
-            }
             continue;
         }
 
-        // Master did not answer FLINTINFO this tick.
-        miss += 1;
-        if miss < confirm {
-            continue;
-        }
-        // Confirmed unreachable across `confirm` consecutive probes.
-        if reachable(&master) {
-            // It answered a bare PING — treat as a transient FLINTINFO blip.
-            miss = 0;
+        // No reachable master. Confirm across `confirm` ticks before acting.
+        no_master_streak += 1;
+        if no_master_streak < confirm {
             continue;
         }
 
-        eprintln!("master {master} unreachable for {confirm} probes; evaluating failover");
-
-        // Safety gate: only auto-promote a survivor that was recently
-        // sequence-converged. Otherwise this is a degraded-window failure
-        // (the survivor may be far behind) — refuse and page. The
-        // spare-seed/S3 recovery path is deferred.
+        // Degraded-window gate: only auto-promote a recently-converged pair.
         if !converged_ever || last_converged.elapsed() > max_stale {
             eprintln!(
-                "REFUSING auto-promotion: pair not converged within {max_stale:?} \
-                 (degraded window — needs spare/S3 recovery, not implemented). PAGE."
+                "[{id}] no master and pair not converged within {max_stale:?} — REFUSING (degraded window; needs spare/S3). PAGE."
             );
-            // Keep watching; if the master returns, resume.
+            no_master_streak = 0;
             std::thread::sleep(Duration::from_secs(1));
-            miss = 0;
             continue;
         }
 
-        if !reachable(&replica) {
-            eprintln!("survivor {replica} also unreachable — cannot fail over. PAGE.");
+        // The survivor is the reachable node with the highest epoch.
+        let Some(survivor) = states
+            .iter()
+            .filter(|n| n.reachable)
+            .max_by_key(|n| n.epoch)
+        else {
+            eprintln!("[{id}] no reachable node in the pair — cannot fail over. PAGE.");
+            no_master_streak = 0;
             std::thread::sleep(Duration::from_secs(1));
-            miss = 0;
             continue;
-        }
+        };
 
-        // Read-then-bump the epoch from the survivor's durable role.
-        let cur = flintinfo(&replica)
-            .map(|i| i.role_epoch_counter)
-            .unwrap_or(1);
-        let next = cur + 1;
+        let next = max_epoch + 1;
         match call(
-            &replica,
+            &survivor.addr,
             &[b"FLINTPROMOTE", b"0", next.to_string().as_bytes()],
         ) {
             Ok(Value::Simple(s)) => {
-                eprintln!("PROMOTED {replica} to master at (0,{next}): {s}");
-                // Roles swap: the survivor is the new master; the old master
-                // is now the node to fence if it returns.
-                std::mem::swap(&mut master, &mut replica);
-                miss = 0;
-                converged_ever = false; // new pair has no replica yet
+                eprintln!("[{id}] PROMOTED {} at (0,{next}): {s}", survivor.addr);
+                converged_ever = false; // new master has no replica yet
+                no_master_streak = 0;
             }
-            other => {
-                eprintln!("promotion of {replica} FAILED: {other:?} — retrying next tick");
+            // -FENCED here means another controller already promoted at this
+            // or a higher epoch: the desired outcome exists, so it's fine.
+            Ok(Value::Error(e)) if e.starts_with("FENCED") => {
+                eprintln!("[{id}] promotion fenced (another controller won): {e}");
+                no_master_streak = 0;
             }
+            other => eprintln!("[{id}] promotion of {} failed: {other:?}", survivor.addr),
         }
     }
 }
 
-/// Fence a node that wrongly believes it is master (returned zombie) with a
-/// strictly higher epoch than the true master's.
-fn fence_zombie(true_master: &str, zombie: &str, zombie_info: &Info) {
-    let true_epoch = flintinfo(true_master)
-        .map(|i| i.role_epoch_counter)
-        .unwrap_or(zombie_info.role_epoch_counter);
-    let next = true_epoch.max(zombie_info.role_epoch_counter) + 1;
-    match call(zombie, &[b"FLINTDEMOTE", b"0", next.to_string().as_bytes()]) {
-        Ok(Value::Simple(s)) => {
-            eprintln!("FENCED zombie {zombie} at (0,{next}): {s}")
+fn fence(id: &str, zombie: &str, epoch: u32) {
+    match call(
+        zombie,
+        &[b"FLINTDEMOTE", b"0", epoch.to_string().as_bytes()],
+    ) {
+        Ok(Value::Simple(s)) => eprintln!("[{id}] FENCED {zombie} at (0,{epoch}): {s}"),
+        Ok(Value::Error(e)) if e.starts_with("FENCED") => {
+            eprintln!("[{id}] fence of {zombie} already done by a peer: {e}")
         }
-        other => eprintln!("fencing {zombie} FAILED: {other:?}"),
+        other => eprintln!("[{id}] fence of {zombie} failed: {other:?}"),
     }
 }
