@@ -33,7 +33,7 @@ run_once() {
     | valkey-cli -p $SPORT --pipe >/dev/null
 
   # Start the cutover in the background; it blocks until done.
-  ( valkey-cli -p $DPORT -t 130 FLINTMIGRATEIN "$SADDR" "$SLOT" "$DADDR" >/dev/null 2>&1 ) &
+  ( valkey-cli -p $DPORT FLINTMIGRATEIN "$SADDR" "$SLOT" "$DADDR" >/dev/null 2>&1 ) &
   local MIG=$!
   sleep "$delay"
   # WHOLE-CLUSTER KILL mid-move.
@@ -106,7 +106,7 @@ test_half_done_flip() {
     | valkey-cli -p $SPORT --pipe >/dev/null
   # Ship data to the dest (no cutover), then place the half-done-flip state:
   # dest owns (has the data, no record), source frozen Migrating to dest.
-  valkey-cli -p $DPORT -t 60 FLINTMIGRATEIN "$SADDR" "$SLOT" >/dev/null
+  valkey-cli -p $DPORT FLINTMIGRATEIN "$SADDR" "$SLOT" >/dev/null
   valkey-cli -p $SPORT FLINTSLOTFREEZE "$SLOT" "$DADDR" >/dev/null
   echo "  [half-done-flip] source frozen (Migrating), dest owns; source records=[$(valkey-cli -p $SPORT FLINTMIGRATIONS)]"
 

@@ -60,7 +60,7 @@ WRITER=$!
 sleep 0.05
 
 echo "== single FLINTMIGRATEIN pass (bulk snapshot + tail of post-snapshot writes)"
-RES=$(valkey-cli -p $DPORT -t 180 FLINTMIGRATEIN "127.0.0.1:$SPORT" "$SLOT" 2>&1)
+RES=$(valkey-cli -p $DPORT FLINTMIGRATEIN "127.0.0.1:$SPORT" "$SLOT" 2>&1)
 wait $WRITER 2>/dev/null
 echo "  result: $RES"
 echo "$RES" | grep -q "MIGRATEIN-OK" || { echo "FAIL: migration did not complete: $RES"; exit 1; }

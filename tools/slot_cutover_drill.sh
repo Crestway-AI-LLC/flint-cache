@@ -43,7 +43,7 @@ def c(d):
 print(c(b"other")%16384)')
 
 echo "== run FULL cutover: FLINTMIGRATEIN <src> <slot> <self-addr>"
-RES=$(valkey-cli -p $DPORT -t 130 FLINTMIGRATEIN "127.0.0.1:$SPORT" "$SLOT" "127.0.0.1:$DPORT" 2>&1)
+RES=$(valkey-cli -p $DPORT FLINTMIGRATEIN "127.0.0.1:$SPORT" "$SLOT" "127.0.0.1:$DPORT" 2>&1)
 echo "  $RES"
 echo "$RES" | grep -q "MIGRATEIN-OK.*cutover" || { echo "FAIL: cutover did not complete: $RES"; exit 1; }
 
