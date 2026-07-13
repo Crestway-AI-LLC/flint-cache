@@ -465,11 +465,11 @@ fn execute(
         if ro {
             return Value::Error("READONLY cannot migrate into a replica".into());
         }
-        return flintmigratein(rocks, args);
+        return flintmigratein(rocks, migration_active, args);
     }
     // FLINTSLOTMOVED <slot> <host:port>: durably mark this slot handed off to
-    // `peer`; subsequent commands for a key in it answer -MOVED. The cutover
-    // step that makes the source disown a moved slot (protocol wiring next).
+    // `peer`; subsequent commands for a key in it answer -MOVED. This is the
+    // terminal cutover step on the source.
     if args
         .first()
         .is_some_and(|n| n.eq_ignore_ascii_case(b"FLINTSLOTMOVED"))
@@ -479,14 +479,26 @@ fn execute(
         }
         return flintslotmoved(rocks, migration_active, args);
     }
-    // Per-slot ownership: after a migration, a command for a key in a slot
-    // this node no longer owns is redirected with -MOVED (Redis Cluster
-    // semantics). Guarded by `migration_active` so ordinary traffic — the
-    // case with no overrides — never pays the extra manifest read.
-    if migration_active.load(Ordering::Relaxed)
-        && let Some(moved) = check_slot_ownership(rocks, args)
+    // FLINTSLOTFREEZE <slot> <dest>: source-side freeze — mark the slot
+    // Migrating so writes to it are shed with -TRYAGAIN (reads still served)
+    // while the destination drains the final tail before the flip.
+    if args
+        .first()
+        .is_some_and(|n| n.eq_ignore_ascii_case(b"FLINTSLOTFREEZE"))
     {
-        return moved;
+        if ro {
+            return Value::Error("READONLY cannot freeze a slot on a replica".into());
+        }
+        return flintslotfreeze(rocks, migration_active, args);
+    }
+    // Per-slot gate: after a migration, a command for a key in a slot this
+    // node no longer owns is redirected with -MOVED; a write to a slot frozen
+    // mid-cutover is shed with -TRYAGAIN. Guarded by `migration_active` so
+    // ordinary traffic (no overrides) never pays the extra manifest read.
+    if migration_active.load(Ordering::Relaxed)
+        && let Some(reply) = check_slot_gate(rocks, args, is_write)
+    {
+        return reply;
     }
     // Lag-cap backpressure: the write path enforces the RPO bound. The
     // min-replicas gate comes first — with no live replica there is no lag
@@ -942,15 +954,51 @@ fn flintmigrateout(
 }
 
 /// Destination side of a slot move (drives FLINTMIGRATEOUT on the source):
-/// apply the bulk snapshot as local writes, then the slot-filtered tail,
-/// until the source reports the slot drained (cursor >= head). Applying via
-/// the normal write path means the imported slot becomes part of THIS node's
-/// replicated data, so its own replicas receive it too.
+/// apply the bulk snapshot then the slot-filtered tail as local writes, so
+/// the imported slot joins THIS node's replicated data.
+///
+/// With `self_addr = Some(me)` it also performs the CUTOVER, in the order
+/// that is safe under interruption (see docs/design.md §2.3, ADR-0004):
+///   1. mark this slot Importing here (we redirect it to the source until we
+///      own it);
+///   2. pull bulk + tail to a first caught-up point;
+///   3. FREEZE the slot on the source (Migrating: writes shed -TRYAGAIN);
+///   4. drain the final tail to a second caught-up point;
+///   5. flip DEST-FIRST: clear our Importing (we now own via the base claim),
+///      then tell the source FLINTSLOTMOVED (it now answers -MOVED to us).
+///
+/// Dest-owns-before-source-disowns avoids a redirect loop, and because writes
+/// are frozen from step 3 the brief dual-read window is over identical data.
+/// Any pre-flip failure rolls back our Importing so we don't strand the slot.
 #[cfg(feature = "rocks")]
-fn migrate_in(kv: &Arc<RocksKv>, src: &str, slot: u16) -> Value {
+fn migrate_in(
+    kv: &Arc<RocksKv>,
+    src: &str,
+    slot: u16,
+    self_addr: Option<&str>,
+    migration_active: &Arc<AtomicBool>,
+) -> Value {
+    use flint_storage::manifest::{self, MigrationPhase};
+
+    // Step 1 (cutover): mark Importing before pulling.
+    if let Some(_me) = self_addr {
+        if let Err(e) = set_slot_phase(kv.as_ref(), slot, MigrationPhase::Importing, src) {
+            return Value::Error(format!("ERR set importing fenced: {e:?}"));
+        }
+        migration_active.store(true, Ordering::Relaxed);
+    }
+    let rollback = || {
+        if self_addr.is_some() {
+            manifest::clear_migration(kv.as_ref(), b"0", slot);
+        }
+    };
+
     let mut stream = match TcpStream::connect(src) {
         Ok(s) => s,
-        Err(e) => return Value::Error(format!("ERR migrate connect {src}: {e}")),
+        Err(e) => {
+            rollback();
+            return Value::Error(format!("ERR migrate connect {src}: {e}"));
+        }
     };
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
     let mut out = Vec::new();
@@ -962,6 +1010,7 @@ fn migrate_in(kv: &Arc<RocksKv>, src: &str, slot: u16) -> Value {
         &mut out,
     );
     if stream.write_all(&out).is_err() {
+        rollback();
         return Value::Error("ERR migrate send failed".into());
     }
 
@@ -969,6 +1018,7 @@ fn migrate_in(kv: &Arc<RocksKv>, src: &str, slot: u16) -> Value {
     let mut chunk = [0u8; 64 * 1024];
     let mut applied: u64 = 0;
     let mut past_bulk = false;
+    let mut frozen = false; // cutover: has the source been frozen yet?
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
     loop {
         match decode(&buf) {
@@ -976,7 +1026,10 @@ fn migrate_in(kv: &Arc<RocksKv>, src: &str, slot: u16) -> Value {
                 buf.drain(..used);
                 match frame {
                     Value::Simple(s) if s == "MIGRATEOUT-OK" => {}
-                    Value::Error(e) => return Value::Error(format!("ERR migrate source: {e}")),
+                    Value::Error(e) => {
+                        rollback();
+                        return Value::Error(format!("ERR migrate source: {e}"));
+                    }
                     Value::Array(Some(items)) => match items.as_slice() {
                         [
                             Value::Bulk(Some(t)),
@@ -996,16 +1049,63 @@ fn migrate_in(kv: &Arc<RocksKv>, src: &str, slot: u16) -> Value {
                         ] if t == b"BULK-END" => {
                             past_bulk = true;
                         }
-                        // Drained: bulk done and the tail reached the source
-                        // head. (A clean cutover would freeze the slot on the
-                        // source first; here writes are expected to have
-                        // quiesced.)
                         [
                             Value::Bulk(Some(t)),
                             Value::Integer(cursor),
                             Value::Integer(head),
                         ] if t == b"CAUGHTUP" && past_bulk && cursor >= head => {
-                            return Value::Simple(format!("MIGRATEIN-OK {applied}"));
+                            match self_addr {
+                                // Data-ship only: caught up, done.
+                                None => return Value::Simple(format!("MIGRATEIN-OK {applied}")),
+                                Some(me) => {
+                                    if !frozen {
+                                        // Step 3: freeze the slot on the source.
+                                        match call_once(
+                                            src,
+                                            &[
+                                                b"FLINTSLOTFREEZE",
+                                                slot.to_string().as_bytes(),
+                                                me.as_bytes(),
+                                            ],
+                                        ) {
+                                            Ok(Value::Simple(_)) => frozen = true,
+                                            other => {
+                                                rollback();
+                                                return Value::Error(format!(
+                                                    "ERR freeze failed: {other:?}"
+                                                ));
+                                            }
+                                        }
+                                        // Loop again to drain the frozen tail.
+                                    } else {
+                                        // Step 5: flip dest-first, then source.
+                                        manifest::clear_migration(kv.as_ref(), b"0", slot);
+                                        match call_once(
+                                            src,
+                                            &[
+                                                b"FLINTSLOTMOVED",
+                                                slot.to_string().as_bytes(),
+                                                me.as_bytes(),
+                                            ],
+                                        ) {
+                                            Ok(Value::Simple(_)) => {
+                                                return Value::Simple(format!(
+                                                    "MIGRATEIN-OK {applied} cutover"
+                                                ));
+                                            }
+                                            other => {
+                                                // We already own (Importing
+                                                // cleared); the source failing
+                                                // to disown is a controller
+                                                // reconcile, not data loss.
+                                                return Value::Error(format!(
+                                                    "ERR cutover handoff incomplete (we own; source not disowned): {other:?}"
+                                                ));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
                         _ => {}
                     },
@@ -1014,24 +1114,41 @@ fn migrate_in(kv: &Arc<RocksKv>, src: &str, slot: u16) -> Value {
             }
             Ok(Decoded::NeedMore) => {
                 if std::time::Instant::now() > deadline {
+                    rollback();
                     return Value::Error("ERR migrate timed out before drain".into());
                 }
                 match stream.read(&mut chunk) {
-                    Ok(0) => return Value::Error("ERR migrate source closed".into()),
+                    Ok(0) => {
+                        rollback();
+                        return Value::Error("ERR migrate source closed".into());
+                    }
                     Ok(n) => buf.extend_from_slice(&chunk[..n]),
                     Err(ref e)
                         if e.kind() == std::io::ErrorKind::WouldBlock
                             || e.kind() == std::io::ErrorKind::TimedOut => {}
-                    Err(e) => return Value::Error(format!("ERR migrate read: {e}")),
+                    Err(e) => {
+                        rollback();
+                        return Value::Error(format!("ERR migrate read: {e}"));
+                    }
                 }
             }
-            Err(_) => return Value::Error("ERR migrate decode".into()),
+            Err(_) => {
+                rollback();
+                return Value::Error("ERR migrate decode".into());
+            }
         }
     }
 }
 
+/// FLINTMIGRATEIN <src host:port> <slot> [<self advertise addr>]. With the
+/// self address it performs the full cutover (freeze/drain/flip); without it,
+/// only ships the data (no ownership change).
 #[cfg(feature = "rocks")]
-fn flintmigratein(rocks: &Option<RocksHandle>, args: &[Vec<u8>]) -> Value {
+fn flintmigratein(
+    rocks: &Option<RocksHandle>,
+    migration_active: &Arc<AtomicBool>,
+    args: &[Vec<u8>],
+) -> Value {
     let Some(kv) = rocks else {
         return Value::Error("ERR FLINTMIGRATEIN requires the rocks engine".into());
     };
@@ -1041,26 +1158,69 @@ fn flintmigratein(rocks: &Option<RocksHandle>, args: &[Vec<u8>]) -> Value {
             .and_then(|r| std::str::from_utf8(r).ok())
             .and_then(|s| s.parse::<u16>().ok()),
     ) else {
-        return Value::Error("ERR FLINTMIGRATEIN <host:port> <slot>".into());
+        return Value::Error("ERR FLINTMIGRATEIN <host:port> <slot> [self-addr]".into());
     };
-    migrate_in(kv, src, slot)
+    let self_addr = args.get(3).and_then(|r| std::str::from_utf8(r).ok());
+    migrate_in(kv, src, slot, self_addr, migration_active)
 }
 
 #[cfg(not(feature = "rocks"))]
-fn flintmigratein(_rocks: &Option<RocksHandle>, _args: &[Vec<u8>]) -> Value {
+fn flintmigratein(
+    _rocks: &Option<RocksHandle>,
+    _migration_active: &Arc<AtomicBool>,
+    _args: &[Vec<u8>],
+) -> Value {
     Value::Error("ERR FLINTMIGRATEIN requires a build with --features rocks".into())
 }
 
-/// FLINTSLOTMOVED <slot> <host:port>: write a durable Moved override so this
-/// node redirects the slot with -MOVED. Epoch is bumped past any existing
-/// record/claim so the write is monotonic and fence-safe.
+/// The next monotonic, fence-safe epoch for a slot's migration record: above
+/// both any existing record and the base claim.
+#[cfg(feature = "rocks")]
+fn next_migration_epoch(kv: &RocksKv, slot: u16) -> flint_storage::manifest::Epoch {
+    use flint_storage::manifest::{self, Epoch};
+    let base = manifest::read_claim(kv, b"0")
+        .map(|c| c.epoch)
+        .unwrap_or(Epoch::ZERO);
+    let cur = manifest::read_migration(kv, b"0", slot)
+        .map(|r| r.epoch)
+        .unwrap_or(Epoch::ZERO);
+    let hi = base.max(cur);
+    Epoch {
+        generation: hi.generation,
+        counter: hi.counter + 1,
+    }
+}
+
+/// Write a phase override for one slot at a fenced next epoch.
+#[cfg(feature = "rocks")]
+fn set_slot_phase(
+    kv: &RocksKv,
+    slot: u16,
+    phase: flint_storage::manifest::MigrationPhase,
+    peer: &str,
+) -> Result<(), flint_storage::manifest::ManifestError> {
+    use flint_storage::manifest::{self, MigrationRecord};
+    manifest::set_migration(
+        kv,
+        &MigrationRecord {
+            ns: b"0".to_vec(),
+            slot,
+            phase,
+            peer: peer.to_string(),
+            epoch: next_migration_epoch(kv, slot),
+        },
+    )
+}
+
+/// FLINTSLOTMOVED <slot> <host:port>: terminal cutover on the source — durable
+/// Moved override so this node answers -MOVED for the slot.
 #[cfg(feature = "rocks")]
 fn flintslotmoved(
     rocks: &Option<RocksHandle>,
     migration_active: &Arc<AtomicBool>,
     args: &[Vec<u8>],
 ) -> Value {
-    use flint_storage::manifest::{self, Epoch, MigrationPhase, MigrationRecord};
+    use flint_storage::manifest::MigrationPhase;
     let Some(kv) = rocks else {
         return Value::Error("ERR FLINTSLOTMOVED requires the rocks engine".into());
     };
@@ -1072,28 +1232,7 @@ fn flintslotmoved(
     ) else {
         return Value::Error("ERR FLINTSLOTMOVED <slot> <host:port>".into());
     };
-    // Next epoch: strictly above the current override and the base claim.
-    let base = manifest::read_claim(kv.as_ref(), b"0")
-        .map(|c| c.epoch)
-        .unwrap_or(Epoch::ZERO);
-    let cur = manifest::read_migration(kv.as_ref(), b"0", slot)
-        .map(|r| r.epoch)
-        .unwrap_or(Epoch::ZERO);
-    let hi = base.max(cur);
-    let next = Epoch {
-        generation: hi.generation,
-        counter: hi.counter + 1,
-    };
-    match manifest::set_migration(
-        kv.as_ref(),
-        &MigrationRecord {
-            ns: b"0".to_vec(),
-            slot,
-            phase: MigrationPhase::Moved,
-            peer: peer.to_string(),
-            epoch: next,
-        },
-    ) {
+    match set_slot_phase(kv.as_ref(), slot, MigrationPhase::Moved, peer) {
         Ok(()) => {
             migration_active.store(true, Ordering::Relaxed);
             Value::Simple(format!("OK slot {slot} moved to {peer}"))
@@ -1111,24 +1250,111 @@ fn flintslotmoved(
     Value::Error("ERR FLINTSLOTMOVED requires a build with --features rocks".into())
 }
 
-/// If the command targets a key in a slot this node has handed off (or is
-/// importing), return the -MOVED redirect; otherwise None (serve normally).
+/// FLINTSLOTFREEZE <slot> <dest>: mark the slot Migrating so the source sheds
+/// writes to it (-TRYAGAIN) while the destination drains the final tail.
 #[cfg(feature = "rocks")]
-fn check_slot_ownership(rocks: &Option<RocksHandle>, args: &[Vec<u8>]) -> Option<Value> {
-    use flint_storage::manifest::{self, SlotOwnership};
-    let kv = rocks.as_ref()?;
-    let key = commands::command_key(args)?;
-    let slot = flint_slot::slot_for_key(key);
-    let base = manifest::read_claim(kv.as_ref(), b"0")?;
-    match manifest::slot_ownership(kv.as_ref(), b"0", slot, &base) {
-        SlotOwnership::MovedTo(addr) => Some(Value::Error(format!("MOVED {slot} {addr}"))),
-        SlotOwnership::Owned | SlotOwnership::NotInRange => None,
+fn flintslotfreeze(
+    rocks: &Option<RocksHandle>,
+    migration_active: &Arc<AtomicBool>,
+    args: &[Vec<u8>],
+) -> Value {
+    use flint_storage::manifest::MigrationPhase;
+    let Some(kv) = rocks else {
+        return Value::Error("ERR FLINTSLOTFREEZE requires the rocks engine".into());
+    };
+    let (Some(slot), Some(peer)) = (
+        args.get(1)
+            .and_then(|r| std::str::from_utf8(r).ok())
+            .and_then(|s| s.parse::<u16>().ok()),
+        args.get(2).and_then(|r| std::str::from_utf8(r).ok()),
+    ) else {
+        return Value::Error("ERR FLINTSLOTFREEZE <slot> <dest>".into());
+    };
+    match set_slot_phase(kv.as_ref(), slot, MigrationPhase::Migrating, peer) {
+        Ok(()) => {
+            migration_active.store(true, Ordering::Relaxed);
+            Value::Simple(format!("OK slot {slot} frozen"))
+        }
+        Err(e) => Value::Error(format!("ERR slot freeze fenced: {e:?}")),
     }
 }
 
 #[cfg(not(feature = "rocks"))]
-fn check_slot_ownership(_rocks: &Option<RocksHandle>, _args: &[Vec<u8>]) -> Option<Value> {
+fn flintslotfreeze(
+    _rocks: &Option<RocksHandle>,
+    _migration_active: &Arc<AtomicBool>,
+    _args: &[Vec<u8>],
+) -> Value {
+    Value::Error("ERR FLINTSLOTFREEZE requires a build with --features rocks".into())
+}
+
+/// Per-slot gate for a command's key: -MOVED if the slot was handed off
+/// (Moved) or is being imported here (Importing); -TRYAGAIN if a WRITE hits a
+/// slot frozen mid-cutover (Migrating). None means serve normally.
+#[cfg(feature = "rocks")]
+fn check_slot_gate(rocks: &Option<RocksHandle>, args: &[Vec<u8>], is_write: bool) -> Option<Value> {
+    use flint_storage::manifest::{self, MigrationPhase};
+    let kv = rocks.as_ref()?;
+    let key = commands::command_key(args)?;
+    let slot = flint_slot::slot_for_key(key);
+    match manifest::read_migration(kv.as_ref(), b"0", slot)?.phase {
+        MigrationPhase::Moved | MigrationPhase::Importing => {
+            let peer = manifest::read_migration(kv.as_ref(), b"0", slot)?.peer;
+            Some(Value::Error(format!("MOVED {slot} {peer}")))
+        }
+        MigrationPhase::Migrating if is_write => {
+            Some(Value::Error("TRYAGAIN slot migrating, retry".into()))
+        }
+        MigrationPhase::Migrating => None, // reads still served by the source
+    }
+}
+
+#[cfg(not(feature = "rocks"))]
+fn check_slot_gate(
+    _rocks: &Option<RocksHandle>,
+    _args: &[Vec<u8>],
+    _is_write: bool,
+) -> Option<Value> {
     None
+}
+
+/// Send one command to `addr` and read one reply (used by the cutover
+/// orchestration to freeze and hand off the slot on the source).
+#[cfg(feature = "rocks")]
+fn call_once(addr: &str, args: &[&[u8]]) -> std::io::Result<Value> {
+    let mut s = TcpStream::connect(addr)?;
+    s.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+    let mut out = Vec::new();
+    encode(
+        &Value::Array(Some(
+            args.iter().map(|a| Value::Bulk(Some(a.to_vec()))).collect(),
+        )),
+        &mut out,
+    );
+    s.write_all(&out)?;
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        match decode(&buf) {
+            Ok(Decoded::Complete(v, _)) => return Ok(v),
+            Ok(Decoded::NeedMore) => {
+                let n = s.read(&mut chunk)?;
+                if n == 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "closed",
+                    ));
+                }
+                buf.extend_from_slice(&chunk[..n]);
+            }
+            Err(e) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("{e:?}"),
+                ));
+            }
+        }
+    }
 }
 
 #[cfg(feature = "rocks")]
