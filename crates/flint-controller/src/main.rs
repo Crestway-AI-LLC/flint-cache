@@ -212,6 +212,10 @@ struct Config {
     /// Positive enables the rebalance planner (dry-run: logs the plan). The
     /// value is the deadband fraction — imbalance below it is left alone.
     rebalance_deadband: f64,
+    /// Nodes to run MIGRATION RECOVERY over (separate from failover, since
+    /// these are independent masters, not a pair). On restart the controller
+    /// observes their in-flight migration records and resumes or rolls back.
+    recover_nodes: Vec<String>,
     bin: String,
     id: String,
 }
@@ -529,31 +533,42 @@ fn main() {
         rebalance_deadband: arg("--rebalance-deadband")
             .and_then(|v| v.parse().ok())
             .unwrap_or(0.0),
+        recover_nodes: arg("--recover-nodes")
+            .map(|s| s.split(',').map(String::from).collect())
+            .unwrap_or_default(),
         bin: server_bin(),
         id: arg("--id").unwrap_or_else(|| "ctl".into()),
     };
 
     let mut pairs = build_pairs();
     assert!(
-        !pairs.is_empty(),
-        "need --nodes/--pairs (decision-only) or --manage-slots/--manage-pairs (managed)"
+        !pairs.is_empty() || !cfg.recover_nodes.is_empty(),
+        "need --nodes/--pairs, --manage-slots/--manage-pairs, or --recover-nodes"
     );
 
     eprintln!(
-        "[{}] flint-controller: {} pair(s) managed={} poll={:?} confirm={} max-stale={:?}",
+        "[{}] flint-controller: {} pair(s) recover-nodes={} poll={:?} confirm={}",
         cfg.id,
         pairs.len(),
-        pairs[0].managed,
+        cfg.recover_nodes.len(),
         cfg.poll,
         cfg.confirm,
-        cfg.max_stale
     );
 
     let mut last_rebalance = Instant::now();
+    let mut last_recover = Instant::now();
     loop {
         std::thread::sleep(cfg.poll);
         for pair in pairs.iter_mut() {
             pair.tick(&cfg);
+        }
+
+        // Migration recovery: reconcile in-flight moves left by an
+        // interruption (a restart mid-cutover). Cheap when nothing is in
+        // flight (one FLINTMIGRATIONS per node returning empty).
+        if !cfg.recover_nodes.is_empty() && last_recover.elapsed() > Duration::from_secs(2) {
+            last_recover = Instant::now();
+            recover_migrations(&cfg);
         }
 
         // Rebalance planning (dry-run): every 5s, observe each pair's fill
@@ -581,6 +596,157 @@ fn main() {
                     }
                 }
             }
+        }
+    }
+}
+
+fn reachable(addr: &str) -> bool {
+    matches!(call(addr, &[b"PING"]), Ok(Value::Simple(s)) if s == "PONG")
+}
+
+/// Like `call` but with a long read timeout, for driving a blocking
+/// FLINTMIGRATEIN (which streams a whole slot) during recovery.
+fn call_slow(addr: &str, args: &[&[u8]], timeout: Duration) -> std::io::Result<Value> {
+    let mut stream = TcpStream::connect(addr)?;
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(Duration::from_millis(800)))?;
+    let frame = Value::Array(Some(
+        args.iter().map(|a| Value::Bulk(Some(a.to_vec()))).collect(),
+    ));
+    let mut out = Vec::new();
+    encode(&frame, &mut out);
+    stream.write_all(&out)?;
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        match decode(&buf) {
+            Ok(Decoded::Complete(v, _)) => return Ok(v),
+            Ok(Decoded::NeedMore) => {
+                let n = stream.read(&mut chunk)?;
+                if n == 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "closed",
+                    ));
+                }
+                buf.extend_from_slice(&chunk[..n]);
+            }
+            Err(e) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("{e:?}"),
+                ));
+            }
+        }
+    }
+}
+
+/// One in-flight migration record observed on a node.
+struct InFlight {
+    node: String,
+    slot: u16,
+    peer: String,
+}
+
+/// Reconcile migrations interrupted by a restart. Observing the two
+/// participants' durable records is enough to decide (ADR-0004: every
+/// structural state is observable from manifests):
+///   - a destination still Importing S from source O  -> RESUME (re-drive the
+///     move; if O is gone, roll back so the dest stops redirecting to it);
+///   - a source Migrating S to dest D whose Importing is already gone (D owns
+///     it — the flip half-completed) -> COMPLETE (tell O to answer -MOVED);
+///     if D is gone entirely, unfreeze O so it serves the slot again.
+fn recover_migrations(cfg: &Config) {
+    let mut importing: Vec<InFlight> = Vec::new();
+    let mut migrating: Vec<InFlight> = Vec::new();
+    for node in &cfg.recover_nodes {
+        let Ok(Value::Array(Some(rows))) = call(node, &[b"FLINTMIGRATIONS"]) else {
+            continue;
+        };
+        for row in rows {
+            let Value::Bulk(Some(b)) = row else { continue };
+            let line = String::from_utf8_lossy(&b);
+            let parts: Vec<&str> = line.split(' ').collect();
+            let [slot, phase, peer] = parts.as_slice() else {
+                continue;
+            };
+            let Ok(slot) = slot.parse::<u16>() else {
+                continue;
+            };
+            let rec = InFlight {
+                node: node.clone(),
+                slot,
+                peer: peer.to_string(),
+            };
+            match *phase {
+                "importing" => importing.push(rec),
+                "migrating" => migrating.push(rec),
+                _ => {}
+            }
+        }
+    }
+    if importing.is_empty() && migrating.is_empty() {
+        return;
+    }
+
+    for rec in &importing {
+        let (dest, src) = (&rec.node, &rec.peer);
+        if reachable(src) {
+            eprintln!(
+                "[{}] recovery: resuming import of slot {} into {dest} from {src}",
+                cfg.id, rec.slot
+            );
+            let r = call_slow(
+                dest,
+                &[
+                    b"FLINTMIGRATEIN",
+                    src.as_bytes(),
+                    rec.slot.to_string().as_bytes(),
+                    dest.as_bytes(),
+                ],
+                Duration::from_secs(120),
+            );
+            eprintln!(
+                "[{}] recovery: resume of slot {} -> {r:?}",
+                cfg.id, rec.slot
+            );
+        } else {
+            eprintln!(
+                "[{}] recovery: source {src} unreachable — aborting import of slot {} at {dest}",
+                cfg.id, rec.slot
+            );
+            let _ = call(dest, &[b"FLINTSLOTABORT", rec.slot.to_string().as_bytes()]);
+        }
+    }
+
+    for rec in &migrating {
+        let (src, dest) = (&rec.node, &rec.peer);
+        // If the dest is still importing this slot, the resume loop owns it.
+        if importing
+            .iter()
+            .any(|i| &i.node == dest && i.slot == rec.slot)
+        {
+            continue;
+        }
+        if reachable(dest) {
+            eprintln!(
+                "[{}] recovery: completing flip of slot {} — {src} -> Moved to {dest}",
+                cfg.id, rec.slot
+            );
+            let _ = call(
+                src,
+                &[
+                    b"FLINTSLOTMOVED",
+                    rec.slot.to_string().as_bytes(),
+                    dest.as_bytes(),
+                ],
+            );
+        } else {
+            eprintln!(
+                "[{}] recovery: dest {dest} gone — unfreezing slot {} on {src}",
+                cfg.id, rec.slot
+            );
+            let _ = call(src, &[b"FLINTSLOTABORT", rec.slot.to_string().as_bytes()]);
         }
     }
 }

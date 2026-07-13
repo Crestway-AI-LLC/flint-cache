@@ -491,6 +491,28 @@ fn execute(
         }
         return flintslotfreeze(rocks, migration_active, args);
     }
+    // FLINTMIGRATIONS: list this node's IN-FLIGHT migration records (one
+    // "slot phase peer" bulk per line), so a recovering controller can
+    // observe and reconcile moves interrupted by a restart. Terminal Moved
+    // overrides are ownership state, not in-flight, and are excluded.
+    if args
+        .first()
+        .is_some_and(|n| n.eq_ignore_ascii_case(b"FLINTMIGRATIONS"))
+    {
+        return flintmigrations(rocks);
+    }
+    // FLINTSLOTABORT <slot>: clear an IN-FLIGHT record (rollback an Importing
+    // or unfreeze a Migrating). Refuses to touch a terminal Moved override —
+    // that is settled ownership, undone only by moving the slot back.
+    if args
+        .first()
+        .is_some_and(|n| n.eq_ignore_ascii_case(b"FLINTSLOTABORT"))
+    {
+        if ro {
+            return Value::Error("READONLY cannot abort a migration on a replica".into());
+        }
+        return flintslotabort(rocks, args);
+    }
     // Per-slot gate: after a migration, a command for a key in a slot this
     // node no longer owns is redirected with -MOVED; a write to a slot frozen
     // mid-cutover is shed with -TRYAGAIN. Guarded by `migration_active` so
@@ -1286,6 +1308,66 @@ fn flintslotfreeze(
     _args: &[Vec<u8>],
 ) -> Value {
     Value::Error("ERR FLINTSLOTFREEZE requires a build with --features rocks".into())
+}
+
+/// FLINTMIGRATIONS: the in-flight (Importing/Migrating) records on this node,
+/// one "slot phase peer" bulk each — the recovery input for the controller.
+#[cfg(feature = "rocks")]
+fn flintmigrations(rocks: &Option<RocksHandle>) -> Value {
+    use flint_storage::manifest::{self, MigrationPhase};
+    let Some(kv) = rocks else {
+        return Value::Error("ERR FLINTMIGRATIONS requires the rocks engine".into());
+    };
+    let rows: Vec<Value> = manifest::scan_migrations(kv.as_ref(), b"0")
+        .into_iter()
+        .filter(|r| r.phase.is_inflight())
+        .map(|r| {
+            let phase = match r.phase {
+                MigrationPhase::Importing => "importing",
+                MigrationPhase::Migrating => "migrating",
+                MigrationPhase::Moved => "moved",
+            };
+            Value::Bulk(Some(format!("{} {phase} {}", r.slot, r.peer).into_bytes()))
+        })
+        .collect();
+    Value::Array(Some(rows))
+}
+
+#[cfg(not(feature = "rocks"))]
+fn flintmigrations(_rocks: &Option<RocksHandle>) -> Value {
+    Value::Error("ERR FLINTMIGRATIONS requires a build with --features rocks".into())
+}
+
+/// FLINTSLOTABORT <slot>: clear an in-flight record (rollback/unfreeze).
+/// Refuses a terminal Moved override — settled ownership is not aborted.
+#[cfg(feature = "rocks")]
+fn flintslotabort(rocks: &Option<RocksHandle>, args: &[Vec<u8>]) -> Value {
+    use flint_storage::manifest::{self, MigrationPhase};
+    let Some(kv) = rocks else {
+        return Value::Error("ERR FLINTSLOTABORT requires the rocks engine".into());
+    };
+    let Some(slot) = args
+        .get(1)
+        .and_then(|r| std::str::from_utf8(r).ok())
+        .and_then(|s| s.parse::<u16>().ok())
+    else {
+        return Value::Error("ERR FLINTSLOTABORT <slot>".into());
+    };
+    match manifest::read_migration(kv.as_ref(), b"0", slot) {
+        Some(r) if r.phase == MigrationPhase::Moved => {
+            Value::Error("ERR slot is Moved (settled ownership), not in-flight".into())
+        }
+        Some(_) => {
+            manifest::clear_migration(kv.as_ref(), b"0", slot);
+            Value::Simple(format!("OK slot {slot} migration aborted"))
+        }
+        None => Value::Simple(format!("OK slot {slot} had no in-flight migration")),
+    }
+}
+
+#[cfg(not(feature = "rocks"))]
+fn flintslotabort(_rocks: &Option<RocksHandle>, _args: &[Vec<u8>]) -> Value {
+    Value::Error("ERR FLINTSLOTABORT requires a build with --features rocks".into())
 }
 
 /// Per-slot gate for a command's key: -MOVED if the slot was handed off
