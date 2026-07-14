@@ -18,13 +18,24 @@
 //! moved-slot cache overrides per slot. A proxy restart loses only cache:
 //! the first request routes to the default owner and relearns from -MOVED.
 //!
-//! v0 scope, deliberately deferred: TLS, tenant auth/namespaces, metering,
-//! cross-slot scatter-gather (multi-key commands route by FIRST key),
-//! hot-key absorption, RESP3, inline commands. FLINT* admin commands are
-//! REJECTED at the proxy: the data-plane admin surface is internal, and the
-//! proxy is the tenant boundary.
+//! Tenancy: --tenants "token=ns,..." enables token auth. Clients AUTH
+//! <token> (or AUTH <user> <token>); the proxy maps the token to the
+//! tenant's namespace and pins every backend connection to it with a
+//! FLINTNS handshake, so all data commands, DBSIZE, and FLUSHALL are
+//! tenant-scoped on the nodes. Pre-auth commands get -NOAUTH; bad tokens
+//! get -WRONGPASS. Without --tenants the proxy runs open on the default
+//! namespace ("0") — the pre-tenancy behavior, unchanged. The moved-slot
+//! cache is keyed (ns, slot): migrations are per-namespace, so tenant A's
+//! -MOVED must never reroute tenant B, whose rows did not move.
+//!
+//! v0 scope, deliberately deferred: TLS, metering, cross-slot
+//! scatter-gather (multi-key commands route by FIRST key), hot-key
+//! absorption, RESP3, inline commands. FLINT* admin commands are REJECTED
+//! at the proxy: the data-plane admin surface is internal, and the proxy is
+//! the tenant boundary.
 //!
 //! Usage: flint-proxy --port 7379 --pairs "m0,r0;m1,r1;..."
+//!                    [--tenants "tokenA=nsA,tokenB=nsB"]
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -54,10 +65,13 @@ struct Topology {
     pairs: Vec<Vec<String>>,
     /// Current master address per pair (None until discovered).
     masters: RwLock<Vec<Option<String>>>,
-    /// Slot -> owner address, learned from -MOVED redirects. Overrides the
-    /// range default; entries are re-learned if they go stale (another
-    /// -MOVED) or lost on restart (relearned from the default owner).
-    moved: RwLock<HashMap<u16, String>>,
+    /// (namespace, slot) -> owner address, learned from -MOVED redirects.
+    /// Keyed per namespace because migrations move one tenant's slot rows:
+    /// tenant A's redirect must not reroute tenant B. Overrides the range
+    /// default; lost entries are relearned from the default owner.
+    moved: RwLock<HashMap<(Vec<u8>, u16), String>>,
+    /// token -> namespace. Empty = open mode (no auth, default namespace).
+    tenants: HashMap<String, Vec<u8>>,
 }
 
 impl Topology {
@@ -66,10 +80,10 @@ impl Topology {
         (slot as usize * self.pairs.len()) / 16384
     }
 
-    /// The address a command for `slot` should go to right now.
-    fn route(&self, slot: u16) -> Option<String> {
+    /// The address a command for `slot` in `ns` should go to right now.
+    fn route(&self, ns: &[u8], slot: u16) -> Option<String> {
         if let Ok(moved) = self.moved.read()
-            && let Some(addr) = moved.get(&slot)
+            && let Some(addr) = moved.get(&(ns.to_vec(), slot))
         {
             return Some(addr.clone());
         }
@@ -77,9 +91,9 @@ impl Topology {
         self.masters.read().ok()?.get(pair)?.clone()
     }
 
-    fn learn_moved(&self, slot: u16, addr: &str) {
+    fn learn_moved(&self, ns: &[u8], slot: u16, addr: &str) {
         if let Ok(mut moved) = self.moved.write() {
-            moved.insert(slot, addr.to_string());
+            moved.insert((ns.to_vec(), slot), addr.to_string());
         }
     }
 
@@ -179,20 +193,44 @@ fn discover_master(nodes: &[String]) -> Option<String> {
 /// Per-client-thread cache of backend connections.
 struct Backends {
     conns: HashMap<String, (TcpStream, Vec<u8>)>,
+    /// Tenant namespace every connection here is pinned to (FLINTNS
+    /// handshake at open). One client = one tenant, so raw frames forward
+    /// without per-command rewriting.
+    ns: Vec<u8>,
 }
 
 impl Backends {
-    fn new() -> Self {
+    fn new(ns: Vec<u8>) -> Self {
         Self {
             conns: HashMap::new(),
+            ns,
         }
     }
 
     fn call(&mut self, addr: &str, frame: &[u8]) -> std::io::Result<Value> {
         if !self.conns.contains_key(addr) {
-            let stream = TcpStream::connect(addr)?;
+            let mut stream = TcpStream::connect(addr)?;
             stream.set_read_timeout(Some(BACKEND_TIMEOUT))?;
             stream.set_write_timeout(Some(BACKEND_TIMEOUT))?;
+            // Pin the connection to the tenant namespace before any data
+            // command can travel on it.
+            let mut hs = Vec::new();
+            encode(
+                &Value::Array(Some(vec![
+                    Value::Bulk(Some(b"FLINTNS".to_vec())),
+                    Value::Bulk(Some(self.ns.clone())),
+                ])),
+                &mut hs,
+            );
+            let mut hs_buf = Vec::new();
+            match call_raw(&mut stream, &mut hs_buf, &hs)? {
+                Value::Simple(_) => {}
+                other => {
+                    return Err(std::io::Error::other(format!(
+                        "namespace handshake rejected: {other:?}"
+                    )));
+                }
+            }
             self.conns.insert(addr.to_string(), (stream, Vec::new()));
         }
         let Some((stream, buf)) = self.conns.get_mut(addr) else {
@@ -234,14 +272,20 @@ fn route_key(args: &[Vec<u8>]) -> Option<&[u8]> {
 
 /// Forward one client command, absorbing -MOVED / -TRYAGAIN / backend death
 /// within the retry budget. Returns the reply the CLIENT should see.
-fn forward(topo: &Topology, backends: &mut Backends, args: &[Vec<u8>], frame: &[u8]) -> Value {
+fn forward(
+    topo: &Topology,
+    backends: &mut Backends,
+    ns: &[u8],
+    args: &[Vec<u8>],
+    frame: &[u8],
+) -> Value {
     let slot = route_key(args).map(slot_for_key);
     let deadline = Instant::now() + RETRY_BUDGET;
     loop {
         // Resolve the target: keyed commands by slot; no-key commands go to
         // pair 0's master (v0: DBSIZE/FLUSHALL fan out below, before here).
         let target = match slot {
-            Some(s) => topo.route(s),
+            Some(s) => topo.route(ns, s),
             None => topo
                 .masters
                 .read()
@@ -279,7 +323,7 @@ fn forward(topo: &Topology, backends: &mut Backends, args: &[Vec<u8>], frame: &[
                 if let (Some(s), Some(new_addr)) = (s, new_addr)
                     && let Ok(s) = s.parse::<u16>()
                 {
-                    topo.learn_moved(s, new_addr);
+                    topo.learn_moved(ns, s, new_addr);
                 }
                 if Instant::now() > deadline {
                     return Value::Error("ERR routing did not settle (moved chase)".into());
@@ -335,8 +379,77 @@ fn fan_out(
     combine(replies)
 }
 
+/// Outcome of the per-command auth check.
+enum AuthStep {
+    /// Answer the client directly (AUTH result, NOAUTH, WRONGPASS).
+    Reply(Value),
+    /// Authorized: proceed in this namespace.
+    Proceed(Vec<u8>),
+}
+
+/// Redis-shaped auth gate. AUTH <token> or AUTH <user> <token> (the user is
+/// ignored; the token alone identifies the tenant). Before auth, everything
+/// except AUTH/QUIT gets -NOAUTH. A successful AUTH fixes the connection's
+/// namespace; re-AUTH to a different tenant is rejected (reconnect instead)
+/// so the backend-connection namespace pinning can never go stale.
+fn auth_step(topo: &Topology, authed_ns: &mut Option<Vec<u8>>, args: &[Vec<u8>]) -> AuthStep {
+    let name = args.first().map(|n| n.to_ascii_uppercase());
+    if name.as_deref() == Some(b"AUTH") {
+        let token = match args.len() {
+            2 => &args[1],
+            3 => &args[2],
+            _ => {
+                return AuthStep::Reply(Value::Error(
+                    "ERR wrong number of arguments for 'auth' command".into(),
+                ));
+            }
+        };
+        if topo.tenants.is_empty() {
+            return AuthStep::Reply(Value::Error(
+                "ERR Client sent AUTH, but no tenants are configured".into(),
+            ));
+        }
+        let Some(ns) = topo
+            .tenants
+            .get(&String::from_utf8_lossy(token).into_owned())
+        else {
+            return AuthStep::Reply(Value::Error("WRONGPASS invalid token".into()));
+        };
+        match authed_ns {
+            Some(cur) if cur != ns => {
+                return AuthStep::Reply(Value::Error(
+                    "ERR already authenticated as another tenant; reconnect to switch".into(),
+                ));
+            }
+            _ => {}
+        }
+        *authed_ns = Some(ns.clone());
+        return AuthStep::Reply(Value::Simple("OK".into()));
+    }
+    match authed_ns {
+        Some(ns) => {
+            // QUIT stays answerable regardless.
+            AuthStep::Proceed(ns.clone())
+        }
+        None => {
+            if name.as_deref() == Some(b"QUIT") {
+                AuthStep::Reply(Value::Simple("OK".into()))
+            } else {
+                AuthStep::Reply(Value::Error("NOAUTH Authentication required.".into()))
+            }
+        }
+    }
+}
+
 fn serve_client(mut stream: TcpStream, topo: Arc<Topology>) -> std::io::Result<()> {
-    let mut backends = Backends::new();
+    // Open mode (no tenants configured): the connection starts authorized
+    // on the default namespace — the pre-tenancy behavior, unchanged.
+    let mut authed_ns: Option<Vec<u8>> = if topo.tenants.is_empty() {
+        Some(b"0".to_vec())
+    } else {
+        None
+    };
+    let mut backends: Option<Backends> = None;
     let mut buf: Vec<u8> = Vec::with_capacity(16 * 1024);
     let mut chunk = [0u8; 16 * 1024];
     let mut out: Vec<u8> = Vec::with_capacity(4 * 1024);
@@ -358,7 +471,13 @@ fn serve_client(mut stream: TcpStream, topo: Arc<Topology>) -> std::io::Result<(
                         stream.write_all(&out)?;
                         return Ok(());
                     };
-                    let reply = handle(&topo, &mut backends, &args, &raw);
+                    let reply = match auth_step(&topo, &mut authed_ns, &args) {
+                        AuthStep::Reply(v) => v,
+                        AuthStep::Proceed(ns) => {
+                            let b = backends.get_or_insert_with(|| Backends::new(ns.clone()));
+                            handle(&topo, b, &ns, &args, &raw)
+                        }
+                    };
                     encode(&reply, &mut out);
                 }
                 Ok(Decoded::NeedMore) => break,
@@ -383,7 +502,13 @@ fn serve_client(mut stream: TcpStream, topo: Arc<Topology>) -> std::io::Result<(
     }
 }
 
-fn handle(topo: &Topology, backends: &mut Backends, args: &[Vec<u8>], raw: &[u8]) -> Value {
+fn handle(
+    topo: &Topology,
+    backends: &mut Backends,
+    ns: &[u8],
+    args: &[Vec<u8>],
+    raw: &[u8],
+) -> Value {
     let Some(name) = args.first() else {
         return Value::Error("ERR empty command".into());
     };
@@ -422,7 +547,7 @@ fn handle(topo: &Topology, backends: &mut Backends, args: &[Vec<u8>], raw: &[u8]
             }
             Value::Simple("OK".into())
         }),
-        _ => forward(topo, backends, args, raw),
+        _ => forward(topo, backends, ns, args, raw),
     }
 }
 
@@ -449,16 +574,34 @@ fn main() -> std::io::Result<()> {
         .collect();
     assert!(!pairs.is_empty(), "need at least one pair");
 
+    // token=ns pairs; empty (flag absent) = open mode on the default ns.
+    let tenants: HashMap<String, Vec<u8>> = arg("--tenants")
+        .map(|spec| {
+            spec.split(',')
+                .filter_map(|pair| {
+                    let (token, ns) = pair.split_once('=')?;
+                    assert!(
+                        !ns.is_empty() && ns.len() <= 64 && !ns.contains('\0'),
+                        "invalid namespace in --tenants"
+                    );
+                    Some((token.to_string(), ns.as_bytes().to_vec()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
     let masters: Vec<Option<String>> = pairs.iter().map(|nodes| discover_master(nodes)).collect();
     eprintln!(
-        "flint-proxy: {} pair(s), masters {:?}",
+        "flint-proxy: {} pair(s), {} tenant(s), masters {:?}",
         pairs.len(),
+        tenants.len(),
         masters
     );
     let topo = Arc::new(Topology {
         pairs,
         masters: RwLock::new(masters),
         moved: RwLock::new(HashMap::new()),
+        tenants,
     });
 
     let listener = TcpListener::bind(("127.0.0.1", port))?;

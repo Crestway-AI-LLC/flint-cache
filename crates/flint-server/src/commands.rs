@@ -75,8 +75,10 @@ pub fn command_key(args: &[Vec<u8>]) -> Option<&[u8]> {
     args.get(1).map(|k| k.as_slice())
 }
 
-/// v0 runs a single default namespace; tenancy arrives with the proxy.
-const NS: &[u8] = b"0";
+/// The default namespace: unauthenticated/direct connections and every
+/// pre-tenancy tool operate here. Tenant connections select their own via
+/// FLINTNS (set by the proxy after token auth).
+pub const DEFAULT_NS: &[u8] = b"0";
 
 /// Wire-facing policy limits, plumbed from the CLI.
 #[derive(Clone, Copy)]
@@ -118,30 +120,45 @@ pub struct Dispatcher<'a> {
     kv: &'a dyn Kv,
     clock: Clock,
     limits: Limits,
+    ns: Vec<u8>,
 }
 
 impl<'a> Dispatcher<'a> {
-    /// Default policy limits. The server binary always goes through
-    /// `with_limits` (config plumbed from the CLI); this is the
-    /// test-and-embedding convenience.
+    /// Default policy limits + default namespace. The server binary always
+    /// goes through `with_limits`; this is the test-and-embedding
+    /// convenience.
     #[allow(dead_code)]
     pub fn new(kv: &'a dyn Kv, clock: Clock) -> Self {
-        Self::with_limits(kv, clock, Limits::default())
+        Self::with_limits(kv, clock, Limits::default(), DEFAULT_NS)
     }
 
-    pub fn with_limits(kv: &'a dyn Kv, clock: Clock, limits: Limits) -> Self {
+    /// Namespace-scoped dispatcher: every data command, DBSIZE, and
+    /// FLUSHALL operate on `ns` only — the tenant-isolation boundary.
+    pub fn with_limits(kv: &'a dyn Kv, clock: Clock, limits: Limits, ns: &[u8]) -> Self {
         let max = limits.max_value_bytes;
         Self {
-            keyspace: Keyspace::new(kv, NS, clock),
-            strings: StringStore::with_max_value_bytes(kv, NS, clock, max),
-            hashes: HashStore::with_max_value_bytes(kv, NS, clock, max),
-            sets: SetStore::with_max_value_bytes(kv, NS, clock, max),
-            lists: ListStore::with_max_value_bytes(kv, NS, clock, max),
-            zsets: ZSetStore::with_max_value_bytes(kv, NS, clock, max),
+            keyspace: Keyspace::new(kv, ns, clock),
+            strings: StringStore::with_max_value_bytes(kv, ns, clock, max),
+            hashes: HashStore::with_max_value_bytes(kv, ns, clock, max),
+            sets: SetStore::with_max_value_bytes(kv, ns, clock, max),
+            lists: ListStore::with_max_value_bytes(kv, ns, clock, max),
+            zsets: ZSetStore::with_max_value_bytes(kv, ns, clock, max),
             kv,
             clock,
             limits,
+            ns: ns.to_vec(),
         }
+    }
+
+    /// `cf | ns_len | ns` — the prefix bounding this namespace's rows in one
+    /// CF. DBSIZE and FLUSHALL must scan/delete inside it, never CF-wide:
+    /// other tenants' rows share the physical keyspace.
+    fn ns_prefix(&self, cf: flint_storage::encoding::Cf) -> Vec<u8> {
+        let mut p = Vec::with_capacity(2 + self.ns.len());
+        p.push(cf as u8);
+        p.push(self.ns.len() as u8);
+        p.extend_from_slice(&self.ns);
+        p
     }
 
     /// True when any key argument of this command exceeds the key cap.
@@ -486,7 +503,7 @@ impl<'a> Dispatcher<'a> {
                 let now = (self.clock)();
                 let mut live: i64 = 0;
                 self.kv.for_each_prefix(
-                    &[flint_storage::encoding::Cf::Metadata as u8],
+                    &self.ns_prefix(flint_storage::encoding::Cf::Metadata),
                     &mut |_, row| {
                         if flint_storage::encoding::MetaHeader::decode(row)
                             .is_some_and(|h| !h.is_expired(now))
@@ -499,7 +516,30 @@ impl<'a> Dispatcher<'a> {
                 Value::Integer(live)
             }
             b"FLUSHALL" => {
-                self.kv.clear();
+                // Namespace-scoped: a tenant flushing its cache must never
+                // touch another tenant's rows (kv.clear() would). Chunked
+                // collect-then-delete keeps memory bounded on huge tenants.
+                use flint_storage::encoding::Cf;
+                for cf in [Cf::Metadata, Cf::Subkey, Cf::ZScore] {
+                    let prefix = self.ns_prefix(cf);
+                    loop {
+                        let mut batch: Vec<Vec<u8>> = Vec::new();
+                        self.kv.for_each_prefix(&prefix, &mut |k, _| {
+                            batch.push(k.to_vec());
+                            batch.len() < 10_000
+                        });
+                        if batch.is_empty() {
+                            break;
+                        }
+                        let done = batch.len() < 10_000;
+                        for k in &batch {
+                            self.kv.delete(k);
+                        }
+                        if done {
+                            break;
+                        }
+                    }
+                }
                 Value::Simple("OK".into())
             }
             b"COMMAND" => Value::Array(Some(vec![])),
@@ -837,6 +877,7 @@ mod tests {
                 max_value_bytes: 16,
                 ..Default::default()
             },
+            DEFAULT_NS,
         );
         let call =
             |parts: &[&[u8]]| d.dispatch(&parts.iter().map(|p| p.to_vec()).collect::<Vec<_>>());
@@ -892,6 +933,7 @@ mod tests {
                 max_key_bytes: 8,
                 ..Default::default()
             },
+            DEFAULT_NS,
         );
         let call =
             |parts: &[&[u8]]| d.dispatch(&parts.iter().map(|p| p.to_vec()).collect::<Vec<_>>());
@@ -910,6 +952,7 @@ mod tests {
                 max_key_bytes: u64::MAX,
                 ..Default::default()
             },
+            DEFAULT_NS,
         );
         let over = vec![b'k'; 65_536];
         assert_eq!(

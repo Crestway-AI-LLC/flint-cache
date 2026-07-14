@@ -328,6 +328,8 @@ fn serve(
     let mut buf: Vec<u8> = Vec::with_capacity(16 * 1024);
     let mut chunk = [0u8; 16 * 1024];
     let mut out: Vec<u8> = Vec::with_capacity(4 * 1024);
+    // Connection-scoped namespace (FLINTNS): the tenant boundary.
+    let mut conn_ns: Vec<u8> = commands::DEFAULT_NS.to_vec();
     loop {
         let mut consumed = 0;
         out.clear();
@@ -368,6 +370,7 @@ fn serve(
                     hub,
                     migration_active,
                     limits,
+                    &mut conn_ns,
                     &args,
                 );
                 encode(&reply, &mut out);
@@ -424,6 +427,7 @@ fn serve(
                         hub,
                         migration_active,
                         limits,
+                        &mut conn_ns,
                         &args,
                     );
                     encode(&reply, &mut out);
@@ -473,8 +477,27 @@ fn execute(
     hub: &Arc<ReplHub>,
     migration_active: &Arc<AtomicBool>,
     limits: commands::Limits,
+    conn_ns: &mut Vec<u8>,
     args: &[Vec<u8>],
 ) -> Value {
+    // FLINTNS <ns>: select this connection's namespace — the tenant
+    // boundary. Sent by the proxy right after token auth; every subsequent
+    // data command, DBSIZE, FLUSHALL, and the slot gate are scoped to it.
+    // The server trusts its callers here (the data port is the internal
+    // surface; the proxy is what faces tenants — mTLS hardens this at M3).
+    if args
+        .first()
+        .is_some_and(|n| n.eq_ignore_ascii_case(b"FLINTNS"))
+    {
+        let Some(ns) = args.get(1) else {
+            return Value::Error("ERR FLINTNS <namespace>".into());
+        };
+        if ns.is_empty() || ns.len() > 64 || ns.contains(&0) {
+            return Value::Error("ERR invalid namespace (1..=64 bytes, no NUL)".into());
+        }
+        *conn_ns = ns.clone();
+        return Value::Simple("OK".into());
+    }
     if args
         .first()
         .is_some_and(|n| n.eq_ignore_ascii_case(b"FLINTLEASE"))
@@ -600,7 +623,7 @@ fn execute(
     // mid-cutover is shed with -TRYAGAIN. Guarded by `migration_active` so
     // ordinary traffic (no overrides) never pays the extra manifest read.
     if migration_active.load(Ordering::Relaxed)
-        && let Some(reply) = check_slot_gate(rocks, args, is_write)
+        && let Some(reply) = check_slot_gate(rocks, conn_ns, args, is_write)
     {
         return reply;
     }
@@ -635,10 +658,16 @@ fn execute(
     // suppressed.
     if ro {
         let ro_store = flint_storage::ReadOnlyKv(store);
-        Dispatcher::with_limits(&ro_store, flint_storage::strings::system_clock, limits)
-            .dispatch(args)
+        Dispatcher::with_limits(
+            &ro_store,
+            flint_storage::strings::system_clock,
+            limits,
+            conn_ns,
+        )
+        .dispatch(args)
     } else {
-        Dispatcher::with_limits(store, flint_storage::strings::system_clock, limits).dispatch(args)
+        Dispatcher::with_limits(store, flint_storage::strings::system_clock, limits, conn_ns)
+            .dispatch(args)
     }
 }
 
@@ -1564,14 +1593,21 @@ fn flintslotabort(_rocks: &Option<RocksHandle>, _args: &[Vec<u8>]) -> Value {
 /// (Moved) or is being imported here (Importing); -TRYAGAIN if a WRITE hits a
 /// slot frozen mid-cutover (Migrating). None means serve normally.
 #[cfg(feature = "rocks")]
-fn check_slot_gate(rocks: &Option<RocksHandle>, args: &[Vec<u8>], is_write: bool) -> Option<Value> {
+fn check_slot_gate(
+    rocks: &Option<RocksHandle>,
+    ns: &[u8],
+    args: &[Vec<u8>],
+    is_write: bool,
+) -> Option<Value> {
     use flint_storage::manifest::{self, MigrationPhase};
     let kv = rocks.as_ref()?;
     let key = commands::command_key(args)?;
     let slot = flint_slot::slot_for_key(key);
-    match manifest::read_migration(kv.as_ref(), b"0", slot)?.phase {
+    // Migration records are per (ns, slot): tenant A's moved slot must not
+    // redirect tenant B, whose rows did not move.
+    match manifest::read_migration(kv.as_ref(), ns, slot)?.phase {
         MigrationPhase::Moved | MigrationPhase::Importing => {
-            let peer = manifest::read_migration(kv.as_ref(), b"0", slot)?.peer;
+            let peer = manifest::read_migration(kv.as_ref(), ns, slot)?.peer;
             Some(Value::Error(format!("MOVED {slot} {peer}")))
         }
         MigrationPhase::Migrating if is_write => {
@@ -1584,6 +1620,7 @@ fn check_slot_gate(rocks: &Option<RocksHandle>, args: &[Vec<u8>], is_write: bool
 #[cfg(not(feature = "rocks"))]
 fn check_slot_gate(
     _rocks: &Option<RocksHandle>,
+    _ns: &[u8],
     _args: &[Vec<u8>],
     _is_write: bool,
 ) -> Option<Value> {
