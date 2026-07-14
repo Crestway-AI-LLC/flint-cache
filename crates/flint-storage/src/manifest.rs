@@ -323,6 +323,22 @@ pub fn scan_migrations(kv: &dyn Kv, ns: &[u8]) -> Vec<MigrationRecord> {
         .collect()
 }
 
+/// Every migration record across ALL namespaces — what boot-time gating,
+/// FLINTMIGRATIONS, and per-slot ownership sweeps enumerate in a
+/// multi-tenant node. Key layout: prefix | ns_len(1) | ns | slot(2 BE).
+pub fn scan_all_migrations(kv: &dyn Kv) -> Vec<MigrationRecord> {
+    kv.scan_prefix(MIGRATION_KEY_PREFIX)
+        .into_iter()
+        .filter_map(|(k, v)| {
+            let rest = k.get(MIGRATION_KEY_PREFIX.len()..)?;
+            let ns_len = *rest.first()? as usize;
+            let ns = rest.get(1..1 + ns_len)?;
+            let slot = u16::from_be_bytes(rest.get(1 + ns_len..1 + ns_len + 2)?.try_into().ok()?);
+            decode_migration(ns, slot, &v)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -607,6 +623,22 @@ mod tests {
         found.sort_unstable();
         assert_eq!(found, vec![7, 300, 16000]);
         assert_eq!(scan_migrations(&kv, b"other").len(), 1);
+
+        // The all-namespaces scan sees every record with its ns intact.
+        let mut all: Vec<(Vec<u8>, u16)> = scan_all_migrations(&kv)
+            .into_iter()
+            .map(|r| (r.ns, r.slot))
+            .collect();
+        all.sort();
+        assert_eq!(
+            all,
+            vec![
+                (b"0".to_vec(), 7),
+                (b"0".to_vec(), 300),
+                (b"0".to_vec(), 16000),
+                (b"other".to_vec(), 7),
+            ]
+        );
     }
 
     #[test]

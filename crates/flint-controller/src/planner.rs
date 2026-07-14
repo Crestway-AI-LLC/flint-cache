@@ -109,30 +109,33 @@ pub fn plan_moves(pairs: &[PairLoad], deadband: f64) -> Vec<Move> {
     moves
 }
 
-/// Choose which of the donor's slots to ship to satisfy (approximately) a
-/// planned move of `amount` load units. Greedy largest-first so the fewest
-/// slots move; ties break to the lowest slot number, so — like `plan_moves`
-/// — the choice is a pure, order-independent function of the observed stats
-/// and concurrent controllers pick the same slots (their duplicate
-/// migrations then collapse against the same fenced records). `cap` bounds
-/// slots per cycle: rebalancing converges over several observe→plan→move
-/// cycles rather than one big bang, which is also the pacing mechanism.
+/// Choose which of the donor's (namespace, slot) units to ship to satisfy
+/// (approximately) a planned move of `amount` load units — the migration
+/// unit in a multi-tenant group is one namespace's slot. Greedy
+/// largest-first so the fewest units move; ties break deterministically
+/// (count desc, then ns asc, then slot asc), so — like `plan_moves` — the
+/// choice is a pure, order-independent function of the observed stats and
+/// concurrent controllers pick the same units (their duplicate migrations
+/// then collapse against the same fenced records). `cap` bounds units per
+/// cycle: rebalancing converges over several observe→plan→move cycles,
+/// which is also the pacing mechanism.
 ///
-/// Stops BEFORE overshooting: a slot is added only while the running total
-/// is under `amount`, so we never move more than one slot past the target
-/// (the deadband absorbs the remainder). Always moves at least one slot if
-/// any is non-empty — otherwise a single slot larger than `amount` could
+/// Stops BEFORE overshooting: a unit is added only while the running total
+/// is under `amount`, so we never move more than one unit past the target
+/// (the deadband absorbs the remainder). Always moves at least one unit if
+/// any is non-empty — otherwise a single unit larger than `amount` could
 /// stall the plan forever.
-pub fn select_slots(stats: &[(u16, u64)], amount: u64, cap: usize) -> Vec<u16> {
-    let mut sorted: Vec<(u16, u64)> = stats.iter().copied().filter(|&(_, n)| n > 0).collect();
+pub fn select_units(stats: &[((String, u16), u64)], amount: u64, cap: usize) -> Vec<(String, u16)> {
+    let mut sorted: Vec<((String, u16), u64)> =
+        stats.iter().filter(|(_, n)| *n > 0).cloned().collect();
     sorted.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
     let mut picked = Vec::new();
     let mut total = 0u64;
-    for (slot, n) in sorted {
+    for (unit, n) in sorted {
         if picked.len() >= cap || (total >= amount && !picked.is_empty()) {
             break;
         }
-        picked.push(slot);
+        picked.push(unit);
         total += n;
     }
     if amount == 0 { Vec::new() } else { picked }
@@ -234,48 +237,74 @@ mod tests {
         assert_eq!(moves[0].approx, 1);
     }
 
+    fn u(ns: &str, slot: u16, n: u64) -> ((String, u16), u64) {
+        ((ns.to_string(), slot), n)
+    }
+
     #[test]
-    fn select_slots_largest_first_until_amount() {
-        let stats = vec![(100u16, 50u64), (200, 500), (300, 30), (400, 200)];
+    fn select_units_largest_first_until_amount() {
+        let stats = vec![
+            u("t", 100, 50),
+            u("t", 200, 500),
+            u("t", 300, 30),
+            u("t", 400, 200),
+        ];
         // amount 600: picks 500 (slot 200), then 200 (slot 400) -> total 700.
-        assert_eq!(select_slots(&stats, 600, 8), vec![200, 400]);
+        let picked: Vec<u16> = select_units(&stats, 600, 8)
+            .into_iter()
+            .map(|(_, s)| s)
+            .collect();
+        assert_eq!(picked, vec![200, 400]);
         // amount 400: the largest alone satisfies it (no overshoot append).
-        assert_eq!(select_slots(&stats, 400, 8), vec![200]);
+        let picked: Vec<u16> = select_units(&stats, 400, 8)
+            .into_iter()
+            .map(|(_, s)| s)
+            .collect();
+        assert_eq!(picked, vec![200]);
     }
 
     #[test]
-    fn select_slots_ties_break_to_lowest_slot() {
-        let stats = vec![(9u16, 100u64), (3, 100), (7, 100)];
-        assert_eq!(select_slots(&stats, 250, 8), vec![3, 7, 9]);
-    }
-
-    #[test]
-    fn select_slots_respects_cap_and_moves_at_least_one() {
-        let stats = vec![(1u16, 10u64), (2, 10), (3, 10), (4, 10)];
+    fn select_units_ties_break_ns_then_slot() {
+        // Equal counts: order is ns asc, then slot asc — deterministic
+        // across controllers regardless of observation order.
+        let stats = vec![u("beta", 3, 100), u("alpha", 9, 100), u("alpha", 3, 100)];
         assert_eq!(
-            select_slots(&stats, 1_000, 2).len(),
+            select_units(&stats, 250, 8),
+            vec![
+                ("alpha".to_string(), 3),
+                ("alpha".to_string(), 9),
+                ("beta".to_string(), 3)
+            ]
+        );
+    }
+
+    #[test]
+    fn select_units_respects_cap_and_moves_at_least_one() {
+        let stats = vec![u("t", 1, 10), u("t", 2, 10), u("t", 3, 10), u("t", 4, 10)];
+        assert_eq!(
+            select_units(&stats, 1_000, 2).len(),
             2,
             "cap bounds the cycle"
         );
-        // A single huge slot larger than amount still moves (no stall).
-        let big = vec![(5u16, 10_000u64)];
-        assert_eq!(select_slots(&big, 100, 8), vec![5]);
+        // A single huge unit larger than amount still moves (no stall).
+        let big = vec![u("t", 5, 10_000)];
+        assert_eq!(select_units(&big, 100, 8), vec![("t".to_string(), 5)]);
     }
 
     #[test]
-    fn select_slots_ignores_empty_and_zero_amount() {
-        assert!(select_slots(&[], 100, 8).is_empty());
-        assert!(select_slots(&[(1, 0), (2, 0)], 100, 8).is_empty());
+    fn select_units_ignores_empty_and_zero_amount() {
+        assert!(select_units(&[], 100, 8).is_empty());
+        assert!(select_units(&[u("t", 1, 0), u("t", 2, 0)], 100, 8).is_empty());
         assert!(
-            select_slots(&[(1, 50)], 0, 8).is_empty(),
+            select_units(&[u("t", 1, 50)], 0, 8).is_empty(),
             "zero amount = no move"
         );
     }
 
     #[test]
-    fn select_slots_is_order_independent() {
-        let a = vec![(10u16, 5u64), (20, 50), (30, 20)];
-        let b = vec![(30u16, 20u64), (10, 5), (20, 50)];
-        assert_eq!(select_slots(&a, 60, 8), select_slots(&b, 60, 8));
+    fn select_units_is_order_independent() {
+        let a = vec![u("x", 10, 5), u("x", 20, 50), u("y", 30, 20)];
+        let b = vec![u("y", 30, 20), u("x", 10, 5), u("x", 20, 50)];
+        assert_eq!(select_units(&a, 60, 8), select_units(&b, 60, 8));
     }
 }

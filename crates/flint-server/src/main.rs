@@ -243,7 +243,7 @@ fn main() -> std::io::Result<()> {
     let migration_active = Arc::new(AtomicBool::new(false));
     #[cfg(feature = "rocks")]
     if let Some(kv) = &rocks
-        && !flint_storage::manifest::scan_migrations(kv.as_ref(), b"0").is_empty()
+        && !flint_storage::manifest::scan_all_migrations(kv.as_ref()).is_empty()
     {
         migration_active.store(true, Ordering::Relaxed);
     }
@@ -492,8 +492,9 @@ fn execute(
         let Some(ns) = args.get(1) else {
             return Value::Error("ERR FLINTNS <namespace>".into());
         };
-        if ns.is_empty() || ns.len() > 64 || ns.contains(&0) {
-            return Value::Error("ERR invalid namespace (1..=64 bytes, no NUL)".into());
+        let ok_byte = |b: &u8| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.');
+        if ns.is_empty() || ns.len() > 64 || !ns.iter().all(ok_byte) {
+            return Value::Error("ERR invalid namespace (1..=64 chars of [A-Za-z0-9._-])".into());
         }
         *conn_ns = ns.clone();
         return Value::Simple("OK".into());
@@ -980,10 +981,13 @@ fn flintmigrateout(
         .and_then(|r| std::str::from_utf8(r).ok())
         .and_then(|s| s.parse::<u16>().ok())
     else {
-        encode(&Value::Error("ERR FLINTMIGRATEOUT <slot>".into()), &mut out);
+        encode(
+            &Value::Error("ERR FLINTMIGRATEOUT <slot> [ns]".into()),
+            &mut out,
+        );
         return stream.write_all(&out);
     };
-    let ns: &[u8] = b"0";
+    let ns: &[u8] = args.get(2).map(|v| v.as_slice()).unwrap_or(b"0");
     // Refuse to ship a slot this node does not own: after a cutover the
     // rows here (if any) are purge-pending ghosts, and re-exporting them
     // would hand out data whose ownership already changed hands.
@@ -1143,19 +1147,20 @@ fn migrate_in(
     slot: u16,
     self_addr: Option<&str>,
     migration_active: &Arc<AtomicBool>,
+    ns: &[u8],
 ) -> Value {
     use flint_storage::manifest::{self, MigrationPhase};
 
     // Step 1 (cutover): mark Importing before pulling.
     if let Some(_me) = self_addr {
-        if let Err(e) = set_slot_phase(kv.as_ref(), slot, MigrationPhase::Importing, src) {
+        if let Err(e) = set_slot_phase(kv.as_ref(), ns, slot, MigrationPhase::Importing, src) {
             return Value::Error(format!("ERR set importing fenced: {e:?}"));
         }
         migration_active.store(true, Ordering::Relaxed);
     }
     let rollback = || {
         if self_addr.is_some() {
-            manifest::clear_migration(kv.as_ref(), b"0", slot);
+            manifest::clear_migration(kv.as_ref(), ns, slot);
         }
     };
 
@@ -1172,6 +1177,7 @@ fn migrate_in(
         &Value::Array(Some(vec![
             Value::Bulk(Some(b"FLINTMIGRATEOUT".to_vec())),
             Value::Bulk(Some(slot.to_string().into_bytes())),
+            Value::Bulk(Some(ns.to_vec())),
         ])),
         &mut out,
     );
@@ -1232,6 +1238,7 @@ fn migrate_in(
                                                 b"FLINTSLOTFREEZE",
                                                 slot.to_string().as_bytes(),
                                                 me.as_bytes(),
+                                                ns,
                                             ],
                                         ) {
                                             Ok(Value::Simple(_)) => frozen = true,
@@ -1245,13 +1252,14 @@ fn migrate_in(
                                         // Loop again to drain the frozen tail.
                                     } else {
                                         // Step 5: flip dest-first, then source.
-                                        manifest::clear_migration(kv.as_ref(), b"0", slot);
+                                        manifest::clear_migration(kv.as_ref(), ns, slot);
                                         match call_once(
                                             src,
                                             &[
                                                 b"FLINTSLOTMOVED",
                                                 slot.to_string().as_bytes(),
                                                 me.as_bytes(),
+                                                ns,
                                             ],
                                         ) {
                                             Ok(Value::Simple(_)) => {
@@ -1324,10 +1332,11 @@ fn flintmigratein(
             .and_then(|r| std::str::from_utf8(r).ok())
             .and_then(|s| s.parse::<u16>().ok()),
     ) else {
-        return Value::Error("ERR FLINTMIGRATEIN <host:port> <slot> [self-addr]".into());
+        return Value::Error("ERR FLINTMIGRATEIN <host:port> <slot> [self-addr] [ns]".into());
     };
     let self_addr = args.get(3).and_then(|r| std::str::from_utf8(r).ok());
-    migrate_in(kv, src, slot, self_addr, migration_active)
+    let ns: &[u8] = args.get(4).map(|v| v.as_slice()).unwrap_or(b"0");
+    migrate_in(kv, src, slot, self_addr, migration_active, ns)
 }
 
 #[cfg(not(feature = "rocks"))]
@@ -1342,12 +1351,14 @@ fn flintmigratein(
 /// The next monotonic, fence-safe epoch for a slot's migration record: above
 /// both any existing record and the base claim.
 #[cfg(feature = "rocks")]
-fn next_migration_epoch(kv: &RocksKv, slot: u16) -> flint_storage::manifest::Epoch {
+fn next_migration_epoch(kv: &RocksKv, ns: &[u8], slot: u16) -> flint_storage::manifest::Epoch {
     use flint_storage::manifest::{self, Epoch};
+    // The base claim is node-wide (ns "0" carries it in v0); the record
+    // fence is per (ns, slot).
     let base = manifest::read_claim(kv, b"0")
         .map(|c| c.epoch)
         .unwrap_or(Epoch::ZERO);
-    let cur = manifest::read_migration(kv, b"0", slot)
+    let cur = manifest::read_migration(kv, ns, slot)
         .map(|r| r.epoch)
         .unwrap_or(Epoch::ZERO);
     let hi = base.max(cur);
@@ -1361,6 +1372,7 @@ fn next_migration_epoch(kv: &RocksKv, slot: u16) -> flint_storage::manifest::Epo
 #[cfg(feature = "rocks")]
 fn set_slot_phase(
     kv: &RocksKv,
+    ns: &[u8],
     slot: u16,
     phase: flint_storage::manifest::MigrationPhase,
     peer: &str,
@@ -1369,11 +1381,11 @@ fn set_slot_phase(
     manifest::set_migration(
         kv,
         &MigrationRecord {
-            ns: b"0".to_vec(),
+            ns: ns.to_vec(),
             slot,
             phase,
             peer: peer.to_string(),
-            epoch: next_migration_epoch(kv, slot),
+            epoch: next_migration_epoch(kv, ns, slot),
         },
     )
 }
@@ -1396,9 +1408,10 @@ fn flintslotmoved(
             .and_then(|s| s.parse::<u16>().ok()),
         args.get(2).and_then(|r| std::str::from_utf8(r).ok()),
     ) else {
-        return Value::Error("ERR FLINTSLOTMOVED <slot> <host:port>".into());
+        return Value::Error("ERR FLINTSLOTMOVED <slot> <host:port> [ns]".into());
     };
-    match set_slot_phase(kv.as_ref(), slot, MigrationPhase::Moved, peer) {
+    let ns: &[u8] = args.get(3).map(|v| v.as_slice()).unwrap_or(b"0");
+    match set_slot_phase(kv.as_ref(), ns, slot, MigrationPhase::Moved, peer) {
         Ok(()) => {
             migration_active.store(true, Ordering::Relaxed);
             // Purge the disowned slot's rows (all CFs): the destination owns
@@ -1410,7 +1423,7 @@ fn flintslotmoved(
             // retried FLINTSLOTMOVED (idempotent at a bumped epoch) or the
             // GC can finish clearing. The deletes ride the WAL, so replicas
             // drop the slot too.
-            let purged = purge_slot_rows(kv.as_ref(), slot);
+            let purged = purge_slot_rows(kv.as_ref(), ns, slot);
             Value::Simple(format!(
                 "OK slot {slot} moved to {peer} ({purged} rows purged)"
             ))
@@ -1422,11 +1435,11 @@ fn flintslotmoved(
 /// Delete every row of `slot` across all CFs. Streaming collect-then-delete
 /// (v0; a real range-delete is an engine refinement). Returns rows removed.
 #[cfg(feature = "rocks")]
-fn purge_slot_rows(kv: &RocksKv, slot: u16) -> usize {
+fn purge_slot_rows(kv: &RocksKv, ns: &[u8], slot: u16) -> usize {
     use flint_storage::encoding::{Cf, slot_prefix};
     let mut purged = 0;
     for cf in [Cf::Metadata, Cf::Subkey, Cf::ZScore] {
-        let prefix = slot_prefix(cf, b"0", slot);
+        let prefix = slot_prefix(cf, ns, slot);
         let mut keys: Vec<Vec<u8>> = Vec::new();
         kv.for_each_prefix(&prefix, &mut |k, _| {
             keys.push(k.to_vec());
@@ -1467,9 +1480,10 @@ fn flintslotfreeze(
             .and_then(|s| s.parse::<u16>().ok()),
         args.get(2).and_then(|r| std::str::from_utf8(r).ok()),
     ) else {
-        return Value::Error("ERR FLINTSLOTFREEZE <slot> <dest>".into());
+        return Value::Error("ERR FLINTSLOTFREEZE <slot> <dest> [ns]".into());
     };
-    match set_slot_phase(kv.as_ref(), slot, MigrationPhase::Migrating, peer) {
+    let ns: &[u8] = args.get(3).map(|v| v.as_slice()).unwrap_or(b"0");
+    match set_slot_phase(kv.as_ref(), ns, slot, MigrationPhase::Migrating, peer) {
         Ok(()) => {
             migration_active.store(true, Ordering::Relaxed);
             Value::Simple(format!("OK slot {slot} frozen"))
@@ -1487,57 +1501,63 @@ fn flintslotfreeze(
     Value::Error("ERR FLINTSLOTFREEZE requires a build with --features rocks".into())
 }
 
-/// FLINTSLOTSTATS: count live metadata rows per slot in one streaming pass
-/// over the 'M' CF (subkey/zscore rows belong to a key counted via its meta
-/// row, so 'M' alone is the key count). Envelope: `M | ns_len | ns |
-/// slot(2 BE) | user_key` — the slot is the two bytes after the ns. Engine-
-/// generic (works on mem and rocks); memory bounded at one u32 per slot.
-/// v0 counts expired-but-unswept rows too — fill approximation, not billing.
+/// FLINTSLOTSTATS: live metadata-row counts per (namespace, slot) — one
+/// "slot count ns" bulk per non-empty unit — in one streaming pass over the
+/// 'M' CF across ALL namespaces (subkey/zscore rows belong to a key counted
+/// via its meta row). Envelope: `M | ns_len | ns | slot(2 BE) | user_key`.
+/// The (ns, slot) unit is the migration unit, so this is exactly the
+/// executor's selection input. Memory is bounded by the number of distinct
+/// non-empty (ns, slot) units. v0 counts expired-but-unswept rows too — a
+/// fill approximation, not billing.
 fn flintslotstats(store: &dyn Kv) -> Value {
-    const NS: &[u8] = b"0";
-    let mut prefix = vec![b'M', NS.len() as u8];
-    prefix.extend_from_slice(NS);
-    let slot_off = prefix.len();
-    let mut counts = vec![0u32; 16384];
-    store.for_each_prefix(&prefix, &mut |k, _| {
-        if let Some(raw) = k.get(slot_off..slot_off + 2) {
-            let slot = u16::from_be_bytes([raw[0], raw[1]]) as usize;
-            if slot < counts.len() {
-                counts[slot] += 1;
+    use std::collections::HashMap;
+    let mut counts: HashMap<(Vec<u8>, u16), u64> = HashMap::new();
+    store.for_each_prefix(b"M", &mut |k, _| {
+        // k = M | ns_len | ns | slot(2) | key
+        if let Some(&ns_len) = k.get(1) {
+            let ns_end = 2 + ns_len as usize;
+            if let Some(ns) = k.get(2..ns_end)
+                && let Some(raw) = k.get(ns_end..ns_end + 2)
+            {
+                let slot = u16::from_be_bytes([raw[0], raw[1]]);
+                *counts.entry((ns.to_vec(), slot)).or_insert(0) += 1;
             }
         }
         true
     });
-    // A slot this node has disowned (Moved) or is still importing must not
-    // be offered to the rebalance planner: its rows are either purge-pending
-    // ghosts or an incomplete copy — moving them again would ship data this
-    // node does not own (found by the execute drill: pre-purge ghost rows
+    // A (ns, slot) this node has disowned (Moved) or is still importing must
+    // not be offered to the rebalance planner: its rows are purge-pending
+    // ghosts or an incomplete copy (found by the execute drill: ghost rows
     // kept the planner chasing the same slots forever).
-    use flint_storage::manifest::{MigrationPhase, scan_migrations};
-    for rec in scan_migrations(store, NS) {
+    use flint_storage::manifest::{MigrationPhase, scan_all_migrations};
+    for rec in scan_all_migrations(store) {
         if matches!(rec.phase, MigrationPhase::Moved | MigrationPhase::Importing) {
-            counts[rec.slot as usize] = 0;
+            counts.remove(&(rec.ns.clone(), rec.slot));
         }
     }
+    let mut rows: Vec<((Vec<u8>, u16), u64)> = counts.into_iter().collect();
+    rows.sort();
     Value::Array(Some(
-        counts
-            .iter()
-            .enumerate()
-            .filter(|(_, n)| **n > 0)
-            .map(|(slot, n)| Value::Bulk(Some(format!("{slot} {n}").into_bytes())))
+        rows.into_iter()
+            .map(|((ns, slot), n)| {
+                Value::Bulk(Some(
+                    format!("{slot} {n} {}", String::from_utf8_lossy(&ns)).into_bytes(),
+                ))
+            })
             .collect(),
     ))
 }
 
-/// FLINTMIGRATIONS: the in-flight (Importing/Migrating) records on this node,
-/// one "slot phase peer" bulk each — the recovery input for the controller.
+/// FLINTMIGRATIONS: the in-flight (Importing/Migrating) records on this node
+/// across ALL namespaces, one "slot phase peer ns" bulk each — the recovery
+/// input for the controller.
 #[cfg(feature = "rocks")]
 fn flintmigrations(rocks: &Option<RocksHandle>) -> Value {
     use flint_storage::manifest::{self, MigrationPhase};
     let Some(kv) = rocks else {
         return Value::Error("ERR FLINTMIGRATIONS requires the rocks engine".into());
     };
-    let rows: Vec<Value> = manifest::scan_migrations(kv.as_ref(), b"0")
+    let rows: Vec<Value> = manifest::scan_all_migrations(kv.as_ref())
         .into_iter()
         .filter(|r| r.phase.is_inflight())
         .map(|r| {
@@ -1546,7 +1566,15 @@ fn flintmigrations(rocks: &Option<RocksHandle>) -> Value {
                 MigrationPhase::Migrating => "migrating",
                 MigrationPhase::Moved => "moved",
             };
-            Value::Bulk(Some(format!("{} {phase} {}", r.slot, r.peer).into_bytes()))
+            Value::Bulk(Some(
+                format!(
+                    "{} {phase} {} {}",
+                    r.slot,
+                    r.peer,
+                    String::from_utf8_lossy(&r.ns)
+                )
+                .into_bytes(),
+            ))
         })
         .collect();
     Value::Array(Some(rows))
@@ -1570,14 +1598,15 @@ fn flintslotabort(rocks: &Option<RocksHandle>, args: &[Vec<u8>]) -> Value {
         .and_then(|r| std::str::from_utf8(r).ok())
         .and_then(|s| s.parse::<u16>().ok())
     else {
-        return Value::Error("ERR FLINTSLOTABORT <slot>".into());
+        return Value::Error("ERR FLINTSLOTABORT <slot> [ns]".into());
     };
-    match manifest::read_migration(kv.as_ref(), b"0", slot) {
+    let ns: &[u8] = args.get(2).map(|v| v.as_slice()).unwrap_or(b"0");
+    match manifest::read_migration(kv.as_ref(), ns, slot) {
         Some(r) if r.phase == MigrationPhase::Moved => {
             Value::Error("ERR slot is Moved (settled ownership), not in-flight".into())
         }
         Some(_) => {
-            manifest::clear_migration(kv.as_ref(), b"0", slot);
+            manifest::clear_migration(kv.as_ref(), ns, slot);
             Value::Simple(format!("OK slot {slot} migration aborted"))
         }
         None => Value::Simple(format!("OK slot {slot} had no in-flight migration")),

@@ -284,19 +284,19 @@ impl Pair {
     }
 
     /// Observe this pair's load for the rebalance planner: the reachable
-    /// master's key count (DBSIZE) plus that master's address (the endpoint
-    /// the executor ships slots from/to). None if no master answers.
+    /// master's TOTAL key count across ALL namespaces (summed from
+    /// FLINTSLOTSTATS — DBSIZE is namespace-scoped since tenancy, so it
+    /// would read 0 on a node whose data lives in tenant namespaces), plus
+    /// that master's address (the endpoint the executor ships from/to).
     fn observe_fill(&self) -> Option<(planner::PairLoad, String)> {
         for addr in &self.nodes {
             let n = observe(addr);
-            if n.reachable
-                && n.role == "master"
-                && let Ok(Value::Integer(fill)) = call(addr, &[b"DBSIZE"])
-            {
+            if n.reachable && n.role == "master" {
+                let fill: u64 = slot_stats(addr).iter().map(|(_, n)| n).sum();
                 return Some((
                     planner::PairLoad {
                         label: self.label.clone(),
-                        fill: fill.max(0) as u64,
+                        fill,
                     },
                     addr.clone(),
                 ));
@@ -673,8 +673,9 @@ fn has_inflight_migration(addr: &str) -> bool {
     }
 }
 
-/// Per-slot key counts from a master (FLINTSLOTSTATS: "slot count" bulks).
-fn slot_stats(addr: &str) -> Vec<(u16, u64)> {
+/// Per-(namespace, slot) key counts from a master (FLINTSLOTSTATS:
+/// "slot count ns" bulks) — the migration unit is (ns, slot).
+fn slot_stats(addr: &str) -> Vec<((String, u16), u64)> {
     let Ok(Value::Array(Some(rows))) = call(addr, &[b"FLINTSLOTSTATS"]) else {
         return Vec::new();
     };
@@ -684,8 +685,11 @@ fn slot_stats(addr: &str) -> Vec<(u16, u64)> {
                 return None;
             };
             let line = String::from_utf8_lossy(&b).into_owned();
-            let (slot, n) = line.split_once(' ')?;
-            Some((slot.parse().ok()?, n.parse().ok()?))
+            let mut parts = line.split(' ');
+            let slot: u16 = parts.next()?.parse().ok()?;
+            let n: u64 = parts.next()?.parse().ok()?;
+            let ns = parts.next()?.to_string();
+            Some(((ns, slot), n))
         })
         .collect()
 }
@@ -714,15 +718,15 @@ fn execute_move(
         return;
     }
     let stats = slot_stats(src);
-    let slots = planner::select_slots(&stats, m.approx, cfg.max_slots_per_cycle);
-    if slots.is_empty() {
+    let units = planner::select_units(&stats, m.approx, cfg.max_slots_per_cycle);
+    if units.is_empty() {
         return;
     }
     eprintln!(
-        "[{}] rebalance EXECUTE: ~{} load {}({src}) -> {}({dst}), slots {slots:?} — fills={fills:?}",
+        "[{}] rebalance EXECUTE: ~{} load {}({src}) -> {}({dst}), units {units:?} — fills={fills:?}",
         cfg.id, m.approx, m.from, m.to
     );
-    for slot in slots {
+    for (ns, slot) in units {
         match call_slow(
             dst,
             &[
@@ -730,12 +734,13 @@ fn execute_move(
                 src.as_bytes(),
                 slot.to_string().as_bytes(),
                 dst.as_bytes(),
+                ns.as_bytes(),
             ],
             Duration::from_secs(120),
         ) {
             Ok(Value::Simple(s)) => {
                 eprintln!(
-                    "[{}] rebalance: slot {slot} {}->{}: {s}",
+                    "[{}] rebalance: {ns}/{slot} {}->{}: {s}",
                     cfg.id, m.from, m.to
                 );
             }
@@ -743,7 +748,7 @@ fn execute_move(
                 // Stop the cycle; recovery reconciles any half-done state and
                 // the next cycle re-plans from observed reality.
                 eprintln!(
-                    "[{}] rebalance: slot {slot} move failed ({other:?}) — yielding to recovery",
+                    "[{}] rebalance: {ns}/{slot} move failed ({other:?}) — yielding to recovery",
                     cfg.id
                 );
                 return;
@@ -757,6 +762,7 @@ struct InFlight {
     node: String,
     slot: u16,
     peer: String,
+    ns: String,
 }
 
 /// Reconcile migrations interrupted by a restart. Observing the two
@@ -778,7 +784,7 @@ fn recover_migrations(cfg: &Config) {
             let Value::Bulk(Some(b)) = row else { continue };
             let line = String::from_utf8_lossy(&b);
             let parts: Vec<&str> = line.split(' ').collect();
-            let [slot, phase, peer] = parts.as_slice() else {
+            let [slot, phase, peer, ns] = parts.as_slice() else {
                 continue;
             };
             let Ok(slot) = slot.parse::<u16>() else {
@@ -788,6 +794,7 @@ fn recover_migrations(cfg: &Config) {
                 node: node.clone(),
                 slot,
                 peer: peer.to_string(),
+                ns: ns.to_string(),
             };
             match *phase {
                 "importing" => importing.push(rec),
@@ -814,6 +821,7 @@ fn recover_migrations(cfg: &Config) {
                     src.as_bytes(),
                     rec.slot.to_string().as_bytes(),
                     dest.as_bytes(),
+                    rec.ns.as_bytes(),
                 ],
                 Duration::from_secs(120),
             );
@@ -826,7 +834,14 @@ fn recover_migrations(cfg: &Config) {
                 "[{}] recovery: source {src} unreachable — aborting import of slot {} at {dest}",
                 cfg.id, rec.slot
             );
-            let _ = call(dest, &[b"FLINTSLOTABORT", rec.slot.to_string().as_bytes()]);
+            let _ = call(
+                dest,
+                &[
+                    b"FLINTSLOTABORT",
+                    rec.slot.to_string().as_bytes(),
+                    rec.ns.as_bytes(),
+                ],
+            );
         }
     }
 
@@ -850,6 +865,7 @@ fn recover_migrations(cfg: &Config) {
                     b"FLINTSLOTMOVED",
                     rec.slot.to_string().as_bytes(),
                     dest.as_bytes(),
+                    rec.ns.as_bytes(),
                 ],
             );
         } else {
@@ -857,7 +873,14 @@ fn recover_migrations(cfg: &Config) {
                 "[{}] recovery: dest {dest} gone — unfreezing slot {} on {src}",
                 cfg.id, rec.slot
             );
-            let _ = call(src, &[b"FLINTSLOTABORT", rec.slot.to_string().as_bytes()]);
+            let _ = call(
+                src,
+                &[
+                    b"FLINTSLOTABORT",
+                    rec.slot.to_string().as_bytes(),
+                    rec.ns.as_bytes(),
+                ],
+            );
         }
     }
 }
