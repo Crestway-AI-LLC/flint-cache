@@ -206,7 +206,14 @@ pub fn subkey_envelope(
 /// Prefix covering every subkey row of one (key, version) — the unit of a
 /// full-collection scan (HGETALL) and of orphan identification.
 pub fn subkey_prefix(ns: &[u8], slot: u16, user_key: &[u8], version: u64) -> Vec<u8> {
-    debug_assert!(user_key.len() <= u16::MAX as usize);
+    // Hard assert, not debug: in release a longer key would silently
+    // truncate the length frame (`as u16`) and write a corrupted envelope
+    // that misparses in GC and can collide across keys. Dispatch rejects
+    // oversized keys before reaching here; this is the last line.
+    assert!(
+        user_key.len() <= u16::MAX as usize,
+        "user key exceeds the envelope's u16 length frame"
+    );
     let mut k = Vec::with_capacity(1 + 1 + ns.len() + 2 + 2 + user_key.len() + 8);
     k.push(Cf::Subkey as u8);
     k.push(ns.len() as u8);
@@ -385,6 +392,22 @@ mod complex_tests {
         assert!(!a.starts_with(&p2));
     }
 
+    /// The last line of defense behind dispatch's key cap: building an
+    /// envelope for a key the u16 length frame cannot represent must
+    /// panic, never silently truncate (truncation corrupts the row and
+    /// can collide across keys).
+    #[test]
+    #[should_panic(expected = "u16 length frame")]
+    fn subkey_prefix_refuses_unframeable_keys() {
+        let _ = subkey_prefix(b"t", 1, &vec![b'k'; 65_536], 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "u16 length frame")]
+    fn zscore_prefix_refuses_unframeable_keys() {
+        let _ = zscore_prefix(b"t", 1, &vec![b'k'; 65_536], 1);
+    }
+
     #[test]
     fn versions_are_monotonic_and_unique() {
         let a = VersionGen::next(1_000);
@@ -480,6 +503,11 @@ pub fn zscore_envelope(
 }
 
 pub fn zscore_prefix(ns: &[u8], slot: u16, user_key: &[u8], version: u64) -> Vec<u8> {
+    // Same u16 length frame, same hard guard as `subkey_prefix`.
+    assert!(
+        user_key.len() <= u16::MAX as usize,
+        "user key exceeds the envelope's u16 length frame"
+    );
     let mut k = Vec::with_capacity(1 + 1 + ns.len() + 2 + 2 + user_key.len() + 8);
     k.push(Cf::ZScore as u8);
     k.push(ns.len() as u8);

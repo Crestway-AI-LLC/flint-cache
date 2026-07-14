@@ -205,22 +205,34 @@ fn main() -> std::io::Result<()> {
         .unwrap_or(0);
     let hub = Arc::new(ReplHub::new(lag_soft, lag_hard, min_replicas));
 
-    // Max-value-size policy (Valkey's proto-max-bulk-len analog, extended
-    // to collections): writes that would grow any single value past this
-    // are rejected. On a beyond-RAM engine an uncapped value can exceed
-    // physical memory, making read-all commands (HGETALL, LRANGE 0 -1)
-    // un-serveable. 0 disables the cap.
-    let max_value_bytes: u64 = arg("--max-value-bytes")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(flint_storage::DEFAULT_MAX_VALUE_BYTES);
-    if max_value_bytes != flint_storage::DEFAULT_MAX_VALUE_BYTES {
+    // Size policies. --max-value-bytes (Valkey's proto-max-bulk-len
+    // analog, extended to collections): writes that would grow any single
+    // value past it are rejected; 0 disables. --max-key-bytes: key-length
+    // cap, clamped to the envelope's structural 64KB ceiling (the subkey
+    // length frame is 2 bytes); 0 means ceiling only.
+    let limits = commands::Limits {
+        max_value_bytes: arg("--max-value-bytes")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(flint_storage::DEFAULT_MAX_VALUE_BYTES),
+        max_key_bytes: arg("--max-key-bytes")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(flint_storage::MAX_KEY_BYTES),
+    };
+    if limits.max_value_bytes != flint_storage::DEFAULT_MAX_VALUE_BYTES {
         eprintln!(
             "max-value-bytes: {}",
-            if max_value_bytes == 0 {
+            if limits.max_value_bytes == 0 {
                 "unlimited".into()
             } else {
-                max_value_bytes.to_string()
+                limits.max_value_bytes.to_string()
             }
+        );
+    }
+    if limits.max_key_bytes != flint_storage::MAX_KEY_BYTES {
+        eprintln!(
+            "max-key-bytes: {} (structural ceiling {})",
+            limits.max_key_bytes,
+            flint_storage::MAX_KEY_BYTES
         );
     }
 
@@ -282,7 +294,7 @@ fn main() -> std::io::Result<()> {
                 rocks,
                 &hub,
                 &migration_active,
-                max_value_bytes,
+                limits,
             );
         });
     }
@@ -311,7 +323,7 @@ fn serve(
     rocks: Option<RocksHandle>,
     hub: &Arc<ReplHub>,
     migration_active: &Arc<AtomicBool>,
-    max_value_bytes: u64,
+    limits: commands::Limits,
 ) -> std::io::Result<()> {
     let mut buf: Vec<u8> = Vec::with_capacity(16 * 1024);
     let mut chunk = [0u8; 16 * 1024];
@@ -352,7 +364,7 @@ fn serve(
                     &rocks,
                     hub,
                     migration_active,
-                    max_value_bytes,
+                    limits,
                     &args,
                 );
                 encode(&reply, &mut out);
@@ -408,7 +420,7 @@ fn serve(
                         &rocks,
                         hub,
                         migration_active,
-                        max_value_bytes,
+                        limits,
                         &args,
                     );
                     encode(&reply, &mut out);
@@ -457,7 +469,7 @@ fn execute(
     rocks: &Option<RocksHandle>,
     hub: &Arc<ReplHub>,
     migration_active: &Arc<AtomicBool>,
-    max_value_bytes: u64,
+    limits: commands::Limits,
     args: &[Vec<u8>],
 ) -> Value {
     if args
@@ -611,19 +623,11 @@ fn execute(
     // suppressed.
     if ro {
         let ro_store = flint_storage::ReadOnlyKv(store);
-        Dispatcher::with_max_value_bytes(
-            &ro_store,
-            flint_storage::strings::system_clock,
-            max_value_bytes,
-        )
-        .dispatch(args)
+        Dispatcher::with_limits(&ro_store, flint_storage::strings::system_clock, limits)
+            .dispatch(args)
     } else {
-        Dispatcher::with_max_value_bytes(
-            store,
-            flint_storage::strings::system_clock,
-            max_value_bytes,
-        )
-        .dispatch(args)
+        Dispatcher::with_limits(store, flint_storage::strings::system_clock, limits)
+            .dispatch(args)
     }
 }
 
@@ -1944,7 +1948,7 @@ mod serve_tests {
                         None,
                         &Arc::new(ReplHub::default()),
                         &Arc::new(AtomicBool::new(false)),
-                        flint_storage::DEFAULT_MAX_VALUE_BYTES,
+                        commands::Limits::default(),
                     );
                 });
             }

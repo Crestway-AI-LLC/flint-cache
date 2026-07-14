@@ -78,6 +78,36 @@ pub fn command_key(args: &[Vec<u8>]) -> Option<&[u8]> {
 /// v0 runs a single default namespace; tenancy arrives with the proxy.
 const NS: &[u8] = b"0";
 
+/// Wire-facing policy limits, plumbed from the CLI.
+#[derive(Clone, Copy)]
+pub struct Limits {
+    /// Cap on any single value's total payload; 0 disables.
+    pub max_value_bytes: u64,
+    /// Cap on user-key length. Always clamped to the envelope's
+    /// structural ceiling (`flint_storage::MAX_KEY_BYTES`); 0 means
+    /// "ceiling only".
+    pub max_key_bytes: u64,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            max_value_bytes: flint_storage::DEFAULT_MAX_VALUE_BYTES,
+            max_key_bytes: flint_storage::MAX_KEY_BYTES,
+        }
+    }
+}
+
+impl Limits {
+    fn effective_max_key(&self) -> u64 {
+        if self.max_key_bytes == 0 {
+            flint_storage::MAX_KEY_BYTES
+        } else {
+            self.max_key_bytes.min(flint_storage::MAX_KEY_BYTES)
+        }
+    }
+}
+
 pub struct Dispatcher<'a> {
     keyspace: Keyspace<'a>,
     strings: StringStore<'a>,
@@ -87,20 +117,20 @@ pub struct Dispatcher<'a> {
     zsets: ZSetStore<'a>,
     kv: &'a dyn Kv,
     clock: Clock,
+    limits: Limits,
 }
 
 impl<'a> Dispatcher<'a> {
     /// Default policy limits. The server binary always goes through
-    /// `with_max_value_bytes` (config plumbed from the CLI); this is the
+    /// `with_limits` (config plumbed from the CLI); this is the
     /// test-and-embedding convenience.
     #[allow(dead_code)]
     pub fn new(kv: &'a dyn Kv, clock: Clock) -> Self {
-        Self::with_max_value_bytes(kv, clock, flint_storage::DEFAULT_MAX_VALUE_BYTES)
+        Self::with_limits(kv, clock, Limits::default())
     }
 
-    /// `max_value_bytes` caps any single value's total payload (string
-    /// payload / collection fields+members+elements); 0 disables the cap.
-    pub fn with_max_value_bytes(kv: &'a dyn Kv, clock: Clock, max: u64) -> Self {
+    pub fn with_limits(kv: &'a dyn Kv, clock: Clock, limits: Limits) -> Self {
+        let max = limits.max_value_bytes;
         Self {
             keyspace: Keyspace::new(kv, NS, clock),
             strings: StringStore::with_max_value_bytes(kv, NS, clock, max),
@@ -110,6 +140,23 @@ impl<'a> Dispatcher<'a> {
             zsets: ZSetStore::with_max_value_bytes(kv, NS, clock, max),
             kv,
             clock,
+            limits,
+        }
+    }
+
+    /// True when any key argument of this command exceeds the key cap.
+    /// Key positions mirror `command_key`: v0 commands take their key at
+    /// args[1]; DEL/EXISTS are all-keys; MSET keys sit at odd indices.
+    /// Enforced for reads and writes alike — an oversized key must never
+    /// reach the envelope builders (their length frame is 2 bytes).
+    fn has_oversized_key(&self, name_upper: &[u8], args: &[Vec<u8>]) -> bool {
+        let max = self.limits.effective_max_key() as usize;
+        match name_upper {
+            b"PING" | b"ECHO" | b"DBSIZE" | b"FLUSHALL" | b"COMMAND" | b"CLUSTER" | b"INFO"
+            | b"SELECT" | b"QUIT" | b"HELLO" => false,
+            b"DEL" | b"EXISTS" => args[1..].iter().any(|k| k.len() > max),
+            b"MSET" => args[1..].iter().step_by(2).any(|k| k.len() > max),
+            _ => args.get(1).is_some_and(|k| k.len() > max),
         }
     }
 
@@ -117,7 +164,11 @@ impl<'a> Dispatcher<'a> {
         let Some(name) = args.first() else {
             return err("ERR empty command");
         };
-        match name.to_ascii_uppercase().as_slice() {
+        let name_upper = name.to_ascii_uppercase();
+        if self.has_oversized_key(&name_upper, args) {
+            return err("ERR key exceeds maximum allowed size (max-key-bytes)");
+        }
+        match name_upper.as_slice() {
             // connection
             b"PING" => match args.len() {
                 1 => Value::Simple("PONG".into()),
@@ -780,7 +831,14 @@ mod tests {
     #[test]
     fn max_value_bytes_policy_rejects_on_the_wire() {
         let s = MemKv::new();
-        let d = Dispatcher::with_max_value_bytes(&s, system_clock, 16);
+        let d = Dispatcher::with_limits(
+            &s,
+            system_clock,
+            Limits {
+                max_value_bytes: 16,
+                ..Default::default()
+            },
+        );
         let call = |parts: &[&[u8]]| {
             d.dispatch(&parts.iter().map(|p| p.to_vec()).collect::<Vec<_>>())
         };
@@ -796,6 +854,69 @@ mod tests {
         assert_eq!(call(&[b"RPUSH", b"l", &[b'e'; 17]]), too_large);
         assert_eq!(call(&[b"SADD", b"s", &[b'm'; 17]]), too_large);
         assert_eq!(call(&[b"ZADD", b"z", b"1", &[b'q'; 9]]), too_large);
+    }
+
+    /// The key cap: the structural 64KB ceiling is always on (the subkey
+    /// envelope frames key length as u16 — an oversized key would corrupt
+    /// it), and --max-key-bytes can only lower it. Reads and writes,
+    /// single- and multi-key commands alike.
+    #[test]
+    fn key_size_ceiling_is_always_enforced() {
+        let s = MemKv::new();
+        let d = Dispatcher::new(&s, system_clock);
+        let call = |parts: &[&[u8]]| {
+            d.dispatch(&parts.iter().map(|p| p.to_vec()).collect::<Vec<_>>())
+        };
+        let too_long = Value::Error("ERR key exceeds maximum allowed size (max-key-bytes)".into());
+        let over = vec![b'k'; 65_536];
+        let at = vec![b'k'; 65_535];
+        // Writes: complex types would hit the envelope; strings stay
+        // consistent with them.
+        assert_eq!(call(&[b"HSET", &over, b"f", b"v"]), too_long);
+        assert_eq!(call(&[b"SET", &over, b"v"]), too_long);
+        // Reads too — an oversized key must never reach a prefix builder.
+        assert_eq!(call(&[b"HGETALL", &over]), too_long);
+        // Multi-key shapes: the oversized key is not at args[1].
+        assert_eq!(call(&[b"DEL", b"ok", &over]), too_long);
+        assert_eq!(call(&[b"MSET", b"ok", b"v", &over, b"v"]), too_long);
+        // At the ceiling everything works.
+        assert_eq!(call(&[b"HSET", &at, b"f", b"v"]), Value::Integer(1));
+        assert_eq!(call(&[b"DEL", &at]), Value::Integer(1));
+        assert_eq!(call(&[b"ZADD", &at, b"1", b"m"]), Value::Integer(1));
+    }
+
+    #[test]
+    fn max_key_bytes_can_lower_but_not_raise_the_ceiling() {
+        let s = MemKv::new();
+        let d = Dispatcher::with_limits(
+            &s,
+            system_clock,
+            Limits {
+                max_key_bytes: 8,
+                ..Default::default()
+            },
+        );
+        let call = |parts: &[&[u8]]| {
+            d.dispatch(&parts.iter().map(|p| p.to_vec()).collect::<Vec<_>>())
+        };
+        let too_long = Value::Error("ERR key exceeds maximum allowed size (max-key-bytes)".into());
+        assert_eq!(call(&[b"SET", b"ninechars", b"v"]), too_long);
+        assert_eq!(call(&[b"SET", b"eightchr", b"v"]), Value::Simple("OK".into()));
+
+        // A configured value above the ceiling clamps back down to it.
+        let raised = Dispatcher::with_limits(
+            &s,
+            system_clock,
+            Limits {
+                max_key_bytes: u64::MAX,
+                ..Default::default()
+            },
+        );
+        let over = vec![b'k'; 65_536];
+        assert_eq!(
+            raised.dispatch(&[b"HSET".to_vec(), over, b"f".to_vec(), b"v".to_vec()]),
+            too_long
+        );
     }
 
     #[test]

@@ -46,6 +46,14 @@ use std::sync::RwLock;
 /// Configure with `--max-value-bytes` (0 = unlimited).
 pub const DEFAULT_MAX_VALUE_BYTES: u64 = 512 * 1024 * 1024;
 
+/// Structural ceiling on user-key length: the subkey/zscore envelopes
+/// frame the key length as 2 bytes (`encoding::subkey_prefix`), so a
+/// longer key cannot be represented — the envelope builders assert it and
+/// the dispatch layer rejects it first with a clean error. Configure a
+/// LOWER policy cap with `--max-key-bytes`; this ceiling cannot be raised
+/// without an envelope format change.
+pub const MAX_KEY_BYTES: u64 = u16::MAX as u64;
+
 /// Minimal flat key-value interface the engine sits on.
 ///
 /// Deliberately synchronous and byte-oriented; ordering (for prefix scans)
