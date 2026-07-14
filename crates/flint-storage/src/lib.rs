@@ -46,8 +46,39 @@ pub trait Kv: Send + Sync {
     fn put(&self, key: &[u8], value: &[u8]);
     /// Returns true if the key existed.
     fn delete(&self, key: &[u8]) -> bool;
+    /// Visit every pair whose key starts with `prefix`, in ascending key
+    /// order, without materializing the range: memory stays bounded no
+    /// matter how many rows match. Return `false` from `visit` to stop.
+    ///
+    /// Contract: `visit` may call back into the store (`get`/`put`/`delete`
+    /// — the GC sweeper deletes rows mid-scan), so implementations must not
+    /// hold internal locks across `visit` invocations. Rows inserted or
+    /// removed during the scan may or may not be visited; rows present for
+    /// the whole scan are visited exactly once.
+    fn for_each_prefix(&self, prefix: &[u8], visit: &mut dyn FnMut(&[u8], &[u8]) -> bool);
     /// All pairs whose key starts with `prefix`, in ascending key order.
-    fn scan_prefix(&self, prefix: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)>;
+    ///
+    /// Materializes the whole range — use only where the range is bounded
+    /// by a single value's size (one hash/set/zset, one slot's manifest
+    /// rows). CF-wide ranges (DBSIZE, GC) go through `for_each_prefix` /
+    /// `count_prefix`; at fleet scale a materialized scan OOMs the process.
+    fn scan_prefix(&self, prefix: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let mut out = Vec::new();
+        self.for_each_prefix(prefix, &mut |k, v| {
+            out.push((k.to_vec(), v.to_vec()));
+            true
+        });
+        out
+    }
+    /// Number of keys with `prefix`, streaming — O(1) memory.
+    fn count_prefix(&self, prefix: &[u8]) -> usize {
+        let mut n = 0;
+        self.for_each_prefix(prefix, &mut |_, _| {
+            n += 1;
+            true
+        });
+        n
+    }
     /// Remove everything. Test/dev convenience (FLUSHALL v0).
     fn clear(&self);
 }
@@ -72,6 +103,9 @@ impl Kv for ReadOnlyKv<'_> {
     fn put(&self, _key: &[u8], _value: &[u8]) {}
     fn delete(&self, _key: &[u8]) -> bool {
         false
+    }
+    fn for_each_prefix(&self, prefix: &[u8], visit: &mut dyn FnMut(&[u8], &[u8]) -> bool) {
+        self.0.for_each_prefix(prefix, visit)
     }
     fn scan_prefix(&self, prefix: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
         self.0.scan_prefix(prefix)
@@ -112,7 +146,42 @@ impl Kv for MemKv {
         self.write().remove(key).is_some()
     }
 
+    fn for_each_prefix(&self, prefix: &[u8], visit: &mut dyn FnMut(&[u8], &[u8]) -> bool) {
+        // Chunked cursor scan: the read lock is released before `visit`
+        // runs (the callback may re-enter the store — a write would
+        // deadlock against a held read lock) and memory stays bounded at
+        // CHUNK pairs regardless of range size.
+        const CHUNK: usize = 1024;
+        let mut cursor: Option<Vec<u8>> = None;
+        loop {
+            let chunk: Vec<(Vec<u8>, Vec<u8>)> = {
+                let lower = match &cursor {
+                    Some(k) => Bound::Excluded(k.as_slice()),
+                    None => Bound::Included(prefix),
+                };
+                self.read()
+                    .range::<[u8], _>((lower, Bound::Unbounded))
+                    .take_while(|(k, _)| k.starts_with(prefix))
+                    .take(CHUNK)
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect()
+            };
+            let exhausted = chunk.len() < CHUNK;
+            cursor = chunk.last().map(|(k, _)| k.clone());
+            for (k, v) in &chunk {
+                if !visit(k, v) {
+                    return;
+                }
+            }
+            if exhausted {
+                return;
+            }
+        }
+    }
+
     fn scan_prefix(&self, prefix: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
+        // Overrides the default: one lock hold = an atomic snapshot of the
+        // range, which the chunked streaming path deliberately gives up.
         self.read()
             .range::<[u8], _>((Bound::Included(prefix), Bound::Unbounded))
             .take_while(|(k, _)| k.starts_with(prefix))
@@ -159,6 +228,58 @@ mod tests {
         );
         assert_eq!(kv.scan_prefix(b"a").len(), 3);
         assert_eq!(kv.scan_prefix(b"c").len(), 0);
+    }
+
+    #[test]
+    fn for_each_prefix_streams_ordered_bounded_and_stops_early() {
+        let kv = MemKv::new();
+        kv.put(b"a|2", b"x");
+        kv.put(b"a|1", b"y");
+        kv.put(b"b|1", b"z");
+        kv.put(b"a", b"meta");
+        let mut seen = Vec::new();
+        kv.for_each_prefix(b"a|", &mut |k, v| {
+            seen.push((k.to_vec(), v.to_vec()));
+            true
+        });
+        assert_eq!(
+            seen,
+            vec![
+                (b"a|1".to_vec(), b"y".to_vec()),
+                (b"a|2".to_vec(), b"x".to_vec()),
+            ]
+        );
+        assert_eq!(kv.count_prefix(b"a"), 3);
+        assert_eq!(kv.count_prefix(b"c"), 0);
+        let mut visited = 0;
+        kv.for_each_prefix(b"a", &mut |_, _| {
+            visited += 1;
+            false
+        });
+        assert_eq!(visited, 1, "returning false stops the scan");
+    }
+
+    /// The contract DBSIZE and the GC sweeper lean on: the callback may
+    /// write back into the store mid-scan, and every row present for the
+    /// whole scan is visited exactly once — including across the chunked
+    /// cursor's lock releases, which a range longer than one chunk forces.
+    #[test]
+    fn for_each_prefix_survives_reentrant_deletes_across_chunks() {
+        let kv = MemKv::new();
+        // Well past one chunk (1024) so cursor resume is exercised.
+        for i in 0..3_000u32 {
+            kv.put(format!("p|{i:08}").as_bytes(), &i.to_be_bytes());
+        }
+        kv.put(b"q", b"other");
+        let mut visited = 0;
+        kv.for_each_prefix(b"p|", &mut |k, _| {
+            assert!(kv.delete(k), "row visited twice or vanished");
+            visited += 1;
+            true
+        });
+        assert_eq!(visited, 3_000);
+        assert_eq!(kv.count_prefix(b"p|"), 0, "sweep-style scan drained the range");
+        assert_eq!(kv.get(b"q"), Some(b"other".to_vec()));
     }
 
     #[test]

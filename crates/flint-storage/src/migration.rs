@@ -44,20 +44,26 @@ pub fn migrate_slots(src: &dyn Kv, dst: &dyn Kv, ns: &[u8], slots: &[u16]) -> Mi
         let mut slot_had_rows = false;
         for cf in ALL_CFS {
             let prefix = slot_prefix(cf, ns, slot);
-            let rows = src.scan_prefix(&prefix);
-            if rows.is_empty() {
+            // Copy first, streaming: the destination owns the data before
+            // the source gives it up, so an interruption can duplicate but
+            // never drop. Values are shipped row-by-row and never held
+            // in memory; only the copied keys are kept, so the delete pass
+            // removes exactly what was copied (a row written to the source
+            // mid-move survives for the next run, never deleted un-copied).
+            let mut copied: Vec<Vec<u8>> = Vec::new();
+            src.for_each_prefix(&prefix, &mut |k, v| {
+                dst.put(k, v);
+                copied.push(k.to_vec());
+                true
+            });
+            if copied.is_empty() {
                 continue;
             }
             slot_had_rows = true;
-            // Copy first: the destination owns the data before the source
-            // gives it up, so an interruption can duplicate but never drop.
-            for (k, v) in &rows {
-                dst.put(k, v);
-            }
-            for (k, _) in &rows {
+            for k in &copied {
                 src.delete(k);
             }
-            report.rows_moved += rows.len();
+            report.rows_moved += copied.len();
         }
         if slot_had_rows {
             report.slots_nonempty += 1;
@@ -78,7 +84,7 @@ mod tests {
     fn count_rows(kv: &dyn Kv) -> usize {
         ALL_CFS
             .iter()
-            .map(|&cf| kv.scan_prefix(&[cf as u8]).len())
+            .map(|&cf| kv.count_prefix(&[cf as u8]))
             .sum()
     }
 

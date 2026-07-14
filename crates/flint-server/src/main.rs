@@ -881,20 +881,34 @@ fn flintmigrateout(
     encode(&Value::Simple("MIGRATEOUT-OK".into()), &mut out);
     stream.write_all(&out)?;
 
-    // Bulk phase: every row of the slot, across all CFs.
+    // Bulk phase: every row of the slot, across all CFs — streamed with
+    // periodic flushes, so neither the row list nor the encode buffer ever
+    // holds a whole slot in memory.
     let mut bulk_rows: u64 = 0;
     for prefix in &prefixes {
         out.clear();
-        for (k, v) in kv.scan_prefix(prefix) {
+        let mut io_err: Option<std::io::Error> = None;
+        kv.for_each_prefix(prefix, &mut |k, v| {
             encode(
                 &Value::Array(Some(vec![
                     Value::Bulk(Some(b"P".to_vec())),
-                    Value::Bulk(Some(k)),
-                    Value::Bulk(Some(v)),
+                    Value::Bulk(Some(k.to_vec())),
+                    Value::Bulk(Some(v.to_vec())),
                 ])),
                 &mut out,
             );
             bulk_rows += 1;
+            if out.len() >= 1 << 20 {
+                if let Err(e) = stream.write_all(&out) {
+                    io_err = Some(e);
+                    return false;
+                }
+                out.clear();
+            }
+            true
+        });
+        if let Some(e) = io_err {
+            return Err(e);
         }
         if !out.is_empty() {
             stream.write_all(&out)?;

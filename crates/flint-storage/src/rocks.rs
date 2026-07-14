@@ -91,16 +91,19 @@ impl Kv for RocksKv {
         existed
     }
 
-    fn scan_prefix(&self, prefix: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
-        self.db
-            .iterator(rocksdb::IteratorMode::From(
-                prefix,
-                rocksdb::Direction::Forward,
-            ))
-            .filter_map(Result::ok)
-            .take_while(|(k, _)| k.starts_with(prefix))
-            .map(|(k, v)| (k.to_vec(), v.to_vec()))
-            .collect()
+    fn for_each_prefix(&self, prefix: &[u8], visit: &mut dyn FnMut(&[u8], &[u8]) -> bool) {
+        // The iterator pins a consistent view, so `visit` may write back
+        // into the store (per the trait contract) without disturbing the
+        // scan, and nothing is materialized beyond one row at a time.
+        let iter = self.db.iterator(rocksdb::IteratorMode::From(
+            prefix,
+            rocksdb::Direction::Forward,
+        ));
+        for (k, v) in iter.filter_map(Result::ok) {
+            if !k.starts_with(prefix) || !visit(&k, &v) {
+                return;
+            }
+        }
     }
 
     fn clear(&self) {

@@ -416,20 +416,26 @@ impl<'a> Dispatcher<'a> {
 
             // admin
             b"DBSIZE" => {
-                // O(n) scan of metadata rows, skipping expired ones. Fine at
-                // v0 scale; becomes a maintained counter with per-slot
-                // accounting later. Doubles as the full-sync integrity probe.
+                // O(n) streaming scan of metadata rows, skipping expired
+                // ones. MUST stay on `for_each_prefix`: a materialized
+                // scan of this CF is O(dataset) memory and OOM-killed the
+                // server at 100M keys. Becomes a maintained counter with
+                // per-slot accounting later. Doubles as the full-sync
+                // integrity probe.
                 let now = (self.clock)();
-                let live = self
-                    .kv
-                    .scan_prefix(&[flint_storage::encoding::Cf::Metadata as u8])
-                    .into_iter()
-                    .filter(|(_, row)| {
-                        flint_storage::encoding::MetaHeader::decode(row)
+                let mut live: i64 = 0;
+                self.kv.for_each_prefix(
+                    &[flint_storage::encoding::Cf::Metadata as u8],
+                    &mut |_, row| {
+                        if flint_storage::encoding::MetaHeader::decode(row)
                             .is_some_and(|h| !h.is_expired(now))
-                    })
-                    .count();
-                Value::Integer(live as i64)
+                        {
+                            live += 1;
+                        }
+                        true
+                    },
+                );
+                Value::Integer(live)
             }
             b"FLUSHALL" => {
                 self.kv.clear();
@@ -708,6 +714,52 @@ mod tests {
             call(&s, &[b"HSET", b"h", b"f", b"v", b"g"]),
             Value::Error(_)
         ));
+    }
+
+    /// DBSIZE's contract from the 100M-key OOM (docs/bench, 2026-07-13
+    /// EC2 run): it must stream the metadata CF via `for_each_prefix`,
+    /// never materialize it with `scan_prefix`. The spy store forwards
+    /// everything to a real MemKv but fails the test if the materializing
+    /// path is hit.
+    struct NoMaterializeKv(MemKv);
+
+    impl Kv for NoMaterializeKv {
+        fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+            self.0.get(key)
+        }
+        fn put(&self, key: &[u8], value: &[u8]) {
+            self.0.put(key, value)
+        }
+        fn delete(&self, key: &[u8]) -> bool {
+            self.0.delete(key)
+        }
+        fn for_each_prefix(&self, prefix: &[u8], visit: &mut dyn FnMut(&[u8], &[u8]) -> bool) {
+            self.0.for_each_prefix(prefix, visit)
+        }
+        fn scan_prefix(&self, _prefix: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
+            panic!("DBSIZE must stream via for_each_prefix, not materialize via scan_prefix")
+        }
+        fn clear(&self) {
+            self.0.clear()
+        }
+    }
+
+    #[test]
+    fn dbsize_streams_and_skips_expired() {
+        let s = NoMaterializeKv(MemKv::new());
+        let d = Dispatcher::new(&s, system_clock);
+        let call = |parts: &[&[u8]]| {
+            d.dispatch(&parts.iter().map(|p| p.to_vec()).collect::<Vec<_>>())
+        };
+        assert_eq!(call(&[b"DBSIZE"]), Value::Integer(0));
+        assert_eq!(call(&[b"SET", b"k1", b"v"]), Value::Simple("OK".into()));
+        assert_eq!(call(&[b"SET", b"k2", b"v"]), Value::Simple("OK".into()));
+        // Already expired at write time: physically present, not counted.
+        assert_eq!(
+            call(&[b"SET", b"dead", b"v", b"PXAT", b"1"]),
+            Value::Simple("OK".into())
+        );
+        assert_eq!(call(&[b"DBSIZE"]), Value::Integer(2));
     }
 
     #[test]

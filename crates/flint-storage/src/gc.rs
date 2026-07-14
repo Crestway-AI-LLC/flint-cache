@@ -21,17 +21,21 @@ pub struct SweepReport {
 pub fn sweep(kv: &dyn Kv, now_ms: u64) -> SweepReport {
     let mut report = SweepReport::default();
 
-    for (k, row) in kv.scan_prefix(&[Cf::Metadata as u8]) {
-        if MetaHeader::decode(&row).is_some_and(|h| h.is_expired(now_ms)) {
-            kv.delete(&k);
+    // Both passes cover whole CFs, so they stream: a materialized scan of
+    // ranges this size is exactly the DBSIZE OOM. Deleting mid-scan is
+    // inside the `for_each_prefix` contract.
+    kv.for_each_prefix(&[Cf::Metadata as u8], &mut |k, row| {
+        if MetaHeader::decode(row).is_some_and(|h| h.is_expired(now_ms)) {
+            kv.delete(k);
             report.expired_meta += 1;
         }
-    }
+        true
+    });
 
     for tag in [Cf::Subkey as u8, Cf::ZScore as u8] {
-        for (k, _) in kv.scan_prefix(&[tag]) {
-            let Some((ns, slot, user_key, version)) = parse_subkey_envelope(&k) else {
-                continue;
+        kv.for_each_prefix(&[tag], &mut |k, _| {
+            let Some((ns, slot, user_key, version)) = parse_subkey_envelope(k) else {
+                return true;
             };
             let live_version = kv
                 .get(&envelope(Cf::Metadata, ns, slot, user_key))
@@ -43,10 +47,11 @@ pub fn sweep(kv: &dyn Kv, now_ms: u64) -> SweepReport {
                     ComplexMeta::decode(&row).map(|m| m.version)
                 });
             if live_version != Some(version) {
-                kv.delete(&k);
+                kv.delete(k);
                 report.orphan_rows += 1;
             }
-        }
+            true
+        });
     }
     report
 }
@@ -103,7 +108,7 @@ mod tests {
         assert!(ks.del(1, b"h"));
         assert!(ks.del(1, b"z"));
         let physical_subkeys =
-            kv.scan_prefix(&[Cf::Subkey as u8]).len() + kv.scan_prefix(&[Cf::ZScore as u8]).len();
+            kv.count_prefix(&[Cf::Subkey as u8]) + kv.count_prefix(&[Cf::ZScore as u8]);
         assert_eq!(
             physical_subkeys, 7,
             "3 hash fields + 2 members + 2 index rows"
@@ -119,9 +124,9 @@ mod tests {
                 orphan_rows: 7
             }
         );
-        assert_eq!(kv.scan_prefix(&[Cf::Subkey as u8]).len(), 0);
-        assert_eq!(kv.scan_prefix(&[Cf::ZScore as u8]).len(), 0);
-        assert_eq!(kv.scan_prefix(&[Cf::Metadata as u8]).len(), 0);
+        assert_eq!(kv.count_prefix(&[Cf::Subkey as u8]), 0);
+        assert_eq!(kv.count_prefix(&[Cf::ZScore as u8]), 0);
+        assert_eq!(kv.count_prefix(&[Cf::Metadata as u8]), 0);
 
         // Idempotent.
         assert_eq!(sweep(&kv, now()), SweepReport::default());
