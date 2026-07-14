@@ -88,10 +88,33 @@ impl WriteBatchIterator for OpCollector {
     }
 }
 
+/// Byte budget per `updates_since_budgeted` poll on serving loops. Small
+/// enough that a poll's working set (the batches plus their encoded frames)
+/// stays in the tens of MB; the caller's poll loop supplies continuation.
+pub const REPL_TAIL_BUDGET_BYTES: usize = 4 * 1024 * 1024;
+
 impl RocksKv {
     /// Master side: every op after `last_applied`, grouped per WAL batch.
     /// Sequence-idempotent per the module contract.
+    ///
+    /// UNBUDGETED: materializes the whole tail, which for a laggard near
+    /// the WAL retention limit is gigabytes. Serving loops that poll must
+    /// use `updates_since_budgeted`; this form is for tests and callers
+    /// that know the tail is small.
     pub fn updates_since(&self, last_applied: u64) -> Result<Vec<ReplBatch>, ReplError> {
+        self.updates_since_budgeted(last_applied, usize::MAX)
+    }
+
+    /// Like `updates_since`, but stops after the first batch that brings
+    /// the accumulated op payload (key + value bytes) to `max_bytes`.
+    /// Batches are never split, so the result is always applied/shipped
+    /// whole; the caller resumes from the last batch's `last_seq` on its
+    /// next poll and converges without any extra signal.
+    pub fn updates_since_budgeted(
+        &self,
+        last_applied: u64,
+        max_bytes: usize,
+    ) -> Result<Vec<ReplBatch>, ReplError> {
         if self.db().latest_sequence_number() <= last_applied {
             return Ok(Vec::new());
         }
@@ -100,6 +123,7 @@ impl RocksKv {
             .get_updates_since(last_applied)
             .map_err(|e| ReplError::WalGap(e.to_string()))?;
         let mut out = Vec::new();
+        let mut bytes = 0usize;
         for item in iter {
             let (first_seq, batch) = item.map_err(|e| ReplError::Storage(e.to_string()))?;
             let mut collector = OpCollector {
@@ -116,11 +140,22 @@ impl RocksKv {
             // below it (partial batch at the cursor boundary). A batch whose
             // ops were ALL filtered still ships (empty) so the cursor
             // advances and contiguity holds.
+            bytes += collector
+                .ops
+                .iter()
+                .map(|op| match op {
+                    ReplOp::Put { key, value } => key.len() + value.len(),
+                    ReplOp::Delete { key } => key.len(),
+                })
+                .sum::<usize>();
             out.push(ReplBatch {
                 first_seq: first_seq.max(last_applied + 1),
                 last_seq,
                 ops: collector.ops,
             });
+            if bytes >= max_bytes {
+                break;
+            }
         }
         Ok(out)
     }
@@ -253,6 +288,53 @@ mod tests {
         // Reads through the normal store work on the replica.
         let rs = StringStore::new(&replica, b"0", system_clock);
         assert_eq!(rs.get(1, b"k1"), Ok(Some(b"v1-updated".to_vec())));
+    }
+
+    /// The budget must partition a large tail into resumable slices — each
+    /// poll bounded, batches never split, and the plain poll-loop converges
+    /// to full parity with no continuation signal beyond the cursor.
+    #[test]
+    fn budgeted_tail_is_bounded_per_poll_and_converges() {
+        let (md, rd) = (TempDir::new("m-budget"), TempDir::new("r-budget"));
+        let master = RocksKv::open(&md.0).expect("open");
+        let replica = RocksKv::open(&rd.0).expect("open");
+        let s = StringStore::new(&master, b"0", system_clock);
+        let value = vec![b'x'; 1_000];
+        for i in 0..200u32 {
+            s.set(1, format!("k{i:04}").as_bytes(), &value, SetOptions::default())
+                .expect("set");
+        }
+
+        const BUDGET: usize = 8 * 1_000; // ~8 ops per poll against ~200 total
+        let mut polls = 0;
+        loop {
+            let batches = master
+                .updates_since_budgeted(replica.last_applied(), BUDGET)
+                .expect("tail");
+            if batches.is_empty() {
+                break;
+            }
+            polls += 1;
+            let bytes: usize = batches
+                .iter()
+                .flat_map(|b| &b.ops)
+                .map(|op| match op {
+                    ReplOp::Put { key, value } => key.len() + value.len(),
+                    ReplOp::Delete { key } => key.len(),
+                })
+                .sum();
+            // One whole batch may overshoot the budget, never more.
+            assert!(
+                bytes < BUDGET + 2_000,
+                "poll materialized {bytes} bytes against a {BUDGET} budget"
+            );
+            for b in &batches {
+                replica.apply_batch(b).expect("apply");
+            }
+        }
+        assert!(polls > 5, "budget did not slice the tail (polls={polls})");
+        assert_eq!(scan_all(&master), scan_all(&replica), "converged to parity");
+        assert_eq!(replica.last_applied(), master.latest_seq());
     }
 
     #[test]

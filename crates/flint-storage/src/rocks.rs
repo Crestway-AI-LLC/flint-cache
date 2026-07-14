@@ -107,17 +107,25 @@ impl Kv for RocksKv {
     }
 
     fn clear(&self) {
-        let keys: Vec<_> = self
-            .db
-            .iterator(rocksdb::IteratorMode::Start)
-            .filter_map(Result::ok)
-            .map(|(k, _)| k)
-            .collect();
+        // Chunked delete batches: collecting every key into one Vec plus
+        // one giant WriteBatch is FLUSHALL's version of the DBSIZE OOM —
+        // two dataset-sized allocations. The scan's pinned view never sees
+        // the interleaved deletes, so each key is deleted exactly once.
+        const CHUNK: usize = 10_000;
         let mut batch = WriteBatch::default();
-        for k in keys {
+        let mut pending = 0;
+        self.for_each_prefix(b"", &mut |k, _| {
             batch.delete(k);
+            pending += 1;
+            if pending == CHUNK {
+                let _ = self.db.write(std::mem::take(&mut batch));
+                pending = 0;
+            }
+            true
+        });
+        if pending > 0 {
+            let _ = self.db.write(batch);
         }
-        let _ = self.db.write(batch);
     }
 }
 
@@ -168,6 +176,20 @@ mod audit {
         assert!(!kv.delete(b"k"));
         kv.clear();
         assert_eq!(kv.scan_prefix(b"").len(), 0);
+    }
+
+    /// FLUSHALL must drain datasets larger than one delete chunk without
+    /// ever holding all keys in memory (chunked batches, not one Vec).
+    #[test]
+    fn clear_drains_past_one_chunk() {
+        let dir = TempDir::new("clear-chunk");
+        let kv = RocksKv::open(&dir.0).expect("open");
+        for i in 0..25_000u32 {
+            kv.put(format!("k{i:08}").as_bytes(), b"v");
+        }
+        assert_eq!(kv.count_prefix(b"k"), 25_000);
+        kv.clear();
+        assert_eq!(kv.count_prefix(b""), 0);
     }
 
     #[test]

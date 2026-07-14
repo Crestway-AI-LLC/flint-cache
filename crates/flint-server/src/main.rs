@@ -269,6 +269,18 @@ fn main() -> std::io::Result<()> {
     Ok(())
 }
 
+/// Per-connection input ceiling (Redis `client-query-buffer-limit`). With
+/// bulk strings capped at `flint_resp::MAX_BULK_LEN`, a legitimate
+/// connection can never accumulate this much undecoded input; hitting it
+/// means a hostile or broken client, and the connection is closed.
+const MAX_QUERY_BUF: usize = 1024 * 1024 * 1024;
+/// Longest accepted inline (non-RESP) command line without a newline.
+const MAX_INLINE_LEN: usize = 64 * 1024;
+/// Flush accumulated pipeline replies past this size. Without it, replies
+/// buffer until the whole pipeline drains — and a few MB of pipelined GETs
+/// against large values can demand an arbitrarily large reply buffer.
+const OUT_FLUSH_THRESHOLD: usize = 1024 * 1024;
+
 #[allow(clippy::too_many_arguments)]
 fn serve(
     mut stream: TcpStream,
@@ -293,6 +305,11 @@ fn serve(
             // line not starting with a RESP array marker, split on spaces.
             if first != b'*' {
                 let Some(nl) = pending.iter().position(|&b| b == b'\n') else {
+                    if pending.len() > MAX_INLINE_LEN {
+                        encode(&Value::Error("ERR Protocol error: too big inline request".into()), &mut out);
+                        stream.write_all(&out)?;
+                        return Ok(());
+                    }
                     break;
                 };
                 let line = &pending[..nl];
@@ -317,6 +334,10 @@ fn serve(
                     &args,
                 );
                 encode(&reply, &mut out);
+                if out.len() >= OUT_FLUSH_THRESHOLD {
+                    stream.write_all(&out)?;
+                    out.clear();
+                }
                 continue;
             }
             match decode(pending) {
@@ -368,6 +389,10 @@ fn serve(
                         &args,
                     );
                     encode(&reply, &mut out);
+                    if out.len() >= OUT_FLUSH_THRESHOLD {
+                        stream.write_all(&out)?;
+                        out.clear();
+                    }
                 }
                 Ok(Decoded::NeedMore) => break,
                 Err(_) => {
@@ -388,6 +413,15 @@ fn serve(
             return Ok(());
         }
         buf.extend_from_slice(&chunk[..n]);
+        if buf.len() > MAX_QUERY_BUF {
+            out.clear();
+            encode(
+                &Value::Error("ERR Protocol error: query buffer limit exceeded".into()),
+                &mut out,
+            );
+            stream.write_all(&out)?;
+            return Ok(());
+        }
     }
 }
 
@@ -788,7 +822,10 @@ fn flintsync(
     }
     loop {
         hub.record_sample(kv.latest_seq(), flint_storage::strings::system_clock());
-        match kv.updates_since(cursor) {
+        // Budgeted: a laggard reconnecting near the WAL retention limit
+        // must not make this loop materialize (and clone twice more into
+        // frames) a multi-GB tail in one poll.
+        match kv.updates_since_budgeted(cursor, flint_storage::repl::REPL_TAIL_BUDGET_BYTES) {
             Ok(batches) if !batches.is_empty() => {
                 out.clear();
                 for batch in &batches {
@@ -931,7 +968,7 @@ fn flintmigrateout(
     // lifetime model as flintsync.
     let mut cursor = snapshot;
     loop {
-        match kv.updates_since(cursor) {
+        match kv.updates_since_budgeted(cursor, flint_storage::repl::REPL_TAIL_BUDGET_BYTES) {
             Ok(batches) => {
                 out.clear();
                 for batch in &batches {
@@ -1483,9 +1520,17 @@ fn ack_reader(mut stream: TcpStream, hub: &Arc<ReplHub>, replica_id: u64) {
     }
 }
 
+/// Max payload per full-sync `F` frame. Bounds BOTH sides: this send
+/// buffer, and the replica's decode buffer (it must hold a whole frame).
+/// Files larger than this ship as multiple frames the replica appends in
+/// order.
+#[cfg(feature = "rocks")]
+const FULLSYNC_CHUNK: usize = 4 * 1024 * 1024;
+
 /// Master side of a checkpoint full sync: stream every file of a fresh
-/// checkpoint, then FULLSYNC-END. v0 buffers each file in memory (fine at
-/// drill scale; chunked streaming is a later refinement).
+/// checkpoint in `FULLSYNC_CHUNK`-sized frames, then FULLSYNC-END. No
+/// whole file is ever held in memory — SSTs are usually ~64MB, but
+/// compaction settings can make them arbitrarily large.
 #[cfg(feature = "rocks")]
 fn flintfullsync(mut stream: TcpStream, rocks: Option<RocksHandle>) -> std::io::Result<()> {
     let mut out = Vec::new();
@@ -1510,17 +1555,31 @@ fn flintfullsync(mut stream: TcpStream, rocks: Option<RocksHandle>) -> std::io::
                 continue;
             }
             let name = entry.file_name().to_string_lossy().into_owned();
-            let bytes = std::fs::read(entry.path())?;
-            out.clear();
-            encode(
-                &Value::Array(Some(vec![
-                    Value::Bulk(Some(b"F".to_vec())),
-                    Value::Bulk(Some(name.into_bytes())),
-                    Value::Bulk(Some(bytes)),
-                ])),
-                &mut out,
-            );
-            stream.write_all(&out)?;
+            let mut file = std::fs::File::open(entry.path())?;
+            let mut chunk = vec![0u8; FULLSYNC_CHUNK];
+            let mut sent_any = false;
+            loop {
+                let n = file.read(&mut chunk)?;
+                if n == 0 && sent_any {
+                    break;
+                }
+                // An empty file still ships one (empty) frame so the
+                // replica creates it.
+                out.clear();
+                encode(
+                    &Value::Array(Some(vec![
+                        Value::Bulk(Some(b"F".to_vec())),
+                        Value::Bulk(Some(name.clone().into_bytes())),
+                        Value::Bulk(Some(chunk[..n].to_vec())),
+                    ])),
+                    &mut out,
+                );
+                stream.write_all(&out)?;
+                sent_any = true;
+                if n == 0 {
+                    break;
+                }
+            }
         }
         out.clear();
         encode(&Value::Simple("FULLSYNC-END".into()), &mut out);
@@ -1604,14 +1663,17 @@ mod replica {
         stream.write_all(&out)?;
         let mut buf: Vec<u8> = Vec::new();
         let mut chunk = [0u8; 256 * 1024];
-        let mut files = 0u32;
+        // Large files arrive as multiple F frames, appended in order. The
+        // first frame for a name truncates: leftovers from an interrupted
+        // earlier attempt must not be appended onto.
+        let mut seen = std::collections::HashSet::<String>::new();
         loop {
             match decode(&buf) {
                 Ok(Decoded::Complete(frame, used)) => {
                     buf.drain(..used);
                     match frame {
                         Value::Simple(s) if s == "FULLSYNC-END" => {
-                            eprintln!("full sync: received {files} files");
+                            eprintln!("full sync: received {} files", seen.len());
                             return Ok(());
                         }
                         Value::Error(e) => {
@@ -1643,8 +1705,13 @@ mod replica {
                                     "unsafe file name in full sync",
                                 ));
                             }
-                            std::fs::write(dir.join(fname.as_ref()), bytes)?;
-                            files += 1;
+                            let mut opts = std::fs::OpenOptions::new();
+                            if seen.insert(fname.clone().into_owned()) {
+                                opts.write(true).create(true).truncate(true);
+                            } else {
+                                opts.append(true);
+                            }
+                            opts.open(dir.join(fname.as_ref()))?.write_all(bytes)?;
                         }
                         _ => {
                             return Err(std::io::Error::new(
@@ -1818,5 +1885,138 @@ mod replica {
             last_seq: *last_seq as u64,
             ops,
         })
+    }
+}
+
+#[cfg(test)]
+mod serve_tests {
+    use super::*;
+
+    /// Ephemeral server running `serve` with a per-connection MemKv.
+    fn spawn_server() -> std::net::SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { continue };
+                std::thread::spawn(move || {
+                    let store = MemKv::new();
+                    let _ = serve(
+                        stream,
+                        &store,
+                        &Arc::new(AtomicBool::new(false)),
+                        &Arc::new(AtomicBool::new(false)),
+                        &Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                        None,
+                        &Arc::new(ReplHub::default()),
+                        &Arc::new(AtomicBool::new(false)),
+                    );
+                });
+            }
+        });
+        addr
+    }
+
+    fn connect(addr: std::net::SocketAddr) -> TcpStream {
+        let s = TcpStream::connect(addr).expect("connect");
+        s.set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .expect("timeout");
+        s
+    }
+
+    /// Read frames until `n` complete values arrived (or the reader times out).
+    fn read_frames(stream: &mut TcpStream, n: usize) -> Vec<Value> {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut chunk = [0u8; 64 * 1024];
+        let mut frames = Vec::new();
+        while frames.len() < n {
+            match decode(&buf) {
+                Ok(Decoded::Complete(v, used)) => {
+                    buf.drain(..used);
+                    frames.push(v);
+                }
+                Ok(Decoded::NeedMore) => {
+                    let got = stream.read(&mut chunk).expect("read");
+                    assert!(got > 0, "server closed after {} frames", frames.len());
+                    buf.extend_from_slice(&chunk[..got]);
+                }
+                Err(e) => panic!("protocol error from server: {e:?}"),
+            }
+        }
+        frames
+    }
+
+    /// The DBSIZE-class fix for the wire: a 5-byte header declaring a 4GB
+    /// bulk must be refused at parse time, not buffered until OOM.
+    #[test]
+    fn oversized_bulk_declaration_is_refused_not_buffered() {
+        let mut s = connect(spawn_server());
+        s.write_all(b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$4294967296\r\n")
+            .expect("send");
+        let mut reply = Vec::new();
+        // Error reply, then the server closes the connection.
+        s.read_to_end(&mut reply).expect("read");
+        let text = String::from_utf8_lossy(&reply);
+        assert!(
+            text.starts_with("-ERR Protocol error"),
+            "expected protocol error, got: {text:?}"
+        );
+    }
+
+    #[test]
+    fn runaway_inline_line_is_refused() {
+        let mut s = connect(spawn_server());
+        // An inline command that never terminates must not accumulate
+        // forever; past MAX_INLINE_LEN the server errors and closes.
+        s.write_all(&vec![b'a'; MAX_INLINE_LEN + 1024]).expect("send");
+        let mut reply = Vec::new();
+        s.read_to_end(&mut reply).expect("read");
+        let text = String::from_utf8_lossy(&reply);
+        assert!(
+            text.starts_with("-ERR Protocol error"),
+            "expected protocol error, got: {text:?}"
+        );
+    }
+
+    /// A pipeline whose replies overflow OUT_FLUSH_THRESHOLD must flush
+    /// incrementally and stay correct — every reply arrives, in order, and
+    /// the connection remains usable.
+    #[test]
+    fn pipelined_replies_flush_incrementally_and_stay_correct() {
+        let mut s = connect(spawn_server());
+        let value = vec![b'v'; 64 * 1024];
+        let mut pipeline = Vec::new();
+        encode(
+            &Value::Array(Some(vec![
+                Value::Bulk(Some(b"SET".to_vec())),
+                Value::Bulk(Some(b"k".to_vec())),
+                Value::Bulk(Some(value.clone())),
+            ])),
+            &mut pipeline,
+        );
+        let gets = 40; // 40 * 64KB of replies ≈ 2.5 * OUT_FLUSH_THRESHOLD
+        for _ in 0..gets {
+            encode(
+                &Value::Array(Some(vec![
+                    Value::Bulk(Some(b"GET".to_vec())),
+                    Value::Bulk(Some(b"k".to_vec())),
+                ])),
+                &mut pipeline,
+            );
+        }
+        s.write_all(&pipeline).expect("send pipeline");
+        let frames = read_frames(&mut s, gets + 1);
+        assert_eq!(frames[0], Value::Simple("OK".into()));
+        for f in &frames[1..] {
+            assert_eq!(f, &Value::Bulk(Some(value.clone())), "GET reply corrupted");
+        }
+        // Connection still healthy after the flushed pipeline.
+        let mut ping = Vec::new();
+        encode(
+            &Value::Array(Some(vec![Value::Bulk(Some(b"PING".to_vec()))])),
+            &mut ping,
+        );
+        s.write_all(&ping).expect("send ping");
+        assert_eq!(read_frames(&mut s, 1)[0], Value::Simple("PONG".into()));
     }
 }

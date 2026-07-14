@@ -42,6 +42,14 @@ pub enum ProtocolError {
 
 const MAX_DEPTH: usize = 32;
 
+/// Largest accepted bulk-string payload (Redis `proto-max-bulk-len`).
+/// Declared lengths are rejected at header-parse time, BEFORE any payload
+/// arrives — otherwise a 5-byte `$4294967296\r\n` header commits the
+/// server to buffering 4GB from that connection.
+pub const MAX_BULK_LEN: usize = 512 * 1024 * 1024;
+/// Largest accepted array element count (Redis caps multibulk at 1M).
+pub const MAX_ARRAY_LEN: usize = 1024 * 1024;
+
 pub fn encode(value: &Value, out: &mut Vec<u8>) {
     match value {
         Value::Simple(s) => {
@@ -115,6 +123,9 @@ fn decode_at(input: &[u8], depth: usize) -> Result<Decoded, ProtocolError> {
                 return Ok(Decoded::Complete(Value::Bulk(None), header));
             }
             let len = usize::try_from(len).map_err(|_| ProtocolError::BadLength)?;
+            if len > MAX_BULK_LEN {
+                return Err(ProtocolError::BadLength);
+            }
             let total = header + len + 2;
             if input.len() < total {
                 return Ok(Decoded::NeedMore);
@@ -135,6 +146,9 @@ fn decode_at(input: &[u8], depth: usize) -> Result<Decoded, ProtocolError> {
                 return Ok(Decoded::Complete(Value::Array(None), offset));
             }
             let len = usize::try_from(len).map_err(|_| ProtocolError::BadLength)?;
+            if len > MAX_ARRAY_LEN {
+                return Err(ProtocolError::BadLength);
+            }
             let mut items = Vec::with_capacity(len.min(1024));
             for _ in 0..len {
                 match decode_at(&input[offset..], depth + 1)? {
@@ -238,6 +252,26 @@ mod tests {
         assert_eq!(decode(b":notanum\r\n"), Err(ProtocolError::BadInteger));
         assert_eq!(decode(b"$-2\r\n"), Err(ProtocolError::BadLength));
         assert_eq!(decode(b"$3\r\nabcXY"), Err(ProtocolError::MissingCrlf));
+    }
+
+    /// The caps must fire on the HEADER alone: waiting for payload bytes
+    /// would defeat their purpose (bounding what a connection can make the
+    /// server buffer).
+    #[test]
+    fn oversized_declared_lengths_are_rejected_from_the_header() {
+        // 4GB bulk declaration, zero payload bytes sent.
+        assert_eq!(decode(b"$4294967296\r\n"), Err(ProtocolError::BadLength));
+        // One past the cap fails; the cap itself parses (NeedMore: header
+        // accepted, awaiting payload).
+        let over = format!("${}\r\n", MAX_BULK_LEN + 1);
+        assert_eq!(decode(over.as_bytes()), Err(ProtocolError::BadLength));
+        let at = format!("${MAX_BULK_LEN}\r\n");
+        assert_eq!(decode(at.as_bytes()), Ok(Decoded::NeedMore));
+        // Same for array element counts.
+        let over = format!("*{}\r\n", MAX_ARRAY_LEN + 1);
+        assert_eq!(decode(over.as_bytes()), Err(ProtocolError::BadLength));
+        let at = format!("*{MAX_ARRAY_LEN}\r\n");
+        assert_eq!(decode(at.as_bytes()), Ok(Decoded::NeedMore));
     }
 
     #[test]
