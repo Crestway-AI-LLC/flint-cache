@@ -90,14 +90,24 @@ pub struct Dispatcher<'a> {
 }
 
 impl<'a> Dispatcher<'a> {
+    /// Default policy limits. The server binary always goes through
+    /// `with_max_value_bytes` (config plumbed from the CLI); this is the
+    /// test-and-embedding convenience.
+    #[allow(dead_code)]
     pub fn new(kv: &'a dyn Kv, clock: Clock) -> Self {
+        Self::with_max_value_bytes(kv, clock, flint_storage::DEFAULT_MAX_VALUE_BYTES)
+    }
+
+    /// `max_value_bytes` caps any single value's total payload (string
+    /// payload / collection fields+members+elements); 0 disables the cap.
+    pub fn with_max_value_bytes(kv: &'a dyn Kv, clock: Clock, max: u64) -> Self {
         Self {
             keyspace: Keyspace::new(kv, NS, clock),
-            strings: StringStore::new(kv, NS, clock),
-            hashes: HashStore::new(kv, NS, clock),
-            sets: SetStore::new(kv, NS, clock),
-            lists: ListStore::new(kv, NS, clock),
-            zsets: ZSetStore::new(kv, NS, clock),
+            strings: StringStore::with_max_value_bytes(kv, NS, clock, max),
+            hashes: HashStore::with_max_value_bytes(kv, NS, clock, max),
+            sets: SetStore::with_max_value_bytes(kv, NS, clock, max),
+            lists: ListStore::with_max_value_bytes(kv, NS, clock, max),
+            zsets: ZSetStore::with_max_value_bytes(kv, NS, clock, max),
             kv,
             clock,
         }
@@ -608,6 +618,9 @@ fn store_err(e: StoreError) -> Value {
         StoreError::WrongType => {
             err("WRONGTYPE Operation against a key holding the wrong kind of value")
         }
+        StoreError::ValueTooLarge => {
+            err("ERR value exceeds maximum allowed size (max-value-bytes)")
+        }
     }
 }
 
@@ -760,6 +773,29 @@ mod tests {
             Value::Simple("OK".into())
         );
         assert_eq!(call(&[b"DBSIZE"]), Value::Integer(2));
+    }
+
+    /// The max-value-bytes policy surfaces on the wire with one stable
+    /// error string, for strings and collections alike.
+    #[test]
+    fn max_value_bytes_policy_rejects_on_the_wire() {
+        let s = MemKv::new();
+        let d = Dispatcher::with_max_value_bytes(&s, system_clock, 16);
+        let call = |parts: &[&[u8]]| {
+            d.dispatch(&parts.iter().map(|p| p.to_vec()).collect::<Vec<_>>())
+        };
+        let too_large =
+            Value::Error("ERR value exceeds maximum allowed size (max-value-bytes)".into());
+        assert_eq!(call(&[b"SET", b"k", &[b'x'; 17]]), too_large);
+        assert_eq!(call(&[b"SET", b"k", b"small"]), Value::Simple("OK".into()));
+        assert_eq!(call(&[b"APPEND", b"k", &[b'y'; 12]]), too_large);
+        assert_eq!(
+            call(&[b"HSET", b"h", b"field", b"0123456789abcdef"]),
+            too_large
+        );
+        assert_eq!(call(&[b"RPUSH", b"l", &[b'e'; 17]]), too_large);
+        assert_eq!(call(&[b"SADD", b"s", &[b'm'; 17]]), too_large);
+        assert_eq!(call(&[b"ZADD", b"z", b"1", &[b'q'; 9]]), too_large);
     }
 
     #[test]

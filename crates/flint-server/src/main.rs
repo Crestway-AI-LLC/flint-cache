@@ -205,6 +205,25 @@ fn main() -> std::io::Result<()> {
         .unwrap_or(0);
     let hub = Arc::new(ReplHub::new(lag_soft, lag_hard, min_replicas));
 
+    // Max-value-size policy (Valkey's proto-max-bulk-len analog, extended
+    // to collections): writes that would grow any single value past this
+    // are rejected. On a beyond-RAM engine an uncapped value can exceed
+    // physical memory, making read-all commands (HGETALL, LRANGE 0 -1)
+    // un-serveable. 0 disables the cap.
+    let max_value_bytes: u64 = arg("--max-value-bytes")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(flint_storage::DEFAULT_MAX_VALUE_BYTES);
+    if max_value_bytes != flint_storage::DEFAULT_MAX_VALUE_BYTES {
+        eprintln!(
+            "max-value-bytes: {}",
+            if max_value_bytes == 0 {
+                "unlimited".into()
+            } else {
+                max_value_bytes.to_string()
+            }
+        );
+    }
+
     // Fast-path guard for per-slot ownership: only consult ownership (an
     // extra manifest read) when at least one migration override exists.
     // Set at boot from durable records and by FLINTSLOTMOVED; false is the
@@ -263,6 +282,7 @@ fn main() -> std::io::Result<()> {
                 rocks,
                 &hub,
                 &migration_active,
+                max_value_bytes,
             );
         });
     }
@@ -291,6 +311,7 @@ fn serve(
     rocks: Option<RocksHandle>,
     hub: &Arc<ReplHub>,
     migration_active: &Arc<AtomicBool>,
+    max_value_bytes: u64,
 ) -> std::io::Result<()> {
     let mut buf: Vec<u8> = Vec::with_capacity(16 * 1024);
     let mut chunk = [0u8; 16 * 1024];
@@ -331,6 +352,7 @@ fn serve(
                     &rocks,
                     hub,
                     migration_active,
+                    max_value_bytes,
                     &args,
                 );
                 encode(&reply, &mut out);
@@ -386,6 +408,7 @@ fn serve(
                         &rocks,
                         hub,
                         migration_active,
+                        max_value_bytes,
                         &args,
                     );
                     encode(&reply, &mut out);
@@ -434,6 +457,7 @@ fn execute(
     rocks: &Option<RocksHandle>,
     hub: &Arc<ReplHub>,
     migration_active: &Arc<AtomicBool>,
+    max_value_bytes: u64,
     args: &[Vec<u8>],
 ) -> Value {
     if args
@@ -587,9 +611,19 @@ fn execute(
     // suppressed.
     if ro {
         let ro_store = flint_storage::ReadOnlyKv(store);
-        Dispatcher::new(&ro_store, flint_storage::strings::system_clock).dispatch(args)
+        Dispatcher::with_max_value_bytes(
+            &ro_store,
+            flint_storage::strings::system_clock,
+            max_value_bytes,
+        )
+        .dispatch(args)
     } else {
-        Dispatcher::new(store, flint_storage::strings::system_clock).dispatch(args)
+        Dispatcher::with_max_value_bytes(
+            store,
+            flint_storage::strings::system_clock,
+            max_value_bytes,
+        )
+        .dispatch(args)
     }
 }
 
@@ -1910,6 +1944,7 @@ mod serve_tests {
                         None,
                         &Arc::new(ReplHub::default()),
                         &Arc::new(AtomicBool::new(false)),
+                        flint_storage::DEFAULT_MAX_VALUE_BYTES,
                     );
                 });
             }

@@ -14,14 +14,21 @@ pub struct ListStore<'a> {
     kv: &'a dyn Kv,
     ns: Vec<u8>,
     clock: Clock,
+    max_value_bytes: u64,
 }
 
 impl<'a> ListStore<'a> {
     pub fn new(kv: &'a dyn Kv, ns: &[u8], clock: Clock) -> Self {
+        Self::with_max_value_bytes(kv, ns, clock, crate::DEFAULT_MAX_VALUE_BYTES)
+    }
+
+    /// `max_value_bytes` = 0 disables the cap.
+    pub fn with_max_value_bytes(kv: &'a dyn Kv, ns: &[u8], clock: Clock, max: u64) -> Self {
         Self {
             kv,
             ns: ns.to_vec(),
             clock,
+            max_value_bytes: if max == 0 { u64::MAX } else { max },
         }
     }
 
@@ -81,6 +88,13 @@ impl<'a> ListStore<'a> {
             Some(m) => m,
             None => ListMeta::new(VersionGen::next((self.clock)())),
         };
+        // Check max-value-bytes before any write: a violation must leave
+        // the list untouched.
+        let bytes = meta.base.bytes + values.iter().map(|v| v.len() as u64).sum::<u64>();
+        if bytes > self.max_value_bytes {
+            return Err(StoreError::ValueTooLarge);
+        }
+        meta.base.bytes = bytes;
         for v in values {
             let idx = if left {
                 meta.head -= 1;
@@ -113,6 +127,9 @@ impl<'a> ListStore<'a> {
         let ek = self.elem_key(slot, key, meta.base.version, idx);
         let val = self.kv.get(&ek);
         self.kv.delete(&ek);
+        if let Some(v) = &val {
+            meta.base.bytes = meta.base.bytes.saturating_sub(v.len() as u64);
+        }
         self.write_meta(slot, key, &meta);
         Ok(val)
     }

@@ -49,20 +49,31 @@ pub enum StoreError {
     NotInteger,
     Overflow,
     WrongType,
+    /// The write would grow the value past the max-value-bytes policy
+    /// (Valkey's `checkStringLength` analog, extended to collections).
+    /// Enforced atomically: the store is untouched when this returns.
+    ValueTooLarge,
 }
 
 pub struct StringStore<'a> {
     kv: &'a dyn Kv,
     ns: Vec<u8>,
     clock: Clock,
+    max_value_bytes: u64,
 }
 
 impl<'a> StringStore<'a> {
     pub fn new(kv: &'a dyn Kv, ns: &[u8], clock: Clock) -> Self {
+        Self::with_max_value_bytes(kv, ns, clock, crate::DEFAULT_MAX_VALUE_BYTES)
+    }
+
+    /// `max_value_bytes` = 0 disables the cap.
+    pub fn with_max_value_bytes(kv: &'a dyn Kv, ns: &[u8], clock: Clock, max: u64) -> Self {
         Self {
             kv,
             ns: ns.to_vec(),
             clock,
+            max_value_bytes: if max == 0 { u64::MAX } else { max },
         }
     }
 
@@ -110,6 +121,9 @@ impl<'a> StringStore<'a> {
         value: &[u8],
         opts: SetOptions,
     ) -> Result<SetOutcome, StoreError> {
+        if value.len() as u64 > self.max_value_bytes {
+            return Err(StoreError::ValueTooLarge);
+        }
         let existing = self.read_live_header(slot, key);
         if (opts.nx && existing.is_some()) || (opts.xx && existing.is_none()) {
             return Ok(SetOutcome::Unchanged);
@@ -152,6 +166,11 @@ impl<'a> StringStore<'a> {
             None => (Vec::new(), 0),
             Some(m) => (m.payload, m.expire_ms),
         };
+        // The incremental hole SET's check can't close: repeated APPENDs
+        // must not build a value past the cap (Valkey checkStringLength).
+        if (payload.len() + suffix.len()) as u64 > self.max_value_bytes {
+            return Err(StoreError::ValueTooLarge);
+        }
         payload.extend_from_slice(suffix);
         let len = payload.len();
         let meta = StringMeta::new(payload, expire_ms);

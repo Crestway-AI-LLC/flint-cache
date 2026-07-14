@@ -18,14 +18,21 @@ pub struct HashStore<'a> {
     kv: &'a dyn Kv,
     ns: Vec<u8>,
     clock: Clock,
+    max_value_bytes: u64,
 }
 
 impl<'a> HashStore<'a> {
     pub fn new(kv: &'a dyn Kv, ns: &[u8], clock: Clock) -> Self {
+        Self::with_max_value_bytes(kv, ns, clock, crate::DEFAULT_MAX_VALUE_BYTES)
+    }
+
+    /// `max_value_bytes` = 0 disables the cap.
+    pub fn with_max_value_bytes(kv: &'a dyn Kv, ns: &[u8], clock: Clock, max: u64) -> Self {
         Self {
             kv,
             ns: ns.to_vec(),
             clock,
+            max_value_bytes: if max == 0 { u64::MAX } else { max },
         }
     }
 
@@ -66,15 +73,40 @@ impl<'a> HashStore<'a> {
             Some(m) => m,
             None => ComplexMeta::new(ValueType::Hash, VersionGen::next((self.clock)())),
         };
-        let mut added = 0u64;
+        // Duplicate fields in one call: last write wins (Redis semantics);
+        // dedupe first or the size/byte deltas would double-count.
+        let mut unique: std::collections::HashMap<&[u8], &[u8]> = Default::default();
         for (field, value) in pairs {
-            let sk = subkey_envelope(&self.ns, slot, key, meta.version, field);
-            if self.kv.get(&sk).is_none() {
-                added += 1;
+            unique.insert(field, value);
+        }
+        // Accounting pass before any write: a max-value-bytes violation
+        // must leave the hash untouched.
+        let mut added = 0u64;
+        let mut bytes = meta.bytes;
+        for (field, value) in &unique {
+            match self
+                .kv
+                .get(&subkey_envelope(&self.ns, slot, key, meta.version, field))
+            {
+                Some(old) => bytes = bytes.saturating_sub(old.len() as u64),
+                None => {
+                    added += 1;
+                    bytes += field.len() as u64;
+                }
             }
-            self.kv.put(&sk, value);
+            bytes += value.len() as u64;
+        }
+        if bytes > self.max_value_bytes {
+            return Err(StoreError::ValueTooLarge);
+        }
+        for (field, value) in &unique {
+            self.kv.put(
+                &subkey_envelope(&self.ns, slot, key, meta.version, field),
+                value,
+            );
         }
         meta.size += added as u32;
+        meta.bytes = bytes;
         self.kv.put(&self.meta_key(slot, key), &meta.encode());
         Ok(added)
     }
@@ -96,8 +128,13 @@ impl<'a> HashStore<'a> {
         let mut removed = 0u64;
         for field in fields {
             let sk = subkey_envelope(&self.ns, slot, key, meta.version, field);
-            if self.kv.delete(&sk) {
+            // Read before delete: the byte accounting needs the freed size.
+            if let Some(old) = self.kv.get(&sk) {
+                self.kv.delete(&sk);
                 removed += 1;
+                meta.bytes = meta
+                    .bytes
+                    .saturating_sub((field.len() + old.len()) as u64);
             }
         }
         meta.size = meta.size.saturating_sub(removed as u32);

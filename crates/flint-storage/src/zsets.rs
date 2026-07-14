@@ -16,14 +16,27 @@ pub struct ZSetStore<'a> {
     kv: &'a dyn Kv,
     ns: Vec<u8>,
     clock: Clock,
+    max_value_bytes: u64,
+}
+
+/// What one member contributes to the zset's byte total: the member
+/// payload plus its 8-byte score.
+fn member_cost(member: &[u8]) -> u64 {
+    member.len() as u64 + 8
 }
 
 impl<'a> ZSetStore<'a> {
     pub fn new(kv: &'a dyn Kv, ns: &[u8], clock: Clock) -> Self {
+        Self::with_max_value_bytes(kv, ns, clock, crate::DEFAULT_MAX_VALUE_BYTES)
+    }
+
+    /// `max_value_bytes` = 0 disables the cap.
+    pub fn with_max_value_bytes(kv: &'a dyn Kv, ns: &[u8], clock: Clock, max: u64) -> Self {
         Self {
             kv,
             ns: ns.to_vec(),
             clock,
+            max_value_bytes: if max == 0 { u64::MAX } else { max },
         }
     }
 
@@ -61,24 +74,43 @@ impl<'a> ZSetStore<'a> {
             Some(m) => m,
             None => ComplexMeta::new(ValueType::ZSet, VersionGen::next((self.clock)())),
         };
-        let mut added = 0u64;
+        // Duplicate members in one call: last score wins; dedupe before
+        // accounting. Score updates leave the byte total unchanged, so
+        // only genuinely-new members count toward max-value-bytes — and
+        // the check happens before any write.
+        let mut unique: std::collections::HashMap<&[u8], f64> = Default::default();
         for (score, member) in pairs {
+            unique.insert(member, *score);
+        }
+        let mut added = 0u64;
+        let mut bytes = meta.bytes;
+        for member in unique.keys() {
+            if self
+                .kv
+                .get(&self.member_key(slot, key, meta.version, member))
+                .is_none()
+            {
+                added += 1;
+                bytes += member_cost(member);
+            }
+        }
+        if bytes > self.max_value_bytes {
+            return Err(StoreError::ValueTooLarge);
+        }
+        for (member, score) in &unique {
             let mk = self.member_key(slot, key, meta.version, member);
-            match self.kv.get(&mk) {
-                Some(old) => {
-                    let old_score = f64::from_le_bytes(old.try_into().unwrap_or([0; 8]));
-                    if old_score != *score {
-                        self.kv.delete(&zscore_envelope(
-                            &self.ns,
-                            slot,
-                            key,
-                            meta.version,
-                            old_score,
-                            member,
-                        ));
-                    }
+            if let Some(old) = self.kv.get(&mk) {
+                let old_score = f64::from_le_bytes(old.try_into().unwrap_or([0; 8]));
+                if old_score != *score {
+                    self.kv.delete(&zscore_envelope(
+                        &self.ns,
+                        slot,
+                        key,
+                        meta.version,
+                        old_score,
+                        member,
+                    ));
                 }
-                None => added += 1,
             }
             self.kv.put(&mk, &score.to_le_bytes());
             self.kv.put(
@@ -87,6 +119,7 @@ impl<'a> ZSetStore<'a> {
             );
         }
         meta.size += added as u32;
+        meta.bytes = bytes;
         self.kv.put(&self.meta_key(slot, key), &meta.encode());
         Ok(added)
     }
@@ -120,6 +153,7 @@ impl<'a> ZSetStore<'a> {
                     member,
                 ));
                 removed += 1;
+                meta.bytes = meta.bytes.saturating_sub(member_cost(member));
             }
         }
         meta.size = meta.size.saturating_sub(removed as u32);

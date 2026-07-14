@@ -131,13 +131,23 @@ impl MetaHeader {
 }
 
 /// Metadata row value for complex types (hash/set/zset/list):
-/// `header(9B) | version(8B BE) | size(4B BE)`.
+/// `header(9B) | version(8B BE) | size(4B BE) | bytes(8B BE)`.
+///
+/// `bytes` is the cumulative payload size of the collection (fields +
+/// values / members / elements), maintained by every mutation. It exists
+/// so the max-value-bytes policy can reject a write in O(1) — on a
+/// beyond-RAM engine a collection can otherwise grow past physical memory
+/// and any read-all command (HGETALL, SMEMBERS, LRANGE) becomes an OOM.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ComplexMeta {
     pub header: MetaHeader,
     pub version: u64,
     pub size: u32,
+    pub bytes: u64,
 }
+
+/// Byte length of the complex-meta payload after the common header.
+const COMPLEX_TAIL_LEN: usize = 8 + 4 + 8;
 
 impl ComplexMeta {
     pub fn new(t: ValueType, version: u64) -> Self {
@@ -148,26 +158,29 @@ impl ComplexMeta {
             },
             version,
             size: 0,
+            bytes: 0,
         }
     }
 
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(HEADER_LEN + 12);
+        let mut out = Vec::with_capacity(HEADER_LEN + COMPLEX_TAIL_LEN);
         self.header.encode_into(&mut out);
         out.extend_from_slice(&self.version.to_be_bytes());
         out.extend_from_slice(&self.size.to_be_bytes());
+        out.extend_from_slice(&self.bytes.to_be_bytes());
         out
     }
 
     pub fn decode(row: &[u8]) -> Option<Self> {
         let header = MetaHeader::decode(row)?;
-        if row.len() < HEADER_LEN + 12 {
+        if row.len() < HEADER_LEN + COMPLEX_TAIL_LEN {
             return None;
         }
         Some(Self {
             header,
             version: u64::from_be_bytes(row[9..17].try_into().ok()?),
             size: u32::from_be_bytes(row[17..21].try_into().ok()?),
+            bytes: u64::from_be_bytes(row[21..29].try_into().ok()?),
         })
     }
 }
@@ -339,9 +352,11 @@ mod complex_tests {
     fn complex_meta_roundtrip() {
         let mut m = ComplexMeta::new(ValueType::Hash, 42);
         m.size = 7;
+        m.bytes = 123_456_789_012; // past u32: byte totals can exceed 4GB
         m.header.expire_ms = 123456;
         assert_eq!(ComplexMeta::decode(&m.encode()), Some(m));
         assert_eq!(ComplexMeta::decode(&[0u8; 20]), None);
+        assert_eq!(ComplexMeta::decode(&[0u8; 28]), None, "truncated tail");
     }
 
     #[test]
@@ -407,10 +422,10 @@ impl ListMeta {
 
     pub fn decode(row: &[u8]) -> Option<Self> {
         let base = ComplexMeta::decode(row)?;
-        if row.len() < HEADER_LEN + 12 + 16 {
+        if row.len() < HEADER_LEN + COMPLEX_TAIL_LEN + 16 {
             return None;
         }
-        let off = HEADER_LEN + 12;
+        let off = HEADER_LEN + COMPLEX_TAIL_LEN;
         Some(Self {
             base,
             head: unbias_index(u64::from_be_bytes(row[off..off + 8].try_into().ok()?)),

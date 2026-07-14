@@ -36,6 +36,16 @@ use std::collections::BTreeMap;
 use std::ops::Bound;
 use std::sync::RwLock;
 
+/// Default cap on any single value's total payload bytes — a string's
+/// payload, or a collection's cumulative fields/members/elements. Matches
+/// Valkey's `proto-max-bulk-len` default (512MB), which is what bounds
+/// value sizes there. On a beyond-RAM engine the cap matters more than in
+/// Valkey: a collection can exceed physical memory, at which point any
+/// read-all command (HGETALL, SMEMBERS, LRANGE 0 -1) is an OOM, so writes
+/// past the cap are rejected instead (`StoreError::ValueTooLarge`).
+/// Configure with `--max-value-bytes` (0 = unlimited).
+pub const DEFAULT_MAX_VALUE_BYTES: u64 = 512 * 1024 * 1024;
+
 /// Minimal flat key-value interface the engine sits on.
 ///
 /// Deliberately synchronous and byte-oriented; ordering (for prefix scans)

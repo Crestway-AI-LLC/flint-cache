@@ -10,14 +10,21 @@ pub struct SetStore<'a> {
     kv: &'a dyn Kv,
     ns: Vec<u8>,
     clock: Clock,
+    max_value_bytes: u64,
 }
 
 impl<'a> SetStore<'a> {
     pub fn new(kv: &'a dyn Kv, ns: &[u8], clock: Clock) -> Self {
+        Self::with_max_value_bytes(kv, ns, clock, crate::DEFAULT_MAX_VALUE_BYTES)
+    }
+
+    /// `max_value_bytes` = 0 disables the cap.
+    pub fn with_max_value_bytes(kv: &'a dyn Kv, ns: &[u8], clock: Clock, max: u64) -> Self {
         Self {
             kv,
             ns: ns.to_vec(),
             clock,
+            max_value_bytes: if max == 0 { u64::MAX } else { max },
         }
     }
 
@@ -50,17 +57,30 @@ impl<'a> SetStore<'a> {
             Some(m) => m,
             None => ComplexMeta::new(ValueType::Set, VersionGen::next((self.clock)())),
         };
-        let mut added = 0u64;
-        for m in members {
-            let sk = subkey_envelope(&self.ns, slot, key, meta.version, m);
-            if self.kv.get(&sk).is_none() {
-                added += 1;
-                self.kv.put(&sk, b"");
+        // Dedupe within the call, then account before any write: a
+        // max-value-bytes violation must leave the set untouched.
+        let mut fresh: Vec<&[u8]> = Vec::new();
+        {
+            let mut seen: std::collections::HashSet<&[u8]> = Default::default();
+            for m in members {
+                let sk = subkey_envelope(&self.ns, slot, key, meta.version, m);
+                if seen.insert(m) && self.kv.get(&sk).is_none() {
+                    fresh.push(m);
+                }
             }
         }
-        meta.size += added as u32;
+        let bytes = meta.bytes + fresh.iter().map(|m| m.len() as u64).sum::<u64>();
+        if bytes > self.max_value_bytes {
+            return Err(StoreError::ValueTooLarge);
+        }
+        for m in &fresh {
+            self.kv
+                .put(&subkey_envelope(&self.ns, slot, key, meta.version, m), b"");
+        }
+        meta.size += fresh.len() as u32;
+        meta.bytes = bytes;
         self.kv.put(&self.meta_key(slot, key), &meta.encode());
-        Ok(added)
+        Ok(fresh.len() as u64)
     }
 
     pub fn srem(&self, slot: u16, key: &[u8], members: &[Vec<u8>]) -> Result<u64, StoreError> {
@@ -74,6 +94,7 @@ impl<'a> SetStore<'a> {
                 .delete(&subkey_envelope(&self.ns, slot, key, meta.version, m))
             {
                 removed += 1;
+                meta.bytes = meta.bytes.saturating_sub(m.len() as u64);
             }
         }
         meta.size = meta.size.saturating_sub(removed as u32);
