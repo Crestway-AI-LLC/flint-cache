@@ -301,8 +301,13 @@ mod tests {
         let s = StringStore::new(&master, b"0", system_clock);
         let value = vec![b'x'; 1_000];
         for i in 0..200u32 {
-            s.set(1, format!("k{i:04}").as_bytes(), &value, SetOptions::default())
-                .expect("set");
+            s.set(
+                1,
+                format!("k{i:04}").as_bytes(),
+                &value,
+                SetOptions::default(),
+            )
+            .expect("set");
         }
 
         const BUDGET: usize = 8 * 1_000; // ~8 ops per poll against ~200 total

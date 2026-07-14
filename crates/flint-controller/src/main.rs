@@ -209,9 +209,15 @@ struct Config {
     max_stale: Duration,
     lease_ttl: u64,
     min_replicas: u32,
-    /// Positive enables the rebalance planner (dry-run: logs the plan). The
-    /// value is the deadband fraction — imbalance below it is left alone.
+    /// Positive enables the rebalance planner. The value is the deadband
+    /// fraction — imbalance below it is left alone. Without
+    /// --rebalance-execute the plan is only logged (dry run).
     rebalance_deadband: f64,
+    /// Execute planned moves (FLINTMIGRATEIN cutovers) instead of logging.
+    rebalance_execute: bool,
+    /// Executor pacing: at most this many slots ship per rebalance cycle;
+    /// convergence happens over several observe→plan→move cycles.
+    max_slots_per_cycle: usize,
     /// Nodes to run MIGRATION RECOVERY over (separate from failover, since
     /// these are independent masters, not a pair). On restart the controller
     /// observes their in-flight migration records and resumes or rolls back.
@@ -278,18 +284,22 @@ impl Pair {
     }
 
     /// Observe this pair's load for the rebalance planner: the reachable
-    /// master's key count (DBSIZE). None if no master answers.
-    fn observe_fill(&self) -> Option<planner::PairLoad> {
+    /// master's key count (DBSIZE) plus that master's address (the endpoint
+    /// the executor ships slots from/to). None if no master answers.
+    fn observe_fill(&self) -> Option<(planner::PairLoad, String)> {
         for addr in &self.nodes {
             let n = observe(addr);
             if n.reachable
                 && n.role == "master"
                 && let Ok(Value::Integer(fill)) = call(addr, &[b"DBSIZE"])
             {
-                return Some(planner::PairLoad {
-                    label: self.label.clone(),
-                    fill: fill.max(0) as u64,
-                });
+                return Some((
+                    planner::PairLoad {
+                        label: self.label.clone(),
+                        fill: fill.max(0) as u64,
+                    },
+                    addr.clone(),
+                ));
             }
         }
         None
@@ -533,6 +543,8 @@ fn main() {
         rebalance_deadband: arg("--rebalance-deadband")
             .and_then(|v| v.parse().ok())
             .unwrap_or(0.0),
+        rebalance_execute: std::env::args().any(|a| a == "--rebalance-execute"),
+        max_slots_per_cycle: arg_or("--max-slots-per-cycle", 4),
         recover_nodes: arg("--recover-nodes")
             .map(|s| s.split(',').map(String::from).collect())
             .unwrap_or_default(),
@@ -571,29 +583,40 @@ fn main() {
             recover_migrations(&cfg);
         }
 
-        // Rebalance planning (dry-run): every 5s, observe each pair's fill
-        // and log the deterministic-hysteresis plan. Execution via
-        // FLINTMIGRATEIN, gated by the safety rules, is a follow-on.
+        // Rebalance: every 5s, observe each pair's fill and derive the
+        // deterministic-hysteresis plan. Dry-run logs it; with
+        // --rebalance-execute, the FIRST move of the plan is executed this
+        // cycle (bounded slots, serial cutovers) and the next cycle re-plans
+        // from fresh fills — convergence by repeated small steps, with the
+        // deadband stopping the loop at balance.
         if cfg.rebalance_deadband > 0.0 && last_rebalance.elapsed() > Duration::from_secs(5) {
             last_rebalance = Instant::now();
-            let loads: Vec<planner::PairLoad> =
+            let observed: Vec<(planner::PairLoad, String)> =
                 pairs.iter().filter_map(|p| p.observe_fill()).collect();
-            if loads.len() >= 2 {
+            if observed.len() >= 2 {
+                let loads: Vec<planner::PairLoad> =
+                    observed.iter().map(|(l, _)| l.clone()).collect();
+                let masters: std::collections::HashMap<String, String> = observed
+                    .iter()
+                    .map(|(l, m)| (l.label.clone(), m.clone()))
+                    .collect();
                 let fills: Vec<(String, u64)> =
                     loads.iter().map(|l| (l.label.clone(), l.fill)).collect();
                 let plan = planner::plan_moves(&loads, cfg.rebalance_deadband);
-                if plan.is_empty() {
-                    eprintln!(
+                match plan.first() {
+                    None => eprintln!(
                         "[{}] rebalance: balanced within deadband {:.2} — fills={fills:?}",
                         cfg.id, cfg.rebalance_deadband
-                    );
-                } else {
-                    for m in &plan {
-                        eprintln!(
-                            "[{}] rebalance PLAN (dry-run): move ~{} load from {} to {} — fills={fills:?}",
-                            cfg.id, m.approx, m.from, m.to
-                        );
+                    ),
+                    Some(_) if !cfg.rebalance_execute => {
+                        for m in &plan {
+                            eprintln!(
+                                "[{}] rebalance PLAN (dry-run): move ~{} load from {} to {} — fills={fills:?}",
+                                cfg.id, m.approx, m.from, m.to
+                            );
+                        }
                     }
+                    Some(m) => execute_move(&cfg, m, &masters, &fills),
                 }
             }
         }
@@ -636,6 +659,94 @@ fn call_slow(addr: &str, args: &[&[u8]], timeout: Duration) -> std::io::Result<V
                     std::io::ErrorKind::InvalidData,
                     format!("{e:?}"),
                 ));
+            }
+        }
+    }
+}
+
+/// True if `addr` reports any in-flight migration record. Errors count as
+/// busy — when in doubt, don't start another move.
+fn has_inflight_migration(addr: &str) -> bool {
+    match call(addr, &[b"FLINTMIGRATIONS"]) {
+        Ok(Value::Array(Some(rows))) => !rows.is_empty(),
+        _ => true,
+    }
+}
+
+/// Per-slot key counts from a master (FLINTSLOTSTATS: "slot count" bulks).
+fn slot_stats(addr: &str) -> Vec<(u16, u64)> {
+    let Ok(Value::Array(Some(rows))) = call(addr, &[b"FLINTSLOTSTATS"]) else {
+        return Vec::new();
+    };
+    rows.into_iter()
+        .filter_map(|r| {
+            let Value::Bulk(Some(b)) = r else {
+                return None;
+            };
+            let line = String::from_utf8_lossy(&b).into_owned();
+            let (slot, n) = line.split_once(' ')?;
+            Some((slot.parse().ok()?, n.parse().ok()?))
+        })
+        .collect()
+}
+
+/// Execute ONE planned pair-level move: pick the donor slots (deterministic,
+/// bounded by max_slots_per_cycle) and drive serial FLINTMIGRATEIN cutovers
+/// on the destination master. Gates: skip the cycle if either side already
+/// has an in-flight migration (recovery or a concurrent controller owns it —
+/// the fenced records make duplicates collapse, but not-starting is cheaper
+/// than being fenced). Serial one-move-per-cycle IS the pacing: the next
+/// cycle re-observes fills and re-plans, and the deadband ends the loop.
+fn execute_move(
+    cfg: &Config,
+    m: &planner::Move,
+    masters: &std::collections::HashMap<String, String>,
+    fills: &[(String, u64)],
+) {
+    let (Some(src), Some(dst)) = (masters.get(&m.from), masters.get(&m.to)) else {
+        return;
+    };
+    if has_inflight_migration(src) || has_inflight_migration(dst) {
+        eprintln!(
+            "[{}] rebalance: move {}->{} deferred — a migration is already in flight",
+            cfg.id, m.from, m.to
+        );
+        return;
+    }
+    let stats = slot_stats(src);
+    let slots = planner::select_slots(&stats, m.approx, cfg.max_slots_per_cycle);
+    if slots.is_empty() {
+        return;
+    }
+    eprintln!(
+        "[{}] rebalance EXECUTE: ~{} load {}({src}) -> {}({dst}), slots {slots:?} — fills={fills:?}",
+        cfg.id, m.approx, m.from, m.to
+    );
+    for slot in slots {
+        match call_slow(
+            dst,
+            &[
+                b"FLINTMIGRATEIN",
+                src.as_bytes(),
+                slot.to_string().as_bytes(),
+                dst.as_bytes(),
+            ],
+            Duration::from_secs(120),
+        ) {
+            Ok(Value::Simple(s)) => {
+                eprintln!(
+                    "[{}] rebalance: slot {slot} {}->{}: {s}",
+                    cfg.id, m.from, m.to
+                );
+            }
+            other => {
+                // Stop the cycle; recovery reconciles any half-done state and
+                // the next cycle re-plans from observed reality.
+                eprintln!(
+                    "[{}] rebalance: slot {slot} move failed ({other:?}) — yielding to recovery",
+                    cfg.id
+                );
+                return;
             }
         }
     }

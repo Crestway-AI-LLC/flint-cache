@@ -132,9 +132,7 @@ impl<'a> HashStore<'a> {
             if let Some(old) = self.kv.get(&sk) {
                 self.kv.delete(&sk);
                 removed += 1;
-                meta.bytes = meta
-                    .bytes
-                    .saturating_sub((field.len() + old.len()) as u64);
+                meta.bytes = meta.bytes.saturating_sub((field.len() + old.len()) as u64);
             }
         }
         meta.size = meta.size.saturating_sub(removed as u32);

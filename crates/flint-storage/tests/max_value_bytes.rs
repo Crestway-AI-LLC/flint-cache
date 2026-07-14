@@ -25,7 +25,12 @@ fn string_set_rejects_past_cap() {
     let kv = MemKv::new();
     let s = StringStore::with_max_value_bytes(&kv, b"t", system_clock, CAP);
     assert_eq!(
-        s.set(1, b"k", &vec![b'x'; CAP as usize + 1], SetOptions::default()),
+        s.set(
+            1,
+            b"k",
+            &vec![b'x'; CAP as usize + 1],
+            SetOptions::default()
+        ),
         Err(StoreError::ValueTooLarge)
     );
     assert_eq!(s.get(1, b"k"), Ok(None), "rejected SET must not write");
@@ -163,13 +168,8 @@ fn zero_disables_the_cap() {
     let kv = MemKv::new();
     let s = StringStore::with_max_value_bytes(&kv, b"t", system_clock, 0);
     assert!(
-        s.set(
-            1,
-            b"k",
-            &vec![b'x'; 2 * 1024 * 1024],
-            SetOptions::default()
-        )
-        .is_ok(),
+        s.set(1, b"k", &vec![b'x'; 2 * 1024 * 1024], SetOptions::default())
+            .is_ok(),
         "max = 0 must mean unlimited"
     );
 }

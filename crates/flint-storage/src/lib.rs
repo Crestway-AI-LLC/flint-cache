@@ -296,7 +296,11 @@ mod tests {
             true
         });
         assert_eq!(visited, 3_000);
-        assert_eq!(kv.count_prefix(b"p|"), 0, "sweep-style scan drained the range");
+        assert_eq!(
+            kv.count_prefix(b"p|"),
+            0,
+            "sweep-style scan drained the range"
+        );
         assert_eq!(kv.get(b"q"), Some(b"other".to_vec()));
     }
 

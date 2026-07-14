@@ -812,9 +812,8 @@ mod tests {
     fn dbsize_streams_and_skips_expired() {
         let s = NoMaterializeKv(MemKv::new());
         let d = Dispatcher::new(&s, system_clock);
-        let call = |parts: &[&[u8]]| {
-            d.dispatch(&parts.iter().map(|p| p.to_vec()).collect::<Vec<_>>())
-        };
+        let call =
+            |parts: &[&[u8]]| d.dispatch(&parts.iter().map(|p| p.to_vec()).collect::<Vec<_>>());
         assert_eq!(call(&[b"DBSIZE"]), Value::Integer(0));
         assert_eq!(call(&[b"SET", b"k1", b"v"]), Value::Simple("OK".into()));
         assert_eq!(call(&[b"SET", b"k2", b"v"]), Value::Simple("OK".into()));
@@ -839,9 +838,8 @@ mod tests {
                 ..Default::default()
             },
         );
-        let call = |parts: &[&[u8]]| {
-            d.dispatch(&parts.iter().map(|p| p.to_vec()).collect::<Vec<_>>())
-        };
+        let call =
+            |parts: &[&[u8]]| d.dispatch(&parts.iter().map(|p| p.to_vec()).collect::<Vec<_>>());
         let too_large =
             Value::Error("ERR value exceeds maximum allowed size (max-value-bytes)".into());
         assert_eq!(call(&[b"SET", b"k", &[b'x'; 17]]), too_large);
@@ -864,9 +862,8 @@ mod tests {
     fn key_size_ceiling_is_always_enforced() {
         let s = MemKv::new();
         let d = Dispatcher::new(&s, system_clock);
-        let call = |parts: &[&[u8]]| {
-            d.dispatch(&parts.iter().map(|p| p.to_vec()).collect::<Vec<_>>())
-        };
+        let call =
+            |parts: &[&[u8]]| d.dispatch(&parts.iter().map(|p| p.to_vec()).collect::<Vec<_>>());
         let too_long = Value::Error("ERR key exceeds maximum allowed size (max-key-bytes)".into());
         let over = vec![b'k'; 65_536];
         let at = vec![b'k'; 65_535];
@@ -896,12 +893,14 @@ mod tests {
                 ..Default::default()
             },
         );
-        let call = |parts: &[&[u8]]| {
-            d.dispatch(&parts.iter().map(|p| p.to_vec()).collect::<Vec<_>>())
-        };
+        let call =
+            |parts: &[&[u8]]| d.dispatch(&parts.iter().map(|p| p.to_vec()).collect::<Vec<_>>());
         let too_long = Value::Error("ERR key exceeds maximum allowed size (max-key-bytes)".into());
         assert_eq!(call(&[b"SET", b"ninechars", b"v"]), too_long);
-        assert_eq!(call(&[b"SET", b"eightchr", b"v"]), Value::Simple("OK".into()));
+        assert_eq!(
+            call(&[b"SET", b"eightchr", b"v"]),
+            Value::Simple("OK".into())
+        );
 
         // A configured value above the ceiling clamps back down to it.
         let raised = Dispatcher::with_limits(

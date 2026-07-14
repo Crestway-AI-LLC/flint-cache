@@ -339,7 +339,10 @@ fn serve(
             if first != b'*' {
                 let Some(nl) = pending.iter().position(|&b| b == b'\n') else {
                     if pending.len() > MAX_INLINE_LEN {
-                        encode(&Value::Error("ERR Protocol error: too big inline request".into()), &mut out);
+                        encode(
+                            &Value::Error("ERR Protocol error: too big inline request".into()),
+                            &mut out,
+                        );
                         stream.write_all(&out)?;
                         return Ok(());
                     }
@@ -571,6 +574,15 @@ fn execute(
     {
         return flintmigrations(rocks);
     }
+    // FLINTSLOTSTATS: per-slot live-key counts ("slot count" bulk per
+    // non-empty slot) — the input the rebalance executor's slot selection
+    // needs. One streaming pass over the metadata CF, bounded memory.
+    if args
+        .first()
+        .is_some_and(|n| n.eq_ignore_ascii_case(b"FLINTSLOTSTATS"))
+    {
+        return flintslotstats(store);
+    }
     // FLINTSLOTABORT <slot>: clear an IN-FLIGHT record (rollback an Importing
     // or unfreeze a Migrating). Refuses to touch a terminal Moved override —
     // that is settled ownership, undone only by moving the slot back.
@@ -626,8 +638,7 @@ fn execute(
         Dispatcher::with_limits(&ro_store, flint_storage::strings::system_clock, limits)
             .dispatch(args)
     } else {
-        Dispatcher::with_limits(store, flint_storage::strings::system_clock, limits)
-            .dispatch(args)
+        Dispatcher::with_limits(store, flint_storage::strings::system_clock, limits).dispatch(args)
     }
 }
 
@@ -944,6 +955,21 @@ fn flintmigrateout(
         return stream.write_all(&out);
     };
     let ns: &[u8] = b"0";
+    // Refuse to ship a slot this node does not own: after a cutover the
+    // rows here (if any) are purge-pending ghosts, and re-exporting them
+    // would hand out data whose ownership already changed hands.
+    {
+        use flint_storage::manifest::{self, MigrationPhase};
+        if let Some(rec) = manifest::read_migration(kv.as_ref(), ns, slot)
+            && matches!(rec.phase, MigrationPhase::Moved | MigrationPhase::Importing)
+        {
+            encode(
+                &Value::Error(format!("ERR slot {slot} not owned (phase {:?})", rec.phase)),
+                &mut out,
+            );
+            return stream.write_all(&out);
+        }
+    }
     let prefixes: Vec<Vec<u8>> = [Cf::Metadata, Cf::Subkey, Cf::ZScore]
         .iter()
         .map(|&cf| slot_prefix(cf, ns, slot))
@@ -1346,10 +1372,43 @@ fn flintslotmoved(
     match set_slot_phase(kv.as_ref(), slot, MigrationPhase::Moved, peer) {
         Ok(()) => {
             migration_active.store(true, Ordering::Relaxed);
-            Value::Simple(format!("OK slot {slot} moved to {peer}"))
+            // Purge the disowned slot's rows (all CFs): the destination owns
+            // the data now, this copy is dead weight that would keep skewing
+            // DBSIZE/fill metrics — the rebalance planner would chase it
+            // forever (found by the execute drill). Ordering is safe: the
+            // durable Moved record lands FIRST, so clients already get
+            // -MOVED; a crash mid-purge leaves invisible orphans that a
+            // retried FLINTSLOTMOVED (idempotent at a bumped epoch) or the
+            // GC can finish clearing. The deletes ride the WAL, so replicas
+            // drop the slot too.
+            let purged = purge_slot_rows(kv.as_ref(), slot);
+            Value::Simple(format!(
+                "OK slot {slot} moved to {peer} ({purged} rows purged)"
+            ))
         }
         Err(e) => Value::Error(format!("ERR slot move fenced: {e:?}")),
     }
+}
+
+/// Delete every row of `slot` across all CFs. Streaming collect-then-delete
+/// (v0; a real range-delete is an engine refinement). Returns rows removed.
+#[cfg(feature = "rocks")]
+fn purge_slot_rows(kv: &RocksKv, slot: u16) -> usize {
+    use flint_storage::encoding::{Cf, slot_prefix};
+    let mut purged = 0;
+    for cf in [Cf::Metadata, Cf::Subkey, Cf::ZScore] {
+        let prefix = slot_prefix(cf, b"0", slot);
+        let mut keys: Vec<Vec<u8>> = Vec::new();
+        kv.for_each_prefix(&prefix, &mut |k, _| {
+            keys.push(k.to_vec());
+            true
+        });
+        for k in &keys {
+            kv.delete(k);
+        }
+        purged += keys.len();
+    }
+    purged
 }
 
 #[cfg(not(feature = "rocks"))]
@@ -1397,6 +1456,48 @@ fn flintslotfreeze(
     _args: &[Vec<u8>],
 ) -> Value {
     Value::Error("ERR FLINTSLOTFREEZE requires a build with --features rocks".into())
+}
+
+/// FLINTSLOTSTATS: count live metadata rows per slot in one streaming pass
+/// over the 'M' CF (subkey/zscore rows belong to a key counted via its meta
+/// row, so 'M' alone is the key count). Envelope: `M | ns_len | ns |
+/// slot(2 BE) | user_key` — the slot is the two bytes after the ns. Engine-
+/// generic (works on mem and rocks); memory bounded at one u32 per slot.
+/// v0 counts expired-but-unswept rows too — fill approximation, not billing.
+fn flintslotstats(store: &dyn Kv) -> Value {
+    const NS: &[u8] = b"0";
+    let mut prefix = vec![b'M', NS.len() as u8];
+    prefix.extend_from_slice(NS);
+    let slot_off = prefix.len();
+    let mut counts = vec![0u32; 16384];
+    store.for_each_prefix(&prefix, &mut |k, _| {
+        if let Some(raw) = k.get(slot_off..slot_off + 2) {
+            let slot = u16::from_be_bytes([raw[0], raw[1]]) as usize;
+            if slot < counts.len() {
+                counts[slot] += 1;
+            }
+        }
+        true
+    });
+    // A slot this node has disowned (Moved) or is still importing must not
+    // be offered to the rebalance planner: its rows are either purge-pending
+    // ghosts or an incomplete copy — moving them again would ship data this
+    // node does not own (found by the execute drill: pre-purge ghost rows
+    // kept the planner chasing the same slots forever).
+    use flint_storage::manifest::{MigrationPhase, scan_migrations};
+    for rec in scan_migrations(store, NS) {
+        if matches!(rec.phase, MigrationPhase::Moved | MigrationPhase::Importing) {
+            counts[rec.slot as usize] = 0;
+        }
+    }
+    Value::Array(Some(
+        counts
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| **n > 0)
+            .map(|(slot, n)| Value::Bulk(Some(format!("{slot} {n}").into_bytes())))
+            .collect(),
+    ))
 }
 
 /// FLINTMIGRATIONS: the in-flight (Importing/Migrating) records on this node,
@@ -2007,7 +2108,8 @@ mod serve_tests {
         let mut s = connect(spawn_server());
         // An inline command that never terminates must not accumulate
         // forever; past MAX_INLINE_LEN the server errors and closes.
-        s.write_all(&vec![b'a'; MAX_INLINE_LEN + 1024]).expect("send");
+        s.write_all(&vec![b'a'; MAX_INLINE_LEN + 1024])
+            .expect("send");
         let mut reply = Vec::new();
         s.read_to_end(&mut reply).expect("read");
         let text = String::from_utf8_lossy(&reply);

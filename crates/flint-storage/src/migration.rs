@@ -82,10 +82,7 @@ mod tests {
     const NS: &[u8] = b"0";
 
     fn count_rows(kv: &dyn Kv) -> usize {
-        ALL_CFS
-            .iter()
-            .map(|&cf| kv.count_prefix(&[cf as u8]))
-            .sum()
+        ALL_CFS.iter().map(|&cf| kv.count_prefix(&[cf as u8])).sum()
     }
 
     /// The load-bearing test: moving a subset of slots to a new store must
