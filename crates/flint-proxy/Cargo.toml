@@ -1,0 +1,14 @@
+[package]
+name = "flint-proxy"
+description = "v0 routing-plane proxy: one client endpoint, slot routing to the owning master, transparent -MOVED/-TRYAGAIN absorption and master rediscovery (TLS/auth/tenancy/scatter-gather are follow-ons)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+flint-resp = { path = "../flint-resp" }
+flint-slot = { path = "../flint-slot" }
+
+[lints]
+workspace = true
