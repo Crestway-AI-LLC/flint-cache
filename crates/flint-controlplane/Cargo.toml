@@ -1,0 +1,13 @@
+[package]
+name = "flint-controlplane"
+description = "v1 global control plane: durable tenant registry (tokens, namespaces, shuffle-shard proxy subsets) + group topology, versioned snapshot push to proxies with ACK (single node; openraft HA is the follow-on)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+flint-resp = { path = "../flint-resp" }
+
+[lints]
+workspace = true

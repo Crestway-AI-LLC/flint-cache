@@ -58,37 +58,51 @@ fn arg(name: &str) -> Option<String> {
     std::env::args().skip_while(|a| a != name).nth(1)
 }
 
-/// Shared cluster view: the pair list (static in v0), each pair's current
-/// master (rediscovered on failure), and the moved-slot override cache.
-struct Topology {
+/// The routing table proper: pairs and their current masters, replaced
+/// atomically when the control plane pushes a new topology.
+#[derive(Default)]
+struct Routing {
     /// Node addresses of each pair; index = pair id.
     pairs: Vec<Vec<String>>,
     /// Current master address per pair (None until discovered).
-    masters: RwLock<Vec<Option<String>>>,
+    masters: Vec<Option<String>>,
+}
+
+/// Shared cluster view: the routing table (static from --pairs, or pushed
+/// by the control plane), the moved-slot override cache, and the tenant
+/// table (static from --tenants, or pushed — filtered to THIS proxy's
+/// assigned tenants, the sub-group boundary).
+struct Topology {
+    routing: RwLock<Routing>,
     /// (namespace, slot) -> owner address, learned from -MOVED redirects.
     /// Keyed per namespace because migrations move one tenant's slot rows:
     /// tenant A's redirect must not reroute tenant B. Overrides the range
     /// default; lost entries are relearned from the default owner.
     moved: RwLock<HashMap<(Vec<u8>, u16), String>>,
-    /// token -> namespace. Empty = open mode (no auth, default namespace).
-    tenants: HashMap<String, Vec<u8>>,
+    /// token -> namespace.
+    tenants: RwLock<HashMap<String, Vec<u8>>>,
+    /// True only for a standalone proxy with no tenants configured: no
+    /// auth, default namespace. A control-plane-fed proxy is never open —
+    /// before its first snapshot it simply has no tenants yet.
+    open_mode: bool,
 }
 
 impl Topology {
-    /// Range-based default owner: pair i serves slots [i*N/16384 ..).
-    fn default_pair(&self, slot: u16) -> usize {
-        (slot as usize * self.pairs.len()) / 16384
-    }
-
     /// The address a command for `slot` in `ns` should go to right now.
+    /// Range-based default owner (pair i serves slots [i*N/16384 ..)),
+    /// overridden per (ns, slot) by the moved cache.
     fn route(&self, ns: &[u8], slot: u16) -> Option<String> {
         if let Ok(moved) = self.moved.read()
             && let Some(addr) = moved.get(&(ns.to_vec(), slot))
         {
             return Some(addr.clone());
         }
-        let pair = self.default_pair(slot);
-        self.masters.read().ok()?.get(pair)?.clone()
+        let routing = self.routing.read().ok()?;
+        if routing.pairs.is_empty() {
+            return None;
+        }
+        let pair = (slot as usize * routing.pairs.len()) / 16384;
+        routing.masters.get(pair)?.clone()
     }
 
     fn learn_moved(&self, ns: &[u8], slot: u16, addr: &str) {
@@ -97,40 +111,87 @@ impl Topology {
         }
     }
 
+    fn lookup_token(&self, token: &str) -> Option<Vec<u8>> {
+        self.tenants.read().ok()?.get(token).cloned()
+    }
+
     /// A backend at `addr` failed: forget cached state that points at it and
     /// rediscover the master of every pair that lists it. (Moved entries are
     /// kept — the new master of that pair holds the moved slots too; only
     /// the address may change, which the next -MOVED corrects.)
     fn rediscover_for(&self, addr: &str) {
-        for (i, nodes) in self.pairs.iter().enumerate() {
-            let involves = nodes.iter().any(|n| n == addr)
-                || self
-                    .masters
-                    .read()
-                    .ok()
-                    .and_then(|m| m.get(i).cloned().flatten())
-                    .is_some_and(|m| m == addr);
-            if involves {
-                let found = discover_master(nodes);
-                if let Ok(mut masters) = self.masters.write()
-                    && let Some(slot) = masters.get_mut(i)
-                {
-                    *slot = found.clone();
-                }
-                // Moved entries pointing at the dead address migrate to the
-                // pair's new master (slot data survives failover via the
-                // pair's replica).
-                if let Some(new_master) = found
-                    && new_master != addr
-                    && let Ok(mut moved) = self.moved.write()
-                {
-                    for v in moved.values_mut() {
-                        if v == addr {
-                            *v = new_master.clone();
-                        }
+        let pairs: Vec<(usize, Vec<String>)> = match self.routing.read() {
+            Ok(r) => r
+                .pairs
+                .iter()
+                .enumerate()
+                .filter(|(i, nodes)| {
+                    nodes.iter().any(|n| n == addr)
+                        || r.masters
+                            .get(*i)
+                            .and_then(|m| m.as_ref())
+                            .is_some_and(|m| m == addr)
+                })
+                .map(|(i, nodes)| (i, nodes.clone()))
+                .collect(),
+            Err(_) => return,
+        };
+        for (i, nodes) in pairs {
+            let found = discover_master(&nodes);
+            if let Ok(mut routing) = self.routing.write()
+                && let Some(slot) = routing.masters.get_mut(i)
+            {
+                *slot = found.clone();
+            }
+            // Moved entries pointing at the dead address migrate to the
+            // pair's new master (slot data survives failover via the
+            // pair's replica).
+            if let Some(new_master) = found
+                && new_master != addr
+                && let Ok(mut moved) = self.moved.write()
+            {
+                for v in moved.values_mut() {
+                    if v == addr {
+                        *v = new_master.clone();
                     }
                 }
             }
+        }
+    }
+
+    /// Apply a control-plane snapshot: replace the tenant table, and — only
+    /// if the pair list actually changed — rebuild the routing table
+    /// (discovering masters), preserving failover-chased masters otherwise.
+    fn apply_snapshot(&self, pairs_spec: &str, tenants_spec: &str) {
+        let new_pairs: Vec<Vec<String>> = if pairs_spec.is_empty() {
+            Vec::new()
+        } else {
+            pairs_spec
+                .split(';')
+                .map(|p| p.split(',').map(String::from).collect())
+                .collect()
+        };
+        let rebuild = match self.routing.read() {
+            Ok(r) => r.pairs != new_pairs,
+            Err(_) => return,
+        };
+        if rebuild {
+            let masters: Vec<Option<String>> =
+                new_pairs.iter().map(|n| discover_master(n)).collect();
+            if let Ok(mut routing) = self.routing.write() {
+                routing.pairs = new_pairs;
+                routing.masters = masters;
+            }
+        }
+        let new_tenants: HashMap<String, Vec<u8>> = tenants_spec
+            .split(',')
+            .filter_map(|pair| {
+                let (token, ns) = pair.split_once('=')?;
+                Some((token.to_string(), ns.as_bytes().to_vec()))
+            })
+            .collect();
+        if let Ok(mut tenants) = self.tenants.write() {
+            *tenants = new_tenants;
         }
     }
 }
@@ -287,26 +348,27 @@ fn forward(
         let target = match slot {
             Some(s) => topo.route(ns, s),
             None => topo
-                .masters
+                .routing
                 .read()
                 .ok()
-                .and_then(|m| m.first().cloned().flatten()),
+                .and_then(|r| r.masters.first().cloned().flatten()),
         };
         let Some(addr) = target else {
             if Instant::now() > deadline {
                 return Value::Error("ERR no reachable master for this slot".into());
             }
             // Nothing known yet (e.g. mid-failover): rediscover everything.
-            for nodes in &topo.pairs {
+            let pairs: Vec<Vec<String>> = topo
+                .routing
+                .read()
+                .map(|r| r.pairs.clone())
+                .unwrap_or_default();
+            for (i, nodes) in pairs.iter().enumerate() {
                 let found = discover_master(nodes);
-                if let Ok(mut masters) = topo.masters.write() {
-                    for (i, p) in topo.pairs.iter().enumerate() {
-                        if std::ptr::eq(p, nodes)
-                            && let Some(m) = masters.get_mut(i)
-                        {
-                            *m = found.clone();
-                        }
-                    }
+                if let Ok(mut routing) = topo.routing.write()
+                    && let Some(m) = routing.masters.get_mut(i)
+                {
+                    *m = found;
                 }
             }
             std::thread::sleep(Duration::from_millis(100));
@@ -360,14 +422,12 @@ fn fan_out(
     frame: &[u8],
     combine: impl Fn(Vec<Value>) -> Value,
 ) -> Value {
+    let masters: Vec<Option<String>> = match topo.routing.read() {
+        Ok(r) => r.masters.clone(),
+        Err(_) => return Value::Error("ERR topology lock".into()),
+    };
     let mut replies = Vec::new();
-    for i in 0..topo.pairs.len() {
-        let addr = {
-            let Ok(masters) = topo.masters.read() else {
-                return Value::Error("ERR topology lock".into());
-            };
-            masters.get(i).cloned().flatten()
-        };
+    for addr in masters {
         let Some(addr) = addr else {
             return Value::Error("ERR a pair has no reachable master".into());
         };
@@ -404,26 +464,23 @@ fn auth_step(topo: &Topology, authed_ns: &mut Option<Vec<u8>>, args: &[Vec<u8>])
                 ));
             }
         };
-        if topo.tenants.is_empty() {
+        if topo.open_mode {
             return AuthStep::Reply(Value::Error(
                 "ERR Client sent AUTH, but no tenants are configured".into(),
             ));
         }
-        let Some(ns) = topo
-            .tenants
-            .get(&String::from_utf8_lossy(token).into_owned())
-        else {
+        let Some(ns) = topo.lookup_token(&String::from_utf8_lossy(token)) else {
             return AuthStep::Reply(Value::Error("WRONGPASS invalid token".into()));
         };
         match authed_ns {
-            Some(cur) if cur != ns => {
+            Some(cur) if *cur != ns => {
                 return AuthStep::Reply(Value::Error(
                     "ERR already authenticated as another tenant; reconnect to switch".into(),
                 ));
             }
             _ => {}
         }
-        *authed_ns = Some(ns.clone());
+        *authed_ns = Some(ns);
         return AuthStep::Reply(Value::Simple("OK".into()));
     }
     match authed_ns {
@@ -442,9 +499,9 @@ fn auth_step(topo: &Topology, authed_ns: &mut Option<Vec<u8>>, args: &[Vec<u8>])
 }
 
 fn serve_client(mut stream: TcpStream, topo: Arc<Topology>) -> std::io::Result<()> {
-    // Open mode (no tenants configured): the connection starts authorized
-    // on the default namespace — the pre-tenancy behavior, unchanged.
-    let mut authed_ns: Option<Vec<u8>> = if topo.tenants.is_empty() {
+    // Open mode (standalone, no tenants configured): the connection starts
+    // authorized on the default namespace — the pre-tenancy behavior.
+    let mut authed_ns: Option<Vec<u8>> = if topo.open_mode {
         Some(b"0".to_vec())
     } else {
         None
@@ -551,6 +608,80 @@ fn handle(
     }
 }
 
+/// One CPWATCH session: subscribe, apply pushed snapshots, ACK each. The
+/// snapshot frame is [SNAPSHOT, version, "a,b;c,d", "tok=ns,..."] — already
+/// filtered by the control plane to this proxy's assigned tenants.
+fn watch_control_plane(
+    cp: &str,
+    advertise: &str,
+    topo: &Topology,
+    last_version: &mut u64,
+) -> std::io::Result<()> {
+    let mut stream = TcpStream::connect(cp)?;
+    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+    let mut out = Vec::new();
+    encode(
+        &Value::Array(Some(vec![
+            Value::Bulk(Some(b"CPWATCH".to_vec())),
+            Value::Bulk(Some(advertise.as_bytes().to_vec())),
+            Value::Bulk(Some(last_version.to_string().into_bytes())),
+        ])),
+        &mut out,
+    );
+    stream.write_all(&out)?;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 64 * 1024];
+    loop {
+        match decode(&buf) {
+            Ok(Decoded::Complete(frame, used)) => {
+                buf.drain(..used);
+                if let Value::Array(Some(items)) = frame
+                    && let [
+                        Value::Bulk(Some(tag)),
+                        Value::Integer(version),
+                        Value::Bulk(Some(pairs)),
+                        Value::Bulk(Some(tenants)),
+                    ] = items.as_slice()
+                    && tag.eq_ignore_ascii_case(b"SNAPSHOT")
+                {
+                    topo.apply_snapshot(
+                        &String::from_utf8_lossy(pairs),
+                        &String::from_utf8_lossy(tenants),
+                    );
+                    *last_version = *version as u64;
+                    eprintln!("control-plane snapshot v{version} applied");
+                    out.clear();
+                    encode(
+                        &Value::Array(Some(vec![
+                            Value::Bulk(Some(b"ACK".to_vec())),
+                            Value::Bulk(Some(version.to_string().into_bytes())),
+                        ])),
+                        &mut out,
+                    );
+                    stream.write_all(&out)?;
+                }
+            }
+            Ok(Decoded::NeedMore) => {
+                let n = stream.read(&mut chunk)?;
+                if n == 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "control plane closed",
+                    ));
+                }
+                buf.extend_from_slice(&chunk[..n]);
+            }
+            Err(e) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("{e:?}"),
+                ));
+            }
+        }
+    }
+}
+
 fn frame_to_args(frame: Value) -> Option<Vec<Vec<u8>>> {
     let Value::Array(Some(items)) = frame else {
         return None;
@@ -567,14 +698,16 @@ fn frame_to_args(frame: Value) -> Option<Vec<Vec<u8>>> {
 
 fn main() -> std::io::Result<()> {
     let port: u16 = arg("--port").and_then(|p| p.parse().ok()).unwrap_or(7379);
-    let pairs: Vec<Vec<String>> = arg("--pairs")
-        .expect("--pairs \"m0,r0;m1,r1\" required")
-        .split(';')
-        .map(|p| p.split(',').map(String::from).collect())
-        .collect();
-    assert!(!pairs.is_empty(), "need at least one pair");
+    let control_plane = arg("--control-plane");
 
-    // token=ns pairs; empty (flag absent) = open mode on the default ns.
+    // Standalone config (ignored in control-plane mode, which pushes both).
+    let pairs: Vec<Vec<String>> = arg("--pairs")
+        .map(|spec| {
+            spec.split(';')
+                .map(|p| p.split(',').map(String::from).collect())
+                .collect()
+        })
+        .unwrap_or_default();
     let tenants: HashMap<String, Vec<u8>> = arg("--tenants")
         .map(|spec| {
             spec.split(',')
@@ -589,20 +722,43 @@ fn main() -> std::io::Result<()> {
                 .collect()
         })
         .unwrap_or_default();
+    assert!(
+        control_plane.is_some() || !pairs.is_empty(),
+        "need --pairs \"m0,r0;m1,r1\" or --control-plane <addr>"
+    );
 
+    let open_mode = control_plane.is_none() && tenants.is_empty();
     let masters: Vec<Option<String>> = pairs.iter().map(|nodes| discover_master(nodes)).collect();
     eprintln!(
-        "flint-proxy: {} pair(s), {} tenant(s), masters {:?}",
+        "flint-proxy: {} static pair(s), {} static tenant(s), control-plane {:?}, open={open_mode}",
         pairs.len(),
         tenants.len(),
-        masters
+        control_plane,
     );
     let topo = Arc::new(Topology {
-        pairs,
-        masters: RwLock::new(masters),
+        routing: RwLock::new(Routing { pairs, masters }),
         moved: RwLock::new(HashMap::new()),
-        tenants,
+        tenants: RwLock::new(tenants),
+        open_mode,
     });
+
+    // Control-plane subscription: CPWATCH pushes filtered snapshots (pairs
+    // + THIS proxy's tenants); we apply and ACK. Reconnect with backoff on
+    // any error — the last-applied table keeps serving in the meantime
+    // (control-plane outage never touches the data path).
+    if let Some(cp) = control_plane {
+        let advertise = arg("--advertise").expect("--control-plane requires --advertise <addr>");
+        let topo = Arc::clone(&topo);
+        std::thread::spawn(move || {
+            let mut last_version: u64 = 0;
+            loop {
+                if let Err(e) = watch_control_plane(&cp, &advertise, &topo, &mut last_version) {
+                    eprintln!("control-plane watch: {e}; reconnecting");
+                }
+                std::thread::sleep(Duration::from_millis(1000));
+            }
+        });
+    }
 
     let listener = TcpListener::bind(("127.0.0.1", port))?;
     eprintln!("flint-proxy listening on 127.0.0.1:{port}");
