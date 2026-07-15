@@ -1,6 +1,6 @@
 [package]
 name = "flint-controlplane"
-description = "v1 global control plane: durable tenant registry (tokens, namespaces, shuffle-shard proxy subsets) + group topology, versioned snapshot push to proxies with ACK (single node; openraft HA is the follow-on)"
+description = "v1 global control plane: durable tenant registry (tokens, namespaces, shuffle-shard proxy subsets) + group topology, versioned snapshot push to proxies with ACK; openraft HA (Raft-replicated durable intent)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,6 +8,10 @@ repository.workspace = true
 
 [dependencies]
 flint-resp = { path = "../flint-resp" }
+openraft = { version = "0.9", features = ["serde"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "time", "sync"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [lints]
 workspace = true

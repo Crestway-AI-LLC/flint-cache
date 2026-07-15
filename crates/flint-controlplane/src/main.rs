@@ -32,6 +32,9 @@
 //!
 //! Usage: flint-controlplane --port 7500 --state /path/state
 
+mod ha;
+mod raft;
+mod registry;
 mod state;
 
 use std::io::{Read, Write};
@@ -351,6 +354,14 @@ fn frame_to_args(frame: Value) -> Option<Vec<Vec<u8>>> {
 fn main() -> std::io::Result<()> {
     let port: u16 = arg("--port").and_then(|p| p.parse().ok()).unwrap_or(7500);
     let path = arg("--state").unwrap_or_else(|| "./flint-cp-state".into());
+
+    // HA mode: --raft with --node-id / --raft-port / --peers / --client-addrs
+    // runs a Raft-replicated node (openraft); otherwise the durable
+    // single-node path below.
+    if std::env::args().any(|a| a == "--raft") {
+        return run_raft(port, path);
+    }
+
     let state = State::load_or_new(path.clone().into());
     eprintln!(
         "flint-controlplane: state {path} (version {}, {} proxies, {} pairs, {} tenants)",
@@ -373,4 +384,43 @@ fn main() -> std::io::Result<()> {
         });
     }
     Ok(())
+}
+
+/// --raft entry: build a tokio runtime and run the Raft node + client
+/// server. Bridges our blocking main into openraft's async world.
+fn run_raft(port: u16, state_path: String) -> std::io::Result<()> {
+    let node_id: u64 = arg("--node-id")
+        .and_then(|v| v.parse().ok())
+        .expect("--raft requires --node-id <n>");
+    let raft_port: u16 = arg("--raft-port")
+        .and_then(|v| v.parse().ok())
+        .expect("--raft requires --raft-port <port>");
+    let peers = arg("--peers").expect("--raft requires --peers \"1=addr,2=addr,...\"");
+    let clients =
+        arg("--client-addrs").expect("--raft requires --client-addrs \"1=addr,2=addr,...\"");
+    let raft_addr = format!("127.0.0.1:{raft_port}");
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(async move {
+        let ha = ha::start(
+            node_id,
+            &raft_addr,
+            raft_port,
+            state_path.into(),
+            &peers,
+            &clients,
+        )
+        .await?;
+        let ha = std::sync::Arc::new(ha);
+        // Bring the cluster up (idempotent; lowest node id initializes).
+        {
+            let ha = std::sync::Arc::clone(&ha);
+            tokio::spawn(async move {
+                ha.maybe_initialize().await;
+            });
+        }
+        ha::run_client(ha, port).await
+    })
 }

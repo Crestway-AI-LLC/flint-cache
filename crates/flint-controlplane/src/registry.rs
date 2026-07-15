@@ -1,0 +1,124 @@
+//! The Raft-replicated registry state + its mutations (state-machine data).
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum Mutation {
+    AddProxy(String),
+    AddPair(Vec<String>),
+    AddTenant {
+        name: String,
+        token: String,
+        ns: String,
+        subset: Vec<String>,
+    },
+    SetSubset {
+        name: String,
+        subset: Vec<String>,
+    },
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Tenant {
+    pub name: String,
+    pub token: String,
+    pub ns: String,
+    pub subset: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RegistryState {
+    pub version: u64,
+    pub proxies: Vec<String>,
+    pub pairs: Vec<Vec<String>>,
+    pub tenants: BTreeMap<String, Tenant>,
+}
+
+/// FNV-1a seed for deterministic subset placement (not a security
+/// boundary; tokens are). Shared with the single-node path.
+fn fnv1a(data: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in data {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+/// Deterministic shuffle-shard: k distinct proxies for `name` from a
+/// sorted `fleet`, so any node computes the same subset without
+/// coordination (design.md §2.1).
+pub fn shuffle_shard(name: &str, fleet: &[String], k: usize) -> Vec<String> {
+    let mut sorted: Vec<&String> = fleet.iter().collect();
+    sorted.sort();
+    let k = k.min(sorted.len());
+    let mut picked = Vec::with_capacity(k);
+    let mut seed = fnv1a(name.as_bytes());
+    while picked.len() < k && !sorted.is_empty() {
+        seed = seed
+            .wrapping_add(0x9E3779B97F4A7C15)
+            .wrapping_mul(0xBF58476D1CE4E5B9);
+        let idx = (seed >> 33) as usize % sorted.len();
+        picked.push(sorted.remove(idx).clone());
+    }
+    picked.sort();
+    picked
+}
+
+impl RegistryState {
+    pub fn apply(&mut self, m: Mutation) {
+        self.version += 1;
+        match m {
+            Mutation::AddProxy(a) => {
+                if !self.proxies.contains(&a) {
+                    self.proxies.push(a);
+                }
+            }
+            Mutation::AddPair(p) => {
+                if !self.pairs.contains(&p) {
+                    self.pairs.push(p);
+                }
+            }
+            Mutation::AddTenant {
+                name,
+                token,
+                ns,
+                subset,
+            } => {
+                self.tenants.insert(
+                    name.clone(),
+                    Tenant {
+                        name,
+                        token,
+                        ns,
+                        subset,
+                    },
+                );
+            }
+            Mutation::SetSubset { name, subset } => {
+                if let Some(t) = self.tenants.get_mut(&name) {
+                    t.subset = subset;
+                }
+            }
+        }
+    }
+
+    /// The snapshot a given proxy should see: shared pair topology + ONLY
+    /// the tenants whose subset includes it (the sub-group boundary).
+    pub fn snapshot_for(&self, proxy: &str) -> (u64, String, String) {
+        let pairs = self
+            .pairs
+            .iter()
+            .map(|p| p.join(","))
+            .collect::<Vec<_>>()
+            .join(";");
+        let tenants = self
+            .tenants
+            .values()
+            .filter(|t| t.subset.iter().any(|s| s == proxy))
+            .map(|t| format!("{}={}", t.token, t.ns))
+            .collect::<Vec<_>>()
+            .join(",");
+        (self.version, pairs, tenants)
+    }
+}
