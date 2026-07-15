@@ -5,7 +5,15 @@ use std::collections::BTreeMap;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Mutation {
     AddProxy(String),
-    AddPair(Vec<String>),
+    AddPair {
+        nodes: Vec<String>,
+        /// Slot range (level-1 routing state); None = unranged/expansion.
+        range: Option<(u16, u16)>,
+    },
+    /// Replace pair `idx`'s membership (node swap: a replacement node takes
+    /// a dead member's seat; slot ranges are positional, so the pair id is
+    /// the stable identity and membership floats).
+    SetPair { idx: usize, nodes: Vec<String> },
     AddTenant {
         name: String,
         token: String,
@@ -45,6 +53,10 @@ pub struct RegistryState {
     pub version: u64,
     pub proxies: Vec<String>,
     pub pairs: Vec<Vec<String>>,
+    /// Slot range owned by pairs[i] (level-1 routing state); None =
+    /// unranged (legacy) — proxies fall back to count-derived ranges.
+    #[serde(default)]
+    pub ranges: Vec<Option<(u16, u16)>>,
     pub tenants: BTreeMap<String, Tenant>,
 }
 
@@ -88,9 +100,18 @@ impl RegistryState {
                     self.proxies.push(a);
                 }
             }
-            Mutation::AddPair(p) => {
-                if !self.pairs.contains(&p) {
-                    self.pairs.push(p);
+            Mutation::AddPair { nodes, range } => {
+                if !self.pairs.contains(&nodes) {
+                    self.pairs.push(nodes);
+                    while self.ranges.len() < self.pairs.len() - 1 {
+                        self.ranges.push(None);
+                    }
+                    self.ranges.push(range);
+                }
+            }
+            Mutation::SetPair { idx, nodes } => {
+                if let Some(p) = self.pairs.get_mut(idx) {
+                    *p = nodes;
                 }
             }
             Mutation::AddTenant {
@@ -134,7 +155,11 @@ impl RegistryState {
         let pairs = self
             .pairs
             .iter()
-            .map(|p| p.join(","))
+            .enumerate()
+            .map(|(i, p)| match self.ranges.get(i).copied().flatten() {
+                Some((a, b)) => format!("{}|{a}-{b}", p.join(",")),
+                None => p.join(","),
+            })
             .collect::<Vec<_>>()
             .join(";");
         let tenants = self

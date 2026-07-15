@@ -106,20 +106,51 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
         }
         b"CPADDPAIR" => {
             let Some(nodes) = text(1).filter(|a| clean(a)) else {
-                return err("CPADDPAIR <a,b[,c]>");
+                return err("CPADDPAIR <a,b[,c]> [start-end|-]");
             };
+            // Optional slot range: level-1 routing state. "-" (or absent) =
+            // unranged; an EXPANSION pair should pass "-" so joining adds
+            // capacity without re-routing unmigrated slots.
+            let range = text(2).as_deref().and_then(state::parse_range);
             let pair: Vec<String> = nodes.split(',').map(String::from).collect();
             let Ok(mut st) = shared.state.lock() else {
                 return err("state lock");
             };
             if !st.pairs.contains(&pair) {
                 st.pairs.push(pair);
+                while st.ranges.len() < st.pairs.len() - 1 {
+                    st.ranges.push(None);
+                }
+                st.ranges.push(range);
                 match st.commit() {
                     Ok(_) => {}
                     Err(e) => return err(&format!("persist: {e}")),
                 }
                 shared.changed.notify_all();
             }
+            ok()
+        }
+        // Replace pair <idx>'s membership (node swap). The pair id is the
+        // stable identity (slot ranges are positional); membership floats.
+        b"CPSETPAIR" => {
+            let (Some(idx), Some(nodes)) = (
+                text(1).and_then(|v| v.parse::<usize>().ok()),
+                text(2).filter(|a| clean(a)),
+            ) else {
+                return err("CPSETPAIR <idx> <a,b[,c]>");
+            };
+            let Ok(mut st) = shared.state.lock() else {
+                return err("state lock");
+            };
+            let Some(p) = st.pairs.get_mut(idx) else {
+                return err("no such pair index");
+            };
+            *p = nodes.split(',').map(String::from).collect();
+            match st.commit() {
+                Ok(_) => {}
+                Err(e) => return err(&format!("persist: {e}")),
+            }
+            shared.changed.notify_all();
             ok()
         }
         b"CPADDTENANT" => {

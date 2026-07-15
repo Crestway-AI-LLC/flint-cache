@@ -89,6 +89,11 @@ struct Routing {
     pairs: Vec<Vec<String>>,
     /// Current master address per pair (None until discovered).
     masters: Vec<Option<String>>,
+    /// Slot range owned by pairs[i], pushed by the control plane (level-1
+    /// routing state). Empty/None entries fall back to count-derived ranges
+    /// (static --pairs mode, legacy registries). An expansion pair arrives
+    /// with NO range: capacity joins without re-routing unmigrated slots.
+    ranges: Vec<Option<(u16, u16)>>,
 }
 
 /// Shared cluster view: the routing table (static from --pairs, or pushed
@@ -141,7 +146,19 @@ impl Topology {
         if routing.pairs.is_empty() {
             return None;
         }
-        let pair = (slot as usize * routing.pairs.len()) / 16384;
+        // Range-owned slot -> that pair. Otherwise (no ranges pushed, or an
+        // uncovered slot) fall back to the count-derived split — but only
+        // across the RANGED prefix when ranges exist, so an unranged
+        // expansion pair never absorbs slots by mere existence.
+        let ranged = routing.ranges.iter().filter(|r| r.is_some()).count();
+        let pair = routing
+            .ranges
+            .iter()
+            .position(|r| matches!(r, Some((a, b)) if (*a..=*b).contains(&slot)))
+            .unwrap_or_else(|| {
+                let n = if ranged > 0 { ranged } else { routing.pairs.len() };
+                (slot as usize * n) / 16384
+            });
         routing.masters.get(pair)?.clone()
     }
 
@@ -217,16 +234,26 @@ impl Topology {
     /// if the pair list actually changed — rebuild the routing table
     /// (discovering masters), preserving failover-chased masters otherwise.
     fn apply_snapshot(&self, pairs_spec: &str, tenants_spec: &str) {
-        let new_pairs: Vec<Vec<String>> = if pairs_spec.is_empty() {
-            Vec::new()
-        } else {
-            pairs_spec
-                .split(';')
-                .map(|p| p.split(',').map(String::from).collect())
-                .collect()
-        };
+        // Pair entry: "a,b" (unranged) or "a,b|start-end" (range-owned).
+        let mut new_pairs: Vec<Vec<String>> = Vec::new();
+        let mut new_ranges: Vec<Option<(u16, u16)>> = Vec::new();
+        if !pairs_spec.is_empty() {
+            for entry in pairs_spec.split(';') {
+                let (nodes, range) = match entry.split_once('|') {
+                    Some((n, r)) => {
+                        let parsed = r.split_once('-').and_then(|(a, b)| {
+                            Some((a.parse::<u16>().ok()?, b.parse::<u16>().ok()?))
+                        });
+                        (n, parsed)
+                    }
+                    None => (entry, None),
+                };
+                new_pairs.push(nodes.split(',').map(String::from).collect());
+                new_ranges.push(range);
+            }
+        }
         let rebuild = match self.routing.read() {
-            Ok(r) => r.pairs != new_pairs,
+            Ok(r) => r.pairs != new_pairs || r.ranges != new_ranges,
             Err(_) => return,
         };
         if rebuild {
@@ -237,6 +264,7 @@ impl Topology {
             if let Ok(mut routing) = self.routing.write() {
                 routing.pairs = new_pairs;
                 routing.masters = masters;
+                routing.ranges = new_ranges;
             }
         }
         let new_tenants: HashMap<String, Vec<u8>> = tenants_spec
@@ -896,7 +924,11 @@ fn main() -> std::io::Result<()> {
         control_plane,
     );
     let topo = Arc::new(Topology {
-        routing: RwLock::new(Routing { pairs, masters }),
+        routing: RwLock::new(Routing {
+            pairs,
+            masters,
+            ranges: Vec::new(),
+        }),
         moved: RwLock::new(HashMap::new()),
         tenants: RwLock::new(tenants),
         auth_counts: RwLock::new(HashMap::new()),

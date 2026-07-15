@@ -44,6 +44,11 @@ pub enum EventKind {
     /// A fresh node seeded itself from the latest snapshot after whole-pair
     /// loss and asserted mastership in a bumped generation.
     SpareRestored,
+    /// A controller observed a pair converged for the first time in its
+    /// process lifetime: the degraded-window gate is open and auto-failover
+    /// is ARMED for that pair. Tooling that (re)starts controllers waits
+    /// for this before declaring an operation complete.
+    Supervised,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

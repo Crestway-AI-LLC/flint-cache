@@ -488,6 +488,18 @@ impl Pair {
                 }
             }
             if legit_converged {
+                if !self.converged_ever {
+                    // First convergence this process-life: auto-failover is
+                    // now armed for this pair. Journaled so orchestration
+                    // (flintctl) can wait for supervision instead of hoping.
+                    journal_event(
+                        &cfg.id,
+                        flint_journal::EventKind::Supervised,
+                        &self.label,
+                        None,
+                        "pair observed converged; auto-failover armed",
+                    );
+                }
                 self.last_converged = Instant::now();
                 self.converged_ever = true;
             }

@@ -1,0 +1,18 @@
+[package]
+name = "flint-ctl"
+description = "flintctl: inventory-driven cluster lifecycle — bootstrap a whole cluster (certs, control plane, pairs, proxies, controller, agent) from one file, then status / tenant / expand / swap-bad-node / stop. v1 runs local processes; a remote runner slots in behind the same command surface"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "flintctl"
+path = "src/main.rs"
+
+[dependencies]
+flint-resp = { path = "../flint-resp" }
+flint-tls = { path = "../flint-tls" }
+
+[lints]
+workspace = true

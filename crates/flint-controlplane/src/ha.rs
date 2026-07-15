@@ -483,8 +483,9 @@ async fn handle_admin(ha: &Ha, args: &[Vec<u8>]) -> Value {
             let Some(nodes) = text(1).filter(|a| clean(a)) else {
                 return Value::Error("ERR CPADDPAIR <a,b[,c]>".into());
             };
+            let range = text(2).as_deref().and_then(crate::state::parse_range);
             let pair = nodes.split(',').map(String::from).collect();
-            match ha.propose(Mutation::AddPair(pair)).await {
+            match ha.propose(Mutation::AddPair { nodes: pair, range }).await {
                 Ok(_) => Value::Simple("OK".into()),
                 Err(l) => redirect(l),
             }
@@ -564,6 +565,19 @@ async fn handle_admin(ha: &Ha, args: &[Vec<u8>]) -> Value {
             match ha.propose(Mutation::DropPrev { name }).await {
                 Ok(_) => Value::Simple("OK".into()),
                 Err(l) => redirect(l),
+            }
+        }
+        b"CPSETPAIR" => {
+            let (Some(idx), Some(nodes)) = (
+                text(1).and_then(|v| v.parse::<usize>().ok()),
+                text(2).filter(|a| clean(a)),
+            ) else {
+                return Value::Error("ERR CPSETPAIR <idx> <a,b[,c]>".into());
+            };
+            let nodes: Vec<String> = nodes.split(',').map(String::from).collect();
+            match ha.propose(Mutation::SetPair { idx, nodes }).await {
+                Ok(v) => Value::Simple(format!("OK version {v}")),
+                Err(redir) => redirect(redir),
             }
         }
         b"CPPROXIES" => {

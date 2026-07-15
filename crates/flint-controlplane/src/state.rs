@@ -37,6 +37,13 @@ pub struct State {
     pub version: u64,
     pub proxies: Vec<String>,
     pub pairs: Vec<Vec<String>>,
+    /// Slot range owned by pairs[i] (level-1 routing state, design.md §2.2).
+    /// None = unranged (legacy registries / static mode): proxies fall back
+    /// to count-derived ranges. An EXPANSION pair joins with an empty range
+    /// (None here is "unranged", (0,0)-style empty is expressed by simply
+    /// never covering a slot): it owns nothing until migration moves slots,
+    /// so adding capacity can never re-route data that has not moved.
+    pub ranges: Vec<Option<(u16, u16)>>,
     /// Keyed by tenant name (BTreeMap: deterministic serialization order).
     pub tenants: BTreeMap<String, Tenant>,
     path: Option<PathBuf>,
@@ -73,6 +80,12 @@ pub fn shuffle_shard(name: &str, fleet: &[String], k: usize) -> Vec<String> {
     }
     picked.sort();
     picked
+}
+
+/// Parse "a-b" into a slot range; "-" (or anything malformed) is None.
+pub fn parse_range(raw: &str) -> Option<(u16, u16)> {
+    let (a, b) = raw.split_once('-')?;
+    Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
 }
 
 /// Render the tenant->subset mapping as DNS zone A records: each tenant
@@ -117,6 +130,7 @@ impl State {
                 Some("pair") => {
                     if let Some(nodes) = parts.next() {
                         s.pairs.push(nodes.split(',').map(String::from).collect());
+                        s.ranges.push(parts.next().and_then(parse_range));
                     }
                 }
                 Some("tenant") => {
@@ -154,8 +168,12 @@ impl State {
         for p in &self.proxies {
             out.push_str(&format!("proxy {p}\n"));
         }
-        for pair in &self.pairs {
-            out.push_str(&format!("pair {}\n", pair.join(",")));
+        for (i, pair) in self.pairs.iter().enumerate() {
+            let range = match self.ranges.get(i).copied().flatten() {
+                Some((a, b)) => format!("{a}-{b}"),
+                None => "-".to_string(),
+            };
+            out.push_str(&format!("pair {} {range}\n", pair.join(",")));
         }
         for t in self.tenants.values() {
             let subset = if t.subset.is_empty() {
@@ -201,7 +219,11 @@ impl State {
         let pairs = self
             .pairs
             .iter()
-            .map(|p| p.join(","))
+            .enumerate()
+            .map(|(i, p)| match self.ranges.get(i).copied().flatten() {
+                Some((a, b)) => format!("{}|{a}-{b}", p.join(",")),
+                None => p.join(","),
+            })
             .collect::<Vec<_>>()
             .join(";");
         let tenants = self
