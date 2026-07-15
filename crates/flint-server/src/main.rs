@@ -46,6 +46,16 @@ static INTERNAL_CLIENT: std::sync::OnceLock<Option<Arc<flint_tls::ClientConfig>>
 // Every node→node dialer is rocks-gated (replication/migration), so the
 // mem-only build never dials out.
 #[cfg_attr(not(feature = "rocks"), allow(dead_code))]
+/// The build stamp surfaced in FLINTINFO — what canary rollouts gate on.
+/// FLINT_BUILD_VERSION overrides (deploy artifacts stamp themselves);
+/// otherwise the crate version.
+fn build_version() -> String {
+    std::env::var("FLINT_BUILD_VERSION").unwrap_or_else(|_| env!("CARGO_PKG_VERSION").to_string())
+}
+
+// Callers are all rocks-gated dial sites (replication/migration/cutover);
+// the mem-only build still parses --internal-* for its listener.
+#[cfg_attr(not(feature = "rocks"), allow(dead_code))]
 fn internal_connect(addr: &str) -> std::io::Result<flint_tls::Stream> {
     flint_tls::connect(addr, INTERNAL_CLIENT.get().unwrap_or(&None))
 }
@@ -999,7 +1009,7 @@ fn flintinfo(read_only: bool, rocks: &Option<RocksHandle>, hub: &Arc<ReplHub>) -
         None => "none".into(),
     };
     let info = format!(
-        "role:{}\r\nrole_epoch:{role_epoch}\r\nlatest_seq:{latest}\r\nlast_applied:{last_applied}\r\nacked_seq:{}\r\nseq_lag:{seq_lag}\r\nlive_replicas:{}\r\nlag_ms:{}\r\nlag_soft_ms:{soft}\r\nlag_hard_ms:{hard}\r\nmin_replicas_to_write:{minr}\r\n",
+        "role:{}\r\nrole_epoch:{role_epoch}\r\nbuild:{build}\r\nlatest_seq:{latest}\r\nlast_applied:{last_applied}\r\nacked_seq:{}\r\nseq_lag:{seq_lag}\r\nlive_replicas:{}\r\nlag_ms:{}\r\nlag_soft_ms:{soft}\r\nlag_hard_ms:{hard}\r\nmin_replicas_to_write:{minr}\r\n",
         if read_only { "replica" } else { "master" },
         hub.effective_acked(now)
             .map_or_else(|| "none".into(), |a| a.to_string()),
@@ -1009,6 +1019,7 @@ fn flintinfo(read_only: bool, rocks: &Option<RocksHandle>, hub: &Arc<ReplHub>) -
         soft = hub.lag_soft_ms,
         hard = hub.lag_hard_ms,
         minr = hub.min_replicas_to_write,
+        build = build_version(),
     );
     Value::Bulk(Some(info.into_bytes()))
 }

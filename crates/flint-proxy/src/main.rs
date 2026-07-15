@@ -362,6 +362,12 @@ impl Backends {
         }
     }
 
+    /// Discard the cached connection to `addr` (stale-routing recovery: the
+    /// next call dials whatever the refreshed masters map says).
+    fn drop_conn(&mut self, addr: &str) {
+        self.conns.remove(addr);
+    }
+
     fn call(&mut self, addr: &str, frame: &[u8]) -> std::io::Result<Value> {
         if !self.conns.contains_key(addr) {
             let mut stream = flint_tls::connect(addr, &self.tls)?;
@@ -491,6 +497,21 @@ fn forward(
                 if Instant::now() > deadline {
                     return Value::Error(e);
                 }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Ok(Value::Error(e)) if e.starts_with("READONLY") => {
+                // A LIVE node refusing writes where we expected a master: a
+                // demoted-in-place ex-master (controlled failover demotes
+                // first and the process stays up). Connection failure is not
+                // the only stale-routing signal — rediscover this pair's
+                // master and retry, exactly like the dead-backend path.
+                // Without this the proxy wedges: the node answers, so no
+                // error path ever fires, and every write bounces -READONLY.
+                if Instant::now() > deadline {
+                    return Value::Error(e);
+                }
+                topo.rediscover_for(&addr);
+                backends.drop_conn(&addr);
                 std::thread::sleep(Duration::from_millis(50));
             }
             Ok(reply) => return reply,
