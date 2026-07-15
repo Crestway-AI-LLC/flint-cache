@@ -89,6 +89,10 @@ struct Topology {
     /// auth, default namespace. A control-plane-fed proxy is never open —
     /// before its first snapshot it simply has no tenants yet.
     open_mode: bool,
+    /// Client-side mutual-TLS config for dialing backends (the internal hop).
+    /// `None` = plaintext backends (default). Set by `--internal-*`; the same
+    /// triple the servers use, in the client role.
+    backend_tls: Option<Arc<rustls::ClientConfig>>,
 }
 
 impl Topology {
@@ -155,7 +159,7 @@ impl Topology {
             Err(_) => return,
         };
         for (i, nodes) in pairs {
-            let found = discover_master(&nodes);
+            let found = discover_master(&nodes, &self.backend_tls);
             if let Ok(mut routing) = self.routing.write()
                 && let Some(slot) = routing.masters.get_mut(i)
             {
@@ -194,8 +198,10 @@ impl Topology {
             Err(_) => return,
         };
         if rebuild {
-            let masters: Vec<Option<String>> =
-                new_pairs.iter().map(|n| discover_master(n)).collect();
+            let masters: Vec<Option<String>> = new_pairs
+                .iter()
+                .map(|n| discover_master(n, &self.backend_tls))
+                .collect();
             if let Ok(mut routing) = self.routing.write() {
                 routing.pairs = new_pairs;
                 routing.masters = masters;
@@ -215,7 +221,11 @@ impl Topology {
 }
 
 /// One RESP request/response exchange on a raw connection.
-fn call_raw(stream: &mut TcpStream, buf: &mut Vec<u8>, frame: &[u8]) -> std::io::Result<Value> {
+fn call_raw(
+    stream: &mut flint_tls::Stream,
+    buf: &mut Vec<u8>,
+    frame: &[u8],
+) -> std::io::Result<Value> {
     stream.write_all(frame)?;
     let mut chunk = [0u8; 64 * 1024];
     loop {
@@ -246,9 +256,12 @@ fn call_raw(stream: &mut TcpStream, buf: &mut Vec<u8>, frame: &[u8]) -> std::io:
 
 /// Probe a pair's nodes for the current master (FLINTINFO role) — the same
 /// discovery rule the controller uses.
-fn discover_master(nodes: &[String]) -> Option<String> {
+fn discover_master(
+    nodes: &[String],
+    tls: &Option<Arc<rustls::ClientConfig>>,
+) -> Option<String> {
     for addr in nodes {
-        let Ok(mut stream) = TcpStream::connect(addr) else {
+        let Ok(mut stream) = flint_tls::connect(addr, tls) else {
             continue;
         };
         let _ = stream.set_read_timeout(Some(Duration::from_millis(800)));
@@ -271,24 +284,27 @@ fn discover_master(nodes: &[String]) -> Option<String> {
 
 /// Per-client-thread cache of backend connections.
 struct Backends {
-    conns: HashMap<String, (TcpStream, Vec<u8>)>,
+    conns: HashMap<String, (flint_tls::Stream, Vec<u8>)>,
     /// Tenant namespace every connection here is pinned to (FLINTNS
     /// handshake at open). One client = one tenant, so raw frames forward
     /// without per-command rewriting.
     ns: Vec<u8>,
+    /// Client-side mutual-TLS for the backend hop (`None` = plaintext).
+    tls: Option<Arc<rustls::ClientConfig>>,
 }
 
 impl Backends {
-    fn new(ns: Vec<u8>) -> Self {
+    fn new(ns: Vec<u8>, tls: Option<Arc<rustls::ClientConfig>>) -> Self {
         Self {
             conns: HashMap::new(),
             ns,
+            tls,
         }
     }
 
     fn call(&mut self, addr: &str, frame: &[u8]) -> std::io::Result<Value> {
         if !self.conns.contains_key(addr) {
-            let mut stream = TcpStream::connect(addr)?;
+            let mut stream = flint_tls::connect(addr, &self.tls)?;
             stream.set_read_timeout(Some(BACKEND_TIMEOUT))?;
             stream.set_write_timeout(Some(BACKEND_TIMEOUT))?;
             // Pin the connection to the tenant namespace before any data
@@ -382,7 +398,7 @@ fn forward(
                 .map(|r| r.pairs.clone())
                 .unwrap_or_default();
             for (i, nodes) in pairs.iter().enumerate() {
-                let found = discover_master(nodes);
+                let found = discover_master(nodes, &topo.backend_tls);
                 if let Ok(mut routing) = topo.routing.write()
                     && let Some(m) = routing.masters.get_mut(i)
                 {
@@ -560,7 +576,8 @@ fn serve_client<S: Read + Write>(mut stream: S, topo: Arc<Topology>) -> std::io:
                     let reply = match auth_step(&topo, &mut authed_ns, &args) {
                         AuthStep::Reply(v) => v,
                         AuthStep::Proceed(ns) => {
-                            let b = backends.get_or_insert_with(|| Backends::new(ns.clone()));
+                            let b = backends
+                                .get_or_insert_with(|| Backends::new(ns.clone(), topo.backend_tls.clone()));
                             handle(&topo, b, &ns, &args, &raw)
                         }
                     };
@@ -800,8 +817,25 @@ fn main() -> std::io::Result<()> {
         "need --pairs \"m0,r0;m1,r1\" or --control-plane <addr>"
     );
 
+    // Internal-mesh mutual TLS for the backend hop: the proxy is the CLIENT
+    // (presents its cert, verifies each backend against the shared CA). Same
+    // both-or-none-plus-ca gating as the frontend; the triple is shared with
+    // the servers, used here in the client role.
+    let backend_tls: Option<Arc<rustls::ClientConfig>> =
+        match (arg("--internal-ca"), arg("--internal-cert"), arg("--internal-key")) {
+            (Some(ca), Some(cert), Some(key)) => Some(
+                flint_tls::client_config(&ca, &cert, &key)
+                    .expect("build backend (internal) TLS client config"),
+            ),
+            (None, None, None) => None,
+            _ => panic!("--internal-ca, --internal-cert, --internal-key must be given together"),
+        };
+
     let open_mode = control_plane.is_none() && tenants.is_empty();
-    let masters: Vec<Option<String>> = pairs.iter().map(|nodes| discover_master(nodes)).collect();
+    let masters: Vec<Option<String>> = pairs
+        .iter()
+        .map(|nodes| discover_master(nodes, &backend_tls))
+        .collect();
     eprintln!(
         "flint-proxy: {} static pair(s), {} static tenant(s), control-plane {:?}, open={open_mode}",
         pairs.len(),
@@ -814,6 +848,7 @@ fn main() -> std::io::Result<()> {
         tenants: RwLock::new(tenants),
         auth_counts: RwLock::new(HashMap::new()),
         open_mode,
+        backend_tls,
     });
 
     // Control-plane subscription: CPWATCH pushes filtered snapshots (pairs

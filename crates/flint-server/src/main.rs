@@ -271,8 +271,28 @@ fn main() -> std::io::Result<()> {
             }
         });
     }
+    // Internal-mesh mutual TLS on the data port: when the --internal-* triple
+    // is set, every accepted connection is TLS and the peer MUST present a
+    // cert chaining to the shared CA (the proxy and replica peers do). This
+    // is the internal hop the FLINTNS comment above anticipated. The three
+    // hijack commands (FLINTSYNC/FLINTFULLSYNC/FLINTMIGRATEOUT) run a duplex
+    // that clones the socket, which a TLS session can't do — they're rejected
+    // over TLS until the node↔node increment restructures the push loop.
+    let internal_tls: Option<Arc<flint_tls::ServerConfig>> =
+        match (arg("--internal-ca"), arg("--internal-cert"), arg("--internal-key")) {
+            (Some(ca), Some(cert), Some(key)) => Some(
+                flint_tls::server_config(&ca, &cert, &key)
+                    .expect("build internal TLS server config"),
+            ),
+            (None, None, None) => None,
+            _ => panic!("--internal-ca, --internal-cert, --internal-key must be given together"),
+        };
+
     let listener = TcpListener::bind(("127.0.0.1", port))?;
-    eprintln!("flint-server listening on 127.0.0.1:{port}");
+    eprintln!(
+        "flint-server listening on 127.0.0.1:{port} ({})",
+        if internal_tls.is_some() { "internal mTLS" } else { "plaintext" }
+    );
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
         let store: Arc<dyn Kv> = Arc::clone(&store);
@@ -284,9 +304,19 @@ fn main() -> std::io::Result<()> {
         let tailer_stop = Arc::clone(&tailer_stop);
         let lease_deadline = Arc::clone(&lease_deadline);
         let migration_active = Arc::clone(&migration_active);
+        let internal_tls = internal_tls.clone();
         std::thread::spawn(move || {
+            // TLS handshake (incl. mutual client-cert verification) runs lazily
+            // on serve's first read; a peer that fails it errors out there.
+            let conn = match flint_tls::accept(stream, &internal_tls) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("internal tls accept: {e}");
+                    return;
+                }
+            };
             let _ = serve(
-                stream,
+                conn,
                 store.as_ref(),
                 &read_only,
                 &tailer_stop,
@@ -315,7 +345,7 @@ const OUT_FLUSH_THRESHOLD: usize = 1024 * 1024;
 
 #[allow(clippy::too_many_arguments)]
 fn serve(
-    mut stream: TcpStream,
+    mut stream: flint_tls::Stream,
     store: &dyn Kv,
     read_only: &Arc<AtomicBool>,
     tailer_stop: &Arc<AtomicBool>,
@@ -393,14 +423,36 @@ fn serve(
                         stream.write_all(&out)?;
                         return Ok(());
                     };
-                    // FLINTSYNC/FLINTFULLSYNC hijack the connection.
+                    // FLINTSYNC/FLINTFULLSYNC/FLINTMIGRATEOUT hijack the
+                    // connection into a socket-cloning duplex — which a TLS
+                    // session can't do. Over an internal-TLS connection they
+                    // are refused (node↔node TLS is a later increment); over
+                    // plaintext they take the raw socket as before.
+                    let is_hijack = args.first().is_some_and(|n| {
+                        n.eq_ignore_ascii_case(b"FLINTSYNC")
+                            || n.eq_ignore_ascii_case(b"FLINTFULLSYNC")
+                            || n.eq_ignore_ascii_case(b"FLINTMIGRATEOUT")
+                    });
+                    if is_hijack && stream.is_tls() {
+                        encode(
+                            &Value::Error(
+                                "ERR replication/migration hijack not supported over TLS yet \
+                                 (node↔node TLS is a later increment)"
+                                    .into(),
+                            ),
+                            &mut out,
+                        );
+                        stream.write_all(&out)?;
+                        return Ok(());
+                    }
                     if args
                         .first()
                         .is_some_and(|n| n.eq_ignore_ascii_case(b"FLINTSYNC"))
                     {
                         buf.drain(..consumed);
                         stream.write_all(&out)?;
-                        return flintsync(stream, rocks, hub, &args);
+                        let tcp = stream.into_plain().expect("hijack checked plaintext");
+                        return flintsync(tcp, rocks, hub, &args);
                     }
                     if args
                         .first()
@@ -408,7 +460,8 @@ fn serve(
                     {
                         buf.drain(..consumed);
                         stream.write_all(&out)?;
-                        return flintfullsync(stream, rocks);
+                        let tcp = stream.into_plain().expect("hijack checked plaintext");
+                        return flintfullsync(tcp, rocks);
                     }
                     if args
                         .first()
@@ -416,7 +469,8 @@ fn serve(
                     {
                         buf.drain(..consumed);
                         stream.write_all(&out)?;
-                        return flintmigrateout(stream, rocks, &args);
+                        let tcp = stream.into_plain().expect("hijack checked plaintext");
+                        return flintmigrateout(tcp, rocks, &args);
                     }
                     let reply = execute(
                         store,
@@ -2107,7 +2161,7 @@ mod serve_tests {
                 std::thread::spawn(move || {
                     let store = MemKv::new();
                     let _ = serve(
-                        stream,
+                        flint_tls::Stream::Plain(stream),
                         &store,
                         &Arc::new(AtomicBool::new(false)),
                         &Arc::new(AtomicBool::new(false)),

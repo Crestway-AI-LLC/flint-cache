@@ -1,0 +1,16 @@
+[package]
+name = "flint-tls"
+description = "Internal-mesh mutual TLS: shared config builders (client-cert-verifying server, cert-presenting client) over a common internal CA, plus plain-or-TLS stream wrappers reused across every internal hop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# `ring` provider = pure-Rust build (no C toolchain); pinned explicitly, not
+# via the process-default provider.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-pemfile = "2"
+
+[lints]
+workspace = true
