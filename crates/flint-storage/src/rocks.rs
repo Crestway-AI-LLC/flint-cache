@@ -23,6 +23,18 @@ pub struct RocksKv {
 }
 
 impl RocksKv {
+    /// Bytes of live SST data on disk — the capacity-model fill signal
+    /// (FLINTINFO `sst_bytes:`; expansion triggers derive fill fractions
+    /// and growth ETAs from it). Live files only: obsolete SSTs awaiting
+    /// deletion would inflate fill with reclaimable space.
+    pub fn sst_bytes(&self) -> u64 {
+        self.db
+            .property_int_value("rocksdb.live-sst-files-size")
+            .ok()
+            .flatten()
+            .unwrap_or(0)
+    }
+
     /// Crate-internal handle for the replication module.
     pub(crate) fn db(&self) -> &DB {
         &self.db

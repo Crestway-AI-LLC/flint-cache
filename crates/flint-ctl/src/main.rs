@@ -46,6 +46,9 @@ struct Inventory {
     proxies: Vec<String>,
     controller: bool,
     agent: Option<String>,
+    /// Per-node storage capacity in bytes (capacity model, question 2);
+    /// passed to the agent so it can compute fill + expansion ETAs.
+    capacity_bytes: Option<u64>,
 }
 
 fn parse_inventory(path: &str) -> Inventory {
@@ -71,6 +74,7 @@ fn parse_inventory(path: &str) -> Inventory {
             "proxy" => inv.proxies.push(val.to_string()),
             "controller" => inv.controller = val == "on",
             "agent" => inv.agent = Some(val.to_string()),
+            "capacity" => inv.capacity_bytes = val.parse().ok(),
             other => panic!("inventory: unknown key {other:?}"),
         }
     }
@@ -446,6 +450,9 @@ fn bootstrap(inv: &Inventory) {
             "--journal".into(),
             format!("{d}/shadow.jsonl"),
         ];
+        if let Some(cap) = inv.capacity_bytes {
+            args.extend(["--node-capacity-bytes".into(), cap.to_string()]);
+        }
         args.extend(internal_args(inv));
         spawn(inv, "agent", "flint-agent", &args);
     }
