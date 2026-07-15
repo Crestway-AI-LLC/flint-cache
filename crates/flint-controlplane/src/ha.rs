@@ -566,6 +566,17 @@ async fn handle_admin(ha: &Ha, args: &[Vec<u8>]) -> Value {
                 Err(l) => redirect(l),
             }
         }
+        b"CPDNSZONE" => {
+            let Some(suffix) = text(1) else {
+                return Value::Error("ERR CPDNSZONE <zone-suffix>".into());
+            };
+            let reg = ha.store.registry().await;
+            let zone = crate::state::dns_zone(
+                &suffix,
+                reg.tenants.values().map(|t| (t.name.as_str(), &t.subset)),
+            );
+            Value::Bulk(Some(zone.into_bytes()))
+        }
         // Fleet journal: node-local append (observability, not Raft intent).
         b"CPJOURNAL" => {
             let Some(line) = text(1) else {
@@ -617,10 +628,19 @@ async fn watch_loop<S: AsyncRead + AsyncWrite + Unpin>(
     mut buf: Vec<u8>,
 ) -> std::io::Result<()> {
     let mut chunk = [0u8; 8192];
+    // Delta suppression: a version bump whose filtered view is unchanged is
+    // acknowledged locally, not pushed (see the single-node watch()).
+    let mut last_view: Option<(String, String)> = None;
     loop {
         let reg = ha.store.registry().await;
         if reg.version > acked {
             let (v, pairs, tenants) = reg.snapshot_for(&proxy);
+            if last_view.as_ref() == Some(&(pairs.clone(), tenants.clone())) {
+                eprintln!("watch {proxy}: suppressed push at version {v} (view unchanged)");
+                acked = v;
+                continue;
+            }
+            last_view = Some((pairs.clone(), tenants.clone()));
             let mut o = Vec::new();
             encode(&snapshot_frame(v, &pairs, &tenants), &mut o);
             sock.write_all(&o).await?;

@@ -75,6 +75,25 @@ pub fn shuffle_shard(name: &str, fleet: &[String], k: usize) -> Vec<String> {
     picked
 }
 
+/// Render the tenant->subset mapping as DNS zone A records: each tenant
+/// name resolves to ONLY its shuffle-shard subset's hosts. This is the
+/// publication format (design.md §2.1) — pushing it to a DNS provider is an
+/// integration on top. Proxies share one standard port in production, so A
+/// records suffice; per-member ports would be SRV, deliberately out of v1.
+pub fn dns_zone<'a>(
+    suffix: &str,
+    tenants: impl Iterator<Item = (&'a str, &'a Vec<String>)>,
+) -> String {
+    let mut out = String::new();
+    for (name, subset) in tenants {
+        for member in subset {
+            let host = member.split(':').next().unwrap_or(member);
+            out.push_str(&format!("{name}.{suffix}. 30 IN A {host}\n"));
+        }
+    }
+    out
+}
+
 impl State {
     pub fn load_or_new(path: PathBuf) -> Self {
         let mut s = State {

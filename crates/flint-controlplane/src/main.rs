@@ -226,6 +226,25 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
             shared.changed.notify_all();
             ok()
         }
+        // DNS subset publication: render the authoritative zone data for the
+        // tenant->proxy-subset mapping. Each tenant resolves to ONLY its
+        // shuffle-shard subset — DNS is how clients land on their sub-group
+        // without a bootstrap service. Output is standard zone A records;
+        // pushing them to a provider (Route53 etc.) is an integration on
+        // top of this rendering.
+        b"CPDNSZONE" => {
+            let Some(suffix) = text(1).filter(|z| clean(z)) else {
+                return err("CPDNSZONE <zone-suffix>");
+            };
+            let Ok(st) = shared.state.lock() else {
+                return err("state lock");
+            };
+            let zone = state::dns_zone(
+                &suffix,
+                st.tenants.values().map(|t| (t.name.as_str(), &t.subset)),
+            );
+            Value::Bulk(Some(zone.into_bytes()))
+        }
         // Fleet journal (flint-journal): typed state-transition events from
         // every component. Append is a single pre-serialized JSON line.
         b"CPJOURNAL" => {
@@ -292,6 +311,13 @@ fn watch(
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     let mut buf = Vec::new();
     let mut chunk = [0u8; 8192];
+    // Delta suppression: the last view actually sent. A version bump whose
+    // FILTERED view for this proxy is unchanged (someone else's tenant
+    // changed) is acknowledged locally without a wire push — with shuffle
+    // sharding most mutations touch a small subset of proxies, so most
+    // pushes are no-ops. State is tiny, so suppress-identical beats
+    // computing diffs.
+    let mut last_view: Option<(String, String)> = None;
     loop {
         // Wait until there is something newer than the proxy has ACKed.
         let (v, pairs, tenants) = {
@@ -308,9 +334,15 @@ fn watch(
             }
             st.snapshot_for(&proxy)
         };
+        if last_view.as_ref() == Some(&(pairs.clone(), tenants.clone())) {
+            eprintln!("watch {proxy}: suppressed push at version {v} (view unchanged)");
+            acked = v;
+            continue;
+        }
         let mut out = Vec::new();
         encode(&snapshot_frame(v, &pairs, &tenants), &mut out);
         stream.write_all(&out)?;
+        last_view = Some((pairs, tenants));
         // Read the ACK (Array ["ACK", <version>]).
         loop {
             match decode(&buf) {
