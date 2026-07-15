@@ -38,7 +38,7 @@ mod registry;
 mod state;
 
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpListener;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
@@ -265,7 +265,7 @@ fn snapshot_frame(version: u64, pairs: &str, tenants: &str) -> Value {
 /// filtered snapshot whenever the version advances past what the proxy has
 /// ACKed. Push -> ACK -> wait-for-change -> push...
 fn watch(
-    mut stream: TcpStream,
+    mut stream: flint_tls::Stream,
     shared: &Shared,
     proxy: String,
     mut acked: u64,
@@ -319,7 +319,7 @@ fn watch(
     }
 }
 
-fn serve(mut stream: TcpStream, shared: Arc<Shared>) -> std::io::Result<()> {
+fn serve(mut stream: flint_tls::Stream, shared: Arc<Shared>) -> std::io::Result<()> {
     let mut buf: Vec<u8> = Vec::with_capacity(8 * 1024);
     let mut chunk = [0u8; 8 * 1024];
     let mut out: Vec<u8> = Vec::with_capacity(4 * 1024);
@@ -398,6 +398,40 @@ fn frame_to_args(frame: Value) -> Option<Vec<Vec<u8>>> {
     Some(args)
 }
 
+/// The --internal-* triple in the server role: the config every
+/// control-plane listener (single-node client port, HA client port, Raft
+/// RPC port) accepts with — peers and proxies must present a CA-signed
+/// cert. None = plaintext.
+fn internal_server_config() -> Option<Arc<flint_tls::ServerConfig>> {
+    match (
+        arg("--internal-ca"),
+        arg("--internal-cert"),
+        arg("--internal-key"),
+    ) {
+        (Some(ca), Some(cert), Some(key)) => Some(
+            flint_tls::server_config(&ca, &cert, &key)
+                .expect("build internal TLS server config"),
+        ),
+        (None, None, None) => None,
+        _ => panic!("--internal-ca, --internal-cert, --internal-key must be given together"),
+    }
+}
+
+/// The same triple in the client role — the Raft RPC dialer.
+fn internal_client_config() -> Option<Arc<flint_tls::ClientConfig>> {
+    match (
+        arg("--internal-ca"),
+        arg("--internal-cert"),
+        arg("--internal-key"),
+    ) {
+        (Some(ca), Some(cert), Some(key)) => Some(
+            flint_tls::client_config(&ca, &cert, &key)
+                .expect("build internal TLS client config"),
+        ),
+        _ => None,
+    }
+}
+
 fn main() -> std::io::Result<()> {
     let port: u16 = arg("--port").and_then(|p| p.parse().ok()).unwrap_or(7500);
     let path = arg("--state").unwrap_or_else(|| "./flint-cp-state".into());
@@ -421,13 +455,25 @@ fn main() -> std::io::Result<()> {
         state: Mutex::new(state),
         changed: Condvar::new(),
     });
+    let internal_tls = internal_server_config();
     let listener = TcpListener::bind(("127.0.0.1", port))?;
-    eprintln!("flint-controlplane listening on 127.0.0.1:{port}");
+    eprintln!(
+        "flint-controlplane listening on 127.0.0.1:{port} ({})",
+        if internal_tls.is_some() { "internal mTLS" } else { "plaintext" }
+    );
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
         let shared = Arc::clone(&shared);
+        let internal_tls = internal_tls.clone();
         std::thread::spawn(move || {
-            let _ = serve(stream, shared);
+            let conn = match flint_tls::accept(stream, &internal_tls) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("internal tls accept: {e}");
+                    return;
+                }
+            };
+            let _ = serve(conn, shared);
         });
     }
     Ok(())
@@ -450,6 +496,11 @@ fn run_raft(port: u16, state_path: String) -> std::io::Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
+    // One --internal-* triple covers all three surfaces of an HA node: the
+    // Raft RPC listener + dialer (peer↔peer) and the client port (proxies
+    // and admin).
+    let tls_server = internal_server_config();
+    let tls_client = internal_client_config();
     rt.block_on(async move {
         let ha = ha::start(
             node_id,
@@ -458,6 +509,8 @@ fn run_raft(port: u16, state_path: String) -> std::io::Result<()> {
             state_path.into(),
             &peers,
             &clients,
+            tls_server.clone(),
+            tls_client,
         )
         .await?;
         let ha = std::sync::Arc::new(ha);
@@ -468,6 +521,6 @@ fn run_raft(port: u16, state_path: String) -> std::io::Result<()> {
                 ha.maybe_initialize().await;
             });
         }
-        ha::run_client(ha, port).await
+        ha::run_client(ha, port, tls_server).await
     })
 }

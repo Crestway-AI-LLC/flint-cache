@@ -8,8 +8,12 @@ repository.workspace = true
 
 [dependencies]
 flint-resp = { path = "../flint-resp" }
+flint-tls = { path = "../flint-tls" }
 openraft = { version = "0.9", features = ["serde"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "time", "sync"] }
+# Async TLS for the tokio paths (Raft RPC + HA client port); reuses the
+# rustls configs flint-tls builds.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 

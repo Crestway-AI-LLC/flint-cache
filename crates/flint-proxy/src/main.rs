@@ -39,7 +39,7 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpListener;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -663,7 +663,9 @@ fn watch_control_plane(
     topo: &Topology,
     last_version: &mut u64,
 ) -> std::io::Result<()> {
-    let mut stream = TcpStream::connect(cp)?;
+    // Same internal-mesh client credentials as the backend hop: the control
+    // plane is part of the mesh, so one --internal-* triple covers both.
+    let mut stream = flint_tls::connect(cp, &topo.backend_tls)?;
     stream.set_read_timeout(Some(Duration::from_secs(30)))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
     let mut out = Vec::new();

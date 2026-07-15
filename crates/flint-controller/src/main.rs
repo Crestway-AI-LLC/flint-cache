@@ -46,7 +46,6 @@
 mod planner;
 
 use std::io::{Read, Write};
-use std::net::TcpStream;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
@@ -117,8 +116,19 @@ fn arg_or<T: std::str::FromStr>(name: &str, default: T) -> T {
     arg(name).and_then(|v| v.parse().ok()).unwrap_or(default)
 }
 
+/// Internal-mesh mutual-TLS client config (--internal-* triple), set once at
+/// startup; every controller→node dial goes through internal_connect, so the
+/// control loop speaks mutual TLS to an mTLS data plane and plaintext
+/// otherwise — one dial path.
+static INTERNAL_CLIENT: std::sync::OnceLock<Option<std::sync::Arc<flint_tls::ClientConfig>>> =
+    std::sync::OnceLock::new();
+
+fn internal_connect(addr: &str) -> std::io::Result<flint_tls::Stream> {
+    flint_tls::connect(addr, INTERNAL_CLIENT.get().unwrap_or(&None))
+}
+
 fn call(addr: &str, args: &[&[u8]]) -> std::io::Result<Value> {
-    let mut stream = TcpStream::connect(addr)?;
+    let mut stream = internal_connect(addr)?;
     stream.set_read_timeout(Some(Duration::from_millis(800)))?;
     stream.set_write_timeout(Some(Duration::from_millis(800)))?;
     let frame = Value::Array(Some(
@@ -526,6 +536,25 @@ fn build_pairs() -> Vec<Pair> {
 }
 
 fn main() {
+    // Internal-mesh mutual TLS toward the nodes (the controller is a client
+    // everywhere — it has no listener). Same both-or-none-plus-ca gating as
+    // the other components.
+    match (
+        arg("--internal-ca"),
+        arg("--internal-cert"),
+        arg("--internal-key"),
+    ) {
+        (Some(ca), Some(cert), Some(key)) => {
+            let _ = INTERNAL_CLIENT.set(Some(
+                flint_tls::client_config(&ca, &cert, &key)
+                    .expect("build internal TLS client config"),
+            ));
+        }
+        (None, None, None) => {
+            let _ = INTERNAL_CLIENT.set(None);
+        }
+        _ => panic!("--internal-ca, --internal-cert, --internal-key must be given together"),
+    }
     let cfg = Config {
         poll: Duration::from_millis(arg_or("--poll-ms", 200)),
         confirm: arg_or("--confirm", 3),
@@ -630,7 +659,7 @@ fn reachable(addr: &str) -> bool {
 /// Like `call` but with a long read timeout, for driving a blocking
 /// FLINTMIGRATEIN (which streams a whole slot) during recovery.
 fn call_slow(addr: &str, args: &[&[u8]], timeout: Duration) -> std::io::Result<Value> {
-    let mut stream = TcpStream::connect(addr)?;
+    let mut stream = internal_connect(addr)?;
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(Duration::from_millis(800)))?;
     let frame = Value::Array(Some(

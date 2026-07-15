@@ -21,8 +21,9 @@ use openraft::raft::{
 use openraft::storage::Adaptor;
 use openraft::{BasicNode, Config, Raft};
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 use crate::raft::{NodeId, Request, Store, TypeConfig};
 use crate::registry::Mutation;
@@ -38,14 +39,14 @@ enum Rpc {
     Snapshot(InstallSnapshotRequest<TypeConfig>),
 }
 
-async fn read_framed(s: &mut TcpStream) -> std::io::Result<Vec<u8>> {
+async fn read_framed<S: AsyncRead + Unpin>(s: &mut S) -> std::io::Result<Vec<u8>> {
     let len = s.read_u32().await? as usize;
     let mut buf = vec![0u8; len];
     s.read_exact(&mut buf).await?;
     Ok(buf)
 }
 
-async fn write_framed(s: &mut TcpStream, bytes: &[u8]) -> std::io::Result<()> {
+async fn write_framed<S: AsyncWrite + Unpin>(s: &mut S, bytes: &[u8]) -> std::io::Result<()> {
     s.write_u32(bytes.len() as u32).await?;
     s.write_all(bytes).await?;
     s.flush().await
@@ -54,11 +55,40 @@ async fn write_framed(s: &mut TcpStream, bytes: &[u8]) -> std::io::Result<()> {
 // --- Network: dial a peer, ship one RPC, read its Result ---
 
 #[derive(Clone)]
-pub struct Network;
+pub struct Network {
+    /// Internal-mesh mutual-TLS connector for peer dials (None = plaintext).
+    pub tls: Option<TlsConnector>,
+}
 
 pub struct Conn {
     target: NodeId,
     addr: String,
+    tls: Option<TlsConnector>,
+}
+
+/// Dial `addr` (optionally through mutual TLS) and run one framed
+/// request/response exchange.
+async fn exchange(
+    addr: &str,
+    tls: &Option<TlsConnector>,
+    body: &[u8],
+) -> std::io::Result<Vec<u8>> {
+    let mut tcp = TcpStream::connect(addr).await?;
+    match tls {
+        None => {
+            write_framed(&mut tcp, body).await?;
+            read_framed(&mut tcp).await
+        }
+        Some(c) => {
+            let name = tokio_rustls::rustls::pki_types::ServerName::try_from(
+                flint_tls::INTERNAL_SNI,
+            )
+            .expect("internal SNI");
+            let mut t = c.connect(name, tcp).await?;
+            write_framed(&mut t, body).await?;
+            read_framed(&mut t).await
+        }
+    }
 }
 
 impl RaftNetworkFactory<TypeConfig> for Network {
@@ -67,6 +97,7 @@ impl RaftNetworkFactory<TypeConfig> for Network {
         Conn {
             target,
             addr: node.addr.clone(),
+            tls: self.tls.clone(),
         }
     }
 }
@@ -80,13 +111,7 @@ impl Conn {
         openraft::error::RPCError<NodeId, BasicNode, openraft::error::RaftError<NodeId>>,
     > {
         let body = serde_json::to_vec(rpc).map_err(|e| unreachable(&self.addr, e))?;
-        let mut s = TcpStream::connect(&self.addr)
-            .await
-            .map_err(|e| unreachable(&self.addr, e))?;
-        write_framed(&mut s, &body)
-            .await
-            .map_err(|e| unreachable(&self.addr, e))?;
-        let resp = read_framed(&mut s)
+        let resp = exchange(&self.addr, &self.tls, &body)
             .await
             .map_err(|e| unreachable(&self.addr, e))?;
         // Wire form: Result<Resp, RaftError<NodeId>>.
@@ -141,13 +166,7 @@ impl RaftNetwork<TypeConfig> for Conn {
     > {
         let body = serde_json::to_vec(&Rpc::Snapshot(rpc))
             .map_err(|e| openraft::error::RPCError::Unreachable(Unreachable::new(&e)))?;
-        let mut s = TcpStream::connect(&self.addr)
-            .await
-            .map_err(|e| openraft::error::RPCError::Unreachable(Unreachable::new(&e)))?;
-        write_framed(&mut s, &body)
-            .await
-            .map_err(|e| openraft::error::RPCError::Unreachable(Unreachable::new(&e)))?;
-        let resp = read_framed(&mut s)
+        let resp = exchange(&self.addr, &self.tls, &body)
             .await
             .map_err(|e| openraft::error::RPCError::Unreachable(Unreachable::new(&e)))?;
         let parsed: Result<
@@ -161,28 +180,41 @@ impl RaftNetwork<TypeConfig> for Conn {
 
 // --- RPC server: dispatch inbound frames to the local Raft ---
 
-async fn serve_rpc(raft: CpRaft, listener: TcpListener) {
+async fn serve_rpc(raft: CpRaft, listener: TcpListener, acceptor: Option<TlsAcceptor>) {
     loop {
-        let Ok((mut s, _)) = listener.accept().await else {
+        let Ok((sock, _)) = listener.accept().await else {
             continue;
         };
         let raft = raft.clone();
+        let acceptor = acceptor.clone();
         tokio::spawn(async move {
-            while let Ok(body) = read_framed(&mut s).await {
-                let Ok(rpc) = serde_json::from_slice::<Rpc>(&body) else {
-                    break;
-                };
-                let out = match rpc {
-                    Rpc::Append(r) => serde_json::to_vec(&raft.append_entries(r).await),
-                    Rpc::Vote(r) => serde_json::to_vec(&raft.vote(r).await),
-                    Rpc::Snapshot(r) => serde_json::to_vec(&raft.install_snapshot(r).await),
-                };
-                let Ok(out) = out else { break };
-                if write_framed(&mut s, &out).await.is_err() {
-                    break;
+            match acceptor {
+                None => rpc_conn(raft, sock).await,
+                Some(a) => {
+                    // Mutual TLS: a peer without a CA-signed cert fails here.
+                    if let Ok(t) = a.accept(sock).await {
+                        rpc_conn(raft, t).await;
+                    }
                 }
             }
         });
+    }
+}
+
+async fn rpc_conn<S: AsyncRead + AsyncWrite + Unpin>(raft: CpRaft, mut s: S) {
+    while let Ok(body) = read_framed(&mut s).await {
+        let Ok(rpc) = serde_json::from_slice::<Rpc>(&body) else {
+            break;
+        };
+        let out = match rpc {
+            Rpc::Append(r) => serde_json::to_vec(&raft.append_entries(r).await),
+            Rpc::Vote(r) => serde_json::to_vec(&raft.vote(r).await),
+            Rpc::Snapshot(r) => serde_json::to_vec(&raft.install_snapshot(r).await),
+        };
+        let Ok(out) = out else { break };
+        if write_framed(&mut s, &out).await.is_err() {
+            break;
+        }
     }
 }
 
@@ -207,6 +239,7 @@ pub struct Ha {
 
 /// Build the Raft node and start the RPC server. Returns the handle the
 /// client server proposes/reads through.
+#[allow(clippy::too_many_arguments)]
 pub async fn start(
     node_id: NodeId,
     raft_addr: &str,
@@ -214,6 +247,8 @@ pub async fn start(
     state_path: std::path::PathBuf,
     peers_spec: &str,
     client_spec: &str,
+    tls_server: Option<Arc<flint_tls::ServerConfig>>,
+    tls_client: Option<Arc<flint_tls::ClientConfig>>,
 ) -> std::io::Result<Ha> {
     let config = Arc::new(
         Config {
@@ -227,14 +262,18 @@ pub async fn start(
     );
     let store = Store::open(state_path);
     let (log_store, state_machine) = Adaptor::new(store.clone());
-    let raft = Raft::new(node_id, config, Network, log_store, state_machine)
+    let network = Network {
+        tls: tls_client.map(TlsConnector::from),
+    };
+    let raft = Raft::new(node_id, config, network, log_store, state_machine)
         .await
         .expect("raft new");
 
     let listener = TcpListener::bind(("127.0.0.1", raft_port)).await?;
     {
         let raft = raft.clone();
-        tokio::spawn(serve_rpc(raft, listener));
+        let acceptor = tls_server.map(TlsAcceptor::from);
+        tokio::spawn(serve_rpc(raft, listener, acceptor));
     }
     let _ = raft_addr;
 
@@ -311,24 +350,44 @@ fn snapshot_frame(v: u64, pairs: &str, tenants: &str) -> Value {
 /// Run the client RESP server: admin mutations propose through Raft (leader
 /// only; a follower redirects), reads and CPWATCH serve from the local
 /// applied registry.
-pub async fn run_client(ha: Arc<Ha>, port: u16) -> std::io::Result<()> {
+pub async fn run_client(
+    ha: Arc<Ha>,
+    port: u16,
+    tls_server: Option<Arc<flint_tls::ServerConfig>>,
+) -> std::io::Result<()> {
+    let acceptor = tls_server.map(TlsAcceptor::from);
     let listener = TcpListener::bind(("127.0.0.1", port)).await?;
     eprintln!(
-        "flint-controlplane[raft node {}] client on :{port}",
-        ha.node_id
+        "flint-controlplane[raft node {}] client on :{port} ({})",
+        ha.node_id,
+        if acceptor.is_some() { "internal mTLS" } else { "plaintext" }
     );
     loop {
         let Ok((sock, _)) = listener.accept().await else {
             continue;
         };
         let ha = Arc::clone(&ha);
+        let acceptor = acceptor.clone();
         tokio::spawn(async move {
-            let _ = client_conn(sock, ha).await;
+            match acceptor {
+                None => {
+                    let _ = client_conn(sock, ha).await;
+                }
+                Some(a) => {
+                    // Mutual TLS: proxies/admin present the mesh cert.
+                    if let Ok(t) = a.accept(sock).await {
+                        let _ = client_conn(t, ha).await;
+                    }
+                }
+            }
         });
     }
 }
 
-async fn client_conn(mut sock: TcpStream, ha: Arc<Ha>) -> std::io::Result<()> {
+async fn client_conn<S: AsyncRead + AsyncWrite + Unpin>(
+    mut sock: S,
+    ha: Arc<Ha>,
+) -> std::io::Result<()> {
     let mut buf: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 16 * 1024];
     loop {
@@ -530,8 +589,8 @@ async fn handle_admin(ha: &Ha, args: &[Vec<u8>]) -> Value {
     }
 }
 
-async fn watch_loop(
-    mut sock: TcpStream,
+async fn watch_loop<S: AsyncRead + AsyncWrite + Unpin>(
+    mut sock: S,
     ha: Arc<Ha>,
     proxy: String,
     mut acked: u64,
