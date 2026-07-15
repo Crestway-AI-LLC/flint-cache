@@ -40,6 +40,7 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpListener;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -53,6 +54,28 @@ const RETRY_BUDGET: Duration = Duration::from_secs(5);
 /// Backend I/O timeout. Generous: a frozen-slot drain or a slow disk read
 /// must not be misread as a dead node.
 const BACKEND_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Default cap on concurrent client connections — proxy admission control.
+/// Thread-per-connection means each connection costs a thread; without a
+/// bound, a connection storm (or a slow/widowed backend holding threads)
+/// exhausts the proxy tier. Generous vs any real ops footprint; tunable with
+/// `--max-conns`. Beyond it, new connections are shed (not silently dropped)
+/// with a -THROTTLED the client already knows to back off on.
+const DEFAULT_MAX_CONNS: usize = 1024;
+
+/// Written to a connection shed at the admission cap. Reuses the -THROTTLED
+/// contract (client: retry with backoff) the data plane uses for durability
+/// shedding, so the client needs no new vocabulary for "busy, back off".
+const SHED_FRAME: &[u8] = b"-THROTTLED proxy at connection capacity, retry with backoff\r\n";
+
+/// Decrements the live-connection counter when a worker exits — by any path,
+/// including a panic — so a crashing handler can never leak a slot.
+struct ConnGuard(Arc<AtomicUsize>);
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
 
 fn arg(name: &str) -> Option<String> {
     std::env::args().skip_while(|a| a != name).nth(1)
@@ -871,32 +894,54 @@ fn main() -> std::io::Result<()> {
         });
     }
 
+    let max_conns: usize = arg("--max-conns")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_MAX_CONNS);
+    let active = Arc::new(AtomicUsize::new(0));
+
     let listener = TcpListener::bind(("127.0.0.1", port))?;
     eprintln!(
-        "flint-proxy listening on 127.0.0.1:{port} ({})",
+        "flint-proxy listening on 127.0.0.1:{port} ({}, max-conns {max_conns})",
         if tls.is_some() { "TLS" } else { "plaintext" }
     );
     for stream in listener.incoming() {
-        let Ok(stream) = stream else { continue };
+        let Ok(mut stream) = stream else { continue };
+        // Admission control: reserve a slot with fetch_add, roll back and shed
+        // if it put us over the cap (no worker thread is spawned for a shed).
+        if active.fetch_add(1, Ordering::Relaxed) >= max_conns {
+            active.fetch_sub(1, Ordering::Relaxed);
+            // Best-effort -THROTTLED for a plaintext client. Under frontend
+            // TLS we skip the handshake (spending it on a shed would defeat
+            // the guard) and just close — the client sees a reset and backs
+            // off, the same contract.
+            if tls.is_none() {
+                let _ = stream.write_all(SHED_FRAME);
+            }
+            continue;
+        }
         let topo = Arc::clone(&topo);
         let tls = tls.clone();
-        std::thread::spawn(move || match tls {
-            Some(cfg) => {
-                // The handshake runs lazily on the first read/write inside
-                // serve_client (the client sends the first command). A
-                // plaintext client hitting the TLS port fails the handshake
-                // and the connection drops — no RESP is ever processed.
-                let conn = match rustls::ServerConnection::new(cfg) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        eprintln!("tls: connection setup failed: {e}");
-                        return;
-                    }
-                };
-                let _ = serve_client(rustls::StreamOwned::new(conn, stream), topo);
-            }
-            None => {
-                let _ = serve_client(stream, topo);
+        let guard = ConnGuard(Arc::clone(&active));
+        std::thread::spawn(move || {
+            let _guard = guard; // decrements on any exit, including panic
+            match tls {
+                Some(cfg) => {
+                    // The handshake runs lazily on the first read/write inside
+                    // serve_client (the client sends the first command). A
+                    // plaintext client hitting the TLS port fails the handshake
+                    // and the connection drops — no RESP is ever processed.
+                    let conn = match rustls::ServerConnection::new(cfg) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            eprintln!("tls: connection setup failed: {e}");
+                            return;
+                        }
+                    };
+                    let _ = serve_client(rustls::StreamOwned::new(conn, stream), topo);
+                }
+                None => {
+                    let _ = serve_client(stream, topo);
+                }
             }
         });
     }
