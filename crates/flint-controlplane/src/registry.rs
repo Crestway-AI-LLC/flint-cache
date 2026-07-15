@@ -16,6 +16,16 @@ pub enum Mutation {
         name: String,
         subset: Vec<String>,
     },
+    /// Dual-version rotation: current token becomes previous, `new` becomes
+    /// current. Both authenticate until DropPrev — zero-downtime rotation.
+    RotateToken {
+        name: String,
+        new: String,
+    },
+    /// Retire the previous token once it has drained.
+    DropPrev {
+        name: String,
+    },
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -24,6 +34,10 @@ pub struct Tenant {
     pub token: String,
     pub ns: String,
     pub subset: Vec<String>,
+    /// Previous token during a rotation; both it and `token` auth to `ns`
+    /// until dropped. None outside a rotation window.
+    #[serde(default)]
+    pub prev_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -92,12 +106,23 @@ impl RegistryState {
                         token,
                         ns,
                         subset,
+                        prev_token: None,
                     },
                 );
             }
             Mutation::SetSubset { name, subset } => {
                 if let Some(t) = self.tenants.get_mut(&name) {
                     t.subset = subset;
+                }
+            }
+            Mutation::RotateToken { name, new } => {
+                if let Some(t) = self.tenants.get_mut(&name) {
+                    t.prev_token = Some(std::mem::replace(&mut t.token, new));
+                }
+            }
+            Mutation::DropPrev { name } => {
+                if let Some(t) = self.tenants.get_mut(&name) {
+                    t.prev_token = None;
                 }
             }
         }
@@ -116,7 +141,13 @@ impl RegistryState {
             .tenants
             .values()
             .filter(|t| t.subset.iter().any(|s| s == proxy))
-            .map(|t| format!("{}={}", t.token, t.ns))
+            .flat_map(|t| {
+                let mut v = vec![format!("{}={}", t.token, t.ns)];
+                if let Some(p) = &t.prev_token {
+                    v.push(format!("{}={}", p, t.ns));
+                }
+                v
+            })
             .collect::<Vec<_>>()
             .join(",");
         (self.version, pairs, tenants)

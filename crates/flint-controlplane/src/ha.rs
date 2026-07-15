@@ -470,6 +470,38 @@ async fn handle_admin(ha: &Ha, args: &[Vec<u8>]) -> Value {
                 Err(l) => redirect(l),
             }
         }
+        b"CPROTATETOKEN" => {
+            let (Some(name), Some(new)) = (text(1), text(2)) else {
+                return Value::Error("ERR CPROTATETOKEN <name> <new-token>".into());
+            };
+            if !clean(&new) {
+                return Value::Error("ERR invalid token".into());
+            }
+            let reg = ha.store.registry().await;
+            if !reg.tenants.contains_key(&name) {
+                return Value::Error("ERR no such tenant".into());
+            }
+            if reg
+                .tenants
+                .values()
+                .any(|t| t.token == new || t.prev_token.as_deref() == Some(new.as_str()))
+            {
+                return Value::Error("ERR token already in use".into());
+            }
+            match ha.propose(Mutation::RotateToken { name, new }).await {
+                Ok(_) => Value::Simple("OK rotated (both tokens valid until CPDROPPREV)".into()),
+                Err(l) => redirect(l),
+            }
+        }
+        b"CPDROPPREV" => {
+            let Some(name) = text(1) else {
+                return Value::Error("ERR CPDROPPREV <name>".into());
+            };
+            match ha.propose(Mutation::DropPrev { name }).await {
+                Ok(_) => Value::Simple("OK".into()),
+                Err(l) => redirect(l),
+            }
+        }
         b"CPINFO" => {
             let reg = ha.store.registry().await;
             let leader = ha.raft.current_leader().await;

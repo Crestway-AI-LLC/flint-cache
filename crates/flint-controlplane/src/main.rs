@@ -145,6 +145,7 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
                     token,
                     ns,
                     subset,
+                    prev_token: None,
                 },
             );
             match st.commit() {
@@ -169,6 +170,52 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
             } else {
                 subset.split(',').map(String::from).collect()
             };
+            match st.commit() {
+                Ok(_) => {}
+                Err(e) => return err(&format!("persist: {e}")),
+            }
+            shared.changed.notify_all();
+            ok()
+        }
+        b"CPROTATETOKEN" => {
+            let (Some(name), Some(new)) = (text(1), text(2)) else {
+                return err("CPROTATETOKEN <name> <new-token>");
+            };
+            if !clean(&new) {
+                return err("invalid token");
+            }
+            let Ok(mut st) = shared.state.lock() else {
+                return err("state lock");
+            };
+            if st
+                .tenants
+                .values()
+                .any(|t| t.token == new || t.prev_token.as_deref() == Some(new.as_str()))
+            {
+                return err("token already in use");
+            }
+            let Some(t) = st.tenants.get_mut(&name) else {
+                return err("no such tenant");
+            };
+            t.prev_token = Some(std::mem::replace(&mut t.token, new));
+            match st.commit() {
+                Ok(_) => {}
+                Err(e) => return err(&format!("persist: {e}")),
+            }
+            shared.changed.notify_all();
+            Value::Simple("OK rotated (both tokens valid until CPDROPPREV)".into())
+        }
+        b"CPDROPPREV" => {
+            let Some(name) = text(1) else {
+                return err("CPDROPPREV <name>");
+            };
+            let Ok(mut st) = shared.state.lock() else {
+                return err("state lock");
+            };
+            let Some(t) = st.tenants.get_mut(&name) else {
+                return err("no such tenant");
+            };
+            t.prev_token = None;
             match st.commit() {
                 Ok(_) => {}
                 Err(e) => return err(&format!("persist: {e}")),

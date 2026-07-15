@@ -81,6 +81,10 @@ struct Topology {
     moved: RwLock<HashMap<(Vec<u8>, u16), String>>,
     /// token -> namespace.
     tenants: RwLock<HashMap<String, Vec<u8>>>,
+    /// token -> successful-AUTH count. During a dual-version rotation the
+    /// operator watches the PREVIOUS token's count go flat before dropping
+    /// it (CPDROPPREV) — the per-version usage metric.
+    auth_counts: RwLock<HashMap<String, u64>>,
     /// True only for a standalone proxy with no tenants configured: no
     /// auth, default namespace. A control-plane-fed proxy is never open —
     /// before its first snapshot it simply has no tenants yet.
@@ -113,6 +117,20 @@ impl Topology {
 
     fn lookup_token(&self, token: &str) -> Option<Vec<u8>> {
         self.tenants.read().ok()?.get(token).cloned()
+    }
+
+    fn bump_auth(&self, token: &str) {
+        if let Ok(mut c) = self.auth_counts.write() {
+            *c.entry(token.to_string()).or_insert(0) += 1;
+        }
+    }
+
+    fn auth_count(&self, token: &str) -> u64 {
+        self.auth_counts
+            .read()
+            .ok()
+            .and_then(|c| c.get(token).copied())
+            .unwrap_or(0)
     }
 
     /// A backend at `addr` failed: forget cached state that points at it and
@@ -454,6 +472,16 @@ enum AuthStep {
 /// so the backend-connection namespace pinning can never go stale.
 fn auth_step(topo: &Topology, authed_ns: &mut Option<Vec<u8>>, args: &[Vec<u8>]) -> AuthStep {
     let name = args.first().map(|n| n.to_ascii_uppercase());
+    // Ops query: per-token AUTH count (drain check during token rotation).
+    // Requires knowing the exact token; low-sensitivity, answered pre-auth.
+    // (A real deploy gates this behind mTLS/admin.)
+    if name.as_deref() == Some(b"PROXYAUTHCOUNT") {
+        let n = args
+            .get(1)
+            .map(|t| topo.auth_count(&String::from_utf8_lossy(t)))
+            .unwrap_or(0);
+        return AuthStep::Reply(Value::Integer(n as i64));
+    }
     if name.as_deref() == Some(b"AUTH") {
         let token = match args.len() {
             2 => &args[1],
@@ -480,6 +508,7 @@ fn auth_step(topo: &Topology, authed_ns: &mut Option<Vec<u8>>, args: &[Vec<u8>])
             }
             _ => {}
         }
+        topo.bump_auth(&String::from_utf8_lossy(token));
         *authed_ns = Some(ns);
         return AuthStep::Reply(Value::Simple("OK".into()));
     }
@@ -739,6 +768,7 @@ fn main() -> std::io::Result<()> {
         routing: RwLock::new(Routing { pairs, masters }),
         moved: RwLock::new(HashMap::new()),
         tenants: RwLock::new(tenants),
+        auth_counts: RwLock::new(HashMap::new()),
         open_mode,
     });
 

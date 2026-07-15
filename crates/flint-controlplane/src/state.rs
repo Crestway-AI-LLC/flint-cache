@@ -28,6 +28,8 @@ pub struct Tenant {
     /// The shuffle-shard subset of proxies serving this tenant. Empty means
     /// "not yet assigned" (no proxies registered at add time).
     pub subset: Vec<String>,
+    /// Previous token during a rotation; both auth to `ns` until dropped.
+    pub prev_token: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -107,6 +109,9 @@ impl State {
                         } else {
                             subset.split(',').map(String::from).collect()
                         };
+                        let prev_token = parts
+                            .next()
+                            .and_then(|p| if p == "-" { None } else { Some(p.to_string()) });
                         s.tenants.insert(
                             name.to_string(),
                             Tenant {
@@ -114,6 +119,7 @@ impl State {
                                 token: token.to_string(),
                                 ns: ns.to_string(),
                                 subset,
+                                prev_token,
                             },
                         );
                     }
@@ -139,8 +145,12 @@ impl State {
                 t.subset.join(",")
             };
             out.push_str(&format!(
-                "tenant {} {} {} {subset}\n",
-                t.name, t.token, t.ns
+                "tenant {} {} {} {subset} {}\n",
+                t.name,
+                t.token,
+                t.ns,
+                t.prev_token.as_deref().unwrap_or("-"),
+                subset = subset
             ));
         }
         out
@@ -179,7 +189,13 @@ impl State {
             .tenants
             .values()
             .filter(|t| t.subset.iter().any(|s| s == proxy))
-            .map(|t| format!("{}={}", t.token, t.ns))
+            .flat_map(|t| {
+                let mut v = vec![format!("{}={}", t.token, t.ns)];
+                if let Some(p) = &t.prev_token {
+                    v.push(format!("{}={}", p, t.ns));
+                }
+                v
+            })
             .collect::<Vec<_>>()
             .join(",");
         (self.version, pairs, tenants)
@@ -237,6 +253,7 @@ mod tests {
                 token: "tok-acme".into(),
                 ns: "acme".into(),
                 subset: vec!["p1:7000".into()],
+                prev_token: None,
             },
         );
         let v = s.commit().expect("commit");
@@ -265,6 +282,7 @@ mod tests {
                     token: format!("tok-{name}"),
                     ns: name.into(),
                     subset: vec![proxy.into()],
+                    prev_token: None,
                 },
             );
         }
