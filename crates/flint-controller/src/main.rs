@@ -127,6 +127,35 @@ fn internal_connect(addr: &str) -> std::io::Result<flint_tls::Stream> {
     flint_tls::connect(addr, INTERNAL_CLIENT.get().unwrap_or(&None))
 }
 
+/// Fleet-journal target (--journal <cp-addr>). Best-effort, detached: the
+/// control loop's decisions never wait on the journal.
+static JOURNAL_TARGET: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+
+fn journal_event(
+    actor: &str,
+    kind: flint_journal::EventKind,
+    subject: &str,
+    epoch: Option<String>,
+    cause: &str,
+) {
+    let Some(Some(target)) = JOURNAL_TARGET.get().cloned() else {
+        return;
+    };
+    flint_journal::emit_detached(
+        target,
+        INTERNAL_CLIENT.get().cloned().unwrap_or(None),
+        flint_journal::Event {
+            at_ms: flint_journal::now_ms(),
+            actor: format!("controller:{actor}"),
+            kind,
+            subject: subject.to_string(),
+            epoch,
+            cause: Some(cause.to_string()),
+            detail: None,
+        },
+    );
+}
+
 fn call(addr: &str, args: &[&[u8]]) -> std::io::Result<Value> {
     let mut stream = internal_connect(addr)?;
     stream.set_read_timeout(Some(Duration::from_millis(800)))?;
@@ -436,6 +465,15 @@ impl Pair {
         if self.no_master_streak < cfg.confirm {
             return;
         }
+        if self.no_master_streak == cfg.confirm {
+            journal_event(
+                &cfg.id,
+                flint_journal::EventKind::Detected,
+                &self.label,
+                None,
+                "master unreachable, confirmed across required ticks",
+            );
+        }
 
         // Degraded-window gate: only auto-promote a recently-converged pair.
         if !self.converged_ever || self.last_converged.elapsed() > cfg.max_stale {
@@ -471,6 +509,13 @@ impl Pair {
                 eprintln!(
                     "[{}][{}] PROMOTED {} at (0,{next}): {s}",
                     cfg.id, self.label, survivor.addr
+                );
+                journal_event(
+                    &cfg.id,
+                    flint_journal::EventKind::PromoteIssued,
+                    &survivor.addr,
+                    Some(format!("(0,{next})")),
+                    "epoch-fenced promotion of the freshest survivor",
                 );
                 self.converged_ever = false; // new master has no replica yet
                 self.no_master_streak = 0;
@@ -555,6 +600,7 @@ fn main() {
         }
         _ => panic!("--internal-ca, --internal-cert, --internal-key must be given together"),
     }
+    let _ = JOURNAL_TARGET.set(arg("--journal"));
     let cfg = Config {
         poll: Duration::from_millis(arg_or("--poll-ms", 200)),
         confirm: arg_or("--confirm", 3),

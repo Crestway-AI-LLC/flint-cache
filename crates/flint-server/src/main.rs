@@ -50,10 +50,38 @@ fn internal_connect(addr: &str) -> std::io::Result<flint_tls::Stream> {
     flint_tls::connect(addr, INTERNAL_CLIENT.get().unwrap_or(&None))
 }
 
+/// Fleet-journal target (--journal <cp-addr>) and this node's own address,
+/// for role-transition events. Reporting is best-effort and detached — a
+/// transition never waits on (or fails because of) the journal.
+static JOURNAL_TARGET: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+static SELF_ADDR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+fn journal_event(kind: flint_journal::EventKind, epoch: Option<String>, cause: &str) {
+    let Some(Some(target)) = JOURNAL_TARGET.get().cloned() else {
+        return;
+    };
+    let me = SELF_ADDR.get().cloned().unwrap_or_default();
+    flint_journal::emit_detached(
+        target,
+        INTERNAL_CLIENT.get().cloned().unwrap_or(None),
+        flint_journal::Event {
+            at_ms: flint_journal::now_ms(),
+            actor: format!("node:{me}"),
+            kind,
+            subject: me.clone(),
+            epoch,
+            cause: Some(cause.to_string()),
+            detail: None,
+        },
+    );
+}
+
 fn main() -> std::io::Result<()> {
     let port = arg("--port")
         .and_then(|p| p.parse::<u16>().ok())
         .unwrap_or(6380);
+    let _ = SELF_ADDR.set(format!("127.0.0.1:{port}"));
+    let _ = JOURNAL_TARGET.set(arg("--journal"));
     let engine = arg("--engine").unwrap_or_else(|| "mem".into());
     let replica_of = arg("--replica-of");
 
@@ -308,6 +336,11 @@ fn main() -> std::io::Result<()> {
                     read_only.store(true, Ordering::Relaxed);
                     eprintln!(
                         "lease expired: self-fenced to read-only (partitioned from controllers)"
+                    );
+                    journal_event(
+                        flint_journal::EventKind::SelfFenced,
+                        None,
+                        "lease expired: no controller renewal",
                     );
                 }
             }
@@ -774,6 +807,11 @@ fn flintpromote(
             tailer_stop.store(true, Ordering::Relaxed);
             read_only.store(false, Ordering::Relaxed);
             eprintln!("promoted to master at role epoch {epoch}");
+            journal_event(
+                flint_journal::EventKind::Promoted,
+                Some(epoch.to_string()),
+                "promotion command applied (epoch-fenced)",
+            );
             Value::Simple(format!("OK promoted at {epoch}"))
         }
         Err(ManifestError::Fenced { current }) => Value::Error(format!(
@@ -842,6 +880,11 @@ fn flintdemote(
             read_only.store(true, Ordering::Relaxed);
             eprintln!(
                 "demoted to replica at role epoch {epoch} (fenced; wipe + --replica-of to resync)"
+            );
+            journal_event(
+                flint_journal::EventKind::Demoted,
+                Some(epoch.to_string()),
+                "demotion command applied (epoch-fenced)",
             );
             Value::Simple(format!("OK demoted at {epoch}"))
         }

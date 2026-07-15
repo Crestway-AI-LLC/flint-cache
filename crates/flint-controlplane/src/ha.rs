@@ -235,6 +235,9 @@ pub struct Ha {
     pub members: BTreeMap<NodeId, BasicNode>,
     /// node -> client (RESP) address, for leader-redirect replies.
     pub client_addrs: BTreeMap<NodeId, String>,
+    /// Node-local fleet-journal file (observability, not Raft state; each
+    /// HA node journals the events IT receives — emitters talk to one CP).
+    pub journal_path: String,
 }
 
 /// Build the Raft node and start the RPC server. Returns the handle the
@@ -260,6 +263,7 @@ pub async fn start(
         .validate()
         .expect("raft config"),
     );
+    let journal_path = format!("{}.journal", state_path.display());
     let store = Store::open(state_path);
     let (log_store, state_machine) = Adaptor::new(store.clone());
     let network = Network {
@@ -292,6 +296,7 @@ pub async fn start(
         node_id,
         members,
         client_addrs,
+        journal_path,
     })
 }
 
@@ -560,6 +565,21 @@ async fn handle_admin(ha: &Ha, args: &[Vec<u8>]) -> Value {
                 Ok(_) => Value::Simple("OK".into()),
                 Err(l) => redirect(l),
             }
+        }
+        // Fleet journal: node-local append (observability, not Raft intent).
+        b"CPJOURNAL" => {
+            let Some(line) = text(1) else {
+                return Value::Error("ERR CPJOURNAL <event-json>".into());
+            };
+            match flint_journal::append_line(&ha.journal_path, &line) {
+                Ok(()) => Value::Simple("OK".into()),
+                Err(e) => Value::Error(format!("ERR journal append: {e}")),
+            }
+        }
+        b"CPJOURNALREAD" => {
+            let n = text(1).and_then(|v| v.parse().ok()).unwrap_or(50);
+            let lines = flint_journal::tail(&ha.journal_path, n);
+            Value::Bulk(Some(lines.join("\n").into_bytes()))
         }
         b"CPINFO" => {
             let reg = ha.store.registry().await;

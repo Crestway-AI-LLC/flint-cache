@@ -1,0 +1,16 @@
+[package]
+name = "flint-journal"
+description = "Fleet journal (design.md §2.10 interface 3): the typed event of every state transition — actor, cause, epoch — plus the best-effort emitter every component uses to report into the control plane's journal. Gauges say what is; the journal says what happened and why."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+flint-resp = { path = "../flint-resp" }
+flint-tls = { path = "../flint-tls" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[lints]
+workspace = true

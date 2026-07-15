@@ -54,6 +54,9 @@ fn arg(name: &str) -> Option<String> {
 struct Shared {
     state: Mutex<State>,
     changed: Condvar,
+    /// Fleet-journal file (append-only JSONL beside --state). Observability,
+    /// not intent: outside the durability contract of the registry.
+    journal_path: String,
 }
 
 fn ok() -> Value {
@@ -222,6 +225,22 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
             }
             shared.changed.notify_all();
             ok()
+        }
+        // Fleet journal (flint-journal): typed state-transition events from
+        // every component. Append is a single pre-serialized JSON line.
+        b"CPJOURNAL" => {
+            let Some(line) = text(1) else {
+                return err("CPJOURNAL <event-json>");
+            };
+            match flint_journal::append_line(&shared.journal_path, &line) {
+                Ok(()) => ok(),
+                Err(e) => err(&format!("journal append: {e}")),
+            }
+        }
+        b"CPJOURNALREAD" => {
+            let n = text(1).and_then(|v| v.parse().ok()).unwrap_or(50);
+            let lines = flint_journal::tail(&shared.journal_path, n);
+            Value::Bulk(Some(lines.join("\n").into_bytes()))
         }
         b"CPINFO" => {
             let Ok(st) = shared.state.lock() else {
@@ -454,6 +473,7 @@ fn main() -> std::io::Result<()> {
     let shared = Arc::new(Shared {
         state: Mutex::new(state),
         changed: Condvar::new(),
+        journal_path: format!("{path}.journal"),
     });
     let internal_tls = internal_server_config();
     let listener = TcpListener::bind(("127.0.0.1", port))?;

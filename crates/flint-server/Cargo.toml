@@ -11,6 +11,7 @@ flint-resp = { path = "../flint-resp" }
 flint-slot = { path = "../flint-slot" }
 flint-storage = { path = "../flint-storage" }
 flint-tls = { path = "../flint-tls" }
+flint-journal = { path = "../flint-journal" }
 
 [lints]
 workspace = true

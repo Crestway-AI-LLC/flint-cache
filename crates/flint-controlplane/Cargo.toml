@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 flint-resp = { path = "../flint-resp" }
 flint-tls = { path = "../flint-tls" }
+flint-journal = { path = "../flint-journal" }
 openraft = { version = "0.9", features = ["serde"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "time", "sync"] }
 # Async TLS for the tokio paths (Raft RPC + HA client port); reuses the
