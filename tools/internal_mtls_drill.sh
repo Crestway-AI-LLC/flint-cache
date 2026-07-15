@@ -7,9 +7,9 @@
 #   - a PLAINTEXT client on the server's data port is REJECTED (mTLS enforced)
 #   - a proxy WITHOUT the internal creds cannot reach the TLS backend (no
 #     master discovered -> writes error out, not silently plaintext)
-#   - the replication/migration hijack (FLINTSYNC) is refused over TLS (its
-#     socket-cloning duplex is the next increment) — verified with a real
-#     mutual-TLS client that DOES pass the handshake
+#   - the replication hijack (FLINTSYNC) handshakes over TLS (its duplex is
+#     single-threaded now; end-to-end replication parity over TLS is proven
+#     in node_tls_drill.sh)
 #   - with no --internal-* flags, server+proxy are plaintext, unchanged
 set -u
 cd "$(dirname "$0")/.."
@@ -72,7 +72,7 @@ R=$(valkey-cli -p 7771 SET nc v 2>&1)
 echo "  credential-less proxy could not reach backend: ${R:0:60}"
 pkill -9 -f "flint-proxy --port 7771" 2>/dev/null
 
-echo "== replication hijack (FLINTSYNC) is REFUSED over TLS (even with a valid cert)"
+echo "== replication hijack (FLINTSYNC) WORKS over TLS (single-threaded duplex)"
 X=$(python3 - "$D" <<'PY'
 import socket, ssl, sys
 d = sys.argv[1]
@@ -88,8 +88,8 @@ with socket.create_connection(("127.0.0.1", 6770), timeout=3) as raw:
         except socket.timeout: print("<no reply>")
 PY
 )
-echo "$X" | grep -q "not supported over TLS" || { echo "FAIL: FLINTSYNC not refused over TLS (got: $X)"; exit 1; }
-echo "  FLINTSYNC over TLS refused cleanly: ${X%%$'\r'*}"
+echo "$X" | grep -q "FLINTSYNC-OK" || { echo "FAIL: FLINTSYNC handshake failed over TLS (got: $X)"; exit 1; }
+echo "  FLINTSYNC over TLS handshakes: ${X%%$'\r'*} (full parity in node_tls_drill)"
 
 echo "== no --internal-* flags: server+proxy plaintext, unchanged"
 pkill -9 -f flint-server 2>/dev/null; pkill -9 -f flint-proxy 2>/dev/null; sleep 0.4
@@ -102,4 +102,4 @@ sleep 0.8
 [ "$(valkey-cli -p 7772 GET pk)" = "world" ] || { echo "FAIL: plaintext GET"; exit 1; }
 echo "  plaintext mode unchanged"
 
-echo "PASS: internal mTLS proxy<->backend — mutual auth enforced, plaintext & credential-less rejected, hijack deferred, plaintext mode intact"
+echo "PASS: internal mTLS proxy<->backend — mutual auth enforced, plaintext & credential-less rejected, FLINTSYNC handshakes over TLS, plaintext mode intact"

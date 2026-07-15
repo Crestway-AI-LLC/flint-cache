@@ -13,7 +13,7 @@ mod commands;
 mod repl_hub;
 
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpListener;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -35,12 +35,54 @@ fn arg(name: &str) -> Option<String> {
     std::env::args().skip_while(|a| a != name).nth(1)
 }
 
+/// Internal-mesh mutual-TLS client config (the --internal-* triple in the
+/// client role), set once at startup. Every node→node dial — replication
+/// tail, full-sync download, migrate-in, cutover orchestration — goes
+/// through [`internal_connect`], so the whole data plane speaks mutual TLS
+/// when configured and plaintext when not, with one dial path.
+static INTERNAL_CLIENT: std::sync::OnceLock<Option<Arc<flint_tls::ClientConfig>>> =
+    std::sync::OnceLock::new();
+
+// Every node→node dialer is rocks-gated (replication/migration), so the
+// mem-only build never dials out.
+#[cfg_attr(not(feature = "rocks"), allow(dead_code))]
+fn internal_connect(addr: &str) -> std::io::Result<flint_tls::Stream> {
+    flint_tls::connect(addr, INTERNAL_CLIENT.get().unwrap_or(&None))
+}
+
 fn main() -> std::io::Result<()> {
     let port = arg("--port")
         .and_then(|p| p.parse::<u16>().ok())
         .unwrap_or(6380);
     let engine = arg("--engine").unwrap_or_else(|| "mem".into());
     let replica_of = arg("--replica-of");
+
+    // Internal-mesh mutual TLS: one --internal-* triple, used in BOTH roles —
+    // server config on the data-port listener (peers must present a cert
+    // chaining to the CA), client config on every node→node dial (replication
+    // tail, full sync, migrate, cutover). Parsed before anything dials out:
+    // a fresh replica's checkpoint download happens during startup, below.
+    let internal_tls: Option<Arc<flint_tls::ServerConfig>> = match (
+        arg("--internal-ca"),
+        arg("--internal-cert"),
+        arg("--internal-key"),
+    ) {
+        (Some(ca), Some(cert), Some(key)) => {
+            let _ = INTERNAL_CLIENT.set(Some(
+                flint_tls::client_config(&ca, &cert, &key)
+                    .expect("build internal TLS client config"),
+            ));
+            Some(
+                flint_tls::server_config(&ca, &cert, &key)
+                    .expect("build internal TLS server config"),
+            )
+        }
+        (None, None, None) => {
+            let _ = INTERNAL_CLIENT.set(None);
+            None
+        }
+        _ => panic!("--internal-ca, --internal-cert, --internal-key must be given together"),
+    };
     // Role is dynamic: FLINTPROMOTE flips a replica to master at runtime.
     let read_only = Arc::new(AtomicBool::new(replica_of.is_some()));
     let tailer_stop = Arc::new(AtomicBool::new(false));
@@ -271,23 +313,6 @@ fn main() -> std::io::Result<()> {
             }
         });
     }
-    // Internal-mesh mutual TLS on the data port: when the --internal-* triple
-    // is set, every accepted connection is TLS and the peer MUST present a
-    // cert chaining to the shared CA (the proxy and replica peers do). This
-    // is the internal hop the FLINTNS comment above anticipated. The three
-    // hijack commands (FLINTSYNC/FLINTFULLSYNC/FLINTMIGRATEOUT) run a duplex
-    // that clones the socket, which a TLS session can't do — they're rejected
-    // over TLS until the node↔node increment restructures the push loop.
-    let internal_tls: Option<Arc<flint_tls::ServerConfig>> =
-        match (arg("--internal-ca"), arg("--internal-cert"), arg("--internal-key")) {
-            (Some(ca), Some(cert), Some(key)) => Some(
-                flint_tls::server_config(&ca, &cert, &key)
-                    .expect("build internal TLS server config"),
-            ),
-            (None, None, None) => None,
-            _ => panic!("--internal-ca, --internal-cert, --internal-key must be given together"),
-        };
-
     let listener = TcpListener::bind(("127.0.0.1", port))?;
     eprintln!(
         "flint-server listening on 127.0.0.1:{port} ({})",
@@ -424,35 +449,17 @@ fn serve(
                         return Ok(());
                     };
                     // FLINTSYNC/FLINTFULLSYNC/FLINTMIGRATEOUT hijack the
-                    // connection into a socket-cloning duplex — which a TLS
-                    // session can't do. Over an internal-TLS connection they
-                    // are refused (node↔node TLS is a later increment); over
-                    // plaintext they take the raw socket as before.
-                    let is_hijack = args.first().is_some_and(|n| {
-                        n.eq_ignore_ascii_case(b"FLINTSYNC")
-                            || n.eq_ignore_ascii_case(b"FLINTFULLSYNC")
-                            || n.eq_ignore_ascii_case(b"FLINTMIGRATEOUT")
-                    });
-                    if is_hijack && stream.is_tls() {
-                        encode(
-                            &Value::Error(
-                                "ERR replication/migration hijack not supported over TLS yet \
-                                 (node↔node TLS is a later increment)"
-                                    .into(),
-                            ),
-                            &mut out,
-                        );
-                        stream.write_all(&out)?;
-                        return Ok(());
-                    }
+                    // connection into a long-lived stream. All three are
+                    // single-threaded over the generic stream (flintsync
+                    // drains ACKs inline), so they run over plaintext and
+                    // internal TLS alike.
                     if args
                         .first()
                         .is_some_and(|n| n.eq_ignore_ascii_case(b"FLINTSYNC"))
                     {
                         buf.drain(..consumed);
                         stream.write_all(&out)?;
-                        let tcp = stream.into_plain().expect("hijack checked plaintext");
-                        return flintsync(tcp, rocks, hub, &args);
+                        return flintsync(stream, rocks, hub, &args);
                     }
                     if args
                         .first()
@@ -460,8 +467,7 @@ fn serve(
                     {
                         buf.drain(..consumed);
                         stream.write_all(&out)?;
-                        let tcp = stream.into_plain().expect("hijack checked plaintext");
-                        return flintfullsync(tcp, rocks);
+                        return flintfullsync(stream, rocks);
                     }
                     if args
                         .first()
@@ -469,8 +475,7 @@ fn serve(
                     {
                         buf.drain(..consumed);
                         stream.write_all(&out)?;
-                        let tcp = stream.into_plain().expect("hijack checked plaintext");
-                        return flintmigrateout(tcp, rocks, &args);
+                        return flintmigrateout(stream, rocks, &args);
                     }
                     let reply = execute(
                         store,
@@ -917,9 +922,17 @@ fn frame_to_args(frame: Value) -> Option<Vec<Vec<u8>>> {
 
 /// Master side of replication: stream WAL batches from the requested
 /// sequence until the replica disconnects.
+///
+/// One loop owns the whole connection: each cycle drains the replica's ACKs
+/// (bounded by a 20ms read timeout, which is also the loop's idle pacing —
+/// it replaces the old sleep), then pushes any new WAL batches. Single-
+/// threaded duplex means no socket cloning, so the stream can be TLS — a
+/// rustls session is one stateful object and cannot be `try_clone`d the way
+/// the old dedicated ACK-reader thread required. Throughput ceiling is
+/// REPL_TAIL_BUDGET_BYTES per ~20ms cycle (~200MB/s), far above a link.
 #[cfg(feature = "rocks")]
 fn flintsync(
-    mut stream: TcpStream,
+    mut stream: flint_tls::Stream,
     rocks: Option<RocksHandle>,
     hub: &Arc<ReplHub>,
     args: &[Vec<u8>],
@@ -942,69 +955,102 @@ fn flintsync(
     let mut out = Vec::new();
     encode(&Value::Simple(format!("FLINTSYNC-OK {cursor}")), &mut out);
     stream.write_all(&out)?;
+    stream.set_read_timeout(Some(std::time::Duration::from_millis(20)))?;
     eprintln!("replica connected, streaming from seq {cursor}");
-    // ACK reader: the replica confirms applied sequences on the same socket.
     let replica_id = hub.register_replica();
-    {
-        let reader = stream.try_clone()?;
-        let hub = Arc::clone(hub);
-        std::thread::spawn(move || {
-            ack_reader(reader, &hub, replica_id);
-            hub.unregister_replica(replica_id);
-        });
-    }
-    loop {
-        hub.record_sample(kv.latest_seq(), flint_storage::strings::system_clock());
-        // Budgeted: a laggard reconnecting near the WAL retention limit
-        // must not make this loop materialize (and clone twice more into
-        // frames) a multi-GB tail in one poll.
-        match kv.updates_since_budgeted(cursor, flint_storage::repl::REPL_TAIL_BUDGET_BYTES) {
-            Ok(batches) if !batches.is_empty() => {
-                out.clear();
-                for batch in &batches {
-                    let ops: Vec<Value> = batch
-                        .ops
-                        .iter()
-                        .map(|op| match op {
-                            ReplOp::Put { key, value } => Value::Array(Some(vec![
-                                Value::Bulk(Some(b"P".to_vec())),
-                                Value::Bulk(Some(key.clone())),
-                                Value::Bulk(Some(value.clone())),
-                            ])),
-                            ReplOp::Delete { key } => Value::Array(Some(vec![
-                                Value::Bulk(Some(b"D".to_vec())),
-                                Value::Bulk(Some(key.clone())),
-                            ])),
-                        })
-                        .collect();
-                    let frame = Value::Array(Some(vec![
-                        Value::Integer(batch.first_seq as i64),
-                        Value::Integer(batch.last_seq as i64),
-                        Value::Array(Some(ops)),
-                    ]));
-                    encode(&frame, &mut out);
-                    cursor = batch.last_seq;
+    let mut ack_buf: Vec<u8> = Vec::new();
+    let mut ack_chunk = [0u8; 4096];
+    let result: std::io::Result<()> = (|| {
+        loop {
+            // Drain ACKs until the timeout tick (the pacing) or the replica
+            // hangs up. Frames here are only ever ["ACK", seq].
+            loop {
+                match decode(&ack_buf) {
+                    Ok(Decoded::Complete(frame, used)) => {
+                        ack_buf.drain(..used);
+                        if let Value::Array(Some(items)) = frame
+                            && let [Value::Bulk(Some(tag)), Value::Bulk(Some(raw))] =
+                                items.as_slice()
+                            && tag.eq_ignore_ascii_case(b"ACK")
+                            && let Some(seq) =
+                                std::str::from_utf8(raw).ok().and_then(|s| s.parse().ok())
+                        {
+                            hub.record_ack(
+                                replica_id,
+                                seq,
+                                flint_storage::strings::system_clock(),
+                            );
+                        }
+                    }
+                    Ok(Decoded::NeedMore) => match stream.read(&mut ack_chunk) {
+                        Ok(0) => return Ok(()), // replica closed
+                        Ok(n) => ack_buf.extend_from_slice(&ack_chunk[..n]),
+                        Err(e)
+                            if e.kind() == std::io::ErrorKind::WouldBlock
+                                || e.kind() == std::io::ErrorKind::TimedOut =>
+                        {
+                            break; // no ACK data this tick
+                        }
+                        Err(e) => return Err(e),
+                    },
+                    Err(_) => return Ok(()), // protocol garbage: drop the replica
                 }
-                stream.write_all(&out)?;
             }
-            Ok(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
-            Err(ReplError::WalGap(e)) => {
-                out.clear();
-                encode(
-                    &Value::Error(format!("WALGAP full sync required: {e}")),
-                    &mut out,
-                );
-                stream.write_all(&out)?;
-                return Ok(());
-            }
-            // SequenceGap is apply-side; a master seeing it is a bug —
-            // fail the stream loudly rather than continue.
-            Err(e @ (ReplError::Storage(_) | ReplError::SequenceGap { .. })) => {
-                eprintln!("replication stream error: {e:?}");
-                return Ok(());
+            hub.record_sample(kv.latest_seq(), flint_storage::strings::system_clock());
+            // Budgeted: a laggard reconnecting near the WAL retention limit
+            // must not make this loop materialize (and clone twice more into
+            // frames) a multi-GB tail in one poll.
+            match kv.updates_since_budgeted(cursor, flint_storage::repl::REPL_TAIL_BUDGET_BYTES) {
+                Ok(batches) if !batches.is_empty() => {
+                    out.clear();
+                    for batch in &batches {
+                        let ops: Vec<Value> = batch
+                            .ops
+                            .iter()
+                            .map(|op| match op {
+                                ReplOp::Put { key, value } => Value::Array(Some(vec![
+                                    Value::Bulk(Some(b"P".to_vec())),
+                                    Value::Bulk(Some(key.clone())),
+                                    Value::Bulk(Some(value.clone())),
+                                ])),
+                                ReplOp::Delete { key } => Value::Array(Some(vec![
+                                    Value::Bulk(Some(b"D".to_vec())),
+                                    Value::Bulk(Some(key.clone())),
+                                ])),
+                            })
+                            .collect();
+                        let frame = Value::Array(Some(vec![
+                            Value::Integer(batch.first_seq as i64),
+                            Value::Integer(batch.last_seq as i64),
+                            Value::Array(Some(ops)),
+                        ]));
+                        encode(&frame, &mut out);
+                        cursor = batch.last_seq;
+                    }
+                    stream.write_all(&out)?;
+                }
+                // Idle: the ACK drain's timeout already paced this cycle.
+                Ok(_) => {}
+                Err(ReplError::WalGap(e)) => {
+                    out.clear();
+                    encode(
+                        &Value::Error(format!("WALGAP full sync required: {e}")),
+                        &mut out,
+                    );
+                    stream.write_all(&out)?;
+                    return Ok(());
+                }
+                // SequenceGap is apply-side; a master seeing it is a bug —
+                // fail the stream loudly rather than continue.
+                Err(e @ (ReplError::Storage(_) | ReplError::SequenceGap { .. })) => {
+                    eprintln!("replication stream error: {e:?}");
+                    return Ok(());
+                }
             }
         }
-    }
+    })();
+    hub.unregister_replica(replica_id);
+    result
 }
 
 /// Source side of a slot move: ship every row of `slot` (all CFs) as a bulk
@@ -1015,7 +1061,7 @@ fn flintsync(
 /// decides when it is drained and closes the connection.
 #[cfg(feature = "rocks")]
 fn flintmigrateout(
-    mut stream: TcpStream,
+    mut stream: flint_tls::Stream,
     rocks: Option<RocksHandle>,
     args: &[Vec<u8>],
 ) -> std::io::Result<()> {
@@ -1218,7 +1264,7 @@ fn migrate_in(
         }
     };
 
-    let mut stream = match TcpStream::connect(src) {
+    let mut stream = match internal_connect(src) {
         Ok(s) => s,
         Err(e) => {
             rollback();
@@ -1714,7 +1760,7 @@ fn check_slot_gate(
 /// orchestration to freeze and hand off the slot on the source).
 #[cfg(feature = "rocks")]
 fn call_once(addr: &str, args: &[&[u8]]) -> std::io::Result<Value> {
-    let mut s = TcpStream::connect(addr)?;
+    let mut s = internal_connect(addr)?;
     s.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
     let mut out = Vec::new();
     encode(
@@ -1749,36 +1795,6 @@ fn call_once(addr: &str, args: &[&[u8]]) -> std::io::Result<Value> {
     }
 }
 
-#[cfg(feature = "rocks")]
-fn ack_reader(mut stream: TcpStream, hub: &Arc<ReplHub>, replica_id: u64) {
-    let mut buf: Vec<u8> = Vec::new();
-    let mut chunk = [0u8; 4096];
-    loop {
-        match decode(&buf) {
-            Ok(Decoded::Complete(frame, used)) => {
-                buf.drain(..used);
-                if let Value::Array(Some(items)) = frame
-                    && let [Value::Bulk(Some(tag)), Value::Bulk(Some(raw))] = items.as_slice()
-                    && tag.eq_ignore_ascii_case(b"ACK")
-                    && let Some(seq) = std::str::from_utf8(raw).ok().and_then(|s| s.parse().ok())
-                {
-                    hub.record_ack(replica_id, seq, flint_storage::strings::system_clock());
-                }
-            }
-            Ok(Decoded::NeedMore) => {
-                let Ok(n) = stream.read(&mut chunk) else {
-                    return;
-                };
-                if n == 0 {
-                    return;
-                }
-                buf.extend_from_slice(&chunk[..n]);
-            }
-            Err(_) => return,
-        }
-    }
-}
-
 /// Max payload per full-sync `F` frame. Bounds BOTH sides: this send
 /// buffer, and the replica's decode buffer (it must hold a whole frame).
 /// Files larger than this ship as multiple frames the replica appends in
@@ -1791,7 +1807,10 @@ const FULLSYNC_CHUNK: usize = 4 * 1024 * 1024;
 /// whole file is ever held in memory — SSTs are usually ~64MB, but
 /// compaction settings can make them arbitrarily large.
 #[cfg(feature = "rocks")]
-fn flintfullsync(mut stream: TcpStream, rocks: Option<RocksHandle>) -> std::io::Result<()> {
+fn flintfullsync(
+    mut stream: flint_tls::Stream,
+    rocks: Option<RocksHandle>,
+) -> std::io::Result<()> {
     let mut out = Vec::new();
     let Some(kv) = rocks else {
         encode(
@@ -1850,7 +1869,10 @@ fn flintfullsync(mut stream: TcpStream, rocks: Option<RocksHandle>) -> std::io::
 }
 
 #[cfg(not(feature = "rocks"))]
-fn flintfullsync(mut stream: TcpStream, _rocks: Option<RocksHandle>) -> std::io::Result<()> {
+fn flintfullsync(
+    mut stream: flint_tls::Stream,
+    _rocks: Option<RocksHandle>,
+) -> std::io::Result<()> {
     let mut out = Vec::new();
     encode(
         &Value::Error("ERR FLINTFULLSYNC requires a build with --features rocks".into()),
@@ -1861,7 +1883,7 @@ fn flintfullsync(mut stream: TcpStream, _rocks: Option<RocksHandle>) -> std::io:
 
 #[cfg(not(feature = "rocks"))]
 fn flintsync(
-    mut stream: TcpStream,
+    mut stream: flint_tls::Stream,
     _rocks: Option<RocksHandle>,
     _hub: &Arc<ReplHub>,
     _args: &[Vec<u8>],
@@ -1876,7 +1898,7 @@ fn flintsync(
 
 #[cfg(not(feature = "rocks"))]
 fn flintmigrateout(
-    mut stream: TcpStream,
+    mut stream: flint_tls::Stream,
     _rocks: Option<RocksHandle>,
     _args: &[Vec<u8>],
 ) -> std::io::Result<()> {
@@ -1913,7 +1935,7 @@ mod replica {
     /// Download a checkpoint into `dir` before the DB is first opened.
     pub fn full_sync_download(target: &str, dir: &std::path::Path) -> std::io::Result<()> {
         std::fs::create_dir_all(dir)?;
-        let mut stream = TcpStream::connect(target)?;
+        let mut stream = internal_connect(target)?;
         let mut out = Vec::new();
         encode(
             &Value::Array(Some(vec![Value::Bulk(Some(b"FLINTFULLSYNC".to_vec()))])),
@@ -2001,7 +2023,7 @@ mod replica {
     }
 
     fn tail_once(target: &str, kv: &Arc<RocksKv>, stop: &Arc<AtomicBool>) -> std::io::Result<()> {
-        let mut stream = TcpStream::connect(target)?;
+        let mut stream = internal_connect(target)?;
         // Short read timeout so the stop flag is honored promptly.
         stream.set_read_timeout(Some(std::time::Duration::from_millis(300)))?;
         let cursor = kv.last_applied();
@@ -2150,6 +2172,7 @@ mod replica {
 #[cfg(test)]
 mod serve_tests {
     use super::*;
+    use std::net::TcpStream;
 
     /// Ephemeral server running `serve` with a per-connection MemKv.
     fn spawn_server() -> std::net::SocketAddr {
