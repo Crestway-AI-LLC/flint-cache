@@ -9,38 +9,9 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use flint_chaos::cluster::{Client, Cluster, arg};
+use flint_chaos::oracle::{KeyLedger, parse_value, value_for};
 use flint_resp::Value;
-use flint_slot::crc16;
 use rand::{Rng, SeedableRng, rngs::SmallRng};
-
-/// Value embeds the OWNING KEY literally + seq + crc, so a value belonging
-/// to another key is detectable with certainty. "flint|<key>|<seq>|<crc>".
-fn value_for(key: &str, seq: u64) -> String {
-    let crc = crc16(format!("{key}|{seq}").as_bytes());
-    format!("flint|{key}|{seq}|{crc:04x}")
-}
-
-fn parse_value(raw: &[u8]) -> Option<(String, u64)> {
-    let s = std::str::from_utf8(raw).ok()?;
-    let mut parts = s.split('|');
-    if parts.next()? != "flint" {
-        return None;
-    }
-    let key = parts.next()?.to_string();
-    let seq: u64 = parts.next()?.parse().ok()?;
-    let crc: u16 = u16::from_str_radix(parts.next()?, 16).ok()?;
-    if crc != crc16(format!("{key}|{seq}").as_bytes()) {
-        return None;
-    }
-    Some((key, seq))
-}
-
-#[derive(Default)]
-struct KeyLedger {
-    written: Vec<u64>,
-    last_acked: u64,
-    last_written: u64,
-}
 
 fn main() {
     let iterations: u32 = arg("--iterations", 12);

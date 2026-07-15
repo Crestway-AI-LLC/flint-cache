@@ -204,6 +204,15 @@ fn controller_bin() -> String {
     })
 }
 
+fn proxy_bin() -> String {
+    std::env::var("FLINT_PROXY_BIN").unwrap_or_else(|_| {
+        format!(
+            "{}/../../target/release/flint-proxy",
+            env!("CARGO_MANIFEST_DIR")
+        )
+    })
+}
+
 /// Poll until `port` reports the given role, or the budget elapses.
 fn wait_until_role(port: u16, role: &str, budget: Duration) -> bool {
     let start = Instant::now();
@@ -297,6 +306,36 @@ impl Cluster {
 
     pub fn replica(&self) -> u16 {
         self.replica_port
+    }
+
+    /// Start a proxy in front of this pair and return its client port. Only
+    /// valid in controlled mode: the proxy is configured with the pair's two
+    /// FIXED ports and chases whichever is master itself (its own FLINTINFO
+    /// rediscovery), exactly as it would in production behind a controller —
+    /// so a workload connects to the proxy and never learns a node port.
+    /// Both nodes' ordering is stable across failovers because roles float
+    /// between the same two ports.
+    pub fn start_proxy(&mut self) -> u16 {
+        assert!(
+            self.controlled,
+            "start_proxy needs bootstrap_controlled (fixed ports)"
+        );
+        let proxy_port = 7690;
+        let pairs = format!("127.0.0.1:{},127.0.0.1:{}", self.master_port, self.replica_port);
+        let log = std::fs::File::create(format!("{}/flint-chaos-proxy.log", std::env::temp_dir().display()))
+            .expect("proxy log");
+        let child = Command::new(proxy_bin())
+            .args(["--port", &proxy_port.to_string(), "--pairs", &pairs])
+            .stderr(log)
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn flint-proxy");
+        self.fleet.track(child);
+        assert!(
+            wait_for_pong(proxy_port, Duration::from_secs(10)),
+            "proxy up on :{proxy_port}"
+        );
+        proxy_port
     }
 
     /// True once the replica is live AND has fully converged in sequence
