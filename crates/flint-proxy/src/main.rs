@@ -527,7 +527,7 @@ fn auth_step(topo: &Topology, authed_ns: &mut Option<Vec<u8>>, args: &[Vec<u8>])
     }
 }
 
-fn serve_client(mut stream: TcpStream, topo: Arc<Topology>) -> std::io::Result<()> {
+fn serve_client<S: Read + Write>(mut stream: S, topo: Arc<Topology>) -> std::io::Result<()> {
     // Open mode (standalone, no tenants configured): the connection starts
     // authorized on the default namespace — the pre-tenancy behavior.
     let mut authed_ns: Option<Vec<u8>> = if topo.open_mode {
@@ -725,9 +725,53 @@ fn frame_to_args(frame: Value) -> Option<Vec<Vec<u8>>> {
     Some(args)
 }
 
+/// Build the server-side TLS config for client-facing termination
+/// (mTLS block, increment 1 — the externally-visible hop). Clients speak
+/// TLS to the proxy; the proxy terminates it and the existing RESP path
+/// runs over the encrypted stream. Backend/control-plane hops stay
+/// plaintext here — internal mTLS is the next increment.
+///
+/// `ring` is the crypto provider (pure-Rust build, no C toolchain), pinned
+/// explicitly rather than via the process-default so a stray
+/// `install_default` elsewhere can never change what this listener uses.
+/// No client-auth yet: this increment is server-authenticated TLS
+/// (confidentiality + server identity); requiring client certs is the
+/// mutual half, layered on once internal hops carry certs too.
+fn load_tls_config(cert_path: &str, key_path: &str) -> Arc<rustls::ServerConfig> {
+    use std::io::BufReader;
+    let cert_file = std::fs::File::open(cert_path)
+        .unwrap_or_else(|e| panic!("open --tls-cert {cert_path}: {e}"));
+    let certs: Vec<_> = rustls_pemfile::certs(&mut BufReader::new(cert_file))
+        .collect::<Result<_, _>>()
+        .expect("parse certificate chain from --tls-cert");
+    assert!(!certs.is_empty(), "--tls-cert {cert_path} has no certificates");
+    let key_file = std::fs::File::open(key_path)
+        .unwrap_or_else(|e| panic!("open --tls-key {key_path}: {e}"));
+    let key = rustls_pemfile::private_key(&mut BufReader::new(key_file))
+        .expect("read private key from --tls-key")
+        .unwrap_or_else(|| panic!("no private key found in --tls-key {key_path}"));
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let config = rustls::ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .expect("TLS protocol versions")
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .expect("build TLS server config (cert/key mismatch?)");
+    Arc::new(config)
+}
+
 fn main() -> std::io::Result<()> {
     let port: u16 = arg("--port").and_then(|p| p.parse().ok()).unwrap_or(7379);
     let control_plane = arg("--control-plane");
+
+    // Client-facing TLS termination: both flags together enable it, neither
+    // keeps the plaintext listener (byte-identical to pre-TLS). One without
+    // the other is a config error, not a silent downgrade.
+    let tls: Option<Arc<rustls::ServerConfig>> = match (arg("--tls-cert"), arg("--tls-key")) {
+        (Some(cert), Some(key)) => Some(load_tls_config(&cert, &key)),
+        (None, None) => None,
+        _ => panic!("--tls-cert and --tls-key must be provided together"),
+    };
 
     // Standalone config (ignored in control-plane mode, which pushes both).
     let pairs: Vec<Vec<String>> = arg("--pairs")
@@ -791,12 +835,32 @@ fn main() -> std::io::Result<()> {
     }
 
     let listener = TcpListener::bind(("127.0.0.1", port))?;
-    eprintln!("flint-proxy listening on 127.0.0.1:{port}");
+    eprintln!(
+        "flint-proxy listening on 127.0.0.1:{port} ({})",
+        if tls.is_some() { "TLS" } else { "plaintext" }
+    );
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
         let topo = Arc::clone(&topo);
-        std::thread::spawn(move || {
-            let _ = serve_client(stream, topo);
+        let tls = tls.clone();
+        std::thread::spawn(move || match tls {
+            Some(cfg) => {
+                // The handshake runs lazily on the first read/write inside
+                // serve_client (the client sends the first command). A
+                // plaintext client hitting the TLS port fails the handshake
+                // and the connection drops — no RESP is ever processed.
+                let conn = match rustls::ServerConnection::new(cfg) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("tls: connection setup failed: {e}");
+                        return;
+                    }
+                };
+                let _ = serve_client(rustls::StreamOwned::new(conn, stream), topo);
+            }
+            None => {
+                let _ = serve_client(stream, topo);
+            }
         });
     }
     Ok(())

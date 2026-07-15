@@ -1,6 +1,6 @@
 [package]
 name = "flint-proxy"
-description = "v0 routing-plane proxy: one client endpoint, slot routing to the owning master, transparent -MOVED/-TRYAGAIN absorption and master rediscovery (TLS/auth/tenancy/scatter-gather are follow-ons)"
+description = "routing-plane proxy: one client endpoint, slot routing to the owning master, transparent -MOVED/-TRYAGAIN absorption and master rediscovery, token-auth tenancy, and optional client-facing TLS termination (scatter-gather + internal mTLS are follow-ons)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,6 +9,10 @@ repository.workspace = true
 [dependencies]
 flint-resp = { path = "../flint-resp" }
 flint-slot = { path = "../flint-slot" }
+# Client-facing TLS termination. `ring` provider = pure-Rust build (no C
+# toolchain); pinned explicitly, not via the process-default provider.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-pemfile = "2"
 
 [lints]
 workspace = true
