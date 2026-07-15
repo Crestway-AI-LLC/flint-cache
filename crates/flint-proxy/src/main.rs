@@ -70,10 +70,10 @@ const SHED_FRAME: &[u8] = b"-THROTTLED proxy at connection capacity, retry with 
 
 /// Decrements the live-connection counter when a worker exits — by any path,
 /// including a panic — so a crashing handler can never leak a slot.
-struct ConnGuard(Arc<AtomicUsize>);
+struct ConnGuard(Arc<Topology>);
 impl Drop for ConnGuard {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::Relaxed);
+        self.0.stat_active.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -108,6 +108,15 @@ struct Topology {
     /// operator watches the PREVIOUS token's count go flat before dropping
     /// it (CPDROPPREV) — the per-version usage metric.
     auth_counts: RwLock<HashMap<String, u64>>,
+    /// Fleet-level ops counters (PROXYSTATS -> the exporter). Relaxed
+    /// atomics: monotonic telemetry, not coordination.
+    stat_conns_total: std::sync::atomic::AtomicU64,
+    stat_shed_total: std::sync::atomic::AtomicU64,
+    stat_auth_ok_total: std::sync::atomic::AtomicU64,
+    stat_auth_fail_total: std::sync::atomic::AtomicU64,
+    stat_commands_total: std::sync::atomic::AtomicU64,
+    /// Live client connections (the admission-control counter).
+    stat_active: AtomicUsize,
     /// True only for a standalone proxy with no tenants configured: no
     /// auth, default namespace. A control-plane-fed proxy is never open —
     /// before its first snapshot it simply has no tenants yet.
@@ -514,6 +523,22 @@ fn auth_step(topo: &Topology, authed_ns: &mut Option<Vec<u8>>, args: &[Vec<u8>])
     // Ops query: per-token AUTH count (drain check during token rotation).
     // Requires knowing the exact token; low-sensitivity, answered pre-auth.
     // (A real deploy gates this behind mTLS/admin.)
+    // Ops query: aggregate proxy counters for the exporter (same pre-auth
+    // rationale as PROXYAUTHCOUNT below). `active` is filled by the caller
+    // holding the admission counter.
+    if name.as_deref() == Some(b"PROXYSTATS") {
+        let load = |c: &std::sync::atomic::AtomicU64| c.load(Ordering::Relaxed);
+        let info = format!(
+            "active:{}\r\nconns_total:{}\r\nshed_total:{}\r\nauth_ok_total:{}\r\nauth_fail_total:{}\r\ncommands_total:{}\r\n",
+            topo.stat_active.load(Ordering::Relaxed),
+            load(&topo.stat_conns_total),
+            load(&topo.stat_shed_total),
+            load(&topo.stat_auth_ok_total),
+            load(&topo.stat_auth_fail_total),
+            load(&topo.stat_commands_total),
+        );
+        return AuthStep::Reply(Value::Bulk(Some(info.into_bytes())));
+    }
     if name.as_deref() == Some(b"PROXYAUTHCOUNT") {
         let n = args
             .get(1)
@@ -537,6 +562,7 @@ fn auth_step(topo: &Topology, authed_ns: &mut Option<Vec<u8>>, args: &[Vec<u8>])
             ));
         }
         let Some(ns) = topo.lookup_token(&String::from_utf8_lossy(token)) else {
+            topo.stat_auth_fail_total.fetch_add(1, Ordering::Relaxed);
             return AuthStep::Reply(Value::Error("WRONGPASS invalid token".into()));
         };
         match authed_ns {
@@ -548,6 +574,7 @@ fn auth_step(topo: &Topology, authed_ns: &mut Option<Vec<u8>>, args: &[Vec<u8>])
             _ => {}
         }
         topo.bump_auth(&String::from_utf8_lossy(token));
+        topo.stat_auth_ok_total.fetch_add(1, Ordering::Relaxed);
         *authed_ns = Some(ns);
         return AuthStep::Reply(Value::Simple("OK".into()));
     }
@@ -596,6 +623,7 @@ fn serve_client<S: Read + Write>(mut stream: S, topo: Arc<Topology>) -> std::io:
                         stream.write_all(&out)?;
                         return Ok(());
                     };
+                    topo.stat_commands_total.fetch_add(1, Ordering::Relaxed);
                     let reply = match auth_step(&topo, &mut authed_ns, &args) {
                         AuthStep::Reply(v) => v,
                         AuthStep::Proceed(ns) => {
@@ -872,6 +900,12 @@ fn main() -> std::io::Result<()> {
         moved: RwLock::new(HashMap::new()),
         tenants: RwLock::new(tenants),
         auth_counts: RwLock::new(HashMap::new()),
+        stat_conns_total: std::sync::atomic::AtomicU64::new(0),
+        stat_shed_total: std::sync::atomic::AtomicU64::new(0),
+        stat_auth_ok_total: std::sync::atomic::AtomicU64::new(0),
+        stat_auth_fail_total: std::sync::atomic::AtomicU64::new(0),
+        stat_commands_total: std::sync::atomic::AtomicU64::new(0),
+        stat_active: AtomicUsize::new(0),
         open_mode,
         backend_tls,
     });
@@ -897,7 +931,6 @@ fn main() -> std::io::Result<()> {
     let max_conns: usize = arg("--max-conns")
         .and_then(|v| v.parse().ok())
         .unwrap_or(DEFAULT_MAX_CONNS);
-    let active = Arc::new(AtomicUsize::new(0));
 
     let listener = TcpListener::bind(("127.0.0.1", port))?;
     eprintln!(
@@ -908,8 +941,10 @@ fn main() -> std::io::Result<()> {
         let Ok(mut stream) = stream else { continue };
         // Admission control: reserve a slot with fetch_add, roll back and shed
         // if it put us over the cap (no worker thread is spawned for a shed).
-        if active.fetch_add(1, Ordering::Relaxed) >= max_conns {
-            active.fetch_sub(1, Ordering::Relaxed);
+        topo.stat_conns_total.fetch_add(1, Ordering::Relaxed);
+        if topo.stat_active.fetch_add(1, Ordering::Relaxed) >= max_conns {
+            topo.stat_active.fetch_sub(1, Ordering::Relaxed);
+            topo.stat_shed_total.fetch_add(1, Ordering::Relaxed);
             // Best-effort -THROTTLED for a plaintext client. Under frontend
             // TLS we skip the handshake (spending it on a shed would defeat
             // the guard) and just close — the client sees a reset and backs
@@ -921,7 +956,7 @@ fn main() -> std::io::Result<()> {
         }
         let topo = Arc::clone(&topo);
         let tls = tls.clone();
-        let guard = ConnGuard(Arc::clone(&active));
+        let guard = ConnGuard(Arc::clone(&topo));
         std::thread::spawn(move || {
             let _guard = guard; // decrements on any exit, including panic
             match tls {

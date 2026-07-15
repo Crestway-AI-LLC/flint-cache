@@ -226,6 +226,13 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
             shared.changed.notify_all();
             ok()
         }
+        // The registered proxy fleet, comma-joined — the exporter's poll list.
+        b"CPPROXIES" => {
+            let Ok(st) = shared.state.lock() else {
+                return err("state lock");
+            };
+            Value::Bulk(Some(st.proxies.join(",").into_bytes()))
+        }
         // DNS subset publication: render the authoritative zone data for the
         // tenant->proxy-subset mapping. Each tenant resolves to ONLY its
         // shuffle-shard subset — DNS is how clients land on their sub-group

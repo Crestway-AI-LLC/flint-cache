@@ -566,6 +566,10 @@ async fn handle_admin(ha: &Ha, args: &[Vec<u8>]) -> Value {
                 Err(l) => redirect(l),
             }
         }
+        b"CPPROXIES" => {
+            let reg = ha.store.registry().await;
+            Value::Bulk(Some(reg.proxies.join(",").into_bytes()))
+        }
         b"CPDNSZONE" => {
             let Some(suffix) = text(1) else {
                 return Value::Error("ERR CPDNSZONE <zone-suffix>".into());
