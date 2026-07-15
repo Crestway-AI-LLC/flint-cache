@@ -39,6 +39,11 @@ pub enum EventKind {
     /// The shadow agent recommended a catalog action (the agent's side of
     /// the recommended-vs-actual evaluation join).
     Recommended,
+    /// A controller triggered a durable off-node snapshot on a master.
+    SnapshotTaken,
+    /// A fresh node seeded itself from the latest snapshot after whole-pair
+    /// loss and asserted mastership in a bumped generation.
+    SpareRestored,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

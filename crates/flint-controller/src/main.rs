@@ -82,6 +82,7 @@ fn spawn_slot(
     slot: &Slot,
     master: Option<&str>,
     min_replicas: u32,
+    restore_from: Option<&str>,
 ) -> std::process::Child {
     kill_port(slot.port);
     let _ = std::fs::remove_dir_all(&slot.dir);
@@ -96,6 +97,13 @@ fn spawn_slot(
     ]);
     if let Some(m) = master {
         cmd.args(["--replica-of", m]);
+    }
+    if let Some(root) = restore_from {
+        cmd.args(["--restore-from", root]);
+    }
+    // Spawned nodes report their own transitions to the same journal.
+    if let Some(Some(j)) = JOURNAL_TARGET.get() {
+        cmd.args(["--journal", j]);
     }
     // Every managed node carries the write-quorum gate: roles float, so a
     // replica promoted after a kill must also shed writes while widowed.
@@ -261,6 +269,13 @@ struct Config {
     /// these are independent masters, not a pair). On restart the controller
     /// observes their in-flight migration records and resumes or rolls back.
     recover_nodes: Vec<String>,
+    /// Snapshot root directory (any mounted path; S3 via mount/sync on the
+    /// same layout). Enables BOTH the schedule (periodic FLINTSNAPSHOT on
+    /// each managed master into <root>/<pair-label>/) and disaster restore
+    /// (whole-pair loss -> spawn a spare seeded from LATEST, which asserts
+    /// mastership in a bumped generation).
+    snapshot_root: Option<String>,
+    snapshot_interval: Duration,
     bin: String,
     id: String,
 }
@@ -281,6 +296,10 @@ struct Pair {
     slot_cooldown: Vec<Instant>,
     slot_child: Vec<Option<std::process::Child>>,
     last_page: Option<Instant>,
+    /// Consecutive ticks with ZERO reachable nodes; bootstrap/restore only
+    /// past `confirm` — a transient double-blip must not wipe live nodes.
+    dark_streak: u32,
+    last_snapshot: Instant,
 }
 
 impl Pair {
@@ -297,6 +316,8 @@ impl Pair {
             slot_cooldown: vec![Instant::now(); n],
             slot_child: (0..n).map(|_| None).collect(),
             last_page: None,
+            dark_streak: 0,
+            last_snapshot: Instant::now(),
             slots,
         }
     }
@@ -360,11 +381,33 @@ impl Pair {
     fn tick(&mut self, cfg: &Config) {
         let states: Vec<Node> = self.nodes.iter().map(|a| observe(a)).collect();
 
-        // Managed bootstrap: nothing up → launch slot0 as master, rest as
-        // fresh replicas of it.
+        // Managed bootstrap / disaster restore: nothing reachable for
+        // `confirm` ticks → launch slot0 as master (seeded from the latest
+        // snapshot when one exists — whole-pair loss), rest as fresh
+        // replicas of it. Confirm-gated: a transient blip where both nodes
+        // miss one poll must not wipe live processes.
         if self.managed && states.iter().all(|n| !n.reachable) {
-            eprintln!("[{}][{}] bootstrapping managed pair", cfg.id, self.label);
-            let c0 = spawn_slot(&cfg.bin, &self.slots[0], None, cfg.min_replicas);
+            self.dark_streak += 1;
+            if self.dark_streak < cfg.confirm {
+                return;
+            }
+            self.dark_streak = 0;
+            let snap_dir = cfg
+                .snapshot_root
+                .as_ref()
+                .map(|r| format!("{r}/{}", self.label));
+            let restore = snap_dir
+                .as_deref()
+                .filter(|d| std::path::Path::new(d).join("LATEST").exists());
+            if let Some(root) = restore {
+                eprintln!(
+                    "[{}][{}] WHOLE PAIR DARK — restoring spare from snapshot root {root}",
+                    cfg.id, self.label
+                );
+            } else {
+                eprintln!("[{}][{}] bootstrapping managed pair", cfg.id, self.label);
+            }
+            let c0 = spawn_slot(&cfg.bin, &self.slots[0], None, cfg.min_replicas, restore);
             self.reap(0, c0);
             let master_addr = self.nodes[0].clone();
             std::thread::sleep(Duration::from_millis(600));
@@ -374,6 +417,7 @@ impl Pair {
                     &self.slots[i],
                     Some(&master_addr),
                     cfg.min_replicas,
+                    None,
                 );
                 self.reap(i, c);
             }
@@ -407,6 +451,35 @@ impl Pair {
                     &legit_addr,
                     &[b"FLINTLEASE", cfg.lease_ttl.to_string().as_bytes()],
                 );
+            }
+            // Snapshot schedule (Tier-0, design.md §2.9): a periodic durable
+            // checkpoint of each managed master into <root>/<pair-label>/.
+            // This is what makes whole-pair loss survivable (spare restore
+            // above) instead of a total-loss page.
+            if let Some(root) = &cfg.snapshot_root
+                && self.last_snapshot.elapsed() >= cfg.snapshot_interval
+            {
+                let dir = format!("{root}/{}", self.label);
+                match call_slow(
+                    &legit_addr,
+                    &[b"FLINTSNAPSHOT", dir.as_bytes()],
+                    Duration::from_secs(30),
+                ) {
+                    Ok(Value::Simple(reply)) => {
+                        self.last_snapshot = Instant::now();
+                        journal_event(
+                            &cfg.id,
+                            flint_journal::EventKind::SnapshotTaken,
+                            &legit_addr,
+                            None,
+                            &format!("scheduled snapshot into {dir}: {reply}"),
+                        );
+                    }
+                    other => eprintln!(
+                        "[{}][{}] snapshot on {legit_addr} failed: {other:?}",
+                        cfg.id, self.label
+                    ),
+                }
             }
             // Any other reachable master-claimer is a zombie: fence it.
             for m in &masters {
@@ -450,6 +523,7 @@ impl Pair {
                             &self.slots[i],
                             Some(&legit_addr),
                             cfg.min_replicas,
+                            None,
                         );
                         self.reap(i, c);
                         self.slot_miss[i] = 0;
@@ -623,6 +697,8 @@ fn main() {
         recover_nodes: arg("--recover-nodes")
             .map(|s| s.split(',').map(String::from).collect())
             .unwrap_or_default(),
+        snapshot_root: arg("--snapshot-root"),
+        snapshot_interval: Duration::from_millis(arg_or("--snapshot-interval-ms", 30_000)),
         bin: server_bin(),
         id: arg("--id").unwrap_or_else(|| "ctl".into()),
     };

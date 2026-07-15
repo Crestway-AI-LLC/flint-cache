@@ -140,6 +140,34 @@ fn main() -> std::io::Result<()> {
             if fresh && let Some(target) = &replica_of {
                 replica::full_sync_download(target, std::path::Path::new(&dir))?;
             }
+            // Spare restore (whole-pair loss): seed from the latest durable
+            // snapshot instead of a live master. Only meaningful on a fresh
+            // node; a node with data has a lineage and must not be papered
+            // over by a snapshot.
+            let restore_from = arg("--restore-from");
+            assert!(
+                !(restore_from.is_some() && replica_of.is_some()),
+                "--restore-from and --replica-of are mutually exclusive"
+            );
+            let mut restored_from_id: Option<String> = None;
+            if fresh && let Some(root) = &restore_from {
+                let root = std::path::Path::new(root);
+                let id = std::fs::read_to_string(root.join("LATEST"))
+                    .map_err(|e| std::io::Error::other(format!("read LATEST: {e}")))?;
+                let id = id.trim().to_string();
+                let src = root.join(&id);
+                let dst = std::path::Path::new(&dir);
+                std::fs::create_dir_all(dst)?;
+                for entry in std::fs::read_dir(&src)? {
+                    let entry = entry?;
+                    // Checkpoints are flat (SSTs, MANIFEST, CURRENT, OPTIONS).
+                    if entry.file_type()?.is_file() {
+                        std::fs::copy(entry.path(), dst.join(entry.file_name()))?;
+                    }
+                }
+                eprintln!("restored data dir from snapshot {id}");
+                restored_from_id = Some(id);
+            }
             let kv = RocksKv::open(std::path::Path::new(&dir))
                 .map_err(|e| std::io::Error::other(format!("rocksdb open: {e}")))?;
             if fresh && replica_of.is_some() {
@@ -191,6 +219,42 @@ fn main() -> std::io::Result<()> {
                     },
                 )
                 .map_err(|e| std::io::Error::other(format!("manifest role: {e:?}")))?;
+            }
+            // A restored spare asserts mastership in a NEW GENERATION:
+            // (g,c) -> (g+1, 1). The whole dead lineage is thereby fenced —
+            // any old node that limps back carries generation g and loses to
+            // the restored line no matter how high its counter climbed.
+            // force_role (unfenced) is correct here: the snapshot's copied
+            // role row is the OLD lineage's identity, not this node's.
+            if let Some(id) = &restored_from_id {
+                let old = manifest::read_role(&kv).map(|c| c.epoch).unwrap_or(Epoch {
+                    generation: 0,
+                    counter: 1,
+                });
+                let bumped = Epoch {
+                    generation: old.generation + 1,
+                    counter: 1,
+                };
+                manifest::force_role(
+                    &kv,
+                    RoleClaim {
+                        role: Role::Master,
+                        epoch: bumped,
+                    },
+                );
+                // Restart replication bookkeeping at the copied DB's own seq
+                // (same reassertion the full-sync seed path does).
+                let cursor = kv.latest_seq();
+                kv.set_last_applied(cursor)
+                    .map_err(|e| std::io::Error::other(format!("cursor init: {e:?}")))?;
+                eprintln!(
+                    "spare restored from {id}: MASTER at epoch {bumped} (generation bump fences the old lineage)"
+                );
+                journal_event(
+                    flint_journal::EventKind::SpareRestored,
+                    Some(bumped.to_string()),
+                    "whole-pair loss: restored from latest snapshot; generation bump fences the old lineage",
+                );
             }
             // A checkpoint full sync copied the MASTER's manifest; the
             // seeded replica reasserts its own identity (same epoch, so
@@ -690,6 +754,17 @@ fn execute(
     {
         return flintmigrations(rocks);
     }
+    // FLINTSNAPSHOT <root>: durable off-node snapshot — a consistent RocksDB
+    // checkpoint written under <root>/<id>/ with <root>/LATEST atomically
+    // repointed. The manifest CF travels inside the checkpoint, so a restore
+    // knows the lineage (role epoch) it came from. <root> is any mounted
+    // path; S3 is a mount/sync integration on top of the same layout.
+    if args
+        .first()
+        .is_some_and(|n| n.eq_ignore_ascii_case(b"FLINTSNAPSHOT"))
+    {
+        return flintsnapshot(rocks, args);
+    }
     // FLINTSLOTSTATS: per-slot live-key counts ("slot count" bulk per
     // non-empty slot) — the input the rebalance executor's slot selection
     // needs. One streaming pass over the metadata CF, bounded memory.
@@ -973,6 +1048,58 @@ fn frame_to_args(frame: Value) -> Option<Vec<Vec<u8>>> {
 /// rustls session is one stateful object and cannot be `try_clone`d the way
 /// the old dedicated ACK-reader thread required. Throughput ceiling is
 /// REPL_TAIL_BUDGET_BYTES per ~20ms cycle (~200MB/s), far above a link.
+/// Drain whatever ACK frames are already available on the replication
+/// stream without blocking beyond the socket's read timeout. Returns false
+/// when the replica is gone (clean close or protocol garbage). Called from
+/// the push loop between cycles AND whenever a chunked batch write would
+/// block — the master must keep consuming ACKs while it writes, or the two
+/// sides write-write deadlock once both socket buffers fill (found by the
+/// chain drill after the single-threaded duplex landed).
+#[cfg(feature = "rocks")]
+fn drain_acks(
+    stream: &mut flint_tls::Stream,
+    ack_buf: &mut Vec<u8>,
+    hub: &Arc<ReplHub>,
+    replica_id: u64,
+) -> std::io::Result<bool> {
+    let mut chunk = [0u8; 4096];
+    loop {
+        match decode(ack_buf) {
+            Ok(Decoded::Complete(frame, used)) => {
+                ack_buf.drain(..used);
+                if let Value::Array(Some(items)) = frame
+                    && let [Value::Bulk(Some(tag)), Value::Bulk(Some(raw))] = items.as_slice()
+                    && tag.eq_ignore_ascii_case(b"ACK")
+                    && let Some(seq) = std::str::from_utf8(raw).ok().and_then(|s| s.parse().ok())
+                {
+                    hub.record_ack(replica_id, seq, flint_storage::strings::system_clock());
+                }
+            }
+            Ok(Decoded::NeedMore) => match stream.read(&mut chunk) {
+                Ok(0) => {
+                    eprintln!("replication stream ended: replica closed");
+                    return Ok(false);
+                }
+                Ok(n) => ack_buf.extend_from_slice(&chunk[..n]),
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    return Ok(true); // no more ACK data this tick
+                }
+                Err(e) => {
+                    eprintln!("replication stream ended: ack read error {e}");
+                    return Err(e);
+                }
+            },
+            Err(e) => {
+                eprintln!("replication stream ended: ack protocol garbage {e:?}");
+                return Ok(false);
+            }
+        }
+    }
+}
+
 #[cfg(feature = "rocks")]
 fn flintsync(
     mut stream: flint_tls::Stream,
@@ -998,46 +1125,25 @@ fn flintsync(
     let mut out = Vec::new();
     encode(&Value::Simple(format!("FLINTSYNC-OK {cursor}")), &mut out);
     stream.write_all(&out)?;
-    stream.set_read_timeout(Some(std::time::Duration::from_millis(20)))?;
+    // ACK-drain read timeout doubles as loop pacing, ADAPTIVELY: while
+    // batches are flowing the drain must be near-nonblocking (1ms) or the
+    // pacing caps replication throughput at one WAL batch per tick (found
+    // by the chain drill: a 200k-write burst converged at ~3k ops/s); only
+    // an IDLE stream uses the 20ms tick, replacing the old idle sleep.
+    stream.set_read_timeout(Some(std::time::Duration::from_millis(1)))?;
+    let mut idle = false;
     eprintln!("replica connected, streaming from seq {cursor}");
     let replica_id = hub.register_replica();
     let mut ack_buf: Vec<u8> = Vec::new();
-    let mut ack_chunk = [0u8; 4096];
     let result: std::io::Result<()> = (|| {
         loop {
-            // Drain ACKs until the timeout tick (the pacing) or the replica
-            // hangs up. Frames here are only ever ["ACK", seq].
-            loop {
-                match decode(&ack_buf) {
-                    Ok(Decoded::Complete(frame, used)) => {
-                        ack_buf.drain(..used);
-                        if let Value::Array(Some(items)) = frame
-                            && let [Value::Bulk(Some(tag)), Value::Bulk(Some(raw))] =
-                                items.as_slice()
-                            && tag.eq_ignore_ascii_case(b"ACK")
-                            && let Some(seq) =
-                                std::str::from_utf8(raw).ok().and_then(|s| s.parse().ok())
-                        {
-                            hub.record_ack(
-                                replica_id,
-                                seq,
-                                flint_storage::strings::system_clock(),
-                            );
-                        }
-                    }
-                    Ok(Decoded::NeedMore) => match stream.read(&mut ack_chunk) {
-                        Ok(0) => return Ok(()), // replica closed
-                        Ok(n) => ack_buf.extend_from_slice(&ack_chunk[..n]),
-                        Err(e)
-                            if e.kind() == std::io::ErrorKind::WouldBlock
-                                || e.kind() == std::io::ErrorKind::TimedOut =>
-                        {
-                            break; // no ACK data this tick
-                        }
-                        Err(e) => return Err(e),
-                    },
-                    Err(_) => return Ok(()), // protocol garbage: drop the replica
-                }
+            stream.set_read_timeout(Some(std::time::Duration::from_millis(if idle {
+                20
+            } else {
+                1
+            })))?;
+            if !drain_acks(&mut stream, &mut ack_buf, hub, replica_id)? {
+                return Ok(());
             }
             hub.record_sample(kv.latest_seq(), flint_storage::strings::system_clock());
             // Budgeted: a laggard reconnecting near the WAL retention limit
@@ -1070,10 +1176,43 @@ fn flintsync(
                         encode(&frame, &mut out);
                         cursor = batch.last_seq;
                     }
-                    stream.write_all(&out)?;
+                    // Chunked send that KEEPS DRAINING ACKS: a blocking
+                    // write_all here deadlocks under burst load — the
+                    // replica ACKs every applied batch, those ACKs fill our
+                    // recv queue while we are stuck in write_all, the
+                    // replica's ACK write then blocks and it stops reading.
+                    // Bounded write timeout + drain-on-block breaks the
+                    // cycle; the drain is what un-sticks the replica.
+                    stream.set_write_timeout(Some(std::time::Duration::from_millis(50)))?;
+                    let mut off = 0;
+                    while off < out.len() {
+                        let end = (off + 64 * 1024).min(out.len());
+                        match stream.write(&out[off..end]) {
+                            Ok(0) => {
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::WriteZero,
+                                    "replica socket closed mid-batch",
+                                ));
+                            }
+                            Ok(n) => off += n,
+                            Err(e)
+                                if e.kind() == std::io::ErrorKind::WouldBlock
+                                    || e.kind() == std::io::ErrorKind::TimedOut =>
+                            {
+                                if !drain_acks(&mut stream, &mut ack_buf, hub, replica_id)? {
+                                    return Ok(());
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("replication stream ended: batch write error {e}");
+                                return Err(e);
+                            }
+                        }
+                    }
+                    idle = false;
                 }
                 // Idle: the ACK drain's timeout already paced this cycle.
-                Ok(_) => {}
+                Ok(_) => idle = true,
                 Err(ReplError::WalGap(e)) => {
                     out.clear();
                     encode(
@@ -1694,6 +1833,45 @@ fn flintslotstats(store: &dyn Kv) -> Value {
 /// FLINTMIGRATIONS: the in-flight (Importing/Migrating) records on this node
 /// across ALL namespaces, one "slot phase peer ns" bulk each — the recovery
 /// input for the controller.
+/// FLINTSNAPSHOT <root>: checkpoint into <root>/<id>, repoint <root>/LATEST.
+/// The id embeds time + latest sequence, so ordering and staleness are
+/// readable from the name alone.
+#[cfg(feature = "rocks")]
+fn flintsnapshot(rocks: &Option<RocksHandle>, args: &[Vec<u8>]) -> Value {
+    let Some(kv) = rocks else {
+        return Value::Error("ERR FLINTSNAPSHOT requires the rocks engine".into());
+    };
+    let Some(root) = args.get(1).and_then(|r| std::str::from_utf8(r).ok()) else {
+        return Value::Error("ERR FLINTSNAPSHOT <root-dir>".into());
+    };
+    let root = std::path::Path::new(root);
+    if let Err(e) = std::fs::create_dir_all(root) {
+        return Value::Error(format!("ERR snapshot root: {e}"));
+    }
+    let id = format!(
+        "snap-{}-seq{}",
+        flint_storage::strings::system_clock(),
+        kv.latest_seq()
+    );
+    let dest = root.join(&id);
+    if let Err(e) = kv.checkpoint_to(&dest) {
+        return Value::Error(format!("ERR checkpoint: {e}"));
+    }
+    // Atomic LATEST repoint: write-then-rename, same as every manifest here.
+    let tmp = root.join("LATEST.tmp");
+    if let Err(e) = std::fs::write(&tmp, &id).and_then(|_| std::fs::rename(&tmp, root.join("LATEST")))
+    {
+        return Value::Error(format!("ERR LATEST repoint: {e}"));
+    }
+    eprintln!("snapshot {id} written to {}", root.display());
+    Value::Simple(format!("OK {id}"))
+}
+
+#[cfg(not(feature = "rocks"))]
+fn flintsnapshot(_rocks: &Option<RocksHandle>, _args: &[Vec<u8>]) -> Value {
+    Value::Error("ERR FLINTSNAPSHOT requires a build with --features rocks".into())
+}
+
 #[cfg(feature = "rocks")]
 fn flintmigrations(rocks: &Option<RocksHandle>) -> Value {
     use flint_storage::manifest::{self, MigrationPhase};
