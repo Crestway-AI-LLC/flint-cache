@@ -155,7 +155,9 @@ fn main() {
                         );
                     }
                     None => {
-                        panic!("iter {iteration}: REPLICA kill lost acked key {key} (absent via proxy)")
+                        panic!(
+                            "iter {iteration}: REPLICA kill lost acked key {key} (absent via proxy)"
+                        )
                     }
                 }
             }
@@ -184,7 +186,9 @@ fn main() {
 
     let (mk, rk) = (cluster.master_kills, cluster.replica_kills);
     println!("---");
-    println!("PASS: {iterations} kills ({mk} master, {rk} replica) through the proxy, {seq} writes");
+    println!(
+        "PASS: {iterations} kills ({mk} master, {rk} replica) through the proxy, {seq} writes"
+    );
     println!("  corruption: 0  time-travel: 0  cross-key: 0  (full path client->proxy->node)");
     println!(
         "  acked keys regressed across master kills: {acked_lost_total} (async contract; replica kills: zero)"

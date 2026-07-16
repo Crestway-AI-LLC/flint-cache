@@ -68,11 +68,7 @@ pub struct Conn {
 
 /// Dial `addr` (optionally through mutual TLS) and run one framed
 /// request/response exchange.
-async fn exchange(
-    addr: &str,
-    tls: &Option<TlsConnector>,
-    body: &[u8],
-) -> std::io::Result<Vec<u8>> {
+async fn exchange(addr: &str, tls: &Option<TlsConnector>, body: &[u8]) -> std::io::Result<Vec<u8>> {
     let mut tcp = TcpStream::connect(addr).await?;
     match tls {
         None => {
@@ -80,10 +76,9 @@ async fn exchange(
             read_framed(&mut tcp).await
         }
         Some(c) => {
-            let name = tokio_rustls::rustls::pki_types::ServerName::try_from(
-                flint_tls::INTERNAL_SNI,
-            )
-            .expect("internal SNI");
+            let name =
+                tokio_rustls::rustls::pki_types::ServerName::try_from(flint_tls::INTERNAL_SNI)
+                    .expect("internal SNI");
             let mut t = c.connect(name, tcp).await?;
             write_framed(&mut t, body).await?;
             read_framed(&mut t).await
@@ -365,7 +360,11 @@ pub async fn run_client(
     eprintln!(
         "flint-controlplane[raft node {}] client on :{port} ({})",
         ha.node_id,
-        if acceptor.is_some() { "internal mTLS" } else { "plaintext" }
+        if acceptor.is_some() {
+            "internal mTLS"
+        } else {
+            "plaintext"
+        }
     );
     loop {
         let Ok((sock, _)) = listener.accept().await else {

@@ -52,8 +52,8 @@ struct Inventory {
 }
 
 fn parse_inventory(path: &str) -> Inventory {
-    let raw = std::fs::read_to_string(path)
-        .unwrap_or_else(|e| panic!("read inventory {path}: {e}"));
+    let raw =
+        std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read inventory {path}: {e}"));
     let mut inv = Inventory {
         bins: "./target/release".into(),
         ..Default::default()
@@ -78,10 +78,23 @@ fn parse_inventory(path: &str) -> Inventory {
             other => panic!("inventory: unknown key {other:?}"),
         }
     }
-    assert!(!inv.statedir.is_empty(), "inventory needs `statedir <path>`");
-    assert!(!inv.cp.is_empty(), "inventory needs at least one `cp <addr>`");
-    assert_eq!(inv.cp.len(), 1, "multi-node CP bootstrap is the HA follow-on");
-    assert!(!inv.pairs.is_empty(), "inventory needs at least one `pair a,b`");
+    assert!(
+        !inv.statedir.is_empty(),
+        "inventory needs `statedir <path>`"
+    );
+    assert!(
+        !inv.cp.is_empty(),
+        "inventory needs at least one `cp <addr>`"
+    );
+    assert_eq!(
+        inv.cp.len(),
+        1,
+        "multi-node CP bootstrap is the HA follow-on"
+    );
+    assert!(
+        !inv.pairs.is_empty(),
+        "inventory needs at least one `pair a,b`"
+    );
     inv
 }
 
@@ -161,7 +174,11 @@ fn wait_pong(addr: &str, tls: &Option<Arc<flint_tls::ClientConfig>>, budget: Dur
     false
 }
 
-fn info_field(addr: &str, tls: &Option<Arc<flint_tls::ClientConfig>>, field: &str) -> Option<String> {
+fn info_field(
+    addr: &str,
+    tls: &Option<Arc<flint_tls::ClientConfig>>,
+    field: &str,
+) -> Option<String> {
     let Ok(Value::Bulk(Some(raw))) = call(addr, tls, &["FLINTINFO"]) else {
         return None;
     };
@@ -256,7 +273,9 @@ fn wait_supervised(inv: &Inventory, n_pairs: usize, since_ms: u64) {
             return;
         }
         if Instant::now() > deadline {
-            eprintln!("  WARNING: supervision not confirmed within 30s (journal may be unavailable); auto-failover may lag");
+            eprintln!(
+                "  WARNING: supervision not confirmed within 30s (journal may be unavailable); auto-failover may lag"
+            );
             return;
         }
         std::thread::sleep(Duration::from_millis(250));
@@ -357,7 +376,10 @@ fn bootstrap(inv: &Inventory) {
     for sub in ["logs", "pids", "snaps"] {
         std::fs::create_dir_all(format!("{d}/{sub}")).expect("statedir");
     }
-    eprintln!("== bootstrap into {d} (tls {})", if inv.tls { "on" } else { "off" });
+    eprintln!(
+        "== bootstrap into {d} (tls {})",
+        if inv.tls { "on" } else { "off" }
+    );
     if inv.tls {
         mint_certs(inv);
     }
@@ -373,7 +395,10 @@ fn bootstrap(inv: &Inventory) {
     ];
     cp_args.extend(internal_args(inv));
     spawn(inv, "cp", "flint-controlplane", &cp_args);
-    assert!(wait_pong(cp, &tls, Duration::from_secs(10)), "control plane up");
+    assert!(
+        wait_pong(cp, &tls, Duration::from_secs(10)),
+        "control plane up"
+    );
     for proxy in &inv.proxies {
         call(cp, &tls, &["CPADDPROXY", proxy]).expect("register proxy");
     }
@@ -391,7 +416,11 @@ fn bootstrap(inv: &Inventory) {
         )
         .expect("register pair");
     }
-    eprintln!("  registry: {} proxies, {} pairs", inv.proxies.len(), inv.pairs.len());
+    eprintln!(
+        "  registry: {} proxies, {} pairs",
+        inv.proxies.len(),
+        inv.pairs.len()
+    );
 
     // 2. Data plane.
     for pair in &inv.pairs {
@@ -416,7 +445,12 @@ fn bootstrap(inv: &Inventory) {
             proxy.clone(),
         ];
         args.extend(internal_args(inv));
-        spawn(inv, &format!("proxy-{}", port_of(proxy)), "flint-proxy", &args);
+        spawn(
+            inv,
+            &format!("proxy-{}", port_of(proxy)),
+            "flint-proxy",
+            &args,
+        );
     }
 
     for proxy in &inv.proxies {
@@ -511,7 +545,10 @@ fn expand(inv: &Inventory, inventory_path: &str, pair_spec: &str) {
     let pair: Vec<String> = pair_spec.split(',').map(String::from).collect();
     eprintln!("== expand: new pair {pair_spec}");
     start_pair_nodes(inv, &pair);
-    assert!(wait_pong(&pair[0], &tls, Duration::from_secs(10)), "new master up");
+    assert!(
+        wait_pong(&pair[0], &tls, Duration::from_secs(10)),
+        "new master up"
+    );
     // "-": the new pair owns no slots yet — capacity joins without
     // re-routing; migration (controller rebalance) moves slots later.
     call(&inv.cp[0], &tls, &["CPADDPAIR", pair_spec, "-"]).expect("register new pair");
@@ -528,7 +565,10 @@ fn expand(inv: &Inventory, inventory_path: &str, pair_spec: &str) {
         kill_pidfile(&inv.statedir, "controller");
         start_controller(&inv2);
         wait_supervised(&inv2, inv2.pairs.len(), t0);
-        eprintln!("  controller rerolled with {} pairs (stateless: a non-event)", inv2.pairs.len());
+        eprintln!(
+            "  controller rerolled with {} pairs (stateless: a non-event)",
+            inv2.pairs.len()
+        );
     }
     eprintln!("== expand complete");
 }
@@ -567,7 +607,10 @@ fn swap_node(inv: &Inventory, inventory_path: &str, bad: &str, new: &str) {
     ];
     args.extend(internal_args(inv));
     spawn(inv, &format!("node-{port}"), "flint-server", &args);
-    assert!(wait_pong(new, &tls, Duration::from_secs(15)), "replacement up");
+    assert!(
+        wait_pong(new, &tls, Duration::from_secs(15)),
+        "replacement up"
+    );
 
     // Wait for full convergence before the seat changes hands.
     let deadline = Instant::now() + Duration::from_secs(60);
@@ -608,7 +651,9 @@ fn swap_node(inv: &Inventory, inventory_path: &str, bad: &str, new: &str) {
         start_controller(&inv2);
         wait_supervised(&inv2, inv2.pairs.len(), t0);
     }
-    eprintln!("== swap complete: pair {pair_idx} seat replaced, registry + inventory updated (supervision armed)");
+    eprintln!(
+        "== swap complete: pair {pair_idx} seat replaced, registry + inventory updated (supervision armed)"
+    );
 }
 
 // ---------- canary upgrade ----------
@@ -767,9 +812,15 @@ fn upgrade(inv: &Inventory, version_tag: Option<String>, soak_ms: u64) {
         }
         masters.push(m);
     }
-    let (canary, canary_master) = replicas.first().cloned().expect("need at least one replica");
+    let (canary, canary_master) = replicas
+        .first()
+        .cloned()
+        .expect("need at least one replica");
 
-    eprintln!("== upgrade: canary {canary} first, soak {soak_ms}ms, then {} more replica(s), masters last", replicas.len() - 1);
+    eprintln!(
+        "== upgrade: canary {canary} first, soak {soak_ms}ms, then {} more replica(s), masters last",
+        replicas.len() - 1
+    );
     let t0 = now_ms();
     if let Err(e) = roll_node(inv, &canary, &canary_master, &envs, &expect, false) {
         panic!("CANARY FAILED (fleet untouched beyond the canary): {e}");
@@ -847,11 +898,21 @@ fn upgrade(inv: &Inventory, version_tag: Option<String>, soak_ms: u64) {
             );
             std::thread::sleep(Duration::from_millis(100));
         }
-        match call(&new_master, &tls, &["FLINTPROMOTE", "0", &(next + 1).to_string()]) {
+        match call(
+            &new_master,
+            &tls,
+            &["FLINTPROMOTE", "0", &(next + 1).to_string()],
+        ) {
             Ok(Value::Simple(_)) => {}
-            other => panic!("promotion of {new_master} at (0,{})failed: {other:?}", next + 1),
+            other => panic!(
+                "promotion of {new_master} at (0,{})failed: {other:?}",
+                next + 1
+            ),
         }
-        eprintln!("  pair {i}: {old_master} demoted + drained; {new_master} promoted at (0,{})", next + 1);
+        eprintln!(
+            "  pair {i}: {old_master} demoted + drained; {new_master} promoted at (0,{})",
+            next + 1
+        );
         if let Err(e) = roll_node(inv, old_master, &new_master, &envs, &expect, true) {
             panic!("old master respawn failed at {old_master}: {e}");
         }
@@ -861,7 +922,9 @@ fn upgrade(inv: &Inventory, version_tag: Option<String>, soak_ms: u64) {
         }
         eprintln!("  pair {i}: old master rolled, tailing the new one warm");
     }
-    eprintln!("== upgrade complete (data plane); proxies/CP/controller/agent roll is the --fleet follow-on");
+    eprintln!(
+        "== upgrade complete (data plane); proxies/CP/controller/agent roll is the --fleet follow-on"
+    );
     status(inv);
 }
 
@@ -872,7 +935,11 @@ fn stop(inv: &Inventory) {
         return;
     };
     for e in entries.flatten() {
-        let name = e.file_name().to_string_lossy().trim_end_matches(".pid").to_string();
+        let name = e
+            .file_name()
+            .to_string_lossy()
+            .trim_end_matches(".pid")
+            .to_string();
         kill_pidfile(d, &name);
         eprintln!("  stopped {name}");
     }
@@ -887,7 +954,11 @@ fn main() {
         .unwrap_or_else(|| panic!("usage: flintctl -f <inventory> <command> [...]"))
         .clone();
     let inv = parse_inventory(&inv_path);
-    let cmd_at = argv.iter().position(|a| a == "-f").map(|i| i + 2).unwrap_or(1);
+    let cmd_at = argv
+        .iter()
+        .position(|a| a == "-f")
+        .map(|i| i + 2)
+        .unwrap_or(1);
     let cmd = argv.get(cmd_at).map(|s| s.as_str()).unwrap_or("status");
     let rest: Vec<String> = argv.iter().skip(cmd_at + 1).cloned().collect();
 
@@ -895,7 +966,10 @@ fn main() {
         "bootstrap" => bootstrap(&inv),
         "status" => status(&inv),
         "tenant" => {
-            assert!(rest.first().map(|s| s.as_str()) == Some("add"), "usage: tenant add <name> <token> <ns> [k]");
+            assert!(
+                rest.first().map(|s| s.as_str()) == Some("add"),
+                "usage: tenant add <name> <token> <ns> [k]"
+            );
             tenant_add(&inv, &rest[1..]);
         }
         "expand" => {
@@ -924,6 +998,8 @@ fn main() {
             upgrade(&inv, tag, soak);
         }
         "stop" => stop(&inv),
-        other => panic!("unknown command {other:?} (bootstrap|status|tenant|expand|swap-node|stop)"),
+        other => {
+            panic!("unknown command {other:?} (bootstrap|status|tenant|expand|swap-node|stop)")
+        }
     }
 }

@@ -45,7 +45,12 @@ fn load_certs(path: &str) -> io::Result<Vec<CertificateDer<'static>>> {
         .map_err(|e| io::Error::new(e.kind(), format!("open cert {path}: {e}")))?;
     let certs: Vec<_> = rustls_pemfile::certs(&mut BufReader::new(f))
         .collect::<Result<_, _>>()
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("parse cert {path}: {e}")))?;
+        .map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("parse cert {path}: {e}"),
+            )
+        })?;
     if certs.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -61,7 +66,10 @@ fn load_key(path: &str) -> io::Result<PrivateKeyDer<'static>> {
     rustls_pemfile::private_key(&mut BufReader::new(f))
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("parse key {path}: {e}")))?
         .ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, format!("no private key in {path}"))
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("no private key in {path}"),
+            )
         })
 }
 
@@ -82,17 +90,13 @@ pub fn server_config(ca: &str, cert: &str, key: &str) -> io::Result<Arc<ServerCo
     let roots = Arc::new(root_store(ca)?);
     let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(roots, provider())
         .build()
-        .map_err(|e| {
-            io::Error::new(io::ErrorKind::InvalidData, format!("client verifier: {e}"))
-        })?;
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("client verifier: {e}")))?;
     let cfg = ServerConfig::builder_with_provider(provider())
         .with_safe_default_protocol_versions()
         .map_err(|e| io::Error::other(format!("tls versions: {e}")))?
         .with_client_cert_verifier(verifier)
         .with_single_cert(load_certs(cert)?, load_key(key)?)
-        .map_err(|e| {
-            io::Error::new(io::ErrorKind::InvalidData, format!("server cert/key: {e}"))
-        })?;
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("server cert/key: {e}")))?;
     Ok(Arc::new(cfg))
 }
 
@@ -105,9 +109,7 @@ pub fn client_config(ca: &str, cert: &str, key: &str) -> io::Result<Arc<ClientCo
         .map_err(|e| io::Error::other(format!("tls versions: {e}")))?
         .with_root_certificates(root_store(ca)?)
         .with_client_auth_cert(load_certs(cert)?, load_key(key)?)
-        .map_err(|e| {
-            io::Error::new(io::ErrorKind::InvalidData, format!("client cert/key: {e}"))
-        })?;
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("client cert/key: {e}")))?;
     Ok(Arc::new(cfg))
 }
 
@@ -193,7 +195,9 @@ pub fn accept(tcp: TcpStream, cfg: &Option<Arc<ServerConfig>>) -> io::Result<Str
         Some(cfg) => {
             let conn = ServerConnection::new(cfg.clone())
                 .map_err(|e| io::Error::other(format!("tls accept: {e}")))?;
-            Ok(Stream::ServerTls(Box::new(rustls::StreamOwned::new(conn, tcp))))
+            Ok(Stream::ServerTls(Box::new(rustls::StreamOwned::new(
+                conn, tcp,
+            ))))
         }
     }
 }
@@ -210,7 +214,9 @@ pub fn connect(addr: &str, cfg: &Option<Arc<ClientConfig>>) -> io::Result<Stream
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("sni: {e}")))?;
             let conn = ClientConnection::new(cfg.clone(), name)
                 .map_err(|e| io::Error::other(format!("tls connect: {e}")))?;
-            Ok(Stream::ClientTls(Box::new(rustls::StreamOwned::new(conn, tcp))))
+            Ok(Stream::ClientTls(Box::new(rustls::StreamOwned::new(
+                conn, tcp,
+            ))))
         }
     }
 }

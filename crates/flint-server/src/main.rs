@@ -423,7 +423,11 @@ fn main() -> std::io::Result<()> {
     let listener = TcpListener::bind(("127.0.0.1", port))?;
     eprintln!(
         "flint-server listening on 127.0.0.1:{port} ({})",
-        if internal_tls.is_some() { "internal mTLS" } else { "plaintext" }
+        if internal_tls.is_some() {
+            "internal mTLS"
+        } else {
+            "plaintext"
+        }
     );
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
@@ -1871,7 +1875,8 @@ fn flintsnapshot(rocks: &Option<RocksHandle>, args: &[Vec<u8>]) -> Value {
     }
     // Atomic LATEST repoint: write-then-rename, same as every manifest here.
     let tmp = root.join("LATEST.tmp");
-    if let Err(e) = std::fs::write(&tmp, &id).and_then(|_| std::fs::rename(&tmp, root.join("LATEST")))
+    if let Err(e) =
+        std::fs::write(&tmp, &id).and_then(|_| std::fs::rename(&tmp, root.join("LATEST")))
     {
         return Value::Error(format!("ERR LATEST repoint: {e}"));
     }
@@ -2040,10 +2045,7 @@ const FULLSYNC_CHUNK: usize = 4 * 1024 * 1024;
 /// whole file is ever held in memory — SSTs are usually ~64MB, but
 /// compaction settings can make them arbitrarily large.
 #[cfg(feature = "rocks")]
-fn flintfullsync(
-    mut stream: flint_tls::Stream,
-    rocks: Option<RocksHandle>,
-) -> std::io::Result<()> {
+fn flintfullsync(mut stream: flint_tls::Stream, rocks: Option<RocksHandle>) -> std::io::Result<()> {
     let mut out = Vec::new();
     let Some(kv) = rocks else {
         encode(

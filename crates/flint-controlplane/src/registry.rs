@@ -13,7 +13,10 @@ pub enum Mutation {
     /// Replace pair `idx`'s membership (node swap: a replacement node takes
     /// a dead member's seat; slot ranges are positional, so the pair id is
     /// the stable identity and membership floats).
-    SetPair { idx: usize, nodes: Vec<String> },
+    SetPair {
+        idx: usize,
+        nodes: Vec<String>,
+    },
     AddTenant {
         name: String,
         token: String,

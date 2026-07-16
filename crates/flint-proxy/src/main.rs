@@ -160,7 +160,11 @@ impl Topology {
             .iter()
             .position(|r| matches!(r, Some((a, b)) if (*a..=*b).contains(&slot)))
             .unwrap_or_else(|| {
-                let n = if ranged > 0 { ranged } else { routing.pairs.len() };
+                let n = if ranged > 0 {
+                    ranged
+                } else {
+                    routing.pairs.len()
+                };
                 (slot as usize * n) / 16384
             });
         routing.masters.get(pair)?.clone()
@@ -320,10 +324,7 @@ fn call_raw(
 
 /// Probe a pair's nodes for the current master (FLINTINFO role) — the same
 /// discovery rule the controller uses.
-fn discover_master(
-    nodes: &[String],
-    tls: &Option<Arc<rustls::ClientConfig>>,
-) -> Option<String> {
+fn discover_master(nodes: &[String], tls: &Option<Arc<rustls::ClientConfig>>) -> Option<String> {
     for addr in nodes {
         let Ok(mut stream) = flint_tls::connect(addr, tls) else {
             continue;
@@ -681,16 +682,19 @@ fn serve_client<S: Read + Write>(mut stream: S, topo: Arc<Topology>) -> std::io:
                     topo.stat_commands_total.fetch_add(1, Ordering::Relaxed);
                     if let Some(name) = args.first() {
                         if flint_commands::is_write_command(name) {
-                            topo.stat_commands_write_total.fetch_add(1, Ordering::Relaxed);
+                            topo.stat_commands_write_total
+                                .fetch_add(1, Ordering::Relaxed);
                         } else if flint_commands::is_read_command(name) {
-                            topo.stat_commands_read_total.fetch_add(1, Ordering::Relaxed);
+                            topo.stat_commands_read_total
+                                .fetch_add(1, Ordering::Relaxed);
                         }
                     }
                     let reply = match auth_step(&topo, &mut authed_ns, &args) {
                         AuthStep::Reply(v) => v,
                         AuthStep::Proceed(ns) => {
-                            let b = backends
-                                .get_or_insert_with(|| Backends::new(ns.clone(), topo.backend_tls.clone()));
+                            let b = backends.get_or_insert_with(|| {
+                                Backends::new(ns.clone(), topo.backend_tls.clone())
+                            });
                             handle(&topo, b, &ns, &args, &raw)
                         }
                     };
@@ -876,9 +880,12 @@ fn load_tls_config(cert_path: &str, key_path: &str) -> Arc<rustls::ServerConfig>
     let certs: Vec<_> = rustls_pemfile::certs(&mut BufReader::new(cert_file))
         .collect::<Result<_, _>>()
         .expect("parse certificate chain from --tls-cert");
-    assert!(!certs.is_empty(), "--tls-cert {cert_path} has no certificates");
-    let key_file = std::fs::File::open(key_path)
-        .unwrap_or_else(|e| panic!("open --tls-key {key_path}: {e}"));
+    assert!(
+        !certs.is_empty(),
+        "--tls-cert {cert_path} has no certificates"
+    );
+    let key_file =
+        std::fs::File::open(key_path).unwrap_or_else(|e| panic!("open --tls-key {key_path}: {e}"));
     let key = rustls_pemfile::private_key(&mut BufReader::new(key_file))
         .expect("read private key from --tls-key")
         .unwrap_or_else(|| panic!("no private key found in --tls-key {key_path}"));
@@ -936,15 +943,18 @@ fn main() -> std::io::Result<()> {
     // (presents its cert, verifies each backend against the shared CA). Same
     // both-or-none-plus-ca gating as the frontend; the triple is shared with
     // the servers, used here in the client role.
-    let backend_tls: Option<Arc<rustls::ClientConfig>> =
-        match (arg("--internal-ca"), arg("--internal-cert"), arg("--internal-key")) {
-            (Some(ca), Some(cert), Some(key)) => Some(
-                flint_tls::client_config(&ca, &cert, &key)
-                    .expect("build backend (internal) TLS client config"),
-            ),
-            (None, None, None) => None,
-            _ => panic!("--internal-ca, --internal-cert, --internal-key must be given together"),
-        };
+    let backend_tls: Option<Arc<rustls::ClientConfig>> = match (
+        arg("--internal-ca"),
+        arg("--internal-cert"),
+        arg("--internal-key"),
+    ) {
+        (Some(ca), Some(cert), Some(key)) => Some(
+            flint_tls::client_config(&ca, &cert, &key)
+                .expect("build backend (internal) TLS client config"),
+        ),
+        (None, None, None) => None,
+        _ => panic!("--internal-ca, --internal-cert, --internal-key must be given together"),
+    };
 
     let open_mode = control_plane.is_none() && tenants.is_empty();
     let masters: Vec<Option<String>> = pairs

@@ -321,9 +321,15 @@ impl Cluster {
             "start_proxy needs bootstrap_controlled (fixed ports)"
         );
         let proxy_port = 7690;
-        let pairs = format!("127.0.0.1:{},127.0.0.1:{}", self.master_port, self.replica_port);
-        let log = std::fs::File::create(format!("{}/flint-chaos-proxy.log", std::env::temp_dir().display()))
-            .expect("proxy log");
+        let pairs = format!(
+            "127.0.0.1:{},127.0.0.1:{}",
+            self.master_port, self.replica_port
+        );
+        let log = std::fs::File::create(format!(
+            "{}/flint-chaos-proxy.log",
+            std::env::temp_dir().display()
+        ))
+        .expect("proxy log");
         let child = Command::new(proxy_bin())
             .args(["--port", &proxy_port.to_string(), "--pairs", &pairs])
             .stderr(log)

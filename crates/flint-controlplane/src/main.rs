@@ -498,8 +498,7 @@ fn internal_server_config() -> Option<Arc<flint_tls::ServerConfig>> {
         arg("--internal-key"),
     ) {
         (Some(ca), Some(cert), Some(key)) => Some(
-            flint_tls::server_config(&ca, &cert, &key)
-                .expect("build internal TLS server config"),
+            flint_tls::server_config(&ca, &cert, &key).expect("build internal TLS server config"),
         ),
         (None, None, None) => None,
         _ => panic!("--internal-ca, --internal-cert, --internal-key must be given together"),
@@ -514,8 +513,7 @@ fn internal_client_config() -> Option<Arc<flint_tls::ClientConfig>> {
         arg("--internal-key"),
     ) {
         (Some(ca), Some(cert), Some(key)) => Some(
-            flint_tls::client_config(&ca, &cert, &key)
-                .expect("build internal TLS client config"),
+            flint_tls::client_config(&ca, &cert, &key).expect("build internal TLS client config"),
         ),
         _ => None,
     }
@@ -549,7 +547,11 @@ fn main() -> std::io::Result<()> {
     let listener = TcpListener::bind(("127.0.0.1", port))?;
     eprintln!(
         "flint-controlplane listening on 127.0.0.1:{port} ({})",
-        if internal_tls.is_some() { "internal mTLS" } else { "plaintext" }
+        if internal_tls.is_some() {
+            "internal mTLS"
+        } else {
+            "plaintext"
+        }
     );
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
