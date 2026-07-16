@@ -768,7 +768,7 @@ fn auth_step(
     if name.as_deref() == Some(b"PROXYSTATS") {
         let load = |c: &std::sync::atomic::AtomicU64| c.load(Ordering::Relaxed);
         let info = format!(
-            "active:{}\r\nconns_total:{}\r\nshed_total:{}\r\nauth_ok_total:{}\r\nauth_fail_total:{}\r\ncommands_total:{}\r\ncommands_read_total:{}\r\ncommands_write_total:{}\r\n",
+            "active:{}\r\nconns_total:{}\r\nshed_total:{}\r\nauth_ok_total:{}\r\nauth_fail_total:{}\r\ncommands_total:{}\r\ncommands_read_total:{}\r\ncommands_write_total:{}\r\nhotkey_sample_rate:{}\r\n",
             topo.stat_active.load(Ordering::Relaxed),
             load(&topo.stat_conns_total),
             load(&topo.stat_shed_total),
@@ -777,6 +777,10 @@ fn auth_step(
             load(&topo.stat_commands_total),
             load(&topo.stat_commands_read_total),
             load(&topo.stat_commands_write_total),
+            // The hot-key sketch samples 1-in-N; the reported hotkey rate is
+            // already scaled back up by this, so it IS the estimated ops/s.
+            // Exposed for transparency about the estimate's granularity.
+            HOTKEY_SAMPLE_RATE,
         );
         return AuthStep::Reply(Value::Bulk(Some(info.into_bytes())));
     }
