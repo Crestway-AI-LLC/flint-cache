@@ -43,6 +43,30 @@ fn arg(name: &str) -> Option<String> {
 static INTERNAL_CLIENT: std::sync::OnceLock<Option<Arc<flint_tls::ClientConfig>>> =
     std::sync::OnceLock::new();
 
+/// Full-sync admission control: a checkpoint full sync creates a consistent
+/// checkpoint and streams every SST — GBs of disk I/O and network, and it
+/// pins those SSTs against compaction reclamation for its duration. Many at
+/// once (a herd after a master restart, or adding several replicas) would
+/// saturate the master and starve the live workload and healthy replicas'
+/// WAL tails. Cap the number in flight; over the cap the master replies
+/// `-THROTTLED` and the requesting replica retries with backoff (the WAL
+/// tail is unaffected — this bounds only bulk SEEDING). Default 2; tune with
+/// `--max-fullsync`.
+static MAX_FULLSYNC: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(2);
+// Only the rocks paths (full-sync serving + its FLINTINFO fields) read this.
+#[cfg_attr(not(feature = "rocks"), allow(dead_code))]
+static FULLSYNC_ACTIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Releases a full-sync slot on any exit (including a mid-stream error), so a
+/// dropped connection can never leak a slot and wedge the cap.
+#[cfg_attr(not(feature = "rocks"), allow(dead_code))]
+struct FullSyncGuard;
+impl Drop for FullSyncGuard {
+    fn drop(&mut self) {
+        FULLSYNC_ACTIVE.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 // Every node→node dialer is rocks-gated (replication/migration), so the
 // mem-only build never dials out.
 #[cfg_attr(not(feature = "rocks"), allow(dead_code))]
@@ -91,6 +115,9 @@ fn main() -> std::io::Result<()> {
         .and_then(|p| p.parse::<u16>().ok())
         .unwrap_or(6380);
     let _ = SELF_ADDR.set(format!("127.0.0.1:{port}"));
+    if let Some(n) = arg("--max-fullsync").and_then(|v| v.parse::<usize>().ok()) {
+        MAX_FULLSYNC.store(n.max(1), Ordering::Relaxed);
+    }
     let _ = JOURNAL_TARGET.set(arg("--journal"));
     let engine = arg("--engine").unwrap_or_else(|| "mem".into());
     let replica_of = arg("--replica-of");
@@ -147,8 +174,23 @@ fn main() -> std::io::Result<()> {
             let fresh = !std::path::Path::new(&dir).join("CURRENT").exists();
             // A fresh replica seeds from a checkpoint (the spare-seeding
             // path), then tails the WAL from the copied DB's own sequence.
+            // Retry on the master's full-sync admission -THROTTLED (a herd
+            // draining) with backoff — a throttled seed must not crash the
+            // replica. The master rejects BEFORE any file ships, so each
+            // retry re-downloads cleanly.
             if fresh && let Some(target) = &replica_of {
-                replica::full_sync_download(target, std::path::Path::new(&dir))?;
+                let mut attempt = 0;
+                loop {
+                    match replica::full_sync_download(target, std::path::Path::new(&dir)) {
+                        Ok(()) => break,
+                        Err(e) if e.to_string().contains("THROTTLED") && attempt < 120 => {
+                            attempt += 1;
+                            eprintln!("full sync throttled by master; retry {attempt} in 1s");
+                            std::thread::sleep(std::time::Duration::from_secs(1));
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
             }
             // Spare restore (whole-pair loss): seed from the latest durable
             // snapshot instead of a live master. Only meaningful on a fresh
@@ -1013,7 +1055,7 @@ fn flintinfo(read_only: bool, rocks: &Option<RocksHandle>, hub: &Arc<ReplHub>) -
         None => "none".into(),
     };
     let info = format!(
-        "role:{}\r\nrole_epoch:{role_epoch}\r\nbuild:{build}\r\nsst_bytes:{sst}\r\nlatest_seq:{latest}\r\nlast_applied:{last_applied}\r\nacked_seq:{}\r\nseq_lag:{seq_lag}\r\nlive_replicas:{}\r\nlag_ms:{}\r\nlag_soft_ms:{soft}\r\nlag_hard_ms:{hard}\r\nmin_replicas_to_write:{minr}\r\n",
+        "role:{}\r\nrole_epoch:{role_epoch}\r\nbuild:{build}\r\nsst_bytes:{sst}\r\nlatest_seq:{latest}\r\nlast_applied:{last_applied}\r\nacked_seq:{}\r\nseq_lag:{seq_lag}\r\nlive_replicas:{}\r\nlag_ms:{}\r\nlag_soft_ms:{soft}\r\nlag_hard_ms:{hard}\r\nmin_replicas_to_write:{minr}\r\nfullsync_active:{fsa}\r\nfullsync_max:{fsm}\r\n",
         if read_only { "replica" } else { "master" },
         hub.effective_acked(now)
             .map_or_else(|| "none".into(), |a| a.to_string()),
@@ -1025,6 +1067,8 @@ fn flintinfo(read_only: bool, rocks: &Option<RocksHandle>, hub: &Arc<ReplHub>) -
         minr = hub.min_replicas_to_write,
         build = build_version(),
         sst = rocks.as_ref().map(|kv| kv.sst_bytes()).unwrap_or(0),
+        fsa = FULLSYNC_ACTIVE.load(Ordering::Relaxed),
+        fsm = MAX_FULLSYNC.load(Ordering::Relaxed),
     );
     Value::Bulk(Some(info.into_bytes()))
 }
@@ -2054,6 +2098,24 @@ fn flintfullsync(mut stream: flint_tls::Stream, rocks: Option<RocksHandle>) -> s
         );
         return stream.write_all(&out);
     };
+    // Admission control: bound concurrent full-syncs. Reserve a slot with a
+    // single fetch_add and roll back if it put us over the cap; the guard
+    // releases on any exit. Over the cap -> -THROTTLED (the replica retries
+    // with backoff); its WAL tail, if any, is untouched.
+    if FULLSYNC_ACTIVE.fetch_add(1, Ordering::Relaxed) >= MAX_FULLSYNC.load(Ordering::Relaxed) {
+        FULLSYNC_ACTIVE.fetch_sub(1, Ordering::Relaxed);
+        encode(
+            &Value::Error("THROTTLED full-sync slots busy, retry with backoff".into()),
+            &mut out,
+        );
+        return stream.write_all(&out);
+    }
+    let _slot = FullSyncGuard;
+    eprintln!(
+        "full sync starting ({}/{} slots in use)",
+        FULLSYNC_ACTIVE.load(Ordering::Relaxed),
+        MAX_FULLSYNC.load(Ordering::Relaxed)
+    );
     // Unique per checkpoint: a millisecond clock collides when two replicas
     // full-sync at once, and RocksDB's create_checkpoint fails if the dest
     // exists — which left both replicas unable to seed (found wiring D7's
