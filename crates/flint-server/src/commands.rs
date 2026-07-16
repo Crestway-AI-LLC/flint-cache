@@ -17,36 +17,12 @@ use flint_storage::strings::{Clock, SetExpiry, SetOptions, SetOutcome, StoreErro
 use flint_storage::zsets::ZSetStore;
 
 /// True for commands that mutate the keyspace (rejected on replicas).
+/// Delegates to the SHARED classifier (flint-commands, ADR-0005 D1): the
+/// server's -READONLY gate and slot gate must classify identically to the
+/// proxy's traffic split and future replica-read routing — one table, no
+/// drift.
 pub fn is_write_command(name: &[u8]) -> bool {
-    matches!(
-        name.to_ascii_uppercase().as_slice(),
-        b"SET"
-            | b"SETNX"
-            | b"SETEX"
-            | b"MSET"
-            | b"DEL"
-            | b"EXPIRE"
-            | b"PEXPIRE"
-            | b"PERSIST"
-            | b"INCR"
-            | b"DECR"
-            | b"INCRBY"
-            | b"DECRBY"
-            | b"APPEND"
-            | b"FLUSHALL"
-            | b"HSET"
-            | b"HDEL"
-            | b"HINCRBY"
-            | b"SADD"
-            | b"SREM"
-            | b"LPUSH"
-            | b"RPUSH"
-            | b"LPOP"
-            | b"RPOP"
-            | b"ZADD"
-            | b"ZREM"
-            | b"ZINCRBY"
-    )
+    flint_commands::is_write_command(name)
 }
 
 /// The single key a command addresses (its slot-determining key), or None

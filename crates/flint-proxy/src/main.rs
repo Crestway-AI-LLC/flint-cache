@@ -120,6 +120,10 @@ struct Topology {
     stat_auth_ok_total: std::sync::atomic::AtomicU64,
     stat_auth_fail_total: std::sync::atomic::AtomicU64,
     stat_commands_total: std::sync::atomic::AtomicU64,
+    /// Read/write traffic split (shared classifier, ADR-0005 D1/D5): the
+    /// per-plane view Grafana and hot-key analysis start from.
+    stat_commands_read_total: std::sync::atomic::AtomicU64,
+    stat_commands_write_total: std::sync::atomic::AtomicU64,
     /// Live client connections (the admission-control counter).
     stat_active: AtomicUsize,
     /// True only for a standalone proxy with no tenants configured: no
@@ -578,13 +582,15 @@ fn auth_step(topo: &Topology, authed_ns: &mut Option<Vec<u8>>, args: &[Vec<u8>])
     if name.as_deref() == Some(b"PROXYSTATS") {
         let load = |c: &std::sync::atomic::AtomicU64| c.load(Ordering::Relaxed);
         let info = format!(
-            "active:{}\r\nconns_total:{}\r\nshed_total:{}\r\nauth_ok_total:{}\r\nauth_fail_total:{}\r\ncommands_total:{}\r\n",
+            "active:{}\r\nconns_total:{}\r\nshed_total:{}\r\nauth_ok_total:{}\r\nauth_fail_total:{}\r\ncommands_total:{}\r\ncommands_read_total:{}\r\ncommands_write_total:{}\r\n",
             topo.stat_active.load(Ordering::Relaxed),
             load(&topo.stat_conns_total),
             load(&topo.stat_shed_total),
             load(&topo.stat_auth_ok_total),
             load(&topo.stat_auth_fail_total),
             load(&topo.stat_commands_total),
+            load(&topo.stat_commands_read_total),
+            load(&topo.stat_commands_write_total),
         );
         return AuthStep::Reply(Value::Bulk(Some(info.into_bytes())));
     }
@@ -673,6 +679,13 @@ fn serve_client<S: Read + Write>(mut stream: S, topo: Arc<Topology>) -> std::io:
                         return Ok(());
                     };
                     topo.stat_commands_total.fetch_add(1, Ordering::Relaxed);
+                    if let Some(name) = args.first() {
+                        if flint_commands::is_write_command(name) {
+                            topo.stat_commands_write_total.fetch_add(1, Ordering::Relaxed);
+                        } else if flint_commands::is_read_command(name) {
+                            topo.stat_commands_read_total.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
                     let reply = match auth_step(&topo, &mut authed_ns, &args) {
                         AuthStep::Reply(v) => v,
                         AuthStep::Proceed(ns) => {
@@ -958,6 +971,8 @@ fn main() -> std::io::Result<()> {
         stat_auth_ok_total: std::sync::atomic::AtomicU64::new(0),
         stat_auth_fail_total: std::sync::atomic::AtomicU64::new(0),
         stat_commands_total: std::sync::atomic::AtomicU64::new(0),
+        stat_commands_read_total: std::sync::atomic::AtomicU64::new(0),
+        stat_commands_write_total: std::sync::atomic::AtomicU64::new(0),
         stat_active: AtomicUsize::new(0),
         open_mode,
         backend_tls,

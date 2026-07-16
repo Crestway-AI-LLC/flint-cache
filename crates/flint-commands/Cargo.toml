@@ -1,0 +1,10 @@
+[package]
+name = "flint-commands"
+description = "The shared read/write command classifier (ADR-0005 D1): one definition used by the server (-READONLY gate, slot gate, the async-write queue's read bypass) and the proxy (traffic split, replica-read routing) so classification can never drift between planes"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true

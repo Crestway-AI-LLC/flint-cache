@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 flint-resp = { path = "../flint-resp" }
 flint-slot = { path = "../flint-slot" }
+flint-commands = { path = "../flint-commands" }
 flint-tls = { path = "../flint-tls" }
 # Client-facing TLS termination. `ring` provider = pure-Rust build (no C
 # toolchain); pinned explicitly, not via the process-default provider.
