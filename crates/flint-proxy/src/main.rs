@@ -81,6 +81,113 @@ fn arg(name: &str) -> Option<String> {
     std::env::args().skip_while(|a| a != name).nth(1)
 }
 
+/// Top-K hot-key sketch (ADR-0005 D5 — OBSERVABILITY ONLY: it informs
+/// PROXYHOTKEYS, the exporter, and the agent; it never toggles behavior).
+/// Space-saving: a full sketch evicts the minimum-total entry, and the
+/// newcomer inherits its count (the classic overestimate bound). Counts
+/// decay by half every DECAY_HALF_LIFE so the sketch tracks the RECENT
+/// window, not all time. Callers SAMPLE updates (1 in SAMPLE_RATE) so the
+/// mutex is off the common path; reported counts are therefore
+/// approximate-by-design, which is all a top-K needs.
+/// (ns, key) -> (reads, writes).
+type HotKeyMap = HashMap<(Vec<u8>, Vec<u8>), (u64, u64)>;
+
+struct HotKeySketch {
+    /// Capped at K entries (space-saving).
+    entries: std::sync::Mutex<HotKeyMap>,
+    last_decay: std::sync::Mutex<Instant>,
+}
+
+const HOTKEY_K: usize = 64;
+const HOTKEY_SAMPLE_RATE: u32 = 4;
+const HOTKEY_DECAY_HALF_LIFE: Duration = Duration::from_secs(10);
+
+impl HotKeySketch {
+    fn new() -> Self {
+        Self {
+            entries: std::sync::Mutex::new(HashMap::new()),
+            last_decay: std::sync::Mutex::new(Instant::now()),
+        }
+    }
+
+    fn observe(&self, ns: &[u8], key: &[u8], is_write: bool) {
+        self.maybe_decay();
+        let Ok(mut map) = self.entries.lock() else {
+            return;
+        };
+        let id = (ns.to_vec(), key.to_vec());
+        if let Some((r, w)) = map.get_mut(&id) {
+            if is_write {
+                *w += HOTKEY_SAMPLE_RATE as u64;
+            } else {
+                *r += HOTKEY_SAMPLE_RATE as u64;
+            }
+            return;
+        }
+        let inherited = if map.len() >= HOTKEY_K {
+            // Space-saving eviction: displace the minimum-total entry; the
+            // newcomer inherits its count (upper-bounds its true count).
+            let min = map
+                .iter()
+                .min_by_key(|(_, (r, w))| r + w)
+                .map(|(k, (r, w))| (k.clone(), r + w));
+            match min {
+                Some((k, c)) => {
+                    map.remove(&k);
+                    c
+                }
+                None => 0,
+            }
+        } else {
+            0
+        };
+        let add = HOTKEY_SAMPLE_RATE as u64;
+        map.insert(
+            id,
+            if is_write {
+                (inherited, add)
+            } else {
+                (add, inherited)
+            },
+        );
+    }
+
+    fn maybe_decay(&self) {
+        let Ok(mut last) = self.last_decay.lock() else {
+            return;
+        };
+        if last.elapsed() < HOTKEY_DECAY_HALF_LIFE {
+            return;
+        }
+        *last = Instant::now();
+        drop(last);
+        if let Ok(mut map) = self.entries.lock() {
+            map.retain(|_, (r, w)| {
+                *r /= 2;
+                *w /= 2;
+                *r + *w > 0
+            });
+        }
+    }
+
+    /// Top entries by total, optionally filtered to one namespace (the
+    /// tenant-scoped view). Key names are DATA: an authed tenant must only
+    /// ever see its own namespace.
+    fn top(&self, ns_filter: Option<&[u8]>, n: usize) -> Vec<(Vec<u8>, Vec<u8>, u64, u64)> {
+        let Ok(map) = self.entries.lock() else {
+            return Vec::new();
+        };
+        let mut rows: Vec<_> = map
+            .iter()
+            .filter(|((ns, _), _)| ns_filter.is_none_or(|f| ns.as_slice() == f))
+            .map(|((ns, k), (r, w))| (ns.clone(), k.clone(), *r, *w))
+            .collect();
+        rows.sort_by_key(|(_, _, r, w)| std::cmp::Reverse(r + w));
+        rows.truncate(n);
+        rows
+    }
+}
+
 /// The routing table proper: pairs and their current masters, replaced
 /// atomically when the control plane pushes a new topology.
 #[derive(Default)]
@@ -126,6 +233,8 @@ struct Topology {
     stat_commands_write_total: std::sync::atomic::AtomicU64,
     /// Live client connections (the admission-control counter).
     stat_active: AtomicUsize,
+    /// Hot-key sketch (D5, observability only).
+    hotkeys: HotKeySketch,
     /// True only for a standalone proxy with no tenants configured: no
     /// auth, default namespace. A control-plane-fed proxy is never open —
     /// before its first snapshot it simply has no tenants yet.
@@ -595,6 +704,25 @@ fn auth_step(topo: &Topology, authed_ns: &mut Option<Vec<u8>>, args: &[Vec<u8>])
         );
         return AuthStep::Reply(Value::Bulk(Some(info.into_bytes())));
     }
+    // Ops/tenant query: top hot keys (D5, observability only). SCOPING IS
+    // THE CONTRACT: an AUTHED connection sees only its own namespace (key
+    // names are data); the unscoped all-namespace view answers pre-auth —
+    // the operator/internal surface, mTLS-gated in a real deploy like the
+    // other PROXY* introspection commands.
+    if name.as_deref() == Some(b"PROXYHOTKEYS") {
+        let rows = topo
+            .hotkeys
+            .top(authed_ns.as_deref().filter(|_| !topo.open_mode), 16);
+        let mut out = String::new();
+        for (ns, key, r, w) in rows {
+            out.push_str(&format!(
+                "{} {} reads:{r} writes:{w}\r\n",
+                String::from_utf8_lossy(&ns),
+                String::from_utf8_lossy(&key),
+            ));
+        }
+        return AuthStep::Reply(Value::Bulk(Some(out.into_bytes())));
+    }
     if name.as_deref() == Some(b"PROXYAUTHCOUNT") {
         let n = args
             .get(1)
@@ -658,6 +786,10 @@ fn serve_client<S: Read + Write>(mut stream: S, topo: Arc<Topology>) -> std::io:
         None
     };
     let mut backends: Option<Backends> = None;
+    // Hot-key sampling tick (D5): every HOTKEY_SAMPLE_RATE-th keyed command
+    // on this connection feeds the sketch, keeping the mutex off the
+    // common path.
+    let mut hotkey_tick: u32 = 0;
     let mut buf: Vec<u8> = Vec::with_capacity(16 * 1024);
     let mut chunk = [0u8; 16 * 1024];
     let mut out: Vec<u8> = Vec::with_capacity(4 * 1024);
@@ -681,12 +813,22 @@ fn serve_client<S: Read + Write>(mut stream: S, topo: Arc<Topology>) -> std::io:
                     };
                     topo.stat_commands_total.fetch_add(1, Ordering::Relaxed);
                     if let Some(name) = args.first() {
-                        if flint_commands::is_write_command(name) {
+                        let is_write = flint_commands::is_write_command(name);
+                        if is_write {
                             topo.stat_commands_write_total
                                 .fetch_add(1, Ordering::Relaxed);
                         } else if flint_commands::is_read_command(name) {
                             topo.stat_commands_read_total
                                 .fetch_add(1, Ordering::Relaxed);
+                        }
+                        if is_write || flint_commands::is_read_command(name) {
+                            hotkey_tick = hotkey_tick.wrapping_add(1);
+                            if hotkey_tick.is_multiple_of(HOTKEY_SAMPLE_RATE)
+                                && let Some(ns) = authed_ns.as_deref()
+                                && let Some(key) = route_key(&args)
+                            {
+                                topo.hotkeys.observe(ns, key, is_write);
+                            }
                         }
                     }
                     let reply = match auth_step(&topo, &mut authed_ns, &args) {
@@ -984,6 +1126,7 @@ fn main() -> std::io::Result<()> {
         stat_commands_read_total: std::sync::atomic::AtomicU64::new(0),
         stat_commands_write_total: std::sync::atomic::AtomicU64::new(0),
         stat_active: AtomicUsize::new(0),
+        hotkeys: HotKeySketch::new(),
         open_mode,
         backend_tls,
     });
