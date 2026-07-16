@@ -219,8 +219,11 @@ struct Topology {
     /// tenant A's redirect must not reroute tenant B. Overrides the range
     /// default; lost entries are relearned from the default owner.
     moved: RwLock<HashMap<(Vec<u8>, u16), String>>,
-    /// token -> namespace.
-    tenants: RwLock<HashMap<String, Vec<u8>>>,
+    /// token -> (namespace, replica_reads opt-in). replica_reads (ADR-0005
+    /// D7) lets this tenant's READS fan across the owning pair's replicas.
+    tenants: RwLock<HashMap<String, (Vec<u8>, bool)>>,
+    /// Round-robin cursor for replica selection (D7).
+    replica_rr: AtomicUsize,
     /// token -> successful-AUTH count. During a dual-version rotation the
     /// operator watches the PREVIOUS token's count go flat before dropping
     /// it (CPDROPPREV) — the per-version usage metric.
@@ -290,8 +293,24 @@ impl Topology {
         }
     }
 
-    fn lookup_token(&self, token: &str) -> Option<Vec<u8>> {
+    fn lookup_token(&self, token: &str) -> Option<(Vec<u8>, bool)> {
         self.tenants.read().ok()?.get(token).cloned()
+    }
+
+    /// A replica of the pair that currently owns `(ns, slot)`, chosen
+    /// round-robin (D7). None -> no replica known: the caller falls back to
+    /// the master. Follows ownership via the master so a migrated slot reads
+    /// from the new owner's replicas, not the old pair's.
+    fn route_replica(&self, ns: &[u8], slot: u16) -> Option<String> {
+        let master = self.route(ns, slot)?;
+        let routing = self.routing.read().ok()?;
+        let members = routing.pairs.iter().find(|nodes| nodes.contains(&master))?;
+        let replicas: Vec<&String> = members.iter().filter(|n| **n != master).collect();
+        if replicas.is_empty() {
+            return None;
+        }
+        let idx = self.replica_rr.fetch_add(1, Ordering::Relaxed) % replicas.len();
+        Some(replicas[idx].clone())
     }
 
     fn bump_auth(&self, token: &str) {
@@ -389,11 +408,16 @@ impl Topology {
                 routing.ranges = new_ranges;
             }
         }
-        let new_tenants: HashMap<String, Vec<u8>> = tenants_spec
+        let new_tenants: HashMap<String, (Vec<u8>, bool)> = tenants_spec
             .split(',')
             .filter_map(|pair| {
-                let (token, ns) = pair.split_once('=')?;
-                Some((token.to_string(), ns.as_bytes().to_vec()))
+                let (token, ns_and_flags) = pair.split_once('=')?;
+                // "ns" or "ns#r" (replica-read opt-in, D7).
+                let (ns, replica_reads) = match ns_and_flags.split_once('#') {
+                    Some((ns, flags)) => (ns, flags.contains('r')),
+                    None => (ns_and_flags, false),
+                };
+                Some((token.to_string(), (ns.as_bytes().to_vec(), replica_reads)))
             })
             .collect();
         if let Ok(mut tenants) = self.tenants.write() {
@@ -558,13 +582,19 @@ fn forward(
     ns: &[u8],
     args: &[Vec<u8>],
     frame: &[u8],
+    read_replica: bool,
 ) -> Value {
     let slot = route_key(args).map(slot_for_key);
     let deadline = Instant::now() + RETRY_BUDGET;
+    // D7: prefer a replica for this read; cleared to fall back to the master
+    // if a replica attempt errors, so a dead/lagging replica never fails a
+    // read.
+    let mut use_replica = read_replica;
     loop {
-        // Resolve the target: keyed commands by slot; no-key commands go to
-        // pair 0's master (v0: DBSIZE/FLUSHALL fan out below, before here).
+        // Resolve the target: a D7 read to a replica of the owning pair, else
+        // the slot's master; no-key commands go to pair 0's master.
         let target = match slot {
+            Some(s) if use_replica => topo.route_replica(ns, s).or_else(|| topo.route(ns, s)),
             Some(s) => topo.route(ns, s),
             None => topo
                 .routing
@@ -635,14 +665,21 @@ fn forward(
             }
             Ok(reply) => return reply,
             Err(_) => {
-                // Backend died (or timed out): rediscover that pair's master
-                // and retry — the failover-chasing path.
+                // Backend died (or timed out). If this was a D7 replica read,
+                // fall back to the master for the retry — a dead/slow replica
+                // must never fail a read. Otherwise rediscover the pair's
+                // master (the failover-chasing path).
                 if Instant::now() > deadline {
                     return Value::Error(
                         "ERR backend unavailable (failover did not settle)".into(),
                     );
                 }
-                topo.rediscover_for(&addr);
+                if use_replica {
+                    use_replica = false;
+                    backends.drop_conn(&addr);
+                } else {
+                    topo.rediscover_for(&addr);
+                }
                 std::thread::sleep(Duration::from_millis(100));
             }
         }
@@ -686,7 +723,12 @@ enum AuthStep {
 /// except AUTH/QUIT gets -NOAUTH. A successful AUTH fixes the connection's
 /// namespace; re-AUTH to a different tenant is rejected (reconnect instead)
 /// so the backend-connection namespace pinning can never go stale.
-fn auth_step(topo: &Topology, authed_ns: &mut Option<Vec<u8>>, args: &[Vec<u8>]) -> AuthStep {
+fn auth_step(
+    topo: &Topology,
+    authed_ns: &mut Option<Vec<u8>>,
+    replica_reads: &mut bool,
+    args: &[Vec<u8>],
+) -> AuthStep {
     let name = args.first().map(|n| n.to_ascii_uppercase());
     // Ops query: per-token AUTH count (drain check during token rotation).
     // Requires knowing the exact token; low-sensitivity, answered pre-auth.
@@ -750,7 +792,7 @@ fn auth_step(topo: &Topology, authed_ns: &mut Option<Vec<u8>>, args: &[Vec<u8>])
                 "ERR Client sent AUTH, but no tenants are configured".into(),
             ));
         }
-        let Some(ns) = topo.lookup_token(&String::from_utf8_lossy(token)) else {
+        let Some((ns, rr)) = topo.lookup_token(&String::from_utf8_lossy(token)) else {
             topo.stat_auth_fail_total.fetch_add(1, Ordering::Relaxed);
             return AuthStep::Reply(Value::Error("WRONGPASS invalid token".into()));
         };
@@ -765,6 +807,7 @@ fn auth_step(topo: &Topology, authed_ns: &mut Option<Vec<u8>>, args: &[Vec<u8>])
         topo.bump_auth(&String::from_utf8_lossy(token));
         topo.stat_auth_ok_total.fetch_add(1, Ordering::Relaxed);
         *authed_ns = Some(ns);
+        *replica_reads = rr;
         return AuthStep::Reply(Value::Simple("OK".into()));
     }
     match authed_ns {
@@ -791,6 +834,8 @@ fn serve_client<S: Read + Write>(mut stream: S, topo: Arc<Topology>) -> std::io:
         None
     };
     let mut backends: Option<Backends> = None;
+    // Replica-read opt-in for THIS connection's tenant (D7), set at AUTH.
+    let mut replica_reads = false;
     // Hot-key sampling tick (D5): every HOTKEY_SAMPLE_RATE-th keyed command
     // on this connection feeds the sketch, keeping the mutex off the
     // common path.
@@ -836,13 +881,19 @@ fn serve_client<S: Read + Write>(mut stream: S, topo: Arc<Topology>) -> std::io:
                             }
                         }
                     }
-                    let reply = match auth_step(&topo, &mut authed_ns, &args) {
+                    let reply = match auth_step(&topo, &mut authed_ns, &mut replica_reads, &args) {
                         AuthStep::Reply(v) => v,
                         AuthStep::Proceed(ns) => {
+                            // D7: route to a replica only if the tenant opted
+                            // in AND this is a read (writes stay on master).
+                            let read_replica = replica_reads
+                                && args
+                                    .first()
+                                    .is_some_and(|n| flint_commands::is_read_command(n));
                             let b = backends.get_or_insert_with(|| {
                                 Backends::new(ns.clone(), topo.backend_tls.clone())
                             });
-                            handle(&topo, b, &ns, &args, &raw)
+                            handle(&topo, b, &ns, &args, &raw, read_replica)
                         }
                     };
                     encode(&reply, &mut out);
@@ -875,6 +926,7 @@ fn handle(
     ns: &[u8],
     args: &[Vec<u8>],
     raw: &[u8],
+    read_replica: bool,
 ) -> Value {
     let Some(name) = args.first() else {
         return Value::Error("ERR empty command".into());
@@ -914,7 +966,7 @@ fn handle(
             }
             Value::Simple("OK".into())
         }),
-        _ => forward(topo, backends, ns, args, raw),
+        _ => forward(topo, backends, ns, args, raw, read_replica),
     }
 }
 
@@ -1067,7 +1119,7 @@ fn main() -> std::io::Result<()> {
                 .collect()
         })
         .unwrap_or_default();
-    let tenants: HashMap<String, Vec<u8>> = arg("--tenants")
+    let tenants: HashMap<String, (Vec<u8>, bool)> = arg("--tenants")
         .map(|spec| {
             spec.split(',')
                 .filter_map(|pair| {
@@ -1076,7 +1128,8 @@ fn main() -> std::io::Result<()> {
                         !ns.is_empty() && ns.len() <= 64 && !ns.contains('\0'),
                         "invalid namespace in --tenants"
                     );
-                    Some((token.to_string(), ns.as_bytes().to_vec()))
+                    // Static mode has no CP flag; replica reads default off.
+                    Some((token.to_string(), (ns.as_bytes().to_vec(), false)))
                 })
                 .collect()
         })
@@ -1131,6 +1184,7 @@ fn main() -> std::io::Result<()> {
         stat_commands_read_total: std::sync::atomic::AtomicU64::new(0),
         stat_commands_write_total: std::sync::atomic::AtomicU64::new(0),
         stat_active: AtomicUsize::new(0),
+        replica_rr: AtomicUsize::new(0),
         hotkeys: HotKeySketch::new(),
         open_mode,
         backend_tls,

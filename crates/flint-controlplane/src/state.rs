@@ -30,6 +30,10 @@ pub struct Tenant {
     pub subset: Vec<String>,
     /// Previous token during a rotation; both auth to `ns` until dropped.
     pub prev_token: Option<String>,
+    /// Replica-read opt-in (ADR-0005 D7): when true, the proxy may fan this
+    /// tenant's reads across the pair's replicas (bounded-staleness, the
+    /// tenant's explicit choice). Writes always go to the master.
+    pub replica_reads: bool,
 }
 
 #[derive(Debug, Default)]
@@ -145,6 +149,7 @@ impl State {
                         let prev_token = parts
                             .next()
                             .and_then(|p| if p == "-" { None } else { Some(p.to_string()) });
+                        let replica_reads = parts.next() == Some("1");
                         s.tenants.insert(
                             name.to_string(),
                             Tenant {
@@ -153,6 +158,7 @@ impl State {
                                 ns: ns.to_string(),
                                 subset,
                                 prev_token,
+                                replica_reads,
                             },
                         );
                     }
@@ -182,11 +188,12 @@ impl State {
                 t.subset.join(",")
             };
             out.push_str(&format!(
-                "tenant {} {} {} {subset} {}\n",
+                "tenant {} {} {} {subset} {} {}\n",
                 t.name,
                 t.token,
                 t.ns,
                 t.prev_token.as_deref().unwrap_or("-"),
+                t.replica_reads as u8,
                 subset = subset
             ));
         }
@@ -231,9 +238,10 @@ impl State {
             .values()
             .filter(|t| t.subset.iter().any(|s| s == proxy))
             .flat_map(|t| {
-                let mut v = vec![format!("{}={}", t.token, t.ns)];
+                let suffix = if t.replica_reads { "#r" } else { "" };
+                let mut v = vec![format!("{}={}{suffix}", t.token, t.ns)];
                 if let Some(p) = &t.prev_token {
-                    v.push(format!("{}={}", p, t.ns));
+                    v.push(format!("{}={}{suffix}", p, t.ns));
                 }
                 v
             })
@@ -295,6 +303,7 @@ mod tests {
                 ns: "acme".into(),
                 subset: vec!["p1:7000".into()],
                 prev_token: None,
+                replica_reads: false,
             },
         );
         let v = s.commit().expect("commit");
@@ -324,6 +333,7 @@ mod tests {
                     ns: name.into(),
                     subset: vec![proxy.into()],
                     prev_token: None,
+                    replica_reads: false,
                 },
             );
         }

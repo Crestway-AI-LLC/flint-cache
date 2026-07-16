@@ -37,6 +37,11 @@ pub enum Mutation {
     DropPrev {
         name: String,
     },
+    /// Set a tenant's replica-read opt-in (ADR-0005 D7).
+    SetReplicaReads {
+        name: String,
+        on: bool,
+    },
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -49,6 +54,10 @@ pub struct Tenant {
     /// until dropped. None outside a rotation window.
     #[serde(default)]
     pub prev_token: Option<String>,
+    /// Replica-read opt-in (ADR-0005 D7): proxy may fan reads across the
+    /// pair's replicas; writes stay on the master. Tenant's explicit choice.
+    #[serde(default)]
+    pub replica_reads: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -131,6 +140,7 @@ impl RegistryState {
                         ns,
                         subset,
                         prev_token: None,
+                        replica_reads: false,
                     },
                 );
             }
@@ -147,6 +157,11 @@ impl RegistryState {
             Mutation::DropPrev { name } => {
                 if let Some(t) = self.tenants.get_mut(&name) {
                     t.prev_token = None;
+                }
+            }
+            Mutation::SetReplicaReads { name, on } => {
+                if let Some(t) = self.tenants.get_mut(&name) {
+                    t.replica_reads = on;
                 }
             }
         }
@@ -170,9 +185,10 @@ impl RegistryState {
             .values()
             .filter(|t| t.subset.iter().any(|s| s == proxy))
             .flat_map(|t| {
-                let mut v = vec![format!("{}={}", t.token, t.ns)];
+                let suffix = if t.replica_reads { "#r" } else { "" };
+                let mut v = vec![format!("{}={}{suffix}", t.token, t.ns)];
                 if let Some(p) = &t.prev_token {
-                    v.push(format!("{}={}", p, t.ns));
+                    v.push(format!("{}={}{suffix}", p, t.ns));
                 }
                 v
             })

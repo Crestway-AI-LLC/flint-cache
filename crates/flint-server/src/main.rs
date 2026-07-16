@@ -2054,10 +2054,16 @@ fn flintfullsync(mut stream: flint_tls::Stream, rocks: Option<RocksHandle>) -> s
         );
         return stream.write_all(&out);
     };
+    // Unique per checkpoint: a millisecond clock collides when two replicas
+    // full-sync at once, and RocksDB's create_checkpoint fails if the dest
+    // exists — which left both replicas unable to seed (found wiring D7's
+    // 3-member pair). A process-global counter guarantees uniqueness.
+    static FULLSYNC_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let ckpt = std::env::temp_dir().join(format!(
-        "flint-fullsync-{}-{}",
+        "flint-fullsync-{}-{}-{}",
         std::process::id(),
-        flint_storage::strings::system_clock()
+        flint_storage::strings::system_clock(),
+        FULLSYNC_SEQ.fetch_add(1, Ordering::Relaxed)
     ));
     kv.checkpoint_to(&ckpt)
         .map_err(|e| std::io::Error::other(format!("checkpoint: {e}")))?;

@@ -573,6 +573,87 @@ fn expand(inv: &Inventory, inventory_path: &str, pair_spec: &str) {
     eprintln!("== expand complete");
 }
 
+/// Add a replica to a pair (ADR-0005 D7 topology knob): spawn a fresh
+/// replica of the pair's master, wait for it to converge, then CPSETPAIR to
+/// append it to the pair's membership. Pure capacity: it owns nothing new,
+/// serves reads for tenants that opted into replica reads. Reroll the
+/// controller so it supervises the wider member set.
+fn add_replica(inv: &Inventory, inventory_path: &str, pair_ref: &str, new: &str) {
+    let tls = tls_client(inv);
+    // pair_ref is a pair index or any current member address.
+    let pair_idx = match pair_ref.parse::<usize>() {
+        Ok(i) if i < inv.pairs.len() => i,
+        _ => inv
+            .pairs
+            .iter()
+            .position(|p| p.iter().any(|a| a == pair_ref))
+            .unwrap_or_else(|| panic!("{pair_ref} is not a pair index or a known member")),
+    };
+    let master = inv.pairs[pair_idx]
+        .iter()
+        .find(|a| info_field(a, &tls, "role:").as_deref() == Some("master"))
+        .unwrap_or_else(|| panic!("pair {pair_idx} has no reachable master"))
+        .clone();
+    eprintln!("== add-replica: {new} -> pair {pair_idx} (master {master})");
+
+    let d = &inv.statedir;
+    let port = port_of(new);
+    let mut args = vec![
+        "--port".to_string(),
+        port.to_string(),
+        "--engine".into(),
+        "rocks".into(),
+        "--data-dir".into(),
+        format!("{d}/node-{port}"),
+        "--journal".into(),
+        inv.cp[0].clone(),
+        "--replica-of".into(),
+        master.clone(),
+    ];
+    args.extend(internal_args(inv));
+    spawn(inv, &format!("node-{port}"), "flint-server", &args);
+    assert!(
+        wait_pong(new, &tls, Duration::from_secs(15)),
+        "new replica up"
+    );
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        if info_field(&master, &tls, "seq_lag:").as_deref() == Some("0") {
+            break;
+        }
+        assert!(Instant::now() < deadline, "new replica never converged");
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    eprintln!("  new replica converged (seq_lag 0)");
+
+    let mut members = inv.pairs[pair_idx].clone();
+    members.push(new.to_string());
+    call(
+        &inv.cp[0],
+        &tls,
+        &["CPSETPAIR", &pair_idx.to_string(), &members.join(",")],
+    )
+    .expect("CPSETPAIR");
+
+    let raw = std::fs::read_to_string(inventory_path).expect("inventory");
+    let updated = raw.replace(
+        &format!("pair {}", inv.pairs[pair_idx].join(",")),
+        &format!("pair {}", members.join(",")),
+    );
+    std::fs::write(inventory_path, updated).expect("inventory update");
+    if inv.controller {
+        let t0 = now_ms();
+        let mut inv2 = inv.clone();
+        inv2.pairs[pair_idx] = members;
+        kill_pidfile(d, "controller");
+        start_controller(&inv2);
+        wait_supervised(&inv2, inv2.pairs.len(), t0);
+    }
+    eprintln!(
+        "== add-replica complete: pair {pair_idx} now has an extra replica for D7 read fan-out"
+    );
+}
+
 fn swap_node(inv: &Inventory, inventory_path: &str, bad: &str, new: &str) {
     let tls = tls_client(inv);
     let Some(pair_idx) = inv.pairs.iter().position(|p| p.iter().any(|a| a == bad)) else {
@@ -982,6 +1063,26 @@ fn main() {
                 rest.get(1).expect("usage: swap-node <bad> <new>"),
             );
             swap_node(&inv, &inv_path, bad, new);
+        }
+        "add-replica" => {
+            let (pair, new) = (
+                rest.first()
+                    .expect("usage: add-replica <pair-idx|member> <new>"),
+                rest.get(1)
+                    .expect("usage: add-replica <pair-idx|member> <new>"),
+            );
+            add_replica(&inv, &inv_path, pair, new);
+        }
+        "tenant-reads" => {
+            let (name, mode) = (
+                rest.first().expect("usage: tenant-reads <name> <on|off>"),
+                rest.get(1).expect("usage: tenant-reads <name> <on|off>"),
+            );
+            let tls = tls_client(&inv);
+            match call(&inv.cp[0], &tls, &["CPTENANTREADS", name, mode]) {
+                Ok(Value::Simple(s)) => println!("{s}"),
+                other => panic!("tenant-reads failed: {other:?}"),
+            }
         }
         "upgrade" => {
             let tag = rest

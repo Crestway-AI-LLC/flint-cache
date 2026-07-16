@@ -180,6 +180,7 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
                     ns,
                     subset,
                     prev_token: None,
+                    replica_reads: false,
                 },
             );
             match st.commit() {
@@ -204,6 +205,31 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
             } else {
                 subset.split(',').map(String::from).collect()
             };
+            match st.commit() {
+                Ok(_) => {}
+                Err(e) => return err(&format!("persist: {e}")),
+            }
+            shared.changed.notify_all();
+            ok()
+        }
+        // Replica-read opt-in for a tenant (ADR-0005 D7). Pushed to the
+        // proxy on the next snapshot; writes stay on the master regardless.
+        b"CPTENANTREADS" => {
+            let (Some(name), Some(mode)) = (text(1), text(2)) else {
+                return err("CPTENANTREADS <name> <on|off>");
+            };
+            let on = match mode.as_str() {
+                "on" => true,
+                "off" => false,
+                _ => return err("CPTENANTREADS <name> <on|off>"),
+            };
+            let Ok(mut st) = shared.state.lock() else {
+                return err("state lock");
+            };
+            let Some(t) = st.tenants.get_mut(&name) else {
+                return err("no such tenant");
+            };
+            t.replica_reads = on;
             match st.commit() {
                 Ok(_) => {}
                 Err(e) => return err(&format!("persist: {e}")),

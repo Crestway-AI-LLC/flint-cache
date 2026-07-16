@@ -566,6 +566,20 @@ async fn handle_admin(ha: &Ha, args: &[Vec<u8>]) -> Value {
                 Err(l) => redirect(l),
             }
         }
+        b"CPTENANTREADS" => {
+            let (Some(name), Some(mode)) = (text(1), text(2)) else {
+                return Value::Error("ERR CPTENANTREADS <name> <on|off>".into());
+            };
+            let on = match mode.as_str() {
+                "on" => true,
+                "off" => false,
+                _ => return Value::Error("ERR CPTENANTREADS <name> <on|off>".into()),
+            };
+            match ha.propose(Mutation::SetReplicaReads { name, on }).await {
+                Ok(_) => Value::Simple("OK".into()),
+                Err(l) => redirect(l),
+            }
+        }
         b"CPSETPAIR" => {
             let (Some(idx), Some(nodes)) = (
                 text(1).and_then(|v| v.parse::<usize>().ok()),
