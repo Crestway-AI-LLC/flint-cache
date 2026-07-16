@@ -99,7 +99,12 @@ struct HotKeySketch {
 }
 
 const HOTKEY_K: usize = 64;
-const HOTKEY_SAMPLE_RATE: u32 = 4;
+/// 1-in-N sampling: only every Nth keyed command takes the sketch mutex.
+/// The sketch is observability-only, so a sparse sample is plenty to surface
+/// a DOMINATING key — sampled counts scale back up by this factor, so the
+/// threshold stays in real-hit units. Power of two: the `is_multiple_of`
+/// tick stays exact even across the u32 counter's wrap.
+const HOTKEY_SAMPLE_RATE: u32 = 16;
 const HOTKEY_DECAY_HALF_LIFE: Duration = Duration::from_secs(10);
 
 impl HotKeySketch {
