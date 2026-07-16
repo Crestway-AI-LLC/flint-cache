@@ -89,8 +89,18 @@ fn arg(name: &str) -> Option<String> {
 /// window, not all time. Callers SAMPLE updates (1 in SAMPLE_RATE) so the
 /// mutex is off the common path; reported counts are therefore
 /// approximate-by-design, which is all a top-K needs.
-/// (ns, key) -> (reads, writes).
-type HotKeyMap = HashMap<(Vec<u8>, Vec<u8>), (u64, u64)>;
+/// Per hot key: a DECAYED score for top-K ranking ("hot now"), plus a
+/// MONOTONIC total for rate — the agent diffs the total across sweeps to
+/// report req/s on the dashboard. Score decays; totals never do.
+#[derive(Default, Clone, Copy)]
+struct HotEntry {
+    r_score: u64,
+    w_score: u64,
+    r_total: u64,
+    w_total: u64,
+}
+/// (ns, key) -> HotEntry.
+type HotKeyMap = HashMap<(Vec<u8>, Vec<u8>), HotEntry>;
 
 struct HotKeySketch {
     /// Capped at K entries (space-saving).
@@ -120,22 +130,27 @@ impl HotKeySketch {
         let Ok(mut map) = self.entries.lock() else {
             return;
         };
+        let add = HOTKEY_SAMPLE_RATE as u64;
         let id = (ns.to_vec(), key.to_vec());
-        if let Some((r, w)) = map.get_mut(&id) {
+        if let Some(e) = map.get_mut(&id) {
             if is_write {
-                *w += HOTKEY_SAMPLE_RATE as u64;
+                e.w_score += add;
+                e.w_total += add;
             } else {
-                *r += HOTKEY_SAMPLE_RATE as u64;
+                e.r_score += add;
+                e.r_total += add;
             }
             return;
         }
+        // Space-saving eviction: displace the minimum-SCORE entry; the
+        // newcomer inherits its score (upper-bounds its true recent count).
+        // Totals start fresh — a re-admitted key's rate resets, which the
+        // agent's counter-reset handling absorbs.
         let inherited = if map.len() >= HOTKEY_K {
-            // Space-saving eviction: displace the minimum-total entry; the
-            // newcomer inherits its count (upper-bounds its true count).
             let min = map
                 .iter()
-                .min_by_key(|(_, (r, w))| r + w)
-                .map(|(k, (r, w))| (k.clone(), r + w));
+                .min_by_key(|(_, e)| e.r_score + e.w_score)
+                .map(|(k, e)| (k.clone(), e.r_score + e.w_score));
             match min {
                 Some((k, c)) => {
                     map.remove(&k);
@@ -146,15 +161,15 @@ impl HotKeySketch {
         } else {
             0
         };
-        let add = HOTKEY_SAMPLE_RATE as u64;
-        map.insert(
-            id,
-            if is_write {
-                (inherited, add)
-            } else {
-                (add, inherited)
-            },
-        );
+        let mut e = HotEntry::default();
+        if is_write {
+            e.w_score = inherited + add;
+            e.w_total = add;
+        } else {
+            e.r_score = inherited + add;
+            e.r_total = add;
+        }
+        map.insert(id, e);
     }
 
     fn maybe_decay(&self) {
@@ -167,17 +182,20 @@ impl HotKeySketch {
         *last = Instant::now();
         drop(last);
         if let Ok(mut map) = self.entries.lock() {
-            map.retain(|_, (r, w)| {
-                *r /= 2;
-                *w /= 2;
-                *r + *w > 0
+            // Halve only the ranking SCORE (recent-window semantics); totals
+            // stay monotonic for the rate. Drop a key once its score reaches
+            // zero — it went cold, so it stops being reported.
+            map.retain(|_, e| {
+                e.r_score /= 2;
+                e.w_score /= 2;
+                e.r_score + e.w_score > 0
             });
         }
     }
 
-    /// Top entries by total, optionally filtered to one namespace (the
-    /// tenant-scoped view). Key names are DATA: an authed tenant must only
-    /// ever see its own namespace.
+    /// Top entries by recent SCORE, optionally filtered to one namespace (the
+    /// tenant-scoped view — key names are DATA). Returns the monotonic TOTALS
+    /// (the agent computes req/s from their deltas), not the score.
     fn top(&self, ns_filter: Option<&[u8]>, n: usize) -> Vec<(Vec<u8>, Vec<u8>, u64, u64)> {
         let Ok(map) = self.entries.lock() else {
             return Vec::new();
@@ -185,11 +203,22 @@ impl HotKeySketch {
         let mut rows: Vec<_> = map
             .iter()
             .filter(|((ns, _), _)| ns_filter.is_none_or(|f| ns.as_slice() == f))
-            .map(|((ns, k), (r, w))| (ns.clone(), k.clone(), *r, *w))
+            .map(|((ns, k), e)| {
+                (
+                    ns.clone(),
+                    k.clone(),
+                    e.r_score + e.w_score,
+                    e.r_total,
+                    e.w_total,
+                )
+            })
             .collect();
-        rows.sort_by_key(|(_, _, r, w)| std::cmp::Reverse(r + w));
+        // Rank by recent score; report totals.
+        rows.sort_by_key(|(_, _, score, _, _)| std::cmp::Reverse(*score));
         rows.truncate(n);
-        rows
+        rows.into_iter()
+            .map(|(ns, k, _, rt, wt)| (ns, k, rt, wt))
+            .collect()
     }
 }
 
