@@ -2572,6 +2572,7 @@ mod serve_tests {
                         &Arc::new(ReplHub::default()),
                         &Arc::new(AtomicBool::new(false)),
                         commands::Limits::default(),
+                        None,
                     );
                 });
             }

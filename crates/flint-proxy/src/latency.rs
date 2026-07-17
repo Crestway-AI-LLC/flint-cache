@@ -141,14 +141,20 @@ mod tests {
         l.observe(b"globex", false, 100);
         let r = l.report(Some(b"acme"));
         assert!(!r.contains("globex"), "scoped view leaked: {r}");
-        let read_line = r.lines().find(|l| l.starts_with("acme read")).unwrap();
+        let read_line = r
+            .lines()
+            .find(|l| l.starts_with("acme read"))
+            .expect("acme read lane");
         let f: Vec<&str> = read_line.split_whitespace().collect();
         // ns kind count sum_us c(250us) c(500us) c(1ms) ... c(+inf)
         assert_eq!(f[2], "3", "count");
         assert_eq!(f[4], "1", "le 250us");
         assert_eq!(f[6], "2", "le 1ms cumulative");
-        assert_eq!(*f.last().unwrap(), "3", "+Inf equals count");
-        let write_line = r.lines().find(|l| l.starts_with("acme write")).unwrap();
+        assert_eq!(*f.last().expect("buckets"), "3", "+Inf equals count");
+        let write_line = r
+            .lines()
+            .find(|l| l.starts_with("acme write"))
+            .expect("acme write lane");
         assert!(write_line.split_whitespace().nth(2) == Some("1"));
         // Operator view carries both tenants.
         let all = l.report(None);

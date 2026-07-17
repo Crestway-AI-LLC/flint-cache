@@ -68,6 +68,17 @@ V=$($A GET k1)
 [ "$V" = "v2" ] || { echo "FAIL: same-proxy write did not invalidate (got $V)"; exit 1; }
 echo "  SET k1 v2 via proxy -> immediate GET sees v2"
 
+echo "== read-your-own-writes holds for EVERY key of a multi-key write (MSET)"
+# Regression for the review-found bug: only MSET's FIRST key was invalidated,
+# so a cached later key kept serving its old value through the same proxy.
+$A MSET ma old-a mb old-b >/dev/null
+$A GET ma >/dev/null; $A GET mb >/dev/null       # cache both
+$A MSET ma new-a mb new-b >/dev/null             # rewrite both via THIS proxy
+VA=$($A GET ma); VB=$($A GET mb)
+[ "$VA" = "new-a" ] || { echo "FAIL: MSET did not invalidate first key (got $VA)"; exit 1; }
+[ "$VB" = "new-b" ] || { echo "FAIL: MSET did not invalidate later key (got $VB)"; exit 1; }
+echo "  MSET ma mb -> immediate GETs see new-a/new-b (all written keys dropped)"
+
 echo "== staleness bound, edge 1: a write BEHIND the proxy is invisible within TTL"
 $A GET k1 >/dev/null  # re-fill cache with v2
 # Write v3 straight to the node (FLINTNS + SET on the data port) — no proxy.

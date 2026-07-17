@@ -294,6 +294,12 @@ struct Topology {
     /// `None` = plaintext backends (default). Set by `--internal-*`; the same
     /// triple the servers use, in the client role.
     backend_tls: Option<Arc<rustls::ClientConfig>>,
+    /// Operator secret for the PROXY* introspection/knob surface. When set,
+    /// the aggregate views (PROXYSTATS, all-tenant PROXYHOTKEYS/PROXYLATENCY,
+    /// PROXYAUTHCOUNT) and the mutating PROXYCACHE require an admin session
+    /// (AUTH <admin-token>); tenants keep their own scoped views. When unset
+    /// (dev/drill mode) the surface stays open, as before.
+    admin_token: Option<String>,
 }
 
 impl Topology {
@@ -775,9 +781,18 @@ fn auth_step(
     authed_ns: &mut Option<Vec<u8>>,
     replica_reads: &mut bool,
     local_cache: &mut bool,
+    is_admin: &mut bool,
     args: &[Vec<u8>],
 ) -> AuthStep {
     let name = args.first().map(|n| n.to_ascii_uppercase());
+    // Admin gate for the operator surface: locked = a token is configured
+    // and this connection has not presented it.
+    let admin_locked = topo.admin_token.is_some() && !*is_admin;
+    let admin_denied = || {
+        AuthStep::Reply(Value::Error(
+            "NOAUTH admin token required for this command".into(),
+        ))
+    };
     // Ops query: per-token AUTH count (drain check during token rotation).
     // Requires knowing the exact token; low-sensitivity, answered pre-auth.
     // (A real deploy gates this behind mTLS/admin.)
@@ -785,6 +800,9 @@ fn auth_step(
     // rationale as PROXYAUTHCOUNT below). `active` is filled by the caller
     // holding the admission counter.
     if name.as_deref() == Some(b"PROXYSTATS") {
+        if admin_locked {
+            return admin_denied();
+        }
         let load = |c: &std::sync::atomic::AtomicU64| c.load(Ordering::Relaxed);
         let (cache_ttl, cache_max, cache_hits, cache_misses, cache_entries, cache_bytes) =
             topo.cache.stats();
@@ -811,6 +829,12 @@ fn auth_step(
     // workload patterns); pre-auth = the all-tenant operator view.
     if name.as_deref() == Some(b"PROXYLATENCY") {
         let scope = authed_ns.as_deref().filter(|_| !topo.open_mode);
+        // The UNSCOPED view aggregates every tenant's latency shapes; with a
+        // token configured it is admin-only. A tenant's own view is always
+        // available to that tenant.
+        if scope.is_none() && admin_locked {
+            return admin_denied();
+        }
         return AuthStep::Reply(Value::Bulk(Some(topo.latency.report(scope).into_bytes())));
     }
     // Ops knob: the proxy near-cache (D6). No args -> report; two args ->
@@ -819,6 +843,9 @@ fn auth_step(
     // a real deploy). Which tenants it applies to is NOT set here — that is
     // the tenant's own CPTENANTCACHE consent.
     if name.as_deref() == Some(b"PROXYCACHE") {
+        if admin_locked {
+            return admin_denied();
+        }
         match args.len() {
             1 => {
                 let (ttl, maxb, hits, misses, entries, bytes) = topo.cache.stats();
@@ -858,9 +885,13 @@ fn auth_step(
     // the operator/internal surface, mTLS-gated in a real deploy like the
     // other PROXY* introspection commands.
     if name.as_deref() == Some(b"PROXYHOTKEYS") {
-        let rows = topo
-            .hotkeys
-            .top(authed_ns.as_deref().filter(|_| !topo.open_mode), 16);
+        let scope = authed_ns.as_deref().filter(|_| !topo.open_mode);
+        // The UNSCOPED view names every tenant's keys (key names are data);
+        // with a token configured it is admin-only.
+        if scope.is_none() && admin_locked {
+            return admin_denied();
+        }
+        let rows = topo.hotkeys.top(scope, 16);
         let mut out = String::new();
         for (ns, key, r, w) in rows {
             out.push_str(&format!(
@@ -872,6 +903,9 @@ fn auth_step(
         return AuthStep::Reply(Value::Bulk(Some(out.into_bytes())));
     }
     if name.as_deref() == Some(b"PROXYAUTHCOUNT") {
+        if admin_locked {
+            return admin_denied();
+        }
         let n = args
             .get(1)
             .map(|t| topo.auth_count(&String::from_utf8_lossy(t)))
@@ -888,6 +922,14 @@ fn auth_step(
                 ));
             }
         };
+        // The admin token opens the operator surface, never a namespace:
+        // an admin session has no tenant and cannot run data commands.
+        if let Some(at) = &topo.admin_token
+            && token.as_slice() == at.as_bytes()
+        {
+            *is_admin = true;
+            return AuthStep::Reply(Value::Simple("OK admin".into()));
+        }
         if topo.open_mode {
             return AuthStep::Reply(Value::Error(
                 "ERR Client sent AUTH, but no tenants are configured".into(),
@@ -940,6 +982,8 @@ fn serve_client<S: Read + Write>(mut stream: S, topo: Arc<Topology>) -> std::io:
     let mut replica_reads = false;
     // Proxy near-cache opt-in for THIS connection's tenant (D6), set at AUTH.
     let mut local_cache = false;
+    // Admin session (AUTH <admin-token>): unlocks the operator surface only.
+    let mut is_admin = false;
     // Hot-key sampling tick (D5): every HOTKEY_SAMPLE_RATE-th keyed command
     // on this connection feeds the sketch, keeping the mutex off the
     // common path.
@@ -995,6 +1039,7 @@ fn serve_client<S: Read + Write>(mut stream: S, topo: Arc<Topology>) -> std::io:
                         &mut authed_ns,
                         &mut replica_reads,
                         &mut local_cache,
+                        &mut is_admin,
                         &args,
                     ) {
                         AuthStep::Reply(v) => v,
@@ -1040,6 +1085,16 @@ fn serve_client<S: Read + Write>(mut stream: S, topo: Arc<Topology>) -> std::io:
                                     match args[0].to_ascii_uppercase().as_slice() {
                                         b"DEL" | b"UNLINK" => {
                                             for k in &args[1..] {
+                                                topo.cache.invalidate(&ns, k);
+                                            }
+                                        }
+                                        // MSET k1 v1 k2 v2 ...: EVERY written
+                                        // key (odd indices) must drop, or a
+                                        // cached later key would keep serving
+                                        // its old value through this proxy —
+                                        // the read-your-own-writes contract.
+                                        b"MSET" => {
+                                            for k in args[1..].iter().step_by(2) {
                                                 topo.cache.invalidate(&ns, k);
                                             }
                                         }
@@ -1375,6 +1430,7 @@ fn main() -> std::io::Result<()> {
         ),
         open_mode,
         backend_tls,
+        admin_token: arg("--admin-token"),
     });
 
     // Control-plane subscription: CPWATCH pushes filtered snapshots (pairs
