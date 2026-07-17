@@ -34,6 +34,10 @@ pub struct Tenant {
     /// tenant's reads across the pair's replicas (bounded-staleness, the
     /// tenant's explicit choice). Writes always go to the master.
     pub replica_reads: bool,
+    /// Proxy near-cache opt-in (ADR-0005 D6): when true, the proxy may
+    /// answer this tenant's GETs from its short-TTL local cache — an
+    /// allowed-staleness contract, the tenant's explicit choice.
+    pub local_cache: bool,
 }
 
 #[derive(Debug, Default)]
@@ -150,6 +154,7 @@ impl State {
                             .next()
                             .and_then(|p| if p == "-" { None } else { Some(p.to_string()) });
                         let replica_reads = parts.next() == Some("1");
+                        let local_cache = parts.next() == Some("1");
                         s.tenants.insert(
                             name.to_string(),
                             Tenant {
@@ -159,6 +164,7 @@ impl State {
                                 subset,
                                 prev_token,
                                 replica_reads,
+                                local_cache,
                             },
                         );
                     }
@@ -188,12 +194,13 @@ impl State {
                 t.subset.join(",")
             };
             out.push_str(&format!(
-                "tenant {} {} {} {subset} {} {}\n",
+                "tenant {} {} {} {subset} {} {} {}\n",
                 t.name,
                 t.token,
                 t.ns,
                 t.prev_token.as_deref().unwrap_or("-"),
                 t.replica_reads as u8,
+                t.local_cache as u8,
                 subset = subset
             ));
         }
@@ -238,7 +245,18 @@ impl State {
             .values()
             .filter(|t| t.subset.iter().any(|s| s == proxy))
             .flat_map(|t| {
-                let suffix = if t.replica_reads { "#r" } else { "" };
+                let mut flags = String::new();
+                if t.replica_reads {
+                    flags.push('r');
+                }
+                if t.local_cache {
+                    flags.push('c');
+                }
+                let suffix = if flags.is_empty() {
+                    String::new()
+                } else {
+                    format!("#{flags}")
+                };
                 let mut v = vec![format!("{}={}{suffix}", t.token, t.ns)];
                 if let Some(p) = &t.prev_token {
                     v.push(format!("{}={}{suffix}", p, t.ns));
@@ -304,6 +322,7 @@ mod tests {
                 subset: vec!["p1:7000".into()],
                 prev_token: None,
                 replica_reads: false,
+                local_cache: false,
             },
         );
         let v = s.commit().expect("commit");
@@ -334,6 +353,7 @@ mod tests {
                     subset: vec![proxy.into()],
                     prev_token: None,
                     replica_reads: false,
+                    local_cache: false,
                 },
             );
         }

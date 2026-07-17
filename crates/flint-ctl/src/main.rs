@@ -1084,6 +1084,20 @@ fn main() {
                 other => panic!("tenant-reads failed: {other:?}"),
             }
         }
+        // Proxy near-cache consent for a tenant (ADR-0005 D6). The cache's
+        // TTL/size knobs are per-proxy runtime settings (PROXYCACHE); this
+        // records the tenant's acceptance of TTL-bounded stale reads.
+        "tenant-cache" => {
+            let (name, mode) = (
+                rest.first().expect("usage: tenant-cache <name> <on|off>"),
+                rest.get(1).expect("usage: tenant-cache <name> <on|off>"),
+            );
+            let tls = tls_client(&inv);
+            match call(&inv.cp[0], &tls, &["CPTENANTCACHE", name, mode]) {
+                Ok(Value::Simple(s)) => println!("{s}"),
+                other => panic!("tenant-cache failed: {other:?}"),
+            }
+        }
         "upgrade" => {
             let tag = rest
                 .iter()
@@ -1100,7 +1114,9 @@ fn main() {
         }
         "stop" => stop(&inv),
         other => {
-            panic!("unknown command {other:?} (bootstrap|status|tenant|expand|swap-node|stop)")
+            panic!(
+                "unknown command {other:?} (bootstrap|status|tenant|tenant-reads|tenant-cache|expand|swap-node|add-replica|upgrade|stop)"
+            )
         }
     }
 }

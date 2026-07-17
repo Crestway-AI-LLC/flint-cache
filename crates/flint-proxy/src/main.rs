@@ -37,6 +37,7 @@
 //! Usage: flint-proxy --port 7379 --pairs "m0,r0;m1,r1;..."
 //!                    [--tenants "tokenA=nsA,tokenB=nsB"]
 
+mod cache;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -101,6 +102,10 @@ struct HotEntry {
 }
 /// (ns, key) -> HotEntry.
 type HotKeyMap = HashMap<(Vec<u8>, Vec<u8>), HotEntry>;
+
+/// A tenant's grant: (namespace, replica_reads opt-in (D7), local_cache
+/// opt-in (D6)).
+type TenantEntry = (Vec<u8>, bool, bool);
 
 struct HotKeySketch {
     /// Capped at K entries (space-saving).
@@ -248,9 +253,11 @@ struct Topology {
     /// tenant A's redirect must not reroute tenant B. Overrides the range
     /// default; lost entries are relearned from the default owner.
     moved: RwLock<HashMap<(Vec<u8>, u16), String>>,
-    /// token -> (namespace, replica_reads opt-in). replica_reads (ADR-0005
-    /// D7) lets this tenant's READS fan across the owning pair's replicas.
-    tenants: RwLock<HashMap<String, (Vec<u8>, bool)>>,
+    /// token -> (namespace, replica_reads opt-in, local_cache opt-in).
+    /// replica_reads (ADR-0005 D7) lets this tenant's READS fan across the
+    /// owning pair's replicas; local_cache (ADR-0005 D6) lets this proxy
+    /// answer the tenant's GETs from its short-TTL local cache.
+    tenants: RwLock<HashMap<String, TenantEntry>>,
     /// Round-robin cursor for replica selection (D7).
     replica_rr: AtomicUsize,
     /// token -> successful-AUTH count. During a dual-version rotation the
@@ -272,6 +279,9 @@ struct Topology {
     stat_active: AtomicUsize,
     /// Hot-key sketch (D5, observability only).
     hotkeys: HotKeySketch,
+    /// Proxy-local read cache (D6): short-TTL, bounded bytes, per-tenant
+    /// opt-in. Runtime-configured via PROXYCACHE.
+    cache: cache::ProxyCache,
     /// True only for a standalone proxy with no tenants configured: no
     /// auth, default namespace. A control-plane-fed proxy is never open —
     /// before its first snapshot it simply has no tenants yet.
@@ -322,7 +332,7 @@ impl Topology {
         }
     }
 
-    fn lookup_token(&self, token: &str) -> Option<(Vec<u8>, bool)> {
+    fn lookup_token(&self, token: &str) -> Option<TenantEntry> {
         self.tenants.read().ok()?.get(token).cloned()
     }
 
@@ -437,16 +447,20 @@ impl Topology {
                 routing.ranges = new_ranges;
             }
         }
-        let new_tenants: HashMap<String, (Vec<u8>, bool)> = tenants_spec
+        let new_tenants: HashMap<String, TenantEntry> = tenants_spec
             .split(',')
             .filter_map(|pair| {
                 let (token, ns_and_flags) = pair.split_once('=')?;
-                // "ns" or "ns#r" (replica-read opt-in, D7).
-                let (ns, replica_reads) = match ns_and_flags.split_once('#') {
-                    Some((ns, flags)) => (ns, flags.contains('r')),
-                    None => (ns_and_flags, false),
+                // "ns" or "ns#<flags>": 'r' = replica reads (D7), 'c' =
+                // proxy near-cache (D6).
+                let (ns, replica_reads, local_cache) = match ns_and_flags.split_once('#') {
+                    Some((ns, flags)) => (ns, flags.contains('r'), flags.contains('c')),
+                    None => (ns_and_flags, false, false),
                 };
-                Some((token.to_string(), (ns.as_bytes().to_vec(), replica_reads)))
+                Some((
+                    token.to_string(),
+                    (ns.as_bytes().to_vec(), replica_reads, local_cache),
+                ))
             })
             .collect();
         if let Ok(mut tenants) = self.tenants.write() {
@@ -756,6 +770,7 @@ fn auth_step(
     topo: &Topology,
     authed_ns: &mut Option<Vec<u8>>,
     replica_reads: &mut bool,
+    local_cache: &mut bool,
     args: &[Vec<u8>],
 ) -> AuthStep {
     let name = args.first().map(|n| n.to_ascii_uppercase());
@@ -767,8 +782,10 @@ fn auth_step(
     // holding the admission counter.
     if name.as_deref() == Some(b"PROXYSTATS") {
         let load = |c: &std::sync::atomic::AtomicU64| c.load(Ordering::Relaxed);
+        let (cache_ttl, cache_max, cache_hits, cache_misses, cache_entries, cache_bytes) =
+            topo.cache.stats();
         let info = format!(
-            "active:{}\r\nconns_total:{}\r\nshed_total:{}\r\nauth_ok_total:{}\r\nauth_fail_total:{}\r\ncommands_total:{}\r\ncommands_read_total:{}\r\ncommands_write_total:{}\r\nhotkey_sample_rate:{}\r\n",
+            "active:{}\r\nconns_total:{}\r\nshed_total:{}\r\nauth_ok_total:{}\r\nauth_fail_total:{}\r\ncommands_total:{}\r\ncommands_read_total:{}\r\ncommands_write_total:{}\r\nhotkey_sample_rate:{}\r\ncache_ttl_ms:{cache_ttl}\r\ncache_max_bytes:{cache_max}\r\ncache_hits_total:{cache_hits}\r\ncache_misses_total:{cache_misses}\r\ncache_entries:{cache_entries}\r\ncache_bytes:{cache_bytes}\r\n",
             topo.stat_active.load(Ordering::Relaxed),
             load(&topo.stat_conns_total),
             load(&topo.stat_shed_total),
@@ -783,6 +800,45 @@ fn auth_step(
             HOTKEY_SAMPLE_RATE,
         );
         return AuthStep::Reply(Value::Bulk(Some(info.into_bytes())));
+    }
+    // Ops knob: the proxy near-cache (D6). No args -> report; two args ->
+    // set (ttl_ms, max_bytes) at RUNTIME; ttl 0 disables and clears. Same
+    // pre-auth operator surface as the other PROXY* commands (mTLS-gated in
+    // a real deploy). Which tenants it applies to is NOT set here — that is
+    // the tenant's own CPTENANTCACHE consent.
+    if name.as_deref() == Some(b"PROXYCACHE") {
+        match args.len() {
+            1 => {
+                let (ttl, maxb, hits, misses, entries, bytes) = topo.cache.stats();
+                return AuthStep::Reply(Value::Bulk(Some(
+                    format!(
+                        "ttl_ms:{ttl}\r\nmax_bytes:{maxb}\r\nhits_total:{hits}\r\nmisses_total:{misses}\r\nentries:{entries}\r\nbytes:{bytes}\r\n"
+                    )
+                    .into_bytes(),
+                )));
+            }
+            3 => {
+                let (Some(ttl), Some(maxb)) = (
+                    std::str::from_utf8(&args[1])
+                        .ok()
+                        .and_then(|v| v.parse().ok()),
+                    std::str::from_utf8(&args[2])
+                        .ok()
+                        .and_then(|v| v.parse().ok()),
+                ) else {
+                    return AuthStep::Reply(Value::Error(
+                        "ERR PROXYCACHE [<ttl_ms> <max_bytes>]".into(),
+                    ));
+                };
+                topo.cache.configure(ttl, maxb);
+                return AuthStep::Reply(Value::Simple("OK".into()));
+            }
+            _ => {
+                return AuthStep::Reply(Value::Error(
+                    "ERR PROXYCACHE [<ttl_ms> <max_bytes>]".into(),
+                ));
+            }
+        }
     }
     // Ops/tenant query: top hot keys (D5, observability only). SCOPING IS
     // THE CONTRACT: an AUTHED connection sees only its own namespace (key
@@ -825,7 +881,7 @@ fn auth_step(
                 "ERR Client sent AUTH, but no tenants are configured".into(),
             ));
         }
-        let Some((ns, rr)) = topo.lookup_token(&String::from_utf8_lossy(token)) else {
+        let Some((ns, rr, lc)) = topo.lookup_token(&String::from_utf8_lossy(token)) else {
             topo.stat_auth_fail_total.fetch_add(1, Ordering::Relaxed);
             return AuthStep::Reply(Value::Error("WRONGPASS invalid token".into()));
         };
@@ -841,6 +897,7 @@ fn auth_step(
         topo.stat_auth_ok_total.fetch_add(1, Ordering::Relaxed);
         *authed_ns = Some(ns);
         *replica_reads = rr;
+        *local_cache = lc;
         return AuthStep::Reply(Value::Simple("OK".into()));
     }
     match authed_ns {
@@ -869,6 +926,8 @@ fn serve_client<S: Read + Write>(mut stream: S, topo: Arc<Topology>) -> std::io:
     let mut backends: Option<Backends> = None;
     // Replica-read opt-in for THIS connection's tenant (D7), set at AUTH.
     let mut replica_reads = false;
+    // Proxy near-cache opt-in for THIS connection's tenant (D6), set at AUTH.
+    let mut local_cache = false;
     // Hot-key sampling tick (D5): every HOTKEY_SAMPLE_RATE-th keyed command
     // on this connection feeds the sketch, keeping the mutex off the
     // common path.
@@ -914,19 +973,69 @@ fn serve_client<S: Read + Write>(mut stream: S, topo: Arc<Topology>) -> std::io:
                             }
                         }
                     }
-                    let reply = match auth_step(&topo, &mut authed_ns, &mut replica_reads, &args) {
+                    let reply = match auth_step(
+                        &topo,
+                        &mut authed_ns,
+                        &mut replica_reads,
+                        &mut local_cache,
+                        &args,
+                    ) {
                         AuthStep::Reply(v) => v,
                         AuthStep::Proceed(ns) => {
-                            // D7: route to a replica only if the tenant opted
-                            // in AND this is a read (writes stay on master).
-                            let read_replica = replica_reads
-                                && args
-                                    .first()
-                                    .is_some_and(|n| flint_commands::is_read_command(n));
-                            let b = backends.get_or_insert_with(|| {
-                                Backends::new(ns.clone(), topo.backend_tls.clone())
-                            });
-                            handle(&topo, b, &ns, &args, &raw, read_replica)
+                            // D6 near-cache: a plain GET for an opted-in
+                            // tenant may answer from the proxy-local cache
+                            // (TTL-bounded staleness, the tenant's choice).
+                            // The hot-key sketch above already observed the
+                            // command, so detection still sees cached reads.
+                            let cacheable = local_cache
+                                && topo.cache.enabled()
+                                && args.len() == 2
+                                && args[0].eq_ignore_ascii_case(b"GET");
+                            if let Some(v) =
+                                cacheable.then(|| topo.cache.get(&ns, &args[1])).flatten()
+                            {
+                                Value::Bulk(Some(v))
+                            } else {
+                                // D7: route to a replica only if the tenant
+                                // opted in AND this is a read (writes stay on
+                                // master).
+                                let read_replica = replica_reads
+                                    && args
+                                        .first()
+                                        .is_some_and(|n| flint_commands::is_read_command(n));
+                                let b = backends.get_or_insert_with(|| {
+                                    Backends::new(ns.clone(), topo.backend_tls.clone())
+                                });
+                                let reply = handle(&topo, b, &ns, &args, &raw, read_replica);
+                                if cacheable && let Value::Bulk(Some(v)) = &reply {
+                                    topo.cache.put(&ns, &args[1], v);
+                                }
+                                // A write through THIS proxy invalidates its
+                                // local entries — read-your-own-writes through
+                                // one proxy. (A write through another proxy is
+                                // seen here only after the TTL: the contract.)
+                                if local_cache
+                                    && topo.cache.enabled()
+                                    && args
+                                        .first()
+                                        .is_some_and(|n| flint_commands::is_write_command(n))
+                                {
+                                    match args[0].to_ascii_uppercase().as_slice() {
+                                        b"DEL" | b"UNLINK" => {
+                                            for k in &args[1..] {
+                                                topo.cache.invalidate(&ns, k);
+                                            }
+                                        }
+                                        b"FLUSHALL" => topo.cache.invalidate_ns(&ns),
+                                        _ => {
+                                            if let Some(k) = args.get(1) {
+                                                topo.cache.invalidate(&ns, k);
+                                            }
+                                        }
+                                    }
+                                }
+                                reply
+                            }
                         }
                     };
                     encode(&reply, &mut out);
@@ -1152,7 +1261,7 @@ fn main() -> std::io::Result<()> {
                 .collect()
         })
         .unwrap_or_default();
-    let tenants: HashMap<String, (Vec<u8>, bool)> = arg("--tenants")
+    let tenants: HashMap<String, TenantEntry> = arg("--tenants")
         .map(|spec| {
             spec.split(',')
                 .filter_map(|pair| {
@@ -1161,8 +1270,9 @@ fn main() -> std::io::Result<()> {
                         !ns.is_empty() && ns.len() <= 64 && !ns.contains('\0'),
                         "invalid namespace in --tenants"
                     );
-                    // Static mode has no CP flag; replica reads default off.
-                    Some((token.to_string(), (ns.as_bytes().to_vec(), false)))
+                    // Static mode has no CP flags; replica reads and the
+                    // near-cache default off.
+                    Some((token.to_string(), (ns.as_bytes().to_vec(), false, false)))
                 })
                 .collect()
         })
@@ -1219,6 +1329,17 @@ fn main() -> std::io::Result<()> {
         stat_active: AtomicUsize::new(0),
         replica_rr: AtomicUsize::new(0),
         hotkeys: HotKeySketch::new(),
+        // D6 near-cache: OFF unless --cache-ttl-ms is given; both knobs stay
+        // runtime-settable via PROXYCACHE. The default budget is deliberately
+        // small — this is a hot-spot absorber, not a data tier.
+        cache: cache::ProxyCache::new(
+            arg("--cache-ttl-ms")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
+            arg("--cache-max-bytes")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(64 * 1024 * 1024),
+        ),
         open_mode,
         backend_tls,
     });

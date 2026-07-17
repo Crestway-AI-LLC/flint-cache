@@ -181,6 +181,7 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
                     subset,
                     prev_token: None,
                     replica_reads: false,
+                    local_cache: false,
                 },
             );
             match st.commit() {
@@ -230,6 +231,33 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
                 return err("no such tenant");
             };
             t.replica_reads = on;
+            match st.commit() {
+                Ok(_) => {}
+                Err(e) => return err(&format!("persist: {e}")),
+            }
+            shared.changed.notify_all();
+            ok()
+        }
+        // Proxy near-cache opt-in for a tenant (ADR-0005 D6): the tenant
+        // accepts TTL-bounded stale reads from the proxy's local cache.
+        // The cache's TTL/size are the PROXY operator's runtime knobs
+        // (PROXYCACHE); this flag is the tenant's consent.
+        b"CPTENANTCACHE" => {
+            let (Some(name), Some(mode)) = (text(1), text(2)) else {
+                return err("CPTENANTCACHE <name> <on|off>");
+            };
+            let on = match mode.as_str() {
+                "on" => true,
+                "off" => false,
+                _ => return err("CPTENANTCACHE <name> <on|off>"),
+            };
+            let Ok(mut st) = shared.state.lock() else {
+                return err("state lock");
+            };
+            let Some(t) = st.tenants.get_mut(&name) else {
+                return err("no such tenant");
+            };
+            t.local_cache = on;
             match st.commit() {
                 Ok(_) => {}
                 Err(e) => return err(&format!("persist: {e}")),

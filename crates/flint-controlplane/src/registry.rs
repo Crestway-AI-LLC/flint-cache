@@ -42,6 +42,12 @@ pub enum Mutation {
         name: String,
         on: bool,
     },
+    /// Set a tenant's proxy near-cache opt-in (ADR-0005 D6). Stale reads
+    /// within the proxy cache TTL are allowed for this tenant.
+    SetLocalCache {
+        name: String,
+        on: bool,
+    },
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -58,6 +64,11 @@ pub struct Tenant {
     /// pair's replicas; writes stay on the master. Tenant's explicit choice.
     #[serde(default)]
     pub replica_reads: bool,
+    /// Proxy near-cache opt-in (ADR-0005 D6): the proxy may answer this
+    /// tenant's GETs from its short-TTL local cache. Tenant's explicit
+    /// choice — the TTL is an allowed-staleness contract.
+    #[serde(default)]
+    pub local_cache: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -141,6 +152,7 @@ impl RegistryState {
                         subset,
                         prev_token: None,
                         replica_reads: false,
+                        local_cache: false,
                     },
                 );
             }
@@ -164,6 +176,11 @@ impl RegistryState {
                     t.replica_reads = on;
                 }
             }
+            Mutation::SetLocalCache { name, on } => {
+                if let Some(t) = self.tenants.get_mut(&name) {
+                    t.local_cache = on;
+                }
+            }
         }
     }
 
@@ -185,7 +202,18 @@ impl RegistryState {
             .values()
             .filter(|t| t.subset.iter().any(|s| s == proxy))
             .flat_map(|t| {
-                let suffix = if t.replica_reads { "#r" } else { "" };
+                let mut flags = String::new();
+                if t.replica_reads {
+                    flags.push('r');
+                }
+                if t.local_cache {
+                    flags.push('c');
+                }
+                let suffix = if flags.is_empty() {
+                    String::new()
+                } else {
+                    format!("#{flags}")
+                };
                 let mut v = vec![format!("{}={}{suffix}", t.token, t.ns)];
                 if let Some(p) = &t.prev_token {
                     v.push(format!("{}={}{suffix}", p, t.ns));
