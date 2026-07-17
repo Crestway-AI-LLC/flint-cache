@@ -426,6 +426,39 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
                 .into_bytes(),
             ))
         }
+        // Tenant SELF-ROTATION (ADR-0006 D3): the CURRENT token is the
+        // credential; the CP MINTS the successor (tenants never choose
+        // secrets), stores only its digest, and returns the plaintext ONCE
+        // — the caller's copy is the only copy. The old token stays valid
+        // (dual-version window) until the rotation loop observes it
+        // drained and drops it. A rotation already in flight is refused:
+        // the window holds exactly two tokens.
+        b"CPMYROTATE" => {
+            let Some(token) = text(1) else {
+                return err("CPMYROTATE <current-token>");
+            };
+            let digest = flint_tls::sha256_hex(token.as_bytes());
+            let Ok(mut st) = shared.state.lock() else {
+                return err("state lock");
+            };
+            let Some(t) = st.tenants.values_mut().find(|t| t.token == digest) else {
+                return Value::Error(
+                    "WRONGPASS invalid token (rotation needs the CURRENT token)".into(),
+                );
+            };
+            if t.prev_token.is_some() {
+                return err("rotation in progress; previous token not yet drained");
+            }
+            let new_plain = flint_tls::mint_token();
+            let new_digest = flint_tls::sha256_hex(new_plain.as_bytes());
+            t.prev_token = Some(std::mem::replace(&mut t.token, new_digest));
+            match st.commit() {
+                Ok(_) => {}
+                Err(e) => return err(&format!("persist: {e}")),
+            }
+            shared.changed.notify_all();
+            Value::Bulk(Some(new_plain.into_bytes()))
+        }
         // Tenant SELF-SERVICE config (portal): the token is the credential;
         // a tenant may toggle exactly the two consent knobs that are ITS
         // choice by contract (ADR-0005: replica reads, near-cache) — never
@@ -477,7 +510,7 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
                     .and_then(|u| u.get(&t.name).copied())
                     .unwrap_or(0);
                 out.push_str(&format!(
-                    "{} {} {} {} {} {} {} {}\r\n",
+                    "{} {} {} {} {} {} {} {} {}\r\n",
                     t.name,
                     t.ns,
                     t.ops_per_sec,
@@ -485,7 +518,8 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
                     t.over_quota as u8,
                     bytes,
                     t.replica_reads as u8,
-                    t.local_cache as u8
+                    t.local_cache as u8,
+                    t.prev_token.as_deref().unwrap_or("-")
                 ));
             }
             Value::Bulk(Some(out.into_bytes()))

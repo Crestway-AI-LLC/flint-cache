@@ -61,6 +61,10 @@ pub enum EventKind {
     /// Tier-1 escalation: the agent needed to act but could not (budget
     /// exhausted, dead-man tripped, verify timeout) — a human is paged.
     PageHuman,
+    /// The rotation loop retired a drained previous token (ADR-0006 D3):
+    /// its auth count stayed flat across the tenant's subset for a full
+    /// drain window. detail carries the drained digest (non-secret).
+    TokenRetired,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

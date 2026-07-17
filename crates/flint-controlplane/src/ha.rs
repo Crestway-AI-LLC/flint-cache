@@ -693,6 +693,40 @@ async fn handle_admin(ha: &Ha, args: &[Vec<u8>]) -> Value {
                 .into_bytes(),
             ))
         }
+        b"CPMYROTATE" => {
+            let Some(token) = text(1) else {
+                return Value::Error("ERR CPMYROTATE <current-token>".into());
+            };
+            let digest = flint_tls::sha256_hex(token.as_bytes());
+            let name = {
+                let reg = ha.store.registry().await;
+                let Some(t) = reg.tenants.values().find(|t| t.token == digest) else {
+                    return Value::Error(
+                        "WRONGPASS invalid token (rotation needs the CURRENT token)".into(),
+                    );
+                };
+                if t.prev_token.is_some() {
+                    return Value::Error(
+                        "ERR rotation in progress; previous token not yet drained".into(),
+                    );
+                }
+                t.name.clone()
+            };
+            // Mint OUTSIDE the Raft log; propose only the digest — the log
+            // and every follower never see the plaintext (the D1 property).
+            let new_plain = flint_tls::mint_token();
+            let new_digest = flint_tls::sha256_hex(new_plain.as_bytes());
+            match ha
+                .propose(Mutation::RotateToken {
+                    name,
+                    new: new_digest,
+                })
+                .await
+            {
+                Ok(_) => Value::Bulk(Some(new_plain.into_bytes())),
+                Err(l) => redirect(l),
+            }
+        }
         b"CPMYCONFIG" => {
             let (Some(token), Some(setting), Some(mode)) = (text(1), text(2), text(3)) else {
                 return Value::Error(
@@ -739,7 +773,7 @@ async fn handle_admin(ha: &Ha, args: &[Vec<u8>]) -> Value {
                     .and_then(|u| u.get(&t.name).copied())
                     .unwrap_or(0);
                 out.push_str(&format!(
-                    "{} {} {} {} {} {} {} {}\r\n",
+                    "{} {} {} {} {} {} {} {} {}\r\n",
                     t.name,
                     t.ns,
                     t.ops_per_sec,
@@ -747,7 +781,8 @@ async fn handle_admin(ha: &Ha, args: &[Vec<u8>]) -> Value {
                     t.over_quota as u8,
                     bytes,
                     t.replica_reads as u8,
-                    t.local_cache as u8
+                    t.local_cache as u8,
+                    t.prev_token.as_deref().unwrap_or("-")
                 ));
             }
             Value::Bulk(Some(out.into_bytes()))

@@ -120,6 +120,17 @@ pub fn server_only_config(cert: &str, key: &str) -> io::Result<Arc<ServerConfig>
         .map_err(|e| io::Error::other(format!("cert/key: {e}")))
 }
 
+/// Mint a fresh credential: 32 bytes from the system CSPRNG, lowercase
+/// hex (64 chars, space-free — RESP- and env-var-friendly). Server-side
+/// minting only (ADR-0006 D3): tenants never choose secrets.
+pub fn mint_token() -> String {
+    use ring::rand::SecureRandom;
+    let rng = ring::rand::SystemRandom::new();
+    let mut bytes = [0u8; 32];
+    rng.fill(&mut bytes).expect("system CSPRNG");
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 /// SHA-256 of `data`, lowercase hex — the token-at-rest digest (ADR-0006
 /// D1). The registry stores and pushes DIGESTS; verifiers hash the
 /// presented token and compare. A stolen digest cannot authenticate (it
