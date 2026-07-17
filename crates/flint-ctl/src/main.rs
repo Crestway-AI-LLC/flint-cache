@@ -1088,6 +1088,22 @@ fn main() {
                 other => panic!("tenant-reads failed: {other:?}"),
             }
         }
+        // Tenant quotas (M5): fleet ops/s + storage bytes; 0 = unlimited.
+        "tenant-quota" => {
+            let (name, ops, bytes) = (
+                rest.first()
+                    .expect("usage: tenant-quota <name> <ops_per_sec> <max_bytes>"),
+                rest.get(1)
+                    .expect("usage: tenant-quota <name> <ops_per_sec> <max_bytes>"),
+                rest.get(2)
+                    .expect("usage: tenant-quota <name> <ops_per_sec> <max_bytes>"),
+            );
+            let tls = tls_client(&inv);
+            match call(&inv.cp[0], &tls, &["CPTENANTQUOTA", name, ops, bytes]) {
+                Ok(Value::Simple(s)) => println!("{s}"),
+                other => panic!("tenant-quota failed: {other:?}"),
+            }
+        }
         // Push the near-cache knobs (PROXYCACHE <ttl_ms> <max_bytes>) to
         // EVERY proxy in the inventory — the per-proxy runtime setting,
         // fleet-applied. Presents the inventory admin token when the fleet
@@ -1144,7 +1160,7 @@ fn main() {
         "stop" => stop(&inv),
         other => {
             panic!(
-                "unknown command {other:?} (bootstrap|status|tenant|tenant-reads|tenant-cache|proxy-cache|expand|swap-node|add-replica|upgrade|stop)"
+                "unknown command {other:?} (bootstrap|status|tenant|tenant-reads|tenant-cache|tenant-quota|proxy-cache|expand|swap-node|add-replica|upgrade|stop)"
             )
         }
     }

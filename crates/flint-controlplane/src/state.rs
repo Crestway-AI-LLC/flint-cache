@@ -137,6 +137,9 @@ impl State {
                             .and_then(|p| if p == "-" { None } else { Some(p.to_string()) });
                         let replica_reads = parts.next() == Some("1");
                         let local_cache = parts.next() == Some("1");
+                        let ops_per_sec = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+                        let max_bytes = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+                        let over_quota = parts.next() == Some("1");
                         s.tenants.insert(
                             name.to_string(),
                             Tenant {
@@ -147,6 +150,9 @@ impl State {
                                 prev_token,
                                 replica_reads,
                                 local_cache,
+                                ops_per_sec,
+                                max_bytes,
+                                over_quota,
                             },
                         );
                     }
@@ -176,13 +182,16 @@ impl State {
                 t.subset.join(",")
             };
             out.push_str(&format!(
-                "tenant {} {} {} {subset} {} {} {}\n",
+                "tenant {} {} {} {subset} {} {} {} {} {} {}\n",
                 t.name,
                 t.token,
                 t.ns,
                 t.prev_token.as_deref().unwrap_or("-"),
                 t.replica_reads as u8,
                 t.local_cache as u8,
+                t.ops_per_sec,
+                t.max_bytes,
+                t.over_quota as u8,
                 subset = subset
             ));
         }
@@ -275,6 +284,9 @@ mod tests {
                 prev_token: None,
                 replica_reads: false,
                 local_cache: false,
+                ops_per_sec: 0,
+                max_bytes: 0,
+                over_quota: false,
             },
         );
         let v = s.commit().expect("commit");
@@ -306,6 +318,9 @@ mod tests {
                     prev_token: None,
                     replica_reads: false,
                     local_cache: false,
+                    ops_per_sec: 0,
+                    max_bytes: 0,
+                    over_quota: false,
                 },
             );
         }

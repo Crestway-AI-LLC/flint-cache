@@ -104,9 +104,23 @@ struct HotEntry {
 /// (ns, key) -> HotEntry.
 type HotKeyMap = HashMap<(Vec<u8>, Vec<u8>), HotEntry>;
 
-/// A tenant's grant: (namespace, replica_reads opt-in (D7), local_cache
-/// opt-in (D6)).
-type TenantEntry = (Vec<u8>, bool, bool);
+/// A tenant's grant, decoded from the snapshot's "token=ns#flags[@rate]"
+/// entry: opt-ins (D7 replica reads, D6 near-cache), the M5 quota state
+/// ('q' = over storage quota; rate = this proxy's ops/s share), and the
+/// namespace everything is scoped to.
+#[derive(Clone, Default)]
+struct TenantGrant {
+    ns: Vec<u8>,
+    replica_reads: bool,
+    local_cache: bool,
+    /// Over storage quota: writes shed with -QUOTA, reads served.
+    over_quota: bool,
+    /// Per-proxy ops/s share (token bucket); 0 = unlimited.
+    rate: u64,
+}
+
+/// Per-namespace token bucket state (tokens, last refill).
+type BucketMap = HashMap<Vec<u8>, (f64, Instant)>;
 
 struct HotKeySketch {
     /// Capped at K entries (space-saving).
@@ -258,7 +272,7 @@ struct Topology {
     /// replica_reads (ADR-0005 D7) lets this tenant's READS fan across the
     /// owning pair's replicas; local_cache (ADR-0005 D6) lets this proxy
     /// answer the tenant's GETs from its short-TTL local cache.
-    tenants: RwLock<HashMap<String, TenantEntry>>,
+    tenants: RwLock<HashMap<String, TenantGrant>>,
     /// Round-robin cursor for replica selection (D7).
     replica_rr: AtomicUsize,
     /// token -> successful-AUTH count. During a dual-version rotation the
@@ -283,6 +297,14 @@ struct Topology {
     /// Per-tenant latency histograms (M4 client-metrics substitute):
     /// tenant-perceived latency measured one hop from the client.
     latency: latency::LatencyHistograms,
+    /// M5 quota state by NAMESPACE (rate share + over-quota verdict),
+    /// rebuilt on every snapshot so a mid-connection verdict flip applies
+    /// without re-auth. Buckets carry the running token count.
+    quota: RwLock<HashMap<Vec<u8>, (u64, bool)>>,
+    buckets: std::sync::Mutex<BucketMap>,
+    /// Quota shed counters (PROXYSTATS -> exporter/billing).
+    stat_quota_throttled_total: std::sync::atomic::AtomicU64,
+    stat_quota_write_shed_total: std::sync::atomic::AtomicU64,
     /// Proxy-local read cache (D6): short-TTL, bounded bytes, per-tenant
     /// opt-in. Runtime-configured via PROXYCACHE.
     cache: cache::ProxyCache,
@@ -342,7 +364,7 @@ impl Topology {
         }
     }
 
-    fn lookup_token(&self, token: &str) -> Option<TenantEntry> {
+    fn lookup_token(&self, token: &str) -> Option<TenantGrant> {
         self.tenants.read().ok()?.get(token).cloned()
     }
 
@@ -457,29 +479,93 @@ impl Topology {
                 routing.ranges = new_ranges;
             }
         }
-        let new_tenants: HashMap<String, TenantEntry> = tenants_spec
+        let new_tenants: HashMap<String, TenantGrant> = tenants_spec
             .split(',')
             .filter_map(|pair| {
                 let (token, ns_and_flags) = pair.split_once('=')?;
-                // "ns" or "ns#<flags>": 'r' = replica reads (D7), 'c' =
-                // proxy near-cache (D6).
-                let (ns, replica_reads, local_cache) = match ns_and_flags.split_once('#') {
-                    Some((ns, flags)) => (ns, flags.contains('r'), flags.contains('c')),
-                    None => (ns_and_flags, false, false),
+                // "ns" or "ns#<flags>[@<rate>]": 'r' = replica reads (D7),
+                // 'c' = near-cache (D6), 'q' = over storage quota (M5);
+                // rate = this proxy's ops/s share. Producer: CP tenant.rs.
+                let (ns, flags, rate) = match ns_and_flags.split_once('#') {
+                    Some((ns, rest)) => match rest.split_once('@') {
+                        Some((flags, rate)) => (ns, flags, rate.parse().unwrap_or(0)),
+                        None => (ns, rest, 0),
+                    },
+                    None => (ns_and_flags, "", 0),
                 };
                 Some((
                     token.to_string(),
-                    (ns.as_bytes().to_vec(), replica_reads, local_cache),
+                    TenantGrant {
+                        ns: ns.as_bytes().to_vec(),
+                        replica_reads: flags.contains('r'),
+                        local_cache: flags.contains('c'),
+                        over_quota: flags.contains('q'),
+                        rate,
+                    },
                 ))
             })
             .collect();
         let keep: std::collections::HashSet<Vec<u8>> =
-            new_tenants.values().map(|(ns, _, _)| ns.clone()).collect();
+            new_tenants.values().map(|g| g.ns.clone()).collect();
+        // Namespace-keyed quota view: enforcement consults THIS on every
+        // command, so a pushed verdict/rate change applies immediately to
+        // live connections (no re-auth).
+        if let Ok(mut quota) = self.quota.write() {
+            *quota = new_tenants
+                .values()
+                .map(|g| (g.ns.clone(), (g.rate, g.over_quota)))
+                .collect();
+        }
         if let Ok(mut tenants) = self.tenants.write() {
             *tenants = new_tenants;
         }
-        // A removed tenant's latency lanes must not export forever.
+        // A removed tenant's latency lanes and bucket must not live forever.
         self.latency.retain(&keep);
+        if let Ok(mut buckets) = self.buckets.lock() {
+            buckets.retain(|ns, _| keep.contains(ns));
+        }
+    }
+
+    /// M5 quota gate for one data command. Order: the storage verdict (a
+    /// write against a full tenant is shed with -QUOTA no matter the rate),
+    /// then the ops/s token bucket (burst = one second of rate). Returns
+    /// the error reply to send, or None to proceed. Tenants with no quota
+    /// row (or the static/open modes) pay one read-lock lookup and pass.
+    fn quota_gate(&self, ns: &[u8], name: &[u8], is_write: bool) -> Option<Value> {
+        let (rate, over) = *self.quota.read().ok()?.get(ns)?;
+        // Space-REDUCING writes stay allowed over-quota — the self-clear
+        // path is the tenant deleting data, which must never be blocked by
+        // the very state it cures.
+        let reduces_space = matches!(
+            name.to_ascii_uppercase().as_slice(),
+            b"DEL" | b"UNLINK" | b"FLUSHALL" | b"EXPIRE" | b"PEXPIRE"
+        );
+        if over && is_write && !reduces_space {
+            self.stat_quota_write_shed_total
+                .fetch_add(1, Ordering::Relaxed);
+            return Some(Value::Error(
+                "QUOTA storage quota exceeded; writes rejected until usage drops (reads still served)"
+                    .into(),
+            ));
+        }
+        if rate == 0 {
+            return None;
+        }
+        let mut buckets = self.buckets.lock().ok()?;
+        let now = Instant::now();
+        let (tokens, last) = buckets.entry(ns.to_vec()).or_insert((rate as f64, now));
+        *tokens = (*tokens + last.elapsed().as_secs_f64() * rate as f64).min(rate as f64);
+        *last = now;
+        if *tokens >= 1.0 {
+            *tokens -= 1.0;
+            None
+        } else {
+            self.stat_quota_throttled_total
+                .fetch_add(1, Ordering::Relaxed);
+            Some(Value::Error(
+                "THROTTLED ops/s quota exceeded, retry with backoff".into(),
+            ))
+        }
     }
 }
 
@@ -810,8 +896,10 @@ fn auth_step(
         let load = |c: &std::sync::atomic::AtomicU64| c.load(Ordering::Relaxed);
         let (cache_ttl, cache_max, cache_hits, cache_misses, cache_entries, cache_bytes) =
             topo.cache.stats();
+        let quota_throttled = topo.stat_quota_throttled_total.load(Ordering::Relaxed);
+        let quota_write_shed = topo.stat_quota_write_shed_total.load(Ordering::Relaxed);
         let info = format!(
-            "active:{}\r\nconns_total:{}\r\nshed_total:{}\r\nauth_ok_total:{}\r\nauth_fail_total:{}\r\ncommands_total:{}\r\ncommands_read_total:{}\r\ncommands_write_total:{}\r\nhotkey_sample_rate:{}\r\ncache_ttl_ms:{cache_ttl}\r\ncache_max_bytes:{cache_max}\r\ncache_hits_total:{cache_hits}\r\ncache_misses_total:{cache_misses}\r\ncache_entries:{cache_entries}\r\ncache_bytes:{cache_bytes}\r\n",
+            "active:{}\r\nconns_total:{}\r\nshed_total:{}\r\nauth_ok_total:{}\r\nauth_fail_total:{}\r\ncommands_total:{}\r\ncommands_read_total:{}\r\ncommands_write_total:{}\r\nhotkey_sample_rate:{}\r\ncache_ttl_ms:{cache_ttl}\r\ncache_max_bytes:{cache_max}\r\ncache_hits_total:{cache_hits}\r\ncache_misses_total:{cache_misses}\r\ncache_entries:{cache_entries}\r\ncache_bytes:{cache_bytes}\r\nquota_throttled_total:{quota_throttled}\r\nquota_write_shed_total:{quota_write_shed}\r\n",
             topo.stat_active.load(Ordering::Relaxed),
             load(&topo.stat_conns_total),
             load(&topo.stat_shed_total),
@@ -939,12 +1027,12 @@ fn auth_step(
                 "ERR Client sent AUTH, but no tenants are configured".into(),
             ));
         }
-        let Some((ns, rr, lc)) = topo.lookup_token(&String::from_utf8_lossy(token)) else {
+        let Some(grant) = topo.lookup_token(&String::from_utf8_lossy(token)) else {
             topo.stat_auth_fail_total.fetch_add(1, Ordering::Relaxed);
             return AuthStep::Reply(Value::Error("WRONGPASS invalid token".into()));
         };
         match authed_ns {
-            Some(cur) if *cur != ns => {
+            Some(cur) if *cur != grant.ns => {
                 return AuthStep::Reply(Value::Error(
                     "ERR already authenticated as another tenant; reconnect to switch".into(),
                 ));
@@ -953,9 +1041,9 @@ fn auth_step(
         }
         topo.bump_auth(&String::from_utf8_lossy(token));
         topo.stat_auth_ok_total.fetch_add(1, Ordering::Relaxed);
-        *authed_ns = Some(ns);
-        *replica_reads = rr;
-        *local_cache = lc;
+        *authed_ns = Some(grant.ns);
+        *replica_reads = grant.replica_reads;
+        *local_cache = grant.local_cache;
         return AuthStep::Reply(Value::Simple("OK".into()));
     }
     match authed_ns {
@@ -1110,6 +1198,22 @@ fn data_command(
     replica_reads: bool,
     local_cache: bool,
 ) -> Value {
+    // M5 quota gate FIRST: a shed command must not touch the cache, a
+    // backend, or the bucket-bypassing fast paths. Only data commands are
+    // charged (PING/ECHO/QUIT are free; they cost this proxy nothing).
+    let is_write = args
+        .first()
+        .is_some_and(|n| flint_commands::is_write_command(n));
+    let is_data = is_write
+        || args
+            .first()
+            .is_some_and(|n| flint_commands::is_read_command(n));
+    if is_data
+        && let Some(name) = args.first()
+        && let Some(shed) = topo.quota_gate(ns, name, is_write)
+    {
+        return shed;
+    }
     // D6 near-cache: a plain GET for an opted-in tenant may answer from the
     // proxy-local cache (TTL-bounded staleness, the tenant's choice). The
     // hot-key sketch already observed the command in the connection loop,
@@ -1365,7 +1469,7 @@ fn main() -> std::io::Result<()> {
                 .collect()
         })
         .unwrap_or_default();
-    let tenants: HashMap<String, TenantEntry> = arg("--tenants")
+    let tenants: HashMap<String, TenantGrant> = arg("--tenants")
         .map(|spec| {
             spec.split(',')
                 .filter_map(|pair| {
@@ -1374,9 +1478,15 @@ fn main() -> std::io::Result<()> {
                         !ns.is_empty() && ns.len() <= 64 && !ns.contains('\0'),
                         "invalid namespace in --tenants"
                     );
-                    // Static mode has no CP flags; replica reads and the
-                    // near-cache default off.
-                    Some((token.to_string(), (ns.as_bytes().to_vec(), false, false)))
+                    // Static mode has no CP flags; opt-ins and quotas
+                    // default off/unlimited.
+                    Some((
+                        token.to_string(),
+                        TenantGrant {
+                            ns: ns.as_bytes().to_vec(),
+                            ..TenantGrant::default()
+                        },
+                    ))
                 })
                 .collect()
         })
@@ -1421,6 +1531,15 @@ fn main() -> std::io::Result<()> {
             ranges: Vec::new(),
         }),
         moved: RwLock::new(HashMap::new()),
+        quota: RwLock::new(
+            tenants
+                .values()
+                .map(|g| (g.ns.clone(), (g.rate, g.over_quota)))
+                .collect(),
+        ),
+        buckets: std::sync::Mutex::new(HashMap::new()),
+        stat_quota_throttled_total: std::sync::atomic::AtomicU64::new(0),
+        stat_quota_write_shed_total: std::sync::atomic::AtomicU64::new(0),
         tenants: RwLock::new(tenants),
         auth_counts: RwLock::new(HashMap::new()),
         stat_conns_total: std::sync::atomic::AtomicU64::new(0),

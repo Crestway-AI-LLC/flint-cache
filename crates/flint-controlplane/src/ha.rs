@@ -594,6 +594,40 @@ async fn handle_admin(ha: &Ha, args: &[Vec<u8>]) -> Value {
                 Err(l) => redirect(l),
             }
         }
+        b"CPTENANTQUOTA" => {
+            let (Some(name), Some(ops), Some(bytes)) = (
+                text(1),
+                text(2).and_then(|v| v.parse::<u64>().ok()),
+                text(3).and_then(|v| v.parse::<u64>().ok()),
+            ) else {
+                return Value::Error("ERR CPTENANTQUOTA <name> <ops_per_sec> <max_bytes>".into());
+            };
+            match ha
+                .propose(Mutation::SetQuota {
+                    name,
+                    ops_per_sec: ops,
+                    max_bytes: bytes,
+                })
+                .await
+            {
+                Ok(_) => Value::Simple("OK".into()),
+                Err(l) => redirect(l),
+            }
+        }
+        b"CPTENANTOVERQUOTA" => {
+            let (Some(name), Some(mode)) = (text(1), text(2)) else {
+                return Value::Error("ERR CPTENANTOVERQUOTA <name> <on|off>".into());
+            };
+            let on = match mode.as_str() {
+                "on" => true,
+                "off" => false,
+                _ => return Value::Error("ERR CPTENANTOVERQUOTA <name> <on|off>".into()),
+            };
+            match ha.propose(Mutation::SetOverQuota { name, on }).await {
+                Ok(_) => Value::Simple("OK".into()),
+                Err(l) => redirect(l),
+            }
+        }
         b"CPSETPAIR" => {
             let (Some(idx), Some(nodes)) = (
                 text(1).and_then(|v| v.parse::<usize>().ok()),

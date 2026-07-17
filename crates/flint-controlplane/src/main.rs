@@ -183,6 +183,9 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
                     prev_token: None,
                     replica_reads: false,
                     local_cache: false,
+                    ops_per_sec: 0,
+                    max_bytes: 0,
+                    over_quota: false,
                 },
             );
             match st.commit() {
@@ -259,6 +262,57 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
                 return err("no such tenant");
             };
             t.local_cache = on;
+            match st.commit() {
+                Ok(_) => {}
+                Err(e) => return err(&format!("persist: {e}")),
+            }
+            shared.changed.notify_all();
+            ok()
+        }
+        // Tenant quotas (M5): fleet ops/s + storage bytes; 0 = unlimited.
+        // The rate reaches proxies pre-divided by subset size (tenant.rs);
+        // the bytes cap is the metering loop's input, not the proxy's.
+        b"CPTENANTQUOTA" => {
+            let (Some(name), Some(ops), Some(bytes)) = (
+                text(1),
+                text(2).and_then(|v| v.parse::<u64>().ok()),
+                text(3).and_then(|v| v.parse::<u64>().ok()),
+            ) else {
+                return err("CPTENANTQUOTA <name> <ops_per_sec> <max_bytes>");
+            };
+            let Ok(mut st) = shared.state.lock() else {
+                return err("state lock");
+            };
+            let Some(t) = st.tenants.get_mut(&name) else {
+                return err("no such tenant");
+            };
+            t.ops_per_sec = ops;
+            t.max_bytes = bytes;
+            match st.commit() {
+                Ok(_) => {}
+                Err(e) => return err(&format!("persist: {e}")),
+            }
+            shared.changed.notify_all();
+            ok()
+        }
+        // The metering loop's storage verdict (M5): flips the 'q' flag the
+        // proxies shed writes on. Operator-invocable too (support cases).
+        b"CPTENANTOVERQUOTA" => {
+            let (Some(name), Some(mode)) = (text(1), text(2)) else {
+                return err("CPTENANTOVERQUOTA <name> <on|off>");
+            };
+            let on = match mode.as_str() {
+                "on" => true,
+                "off" => false,
+                _ => return err("CPTENANTOVERQUOTA <name> <on|off>"),
+            };
+            let Ok(mut st) = shared.state.lock() else {
+                return err("state lock");
+            };
+            let Some(t) = st.tenants.get_mut(&name) else {
+                return err("no such tenant");
+            };
+            t.over_quota = on;
             match st.commit() {
                 Ok(_) => {}
                 Err(e) => return err(&format!("persist: {e}")),

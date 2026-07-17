@@ -48,6 +48,20 @@ pub enum Mutation {
         name: String,
         on: bool,
     },
+    /// Set a tenant's quotas (M5): fleet ops/s and storage bytes; 0 =
+    /// unlimited. Lowering max_bytes does NOT flip over_quota by itself —
+    /// the metering loop owns that verdict.
+    SetQuota {
+        name: String,
+        ops_per_sec: u64,
+        max_bytes: u64,
+    },
+    /// The metering loop's storage verdict (M5): pushed to proxies as the
+    /// 'q' flag; writes shed with -QUOTA while set.
+    SetOverQuota {
+        name: String,
+        on: bool,
+    },
 }
 
 pub use crate::tenant::Tenant;
@@ -134,6 +148,9 @@ impl RegistryState {
                         prev_token: None,
                         replica_reads: false,
                         local_cache: false,
+                        ops_per_sec: 0,
+                        max_bytes: 0,
+                        over_quota: false,
                     },
                 );
             }
@@ -160,6 +177,21 @@ impl RegistryState {
             Mutation::SetLocalCache { name, on } => {
                 if let Some(t) = self.tenants.get_mut(&name) {
                     t.local_cache = on;
+                }
+            }
+            Mutation::SetQuota {
+                name,
+                ops_per_sec,
+                max_bytes,
+            } => {
+                if let Some(t) = self.tenants.get_mut(&name) {
+                    t.ops_per_sec = ops_per_sec;
+                    t.max_bytes = max_bytes;
+                }
+            }
+            Mutation::SetOverQuota { name, on } => {
+                if let Some(t) = self.tenants.get_mut(&name) {
+                    t.over_quota = on;
                 }
             }
         }
