@@ -865,6 +865,41 @@ fn execute(
     // repointed. The manifest CF travels inside the checkpoint, so a restore
     // knows the lineage (role epoch) it came from. <root> is any mounted
     // path; S3 is a mount/sync integration on top of the same layout.
+    // FLINTNSBYTES <ns>: approximate resident bytes for one namespace (the
+    // engine's SST range estimator — O(file metadata), no keyspace walk).
+    // The storage-metering input (M5): the agent sweeps this per tenant.
+    if args
+        .first()
+        .is_some_and(|n| n.eq_ignore_ascii_case(b"FLINTNSBYTES"))
+    {
+        let Some(ns) = args.get(1) else {
+            return Value::Error("ERR FLINTNSBYTES <namespace>".into());
+        };
+        #[cfg(feature = "rocks")]
+        if let Some(kv) = rocks {
+            return Value::Integer(kv.ns_bytes(ns) as i64);
+        }
+        let _ = ns;
+        return Value::Error("ERR FLINTNSBYTES requires the rocks engine".into());
+    }
+    // FLINTCOMPACT <ns>: compact the namespace's ranges so deletions become
+    // visible to FLINTNSBYTES now instead of at the next background
+    // compaction — the metering loop's self-clear path in compressed time.
+    if args
+        .first()
+        .is_some_and(|n| n.eq_ignore_ascii_case(b"FLINTCOMPACT"))
+    {
+        let Some(ns) = args.get(1) else {
+            return Value::Error("ERR FLINTCOMPACT <namespace>".into());
+        };
+        #[cfg(feature = "rocks")]
+        if let Some(kv) = rocks {
+            kv.compact_ns(ns);
+            return Value::Simple("OK".into());
+        }
+        let _ = ns;
+        return Value::Error("ERR FLINTCOMPACT requires the rocks engine".into());
+    }
     if args
         .first()
         .is_some_and(|n| n.eq_ignore_ascii_case(b"FLINTSNAPSHOT"))

@@ -367,6 +367,22 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
             ok()
         }
         // The registered proxy fleet, comma-joined — the exporter's poll list.
+        // Tenant metering view (M5): one "name ns ops_per_sec max_bytes
+        // over_quota" line per tenant — the agent's sweep input. Tokens are
+        // deliberately NOT included (this surface feeds metering, not auth).
+        b"CPTENANTS" => {
+            let Ok(st) = shared.state.lock() else {
+                return err("state lock");
+            };
+            let mut out = String::new();
+            for t in st.tenants.values() {
+                out.push_str(&format!(
+                    "{} {} {} {} {}\r\n",
+                    t.name, t.ns, t.ops_per_sec, t.max_bytes, t.over_quota as u8
+                ));
+            }
+            Value::Bulk(Some(out.into_bytes()))
+        }
         b"CPPROXIES" => {
             let Ok(st) = shared.state.lock() else {
                 return err("state lock");

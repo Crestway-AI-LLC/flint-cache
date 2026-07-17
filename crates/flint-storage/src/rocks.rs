@@ -54,6 +54,54 @@ impl RocksKv {
         self.db.write(wb)
     }
 
+    /// Approximate resident bytes for one namespace — the storage-metering
+    /// signal (M5 quotas). Uses the engine's SST range estimator over the
+    /// namespace's three envelope prefixes (Metadata/Subkey/ZScore), so it
+    /// is O(file metadata), never a keyspace walk. APPROXIMATE by contract:
+    /// it tracks compacted SST bytes (memtable-only recent writes undercount
+    /// briefly), which is exactly the honesty level billing/quota sweeps
+    /// need — the drill bounds it, the docs say "resident", not "logical".
+    pub fn ns_bytes(&self, ns: &[u8]) -> u64 {
+        // One (start, end) pair per envelope CF byte. The end bound appends
+        // 0xff past the ns prefix: envelope keys continue with a 2-byte BE
+        // slot then the user key, all < the 0xff sentinel run, so the range
+        // covers exactly this namespace's rows (ns_len byte keeps a longer
+        // namespace sharing the prefix out of range).
+        let bounds: Vec<(Vec<u8>, Vec<u8>)> = [b'M', b'S', b'Z']
+            .iter()
+            .map(|&cf| {
+                let mut start = Vec::with_capacity(2 + ns.len());
+                start.push(cf);
+                start.push(ns.len() as u8);
+                start.extend_from_slice(ns);
+                let mut end = start.clone();
+                end.extend_from_slice(&[0xff, 0xff, 0xff]);
+                (start, end)
+            })
+            .collect();
+        let ranges: Vec<rocksdb::Range> = bounds
+            .iter()
+            .map(|(s, e)| rocksdb::Range::new(s, e))
+            .collect();
+        self.db.get_approximate_sizes(&ranges).iter().sum()
+    }
+
+    /// Compact one namespace's ranges so tombstones (deleted rows) actually
+    /// leave the SSTs — the moment `ns_bytes` sees a delete-driven drop.
+    /// Background compaction gets there eventually; this is the on-demand
+    /// path (FLINTCOMPACT) for GC pressure and the metering drills.
+    pub fn compact_ns(&self, ns: &[u8]) {
+        for cf in [b'M', b'S', b'Z'] {
+            let mut start = Vec::with_capacity(2 + ns.len());
+            start.push(cf);
+            start.push(ns.len() as u8);
+            start.extend_from_slice(ns);
+            let mut end = start.clone();
+            end.extend_from_slice(&[0xff, 0xff, 0xff]);
+            self.db.compact_range(Some(&start), Some(&end));
+        }
+    }
+
     /// Crate-internal handle for the replication module.
     pub(crate) fn db(&self) -> &DB {
         &self.db

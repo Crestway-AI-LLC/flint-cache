@@ -641,6 +641,17 @@ async fn handle_admin(ha: &Ha, args: &[Vec<u8>]) -> Value {
                 Err(redir) => redirect(redir),
             }
         }
+        b"CPTENANTS" => {
+            let reg = ha.store.registry().await;
+            let mut out = String::new();
+            for t in reg.tenants.values() {
+                out.push_str(&format!(
+                    "{} {} {} {} {}\r\n",
+                    t.name, t.ns, t.ops_per_sec, t.max_bytes, t.over_quota as u8
+                ));
+            }
+            Value::Bulk(Some(out.into_bytes()))
+        }
         b"CPPROXIES" => {
             let reg = ha.store.registry().await;
             Value::Bulk(Some(reg.proxies.join(",").into_bytes()))

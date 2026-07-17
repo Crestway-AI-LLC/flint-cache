@@ -49,6 +49,9 @@ pub enum EventKind {
     /// is ARMED for that pair. Tooling that (re)starts controllers waits
     /// for this before declaring an operation complete.
     Supervised,
+    /// The metering loop flipped a tenant's storage-quota verdict (M5).
+    /// detail carries "on <used>/<cap>" or "off <used>/<cap>".
+    QuotaVerdict,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
