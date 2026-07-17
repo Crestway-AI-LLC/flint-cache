@@ -408,11 +408,53 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
                 .unwrap_or(0);
             Value::Bulk(Some(
                 format!(
-                    "{} {} {} {} {} {}\r\n",
-                    t.name, t.ns, t.ops_per_sec, t.max_bytes, t.over_quota as u8, bytes
+                    "{} {} {} {} {} {} {} {}\r\n",
+                    t.name,
+                    t.ns,
+                    t.ops_per_sec,
+                    t.max_bytes,
+                    t.over_quota as u8,
+                    bytes,
+                    t.replica_reads as u8,
+                    t.local_cache as u8
                 )
                 .into_bytes(),
             ))
+        }
+        // Tenant SELF-SERVICE config (portal): the token is the credential;
+        // a tenant may toggle exactly the two consent knobs that are ITS
+        // choice by contract (ADR-0005: replica reads, near-cache) — never
+        // quotas, never another tenant. Pushed to proxies like any change.
+        b"CPMYCONFIG" => {
+            let (Some(token), Some(setting), Some(mode)) = (text(1), text(2), text(3)) else {
+                return err("CPMYCONFIG <token> <replica-reads|near-cache> <on|off>");
+            };
+            let on = match mode.as_str() {
+                "on" => true,
+                "off" => false,
+                _ => return err("CPMYCONFIG <token> <replica-reads|near-cache> <on|off>"),
+            };
+            let Ok(mut st) = shared.state.lock() else {
+                return err("state lock");
+            };
+            let Some(t) = st
+                .tenants
+                .values_mut()
+                .find(|t| t.token == token || t.prev_token.as_deref() == Some(token.as_str()))
+            else {
+                return Value::Error("WRONGPASS invalid token".into());
+            };
+            match setting.as_str() {
+                "replica-reads" => t.replica_reads = on,
+                "near-cache" => t.local_cache = on,
+                _ => return err("unknown setting (replica-reads|near-cache)"),
+            }
+            match st.commit() {
+                Ok(_) => {}
+                Err(e) => return err(&format!("persist: {e}")),
+            }
+            shared.changed.notify_all();
+            ok()
         }
         // Tenant metering view (M5): one "name ns ops_per_sec max_bytes
         // over_quota" line per tenant — the agent's sweep input. Tokens are
@@ -421,11 +463,23 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
             let Ok(st) = shared.state.lock() else {
                 return err("state lock");
             };
+            let usage = shared.usage.lock().ok();
             let mut out = String::new();
             for t in st.tenants.values() {
+                let bytes = usage
+                    .as_ref()
+                    .and_then(|u| u.get(&t.name).copied())
+                    .unwrap_or(0);
                 out.push_str(&format!(
-                    "{} {} {} {} {}\r\n",
-                    t.name, t.ns, t.ops_per_sec, t.max_bytes, t.over_quota as u8
+                    "{} {} {} {} {} {} {} {}\r\n",
+                    t.name,
+                    t.ns,
+                    t.ops_per_sec,
+                    t.max_bytes,
+                    t.over_quota as u8,
+                    bytes,
+                    t.replica_reads as u8,
+                    t.local_cache as u8
                 ));
             }
             Value::Bulk(Some(out.into_bytes()))

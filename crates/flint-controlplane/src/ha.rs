@@ -675,19 +675,73 @@ async fn handle_admin(ha: &Ha, args: &[Vec<u8>]) -> Value {
                 .unwrap_or(0);
             Value::Bulk(Some(
                 format!(
-                    "{} {} {} {} {} {}\r\n",
-                    t.name, t.ns, t.ops_per_sec, t.max_bytes, t.over_quota as u8, bytes
+                    "{} {} {} {} {} {} {} {}\r\n",
+                    t.name,
+                    t.ns,
+                    t.ops_per_sec,
+                    t.max_bytes,
+                    t.over_quota as u8,
+                    bytes,
+                    t.replica_reads as u8,
+                    t.local_cache as u8
                 )
                 .into_bytes(),
             ))
         }
+        b"CPMYCONFIG" => {
+            let (Some(token), Some(setting), Some(mode)) = (text(1), text(2), text(3)) else {
+                return Value::Error(
+                    "ERR CPMYCONFIG <token> <replica-reads|near-cache> <on|off>".into(),
+                );
+            };
+            let on = match mode.as_str() {
+                "on" => true,
+                "off" => false,
+                _ => {
+                    return Value::Error(
+                        "ERR CPMYCONFIG <token> <replica-reads|near-cache> <on|off>".into(),
+                    );
+                }
+            };
+            let name =
+                {
+                    let reg = ha.store.registry().await;
+                    match reg.tenants.values().find(|t| {
+                        t.token == token || t.prev_token.as_deref() == Some(token.as_str())
+                    }) {
+                        Some(t) => t.name.clone(),
+                        None => return Value::Error("WRONGPASS invalid token".into()),
+                    }
+                };
+            let mutation = match setting.as_str() {
+                "replica-reads" => Mutation::SetReplicaReads { name, on },
+                "near-cache" => Mutation::SetLocalCache { name, on },
+                _ => return Value::Error("ERR unknown setting (replica-reads|near-cache)".into()),
+            };
+            match ha.propose(mutation).await {
+                Ok(_) => Value::Simple("OK".into()),
+                Err(l) => redirect(l),
+            }
+        }
         b"CPTENANTS" => {
             let reg = ha.store.registry().await;
+            let usage = ha.usage.lock().ok();
             let mut out = String::new();
             for t in reg.tenants.values() {
+                let bytes = usage
+                    .as_ref()
+                    .and_then(|u| u.get(&t.name).copied())
+                    .unwrap_or(0);
                 out.push_str(&format!(
-                    "{} {} {} {} {}\r\n",
-                    t.name, t.ns, t.ops_per_sec, t.max_bytes, t.over_quota as u8
+                    "{} {} {} {} {} {} {} {}\r\n",
+                    t.name,
+                    t.ns,
+                    t.ops_per_sec,
+                    t.max_bytes,
+                    t.over_quota as u8,
+                    bytes,
+                    t.replica_reads as u8,
+                    t.local_cache as u8
                 ));
             }
             Value::Bulk(Some(out.into_bytes()))
