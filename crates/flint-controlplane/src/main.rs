@@ -36,6 +36,7 @@ mod ha;
 mod raft;
 mod registry;
 mod state;
+mod tenant;
 
 use std::io::{Read, Write};
 use std::net::TcpListener;

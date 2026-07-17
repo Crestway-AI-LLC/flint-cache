@@ -168,4 +168,58 @@ print("  globex (not opted in) writes inline and reads back — queue is strictl
 PY
 [ $? -eq 0 ] || exit 1
 
-echo "PASS: async write queue — opt-in, ordered per-connection, no lost updates, bounded (-THROTTLED), reads unaffected"
+echo "== REPLICATION: batched writes reach a replica intact (coverage from review)"
+# The consumer commits each batch as one engine WriteBatch; the WAL tailer
+# must carry it to a replica exactly like inline writes. Fresh pair, queued
+# INCR storm, then replica-vs-master parity on the final value.
+pkill -9 -f flint-server 2>/dev/null; sleep 0.4; rm -rf "$D"; mkdir -p "$D"
+$B --port 6995 --engine rocks --data-dir "$D/m2" --async-writes acme 2>"$D/m2.log" &
+for i in $(seq 1 30); do [ "$(valkey-cli -p 6995 PING 2>/dev/null)" = "PONG" ] && break; sleep 0.2; done
+$B --port 6996 --engine rocks --data-dir "$D/r2" --replica-of 127.0.0.1:6995 2>"$D/r2.log" &
+sleep 1.2
+python3 - <<'PY'
+import socket, threading
+def resp(a):
+    return f"*{len(a)}\r\n".encode()+b"".join(f"${len(x)}\r\n{x}\r\n".encode() for x in a)
+def worker():
+    s=socket.create_connection(("127.0.0.1",6995),timeout=10); s.settimeout(10)
+    s.sendall(resp(["FLINTNS","acme"])); s.recv(64)
+    for _ in range(400):
+        while True:
+            s.sendall(resp(["INCR","repl:counter"]))
+            b=b""
+            while not b.endswith(b"\r\n"): b+=s.recv(64)
+            if b"THROTTLED" not in b: break
+    s.close()
+ts=[threading.Thread(target=worker) for _ in range(6)]
+[t.start() for t in ts]; [t.join() for t in ts]
+PY
+# Wait for the replica to drain the tail, then compare through FLINTNS.
+CONV=""
+for i in $(seq 1 40); do
+  MV=$(valkey-cli -p 6995 FLINTNS acme >/dev/null 2>&1; printf "")
+  MV=$(python3 -c '
+import socket
+def resp(a):
+    return f"*{len(a)}\r\n".encode()+b"".join(f"${len(x)}\r\n{x}\r\n".encode() for x in a)
+def get(port):
+    s=socket.create_connection(("127.0.0.1",port),timeout=5); s.settimeout(5)
+    s.sendall(resp(["FLINTNS","acme"])); s.recv(64)
+    s.sendall(resp(["GET","repl:counter"]))
+    b=b""
+    while not b.endswith(b"\r\n"): b+=s.recv(64)
+    return b.split(b"\r\n")[1].decode()
+try:
+    m=get(6995); r=get(6996)
+    print(f"{m} {r}")
+except Exception as e:
+    print(f"err err")
+')
+  M=$(echo "$MV" | cut -d' ' -f1); R=$(echo "$MV" | cut -d' ' -f2)
+  if [ "$M" = "2400" ] && [ "$R" = "2400" ]; then CONV=yes; break; fi
+  sleep 0.3
+done
+[ "$CONV" = "yes" ] || { echo "FAIL: replica did not converge (master=$M replica=$R, want 2400)"; exit 1; }
+echo "  master=2400, replica=2400 — group-committed batches replicate intact"
+
+echo "PASS: async write queue — opt-in, ordered per-connection, no lost updates, bounded (-THROTTLED), reads unaffected, replicates intact"

@@ -473,9 +473,13 @@ impl Topology {
                 ))
             })
             .collect();
+        let keep: std::collections::HashSet<Vec<u8>> =
+            new_tenants.values().map(|(ns, _, _)| ns.clone()).collect();
         if let Ok(mut tenants) = self.tenants.write() {
             *tenants = new_tenants;
         }
+        // A removed tenant's latency lanes must not export forever.
+        self.latency.retain(&keep);
     }
 }
 
@@ -1043,72 +1047,15 @@ fn serve_client<S: Read + Write>(mut stream: S, topo: Arc<Topology>) -> std::io:
                         &args,
                     ) {
                         AuthStep::Reply(v) => v,
-                        AuthStep::Proceed(ns) => {
-                            // D6 near-cache: a plain GET for an opted-in
-                            // tenant may answer from the proxy-local cache
-                            // (TTL-bounded staleness, the tenant's choice).
-                            // The hot-key sketch above already observed the
-                            // command, so detection still sees cached reads.
-                            let cacheable = local_cache
-                                && topo.cache.enabled()
-                                && args.len() == 2
-                                && args[0].eq_ignore_ascii_case(b"GET");
-                            if let Some(v) =
-                                cacheable.then(|| topo.cache.get(&ns, &args[1])).flatten()
-                            {
-                                Value::Bulk(Some(v))
-                            } else {
-                                // D7: route to a replica only if the tenant
-                                // opted in AND this is a read (writes stay on
-                                // master).
-                                let read_replica = replica_reads
-                                    && args
-                                        .first()
-                                        .is_some_and(|n| flint_commands::is_read_command(n));
-                                let b = backends.get_or_insert_with(|| {
-                                    Backends::new(ns.clone(), topo.backend_tls.clone())
-                                });
-                                let reply = handle(&topo, b, &ns, &args, &raw, read_replica);
-                                if cacheable && let Value::Bulk(Some(v)) = &reply {
-                                    topo.cache.put(&ns, &args[1], v);
-                                }
-                                // A write through THIS proxy invalidates its
-                                // local entries — read-your-own-writes through
-                                // one proxy. (A write through another proxy is
-                                // seen here only after the TTL: the contract.)
-                                if local_cache
-                                    && topo.cache.enabled()
-                                    && args
-                                        .first()
-                                        .is_some_and(|n| flint_commands::is_write_command(n))
-                                {
-                                    match args[0].to_ascii_uppercase().as_slice() {
-                                        b"DEL" | b"UNLINK" => {
-                                            for k in &args[1..] {
-                                                topo.cache.invalidate(&ns, k);
-                                            }
-                                        }
-                                        // MSET k1 v1 k2 v2 ...: EVERY written
-                                        // key (odd indices) must drop, or a
-                                        // cached later key would keep serving
-                                        // its old value through this proxy —
-                                        // the read-your-own-writes contract.
-                                        b"MSET" => {
-                                            for k in args[1..].iter().step_by(2) {
-                                                topo.cache.invalidate(&ns, k);
-                                            }
-                                        }
-                                        b"FLUSHALL" => topo.cache.invalidate_ns(&ns),
-                                        _ => {
-                                            if let Some(k) = args.get(1) {
-                                                topo.cache.invalidate(&ns, k);
-                                            }
-                                        }
-                                    }
-                                }
-                                reply
-                            }
-                        }
+                        AuthStep::Proceed(ns) => data_command(
+                            &topo,
+                            &mut backends,
+                            &ns,
+                            &args,
+                            &raw,
+                            replica_reads,
+                            local_cache,
+                        ),
                     };
                     // Record into this tenant's read/write histogram — data
                     // commands only (the D1 classifier; AUTH/PROXY* are
@@ -1147,6 +1094,76 @@ fn serve_client<S: Read + Write>(mut stream: S, topo: Arc<Topology>) -> std::io:
         }
         buf.extend_from_slice(&chunk[..n]);
     }
+}
+
+/// One authorized tenant command, end to end: the D6 near-cache in front
+/// (lookup, fill, write-invalidation), D7 replica routing, and the backend
+/// forward. Extracted from `serve_client` so the connection loop stays a
+/// decode/auth/encode skeleton.
+#[allow(clippy::too_many_arguments)]
+fn data_command(
+    topo: &Topology,
+    backends: &mut Option<Backends>,
+    ns: &[u8],
+    args: &[Vec<u8>],
+    raw: &[u8],
+    replica_reads: bool,
+    local_cache: bool,
+) -> Value {
+    // D6 near-cache: a plain GET for an opted-in tenant may answer from the
+    // proxy-local cache (TTL-bounded staleness, the tenant's choice). The
+    // hot-key sketch already observed the command in the connection loop,
+    // so detection still sees cached reads.
+    let cacheable = local_cache
+        && topo.cache.enabled()
+        && args.len() == 2
+        && args[0].eq_ignore_ascii_case(b"GET");
+    if let Some(v) = cacheable.then(|| topo.cache.get(ns, &args[1])).flatten() {
+        return Value::Bulk(Some(v));
+    }
+    // D7: route to a replica only if the tenant opted in AND this is a read
+    // (writes stay on the master).
+    let read_replica = replica_reads
+        && args
+            .first()
+            .is_some_and(|n| flint_commands::is_read_command(n));
+    let b = backends.get_or_insert_with(|| Backends::new(ns.to_vec(), topo.backend_tls.clone()));
+    let reply = handle(topo, b, ns, args, raw, read_replica);
+    if cacheable && let Value::Bulk(Some(v)) = &reply {
+        topo.cache.put(ns, &args[1], v);
+    }
+    // A write through THIS proxy invalidates its local entries —
+    // read-your-own-writes through one proxy. (A write through another
+    // proxy is seen here only after the TTL: the contract.)
+    if local_cache
+        && topo.cache.enabled()
+        && args
+            .first()
+            .is_some_and(|n| flint_commands::is_write_command(n))
+    {
+        match args[0].to_ascii_uppercase().as_slice() {
+            b"DEL" | b"UNLINK" => {
+                for k in &args[1..] {
+                    topo.cache.invalidate(ns, k);
+                }
+            }
+            // MSET k1 v1 k2 v2 ...: EVERY written key (odd indices) must
+            // drop, or a cached later key would keep serving its old value
+            // through this proxy — the read-your-own-writes contract.
+            b"MSET" => {
+                for k in args[1..].iter().step_by(2) {
+                    topo.cache.invalidate(ns, k);
+                }
+            }
+            b"FLUSHALL" => topo.cache.invalidate_ns(ns),
+            _ => {
+                if let Some(k) = args.get(1) {
+                    topo.cache.invalidate(ns, k);
+                }
+            }
+        }
+    }
+    reply
 }
 
 fn handle(

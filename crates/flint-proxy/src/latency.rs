@@ -105,6 +105,14 @@ impl LatencyHistograms {
         }
     }
 
+    /// Drop histograms for namespaces no longer in the tenant table (a
+    /// removed tenant's series would otherwise be exported forever).
+    pub fn retain(&self, keep: &std::collections::HashSet<Vec<u8>>) {
+        if let Ok(mut map) = self.tenants.write() {
+            map.retain(|ns, _| keep.contains(ns));
+        }
+    }
+
     /// Report lines: `<ns> <read|write> <count> <sum_us> <cum buckets...>`.
     /// `scope` = Some(ns): only that tenant's lanes (the authed view);
     /// None: every tenant (the pre-auth operator view) — the same scoping

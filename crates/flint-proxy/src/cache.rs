@@ -15,6 +15,13 @@
 //! FIFO with generation checks — with one short TTL, insertion order IS
 //! expiry order, so FIFO evicts the entries closest to death anyway and
 //! stays O(1) without LRU bookkeeping.
+//!
+//! Fairness: the byte budget is shared, so an unchecked key-spraying tenant
+//! would evict every other tenant's entries (a noisy neighbor INSIDE the
+//! mitigation). At insert time the writing tenant is capped at
+//! `budget / resident-tenant-count`; over its share, its OWN oldest entries
+//! evict first. Other tenants' entries are touched only by the global
+//! budget (oldest-first, which is the sprayer's own entries anyway).
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
@@ -36,7 +43,34 @@ struct Inner {
     map: HashMap<Vec<u8>, Entry>,
     fifo: VecDeque<(Vec<u8>, u64)>,
     bytes: usize,
+    /// Resident bytes per namespace — the fairness accounting.
+    ns_bytes: HashMap<Vec<u8>, usize>,
     generation: u64,
+}
+
+impl Inner {
+    /// The composite key's namespace (length-prefixed by `composite`).
+    fn ns_of(key: &[u8]) -> &[u8] {
+        let n = u32::from_be_bytes([key[0], key[1], key[2], key[3]]) as usize;
+        &key[4..4 + n]
+    }
+
+    /// Remove `key` from the map, keeping BOTH byte ledgers consistent.
+    /// The fifo slot (if any) goes stale and is skipped by eviction.
+    fn remove(&mut self, key: &[u8]) -> bool {
+        let Some(e) = self.map.remove(key) else {
+            return false;
+        };
+        self.bytes -= e.cost;
+        let ns = Self::ns_of(key).to_vec();
+        if let Some(b) = self.ns_bytes.get_mut(&ns) {
+            *b -= e.cost;
+            if *b == 0 {
+                self.ns_bytes.remove(&ns);
+            }
+        }
+        true
+    }
 }
 
 pub struct ProxyCache {
@@ -121,9 +155,7 @@ impl ProxyCache {
                 return Some(val);
             }
             // Expired: reclaim now rather than waiting for FIFO churn.
-            if let Some(e) = inner.map.remove(&c) {
-                inner.bytes -= e.cost;
-            }
+            inner.remove(&c);
         }
         drop(inner);
         self.misses.fetch_add(1, Ordering::Relaxed);
@@ -158,10 +190,16 @@ impl ProxyCache {
             },
         ) {
             inner.bytes -= old.cost;
+            let old_cost = old.cost;
+            if let Some(b) = inner.ns_bytes.get_mut(ns) {
+                *b -= old_cost;
+            }
         }
         inner.bytes += cost;
-        inner.fifo.push_back((c, generation));
+        *inner.ns_bytes.entry(ns.to_vec()).or_insert(0) += cost;
+        inner.fifo.push_back((c.clone(), generation));
         Self::evict_to_budget(&mut inner, budget);
+        Self::enforce_ns_share(&mut inner, ns, budget, &c);
     }
 
     /// Drop (ns, key) — a write to it went through this proxy.
@@ -169,10 +207,8 @@ impl ProxyCache {
         if !self.enabled() {
             return;
         }
-        if let Ok(mut inner) = self.inner.lock()
-            && let Some(e) = inner.map.remove(&composite(ns, key))
-        {
-            inner.bytes -= e.cost;
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.remove(&composite(ns, key));
         }
     }
 
@@ -192,9 +228,7 @@ impl ProxyCache {
                 .cloned()
                 .collect();
             for k in doomed {
-                if let Some(e) = inner.map.remove(&k) {
-                    inner.bytes -= e.cost;
-                }
+                inner.remove(&k);
             }
         }
     }
@@ -210,9 +244,41 @@ impl ProxyCache {
                 .map
                 .get(&key)
                 .is_some_and(|e| e.generation == generation);
-            if live && let Some(e) = inner.map.remove(&key) {
-                inner.bytes -= e.cost;
+            if live {
+                inner.remove(&key);
             }
+        }
+    }
+
+    /// Fairness: cap `ns` at budget / resident-tenant-count by evicting its
+    /// OWN oldest entries (never another tenant's), sparing the entry just
+    /// inserted (`newest`) so a below-share tenant always keeps its latest.
+    fn enforce_ns_share(inner: &mut Inner, ns: &[u8], budget: usize, newest: &[u8]) {
+        let residents = inner.ns_bytes.len().max(1);
+        let share = budget / residents;
+        if inner.ns_bytes.get(ns).copied().unwrap_or(0) <= share {
+            return;
+        }
+        // Walk oldest-first; evict only this namespace's LIVE entries. The
+        // fifo slots stay (they turn stale and are skipped later).
+        let doomed: Vec<Vec<u8>> = inner
+            .fifo
+            .iter()
+            .filter(|(k, generation)| {
+                k.as_slice() != newest
+                    && Inner::ns_of(k) == ns
+                    && inner
+                        .map
+                        .get(k)
+                        .is_some_and(|e| e.generation == *generation)
+            })
+            .map(|(k, _)| k.clone())
+            .collect();
+        for k in doomed {
+            if inner.ns_bytes.get(ns).copied().unwrap_or(0) <= share {
+                break;
+            }
+            inner.remove(&k);
         }
     }
 }
@@ -249,5 +315,31 @@ mod tests {
         assert_eq!((entries, bytes), (0, 0));
         c.put(b"acme", b"k", b"v");
         assert_eq!(c.get(b"acme", b"k"), None);
+    }
+
+    #[test]
+    fn spraying_tenant_cannot_evict_others() {
+        // Budget 1000, two tenants resident -> each capped at ~500 at
+        // insert time. globex parks a few entries; acme sprays far past
+        // the whole budget; globex's entries must survive.
+        let c = ProxyCache::new(60_000, 1000);
+        for i in 0..5u32 {
+            c.put(b"globex", format!("g:{i}").as_bytes(), &[b'y'; 20]);
+        }
+        for i in 0..200u32 {
+            c.put(b"acme", format!("a:{i}").as_bytes(), &[b'x'; 30]);
+        }
+        for i in 0..5u32 {
+            assert!(
+                c.get(b"globex", format!("g:{i}").as_bytes()).is_some(),
+                "acme's spray evicted globex's entry g:{i}"
+            );
+        }
+        let (_, _, _, _, _, bytes) = c.stats();
+        assert!(bytes <= 1000, "global budget exceeded: {bytes}");
+        // acme is bounded by its share, not the whole budget: its newest
+        // entries live, its oldest were self-evicted.
+        assert!(c.get(b"acme", b"a:199").is_some());
+        assert!(c.get(b"acme", b"a:0").is_none());
     }
 }

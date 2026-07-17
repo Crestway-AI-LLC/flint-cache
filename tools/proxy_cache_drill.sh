@@ -27,7 +27,9 @@ echo "== cluster: CP + master + proxy; acme consents to the cache, globex does n
 $CP --port 7660 --state "$D/cp" 2>/dev/null &
 for i in $(seq 1 30); do [ "$(valkey-cli -p 7660 PING 2>/dev/null)" = "PONG" ] && break; sleep 0.2; done
 valkey-cli -p 7660 CPADDPROXY 127.0.0.1:7881 >/dev/null
-valkey-cli -p 7660 CPADDPAIR 127.0.0.1:6970 >/dev/null
+# Both pair members registered so the proxy can chase a failover to 6971
+# (the FAILOVER section below promotes it).
+valkey-cli -p 7660 CPADDPAIR 127.0.0.1:6970,127.0.0.1:6971 >/dev/null
 valkey-cli -p 7660 CPADDTENANT acme tok-acme acme 1 >/dev/null
 valkey-cli -p 7660 CPADDTENANT globex tok-glx globex 1 >/dev/null
 valkey-cli -p 7660 CPTENANTCACHE acme on >/dev/null || { echo "FAIL: CPTENANTCACHE"; exit 1; }
@@ -107,6 +109,26 @@ V=$($A GET k9)   # a HIT answers locally and instantly; a miss would error after
 [ "$V" = "alive" ] || { echo "FAIL: cache did not serve with backend down (got '$V')"; exit 1; }
 echo "  GET k9 = alive, served with zero backends up — locally, provably from the cache"
 $B --port 6970 --engine rocks --data-dir "$D/m" 2>/dev/null &   # restore for the rest
+sleep 0.9
+
+echo "== FAILOVER: invalidation keeps working through a promoted master (coverage from review)"
+# Attach a replica, kill the master, promote — the proxy chases the new
+# master; a write through the proxy must invalidate and the next GET must
+# come from the NEW master (fresh), not the cache (stale).
+$B --port 6971 --engine rocks --data-dir "$D/r" --replica-of 127.0.0.1:6970 2>/dev/null &
+sleep 1.2
+$A SET f1 before >/dev/null; $A GET f1 >/dev/null   # cache 'before'
+sleep 0.5                                            # let the write replicate
+pkill -9 -f "flint-server --port 6970"; sleep 0.3
+valkey-cli -p 6971 FLINTPROMOTE 1 99 >/dev/null 2>&1 || valkey-cli -p 6971 FLINTPROMOTE 2 1 >/dev/null
+V=$($A GET f1)   # within TTL: served from cache even during the failover window
+[ "$V" = "before" ] || { echo "FAIL: cache did not carry through failover (got $V)"; exit 1; }
+$A SET f1 after >/dev/null   # write via proxy -> chases to the promoted master + invalidates
+V=$($A GET f1)
+[ "$V" = "after" ] || { echo "FAIL: post-failover invalidation broken (got $V)"; exit 1; }
+echo "  cache served through the failover window; post-promotion write invalidated cleanly"
+pkill -9 -f "flint-server --port 6971" 2>/dev/null
+$B --port 6970 --engine rocks --data-dir "$D/m" 2>/dev/null &   # restore original master for the rest
 sleep 0.9
 
 echo "== byte budget honored under key spray"

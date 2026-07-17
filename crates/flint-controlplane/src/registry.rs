@@ -50,26 +50,7 @@ pub enum Mutation {
     },
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct Tenant {
-    pub name: String,
-    pub token: String,
-    pub ns: String,
-    pub subset: Vec<String>,
-    /// Previous token during a rotation; both it and `token` auth to `ns`
-    /// until dropped. None outside a rotation window.
-    #[serde(default)]
-    pub prev_token: Option<String>,
-    /// Replica-read opt-in (ADR-0005 D7): proxy may fan reads across the
-    /// pair's replicas; writes stay on the master. Tenant's explicit choice.
-    #[serde(default)]
-    pub replica_reads: bool,
-    /// Proxy near-cache opt-in (ADR-0005 D6): the proxy may answer this
-    /// tenant's GETs from its short-TTL local cache. Tenant's explicit
-    /// choice — the TTL is an allowed-staleness contract.
-    #[serde(default)]
-    pub local_cache: bool,
-}
+pub use crate::tenant::Tenant;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RegistryState {
@@ -187,41 +168,8 @@ impl RegistryState {
     /// The snapshot a given proxy should see: shared pair topology + ONLY
     /// the tenants whose subset includes it (the sub-group boundary).
     pub fn snapshot_for(&self, proxy: &str) -> (u64, String, String) {
-        let pairs = self
-            .pairs
-            .iter()
-            .enumerate()
-            .map(|(i, p)| match self.ranges.get(i).copied().flatten() {
-                Some((a, b)) => format!("{}|{a}-{b}", p.join(",")),
-                None => p.join(","),
-            })
-            .collect::<Vec<_>>()
-            .join(";");
-        let tenants = self
-            .tenants
-            .values()
-            .filter(|t| t.subset.iter().any(|s| s == proxy))
-            .flat_map(|t| {
-                let mut flags = String::new();
-                if t.replica_reads {
-                    flags.push('r');
-                }
-                if t.local_cache {
-                    flags.push('c');
-                }
-                let suffix = if flags.is_empty() {
-                    String::new()
-                } else {
-                    format!("#{flags}")
-                };
-                let mut v = vec![format!("{}={}{suffix}", t.token, t.ns)];
-                if let Some(p) = &t.prev_token {
-                    v.push(format!("{}={}{suffix}", p, t.ns));
-                }
-                v
-            })
-            .collect::<Vec<_>>()
-            .join(",");
+        let (pairs, tenants) =
+            crate::tenant::snapshot_for(&self.pairs, &self.ranges, self.tenants.values(), proxy);
         (self.version, pairs, tenants)
     }
 }

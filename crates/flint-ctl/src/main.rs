@@ -49,6 +49,9 @@ struct Inventory {
     /// Per-node storage capacity in bytes (capacity model, question 2);
     /// passed to the agent so it can compute fill + expansion ETAs.
     capacity_bytes: Option<u64>,
+    /// Proxy admin token (`--admin-token` on every proxy; presented before
+    /// PROXY* operator commands). None = ungated dev fleet.
+    admin_token: Option<String>,
 }
 
 fn parse_inventory(path: &str) -> Inventory {
@@ -75,6 +78,7 @@ fn parse_inventory(path: &str) -> Inventory {
             "controller" => inv.controller = val == "on",
             "agent" => inv.agent = Some(val.to_string()),
             "capacity" => inv.capacity_bytes = val.parse().ok(),
+            "admin-token" => inv.admin_token = Some(val.to_string()),
             other => panic!("inventory: unknown key {other:?}"),
         }
     }
@@ -1084,6 +1088,31 @@ fn main() {
                 other => panic!("tenant-reads failed: {other:?}"),
             }
         }
+        // Push the near-cache knobs (PROXYCACHE <ttl_ms> <max_bytes>) to
+        // EVERY proxy in the inventory — the per-proxy runtime setting,
+        // fleet-applied. Presents the inventory admin token when the fleet
+        // is gated.
+        "proxy-cache" => {
+            let (ttl, maxb) = (
+                rest.first()
+                    .expect("usage: proxy-cache <ttl_ms> <max_bytes>"),
+                rest.get(1)
+                    .expect("usage: proxy-cache <ttl_ms> <max_bytes>"),
+            );
+            let tls = tls_client(&inv);
+            for proxy in &inv.proxies {
+                if let Some(tok) = &inv.admin_token {
+                    match call(proxy, &tls, &["AUTH", tok]) {
+                        Ok(Value::Simple(_)) => {}
+                        other => panic!("proxy-cache: admin auth to {proxy} failed: {other:?}"),
+                    }
+                }
+                match call(proxy, &tls, &["PROXYCACHE", ttl, maxb]) {
+                    Ok(Value::Simple(_)) => println!("{proxy}: cache ttl={ttl}ms max={maxb}B"),
+                    other => panic!("proxy-cache: {proxy} rejected: {other:?}"),
+                }
+            }
+        }
         // Proxy near-cache consent for a tenant (ADR-0005 D6). The cache's
         // TTL/size knobs are per-proxy runtime settings (PROXYCACHE); this
         // records the tenant's acceptance of TTL-bounded stale reads.
@@ -1115,7 +1144,7 @@ fn main() {
         "stop" => stop(&inv),
         other => {
             panic!(
-                "unknown command {other:?} (bootstrap|status|tenant|tenant-reads|tenant-cache|expand|swap-node|add-replica|upgrade|stop)"
+                "unknown command {other:?} (bootstrap|status|tenant|tenant-reads|tenant-cache|proxy-cache|expand|swap-node|add-replica|upgrade|stop)"
             )
         }
     }

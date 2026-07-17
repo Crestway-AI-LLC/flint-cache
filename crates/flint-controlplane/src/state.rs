@@ -20,25 +20,7 @@ use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Tenant {
-    pub name: String,
-    pub token: String,
-    pub ns: String,
-    /// The shuffle-shard subset of proxies serving this tenant. Empty means
-    /// "not yet assigned" (no proxies registered at add time).
-    pub subset: Vec<String>,
-    /// Previous token during a rotation; both auth to `ns` until dropped.
-    pub prev_token: Option<String>,
-    /// Replica-read opt-in (ADR-0005 D7): when true, the proxy may fan this
-    /// tenant's reads across the pair's replicas (bounded-staleness, the
-    /// tenant's explicit choice). Writes always go to the master.
-    pub replica_reads: bool,
-    /// Proxy near-cache opt-in (ADR-0005 D6): when true, the proxy may
-    /// answer this tenant's GETs from its short-TTL local cache — an
-    /// allowed-staleness contract, the tenant's explicit choice.
-    pub local_cache: bool,
-}
+pub use crate::tenant::Tenant;
 
 #[derive(Debug, Default)]
 pub struct State {
@@ -229,42 +211,12 @@ impl State {
     /// tenants never — no subset, no service). This filtering is the
     /// blast-radius/security boundary: a proxy never holds tokens it does
     /// not serve.
+    /// The snapshot a given proxy should see (shared renderer — the subset
+    /// filter is the blast-radius/security boundary: a proxy never holds
+    /// tokens it does not serve).
     pub fn snapshot_for(&self, proxy: &str) -> (u64, String, String) {
-        let pairs = self
-            .pairs
-            .iter()
-            .enumerate()
-            .map(|(i, p)| match self.ranges.get(i).copied().flatten() {
-                Some((a, b)) => format!("{}|{a}-{b}", p.join(",")),
-                None => p.join(","),
-            })
-            .collect::<Vec<_>>()
-            .join(";");
-        let tenants = self
-            .tenants
-            .values()
-            .filter(|t| t.subset.iter().any(|s| s == proxy))
-            .flat_map(|t| {
-                let mut flags = String::new();
-                if t.replica_reads {
-                    flags.push('r');
-                }
-                if t.local_cache {
-                    flags.push('c');
-                }
-                let suffix = if flags.is_empty() {
-                    String::new()
-                } else {
-                    format!("#{flags}")
-                };
-                let mut v = vec![format!("{}={}{suffix}", t.token, t.ns)];
-                if let Some(p) = &t.prev_token {
-                    v.push(format!("{}={}{suffix}", p, t.ns));
-                }
-                v
-            })
-            .collect::<Vec<_>>()
-            .join(",");
+        let (pairs, tenants) =
+            crate::tenant::snapshot_for(&self.pairs, &self.ranges, self.tenants.values(), proxy);
         (self.version, pairs, tenants)
     }
 }
