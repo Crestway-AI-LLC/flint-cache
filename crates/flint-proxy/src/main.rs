@@ -38,6 +38,7 @@
 //!                    [--tenants "tokenA=nsA,tokenB=nsB"]
 
 mod cache;
+mod latency;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -279,6 +280,9 @@ struct Topology {
     stat_active: AtomicUsize,
     /// Hot-key sketch (D5, observability only).
     hotkeys: HotKeySketch,
+    /// Per-tenant latency histograms (M4 client-metrics substitute):
+    /// tenant-perceived latency measured one hop from the client.
+    latency: latency::LatencyHistograms,
     /// Proxy-local read cache (D6): short-TTL, bounded bytes, per-tenant
     /// opt-in. Runtime-configured via PROXYCACHE.
     cache: cache::ProxyCache,
@@ -801,6 +805,14 @@ fn auth_step(
         );
         return AuthStep::Reply(Value::Bulk(Some(info.into_bytes())));
     }
+    // Ops/tenant query: per-tenant latency histograms (the client-metrics
+    // substitute — measured one hop from the client). Same scoping contract
+    // as PROXYHOTKEYS: authed = own namespace only (latency shapes leak
+    // workload patterns); pre-auth = the all-tenant operator view.
+    if name.as_deref() == Some(b"PROXYLATENCY") {
+        let scope = authed_ns.as_deref().filter(|_| !topo.open_mode);
+        return AuthStep::Reply(Value::Bulk(Some(topo.latency.report(scope).into_bytes())));
+    }
     // Ops knob: the proxy near-cache (D6). No args -> report; two args ->
     // set (ttl_ms, max_bytes) at RUNTIME; ttl 0 disables and clears. Same
     // pre-auth operator surface as the other PROXY* commands (mTLS-gated in
@@ -973,6 +985,11 @@ fn serve_client<S: Read + Write>(mut stream: S, topo: Arc<Topology>) -> std::io:
                             }
                         }
                     }
+                    // Tenant-perceived latency starts here: everything the
+                    // proxy does for this command — cache lookup, routing,
+                    // backend round trip, MOVED/failover retries — is what
+                    // the client waits for.
+                    let started = Instant::now();
                     let reply = match auth_step(
                         &topo,
                         &mut authed_ns,
@@ -1038,6 +1055,21 @@ fn serve_client<S: Read + Write>(mut stream: S, topo: Arc<Topology>) -> std::io:
                             }
                         }
                     };
+                    // Record into this tenant's read/write histogram — data
+                    // commands only (the D1 classifier; AUTH/PROXY* are
+                    // neither), and only once a namespace is bound.
+                    if let Some(ns) = authed_ns.as_deref()
+                        && let Some(name) = args.first()
+                    {
+                        let is_write = flint_commands::is_write_command(name);
+                        if is_write || flint_commands::is_read_command(name) {
+                            topo.latency.observe(
+                                ns,
+                                is_write,
+                                started.elapsed().as_micros() as u64,
+                            );
+                        }
+                    }
                     encode(&reply, &mut out);
                 }
                 Ok(Decoded::NeedMore) => break,
@@ -1329,6 +1361,7 @@ fn main() -> std::io::Result<()> {
         stat_active: AtomicUsize::new(0),
         replica_rr: AtomicUsize::new(0),
         hotkeys: HotKeySketch::new(),
+        latency: latency::LatencyHistograms::default(),
         // D6 near-cache: OFF unless --cache-ttl-ms is given; both knobs stay
         // runtime-settable via PROXYCACHE. The default budget is deliberately
         // small — this is a hot-spot absorber, not a data tier.
