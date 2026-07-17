@@ -305,9 +305,19 @@ mod tests {
         assert_eq!(loaded.version, 1);
         assert_eq!(loaded.proxies, s.proxies);
         assert_eq!(loaded.pairs, s.pairs);
+        // ADR-0006 D1: this token was written PLAINTEXT (straight into the
+        // struct, bypassing the CPADDTENANT digest boundary) — load MIGRATES
+        // it to its SHA-256 digest, one-way. The digest form then roundtrips
+        // unchanged (64-hex is recognized as already-digested).
+        let expected_digest = flint_tls::sha256_hex(b"tok-acme");
         assert_eq!(
             loaded.tenants.get("acme").map(|t| t.token.clone()),
-            Some("tok-acme".into())
+            Some(expected_digest.clone())
+        );
+        let reloaded = State::load_or_new(path.clone());
+        assert_eq!(
+            reloaded.tenants.get("acme").map(|t| t.token.clone()),
+            Some(expected_digest)
         );
         let _ = std::fs::remove_file(&path);
     }
