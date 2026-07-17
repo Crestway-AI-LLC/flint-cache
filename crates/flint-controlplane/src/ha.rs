@@ -501,6 +501,9 @@ async fn handle_admin(ha: &Ha, args: &[Vec<u8>]) -> Value {
                 return Value::Error("ERR invalid name/token/ns".into());
             }
             let k: usize = text(4).and_then(|v| v.parse().ok()).unwrap_or(2);
+            // ADR-0006 D1: hash BEFORE proposing — the Raft log, snapshots,
+            // and every follower store only the digest.
+            let token = flint_tls::sha256_hex(token.as_bytes());
             // Compute the subset from the current fleet (deterministic).
             let reg = ha.store.registry().await;
             if reg.tenants.contains_key(&name) {
@@ -545,6 +548,7 @@ async fn handle_admin(ha: &Ha, args: &[Vec<u8>]) -> Value {
             if !clean(&new) {
                 return Value::Error("ERR invalid token".into());
             }
+            let new = flint_tls::sha256_hex(new.as_bytes());
             let reg = ha.store.registry().await;
             if !reg.tenants.contains_key(&name) {
                 return Value::Error("ERR no such tenant".into());
@@ -659,6 +663,7 @@ async fn handle_admin(ha: &Ha, args: &[Vec<u8>]) -> Value {
             let Some(token) = text(1) else {
                 return Value::Error("ERR CPMYUSAGE <token>".into());
             };
+            let token = flint_tls::sha256_hex(token.as_bytes());
             let reg = ha.store.registry().await;
             let Some(t) = reg
                 .tenants
@@ -694,6 +699,7 @@ async fn handle_admin(ha: &Ha, args: &[Vec<u8>]) -> Value {
                     "ERR CPMYCONFIG <token> <replica-reads|near-cache> <on|off>".into(),
                 );
             };
+            let token = flint_tls::sha256_hex(token.as_bytes());
             let on = match mode.as_str() {
                 "on" => true,
                 "off" => false,

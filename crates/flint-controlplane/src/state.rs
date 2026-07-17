@@ -135,6 +135,15 @@ impl State {
                         let prev_token = parts
                             .next()
                             .and_then(|p| if p == "-" { None } else { Some(p.to_string()) });
+                        // ADR-0006 D1 migration: a plaintext-era token (not
+                        // a 64-hex digest) is hashed ON LOAD — one-way, once.
+                        let digestify = |t: String| {
+                            if t.len() == 64 && t.bytes().all(|b| b.is_ascii_hexdigit()) {
+                                t
+                            } else {
+                                flint_tls::sha256_hex(t.as_bytes())
+                            }
+                        };
                         let replica_reads = parts.next() == Some("1");
                         let local_cache = parts.next() == Some("1");
                         let ops_per_sec = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0);
@@ -144,10 +153,10 @@ impl State {
                             name.to_string(),
                             Tenant {
                                 name: name.to_string(),
-                                token: token.to_string(),
+                                token: digestify(token.to_string()),
                                 ns: ns.to_string(),
                                 subset,
-                                prev_token,
+                                prev_token: prev_token.map(digestify),
                                 replica_reads,
                                 local_cache,
                                 ops_per_sec,

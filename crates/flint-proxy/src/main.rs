@@ -364,8 +364,11 @@ impl Topology {
         }
     }
 
+    /// The tenant table is keyed by token DIGEST (ADR-0006 D1): hash the
+    /// presented token, then look up. A leaked table entry cannot AUTH.
     fn lookup_token(&self, token: &str) -> Option<TenantGrant> {
-        self.tenants.read().ok()?.get(token).cloned()
+        let digest = flint_tls::sha256_hex(token.as_bytes());
+        self.tenants.read().ok()?.get(&digest).cloned()
     }
 
     /// A replica of the pair that currently owns `(ns, slot)`, chosen
@@ -384,17 +387,27 @@ impl Topology {
         Some(replicas[idx].clone())
     }
 
+    /// Per-token usage counters, keyed by DIGEST (rotation drain checks).
     fn bump_auth(&self, token: &str) {
+        let digest = flint_tls::sha256_hex(token.as_bytes());
         if let Ok(mut c) = self.auth_counts.write() {
-            *c.entry(token.to_string()).or_insert(0) += 1;
+            *c.entry(digest).or_insert(0) += 1;
         }
     }
 
+    /// Drain-check lookup: accepts the PLAINTEXT token (hashed here) or the
+    /// digest directly (what digest-only callers like the rotation loop
+    /// hold — plaintext is the tenant's alone).
     fn auth_count(&self, token: &str) -> u64 {
-        self.auth_counts
-            .read()
-            .ok()
-            .and_then(|c| c.get(token).copied())
+        let counts = match self.auth_counts.read() {
+            Ok(c) => c,
+            Err(_) => return 0,
+        };
+        let digest = flint_tls::sha256_hex(token.as_bytes());
+        counts
+            .get(&digest)
+            .or_else(|| counts.get(token))
+            .copied()
             .unwrap_or(0)
     }
 
@@ -1443,9 +1456,10 @@ fn main() -> std::io::Result<()> {
                         "invalid namespace in --tenants"
                     );
                     // Static mode has no CP flags; opt-ins and quotas
-                    // default off/unlimited.
+                    // default off/unlimited. Keyed by digest like the CP
+                    // push (D1): the process never holds plaintext either.
                     Some((
-                        token.to_string(),
+                        flint_tls::sha256_hex(token.as_bytes()),
                         TenantGrant {
                             ns: ns.as_bytes().to_vec(),
                             ..TenantGrant::default()

@@ -166,6 +166,9 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
                 return err("invalid name/token/ns (space-free, <=128 chars)");
             }
             let k: usize = text(4).and_then(|v| v.parse().ok()).unwrap_or(2);
+            // ADR-0006 D1: only the DIGEST is stored/pushed; the plaintext
+            // dies with this request.
+            let token = flint_tls::sha256_hex(token.as_bytes());
             let Ok(mut st) = shared.state.lock() else {
                 return err("state lock");
             };
@@ -331,6 +334,7 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
             if !clean(&new) {
                 return err("invalid token");
             }
+            let new = flint_tls::sha256_hex(new.as_bytes());
             let Ok(mut st) = shared.state.lock() else {
                 return err("state lock");
             };
@@ -390,6 +394,7 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
             let Some(token) = text(1) else {
                 return err("CPMYUSAGE <token>");
             };
+            let token = flint_tls::sha256_hex(token.as_bytes());
             let Ok(st) = shared.state.lock() else {
                 return err("state lock");
             };
@@ -429,6 +434,7 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
             let (Some(token), Some(setting), Some(mode)) = (text(1), text(2), text(3)) else {
                 return err("CPMYCONFIG <token> <replica-reads|near-cache> <on|off>");
             };
+            let token = flint_tls::sha256_hex(token.as_bytes());
             let on = match mode.as_str() {
                 "on" => true,
                 "off" => false,

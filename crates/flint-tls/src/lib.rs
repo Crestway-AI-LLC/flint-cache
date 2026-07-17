@@ -120,6 +120,16 @@ pub fn server_only_config(cert: &str, key: &str) -> io::Result<Arc<ServerConfig>
         .map_err(|e| io::Error::other(format!("cert/key: {e}")))
 }
 
+/// SHA-256 of `data`, lowercase hex — the token-at-rest digest (ADR-0006
+/// D1). The registry stores and pushes DIGESTS; verifiers hash the
+/// presented token and compare. A stolen digest cannot authenticate (it
+/// would be hashed again), so digests are non-secret and plain equality
+/// comparison is safe.
+pub fn sha256_hex(data: &[u8]) -> String {
+    let digest = ring::digest::digest(&ring::digest::SHA256, data);
+    digest.as_ref().iter().map(|b| format!("{b:02x}")).collect()
+}
+
 /// EDGE-client TLS: verify the server against `ca`, present no client cert
 /// (edge auth is tokens, not certs), and use the dialed host as the server
 /// name — how a tenant's own redis client or the console verifies the
