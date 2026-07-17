@@ -233,6 +233,9 @@ pub struct Ha {
     /// Node-local fleet-journal file (observability, not Raft state; each
     /// HA node journals the events IT receives — emitters talk to one CP).
     pub journal_path: String,
+    /// Latest metered resident bytes per tenant name (CPTENANTUSAGE) —
+    /// node-local telemetry for CPMYUSAGE, never Rafted.
+    pub usage: std::sync::Mutex<std::collections::HashMap<String, u64>>,
 }
 
 /// Build the Raft node and start the RPC server. Returns the handle the
@@ -292,6 +295,7 @@ pub async fn start(
         members,
         client_addrs,
         journal_path,
+        usage: std::sync::Mutex::new(std::collections::HashMap::new()),
     })
 }
 
@@ -640,6 +644,42 @@ async fn handle_admin(ha: &Ha, args: &[Vec<u8>]) -> Value {
                 Ok(v) => Value::Simple(format!("OK version {v}")),
                 Err(redir) => redirect(redir),
             }
+        }
+        b"CPTENANTUSAGE" => {
+            let (Some(name), Some(bytes)) = (text(1), text(2).and_then(|v| v.parse::<u64>().ok()))
+            else {
+                return Value::Error("ERR CPTENANTUSAGE <name> <bytes>".into());
+            };
+            if let Ok(mut usage) = ha.usage.lock() {
+                usage.insert(name, bytes);
+            }
+            Value::Simple("OK".into())
+        }
+        b"CPMYUSAGE" => {
+            let Some(token) = text(1) else {
+                return Value::Error("ERR CPMYUSAGE <token>".into());
+            };
+            let reg = ha.store.registry().await;
+            let Some(t) = reg
+                .tenants
+                .values()
+                .find(|t| t.token == token || t.prev_token.as_deref() == Some(token.as_str()))
+            else {
+                return Value::Error("WRONGPASS invalid token".into());
+            };
+            let bytes = ha
+                .usage
+                .lock()
+                .ok()
+                .and_then(|u| u.get(&t.name).copied())
+                .unwrap_or(0);
+            Value::Bulk(Some(
+                format!(
+                    "{} {} {} {} {} {}\r\n",
+                    t.name, t.ns, t.ops_per_sec, t.max_bytes, t.over_quota as u8, bytes
+                )
+                .into_bytes(),
+            ))
         }
         b"CPTENANTS" => {
             let reg = ha.store.registry().await;

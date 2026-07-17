@@ -58,6 +58,10 @@ struct Shared {
     /// Fleet-journal file (append-only JSONL beside --state). Observability,
     /// not intent: outside the durability contract of the registry.
     journal_path: String,
+    /// Latest metered resident bytes per tenant NAME (CPTENANTUSAGE, set by
+    /// the agent's metering sweep each interval). In-memory ONLY — telemetry
+    /// for CPMYUSAGE/console reads, never persisted, never versioned.
+    usage: Mutex<std::collections::HashMap<String, u64>>,
 }
 
 fn ok() -> Value {
@@ -367,6 +371,49 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
             ok()
         }
         // The registered proxy fleet, comma-joined — the exporter's poll list.
+        // Agent-set usage gauge (metering sweep): latest resident bytes per
+        // tenant. Telemetry, in-memory, unversioned.
+        b"CPTENANTUSAGE" => {
+            let (Some(name), Some(bytes)) = (text(1), text(2).and_then(|v| v.parse::<u64>().ok()))
+            else {
+                return err("CPTENANTUSAGE <name> <bytes>");
+            };
+            if let Ok(mut usage) = shared.usage.lock() {
+                usage.insert(name, bytes);
+            }
+            ok()
+        }
+        // Tenant-scoped self-service view (console v1): the TOKEN is the
+        // credential — a tenant can read exactly its own row, nothing else.
+        // Reply: "name ns ops_per_sec max_bytes over_quota resident_bytes".
+        b"CPMYUSAGE" => {
+            let Some(token) = text(1) else {
+                return err("CPMYUSAGE <token>");
+            };
+            let Ok(st) = shared.state.lock() else {
+                return err("state lock");
+            };
+            let Some(t) = st
+                .tenants
+                .values()
+                .find(|t| t.token == token || t.prev_token.as_deref() == Some(token.as_str()))
+            else {
+                return Value::Error("WRONGPASS invalid token".into());
+            };
+            let bytes = shared
+                .usage
+                .lock()
+                .ok()
+                .and_then(|u| u.get(&t.name).copied())
+                .unwrap_or(0);
+            Value::Bulk(Some(
+                format!(
+                    "{} {} {} {} {} {}\r\n",
+                    t.name, t.ns, t.ops_per_sec, t.max_bytes, t.over_quota as u8, bytes
+                )
+                .into_bytes(),
+            ))
+        }
         // Tenant metering view (M5): one "name ns ops_per_sec max_bytes
         // over_quota" line per tenant — the agent's sweep input. Tokens are
         // deliberately NOT included (this surface feeds metering, not auth).
@@ -667,6 +714,7 @@ fn main() -> std::io::Result<()> {
         state: Mutex::new(state),
         changed: Condvar::new(),
         journal_path: format!("{path}.journal"),
+        usage: Mutex::new(std::collections::HashMap::new()),
     });
     let internal_tls = internal_server_config();
     let listener = TcpListener::bind(("127.0.0.1", port))?;
