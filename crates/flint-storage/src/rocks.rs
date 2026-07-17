@@ -35,6 +35,25 @@ impl RocksKv {
             .unwrap_or(0)
     }
 
+    /// Apply a set of key mutations as ONE atomic WriteBatch — one grouped
+    /// WAL append and one write-lock acquisition for the whole set (RocksDB
+    /// group commit). The async write queue (ADR-0005 D4) uses this to
+    /// collapse many connections' writes into one engine write. `None` value
+    /// = delete. Replication picks the batch up from the WAL as usual.
+    pub fn apply_writes(&self, ops: &[(Vec<u8>, Option<Vec<u8>>)]) -> Result<(), rocksdb::Error> {
+        if ops.is_empty() {
+            return Ok(());
+        }
+        let mut wb = rocksdb::WriteBatch::default();
+        for (k, v) in ops {
+            match v {
+                Some(val) => wb.put(k, val),
+                None => wb.delete(k),
+            }
+        }
+        self.db.write(wb)
+    }
+
     /// Crate-internal handle for the replication module.
     pub(crate) fn db(&self) -> &DB {
         &self.db

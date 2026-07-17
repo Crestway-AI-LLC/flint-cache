@@ -11,6 +11,7 @@
 
 mod commands;
 mod repl_hub;
+mod write_queue;
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -422,6 +423,48 @@ fn main() -> std::io::Result<()> {
         );
     }
 
+    // ADR-0005 D4: opt-in async write queue. For an opted-in namespace, a
+    // batchable string/counter write enqueues and the connection blocks on
+    // its ack (ack-after-apply); a single consumer commits each batch as one
+    // engine WriteBatch (group commit) — trading ~2-3x write latency for far
+    // fewer engine writes under a write-hot workload. rocks-only: the batch
+    // commit needs RocksKv::apply_writes.
+    #[allow(unused_variables)]
+    let write_queue: Option<Arc<write_queue::WriteQueue>> = {
+        #[cfg(feature = "rocks")]
+        {
+            match (arg("--async-writes"), rocks.clone()) {
+                (Some(spec), Some(rk)) => {
+                    let cap = arg("--async-queue-cap")
+                        .and_then(|v| v.parse::<usize>().ok())
+                        .unwrap_or(write_queue::DEFAULT_QUEUE_CAP);
+                    eprintln!("async-writes ENABLED (opt-in write queue): {spec} (cap {cap})");
+                    Some(write_queue::WriteQueue::start(
+                        write_queue::AsyncScope::parse(&spec),
+                        cap,
+                        Arc::clone(&store),
+                        rk,
+                        flint_storage::strings::system_clock,
+                        limits,
+                    ))
+                }
+                (Some(_), None) => {
+                    eprintln!("--async-writes requires --engine rocks");
+                    std::process::exit(2);
+                }
+                (None, _) => None,
+            }
+        }
+        #[cfg(not(feature = "rocks"))]
+        {
+            if arg("--async-writes").is_some() {
+                eprintln!("--async-writes requires a rocks build");
+                std::process::exit(2);
+            }
+            None
+        }
+    };
+
     // Fast-path guard for per-slot ownership: only consult ownership (an
     // extra manifest read) when at least one migration override exists.
     // Set at boot from durable records and by FLINTSLOTMOVED; false is the
@@ -482,6 +525,7 @@ fn main() -> std::io::Result<()> {
         let tailer_stop = Arc::clone(&tailer_stop);
         let lease_deadline = Arc::clone(&lease_deadline);
         let migration_active = Arc::clone(&migration_active);
+        let write_queue = write_queue.clone();
         let internal_tls = internal_tls.clone();
         std::thread::spawn(move || {
             // TLS handshake (incl. mutual client-cert verification) runs lazily
@@ -503,6 +547,7 @@ fn main() -> std::io::Result<()> {
                 &hub,
                 &migration_active,
                 limits,
+                write_queue.as_ref(),
             );
         });
     }
@@ -532,6 +577,7 @@ fn serve(
     hub: &Arc<ReplHub>,
     migration_active: &Arc<AtomicBool>,
     limits: commands::Limits,
+    write_queue: Option<&Arc<write_queue::WriteQueue>>,
 ) -> std::io::Result<()> {
     let mut buf: Vec<u8> = Vec::with_capacity(16 * 1024);
     let mut chunk = [0u8; 16 * 1024];
@@ -578,6 +624,7 @@ fn serve(
                     hub,
                     migration_active,
                     limits,
+                    write_queue,
                     &mut conn_ns,
                     &args,
                 );
@@ -639,6 +686,7 @@ fn serve(
                         hub,
                         migration_active,
                         limits,
+                        write_queue,
                         &mut conn_ns,
                         &args,
                     );
@@ -689,6 +737,7 @@ fn execute(
     hub: &Arc<ReplHub>,
     migration_active: &Arc<AtomicBool>,
     limits: commands::Limits,
+    write_queue: Option<&Arc<write_queue::WriteQueue>>,
     conn_ns: &mut Vec<u8>,
     args: &[Vec<u8>],
 ) -> Value {
@@ -750,7 +799,7 @@ fn execute(
         .first()
         .is_some_and(|n| n.eq_ignore_ascii_case(b"FLINTINFO"))
     {
-        return flintinfo(ro, rocks, hub);
+        return flintinfo(ro, rocks, hub, write_queue.map(|q| q.depth()));
     }
     if args
         .first()
@@ -873,6 +922,22 @@ fn execute(
             }
             _ => {}
         }
+    }
+    // ADR-0005 D4: for an opted-in namespace, route a batchable string/counter
+    // write through the async queue — the connection blocks on the consumer's
+    // ack-after-apply (one group-committed engine WriteBatch per drained
+    // batch). Placed AFTER the quorum/lag gates (a queued write is still shed
+    // by them) and the slot gate; reads, non-batchable writes, and
+    // non-opted-in namespaces fall through to inline dispatch below. Reached
+    // only on the master (is_write && !ro).
+    if is_write
+        && let Some(q) = write_queue
+        && q.wants(conn_ns)
+        && args
+            .first()
+            .is_some_and(|name| write_queue::is_batchable(name))
+    {
+        return q.submit(conn_ns.clone(), args.to_vec());
     }
     // On a replica, wrap the store so lazy-expiry deletes buried in read
     // paths become no-ops: a replica must not write to its own store (that
@@ -1036,7 +1101,12 @@ fn flintdemote(
 }
 
 #[cfg(feature = "rocks")]
-fn flintinfo(read_only: bool, rocks: &Option<RocksHandle>, hub: &Arc<ReplHub>) -> Value {
+fn flintinfo(
+    read_only: bool,
+    rocks: &Option<RocksHandle>,
+    hub: &Arc<ReplHub>,
+    async_queue_depth: Option<usize>,
+) -> Value {
     let now = flint_storage::strings::system_clock();
     let latest = rocks.as_ref().map(|kv| kv.latest_seq()).unwrap_or(0);
     let last_applied = rocks.as_ref().map(|kv| kv.last_applied()).unwrap_or(0);
@@ -1055,7 +1125,7 @@ fn flintinfo(read_only: bool, rocks: &Option<RocksHandle>, hub: &Arc<ReplHub>) -
         None => "none".into(),
     };
     let info = format!(
-        "role:{}\r\nrole_epoch:{role_epoch}\r\nbuild:{build}\r\nsst_bytes:{sst}\r\nlatest_seq:{latest}\r\nlast_applied:{last_applied}\r\nacked_seq:{}\r\nseq_lag:{seq_lag}\r\nlive_replicas:{}\r\nlag_ms:{}\r\nlag_soft_ms:{soft}\r\nlag_hard_ms:{hard}\r\nmin_replicas_to_write:{minr}\r\nfullsync_active:{fsa}\r\nfullsync_max:{fsm}\r\n",
+        "role:{}\r\nrole_epoch:{role_epoch}\r\nbuild:{build}\r\nsst_bytes:{sst}\r\nlatest_seq:{latest}\r\nlast_applied:{last_applied}\r\nacked_seq:{}\r\nseq_lag:{seq_lag}\r\nlive_replicas:{}\r\nlag_ms:{}\r\nlag_soft_ms:{soft}\r\nlag_hard_ms:{hard}\r\nmin_replicas_to_write:{minr}\r\nfullsync_active:{fsa}\r\nfullsync_max:{fsm}\r\nasync_write_queue:{aqd}\r\n",
         if read_only { "replica" } else { "master" },
         hub.effective_acked(now)
             .map_or_else(|| "none".into(), |a| a.to_string()),
@@ -1069,12 +1139,18 @@ fn flintinfo(read_only: bool, rocks: &Option<RocksHandle>, hub: &Arc<ReplHub>) -
         sst = rocks.as_ref().map(|kv| kv.sst_bytes()).unwrap_or(0),
         fsa = FULLSYNC_ACTIVE.load(Ordering::Relaxed),
         fsm = MAX_FULLSYNC.load(Ordering::Relaxed),
+        aqd = async_queue_depth.map_or_else(|| "off".into(), |d| d.to_string()),
     );
     Value::Bulk(Some(info.into_bytes()))
 }
 
 #[cfg(not(feature = "rocks"))]
-fn flintinfo(read_only: bool, _rocks: &Option<RocksHandle>, hub: &Arc<ReplHub>) -> Value {
+fn flintinfo(
+    read_only: bool,
+    _rocks: &Option<RocksHandle>,
+    hub: &Arc<ReplHub>,
+    _async_queue_depth: Option<usize>,
+) -> Value {
     let now = flint_storage::strings::system_clock();
     let info = format!(
         "role:{}\r\nlive_replica:{}\r\n",
