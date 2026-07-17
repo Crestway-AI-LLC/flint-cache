@@ -1410,44 +1410,6 @@ fn frame_to_args(frame: Value) -> Option<Vec<Vec<u8>>> {
     Some(args)
 }
 
-/// Build the server-side TLS config for client-facing termination
-/// (mTLS block, increment 1 — the externally-visible hop). Clients speak
-/// TLS to the proxy; the proxy terminates it and the existing RESP path
-/// runs over the encrypted stream. Backend/control-plane hops stay
-/// plaintext here — internal mTLS is the next increment.
-///
-/// `ring` is the crypto provider (pure-Rust build, no C toolchain), pinned
-/// explicitly rather than via the process-default so a stray
-/// `install_default` elsewhere can never change what this listener uses.
-/// No client-auth yet: this increment is server-authenticated TLS
-/// (confidentiality + server identity); requiring client certs is the
-/// mutual half, layered on once internal hops carry certs too.
-fn load_tls_config(cert_path: &str, key_path: &str) -> Arc<rustls::ServerConfig> {
-    use std::io::BufReader;
-    let cert_file = std::fs::File::open(cert_path)
-        .unwrap_or_else(|e| panic!("open --tls-cert {cert_path}: {e}"));
-    let certs: Vec<_> = rustls_pemfile::certs(&mut BufReader::new(cert_file))
-        .collect::<Result<_, _>>()
-        .expect("parse certificate chain from --tls-cert");
-    assert!(
-        !certs.is_empty(),
-        "--tls-cert {cert_path} has no certificates"
-    );
-    let key_file =
-        std::fs::File::open(key_path).unwrap_or_else(|e| panic!("open --tls-key {key_path}: {e}"));
-    let key = rustls_pemfile::private_key(&mut BufReader::new(key_file))
-        .expect("read private key from --tls-key")
-        .unwrap_or_else(|| panic!("no private key found in --tls-key {key_path}"));
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let config = rustls::ServerConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
-        .expect("TLS protocol versions")
-        .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .expect("build TLS server config (cert/key mismatch?)");
-    Arc::new(config)
-}
-
 fn main() -> std::io::Result<()> {
     let port: u16 = arg("--port").and_then(|p| p.parse().ok()).unwrap_or(7379);
     let control_plane = arg("--control-plane");
@@ -1456,7 +1418,9 @@ fn main() -> std::io::Result<()> {
     // keeps the plaintext listener (byte-identical to pre-TLS). One without
     // the other is a config error, not a silent downgrade.
     let tls: Option<Arc<rustls::ServerConfig>> = match (arg("--tls-cert"), arg("--tls-key")) {
-        (Some(cert), Some(key)) => Some(load_tls_config(&cert, &key)),
+        (Some(cert), Some(key)) => {
+            Some(flint_tls::server_only_config(&cert, &key).expect("client-facing TLS config"))
+        }
         (None, None) => None,
         _ => panic!("--tls-cert and --tls-key must be provided together"),
     };

@@ -52,6 +52,10 @@ struct Inventory {
     /// Proxy admin token (`--admin-token` on every proxy; presented before
     /// PROXY* operator commands). None = ungated dev fleet.
     admin_token: Option<String>,
+    /// Client-facing TLS at the proxy (ADR-0006 D2 packaging default):
+    /// bootstrap mints an EDGE cert (IP/localhost SANs, same CA) and passes
+    /// --tls-cert/--tls-key; tenants verify with the cluster CA.
+    client_tls: bool,
 }
 
 fn parse_inventory(path: &str) -> Inventory {
@@ -79,6 +83,7 @@ fn parse_inventory(path: &str) -> Inventory {
             "agent" => inv.agent = Some(val.to_string()),
             "capacity" => inv.capacity_bytes = val.parse().ok(),
             "admin-token" => inv.admin_token = Some(val.to_string()),
+            "client-tls" => inv.client_tls = val == "on",
             other => panic!("inventory: unknown key {other:?}"),
         }
     }
@@ -319,7 +324,30 @@ fn mint_certs(inv: &Inventory) {
          openssl x509 -req -in {d}/int.csr -CA {d}/ca.crt -CAkey {d}/ca.key -CAcreateserial \
          -out {d}/int.crt -days 365 -extfile {d}/ext.cnf 2>/dev/null"
     ));
-    eprintln!("  minted internal CA + component cert");
+    // Edge cert (client-facing TLS, ADR-0006 D2): server-auth only, with
+    // the SANs edge clients actually dial (the mesh cert's DNS:flint-internal
+    // would fail browser/redis-client verification against 127.0.0.1).
+    sh(&format!(
+        "openssl req -newkey rsa:2048 -nodes -keyout {d}/edge.key -out {d}/edge.csr \
+         -subj /CN=flint-edge 2>/dev/null"
+    ));
+    sh(&format!(
+        "printf 'subjectAltName=IP:127.0.0.1,DNS:localhost\nextendedKeyUsage=serverAuth\nbasicConstraints=CA:FALSE' > {d}/edge-ext.cnf && \
+         openssl x509 -req -in {d}/edge.csr -CA {d}/ca.crt -CAkey {d}/ca.key -CAcreateserial \
+         -out {d}/edge.crt -days 365 -extfile {d}/edge-ext.cnf 2>/dev/null"
+    ));
+    eprintln!("  minted internal CA + component cert + edge cert");
+}
+
+/// Proxy liveness that respects the front door: plaintext fleets answer
+/// PROXYSTATS; a client-TLS fleet is probed at the TCP layer (flintctl is
+/// not an edge client — real encrypted traffic is verified by the drills).
+fn proxy_up(inv: &Inventory, proxy: &str) -> bool {
+    if inv.client_tls {
+        std::net::TcpStream::connect(proxy).is_ok()
+    } else {
+        matches!(call(proxy, &None, &["PROXYSTATS"]), Ok(Value::Bulk(_)))
+    }
 }
 
 fn start_pair_nodes(inv: &Inventory, pair: &[String]) {
@@ -449,6 +477,15 @@ fn bootstrap(inv: &Inventory) {
             proxy.clone(),
         ];
         args.extend(internal_args(inv));
+        if inv.client_tls {
+            // ADR-0006 D2: the packaged default is an encrypted front door.
+            args.extend([
+                "--tls-cert".to_string(),
+                format!("{}/certs/edge.crt", inv.statedir),
+                "--tls-key".to_string(),
+                format!("{}/certs/edge.key", inv.statedir),
+            ]);
+        }
         spawn(
             inv,
             &format!("proxy-{}", port_of(proxy)),
@@ -463,7 +500,7 @@ fn bootstrap(inv: &Inventory) {
         // the client port is not part of the internal mesh.
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
-            if matches!(call(proxy, &None, &["PROXYSTATS"]), Ok(Value::Bulk(_))) {
+            if proxy_up(inv, proxy) {
                 break;
             }
             assert!(
@@ -525,7 +562,7 @@ fn status(inv: &Inventory) {
     for proxy in &inv.proxies {
         // The proxy's client port is plaintext (frontend TLS is separate
         // from the internal mesh): probe it without the mesh cert.
-        let up = matches!(call(proxy, &None, &["PROXYSTATS"]), Ok(Value::Bulk(_)));
+        let up = proxy_up(inv, proxy);
         println!("proxy     {proxy}  {}", if up { "up" } else { "DOWN" });
     }
     if let Some(agent) = &inv.agent {

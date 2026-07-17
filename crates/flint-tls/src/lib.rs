@@ -103,6 +103,55 @@ pub fn server_config(ca: &str, cert: &str, key: &str) -> io::Result<Arc<ServerCo
 /// Client config for an internal dialer: presents `cert`/`key` (the mutual
 /// half — the server verifies it) and verifies the server's cert chains to
 /// `ca`.
+/// Server-authenticated-only TLS (NO client certs) — the EDGE surface:
+/// the proxy's client-facing listener and the portals' HTTPS. Distinct from
+/// `server_config` (the mutual-TLS internal mesh) on purpose: edge clients
+/// are browsers and redis clients that authenticate with tokens, not certs.
+pub fn server_only_config(cert: &str, key: &str) -> io::Result<Arc<ServerConfig>> {
+    let certs = load_certs(cert)?;
+    let key = load_key(key)?;
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| io::Error::other(format!("tls versions: {e}")))?
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map(Arc::new)
+        .map_err(|e| io::Error::other(format!("cert/key: {e}")))
+}
+
+/// EDGE-client TLS: verify the server against `ca`, present no client cert
+/// (edge auth is tokens, not certs), and use the dialed host as the server
+/// name — how a tenant's own redis client or the console verifies the
+/// proxy's edge cert (IP/localhost SANs).
+pub fn edge_client_config(ca: &str) -> io::Result<Arc<ClientConfig>> {
+    let cfg = ClientConfig::builder_with_provider(provider())
+        .with_safe_default_protocol_versions()
+        .map_err(|e| io::Error::other(format!("tls versions: {e}")))?
+        .with_root_certificates(root_store(ca)?)
+        .with_no_client_auth();
+    Ok(Arc::new(cfg))
+}
+
+/// Connect to an EDGE TLS listener: server name = the host part of `addr`
+/// (matching the edge cert's IP/DNS SANs), unlike the mesh's fixed SNI.
+pub fn connect_edge(addr: &str, cfg: &Option<Arc<ClientConfig>>) -> io::Result<Stream> {
+    let tcp = TcpStream::connect(addr)?;
+    match cfg {
+        None => Ok(Stream::Plain(tcp)),
+        Some(cfg) => {
+            let host = addr.split(':').next().unwrap_or(addr).to_string();
+            let name = ServerName::try_from(host)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("sni: {e}")))?;
+            let conn = ClientConnection::new(cfg.clone(), name)
+                .map_err(|e| io::Error::other(format!("tls connect: {e}")))?;
+            Ok(Stream::ClientTls(Box::new(rustls::StreamOwned::new(
+                conn, tcp,
+            ))))
+        }
+    }
+}
+
 pub fn client_config(ca: &str, cert: &str, key: &str) -> io::Result<Arc<ClientConfig>> {
     let cfg = ClientConfig::builder_with_provider(provider())
         .with_safe_default_protocol_versions()
