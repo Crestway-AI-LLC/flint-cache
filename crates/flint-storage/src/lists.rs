@@ -10,6 +10,15 @@ use crate::encoding::{
 };
 use crate::strings::{Clock, StoreError};
 
+/// LSET's three-way result: the command answers "ERR no such key" and
+/// "ERR index out of range" differently, so the store must say which.
+#[derive(Debug, PartialEq, Eq)]
+pub enum LsetOutcome {
+    NoKey,
+    OutOfRange,
+    Set,
+}
+
 pub struct ListStore<'a> {
     kv: &'a dyn Kv,
     ns: Vec<u8>,
@@ -155,6 +164,114 @@ impl<'a> ListStore<'a> {
             .get(&self.elem_key(slot, key, meta.base.version, meta.head + rank)))
     }
 
+    /// LSET: overwrite the element at `rank`. The caller must distinguish a
+    /// missing key from a bad index (different Redis errors), hence the enum.
+    pub fn lset(
+        &self,
+        slot: u16,
+        key: &[u8],
+        rank: i64,
+        value: &[u8],
+    ) -> Result<LsetOutcome, StoreError> {
+        let Some(mut meta) = self.read_meta(slot, key)? else {
+            return Ok(LsetOutcome::NoKey);
+        };
+        let len = meta.tail - meta.head;
+        let rank = if rank < 0 { len + rank } else { rank };
+        if rank < 0 || rank >= len {
+            return Ok(LsetOutcome::OutOfRange);
+        }
+        let ek = self.elem_key(slot, key, meta.base.version, meta.head + rank);
+        let old = self.kv.get(&ek).map_or(0, |v| v.len() as u64);
+        let bytes = meta.base.bytes.saturating_sub(old) + value.len() as u64;
+        if bytes > self.max_value_bytes {
+            return Err(StoreError::ValueTooLarge);
+        }
+        meta.base.bytes = bytes;
+        self.kv.put(&ek, value);
+        self.write_meta(slot, key, &meta);
+        Ok(LsetOutcome::Set)
+    }
+
+    /// LTRIM: keep `[start, stop]` (Redis inclusive/negative semantics). The
+    /// kept run stays where it is and head/tail move inward — trimming is
+    /// end-based by construction, so no renumbering. An empty keep-range
+    /// deletes the key (write_meta's head==tail rule).
+    pub fn ltrim(&self, slot: u16, key: &[u8], start: i64, stop: i64) -> Result<(), StoreError> {
+        let Some(mut meta) = self.read_meta(slot, key)? else {
+            return Ok(());
+        };
+        let len = meta.tail - meta.head;
+        let norm = |i: i64| if i < 0 { len + i } else { i };
+        let from = norm(start).max(0);
+        let to = norm(stop).min(len - 1);
+        let (new_head, new_tail) = if from > to {
+            (meta.head, meta.head)
+        } else {
+            (meta.head + from, meta.head + to + 1)
+        };
+        for idx in (meta.head..new_head).chain(new_tail..meta.tail) {
+            let ek = self.elem_key(slot, key, meta.base.version, idx);
+            if let Some(v) = self.kv.get(&ek) {
+                meta.base.bytes = meta.base.bytes.saturating_sub(v.len() as u64);
+            }
+            self.kv.delete(&ek);
+        }
+        meta.head = new_head;
+        meta.tail = new_tail;
+        self.write_meta(slot, key, &meta);
+        Ok(())
+    }
+
+    /// LPOS: head-based indices of elements equal to `element`, in scan
+    /// order. `rank` (caller guarantees non-zero) picks the direction and the
+    /// starting match: positive scans head→tail skipping `rank-1` matches,
+    /// negative scans tail→head. `count` caps the hits (0 = unlimited);
+    /// `maxlen` caps the comparisons (0 = unlimited).
+    pub fn lpos(
+        &self,
+        slot: u16,
+        key: &[u8],
+        element: &[u8],
+        rank: i64,
+        count: u64,
+        maxlen: u64,
+    ) -> Result<Vec<i64>, StoreError> {
+        let Some(meta) = self.read_meta(slot, key)? else {
+            return Ok(Vec::new());
+        };
+        let len = meta.tail - meta.head;
+        let ranks: Box<dyn Iterator<Item = i64>> = if rank > 0 {
+            Box::new(0..len)
+        } else {
+            Box::new((0..len).rev())
+        };
+        // `maxlen` caps how many elements get COMPARED, not how many match.
+        let ranks: Box<dyn Iterator<Item = i64>> = if maxlen != 0 {
+            Box::new(ranks.take(maxlen as usize))
+        } else {
+            ranks
+        };
+        let mut skip = rank.unsigned_abs().saturating_sub(1);
+        let mut out = Vec::new();
+        for r in ranks {
+            let v = self
+                .kv
+                .get(&self.elem_key(slot, key, meta.base.version, meta.head + r));
+            if v.as_deref() == Some(element) {
+                if skip > 0 {
+                    skip -= 1;
+                    continue;
+                }
+                out.push(r);
+                if count != 0 && out.len() as u64 >= count {
+                    break;
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// LRANGE with Redis index semantics (inclusive, negatives from end).
     pub fn lrange(
         &self,
@@ -228,6 +345,60 @@ mod tests {
         assert_eq!(l.lrange(1, b"l", 0, 99), Ok(vs(&[b"a", b"b", b"c", b"d"])));
         assert_eq!(l.lrange(1, b"l", 3, 1), Ok(vec![]));
         assert_eq!(l.lrange(1, b"l", -99, 0), Ok(vs(&[b"a"])));
+    }
+
+    #[test]
+    fn lset_overwrites_and_distinguishes_errors() {
+        let kv = MemKv::new();
+        let l = ListStore::new(&kv, b"t", now);
+        assert_eq!(l.lset(1, b"nope", 0, b"x"), Ok(LsetOutcome::NoKey));
+        l.push(1, b"l", &vs(&[b"a", b"b", b"c"]), false)
+            .expect("push");
+        assert_eq!(l.lset(1, b"l", 1, b"B"), Ok(LsetOutcome::Set));
+        assert_eq!(l.lset(1, b"l", -1, b"C"), Ok(LsetOutcome::Set));
+        assert_eq!(l.lset(1, b"l", 3, b"x"), Ok(LsetOutcome::OutOfRange));
+        assert_eq!(l.lset(1, b"l", -4, b"x"), Ok(LsetOutcome::OutOfRange));
+        assert_eq!(l.lrange(1, b"l", 0, -1), Ok(vs(&[b"a", b"B", b"C"])));
+    }
+
+    #[test]
+    fn ltrim_keeps_range_and_deletes_empty() {
+        let kv = MemKv::new();
+        let l = ListStore::new(&kv, b"t", now);
+        l.push(1, b"l", &vs(&[b"a", b"b", b"c", b"d", b"e"]), false)
+            .expect("push");
+        l.ltrim(1, b"l", 1, -2).expect("trim");
+        assert_eq!(l.lrange(1, b"l", 0, -1), Ok(vs(&[b"b", b"c", b"d"])));
+        // Pushing after a trim keeps working (head/tail moved, no renumber).
+        l.push(1, b"l", &vs(&[b"z"]), true).expect("push");
+        assert_eq!(l.lrange(1, b"l", 0, -1), Ok(vs(&[b"z", b"b", b"c", b"d"])));
+        // Empty keep-range deletes the key entirely.
+        l.ltrim(1, b"l", 5, 1).expect("trim");
+        assert_eq!(l.llen(1, b"l"), Ok(0));
+        // Missing key is a no-op OK.
+        assert_eq!(l.ltrim(1, b"nope", 0, -1), Ok(()));
+    }
+
+    #[test]
+    fn lpos_rank_count_maxlen() {
+        let kv = MemKv::new();
+        let l = ListStore::new(&kv, b"t", now);
+        // a b c a b c a  → "a" at 0, 3, 6
+        l.push(
+            1,
+            b"l",
+            &vs(&[b"a", b"b", b"c", b"a", b"b", b"c", b"a"]),
+            false,
+        )
+        .expect("push");
+        assert_eq!(l.lpos(1, b"l", b"a", 1, 1, 0), Ok(vec![0]));
+        assert_eq!(l.lpos(1, b"l", b"a", 2, 1, 0), Ok(vec![3]));
+        assert_eq!(l.lpos(1, b"l", b"a", 1, 0, 0), Ok(vec![0, 3, 6]));
+        assert_eq!(l.lpos(1, b"l", b"a", -1, 2, 0), Ok(vec![6, 3]));
+        // MAXLEN caps comparisons: only the first 2 elements are inspected.
+        assert_eq!(l.lpos(1, b"l", b"a", 1, 0, 2), Ok(vec![0]));
+        assert_eq!(l.lpos(1, b"l", b"missing", 1, 1, 0), Ok(vec![]));
+        assert_eq!(l.lpos(1, b"nope", b"a", 1, 1, 0), Ok(vec![]));
     }
 
     #[test]

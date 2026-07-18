@@ -511,6 +511,93 @@ fn corpus() -> Vec<Case> {
             ],
         },
         Case {
+            family: "lists",
+            name: "lset overwrite and range errors",
+            steps: vec![
+                s(&[b"RPUSH", b"l4", b"a", b"b", b"c"], Expect::Int(3)),
+                s(&[b"LSET", b"l4", b"1", b"B"], Expect::Ok),
+                s(&[b"LSET", b"l4", b"-1", b"C"], Expect::Ok),
+                s(
+                    &[b"LRANGE", b"l4", b"0", b"-1"],
+                    Expect::Arr(vec![
+                        Expect::Str(b"a"),
+                        Expect::Str(b"B"),
+                        Expect::Str(b"C"),
+                    ]),
+                ),
+                s(&[b"LSET", b"l4", b"3", b"x"], Expect::AnyError),
+                s(&[b"LSET", b"l4", b"-4", b"x"], Expect::AnyError),
+                s(&[b"LSET", b"nosuch", b"0", b"x"], Expect::AnyError),
+            ],
+        },
+        Case {
+            family: "lists",
+            name: "ltrim keep window and empty deletes",
+            steps: vec![
+                s(
+                    &[b"RPUSH", b"l5", b"a", b"b", b"c", b"d", b"e"],
+                    Expect::Int(5),
+                ),
+                s(&[b"LTRIM", b"l5", b"1", b"-2"], Expect::Ok),
+                s(
+                    &[b"LRANGE", b"l5", b"0", b"-1"],
+                    Expect::Arr(vec![
+                        Expect::Str(b"b"),
+                        Expect::Str(b"c"),
+                        Expect::Str(b"d"),
+                    ]),
+                ),
+                // Pushes after a trim behave normally.
+                s(&[b"LPUSH", b"l5", b"z"], Expect::Int(4)),
+                s(
+                    &[b"LRANGE", b"l5", b"0", b"-1"],
+                    Expect::Arr(vec![
+                        Expect::Str(b"z"),
+                        Expect::Str(b"b"),
+                        Expect::Str(b"c"),
+                        Expect::Str(b"d"),
+                    ]),
+                ),
+                // Inverted keep-range empties (and thus deletes) the key.
+                s(&[b"LTRIM", b"l5", b"5", b"1"], Expect::Ok),
+                s(&[b"EXISTS", b"l5"], Expect::Int(0)),
+                // Missing key is still +OK.
+                s(&[b"LTRIM", b"nosuch", b"0", b"-1"], Expect::Ok),
+            ],
+        },
+        Case {
+            family: "lists",
+            name: "lpos rank count maxlen",
+            steps: vec![
+                s(
+                    &[b"RPUSH", b"l6", b"a", b"b", b"c", b"a", b"b", b"c", b"a"],
+                    Expect::Int(7),
+                ),
+                s(&[b"LPOS", b"l6", b"a"], Expect::Int(0)),
+                s(&[b"LPOS", b"l6", b"a", b"RANK", b"2"], Expect::Int(3)),
+                s(&[b"LPOS", b"l6", b"a", b"RANK", b"-1"], Expect::Int(6)),
+                s(&[b"LPOS", b"l6", b"missing"], Expect::Nil),
+                s(
+                    &[b"LPOS", b"l6", b"a", b"COUNT", b"0"],
+                    Expect::Arr(vec![Expect::Int(0), Expect::Int(3), Expect::Int(6)]),
+                ),
+                s(
+                    &[b"LPOS", b"l6", b"a", b"RANK", b"-1", b"COUNT", b"2"],
+                    Expect::Arr(vec![Expect::Int(6), Expect::Int(3)]),
+                ),
+                s(
+                    &[b"LPOS", b"l6", b"a", b"COUNT", b"0", b"MAXLEN", b"2"],
+                    Expect::Arr(vec![Expect::Int(0)]),
+                ),
+                s(
+                    &[b"LPOS", b"l6", b"missing", b"COUNT", b"0"],
+                    Expect::Arr(vec![]),
+                ),
+                s(&[b"LPOS", b"l6", b"a", b"RANK", b"0"], Expect::AnyError),
+                s(&[b"LPOS", b"l6", b"a", b"COUNT", b"-1"], Expect::AnyError),
+            ],
+        },
+        Case {
             family: "zsets",
             name: "zadd zscore zrange ordering",
             steps: vec![

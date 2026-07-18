@@ -11,7 +11,7 @@ use flint_slot::slot_for_key;
 use flint_storage::Kv;
 use flint_storage::hashes::HashStore;
 use flint_storage::keyspace::{Keyspace, Ttl};
-use flint_storage::lists::ListStore;
+use flint_storage::lists::{ListStore, LsetOutcome};
 use flint_storage::sets::SetStore;
 use flint_storage::strings::{Clock, SetExpiry, SetOptions, SetOutcome, StoreError, StringStore};
 use flint_storage::zsets::{ScoreBound, ZSetStore};
@@ -463,6 +463,25 @@ impl<'a> Dispatcher<'a> {
                     _ => err("ERR value is not an integer or out of range"),
                 }
             }),
+            b"LSET" => exact(args, 4, "lset", |a| match parse_i64(&a[2]) {
+                Ok(rank) => match self.lists.lset(slot_for_key(&a[1]), &a[1], rank, &a[3]) {
+                    Ok(LsetOutcome::Set) => Value::Simple("OK".into()),
+                    Ok(LsetOutcome::NoKey) => err("ERR no such key"),
+                    Ok(LsetOutcome::OutOfRange) => err("ERR index out of range"),
+                    Err(e) => store_err(e),
+                },
+                Err(_) => err("ERR value is not an integer or out of range"),
+            }),
+            b"LTRIM" => exact(args, 4, "ltrim", |a| {
+                match (parse_i64(&a[2]), parse_i64(&a[3])) {
+                    (Ok(start), Ok(stop)) => reply(
+                        self.lists.ltrim(slot_for_key(&a[1]), &a[1], start, stop),
+                        |()| Value::Simple("OK".into()),
+                    ),
+                    _ => err("ERR value is not an integer or out of range"),
+                }
+            }),
+            b"LPOS" => self.cmd_lpos(args),
 
             // zsets
             b"ZADD" => self.cmd_zadd(args),
@@ -880,6 +899,68 @@ impl<'a> Dispatcher<'a> {
                 _ => err("ERR value is not an integer or out of range"),
             }
         })
+    }
+
+    /// LPOS key element [RANK rank] [COUNT num] [MAXLEN len]. Without COUNT
+    /// the reply is a single index (or nil); with COUNT it is an array —
+    /// COUNT 0 means every match.
+    fn cmd_lpos(&self, args: &[Vec<u8>]) -> Value {
+        if args.len() < 3 {
+            return arity_err("lpos");
+        }
+        let mut rank: i64 = 1;
+        let mut count: Option<u64> = None;
+        let mut maxlen: u64 = 0;
+        let mut i = 3;
+        while i < args.len() {
+            let Some(val) = args.get(i + 1) else {
+                return err("ERR syntax error");
+            };
+            match args[i].to_ascii_uppercase().as_slice() {
+                b"RANK" => match parse_i64(val) {
+                    Ok(0) => {
+                        return err(
+                            "ERR RANK can't be zero, use 1 to start searching from the first \
+                             matching element in the head of the list or -1 for the tail",
+                        );
+                    }
+                    Ok(r) => rank = r,
+                    Err(_) => return err("ERR value is not an integer or out of range"),
+                },
+                b"COUNT" => match parse_i64(val) {
+                    Ok(c) if c >= 0 => count = Some(c as u64),
+                    _ => return err("ERR COUNT can't be negative"),
+                },
+                b"MAXLEN" => match parse_i64(val) {
+                    Ok(m) if m >= 0 => maxlen = m as u64,
+                    _ => return err("ERR MAXLEN can't be negative"),
+                },
+                _ => return err("ERR syntax error"),
+            }
+            i += 2;
+        }
+        // No COUNT still needs just one hit; COUNT 0 lifts the cap.
+        let cap = count.map_or(1, |c| c);
+        match self.lists.lpos(
+            slot_for_key(&args[1]),
+            &args[1],
+            &args[2],
+            rank,
+            cap,
+            maxlen,
+        ) {
+            Ok(hits) => {
+                if count.is_none() {
+                    match hits.first() {
+                        Some(&idx) => Value::Integer(idx),
+                        None => Value::Bulk(None),
+                    }
+                } else {
+                    Value::Array(Some(hits.into_iter().map(Value::Integer).collect()))
+                }
+            }
+            Err(e) => store_err(e),
+        }
     }
 
     fn cmd_expire(&self, args: &[Vec<u8>], name: &str, unit_ms: u64) -> Value {
