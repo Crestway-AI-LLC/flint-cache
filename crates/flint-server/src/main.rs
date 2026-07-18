@@ -38,11 +38,12 @@ fn arg(name: &str) -> Option<String> {
 }
 
 /// Internal-mesh mutual-TLS client config (the --internal-* triple in the
-/// client role), set once at startup. Every node→node dial — replication
-/// tail, full-sync download, migrate-in, cutover orchestration — goes
-/// through [`internal_connect`], so the whole data plane speaks mutual TLS
-/// when configured and plaintext when not, with one dial path.
-static INTERNAL_CLIENT: std::sync::OnceLock<Option<Arc<flint_tls::ClientConfig>>> =
+/// client role), set once at startup as a HOT-RELOADING handle (ADR-0006
+/// D4 follow-on): every node→node dial — replication tail, full-sync
+/// download, migrate-in, cutover orchestration — goes through
+/// [`internal_connect`], which snapshots the current leaf per dial, so the
+/// whole data plane picks up a rotated cert with no restart.
+static INTERNAL_CLIENT: std::sync::OnceLock<Option<Arc<flint_tls::ReloadableClientConfig>>> =
     std::sync::OnceLock::new();
 
 /// Full-sync admission control: a checkpoint full sync creates a consistent
@@ -114,7 +115,7 @@ fn build_version() -> String {
 // the mem-only build still parses --internal-* for its listener.
 #[cfg_attr(not(feature = "rocks"), allow(dead_code))]
 fn internal_connect(addr: &str) -> std::io::Result<flint_tls::Stream> {
-    flint_tls::connect(addr, INTERNAL_CLIENT.get().unwrap_or(&None))
+    flint_tls::connect_reloadable(addr, INTERNAL_CLIENT.get().unwrap_or(&None))
 }
 
 /// Fleet-journal target (--journal <cp-addr>) and this node's own address,
@@ -134,7 +135,11 @@ fn journal_event(kind: flint_journal::EventKind, epoch: Option<String>, cause: &
     let me = SELF_ADDR.get().cloned().unwrap_or_default();
     flint_journal::emit_detached(
         target,
-        INTERNAL_CLIENT.get().cloned().unwrap_or(None),
+        INTERNAL_CLIENT
+            .get()
+            .cloned()
+            .unwrap_or(None)
+            .map(|r| r.current()),
         flint_journal::Event {
             at_ms: flint_journal::now_ms(),
             actor: format!("node:{me}"),
@@ -170,11 +175,10 @@ fn main() -> std::io::Result<()> {
     // chaining to the CA), client config on every node→node dial (replication
     // tail, full sync, migrate, cutover). Parsed before anything dials out:
     // a fresh replica's checkpoint download happens during startup, below.
-    // The data port's mesh TLS config HOT-RELOADS its leaf on disk change
-    // (ADR-0006 D4): `flintctl rotate-certs` re-signs the leaf and this
-    // listener picks it up within a poll — no restart. (The client config
-    // dialed on node->node hops is still built once; leaf rotation on the
-    // dial side is the same helper, a follow-on.)
+    // BOTH roles hot-reload their leaf on disk change (ADR-0006 D4 + its
+    // follow-on): `flintctl rotate-certs` re-signs the leaf; the listener
+    // picks it up within a poll and every node->node dial snapshots the
+    // current leaf at dial time — no restarts anywhere.
     let internal_reload: Option<Arc<flint_tls::ReloadableServerConfig>> = match (
         arg("--internal-ca"),
         arg("--internal-cert"),
@@ -183,7 +187,7 @@ fn main() -> std::io::Result<()> {
         (Some(ca), Some(cert), Some(key)) => {
             let _ = CERT_PATH.set(Some(cert.clone()));
             let _ = INTERNAL_CLIENT.set(Some(
-                flint_tls::client_config(&ca, &cert, &key)
+                flint_tls::ReloadableClientConfig::watch(&ca, &cert, &key)
                     .expect("build internal TLS client config"),
             ));
             Some(

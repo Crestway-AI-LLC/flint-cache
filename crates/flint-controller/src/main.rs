@@ -128,11 +128,12 @@ fn arg_or<T: std::str::FromStr>(name: &str, default: T) -> T {
 /// startup; every controller→node dial goes through internal_connect, so the
 /// control loop speaks mutual TLS to an mTLS data plane and plaintext
 /// otherwise — one dial path.
-static INTERNAL_CLIENT: std::sync::OnceLock<Option<std::sync::Arc<flint_tls::ClientConfig>>> =
-    std::sync::OnceLock::new();
+static INTERNAL_CLIENT: std::sync::OnceLock<
+    Option<std::sync::Arc<flint_tls::ReloadableClientConfig>>,
+> = std::sync::OnceLock::new();
 
 fn internal_connect(addr: &str) -> std::io::Result<flint_tls::Stream> {
-    flint_tls::connect(addr, INTERNAL_CLIENT.get().unwrap_or(&None))
+    flint_tls::connect_reloadable(addr, INTERNAL_CLIENT.get().unwrap_or(&None))
 }
 
 /// Fleet-journal target (--journal <cp-addr>). Best-effort, detached: the
@@ -151,7 +152,11 @@ fn journal_event(
     };
     flint_journal::emit_detached(
         target,
-        INTERNAL_CLIENT.get().cloned().unwrap_or(None),
+        INTERNAL_CLIENT
+            .get()
+            .cloned()
+            .unwrap_or(None)
+            .map(|r| r.current()),
         flint_journal::Event {
             at_ms: flint_journal::now_ms(),
             actor: format!("controller:{actor}"),
@@ -677,7 +682,7 @@ fn main() {
     ) {
         (Some(ca), Some(cert), Some(key)) => {
             let _ = INTERNAL_CLIENT.set(Some(
-                flint_tls::client_config(&ca, &cert, &key)
+                flint_tls::ReloadableClientConfig::watch(&ca, &cert, &key)
                     .expect("build internal TLS client config"),
             ));
         }

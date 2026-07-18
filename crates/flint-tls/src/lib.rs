@@ -291,59 +291,111 @@ pub fn connect(addr: &str, cfg: &Option<Arc<ClientConfig>>) -> io::Result<Stream
     }
 }
 
-/// A mesh server TLS config that HOT-RELOADS its leaf cert/key from disk
-/// (ADR-0006 D4). A background thread polls the files' mtimes; on change it
-/// rebuilds the rustls `ServerConfig` and swaps it in, so a new connection
-/// picks up a freshly re-minted leaf cert with NO process restart. Existing
-/// connections keep their session (same CA — both leaves verify). Rotating
-/// the leaf is then `flintctl rotate-certs` (re-sign from the CA) + wait one
-/// poll; the CA itself stays a runbook (rare, cross-signed).
+/// The shared hot-reload engine (ADR-0006 D4): build once (hard error),
+/// then poll the watched files' mtimes every 2s and swap in a rebuilt
+/// config on change. A later bad reload is logged and the previous good
+/// config is KEPT — rotation must never take a healthy listener/dialer
+/// down.
+fn watch_config<T: Send + Sync + 'static>(
+    build: impl Fn() -> io::Result<Arc<T>> + Send + 'static,
+    watched: Vec<String>,
+) -> io::Result<Arc<std::sync::RwLock<Arc<T>>>> {
+    let cell = Arc::new(std::sync::RwLock::new(build()?));
+    let handle = Arc::clone(&cell);
+    std::thread::spawn(move || {
+        let mtime = |p: &String| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+        let mut last: Vec<_> = watched.iter().map(mtime).collect();
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            let now: Vec<_> = watched.iter().map(mtime).collect();
+            if now != last && now.iter().all(|m| m.is_some()) {
+                match build() {
+                    Ok(fresh) => {
+                        if let Ok(mut g) = handle.write() {
+                            *g = fresh;
+                        }
+                        eprintln!("tls: hot-reloaded leaf certificate");
+                        last = now;
+                    }
+                    Err(e) => eprintln!("tls: reload skipped (keeping current): {e}"),
+                }
+            }
+        }
+    });
+    Ok(cell)
+}
+
+/// A server TLS config that HOT-RELOADS its leaf cert/key from disk
+/// (ADR-0006 D4): a new connection picks up a freshly re-minted leaf with
+/// NO process restart; existing connections keep their session (same CA —
+/// both leaves verify). Rotating the leaf is then `flintctl rotate-certs`
+/// (re-sign from the CA) + one poll; the CA itself stays a runbook (rare,
+/// cross-signed). Covers both listener flavors: the mutual-TLS mesh
+/// (`watch`) and the edge/server-only surface (`watch_edge`).
 pub struct ReloadableServerConfig {
     current: Arc<std::sync::RwLock<Arc<ServerConfig>>>,
 }
 
 impl ReloadableServerConfig {
-    /// Build from the mesh triple and start watching `cert`/`key` for
-    /// changes (poll interval 2s). Errors only on the INITIAL build — a
-    /// later bad reload is logged and the previous good config is kept.
+    /// Mesh listener: build from the internal triple and watch `cert`/`key`.
+    /// Errors only on the INITIAL build.
     pub fn watch(ca: &str, cert: &str, key: &str) -> io::Result<Arc<Self>> {
-        let build = {
-            let (ca, cert, key) = (ca.to_string(), cert.to_string(), key.to_string());
-            move || server_config(&ca, &cert, &key)
-        };
-        let cfg = build()?;
-        let this = Arc::new(ReloadableServerConfig {
-            current: Arc::new(std::sync::RwLock::new(cfg)),
-        });
-        let watched = [cert.to_string(), key.to_string()];
-        let handle = Arc::clone(&this);
-        std::thread::spawn(move || {
-            let mtime = |p: &str| std::fs::metadata(p).and_then(|m| m.modified()).ok();
-            let mut last: Vec<_> = watched.iter().map(|p| mtime(p)).collect();
-            loop {
-                std::thread::sleep(std::time::Duration::from_secs(2));
-                let now: Vec<_> = watched.iter().map(|p| mtime(p)).collect();
-                if now != last && now.iter().all(|m| m.is_some()) {
-                    match build() {
-                        Ok(fresh) => {
-                            if let Ok(mut g) = handle.current.write() {
-                                *g = fresh;
-                            }
-                            eprintln!("tls: hot-reloaded leaf certificate");
-                            last = now;
-                        }
-                        Err(e) => eprintln!("tls: reload skipped (keeping current): {e}"),
-                    }
-                }
-            }
-        });
-        Ok(this)
+        let (ca, cert, key) = (ca.to_string(), cert.to_string(), key.to_string());
+        let watched = vec![cert.clone(), key.clone()];
+        let current = watch_config(move || server_config(&ca, &cert, &key), watched)?;
+        Ok(Arc::new(ReloadableServerConfig { current }))
+    }
+
+    /// Edge listener (proxy client-facing port, portal HTTPS): server-only
+    /// TLS, no client certs — same reload discipline.
+    pub fn watch_edge(cert: &str, key: &str) -> io::Result<Arc<Self>> {
+        let (cert, key) = (cert.to_string(), key.to_string());
+        let watched = vec![cert.clone(), key.clone()];
+        let current = watch_config(move || server_only_config(&cert, &key), watched)?;
+        Ok(Arc::new(ReloadableServerConfig { current }))
     }
 
     /// The current config, ready for `accept`. Read once per new connection.
     pub fn current(&self) -> Option<Arc<ServerConfig>> {
         self.current.read().ok().map(|g| g.clone())
     }
+}
+
+/// The dial-side counterpart: a mesh CLIENT config that hot-reloads its
+/// leaf. Every long-lived dialer (proxy→backend/CP, node→node, controller,
+/// agent, portals' internal dials) snapshots `current()` per dial, so the
+/// first dial after a rotation already presents the new leaf.
+pub struct ReloadableClientConfig {
+    current: Arc<std::sync::RwLock<Arc<ClientConfig>>>,
+}
+
+impl ReloadableClientConfig {
+    /// Build from the mesh triple and watch `cert`/`key`. Errors only on
+    /// the INITIAL build.
+    pub fn watch(ca: &str, cert: &str, key: &str) -> io::Result<Arc<Self>> {
+        let (ca, cert, key) = (ca.to_string(), cert.to_string(), key.to_string());
+        let watched = vec![cert.clone(), key.clone()];
+        let current = watch_config(move || client_config(&ca, &cert, &key), watched)?;
+        Ok(Arc::new(ReloadableClientConfig { current }))
+    }
+
+    /// The current config: snapshot once per dial.
+    pub fn current(&self) -> Arc<ClientConfig> {
+        self.current
+            .read()
+            .map(|g| g.clone())
+            .unwrap_or_else(|e| e.into_inner().clone())
+    }
+}
+
+/// `connect`, but resolving a reloadable dial config at THIS dial — the
+/// drop-in for call sites that used to hold a load-once `ClientConfig`.
+pub fn connect_reloadable(
+    addr: &str,
+    cfg: &Option<Arc<ReloadableClientConfig>>,
+) -> io::Result<Stream> {
+    let snap = cfg.as_ref().map(|r| r.current());
+    connect(addr, &snap)
 }
 
 /// Days until the leaf certificate at `path` expires — the cert-hygiene

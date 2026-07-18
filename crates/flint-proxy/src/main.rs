@@ -325,10 +325,11 @@ struct Topology {
     /// auth, default namespace. A control-plane-fed proxy is never open —
     /// before its first snapshot it simply has no tenants yet.
     open_mode: bool,
-    /// Client-side mutual-TLS config for dialing backends (the internal hop).
-    /// `None` = plaintext backends (default). Set by `--internal-*`; the same
-    /// triple the servers use, in the client role.
-    backend_tls: Option<Arc<rustls::ClientConfig>>,
+    /// Client-side mutual-TLS for dialing backends (the internal hop),
+    /// hot-reloading its leaf (ADR-0006 D4) — each dial snapshots the
+    /// current config. `None` = plaintext backends (default). Set by
+    /// `--internal-*`; the same triple the servers use, in the client role.
+    backend_tls: Option<Arc<flint_tls::ReloadableClientConfig>>,
     /// This proxy's own mesh leaf cert path (--internal-cert), for the
     /// cert-expiry gauge in PROXYSTATS. None => plaintext mesh.
     cert_path: Option<String>,
@@ -648,9 +649,12 @@ fn call_raw(
 
 /// Probe a pair's nodes for the current master (FLINTINFO role) — the same
 /// discovery rule the controller uses.
-fn discover_master(nodes: &[String], tls: &Option<Arc<rustls::ClientConfig>>) -> Option<String> {
+fn discover_master(
+    nodes: &[String],
+    tls: &Option<Arc<flint_tls::ReloadableClientConfig>>,
+) -> Option<String> {
     for addr in nodes {
-        let Ok(mut stream) = flint_tls::connect(addr, tls) else {
+        let Ok(mut stream) = flint_tls::connect_reloadable(addr, tls) else {
             continue;
         };
         let _ = stream.set_read_timeout(Some(Duration::from_millis(800)));
@@ -678,12 +682,13 @@ struct Backends {
     /// handshake at open). One client = one tenant, so raw frames forward
     /// without per-command rewriting.
     ns: Vec<u8>,
-    /// Client-side mutual-TLS for the backend hop (`None` = plaintext).
-    tls: Option<Arc<rustls::ClientConfig>>,
+    /// Client-side mutual-TLS for the backend hop (`None` = plaintext),
+    /// snapshotted from the reloadable handle at each dial.
+    tls: Option<Arc<flint_tls::ReloadableClientConfig>>,
 }
 
 impl Backends {
-    fn new(ns: Vec<u8>, tls: Option<Arc<rustls::ClientConfig>>) -> Self {
+    fn new(ns: Vec<u8>, tls: Option<Arc<flint_tls::ReloadableClientConfig>>) -> Self {
         Self {
             conns: HashMap::new(),
             ns,
@@ -699,7 +704,7 @@ impl Backends {
 
     fn call(&mut self, addr: &str, frame: &[u8]) -> std::io::Result<Value> {
         if !self.conns.contains_key(addr) {
-            let mut stream = flint_tls::connect(addr, &self.tls)?;
+            let mut stream = flint_tls::connect_reloadable(addr, &self.tls)?;
             stream.set_read_timeout(Some(BACKEND_TIMEOUT))?;
             stream.set_write_timeout(Some(BACKEND_TIMEOUT))?;
             // Pin the connection to the tenant namespace before any data
@@ -1410,7 +1415,7 @@ fn watch_control_plane(
 ) -> std::io::Result<()> {
     // Same internal-mesh client credentials as the backend hop: the control
     // plane is part of the mesh, so one --internal-* triple covers both.
-    let mut stream = flint_tls::connect(cp, &topo.backend_tls)?;
+    let mut stream = flint_tls::connect_reloadable(cp, &topo.backend_tls)?;
     stream.set_read_timeout(Some(Duration::from_secs(30)))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
     let mut out = Vec::new();
@@ -1503,13 +1508,17 @@ fn main() -> std::io::Result<()> {
     // Client-facing TLS termination: both flags together enable it, neither
     // keeps the plaintext listener (byte-identical to pre-TLS). One without
     // the other is a config error, not a silent downgrade.
-    let tls: Option<Arc<rustls::ServerConfig>> = match (arg("--tls-cert"), arg("--tls-key")) {
-        (Some(cert), Some(key)) => {
-            Some(flint_tls::server_only_config(&cert, &key).expect("client-facing TLS config"))
-        }
-        (None, None) => None,
-        _ => panic!("--tls-cert and --tls-key must be provided together"),
-    };
+    // Hot-reloading (ADR-0006 D4 follow-on): each new client connection
+    // snapshots the current edge cert, so rotation needs no restart.
+    let tls: Option<Arc<flint_tls::ReloadableServerConfig>> =
+        match (arg("--tls-cert"), arg("--tls-key")) {
+            (Some(cert), Some(key)) => Some(
+                flint_tls::ReloadableServerConfig::watch_edge(&cert, &key)
+                    .expect("client-facing TLS config"),
+            ),
+            (None, None) => None,
+            _ => panic!("--tls-cert and --tls-key must be provided together"),
+        };
 
     // Standalone config (ignored in control-plane mode, which pushes both).
     let pairs: Vec<Vec<String>> = arg("--pairs")
@@ -1551,13 +1560,13 @@ fn main() -> std::io::Result<()> {
     // (presents its cert, verifies each backend against the shared CA). Same
     // both-or-none-plus-ca gating as the frontend; the triple is shared with
     // the servers, used here in the client role.
-    let backend_tls: Option<Arc<rustls::ClientConfig>> = match (
+    let backend_tls: Option<Arc<flint_tls::ReloadableClientConfig>> = match (
         arg("--internal-ca"),
         arg("--internal-cert"),
         arg("--internal-key"),
     ) {
         (Some(ca), Some(cert), Some(key)) => Some(
-            flint_tls::client_config(&ca, &cert, &key)
+            flint_tls::ReloadableClientConfig::watch(&ca, &cert, &key)
                 .expect("build backend (internal) TLS client config"),
         ),
         (None, None, None) => None,
@@ -1674,12 +1683,14 @@ fn main() -> std::io::Result<()> {
         let guard = ConnGuard(Arc::clone(&topo));
         std::thread::spawn(move || {
             let _guard = guard; // decrements on any exit, including panic
-            match tls {
+            match tls.as_ref().and_then(|r| r.current()) {
                 Some(cfg) => {
                     // The handshake runs lazily on the first read/write inside
                     // serve_client (the client sends the first command). A
                     // plaintext client hitting the TLS port fails the handshake
                     // and the connection drops — no RESP is ever processed.
+                    // The config is snapshotted per connection, so a rotated
+                    // edge cert applies to the next accept with no restart.
                     let conn = match rustls::ServerConnection::new(cfg) {
                         Ok(c) => c,
                         Err(e) => {

@@ -56,21 +56,28 @@ async fn write_framed<S: AsyncWrite + Unpin>(s: &mut S, bytes: &[u8]) -> std::io
 
 #[derive(Clone)]
 pub struct Network {
-    /// Internal-mesh mutual-TLS connector for peer dials (None = plaintext).
-    pub tls: Option<TlsConnector>,
+    /// Internal-mesh mutual-TLS dial config, hot-reloading its leaf
+    /// (ADR-0006 D4 follow-on); each dial builds a fresh connector from the
+    /// current snapshot. None = plaintext.
+    pub tls: Option<Arc<flint_tls::ReloadableClientConfig>>,
 }
 
 pub struct Conn {
     target: NodeId,
     addr: String,
-    tls: Option<TlsConnector>,
+    tls: Option<Arc<flint_tls::ReloadableClientConfig>>,
 }
 
 /// Dial `addr` (optionally through mutual TLS) and run one framed
-/// request/response exchange.
-async fn exchange(addr: &str, tls: &Option<TlsConnector>, body: &[u8]) -> std::io::Result<Vec<u8>> {
+/// request/response exchange. The TLS config is snapshotted per dial, so a
+/// rotated leaf applies to the next RPC with no restart.
+async fn exchange(
+    addr: &str,
+    tls: &Option<Arc<flint_tls::ReloadableClientConfig>>,
+    body: &[u8],
+) -> std::io::Result<Vec<u8>> {
     let mut tcp = TcpStream::connect(addr).await?;
-    match tls {
+    match tls.as_ref().map(|r| TlsConnector::from(r.current())) {
         None => {
             write_framed(&mut tcp, body).await?;
             read_framed(&mut tcp).await
@@ -175,13 +182,21 @@ impl RaftNetwork<TypeConfig> for Conn {
 
 // --- RPC server: dispatch inbound frames to the local Raft ---
 
-async fn serve_rpc(raft: CpRaft, listener: TcpListener, acceptor: Option<TlsAcceptor>) {
+async fn serve_rpc(
+    raft: CpRaft,
+    listener: TcpListener,
+    tls: Option<Arc<flint_tls::ReloadableServerConfig>>,
+) {
     loop {
         let Ok((sock, _)) = listener.accept().await else {
             continue;
         };
         let raft = raft.clone();
-        let acceptor = acceptor.clone();
+        // Snapshot per accept: a rotated leaf serves the next connection.
+        let acceptor = tls
+            .as_ref()
+            .and_then(|r| r.current())
+            .map(TlsAcceptor::from);
         tokio::spawn(async move {
             match acceptor {
                 None => rpc_conn(raft, sock).await,
@@ -248,8 +263,8 @@ pub async fn start(
     state_path: std::path::PathBuf,
     peers_spec: &str,
     client_spec: &str,
-    tls_server: Option<Arc<flint_tls::ServerConfig>>,
-    tls_client: Option<Arc<flint_tls::ClientConfig>>,
+    tls_server: Option<Arc<flint_tls::ReloadableServerConfig>>,
+    tls_client: Option<Arc<flint_tls::ReloadableClientConfig>>,
 ) -> std::io::Result<Ha> {
     let config = Arc::new(
         Config {
@@ -264,9 +279,7 @@ pub async fn start(
     let journal_path = format!("{}.journal", state_path.display());
     let store = Store::open(state_path);
     let (log_store, state_machine) = Adaptor::new(store.clone());
-    let network = Network {
-        tls: tls_client.map(TlsConnector::from),
-    };
+    let network = Network { tls: tls_client };
     let raft = Raft::new(node_id, config, network, log_store, state_machine)
         .await
         .expect("raft new");
@@ -274,8 +287,7 @@ pub async fn start(
     let listener = TcpListener::bind(("127.0.0.1", raft_port)).await?;
     {
         let raft = raft.clone();
-        let acceptor = tls_server.map(TlsAcceptor::from);
-        tokio::spawn(serve_rpc(raft, listener, acceptor));
+        tokio::spawn(serve_rpc(raft, listener, tls_server));
     }
     let _ = raft_addr;
 
@@ -358,14 +370,13 @@ fn snapshot_frame(v: u64, pairs: &str, tenants: &str, admin: &str) -> Value {
 pub async fn run_client(
     ha: Arc<Ha>,
     port: u16,
-    tls_server: Option<Arc<flint_tls::ServerConfig>>,
+    tls_server: Option<Arc<flint_tls::ReloadableServerConfig>>,
 ) -> std::io::Result<()> {
-    let acceptor = tls_server.map(TlsAcceptor::from);
     let listener = TcpListener::bind(("127.0.0.1", port)).await?;
     eprintln!(
         "flint-controlplane[raft node {}] client on :{port} ({})",
         ha.node_id,
-        if acceptor.is_some() {
+        if tls_server.is_some() {
             "internal mTLS"
         } else {
             "plaintext"
@@ -376,7 +387,11 @@ pub async fn run_client(
             continue;
         };
         let ha = Arc::clone(&ha);
-        let acceptor = acceptor.clone();
+        // Snapshot per accept (rotated leaf serves the next connection).
+        let acceptor = tls_server
+            .as_ref()
+            .and_then(|r| r.current())
+            .map(TlsAcceptor::from);
         tokio::spawn(async move {
             match acceptor {
                 None => {

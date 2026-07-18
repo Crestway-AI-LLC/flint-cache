@@ -817,29 +817,32 @@ fn frame_to_args(frame: Value) -> Option<Vec<Vec<u8>>> {
 /// control-plane listener (single-node client port, HA client port, Raft
 /// RPC port) accepts with — peers and proxies must present a CA-signed
 /// cert. None = plaintext.
-fn internal_server_config() -> Option<Arc<flint_tls::ServerConfig>> {
+fn internal_server_config() -> Option<Arc<flint_tls::ReloadableServerConfig>> {
     match (
         arg("--internal-ca"),
         arg("--internal-cert"),
         arg("--internal-key"),
     ) {
         (Some(ca), Some(cert), Some(key)) => Some(
-            flint_tls::server_config(&ca, &cert, &key).expect("build internal TLS server config"),
+            flint_tls::ReloadableServerConfig::watch(&ca, &cert, &key)
+                .expect("build internal TLS server config"),
         ),
         (None, None, None) => None,
         _ => panic!("--internal-ca, --internal-cert, --internal-key must be given together"),
     }
 }
 
-/// The same triple in the client role — the Raft RPC dialer.
-fn internal_client_config() -> Option<Arc<flint_tls::ClientConfig>> {
+/// The same triple in the client role — the Raft RPC dialer. Hot-reloading
+/// like the listeners: each RPC dial snapshots the current leaf.
+fn internal_client_config() -> Option<Arc<flint_tls::ReloadableClientConfig>> {
     match (
         arg("--internal-ca"),
         arg("--internal-cert"),
         arg("--internal-key"),
     ) {
         (Some(ca), Some(cert), Some(key)) => Some(
-            flint_tls::client_config(&ca, &cert, &key).expect("build internal TLS client config"),
+            flint_tls::ReloadableClientConfig::watch(&ca, &cert, &key)
+                .expect("build internal TLS client config"),
         ),
         _ => None,
     }
@@ -891,7 +894,8 @@ fn main() -> std::io::Result<()> {
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
         let shared = Arc::clone(&shared);
-        let internal_tls = internal_tls.clone();
+        // Snapshot per accept: a rotated leaf serves the next connection.
+        let internal_tls = internal_tls.as_ref().and_then(|r| r.current());
         std::thread::spawn(move || {
             let conn = match flint_tls::accept(stream, &internal_tls) {
                 Ok(c) => c,
