@@ -316,6 +316,9 @@ struct Topology {
     /// `None` = plaintext backends (default). Set by `--internal-*`; the same
     /// triple the servers use, in the client role.
     backend_tls: Option<Arc<rustls::ClientConfig>>,
+    /// This proxy's own mesh leaf cert path (--internal-cert), for the
+    /// cert-expiry gauge in PROXYSTATS. None => plaintext mesh.
+    cert_path: Option<String>,
     /// Admin-token DIGESTS (ADR-0006 D1/D4): current + optionally previous
     /// during a rotation window. Non-empty => the operator surface
     /// (PROXYSTATS, all-tenant hot-key/latency, PROXYAUTHCOUNT, mutating
@@ -931,7 +934,7 @@ fn auth_step(
         let quota_throttled = topo.stat_quota_throttled_total.load(Ordering::Relaxed);
         let quota_write_shed = topo.stat_quota_write_shed_total.load(Ordering::Relaxed);
         let info = format!(
-            "active:{}\r\nconns_total:{}\r\nshed_total:{}\r\nauth_ok_total:{}\r\nauth_fail_total:{}\r\ncommands_total:{}\r\ncommands_read_total:{}\r\ncommands_write_total:{}\r\nhotkey_sample_rate:{}\r\ncache_ttl_ms:{cache_ttl}\r\ncache_max_bytes:{cache_max}\r\ncache_hits_total:{cache_hits}\r\ncache_misses_total:{cache_misses}\r\ncache_entries:{cache_entries}\r\ncache_bytes:{cache_bytes}\r\nquota_throttled_total:{quota_throttled}\r\nquota_write_shed_total:{quota_write_shed}\r\n",
+            "active:{}\r\nconns_total:{}\r\nshed_total:{}\r\nauth_ok_total:{}\r\nauth_fail_total:{}\r\ncommands_total:{}\r\ncommands_read_total:{}\r\ncommands_write_total:{}\r\nhotkey_sample_rate:{}\r\ncache_ttl_ms:{cache_ttl}\r\ncache_max_bytes:{cache_max}\r\ncache_hits_total:{cache_hits}\r\ncache_misses_total:{cache_misses}\r\ncache_entries:{cache_entries}\r\ncache_bytes:{cache_bytes}\r\nquota_throttled_total:{quota_throttled}\r\nquota_write_shed_total:{quota_write_shed}\r\ncert_days_remaining:{cdr}\r\n",
             topo.stat_active.load(Ordering::Relaxed),
             load(&topo.stat_conns_total),
             load(&topo.stat_shed_total),
@@ -944,6 +947,11 @@ fn auth_step(
             // already scaled back up by this, so it IS the estimated ops/s.
             // Exposed for transparency about the estimate's granularity.
             HOTKEY_SAMPLE_RATE,
+            cdr = topo
+                .cert_path
+                .as_deref()
+                .and_then(flint_tls::cert_days_remaining)
+                .map_or_else(|| "none".into(), |d| d.to_string()),
         );
         return AuthStep::Reply(Value::Bulk(Some(info.into_bytes())));
     }
@@ -1576,6 +1584,7 @@ fn main() -> std::io::Result<()> {
         ),
         open_mode,
         backend_tls,
+        cert_path: arg("--internal-cert"),
         admin_digests: RwLock::new(
             arg("--admin-token")
                 .map(|t| vec![flint_tls::sha256_hex(t.as_bytes())])

@@ -622,9 +622,13 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
             let Ok(st) = shared.state.lock() else {
                 return err("state lock");
             };
+            let cdr = arg("--internal-cert")
+                .as_deref()
+                .and_then(flint_tls::cert_days_remaining)
+                .map_or_else(|| "none".into(), |d: i64| d.to_string());
             Value::Bulk(Some(
                 format!(
-                    "version:{}\r\nproxies:{}\r\npairs:{}\r\ntenants:{}\r\n",
+                    "version:{}\r\nproxies:{}\r\npairs:{}\r\ntenants:{}\r\ncert_days_remaining:{cdr}\r\n",
                     st.version,
                     st.proxies.len(),
                     st.pairs.len(),

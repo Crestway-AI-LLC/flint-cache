@@ -864,9 +864,15 @@ async fn handle_admin(ha: &Ha, args: &[Vec<u8>]) -> Value {
         b"CPINFO" => {
             let reg = ha.store.registry().await;
             let leader = ha.raft.current_leader().await;
+            let cdr = std::env::args()
+                .skip_while(|a| a != "--internal-cert")
+                .nth(1)
+                .as_deref()
+                .and_then(flint_tls::cert_days_remaining)
+                .map_or_else(|| "none".into(), |d: i64| d.to_string());
             Value::Bulk(Some(
                 format!(
-                    "version:{}\r\nproxies:{}\r\npairs:{}\r\ntenants:{}\r\nnode:{}\r\nleader:{}\r\n",
+                    "version:{}\r\nproxies:{}\r\npairs:{}\r\ntenants:{}\r\nnode:{}\r\nleader:{}\r\ncert_days_remaining:{cdr}\r\n",
                     reg.version,
                     reg.proxies.len(),
                     reg.pairs.len(),

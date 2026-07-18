@@ -91,6 +91,10 @@ fn internal_connect(addr: &str) -> std::io::Result<flint_tls::Stream> {
 /// transition never waits on (or fails because of) the journal.
 static JOURNAL_TARGET: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
 static SELF_ADDR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+/// This node's own mesh leaf cert path (--internal-cert), for the
+/// cert-expiry gauge in FLINTINFO (ADR-0006 cert hygiene). Read live so a
+/// hot-reload's new leaf is reflected.
+static CERT_PATH: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
 
 fn journal_event(kind: flint_journal::EventKind, epoch: Option<String>, cause: &str) {
     let Some(Some(target)) = JOURNAL_TARGET.get().cloned() else {
@@ -140,6 +144,7 @@ fn main() -> std::io::Result<()> {
         arg("--internal-key"),
     ) {
         (Some(ca), Some(cert), Some(key)) => {
+            let _ = CERT_PATH.set(Some(cert.clone()));
             let _ = INTERNAL_CLIENT.set(Some(
                 flint_tls::client_config(&ca, &cert, &key)
                     .expect("build internal TLS client config"),
@@ -1168,7 +1173,7 @@ fn flintinfo(
         None => "none".into(),
     };
     let info = format!(
-        "role:{}\r\nrole_epoch:{role_epoch}\r\nbuild:{build}\r\nsst_bytes:{sst}\r\nlatest_seq:{latest}\r\nlast_applied:{last_applied}\r\nacked_seq:{}\r\nseq_lag:{seq_lag}\r\nlive_replicas:{}\r\nlag_ms:{}\r\nlag_soft_ms:{soft}\r\nlag_hard_ms:{hard}\r\nmin_replicas_to_write:{minr}\r\nfullsync_active:{fsa}\r\nfullsync_max:{fsm}\r\nasync_write_queue:{aqd}\r\n",
+        "role:{}\r\nrole_epoch:{role_epoch}\r\nbuild:{build}\r\nsst_bytes:{sst}\r\nlatest_seq:{latest}\r\nlast_applied:{last_applied}\r\nacked_seq:{}\r\nseq_lag:{seq_lag}\r\nlive_replicas:{}\r\nlag_ms:{}\r\nlag_soft_ms:{soft}\r\nlag_hard_ms:{hard}\r\nmin_replicas_to_write:{minr}\r\nfullsync_active:{fsa}\r\nfullsync_max:{fsm}\r\nasync_write_queue:{aqd}\r\ncert_days_remaining:{cdr}\r\n",
         if read_only { "replica" } else { "master" },
         hub.effective_acked(now)
             .map_or_else(|| "none".into(), |a| a.to_string()),
@@ -1183,6 +1188,11 @@ fn flintinfo(
         fsa = FULLSYNC_ACTIVE.load(Ordering::Relaxed),
         fsm = MAX_FULLSYNC.load(Ordering::Relaxed),
         aqd = async_queue_depth.map_or_else(|| "off".into(), |d| d.to_string()),
+        cdr = CERT_PATH
+            .get()
+            .and_then(|p| p.as_deref())
+            .and_then(flint_tls::cert_days_remaining)
+            .map_or_else(|| "none".into(), |d| d.to_string()),
     );
     Value::Bulk(Some(info.into_bytes()))
 }

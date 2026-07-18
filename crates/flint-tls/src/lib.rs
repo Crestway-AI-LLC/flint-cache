@@ -345,3 +345,21 @@ impl ReloadableServerConfig {
         self.current.read().ok().map(|g| g.clone())
     }
 }
+
+/// Days until the leaf certificate at `path` expires — the cert-hygiene
+/// signal (ADR-0006 D4 pairs with this: the metric tells you WHEN to
+/// `flintctl rotate-certs`). Negative once expired; None if the file is
+/// unreadable or unparseable. Each component computes this for its OWN leaf
+/// and reports it through the introspection command it already answers.
+pub fn cert_days_remaining(path: &str) -> Option<i64> {
+    let pem = std::fs::read(path).ok()?;
+    // First certificate in the file is the leaf.
+    let (_, der) = x509_parser::pem::parse_x509_pem(&pem).ok()?;
+    let cert = der.parse_x509().ok()?;
+    let not_after = cert.validity().not_after.timestamp();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs() as i64;
+    Some((not_after - now) / 86_400)
+}
