@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Elastic-2.0
 # Rebalance EXECUTION drill: three masters with badly unbalanced fills; the
 # controller (planner + executor) must move slots via real FLINTMIGRATEIN
 # cutovers until the group is balanced within the deadband — hands-free.

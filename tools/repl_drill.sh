@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Elastic-2.0
 # Replication drill: master + replica (rocks), mass-load, verify parity,
 # verify -READONLY, kill the master, confirm the replica keeps serving.
 # Requires a release build with --features rocks and valkey-cli.

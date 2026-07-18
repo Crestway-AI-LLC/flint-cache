@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Elastic-2.0
 //! ZSetStore: sorted sets with the dual-index scheme.
 //!
 //! Member row (Subkey CF): member → score bytes (f64 LE), for O(1) ZSCORE.

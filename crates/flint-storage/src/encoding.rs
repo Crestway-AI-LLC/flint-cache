@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Elastic-2.0
 //! Encoding layer v1 (ADR-0002): the key envelope and metadata row layout.
 //!
 //! The envelope `cf-tag | namespace | slot | user_key` is a SYSTEM

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Elastic-2.0
 //! flint-conformance: the compatibility oracle.
 //!
 //! Runs a table-driven corpus of Redis-semantics cases against any RESP2

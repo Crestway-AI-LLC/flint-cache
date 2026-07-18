@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Elastic-2.0
 //! Garbage collection: expired metadata rows and orphaned subkey rows.
 //!
 //! O(1) deletes and lazy expiry leave physically-present but unreachable

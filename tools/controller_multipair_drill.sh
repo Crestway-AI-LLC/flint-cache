@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Elastic-2.0
 # Multi-pair controller drill: ONE controller manages THREE pairs (a group).
 # Each pair fails over INDEPENDENTLY — killing the master of pair B must
 # promote pair B's survivor and respawn its replacement without touching

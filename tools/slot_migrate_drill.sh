@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Elastic-2.0
 # Slot-move drill: ship one slot's data from a live SOURCE to a live
 # DESTINATION in a SINGLE pass, while writes to that slot arrive AFTER the
 # migration's snapshot — so those writes can ONLY reach the destination via

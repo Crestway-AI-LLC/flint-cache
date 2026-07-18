@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Elastic-2.0
 //! Replication primitives: WAL tailing on the master, atomic apply on the
 //! replica.
 //!

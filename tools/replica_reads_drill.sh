@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Elastic-2.0
 # ADR-0005 D7 drill: read scaling via per-shard replica count (two knobs).
 #
 # Replicas mirror the master, so a correctly-served replica read returns the

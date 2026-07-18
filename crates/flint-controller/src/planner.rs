@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Elastic-2.0
 //! Rebalance planner: given a group's per-pair fill/heat map, decide which
 //! pairs should shed load to which (docs/design.md §2.3). Pure and
 //! deterministic — the controller feeds it observed fills and (today, via

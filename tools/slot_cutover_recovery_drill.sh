@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Elastic-2.0
 # THE durability proof: interrupt a slot cutover by killing BOTH the source
 # and the destination (a whole-cluster redeploy) mid-move, restart them, and
 # let the recovery controller reconcile from the durable manifest records.

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Elastic-2.0
 # Controller HA drill: run THREE controllers on one pair. Discovery-based +
 # epoch-fenced means concurrent controllers are safe. Verify:
 #   1. with all 3 running, a master kill promotes exactly once (extra

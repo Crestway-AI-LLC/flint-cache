@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Elastic-2.0
 # min-replicas-to-write drill: a master with --min-replicas-to-write 1 sheds
 # writes (-THROTTLED) the moment its last replica dies, and resumes as soon
 # as a replacement starts acking. This closes the widowed-master hole: the

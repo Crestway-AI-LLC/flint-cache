@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Elastic-2.0
 # Control plane v1 drill:
 #   - CP owns the tenant registry + topology; two proxies subscribe (CPWATCH)
 #     and are fed ONLY their assigned tenants (shuffle-shard sub-groups)

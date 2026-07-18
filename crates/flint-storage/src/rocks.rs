@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Elastic-2.0
 //! RocksDB-backed `Kv` + the M0 coverage audit.
 //!
 //! The audit tests below each prove one API the design depends on

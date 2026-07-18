@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Elastic-2.0
 # Proxy-in-the-loop chaos gate: the SAME ledger oracle as chaos_drill, but the
 # whole workload flows through the proxy (client->proxy->node) while a real
 # controller drives failover. Proves no acked write is lost or corrupted across

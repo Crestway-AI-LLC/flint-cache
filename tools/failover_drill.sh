@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Elastic-2.0
 # Manual failover drill: master + replica, load, kill -9 the master,
 # FLINTPROMOTE the replica with a higher role epoch, verify it accepts
 # writes with data intact — and that stale/equal epochs are FENCED.

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Elastic-2.0
 # Node↔node mTLS drill (mTLS block, increment 3: the data plane's own hops).
 #   - a fresh replica bootstraps from an mTLS master: checkpoint full sync
 #     (FLINTFULLSYNC) AND the live tail (FLINTSYNC) both over mutual TLS

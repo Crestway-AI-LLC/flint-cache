@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Elastic-2.0
 //! Shared chaos infrastructure: a RESP client, a process fleet that cleans
 //! up on panic, and a `Cluster` that plays the meta trio's role manually —
 //! detecting kills, promoting survivors via epoch-fenced FLINTPROMOTE, and

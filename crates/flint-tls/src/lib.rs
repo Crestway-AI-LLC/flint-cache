@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Elastic-2.0
 //! Internal-mesh mutual TLS (docs/design.md — the mTLS block, internal hops).
 //!
 //! Every internal hop (proxy↔backend, node↔node replication, proxy↔control-

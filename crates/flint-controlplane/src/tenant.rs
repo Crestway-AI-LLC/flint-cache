@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Elastic-2.0
 //! The ONE Tenant type and the ONE snapshot encoding, shared by both
 //! control-plane modes (simple `state.rs` and Raft `registry.rs`).
 //!

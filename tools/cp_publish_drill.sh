@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Elastic-2.0
 # CP publication drill: the last two control-plane M3 items.
 #   A) DELTA SUPPRESSION: a registry version bump whose FILTERED view for a
 #      proxy is unchanged is ACKed locally, not pushed — with shuffle

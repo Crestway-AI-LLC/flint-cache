@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Elastic-2.0
 # ADR-0006 D4 FOLLOW-ON drill — cert hot-reload on EVERY listener/dialer.
 #   - full mTLS fleet (client-tls on): CP client port, node data ports,
 #     proxy edge port all serve TLS; every dialer holds a reloadable config

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Elastic-2.0
 # Full-sync admission-control drill: the master bounds concurrent full-syncs
 # so a replica herd can't saturate its disk/network or pin SSTs against
 # compaction (found while wiring D7's multi-replica pairs).

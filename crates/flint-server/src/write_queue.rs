@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Elastic-2.0
 //! Opt-in async write queue (ADR-0005 D4). For an opted-in namespace, a
 //! batchable string/counter write enqueues instead of applying inline; the
 //! connection thread blocks on its reply (ack-after-apply), and a single

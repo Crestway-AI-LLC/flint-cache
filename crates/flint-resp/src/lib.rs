@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Elastic-2.0
 //! RESP2 wire protocol: encoding and incremental decoding.
 //!
 //! Scope (v0): RESP2 only — every Redis client speaks it. RESP3 is a later,

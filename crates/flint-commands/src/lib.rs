@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Elastic-2.0
 //! Read/write command classification (ADR-0005 D1) — ONE definition shared
 //! by every plane. The server gates `-READONLY` and the slot freeze on it;
 //! the proxy splits traffic accounting on it and will route replica reads

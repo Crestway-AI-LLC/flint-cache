@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Elastic-2.0
 # Async write-queue bench (ADR-0005 D4). The ADR gates the "not for counters"
 # concession on THIS measurement: does routing writes through the async queue
 # (group commit) actually help, and what does it cost in per-write latency?

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Elastic-2.0
 //! flintctl — inventory-driven cluster lifecycle (roadmap M4, operability).
 //!
 //! One file describes the cluster; flintctl makes it so:

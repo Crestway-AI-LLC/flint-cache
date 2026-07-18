@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Elastic-2.0
 //! Per-tenant latency histograms, measured AT THE PROXY (M4 "client-side
 //! metrics", revised: we cannot put code in users' clients, so we measure at
 //! the closest point we do control — one hop from the client). What a tenant

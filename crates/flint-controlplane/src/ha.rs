@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Elastic-2.0
 //! HA runtime: a Raft node (openraft) + JSON-framed RPC network between
 //! control-plane nodes + the client-facing RESP server, all on tokio.
 //! Entered only in --raft mode; the blocking single-node path is untouched.

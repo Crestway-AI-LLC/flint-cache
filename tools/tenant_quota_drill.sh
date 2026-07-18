@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Elastic-2.0
 # Tenant quota drill (M5 — quotas v1, proxy-enforced).
 #   - CPTENANTQUOTA <name> <ops_per_sec> <max_bytes>; the rate reaches each
 #     proxy PRE-DIVIDED by the tenant's subset size (tenant.rs encoding)

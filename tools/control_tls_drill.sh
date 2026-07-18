@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Elastic-2.0
 # Control-plane mTLS drill (mTLS block, final increment: every remaining hop).
 #   - a 3-node Raft control plane runs its inter-node RPC over mutual TLS:
 #     leader election, replication, and failover all encrypted

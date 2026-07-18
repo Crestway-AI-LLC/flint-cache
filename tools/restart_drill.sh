@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Elastic-2.0
 # Warm-restart drill: load data into flint (rocks engine), kill -9 the
 # server, time restart-to-first-PONG, and verify the data survived.
 #

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Elastic-2.0
 //! openraft HA: the control plane's durable intent (tenant registry, proxy
 //! fleet, group topology) replicated by Raft across a 3-node (→5 GA) quorum,
 //! removing the single-node SPOF (design.md §2.2).

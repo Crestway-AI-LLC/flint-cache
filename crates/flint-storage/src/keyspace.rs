@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Elastic-2.0
 //! Type-agnostic keyspace operations.
 //!
 //! DEL, EXISTS, TYPE, EXPIRE/TTL/PERSIST work on any value type by parsing

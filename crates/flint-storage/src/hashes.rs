@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Elastic-2.0
 //! HashStore: Redis hashes on versioned subkey rows.
 //!
 //! Metadata row: `header | version | size`. Each field is its own row at

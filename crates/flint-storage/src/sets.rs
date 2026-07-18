@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Elastic-2.0
 //! SetStore: Redis sets — members are empty-valued subkey rows.
 
 use crate::Kv;

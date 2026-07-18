@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Elastic-2.0
 # R1 drill — a replica self-fences stale reads; the proxy falls back to the
 # master (back-pressure review).
 #   - master + replica; tenant opted into replica reads (D7)

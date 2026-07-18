@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Elastic-2.0
 # Proxy admission-control drill (backpressure at the front door).
 #   A) the proxy caps concurrent client connections (--max-conns): at the cap
 #      a new connection is SHED with -THROTTLED (a clean signal the client

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Elastic-2.0
 # Lease drill: a master lease-managed by a controller self-fences when
 # renewals stop (the controller can no longer reach it). Proves the master
 # stops accepting writes on TTL expiry WITHOUT anyone sending FLINTDEMOTE —

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Elastic-2.0
 //! Proxy-local read cache (ADR-0005 D6, revised). We cannot control users'
 //! clients, so the near-cache lives at the closest point we DO control: this
 //! proxy. GET replies for OPTED-IN tenants are kept for a short TTL under a

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Elastic-2.0
 # Controller drill: a master/replica pair plus flint-controller. Kill the
 # master and verify the controller AUTOMATICALLY promotes the survivor —
 # no manual FLINTPROMOTE — with data intact. Then bring the old master back

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Elastic-2.0
 //! flint-chaos (KV workload): random writes with a checksummed ledger while
 //! master/replica instances are killed randomly. Oracle: no corruption ever;
 //! zero acked-write loss on replica kills and on steady-state master

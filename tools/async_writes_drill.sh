@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Elastic-2.0
 # Async write-queue drill (ADR-0005 D4 — OPT-IN).
 # For an opted-in namespace, a batchable string/counter write enqueues and the
 # connection blocks on the consumer's ack-after-apply; the consumer drains the

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Elastic-2.0
 # Token rotation drill: zero-downtime dual-version token rotation with
 # per-version usage metrics.
 #   - a tenant rotates its token: OLD and NEW both authenticate (no downtime)

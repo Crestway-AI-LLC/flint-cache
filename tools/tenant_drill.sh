@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Elastic-2.0
 # Tenant drill: token auth at the proxy + namespace isolation on the nodes.
 #   - pre-auth commands get -NOAUTH; bad tokens get -WRONGPASS
 #   - two tenants write the SAME key names; each reads only its own values

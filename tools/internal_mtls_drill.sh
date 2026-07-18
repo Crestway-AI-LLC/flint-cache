@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Elastic-2.0
 # Internal-hop mutual-TLS drill (mTLS block, increment 2: proxy↔backend).
 #   - a shared internal CA signs one internal cert (SAN flint-internal, both
 #     server+client EKU); the server and the proxy both use that triple

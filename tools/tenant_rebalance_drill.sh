@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Elastic-2.0
 # Multi-tenant rebalance drill: two tenants write into the SAME slots (same
 # hash tags, different namespaces) all landing on one master; the controller
 # rebalances with (ns, slot) as the move unit. Asserts:

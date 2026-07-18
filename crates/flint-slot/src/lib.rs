@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Elastic-2.0
 //! Redis Cluster-compatible key→slot mapping.
 //!
 //! The key→slot mapping is fixed forever; only slot *ownership* moves.

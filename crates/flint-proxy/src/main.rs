@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Elastic-2.0
 //! flint-proxy (v0): the routing plane's front door (docs/design.md §2.1).
 //!
 //! Clients get ONE plain-RESP endpoint and need no cluster awareness, ever.

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Elastic-2.0
 //! flint proxy-chaos: the SAME ledger oracle as `flint-chaos`, but the whole
 //! workload flows through the proxy — client→proxy→node — while a real
 //! controller drives failover. This is the production path the direct-to-node

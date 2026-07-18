@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Elastic-2.0
 # Proxy near-cache drill (ADR-0005 D6, revised — proxy-local, opt-in).
 #   - tenant consent gate: acme opts in (CPTENANTCACHE/#c); globex does not
 #   - operator runtime knobs: PROXYCACHE <ttl_ms> <max_bytes> on a LIVE proxy

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Elastic-2.0
 //! Node manifests: durable slot-ownership and role claims with fencing
 //! epochs.
 //!

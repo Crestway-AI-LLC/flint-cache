@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Elastic-2.0
 //! flint-bench: the p99.9-under-adversity measurement instrument.
 //!
 //! Phases (run all, or pick with --phase):

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Elastic-2.0
 //! Storage layer.
 //!
 //! Layering (docs/design.md §2.4, encoding-abstraction decision):

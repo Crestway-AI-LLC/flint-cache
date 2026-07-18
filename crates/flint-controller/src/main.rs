@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Elastic-2.0
 //! flint-controller (v0): the meta trio's DECISION LOGIC.
 //!
 //! Discovery-based and STATELESS about roles: every tick it re-observes all

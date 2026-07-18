@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Elastic-2.0
 //! Write-batching KV overlay (ADR-0005 D4). Wraps the real store; buffers
 //! writes and overlays them on reads, so the async-write consumer can run a
 //! batch of commands through the normal `Dispatcher` — each computing its

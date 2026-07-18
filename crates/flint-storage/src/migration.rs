@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Elastic-2.0
 //! Intra-group slot migration — the mechanism behind capacity expansion and
 //! data balance within a shard group (docs/design.md §2.3).
 //!

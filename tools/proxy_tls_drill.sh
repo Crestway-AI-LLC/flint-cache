@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Elastic-2.0
 # Proxy TLS-termination drill (mTLS block, increment 1: the client-facing hop).
 #   - the proxy accepts TLS on its client port and terminates it; the existing
 #     RESP path runs over the encrypted stream (PING/SET/GET all work)

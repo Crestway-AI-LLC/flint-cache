@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Elastic-2.0
 # Snapshot + spare-attach drill (the M3 disaster-recovery item).
 #   - the controller takes scheduled durable snapshots of the managed master
 #     (FLINTSNAPSHOT -> <root>/<pair>/<id> + LATEST, consistent checkpoint)

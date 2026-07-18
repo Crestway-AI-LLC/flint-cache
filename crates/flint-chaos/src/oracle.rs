@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Elastic-2.0
 //! The KV ledger oracle — the ONE definition shared by every KV chaos
 //! workload (`flint-chaos` direct-to-node, `proxy_chaos` through the proxy),
 //! so the corruption/loss checks can never drift between what the data plane

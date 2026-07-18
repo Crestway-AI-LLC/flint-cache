@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Elastic-2.0
 //! The max-value-size policy (Valkey `proto-max-bulk-len` analog,
 //! extended to collections): no single value's payload may grow past the
 //! configured cap. On a beyond-RAM engine this is the guard that keeps

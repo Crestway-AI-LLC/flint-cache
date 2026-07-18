@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Elastic-2.0
 # ADR-0006 D4 (part 2) drill — mesh leaf cert HOT-RELOAD, no restart.
 #   - a mesh master + replica over mutual TLS, replicating live
 #   - `flintctl rotate-certs` re-signs the leaf certs from the CA in place

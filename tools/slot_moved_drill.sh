@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Elastic-2.0
 # -MOVED enforcement drill: mark one slot as handed off (FLINTSLOTMOVED) and
 # verify per-slot ownership on the command path — a key in the moved slot is
 # redirected with -MOVED <slot> <addr>, a key in any other slot still serves,

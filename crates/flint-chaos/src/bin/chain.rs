@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Elastic-2.0
 //! Chain-traversal chaos: build a linked list of N elements
 //! (key0000001 -> key0000002 -> ... -> key{N} -> "END"), then walk it
 //! pointer-by-pointer while master/replica instances are killed randomly.

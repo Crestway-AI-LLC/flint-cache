@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Elastic-2.0
 //! Command dispatch: `Vec<arg-bytes>` in, RESP `Value` out.
 //!
 //! Commands route through the encoding layer with the slot computed per

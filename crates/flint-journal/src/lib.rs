@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Elastic-2.0
 //! Fleet journal (design.md §2.10, interface 3): a typed event log of every
 //! state transition with **actor**, **cause**, and **epoch**. Gauges say what
 //! is; the journal says what happened and why. Catalog recommendations emit

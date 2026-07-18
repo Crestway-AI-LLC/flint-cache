@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Elastic-2.0
 //! Bulk filler for benchmark datasets: pipelined SETs of `--keys` entries,
 //! `--val-size` bytes each, key format `key:%012d` — exactly the shape
 //! redis-benchmark generates with `-r N` (`key:__rand_int__`), so a fill

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Elastic-2.0
 //! The Raft-replicated registry state + its mutations (state-machine data).
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;

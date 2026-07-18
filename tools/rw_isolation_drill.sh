@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Elastic-2.0
 # ADR-0005 D1 drill: read/write path independence ACROSS clients, pinned.
 #
 # The architecture already guarantees this structurally (per-client backend

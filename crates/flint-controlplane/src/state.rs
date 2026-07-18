@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Elastic-2.0
 //! Control-plane state: the durable intent nothing else can re-derive
 //! (design.md §2.2) — tenant registry (token, namespace, proxy subset),
 //! proxy fleet, group topology — plus a monotonic version stamped on every

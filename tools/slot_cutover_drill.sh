@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Elastic-2.0
 # Full slot cutover drill: FLINTMIGRATEIN with a self-address drives the whole
 # freeze -> drain -> flip protocol. After it completes:
 #   - the SOURCE answers -MOVED <slot> <dest> for the slot (it disowned it),

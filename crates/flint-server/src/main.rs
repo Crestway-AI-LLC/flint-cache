@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Elastic-2.0
 //! flint-server: the data-plane node binary.
 //!
 //! v0: blocking TCP, thread per connection, RESP2 (+ inline commands).

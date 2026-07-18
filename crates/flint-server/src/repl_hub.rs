@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Elastic-2.0
 //! Master-side replication bookkeeping: replica acknowledgement state and
 //! time-based lag, feeding the lag-cap backpressure that enforces the
 //! failover RPO bound by construction.

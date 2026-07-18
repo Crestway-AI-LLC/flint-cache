@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Elastic-2.0
 //! flint-controlplane (v1): the global control plane's tenant-registry +
 //! snapshot-push half (design.md §2.2).
 //!

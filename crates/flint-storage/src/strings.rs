@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Elastic-2.0
 //! StringStore: the string-type TypeStore over any `Kv`.
 //!
 //! Owns Redis string semantics: SET options, the integer-string commands,

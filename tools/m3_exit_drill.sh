@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Elastic-2.0
 # M3 exit drill (roadmap): 50 namespaces packed on ONE group; failover under
 # multi-tenant load.
 #   - 50 tenants, each with its own token, share 2 replicated pairs behind

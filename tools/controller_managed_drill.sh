@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Elastic-2.0
 # Managed-controller drill: the controller OWNS the full failover cycle —
 # it bootstraps the pair, and on any kill it promotes and/or respawns a
 # fresh replacement replica. The drill only KILLS nodes; it never promotes

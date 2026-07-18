@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Elastic-2.0
 # ADR-0006 D1 drill — tokens hashed at rest, verified by digest.
 #   - CPADDTENANT stores a DIGEST: the CP state file on disk contains no
 #     plaintext token; the snapshot frame pushed to proxies carries none

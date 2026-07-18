@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Elastic-2.0
 # Control plane HA drill (openraft): a 3-node Raft cluster.
 #   - elects a leader; writes go to the leader (a follower redirects)
 #   - a mutation replicates to all 3 (quorum-durable, versions converge)

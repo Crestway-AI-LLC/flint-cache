@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Elastic-2.0
 //! ListStore: Redis lists as a deque of index-addressed subkey rows.
 //!
 //! The metadata carries head/tail counters (elements at head..tail); the

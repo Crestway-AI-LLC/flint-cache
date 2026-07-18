@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Elastic-2.0
 //! Slot migration: the data-shipping, cutover, and per-slot gating half of
 //! rebalancing (ADR-0004). Extracted from main.rs in the review-driven
 //! module split — everything here shares the same unit (a (namespace, slot)

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Elastic-2.0
 # Proxy drill: a client that knows ONLY the proxy endpoint keeps working
 # while, underneath it: (1) slots migrate between pairs (client must never
 # see -MOVED — the proxy absorbs and chases redirects), and (2) a master is

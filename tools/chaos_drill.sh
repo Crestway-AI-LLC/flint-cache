@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Elastic-2.0
 # Chaos gate: random master/replica kills under load, ledger-verified.
 # Requires a release build with --features rocks. Kills stray servers first.
 set -euo pipefail
