@@ -1,0 +1,41 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/flint-slot",
+    "crates/flint-resp",
+    "crates/flint-commands",
+    "crates/flint-tls",
+    "crates/flint-storage",
+    "crates/flint-server",
+    "crates/flint-conformance",
+    "crates/flint-bench",
+    "crates/flint-chaos",
+    "crates/flint-controller",
+    "crates/flint-proxy",
+    "crates/flint-controlplane",
+    "crates/flint-journal",
+    "crates/flint-ctl",
+]
+default-members = [
+    "crates/flint-slot",
+    "crates/flint-resp",
+    "crates/flint-commands",
+    "crates/flint-tls",
+    "crates/flint-storage",
+    "crates/flint-server",
+    "crates/flint-conformance",
+    "crates/flint-controller",
+    "crates/flint-proxy",
+    "crates/flint-controlplane",
+    "crates/flint-journal",
+    "crates/flint-ctl",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+license = "Elastic-2.0"
+repository = "https://github.com/CrestwayAI/flint-cache"
+
+[workspace.lints.clippy]
+unwrap_used = "warn"
