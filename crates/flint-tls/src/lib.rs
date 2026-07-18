@@ -290,3 +290,58 @@ pub fn connect(addr: &str, cfg: &Option<Arc<ClientConfig>>) -> io::Result<Stream
         }
     }
 }
+
+/// A mesh server TLS config that HOT-RELOADS its leaf cert/key from disk
+/// (ADR-0006 D4). A background thread polls the files' mtimes; on change it
+/// rebuilds the rustls `ServerConfig` and swaps it in, so a new connection
+/// picks up a freshly re-minted leaf cert with NO process restart. Existing
+/// connections keep their session (same CA — both leaves verify). Rotating
+/// the leaf is then `flintctl rotate-certs` (re-sign from the CA) + wait one
+/// poll; the CA itself stays a runbook (rare, cross-signed).
+pub struct ReloadableServerConfig {
+    current: Arc<std::sync::RwLock<Arc<ServerConfig>>>,
+}
+
+impl ReloadableServerConfig {
+    /// Build from the mesh triple and start watching `cert`/`key` for
+    /// changes (poll interval 2s). Errors only on the INITIAL build — a
+    /// later bad reload is logged and the previous good config is kept.
+    pub fn watch(ca: &str, cert: &str, key: &str) -> io::Result<Arc<Self>> {
+        let build = {
+            let (ca, cert, key) = (ca.to_string(), cert.to_string(), key.to_string());
+            move || server_config(&ca, &cert, &key)
+        };
+        let cfg = build()?;
+        let this = Arc::new(ReloadableServerConfig {
+            current: Arc::new(std::sync::RwLock::new(cfg)),
+        });
+        let watched = [cert.to_string(), key.to_string()];
+        let handle = Arc::clone(&this);
+        std::thread::spawn(move || {
+            let mtime = |p: &str| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+            let mut last: Vec<_> = watched.iter().map(|p| mtime(p)).collect();
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                let now: Vec<_> = watched.iter().map(|p| mtime(p)).collect();
+                if now != last && now.iter().all(|m| m.is_some()) {
+                    match build() {
+                        Ok(fresh) => {
+                            if let Ok(mut g) = handle.current.write() {
+                                *g = fresh;
+                            }
+                            eprintln!("tls: hot-reloaded leaf certificate");
+                            last = now;
+                        }
+                        Err(e) => eprintln!("tls: reload skipped (keeping current): {e}"),
+                    }
+                }
+            }
+        });
+        Ok(this)
+    }
+
+    /// The current config, ready for `accept`. Read once per new connection.
+    pub fn current(&self) -> Option<Arc<ServerConfig>> {
+        self.current.read().ok().map(|g| g.clone())
+    }
+}

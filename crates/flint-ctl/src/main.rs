@@ -315,6 +315,16 @@ fn mint_certs(inv: &Inventory) {
         "openssl req -x509 -newkey rsa:2048 -nodes -keyout {d}/ca.key -out {d}/ca.crt -days 365 \
          -subj /CN=flint-internal-ca -addext basicConstraints=critical,CA:TRUE 2>/dev/null"
     ));
+    resign_leaves(&d, &sh);
+    eprintln!("  minted internal CA + component cert + edge cert");
+}
+
+/// (Re-)sign the LEAF certs — the mesh cert (int) and the edge cert — from
+/// the existing CA, fresh keypairs each time. Used at bootstrap and by
+/// `rotate-certs` (ADR-0006 D4): overwriting int.crt/int.key in place makes
+/// each component's hot-reload watcher pick up the new leaf, no restart. The
+/// CA is untouched, so old and new leaves both verify during the roll.
+fn resign_leaves(d: &str, sh: &dyn Fn(&str)) {
     sh(&format!(
         "openssl req -newkey rsa:2048 -nodes -keyout {d}/int.key -out {d}/int.csr \
          -subj /CN=flint-internal 2>/dev/null"
@@ -324,9 +334,6 @@ fn mint_certs(inv: &Inventory) {
          openssl x509 -req -in {d}/int.csr -CA {d}/ca.crt -CAkey {d}/ca.key -CAcreateserial \
          -out {d}/int.crt -days 365 -extfile {d}/ext.cnf 2>/dev/null"
     ));
-    // Edge cert (client-facing TLS, ADR-0006 D2): server-auth only, with
-    // the SANs edge clients actually dial (the mesh cert's DNS:flint-internal
-    // would fail browser/redis-client verification against 127.0.0.1).
     sh(&format!(
         "openssl req -newkey rsa:2048 -nodes -keyout {d}/edge.key -out {d}/edge.csr \
          -subj /CN=flint-edge 2>/dev/null"
@@ -336,7 +343,27 @@ fn mint_certs(inv: &Inventory) {
          openssl x509 -req -in {d}/edge.csr -CA {d}/ca.crt -CAkey {d}/ca.key -CAcreateserial \
          -out {d}/edge.crt -days 365 -extfile {d}/edge-ext.cnf 2>/dev/null"
     ));
-    eprintln!("  minted internal CA + component cert + edge cert");
+}
+
+/// `flintctl rotate-certs`: re-sign the leaf certs from the CA in place; the
+/// running components' TLS watchers reload within a poll. No restart, no CA
+/// change (CA rotation stays a runbook).
+fn rotate_certs(inv: &Inventory) {
+    let d = format!("{}/certs", inv.statedir);
+    assert!(
+        std::path::Path::new(&format!("{d}/ca.crt")).exists(),
+        "no CA at {d}/ca.crt — is this a `tls on` cluster?"
+    );
+    let sh = |cmd: &str| {
+        let ok = Command::new("sh")
+            .args(["-c", cmd])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(ok, "cert step failed: {cmd}");
+    };
+    resign_leaves(&d, &sh);
+    println!("re-signed mesh + edge leaf certs from the CA; components hot-reload within ~2s");
 }
 
 /// Proxy liveness that respects the front door: plaintext fleets answer
@@ -1159,6 +1186,10 @@ fn main() {
         // Rotate the FLEET ADMIN token (ADR-0006 D4): the CP mints the
         // successor, keeps both valid, and the agent retires the old one
         // once it has rolled through the fleet. Prints the new token ONCE.
+        // Re-sign the mesh/edge LEAF certs from the CA (ADR-0006 D4);
+        // running components hot-reload with no restart. CA rotation is a
+        // runbook, not this verb.
+        "rotate-certs" => rotate_certs(&inv),
         "rotate-admin" => {
             let tls = tls_client(&inv);
             match call(&inv.cp[0], &tls, &["CPADMINROTATE"]) {
@@ -1223,7 +1254,7 @@ fn main() {
         "stop" => stop(&inv),
         other => {
             panic!(
-                "unknown command {other:?} (bootstrap|status|tenant|tenant-reads|tenant-cache|tenant-quota|rotate-admin|proxy-cache|expand|swap-node|add-replica|upgrade|stop)"
+                "unknown command {other:?} (bootstrap|status|tenant|tenant-reads|tenant-cache|tenant-quota|rotate-admin|rotate-certs|proxy-cache|expand|swap-node|add-replica|upgrade|stop)"
             )
         }
     }

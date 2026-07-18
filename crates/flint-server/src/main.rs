@@ -129,7 +129,12 @@ fn main() -> std::io::Result<()> {
     // chaining to the CA), client config on every node→node dial (replication
     // tail, full sync, migrate, cutover). Parsed before anything dials out:
     // a fresh replica's checkpoint download happens during startup, below.
-    let internal_tls: Option<Arc<flint_tls::ServerConfig>> = match (
+    // The data port's mesh TLS config HOT-RELOADS its leaf on disk change
+    // (ADR-0006 D4): `flintctl rotate-certs` re-signs the leaf and this
+    // listener picks it up within a poll — no restart. (The client config
+    // dialed on node->node hops is still built once; leaf rotation on the
+    // dial side is the same helper, a follow-on.)
+    let internal_reload: Option<Arc<flint_tls::ReloadableServerConfig>> = match (
         arg("--internal-ca"),
         arg("--internal-cert"),
         arg("--internal-key"),
@@ -140,7 +145,7 @@ fn main() -> std::io::Result<()> {
                     .expect("build internal TLS client config"),
             ));
             Some(
-                flint_tls::server_config(&ca, &cert, &key)
+                flint_tls::ReloadableServerConfig::watch(&ca, &cert, &key)
                     .expect("build internal TLS server config"),
             )
         }
@@ -509,7 +514,7 @@ fn main() -> std::io::Result<()> {
     let listener = TcpListener::bind(("127.0.0.1", port))?;
     eprintln!(
         "flint-server listening on 127.0.0.1:{port} ({})",
-        if internal_tls.is_some() {
+        if internal_reload.is_some() {
             "internal mTLS"
         } else {
             "plaintext"
@@ -527,7 +532,9 @@ fn main() -> std::io::Result<()> {
         let lease_deadline = Arc::clone(&lease_deadline);
         let migration_active = Arc::clone(&migration_active);
         let write_queue = write_queue.clone();
-        let internal_tls = internal_tls.clone();
+        // Snapshot the CURRENT leaf per connection — a hot-reload between
+        // connections is picked up here (ADR-0006 D4).
+        let internal_tls = internal_reload.as_ref().and_then(|r| r.current());
         std::thread::spawn(move || {
             // TLS handshake (incl. mutual client-cert verification) runs lazily
             // on serve's first read; a peer that fails it errors out there.
