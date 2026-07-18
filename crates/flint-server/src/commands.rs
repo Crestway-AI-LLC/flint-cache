@@ -14,7 +14,7 @@ use flint_storage::keyspace::{Keyspace, Ttl};
 use flint_storage::lists::ListStore;
 use flint_storage::sets::SetStore;
 use flint_storage::strings::{Clock, SetExpiry, SetOptions, SetOutcome, StoreError, StringStore};
-use flint_storage::zsets::ZSetStore;
+use flint_storage::zsets::{ScoreBound, ZSetStore};
 
 /// True for commands that mutate the keyspace (rejected on replicas).
 /// Delegates to the SHARED classifier (flint-commands, ADR-0005 D1): the
@@ -495,6 +495,17 @@ impl<'a> Dispatcher<'a> {
                 })
             }),
             b"ZRANGE" => self.cmd_zrange(args),
+            b"ZREVRANGE" => self.cmd_zrange_idx(args, "zrevrange", true),
+            b"ZRANGEBYSCORE" => self.cmd_zrangebyscore(args, "zrangebyscore", false),
+            b"ZREVRANGEBYSCORE" => self.cmd_zrangebyscore(args, "zrevrangebyscore", true),
+            b"ZRANK" => self.cmd_zrank(args, "zrank", false),
+            b"ZREVRANK" => self.cmd_zrank(args, "zrevrank", true),
+            b"ZCOUNT" => self.cmd_zcount(args),
+            b"ZMSCORE" => self.cmd_zmscore(args),
+            b"ZPOPMIN" => self.cmd_zpop(args, "zpopmin", false),
+            b"ZPOPMAX" => self.cmd_zpop(args, "zpopmax", true),
+            b"ZREMRANGEBYSCORE" => self.cmd_zremrangebyscore(args),
+            b"ZREMRANGEBYRANK" => self.cmd_zremrangebyrank(args),
 
             // keyspace (type-agnostic)
             b"DEL" | b"UNLINK" => {
@@ -705,6 +716,170 @@ impl<'a> Dispatcher<'a> {
             ),
             _ => err("ERR value is not an integer or out of range"),
         }
+    }
+
+    fn zrows(ranked: Vec<(Vec<u8>, f64)>, withscores: bool) -> Value {
+        let mut out = Vec::new();
+        for (member, score) in ranked {
+            out.push(Value::Bulk(Some(member)));
+            if withscores {
+                out.push(Value::Bulk(Some(fmt_score(score))));
+            }
+        }
+        Value::Array(Some(out))
+    }
+
+    fn cmd_zrange_idx(&self, args: &[Vec<u8>], name: &str, rev: bool) -> Value {
+        let withscores = match args.len() {
+            4 => false,
+            5 if args[4].eq_ignore_ascii_case(b"WITHSCORES") => true,
+            5 => return err("ERR syntax error"),
+            _ => return arity_err(name),
+        };
+        match (parse_i64(&args[2]), parse_i64(&args[3])) {
+            (Ok(start), Ok(stop)) => reply(
+                self.zsets
+                    .zrange_rev(slot_for_key(&args[1]), &args[1], start, stop, rev),
+                |r| Self::zrows(r, withscores),
+            ),
+            _ => err("ERR value is not an integer or out of range"),
+        }
+    }
+
+    /// ZRANGEBYSCORE / ZREVRANGEBYSCORE key min max [WITHSCORES]
+    /// [LIMIT offset count]. The reversed form takes (max, min).
+    fn cmd_zrangebyscore(&self, args: &[Vec<u8>], name: &str, rev: bool) -> Value {
+        if args.len() < 4 {
+            return arity_err(name);
+        }
+        let (lo_raw, hi_raw) = if rev {
+            (&args[3], &args[2])
+        } else {
+            (&args[2], &args[3])
+        };
+        let (Some(min), Some(max)) = (ScoreBound::parse(lo_raw), ScoreBound::parse(hi_raw)) else {
+            return err("ERR min or max is not a float");
+        };
+        let mut withscores = false;
+        let (mut offset, mut count) = (0i64, -1i64);
+        let mut i = 4;
+        while i < args.len() {
+            match args[i].to_ascii_uppercase().as_slice() {
+                b"WITHSCORES" => withscores = true,
+                b"LIMIT" => {
+                    let (Some(o), Some(c)) = (args.get(i + 1), args.get(i + 2)) else {
+                        return err("ERR syntax error");
+                    };
+                    let (Ok(o), Ok(c)) = (parse_i64(o), parse_i64(c)) else {
+                        return err("ERR value is not an integer or out of range");
+                    };
+                    offset = o;
+                    count = c;
+                    i += 2;
+                }
+                _ => return err("ERR syntax error"),
+            }
+            i += 1;
+        }
+        reply(
+            self.zsets.zrange_by_score(
+                slot_for_key(&args[1]),
+                &args[1],
+                min,
+                max,
+                rev,
+                offset,
+                count,
+            ),
+            |r| Self::zrows(r, withscores),
+        )
+    }
+
+    fn cmd_zrank(&self, args: &[Vec<u8>], name: &str, rev: bool) -> Value {
+        exact(args, 3, name, |a| {
+            reply(
+                self.zsets.zrank(slot_for_key(&a[1]), &a[1], &a[2], rev),
+                |o| match o {
+                    Some(rank) => Value::Integer(rank as i64),
+                    None => Value::Bulk(None),
+                },
+            )
+        })
+    }
+
+    fn cmd_zcount(&self, args: &[Vec<u8>]) -> Value {
+        exact(args, 4, "zcount", |a| {
+            let (Some(min), Some(max)) = (ScoreBound::parse(&a[2]), ScoreBound::parse(&a[3]))
+            else {
+                return err("ERR min or max is not a float");
+            };
+            reply(
+                self.zsets.zcount(slot_for_key(&a[1]), &a[1], min, max),
+                |n| Value::Integer(n as i64),
+            )
+        })
+    }
+
+    fn cmd_zmscore(&self, args: &[Vec<u8>]) -> Value {
+        if args.len() < 3 {
+            return arity_err("zmscore");
+        }
+        reply(
+            self.zsets
+                .zmscore(slot_for_key(&args[1]), &args[1], &args[2..]),
+            |scores| {
+                Value::Array(Some(
+                    scores
+                        .into_iter()
+                        .map(|s| Value::Bulk(s.map(fmt_score)))
+                        .collect(),
+                ))
+            },
+        )
+    }
+
+    fn cmd_zpop(&self, args: &[Vec<u8>], name: &str, max_end: bool) -> Value {
+        let count = match args.len() {
+            2 => 1usize,
+            3 => match parse_i64(&args[2]) {
+                Ok(n) if n >= 0 => n as usize,
+                Ok(_) => return err("ERR value is out of range, must be positive"),
+                Err(_) => return err("ERR value is not an integer or out of range"),
+            },
+            _ => return arity_err(name),
+        };
+        reply(
+            self.zsets
+                .zpop(slot_for_key(&args[1]), &args[1], count, max_end),
+            |r| Self::zrows(r, true),
+        )
+    }
+
+    fn cmd_zremrangebyscore(&self, args: &[Vec<u8>]) -> Value {
+        exact(args, 4, "zremrangebyscore", |a| {
+            let (Some(min), Some(max)) = (ScoreBound::parse(&a[2]), ScoreBound::parse(&a[3]))
+            else {
+                return err("ERR min or max is not a float");
+            };
+            reply(
+                self.zsets
+                    .zremrangebyscore(slot_for_key(&a[1]), &a[1], min, max),
+                |n| Value::Integer(n as i64),
+            )
+        })
+    }
+
+    fn cmd_zremrangebyrank(&self, args: &[Vec<u8>]) -> Value {
+        exact(args, 4, "zremrangebyrank", |a| {
+            match (parse_i64(&a[2]), parse_i64(&a[3])) {
+                (Ok(start), Ok(stop)) => reply(
+                    self.zsets
+                        .zremrangebyrank(slot_for_key(&a[1]), &a[1], start, stop),
+                    |n| Value::Integer(n as i64),
+                ),
+                _ => err("ERR value is not an integer or out of range"),
+            }
+        })
     }
 
     fn cmd_expire(&self, args: &[Vec<u8>], name: &str, unit_ms: u64) -> Value {

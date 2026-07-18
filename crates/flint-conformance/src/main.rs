@@ -730,6 +730,144 @@ fn corpus() -> Vec<Case> {
                 ),
             ],
         },
+        // --- Tier-2: sorted-set range family (validated vs Valkey) ---
+        Case {
+            family: "zsets",
+            name: "zrangebyscore inclusive and exclusive",
+            steps: vec![
+                s(
+                    &[b"ZADD", b"zr", b"1", b"a", b"2", b"b", b"3", b"c"],
+                    Expect::Int(3),
+                ),
+                s(
+                    &[b"ZRANGEBYSCORE", b"zr", b"1", b"2"],
+                    Expect::Arr(vec![Expect::Str(b"a"), Expect::Str(b"b")]),
+                ),
+                s(
+                    &[b"ZRANGEBYSCORE", b"zr", b"(1", b"3"],
+                    Expect::Arr(vec![Expect::Str(b"b"), Expect::Str(b"c")]),
+                ),
+                s(
+                    &[b"ZRANGEBYSCORE", b"zr", b"-inf", b"+inf"],
+                    Expect::Arr(vec![
+                        Expect::Str(b"a"),
+                        Expect::Str(b"b"),
+                        Expect::Str(b"c"),
+                    ]),
+                ),
+                s(
+                    &[b"ZRANGEBYSCORE", b"zr", b"-inf", b"+inf", b"WITHSCORES"],
+                    Expect::Arr(vec![
+                        Expect::Str(b"a"),
+                        Expect::Str(b"1"),
+                        Expect::Str(b"b"),
+                        Expect::Str(b"2"),
+                        Expect::Str(b"c"),
+                        Expect::Str(b"3"),
+                    ]),
+                ),
+                s(
+                    &[
+                        b"ZRANGEBYSCORE",
+                        b"zr",
+                        b"-inf",
+                        b"+inf",
+                        b"LIMIT",
+                        b"1",
+                        b"1",
+                    ],
+                    Expect::Arr(vec![Expect::Str(b"b")]),
+                ),
+            ],
+        },
+        Case {
+            family: "zsets",
+            name: "zrevrange and zrevrangebyscore",
+            steps: vec![
+                s(
+                    &[b"ZADD", b"zv", b"1", b"a", b"2", b"b", b"3", b"c"],
+                    Expect::Int(3),
+                ),
+                s(
+                    &[b"ZREVRANGE", b"zv", b"0", b"-1"],
+                    Expect::Arr(vec![
+                        Expect::Str(b"c"),
+                        Expect::Str(b"b"),
+                        Expect::Str(b"a"),
+                    ]),
+                ),
+                s(
+                    &[b"ZREVRANGEBYSCORE", b"zv", b"3", b"2"],
+                    Expect::Arr(vec![Expect::Str(b"c"), Expect::Str(b"b")]),
+                ),
+            ],
+        },
+        Case {
+            family: "zsets",
+            name: "zrank zrevrank zcount zmscore",
+            steps: vec![
+                s(
+                    &[b"ZADD", b"zk", b"10", b"a", b"20", b"b", b"30", b"c"],
+                    Expect::Int(3),
+                ),
+                s(&[b"ZRANK", b"zk", b"a"], Expect::Int(0)),
+                s(&[b"ZRANK", b"zk", b"c"], Expect::Int(2)),
+                s(&[b"ZRANK", b"zk", b"missing"], Expect::Nil),
+                s(&[b"ZREVRANK", b"zk", b"a"], Expect::Int(2)),
+                s(&[b"ZCOUNT", b"zk", b"15", b"30"], Expect::Int(2)),
+                s(&[b"ZCOUNT", b"zk", b"(10", b"(30"], Expect::Int(1)),
+                s(
+                    &[b"ZMSCORE", b"zk", b"a", b"nope", b"c"],
+                    Expect::Arr(vec![Expect::Str(b"10"), Expect::Nil, Expect::Str(b"30")]),
+                ),
+            ],
+        },
+        Case {
+            family: "zsets",
+            name: "zpopmin zpopmax",
+            steps: vec![
+                s(
+                    &[b"ZADD", b"zp", b"1", b"a", b"2", b"b", b"3", b"c"],
+                    Expect::Int(3),
+                ),
+                s(
+                    &[b"ZPOPMIN", b"zp"],
+                    Expect::Arr(vec![Expect::Str(b"a"), Expect::Str(b"1")]),
+                ),
+                s(
+                    &[b"ZPOPMAX", b"zp", b"2"],
+                    Expect::Arr(vec![
+                        Expect::Str(b"c"),
+                        Expect::Str(b"3"),
+                        Expect::Str(b"b"),
+                        Expect::Str(b"2"),
+                    ]),
+                ),
+                s(&[b"ZCARD", b"zp"], Expect::Int(0)),
+            ],
+        },
+        Case {
+            family: "zsets",
+            name: "zremrangebyscore and byrank",
+            steps: vec![
+                s(
+                    &[
+                        b"ZADD", b"zd", b"1", b"a", b"2", b"b", b"3", b"c", b"4", b"d",
+                    ],
+                    Expect::Int(4),
+                ),
+                s(&[b"ZREMRANGEBYSCORE", b"zd", b"2", b"3"], Expect::Int(2)),
+                s(
+                    &[b"ZRANGE", b"zd", b"0", b"-1"],
+                    Expect::Arr(vec![Expect::Str(b"a"), Expect::Str(b"d")]),
+                ),
+                s(&[b"ZREMRANGEBYRANK", b"zd", b"0", b"0"], Expect::Int(1)),
+                s(
+                    &[b"ZRANGE", b"zd", b"0", b"-1"],
+                    Expect::Arr(vec![Expect::Str(b"d")]),
+                ),
+            ],
+        },
     ]
 }
 

@@ -21,6 +21,50 @@ pub struct ZSetStore<'a> {
 
 /// What one member contributes to the zset's byte total: the member
 /// payload plus its 8-byte score.
+/// A ZRANGEBYSCORE / ZCOUNT bound: a value with inclusive/exclusive flag.
+/// `-inf`/`+inf` parse to ±infinity (always satisfied on that side).
+#[derive(Clone, Copy)]
+pub struct ScoreBound {
+    pub value: f64,
+    pub inclusive: bool,
+}
+
+impl ScoreBound {
+    /// Parse a Redis score-range token: "5" (inclusive), "(5" (exclusive),
+    /// "-inf"/"+inf"/"inf". None = malformed.
+    pub fn parse(raw: &[u8]) -> Option<ScoreBound> {
+        let (inclusive, body) = match raw.first() {
+            Some(b'(') => (false, &raw[1..]),
+            _ => (true, raw),
+        };
+        let text = std::str::from_utf8(body).ok()?.trim();
+        let value = match text.to_ascii_lowercase().as_str() {
+            "-inf" | "-infinity" => f64::NEG_INFINITY,
+            "+inf" | "inf" | "+infinity" | "infinity" => f64::INFINITY,
+            other => other.parse::<f64>().ok()?,
+        };
+        Some(ScoreBound { value, inclusive })
+    }
+
+    /// Is `score` above this LOWER bound?
+    fn ge_lower(&self, score: f64) -> bool {
+        if self.inclusive {
+            score >= self.value
+        } else {
+            score > self.value
+        }
+    }
+
+    /// Is `score` below this UPPER bound?
+    fn le_upper(&self, score: f64) -> bool {
+        if self.inclusive {
+            score <= self.value
+        } else {
+            score < self.value
+        }
+    }
+}
+
 fn member_cost(member: &[u8]) -> u64 {
     member.len() as u64 + 8
 }
@@ -185,6 +229,189 @@ impl<'a> ZSetStore<'a> {
 
     /// ZRANGE by rank (inclusive, negatives from end): (member, score) in
     /// (score, member) order.
+    /// All (member, score) in ascending (score, member) order — the ZScore
+    /// CF is already ordered that way, so this is a single prefix scan. A
+    /// zset lives in ONE key, so this is bounded by the zset's cardinality.
+    fn all_ordered(&self, slot: u16, key: &[u8]) -> Result<Vec<(Vec<u8>, f64)>, StoreError> {
+        let Some(meta) = self.read_meta(slot, key)? else {
+            return Ok(Vec::new());
+        };
+        let prefix = zscore_prefix(&self.ns, slot, key, meta.version);
+        Ok(self
+            .kv
+            .scan_prefix(&prefix)
+            .into_iter()
+            .map(|(k, _)| {
+                let rest = &k[prefix.len()..];
+                let score =
+                    decode_score(u64::from_be_bytes(rest[..8].try_into().unwrap_or([0; 8])));
+                (rest[8..].to_vec(), score)
+            })
+            .collect())
+    }
+
+    /// ZRANGEBYSCORE / ZREVRANGEBYSCORE: members whose score is in
+    /// [min,max] (bounds may be exclusive), optionally reversed, then
+    /// LIMIT offset/count applied. Ascending output unless `rev`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn zrange_by_score(
+        &self,
+        slot: u16,
+        key: &[u8],
+        min: ScoreBound,
+        max: ScoreBound,
+        rev: bool,
+        offset: i64,
+        count: i64,
+    ) -> Result<Vec<(Vec<u8>, f64)>, StoreError> {
+        let mut hits: Vec<(Vec<u8>, f64)> = self
+            .all_ordered(slot, key)?
+            .into_iter()
+            .filter(|(_, sc)| min.ge_lower(*sc) && max.le_upper(*sc))
+            .collect();
+        if rev {
+            hits.reverse();
+        }
+        // LIMIT offset count (count < 0 = to the end); no LIMIT => all.
+        if offset > 0 {
+            let off = (offset as usize).min(hits.len());
+            hits.drain(..off);
+        }
+        if count >= 0 {
+            hits.truncate(count as usize);
+        }
+        Ok(hits)
+    }
+
+    /// ZCOUNT: members with score in [min,max].
+    pub fn zcount(
+        &self,
+        slot: u16,
+        key: &[u8],
+        min: ScoreBound,
+        max: ScoreBound,
+    ) -> Result<u64, StoreError> {
+        Ok(self
+            .all_ordered(slot, key)?
+            .into_iter()
+            .filter(|(_, sc)| min.ge_lower(*sc) && max.le_upper(*sc))
+            .count() as u64)
+    }
+
+    /// ZRANK / ZREVRANK: 0-based position of `member` in ascending (rev:
+    /// descending) order; None if absent.
+    pub fn zrank(
+        &self,
+        slot: u16,
+        key: &[u8],
+        member: &[u8],
+        rev: bool,
+    ) -> Result<Option<u64>, StoreError> {
+        let all = self.all_ordered(slot, key)?;
+        let Some(idx) = all.iter().position(|(m, _)| m.as_slice() == member) else {
+            return Ok(None);
+        };
+        Ok(Some(if rev {
+            (all.len() - 1 - idx) as u64
+        } else {
+            idx as u64
+        }))
+    }
+
+    /// ZMSCORE: score of each member (None per missing).
+    pub fn zmscore(
+        &self,
+        slot: u16,
+        key: &[u8],
+        members: &[Vec<u8>],
+    ) -> Result<Vec<Option<f64>>, StoreError> {
+        members.iter().map(|m| self.zscore(slot, key, m)).collect()
+    }
+
+    /// ZPOPMIN / ZPOPMAX: remove and return up to `count` members from the
+    /// low (min) or high (max) end, in pop order.
+    pub fn zpop(
+        &self,
+        slot: u16,
+        key: &[u8],
+        count: usize,
+        max_end: bool,
+    ) -> Result<Vec<(Vec<u8>, f64)>, StoreError> {
+        let mut all = self.all_ordered(slot, key)?;
+        if max_end {
+            all.reverse();
+        }
+        let popped: Vec<(Vec<u8>, f64)> = all.into_iter().take(count).collect();
+        let members: Vec<Vec<u8>> = popped.iter().map(|(m, _)| m.clone()).collect();
+        self.zrem(slot, key, &members)?;
+        Ok(popped)
+    }
+
+    /// ZREMRANGEBYSCORE: remove members with score in [min,max]; count.
+    pub fn zremrangebyscore(
+        &self,
+        slot: u16,
+        key: &[u8],
+        min: ScoreBound,
+        max: ScoreBound,
+    ) -> Result<u64, StoreError> {
+        let doomed: Vec<Vec<u8>> = self
+            .all_ordered(slot, key)?
+            .into_iter()
+            .filter(|(_, sc)| min.ge_lower(*sc) && max.le_upper(*sc))
+            .map(|(m, _)| m)
+            .collect();
+        self.zrem(slot, key, &doomed)
+    }
+
+    /// ZREMRANGEBYRANK: remove members in the [start,stop] rank window
+    /// (negatives from the end); count.
+    pub fn zremrangebyrank(
+        &self,
+        slot: u16,
+        key: &[u8],
+        start: i64,
+        stop: i64,
+    ) -> Result<u64, StoreError> {
+        let all = self.all_ordered(slot, key)?;
+        let len = all.len() as i64;
+        let norm = |i: i64| if i < 0 { len + i } else { i };
+        let from = norm(start).max(0);
+        let to = norm(stop).min(len - 1);
+        if from > to || all.is_empty() {
+            return Ok(0);
+        }
+        let doomed: Vec<Vec<u8>> = all[from as usize..=to as usize]
+            .iter()
+            .map(|(m, _)| m.clone())
+            .collect();
+        self.zrem(slot, key, &doomed)
+    }
+
+    /// ZRANGE by rank (inclusive, negatives from end), optionally reversed
+    /// (ZREVRANGE): (member, score) in (score, member) order.
+    pub fn zrange_rev(
+        &self,
+        slot: u16,
+        key: &[u8],
+        start: i64,
+        stop: i64,
+        rev: bool,
+    ) -> Result<Vec<(Vec<u8>, f64)>, StoreError> {
+        let mut all = self.all_ordered(slot, key)?;
+        if rev {
+            all.reverse();
+        }
+        let len = all.len() as i64;
+        let norm = |i: i64| if i < 0 { len + i } else { i };
+        let from = norm(start).max(0);
+        let to = norm(stop).min(len - 1);
+        if from > to {
+            return Ok(Vec::new());
+        }
+        Ok(all[from as usize..=to as usize].to_vec())
+    }
+
     pub fn zrange(
         &self,
         slot: u16,

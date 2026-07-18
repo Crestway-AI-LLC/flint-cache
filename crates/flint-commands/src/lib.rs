@@ -46,6 +46,10 @@ pub fn is_write_command(name: &[u8]) -> bool {
             | b"ZADD"
             | b"ZREM"
             | b"ZINCRBY"
+            | b"ZPOPMIN"
+            | b"ZPOPMAX"
+            | b"ZREMRANGEBYSCORE"
+            | b"ZREMRANGEBYRANK"
     )
 }
 
@@ -79,7 +83,13 @@ pub fn is_read_command(name: &[u8]) -> bool {
             | b"ZSCORE"
             | b"ZCARD"
             | b"ZRANGE"
+            | b"ZREVRANGE"
+            | b"ZRANGEBYSCORE"
+            | b"ZREVRANGEBYSCORE"
             | b"ZRANK"
+            | b"ZREVRANK"
+            | b"ZCOUNT"
+            | b"ZMSCORE"
             | b"DBSIZE"
     )
 }
