@@ -24,7 +24,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(feature = "rocks")]
 use std::sync::mpsc::Receiver;
-use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
+use std::sync::mpsc::{RecvTimeoutError, SyncSender, TrySendError, sync_channel};
+use std::time::Duration;
 
 use flint_resp::Value;
 #[cfg(feature = "rocks")]
@@ -40,6 +41,12 @@ use crate::commands::{Dispatcher, Limits};
 /// Max commands merged into one engine write. Bigger = better amortization,
 /// worse tail latency for the last op in a batch; 256 is a balanced default.
 const BATCH_MAX: usize = 256;
+/// A queued write that has not been acked within this window means the
+/// single consumer is wedged (e.g. a RocksDB write stall mid-commit). Rather
+/// than block the connection thread forever, the writer is shed -THROTTLED
+/// (the queue's own bounded contract) so the client backs off instead of
+/// hanging. Generous vs any healthy batch commit.
+const SUBMIT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Default bounded queue depth. Full -> the writer gets -THROTTLED (the
 /// existing back-off contract), never an unbounded backlog. Overridable with
 /// `--async-queue-cap` (lets operators tune the shed point, and lets the
@@ -140,9 +147,18 @@ impl WriteQueue {
             args,
             reply: rtx,
         }) {
-            Ok(()) => rrx
-                .recv()
-                .unwrap_or_else(|_| Value::Error("ERR async write consumer stopped".into())),
+            Ok(()) => match rrx.recv_timeout(SUBMIT_TIMEOUT) {
+                Ok(reply) => reply,
+                // The consumer is wedged: don't hang the connection forever.
+                // The write's own slot is left counted-in-flight (the batch
+                // may still commit it); the CLIENT is told to back off.
+                Err(RecvTimeoutError::Timeout) => {
+                    Value::Error("THROTTLED async write queue stalled, retry with backoff".into())
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    Value::Error("ERR async write consumer stopped".into())
+                }
+            },
             Err(TrySendError::Full(_)) => {
                 self.depth.fetch_sub(1, Ordering::Relaxed);
                 Value::Error("THROTTLED async write queue full, retry with backoff".into())

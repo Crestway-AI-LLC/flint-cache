@@ -54,6 +54,19 @@ impl RocksKv {
         self.db.write(wb)
     }
 
+    /// Engine write-stall signals (W2 back-pressure visibility): RocksDB's
+    /// L0/pending-compaction back-pressure that silently slows or stops
+    /// writes. Returns (write_stopped, delayed_write_rate_bytes_per_sec):
+    /// stopped=1 means writes are fully halted; a nonzero rate means writes
+    /// are being throttled (soft stall). Both 0 = healthy.
+    pub fn write_stall(&self) -> (u64, u64) {
+        let prop = |name: &str| self.db.property_int_value(name).ok().flatten().unwrap_or(0);
+        (
+            prop("rocksdb.is-write-stopped"),
+            prop("rocksdb.actual-delayed-write-rate"),
+        )
+    }
+
     /// Approximate resident bytes for one namespace — the storage-metering
     /// signal (M5 quotas). Uses the engine's SST range estimator over the
     /// namespace's three envelope prefixes (Metadata/Subkey/ZScore), so it

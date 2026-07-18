@@ -67,6 +67,25 @@ static REPLICA_CONTACT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::Ato
 /// Read-staleness bound (ms). Well above the 500ms keepalive so a healthy
 /// replica never false-fences; tunable with --replica-read-stale-ms.
 static REPLICA_STALE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(3000);
+/// Data-port connection cap (B1 back-pressure symmetry with the proxy's
+/// admission control). Thread-per-connection: without a bound, a connection
+/// storm exhausts the node's threads. This is the INTERNAL mesh surface, so
+/// only a buggy proxy fleet or runaway internal tooling can approach it — a
+/// generous safety valve, not a tenant-facing limit. Over the cap a new
+/// connection is DROPPED (a reset the peer backs off on; writing a
+/// pre-handshake shed frame over mutual TLS is not possible). Tunable with
+/// --max-conns.
+static MAX_CONNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(2048);
+static ACTIVE_CONNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static CONNS_SHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Decrements the live-connection counter on any exit (incl. panic).
+struct ConnGuard;
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        ACTIVE_CONNS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
 // Only the rocks paths (full-sync serving + its FLINTINFO fields) read this.
 #[cfg_attr(not(feature = "rocks"), allow(dead_code))]
 static FULLSYNC_ACTIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -138,6 +157,9 @@ fn main() -> std::io::Result<()> {
     }
     if let Some(n) = arg("--replica-read-stale-ms").and_then(|v| v.parse::<u64>().ok()) {
         REPLICA_STALE_MS.store(n, Ordering::Relaxed);
+    }
+    if let Some(n) = arg("--max-conns").and_then(|v| v.parse::<usize>().ok()) {
+        MAX_CONNS.store(n.max(1), Ordering::Relaxed);
     }
     let _ = JOURNAL_TARGET.set(arg("--journal"));
     let engine = arg("--engine").unwrap_or_else(|| "mem".into());
@@ -542,6 +564,14 @@ fn main() -> std::io::Result<()> {
     );
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
+        // B1: shed over the connection cap (drop = reset; the peer backs
+        // off). Reserve the slot before spawning so the count is accurate.
+        if ACTIVE_CONNS.fetch_add(1, Ordering::Relaxed) >= MAX_CONNS.load(Ordering::Relaxed) {
+            ACTIVE_CONNS.fetch_sub(1, Ordering::Relaxed);
+            CONNS_SHED.fetch_add(1, Ordering::Relaxed);
+            drop(stream);
+            continue;
+        }
         let store: Arc<dyn Kv> = Arc::clone(&store);
         // Option<Arc<RocksKv>> with the feature; Option<()> (Copy) without.
         #[allow(clippy::clone_on_copy)]
@@ -556,6 +586,7 @@ fn main() -> std::io::Result<()> {
         // connections is picked up here (ADR-0006 D4).
         let internal_tls = internal_reload.as_ref().and_then(|r| r.current());
         std::thread::spawn(move || {
+            let _conn_guard = ConnGuard;
             // TLS handshake (incl. mutual client-cert verification) runs lazily
             // on serve's first read; a peer that fails it errors out there.
             let conn = match flint_tls::accept(stream, &internal_tls) {
@@ -1206,7 +1237,7 @@ fn flintinfo(
         None => "none".into(),
     };
     let info = format!(
-        "role:{}\r\nrole_epoch:{role_epoch}\r\nbuild:{build}\r\nsst_bytes:{sst}\r\nlatest_seq:{latest}\r\nlast_applied:{last_applied}\r\nacked_seq:{}\r\nseq_lag:{seq_lag}\r\nlive_replicas:{}\r\nlag_ms:{}\r\nlag_soft_ms:{soft}\r\nlag_hard_ms:{hard}\r\nmin_replicas_to_write:{minr}\r\nfullsync_active:{fsa}\r\nfullsync_max:{fsm}\r\nasync_write_queue:{aqd}\r\ncert_days_remaining:{cdr}\r\n",
+        "role:{}\r\nrole_epoch:{role_epoch}\r\nbuild:{build}\r\nsst_bytes:{sst}\r\nlatest_seq:{latest}\r\nlast_applied:{last_applied}\r\nacked_seq:{}\r\nseq_lag:{seq_lag}\r\nlive_replicas:{}\r\nlag_ms:{}\r\nlag_soft_ms:{soft}\r\nlag_hard_ms:{hard}\r\nmin_replicas_to_write:{minr}\r\nfullsync_active:{fsa}\r\nfullsync_max:{fsm}\r\nasync_write_queue:{aqd}\r\ncert_days_remaining:{cdr}\r\nactive_conns:{ac}\r\nmax_conns:{mc}\r\nconns_shed_total:{cs}\r\nwrite_stopped:{wst}\r\ndelayed_write_rate:{dwr}\r\n",
         if read_only { "replica" } else { "master" },
         hub.effective_acked(now)
             .map_or_else(|| "none".into(), |a| a.to_string()),
@@ -1226,6 +1257,11 @@ fn flintinfo(
             .and_then(|p| p.as_deref())
             .and_then(flint_tls::cert_days_remaining)
             .map_or_else(|| "none".into(), |d| d.to_string()),
+        ac = ACTIVE_CONNS.load(Ordering::Relaxed),
+        mc = MAX_CONNS.load(Ordering::Relaxed),
+        cs = CONNS_SHED.load(Ordering::Relaxed),
+        wst = rocks.as_ref().map(|kv| kv.write_stall().0).unwrap_or(0),
+        dwr = rocks.as_ref().map(|kv| kv.write_stall().1).unwrap_or(0),
     );
     Value::Bulk(Some(info.into_bytes()))
 }
