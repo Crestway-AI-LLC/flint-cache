@@ -55,6 +55,18 @@ static INTERNAL_CLIENT: std::sync::OnceLock<Option<Arc<flint_tls::ClientConfig>>
 /// tail is unaffected — this bounds only bulk SEEDING). Default 2; tune with
 /// `--max-fullsync`.
 static MAX_FULLSYNC: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(2);
+/// Wall-clock ms of this replica's last contact FROM the master over the
+/// FLINTSYNC stream (batch or idle keepalive). A replica whose contact is
+/// older than REPLICA_STALE_MS is not in live sync and self-fences READS
+/// (R1): it returns -TRYAGAIN, and the proxy's existing dead-replica
+/// fallback retries the master — so a wedged/partitioned replica can never
+/// serve arbitrarily stale data past the bound the tenant was promised.
+/// 0 = never contacted (a fresh, still-catching-up replica fences until its
+/// first keepalive). A MASTER never consults this.
+static REPLICA_CONTACT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Read-staleness bound (ms). Well above the 500ms keepalive so a healthy
+/// replica never false-fences; tunable with --replica-read-stale-ms.
+static REPLICA_STALE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(3000);
 // Only the rocks paths (full-sync serving + its FLINTINFO fields) read this.
 #[cfg_attr(not(feature = "rocks"), allow(dead_code))]
 static FULLSYNC_ACTIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -123,6 +135,9 @@ fn main() -> std::io::Result<()> {
     let _ = SELF_ADDR.set(format!("127.0.0.1:{port}"));
     if let Some(n) = arg("--max-fullsync").and_then(|v| v.parse::<usize>().ok()) {
         MAX_FULLSYNC.store(n.max(1), Ordering::Relaxed);
+    }
+    if let Some(n) = arg("--replica-read-stale-ms").and_then(|v| v.parse::<u64>().ok()) {
+        REPLICA_STALE_MS.store(n, Ordering::Relaxed);
     }
     let _ = JOURNAL_TARGET.set(arg("--journal"));
     let engine = arg("--engine").unwrap_or_else(|| "mem".into());
@@ -808,6 +823,24 @@ fn execute(
     if ro && is_write {
         return Value::Error("READONLY You can't write against a read only replica.".into());
     }
+    // R1: a replica self-fences READS once it has lost live contact with the
+    // master for longer than the staleness bound. Admin/FLINT* commands are
+    // exempt (they are diagnostics, not tenant reads); a fresh replica that
+    // has never heard from the master (contact 0) also fences.
+    if ro
+        && args
+            .first()
+            .is_some_and(|name| flint_commands::is_read_command(name))
+    {
+        let contact = REPLICA_CONTACT_MS.load(Ordering::Relaxed);
+        let now = flint_storage::strings::system_clock();
+        let stale = REPLICA_STALE_MS.load(Ordering::Relaxed);
+        if contact == 0 || now.saturating_sub(contact) > stale {
+            return Value::Error(
+                "TRYAGAIN replica out of sync (stale reads fenced); retry — the proxy will route to the master".into(),
+            );
+        }
+    }
     if args
         .first()
         .is_some_and(|n| n.eq_ignore_ascii_case(b"FLINTINFO"))
@@ -1321,6 +1354,7 @@ fn flintsync(
     // an IDLE stream uses the 20ms tick, replacing the old idle sleep.
     stream.set_read_timeout(Some(std::time::Duration::from_millis(1)))?;
     let mut idle = false;
+    let mut last_keepalive = std::time::Instant::now();
     eprintln!("replica connected, streaming from seq {cursor}");
     let replica_id = hub.register_replica();
     let mut ack_buf: Vec<u8> = Vec::new();
@@ -1401,7 +1435,17 @@ fn flintsync(
                     idle = false;
                 }
                 // Idle: the ACK drain's timeout already paced this cycle.
-                Ok(_) => idle = true,
+                // Send a liveness keepalive (re-FLINTSYNC-OK) every ~500ms so
+                // an idle replica can tell "caught up" from "cut off" (R1).
+                Ok(_) => {
+                    idle = true;
+                    if last_keepalive.elapsed() >= std::time::Duration::from_millis(500) {
+                        out.clear();
+                        encode(&Value::Simple(format!("FLINTSYNC-OK {cursor}")), &mut out);
+                        stream.write_all(&out)?;
+                        last_keepalive = std::time::Instant::now();
+                    }
+                }
                 Err(ReplError::WalGap(e)) => {
                     out.clear();
                     encode(
@@ -1736,6 +1780,9 @@ mod replica {
             match decode(&buf) {
                 Ok(Decoded::Complete(frame, used)) => {
                     buf.drain(..used);
+                    // Any frame from the master = live contact (R1).
+                    super::REPLICA_CONTACT_MS
+                        .store(flint_storage::strings::system_clock(), Ordering::Relaxed);
                     match frame {
                         Value::Simple(s) if s.starts_with("FLINTSYNC-OK") => {
                             out.clear();

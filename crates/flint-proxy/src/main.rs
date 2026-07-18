@@ -70,6 +70,19 @@ const DEFAULT_MAX_CONNS: usize = 1024;
 /// shedding, so the client needs no new vocabulary for "busy, back off".
 const SHED_FRAME: &[u8] = b"-THROTTLED proxy at connection capacity, retry with backoff\r\n";
 
+/// Per-connection undecoded-input ceiling (mirrors the server's
+/// client-query-buffer-limit). With bulk strings capped at the codec's
+/// MAX_BULK_LEN, a well-behaved client never accumulates this much pending
+/// input; hitting it means a hostile or broken client and the connection is
+/// closed. The PROXY is the tenant-facing surface, so it must bound this too
+/// — not only the server behind it.
+const MAX_QUERY_BUF: usize = 1024 * 1024 * 1024;
+
+/// Flush accumulated pipeline replies once they pass this size, instead of
+/// buffering a whole read-batch of replies. Without it, a pipeline of large
+/// GETs can demand an arbitrarily large reply buffer on the proxy.
+const OUT_FLUSH_THRESHOLD: usize = 1024 * 1024;
+
 /// Decrements the live-connection counter when a worker exits — by any path,
 /// including a panic — so a crashing handler can never leak a slot.
 struct ConnGuard(Arc<Topology>);
@@ -814,12 +827,19 @@ fn forward(
                 }
             }
             Ok(Value::Error(e)) if e.starts_with("TRYAGAIN") => {
-                // Slot frozen mid-cutover: the drain is sub-second; wait it
-                // out inside the budget instead of bothering the client.
                 if Instant::now() > deadline {
                     return Value::Error(e);
                 }
-                std::thread::sleep(Duration::from_millis(50));
+                // A STALE-REPLICA fence (R1): the replica lost live contact
+                // with the master and refuses the read. Falling back to the
+                // MASTER (which is fresh) is the correct answer, not retrying
+                // the same stale replica. A slot-freeze TRYAGAIN (no replica
+                // in play) still waits the sub-second drain.
+                if use_replica {
+                    use_replica = false;
+                } else {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
             }
             Ok(Value::Error(e)) if e.starts_with("READONLY") => {
                 // A LIVE node refusing writes where we expected a master: a
@@ -1207,6 +1227,10 @@ fn serve_client<S: Read + Write>(mut stream: S, topo: Arc<Topology>) -> std::io:
                         }
                     }
                     encode(&reply, &mut out);
+                    if out.len() >= OUT_FLUSH_THRESHOLD {
+                        stream.write_all(&out)?;
+                        out.clear();
+                    }
                 }
                 Ok(Decoded::NeedMore) => break,
                 Err(_) => {
@@ -1227,6 +1251,15 @@ fn serve_client<S: Read + Write>(mut stream: S, topo: Arc<Topology>) -> std::io:
             return Ok(());
         }
         buf.extend_from_slice(&chunk[..n]);
+        if buf.len() > MAX_QUERY_BUF {
+            out.clear();
+            encode(
+                &Value::Error("ERR Protocol error: query buffer limit exceeded".into()),
+                &mut out,
+            );
+            let _ = stream.write_all(&out);
+            return Ok(());
+        }
     }
 }
 
