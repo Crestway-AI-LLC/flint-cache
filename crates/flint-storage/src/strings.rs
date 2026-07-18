@@ -48,6 +48,10 @@ pub struct SetOptions {
 pub enum StoreError {
     NotInteger,
     Overflow,
+    NotFloat,
+    /// A float op's result left the representable range (Redis refuses to
+    /// store NaN/Infinity from INCRBYFLOAT).
+    NanOrInfinity,
     WrongType,
     /// The write would grow the value past the max-value-bytes policy
     /// (Valkey's `checkStringLength` analog, extended to collections).
@@ -169,6 +173,29 @@ impl<'a> StringStore<'a> {
         Ok(next)
     }
 
+    /// INCRBYFLOAT. Creates the key at 0. Preserves TTL. Returns the stored
+    /// representation — Redis's LD_STR_HUMAN shape (`%.17f`, trailing zeros
+    /// then a bare dot trimmed), which is also what lands in the value.
+    pub fn incr_by_float(&self, slot: u16, key: &[u8], delta: f64) -> Result<Vec<u8>, StoreError> {
+        let existing = self.read_live(slot, key)?;
+        let (current, expire_ms) = match &existing {
+            None => (0f64, 0u64),
+            Some(m) => {
+                let s = std::str::from_utf8(&m.payload).map_err(|_| StoreError::NotFloat)?;
+                let v: f64 = s.parse().map_err(|_| StoreError::NotFloat)?;
+                (v, m.expire_ms)
+            }
+        };
+        let next = current + delta;
+        if !next.is_finite() {
+            return Err(StoreError::NanOrInfinity);
+        }
+        let repr = fmt_float_human(next);
+        let meta = StringMeta::new(repr.clone(), expire_ms);
+        self.kv.put(&self.meta_key(slot, key), &meta.encode());
+        Ok(repr)
+    }
+
     /// APPEND: returns new length. Creates the key. Preserves TTL.
     pub fn append(&self, slot: u16, key: &[u8], suffix: &[u8]) -> Result<usize, StoreError> {
         let existing = self.read_live(slot, key)?;
@@ -247,6 +274,24 @@ impl<'a> StringStore<'a> {
         self.kv.put(&self.meta_key(slot, key), &meta.encode());
         Ok(len)
     }
+}
+
+/// Redis's LD_STR_HUMAN float shape: fixed `%.17f`, then trim trailing
+/// zeros, then a bare trailing dot. (`10.75` → "10.75", `3.0` → "3".) On
+/// aarch64 `long double` IS `double`, so f64 reproduces the reference
+/// output bit-for-bit on this platform class — the conformance oracle
+/// referees.
+fn fmt_float_human(x: f64) -> Vec<u8> {
+    let mut s = format!("{x:.17}");
+    if s.contains('.') {
+        while s.ends_with('0') {
+            s.pop();
+        }
+        if s.ends_with('.') {
+            s.pop();
+        }
+    }
+    s.into_bytes()
 }
 
 #[cfg(test)]
@@ -350,6 +395,47 @@ mod tests {
         assert_eq!(s.get(1, b"a"), Ok(Some(b"hello".to_vec())));
         assert_eq!(s.strlen(1, b"a"), Ok(5));
         assert_eq!(s.strlen(1, b"missing"), Ok(0));
+    }
+
+    #[test]
+    fn incr_by_float_shapes_and_errors() {
+        test_clock!(NOW, now, 1_000_000);
+        let kv = MemKv::new();
+        let s = StringStore::new(&kv, b"t", now);
+        // Missing key starts at 0; dyadic values are exact.
+        assert_eq!(s.incr_by_float(1, b"f", 10.5), Ok(b"10.5".to_vec()));
+        assert_eq!(s.incr_by_float(1, b"f", 0.25), Ok(b"10.75".to_vec()));
+        assert_eq!(s.incr_by_float(1, b"f", -0.75), Ok(b"10".to_vec()));
+        assert_eq!(s.get(1, b"f"), Ok(Some(b"10".to_vec())));
+        // Exponent-form stored values parse; output is always human form.
+        s.set(1, b"e", b"3.0e3", SetOptions::default())
+            .expect("set");
+        assert_eq!(s.incr_by_float(1, b"e", 200.0), Ok(b"3200".to_vec()));
+        // Non-float value refuses.
+        s.set(1, b"bad", b"hello", SetOptions::default())
+            .expect("set");
+        assert_eq!(s.incr_by_float(1, b"bad", 1.0), Err(StoreError::NotFloat));
+        // Inf result refuses and leaves the value alone.
+        s.set(1, b"inf", b"inf", SetOptions::default())
+            .expect("set");
+        assert_eq!(
+            s.incr_by_float(1, b"inf", 1.0),
+            Err(StoreError::NanOrInfinity)
+        );
+        // TTL is preserved.
+        s.set(
+            1,
+            b"t1",
+            b"1.5",
+            SetOptions {
+                expiry: SetExpiry::AtMs(2_000_000),
+                ..Default::default()
+            },
+        )
+        .expect("set");
+        assert_eq!(s.incr_by_float(1, b"t1", 1.0), Ok(b"2.5".to_vec()));
+        let m = s.read_live(1, b"t1").expect("read").expect("live");
+        assert_eq!(m.expire_ms, 2_000_000);
     }
 
     #[test]

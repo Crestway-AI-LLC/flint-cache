@@ -233,6 +233,14 @@ impl<'a> Dispatcher<'a> {
             }),
             b"INCRBY" => self.cmd_incr_delta(args, "incrby", 1),
             b"DECRBY" => self.cmd_incr_delta(args, "decrby", -1),
+            b"INCRBYFLOAT" => exact(args, 3, "incrbyfloat", |a| match parse_f64(&a[2]) {
+                Ok(delta) => reply(
+                    self.strings
+                        .incr_by_float(slot_for_key(&a[1]), &a[1], delta),
+                    |repr| Value::Bulk(Some(repr)),
+                ),
+                Err(_) => err("ERR value is not a valid float"),
+            }),
             b"APPEND" => exact(args, 3, "append", |a| {
                 reply(
                     self.strings.append(slot_for_key(&a[1]), &a[1], &a[2]),
@@ -435,6 +443,9 @@ impl<'a> Dispatcher<'a> {
             }),
             b"SPOP" => self.cmd_spop(args),
             b"SRANDMEMBER" => self.cmd_srandmember(args),
+            b"HSCAN" => self.cmd_scan_typed(args, ScanKind::Hash),
+            b"SSCAN" => self.cmd_scan_typed(args, ScanKind::Set),
+            b"ZSCAN" => self.cmd_scan_typed(args, ScanKind::ZSet),
 
             // lists
             b"LPUSH" | b"RPUSH" => {
@@ -941,6 +952,94 @@ impl<'a> Dispatcher<'a> {
         })
     }
 
+    /// HSCAN/SSCAN/ZSCAN key cursor [MATCH pat] [COUNT n] [NOVALUES].
+    /// Our collections materialize from ONE prefix scan, so every scan is a
+    /// single-shot iteration: ignore the cursor's value, return the whole
+    /// (filtered) collection, answer cursor "0" — exactly Redis's behavior
+    /// for listpack/intset-encoded keys, and a valid SCAN contract (each
+    /// element returned once, iteration terminates). COUNT is a hint and is
+    /// validated then ignored; NOVALUES is HSCAN-only.
+    fn cmd_scan_typed(&self, args: &[Vec<u8>], kind: ScanKind) -> Value {
+        let name = match kind {
+            ScanKind::Hash => "hscan",
+            ScanKind::Set => "sscan",
+            ScanKind::ZSet => "zscan",
+        };
+        if args.len() < 3 {
+            return arity_err(name);
+        }
+        if std::str::from_utf8(&args[2])
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .is_none()
+        {
+            return err("ERR invalid cursor");
+        }
+        let mut pattern: Option<&[u8]> = None;
+        let mut novalues = false;
+        let mut i = 3;
+        while i < args.len() {
+            match args[i].to_ascii_uppercase().as_slice() {
+                b"MATCH" => match args.get(i + 1) {
+                    Some(p) => {
+                        pattern = Some(p);
+                        i += 2;
+                    }
+                    None => return err("ERR syntax error"),
+                },
+                b"COUNT" => match args.get(i + 1).and_then(|c| parse_i64(c).ok()) {
+                    Some(n) if n >= 1 => i += 2,
+                    _ => return err("ERR syntax error"),
+                },
+                b"NOVALUES" if matches!(kind, ScanKind::Hash) => {
+                    novalues = true;
+                    i += 1;
+                }
+                _ => return err("ERR syntax error"),
+            }
+        }
+        let keep = |s: &[u8]| pattern.is_none_or(|p| glob_match(p, s));
+        let slot = slot_for_key(&args[1]);
+        let items = match kind {
+            ScanKind::Hash => match self.hashes.hgetall(slot, &args[1]) {
+                Ok(pairs) => pairs
+                    .into_iter()
+                    .filter(|(f, _)| keep(f))
+                    .flat_map(|(f, v)| {
+                        if novalues {
+                            vec![Value::Bulk(Some(f))]
+                        } else {
+                            vec![Value::Bulk(Some(f)), Value::Bulk(Some(v))]
+                        }
+                    })
+                    .collect(),
+                Err(e) => return store_err(e),
+            },
+            ScanKind::Set => match self.sets.smembers(slot, &args[1]) {
+                Ok(ms) => ms
+                    .into_iter()
+                    .filter(|m| keep(m))
+                    .map(|m| Value::Bulk(Some(m)))
+                    .collect(),
+                Err(e) => return store_err(e),
+            },
+            ScanKind::ZSet => match self.zsets.zrange(slot, &args[1], 0, -1) {
+                Ok(rows) => rows
+                    .into_iter()
+                    .filter(|(m, _)| keep(m))
+                    .flat_map(|(m, sc)| {
+                        vec![Value::Bulk(Some(m)), Value::Bulk(Some(fmt_score(sc)))]
+                    })
+                    .collect(),
+                Err(e) => return store_err(e),
+            },
+        };
+        Value::Array(Some(vec![
+            Value::Bulk(Some(b"0".to_vec())),
+            Value::Array(Some(items)),
+        ]))
+    }
+
     /// SPOP key [count]. Without count: single bulk (or nil). With count:
     /// an array — count 0 is the empty array, negative is an error.
     fn cmd_spop(&self, args: &[Vec<u8>]) -> Value {
@@ -1108,11 +1207,126 @@ fn reply<T>(r: Result<T, StoreError>, f: impl FnOnce(T) -> Value) -> Value {
     }
 }
 
+/// Which collection a typed scan walks.
+enum ScanKind {
+    Hash,
+    Set,
+    ZSet,
+}
+
+/// Redis stringmatchlen-style glob over bytes: `*`, `?`, `[set]`/`[^set]`
+/// with `a-z` ranges, and `\` escapes. Iterative with single-star
+/// backtracking (globs have no nested quantifiers, so one backtrack point
+/// suffices).
+fn glob_match(pat: &[u8], s: &[u8]) -> bool {
+    let (mut p, mut i) = (0usize, 0usize);
+    let (mut star_p, mut star_i) = (usize::MAX, 0usize);
+    while i < s.len() {
+        let advanced = if p < pat.len() {
+            match pat[p] {
+                b'*' => {
+                    star_p = p;
+                    star_i = i;
+                    p += 1;
+                    continue;
+                }
+                b'?' => {
+                    p += 1;
+                    i += 1;
+                    true
+                }
+                b'[' => match class_match(pat, p, s[i]) {
+                    Some((true, next_p)) => {
+                        p = next_p;
+                        i += 1;
+                        true
+                    }
+                    _ => false,
+                },
+                b'\\' if p + 1 < pat.len() => {
+                    if pat[p + 1] == s[i] {
+                        p += 2;
+                        i += 1;
+                        true
+                    } else {
+                        false
+                    }
+                }
+                c => {
+                    if c == s[i] {
+                        p += 1;
+                        i += 1;
+                        true
+                    } else {
+                        false
+                    }
+                }
+            }
+        } else {
+            false
+        };
+        if !advanced {
+            if star_p == usize::MAX {
+                return false;
+            }
+            // Backtrack: let the last '*' swallow one more input byte.
+            star_i += 1;
+            i = star_i;
+            p = star_p + 1;
+        }
+    }
+    while p < pat.len() && pat[p] == b'*' {
+        p += 1;
+    }
+    p == pat.len()
+}
+
+/// `[...]` class at `pat[open]` (which is '['): does `c` match, and where
+/// does the class end? None on an unterminated class (treated as no match,
+/// mirroring Redis's lenient parser).
+fn class_match(pat: &[u8], open: usize, c: u8) -> Option<(bool, usize)> {
+    let mut p = open + 1;
+    let negate = pat.get(p) == Some(&b'^');
+    if negate {
+        p += 1;
+    }
+    let mut hit = false;
+    let mut first = true;
+    while p < pat.len() {
+        match pat[p] {
+            b']' if !first => return Some((hit != negate, p + 1)),
+            b'\\' if p + 1 < pat.len() => {
+                if pat[p + 1] == c {
+                    hit = true;
+                }
+                p += 2;
+            }
+            lo if p + 2 < pat.len() && pat[p + 1] == b'-' && pat[p + 2] != b']' => {
+                let hi = pat[p + 2];
+                if (lo.min(hi)..=lo.max(hi)).contains(&c) {
+                    hit = true;
+                }
+                p += 3;
+            }
+            ch => {
+                if ch == c {
+                    hit = true;
+                }
+                p += 1;
+            }
+        }
+        first = false;
+    }
+    None
+}
+
 fn store_err(e: StoreError) -> Value {
     match e {
         StoreError::NotInteger | StoreError::Overflow => {
             err("ERR value is not an integer or out of range")
         }
+        StoreError::NotFloat => err("ERR value is not a valid float"),
+        StoreError::NanOrInfinity => err("ERR increment would produce NaN or Infinity"),
         StoreError::WrongType => {
             err("WRONGTYPE Operation against a key holding the wrong kind of value")
         }

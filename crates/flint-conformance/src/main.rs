@@ -525,6 +525,124 @@ fn corpus() -> Vec<Case> {
             ],
         },
         Case {
+            family: "strings",
+            name: "incrbyfloat human formatting",
+            steps: vec![
+                // Dyadic increments are exact in binary floating point, so
+                // the human formatting is deterministic cross-platform.
+                s(&[b"INCRBYFLOAT", b"fb1", b"10.5"], Expect::Str(b"10.5")),
+                s(&[b"INCRBYFLOAT", b"fb1", b"0.25"], Expect::Str(b"10.75")),
+                s(&[b"INCRBYFLOAT", b"fb1", b"-0.75"], Expect::Str(b"10")),
+                s(&[b"GET", b"fb1"], Expect::Str(b"10")),
+                // Exponent-form stored values parse; output is human form.
+                s(&[b"SET", b"fb2", b"3.0e3"], Expect::Ok),
+                s(&[b"INCRBYFLOAT", b"fb2", b"200"], Expect::Str(b"3200")),
+                s(&[b"SET", b"fb3", b"hello"], Expect::Ok),
+                s(&[b"INCRBYFLOAT", b"fb3", b"1"], Expect::AnyError),
+                s(&[b"INCRBYFLOAT", b"fb4", b"notafloat"], Expect::AnyError),
+                s(&[b"SET", b"fb5", b"inf"], Expect::Ok),
+                s(&[b"INCRBYFLOAT", b"fb5", b"1"], Expect::AnyError),
+            ],
+        },
+        Case {
+            family: "hashes",
+            name: "hscan single shot with match and novalues",
+            steps: vec![
+                s(
+                    &[b"HSET", b"hs1", b"f1", b"v1", b"f2", b"v2", b"g1", b"v3"],
+                    Expect::Int(3),
+                ),
+                s(
+                    &[b"HSCAN", b"hs1", b"0"],
+                    Expect::Arr(vec![
+                        Expect::Str(b"0"),
+                        Expect::UnorderedPairs(vec![
+                            (b"f1", b"v1"),
+                            (b"f2", b"v2"),
+                            (b"g1", b"v3"),
+                        ]),
+                    ]),
+                ),
+                s(
+                    &[b"HSCAN", b"hs1", b"0", b"MATCH", b"f*"],
+                    Expect::Arr(vec![
+                        Expect::Str(b"0"),
+                        Expect::UnorderedPairs(vec![(b"f1", b"v1"), (b"f2", b"v2")]),
+                    ]),
+                ),
+                s(
+                    &[b"HSCAN", b"hs1", b"0", b"COUNT", b"100", b"NOVALUES"],
+                    Expect::Arr(vec![
+                        Expect::Str(b"0"),
+                        Expect::UnorderedStrs(vec![b"f1", b"f2", b"g1"]),
+                    ]),
+                ),
+                s(
+                    &[b"HSCAN", b"nosuchh", b"0"],
+                    Expect::Arr(vec![Expect::Str(b"0"), Expect::Arr(vec![])]),
+                ),
+                s(&[b"HSCAN", b"hs1", b"notanumber"], Expect::AnyError),
+                s(&[b"HSCAN", b"hs1", b"0", b"MATCH"], Expect::AnyError),
+            ],
+        },
+        Case {
+            family: "sets",
+            name: "sscan single shot with match",
+            steps: vec![
+                s(&[b"SADD", b"ss1", b"a", b"ab", b"b"], Expect::Int(3)),
+                s(
+                    &[b"SSCAN", b"ss1", b"0"],
+                    Expect::Arr(vec![
+                        Expect::Str(b"0"),
+                        Expect::UnorderedStrs(vec![b"a", b"ab", b"b"]),
+                    ]),
+                ),
+                s(
+                    &[b"SSCAN", b"ss1", b"0", b"MATCH", b"a*"],
+                    Expect::Arr(vec![
+                        Expect::Str(b"0"),
+                        Expect::UnorderedStrs(vec![b"a", b"ab"]),
+                    ]),
+                ),
+                s(
+                    &[b"SSCAN", b"ss1", b"0", b"MATCH", b"?"],
+                    Expect::Arr(vec![
+                        Expect::Str(b"0"),
+                        Expect::UnorderedStrs(vec![b"a", b"b"]),
+                    ]),
+                ),
+                s(
+                    &[b"SSCAN", b"nosuchs2", b"0"],
+                    Expect::Arr(vec![Expect::Str(b"0"), Expect::Arr(vec![])]),
+                ),
+            ],
+        },
+        Case {
+            family: "zsets",
+            name: "zscan single shot with match",
+            steps: vec![
+                s(&[b"ZADD", b"zs1", b"1", b"a", b"2", b"b"], Expect::Int(2)),
+                s(
+                    &[b"ZSCAN", b"zs1", b"0"],
+                    Expect::Arr(vec![
+                        Expect::Str(b"0"),
+                        Expect::UnorderedPairs(vec![(b"a", b"1"), (b"b", b"2")]),
+                    ]),
+                ),
+                s(
+                    &[b"ZSCAN", b"zs1", b"0", b"MATCH", b"b*"],
+                    Expect::Arr(vec![
+                        Expect::Str(b"0"),
+                        Expect::UnorderedPairs(vec![(b"b", b"2")]),
+                    ]),
+                ),
+                s(
+                    &[b"ZSCAN", b"nosuchz", b"0"],
+                    Expect::Arr(vec![Expect::Str(b"0"), Expect::Arr(vec![])]),
+                ),
+            ],
+        },
+        Case {
             family: "lists",
             name: "push pop order",
             steps: vec![
