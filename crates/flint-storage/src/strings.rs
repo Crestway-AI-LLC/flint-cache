@@ -142,6 +142,16 @@ impl<'a> StringStore<'a> {
         Ok(self.read_live(slot, key)?.map(|m| m.payload))
     }
 
+    /// GETDEL: return the value and delete the key atomically (one node, one
+    /// slot). WRONGTYPE if the key holds a non-string (read_live checks type).
+    pub fn get_del(&self, slot: u16, key: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
+        let existing = self.read_live(slot, key)?.map(|m| m.payload);
+        if existing.is_some() {
+            self.kv.delete(&self.meta_key(slot, key));
+        }
+        Ok(existing)
+    }
+
     /// INCRBY/DECRBY. Creates the key at 0. Preserves TTL.
     pub fn incr_by(&self, slot: u16, key: &[u8], delta: i64) -> Result<i64, StoreError> {
         let existing = self.read_live(slot, key)?;

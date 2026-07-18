@@ -648,6 +648,88 @@ fn corpus() -> Vec<Case> {
                 s(&[b"DBSIZE"], Expect::Int(2)),
             ],
         },
+        // --- Tier-1 command coverage (validated vs Valkey) ---
+        Case {
+            family: "strings",
+            name: "getdel returns and removes",
+            steps: vec![
+                s(&[b"SET", b"gd1", b"v"], Expect::Ok),
+                s(&[b"GETDEL", b"gd1"], Expect::Str(b"v")),
+                s(&[b"GET", b"gd1"], Expect::Nil),
+                s(&[b"GETDEL", b"gd_missing"], Expect::Nil),
+            ],
+        },
+        Case {
+            family: "strings",
+            name: "getset returns old",
+            steps: vec![
+                s(&[b"GETSET", b"gs1", b"a"], Expect::Nil),
+                s(&[b"GETSET", b"gs1", b"b"], Expect::Str(b"a")),
+                s(&[b"GET", b"gs1"], Expect::Str(b"b")),
+            ],
+        },
+        Case {
+            family: "strings",
+            name: "set with get option",
+            steps: vec![
+                s(&[b"SET", b"sg1", b"a", b"GET"], Expect::Nil),
+                s(&[b"SET", b"sg1", b"b", b"GET"], Expect::Str(b"a")),
+                s(&[b"GET", b"sg1"], Expect::Str(b"b")),
+                // NX + GET: write rejected, old value still returned.
+                s(&[b"SET", b"sg1", b"c", b"NX", b"GET"], Expect::Str(b"b")),
+                s(&[b"GET", b"sg1"], Expect::Str(b"b")),
+            ],
+        },
+        Case {
+            family: "keyspace",
+            name: "expireat and expiretime",
+            steps: vec![
+                s(&[b"SET", b"ea1", b"v"], Expect::Ok),
+                // Far-future absolute second; TTL reads back ~that window.
+                s(&[b"EXPIREAT", b"ea1", b"9999999999"], Expect::Int(1)),
+                s(&[b"EXPIRETIME", b"ea1"], Expect::Int(9999999999)),
+                // A past instant deletes.
+                s(&[b"SET", b"ea2", b"v"], Expect::Ok),
+                s(&[b"EXPIREAT", b"ea2", b"1"], Expect::Int(1)),
+                s(&[b"GET", b"ea2"], Expect::Nil),
+                // No-expiry / missing sentinels.
+                s(&[b"SET", b"ea3", b"v"], Expect::Ok),
+                s(&[b"EXPIRETIME", b"ea3"], Expect::Int(-1)),
+                s(&[b"EXPIRETIME", b"ea_missing"], Expect::Int(-2)),
+            ],
+        },
+        Case {
+            family: "keyspace",
+            name: "unlink removes like del",
+            steps: vec![
+                s(&[b"SET", b"ul1", b"v"], Expect::Ok),
+                s(&[b"SET", b"ul2", b"v"], Expect::Ok),
+                s(&[b"UNLINK", b"ul1", b"ul2", b"ul_missing"], Expect::Int(2)),
+                s(&[b"GET", b"ul1"], Expect::Nil),
+            ],
+        },
+        Case {
+            family: "hashes",
+            name: "hsetnx and hstrlen",
+            steps: vec![
+                s(&[b"HSETNX", b"hx1", b"f", b"hello"], Expect::Int(1)),
+                s(&[b"HSETNX", b"hx1", b"f", b"other"], Expect::Int(0)),
+                s(&[b"HGET", b"hx1", b"f"], Expect::Str(b"hello")),
+                s(&[b"HSTRLEN", b"hx1", b"f"], Expect::Int(5)),
+                s(&[b"HSTRLEN", b"hx1", b"nofield"], Expect::Int(0)),
+            ],
+        },
+        Case {
+            family: "sets",
+            name: "smismember batch membership",
+            steps: vec![
+                s(&[b"SADD", b"sm1", b"a", b"b"], Expect::Int(2)),
+                s(
+                    &[b"SMISMEMBER", b"sm1", b"a", b"x", b"b"],
+                    Expect::Arr(vec![Expect::Int(1), Expect::Int(0), Expect::Int(1)]),
+                ),
+            ],
+        },
     ]
 }
 

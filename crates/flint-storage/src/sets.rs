@@ -116,6 +116,19 @@ impl<'a> SetStore<'a> {
             .is_some())
     }
 
+    /// SMISMEMBER: membership for several members in one pass.
+    pub fn smismember(
+        &self,
+        slot: u16,
+        key: &[u8],
+        members: &[Vec<u8>],
+    ) -> Result<Vec<bool>, StoreError> {
+        members
+            .iter()
+            .map(|m| self.sismember(slot, key, m))
+            .collect()
+    }
+
     pub fn smembers(&self, slot: u16, key: &[u8]) -> Result<Vec<Vec<u8>>, StoreError> {
         let Some(meta) = self.read_meta(slot, key)? else {
             return Ok(Vec::new());

@@ -111,6 +111,26 @@ impl<'a> HashStore<'a> {
         Ok(added)
     }
 
+    /// HSETNX: set the field only if it does not exist. Returns true if set.
+    pub fn hsetnx(
+        &self,
+        slot: u16,
+        key: &[u8],
+        field: &[u8],
+        value: &[u8],
+    ) -> Result<bool, StoreError> {
+        if self.hget(slot, key, field)?.is_some() {
+            return Ok(false);
+        }
+        self.hset(slot, key, &[(field.to_vec(), value.to_vec())])?;
+        Ok(true)
+    }
+
+    /// HSTRLEN: length of the field's value (0 if the field/key is missing).
+    pub fn hstrlen(&self, slot: u16, key: &[u8], field: &[u8]) -> Result<usize, StoreError> {
+        Ok(self.hget(slot, key, field)?.map(|v| v.len()).unwrap_or(0))
+    }
+
     pub fn hget(&self, slot: u16, key: &[u8], field: &[u8]) -> Result<Option<Vec<u8>>, StoreError> {
         let Some(meta) = self.read_meta(slot, key)? else {
             return Ok(None);

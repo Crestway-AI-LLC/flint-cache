@@ -201,6 +201,24 @@ impl<'a> Dispatcher<'a> {
             b"GET" => exact(args, 2, "get", |a| {
                 reply(self.strings.get(slot_for_key(&a[1]), &a[1]), Value::Bulk)
             }),
+            b"GETDEL" => exact(args, 2, "getdel", |a| {
+                reply(
+                    self.strings.get_del(slot_for_key(&a[1]), &a[1]),
+                    Value::Bulk,
+                )
+            }),
+            b"GETSET" => exact(args, 3, "getset", |a| {
+                // Set new, return old (nil if absent; WRONGTYPE if non-string).
+                let slot = slot_for_key(&a[1]);
+                let old = self.strings.get(slot, &a[1]);
+                if let Err(e) = old {
+                    return store_err(e);
+                }
+                match self.strings.set(slot, &a[1], &a[2], SetOptions::default()) {
+                    Ok(_) => Value::Bulk(old.ok().flatten()),
+                    Err(e) => store_err(e),
+                }
+            }),
             b"INCR" => exact(args, 2, "incr", |a| {
                 reply(
                     self.strings.incr_by(slot_for_key(&a[1]), &a[1], 1),
@@ -258,6 +276,18 @@ impl<'a> Dispatcher<'a> {
 
             // hashes
             b"HSET" => self.cmd_hset(args),
+            b"HSETNX" => exact(args, 4, "hsetnx", |a| {
+                reply(
+                    self.hashes.hsetnx(slot_for_key(&a[1]), &a[1], &a[2], &a[3]),
+                    |set| Value::Integer(set as i64),
+                )
+            }),
+            b"HSTRLEN" => exact(args, 3, "hstrlen", |a| {
+                reply(
+                    self.hashes.hstrlen(slot_for_key(&a[1]), &a[1], &a[2]),
+                    |n| Value::Integer(n as i64),
+                )
+            }),
             b"HGET" => exact(args, 3, "hget", |a| {
                 reply(
                     self.hashes.hget(slot_for_key(&a[1]), &a[1], &a[2]),
@@ -359,6 +389,21 @@ impl<'a> Dispatcher<'a> {
                     |b| Value::Integer(b as i64),
                 )
             }),
+            b"SMISMEMBER" => {
+                if args.len() < 3 {
+                    return arity_err("smismember");
+                }
+                let slot = slot_for_key(&args[1]);
+                match self.sets.smismember(slot, &args[1], &args[2..]) {
+                    Ok(flags) => Value::Array(Some(
+                        flags
+                            .into_iter()
+                            .map(|b| Value::Integer(b as i64))
+                            .collect(),
+                    )),
+                    Err(e) => store_err(e),
+                }
+            }
             b"SMEMBERS" => exact(args, 2, "smembers", |a| {
                 reply(self.sets.smembers(slot_for_key(&a[1]), &a[1]), |ms| {
                     Value::Array(Some(ms.into_iter().map(|m| Value::Bulk(Some(m))).collect()))
@@ -452,7 +497,11 @@ impl<'a> Dispatcher<'a> {
             b"ZRANGE" => self.cmd_zrange(args),
 
             // keyspace (type-agnostic)
-            b"DEL" => multi_key(args, "del", |k| self.keyspace.del(slot_for_key(k), k)),
+            b"DEL" | b"UNLINK" => {
+                // UNLINK is Redis's async unlink; our DEL is already O(1)
+                // (version bump), so they are identical here.
+                multi_key(args, "del", |k| self.keyspace.del(slot_for_key(k), k))
+            }
             b"EXISTS" => multi_key(args, "exists", |k| self.keyspace.exists(slot_for_key(k), k)),
             b"TYPE" => exact(args, 2, "type", |a| {
                 match self.keyspace.value_type(slot_for_key(&a[1]), &a[1]) {
@@ -462,8 +511,12 @@ impl<'a> Dispatcher<'a> {
             }),
             b"EXPIRE" => self.cmd_expire(args, "expire", 1000),
             b"PEXPIRE" => self.cmd_expire(args, "pexpire", 1),
+            b"EXPIREAT" => self.cmd_expire_at(args, "expireat", 1000),
+            b"PEXPIREAT" => self.cmd_expire_at(args, "pexpireat", 1),
             b"TTL" => self.cmd_ttl(args, "ttl", 1000),
             b"PTTL" => self.cmd_ttl(args, "pttl", 1),
+            b"EXPIRETIME" => self.cmd_expire_time(args, "expiretime", 1000),
+            b"PEXPIRETIME" => self.cmd_expire_time(args, "pexpiretime", 1),
             b"PERSIST" => exact(args, 2, "persist", |a| {
                 Value::Integer(self.keyspace.persist(slot_for_key(&a[1]), &a[1]) as i64)
             }),
@@ -533,12 +586,16 @@ impl<'a> Dispatcher<'a> {
         }
         let (key, value) = (&args[1], &args[2]);
         let mut opts = SetOptions::default();
+        // SET ... GET: return the OLD value (nil if absent; WRONGTYPE if the
+        // key held a non-string). NX+GET/XX+GET are valid in modern Redis.
+        let mut want_get = false;
         let mut i = 3;
         while i < args.len() {
             match args[i].to_ascii_uppercase().as_slice() {
                 b"NX" => opts.nx = true,
                 b"XX" => opts.xx = true,
                 b"KEEPTTL" => opts.expiry = SetExpiry::Keep,
+                b"GET" => want_get = true,
                 b"EX" | b"PX" | b"EXAT" | b"PXAT" => {
                     let unit_ms =
                         matches!(args[i].to_ascii_uppercase().as_slice(), b"EX" | b"EXAT");
@@ -569,9 +626,26 @@ impl<'a> Dispatcher<'a> {
         if opts.nx && opts.xx {
             return err("ERR syntax error");
         }
-        match self.strings.set(slot_for_key(key), key, value, opts) {
-            Ok(SetOutcome::Done) => Value::Simple("OK".into()),
-            Ok(SetOutcome::Unchanged) => Value::Bulk(None),
+        let slot = slot_for_key(key);
+        // With GET we must read the old value first (and surface WRONGTYPE).
+        let old = if want_get {
+            match self.strings.get(slot, key) {
+                Ok(v) => Some(v),
+                Err(e) => return store_err(e),
+            }
+        } else {
+            None
+        };
+        match self.strings.set(slot, key, value, opts) {
+            Ok(SetOutcome::Done) => match old {
+                Some(v) => Value::Bulk(v),
+                None => Value::Simple("OK".into()),
+            },
+            // NX/XX rejected the write: GET still returns the old value.
+            Ok(SetOutcome::Unchanged) => match old {
+                Some(v) => Value::Bulk(v),
+                None => Value::Bulk(None),
+            },
             Err(e) => store_err(e),
         }
     }
@@ -645,6 +719,29 @@ impl<'a> Dispatcher<'a> {
                 Value::Integer(self.keyspace.expire_at(slot_for_key(&a[1]), &a[1], at) as i64)
             }
             Err(_) => err("ERR value is not an integer or out of range"),
+        })
+    }
+
+    /// EXPIREAT/PEXPIREAT: the argument is an ABSOLUTE instant (s or ms).
+    fn cmd_expire_at(&self, args: &[Vec<u8>], name: &str, unit_ms: u64) -> Value {
+        exact(args, 3, name, |a| match parse_i64(&a[2]) {
+            Ok(n) => {
+                let at = (n.saturating_mul(unit_ms as i64)).max(1) as u64;
+                Value::Integer(self.keyspace.expire_at(slot_for_key(&a[1]), &a[1], at) as i64)
+            }
+            Err(_) => err("ERR value is not an integer or out of range"),
+        })
+    }
+
+    /// EXPIRETIME/PEXPIRETIME: the ABSOLUTE expiry (s or ms); -1 no expiry,
+    /// -2 missing key.
+    fn cmd_expire_time(&self, args: &[Vec<u8>], name: &str, unit_ms: u64) -> Value {
+        exact(args, 2, name, |a| {
+            match self.keyspace.expire_time_ms(slot_for_key(&a[1]), &a[1]) {
+                None => Value::Integer(-2),
+                Some(0) => Value::Integer(-1),
+                Some(ms) => Value::Integer((ms / unit_ms) as i64),
+            }
         })
     }
 

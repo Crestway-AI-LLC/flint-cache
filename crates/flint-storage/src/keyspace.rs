@@ -82,6 +82,12 @@ impl<'a> Keyspace<'a> {
         true
     }
 
+    /// EXPIRETIME/PEXPIRETIME: the ABSOLUTE expiry instant in ms.
+    /// None = key missing; Some(0) = key exists with no expiry.
+    pub fn expire_time_ms(&self, slot: u16, key: &[u8]) -> Option<u64> {
+        self.read_live_row(slot, key).map(|(h, _)| h.expire_ms)
+    }
+
     pub fn ttl(&self, slot: u16, key: &[u8]) -> Ttl {
         match self.read_live_row(slot, key) {
             None => Ttl::Missing,
