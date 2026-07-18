@@ -3,6 +3,14 @@
 //! The metadata carries head/tail counters (elements at head..tail); the
 //! element at index i lives at `subkey_envelope(…, biased_be(i))`, so LPUSH
 //! is head-1 and RPUSH is tail — both O(1), exactly the Kvrocks scheme.
+//!
+//! Interior mutation (LREM/LINSERT) keeps the index space DENSE by
+//! collect-and-rewrite: read the elements, edit in memory, lay them back
+//! down from the old head. That is O(n) row writes per call — the accepted
+//! price for keeping LINDEX/LSET O(1) point lookups. The alternative
+//! (tolerating gaps in the index space) was rejected: every
+//! index-addressed op would degrade to a scan, taxing the common
+//! queue-shaped workload to subsidize the rare interior edit.
 
 use crate::Kv;
 use crate::encoding::{
@@ -272,6 +280,101 @@ impl<'a> ListStore<'a> {
         Ok(out)
     }
 
+    /// All live values head→tail (the collect half of collect-and-rewrite).
+    fn collect(&self, slot: u16, key: &[u8], meta: &ListMeta) -> Vec<Vec<u8>> {
+        (meta.head..meta.tail)
+            .filter_map(|i| self.kv.get(&self.elem_key(slot, key, meta.base.version, i)))
+            .collect()
+    }
+
+    /// The rewrite half: drop every old row, lay `vals` down densely from
+    /// the old head, refresh counters and bytes. Callers mutate `vals` in
+    /// memory between collect and rewrite.
+    fn rewrite(&self, slot: u16, key: &[u8], meta: &mut ListMeta, vals: Vec<Vec<u8>>) {
+        for i in meta.head..meta.tail {
+            self.kv
+                .delete(&self.elem_key(slot, key, meta.base.version, i));
+        }
+        meta.base.bytes = vals.iter().map(|v| v.len() as u64).sum();
+        meta.tail = meta.head + vals.len() as i64;
+        for (off, v) in vals.iter().enumerate() {
+            self.kv.put(
+                &self.elem_key(slot, key, meta.base.version, meta.head + off as i64),
+                v,
+            );
+        }
+        self.write_meta(slot, key, meta);
+    }
+
+    /// LREM: remove matches of `element` — `count > 0` removes the first
+    /// `count` head→tail, `count < 0` the first `|count|` tail→head, `0`
+    /// removes all. Returns how many went.
+    pub fn lrem(
+        &self,
+        slot: u16,
+        key: &[u8],
+        count: i64,
+        element: &[u8],
+    ) -> Result<u64, StoreError> {
+        let Some(mut meta) = self.read_meta(slot, key)? else {
+            return Ok(0);
+        };
+        let vals = self.collect(slot, key, &meta);
+        let limit = if count == 0 {
+            u64::MAX
+        } else {
+            count.unsigned_abs()
+        };
+        let mut removed = 0u64;
+        let mut matches = |v: &Vec<u8>| {
+            if removed < limit && v == element {
+                removed += 1;
+                false
+            } else {
+                true
+            }
+        };
+        let keep: Vec<Vec<u8>> = if count >= 0 {
+            vals.into_iter().filter(|v| matches(v)).collect()
+        } else {
+            let mut kept: Vec<Vec<u8>> = vals.into_iter().rev().filter(|v| matches(v)).collect();
+            kept.reverse();
+            kept
+        };
+        if removed > 0 {
+            self.rewrite(slot, key, &mut meta, keep);
+        }
+        Ok(removed)
+    }
+
+    /// LINSERT before/after the FIRST occurrence of `pivot` (head→tail
+    /// search, as in Redis). Returns the new length, `-1` when the pivot is
+    /// absent, `0` when the key does not exist — the command's exact wire
+    /// values.
+    pub fn linsert(
+        &self,
+        slot: u16,
+        key: &[u8],
+        before: bool,
+        pivot: &[u8],
+        element: &[u8],
+    ) -> Result<i64, StoreError> {
+        let Some(mut meta) = self.read_meta(slot, key)? else {
+            return Ok(0);
+        };
+        if meta.base.bytes + element.len() as u64 > self.max_value_bytes {
+            return Err(StoreError::ValueTooLarge);
+        }
+        let mut vals = self.collect(slot, key, &meta);
+        let Some(pos) = vals.iter().position(|v| v == pivot) else {
+            return Ok(-1);
+        };
+        vals.insert(if before { pos } else { pos + 1 }, element.to_vec());
+        let len = vals.len() as i64;
+        self.rewrite(slot, key, &mut meta, vals);
+        Ok(len)
+    }
+
     /// LRANGE with Redis index semantics (inclusive, negatives from end).
     pub fn lrange(
         &self,
@@ -399,6 +502,42 @@ mod tests {
         assert_eq!(l.lpos(1, b"l", b"a", 1, 0, 2), Ok(vec![0]));
         assert_eq!(l.lpos(1, b"l", b"missing", 1, 1, 0), Ok(vec![]));
         assert_eq!(l.lpos(1, b"nope", b"a", 1, 1, 0), Ok(vec![]));
+    }
+
+    #[test]
+    fn lrem_directions_and_counts() {
+        let kv = MemKv::new();
+        let l = ListStore::new(&kv, b"t", now);
+        l.push(1, b"l", &vs(&[b"a", b"b", b"a", b"c", b"a"]), false)
+            .expect("push");
+        assert_eq!(l.lrem(1, b"l", 1, b"a"), Ok(1));
+        assert_eq!(l.lrange(1, b"l", 0, -1), Ok(vs(&[b"b", b"a", b"c", b"a"])));
+        assert_eq!(l.lrem(1, b"l", -1, b"a"), Ok(1));
+        assert_eq!(l.lrange(1, b"l", 0, -1), Ok(vs(&[b"b", b"a", b"c"])));
+        assert_eq!(l.lrem(1, b"l", 0, b"a"), Ok(1));
+        assert_eq!(l.lrange(1, b"l", 0, -1), Ok(vs(&[b"b", b"c"])));
+        assert_eq!(l.lrem(1, b"l", 0, b"zz"), Ok(0));
+        assert_eq!(l.lrem(1, b"nope", 0, b"a"), Ok(0));
+        // Removing everything deletes the key.
+        assert_eq!(l.lrem(1, b"l", 0, b"b"), Ok(1));
+        assert_eq!(l.lrem(1, b"l", 0, b"c"), Ok(1));
+        assert_eq!(l.llen(1, b"l"), Ok(0));
+    }
+
+    #[test]
+    fn linsert_before_after_and_misses() {
+        let kv = MemKv::new();
+        let l = ListStore::new(&kv, b"t", now);
+        l.push(1, b"l", &vs(&[b"a", b"c"]), false).expect("push");
+        assert_eq!(l.linsert(1, b"l", true, b"c", b"b"), Ok(3));
+        assert_eq!(l.linsert(1, b"l", false, b"c", b"d"), Ok(4));
+        assert_eq!(l.lrange(1, b"l", 0, -1), Ok(vs(&[b"a", b"b", b"c", b"d"])));
+        assert_eq!(l.linsert(1, b"l", true, b"zz", b"x"), Ok(-1));
+        assert_eq!(l.linsert(1, b"nope", true, b"a", b"x"), Ok(0));
+        // Ends still behave after an interior rewrite.
+        l.push(1, b"l", &vs(&[b"e"]), false).expect("push");
+        assert_eq!(l.pop(1, b"l", true), Ok(Some(b"a".to_vec())));
+        assert_eq!(l.lrange(1, b"l", 0, -1), Ok(vs(&[b"b", b"c", b"d", b"e"])));
     }
 
     #[test]

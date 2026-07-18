@@ -244,6 +244,25 @@ impl<'a> Dispatcher<'a> {
                     Value::Integer(n as i64)
                 })
             }),
+            b"GETRANGE" => exact(args, 4, "getrange", |a| {
+                match (parse_i64(&a[2]), parse_i64(&a[3])) {
+                    (Ok(start), Ok(end)) => reply(
+                        self.strings
+                            .getrange(slot_for_key(&a[1]), &a[1], start, end),
+                        |v| Value::Bulk(Some(v)),
+                    ),
+                    _ => err("ERR value is not an integer or out of range"),
+                }
+            }),
+            b"SETRANGE" => exact(args, 4, "setrange", |a| match parse_i64(&a[2]) {
+                Ok(off) if off >= 0 => reply(
+                    self.strings
+                        .setrange(slot_for_key(&a[1]), &a[1], off as u64, &a[3]),
+                    |n| Value::Integer(n as i64),
+                ),
+                Ok(_) => err("ERR offset is out of range"),
+                Err(_) => err("ERR value is not an integer or out of range"),
+            }),
 
             b"MSET" => {
                 if args.len() < 3 || !(args.len() - 1).is_multiple_of(2) {
@@ -414,6 +433,8 @@ impl<'a> Dispatcher<'a> {
                     Value::Integer(n as i64)
                 })
             }),
+            b"SPOP" => self.cmd_spop(args),
+            b"SRANDMEMBER" => self.cmd_srandmember(args),
 
             // lists
             b"LPUSH" | b"RPUSH" => {
@@ -482,6 +503,25 @@ impl<'a> Dispatcher<'a> {
                 }
             }),
             b"LPOS" => self.cmd_lpos(args),
+            b"LREM" => exact(args, 4, "lrem", |a| match parse_i64(&a[2]) {
+                Ok(count) => reply(
+                    self.lists.lrem(slot_for_key(&a[1]), &a[1], count, &a[3]),
+                    |n| Value::Integer(n as i64),
+                ),
+                Err(_) => err("ERR value is not an integer or out of range"),
+            }),
+            b"LINSERT" => exact(args, 5, "linsert", |a| {
+                let before = match a[2].to_ascii_uppercase().as_slice() {
+                    b"BEFORE" => true,
+                    b"AFTER" => false,
+                    _ => return err("ERR syntax error"),
+                };
+                reply(
+                    self.lists
+                        .linsert(slot_for_key(&a[1]), &a[1], before, &a[3], &a[4]),
+                    Value::Integer,
+                )
+            }),
 
             // zsets
             b"ZADD" => self.cmd_zadd(args),
@@ -899,6 +939,44 @@ impl<'a> Dispatcher<'a> {
                 _ => err("ERR value is not an integer or out of range"),
             }
         })
+    }
+
+    /// SPOP key [count]. Without count: single bulk (or nil). With count:
+    /// an array — count 0 is the empty array, negative is an error.
+    fn cmd_spop(&self, args: &[Vec<u8>]) -> Value {
+        match args.len() {
+            2 => match self.sets.spop(slot_for_key(&args[1]), &args[1], 1) {
+                Ok(mut popped) => Value::Bulk(popped.pop()),
+                Err(e) => store_err(e),
+            },
+            3 => match parse_i64(&args[2]) {
+                Ok(n) if n >= 0 => reply(
+                    self.sets.spop(slot_for_key(&args[1]), &args[1], n as u64),
+                    |ms| Value::Array(Some(ms.into_iter().map(|m| Value::Bulk(Some(m))).collect())),
+                ),
+                _ => err("ERR value is out of range, must be positive"),
+            },
+            _ => arity_err("spop"),
+        }
+    }
+
+    /// SRANDMEMBER key [count]. Without count: single bulk (or nil). With
+    /// count: array — positive is distinct-clamped, negative repeats.
+    fn cmd_srandmember(&self, args: &[Vec<u8>]) -> Value {
+        match args.len() {
+            2 => match self.sets.srandmember(slot_for_key(&args[1]), &args[1], 1) {
+                Ok(mut picks) => Value::Bulk(picks.pop()),
+                Err(e) => store_err(e),
+            },
+            3 => match parse_i64(&args[2]) {
+                Ok(n) => reply(
+                    self.sets.srandmember(slot_for_key(&args[1]), &args[1], n),
+                    |ms| Value::Array(Some(ms.into_iter().map(|m| Value::Bulk(Some(m))).collect())),
+                ),
+                Err(_) => err("ERR value is not an integer or out of range"),
+            },
+            _ => arity_err("srandmember"),
+        }
     }
 
     /// LPOS key element [RANK rank] [COUNT num] [MAXLEN len]. Without COUNT

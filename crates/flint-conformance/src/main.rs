@@ -153,6 +153,43 @@ fn corpus() -> Vec<Case> {
             ],
         },
         Case {
+            family: "strings",
+            name: "getrange windows",
+            steps: vec![
+                s(&[b"SET", b"gr1", b"Hello World"], Expect::Ok),
+                s(&[b"GETRANGE", b"gr1", b"0", b"4"], Expect::Str(b"Hello")),
+                s(&[b"GETRANGE", b"gr1", b"-5", b"-1"], Expect::Str(b"World")),
+                s(
+                    &[b"GETRANGE", b"gr1", b"0", b"-1"],
+                    Expect::Str(b"Hello World"),
+                ),
+                s(&[b"GETRANGE", b"gr1", b"9", b"2"], Expect::Str(b"")),
+                s(&[b"GETRANGE", b"gr1", b"50", b"60"], Expect::Str(b"")),
+                s(&[b"GETRANGE", b"nosuchg", b"0", b"-1"], Expect::Str(b"")),
+            ],
+        },
+        Case {
+            family: "strings",
+            name: "setrange pad overwrite ttl",
+            steps: vec![
+                // Missing key + offset: zero-padded creation.
+                s(&[b"SETRANGE", b"sr1", b"5", b"World"], Expect::Int(10)),
+                s(&[b"GET", b"sr1"], Expect::Str(b"\0\0\0\0\0World")),
+                s(&[b"SET", b"sr2", b"Hello World"], Expect::Ok),
+                s(&[b"SETRANGE", b"sr2", b"6", b"Redis"], Expect::Int(11)),
+                s(&[b"GET", b"sr2"], Expect::Str(b"Hello Redis")),
+                // Empty patch never creates the key.
+                s(&[b"SETRANGE", b"srn", b"0", b""], Expect::Int(0)),
+                s(&[b"EXISTS", b"srn"], Expect::Int(0)),
+                // TTL survives the in-place mutation.
+                s(&[b"SETEX", b"srt", b"100", b"hello"], Expect::Ok),
+                s(&[b"SETRANGE", b"srt", b"0", b"H"], Expect::Int(5)),
+                s(&[b"TTL", b"srt"], Expect::IntRange(95, 100)),
+                s(&[b"GET", b"srt"], Expect::Str(b"Hello")),
+                s(&[b"SETRANGE", b"sr2", b"-1", b"x"], Expect::AnyError),
+            ],
+        },
+        Case {
             family: "keyspace",
             name: "del returns removal count",
             steps: vec![
@@ -451,6 +488,43 @@ fn corpus() -> Vec<Case> {
             ],
         },
         Case {
+            family: "sets",
+            name: "spop srandmember deterministic shapes",
+            steps: vec![
+                // A one-member set pins the random pick.
+                s(&[b"SADD", b"sp1", b"a"], Expect::Int(1)),
+                s(&[b"SRANDMEMBER", b"sp1"], Expect::Str(b"a")),
+                s(
+                    &[b"SRANDMEMBER", b"sp1", b"5"],
+                    Expect::Arr(vec![Expect::Str(b"a")]),
+                ),
+                s(
+                    &[b"SRANDMEMBER", b"sp1", b"-3"],
+                    Expect::Arr(vec![
+                        Expect::Str(b"a"),
+                        Expect::Str(b"a"),
+                        Expect::Str(b"a"),
+                    ]),
+                ),
+                s(&[b"SRANDMEMBER", b"sp1", b"0"], Expect::Arr(vec![])),
+                s(&[b"SRANDMEMBER", b"nosuchs"], Expect::Nil),
+                s(&[b"SRANDMEMBER", b"nosuchs", b"3"], Expect::Arr(vec![])),
+                s(&[b"SPOP", b"sp1"], Expect::Str(b"a")),
+                s(&[b"EXISTS", b"sp1"], Expect::Int(0)),
+                s(&[b"SPOP", b"nosuchs"], Expect::Nil),
+                s(&[b"SPOP", b"nosuchs", b"2"], Expect::Arr(vec![])),
+                // Over-count pops everything — compare unordered.
+                s(&[b"SADD", b"sp2", b"a", b"b", b"c"], Expect::Int(3)),
+                s(
+                    &[b"SPOP", b"sp2", b"5"],
+                    Expect::UnorderedStrs(vec![b"a", b"b", b"c"]),
+                ),
+                s(&[b"EXISTS", b"sp2"], Expect::Int(0)),
+                s(&[b"SADD", b"sp3", b"x"], Expect::Int(1)),
+                s(&[b"SPOP", b"sp3", b"-1"], Expect::AnyError),
+            ],
+        },
+        Case {
             family: "lists",
             name: "push pop order",
             steps: vec![
@@ -595,6 +669,84 @@ fn corpus() -> Vec<Case> {
                 ),
                 s(&[b"LPOS", b"l6", b"a", b"RANK", b"0"], Expect::AnyError),
                 s(&[b"LPOS", b"l6", b"a", b"COUNT", b"-1"], Expect::AnyError),
+            ],
+        },
+        Case {
+            family: "lists",
+            name: "lrem counts and directions",
+            steps: vec![
+                s(
+                    &[b"RPUSH", b"l7", b"a", b"b", b"a", b"c", b"a"],
+                    Expect::Int(5),
+                ),
+                s(&[b"LREM", b"l7", b"1", b"a"], Expect::Int(1)),
+                s(
+                    &[b"LRANGE", b"l7", b"0", b"-1"],
+                    Expect::Arr(vec![
+                        Expect::Str(b"b"),
+                        Expect::Str(b"a"),
+                        Expect::Str(b"c"),
+                        Expect::Str(b"a"),
+                    ]),
+                ),
+                s(&[b"LREM", b"l7", b"-1", b"a"], Expect::Int(1)),
+                s(
+                    &[b"LRANGE", b"l7", b"0", b"-1"],
+                    Expect::Arr(vec![
+                        Expect::Str(b"b"),
+                        Expect::Str(b"a"),
+                        Expect::Str(b"c"),
+                    ]),
+                ),
+                s(&[b"LREM", b"l7", b"0", b"a"], Expect::Int(1)),
+                s(
+                    &[b"LRANGE", b"l7", b"0", b"-1"],
+                    Expect::Arr(vec![Expect::Str(b"b"), Expect::Str(b"c")]),
+                ),
+                s(&[b"LREM", b"l7", b"0", b"zz"], Expect::Int(0)),
+                s(&[b"LREM", b"nosuchl", b"0", b"x"], Expect::Int(0)),
+            ],
+        },
+        Case {
+            family: "lists",
+            name: "linsert before after and misses",
+            steps: vec![
+                s(&[b"RPUSH", b"l8", b"a", b"c"], Expect::Int(2)),
+                s(&[b"LINSERT", b"l8", b"BEFORE", b"c", b"b"], Expect::Int(3)),
+                s(&[b"LINSERT", b"l8", b"AFTER", b"c", b"d"], Expect::Int(4)),
+                s(
+                    &[b"LRANGE", b"l8", b"0", b"-1"],
+                    Expect::Arr(vec![
+                        Expect::Str(b"a"),
+                        Expect::Str(b"b"),
+                        Expect::Str(b"c"),
+                        Expect::Str(b"d"),
+                    ]),
+                ),
+                s(
+                    &[b"LINSERT", b"l8", b"BEFORE", b"zz", b"x"],
+                    Expect::Int(-1),
+                ),
+                s(
+                    &[b"LINSERT", b"nosuchl", b"BEFORE", b"a", b"b"],
+                    Expect::Int(0),
+                ),
+                s(
+                    &[b"LINSERT", b"l8", b"SIDEWAYS", b"a", b"b"],
+                    Expect::AnyError,
+                ),
+                // Ends still behave after interior rewrites.
+                s(&[b"RPUSH", b"l8", b"e"], Expect::Int(5)),
+                s(&[b"LPOP", b"l8"], Expect::Str(b"a")),
+                s(
+                    &[b"LRANGE", b"l8", b"0", b"-1"],
+                    Expect::Arr(vec![
+                        Expect::Str(b"b"),
+                        Expect::Str(b"c"),
+                        Expect::Str(b"d"),
+                        Expect::Str(b"e"),
+                    ]),
+                ),
             ],
         },
         Case {

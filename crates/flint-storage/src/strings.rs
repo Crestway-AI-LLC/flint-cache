@@ -191,6 +191,62 @@ impl<'a> StringStore<'a> {
     pub fn strlen(&self, slot: u16, key: &[u8]) -> Result<usize, StoreError> {
         Ok(self.read_live(slot, key)?.map_or(0, |m| m.payload.len()))
     }
+
+    /// GETRANGE: inclusive `[start, end]` with negatives from the end,
+    /// clamped; an inverted or fully out-of-range window is the empty string.
+    pub fn getrange(
+        &self,
+        slot: u16,
+        key: &[u8],
+        start: i64,
+        end: i64,
+    ) -> Result<Vec<u8>, StoreError> {
+        let Some(m) = self.read_live(slot, key)? else {
+            return Ok(Vec::new());
+        };
+        let len = m.payload.len() as i64;
+        let norm = |i: i64| if i < 0 { len + i } else { i };
+        let from = norm(start).max(0);
+        let to = norm(end).min(len - 1);
+        if len == 0 || from > to {
+            return Ok(Vec::new());
+        }
+        Ok(m.payload[from as usize..=(to as usize)].to_vec())
+    }
+
+    /// SETRANGE: overwrite `patch` at `offset`, zero-padding any gap;
+    /// returns the new length. An empty patch is a pure length probe —
+    /// Redis never creates the key for it. Preserves TTL (in-place
+    /// mutation, like APPEND).
+    pub fn setrange(
+        &self,
+        slot: u16,
+        key: &[u8],
+        offset: u64,
+        patch: &[u8],
+    ) -> Result<usize, StoreError> {
+        let existing = self.read_live(slot, key)?;
+        if patch.is_empty() {
+            return Ok(existing.map_or(0, |m| m.payload.len()));
+        }
+        let (mut payload, expire_ms) = match existing {
+            None => (Vec::new(), 0),
+            Some(m) => (m.payload, m.expire_ms),
+        };
+        let end = offset + patch.len() as u64;
+        if end > self.max_value_bytes {
+            return Err(StoreError::ValueTooLarge);
+        }
+        let end = end as usize;
+        if payload.len() < end {
+            payload.resize(end, 0);
+        }
+        payload[offset as usize..end].copy_from_slice(patch);
+        let len = payload.len();
+        let meta = StringMeta::new(payload, expire_ms);
+        self.kv.put(&self.meta_key(slot, key), &meta.encode());
+        Ok(len)
+    }
 }
 
 #[cfg(test)]
@@ -294,6 +350,59 @@ mod tests {
         assert_eq!(s.get(1, b"a"), Ok(Some(b"hello".to_vec())));
         assert_eq!(s.strlen(1, b"a"), Ok(5));
         assert_eq!(s.strlen(1, b"missing"), Ok(0));
+    }
+
+    #[test]
+    fn getrange_windows() {
+        test_clock!(NOW, now, 1_000_000);
+        let kv = MemKv::new();
+        let s = StringStore::new(&kv, b"t", now);
+        s.set(1, b"k", b"Hello World", SetOptions::default())
+            .expect("set");
+        assert_eq!(s.getrange(1, b"k", 0, 4), Ok(b"Hello".to_vec()));
+        assert_eq!(s.getrange(1, b"k", -5, -1), Ok(b"World".to_vec()));
+        assert_eq!(s.getrange(1, b"k", 0, -1), Ok(b"Hello World".to_vec()));
+        assert_eq!(s.getrange(1, b"k", 9, 2), Ok(vec![]));
+        assert_eq!(s.getrange(1, b"k", 50, 60), Ok(vec![]));
+        assert_eq!(s.getrange(1, b"missing", 0, -1), Ok(vec![]));
+    }
+
+    #[test]
+    fn setrange_pads_preserves_ttl() {
+        test_clock!(NOW, now, 1_000_000);
+        let kv = MemKv::new();
+        let s = StringStore::new(&kv, b"t", now);
+        // Missing key + offset: zero-padded creation.
+        assert_eq!(s.setrange(1, b"k", 5, b"World"), Ok(10));
+        assert_eq!(s.get(1, b"k"), Ok(Some(b"\0\0\0\0\0World".to_vec())));
+        // Overwrite inside an existing value.
+        s.set(1, b"k2", b"Hello World", SetOptions::default())
+            .expect("set");
+        assert_eq!(s.setrange(1, b"k2", 6, b"Redis"), Ok(11));
+        assert_eq!(s.get(1, b"k2"), Ok(Some(b"Hello Redis".to_vec())));
+        // Empty patch never creates the key (pure length probe).
+        assert_eq!(s.setrange(1, b"nope", 0, b""), Ok(0));
+        assert_eq!(s.get(1, b"nope"), Ok(None));
+        // TTL survives the in-place mutation.
+        s.set(
+            1,
+            b"k3",
+            b"hello",
+            SetOptions {
+                expiry: SetExpiry::AtMs(2_000_000),
+                ..Default::default()
+            },
+        )
+        .expect("set");
+        assert_eq!(s.setrange(1, b"k3", 0, b"H"), Ok(5));
+        let m = s.read_live(1, b"k3").expect("read").expect("live");
+        assert_eq!(m.expire_ms, 2_000_000);
+        // The cap is enforced on the extended length.
+        let capped = StringStore::with_max_value_bytes(&kv, b"t", now, 8);
+        assert_eq!(
+            capped.setrange(1, b"c", 6, b"abc"),
+            Err(StoreError::ValueTooLarge)
+        );
     }
 
     #[test]
