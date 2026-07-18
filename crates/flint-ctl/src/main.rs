@@ -344,9 +344,15 @@ fn mint_certs(inv: &Inventory) {
 /// not an edge client — real encrypted traffic is verified by the drills).
 fn proxy_up(inv: &Inventory, proxy: &str) -> bool {
     if inv.client_tls {
-        std::net::TcpStream::connect(proxy).is_ok()
-    } else {
-        matches!(call(proxy, &None, &["PROXYSTATS"]), Ok(Value::Bulk(_)))
+        return std::net::TcpStream::connect(proxy).is_ok();
+    }
+    // PROXYSTATS answers a Bulk when ungated; once the CP pushes an admin
+    // digest (ADR-0006 D4) it answers -NOAUTH pre-auth. EITHER proves the
+    // proxy is up and serving — only connect failure means down.
+    match call(proxy, &None, &["PROXYSTATS"]) {
+        Ok(Value::Bulk(_)) => true,
+        Ok(Value::Error(e)) => e.starts_with("NOAUTH"),
+        _ => false,
     }
 }
 
@@ -426,6 +432,11 @@ fn bootstrap(inv: &Inventory) {
         format!("{d}/cp-state"),
     ];
     cp_args.extend(internal_args(inv));
+    if let Some(tok) = &inv.admin_token {
+        // ADR-0006 D4: the admin token lives in the CP and is pushed to
+        // proxies as a digest; rotate it later with `flintctl rotate-admin`.
+        cp_args.extend(["--admin-token".to_string(), tok.clone()]);
+    }
     spawn(inv, "cp", "flint-controlplane", &cp_args);
     assert!(
         wait_pong(cp, &tls, Duration::from_secs(10)),
@@ -1145,6 +1156,21 @@ fn main() {
         // EVERY proxy in the inventory — the per-proxy runtime setting,
         // fleet-applied. Presents the inventory admin token when the fleet
         // is gated.
+        // Rotate the FLEET ADMIN token (ADR-0006 D4): the CP mints the
+        // successor, keeps both valid, and the agent retires the old one
+        // once it has rolled through the fleet. Prints the new token ONCE.
+        "rotate-admin" => {
+            let tls = tls_client(&inv);
+            match call(&inv.cp[0], &tls, &["CPADMINROTATE"]) {
+                Ok(Value::Bulk(Some(t))) => {
+                    println!("{}", String::from_utf8_lossy(&t));
+                    eprintln!(
+                        "  new admin token minted; both old and new work until the agent retires the old one"
+                    );
+                }
+                other => panic!("rotate-admin failed: {other:?}"),
+            }
+        }
         "proxy-cache" => {
             let (ttl, maxb) = (
                 rest.first()
@@ -1197,7 +1223,7 @@ fn main() {
         "stop" => stop(&inv),
         other => {
             panic!(
-                "unknown command {other:?} (bootstrap|status|tenant|tenant-reads|tenant-cache|tenant-quota|proxy-cache|expand|swap-node|add-replica|upgrade|stop)"
+                "unknown command {other:?} (bootstrap|status|tenant|tenant-reads|tenant-cache|tenant-quota|rotate-admin|proxy-cache|expand|swap-node|add-replica|upgrade|stop)"
             )
         }
     }

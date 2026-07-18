@@ -524,6 +524,59 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
             }
             Value::Bulk(Some(out.into_bytes()))
         }
+        // Fleet admin token: current (returned to the mesh-authenticated
+        // agent so it can present it to proxies) — this port is the mTLS CP
+        // surface, so the caller is already an operator.
+        b"CPADMINTOKEN" => {
+            let Ok(st) = shared.state.lock() else {
+                return err("state lock");
+            };
+            match &st.admin_token {
+                Some(t) => Value::Bulk(Some(t.clone().into_bytes())),
+                None => Value::Bulk(None),
+            }
+        }
+        // Rotate the fleet admin token (ADR-0006 D4): mint the successor,
+        // current -> previous, return the new plaintext ONCE. Both remain
+        // valid (proxies get both digests) until the agent retires prev.
+        b"CPADMINROTATE" => {
+            let Ok(mut st) = shared.state.lock() else {
+                return err("state lock");
+            };
+            if st.admin_prev.is_some() {
+                return err("admin rotation in progress; previous token not yet retired");
+            }
+            let new_plain = flint_tls::mint_token();
+            st.admin_prev = st.admin_token.take();
+            st.admin_token = Some(new_plain.clone());
+            match st.commit() {
+                Ok(_) => {}
+                Err(e) => return err(&format!("persist: {e}")),
+            }
+            shared.changed.notify_all();
+            Value::Bulk(Some(new_plain.into_bytes()))
+        }
+        // Retire the previous admin token (the agent calls this once it has
+        // adopted current across the fleet — drop-on-adoption).
+        b"CPADMINPREV" => {
+            let Ok(st) = shared.state.lock() else {
+                return err("state lock");
+            };
+            Value::Integer(st.admin_prev.is_some() as i64)
+        }
+        b"CPADMINDROPPREV" => {
+            let Ok(mut st) = shared.state.lock() else {
+                return err("state lock");
+            };
+            if st.admin_prev.take().is_some() {
+                match st.commit() {
+                    Ok(_) => {}
+                    Err(e) => return err(&format!("persist: {e}")),
+                }
+                shared.changed.notify_all();
+            }
+            ok()
+        }
         b"CPPROXIES" => {
             let Ok(st) = shared.state.lock() else {
                 return err("state lock");
@@ -587,19 +640,22 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
             let Ok(st) = shared.state.lock() else {
                 return err("state lock");
             };
-            let (v, pairs, tenants) = st.snapshot_for(&proxy);
-            snapshot_frame(v, &pairs, &tenants)
+            let (v, pairs, tenants, admin) = st.snapshot_for(&proxy);
+            snapshot_frame(v, &pairs, &tenants, &admin)
         }
         _ => err("unknown control-plane command"),
     }
 }
 
-fn snapshot_frame(version: u64, pairs: &str, tenants: &str) -> Value {
+fn snapshot_frame(version: u64, pairs: &str, tenants: &str, admin: &str) -> Value {
     Value::Array(Some(vec![
         Value::Bulk(Some(b"SNAPSHOT".to_vec())),
         Value::Integer(version as i64),
         Value::Bulk(Some(pairs.as_bytes().to_vec())),
         Value::Bulk(Some(tenants.as_bytes().to_vec())),
+        // ADR-0006 D4: "curdigest,prevdigest" — a 5th element; pre-D4
+        // proxies index elements 2/3 and ignore it.
+        Value::Bulk(Some(admin.as_bytes().to_vec())),
     ]))
 }
 
@@ -621,10 +677,10 @@ fn watch(
     // sharding most mutations touch a small subset of proxies, so most
     // pushes are no-ops. State is tiny, so suppress-identical beats
     // computing diffs.
-    let mut last_view: Option<(String, String)> = None;
+    let mut last_view: Option<(String, String, String)> = None;
     loop {
         // Wait until there is something newer than the proxy has ACKed.
-        let (v, pairs, tenants) = {
+        let (v, pairs, tenants, admin) = {
             let Ok(mut st) = shared.state.lock() else {
                 return Ok(());
             };
@@ -638,15 +694,15 @@ fn watch(
             }
             st.snapshot_for(&proxy)
         };
-        if last_view.as_ref() == Some(&(pairs.clone(), tenants.clone())) {
+        if last_view.as_ref() == Some(&(pairs.clone(), tenants.clone(), admin.clone())) {
             eprintln!("watch {proxy}: suppressed push at version {v} (view unchanged)");
             acked = v;
             continue;
         }
         let mut out = Vec::new();
-        encode(&snapshot_frame(v, &pairs, &tenants), &mut out);
+        encode(&snapshot_frame(v, &pairs, &tenants, &admin), &mut out);
         stream.write_all(&out)?;
-        last_view = Some((pairs, tenants));
+        last_view = Some((pairs, tenants, admin));
         // Read the ACK (Array ["ACK", <version>]).
         loop {
             match decode(&buf) {
@@ -796,7 +852,15 @@ fn main() -> std::io::Result<()> {
         return run_raft(port, path);
     }
 
-    let state = State::load_or_new(path.clone().into());
+    let mut state = State::load_or_new(path.clone().into());
+    // Seed the fleet admin token on first boot (ADR-0006 D4). Once in
+    // state it rotates via CPADMINROTATE; the flag is ignored thereafter.
+    if state.admin_token.is_none()
+        && let Some(t) = arg("--admin-token")
+    {
+        state.admin_token = Some(t);
+        let _ = state.commit();
+    }
     eprintln!(
         "flint-controlplane: state {path} (version {}, {} proxies, {} pairs, {} tenants)",
         state.version,

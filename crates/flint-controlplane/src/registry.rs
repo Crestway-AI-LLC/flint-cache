@@ -62,6 +62,13 @@ pub enum Mutation {
         name: String,
         on: bool,
     },
+    /// Set the fleet admin token pair directly (ADR-0006 D4). The CP command
+    /// layer computes current/previous; the mutation just stores what it is
+    /// told, so the Raft log is the single source of truth.
+    SetAdmin {
+        token: Option<String>,
+        prev: Option<String>,
+    },
 }
 
 pub use crate::tenant::Tenant;
@@ -76,6 +83,13 @@ pub struct RegistryState {
     #[serde(default)]
     pub ranges: Vec<Option<(u16, u16)>>,
     pub tenants: BTreeMap<String, Tenant>,
+    /// Fleet admin (operator) token, current + previous (ADR-0006 D4).
+    /// Plaintext (the agent retrieves it; proxies get only the digest).
+    /// Rafted like every other registry fact.
+    #[serde(default)]
+    pub admin_token: Option<String>,
+    #[serde(default)]
+    pub admin_prev: Option<String>,
 }
 
 /// FNV-1a seed for deterministic subset placement (not a security
@@ -194,14 +208,24 @@ impl RegistryState {
                     t.over_quota = on;
                 }
             }
+            Mutation::SetAdmin { token, prev } => {
+                self.admin_token = token;
+                self.admin_prev = prev;
+            }
         }
     }
 
     /// The snapshot a given proxy should see: shared pair topology + ONLY
     /// the tenants whose subset includes it (the sub-group boundary).
-    pub fn snapshot_for(&self, proxy: &str) -> (u64, String, String) {
+    pub fn snapshot_for(&self, proxy: &str) -> (u64, String, String, String) {
         let (pairs, tenants) =
             crate::tenant::snapshot_for(&self.pairs, &self.ranges, self.tenants.values(), proxy);
-        (self.version, pairs, tenants)
+        let d = |t: &Option<String>| {
+            t.as_deref()
+                .map(|s| flint_tls::sha256_hex(s.as_bytes()))
+                .unwrap_or_else(|| "-".into())
+        };
+        let admin = format!("{},{}", d(&self.admin_token), d(&self.admin_prev));
+        (self.version, pairs, tenants, admin)
     }
 }

@@ -316,12 +316,13 @@ struct Topology {
     /// `None` = plaintext backends (default). Set by `--internal-*`; the same
     /// triple the servers use, in the client role.
     backend_tls: Option<Arc<rustls::ClientConfig>>,
-    /// Operator secret for the PROXY* introspection/knob surface. When set,
-    /// the aggregate views (PROXYSTATS, all-tenant PROXYHOTKEYS/PROXYLATENCY,
-    /// PROXYAUTHCOUNT) and the mutating PROXYCACHE require an admin session
-    /// (AUTH <admin-token>); tenants keep their own scoped views. When unset
-    /// (dev/drill mode) the surface stays open, as before.
-    admin_token: Option<String>,
+    /// Admin-token DIGESTS (ADR-0006 D1/D4): current + optionally previous
+    /// during a rotation window. Non-empty => the operator surface
+    /// (PROXYSTATS, all-tenant hot-key/latency, PROXYAUTHCOUNT, mutating
+    /// PROXYCACHE) requires AUTH <admin-token>. Set from a static
+    /// --admin-token (hashed at parse) OR pushed by the CP snapshot, so it
+    /// rotates without a proxy restart. Empty => open surface (dev).
+    admin_digests: RwLock<Vec<String>>,
 }
 
 impl Topology {
@@ -458,7 +459,20 @@ impl Topology {
     /// Apply a control-plane snapshot: replace the tenant table, and — only
     /// if the pair list actually changed — rebuild the routing table
     /// (discovering masters), preserving failover-chased masters otherwise.
-    fn apply_snapshot(&self, pairs_spec: &str, tenants_spec: &str) {
+    fn apply_snapshot(&self, pairs_spec: &str, tenants_spec: &str, admin_spec: &str) {
+        // "curdigest,prevdigest" (either "-"): the operator-surface gate,
+        // pushed so admin-token rotation needs no proxy restart. An EMPTY
+        // spec (pre-D4 CP) leaves any static --admin-token digest in place.
+        if !admin_spec.is_empty() {
+            let digests: Vec<String> = admin_spec
+                .split(',')
+                .filter(|d| !d.is_empty() && *d != "-")
+                .map(String::from)
+                .collect();
+            if let Ok(mut a) = self.admin_digests.write() {
+                *a = digests;
+            }
+        }
         // Pair entry: "a,b" (unranged) or "a,b|start-end" (range-owned).
         let mut new_pairs: Vec<Vec<String>> = Vec::new();
         let mut new_ranges: Vec<Option<(u16, u16)>> = Vec::new();
@@ -890,7 +904,12 @@ fn auth_step(
     let name = args.first().map(|n| n.to_ascii_uppercase());
     // Admin gate for the operator surface: locked = a token is configured
     // and this connection has not presented it.
-    let admin_locked = topo.admin_token.is_some() && !*is_admin;
+    let admin_locked = topo
+        .admin_digests
+        .read()
+        .map(|d| !d.is_empty())
+        .unwrap_or(false)
+        && !*is_admin;
     let admin_denied = || {
         AuthStep::Reply(Value::Error(
             "NOAUTH admin token required for this command".into(),
@@ -1027,10 +1046,16 @@ fn auth_step(
                 ));
             }
         };
-        // The admin token opens the operator surface, never a namespace:
-        // an admin session has no tenant and cannot run data commands.
-        if let Some(at) = &topo.admin_token
-            && token.as_slice() == at.as_bytes()
+        // The admin token opens the operator surface, never a namespace: an
+        // admin session has no tenant and cannot run data commands. Match
+        // the presented token's DIGEST against current OR previous (the
+        // rotation window), so a roll never locks the operator out.
+        let presented = flint_tls::sha256_hex(token);
+        if topo
+            .admin_digests
+            .read()
+            .map(|d| d.contains(&presented))
+            .unwrap_or(false)
         {
             *is_admin = true;
             return AuthStep::Reply(Value::Simple("OK admin".into()));
@@ -1363,18 +1388,25 @@ fn watch_control_plane(
         match decode(&buf) {
             Ok(Decoded::Complete(frame, used)) => {
                 buf.drain(..used);
-                if let Value::Array(Some(items)) = frame
-                    && let [
-                        Value::Bulk(Some(tag)),
-                        Value::Integer(version),
-                        Value::Bulk(Some(pairs)),
-                        Value::Bulk(Some(tenants)),
-                    ] = items.as_slice()
-                    && tag.eq_ignore_ascii_case(b"SNAPSHOT")
+                if let Value::Array(Some(items)) = &frame
+                    && items.len() >= 4
+                    && matches!(items.first(), Some(Value::Bulk(Some(t))) if t.eq_ignore_ascii_case(b"SNAPSHOT"))
+                    && let (
+                        Some(Value::Integer(version)),
+                        Some(Value::Bulk(Some(pairs))),
+                        Some(Value::Bulk(Some(tenants))),
+                    ) = (items.get(1), items.get(2), items.get(3))
                 {
+                    // The admin field (element 4) is present from D4 CPs
+                    // only; older frames omit it, leaving the static digest.
+                    let admin = match items.get(4) {
+                        Some(Value::Bulk(Some(a))) => String::from_utf8_lossy(a).to_string(),
+                        _ => String::new(),
+                    };
                     topo.apply_snapshot(
                         &String::from_utf8_lossy(pairs),
                         &String::from_utf8_lossy(tenants),
+                        &admin,
                     );
                     *last_version = *version as u64;
                     eprintln!("control-plane snapshot v{version} applied");
@@ -1544,7 +1576,11 @@ fn main() -> std::io::Result<()> {
         ),
         open_mode,
         backend_tls,
-        admin_token: arg("--admin-token"),
+        admin_digests: RwLock::new(
+            arg("--admin-token")
+                .map(|t| vec![flint_tls::sha256_hex(t.as_bytes())])
+                .unwrap_or_default(),
+        ),
     });
 
     // Control-plane subscription: CPWATCH pushes filtered snapshots (pairs

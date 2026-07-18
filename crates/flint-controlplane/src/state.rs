@@ -36,6 +36,15 @@ pub struct State {
     pub ranges: Vec<Option<(u16, u16)>>,
     /// Keyed by tenant name (BTreeMap: deterministic serialization order).
     pub tenants: BTreeMap<String, Tenant>,
+    /// Fleet operator (admin) token, CURRENT (ADR-0006 D4). Stored PLAINTEXT
+    /// — unlike tenant tokens it is RETRIEVED by our own components (the
+    /// agent presents it to proxies over their token-auth front door), so it
+    /// cannot be one-way hashed; at rest it relies on volume encryption. The
+    /// DIGEST is what the proxies receive (they verify, never retrieve).
+    pub admin_token: Option<String>,
+    /// Previous admin token during a rotation window (both valid until the
+    /// agent's drop-on-adoption retires it).
+    pub admin_prev: Option<String>,
     path: Option<PathBuf>,
 }
 
@@ -166,6 +175,10 @@ impl State {
                         );
                     }
                 }
+                Some("admin") => {
+                    s.admin_token = parts.next().filter(|v| *v != "-").map(String::from);
+                    s.admin_prev = parts.next().filter(|v| *v != "-").map(String::from);
+                }
                 _ => {}
             }
         }
@@ -174,6 +187,13 @@ impl State {
 
     fn serialize(&self) -> String {
         let mut out = format!("version {}\n", self.version);
+        if self.admin_token.is_some() || self.admin_prev.is_some() {
+            out.push_str(&format!(
+                "admin {} {}\n",
+                self.admin_token.as_deref().unwrap_or("-"),
+                self.admin_prev.as_deref().unwrap_or("-")
+            ));
+        }
         for p in &self.proxies {
             out.push_str(&format!("proxy {p}\n"));
         }
@@ -232,10 +252,22 @@ impl State {
     /// The snapshot a given proxy should see (shared renderer — the subset
     /// filter is the blast-radius/security boundary: a proxy never holds
     /// tokens it does not serve).
-    pub fn snapshot_for(&self, proxy: &str) -> (u64, String, String) {
+    pub fn snapshot_for(&self, proxy: &str) -> (u64, String, String, String) {
         let (pairs, tenants) =
             crate::tenant::snapshot_for(&self.pairs, &self.ranges, self.tenants.values(), proxy);
-        (self.version, pairs, tenants)
+        (self.version, pairs, tenants, self.admin_digests())
+    }
+
+    /// The admin field the proxy receives: "curdigest,prevdigest" (either
+    /// "-"). DIGESTS — the proxy verifies a presented admin token by hash,
+    /// exactly like tenant tokens (D1); it never holds the plaintext.
+    pub fn admin_digests(&self) -> String {
+        let d = |t: &Option<String>| {
+            t.as_deref()
+                .map(|s| flint_tls::sha256_hex(s.as_bytes()))
+                .unwrap_or_else(|| "-".into())
+        };
+        format!("{},{}", d(&self.admin_token), d(&self.admin_prev))
     }
 }
 
@@ -344,11 +376,11 @@ mod tests {
             );
         }
         s.version = 7;
-        let (v, pairs, tenants) = s.snapshot_for("p1");
+        let (v, pairs, tenants, _admin) = s.snapshot_for("p1");
         assert_eq!(v, 7);
         assert_eq!(pairs, "a:1,b:1");
         assert_eq!(tenants, "tok-t1=t1,tok-t3=t3");
-        let (_, _, t2) = s.snapshot_for("p2");
+        let (_, _, t2, _) = s.snapshot_for("p2");
         assert_eq!(t2, "tok-t2=t2", "p2 must not see p1's tokens");
     }
 }

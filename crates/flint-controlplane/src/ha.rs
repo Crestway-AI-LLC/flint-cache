@@ -342,12 +342,13 @@ fn args_of(frame: Value) -> Option<Vec<Vec<u8>>> {
     Some(out)
 }
 
-fn snapshot_frame(v: u64, pairs: &str, tenants: &str) -> Value {
+fn snapshot_frame(v: u64, pairs: &str, tenants: &str, admin: &str) -> Value {
     Value::Array(Some(vec![
         Value::Bulk(Some(b"SNAPSHOT".to_vec())),
         Value::Integer(v as i64),
         Value::Bulk(Some(pairs.as_bytes().to_vec())),
         Value::Bulk(Some(tenants.as_bytes().to_vec())),
+        Value::Bulk(Some(admin.as_bytes().to_vec())),
     ]))
 }
 
@@ -787,6 +788,49 @@ async fn handle_admin(ha: &Ha, args: &[Vec<u8>]) -> Value {
             }
             Value::Bulk(Some(out.into_bytes()))
         }
+        b"CPADMINTOKEN" => {
+            let reg = ha.store.registry().await;
+            match reg.admin_token {
+                Some(t) => Value::Bulk(Some(t.into_bytes())),
+                None => Value::Bulk(None),
+            }
+        }
+        b"CPADMINROTATE" => {
+            let reg = ha.store.registry().await;
+            if reg.admin_prev.is_some() {
+                return Value::Error(
+                    "ERR admin rotation in progress; previous token not yet retired".into(),
+                );
+            }
+            let new_plain = flint_tls::mint_token();
+            match ha
+                .propose(Mutation::SetAdmin {
+                    token: Some(new_plain.clone()),
+                    prev: reg.admin_token,
+                })
+                .await
+            {
+                Ok(_) => Value::Bulk(Some(new_plain.into_bytes())),
+                Err(l) => redirect(l),
+            }
+        }
+        b"CPADMINPREV" => {
+            let reg = ha.store.registry().await;
+            Value::Integer(reg.admin_prev.is_some() as i64)
+        }
+        b"CPADMINDROPPREV" => {
+            let reg = ha.store.registry().await;
+            match ha
+                .propose(Mutation::SetAdmin {
+                    token: reg.admin_token,
+                    prev: None,
+                })
+                .await
+            {
+                Ok(_) => Value::Simple("OK".into()),
+                Err(l) => redirect(l),
+            }
+        }
         b"CPPROXIES" => {
             let reg = ha.store.registry().await;
             Value::Bulk(Some(reg.proxies.join(",").into_bytes()))
@@ -838,8 +882,8 @@ async fn handle_admin(ha: &Ha, args: &[Vec<u8>]) -> Value {
                 return Value::Error("ERR CPSNAPSHOT <proxy-addr>".into());
             };
             let reg = ha.store.registry().await;
-            let (v, pairs, tenants) = reg.snapshot_for(&proxy);
-            snapshot_frame(v, &pairs, &tenants)
+            let (v, pairs, tenants, admin) = reg.snapshot_for(&proxy);
+            snapshot_frame(v, &pairs, &tenants, &admin)
         }
         _ => Value::Error("ERR unknown control-plane command".into()),
     }
@@ -855,19 +899,19 @@ async fn watch_loop<S: AsyncRead + AsyncWrite + Unpin>(
     let mut chunk = [0u8; 8192];
     // Delta suppression: a version bump whose filtered view is unchanged is
     // acknowledged locally, not pushed (see the single-node watch()).
-    let mut last_view: Option<(String, String)> = None;
+    let mut last_view: Option<(String, String, String)> = None;
     loop {
         let reg = ha.store.registry().await;
         if reg.version > acked {
-            let (v, pairs, tenants) = reg.snapshot_for(&proxy);
-            if last_view.as_ref() == Some(&(pairs.clone(), tenants.clone())) {
+            let (v, pairs, tenants, admin) = reg.snapshot_for(&proxy);
+            if last_view.as_ref() == Some(&(pairs.clone(), tenants.clone(), admin.clone())) {
                 eprintln!("watch {proxy}: suppressed push at version {v} (view unchanged)");
                 acked = v;
                 continue;
             }
-            last_view = Some((pairs.clone(), tenants.clone()));
+            last_view = Some((pairs.clone(), tenants.clone(), admin.clone()));
             let mut o = Vec::new();
-            encode(&snapshot_frame(v, &pairs, &tenants), &mut o);
+            encode(&snapshot_frame(v, &pairs, &tenants, &admin), &mut o);
             sock.write_all(&o).await?;
             // Read the ACK.
             loop {
