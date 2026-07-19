@@ -35,7 +35,7 @@ default-members = [
 version = "0.0.1"
 edition = "2024"
 license = "Elastic-2.0"
-repository = "https://github.com/CrestwayAI/flint-cache"
+repository = "https://github.com/Crestway-AI-LLC/flint-cache"
 
 [workspace.lints.clippy]
 unwrap_used = "warn"
