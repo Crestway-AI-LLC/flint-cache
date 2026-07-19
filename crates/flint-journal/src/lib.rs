@@ -62,6 +62,11 @@ pub enum EventKind {
     /// Tier-1 escalation: the agent needed to act but could not (budget
     /// exhausted, dead-man tripped, verify timeout) — a human is paged.
     PageHuman,
+    /// The agent's consolidation cron swept the CP slot-ownership table
+    /// (CPCONSOLIDATE) and the row count DROPPED — adjacent runs merged or
+    /// rows made redundant by topology change retired. detail carries
+    /// "before -> after". No-op sweeps are not journaled.
+    SlotsConsolidated,
     /// The rotation loop retired a drained previous token (ADR-0006 D3):
     /// its auth count stayed flat across the tenant's subset for a full
     /// drain window. detail carries the drained digest (non-secret).
