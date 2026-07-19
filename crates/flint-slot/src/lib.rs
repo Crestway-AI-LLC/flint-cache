@@ -93,3 +93,120 @@ mod tests {
         }
     }
 }
+
+/// An ordered, non-overlapping set of slot intervals, each mapping a
+/// contiguous `[lo, hi]` range to a small index — the interval model of
+/// routing state at EVERY level (ADR-0007): level-1 uses it as
+/// `range → pair index` inside a cluster; level-0 (federation) uses it as
+/// `range → cluster index` for a federated tenant. Single-slot intervals
+/// (`lo == hi`) are legal — the mid-migration shape. Compact at rest and
+/// on the wire; expand to a dense array only where O(1) lookup matters.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlotIntervals {
+    /// Sorted by `lo`, non-overlapping: `(lo, hi, index)`, `lo <= hi`.
+    entries: Vec<(u16, u16, u16)>,
+}
+
+impl SlotIntervals {
+    /// The whole slot space owned by one index — the non-federated default
+    /// (every slot → cluster 0) and the fresh-pair default.
+    pub fn single(index: u16) -> Self {
+        SlotIntervals {
+            entries: vec![(0, SLOT_COUNT - 1, index)],
+        }
+    }
+
+    /// Build from arbitrary entries; sorts and validates. `None` when an
+    /// interval is inverted (`lo > hi`), out of the slot space, or two
+    /// intervals overlap — a malformed map must fail loudly at parse time,
+    /// never route wrongly at lookup time.
+    pub fn from_entries(mut entries: Vec<(u16, u16, u16)>) -> Option<Self> {
+        entries.sort_unstable();
+        for (i, &(lo, hi, _)) in entries.iter().enumerate() {
+            if lo > hi || hi >= SLOT_COUNT {
+                return None;
+            }
+            if let Some(&(next_lo, _, _)) = entries.get(i + 1)
+                && next_lo <= hi
+            {
+                return None;
+            }
+        }
+        Some(SlotIntervals { entries })
+    }
+
+    /// The index owning `slot`, or `None` for an uncovered slot (callers
+    /// choose the fallback — the proxy falls back to its default map).
+    pub fn lookup(&self, slot: u16) -> Option<u16> {
+        let i = self.entries.partition_point(|&(lo, _, _)| lo <= slot);
+        let &(lo, hi, idx) = self.entries.get(i.checked_sub(1)?)?;
+        (slot >= lo && slot <= hi).then_some(idx)
+    }
+
+    /// The raw sorted entries (wire encoding, consolidation planning).
+    pub fn entries(&self) -> &[(u16, u16, u16)] {
+        &self.entries
+    }
+
+    /// Dense O(1) form: one index per slot (`u16::MAX` = uncovered). The
+    /// in-RAM shape for hot-path routing; ~32 KB per map.
+    pub fn dense(&self) -> Vec<u16> {
+        let mut d = vec![u16::MAX; SLOT_COUNT as usize];
+        for &(lo, hi, idx) in &self.entries {
+            for s in lo..=hi {
+                d[s as usize] = idx;
+            }
+        }
+        d
+    }
+}
+
+#[cfg(test)]
+mod interval_tests {
+    use super::*;
+
+    #[test]
+    fn single_covers_everything() {
+        let m = SlotIntervals::single(3);
+        assert_eq!(m.lookup(0), Some(3));
+        assert_eq!(m.lookup(16383), Some(3));
+        assert_eq!(m.lookup(9999), Some(3));
+    }
+
+    #[test]
+    fn from_entries_sorts_validates_and_looks_up() {
+        // Out of order in, sorted out; single-slot interval legal.
+        let m = SlotIntervals::from_entries(vec![(100, 100, 7), (0, 99, 1), (101, 16383, 2)])
+            .expect("valid");
+        assert_eq!(m.lookup(0), Some(1));
+        assert_eq!(m.lookup(99), Some(1));
+        assert_eq!(m.lookup(100), Some(7));
+        assert_eq!(m.lookup(101), Some(2));
+        assert_eq!(m.lookup(16383), Some(2));
+    }
+
+    #[test]
+    fn gaps_are_uncovered_not_wrong() {
+        let m = SlotIntervals::from_entries(vec![(10, 20, 1)]).expect("valid");
+        assert_eq!(m.lookup(9), None);
+        assert_eq!(m.lookup(21), None);
+        assert_eq!(m.lookup(15), Some(1));
+    }
+
+    #[test]
+    fn malformed_maps_fail_at_parse() {
+        assert!(SlotIntervals::from_entries(vec![(20, 10, 1)]).is_none()); // inverted
+        assert!(SlotIntervals::from_entries(vec![(0, 16384, 1)]).is_none()); // out of space
+        assert!(SlotIntervals::from_entries(vec![(0, 10, 1), (10, 20, 2)]).is_none()); // overlap
+        assert!(SlotIntervals::from_entries(vec![(0, 10, 1), (5, 8, 2)]).is_none()); // nested
+    }
+
+    #[test]
+    fn dense_matches_lookup() {
+        let m = SlotIntervals::from_entries(vec![(0, 8191, 0), (8192, 16383, 1)]).expect("valid");
+        let d = m.dense();
+        for s in [0u16, 8191, 8192, 16383, 4000, 12000] {
+            assert_eq!(d[s as usize], m.lookup(s).unwrap_or(u16::MAX));
+        }
+    }
+}

@@ -49,6 +49,11 @@ pub enum Mutation {
         name: String,
         on: bool,
     },
+    /// Set a tenant's federation flag (ADR-0007, plumbing only today).
+    SetFederated {
+        name: String,
+        on: bool,
+    },
     /// Set a tenant's quotas (M5): fleet ops/s and storage bytes; 0 =
     /// unlimited. Lowering max_bytes does NOT flip over_quota by itself —
     /// the metering loop owns that verdict.
@@ -163,6 +168,7 @@ impl RegistryState {
                         prev_token: None,
                         replica_reads: false,
                         local_cache: false,
+                        federated: false,
                         ops_per_sec: 0,
                         max_bytes: 0,
                         over_quota: false,
@@ -192,6 +198,11 @@ impl RegistryState {
             Mutation::SetLocalCache { name, on } => {
                 if let Some(t) = self.tenants.get_mut(&name) {
                     t.local_cache = on;
+                }
+            }
+            Mutation::SetFederated { name, on } => {
+                if let Some(t) = self.tenants.get_mut(&name) {
+                    t.federated = on;
                 }
             }
             Mutation::SetQuota {

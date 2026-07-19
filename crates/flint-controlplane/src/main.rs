@@ -191,6 +191,7 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
                     prev_token: None,
                     replica_reads: false,
                     local_cache: false,
+                    federated: false,
                     ops_per_sec: 0,
                     max_bytes: 0,
                     over_quota: false,
@@ -218,6 +219,32 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
             } else {
                 subset.split(',').map(String::from).collect()
             };
+            match st.commit() {
+                Ok(_) => {}
+                Err(e) => return err(&format!("persist: {e}")),
+            }
+            shared.changed.notify_all();
+            ok()
+        }
+        // Federation flag (ADR-0007, plumbing): marks the tenant as served
+        // by a dedicated multi-cluster proxy group. Rides the snapshot as
+        // 'f'; no routing consequence until the fleet-map work lands.
+        b"CPTENANTFEDERATE" => {
+            let (Some(name), Some(mode)) = (text(1), text(2)) else {
+                return err("CPTENANTFEDERATE <name> <on|off>");
+            };
+            let on = match mode.as_str() {
+                "on" => true,
+                "off" => false,
+                _ => return err("CPTENANTFEDERATE <name> <on|off>"),
+            };
+            let Ok(mut st) = shared.state.lock() else {
+                return err("state lock");
+            };
+            let Some(t) = st.tenants.get_mut(&name) else {
+                return err("no such tenant");
+            };
+            t.federated = on;
             match st.commit() {
                 Ok(_) => {}
                 Err(e) => return err(&format!("persist: {e}")),

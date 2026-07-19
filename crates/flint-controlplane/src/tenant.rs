@@ -45,12 +45,19 @@ pub struct Tenant {
     /// an operator). Rides the snapshot as the 'q' flag.
     #[serde(default)]
     pub over_quota: bool,
+    /// Federation flag (ADR-0007, plumbing only today): this tenant's slot
+    /// space may span member clusters, served by a dedicated proxy group.
+    /// Rides the snapshot as the 'f' flag; routing semantics arrive with
+    /// the fleet-map work.
+    #[serde(default)]
+    pub federated: bool,
 }
 
 impl Tenant {
     /// The snapshot flag suffix the proxy parses: "#<flags>[@<rate>]" —
     /// flags 'r' (replica reads), 'c' (near-cache), 'q' (over storage
-    /// quota); `rate` = this tenant's PER-PROXY ops/s share (present only
+    /// quota), 'f' (federated, ADR-0007); `rate` = this tenant's PER-PROXY
+    /// ops/s share (present only
     /// when a rate quota is set). THE single producer of this encoding —
     /// see the proxy's `apply_snapshot` for the single consumer.
     pub fn flags_suffix(&self) -> String {
@@ -63,6 +70,9 @@ impl Tenant {
         }
         if self.over_quota {
             flags.push('q');
+        }
+        if self.federated {
+            flags.push('f');
         }
         let rate = self.per_proxy_rate();
         match (flags.is_empty(), rate) {

@@ -127,6 +127,11 @@ struct TenantGrant {
     ns: Vec<u8>,
     replica_reads: bool,
     local_cache: bool,
+    /// Federation flag (ADR-0007, plumbing only today): this tenant's slot
+    /// space may span member clusters. Routing consequences arrive with the
+    /// fleet-map work; until then the flag rides the wire and is stored.
+    #[allow(dead_code)]
+    federated: bool,
     /// Over storage quota: writes shed with -QUOTA, reads served.
     over_quota: bool,
     /// Per-proxy ops/s share (token bucket); 0 = unlimited.
@@ -275,13 +280,27 @@ struct Routing {
 /// by the control plane), the moved-slot override cache, and the tenant
 /// table (static from --tenants, or pushed — filtered to THIS proxy's
 /// assigned tenants, the sub-group boundary).
-struct Topology {
+/// One cluster's routing state: the level-1 table (pairs/masters/ranges)
+/// plus its moved-slot override cache. Today every proxy holds exactly ONE
+/// of these; a federated tenant's dedicated proxy group (ADR-0007) will
+/// hold one per member cluster, selected per-request by the level-0 map.
+struct ClusterView {
     routing: RwLock<Routing>,
     /// (namespace, slot) -> owner address, learned from -MOVED redirects.
     /// Keyed per namespace because migrations move one tenant's slot rows:
     /// tenant A's redirect must not reroute tenant B. Overrides the range
     /// default; lost entries are relearned from the default owner.
     moved: RwLock<HashMap<(Vec<u8>, u16), String>>,
+}
+
+struct Topology {
+    /// Member-cluster views, indexed by the level-0 map's cluster index.
+    /// Invariant: non-empty; index 0 is the home cluster and the fallback.
+    clusters: Vec<ClusterView>,
+    /// Level-0: slot range -> cluster index (ADR-0007). A non-federated
+    /// proxy holds the single-interval default (everything -> cluster 0),
+    /// so today this resolves to 0 unconditionally.
+    level0: RwLock<flint_slot::SlotIntervals>,
     /// token -> (namespace, replica_reads opt-in, local_cache opt-in).
     /// replica_reads (ADR-0005 D7) lets this tenant's READS fan across the
     /// owning pair's replicas; local_cache (ADR-0005 D6) lets this proxy
@@ -348,12 +367,13 @@ impl Topology {
     /// Range-based default owner (pair i serves slots [i*N/16384 ..)),
     /// overridden per (ns, slot) by the moved cache.
     fn route(&self, ns: &[u8], slot: u16) -> Option<String> {
-        if let Ok(moved) = self.moved.read()
+        let view = self.cluster_for(slot);
+        if let Ok(moved) = view.moved.read()
             && let Some(addr) = moved.get(&(ns.to_vec(), slot))
         {
             return Some(addr.clone());
         }
-        let routing = self.routing.read().ok()?;
+        let routing = view.routing.read().ok()?;
         if routing.pairs.is_empty() {
             return None;
         }
@@ -378,9 +398,25 @@ impl Topology {
     }
 
     fn learn_moved(&self, ns: &[u8], slot: u16, addr: &str) {
-        if let Ok(mut moved) = self.moved.write() {
+        if let Ok(mut moved) = self.cluster_for(slot).moved.write() {
             moved.insert((ns.to_vec(), slot), addr.to_string());
         }
+    }
+
+    /// The member cluster owning `slot` per the level-0 map — cluster 0
+    /// (the home cluster) for every non-federated proxy and for any
+    /// uncovered slot. The federation seam: multi-cluster routing changes
+    /// THIS function's inputs, not its callers.
+    fn cluster_for(&self, slot: u16) -> &ClusterView {
+        let idx = self
+            .level0
+            .read()
+            .ok()
+            .and_then(|m| m.lookup(slot))
+            .map(|i| i as usize)
+            .filter(|i| *i < self.clusters.len())
+            .unwrap_or(0);
+        &self.clusters[idx]
     }
 
     /// The tenant table is keyed by token DIGEST (ADR-0006 D1): hash the
@@ -396,7 +432,7 @@ impl Topology {
     /// from the new owner's replicas, not the old pair's.
     fn route_replica(&self, ns: &[u8], slot: u16) -> Option<String> {
         let master = self.route(ns, slot)?;
-        let routing = self.routing.read().ok()?;
+        let routing = self.cluster_for(slot).routing.read().ok()?;
         let members = routing.pairs.iter().find(|nodes| nodes.contains(&master))?;
         let replicas: Vec<&String> = members.iter().filter(|n| **n != master).collect();
         if replicas.is_empty() {
@@ -435,39 +471,43 @@ impl Topology {
     /// kept — the new master of that pair holds the moved slots too; only
     /// the address may change, which the next -MOVED corrects.)
     fn rediscover_for(&self, addr: &str) {
-        let pairs: Vec<(usize, Vec<String>)> = match self.routing.read() {
-            Ok(r) => r
-                .pairs
-                .iter()
-                .enumerate()
-                .filter(|(i, nodes)| {
-                    nodes.iter().any(|n| n == addr)
-                        || r.masters
-                            .get(*i)
-                            .and_then(|m| m.as_ref())
-                            .is_some_and(|m| m == addr)
-                })
-                .map(|(i, nodes)| (i, nodes.clone()))
-                .collect(),
-            Err(_) => return,
-        };
-        for (i, nodes) in pairs {
-            let found = discover_master(&nodes, &self.backend_tls);
-            if let Ok(mut routing) = self.routing.write()
-                && let Some(slot) = routing.masters.get_mut(i)
-            {
-                *slot = found.clone();
-            }
-            // Moved entries pointing at the dead address migrate to the
-            // pair's new master (slot data survives failover via the
-            // pair's replica).
-            if let Some(new_master) = found
-                && new_master != addr
-                && let Ok(mut moved) = self.moved.write()
-            {
-                for v in moved.values_mut() {
-                    if v == addr {
-                        *v = new_master.clone();
+        // A dead address could belong to any member cluster: walk them all
+        // (one, today).
+        for view in &self.clusters {
+            let pairs: Vec<(usize, Vec<String>)> = match view.routing.read() {
+                Ok(r) => r
+                    .pairs
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, nodes)| {
+                        nodes.iter().any(|n| n == addr)
+                            || r.masters
+                                .get(*i)
+                                .and_then(|m| m.as_ref())
+                                .is_some_and(|m| m == addr)
+                    })
+                    .map(|(i, nodes)| (i, nodes.clone()))
+                    .collect(),
+                Err(_) => continue,
+            };
+            for (i, nodes) in pairs {
+                let found = discover_master(&nodes, &self.backend_tls);
+                if let Ok(mut routing) = view.routing.write()
+                    && let Some(slot) = routing.masters.get_mut(i)
+                {
+                    *slot = found.clone();
+                }
+                // Moved entries pointing at the dead address migrate to the
+                // pair's new master (slot data survives failover via the
+                // pair's replica).
+                if let Some(new_master) = found
+                    && new_master != addr
+                    && let Ok(mut moved) = view.moved.write()
+                {
+                    for v in moved.values_mut() {
+                        if v == addr {
+                            *v = new_master.clone();
+                        }
                     }
                 }
             }
@@ -509,7 +549,11 @@ impl Topology {
                 new_ranges.push(range);
             }
         }
-        let rebuild = match self.routing.read() {
+        // Snapshot pushes feed the HOME cluster's view (index 0). A
+        // federated proxy group (ADR-0007) will run one watch loop per
+        // member CP, each targeting its own view.
+        let view = &self.clusters[0];
+        let rebuild = match view.routing.read() {
             Ok(r) => r.pairs != new_pairs || r.ranges != new_ranges,
             Err(_) => return,
         };
@@ -518,7 +562,7 @@ impl Topology {
                 .iter()
                 .map(|n| discover_master(n, &self.backend_tls))
                 .collect();
-            if let Ok(mut routing) = self.routing.write() {
+            if let Ok(mut routing) = view.routing.write() {
                 routing.pairs = new_pairs;
                 routing.masters = masters;
                 routing.ranges = new_ranges;
@@ -545,6 +589,7 @@ impl Topology {
                         replica_reads: flags.contains('r'),
                         local_cache: flags.contains('c'),
                         over_quota: flags.contains('q'),
+                        federated: flags.contains('f'),
                         rate,
                     },
                 ))
@@ -788,7 +833,7 @@ fn forward(
         let target = match slot {
             Some(s) if use_replica => topo.route_replica(ns, s).or_else(|| topo.route(ns, s)),
             Some(s) => topo.route(ns, s),
-            None => topo
+            None => topo.clusters[0]
                 .routing
                 .read()
                 .ok()
@@ -799,17 +844,19 @@ fn forward(
                 return Value::Error("ERR no reachable master for this slot".into());
             }
             // Nothing known yet (e.g. mid-failover): rediscover everything.
-            let pairs: Vec<Vec<String>> = topo
-                .routing
-                .read()
-                .map(|r| r.pairs.clone())
-                .unwrap_or_default();
-            for (i, nodes) in pairs.iter().enumerate() {
-                let found = discover_master(nodes, &topo.backend_tls);
-                if let Ok(mut routing) = topo.routing.write()
-                    && let Some(m) = routing.masters.get_mut(i)
-                {
-                    *m = found;
+            for view in &topo.clusters {
+                let pairs: Vec<Vec<String>> = view
+                    .routing
+                    .read()
+                    .map(|r| r.pairs.clone())
+                    .unwrap_or_default();
+                for (i, nodes) in pairs.iter().enumerate() {
+                    let found = discover_master(nodes, &topo.backend_tls);
+                    if let Ok(mut routing) = view.routing.write()
+                        && let Some(m) = routing.masters.get_mut(i)
+                    {
+                        *m = found;
+                    }
                 }
             }
             std::thread::sleep(Duration::from_millis(100));
@@ -892,10 +939,15 @@ fn fan_out(
     frame: &[u8],
     combine: impl Fn(Vec<Value>) -> Value,
 ) -> Value {
-    let masters: Vec<Option<String>> = match topo.routing.read() {
-        Ok(r) => r.masters.clone(),
-        Err(_) => return Value::Error("ERR topology lock".into()),
-    };
+    // Fan across every member cluster's masters (one cluster today; the
+    // ADR-0007 O(clusters x pairs) broadcast shape).
+    let mut masters: Vec<Option<String>> = Vec::new();
+    for view in &topo.clusters {
+        match view.routing.read() {
+            Ok(r) => masters.extend(r.masters.clone()),
+            Err(_) => return Value::Error("ERR topology lock".into()),
+        }
+    }
     let mut replies = Vec::new();
     for addr in masters {
         let Some(addr) = addr else {
@@ -1504,7 +1556,18 @@ fn frame_to_args(frame: Value) -> Option<Vec<Vec<u8>>> {
 
 fn main() -> std::io::Result<()> {
     let port: u16 = arg("--port").and_then(|p| p.parse().ok()).unwrap_or(7379);
-    let control_plane = arg("--control-plane");
+    // Comma-list ready (ADR-0007: a federated proxy group subscribes to
+    // each member cluster's CP). Exactly ONE is supported until the
+    // fleet-map work lands — reject more with an honest error rather than
+    // silently ignoring extras.
+    let control_planes: Vec<String> = arg("--control-plane")
+        .map(|v| v.split(',').map(str::trim).map(String::from).collect())
+        .unwrap_or_default();
+    assert!(
+        control_planes.len() <= 1,
+        "multiple --control-plane addresses are federation (ADR-0007) and not wired yet; give one"
+    );
+    let control_plane = control_planes.first().cloned();
 
     // Client-facing TLS termination: both flags together enable it, neither
     // keeps the plaintext listener (byte-identical to pre-TLS). One without
@@ -1586,12 +1649,15 @@ fn main() -> std::io::Result<()> {
         control_plane,
     );
     let topo = Arc::new(Topology {
-        routing: RwLock::new(Routing {
-            pairs,
-            masters,
-            ranges: Vec::new(),
-        }),
-        moved: RwLock::new(HashMap::new()),
+        clusters: vec![ClusterView {
+            routing: RwLock::new(Routing {
+                pairs,
+                masters,
+                ranges: Vec::new(),
+            }),
+            moved: RwLock::new(HashMap::new()),
+        }],
+        level0: RwLock::new(flint_slot::SlotIntervals::single(0)),
         quota: RwLock::new(
             tenants
                 .values()
