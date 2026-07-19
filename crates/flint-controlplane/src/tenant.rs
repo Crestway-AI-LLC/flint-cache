@@ -131,10 +131,79 @@ pub fn snapshot_for<'a>(
     (pairs_spec, tenants_spec)
 }
 
-/// Render the slot-exception table for the snapshot's 6th frame element:
-/// `ns:slot:pair` entries joined by ';' (empty when none). Exceptions are
-/// Option B's sparse layer — CP-held truth for slots whose owner diverges
-/// from the pair's contiguous default range.
+/// A slot-ownership exception RUN: `(ns, lo, hi, pair_idx)` — ownership of
+/// `ns`'s slots `lo..=hi` diverges from the default range to `pair_idx`.
+/// Adjacent single-slot commits compress into runs (the consolidation op),
+/// so the table is sized by fragmentation SHAPE, not migrated-slot count.
+pub type SlotRun = (String, u16, u16, u16);
+
+/// Record `(ns, slot) -> pair` into `runs`: carve the slot out of any run
+/// covering it (splitting an interior hit), insert, merge with adjacent
+/// same-ns same-pair neighbors, and RETIRE anything redundant against the
+/// default ranges (an exception that agrees with the default is not an
+/// exception — this is also how a committed move-back self-retires without
+/// the CPCLEARSLOT sharp edge).
+pub fn set_slot_owner(
+    runs: &mut Vec<SlotRun>,
+    ns: &str,
+    slot: u16,
+    pair: u16,
+    ranges: &[Option<(u16, u16)>],
+    pair_count: usize,
+) {
+    clear_slot_owner(runs, ns, slot);
+    runs.push((ns.to_string(), slot, slot, pair));
+    normalize(runs, ranges, pair_count);
+}
+
+/// Remove `slot` from any run covering it (splitting when interior).
+/// Returns whether anything covered it.
+pub fn clear_slot_owner(runs: &mut Vec<SlotRun>, ns: &str, slot: u16) -> bool {
+    let mut hit = false;
+    let mut out: Vec<SlotRun> = Vec::with_capacity(runs.len() + 1);
+    for (n, lo, hi, p) in runs.drain(..) {
+        if n != ns || slot < lo || slot > hi {
+            out.push((n, lo, hi, p));
+            continue;
+        }
+        hit = true;
+        if lo < slot {
+            out.push((n.clone(), lo, slot - 1, p));
+        }
+        if hi > slot {
+            out.push((n, slot + 1, hi, p));
+        }
+    }
+    *runs = out;
+    hit
+}
+
+/// The consolidation sweep (also applied on every mutation): sort, merge
+/// adjacent same-ns same-pair runs, and drop runs made entirely of slots
+/// whose default owner already IS the run's pair.
+pub fn normalize(runs: &mut Vec<SlotRun>, ranges: &[Option<(u16, u16)>], pair_count: usize) {
+    runs.sort();
+    let mut out: Vec<SlotRun> = Vec::with_capacity(runs.len());
+    for (n, lo, hi, p) in runs.drain(..) {
+        if let Some((ln, _, lhi, lp)) = out.last_mut()
+            && *ln == n
+            && *lp == p
+            && *lhi as u32 + 1 == lo as u32
+        {
+            *lhi = hi;
+            continue;
+        }
+        out.push((n, lo, hi, p));
+    }
+    out.retain(|(_, lo, hi, p)| {
+        !(*lo..=*hi).all(|s| flint_slot::default_pair(s, ranges, pair_count) == Some(*p as usize))
+    });
+    *runs = out;
+}
+
+/// Render the exception table for the snapshot's 6th frame element:
+/// `ns:slot:pair` for single-slot runs, `ns:lo-hi:pair` for wider ones,
+/// joined by ';' (empty when none).
 ///
 /// FILTERED like the tenant table: a proxy receives only rows for
 /// namespaces of tenants whose subset includes it — the same blast-radius
@@ -142,7 +211,7 @@ pub fn snapshot_for<'a>(
 /// serve"), and it keeps each proxy's map sized by ITS tenants'
 /// fragmentation, not the fleet's.
 pub fn exceptions_spec_for<'a>(
-    exceptions: &[(String, u16, u16)],
+    exceptions: &[SlotRun],
     tenants: impl Iterator<Item = &'a Tenant>,
     proxy: &str,
 ) -> String {
@@ -152,8 +221,14 @@ pub fn exceptions_spec_for<'a>(
         .collect();
     exceptions
         .iter()
-        .filter(|(ns, _, _)| served.contains(ns.as_str()))
-        .map(|(ns, slot, pair)| format!("{ns}:{slot}:{pair}"))
+        .filter(|(ns, _, _, _)| served.contains(ns.as_str()))
+        .map(|(ns, lo, hi, pair)| {
+            if lo == hi {
+                format!("{ns}:{lo}:{pair}")
+            } else {
+                format!("{ns}:{lo}-{hi}:{pair}")
+            }
+        })
         .collect::<Vec<_>>()
         .join(";")
 }

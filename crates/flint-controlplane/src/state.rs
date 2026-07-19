@@ -43,7 +43,7 @@ pub struct State {
     /// per (ns, slot). Pair INDEX, not address: routing then follows the
     /// pair's failovers automatically. The CP is the durable truth;
     /// proxy-learned -MOVED entries are only the bridge until this commits.
-    pub exceptions: Vec<(String, u16, u16)>,
+    pub exceptions: Vec<crate::tenant::SlotRun>,
     /// Fleet operator (admin) token, CURRENT (ADR-0006 D4). Stored PLAINTEXT
     /// — unlike tenant tokens it is RETRIEVED by our own components (the
     /// agent presents it to proxies over their token-auth front door), so it
@@ -187,12 +187,23 @@ impl State {
                     }
                 }
                 Some("exc") => {
-                    if let (Some(ns), Some(slot), Some(pair)) = (
-                        parts.next(),
-                        parts.next().and_then(|v| v.parse().ok()),
-                        parts.next().and_then(|v| v.parse().ok()),
-                    ) {
-                        s.exceptions.push((ns.to_string(), slot, pair));
+                    // 4-field run form "ns lo hi pair"; a legacy 3-field
+                    // single "ns slot pair" loads as a width-1 run.
+                    let f: Vec<&str> = parts.collect();
+                    match f.as_slice() {
+                        [ns, lo, hi, pair] => {
+                            if let (Ok(lo), Ok(hi), Ok(pair)) =
+                                (lo.parse(), hi.parse(), pair.parse())
+                            {
+                                s.exceptions.push((ns.to_string(), lo, hi, pair));
+                            }
+                        }
+                        [ns, slot, pair] => {
+                            if let (Ok(slot), Ok(pair)) = (slot.parse::<u16>(), pair.parse()) {
+                                s.exceptions.push((ns.to_string(), slot, slot, pair));
+                            }
+                        }
+                        _ => {}
                     }
                 }
                 Some("admin") => {
@@ -224,8 +235,8 @@ impl State {
             };
             out.push_str(&format!("pair {} {range}\n", pair.join(",")));
         }
-        for (ns, slot, pair) in &self.exceptions {
-            out.push_str(&format!("exc {ns} {slot} {pair}\n"));
+        for (ns, lo, hi, pair) in &self.exceptions {
+            out.push_str(&format!("exc {ns} {lo} {hi} {pair}\n"));
         }
         for t in self.tenants.values() {
             let subset = if t.subset.is_empty() {
@@ -301,16 +312,21 @@ impl State {
 
     /// Record (ns, slot) -> pair_idx, replacing any previous owner row.
     pub fn set_exception(&mut self, ns: &str, slot: u16, pair: u16) {
-        self.exceptions.retain(|(n, s, _)| !(n == ns && *s == slot));
-        self.exceptions.push((ns.to_string(), slot, pair));
-        self.exceptions.sort();
+        let n = self.pairs.len();
+        crate::tenant::set_slot_owner(&mut self.exceptions, ns, slot, pair, &self.ranges, n);
     }
 
-    /// Retire the (ns, slot) row (consolidation, or a move back).
+    /// Retire (ns, slot) from the table (splits an interior hit).
     pub fn clear_exception(&mut self, ns: &str, slot: u16) -> bool {
-        let before = self.exceptions.len();
-        self.exceptions.retain(|(n, s, _)| !(n == ns && *s == slot));
-        self.exceptions.len() != before
+        crate::tenant::clear_slot_owner(&mut self.exceptions, ns, slot)
+    }
+
+    /// The consolidation sweep: merge adjacent runs, drop redundant ones.
+    /// Returns the row count after.
+    pub fn consolidate(&mut self) -> usize {
+        let n = self.pairs.len();
+        crate::tenant::normalize(&mut self.exceptions, &self.ranges, n);
+        self.exceptions.len()
     }
 }
 
@@ -349,24 +365,43 @@ mod tests {
                 },
             );
         }
+        // Slots 100/200: default owner is pair 0 (count-derived) — pointing
+        // them at pair 1 is a real exception.
         s.set_exception("acme", 100, 1);
-        s.set_exception("bravo", 200, 0);
+        s.set_exception("bravo", 200, 1);
         let (_, _, _, _, exc1) = s.snapshot_for("p1");
         let (_, _, _, _, exc2) = s.snapshot_for("p2");
         // Each proxy sees ONLY its served tenants' rows (R4 boundary).
         assert_eq!(exc1, "acme:100:1");
-        assert_eq!(exc2, "bravo:200:0");
-        // set replaces, clear retires — and survives a reload.
+        assert_eq!(exc2, "bravo:200:1");
+        // Adjacent same-pair commits COMPRESS into one run row.
+        s.set_exception("acme", 101, 1);
+        s.set_exception("acme", 102, 1);
+        let (_, _, _, _, exc1) = s.snapshot_for("p1");
+        assert_eq!(exc1, "acme:100-102:1");
+        assert_eq!(s.exceptions.len(), 2, "one acme run + one bravo single");
+        // An interior clear SPLITS the run.
+        assert!(s.clear_exception("acme", 101));
+        let (_, _, _, _, exc1) = s.snapshot_for("p1");
+        assert_eq!(exc1, "acme:100:1;acme:102:1");
+        // Committing a move BACK to the default owner self-retires the row
+        // (the safe alternative to CPCLEARSLOT).
         s.set_exception("acme", 100, 0);
+        let (_, _, _, _, exc1) = s.snapshot_for("p1");
+        assert_eq!(exc1, "acme:102:1");
+        // Runs survive the line-format round-trip.
         s.commit().expect("commit");
         let r = State::load_or_new(dir.join("state"));
         assert_eq!(
             r.exceptions,
-            vec![("acme".to_string(), 100, 0), ("bravo".to_string(), 200, 0)]
+            vec![
+                ("acme".to_string(), 102, 102, 1),
+                ("bravo".to_string(), 200, 200, 1)
+            ]
         );
+        // consolidate() reports the surviving row count.
         let mut s = r;
-        assert!(s.clear_exception("acme", 100));
-        assert!(!s.clear_exception("acme", 100));
+        assert_eq!(s.consolidate(), 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

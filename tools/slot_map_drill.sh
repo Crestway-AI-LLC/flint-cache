@@ -96,4 +96,25 @@ echo "== retire the row (consolidation path)"
 valkey-cli -p 7840 CPSLOTS | grep -q "acme $SLOT" && { echo "FAIL: row survived clear"; exit 1; }
 echo "  cleared; CPSLOTS empty"
 
-echo "PASS: Option B — slot ownership committed at cutover is durable CP truth; a cold proxy routes fragmented ownership from its first snapshot with ZERO -MOVED discovery; rows list, count, survive restart, and retire"
+echo "== consolidation: adjacent commits compress; move-backs self-retire"
+valkey-cli -p 7840 CPSETSLOT acme 1000 1 >/dev/null
+valkey-cli -p 7840 CPSETSLOT acme 1001 1 >/dev/null
+valkey-cli -p 7840 CPSETSLOT acme 1002 1 >/dev/null
+ROWS=$(valkey-cli -p 7840 CPSLOTS | grep -c "acme")
+RUN=$(valkey-cli -p 7840 CPSLOTS | grep "acme 1000")
+[ "$ROWS" = "1" ] && echo "$RUN" | grep -q "acme 1000 1002 1" || { echo "FAIL: adjacent commits did not compress ($ROWS rows: $RUN)"; exit 1; }
+SNAP=$(valkey-cli -p 7840 CPSNAPSHOT 127.0.0.1:7995 | sed -n '6p')
+echo "$SNAP" | grep -q "acme:1000-1002:1" || { echo "FAIL: run form missing from snapshot ($SNAP)"; exit 1; }
+echo "  three commits -> ONE row (acme 1000 1002 1); snapshot carries acme:1000-1002:1"
+# Interior move-back: splits the run AND self-retires (default owner).
+valkey-cli -p 7840 CPSETSLOT acme 1001 0 >/dev/null
+ROWS=$(valkey-cli -p 7840 CPSLOTS | grep -c "acme")
+[ "$ROWS" = "2" ] || { echo "FAIL: interior move-back should split to 2 rows (got $ROWS)"; exit 1; }
+[ "$(valkey-cli -p 7840 CPCONSOLIDATE)" = "2" ] || { echo "FAIL: CPCONSOLIDATE count"; exit 1; }
+# Full move-back retires everything without CPCLEARSLOT.
+valkey-cli -p 7840 CPSETSLOT acme 1000 0 >/dev/null
+valkey-cli -p 7840 CPSETSLOT acme 1002 0 >/dev/null
+[ "$(valkey-cli -p 7840 CPSLOTS | grep -c acme)" = "0" ] || { echo "FAIL: move-backs did not self-retire"; exit 1; }
+echo "  interior split -> 2 rows; CPCONSOLIDATE=2; move-backs self-retired to 0 rows"
+
+echo "PASS: Option B — slot ownership committed at cutover is durable CP truth; a cold proxy routes fragmented ownership from its first snapshot with ZERO -MOVED discovery; rows list, count, survive restart, retire — and adjacent commits consolidate into runs while move-backs self-retire"

@@ -57,6 +57,7 @@ echo "== register fleet + a tenant (follows LEADER redirect from any node)"
 cpw 7502 CPADDPROXY 127.0.0.1:9001 >/dev/null
 cpw 7502 CPADDPROXY 127.0.0.1:9002 >/dev/null
 cpw 7503 CPADDPAIR 127.0.0.1:6730 >/dev/null
+cpw 7503 CPADDPAIR 127.0.0.1:6731 >/dev/null
 R=$(cpw 7501 CPADDTENANT acme tok-acme acme 1)
 echo "  $R"
 echo "$R" | grep -q "subset" || { echo "FAIL: tenant add: $R"; exit 1; }
@@ -120,13 +121,13 @@ while time.time() - t0 < 3 and read_some():
 buf = b""
 # Trigger the exception-only mutation on a second connection.
 c = socket.create_connection(("127.0.0.1", port), timeout=5)
-c.sendall(resp(["CPSETSLOT", "acme", "77", "0"]))
+c.sendall(resp(["CPSETSLOT", "acme", "77", "1"]))
 c.recv(64); c.close()
 # The push carrying acme:77:0 must arrive.
 deadline = time.time() + 8
 ok = False
 while time.time() < deadline:
-    if b"acme:77:0" in buf:
+    if b"acme:77:1" in buf:
         ok = True; break
     if not read_some():
         break

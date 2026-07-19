@@ -210,3 +210,45 @@ mod interval_tests {
         }
     }
 }
+
+/// The DEFAULT owner of `slot` given per-pair contiguous ranges — the one
+/// definition shared by the proxy's routing fallback and the control
+/// plane's exception-redundancy check (an exception row that agrees with
+/// this is not an exception and retires itself). Semantics: a range-owned
+/// slot belongs to that pair; otherwise the count-derived split applies —
+/// across the RANGED prefix when any ranges exist (an unranged expansion
+/// pair never absorbs slots by mere existence), across all pairs when none
+/// do. `None` when there are no pairs.
+pub fn default_pair(slot: u16, ranges: &[Option<(u16, u16)>], pair_count: usize) -> Option<usize> {
+    if pair_count == 0 {
+        return None;
+    }
+    if let Some(i) = ranges
+        .iter()
+        .position(|r| matches!(r, Some((a, b)) if (*a..=*b).contains(&slot)))
+    {
+        return Some(i);
+    }
+    let ranged = ranges.iter().filter(|r| r.is_some()).count();
+    let n = if ranged > 0 { ranged } else { pair_count };
+    Some((slot as usize * n) / 16384)
+}
+
+#[cfg(test)]
+mod default_pair_tests {
+    use super::*;
+
+    #[test]
+    fn range_owned_wins_then_count_derived_over_ranged_prefix() {
+        let ranges = vec![Some((0u16, 99u16)), Some((100, 199)), None];
+        assert_eq!(default_pair(50, &ranges, 3), Some(0));
+        assert_eq!(default_pair(150, &ranges, 3), Some(1));
+        // Uncovered slot: count-derived across the 2 RANGED pairs only —
+        // the unranged expansion pair (idx 2) absorbs nothing.
+        assert_eq!(default_pair(16000, &ranges, 3), Some(1));
+        // No ranges at all: split across every pair.
+        assert_eq!(default_pair(0, &[None, None], 2), Some(0));
+        assert_eq!(default_pair(16383, &[None, None], 2), Some(1));
+        assert_eq!(default_pair(0, &[], 0), None);
+    }
+}

@@ -404,26 +404,10 @@ impl Topology {
             }
         }
         let routing = view.routing.read().ok()?;
-        if routing.pairs.is_empty() {
-            return None;
-        }
-        // Range-owned slot -> that pair. Otherwise (no ranges pushed, or an
-        // uncovered slot) fall back to the count-derived split — but only
-        // across the RANGED prefix when ranges exist, so an unranged
-        // expansion pair never absorbs slots by mere existence.
-        let ranged = routing.ranges.iter().filter(|r| r.is_some()).count();
-        let pair = routing
-            .ranges
-            .iter()
-            .position(|r| matches!(r, Some((a, b)) if (*a..=*b).contains(&slot)))
-            .unwrap_or_else(|| {
-                let n = if ranged > 0 {
-                    ranged
-                } else {
-                    routing.pairs.len()
-                };
-                (slot as usize * n) / 16384
-            });
+        // The default owner — ONE definition shared with the CP's
+        // exception-redundancy check (flint-slot::default_pair), so routing
+        // and retirement can never drift.
+        let pair = flint_slot::default_pair(slot, &routing.ranges, routing.pairs.len())?;
         routing.masters.get(pair)?.clone()
     }
 
@@ -609,18 +593,31 @@ impl Topology {
         // Option B: install the pushed ownership truth, then retire any
         // -MOVED bridge entries it supersedes — the CP is authoritative
         // from this instant.
-        let new_exc: HashMap<(Vec<u8>, u16), usize> = exc_spec
-            .split(';')
-            .filter(|e| !e.is_empty())
-            .filter_map(|e| {
-                // ns may contain ':': parse from the right.
-                let mut it = e.rsplitn(3, ':');
-                let pair: usize = it.next()?.parse().ok()?;
-                let slot: u16 = it.next()?.parse().ok()?;
-                let ns = it.next()?;
-                Some(((ns.as_bytes().to_vec(), slot), pair))
-            })
-            .collect();
+        let mut new_exc: HashMap<(Vec<u8>, u16), usize> = HashMap::new();
+        for e in exc_spec.split(';').filter(|e| !e.is_empty()) {
+            // ns may contain ':': parse from the right. The middle field is
+            // a single slot or a consolidated run "lo-hi".
+            let mut it = e.rsplitn(3, ':');
+            let (Some(pair), Some(mid), Some(ns)) = (it.next(), it.next(), it.next()) else {
+                continue;
+            };
+            let Ok(pair) = pair.parse::<usize>() else {
+                continue;
+            };
+            let (lo, hi) = match mid.split_once('-') {
+                Some((a, b)) => match (a.parse::<u16>(), b.parse::<u16>()) {
+                    (Ok(a), Ok(b)) if a <= b => (a, b),
+                    _ => continue,
+                },
+                None => match mid.parse::<u16>() {
+                    Ok(s) => (s, s),
+                    Err(_) => continue,
+                },
+            };
+            for slot in lo..=hi {
+                new_exc.insert((ns.as_bytes().to_vec(), slot), pair);
+            }
+        }
         if let Ok(mut exc) = view.exceptions.write() {
             *exc = new_exc.clone();
         }

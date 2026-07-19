@@ -1,5 +1,11 @@
 # Flint docs
 
+- `command-support.md` — the supported command matrix, semantics notes,
+  and what is excluded by design.
+- `release-checklist.md` — the pre-release ritual: gates, conformance,
+  drills, chaos.
+- `runbooks/ca-rotation.md` — the one certificate operation that is a
+  supervised runbook rather than automation.
 - `architecture.md` — the three planes, and a normal write/read traced
   end to end through the code.
 - `adr/` — architecture decision records for the open stack (numbered

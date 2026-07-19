@@ -287,7 +287,7 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
             shared.changed.notify_all();
             ok()
         }
-        // The queryable ownership truth: "ns slot pair" per row.
+        // The queryable ownership truth: "ns lo hi pair" per RUN.
         b"CPSLOTS" => {
             let Ok(st) = shared.state.lock() else {
                 return err("state lock");
@@ -295,11 +295,26 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
             Value::Array(Some(
                 st.exceptions
                     .iter()
-                    .map(|(ns, slot, pair)| {
-                        Value::Bulk(Some(format!("{ns} {slot} {pair}").into_bytes()))
+                    .map(|(ns, lo, hi, pair)| {
+                        Value::Bulk(Some(format!("{ns} {lo} {hi} {pair}").into_bytes()))
                     })
                     .collect(),
             ))
+        }
+        // The consolidation sweep, cron-able: merge adjacent runs and drop
+        // rows redundant against the default ranges. Replies with the row
+        // count that remains.
+        b"CPCONSOLIDATE" => {
+            let Ok(mut st) = shared.state.lock() else {
+                return err("state lock");
+            };
+            let rows = st.consolidate();
+            match st.commit() {
+                Ok(_) => {}
+                Err(e) => return err(&format!("persist: {e}")),
+            }
+            shared.changed.notify_all();
+            Value::Integer(rows as i64)
         }
         // Federation flag (ADR-0007, plumbing): marks the tenant as served
         // by a dedicated multi-cluster proxy group. Rides the snapshot as

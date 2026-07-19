@@ -60,11 +60,15 @@ pub enum Mutation {
         slot: u16,
         pair: u16,
     },
-    /// Retire an exception row (consolidation, or a move back).
+    /// Retire an exception row (a move back; interior hits split).
     ClearSlotOwner {
         ns: String,
         slot: u16,
     },
+    /// The consolidation sweep: merge adjacent runs, drop rows redundant
+    /// against the default ranges. Deterministic (pure function of state),
+    /// so it is safe as a replicated mutation.
+    ConsolidateSlots,
     /// Set a tenant's quotas (M5): fleet ops/s and storage bytes; 0 =
     /// unlimited. Lowering max_bytes does NOT flip over_quota by itself —
     /// the metering loop owns that verdict.
@@ -90,13 +94,34 @@ pub enum Mutation {
 
 pub use crate::tenant::Tenant;
 
+/// Accept both the run form (4-tuple) and the legacy single form
+/// (3-tuple, widened to a run) when loading Raft snapshots.
+fn runs_compat<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Vec<crate::tenant::SlotRun>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Row {
+        Run((String, u16, u16, u16)),
+        Single((String, u16, u16)),
+    }
+    let rows: Vec<Row> = Vec::deserialize(d)?;
+    Ok(rows
+        .into_iter()
+        .map(|r| match r {
+            Row::Run(t) => t,
+            Row::Single((ns, slot, pair)) => (ns, slot, slot, pair),
+        })
+        .collect())
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RegistryState {
-    /// Slot-ownership exceptions (Option B): (ns, slot, pair_idx) rows
-    /// where ownership diverges from the pair's default range. Serde
-    /// default: pre-Option-B Raft snapshots load with none.
-    #[serde(default)]
-    pub exceptions: Vec<(String, u16, u16)>,
+    /// Slot-ownership exception RUNS (Option B + consolidation):
+    /// (ns, lo, hi, pair_idx). Serde: pre-Option-B snapshots load with
+    /// none; pre-consolidation 3-tuple singles load as width-1 runs.
+    #[serde(default, deserialize_with = "runs_compat")]
+    pub exceptions: Vec<crate::tenant::SlotRun>,
     pub version: u64,
     pub proxies: Vec<String>,
     pub pairs: Vec<Vec<String>>,
@@ -222,14 +247,22 @@ impl RegistryState {
                 }
             }
             Mutation::SetSlotOwner { ns, slot, pair } => {
-                self.exceptions
-                    .retain(|(n, s, _)| !(*n == ns && *s == slot));
-                self.exceptions.push((ns, slot, pair));
-                self.exceptions.sort();
+                let n = self.pairs.len();
+                crate::tenant::set_slot_owner(
+                    &mut self.exceptions,
+                    &ns,
+                    slot,
+                    pair,
+                    &self.ranges,
+                    n,
+                );
             }
             Mutation::ClearSlotOwner { ns, slot } => {
-                self.exceptions
-                    .retain(|(n, s, _)| !(*n == ns && *s == slot));
+                crate::tenant::clear_slot_owner(&mut self.exceptions, &ns, slot);
+            }
+            Mutation::ConsolidateSlots => {
+                let n = self.pairs.len();
+                crate::tenant::normalize(&mut self.exceptions, &self.ranges, n);
             }
             Mutation::SetQuota {
                 name,

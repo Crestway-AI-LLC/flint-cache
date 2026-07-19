@@ -655,12 +655,19 @@ async fn handle_admin(ha: &Ha, args: &[Vec<u8>]) -> Value {
             Value::Array(Some(
                 reg.exceptions
                     .iter()
-                    .map(|(ns, slot, pair)| {
-                        Value::Bulk(Some(format!("{ns} {slot} {pair}").into_bytes()))
+                    .map(|(ns, lo, hi, pair)| {
+                        Value::Bulk(Some(format!("{ns} {lo} {hi} {pair}").into_bytes()))
                     })
                     .collect(),
             ))
         }
+        b"CPCONSOLIDATE" => match ha.propose(Mutation::ConsolidateSlots).await {
+            Ok(_) => {
+                let reg = ha.store.registry().await;
+                Value::Integer(reg.exceptions.len() as i64)
+            }
+            Err(l) => redirect(l),
+        },
         b"CPTENANTFEDERATE" => {
             let (Some(name), Some(mode)) = (text(1), text(2)) else {
                 return Value::Error("ERR CPTENANTFEDERATE <name> <on|off>".into());
