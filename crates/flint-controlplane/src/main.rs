@@ -226,6 +226,73 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
             shared.changed.notify_all();
             ok()
         }
+        // Option B: record slot-ownership truth at cutover. Owner may be a
+        // pair INDEX or any member address (resolved here) — stored as the
+        // index so routing follows that pair's failovers automatically.
+        b"CPSETSLOT" => {
+            let (Some(ns), Some(slot), Some(owner)) = (
+                text(1),
+                text(2).and_then(|v| v.parse::<u16>().ok()),
+                text(3),
+            ) else {
+                return err("CPSETSLOT <ns> <slot> <pair-idx|member-addr>");
+            };
+            // flint_slot::SLOT_COUNT without taking the dep for one constant.
+            if slot >= 16384 {
+                return err("slot out of range");
+            }
+            let Ok(mut st) = shared.state.lock() else {
+                return err("state lock");
+            };
+            let pair: Option<u16> = owner.parse::<u16>().ok().or_else(|| {
+                st.pairs
+                    .iter()
+                    .position(|p| p.contains(&owner))
+                    .map(|i| i as u16)
+            });
+            let Some(pair) = pair.filter(|p| (*p as usize) < st.pairs.len()) else {
+                return err("owner is neither a pair index nor a member address");
+            };
+            st.set_exception(&ns, slot, pair);
+            match st.commit() {
+                Ok(_) => {}
+                Err(e) => return err(&format!("persist: {e}")),
+            }
+            shared.changed.notify_all();
+            ok()
+        }
+        b"CPCLEARSLOT" => {
+            let (Some(ns), Some(slot)) = (text(1), text(2).and_then(|v| v.parse::<u16>().ok()))
+            else {
+                return err("CPCLEARSLOT <ns> <slot>");
+            };
+            let Ok(mut st) = shared.state.lock() else {
+                return err("state lock");
+            };
+            if !st.clear_exception(&ns, slot) {
+                return err("no such exception");
+            }
+            match st.commit() {
+                Ok(_) => {}
+                Err(e) => return err(&format!("persist: {e}")),
+            }
+            shared.changed.notify_all();
+            ok()
+        }
+        // The queryable ownership truth: "ns slot pair" per row.
+        b"CPSLOTS" => {
+            let Ok(st) = shared.state.lock() else {
+                return err("state lock");
+            };
+            Value::Array(Some(
+                st.exceptions
+                    .iter()
+                    .map(|(ns, slot, pair)| {
+                        Value::Bulk(Some(format!("{ns} {slot} {pair}").into_bytes()))
+                    })
+                    .collect(),
+            ))
+        }
         // Federation flag (ADR-0007, plumbing): marks the tenant as served
         // by a dedicated multi-cluster proxy group. Rides the snapshot as
         // 'f'; no routing consequence until the fleet-map work lands.
@@ -656,11 +723,12 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
                 .map_or_else(|| "none".into(), |d: i64| d.to_string());
             Value::Bulk(Some(
                 format!(
-                    "version:{}\r\nproxies:{}\r\npairs:{}\r\ntenants:{}\r\ncert_days_remaining:{cdr}\r\n",
+                    "version:{}\r\nproxies:{}\r\npairs:{}\r\ntenants:{}\r\nslot_exceptions:{}\r\ncert_days_remaining:{cdr}\r\n",
                     st.version,
                     st.proxies.len(),
                     st.pairs.len(),
-                    st.tenants.len()
+                    st.tenants.len(),
+                    st.exceptions.len()
                 )
                 .into_bytes(),
             ))
@@ -672,14 +740,14 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
             let Ok(st) = shared.state.lock() else {
                 return err("state lock");
             };
-            let (v, pairs, tenants, admin) = st.snapshot_for(&proxy);
-            snapshot_frame(v, &pairs, &tenants, &admin)
+            let (v, pairs, tenants, admin, exc) = st.snapshot_for(&proxy);
+            snapshot_frame(v, &pairs, &tenants, &admin, &exc)
         }
         _ => err("unknown control-plane command"),
     }
 }
 
-fn snapshot_frame(version: u64, pairs: &str, tenants: &str, admin: &str) -> Value {
+fn snapshot_frame(version: u64, pairs: &str, tenants: &str, admin: &str, exc: &str) -> Value {
     Value::Array(Some(vec![
         Value::Bulk(Some(b"SNAPSHOT".to_vec())),
         Value::Integer(version as i64),
@@ -688,6 +756,9 @@ fn snapshot_frame(version: u64, pairs: &str, tenants: &str, admin: &str) -> Valu
         // ADR-0006 D4: "curdigest,prevdigest" — a 5th element; pre-D4
         // proxies index elements 2/3 and ignore it.
         Value::Bulk(Some(admin.as_bytes().to_vec())),
+        // Option B: slot-ownership exceptions ("ns:slot:pair;..."), the
+        // 6th element; older proxies ignore it, older CPs omit it.
+        Value::Bulk(Some(exc.as_bytes().to_vec())),
     ]))
 }
 
@@ -709,10 +780,10 @@ fn watch(
     // sharding most mutations touch a small subset of proxies, so most
     // pushes are no-ops. State is tiny, so suppress-identical beats
     // computing diffs.
-    let mut last_view: Option<(String, String, String)> = None;
+    let mut last_view: Option<(String, String, String, String)> = None;
     loop {
         // Wait until there is something newer than the proxy has ACKed.
-        let (v, pairs, tenants, admin) = {
+        let (v, pairs, tenants, admin, exc) = {
             let Ok(mut st) = shared.state.lock() else {
                 return Ok(());
             };
@@ -726,15 +797,16 @@ fn watch(
             }
             st.snapshot_for(&proxy)
         };
-        if last_view.as_ref() == Some(&(pairs.clone(), tenants.clone(), admin.clone())) {
+        if last_view.as_ref() == Some(&(pairs.clone(), tenants.clone(), admin.clone(), exc.clone()))
+        {
             eprintln!("watch {proxy}: suppressed push at version {v} (view unchanged)");
             acked = v;
             continue;
         }
         let mut out = Vec::new();
-        encode(&snapshot_frame(v, &pairs, &tenants, &admin), &mut out);
+        encode(&snapshot_frame(v, &pairs, &tenants, &admin, &exc), &mut out);
         stream.write_all(&out)?;
-        last_view = Some((pairs, tenants, admin));
+        last_view = Some((pairs, tenants, admin, exc));
         // Read the ACK (Array ["ACK", <version>]).
         loop {
             match decode(&buf) {

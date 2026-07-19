@@ -432,6 +432,9 @@ fn start_controller(inv: &Inventory) {
         inv.cp[0].clone(),
         "--snapshot-root".into(),
         format!("{d}/snaps"),
+        // Option B: cutovers commit ownership truth to the CP.
+        "--commit-cp".into(),
+        inv.cp[0].clone(),
     ];
     args.extend(internal_args(inv));
     spawn(inv, "controller", "flint-controller", &args);

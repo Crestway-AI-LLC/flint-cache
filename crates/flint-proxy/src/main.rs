@@ -288,9 +288,16 @@ struct ClusterView {
     routing: RwLock<Routing>,
     /// (namespace, slot) -> owner address, learned from -MOVED redirects.
     /// Keyed per namespace because migrations move one tenant's slot rows:
-    /// tenant A's redirect must not reroute tenant B. Overrides the range
-    /// default; lost entries are relearned from the default owner.
+    /// tenant A's redirect must not reroute tenant B. Since Option B this
+    /// is only the BRIDGE between a cutover's node flip and the CP's
+    /// exception commit — entries are pruned as the pushed truth arrives.
     moved: RwLock<HashMap<(Vec<u8>, u16), String>>,
+    /// (namespace, slot) -> pair INDEX: the CP-held ownership truth
+    /// (Option B), pushed in the snapshot's 6th element. Index, not
+    /// address, so a routed slot follows its pair's failovers. A cold
+    /// proxy routes fragmented ownership correctly from its first
+    /// snapshot — zero -MOVED redirects.
+    exceptions: RwLock<HashMap<(Vec<u8>, u16), usize>>,
 }
 
 struct Topology {
@@ -316,6 +323,10 @@ struct Topology {
     /// atomics: monotonic telemetry, not coordination.
     stat_conns_total: std::sync::atomic::AtomicU64,
     stat_shed_total: std::sync::atomic::AtomicU64,
+    /// -MOVED redirects LEARNED since start. With Option B this should sit
+    /// at ~zero in steady state (the CP push carries ownership truth); a
+    /// climbing value means proxies are discovering topology the hard way.
+    stat_moved_learned: std::sync::atomic::AtomicU64,
     stat_auth_ok_total: std::sync::atomic::AtomicU64,
     stat_auth_fail_total: std::sync::atomic::AtomicU64,
     stat_commands_total: std::sync::atomic::AtomicU64,
@@ -368,10 +379,18 @@ impl Topology {
     /// overridden per (ns, slot) by the moved cache.
     fn route(&self, ns: &[u8], slot: u16) -> Option<String> {
         let view = self.cluster_for(slot);
+        // Precedence: the -MOVED bridge (newest, seconds-lived) -> the
+        // CP-pushed exception truth -> the pair's default range.
         if let Ok(moved) = view.moved.read()
             && let Some(addr) = moved.get(&(ns.to_vec(), slot))
         {
             return Some(addr.clone());
+        }
+        if let Ok(exc) = view.exceptions.read()
+            && let Some(&pair) = exc.get(&(ns.to_vec(), slot))
+        {
+            let routing = view.routing.read().ok()?;
+            return routing.masters.get(pair)?.clone();
         }
         let routing = view.routing.read().ok()?;
         if routing.pairs.is_empty() {
@@ -398,6 +417,8 @@ impl Topology {
     }
 
     fn learn_moved(&self, ns: &[u8], slot: u16, addr: &str) {
+        self.stat_moved_learned
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if let Ok(mut moved) = self.cluster_for(slot).moved.write() {
             moved.insert((ns.to_vec(), slot), addr.to_string());
         }
@@ -517,7 +538,13 @@ impl Topology {
     /// Apply a control-plane snapshot: replace the tenant table, and — only
     /// if the pair list actually changed — rebuild the routing table
     /// (discovering masters), preserving failover-chased masters otherwise.
-    fn apply_snapshot(&self, pairs_spec: &str, tenants_spec: &str, admin_spec: &str) {
+    fn apply_snapshot(
+        &self,
+        pairs_spec: &str,
+        tenants_spec: &str,
+        admin_spec: &str,
+        exc_spec: &str,
+    ) {
         // "curdigest,prevdigest" (either "-"): the operator-surface gate,
         // pushed so admin-token rotation needs no proxy restart. An EMPTY
         // spec (pre-D4 CP) leaves any static --admin-token digest in place.
@@ -567,6 +594,27 @@ impl Topology {
                 routing.masters = masters;
                 routing.ranges = new_ranges;
             }
+        }
+        // Option B: install the pushed ownership truth, then retire any
+        // -MOVED bridge entries it supersedes — the CP is authoritative
+        // from this instant.
+        let new_exc: HashMap<(Vec<u8>, u16), usize> = exc_spec
+            .split(';')
+            .filter(|e| !e.is_empty())
+            .filter_map(|e| {
+                // ns may contain ':': parse from the right.
+                let mut it = e.rsplitn(3, ':');
+                let pair: usize = it.next()?.parse().ok()?;
+                let slot: u16 = it.next()?.parse().ok()?;
+                let ns = it.next()?;
+                Some(((ns.as_bytes().to_vec(), slot), pair))
+            })
+            .collect();
+        if let Ok(mut exc) = view.exceptions.write() {
+            *exc = new_exc.clone();
+        }
+        if let Ok(mut moved) = view.moved.write() {
+            moved.retain(|k, _| !new_exc.contains_key(k));
         }
         let new_tenants: HashMap<String, TenantGrant> = tenants_spec
             .split(',')
@@ -1010,9 +1058,10 @@ fn auth_step(
         let (cache_ttl, cache_max, cache_hits, cache_misses, cache_entries, cache_bytes) =
             topo.cache.stats();
         let quota_throttled = topo.stat_quota_throttled_total.load(Ordering::Relaxed);
+        let moved_learned = topo.stat_moved_learned.load(Ordering::Relaxed);
         let quota_write_shed = topo.stat_quota_write_shed_total.load(Ordering::Relaxed);
         let info = format!(
-            "active:{}\r\nconns_total:{}\r\nshed_total:{}\r\nauth_ok_total:{}\r\nauth_fail_total:{}\r\ncommands_total:{}\r\ncommands_read_total:{}\r\ncommands_write_total:{}\r\nhotkey_sample_rate:{}\r\ncache_ttl_ms:{cache_ttl}\r\ncache_max_bytes:{cache_max}\r\ncache_hits_total:{cache_hits}\r\ncache_misses_total:{cache_misses}\r\ncache_entries:{cache_entries}\r\ncache_bytes:{cache_bytes}\r\nquota_throttled_total:{quota_throttled}\r\nquota_write_shed_total:{quota_write_shed}\r\ncert_days_remaining:{cdr}\r\n",
+            "active:{}\r\nconns_total:{}\r\nshed_total:{}\r\nauth_ok_total:{}\r\nauth_fail_total:{}\r\ncommands_total:{}\r\ncommands_read_total:{}\r\ncommands_write_total:{}\r\nhotkey_sample_rate:{}\r\ncache_ttl_ms:{cache_ttl}\r\ncache_max_bytes:{cache_max}\r\ncache_hits_total:{cache_hits}\r\ncache_misses_total:{cache_misses}\r\ncache_entries:{cache_entries}\r\ncache_bytes:{cache_bytes}\r\nmoved_learned_total:{moved_learned}\r\nquota_throttled_total:{quota_throttled}\r\nquota_write_shed_total:{quota_write_shed}\r\ncert_days_remaining:{cdr}\r\n",
             topo.stat_active.load(Ordering::Relaxed),
             load(&topo.stat_conns_total),
             load(&topo.stat_shed_total),
@@ -1502,10 +1551,17 @@ fn watch_control_plane(
                         Some(Value::Bulk(Some(a))) => String::from_utf8_lossy(a).to_string(),
                         _ => String::new(),
                     };
+                    // Option B: element 5 = slot-ownership exceptions;
+                    // pre-Option-B CPs omit it (empty = none).
+                    let exc = match items.get(5) {
+                        Some(Value::Bulk(Some(e))) => String::from_utf8_lossy(e).to_string(),
+                        _ => String::new(),
+                    };
                     topo.apply_snapshot(
                         &String::from_utf8_lossy(pairs),
                         &String::from_utf8_lossy(tenants),
                         &admin,
+                        &exc,
                     );
                     *last_version = *version as u64;
                     eprintln!("control-plane snapshot v{version} applied");
@@ -1656,6 +1712,7 @@ fn main() -> std::io::Result<()> {
                 ranges: Vec::new(),
             }),
             moved: RwLock::new(HashMap::new()),
+            exceptions: RwLock::new(HashMap::new()),
         }],
         level0: RwLock::new(flint_slot::SlotIntervals::single(0)),
         quota: RwLock::new(
@@ -1671,6 +1728,7 @@ fn main() -> std::io::Result<()> {
         auth_counts: RwLock::new(HashMap::new()),
         stat_conns_total: std::sync::atomic::AtomicU64::new(0),
         stat_shed_total: std::sync::atomic::AtomicU64::new(0),
+        stat_moved_learned: std::sync::atomic::AtomicU64::new(0),
         stat_auth_ok_total: std::sync::atomic::AtomicU64::new(0),
         stat_auth_fail_total: std::sync::atomic::AtomicU64::new(0),
         stat_commands_total: std::sync::atomic::AtomicU64::new(0),

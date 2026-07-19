@@ -37,6 +37,13 @@ pub struct State {
     pub ranges: Vec<Option<(u16, u16)>>,
     /// Keyed by tenant name (BTreeMap: deterministic serialization order).
     pub tenants: BTreeMap<String, Tenant>,
+    /// Slot-ownership EXCEPTIONS (Option B): `(ns, slot, pair_idx)` rows
+    /// where ownership diverges from the pair's contiguous default range —
+    /// committed by the migration orchestrator at cutover. Sorted, unique
+    /// per (ns, slot). Pair INDEX, not address: routing then follows the
+    /// pair's failovers automatically. The CP is the durable truth;
+    /// proxy-learned -MOVED entries are only the bridge until this commits.
+    pub exceptions: Vec<(String, u16, u16)>,
     /// Fleet operator (admin) token, CURRENT (ADR-0006 D4). Stored PLAINTEXT
     /// — unlike tenant tokens it is RETRIEVED by our own components (the
     /// agent presents it to proxies over their token-auth front door), so it
@@ -179,6 +186,15 @@ impl State {
                         );
                     }
                 }
+                Some("exc") => {
+                    if let (Some(ns), Some(slot), Some(pair)) = (
+                        parts.next(),
+                        parts.next().and_then(|v| v.parse().ok()),
+                        parts.next().and_then(|v| v.parse().ok()),
+                    ) {
+                        s.exceptions.push((ns.to_string(), slot, pair));
+                    }
+                }
                 Some("admin") => {
                     s.admin_token = parts.next().filter(|v| *v != "-").map(String::from);
                     s.admin_prev = parts.next().filter(|v| *v != "-").map(String::from);
@@ -207,6 +223,9 @@ impl State {
                 None => "-".to_string(),
             };
             out.push_str(&format!("pair {} {range}\n", pair.join(",")));
+        }
+        for (ns, slot, pair) in &self.exceptions {
+            out.push_str(&format!("exc {ns} {slot} {pair}\n"));
         }
         for t in self.tenants.values() {
             let subset = if t.subset.is_empty() {
@@ -256,10 +275,16 @@ impl State {
     /// The snapshot a given proxy should see (shared renderer — the subset
     /// filter is the blast-radius/security boundary: a proxy never holds
     /// tokens it does not serve).
-    pub fn snapshot_for(&self, proxy: &str) -> (u64, String, String, String) {
+    pub fn snapshot_for(&self, proxy: &str) -> (u64, String, String, String, String) {
         let (pairs, tenants) =
             crate::tenant::snapshot_for(&self.pairs, &self.ranges, self.tenants.values(), proxy);
-        (self.version, pairs, tenants, self.admin_digests())
+        (
+            self.version,
+            pairs,
+            tenants,
+            self.admin_digests(),
+            crate::tenant::exceptions_spec(&self.exceptions),
+        )
     }
 
     /// The admin field the proxy receives: "curdigest,prevdigest" (either
@@ -272,6 +297,20 @@ impl State {
                 .unwrap_or_else(|| "-".into())
         };
         format!("{},{}", d(&self.admin_token), d(&self.admin_prev))
+    }
+
+    /// Record (ns, slot) -> pair_idx, replacing any previous owner row.
+    pub fn set_exception(&mut self, ns: &str, slot: u16, pair: u16) {
+        self.exceptions.retain(|(n, s, _)| !(n == ns && *s == slot));
+        self.exceptions.push((ns.to_string(), slot, pair));
+        self.exceptions.sort();
+    }
+
+    /// Retire the (ns, slot) row (consolidation, or a move back).
+    pub fn clear_exception(&mut self, ns: &str, slot: u16) -> bool {
+        let before = self.exceptions.len();
+        self.exceptions.retain(|(n, s, _)| !(n == ns && *s == slot));
+        self.exceptions.len() != before
     }
 }
 
@@ -382,11 +421,11 @@ mod tests {
             );
         }
         s.version = 7;
-        let (v, pairs, tenants, _admin) = s.snapshot_for("p1");
+        let (v, pairs, tenants, _admin, _exc) = s.snapshot_for("p1");
         assert_eq!(v, 7);
         assert_eq!(pairs, "a:1,b:1");
         assert_eq!(tenants, "tok-t1=t1,tok-t3=t3");
-        let (_, _, t2, _) = s.snapshot_for("p2");
+        let (_, _, t2, _, _) = s.snapshot_for("p2");
         assert_eq!(t2, "tok-t2=t2", "p2 must not see p1's tokens");
     }
 }

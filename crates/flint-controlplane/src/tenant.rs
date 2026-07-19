@@ -131,6 +131,18 @@ pub fn snapshot_for<'a>(
     (pairs_spec, tenants_spec)
 }
 
+/// Render the slot-exception table for the snapshot's 6th frame element:
+/// `ns:slot:pair` entries joined by ';' (empty when none). Exceptions are
+/// Option B's sparse layer — CP-held truth for slots whose owner diverges
+/// from the pair's contiguous default range.
+pub fn exceptions_spec(exceptions: &[(String, u16, u16)]) -> String {
+    exceptions
+        .iter()
+        .map(|(ns, slot, pair)| format!("{ns}:{slot}:{pair}"))
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

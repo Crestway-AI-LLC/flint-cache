@@ -271,6 +271,10 @@ struct Config {
     /// Executor pacing: at most this many slots ship per rebalance cycle;
     /// convergence happens over several observe→plan→move cycles.
     max_slots_per_cycle: usize,
+    /// Control plane to COMMIT slot-ownership truth to after each
+    /// successful cutover (Option B: CPSETSLOT <ns> <slot> <new-owner>).
+    /// None = no CP (static drills): proxies learn via -MOVED as before.
+    commit_cp: Option<String>,
     /// Nodes to run MIGRATION RECOVERY over (separate from failover, since
     /// these are independent masters, not a pair). On restart the controller
     /// observes their in-flight migration records and resumes or rolls back.
@@ -712,6 +716,7 @@ fn main() {
             .unwrap_or(0.0),
         rebalance_execute: std::env::args().any(|a| a == "--rebalance-execute"),
         max_slots_per_cycle: arg_or("--max-slots-per-cycle", 4),
+        commit_cp: arg("--commit-cp"),
         recover_nodes: arg("--recover-nodes")
             .map(|s| s.split(',').map(String::from).collect())
             .unwrap_or_default(),
@@ -912,6 +917,27 @@ fn execute_move(
                     "[{}] rebalance: {ns}/{slot} {}->{}: {s}",
                     cfg.id, m.from, m.to
                 );
+                // Option B: the cutover is durable on the nodes; now commit
+                // the ownership truth to the CP so every proxy (including
+                // cold-started ones) routes it from the snapshot, not from
+                // -MOVED discovery. Best-effort: on failure the -MOVED
+                // bridge still routes correctly and the next cycle retries
+                // nothing (the CP row is idempotent to re-set).
+                if let Some(cp) = &cfg.commit_cp {
+                    let r = call(
+                        cp,
+                        &[
+                            b"CPSETSLOT",
+                            ns.as_bytes(),
+                            slot.to_string().as_bytes(),
+                            dst.as_bytes(),
+                        ],
+                    );
+                    eprintln!(
+                        "[{}] rebalance: CPSETSLOT {ns}/{slot} -> {dst}: {r:?}",
+                        cfg.id
+                    );
+                }
             }
             other => {
                 // Stop the cycle; recovery reconciles any half-done state and

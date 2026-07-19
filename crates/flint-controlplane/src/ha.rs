@@ -355,13 +355,14 @@ fn args_of(frame: Value) -> Option<Vec<Vec<u8>>> {
     Some(out)
 }
 
-fn snapshot_frame(v: u64, pairs: &str, tenants: &str, admin: &str) -> Value {
+fn snapshot_frame(v: u64, pairs: &str, tenants: &str, admin: &str, exc: &str) -> Value {
     Value::Array(Some(vec![
         Value::Bulk(Some(b"SNAPSHOT".to_vec())),
         Value::Integer(v as i64),
         Value::Bulk(Some(pairs.as_bytes().to_vec())),
         Value::Bulk(Some(tenants.as_bytes().to_vec())),
         Value::Bulk(Some(admin.as_bytes().to_vec())),
+        Value::Bulk(Some(exc.as_bytes().to_vec())),
     ]))
 }
 
@@ -604,6 +605,61 @@ async fn handle_admin(ha: &Ha, args: &[Vec<u8>]) -> Value {
                 Ok(_) => Value::Simple("OK".into()),
                 Err(l) => redirect(l),
             }
+        }
+        b"CPSETSLOT" => {
+            let (Some(ns), Some(slot), Some(owner)) = (
+                text(1),
+                text(2).and_then(|v| v.parse::<u16>().ok()),
+                text(3),
+            ) else {
+                return Value::Error("ERR CPSETSLOT <ns> <slot> <pair-idx|member-addr>".into());
+            };
+            if slot >= 16384 {
+                return Value::Error("ERR slot out of range".into());
+            }
+            let pair: Option<u16> = {
+                let reg = ha.store.registry().await;
+                owner
+                    .parse::<u16>()
+                    .ok()
+                    .or_else(|| {
+                        reg.pairs
+                            .iter()
+                            .position(|p| p.contains(&owner))
+                            .map(|i| i as u16)
+                    })
+                    .filter(|p| (*p as usize) < reg.pairs.len())
+            };
+            let Some(pair) = pair else {
+                return Value::Error(
+                    "ERR owner is neither a pair index nor a member address".into(),
+                );
+            };
+            match ha.propose(Mutation::SetSlotOwner { ns, slot, pair }).await {
+                Ok(_) => Value::Simple("OK".into()),
+                Err(l) => redirect(l),
+            }
+        }
+        b"CPCLEARSLOT" => {
+            let (Some(ns), Some(slot)) = (text(1), text(2).and_then(|v| v.parse::<u16>().ok()))
+            else {
+                return Value::Error("ERR CPCLEARSLOT <ns> <slot>".into());
+            };
+            match ha.propose(Mutation::ClearSlotOwner { ns, slot }).await {
+                Ok(_) => Value::Simple("OK".into()),
+                Err(l) => redirect(l),
+            }
+        }
+        b"CPSLOTS" => {
+            let reg = ha.store.registry().await;
+            Value::Array(Some(
+                reg.exceptions
+                    .iter()
+                    .map(|(ns, slot, pair)| {
+                        Value::Bulk(Some(format!("{ns} {slot} {pair}").into_bytes()))
+                    })
+                    .collect(),
+            ))
         }
         b"CPTENANTFEDERATE" => {
             let (Some(name), Some(mode)) = (text(1), text(2)) else {
@@ -918,8 +974,8 @@ async fn handle_admin(ha: &Ha, args: &[Vec<u8>]) -> Value {
                 return Value::Error("ERR CPSNAPSHOT <proxy-addr>".into());
             };
             let reg = ha.store.registry().await;
-            let (v, pairs, tenants, admin) = reg.snapshot_for(&proxy);
-            snapshot_frame(v, &pairs, &tenants, &admin)
+            let (v, pairs, tenants, admin, exc) = reg.snapshot_for(&proxy);
+            snapshot_frame(v, &pairs, &tenants, &admin, &exc)
         }
         _ => Value::Error("ERR unknown control-plane command".into()),
     }
@@ -939,7 +995,7 @@ async fn watch_loop<S: AsyncRead + AsyncWrite + Unpin>(
     loop {
         let reg = ha.store.registry().await;
         if reg.version > acked {
-            let (v, pairs, tenants, admin) = reg.snapshot_for(&proxy);
+            let (v, pairs, tenants, admin, exc) = reg.snapshot_for(&proxy);
             if last_view.as_ref() == Some(&(pairs.clone(), tenants.clone(), admin.clone())) {
                 eprintln!("watch {proxy}: suppressed push at version {v} (view unchanged)");
                 acked = v;
@@ -947,7 +1003,7 @@ async fn watch_loop<S: AsyncRead + AsyncWrite + Unpin>(
             }
             last_view = Some((pairs.clone(), tenants.clone(), admin.clone()));
             let mut o = Vec::new();
-            encode(&snapshot_frame(v, &pairs, &tenants, &admin), &mut o);
+            encode(&snapshot_frame(v, &pairs, &tenants, &admin, &exc), &mut o);
             sock.write_all(&o).await?;
             // Read the ACK.
             loop {

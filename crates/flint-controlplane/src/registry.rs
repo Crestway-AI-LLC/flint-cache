@@ -54,6 +54,17 @@ pub enum Mutation {
         name: String,
         on: bool,
     },
+    /// Record slot-ownership truth at cutover (Option B).
+    SetSlotOwner {
+        ns: String,
+        slot: u16,
+        pair: u16,
+    },
+    /// Retire an exception row (consolidation, or a move back).
+    ClearSlotOwner {
+        ns: String,
+        slot: u16,
+    },
     /// Set a tenant's quotas (M5): fleet ops/s and storage bytes; 0 =
     /// unlimited. Lowering max_bytes does NOT flip over_quota by itself —
     /// the metering loop owns that verdict.
@@ -81,6 +92,11 @@ pub use crate::tenant::Tenant;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RegistryState {
+    /// Slot-ownership exceptions (Option B): (ns, slot, pair_idx) rows
+    /// where ownership diverges from the pair's default range. Serde
+    /// default: pre-Option-B Raft snapshots load with none.
+    #[serde(default)]
+    pub exceptions: Vec<(String, u16, u16)>,
     pub version: u64,
     pub proxies: Vec<String>,
     pub pairs: Vec<Vec<String>>,
@@ -205,6 +221,16 @@ impl RegistryState {
                     t.federated = on;
                 }
             }
+            Mutation::SetSlotOwner { ns, slot, pair } => {
+                self.exceptions
+                    .retain(|(n, s, _)| !(*n == ns && *s == slot));
+                self.exceptions.push((ns, slot, pair));
+                self.exceptions.sort();
+            }
+            Mutation::ClearSlotOwner { ns, slot } => {
+                self.exceptions
+                    .retain(|(n, s, _)| !(*n == ns && *s == slot));
+            }
             Mutation::SetQuota {
                 name,
                 ops_per_sec,
@@ -229,7 +255,7 @@ impl RegistryState {
 
     /// The snapshot a given proxy should see: shared pair topology + ONLY
     /// the tenants whose subset includes it (the sub-group boundary).
-    pub fn snapshot_for(&self, proxy: &str) -> (u64, String, String, String) {
+    pub fn snapshot_for(&self, proxy: &str) -> (u64, String, String, String, String) {
         let (pairs, tenants) =
             crate::tenant::snapshot_for(&self.pairs, &self.ranges, self.tenants.values(), proxy);
         let d = |t: &Option<String>| {
@@ -238,6 +264,12 @@ impl RegistryState {
                 .unwrap_or_else(|| "-".into())
         };
         let admin = format!("{},{}", d(&self.admin_token), d(&self.admin_prev));
-        (self.version, pairs, tenants, admin)
+        (
+            self.version,
+            pairs,
+            tenants,
+            admin,
+            crate::tenant::exceptions_spec(&self.exceptions),
+        )
     }
 }
