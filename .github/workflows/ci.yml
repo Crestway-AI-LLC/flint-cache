@@ -17,8 +17,11 @@ jobs:
       - run: cargo test --workspace
   # The rocks engine is the production configuration; without this leg the
   # entire cfg(feature = "rocks") surface (replication, full sync, the async
-  # write queue, manifests) would merge unchecked.
+  # write queue, manifests) would merge unchecked. It compiles RocksDB
+  # (~25 min cold), so it runs on PULL REQUESTS only — the merge gate holds,
+  # while direct pushes to main spend only the cheap mem-config job.
   check-rocks:
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
