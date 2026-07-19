@@ -991,17 +991,21 @@ async fn watch_loop<S: AsyncRead + AsyncWrite + Unpin>(
     let mut chunk = [0u8; 8192];
     // Delta suppression: a version bump whose filtered view is unchanged is
     // acknowledged locally, not pushed (see the single-node watch()).
-    let mut last_view: Option<(String, String, String)> = None;
+    // The tuple must cover EVERY pushed field — omitting one (as the
+    // exception spec once was) makes changes to it silently suppressible.
+    let mut last_view: Option<(String, String, String, String)> = None;
     loop {
         let reg = ha.store.registry().await;
         if reg.version > acked {
             let (v, pairs, tenants, admin, exc) = reg.snapshot_for(&proxy);
-            if last_view.as_ref() == Some(&(pairs.clone(), tenants.clone(), admin.clone())) {
+            if last_view.as_ref()
+                == Some(&(pairs.clone(), tenants.clone(), admin.clone(), exc.clone()))
+            {
                 eprintln!("watch {proxy}: suppressed push at version {v} (view unchanged)");
                 acked = v;
                 continue;
             }
-            last_view = Some((pairs.clone(), tenants.clone(), admin.clone()));
+            last_view = Some((pairs.clone(), tenants.clone(), admin.clone(), exc.clone()));
             let mut o = Vec::new();
             encode(&snapshot_frame(v, &pairs, &tenants, &admin, &exc), &mut o);
             sock.write_all(&o).await?;

@@ -269,7 +269,7 @@ impl RegistryState {
             pairs,
             tenants,
             admin,
-            crate::tenant::exceptions_spec(&self.exceptions),
+            crate::tenant::exceptions_spec_for(&self.exceptions, self.tenants.values(), proxy),
         )
     }
 }

@@ -390,7 +390,18 @@ impl Topology {
             && let Some(&pair) = exc.get(&(ns.to_vec(), slot))
         {
             let routing = view.routing.read().ok()?;
-            return routing.masters.get(pair)?.clone();
+            match routing.masters.get(pair) {
+                // Valid pair, master known: the exception routes.
+                Some(Some(addr)) => return Some(addr.clone()),
+                // Valid pair, master not yet discovered: fail THIS lookup so
+                // the caller's rediscovery loop fills it (pre-existing
+                // contract for undiscovered masters).
+                Some(None) => return None,
+                // Stale row referencing a pair that no longer exists:
+                // DEGRADE to the default-range path below rather than
+                // killing routing for this (ns, slot) outright.
+                None => {}
+            }
         }
         let routing = view.routing.read().ok()?;
         if routing.pairs.is_empty() {
@@ -613,8 +624,18 @@ impl Topology {
         if let Ok(mut exc) = view.exceptions.write() {
             *exc = new_exc.clone();
         }
-        if let Ok(mut moved) = view.moved.write() {
-            moved.retain(|k, _| !new_exc.contains_key(k));
+        // Retire only bridge entries the truth AGREES with (addr == the
+        // exception pair's current master). A DISAGREEING bridge is newer
+        // information — a re-migration in flight that the CP has not
+        // committed yet — and pruning it would cost one fresh -MOVED per
+        // push until the commit lands.
+        if let (Ok(mut moved), Ok(routing)) = (view.moved.write(), view.routing.read()) {
+            moved.retain(|k, addr| match new_exc.get(k) {
+                Some(&pair) => {
+                    routing.masters.get(pair).and_then(|m| m.as_deref()) != Some(addr.as_str())
+                }
+                None => true,
+            });
         }
         let new_tenants: HashMap<String, TenantGrant> = tenants_spec
             .split(',')
@@ -1832,4 +1853,135 @@ fn main() -> std::io::Result<()> {
         });
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod route_tests {
+    use super::*;
+
+    /// A minimal Topology: one cluster view with the given pairs/masters/
+    /// ranges, everything else inert. The routing logic under test reads
+    /// only clusters/level0.
+    fn topo(pairs: Vec<Vec<String>>, masters: Vec<Option<String>>) -> Topology {
+        Topology {
+            clusters: vec![ClusterView {
+                routing: RwLock::new(Routing {
+                    pairs,
+                    masters,
+                    ranges: Vec::new(),
+                }),
+                moved: RwLock::new(HashMap::new()),
+                exceptions: RwLock::new(HashMap::new()),
+            }],
+            level0: RwLock::new(flint_slot::SlotIntervals::single(0)),
+            tenants: RwLock::new(HashMap::new()),
+            replica_rr: AtomicUsize::new(0),
+            auth_counts: RwLock::new(HashMap::new()),
+            stat_conns_total: std::sync::atomic::AtomicU64::new(0),
+            stat_shed_total: std::sync::atomic::AtomicU64::new(0),
+            stat_moved_learned: std::sync::atomic::AtomicU64::new(0),
+            stat_auth_ok_total: std::sync::atomic::AtomicU64::new(0),
+            stat_auth_fail_total: std::sync::atomic::AtomicU64::new(0),
+            stat_commands_total: std::sync::atomic::AtomicU64::new(0),
+            stat_commands_read_total: std::sync::atomic::AtomicU64::new(0),
+            stat_commands_write_total: std::sync::atomic::AtomicU64::new(0),
+            stat_active: AtomicUsize::new(0),
+            hotkeys: HotKeySketch::new(),
+            latency: latency::LatencyHistograms::default(),
+            quota: RwLock::new(HashMap::new()),
+            buckets: std::sync::Mutex::new(HashMap::new()),
+            stat_quota_throttled_total: std::sync::atomic::AtomicU64::new(0),
+            stat_quota_write_shed_total: std::sync::atomic::AtomicU64::new(0),
+            cache: cache::ProxyCache::new(0, 0),
+            open_mode: true,
+            backend_tls: None,
+            cert_path: None,
+            admin_digests: RwLock::new(Vec::new()),
+        }
+    }
+
+    fn two_pair_topo() -> Topology {
+        topo(
+            vec![vec!["a:1".into()], vec!["b:1".into()]],
+            vec![Some("a:1".into()), Some("b:1".into())],
+        )
+    }
+
+    #[test]
+    fn exception_overrides_range_default() {
+        let t = two_pair_topo();
+        // Count-derived default: slot 100 -> pair 0. Exception moves it to 1.
+        assert_eq!(t.route(b"acme", 100), Some("a:1".into()));
+        if let Ok(mut e) = t.clusters[0].exceptions.write() {
+            e.insert((b"acme".to_vec(), 100), 1);
+        }
+        assert_eq!(t.route(b"acme", 100), Some("b:1".into()));
+        // Another tenant's identical slot is untouched (per-ns keying).
+        assert_eq!(t.route(b"bravo", 100), Some("a:1".into()));
+    }
+
+    #[test]
+    fn moved_bridge_outranks_exception() {
+        let t = two_pair_topo();
+        if let Ok(mut e) = t.clusters[0].exceptions.write() {
+            e.insert((b"acme".to_vec(), 100), 1);
+        }
+        t.learn_moved(b"acme", 100, "c:1");
+        assert_eq!(t.route(b"acme", 100), Some("c:1".into()));
+        assert_eq!(
+            t.stat_moved_learned
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[test]
+    fn stale_exception_degrades_to_range_default() {
+        // R2: a row referencing a nonexistent pair must NOT kill routing.
+        let t = two_pair_topo();
+        if let Ok(mut e) = t.clusters[0].exceptions.write() {
+            e.insert((b"acme".to_vec(), 100), 7); // no pair 7
+        }
+        assert_eq!(t.route(b"acme", 100), Some("a:1".into()));
+        // A valid pair with an undiscovered master keeps the fail-then-
+        // rediscover contract (route None).
+        if let Ok(mut r) = t.clusters[0].routing.write() {
+            r.masters[1] = None;
+        }
+        if let Ok(mut e) = t.clusters[0].exceptions.write() {
+            e.insert((b"acme".to_vec(), 100), 1);
+        }
+        assert_eq!(t.route(b"acme", 100), None);
+    }
+
+    #[test]
+    fn snapshot_parses_exceptions_and_prunes_agreeing_bridges_only() {
+        let t = two_pair_topo();
+        // Two bridges: one AGREES with the incoming truth (-> b:1, pair 1),
+        // one DISAGREES (newer re-migration to c:1).
+        t.learn_moved(b"acme", 100, "b:1");
+        t.learn_moved(b"acme", 200, "c:1");
+        // Pairs spec must match the current table INCLUDING ranges so
+        // apply_snapshot does not rebuild (a rebuild would re-discover
+        // masters over dead test addresses); ns contains ':' to prove
+        // right-anchored parsing.
+        if let Ok(mut r) = t.clusters[0].routing.write() {
+            r.ranges = vec![None, None];
+        }
+        t.apply_snapshot("a:1;b:1", "", "", "acme:100:1;acme:200:1;odd:ns:300:0");
+        let exc = t.clusters[0].exceptions.read().expect("lock");
+        assert_eq!(exc.get(&(b"acme".to_vec(), 100)), Some(&1));
+        assert_eq!(exc.get(&(b"odd:ns".to_vec(), 300)), Some(&0));
+        drop(exc);
+        let moved = t.clusters[0].moved.read().expect("lock");
+        assert!(
+            !moved.contains_key(&(b"acme".to_vec(), 100)),
+            "agreeing bridge should be pruned"
+        );
+        assert_eq!(
+            moved.get(&(b"acme".to_vec(), 200)).map(String::as_str),
+            Some("c:1"),
+            "disagreeing (newer) bridge must survive the push"
+        );
+    }
 }

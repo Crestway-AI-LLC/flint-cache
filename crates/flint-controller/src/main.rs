@@ -923,6 +923,11 @@ fn execute_move(
                 // -MOVED discovery. Best-effort: on failure the -MOVED
                 // bridge still routes correctly and the next cycle retries
                 // nothing (the CP row is idempotent to re-set).
+                // Resolution note: the CP matches `dst` against its
+                // REGISTERED pair members, so pairs must be registered by
+                // the nodes' advertise addresses (flintctl does). A form
+                // mismatch (hostname vs IP) fails the commit — logged
+                // below; the -MOVED bridge still routes until fixed.
                 if let Some(cp) = &cfg.commit_cp {
                     let r = call(
                         cp,

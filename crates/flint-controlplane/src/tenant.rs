@@ -135,9 +135,24 @@ pub fn snapshot_for<'a>(
 /// `ns:slot:pair` entries joined by ';' (empty when none). Exceptions are
 /// Option B's sparse layer — CP-held truth for slots whose owner diverges
 /// from the pair's contiguous default range.
-pub fn exceptions_spec(exceptions: &[(String, u16, u16)]) -> String {
+///
+/// FILTERED like the tenant table: a proxy receives only rows for
+/// namespaces of tenants whose subset includes it — the same blast-radius
+/// boundary ("a proxy never holds facts about tenants it does not
+/// serve"), and it keeps each proxy's map sized by ITS tenants'
+/// fragmentation, not the fleet's.
+pub fn exceptions_spec_for<'a>(
+    exceptions: &[(String, u16, u16)],
+    tenants: impl Iterator<Item = &'a Tenant>,
+    proxy: &str,
+) -> String {
+    let served: std::collections::HashSet<&str> = tenants
+        .filter(|t| t.subset.iter().any(|s| s == proxy))
+        .map(|t| t.ns.as_str())
+        .collect();
     exceptions
         .iter()
+        .filter(|(ns, _, _)| served.contains(ns.as_str()))
         .map(|(ns, slot, pair)| format!("{ns}:{slot}:{pair}"))
         .collect::<Vec<_>>()
         .join(";")

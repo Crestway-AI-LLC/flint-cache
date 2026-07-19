@@ -79,6 +79,65 @@ done
 echo "  all nodes at version $V1"
 VER_BEFORE=$V1
 
+echo "== R1 regression: an EXCEPTION-ONLY change must reach a CPWATCH subscriber"
+# Find the proxy in acme's subset (its CPSNAPSHOT carries the tenant).
+SERVED=""
+for P in 127.0.0.1:9001 127.0.0.1:9002; do
+  T=$(cpw 750$LEADER CPSNAPSHOT "$P" | sed -n '4p')
+  [ -n "$T" ] && SERVED=$P
+done
+[ -n "$SERVED" ] || { echo "FAIL: no proxy serves acme"; exit 1; }
+WATCH=$(LP=750$LEADER SERVED=$SERVED python3 - <<'PY'
+import os, socket, time
+def resp(a): return f"*{len(a)}\r\n".encode()+b"".join(f"${len(x)}\r\n{x}\r\n".encode() for x in a)
+port = int(os.environ["LP"]); served = os.environ["SERVED"]
+# Subscribe first (ACKed up to the current tip via version 0 start: the
+# first push replays the current view; ACK it, then the ONLY later change
+# is the CPSETSLOT below).
+w = socket.create_connection(("127.0.0.1", port), timeout=12); w.settimeout(12)
+w.sendall(resp(["CPWATCH", served, "0"]))
+buf = b""
+def read_some():
+    global buf
+    try:
+        c = w.recv(8192)
+    except socket.timeout:
+        return False
+    if not c: return False
+    buf += c
+    return True
+# Drain the initial replay push and ACK its ACTUAL version (an inflated
+# ACK would tell the watch we are ahead of every future change).
+import re
+t0 = time.time()
+ver = None
+while time.time() - t0 < 3 and read_some():
+    m = re.search(rb":(\d+)\r\n", buf)
+    if m and b"SNAPSHOT" in buf:
+        ver = m.group(1).decode()
+        w.sendall(resp(["ACK", ver]))
+        break
+buf = b""
+# Trigger the exception-only mutation on a second connection.
+c = socket.create_connection(("127.0.0.1", port), timeout=5)
+c.sendall(resp(["CPSETSLOT", "acme", "77", "0"]))
+c.recv(64); c.close()
+# The push carrying acme:77:0 must arrive.
+deadline = time.time() + 8
+ok = False
+while time.time() < deadline:
+    if b"acme:77:0" in buf:
+        ok = True; break
+    if not read_some():
+        break
+print("PUSHED" if ok else "NOPUSH")
+PY
+)
+echo "  watch result: $WATCH"
+echo "$WATCH" | grep -q "PUSHED" || { echo "FAIL: exception-only change was suppressed (R1)"; exit 1; }
+echo "  CPSETSLOT alone triggered a push carrying the exception row"
+
+
 echo "== KILL the leader (node $LEADER)"
 pkill -9 -f "flint-controlplane --raft --node-id $LEADER "
 NEW=""

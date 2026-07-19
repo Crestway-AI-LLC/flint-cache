@@ -261,6 +261,14 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
             shared.changed.notify_all();
             ok()
         }
+        // SHARP EDGE (documented, not guarded — the CP cannot see data
+        // placement): clearing a row makes routing fall back to the range
+        // default. Safe ONLY after the slot's data moved back, or as part
+        // of a consolidation that rewrites the pair range to cover the
+        // exception. Clearing while data sits on the excepted pair SPLITS
+        // ownership: reads answer nil from the wrong pair, writes land
+        // there. Operator-invoked only; automation must use the future
+        // consolidation op.
         b"CPCLEARSLOT" => {
             let (Some(ns), Some(slot)) = (text(1), text(2).and_then(|v| v.parse::<u16>().ok()))
             else {

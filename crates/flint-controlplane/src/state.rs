@@ -283,7 +283,7 @@ impl State {
             pairs,
             tenants,
             self.admin_digests(),
-            crate::tenant::exceptions_spec(&self.exceptions),
+            crate::tenant::exceptions_spec_for(&self.exceptions, self.tenants.values(), proxy),
         )
     }
 
@@ -320,6 +320,54 @@ mod tests {
 
     fn fleet(n: usize) -> Vec<String> {
         (0..n).map(|i| format!("10.0.0.{i}:7000")).collect()
+    }
+
+    #[test]
+    fn exceptions_are_subset_filtered_per_proxy() {
+        let dir = std::env::temp_dir().join(format!("flint-exc-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let mut s = State::load_or_new(dir.join("state"));
+        s.proxies = vec!["p1".into(), "p2".into()];
+        s.pairs = vec![vec!["a:1".into()], vec!["b:1".into()]];
+        s.ranges = vec![None, None];
+        for (name, ns, subset) in [("t1", "acme", "p1"), ("t2", "bravo", "p2")] {
+            s.tenants.insert(
+                name.into(),
+                Tenant {
+                    name: name.into(),
+                    token: flint_tls::sha256_hex(name.as_bytes()),
+                    ns: ns.into(),
+                    subset: vec![subset.into()],
+                    prev_token: None,
+                    replica_reads: false,
+                    local_cache: false,
+                    federated: false,
+                    ops_per_sec: 0,
+                    max_bytes: 0,
+                    over_quota: false,
+                },
+            );
+        }
+        s.set_exception("acme", 100, 1);
+        s.set_exception("bravo", 200, 0);
+        let (_, _, _, _, exc1) = s.snapshot_for("p1");
+        let (_, _, _, _, exc2) = s.snapshot_for("p2");
+        // Each proxy sees ONLY its served tenants' rows (R4 boundary).
+        assert_eq!(exc1, "acme:100:1");
+        assert_eq!(exc2, "bravo:200:0");
+        // set replaces, clear retires — and survives a reload.
+        s.set_exception("acme", 100, 0);
+        s.commit().expect("commit");
+        let r = State::load_or_new(dir.join("state"));
+        assert_eq!(
+            r.exceptions,
+            vec![("acme".to_string(), 100, 0), ("bravo".to_string(), 200, 0)]
+        );
+        let mut s = r;
+        assert!(s.clear_exception("acme", 100));
+        assert!(!s.clear_exception("acme", 100));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
