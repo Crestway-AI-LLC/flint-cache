@@ -440,16 +440,31 @@ fn start_controller(inv: &Inventory) {
     spawn(inv, "controller", "flint-controller", &args);
 }
 
+/// First-time bring-up: mint certs, spawn, REGISTER the topology.
 fn bootstrap(inv: &Inventory) {
+    launch(inv, true);
+}
+
+/// Reboot path (idempotent boot, marketplace first-boot re-runs): spawn
+/// every process against EXISTING state — no cert minting, no registry
+/// writes (CPADDPAIR/CPADDPROXY append; re-running them would duplicate
+/// topology). The CP state file, node data dirs, and certs carry the
+/// fleet's memory.
+fn start(inv: &Inventory) {
+    launch(inv, false);
+}
+
+fn launch(inv: &Inventory, register: bool) {
     let d = &inv.statedir;
     for sub in ["logs", "pids", "snaps"] {
         std::fs::create_dir_all(format!("{d}/{sub}")).expect("statedir");
     }
     eprintln!(
-        "== bootstrap into {d} (tls {})",
+        "== {} into {d} (tls {})",
+        if register { "bootstrap" } else { "start" },
         if inv.tls { "on" } else { "off" }
     );
-    if inv.tls {
+    if register && inv.tls {
         mint_certs(inv);
     }
     let tls = tls_client(inv);
@@ -473,28 +488,30 @@ fn bootstrap(inv: &Inventory) {
         wait_pong(cp, &tls, Duration::from_secs(10)),
         "control plane up"
     );
-    for proxy in &inv.proxies {
-        call(cp, &tls, &["CPADDPROXY", proxy]).expect("register proxy");
+    if register {
+        for proxy in &inv.proxies {
+            call(cp, &tls, &["CPADDPROXY", proxy]).expect("register proxy");
+        }
+        // Initial pairs carry the even slot split as EXPLICIT level-1
+        // routing state; expansion pairs later join with "-" (no range) so
+        // capacity never re-routes unmigrated slots.
+        let n = inv.pairs.len();
+        for (i, pair) in inv.pairs.iter().enumerate() {
+            let start = i * 16384 / n;
+            let end = (i + 1) * 16384 / n - 1;
+            call(
+                cp,
+                &tls,
+                &["CPADDPAIR", &pair.join(","), &format!("{start}-{end}")],
+            )
+            .expect("register pair");
+        }
+        eprintln!(
+            "  registry: {} proxies, {} pairs",
+            inv.proxies.len(),
+            inv.pairs.len()
+        );
     }
-    // Initial pairs carry the even slot split as EXPLICIT level-1 routing
-    // state; expansion pairs later join with "-" (no range) so capacity
-    // never re-routes unmigrated slots.
-    let n = inv.pairs.len();
-    for (i, pair) in inv.pairs.iter().enumerate() {
-        let start = i * 16384 / n;
-        let end = (i + 1) * 16384 / n - 1;
-        call(
-            cp,
-            &tls,
-            &["CPADDPAIR", &pair.join(","), &format!("{start}-{end}")],
-        )
-        .expect("register pair");
-    }
-    eprintln!(
-        "  registry: {} proxies, {} pairs",
-        inv.proxies.len(),
-        inv.pairs.len()
-    );
 
     // 2. Data plane.
     for pair in &inv.pairs {
@@ -580,7 +597,10 @@ fn bootstrap(inv: &Inventory) {
     if inv.controller {
         wait_supervised(inv, inv.pairs.len(), ctl_since);
     }
-    eprintln!("== bootstrap complete");
+    eprintln!(
+        "== {} complete",
+        if register { "bootstrap" } else { "start" }
+    );
     status(inv);
 }
 
@@ -1136,6 +1156,7 @@ fn main() {
 
     match cmd {
         "bootstrap" => bootstrap(&inv),
+        "start" => start(&inv),
         "status" => status(&inv),
         "tenant" => {
             assert!(
@@ -1266,7 +1287,7 @@ fn main() {
         "stop" => stop(&inv),
         other => {
             panic!(
-                "unknown command {other:?} (bootstrap|status|tenant|tenant-reads|tenant-cache|tenant-quota|rotate-admin|rotate-certs|proxy-cache|expand|swap-node|add-replica|upgrade|stop)"
+                "unknown command {other:?} (bootstrap|start|status|tenant|tenant-reads|tenant-cache|tenant-quota|rotate-admin|rotate-certs|proxy-cache|expand|swap-node|add-replica|upgrade|stop)"
             )
         }
     }
