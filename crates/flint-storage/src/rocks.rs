@@ -81,7 +81,7 @@ impl RocksKv {
         // slot then the user key, all < the 0xff sentinel run, so the range
         // covers exactly this namespace's rows (ns_len byte keeps a longer
         // namespace sharing the prefix out of range).
-        let bounds: Vec<(Vec<u8>, Vec<u8>)> = [b'M', b'S', b'Z']
+        let bounds: Vec<(Vec<u8>, Vec<u8>)> = b"MSZ"
             .iter()
             .map(|&cf| {
                 let mut start = Vec::with_capacity(2 + ns.len());
@@ -105,7 +105,7 @@ impl RocksKv {
     /// Background compaction gets there eventually; this is the on-demand
     /// path (FLINTCOMPACT) for GC pressure and the metering drills.
     pub fn compact_ns(&self, ns: &[u8]) {
-        for cf in [b'M', b'S', b'Z'] {
+        for cf in *b"MSZ" {
             let mut start = Vec::with_capacity(2 + ns.len());
             start.push(cf);
             start.push(ns.len() as u8);
