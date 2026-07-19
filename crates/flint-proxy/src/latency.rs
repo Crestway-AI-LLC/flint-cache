@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Bucket upper bounds in MICROSECONDS, cumulative (Prometheus `le`).
 /// Spans a cache hit (~100 µs) to a stalled failover retry (~5 s budget).
-/// The exporter (flint-agent) renders these as seconds in `le` labels —
+/// The metrics exporter renders these as seconds in `le` labels —
 /// the two lists must stay in step (see agent metrics.rs LATENCY_LE).
 pub const BUCKETS_US: [u64; 12] = [
     250,       // 0.25 ms — cache hit / same-host round trip

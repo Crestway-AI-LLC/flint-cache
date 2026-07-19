@@ -555,6 +555,10 @@ fn bootstrap(inv: &Inventory) {
     if inv.controller {
         start_controller(inv);
     }
+    // Optional fleet-agent add-on: the `agent <addr>` inventory key starts
+    // a flint-agent binary if one sits in the bins dir. The agent (fleet
+    // metering/insights/automation) is not part of this repository; without
+    // the binary the key simply has nothing to start.
     if let Some(agent) = &inv.agent {
         let mut args = vec![
             "--control-plane".to_string(),
@@ -604,6 +608,10 @@ fn status(inv: &Inventory) {
         let up = proxy_up(inv, proxy);
         println!("proxy     {proxy}  {}", if up { "up" } else { "DOWN" });
     }
+    // Optional fleet-agent add-on: the `agent <addr>` inventory key starts
+    // a flint-agent binary if one sits in the bins dir. The agent (fleet
+    // metering/insights/automation) is not part of this repository; without
+    // the binary the key simply has nothing to start.
     if let Some(agent) = &inv.agent {
         println!("agent     metrics http://{agent}/metrics");
     }
