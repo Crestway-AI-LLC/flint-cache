@@ -40,6 +40,9 @@ Everything needed to run AND operate Flint yourself:
   slot hashing, the shared read/write command classifier, and the typed fleet
   event log.
 
+[docs/architecture.md](docs/architecture.md) is the system map — the three
+planes, and a normal write and read traced end to end.
+
 `tools/` holds the drill scripts — end-to-end proofs (replication parity,
 failover RTO, slot migration and cutover, quota enforcement, token and
 certificate rotation under live traffic, chaos) that run against real

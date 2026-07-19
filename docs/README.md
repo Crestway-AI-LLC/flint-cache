@@ -1,5 +1,7 @@
 # Flint docs
 
+- `architecture.md` — the three planes, and a normal write/read traced
+  end to end through the code.
 - `adr/` — architecture decision records for the open stack (numbered
   globally; gaps in the sequence are Crestway-internal records about the
   managed-service plane, referenced from code comments by number).
