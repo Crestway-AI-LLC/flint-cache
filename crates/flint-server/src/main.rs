@@ -13,6 +13,7 @@
 mod commands;
 mod migrate;
 mod repl_hub;
+mod write_lock;
 mod write_queue;
 
 use std::io::{Read, Write};
@@ -514,18 +515,33 @@ fn main() -> std::io::Result<()> {
     // engine WriteBatch (group commit) — trading ~2-3x write latency for far
     // fewer engine writes under a write-hot workload. rocks-only: the batch
     // commit needs RocksKv::apply_writes.
+    //
+    // The queue is ALWAYS constructed on a rocks node (an idle consumer
+    // costs one parked thread) so the opt-in can arrive two ways:
+    //   - `--async-writes ns1,ns2|all` — static node-level scope
+    //     (self-hosters, drills);
+    //   - the FLINTNS 'a' handshake flag — per-connection, sent by the
+    //     proxy for tenants whose CP 'a' flag is set (CPTENANTASYNC).
     #[allow(unused_variables)]
     let write_queue: Option<Arc<write_queue::WriteQueue>> = {
         #[cfg(feature = "rocks")]
         {
             match (arg("--async-writes"), rocks.clone()) {
-                (Some(spec), Some(rk)) => {
+                (spec, Some(rk)) => {
                     let cap = arg("--async-queue-cap")
                         .and_then(|v| v.parse::<usize>().ok())
                         .unwrap_or(write_queue::DEFAULT_QUEUE_CAP);
-                    eprintln!("async-writes ENABLED (opt-in write queue): {spec} (cap {cap})");
+                    let scope = match &spec {
+                        Some(s) => {
+                            eprintln!("async-writes ENABLED (opt-in write queue): {s} (cap {cap})");
+                            write_queue::AsyncScope::parse(s)
+                        }
+                        // No static scope: the queue serves only
+                        // handshake-flagged connections.
+                        None => write_queue::AsyncScope::Only(Default::default()),
+                    };
                     Some(write_queue::WriteQueue::start(
-                        write_queue::AsyncScope::parse(&spec),
+                        scope,
                         cap,
                         Arc::clone(&store),
                         rk,
@@ -537,7 +553,7 @@ fn main() -> std::io::Result<()> {
                     eprintln!("--async-writes requires --engine rocks");
                     std::process::exit(2);
                 }
-                (None, _) => None,
+                (None, None) => None,
             }
         }
         #[cfg(not(feature = "rocks"))]
@@ -680,6 +696,8 @@ fn serve(
     let mut out: Vec<u8> = Vec::with_capacity(4 * 1024);
     // Connection-scoped namespace (FLINTNS): the tenant boundary.
     let mut conn_ns: Vec<u8> = commands::DEFAULT_NS.to_vec();
+    // Connection-scoped async-write opt-in (FLINTNS 'a' flag, D4).
+    let mut conn_async = false;
     loop {
         let mut consumed = 0;
         out.clear();
@@ -722,6 +740,7 @@ fn serve(
                     limits,
                     write_queue,
                     &mut conn_ns,
+                    &mut conn_async,
                     &args,
                 );
                 encode(&reply, &mut out);
@@ -784,6 +803,7 @@ fn serve(
                         limits,
                         write_queue,
                         &mut conn_ns,
+                        &mut conn_async,
                         &args,
                     );
                     encode(&reply, &mut out);
@@ -835,6 +855,7 @@ fn execute(
     limits: commands::Limits,
     write_queue: Option<&Arc<write_queue::WriteQueue>>,
     conn_ns: &mut Vec<u8>,
+    conn_async: &mut bool,
     args: &[Vec<u8>],
 ) -> Value {
     // FLINTNS <ns>: select this connection's namespace — the tenant
@@ -847,11 +868,18 @@ fn execute(
         .is_some_and(|n| n.eq_ignore_ascii_case(b"FLINTNS"))
     {
         let Some(ns) = args.get(1) else {
-            return Value::Error("ERR FLINTNS <namespace>".into());
+            return Value::Error("ERR FLINTNS <namespace> [a]".into());
         };
         let ok_byte = |b: &u8| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.');
         if ns.is_empty() || ns.len() > 64 || !ns.iter().all(ok_byte) {
             return Value::Error("ERR invalid namespace (1..=64 chars of [A-Za-z0-9._-])".into());
+        }
+        // Optional 'a' (D4): the proxy pins this connection for a tenant
+        // whose CP flag opts batchable writes into the async write queue.
+        match args.get(2) {
+            None => *conn_async = false,
+            Some(f) if f.eq_ignore_ascii_case(b"a") => *conn_async = true,
+            Some(_) => return Value::Error("ERR FLINTNS <namespace> [a]".into()),
         }
         *conn_ns = ns.clone();
         return Value::Simple("OK".into());
@@ -1081,13 +1109,33 @@ fn execute(
     // only on the master (is_write && !ro).
     if is_write
         && let Some(q) = write_queue
-        && q.wants(conn_ns)
+        && (*conn_async || q.wants(conn_ns))
         && args
             .first()
             .is_some_and(|name| write_queue::is_batchable(name))
     {
         return q.submit(conn_ns.clone(), args.to_vec());
     }
+    // Writer-writer exclusion (lost-update fix — see write_lock.rs): a
+    // single-key inline write serializes with other writers of that key;
+    // multi-key or keyless writes exclude every writer. Readers take no
+    // lock. Acquired AFTER the queue branch (a queued submit blocks on the
+    // consumer, which itself takes the global lock — holding a stripe
+    // across that wait would deadlock).
+    let _write_guard = if is_write && !ro {
+        let name = args
+            .first()
+            .map(|n| n.to_ascii_uppercase())
+            .unwrap_or_default();
+        let multi = (name == b"MSET" && args.len() > 3)
+            || ((name == b"DEL" || name == b"UNLINK") && args.len() > 2);
+        match (multi, commands::command_key(args)) {
+            (false, Some(k)) => Some(write_lock::lock_key(conn_ns, k)),
+            _ => Some(write_lock::lock_all()),
+        }
+    } else {
+        None
+    };
     // On a replica, wrap the store so lazy-expiry deletes buried in read
     // paths become no-ops: a replica must not write to its own store (that
     // would diverge it from the master); the master's replicated DELETE and

@@ -193,6 +193,11 @@ fn consumer(
         }
         depth.fetch_sub(jobs.len(), Ordering::Relaxed);
 
+        // Exclude every inline writer for the batch's dispatch + commit
+        // (write_lock.rs): a flagged tenant's non-batchable DEL, or another
+        // tenant's inline traffic, must not interleave with the batch's
+        // read-modify-write halves.
+        let _all = crate::write_lock::lock_all();
         // Run every command against ONE BatchingKv: each computes its exact
         // reply over the accumulating state (an INCR burst on one key sees
         // its own prior increments).

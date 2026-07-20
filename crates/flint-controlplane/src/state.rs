@@ -182,6 +182,7 @@ impl State {
                                 // Legacy line-format state predates the
                                 // flag; JSON state carries it (serde).
                                 federated: false,
+                                async_writes: false,
                             },
                         );
                     }
@@ -359,6 +360,7 @@ mod tests {
                     replica_reads: false,
                     local_cache: false,
                     federated: false,
+                    async_writes: false,
                     ops_per_sec: 0,
                     max_bytes: 0,
                     over_quota: false,
@@ -452,6 +454,7 @@ mod tests {
                 replica_reads: false,
                 local_cache: false,
                 federated: false,
+                async_writes: false,
                 ops_per_sec: 0,
                 max_bytes: 0,
                 over_quota: false,
@@ -497,6 +500,7 @@ mod tests {
                     replica_reads: false,
                     local_cache: false,
                     federated: false,
+                    async_writes: false,
                     ops_per_sec: 0,
                     max_bytes: 0,
                     over_quota: false,

@@ -54,6 +54,11 @@ pub enum Mutation {
         name: String,
         on: bool,
     },
+    /// Set a tenant's async write-queue opt-in (ADR-0005 D4).
+    SetAsyncWrites {
+        name: String,
+        on: bool,
+    },
     /// Record slot-ownership truth at cutover (Option B).
     SetSlotOwner {
         ns: String,
@@ -210,6 +215,7 @@ impl RegistryState {
                         replica_reads: false,
                         local_cache: false,
                         federated: false,
+                        async_writes: false,
                         ops_per_sec: 0,
                         max_bytes: 0,
                         over_quota: false,
@@ -244,6 +250,11 @@ impl RegistryState {
             Mutation::SetFederated { name, on } => {
                 if let Some(t) = self.tenants.get_mut(&name) {
                     t.federated = on;
+                }
+            }
+            Mutation::SetAsyncWrites { name, on } => {
+                if let Some(t) = self.tenants.get_mut(&name) {
+                    t.async_writes = on;
                 }
             }
             Mutation::SetSlotOwner { ns, slot, pair } => {

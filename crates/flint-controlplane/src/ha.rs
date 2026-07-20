@@ -668,6 +668,20 @@ async fn handle_admin(ha: &Ha, args: &[Vec<u8>]) -> Value {
             }
             Err(l) => redirect(l),
         },
+        b"CPTENANTASYNC" => {
+            let (Some(name), Some(mode)) = (text(1), text(2)) else {
+                return Value::Error("ERR CPTENANTASYNC <name> <on|off>".into());
+            };
+            let on = match mode.as_str() {
+                "on" => true,
+                "off" => false,
+                _ => return Value::Error("ERR CPTENANTASYNC <name> <on|off>".into()),
+            };
+            match ha.propose(Mutation::SetAsyncWrites { name, on }).await {
+                Ok(_) => Value::Simple("OK".into()),
+                Err(l) => redirect(l),
+            }
+        }
         b"CPTENANTFEDERATE" => {
             let (Some(name), Some(mode)) = (text(1), text(2)) else {
                 return Value::Error("ERR CPTENANTFEDERATE <name> <on|off>".into());

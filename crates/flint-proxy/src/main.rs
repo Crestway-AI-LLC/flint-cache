@@ -134,6 +134,11 @@ struct TenantGrant {
     federated: bool,
     /// Over storage quota: writes shed with -QUOTA, reads served.
     over_quota: bool,
+    /// Async write-queue opt-in (ADR-0005 D4): backend connections for this
+    /// tenant are pinned with the async handshake flag, so batchable writes
+    /// coalesce through the node's write queue. Applies to client
+    /// connections authed after the flag arrives (the pin happens at dial).
+    async_writes: bool,
     /// Per-proxy ops/s share (token bucket); 0 = unlimited.
     rate: u64,
 }
@@ -656,6 +661,7 @@ impl Topology {
                         local_cache: flags.contains('c'),
                         over_quota: flags.contains('q'),
                         federated: flags.contains('f'),
+                        async_writes: flags.contains('a'),
                         rate,
                     },
                 ))
@@ -797,14 +803,22 @@ struct Backends {
     /// Client-side mutual-TLS for the backend hop (`None` = plaintext),
     /// snapshotted from the reloadable handle at each dial.
     tls: Option<Arc<flint_tls::ReloadableClientConfig>>,
+    /// Async write-queue opt-in (D4): pin backend conns with the 'a'
+    /// handshake flag so the node routes batchable writes via its queue.
+    async_writes: bool,
 }
 
 impl Backends {
-    fn new(ns: Vec<u8>, tls: Option<Arc<flint_tls::ReloadableClientConfig>>) -> Self {
+    fn new(
+        ns: Vec<u8>,
+        tls: Option<Arc<flint_tls::ReloadableClientConfig>>,
+        async_writes: bool,
+    ) -> Self {
         Self {
             conns: HashMap::new(),
             ns,
             tls,
+            async_writes,
         }
     }
 
@@ -820,15 +834,17 @@ impl Backends {
             stream.set_read_timeout(Some(BACKEND_TIMEOUT))?;
             stream.set_write_timeout(Some(BACKEND_TIMEOUT))?;
             // Pin the connection to the tenant namespace before any data
-            // command can travel on it.
+            // command can travel on it; the 'a' arg opts this connection's
+            // batchable writes into the node's async write queue (D4).
+            let mut hs_args = vec![
+                Value::Bulk(Some(b"FLINTNS".to_vec())),
+                Value::Bulk(Some(self.ns.clone())),
+            ];
+            if self.async_writes {
+                hs_args.push(Value::Bulk(Some(b"a".to_vec())));
+            }
             let mut hs = Vec::new();
-            encode(
-                &Value::Array(Some(vec![
-                    Value::Bulk(Some(b"FLINTNS".to_vec())),
-                    Value::Bulk(Some(self.ns.clone())),
-                ])),
-                &mut hs,
-            );
+            encode(&Value::Array(Some(hs_args)), &mut hs);
             let mut hs_buf = Vec::new();
             match call_raw(&mut stream, &mut hs_buf, &hs)? {
                 Value::Simple(_) => {}
@@ -1040,11 +1056,13 @@ enum AuthStep {
 /// except AUTH/QUIT gets -NOAUTH. A successful AUTH fixes the connection's
 /// namespace; re-AUTH to a different tenant is rejected (reconnect instead)
 /// so the backend-connection namespace pinning can never go stale.
+#[allow(clippy::too_many_arguments)]
 fn auth_step(
     topo: &Topology,
     authed_ns: &mut Option<Vec<u8>>,
     replica_reads: &mut bool,
     local_cache: &mut bool,
+    async_writes: &mut bool,
     is_admin: &mut bool,
     args: &[Vec<u8>],
 ) -> AuthStep {
@@ -1235,6 +1253,7 @@ fn auth_step(
         *authed_ns = Some(grant.ns);
         *replica_reads = grant.replica_reads;
         *local_cache = grant.local_cache;
+        *async_writes = grant.async_writes;
         return AuthStep::Reply(Value::Simple("OK".into()));
     }
     match authed_ns {
@@ -1265,6 +1284,9 @@ fn serve_client<S: Read + Write>(mut stream: S, topo: Arc<Topology>) -> std::io:
     let mut replica_reads = false;
     // Proxy near-cache opt-in for THIS connection's tenant (D6), set at AUTH.
     let mut local_cache = false;
+    // Async write-queue opt-in for THIS connection's tenant (D4), set at
+    // AUTH; carried onto backend pins at dial.
+    let mut async_writes = false;
     // Admin session (AUTH <admin-token>): unlocks the operator surface only.
     let mut is_admin = false;
     // Hot-key sampling tick (D5): every HOTKEY_SAMPLE_RATE-th keyed command
@@ -1322,6 +1344,7 @@ fn serve_client<S: Read + Write>(mut stream: S, topo: Arc<Topology>) -> std::io:
                         &mut authed_ns,
                         &mut replica_reads,
                         &mut local_cache,
+                        &mut async_writes,
                         &mut is_admin,
                         &args,
                     ) {
@@ -1334,6 +1357,7 @@ fn serve_client<S: Read + Write>(mut stream: S, topo: Arc<Topology>) -> std::io:
                             &raw,
                             replica_reads,
                             local_cache,
+                            async_writes,
                         ),
                     };
                     // Record into this tenant's read/write histogram — data
@@ -1401,6 +1425,7 @@ fn data_command(
     raw: &[u8],
     replica_reads: bool,
     local_cache: bool,
+    async_writes: bool,
 ) -> Value {
     // M5 quota gate FIRST: a shed command must not touch the cache, a
     // backend, or the bucket-bypassing fast paths. Only data commands are
@@ -1435,7 +1460,8 @@ fn data_command(
         && args
             .first()
             .is_some_and(|n| flint_commands::is_read_command(n));
-    let b = backends.get_or_insert_with(|| Backends::new(ns.to_vec(), topo.backend_tls.clone()));
+    let b = backends
+        .get_or_insert_with(|| Backends::new(ns.to_vec(), topo.backend_tls.clone(), async_writes));
     let reply = handle(topo, b, ns, args, raw, read_replica);
     if cacheable && let Value::Bulk(Some(v)) = &reply {
         topo.cache.put(ns, &args[1], v);

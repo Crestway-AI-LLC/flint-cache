@@ -192,6 +192,7 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
                     replica_reads: false,
                     local_cache: false,
                     federated: false,
+                    async_writes: false,
                     ops_per_sec: 0,
                     max_bytes: 0,
                     over_quota: false,
@@ -319,6 +320,32 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
         // Federation flag (ADR-0007, plumbing): marks the tenant as served
         // by a dedicated multi-cluster proxy group. Rides the snapshot as
         // 'f'; no routing consequence until the fleet-map work lands.
+        // Async write-queue opt-in (ADR-0005 D4) — the hot-key write
+        // mitigation, operator-set. Pushed to the proxy as the 'a' flag on
+        // the next snapshot; applies to client connections authed after it.
+        b"CPTENANTASYNC" => {
+            let (Some(name), Some(mode)) = (text(1), text(2)) else {
+                return err("CPTENANTASYNC <name> <on|off>");
+            };
+            let on = match mode.as_str() {
+                "on" => true,
+                "off" => false,
+                _ => return err("CPTENANTASYNC <name> <on|off>"),
+            };
+            let Ok(mut st) = shared.state.lock() else {
+                return err("state lock");
+            };
+            let Some(t) = st.tenants.get_mut(&name) else {
+                return err("no such tenant");
+            };
+            t.async_writes = on;
+            match st.commit() {
+                Ok(_) => {}
+                Err(e) => return err(&format!("persist: {e}")),
+            }
+            shared.changed.notify_all();
+            ok()
+        }
         b"CPTENANTFEDERATE" => {
             let (Some(name), Some(mode)) = (text(1), text(2)) else {
                 return err("CPTENANTFEDERATE <name> <on|off>");

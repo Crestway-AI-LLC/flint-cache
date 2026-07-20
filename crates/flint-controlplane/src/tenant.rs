@@ -51,12 +51,20 @@ pub struct Tenant {
     /// the fleet-map work.
     #[serde(default)]
     pub federated: bool,
+    /// Async write-queue opt-in (ADR-0005 D4): the proxy pins this tenant's
+    /// backend connections with the async handshake flag, so batchable
+    /// string/counter writes coalesce through the node's write queue
+    /// (ack-after-apply — added write latency, never staleness). Rides the
+    /// snapshot as the 'a' flag; operator-set (hot-key write mitigation).
+    #[serde(default)]
+    pub async_writes: bool,
 }
 
 impl Tenant {
     /// The snapshot flag suffix the proxy parses: "#<flags>[@<rate>]" —
     /// flags 'r' (replica reads), 'c' (near-cache), 'q' (over storage
-    /// quota), 'f' (federated, ADR-0007); `rate` = this tenant's PER-PROXY
+    /// quota), 'f' (federated, ADR-0007), 'a' (async write queue, ADR-0005
+    /// D4); `rate` = this tenant's PER-PROXY
     /// ops/s share (present only
     /// when a rate quota is set). THE single producer of this encoding —
     /// see the proxy's `apply_snapshot` for the single consumer.
@@ -73,6 +81,9 @@ impl Tenant {
         }
         if self.federated {
             flags.push('f');
+        }
+        if self.async_writes {
+            flags.push('a');
         }
         let rate = self.per_proxy_rate();
         match (flags.is_empty(), rate) {
