@@ -66,6 +66,17 @@ One rule ties the planes together: **data moves only through the proxy;
 topology moves only through the control plane.** Nodes never gossip
 routing; proxies never decide topology.
 
+A second rule governs configuration: **anything per-tenant is a
+control-plane fact, set dynamically and pushed — never a process flag.**
+The tenant opt-ins ('r' replica reads, 'c' near-cache, 'q' over-quota,
+'f' federated, 'a' async writes) all follow it: one CP command, one
+snapshot push, no restarts anywhere. Quota state applies to every
+connection immediately; the AUTH-bound opt-ins apply to connections
+authed after the push (a connection's semantics never change
+mid-stream). Per-process knobs (lag caps, queue cap, fsync cadence)
+either get a runtime admin command or accept the rolling-restart path —
+a new tenant-scoped setting must not.
+
 ## A normal write
 
 `SET user:42 "v"` from a tenant's off-the-shelf Redis client:
