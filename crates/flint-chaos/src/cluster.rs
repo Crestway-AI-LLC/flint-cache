@@ -145,6 +145,15 @@ fn spawn_node(port: u16, dir: &str, replica_of: Option<u16>) -> Child {
     {
         cmd.args(["--min-replicas-to-write", &n]);
     }
+    // Optional async write queue (ADR-0005 D4) for every spawned node, so
+    // the queue survives promote-replace and respawn. The open-mode proxy
+    // pins namespace "0", so `FLINT_CHAOS_ASYNC_WRITES=0` opts the whole
+    // chaos path in.
+    if let Ok(spec) = std::env::var("FLINT_CHAOS_ASYNC_WRITES")
+        && !spec.is_empty()
+    {
+        cmd.args(["--async-writes", &spec]);
+    }
     let log = std::fs::File::create(format!("{dir}.log")).expect("node log");
     cmd.stderr(log)
         .stdout(std::process::Stdio::null())

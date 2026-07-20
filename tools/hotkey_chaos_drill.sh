@@ -17,8 +17,22 @@ cargo build --release -q -p flint-server --features rocks
 cargo build --release -q -p flint-chaos
 KILLS="${KILLS:-6}"
 KEYS="${KEYS:-8}"
-./target/release/hotkey --kills "$KILLS" --keys "$KEYS"
+WRITERS="${WRITERS:-4}"
+
+echo "== phase 1: inline (sync) write path"
+./target/release/hotkey --kills "$KILLS" --keys "$KEYS" --writers "$WRITERS"
 pkill -9 -f flint-server 2>/dev/null || true
 pkill -9 -f flint-controller 2>/dev/null || true
 pkill -9 -f flint-proxy 2>/dev/null || true
-echo "HOTKEY CHAOS PASSED"
+sleep 0.5
+
+echo "== phase 2: ASYNC WRITE QUEUE (ADR-0005 D4) — the hot-key mitigation"
+# The open-mode proxy pins namespace "0"; opting it in routes every hot-key
+# write through the queue (group-committed batches, ack after apply), on
+# every node the harness spawns — including promote-replace respawns.
+FLINT_CHAOS_ASYNC_WRITES=0 \
+  ./target/release/hotkey --kills "$KILLS" --keys "$KEYS" --writers "$WRITERS"
+pkill -9 -f flint-server 2>/dev/null || true
+pkill -9 -f flint-controller 2>/dev/null || true
+pkill -9 -f flint-proxy 2>/dev/null || true
+echo "HOTKEY CHAOS PASSED (sync + async-queue)"
