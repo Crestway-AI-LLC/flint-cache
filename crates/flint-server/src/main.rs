@@ -92,6 +92,10 @@ impl Drop for ConnGuard {
 #[cfg_attr(not(feature = "rocks"), allow(dead_code))]
 static FULLSYNC_ACTIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+// WAL fsync cadence in ms (0 = disabled), for FLINTINFO. Rocks-only.
+#[cfg_attr(not(feature = "rocks"), allow(dead_code))]
+static WAL_FSYNC_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Releases a full-sync slot on any exit (including a mid-stream error), so a
 /// dropped connection can never leak a slot and wedge the cap.
 #[cfg_attr(not(feature = "rocks"), allow(dead_code))]
@@ -422,6 +426,34 @@ fn main() -> std::io::Result<()> {
         eprintln!("replica-of={target} (writes rejected with -READONLY)");
         let stop = Arc::clone(&tailer_stop);
         std::thread::spawn(move || replica::run(&target, &kv, &stop));
+    }
+
+    // Bounded-cadence WAL fsync (--wal-fsync-ms, default 500; 0 disables).
+    // Ordinary writes append to the WAL unsynced — zero acked loss across a
+    // process crash (the OS holds the pages) — and this tick group-commits
+    // an fsync every cadence, bounding a HOST failure's loss window (power,
+    // kernel, instance loss) to the cadence. Together with the lag-hard
+    // replication cap this is the structural basis of the published RPO.
+    #[cfg(feature = "rocks")]
+    {
+        let wal_fsync_ms: u64 = arg("--wal-fsync-ms")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(500);
+        WAL_FSYNC_MS.store(wal_fsync_ms, Ordering::Relaxed);
+        if let Some(kv) = rocks.clone()
+            && wal_fsync_ms > 0
+        {
+            std::thread::spawn(move || {
+                loop {
+                    std::thread::sleep(std::time::Duration::from_millis(wal_fsync_ms));
+                    if let Err(e) = kv.flush_wal_sync() {
+                        eprintln!("wal fsync tick failed: {e}");
+                    }
+                }
+            });
+        } else if wal_fsync_ms == 0 {
+            eprintln!("wal fsync cadence DISABLED (--wal-fsync-ms 0): host-loss window unbounded");
+        }
     }
 
     // RPO knobs: --lag-soft-ms delays writes, --lag-hard-ms sheds them.
@@ -1242,7 +1274,7 @@ fn flintinfo(
         None => "none".into(),
     };
     let info = format!(
-        "role:{}\r\nrole_epoch:{role_epoch}\r\nbuild:{build}\r\nsst_bytes:{sst}\r\nlatest_seq:{latest}\r\nlast_applied:{last_applied}\r\nacked_seq:{}\r\nseq_lag:{seq_lag}\r\nlive_replicas:{}\r\nlag_ms:{}\r\nlag_soft_ms:{soft}\r\nlag_hard_ms:{hard}\r\nmin_replicas_to_write:{minr}\r\nfullsync_active:{fsa}\r\nfullsync_max:{fsm}\r\nasync_write_queue:{aqd}\r\ncert_days_remaining:{cdr}\r\nactive_conns:{ac}\r\nmax_conns:{mc}\r\nconns_shed_total:{cs}\r\nwrite_stopped:{wst}\r\ndelayed_write_rate:{dwr}\r\n",
+        "role:{}\r\nrole_epoch:{role_epoch}\r\nbuild:{build}\r\nsst_bytes:{sst}\r\nlatest_seq:{latest}\r\nlast_applied:{last_applied}\r\nacked_seq:{}\r\nseq_lag:{seq_lag}\r\nlive_replicas:{}\r\nlag_ms:{}\r\nlag_soft_ms:{soft}\r\nlag_hard_ms:{hard}\r\nmin_replicas_to_write:{minr}\r\nfullsync_active:{fsa}\r\nfullsync_max:{fsm}\r\nasync_write_queue:{aqd}\r\nwal_fsync_ms:{wfm}\r\nwal_fsync_total:{wft}\r\ncert_days_remaining:{cdr}\r\nactive_conns:{ac}\r\nmax_conns:{mc}\r\nconns_shed_total:{cs}\r\nwrite_stopped:{wst}\r\ndelayed_write_rate:{dwr}\r\n",
         if read_only { "replica" } else { "master" },
         hub.effective_acked(now)
             .map_or_else(|| "none".into(), |a| a.to_string()),
@@ -1257,6 +1289,8 @@ fn flintinfo(
         fsa = FULLSYNC_ACTIVE.load(Ordering::Relaxed),
         fsm = MAX_FULLSYNC.load(Ordering::Relaxed),
         aqd = async_queue_depth.map_or_else(|| "off".into(), |d| d.to_string()),
+        wfm = WAL_FSYNC_MS.load(Ordering::Relaxed),
+        wft = rocks.as_ref().map(|kv| kv.wal_fsync_total()).unwrap_or(0),
         cdr = CERT_PATH
             .get()
             .and_then(|p| p.as_deref())

@@ -83,7 +83,7 @@ sequenceDiagram
     Note over P: write classifier -> quota bucket<br/>slot = crc16("user:42") % 16384<br/>near-cache invalidate ("user:42")
     P->>M: SET user:42 "v" (mTLS conn, FLINTNS-pinned)
     Note over M: role/epoch gate, slot gate,<br/>lag + min-replica gates
-    Note over M: envelope-encode, WAL append,<br/>fsync (group commit)
+    Note over M: envelope-encode, WAL append<br/>(fsync cadence: 500 ms tick)
     M-->>P: +OK
     P-->>C: +OK
     M--)R: WAL ops (async tail)
@@ -114,10 +114,17 @@ Step by step:
    and `min-replicas-to-write` can require live replicas before accepting.
 5. **Apply.** The dispatcher encodes the mutation through the envelope
    layer (namespace-prefixed, so tenants are physically disjoint key
-   ranges) and commits it to RocksDB with the WAL — **fsync before ack**,
-   group-committed so concurrent writers share the flush.
-6. **Ack.** The client's `+OK` means: durable on the master's disk. It
-   survives a crash and restart of the master.
+   ranges) and commits it to RocksDB with the WAL. The WAL is fsynced by
+   a **bounded cadence** (`--wal-fsync-ms`, default 500 ms — one group
+   commit covering everything since the last tick), so the write hits
+   stable storage within half a second of its ack without paying a
+   per-write fsync.
+6. **Ack.** The client's `+OK` means: applied, and in the WAL. It
+   survives a crash and restart of the master process (the OS holds the
+   WAL pages — proven by every kill -9 drill). The loss window of a
+   whole-HOST failure (power, kernel, instance) is bounded by the fsync
+   cadence; the loss window of a failover is bounded by the replication
+   lag cap (step 4). Every window is a knob, not a hope.
 7. **Replicate (async).** The replica tails the master's WAL over mTLS and
    applies batches atomically, advancing its acked sequence; the master
    tracks `seq_lag`/`lag_ms` per replica, which feed the gates in step 4

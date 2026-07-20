@@ -21,6 +21,8 @@ use crate::Kv;
 /// with `TypeStore`.
 pub struct RocksKv {
     db: DB,
+    /// Completed WAL fsyncs (the bounded-cadence durability tick).
+    wal_fsyncs: std::sync::atomic::AtomicU64,
 }
 
 impl RocksKv {
@@ -147,7 +149,26 @@ impl RocksKv {
         });
         Ok(Self {
             db: DB::open(&opts, path)?,
+            wal_fsyncs: std::sync::atomic::AtomicU64::new(0),
         })
+    }
+
+    /// Fsync the WAL — one group commit covering everything appended since
+    /// the last call. Ordinary writes go to the WAL unsynced (OS page cache:
+    /// zero acked loss across process crash/restart, proven by the chaos
+    /// drills); this tick, driven by the server's `--wal-fsync-ms` cadence,
+    /// is what bounds the loss window of a HOST failure (power, kernel,
+    /// instance loss) to the cadence instead of "whenever the OS flushed".
+    pub fn flush_wal_sync(&self) -> Result<(), rocksdb::Error> {
+        self.db.flush_wal(true)?;
+        self.wal_fsyncs
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Completed WAL fsync ticks (FLINTINFO `wal_fsync_total:`).
+    pub fn wal_fsync_total(&self) -> u64 {
+        self.wal_fsyncs.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Create a RocksDB checkpoint (hard-linked consistent copy) at `path`.

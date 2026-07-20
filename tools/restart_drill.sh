@@ -41,6 +41,12 @@ echo "== loading $KEYS strings + 1000 hashes via valkey-cli --pipe"
 BEFORE_SAMPLE=$(valkey-cli -p "$PORT" GET "key:0042000" || true)
 echo "== sample before kill: key:0042000 = $BEFORE_SAMPLE"
 
+echo "== WAL fsync cadence is live (bounded host-loss window)"
+sleep 1.2   # > two 500 ms ticks
+WFT=$(valkey-cli -p "$PORT" FLINTINFO | tr -d '\r' | grep '^wal_fsync_total:' | cut -d: -f2)
+[ "${WFT:-0}" -ge 1 ] || { echo "FAIL: wal_fsync_total never advanced ($WFT)"; exit 1; }
+echo "== wal_fsync_total=$WFT (cadence $(valkey-cli -p "$PORT" FLINTINFO | tr -d '\r' | grep '^wal_fsync_ms:' | cut -d: -f2) ms)"
+
 echo "== kill -9"
 pkill -9 -f "flint-server --port $PORT"
 sleep 0.3
