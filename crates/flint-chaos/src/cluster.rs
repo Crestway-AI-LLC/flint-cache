@@ -419,7 +419,7 @@ impl Cluster {
     /// that view stable for a window comfortably beyond confirm*poll
     /// guarantees the controller's next sweep records it. (This is the
     /// steady-state regime under test, not the degraded window.)
-    fn await_controller_observed(&self) {
+    pub fn await_controller_observed(&self) {
         let need = Duration::from_millis(1_300);
         let deadline = Instant::now() + Duration::from_secs(12);
         let mut converged_since: Option<Instant> = None;
@@ -443,8 +443,17 @@ impl Cluster {
     /// controller to promote the survivor (the harness does not promote).
     /// Re-attach a fresh replacement replica on the dead node's fixed port.
     pub fn kill_master_await_controller(&mut self) -> u16 {
-        assert!(self.controlled, "use bootstrap_controlled");
         self.await_controller_observed();
+        self.kill_master_now_await_controller()
+    }
+
+    /// Controlled mode, hot-writer variant: kill IMMEDIATELY, without the
+    /// sustained-convergence wait. For workloads that keep writing through
+    /// the kill (the wait can never observe seq_lag==0 under a live hammer):
+    /// the caller parks its writer, proves convergence itself (wait_healthy +
+    /// await_controller_observed), resumes the writer, then calls this.
+    pub fn kill_master_now_await_controller(&mut self) -> u16 {
+        assert!(self.controlled, "use bootstrap_controlled");
         self.master_kills += 1;
         let dead = self.master_port;
         let survivor = self.replica_port;

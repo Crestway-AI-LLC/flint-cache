@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: Elastic-2.0
+# Hot-key write path under controller-driven failover: a writer hammers a
+# handful of keys THROUGH each master kill (it never pauses for the kill),
+# so every failover's loss window lands on the keys being written that
+# instant. Ledger-verified (no corruption / cross-key / time-travel /
+# phantom; regressions accounted), and the client-observed write blackout
+# of every failover is measured against the published 10 s RTO — the drill
+# FAILS if any failover exceeds it.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+pkill -9 -f flint-server 2>/dev/null || true
+pkill -9 -f flint-controller 2>/dev/null || true
+pkill -9 -f flint-proxy 2>/dev/null || true
+sleep 0.5
+cargo build --release -q -p flint-server --features rocks
+cargo build --release -q -p flint-chaos
+KILLS="${KILLS:-6}"
+KEYS="${KEYS:-8}"
+./target/release/hotkey --kills "$KILLS" --keys "$KEYS"
+pkill -9 -f flint-server 2>/dev/null || true
+pkill -9 -f flint-controller 2>/dev/null || true
+pkill -9 -f flint-proxy 2>/dev/null || true
+echo "HOTKEY CHAOS PASSED"
