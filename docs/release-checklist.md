@@ -48,4 +48,25 @@ cross-key / acked-loss anomalies.
 
 Tag only after 1-4 are green in one working tree with no uncommitted
 changes. The tag message names the conformance count and the drill set
-run.
+run. If the release BREAKS the on-disk format, say `format-break` in
+the tag annotation — the pipeline records it in the manifest, and
+`flintctl upgrade --manifest` refuses the canary fast path for it
+(a format break cannot roll back; it ships via the migration runbook).
+
+## 6. What the tag triggers (fleet releases)
+
+Pushing the tag to the fleet repo runs the release pipeline: tests on
+both workspaces against the exact bits shipped, then ONE artifact —
+the 12-binary Linux bundle plus `manifest.json` (version, bundle URL,
+sha256, format_break, public commit) attached to a GitHub release.
+Deploying is then one command (or the ops portal's Canary-upgrade
+button): download, verify the sha256, unpack into the inventory's bins
+dir, and
+
+    flintctl -f <inventory> upgrade --manifest manifest.json --version-tag <tag>
+
+— canary replica first, soak against the fleet journal, remaining
+replicas, masters last via controlled failover; any unexpected journal
+transition aborts the roll (already-upgraded nodes stay: roll forward).
+A HOTFIX is the same pipeline and the same command with a shorter
+`--soak-ms` — never a separate untested path.
