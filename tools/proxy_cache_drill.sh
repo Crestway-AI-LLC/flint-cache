@@ -39,11 +39,12 @@ sleep 0.7
 $PX --port 7881 --control-plane 127.0.0.1:7660 --advertise 127.0.0.1:7881 2>"$D/px.log" &
 sleep 1.5
 
-echo "== cache starts OFF; operator enables at RUNTIME: PROXYCACHE 1500 65536"
-valkey-cli -p 7881 PROXYCACHE | grep -q 'ttl_ms:0' || { echo "FAIL: cache not off at boot"; exit 1; }
+echo "== cache defaults ON (ttl 300 ms, 256 MB); operator retunes at RUNTIME: PROXYCACHE 1500 65536"
+valkey-cli -p 7881 PROXYCACHE | grep -q 'ttl_ms:300' || { echo "FAIL: default ttl not 300"; exit 1; }
+valkey-cli -p 7881 PROXYCACHE | grep -q 'max_bytes:268435456' || { echo "FAIL: default budget not 256MB"; exit 1; }
 [ "$(valkey-cli -p 7881 PROXYCACHE 1500 65536)" = "OK" ] || { echo "FAIL: PROXYCACHE set"; exit 1; }
 valkey-cli -p 7881 PROXYCACHE | grep -q 'ttl_ms:1500' || { echo "FAIL: runtime ttl not applied"; exit 1; }
-echo "  ttl=1500ms max_bytes=65536, applied to the live proxy"
+echo "  defaults verified, then ttl=1500ms max_bytes=65536 applied to the live proxy"
 
 A="valkey-cli -p 7881 -a tok-acme --no-auth-warning"
 G="valkey-cli -p 7881 -a tok-glx --no-auth-warning"

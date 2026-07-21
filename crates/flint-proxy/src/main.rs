@@ -1782,16 +1782,19 @@ fn main() -> std::io::Result<()> {
         replica_rr: AtomicUsize::new(0),
         hotkeys: HotKeySketch::new(),
         latency: latency::LatencyHistograms::default(),
-        // D6 near-cache: OFF unless --cache-ttl-ms is given; both knobs stay
-        // runtime-settable via PROXYCACHE. The default budget is deliberately
-        // small — this is a hot-spot absorber, not a data tier.
+        // D6 near-cache defaults: TTL 300 ms, budget 256 MB (Jeff,
+        // 2026-07-20). ON by default at the proxy — but caching still
+        // requires the tenant's 'c' opt-in per request, so an un-opted
+        // fleet caches nothing. Both knobs stay runtime-settable via
+        // PROXYCACHE (0 TTL disables and clears); the budget is bounded —
+        // this is a hot-spot absorber, not a data tier.
         cache: cache::ProxyCache::new(
             arg("--cache-ttl-ms")
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(0),
+                .unwrap_or(300),
             arg("--cache-max-bytes")
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(64 * 1024 * 1024),
+                .unwrap_or(256 * 1024 * 1024),
         ),
         open_mode,
         backend_tls,
