@@ -1196,6 +1196,33 @@ fn main() {
                 other => panic!("tenant-reads failed: {other:?}"),
             }
         }
+        // Async write-queue opt-in (ADR-0005 D4, the 'a' flag): the hot-key
+        // write mitigation, operator-set here or tenant-set via the portal.
+        "tenant-async" => {
+            let (name, mode) = (
+                rest.first().expect("usage: tenant-async <name> <on|off>"),
+                rest.get(1).expect("usage: tenant-async <name> <on|off>"),
+            );
+            let tls = tls_client(&inv);
+            match call(&inv.cp[0], &tls, &["CPTENANTASYNC", name, mode]) {
+                Ok(Value::Simple(s)) => println!("{s}"),
+                other => panic!("tenant-async failed: {other:?}"),
+            }
+        }
+        // Federation flag (ADR-0007, plumbing today): marks the tenant and
+        // rides the snapshot; routing semantics arrive with the fleet map.
+        "tenant-federate" => {
+            let (name, mode) = (
+                rest.first()
+                    .expect("usage: tenant-federate <name> <on|off>"),
+                rest.get(1).expect("usage: tenant-federate <name> <on|off>"),
+            );
+            let tls = tls_client(&inv);
+            match call(&inv.cp[0], &tls, &["CPTENANTFEDERATE", name, mode]) {
+                Ok(Value::Simple(s)) => println!("{s}"),
+                other => panic!("tenant-federate failed: {other:?}"),
+            }
+        }
         // Tenant quotas (M5): fleet ops/s + storage bytes; 0 = unlimited.
         "tenant-quota" => {
             let (name, ops, bytes) = (
@@ -1287,7 +1314,7 @@ fn main() {
         "stop" => stop(&inv),
         other => {
             panic!(
-                "unknown command {other:?} (bootstrap|start|status|tenant|tenant-reads|tenant-cache|tenant-quota|rotate-admin|rotate-certs|proxy-cache|expand|swap-node|add-replica|upgrade|stop)"
+                "unknown command {other:?} (bootstrap|start|status|tenant|tenant-reads|tenant-cache|tenant-async|tenant-federate|tenant-quota|rotate-admin|rotate-certs|proxy-cache|expand|swap-node|add-replica|upgrade|stop)"
             )
         }
     }

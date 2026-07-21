@@ -558,7 +558,7 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
                 .unwrap_or(0);
             Value::Bulk(Some(
                 format!(
-                    "{} {} {} {} {} {} {} {}\r\n",
+                    "{} {} {} {} {} {} {} {} {}\r\n",
                     t.name,
                     t.ns,
                     t.ops_per_sec,
@@ -566,7 +566,8 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
                     t.over_quota as u8,
                     bytes,
                     t.replica_reads as u8,
-                    t.local_cache as u8
+                    t.local_cache as u8,
+                    t.async_writes as u8
                 )
                 .into_bytes(),
             ))
@@ -610,13 +611,17 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
         // quotas, never another tenant. Pushed to proxies like any change.
         b"CPMYCONFIG" => {
             let (Some(token), Some(setting), Some(mode)) = (text(1), text(2), text(3)) else {
-                return err("CPMYCONFIG <token> <replica-reads|near-cache> <on|off>");
+                return err("CPMYCONFIG <token> <replica-reads|near-cache|async-writes> <on|off>");
             };
             let token = flint_tls::sha256_hex(token.as_bytes());
             let on = match mode.as_str() {
                 "on" => true,
                 "off" => false,
-                _ => return err("CPMYCONFIG <token> <replica-reads|near-cache> <on|off>"),
+                _ => {
+                    return err(
+                        "CPMYCONFIG <token> <replica-reads|near-cache|async-writes> <on|off>",
+                    );
+                }
             };
             let Ok(mut st) = shared.state.lock() else {
                 return err("state lock");
@@ -631,7 +636,10 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
             match setting.as_str() {
                 "replica-reads" => t.replica_reads = on,
                 "near-cache" => t.local_cache = on,
-                _ => return err("unknown setting (replica-reads|near-cache)"),
+                // The tenant's OWN latency trade (ADR-0005 D4): coalesce
+                // its batchable writes through the node queue.
+                "async-writes" => t.async_writes = on,
+                _ => return err("unknown setting (replica-reads|near-cache|async-writes)"),
             }
             match st.commit() {
                 Ok(_) => {}
@@ -655,7 +663,7 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
                     .and_then(|u| u.get(&t.name).copied())
                     .unwrap_or(0);
                 out.push_str(&format!(
-                    "{} {} {} {} {} {} {} {} {}\r\n",
+                    "{} {} {} {} {} {} {} {} {} {} {}\r\n",
                     t.name,
                     t.ns,
                     t.ops_per_sec,
@@ -664,7 +672,9 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
                     bytes,
                     t.replica_reads as u8,
                     t.local_cache as u8,
-                    t.prev_token.as_deref().unwrap_or("-")
+                    t.prev_token.as_deref().unwrap_or("-"),
+                    t.federated as u8,
+                    t.async_writes as u8
                 ));
             }
             Value::Bulk(Some(out.into_bytes()))

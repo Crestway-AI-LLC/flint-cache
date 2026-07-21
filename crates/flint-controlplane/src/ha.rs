@@ -788,7 +788,7 @@ async fn handle_admin(ha: &Ha, args: &[Vec<u8>]) -> Value {
                 .unwrap_or(0);
             Value::Bulk(Some(
                 format!(
-                    "{} {} {} {} {} {} {} {}\r\n",
+                    "{} {} {} {} {} {} {} {} {}\r\n",
                     t.name,
                     t.ns,
                     t.ops_per_sec,
@@ -796,7 +796,8 @@ async fn handle_admin(ha: &Ha, args: &[Vec<u8>]) -> Value {
                     t.over_quota as u8,
                     bytes,
                     t.replica_reads as u8,
-                    t.local_cache as u8
+                    t.local_cache as u8,
+                    t.async_writes as u8
                 )
                 .into_bytes(),
             ))
@@ -838,7 +839,8 @@ async fn handle_admin(ha: &Ha, args: &[Vec<u8>]) -> Value {
         b"CPMYCONFIG" => {
             let (Some(token), Some(setting), Some(mode)) = (text(1), text(2), text(3)) else {
                 return Value::Error(
-                    "ERR CPMYCONFIG <token> <replica-reads|near-cache> <on|off>".into(),
+                    "ERR CPMYCONFIG <token> <replica-reads|near-cache|async-writes> <on|off>"
+                        .into(),
                 );
             };
             let token = flint_tls::sha256_hex(token.as_bytes());
@@ -847,7 +849,8 @@ async fn handle_admin(ha: &Ha, args: &[Vec<u8>]) -> Value {
                 "off" => false,
                 _ => {
                     return Value::Error(
-                        "ERR CPMYCONFIG <token> <replica-reads|near-cache> <on|off>".into(),
+                        "ERR CPMYCONFIG <token> <replica-reads|near-cache|async-writes> <on|off>"
+                            .into(),
                     );
                 }
             };
@@ -864,7 +867,12 @@ async fn handle_admin(ha: &Ha, args: &[Vec<u8>]) -> Value {
             let mutation = match setting.as_str() {
                 "replica-reads" => Mutation::SetReplicaReads { name, on },
                 "near-cache" => Mutation::SetLocalCache { name, on },
-                _ => return Value::Error("ERR unknown setting (replica-reads|near-cache)".into()),
+                "async-writes" => Mutation::SetAsyncWrites { name, on },
+                _ => {
+                    return Value::Error(
+                        "ERR unknown setting (replica-reads|near-cache|async-writes)".into(),
+                    );
+                }
             };
             match ha.propose(mutation).await {
                 Ok(_) => Value::Simple("OK".into()),
@@ -881,7 +889,7 @@ async fn handle_admin(ha: &Ha, args: &[Vec<u8>]) -> Value {
                     .and_then(|u| u.get(&t.name).copied())
                     .unwrap_or(0);
                 out.push_str(&format!(
-                    "{} {} {} {} {} {} {} {} {}\r\n",
+                    "{} {} {} {} {} {} {} {} {} {} {}\r\n",
                     t.name,
                     t.ns,
                     t.ops_per_sec,
@@ -890,7 +898,9 @@ async fn handle_admin(ha: &Ha, args: &[Vec<u8>]) -> Value {
                     bytes,
                     t.replica_reads as u8,
                     t.local_cache as u8,
-                    t.prev_token.as_deref().unwrap_or("-")
+                    t.prev_token.as_deref().unwrap_or("-"),
+                    t.federated as u8,
+                    t.async_writes as u8
                 ));
             }
             Value::Bulk(Some(out.into_bytes()))

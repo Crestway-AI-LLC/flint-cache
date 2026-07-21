@@ -104,4 +104,13 @@ read -r T3 C3 <<<"$(storm tok-hot af:counter2)"
 [ "$T3" = "0" ] || { echo "FAIL: flag off but still queued ($T3 THROTTLED)"; exit 1; }
 echo "  flag off: 0 -THROTTLED, counter exactly 4800"
 
-echo "PASS: 'a' is a live CP tenant flag — snapshot-pushed, proxy-pinned, queue-routed, exact counters, off propagates"
+echo "== tenant SELF-SERVICE path: CPMYCONFIG <token> async-writes on (the portal's call)"
+R=$(valkey-cli -p 7520 CPMYCONFIG tok-cold async-writes on)
+[ "$R" = "OK" ] || { echo "FAIL: CPMYCONFIG async-writes: $R"; exit 1; }
+sleep 1.5   # snapshot push
+read -r T4 C4 <<<"$(storm tok-cold af:counter3)"
+[ "$C4" = "4800" ] || { echo "FAIL: self-service counter $C4 (want 4800)"; exit 1; }
+[ "$T4" -ge 1 ] || { echo "FAIL: self-service opt-in never reached the queue"; exit 1; }
+echo "  cold self-opted in: $T4 -THROTTLED sheds, counter exactly 4800"
+
+echo "PASS: 'a' is a live CP tenant flag — snapshot-pushed, proxy-pinned, queue-routed, exact counters, off propagates, self-service works"
