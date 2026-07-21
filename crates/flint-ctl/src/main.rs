@@ -1309,6 +1309,33 @@ fn main() {
                 .and_then(|i| rest.get(i + 1))
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(3000);
+            // Release-manifest guard: the canary path's safety net is that
+            // any node can roll back or forward freely, which an on-disk
+            // FORMAT BREAK destroys. A manifest declaring one refuses the
+            // fast path unless the operator explicitly acknowledges the
+            // migration-release runbook.
+            if let Some(mf) = rest
+                .iter()
+                .position(|a| a == "--manifest")
+                .and_then(|i| rest.get(i + 1))
+            {
+                let body = std::fs::read_to_string(mf)
+                    .unwrap_or_else(|e| panic!("cannot read manifest {mf}: {e}"));
+                let breaks = body.split("\"format_break\"").nth(1).is_some_and(|rest| {
+                    rest.trim_start()
+                        .trim_start_matches(':')
+                        .trim_start()
+                        .starts_with("true")
+                });
+                if breaks && !rest.iter().any(|a| a == "--allow-format-break") {
+                    panic!(
+                        "REFUSED: manifest {mf} declares format_break=true — this release \
+                         cannot roll back and must ship via the migration runbook, not the \
+                         canary fast path. Re-run with --allow-format-break only if you are \
+                         executing that runbook."
+                    );
+                }
+            }
             upgrade(&inv, tag, soak);
         }
         "stop" => stop(&inv),
