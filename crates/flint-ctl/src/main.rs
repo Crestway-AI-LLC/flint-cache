@@ -189,8 +189,28 @@ fn call(
     tls: &Option<Arc<flint_tls::ClientConfig>>,
     args: &[&str],
 ) -> std::io::Result<Value> {
+    call_to(addr, tls, args, Duration::from_millis(1500))
+}
+
+/// Like `call` but with a caller-chosen read timeout — for slot migration,
+/// which streams a whole slot and can exceed the default.
+fn call_slow(
+    addr: &str,
+    tls: &Option<Arc<flint_tls::ClientConfig>>,
+    args: &[&str],
+    read_timeout: Duration,
+) -> std::io::Result<Value> {
+    call_to(addr, tls, args, read_timeout)
+}
+
+fn call_to(
+    addr: &str,
+    tls: &Option<Arc<flint_tls::ClientConfig>>,
+    args: &[&str],
+    read_timeout: Duration,
+) -> std::io::Result<Value> {
     let mut s = flint_tls::connect(addr, tls)?;
-    s.set_read_timeout(Some(Duration::from_millis(1500)))?;
+    s.set_read_timeout(Some(read_timeout))?;
     s.set_write_timeout(Some(Duration::from_millis(1500)))?;
     let frame = Value::Array(Some(
         args.iter()
@@ -1216,6 +1236,92 @@ fn controlled_failover(
 /// master (wipe + checkpoint resync, the demote contract). No build change.
 /// The one clean way to hand off a master on demand: run it before taking a
 /// master out for maintenance or `decommission-node`.
+/// Resolve a pair reference (index or any member address) to its live
+/// master address.
+fn pair_master(
+    inv: &Inventory,
+    tls: &Option<Arc<flint_tls::ClientConfig>>,
+    pair_ref: &str,
+) -> String {
+    let idx = match pair_ref.parse::<usize>() {
+        Ok(i) if i < inv.pairs.len() => i,
+        _ => inv
+            .pairs
+            .iter()
+            .position(|p| p.iter().any(|a| a == pair_ref))
+            .unwrap_or_else(|| panic!("{pair_ref} is not a pair index or a known member")),
+    };
+    inv.pairs[idx]
+        .iter()
+        .find(|a| info_field(a, tls, "role:").as_deref() == Some("master"))
+        .cloned()
+        .unwrap_or_else(|| panic!("pair {idx} has no reachable master"))
+}
+
+/// `flintctl migrate-slots <ns> <lo-hi> <src> <dest>`: move a contiguous
+/// slot range of ONE namespace from src's master to dest's master — the
+/// same epoch-fenced FLINTMIGRATEIN cutover the auto-rebalancer uses, then
+/// committed to the CP (CPSETSLOT) so every proxy (cold-started ones
+/// included) routes it from the snapshot, not from -MOVED discovery. A live
+/// writer sees a brief -TRYAGAIN / -MOVED bridge per slot, never loss.
+/// Operator control for capacity moves the size-policy rebalancer would not
+/// make on its own.
+fn migrate_slots(inv: &Inventory, ns: &str, range: &str, src: &str, dest: &str) {
+    let tls = tls_client(inv);
+    let (lo, hi) = range
+        .split_once('-')
+        .and_then(|(a, b)| Some((a.parse::<u16>().ok()?, b.parse::<u16>().ok()?)))
+        .unwrap_or_else(|| panic!("range must be lo-hi, e.g. 8000-8191 (got {range:?})"));
+    assert!(lo <= hi, "range lo must be <= hi ({lo}-{hi})");
+    assert!(hi < 16384, "slots are 0..16383 (got hi={hi})");
+    let src_master = pair_master(inv, &tls, src);
+    let dest_master = pair_master(inv, &tls, dest);
+    assert!(
+        src_master != dest_master,
+        "src and dest resolve to the same master ({src_master}); nothing to move"
+    );
+    eprintln!(
+        "== migrate-slots {ns} {lo}-{hi}: {src_master} -> {dest_master} ({} slot(s))",
+        hi - lo + 1
+    );
+    let mut moved = 0u32;
+    for slot in lo..=hi {
+        match call_slow(
+            &dest_master,
+            &tls,
+            &[
+                "FLINTMIGRATEIN",
+                &src_master,
+                &slot.to_string(),
+                &dest_master,
+                ns,
+            ],
+            Duration::from_secs(120),
+        ) {
+            Ok(Value::Simple(_)) => {
+                // Option B: commit ownership truth to the CP so proxies route
+                // it from the snapshot. Best-effort — the -MOVED bridge still
+                // routes correctly until the row lands, and CPSETSLOT is
+                // idempotent to re-set.
+                match call(
+                    &inv.cp[0],
+                    &tls,
+                    &["CPSETSLOT", ns, &slot.to_string(), &dest_master],
+                ) {
+                    Ok(Value::Simple(_)) => {}
+                    other => eprintln!(
+                        "  warn: CPSETSLOT {ns}/{slot} not committed: {other:?} (the -MOVED bridge still routes)"
+                    ),
+                }
+                moved += 1;
+            }
+            other => panic!("migrate {ns}/{slot} {src_master}->{dest_master} failed: {other:?}"),
+        }
+    }
+    eprintln!("== migrate-slots complete: {moved} slot(s) now owned by {dest_master}");
+    status(inv);
+}
+
 fn failover(inv: &Inventory, node: &str) {
     let tls = tls_client(inv);
     let Some(pair_idx) = inv.pairs.iter().position(|p| p.iter().any(|a| a == node)) else {
@@ -1524,6 +1630,19 @@ fn main() {
             add_replica(&inv, &inv_path, pair, new);
         }
         "reload" => reload(&inv),
+        "migrate-slots" => {
+            let (ns, range, src, dest) = (
+                rest.first()
+                    .expect("usage: migrate-slots <ns> <lo-hi> <src> <dest>"),
+                rest.get(1)
+                    .expect("usage: migrate-slots <ns> <lo-hi> <src> <dest>"),
+                rest.get(2)
+                    .expect("usage: migrate-slots <ns> <lo-hi> <src> <dest>"),
+                rest.get(3)
+                    .expect("usage: migrate-slots <ns> <lo-hi> <src> <dest>"),
+            );
+            migrate_slots(&inv, ns, range, src, dest);
+        }
         "failover" => {
             let node = rest.first().expect("usage: failover <node-addr>");
             failover(&inv, node);
@@ -1697,7 +1816,7 @@ fn main() {
         "stop" => stop(&inv),
         other => {
             panic!(
-                "unknown command {other:?} (bootstrap|start|status|reload|tenant|tenant-reads|tenant-cache|tenant-async|tenant-federate|tenant-quota|rotate-admin|rotate-certs|proxy-cache|expand|swap-node|add-replica|failover|decommission-node|upgrade|stop)"
+                "unknown command {other:?} (bootstrap|start|status|reload|tenant|tenant-reads|tenant-cache|tenant-async|tenant-federate|tenant-quota|rotate-admin|rotate-certs|proxy-cache|expand|swap-node|add-replica|migrate-slots|failover|decommission-node|upgrade|stop)"
             )
         }
     }
