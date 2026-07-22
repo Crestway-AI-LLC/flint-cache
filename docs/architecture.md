@@ -193,10 +193,11 @@ sequenceDiagram
 
 ## Failover
 
-Master failover — the planned graceful handoff and the unexpected
-crash/partition path, the epoch-fencing + lease + lag-cap invariants they
-rest on, and the argument for why two masters can never serve the same
-slot — has its own map in [failover.md](failover.md).
+Failover — master handoff (planned graceful, and unexpected
+crash/partition), the epoch-fencing + lease + lag-cap invariants it rests
+on, why two masters can never serve the same slot, and the stateless
+proxy-instance failure case — has its own map in
+[failover.md](failover.md).
 
 ## Where the invariants are proven
 

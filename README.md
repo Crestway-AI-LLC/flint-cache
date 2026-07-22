@@ -45,9 +45,9 @@ Everything needed to run AND operate Flint yourself:
 
 [docs/architecture.md](docs/architecture.md) is the system map — the three
 planes, and a normal write and read traced end to end.
-[docs/failover.md](docs/failover.md) covers master failover — the planned
-(graceful handoff) and unexpected (crash/partition) paths, and why
-split-brain is structurally impossible.
+[docs/failover.md](docs/failover.md) covers failover — master handoff
+(planned and crash/partition) and why split-brain is impossible, plus the
+stateless proxy-instance failure case.
 
 `tools/` holds the drill scripts — end-to-end proofs (replication parity,
 failover RTO, slot migration and cutover, quota enforcement, token and

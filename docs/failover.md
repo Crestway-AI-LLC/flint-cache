@@ -1,8 +1,13 @@
-# Master failover — design
+# Failover — design
 
-How Flint moves the master role within a pair without losing acknowledged
-writes, without ever running two masters, and without the client seeing
-more than a brief latency bump. Two paths share one safety foundation:
+How Flint survives the loss of an instance. Most of this doc is **master
+failover** — moving the master role within a pair without losing
+acknowledged writes, without ever running two masters, and without the
+client seeing more than a brief latency bump — because that is the case
+with data and a role at stake. A **proxy** instance failure (stateless, no
+data at risk) is the short section near the end.
+
+Master failover has two paths sharing one safety foundation:
 
 - **Planned** — an operator hands the role off gracefully (maintenance,
   node decommission, rolling upgrade): `flintctl failover <node>`.
@@ -173,6 +178,60 @@ routes by the master it rediscovers — never two at once. Every layer
 (manifest epoch, node lease, controller promotion, proxy routing) agrees
 on a single lineage, and each is independently fenced.
 
+## Proxy instance failure (the stateless contrast)
+
+A master carries data and a role, so its failure needs epochs, leases, and
+a promotion. A **proxy carries neither** — it is stateless by design, and
+its failure is correspondingly boring: no data is at risk, no election
+happens, and recovery is a client reconnect plus (optionally) a fresh
+instance.
+
+- **Nothing durable is lost.** All a proxy holds is pushed, ephemeral
+  state: the topology, tenants, token digests, quotas, and opt-in flags
+  that arrive as versioned snapshots from the control plane (`CPWATCH`).
+  The only thing that dies with a proxy is its **near-cache** — bounded,
+  short-TTL, invalidate-on-write — so losing it is a warm-up cost on the
+  survivors, never a correctness event.
+- **A tenant is served by a subset, not one proxy.** Each tenant is
+  assigned a **shuffle-shard subset** of the proxy fleet (`k` proxies,
+  default 2; `CPSETSUBSET` overrides for whale isolation), and its
+  endpoint publishes to that subset (per-tenant DNS). One proxy dying
+  removes one address from the tenant's endpoint; the client's next
+  connection lands on another subset member, which already serves that
+  tenant from its own snapshot.
+- **In-flight requests retry, not fail permanently.** Requests on the
+  dead proxy get a connection error; the client reconnects (to another
+  subset member) and retries. Because reads route to the master by
+  default, read-your-writes still holds across the reconnect. A read that
+  had been answered from the dead proxy's near-cache is simply re-fetched.
+- **A replacement is a cold start, not a rebuild.** A new proxy boots in
+  control-plane mode, subscribes with `CPWATCH`, and receives a
+  **filtered** snapshot (only its assigned tenants — a proxy never holds
+  tokens it does not serve). It routes correctly **from its first
+  snapshot**: `slot_map_drill` shows a cold proxy serving fragmented slot
+  ownership with `moved_learned_total = 0` — no `-MOVED` chasing needed to
+  be correct. It then warms its near-cache and learns any migration
+  bridges over time; those are latency optimizations, not correctness
+  prerequisites.
+
+Detection and replacement are the fleet's job, not the data path's: the
+control plane suppresses no-op pushes, and the operator/agent re-adds a
+proxy (or an autoscaling group replaces the instance). Until then, the
+tenant's other subset proxies carry the load.
+
+**The single-VM shape.** The marketplace entry SKU runs one proxy on the
+instance, so a proxy failure there is an *instance* failure — recovered by
+replacing the instance (an ASG or a fresh launch), after which the fleet
+bootstraps back and the proxy rejoins with a cold-start snapshot. The
+subset failover above is the multi-proxy / managed shape, where a single
+proxy loss is invisible to clients.
+
+| scenario | response | client impact | loss |
+|---|---|---|---|
+| One proxy in a multi-proxy subset dies | client reconnects to another subset member; agent/operator replaces the instance | brief reconnect + retry; a cold near-cache warms up | none |
+| A replacement proxy joins | `CPWATCH` snapshot → serves from the first frame | none | none |
+| Single-VM proxy (== instance) dies | replace the instance; fleet re-bootstraps, proxy rejoins cold | unavailable until the instance is back | none (data on NVMe) |
+
 ## Where it is proven
 
 - `failover_drill.sh` — epoch-fenced promotion; a returning zombie master
@@ -188,3 +247,8 @@ on a single lineage, and each is independently fenced.
   kills with a ledger oracle: every acked write accounted for, zero
   corruption, zero double-ownership, through both direct and
   client→proxy→node paths.
+- `slot_map_drill.sh` — a cold proxy routes fragmented slot ownership
+  correctly from its first snapshot (`moved_learned_total = 0`), the
+  proxy-replacement guarantee.
+- `proxy_drill.sh` — one endpoint absorbs migration and failover; the
+  client never sees `-MOVED`/`-ASK`.
