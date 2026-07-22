@@ -286,6 +286,11 @@ struct Config {
     /// mastership in a bumped generation).
     snapshot_root: Option<String>,
     snapshot_interval: Duration,
+    /// How the rebalancer scores pair load. Open stack: `size` (balance by
+    /// data). The private plane ships a `traffic` policy (balance by
+    /// ops/second) behind the same `BalancePolicy` seam. Selected by
+    /// --balance-policy; unknown names fail fast at startup.
+    balance_policy: Box<dyn planner::BalancePolicy>,
     bin: String,
     id: String,
 }
@@ -358,11 +363,18 @@ impl Pair {
     /// FLINTSLOTSTATS — DBSIZE is namespace-scoped since tenancy, so it
     /// would read 0 on a node whose data lives in tenant namespaces), plus
     /// that master's address (the endpoint the executor ships from/to).
-    fn observe_fill(&self) -> Option<(planner::PairLoad, String)> {
+    fn observe_fill(
+        &self,
+        policy: &dyn planner::BalancePolicy,
+    ) -> Option<(planner::PairLoad, String)> {
         for addr in &self.nodes {
             let n = observe(addr);
             if n.reachable && n.role == "master" {
-                let fill: u64 = slot_stats(addr).iter().map(|(_, n)| n).sum();
+                // The policy maps the master's per-slot stats to the single
+                // load number the planner balances on. `size` (open default)
+                // sums key counts; other policies weigh the same stats
+                // differently without changing the planner.
+                let fill = policy.pair_load(&slot_stats(addr));
                 return Some((
                     planner::PairLoad {
                         label: self.label.clone(),
@@ -697,6 +709,14 @@ fn main() {
         _ => panic!("--internal-ca, --internal-cert, --internal-key must be given together"),
     }
     let _ = JOURNAL_TARGET.set(arg("--journal"));
+    // Resolve the rebalance policy up front so an unknown name is a startup
+    // error, not a silent fallback to the wrong metric.
+    let policy_name = arg("--balance-policy").unwrap_or_else(|| "size".into());
+    let balance_policy = planner::policy_by_name(&policy_name).unwrap_or_else(|| {
+        eprintln!("unknown --balance-policy '{policy_name}' (open stack ships: size)");
+        std::process::exit(2);
+    });
+
     let cfg = Config {
         poll: Duration::from_millis(arg_or("--poll-ms", 200)),
         confirm: arg_or("--confirm", 3),
@@ -722,6 +742,7 @@ fn main() {
             .unwrap_or_default(),
         snapshot_root: arg("--snapshot-root"),
         snapshot_interval: Duration::from_millis(arg_or("--snapshot-interval-ms", 30_000)),
+        balance_policy,
         bin: server_bin(),
         id: arg("--id").unwrap_or_else(|| "ctl".into()),
     };
@@ -733,12 +754,13 @@ fn main() {
     );
 
     eprintln!(
-        "[{}] flint-controller: {} pair(s) recover-nodes={} poll={:?} confirm={}",
+        "[{}] flint-controller: {} pair(s) recover-nodes={} poll={:?} confirm={} balance-policy={}",
         cfg.id,
         pairs.len(),
         cfg.recover_nodes.len(),
         cfg.poll,
         cfg.confirm,
+        cfg.balance_policy.name(),
     );
 
     let mut last_rebalance = Instant::now();
@@ -765,8 +787,10 @@ fn main() {
         // deadband stopping the loop at balance.
         if cfg.rebalance_deadband > 0.0 && last_rebalance.elapsed() > Duration::from_secs(5) {
             last_rebalance = Instant::now();
-            let observed: Vec<(planner::PairLoad, String)> =
-                pairs.iter().filter_map(|p| p.observe_fill()).collect();
+            let observed: Vec<(planner::PairLoad, String)> = pairs
+                .iter()
+                .filter_map(|p| p.observe_fill(&*cfg.balance_policy))
+                .collect();
             if observed.len() >= 2 {
                 let loads: Vec<planner::PairLoad> =
                     observed.iter().map(|(l, _)| l.clone()).collect();

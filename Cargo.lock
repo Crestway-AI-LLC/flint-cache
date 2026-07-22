@@ -562,6 +562,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "flint-exporter"
+version = "0.0.1"
+dependencies = [
+ "flint-resp",
+ "flint-tls",
+]
+
+[[package]]
 name = "flint-journal"
 version = "0.0.1"
 dependencies = [

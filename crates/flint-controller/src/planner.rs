@@ -142,6 +142,49 @@ pub fn select_units(stats: &[((String, u16), u64)], amount: u64, cap: usize) -> 
     if amount == 0 { Vec::new() } else { picked }
 }
 
+// ---- Balance policy framework -------------------------------------------
+//
+// A policy turns a pair's per-slot stats into the single LOAD number the
+// planner balances on. This is the seam that decides WHAT "balanced" means.
+// The open stack ships one policy — SIZE (balance so every pair holds a
+// similar amount of DATA). Other policies (e.g. TRAFFIC — balance so every
+// pair serves a similar number of ops/second) plug in behind the same trait
+// without touching the planner; the traffic policy is the Crestway plane's
+// differentiation and needs per-slot ops metering the open stack does not
+// emit. `plan_moves` and `select_units` are policy-agnostic — a policy only
+// changes the load NUMBER fed in.
+
+/// Turns a master's per-slot stats — `((namespace, slot), metric)` — into
+/// the pair's load. Deterministic and pure.
+pub trait BalancePolicy: Send + Sync {
+    /// The policy name (matches the `--balance-policy` selector).
+    fn name(&self) -> &'static str;
+    /// The pair's load from its per-slot stats.
+    fn pair_load(&self, per_slot: &[((String, u16), u64)]) -> u64;
+}
+
+/// The open default: balance by DATA size. `FLINTSLOTSTATS` reports a
+/// per-slot count (keys today, bytes later); a pair's load is their sum.
+pub struct SizePolicy;
+impl BalancePolicy for SizePolicy {
+    fn name(&self) -> &'static str {
+        "size"
+    }
+    fn pair_load(&self, per_slot: &[((String, u16), u64)]) -> u64 {
+        per_slot.iter().map(|(_, n)| n).sum()
+    }
+}
+
+/// Select a policy by name. The open stack knows only `size`; an unknown
+/// name (e.g. a private `traffic` policy) returns None so the caller can
+/// error clearly rather than silently balancing on the wrong metric.
+pub fn policy_by_name(name: &str) -> Option<Box<dyn BalancePolicy>> {
+    match name {
+        "size" => Some(Box::new(SizePolicy)),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -151,6 +194,29 @@ mod tests {
             label: label.into(),
             fill,
         }
+    }
+
+    #[test]
+    fn size_policy_sums_per_slot_counts() {
+        let p = SizePolicy;
+        assert_eq!(p.name(), "size");
+        let stats = vec![
+            (("acme".to_string(), 10u16), 100u64),
+            (("acme".to_string(), 11u16), 250u64),
+            (("beta".to_string(), 12u16), 3u64),
+        ];
+        assert_eq!(p.pair_load(&stats), 353);
+        assert_eq!(p.pair_load(&[]), 0);
+    }
+
+    #[test]
+    fn policy_by_name_knows_only_size_in_open_stack() {
+        assert_eq!(
+            policy_by_name("size").expect("size policy exists").name(),
+            "size"
+        );
+        assert!(policy_by_name("traffic").is_none());
+        assert!(policy_by_name("nonsense").is_none());
     }
 
     #[test]

@@ -113,6 +113,46 @@ Exporter series backing it: `flint_node_sst_bytes{node,pair}`,
 `flint_pair_sst_bytes{pair}`, `flint_pair_capacity_bytes{pair}`,
 `flint_pair_days_to_80{pair}`, `flint_insight{kind="capacity_pressure"}`.
 
+## Scaling out: adding shards and moving slots
+
+A cluster grows by adding pairs. `flintctl expand <master>,<replica>` joins a
+pair **unranged** — it owns no slots and takes no traffic until slots move to
+it. Two mechanisms move slots onto the new capacity; both drive the same
+epoch-fenced `FLINTMIGRATEIN` cutover (a slot is served throughout, and the
+control plane records the new owner via `CPSETSLOT` at commit — no acked
+write is lost).
+
+**1. Automatic rebalancing (policy-driven).** With `--rebalance-deadband
+<frac>` the controller observes each pair's load every cycle, plans the
+minimum set of moves to bring the group within the deadband, and — with
+`--rebalance-execute` — ships them a few slots per cycle, re-planning from
+fresh observations each time (convergence by small steps; the deadband stops
+the loop at balance). *What "load" means is a policy*, selected with
+`--balance-policy`:
+
+  - **`size` (default, open stack).** Balance by data: a pair's load is the
+    sum of its per-slot key counts (`FLINTSLOTSTATS`; bytes later). This is
+    what "70% fill ⇒ expand → controller drains the pressured pair" above
+    uses. It is the right default — the pressure signal that triggers
+    expansion is a *capacity* signal.
+  - **`traffic` (Crestway managed plane).** Balance by request rate
+    (ops/second per slot) rather than bytes, so a small-but-hot slot range is
+    spread across pairs even when every pair is well under its size budget.
+    It plugs into the same `BalancePolicy` seam without changing the planner;
+    it needs per-slot ops metering the open stack does not emit, which is why
+    it ships with the managed service rather than the open repo.
+
+An unknown `--balance-policy` name is a startup error, not a silent fallback.
+
+**2. Operator-directed move.** When an operator wants a *specific* slot range
+on a *specific* destination — draining a noisy-neighbor range, pre-placing a
+known-hot tenant, or staging a planned migration — `flintctl migrate-slots
+<ns> <lo-hi> <src-pair> <dest-pair>` moves exactly that range, one slot at a
+time, and commits ownership to the CP. This is manual and outside the
+deadband loop: it does exactly what is asked, nothing more. Verified by
+`tools/migrate_slots_drill.sh` (range moves, CP records the new owner, keys
+intact, zero acked-write loss across the cutover).
+
 **Non-storage expansion signals** (rebalance-or-expand judgment calls,
 watched on the same dashboard): sustained per-node ops near the 100K
 ceiling with balanced slots (expand); proxy `active` conns pinned at the
