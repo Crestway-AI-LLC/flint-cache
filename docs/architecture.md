@@ -191,6 +191,13 @@ sequenceDiagram
    block cache, which is where "disk-first" keeps RAM-class latency for
    hot keys while the long tail lives on NVMe.
 
+## Failover
+
+Master failover — the planned graceful handoff and the unexpected
+crash/partition path, the epoch-fencing + lease + lag-cap invariants they
+rest on, and the argument for why two masters can never serve the same
+slot — has its own map in [failover.md](failover.md).
+
 ## Where the invariants are proven
 
 Every claim above has a runnable proof in `tools/`: replication parity and
