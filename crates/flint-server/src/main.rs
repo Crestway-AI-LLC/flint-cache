@@ -242,9 +242,25 @@ fn main() -> std::io::Result<()> {
                 loop {
                     match replica::full_sync_download(target, std::path::Path::new(&dir)) {
                         Ok(()) => break,
-                        Err(e) if e.to_string().contains("THROTTLED") && attempt < 120 => {
+                        // Retryable: the master admitting a herd (-THROTTLED)
+                        // or simply NOT LISTENING YET — a fleet boot starts
+                        // master and replica within the same second, and the
+                        // replica losing that race must wait, not die (the
+                        // CFN stack lost it; the smoke instance won it).
+                        // Genuinely malformed streams stay fatal.
+                        Err(e) if attempt < 120
+                            && (e.to_string().contains("THROTTLED")
+                                || matches!(
+                                    e.kind(),
+                                    std::io::ErrorKind::ConnectionRefused
+                                        | std::io::ErrorKind::ConnectionReset
+                                        | std::io::ErrorKind::ConnectionAborted
+                                        | std::io::ErrorKind::TimedOut
+                                        | std::io::ErrorKind::UnexpectedEof
+                                )) =>
+                        {
                             attempt += 1;
-                            eprintln!("full sync throttled by master; retry {attempt} in 1s");
+                            eprintln!("full sync not ready ({e}); retry {attempt} in 1s");
                             std::thread::sleep(std::time::Duration::from_secs(1));
                         }
                         Err(e) => return Err(e),
