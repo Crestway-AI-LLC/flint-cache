@@ -236,6 +236,49 @@ well before expiry.
 every component before the old is retired) has its own runbook:
 [runbooks/ca-rotation.md](runbooks/ca-rotation.md).
 
+## 6. Production on AWS: load balancing the proxy tier
+
+For a multi-proxy production fleet on AWS, front the proxies with a
+**Network Load Balancer (NLB)** — not an ALB. RESP is a raw TCP protocol,
+so the L7/HTTP ALB cannot speak it; the NLB is L4.
+
+Run the NLB in **TCP passthrough** (no TLS termination at the LB): the
+proxy keeps terminating client TLS with its edge cert and the client keeps
+verifying against the fleet CA, so the mTLS-to-edge model stays end to end.
+(The NLB *can* terminate with an ACM cert and re-encrypt to the proxy if
+you prefer certs in ACM — more moving parts; passthrough is the clean
+default.)
+
+What the NLB buys you:
+
+- **Health-based eviction in seconds.** An NLB target health check (a TCP
+  connect on the proxy port is sufficient — accepting = healthy) pulls an
+  unresponsive proxy out of rotation automatically, no DNS publisher and no
+  30-second client-retry window. This is the fast-failover the raw
+  per-tenant DNS model lacks.
+- **One stable, cross-AZ endpoint** that scales with the target group.
+- Negligible latency (L4 passthrough is microseconds against sub-ms reads).
+
+**One endpoint, token-scoped — the default shape.** Auth is by **token**,
+not by endpoint: a tenant's token maps to its namespace at whichever proxy
+it lands on. So every tenant connects to the *same* NLB endpoint
+(`cache.example.com`) and AUTHs with its own token — simpler than
+per-tenant DNS, and isolation is still real (stateless proxies, per-tenant
+ops/s + storage quotas, admission control). The per-tenant shuffle-shard
+**subset** (§4, `CPSETSUBSET` + `CPDNSZONE`) then becomes the
+**dedicated-isolation tier** for a whale that needs *physical* proxy
+separation — put its dedicated proxies behind their own NLB / target
+group — rather than the default routing model. The DNS-subset model still
+serves non-AWS deployments and anyone who prefers not to run an LB.
+
+**Spread across AZs.** Register proxies in multiple AZs behind the NLB
+(cross-AZ aware), and place each pair's master and replica in *different*
+AZs so an AZ loss is survivable — the topology the capacity model assumes.
+
+**Not the entry SKU.** The single-VM marketplace shape runs one proxy on
+the instance; adding an NLB there is pure cost. The NLB is the multi-VM
+production template (the follow-on to the single-VM CloudFormation stack).
+
 ## See also
 
 - [architecture.md](architecture.md) — the three planes; write and read paths.
