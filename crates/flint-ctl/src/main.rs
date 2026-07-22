@@ -23,6 +23,21 @@
 //!   controller on
 //!   agent 127.0.0.1:9464          shadow agent; the addr's port = metrics port
 //!
+//! Operator tunables (all OPTIONAL; absent = the binary's compiled default).
+//! Externalized so they change with a config edit + `stop`/`start` — no
+//! rebuild, no redeploy:
+//!   wal-fsync-ms 500      node: WAL fsync cadence (host-loss RPO bound)
+//!   lag-soft-ms 500       node: replication soft lag cap (delays writes)
+//!   lag-hard-ms 1000      node: replication hard lag cap (sheds; RPO)
+//!   min-replicas 1        node: min-replicas-to-write safety gate
+//!   max-conns 10000       node + proxy: connection admission cap
+//!   async-queue-cap 4096  node: async write-queue depth
+//!   cache-ttl-ms 300      proxy: near-cache TTL default
+//!   cache-max-bytes N     proxy: near-cache byte budget default
+//!   poll-ms 200           controller: failure-probe interval (RTO)
+//!   confirm 3             controller: consecutive fails before promote
+//!   lease-ttl-ms 3000     controller: master lease TTL
+//!
 //! v1 runs LOCAL processes (spawn-a-fresh-node model); a remote runner slots
 //! in behind the same command surface later. Two properties this tool leans
 //! on by design: controllers are STATELESS (ADR-0004) so `expand` simply
@@ -64,6 +79,22 @@ struct Inventory {
     /// private/public IP, a DNS endpoint. localhost/127.0.0.1 are always
     /// included.
     edge_sans: Vec<String>,
+    /// Operator TUNABLES, externalized so they change with a config edit +
+    /// restart — no rebuild, no redeploy. All optional; an absent key leaves
+    /// the binary's compiled default. flintctl threads each into the
+    /// spawned process's flags at bootstrap/start, so `stop` + edit +
+    /// `start` applies new values.
+    wal_fsync_ms: Option<u64>, // node: WAL fsync cadence (host-loss bound)
+    lag_soft_ms: Option<u64>,      // node: replication soft lag cap (delay)
+    lag_hard_ms: Option<u64>,      // node: replication hard lag cap (RPO shed)
+    min_replicas: Option<u32>,     // node: min-replicas-to-write safety gate
+    max_conns: Option<u64>,        // node + proxy: connection admission cap
+    async_queue_cap: Option<u64>,  // node: async write-queue depth
+    cache_ttl_ms: Option<u64>,     // proxy: near-cache TTL default
+    cache_max_bytes: Option<u64>,  // proxy: near-cache byte budget default
+    ctl_poll_ms: Option<u64>,      // controller: failure-probe interval (RTO)
+    ctl_confirm: Option<u32>,      // controller: consecutive fails to promote
+    ctl_lease_ttl_ms: Option<u64>, // controller: master lease TTL
 }
 
 fn parse_inventory(path: &str) -> Inventory {
@@ -93,6 +124,18 @@ fn parse_inventory(path: &str) -> Inventory {
             "admin-token" => inv.admin_token = Some(val.to_string()),
             "client-tls" => inv.client_tls = val == "on",
             "edge-san" => inv.edge_sans.push(val.to_string()),
+            // Operator tunables (see the Inventory struct).
+            "wal-fsync-ms" => inv.wal_fsync_ms = val.parse().ok(),
+            "lag-soft-ms" => inv.lag_soft_ms = val.parse().ok(),
+            "lag-hard-ms" => inv.lag_hard_ms = val.parse().ok(),
+            "min-replicas" => inv.min_replicas = val.parse().ok(),
+            "max-conns" => inv.max_conns = val.parse().ok(),
+            "async-queue-cap" => inv.async_queue_cap = val.parse().ok(),
+            "cache-ttl-ms" => inv.cache_ttl_ms = val.parse().ok(),
+            "cache-max-bytes" => inv.cache_max_bytes = val.parse().ok(),
+            "poll-ms" => inv.ctl_poll_ms = val.parse().ok(),
+            "confirm" => inv.ctl_confirm = val.parse().ok(),
+            "lease-ttl-ms" => inv.ctl_lease_ttl_ms = val.parse().ok(),
             other => panic!("inventory: unknown key {other:?}"),
         }
     }
@@ -255,6 +298,49 @@ fn internal_args(inv: &Inventory) -> Vec<String> {
         "--internal-key".into(),
         format!("{d}/certs/int.key"),
     ]
+}
+
+/// Node (flint-server) operator tunables from the inventory — durability,
+/// RPO, and admission knobs. Absent keys leave the binary's default, so
+/// this never changes behaviour it wasn't explicitly told to.
+fn node_tuning_args(inv: &Inventory) -> Vec<String> {
+    let mut a = Vec::new();
+    let mut push = |flag: &str, v: String| a.extend([flag.to_string(), v]);
+    if let Some(v) = inv.wal_fsync_ms {
+        push("--wal-fsync-ms", v.to_string());
+    }
+    if let Some(v) = inv.lag_soft_ms {
+        push("--lag-soft-ms", v.to_string());
+    }
+    if let Some(v) = inv.lag_hard_ms {
+        push("--lag-hard-ms", v.to_string());
+    }
+    if let Some(v) = inv.min_replicas {
+        push("--min-replicas-to-write", v.to_string());
+    }
+    if let Some(v) = inv.max_conns {
+        push("--max-conns", v.to_string());
+    }
+    if let Some(v) = inv.async_queue_cap {
+        push("--async-queue-cap", v.to_string());
+    }
+    a
+}
+
+/// Proxy operator tunables: near-cache defaults + admission.
+fn proxy_tuning_args(inv: &Inventory) -> Vec<String> {
+    let mut a = Vec::new();
+    let mut push = |flag: &str, v: String| a.extend([flag.to_string(), v]);
+    if let Some(v) = inv.cache_ttl_ms {
+        push("--cache-ttl-ms", v.to_string());
+    }
+    if let Some(v) = inv.cache_max_bytes {
+        push("--cache-max-bytes", v.to_string());
+    }
+    if let Some(v) = inv.max_conns {
+        push("--max-conns", v.to_string());
+    }
+    a
 }
 
 /// Wait until the controller journals `Supervised` (auto-failover armed)
@@ -430,6 +516,7 @@ fn start_pair_nodes(inv: &Inventory, pair: &[String]) {
             args.extend(["--replica-of".into(), pair[0].clone()]);
         }
         args.extend(internal_args(inv));
+        args.extend(node_tuning_args(inv));
         spawn(inv, &format!("node-{port}"), "flint-server", &args);
         // The master must be up before its replicas dial in.
         if i == 0 {
@@ -451,10 +538,11 @@ fn start_controller(inv: &Inventory) {
         pairs_spec,
         "--id".into(),
         "ctl".into(),
+        // RTO timing knobs — inventory-tunable (config edit + restart).
         "--poll-ms".into(),
-        "200".into(),
+        inv.ctl_poll_ms.unwrap_or(200).to_string(),
         "--confirm".into(),
-        "3".into(),
+        inv.ctl_confirm.unwrap_or(3).to_string(),
         "--journal".into(),
         inv.cp[0].clone(),
         "--snapshot-root".into(),
@@ -463,6 +551,9 @@ fn start_controller(inv: &Inventory) {
         "--commit-cp".into(),
         inv.cp[0].clone(),
     ];
+    if let Some(v) = inv.ctl_lease_ttl_ms {
+        args.extend(["--lease-ttl-ms".into(), v.to_string()]);
+    }
     args.extend(internal_args(inv));
     spawn(inv, "controller", "flint-controller", &args);
 }
@@ -572,6 +663,7 @@ fn launch(inv: &Inventory, register: bool) {
             proxy.clone(),
         ];
         args.extend(internal_args(inv));
+        args.extend(proxy_tuning_args(inv));
         if inv.client_tls {
             // ADR-0006 D2: the packaged default is an encrypted front door.
             args.extend([
@@ -758,6 +850,7 @@ fn add_replica(inv: &Inventory, inventory_path: &str, pair_ref: &str, new: &str)
         master.clone(),
     ];
     args.extend(internal_args(inv));
+    args.extend(node_tuning_args(inv));
     spawn(inv, &format!("node-{port}"), "flint-server", &args);
     assert!(
         wait_pong(new, &tls, Duration::from_secs(15)),
@@ -834,6 +927,7 @@ fn swap_node(inv: &Inventory, inventory_path: &str, bad: &str, new: &str) {
         master.clone(),
     ];
     args.extend(internal_args(inv));
+    args.extend(node_tuning_args(inv));
     spawn(inv, &format!("node-{port}"), "flint-server", &args);
     assert!(
         wait_pong(new, &tls, Duration::from_secs(15)),
@@ -968,6 +1062,7 @@ fn roll_node(
         master.to_string(),
     ];
     args.extend(internal_args(inv));
+    args.extend(node_tuning_args(inv));
     spawn_env(inv, &format!("node-{port}"), "flint-server", &args, envs);
     if !wait_pong(addr, &tls, Duration::from_secs(15)) {
         return Err(format!("{addr} did not come back after the binary swap"));
