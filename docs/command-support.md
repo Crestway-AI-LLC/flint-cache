@@ -48,6 +48,15 @@ ZREMRANGEBYSCORE, ZREMRANGEBYRANK, ZSCAN (MATCH, COUNT).
   (mid-migration write or fenced stale replica; the proxy retries/falls
   back for you).
 
+## Planned
+
+- **JSON** (near roadmap): a native document type — JSON.SET / JSON.GET /
+  JSON.DEL / JSON.TYPE / numeric and array ops, addressed by JSONPath.
+  Flint's own implementation (conformance-tested against a reference the
+  way every type is — not the RedisJSON module), built on the existing
+  envelope encoding, so large documents live beyond RAM like any other
+  value. Slot-sharded and single-key, consistent with the tenancy model.
+
 ## Not yet supported
 
 - **Keyspace SCAN** (deferred: cursor semantics across migrating shard
