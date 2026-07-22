@@ -48,6 +48,9 @@ planes, and a normal write and read traced end to end.
 [docs/failover.md](docs/failover.md) covers failover — master handoff
 (planned and crash/partition) and why split-brain is impossible, plus the
 stateless proxy-instance failure case.
+[docs/self-hosting.md](docs/self-hosting.md) is the deploy-on-your-own-
+hardware guide — sizing, the config file, monitoring, users, and
+credential rotation.
 
 `tools/` holds the drill scripts — end-to-end proofs (replication parity,
 failover RTO, slot migration and cutover, quota enforcement, token and
