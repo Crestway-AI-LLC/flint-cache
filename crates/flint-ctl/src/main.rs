@@ -1088,12 +1088,15 @@ fn failover(inv: &Inventory, node: &str) {
     status(inv);
 }
 
-/// `flintctl decommission-node <addr> [--force]`: drop ONE member from its
-/// pair, leaving the pair running on its remaining node(s). The inverse of
-/// `add-replica`. Refuses a live master (fail it over first), the pair's
-/// last node (that is a whole shard — out of scope), or a removal that
-/// would drop the pair below the master's min-replicas-to-write and freeze
-/// writes (unless --force).
+/// `flintctl decommission-node <addr> [--force] [--drain-ms N]`: drop ONE
+/// member from its pair, leaving the pair running on its remaining node(s).
+/// The inverse of `add-replica`. Refuses a live master (fail it over
+/// first), the pair's last node (that is a whole shard — out of scope), or
+/// a removal that would drop the pair below the master's
+/// min-replicas-to-write and freeze writes (unless --force). Drains traffic
+/// gracefully first: a time-bounded `drain_ms` wait (default 5000) during
+/// which the node stays up and serving while proxies route off it, then it
+/// is stopped.
 fn decommission_node(
     inv: &Inventory,
     inventory_path: &str,
@@ -1378,7 +1381,7 @@ fn main() {
                 .position(|a| a == "--drain-ms")
                 .and_then(|i| rest.get(i + 1))
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(3000);
+                .unwrap_or(5000);
             decommission_node(&inv, &inv_path, addr, force, drain_ms);
         }
         "tenant-reads" => {
