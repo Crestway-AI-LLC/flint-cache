@@ -1094,7 +1094,13 @@ fn failover(inv: &Inventory, node: &str) {
 /// last node (that is a whole shard — out of scope), or a removal that
 /// would drop the pair below the master's min-replicas-to-write and freeze
 /// writes (unless --force).
-fn decommission_node(inv: &Inventory, inventory_path: &str, addr: &str, force: bool) {
+fn decommission_node(
+    inv: &Inventory,
+    inventory_path: &str,
+    addr: &str,
+    force: bool,
+    drain_ms: u64,
+) {
     let tls = tls_client(inv);
     let Some(pair_idx) = inv.pairs.iter().position(|p| p.iter().any(|a| a == addr)) else {
         panic!("{addr} is not in any pair in the inventory");
@@ -1137,14 +1143,23 @@ fn decommission_node(inv: &Inventory, inventory_path: &str, addr: &str, force: b
              Add a replacement first, or pass --force to proceed anyway."
         );
     }
-    eprintln!("== decommission-node: removing {addr} from pair {pair_idx}");
+    eprintln!("== decommission-node: draining {addr} out of pair {pair_idx}");
     let remaining: Vec<String> = members.iter().filter(|a| *a != addr).cloned().collect();
+    // GRACEFUL DRAIN, in order: remove the node from the topology FIRST
+    // (proxies stop routing replica-reads to it on the next snapshot), let
+    // that converge while the node is STILL UP AND SERVING, and only THEN
+    // stop it — so no read, not even one the proxy would otherwise absorb
+    // and retry on the master, ever hits a dying node. Writes never touch a
+    // replica, so they are unaffected throughout. Bounded; the snapshot
+    // push is sub-second, so a few seconds covers several cycles.
     call(
         &inv.cp[0],
         &tls,
         &["CPSETPAIR", &pair_idx.to_string(), &remaining.join(",")],
     )
     .expect("CPSETPAIR");
+    eprintln!("  draining {drain_ms}ms for proxies to route off {addr} (still serving)");
+    std::thread::sleep(Duration::from_millis(drain_ms));
     kill_pidfile(&inv.statedir, &format!("node-{}", port_of(addr)));
     let raw = std::fs::read_to_string(inventory_path).expect("inventory");
     let updated = raw.replace(
@@ -1356,9 +1371,15 @@ fn main() {
         "decommission-node" => {
             let addr = rest
                 .first()
-                .expect("usage: decommission-node <node-addr> [--force]");
+                .expect("usage: decommission-node <node-addr> [--force] [--drain-ms N]");
             let force = rest.iter().any(|a| a == "--force");
-            decommission_node(&inv, &inv_path, addr, force);
+            let drain_ms = rest
+                .iter()
+                .position(|a| a == "--drain-ms")
+                .and_then(|i| rest.get(i + 1))
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(3000);
+            decommission_node(&inv, &inv_path, addr, force, drain_ms);
         }
         "tenant-reads" => {
             let (name, mode) = (

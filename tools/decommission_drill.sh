@@ -96,7 +96,7 @@ echo "  refused: '$(grep -o 'live MASTER.*failover [^ ]*' /tmp/decom-g1.log | he
 
 VICTIM=$(status | awk '/replica/{print $3; exit}')
 echo "== DECOMMISSION the replica ($VICTIM) — pair keeps serving master-only"
-./target/release/flintctl -f "$INV" decommission-node "$VICTIM" 2>&1 | grep -E 'removing|complete' | sed 's/^/  /'
+./target/release/flintctl -f "$INV" decommission-node "$VICTIM" 2>&1 | grep -E 'draining|complete' | sed 's/^/  /'
 sleep 1
 [ "$(nodes_live)" -eq 1 ] || { echo "FAIL: expected 1 node after decommission, got $(nodes_live)"; exit 1; }
 grep -q "7001,127.0.0.1:7002" "$INV" && { echo "FAIL: inventory still lists both nodes"; exit 1; }
