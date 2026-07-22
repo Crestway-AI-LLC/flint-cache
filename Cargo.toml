@@ -15,6 +15,7 @@ members = [
     "crates/flint-controlplane",
     "crates/flint-journal",
     "crates/flint-ctl",
+    "crates/flint-exporter",
 ]
 default-members = [
     "crates/flint-slot",
@@ -29,6 +30,7 @@ default-members = [
     "crates/flint-controlplane",
     "crates/flint-journal",
     "crates/flint-ctl",
+    "crates/flint-exporter",
 ]
 
 [workspace.package]

@@ -125,17 +125,31 @@ the metrics source you build on:
   `cert_days_remaining`. **`PROXYLATENCY`** gives per-lane read/write
   histograms.
 
-To feed **Prometheus + Grafana**, run a small exporter that polls those
-commands on a scrape interval and re-emits them as Prometheus text (they
-are already `field:value` lines — a ~40-line script). Point Prometheus at
-the exporter, and Grafana at Prometheus:
+The open stack ships a reference exporter, **`flint-exporter`**, that polls
+those commands and serves them as Prometheus text on `/metrics`. Point it
+at your nodes and proxies (mesh certs for the nodes, the same CA verifies
+the proxy edge):
+
+```sh
+flint-exporter --port 9100 \
+  --node 127.0.0.1:7001 --node 127.0.0.1:7002 \
+  --proxy 127.0.0.1:7379 \
+  --ca state/certs/ca.crt --cert state/certs/int.crt --key state/certs/int.key
+# omit --ca/--cert/--key for a fully plaintext dev fleet;
+# add --admin-token <tok> if your proxy admin surface is gated.
+```
+
+It emits `flint_up{instance,role}` / `flint_proxy_up{instance}` plus every
+numeric `FLINTINFO`/`PROXYSTATS` field as a gauge
+(`flint_lag_ms`, `flint_wal_fsync_ms`, `flint_proxy_cache_hits_total`, …).
+Point Prometheus at it, and Grafana at Prometheus:
 
 ```yaml
 # prometheus.yml
 scrape_configs:
   - job_name: flint
     static_configs:
-      - targets: ['127.0.0.1:9100']   # your FLINTINFO/PROXYSTATS exporter
+      - targets: ['127.0.0.1:9100']   # flint-exporter
 ```
 
 Then build panels on the fields above — the essential four: **replication
@@ -143,10 +157,10 @@ lag** (`lag_ms` / `seq_lag` per pair), **role/liveness** (`role`,
 `live_replicas`), **cert expiry** (`cert_days_remaining` — alert well
 before zero), and **proxy throughput + cache hit rate**.
 
-> The managed Crestway plane ships a turnkey metrics exporter (the fleet
-> agent) and curated Grafana dashboards; on the open stack you point your
-> own exporter at the commands above. The data is identical — only the
-> packaging differs.
+> `flint-exporter` is intentionally lean — a starting point to extend. The
+> managed Crestway plane ships a fuller metrics agent (insights, capacity
+> triggers) and curated Grafana dashboards; the underlying data is the
+> same commands above.
 
 Alert on: `seq_lag` climbing without draining, `live_replicas` dropping
 below your `min-replicas`, `cert_days_remaining` under ~14, and sustained

@@ -1,0 +1,14 @@
+[package]
+name = "flint-exporter"
+description = "Reference Prometheus exporter: scrapes FLINTINFO/PROXYSTATS from an open Flint fleet and serves /metrics"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+flint-tls = { path = "../flint-tls" }
+flint-resp = { path = "../flint-resp" }
+
+[lints]
+workspace = true
