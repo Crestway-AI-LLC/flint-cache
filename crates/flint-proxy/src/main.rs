@@ -1828,9 +1828,12 @@ fn main() -> std::io::Result<()> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(DEFAULT_MAX_CONNS);
 
-    let listener = TcpListener::bind(("127.0.0.1", port))?;
+    // --bind: the listener address. Loopback by default; 0.0.0.0 for a
+    // front door serving external clients (the marketplace single-VM shape).
+    let bind = arg("--bind").unwrap_or_else(|| "127.0.0.1".into());
+    let listener = TcpListener::bind((bind.as_str(), port))?;
     eprintln!(
-        "flint-proxy listening on 127.0.0.1:{port} ({}, max-conns {max_conns})",
+        "flint-proxy listening on {bind}:{port} ({}, max-conns {max_conns})",
         if tls.is_some() { "TLS" } else { "plaintext" }
     );
     for stream in listener.incoming() {

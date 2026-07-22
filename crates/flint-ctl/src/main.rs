@@ -57,6 +57,11 @@ struct Inventory {
     /// bootstrap mints an EDGE cert (IP/localhost SANs, same CA) and passes
     /// --tls-cert/--tls-key; tenants verify with the cluster CA.
     client_tls: bool,
+    /// Extra subjectAltNames for the EDGE cert (`edge-san <ip-or-dns>`,
+    /// repeatable): the addresses real clients dial — an instance's
+    /// private/public IP, a DNS endpoint. localhost/127.0.0.1 are always
+    /// included.
+    edge_sans: Vec<String>,
 }
 
 fn parse_inventory(path: &str) -> Inventory {
@@ -85,6 +90,7 @@ fn parse_inventory(path: &str) -> Inventory {
             "capacity" => inv.capacity_bytes = val.parse().ok(),
             "admin-token" => inv.admin_token = Some(val.to_string()),
             "client-tls" => inv.client_tls = val == "on",
+            "edge-san" => inv.edge_sans.push(val.to_string()),
             other => panic!("inventory: unknown key {other:?}"),
         }
     }
@@ -316,7 +322,7 @@ fn mint_certs(inv: &Inventory) {
         "openssl req -x509 -newkey rsa:2048 -nodes -keyout {d}/ca.key -out {d}/ca.crt -days 365 \
          -subj /CN=flint-internal-ca -addext basicConstraints=critical,CA:TRUE 2>/dev/null"
     ));
-    resign_leaves(&d, &sh);
+    resign_leaves(&d, &sh, &inv.edge_sans);
     eprintln!("  minted internal CA + component cert + edge cert");
 }
 
@@ -325,7 +331,7 @@ fn mint_certs(inv: &Inventory) {
 /// `rotate-certs` (ADR-0006 D4): overwriting int.crt/int.key in place makes
 /// each component's hot-reload watcher pick up the new leaf, no restart. The
 /// CA is untouched, so old and new leaves both verify during the roll.
-fn resign_leaves(d: &str, sh: &dyn Fn(&str)) {
+fn resign_leaves(d: &str, sh: &dyn Fn(&str), edge_sans: &[String]) {
     sh(&format!(
         "openssl req -newkey rsa:2048 -nodes -keyout {d}/int.key -out {d}/int.csr \
          -subj /CN=flint-internal 2>/dev/null"
@@ -340,10 +346,29 @@ fn resign_leaves(d: &str, sh: &dyn Fn(&str)) {
          -subj /CN=flint-edge 2>/dev/null"
     ));
     sh(&format!(
-        "printf 'subjectAltName=IP:127.0.0.1,DNS:localhost\nextendedKeyUsage=serverAuth\nbasicConstraints=CA:FALSE' > {d}/edge-ext.cnf && \
+        "printf 'subjectAltName={sans}\nextendedKeyUsage=serverAuth\nbasicConstraints=CA:FALSE' > {d}/edge-ext.cnf && \
          openssl x509 -req -in {d}/edge.csr -CA {d}/ca.crt -CAkey {d}/ca.key -CAcreateserial \
-         -out {d}/edge.crt -days 365 -extfile {d}/edge-ext.cnf 2>/dev/null"
+         -out {d}/edge.crt -days 365 -extfile {d}/edge-ext.cnf 2>/dev/null",
+        sans = edge_san_list(edge_sans),
     ));
+}
+
+/// The edge cert's SAN list: loopback always, plus every `edge-san` entry —
+/// IPs as IP: entries, everything else as DNS:.
+fn edge_san_list(extra: &[String]) -> String {
+    let mut sans = vec!["IP:127.0.0.1".to_string(), "DNS:localhost".to_string()];
+    for e in extra {
+        let e = e.trim();
+        if e.is_empty() {
+            continue;
+        }
+        if e.parse::<std::net::IpAddr>().is_ok() {
+            sans.push(format!("IP:{e}"));
+        } else {
+            sans.push(format!("DNS:{e}"));
+        }
+    }
+    sans.join(",")
 }
 
 /// `flintctl rotate-certs`: re-sign the leaf certs from the CA in place; the
@@ -363,7 +388,7 @@ fn rotate_certs(inv: &Inventory) {
             .unwrap_or(false);
         assert!(ok, "cert step failed: {cmd}");
     };
-    resign_leaves(&d, &sh);
+    resign_leaves(&d, &sh, &inv.edge_sans);
     println!("re-signed mesh + edge leaf certs from the CA; components hot-reload within ~2s");
 }
 
@@ -527,9 +552,18 @@ fn launch(inv: &Inventory, register: bool) {
 
     // 3. Routing plane.
     for proxy in &inv.proxies {
+        // The inventory addr's HOST is the bind address (0.0.0.0 serves
+        // external clients — the marketplace shape; 127.0.0.1 stays the
+        // loopback default).
+        let bind_host = proxy
+            .rsplit_once(':')
+            .map(|(h, _)| h)
+            .unwrap_or("127.0.0.1");
         let mut args = vec![
             "--port".to_string(),
             port_of(proxy).to_string(),
+            "--bind".to_string(),
+            bind_host.to_string(),
             "--control-plane".into(),
             cp.clone(),
             "--advertise".into(),
