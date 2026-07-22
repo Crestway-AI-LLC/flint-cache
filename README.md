@@ -26,7 +26,9 @@ Everything needed to run AND operate Flint yourself:
 - **`flint-ctl`** — cluster lifecycle from one inventory file: bootstrap
   (with full mTLS cert minting), expand, add-replica, swap-node, graceful
   failover, decommission-node, tenant management, canary upgrades,
-  rotate-certs / rotate-admin.
+  rotate-certs / rotate-admin, and hot config reload (edit the inventory,
+  `reload` pushes durability/RPO/admission knobs to the running fleet — no
+  restart).
 - **`flint-controller`** — automatic failover: detect → verify → promote →
   fence, with leases so a partitioned master self-demotes.
 - **`flint-storage`** — the engine: envelope encoding, typed stores, GC,

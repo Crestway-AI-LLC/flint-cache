@@ -35,6 +35,7 @@ disagrees with the oracle, the case is wrong.
     tools/cert_reload_fleet_drill.sh  # leaf rotation under live traffic
     tools/controlplane_ha_drill.sh    # Raft CP: election, failover, watch push
     tools/decommission_drill.sh       # graceful failover + single-node retire, guarded
+    tools/config_file_drill.sh        # config-file tunables + hot reload (no restart)
     tools/federation_plumbing_drill.sh
 
 ## 4. Chaos (the honesty step)
