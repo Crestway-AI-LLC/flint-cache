@@ -78,12 +78,29 @@ check lag_hard_ms 2000
 check min_replicas_to_write 1
 check max_conns 4096
 
-echo "== CHANGE a value in the config, restart, prove it took (no rebuild)"
-sed -i.bak 's/wal-fsync-ms 250/wal-fsync-ms 1000/' "$INV"
-./target/release/flintctl -f "$INV" stop >/dev/null 2>&1
-sleep 1
-./target/release/flintctl -f "$INV" start >/dev/null 2>&1
+echo "== HOT RELOAD: change values in the config, 'flintctl reload', NO restart"
+# Capture the master's pid so we can prove it never restarted.
+PID_BEFORE=$(cat "$STATE/pids/node-7001.pid")
+sed -i.bak 's/wal-fsync-ms 250/wal-fsync-ms 1000/; s/lag-hard-ms 2000/lag-hard-ms 3000/; s/max-conns 4096/max-conns 8192/' "$INV"
+./target/release/flintctl -f "$INV" reload 2>&1 | sed 's/^/  /'
 check wal_fsync_ms 1000
-echo "  changed 250 -> 1000 with an edit + restart; same binary"
+check lag_hard_ms 3000
+check max_conns 8192
+PID_AFTER=$(cat "$STATE/pids/node-7001.pid")
+[ "$PID_BEFORE" = "$PID_AFTER" ] || { echo "FAIL: node restarted (pid $PID_BEFORE -> $PID_AFTER)"; exit 1; }
+echo "  applied live via FLINTCONFIG; node pid unchanged ($PID_AFTER) — no restart"
 
-echo "PASS: operator tunables are config-file driven — edit + restart, no rebuild/redeploy"
+echo "== FLINTCONFIG dump reflects the live values"
+DUMP=$(python3 -c '
+import socket, ssl, os
+d="/tmp/flint-cfg-state/certs"
+ctx=ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT); ctx.load_verify_locations(f"{d}/ca.crt")
+ctx.load_cert_chain(f"{d}/int.crt", f"{d}/int.key"); ctx.check_hostname=False
+s=ctx.wrap_socket(socket.create_connection(("127.0.0.1",7001),timeout=5),server_hostname="flint-internal")
+s.sendall(b"*1\r\n$11\r\nFLINTCONFIG\r\n")
+print(s.recv(65536).decode(errors="replace"))
+')
+echo "$DUMP" | grep -q 'wal-fsync-ms:1000' || { echo "FAIL: dump missing wal-fsync-ms:1000"; echo "$DUMP"; exit 1; }
+echo "  FLINTCONFIG dump: hot knobs reported live"
+
+echo "PASS: operator tunables are config-file driven AND hot-reloadable (flintctl reload, no restart, no rebuild)"

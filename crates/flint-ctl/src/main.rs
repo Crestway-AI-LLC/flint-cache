@@ -24,19 +24,20 @@
 //!   agent 127.0.0.1:9464          shadow agent; the addr's port = metrics port
 //!
 //! Operator tunables (all OPTIONAL; absent = the binary's compiled default).
-//! Externalized so they change with a config edit + `stop`/`start` — no
-//! rebuild, no redeploy:
-//!   wal-fsync-ms 500      node: WAL fsync cadence (host-loss RPO bound)
-//!   lag-soft-ms 500       node: replication soft lag cap (delays writes)
-//!   lag-hard-ms 1000      node: replication hard lag cap (sheds; RPO)
-//!   min-replicas 1        node: min-replicas-to-write safety gate
-//!   max-conns 10000       node + proxy: connection admission cap
-//!   async-queue-cap 4096  node: async write-queue depth
-//!   cache-ttl-ms 300      proxy: near-cache TTL default
-//!   cache-max-bytes N     proxy: near-cache byte budget default
-//!   poll-ms 200           controller: failure-probe interval (RTO)
-//!   confirm 3             controller: consecutive fails before promote
-//!   lease-ttl-ms 3000     controller: master lease TTL
+//! Edit the file, then `flintctl reload` to push the HOT knobs to the
+//! running fleet (no restart), or `stop`/`start` for the restart-only ones.
+//! No rebuild, no redeploy either way.
+//!   wal-fsync-ms 500      node  HOT   WAL fsync cadence (host-loss RPO)
+//!   lag-soft-ms 500       node  HOT   soft lag cap (delays writes)
+//!   lag-hard-ms 1000      node  HOT   hard lag cap (sheds; RPO bound)
+//!   min-replicas 1        node  HOT   min-replicas-to-write gate
+//!   max-conns 10000       node  HOT   connection admission cap
+//!   async-queue-cap 4096  node  restart  async write-queue depth
+//!   cache-ttl-ms 300      proxy HOT   near-cache TTL (via PROXYCACHE)
+//!   cache-max-bytes N     proxy HOT   near-cache byte budget
+//!   poll-ms 200           ctlr  restart  failure-probe interval (RTO)
+//!   confirm 3             ctlr  restart  consecutive fails before promote
+//!   lease-ttl-ms 3000     ctlr  restart  master lease TTL
 //!
 //! v1 runs LOCAL processes (spawn-a-fresh-node model); a remote runner slots
 //! in behind the same command surface later. Two properties this tool leans
@@ -298,6 +299,66 @@ fn internal_args(inv: &Inventory) -> Vec<String> {
         "--internal-key".into(),
         format!("{d}/certs/int.key"),
     ]
+}
+
+/// `flintctl reload`: re-read the config file and PUSH the hot-reloadable
+/// tunables to the RUNNING fleet — no restart. Node knobs go over the mesh
+/// via FLINTCONFIG; proxy near-cache via PROXYCACHE. Restart-only knobs
+/// (async-queue-cap, controller timing) are reported as needing stop/start.
+/// A node that doesn't answer is warned, not fatal — reload is best-effort
+/// convergence, `status` shows the truth.
+fn reload(inv: &Inventory) {
+    let tls = tls_client(inv);
+    let node_kv: [(&str, Option<String>); 5] = [
+        ("wal-fsync-ms", inv.wal_fsync_ms.map(|v| v.to_string())),
+        ("lag-soft-ms", inv.lag_soft_ms.map(|v| v.to_string())),
+        ("lag-hard-ms", inv.lag_hard_ms.map(|v| v.to_string())),
+        (
+            "min-replicas-to-write",
+            inv.min_replicas.map(|v| v.to_string()),
+        ),
+        ("max-conns", inv.max_conns.map(|v| v.to_string())),
+    ];
+    for pair in &inv.pairs {
+        for node in pair {
+            for (k, v) in node_kv.iter() {
+                if let Some(val) = v {
+                    match call(node, &tls, &["FLINTCONFIG", k, val]) {
+                        Ok(Value::Simple(_)) => println!("  {node}: {k}={val}"),
+                        other => eprintln!("  {node}: FLINTCONFIG {k} rejected: {other:?}"),
+                    }
+                }
+            }
+        }
+    }
+    if inv.cache_ttl_ms.is_some() || inv.cache_max_bytes.is_some() {
+        // PROXYCACHE needs both; the compiled defaults fill an unset one.
+        let ttl = inv.cache_ttl_ms.unwrap_or(300).to_string();
+        let maxb = inv.cache_max_bytes.unwrap_or(256 * 1024 * 1024).to_string();
+        for proxy in &inv.proxies {
+            if let Some(tok) = &inv.admin_token {
+                let _ = call(proxy, &tls, &["AUTH", tok]);
+            }
+            match call(proxy, &tls, &["PROXYCACHE", &ttl, &maxb]) {
+                Ok(Value::Simple(_)) => println!("  {proxy}: cache ttl={ttl}ms max={maxb}B"),
+                other => eprintln!("  {proxy}: PROXYCACHE rejected: {other:?}"),
+            }
+        }
+    }
+    let mut restart_only = Vec::new();
+    if inv.async_queue_cap.is_some() {
+        restart_only.push("async-queue-cap");
+    }
+    if inv.ctl_poll_ms.is_some() || inv.ctl_confirm.is_some() || inv.ctl_lease_ttl_ms.is_some() {
+        restart_only.push("controller timing (poll-ms/confirm/lease-ttl-ms)");
+    }
+    if !restart_only.is_empty() {
+        println!(
+            "note: {} not hot-reloadable — apply with stop/start",
+            restart_only.join(", ")
+        );
+    }
+    println!("== reload complete (hot knobs pushed to the running fleet)");
 }
 
 /// Node (flint-server) operator tunables from the inventory — durability,
@@ -1462,6 +1523,7 @@ fn main() {
             );
             add_replica(&inv, &inv_path, pair, new);
         }
+        "reload" => reload(&inv),
         "failover" => {
             let node = rest.first().expect("usage: failover <node-addr>");
             failover(&inv, node);
@@ -1635,7 +1697,7 @@ fn main() {
         "stop" => stop(&inv),
         other => {
             panic!(
-                "unknown command {other:?} (bootstrap|start|status|tenant|tenant-reads|tenant-cache|tenant-async|tenant-federate|tenant-quota|rotate-admin|rotate-certs|proxy-cache|expand|swap-node|add-replica|failover|decommission-node|upgrade|stop)"
+                "unknown command {other:?} (bootstrap|start|status|reload|tenant|tenant-reads|tenant-cache|tenant-async|tenant-federate|tenant-quota|rotate-admin|rotate-certs|proxy-cache|expand|swap-node|add-replica|failover|decommission-node|upgrade|stop)"
             )
         }
     }

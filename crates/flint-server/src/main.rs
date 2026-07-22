@@ -452,25 +452,37 @@ fn main() -> std::io::Result<()> {
     // an fsync every cadence, bounding a HOST failure's loss window (power,
     // kernel, instance loss) to the cadence. Together with the lag-hard
     // replication cap this is the structural basis of the published RPO.
+    // The cadence lives in WAL_FSYNC_MS (atomic) and the tick reads it EVERY
+    // iteration, so FLINTCONFIG retunes — or toggles (0 = disabled) — it
+    // live, no restart. The thread always runs (on rocks); at 0 it idles a
+    // fixed poll and skips the fsync.
     #[cfg(feature = "rocks")]
     {
         let wal_fsync_ms: u64 = arg("--wal-fsync-ms")
             .and_then(|v| v.parse().ok())
             .unwrap_or(500);
         WAL_FSYNC_MS.store(wal_fsync_ms, Ordering::Relaxed);
-        if let Some(kv) = rocks.clone()
-            && wal_fsync_ms > 0
-        {
+        if wal_fsync_ms == 0 {
+            eprintln!("wal fsync cadence DISABLED (--wal-fsync-ms 0): host-loss window unbounded");
+        }
+        if let Some(kv) = rocks.clone() {
             std::thread::spawn(move || {
                 loop {
-                    std::thread::sleep(std::time::Duration::from_millis(wal_fsync_ms));
+                    let cadence = WAL_FSYNC_MS.load(Ordering::Relaxed);
+                    if cadence == 0 {
+                        std::thread::sleep(std::time::Duration::from_millis(500));
+                        continue;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(cadence));
+                    // Re-check: a retune to 0 during the sleep means skip.
+                    if WAL_FSYNC_MS.load(Ordering::Relaxed) == 0 {
+                        continue;
+                    }
                     if let Err(e) = kv.flush_wal_sync() {
                         eprintln!("wal fsync tick failed: {e}");
                     }
                 }
             });
-        } else if wal_fsync_ms == 0 {
-            eprintln!("wal fsync cadence DISABLED (--wal-fsync-ms 0): host-loss window unbounded");
         }
     }
 
@@ -929,6 +941,64 @@ fn execute(
             }
         ));
     }
+    if args
+        .first()
+        .is_some_and(|n| n.eq_ignore_ascii_case(b"FLINTCONFIG"))
+    {
+        // FLINTCONFIG [<key> <value>]: hot-reload a runtime tunable with no
+        // restart. No args -> dump current values. Valid on any node (admin
+        // op, not a tenant write); the values are read live on the hot
+        // paths, so a change takes effect on the next write/tick/accept.
+        let field = |k: &str, v: String| format!("{k}:{v}");
+        if args.len() == 1 {
+            let dump = [
+                field(
+                    "wal-fsync-ms",
+                    WAL_FSYNC_MS.load(Ordering::Relaxed).to_string(),
+                ),
+                field("lag-soft-ms", hub.lag_soft_ms().to_string()),
+                field("lag-hard-ms", hub.lag_hard_ms().to_string()),
+                field(
+                    "min-replicas-to-write",
+                    hub.min_replicas_to_write().to_string(),
+                ),
+                field("max-conns", MAX_CONNS.load(Ordering::Relaxed).to_string()),
+            ]
+            .join("\r\n");
+            return Value::Bulk(Some(dump.into_bytes()));
+        }
+        let (Some(key), Some(val)) = (
+            args.get(1).map(|k| k.to_ascii_lowercase()),
+            args.get(2)
+                .and_then(|v| std::str::from_utf8(v).ok())
+                .map(str::to_string),
+        ) else {
+            return Value::Error("ERR usage: FLINTCONFIG [<key> <value>]".into());
+        };
+        macro_rules! parse {
+            () => {
+                match val.parse() {
+                    Ok(v) => v,
+                    Err(_) => return Value::Error(format!("ERR bad value {val:?}")),
+                }
+            };
+        }
+        match key.as_slice() {
+            b"wal-fsync-ms" => WAL_FSYNC_MS.store(parse!(), Ordering::Relaxed),
+            b"lag-soft-ms" => hub.set_lag_soft_ms(parse!()),
+            b"lag-hard-ms" => hub.set_lag_hard_ms(parse!()),
+            b"min-replicas-to-write" => hub.set_min_replicas_to_write(parse!()),
+            b"max-conns" => MAX_CONNS.store(std::cmp::max(1, parse!()), Ordering::Relaxed),
+            other => {
+                return Value::Error(format!(
+                    "ERR unknown or restart-only config key {:?} (hot: wal-fsync-ms, \
+                     lag-soft-ms, lag-hard-ms, min-replicas-to-write, max-conns)",
+                    String::from_utf8_lossy(other)
+                ));
+            }
+        }
+        return Value::Simple("OK".into());
+    }
     let ro = read_only.load(Ordering::Relaxed);
     let is_write = args
         .first()
@@ -1106,12 +1176,12 @@ fn execute(
             );
         }
         match hub.lag_ms(now) {
-            Some(lag) if lag >= hub.lag_hard_ms => {
+            Some(lag) if lag >= hub.lag_hard_ms() => {
                 return Value::Error(
                     "THROTTLED replication lag exceeds limit, retry with backoff".into(),
                 );
             }
-            Some(lag) if lag >= hub.lag_soft_ms => {
+            Some(lag) if lag >= hub.lag_soft_ms() => {
                 std::thread::sleep(std::time::Duration::from_millis(2));
             }
             _ => {}
@@ -1346,9 +1416,9 @@ fn flintinfo(
         hub.live_replica_count(now),
         hub.lag_ms(now)
             .map_or_else(|| "none".into(), |l| l.to_string()),
-        soft = hub.lag_soft_ms,
-        hard = hub.lag_hard_ms,
-        minr = hub.min_replicas_to_write,
+        soft = hub.lag_soft_ms(),
+        hard = hub.lag_hard_ms(),
+        minr = hub.min_replicas_to_write(),
         build = build_version(),
         sst = rocks.as_ref().map(|kv| kv.sst_bytes()).unwrap_or(0),
         fsa = FULLSYNC_ACTIVE.load(Ordering::Relaxed),

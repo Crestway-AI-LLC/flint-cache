@@ -12,7 +12,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 /// ACKs older than this mean the replica link is down.
 pub const LIVENESS_WINDOW_MS: u64 = 2_000;
@@ -28,18 +28,18 @@ pub const DEFAULT_LAG_HARD_MS: u64 = 1_000;
 const MAX_SAMPLES: usize = 512;
 
 pub struct ReplHub {
-    /// Soft cap (ms): delay writes beyond this lag.
-    pub lag_soft_ms: u64,
-    /// Hard cap (ms): shed writes beyond this lag — the RPO bound.
-    pub lag_hard_ms: u64,
-    /// Writes are shed while fewer than this many replicas are LIVE
-    /// (Redis min-replicas-to-write semantics). This closes the widowed-
-    /// master hole the lag cap alone leaves open: with no live replica
-    /// there is no lag to measure, so without this gate an isolated master
-    /// would accept unbounded at-risk writes — e.g. when a partition
-    /// strands it with a controller that keeps renewing its lease. 0
-    /// (default) disables the gate: a standalone master must serve freely.
-    pub min_replicas_to_write: u32,
+    /// Soft/hard lag caps (ms) and the min-replicas gate — ATOMIC so they
+    /// hot-reload live (FLINTCONFIG) without a restart. Read on the write
+    /// path via the getters below.
+    ///   soft: delay writes beyond this lag.
+    ///   hard: shed writes beyond this lag — the RPO bound.
+    ///   min_replicas: shed while fewer than this many replicas are LIVE
+    ///     (Redis min-replicas-to-write). Closes the widowed-master hole
+    ///     the lag cap alone leaves open (no live replica => no lag to
+    ///     measure); 0 disables it (a standalone master serves freely).
+    lag_soft_ms: AtomicU64,
+    lag_hard_ms: AtomicU64,
+    min_replicas_to_write: AtomicU32,
     next_id: AtomicU64,
     /// Per-replica ack state: id -> (acked_seq, last_ack_ms). The RPO
     /// reference is the freshest LIVE replica: a dead replica's cursor
@@ -59,13 +59,40 @@ impl Default for ReplHub {
 impl ReplHub {
     pub fn new(lag_soft_ms: u64, lag_hard_ms: u64, min_replicas_to_write: u32) -> Self {
         Self {
-            lag_soft_ms,
-            lag_hard_ms: lag_hard_ms.max(lag_soft_ms),
-            min_replicas_to_write,
+            lag_soft_ms: AtomicU64::new(lag_soft_ms),
+            lag_hard_ms: AtomicU64::new(lag_hard_ms.max(lag_soft_ms)),
+            min_replicas_to_write: AtomicU32::new(min_replicas_to_write),
             next_id: AtomicU64::new(1),
             replicas: Mutex::new(HashMap::new()),
             samples: Mutex::new(VecDeque::new()),
         }
+    }
+
+    /// Current soft/hard lag caps and min-replicas gate (hot-reloadable).
+    pub fn lag_soft_ms(&self) -> u64 {
+        self.lag_soft_ms.load(Ordering::Relaxed)
+    }
+    pub fn lag_hard_ms(&self) -> u64 {
+        self.lag_hard_ms.load(Ordering::Relaxed)
+    }
+    pub fn min_replicas_to_write(&self) -> u32 {
+        self.min_replicas_to_write.load(Ordering::Relaxed)
+    }
+
+    /// Live retune (FLINTCONFIG). Hard is clamped >= soft so the invariant
+    /// the constructor enforces can never be broken at runtime either.
+    pub fn set_lag_soft_ms(&self, v: u64) {
+        self.lag_soft_ms.store(v, Ordering::Relaxed);
+        if self.lag_hard_ms.load(Ordering::Relaxed) < v {
+            self.lag_hard_ms.store(v, Ordering::Relaxed);
+        }
+    }
+    pub fn set_lag_hard_ms(&self, v: u64) {
+        let clamped = v.max(self.lag_soft_ms.load(Ordering::Relaxed));
+        self.lag_hard_ms.store(clamped, Ordering::Relaxed);
+    }
+    pub fn set_min_replicas_to_write(&self, v: u32) {
+        self.min_replicas_to_write.store(v, Ordering::Relaxed);
     }
 
     /// True when the write path must shed because fewer replicas are live
@@ -74,8 +101,8 @@ impl ReplHub {
     /// acking, so the unavailability window after losing a replica is
     /// detect + respawn + first ack, not a full resync.
     pub fn below_write_quorum(&self, now_ms: u64) -> bool {
-        self.min_replicas_to_write > 0
-            && (self.live_replica_count(now_ms) as u32) < self.min_replicas_to_write
+        let min = self.min_replicas_to_write();
+        min > 0 && (self.live_replica_count(now_ms) as u32) < min
     }
 
     /// A replication connection announces itself; ACKs carry its id.
@@ -230,13 +257,18 @@ mod cap_tests {
     #[test]
     fn caps_are_configurable_and_ordered() {
         let hub = ReplHub::new(200, 800, 0);
-        assert_eq!((hub.lag_soft_ms, hub.lag_hard_ms), (200, 800));
+        assert_eq!((hub.lag_soft_ms(), hub.lag_hard_ms()), (200, 800));
+        // Live retune keeps the hard >= soft invariant.
+        hub.set_lag_hard_ms(100);
+        assert_eq!(hub.lag_hard_ms(), 200);
+        hub.set_lag_soft_ms(500);
+        assert_eq!((hub.lag_soft_ms(), hub.lag_hard_ms()), (500, 500));
         // Hard cap can never sit below the soft cap.
         let clamped = ReplHub::new(900, 300, 0);
-        assert_eq!(clamped.lag_hard_ms, 900);
+        assert_eq!(clamped.lag_hard_ms(), 900);
         let d = ReplHub::default();
         assert_eq!(
-            (d.lag_soft_ms, d.lag_hard_ms),
+            (d.lag_soft_ms(), d.lag_hard_ms()),
             (DEFAULT_LAG_SOFT_MS, DEFAULT_LAG_HARD_MS)
         );
     }
