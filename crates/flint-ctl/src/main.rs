@@ -9,6 +9,8 @@
 //!   flintctl -f cluster.flint tenant add <name> <token> <ns> [k]
 //!   flintctl -f cluster.flint expand <a,b[,c]>      new pair + reroll ctl
 //!   flintctl -f cluster.flint swap-node <bad> <new> fresh replica + CPSETPAIR
+//!   flintctl -f cluster.flint failover <node>       graceful master handoff
+//!   flintctl -f cluster.flint decommission-node <a> drop one member from a pair
 //!   flintctl -f cluster.flint stop          kill everything it started
 //!
 //! Inventory (line-based, # comments):
@@ -997,6 +999,173 @@ fn roll_node(
     }
 }
 
+/// The loss-critical failover core, shared by `upgrade` and `failover`:
+/// fence at an epoch above everything either member has seen, then DEMOTE
+/// the old master FIRST (it stops acking writes), DRAIN (its replica
+/// applies every acked write), and only THEN PROMOTE the new master.
+/// Demote-first is what makes it lossless — a promote-first window lets the
+/// old master ack writes the new lineage never contains; the no-master gap
+/// between demote and promote is absorbed by the proxy's retry budget
+/// (latency, not loss). The drain also guarantees the promotion target is
+/// caught up, so a lagging replica never freezes an incomplete dataset.
+/// Returns the promoted epoch counter.
+fn controlled_failover(
+    inv: &Inventory,
+    tls: &Option<Arc<flint_tls::ClientConfig>>,
+    pair: &[String],
+    old_master: &str,
+    new_master: &str,
+) -> u32 {
+    let _ = inv;
+    let next = pair
+        .iter()
+        .filter_map(|a| info_field(a, tls, "role_epoch:"))
+        .filter_map(|e| epoch_counter(&e))
+        .max()
+        .unwrap_or(1)
+        + 1;
+    match call(old_master, tls, &["FLINTDEMOTE", "0", &next.to_string()]) {
+        Ok(Value::Simple(_)) => {}
+        Ok(Value::Error(e)) if e.starts_with("FENCED") => {}
+        other => panic!("demotion of {old_master} failed: {other:?}"),
+    }
+    let drain_deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if info_field(old_master, tls, "seq_lag:").as_deref() == Some("0") {
+            break;
+        }
+        assert!(
+            Instant::now() < drain_deadline,
+            "replica never drained the demoted master {old_master}'s tail"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    match call(
+        new_master,
+        tls,
+        &["FLINTPROMOTE", "0", &(next + 1).to_string()],
+    ) {
+        Ok(Value::Simple(_)) => {}
+        other => panic!(
+            "promotion of {new_master} at (0,{}) failed: {other:?}",
+            next + 1
+        ),
+    }
+    next + 1
+}
+
+/// `flintctl failover <node>`: a graceful, epoch-fenced handoff of a LIVE
+/// master to its replica — the same demote→drain→promote core the upgrade
+/// uses — after which the ex-master rejoins as a fresh replica of the new
+/// master (wipe + checkpoint resync, the demote contract). No build change.
+/// The one clean way to hand off a master on demand: run it before taking a
+/// master out for maintenance or `decommission-node`.
+fn failover(inv: &Inventory, node: &str) {
+    let tls = tls_client(inv);
+    let Some(pair_idx) = inv.pairs.iter().position(|p| p.iter().any(|a| a == node)) else {
+        panic!("{node} is not in any pair in the inventory");
+    };
+    let pair = &inv.pairs[pair_idx];
+    if info_field(node, &tls, "role:").as_deref() != Some("master") {
+        panic!("{node} is not the live master of pair {pair_idx}; nothing to fail over");
+    }
+    let new_master = pair
+        .iter()
+        .find(|a| *a != node && info_field(a, &tls, "role:").as_deref() == Some("replica"))
+        .cloned()
+        .unwrap_or_else(|| {
+            panic!("pair {pair_idx} has no reachable replica to promote; add one first")
+        });
+    eprintln!("== failover: pair {pair_idx}, {node} -> {new_master}");
+    let promoted = controlled_failover(inv, &tls, pair, node, &new_master);
+    eprintln!("  {node} demoted + drained; {new_master} promoted at (0,{promoted})");
+    // The ex-master rejoins as a fresh replica of the NEW master — no build
+    // change (empty envs), wipe = the demote contract.
+    if let Err(e) = roll_node(inv, node, &new_master, &[], &None, true) {
+        panic!("ex-master {node} failed to rejoin as a replica: {e}");
+    }
+    eprintln!("== failover complete: {new_master} is master; {node} rejoined as replica");
+    status(inv);
+}
+
+/// `flintctl decommission-node <addr> [--force]`: drop ONE member from its
+/// pair, leaving the pair running on its remaining node(s). The inverse of
+/// `add-replica`. Refuses a live master (fail it over first), the pair's
+/// last node (that is a whole shard — out of scope), or a removal that
+/// would drop the pair below the master's min-replicas-to-write and freeze
+/// writes (unless --force).
+fn decommission_node(inv: &Inventory, inventory_path: &str, addr: &str, force: bool) {
+    let tls = tls_client(inv);
+    let Some(pair_idx) = inv.pairs.iter().position(|p| p.iter().any(|a| a == addr)) else {
+        panic!("{addr} is not in any pair in the inventory");
+    };
+    let members = inv.pairs[pair_idx].clone();
+    if members.len() <= 1 {
+        panic!(
+            "{addr} is the last node in pair {pair_idx} — that is the whole shard, \
+             not a single-node decommission (out of scope)"
+        );
+    }
+    if info_field(addr, &tls, "role:").as_deref() == Some("master") {
+        panic!(
+            "{addr} is the live MASTER of pair {pair_idx}; run \
+             `flintctl -f <inv> failover {addr}` first, then decommission it"
+        );
+    }
+    // min-replicas guard: what live replica count remains, vs what the
+    // master needs to accept writes?
+    let master = members
+        .iter()
+        .find(|a| info_field(a, &tls, "role:").as_deref() == Some("master"))
+        .unwrap_or_else(|| panic!("pair {pair_idx} has no reachable master"));
+    let min_repl: u32 = info_field(master, &tls, "min_replicas_to_write:")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let live_replicas: u32 = info_field(master, &tls, "live_replicas:")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let addr_live = info_field(addr, &tls, "role:").as_deref() == Some("replica");
+    let after = if addr_live {
+        live_replicas.saturating_sub(1)
+    } else {
+        live_replicas
+    };
+    if min_repl > 0 && after < min_repl && !force {
+        panic!(
+            "removing {addr} would leave pair {pair_idx} with {after} live replica(s), \
+             below min-replicas-to-write={min_repl}: the master would FREEZE writes. \
+             Add a replacement first, or pass --force to proceed anyway."
+        );
+    }
+    eprintln!("== decommission-node: removing {addr} from pair {pair_idx}");
+    let remaining: Vec<String> = members.iter().filter(|a| *a != addr).cloned().collect();
+    call(
+        &inv.cp[0],
+        &tls,
+        &["CPSETPAIR", &pair_idx.to_string(), &remaining.join(",")],
+    )
+    .expect("CPSETPAIR");
+    kill_pidfile(&inv.statedir, &format!("node-{}", port_of(addr)));
+    let raw = std::fs::read_to_string(inventory_path).expect("inventory");
+    let updated = raw.replace(
+        &format!("pair {}", members.join(",")),
+        &format!("pair {}", remaining.join(",")),
+    );
+    std::fs::write(inventory_path, updated).expect("inventory update");
+    if inv.controller {
+        let t0 = now_ms();
+        let mut inv2 = inv.clone();
+        inv2.pairs[pair_idx] = remaining;
+        kill_pidfile(&inv.statedir, "controller");
+        start_controller(&inv2);
+        wait_supervised(&inv2, inv2.pairs.len(), t0);
+    }
+    eprintln!(
+        "== decommission-node complete: {addr} removed; pair {pair_idx} runs on its remaining node(s)"
+    );
+    status(inv);
+}
+
 /// Canary upgrade: one replica first, soak against the fleet journal, then
 /// the remaining replicas, then masters LAST via an epoch-fenced controlled
 /// failover (promote the already-upgraded replica, demote the old master,
@@ -1094,50 +1263,11 @@ fn upgrade(inv: &Inventory, version_tag: Option<String>, soak_ms: u64) {
             .find(|a| *a != old_master)
             .expect("pair has an upgraded replica")
             .clone();
-        // Fencing epoch: above everything either member has seen.
-        let next = pair
-            .iter()
-            .filter_map(|a| info_field(a, &tls, "role_epoch:"))
-            .filter_map(|e| epoch_counter(&e))
-            .max()
-            .unwrap_or(1)
-            + 1;
-        // ORDER IS LOSS-CRITICAL: demote FIRST (the old master stops
-        // acking writes), DRAIN (its replica applies every acked write),
-        // THEN promote. Promote-first opens a window where the proxy still
-        // routes to the old master, which acks writes the new lineage will
-        // never contain. The no-master gap between demote and promote is
-        // absorbed by the proxy's retry budget: latency, not loss.
-        match call(old_master, &tls, &["FLINTDEMOTE", "0", &next.to_string()]) {
-            Ok(Value::Simple(_)) => {}
-            Ok(Value::Error(e)) if e.starts_with("FENCED") => {}
-            other => panic!("demotion of {old_master} failed: {other:?}"),
-        }
-        let drain_deadline = Instant::now() + Duration::from_secs(30);
-        loop {
-            if info_field(old_master, &tls, "seq_lag:").as_deref() == Some("0") {
-                break;
-            }
-            assert!(
-                Instant::now() < drain_deadline,
-                "pair {i}: replica never drained the demoted master's tail"
-            );
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        match call(
-            &new_master,
-            &tls,
-            &["FLINTPROMOTE", "0", &(next + 1).to_string()],
-        ) {
-            Ok(Value::Simple(_)) => {}
-            other => panic!(
-                "promotion of {new_master} at (0,{})failed: {other:?}",
-                next + 1
-            ),
-        }
+        // The loss-critical demote->drain->promote core (shared with the
+        // `failover` verb).
+        let promoted = controlled_failover(inv, &tls, pair, old_master, &new_master);
         eprintln!(
-            "  pair {i}: {old_master} demoted + drained; {new_master} promoted at (0,{})",
-            next + 1
+            "  pair {i}: {old_master} demoted + drained; {new_master} promoted at (0,{promoted})"
         );
         if let Err(e) = roll_node(inv, old_master, &new_master, &envs, &expect, true) {
             panic!("old master respawn failed at {old_master}: {e}");
@@ -1218,6 +1348,17 @@ fn main() {
                     .expect("usage: add-replica <pair-idx|member> <new>"),
             );
             add_replica(&inv, &inv_path, pair, new);
+        }
+        "failover" => {
+            let node = rest.first().expect("usage: failover <node-addr>");
+            failover(&inv, node);
+        }
+        "decommission-node" => {
+            let addr = rest
+                .first()
+                .expect("usage: decommission-node <node-addr> [--force]");
+            let force = rest.iter().any(|a| a == "--force");
+            decommission_node(&inv, &inv_path, addr, force);
         }
         "tenant-reads" => {
             let (name, mode) = (
@@ -1375,7 +1516,7 @@ fn main() {
         "stop" => stop(&inv),
         other => {
             panic!(
-                "unknown command {other:?} (bootstrap|start|status|tenant|tenant-reads|tenant-cache|tenant-async|tenant-federate|tenant-quota|rotate-admin|rotate-certs|proxy-cache|expand|swap-node|add-replica|upgrade|stop)"
+                "unknown command {other:?} (bootstrap|start|status|tenant|tenant-reads|tenant-cache|tenant-async|tenant-federate|tenant-quota|rotate-admin|rotate-certs|proxy-cache|expand|swap-node|add-replica|failover|decommission-node|upgrade|stop)"
             )
         }
     }
