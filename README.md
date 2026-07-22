@@ -24,8 +24,9 @@ Everything needed to run AND operate Flint yourself:
   versioned snapshots to proxies; runs durable single-node or Raft-replicated
   (openraft) for HA; self-service token rotation with dual-version windows.
 - **`flint-ctl`** — cluster lifecycle from one inventory file: bootstrap
-  (with full mTLS cert minting), expand, add-replica, swap-node, tenant
-  management, canary upgrades, rotate-certs / rotate-admin.
+  (with full mTLS cert minting), expand, add-replica, swap-node, graceful
+  failover, decommission-node, tenant management, canary upgrades,
+  rotate-certs / rotate-admin.
 - **`flint-controller`** — automatic failover: detect → verify → promote →
   fence, with leases so a partitioned master self-demotes.
 - **`flint-storage`** — the engine: envelope encoding, typed stores, GC,

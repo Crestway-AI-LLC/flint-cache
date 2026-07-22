@@ -34,6 +34,7 @@ disagrees with the oracle, the case is wrong.
     tools/token_rotation_drill.sh     # dual-version token roll, zero downtime
     tools/cert_reload_fleet_drill.sh  # leaf rotation under live traffic
     tools/controlplane_ha_drill.sh    # Raft CP: election, failover, watch push
+    tools/decommission_drill.sh       # graceful failover + single-node retire, guarded
     tools/federation_plumbing_drill.sh
 
 ## 4. Chaos (the honesty step)
