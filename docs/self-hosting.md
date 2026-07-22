@@ -66,8 +66,8 @@ fill target.
   benched hot-tier budget).
 
 > The full capacity model — the detection-sweep math, expansion triggers,
-> and per-tenant sizing — is maintained separately in the operator
-> handbook; the numbers above are its load-bearing conclusions.
+> and per-tenant sizing — is in [capacity-model.md](capacity-model.md); the
+> numbers above are its load-bearing conclusions.
 
 ## 2. Configuration files
 
@@ -174,8 +174,8 @@ flintctl -f cluster.flint tenant-async acme on     # async write queue
 TLS), their **token**, the **CA certificate** (`state/certs/ca.crt`, to
 verify TLS), and their **limits**. They connect with any Redis/Valkey
 client — the namespace is transparent (their token maps to it at the
-proxy; they never type it). A ready-to-send tenant onboarding guide with
-sample code lives in the operator handbook.
+proxy; they never type it). Hand them [tenant-guide.md](tenant-guide.md):
+a ready-to-send onboarding guide with connect-and-go sample code.
 
 Notes:
 - Tokens are stored **hashed** (SHA-256) — you cannot recover a token,
@@ -226,6 +226,8 @@ every component before the old is retired) has its own runbook:
 
 - [architecture.md](architecture.md) — the three planes; write and read paths.
 - [failover.md](failover.md) — master handoff (planned + crash), proxy failure.
+- [capacity-model.md](capacity-model.md) — sizing the data plane in depth.
+- [tenant-guide.md](tenant-guide.md) — what a tenant receives and how to use it.
 - [command-support.md](command-support.md) — the supported command surface.
 - [release-checklist.md](release-checklist.md) — gates + how a release
   upgrades a running fleet (`flintctl upgrade`: canary, soak, masters last).
