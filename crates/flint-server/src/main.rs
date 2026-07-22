@@ -248,16 +248,17 @@ fn main() -> std::io::Result<()> {
                         // replica losing that race must wait, not die (the
                         // CFN stack lost it; the smoke instance won it).
                         // Genuinely malformed streams stay fatal.
-                        Err(e) if attempt < 120
-                            && (e.to_string().contains("THROTTLED")
-                                || matches!(
-                                    e.kind(),
-                                    std::io::ErrorKind::ConnectionRefused
-                                        | std::io::ErrorKind::ConnectionReset
-                                        | std::io::ErrorKind::ConnectionAborted
-                                        | std::io::ErrorKind::TimedOut
-                                        | std::io::ErrorKind::UnexpectedEof
-                                )) =>
+                        Err(e)
+                            if attempt < 120
+                                && (e.to_string().contains("THROTTLED")
+                                    || matches!(
+                                        e.kind(),
+                                        std::io::ErrorKind::ConnectionRefused
+                                            | std::io::ErrorKind::ConnectionReset
+                                            | std::io::ErrorKind::ConnectionAborted
+                                            | std::io::ErrorKind::TimedOut
+                                            | std::io::ErrorKind::UnexpectedEof
+                                    )) =>
                         {
                             attempt += 1;
                             eprintln!("full sync not ready ({e}); retry {attempt} in 1s");
