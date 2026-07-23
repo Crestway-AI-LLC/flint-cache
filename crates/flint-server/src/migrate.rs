@@ -30,6 +30,43 @@ use crate::RocksHandle;
 #[cfg(feature = "rocks")]
 use crate::{commands, internal_connect};
 
+/// Average-rate limiter for the migration bulk copy. Reads the live
+/// `MIGRATE_RATE_BYTES` cap (bytes/sec; 0 = unlimited) after each flush and
+/// sleeps so cumulative throughput stays under it. Keeps a rebalance copy —
+/// above all a traffic-policy move shipping the HOTTEST slots — from
+/// saturating disk/net and inflating live p99. Reading the cap per flush makes
+/// it hot-reloadable (FLINTCONFIG) mid-migration.
+#[cfg(feature = "rocks")]
+struct Pacer {
+    start: std::time::Instant,
+    sent: u64,
+}
+
+#[cfg(feature = "rocks")]
+impl Pacer {
+    fn new() -> Self {
+        Self {
+            start: std::time::Instant::now(),
+            sent: 0,
+        }
+    }
+
+    /// Account `n` freshly-sent bytes, then sleep if we are ahead of the cap.
+    fn pace(&mut self, n: usize) {
+        self.sent += n as u64;
+        let rate = crate::MIGRATE_RATE_BYTES.load(std::sync::atomic::Ordering::Relaxed);
+        if rate == 0 {
+            return;
+        }
+        // Time this many bytes SHOULD have taken at the cap; sleep the deficit.
+        let required = std::time::Duration::from_secs_f64(self.sent as f64 / rate as f64);
+        let elapsed = self.start.elapsed();
+        if required > elapsed {
+            std::thread::sleep(required - elapsed);
+        }
+    }
+}
+
 /// Source side of a slot move: ship every row of `slot` (all CFs) as a bulk
 /// snapshot, then stream the slot-filtered live tail so writes that landed
 /// during the copy also reach the destination. Ownership does NOT change here
@@ -96,6 +133,7 @@ pub(crate) fn flintmigrateout(
     // periodic flushes, so neither the row list nor the encode buffer ever
     // holds a whole slot in memory.
     let mut bulk_rows: u64 = 0;
+    let mut pacer = Pacer::new();
     for prefix in &prefixes {
         out.clear();
         let mut io_err: Option<std::io::Error> = None;
@@ -110,11 +148,13 @@ pub(crate) fn flintmigrateout(
             );
             bulk_rows += 1;
             if out.len() >= 1 << 20 {
+                let n = out.len();
                 if let Err(e) = stream.write_all(&out) {
                     io_err = Some(e);
                     return false;
                 }
                 out.clear();
+                pacer.pace(n); // cap the copy rate right after each 1MB flush
             }
             true
         });
@@ -122,7 +162,9 @@ pub(crate) fn flintmigrateout(
             return Err(e);
         }
         if !out.is_empty() {
+            let n = out.len();
             stream.write_all(&out)?;
+            pacer.pace(n);
         }
     }
     out.clear();

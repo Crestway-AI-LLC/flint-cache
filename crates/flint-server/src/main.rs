@@ -11,6 +11,7 @@
 //! rejects mutating commands with -READONLY.
 
 mod commands;
+mod heat;
 mod migrate;
 mod repl_hub;
 mod write_lock;
@@ -96,6 +97,14 @@ static FULLSYNC_ACTIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::Atom
 // WAL fsync cadence in ms (0 = disabled), for FLINTINFO. Rocks-only.
 #[cfg_attr(not(feature = "rocks"), allow(dead_code))]
 static WAL_FSYNC_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+// Slot-migration copy rate cap in bytes/sec (0 = unlimited). The source of a
+// FLINTMIGRATEIN paces its bulk+tail stream to this, so rebalancing — above
+// all a traffic-policy move, which by definition ships the HOTTEST slots —
+// doesn't saturate disk/net and inflate live p99. Read live by the stream and
+// hot-reloadable via FLINTCONFIG. Rocks-only.
+#[cfg_attr(not(feature = "rocks"), allow(dead_code))]
+static MIGRATE_RATE_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Releases a full-sync slot on any exit (including a mid-stream error), so a
 /// dropped connection can never leak a slot and wedge the cap.
@@ -462,6 +471,11 @@ fn main() -> std::io::Result<()> {
             .and_then(|v| v.parse().ok())
             .unwrap_or(500);
         WAL_FSYNC_MS.store(wal_fsync_ms, Ordering::Relaxed);
+        // Slot-migration copy-rate cap (bytes/sec; 0 = unlimited, the default).
+        let migrate_rate_bytes: u64 = arg("--migrate-rate-bytes")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        MIGRATE_RATE_BYTES.store(migrate_rate_bytes, Ordering::Relaxed);
         if wal_fsync_ms == 0 {
             eprintln!("wal fsync cadence DISABLED (--wal-fsync-ms 0): host-loss window unbounded");
         }
@@ -963,6 +977,10 @@ fn execute(
                     hub.min_replicas_to_write().to_string(),
                 ),
                 field("max-conns", MAX_CONNS.load(Ordering::Relaxed).to_string()),
+                field(
+                    "migrate-rate-bytes",
+                    MIGRATE_RATE_BYTES.load(Ordering::Relaxed).to_string(),
+                ),
             ]
             .join("\r\n");
             return Value::Bulk(Some(dump.into_bytes()));
@@ -989,10 +1007,12 @@ fn execute(
             b"lag-hard-ms" => hub.set_lag_hard_ms(parse!()),
             b"min-replicas-to-write" => hub.set_min_replicas_to_write(parse!()),
             b"max-conns" => MAX_CONNS.store(std::cmp::max(1, parse!()), Ordering::Relaxed),
+            b"migrate-rate-bytes" => MIGRATE_RATE_BYTES.store(parse!(), Ordering::Relaxed),
             other => {
                 return Value::Error(format!(
                     "ERR unknown or restart-only config key {:?} (hot: wal-fsync-ms, \
-                     lag-soft-ms, lag-hard-ms, min-replicas-to-write, max-conns)",
+                     lag-soft-ms, lag-hard-ms, min-replicas-to-write, max-conns, \
+                     migrate-rate-bytes)",
                     String::from_utf8_lossy(other)
                 ));
             }
@@ -1143,6 +1163,23 @@ fn execute(
     {
         return migrate::flintslotstats(store);
     }
+    // FLINTSLOTHEAT: per-slot cumulative op counts — the traffic-balance
+    // signal (ops/sec = delta between two scrapes / elapsed). First bulk is a
+    // header "uptime_ms <ms>"; the rest are "slot ops" for non-empty slots.
+    if args
+        .first()
+        .is_some_and(|n| n.eq_ignore_ascii_case(b"FLINTSLOTHEAT"))
+    {
+        let mut rows = vec![Value::Bulk(Some(
+            format!("uptime_ms {}", heat::uptime_ms()).into_bytes(),
+        ))];
+        rows.extend(
+            heat::snapshot()
+                .into_iter()
+                .map(|(slot, ops)| Value::Bulk(Some(format!("{slot} {ops}").into_bytes()))),
+        );
+        return Value::Array(Some(rows));
+    }
     // FLINTSLOTABORT <slot>: clear an IN-FLIGHT record (rollback an Importing
     // or unfreeze a Migrating). Refuses to touch a terminal Moved override —
     // that is settled ownership, undone only by moving the slot back.
@@ -1163,6 +1200,14 @@ fn execute(
         && let Some(reply) = migrate::check_slot_gate(rocks, conn_ns, args, is_write)
     {
         return reply;
+    }
+    // Per-slot heat: count every keyed op destined for a slot this node owns
+    // (the slot gate above already redirected/shed the ones it doesn't). Done
+    // before the throttle/queue branches diverge so async-queued writes are
+    // counted too. Cheap (a CRC16 + relaxed add); FLINTSLOTHEAT exposes it for
+    // the traffic-balance policy.
+    if let Some(k) = commands::command_key(args) {
+        heat::record_key(k);
     }
     // Lag-cap backpressure: the write path enforces the RPO bound. The
     // min-replicas gate comes first — with no live replica there is no lag
