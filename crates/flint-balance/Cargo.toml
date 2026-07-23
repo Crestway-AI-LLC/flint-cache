@@ -1,0 +1,10 @@
+[package]
+name = "flint-balance"
+description = "Metric-agnostic rebalance planner + balance-policy seam: given per-pair load, decide which pairs shed load to which (deterministic, hysteretic). Shared by the controller (size policy) and any policy that feeds it a different load metric."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true

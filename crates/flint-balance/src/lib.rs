@@ -1,10 +1,17 @@
 // SPDX-License-Identifier: Elastic-2.0
-//! Rebalance planner: given a group's per-pair fill/heat map, decide which
-//! pairs should shed load to which (docs/design.md §2.3). Pure and
-//! deterministic — the controller feeds it observed fills and (today, via
-//! --rebalance-deadband) LOGS the plan as a dry run. Executing the returned
-//! moves via FLINTMIGRATEIN, gated by the min-replicas/lease safety rules, is
-//! the follow-on step.
+//! Rebalance planner + balance-policy seam (docs/design.md §2.3). Given a
+//! group's per-pair load map, decide which pairs should shed load to which.
+//! Pure and deterministic — the caller feeds it observed loads and executes
+//! the returned moves via FLINTMIGRATEIN, gated by the min-replicas/lease
+//! safety rules.
+//!
+//! This is a *shared* library, not controller-internal: the open
+//! `flint-controller` drives it with the SIZE policy (balance by data), and
+//! the managed plane drives the SAME `plan_moves`/`select_units` with a
+//! different load metric (traffic — ops/second per slot, read from the
+//! server's FLINTSLOTHEAT). The planner is metric-agnostic; a policy only
+//! changes the load NUMBER fed in. Keeping it here means both planes share
+//! one deterministic planner and one set of invariants.
 //!
 //! Two properties the design requires (ADR-0004 obligation #2):
 //!   - Deterministic: identical inputs yield an identical plan, regardless of
@@ -15,10 +22,10 @@
 //!     deadband prevents OSCILLATION — two controllers (or successive ticks)
 //!     shuffling load back and forth around a balanced point.
 //!
-//! Granularity is pair-level (from, to, approximate amount). Choosing the
-//! specific slots to move to make up the amount needs per-slot heat, which
-//! the nodes do not expose yet; that selection is a follow-on. Fill is an
-//! opaque load unit (key count today via DBSIZE; bytes later).
+//! Granularity is pair-level (from, to, approximate amount); `select_units`
+//! then chooses the specific (namespace, slot) units to make up the amount
+//! from the donor's per-slot stats. Fill is an opaque load unit — key count
+//! (SIZE, via FLINTSLOTSTATS) or op rate (TRAFFIC, via FLINTSLOTHEAT).
 
 /// One pair's observed load.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -147,12 +154,11 @@ pub fn select_units(stats: &[((String, u16), u64)], amount: u64, cap: usize) -> 
 // A policy turns a pair's per-slot stats into the single LOAD number the
 // planner balances on. This is the seam that decides WHAT "balanced" means.
 // The open stack ships one policy — SIZE (balance so every pair holds a
-// similar amount of DATA). Other policies (e.g. TRAFFIC — balance so every
-// pair serves a similar number of ops/second) plug in behind the same trait
-// without touching the planner; the traffic policy is the Crestway plane's
-// differentiation and needs per-slot ops metering the open stack does not
-// emit. `plan_moves` and `select_units` are policy-agnostic — a policy only
-// changes the load NUMBER fed in.
+// similar amount of DATA, from FLINTSLOTSTATS key counts). The managed plane
+// ships TRAFFIC (balance so every pair serves a similar op rate, from
+// FLINTSLOTHEAT) behind the same trait without touching the planner.
+// `plan_moves` and `select_units` are policy-agnostic — a policy only changes
+// the load NUMBER fed in.
 
 /// Turns a master's per-slot stats — `((namespace, slot), metric)` — into
 /// the pair's load. Deterministic and pure.
@@ -176,8 +182,9 @@ impl BalancePolicy for SizePolicy {
 }
 
 /// Select a policy by name. The open stack knows only `size`; an unknown
-/// name (e.g. a private `traffic` policy) returns None so the caller can
-/// error clearly rather than silently balancing on the wrong metric.
+/// name (e.g. the managed plane's `traffic` policy) returns None so the
+/// caller can error clearly rather than silently balancing on the wrong
+/// metric.
 pub fn policy_by_name(name: &str) -> Option<Box<dyn BalancePolicy>> {
     match name {
         "size" => Some(Box::new(SizePolicy)),

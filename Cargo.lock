@@ -501,6 +501,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "flint-balance"
+version = "0.0.1"
+
+[[package]]
 name = "flint-bench"
 version = "0.0.1"
 dependencies = [
@@ -533,6 +537,7 @@ dependencies = [
 name = "flint-controller"
 version = "0.0.1"
 dependencies = [
+ "flint-balance",
  "flint-journal",
  "flint-resp",
  "flint-tls",

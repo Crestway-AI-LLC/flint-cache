@@ -10,6 +10,7 @@ repository.workspace = true
 flint-resp = { path = "../flint-resp" }
 flint-tls = { path = "../flint-tls" }
 flint-journal = { path = "../flint-journal" }
+flint-balance = { path = "../flint-balance" }
 
 [lints]
 workspace = true

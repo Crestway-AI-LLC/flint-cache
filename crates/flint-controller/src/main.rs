@@ -44,7 +44,11 @@
 //!   flint-controller --manage-pairs "6500:/d/a,6501:/d/b;6510:/d/c,6511:/d/d"
 //!   common: [--poll-ms 200] [--confirm 3] [--max-stale-ms 5000] [--lease-ttl-ms 3000]
 
-mod planner;
+// The rebalance planner + balance-policy seam lives in the shared
+// `flint-balance` library so the managed plane reuses the same
+// metric-agnostic planner (fed a different load metric). Aliased to
+// `planner` to keep call sites unchanged.
+use flint_balance as planner;
 
 use std::io::{Read, Write};
 use std::process::Command;
