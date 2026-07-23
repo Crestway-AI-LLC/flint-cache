@@ -91,6 +91,42 @@ admin-token <tok>           # gate the PROXY*/operator surface
 edge-san <ip-or-dns>        # extra SANs on the edge cert (real client addrs)
 ```
 
+**The `pair` line — one line per pair.** The comma separates the *members
+of a single pair*, not pairs from each other: the **first member is the
+master**, the rest are replicas (`pair m,r1,r2` is a master with two
+replicas). Add a pair by adding another `pair` line. Pairs are numbered by
+line order (pair 0, pair 1, …) — that index is the stable identity
+`flintctl migrate-slots`, `CPSLOTS`, and `swap-node` refer to. A
+single-member `pair HOST:P` is a master with no replica: fine for dev, not
+for production (a `min-replicas 1` write would shed with no replica to ack).
+`cp` follows the same shape — one line is a single-node control plane, three
+lines make a Raft HA set.
+
+A two-pair cluster with a proxy tier and HA control plane:
+
+```
+statedir /var/lib/flint
+bins /opt/flint/bin
+tls on
+client-tls on
+cp 10.0.1.10:7500           # 3 cp lines -> Raft HA control plane
+cp 10.0.1.11:7500
+cp 10.0.1.12:7500
+pair 10.0.2.10:7001,10.0.2.11:7001   # pair 0: master, replica (separate hosts)
+pair 10.0.2.12:7001,10.0.2.13:7001   # pair 1: master, replica
+proxy 10.0.1.20:7379         # 2 proxies -> a proxy loss is invisible
+proxy 10.0.1.21:7379
+controller on
+capacity 1717986918400       # ~1.6 TB per-node fill budget
+min-replicas 1               # close the widowed-master write hole
+```
+
+Don't hand-edit an inventory to *grow* a running cluster and re-bootstrap —
+add capacity live with `flintctl expand 10.0.2.14:7001,10.0.2.15:7001`
+(same comma syntax; the new pair joins unranged, then rebalancing or
+`migrate-slots` drains slots onto it), and keep the inventory in sync so
+`reload`/`status`/`stop` still see the whole fleet.
+
 **Operator tunables** (all optional; absent = compiled default). Edit,
 then `flintctl reload` to push the **HOT** ones to the running fleet with
 no restart, or `stop`/`start` for the restart-only ones:
