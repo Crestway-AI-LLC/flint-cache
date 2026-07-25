@@ -63,6 +63,10 @@ struct Inventory {
     cp: Vec<String>,
     pairs: Vec<Vec<String>>,
     proxies: Vec<String>,
+    /// Optional per-proxy ADVERTISE address (public-DNS deployments where
+    /// bind != the dialable address). Positional with `proxies`; absent =
+    /// advertise the proxy line itself (the historical behavior).
+    proxy_advertise: Vec<String>,
     controller: bool,
     agent: Option<String>,
     /// Per-node storage capacity in bytes (capacity model, question 2);
@@ -119,6 +123,11 @@ fn parse_inventory(path: &str) -> Inventory {
             "cp" => inv.cp.push(val.to_string()),
             "pair" => inv.pairs.push(val.split(',').map(String::from).collect()),
             "proxy" => inv.proxies.push(val.to_string()),
+            // Public-DNS deployments: what the proxy REGISTERS (and clients/
+            // portals dial) when it differs from the bind address — an EC2
+            // instance cannot bind its public IP or DNS name. Positional:
+            // the Nth proxy-advertise line pairs with the Nth proxy line.
+            "proxy-advertise" => inv.proxy_advertise.push(val.to_string()),
             "controller" => inv.controller = val == "on",
             "agent" => inv.agent = Some(val.to_string()),
             "capacity" => inv.capacity_bytes = val.parse().ok(),
@@ -744,8 +753,11 @@ fn launch(inv: &Inventory, register: bool) {
         "control plane up"
     );
     if register {
-        for proxy in &inv.proxies {
-            call(cp, &tls, &["CPADDPROXY", proxy]).expect("register proxy");
+        for (i, proxy) in inv.proxies.iter().enumerate() {
+            // Register the ADVERTISE address when one is declared (public-DNS
+            // deployments): the registry is what clients and portals dial.
+            let adv = inv.proxy_advertise.get(i).unwrap_or(proxy);
+            call(cp, &tls, &["CPADDPROXY", adv]).expect("register proxy");
         }
         // Initial pairs carry the even slot split as EXPLICIT level-1
         // routing state; expansion pairs later join with "-" (no range) so
@@ -781,14 +793,18 @@ fn launch(inv: &Inventory, register: bool) {
     }
 
     // 3. Routing plane.
-    for proxy in &inv.proxies {
+    for (i, proxy) in inv.proxies.iter().enumerate() {
         // The inventory addr's HOST is the bind address (0.0.0.0 serves
         // external clients — the marketplace shape; 127.0.0.1 stays the
-        // loopback default).
+        // loopback default). The ADVERTISE address is what the proxy
+        // reports of itself (subset identity): the proxy-advertise line
+        // when declared, else the bind line — must match what bootstrap
+        // registered.
         let bind_host = proxy
             .rsplit_once(':')
             .map(|(h, _)| h)
             .unwrap_or("127.0.0.1");
+        let advertise = inv.proxy_advertise.get(i).unwrap_or(proxy);
         let mut args = vec![
             "--port".to_string(),
             port_of(proxy).to_string(),
@@ -797,7 +813,7 @@ fn launch(inv: &Inventory, register: bool) {
             "--control-plane".into(),
             cp.clone(),
             "--advertise".into(),
-            proxy.clone(),
+            advertise.clone(),
         ];
         args.extend(internal_args(inv));
         args.extend(proxy_tuning_args(inv));
