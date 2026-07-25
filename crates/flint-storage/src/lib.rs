@@ -76,6 +76,25 @@ pub trait Kv: Send + Sync {
     /// removed during the scan may or may not be visited; rows present for
     /// the whole scan are visited exactly once.
     fn for_each_prefix(&self, prefix: &[u8], visit: &mut dyn FnMut(&[u8], &[u8]) -> bool);
+    /// Like `for_each_prefix`, but visiting only keys STRICTLY AFTER
+    /// `start_after` — the resume primitive for incremental iteration
+    /// (keyspace SCAN). `start_after` empty = from the prefix start. The
+    /// default body scans the prefix and skips; ordered stores override
+    /// with a real seek so resuming deep into a large namespace is O(seek),
+    /// not O(position).
+    fn for_each_from(
+        &self,
+        prefix: &[u8],
+        start_after: &[u8],
+        visit: &mut dyn FnMut(&[u8], &[u8]) -> bool,
+    ) {
+        self.for_each_prefix(prefix, &mut |k, v| {
+            if !start_after.is_empty() && k <= start_after {
+                return true;
+            }
+            visit(k, v)
+        });
+    }
     /// All pairs whose key starts with `prefix`, in ascending key order.
     ///
     /// Materializes the whole range — use only where the range is bounded
@@ -127,6 +146,14 @@ impl Kv for ReadOnlyKv<'_> {
     fn for_each_prefix(&self, prefix: &[u8], visit: &mut dyn FnMut(&[u8], &[u8]) -> bool) {
         self.0.for_each_prefix(prefix, visit)
     }
+    fn for_each_from(
+        &self,
+        prefix: &[u8],
+        start_after: &[u8],
+        visit: &mut dyn FnMut(&[u8], &[u8]) -> bool,
+    ) {
+        self.0.for_each_from(prefix, start_after, visit)
+    }
     fn scan_prefix(&self, prefix: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
         self.0.scan_prefix(prefix)
     }
@@ -151,28 +178,18 @@ impl MemKv {
     fn write(&self) -> std::sync::RwLockWriteGuard<'_, BTreeMap<Vec<u8>, Vec<u8>>> {
         self.map.write().unwrap_or_else(|e| e.into_inner())
     }
-}
 
-impl Kv for MemKv {
-    fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
-        self.read().get(key).cloned()
-    }
-
-    fn put(&self, key: &[u8], value: &[u8]) {
-        self.write().insert(key.to_vec(), value.to_vec());
-    }
-
-    fn delete(&self, key: &[u8]) -> bool {
-        self.write().remove(key).is_some()
-    }
-
-    fn for_each_prefix(&self, prefix: &[u8], visit: &mut dyn FnMut(&[u8], &[u8]) -> bool) {
-        // Chunked cursor scan: the read lock is released before `visit`
-        // runs (the callback may re-enter the store — a write would
-        // deadlock against a held read lock) and memory stays bounded at
-        // CHUNK pairs regardless of range size.
+    /// Chunked cursor scan: the read lock is released before `visit` runs
+    /// (the callback may re-enter the store — a write would deadlock
+    /// against a held read lock) and memory stays bounded at CHUNK pairs
+    /// regardless of range size. `cursor` = resume strictly after this key.
+    fn chunked(
+        &self,
+        prefix: &[u8],
+        mut cursor: Option<Vec<u8>>,
+        visit: &mut dyn FnMut(&[u8], &[u8]) -> bool,
+    ) {
         const CHUNK: usize = 1024;
-        let mut cursor: Option<Vec<u8>> = None;
         loop {
             let chunk: Vec<(Vec<u8>, Vec<u8>)> = {
                 let lower = match &cursor {
@@ -197,6 +214,36 @@ impl Kv for MemKv {
                 return;
             }
         }
+    }
+}
+
+impl Kv for MemKv {
+    fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+        self.read().get(key).cloned()
+    }
+
+    fn put(&self, key: &[u8], value: &[u8]) {
+        self.write().insert(key.to_vec(), value.to_vec());
+    }
+
+    fn delete(&self, key: &[u8]) -> bool {
+        self.write().remove(key).is_some()
+    }
+
+    fn for_each_prefix(&self, prefix: &[u8], visit: &mut dyn FnMut(&[u8], &[u8]) -> bool) {
+        self.chunked(prefix, None, visit);
+    }
+
+    fn for_each_from(
+        &self,
+        prefix: &[u8],
+        start_after: &[u8],
+        visit: &mut dyn FnMut(&[u8], &[u8]) -> bool,
+    ) {
+        // The chunked loop's resume cursor IS a strictly-after bound —
+        // seeding it with start_after is a real seek, not a scan-and-skip.
+        let seed = (!start_after.is_empty()).then(|| start_after.to_vec());
+        self.chunked(prefix, seed, visit);
     }
 
     fn scan_prefix(&self, prefix: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {

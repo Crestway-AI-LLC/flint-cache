@@ -88,6 +88,7 @@ pub fn is_read_command(name: &[u8]) -> bool {
             | b"HSCAN"
             | b"SSCAN"
             | b"ZSCAN"
+            | b"SCAN"
             | b"SCARD"
             | b"SMEMBERS"
             | b"LLEN"

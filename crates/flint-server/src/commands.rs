@@ -147,7 +147,7 @@ impl<'a> Dispatcher<'a> {
         let max = self.limits.effective_max_key() as usize;
         match name_upper {
             b"PING" | b"ECHO" | b"DBSIZE" | b"FLUSHALL" | b"COMMAND" | b"CLUSTER" | b"INFO"
-            | b"SELECT" | b"QUIT" | b"HELLO" => false,
+            | b"SELECT" | b"QUIT" | b"HELLO" | b"SCAN" => false,
             b"DEL" | b"EXISTS" => args[1..].iter().any(|k| k.len() > max),
             b"MSET" => args[1..].iter().step_by(2).any(|k| k.len() > max),
             _ => args.get(1).is_some_and(|k| k.len() > max),
@@ -603,6 +603,9 @@ impl<'a> Dispatcher<'a> {
                 Value::Integer(self.keyspace.persist(slot_for_key(&a[1]), &a[1]) as i64)
             }),
 
+            // keyspace iteration
+            b"SCAN" => self.cmd_scan(args),
+
             // admin
             b"DBSIZE" => {
                 // O(n) streaming scan of metadata rows, skipping expired
@@ -953,6 +956,169 @@ impl<'a> Dispatcher<'a> {
         })
     }
 
+    /// SCAN cursor [MATCH pat] [COUNT n] [TYPE t] — incremental keyspace
+    /// iteration over THIS namespace's metadata rows, in (slot, key) order.
+    ///
+    /// Cursor model: Redis clients (redis-py, go-redis) parse the cursor
+    /// with int(), so it MUST be numeric — a position-encoded string cursor
+    /// breaks them. A numeric cursor cannot losslessly encode an arbitrary
+    /// resume key, so cursors are SERVER-SIDE: a bounded, TTL'd table maps
+    /// id -> (ns, resume envelope key). Each batch re-seeks fresh
+    /// (`for_each_from`), so the scan holds no iterator open and tolerates
+    /// concurrent writes with Redis's weak guarantee (keys present the
+    /// whole scan are returned; concurrent adds/removes may or may not
+    /// be). An expired or unknown cursor answers "ERR invalid cursor" —
+    /// honest truncation, never a silent partial enumeration.
+    ///
+    /// COUNT bounds rows EXAMINED per batch (default 10, like Redis);
+    /// MATCH globs the user key; TYPE filters on the header's value type.
+    /// Expired-but-unswept rows are skipped, mirroring DBSIZE.
+    fn cmd_scan(&self, args: &[Vec<u8>]) -> Value {
+        if args.len() < 2 {
+            return arity_err("scan");
+        }
+        let Some(cursor_in) = std::str::from_utf8(&args[1])
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+        else {
+            return err("ERR invalid cursor");
+        };
+        let mut pattern: Option<&[u8]> = None;
+        let mut count: usize = 10;
+        let mut type_filter: Option<flint_storage::encoding::ValueType> = None;
+        let mut i = 2;
+        while i < args.len() {
+            match args[i].to_ascii_uppercase().as_slice() {
+                b"MATCH" => match args.get(i + 1) {
+                    Some(p) => {
+                        pattern = Some(p);
+                        i += 2;
+                    }
+                    None => return err("ERR syntax error"),
+                },
+                b"COUNT" => match args.get(i + 1).and_then(|c| parse_i64(c).ok()) {
+                    Some(n) if n >= 1 => {
+                        count = (n as usize).min(10_000);
+                        i += 2;
+                    }
+                    _ => return err("ERR syntax error"),
+                },
+                b"TYPE" => match args.get(i + 1).map(|t| t.to_ascii_lowercase()) {
+                    Some(t) => {
+                        use flint_storage::encoding::ValueType as VT;
+                        type_filter = Some(match t.as_slice() {
+                            b"string" => VT::String,
+                            b"hash" => VT::Hash,
+                            b"set" => VT::Set,
+                            b"zset" => VT::ZSet,
+                            b"list" => VT::List,
+                            // An unknown type matches nothing (Redis answers
+                            // empty batches, not an error).
+                            _ => {
+                                return Value::Array(Some(vec![
+                                    Value::Bulk(Some(b"0".to_vec())),
+                                    Value::Array(Some(Vec::new())),
+                                ]));
+                            }
+                        });
+                        i += 2;
+                    }
+                    None => return err("ERR syntax error"),
+                },
+                _ => return err("ERR syntax error"),
+            }
+        }
+
+        // Resolve the resume position. Cursor 0 = a fresh scan; otherwise
+        // the table row must exist AND belong to this namespace (a cursor
+        // is not transferable across tenants).
+        let resume: Vec<u8> = if cursor_in == 0 {
+            Vec::new()
+        } else {
+            match scan_cursors().lock() {
+                Ok(map) => match map.get(&cursor_in) {
+                    Some(c) if c.ns == self.ns => c.resume.clone(),
+                    _ => return err("ERR invalid cursor"),
+                },
+                Err(_) => return err("ERR cursor table lock"),
+            }
+        };
+
+        let prefix = self.ns_prefix(flint_storage::encoding::Cf::Metadata);
+        let now = (self.clock)();
+        let mut keys: Vec<Value> = Vec::new();
+        let mut examined = 0usize;
+        let mut last: Vec<u8> = Vec::new();
+        let mut more = false;
+        self.kv.for_each_from(&prefix, &resume, &mut |k, row| {
+            if examined == count {
+                // One row PAST the budget proves the keyspace continues.
+                more = true;
+                return false;
+            }
+            examined += 1;
+            last = k.to_vec();
+            let Some(h) = flint_storage::encoding::MetaHeader::decode(row) else {
+                return true;
+            };
+            if h.is_expired(now) {
+                return true;
+            }
+            if let Some(want) = type_filter
+                && flint_storage::encoding::ValueType::from_flags(h.flags) != Some(want)
+            {
+                return true;
+            }
+            // user key = envelope minus (prefix + 2 slot bytes).
+            let user = &k[prefix.len() + 2..];
+            if pattern.is_none_or(|p| glob_match(p, user)) {
+                keys.push(Value::Bulk(Some(user.to_vec())));
+            }
+            true
+        });
+
+        let next = if more {
+            let Ok(mut map) = scan_cursors().lock() else {
+                return err("ERR cursor table lock");
+            };
+            // TTL sweep + capacity bound: an abandoned scan must not leak.
+            let now_t = std::time::Instant::now();
+            map.retain(|_, c| now_t.duration_since(c.at) < SCAN_CURSOR_TTL);
+            let id = if cursor_in != 0 && map.contains_key(&cursor_in) {
+                cursor_in // continue the same session in place
+            } else {
+                if map.len() >= SCAN_CURSOR_CAP
+                    && let Some((&oldest, _)) = map.iter().min_by_key(|(_, c)| c.at)
+                {
+                    map.remove(&oldest);
+                }
+                NEXT_SCAN_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            };
+            map.insert(
+                id,
+                ScanCursor {
+                    ns: self.ns.clone(),
+                    resume: last,
+                    at: now_t,
+                },
+            );
+            id
+        } else {
+            // Scan complete: retire the session row.
+            if cursor_in != 0
+                && let Ok(mut map) = scan_cursors().lock()
+            {
+                map.remove(&cursor_in);
+            }
+            0
+        };
+
+        Value::Array(Some(vec![
+            Value::Bulk(Some(next.to_string().into_bytes())),
+            Value::Array(Some(keys)),
+        ]))
+    }
+
     /// HSCAN/SSCAN/ZSCAN key cursor [MATCH pat] [COUNT n] [NOVALUES].
     /// Our collections materialize from ONE prefix scan, so every scan is a
     /// single-shot iteration: ignore the cursor's value, return the whole
@@ -1215,6 +1381,28 @@ enum ScanKind {
     ZSet,
 }
 
+/// One in-flight keyspace SCAN session: which namespace it belongs to and
+/// the envelope key to resume STRICTLY AFTER. See `cmd_scan` for why the
+/// table is server-side (numeric-cursor client compatibility).
+struct ScanCursor {
+    ns: Vec<u8>,
+    resume: Vec<u8>,
+    at: std::time::Instant,
+}
+
+/// Bounded + TTL'd: an abandoned scan costs one row for two minutes, and
+/// the table never exceeds SCAN_CURSOR_CAP rows (oldest evicted).
+const SCAN_CURSOR_TTL: std::time::Duration = std::time::Duration::from_secs(120);
+const SCAN_CURSOR_CAP: usize = 1024;
+static NEXT_SCAN_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn scan_cursors() -> &'static std::sync::Mutex<std::collections::HashMap<u64, ScanCursor>> {
+    static TABLE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<u64, ScanCursor>>,
+    > = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
 /// Redis stringmatchlen-style glob over bytes: `*`, `?`, `[set]`/`[^set]`
 /// with `a-z` ranges, and `\` escapes. Iterative with single-star
 /// backtracking (globs have no nested quantifiers, so one backtrack point
@@ -1394,6 +1582,126 @@ mod tests {
     fn call(kv: &MemKv, parts: &[&[u8]]) -> Value {
         let d = Dispatcher::new(kv, system_clock);
         d.dispatch(&parts.iter().map(|p| p.to_vec()).collect::<Vec<_>>())
+    }
+
+    /// Drive a full SCAN to completion, returning every key seen. Panics on
+    /// a non-conforming reply shape or a scan that fails to terminate.
+    fn scan_all(kv: &MemKv, extra: &[&[u8]]) -> Vec<Vec<u8>> {
+        let mut cursor = b"0".to_vec();
+        let mut out = Vec::new();
+        for _ in 0..10_000 {
+            let mut args: Vec<&[u8]> = vec![b"SCAN", &cursor];
+            args.extend_from_slice(extra);
+            let Value::Array(Some(reply)) = call(kv, &args) else {
+                panic!("SCAN reply shape");
+            };
+            let Value::Bulk(Some(next)) = &reply[0] else {
+                panic!("cursor shape");
+            };
+            let Value::Array(Some(keys)) = &reply[1] else {
+                panic!("keys shape");
+            };
+            for k in keys {
+                let Value::Bulk(Some(k)) = k else {
+                    panic!("key shape");
+                };
+                out.push(k.clone());
+            }
+            if next.as_slice() == b"0" {
+                return out;
+            }
+            cursor = next.clone();
+        }
+        panic!("scan did not terminate");
+    }
+
+    #[test]
+    fn scan_pages_through_the_whole_keyspace_exactly_once() {
+        let s = MemKv::new();
+        for i in 0..137 {
+            call(&s, &[b"SET", format!("k:{i:03}").as_bytes(), b"v"]);
+        }
+        // Default COUNT (10) forces many batches; no key lost, none doubled.
+        let mut got = scan_all(&s, &[]);
+        got.sort();
+        let mut want: Vec<Vec<u8>> = (0..137).map(|i| format!("k:{i:03}").into_bytes()).collect();
+        want.sort();
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn scan_match_and_count_and_type() {
+        let s = MemKv::new();
+        for i in 0..30 {
+            call(&s, &[b"SET", format!("s:{i}").as_bytes(), b"v"]);
+        }
+        call(&s, &[b"HSET", b"h:1", b"f", b"v"]);
+        call(&s, &[b"LPUSH", b"l:1", b"v"]);
+        // MATCH filters without breaking pagination.
+        let got = scan_all(&s, &[b"MATCH", b"s:1*", b"COUNT", b"7"]);
+        assert_eq!(got.len(), 11, "s:1 and s:10..19");
+        // TYPE filter: only the hash.
+        let got = scan_all(&s, &[b"TYPE", b"hash"]);
+        assert_eq!(got, vec![b"h:1".to_vec()]);
+        // Unknown TYPE matches nothing, errors nothing.
+        assert!(scan_all(&s, &[b"TYPE", b"stream"]).is_empty());
+    }
+
+    #[test]
+    fn scan_skips_expired_and_rejects_bad_cursors() {
+        let s = MemKv::new();
+        call(&s, &[b"SET", b"live", b"v"]);
+        call(&s, &[b"SET", b"dead", b"v", b"PX", b"1"]);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert_eq!(scan_all(&s, &[]), vec![b"live".to_vec()]);
+        // A cursor that was never issued is an honest error, not a silent
+        // restart or truncation.
+        assert!(matches!(
+            call(&s, &[b"SCAN", b"999999999"]),
+            Value::Error(e) if e.contains("invalid cursor")
+        ));
+        assert!(matches!(
+            call(&s, &[b"SCAN", b"not-a-number"]),
+            Value::Error(e) if e.contains("invalid cursor")
+        ));
+    }
+
+    #[test]
+    fn scan_cursor_is_namespace_scoped() {
+        let s = MemKv::new();
+        // Tenant A seeds enough keys to leave a live cursor mid-scan.
+        let a = Dispatcher::with_limits(&s, system_clock, Limits::default(), b"tenant-a");
+        for i in 0..40 {
+            a.dispatch(&[
+                b"SET".to_vec(),
+                format!("a:{i}").into_bytes(),
+                b"v".to_vec(),
+            ]);
+        }
+        let Value::Array(Some(reply)) = a.dispatch(&[
+            b"SCAN".to_vec(),
+            b"0".to_vec(),
+            b"COUNT".to_vec(),
+            b"5".to_vec(),
+        ]) else {
+            panic!("scan shape");
+        };
+        let Value::Bulk(Some(cursor)) = &reply[0] else {
+            panic!("cursor shape");
+        };
+        assert_ne!(cursor.as_slice(), b"0", "mid-scan cursor expected");
+        // Tenant B presenting A's cursor is rejected — cursors are not
+        // transferable across namespaces.
+        let b = Dispatcher::with_limits(&s, system_clock, Limits::default(), b"tenant-b");
+        assert!(matches!(
+            b.dispatch(&[b"SCAN".to_vec(), cursor.clone()]),
+            Value::Error(e) if e.contains("invalid cursor")
+        ));
+        // And A can continue the same cursor unharmed.
+        assert!(matches!(
+            a.dispatch(&[b"SCAN".to_vec(), cursor.clone()]),
+            Value::Array(Some(_))
+        ));
     }
 
     #[test]

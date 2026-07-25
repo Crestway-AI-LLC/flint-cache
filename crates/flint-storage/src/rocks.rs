@@ -220,6 +220,37 @@ impl Kv for RocksKv {
         }
     }
 
+    fn for_each_from(
+        &self,
+        prefix: &[u8],
+        start_after: &[u8],
+        visit: &mut dyn FnMut(&[u8], &[u8]) -> bool,
+    ) {
+        // Real seek: resume deep into a large namespace is O(seek), not a
+        // scan-and-skip from the prefix start. `From` is inclusive, so the
+        // exact resume key is skipped by comparison.
+        let seek = if start_after.is_empty() {
+            prefix
+        } else {
+            start_after
+        };
+        let iter = self.db.iterator(rocksdb::IteratorMode::From(
+            seek,
+            rocksdb::Direction::Forward,
+        ));
+        for (k, v) in iter.filter_map(Result::ok) {
+            if !k.starts_with(prefix) {
+                return;
+            }
+            if !start_after.is_empty() && k.as_ref() <= start_after {
+                continue;
+            }
+            if !visit(&k, &v) {
+                return;
+            }
+        }
+    }
+
     fn clear(&self) {
         // Chunked delete batches: collecting every key into one Vec plus
         // one giant WriteBatch is FLUSHALL's version of the DBSIZE OOM —
