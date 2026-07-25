@@ -205,6 +205,34 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
             shared.changed.notify_all();
             Value::Simple(reply)
         }
+        b"CPDELTENANT" => {
+            // Remove a tenant: the record (auth revoked on the next snapshot
+            // push — proxies drop the grant) and its namespace's slot-map
+            // exception rows (a dead ns must not pin slot ownership). DATA
+            // is not touched here — the CP holds no data; `flintctl tenant
+            // remove` follows with a namespace wipe on the pairs.
+            let Some(name) = text(1) else {
+                return err("CPDELTENANT <name>");
+            };
+            let Ok(mut st) = shared.state.lock() else {
+                return err("state lock");
+            };
+            let Some(t) = st.tenants.remove(&name) else {
+                return err("no such tenant");
+            };
+            let ns = t.ns.clone();
+            st.exceptions.retain(|(e_ns, _, _, _)| e_ns != &ns);
+            match st.commit() {
+                Ok(_) => {}
+                Err(e) => return err(&format!("persist: {e}")),
+            }
+            drop(st);
+            if let Ok(mut usage) = shared.usage.lock() {
+                usage.remove(&name);
+            }
+            shared.changed.notify_all();
+            Value::Simple(format!("OK removed {name} ns {ns}"))
+        }
         b"CPSETSUBSET" => {
             let (Some(name), Some(subset)) = (text(1), text(2)) else {
                 return err("CPSETSUBSET <name> <p1,p2|->");

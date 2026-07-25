@@ -24,6 +24,12 @@ pub enum Mutation {
         ns: String,
         subset: Vec<String>,
     },
+    /// Remove a tenant: the record (auth revoked on the next push) and its
+    /// namespace's slot-map exception rows. Data wipe is the caller's
+    /// follow-up (`flintctl tenant remove`) — the CP holds no data.
+    DelTenant {
+        name: String,
+    },
     SetSubset {
         name: String,
         subset: Vec<String>,
@@ -221,6 +227,12 @@ impl RegistryState {
                         over_quota: false,
                     },
                 );
+            }
+            Mutation::DelTenant { name } => {
+                if let Some(t) = self.tenants.remove(&name) {
+                    let ns = t.ns;
+                    self.exceptions.retain(|(e_ns, _, _, _)| e_ns != &ns);
+                }
             }
             Mutation::SetSubset { name, subset } => {
                 if let Some(t) = self.tenants.get_mut(&name) {

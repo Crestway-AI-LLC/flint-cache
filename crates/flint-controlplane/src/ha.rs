@@ -545,6 +545,20 @@ async fn handle_admin(ha: &Ha, args: &[Vec<u8>]) -> Value {
                 Err(l) => redirect(l),
             }
         }
+        b"CPDELTENANT" => {
+            let Some(name) = text(1) else {
+                return Value::Error("ERR CPDELTENANT <name>".into());
+            };
+            let reg = ha.store.registry().await;
+            let Some(t) = reg.tenants.get(&name) else {
+                return Value::Error("ERR no such tenant".into());
+            };
+            let reply = format!("OK removed {name} ns {}", t.ns);
+            match ha.propose(Mutation::DelTenant { name }).await {
+                Ok(_) => Value::Simple(reply),
+                Err(l) => redirect(l),
+            }
+        }
         b"CPSETSUBSET" => {
             let (Some(name), Some(subset)) = (text(1), text(2)) else {
                 return Value::Error("ERR CPSETSUBSET <name> <p1,p2|->".into());

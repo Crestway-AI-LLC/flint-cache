@@ -203,6 +203,62 @@ fn call_slow(
     call_to(addr, tls, args, read_timeout)
 }
 
+/// Run a SEQUENCE of commands on ONE connection, returning the last reply.
+/// Needed wherever an earlier command sets connection state a later one
+/// depends on (FLINTNS pins the namespace; FLUSHALL then wipes THAT ns).
+fn call_seq(
+    addr: &str,
+    tls: &Option<Arc<flint_tls::ClientConfig>>,
+    cmds: &[&[&str]],
+    read_timeout: Duration,
+) -> std::io::Result<Value> {
+    let mut s = flint_tls::connect(addr, tls)?;
+    s.set_read_timeout(Some(read_timeout))?;
+    s.set_write_timeout(Some(Duration::from_millis(1500)))?;
+    let mut last = Value::Simple(String::new());
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 16384];
+    for args in cmds {
+        let frame = Value::Array(Some(
+            args.iter()
+                .map(|a| Value::Bulk(Some(a.as_bytes().to_vec())))
+                .collect(),
+        ));
+        let mut out = Vec::new();
+        encode(&frame, &mut out);
+        s.write_all(&out)?;
+        loop {
+            match decode(&buf) {
+                Ok(Decoded::Complete(v, used)) => {
+                    buf.drain(..used);
+                    if let Value::Error(e) = &v {
+                        return Err(std::io::Error::other(e.clone()));
+                    }
+                    last = v;
+                    break;
+                }
+                Ok(Decoded::NeedMore) => {
+                    let n = s.read(&mut chunk)?;
+                    if n == 0 {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "closed",
+                        ));
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                }
+                Err(e) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("{e:?}"),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(last)
+}
+
 fn call_to(
     addr: &str,
     tls: &Option<Arc<flint_tls::ClientConfig>>,
@@ -858,6 +914,53 @@ fn tenant_add(inv: &Inventory, rest: &[String]) {
         Ok(Value::Simple(s)) => println!("{s}"),
         other => panic!("tenant add failed: {other:?}"),
     }
+}
+
+/// Remove a tenant end to end: look up its namespace, revoke the record at
+/// the CP (CPDELTENANT — auth dies on the next snapshot push, and the ns's
+/// slot-exception rows retire with it), then WIPE the namespace's data on
+/// every pair master (FLINTNS + FLUSHALL — namespace-scoped by the tenancy
+/// invariant). Data wipe is best-effort per pair and reported; re-running
+/// is safe (the wipe is idempotent, the CP delete errors "no such tenant").
+fn tenant_remove(inv: &Inventory, name: &str) {
+    let tls = tls_client(inv);
+    // Namespace lookup BEFORE deletion (the record dies with the delete).
+    let ns = match call(&inv.cp[0], &tls, &["CPTENANTS"]) {
+        Ok(Value::Bulk(Some(raw))) => String::from_utf8_lossy(&raw)
+            .lines()
+            .find_map(|l| {
+                let mut it = l.split_whitespace();
+                (it.next() == Some(name)).then(|| it.next().map(String::from))?
+            })
+            .unwrap_or_else(|| panic!("no such tenant {name:?}")),
+        other => panic!("CPTENANTS failed: {other:?}"),
+    };
+    match call(&inv.cp[0], &tls, &["CPDELTENANT", name]) {
+        Ok(Value::Simple(s)) => eprintln!("== {s}"),
+        other => panic!("tenant remove failed: {other:?}"),
+    }
+    for i in 0..inv.pairs.len() {
+        let master = pair_master(inv, &tls, &i.to_string());
+        // ONE connection for both: FLINTNS pins this connection's namespace,
+        // FLUSHALL then wipes exactly that namespace (a fresh connection
+        // would wipe the default ns instead).
+        let wiped = call_seq(
+            &master,
+            &tls,
+            &[&["FLINTNS", &ns], &["FLUSHALL"]],
+            Duration::from_secs(30),
+        )
+        .is_ok();
+        eprintln!(
+            "  pair {i} ({master}): ns {ns} {}",
+            if wiped {
+                "wiped"
+            } else {
+                "WIPE FAILED (re-run)"
+            }
+        );
+    }
+    eprintln!("== tenant {name} removed (ns {ns})");
 }
 
 fn expand(inv: &Inventory, inventory_path: &str, pair_spec: &str) {
@@ -1602,13 +1705,14 @@ fn main() {
         "bootstrap" => bootstrap(&inv),
         "start" => start(&inv),
         "status" => status(&inv),
-        "tenant" => {
-            assert!(
-                rest.first().map(|s| s.as_str()) == Some("add"),
-                "usage: tenant add <name> <token> <ns> [k]"
-            );
-            tenant_add(&inv, &rest[1..]);
-        }
+        "tenant" => match rest.first().map(|s| s.as_str()) {
+            Some("add") => tenant_add(&inv, &rest[1..]),
+            Some("remove") => {
+                let name = rest.get(1).expect("usage: tenant remove <name>");
+                tenant_remove(&inv, name);
+            }
+            _ => panic!("usage: tenant add <name> <token> <ns> [k] | tenant remove <name>"),
+        },
         "expand" => {
             let spec = rest.first().expect("usage: expand <a,b[,c]>");
             expand(&inv, &inv_path, spec);
