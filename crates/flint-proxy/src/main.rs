@@ -44,7 +44,7 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use flint_resp::{Decoded, Value, decode, encode};
@@ -1500,6 +1500,156 @@ fn data_command(
     reply
 }
 
+/// One in-flight keyspace SCAN session THROUGH this proxy: which master
+/// the session is currently draining and that master's own cursor. The
+/// proxy iterates masters one at a time (a node's cursor table lives on
+/// that node, so a session must not bounce between nodes — SCAN is pinned
+/// to masters and never takes the replica-read path). Bounded + TTL'd like
+/// the node table; namespace-scoped like the node table.
+struct ProxyScanCursor {
+    ns: Vec<u8>,
+    master_idx: usize,
+    master: String,
+    node_cursor: u64,
+    at: std::time::Instant,
+}
+
+const PSCAN_TTL: std::time::Duration = std::time::Duration::from_secs(120);
+const PSCAN_CAP: usize = 1024;
+static NEXT_PSCAN_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn pscan_cursors() -> &'static Mutex<HashMap<u64, ProxyScanCursor>> {
+    static TABLE: std::sync::OnceLock<Mutex<HashMap<u64, ProxyScanCursor>>> =
+        std::sync::OnceLock::new();
+    TABLE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// SCAN through the proxy: drain master 0's keyspace via its own SCAN,
+/// then master 1's, … — the client sees ONE cursor stream over the whole
+/// group. MATCH/COUNT/TYPE pass through verbatim; only the cursor argument
+/// is rewritten per hop. Failover mid-scan invalidates the session (the
+/// dead master held its cursor state): the client gets "ERR invalid
+/// cursor" and restarts — Redis's weak scan guarantee, stated honestly.
+fn scan_forward(topo: &Topology, backends: &mut Backends, ns: &[u8], args: &[Vec<u8>]) -> Value {
+    if args.len() < 2 {
+        return Value::Error("ERR wrong number of arguments for 'scan' command".into());
+    }
+    let Some(cursor_in) = std::str::from_utf8(&args[1])
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+    else {
+        return Value::Error("ERR invalid cursor".into());
+    };
+    // Masters, in pair order (the fan_out collection shape).
+    let mut masters: Vec<Option<String>> = Vec::new();
+    for view in &topo.clusters {
+        match view.routing.read() {
+            Ok(r) => masters.extend(r.masters.clone()),
+            Err(_) => return Value::Error("ERR topology lock".into()),
+        }
+    }
+    let (master_idx, master, node_cursor) = if cursor_in == 0 {
+        match masters.first() {
+            Some(Some(m)) => (0usize, m.clone(), 0u64),
+            _ => return Value::Error("ERR a pair has no reachable master".into()),
+        }
+    } else {
+        let Ok(mut map) = pscan_cursors().lock() else {
+            return Value::Error("ERR cursor table lock".into());
+        };
+        let state = match map.get(&cursor_in) {
+            Some(c) if c.ns == ns => (c.master_idx, c.master.clone(), c.node_cursor),
+            _ => return Value::Error("ERR invalid cursor".into()),
+        };
+        // Topology moved under the session (failover, expansion re-slotting
+        // the index): the recorded master no longer sits at the recorded
+        // seat. Its node-side cursor died with it — retire the session and
+        // tell the client honestly rather than resume against a different
+        // node's keyspace.
+        if masters.get(state.0).and_then(|m| m.as_ref()) != Some(&state.1) {
+            map.remove(&cursor_in);
+            return Value::Error("ERR invalid cursor".into());
+        }
+        state
+    };
+    // Forward with only the cursor rewritten.
+    let mut fwd = args.to_vec();
+    fwd[1] = node_cursor.to_string().into_bytes();
+    let frame = Value::Array(Some(
+        fwd.into_iter().map(|a| Value::Bulk(Some(a))).collect(),
+    ));
+    let mut out = Vec::new();
+    encode(&frame, &mut out);
+    let reply = match backends.call(&master, &out) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(format!("ERR scan forward to {master}: {e}")),
+    };
+    let Value::Array(Some(mut parts)) = reply else {
+        return match reply {
+            Value::Error(e) => Value::Error(e),
+            other => Value::Error(format!("ERR scan reply shape: {other:?}")),
+        };
+    };
+    if parts.len() != 2 {
+        return Value::Error("ERR scan reply shape".into());
+    }
+    let keys = parts.pop().unwrap_or(Value::Array(Some(Vec::new())));
+    let node_next: u64 = match &parts[0] {
+        Value::Bulk(Some(c)) => match std::str::from_utf8(c).ok().and_then(|s| s.parse().ok()) {
+            Some(n) => n,
+            None => return Value::Error("ERR scan reply cursor".into()),
+        },
+        _ => return Value::Error("ERR scan reply shape".into()),
+    };
+    // Next session state: same master continues, or advance to the next
+    // pair's master with a fresh node cursor, or the group is exhausted.
+    let next_state = if node_next != 0 {
+        Some((master_idx, master, node_next))
+    } else {
+        masters
+            .get(master_idx + 1)
+            .and_then(|m| m.clone().map(|m| (master_idx + 1, m, 0u64)))
+    };
+    let Ok(mut map) = pscan_cursors().lock() else {
+        return Value::Error("ERR cursor table lock".into());
+    };
+    let proxy_next = match next_state {
+        Some((idx, m, nc)) => {
+            let now = std::time::Instant::now();
+            map.retain(|_, c| now.duration_since(c.at) < PSCAN_TTL);
+            let id = if cursor_in != 0 {
+                cursor_in
+            } else {
+                if map.len() >= PSCAN_CAP
+                    && let Some((&oldest, _)) = map.iter().min_by_key(|(_, c)| c.at)
+                {
+                    map.remove(&oldest);
+                }
+                NEXT_PSCAN_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            };
+            map.insert(
+                id,
+                ProxyScanCursor {
+                    ns: ns.to_vec(),
+                    master_idx: idx,
+                    master: m,
+                    node_cursor: nc,
+                    at: now,
+                },
+            );
+            id
+        }
+        None => {
+            map.remove(&cursor_in);
+            0
+        }
+    };
+    Value::Array(Some(vec![
+        Value::Bulk(Some(proxy_next.to_string().into_bytes())),
+        keys,
+    ]))
+}
+
 fn handle(
     topo: &Topology,
     backends: &mut Backends,
@@ -1527,6 +1677,10 @@ fn handle(
         _ if upper.starts_with(b"FLINT") => {
             Value::Error("ERR admin commands are not available through the proxy".into())
         }
+        // Keyspace iteration: one client cursor stream over every pair's
+        // master, in pair order. Never the replica-read path (a node's
+        // cursor state lives on the node that minted it).
+        b"SCAN" => scan_forward(topo, backends, ns, args),
         // Group-wide aggregates fan out.
         b"DBSIZE" => fan_out(topo, backends, raw, |replies| {
             let mut total = 0i64;

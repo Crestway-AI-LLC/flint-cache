@@ -1226,6 +1226,98 @@ fn corpus() -> Vec<Case> {
                 ),
             ],
         },
+        // Keyspace SCAN. Frame-comparable cases only: with COUNT >= the
+        // keyspace size both Flint and Valkey complete in ONE batch with
+        // cursor "0", so the reply is deterministic modulo key order.
+        // Multi-batch pagination is validated by scan_drill.sh + unit
+        // tests (batch boundaries and cursor VALUES legitimately differ:
+        // Valkey cursors are reversed-bit bucket indexes, Flint cursors
+        // are server-side session ids). Known, documented divergence NOT
+        // tested here: Valkey accepts any integer as a cursor (a bucket
+        // index); Flint answers "ERR invalid cursor" for a cursor it never
+        // issued — invisible to real clients, which only echo cursors.
+        Case {
+            family: "scan",
+            name: "one-shot enumeration returns every key, cursor 0",
+            steps: vec![
+                s(&[b"SET", b"sc:a", b"1"], Expect::Ok),
+                s(&[b"SET", b"sc:b", b"1"], Expect::Ok),
+                s(&[b"SET", b"sc:c", b"1"], Expect::Ok),
+                s(
+                    &[b"SCAN", b"0", b"COUNT", b"1000"],
+                    Expect::Arr(vec![
+                        Expect::Str(b"0"),
+                        Expect::UnorderedStrs(vec![b"sc:a", b"sc:b", b"sc:c"]),
+                    ]),
+                ),
+            ],
+        },
+        Case {
+            family: "scan",
+            name: "empty keyspace scans clean",
+            steps: vec![s(
+                &[b"SCAN", b"0"],
+                Expect::Arr(vec![Expect::Str(b"0"), Expect::UnorderedStrs(vec![])]),
+            )],
+        },
+        Case {
+            family: "scan",
+            name: "MATCH filters with * ? and [] globs",
+            steps: vec![
+                s(&[b"SET", b"user:1", b"1"], Expect::Ok),
+                s(&[b"SET", b"user:2", b"1"], Expect::Ok),
+                s(&[b"SET", b"other", b"1"], Expect::Ok),
+                s(
+                    &[b"SCAN", b"0", b"MATCH", b"user:*", b"COUNT", b"1000"],
+                    Expect::Arr(vec![
+                        Expect::Str(b"0"),
+                        Expect::UnorderedStrs(vec![b"user:1", b"user:2"]),
+                    ]),
+                ),
+                s(
+                    &[b"SCAN", b"0", b"MATCH", b"user:?", b"COUNT", b"1000"],
+                    Expect::Arr(vec![
+                        Expect::Str(b"0"),
+                        Expect::UnorderedStrs(vec![b"user:1", b"user:2"]),
+                    ]),
+                ),
+                s(
+                    &[b"SCAN", b"0", b"MATCH", b"user:[1]", b"COUNT", b"1000"],
+                    Expect::Arr(vec![
+                        Expect::Str(b"0"),
+                        Expect::UnorderedStrs(vec![b"user:1"]),
+                    ]),
+                ),
+            ],
+        },
+        Case {
+            family: "scan",
+            name: "TYPE filter selects by value type",
+            steps: vec![
+                s(&[b"SET", b"t:s", b"1"], Expect::Ok),
+                s(&[b"HSET", b"t:h", b"f", b"v"], Expect::Int(1)),
+                s(
+                    &[b"SCAN", b"0", b"TYPE", b"hash", b"COUNT", b"1000"],
+                    Expect::Arr(vec![Expect::Str(b"0"), Expect::UnorderedStrs(vec![b"t:h"])]),
+                ),
+            ],
+        },
+        Case {
+            family: "scan",
+            name: "expired keys are not enumerated",
+            steps: vec![
+                s(&[b"SET", b"gone", b"1", b"PX", b"40"], Expect::Ok),
+                s(&[b"SET", b"stays", b"1"], Expect::Ok),
+                sd(&[b"PING"], Expect::Pong, 80),
+                s(
+                    &[b"SCAN", b"0", b"COUNT", b"1000"],
+                    Expect::Arr(vec![
+                        Expect::Str(b"0"),
+                        Expect::UnorderedStrs(vec![b"stays"]),
+                    ]),
+                ),
+            ],
+        },
     ]
 }
 

@@ -13,6 +13,10 @@ to the tenant namespace).
 **Keyspace**: DEL, UNLINK, EXISTS, TYPE, EXPIRE, PEXPIRE, EXPIREAT,
 PEXPIREAT, TTL, PTTL, EXPIRETIME, PEXPIRETIME, PERSIST.
 
+**Keyspace iteration**: SCAN (MATCH, COUNT, TYPE) — incremental, works
+through the proxy across all shard pairs as one cursor stream (redis-cli
+`--scan`, RedisInsight, and client iterators work as-is).
+
 **Strings**: SET (NX, XX, EX, PX, EXAT, PXAT, KEEPTTL, GET), SETNX, SETEX,
 GET, GETDEL, GETSET, MSET, MGET, APPEND, STRLEN, GETRANGE, SETRANGE,
 INCR, DECR, INCRBY, DECRBY, INCRBYFLOAT.
@@ -33,10 +37,20 @@ ZREMRANGEBYSCORE, ZREMRANGEBYRANK, ZSCAN (MATCH, COUNT).
 
 ## Semantics worth knowing
 
-- **Scans are single-shot.** HSCAN/SSCAN/ZSCAN return the whole (filtered)
-  collection with cursor `0` in one iteration — exactly Redis's own
-  behavior for listpack/intset encodings, and a valid SCAN contract
+- **Collection scans are single-shot.** HSCAN/SSCAN/ZSCAN return the whole
+  (filtered) collection with cursor `0` in one iteration — exactly Redis's
+  own behavior for listpack/intset encodings, and a valid SCAN contract
   (every element once, terminating). COUNT is accepted as the hint it is.
+- **Keyspace SCAN cursors are server-side sessions**, not Redis's
+  reversed-bit bucket indexes. Guarantees are Redis-compatible (keys
+  present throughout the scan are returned — here exactly once; COUNT
+  bounds rows examined per batch), with two visible differences: a cursor
+  Flint never issued (or one idle > 2 minutes, or one whose shard failed
+  over mid-scan) answers `ERR invalid cursor` — restart the scan — where
+  Redis would silently accept any integer; and cursors are bound to the
+  tenant that opened them. Client iterators only ever echo server cursors,
+  so real tools (redis-cli `--scan`, RedisInsight, client `scan_iter`s)
+  are unaffected.
 - **INCRBYFLOAT** formats like Redis (`%.17f`, trailing zeros trimmed).
 - **Expiry is lazy + swept**: an expired key reads as missing immediately;
   physical reclamation is background.
@@ -56,11 +70,6 @@ ZREMRANGEBYSCORE, ZREMRANGEBYRANK, ZSCAN (MATCH, COUNT).
   way every type is — not the RedisJSON module), built on the existing
   envelope encoding, so large documents live beyond RAM like any other
   value. Slot-sharded and single-key, consistent with the tenancy model.
-
-## Not yet supported
-
-- **Keyspace SCAN** (deferred: cursor semantics across migrating shard
-  pairs need a design pass; per-key HSCAN/SSCAN/ZSCAN cover most uses).
 
 ## Excluded by design
 
