@@ -13,6 +13,9 @@ flint-slot = { path = "../flint-slot" }
 flint-storage = { path = "../flint-storage" }
 flint-tls = { path = "../flint-tls" }
 flint-journal = { path = "../flint-journal" }
+# JSON document type: parsing/path resolution live in the command layer
+# (storage stores opaque bytes). Already in the tree via flint-journal.
+serde_json = { version = "1", features = ["preserve_order"] }
 
 [lints]
 workspace = true

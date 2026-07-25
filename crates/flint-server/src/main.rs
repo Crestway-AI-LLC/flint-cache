@@ -12,6 +12,7 @@
 
 mod commands;
 mod heat;
+mod json_path;
 mod migrate;
 mod repl_hub;
 mod write_lock;

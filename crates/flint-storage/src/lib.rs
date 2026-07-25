@@ -21,6 +21,7 @@ pub mod batch;
 pub mod encoding;
 pub mod gc;
 pub mod hashes;
+pub mod json;
 pub mod keyspace;
 pub mod lists;
 pub mod manifest;

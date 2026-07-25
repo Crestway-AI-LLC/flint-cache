@@ -58,6 +58,13 @@ pub fn is_write_command(name: &[u8]) -> bool {
             | b"ZPOPMAX"
             | b"ZREMRANGEBYSCORE"
             | b"ZREMRANGEBYRANK"
+            // JSON documents: every mutation is a read-modify-write of the
+            // whole document row, so they classify like any other write.
+            | b"JSON.SET"
+            | b"JSON.DEL"
+            | b"JSON.FORGET"
+            | b"JSON.NUMINCRBY"
+            | b"JSON.ARRAPPEND"
     )
 }
 
@@ -106,6 +113,9 @@ pub fn is_read_command(name: &[u8]) -> bool {
             | b"ZCOUNT"
             | b"ZMSCORE"
             | b"DBSIZE"
+            | b"JSON.GET"
+            | b"JSON.TYPE"
+            | b"JSON.ARRLEN"
     )
 }
 

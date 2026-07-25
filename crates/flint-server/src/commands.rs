@@ -11,6 +11,7 @@ use flint_resp::Value;
 use flint_slot::slot_for_key;
 use flint_storage::Kv;
 use flint_storage::hashes::HashStore;
+use flint_storage::json::JsonStore;
 use flint_storage::keyspace::{Keyspace, Ttl};
 use flint_storage::lists::{ListStore, LsetOutcome};
 use flint_storage::sets::SetStore;
@@ -94,6 +95,7 @@ pub struct Dispatcher<'a> {
     sets: SetStore<'a>,
     lists: ListStore<'a>,
     zsets: ZSetStore<'a>,
+    json: JsonStore<'a>,
     kv: &'a dyn Kv,
     clock: Clock,
     limits: Limits,
@@ -120,6 +122,7 @@ impl<'a> Dispatcher<'a> {
             sets: SetStore::with_max_value_bytes(kv, ns, clock, max),
             lists: ListStore::with_max_value_bytes(kv, ns, clock, max),
             zsets: ZSetStore::with_max_value_bytes(kv, ns, clock, max),
+            json: JsonStore::with_max_value_bytes(kv, ns, clock, max),
             kv,
             clock,
             limits,
@@ -603,6 +606,15 @@ impl<'a> Dispatcher<'a> {
                 Value::Integer(self.keyspace.persist(slot_for_key(&a[1]), &a[1]) as i64)
             }),
 
+            // JSON documents
+            b"JSON.SET" => self.cmd_json_set(args),
+            b"JSON.GET" => self.cmd_json_get(args),
+            b"JSON.DEL" | b"JSON.FORGET" => self.cmd_json_del(args),
+            b"JSON.TYPE" => self.cmd_json_type(args),
+            b"JSON.NUMINCRBY" => self.cmd_json_numincrby(args),
+            b"JSON.ARRAPPEND" => self.cmd_json_arrappend(args),
+            b"JSON.ARRLEN" => self.cmd_json_arrlen(args),
+
             // keyspace iteration
             b"SCAN" => self.cmd_scan(args),
 
@@ -954,6 +966,278 @@ impl<'a> Dispatcher<'a> {
                 _ => err("ERR value is not an integer or out of range"),
             }
         })
+    }
+
+    /// The JSON family's shared preamble: parse the path argument (absent
+    /// = the root, like Redis) and load the live document. Returns the
+    /// parsed path plus the parsed document, or the error reply to send.
+    fn json_open(
+        &self,
+        key: &[u8],
+        path_arg: Option<&Vec<u8>>,
+    ) -> Result<(crate::json_path::Path, Option<serde_json::Value>), Value> {
+        let raw = path_arg.map(|p| String::from_utf8_lossy(p).to_string());
+        let path = match crate::json_path::parse(raw.as_deref().unwrap_or("$")) {
+            Ok(p) => p,
+            Err(crate::json_path::PathError::Unsupported) => {
+                return Err(err(
+                    "ERR path contains an unsupported construct (wildcards, \
+                     recursive descent, slices, and filters are not supported)",
+                ));
+            }
+            Err(crate::json_path::PathError::Malformed) => {
+                return Err(err("ERR malformed JSON path"));
+            }
+        };
+        let bytes = match self.json.get(slot_for_key(key), key) {
+            Ok(b) => b,
+            Err(e) => return Err(store_err(e)),
+        };
+        let doc = match bytes {
+            None => None,
+            Some(b) => match serde_json::from_slice(&b) {
+                Ok(v) => Some(v),
+                // A row that fails to parse is corruption, not a user error.
+                Err(_) => return Err(err("ERR stored document is not valid JSON")),
+            },
+        };
+        Ok((path, doc))
+    }
+
+    /// Persist a mutated document, preserving any TTL (a sub-document write
+    /// is an in-place mutation, not a fresh key).
+    fn json_save(&self, key: &[u8], doc: &serde_json::Value) -> Option<Value> {
+        let Ok(bytes) = serde_json::to_vec(doc) else {
+            return Some(err("ERR could not serialize document"));
+        };
+        match self.json.set_keep_ttl(slot_for_key(key), key, &bytes) {
+            Ok(()) => None,
+            Err(e) => Some(store_err(e)),
+        }
+    }
+
+    /// JSON.SET key path value [NX|XX] — writes a document or a path within
+    /// one. Root path on a missing key creates the document; a sub-path
+    /// requires the key AND the path's parent to exist (no silent creation
+    /// of intermediate levels).
+    fn cmd_json_set(&self, args: &[Vec<u8>]) -> Value {
+        if args.len() < 4 || args.len() > 5 {
+            return arity_err("json.set");
+        }
+        let (nx, xx) = match args.get(4).map(|f| f.to_ascii_uppercase()) {
+            None => (false, false),
+            Some(f) if f == b"NX" => (true, false),
+            Some(f) if f == b"XX" => (false, true),
+            Some(_) => return err("ERR syntax error"),
+        };
+        let Ok(value): Result<serde_json::Value, _> = serde_json::from_slice(&args[3]) else {
+            return err("ERR value is not valid JSON");
+        };
+        let (path, doc) = match self.json_open(&args[1], Some(&args[2])) {
+            Ok(v) => v,
+            Err(reply) => return reply,
+        };
+        let key = &args[1];
+        // Whole-document write: the key itself is the NX/XX subject.
+        if path.is_root() {
+            if (nx && doc.is_some()) || (xx && doc.is_none()) {
+                return Value::Bulk(None);
+            }
+            let Ok(bytes) = serde_json::to_vec(&value) else {
+                return err("ERR could not serialize document");
+            };
+            return match self.json.set(slot_for_key(key), key, &bytes) {
+                Ok(()) => Value::Simple("OK".into()),
+                Err(e) => store_err(e),
+            };
+        }
+        let Some(mut doc) = doc else {
+            return err("ERR new objects must be created at the root");
+        };
+        // NX/XX on a sub-path test the PATH's existence.
+        let exists = crate::json_path::get(&doc, &path).is_some();
+        if (nx && exists) || (xx && !exists) {
+            return Value::Bulk(None);
+        }
+        match crate::json_path::set(&mut doc, &path, value) {
+            crate::json_path::SetOutcome::Set | crate::json_path::SetOutcome::Created => {
+                match self.json_save(key, &doc) {
+                    Some(e) => e,
+                    None => Value::Simple("OK".into()),
+                }
+            }
+            crate::json_path::SetOutcome::MissingParent => {
+                err("ERR path parent does not exist (intermediate levels are not created)")
+            }
+            crate::json_path::SetOutcome::ShapeMismatch => {
+                err("ERR path does not fit the document's shape at that position")
+            }
+        }
+    }
+
+    /// JSON.GET key [path] — the value at the path, serialized. Nil when the
+    /// key or the path is absent.
+    fn cmd_json_get(&self, args: &[Vec<u8>]) -> Value {
+        if args.len() < 2 || args.len() > 3 {
+            return arity_err("json.get");
+        }
+        let (path, doc) = match self.json_open(&args[1], args.get(2)) {
+            Ok(v) => v,
+            Err(reply) => return reply,
+        };
+        let Some(doc) = doc else {
+            return Value::Bulk(None);
+        };
+        match crate::json_path::get(&doc, &path) {
+            None => Value::Bulk(None),
+            Some(v) => match serde_json::to_vec(v) {
+                Ok(b) => Value::Bulk(Some(b)),
+                Err(_) => err("ERR could not serialize value"),
+            },
+        }
+    }
+
+    /// JSON.DEL key [path] — root path deletes the key; a sub-path removes
+    /// that member/element. Returns the number of paths deleted (0 or 1).
+    fn cmd_json_del(&self, args: &[Vec<u8>]) -> Value {
+        if args.len() < 2 || args.len() > 3 {
+            return arity_err("json.del");
+        }
+        let (path, doc) = match self.json_open(&args[1], args.get(2)) {
+            Ok(v) => v,
+            Err(reply) => return reply,
+        };
+        let key = &args[1];
+        let Some(mut doc) = doc else {
+            return Value::Integer(0);
+        };
+        if path.is_root() {
+            return match self.json.delete(slot_for_key(key), key) {
+                Ok(true) => Value::Integer(1),
+                Ok(false) => Value::Integer(0),
+                Err(e) => store_err(e),
+            };
+        }
+        if !crate::json_path::remove(&mut doc, &path) {
+            return Value::Integer(0);
+        }
+        match self.json_save(key, &doc) {
+            Some(e) => e,
+            None => Value::Integer(1),
+        }
+    }
+
+    /// JSON.TYPE key [path] — Redis's type vocabulary for the value at the
+    /// path; nil when absent.
+    fn cmd_json_type(&self, args: &[Vec<u8>]) -> Value {
+        if args.len() < 2 || args.len() > 3 {
+            return arity_err("json.type");
+        }
+        let (path, doc) = match self.json_open(&args[1], args.get(2)) {
+            Ok(v) => v,
+            Err(reply) => return reply,
+        };
+        match doc.as_ref().and_then(|d| crate::json_path::get(d, &path)) {
+            None => Value::Bulk(None),
+            Some(v) => Value::Simple(crate::json_path::type_name(v).into()),
+        }
+    }
+
+    /// JSON.NUMINCRBY key path number — atomically add to a number at the
+    /// path, replying with the new value.
+    fn cmd_json_numincrby(&self, args: &[Vec<u8>]) -> Value {
+        if args.len() != 4 {
+            return arity_err("json.numincrby");
+        }
+        let Some(by) = std::str::from_utf8(&args[3])
+            .ok()
+            .and_then(|s| s.parse::<f64>().ok())
+        else {
+            return err("ERR value is not a number");
+        };
+        let (path, doc) = match self.json_open(&args[1], Some(&args[2])) {
+            Ok(v) => v,
+            Err(reply) => return reply,
+        };
+        let Some(mut doc) = doc else {
+            return err("ERR no such key");
+        };
+        let Some(slot) = crate::json_path::get_mut(&mut doc, &path) else {
+            return err("ERR path does not exist");
+        };
+        let Some(cur) = slot.as_f64() else {
+            return err("ERR path does not hold a number");
+        };
+        let next = cur + by;
+        if !next.is_finite() {
+            return err("ERR result is not a finite number");
+        }
+        // Integer in, integer out (Redis's JSON keeps ints as ints).
+        *slot = match (slot.is_i64() || slot.is_u64()) && by.fract() == 0.0 {
+            true => serde_json::json!(next as i64),
+            false => match serde_json::Number::from_f64(next) {
+                Some(n) => serde_json::Value::Number(n),
+                None => return err("ERR result is not representable"),
+            },
+        };
+        let out = slot.clone();
+        match self.json_save(&args[1], &doc) {
+            Some(e) => e,
+            None => match serde_json::to_vec(&out) {
+                Ok(b) => Value::Bulk(Some(b)),
+                Err(_) => err("ERR could not serialize value"),
+            },
+        }
+    }
+
+    /// JSON.ARRAPPEND key path value [value ...] — append to an array,
+    /// replying with the new length.
+    fn cmd_json_arrappend(&self, args: &[Vec<u8>]) -> Value {
+        if args.len() < 4 {
+            return arity_err("json.arrappend");
+        }
+        let mut values = Vec::with_capacity(args.len() - 3);
+        for raw in &args[3..] {
+            match serde_json::from_slice(raw) {
+                Ok(v) => values.push(v),
+                Err(_) => return err("ERR value is not valid JSON"),
+            }
+        }
+        let (path, doc) = match self.json_open(&args[1], Some(&args[2])) {
+            Ok(v) => v,
+            Err(reply) => return reply,
+        };
+        let Some(mut doc) = doc else {
+            return err("ERR no such key");
+        };
+        let Some(target) = crate::json_path::get_mut(&mut doc, &path) else {
+            return err("ERR path does not exist");
+        };
+        let serde_json::Value::Array(arr) = target else {
+            return err("ERR path does not hold an array");
+        };
+        arr.extend(values);
+        let len = arr.len() as i64;
+        match self.json_save(&args[1], &doc) {
+            Some(e) => e,
+            None => Value::Integer(len),
+        }
+    }
+
+    /// JSON.ARRLEN key [path] — length of the array at the path.
+    fn cmd_json_arrlen(&self, args: &[Vec<u8>]) -> Value {
+        if args.len() < 2 || args.len() > 3 {
+            return arity_err("json.arrlen");
+        }
+        let (path, doc) = match self.json_open(&args[1], args.get(2)) {
+            Ok(v) => v,
+            Err(reply) => return reply,
+        };
+        match doc.as_ref().and_then(|d| crate::json_path::get(d, &path)) {
+            None => Value::Bulk(None),
+            Some(serde_json::Value::Array(a)) => Value::Integer(a.len() as i64),
+            Some(_) => err("ERR path does not hold an array"),
+        }
     }
 
     /// SCAN cursor [MATCH pat] [COUNT n] [TYPE t] — incremental keyspace
@@ -1702,6 +1986,136 @@ mod tests {
             a.dispatch(&[b"SCAN".to_vec(), cursor.clone()]),
             Value::Array(Some(_))
         ));
+    }
+
+    #[test]
+    fn json_document_lifecycle_and_paths() {
+        let s = MemKv::new();
+        // Root write creates the document; TYPE and GET see it.
+        assert_eq!(
+            call(&s, &[b"JSON.SET", b"d", b"$", br#"{"a":1,"t":["x"]}"#]),
+            Value::Simple("OK".into())
+        );
+        assert_eq!(call(&s, &[b"TYPE", b"d"]), Value::Simple("json".into()));
+        assert_eq!(
+            call(&s, &[b"JSON.TYPE", b"d", b"$.a"]),
+            Value::Simple("integer".into())
+        );
+        assert_eq!(
+            call(&s, &[b"JSON.GET", b"d", b"$.a"]),
+            Value::Bulk(Some(b"1".to_vec()))
+        );
+        // Sub-path write, then read back through the whole document.
+        assert_eq!(
+            call(&s, &[b"JSON.SET", b"d", b"$.a", b"42"]),
+            Value::Simple("OK".into())
+        );
+        assert_eq!(
+            call(&s, &[b"JSON.GET", b"d", b"$.a"]),
+            Value::Bulk(Some(b"42".to_vec()))
+        );
+        // Array ops.
+        assert_eq!(
+            call(&s, &[b"JSON.ARRAPPEND", b"d", b"$.t", br#""y""#, br#""z""#]),
+            Value::Integer(3)
+        );
+        assert_eq!(call(&s, &[b"JSON.ARRLEN", b"d", b"$.t"]), Value::Integer(3));
+        assert_eq!(
+            call(&s, &[b"JSON.GET", b"d", b"$.t[-1]"]),
+            Value::Bulk(Some(br#""z""#.to_vec()))
+        );
+        // Numeric increment keeps integers integral.
+        assert_eq!(
+            call(&s, &[b"JSON.NUMINCRBY", b"d", b"$.a", b"8"]),
+            Value::Bulk(Some(b"50".to_vec()))
+        );
+        // Path delete removes just that member; the document survives.
+        assert_eq!(call(&s, &[b"JSON.DEL", b"d", b"$.a"]), Value::Integer(1));
+        assert_eq!(call(&s, &[b"JSON.GET", b"d", b"$.a"]), Value::Bulk(None));
+        assert_eq!(call(&s, &[b"JSON.ARRLEN", b"d", b"$.t"]), Value::Integer(3));
+        // Root delete removes the key.
+        assert_eq!(call(&s, &[b"JSON.DEL", b"d"]), Value::Integer(1));
+        assert_eq!(call(&s, &[b"EXISTS", b"d"]), Value::Integer(0));
+    }
+
+    #[test]
+    fn json_errors_are_specific_and_safe() {
+        let s = MemKv::new();
+        call(
+            &s,
+            &[b"JSON.SET", b"d", b"$", br#"{"o":{"n":1},"s":"str"}"#],
+        );
+        // Unsupported path constructs name themselves.
+        assert!(
+            matches!(call(&s, &[b"JSON.GET", b"d", b"$..n"]), Value::Error(e) if e.contains("unsupported"))
+        );
+        assert!(
+            matches!(call(&s, &[b"JSON.GET", b"d", b"$.o[*]"]), Value::Error(e) if e.contains("unsupported"))
+        );
+        // Intermediates are never created silently.
+        assert!(matches!(
+            call(&s, &[b"JSON.SET", b"d", b"$.x.y", b"1"]),
+            Value::Error(e) if e.contains("parent")
+        ));
+        assert_eq!(call(&s, &[b"JSON.GET", b"d", b"$.x"]), Value::Bulk(None));
+        // Type mismatches at the path.
+        assert!(matches!(
+            call(&s, &[b"JSON.NUMINCRBY", b"d", b"$.s", b"1"]),
+            Value::Error(e) if e.contains("number")
+        ));
+        assert!(matches!(
+            call(&s, &[b"JSON.ARRAPPEND", b"d", b"$.o", b"1"]),
+            Value::Error(e) if e.contains("array")
+        ));
+        // Invalid JSON input is rejected before it can be stored.
+        assert!(matches!(
+            call(&s, &[b"JSON.SET", b"d2", b"$", b"{not json"]),
+            Value::Error(e) if e.contains("valid JSON")
+        ));
+        assert_eq!(call(&s, &[b"EXISTS", b"d2"]), Value::Integer(0));
+        // WRONGTYPE both directions against a string.
+        call(&s, &[b"SET", b"str", b"v"]);
+        assert!(
+            matches!(call(&s, &[b"JSON.GET", b"str"]), Value::Error(e) if e.starts_with("WRONGTYPE"))
+        );
+        assert!(matches!(call(&s, &[b"GET", b"d"]), Value::Error(e) if e.starts_with("WRONGTYPE")));
+    }
+
+    #[test]
+    fn json_set_nx_xx_and_ttl_preservation() {
+        let s = MemKv::new();
+        // NX creates, then refuses.
+        assert_eq!(
+            call(&s, &[b"JSON.SET", b"d", b"$", br#"{"a":1}"#, b"NX"]),
+            Value::Simple("OK".into())
+        );
+        assert_eq!(
+            call(&s, &[b"JSON.SET", b"d", b"$", br#"{"a":2}"#, b"NX"]),
+            Value::Bulk(None)
+        );
+        // XX on a missing path refuses; on an existing path it writes.
+        assert_eq!(
+            call(&s, &[b"JSON.SET", b"d", b"$.new", b"1", b"XX"]),
+            Value::Bulk(None)
+        );
+        assert_eq!(
+            call(&s, &[b"JSON.SET", b"d", b"$.a", b"9", b"XX"]),
+            Value::Simple("OK".into())
+        );
+        assert_eq!(
+            call(&s, &[b"JSON.GET", b"d", b"$.a"]),
+            Value::Bulk(Some(b"9".to_vec()))
+        );
+        // A sub-path write preserves the key's TTL (an in-place mutation).
+        assert_eq!(call(&s, &[b"EXPIRE", b"d", b"100"]), Value::Integer(1));
+        call(&s, &[b"JSON.SET", b"d", b"$.a", b"10"]);
+        assert!(
+            matches!(call(&s, &[b"TTL", b"d"]), Value::Integer(t) if t > 0),
+            "sub-path write kept the TTL"
+        );
+        // A ROOT write clears it, like a plain SET.
+        call(&s, &[b"JSON.SET", b"d", b"$", br#"{"a":1}"#]);
+        assert_eq!(call(&s, &[b"TTL", b"d"]), Value::Integer(-1));
     }
 
     #[test]

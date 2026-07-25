@@ -30,6 +30,11 @@ pub enum ValueType {
     Set = 2,
     ZSet = 3,
     List = 4,
+    /// A JSON document, stored as its serialized bytes in the metadata row
+    /// (strings-shaped: one row, no subkeys) — documents live beyond RAM
+    /// like any value. Parsing/manipulation is the command layer's job;
+    /// storage sees opaque bytes plus this tag.
+    Json = 5,
 }
 
 impl ValueType {
@@ -40,6 +45,7 @@ impl ValueType {
             2 => Some(Self::Set),
             3 => Some(Self::ZSet),
             4 => Some(Self::List),
+            5 => Some(Self::Json),
             _ => None,
         }
     }
@@ -51,6 +57,7 @@ impl ValueType {
             Self::Set => "set",
             Self::ZSet => "zset",
             Self::List => "list",
+            Self::Json => "json",
         }
     }
 }
@@ -257,6 +264,19 @@ impl StringMeta {
     pub fn new(payload: Vec<u8>, expire_ms: u64) -> Self {
         Self {
             flags: make_flags(ValueType::String, ENCODING_V1),
+            expire_ms,
+            payload,
+        }
+    }
+
+    /// Same one-row shape, tagged as another payload-in-metadata type —
+    /// JSON documents store their serialized bytes exactly like a string
+    /// (one row, no subkeys), so they reuse this layout and differ only in
+    /// the type tag. Keeps the encoding layer honest: one payload row
+    /// format, several types wearing it.
+    pub fn new_typed(t: ValueType, payload: Vec<u8>, expire_ms: u64) -> Self {
+        Self {
+            flags: make_flags(t, ENCODING_V1),
             expire_ms,
             payload,
         }
