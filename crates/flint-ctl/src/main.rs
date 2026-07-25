@@ -67,6 +67,10 @@ struct Inventory {
     /// bind != the dialable address). Positional with `proxies`; absent =
     /// advertise the proxy line itself (the historical behavior).
     proxy_advertise: Vec<String>,
+    /// Trust bundle for dialing the proxies' EDGE port (agent PROXY*
+    /// views). Absent = the internal CA, which signs the default edge
+    /// cert; public-cert fleets point it at the system bundle.
+    edge_trust: Option<String>,
     controller: bool,
     agent: Option<String>,
     /// Per-node storage capacity in bytes (capacity model, question 2);
@@ -128,6 +132,7 @@ fn parse_inventory(path: &str) -> Inventory {
             // instance cannot bind its public IP or DNS name. Positional:
             // the Nth proxy-advertise line pairs with the Nth proxy line.
             "proxy-advertise" => inv.proxy_advertise.push(val.to_string()),
+            "edge-trust" => inv.edge_trust = Some(val.to_string()),
             "controller" => inv.controller = val == "on",
             "agent" => inv.agent = Some(val.to_string()),
             "capacity" => inv.capacity_bytes = val.parse().ok(),
@@ -871,6 +876,17 @@ fn launch(inv: &Inventory, register: bool) {
         ];
         if let Some(cap) = inv.capacity_bytes {
             args.extend(["--node-capacity-bytes".into(), cap.to_string()]);
+        }
+        // Edge trust for the agent's PROXY* dials. Default = the internal
+        // CA (it signs the default edge cert); a fleet serving a PUBLIC
+        // edge cert (LE on a DNS name) overrides with `edge-trust <path>`
+        // (e.g. the system bundle).
+        if inv.client_tls {
+            let trust = inv
+                .edge_trust
+                .clone()
+                .unwrap_or_else(|| format!("{}/certs/ca.crt", inv.statedir));
+            args.extend(["--edge-ca".into(), trust]);
         }
         args.extend(internal_args(inv));
         spawn(inv, "agent", "flint-agent", &args);
