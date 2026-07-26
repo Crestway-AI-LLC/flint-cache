@@ -381,6 +381,61 @@ fn kill_pidfile(dir: &str, name: &str) {
     }
 }
 
+/// The binaries `flintctl` starts — the orphan sweep's allowlist.
+const FLEET_BINARIES: [&str; 5] = [
+    "flint-server",
+    "flint-proxy",
+    "flint-controlplane",
+    "flint-controller",
+    "flint-agent",
+];
+
+/// Kill fleet processes belonging to THIS inventory that the pidfiles do
+/// not know about.
+///
+/// Why this is needed: pidfiles record only the most recent start, so a
+/// `start` that runs while a fleet is already up orphans the earlier set —
+/// `stop` then leaves it running forever. (Observed on the playground: a
+/// controller from a previous start survived two upgrade cycles. Harmless
+/// there because controllers are epoch-fenced and safe to run concurrently
+/// — but an orphaned NODE holding a port or a data dir is not harmless.)
+///
+/// Scoped twice over, because a stray `kill -9` is worse than a stray
+/// process: a match requires the command line to name one of OUR binaries
+/// AND to carry this inventory's statedir. A second fleet on the same host
+/// (different statedir) is untouched, and so is an editor or tail that
+/// merely has the path open.
+///
+/// Caveat: a fully plaintext fleet (`tls off`, `client-tls off`) can leave
+/// the proxy with no statedir-derived path in its arguments; that one is
+/// only reachable through its pidfile. Every packaged/production fleet is
+/// TLS-on, where all five carry it.
+fn sweep_orphans(inv: &Inventory) -> usize {
+    let Ok(out) = Command::new("ps").args(["-eo", "pid=,args="]).output() else {
+        return 0;
+    };
+    let me = std::process::id();
+    let mut killed = 0;
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let Some((pid, args)) = line.trim().split_once(char::is_whitespace) else {
+            continue;
+        };
+        let Ok(pid) = pid.trim().parse::<u32>() else {
+            continue;
+        };
+        if pid == me || !args.contains(inv.statedir.as_str()) {
+            continue;
+        }
+        if !FLEET_BINARIES.iter().any(|b| args.contains(b)) {
+            continue;
+        }
+        let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
+        eprintln!("  swept orphan pid {pid} (not in pidfiles)");
+        killed += 1;
+    }
+    killed
+}
+
 fn internal_args(inv: &Inventory) -> Vec<String> {
     if !inv.tls {
         return Vec::new();
@@ -1709,18 +1764,26 @@ fn upgrade(inv: &Inventory, version_tag: Option<String>, soak_ms: u64) {
 
 fn stop(inv: &Inventory) {
     let d = &inv.statedir;
-    let Ok(entries) = std::fs::read_dir(format!("{d}/pids")) else {
-        eprintln!("nothing to stop (no pidfiles)");
-        return;
-    };
-    for e in entries.flatten() {
-        let name = e
-            .file_name()
-            .to_string_lossy()
-            .trim_end_matches(".pid")
-            .to_string();
-        kill_pidfile(d, &name);
-        eprintln!("  stopped {name}");
+    match std::fs::read_dir(format!("{d}/pids")) {
+        Ok(entries) => {
+            for e in entries.flatten() {
+                let name = e
+                    .file_name()
+                    .to_string_lossy()
+                    .trim_end_matches(".pid")
+                    .to_string();
+                kill_pidfile(d, &name);
+                eprintln!("  stopped {name}");
+            }
+        }
+        // Missing pidfiles is exactly when the sweep matters most (the
+        // directory was wiped, or a start never recorded), so fall through
+        // rather than returning early.
+        Err(_) => eprintln!("  no pidfiles — sweeping by process instead"),
+    }
+    let swept = sweep_orphans(inv);
+    if swept > 0 {
+        eprintln!("  {swept} orphan(s) swept — a start had run over a live fleet");
     }
 }
 
