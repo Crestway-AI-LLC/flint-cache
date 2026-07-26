@@ -66,11 +66,17 @@ fn cmd(parts: &[&[u8]]) -> Vec<Vec<u8>> {
 /// This distinction is load-bearing for how much the corpus PROVES. For
 /// every other family, a green run against Valkey means the cases encode
 /// real Redis behavior, and a green run against Flint means Flint matches
-/// it — two independent facts. For a flint-only family there is no external
-/// oracle: the corpus IS the contract, written from the Redis/RedisJSON
-/// semantics we chose to implement, and it proves only self-consistency
-/// across our own engines (mem and rocks must agree). Worth stating plainly
-/// rather than letting a 100% line imply more than it does.
+/// it — two independent facts. For a flint-only family the `--reference`
+/// run proves neither, so it is skipped rather than reported as a failure
+/// that would say nothing about either side.
+///
+/// JSON does have an oracle, just not one `--reference` can reach: the
+/// RedisJSON module, which has to be built from source and loaded into a
+/// module-capable server. `tools/redisjson_compare.sh` runs this same
+/// corpus against it and asserts that the ONLY cases which fail are the
+/// three divergences we chose on purpose (see docs/command-support.md).
+/// Run it whenever these cases change; a green run there is what lets us
+/// say "matches RedisJSON" rather than "matches the contract we wrote".
 fn flint_only(family: &str) -> bool {
     matches!(family, "json")
 }
@@ -1257,6 +1263,12 @@ fn corpus() -> Vec<Case> {
         // prove mem/rocks agree on it — not that we match another
         // implementation. Kept frame-comparable: with `preserve_order`,
         // object key order is insertion order, so replies are deterministic.
+        //
+        // The expectations below were checked reply-by-reply against the
+        // real RedisJSON module (built from source, loaded into Redis 8.2),
+        // so "the contract we chose" is a verified match rather than a
+        // reading of the docs. The four places we knowingly differ are
+        // called out inline and in docs/command-support.md.
         Case {
             family: "json",
             name: "document roundtrip: root set, path get, TYPE vocabulary",
@@ -1270,20 +1282,122 @@ fn corpus() -> Vec<Case> {
                     ],
                     Expect::Ok,
                 ),
+                // DIVERGENCE (deliberate): RedisJSON answers its module type
+                // name, "ReJSON-RL". We answer the type, which is what the
+                // rest of our TYPE vocabulary looks like.
                 s(&[b"TYPE", b"doc"], Expect::Simple("json")),
-                s(&[b"JSON.TYPE", b"doc", b"$"], Expect::Simple("object")),
-                s(&[b"JSON.TYPE", b"doc", b"$.n"], Expect::Simple("integer")),
-                s(&[b"JSON.TYPE", b"doc", b"$.s"], Expect::Simple("string")),
-                s(&[b"JSON.TYPE", b"doc", b"$.a"], Expect::Simple("array")),
-                s(&[b"JSON.TYPE", b"doc", b"$.o"], Expect::Simple("object")),
-                s(&[b"JSON.TYPE", b"doc", b"$.o.k"], Expect::Simple("boolean")),
-                s(&[b"JSON.GET", b"doc", b"$.n"], Expect::Str(b"1")),
-                s(&[b"JSON.GET", b"doc", b"$.s"], Expect::Str(br#""x""#)),
-                s(&[b"JSON.GET", b"doc", b"$.a"], Expect::Str(b"[1,2]")),
-                // Absent path and absent key are both nil, never an error.
-                s(&[b"JSON.GET", b"doc", b"$.nope"], Expect::Nil),
+                // JSONPath dialect: every reply is a container of matches.
+                s(
+                    &[b"JSON.TYPE", b"doc", b"$"],
+                    Expect::Arr(vec![Expect::Str(b"object")]),
+                ),
+                s(
+                    &[b"JSON.TYPE", b"doc", b"$.n"],
+                    Expect::Arr(vec![Expect::Str(b"integer")]),
+                ),
+                s(
+                    &[b"JSON.TYPE", b"doc", b"$.s"],
+                    Expect::Arr(vec![Expect::Str(b"string")]),
+                ),
+                s(
+                    &[b"JSON.TYPE", b"doc", b"$.a"],
+                    Expect::Arr(vec![Expect::Str(b"array")]),
+                ),
+                s(
+                    &[b"JSON.TYPE", b"doc", b"$.o"],
+                    Expect::Arr(vec![Expect::Str(b"object")]),
+                ),
+                s(
+                    &[b"JSON.TYPE", b"doc", b"$.o.k"],
+                    Expect::Arr(vec![Expect::Str(b"boolean")]),
+                ),
+                s(&[b"JSON.GET", b"doc", b"$.n"], Expect::Str(b"[1]")),
+                s(&[b"JSON.GET", b"doc", b"$.s"], Expect::Str(br#"["x"]"#)),
+                s(&[b"JSON.GET", b"doc", b"$.a"], Expect::Str(b"[[1,2]]")),
+                // A path that matches nothing is an EMPTY container here —
+                // not nil, not an error. A missing KEY is still nil, in
+                // either dialect.
+                s(&[b"JSON.GET", b"doc", b"$.nope"], Expect::Str(b"[]")),
                 s(&[b"JSON.GET", b"ghost", b"$"], Expect::Nil),
                 s(&[b"JSON.TYPE", b"ghost"], Expect::Nil),
+            ],
+        },
+        // The dialect rule itself, held side by side: the SAME document and
+        // the SAME paths, spelled two ways. This is the case that would
+        // catch a regression where one command forgets to shape its reply.
+        Case {
+            family: "json",
+            name: "path dialects: $ replies in containers, legacy replies bare",
+            steps: vec![
+                s(
+                    &[b"JSON.SET", b"d", b"$", br#"{"n":1,"a":[1,2],"o":{}}"#],
+                    Expect::Ok,
+                ),
+                // JSON.GET / NUMINCRBY carry matches inside the JSON they
+                // return; TYPE / ARRLEN / ARRAPPEND use a RESP array.
+                s(&[b"JSON.GET", b"d", b"$.n"], Expect::Str(b"[1]")),
+                s(&[b"JSON.GET", b"d", b".n"], Expect::Str(b"1")),
+                s(&[b"JSON.GET", b"d", b"n"], Expect::Str(b"1")),
+                // No path at all is the legacy root: the document itself.
+                s(
+                    &[b"JSON.GET", b"d"],
+                    Expect::Str(br#"{"n":1,"a":[1,2],"o":{}}"#),
+                ),
+                s(
+                    &[b"JSON.GET", b"d", b"."],
+                    Expect::Str(br#"{"n":1,"a":[1,2],"o":{}}"#),
+                ),
+                s(
+                    &[b"JSON.GET", b"d", b"$"],
+                    Expect::Str(br#"[{"n":1,"a":[1,2],"o":{}}]"#),
+                ),
+                s(
+                    &[b"JSON.TYPE", b"d", b"$.n"],
+                    Expect::Arr(vec![Expect::Str(b"integer")]),
+                ),
+                s(&[b"JSON.TYPE", b"d", b".n"], Expect::Str(b"integer")),
+                s(
+                    &[b"JSON.ARRLEN", b"d", b"$.a"],
+                    Expect::Arr(vec![Expect::Int(2)]),
+                ),
+                s(&[b"JSON.ARRLEN", b"d", b".a"], Expect::Int(2)),
+                s(
+                    &[b"JSON.ARRAPPEND", b"d", b"$.a", b"3"],
+                    Expect::Arr(vec![Expect::Int(3)]),
+                ),
+                s(&[b"JSON.ARRAPPEND", b"d", b".a", b"4"], Expect::Int(4)),
+                s(
+                    &[b"JSON.NUMINCRBY", b"d", b"$.n", b"1"],
+                    Expect::Str(b"[2]"),
+                ),
+                s(&[b"JSON.NUMINCRBY", b"d", b".n", b"1"], Expect::Str(b"3")),
+                // A path matching nothing: empty container vs error. Same
+                // question, two dialects, two answers — this asymmetry IS
+                // the contract, not an oversight.
+                s(&[b"JSON.GET", b"d", b"$.gone"], Expect::Str(b"[]")),
+                s(&[b"JSON.GET", b"d", b".gone"], Expect::AnyError),
+                s(&[b"JSON.TYPE", b"d", b"$.gone"], Expect::Arr(vec![])),
+                // TYPE is the exception: its legacy dialect answers nil, not
+                // an error — "what type is this" / "nothing" is an answer.
+                // RedisJSON does the same.
+                s(&[b"JSON.TYPE", b"d", b".gone"], Expect::Nil),
+                s(&[b"JSON.ARRLEN", b"d", b"$.gone"], Expect::Arr(vec![])),
+                s(&[b"JSON.ARRLEN", b"d", b".gone"], Expect::AnyError),
+                // A path that matches the WRONG SHAPE: a null element vs an
+                // error. Under multi-match one bad match must not fail the
+                // rest, which is why the container holds a null.
+                s(
+                    &[b"JSON.ARRLEN", b"d", b"$.o"],
+                    Expect::Arr(vec![Expect::Nil]),
+                ),
+                s(&[b"JSON.ARRLEN", b"d", b".o"], Expect::AnyError),
+                s(
+                    &[b"JSON.NUMINCRBY", b"d", b"$.o", b"1"],
+                    Expect::Str(b"[null]"),
+                ),
+                s(&[b"JSON.NUMINCRBY", b"d", b".o", b"1"], Expect::AnyError),
+                // The document survived every one of those refusals.
+                s(&[b"JSON.GET", b"d", b".a"], Expect::Str(b"[1,2,3,4]")),
             ],
         },
         Case {
@@ -1295,21 +1409,31 @@ fn corpus() -> Vec<Case> {
                     Expect::Ok,
                 ),
                 s(&[b"JSON.SET", b"d", b"$.a[0]", b"99"], Expect::Ok),
-                s(&[b"JSON.GET", b"d", b"$.a[0]"], Expect::Str(b"99")),
+                s(&[b"JSON.GET", b"d", b"$.a[0]"], Expect::Str(b"[99]")),
                 // Negative index counts from the end, like Redis.
-                s(&[b"JSON.GET", b"d", b"$.a[-1]"], Expect::Str(b"30")),
+                s(&[b"JSON.GET", b"d", b"$.a[-1]"], Expect::Str(b"[30]")),
                 s(&[b"JSON.SET", b"d", b"$.a[-1]", b"31"], Expect::Ok),
-                s(&[b"JSON.GET", b"d", b"$.a"], Expect::Str(b"[99,20,31]")),
-                // index == len appends; past the end is refused, leaving no hole.
+                s(&[b"JSON.GET", b"d", b"$.a"], Expect::Str(b"[[99,20,31]]")),
+                // DIVERGENCE (deliberate): index == len appends here, where
+                // RedisJSON refuses it in both dialects. Past the end is
+                // refused either way, leaving no hole.
                 s(&[b"JSON.SET", b"d", b"$.a[3]", b"40"], Expect::Ok),
-                s(&[b"JSON.GET", b"d", b"$.a"], Expect::Str(b"[99,20,31,40]")),
+                s(
+                    &[b"JSON.GET", b"d", b"$.a"],
+                    Expect::Str(b"[[99,20,31,40]]"),
+                ),
                 s(&[b"JSON.SET", b"d", b"$.a[9]", b"0"], Expect::AnyError),
-                s(&[b"JSON.GET", b"d", b"$.a"], Expect::Str(b"[99,20,31,40]")),
+                s(
+                    &[b"JSON.GET", b"d", b"$.a"],
+                    Expect::Str(b"[[99,20,31,40]]"),
+                ),
                 // A new leaf is created; intermediates never are.
                 s(&[b"JSON.SET", b"d", b"$.fresh", br#""v""#], Expect::Ok),
-                s(&[b"JSON.GET", b"d", b"$.fresh"], Expect::Str(br#""v""#)),
+                s(&[b"JSON.GET", b"d", b"$.fresh"], Expect::Str(br#"["v"]"#)),
+                // DIVERGENCE (deliberate): RedisJSON answers nil for a
+                // missing intermediate — a silent no-op. We say why.
                 s(&[b"JSON.SET", b"d", b"$.x.y", b"1"], Expect::AnyError),
-                s(&[b"JSON.GET", b"d", b"$.x"], Expect::Nil),
+                s(&[b"JSON.GET", b"d", b"$.x"], Expect::Str(b"[]")),
             ],
         },
         Case {
@@ -1320,26 +1444,34 @@ fn corpus() -> Vec<Case> {
                     &[b"JSON.SET", b"d", b"$", br#"{"i":10,"f":1.5,"s":"x"}"#],
                     Expect::Ok,
                 ),
-                s(&[b"JSON.NUMINCRBY", b"d", b"$.i", b"5"], Expect::Str(b"15")),
+                s(
+                    &[b"JSON.NUMINCRBY", b"d", b"$.i", b"5"],
+                    Expect::Str(b"[15]"),
+                ),
                 s(
                     &[b"JSON.NUMINCRBY", b"d", b"$.i", b"-20"],
-                    Expect::Str(b"-5"),
+                    Expect::Str(b"[-5]"),
                 ),
                 s(
                     &[b"JSON.NUMINCRBY", b"d", b"$.f", b"0.5"],
-                    Expect::Str(b"2.0"),
+                    Expect::Str(b"[2.0]"),
                 ),
-                s(&[b"JSON.NUMINCRBY", b"d", b"$.s", b"1"], Expect::AnyError),
+                s(
+                    &[b"JSON.NUMINCRBY", b"d", b"$.s", b"1"],
+                    Expect::Str(b"[null]"),
+                ),
                 s(
                     &[b"JSON.NUMINCRBY", b"d", b"$.gone", b"1"],
-                    Expect::AnyError,
+                    Expect::Str(b"[]"),
                 ),
+                // A bad INCREMENT is a client error in either dialect — it
+                // is the argument that is wrong, not the match.
                 s(
                     &[b"JSON.NUMINCRBY", b"d", b"$.i", b"notanumber"],
                     Expect::AnyError,
                 ),
                 // The refused increments left the document untouched.
-                s(&[b"JSON.GET", b"d", b"$.i"], Expect::Str(b"-5")),
+                s(&[b"JSON.GET", b"d", b"$.i"], Expect::Str(b"[-5]")),
             ],
         },
         Case {
@@ -1350,18 +1482,36 @@ fn corpus() -> Vec<Case> {
                     &[b"JSON.SET", b"d", b"$", br#"{"a":[],"o":{}}"#],
                     Expect::Ok,
                 ),
-                s(&[b"JSON.ARRLEN", b"d", b"$.a"], Expect::Int(0)),
-                s(&[b"JSON.ARRAPPEND", b"d", b"$.a", b"1"], Expect::Int(1)),
+                s(
+                    &[b"JSON.ARRLEN", b"d", b"$.a"],
+                    Expect::Arr(vec![Expect::Int(0)]),
+                ),
+                s(
+                    &[b"JSON.ARRAPPEND", b"d", b"$.a", b"1"],
+                    Expect::Arr(vec![Expect::Int(1)]),
+                ),
                 s(
                     &[b"JSON.ARRAPPEND", b"d", b"$.a", b"2", b"3"],
-                    Expect::Int(3),
+                    Expect::Arr(vec![Expect::Int(3)]),
                 ),
-                s(&[b"JSON.ARRLEN", b"d", b"$.a"], Expect::Int(3)),
-                s(&[b"JSON.GET", b"d", b"$.a"], Expect::Str(b"[1,2,3]")),
-                // Non-arrays and missing paths are errors, not silent no-ops.
-                s(&[b"JSON.ARRAPPEND", b"d", b"$.o", b"1"], Expect::AnyError),
-                s(&[b"JSON.ARRLEN", b"d", b"$.o"], Expect::AnyError),
-                s(&[b"JSON.ARRLEN", b"d", b"$.gone"], Expect::Nil),
+                s(
+                    &[b"JSON.ARRLEN", b"d", b"$.a"],
+                    Expect::Arr(vec![Expect::Int(3)]),
+                ),
+                s(&[b"JSON.GET", b"d", b"$.a"], Expect::Str(b"[[1,2,3]]")),
+                // Under JSONPath a non-array match is a null element and a
+                // missing path is an empty container; the legacy spellings
+                // of the same three are errors (asserted in the dialect
+                // case above).
+                s(
+                    &[b"JSON.ARRAPPEND", b"d", b"$.o", b"1"],
+                    Expect::Arr(vec![Expect::Nil]),
+                ),
+                s(
+                    &[b"JSON.ARRLEN", b"d", b"$.o"],
+                    Expect::Arr(vec![Expect::Nil]),
+                ),
+                s(&[b"JSON.ARRLEN", b"d", b"$.gone"], Expect::Arr(vec![])),
             ],
         },
         Case {
@@ -1373,12 +1523,15 @@ fn corpus() -> Vec<Case> {
                     Expect::Ok,
                 ),
                 s(&[b"JSON.DEL", b"d", b"$.a"], Expect::Int(1)),
-                s(&[b"JSON.GET", b"d", b"$.a"], Expect::Nil),
+                s(&[b"JSON.GET", b"d", b"$.a"], Expect::Str(b"[]")),
                 s(&[b"EXISTS", b"d"], Expect::Int(1)),
-                // Deleting an absent path reports 0, not an error.
+                // JSON.DEL counts what it removed in BOTH dialects — it
+                // answers a number, not a set of matches, so there is no
+                // container to shape.
                 s(&[b"JSON.DEL", b"d", b"$.a"], Expect::Int(0)),
+                s(&[b"JSON.DEL", b"d", b".a"], Expect::Int(0)),
                 s(&[b"JSON.DEL", b"d", b"$.b[0]"], Expect::Int(1)),
-                s(&[b"JSON.GET", b"d", b"$.b"], Expect::Str(b"[2]")),
+                s(&[b"JSON.GET", b"d", b"$.b"], Expect::Str(b"[[2]]")),
                 // Root delete removes the whole key; FORGET is the alias.
                 s(&[b"JSON.DEL", b"d"], Expect::Int(1)),
                 s(&[b"EXISTS", b"d"], Expect::Int(0)),
@@ -1397,12 +1550,14 @@ fn corpus() -> Vec<Case> {
                     &[b"JSON.SET", b"d", b"$", br#"{"a":2}"#, b"NX"],
                     Expect::Nil,
                 ),
-                s(&[b"JSON.GET", b"d", b"$.a"], Expect::Str(b"1")),
+                s(&[b"JSON.GET", b"d", b"$.a"], Expect::Str(b"[1]")),
+                // A rejected NX/XX is nil in both dialects: the reply says
+                // "I did not write", which is not a set of matches.
                 s(&[b"JSON.SET", b"d", b"$.new", b"7", b"XX"], Expect::Nil),
                 s(&[b"JSON.SET", b"d", b"$.new", b"7", b"NX"], Expect::Ok),
-                s(&[b"JSON.GET", b"d", b"$.new"], Expect::Str(b"7")),
+                s(&[b"JSON.GET", b"d", b"$.new"], Expect::Str(b"[7]")),
                 s(&[b"JSON.SET", b"d", b"$.new", b"8", b"XX"], Expect::Ok),
-                s(&[b"JSON.GET", b"d", b"$.new"], Expect::Str(b"8")),
+                s(&[b"JSON.GET", b"d", b"$.new"], Expect::Str(b"[8]")),
                 s(
                     &[b"JSON.SET", b"d", b"$", b"{}", b"BOGUS"],
                     Expect::AnyError,
@@ -1424,7 +1579,7 @@ fn corpus() -> Vec<Case> {
                 s(&[b"JSON.SET", b"bad", b"$", b"{not json"], Expect::AnyError),
                 s(&[b"EXISTS", b"bad"], Expect::Int(0)),
                 // The document survived every refusal.
-                s(&[b"JSON.GET", b"d", b"$.a.b"], Expect::Str(b"1")),
+                s(&[b"JSON.GET", b"d", b"$.a.b"], Expect::Str(b"[1]")),
             ],
         },
         Case {
@@ -1454,15 +1609,27 @@ fn corpus() -> Vec<Case> {
         },
         Case {
             family: "json",
-            name: "TTL: a sub-path write preserves expiry, a root write clears it",
+            name: "TTL survives every document write, root replacement included",
             steps: vec![
                 s(&[b"JSON.SET", b"d", b"$", br#"{"a":1}"#], Expect::Ok),
                 s(&[b"EXPIRE", b"d", b"100"], Expect::Int(1)),
                 s(&[b"JSON.SET", b"d", b"$.a", b"2"], Expect::Ok),
                 s(&[b"TTL", b"d"], Expect::IntRange(90, 100)),
-                s(&[b"JSON.NUMINCRBY", b"d", b"$.a", b"1"], Expect::Str(b"3")),
+                s(
+                    &[b"JSON.NUMINCRBY", b"d", b"$.a", b"1"],
+                    Expect::Str(b"[3]"),
+                ),
                 s(&[b"TTL", b"d"], Expect::IntRange(90, 100)),
+                // Replacing the whole document is still a mutation of an
+                // existing key, so the expiry stays — unlike a plain SET,
+                // which clears it. Clearing here would silently promote a
+                // TTL'd document to an immortal one, and in a cache that
+                // leak is worse than the inconsistency with SET.
                 s(&[b"JSON.SET", b"d", b"$", br#"{"a":9}"#], Expect::Ok),
+                s(&[b"TTL", b"d"], Expect::IntRange(90, 100)),
+                s(&[b"JSON.DEL", b"d"], Expect::Int(1)),
+                // A fresh key has no expiry to keep.
+                s(&[b"JSON.SET", b"d", b"$", br#"{"a":1}"#], Expect::Ok),
                 s(&[b"TTL", b"d"], Expect::Int(-1)),
                 // An expired document reads as gone.
                 s(&[b"JSON.SET", b"t", b"$", b"[1]"], Expect::Ok),

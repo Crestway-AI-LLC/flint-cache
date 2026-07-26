@@ -969,15 +969,17 @@ impl<'a> Dispatcher<'a> {
     }
 
     /// The JSON family's shared preamble: parse the path argument (absent
-    /// = the root, like Redis) and load the live document. Returns the
-    /// parsed path plus the parsed document, or the error reply to send.
+    /// = the legacy root, like Redis) and load the live document. Returns
+    /// the parsed path plus the parsed document, or the error reply to send.
     fn json_open(
         &self,
         key: &[u8],
         path_arg: Option<&Vec<u8>>,
     ) -> Result<(crate::json_path::Path, Option<serde_json::Value>), Value> {
         let raw = path_arg.map(|p| String::from_utf8_lossy(p).to_string());
-        let path = match crate::json_path::parse(raw.as_deref().unwrap_or("$")) {
+        // No path argument means the LEGACY root, not `$`: `JSON.GET key`
+        // must answer the document, not a container holding it.
+        let path = match crate::json_path::parse(raw.as_deref().unwrap_or(".")) {
             Ok(p) => p,
             Err(crate::json_path::PathError::Unsupported) => {
                 return Err(err(
@@ -1004,13 +1006,64 @@ impl<'a> Dispatcher<'a> {
         Ok((path, doc))
     }
 
+    /// Serialize a JSON value into a bulk reply.
+    fn json_bulk(v: &serde_json::Value) -> Value {
+        match serde_json::to_vec(v) {
+            Ok(b) => Value::Bulk(Some(b)),
+            Err(_) => err("ERR could not serialize value"),
+        }
+    }
+
+    /// Shape a value-returning JSON reply for the caller's dialect.
+    ///
+    /// The commands whose reply IS a JSON document (GET, NUMINCRBY) carry
+    /// their matches inside the serialized JSON — `[1]`, `[null]`, `[]` —
+    /// while the ones that reply in RESP terms (TYPE, ARRLEN, ARRAPPEND) use
+    /// a RESP array instead; `json_resp_matches` below is that variant.
+    /// Both are RedisJSON's shapes, verified against the module.
+    ///
+    /// `found` is the single match (v1 is single-match), `Some(None)` means
+    /// "the path matched, but the value is not what this command operates
+    /// on" — a non-array for ARRLEN, a non-number for NUMINCRBY. Legacy
+    /// callers get an error there; JSONPath callers get a null element,
+    /// because in a multi-match world one bad match must not fail the rest.
+    fn json_doc_matches(
+        path: &crate::json_path::Path,
+        found: Option<Option<serde_json::Value>>,
+        legacy_err: &str,
+    ) -> Value {
+        match (path.is_jsonpath(), found) {
+            (true, Some(Some(v))) => Self::json_bulk(&serde_json::json!([v])),
+            (true, Some(None)) => Self::json_bulk(&serde_json::json!([serde_json::Value::Null])),
+            (true, None) => Self::json_bulk(&serde_json::json!([])),
+            (false, Some(Some(v))) => Self::json_bulk(&v),
+            (false, _) => err(legacy_err),
+        }
+    }
+
+    /// The RESP-array counterpart of [`Self::json_doc_matches`], for the
+    /// commands that answer in RESP types rather than serialized JSON.
+    fn json_resp_matches(
+        path: &crate::json_path::Path,
+        found: Option<Option<Value>>,
+        legacy_err: &str,
+    ) -> Value {
+        match (path.is_jsonpath(), found) {
+            (true, Some(Some(v))) => Value::Array(Some(vec![v])),
+            (true, Some(None)) => Value::Array(Some(vec![Value::Bulk(None)])),
+            (true, None) => Value::Array(Some(Vec::new())),
+            (false, Some(Some(v))) => v,
+            (false, _) => err(legacy_err),
+        }
+    }
+
     /// Persist a mutated document, preserving any TTL (a sub-document write
     /// is an in-place mutation, not a fresh key).
     fn json_save(&self, key: &[u8], doc: &serde_json::Value) -> Option<Value> {
         let Ok(bytes) = serde_json::to_vec(doc) else {
             return Some(err("ERR could not serialize document"));
         };
-        match self.json.set_keep_ttl(slot_for_key(key), key, &bytes) {
+        match self.json.set(slot_for_key(key), key, &bytes) {
             Ok(()) => None,
             Err(e) => Some(store_err(e)),
         }
@@ -1046,6 +1099,10 @@ impl<'a> Dispatcher<'a> {
             let Ok(bytes) = serde_json::to_vec(&value) else {
                 return err("ERR could not serialize document");
             };
+            // Replacing the document is an in-place mutation of an existing
+            // key, not a fresh key, so the TTL survives — RedisJSON's
+            // behavior, and the safe direction for a cache: clearing it
+            // would quietly turn an expiring document into an immortal one.
             return match self.json.set(slot_for_key(key), key, &bytes) {
                 Ok(()) => Value::Simple("OK".into()),
                 Err(e) => store_err(e),
@@ -1075,8 +1132,9 @@ impl<'a> Dispatcher<'a> {
         }
     }
 
-    /// JSON.GET key [path] — the value at the path, serialized. Nil when the
-    /// key or the path is absent.
+    /// JSON.GET key [path] — the value at the path, serialized. A missing
+    /// KEY is nil in either dialect; a missing PATH is `[]` under JSONPath
+    /// and an error under the legacy dialect.
     fn cmd_json_get(&self, args: &[Vec<u8>]) -> Value {
         if args.len() < 2 || args.len() > 3 {
             return arity_err("json.get");
@@ -1088,13 +1146,8 @@ impl<'a> Dispatcher<'a> {
         let Some(doc) = doc else {
             return Value::Bulk(None);
         };
-        match crate::json_path::get(&doc, &path) {
-            None => Value::Bulk(None),
-            Some(v) => match serde_json::to_vec(v) {
-                Ok(b) => Value::Bulk(Some(b)),
-                Err(_) => err("ERR could not serialize value"),
-            },
-        }
+        let found = crate::json_path::get(&doc, &path).map(|v| Some(v.clone()));
+        Self::json_doc_matches(&path, found, PATH_MISSING)
     }
 
     /// JSON.DEL key [path] — root path deletes the key; a sub-path removes
@@ -1128,7 +1181,7 @@ impl<'a> Dispatcher<'a> {
     }
 
     /// JSON.TYPE key [path] — Redis's type vocabulary for the value at the
-    /// path; nil when absent.
+    /// path. Nil when the KEY is absent (either dialect).
     fn cmd_json_type(&self, args: &[Vec<u8>]) -> Value {
         if args.len() < 2 || args.len() > 3 {
             return arity_err("json.type");
@@ -1137,10 +1190,22 @@ impl<'a> Dispatcher<'a> {
             Ok(v) => v,
             Err(reply) => return reply,
         };
-        match doc.as_ref().and_then(|d| crate::json_path::get(d, &path)) {
-            None => Value::Bulk(None),
-            Some(v) => Value::Simple(crate::json_path::type_name(v).into()),
-        }
+        let Some(doc) = doc else {
+            return Value::Bulk(None);
+        };
+        let Some(v) = crate::json_path::get(&doc, &path) else {
+            // JSON.TYPE is the one command whose legacy dialect answers NIL
+            // rather than an error for a path that matches nothing — asking
+            // what type something is and being told "nothing" is an answer,
+            // not a failure. Verified against RedisJSON, which is otherwise
+            // error-on-no-match for the legacy dialect.
+            return match path.is_jsonpath() {
+                true => Value::Array(Some(Vec::new())),
+                false => Value::Bulk(None),
+            };
+        };
+        let name = Value::Bulk(Some(crate::json_path::type_name(v).into()));
+        Self::json_resp_matches(&path, Some(Some(name)), PATH_MISSING)
     }
 
     /// JSON.NUMINCRBY key path number — atomically add to a number at the
@@ -1160,13 +1225,15 @@ impl<'a> Dispatcher<'a> {
             Err(reply) => return reply,
         };
         let Some(mut doc) = doc else {
-            return err("ERR no such key");
+            return err(NO_SUCH_KEY);
         };
+        // Three outcomes, and the dialect decides how the last two read:
+        // no match at all, a match that is not a number, or a new value.
         let Some(slot) = crate::json_path::get_mut(&mut doc, &path) else {
-            return err("ERR path does not exist");
+            return Self::json_doc_matches(&path, None, PATH_MISSING);
         };
         let Some(cur) = slot.as_f64() else {
-            return err("ERR path does not hold a number");
+            return Self::json_doc_matches(&path, Some(None), "ERR path does not hold a number");
         };
         let next = cur + by;
         if !next.is_finite() {
@@ -1183,10 +1250,7 @@ impl<'a> Dispatcher<'a> {
         let out = slot.clone();
         match self.json_save(&args[1], &doc) {
             Some(e) => e,
-            None => match serde_json::to_vec(&out) {
-                Ok(b) => Value::Bulk(Some(b)),
-                Err(_) => err("ERR could not serialize value"),
-            },
+            None => Self::json_doc_matches(&path, Some(Some(out)), PATH_MISSING),
         }
     }
 
@@ -1208,19 +1272,19 @@ impl<'a> Dispatcher<'a> {
             Err(reply) => return reply,
         };
         let Some(mut doc) = doc else {
-            return err("ERR no such key");
+            return err(NO_SUCH_KEY);
         };
         let Some(target) = crate::json_path::get_mut(&mut doc, &path) else {
-            return err("ERR path does not exist");
+            return Self::json_resp_matches(&path, None, PATH_MISSING);
         };
         let serde_json::Value::Array(arr) = target else {
-            return err("ERR path does not hold an array");
+            return Self::json_resp_matches(&path, Some(None), NOT_AN_ARRAY);
         };
         arr.extend(values);
         let len = arr.len() as i64;
         match self.json_save(&args[1], &doc) {
             Some(e) => e,
-            None => Value::Integer(len),
+            None => Self::json_resp_matches(&path, Some(Some(Value::Integer(len))), NOT_AN_ARRAY),
         }
     }
 
@@ -1233,10 +1297,21 @@ impl<'a> Dispatcher<'a> {
             Ok(v) => v,
             Err(reply) => return reply,
         };
-        match doc.as_ref().and_then(|d| crate::json_path::get(d, &path)) {
-            None => Value::Bulk(None),
-            Some(serde_json::Value::Array(a)) => Value::Integer(a.len() as i64),
-            Some(_) => err("ERR path does not hold an array"),
+        let Some(doc) = doc else {
+            return Value::Bulk(None);
+        };
+        // The two failure shapes carry different legacy messages, so they
+        // are separate calls rather than one folded expression.
+        let Some(v) = crate::json_path::get(&doc, &path) else {
+            return Self::json_resp_matches(&path, None, PATH_MISSING);
+        };
+        match v {
+            serde_json::Value::Array(a) => Self::json_resp_matches(
+                &path,
+                Some(Some(Value::Integer(a.len() as i64))),
+                NOT_AN_ARRAY,
+            ),
+            _ => Self::json_resp_matches(&path, Some(None), NOT_AN_ARRAY),
         }
     }
 
@@ -1847,6 +1922,13 @@ fn parse_i64(raw: &[u8]) -> Result<i64, ()> {
         .map_err(|_| ())
 }
 
+/// The legacy-dialect JSON errors. Only ever reached from a non-`$` path:
+/// a JSONPath caller gets an empty or null-holding container instead, which
+/// is the whole point of the two dialects.
+const PATH_MISSING: &str = "ERR Path does not exist";
+const NOT_AN_ARRAY: &str = "ERR path does not hold an array";
+const NO_SUCH_KEY: &str = "ERR could not perform this operation on a key that doesn't exist";
+
 fn err(msg: &str) -> Value {
     Value::Error(msg.into())
 }
@@ -1997,12 +2079,21 @@ mod tests {
             Value::Simple("OK".into())
         );
         assert_eq!(call(&s, &[b"TYPE", b"d"]), Value::Simple("json".into()));
+        // `$` paths reply in containers; the legacy spellings reply bare.
         assert_eq!(
             call(&s, &[b"JSON.TYPE", b"d", b"$.a"]),
-            Value::Simple("integer".into())
+            Value::Array(Some(vec![Value::Bulk(Some(b"integer".to_vec()))]))
+        );
+        assert_eq!(
+            call(&s, &[b"JSON.TYPE", b"d", b".a"]),
+            Value::Bulk(Some(b"integer".to_vec()))
         );
         assert_eq!(
             call(&s, &[b"JSON.GET", b"d", b"$.a"]),
+            Value::Bulk(Some(b"[1]".to_vec()))
+        );
+        assert_eq!(
+            call(&s, &[b"JSON.GET", b"d", b".a"]),
             Value::Bulk(Some(b"1".to_vec()))
         );
         // Sub-path write, then read back through the whole document.
@@ -2012,27 +2103,42 @@ mod tests {
         );
         assert_eq!(
             call(&s, &[b"JSON.GET", b"d", b"$.a"]),
-            Value::Bulk(Some(b"42".to_vec()))
+            Value::Bulk(Some(b"[42]".to_vec()))
         );
         // Array ops.
         assert_eq!(
             call(&s, &[b"JSON.ARRAPPEND", b"d", b"$.t", br#""y""#, br#""z""#]),
-            Value::Integer(3)
+            Value::Array(Some(vec![Value::Integer(3)]))
         );
-        assert_eq!(call(&s, &[b"JSON.ARRLEN", b"d", b"$.t"]), Value::Integer(3));
+        assert_eq!(
+            call(&s, &[b"JSON.ARRLEN", b"d", b"$.t"]),
+            Value::Array(Some(vec![Value::Integer(3)]))
+        );
+        assert_eq!(call(&s, &[b"JSON.ARRLEN", b"d", b".t"]), Value::Integer(3));
         assert_eq!(
             call(&s, &[b"JSON.GET", b"d", b"$.t[-1]"]),
-            Value::Bulk(Some(br#""z""#.to_vec()))
+            Value::Bulk(Some(br#"["z"]"#.to_vec()))
         );
         // Numeric increment keeps integers integral.
         assert_eq!(
             call(&s, &[b"JSON.NUMINCRBY", b"d", b"$.a", b"8"]),
+            Value::Bulk(Some(b"[50]".to_vec()))
+        );
+        assert_eq!(
+            call(&s, &[b"JSON.NUMINCRBY", b"d", b".a", b"0"]),
             Value::Bulk(Some(b"50".to_vec()))
         );
-        // Path delete removes just that member; the document survives.
+        // Path delete removes just that member; the document survives. A
+        // path matching nothing is an empty container, not nil.
         assert_eq!(call(&s, &[b"JSON.DEL", b"d", b"$.a"]), Value::Integer(1));
-        assert_eq!(call(&s, &[b"JSON.GET", b"d", b"$.a"]), Value::Bulk(None));
-        assert_eq!(call(&s, &[b"JSON.ARRLEN", b"d", b"$.t"]), Value::Integer(3));
+        assert_eq!(
+            call(&s, &[b"JSON.GET", b"d", b"$.a"]),
+            Value::Bulk(Some(b"[]".to_vec()))
+        );
+        assert_eq!(
+            call(&s, &[b"JSON.ARRLEN", b"d", b"$.t"]),
+            Value::Array(Some(vec![Value::Integer(3)]))
+        );
         // Root delete removes the key.
         assert_eq!(call(&s, &[b"JSON.DEL", b"d"]), Value::Integer(1));
         assert_eq!(call(&s, &[b"EXISTS", b"d"]), Value::Integer(0));
@@ -2057,14 +2163,26 @@ mod tests {
             call(&s, &[b"JSON.SET", b"d", b"$.x.y", b"1"]),
             Value::Error(e) if e.contains("parent")
         ));
-        assert_eq!(call(&s, &[b"JSON.GET", b"d", b"$.x"]), Value::Bulk(None));
-        // Type mismatches at the path.
-        assert!(matches!(
+        assert_eq!(
+            call(&s, &[b"JSON.GET", b"d", b"$.x"]),
+            Value::Bulk(Some(b"[]".to_vec()))
+        );
+        // Type mismatches at the path: a null element under `$`, an error
+        // under the legacy dialect. Same condition, two contracts.
+        assert_eq!(
             call(&s, &[b"JSON.NUMINCRBY", b"d", b"$.s", b"1"]),
+            Value::Bulk(Some(b"[null]".to_vec()))
+        );
+        assert!(matches!(
+            call(&s, &[b"JSON.NUMINCRBY", b"d", b".s", b"1"]),
             Value::Error(e) if e.contains("number")
         ));
-        assert!(matches!(
+        assert_eq!(
             call(&s, &[b"JSON.ARRAPPEND", b"d", b"$.o", b"1"]),
+            Value::Array(Some(vec![Value::Bulk(None)]))
+        );
+        assert!(matches!(
+            call(&s, &[b"JSON.ARRAPPEND", b"d", b".o", b"1"]),
             Value::Error(e) if e.contains("array")
         ));
         // Invalid JSON input is rejected before it can be stored.
@@ -2104,16 +2222,24 @@ mod tests {
         );
         assert_eq!(
             call(&s, &[b"JSON.GET", b"d", b"$.a"]),
-            Value::Bulk(Some(b"9".to_vec()))
+            Value::Bulk(Some(b"[9]".to_vec()))
         );
-        // A sub-path write preserves the key's TTL (an in-place mutation).
+        // EVERY document write is an in-place mutation of an existing key,
+        // so the TTL survives — the root replacement included. Clearing it
+        // there would quietly make an expiring document immortal.
         assert_eq!(call(&s, &[b"EXPIRE", b"d", b"100"]), Value::Integer(1));
         call(&s, &[b"JSON.SET", b"d", b"$.a", b"10"]);
         assert!(
             matches!(call(&s, &[b"TTL", b"d"]), Value::Integer(t) if t > 0),
             "sub-path write kept the TTL"
         );
-        // A ROOT write clears it, like a plain SET.
+        call(&s, &[b"JSON.SET", b"d", b"$", br#"{"a":1}"#]);
+        assert!(
+            matches!(call(&s, &[b"TTL", b"d"]), Value::Integer(t) if t > 0),
+            "root replacement kept the TTL too"
+        );
+        // A genuinely fresh key has no expiry to keep.
+        call(&s, &[b"JSON.DEL", b"d"]);
         call(&s, &[b"JSON.SET", b"d", b"$", br#"{"a":1}"#]);
         assert_eq!(call(&s, &[b"TTL", b"d"]), Value::Integer(-1));
     }

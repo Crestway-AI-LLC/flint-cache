@@ -11,11 +11,12 @@
 //! NOT in v1, and rejected with a clear error rather than half-honored:
 //! wildcards (`$.a[*]`, `$.*`), recursive descent (`$..a`), slices
 //! (`[0:2]`), and filter expressions (`?(@.x>1)`). Those turn every command
-//! into a multi-match API — each reply becomes an array of results, and
-//! mutations apply to N places — which is a semantic step this type does
-//! not need to take before real usage tells us which ones matter. A wrong
-//! guess here is a compatibility break later; an unsupported-path error is
-//! not.
+//! into a multi-match API — mutations would apply to N places — which is a
+//! semantic step this type does not need to take before real usage tells us
+//! which ones matter. A wrong guess here is a compatibility break later; an
+//! unsupported-path error is not.
+//!
+//! The REPLY side of multi-match, though, we adopt today: see [`Mode`].
 
 use serde_json::Value as J;
 
@@ -28,13 +29,53 @@ pub enum Step {
     Index(i64),
 }
 
-/// A parsed path: the steps from the document root (empty = the root).
+/// Which path dialect the caller used — and therefore which reply shape
+/// they expect back.
+///
+/// RedisJSON has two, distinguished purely by a leading `$`, and clients
+/// depend on the difference: `redis-py`'s `json().get(key, "$.a")` indexes
+/// `[0]` off the reply, so answering a bare scalar breaks it.
+///
+/// - [`Mode::Legacy`] (`.a`, `a`, or no path at all): the reply is the
+///   value itself, and a path that matches nothing is an ERROR.
+/// - [`Mode::JsonPath`] (anything starting with `$`): the reply is a
+///   CONTAINER of matches — one element here, since v1 is single-match —
+///   and a path that matches nothing is an empty container, not an error.
+///
+/// Wrapping now is also what makes multi-match additive later: the array is
+/// already the right shape, so `$..a` returning two elements would not
+/// change any reply type. Shipping scalars would have made it a break.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Mode {
+    #[default]
+    Legacy,
+    JsonPath,
+}
+
+/// A parsed path: the steps from the document root (empty = the root), plus
+/// the dialect it was written in.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct Path(pub Vec<Step>);
+pub struct Path {
+    pub steps: Vec<Step>,
+    pub mode: Mode,
+}
 
 impl Path {
+    /// A path built internally (parent walks), where the dialect is
+    /// irrelevant because nothing is replied from it.
+    fn internal(steps: Vec<Step>) -> Self {
+        Self {
+            steps,
+            mode: Mode::Legacy,
+        }
+    }
+
     pub fn is_root(&self) -> bool {
-        self.0.is_empty()
+        self.steps.is_empty()
+    }
+
+    pub fn is_jsonpath(&self) -> bool {
+        self.mode == Mode::JsonPath
     }
 }
 
@@ -50,12 +91,26 @@ pub enum PathError {
     Unsupported,
 }
 
-/// Parse the supported subset. Accepts `$`-rooted and legacy dot paths;
-/// an empty path means the root (Redis defaults a missing path to `$`).
+/// Parse the supported subset. Accepts `$`-rooted and legacy dot paths; an
+/// empty path means the LEGACY root, because a caller who passed no path at
+/// all (`JSON.GET key`) wants the document itself, not a one-element
+/// container holding it.
 pub fn parse(path: &str) -> Result<Path, PathError> {
     let s = path.trim();
-    if s.is_empty() || s == "$" {
-        return Ok(Path::default());
+    // The dialect is decided by the leading `$` alone, before any parsing,
+    // so even a rejected path knows which shape its caller expected.
+    let mode = if s.starts_with('$') {
+        Mode::JsonPath
+    } else {
+        Mode::Legacy
+    };
+    // `.` is the legacy spelling of the root, still what older RedisJSON
+    // docs and examples use; `$` is the JSONPath one.
+    if s.is_empty() || s == "$" || s == "." {
+        return Ok(Path {
+            steps: Vec::new(),
+            mode,
+        });
     }
     // Reject the multi-match constructs explicitly, before parsing, so the
     // error names the reason instead of "malformed".
@@ -104,7 +159,7 @@ pub fn parse(path: &str) -> Result<Path, PathError> {
             rest = &rest[end..];
         }
     }
-    Ok(Path(steps))
+    Ok(Path { steps, mode })
 }
 
 /// Resolve an array index against a length: negative counts from the end.
@@ -118,7 +173,7 @@ fn resolve_index(idx: i64, len: usize) -> Option<usize> {
 /// disagrees (member step into an array, index into an object, …).
 pub fn get<'v>(doc: &'v J, path: &Path) -> Option<&'v J> {
     let mut cur = doc;
-    for step in &path.0 {
+    for step in &path.steps {
         cur = match (step, cur) {
             (Step::Key(k), J::Object(m)) => m.get(k)?,
             (Step::Index(i), J::Array(a)) => a.get(resolve_index(*i, a.len())?)?,
@@ -132,7 +187,7 @@ pub fn get<'v>(doc: &'v J, path: &Path) -> Option<&'v J> {
 /// ARRAPPEND). None when the path does not resolve.
 pub fn get_mut<'v>(doc: &'v mut J, path: &Path) -> Option<&'v mut J> {
     let mut cur = doc;
-    for step in &path.0 {
+    for step in &path.steps {
         cur = match (step, cur) {
             (Step::Key(k), J::Object(m)) => m.get_mut(k)?,
             (Step::Index(i), J::Array(a)) => {
@@ -164,11 +219,11 @@ pub enum SetOutcome {
 /// Write `value` at `path`, creating the LEAF only (never intermediates).
 /// Appending to an array is expressed as the index == len.
 pub fn set(doc: &mut J, path: &Path, value: J) -> SetOutcome {
-    let Some((last, parents)) = path.0.split_last() else {
+    let Some((last, parents)) = path.steps.split_last() else {
         *doc = value; // root replace
         return SetOutcome::Set;
     };
-    let parent_path = Path(parents.to_vec());
+    let parent_path = Path::internal(parents.to_vec());
     let Some(parent) = get_mut(doc, &parent_path) else {
         return SetOutcome::MissingParent;
     };
@@ -205,10 +260,10 @@ pub fn set(doc: &mut J, path: &Path, value: J) -> SetOutcome {
 /// is never removed here (that is a whole-key DEL, which the command layer
 /// routes to the store).
 pub fn remove(doc: &mut J, path: &Path) -> bool {
-    let Some((last, parents)) = path.0.split_last() else {
+    let Some((last, parents)) = path.steps.split_last() else {
         return false;
     };
-    let parent_path = Path(parents.to_vec());
+    let parent_path = Path::internal(parents.to_vec());
     let Some(parent) = get_mut(doc, &parent_path) else {
         return false;
     };
@@ -256,18 +311,34 @@ mod tests {
     fn parses_root_dot_bracket_and_legacy_forms() {
         assert!(p("$").is_root());
         assert!(p("").is_root());
-        assert_eq!(p("$.a").0, vec![Step::Key("a".into())]);
-        assert_eq!(p("a").0, vec![Step::Key("a".into())]);
+        assert_eq!(p("$.a").steps, vec![Step::Key("a".into())]);
+        assert_eq!(p("a").steps, vec![Step::Key("a".into())]);
         assert_eq!(
-            p("$.a.b[2]").0,
+            p("$.a.b[2]").steps,
             vec![Step::Key("a".into()), Step::Key("b".into()), Step::Index(2)]
         );
-        assert_eq!(p("$[0]").0, vec![Step::Index(0)]);
-        assert_eq!(p("$[-1]").0, vec![Step::Index(-1)]);
+        assert_eq!(p("$[0]").steps, vec![Step::Index(0)]);
+        assert_eq!(p("$[-1]").steps, vec![Step::Index(-1)]);
         assert_eq!(
-            p(r#"$["odd key"].n"#).0,
+            p(r#"$["odd key"].n"#).steps,
             vec![Step::Key("odd key".into()), Step::Key("n".into())]
         );
+    }
+
+    #[test]
+    fn the_leading_dollar_alone_picks_the_dialect() {
+        for s in ["$", "$.a", "$[0]", r#"$["k"]"#] {
+            assert_eq!(p(s).mode, Mode::JsonPath, "{s}");
+            assert!(p(s).is_jsonpath(), "{s}");
+        }
+        // No `$`, including the no-path-at-all case, is the legacy dialect:
+        // `JSON.GET key` must answer the document, not `[document]`.
+        for s in ["", ".a", "a", "a.b[0]", "."] {
+            assert_eq!(p(s).mode, Mode::Legacy, "{s}");
+        }
+        // All three spellings of the root resolve identically; only the
+        // reply shape they imply differs.
+        assert!(p("$").is_root() && p("").is_root() && p(".").is_root());
     }
 
     #[test]

@@ -85,23 +85,20 @@ impl<'a> JsonStore<'a> {
         Ok(self.read_live(slot, key)?.is_some())
     }
 
-    /// Whole-document write, and the raw primitive: it overwrites whatever
-    /// row is there, of any type, and clears the TTL.
+    /// Write a document, preserving whatever expiry the key already had.
     ///
-    /// The TYPE GATE lives one layer up, in the command handler: JSON.SET
-    /// reads the key first and refuses a non-JSON value with WRONGTYPE, so
-    /// a document write is never a silent way to destroy a string or a
-    /// hash (RedisJSON behaves the same way, and unlike a plain SET, which
-    /// does clobber anything). In practice this primitive is therefore only
-    /// reached for JSON-over-JSON overwrites and for fresh keys — but it
-    /// stays permissive because the storage layer does not adjudicate
-    /// types; it stores bytes.
+    /// EVERY document write goes through here — whole-document replacement
+    /// as much as a sub-path edit — because both are mutations of an
+    /// existing key, not fresh keys. Clearing the TTL on a root write would
+    /// quietly turn an expiring document into an immortal one, which for a
+    /// cache is the expensive direction to be wrong in; RedisJSON preserves
+    /// it too. A fresh key has no expiry to keep, so it lands at 0.
+    ///
+    /// The read this does to recover the expiry also re-applies the type
+    /// gate: writing a document over a string errors here as well as in the
+    /// command handler. Belt and braces, and it costs a read we already
+    /// wanted.
     pub fn set(&self, slot: u16, key: &[u8], doc: &[u8]) -> Result<(), StoreError> {
-        self.write(slot, key, doc, 0)
-    }
-
-    /// Write preserving an expiry (sub-path updates: mutate, keep the TTL).
-    pub fn set_keep_ttl(&self, slot: u16, key: &[u8], doc: &[u8]) -> Result<(), StoreError> {
         let keep = self.read_live(slot, key)?.map(|(_, e)| e).unwrap_or(0);
         self.write(slot, key, doc, keep)
     }
@@ -166,34 +163,37 @@ mod tests {
     }
 
     #[test]
-    fn raw_set_is_permissive_the_command_layer_holds_the_type_gate() {
+    fn a_document_write_never_clobbers_a_foreign_type() {
         let kv = MemKv::new();
         let s = StringStore::new(&kv, b"t", system_clock);
         let j = store(&kv);
         s.set(1, b"k", b"v", Default::default()).expect("set str");
-        // The PRIMITIVE overwrites any row — storage stores bytes and does
-        // not adjudicate types. JSON.SET refuses this at the command layer
-        // (WRONGTYPE, asserted in the conformance corpus), so a document
-        // write can never silently destroy a string in practice.
-        j.set(1, b"k", b"[1,2]").expect("primitive overwrites");
-        assert_eq!(j.get(1, b"k").expect("get").as_deref(), Some(&b"[1,2]"[..]));
+        // The command layer refuses this first (WRONGTYPE, asserted in the
+        // conformance corpus); storage refuses it too, so no path into this
+        // crate can silently destroy a string with a document.
+        assert_eq!(j.set(1, b"k", b"[1,2]"), Err(StoreError::WrongType));
+        assert_eq!(s.get(1, b"k").expect("get").as_deref(), Some(&b"v"[..]));
     }
 
     #[test]
-    fn set_keep_ttl_preserves_expiry() {
+    fn every_write_preserves_expiry_root_replacement_included() {
         let kv = MemKv::new();
         let j = store(&kv);
         // Write with an expiry by hand (the command layer does this through
-        // the keyspace layer's EXPIRE), then confirm a path-style rewrite
-        // does not clear it.
+        // the keyspace layer's EXPIRE), then confirm neither a sub-path
+        // rewrite nor a whole-document replacement clears it. The root case
+        // is the one that matters: a TTL'd document must not become
+        // immortal because someone replaced its contents.
         let far = system_clock() + 60_000;
         let row = StringMeta::new_typed(ValueType::Json, br#"{"a":1}"#.to_vec(), far).encode();
         kv.put(&envelope(Cf::Metadata, b"t", 1, b"d"), &row);
-        j.set_keep_ttl(1, b"d", br#"{"a":2}"#).expect("keep ttl");
-        let raw = kv.get(&envelope(Cf::Metadata, b"t", 1, b"d")).expect("row");
-        let h = MetaHeader::decode(&raw).expect("header");
-        assert_eq!(h.expire_ms, far, "expiry survives a sub-path rewrite");
-        assert_eq!(h.value_type(), Some(ValueType::Json));
+        for doc in [&br#"{"a":2}"#[..], &br#"[9]"#[..]] {
+            j.set(1, b"d", doc).expect("write");
+            let raw = kv.get(&envelope(Cf::Metadata, b"t", 1, b"d")).expect("row");
+            let h = MetaHeader::decode(&raw).expect("header");
+            assert_eq!(h.expire_ms, far, "expiry survived");
+            assert_eq!(h.value_type(), Some(ValueType::Json));
+        }
     }
 
     #[test]
