@@ -1,8 +1,18 @@
 # Command support
 
 Every supported command is gated by the conformance oracle: a corpus case
-validated against a real Valkey and both Flint engines (mem, rocks). If it
-is listed here, `flint-conformance` proves it behaves like Redis.
+run against both Flint engines (mem, rocks). For every family with a
+counterpart in the reference implementation, the same case also runs
+against a real Valkey — so a green run proves two independent things: the
+case encodes real Redis behavior, and Flint matches it.
+
+**One exception, stated plainly: the JSON family has no reference.** Stock
+Redis/Valkey have no JSON type (it is the separate RedisJSON module), so
+those cases assert the contract we chose — modelled on RedisJSON, and
+documented under "Semantics worth knowing" where we deliberately diverge —
+and prove our two engines agree on it. They do not prove bug-for-bug
+RedisJSON compatibility. `flint-conformance --reference` skips them rather
+than reporting a failure that would say nothing about either side.
 
 ## Supported
 
@@ -12,6 +22,9 @@ to the tenant namespace).
 
 **Keyspace**: DEL, UNLINK, EXISTS, TYPE, EXPIRE, PEXPIRE, EXPIREAT,
 PEXPIREAT, TTL, PTTL, EXPIRETIME, PEXPIRETIME, PERSIST.
+
+**JSON documents**: JSON.SET (NX, XX), JSON.GET, JSON.DEL / JSON.FORGET,
+JSON.TYPE, JSON.NUMINCRBY, JSON.ARRAPPEND, JSON.ARRLEN.
 
 **Keyspace iteration**: SCAN (MATCH, COUNT, TYPE) — incremental, works
 through the proxy across all shard pairs as one cursor stream (redis-cli
@@ -51,6 +64,21 @@ ZREMRANGEBYSCORE, ZREMRANGEBYRANK, ZSCAN (MATCH, COUNT).
   tenant that opened them. Client iterators only ever echo server cursors,
   so real tools (redis-cli `--scan`, RedisInsight, client `scan_iter`s)
   are unaffected.
+- **JSON paths are a single-match subset.** `$`, object members, and array
+  indexes in any mix — `$.user.tags[0]`, `$["odd key"].n`, negative indexes
+  counting from the end, and the legacy dot form (`user.tags[0]`). Wildcards
+  (`$.a[*]`, `$.*`), recursive descent (`$..a`), slices, and filters are
+  rejected as UNSUPPORTED — a distinct error from a malformed path, because
+  they would turn every command into a multi-match API and we would rather
+  say no than guess a semantic we cannot change later.
+- **JSON writes create the leaf, never intermediate levels**, so a typo
+  cannot silently grow a document a shape you did not ask for; a sub-path
+  write preserves the key's TTL, while a root write clears it like a plain
+  SET. **JSON.SET will not overwrite a non-JSON key** (WRONGTYPE) — unlike a
+  plain SET, a document write is never a silent way to destroy a string or a
+  hash. JSON.NUMINCRBY keeps integers integral. Documents are stored as one
+  row, so they live beyond RAM like any value; sub-document writes rewrite
+  that row.
 - **INCRBYFLOAT** formats like Redis (`%.17f`, trailing zeros trimmed).
 - **Expiry is lazy + swept**: an expired key reads as missing immediately;
   physical reclamation is background.
@@ -61,15 +89,6 @@ ZREMRANGEBYSCORE, ZREMRANGEBYRANK, ZSCAN (MATCH, COUNT).
   (rate quota / back-pressure; retry with backoff), `-TRYAGAIN`
   (mid-migration write or fenced stale replica; the proxy retries/falls
   back for you).
-
-## Planned
-
-- **JSON** (near roadmap): a native document type — JSON.SET / JSON.GET /
-  JSON.DEL / JSON.TYPE / numeric and array ops, addressed by JSONPath.
-  Flint's own implementation (conformance-tested against a reference the
-  way every type is — not the RedisJSON module), built on the existing
-  envelope encoding, so large documents live beyond RAM like any other
-  value. Slot-sharded and single-key, consistent with the tenancy model.
 
 ## Excluded by design
 

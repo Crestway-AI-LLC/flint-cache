@@ -85,9 +85,17 @@ impl<'a> JsonStore<'a> {
         Ok(self.read_live(slot, key)?.is_some())
     }
 
-    /// Whole-document write. Replaces any existing value INCLUDING another
-    /// type (Redis's SET semantics — a document overwrite is not a type
-    /// error), and clears the TTL, like a plain SET.
+    /// Whole-document write, and the raw primitive: it overwrites whatever
+    /// row is there, of any type, and clears the TTL.
+    ///
+    /// The TYPE GATE lives one layer up, in the command handler: JSON.SET
+    /// reads the key first and refuses a non-JSON value with WRONGTYPE, so
+    /// a document write is never a silent way to destroy a string or a
+    /// hash (RedisJSON behaves the same way, and unlike a plain SET, which
+    /// does clobber anything). In practice this primitive is therefore only
+    /// reached for JSON-over-JSON overwrites and for fresh keys — but it
+    /// stays permissive because the storage layer does not adjudicate
+    /// types; it stores bytes.
     pub fn set(&self, slot: u16, key: &[u8], doc: &[u8]) -> Result<(), StoreError> {
         self.write(slot, key, doc, 0)
     }
@@ -158,13 +166,16 @@ mod tests {
     }
 
     #[test]
-    fn document_overwrite_replaces_any_type_and_clears_ttl() {
+    fn raw_set_is_permissive_the_command_layer_holds_the_type_gate() {
         let kv = MemKv::new();
         let s = StringStore::new(&kv, b"t", system_clock);
         let j = store(&kv);
         s.set(1, b"k", b"v", Default::default()).expect("set str");
-        // Whole-document SET wins over a foreign type (Redis SET semantics).
-        j.set(1, b"k", b"[1,2]").expect("overwrite");
+        // The PRIMITIVE overwrites any row — storage stores bytes and does
+        // not adjudicate types. JSON.SET refuses this at the command layer
+        // (WRONGTYPE, asserted in the conformance corpus), so a document
+        // write can never silently destroy a string in practice.
+        j.set(1, b"k", b"[1,2]").expect("primitive overwrites");
         assert_eq!(j.get(1, b"k").expect("get").as_deref(), Some(&b"[1,2]"[..]));
     }
 

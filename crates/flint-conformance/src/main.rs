@@ -59,6 +59,22 @@ fn cmd(parts: &[&[u8]]) -> Vec<Vec<u8>> {
     parts.iter().map(|p| p.to_vec()).collect()
 }
 
+/// Families the reference implementation does not have, so it cannot serve
+/// as their oracle. `--reference` skips them; against Flint targets they
+/// run normally.
+///
+/// This distinction is load-bearing for how much the corpus PROVES. For
+/// every other family, a green run against Valkey means the cases encode
+/// real Redis behavior, and a green run against Flint means Flint matches
+/// it — two independent facts. For a flint-only family there is no external
+/// oracle: the corpus IS the contract, written from the Redis/RedisJSON
+/// semantics we chose to implement, and it proves only self-consistency
+/// across our own engines (mem and rocks must agree). Worth stating plainly
+/// rather than letting a 100% line imply more than it does.
+fn flint_only(family: &str) -> bool {
+    matches!(family, "json")
+}
+
 fn corpus() -> Vec<Case> {
     let big = vec![0xABu8; 1024];
     vec![
@@ -1236,6 +1252,226 @@ fn corpus() -> Vec<Case> {
         // tested here: Valkey accepts any integer as a cursor (a bucket
         // index); Flint answers "ERR invalid cursor" for a cursor it never
         // issued — invisible to real clients, which only echo cursors.
+        // JSON documents. FLINT-ONLY (see `flint_only`): the reference has
+        // no JSON type, so these cases assert the contract we chose, and
+        // prove mem/rocks agree on it — not that we match another
+        // implementation. Kept frame-comparable: with `preserve_order`,
+        // object key order is insertion order, so replies are deterministic.
+        Case {
+            family: "json",
+            name: "document roundtrip: root set, path get, TYPE vocabulary",
+            steps: vec![
+                s(
+                    &[
+                        b"JSON.SET",
+                        b"doc",
+                        b"$",
+                        br#"{"n":1,"s":"x","a":[1,2],"o":{"k":true}}"#,
+                    ],
+                    Expect::Ok,
+                ),
+                s(&[b"TYPE", b"doc"], Expect::Simple("json")),
+                s(&[b"JSON.TYPE", b"doc", b"$"], Expect::Simple("object")),
+                s(&[b"JSON.TYPE", b"doc", b"$.n"], Expect::Simple("integer")),
+                s(&[b"JSON.TYPE", b"doc", b"$.s"], Expect::Simple("string")),
+                s(&[b"JSON.TYPE", b"doc", b"$.a"], Expect::Simple("array")),
+                s(&[b"JSON.TYPE", b"doc", b"$.o"], Expect::Simple("object")),
+                s(&[b"JSON.TYPE", b"doc", b"$.o.k"], Expect::Simple("boolean")),
+                s(&[b"JSON.GET", b"doc", b"$.n"], Expect::Str(b"1")),
+                s(&[b"JSON.GET", b"doc", b"$.s"], Expect::Str(br#""x""#)),
+                s(&[b"JSON.GET", b"doc", b"$.a"], Expect::Str(b"[1,2]")),
+                // Absent path and absent key are both nil, never an error.
+                s(&[b"JSON.GET", b"doc", b"$.nope"], Expect::Nil),
+                s(&[b"JSON.GET", b"ghost", b"$"], Expect::Nil),
+                s(&[b"JSON.TYPE", b"ghost"], Expect::Nil),
+            ],
+        },
+        Case {
+            family: "json",
+            name: "path writes: leaf create, array index, negative index",
+            steps: vec![
+                s(
+                    &[b"JSON.SET", b"d", b"$", br#"{"a":[10,20,30]}"#],
+                    Expect::Ok,
+                ),
+                s(&[b"JSON.SET", b"d", b"$.a[0]", b"99"], Expect::Ok),
+                s(&[b"JSON.GET", b"d", b"$.a[0]"], Expect::Str(b"99")),
+                // Negative index counts from the end, like Redis.
+                s(&[b"JSON.GET", b"d", b"$.a[-1]"], Expect::Str(b"30")),
+                s(&[b"JSON.SET", b"d", b"$.a[-1]", b"31"], Expect::Ok),
+                s(&[b"JSON.GET", b"d", b"$.a"], Expect::Str(b"[99,20,31]")),
+                // index == len appends; past the end is refused, leaving no hole.
+                s(&[b"JSON.SET", b"d", b"$.a[3]", b"40"], Expect::Ok),
+                s(&[b"JSON.GET", b"d", b"$.a"], Expect::Str(b"[99,20,31,40]")),
+                s(&[b"JSON.SET", b"d", b"$.a[9]", b"0"], Expect::AnyError),
+                s(&[b"JSON.GET", b"d", b"$.a"], Expect::Str(b"[99,20,31,40]")),
+                // A new leaf is created; intermediates never are.
+                s(&[b"JSON.SET", b"d", b"$.fresh", br#""v""#], Expect::Ok),
+                s(&[b"JSON.GET", b"d", b"$.fresh"], Expect::Str(br#""v""#)),
+                s(&[b"JSON.SET", b"d", b"$.x.y", b"1"], Expect::AnyError),
+                s(&[b"JSON.GET", b"d", b"$.x"], Expect::Nil),
+            ],
+        },
+        Case {
+            family: "json",
+            name: "NUMINCRBY keeps integers integral and rejects non-numbers",
+            steps: vec![
+                s(
+                    &[b"JSON.SET", b"d", b"$", br#"{"i":10,"f":1.5,"s":"x"}"#],
+                    Expect::Ok,
+                ),
+                s(&[b"JSON.NUMINCRBY", b"d", b"$.i", b"5"], Expect::Str(b"15")),
+                s(
+                    &[b"JSON.NUMINCRBY", b"d", b"$.i", b"-20"],
+                    Expect::Str(b"-5"),
+                ),
+                s(
+                    &[b"JSON.NUMINCRBY", b"d", b"$.f", b"0.5"],
+                    Expect::Str(b"2.0"),
+                ),
+                s(&[b"JSON.NUMINCRBY", b"d", b"$.s", b"1"], Expect::AnyError),
+                s(
+                    &[b"JSON.NUMINCRBY", b"d", b"$.gone", b"1"],
+                    Expect::AnyError,
+                ),
+                s(
+                    &[b"JSON.NUMINCRBY", b"d", b"$.i", b"notanumber"],
+                    Expect::AnyError,
+                ),
+                // The refused increments left the document untouched.
+                s(&[b"JSON.GET", b"d", b"$.i"], Expect::Str(b"-5")),
+            ],
+        },
+        Case {
+            family: "json",
+            name: "array ops: ARRAPPEND returns the new length, ARRLEN reads it",
+            steps: vec![
+                s(
+                    &[b"JSON.SET", b"d", b"$", br#"{"a":[],"o":{}}"#],
+                    Expect::Ok,
+                ),
+                s(&[b"JSON.ARRLEN", b"d", b"$.a"], Expect::Int(0)),
+                s(&[b"JSON.ARRAPPEND", b"d", b"$.a", b"1"], Expect::Int(1)),
+                s(
+                    &[b"JSON.ARRAPPEND", b"d", b"$.a", b"2", b"3"],
+                    Expect::Int(3),
+                ),
+                s(&[b"JSON.ARRLEN", b"d", b"$.a"], Expect::Int(3)),
+                s(&[b"JSON.GET", b"d", b"$.a"], Expect::Str(b"[1,2,3]")),
+                // Non-arrays and missing paths are errors, not silent no-ops.
+                s(&[b"JSON.ARRAPPEND", b"d", b"$.o", b"1"], Expect::AnyError),
+                s(&[b"JSON.ARRLEN", b"d", b"$.o"], Expect::AnyError),
+                s(&[b"JSON.ARRLEN", b"d", b"$.gone"], Expect::Nil),
+            ],
+        },
+        Case {
+            family: "json",
+            name: "DEL: a path removes one member, the root removes the key",
+            steps: vec![
+                s(
+                    &[b"JSON.SET", b"d", b"$", br#"{"a":1,"b":[1,2]}"#],
+                    Expect::Ok,
+                ),
+                s(&[b"JSON.DEL", b"d", b"$.a"], Expect::Int(1)),
+                s(&[b"JSON.GET", b"d", b"$.a"], Expect::Nil),
+                s(&[b"EXISTS", b"d"], Expect::Int(1)),
+                // Deleting an absent path reports 0, not an error.
+                s(&[b"JSON.DEL", b"d", b"$.a"], Expect::Int(0)),
+                s(&[b"JSON.DEL", b"d", b"$.b[0]"], Expect::Int(1)),
+                s(&[b"JSON.GET", b"d", b"$.b"], Expect::Str(b"[2]")),
+                // Root delete removes the whole key; FORGET is the alias.
+                s(&[b"JSON.DEL", b"d"], Expect::Int(1)),
+                s(&[b"EXISTS", b"d"], Expect::Int(0)),
+                s(&[b"JSON.DEL", b"gone"], Expect::Int(0)),
+                s(&[b"JSON.SET", b"d2", b"$", b"[1]"], Expect::Ok),
+                s(&[b"JSON.FORGET", b"d2"], Expect::Int(1)),
+                s(&[b"EXISTS", b"d2"], Expect::Int(0)),
+            ],
+        },
+        Case {
+            family: "json",
+            name: "NX/XX on the key and on a path",
+            steps: vec![
+                s(&[b"JSON.SET", b"d", b"$", br#"{"a":1}"#, b"NX"], Expect::Ok),
+                s(
+                    &[b"JSON.SET", b"d", b"$", br#"{"a":2}"#, b"NX"],
+                    Expect::Nil,
+                ),
+                s(&[b"JSON.GET", b"d", b"$.a"], Expect::Str(b"1")),
+                s(&[b"JSON.SET", b"d", b"$.new", b"7", b"XX"], Expect::Nil),
+                s(&[b"JSON.SET", b"d", b"$.new", b"7", b"NX"], Expect::Ok),
+                s(&[b"JSON.GET", b"d", b"$.new"], Expect::Str(b"7")),
+                s(&[b"JSON.SET", b"d", b"$.new", b"8", b"XX"], Expect::Ok),
+                s(&[b"JSON.GET", b"d", b"$.new"], Expect::Str(b"8")),
+                s(
+                    &[b"JSON.SET", b"d", b"$", b"{}", b"BOGUS"],
+                    Expect::AnyError,
+                ),
+            ],
+        },
+        Case {
+            family: "json",
+            name: "unsupported paths and invalid JSON are refused, not guessed",
+            steps: vec![
+                s(&[b"JSON.SET", b"d", b"$", br#"{"a":{"b":1}}"#], Expect::Ok),
+                // Multi-match constructs are out of the v1 subset.
+                s(&[b"JSON.GET", b"d", b"$..b"], Expect::AnyError),
+                s(&[b"JSON.GET", b"d", b"$.a[*]"], Expect::AnyError),
+                s(&[b"JSON.GET", b"d", b"$.*"], Expect::AnyError),
+                s(&[b"JSON.GET", b"d", b"$.a[0:2]"], Expect::AnyError),
+                // Malformed paths and payloads.
+                s(&[b"JSON.GET", b"d", b"$.a["], Expect::AnyError),
+                s(&[b"JSON.SET", b"bad", b"$", b"{not json"], Expect::AnyError),
+                s(&[b"EXISTS", b"bad"], Expect::Int(0)),
+                // The document survived every refusal.
+                s(&[b"JSON.GET", b"d", b"$.a.b"], Expect::Str(b"1")),
+            ],
+        },
+        Case {
+            family: "json",
+            name: "type gate: WRONGTYPE in both directions",
+            steps: vec![
+                s(&[b"SET", b"str", b"v"], Expect::Ok),
+                s(&[b"JSON.GET", b"str", b"$"], Expect::AnyError),
+                s(&[b"JSON.TYPE", b"str"], Expect::AnyError),
+                s(&[b"JSON.ARRLEN", b"str"], Expect::AnyError),
+                s(&[b"JSON.SET", b"doc", b"$", br#"{"a":1}"#], Expect::Ok),
+                s(&[b"GET", b"doc"], Expect::AnyError),
+                s(&[b"HGET", b"doc", b"a"], Expect::AnyError),
+                s(&[b"LLEN", b"doc"], Expect::AnyError),
+                // JSON.SET does NOT overwrite a foreign type, even at the
+                // root — unlike a plain SET, which clobbers anything. A
+                // document write must not be a silent way to destroy a
+                // string or a hash; the caller deletes first if that is
+                // what they meant.
+                s(&[b"JSON.SET", b"str", b"$", b"[1]"], Expect::AnyError),
+                s(&[b"GET", b"str"], Expect::Str(b"v")),
+                // The reverse direction stays Redis-normal: plain SET does
+                // clobber a document.
+                s(&[b"SET", b"doc", b"plain"], Expect::Ok),
+                s(&[b"GET", b"doc"], Expect::Str(b"plain")),
+            ],
+        },
+        Case {
+            family: "json",
+            name: "TTL: a sub-path write preserves expiry, a root write clears it",
+            steps: vec![
+                s(&[b"JSON.SET", b"d", b"$", br#"{"a":1}"#], Expect::Ok),
+                s(&[b"EXPIRE", b"d", b"100"], Expect::Int(1)),
+                s(&[b"JSON.SET", b"d", b"$.a", b"2"], Expect::Ok),
+                s(&[b"TTL", b"d"], Expect::IntRange(90, 100)),
+                s(&[b"JSON.NUMINCRBY", b"d", b"$.a", b"1"], Expect::Str(b"3")),
+                s(&[b"TTL", b"d"], Expect::IntRange(90, 100)),
+                s(&[b"JSON.SET", b"d", b"$", br#"{"a":9}"#], Expect::Ok),
+                s(&[b"TTL", b"d"], Expect::Int(-1)),
+                // An expired document reads as gone.
+                s(&[b"JSON.SET", b"t", b"$", b"[1]"], Expect::Ok),
+                s(&[b"PEXPIRE", b"t", b"40"], Expect::Int(1)),
+                sd(&[b"PING"], Expect::Pong, 80),
+                s(&[b"JSON.GET", b"t", b"$"], Expect::Nil),
+                s(&[b"EXISTS", b"t"], Expect::Int(0)),
+            ],
+        },
         Case {
             family: "scan",
             name: "one-shot enumeration returns every key, cursor 0",
@@ -1439,10 +1675,21 @@ fn main() -> ExitCode {
         .nth(1)
         .unwrap_or_else(|| "127.0.0.1:6380".into());
 
+    // --reference: the target is valkey/redis, which validates the corpus
+    // itself. Families the reference does not implement are skipped rather
+    // than reported as failures — a red line there would say nothing about
+    // either implementation.
+    let reference = std::env::args().any(|a| a == "--reference");
+
     let mut per_family: BTreeMap<&str, (u32, u32)> = BTreeMap::new();
     let mut failures: Vec<String> = Vec::new();
+    let mut skipped = 0u32;
 
     for case in corpus() {
+        if reference && flint_only(case.family) {
+            skipped += 1;
+            continue;
+        }
         let entry = per_family.entry(case.family).or_insert((0, 0));
         entry.1 += 1;
         let result = run_case(&target, &case);
@@ -1466,6 +1713,9 @@ fn main() -> ExitCode {
         "overall: {pass}/{total} ({:.1}%)",
         100.0 * pass as f64 / total as f64
     );
+    if skipped > 0 {
+        println!("  ({skipped} flint-only case(s) skipped: no reference oracle)");
+    }
     if failures.is_empty() {
         ExitCode::SUCCESS
     } else {
