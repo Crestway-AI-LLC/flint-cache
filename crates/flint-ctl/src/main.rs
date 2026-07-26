@@ -71,6 +71,10 @@ struct Inventory {
     /// views). Absent = the internal CA, which signs the default edge
     /// cert; public-cert fleets point it at the system bundle.
     edge_trust: Option<String>,
+    /// Billing journal path (agent --billing): the append-only per-tenant
+    /// usage record a metering reporter aggregates from. Absent = the
+    /// agent keeps no billing journal (self-hosters who do not bill).
+    billing: Option<String>,
     controller: bool,
     agent: Option<String>,
     /// Per-node storage capacity in bytes (capacity model, question 2);
@@ -133,6 +137,7 @@ fn parse_inventory(path: &str) -> Inventory {
             // the Nth proxy-advertise line pairs with the Nth proxy line.
             "proxy-advertise" => inv.proxy_advertise.push(val.to_string()),
             "edge-trust" => inv.edge_trust = Some(val.to_string()),
+            "billing" => inv.billing = Some(val.to_string()),
             "controller" => inv.controller = val == "on",
             "agent" => inv.agent = Some(val.to_string()),
             "capacity" => inv.capacity_bytes = val.parse().ok(),
@@ -881,6 +886,9 @@ fn launch(inv: &Inventory, register: bool) {
         // CA (it signs the default edge cert); a fleet serving a PUBLIC
         // edge cert (LE on a DNS name) overrides with `edge-trust <path>`
         // (e.g. the system bundle).
+        if let Some(billing) = &inv.billing {
+            args.extend(["--billing".to_string(), billing.clone()]);
+        }
         if inv.client_tls {
             let trust = inv
                 .edge_trust
