@@ -1786,7 +1786,11 @@ fn upgrade(inv: &Inventory, version_tag: Option<String>, soak_ms: u64) {
             .cloned()
             .unwrap_or_else(|| m.clone());
         if let Err(e) = roll_node(inv, r, &m_now, &envs, &expect, false) {
-            panic!("replica roll failed at {r}: {e}");
+            // Same outcome as a failed journal check below — the roll
+            // stopped part-way — so it reports the same way. Panicking here
+            // gave the one MORE likely failure the worse exit code.
+            eprintln!("== UPGRADE ABORTED at {r}: {e}");
+            std::process::exit(3);
         }
         if let Err(e) = journal_clean(inv, t, REPLICA_PHASE_DISALLOWED) {
             eprintln!("== UPGRADE ABORTED after {r}: {e}");
@@ -1811,7 +1815,8 @@ fn upgrade(inv: &Inventory, version_tag: Option<String>, soak_ms: u64) {
             "  pair {i}: {old_master} demoted + drained; {new_master} promoted at (0,{promoted})"
         );
         if let Err(e) = roll_node(inv, old_master, &new_master, &envs, &expect, true) {
-            panic!("old master respawn failed at {old_master}: {e}");
+            eprintln!("== UPGRADE ABORTED after pair {i} failover, respawning {old_master}: {e}");
+            std::process::exit(3);
         }
         if let Err(e) = journal_clean(inv, t, MASTER_PHASE_DISALLOWED) {
             eprintln!("== UPGRADE ABORTED after pair {i} master roll: {e}");
