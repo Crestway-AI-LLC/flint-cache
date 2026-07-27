@@ -6,6 +6,17 @@ hostage in RAM — so it survives restarts, replicates with a bounded loss
 window, fails over in seconds, and costs storage economics instead of memory
 economics. Clients connect with any Redis client; no SDK, no new protocol.
 
+**Fewer misses beats faster hits.** A RAM cache is faster on a hit and that
+is not the number your users feel. When the working set does not fit — and
+past a few hundred GB it does not, because the managed options cap out —
+what they feel is the evictions: every evicted key is a request that falls
+through to your origin, and on a hot key it is every concurrent request at
+once, the thundering herd that turns a cache miss into an incident. Holding
+the whole set costs a few hundred microseconds on the hit and stops the
+seconds at the origin. That is the trade this project exists to make, and
+[the measured numbers](docs/architecture.md) are there to show the hit is
+fast enough that you stop thinking about it.
+
 ## What's in this repository
 
 Everything needed to run AND operate Flint yourself:
