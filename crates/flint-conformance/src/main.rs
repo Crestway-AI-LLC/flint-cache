@@ -14,7 +14,7 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::process::ExitCode;
 
-use flint_resp::{Decoded, Value, decode, encode};
+use flint_resp::{Decoded, Proto, Value, decode, encode};
 
 /// What a step's reply must look like.
 #[derive(Debug, Clone)]
@@ -1727,14 +1727,33 @@ fn corpus() -> Vec<Case> {
 struct Client {
     stream: TcpStream,
     buf: Vec<u8>,
+    proto: Proto,
 }
 
 impl Client {
-    fn connect(target: &str) -> std::io::Result<Self> {
-        Ok(Self {
+    fn connect(target: &str, proto: Proto) -> std::io::Result<Self> {
+        // The handshake runs with normalization still OFF: the server
+        // answers HELLO 3 in the dialect it just switched to, and folding
+        // that map down to an array here would hide the very thing we are
+        // checking. Adopt the dialect only once it is confirmed.
+        let mut c = Self {
             stream: TcpStream::connect(target)?,
             buf: Vec::new(),
-        })
+            proto: Proto::Resp2,
+        };
+        if proto == Proto::Resp3 {
+            let hello = vec![b"HELLO".to_vec(), b"3".to_vec()];
+            match c.call(&hello)? {
+                Value::Map(_) => {}
+                other => {
+                    return Err(std::io::Error::other(format!(
+                        "target refused HELLO 3: {other:?}"
+                    )));
+                }
+            }
+        }
+        c.proto = proto;
+        Ok(c)
     }
 
     fn call(&mut self, args: &[Vec<u8>]) -> std::io::Result<Value> {
@@ -1749,7 +1768,7 @@ impl Client {
             match decode(&self.buf) {
                 Ok(Decoded::Complete(value, used)) => {
                     self.buf.drain(..used);
-                    return Ok(value);
+                    return Ok(self.normalize(args, value));
                 }
                 Ok(Decoded::NeedMore) => {
                     let n = self.stream.read(&mut chunk)?;
@@ -1768,6 +1787,71 @@ impl Client {
                     ));
                 }
             }
+        }
+    }
+}
+
+impl Client {
+    /// Fold a RESP3 reply back to the RESP2 shape the corpus asserts.
+    ///
+    /// The corpus is written once, in RESP2 terms, and run under both
+    /// dialects. That is deliberate: what a RESP3 pass should prove is not
+    /// that the bytes differ — of course they do — but that they carry the
+    /// SAME INFORMATION. Downgrading through the very encoder the server
+    /// uses and re-decoding is the sharpest available check of that, and it
+    /// catches the failures that matter: a map paired up wrong, a score
+    /// that lost precision becoming a double, a set that dropped a member.
+    fn normalize(&self, args: &[Vec<u8>], v: Value) -> Value {
+        if self.proto == Proto::Resp2 {
+            return v;
+        }
+        // JSON.TYPE carries an extra array layer under RESP3 (RedisJSON's
+        // quirk, which we match); peel it before comparing.
+        let v = match args.first() {
+            Some(n) if flint_resp::resp3_nests_reply(n) => match v {
+                Value::Array(Some(mut items)) if items.len() == 1 => items.remove(0),
+                other => other,
+            },
+            _ => v,
+        };
+        // Score pairs are the one shape the wire cannot hand back as
+        // itself: `ScorePairs` encodes to nested [member, double] arrays,
+        // and decoding those yields exactly that — plain arrays, with no
+        // way to tell they were pairs. So recognize the shape and flatten
+        // it the way RESP2 would have. The recognizer is deliberately
+        // narrow (every element a 2-tuple of bulk-then-double), which in
+        // this command set only ZRANGE-family WITHSCORES and ZPOPMIN/MAX
+        // with a count produce.
+        let v = match v {
+            Value::Array(Some(items))
+                if !items.is_empty()
+                    && items.iter().all(|it| {
+                        matches!(it, Value::Array(Some(p))
+                            if p.len() == 2
+                                && matches!(p[0], Value::Bulk(Some(_)))
+                                && matches!(p[1], Value::Double(_)))
+                    }) =>
+            {
+                Value::Array(Some(
+                    items
+                        .into_iter()
+                        .flat_map(|it| match it {
+                            Value::Array(Some(p)) => p,
+                            other => vec![other],
+                        })
+                        .collect(),
+                ))
+            }
+            other => other,
+        };
+        let mut buf = Vec::new();
+        flint_resp::encode_proto(&v, Proto::Resp2, &mut buf);
+        match decode(&buf) {
+            Ok(Decoded::Complete(down, _)) => down,
+            // Un-downgradable is a real failure; hand the original back so
+            // the mismatch is reported against what the server actually
+            // sent rather than swallowed here.
+            _ => v,
         }
     }
 }
@@ -1848,6 +1932,17 @@ fn main() -> ExitCode {
     // either implementation.
     let reference = std::env::args().any(|a| a == "--reference");
 
+    // --proto 3 runs the whole corpus over RESP3, folding each reply back
+    // to its RESP2 shape before matching (see `Client::normalize`).
+    let proto = match std::env::args()
+        .skip_while(|a| a != "--proto")
+        .nth(1)
+        .as_deref()
+    {
+        Some("3") => Proto::Resp3,
+        _ => Proto::Resp2,
+    };
+
     let mut per_family: BTreeMap<&str, (u32, u32)> = BTreeMap::new();
     let mut failures: Vec<String> = Vec::new();
     let mut skipped = 0u32;
@@ -1859,7 +1954,7 @@ fn main() -> ExitCode {
         }
         let entry = per_family.entry(case.family).or_insert((0, 0));
         entry.1 += 1;
-        let result = run_case(&target, &case);
+        let result = run_case(&target, &case, proto);
         match result {
             Ok(None) => entry.0 += 1,
             Ok(Some(failure)) => {
@@ -1869,7 +1964,7 @@ fn main() -> ExitCode {
         }
     }
 
-    println!("target: {target}");
+    println!("target: {target} (RESP{})", proto.version());
     let (mut pass, mut total) = (0, 0);
     for (family, (p, t)) in &per_family {
         println!("  {family:<12} {p}/{t}");
@@ -1896,8 +1991,8 @@ fn main() -> ExitCode {
 
 /// Runs one case on a fresh connection with a clean keyspace.
 /// Ok(None) = pass; Ok(Some(msg)) = semantic failure; Err = transport failure.
-fn run_case(target: &str, case: &Case) -> std::io::Result<Option<String>> {
-    let mut client = Client::connect(target)?;
+fn run_case(target: &str, case: &Case, proto: Proto) -> std::io::Result<Option<String>> {
+    let mut client = Client::connect(target, proto)?;
     let flushed = client.call(&cmd(&[b"FLUSHALL"]))?;
     if flushed != Value::Simple("OK".into()) {
         return Ok(Some(format!("FLUSHALL failed: {flushed:?}")));

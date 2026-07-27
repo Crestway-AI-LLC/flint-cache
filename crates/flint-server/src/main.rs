@@ -23,7 +23,7 @@ use std::net::TcpListener;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use flint_resp::{Decoded, Value, decode, encode};
+use flint_resp::{Decoded, Value, decode, encode, encode_proto};
 use flint_storage::{Kv, MemKv};
 
 use crate::commands::Dispatcher;
@@ -742,6 +742,10 @@ fn serve(
     let mut conn_ns: Vec<u8> = commands::DEFAULT_NS.to_vec();
     // Connection-scoped async-write opt-in (FLINTNS 'a' flag, D4).
     let mut conn_async = false;
+    // Connection-scoped RESP dialect. Starts at RESP2, so every existing
+    // caller — flintctl, the controller, the agent, a bare redis-cli — is
+    // untouched until something sends HELLO 3.
+    let mut conn_proto = flint_resp::Proto::default();
     loop {
         let mut consumed = 0;
         out.clear();
@@ -785,9 +789,10 @@ fn serve(
                     write_queue,
                     &mut conn_ns,
                     &mut conn_async,
+                    &mut conn_proto,
                     &args,
                 );
-                encode(&reply, &mut out);
+                encode_proto(&reply, conn_proto, &mut out);
                 if out.len() >= OUT_FLUSH_THRESHOLD {
                     stream.write_all(&out)?;
                     out.clear();
@@ -848,9 +853,10 @@ fn serve(
                         write_queue,
                         &mut conn_ns,
                         &mut conn_async,
+                        &mut conn_proto,
                         &args,
                     );
-                    encode(&reply, &mut out);
+                    encode_proto(&reply, conn_proto, &mut out);
                     if out.len() >= OUT_FLUSH_THRESHOLD {
                         stream.write_all(&out)?;
                         out.clear();
@@ -900,8 +906,34 @@ fn execute(
     write_queue: Option<&Arc<write_queue::WriteQueue>>,
     conn_ns: &mut Vec<u8>,
     conn_async: &mut bool,
+    conn_proto: &mut flint_resp::Proto,
     args: &[Vec<u8>],
 ) -> Value {
+    // HELLO: protocol negotiation, answered here rather than in the
+    // command table because it MUTATES this connection's dialect.
+    //
+    // The node's data port is internal (the proxy is what faces tenants),
+    // so the AUTH clause carries no credentials worth checking here — but
+    // the proxy speaks HELLO 3 to us to get typed replies it can downgrade
+    // for whichever dialect its own client negotiated.
+    if args
+        .first()
+        .is_some_and(|n| n.eq_ignore_ascii_case(b"HELLO"))
+    {
+        let req = match flint_resp::parse_hello(args) {
+            Ok(r) => r,
+            Err(e) => return e.reply(),
+        };
+        if let Some(p) = req.proto {
+            *conn_proto = p;
+        }
+        let role = if read_only.load(Ordering::Relaxed) {
+            "replica"
+        } else {
+            "master"
+        };
+        return flint_resp::hello_reply(*conn_proto, env!("CARGO_PKG_VERSION"), role);
+    }
     // FLINTNS <ns>: select this connection's namespace — the tenant
     // boundary. Sent by the proxy right after token auth; every subsequent
     // data command, DBSIZE, FLUSHALL, and the slot gate are scoped to it.

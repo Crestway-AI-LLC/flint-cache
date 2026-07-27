@@ -366,12 +366,13 @@ impl<'a> Dispatcher<'a> {
             }
             b"HGETALL" => exact(args, 2, "hgetall", |a| {
                 reply(self.hashes.hgetall(slot_for_key(&a[1]), &a[1]), |pairs| {
-                    let mut out = Vec::with_capacity(pairs.len() * 2);
-                    for (f, v) in pairs {
-                        out.push(Value::Bulk(Some(f)));
-                        out.push(Value::Bulk(Some(v)));
-                    }
-                    Value::Array(Some(out))
+                    // A hash IS a map; RESP2 just has no way to say so.
+                    Value::Map(
+                        pairs
+                            .into_iter()
+                            .map(|(f, v)| (Value::Bulk(Some(f)), Value::Bulk(Some(v))))
+                            .collect(),
+                    )
                 })
             }),
             b"HKEYS" => exact(args, 2, "hkeys", |a| {
@@ -437,7 +438,7 @@ impl<'a> Dispatcher<'a> {
             }
             b"SMEMBERS" => exact(args, 2, "smembers", |a| {
                 reply(self.sets.smembers(slot_for_key(&a[1]), &a[1]), |ms| {
-                    Value::Array(Some(ms.into_iter().map(|m| Value::Bulk(Some(m))).collect()))
+                    Value::Set(ms.into_iter().map(|m| Value::Bulk(Some(m))).collect())
                 })
             }),
             b"SCARD" => exact(args, 2, "scard", |a| {
@@ -542,14 +543,14 @@ impl<'a> Dispatcher<'a> {
             b"ZADD" => self.cmd_zadd(args),
             b"ZSCORE" => exact(args, 3, "zscore", |a| {
                 reply(self.zsets.zscore(slot_for_key(&a[1]), &a[1], &a[2]), |s| {
-                    Value::Bulk(s.map(fmt_score))
+                    s.map(Value::Double).unwrap_or(Value::Null)
                 })
             }),
             b"ZINCRBY" => exact(args, 4, "zincrby", |a| match parse_f64(&a[2]) {
                 Ok(delta) => reply(
                     self.zsets
                         .zincr_by(slot_for_key(&a[1]), &a[1], delta, &a[3]),
-                    |sc| Value::Bulk(Some(fmt_score(sc))),
+                    Value::Double,
                 ),
                 Err(_) => err("ERR value is not a valid float"),
             }),
@@ -669,7 +670,6 @@ impl<'a> Dispatcher<'a> {
                 Value::Simple("OK".into())
             }
             b"COMMAND" => Value::Array(Some(vec![])),
-            b"HELLO" => err("ERR unsupported protocol version; this server speaks RESP2"),
             other => {
                 let name = String::from_utf8_lossy(other).to_lowercase();
                 err(&format!("ERR unknown command '{name}'"))
@@ -789,30 +789,28 @@ impl<'a> Dispatcher<'a> {
             (Ok(start), Ok(stop)) => reply(
                 self.zsets
                     .zrange(slot_for_key(&args[1]), &args[1], start, stop),
-                |ranked| {
-                    let mut out = Vec::new();
-                    for (member, score) in ranked {
-                        out.push(Value::Bulk(Some(member)));
-                        if withscores {
-                            out.push(Value::Bulk(Some(fmt_score(score))));
-                        }
-                    }
-                    Value::Array(Some(out))
-                },
+                |ranked| Self::zrows(ranked, withscores),
             ),
             _ => err("ERR value is not an integer or out of range"),
         }
     }
 
+    /// The member[/score] rows every ZRANGE-family command replies with.
+    ///
+    /// WITHSCORES is not a flag on an array of strings: RESP2 interleaves
+    /// members and scores, RESP3 nests each as its own pair with a real
+    /// double. Saying `ScorePairs` here states which of those we mean once,
+    /// and lets the encoder render whichever the connection asked for.
     fn zrows(ranked: Vec<(Vec<u8>, f64)>, withscores: bool) -> Value {
-        let mut out = Vec::new();
-        for (member, score) in ranked {
-            out.push(Value::Bulk(Some(member)));
-            if withscores {
-                out.push(Value::Bulk(Some(fmt_score(score))));
-            }
+        if withscores {
+            return Value::ScorePairs(ranked);
         }
-        Value::Array(Some(out))
+        Value::Array(Some(
+            ranked
+                .into_iter()
+                .map(|(member, _)| Value::Bulk(Some(member)))
+                .collect(),
+        ))
     }
 
     fn cmd_zrange_idx(&self, args: &[Vec<u8>], name: &str, rev: bool) -> Value {
@@ -917,18 +915,26 @@ impl<'a> Dispatcher<'a> {
                 Value::Array(Some(
                     scores
                         .into_iter()
-                        .map(|s| Value::Bulk(s.map(fmt_score)))
+                        .map(|s| s.map(Value::Double).unwrap_or(Value::Null))
                         .collect(),
                 ))
             },
         )
     }
 
+    /// ZPOPMIN/ZPOPMAX key [count].
+    ///
+    /// Whether a COUNT was written changes the reply's shape, not just its
+    /// length: without one the reply is a single flat `[member, score]`,
+    /// with one it is a list of pairs — and under RESP3 those are visibly
+    /// different frames (`*2` of member+double vs `*n` of `*2`s). So the
+    /// presence of the argument has to survive to the reply, which is why
+    /// it is tracked separately from the count itself.
     fn cmd_zpop(&self, args: &[Vec<u8>], name: &str, max_end: bool) -> Value {
-        let count = match args.len() {
-            2 => 1usize,
+        let (count, counted) = match args.len() {
+            2 => (1usize, false),
             3 => match parse_i64(&args[2]) {
-                Ok(n) if n >= 0 => n as usize,
+                Ok(n) if n >= 0 => (n as usize, true),
                 Ok(_) => return err("ERR value is out of range, must be positive"),
                 Err(_) => return err("ERR value is not an integer or out of range"),
             },
@@ -937,7 +943,16 @@ impl<'a> Dispatcher<'a> {
         reply(
             self.zsets
                 .zpop(slot_for_key(&args[1]), &args[1], count, max_end),
-            |r| Self::zrows(r, true),
+            |r| match counted {
+                true => Value::ScorePairs(r),
+                // The bare form flattens the single row it popped (and is
+                // simply empty when the key was).
+                false => Value::Array(Some(
+                    r.into_iter()
+                        .flat_map(|(m, sc)| [Value::Bulk(Some(m)), Value::Double(sc)])
+                        .collect(),
+                )),
+            },
         )
     }
 
@@ -1193,19 +1208,28 @@ impl<'a> Dispatcher<'a> {
         let Some(doc) = doc else {
             return Value::Bulk(None);
         };
+        // RedisJSON nests this reply one level deeper under RESP3 and
+        // redis-py unwraps to match; `Resp3Nested` carries that intent so
+        // the RESP2 spelling stays exactly as it was. See
+        // `flint_resp::resp3_nests_reply`.
+        let nest = |v: Value| Value::Resp3Nested(Box::new(v));
         let Some(v) = crate::json_path::get(&doc, &path) else {
             // JSON.TYPE is the one command whose legacy dialect answers NIL
             // rather than an error for a path that matches nothing — asking
             // what type something is and being told "nothing" is an answer,
             // not a failure. Verified against RedisJSON, which is otherwise
             // error-on-no-match for the legacy dialect.
-            return match path.is_jsonpath() {
+            return nest(match path.is_jsonpath() {
                 true => Value::Array(Some(Vec::new())),
                 false => Value::Bulk(None),
-            };
+            });
         };
         let name = Value::Bulk(Some(crate::json_path::type_name(v).into()));
-        Self::json_resp_matches(&path, Some(Some(name)), PATH_MISSING)
+        nest(Self::json_resp_matches(
+            &path,
+            Some(Some(name)),
+            PATH_MISSING,
+        ))
     }
 
     /// JSON.NUMINCRBY key path number — atomically add to a number at the
@@ -1577,7 +1601,7 @@ impl<'a> Dispatcher<'a> {
             3 => match parse_i64(&args[2]) {
                 Ok(n) if n >= 0 => reply(
                     self.sets.spop(slot_for_key(&args[1]), &args[1], n as u64),
-                    |ms| Value::Array(Some(ms.into_iter().map(|m| Value::Bulk(Some(m))).collect())),
+                    |ms| Value::Set(ms.into_iter().map(|m| Value::Bulk(Some(m))).collect()),
                 ),
                 _ => err("ERR value is out of range, must be positive"),
             },
@@ -2080,13 +2104,17 @@ mod tests {
         );
         assert_eq!(call(&s, &[b"TYPE", b"d"]), Value::Simple("json".into()));
         // `$` paths reply in containers; the legacy spellings reply bare.
+        // Both arrive wrapped in `Resp3Nested`, which adds a level under
+        // RESP3 only — matching how RedisJSON answers JSON.TYPE there.
         assert_eq!(
             call(&s, &[b"JSON.TYPE", b"d", b"$.a"]),
-            Value::Array(Some(vec![Value::Bulk(Some(b"integer".to_vec()))]))
+            Value::Resp3Nested(Box::new(Value::Array(Some(vec![Value::Bulk(Some(
+                b"integer".to_vec()
+            ))]))))
         );
         assert_eq!(
             call(&s, &[b"JSON.TYPE", b"d", b".a"]),
-            Value::Bulk(Some(b"integer".to_vec()))
+            Value::Resp3Nested(Box::new(Value::Bulk(Some(b"integer".to_vec()))))
         );
         assert_eq!(
             call(&s, &[b"JSON.GET", b"d", b"$.a"]),

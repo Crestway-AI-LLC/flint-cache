@@ -34,6 +34,14 @@ works; `AUTH <token>` (or `AUTH <user> <token>`, the user is ignored).
 During a token rotation both your old and new tokens authenticate until
 the rotation completes; swap at your leisure inside that window.
 
+**RESP2 and RESP3 both work, and you do not have to choose.** Clients that
+open with `HELLO 3` — which is the default in redis-py 8 and current
+node-redis — get RESP3, including credentials passed inside the handshake;
+older clients stay on RESP2. Under RESP3 your client hands back its own
+native types (`HGETALL` → `dict`, `SMEMBERS` → `set`, `ZSCORE` → `float`)
+because Flint sends the typed replies those clients expect. Nothing to
+configure either way.
+
 ### Sample code
 
 **redis-cli / valkey-cli**

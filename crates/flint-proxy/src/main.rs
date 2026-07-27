@@ -47,7 +47,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
-use flint_resp::{Decoded, Value, decode, encode};
+use flint_resp::{Decoded, Value, decode, encode, encode_proto};
 use flint_slot::slot_for_key;
 
 /// Total retry budget for one client command across MOVED chases, TRYAGAIN
@@ -833,6 +833,34 @@ impl Backends {
             let mut stream = flint_tls::connect_reloadable(addr, &self.tls)?;
             stream.set_read_timeout(Some(BACKEND_TIMEOUT))?;
             stream.set_write_timeout(Some(BACKEND_TIMEOUT))?;
+            // Speak RESP3 to the backend ALWAYS, whatever this proxy's
+            // clients negotiated.
+            //
+            // The reason is that a RESP2 reply is ambiguous: a flat array
+            // could be a hash, a list, or member/score pairs, and once the
+            // types are flattened the proxy cannot put them back. RESP3
+            // keeps them (`%`, `~`, `,`), so the proxy decodes a reply that
+            // still knows what it means and re-renders it for whichever
+            // dialect the client asked for. Backend connections are pooled
+            // and shared across clients, so pinning them to one client's
+            // dialect was never an option anyway.
+            let mut hello = Vec::new();
+            encode(
+                &Value::Array(Some(vec![
+                    Value::Bulk(Some(b"HELLO".to_vec())),
+                    Value::Bulk(Some(b"3".to_vec())),
+                ])),
+                &mut hello,
+            );
+            let mut hello_buf = Vec::new();
+            match call_raw(&mut stream, &mut hello_buf, &hello)? {
+                Value::Map(_) => {}
+                other => {
+                    return Err(std::io::Error::other(format!(
+                        "backend refused RESP3: {other:?}"
+                    )));
+                }
+            }
             // Pin the connection to the tenant namespace before any data
             // command can travel on it; the 'a' arg opts this connection's
             // batchable writes into the node's async write queue (D4).
@@ -945,7 +973,23 @@ fn forward(
             continue;
         };
 
-        match backends.call(&addr, frame) {
+        // Backends answer us in RESP3, so a reply the JSON.TYPE quirk
+        // applies to arrives already nested. Peel that layer back off and
+        // re-mark it, so THIS client's dialect is what decides whether it
+        // goes on again.
+        let renest = |v: Value| match v {
+            Value::Array(Some(mut items)) if items.len() == 1 => {
+                Value::Resp3Nested(Box::new(items.remove(0)))
+            }
+            other => other,
+        };
+        let nests = args
+            .first()
+            .is_some_and(|n| flint_resp::resp3_nests_reply(n));
+        match backends
+            .call(&addr, frame)
+            .map(|v| if nests { renest(v) } else { v })
+        {
             Ok(Value::Error(e)) if e.starts_with("MOVED ") => {
                 // "MOVED <slot> <addr>": learn and chase. The client must
                 // never see this — absorbing it is the proxy's reason to
@@ -1064,6 +1108,7 @@ fn auth_step(
     local_cache: &mut bool,
     async_writes: &mut bool,
     is_admin: &mut bool,
+    proto: &mut flint_resp::Proto,
     args: &[Vec<u8>],
 ) -> AuthStep {
     let name = args.first().map(|n| n.to_ascii_uppercase());
@@ -1207,6 +1252,46 @@ fn auth_step(
             .unwrap_or(0);
         return AuthStep::Reply(Value::Integer(n as i64));
     }
+    // HELLO, before the auth gate on purpose: redis-py 8 and node-redis
+    // carry their credentials INSIDE it (`HELLO 3 AUTH default <token>`)
+    // and never send a separate AUTH. Answering -NOAUTH here is what made
+    // Flint unreachable from the entire modern Python client ecosystem.
+    if name.as_deref() == Some(b"HELLO") {
+        let req = match flint_resp::parse_hello(args) {
+            Ok(r) => r,
+            Err(e) => return AuthStep::Reply(e.reply()),
+        };
+        if let Some((_user, token)) = req.auth.clone() {
+            // The username is ignored, exactly as our AUTH arm ignores it:
+            // a Flint token IS the identity. Reuse that arm so inline and
+            // standalone credentials can never diverge.
+            let auth = vec![b"AUTH".to_vec(), token];
+            // A rejected credential must fail the HELLO, not quietly hand
+            // back a successful handshake with no namespace bound.
+            if let AuthStep::Reply(Value::Error(e)) = auth_step(
+                topo,
+                authed_ns,
+                replica_reads,
+                local_cache,
+                async_writes,
+                is_admin,
+                proto,
+                &auth,
+            ) {
+                return AuthStep::Reply(Value::Error(e));
+            }
+        }
+        // The dialect switches only once the handshake is otherwise good,
+        // so a failed HELLO leaves the connection exactly as it was.
+        if let Some(p) = req.proto {
+            *proto = p;
+        }
+        return AuthStep::Reply(flint_resp::hello_reply(
+            *proto,
+            env!("CARGO_PKG_VERSION"),
+            "master",
+        ));
+    }
     if name.as_deref() == Some(b"AUTH") {
         let token = match args.len() {
             2 => &args[1],
@@ -1289,6 +1374,10 @@ fn serve_client<S: Read + Write>(mut stream: S, topo: Arc<Topology>) -> std::io:
     let mut async_writes = false;
     // Admin session (AUTH <admin-token>): unlocks the operator surface only.
     let mut is_admin = false;
+    // The RESP dialect THIS client negotiated, set by HELLO. Backends
+    // always answer us in RESP3 so their replies keep their types; this is
+    // what we downgrade to on the way back out.
+    let mut proto = flint_resp::Proto::default();
     // Hot-key sampling tick (D5): every HOTKEY_SAMPLE_RATE-th keyed command
     // on this connection feeds the sketch, keeping the mutex off the
     // common path.
@@ -1346,6 +1435,7 @@ fn serve_client<S: Read + Write>(mut stream: S, topo: Arc<Topology>) -> std::io:
                         &mut local_cache,
                         &mut async_writes,
                         &mut is_admin,
+                        &mut proto,
                         &args,
                     ) {
                         AuthStep::Reply(v) => v,
@@ -1375,7 +1465,7 @@ fn serve_client<S: Read + Write>(mut stream: S, topo: Arc<Topology>) -> std::io:
                             );
                         }
                     }
-                    encode(&reply, &mut out);
+                    encode_proto(&reply, proto, &mut out);
                     if out.len() >= OUT_FLUSH_THRESHOLD {
                         stream.write_all(&out)?;
                         out.clear();

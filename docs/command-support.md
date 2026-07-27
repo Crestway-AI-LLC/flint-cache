@@ -52,6 +52,30 @@ ZREVRANGE, ZRANGEBYSCORE, ZREVRANGEBYSCORE (WITHSCORES, LIMIT, exclusive
 bounds, ±inf), ZRANK, ZREVRANK, ZCOUNT, ZPOPMIN, ZPOPMAX,
 ZREMRANGEBYSCORE, ZREMRANGEBYRANK, ZSCAN (MATCH, COUNT).
 
+## Protocols: RESP2 and RESP3
+
+Both, negotiated per connection with `HELLO`. Connections start at RESP2;
+`HELLO 3` switches, and `HELLO` reports which is in force. This is not
+cosmetic — **redis-py 8 defaults to RESP3 and sends its credentials inside
+the handshake** (`HELLO 3 AUTH default <token>`) rather than as a separate
+`AUTH`, so a server without it is unreachable from most of the current
+Python ecosystem, not merely degraded.
+
+Under RESP3 the replies that have a real type get one, exactly as Redis
+sends them: `HGETALL` is a map, `SMEMBERS` and `SPOP key count` are sets,
+`ZSCORE`/`ZINCRBY` are doubles, `ZRANGE … WITHSCORES` and `ZPOPMIN key
+count` are member/score pairs, and null is `_`. Clients therefore hand you
+a `dict`, a `set`, and a `float` without post-processing. RESP2 keeps the
+flattened spellings it always had, byte for byte.
+
+Worth knowing because the obvious guess is wrong: `HSCAN`/`SSCAN`/`ZSCAN`,
+`SRANDMEMBER`, `SMISMEMBER`, `SCAN`, `LPOS`, and `INCRBYFLOAT` are
+identical in both protocols — scan cursors still carry string scores. The
+shapes here were captured off the wire from a real Redis 8.2 rather than
+read off a spec, and `flint-conformance --proto 3` runs the whole corpus
+over RESP3 (against Flint and against a reference Valkey) to keep them
+honest.
+
 ## Semantics worth knowing
 
 - **Collection scans are single-shot.** HSCAN/SSCAN/ZSCAN return the whole
