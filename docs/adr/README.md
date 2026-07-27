@@ -1,0 +1,38 @@
+# Architecture decision records
+
+Decisions that shaped Flint, with the reasoning and the alternatives that
+lost. Format and rationale: [0001](0001-record-architecture-decisions.md).
+
+| ADR | Decision |
+|---|---|
+| [0001](0001-record-architecture-decisions.md) | Record architecture decisions |
+| [0002](0002-encoding-abstraction.md) | Encoding abstraction: one envelope over a swappable `Kv` |
+| [0003](0003-rocksdb-baseline.md) | RocksDB as the v0 engine, measured rather than assumed |
+| [0004](0004-no-per-group-raft.md) | No per-group Raft: epoch fencing in the node's own manifest |
+
+## Why the numbering has a gap
+
+You will find references to **ADR-0005 through ADR-0009** throughout this
+codebase — the shared read/write classifier and the async write queue
+(0005), token hashing and credential rotation (0006), federation plumbing
+(0007), and so on. Those records are not in this repository.
+
+Flint is open-core. This repository is the engine and the operational
+tooling: server, proxy, control plane, controller, `flintctl`, and the
+conformance, bench and chaos harnesses — everything needed to run and
+operate Flint yourself, under the Elastic License 2.0. The **managed
+plane** — fleet autonomy, metering and billing, the tenant and operator
+consoles, marketplace fulfilment — is operated by Crestway AI LLC and lives
+in a private repository, and the ADRs numbered 0005+ mostly decide things in
+that plane.
+
+They are numbered in one sequence on purpose. A decision does not become a
+different decision because of which repository it lands in, and renumbering
+per repository would make the two halves impossible to discuss together.
+The citations are kept as-is rather than stripped: a comment saying *why*
+the classifier must be one shared table is worth more than a comment that
+has had its provenance filed off, even when you cannot open the reference.
+
+Where an ADR in that range decides something visible from here, the code
+comment at the call site states the decision itself, so nothing you need in
+order to read this repository depends on a document you cannot see.

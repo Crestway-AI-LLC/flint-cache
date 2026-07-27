@@ -118,7 +118,7 @@ placement, spare allocation), exactly as in the two-level design.
   are stateless, so recovery is "start one anywhere."
 - Debuggability needs are met without a consensus log: the epoch sequence is
   already a total order of structural decisions; decisions are emitted to
-  the fleet journal (design.md §2.10) keyed by epoch; any controller can
+  the fleet journal (`flint-journal`) keyed by epoch; any controller can
   serve the derived cluster view. If interleaved multi-controller logs prove
   confusing in practice, the escape hatch is lease-based leader election
   among controllers (a lock, not consensus) — fencing remains the safety.

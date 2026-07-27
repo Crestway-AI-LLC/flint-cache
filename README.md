@@ -10,8 +10,10 @@ economics. Clients connect with any Redis client; no SDK, no new protocol.
 
 Everything needed to run AND operate Flint yourself:
 
-- **`flint-server`** — the data-plane node: RESP2 over TCP, strings / hashes /
-  sets / lists / sorted sets with TTLs, an in-memory engine for development
+- **`flint-server`** — the data-plane node: RESP over TCP in both dialects
+  (RESP2 and RESP3, negotiated per connection with `HELLO`), strings /
+  hashes / sets / lists / sorted sets / JSON documents with TTLs, cursor-
+  based keyspace `SCAN`, an in-memory engine for development
   and the RocksDB engine for production, WAL-based async replication with
   lag-capped back-pressure, checkpoint full sync, epoch-fenced promotion,
   warm restarts.
@@ -33,15 +35,23 @@ Everything needed to run AND operate Flint yourself:
   fence, with leases so a partitioned master self-demotes.
 - **`flint-storage`** — the engine: envelope encoding, typed stores, GC,
   replication primitives, manifests and epochs, over a swappable `Kv` seam.
-- **`flint-conformance`** — the compatibility oracle. Every command lands with
-  a corpus case validated against a real Valkey **and** both Flint engines;
-  CI gates on it.
+- **`flint-conformance`** — the compatibility oracle. Every command lands
+  with a corpus case validated against a real Valkey **and** both Flint
+  engines, under both protocol dialects; CI gates on it. One honest
+  exception: stock Redis and Valkey have no JSON type, so the JSON family
+  has no reference in that run — those cases are checked separately against
+  the RedisJSON module itself (`tools/redisjson_compare.sh`), and the places
+  we deliberately differ are written down in
+  [docs/command-support.md](docs/command-support.md).
 - **`flint-bench`**, **`flint-chaos`** — the honesty tools: p99.9-under-
   compaction benchmarks and a random-kill chaos harness with a ledger oracle.
+- **`flint-balance`** — the slot-rebalancing planner: a policy seam plus the
+  size-based policy, so a cluster can be levelled by a rule you can read.
+- **`flint-exporter`** — Prometheus metrics for a self-hosted fleet.
 - **`flint-tls`**, **`flint-resp`**, **`flint-slot`**, **`flint-commands`**,
-  **`flint-journal`** — TLS with hot-reloading certificates, the RESP codec,
-  slot hashing, the shared read/write command classifier, and the typed fleet
-  event log.
+  **`flint-journal`** — TLS with hot-reloading certificates, the RESP codec
+  (both dialects), slot hashing, the shared read/write command classifier,
+  and the typed fleet event log.
 
 [docs/architecture.md](docs/architecture.md) is the system map — the three
 planes, and a normal write and read traced end to end.
@@ -128,4 +138,6 @@ Issues and pull requests are welcome. Contributions require agreeing to the
 project CLA (see [CONTRIBUTING.md](CONTRIBUTING.md)) so the project retains
 clear licensing. Every change must pass the gates above — including a
 conformance corpus entry for any new command, validated against the Valkey
-oracle.
+oracle (or, for commands Valkey does not have, against the module that
+defines them — see [docs/adr/README.md](docs/adr/README.md) for how this
+repository relates to the managed plane).

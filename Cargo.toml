@@ -40,6 +40,10 @@ version = "0.0.1"
 edition = "2024"
 license = "Elastic-2.0"
 repository = "https://github.com/Crestway-AI-LLC/flint-cache"
+# These crates are the product, not libraries for crates.io. Elastic-2.0 is
+# not an OSI licence and none of this is meant to be depended on by name, so
+# a stray `cargo publish` from the workspace should fail closed.
+publish = false
 
 [workspace.lints.clippy]
 unwrap_used = "warn"
