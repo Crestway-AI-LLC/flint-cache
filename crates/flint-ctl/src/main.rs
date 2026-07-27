@@ -39,6 +39,10 @@
 //!   confirm 3             ctlr  restart  consecutive fails before promote
 //!   lease-ttl-ms 3000     ctlr  restart  master lease TTL
 //!
+//! Exit status (flintctl is scriptable): 0 done; 1 the fleet refused the
+//! command — the CP's or node's OWN error text goes to stderr, never a
+//! panic; 3 `upgrade` aborted mid-roll and the fleet wants a look.
+//!
 //! v1 runs LOCAL processes (spawn-a-fresh-node model); a remote runner slots
 //! in behind the same command surface later. Two properties this tool leans
 //! on by design: controllers are STATELESS (ADR-0004) so `expand` simply
@@ -320,6 +324,48 @@ fn call_to(
     }
 }
 
+// ---------- reporting a refused admin call ----------
+//
+// `call` hands back a server's `-ERR` as `Ok(Value::Error(_))` — a
+// SUCCESSFUL `Result` carrying a refusal — which makes both lazy spellings
+// misreport it. `panic!("{reply:?}")` buries a perfectly good
+// `ERR tenant exists` inside `Ok(Error("ERR tenant exists"))`, prints a
+// backtrace hint, and exits with a panic code; `.expect(..)` is worse — it
+// treats the refusal as success and carries on. Everything below funnels
+// through these so an operator gets the SERVER'S OWN sentence and a status
+// a script can branch on. (Exit 1 = the command was refused; `upgrade`
+// keeps its own 3 for "aborted mid-roll, fleet needs a look".)
+
+/// End the command with our own message: stderr, clean nonzero exit.
+fn die(msg: &str) -> ! {
+    eprintln!("flintctl: {msg}");
+    std::process::exit(1)
+}
+
+/// One line for a failed call: the server's error text when it answered,
+/// the transport error when it did not.
+fn reply_err(reply: &std::io::Result<Value>) -> String {
+    match reply {
+        Ok(Value::Error(e)) => e.clone(),
+        // Unreachable CP, TLS refusal, timeout, short read.
+        Err(e) => e.to_string(),
+        Ok(other) => format!("unexpected reply {other:?}"),
+    }
+}
+
+/// End the command with the SERVER'S message.
+fn fail(what: &str, reply: &std::io::Result<Value>) -> ! {
+    die(&format!("{what}: {}", reply_err(reply)))
+}
+
+/// Run an admin call for its effect; any refusal ends the command.
+fn must(what: &str, reply: std::io::Result<Value>) -> Value {
+    match reply {
+        Ok(v) if !matches!(v, Value::Error(_)) => v,
+        other => fail(what, &other),
+    }
+}
+
 fn wait_pong(addr: &str, tls: &Option<Arc<flint_tls::ClientConfig>>, budget: Duration) -> bool {
     let start = Instant::now();
     while start.elapsed() < budget {
@@ -475,7 +521,9 @@ fn reload(inv: &Inventory) {
                 if let Some(val) = v {
                     match call(node, &tls, &["FLINTCONFIG", k, val]) {
                         Ok(Value::Simple(_)) => println!("  {node}: {k}={val}"),
-                        other => eprintln!("  {node}: FLINTCONFIG {k} rejected: {other:?}"),
+                        other => {
+                            eprintln!("  {node}: FLINTCONFIG {k} rejected: {}", reply_err(&other))
+                        }
                     }
                 }
             }
@@ -491,7 +539,7 @@ fn reload(inv: &Inventory) {
             }
             match call(proxy, &tls, &["PROXYCACHE", &ttl, &maxb]) {
                 Ok(Value::Simple(_)) => println!("  {proxy}: cache ttl={ttl}ms max={maxb}B"),
-                other => eprintln!("  {proxy}: PROXYCACHE rejected: {other:?}"),
+                other => eprintln!("  {proxy}: PROXYCACHE rejected: {}", reply_err(&other)),
             }
         }
     }
@@ -822,7 +870,7 @@ fn launch(inv: &Inventory, register: bool) {
             // Register the ADVERTISE address when one is declared (public-DNS
             // deployments): the registry is what clients and portals dial.
             let adv = inv.proxy_advertise.get(i).unwrap_or(proxy);
-            call(cp, &tls, &["CPADDPROXY", adv]).expect("register proxy");
+            must("register proxy", call(cp, &tls, &["CPADDPROXY", adv]));
         }
         // Initial pairs carry the even slot split as EXPLICIT level-1
         // routing state; expansion pairs later join with "-" (no range) so
@@ -831,12 +879,14 @@ fn launch(inv: &Inventory, register: bool) {
         for (i, pair) in inv.pairs.iter().enumerate() {
             let start = i * 16384 / n;
             let end = (i + 1) * 16384 / n - 1;
-            call(
-                cp,
-                &tls,
-                &["CPADDPAIR", &pair.join(","), &format!("{start}-{end}")],
-            )
-            .expect("register pair");
+            must(
+                "register pair",
+                call(
+                    cp,
+                    &tls,
+                    &["CPADDPAIR", &pair.join(","), &format!("{start}-{end}")],
+                ),
+            );
         }
         eprintln!(
             "  registry: {} proxies, {} pairs",
@@ -1007,7 +1057,7 @@ fn tenant_add(inv: &Inventory, rest: &[String]) {
     args.extend(strs);
     match call(&inv.cp[0], &tls, &args) {
         Ok(Value::Simple(s)) => println!("{s}"),
-        other => panic!("tenant add failed: {other:?}"),
+        other => fail("tenant add failed", &other),
     }
 }
 
@@ -1027,12 +1077,12 @@ fn tenant_remove(inv: &Inventory, name: &str) {
                 let mut it = l.split_whitespace();
                 (it.next() == Some(name)).then(|| it.next().map(String::from))?
             })
-            .unwrap_or_else(|| panic!("no such tenant {name:?}")),
-        other => panic!("CPTENANTS failed: {other:?}"),
+            .unwrap_or_else(|| die(&format!("tenant remove failed: no such tenant {name:?}"))),
+        other => fail("CPTENANTS failed", &other),
     };
     match call(&inv.cp[0], &tls, &["CPDELTENANT", name]) {
         Ok(Value::Simple(s)) => eprintln!("== {s}"),
-        other => panic!("tenant remove failed: {other:?}"),
+        other => fail("tenant remove failed", &other),
     }
     for i in 0..inv.pairs.len() {
         let master = pair_master(inv, &tls, &i.to_string());
@@ -1069,7 +1119,10 @@ fn expand(inv: &Inventory, inventory_path: &str, pair_spec: &str) {
     );
     // "-": the new pair owns no slots yet — capacity joins without
     // re-routing; migration (controller rebalance) moves slots later.
-    call(&inv.cp[0], &tls, &["CPADDPAIR", pair_spec, "-"]).expect("register new pair");
+    must(
+        "register new pair",
+        call(&inv.cp[0], &tls, &["CPADDPAIR", pair_spec, "-"]),
+    );
     // Persist to the inventory, then reroll the controller with the new
     // pair list. Controllers are STATELESS (ADR-0004): restarting one is a
     // non-event — it re-derives everything from the nodes' manifests.
@@ -1147,12 +1200,14 @@ fn add_replica(inv: &Inventory, inventory_path: &str, pair_ref: &str, new: &str)
 
     let mut members = inv.pairs[pair_idx].clone();
     members.push(new.to_string());
-    call(
-        &inv.cp[0],
-        &tls,
-        &["CPSETPAIR", &pair_idx.to_string(), &members.join(",")],
-    )
-    .expect("CPSETPAIR");
+    must(
+        "CPSETPAIR",
+        call(
+            &inv.cp[0],
+            &tls,
+            &["CPSETPAIR", &pair_idx.to_string(), &members.join(",")],
+        ),
+    );
 
     let raw = std::fs::read_to_string(inventory_path).expect("inventory");
     let updated = raw.replace(
@@ -1229,12 +1284,14 @@ fn swap_node(inv: &Inventory, inventory_path: &str, bad: &str, new: &str) {
         .iter()
         .map(|a| if a == bad { new.to_string() } else { a.clone() })
         .collect();
-    call(
-        &inv.cp[0],
-        &tls,
-        &["CPSETPAIR", &pair_idx.to_string(), &new_members.join(",")],
-    )
-    .expect("CPSETPAIR");
+    must(
+        "CPSETPAIR",
+        call(
+            &inv.cp[0],
+            &tls,
+            &["CPSETPAIR", &pair_idx.to_string(), &new_members.join(",")],
+        ),
+    );
     kill_pidfile(d, &format!("node-{}", port_of(bad)));
 
     // Persist + reroll the controller onto the new membership.
@@ -1401,7 +1458,7 @@ fn controlled_failover(
     match call(old_master, tls, &["FLINTDEMOTE", "0", &next.to_string()]) {
         Ok(Value::Simple(_)) => {}
         Ok(Value::Error(e)) if e.starts_with("FENCED") => {}
-        other => panic!("demotion of {old_master} failed: {other:?}"),
+        other => fail(&format!("demotion of {old_master} failed"), &other),
     }
     let drain_deadline = Instant::now() + Duration::from_secs(30);
     loop {
@@ -1420,9 +1477,9 @@ fn controlled_failover(
         &["FLINTPROMOTE", "0", &(next + 1).to_string()],
     ) {
         Ok(Value::Simple(_)) => {}
-        other => panic!(
-            "promotion of {new_master} at (0,{}) failed: {other:?}",
-            next + 1
+        other => fail(
+            &format!("promotion of {new_master} at (0,{}) failed", next + 1),
+            &other,
         ),
     }
     next + 1
@@ -1508,12 +1565,16 @@ fn migrate_slots(inv: &Inventory, ns: &str, range: &str, src: &str, dest: &str) 
                 ) {
                     Ok(Value::Simple(_)) => {}
                     other => eprintln!(
-                        "  warn: CPSETSLOT {ns}/{slot} not committed: {other:?} (the -MOVED bridge still routes)"
+                        "  warn: CPSETSLOT {ns}/{slot} not committed: {} (the -MOVED bridge still routes)",
+                        reply_err(&other)
                     ),
                 }
                 moved += 1;
             }
-            other => panic!("migrate {ns}/{slot} {src_master}->{dest_master} failed: {other:?}"),
+            other => fail(
+                &format!("migrate {ns}/{slot} {src_master}->{dest_master} failed"),
+                &other,
+            ),
         }
     }
     eprintln!("== migrate-slots complete: {moved} slot(s) now owned by {dest_master}");
@@ -1615,12 +1676,14 @@ fn decommission_node(
     // and retry on the master, ever hits a dying node. Writes never touch a
     // replica, so they are unaffected throughout. Bounded; the snapshot
     // push is sub-second, so a few seconds covers several cycles.
-    call(
-        &inv.cp[0],
-        &tls,
-        &["CPSETPAIR", &pair_idx.to_string(), &remaining.join(",")],
-    )
-    .expect("CPSETPAIR");
+    must(
+        "CPSETPAIR",
+        call(
+            &inv.cp[0],
+            &tls,
+            &["CPSETPAIR", &pair_idx.to_string(), &remaining.join(",")],
+        ),
+    );
     eprintln!("  draining {drain_ms}ms for proxies to route off {addr} (still serving)");
     std::thread::sleep(Duration::from_millis(drain_ms));
     kill_pidfile(&inv.statedir, &format!("node-{}", port_of(addr)));
@@ -1875,7 +1938,7 @@ fn main() {
             let tls = tls_client(&inv);
             match call(&inv.cp[0], &tls, &["CPTENANTREADS", name, mode]) {
                 Ok(Value::Simple(s)) => println!("{s}"),
-                other => panic!("tenant-reads failed: {other:?}"),
+                other => fail("tenant-reads failed", &other),
             }
         }
         // Async write-queue opt-in (ADR-0005 D4, the 'a' flag): the hot-key
@@ -1888,7 +1951,7 @@ fn main() {
             let tls = tls_client(&inv);
             match call(&inv.cp[0], &tls, &["CPTENANTASYNC", name, mode]) {
                 Ok(Value::Simple(s)) => println!("{s}"),
-                other => panic!("tenant-async failed: {other:?}"),
+                other => fail("tenant-async failed", &other),
             }
         }
         // Federation flag (ADR-0007, plumbing today): marks the tenant and
@@ -1902,7 +1965,7 @@ fn main() {
             let tls = tls_client(&inv);
             match call(&inv.cp[0], &tls, &["CPTENANTFEDERATE", name, mode]) {
                 Ok(Value::Simple(s)) => println!("{s}"),
-                other => panic!("tenant-federate failed: {other:?}"),
+                other => fail("tenant-federate failed", &other),
             }
         }
         // Tenant quotas (M5): fleet ops/s + storage bytes; 0 = unlimited.
@@ -1918,7 +1981,7 @@ fn main() {
             let tls = tls_client(&inv);
             match call(&inv.cp[0], &tls, &["CPTENANTQUOTA", name, ops, bytes]) {
                 Ok(Value::Simple(s)) => println!("{s}"),
-                other => panic!("tenant-quota failed: {other:?}"),
+                other => fail("tenant-quota failed", &other),
             }
         }
         // Push the near-cache knobs (PROXYCACHE <ttl_ms> <max_bytes>) to
@@ -1941,7 +2004,7 @@ fn main() {
                         "  new admin token minted; both old and new work until the agent retires the old one"
                     );
                 }
-                other => panic!("rotate-admin failed: {other:?}"),
+                other => fail("rotate-admin failed", &other),
             }
         }
         "proxy-cache" => {
@@ -1956,12 +2019,15 @@ fn main() {
                 if let Some(tok) = &inv.admin_token {
                     match call(proxy, &tls, &["AUTH", tok]) {
                         Ok(Value::Simple(_)) => {}
-                        other => panic!("proxy-cache: admin auth to {proxy} failed: {other:?}"),
+                        other => fail(
+                            &format!("proxy-cache: admin auth to {proxy} failed"),
+                            &other,
+                        ),
                     }
                 }
                 match call(proxy, &tls, &["PROXYCACHE", ttl, maxb]) {
                     Ok(Value::Simple(_)) => println!("{proxy}: cache ttl={ttl}ms max={maxb}B"),
-                    other => panic!("proxy-cache: {proxy} rejected: {other:?}"),
+                    other => fail(&format!("proxy-cache: {proxy} rejected"), &other),
                 }
             }
         }
@@ -1976,7 +2042,7 @@ fn main() {
             let tls = tls_client(&inv);
             match call(&inv.cp[0], &tls, &["CPTENANTCACHE", name, mode]) {
                 Ok(Value::Simple(s)) => println!("{s}"),
-                other => panic!("tenant-cache failed: {other:?}"),
+                other => fail("tenant-cache failed", &other),
             }
         }
         "upgrade" => {
