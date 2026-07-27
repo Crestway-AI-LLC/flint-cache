@@ -1452,10 +1452,20 @@ fn corpus() -> Vec<Case> {
                     &[b"JSON.NUMINCRBY", b"d", b"$.i", b"-20"],
                     Expect::Str(b"[-5]"),
                 ),
+                // A float stays a float. Incremented to a NON-integral
+                // value on purpose: RESP3's double type cannot distinguish
+                // the float 2.0 from the integer 2 (it spells both `,2`),
+                // and RedisJSON has exactly the same limitation — so
+                // asserting `[2.0]` here would be asserting something the
+                // protocol cannot carry. Float-ness is checked below with
+                // JSON.GET, which is JSON text in both dialects and so
+                // shows the `.0` either way.
                 s(
-                    &[b"JSON.NUMINCRBY", b"d", b"$.f", b"0.5"],
-                    Expect::Str(b"[2.0]"),
+                    &[b"JSON.NUMINCRBY", b"d", b"$.f", b"0.25"],
+                    Expect::Str(b"[1.75]"),
                 ),
+                s(&[b"JSON.SET", b"d", b"$.g", b"2.0"], Expect::Ok),
+                s(&[b"JSON.GET", b"d", b"$.g"], Expect::Str(b"[2.0]")),
                 s(
                     &[b"JSON.NUMINCRBY", b"d", b"$.s", b"1"],
                     Expect::Str(b"[null]"),
@@ -1812,6 +1822,16 @@ impl Client {
                 Value::Array(Some(mut items)) if items.len() == 1 => items.remove(0),
                 other => other,
             },
+            _ => v,
+        };
+        // JSON.NUMINCRBY answers a typed array under RESP3 and JSON text
+        // under RESP2 — a difference in KIND, so it takes the same rebuild
+        // the proxy uses rather than a generic re-render.
+        let v = match args.first() {
+            Some(n) if flint_resp::resp3_differs_in_kind(n) && !matches!(v, Value::Error(_)) => {
+                let jsonpath = args.get(2).is_some_and(|p| p.first() == Some(&b'$'));
+                flint_resp::json_numincrby_resp2(&v, jsonpath)
+            }
             _ => v,
         };
         // Score pairs are the one shape the wire cannot hand back as

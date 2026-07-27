@@ -986,10 +986,27 @@ fn forward(
         let nests = args
             .first()
             .is_some_and(|n| flint_resp::resp3_nests_reply(n));
-        match backends
-            .call(&addr, frame)
-            .map(|v| if nests { renest(v) } else { v })
-        {
+        // JSON.NUMINCRBY's dialects differ in reply KIND, so the RESP2
+        // spelling has to be rebuilt from the RESP3 array we just read
+        // (derivable: the array holds the matches, args[2] says which
+        // spelling the caller expects).
+        let kind_differs = args
+            .first()
+            .is_some_and(|n| flint_resp::resp3_differs_in_kind(n));
+        let jsonpath = args.get(2).is_some_and(|p| p.first() == Some(&b'$'));
+        let repair = |v: Value| {
+            if nests {
+                return renest(v);
+            }
+            if kind_differs && !matches!(v, Value::Error(_)) {
+                return Value::ByProto {
+                    resp2: Box::new(flint_resp::json_numincrby_resp2(&v, jsonpath)),
+                    resp3: Box::new(v),
+                };
+            }
+            v
+        };
+        match backends.call(&addr, frame).map(repair) {
             Ok(Value::Error(e)) if e.starts_with("MOVED ") => {
                 // "MOVED <slot> <addr>": learn and chase. The client must
                 // never see this — absorbing it is the proxy's reason to

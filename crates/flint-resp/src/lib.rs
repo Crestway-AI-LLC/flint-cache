@@ -94,6 +94,23 @@ pub enum Value {
     /// the real module; skip it and the same call answers `"array"`, which
     /// is the kind of difference that breaks user code far from here.
     Resp3Nested(Box<Value>),
+    /// Two genuinely different replies, one per dialect — the escape hatch
+    /// for when the protocols disagree about the reply's KIND, not merely
+    /// its shape, and no amount of re-rendering can bridge them.
+    ///
+    /// Exactly one command needs it: `JSON.NUMINCRBY`. RESP2 answers a
+    /// JSON string (`[6]`), RESP3 answers a typed RESP array (`*1 :6`), and
+    /// for a legacy path that matches nothing RESP2 answers an ERROR where
+    /// RESP3 answers an empty array. An encoder cannot turn a string into
+    /// an array into an error, so both are carried and the encoder picks.
+    ///
+    /// Reach for this last. Every other difference between the dialects is
+    /// a rendering of the same meaning, and [`Value::Map`], [`Value::Set`]
+    /// and friends say that far better than a pair of pre-baked replies.
+    ByProto {
+        resp2: Box<Value>,
+        resp3: Box<Value>,
+    },
     /// Member/score pairs — `ZRANGE … WITHSCORES`, `ZPOPMIN key count`.
     ///
     /// This one is a STRUCTURAL difference, not just a type tag: RESP2
@@ -124,6 +141,51 @@ pub fn fmt_double(s: f64) -> Vec<u8> {
 /// layer back off before deciding what its OWN client should see.
 pub fn resp3_nests_reply(command: &[u8]) -> bool {
     command.eq_ignore_ascii_case(b"JSON.TYPE")
+}
+
+/// True for the command whose two dialects disagree in reply KIND, so the
+/// proxy knows to rebuild the RESP2 spelling from the RESP3 one it read.
+pub fn resp3_differs_in_kind(command: &[u8]) -> bool {
+    command.eq_ignore_ascii_case(b"JSON.NUMINCRBY")
+}
+
+/// Rebuild `JSON.NUMINCRBY`'s RESP2 reply from its RESP3 array.
+///
+/// The proxy reads backends in RESP3, so this is the direction it needs:
+/// `*1 :6` becomes the JSON text `[6]` for a `$` caller, or the bare `6`
+/// for a legacy one. Every input is derivable — the array holds the
+/// matches, and the path the caller wrote says which spelling they expect.
+pub fn json_numincrby_resp2(resp3_reply: &Value, jsonpath: bool) -> Value {
+    let Value::Array(Some(items)) = resp3_reply else {
+        // An error (or anything unexpected) passes straight through: it is
+        // already the same in both dialects.
+        return resp3_reply.clone();
+    };
+    let render = |v: &Value| -> Vec<u8> {
+        match v {
+            Value::Integer(i) => i.to_string().into_bytes(),
+            Value::Double(d) => fmt_double(*d),
+            _ => b"null".to_vec(),
+        }
+    };
+    if jsonpath {
+        let mut out = vec![b'['];
+        for (i, item) in items.iter().enumerate() {
+            if i > 0 {
+                out.push(b',');
+            }
+            out.extend_from_slice(&render(item));
+        }
+        out.push(b']');
+        return Value::Bulk(Some(out));
+    }
+    // Legacy: the value itself. No match, or a match that is not a number,
+    // is the error RESP2 callers get — the one place the dialects disagree
+    // about the KIND of the reply rather than its shape.
+    match items.first() {
+        Some(Value::Integer(_) | Value::Double(_)) => Value::Bulk(Some(render(&items[0]))),
+        _ => Value::Error("ERR Path does not exist or does not contains a number".into()),
+    }
 }
 
 /// A parsed `HELLO [protover [AUTH user pass] [SETNAME name]]`.
@@ -251,13 +313,13 @@ pub fn encode(value: &Value, out: &mut Vec<u8>) {
 /// a set is a plain array, a double becomes a bulk string, and member/score
 /// pairs interleave instead of nesting.
 pub fn encode_proto(value: &Value, proto: Proto, out: &mut Vec<u8>) {
-    let resp3 = proto == Proto::Resp3;
+    let resp3_sel = proto == Proto::Resp3;
     match value {
         Value::Null => {
-            out.extend_from_slice(if resp3 { b"_\r\n" } else { b"$-1\r\n" });
+            out.extend_from_slice(if resp3_sel { b"_\r\n" } else { b"$-1\r\n" });
         }
         Value::Double(d) => {
-            if resp3 {
+            if resp3_sel {
                 out.push(b',');
                 // RESP3 spells the infinities out; finite values use the
                 // same shortest-roundtrip text as the RESP2 bulk.
@@ -272,7 +334,7 @@ pub fn encode_proto(value: &Value, proto: Proto, out: &mut Vec<u8>) {
             }
         }
         Value::Map(pairs) => {
-            if resp3 {
+            if resp3_sel {
                 out.push(b'%');
                 out.extend_from_slice(pairs.len().to_string().as_bytes());
             } else {
@@ -286,26 +348,33 @@ pub fn encode_proto(value: &Value, proto: Proto, out: &mut Vec<u8>) {
             }
         }
         Value::Set(items) => {
-            out.push(if resp3 { b'~' } else { b'*' });
+            out.push(if resp3_sel { b'~' } else { b'*' });
             out.extend_from_slice(items.len().to_string().as_bytes());
             out.extend_from_slice(b"\r\n");
             for item in items {
                 encode_proto(item, proto, out);
             }
         }
+        Value::ByProto { resp2, resp3 } => {
+            encode_proto(if resp3_sel { resp3 } else { resp2 }, proto, out);
+        }
         Value::Resp3Nested(inner) => {
-            if resp3 {
+            if resp3_sel {
                 out.extend_from_slice(b"*1\r\n");
             }
             encode_proto(inner, proto, out);
         }
         Value::ScorePairs(pairs) => {
             out.push(b'*');
-            let n = if resp3 { pairs.len() } else { pairs.len() * 2 };
+            let n = if resp3_sel {
+                pairs.len()
+            } else {
+                pairs.len() * 2
+            };
             out.extend_from_slice(n.to_string().as_bytes());
             out.extend_from_slice(b"\r\n");
             for (member, score) in pairs {
-                if resp3 {
+                if resp3_sel {
                     out.extend_from_slice(b"*2\r\n");
                 }
                 encode_proto(&Value::Bulk(Some(member.clone())), proto, out);
@@ -328,7 +397,7 @@ pub fn encode_proto(value: &Value, proto: Proto, out: &mut Vec<u8>) {
             out.extend_from_slice(b"\r\n");
         }
         // Both spellings of "absent" collapse to RESP3's single null.
-        Value::Bulk(None) | Value::Array(None) if resp3 => out.extend_from_slice(b"_\r\n"),
+        Value::Bulk(None) | Value::Array(None) if resp3_sel => out.extend_from_slice(b"_\r\n"),
         Value::Bulk(None) => out.extend_from_slice(b"$-1\r\n"),
         Value::Bulk(Some(data)) => {
             out.push(b'$');

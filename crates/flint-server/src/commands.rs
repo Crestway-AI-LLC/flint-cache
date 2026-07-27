@@ -1251,13 +1251,32 @@ impl<'a> Dispatcher<'a> {
         let Some(mut doc) = doc else {
             return err(NO_SUCH_KEY);
         };
-        // Three outcomes, and the dialect decides how the last two read:
-        // no match at all, a match that is not a number, or a new value.
+        // NUMINCRBY is the ONE command whose two dialects disagree about
+        // the KIND of reply, not just its shape: RESP2 answers JSON text
+        // (`[6]`), RESP3 answers a typed RESP array (`*1 :6`). So each
+        // outcome is built for both and `ByProto` carries the pair.
+        let numeric = |v: Option<&serde_json::Value>| -> Value {
+            match v {
+                Some(n) if n.is_i64() || n.is_u64() => Value::Integer(n.as_i64().unwrap_or(0)),
+                Some(n) => Value::Double(n.as_f64().unwrap_or(0.0)),
+                None => Value::Null,
+            }
+        };
+        let paired = |resp2: Value, matches: Vec<Value>| Value::ByProto {
+            resp2: Box::new(resp2),
+            resp3: Box::new(Value::Array(Some(matches))),
+        };
         let Some(slot) = crate::json_path::get_mut(&mut doc, &path) else {
-            return Self::json_doc_matches(&path, None, PATH_MISSING);
+            return paired(
+                Self::json_doc_matches(&path, None, PATH_MISSING),
+                Vec::new(),
+            );
         };
         let Some(cur) = slot.as_f64() else {
-            return Self::json_doc_matches(&path, Some(None), "ERR path does not hold a number");
+            return paired(
+                Self::json_doc_matches(&path, Some(None), "ERR path does not hold a number"),
+                vec![Value::Null],
+            );
         };
         let next = cur + by;
         if !next.is_finite() {
@@ -1274,7 +1293,10 @@ impl<'a> Dispatcher<'a> {
         let out = slot.clone();
         match self.json_save(&args[1], &doc) {
             Some(e) => e,
-            None => Self::json_doc_matches(&path, Some(Some(out)), PATH_MISSING),
+            None => paired(
+                Self::json_doc_matches(&path, Some(Some(out.clone())), PATH_MISSING),
+                vec![numeric(Some(&out))],
+            ),
         }
     }
 
@@ -1969,9 +1991,21 @@ mod tests {
     use flint_storage::MemKv;
     use flint_storage::strings::system_clock;
 
+    use flint_resp::Proto;
+
     fn call(kv: &MemKv, parts: &[&[u8]]) -> Value {
         let d = Dispatcher::new(kv, system_clock);
         d.dispatch(&parts.iter().map(|p| p.to_vec()).collect::<Vec<_>>())
+    }
+
+    /// The bytes a client on `proto` actually receives. Comparing wire
+    /// output is the honest assertion for replies whose two dialects differ
+    /// — the carrier (`ByProto`, `Resp3Nested`) is an implementation
+    /// detail, but the bytes are the contract.
+    fn wire(v: &Value, proto: Proto) -> Vec<u8> {
+        let mut out = Vec::new();
+        flint_resp::encode_proto(v, proto, &mut out);
+        out
     }
 
     /// Drive a full SCAN to completion, returning every key seen. Panics on
@@ -2147,14 +2181,29 @@ mod tests {
             call(&s, &[b"JSON.GET", b"d", b"$.t[-1]"]),
             Value::Bulk(Some(br#"["z"]"#.to_vec()))
         );
-        // Numeric increment keeps integers integral.
+        // Numeric increment keeps integers integral. NUMINCRBY is the one
+        // command whose two dialects differ in reply KIND, so assert what
+        // each protocol actually puts on the wire rather than the carrier.
         assert_eq!(
-            call(&s, &[b"JSON.NUMINCRBY", b"d", b"$.a", b"8"]),
-            Value::Bulk(Some(b"[50]".to_vec()))
+            wire(
+                &call(&s, &[b"JSON.NUMINCRBY", b"d", b"$.a", b"8"]),
+                Proto::Resp2
+            ),
+            b"$4\r\n[50]\r\n"
         );
         assert_eq!(
-            call(&s, &[b"JSON.NUMINCRBY", b"d", b".a", b"0"]),
-            Value::Bulk(Some(b"50".to_vec()))
+            wire(
+                &call(&s, &[b"JSON.NUMINCRBY", b"d", b"$.a", b"0"]),
+                Proto::Resp3
+            ),
+            b"*1\r\n:50\r\n"
+        );
+        assert_eq!(
+            wire(
+                &call(&s, &[b"JSON.NUMINCRBY", b"d", b".a", b"0"]),
+                Proto::Resp2
+            ),
+            b"$2\r\n50\r\n"
         );
         // Path delete removes just that member; the document survives. A
         // path matching nothing is an empty container, not nil.
@@ -2198,13 +2247,36 @@ mod tests {
         // Type mismatches at the path: a null element under `$`, an error
         // under the legacy dialect. Same condition, two contracts.
         assert_eq!(
-            call(&s, &[b"JSON.NUMINCRBY", b"d", b"$.s", b"1"]),
-            Value::Bulk(Some(b"[null]".to_vec()))
+            wire(
+                &call(&s, &[b"JSON.NUMINCRBY", b"d", b"$.s", b"1"]),
+                Proto::Resp2
+            ),
+            b"$6\r\n[null]\r\n"
         );
-        assert!(matches!(
-            call(&s, &[b"JSON.NUMINCRBY", b"d", b".s", b"1"]),
-            Value::Error(e) if e.contains("number")
-        ));
+        assert_eq!(
+            wire(
+                &call(&s, &[b"JSON.NUMINCRBY", b"d", b"$.s", b"1"]),
+                Proto::Resp3
+            ),
+            b"*1\r\n_\r\n"
+        );
+        // The legacy dialect errors under RESP2 — and under RESP3 answers a
+        // one-element array holding null, because there the reply KIND
+        // itself differs. RedisJSON does exactly this; assert the bytes.
+        assert!(
+            String::from_utf8_lossy(&wire(
+                &call(&s, &[b"JSON.NUMINCRBY", b"d", b".s", b"1"]),
+                Proto::Resp2
+            ))
+            .contains("number")
+        );
+        assert_eq!(
+            wire(
+                &call(&s, &[b"JSON.NUMINCRBY", b"d", b".s", b"1"]),
+                Proto::Resp3
+            ),
+            b"*1\r\n_\r\n"
+        );
         assert_eq!(
             call(&s, &[b"JSON.ARRAPPEND", b"d", b"$.o", b"1"]),
             Value::Array(Some(vec![Value::Bulk(None)]))
