@@ -49,6 +49,18 @@ use std::sync::RwLock;
 /// Configure with `--max-value-bytes` (0 = unlimited).
 pub const DEFAULT_MAX_VALUE_BYTES: u64 = 512 * 1024 * 1024;
 
+/// Default policy cap on user-key length: 4 KiB, the same ceiling
+/// ElastiCache Serverless enforces, so a key that works there works here
+/// and a migration does not discover the difference in production.
+///
+/// This is a POLICY default, well under the structural ceiling below, and
+/// deliberately stricter than stock Redis — where a key is just a string
+/// and may be up to 512 MB. A multi-megabyte key is never a working cache
+/// key; it is a bug or an attack, and every one of them is copied into
+/// each subkey envelope. Raise it with `--max-key-bytes` if a real
+/// workload needs to, up to the structural ceiling.
+pub const DEFAULT_MAX_KEY_BYTES: u64 = 4 * 1024;
+
 /// Structural ceiling on user-key length: the subkey/zscore envelopes
 /// frame the key length as 2 bytes (`encoding::subkey_prefix`), so a
 /// longer key cannot be represented — the envelope builders assert it and

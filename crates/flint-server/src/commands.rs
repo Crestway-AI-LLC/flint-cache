@@ -73,7 +73,7 @@ impl Default for Limits {
     fn default() -> Self {
         Self {
             max_value_bytes: flint_storage::DEFAULT_MAX_VALUE_BYTES,
-            max_key_bytes: flint_storage::MAX_KEY_BYTES,
+            max_key_bytes: flint_storage::DEFAULT_MAX_KEY_BYTES,
         }
     }
 }
@@ -2472,7 +2472,17 @@ mod tests {
     #[test]
     fn key_size_ceiling_is_always_enforced() {
         let s = MemKv::new();
-        let d = Dispatcher::new(&s, system_clock);
+        // Policy OFF (0 = ceiling only), so what this asserts really is the
+        // STRUCTURAL limit and not the 4 KiB default sitting in front of it.
+        let d = Dispatcher::with_limits(
+            &s,
+            system_clock,
+            Limits {
+                max_key_bytes: 0,
+                ..Default::default()
+            },
+            DEFAULT_NS,
+        );
         let call =
             |parts: &[&[u8]]| d.dispatch(&parts.iter().map(|p| p.to_vec()).collect::<Vec<_>>());
         let too_long = Value::Error("ERR key exceeds maximum allowed size (max-key-bytes)".into());
@@ -2491,6 +2501,28 @@ mod tests {
         assert_eq!(call(&[b"HSET", &at, b"f", b"v"]), Value::Integer(1));
         assert_eq!(call(&[b"DEL", &at]), Value::Integer(1));
         assert_eq!(call(&[b"ZADD", &at, b"1", b"m"]), Value::Integer(1));
+    }
+
+    /// The shipped default is 4 KiB — ElastiCache Serverless's key ceiling
+    /// — so a key that works on the service people are migrating from works
+    /// here, and one that does not is refused at both ends rather than
+    /// discovered in production.
+    #[test]
+    fn default_key_cap_matches_the_managed_service_ceiling() {
+        assert_eq!(flint_storage::DEFAULT_MAX_KEY_BYTES, 4096);
+        let s = MemKv::new();
+        let d = Dispatcher::new(&s, system_clock);
+        let call =
+            |parts: &[&[u8]]| d.dispatch(&parts.iter().map(|p| p.to_vec()).collect::<Vec<_>>());
+        let at = vec![b'k'; 4096];
+        let over = vec![b'k'; 4097];
+        assert_eq!(call(&[b"SET", &at, b"v"]), Value::Simple("OK".into()));
+        assert_eq!(
+            call(&[b"SET", &over, b"v"]),
+            Value::Error("ERR key exceeds maximum allowed size (max-key-bytes)".into())
+        );
+        // Refused on the way in: nothing was written under the long key.
+        assert_eq!(call(&[b"EXISTS", &at]), Value::Integer(1));
     }
 
     #[test]

@@ -149,6 +149,16 @@ Three cases differ, each on purpose:
 A fourth, smaller one: a write to a missing intermediate (`$.x.y` where `x`
 does not exist) is an error here and a silent nil in RedisJSON. Both refuse
 the write; ours says why.
+- **Keys are capped at 4 KiB**, where stock Redis treats a key as just
+  another string and accepts up to 512 MB. The cap matches what ElastiCache
+  Serverless enforces, so a key that works on the managed service people
+  migrate from works here — and one that does not is refused at both ends
+  instead of found in production. A multi-megabyte key is never a working
+  cache key, and every one of them is copied into each subkey envelope.
+  Raise it with `--max-key-bytes` (up to a structural 64 KiB ceiling: the
+  subkey envelope frames key length in two bytes) or set `0` for the
+  ceiling alone. Values stay at Redis's own 512 MB
+  (`--max-value-bytes`).
 - **INCRBYFLOAT** formats like Redis (`%.17f`, trailing zeros trimmed).
 - **Expiry is lazy + swept**: an expired key reads as missing immediately;
   physical reclamation is background.

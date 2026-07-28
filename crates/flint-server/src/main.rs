@@ -525,15 +525,16 @@ fn main() -> std::io::Result<()> {
     // Size policies. --max-value-bytes (Valkey's proto-max-bulk-len
     // analog, extended to collections): writes that would grow any single
     // value past it are rejected; 0 disables. --max-key-bytes: key-length
-    // cap, clamped to the envelope's structural 64KB ceiling (the subkey
-    // length frame is 2 bytes); 0 means ceiling only.
+    // cap, 4 KiB by default (ElastiCache Serverless's ceiling), clamped to
+    // the envelope's structural 64KB one (the subkey length frame is 2
+    // bytes); 0 means ceiling only.
     let limits = commands::Limits {
         max_value_bytes: arg("--max-value-bytes")
             .and_then(|v| v.parse().ok())
             .unwrap_or(flint_storage::DEFAULT_MAX_VALUE_BYTES),
         max_key_bytes: arg("--max-key-bytes")
             .and_then(|v| v.parse().ok())
-            .unwrap_or(flint_storage::MAX_KEY_BYTES),
+            .unwrap_or(flint_storage::DEFAULT_MAX_KEY_BYTES),
     };
     if limits.max_value_bytes != flint_storage::DEFAULT_MAX_VALUE_BYTES {
         eprintln!(
@@ -545,7 +546,7 @@ fn main() -> std::io::Result<()> {
             }
         );
     }
-    if limits.max_key_bytes != flint_storage::MAX_KEY_BYTES {
+    if limits.max_key_bytes != flint_storage::DEFAULT_MAX_KEY_BYTES {
         eprintln!(
             "max-key-bytes: {} (structural ceiling {})",
             limits.max_key_bytes,
