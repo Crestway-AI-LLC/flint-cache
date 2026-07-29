@@ -44,7 +44,7 @@ cleanup() {
   if [ "$(uname)" = "Darwin" ]; then
     hdiutil detach "$MNT" -force -quiet 2>/dev/null
   else
-    umount "$MNT" 2>/dev/null
+    sudo umount "$MNT" 2>/dev/null
   fi
   rm -rf "$IMG" "$MNT" 2>/dev/null
 }
@@ -59,11 +59,15 @@ if [ "$(uname)" = "Darwin" ]; then
   hdiutil attach "$IMG" -mountpoint "$MNT" -quiet || fail "could not attach the disk image"
 else
   command -v mkfs.ext4 >/dev/null || { echo "SKIP: mkfs.ext4 not available"; exit 0; }
-  [ "$(id -u)" = "0" ] || { echo "SKIP: needs root to mount a loop device"; exit 0; }
+  # sudo for the MOUNT ONLY, never for the whole script: cargo and the
+  # toolchain are installed per-user, and running everything as root loses
+  # them ("rustup could not choose a version of cargo to run").
+  sudo -n true 2>/dev/null || { echo "SKIP: needs passwordless sudo to mount a loop device"; exit 0; }
   mkdir -p "$MNT"
   dd if=/dev/zero of="$IMG" bs=1M count="$SIZE_MB" status=none
   mkfs.ext4 -q "$IMG"
-  mount -o loop "$IMG" "$MNT" || fail "could not mount the loop device"
+  sudo mount -o loop "$IMG" "$MNT" || fail "could not mount the loop device"
+  sudo chown "$(id -u):$(id -g)" "$MNT" || fail "could not take ownership of the mount"
 fi
 
 cargo build --release -q -p flint-server --features rocks || fail "build"
