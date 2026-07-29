@@ -1313,6 +1313,53 @@ fn verify_checks(inv: &Inventory, probe: Option<&str>, loud: bool) -> Vec<String
         note(proxy_up(inv, p), "proxy up", p.clone());
     }
 
+    // The CP's proxy registry must contain exactly the proxies this inventory
+    // declares, under the identity they run with (advertise when set).
+    //
+    // Registrations are append-only, so a fleet re-bootstrapped after its
+    // identity changed — bind address one time, DNS name the next — carries
+    // BOTH rows forever with nothing marking which is live. Tenant placement
+    // shuffle-shards across that list, so a new tenant can be handed a name no
+    // running proxy answers to and then fail authentication at the edge with a
+    // byte-correct token. That happened on the playground and took a digest
+    // comparison to diagnose, because nothing logs it.
+    let declared: Vec<String> = (0..inv.proxies.len())
+        .map(|i| probe_target(inv, i))
+        .collect();
+    match call(&inv.cp[0], &tls, &["CPPROXIES"]) {
+        Ok(Value::Bulk(Some(raw))) => {
+            let listed: Vec<String> = String::from_utf8_lossy(&raw)
+                .split(',')
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect();
+            let strays: Vec<&String> = listed.iter().filter(|r| !declared.contains(r)).collect();
+            let missing: Vec<&String> = declared.iter().filter(|d| !listed.contains(d)).collect();
+            note(
+                strays.is_empty(),
+                "registry has no stray proxies",
+                if strays.is_empty() {
+                    format!("{} registered", listed.len())
+                } else {
+                    format!(
+                        "{strays:?} registered but not in the inventory — tenants placed there \
+                         get -WRONGPASS; retire with `flintctl retire-proxy <addr>`"
+                    )
+                },
+            );
+            note(
+                missing.is_empty(),
+                "every declared proxy is registered",
+                if missing.is_empty() {
+                    String::new()
+                } else {
+                    format!("{missing:?} declared but never registered")
+                },
+            );
+        }
+        other => note(false, "CPPROXIES", format!("{other:?}")),
+    }
+
     // The data-plane probe needs a tenant credential; without one the
     // structural checks above still run, but the checks that actually catch
     // a stale routing table cannot. Say so rather than imply a clean bill.
@@ -1481,6 +1528,33 @@ fn tenant_add(inv: &Inventory, rest: &[String]) {
 /// every pair master (FLINTNS + FLUSHALL — namespace-scoped by the tenancy
 /// invariant). Data wipe is best-effort per pair and reported; re-running
 /// is safe (the wipe is idempotent, the CP delete errors "no such tenant").
+/// Retire a proxy registration the inventory no longer declares.
+///
+/// The counterpart to what `verify` reports. Registrations are append-only,
+/// so a re-bootstrapped fleet whose proxy identity changed keeps both rows,
+/// and tenant placement can shuffle-shard onto the dead one — a tenant that
+/// then answers -WRONGPASS at every edge with a byte-correct token.
+///
+/// Deliberately NOT automatic. `start` runs on every boot, and silently
+/// deleting registry rows on boot is the kind of helpfulness that removes a
+/// proxy someone meant to keep. verify names it; the operator retires it.
+fn retire_proxy(inv: &Inventory, addr: &str) {
+    let tls = tls_client(inv);
+    let declared: Vec<String> = (0..inv.proxies.len())
+        .map(|i| probe_target(inv, i))
+        .collect();
+    if declared.iter().any(|d| d == addr) {
+        die(&format!(
+            "refusing: {addr} IS declared in this inventory — retiring it would strip a live \
+             proxy from every tenant subset. Remove the proxy line first if that is the intent."
+        ));
+    }
+    match call(&inv.cp[0], &tls, &["CPDELPROXY", addr]) {
+        Ok(Value::Simple(s)) => println!("{s}"),
+        other => fail("retire-proxy failed", &other),
+    }
+}
+
 fn tenant_remove(inv: &Inventory, name: &str) {
     let tls = tls_client(inv);
     // Namespace lookup BEFORE deletion (the record dies with the delete).
@@ -2383,6 +2457,10 @@ fn main() {
         }
         "start" => start(&inv),
         "status" => status(&inv),
+        "retire-proxy" => {
+            let addr = rest.first().expect("usage: retire-proxy <addr>");
+            retire_proxy(&inv, addr);
+        }
         "verify" => verify(&inv, &rest),
         "tenant" => match rest.first().map(|s| s.as_str()) {
             Some("add") => tenant_add(&inv, &rest[1..]),

@@ -40,6 +40,7 @@ disagrees with the oracle, the case is wrong.
     tools/disk_pressure_drill.sh      # host out of room: shed, serve, self-recover
     tools/ctl_error_drill.sh          # a refused command reports, never panics
     tools/client_compat_drill.sh      # redis-py + node-redis, both on RESP3
+    tools/proxy_registry_drill.sh     # stray registrations cannot strand a tenant
 
 ## 3b. Integrity — the cluster agrees with itself
 

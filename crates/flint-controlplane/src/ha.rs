@@ -500,6 +500,15 @@ async fn handle_admin(ha: &Ha, args: &[Vec<u8>]) -> Value {
                 Err(l) => redirect(l),
             }
         }
+        b"CPDELPROXY" => {
+            let Some(addr) = text(1) else {
+                return Value::Error("ERR CPDELPROXY <addr>".into());
+            };
+            match ha.propose(Mutation::DelProxy(addr.clone())).await {
+                Ok(_) => Value::Simple(format!("OK retired {addr}")),
+                Err(l) => redirect(l),
+            }
+        }
         b"CPADDPAIR" => {
             let Some(nodes) = text(1).filter(|a| clean(a)) else {
                 return Value::Error("ERR CPADDPAIR <a,b[,c]>".into());
@@ -561,15 +570,22 @@ async fn handle_admin(ha: &Ha, args: &[Vec<u8>]) -> Value {
         }
         b"CPSETSUBSET" => {
             let (Some(name), Some(subset)) = (text(1), text(2)) else {
-                return Value::Error("ERR CPSETSUBSET <name> <p1,p2|->".into());
+                return Value::Error("ERR CPSETSUBSET <name> <p1,p2|*|->".into());
             };
-            let subset = if subset == "-" {
-                Vec::new()
-            } else {
-                subset.split(',').map(String::from).collect()
+            // `*` = every registered proxy, `-` = NONE (drain). `-` reads
+            // like "all" and means the opposite; see CPSETSUBSET's docs.
+            let subset: Vec<String> = match subset.as_str() {
+                "-" => Vec::new(),
+                "*" => ha.store.registry().await.proxies.clone(),
+                list => list.split(',').map(String::from).collect(),
             };
+            let placed = subset.len();
             match ha.propose(Mutation::SetSubset { name, subset }).await {
-                Ok(_) => Value::Simple("OK".into()),
+                Ok(_) if placed == 0 => Value::Simple(
+                    "OK subset = NONE — this tenant is DRAINED and will answer -WRONGPASS at every edge"
+                        .into(),
+                ),
+                Ok(_) => Value::Simple(format!("OK subset = {placed} proxy(ies)")),
                 Err(l) => redirect(l),
             }
         }

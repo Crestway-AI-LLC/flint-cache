@@ -18,11 +18,19 @@
 //!
 //! Admin API (RESP):
 //!   CPADDPROXY <addr>                       register a fleet member
+//!   CPDELPROXY <addr>                       retire a registration (and drop
+//!                                           it from every tenant subset)
 //!   CPADDPAIR <a,b[,c]>                     register a replica set
 //!   CPADDTENANT <name> <token> <ns> [k]     add tenant; subset = shuffle
 //!                                           shard of k (default 2) proxies
-//!   CPSETSUBSET <name> <p1,p2|->            override subset (whale
-//!                                           isolation / drain)
+//!   CPSETSUBSET <name> <p1,p2|*|->          override subset: an explicit
+//!                                           list, `*` = every registered
+//!                                           proxy, `-` = NONE (drain). The
+//!                                           reply says which, because `-`
+//!                                           reads like "all" and means the
+//!                                           opposite: a tenant set to `-`
+//!                                           is served nowhere and answers
+//!                                           -WRONGPASS at every edge.
 //!   CPINFO                                  version + counts
 //!   CPSNAPSHOT <proxy-addr>                 one-shot filtered snapshot
 //!
@@ -109,6 +117,30 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
                 shared.changed.notify_all();
             }
             ok()
+        }
+        b"CPDELPROXY" => {
+            let Some(addr) = text(1) else {
+                return err("CPDELPROXY <addr>");
+            };
+            let Ok(mut st) = shared.state.lock() else {
+                return err("state lock");
+            };
+            if !st.proxies.iter().any(|p| p == &addr) {
+                return err(&format!("no such proxy {addr}"));
+            };
+            st.proxies.retain(|p| p != &addr);
+            // A retired proxy must not linger in any tenant's subset: leaving
+            // it there is the same trap one level down, and the tenant keeps
+            // a placement slot pointing at nothing.
+            for t in st.tenants.values_mut() {
+                t.subset.retain(|p| p != &addr);
+            }
+            match st.commit() {
+                Ok(_) => {}
+                Err(e) => return err(&format!("persist: {e}")),
+            }
+            shared.changed.notify_all();
+            Value::Simple(format!("OK retired {addr}"))
         }
         b"CPADDPAIR" => {
             let Some(nodes) = text(1).filter(|a| clean(a)) else {
@@ -235,25 +267,35 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
         }
         b"CPSETSUBSET" => {
             let (Some(name), Some(subset)) = (text(1), text(2)) else {
-                return err("CPSETSUBSET <name> <p1,p2|->");
+                return err("CPSETSUBSET <name> <p1,p2|*|->");
             };
             let Ok(mut st) = shared.state.lock() else {
                 return err("state lock");
             };
+            let all: Vec<String> = st.proxies.clone();
             let Some(t) = st.tenants.get_mut(&name) else {
                 return err("no such tenant");
             };
-            t.subset = if subset == "-" {
-                Vec::new()
-            } else {
-                subset.split(',').map(String::from).collect()
+            t.subset = match subset.as_str() {
+                "-" => Vec::new(),
+                "*" => all,
+                list => list.split(',').map(String::from).collect(),
             };
+            let placed = t.subset.len();
             match st.commit() {
                 Ok(_) => {}
                 Err(e) => return err(&format!("persist: {e}")),
             }
             shared.changed.notify_all();
-            ok()
+            // Say what happened. `+OK` after setting a subset to `-` looks
+            // identical to `+OK` after placing the tenant everywhere, and the
+            // two differ by "serves nowhere".
+            Value::Simple(if placed == 0 {
+                "OK subset = NONE — this tenant is DRAINED and will answer -WRONGPASS at every edge"
+                    .to_string()
+            } else {
+                format!("OK subset = {placed} proxy(ies)")
+            })
         }
         // Option B: record slot-ownership truth at cutover. Owner may be a
         // pair INDEX or any member address (resolved here) — stored as the

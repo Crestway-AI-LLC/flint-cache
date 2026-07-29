@@ -6,6 +6,15 @@ use std::collections::BTreeMap;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Mutation {
     AddProxy(String),
+    /// Retire a proxy registration.
+    ///
+    /// Registrations were append-only, so a proxy that changed identity —
+    /// bind address one bootstrap, advertise name the next — left BOTH rows
+    /// standing, and nothing distinguished the live one. Tenant placement
+    /// shuffle-shards across this list, so a new tenant could be assigned to
+    /// a name no running proxy answers to and get -WRONGPASS from the edge
+    /// with a correct token. Observed on the playground.
+    DelProxy(String),
     AddPair {
         nodes: Vec<String>,
         /// Slot range (level-1 routing state); None = unranged/expansion.
@@ -188,6 +197,15 @@ impl RegistryState {
             Mutation::AddProxy(a) => {
                 if !self.proxies.contains(&a) {
                     self.proxies.push(a);
+                }
+            }
+            Mutation::DelProxy(a) => {
+                self.proxies.retain(|p| p != &a);
+                // A retired proxy must not linger in any tenant's subset:
+                // leaving it there is the same trap one level down, and the
+                // tenant would keep a placement slot pointing at nothing.
+                for t in self.tenants.values_mut() {
+                    t.subset.retain(|p| p != &a);
                 }
             }
             Mutation::AddPair { nodes, range } => {
