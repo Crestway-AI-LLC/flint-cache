@@ -527,13 +527,62 @@ fn pids_matching(bin: &str, ident: &str) -> Vec<u32> {
 /// So: kill what the pidfile claims, then kill anything still answering to
 /// this seat by argv (the `stop` sweep's logic narrowed to one process), and
 /// do not return until nothing matches.
-fn stop_seat(inv: &Inventory, name: &str, bin: &str, ident: &str) -> Result<(), String> {
+/// Wait until `port` can actually be bound.
+///
+/// "The process is gone from ps" is a PROXY for the precondition that matters,
+/// and not a reliable one: `kill` returns as soon as the signal is queued, not
+/// when the target has died and released its listener. Rolling the playground
+/// to rc.14 hit exactly that window — the replacement control plane bound
+/// microseconds too early, died with `AddrInUse`, and left the fleet with NO
+/// control plane. The roll reported the truth ("did not answer after the
+/// binary swap") but the damage was done by then.
+///
+/// So assert the real precondition. Binding both the wildcard and loopback
+/// forms covers seats that bind either.
+fn wait_port_free(port: u16, budget: Duration) -> Result<(), String> {
+    use std::net::TcpListener;
+    let deadline = Instant::now() + budget;
+    loop {
+        let wildcard = TcpListener::bind(("0.0.0.0", port));
+        let loopback = TcpListener::bind(("127.0.0.1", port));
+        match (&wildcard, &loopback) {
+            (Ok(_), Ok(_)) => {
+                // Drop both before the caller spawns; a listener held here
+                // would be the very conflict this exists to avoid.
+                drop(wildcard);
+                drop(loopback);
+                return Ok(());
+            }
+            _ => {
+                if Instant::now() > deadline {
+                    return Err(format!(
+                        "port {port} still bound after the process was gone — refusing to start a \
+                         replacement that would die with AddrInUse and leave nothing serving"
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }
+}
+
+fn stop_seat(
+    inv: &Inventory,
+    name: &str,
+    bin: &str,
+    ident: &str,
+    port: Option<u16>,
+) -> Result<(), String> {
     kill_pidfile(&inv.statedir, name);
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let alive = pids_matching(bin, ident);
         if alive.is_empty() {
-            return Ok(());
+            // Gone from ps is necessary but NOT sufficient — see wait_port_free.
+            return match port {
+                Some(p) => wait_port_free(p, Duration::from_secs(15)),
+                None => Ok(()),
+            };
         }
         for pid in &alive {
             let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
@@ -1923,6 +1972,7 @@ fn roll_node(
         &format!("node-{port}"),
         "flint-server",
         &format!("{d}/node-{port}"),
+        Some(port),
     )?;
     if wipe {
         // Ex-masters NEVER warm-rejoin, even durably demoted: their
@@ -2409,7 +2459,13 @@ fn roll_edge(inv: &Inventory, envs: &[(String, String)]) {
 
     if inv.controller {
         eprintln!("== controller");
-        if let Err(e) = stop_seat(inv, "controller", "flint-controller", &format!("{d}/snaps")) {
+        if let Err(e) = stop_seat(
+            inv,
+            "controller",
+            "flint-controller",
+            &format!("{d}/snaps"),
+            None,
+        ) {
             die_on("controller", e);
         }
         spawn_env(
@@ -2423,14 +2479,26 @@ fn roll_edge(inv: &Inventory, envs: &[(String, String)]) {
 
     if let Some(args) = agent_args(inv) {
         eprintln!("== agent");
-        if let Err(e) = stop_seat(inv, "agent", "flint-agent", &format!("{d}/shadow.jsonl")) {
+        if let Err(e) = stop_seat(
+            inv,
+            "agent",
+            "flint-agent",
+            &format!("{d}/shadow.jsonl"),
+            inv.agent.as_deref().map(port_of),
+        ) {
             die_on("agent", e);
         }
         spawn_env(inv, "agent", "flint-agent", &args, envs);
     }
 
     eprintln!("== control plane");
-    if let Err(e) = stop_seat(inv, "cp", "flint-controlplane", &format!("{d}/cp-state")) {
+    if let Err(e) = stop_seat(
+        inv,
+        "cp",
+        "flint-controlplane",
+        &format!("{d}/cp-state"),
+        Some(port_of(&inv.cp[0])),
+    ) {
         die_on("control plane", e);
     }
     spawn_env(inv, "cp", "flint-controlplane", &cp_args(inv), envs);
@@ -2448,7 +2516,7 @@ fn roll_edge(inv: &Inventory, envs: &[(String, String)]) {
         // started with and is unique per proxy, so the match cannot stray
         // onto a sibling.
         let ident = inv.proxy_advertise.get(i).unwrap_or(proxy).clone();
-        if let Err(e) = stop_seat(inv, &seat, "flint-proxy", &ident) {
+        if let Err(e) = stop_seat(inv, &seat, "flint-proxy", &ident, Some(port_of(proxy))) {
             die_on(&seat, e);
         }
         spawn_env(inv, &seat, "flint-proxy", &proxy_args(inv, i), envs);
