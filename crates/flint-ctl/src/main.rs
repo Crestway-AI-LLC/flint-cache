@@ -230,13 +230,69 @@ fn call_slow(
 /// Run a SEQUENCE of commands on ONE connection, returning the last reply.
 /// Needed wherever an earlier command sets connection state a later one
 /// depends on (FLINTNS pins the namespace; FLUSHALL then wipes THAT ns).
+/// EDGE-client TLS for the verify probe: verify the proxy's edge cert, present
+/// no client cert (edge auth is tokens, not certs) — the same trust a tenant's
+/// own redis client uses.
+///
+/// Without this the probe dialled the client port in PLAINTEXT, and on any
+/// `client-tls on` fleet — which is every real deployment — decoded the
+/// server's TLS alert as a RESP frame and reported
+/// `UnknownType(21)` five times over. So the half of verify that actually
+/// catches a stale routing table was unusable exactly where it matters, and
+/// it failed in a way that named neither TLS nor the port.
+fn edge_tls_client(inv: &Inventory) -> Option<Arc<flint_tls::ClientConfig>> {
+    if !inv.client_tls {
+        return None;
+    }
+    // Default trust is the internal CA (it signs the default edge cert); a
+    // fleet serving a PUBLIC edge cert declares `edge-trust <bundle>`.
+    let trust = inv
+        .edge_trust
+        .clone()
+        .unwrap_or_else(|| format!("{}/certs/ca.crt", inv.statedir));
+    Some(
+        flint_tls::edge_client_config(&trust)
+            .unwrap_or_else(|e| die(&format!("edge trust {trust}: {e}"))),
+    )
+}
+
+/// Where to dial the proxy as a CLIENT would.
+///
+/// The inventory's proxy line is a BIND address: `0.0.0.0:7379` is not a
+/// hostname, and under TLS its SNI matches nothing in the edge cert. The
+/// advertise address is the one published to clients and the one the cert is
+/// issued for, so a probe of it tests what tenants actually reach — DNS and
+/// certificate included.
+fn probe_target(inv: &Inventory, i: usize) -> String {
+    inv.proxy_advertise
+        .get(i)
+        .cloned()
+        .unwrap_or_else(|| inv.proxies[i].clone())
+}
+
 fn call_seq(
     addr: &str,
     tls: &Option<Arc<flint_tls::ClientConfig>>,
     cmds: &[&[&str]],
     read_timeout: Duration,
 ) -> std::io::Result<Value> {
-    let mut s = flint_tls::connect(addr, tls)?;
+    call_seq_on(addr, tls, cmds, read_timeout, false)
+}
+
+/// `edge = true` dials the client port (server name = the dialled host, edge
+/// cert SANs) instead of the mesh (fixed internal SNI, mutual auth).
+fn call_seq_on(
+    addr: &str,
+    tls: &Option<Arc<flint_tls::ClientConfig>>,
+    cmds: &[&[&str]],
+    read_timeout: Duration,
+    edge: bool,
+) -> std::io::Result<Value> {
+    let mut s = if edge {
+        flint_tls::connect_edge(addr, tls)?
+    } else {
+        flint_tls::connect(addr, tls)?
+    };
     s.set_read_timeout(Some(read_timeout))?;
     s.set_write_timeout(Some(Duration::from_millis(1500)))?;
     let mut last = Value::Simple(String::new());
@@ -1261,18 +1317,31 @@ fn verify_checks(inv: &Inventory, probe: Option<&str>, loud: bool) -> Vec<String
     // structural checks above still run, but the checks that actually catch
     // a stale routing table cannot. Say so rather than imply a clean bill.
     match (probe, inv.proxies.first()) {
-        (Some(spec), Some(proxy)) => {
+        (Some(spec), Some(_)) => {
             let (tenant, token) = spec.split_once(':').unwrap_or((spec, ""));
-            head(&format!("== data plane through {proxy} as {tenant}"));
+            // Dial the ADVERTISE address over EDGE tls — what a tenant dials,
+            // with the trust a tenant uses. Probing the bind address in
+            // plaintext tested a path no client takes.
+            let target = probe_target(inv, 0);
+            let edge = edge_tls_client(inv);
+            let proxy = &target;
+            head(&format!(
+                "== data plane through {proxy} as {tenant} ({})",
+                if edge.is_some() {
+                    "client-tls"
+                } else {
+                    "plaintext"
+                }
+            ));
             let t = Duration::from_secs(10);
             // Each probe is its own authenticated session; call_seq returns
             // the LAST reply, which is the one being asserted on.
-            match call_seq(proxy, &None, &[&["AUTH", token], &["PING"]], t) {
+            match call_seq_on(proxy, &edge, &[&["AUTH", token], &["PING"]], t, true) {
                 Ok(Value::Simple(ref r)) if r == "PONG" => note(true, "auth + ping", String::new()),
                 other => note(false, "auth + ping", format!("{other:?}")),
             }
             // DBSIZE fans out to EVERY master: one stale entry fails it.
-            match call_seq(proxy, &None, &[&["AUTH", token], &["DBSIZE"]], t) {
+            match call_seq_on(proxy, &edge, &[&["AUTH", token], &["DBSIZE"]], t, true) {
                 Ok(Value::Integer(n)) => note(
                     true,
                     "DBSIZE fan-out reaches every master",
@@ -1286,17 +1355,18 @@ fn verify_checks(inv: &Inventory, probe: Option<&str>, loud: bool) -> Vec<String
             // is the check that touches every master. Labelled for what it
             // actually proves, because a green line that reads "reaches
             // every master" while one is dead is worse than no check.
-            match call_seq(proxy, &None, &[&["AUTH", token], &["SCAN", "0"]], t) {
+            match call_seq_on(proxy, &edge, &[&["AUTH", token], &["SCAN", "0"]], t, true) {
                 Ok(Value::Array(Some(_))) => note(true, "SCAN opens a cursor", String::new()),
                 other => note(false, "SCAN opens a cursor", format!("{other:?}")),
             }
             // A write read back and cleaned up: the keyed path end to end.
             let k = format!("__verify__:{}", std::process::id());
-            let wrote = call_seq(
+            let wrote = call_seq_on(
                 proxy,
-                &None,
+                &edge,
                 &[&["AUTH", token], &["SET", &k, "1"], &["GET", &k]],
                 t,
+                true,
             );
             match wrote {
                 Ok(Value::Bulk(Some(ref b))) if b == b"1" => {
@@ -1304,11 +1374,11 @@ fn verify_checks(inv: &Inventory, probe: Option<&str>, loud: bool) -> Vec<String
                 }
                 other => note(false, "write/read round trip", format!("{other:?}")),
             }
-            let _ = call_seq(proxy, &None, &[&["AUTH", token], &["DEL", &k]], t);
+            let _ = call_seq_on(proxy, &edge, &[&["AUTH", token], &["DEL", &k]], t, true);
             // Inline command support: `redis-cli --pipe` and telnet debugging
             // both depend on it, and it failed silently when absent.
             note(
-                probe_inline(proxy, token),
+                probe_inline(proxy, token, &edge),
                 "inline command accepted",
                 String::new(),
             );
@@ -1324,9 +1394,9 @@ fn verify_checks(inv: &Inventory, probe: Option<&str>, loud: bool) -> Vec<String
 
 /// Send one inline (non-RESP) command and see whether the proxy honours it.
 /// Written by hand because every other path here speaks RESP.
-fn probe_inline(proxy: &str, token: &str) -> bool {
+fn probe_inline(proxy: &str, token: &str, tls: &Option<Arc<flint_tls::ClientConfig>>) -> bool {
     use std::io::{Read, Write};
-    let Ok(mut s) = std::net::TcpStream::connect(proxy) else {
+    let Ok(mut s) = flint_tls::connect_edge(proxy, tls) else {
         return false;
     };
     let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(3)));

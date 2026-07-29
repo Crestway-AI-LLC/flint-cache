@@ -95,4 +95,21 @@ read -r ACKED ERRS < "$D/writer.out"
 echo "  writer through the window: $ACKED acked, $ERRS errors"
 [ "$ERRS" = "0" ] && [ "$ACKED" -gt 0 ] || { echo "FAIL: writer saw errors across the reload"; exit 1; }
 
+# VERIFY ON A CLIENT-TLS FLEET. The probe used to dial the client port in
+# plaintext, so on every real deployment it decoded the proxy's TLS alert as a
+# RESP frame and reported UnknownType(21) for all five data-plane checks. The
+# structural checks passed throughout, which is what made it look fine. This
+# is the only drill with `client-tls on`, so it is where that has to be caught.
+echo "== flintctl verify --probe works THROUGH the encrypted front door"
+OUT=$($CTL -f "$D/cluster.flint" verify --probe acme:tok-acme 2>&1)
+echo "$OUT" | sed 's/^/  | /'
+echo "$OUT" | grep -q "UnknownType" \
+  && { echo "FAIL: probe decoded TLS bytes as RESP — it is dialling plaintext"; exit 1; }
+echo "$OUT" | grep -q "VERIFY OK" || { echo "FAIL: verify did not pass on a client-tls fleet"; exit 1; }
+echo "$OUT" | grep -q "client-tls" || { echo "FAIL: verify did not report which transport it used"; exit 1; }
+for c in "auth + ping" "DBSIZE fan-out" "SCAN opens a cursor" "write/read round trip" "inline command accepted"; do
+  echo "$OUT" | grep -q "ok   $c" || { echo "FAIL: data-plane check [$c] did not pass over TLS"; exit 1; }
+done
+echo "  all five data-plane checks passed over client TLS"
+
 echo "PASS: cert hot-reload fleet-wide — CP client port, node data port, proxy edge (and every dialer via per-dial snapshots) pick up a rotated leaf within one poll, no restarts, zero write errors"
