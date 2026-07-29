@@ -79,6 +79,11 @@ const SHED_FRAME: &[u8] = b"-THROTTLED proxy at connection capacity, retry with 
 /// — not only the server behind it.
 const MAX_QUERY_BUF: usize = 1024 * 1024 * 1024;
 
+/// Longest accepted inline (non-RESP) command line without a newline —
+/// same bound the server applies, so a client cannot make the proxy buffer
+/// an unbounded "line" that never arrives.
+const MAX_INLINE_LEN: usize = 64 * 1024;
+
 /// Flush accumulated pipeline replies once they pass this size, instead of
 /// buffering a whole read-batch of replies. Without it, a pipeline of large
 /// GETs can demand an arbitrarily large reply buffer on the proxy.
@@ -1072,6 +1077,28 @@ fn forward(
 }
 
 /// Fan a command out to every pair's master; combine with `combine`.
+/// Re-resolve one pair's master and write it back into the routing map.
+///
+/// The keyed path does this inline when a backend call fails; the fan-out
+/// path did not, which meant a promotion it had not heard about looked
+/// exactly like a permanently dead node. Shared so the two cannot drift
+/// again.
+fn refresh_pair_master(view: &ClusterView, idx: usize, topo: &Topology) -> Option<String> {
+    let nodes = view
+        .routing
+        .read()
+        .ok()
+        .and_then(|r| r.pairs.get(idx).cloned())
+        .unwrap_or_default();
+    let found = discover_master(&nodes, &topo.backend_tls);
+    if let Ok(mut routing) = view.routing.write()
+        && let Some(m) = routing.masters.get_mut(idx)
+    {
+        m.clone_from(&found);
+    }
+    found
+}
+
 fn fan_out(
     topo: &Topology,
     backends: &mut Backends,
@@ -1080,21 +1107,48 @@ fn fan_out(
 ) -> Value {
     // Fan across every member cluster's masters (one cluster today; the
     // ADR-0007 O(clusters x pairs) broadcast shape).
-    let mut masters: Vec<Option<String>> = Vec::new();
-    for view in &topo.clusters {
-        match view.routing.read() {
-            Ok(r) => masters.extend(r.masters.clone()),
-            Err(_) => return Value::Error("ERR topology lock".into()),
-        }
-    }
+    //
+    // A pair whose master is unreachable — or not known yet — is REDISCOVERED
+    // rather than failed. Without this, one failover left DBSIZE, FLUSHALL
+    // and SCAN pointed at the dead node forever: keyed traffic healed itself
+    // and these did not, so the proxy went on insisting the cluster was
+    // broken long after it had recovered. Found on an 8-pair chaos run.
     let mut replies = Vec::new();
-    for addr in masters {
-        let Some(addr) = addr else {
-            return Value::Error("ERR a pair has no reachable master".into());
+    for view in &topo.clusters {
+        let (pair_count, mut masters) = match view.routing.read() {
+            Ok(r) => (r.pairs.len(), r.masters.clone()),
+            Err(_) => return Value::Error("ERR topology lock".into()),
         };
-        match backends.call(&addr, frame) {
-            Ok(v) => replies.push(v),
-            Err(e) => return Value::Error(format!("ERR fan-out to {addr}: {e}")),
+        masters.resize(pair_count, None);
+        for (idx, addr) in masters.into_iter().enumerate() {
+            // Try what we believe, then what is actually true.
+            let mut attempt = addr;
+            let mut refreshed = false;
+            loop {
+                match attempt {
+                    Some(a) => match backends.call(&a, frame) {
+                        Ok(v) => {
+                            replies.push(v);
+                            break;
+                        }
+                        Err(e) => {
+                            if refreshed {
+                                return Value::Error(format!("ERR fan-out to {a}: {e}"));
+                            }
+                            backends.drop_conn(&a);
+                            attempt = refresh_pair_master(view, idx, topo);
+                            refreshed = true;
+                        }
+                    },
+                    None => {
+                        if refreshed {
+                            return Value::Error(format!("ERR pair {idx} has no reachable master"));
+                        }
+                        attempt = refresh_pair_master(view, idx, topo);
+                        refreshed = true;
+                    }
+                }
+            }
         }
     }
     combine(replies)
@@ -1402,6 +1456,55 @@ fn serve_client<S: Read + Write>(mut stream: S, topo: Arc<Topology>) -> std::io:
         let mut consumed = 0;
         out.clear();
         loop {
+            // Inline commands (`SET k v\r\n`), the same shape the server
+            // already accepts. The proxy used to answer -ERR Protocol error
+            // and CLOSE the connection, which broke two ordinary things:
+            // `redis-cli --pipe`, the bulk-import path Redis's own
+            // mass-insert docs tell you to use, and plain `nc host port`
+            // debugging. The --pipe case failed silently — it reported "All
+            // data transferred" while nothing had landed.
+            //
+            // Rewritten into a RESP frame and pushed through the identical
+            // auth, quota and routing path, so inline callers get no special
+            // treatment beyond the framing.
+            if let Some(&first) = buf[consumed..].first()
+                && first != b'*'
+            {
+                let pending = &buf[consumed..];
+                let Some(nl) = pending.iter().position(|&b| b == b'\n') else {
+                    if pending.len() > MAX_INLINE_LEN {
+                        encode(
+                            &Value::Error("ERR Protocol error: too big inline request".into()),
+                            &mut out,
+                        );
+                        stream.write_all(&out)?;
+                        return Ok(());
+                    }
+                    break;
+                };
+                let line = pending[..nl].strip_suffix(b"\r").unwrap_or(&pending[..nl]);
+                let args: Vec<Vec<u8>> = line
+                    .split(|&b| b == b' ')
+                    .filter(|p| !p.is_empty())
+                    .map(|p| p.to_vec())
+                    .collect();
+                let mut resp = Vec::new();
+                if !args.is_empty() {
+                    encode(
+                        &Value::Array(Some(
+                            args.into_iter().map(|a| Value::Bulk(Some(a))).collect(),
+                        )),
+                        &mut resp,
+                    );
+                }
+                // Splice the RESP form in place of the inline bytes, then
+                // fall through: one dispatch path, no duplicated auth,
+                // quota, routing or latency accounting. An empty line
+                // (`\r\n` alone, which redis-cli sends on a bare Enter)
+                // splices to nothing and is simply skipped.
+                buf.splice(consumed..consumed + nl + 1, resp);
+                continue;
+            }
             match decode(&buf[consumed..]) {
                 Ok(Decoded::Complete(frame, used)) => {
                     let raw = buf[consumed..consumed + used].to_vec();
