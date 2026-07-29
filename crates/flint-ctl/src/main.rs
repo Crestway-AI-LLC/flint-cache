@@ -1308,6 +1308,61 @@ fn verify_checks(inv: &Inventory, probe: Option<&str>, loud: bool) -> Vec<String
         format!("{builds:?}"),
     );
 
+    // The inventory's declared `capacity` against the disk each node actually
+    // has. Nodes already report disk_total_bytes (the headroom guard samples
+    // statvfs), so this costs nothing and works on a multi-machine fleet,
+    // where a single agent could not stat a remote node's filesystem.
+    //
+    // OVER-declaring is the failure that matters: the capacity model sizes
+    // expansion off this number, so a fleet claiming more disk than it has
+    // stays quiet through the pressure that should have triggered
+    // ExpandCluster. The playground declared 1.6 TB on a 436 GB disk — an
+    // i4i.2xlarge figure left behind on an i4i.large — and nothing noticed
+    // for weeks, because a wrong constant looks exactly like a right one.
+    //
+    // Under-declaring is deliberate headroom, so it is reported, not failed.
+    if let Some(declared) = inv.capacity_bytes {
+        for pair in &inv.pairs {
+            for addr in pair {
+                let Some(total) = info_field(addr, &tls, "disk_total_bytes:")
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .filter(|t| *t > 0)
+                else {
+                    continue; // node down, or an engine with no disk to report
+                };
+                let gib = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
+                if declared > total {
+                    note(
+                        false,
+                        "declared capacity fits the disk",
+                        format!(
+                            "{addr}: inventory says {:.0} GiB, the filesystem is {:.0} GiB — \
+                             capacity pressure will fire late or never",
+                            gib(declared),
+                            gib(total)
+                        ),
+                    );
+                } else if declared * 10 < total * 9 {
+                    note(
+                        true,
+                        "declared capacity fits the disk",
+                        format!(
+                            "{addr}: {:.0} of {:.0} GiB declared (headroom held back)",
+                            gib(declared),
+                            gib(total)
+                        ),
+                    );
+                } else {
+                    note(
+                        true,
+                        "declared capacity fits the disk",
+                        format!("{addr}: {:.0} GiB", gib(total)),
+                    );
+                }
+            }
+        }
+    }
+
     head("== proxies");
     for p in &inv.proxies {
         note(proxy_up(inv, p), "proxy up", p.clone());

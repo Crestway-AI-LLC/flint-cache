@@ -13,6 +13,9 @@
 # This drill reproduces that end to end, then proves the three things that
 # make it survivable: verify NAMES the stray, retire-proxy removes it, and the
 # subset sentinels say what they did.
+#
+# It closes with the other declared-vs-actual reconciliation of the same
+# shape: the inventory's `capacity` against the disk the nodes report.
 set -u
 cd "$(dirname "$0")/.."
 D=/tmp/flint-pxreg; INV=$D/cluster.flint
@@ -116,4 +119,28 @@ $CTL -f "$INV" verify --probe trap:tok-trap >/dev/null 2>&1 \
   || { echo "FAIL: verify still unhappy after cleanup"; exit 1; }
 echo "  verified"
 
-echo "PASS: proxy registry — a stray registration is named by verify, retired by retire-proxy, cannot silently strand a tenant, and the subset sentinels state their effect"
+echo "== inventory capacity is checked against the disk the nodes actually have"
+# Over-declaring is the failure that matters: the capacity model sizes
+# expansion off this number, so a fleet claiming more disk than it has stays
+# quiet through the pressure that should have triggered ExpandCluster. The
+# playground declared 1.6 TB on a 436 GB disk for weeks — a wrong constant
+# looks exactly like a right one.
+cp "$INV" "$INV.bak"
+echo "capacity 999999999999999" >> "$INV"        # 1 PB, on a laptop
+OUT=$($CTL -f "$INV" verify 2>&1)
+echo "$OUT" | grep -q "FAIL.*declared capacity" \
+  || { echo "FAIL: verify accepted a capacity larger than the disk"; echo "$OUT"; exit 1; }
+echo "$OUT" | grep -q "capacity pressure will fire late or never" \
+  || { echo "FAIL: verify did not say what the consequence is"; exit 1; }
+$CTL -f "$INV" verify >/dev/null 2>&1 && { echo "FAIL: verify exited 0 with an impossible capacity"; exit 1; }
+echo "  over-declared capacity is caught and named"
+# A capacity that FITS is fine, and holding headroom back is deliberate, not
+# an error — so it reports rather than fails.
+cp "$INV.bak" "$INV"; echo "capacity 1000000000" >> "$INV"
+$CTL -f "$INV" verify 2>&1 | grep -q "ok   declared capacity fits the disk" \
+  || { echo "FAIL: an under-declared capacity should pass"; exit 1; }
+$CTL -f "$INV" verify >/dev/null 2>&1 || { echo "FAIL: verify should pass with a capacity that fits"; exit 1; }
+echo "  a capacity that fits passes, headroom noted not failed"
+cp "$INV.bak" "$INV"
+
+echo "PASS: proxy registry — a stray registration is named by verify, retired by retire-proxy, cannot silently strand a tenant, the subset sentinels state their effect, and a declared capacity larger than the disk is refused"
