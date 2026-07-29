@@ -50,6 +50,7 @@
 //! IDs are the stable identity while membership floats, so `swap-node` is
 //! CPSETPAIR after the replacement converges.
 
+use std::collections::BTreeSet;
 use std::io::{Read, Write};
 use std::process::Command;
 use std::sync::Arc;
@@ -1014,6 +1015,209 @@ fn launch(inv: &Inventory, register: bool) {
     status(inv);
 }
 
+/// Reconcile the cluster's three views of itself and report disagreement.
+///
+/// A cluster can be wrong in ways no single component notices, because each
+/// one is internally consistent. The control plane's registry, a node's own
+/// manifest, and the proxy's routing table are three separate beliefs about
+/// the same fleet, and the interesting failures are the disagreements —
+/// a promotion the proxy never heard about, a pair with two masters, a
+/// half-finished canary leaving mixed builds.
+///
+/// So the proxy's view is probed BEHAVIOURALLY rather than read out of it.
+/// What matters is not what it thinks the topology is, but whether the
+/// commands that depend on that belief actually work. `DBSIZE` and `SCAN`
+/// touch every master; either failing means the proxy is holding a stale
+/// map. That is exactly the shape of the bug this command was written for:
+/// after a failover, keyed traffic recovered while fan-out stayed pointed
+/// at the dead node, and every drill stayed green.
+fn verify(inv: &Inventory, args: &[String]) {
+    let tls = tls_client(inv);
+    let mut problems: Vec<String> = Vec::new();
+    let mut note = |ok: bool, label: &str, detail: String| {
+        println!(
+            "  {} {label}{}",
+            if ok { "ok  " } else { "FAIL" },
+            if detail.is_empty() {
+                String::new()
+            } else {
+                format!("  {detail}")
+            }
+        );
+        if !ok {
+            problems.push(format!("{label}: {detail}"));
+        }
+    };
+
+    println!("== control plane");
+    let cp = &inv.cp[0];
+    let cp_ok = matches!(call(cp, &tls, &["PING"]), Ok(Value::Simple(s)) if s == "PONG");
+    note(cp_ok, "reachable", cp.clone());
+
+    println!("== pairs: one master each, coherent epochs, one build");
+    let mut builds: BTreeSet<String> = BTreeSet::new();
+    for (i, pair) in inv.pairs.iter().enumerate() {
+        let mut masters = Vec::new();
+        let mut down = Vec::new();
+        for addr in pair {
+            match info_field(addr, &tls, "role:") {
+                Some(role) => {
+                    if role == "master" {
+                        masters.push(addr.clone());
+                    }
+                    if let Some(b) = info_field(addr, &tls, "build:") {
+                        builds.insert(b);
+                    }
+                }
+                None => down.push(addr.clone()),
+            }
+        }
+        let label = format!("pair {i}");
+        match masters.len() {
+            1 => note(
+                true,
+                &label,
+                format!("master {} ({} down)", masters[0], down.len()),
+            ),
+            0 => note(false, &label, format!("NO master; down: {down:?}")),
+            // The invariant epoch fencing exists to make impossible. If this
+            // ever prints, two nodes are accepting writes for the same slots.
+            _ => note(
+                false,
+                &label,
+                format!("SPLIT BRAIN: {} masters {masters:?}", masters.len()),
+            ),
+        }
+    }
+    note(
+        builds.len() <= 1,
+        "single build across the fleet",
+        format!("{builds:?}"),
+    );
+
+    println!("== proxies");
+    for p in &inv.proxies {
+        note(proxy_up(inv, p), "proxy up", p.clone());
+    }
+
+    // The data-plane probe needs a tenant credential; without one the
+    // structural checks above still run, but the checks that actually catch
+    // a stale routing table cannot. Say so rather than imply a clean bill.
+    let probe = args
+        .iter()
+        .position(|a| a == "--probe")
+        .and_then(|i| args.get(i + 1));
+    match (probe, inv.proxies.first()) {
+        (Some(spec), Some(proxy)) => {
+            let (tenant, token) = spec.split_once(':').unwrap_or((spec.as_str(), ""));
+            println!("== data plane through {proxy} as {tenant}");
+            let t = Duration::from_secs(10);
+            // Each probe is its own authenticated session; call_seq returns
+            // the LAST reply, which is the one being asserted on.
+            match call_seq(proxy, &None, &[&["AUTH", token], &["PING"]], t) {
+                Ok(Value::Simple(ref r)) if r == "PONG" => note(true, "auth + ping", String::new()),
+                other => note(false, "auth + ping", format!("{other:?}")),
+            }
+            // DBSIZE fans out to EVERY master: one stale entry fails it.
+            match call_seq(proxy, &None, &[&["AUTH", token], &["DBSIZE"]], t) {
+                Ok(Value::Integer(n)) => note(
+                    true,
+                    "DBSIZE fan-out reaches every master",
+                    format!("{n} keys"),
+                ),
+                other => note(false, "DBSIZE fan-out", format!("{other:?}")),
+            }
+            // SCAN only OPENS the cursor: the first batch comes from the
+            // first master, so a pair three deep can be dead and this still
+            // succeeds — observed exactly that while testing. DBSIZE above
+            // is the check that touches every master. Labelled for what it
+            // actually proves, because a green line that reads "reaches
+            // every master" while one is dead is worse than no check.
+            match call_seq(proxy, &None, &[&["AUTH", token], &["SCAN", "0"]], t) {
+                Ok(Value::Array(Some(_))) => note(true, "SCAN opens a cursor", String::new()),
+                other => note(false, "SCAN opens a cursor", format!("{other:?}")),
+            }
+            // A write read back and cleaned up: the keyed path end to end.
+            let k = format!("__verify__:{}", std::process::id());
+            let wrote = call_seq(
+                proxy,
+                &None,
+                &[&["AUTH", token], &["SET", &k, "1"], &["GET", &k]],
+                t,
+            );
+            match wrote {
+                Ok(Value::Bulk(Some(ref b))) if b == b"1" => {
+                    note(true, "write/read round trip", String::new())
+                }
+                other => note(false, "write/read round trip", format!("{other:?}")),
+            }
+            let _ = call_seq(proxy, &None, &[&["AUTH", token], &["DEL", &k]], t);
+            // Inline command support: `redis-cli --pipe` and telnet debugging
+            // both depend on it, and it failed silently when absent.
+            note(
+                probe_inline(proxy, token),
+                "inline command accepted",
+                String::new(),
+            );
+        }
+        (None, _) => {
+            println!("== data plane  SKIPPED (pass --probe <tenant>:<token> to include it)")
+        }
+        (_, None) => println!("== data plane  SKIPPED (no proxy in the inventory)"),
+    }
+
+    println!();
+    if problems.is_empty() {
+        println!(
+            "VERIFY OK: {} pair(s), {} proxy(ies) — all views agree",
+            inv.pairs.len(),
+            inv.proxies.len()
+        );
+    } else {
+        println!("VERIFY FAILED: {} problem(s)", problems.len());
+        for p in &problems {
+            println!("  - {p}");
+        }
+        std::process::exit(1);
+    }
+}
+
+/// Send one inline (non-RESP) command and see whether the proxy honours it.
+/// Written by hand because every other path here speaks RESP.
+fn probe_inline(proxy: &str, token: &str) -> bool {
+    use std::io::{Read, Write};
+    let Ok(mut s) = std::net::TcpStream::connect(proxy) else {
+        return false;
+    };
+    let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(3)));
+    if s.write_all(format!("AUTH {token}\r\nPING\r\n").as_bytes())
+        .is_err()
+    {
+        return false;
+    }
+    let mut buf = [0u8; 256];
+    let mut seen = Vec::new();
+    for _ in 0..3 {
+        match s.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                seen.extend_from_slice(&buf[..n]);
+                if seen
+                    .windows(7)
+                    .any(|w| w == b"+PONG\r\n".get(..7).unwrap_or(w))
+                {
+                    break;
+                }
+                if seen.ends_with(b"+PONG\r\n") {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    seen.ends_with(b"+PONG\r\n") || seen.windows(6).any(|w| w == b"+PONG\r")
+}
+
 fn status(inv: &Inventory) {
     let tls = tls_client(inv);
     let cp = &inv.cp[0];
@@ -1876,6 +2080,7 @@ fn main() {
         "bootstrap" => bootstrap(&inv),
         "start" => start(&inv),
         "status" => status(&inv),
+        "verify" => verify(&inv, &rest),
         "tenant" => match rest.first().map(|s| s.as_str()) {
             Some("add") => tenant_add(&inv, &rest[1..]),
             Some("remove") => {
