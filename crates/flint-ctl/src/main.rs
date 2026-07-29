@@ -428,6 +428,70 @@ fn kill_pidfile(dir: &str, name: &str) {
     }
 }
 
+/// Pids running `bin` with `ident` as an EXACT argument.
+///
+/// Exact-token, never substring: `<statedir>/node-700` is a prefix of
+/// `<statedir>/node-7001`, and killing the wrong seat mid-upgrade would be
+/// considerably worse than the bug this exists to fix.
+fn pids_matching(bin: &str, ident: &str) -> Vec<u32> {
+    let Ok(out) = Command::new("ps").args(["-eo", "pid=,args="]).output() else {
+        return Vec::new();
+    };
+    let me = std::process::id();
+    let mut hits = Vec::new();
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let Some((pid, args)) = line.trim().split_once(char::is_whitespace) else {
+            continue;
+        };
+        let Ok(pid) = pid.trim().parse::<u32>() else {
+            continue;
+        };
+        if pid != me && args.contains(bin) && args.split_whitespace().any(|t| t == ident) {
+            hits.push(pid);
+        }
+    }
+    hits
+}
+
+/// Stop one fleet seat and PROVE it stopped before anything replaces it.
+///
+/// `kill_pidfile` alone is a promise, not a fact. A pidfile records only the
+/// most recent start, so a fleet restarted out of band leaves pids that no
+/// longer exist — and killing a dead pid succeeds silently at doing nothing.
+///
+/// That is not hypothetical. On the playground every pidfile for the control
+/// plane, both nodes and the proxy was stale, so an upgrade killed nothing,
+/// started a SECOND node on a port the original still held, watched the new
+/// one fail to bind and exit, and then read the build from the SURVIVOR. It
+/// aborted with "reports build 0.0.1" — correct, but for a reason two steps
+/// removed from the actual fault. And that abort only happened because
+/// `--version-tag` was passed; without it the build check is skipped and the
+/// same roll reports success having changed nothing.
+///
+/// So: kill what the pidfile claims, then kill anything still answering to
+/// this seat by argv (the `stop` sweep's logic narrowed to one process), and
+/// do not return until nothing matches.
+fn stop_seat(inv: &Inventory, name: &str, bin: &str, ident: &str) -> Result<(), String> {
+    kill_pidfile(&inv.statedir, name);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let alive = pids_matching(bin, ident);
+        if alive.is_empty() {
+            return Ok(());
+        }
+        for pid in &alive {
+            let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
+        }
+        if Instant::now() > deadline {
+            return Err(format!(
+                "{name}: {bin} still alive as {alive:?} after kill — refusing to start a \
+                 replacement that would fail to bind and leave the old build serving"
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(150));
+    }
+}
+
 /// The binaries `flintctl` starts — the orphan sweep's allowlist.
 const FLEET_BINARIES: [&str; 5] = [
     "flint-server",
@@ -785,7 +849,98 @@ fn start_pair_nodes(inv: &Inventory, pair: &[String]) {
     }
 }
 
-fn start_controller(inv: &Inventory) {
+/// Argument builders, one per fleet role.
+///
+/// These exist so `start` and `upgrade` cannot construct a process
+/// differently: an upgrade that respawns the proxy with a subtly different
+/// argv is a config change disguised as a version bump, and it would show up
+/// as behaviour nobody chose. One builder, two callers.
+fn cp_args(inv: &Inventory) -> Vec<String> {
+    let d = &inv.statedir;
+    let mut args = vec![
+        "--port".to_string(),
+        port_of(&inv.cp[0]).to_string(),
+        "--state".into(),
+        format!("{d}/cp-state"),
+    ];
+    args.extend(internal_args(inv));
+    if let Some(tok) = &inv.admin_token {
+        // ADR-0006 D4: the admin token lives in the CP and is pushed to
+        // proxies as a digest; rotate it later with `flintctl rotate-admin`.
+        args.extend(["--admin-token".to_string(), tok.clone()]);
+    }
+    args
+}
+
+fn proxy_args(inv: &Inventory, i: usize) -> Vec<String> {
+    let proxy = &inv.proxies[i];
+    // The inventory addr's HOST is the bind address (0.0.0.0 serves external
+    // clients — the marketplace shape; 127.0.0.1 stays the loopback default).
+    // The ADVERTISE address is what the proxy reports of itself (subset
+    // identity): the proxy-advertise line when declared, else the bind line —
+    // must match what bootstrap registered.
+    let bind_host = proxy
+        .rsplit_once(':')
+        .map(|(h, _)| h)
+        .unwrap_or("127.0.0.1");
+    let advertise = inv.proxy_advertise.get(i).unwrap_or(proxy);
+    let mut args = vec![
+        "--port".to_string(),
+        port_of(proxy).to_string(),
+        "--bind".to_string(),
+        bind_host.to_string(),
+        "--control-plane".into(),
+        inv.cp[0].clone(),
+        "--advertise".into(),
+        advertise.clone(),
+    ];
+    args.extend(internal_args(inv));
+    args.extend(proxy_tuning_args(inv));
+    if inv.client_tls {
+        // ADR-0006 D2: the packaged default is an encrypted front door.
+        args.extend([
+            "--tls-cert".to_string(),
+            format!("{}/certs/edge.crt", inv.statedir),
+            "--tls-key".to_string(),
+            format!("{}/certs/edge.key", inv.statedir),
+        ]);
+    }
+    args
+}
+
+fn agent_args(inv: &Inventory) -> Option<Vec<String>> {
+    let agent = inv.agent.as_ref()?;
+    let d = &inv.statedir;
+    let mut args = vec![
+        "--control-plane".to_string(),
+        inv.cp[0].clone(),
+        "--metrics-port".into(),
+        port_of(agent).to_string(),
+        "--journal".into(),
+        format!("{d}/shadow.jsonl"),
+    ];
+    if let Some(cap) = inv.capacity_bytes {
+        args.extend(["--node-capacity-bytes".into(), cap.to_string()]);
+    }
+    // Edge trust for the agent's PROXY* dials. Default = the internal
+    // CA (it signs the default edge cert); a fleet serving a PUBLIC
+    // edge cert (LE on a DNS name) overrides with `edge-trust <path>`
+    // (e.g. the system bundle).
+    if let Some(billing) = &inv.billing {
+        args.extend(["--billing".to_string(), billing.clone()]);
+    }
+    if inv.client_tls {
+        let trust = inv
+            .edge_trust
+            .clone()
+            .unwrap_or_else(|| format!("{}/certs/ca.crt", inv.statedir));
+        args.extend(["--edge-ca".into(), trust]);
+    }
+    args.extend(internal_args(inv));
+    Some(args)
+}
+
+fn controller_args(inv: &Inventory) -> Vec<String> {
     let pairs_spec = inv
         .pairs
         .iter()
@@ -815,7 +970,11 @@ fn start_controller(inv: &Inventory) {
         args.extend(["--lease-ttl-ms".into(), v.to_string()]);
     }
     args.extend(internal_args(inv));
-    spawn(inv, "controller", "flint-controller", &args);
+    args
+}
+
+fn start_controller(inv: &Inventory) {
+    spawn(inv, "controller", "flint-controller", &controller_args(inv));
 }
 
 /// First-time bring-up: mint certs, spawn, REGISTER the topology.
@@ -849,19 +1008,7 @@ fn launch(inv: &Inventory, register: bool) {
 
     // 1. Control plane, then the registry (proxies + pairs).
     let cp = &inv.cp[0];
-    let mut cp_args = vec![
-        "--port".to_string(),
-        port_of(cp).to_string(),
-        "--state".into(),
-        format!("{d}/cp-state"),
-    ];
-    cp_args.extend(internal_args(inv));
-    if let Some(tok) = &inv.admin_token {
-        // ADR-0006 D4: the admin token lives in the CP and is pushed to
-        // proxies as a digest; rotate it later with `flintctl rotate-admin`.
-        cp_args.extend(["--admin-token".to_string(), tok.clone()]);
-    }
-    spawn(inv, "cp", "flint-controlplane", &cp_args);
+    spawn(inv, "cp", "flint-controlplane", &cp_args(inv));
     assert!(
         wait_pong(cp, &tls, Duration::from_secs(10)),
         "control plane up"
@@ -916,37 +1063,11 @@ fn launch(inv: &Inventory, register: bool) {
         // reports of itself (subset identity): the proxy-advertise line
         // when declared, else the bind line — must match what bootstrap
         // registered.
-        let bind_host = proxy
-            .rsplit_once(':')
-            .map(|(h, _)| h)
-            .unwrap_or("127.0.0.1");
-        let advertise = inv.proxy_advertise.get(i).unwrap_or(proxy);
-        let mut args = vec![
-            "--port".to_string(),
-            port_of(proxy).to_string(),
-            "--bind".to_string(),
-            bind_host.to_string(),
-            "--control-plane".into(),
-            cp.clone(),
-            "--advertise".into(),
-            advertise.clone(),
-        ];
-        args.extend(internal_args(inv));
-        args.extend(proxy_tuning_args(inv));
-        if inv.client_tls {
-            // ADR-0006 D2: the packaged default is an encrypted front door.
-            args.extend([
-                "--tls-cert".to_string(),
-                format!("{}/certs/edge.crt", inv.statedir),
-                "--tls-key".to_string(),
-                format!("{}/certs/edge.key", inv.statedir),
-            ]);
-        }
         spawn(
             inv,
             &format!("proxy-{}", port_of(proxy)),
             "flint-proxy",
-            &args,
+            &proxy_args(inv, i),
         );
     }
 
@@ -976,35 +1097,15 @@ fn launch(inv: &Inventory, register: bool) {
     // a flint-agent binary if one sits in the bins dir. The agent (fleet
     // metering/insights/automation) is not part of this repository; without
     // the binary the key simply has nothing to start.
-    if let Some(agent) = &inv.agent {
-        let mut args = vec![
-            "--control-plane".to_string(),
-            cp.clone(),
-            "--metrics-port".into(),
-            port_of(agent).to_string(),
-            "--journal".into(),
-            format!("{d}/shadow.jsonl"),
-        ];
-        if let Some(cap) = inv.capacity_bytes {
-            args.extend(["--node-capacity-bytes".into(), cap.to_string()]);
-        }
-        // Edge trust for the agent's PROXY* dials. Default = the internal
-        // CA (it signs the default edge cert); a fleet serving a PUBLIC
-        // edge cert (LE on a DNS name) overrides with `edge-trust <path>`
-        // (e.g. the system bundle).
-        if let Some(billing) = &inv.billing {
-            args.extend(["--billing".to_string(), billing.clone()]);
-        }
-        if inv.client_tls {
-            let trust = inv
-                .edge_trust
-                .clone()
-                .unwrap_or_else(|| format!("{}/certs/ca.crt", inv.statedir));
-            args.extend(["--edge-ca".into(), trust]);
-        }
-        args.extend(internal_args(inv));
-        spawn(inv, "agent", "flint-agent", &args);
+    if inv.agent.is_some() {
+        spawn(
+            inv,
+            "agent",
+            "flint-agent",
+            &agent_args(inv).expect("agent args"),
+        );
     }
+
     if inv.controller {
         wait_supervised(inv, inv.pairs.len(), ctl_since);
     }
@@ -1618,7 +1719,12 @@ fn roll_node(
     // fresh. (Checking after the respawn is a race against the controller
     // fencing a returning zombie; checking BEFORE the kill is not.)
     let wipe = wipe || info_field(addr, &tls, "role:").as_deref() != Some("replica");
-    kill_pidfile(d, &format!("node-{port}"));
+    stop_seat(
+        inv,
+        &format!("node-{port}"),
+        "flint-server",
+        &format!("{d}/node-{port}"),
+    )?;
     if wipe {
         // Ex-masters NEVER warm-rejoin, even durably demoted: their
         // replication cursor is an ex-master's (not a tail position) and
@@ -1955,7 +2061,7 @@ fn decommission_node(
 /// failover (promote the already-upgraded replica, demote the old master,
 /// warm-restart it on the new build as a replica). Any unexpected journal
 /// transition aborts the roll — already-upgraded nodes stay (roll forward).
-fn upgrade(inv: &Inventory, version_tag: Option<String>, soak_ms: u64) {
+fn upgrade(inv: &Inventory, version_tag: Option<String>, soak_ms: u64, nodes_only: bool) {
     let tls = tls_client(inv);
     let envs: Vec<(String, String)> = version_tag
         .iter()
@@ -2067,10 +2173,95 @@ fn upgrade(inv: &Inventory, version_tag: Option<String>, soak_ms: u64) {
         }
         eprintln!("  pair {i}: old master rolled, tailing the new one warm");
     }
-    eprintln!(
-        "== upgrade complete (data plane); proxies/CP/controller/agent roll is the --fleet follow-on"
-    );
+    if nodes_only {
+        eprintln!(
+            "== upgrade complete (DATA PLANE ONLY, --nodes-only): the proxy, control plane, \
+             controller and agent are STILL RUNNING THE OLD BINARY"
+        );
+        status(inv);
+        return;
+    }
+    roll_edge(inv, &envs);
+    eprintln!("== upgrade complete (whole fleet)");
     status(inv);
+}
+
+/// Roll everything that is not a pair node: controller, agent, control
+/// plane, proxies.
+///
+/// These have no role to hand over, so each is a stop-and-respawn rather than
+/// a failover. Order is chosen so the client-facing hop moves last, over a
+/// fleet that is already new: controller and agent first (nothing depends on
+/// them for serving), then the control plane (proxies hold a routing cache
+/// and reconnect their watch), then the proxies.
+///
+/// This phase is the difference between an upgrade and a deploy. Without it
+/// `upgrade` rolls the two pair nodes and reports success — which is exactly
+/// what would have happened shipping rc.12, whose entire point was two fixes
+/// in the PROXY. A release that cannot deliver a proxy fix is not a release.
+fn roll_edge(inv: &Inventory, envs: &[(String, String)]) {
+    let d = &inv.statedir;
+    let tls = tls_client(inv);
+    let die_on = |seat: &str, e: String| -> ! {
+        eprintln!("== UPGRADE ABORTED rolling {seat}: {e}");
+        eprintln!("   the data plane is already on the new build (roll forward)");
+        std::process::exit(3);
+    };
+
+    if inv.controller {
+        eprintln!("== controller");
+        if let Err(e) = stop_seat(inv, "controller", "flint-controller", &format!("{d}/snaps")) {
+            die_on("controller", e);
+        }
+        spawn_env(
+            inv,
+            "controller",
+            "flint-controller",
+            &controller_args(inv),
+            envs,
+        );
+    }
+
+    if let Some(args) = agent_args(inv) {
+        eprintln!("== agent");
+        if let Err(e) = stop_seat(inv, "agent", "flint-agent", &format!("{d}/shadow.jsonl")) {
+            die_on("agent", e);
+        }
+        spawn_env(inv, "agent", "flint-agent", &args, envs);
+    }
+
+    eprintln!("== control plane");
+    if let Err(e) = stop_seat(inv, "cp", "flint-controlplane", &format!("{d}/cp-state")) {
+        die_on("control plane", e);
+    }
+    spawn_env(inv, "cp", "flint-controlplane", &cp_args(inv), envs);
+    if !wait_pong(&inv.cp[0], &tls, Duration::from_secs(15)) {
+        die_on(
+            "control plane",
+            "did not answer after the binary swap".into(),
+        );
+    }
+
+    eprintln!("== proxies last (clients see one blip, over an already-new fleet)");
+    for (i, proxy) in inv.proxies.iter().enumerate() {
+        let seat = format!("proxy-{}", port_of(proxy));
+        // Identity is the ADVERTISE address: it is what this proxy was
+        // started with and is unique per proxy, so the match cannot stray
+        // onto a sibling.
+        let ident = inv.proxy_advertise.get(i).unwrap_or(proxy).clone();
+        if let Err(e) = stop_seat(inv, &seat, "flint-proxy", &ident) {
+            die_on(&seat, e);
+        }
+        spawn_env(inv, &seat, "flint-proxy", &proxy_args(inv, i), envs);
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !proxy_up(inv, proxy) {
+            if Instant::now() > deadline {
+                die_on(&seat, "did not serve after the binary swap".into());
+            }
+            std::thread::sleep(Duration::from_millis(150));
+        }
+        eprintln!("  {seat} rolled and serving");
+    }
 }
 
 fn stop(inv: &Inventory) {
@@ -2344,7 +2535,8 @@ fn main() {
                     );
                 }
             }
-            upgrade(&inv, tag, soak);
+            let nodes_only = rest.iter().any(|a| a == "--nodes-only");
+            upgrade(&inv, tag, soak, nodes_only);
         }
         "stop" => stop(&inv),
         other => {
