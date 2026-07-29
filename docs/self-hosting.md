@@ -202,6 +202,43 @@ Alert on: `seq_lag` climbing without draining, `live_replicas` dropping
 below your `min-replicas`, `cert_days_remaining` under ~14, and sustained
 `write_stopped`.
 
+## 3b. Disk headroom
+
+Per-tenant quotas bound each namespace. **Nothing bounds the host**, and
+the sum of quotas is meant to exceed the disk — that oversubscription is
+the whole point of packing tenants. So plan for the node to fill, and know
+what it does when it starts to.
+
+Each node samples the filesystem holding its `--data-dir` and, below the
+threshold, refuses ordinary writes with `-QUOTA` while continuing to serve
+reads and to accept `DEL`/`UNLINK`/`EXPIRE`/`FLUSHALL`. It reopens by
+itself once space returns; no operator action is needed either way.
+
+| flag | default | meaning |
+|---|---|---|
+| `--disk-min-free-pct` | `10` | shed below this share of the filesystem; `0` disables |
+| `--disk-min-free-bytes` | `2 GiB` | shed below this many free bytes; `0` disables |
+| `--disk-sample-ms` | `2000` | how often the filesystem is measured |
+
+Both thresholds apply and the stricter binds: a percentage alone is
+useless on a 16 TB disk (10% is 1.6 TB of headroom nobody wants to hold)
+and a byte floor alone is useless on a small one.
+
+**The gate fires early on purpose.** An LSM needs free space to compact —
+new SSTs are written before the old ones are dropped — and the cure for a
+full disk is a trap without it: freeing space means deleting, a delete is
+a write, and reclaiming the bytes needs the compaction that has no room to
+run. Stopping at 10% leaves room to dig out; stopping at 0% may not.
+
+Watch `disk_free_bytes`, `disk_free_pct` and `disk_verdict` in `FLINTINFO`
+(and the exporter). `disk_unknown_samples` counting up means the sampler
+cannot read the filesystem — the node is then flying blind and will NOT
+shed, because a failed measurement is not evidence of a full disk.
+
+Known gap: this gates client writes. A **replica** applying its master's
+WAL keeps writing regardless, so a replica can still fill. Size replicas
+with the same headroom as their master.
+
 ## 4. Managing users (tenants)
 
 A tenant is a namespace + a token + a proxy subset + quotas. All via

@@ -116,6 +116,7 @@ absorbed by the proxy).
 |---|---|---|
 | `-THROTTLED ...` | back-pressure: your ops/s quota, a durability guard, or admission control | retry with backoff — the condition is transient |
 | `-QUOTA ...` | your storage cap is exceeded; **writes** are rejected | reads still work, and **deletes always work** — free space (DEL/UNLINK/FLUSHALL/EXPIRE) and the verdict clears itself within a sweep |
+| `-QUOTA server is low on disk space ...` | the **server**, not your cap, is short of room | same contract: reads served, deletes work, and it clears itself once space returns. Your usage may be well under quota — this one is ours to fix, and it pages us |
 | `-WRONGPASS` / `-NOAUTH` | bad or missing token | check the token; re-AUTH |
 
 Two invariants worth knowing:

@@ -10,6 +10,9 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+# statvfs for the data-dir headroom probe (disk.rs). Already in the tree
+# via rocksdb, so this adds no new third-party code.
+libc = "0.2"
 rocksdb = { version = "0.24.0", optional = true }
 
 [dev-dependencies]

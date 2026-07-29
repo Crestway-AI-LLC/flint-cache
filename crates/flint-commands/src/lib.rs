@@ -11,6 +11,25 @@
 //! every consumer (a replica rejects them, the slot gate freezes them, a
 //! future replica-read router keeps them on the master).
 
+/// True when `name` can only SHRINK the keyspace.
+///
+/// The one class of write that must stay allowed when the system is refusing
+/// writes for lack of room — over a tenant's storage quota, or on a node out
+/// of disk headroom. Both of those conditions are cured by deleting data, so
+/// blocking deletes would make the state self-perpetuating: the operator is
+/// told to free space by the same server that refuses to let them.
+///
+/// Shared for the same reason the read/write split is: the proxy applies it
+/// for the per-tenant quota verdict and the server applies it for the
+/// node-level disk verdict, and a command that frees space in one plane but
+/// not the other is a trap that only shows up during an incident.
+pub fn reduces_space(name: &[u8]) -> bool {
+    matches!(
+        name.to_ascii_uppercase().as_slice(),
+        b"DEL" | b"UNLINK" | b"FLUSHALL" | b"EXPIRE" | b"PEXPIRE" | b"EXPIREAT" | b"PEXPIREAT"
+    )
+}
+
 /// True when `name` mutates the keyspace.
 pub fn is_write_command(name: &[u8]) -> bool {
     matches!(

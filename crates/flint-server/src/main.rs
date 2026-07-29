@@ -11,6 +11,7 @@
 //! rejects mutating commands with -READONLY.
 
 mod commands;
+mod diskguard;
 mod heat;
 mod json_path;
 mod migrate;
@@ -94,6 +95,12 @@ impl Drop for ConnGuard {
 // Only the rocks paths (full-sync serving + its FLINTINFO fields) read this.
 #[cfg_attr(not(feature = "rocks"), allow(dead_code))]
 static FULLSYNC_ACTIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+// Disk headroom for the data directory. A node-wide condition (it is the
+// host's filesystem, not any tenant's), so it lives beside the other
+// process statics rather than threading through every call.
+static DISK: std::sync::LazyLock<diskguard::DiskGuard> =
+    std::sync::LazyLock::new(diskguard::DiskGuard::default);
 
 // WAL fsync cadence in ms (0 = disabled), for FLINTINFO. Rocks-only.
 #[cfg_attr(not(feature = "rocks"), allow(dead_code))]
@@ -229,6 +236,10 @@ fn main() -> std::io::Result<()> {
 
     #[allow(unused_mut)]
     let mut rocks: Option<RocksHandle> = None;
+    // The filesystem the disk guard watches. Only set for an engine that
+    // actually writes to one — the mem engine has no disk to run out of.
+    #[allow(unused_mut)]
+    let mut data_dir_for_guard: Option<String> = None;
     let store: Arc<dyn Kv> = match engine.as_str() {
         "mem" => {
             if replica_of.is_some() {
@@ -240,6 +251,7 @@ fn main() -> std::io::Result<()> {
         #[cfg(feature = "rocks")]
         "rocks" => {
             let dir = arg("--data-dir").unwrap_or_else(|| "./flint-data".into());
+            data_dir_for_guard = Some(dir.clone());
             let fresh = !std::path::Path::new(&dir).join("CURRENT").exists();
             // A fresh replica seeds from a checkpoint (the spare-seeding
             // path), then tails the WAL from the copied DB's own sequence.
@@ -546,6 +558,51 @@ fn main() -> std::io::Result<()> {
             }
         );
     }
+    // Disk headroom sampler. Only meaningful when data actually lands on a
+    // filesystem, so the mem engine has nothing to guard and starts no
+    // thread. Thresholds: --disk-min-free-pct (default 10) and
+    // --disk-min-free-bytes (default 2 GiB); either can be set to 0 to
+    // disable that half, and both to 0 to turn the gate off entirely.
+    if let Some(dir) = data_dir_for_guard.clone() {
+        let thresholds = diskguard::Thresholds {
+            min_free_pct: arg("--disk-min-free-pct")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(diskguard::Thresholds::default().min_free_pct),
+            min_free_bytes: arg("--disk-min-free-bytes")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(diskguard::Thresholds::default().min_free_bytes),
+        };
+        let every = std::time::Duration::from_millis(
+            arg("--disk-sample-ms")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(2_000),
+        );
+        eprintln!(
+            "disk guard: min-free {}% or {} bytes, sampling {} every {:?}",
+            thresholds.min_free_pct, thresholds.min_free_bytes, dir, every
+        );
+        std::thread::spawn(move || {
+            let path = std::path::PathBuf::from(&dir);
+            let mut last = diskguard::Verdict::Ok;
+            loop {
+                let usage = flint_storage::disk::sample(&path);
+                let v = diskguard::verdict(usage, thresholds, last);
+                if v != last {
+                    // Transitions are the thing an operator needs in the
+                    // log; steady state is what the metrics are for.
+                    eprintln!(
+                        "disk guard: {last:?} -> {v:?} (free {} of {} bytes)",
+                        usage.map(|u| u.free_bytes).unwrap_or(0),
+                        usage.map(|u| u.total_bytes).unwrap_or(0)
+                    );
+                }
+                DISK.apply(usage, v);
+                last = v;
+                std::thread::sleep(every);
+            }
+        });
+    }
+
     if limits.max_key_bytes != flint_storage::DEFAULT_MAX_KEY_BYTES {
         eprintln!(
             "max-key-bytes: {} (structural ceiling {})",
@@ -1060,6 +1117,19 @@ fn execute(
     if ro && is_write {
         return Value::Error("READONLY You can't write against a read only replica.".into());
     }
+    // Disk headroom. Space-REDUCING writes stay allowed, because deleting is
+    // the only way out and blocking it makes the condition self-sustaining;
+    // reads are untouched. Same classifier the proxy uses for the per-tenant
+    // quota verdict, so the two planes cannot disagree about what frees
+    // space.
+    if is_write
+        && DISK.shedding()
+        && !args
+            .first()
+            .is_some_and(|n| flint_commands::reduces_space(n))
+    {
+        return Value::Error(diskguard::DISK_FULL_ERROR.into());
+    }
     // R1: a replica self-fences READS once it has lost live contact with the
     // master for longer than the staleness bound. Admin/FLINT* commands are
     // exempt (they are diagnostics, not tenant reads); a fresh replica that
@@ -1487,8 +1557,9 @@ fn flintinfo(
         Some(acked) => latest.saturating_sub(acked).to_string(),
         None => "none".into(),
     };
+    let (disk_free, disk_total, disk_unknown) = DISK.snapshot();
     let info = format!(
-        "role:{}\r\nrole_epoch:{role_epoch}\r\nbuild:{build}\r\nsst_bytes:{sst}\r\nlatest_seq:{latest}\r\nlast_applied:{last_applied}\r\nacked_seq:{}\r\nseq_lag:{seq_lag}\r\nlive_replicas:{}\r\nlag_ms:{}\r\nlag_soft_ms:{soft}\r\nlag_hard_ms:{hard}\r\nmin_replicas_to_write:{minr}\r\nfullsync_active:{fsa}\r\nfullsync_max:{fsm}\r\nasync_write_queue:{aqd}\r\nwal_fsync_ms:{wfm}\r\nwal_fsync_total:{wft}\r\ncert_days_remaining:{cdr}\r\nactive_conns:{ac}\r\nmax_conns:{mc}\r\nconns_shed_total:{cs}\r\nwrite_stopped:{wst}\r\ndelayed_write_rate:{dwr}\r\n",
+        "role:{}\r\nrole_epoch:{role_epoch}\r\nbuild:{build}\r\nsst_bytes:{sst}\r\nlatest_seq:{latest}\r\nlast_applied:{last_applied}\r\nacked_seq:{}\r\nseq_lag:{seq_lag}\r\nlive_replicas:{}\r\nlag_ms:{}\r\nlag_soft_ms:{soft}\r\nlag_hard_ms:{hard}\r\nmin_replicas_to_write:{minr}\r\nfullsync_active:{fsa}\r\nfullsync_max:{fsm}\r\nasync_write_queue:{aqd}\r\nwal_fsync_ms:{wfm}\r\nwal_fsync_total:{wft}\r\ncert_days_remaining:{cdr}\r\nactive_conns:{ac}\r\nmax_conns:{mc}\r\nconns_shed_total:{cs}\r\nwrite_stopped:{wst}\r\ndelayed_write_rate:{dwr}\r\ndisk_free_bytes:{dfb}\r\ndisk_total_bytes:{dtb}\r\ndisk_free_pct:{dfp}\r\ndisk_verdict:{dv}\r\ndisk_unknown_samples:{dus}\r\n",
         if read_only { "replica" } else { "master" },
         hub.effective_acked(now)
             .map_or_else(|| "none".into(), |a| a.to_string()),
@@ -1515,6 +1586,17 @@ fn flintinfo(
         cs = CONNS_SHED.load(Ordering::Relaxed),
         wst = rocks.as_ref().map(|kv| kv.write_stall().0).unwrap_or(0),
         dwr = rocks.as_ref().map(|kv| kv.write_stall().1).unwrap_or(0),
+        dfb = disk_free,
+        dtb = disk_total,
+        dfp = disk_free
+            .saturating_mul(100)
+            .checked_div(disk_total)
+            .map_or_else(|| "none".into(), |p| p.to_string()),
+        dv = match DISK.current() {
+            diskguard::Verdict::Ok => "ok",
+            diskguard::Verdict::Shed => "shed",
+        },
+        dus = disk_unknown,
     );
     Value::Bulk(Some(info.into_bytes()))
 }

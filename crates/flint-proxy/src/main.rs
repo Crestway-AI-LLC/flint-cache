@@ -697,12 +697,8 @@ impl Topology {
         let (rate, over) = *self.quota.read().ok()?.get(ns)?;
         // Space-REDUCING writes stay allowed over-quota — the self-clear
         // path is the tenant deleting data, which must never be blocked by
-        // the very state it cures.
-        let reduces_space = matches!(
-            name.to_ascii_uppercase().as_slice(),
-            b"DEL" | b"UNLINK" | b"FLUSHALL" | b"EXPIRE" | b"PEXPIRE"
-        );
-        if over && is_write && !reduces_space {
+        // the very state it cures. Shared with the server's disk gate.
+        if over && is_write && !flint_commands::reduces_space(name) {
             self.stat_quota_write_shed_total
                 .fetch_add(1, Ordering::Relaxed);
             return Some(Value::Error(

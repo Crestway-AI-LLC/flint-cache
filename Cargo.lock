@@ -622,6 +622,7 @@ name = "flint-storage"
 version = "0.0.1"
 dependencies = [
  "flint-slot",
+ "libc",
  "rocksdb",
 ]
 
