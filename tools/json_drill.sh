@@ -129,4 +129,11 @@ $B JSON.SET mine '$' '{"who":"beta"}' >/dev/null
 [ "$($B DBSIZE)" = "1" ] || { echo "FAIL: beta DBSIZE $($B DBSIZE)"; exit 1; }
 echo "  neither tenant can see the other's documents"
 
+# The cluster must also AGREE WITH ITSELF, not merely pass the one
+# path this drill exercises — the gap two shipped bugs lived in.
+echo "== integrity: every view of the cluster reconciles"
+./target/release/flintctl -f "$INV" verify --probe acme:tok-acme >/dev/null \
+  || { echo "FAIL: cluster does not reconcile (run: flintctl -f $INV verify --probe acme:tok-acme)"; exit 1; }
+echo "  verified"
+
 echo "PASS: JSON through the proxy — documents shard by slot, both reply dialects survive the hop, TTLs persist across restart, tenants stay isolated"

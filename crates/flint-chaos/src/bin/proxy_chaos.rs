@@ -64,6 +64,64 @@ fn proxy_get(client: &mut Client, proxy_port: u16, key: &str) -> Option<Vec<u8>>
     }
 }
 
+/// Fan-out commands (DBSIZE, SCAN, FLUSHALL) address every pair's master
+/// directly rather than routing by slot, so they are the one path a stale
+/// master table breaks *permanently*: keyed traffic re-resolves on the next
+/// MOVED, but a fan-out has nothing to correct it. That is exactly how the
+/// shipped bug behaved — keyed reads healed within seconds while SCAN and
+/// DBSIZE stayed pointed at a node that had been dead since the promotion.
+///
+/// Must be called BEFORE any keyed read following the promotion. The keyed
+/// path repairs the shared master table as a side effect of re-resolving,
+/// so a fan-out checked afterwards passes even against the buggy proxy —
+/// verified by reverting the fix. Order is what makes this a regression.
+///
+/// `floor` is the minimum DBSIZE that would still be honest: 0 before the
+/// keyed sweep (any definitive answer proves rediscovery), and the number of
+/// keys just read back afterwards (a fan-out that skipped the promoted pair
+/// would return a short count rather than an error).
+fn assert_fanout_healthy(client: &mut Client, proxy_port: u16, floor: u64, iteration: u32) {
+    let start = Instant::now();
+    let mut last;
+    loop {
+        let dbsize = match client.call(&[b"DBSIZE"]) {
+            Ok(Value::Integer(n)) if n as u64 >= floor => n as u64,
+            other => {
+                last = format!("DBSIZE -> {other:?}");
+                if start.elapsed() > PROXY_OP_BUDGET {
+                    panic!(
+                        "iter {iteration}: fan-out still broken {:?} after promotion ({last}); \
+                         keyed traffic recovered, so this is a stale master table, not a dead cluster",
+                        start.elapsed()
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(40));
+                *client = reconnect(proxy_port);
+                continue;
+            }
+        };
+        // SCAN opens a cursor over the same fan-out set; a stale entry there
+        // errors rather than under-reporting, so a clean first page is the
+        // signal. Full enumeration is the scan drill's job, not this one.
+        match client.call(&[b"SCAN", b"0", b"COUNT", b"10"]) {
+            Ok(Value::Array(Some(items))) if items.len() == 2 => {
+                println!(
+                    "  iter {iteration}: fan-out healthy after promotion (DBSIZE {dbsize} >= {floor}, SCAN cursor opened)"
+                );
+                return;
+            }
+            other => {
+                last = format!("SCAN -> {other:?}");
+                if start.elapsed() > PROXY_OP_BUDGET {
+                    panic!("iter {iteration}: fan-out still broken after promotion ({last})");
+                }
+                std::thread::sleep(Duration::from_millis(40));
+                *client = reconnect(proxy_port);
+            }
+        }
+    }
+}
+
 fn main() {
     let iterations: u32 = arg("--iterations", 12);
     let key_count: u64 = arg("--keys", 400);
@@ -112,13 +170,18 @@ fn main() {
         if want_master && cluster.wait_healthy(Duration::from_secs(8)) {
             // Controller promotes; the proxy must chase on its own.
             cluster.kill_master_await_controller();
+            // FIRST command after the promotion, deliberately: see the note on
+            // assert_fanout_healthy. Anything keyed here would mask the bug.
+            assert_fanout_healthy(&mut writer, proxy_port, 0, iteration);
             let mut lost_here = 0u64;
+            let mut readable = 0u64;
             for (key, entry) in ledger.iter_mut() {
                 if entry.last_acked == 0 {
                     continue;
                 }
                 match proxy_get(&mut writer, proxy_port, key) {
                     Some(raw) => {
+                        readable += 1;
                         let (owner, got) = parse_value(&raw)
                             .unwrap_or_else(|| panic!("TORN VALUE at {key}: {raw:?}"));
                         assert_eq!(&owner, key, "CROSS-KEY at {key}: owned by {owner}");
@@ -138,6 +201,10 @@ fn main() {
             println!(
                 "iter {iteration}: killed MASTER (controller-promoted, proxy-chased); acked keys regressed: {lost_here}"
             );
+            // Now that the keyed sweep has established a floor, re-check the
+            // count itself: the pre-sweep call proved the fan-out rediscovers,
+            // this one proves it did not quietly drop a pair from the sum.
+            assert_fanout_healthy(&mut writer, proxy_port, readable, iteration);
         } else {
             cluster.kill_replica_fixed();
             for (key, entry) in &ledger {

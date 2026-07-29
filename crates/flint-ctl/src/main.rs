@@ -1032,29 +1032,85 @@ fn launch(inv: &Inventory, register: bool) {
 /// after a failover, keyed traffic recovered while fan-out stayed pointed
 /// at the dead node, and every drill stayed green.
 fn verify(inv: &Inventory, args: &[String]) {
+    let probe = args
+        .iter()
+        .position(|a| a == "--probe")
+        .and_then(|i| args.get(i + 1))
+        .cloned();
+    let problems = verify_checks(inv, probe.as_deref(), true);
+    println!();
+    if problems.is_empty() {
+        println!(
+            "VERIFY OK: {} pair(s), {} proxy(ies) — all views agree",
+            inv.pairs.len(),
+            inv.proxies.len()
+        );
+    } else {
+        println!("VERIFY FAILED: {} problem(s)", problems.len());
+        for p in &problems {
+            println!("  - {p}");
+        }
+        std::process::exit(1);
+    }
+}
+
+/// Run the reconciliation after an operation that changed the cluster, and
+/// REFUSE to report success if the result does not hold together.
+///
+/// The whole point of the previous commit's findings is that a check nobody
+/// runs is a check that does not exist: both bugs it was written for
+/// survived because every drill was green and nothing looked. So expansion,
+/// failover and slot moves end here, and a cluster that does not reconcile
+/// makes the command that produced it fail.
+fn verify_after(inv: &Inventory, op: &str) {
+    let problems = verify_checks(inv, None, false);
+    if problems.is_empty() {
+        println!("verify: {op} left the cluster consistent");
+        return;
+    }
+    eprintln!("verify: {op} left the cluster INCONSISTENT:");
+    for p in &problems {
+        eprintln!("  - {p}");
+    }
+    eprintln!(
+        "flintctl: run `flintctl -f <inventory> verify` for detail; the operation itself may have\n         partially applied, so inspect before retrying."
+    );
+    std::process::exit(1);
+}
+
+/// The checks themselves. Returns the problems found; prints per-check
+/// lines only when `loud`, so the post-step form stays quiet on success.
+fn verify_checks(inv: &Inventory, probe: Option<&str>, loud: bool) -> Vec<String> {
     let tls = tls_client(inv);
     let mut problems: Vec<String> = Vec::new();
     let mut note = |ok: bool, label: &str, detail: String| {
-        println!(
-            "  {} {label}{}",
-            if ok { "ok  " } else { "FAIL" },
-            if detail.is_empty() {
-                String::new()
-            } else {
-                format!("  {detail}")
-            }
-        );
+        if loud {
+            println!(
+                "  {} {label}{}",
+                if ok { "ok  " } else { "FAIL" },
+                if detail.is_empty() {
+                    String::new()
+                } else {
+                    format!("  {detail}")
+                }
+            );
+        }
         if !ok {
             problems.push(format!("{label}: {detail}"));
         }
     };
+    let head = |t: &str| {
+        if loud {
+            println!("{t}");
+        }
+    };
 
-    println!("== control plane");
+    head("== control plane");
     let cp = &inv.cp[0];
     let cp_ok = matches!(call(cp, &tls, &["PING"]), Ok(Value::Simple(s)) if s == "PONG");
     note(cp_ok, "reachable", cp.clone());
 
-    println!("== pairs: one master each, coherent epochs, one build");
+    head("== pairs: one master each, coherent epochs, one build");
     let mut builds: BTreeSet<String> = BTreeSet::new();
     for (i, pair) in inv.pairs.iter().enumerate() {
         let mut masters = Vec::new();
@@ -1095,7 +1151,7 @@ fn verify(inv: &Inventory, args: &[String]) {
         format!("{builds:?}"),
     );
 
-    println!("== proxies");
+    head("== proxies");
     for p in &inv.proxies {
         note(proxy_up(inv, p), "proxy up", p.clone());
     }
@@ -1103,14 +1159,10 @@ fn verify(inv: &Inventory, args: &[String]) {
     // The data-plane probe needs a tenant credential; without one the
     // structural checks above still run, but the checks that actually catch
     // a stale routing table cannot. Say so rather than imply a clean bill.
-    let probe = args
-        .iter()
-        .position(|a| a == "--probe")
-        .and_then(|i| args.get(i + 1));
     match (probe, inv.proxies.first()) {
         (Some(spec), Some(proxy)) => {
-            let (tenant, token) = spec.split_once(':').unwrap_or((spec.as_str(), ""));
-            println!("== data plane through {proxy} as {tenant}");
+            let (tenant, token) = spec.split_once(':').unwrap_or((spec, ""));
+            head(&format!("== data plane through {proxy} as {tenant}"));
             let t = Duration::from_secs(10);
             // Each probe is its own authenticated session; call_seq returns
             // the LAST reply, which is the one being asserted on.
@@ -1166,20 +1218,7 @@ fn verify(inv: &Inventory, args: &[String]) {
         (_, None) => println!("== data plane  SKIPPED (no proxy in the inventory)"),
     }
 
-    println!();
-    if problems.is_empty() {
-        println!(
-            "VERIFY OK: {} pair(s), {} proxy(ies) — all views agree",
-            inv.pairs.len(),
-            inv.proxies.len()
-        );
-    } else {
-        println!("VERIFY FAILED: {} problem(s)", problems.len());
-        for p in &problems {
-            println!("  - {p}");
-        }
-        std::process::exit(1);
-    }
+    problems
 }
 
 /// Send one inline (non-RESP) command and see whether the proxy honours it.
@@ -2077,7 +2116,10 @@ fn main() {
     let rest: Vec<String> = argv.iter().skip(cmd_at + 1).cloned().collect();
 
     match cmd {
-        "bootstrap" => bootstrap(&inv),
+        "bootstrap" => {
+            bootstrap(&inv);
+            verify_after(&inv, "bootstrap");
+        }
         "start" => start(&inv),
         "status" => status(&inv),
         "verify" => verify(&inv, &rest),
@@ -2092,6 +2134,9 @@ fn main() {
         "expand" => {
             let spec = rest.first().expect("usage: expand <a,b[,c]>");
             expand(&inv, &inv_path, spec);
+            // The inventory on disk grew; re-read it so the check sees the
+            // pair that was just added rather than the old shape.
+            verify_after(&parse_inventory(&inv_path), "expand");
         }
         "swap-node" => {
             let (bad, new) = (
@@ -2099,6 +2144,7 @@ fn main() {
                 rest.get(1).expect("usage: swap-node <bad> <new>"),
             );
             swap_node(&inv, &inv_path, bad, new);
+            verify_after(&parse_inventory(&inv_path), "swap-node");
         }
         "add-replica" => {
             let (pair, new) = (
@@ -2108,6 +2154,7 @@ fn main() {
                     .expect("usage: add-replica <pair-idx|member> <new>"),
             );
             add_replica(&inv, &inv_path, pair, new);
+            verify_after(&parse_inventory(&inv_path), "add-replica");
         }
         "reload" => reload(&inv),
         "migrate-slots" => {
@@ -2122,10 +2169,12 @@ fn main() {
                     .expect("usage: migrate-slots <ns> <lo-hi> <src> <dest>"),
             );
             migrate_slots(&inv, ns, range, src, dest);
+            verify_after(&inv, "migrate-slots");
         }
         "failover" => {
             let node = rest.first().expect("usage: failover <node-addr>");
             failover(&inv, node);
+            verify_after(&inv, "failover");
         }
         "decommission-node" => {
             let addr = rest
@@ -2139,6 +2188,7 @@ fn main() {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(5000);
             decommission_node(&inv, &inv_path, addr, force, drain_ms);
+            verify_after(&parse_inventory(&inv_path), "decommission-node");
         }
         "tenant-reads" => {
             let (name, mode) = (

@@ -91,4 +91,11 @@ E=$($A SCAN 424242424242 2>&1)
 echo "$E" | grep -qi 'invalid cursor' || { echo "FAIL: bad cursor answered: $E"; exit 1; }
 echo "  ERR invalid cursor"
 
+# The cluster must also AGREE WITH ITSELF, not merely pass the one
+# path this drill exercises — the gap two shipped bugs lived in.
+echo "== integrity: every view of the cluster reconciles"
+./target/release/flintctl -f "$INV" verify --probe acme:tok-acme >/dev/null \
+  || { echo "FAIL: cluster does not reconcile (run: flintctl -f $INV verify --probe acme:tok-acme)"; exit 1; }
+echo "  verified"
+
 echo "PASS: SCAN through the proxy — full exactly-once enumeration across 2 pairs, MATCH, tenant isolation, honest cursors"

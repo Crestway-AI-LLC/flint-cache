@@ -37,6 +37,30 @@ disagrees with the oracle, the case is wrong.
     tools/decommission_drill.sh       # graceful failover + single-node retire, guarded
     tools/config_file_drill.sh        # config-file tunables + hot reload (no restart)
     tools/federation_plumbing_drill.sh
+    tools/disk_pressure_drill.sh      # host out of room: shed, serve, self-recover
+    tools/ctl_error_drill.sh          # a refused command reports, never panics
+    tools/client_compat_drill.sh      # redis-py + node-redis, both on RESP3
+
+## 3b. Integrity — the cluster agrees with itself
+
+Every operation that changes topology now ends in `flintctl verify`
+automatically, so a bootstrap or expand that produced an inconsistent
+cluster FAILS rather than reporting success. Confirm it independently on a
+live cluster before tagging:
+
+    flintctl -f cluster.flint verify --probe <tenant>:<token>
+
+It reconciles three separate beliefs about the fleet — the control plane's
+registry, each node's own manifest, and the proxy's actual behaviour — and
+the disagreements are the interesting failures. Two shipped bugs went
+undetected precisely because each component was internally consistent and
+every drill was green: fan-out kept addressing a master that had been dead
+since the last failover, and the proxy rejected inline commands while
+`--pipe` reported success.
+
+`--probe` is what exercises the data plane; without it the structural
+checks still run but the ones that catch a stale routing table cannot, and
+it says SKIPPED rather than implying a clean bill.
 
 ## 4. Chaos (the honesty step)
 
@@ -45,6 +69,14 @@ disagrees with the oracle, the case is wrong.
 
 Both must report ALL SEEDS PASSED with zero corruption / time-travel /
 cross-key / acked-loss anomalies.
+
+**Known limit, stated so nobody mistakes the coverage.** Both chaos drills
+kill PROCESSES on one host. They cannot produce a network partition, host
+loss, cross-AZ latency, or a single host running out of disk — the faults
+that a multi-machine cluster has and a single box does not. That is the
+weakest useful form of chaos, and it still found two serious bugs during
+the 8-pair EC2 run (docs/bench/scale-8-pairs.md). Real multi-machine chaos
+is blocked on the remote-runner flintctl and is tracked separately.
 
 ## 5. Tag
 

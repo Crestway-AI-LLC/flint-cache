@@ -111,4 +111,11 @@ grep -q 'whole shard' /tmp/decom-g2.log || { echo "FAIL: wrong guard"; cat /tmp/
 echo "  refused: whole-shard removal is out of scope"
 
 rm -f "$RUN"; wait "$WRITER_PID" 2>/dev/null
+# The cluster must also AGREE WITH ITSELF, not merely pass the one
+# path this drill exercises — the gap two shipped bugs lived in.
+echo "== integrity: every view of the cluster reconciles"
+./target/release/flintctl -f "$INV" verify --probe acme:tok-acme >/dev/null \
+  || { echo "FAIL: cluster does not reconcile (run: flintctl -f $INV verify --probe acme:tok-acme)"; exit 1; }
+echo "  verified"
+
 echo "PASS: failover (graceful, zero acked loss) + decommission-node (guarded both ways, pair keeps serving)"

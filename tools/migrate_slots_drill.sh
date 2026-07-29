@@ -117,4 +117,11 @@ ACKED=$(cat "$ACK"); GOT=$($A GET '{mig2}:writer')
 echo "  live writer: zero acked-write loss across the cutover (acked=$ACKED, read=$GOT)"
 
 rm -f "$RUN"; wait "$WPID" 2>/dev/null
+# The cluster must also AGREE WITH ITSELF, not merely pass the one
+# path this drill exercises — the gap two shipped bugs lived in.
+echo "== integrity: every view of the cluster reconciles"
+./target/release/flintctl -f "$INV" verify --probe acme:tok-acme >/dev/null \
+  || { echo "FAIL: cluster does not reconcile (run: flintctl -f $INV verify --probe acme:tok-acme)"; exit 1; }
+echo "  verified"
+
 echo "PASS: migrate-slots moved a range operator-directed — CP-committed, keys intact, zero acked loss"
