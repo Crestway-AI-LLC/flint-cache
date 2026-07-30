@@ -485,8 +485,13 @@ mod tests {
         let master = RocksKv::open(&md.0).expect("open");
         let s = StringStore::new(&master, b"0", system_clock);
         for i in 0..8 {
-            s.set(1, format!("early{i}").as_bytes(), b"v", SetOptions::default())
-                .expect("set");
+            s.set(
+                1,
+                format!("early{i}").as_bytes(),
+                b"v",
+                SetOptions::default(),
+            )
+            .expect("set");
         }
         // A cursor in the MIDDLE of what the first segment holds: the writes
         // just after it are the ones about to become unreachable.
@@ -502,8 +507,13 @@ mod tests {
         // without waiting out the TTL.
         master.flush();
         for i in 0..4 {
-            s.set(1, format!("late{i}").as_bytes(), b"v", SetOptions::default())
-                .expect("set");
+            s.set(
+                1,
+                format!("late{i}").as_bytes(),
+                b"v",
+                SetOptions::default(),
+            )
+            .expect("set");
         }
         let archive = master.path().join("archive");
         let mut retired = 0;
@@ -531,7 +541,9 @@ mod tests {
                     "a batch starting at the cursor would mean nothing was actually stranded"
                 );
             }
-            other => panic!("a cursor outside the retained WAL must not read as caught up: {other:?}"),
+            other => {
+                panic!("a cursor outside the retained WAL must not read as caught up: {other:?}")
+            }
         }
 
         // And the caught-up case must stay quiet: a cursor at or past the

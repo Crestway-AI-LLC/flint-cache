@@ -2855,7 +2855,10 @@ mod port_free_tests {
         let port = held.local_addr().expect("local addr").port();
         let err = wait_port_free(port, Duration::from_millis(400))
             .expect_err("a port with a live listener must not be reported free");
-        assert!(err.contains(&port.to_string()), "the error should name the port: {err}");
+        assert!(
+            err.contains(&port.to_string()),
+            "the error should name the port: {err}"
+        );
         drop(held);
         assert!(
             wait_port_free(port, Duration::from_secs(2)).is_ok(),

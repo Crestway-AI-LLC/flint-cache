@@ -1587,7 +1587,9 @@ fn flintdemote(
             // suffix the successor never saw.
             mark_needs_reseed(
                 kv.path(),
-                &format!("demoted to replica at role epoch {epoch}; the unreplicated suffix may have diverged"),
+                &format!(
+                    "demoted to replica at role epoch {epoch}; the unreplicated suffix may have diverged"
+                ),
             );
             eprintln!(
                 "demoted to replica at role epoch {epoch} (fenced; wipe + --replica-of to resync)"
