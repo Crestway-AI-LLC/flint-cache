@@ -543,26 +543,26 @@ fn wait_port_free(port: u16, budget: Duration) -> Result<(), String> {
     use std::net::TcpListener;
     let deadline = Instant::now() + budget;
     loop {
-        let wildcard = TcpListener::bind(("0.0.0.0", port));
-        let loopback = TcpListener::bind(("127.0.0.1", port));
-        match (&wildcard, &loopback) {
-            (Ok(_), Ok(_)) => {
-                // Drop both before the caller spawns; a listener held here
-                // would be the very conflict this exists to avoid.
-                drop(wildcard);
-                drop(loopback);
-                return Ok(());
-            }
-            _ => {
-                if Instant::now() > deadline {
-                    return Err(format!(
-                        "port {port} still bound after the process was gone — refusing to start a \
-                         replacement that would die with AddrInUse and leave nothing serving"
-                    ));
-                }
-                std::thread::sleep(Duration::from_millis(100));
-            }
+        // ONE AT A TIME, each dropped before the next. Holding the wildcard
+        // while probing loopback makes the prober its own conflict: on Linux
+        // 0.0.0.0:P and 127.0.0.1:P overlap, so the second bind fails with
+        // AddrInUse and the check can NEVER pass. macOS permits the overlap,
+        // which is why every local drill went green and the first Linux roll
+        // aborted its canary — the same wrong-platform trap as benchmarking
+        // an LSM on a laptop.
+        let free = [("0.0.0.0", port), ("127.0.0.1", port)]
+            .iter()
+            .all(|addr| TcpListener::bind(*addr).is_ok());
+        if free {
+            return Ok(());
         }
+        if Instant::now() > deadline {
+            return Err(format!(
+                "port {port} still bound after the process was gone — refusing to start a \
+                 replacement that would die with AddrInUse and leave nothing serving"
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(100));
     }
 }
 
@@ -2815,5 +2815,51 @@ fn main() {
                 "unknown command {other:?} (bootstrap|start|status|reload|tenant|tenant-reads|tenant-cache|tenant-async|tenant-federate|tenant-quota|rotate-admin|rotate-certs|proxy-cache|expand|swap-node|add-replica|migrate-slots|failover|decommission-node|upgrade|stop)"
             )
         }
+    }
+}
+
+#[cfg(test)]
+mod port_free_tests {
+    use super::*;
+    use std::net::TcpListener;
+
+    /// The case that actually broke: a FREE port must be reported free.
+    ///
+    /// The first version probed 0.0.0.0:P and 127.0.0.1:P while still holding
+    /// the first listener. On Linux those overlap, so the second bind failed
+    /// and the check could never pass — every roll would abort its canary
+    /// after killing the seat. macOS permits the overlap, so all the shell
+    /// drills (which only ever run on the dev laptop) went green.
+    ///
+    /// This test lives here because `cargo test` runs on LINUX in the release
+    /// pipeline. That is the only gate in this repo that sees the platform the
+    /// fleet actually runs on.
+    #[test]
+    fn a_free_port_is_reported_free() {
+        let port = {
+            let probe = TcpListener::bind(("127.0.0.1", 0)).expect("ephemeral port");
+            probe.local_addr().expect("local addr").port()
+            // probe dropped here: the port is now genuinely free
+        };
+        assert!(
+            wait_port_free(port, Duration::from_secs(2)).is_ok(),
+            "a free port must be reported free — if this fails on Linux and passes on macOS, \
+             the check is binding overlapping addresses and conflicting with itself"
+        );
+    }
+
+    /// And a HELD port must not be, or the check is decorative.
+    #[test]
+    fn a_held_port_is_not_reported_free() {
+        let held = TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+        let port = held.local_addr().expect("local addr").port();
+        let err = wait_port_free(port, Duration::from_millis(400))
+            .expect_err("a port with a live listener must not be reported free");
+        assert!(err.contains(&port.to_string()), "the error should name the port: {err}");
+        drop(held);
+        assert!(
+            wait_port_free(port, Duration::from_secs(2)).is_ok(),
+            "once released, the port must be reported free"
+        );
     }
 }
