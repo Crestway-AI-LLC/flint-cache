@@ -97,7 +97,21 @@ sequenceDiagram
 4. **Rejoin.** The ex-master wipes and full-syncs back as a fresh replica
    of the new master (an ex-master's replication cursor is not a tail
    position, so it never warm-rejoins — the demote contract is
-   wipe + checkpoint resync).
+   wipe + checkpoint resync). `FLINTDEMOTE` records this itself, leaving a
+   `NEEDS_RESEED` marker in the data dir, so the wipe happens no matter
+   which tool restarts the seat. Starting the node **without**
+   `--replica-of` clears the marker instead: it is being started as the
+   lineage, not as a tailer.
+
+**The same marker covers replication falling too far behind.** A replica
+whose cursor has aged out of the master's retained WAL cannot catch up by
+reconnecting — the bytes it needs no longer exist. It marks itself and
+exits non-zero rather than retrying forever (under systemd's
+`Restart=on-failure` the next start re-seeds unattended). Before this, such
+a node reconnected once a second indefinitely while the master went on
+counting it as a live replica: a pair that looked protected and was not.
+`reseed_drill.sh` covers both directions, including the case that must NOT
+re-seed — an ordinary warm restart still resumes from its durable cursor.
 
 **Guarantee: zero acknowledged-write loss.** The no-master gap between
 demote and promote is sub-second and absorbed by the proxy's retry budget

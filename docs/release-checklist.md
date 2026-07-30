@@ -41,6 +41,7 @@ disagrees with the oracle, the case is wrong.
     tools/ctl_error_drill.sh          # a refused command reports, never panics
     tools/client_compat_drill.sh      # redis-py + node-redis, both on RESP3
     tools/proxy_registry_drill.sh     # stray registrations cannot strand a tenant
+    tools/reseed_drill.sh             # a replica outside the WAL re-seeds, warm restart does not
 
 ## 3b. Integrity — the cluster agrees with itself
 

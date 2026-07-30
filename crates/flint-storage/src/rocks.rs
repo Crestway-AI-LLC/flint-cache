@@ -21,6 +21,10 @@ use crate::Kv;
 /// with `TypeStore`.
 pub struct RocksKv {
     db: DB,
+    /// The directory this DB was opened from. RocksDB does not hand it back,
+    /// and callers that need to leave something BESIDE the data (the re-seed
+    /// marker) would otherwise have to thread the path separately.
+    path: std::path::PathBuf,
     /// Completed WAL fsyncs (the bounded-cadence durability tick).
     wal_fsyncs: std::sync::atomic::AtomicU64,
 }
@@ -149,8 +153,14 @@ impl RocksKv {
         });
         Ok(Self {
             db: DB::open(&opts, path)?,
+            path: path.to_path_buf(),
             wal_fsyncs: std::sync::atomic::AtomicU64::new(0),
         })
+    }
+
+    /// The data directory this DB was opened from.
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
     /// Fsync the WAL — one group commit covering everything appended since

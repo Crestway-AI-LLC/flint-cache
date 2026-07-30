@@ -42,6 +42,51 @@ fn arg(name: &str) -> Option<String> {
     std::env::args().skip_while(|a| a != name).nth(1)
 }
 
+/// Marker file dropped beside a data dir whose contents can no longer be
+/// continued from a master: the next start with `--replica-of` discards the
+/// directory and full-syncs instead of resuming.
+///
+/// A file rather than a system row because the decision is made BEFORE the
+/// DB is opened — and the directory it describes is about to be deleted
+/// anyway. Two situations write it, and they are the same situation seen
+/// from two sides:
+///
+/// * demotion — an ex-master's unreplicated suffix may have diverged from
+///   the successor's lineage, so FLINTDEMOTE's contract has always been
+///   "wipe and resync"; it now records that itself instead of relying on
+///   whichever tool happens to restart the seat;
+/// * a replication cursor that has fallen outside the master's retained WAL,
+///   which no amount of reconnecting can fix.
+///
+/// Promotion clears it: a promoted node IS the lineage, and a stale marker
+/// would make its next start-as-replica destroy good data.
+#[cfg(feature = "rocks")]
+const NEEDS_RESEED: &str = "NEEDS_RESEED";
+
+/// Record that `dir`'s contents must be thrown away before this node can
+/// tail a master again. Best-effort and loud on failure: losing the marker
+/// costs a manual wipe later, which is exactly where we were before.
+#[cfg(feature = "rocks")]
+fn mark_needs_reseed(dir: &std::path::Path, why: &str) {
+    let marker = dir.join(NEEDS_RESEED);
+    if let Err(e) = std::fs::write(&marker, format!("{why}\n")) {
+        eprintln!("could not write {}: {e}", marker.display());
+    }
+}
+
+/// Drop the marker — this copy is authoritative again.
+#[cfg(feature = "rocks")]
+fn clear_needs_reseed(dir: &std::path::Path) {
+    let marker = dir.join(NEEDS_RESEED);
+    if marker.exists() {
+        if let Err(e) = std::fs::remove_file(&marker) {
+            eprintln!("could not remove {}: {e}", marker.display());
+        } else {
+            eprintln!("cleared {NEEDS_RESEED}: this node is the lineage now");
+        }
+    }
+}
+
 /// Internal-mesh mutual-TLS client config (the --internal-* triple in the
 /// client role), set once at startup as a HOT-RELOADING handle (ADR-0006
 /// D4 follow-on): every node→node dial — replication tail, full-sync
@@ -252,7 +297,30 @@ fn main() -> std::io::Result<()> {
         "rocks" => {
             let dir = arg("--data-dir").unwrap_or_else(|| "./flint-data".into());
             data_dir_for_guard = Some(dir.clone());
-            let fresh = !std::path::Path::new(&dir).join("CURRENT").exists();
+            // Honour a re-seed marker BEFORE anything opens the directory.
+            // It is only ever acted on when someone asked us to tail a
+            // master: with no --replica-of we are being started AS the
+            // lineage, and the marker describes a replication position we no
+            // longer follow, so it is cleared and the data kept. Deliberately
+            // narrow — silently turning ordinary restarts into full syncs
+            // would be a far worse bug than the one this fixes.
+            let dir_path = std::path::Path::new(&dir).to_path_buf();
+            let reseed = dir_path.join(NEEDS_RESEED).exists();
+            if reseed {
+                if replica_of.is_some() {
+                    eprintln!(
+                        "{NEEDS_RESEED} present: this copy cannot be continued ({}) — discarding \
+                         it and re-seeding from a checkpoint",
+                        std::fs::read_to_string(dir_path.join(NEEDS_RESEED))
+                            .unwrap_or_default()
+                            .trim()
+                    );
+                    std::fs::remove_dir_all(&dir_path)?;
+                } else {
+                    clear_needs_reseed(&dir_path);
+                }
+            }
+            let fresh = !dir_path.join("CURRENT").exists();
             // A fresh replica seeds from a checkpoint (the spare-seeding
             // path), then tails the WAL from the copied DB's own sequence.
             // Retry on the master's full-sync admission -THROTTLED (a herd
@@ -1435,6 +1503,11 @@ fn flintpromote(
             // Durable role first; only then flip runtime state.
             tailer_stop.store(true, Ordering::Relaxed);
             read_only.store(false, Ordering::Relaxed);
+            // This node IS the lineage now. Any re-seed marker left by an
+            // earlier demotion describes a position nobody follows any more,
+            // and leaving it would make a later start-as-replica throw away
+            // the very history everyone else is now descended from.
+            clear_needs_reseed(kv.path());
             eprintln!("promoted to master at role epoch {epoch}");
             journal_event(
                 flint_journal::EventKind::Promoted,
@@ -1507,6 +1580,15 @@ fn flintdemote(
             // Durable role first, then flip runtime state: no window where a
             // crash resurrects a writable master.
             read_only.store(true, Ordering::Relaxed);
+            // Record the resync contract this command's own docstring states,
+            // rather than trusting whichever tool restarts the seat to know
+            // it. `flintctl roll-node` wipes; `flintctl start` did not, and a
+            // demoted ex-master would then tail a new lineage carrying a
+            // suffix the successor never saw.
+            mark_needs_reseed(
+                kv.path(),
+                &format!("demoted to replica at role epoch {epoch}; the unreplicated suffix may have diverged"),
+            );
             eprintln!(
                 "demoted to replica at role epoch {epoch} (fenced; wipe + --replica-of to resync)"
             );
@@ -2006,7 +2088,42 @@ fn flintsync(
 #[cfg(feature = "rocks")]
 mod replica {
     use super::*;
-    use flint_storage::repl::{ReplBatch, ReplOp};
+    use flint_storage::repl::{ReplBatch, ReplError, ReplOp};
+
+    /// How a tail attempt ended.
+    ///
+    /// The distinction is the whole point: everything a replica normally
+    /// meets — the master restarting, a dropped link, a short read — is
+    /// fixed by reconnecting from the durable cursor, and the loop must not
+    /// give up on it. Exactly one condition is not, and treating it like the
+    /// others is what left a node reconnecting once a second all night.
+    enum TailError {
+        Transient(std::io::Error),
+        /// The bytes we are waiting for no longer exist on the master.
+        ///
+        /// It reaches us two ways, and both were being retried forever: the
+        /// master can say so outright (`-WALGAP`, when RocksDB reports the
+        /// requested sequence as unavailable), or it can ship the oldest
+        /// batch it still has, which then starts past our cursor and fails
+        /// apply-side. Same condition, one hop apart.
+        WalPurged(String),
+    }
+
+    /// Lets `tail_once` keep using `?` on ordinary I/O.
+    impl From<std::io::Error> for TailError {
+        fn from(e: std::io::Error) -> Self {
+            Self::Transient(e)
+        }
+    }
+
+    impl std::fmt::Display for TailError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::Transient(e) => write!(f, "{e}"),
+                Self::WalPurged(why) => write!(f, "{why}"),
+            }
+        }
+    }
 
     pub fn run(target: &str, kv: &Arc<RocksKv>, stop: &Arc<AtomicBool>) {
         loop {
@@ -2017,6 +2134,29 @@ mod replica {
             if let Err(e) = tail_once(target, kv, stop)
                 && !stop.load(Ordering::Relaxed)
             {
+                // Retrying a purged span cannot work: the next request asks
+                // for the same missing sequence and fails identically,
+                // forever. Observed on the playground — a replica looped
+                // ~1/second all night at live_replicas 0 while the pair ran
+                // unprotected, and only a manual wipe recovered it. So take
+                // the remedy WalGap already prescribes: re-seed.
+                if let TailError::WalPurged(why) = &e {
+                    eprintln!(
+                        "FATAL: {why} — this link can never resume. Marking for re-seed and \
+                         exiting; the next start will full-sync from a checkpoint."
+                    );
+                    // A marker + exit rather than an in-process re-seed: the
+                    // DB handle is shared with the serving path, and tearing
+                    // it down underneath live readers is a much larger change
+                    // than this failure warrants. Exiting is also the honest
+                    // signal — under systemd (`Restart=on-failure`) the next
+                    // start re-seeds unattended.
+                    super::mark_needs_reseed(
+                        kv.path(),
+                        "replication cursor fell outside the master's retained WAL",
+                    );
+                    std::process::exit(3);
+                }
                 eprintln!("replication link lost ({e}); reconnecting in 1s");
             }
             std::thread::sleep(std::time::Duration::from_secs(1));
@@ -2113,7 +2253,7 @@ mod replica {
         }
     }
 
-    fn tail_once(target: &str, kv: &Arc<RocksKv>, stop: &Arc<AtomicBool>) -> std::io::Result<()> {
+    fn tail_once(target: &str, kv: &Arc<RocksKv>, stop: &Arc<AtomicBool>) -> Result<(), TailError> {
         let mut stream = internal_connect(target)?;
         // Short read timeout so the stop flag is honored promptly.
         stream.set_read_timeout(Some(std::time::Duration::from_millis(300)))?;
@@ -2166,8 +2306,13 @@ mod replica {
                             );
                             stream.write_all(&out)?;
                         }
+                        // The master diagnosing the purge itself. Retrying
+                        // asks the same question and gets the same answer.
+                        Value::Error(e) if e.starts_with("WALGAP") => {
+                            return Err(TailError::WalPurged(e));
+                        }
                         Value::Error(e) => {
-                            return Err(std::io::Error::other(format!("master error: {e}")));
+                            return Err(std::io::Error::other(format!("master error: {e}")).into());
                         }
                         other => {
                             let batch = parse_batch(other).ok_or_else(|| {
@@ -2176,8 +2321,24 @@ mod replica {
                                     "malformed replication frame",
                                 )
                             })?;
-                            kv.apply_batch(&batch)
-                                .map_err(|e| std::io::Error::other(format!("apply: {e:?}")))?;
+                            kv.apply_batch(&batch).map_err(|e| match e {
+                                // A batch starting AFTER the sequence we need
+                                // means the span between was purged from the
+                                // master's WAL: this is WalGap arriving one
+                                // hop late, because the master shipped what it
+                                // still had instead of refusing outright.
+                                ReplError::SequenceGap { expected, got } if got > expected => {
+                                    TailError::WalPurged(format!(
+                                        "master's oldest batch starts at {got}, past the {expected} \
+                                         we still need"
+                                    ))
+                                }
+                                // A batch starting BEFORE it is reordering or
+                                // a lost frame — re-requesting fixes that.
+                                other => TailError::Transient(std::io::Error::other(format!(
+                                    "apply: {other:?}"
+                                ))),
+                            })?;
                             out.clear();
                             encode(
                                 &Value::Array(Some(vec![
@@ -2199,7 +2360,8 @@ mod replica {
                             return Err(std::io::Error::new(
                                 std::io::ErrorKind::UnexpectedEof,
                                 "master closed",
-                            ));
+                            )
+                            .into());
                         }
                         Ok(n) => buf.extend_from_slice(&chunk[..n]),
                         Err(e)
@@ -2208,14 +2370,15 @@ mod replica {
                         {
                             continue; // timeout tick: loop re-checks stop
                         }
-                        Err(e) => return Err(e),
+                        Err(e) => return Err(e.into()),
                     }
                 }
                 Err(e) => {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         format!("replication protocol error: {e:?}"),
-                    ));
+                    )
+                    .into());
                 }
             }
         }

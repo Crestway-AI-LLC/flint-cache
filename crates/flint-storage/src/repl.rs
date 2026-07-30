@@ -158,6 +158,23 @@ impl RocksKv {
                 break;
             }
         }
+        // We know there are newer sequences (checked above), so producing no
+        // batch at all means the WAL cannot reach back to `last_applied`:
+        // RocksDB hands out an iterator that simply yields nothing when the
+        // requested sequence lives in a segment that has been recycled.
+        //
+        // Reporting that as "no updates" is how a replica ends up frozen at a
+        // stale cursor while the master still counts it as live — seq_lag
+        // climbing, live_replicas 1, and not one error on either side. It is
+        // the same condition as the explicit gap below, so it gets the same
+        // answer: the replica must full-sync.
+        if out.is_empty() {
+            return Err(ReplError::WalGap(format!(
+                "sequence {} is no longer in the WAL (latest is {})",
+                last_applied + 1,
+                self.db().latest_sequence_number()
+            )));
+        }
         Ok(out)
     }
 
@@ -453,6 +470,78 @@ mod tests {
         // Applying in order proceeds normally.
         replica.apply_batch(&batches[1]).expect("second");
         replica.apply_batch(&batches[2]).expect("third");
+    }
+
+    /// A cursor the WAL can no longer reach must be an ERROR, not silence.
+    ///
+    /// RocksDB answers `get_updates_since` for a recycled sequence with an
+    /// iterator that yields nothing, which used to be reported as "no
+    /// updates" — indistinguishable from a caught-up replica. On the
+    /// playground that left a node frozen 20k sequences behind while the
+    /// master still counted it live, seq_lag climbing, nothing logged.
+    #[test]
+    fn a_cursor_the_wal_cannot_reach_is_a_gap_not_silence() {
+        let md = TempDir::new("m-walgap");
+        let master = RocksKv::open(&md.0).expect("open");
+        let s = StringStore::new(&master, b"0", system_clock);
+        for i in 0..8 {
+            s.set(1, format!("early{i}").as_bytes(), b"v", SetOptions::default())
+                .expect("set");
+        }
+        // A cursor in the MIDDLE of what the first segment holds: the writes
+        // just after it are the ones about to become unreachable.
+        let stranded = master.latest_seq() / 2;
+        assert!(
+            !master.updates_since(stranded).expect("tail").is_empty(),
+            "precondition: this cursor is reachable while its WAL is retained"
+        );
+
+        // Retire the segment holding `stranded`: a flush makes it obsolete
+        // and RocksDB moves it to archive/, which is exactly where retention
+        // expiry deletes it from. Deleting it by hand is the same end state
+        // without waiting out the TTL.
+        master.flush();
+        for i in 0..4 {
+            s.set(1, format!("late{i}").as_bytes(), b"v", SetOptions::default())
+                .expect("set");
+        }
+        let archive = master.path().join("archive");
+        let mut retired = 0;
+        for entry in std::fs::read_dir(&archive).expect("archive dir") {
+            let p = entry.expect("entry").path();
+            if p.extension().is_some_and(|e| e == "log") {
+                std::fs::remove_file(&p).expect("retire segment");
+                retired += 1;
+            }
+        }
+        assert!(retired > 0, "precondition: a WAL segment was retired");
+
+        // The master HAS newer data, so "nothing to do" here is a lie — and
+        // it is the specific lie that freezes a replica while the master goes
+        // on counting it live. RocksDB answers a recycled sequence either by
+        // yielding nothing or by starting at the oldest segment it kept, so
+        // both shapes are legal; what is NOT legal is silence.
+        match master.updates_since(stranded) {
+            Err(ReplError::WalGap(_)) => {}
+            Ok(batches) if !batches.is_empty() => {
+                // The replica's own contiguity check catches this one: the
+                // span visibly starts past the sequence it asked for.
+                assert!(
+                    batches[0].first_seq > stranded + 1,
+                    "a batch starting at the cursor would mean nothing was actually stranded"
+                );
+            }
+            other => panic!("a cursor outside the retained WAL must not read as caught up: {other:?}"),
+        }
+
+        // And the caught-up case must stay quiet: a cursor at or past the
+        // latest sequence is not a gap, it is a replica with nothing to do.
+        assert!(
+            master
+                .updates_since(master.latest_seq())
+                .expect("caught up is not a gap")
+                .is_empty()
+        );
     }
 
     #[test]
