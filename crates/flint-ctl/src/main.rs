@@ -856,6 +856,21 @@ fn pids_matching(bin: &str, ident: &str) -> Vec<u32> {
         let Ok(pid) = pid.trim().parse::<u32>() else {
             continue;
         };
+        // NEVER match a flintctl. Over ssh the remote command's own argv is
+        //
+        //   sudo -n .../flintctl host-stop-seat <statedir> node-7002 \
+        //        flint-server /var/lib/flint/node-7002 7002
+        //
+        // which contains the binary name AND the ident as an exact token, so
+        // it satisfies both tests below. Excluding only our own pid is not
+        // enough: the `sudo` PARENT matches too, and killing it takes the ssh
+        // session down with it — the kill lands, then reports failure with an
+        // empty error. Locally this cannot happen, because there the ident is
+        // a function argument rather than a command line. A flintctl is never
+        // a fleet seat, so skipping them is exact rather than a heuristic.
+        if args.contains("flintctl") {
+            continue;
+        }
         if pid != me && args.contains(bin) && args.split_whitespace().any(|t| t == ident) {
             hits.push(pid);
         }
@@ -948,10 +963,21 @@ fn stop_seat(
         if out.status.success() {
             return Ok(());
         }
+        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
         return Err(format!(
             "{name} on {}: {}",
             r.label(),
-            String::from_utf8_lossy(&out.stderr).trim()
+            if err.is_empty() {
+                // ssh exits 255 when the connection itself failed, and says
+                // nothing. An empty message here sent one debugging session
+                // looking at the wrong end of the pipe.
+                format!(
+                    "no output, exit {} (255 = the ssh connection failed, not the command)",
+                    out.status.code().unwrap_or(-1)
+                )
+            } else {
+                err
+            }
         ));
     }
     local_stop_seat(&inv.statedir, name, bin, ident, port)
@@ -1080,7 +1106,10 @@ fn local_sweep_orphans(statedir: &str) -> usize {
         let Ok(pid) = pid.trim().parse::<u32>() else {
             continue;
         };
-        if pid == me || !args.contains(statedir) {
+        // Same exclusion as pids_matching: every remote `flintctl host-*`
+        // argv carries the statedir, so a sweep that did not skip flintctl
+        // would kill the very command performing the sweep.
+        if pid == me || args.contains("flintctl") || !args.contains(statedir) {
             continue;
         }
         if !FLEET_BINARIES.iter().any(|b| args.contains(b)) {
