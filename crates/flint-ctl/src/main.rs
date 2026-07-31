@@ -1463,6 +1463,9 @@ fn start_pair_nodes(inv: &Inventory, pair: &[String]) {
         let mut args = vec![
             "--port".to_string(),
             port.to_string(),
+            // Reachable from the other host of the pair, not just this one.
+            "--bind".into(),
+            host_of(addr).to_string(),
             "--engine".into(),
             "rocks".into(),
             "--data-dir".into(),
@@ -1500,6 +1503,12 @@ fn cp_args(inv: &Inventory) -> Vec<String> {
     let mut args = vec![
         "--port".to_string(),
         port_of(&inv.cp[0]).to_string(),
+        // Bind the address the inventory tells everyone else to dial. On a
+        // loopback fleet this is 127.0.0.1 and nothing changes; on a fleet
+        // with real addresses it is the difference between a control plane
+        // and an unreachable process.
+        "--bind".into(),
+        host_of(&inv.cp[0]).to_string(),
         "--state".into(),
         format!("{d}/cp-state"),
     ];
@@ -2329,6 +2338,8 @@ fn add_replica(inv: &Inventory, inventory_path: &str, pair_ref: &str, new: &str)
     let mut args = vec![
         "--port".to_string(),
         port.to_string(),
+        "--bind".into(),
+        host_of(new).to_string(),
         "--engine".into(),
         "rocks".into(),
         "--data-dir".into(),
@@ -2414,6 +2425,8 @@ fn swap_node(inv: &Inventory, inventory_path: &str, bad: &str, new: &str) {
     let mut args = vec![
         "--port".to_string(),
         port.to_string(),
+        "--bind".into(),
+        host_of(new).to_string(),
         "--engine".into(),
         "rocks".into(),
         "--data-dir".into(),
@@ -2568,6 +2581,8 @@ fn roll_node(
     let mut args = vec![
         "--port".to_string(),
         port.to_string(),
+        "--bind".into(),
+        host_of(addr).to_string(),
         "--engine".into(),
         "rocks".into(),
         "--data-dir".into(),

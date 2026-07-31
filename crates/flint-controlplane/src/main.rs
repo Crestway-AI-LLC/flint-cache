@@ -1112,9 +1112,14 @@ fn main() -> std::io::Result<()> {
         usage: Mutex::new(std::collections::HashMap::new()),
     });
     let internal_tls = internal_server_config();
-    let listener = TcpListener::bind(("127.0.0.1", port))?;
+    // See the note on flint-server's --bind: loopback stays the default so
+    // every existing single-host fleet is untouched, but a control plane that
+    // can only be reached from its own machine cannot serve proxies, a
+    // controller or an agent living anywhere else.
+    let bind = arg("--bind").unwrap_or_else(|| "127.0.0.1".into());
+    let listener = TcpListener::bind((bind.as_str(), port))?;
     eprintln!(
-        "flint-controlplane listening on 127.0.0.1:{port} ({})",
+        "flint-controlplane listening on {bind}:{port} ({})",
         if internal_tls.is_some() {
             "internal mTLS"
         } else {

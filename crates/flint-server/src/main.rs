@@ -776,9 +776,16 @@ fn main() -> std::io::Result<()> {
             }
         });
     }
-    let listener = TcpListener::bind(("127.0.0.1", port))?;
+    // Loopback by default — a node serves the internal mesh, and on the
+    // single-host fleets that have existed until now that is both correct and
+    // the safer default. `--bind` is what makes a node reachable from ANOTHER
+    // machine: without it a pair split across two hosts is unreachable in
+    // both directions, however correctly it was placed there. The proxy has
+    // carried the same flag since the marketplace needed external clients.
+    let bind = arg("--bind").unwrap_or_else(|| "127.0.0.1".into());
+    let listener = TcpListener::bind((bind.as_str(), port))?;
     eprintln!(
-        "flint-server listening on 127.0.0.1:{port} ({})",
+        "flint-server listening on {bind}:{port} ({})",
         if internal_reload.is_some() {
             "internal mTLS"
         } else {
