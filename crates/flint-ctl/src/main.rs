@@ -816,6 +816,56 @@ fn spawn(inv: &Inventory, r: &Runner, name: &str, bin: &str, args: &[String]) {
     spawn_env(inv, r, name, bin, args, &[]);
 }
 
+/// Discard a node's data dir ON THE HOST THAT HOLDS IT.
+///
+/// This was the last local-filesystem call still aimed at a remote seat, and
+/// it failed in the quietest possible way: `remove_dir_all` on the
+/// orchestrator deleted nothing (the path is not there), returned the `()` it
+/// always returns, and the caller carried on believing the seat had been
+/// wiped. The seat then rebooted on its OLD data, whose durable role still
+/// said master — so it came up as a master, the controller fenced it, and it
+/// sat demoted-but-unseeded forever because the demote contract's wipe had
+/// already "happened".
+fn wipe_node(inv: &Inventory, r: &Runner, port: u16) -> Result<(), String> {
+    let dir = format!("{}/node-{port}", inv.statedir);
+    if r.is_remote() {
+        let argv = vec![
+            format!("{}/flintctl", inv.bins),
+            "host-wipe-node".into(),
+            inv.statedir.clone(),
+            format!("node-{port}"),
+        ];
+        let out = r
+            .output(&argv)
+            .map_err(|e| format!("wipe {dir} on {}: {e}", r.label()))?;
+        if !out.status.success() {
+            return Err(format!(
+                "wipe {dir} on {}: {}",
+                r.label(),
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        return Ok(());
+    }
+    local_wipe_node(&inv.statedir, &format!("node-{port}"))
+}
+
+/// Remove one seat's data dir. Refuses anything that is not a node dir under
+/// the given statedir — this runs as root over ssh, so a malformed name must
+/// not be able to name something else.
+fn local_wipe_node(statedir: &str, name: &str) -> Result<(), String> {
+    if statedir.is_empty() || !name.starts_with("node-") || name.contains('/') {
+        return Err(format!("refusing to wipe {statedir:?}/{name:?}"));
+    }
+    let dir = format!("{statedir}/{name}");
+    match std::fs::remove_dir_all(&dir) {
+        Ok(()) => Ok(()),
+        // Already gone is the desired end state.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("remove {dir}: {e}")),
+    }
+}
+
 fn kill_pidfile(inv: &Inventory, r: &Runner, name: &str) {
     if r.is_remote() {
         let argv = vec![
@@ -2605,7 +2655,7 @@ fn roll_node(
         // The demote contract is wipe + checkpoint resync; flintctl knows it
         // just demoted this seat, so it applies the contract itself.
         std::thread::sleep(Duration::from_millis(300));
-        let _ = std::fs::remove_dir_all(format!("{d}/node-{port}"));
+        wipe_node(inv, &runner_for(inv, addr), port)?;
     }
     let mut args = vec![
         "--port".to_string(),
@@ -3298,6 +3348,13 @@ fn host_command(cmd: &str, a: &[String]) -> ! {
             local_stop_all(&need(0, "statedir"));
             std::process::exit(0)
         }
+        "host-wipe-node" => match local_wipe_node(&need(0, "statedir"), &need(1, "name")) {
+            Ok(()) => std::process::exit(0),
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(1)
+            }
+        },
         "host-sweep" => {
             println!("{}", local_sweep_orphans(&need(0, "statedir")));
             std::process::exit(0)
