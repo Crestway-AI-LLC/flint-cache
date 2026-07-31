@@ -23,7 +23,7 @@
 # before killing anything), for the same reason: a stray kill is worse than a
 # stray process.
 #
-# TWO RULES LEARNED THE HARD WAY, both encoded below:
+# THREE RULES LEARNED THE HARD WAY, all encoded below:
 #
 #   1. Match argv[0]'s BASENAME, never the whole command line. A whole-line
 #      match flags anything that merely NAMES a binary — an editor with
@@ -31,9 +31,22 @@
 #      session, whose argv carries `--add-dir .../crates/flint-server/src`.
 #      The first version did this and refused to run on a clean box.
 #
-#   2. Never match flintctl. It is not a fleet seat, and over ssh a
-#      `flintctl host-*` argv carries both a binary name and a statedir, so
-#      an unfiltered sweep kills the command doing the sweeping.
+#   2. flintctl is never a seat — but do NOT exclude it by scanning the
+#      command line. Rule 1 already handles it: argv[0] of `flintctl ...`
+#      (or `sudo ... flintctl ...`) is not in the daemon set, so it cannot
+#      match. A whole-line `/flintctl/` exclusion looks equivalent and is
+#      not: `flint-ops` is started with `--flintctl <path>` as a legitimate
+#      argument, so that exclusion made ops immune to its own cleanup and
+#      it leaked out of every edge_tls and ops_portal run. The same
+#      whole-line-versus-argv[0] confusion as rule 1, in the rule written
+#      to prevent it.
+#
+#   3. The binary set is every long-running Flint DAEMON across both repos —
+#      console, ops, register, exporter and meter exist only in the fleet
+#      repo — so the two copies of this file stay byte-identical and a
+#      public checkout simply never has those processes. Deliberately
+#      excluded: flintctl (see 2) and the one-shot tools (bench, chaos,
+#      conformance), which are not seats and exit on their own.
 
 # fleet_init <scope-dir> [port ...]
 #
@@ -59,7 +72,7 @@ _fleet_foreign() {
     {
       n = split($2, parts, "/")
       exe = parts[n]
-      if (exe !~ /^flint-(server|proxy|controlplane|controller|agent)$/) next
+      if (exe !~ /^flint-(server|proxy|controlplane|controller|agent|console|ops|register|exporter|meter)$/) next
       if (index($0, scope) > 0) next
       if (ports != "" && $0 ~ ("(^|[^0-9])(" ports ")([^0-9]|$)")) next
       print
@@ -71,7 +84,7 @@ _fleet_foreign() {
 # components (space separated, e.g. "controlplane proxy").
 _fleet_ours() {
   local want="${1:-}"
-  local re='^flint-(server|proxy|controlplane|controller|agent)$'
+  local re='^flint-(server|proxy|controlplane|controller|agent|console|ops|register|exporter|meter)$'
   if [ -n "$want" ]; then
     re="^flint-($(printf '%s' "$want" | tr ' ' '|'))$"
   fi
@@ -79,8 +92,14 @@ _fleet_ours() {
     {
       n = split($2, parts, "/")
       exe = parts[n]
+      # The COMPONENT filter. Dropping this makes every `fleet_kill <part>`
+      # a blanket sweep, which silently rewrites the drill that called it —
+      # `fleet_kill controlplane` would take the nodes with it. It went
+      # missing once already, deleted by a careless two-line replacement
+      # while removing an adjacent check, and cost a long bisect: the
+      # symptom was a NODE vanishing during a step that only kills the
+      # control plane, which reads like a product bug.
       if (exe !~ re) next
-      if ($0 ~ /flintctl/) next
       mine = (index($0, scope) > 0)
       if (!mine && ports != "")
         mine = ($0 ~ ("(^|[^0-9])(" ports ")([^0-9]|$)"))
@@ -125,6 +144,21 @@ fleet_guard() {
 # what they mean.
 fleet_kill() {
   local want="$*"
-  _fleet_ours "$want" | while read -r pid; do kill -9 "$pid" 2>/dev/null; done
+  local pid args
+  for pid in $(_fleet_ours "$want"); do
+    # RE-VERIFY before signalling. `pkill` matches and signals as one act;
+    # this is a snapshot followed by a kill, and between the two the pid can
+    # exit and be REUSED by something else. These drills spawn hundreds of
+    # short-lived processes, so that window is not theoretical: a stale pid
+    # from the snapshot landed on a live flint-server and killed the node the
+    # drill was still using, which presented as "data path disturbed" — a
+    # product failure that was really a harness race.
+    args="$(ps -o args= -p "$pid" 2>/dev/null)"
+    case "$args" in
+      *flint-*) ;;                 # still one of ours
+      *) continue ;;               # exited, or the pid now belongs elsewhere
+    esac
+    kill -9 "$pid" 2>/dev/null
+  done
   return 0
 }
