@@ -3302,6 +3302,46 @@ fn main() {
             verify_after(&inv, "bootstrap");
         }
         "start" => start(&inv),
+        // Fault injection and its inverse. `kill-node` is the abrupt loss of
+        // one seat — no drain, no demote — which is what a chaos run needs
+        // and what a real crash looks like. `restart-node` brings the seat
+        // back the only way an ex-member safely returns: wiped and re-seeded
+        // from whoever is master NOW, which may not be who it was before.
+        //
+        // They live here rather than in the chaos harness because the
+        // harness has no idea which machine a seat is on; flintctl does, and
+        // routes both through the same Runner the rest of the fleet uses.
+        "kill-node" => {
+            let addr = rest.first().expect("usage: kill-node <addr>");
+            let port = port_of(addr);
+            let d = &inv.statedir;
+            match stop_seat(
+                &inv,
+                &runner_for(&inv, addr),
+                &format!("node-{port}"),
+                "flint-server",
+                &format!("{d}/node-{port}"),
+                Some(port),
+            ) {
+                Ok(()) => println!("killed {addr}"),
+                Err(e) => die(&format!("kill-node {addr}: {e}")),
+            }
+        }
+        "restart-node" => {
+            let addr = rest.first().expect("usage: restart-node <addr>");
+            let tls = tls_client(&inv);
+            let master = pair_master(&inv, &tls, addr);
+            if &master == addr {
+                die(&format!(
+                    "{addr} is currently MASTER of its pair — restarting it as a replica of \
+                     itself is meaningless; fail it over first"
+                ));
+            }
+            match roll_node(&inv, addr, &master, &[], &None, true) {
+                Ok(()) => println!("restarted {addr} as a replica of {master}"),
+                Err(e) => die(&format!("restart-node {addr}: {e}")),
+            }
+        }
         "push-bins" => {
             let tarball = rest.first().expect("usage: push-bins <bundle.tar.gz>");
             push_bins(&inv, tarball);

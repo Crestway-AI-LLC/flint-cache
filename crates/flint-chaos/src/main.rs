@@ -5,11 +5,16 @@
 //! failover; no time-travel or cross-key bleed.
 //!
 //! Usage: flint-chaos [--iterations 12] [--keys 400] [--mode mixed|replica|master] [--seed N]
+//!
+//! `--inventory <path>` attaches to a REAL flintctl-managed fleet instead of
+//! spawning a local pair, so the same oracle runs against seats that may be
+//! on different machines. Faults go through `flintctl kill-node` /
+//! `restart-node`, which know where each seat lives.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use flint_chaos::cluster::{Client, Cluster, arg};
+use flint_chaos::cluster::{Attached, Cluster, Target, arg};
 use flint_chaos::oracle::{KeyLedger, parse_value, value_for};
 use flint_resp::Value;
 use rand::{Rng, SeedableRng, rngs::SmallRng};
@@ -24,26 +29,40 @@ fn main() {
         // Gate every node the harness spawns; workloads must retry -THROTTLED.
         unsafe { std::env::set_var("FLINT_CHAOS_MIN_REPLICAS", min_replicas.to_string()) };
     }
+    let inventory: String = arg("--inventory", String::new());
     println!(
         "chaos-kv: {iterations} kills, {key_count} keys, mode={mode}, driver={}, min_replicas={min_replicas}",
-        if controller_driven {
+        if !inventory.is_empty() {
+            // An attached fleet HAS a controller; promotion was never ours
+            // to make, so saying "harness" here would misreport what was
+            // actually under test.
+            "fleet-controller"
+        } else if controller_driven {
             "controller"
         } else {
             "harness"
         }
     );
 
-    let mut cluster = if controller_driven {
-        Cluster::bootstrap_controlled(150, 3, 3_000)
+    let mut cluster = if inventory.is_empty() {
+        Target::Local {
+            cluster: if controller_driven {
+                Cluster::bootstrap_controlled(150, 3, 3_000)
+            } else {
+                Cluster::bootstrap()
+            },
+            controller_driven,
+        }
     } else {
-        Cluster::bootstrap()
+        // A real fleet already has a controller; promotion is its job.
+        Target::Attached(Attached::open(&inventory, arg("--pair", 0)))
     };
     let mut ledger: HashMap<String, KeyLedger> = HashMap::new();
     let mut rng = SmallRng::seed_from_u64(arg("--seed", 42));
     let mut seq = 0u64;
     let mut acked_lost_total = 0u64;
     let mut throttled_total = 0u64;
-    let mut writer = Client::connect(cluster.master()).expect("writer connect");
+    let mut writer = cluster.master_client().expect("writer connect");
 
     for iteration in 1..=iterations {
         // Write for a random spell.
@@ -67,7 +86,7 @@ fn main() {
                 }
                 Ok(_) | Err(_) => {
                     std::thread::sleep(Duration::from_millis(50));
-                    if let Ok(c) = Client::connect(cluster.master()) {
+                    if let Ok(c) = cluster.master_client() {
                         writer = c;
                     }
                 }
@@ -82,12 +101,8 @@ fn main() {
         // Steady-state guard: only kill a master with a live, caught-up
         // replica — that tests the ≤1s RPO regime, not degraded-window loss.
         if want_master && cluster.wait_healthy(Duration::from_secs(8)) {
-            if controller_driven {
-                cluster.kill_master_await_controller();
-            } else {
-                cluster.kill_master();
-            }
-            let mut c = Client::connect(cluster.master()).expect("new master");
+            cluster.kill_master();
+            let mut c = cluster.master_client().expect("new master");
             let mut lost_here = 0u64;
             for (key, entry) in ledger.iter_mut() {
                 if entry.last_acked == 0 {
@@ -113,14 +128,10 @@ fn main() {
             }
             acked_lost_total += lost_here;
             println!("iter {iteration}: killed MASTER; acked keys regressed: {lost_here}");
-            writer = Client::connect(cluster.master()).expect("reconnect");
+            writer = cluster.master_client().expect("reconnect");
         } else {
-            if controller_driven {
-                cluster.kill_replica_fixed();
-            } else {
-                cluster.kill_replica();
-            }
-            let mut c = Client::connect(cluster.master()).expect("master");
+            cluster.kill_replica();
+            let mut c = cluster.master_client().expect("master");
             for (key, entry) in &ledger {
                 if entry.last_acked == 0 {
                     continue;
@@ -146,7 +157,7 @@ fn main() {
     }
 
     // Final full-keyspace walk.
-    let mut c = Client::connect(cluster.master()).expect("final connect");
+    let mut c = cluster.master_client().expect("final connect");
     let (mut present, mut missing) = (0u64, 0u64);
     for (key, entry) in &ledger {
         match c.call(&[b"GET", key.as_bytes()]) {
@@ -166,7 +177,7 @@ fn main() {
         }
     }
 
-    let (mk, rk) = (cluster.master_kills, cluster.replica_kills);
+    let (mk, rk) = cluster.kills();
     println!("---");
     println!("PASS: {iterations} kills ({mk} master, {rk} replica), {seq} writes");
     println!("  corruption: 0  time-travel: 0  cross-key: 0");

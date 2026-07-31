@@ -9,11 +9,298 @@
 //! drift between tests.
 
 use std::io::{Read, Write};
-use std::net::TcpStream;
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
 use flint_resp::{Decoded, Value, decode, encode};
+
+/// A fleet this harness did NOT spawn: real seats, on real machines, managed
+/// by flintctl.
+///
+/// The harness cannot start or kill those processes itself — it has no idea
+/// which machine any of them is on, and reimplementing that knowledge here
+/// would be a second copy of it to drift. So faults go out through
+/// `flintctl kill-node` / `restart-node`, which already route to the owning
+/// host, and this type only decides WHICH seat and WHEN.
+///
+/// Everything downstream — the ledger, the value checksums, the acked-write
+/// accounting — is untouched. That is the whole point: the oracle that has
+/// been catching corruption on one host is exactly the oracle we want to
+/// point at seven.
+pub struct Attached {
+    /// `flintctl -f <inventory>`, the control surface for every fault.
+    inventory: String,
+    ctl: String,
+    /// The pair under test, as declared. Roles float between these two.
+    members: Vec<String>,
+    tls: Option<std::sync::Arc<flint_tls::ClientConfig>>,
+    master_kills: std::cell::Cell<u32>,
+    replica_kills: std::cell::Cell<u32>,
+}
+
+impl Attached {
+    /// Read ONLY the pair lines and the cert dir from the inventory.
+    ///
+    /// Deliberately not a second full inventory parser: flintctl owns that,
+    /// and duplicating it here would be one more thing to drift. `pair` and
+    /// `statedir` are the two keys this harness needs, and both have been
+    /// stable since the format existed.
+    pub fn open(inventory: &str, pair_index: usize) -> Self {
+        let raw = std::fs::read_to_string(inventory)
+            .unwrap_or_else(|e| panic!("read inventory {inventory}: {e}"));
+        let mut pairs: Vec<Vec<String>> = Vec::new();
+        let mut statedir = String::new();
+        let mut tls_on = false;
+        for line in raw.lines() {
+            let line = line.split('#').next().unwrap_or("").trim();
+            let Some((k, v)) = line.split_once(' ') else {
+                continue;
+            };
+            match k {
+                "pair" => pairs.push(v.trim().split(',').map(String::from).collect()),
+                "statedir" => statedir = v.trim().to_string(),
+                "tls" => tls_on = v.trim() == "on",
+                _ => {}
+            }
+        }
+        assert!(
+            pair_index < pairs.len(),
+            "inventory declares {} pair(s); --pair {pair_index} is out of range",
+            pairs.len()
+        );
+        let tls = if tls_on {
+            let d = format!("{statedir}/certs");
+            Some(
+                flint_tls::client_config(
+                    &format!("{d}/ca.crt"),
+                    &format!("{d}/int.crt"),
+                    &format!("{d}/int.key"),
+                )
+                .expect("mesh certs (run where the fleet's certs live)"),
+            )
+        } else {
+            None
+        };
+        Self {
+            inventory: inventory.to_string(),
+            ctl: std::env::var("FLINTCTL_BIN").unwrap_or_else(|_| {
+                format!(
+                    "{}/../../target/release/flintctl",
+                    env!("CARGO_MANIFEST_DIR")
+                )
+            }),
+            members: pairs[pair_index].clone(),
+            tls,
+            master_kills: std::cell::Cell::new(0),
+            replica_kills: std::cell::Cell::new(0),
+        }
+    }
+
+    fn ctl(&self, args: &[&str]) -> Result<String, String> {
+        let out = Command::new(&self.ctl)
+            .args(["-f", &self.inventory])
+            .args(args)
+            .output()
+            .map_err(|e| format!("flintctl {args:?}: {e}"))?;
+        if out.status.success() {
+            Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+        } else {
+            Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+        }
+    }
+
+    pub fn tls(&self) -> &Option<std::sync::Arc<flint_tls::ClientConfig>> {
+        &self.tls
+    }
+
+    fn role_of(&self, addr: &str) -> Option<String> {
+        let mut c = Client::connect_addr(addr, &self.tls).ok()?;
+        let Ok(Value::Bulk(Some(raw))) = c.call(&[b"FLINTINFO"]) else {
+            return None;
+        };
+        String::from_utf8_lossy(&raw)
+            .lines()
+            .find_map(|l| l.strip_prefix("role:").map(|v| v.trim().to_string()))
+    }
+
+    /// Whoever is master RIGHT NOW — asked, never assumed. After a failover
+    /// the roles have swapped, and a harness that remembered the old answer
+    /// would write to a node that now rejects writes.
+    pub fn master(&self) -> String {
+        for _ in 0..100 {
+            for m in &self.members {
+                if self.role_of(m).as_deref() == Some("master") {
+                    return m.clone();
+                }
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        panic!("pair {:?} has no reachable master", self.members);
+    }
+
+    pub fn replica(&self) -> Option<String> {
+        let master = self.master();
+        self.members.iter().find(|m| **m != master).cloned()
+    }
+
+    /// Steady state: a live replica, fully converged in sequence. The same
+    /// gate the local harness applies, read from the master's own view.
+    pub fn wait_healthy(&self, budget: Duration) -> bool {
+        let start = Instant::now();
+        while start.elapsed() < budget {
+            let m = self.master();
+            let info = self.info(&m);
+            let live = info.get("live_replicas").is_some_and(|v| v.trim() != "0");
+            let converged = info
+                .get("seq_lag")
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .is_some_and(|l| l == 0);
+            if live && converged {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        false
+    }
+
+    fn info(&self, addr: &str) -> std::collections::HashMap<String, String> {
+        let mut out = std::collections::HashMap::new();
+        if let Ok(mut c) = Client::connect_addr(addr, &self.tls)
+            && let Ok(Value::Bulk(Some(raw))) = c.call(&[b"FLINTINFO"])
+        {
+            for line in String::from_utf8_lossy(&raw).lines() {
+                if let Some((k, v)) = line.split_once(':') {
+                    out.insert(k.to_string(), v.trim().to_string());
+                }
+            }
+        }
+        out
+    }
+
+    /// Kill a seat and, if it was the master, wait for the fleet's own
+    /// controller to promote the survivor. The harness never promotes here:
+    /// on a real fleet that decision belongs to flint-controller, and taking
+    /// it away would test the harness instead of the product.
+    pub fn kill(&self, addr: &str) -> Result<(), String> {
+        let was_master = self.role_of(addr).as_deref() == Some("master");
+        if was_master {
+            self.master_kills.set(self.master_kills.get() + 1);
+        } else {
+            self.replica_kills.set(self.replica_kills.get() + 1);
+        }
+        let survivor = self.members.iter().find(|m| *m != addr).cloned();
+        self.ctl(&["kill-node", addr])?;
+        if was_master && let Some(s) = survivor {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while Instant::now() < deadline {
+                if self.role_of(&s).as_deref() == Some("master") {
+                    return Ok(());
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            return Err(format!("controller did not promote {s} within 30s"));
+        }
+        Ok(())
+    }
+
+    /// Bring a killed seat back. Always wiped and re-seeded from the CURRENT
+    /// master, which after a failover is its old peer.
+    pub fn restart(&self, addr: &str) -> Result<(), String> {
+        self.ctl(&["restart-node", addr]).map(|_| ())
+    }
+
+    pub fn members(&self) -> &[String] {
+        &self.members
+    }
+
+    pub fn kills(&self) -> (u32, u32) {
+        (self.master_kills.get(), self.replica_kills.get())
+    }
+}
+
+/// The fleet under test, however it got there.
+///
+/// One workload and one oracle drive both: a harness-spawned local pair, and
+/// a real flintctl-managed fleet whose seats may be on different machines.
+/// The alternative — a second copy of the write loop for the attached case —
+/// would mean the corruption checks that matter most ran against a DIFFERENT
+/// implementation on the topology they matter most on.
+pub enum Target {
+    Local {
+        cluster: Cluster,
+        controller_driven: bool,
+    },
+    Attached(Attached),
+}
+
+impl Target {
+    /// A client on whoever is master now.
+    pub fn master_client(&self) -> std::io::Result<Client> {
+        match self {
+            Target::Local { cluster, .. } => Client::connect(cluster.master()),
+            Target::Attached(a) => Client::connect_addr(&a.master(), a.tls()),
+        }
+    }
+
+    pub fn wait_healthy(&self, budget: Duration) -> bool {
+        match self {
+            Target::Local { cluster, .. } => cluster.wait_healthy(budget),
+            Target::Attached(a) => a.wait_healthy(budget),
+        }
+    }
+
+    pub fn kill_master(&mut self) {
+        match self {
+            Target::Local {
+                cluster,
+                controller_driven,
+            } => {
+                if *controller_driven {
+                    cluster.kill_master_await_controller();
+                } else {
+                    cluster.kill_master();
+                }
+            }
+            Target::Attached(a) => {
+                let dead = a.master();
+                a.kill(&dead).unwrap_or_else(|e| panic!("kill master: {e}"));
+                // Bring the dead seat back as a replica of the survivor that
+                // was just promoted. Same fixed address, fresh data.
+                a.restart(&dead)
+                    .unwrap_or_else(|e| panic!("restart {dead}: {e}"));
+            }
+        }
+    }
+
+    pub fn kill_replica(&mut self) {
+        match self {
+            Target::Local {
+                cluster,
+                controller_driven,
+            } => {
+                if *controller_driven {
+                    cluster.kill_replica_fixed();
+                } else {
+                    cluster.kill_replica();
+                }
+            }
+            Target::Attached(a) => {
+                let Some(r) = a.replica() else {
+                    panic!("pair has no replica to kill");
+                };
+                a.kill(&r).unwrap_or_else(|e| panic!("kill replica: {e}"));
+                a.restart(&r).unwrap_or_else(|e| panic!("restart {r}: {e}"));
+            }
+        }
+    }
+
+    pub fn kills(&self) -> (u32, u32) {
+        match self {
+            Target::Local { cluster, .. } => (cluster.master_kills, cluster.replica_kills),
+            Target::Attached(a) => a.kills(),
+        }
+    }
+}
 
 pub fn arg<T: std::str::FromStr>(name: &str, default: T) -> T {
     std::env::args()
@@ -24,13 +311,24 @@ pub fn arg<T: std::str::FromStr>(name: &str, default: T) -> T {
 }
 
 pub struct Client {
-    stream: TcpStream,
+    stream: flint_tls::Stream,
     buf: Vec<u8>,
 }
 
 impl Client {
     pub fn connect(port: u16) -> std::io::Result<Self> {
-        let stream = TcpStream::connect(("127.0.0.1", port))?;
+        Self::connect_addr(&format!("127.0.0.1:{port}"), &None)
+    }
+
+    /// Dial any address, optionally over the internal mesh.
+    ///
+    /// A harness-spawned fleet is plaintext loopback; a real one is mTLS on
+    /// real addresses. Same client either way — only the config differs.
+    pub fn connect_addr(
+        addr: &str,
+        tls: &Option<std::sync::Arc<flint_tls::ClientConfig>>,
+    ) -> std::io::Result<Self> {
+        let stream = flint_tls::connect(addr, tls)?;
         stream.set_read_timeout(Some(Duration::from_millis(1500)))?;
         Ok(Self {
             stream,

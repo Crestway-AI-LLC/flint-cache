@@ -10,6 +10,8 @@ publish.workspace = true
 [dependencies]
 flint-resp = { path = "../flint-resp" }
 flint-slot = { path = "../flint-slot" }
+# Attached mode talks to a REAL fleet, whose node ports speak internal mTLS.
+flint-tls = { path = "../flint-tls" }
 rand = { version = "0.9", features = ["small_rng"] }
 
 [lints]
