@@ -4,6 +4,16 @@ The pre-release ritual, in order. CI enforces the first block; the drill
 and chaos blocks are deliberately manual (minutes-long, randomized) and
 MUST be run before tagging.
 
+**Run it, don't retype it:**
+
+    tools/gates.sh
+
+That script IS sections 1-4 below, in this order, and it keeps every step's
+output under `/tmp/flint-gates` so a failure can be read instead of
+reproduced. This document stays as the explanation of why each step exists
+and what it is allowed to be red about; the script is what actually runs.
+Retyping the list is how a step silently leaves the gate.
+
 ## 1. Gates (CI order — fmt first)
 
     cargo fmt --all --check
@@ -94,7 +104,7 @@ the tag annotation — the pipeline records it in the manifest, and
 
 Pushing the tag to the fleet repo runs the release pipeline: tests on
 both workspaces against the exact bits shipped, then ONE artifact —
-the 12-binary Linux bundle plus `manifest.json` (version, bundle URL,
+the 14-binary Linux bundle plus `manifest.json` (version, bundle URL,
 sha256, format_break, public commit) attached to a GitHub release.
 Deploying is then one command (or the ops portal's Canary-upgrade
 button): download, verify the sha256, unpack into the inventory's bins

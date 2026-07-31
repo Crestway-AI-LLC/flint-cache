@@ -173,10 +173,49 @@ impl Drop for FullSyncGuard {
 // mem-only build never dials out.
 #[cfg_attr(not(feature = "rocks"), allow(dead_code))]
 /// The build stamp surfaced in FLINTINFO — what canary rollouts gate on.
-/// FLINT_BUILD_VERSION overrides (deploy artifacts stamp themselves);
-/// otherwise the crate version.
+///
+/// Precedence, and the ORDER is the whole fix:
+///
+///   1. `FLINT_RELEASE_TAG`, baked in at COMPILE time by the release build.
+///   2. `FLINT_BUILD_VERSION` from the environment, for unstamped builds.
+///   3. The crate version.
+///
+/// It used to be (2) then (3), which made the stamp a property of whoever
+/// LAUNCHED the process rather than of the binary on disk. Only `flintctl
+/// upgrade` injects that variable, so every other spawn path — `start`,
+/// `restart-node`, and systemd's `Restart=on-failure`, which flintctl cannot
+/// reach at all — left a node reporting `0.0.1` out of a perfectly good
+/// release binary. Seen live: `restart-node` on the playground produced
+/// `FAIL single build across the fleet {"0.0.1", "v0.1.0-rc.16"}` for two
+/// nodes running the SAME file. That is worse than cosmetic — it means
+/// `verify` cannot be put on a schedule, because a legitimate restart leaves
+/// it red until the next upgrade, and a check that is routinely red for a
+/// non-problem stops being read.
+///
+/// The baked value deliberately WINS over the environment, which also turns
+/// `upgrade`'s post-roll build assertion from a tautology into a real check:
+/// flintctl set the variable and then verified the value it had just set, so
+/// the assertion passed even when the staged binary was still the old one.
 fn build_version() -> String {
-    std::env::var("FLINT_BUILD_VERSION").unwrap_or_else(|_| env!("CARGO_PKG_VERSION").to_string())
+    resolve_build_version(
+        option_env!("FLINT_RELEASE_TAG"),
+        std::env::var("FLINT_BUILD_VERSION").ok(),
+        env!("CARGO_PKG_VERSION"),
+    )
+}
+
+/// The precedence itself, separated from where the three values come from.
+///
+/// Split out because the ORDER is the fix and the inputs are otherwise
+/// untestable: `option_env!` resolves at compile time, so a test of
+/// `build_version()` could only ever observe the one combination this
+/// particular build happened to be compiled with — which is precisely the
+/// case that was wrong before.
+fn resolve_build_version(baked: Option<&str>, env: Option<String>, crate_version: &str) -> String {
+    baked
+        .map(str::to_string)
+        .or(env)
+        .unwrap_or_else(|| crate_version.to_string())
 }
 
 // Callers are all rocks-gated dial sites (replication/migration/cutover);
@@ -221,6 +260,14 @@ fn journal_event(kind: flint_journal::EventKind, epoch: Option<String>, cause: &
 }
 
 fn main() -> std::io::Result<()> {
+    // Ask the binary what it is, without starting it. Until now the only way
+    // to tell which release a file was came from `ls -la` and process start
+    // times — inference, not an answer — and it is what the release build
+    // asserts against to prove the stamp actually landed.
+    if std::env::args().any(|a| a == "--build-version") {
+        println!("{}", build_version());
+        return Ok(());
+    }
     let port = arg("--port")
         .and_then(|p| p.parse::<u16>().ok())
         .unwrap_or(6380);
@@ -2432,6 +2479,51 @@ mod replica {
             last_seq: *last_seq as u64,
             ops,
         })
+    }
+}
+
+#[cfg(test)]
+mod build_version_tests {
+    use super::resolve_build_version;
+
+    /// The regression this file exists for. The stamp must be a property of
+    /// the BINARY, not of whoever launched it: `flintctl upgrade` injects
+    /// FLINT_BUILD_VERSION, but `start`, `restart-node` and systemd do not,
+    /// and a node that reports a different version depending on who started
+    /// it makes `flintctl verify` fail on a fleet that is perfectly uniform.
+    #[test]
+    fn a_baked_tag_outranks_whatever_the_launcher_says() {
+        assert_eq!(
+            resolve_build_version(
+                Some("v0.1.0-rc.21"),
+                Some("v0.0.9-whatever".into()),
+                "0.0.1"
+            ),
+            "v0.1.0-rc.21"
+        );
+    }
+
+    /// Letting the baked tag win is also what makes `upgrade`'s post-roll
+    /// build assertion mean something: flintctl set the environment variable
+    /// and then checked the value it had just set, so the check passed even
+    /// when the staged binary was still the old one. With the tag compiled
+    /// in, that assertion reads the binary instead of its own argument.
+    #[test]
+    fn a_launcher_cannot_make_a_binary_claim_a_version_it_is_not() {
+        let claimed =
+            resolve_build_version(Some("v0.1.0-rc.21"), Some("v0.1.0-rc.22".into()), "0.0.1");
+        assert_ne!(claimed, "v0.1.0-rc.22");
+    }
+
+    /// Unstamped builds — every local `cargo build` — keep the old behaviour
+    /// so development and the existing drills are unaffected.
+    #[test]
+    fn without_a_baked_tag_the_environment_still_works() {
+        assert_eq!(
+            resolve_build_version(None, Some("v0.1.0-rc.20".into()), "0.0.1"),
+            "v0.1.0-rc.20"
+        );
+        assert_eq!(resolve_build_version(None, None, "0.0.1"), "0.0.1");
     }
 }
 

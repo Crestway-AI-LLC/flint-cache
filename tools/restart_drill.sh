@@ -18,7 +18,19 @@ trap cleanup EXIT
 echo "== drill: $KEYS keys, port $PORT, dir $DIR"
 
 "$BIN" --port "$PORT" --engine rocks --data-dir "$DIR" &
-sleep 0.5
+# WAIT for the port, do not guess at it. This was `sleep 0.5`, which is a bet
+# that the machine can start a just-linked binary in half a second — and the
+# first run after a build loses that bet, because the first exec pays for
+# signature validation and a cold page cache. The 100k-key load below then
+# hit a socket nobody was listening on and the drill died in one second with
+# no diagnosis, on a build that was fine. The restart phase further down
+# already polls for PONG; this start had no reason to differ.
+for _ in $(seq 1 200); do
+  [ "$(valkey-cli -p "$PORT" PING 2>/dev/null)" = "PONG" ] && break
+  sleep 0.05
+done
+[ "$(valkey-cli -p "$PORT" PING 2>/dev/null)" = "PONG" ] \
+  || { echo "FAIL: server never came up on $PORT"; exit 1; }
 
 echo "== loading $KEYS strings + 1000 hashes via valkey-cli --pipe"
 # Emit proper RESP arrays (flint speaks RESP only; inline commands are a

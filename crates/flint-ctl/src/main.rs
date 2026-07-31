@@ -2999,6 +2999,14 @@ fn decommission_node(
 /// transition aborts the roll — already-upgraded nodes stay (roll forward).
 fn upgrade(inv: &Inventory, version_tag: Option<String>, soak_ms: u64, nodes_only: bool) {
     let tls = tls_client(inv);
+    // Kept for binaries built before the tag was compiled in: release builds
+    // now bake FLINT_RELEASE_TAG, which OUTRANKS this variable, so on a
+    // current bundle the injection is inert and `expect` below compares
+    // against what the binary itself says. That matters — while flintctl was
+    // the only source of the stamp, setting the variable and then asserting
+    // the value it had just set proved nothing about which binary had
+    // actually been staged. Rolling ONTO an older build still needs it, so
+    // it stays until the fleet's floor is past the change.
     let envs: Vec<(String, String)> = version_tag
         .iter()
         .map(|t| ("FLINT_BUILD_VERSION".to_string(), t.clone()))
