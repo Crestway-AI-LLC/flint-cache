@@ -113,6 +113,23 @@ struct Inventory {
     ctl_poll_ms: Option<u64>,      // controller: failure-probe interval (RTO)
     ctl_confirm: Option<u32>,      // controller: consecutive fails to promote
     ctl_lease_ttl_ms: Option<u64>, // controller: master lease TTL
+    /// SSH login for seats that live on OTHER machines. Absent = every seat
+    /// is local, which is the single-host fleet every drill exercises.
+    ssh_user: Option<String>,
+    /// Optional identity file for those SSH hops (`-i`); absent = the agent
+    /// or the default key.
+    ssh_key: Option<String>,
+    /// Run the remote side under `sudo -n`. Packaged fleets keep the mesh key
+    /// root-only, so the login user cannot read `certs/int.key` or write
+    /// `/var/lib/flint` without it.
+    ssh_sudo: bool,
+    /// Which host runs proxies[i]. A proxy BINDS a wildcard (`0.0.0.0:7379`),
+    /// so unlike every other seat its address does not name its machine.
+    /// Positional with `proxy` lines; absent = local.
+    proxy_hosts: Vec<String>,
+    /// Which host runs the controller. It has no address of its own — it
+    /// dials the nodes rather than serving — so placement must be declared.
+    controller_host: Option<String>,
 }
 
 fn parse_inventory(path: &str) -> Inventory {
@@ -161,6 +178,13 @@ fn parse_inventory(path: &str) -> Inventory {
             "poll-ms" => inv.ctl_poll_ms = val.parse().ok(),
             "confirm" => inv.ctl_confirm = val.parse().ok(),
             "lease-ttl-ms" => inv.ctl_lease_ttl_ms = val.parse().ok(),
+            // Multi-host placement (see the Inventory struct). Omit them all
+            // and the fleet is single-host, byte for byte as before.
+            "ssh-user" => inv.ssh_user = Some(val.to_string()),
+            "ssh-key" => inv.ssh_key = Some(val.to_string()),
+            "ssh-sudo" => inv.ssh_sudo = val == "on",
+            "proxy-host" => inv.proxy_hosts.push(val.to_string()),
+            "controller-host" => inv.controller_host = Some(val.to_string()),
             other => panic!("inventory: unknown key {other:?}"),
         }
     }
@@ -455,28 +479,358 @@ fn info_field(
 // parent left to wait() — macOS/launchd reparents them — so the zombie
 // lint does not apply to this design.
 #[allow(clippy::zombie_processes)]
-fn spawn_env(inv: &Inventory, name: &str, bin: &str, args: &[String], envs: &[(String, String)]) {
-    let d = &inv.statedir;
-    let log = std::fs::File::create(format!("{d}/logs/{name}.log")).expect("log file");
-    let mut cmd = Command::new(format!("{}/{bin}", inv.bins));
+/// Which MACHINE a fleet seat's process lives on.
+///
+/// v1 ran every process on the machine flintctl itself runs on, and the
+/// primitives quietly assume it: `wait_port_free` proves a port is free by
+/// BINDING it, `pids_matching` reads `ps`, a pidfile is a path on one disk.
+/// Each is a statement about a single host, and each is silently wrong when
+/// aimed at a seat somewhere else — `kill_pidfile` in particular would read a
+/// local pidfile, find nothing, and report success.
+///
+/// So a remote seat does not get a reimplementation of those checks over ssh;
+/// it gets the SAME code, executed on the host it is about, by invoking that
+/// host's own `flintctl host-*`. One implementation of each invariant, two
+/// transports. Reimplementing them as shell one-liners is exactly how rc.15
+/// shipped a port check that could never pass on Linux.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Runner {
+    Local,
+    Ssh {
+        target: String,
+        key: Option<String>,
+        sudo: bool,
+    },
+}
+
+/// Single-quote for `sh -c`: wrap in quotes, and close/escape/reopen for any
+/// embedded quote. Fleet arguments carry statedir paths and tokens; one
+/// unquoted space would silently truncate an argument list.
+fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+impl Runner {
+    /// The argv that runs `argv` on this runner's host.
+    fn wrap(&self, argv: &[String]) -> Vec<String> {
+        match self {
+            Runner::Local => argv.to_vec(),
+            Runner::Ssh { target, key, sudo } => {
+                let mut out: Vec<String> = vec!["ssh".into(), "-o".into(), "BatchMode=yes".into()];
+                out.extend([
+                    "-o".to_string(),
+                    "StrictHostKeyChecking=accept-new".to_string(),
+                    "-o".to_string(),
+                    "ConnectTimeout=10".to_string(),
+                ]);
+                if let Some(k) = key {
+                    out.extend(["-i".to_string(), k.clone()]);
+                }
+                out.push(target.clone());
+                let remote = argv
+                    .iter()
+                    .map(|a| sh_quote(a))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                out.push(if *sudo {
+                    format!("sudo -n {remote}")
+                } else {
+                    remote
+                });
+                out
+            }
+        }
+    }
+
+    fn output(&self, argv: &[String]) -> std::io::Result<std::process::Output> {
+        let full = self.wrap(argv);
+        Command::new(&full[0]).args(&full[1..]).output()
+    }
+
+    /// Copy a local file to `dst` on this runner's host.
+    ///
+    /// Staged through /tmp then `install`ed, because the destinations are
+    /// root-owned (`/var/lib/flint/certs`, `/opt/flint/bin`) and scp runs as
+    /// the login user.
+    fn send_file(&self, src: &str, dst: &str, mode: &str) -> Result<(), String> {
+        match self {
+            Runner::Local => {
+                if src == dst {
+                    return Ok(());
+                }
+                if let Some(parent) = std::path::Path::new(dst).parent() {
+                    std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {dst}: {e}"))?;
+                }
+                std::fs::copy(src, dst)
+                    .map(|_| ())
+                    .map_err(|e| format!("copy {src} -> {dst}: {e}"))
+            }
+            Runner::Ssh { target, key, .. } => {
+                let base = std::path::Path::new(dst)
+                    .file_name()
+                    .map(|f| f.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "flint-push".into());
+                let stage = format!("/tmp/flintctl-push-{base}");
+                let mut scp: Vec<String> = vec!["scp".into(), "-o".into(), "BatchMode=yes".into()];
+                scp.extend([
+                    "-o".to_string(),
+                    "StrictHostKeyChecking=accept-new".to_string(),
+                ]);
+                if let Some(k) = key {
+                    scp.extend(["-i".to_string(), k.clone()]);
+                }
+                scp.push(src.to_string());
+                scp.push(format!("{target}:{stage}"));
+                let out = Command::new(&scp[0])
+                    .args(&scp[1..])
+                    .output()
+                    .map_err(|e| format!("scp {src}: {e}"))?;
+                if !out.status.success() {
+                    return Err(format!(
+                        "scp {src} -> {target}: {}",
+                        String::from_utf8_lossy(&out.stderr).trim()
+                    ));
+                }
+                let install = vec![
+                    "install".to_string(),
+                    "-D".to_string(),
+                    "-m".to_string(),
+                    mode.to_string(),
+                    stage.clone(),
+                    dst.to_string(),
+                ];
+                let out = self
+                    .output(&install)
+                    .map_err(|e| format!("install {dst}: {e}"))?;
+                if !out.status.success() {
+                    return Err(format!(
+                        "install {dst} on {target}: {}",
+                        String::from_utf8_lossy(&out.stderr).trim()
+                    ));
+                }
+                let _ = self.output(&["rm".to_string(), "-f".to_string(), stage]);
+                Ok(())
+            }
+        }
+    }
+
+    fn label(&self) -> String {
+        match self {
+            Runner::Local => "local".into(),
+            Runner::Ssh { target, .. } => target.clone(),
+        }
+    }
+
+    fn is_remote(&self) -> bool {
+        matches!(self, Runner::Ssh { .. })
+    }
+}
+
+/// True when `host` names an address THIS machine holds.
+///
+/// Binding it is the proof — the same discipline `wait_port_free` rests on.
+/// Binding port 0 on an address you own succeeds; on another machine's
+/// address it fails with EADDRNOTAVAIL. That beats parsing `ifconfig`, and it
+/// needs no dependency.
+fn is_local_host(host: &str) -> bool {
+    use std::net::{IpAddr, TcpListener, ToSocketAddrs};
+    use std::sync::{Mutex, OnceLock};
+    if host.is_empty() || host == "0.0.0.0" || host == "::" || host == "localhost" {
+        return true;
+    }
+    static MEMO: OnceLock<Mutex<std::collections::HashMap<String, bool>>> = OnceLock::new();
+    let memo = MEMO.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    if let Ok(m) = memo.lock()
+        && let Some(hit) = m.get(host)
+    {
+        return *hit;
+    }
+    let ips: Vec<IpAddr> = match host.parse::<IpAddr>() {
+        Ok(ip) => vec![ip],
+        // A DNS name has to be resolved before it can be judged.
+        Err(_) => (host, 0u16)
+            .to_socket_addrs()
+            .map(|it| it.map(|s| s.ip()).collect())
+            .unwrap_or_default(),
+    };
+    let local = ips.iter().any(|ip| TcpListener::bind((*ip, 0)).is_ok());
+    if let Ok(mut m) = memo.lock() {
+        m.insert(host.to_string(), local);
+    }
+    local
+}
+
+/// The host part of `host:port` (IPv6 literals keep their brackets).
+fn host_of(addr: &str) -> &str {
+    match addr.rsplit_once(':') {
+        Some((h, _)) => h,
+        None => addr,
+    }
+}
+
+fn runner_for_host(inv: &Inventory, host: &str) -> Runner {
+    if is_local_host(host) {
+        return Runner::Local;
+    }
+    let user = inv.ssh_user.as_deref().unwrap_or_else(|| {
+        die(&format!(
+            "inventory places a seat on {host}, which is not this machine, but declares no \
+             `ssh-user` — flintctl cannot start or stop a process it has no way to reach"
+        ))
+    });
+    Runner::Ssh {
+        target: format!("{user}@{host}"),
+        key: inv.ssh_key.clone(),
+        sudo: inv.ssh_sudo,
+    }
+}
+
+/// The runner for the machine serving `addr`.
+fn runner_for(inv: &Inventory, addr: &str) -> Runner {
+    runner_for_host(inv, host_of(addr))
+}
+
+/// Proxies bind a wildcard, so their address does not name their machine —
+/// `proxy-host` does, positionally.
+fn proxy_runner(inv: &Inventory, i: usize) -> Runner {
+    match inv.proxy_hosts.get(i) {
+        Some(h) => runner_for_host(inv, h),
+        None => runner_for(inv, &inv.proxies[i]),
+    }
+}
+
+/// The controller serves nothing, so it has no address to derive from.
+fn controller_runner(inv: &Inventory) -> Runner {
+    match &inv.controller_host {
+        Some(h) => runner_for_host(inv, h),
+        None => Runner::Local,
+    }
+}
+
+fn agent_runner(inv: &Inventory) -> Runner {
+    match &inv.agent {
+        Some(a) => runner_for(inv, a),
+        None => Runner::Local,
+    }
+}
+
+/// Every distinct machine this inventory places a seat on.
+fn all_runners(inv: &Inventory) -> Vec<Runner> {
+    let mut out = vec![Runner::Local];
+    let mut push = |r: Runner| {
+        if !out.contains(&r) {
+            out.push(r);
+        }
+    };
+    push(runner_for(inv, &inv.cp[0]));
+    for pair in &inv.pairs {
+        for node in pair {
+            push(runner_for(inv, node));
+        }
+    }
+    for i in 0..inv.proxies.len() {
+        push(proxy_runner(inv, i));
+    }
+    if inv.controller {
+        push(controller_runner(inv));
+    }
+    if inv.agent.is_some() {
+        push(agent_runner(inv));
+    }
+    out
+}
+
+fn spawn_env(
+    inv: &Inventory,
+    r: &Runner,
+    name: &str,
+    bin: &str,
+    args: &[String],
+    envs: &[(String, String)],
+) {
+    if let Runner::Ssh { .. } = r {
+        let mut argv = vec![
+            format!("{}/flintctl", inv.bins),
+            "host-spawn".into(),
+            inv.statedir.clone(),
+            inv.bins.clone(),
+            name.to_string(),
+            bin.to_string(),
+        ];
+        for (k, v) in envs {
+            argv.push("--env".into());
+            argv.push(format!("{k}={v}"));
+        }
+        argv.push("--".into());
+        argv.extend(args.iter().cloned());
+        let out = r
+            .output(&argv)
+            .unwrap_or_else(|e| panic!("spawn {name} on {}: {e}", r.label()));
+        let text = String::from_utf8_lossy(&out.stdout);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success(),
+            "spawn {name} on {}: {}",
+            r.label(),
+            err.trim()
+        );
+        eprintln!("  started {name} on {} ({})", r.label(), text.trim());
+        return;
+    }
+    local_spawn_env(&inv.statedir, &inv.bins, name, bin, args, envs);
+}
+
+/// Start one seat on THIS machine, recording its pid.
+fn local_spawn_env(
+    statedir: &str,
+    bins: &str,
+    name: &str,
+    bin: &str,
+    args: &[String],
+    envs: &[(String, String)],
+) {
+    let log = std::fs::File::create(format!("{statedir}/logs/{name}.log")).expect("log file");
+    let mut cmd = Command::new(format!("{bins}/{bin}"));
     cmd.args(args);
     for (k, v) in envs {
         cmd.env(k, v);
     }
+    // Deliberately never waited on: these are the fleet's long-lived daemons,
+    // and flintctl exits while they keep serving. Their lifecycle is the
+    // pidfile plus `stop_seat`, not this process's exit status.
+    #[allow(clippy::zombie_processes)]
     let child = cmd
         .stdout(std::process::Stdio::null())
         .stderr(log)
         .spawn()
         .unwrap_or_else(|e| panic!("spawn {bin} ({name}): {e}"));
-    std::fs::write(format!("{d}/pids/{name}.pid"), child.id().to_string()).expect("pidfile");
+    std::fs::write(
+        format!("{statedir}/pids/{name}.pid"),
+        child.id().to_string(),
+    )
+    .expect("pidfile");
     eprintln!("  started {name} (pid {})", child.id());
 }
 
-fn spawn(inv: &Inventory, name: &str, bin: &str, args: &[String]) {
-    spawn_env(inv, name, bin, args, &[]);
+fn spawn(inv: &Inventory, r: &Runner, name: &str, bin: &str, args: &[String]) {
+    spawn_env(inv, r, name, bin, args, &[]);
 }
 
-fn kill_pidfile(dir: &str, name: &str) {
+fn kill_pidfile(inv: &Inventory, r: &Runner, name: &str) {
+    if r.is_remote() {
+        let argv = vec![
+            format!("{}/flintctl", inv.bins),
+            "host-kill-pidfile".into(),
+            inv.statedir.clone(),
+            name.to_string(),
+        ];
+        let _ = r.output(&argv);
+        return;
+    }
+    local_kill_pidfile(&inv.statedir, name);
+}
+
+fn local_kill_pidfile(dir: &str, name: &str) {
     let path = format!("{dir}/pids/{name}.pid");
     if let Ok(pid) = std::fs::read_to_string(&path) {
         let _ = Command::new("kill").args(["-9", pid.trim()]).status();
@@ -568,12 +922,49 @@ fn wait_port_free(port: u16, budget: Duration) -> Result<(), String> {
 
 fn stop_seat(
     inv: &Inventory,
+    r: &Runner,
     name: &str,
     bin: &str,
     ident: &str,
     port: Option<u16>,
 ) -> Result<(), String> {
-    kill_pidfile(&inv.statedir, name);
+    if r.is_remote() {
+        // The whole point of stop_seat is proving a fact about one machine.
+        // Ask that machine.
+        let mut argv = vec![
+            format!("{}/flintctl", inv.bins),
+            "host-stop-seat".into(),
+            inv.statedir.clone(),
+            name.to_string(),
+            bin.to_string(),
+            ident.to_string(),
+        ];
+        if let Some(p) = port {
+            argv.push(p.to_string());
+        }
+        let out = r
+            .output(&argv)
+            .map_err(|e| format!("stop {name} on {}: {e}", r.label()))?;
+        if out.status.success() {
+            return Ok(());
+        }
+        return Err(format!(
+            "{name} on {}: {}",
+            r.label(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    local_stop_seat(&inv.statedir, name, bin, ident, port)
+}
+
+fn local_stop_seat(
+    statedir: &str,
+    name: &str,
+    bin: &str,
+    ident: &str,
+    port: Option<u16>,
+) -> Result<(), String> {
+    local_kill_pidfile(statedir, name);
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let alive = pids_matching(bin, ident);
@@ -626,7 +1017,57 @@ const FLEET_BINARIES: [&str; 5] = [
 /// the proxy with no statedir-derived path in its arguments; that one is
 /// only reachable through its pidfile. Every packaged/production fleet is
 /// TLS-on, where all five carry it.
+/// Sweep every machine the inventory places a seat on — an orphan on host C
+/// is exactly as harmful as one here, and rather harder to notice.
 fn sweep_orphans(inv: &Inventory) -> usize {
+    let mut killed = 0;
+    for r in all_runners(inv) {
+        if r.is_remote() {
+            let argv = vec![
+                format!("{}/flintctl", inv.bins),
+                "host-sweep".into(),
+                inv.statedir.clone(),
+            ];
+            if let Ok(out) = r.output(&argv) {
+                let n: usize = String::from_utf8_lossy(&out.stdout)
+                    .trim()
+                    .parse()
+                    .unwrap_or(0);
+                if n > 0 {
+                    eprintln!("  swept {n} orphan(s) on {}", r.label());
+                }
+                killed += n;
+            }
+        } else {
+            killed += local_sweep_orphans(&inv.statedir);
+        }
+    }
+    killed
+}
+
+/// Kill every seat THIS machine's pidfiles name.
+fn local_stop_all(statedir: &str) {
+    match std::fs::read_dir(format!("{statedir}/pids")) {
+        Ok(entries) => {
+            for e in entries.flatten() {
+                let name = e
+                    .file_name()
+                    .to_string_lossy()
+                    .trim_end_matches(".pid")
+                    .to_string();
+                local_kill_pidfile(statedir, &name);
+                println!("stopped {name}");
+                eprintln!("  stopped {name}");
+            }
+        }
+        // Missing pidfiles is exactly when the sweep matters most (the
+        // directory was wiped, or a start never recorded), so fall through
+        // rather than returning early.
+        Err(_) => eprintln!("  no pidfiles — sweeping by process instead"),
+    }
+}
+
+fn local_sweep_orphans(statedir: &str) -> usize {
     let Ok(out) = Command::new("ps").args(["-eo", "pid=,args="]).output() else {
         return 0;
     };
@@ -639,7 +1080,7 @@ fn sweep_orphans(inv: &Inventory) -> usize {
         let Ok(pid) = pid.trim().parse::<u32>() else {
             continue;
         };
-        if pid == me || !args.contains(inv.statedir.as_str()) {
+        if pid == me || !args.contains(statedir) {
             continue;
         }
         if !FLEET_BINARIES.iter().any(|b| args.contains(b)) {
@@ -843,6 +1284,94 @@ fn mint_certs(inv: &Inventory) {
     eprintln!("  minted internal CA + component cert + edge cert");
 }
 
+/// Copy the minted certs to every OTHER machine in the fleet.
+///
+/// This is a file copy rather than a PKI exercise because the mesh does not
+/// use per-host identities: every component presents the same `int` leaf, and
+/// internal dials verify a FIXED name (`flint_tls::INTERNAL_SNI`) instead of
+/// the address they connected to. So a node on another continent needs the
+/// same three files and nothing else.
+///
+/// The edge cert is different — clients DO verify the address they dialed —
+/// but its SANs come from the inventory's `edge-san` lines, so it too is
+/// correct everywhere once minted. It only goes to proxy hosts, which are the
+/// only seats that serve it.
+fn push_certs(inv: &Inventory) {
+    let d = format!("{}/certs", inv.statedir);
+    let proxy_hosts: Vec<Runner> = (0..inv.proxies.len())
+        .map(|i| proxy_runner(inv, i))
+        .collect();
+    for r in all_runners(inv) {
+        if !r.is_remote() {
+            continue;
+        }
+        for (f, mode) in [("ca.crt", "644"), ("int.crt", "644"), ("int.key", "600")] {
+            if let Err(e) = r.send_file(&format!("{d}/{f}"), &format!("{d}/{f}"), mode) {
+                die(&format!("distributing {f} to {}: {e}", r.label()));
+            }
+        }
+        if inv.client_tls && proxy_hosts.contains(&r) {
+            for (f, mode) in [("edge.crt", "644"), ("edge.key", "600")] {
+                if let Err(e) = r.send_file(&format!("{d}/{f}"), &format!("{d}/{f}"), mode) {
+                    die(&format!("distributing {f} to {}: {e}", r.label()));
+                }
+            }
+        }
+        eprintln!("  certs -> {}", r.label());
+    }
+}
+
+/// `flintctl push-bins <tarball>`: stage a release bundle into every host's
+/// bins dir.
+///
+/// `upgrade` rolls whatever is staged; it does not fetch. On a single host
+/// that staging is a manual `tar x`, and this is the same act for a fleet.
+///
+/// Note the ordering hazard it inherits: the orchestrator's OWN flintctl is
+/// among the binaries replaced, so a release that fixes a bug in the roll path
+/// cannot roll itself out with the broken one. Unpack first, then upgrade.
+fn push_bins(inv: &Inventory, tarball: &str) {
+    assert!(
+        std::path::Path::new(tarball).exists(),
+        "no such bundle: {tarball}"
+    );
+    for r in all_runners(inv) {
+        let staged = format!(
+            "/tmp/{}",
+            std::path::Path::new(tarball)
+                .file_name()
+                .map(|f| f.to_string_lossy().to_string())
+                .unwrap_or_else(|| "flint-bundle.tar.gz".into())
+        );
+        if r.is_remote()
+            && let Err(e) = r.send_file(tarball, &staged, "644")
+        {
+            die(&format!("staging bundle on {}: {e}", r.label()));
+        }
+        let src = if r.is_remote() {
+            staged
+        } else {
+            tarball.to_string()
+        };
+        let argv = vec![
+            "tar".to_string(),
+            "xzf".to_string(),
+            src,
+            "-C".to_string(),
+            inv.bins.clone(),
+        ];
+        match r.output(&argv) {
+            Ok(out) if out.status.success() => eprintln!("  bins -> {}", r.label()),
+            Ok(out) => die(&format!(
+                "unpacking on {}: {}",
+                r.label(),
+                String::from_utf8_lossy(&out.stderr).trim()
+            )),
+            Err(e) => die(&format!("unpacking on {}: {e}", r.label())),
+        }
+    }
+}
+
 /// (Re-)sign the LEAF certs — the mesh cert (int) and the edge cert — from
 /// the existing CA, fresh keypairs each time. Used at bootstrap and by
 /// `rotate-certs` (ADR-0006 D4): overwriting int.crt/int.key in place makes
@@ -946,7 +1475,13 @@ fn start_pair_nodes(inv: &Inventory, pair: &[String]) {
         }
         args.extend(internal_args(inv));
         args.extend(node_tuning_args(inv));
-        spawn(inv, &format!("node-{port}"), "flint-server", &args);
+        spawn(
+            inv,
+            &runner_for(inv, addr),
+            &format!("node-{port}"),
+            "flint-server",
+            &args,
+        );
         // The master must be up before its replicas dial in.
         if i == 0 {
             std::thread::sleep(Duration::from_millis(700));
@@ -1079,7 +1614,13 @@ fn controller_args(inv: &Inventory) -> Vec<String> {
 }
 
 fn start_controller(inv: &Inventory) {
-    spawn(inv, "controller", "flint-controller", &controller_args(inv));
+    spawn(
+        inv,
+        &controller_runner(inv),
+        "controller",
+        "flint-controller",
+        &controller_args(inv),
+    );
 }
 
 /// First-time bring-up: mint certs, spawn, REGISTER the topology.
@@ -1101,6 +1642,21 @@ fn launch(inv: &Inventory, register: bool) {
     for sub in ["logs", "pids", "snaps"] {
         std::fs::create_dir_all(format!("{d}/{sub}")).expect("statedir");
     }
+    // Remote hosts need the same skeleton before anything writes a log or a
+    // pidfile into it.
+    for r in all_runners(inv) {
+        if r.is_remote() {
+            let dirs: Vec<String> = ["logs", "pids", "snaps"]
+                .iter()
+                .map(|sub| format!("{d}/{sub}"))
+                .collect();
+            let mut argv = vec!["mkdir".to_string(), "-p".to_string()];
+            argv.extend(dirs);
+            if let Err(e) = r.output(&argv) {
+                die(&format!("preparing statedir on {}: {e}", r.label()));
+            }
+        }
+    }
     eprintln!(
         "== {} into {d} (tls {})",
         if register { "bootstrap" } else { "start" },
@@ -1108,12 +1664,19 @@ fn launch(inv: &Inventory, register: bool) {
     );
     if register && inv.tls {
         mint_certs(inv);
+        push_certs(inv);
     }
     let tls = tls_client(inv);
 
     // 1. Control plane, then the registry (proxies + pairs).
     let cp = &inv.cp[0];
-    spawn(inv, "cp", "flint-controlplane", &cp_args(inv));
+    spawn(
+        inv,
+        &runner_for(inv, cp),
+        "cp",
+        "flint-controlplane",
+        &cp_args(inv),
+    );
     assert!(
         wait_pong(cp, &tls, Duration::from_secs(10)),
         "control plane up"
@@ -1170,6 +1733,7 @@ fn launch(inv: &Inventory, register: bool) {
         // registered.
         spawn(
             inv,
+            &proxy_runner(inv, i),
             &format!("proxy-{}", port_of(proxy)),
             "flint-proxy",
             &proxy_args(inv, i),
@@ -1205,6 +1769,7 @@ fn launch(inv: &Inventory, register: bool) {
     if inv.agent.is_some() {
         spawn(
             inv,
+            &agent_runner(inv),
             "agent",
             "flint-agent",
             &agent_args(inv).expect("agent args"),
@@ -1725,7 +2290,7 @@ fn expand(inv: &Inventory, inventory_path: &str, pair_spec: &str) {
     inv2.pairs.push(pair);
     if inv.controller {
         let t0 = now_ms();
-        kill_pidfile(&inv.statedir, "controller");
+        kill_pidfile(inv, &controller_runner(inv), "controller");
         start_controller(&inv2);
         wait_supervised(&inv2, inv2.pairs.len(), t0);
         eprintln!(
@@ -1775,7 +2340,13 @@ fn add_replica(inv: &Inventory, inventory_path: &str, pair_ref: &str, new: &str)
     ];
     args.extend(internal_args(inv));
     args.extend(node_tuning_args(inv));
-    spawn(inv, &format!("node-{port}"), "flint-server", &args);
+    spawn(
+        inv,
+        &runner_for(inv, new),
+        &format!("node-{port}"),
+        "flint-server",
+        &args,
+    );
     assert!(
         wait_pong(new, &tls, Duration::from_secs(15)),
         "new replica up"
@@ -1811,7 +2382,7 @@ fn add_replica(inv: &Inventory, inventory_path: &str, pair_ref: &str, new: &str)
         let t0 = now_ms();
         let mut inv2 = inv.clone();
         inv2.pairs[pair_idx] = members;
-        kill_pidfile(d, "controller");
+        kill_pidfile(inv, &controller_runner(inv), "controller");
         start_controller(&inv2);
         wait_supervised(&inv2, inv2.pairs.len(), t0);
     }
@@ -1854,7 +2425,13 @@ fn swap_node(inv: &Inventory, inventory_path: &str, bad: &str, new: &str) {
     ];
     args.extend(internal_args(inv));
     args.extend(node_tuning_args(inv));
-    spawn(inv, &format!("node-{port}"), "flint-server", &args);
+    spawn(
+        inv,
+        &runner_for(inv, new),
+        &format!("node-{port}"),
+        "flint-server",
+        &args,
+    );
     assert!(
         wait_pong(new, &tls, Duration::from_secs(15)),
         "replacement up"
@@ -1884,7 +2461,11 @@ fn swap_node(inv: &Inventory, inventory_path: &str, bad: &str, new: &str) {
             &["CPSETPAIR", &pair_idx.to_string(), &new_members.join(",")],
         ),
     );
-    kill_pidfile(d, &format!("node-{}", port_of(bad)));
+    kill_pidfile(
+        inv,
+        &runner_for(inv, bad),
+        &format!("node-{}", port_of(bad)),
+    );
 
     // Persist + reroll the controller onto the new membership.
     let raw = std::fs::read_to_string(inventory_path).expect("inventory");
@@ -1897,7 +2478,7 @@ fn swap_node(inv: &Inventory, inventory_path: &str, bad: &str, new: &str) {
         let t0 = now_ms();
         let mut inv2 = inv.clone();
         inv2.pairs[pair_idx] = new_members;
-        kill_pidfile(d, "controller");
+        kill_pidfile(inv, &controller_runner(inv), "controller");
         start_controller(&inv2);
         wait_supervised(&inv2, inv2.pairs.len(), t0);
     }
@@ -1969,6 +2550,7 @@ fn roll_node(
     let wipe = wipe || info_field(addr, &tls, "role:").as_deref() != Some("replica");
     stop_seat(
         inv,
+        &runner_for(inv, addr),
         &format!("node-{port}"),
         "flint-server",
         &format!("{d}/node-{port}"),
@@ -1997,7 +2579,14 @@ fn roll_node(
     ];
     args.extend(internal_args(inv));
     args.extend(node_tuning_args(inv));
-    spawn_env(inv, &format!("node-{port}"), "flint-server", &args, envs);
+    spawn_env(
+        inv,
+        &runner_for(inv, addr),
+        &format!("node-{port}"),
+        "flint-server",
+        &args,
+        envs,
+    );
     if !wait_pong(addr, &tls, Duration::from_secs(15)) {
         return Err(format!("{addr} did not come back after the binary swap"));
     }
@@ -2284,7 +2873,11 @@ fn decommission_node(
     );
     eprintln!("  draining {drain_ms}ms for proxies to route off {addr} (still serving)");
     std::thread::sleep(Duration::from_millis(drain_ms));
-    kill_pidfile(&inv.statedir, &format!("node-{}", port_of(addr)));
+    kill_pidfile(
+        inv,
+        &runner_for(inv, addr),
+        &format!("node-{}", port_of(addr)),
+    );
     let raw = std::fs::read_to_string(inventory_path).expect("inventory");
     let updated = raw.replace(
         &format!("pair {}", members.join(",")),
@@ -2295,7 +2888,7 @@ fn decommission_node(
         let t0 = now_ms();
         let mut inv2 = inv.clone();
         inv2.pairs[pair_idx] = remaining;
-        kill_pidfile(&inv.statedir, "controller");
+        kill_pidfile(inv, &controller_runner(inv), "controller");
         start_controller(&inv2);
         wait_supervised(&inv2, inv2.pairs.len(), t0);
     }
@@ -2461,6 +3054,7 @@ fn roll_edge(inv: &Inventory, envs: &[(String, String)]) {
         eprintln!("== controller");
         if let Err(e) = stop_seat(
             inv,
+            &controller_runner(inv),
             "controller",
             "flint-controller",
             &format!("{d}/snaps"),
@@ -2470,6 +3064,7 @@ fn roll_edge(inv: &Inventory, envs: &[(String, String)]) {
         }
         spawn_env(
             inv,
+            &controller_runner(inv),
             "controller",
             "flint-controller",
             &controller_args(inv),
@@ -2481,6 +3076,7 @@ fn roll_edge(inv: &Inventory, envs: &[(String, String)]) {
         eprintln!("== agent");
         if let Err(e) = stop_seat(
             inv,
+            &agent_runner(inv),
             "agent",
             "flint-agent",
             &format!("{d}/shadow.jsonl"),
@@ -2488,12 +3084,13 @@ fn roll_edge(inv: &Inventory, envs: &[(String, String)]) {
         ) {
             die_on("agent", e);
         }
-        spawn_env(inv, "agent", "flint-agent", &args, envs);
+        spawn_env(inv, &agent_runner(inv), "agent", "flint-agent", &args, envs);
     }
 
     eprintln!("== control plane");
     if let Err(e) = stop_seat(
         inv,
+        &runner_for(inv, &inv.cp[0]),
         "cp",
         "flint-controlplane",
         &format!("{d}/cp-state"),
@@ -2501,7 +3098,14 @@ fn roll_edge(inv: &Inventory, envs: &[(String, String)]) {
     ) {
         die_on("control plane", e);
     }
-    spawn_env(inv, "cp", "flint-controlplane", &cp_args(inv), envs);
+    spawn_env(
+        inv,
+        &runner_for(inv, &inv.cp[0]),
+        "cp",
+        "flint-controlplane",
+        &cp_args(inv),
+        envs,
+    );
     if !wait_pong(&inv.cp[0], &tls, Duration::from_secs(15)) {
         die_on(
             "control plane",
@@ -2516,10 +3120,24 @@ fn roll_edge(inv: &Inventory, envs: &[(String, String)]) {
         // started with and is unique per proxy, so the match cannot stray
         // onto a sibling.
         let ident = inv.proxy_advertise.get(i).unwrap_or(proxy).clone();
-        if let Err(e) = stop_seat(inv, &seat, "flint-proxy", &ident, Some(port_of(proxy))) {
+        if let Err(e) = stop_seat(
+            inv,
+            &proxy_runner(inv, i),
+            &seat,
+            "flint-proxy",
+            &ident,
+            Some(port_of(proxy)),
+        ) {
             die_on(&seat, e);
         }
-        spawn_env(inv, &seat, "flint-proxy", &proxy_args(inv, i), envs);
+        spawn_env(
+            inv,
+            &proxy_runner(inv, i),
+            &seat,
+            "flint-proxy",
+            &proxy_args(inv, i),
+            envs,
+        );
         let deadline = Instant::now() + Duration::from_secs(15);
         while !proxy_up(inv, proxy) {
             if Instant::now() > deadline {
@@ -2532,23 +3150,27 @@ fn roll_edge(inv: &Inventory, envs: &[(String, String)]) {
 }
 
 fn stop(inv: &Inventory) {
-    let d = &inv.statedir;
-    match std::fs::read_dir(format!("{d}/pids")) {
-        Ok(entries) => {
-            for e in entries.flatten() {
-                let name = e
-                    .file_name()
-                    .to_string_lossy()
-                    .trim_end_matches(".pid")
-                    .to_string();
-                kill_pidfile(d, &name);
-                eprintln!("  stopped {name}");
+    // Each host keeps its OWN pids dir, so "stop the fleet" means asking
+    // every machine to stop what it is holding. Reading only the local
+    // directory would leave remote seats running while reporting success.
+    for r in all_runners(inv) {
+        if r.is_remote() {
+            let argv = vec![
+                format!("{}/flintctl", inv.bins),
+                "host-stop-all".into(),
+                inv.statedir.clone(),
+            ];
+            match r.output(&argv) {
+                Ok(out) => {
+                    for line in String::from_utf8_lossy(&out.stdout).lines() {
+                        eprintln!("  [{}] {line}", r.label());
+                    }
+                }
+                Err(e) => eprintln!("  [{}] stop failed: {e}", r.label()),
             }
+        } else {
+            local_stop_all(&inv.statedir);
         }
-        // Missing pidfiles is exactly when the sweep matters most (the
-        // directory was wiped, or a start never recorded), so fall through
-        // rather than returning early.
-        Err(_) => eprintln!("  no pidfiles — sweeping by process instead"),
     }
     let swept = sweep_orphans(inv);
     if swept > 0 {
@@ -2556,8 +3178,109 @@ fn stop(inv: &Inventory) {
     }
 }
 
+/// The per-host half of the remote runner.
+///
+/// These run ON the machine they are about, invoked over ssh by an
+/// orchestrating flintctl, and they take their parameters on the command line
+/// rather than from an inventory — a data host has no reason to hold the
+/// fleet's inventory file, and giving it one would create a second copy of the
+/// truth to drift.
+///
+/// They deliberately call the SAME functions the local path calls. That is the
+/// whole design: `wait_port_free` is only meaningful executed on the host
+/// whose port it is, and a second implementation over ssh would be free to be
+/// subtly different — which is precisely how rc.15 shipped a port check that
+/// could never pass on Linux.
+fn host_command(cmd: &str, a: &[String]) -> ! {
+    let need = |i: usize, what: &str| -> String {
+        a.get(i)
+            .unwrap_or_else(|| die(&format!("{cmd}: missing {what}")))
+            .clone()
+    };
+    match cmd {
+        "host-spawn" => {
+            let (statedir, bins, name, bin) = (
+                need(0, "statedir"),
+                need(1, "bins"),
+                need(2, "name"),
+                need(3, "bin"),
+            );
+            let mut envs = Vec::new();
+            let mut args = Vec::new();
+            let mut i = 4;
+            while i < a.len() {
+                match a[i].as_str() {
+                    "--env" => {
+                        if let Some((k, v)) = a.get(i + 1).and_then(|kv| kv.split_once('=')) {
+                            envs.push((k.to_string(), v.to_string()));
+                        }
+                        i += 2;
+                    }
+                    "--" => {
+                        args.extend(a[i + 1..].iter().cloned());
+                        break;
+                    }
+                    _ => i += 1,
+                }
+            }
+            for sub in ["logs", "pids", "snaps"] {
+                let _ = std::fs::create_dir_all(format!("{statedir}/{sub}"));
+            }
+            local_spawn_env(&statedir, &bins, &name, &bin, &args, &envs);
+            println!("pid recorded in {statedir}/pids/{name}.pid");
+            std::process::exit(0)
+        }
+        "host-stop-seat" => {
+            let port = a.get(4).and_then(|p| p.parse::<u16>().ok());
+            match local_stop_seat(
+                &need(0, "statedir"),
+                &need(1, "name"),
+                &need(2, "bin"),
+                &need(3, "ident"),
+                port,
+            ) {
+                Ok(()) => std::process::exit(0),
+                Err(e) => {
+                    eprintln!("{e}");
+                    std::process::exit(1)
+                }
+            }
+        }
+        "host-kill-pidfile" => {
+            local_kill_pidfile(&need(0, "statedir"), &need(1, "name"));
+            std::process::exit(0)
+        }
+        "host-stop-all" => {
+            local_stop_all(&need(0, "statedir"));
+            std::process::exit(0)
+        }
+        "host-sweep" => {
+            println!("{}", local_sweep_orphans(&need(0, "statedir")));
+            std::process::exit(0)
+        }
+        "host-port-free" => {
+            let port: u16 = need(0, "port")
+                .parse()
+                .unwrap_or_else(|_| die("host-port-free: port"));
+            let ms: u64 = a.get(1).and_then(|m| m.parse().ok()).unwrap_or(15_000);
+            match wait_port_free(port, Duration::from_millis(ms)) {
+                Ok(()) => std::process::exit(0),
+                Err(e) => {
+                    eprintln!("{e}");
+                    std::process::exit(1)
+                }
+            }
+        }
+        other => die(&format!("unknown host command {other:?}")),
+    }
+}
+
 fn main() {
     let argv: Vec<String> = std::env::args().collect();
+    // Host-side commands come with no inventory: dispatch before requiring -f.
+    if let Some(cmd) = argv.get(1).filter(|c| c.starts_with("host-")) {
+        host_command(&cmd.clone(), &argv[2..]);
+    }
     let inv_path = argv
         .iter()
         .position(|a| a == "-f")
@@ -2579,6 +3302,10 @@ fn main() {
             verify_after(&inv, "bootstrap");
         }
         "start" => start(&inv),
+        "push-bins" => {
+            let tarball = rest.first().expect("usage: push-bins <bundle.tar.gz>");
+            push_bins(&inv, tarball);
+        }
         "status" => status(&inv),
         "retire-proxy" => {
             let addr = rest.first().expect("usage: retire-proxy <addr>");
