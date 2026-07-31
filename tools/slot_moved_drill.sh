@@ -8,7 +8,10 @@
 # protocol that sets this state automatically is next.
 set -u
 cd "$(dirname "$0")/.."
-pkill -9 -f flint-server 2>/dev/null; sleep 0.4
+. "$(dirname "$0")/lib/fleet.sh"
+fleet_init /tmp/flint-moved 6560 7000
+fleet_guard
+fleet_kill server; sleep 0.4
 DIR=$(mktemp -d /tmp/flint-moved.XXXXXX)
 B=./target/release/flint-server
 PORT=6560

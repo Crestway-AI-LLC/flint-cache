@@ -8,7 +8,10 @@
 # separate step, not exercised here.
 set -u
 cd "$(dirname "$0")/.."
-pkill -9 -f flint-server 2>/dev/null; sleep 0.4
+. "$(dirname "$0")/lib/fleet.sh"
+fleet_init /tmp/flint-mig- 6530 6531
+fleet_guard
+fleet_kill server; sleep 0.4
 SDIR=$(mktemp -d /tmp/flint-mig-src.XXXXXX); DDIR=$(mktemp -d /tmp/flint-mig-dst.XXXXXX)
 B=./target/release/flint-server
 SPORT=6530; DPORT=6531

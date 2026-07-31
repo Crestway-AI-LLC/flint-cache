@@ -16,10 +16,13 @@
 # 2-3x single-write latency cost is expected and printed, not hidden.
 set -u
 cd "$(dirname "$0")/.."
+. "$(dirname "$0")/lib/fleet.sh"
+fleet_init /tmp/flint-asyncbench 6996 6997
+fleet_guard
 B=./target/release/flint-server
 D=/tmp/flint-asyncbench; rm -rf "$D"; mkdir -p "$D"
-pkill -9 -f flint-server 2>/dev/null; sleep 0.4
-cleanup() { pkill -9 -f flint-server 2>/dev/null; rm -rf "$D"; }
+fleet_kill server; sleep 0.4
+cleanup() { fleet_kill server; rm -rf "$D"; }
 trap cleanup EXIT
 
 CONN=${CONN:-32}

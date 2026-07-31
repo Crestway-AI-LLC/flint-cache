@@ -10,11 +10,14 @@
 #      — the proxy relays durability backpressure, it does not swallow it
 set -u
 cd "$(dirname "$0")/.."
+. "$(dirname "$0")/lib/fleet.sh"
+fleet_init /tmp/flint-bp 6810 6811 7810 7811
+fleet_guard
 B=./target/release/flint-server
 PX=./target/release/flint-proxy
 D=/tmp/flint-bp; rm -rf "$D"; mkdir -p "$D"
-pkill -9 -f flint-server 2>/dev/null; pkill -9 -f flint-proxy 2>/dev/null; sleep 0.4
-cleanup() { pkill -9 -f flint-server 2>/dev/null; pkill -9 -f flint-proxy 2>/dev/null; rm -rf "$D"; }
+fleet_kill server; fleet_kill proxy; sleep 0.4
+cleanup() { fleet_kill server; fleet_kill proxy; rm -rf "$D"; }
 trap cleanup EXIT
 
 echo "== A) admission cap: --max-conns 4, shed the 5th with -THROTTLED"
@@ -69,7 +72,7 @@ PY
 echo "  admission cap enforced and recovers"
 
 echo "== B) data-plane -THROTTLED passes through the proxy unchanged"
-pkill -9 -f flint-server 2>/dev/null; pkill -9 -f flint-proxy 2>/dev/null; sleep 0.4
+fleet_kill server; fleet_kill proxy; sleep 0.4
 # Widowed master: requires 1 live replica to write, but has none -> writes shed.
 $B --port 6811 --engine rocks --data-dir "$D/d2" --min-replicas-to-write 1 2>/dev/null &
 sleep 0.6

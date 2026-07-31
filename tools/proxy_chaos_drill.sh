@@ -9,9 +9,12 @@
 # The direct-to-node chaos_drill.sh stays the storage-engine regression gate;
 # this is the routing-plane end-to-end gate. Both share one oracle.
 set -euo pipefail
-pkill -9 -f flint-server 2>/dev/null || true
-pkill -9 -f flint-proxy 2>/dev/null || true
-pkill -9 -f flint-controller 2>/dev/null || true
+. "$(dirname "$0")/lib/fleet.sh"
+fleet_init /tmp/flint-chaos-
+fleet_guard
+fleet_kill server
+fleet_kill proxy
+fleet_kill controller
 sleep 0.5
 cargo build --release -q -p flint-server --features rocks
 cargo build --release -q -p flint-proxy -p flint-controller -p flint-chaos
@@ -20,9 +23,9 @@ ITERS="${ITERS:-12}"
 for seed in $SEEDS; do
   echo "== proxy-chaos seed=$seed iters=$ITERS"
   ./target/release/proxy_chaos --iterations "$ITERS" --keys 300 --seed "$seed"
-  pkill -9 -f flint-server 2>/dev/null || true
-  pkill -9 -f flint-proxy 2>/dev/null || true
-  pkill -9 -f flint-controller 2>/dev/null || true
+  fleet_kill server
+  fleet_kill proxy
+  fleet_kill controller
   sleep 0.3
 done
 echo "ALL SEEDS PASSED"

@@ -7,14 +7,17 @@
 #   2. killing 2 of 3 controllers still recovers the next master kill.
 set -u
 cd "$(dirname "$0")/.."
-pkill -9 -f flint-server 2>/dev/null; pkill -9 -f flint-controller 2>/dev/null; sleep 0.4
+. "$(dirname "$0")/lib/fleet.sh"
+fleet_init /tmp/flint-ha- 6450 6451 6452
+fleet_guard
+fleet_kill server; fleet_kill controller; sleep 0.4
 D1=$(mktemp -d /tmp/flint-ha-1.XXXXXX); D2=$(mktemp -d /tmp/flint-ha-2.XXXXXX)
 D3=$(mktemp -d /tmp/flint-ha-3.XXXXXX)
 B=./target/release/flint-server
 P1=6450; P2=6451; P3=6452
 cleanup() {
   pkill -9 -f "flint-server --port 645" 2>/dev/null
-  pkill -9 -f flint-controller 2>/dev/null
+  fleet_kill controller
   rm -rf "$D1" "$D2" "$D3"
 }
 trap cleanup EXIT

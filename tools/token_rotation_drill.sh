@@ -8,15 +8,18 @@
 #   - CPDROPPREV retires the old token; it then gets WRONGPASS, NEW still works
 set -u
 cd "$(dirname "$0")/.."
-pkill -9 -f flint-server 2>/dev/null; pkill -9 -f flint-proxy 2>/dev/null; pkill -9 -f flint-controlplane 2>/dev/null; sleep 0.4
+. "$(dirname "$0")/lib/fleet.sh"
+fleet_init /tmp/flint-rot-state 6750 7550 7701
+fleet_guard
+fleet_kill server; fleet_kill proxy; fleet_kill controlplane; sleep 0.4
 B=./target/release/flint-server
 CP=./target/release/flint-controlplane
 PX=./target/release/flint-proxy
 STATE=/tmp/flint-rot-state
 cleanup() {
   pkill -9 -f "flint-server --port 675" 2>/dev/null
-  pkill -9 -f flint-proxy 2>/dev/null
-  pkill -9 -f flint-controlplane 2>/dev/null
+  fleet_kill proxy
+  fleet_kill controlplane
   rm -rf /tmp/flint-rot-* "$STATE" "$STATE.tmp"
 }
 trap cleanup EXIT
@@ -73,7 +76,7 @@ echo "$X" | grep -q "WRONGPASS" || { echo "FAIL: retired token v1 still accepted
 echo "  v1 rejected, v2 serves"
 
 echo "== rotation state is durable (CP restart preserves current token)"
-pkill -9 -f flint-controlplane; sleep 0.4
+fleet_kill controlplane; sleep 0.4
 $CP --port 7550 --state "$STATE" 2>>/tmp/flint-rot-cp.log &
 sleep 1.5
 [ "$(a tok-v2 GET k)" = "hello" ] || { echo "FAIL: v2 lost across CP restart"; exit 1; }

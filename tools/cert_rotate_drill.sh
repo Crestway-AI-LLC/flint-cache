@@ -9,15 +9,18 @@
 #     ZERO errors (same CA -> old session stays valid, new dials use new leaf)
 set -u
 cd "$(dirname "$0")/.."
+. "$(dirname "$0")/lib/fleet.sh"
+fleet_init /tmp/flint-certrot 7061 7062 7063 7795 7998
+fleet_guard
 CTL=./target/release/flintctl
 B=./target/release/flint-server
 D=/tmp/flint-certrot; rm -rf "$D"; mkdir -p "$D"
-pkill -9 -f flint-server 2>/dev/null; pkill -9 -f flint-proxy 2>/dev/null
-pkill -9 -f flint-controlplane 2>/dev/null; pkill -9 -f flint-controller 2>/dev/null; sleep 0.4
+fleet_kill server; fleet_kill proxy
+fleet_kill controlplane; fleet_kill controller; sleep 0.4
 cleanup() {
   $CTL -f "$D/cluster.flint" stop >/dev/null 2>&1
-  pkill -9 -f flint-server 2>/dev/null; pkill -9 -f flint-proxy 2>/dev/null
-  pkill -9 -f flint-controlplane 2>/dev/null; pkill -9 -f flint-controller 2>/dev/null
+  fleet_kill server; fleet_kill proxy
+  fleet_kill controlplane; fleet_kill controller
   rm -rf "$D"
 }
 trap cleanup EXIT

@@ -8,6 +8,9 @@
 # the kill lands at different phases (pull / freeze / flip).
 set -u
 cd "$(dirname "$0")/.."
+. "$(dirname "$0")/lib/fleet.sh"
+fleet_init /tmp/flint-rec- 6580 6581
+fleet_guard
 B=./target/release/flint-server
 SPORT=6580; DPORT=6581
 SADDR="127.0.0.1:$SPORT"; DADDR="127.0.0.1:$DPORT"
@@ -23,7 +26,7 @@ print(c(b"mover")%16384)')
 
 run_once() {
   local delay="$1"
-  pkill -9 -f "flint-server --port 658" 2>/dev/null; pkill -9 -f flint-controller 2>/dev/null; sleep 0.4
+  pkill -9 -f "flint-server --port 658" 2>/dev/null; fleet_kill controller; sleep 0.4
   local SDIR DDIR
   SDIR=$(mktemp -d /tmp/flint-rec-s.XXXXXX); DDIR=$(mktemp -d /tmp/flint-rec-d.XXXXXX)
   $B --port $SPORT --engine rocks --data-dir "$SDIR" 2>/dev/null &
@@ -97,7 +100,7 @@ run_once() {
 # construct the state directly: ship the data (no cutover), then freeze the
 # source. Recovery must COMPLETE the flip: source -> Moved.
 test_half_done_flip() {
-  pkill -9 -f "flint-server --port 658" 2>/dev/null; pkill -9 -f flint-controller 2>/dev/null; sleep 0.4
+  pkill -9 -f "flint-server --port 658" 2>/dev/null; fleet_kill controller; sleep 0.4
   local SDIR DDIR
   SDIR=$(mktemp -d /tmp/flint-rec-s.XXXXXX); DDIR=$(mktemp -d /tmp/flint-rec-d.XXXXXX)
   $B --port $SPORT --engine rocks --data-dir "$SDIR" 2>/dev/null &
@@ -124,7 +127,7 @@ test_half_done_flip() {
   return 0
 }
 
-trap 'pkill -9 -f "flint-server --port 658" 2>/dev/null; pkill -9 -f flint-controller 2>/dev/null' EXIT
+trap 'pkill -9 -f "flint-server --port 658" 2>/dev/null; fleet_kill controller' EXIT
 : > /tmp/flint-rec.log
 echo "== slot {mover}=$SLOT, $KEYS keys; killing BOTH nodes mid-cutover (timing-based)"
 FAILS=0

@@ -11,15 +11,18 @@
 #   - rotation drain counters key by digest but accept plaintext lookups
 set -u
 cd "$(dirname "$0")/.."
+. "$(dirname "$0")/lib/fleet.sh"
+fleet_init /tmp/flint-tokhash 7031 7770 7991
+fleet_guard
 B=./target/release/flint-server
 CP=./target/release/flint-controlplane
 PX=./target/release/flint-proxy
 D=/tmp/flint-tokhash; rm -rf "$D"; mkdir -p "$D"
-pkill -9 -f flint-server 2>/dev/null; pkill -9 -f flint-proxy 2>/dev/null
-pkill -9 -f flint-controlplane 2>/dev/null; sleep 0.4
+fleet_kill server; fleet_kill proxy
+fleet_kill controlplane; sleep 0.4
 cleanup() {
-  pkill -9 -f flint-server 2>/dev/null; pkill -9 -f flint-proxy 2>/dev/null
-  pkill -9 -f flint-controlplane 2>/dev/null; rm -rf "$D"
+  fleet_kill server; fleet_kill proxy
+  fleet_kill controlplane; rm -rf "$D"
 }
 trap cleanup EXIT
 
@@ -54,7 +57,7 @@ echo "$DW" | grep -qi "PONG" && { echo "FAIL: the stored digest authenticated (h
 echo "  plaintext AUTHs; wrong token and the RAW DIGEST both rejected"
 
 echo "== CP restart from the digest-only file preserves auth"
-pkill -9 -f flint-controlplane; sleep 0.3
+fleet_kill controlplane; sleep 0.3
 $CP --port 7770 --state "$D/cp" 2>/dev/null &
 sleep 1.5   # proxy re-subscribes and gets a fresh push
 V=$(valkey-cli -p 7991 -a super-secret-token --no-auth-warning GET k)
@@ -62,7 +65,7 @@ V=$(valkey-cli -p 7991 -a super-secret-token --no-auth-warning GET k)
 echo "  restart + repush: auth intact, data intact"
 
 echo "== MIGRATION: a plaintext-era state file digests on first load"
-pkill -9 -f flint-controlplane; sleep 0.3
+fleet_kill controlplane; sleep 0.3
 # Hand-write an old-format file with a PLAINTEXT token column.
 # A version AHEAD of what the proxy has seen: push suppression would keep
 # a same-version snapshot from reaching the already-subscribed proxy.

@@ -21,16 +21,19 @@
 # nothing local can test that honestly.
 set -u
 cd "$(dirname "$0")/.."
+. "$(dirname "$0")/lib/fleet.sh"
+fleet_init /tmp/flint-attached 7361 7362 7692 7744
+fleet_guard
 D=/tmp/flint-attached; INV=$D/cluster.flint
 CTL=./target/release/flintctl
 ITER="${1:-6}"
-pkill -9 -f flint-server 2>/dev/null; pkill -9 -f flint-proxy 2>/dev/null
-pkill -9 -f flint-controlplane 2>/dev/null; pkill -9 -f flint-controller 2>/dev/null
+fleet_kill server; fleet_kill proxy
+fleet_kill controlplane; fleet_kill controller
 sleep 0.4
 cleanup() {
   $CTL -f "$INV" stop >/dev/null 2>&1
-  pkill -9 -f flint-server 2>/dev/null; pkill -9 -f flint-proxy 2>/dev/null
-  pkill -9 -f flint-controlplane 2>/dev/null; pkill -9 -f flint-controller 2>/dev/null
+  fleet_kill server; fleet_kill proxy
+  fleet_kill controlplane; fleet_kill controller
   rm -rf "$D"
 }
 trap cleanup EXIT

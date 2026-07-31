@@ -14,14 +14,17 @@
 #   - tenant isolation holds for the JSON keyspace.
 set -u
 cd "$(dirname "$0")/.."
+. "$(dirname "$0")/lib/fleet.sh"
+fleet_init /tmp/flint-json-state 7311 7312 7313 7314 7681 7722
+fleet_guard
 STATE=/tmp/flint-json-state; INV=/tmp/flint-json.flint
-pkill -9 -f flint-server 2>/dev/null; pkill -9 -f flint-proxy 2>/dev/null
-pkill -9 -f flint-controlplane 2>/dev/null; pkill -9 -f flint-controller 2>/dev/null
+fleet_kill server; fleet_kill proxy
+fleet_kill controlplane; fleet_kill controller
 sleep 0.4
 cleanup() {
   ./target/release/flintctl -f "$INV" stop 2>/dev/null
-  pkill -9 -f flint-server 2>/dev/null; pkill -9 -f flint-proxy 2>/dev/null
-  pkill -9 -f flint-controlplane 2>/dev/null; pkill -9 -f flint-controller 2>/dev/null
+  fleet_kill server; fleet_kill proxy
+  fleet_kill controlplane; fleet_kill controller
   rm -rf "$STATE" "$INV"
 }
 trap cleanup EXIT

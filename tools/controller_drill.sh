@@ -6,13 +6,16 @@
 # and verify the controller fences it (FLINTDEMOTE).
 set -u
 cd "$(dirname "$0")/.."
-pkill -9 -f flint-server 2>/dev/null; pkill -9 -f flint-controller 2>/dev/null; sleep 0.4
+. "$(dirname "$0")/lib/fleet.sh"
+fleet_init /tmp/flint-ctl-m 6440 6441
+fleet_guard
+fleet_kill server; fleet_kill controller; sleep 0.4
 MDIR=$(mktemp -d /tmp/flint-ctl-m.XXXXXX); RDIR=$(mktemp -d /tmp/flint-ctl-r.XXXXXX)
 B=./target/release/flint-server
 MPORT=6440; RPORT=6441
 cleanup() {
   pkill -9 -f "flint-server --port 644" 2>/dev/null
-  pkill -9 -f flint-controller 2>/dev/null
+  fleet_kill controller
   rm -rf "$MDIR" "$RDIR"
 }
 trap cleanup EXIT

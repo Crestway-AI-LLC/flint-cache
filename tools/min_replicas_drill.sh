@@ -8,7 +8,10 @@
 # controller while the other side promotes). Reads stay available throughout.
 set -u
 cd "$(dirname "$0")/.."
-pkill -9 -f flint-server 2>/dev/null; sleep 0.4
+. "$(dirname "$0")/lib/fleet.sh"
+fleet_init /tmp/flint-minr-m 6480 6481 6482
+fleet_guard
+fleet_kill server; sleep 0.4
 MDIR=$(mktemp -d /tmp/flint-minr-m.XXXXXX); R1DIR=$(mktemp -d /tmp/flint-minr-r1.XXXXXX)
 R2DIR=$(mktemp -d /tmp/flint-minr-r2.XXXXXX)
 B=./target/release/flint-server

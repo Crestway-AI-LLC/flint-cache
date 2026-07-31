@@ -12,8 +12,11 @@
 #   - CPTENANTASYNC off propagates: a rerun storm on hot sheds zero
 set -u
 cd "$(dirname "$0")/.."
-pkill -9 -f flint-server 2>/dev/null; pkill -9 -f flint-proxy 2>/dev/null
-pkill -9 -f flint-controlplane 2>/dev/null; sleep 0.4
+. "$(dirname "$0")/lib/fleet.sh"
+fleet_init /tmp/flint-af-state 6760 7520 7611
+fleet_guard
+fleet_kill server; fleet_kill proxy
+fleet_kill controlplane; sleep 0.4
 B=./target/release/flint-server
 CP=./target/release/flint-controlplane
 PX=./target/release/flint-proxy
@@ -21,8 +24,8 @@ STATE=/tmp/flint-af-state
 D=/tmp/flint-af-node
 cleanup() {
   pkill -9 -f "flint-server --port 6760" 2>/dev/null
-  pkill -9 -f flint-proxy 2>/dev/null
-  pkill -9 -f flint-controlplane 2>/dev/null
+  fleet_kill proxy
+  fleet_kill controlplane
   rm -rf "$D" "$STATE" "$STATE.tmp" /tmp/flint-af-*.log
 }
 trap cleanup EXIT

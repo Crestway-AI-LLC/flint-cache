@@ -10,16 +10,19 @@
 # writes across the cutover.
 set -u
 cd "$(dirname "$0")/.."
+. "$(dirname "$0")/lib/fleet.sh"
+fleet_init /tmp/flint-migsl-state 7001 7002 7011 7012 7379 7500
+fleet_guard
 STATE=/tmp/flint-migsl-state; INV=/tmp/flint-migsl.flint
 RUN=/tmp/flint-migsl-run; ACK=/tmp/flint-migsl-ack
-pkill -9 -f flint-server 2>/dev/null; pkill -9 -f flint-proxy 2>/dev/null
-pkill -9 -f flint-controlplane 2>/dev/null; pkill -9 -f flint-controller 2>/dev/null
+fleet_kill server; fleet_kill proxy
+fleet_kill controlplane; fleet_kill controller
 sleep 0.4
 cleanup() {
   rm -f "$RUN"
   ./target/release/flintctl -f "$INV" stop 2>/dev/null
-  pkill -9 -f flint-server 2>/dev/null; pkill -9 -f flint-proxy 2>/dev/null
-  pkill -9 -f flint-controlplane 2>/dev/null; pkill -9 -f flint-controller 2>/dev/null
+  fleet_kill server; fleet_kill proxy
+  fleet_kill controlplane; fleet_kill controller
   rm -rf "$STATE" "$INV" "$ACK"
 }
 trap cleanup EXIT

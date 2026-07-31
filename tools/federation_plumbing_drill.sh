@@ -7,15 +7,18 @@
 #     (multi-cluster subscription arrives with the fleet-map work)
 set -u
 cd "$(dirname "$0")/.."
+. "$(dirname "$0")/lib/fleet.sh"
+fleet_init /tmp/flint-fedplumb 7091 7830 7831 7996 7997
+fleet_guard
 CP=./target/release/flint-controlplane
 B=./target/release/flint-server
 PX=./target/release/flint-proxy
 D=/tmp/flint-fedplumb; rm -rf "$D"; mkdir -p "$D"
-pkill -9 -f flint-server 2>/dev/null; pkill -9 -f flint-proxy 2>/dev/null
-pkill -9 -f flint-controlplane 2>/dev/null; sleep 0.4
+fleet_kill server; fleet_kill proxy
+fleet_kill controlplane; sleep 0.4
 cleanup() {
-  pkill -9 -f flint-server 2>/dev/null; pkill -9 -f flint-proxy 2>/dev/null
-  pkill -9 -f flint-controlplane 2>/dev/null; rm -rf "$D"
+  fleet_kill server; fleet_kill proxy
+  fleet_kill controlplane; rm -rf "$D"
 }
 trap cleanup EXIT
 

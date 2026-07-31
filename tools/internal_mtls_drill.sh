@@ -14,11 +14,14 @@
 #   - with no --internal-* flags, server+proxy are plaintext, unchanged
 set -u
 cd "$(dirname "$0")/.."
+. "$(dirname "$0")/lib/fleet.sh"
+fleet_init /tmp/flint-mtls 6770 6771 7770 7771 7772
+fleet_guard
 B=./target/release/flint-server
 PX=./target/release/flint-proxy
 D=/tmp/flint-mtls; rm -rf "$D"; mkdir -p "$D"
-pkill -9 -f flint-server 2>/dev/null; pkill -9 -f flint-proxy 2>/dev/null; sleep 0.4
-cleanup() { pkill -9 -f flint-server 2>/dev/null; pkill -9 -f flint-proxy 2>/dev/null; rm -rf "$D"; }
+fleet_kill server; fleet_kill proxy; sleep 0.4
+cleanup() { fleet_kill server; fleet_kill proxy; rm -rf "$D"; }
 trap cleanup EXIT
 
 echo "== mint an internal CA and one internal cert (SAN flint-internal, server+client EKU)"
@@ -93,7 +96,7 @@ echo "$X" | grep -q "FLINTSYNC-OK" || { echo "FAIL: FLINTSYNC handshake failed o
 echo "  FLINTSYNC over TLS handshakes: ${X%%$'\r'*} (full parity in node_tls_drill)"
 
 echo "== no --internal-* flags: server+proxy plaintext, unchanged"
-pkill -9 -f flint-server 2>/dev/null; pkill -9 -f flint-proxy 2>/dev/null; sleep 0.4
+fleet_kill server; fleet_kill proxy; sleep 0.4
 $B --port 6771 --engine rocks --data-dir "$D/data2" 2>"$D/srv2.log" &
 sleep 0.6
 grep -q "plaintext" "$D/srv2.log" || { echo "FAIL: server not plaintext without flags"; exit 1; }

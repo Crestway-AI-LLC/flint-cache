@@ -18,15 +18,18 @@
 # shape: the inventory's `capacity` against the disk the nodes report.
 set -u
 cd "$(dirname "$0")/.."
+. "$(dirname "$0")/lib/fleet.sh"
+fleet_init /tmp/flint-pxreg 7351 7352 7691 7733 9999
+fleet_guard
 D=/tmp/flint-pxreg; INV=$D/cluster.flint
 CTL=./target/release/flintctl
-pkill -9 -f flint-server 2>/dev/null; pkill -9 -f flint-proxy 2>/dev/null
-pkill -9 -f flint-controlplane 2>/dev/null; pkill -9 -f flint-controller 2>/dev/null
+fleet_kill server; fleet_kill proxy
+fleet_kill controlplane; fleet_kill controller
 sleep 0.4
 cleanup() {
   $CTL -f "$INV" stop 2>/dev/null
-  pkill -9 -f flint-server 2>/dev/null; pkill -9 -f flint-proxy 2>/dev/null
-  pkill -9 -f flint-controlplane 2>/dev/null; pkill -9 -f flint-controller 2>/dev/null
+  fleet_kill server; fleet_kill proxy
+  fleet_kill controlplane; fleet_kill controller
   rm -rf "$D"
 }
 trap cleanup EXIT

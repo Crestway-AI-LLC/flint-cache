@@ -13,16 +13,19 @@
 #     it promotes the replica through encrypted probes/commands
 set -u
 cd "$(dirname "$0")/.."
+. "$(dirname "$0")/lib/fleet.sh"
+fleet_init /tmp/flint-ctls 6795 6796 7541 7542 7543 7551 7552 7553 7790
+fleet_guard
 B=./target/release/flint-server
 CP=./target/release/flint-controlplane
 PX=./target/release/flint-proxy
 CTL=./target/release/flint-controller
 D=/tmp/flint-ctls; rm -rf "$D"; mkdir -p "$D"
-pkill -9 -f flint-server 2>/dev/null; pkill -9 -f flint-proxy 2>/dev/null
-pkill -9 -f flint-controlplane 2>/dev/null; pkill -9 -f flint-controller 2>/dev/null; sleep 0.4
+fleet_kill server; fleet_kill proxy
+fleet_kill controlplane; fleet_kill controller; sleep 0.4
 cleanup() {
-  pkill -9 -f flint-server 2>/dev/null; pkill -9 -f flint-proxy 2>/dev/null
-  pkill -9 -f flint-controlplane 2>/dev/null; pkill -9 -f flint-controller 2>/dev/null
+  fleet_kill server; fleet_kill proxy
+  fleet_kill controlplane; fleet_kill controller
   rm -rf "$D"
 }
 trap cleanup EXIT

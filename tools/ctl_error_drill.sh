@@ -16,14 +16,17 @@
 # transport failure (not a -ERR reply) reports the same way.
 set -u
 cd "$(dirname "$0")/.."
+. "$(dirname "$0")/lib/fleet.sh"
+fleet_init /tmp/flint-ctlerr-state 7701 7702 7830
+fleet_guard
 STATE=/tmp/flint-ctlerr-state; INV=/tmp/flint-ctlerr.flint
 DEAD=/tmp/flint-ctlerr-dead.flint
 CTL=./target/release/flintctl
-pkill -9 -f flint-server 2>/dev/null; pkill -9 -f flint-controlplane 2>/dev/null
+fleet_kill server; fleet_kill controlplane
 sleep 0.4
 cleanup() {
   $CTL -f "$INV" stop >/dev/null 2>&1
-  pkill -9 -f flint-server 2>/dev/null; pkill -9 -f flint-controlplane 2>/dev/null
+  fleet_kill server; fleet_kill controlplane
   rm -rf "$STATE" "$INV" "$DEAD" /tmp/flint-ctlerr.out /tmp/flint-ctlerr.err
 }
 trap cleanup EXIT

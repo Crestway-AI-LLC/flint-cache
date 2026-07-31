@@ -9,11 +9,14 @@
 #     byte-identically (no silent downgrade, no behavior change)
 set -u
 cd "$(dirname "$0")/.."
+. "$(dirname "$0")/lib/fleet.sh"
+fleet_init /tmp/flint-tls 6760 7760 7761
+fleet_guard
 B=./target/release/flint-server
 PX=./target/release/flint-proxy
 D=/tmp/flint-tls; rm -rf "$D"; mkdir -p "$D"
-pkill -9 -f flint-server 2>/dev/null; pkill -9 -f flint-proxy 2>/dev/null; sleep 0.4
-cleanup() { pkill -9 -f flint-server 2>/dev/null; pkill -9 -f flint-proxy 2>/dev/null; rm -rf "$D"; }
+fleet_kill server; fleet_kill proxy; sleep 0.4
+cleanup() { fleet_kill server; fleet_kill proxy; rm -rf "$D"; }
 trap cleanup EXIT
 
 # One backend; the proxy runs open-mode (no tenants) with a single static pair.
@@ -88,7 +91,7 @@ echo "$P" | grep -q "PONG" && { echo "FAIL: plaintext client got PONG on TLS por
 echo "  plaintext rejected (no PONG): $P"
 
 echo "== same binary, NO --tls-* flags: plaintext still works (no downgrade path)"
-pkill -9 -f flint-proxy; sleep 0.4
+fleet_kill proxy; sleep 0.4
 $PX --port 7761 --pairs "127.0.0.1:6760" 2>"$D/px2.log" &
 sleep 0.8
 grep -q "plaintext" "$D/px2.log" || { echo "FAIL: proxy did not report plaintext mode"; cat "$D/px2.log"; exit 1; }

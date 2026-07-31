@@ -6,13 +6,16 @@
 # or spawns. Proves hands-free detect -> promote -> respawn -> reconverge.
 set -u
 cd "$(dirname "$0")/.."
-pkill -9 -f flint-server 2>/dev/null; pkill -9 -f flint-controller 2>/dev/null; sleep 0.4
+. "$(dirname "$0")/lib/fleet.sh"
+fleet_init /tmp/flint-mng- 6460 6470
+fleet_guard
+fleet_kill server; fleet_kill controller; sleep 0.4
 D1=/tmp/flint-mng-1; D2=/tmp/flint-mng-2
 rm -rf "$D1" "$D2" "$D1.log" "$D2.log"
 P1=6460; P2=6470
 cleanup() {
   pkill -9 -f "flint-server --port 64" 2>/dev/null
-  pkill -9 -f flint-controller 2>/dev/null
+  fleet_kill controller
   rm -rf "$D1" "$D2"
 }
 trap cleanup EXIT

@@ -7,14 +7,17 @@
 # per-pair state. The drill only KILLS; the controller does everything.
 set -u
 cd "$(dirname "$0")/.."
-pkill -9 -f flint-server 2>/dev/null; pkill -9 -f flint-controller 2>/dev/null; sleep 0.4
+. "$(dirname "$0")/lib/fleet.sh"
+fleet_init /tmp/flint-mp- 6500 6501 6510 6511 6520
+fleet_guard
+fleet_kill server; fleet_kill controller; sleep 0.4
 # Three pairs on fixed ports; roles float within each pair.
 declare -a A=(6500 6501) B=(6510 6511) C=(6520 6521)
 DIRS=()
 for p in 6500 6501 6510 6511 6520 6521; do DIRS+=("/tmp/flint-mp-$p"); rm -rf "/tmp/flint-mp-$p" "/tmp/flint-mp-$p.log"; done
 cleanup() {
   pkill -9 -f "flint-server --port 65" 2>/dev/null
-  pkill -9 -f flint-controller 2>/dev/null
+  fleet_kill controller
   for p in 6500 6501 6510 6511 6520 6521; do rm -rf "/tmp/flint-mp-$p"; done
 }
 trap cleanup EXIT

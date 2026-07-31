@@ -15,16 +15,19 @@
 # the statedir (an editor, a tail) must survive.
 set -u
 cd "$(dirname "$0")/.."
+. "$(dirname "$0")/lib/fleet.sh"
+fleet_init /tmp/flint-sweep-a 7501 7502 7601 7602 7810 7820 7879 7889
+fleet_guard
 A=/tmp/flint-sweep-a; B=/tmp/flint-sweep-b
 INVA=/tmp/flint-sweep-a.flint; INVB=/tmp/flint-sweep-b.flint
 CTL=./target/release/flintctl
-pkill -9 -f flint-server 2>/dev/null; pkill -9 -f flint-proxy 2>/dev/null
-pkill -9 -f flint-controlplane 2>/dev/null; pkill -9 -f flint-controller 2>/dev/null
+fleet_kill server; fleet_kill proxy
+fleet_kill controlplane; fleet_kill controller
 sleep 0.4
 cleanup() {
   $CTL -f "$INVA" stop >/dev/null 2>&1; $CTL -f "$INVB" stop >/dev/null 2>&1
-  pkill -9 -f flint-server 2>/dev/null; pkill -9 -f flint-proxy 2>/dev/null
-  pkill -9 -f flint-controlplane 2>/dev/null; pkill -9 -f flint-controller 2>/dev/null
+  fleet_kill server; fleet_kill proxy
+  fleet_kill controlplane; fleet_kill controller
   kill "${TAIL_PID:-0}" 2>/dev/null
   rm -rf "$A" "$B" "$INVA" "$INVB"
 }

@@ -10,10 +10,13 @@
 #   - every replica eventually seeds and converges
 set -u
 cd "$(dirname "$0")/.."
+. "$(dirname "$0")/lib/fleet.sh"
+fleet_init /tmp/flint-fscap 6990
+fleet_guard
 B=./target/release/flint-server
 D=/tmp/flint-fscap; rm -rf "$D"; mkdir -p "$D"
-pkill -9 -f flint-server 2>/dev/null; sleep 0.4
-cleanup() { pkill -9 -f flint-server 2>/dev/null; rm -rf "$D"; }
+fleet_kill server; sleep 0.4
+cleanup() { fleet_kill server; rm -rf "$D"; }
 trap cleanup EXIT
 
 echo "== master (--max-fullsync 1) + a dataset worth streaming"

@@ -12,13 +12,16 @@
 #     and can write — no tenant lost, no tenant bled into another
 set -u
 cd "$(dirname "$0")/.."
-pkill -9 -f flint-server 2>/dev/null; pkill -9 -f flint-controller 2>/dev/null; pkill -9 -f flint-proxy 2>/dev/null; sleep 0.4
+. "$(dirname "$0")/lib/fleet.sh"
+fleet_init /tmp/flint-m3- 6669 6710 6711 6720 6721
+fleet_guard
+fleet_kill server; fleet_kill controller; fleet_kill proxy; sleep 0.4
 B=./target/release/flint-server
 KEYS_PER_TENANT=300
 cleanup() {
   pkill -9 -f "flint-server --port 67" 2>/dev/null
-  pkill -9 -f flint-controller 2>/dev/null
-  pkill -9 -f flint-proxy 2>/dev/null
+  fleet_kill controller
+  fleet_kill proxy
   rm -rf /tmp/flint-m3-* /tmp/m3-stop
 }
 trap cleanup EXIT

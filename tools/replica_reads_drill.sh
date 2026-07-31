@@ -15,15 +15,18 @@
 # state is stable for the toggle.
 set -u
 cd "$(dirname "$0")/.."
+. "$(dirname "$0")/lib/fleet.sh"
+fleet_init /tmp/flint-d7 6970 6971 6972 7640 7881
+fleet_guard
 B=./target/release/flint-server
 CP=./target/release/flint-controlplane
 PX=./target/release/flint-proxy
 D=/tmp/flint-d7; rm -rf "$D"; mkdir -p "$D"
-pkill -9 -f flint-server 2>/dev/null; pkill -9 -f flint-proxy 2>/dev/null
-pkill -9 -f flint-controlplane 2>/dev/null; sleep 0.4
+fleet_kill server; fleet_kill proxy
+fleet_kill controlplane; sleep 0.4
 cleanup() {
-  pkill -9 -f flint-server 2>/dev/null; pkill -9 -f flint-proxy 2>/dev/null
-  pkill -9 -f flint-controlplane 2>/dev/null; rm -rf "$D"
+  fleet_kill server; fleet_kill proxy
+  fleet_kill controlplane; rm -rf "$D"
 }
 trap cleanup EXIT
 

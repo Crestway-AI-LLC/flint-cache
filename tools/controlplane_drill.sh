@@ -10,15 +10,18 @@
 #   - CP state survives restart; CP OUTAGE does not touch the data path
 set -u
 cd "$(dirname "$0")/.."
-pkill -9 -f flint-server 2>/dev/null; pkill -9 -f flint-proxy 2>/dev/null; pkill -9 -f flint-controlplane 2>/dev/null; sleep 0.4
+. "$(dirname "$0")/lib/fleet.sh"
+fleet_init /tmp/flint-cp-drill-state 6730 6740 7500 7601 7602
+fleet_guard
+fleet_kill server; fleet_kill proxy; fleet_kill controlplane; sleep 0.4
 B=./target/release/flint-server
 CP=./target/release/flint-controlplane
 PX=./target/release/flint-proxy
 STATE=/tmp/flint-cp-drill-state
 cleanup() {
   pkill -9 -f "flint-server --port 673" 2>/dev/null
-  pkill -9 -f flint-proxy 2>/dev/null
-  pkill -9 -f flint-controlplane 2>/dev/null
+  fleet_kill proxy
+  fleet_kill controlplane
   rm -rf /tmp/flint-cpd-* "$STATE" "$STATE.tmp"
 }
 trap cleanup EXIT
@@ -82,7 +85,7 @@ echo "  drained live: :$OPORT refuses, :$APORT serves"
 
 echo "== CP outage: data path unaffected; restart restores durable state"
 V_BEFORE=$(valkey-cli -p 7500 CPINFO | tr '\r' '\n' | grep "^version" | cut -d: -f2)
-pkill -9 -f flint-controlplane; sleep 0.5
+fleet_kill controlplane; sleep 0.5
 W=$(valkey-cli -p "$APORT" -a tok-acme --no-auth-warning SET during-outage ok 2>&1)
 [ "$W" = "OK" ] || { echo "FAIL: data path depends on CP being up: $W"; exit 1; }
 [ "$(valkey-cli -p "$APORT" -a tok-acme --no-auth-warning GET during-outage)" = "ok" ] || { echo "FAIL: read during outage"; exit 1; }

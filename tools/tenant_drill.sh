@@ -7,12 +7,15 @@
 #   - re-AUTH to a different tenant on one connection is rejected
 set -u
 cd "$(dirname "$0")/.."
-pkill -9 -f flint-server 2>/dev/null; pkill -9 -f flint-proxy 2>/dev/null; sleep 0.4
+. "$(dirname "$0")/lib/fleet.sh"
+fleet_init /tmp/flint-tn 6650 6667
+fleet_guard
+fleet_kill server; fleet_kill proxy; sleep 0.4
 B=./target/release/flint-server
 D=$(mktemp -d /tmp/flint-tn.XXXXXX)
 cleanup() {
   pkill -9 -f "flint-server --port 6650" 2>/dev/null
-  pkill -9 -f flint-proxy 2>/dev/null
+  fleet_kill proxy
   rm -rf "$D"
 }
 trap cleanup EXIT

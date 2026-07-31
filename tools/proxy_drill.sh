@@ -8,13 +8,16 @@
 # plane's product promise: zero cluster awareness for clients.
 set -u
 cd "$(dirname "$0")/.."
-pkill -9 -f flint-server 2>/dev/null; pkill -9 -f flint-controller 2>/dev/null; pkill -9 -f flint-proxy 2>/dev/null; sleep 0.4
+. "$(dirname "$0")/lib/fleet.sh"
+fleet_init /tmp/flint-px- 6630 6631 6640 6641 6666
+fleet_guard
+fleet_kill server; fleet_kill controller; fleet_kill proxy; sleep 0.4
 B=./target/release/flint-server
 # Two pairs: (6630 master, 6631 replica) and (6640 master, 6641 replica).
 cleanup() {
   pkill -9 -f "flint-server --port 66" 2>/dev/null
-  pkill -9 -f flint-controller 2>/dev/null
-  pkill -9 -f flint-proxy 2>/dev/null
+  fleet_kill controller
+  fleet_kill proxy
   rm -rf /tmp/flint-px-*
 }
 trap cleanup EXIT

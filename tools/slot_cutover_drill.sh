@@ -9,7 +9,10 @@
 # is shed with -TRYAGAIN (verified indirectly via the clean end state).
 set -u
 cd "$(dirname "$0")/.."
-pkill -9 -f flint-server 2>/dev/null; sleep 0.4
+. "$(dirname "$0")/lib/fleet.sh"
+fleet_init /tmp/flint-cut- 6570 6571
+fleet_guard
+fleet_kill server; sleep 0.4
 SDIR=$(mktemp -d /tmp/flint-cut-src.XXXXXX); DDIR=$(mktemp -d /tmp/flint-cut-dst.XXXXXX)
 B=./target/release/flint-server
 SPORT=6570; DPORT=6571

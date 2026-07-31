@@ -9,9 +9,12 @@
 # FAILS if any failover exceeds it.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-pkill -9 -f flint-server 2>/dev/null || true
-pkill -9 -f flint-controller 2>/dev/null || true
-pkill -9 -f flint-proxy 2>/dev/null || true
+. "$(dirname "$0")/lib/fleet.sh"
+fleet_init /tmp/flint-chaos-
+fleet_guard
+fleet_kill server
+fleet_kill controller
+fleet_kill proxy
 sleep 0.5
 cargo build --release -q -p flint-server --features rocks
 cargo build --release -q -p flint-chaos
@@ -21,9 +24,9 @@ WRITERS="${WRITERS:-4}"
 
 echo "== phase 1: inline (sync) write path"
 ./target/release/hotkey --kills "$KILLS" --keys "$KEYS" --writers "$WRITERS"
-pkill -9 -f flint-server 2>/dev/null || true
-pkill -9 -f flint-controller 2>/dev/null || true
-pkill -9 -f flint-proxy 2>/dev/null || true
+fleet_kill server
+fleet_kill controller
+fleet_kill proxy
 sleep 0.5
 
 echo "== phase 2: ASYNC WRITE QUEUE (ADR-0005 D4) — the hot-key mitigation"
@@ -32,7 +35,7 @@ echo "== phase 2: ASYNC WRITE QUEUE (ADR-0005 D4) — the hot-key mitigation"
 # every node the harness spawns — including promote-replace respawns.
 FLINT_CHAOS_ASYNC_WRITES=0 \
   ./target/release/hotkey --kills "$KILLS" --keys "$KEYS" --writers "$WRITERS"
-pkill -9 -f flint-server 2>/dev/null || true
-pkill -9 -f flint-controller 2>/dev/null || true
-pkill -9 -f flint-proxy 2>/dev/null || true
+fleet_kill server
+fleet_kill controller
+fleet_kill proxy
 echo "HOTKEY CHAOS PASSED (sync + async-queue)"

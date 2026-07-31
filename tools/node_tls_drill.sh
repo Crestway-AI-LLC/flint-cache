@@ -11,10 +11,13 @@
 # Every check runs over mutual TLS: the data ports accept nothing else.
 set -u
 cd "$(dirname "$0")/.."
+. "$(dirname "$0")/lib/fleet.sh"
+fleet_init /tmp/flint-ntls 6790 6791 6792
+fleet_guard
 B=./target/release/flint-server
 D=/tmp/flint-ntls; rm -rf "$D"; mkdir -p "$D"
-pkill -9 -f flint-server 2>/dev/null; sleep 0.4
-cleanup() { pkill -9 -f flint-server 2>/dev/null; rm -rf "$D"; }
+fleet_kill server; sleep 0.4
+cleanup() { fleet_kill server; rm -rf "$D"; }
 trap cleanup EXIT
 
 echo "== mint internal CA + cert (SAN flint-internal, server+client EKU)"

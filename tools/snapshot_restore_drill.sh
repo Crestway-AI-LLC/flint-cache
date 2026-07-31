@@ -14,15 +14,18 @@
 #   - the fleet journal records SnapshotTaken and SpareRestored
 set -u
 cd "$(dirname "$0")/.."
+. "$(dirname "$0")/lib/fleet.sh"
+fleet_init /tmp/flint-snap 6870 6871 7590
+fleet_guard
 B=./target/release/flint-server
 CP=./target/release/flint-controlplane
 CTL=./target/release/flint-controller
 D=/tmp/flint-snap; rm -rf "$D"; mkdir -p "$D"
-pkill -9 -f flint-server 2>/dev/null; pkill -9 -f flint-controller 2>/dev/null
-pkill -9 -f flint-controlplane 2>/dev/null; sleep 0.4
+fleet_kill server; fleet_kill controller
+fleet_kill controlplane; sleep 0.4
 cleanup() {
-  pkill -9 -f flint-server 2>/dev/null; pkill -9 -f flint-controller 2>/dev/null
-  pkill -9 -f flint-controlplane 2>/dev/null; rm -rf "$D"
+  fleet_kill server; fleet_kill controller
+  fleet_kill controlplane; rm -rf "$D"
 }
 trap cleanup EXIT
 

@@ -14,11 +14,14 @@
 #     commands_read/write_total) counts both sides correctly
 set -u
 cd "$(dirname "$0")/.."
+. "$(dirname "$0")/lib/fleet.sh"
+fleet_init /tmp/flint-rwiso 6940 7861
+fleet_guard
 B=./target/release/flint-server
 PX=./target/release/flint-proxy
 D=/tmp/flint-rwiso; rm -rf "$D"; mkdir -p "$D"
-pkill -9 -f flint-server 2>/dev/null; pkill -9 -f flint-proxy 2>/dev/null; sleep 0.4
-cleanup() { pkill -9 -f flint-server 2>/dev/null; pkill -9 -f flint-proxy 2>/dev/null; rm -rf "$D"; }
+fleet_kill server; fleet_kill proxy; sleep 0.4
+cleanup() { fleet_kill server; fleet_kill proxy; rm -rf "$D"; }
 trap cleanup EXIT
 
 $B --port 6940 --engine rocks --data-dir "$D/m" 2>/dev/null &

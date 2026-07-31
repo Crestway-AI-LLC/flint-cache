@@ -7,13 +7,16 @@
 # moved slots answer -MOVED on the old owner and serve on the new one.
 set -u
 cd "$(dirname "$0")/.."
-pkill -9 -f flint-server 2>/dev/null; pkill -9 -f flint-controller 2>/dev/null; sleep 0.4
+. "$(dirname "$0")/lib/fleet.sh"
+fleet_init /tmp/flint-rb- 6600 6601 6602
+fleet_guard
+fleet_kill server; fleet_kill controller; sleep 0.4
 B=./target/release/flint-server
 P0=6600; P1=6601; P2=6602
 DIRS=""
 cleanup() {
   pkill -9 -f "flint-server --port 660" 2>/dev/null
-  pkill -9 -f flint-controller 2>/dev/null
+  fleet_kill controller
   rm -rf /tmp/flint-rb-*
 }
 trap cleanup EXIT

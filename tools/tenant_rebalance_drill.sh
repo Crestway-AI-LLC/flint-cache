@@ -10,13 +10,16 @@
 #   - per-tenant DBSIZE is conserved (no loss, no duplication, no bleed)
 set -u
 cd "$(dirname "$0")/.."
-pkill -9 -f flint-server 2>/dev/null; pkill -9 -f flint-controller 2>/dev/null; pkill -9 -f flint-proxy 2>/dev/null; sleep 0.4
+. "$(dirname "$0")/lib/fleet.sh"
+fleet_init /tmp/flint-tr- 6668 6700 6701
+fleet_guard
+fleet_kill server; fleet_kill controller; fleet_kill proxy; sleep 0.4
 B=./target/release/flint-server
 P0=6700; P1=6701
 cleanup() {
   pkill -9 -f "flint-server --port 670" 2>/dev/null
-  pkill -9 -f flint-controller 2>/dev/null
-  pkill -9 -f flint-proxy 2>/dev/null
+  fleet_kill controller
+  fleet_kill proxy
   rm -rf /tmp/flint-tr-*
 }
 trap cleanup EXIT

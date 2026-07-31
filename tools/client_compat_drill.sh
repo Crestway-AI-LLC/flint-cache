@@ -15,16 +15,19 @@
 # let the script build a throwaway venv with the newest python3 it finds.
 set -u
 cd "$(dirname "$0")/.."
+. "$(dirname "$0")/lib/fleet.sh"
+fleet_init /tmp/flint-compat-state 7321 7322 7323 7324 7683 7724
+fleet_guard
 STATE=/tmp/flint-compat-state; INV=/tmp/flint-compat.flint
 PORT=7683
 
-pkill -9 -f flint-server 2>/dev/null; pkill -9 -f flint-proxy 2>/dev/null
-pkill -9 -f flint-controlplane 2>/dev/null; pkill -9 -f flint-controller 2>/dev/null
+fleet_kill server; fleet_kill proxy
+fleet_kill controlplane; fleet_kill controller
 sleep 0.4
 cleanup() {
   ./target/release/flintctl -f "$INV" stop 2>/dev/null
-  pkill -9 -f flint-server 2>/dev/null; pkill -9 -f flint-proxy 2>/dev/null
-  pkill -9 -f flint-controlplane 2>/dev/null; pkill -9 -f flint-controller 2>/dev/null
+  fleet_kill server; fleet_kill proxy
+  fleet_kill controlplane; fleet_kill controller
   rm -rf "$STATE" "$INV"
 }
 trap cleanup EXIT
