@@ -11,7 +11,7 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init /tmp/flint-migsl-state 7001 7002 7011 7012 7379 7500
+fleet_init /tmp/flint-migsl-state 7231 7232 7233 7234 7235 7236
 fleet_guard
 STATE=/tmp/flint-migsl-state; INV=/tmp/flint-migsl.flint
 RUN=/tmp/flint-migsl-run; ACK=/tmp/flint-migsl-ack
@@ -37,12 +37,12 @@ cat > "$INV" <<EOF
 statedir $STATE
 bins ./target/release
 tls on
-cp 127.0.0.1:7500
-pair 127.0.0.1:7001,127.0.0.1:7002
-proxy 127.0.0.1:7379
+cp 127.0.0.1:7236
+pair 127.0.0.1:7231,127.0.0.1:7232
+proxy 127.0.0.1:7235
 controller on
 EOF
-A="valkey-cli -p 7379 -a tok-acme --no-auth-warning"
+A="valkey-cli -p 7235 -a tok-acme --no-auth-warning"
 
 echo "== bootstrap one pair (owns all 16384 slots)"
 ./target/release/flintctl -f "$INV" bootstrap >/dev/null 2>&1
@@ -51,7 +51,7 @@ echo "== bootstrap one pair (owns all 16384 slots)"
 # {mig2} hashes to slot 8450. Seed 2000 keys all in that slot.
 echo "== seed 2000 keys in slot 8450 ({mig2})"
 awk 'BEGIN{for(i=0;i<2000;i++){k=sprintf("{mig2}:k%05d",i);v=sprintf("v%05d",i);printf "*3\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n",length(k),k,length(v),v}}' \
-  | valkey-cli -p 7379 -a tok-acme --no-auth-warning --pipe >/dev/null 2>&1
+  | valkey-cli -p 7235 -a tok-acme --no-auth-warning --pipe >/dev/null 2>&1
 BEFORE=$($A GET '{mig2}:k00000')
 [ "$BEFORE" = "v00000" ] || { echo "FAIL: seed not readable ($BEFORE)"; exit 1; }
 echo "  seeded; sample {mig2}:k00000 = $BEFORE"
@@ -67,7 +67,7 @@ WPID=$!
 sleep 1
 
 echo "== expand: add a second pair (unranged — owns nothing yet)"
-./target/release/flintctl -f "$INV" expand 127.0.0.1:7011,127.0.0.1:7012 >/dev/null 2>&1
+./target/release/flintctl -f "$INV" expand 127.0.0.1:7233,127.0.0.1:7234 >/dev/null 2>&1
 sleep 1
 
 echo "== migrate-slots acme 8400-8500 : pair 0 -> pair 1"
@@ -81,7 +81,7 @@ import socket, ssl
 d="/tmp/flint-migsl-state/certs"
 ctx=ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT); ctx.load_verify_locations(f"{d}/ca.crt")
 ctx.load_cert_chain(f"{d}/int.crt", f"{d}/int.key"); ctx.check_hostname=False
-s=ctx.wrap_socket(socket.create_connection(("127.0.0.1",7500),timeout=5),server_hostname="flint-internal")
+s=ctx.wrap_socket(socket.create_connection(("127.0.0.1",7236),timeout=5),server_hostname="flint-internal")
 s.sendall(b"*1\r\n$7\r\nCPSLOTS\r\n")
 print(s.recv(65536).decode(errors="replace"))
 PY
@@ -97,13 +97,13 @@ AFTER=$($A GET '{mig2}:k00000')
 [ "$($A GET '{mig2}:k01999')" = "v01999" ] || { echo "FAIL: tail key lost after move"; exit 1; }
 echo "  {mig2}:k00000 and k01999 both intact via the proxy"
 
-echo "== the NEW owner (pair 1 master, 7011) physically holds the slot"
+echo "== the NEW owner (pair 1 master, 7233) physically holds the slot"
 HELD=$(python3 - <<'PY'
 import socket, ssl
 d="/tmp/flint-migsl-state/certs"
 ctx=ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT); ctx.load_verify_locations(f"{d}/ca.crt")
 ctx.load_cert_chain(f"{d}/int.crt", f"{d}/int.key"); ctx.check_hostname=False
-s=ctx.wrap_socket(socket.create_connection(("127.0.0.1",7011),timeout=5),server_hostname="flint-internal")
+s=ctx.wrap_socket(socket.create_connection(("127.0.0.1",7233),timeout=5),server_hostname="flint-internal")
 def cmd(*a):
     fr=b"*%d\r\n"%len(a)+b"".join(b"$%d\r\n%s\r\n"%(len(x),x) for x in a); s.sendall(fr)
     return s.recv(65536)
@@ -111,8 +111,8 @@ cmd(b"FLINTNS",b"acme")
 print(cmd(b"GET",b"{mig2}:k00000").decode(errors="replace"))
 PY
 )
-echo "$HELD" | grep -q 'v00000' || { echo "FAIL: new owner 7011 does not hold the slot data"; echo "$HELD"; exit 1; }
-echo "  pair 1 master (7011) serves {mig2}:k00000 directly"
+echo "$HELD" | grep -q 'v00000' || { echo "FAIL: new owner 7233 does not hold the slot data"; echo "$HELD"; exit 1; }
+echo "  pair 1 master (7233) serves {mig2}:k00000 directly"
 
 ACKED=$(cat "$ACK"); GOT=$($A GET '{mig2}:writer')
 [ -n "$ACKED" ] && [ "$GOT" -ge "$ACKED" ] 2>/dev/null \

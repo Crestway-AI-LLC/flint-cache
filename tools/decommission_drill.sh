@@ -14,7 +14,7 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init /tmp/flint-decom-state 7001 7002 7379 7500
+fleet_init /tmp/flint-decom-state 7221 7222 7223 7224
 fleet_guard
 STATE=/tmp/flint-decom-state
 INV=/tmp/flint-decom.flint
@@ -40,16 +40,16 @@ cat > "$INV" <<EOF
 statedir $STATE
 bins ./target/release
 tls on
-cp 127.0.0.1:7500
-pair 127.0.0.1:7001,127.0.0.1:7002
-proxy 127.0.0.1:7379
+cp 127.0.0.1:7224
+pair 127.0.0.1:7221,127.0.0.1:7222
+proxy 127.0.0.1:7223
 controller on
 EOF
 
 status() { ./target/release/flintctl -f "$INV" status 2>/dev/null; }
 master() { status | awk '/master/{print $3; exit}'; }
 nodes_live() { status | grep -cE 'master|replica'; }
-A="valkey-cli -p 7379 -a tok-acme --no-auth-warning"
+A="valkey-cli -p 7223 -a tok-acme --no-auth-warning"
 
 echo "== bootstrap a master+replica pair behind a proxy + controller"
 ./target/release/flintctl -f "$INV" bootstrap >/dev/null 2>&1
@@ -57,7 +57,7 @@ echo "== bootstrap a master+replica pair behind a proxy + controller"
 
 echo "== seed 5000 keys through the proxy"
 awk 'BEGIN{for(i=0;i<5000;i++){k=sprintf("k:%05d",i);v=sprintf("v-%05d",i);printf "*3\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n",length(k),k,length(v),v}}' \
-  | valkey-cli -p 7379 -a tok-acme --no-auth-warning --pipe >/dev/null 2>&1
+  | valkey-cli -p 7223 -a tok-acme --no-auth-warning --pipe >/dev/null 2>&1
 SEED=$($A DBSIZE)
 [ "$SEED" = "5000" ] || { echo "FAIL: seed DBSIZE=$SEED (want 5000)"; exit 1; }
 echo "  seeded 5000"
@@ -102,7 +102,7 @@ echo "== DECOMMISSION the replica ($VICTIM) — pair keeps serving master-only"
 ./target/release/flintctl -f "$INV" decommission-node "$VICTIM" 2>&1 | grep -E 'draining|complete' | sed 's/^/  /'
 sleep 1
 [ "$(nodes_live)" -eq 1 ] || { echo "FAIL: expected 1 node after decommission, got $(nodes_live)"; exit 1; }
-grep -q "7001,127.0.0.1:7002" "$INV" && { echo "FAIL: inventory still lists both nodes"; exit 1; }
+grep -q "7221,127.0.0.1:7222" "$INV" && { echo "FAIL: inventory still lists both nodes"; exit 1; }
 [ "$($A DBSIZE)" -ge 5000 ] || { echo "FAIL: data lost after decommission"; exit 1; }
 [ "$($A SET post:decom ok)" = "OK" ] || { echo "FAIL: not writable after decommission"; exit 1; }
 echo "  pair serves reads+writes on the remaining node; keys intact; inventory updated"

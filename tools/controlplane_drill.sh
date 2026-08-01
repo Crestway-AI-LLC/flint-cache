@@ -11,7 +11,7 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init /tmp/flint-cp-drill-state 6730 6740 7500 7601 7602
+fleet_init /tmp/flint-cp-drill-state 6730 6740 7241 7601 7602
 fleet_guard
 fleet_kill server; fleet_kill proxy; fleet_kill controlplane; sleep 0.4
 B=./target/release/flint-server
@@ -35,22 +35,22 @@ done
 sleep 0.8
 
 echo "== control plane + registrations"
-$CP --port 7500 --state "$STATE" 2>/tmp/flint-cpd-cp.log &
-fleet_wait_listen 7500
+$CP --port 7241 --state "$STATE" 2>/tmp/flint-cpd-cp.log &
+fleet_wait_listen 7241
 sleep 0.5
-valkey-cli -p 7500 CPADDPROXY 127.0.0.1:7601 >/dev/null
-valkey-cli -p 7500 CPADDPROXY 127.0.0.1:7602 >/dev/null
-valkey-cli -p 7500 CPADDPAIR 127.0.0.1:6730 >/dev/null
-valkey-cli -p 7500 CPADDPAIR 127.0.0.1:6740 >/dev/null
+valkey-cli -p 7241 CPADDPROXY 127.0.0.1:7601 >/dev/null
+valkey-cli -p 7241 CPADDPROXY 127.0.0.1:7602 >/dev/null
+valkey-cli -p 7241 CPADDPAIR 127.0.0.1:6730 >/dev/null
+valkey-cli -p 7241 CPADDPAIR 127.0.0.1:6740 >/dev/null
 
 echo "== two proxies in control-plane mode (no --pairs/--tenants flags)"
-$PX --port 7601 --control-plane 127.0.0.1:7500 --advertise 127.0.0.1:7601 2>/tmp/flint-cpd-p1.log &
-$PX --port 7602 --control-plane 127.0.0.1:7500 --advertise 127.0.0.1:7602 2>/tmp/flint-cpd-p2.log &
+$PX --port 7601 --control-plane 127.0.0.1:7241 --advertise 127.0.0.1:7601 2>/tmp/flint-cpd-p1.log &
+$PX --port 7602 --control-plane 127.0.0.1:7241 --advertise 127.0.0.1:7602 2>/tmp/flint-cpd-p2.log &
 fleet_wait_listen 7601 7602
 sleep 1.5
 
 echo "== add tenant with k=1: assigned to exactly one proxy (shuffle shard)"
-R=$(valkey-cli -p 7500 CPADDTENANT acme tok-acme acme 1)
+R=$(valkey-cli -p 7241 CPADDTENANT acme tok-acme acme 1)
 echo "  $R"
 SUB=$(echo "$R" | grep -oE '\[[^]]*\]' | tr -d '[]')
 [ -n "$SUB" ] || { echo "FAIL: no subset in reply: $R"; exit 1; }
@@ -68,7 +68,7 @@ echo "$X" | grep -q "WRONGPASS" || { echo "FAIL: non-assigned proxy :$OPORT acce
 echo "  assigned :$APORT serves; other :$OPORT refuses (WRONGPASS) — blast radius bounded"
 
 echo "== runtime add with k=2: appears on BOTH proxies, no restarts"
-valkey-cli -p 7500 CPADDTENANT globex tok-glx globex 2 >/dev/null
+valkey-cli -p 7241 CPADDTENANT globex tok-glx globex 2 >/dev/null
 sleep 1.5
 for p in 7601 7602; do
   W=$(valkey-cli -p $p -a tok-glx --no-auth-warning SET g 1 2>&1)
@@ -77,7 +77,7 @@ done
 echo "  globex live on both proxies within one push cycle"
 
 echo "== CPSETSUBSET: drain globex to :$APORT only (live re-assignment)"
-valkey-cli -p 7500 CPSETSUBSET globex "127.0.0.1:$APORT" >/dev/null
+valkey-cli -p 7241 CPSETSUBSET globex "127.0.0.1:$APORT" >/dev/null
 sleep 1.5
 X=$(valkey-cli -p "$OPORT" -a tok-glx --no-auth-warning SET g 2 2>&1)
 echo "$X" | grep -q "WRONGPASS" || { echo "FAIL: drained proxy :$OPORT still accepts globex: $X"; exit 1; }
@@ -86,20 +86,20 @@ W=$(valkey-cli -p "$APORT" -a tok-glx --no-auth-warning SET g 2 2>&1)
 echo "  drained live: :$OPORT refuses, :$APORT serves"
 
 echo "== CP outage: data path unaffected; restart restores durable state"
-V_BEFORE=$(valkey-cli -p 7500 CPINFO | tr '\r' '\n' | grep "^version" | cut -d: -f2)
+V_BEFORE=$(valkey-cli -p 7241 CPINFO | tr '\r' '\n' | grep "^version" | cut -d: -f2)
 fleet_kill controlplane; sleep 0.5
 W=$(valkey-cli -p "$APORT" -a tok-acme --no-auth-warning SET during-outage ok 2>&1)
 [ "$W" = "OK" ] || { echo "FAIL: data path depends on CP being up: $W"; exit 1; }
 [ "$(valkey-cli -p "$APORT" -a tok-acme --no-auth-warning GET during-outage)" = "ok" ] || { echo "FAIL: read during outage"; exit 1; }
-$CP --port 7500 --state "$STATE" 2>>/tmp/flint-cpd-cp.log &
-fleet_wait_listen 7500
+$CP --port 7241 --state "$STATE" 2>>/tmp/flint-cpd-cp.log &
+fleet_wait_listen 7241
 sleep 1
-V_AFTER=$(valkey-cli -p 7500 CPINFO | tr '\r' '\n' | grep "^version" | cut -d: -f2)
+V_AFTER=$(valkey-cli -p 7241 CPINFO | tr '\r' '\n' | grep "^version" | cut -d: -f2)
 [ "$V_AFTER" = "$V_BEFORE" ] || { echo "FAIL: state lost across restart ($V_BEFORE -> $V_AFTER)"; exit 1; }
 echo "  wrote+read during CP outage; restart restored version $V_AFTER"
 
 echo "== tenant added after CP restart still propagates (watch reconnected)"
-valkey-cli -p 7500 CPADDTENANT initech tok-ini initech 2 >/dev/null
+valkey-cli -p 7241 CPADDTENANT initech tok-ini initech 2 >/dev/null
 OK=0
 for i in $(seq 1 10); do
   [ "$(valkey-cli -p 7601 -a tok-ini --no-auth-warning SET i 1 2>&1)" = "OK" ] && { OK=1; break; }

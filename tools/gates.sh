@@ -53,8 +53,35 @@ step() {  # step <name> <log-suffix> <command...>
 want() { case " ${STAGES} " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
 STAGES="${*:-check conformance drills chaos}"
 
+# No drill may claim the DEFAULT cluster ports.
+#
+# fleet.sh decides ownership by scope directory OR port: a process on one of
+# the drill's declared ports counts as the drill's own, so fleet_guard lets it
+# through and fleet_kill sends it -9. That is right for a leaked seat and
+# catastrophic for the real thing, because 7001/7002/7379/7500 is exactly what
+# render-inventory.sh and the playground deploy. Four public drills and one
+# fleet drill claimed that block, which meant running the suite on a machine
+# with a default-port cluster would kill it — silently, since the guard reads
+# it as ours. That is the harm the guard exists to prevent, arriving through
+# the port channel.
+#
+# Kept here rather than in fleet.sh because it is a property of the SET of
+# drills, which no single drill can check about itself.
+assert_no_default_ports() {
+  local hits
+  hits=$(grep -nE '^fleet_init .*[^0-9](7001|7002|7379|7500)([^0-9]|$)' \
+    tools/*_drill.sh 2>/dev/null || true)
+  [ -z "$hits" ] && return 0
+  echo "FAIL  drills claim the default cluster ports (7001/7002/7379/7500):"
+  echo "$hits" | sed 's/^/        /'
+  echo "        fleet_kill would -9 a real cluster on those ports and"
+  echo "        fleet_guard would not object. Move the drill to a free block."
+  FAILED="$FAILED default-ports"
+}
+
 if want check; then
   echo "== gates: fmt, clippy, tests (both feature configs)"
+  assert_no_default_ports
   step "fmt" fmt cargo fmt --all --check
   step "clippy (mem)" clippy-mem \
     cargo clippy --workspace --all-targets -- -D warnings
