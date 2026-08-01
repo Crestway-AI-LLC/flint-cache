@@ -4,6 +4,7 @@
 # verify -READONLY, kill the master, confirm the replica keeps serving.
 # Requires a release build with --features rocks and valkey-cli.
 set -euo pipefail
+. "$(dirname "$0")/lib/fleet.sh"
 
 KEYS="${1:-50000}"
 MPORT="${2:-6420}"
@@ -21,9 +22,11 @@ trap cleanup EXIT
 
 echo "== master :$MPORT, replica :$RPORT, $KEYS keys"
 "$BIN" --port "$MPORT" --engine rocks --data-dir "$MDIR" &
+fleet_wait_listen "$MPORT"
 sleep 0.4
 RLOG="$(mktemp /tmp/flint-replica-log.XXXXXX)"
 "$BIN" --port "$RPORT" --engine rocks --data-dir "$RDIR" --replica-of "127.0.0.1:$MPORT" 2> "$RLOG" &
+fleet_wait_listen "$RPORT"
 sleep 0.6
 
 echo "== loading $KEYS strings + 500 hashes into the master"

@@ -33,6 +33,7 @@ valkey-cli -p 7840 CPADDTENANT acme tok-acme acme 1 >/dev/null
 $B --port 7101 --engine rocks --data-dir "$D/a" --advertise 127.0.0.1:7101 2>/dev/null &
 $B --port 7102 --engine rocks --data-dir "$D/b" --advertise 127.0.0.1:7102 2>/dev/null &
 $PX --port 7995 --control-plane 127.0.0.1:7840 --advertise 127.0.0.1:7995 2>/dev/null &
+fleet_wait_listen 7101 7102 7995
 sleep 1.5
 A="valkey-cli -p 7995 -a tok-acme --no-auth-warning"
 
@@ -68,6 +69,7 @@ echo "  CP restarted; exception row intact"
 echo "== COLD proxy: correct routing from the first snapshot, zero -MOVED"
 pkill -9 -f "flint-proxy --port 7995"; sleep 0.3
 $PX --port 7995 --control-plane 127.0.0.1:7840 --advertise 127.0.0.1:7995 2>/dev/null &
+fleet_wait_listen 7995
 sleep 1.5
 OK=1
 for i in 1 13 27 42 50; do

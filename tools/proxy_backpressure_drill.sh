@@ -22,8 +22,10 @@ trap cleanup EXIT
 
 echo "== A) admission cap: --max-conns 4, shed the 5th with -THROTTLED"
 $B --port 6810 --engine rocks --data-dir "$D/d" 2>/dev/null &
+fleet_wait_listen 6810
 sleep 0.6
 $PX --port 7810 --pairs "127.0.0.1:6810" --max-conns 4 2>"$D/px.log" &
+fleet_wait_listen 7810
 sleep 1.0
 grep -q "max-conns 4" "$D/px.log" || { echo "FAIL: proxy did not report the cap"; cat "$D/px.log"; exit 1; }
 
@@ -75,8 +77,10 @@ echo "== B) data-plane -THROTTLED passes through the proxy unchanged"
 fleet_kill server; fleet_kill proxy; sleep 0.4
 # Widowed master: requires 1 live replica to write, but has none -> writes shed.
 $B --port 6811 --engine rocks --data-dir "$D/d2" --min-replicas-to-write 1 2>/dev/null &
+fleet_wait_listen 6811
 sleep 0.6
 $PX --port 7811 --pairs "127.0.0.1:6811" 2>"$D/px2.log" &
+fleet_wait_listen 7811
 sleep 1.0
 R=$(valkey-cli -p 7811 SET k v 2>&1)
 echo "$R" | grep -qi "THROTTLED" || { echo "FAIL: proxy did not relay -THROTTLED (got: $R)"; exit 1; }

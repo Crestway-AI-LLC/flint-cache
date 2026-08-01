@@ -28,6 +28,7 @@ trap cleanup EXIT
 
 $B --port $SPORT --engine rocks --data-dir "$SDIR" 2>/dev/null &
 $B --port $DPORT --engine rocks --data-dir "$DDIR" 2>/dev/null &
+fleet_wait_listen $SPORT $DPORT
 sleep 0.8
 for p in $SPORT $DPORT; do
   [ "$(valkey-cli -p $p PING 2>/dev/null)" = "PONG" ] || { echo "FAIL: node :$p not up"; exit 1; }

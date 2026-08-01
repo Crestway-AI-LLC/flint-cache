@@ -38,6 +38,7 @@ echo "== start controller (failover) and proxy (routing)"
 ./target/release/flint-controller --pairs "127.0.0.1:6630,127.0.0.1:6631;127.0.0.1:6640,127.0.0.1:6641" \
   --id PX --poll-ms 150 --confirm 3 2>/tmp/flint-px-ctl.log &
 ./target/release/flint-proxy --port 6666 --pairs "127.0.0.1:6630,127.0.0.1:6631;127.0.0.1:6640,127.0.0.1:6641" 2>/tmp/flint-px-proxy.log &
+fleet_wait_listen 6666
 sleep 1.2
 [ "$(valkey-cli -p 6666 PING)" = "PONG" ] || { echo "FAIL: proxy not up"; exit 1; }
 

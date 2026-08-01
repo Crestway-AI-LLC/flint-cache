@@ -39,12 +39,14 @@ INT="--internal-ca $D/ca.crt --internal-cert $D/int.crt --internal-key $D/int.ke
 
 echo "== flint-server with internal mTLS on the data port"
 $B --port 6770 --engine rocks --data-dir "$D/data" $INT 2>"$D/srv.log" &
+fleet_wait_listen 6770
 sleep 0.8
 grep -q "internal mTLS" "$D/srv.log" || { echo "FAIL: server not in mTLS mode"; cat "$D/srv.log"; exit 1; }
 echo "  server up in internal-mTLS mode"
 
 echo "== proxy dials the backend as a mutual-TLS client (frontend stays plaintext)"
 $PX --port 7770 --pairs "127.0.0.1:6770" $INT 2>"$D/px.log" &
+fleet_wait_listen 7770
 sleep 1.0
 [ "$(valkey-cli -p 7770 SET ik hello)" = "OK" ] || { echo "FAIL: SET through mTLS backend"; cat "$D/px.log"; exit 1; }
 [ "$(valkey-cli -p 7770 GET ik)" = "hello" ] || { echo "FAIL: GET through mTLS backend"; exit 1; }
@@ -70,6 +72,7 @@ echo "== a proxy WITHOUT internal creds cannot reach the TLS backend"
 # Plaintext proxy dials the TLS server: the FLINTINFO probe fails the TLS
 # handshake, so no master is discovered and writes have nowhere to land.
 $PX --port 7771 --pairs "127.0.0.1:6770" 2>"$D/px_noc.log" &
+fleet_wait_listen 7771
 sleep 1.0
 R=$(valkey-cli -p 7771 SET nc v 2>&1)
 [ "$R" = "OK" ] && { echo "FAIL: credential-less proxy wrote to TLS backend ($R)"; exit 1; }
@@ -98,9 +101,11 @@ echo "  FLINTSYNC over TLS handshakes: ${X%%$'\r'*} (full parity in node_tls_dri
 echo "== no --internal-* flags: server+proxy plaintext, unchanged"
 fleet_kill server; fleet_kill proxy; sleep 0.4
 $B --port 6771 --engine rocks --data-dir "$D/data2" 2>"$D/srv2.log" &
+fleet_wait_listen 6771
 sleep 0.6
 grep -q "plaintext" "$D/srv2.log" || { echo "FAIL: server not plaintext without flags"; exit 1; }
 $PX --port 7772 --pairs "127.0.0.1:6771" 2>"$D/px2.log" &
+fleet_wait_listen 7772
 sleep 0.8
 [ "$(valkey-cli -p 7772 SET pk world)" = "OK" ] || { echo "FAIL: plaintext path broken"; exit 1; }
 [ "$(valkey-cli -p 7772 GET pk)" = "world" ] || { echo "FAIL: plaintext GET"; exit 1; }

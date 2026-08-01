@@ -21,9 +21,11 @@ cleanup() {
 trap cleanup EXIT
 
 $B --port 6650 --engine rocks --data-dir "$D" 2>/dev/null &
+fleet_wait_listen 6650
 sleep 0.6
 ./target/release/flint-proxy --port 6667 --pairs "127.0.0.1:6650" \
   --tenants "tokA=alpha,tokB=beta" 2>/tmp/flint-tn-proxy.log &
+fleet_wait_listen 6667
 sleep 0.5
 
 echo "== pre-auth: everything but AUTH/QUIT is refused"

@@ -37,6 +37,7 @@ valkey-cli -p 7640 CPADDPAIR 127.0.0.1:6970,127.0.0.1:6971,127.0.0.1:6972 >/dev/
 valkey-cli -p 7640 CPADDTENANT acme tok-acme acme 1 >/dev/null
 start_replica() { $B --port "$1" --engine rocks --data-dir "$D/$2" --replica-of 127.0.0.1:6970 2>/dev/null & }
 $B --port 6970 --engine rocks --data-dir "$D/m" 2>/dev/null &
+fleet_wait_listen 6970
 sleep 0.7
 start_replica 6971 r1
 start_replica 6972 r2

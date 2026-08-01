@@ -38,8 +38,10 @@ valkey-cli -p 7660 CPADDTENANT acme tok-acme acme 1 >/dev/null
 valkey-cli -p 7660 CPADDTENANT globex tok-glx globex 1 >/dev/null
 valkey-cli -p 7660 CPTENANTCACHE acme on >/dev/null || { echo "FAIL: CPTENANTCACHE"; exit 1; }
 $B --port 6970 --engine rocks --data-dir "$D/m" 2>/dev/null &
+fleet_wait_listen 6970
 sleep 0.7
 $PX --port 7881 --control-plane 127.0.0.1:7660 --advertise 127.0.0.1:7881 2>"$D/px.log" &
+fleet_wait_listen 7881
 sleep 1.5
 
 echo "== cache defaults ON (ttl 300 ms, 256 MB); operator retunes at RUNTIME: PROXYCACHE 1500 65536"
@@ -121,6 +123,7 @@ echo "== FAILOVER: invalidation keeps working through a promoted master (coverag
 # master; a write through the proxy must invalidate and the next GET must
 # come from the NEW master (fresh), not the cache (stale).
 $B --port 6971 --engine rocks --data-dir "$D/r" --replica-of 127.0.0.1:6970 2>/dev/null &
+fleet_wait_listen 6971
 sleep 1.2
 $A SET f1 before >/dev/null; $A GET f1 >/dev/null   # cache 'before'
 sleep 0.5                                            # let the write replicate

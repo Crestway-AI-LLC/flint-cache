@@ -33,8 +33,10 @@ valkey-cli -p 7770 CPADDPROXY 127.0.0.1:7991 >/dev/null
 valkey-cli -p 7770 CPADDPAIR 127.0.0.1:7031 >/dev/null
 valkey-cli -p 7770 CPADDTENANT acme super-secret-token acme 1 >/dev/null
 $B --port 7031 --engine rocks --data-dir "$D/m" 2>/dev/null &
+fleet_wait_listen 7031
 sleep 0.7
 $PX --port 7991 --control-plane 127.0.0.1:7770 --advertise 127.0.0.1:7991 2>/dev/null &
+fleet_wait_listen 7991
 sleep 1.2
 
 echo "== the plaintext exists NOWHERE server-side"
@@ -77,6 +79,7 @@ pair 127.0.0.1:7031 0-16383
 tenant legacy legacy-plaintext-tok legacy 127.0.0.1:7991 - 0 0 0 0 0
 EOF
 $CP --port 7770 --state "$D/cp-old" 2>/dev/null &
+fleet_wait_listen 7770
 sleep 1.5
 V=$(valkey-cli -p 7991 -a legacy-plaintext-tok --no-auth-warning PING 2>&1 | head -1)
 echo "$V" | grep -qi "PONG" || { echo "FAIL: legacy tenant cannot auth after migration: $V"; exit 1; }

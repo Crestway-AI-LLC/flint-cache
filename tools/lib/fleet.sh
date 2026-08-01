@@ -107,6 +107,46 @@ _fleet_ours() {
     }'
 }
 
+# fleet_wait_listen <port> [port ...] — block until each port accepts.
+#
+# Takes SEVERAL ports on purpose. Drills routinely start a pair with one
+# sleep covering both, and waiting on only the last one would quietly narrow
+# the check to half of what the sleep covered — the seat that starts first is
+# usually ready first, so the narrowing would hold right up until the day it
+# did not.
+#
+# Drills used to start a seat and then `sleep 0.5`, which is not a wait, it is
+# a BET that the machine can start a just-linked binary in half a second. The
+# first run after a build loses it — a first exec pays for signature
+# validation and a cold page cache — and the drill then talks to a socket
+# nobody is listening on. One such run failed five unrelated drills that all
+# passed on every rerun, which reads exactly like a product bug and is not
+# one; that cost an afternoon.
+#
+# A TCP accept is the right signal because it is the one every component
+# shares: PING needs RESP and would need the right TLS config, while "are you
+# listening" is answerable for a node, a proxy and a control plane alike. It
+# is also STRICTLY better than a sleep for a fresh replica, whose listener
+# binds only after its checkpoint download finishes.
+#
+# Waits that are not readiness — "let the controller observe convergence" —
+# are a different thing and must stay sleeps.
+fleet_wait_listen() {
+  local port deadline
+  for port in "$@"; do
+    deadline=$(( $(date +%s) + 30 ))
+    while :; do
+      if (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then break; fi
+      if [ "$(date +%s)" -ge "$deadline" ]; then
+        echo "FAIL: nothing listening on 127.0.0.1:$port after 30s"
+        return 1
+      fi
+      sleep 0.05
+    done
+  done
+  return 0
+}
+
 # fleet_guard — refuse to run on a box that already has a foreign fleet.
 #
 # The point is to FAIL rather than destroy. A drill that silently killed a

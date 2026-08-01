@@ -5,6 +5,7 @@
 # writes with data intact — and that stale/equal epochs are FENCED.
 # (The meta trio will automate the decision; the mechanics are these.)
 set -euo pipefail
+. "$(dirname "$0")/lib/fleet.sh"
 
 KEYS="${1:-20000}"
 MPORT="${2:-6440}"
@@ -22,8 +23,10 @@ trap cleanup EXIT
 
 echo "== master :$MPORT, replica :$RPORT"
 "$BIN" --port "$MPORT" --engine rocks --data-dir "$MDIR" &
+fleet_wait_listen "$MPORT"
 sleep 0.4
 "$BIN" --port "$RPORT" --engine rocks --data-dir "$RDIR" --replica-of "127.0.0.1:$MPORT" &
+fleet_wait_listen "$RPORT"
 sleep 0.6
 
 echo "== loading $KEYS keys"
@@ -80,6 +83,7 @@ echo "== restart the promoted node WITH stale --replica-of: manifest must win"
 pkill -f "flint-server --port $RPORT"
 sleep 0.4
 "$BIN" --port "$RPORT" --engine rocks --data-dir "$RDIR" --replica-of "127.0.0.1:$MPORT" &
+fleet_wait_listen "$RPORT"
 sleep 0.6
 W2=$(valkey-cli -p "$RPORT" SET after-restart still-master)
 [ "$W2" = "OK" ] || { echo "FAIL: promoted role lost after restart: $W2"; exit 1; }
@@ -87,6 +91,7 @@ W2=$(valkey-cli -p "$RPORT" SET after-restart still-master)
 
 echo "== ZOMBIE: restart the OLD master on its old data dir"
 "$BIN" --port "$MPORT" --engine rocks --data-dir "$MDIR" &
+fleet_wait_listen "$MPORT"
 sleep 0.6
 # Hazard demonstrated: it still believes it is master (accepts a write).
 Z=$(valkey-cli -p "$MPORT" SET zombie-write bad 2>&1)
@@ -110,6 +115,7 @@ echo "== demotion survives restart (durable fencing)"
 pkill -f "flint-server --port $MPORT"
 sleep 0.4
 "$BIN" --port "$MPORT" --engine rocks --data-dir "$MDIR" &
+fleet_wait_listen "$MPORT"
 sleep 0.6
 RO2=$(valkey-cli -p "$MPORT" SET should-fail x 2>&1 || true)
 echo "$RO2" | grep -q "READONLY" || { echo "FAIL: zombie writable again after restart: $RO2"; exit 1; }

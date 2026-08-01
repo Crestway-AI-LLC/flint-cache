@@ -24,6 +24,7 @@ trap cleanup EXIT
 
 echo "== master with min-replicas-to-write=1, plus one replica"
 $B --port $MPORT --engine rocks --data-dir "$MDIR" --min-replicas-to-write 1 2>/dev/null &
+fleet_wait_listen $MPORT
 sleep 0.5
 
 echo "== gate engaged BEFORE any replica exists (no unbounded window at birth)"

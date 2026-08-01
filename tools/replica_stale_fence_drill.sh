@@ -35,10 +35,12 @@ valkey-cli -p 7810 CPADDPAIR 127.0.0.1:7081,127.0.0.1:7082 >/dev/null
 valkey-cli -p 7810 CPADDTENANT acme tok-acme acme 1 >/dev/null
 valkey-cli -p 7810 CPTENANTREADS acme on >/dev/null
 $B --port 7081 --engine rocks --data-dir "$D/m" 2>/dev/null &
+fleet_wait_listen 7081
 sleep 0.7
 $B --port 7082 --engine rocks --data-dir "$D/r" --replica-of 127.0.0.1:7081 \
    --replica-read-stale-ms 1500 2>/dev/null &
 $PX --port 7999 --control-plane 127.0.0.1:7810 --advertise 127.0.0.1:7999 2>/dev/null &
+fleet_wait_listen 7082 7999
 sleep 1.5
 
 A="valkey-cli -p 7999 -a tok-acme --no-auth-warning"

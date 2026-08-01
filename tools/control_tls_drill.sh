@@ -98,12 +98,14 @@ echo "  fleet + tenant registered through the encrypted client port"
 
 echo "== mTLS data pair + proxy (CPWATCH over mTLS, backends over mTLS)"
 $B --port 6795 --engine rocks --data-dir "$D/m" $INT 2>"$D/m.log" &
+fleet_wait_listen 6795
 sleep 0.8
 $B --port 6796 --engine rocks --data-dir "$D/r" --replica-of 127.0.0.1:6795 $INT 2>"$D/r.log" &
 # Point the proxy at a NON-leader CP node so the leader-kill below never
 # touches the proxy's watch connection.
 WATCH_NODE=$(( LEADER % 3 + 1 ))
 $PX --port 7790 --control-plane 127.0.0.1:754$WATCH_NODE --advertise 127.0.0.1:7790 $INT 2>"$D/px.log" &
+fleet_wait_listen 7790
 sleep 2
 a() { valkey-cli -p 7790 -a tok-acme --no-auth-warning "$@"; }
 [ "$(a SET ek hello)" = "OK" ] || { echo "FAIL: tenant write through full mesh"; tail -3 "$D/px.log"; exit 1; }

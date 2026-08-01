@@ -180,6 +180,7 @@ fleet_kill server; sleep 0.4; rm -rf "$D"; mkdir -p "$D"
 $B --port 6995 --engine rocks --data-dir "$D/m2" --async-writes acme 2>"$D/m2.log" &
 for i in $(seq 1 30); do [ "$(valkey-cli -p 6995 PING 2>/dev/null)" = "PONG" ] && break; sleep 0.2; done
 $B --port 6996 --engine rocks --data-dir "$D/r2" --replica-of 127.0.0.1:6995 2>"$D/r2.log" &
+fleet_wait_listen 6996
 sleep 1.2
 python3 - <<'PY'
 import socket, threading

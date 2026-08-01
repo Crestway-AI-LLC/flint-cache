@@ -25,8 +25,10 @@ cleanup() { fleet_kill server; fleet_kill proxy; rm -rf "$D"; }
 trap cleanup EXIT
 
 $B --port 6940 --engine rocks --data-dir "$D/m" 2>/dev/null &
+fleet_wait_listen 6940
 sleep 0.7
 $PX --port 7861 --pairs "127.0.0.1:6940" 2>/dev/null &
+fleet_wait_listen 7861
 sleep 1.0
 valkey-cli -p 7861 SET readkey readval >/dev/null
 

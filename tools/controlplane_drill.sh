@@ -36,6 +36,7 @@ sleep 0.8
 
 echo "== control plane + registrations"
 $CP --port 7500 --state "$STATE" 2>/tmp/flint-cpd-cp.log &
+fleet_wait_listen 7500
 sleep 0.5
 valkey-cli -p 7500 CPADDPROXY 127.0.0.1:7601 >/dev/null
 valkey-cli -p 7500 CPADDPROXY 127.0.0.1:7602 >/dev/null
@@ -45,6 +46,7 @@ valkey-cli -p 7500 CPADDPAIR 127.0.0.1:6740 >/dev/null
 echo "== two proxies in control-plane mode (no --pairs/--tenants flags)"
 $PX --port 7601 --control-plane 127.0.0.1:7500 --advertise 127.0.0.1:7601 2>/tmp/flint-cpd-p1.log &
 $PX --port 7602 --control-plane 127.0.0.1:7500 --advertise 127.0.0.1:7602 2>/tmp/flint-cpd-p2.log &
+fleet_wait_listen 7601 7602
 sleep 1.5
 
 echo "== add tenant with k=1: assigned to exactly one proxy (shuffle shard)"
@@ -90,6 +92,7 @@ W=$(valkey-cli -p "$APORT" -a tok-acme --no-auth-warning SET during-outage ok 2>
 [ "$W" = "OK" ] || { echo "FAIL: data path depends on CP being up: $W"; exit 1; }
 [ "$(valkey-cli -p "$APORT" -a tok-acme --no-auth-warning GET during-outage)" = "ok" ] || { echo "FAIL: read during outage"; exit 1; }
 $CP --port 7500 --state "$STATE" 2>>/tmp/flint-cpd-cp.log &
+fleet_wait_listen 7500
 sleep 1
 V_AFTER=$(valkey-cli -p 7500 CPINFO | tr '\r' '\n' | grep "^version" | cut -d: -f2)
 [ "$V_AFTER" = "$V_BEFORE" ] || { echo "FAIL: state lost across restart ($V_BEFORE -> $V_AFTER)"; exit 1; }

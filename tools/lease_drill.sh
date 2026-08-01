@@ -21,8 +21,10 @@ cleanup() {
 trap cleanup EXIT
 
 $B --port $MPORT --engine rocks --data-dir "$MDIR" 2>/dev/null &
+fleet_wait_listen $MPORT
 sleep 0.5
 $B --port $RPORT --engine rocks --data-dir "$RDIR" --replica-of 127.0.0.1:$MPORT 2>/dev/null &
+fleet_wait_listen $RPORT
 sleep 0.9
 valkey-cli -p $MPORT SET k v >/dev/null
 

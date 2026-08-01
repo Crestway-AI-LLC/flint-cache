@@ -59,6 +59,7 @@ PY
 
 echo "== master (mTLS) up; seed keys over mutual TLS"
 $B --port 6790 --engine rocks --data-dir "$D/m" $INT 2>"$D/m.log" &
+fleet_wait_listen 6790
 sleep 0.8
 # Seed: 2000 {mover} keys pipelined on one TLS connection.
 N=$(python3 - <<'PY'
@@ -85,6 +86,7 @@ echo "  2000 keys seeded over mTLS"
 
 echo "== fresh replica bootstraps over mTLS (full sync + tail)"
 $B --port 6791 --engine rocks --data-dir "$D/r" --replica-of 127.0.0.1:6790 $INT 2>"$D/r.log" &
+fleet_wait_listen 6791
 sleep 3
 R=$(resp 6791 3 GET "{mover}:key000123")
 echo "$R" | grep -q "base-000123" || { echo "FAIL: full-sync key missing on replica (got: $R)"; cat "$D/r.log" | tail -5; exit 1; }
@@ -111,6 +113,7 @@ echo "  tail write replicated over TLS"
 
 echo "== slot move between two mTLS nodes (migrate-in dials the source over mTLS)"
 $B --port 6792 --engine rocks --data-dir "$D/d" $INT 2>"$D/d.log" &
+fleet_wait_listen 6792
 sleep 0.8
 SLOT=$(python3 - <<'PY'
 def crc16(d):

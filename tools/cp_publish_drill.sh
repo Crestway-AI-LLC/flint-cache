@@ -27,14 +27,17 @@ cleanup() {
 trap cleanup EXIT
 
 $B --port 6890 --engine rocks --data-dir "$D/n" 2>/dev/null &
+fleet_wait_listen 6890
 sleep 0.6
 $CP --port 7595 --state "$D/cp" 2>"$D/cp.log" &
+fleet_wait_listen 7595
 sleep 0.5
 valkey-cli -p 7595 CPADDPROXY 127.0.0.1:7821 >/dev/null
 valkey-cli -p 7595 CPADDPROXY 127.0.0.1:7822 >/dev/null
 valkey-cli -p 7595 CPADDPAIR 127.0.0.1:6890 >/dev/null
 $PX --port 7821 --control-plane 127.0.0.1:7595 --advertise 127.0.0.1:7821 2>/dev/null &
 $PX --port 7822 --control-plane 127.0.0.1:7595 --advertise 127.0.0.1:7822 2>/dev/null &
+fleet_wait_listen 7821 7822
 sleep 1.5
 
 echo "== A) tenant pinned to proxy1 only: proxy2's push is SUPPRESSED"

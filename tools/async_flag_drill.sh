@@ -43,6 +43,7 @@ valkey-cli -p 7520 CPADDTENANT cold tok-cold cold 1 >/dev/null
 R=$(valkey-cli -p 7520 CPTENANTASYNC hot on)
 [ "$R" = "OK" ] || { echo "FAIL: CPTENANTASYNC: $R"; exit 1; }
 $PX --port 7611 --control-plane 127.0.0.1:7520 --advertise 127.0.0.1:7611 2>/tmp/flint-af-proxy.log &
+fleet_wait_listen 7611
 sleep 1.5
 
 echo "== snapshot carries the 'a' flag for hot only"

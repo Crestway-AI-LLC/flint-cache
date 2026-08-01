@@ -31,6 +31,7 @@ run_once() {
   SDIR=$(mktemp -d /tmp/flint-rec-s.XXXXXX); DDIR=$(mktemp -d /tmp/flint-rec-d.XXXXXX)
   $B --port $SPORT --engine rocks --data-dir "$SDIR" 2>/dev/null &
   $B --port $DPORT --engine rocks --data-dir "$DDIR" 2>/dev/null &
+  fleet_wait_listen $SPORT $DPORT
   sleep 0.8
 
   awk -v n="$KEYS" 'BEGIN{for(i=0;i<n;i++){k=sprintf("{mover}:key%06d",i);v=sprintf("val-%06d",i);printf "*3\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n",length(k),k,length(v),v}}' \
@@ -48,6 +49,7 @@ run_once() {
   # Restart both nodes on the same data dirs (the redeploy).
   $B --port $SPORT --engine rocks --data-dir "$SDIR" 2>/dev/null &
   $B --port $DPORT --engine rocks --data-dir "$DDIR" 2>/dev/null &
+  fleet_wait_listen $SPORT $DPORT
   sleep 0.9
 
   # Observe the interrupted state from the durable records.
@@ -105,6 +107,7 @@ test_half_done_flip() {
   SDIR=$(mktemp -d /tmp/flint-rec-s.XXXXXX); DDIR=$(mktemp -d /tmp/flint-rec-d.XXXXXX)
   $B --port $SPORT --engine rocks --data-dir "$SDIR" 2>/dev/null &
   $B --port $DPORT --engine rocks --data-dir "$DDIR" 2>/dev/null &
+  fleet_wait_listen $SPORT $DPORT
   sleep 0.8
   awk 'BEGIN{for(i=0;i<2000;i++){k=sprintf("{mover}:key%06d",i);printf "*3\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$5\r\nvalue\r\n",length(k),k}}' \
     | valkey-cli -p $SPORT --pipe >/dev/null

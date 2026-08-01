@@ -45,6 +45,7 @@ TENANTS=$(python3 -c 'print(",".join(f"tok{i:02d}=tenant{i:02d}" for i in range(
 ./target/release/flint-proxy --port 6669 \
   --pairs "127.0.0.1:6710,127.0.0.1:6711;127.0.0.1:6720,127.0.0.1:6721" \
   --tenants "$TENANTS" 2>/tmp/flint-m3-proxy.log &
+fleet_wait_listen 6669
 sleep 1.2
 
 echo "== seed: 50 tenants x $KEYS_PER_TENANT keys through the authed proxy"

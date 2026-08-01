@@ -21,8 +21,10 @@ cleanup() {
 trap cleanup EXIT
 
 $B --port $MPORT --engine rocks --data-dir "$MDIR" 2>/dev/null &
+fleet_wait_listen $MPORT
 sleep 0.5
 $B --port $RPORT --engine rocks --data-dir "$RDIR" --replica-of 127.0.0.1:$MPORT 2>/dev/null &
+fleet_wait_listen $RPORT
 sleep 0.9
 
 echo "== loading 20000 keys"
@@ -55,6 +57,7 @@ echo "$(grep -oE 'PROMOTED .* at \(0,[0-9]+\)' /tmp/flint-ctl.log | head -1)"
 
 echo "== bring the OLD master back; controller must fence it"
 $B --port $MPORT --engine rocks --data-dir "$MDIR" 2>/dev/null &
+fleet_wait_listen $MPORT
 sleep 2.0
 FENCED=0
 for i in $(seq 1 40); do

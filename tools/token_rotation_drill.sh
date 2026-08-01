@@ -26,13 +26,16 @@ trap cleanup EXIT
 rm -f "$STATE"
 
 $B --port 6750 --engine rocks --data-dir /tmp/flint-rot-data 2>/dev/null &
+fleet_wait_listen 6750
 sleep 0.6
 $CP --port 7550 --state "$STATE" 2>/tmp/flint-rot-cp.log &
+fleet_wait_listen 7550
 sleep 0.4
 valkey-cli -p 7550 CPADDPROXY 127.0.0.1:7701 >/dev/null
 valkey-cli -p 7550 CPADDPAIR 127.0.0.1:6750 >/dev/null
 valkey-cli -p 7550 CPADDTENANT acme tok-v1 acme 1 >/dev/null
 $PX --port 7701 --control-plane 127.0.0.1:7550 --advertise 127.0.0.1:7701 2>/tmp/flint-rot-px.log &
+fleet_wait_listen 7701
 sleep 1.2
 
 a() { valkey-cli -p 7701 -a "$1" --no-auth-warning "${@:2}"; }
@@ -78,6 +81,7 @@ echo "  v1 rejected, v2 serves"
 echo "== rotation state is durable (CP restart preserves current token)"
 fleet_kill controlplane; sleep 0.4
 $CP --port 7550 --state "$STATE" 2>>/tmp/flint-rot-cp.log &
+fleet_wait_listen 7550
 sleep 1.5
 [ "$(a tok-v2 GET k)" = "hello" ] || { echo "FAIL: v2 lost across CP restart"; exit 1; }
 echo "  current token survived CP restart"

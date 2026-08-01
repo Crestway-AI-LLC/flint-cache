@@ -26,8 +26,10 @@ trap cleanup EXIT
 # uses as the replacement after a promotion (the controller decides; node
 # lifecycle is external, matching the real split).
 $B --port $P1 --engine rocks --data-dir "$D1" 2>/dev/null &
+fleet_wait_listen $P1
 sleep 0.5
 $B --port $P2 --engine rocks --data-dir "$D2" --replica-of 127.0.0.1:$P1 2>/dev/null &
+fleet_wait_listen $P2
 sleep 0.9
 
 echo "== loading 15000 keys"

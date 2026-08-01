@@ -31,6 +31,7 @@ trap cleanup EXIT
 
 echo "== CP (journal) + controller managing the pair with a snapshot schedule"
 $CP --port 7590 --state "$D/cp-state" 2>/dev/null &
+fleet_wait_listen 7590
 sleep 0.5
 FLINT_SERVER_BIN=$B $CTL --manage-slots "6870:$D/n0,6871:$D/n1" \
   --server-bin "$B" --id ctl --poll-ms 200 --confirm 3 \

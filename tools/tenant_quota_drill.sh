@@ -39,9 +39,11 @@ valkey-cli -p 7690 CPADDTENANT acme tok-acme acme 2 >/dev/null
 valkey-cli -p 7690 CPADDTENANT globex tok-glx globex 1 >/dev/null
 valkey-cli -p 7690 CPTENANTQUOTA acme 400 0 >/dev/null || { echo "FAIL: CPTENANTQUOTA"; exit 1; }
 $B --port 6985 --engine rocks --data-dir "$D/m" 2>/dev/null &
+fleet_wait_listen 6985
 sleep 0.7
 $PX --port 7911 --control-plane 127.0.0.1:7690 --advertise 127.0.0.1:7911 2>"$D/px1.log" &
 $PX --port 7912 --control-plane 127.0.0.1:7690 --advertise 127.0.0.1:7912 2>"$D/px2.log" &
+fleet_wait_listen 7911 7912
 sleep 1.5
 
 echo "== rate, one proxy: acme hammers proxy 1 only -> its 200/s SHARE binds"

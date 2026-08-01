@@ -19,6 +19,7 @@ cleanup() { pkill -9 -f "flint-server --port 6560" 2>/dev/null; rm -rf "$DIR"; }
 trap cleanup EXIT
 
 $B --port $PORT --engine rocks --data-dir "$DIR" 2>/dev/null &
+fleet_wait_listen $PORT
 sleep 0.7
 [ "$(valkey-cli -p $PORT PING)" = "PONG" ] || { echo "FAIL: node not up"; exit 1; }
 
@@ -65,6 +66,7 @@ echo "  alpha redirected, beta served"
 echo "== restart the node; the override is durable (manifest-backed)"
 pkill -9 -f "flint-server --port 6560"; sleep 0.5
 $B --port $PORT --engine rocks --data-dir "$DIR" 2>/dev/null &
+fleet_wait_listen $PORT
 sleep 0.7
 MOVED2=$(valkey-cli -p $PORT GET "{alpha}:k" 2>&1)
 echo "  after restart, alpha GET -> $MOVED2"

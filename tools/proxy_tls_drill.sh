@@ -21,6 +21,7 @@ trap cleanup EXIT
 
 # One backend; the proxy runs open-mode (no tenants) with a single static pair.
 $B --port 6760 --engine rocks --data-dir "$D/data" 2>/dev/null &
+fleet_wait_listen 6760
 sleep 0.6
 
 echo "== generate a self-signed server cert (dev only)"
@@ -55,6 +56,7 @@ PY
 echo "== proxy with TLS termination"
 $PX --port 7760 --pairs "127.0.0.1:6760" \
     --tls-cert "$D/cert.pem" --tls-key "$D/key.pem" 2>"$D/px.log" &
+fleet_wait_listen 7760
 sleep 1.0
 grep -q "TLS" "$D/px.log" || { echo "FAIL: proxy did not report TLS mode"; cat "$D/px.log"; exit 1; }
 echo "  proxy up in TLS mode"
@@ -93,6 +95,7 @@ echo "  plaintext rejected (no PONG): $P"
 echo "== same binary, NO --tls-* flags: plaintext still works (no downgrade path)"
 fleet_kill proxy; sleep 0.4
 $PX --port 7761 --pairs "127.0.0.1:6760" 2>"$D/px2.log" &
+fleet_wait_listen 7761
 sleep 0.8
 grep -q "plaintext" "$D/px2.log" || { echo "FAIL: proxy did not report plaintext mode"; cat "$D/px2.log"; exit 1; }
 [ "$(valkey-cli -p 7761 PING)" = "PONG" ] || { echo "FAIL: plaintext mode broken"; exit 1; }

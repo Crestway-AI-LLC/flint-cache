@@ -30,6 +30,7 @@ valkey-cli -p 7830 CPADDPAIR 127.0.0.1:7091 >/dev/null
 valkey-cli -p 7830 CPADDTENANT acme tok-acme acme 1 >/dev/null
 $B --port 7091 --engine rocks --data-dir "$D/m" 2>/dev/null &
 $PX --port 7997 --control-plane 127.0.0.1:7830 --advertise 127.0.0.1:7997 2>/dev/null &
+fleet_wait_listen 7091 7997
 sleep 1.5
 A="valkey-cli -p 7997 -a tok-acme --no-auth-warning"
 [ "$($A SET k v)" = "OK" ] || { echo "FAIL: baseline write"; exit 1; }

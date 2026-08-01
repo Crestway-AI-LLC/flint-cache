@@ -32,6 +32,7 @@ sleep 0.8
 
 ./target/release/flint-proxy --port 6668 --pairs "127.0.0.1:$P0;127.0.0.1:$P1" \
   --tenants "tokA=alpha,tokB=beta" 2>/tmp/flint-tr-proxy.log &
+fleet_wait_listen 6668
 sleep 0.5
 
 # Four hash tags whose slots default-route to pair 0 (slot < 8192), so all
