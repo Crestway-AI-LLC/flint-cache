@@ -22,7 +22,7 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init /tmp/flint-attached 7361 7362 7692 7744
+fleet_init /tmp/flint-attached 7361 7362 7363 7364 7692 7744
 fleet_guard
 D=/tmp/flint-attached; INV=$D/cluster.flint
 CTL=./target/release/flintctl
@@ -50,6 +50,7 @@ bins ./target/release
 tls on
 cp 127.0.0.1:7744
 pair 127.0.0.1:7361,127.0.0.1:7362
+pair 127.0.0.1:7363,127.0.0.1:7364
 proxy 127.0.0.1:7692
 controller on
 poll-ms 150
@@ -75,7 +76,7 @@ echo "  restart-node refuses the master ($MASTER)"
 
 echo "== chaos: $ITER kills through flintctl, promotion by the fleet's controller"
 FLINTCTL_BIN=$CTL ./target/release/flint-chaos \
-  --inventory "$INV" --iterations "$ITER" --keys 300 --mode mixed --seed 7 \
+  --inventory "$INV" --iterations "$ITER" --keys 300 --mode mixed \
   2>&1 | tee "$D/chaos.log" | sed 's/^/  /'
 grep -q "^PASS:" "$D/chaos.log" || { echo "FAIL: chaos oracle did not pass"; exit 1; }
 
@@ -88,7 +89,16 @@ RK=$(sed -n 's/.*(\([0-9]*\) master, \([0-9]*\) replica).*/\2/p' "$D/chaos.log")
   || { echo "FAIL: expected $ITER kills, ledger reports ${MK:-0}+${RK:-0}"; exit 1; }
 [ "${MK:-0}" -ge 1 ] \
   || { echo "FAIL: no MASTER was ever killed — the failover path went untested"; exit 1; }
-echo "  $MK master kill(s), $RK replica kill(s), all via flintctl"
+# BOTH pairs must take at least one kill. The 7-host chaos runs reported
+# "16 cross-host kills" while every kill landed on pair 0 and pair 1 was
+# scenery — the harness opened a single pair index defaulting to 0. This
+# fleet declares two pairs precisely so that regression cannot come back
+# quietly: a harness that only ever kills pair 0 fails here.
+grep -q "pair 0: killed" "$D/chaos.log" \
+  || { echo "FAIL: no kill ever landed on pair 0"; exit 1; }
+grep -q "pair 1: killed" "$D/chaos.log" \
+  || { echo "FAIL: no kill ever landed on pair 1 — the harness is single-pair again"; exit 1; }
+echo "  $MK master kill(s), $RK replica kill(s), spread across both pairs, all via flintctl"
 
 echo "== the fleet is intact afterwards, by its own reckoning"
 # The point of routing faults through flintctl is that the fleet stays a

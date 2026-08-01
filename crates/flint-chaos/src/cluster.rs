@@ -45,6 +45,19 @@ impl Attached {
     /// and duplicating it here would be one more thing to drift. `pair` and
     /// `statedir` are the two keys this harness needs, and both have been
     /// stable since the format existed.
+    /// How many pairs the inventory declares — so the harness can open one
+    /// Attached per pair instead of silently testing only the first. The
+    /// 7-host runs advertised "16 cross-host kills on 7 hosts" while every
+    /// kill landed on pair 0 and pair 1 was scenery (#118 item 2).
+    pub fn pair_count(inventory: &str) -> usize {
+        let raw = std::fs::read_to_string(inventory)
+            .unwrap_or_else(|e| panic!("read inventory {inventory}: {e}"));
+        raw.lines()
+            .filter_map(|l| l.split('#').next())
+            .filter(|l| l.trim_start().starts_with("pair "))
+            .count()
+    }
+
     pub fn open(inventory: &str, pair_index: usize) -> Self {
         let raw = std::fs::read_to_string(inventory)
             .unwrap_or_else(|e| panic!("read inventory {inventory}: {e}"));
