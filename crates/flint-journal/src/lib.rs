@@ -143,12 +143,35 @@ pub fn emit_detached(target: String, tls: Option<Arc<flint_tls::ClientConfig>>, 
 
 /// Control-plane side: append one pre-serialized event line to the journal
 /// file. Plain append, no fsync — loss-tolerant observability (module docs).
+///
+/// ONE write, and that is the whole point. This was `writeln!(f, "{}", line)`,
+/// which on an unbuffered `File` is `write_fmt` and issues a SEPARATE write()
+/// syscall per format piece: one for the body, one for the newline. Any other
+/// appender landing between those two produces `{..}{..}` on a single line,
+/// and a reader parsing json-per-line gets `Extra data: line 1 column 166` —
+/// which is how this was found, as an intermittent drill failure.
+///
+/// Not hypothetical: the control plane appends from a thread per connection,
+/// and the scheduled-verify timer added a SECOND PROCESS appending to the same
+/// file on a live fleet every five minutes. The journal is what the ops portal
+/// shows and what `upgrade` reads to judge a soak clean, so a line that cannot
+/// be parsed is a line that does not exist.
+///
+/// Building the newline into the buffer leaves exactly one `write` for an
+/// O_APPEND handle, which is what makes the append indivisible. `write_all`
+/// would still loop on a short write, but a short write on a few hundred bytes
+/// to a regular file does not happen in practice, and the alternative — two
+/// writes every time — is broken by construction rather than by bad luck.
 pub fn append_line(path: &str, json_line: &str) -> std::io::Result<()> {
     let mut f = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)?;
-    writeln!(f, "{}", json_line.trim_end())
+    let line = json_line.trim_end();
+    let mut buf = Vec::with_capacity(line.len() + 1);
+    buf.extend_from_slice(line.as_bytes());
+    buf.push(b'\n');
+    f.write_all(&buf)
 }
 
 /// Control-plane side: the last `n` journal lines, oldest first.
@@ -162,4 +185,73 @@ pub fn tail(path: &str, n: usize) -> Vec<String> {
         .skip(lines.len().saturating_sub(n))
         .map(|s| s.to_string())
         .collect()
+}
+
+#[cfg(test)]
+mod append_tests {
+    use super::*;
+
+    /// Concurrent appenders must not interleave WITHIN a line.
+    ///
+    /// This failed before `append_line` built the line and its newline into one
+    /// buffer: `writeln!` on an unbuffered File is `write_fmt`, which issues a
+    /// separate write() per format piece — one for the body, one for the "\n".
+    /// Another appender landing between those two syscalls produces `{..}{..}`
+    /// on a single line, and a reader doing json-per-line gets
+    /// `Extra data: line 1 column 166`, which is how this was noticed.
+    ///
+    /// It is not a hypothetical race. The control plane appends from a thread
+    /// per connection, and as of the scheduled-verify timer a SECOND PROCESS
+    /// appends to the same file on a live fleet every five minutes. The journal
+    /// is what the ops portal shows and what `upgrade` reads to decide a soak
+    /// was clean: a line that cannot be parsed is a line that does not exist.
+    #[test]
+    fn concurrent_appends_never_interleave_within_a_line() {
+        let dir = std::env::temp_dir().join(format!("flint-journal-race-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("j.jsonl");
+        let p = path.to_string_lossy().to_string();
+        let _ = std::fs::remove_file(&path);
+
+        const WRITERS: usize = 8;
+        const EACH: usize = 250;
+        // Long enough that a torn write has a wide window to be caught in; a
+        // 40-byte line would make this test pass by luck rather than by fix.
+        let filler = "x".repeat(300);
+
+        std::thread::scope(|s| {
+            for w in 0..WRITERS {
+                let p = p.clone();
+                let filler = filler.clone();
+                s.spawn(move || {
+                    for i in 0..EACH {
+                        let line = serde_json::json!({
+                            "at_ms": 1_u64, "actor": format!("w{w}"), "kind": "Detected",
+                            "subject": format!("seat-{i}"), "detail": filler,
+                        })
+                        .to_string();
+                        append_line(&p, &line).expect("append");
+                    }
+                });
+            }
+        });
+
+        let raw = std::fs::read_to_string(&path).expect("read journal");
+        let lines: Vec<&str> = raw.lines().collect();
+        assert_eq!(
+            lines.len(),
+            WRITERS * EACH,
+            "expected one line per append; got {} — lines were merged or split",
+            lines.len()
+        );
+        for (n, l) in lines.iter().enumerate() {
+            serde_json::from_str::<serde_json::Value>(l).unwrap_or_else(|e| {
+                panic!(
+                    "line {n} is not one JSON object ({e}); first 120 bytes: {:?}",
+                    &l[..l.len().min(120)]
+                )
+            });
+        }
+        let _ = std::fs::remove_file(&path);
+    }
 }
