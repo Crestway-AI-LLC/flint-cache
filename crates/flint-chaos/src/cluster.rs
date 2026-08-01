@@ -146,15 +146,33 @@ impl Attached {
     /// Steady state: a live replica, fully converged in sequence. The same
     /// gate the local harness applies, read from the master's own view.
     pub fn wait_healthy(&self, budget: Duration) -> bool {
+        self.wait_replica(budget, true)
+    }
+
+    /// A live replica exists — but say NOTHING about how far behind it is.
+    ///
+    /// This is the precondition for a master kill that actually tests the
+    /// RPO claim. Requiring seq_lag==0 as well (what wait_healthy does)
+    /// guarantees the dying master has no unreplicated suffix, so no acked
+    /// write CAN be lost and the oracle's "zero loss" result is a statement
+    /// about the harness rather than the engine. A live replica is still
+    /// required: with none, loss is unbounded by design (the widowed-master
+    /// case), which is a different scenario and not this one.
+    pub fn wait_replica_live(&self, budget: Duration) -> bool {
+        self.wait_replica(budget, false)
+    }
+
+    fn wait_replica(&self, budget: Duration, need_converged: bool) -> bool {
         let start = Instant::now();
         while start.elapsed() < budget {
             let m = self.master();
             let info = self.info(&m);
             let live = info.get("live_replicas").is_some_and(|v| v.trim() != "0");
-            let converged = info
-                .get("seq_lag")
-                .and_then(|v| v.trim().parse::<u64>().ok())
-                .is_some_and(|l| l == 0);
+            let converged = !need_converged
+                || info
+                    .get("seq_lag")
+                    .and_then(|v| v.trim().parse::<u64>().ok())
+                    .is_some_and(|l| l == 0);
             if live && converged {
                 return true;
             }
@@ -246,6 +264,29 @@ impl Target {
         match self {
             Target::Local { cluster, .. } => cluster.wait_healthy(budget),
             Target::Attached(a) => a.wait_healthy(budget),
+        }
+    }
+
+    /// See Attached::wait_replica_live — a live replica, not a converged one.
+    pub fn wait_replica_live(&self, budget: Duration) -> bool {
+        match self {
+            Target::Local { cluster, .. } => cluster.wait_replica_live(budget),
+            Target::Attached(a) => a.wait_replica_live(budget),
+        }
+    }
+
+    /// Does the HARNESS issue the promotion, rather than a controller?
+    ///
+    /// Recovery wall-clock is only an RTO measurement when something the
+    /// product ships does the promoting. In harness-driven local mode the
+    /// harness sends FLINTPROMOTE itself, so the number would describe this
+    /// binary, and reporting it as RTO would be a lie with a decimal point.
+    pub fn promotion_is_harness(&self) -> bool {
+        match self {
+            Target::Local {
+                controller_driven, ..
+            } => !*controller_driven,
+            Target::Attached(_) => false,
         }
     }
 
@@ -670,6 +711,23 @@ impl Cluster {
                 .and_then(|v| v.trim().parse::<u64>().ok())
                 .is_some_and(|lag| lag < 400);
             if live && converged && in_time {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        false
+    }
+
+    /// A live replica exists; its lag is deliberately NOT constrained.
+    ///
+    /// The counterpart of wait_healthy for the RPO regime: see
+    /// Attached::wait_replica_live. Killing only converged masters proves
+    /// nothing about the loss window, because there is nothing to lose.
+    pub fn wait_replica_live(&self, budget: Duration) -> bool {
+        let start = Instant::now();
+        while start.elapsed() < budget {
+            if flintinfo_field(self.master_port, "live_replicas:").is_some_and(|v| v.trim() != "0")
+            {
                 return true;
             }
             std::thread::sleep(Duration::from_millis(50));
