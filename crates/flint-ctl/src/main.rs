@@ -1634,14 +1634,21 @@ fn proxy_args(inv: &Inventory, i: usize) -> Vec<String> {
     let proxy = &inv.proxies[i];
     // The inventory addr's HOST is the bind address (0.0.0.0 serves external
     // clients — the marketplace shape; 127.0.0.1 stays the loopback default).
-    // The ADVERTISE address is what the proxy reports of itself (subset
-    // identity): the proxy-advertise line when declared, else the bind line —
-    // must match what bootstrap registered.
+    //
+    // The ADVERTISE address is the proxy's IDENTITY, and identity has exactly
+    // one definition — proxy_dial. Three places used to compute it separately:
+    // here, bootstrap's CPADDPROXY, and verify's declared list. Two of them
+    // said "advertise else BIND", which on a fleet where the proxy has its own
+    // machine means the useless `0.0.0.0:7379`, and the third said proxy_dial.
+    // A 7-host bootstrap then came up completely healthy and failed its own
+    // verify: `["0.0.0.0:7379"] registered but not in the inventory` alongside
+    // `["172.31.64.235:7379"] declared but never registered` — the same seat,
+    // under two names. #103 was this failure in another costume.
     let bind_host = proxy
         .rsplit_once(':')
         .map(|(h, _)| h)
         .unwrap_or("127.0.0.1");
-    let advertise = inv.proxy_advertise.get(i).unwrap_or(proxy);
+    let advertise = proxy_dial(inv, i);
     let mut args = vec![
         "--port".to_string(),
         port_of(proxy).to_string(),
@@ -1650,7 +1657,7 @@ fn proxy_args(inv: &Inventory, i: usize) -> Vec<String> {
         "--control-plane".into(),
         inv.cp[0].clone(),
         "--advertise".into(),
-        advertise.clone(),
+        advertise,
     ];
     args.extend(internal_args(inv));
     args.extend(proxy_tuning_args(inv));
@@ -1800,11 +1807,12 @@ fn launch(inv: &Inventory, register: bool) {
         "control plane up"
     );
     if register {
-        for (i, proxy) in inv.proxies.iter().enumerate() {
-            // Register the ADVERTISE address when one is declared (public-DNS
-            // deployments): the registry is what clients and portals dial.
-            let adv = inv.proxy_advertise.get(i).unwrap_or(proxy);
-            must("register proxy", call(cp, &tls, &["CPADDPROXY", adv]));
+        for i in 0..inv.proxies.len() {
+            // The registry is what clients and portals dial, so it holds the
+            // proxy's identity — same definition as the --advertise it was
+            // started with and the address verify expects. One function.
+            let adv = proxy_dial(inv, i);
+            must("register proxy", call(cp, &tls, &["CPADDPROXY", &adv]));
         }
         // Initial pairs carry the even slot split as EXPLICIT level-1
         // routing state; expansion pairs later join with "-" (no range) so
@@ -3251,8 +3259,9 @@ fn roll_edge(inv: &Inventory, envs: &[(String, String)]) {
         let seat = format!("proxy-{}", port_of(proxy));
         // Identity is the ADVERTISE address: it is what this proxy was
         // started with and is unique per proxy, so the match cannot stray
-        // onto a sibling.
-        let ident = inv.proxy_advertise.get(i).unwrap_or(proxy).clone();
+        // onto a sibling. Same definition as proxy_args uses, or the match
+        // would look for an argv that was never written.
+        let ident = proxy_dial(inv, i);
         if let Err(e) = stop_seat(
             inv,
             &proxy_runner(inv, i),
