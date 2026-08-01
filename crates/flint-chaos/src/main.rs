@@ -52,6 +52,16 @@ fn main() {
     // sheds instead of acking — so losing one is a breach of the published
     // bound, not the async contract.
     let lag_hard_ms: u64 = arg("--lag-hard-ms", 1_000);
+    // The oracle's bound and the server's enforced cap must be the SAME
+    // number, or the check compares against a cap nobody applied.
+    if lag_hard_ms != 1_000 {
+        unsafe { std::env::set_var("FLINT_CHAOS_LAG_HARD_MS", lag_hard_ms.to_string()) };
+    }
+    // Freeze the replica for this long before each master kill, so the master
+    // acks writes the replica has not taken. Without it the unreplicated
+    // suffix is empty on loopback and the RPO bound has nothing to measure —
+    // every run to date reported a loss depth of 0ms.
+    let stall_replica_ms: u64 = arg("--stall-replica-ms", 0);
     // Slack for measurement, not for the engine: the master samples lag
     // slightly before it decides to ack, and our ack clock is taken after the
     // reply arrives. Small next to the cap it qualifies.
@@ -197,6 +207,20 @@ fn main() {
             std::thread::sleep(Duration::from_millis(1_500)); // controller confirm*poll
             shared.pause.store(false, Ordering::SeqCst);
             std::thread::sleep(Duration::from_millis(300)); // hammer re-established
+
+            // Deliberately push the replica behind, so the master is acking
+            // writes that have not replicated when it dies. Kept under the
+            // 2s liveness window so the pair still looks failover-worthy —
+            // this is the bounded-loss regime, not the widowed one.
+            if stall_replica_ms > 0 && cluster.stall_replica(true) {
+                std::thread::sleep(Duration::from_millis(stall_replica_ms));
+                // Unfreeze BEFORE the kill, not after. The survivor has to be
+                // running to be promoted and to answer the oracle, but it is
+                // still carrying the whole backlog, so the master dies with
+                // acked writes the replica has not taken. Resuming afterwards
+                // instead meant sending FLINTPROMOTE to a stopped process.
+                cluster.stall_replica(false);
+            }
             // Arm the writer's RTO clock, then kill. The kill blocks through
             // the promotion, so any timestamp taken after it would include
             // the recovery it is meant to measure. The writer closes the
@@ -477,5 +501,20 @@ fn main() {
     println!(
         "  deepest acked-write loss: {deepest_loss_ms}ms before the kill (cap {lag_hard_ms}ms + {rpo_margin_ms}ms margin; anything older would have failed the run)"
     );
+    // Say plainly when a run proved nothing about the bound. A zero here is
+    // not a pass — it means no acked write was ever at risk, so the RPO
+    // check had nothing to judge.
+    if deepest_loss_ms == 0 {
+        println!(
+            "  NOTE: loss depth 0 means replication kept up throughout — the RPO bound was \
+             not exercised by this run (try --stall-replica-ms)"
+        );
+    }
+    if throttled_total == 0 {
+        println!(
+            "  NOTE: nothing was shed — the lag cap never bit, so the mechanism the bound \
+             RESTS on is unproven by this run (try a smaller --lag-hard-ms)"
+        );
+    }
     println!("  final walk: {present} present, {missing} missing-or-regressed");
 }

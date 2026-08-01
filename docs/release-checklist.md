@@ -52,6 +52,7 @@ disagrees with the oracle, the case is wrong.
     tools/client_compat_drill.sh      # redis-py + node-redis, both on RESP3
     tools/proxy_registry_drill.sh     # stray registrations cannot strand a tenant
     tools/reseed_drill.sh             # a replica outside the WAL re-seeds, warm restart does not
+    tools/lag_cap_drill.sh            # the lag cap is OBSERVED to shed, not just configured
     tools/attached_chaos_drill.sh     # chaos through the OPERATOR path, fleet's own controller
 
 ## 3b. Integrity — the cluster agrees with itself

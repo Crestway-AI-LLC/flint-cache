@@ -325,6 +325,19 @@ impl Target {
         }
     }
 
+    /// Freeze this pair's replica so the master's acks outrun replication.
+    /// Returns false when the target cannot be frozen (attached fleets: the
+    /// seat may be on another host, and reaching it would need the ssh path).
+    pub fn stall_replica(&self, on: bool) -> bool {
+        match self {
+            Target::Local { cluster, .. } => {
+                signal_by_port(cluster.replica(), if on { "-STOP" } else { "-CONT" });
+                true
+            }
+            Target::Attached(_) => false,
+        }
+    }
+
     /// Kill the master WITHOUT any convergence pre-wait, for workloads that
     /// keep writing through the kill. The caller is responsible for having
     /// parked the writer long enough for the controller to arm (see
@@ -573,6 +586,25 @@ fn spawn_node(port: u16, dir: &str, replica_of: Option<u16>) -> Child {
     {
         cmd.args(["--min-replicas-to-write", &n]);
     }
+    // The lag cap the ORACLE asserts against must be the cap the SERVER
+    // actually enforces, or the check is measuring one number against a
+    // different one. Env-based for the same reason as the quorum gate: it has
+    // to reach every spawn site, including promote-replace and respawn.
+    if let Ok(ms) = std::env::var("FLINT_CHAOS_LAG_HARD_MS")
+        && !ms.is_empty()
+    {
+        // BOTH caps, because ReplHub::new clamps hard up to soft
+        // (`lag_hard_ms.max(lag_soft_ms)`) to keep hard >= soft. Passing only
+        // --lag-hard-ms 5 therefore yields a 500ms cap — the default soft —
+        // and a run that looks like it tested aggressive shedding while
+        // testing nothing of the sort. Two experiments here read zero before
+        // the clamp was found.
+        let soft = ms
+            .parse::<u64>()
+            .map(|v| v.saturating_sub(1).max(1))
+            .unwrap_or(1);
+        cmd.args(["--lag-soft-ms", &soft.to_string(), "--lag-hard-ms", &ms]);
+    }
     // Optional async write queue (ADR-0005 D4) for every spawned node, so
     // the queue survives promote-replace and respawn. The open-mode proxy
     // pins namespace "0", so `FLINT_CHAOS_ASYNC_WRITES=0` opts the whole
@@ -587,6 +619,26 @@ fn spawn_node(port: u16, dir: &str, replica_of: Option<u16>) -> Child {
         .stdout(std::process::Stdio::null())
         .spawn()
         .expect("spawn flint-server")
+}
+
+/// SIGSTOP / SIGCONT a node by port, to make replication fall behind ON
+/// PURPOSE.
+///
+/// Every chaos run ever recorded reported `deepest acked-write loss: 0ms`
+/// and `writes shed -THROTTLED: 0` — including a 7-host run over a real
+/// network. Those zeros are not evidence of correctness; they mean the
+/// harness never created the condition. Loopback replication acks in ~0.2ms,
+/// so the unreplicated suffix closes inside the measurement's resolution and
+/// lag never approaches the 1000ms cap.
+///
+/// Freezing the replica for a chosen interval produces exactly the regime the
+/// RPO claim describes: a master acking writes its replica has not taken yet.
+/// Under the liveness window (2s) a short freeze leaves the replica still
+/// counted live, so the kill gate still sees a pair worth failing over.
+fn signal_by_port(port: u16, sig: &str) {
+    let _ = Command::new("pkill")
+        .args([sig, "-f", &format!("flint-server --port {port}")])
+        .status();
 }
 
 fn kill_by_port(port: u16) {
