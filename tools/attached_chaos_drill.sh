@@ -44,6 +44,7 @@ cargo build --release -q -p flint-server -p flint-proxy -p flint-controlplane \
   || { echo "FAIL: build"; exit 1; }
 
 cat > "$INV" <<EOF
+disposable on
 statedir $D/state
 bins ./target/release
 tls on

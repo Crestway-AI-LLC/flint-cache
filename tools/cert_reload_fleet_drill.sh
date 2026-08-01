@@ -29,6 +29,7 @@ trap cleanup EXIT
 
 echo "== bootstrap: mesh mTLS + encrypted front door (client-tls on)"
 cat > "$D/cluster.flint" <<EOF
+disposable on
 statedir $D/state
 bins ./target/release
 tls on

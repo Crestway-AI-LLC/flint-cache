@@ -27,6 +27,7 @@ trap cleanup EXIT
 
 echo "== bootstrap a mesh (mTLS) cluster: master + replica, proxy"
 cat > "$D/cluster.flint" <<EOF
+disposable on
 statedir $D/state
 bins ./target/release
 tls on

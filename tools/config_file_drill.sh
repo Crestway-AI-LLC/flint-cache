@@ -30,6 +30,7 @@ cargo build --release -q -p flint-server -p flint-proxy -p flint-controlplane \
 # NON-DEFAULT tunables in the config file (defaults: wal 500, soft 500,
 # hard 1000, min-replicas 0, max-conns big).
 cat > "$INV" <<EOF
+disposable on
 statedir $STATE
 bins ./target/release
 tls on

@@ -34,6 +34,7 @@ cargo build --release -q -p flint-server -p flint-proxy -p flint-controlplane \
 # ONE pair to start: it owns every slot. Controller on but rebalance OFF
 # (default), so nothing auto-moves — the operator move is the only one.
 cat > "$INV" <<EOF
+disposable on
 statedir $STATE
 bins ./target/release
 tls on

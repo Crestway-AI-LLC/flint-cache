@@ -38,6 +38,7 @@ cargo build --release -q -p flint-server -p flint-proxy -p flint-controlplane \
   -p flint-controller -p flint-ctl --features flint-server/rocks
 
 cat > "$INVA" <<EOF
+disposable on
 statedir $A
 bins ./target/release
 tls on

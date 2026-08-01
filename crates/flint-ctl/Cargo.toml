@@ -12,6 +12,7 @@ name = "flintctl"
 path = "src/main.rs"
 
 [dependencies]
+flint-build = { path = "../flint-build" }
 flint-resp = { path = "../flint-resp" }
 flint-tls = { path = "../flint-tls" }
 

@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/flint-build",
     "crates/flint-slot",
     "crates/flint-resp",
     "crates/flint-commands",
@@ -19,6 +20,7 @@ members = [
     "crates/flint-exporter",
 ]
 default-members = [
+    "crates/flint-build",
     "crates/flint-slot",
     "crates/flint-resp",
     "crates/flint-commands",

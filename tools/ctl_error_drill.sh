@@ -35,6 +35,7 @@ rm -rf "$STATE" "$INV" "$DEAD"
 cargo build --release -q -p flint-server -p flint-controlplane -p flint-ctl
 
 cat > "$INV" <<EOF
+disposable on
 statedir $STATE
 bins ./target/release
 tls on

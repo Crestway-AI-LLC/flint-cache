@@ -126,6 +126,10 @@ struct Inventory {
     /// Which host runs proxies[i]. A proxy BINDS a wildcard (`0.0.0.0:7379`),
     /// so unlike every other seat its address does not name its machine.
     /// Positional with `proxy` lines; absent = local.
+    /// This fleet is disposable — a chaos cluster that exists for one run.
+    /// Only such a fleet may be mutated by a binary that is not a release
+    /// build; see require_release_or_disposable.
+    disposable: bool,
     proxy_hosts: Vec<String>,
     /// Which host runs the controller. It has no address of its own — it
     /// dials the nodes rather than serving — so placement must be declared.
@@ -185,6 +189,10 @@ fn parse_inventory(path: &str) -> Inventory {
             "ssh-sudo" => inv.ssh_sudo = val == "on",
             "proxy-host" => inv.proxy_hosts.push(val.to_string()),
             "controller-host" => inv.controller_host = Some(val.to_string()),
+            // Declares this fleet THROWAWAY: a non-release flintctl may
+            // mutate it. Absent means a real cluster, which is the safe
+            // default and the one every existing inventory already has.
+            "disposable" => inv.disposable = val == "on",
             other => panic!("inventory: unknown key {other:?}"),
         }
     }
@@ -3424,8 +3432,86 @@ fn host_command(cmd: &str, a: &[String]) -> ! {
     }
 }
 
+/// This flintctl's own build stamp — same definition every Flint binary uses.
+fn build_version() -> String {
+    flint_build::version(env!("CARGO_PKG_VERSION"))
+}
+
+/// Verbs that CHANGE a fleet. A binary that is not a release build may run
+/// these only against an inventory that declares itself disposable.
+///
+/// The read-only verbs are deliberately absent: diagnosing a cluster with
+/// whatever flintctl is to hand is exactly when `status` and `verify` matter,
+/// and neither can break anything.
+const MUTATING: &[&str] = &[
+    "bootstrap",
+    "start",
+    "stop",
+    "reload",
+    "upgrade",
+    "push-bins",
+    "kill-node",
+    "restart-node",
+    "expand",
+    "swap-node",
+    "add-replica",
+    "decommission-node",
+    "migrate-slots",
+    "failover",
+    "retire-proxy",
+    "rotate-admin",
+    "rotate-certs",
+    "proxy-cache",
+    "tenant",
+    "tenant-reads",
+    "tenant-cache",
+    "tenant-async",
+    "tenant-federate",
+    "tenant-quota",
+];
+
+/// The guard that makes a fast build channel safe to have at all.
+///
+/// The release bundle is the artifact contract — manifest sha256, public_sha,
+/// format_break, `upgrade --version-tag`, the compiled-in stamp — and all of
+/// it exists so that what is running is identifiable. A source-built binary
+/// has none of that, which is fine for a cluster that exists for one chaos
+/// run and is deleted afterwards, and not fine anywhere else. A convenient
+/// path gets reused: without this, the same command that rolls a throwaway
+/// fleet rolls the playground, and nothing says otherwise until afterwards.
+///
+/// Enforced HERE rather than in the script that generates the inventory,
+/// because a guard you can step around by invoking the tool directly is a
+/// convention, not a guard. Only possible because a binary can now say what
+/// it is: before the release tag was compiled in, every build looked alike.
+fn require_release_or_disposable(inv: &Inventory, cmd: &str) {
+    if !MUTATING.contains(&cmd) {
+        return;
+    }
+    let v = build_version();
+    if flint_build::is_release(&v) || inv.disposable {
+        return;
+    }
+    die(&format!(
+        "refusing `{cmd}`: this flintctl reports build {v:?}, which is not a release, \
+         and the inventory does not declare `disposable on`.\n\
+         \n\
+         A source or CI-artifact build carries no manifest, no sha256 and no \
+         version anyone can check, so it may only mutate a fleet that exists to \
+         be thrown away. Read-only commands (status, verify) are always allowed.\n\
+         \n\
+         For a throwaway cluster add `disposable on` to its inventory. For a real \
+         one, deploy a release bundle."
+    ));
+}
+
 fn main() {
     let argv: Vec<String> = std::env::args().collect();
+    // Ask the binary what it is without starting anything.
+    if argv.iter().any(|a| a == "--build-version") {
+        println!("{}", build_version());
+        return;
+    }
     // Host-side commands come with no inventory: dispatch before requiring -f.
     if let Some(cmd) = argv.get(1).filter(|c| c.starts_with("host-")) {
         host_command(&cmd.clone(), &argv[2..]);
@@ -3444,6 +3530,7 @@ fn main() {
         .unwrap_or(1);
     let cmd = argv.get(cmd_at).map(|s| s.as_str()).unwrap_or("status");
     let rest: Vec<String> = argv.iter().skip(cmd_at + 1).cloned().collect();
+    require_release_or_disposable(&inv, cmd);
 
     match cmd {
         "bootstrap" => {
