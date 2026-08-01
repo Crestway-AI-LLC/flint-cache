@@ -288,10 +288,36 @@ fn edge_tls_client(inv: &Inventory) -> Option<Arc<flint_tls::ClientConfig>> {
 /// issued for, so a probe of it tests what tenants actually reach — DNS and
 /// certificate included.
 fn probe_target(inv: &Inventory, i: usize) -> String {
-    inv.proxy_advertise
-        .get(i)
-        .cloned()
-        .unwrap_or_else(|| inv.proxies[i].clone())
+    proxy_dial(inv, i)
+}
+
+/// The address to DIAL for `proxies[i]` — liveness, status, verify, admin.
+///
+/// A bind address is not a destination. `0.0.0.0:7379` names no machine, so
+/// dialling it reaches whatever is on THIS host's port 7379: on a fleet where
+/// the proxy shares the orchestrator's box that is the proxy, and the mistake
+/// is invisible. Give the proxy its own machine and the same dial reaches
+/// nothing, so bootstrap declares a perfectly healthy proxy dead —
+///
+///     proxy 0.0.0.0:7379 did not come up (port busy?)
+///
+/// — which is exactly how the first 7-host run failed. Every smaller topology
+/// hid it, including the 2-host chaos run, because there the proxy and the
+/// orchestrator were the same machine.
+///
+/// Order: the ADVERTISE address when declared (what clients and the registry
+/// use, and what the edge cert is issued for), else the declared `proxy-host`
+/// with the bind port, else the bind address — which is correct for the
+/// single-host fleet every drill exercises.
+fn proxy_dial(inv: &Inventory, i: usize) -> String {
+    if let Some(adv) = inv.proxy_advertise.get(i) {
+        return adv.clone();
+    }
+    let bind = &inv.proxies[i];
+    match inv.proxy_hosts.get(i) {
+        Some(host) => format!("{host}:{}", port_of(bind)),
+        None => bind.clone(),
+    }
 }
 
 fn call_seq(
@@ -1223,7 +1249,8 @@ fn reload(inv: &Inventory) {
         // PROXYCACHE needs both; the compiled defaults fill an unset one.
         let ttl = inv.cache_ttl_ms.unwrap_or(300).to_string();
         let maxb = inv.cache_max_bytes.unwrap_or(256 * 1024 * 1024).to_string();
-        for proxy in &inv.proxies {
+        for i in 0..inv.proxies.len() {
+            let proxy = &proxy_dial(inv, i);
             if let Some(tok) = &inv.admin_token {
                 let _ = call(proxy, &tls, &["AUTH", tok]);
             }
@@ -1520,7 +1547,10 @@ fn rotate_certs(inv: &Inventory) {
 /// Proxy liveness that respects the front door: plaintext fleets answer
 /// PROXYSTATS; a client-TLS fleet is probed at the TCP layer (flintctl is
 /// not an edge client — real encrypted traffic is verified by the drills).
-fn proxy_up(inv: &Inventory, proxy: &str) -> bool {
+fn proxy_up(inv: &Inventory, i: usize) -> bool {
+    // Resolved here rather than by the caller: passing an address in is what
+    // let the BIND address reach the liveness check in the first place.
+    let proxy = &proxy_dial(inv, i);
     if inv.client_tls {
         return std::net::TcpStream::connect(proxy).is_ok();
     }
@@ -1828,18 +1858,19 @@ fn launch(inv: &Inventory, register: bool) {
         );
     }
 
-    for proxy in &inv.proxies {
+    for (i, proxy) in inv.proxies.iter().enumerate() {
         // Liveness probe = PROXYSTATS (answered pre-auth); a CP-fed proxy
         // replies -NOAUTH to PING until a tenant authenticates. Plaintext:
         // the client port is not part of the internal mesh.
         let deadline = Instant::now() + Duration::from_secs(10);
+        let dial = proxy_dial(inv, i);
         loop {
-            if proxy_up(inv, proxy) {
+            if proxy_up(inv, i) {
                 break;
             }
             assert!(
                 Instant::now() < deadline,
-                "proxy {proxy} did not come up (port busy?)"
+                "proxy {proxy} (dialled at {dial}) did not come up (port busy?)"
             );
             std::thread::sleep(Duration::from_millis(150));
         }
@@ -2066,8 +2097,8 @@ fn verify_checks(inv: &Inventory, probe: Option<&str>, loud: bool) -> Vec<String
     }
 
     head("== proxies");
-    for p in &inv.proxies {
-        note(proxy_up(inv, p), "proxy up", p.clone());
+    for (i, p) in inv.proxies.iter().enumerate() {
+        note(proxy_up(inv, i), "proxy up", p.clone());
     }
 
     // The CP's proxy registry must contain exactly the proxies this inventory
@@ -2253,10 +2284,10 @@ fn status(inv: &Inventory) {
             }
         }
     }
-    for proxy in &inv.proxies {
+    for (i, proxy) in inv.proxies.iter().enumerate() {
         // The proxy's client port is plaintext (frontend TLS is separate
         // from the internal mesh): probe it without the mesh cert.
-        let up = proxy_up(inv, proxy);
+        let up = proxy_up(inv, i);
         println!("proxy     {proxy}  {}", if up { "up" } else { "DOWN" });
     }
     // Optional fleet-agent add-on: the `agent <addr>` inventory key starts
@@ -3241,7 +3272,7 @@ fn roll_edge(inv: &Inventory, envs: &[(String, String)]) {
             envs,
         );
         let deadline = Instant::now() + Duration::from_secs(15);
-        while !proxy_up(inv, proxy) {
+        while !proxy_up(inv, i) {
             if Instant::now() > deadline {
                 die_on(&seat, "did not serve after the binary swap".into());
             }
@@ -3613,7 +3644,8 @@ fn main() {
                     .expect("usage: proxy-cache <ttl_ms> <max_bytes>"),
             );
             let tls = tls_client(&inv);
-            for proxy in &inv.proxies {
+            for i in 0..inv.proxies.len() {
+                let proxy = &proxy_dial(&inv, i);
                 if let Some(tok) = &inv.admin_token {
                     match call(proxy, &tls, &["AUTH", tok]) {
                         Ok(Value::Simple(_)) => {}
