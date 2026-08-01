@@ -88,8 +88,22 @@ kill PROCESSES on one host. They cannot produce a network partition, host
 loss, cross-AZ latency, or a single host running out of disk — the faults
 that a multi-machine cluster has and a single box does not. That is the
 weakest useful form of chaos, and it still found two serious bugs during
-the 8-pair EC2 run (docs/bench/scale-8-pairs.md). Real multi-machine chaos
-is blocked on the remote-runner flintctl and is tracked separately.
+the 8-pair EC2 run (docs/bench/scale-8-pairs.md).
+
+## 4b. Multi-host chaos (fleet repo, costs money, one command)
+
+    packaging/aws/chaos-cluster/run.sh --tag <tag>
+
+Provisions throwaway EC2 hosts, stages the REAL release bundle, bootstraps
+across them, runs the same ledger oracle with kills routed through flintctl
+to the owning host, verifies, and destroys everything. Not in CI — that
+needs credentials and a cost budget — but it is one command and it tears
+down on every exit path, including Ctrl-C, and the hosts self-terminate on
+their own TTL if the driving side dies.
+
+This is what covers the faults section 4 cannot: a real network between the
+pair members. It still does not cover partitions, host loss or a single host
+filling its disk; those remain untested.
 
 ## 5. Tag
 
