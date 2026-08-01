@@ -55,14 +55,61 @@ otherwise accept unbounded at-risk writes. `min-replicas-to-write`
 while fewer than N replicas are live. Together with the lease this closes
 the widowed-master hole.
 
+**It is off unless you turn it on, and turning it on costs write
+availability on every failover.** The default is 0 and nothing in the
+shipping path sets it, so out of the box a master whose replica has been
+gone longer than the 2 s liveness window accepts writes with no replica
+and no throttling at all — measured at 539 writes in ~4 s on an
+unmanaged pair. A controller-managed fleet is covered by the lease
+instead (`--lease-ttl-ms`, default 3000), which is a 3 s bound rather
+than the cap's 1 s.
+
+Setting it to 1 closes that, but a **freshly promoted master has no
+replica either**, and the gate cannot tell "the peer died" from "I was
+just promoted": it sheds every write until a replacement replica attaches
+*and* acks, which on a large dataset means the whole full-sync. That is a
+straight trade of failover RTO for durability, which is why the default
+is 0 — the same reason Redis ships `min-replicas-to-write 0`. Set it to 1
+when losing acked writes is worse than a write outage, and size
+`--lease-ttl-ms` and your replacement-attach time accordingly.
+
 ### The lag cap (the RPO bound)
 
 Replication is asynchronous, but the master **sheds writes**
 (`-THROTTLED`) once replica lag exceeds `--lag-hard-ms` (default 1000; a
-soft cap delays first). So the window of acknowledged-but-unreplicated
+soft cap delays first). So the set of acknowledged-but-unreplicated
 writes — everything a failover could lose — is a configuration bound, not
 an accident. All four knobs above hot-reload (`flintctl reload`), so an
 operator can tighten them under load without a restart.
+
+**Read that bound carefully: it bounds VOLUME, not age.** Every mechanism
+on this page — the lag cap, the min-replicas gate, the lease — works by
+deciding *when the master stops accepting new writes*. None of them can
+reach back and protect a write that was already acknowledged. Once a
+write is acked and replication then stalls, that write stays at risk for
+as long as the stall lasts, and its age at the moment of a crash is
+bounded by nothing.
+
+So the honest statement is: **at most one cap-window's worth of writes is
+ever at risk**, because past the cap the master stops adding to the pile.
+The oldest write in that pile can be far older than the cap.
+
+This was measured, not reasoned about. `flint-chaos --stall-replica-ms`
+freezes the replica with SIGSTOP so the master acks writes it cannot
+replicate:
+
+| stall | deepest acked-write loss |
+|---|---|
+| none | 0 ms |
+| 700 ms (under the 1000 ms cap) | 543 ms |
+| 1800 ms (over the cap) | ~1.7 s — *older than the cap* |
+
+The third row is not a bug being caught. It reproduces identically under
+both the harness and controller drivers, and with `min-replicas 1`: every
+gate did its job, and the write still aged past the cap because nothing
+bounds age. Wording that promised "at most N seconds of acked writes"
+described a guarantee no code here provides, and has been corrected to
+the volume form above.
 
 ## Planned failover
 
@@ -154,20 +201,24 @@ flowchart LR
   epoch (and demoted if it claims master); a fresh replacement replica is
   attached and full-syncs from the new master.
 
-**RPO.** Bounded by the lag cap: a crash loses at most the async tail
-below `--lag-hard-ms` (default ≤ 1 s), and only writes that were acked
-after the last replicated one. A replica kill loses nothing (the master
-is untouched). **RTO.** Detection + verify + promote + proxy rediscovery;
-drill-measured **~0.6–1.2 s** from master kill to writable again at the
-defaults.
+**RPO.** A crash loses at most one cap-window's worth of writes — the
+async tail the master accepted before lag reached `--lag-hard-ms`
+(default 1000) — and only writes acked after the last replicated one. The
+CAP is what bounds how much is at risk; it does **not** bound how old the
+oldest at-risk write is, which grows with the length of the replication
+stall (see "the lag cap" above for the measurements). A replica kill
+loses nothing (the master is untouched). **RTO.** Detection + verify +
+promote + proxy rediscovery; drill-measured **~0.6–1.2 s** from master
+kill to writable again at the defaults.
 
 ## Failure scenarios
 
 | scenario | response | client impact | loss |
 |---|---|---|---|
-| Master process crashes (replica live) | controller confirms, promotes the converged replica, attaches a fresh replica | brief retry (proxy chases) | ≤ lag-hard tail |
+| Master process crashes (replica live) | controller confirms, promotes the converged replica, attaches a fresh replica | brief retry (proxy chases) | ≤ one lag-hard window of writes |
 | Master + replica both crash | controller REFUSES (not converged), pages; spare-restore from durable snapshot | writes unavailable until restore | up to last snapshot (rare) |
-| Network partition strands the master | master self-fences read-only on lease expiry; controller promotes the reachable survivor | brief retry; reads may `-TRYAGAIN` then fall back | ≤ lag-hard tail |
+| Network partition strands the master | master self-fences read-only on lease expiry; controller promotes the reachable survivor | brief retry; reads may `-TRYAGAIN` then fall back | ≤ one lag-hard window of writes |
+| Replica dies, master keeps serving | controller attaches a fresh replica; master is widowed until it syncs | none | **unbounded** at the default `min-replicas-to-write 0` (no replica ⇒ no lag ⇒ no cap); bounded by `--lease-ttl-ms` in a managed fleet, or by setting the gate to 1 and accepting the write freeze |
 | Old master returns after promotion | fenced by stale epoch; demoted; rejoins as fresh replica | none | none |
 | Controller itself dies | data plane keeps serving; leases still expire so no zombie master; any HA-set survivor resumes supervision | none (a *new* failure during the gap waits for a controller) | none |
 | Planned handoff (maintenance/upgrade) | `flintctl failover`: demote → drain → promote | brief retry | **zero** (drained) |
