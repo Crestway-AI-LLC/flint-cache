@@ -61,6 +61,14 @@ fn main() {
     // acks writes the replica has not taken. Without it the unreplicated
     // suffix is empty on loopback and the RPO bound has nothing to measure —
     // every run to date reported a loss depth of 0ms.
+    //
+    // Calibration matters. A stall well under the cap produces real,
+    // in-bounds loss depth (700ms stall -> 543ms deepest loss, oracle green;
+    // the same seed with no stall reads 0ms, so the stall is demonstrably
+    // what creates the window). A stall LONGER than the cap trips the RPO
+    // assertion — not because a gate failed, but because the published bound
+    // is stated as a wall-clock age and no gate bounds the age of an
+    // already-acked write. See the assertion's own note.
     let stall_replica_ms: u64 = arg("--stall-replica-ms", 0);
     // Slack for measurement, not for the engine: the master samples lag
     // slightly before it decides to ack, and our ack clock is taken after the
@@ -332,6 +340,25 @@ fn main() {
                 // Acked before the cap's window? Then replication carried it,
                 // or the bound is broken. Acked inside the window? Losing it
                 // is the async contract — track the depth, not a failure.
+                //
+                // WHAT THIS ASSERTION ENCODES, and why it can fire on
+                // behaviour that is not a code bug. docs/failover.md states
+                // the RPO as a WALL-CLOCK age: "a crash loses at most the
+                // async tail below --lag-hard-ms (default <= 1 s)". The
+                // mechanisms actually implemented — the lag cap, the
+                // min-replicas gate, the lease — all bound when the master
+                // STOPS ACCEPTING NEW writes. None of them can retroactively
+                // protect a write that was already acked. So if the replica
+                // stalls right after an ack, that write's age grows for as
+                // long as the stall lasts, without limit, and this assertion
+                // fires while every gate did its job.
+                //
+                // Reproduced at --stall-replica-ms 1800 under BOTH drivers
+                // and with --min-replicas 1: breach at ~1.7s every time. The
+                // bound the product enforces is on the VOLUME of at-risk
+                // writes (about one cap-window's worth), not on their age.
+                // Until the claim and the mechanism are reconciled the
+                // assertion stays as-is, because it is the published promise.
                 for &(seq, at) in acked_at {
                     // The writer may have re-acked this key AFTER the kill;
                     // those acks belong to the new master and say nothing
@@ -343,7 +370,10 @@ fn main() {
                         seq <= got || at > must_have_replicated_by,
                         "iter {iteration}: RPO BREACH at {key}: survivor holds seq {got}, but \
                          seq {seq} was acked {}ms before the kill — beyond the {lag_hard_ms}ms \
-                         cap (+{rpo_margin_ms}ms margin) that promises replication carried it",
+                         cap (+{rpo_margin_ms}ms margin) that promises replication carried it. \
+                         If this run used --stall-replica-ms, see the note above: an ack that \
+                         predates the stall ages past the cap no matter what the gates do, and \
+                         the claim, not the code, is what needs fixing",
                         kill_ms.saturating_sub(at)
                     );
                     if seq > got {
