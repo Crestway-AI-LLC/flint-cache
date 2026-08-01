@@ -5,3 +5,4 @@
 //! and `chain` (linked-list traversal under failover).
 pub mod cluster;
 pub mod oracle;
+pub mod writer;

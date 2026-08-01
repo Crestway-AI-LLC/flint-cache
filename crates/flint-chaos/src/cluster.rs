@@ -33,7 +33,7 @@ pub struct Attached {
     ctl: String,
     /// The pair under test, as declared. Roles float between these two.
     members: Vec<String>,
-    tls: Option<std::sync::Arc<flint_tls::ClientConfig>>,
+    pub tls: Option<std::sync::Arc<flint_tls::ClientConfig>>,
     master_kills: std::cell::Cell<u32>,
     replica_kills: std::cell::Cell<u32>,
 }
@@ -275,6 +275,28 @@ impl Target {
         }
     }
 
+    /// Candidate master endpoints for a client-side writer: the fixed pair
+    /// addresses (attached), or the pair's CURRENT ports (local, where a
+    /// harness-mode replacement replica gets a fresh port — the caller
+    /// republishes after each kill).
+    pub fn endpoints(&self) -> Vec<String> {
+        match self {
+            Target::Local { cluster, .. } => vec![
+                format!("127.0.0.1:{}", cluster.master()),
+                format!("127.0.0.1:{}", cluster.replica()),
+            ],
+            Target::Attached(a) => a.members().to_vec(),
+        }
+    }
+
+    /// The mesh client config an attached fleet's writer needs; None locally.
+    pub fn tls(&self) -> Option<std::sync::Arc<flint_tls::ClientConfig>> {
+        match self {
+            Target::Local { .. } => None,
+            Target::Attached(a) => a.tls.clone(),
+        }
+    }
+
     /// Does the HARNESS issue the promotion, rather than a controller?
     ///
     /// Recovery wall-clock is only an RTO measurement when something the
@@ -287,6 +309,33 @@ impl Target {
                 controller_driven, ..
             } => !*controller_driven,
             Target::Attached(_) => false,
+        }
+    }
+
+    /// Kill the master WITHOUT any convergence pre-wait, for workloads that
+    /// keep writing through the kill. The caller is responsible for having
+    /// parked the writer long enough for the controller to arm (see
+    /// writer::Shared::pause); the standard kill_master's own wait can never
+    /// observe seq_lag==0 under a live hammer and would burn its whole
+    /// timeout before killing anyway.
+    pub fn kill_master_hot(&mut self) {
+        match self {
+            Target::Local {
+                cluster,
+                controller_driven,
+            } => {
+                if *controller_driven {
+                    cluster.kill_master_now_await_controller();
+                } else {
+                    cluster.kill_master();
+                }
+            }
+            Target::Attached(a) => {
+                let dead = a.master();
+                a.kill(&dead).unwrap_or_else(|e| panic!("kill master: {e}"));
+                a.restart(&dead)
+                    .unwrap_or_else(|e| panic!("restart {dead}: {e}"));
+            }
         }
     }
 

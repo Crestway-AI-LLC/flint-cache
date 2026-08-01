@@ -11,7 +11,7 @@
 //! on different machines. Faults go through `flintctl kill-node` /
 //! `restart-node`, which know where each seat lives.
 
-use std::collections::HashMap;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use flint_chaos::cluster::{Attached, Cluster, Target, arg};
@@ -19,13 +19,8 @@ use flint_chaos::cluster::{Attached, Cluster, Target, arg};
 /// Wall clock in ms. The RPO bound is a statement about TIME — "acked longer
 /// ago than the cap must have replicated" — so the ledger needs a real clock,
 /// not the monotonic Instant used for pacing.
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
-use flint_chaos::oracle::{KeyLedger, parse_value, value_for};
+use flint_chaos::oracle::parse_value;
+use flint_chaos::writer::{self, Shared, now_ms};
 use flint_resp::Value;
 use rand::{Rng, SeedableRng, rngs::SmallRng};
 
@@ -78,43 +73,26 @@ fn main() {
         // A real fleet already has a controller; promotion is its job.
         Target::Attached(Attached::open(&inventory, arg("--pair", 0)))
     };
-    let mut ledger: HashMap<String, KeyLedger> = HashMap::new();
+    // The workload runs on its own thread and does not stop for kills —
+    // that is the entire point (#118 item 1): with the writer parked at the
+    // moment a master dies, the unreplicated suffix is empty and the RPO
+    // bound has nothing to test. See writer.rs for the full argument.
+    let shared = std::sync::Arc::new(Shared::new(cluster.endpoints(), cluster.tls(), key_count));
+    let writer_seed: u64 = arg("--seed", 42);
+    let writer_handle = {
+        let shared = shared.clone();
+        std::thread::spawn(move || writer::run(&shared, writer_seed))
+    };
+
     let mut rng = SmallRng::seed_from_u64(arg("--seed", 42));
-    let mut seq = 0u64;
     let mut acked_lost_total = 0u64;
-    let mut throttled_total = 0u64;
     let mut rtos: Vec<u64> = Vec::new();
     let mut deepest_loss_ms: u64 = 0;
-    let mut writer = cluster.master_client().expect("writer connect");
 
     for iteration in 1..=iterations {
-        // Write for a random spell.
-        let spell = Duration::from_millis(rng.random_range(400..900));
-        let start = Instant::now();
-        while start.elapsed() < spell {
-            seq += 1;
-            let key = format!("key{}", rng.random_range(0..key_count));
-            let value = value_for(&key, seq);
-            let entry = ledger.entry(key.clone()).or_default();
-            entry.written.push(seq);
-            entry.last_written = seq;
-            match writer.call(&[b"SET", key.as_bytes(), value.as_bytes()]) {
-                Ok(Value::Simple(s)) if s == "OK" => entry.record_ack(seq, now_ms()),
-                Ok(Value::Error(e)) if e.starts_with("THROTTLED") => {
-                    // Widowed/lagging master shed this write; the client
-                    // contract is retry-with-backoff. It was never acked, so
-                    // the ledger does not count it — no false loss.
-                    throttled_total += 1;
-                    std::thread::sleep(Duration::from_millis(20));
-                }
-                Ok(_) | Err(_) => {
-                    std::thread::sleep(Duration::from_millis(50));
-                    if let Ok(c) = cluster.master_client() {
-                        writer = c;
-                    }
-                }
-            }
-        }
+        // Let the writer run for a spell BETWEEN kills; it keeps writing
+        // through what follows.
+        std::thread::sleep(Duration::from_millis(rng.random_range(400..900)));
 
         let want_master = match mode.as_str() {
             "replica" => false,
@@ -122,59 +100,95 @@ fn main() {
             _ => rng.random_bool(0.5),
         };
         // Kill a master that HAS a live replica but is NOT required to be
-        // caught up, with writes landing right until the kill. That is the
-        // regime the RPO number describes; requiring seq_lag==0 first (the
-        // old guard) left nothing unreplicated to lose, so the oracle's
-        // verdict was a property of this harness.
+        // caught up, with writes in flight AT the kill. That is the regime
+        // the RPO number describes; requiring seq_lag==0 first (the old
+        // guard) left nothing unreplicated to lose, so the oracle's verdict
+        // was a property of this harness.
         if want_master && cluster.wait_replica_live(Duration::from_secs(8)) {
-            // Everything acked before this instant, minus the cap's window,
-            // must survive. Taken BEFORE the kill: kill_master() blocks
-            // through the promotion, so a timestamp after it would already
-            // include the recovery it is meant to measure.
-            let kill_ms = now_ms();
             let harness_promoted = cluster.promotion_is_harness();
-            cluster.kill_master();
-            // RTO: master death -> the pair accepting writes again, which is
-            // the published definition. Measured only when something the
-            // product ships did the promoting.
-            let mut c = cluster.master_client().expect("new master");
-            let probe = format!("rto-probe-{iteration}");
-            let mut writable_ms = None;
+            // ARM, RESUME, THEN KILL. The controller arms auto-failover only
+            // after observing the pair converged, and under a live hammer it
+            // never does — the first run of this loop killed an unarmed pair
+            // and died on "controller did not promote within 20s". So: park
+            // the writer until convergence has been visible long enough for
+            // the controller's confirm*poll window (the hotkey drill's
+            // precedent), resume the hammer, give it a beat so the replica is
+            // genuinely behind again, and only then kill. Writes are in
+            // flight AT the kill, which is the point of this whole change.
+            shared.pause.store(true, Ordering::SeqCst);
+            assert!(
+                cluster.wait_healthy(Duration::from_secs(10)),
+                "iter {iteration}: pair never converged while the writer was parked"
+            );
+            std::thread::sleep(Duration::from_millis(1_500)); // controller confirm*poll
+            shared.pause.store(false, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(300)); // hammer re-established
+            // Arm the writer's RTO clock, then kill. The kill blocks through
+            // the promotion, so any timestamp taken after it would include
+            // the recovery it is meant to measure. The writer closes the
+            // measurement with its FIRST POST-KILL ACK — the vantage of the
+            // thing actually trying to write.
+            shared.recovered_ms.store(0, Ordering::SeqCst);
+            shared.outage_seen.store(false, Ordering::SeqCst);
+            let kill_ms = now_ms();
+            shared.kill_ms.store(kill_ms, Ordering::SeqCst);
+            cluster.kill_master_hot();
+            // Harness-mode replacement replicas get fresh ports; republish
+            // so the writer can find the pair again. (Attached and
+            // controlled-local endpoints are fixed; this is a no-op there.)
+            shared.set_endpoints(cluster.endpoints());
+
             let deadline = Instant::now() + Duration::from_millis(rto_budget_ms.max(1) * 2);
-            while Instant::now() < deadline {
-                if let Ok(Value::Simple(ok)) = c.call(&[b"SET", probe.as_bytes(), b"1"])
-                    && ok == "OK"
-                {
-                    writable_ms = Some(now_ms().saturating_sub(kill_ms));
-                    break;
+            let rto = loop {
+                let r = shared.recovered_ms.load(Ordering::SeqCst);
+                if r != 0 {
+                    break r;
                 }
-                std::thread::sleep(Duration::from_millis(20));
-                if let Ok(fresh) = cluster.master_client() {
-                    c = fresh;
-                }
-            }
-            let rto = writable_ms.unwrap_or_else(|| {
-                panic!("iter {iteration}: pair never accepted writes within {rto_budget_ms}ms x2")
-            });
+                assert!(
+                    Instant::now() < deadline,
+                    "iter {iteration}: writer saw no ack within {rto_budget_ms}ms x2 of the kill"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            shared.kill_ms.store(0, Ordering::SeqCst);
             if !harness_promoted {
                 rtos.push(rto);
                 assert!(
                     rto <= rto_budget_ms,
                     "iter {iteration}: RTO {rto}ms exceeds the published budget {rto_budget_ms}ms \
-                     (docs/slo.md) — kill to writable"
+                     (docs/slo.md) — kill to first post-kill ack"
                 );
             }
 
-            // Acked writes older than the cap's window are guaranteed
-            // replicated, so the survivor must hold them. Newer ones may be
-            // gone: that IS the async contract, and counting them as failures
-            // would make the drill demand something never promised.
+            // Oracle pass over a SNAPSHOT of the ledger. The writer keeps
+            // going, so keys examined here can gain acks afterwards — but a
+            // new ack cannot un-lose an old one, and each key's verdict uses
+            // only what was recorded at snapshot time.
+            struct KeySnap {
+                key: String,
+                acked_at: Vec<(u64, u64)>,
+                last_acked: u64,
+            }
+            let snapshot: Vec<KeySnap> = {
+                let led = shared.ledger.lock().unwrap_or_else(|e| e.into_inner());
+                led.iter()
+                    .filter(|(_, e)| e.last_acked != 0)
+                    .map(|(k, e)| KeySnap {
+                        key: k.clone(),
+                        acked_at: e.acked_at.clone(),
+                        last_acked: e.last_acked,
+                    })
+                    .collect()
+            };
             let must_have_replicated_by = kill_ms.saturating_sub(lag_hard_ms + rpo_margin_ms);
+            let mut c = cluster.master_client().expect("oracle connect");
             let mut lost_here = 0u64;
-            for (key, entry) in ledger.iter_mut() {
-                if entry.last_acked == 0 {
-                    continue;
-                }
+            for KeySnap {
+                key,
+                acked_at,
+                last_acked,
+            } in &snapshot
+            {
                 let got = match c.call(&[b"GET", key.as_bytes()]) {
                     Ok(Value::Bulk(Some(raw))) => {
                         let (owner, seq_got) = parse_value(&raw)
@@ -185,28 +199,44 @@ fn main() {
                     Ok(Value::Bulk(None)) => 0,
                     _ => continue,
                 };
-                let breaches = entry.breaches(got, must_have_replicated_by);
-                assert!(
-                    breaches.is_empty(),
-                    "iter {iteration}: RPO BREACH at {key}: survivor holds seq {got}, but \
-                     seq {} was acked {}ms before the kill — beyond the {lag_hard_ms}ms cap \
-                     (+{rpo_margin_ms}ms margin) that promises replication carried it",
-                    breaches[0].0,
-                    kill_ms.saturating_sub(breaches[0].1)
-                );
-                if let Some(newest) = entry.newest_lost_ack_ms(got) {
-                    deepest_loss_ms = deepest_loss_ms.max(kill_ms.saturating_sub(newest));
+                // Acked before the cap's window? Then replication carried it,
+                // or the bound is broken. Acked inside the window? Losing it
+                // is the async contract — track the depth, not a failure.
+                for &(seq, at) in acked_at {
+                    // The writer may have re-acked this key AFTER the kill;
+                    // those acks belong to the new master and say nothing
+                    // about what the old one lost.
+                    if at >= kill_ms {
+                        continue;
+                    }
+                    assert!(
+                        seq <= got || at > must_have_replicated_by,
+                        "iter {iteration}: RPO BREACH at {key}: survivor holds seq {got}, but \
+                         seq {seq} was acked {}ms before the kill — beyond the {lag_hard_ms}ms \
+                         cap (+{rpo_margin_ms}ms margin) that promises replication carried it",
+                        kill_ms.saturating_sub(at)
+                    );
+                    if seq > got {
+                        deepest_loss_ms = deepest_loss_ms.max(kill_ms.saturating_sub(at));
+                    }
                 }
-                if got < entry.last_acked {
+                if got < *last_acked {
                     lost_here += 1;
-                    entry.last_acked = got;
-                    entry.last_written = entry.last_written.max(got);
-                    entry.acked_at.retain(|&(seq, _)| seq <= got);
+                    // Reconcile the shared ledger so later verdicts do not
+                    // re-count the same regression, and the final walk's
+                    // time-travel ceiling reflects what actually survived.
+                    let mut led = shared.ledger.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(entry) = led.get_mut(key)
+                        && entry.last_acked == *last_acked
+                    {
+                        entry.last_acked = got;
+                        entry.acked_at.retain(|&(s, at)| s <= got || at >= kill_ms);
+                    }
                 }
             }
             acked_lost_total += lost_here;
             println!(
-                "iter {iteration}: killed MASTER (writer live); RTO {rto}ms{}; acked keys \
+                "iter {iteration}: killed MASTER (writes in flight); RTO {rto}ms{}; acked keys \
                  regressed: {lost_here} (all within the {lag_hard_ms}ms cap)",
                 if harness_promoted {
                     " harness-promoted, not RTO"
@@ -214,23 +244,28 @@ fn main() {
                     ""
                 }
             );
-            writer = cluster.master_client().expect("reconnect");
         } else {
             cluster.kill_replica();
+            shared.set_endpoints(cluster.endpoints());
+            // A replica kill must not disturb the write path at all: every
+            // ack recorded BEFORE the kill still stands on the master.
+            let snapshot: Vec<(String, u64)> = {
+                let led = shared.ledger.lock().unwrap_or_else(|e| e.into_inner());
+                led.iter()
+                    .filter(|(_, e)| e.last_acked != 0)
+                    .map(|(k, e)| (k.clone(), e.last_acked))
+                    .collect()
+            };
             let mut c = cluster.master_client().expect("master");
-            for (key, entry) in &ledger {
-                if entry.last_acked == 0 {
-                    continue;
-                }
+            for (key, last_acked) in &snapshot {
                 match c.call(&[b"GET", key.as_bytes()]) {
                     Ok(Value::Bulk(Some(raw))) => {
                         let (owner, got) = parse_value(&raw)
                             .unwrap_or_else(|| panic!("TORN VALUE at {key}: {raw:?}"));
                         assert_eq!(&owner, key, "CROSS-KEY at {key}: owned by {owner}");
                         assert!(
-                            got >= entry.last_acked,
-                            "iter {iteration}: REPLICA kill lost acked write at {key}: {got} < {}",
-                            entry.last_acked
+                            got >= *last_acked,
+                            "iter {iteration}: REPLICA kill lost acked write at {key}: {got} < {last_acked}"
                         );
                     }
                     other => {
@@ -241,6 +276,14 @@ fn main() {
             println!("iter {iteration}: killed REPLICA; zero acked loss verified");
         }
     }
+
+    // Stop the writer before the final walk, or the walk races live SETs and
+    // "TIME TRAVEL" would fire on a value newer than the snapshot ceiling.
+    shared.stop.store(true, Ordering::SeqCst);
+    writer_handle.join().expect("writer thread");
+    let seq = shared.seq.load(Ordering::SeqCst);
+    let throttled_total = shared.throttled.load(Ordering::SeqCst);
+    let ledger = std::mem::take(&mut *shared.ledger.lock().unwrap_or_else(|e| e.into_inner()));
 
     // Final full-keyspace walk.
     let mut c = cluster.master_client().expect("final connect");
