@@ -514,6 +514,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "flint-build"
+version = "0.0.1"
+
+[[package]]
 name = "flint-chaos"
 version = "0.0.1"
 dependencies = [
@@ -563,6 +567,7 @@ dependencies = [
 name = "flint-ctl"
 version = "0.0.1"
 dependencies = [
+ "flint-build",
  "flint-resp",
  "flint-tls",
 ]
@@ -605,6 +610,7 @@ version = "0.0.1"
 name = "flint-server"
 version = "0.0.1"
 dependencies = [
+ "flint-build",
  "flint-commands",
  "flint-journal",
  "flint-resp",
