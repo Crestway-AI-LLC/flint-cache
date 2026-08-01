@@ -1,11 +1,34 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Elastic-2.0
 # Slot-move drill: ship one slot's data from a live SOURCE to a live
-# DESTINATION in a SINGLE pass, while writes to that slot arrive AFTER the
-# migration's snapshot — so those writes can ONLY reach the destination via
-# the replication tail, not the bulk copy. Proves the data-shipping half of
+# DESTINATION while writes to that slot arrive AFTER the migration's
+# snapshot — so those writes can ONLY reach the destination via the
+# replication tail, not the bulk copy. Proves the data-shipping half of
 # intra-group rebalancing catches mid-copy writes. Ownership cutover is a
 # separate step, not exercised here.
+#
+# TWO PASSES, and the reason matters. This drill used to run ONE pass
+# concurrently with the writer and then assert the destination held every
+# key, on the stated premise that "the migrate cannot drain (and return)
+# until the burst finishes". That premise is false. Data-ship-only mode
+# (no self-addr) promises to ship up to a CAUGHT-UP POINT: the source sends
+# CAUGHTUP <cursor> <head> and the destination stops the moment cursor
+# reaches head. Under load the writer is slowed more than the migrator, so
+# the head is reachable early — reproduced with 6 CPU hogs, where the pass
+# returned MIGRATEIN-OK 77023 of 220001 keys and the two highest sampled
+# keys were legitimately absent. That is the mode working, not failing.
+#
+# Convergence under continuous writes is the CUTOVER mode's job
+# (freeze -> drain -> flip), which is what both real callers use — the
+# controller's rebalance executor and its recovery resume both pass the
+# destination address. Nothing in production relies on a single data-ship
+# pass being complete.
+#
+# So: pass 1 runs against the live writer and proves only what that mode
+# promises — that the tail carried post-snapshot writes. Pass 2 runs after
+# the writer has stopped, where the source head is FIXED and convergence is
+# therefore guaranteed rather than raced, and that is where completeness is
+# asserted.
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
@@ -64,7 +87,7 @@ awk -v tag="$TAG" -v n="$BASE" 'BEGIN{for(i=0;i<n;i++){k=sprintf("%s:key%06d",ta
 WRITER=$!
 sleep 0.05
 
-echo "== single FLINTMIGRATEIN pass (bulk snapshot + tail of post-snapshot writes)"
+echo "== pass 1: FLINTMIGRATEIN while the writer is still going"
 RES=$(valkey-cli -p $DPORT FLINTMIGRATEIN "127.0.0.1:$SPORT" "$SLOT" 2>&1)
 wait $WRITER 2>/dev/null
 echo "  result: $RES"
@@ -75,6 +98,14 @@ APPLIED=$(echo "$RES" | grep -oE '[0-9]+$')
 # post-snapshot writes. (If it equalled BASE, the tail did nothing.)
 [ "$APPLIED" -gt "$BASE" ] || { echo "FAIL: applied=$APPLIED not greater than bulk=$BASE — tail shipped nothing"; exit 1; }
 echo "  applied=$APPLIED > bulk=$BASE — the tail shipped mid-copy writes"
+
+# The writer has stopped, so the source head no longer moves and this pass
+# MUST reach it. Asserting completeness here is deterministic; asserting it
+# after pass 1 was a race against how fast the writer happened to run.
+echo "== pass 2: converge now that the source is static"
+RES2=$(valkey-cli -p $DPORT FLINTMIGRATEIN "127.0.0.1:$SPORT" "$SLOT" 2>&1)
+echo "  result: $RES2"
+echo "$RES2" | grep -q "MIGRATEIN-OK" || { echo "FAIL: converging pass did not complete: $RES2"; exit 1; }
 
 echo "== verify destination holds base AND tail-only keys, with exact values"
 MISS=0
@@ -91,4 +122,4 @@ SRC_N=$(valkey-cli -p $SPORT DBSIZE); DST_N=$(valkey-cli -p $DPORT DBSIZE)
 echo "  source DBSIZE=$SRC_N  destination DBSIZE=$DST_N"
 [ "$DST_N" = "$SRC_N" ] || { echo "FAIL: destination count $DST_N != source $SRC_N"; exit 1; }
 
-echo "PASS: single-pass slot move shipped bulk + tail; destination holds the full slot ($DST_N keys), tail-only keys present with post-snapshot values"
+echo "PASS: slot move shipped bulk + tail (pass 1 applied $APPLIED > bulk $BASE, so mid-copy writes rode the tail) and converged on a static source (pass 2): destination holds the full slot ($DST_N keys) with post-snapshot values"
