@@ -63,6 +63,15 @@ $CTL -f "$INV" bootstrap >/dev/null 2>&1 || { echo "FAIL: bootstrap"; exit 1; }
 $CTL -f "$INV" verify >/dev/null 2>&1 || { echo "FAIL: fleet did not verify before chaos"; exit 1; }
 echo "  VERIFY OK"
 
+# A tenant, so the workload can go through the PROXY EDGE rather than dialling
+# each master. That is the path a real client takes, and until now it was
+# covered only by the local proxy_chaos drill — the attached (operator-path)
+# chaos still bypassed the proxy entirely, so "the proxy chases a promotion"
+# was never tested on a CP-fed proxy with a gated tenant.
+$CTL -f "$INV" tenant add chaos tok-chaos chaos 1 >/dev/null 2>&1 \
+  || { echo "FAIL: could not create the chaos tenant"; exit 1; }
+echo "  tenant chaos created; workload will drive the edge at 127.0.0.1:7692"
+
 echo "== the two fault verbs behave before we lean on them"
 # restart-node must REFUSE the master: bringing the master back as a replica
 # of itself is meaningless, and doing it silently would wipe the only copy.
@@ -77,6 +86,7 @@ echo "  restart-node refuses the master ($MASTER)"
 echo "== chaos: $ITER kills through flintctl, promotion by the fleet's controller"
 FLINTCTL_BIN=$CTL ./target/release/flint-chaos \
   --inventory "$INV" --iterations "$ITER" --keys 300 --mode mixed \
+  --edge 127.0.0.1:7692 --auth chaos:tok-chaos \
   2>&1 | tee "$D/chaos.log" | sed 's/^/  /'
 grep -q "^PASS:" "$D/chaos.log" || { echo "FAIL: chaos oracle did not pass"; exit 1; }
 

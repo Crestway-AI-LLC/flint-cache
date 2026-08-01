@@ -20,7 +20,7 @@ use flint_chaos::cluster::{Attached, Cluster, Target, arg};
 /// ago than the cap must have replicated" — so the ledger needs a real clock,
 /// not the monotonic Instant used for pacing.
 use flint_chaos::oracle::parse_value;
-use flint_chaos::writer::{self, Shared, now_ms};
+use flint_chaos::writer::{self, Edge, Shared, now_ms};
 use flint_resp::Value;
 use rand::{Rng, SeedableRng, rngs::SmallRng};
 
@@ -58,6 +58,11 @@ fn main() {
     let rpo_margin_ms: u64 = arg("--rpo-margin-ms", 500);
     // docs/slo.md publishes RTO <= 10 s.
     let rto_budget_ms: u64 = arg("--rto-budget-ms", 10_000);
+    // Client-path mode: drive the workload through the proxy edge instead of
+    // dialling each pair's master (#118 item 3, and what the #99 plan asked
+    // for). Needs a tenant credential because a CP-fed proxy is gated.
+    let edge_addr: String = arg("--edge", String::new());
+    let edge_auth: String = arg("--auth", String::new());
     println!(
         "chaos-kv: {iterations} kills, {key_count} keys, mode={mode}, driver={}, min_replicas={min_replicas}, seed={seed} (replay with --seed {seed})",
         if !inventory.is_empty() {
@@ -105,9 +110,36 @@ fn main() {
     // moment a master dies, the unreplicated suffix is empty and the RPO
     // bound has nothing to test. See writer.rs for the full argument.
     let writer_seed: u64 = seed;
-    let shareds: Vec<std::sync::Arc<Shared>> = targets
-        .iter()
-        .map(|t| std::sync::Arc::new(Shared::new(t.endpoints(), t.tls(), key_count)))
+    let edge = if edge_addr.is_empty() {
+        None
+    } else {
+        let (tenant, token) = edge_auth
+            .split_once(':')
+            .unwrap_or_else(|| panic!("--edge needs --auth <tenant>:<token>"));
+        println!("  client path: proxy edge {edge_addr} as tenant {tenant}");
+        Some(Edge {
+            addr: edge_addr.clone(),
+            tenant: tenant.to_string(),
+            token: token.to_string(),
+        })
+    };
+    let pair_count = targets.len();
+    let shareds: Vec<std::sync::Arc<Shared>> = (0..pair_count)
+        .map(|i| {
+            let t = &targets[i];
+            // Through the edge the PROXY routes, so each writer pins its keys
+            // behind a hash tag landing in its own pair's slots — otherwise
+            // writer 1's keys scatter onto pair 0 and its verdict after a
+            // pair-1 kill would judge the wrong nodes.
+            let tag = if edge.is_some() {
+                flint_chaos::cluster::pair_tag(i, pair_count)
+            } else {
+                String::new()
+            };
+            std::sync::Arc::new(
+                Shared::new(t.endpoints(), t.tls(), key_count).with_edge(edge.clone(), tag),
+            )
+        })
         .collect();
     let writer_handles: Vec<_> = shareds
         .iter()
@@ -172,6 +204,8 @@ fn main() {
             // thing actually trying to write.
             shared.recovered_ms.store(0, Ordering::SeqCst);
             shared.outage_seen.store(false, Ordering::SeqCst);
+            shared.max_stall_ms.store(0, Ordering::SeqCst);
+            shared.acks_after_kill.store(0, Ordering::SeqCst);
             let kill_ms = now_ms();
             shared.kill_ms.store(kill_ms, Ordering::SeqCst);
             cluster.kill_master_hot();
@@ -181,23 +215,46 @@ fn main() {
             shared.set_endpoints(cluster.endpoints());
 
             let deadline = Instant::now() + Duration::from_millis(rto_budget_ms.max(1) * 2);
-            let rto = loop {
-                let r = shared.recovered_ms.load(Ordering::SeqCst);
-                if r != 0 {
-                    break r;
+            // Two different questions, because the two paths answer different
+            // ones. DIRECT: how long from the error to the first success —
+            // the client saw the outage. CLIENT PATH: how long was the worst
+            // stall — the client saw no error at all, just one slow write,
+            // because the proxy chased the promotion underneath. Waiting for
+            // a direct-path outage on the client path hangs forever; the
+            // first run of edge mode did exactly that.
+            let rto = if shared.edge.is_some() {
+                // Enough acks after the kill that the failover window is
+                // certainly behind us, then take the worst gap.
+                loop {
+                    if shared.acks_after_kill.load(Ordering::SeqCst) >= 50 {
+                        break shared.max_stall_ms.load(Ordering::SeqCst).max(1);
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "iter {iteration}: edge served fewer than 50 writes in \
+                         {rto_budget_ms}ms x2 after the kill — the proxy never recovered"
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
                 }
-                assert!(
-                    Instant::now() < deadline,
-                    "iter {iteration}: writer saw no ack within {rto_budget_ms}ms x2 of the kill"
-                );
-                std::thread::sleep(Duration::from_millis(10));
+            } else {
+                loop {
+                    let r = shared.recovered_ms.load(Ordering::SeqCst);
+                    if r != 0 {
+                        break r;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "iter {iteration}: writer saw no ack within {rto_budget_ms}ms x2 of the kill"
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
             };
             shared.kill_ms.store(0, Ordering::SeqCst);
             if !harness_promoted {
                 rtos.push(rto);
                 assert!(
                     rto <= rto_budget_ms,
-                    "iter {iteration}: RTO {rto}ms exceeds the published budget {rto_budget_ms}ms \
+                    "iter {iteration}: {rto}ms exceeds the published budget {rto_budget_ms}ms \
                      (docs/slo.md) — kill to first post-kill ack"
                 );
             }
@@ -223,7 +280,14 @@ fn main() {
                     .collect()
             };
             let must_have_replicated_by = kill_ms.saturating_sub(lag_hard_ms + rpo_margin_ms);
-            let mut c = cluster.master_client().expect("oracle connect");
+            // Read back the way the CLIENT would: through the edge when
+            // that is the path under test, so a proxy that has not chased
+            // the promotion shows up as the data loss it would be for a
+            // real client rather than being bypassed.
+            let mut c = shared
+                .connect()
+                .or_else(|| cluster.master_client().ok())
+                .expect("oracle connect");
             let mut lost_here = 0u64;
             for KeySnap {
                 key,
@@ -286,8 +350,13 @@ fn main() {
             }
             acked_lost_total += lost_here;
             println!(
-                "iter {iteration}: pair {pair_idx}: killed MASTER (writes in flight); RTO {rto}ms{}; acked keys \
+                "iter {iteration}: pair {pair_idx}: killed MASTER (writes in flight); {} {rto}ms{}; acked keys \
                  regressed: {lost_here} (all within the {lag_hard_ms}ms cap)",
+                if shared.edge.is_some() {
+                    "client stall"
+                } else {
+                    "RTO"
+                },
                 if harness_promoted {
                     " harness-promoted, not RTO"
                 } else {
@@ -306,7 +375,10 @@ fn main() {
                     .map(|(k, e)| (k.clone(), e.last_acked))
                     .collect()
             };
-            let mut c = cluster.master_client().expect("master");
+            let mut c = shared
+                .connect()
+                .or_else(|| cluster.master_client().ok())
+                .expect("master");
             for (key, last_acked) in &snapshot {
                 match c.call(&[b"GET", key.as_bytes()]) {
                     Ok(Value::Bulk(Some(raw))) => {
@@ -346,7 +418,10 @@ fn main() {
     let (mut present, mut missing) = (0u64, 0u64);
     for (t, sh) in targets.iter_mut().zip(&shareds) {
         let ledger = std::mem::take(&mut *sh.ledger.lock().unwrap_or_else(|e| e.into_inner()));
-        let mut c = t.master_client().expect("final connect");
+        let mut c = sh
+            .connect()
+            .or_else(|| t.master_client().ok())
+            .expect("final connect");
         for (key, entry) in &ledger {
             match c.call(&[b"GET", key.as_bytes()]) {
                 Ok(Value::Bulk(Some(raw))) => {
@@ -386,8 +461,16 @@ fn main() {
         sorted.sort_unstable();
         let p50 = sorted[sorted.len() / 2];
         let worst = *sorted.last().expect("non-empty");
+        let label = if edge.is_some() {
+            // Named for what it is. Through the edge the client never saw a
+            // failure, so calling this RTO would overstate the outage and
+            // understate the product: the proxy absorbed it.
+            "client-visible stall (no errors seen; the proxy chased the promotion)"
+        } else {
+            "RTO kill->writable"
+        };
         println!(
-            "  RTO kill->writable over {} promotion(s): p50 {p50}ms, worst {worst}ms (budget {rto_budget_ms}ms, docs/slo.md)",
+            "  {label} over {} promotion(s): p50 {p50}ms, worst {worst}ms (budget {rto_budget_ms}ms, docs/slo.md)",
             sorted.len()
         );
     }

@@ -78,7 +78,47 @@ pub struct Shared {
     /// kill -9 guarantees the next call on that connection fails, so the
     /// gate always opens.
     pub outage_seen: AtomicBool,
+    /// Wall clock of the most recent ack, and the largest gap between two
+    /// consecutive acks since the kill was armed.
+    ///
+    /// Through the proxy edge a client does NOT see an outage: a probe held
+    /// across a master kill got 120 replies and 120 of them were +OK. The
+    /// proxy chases the promotion and retries underneath, so "time from the
+    /// error to the first success" — the direct-path RTO — measures an event
+    /// the client never experiences, and waiting for it hangs forever (it
+    /// did). What a client actually feels is a STALL: one write takes as long
+    /// as the failover instead of failing. So the client path reports the
+    /// widest inter-ack gap spanning the kill, which is the same quantity the
+    /// SLO cares about seen from where the customer sits.
+    pub last_ack_ms: AtomicU64,
+    pub max_stall_ms: AtomicU64,
+    /// Acks observed strictly after the kill instant — proof that service
+    /// continued, and how the client path knows the window has closed.
+    pub acks_after_kill: AtomicU64,
     pub key_count: u64,
+    /// Client-path mode: dial the PROXY EDGE with a tenant credential rather
+    /// than the pair's master directly.
+    ///
+    /// The #99 plan specified this ("the workload runs from the orchestrator
+    /// through the proxy edge") and it was never built, so client-visible
+    /// failover — the proxy noticing a promotion and chasing it, the retry
+    /// semantics a real client sees — was covered only by the LOCAL
+    /// proxy_chaos drill and never once multi-host.
+    ///
+    /// Direct-to-master stays the default: it isolates the ENGINE's failover
+    /// from the proxy's rediscovery, and when both run you can tell which
+    /// layer a regression came from.
+    pub edge: Option<Edge>,
+    /// Every key this writer touches carries this hash tag, pinning it to one
+    /// pair even though the proxy does the routing. Empty in direct mode.
+    pub tag: String,
+}
+
+#[derive(Clone)]
+pub struct Edge {
+    pub addr: String,
+    pub tenant: String,
+    pub token: String,
 }
 
 impl Shared {
@@ -98,12 +138,50 @@ impl Shared {
             kill_ms: AtomicU64::new(0),
             recovered_ms: AtomicU64::new(0),
             outage_seen: AtomicBool::new(false),
+            last_ack_ms: AtomicU64::new(0),
+            max_stall_ms: AtomicU64::new(0),
+            acks_after_kill: AtomicU64::new(0),
             key_count,
+            edge: None,
+            tag: String::new(),
+        }
+    }
+
+    pub fn with_edge(mut self, edge: Option<Edge>, tag: String) -> Self {
+        self.edge = edge;
+        self.tag = tag;
+        self
+    }
+
+    fn key(&self, n: u64) -> String {
+        if self.tag.is_empty() {
+            format!("key{n}")
+        } else {
+            format!("{{{}}}key{n}", self.tag)
         }
     }
 
     pub fn set_endpoints(&self, eps: Vec<String>) {
         *self.endpoints.lock().unwrap_or_else(|e| e.into_inner()) = eps;
+    }
+
+    /// A connected, authenticated client for this writer's traffic: the edge
+    /// when configured, else whichever endpoint answers as master.
+    pub fn connect(&self) -> Option<Client> {
+        let Some(e) = &self.edge else {
+            return self.connect_master();
+        };
+        // The edge is a FIXED address that outlives every failover — that is
+        // the point of it. The proxy speaks plaintext to clients (frontend
+        // TLS is a separate concern from the internal mesh), so no config.
+        let mut c = Client::connect_addr(&e.addr, &None).ok()?;
+        match c.call(&[b"AUTH", e.token.as_bytes()]) {
+            Ok(Value::Simple(_)) => Some(c),
+            // A CP-fed proxy answers -NOAUTH until a tenant authenticates and
+            // may still be loading its snapshot right after a restart; either
+            // way the caller retries.
+            _ => None,
+        }
     }
 
     /// Dial whichever endpoint currently answers as master.
@@ -140,7 +218,7 @@ impl Shared {
 pub fn run(shared: &Shared, seed: u64) {
     use rand::{Rng, SeedableRng, rngs::SmallRng};
     let mut rng = SmallRng::seed_from_u64(seed);
-    let mut client = shared.connect_master();
+    let mut client = shared.connect();
 
     while !shared.stop.load(Ordering::SeqCst) {
         if shared.pause.load(Ordering::SeqCst) {
@@ -149,10 +227,10 @@ pub fn run(shared: &Shared, seed: u64) {
         }
         let Some(c) = client.as_mut() else {
             std::thread::sleep(Duration::from_millis(10));
-            client = shared.connect_master();
+            client = shared.connect();
             continue;
         };
-        let key = format!("key{}", rng.random_range(0..shared.key_count));
+        let key = shared.key(rng.random_range(0..shared.key_count));
         let seq = shared.seq.fetch_add(1, Ordering::SeqCst) + 1;
         let value = value_for(&key, seq);
 
@@ -174,10 +252,21 @@ pub fn run(shared: &Shared, seed: u64) {
                     let mut led = shared.ledger.lock().unwrap_or_else(|e| e.into_inner());
                     led.entry(key).or_default().record_ack(seq, at);
                 }
+                let kill = shared.kill_ms.load(Ordering::SeqCst);
+                // Stall accounting, for the client path. Measured on every
+                // ack so the window spanning the kill is caught wherever it
+                // falls.
+                let prev = shared.last_ack_ms.swap(at, Ordering::SeqCst);
+                if kill != 0 && prev != 0 {
+                    let gap = at.saturating_sub(prev);
+                    shared.max_stall_ms.fetch_max(gap, Ordering::SeqCst);
+                    if at > kill {
+                        shared.acks_after_kill.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
                 // First ack AFTER the observed outage closes the RTO
                 // measurement; acks before the outage are the old master
                 // still draining and say nothing about recovery.
-                let kill = shared.kill_ms.load(Ordering::SeqCst);
                 if kill != 0
                     && shared.outage_seen.load(Ordering::SeqCst)
                     && shared.recovered_ms.load(Ordering::SeqCst) == 0
@@ -200,7 +289,7 @@ pub fn run(shared: &Shared, seed: u64) {
                 if shared.kill_ms.load(Ordering::SeqCst) != 0 {
                     shared.outage_seen.store(true, Ordering::SeqCst);
                 }
-                client = shared.connect_master();
+                client = shared.connect();
                 if client.is_none() {
                     std::thread::sleep(Duration::from_millis(10));
                 }

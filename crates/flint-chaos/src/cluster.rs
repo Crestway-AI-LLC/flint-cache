@@ -405,6 +405,33 @@ impl Target {
     }
 }
 
+/// A hash tag whose slot lands in `pair_idx`'s share of an EVEN split.
+///
+/// Going through the proxy edge means the PROXY decides which pair a key
+/// lands on, which would dissolve the per-pair ledgers: a writer for pair 1
+/// would scatter keys onto pair 0 and its verdict after a pair-1 kill would
+/// be judging the wrong nodes. Pinning every key of writer i behind a tag
+/// that routes to pair i keeps each ledger about exactly one pair, while the
+/// traffic still crosses the real client path.
+///
+/// Assumes the bootstrap split (`i*16384/n ..= (i+1)*16384/n - 1`), which is
+/// what `flintctl bootstrap` registers and what a throwaway chaos fleet has.
+/// A fleet with migrated slots would need the CP's map instead; asserting
+/// that here would mean a second slot-map parser, so the caller is expected
+/// not to point edge mode at a rebalanced cluster.
+pub fn pair_tag(pair_idx: usize, pair_count: usize) -> String {
+    let lo = (pair_idx * 16384 / pair_count) as u16;
+    let hi = ((pair_idx + 1) * 16384 / pair_count - 1) as u16;
+    for n in 0..100_000u32 {
+        let tag = format!("p{pair_idx}x{n}");
+        let slot = flint_slot::crc16(tag.as_bytes()) % 16384;
+        if slot >= lo && slot <= hi {
+            return tag;
+        }
+    }
+    panic!("no hash tag found for pair {pair_idx} of {pair_count} (slots {lo}..={hi})");
+}
+
 pub fn arg<T: std::str::FromStr>(name: &str, default: T) -> T {
     std::env::args()
         .skip_while(|a| a != name)
