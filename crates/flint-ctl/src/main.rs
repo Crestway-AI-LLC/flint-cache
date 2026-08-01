@@ -31,6 +31,11 @@
 //!   lag-soft-ms 500       node  HOT   soft lag cap (delays writes)
 //!   lag-hard-ms 1000      node  HOT   hard lag cap (sheds; RPO bound)
 //!   min-replicas 1        node  HOT   min-replicas-to-write gate
+//!   widowed-grace-ms N    node  HOT   max time accepting writes with NO
+//!                                     replica (default 10000 on a pair;
+//!                                     0 off). The only bound on the
+//!                                     widowed window — the lag cap has
+//!                                     no replica to measure against.
 //!   max-conns 10000       node  HOT   connection admission cap
 //!   async-queue-cap 4096  node  restart  async write-queue depth
 //!   cache-ttl-ms 300      proxy HOT   near-cache TTL (via PROXYCACHE)
@@ -103,9 +108,13 @@ struct Inventory {
     /// spawned process's flags at bootstrap/start, so `stop` + edit +
     /// `start` applies new values.
     wal_fsync_ms: Option<u64>, // node: WAL fsync cadence (host-loss bound)
-    lag_soft_ms: Option<u64>,      // node: replication soft lag cap (delay)
-    lag_hard_ms: Option<u64>,      // node: replication hard lag cap (RPO shed)
-    min_replicas: Option<u32>,     // node: min-replicas-to-write safety gate
+    lag_soft_ms: Option<u64>,  // node: replication soft lag cap (delay)
+    lag_hard_ms: Option<u64>,  // node: replication hard lag cap (RPO shed)
+    min_replicas: Option<u32>, // node: min-replicas-to-write safety gate
+    /// node: how long a seat may keep accepting writes with NO live replica
+    /// before it sheds. Absent = flintctl's own default for pair members
+    /// (DEFAULT_WIDOWED_GRACE_MS); explicit 0 turns it off.
+    widowed_grace_ms: Option<u64>,
     max_conns: Option<u64>,        // node + proxy: connection admission cap
     async_queue_cap: Option<u64>,  // node: async write-queue depth
     cache_ttl_ms: Option<u64>,     // proxy: near-cache TTL default
@@ -175,6 +184,7 @@ fn parse_inventory(path: &str) -> Inventory {
             "lag-soft-ms" => inv.lag_soft_ms = val.parse().ok(),
             "lag-hard-ms" => inv.lag_hard_ms = val.parse().ok(),
             "min-replicas" => inv.min_replicas = val.parse().ok(),
+            "widowed-grace-ms" => inv.widowed_grace_ms = val.parse().ok(),
             "max-conns" => inv.max_conns = val.parse().ok(),
             "async-queue-cap" => inv.async_queue_cap = val.parse().ok(),
             "cache-ttl-ms" => inv.cache_ttl_ms = val.parse().ok(),
@@ -1098,6 +1108,73 @@ fn local_stop_seat(
     }
 }
 
+/// Push the widowed grace that a pair's CURRENT size implies to every member
+/// of it, live, after a topology change.
+///
+/// "Widowed" has to mean "lost a peer it is supposed to have", not "is alone
+/// right now". Those differ exactly when an operator deliberately shrinks a
+/// pair: after `decommission`, the survivor is not widowed, it is standalone
+/// by decision — and a grace inherited from when it HAD a peer would shed
+/// every write once it expired. The decommission drill caught precisely that,
+/// reporting "not writable after decommission" ten seconds later.
+///
+/// The node cannot make this call: from inside the process, "my peer died"
+/// and "my peer was retired on purpose" are the same observation. flintctl
+/// owns the inventory, so flintctl owns the reconciliation — and it must do
+/// it on every path that changes a pair's size, not only at spawn.
+///
+/// Hot, via FLINTCONFIG: a topology change must not need a restart to become
+/// safe, and a restart to become safe is a restart that gets skipped.
+fn reconcile_widowed_grace(
+    inv: &Inventory,
+    members: &[String],
+    tls: &Option<Arc<flint_tls::ClientConfig>>,
+) {
+    // An explicit inventory value is the operator's, and is applied at spawn
+    // for every member already. Only flintctl's OWN default is topology-
+    // derived, so only that needs revisiting here.
+    if inv.widowed_grace_ms.is_some() {
+        return;
+    }
+    let want = if members.len() > 1 {
+        DEFAULT_WIDOWED_GRACE_MS
+    } else {
+        0
+    };
+    for node in members {
+        match call(
+            node,
+            tls,
+            &["FLINTCONFIG", "widowed-grace-ms", &want.to_string()],
+        ) {
+            Ok(Value::Simple(_)) => {
+                eprintln!(
+                    "  {node}: widowed-grace-ms={want} (pair size {})",
+                    members.len()
+                )
+            }
+            // Not fatal: the seat may be mid-restart, and the spawn path
+            // applies the same value. Say so rather than passing silently —
+            // a gate that failed to move is the thing worth seeing.
+            other => eprintln!(
+                "  {node}: could NOT set widowed-grace-ms={want}: {}",
+                reply_err(&other)
+            ),
+        }
+    }
+}
+
+/// How long a PAIR MEMBER may keep accepting writes with no live replica
+/// before it sheds them, when the inventory does not say.
+///
+/// 10 s deliberately equals the published RPO envelope: the promise is "at
+/// most ten seconds' worth of acknowledged writes at risk", and this is the
+/// mechanism that makes it true when there is no replica to measure lag
+/// against. Pick a different number by setting `widowed-grace-ms`; it wants
+/// to be comfortably longer than a promotion plus a replacement replica's
+/// first ack, and shorter than the loss you are willing to publish.
+const DEFAULT_WIDOWED_GRACE_MS: u64 = 10_000;
+
 /// The binaries `flintctl` starts — the orphan sweep's allowlist.
 const FLEET_BINARIES: [&str; 5] = [
     "flint-server",
@@ -1229,13 +1306,21 @@ fn internal_args(inv: &Inventory) -> Vec<String> {
 /// convergence, `status` shows the truth.
 fn reload(inv: &Inventory) {
     let tls = tls_client(inv);
-    let node_kv: [(&str, Option<String>); 5] = [
+    let node_kv: [(&str, Option<String>); 6] = [
         ("wal-fsync-ms", inv.wal_fsync_ms.map(|v| v.to_string())),
         ("lag-soft-ms", inv.lag_soft_ms.map(|v| v.to_string())),
         ("lag-hard-ms", inv.lag_hard_ms.map(|v| v.to_string())),
         (
             "min-replicas-to-write",
             inv.min_replicas.map(|v| v.to_string()),
+        ),
+        // Reload pushes only what the inventory SAYS. flintctl's
+        // pair-member default is applied at spawn, not here: a reload
+        // that silently re-imposed it would overwrite a value an
+        // operator had just set live through FLINTCONFIG.
+        (
+            "widowed-grace-ms",
+            inv.widowed_grace_ms.map(|v| v.to_string()),
         ),
         ("max-conns", inv.max_conns.map(|v| v.to_string())),
     ];
@@ -1287,7 +1372,14 @@ fn reload(inv: &Inventory) {
 /// Node (flint-server) operator tunables from the inventory — durability,
 /// RPO, and admission knobs. Absent keys leave the binary's default, so
 /// this never changes behaviour it wasn't explicitly told to.
-fn node_tuning_args(inv: &Inventory) -> Vec<String> {
+///
+/// `replicated` says whether this seat lives in a pair that HAS a peer. It
+/// decides one thing — the widowed grace — and it has to be decided here
+/// rather than in the server, because the server cannot know its own
+/// topology: a lone flint-server and a pair member that has just lost its
+/// peer look identical from inside the process. flintctl reads the
+/// inventory, so it is the only component that can tell them apart.
+fn node_tuning_args(inv: &Inventory, replicated: bool) -> Vec<String> {
     let mut a = Vec::new();
     let mut push = |flag: &str, v: String| a.extend([flag.to_string(), v]);
     if let Some(v) = inv.wal_fsync_ms {
@@ -1301,6 +1393,31 @@ fn node_tuning_args(inv: &Inventory) -> Vec<String> {
     }
     if let Some(v) = inv.min_replicas {
         push("--min-replicas-to-write", v.to_string());
+    }
+    // The widowed grace, ON BY DEFAULT for a seat that has a peer.
+    //
+    // This is the one tunable flintctl turns on rather than merely passing
+    // through, because leaving it off has no safe reading. With no live
+    // replica the lag cap cannot fire — `lag_ms` is None, the write path
+    // falls through, and the master accepts writes nothing is copying, with
+    // no bound at all. Measured before this existed: a default pair whose
+    // replica was frozen took 539 writes in ~4s with zero replicas. Every
+    // shipped cluster was in that state, because the only guard against it
+    // (min-replicas-to-write) defaults to 0 and nothing set it.
+    //
+    // 10s matches the published RPO envelope on purpose: the doc promises at
+    // most ten seconds' worth of acked writes at risk, and this is what makes
+    // that true in the widowed case instead of aspirational. A pair that
+    // wants a different trade sets `widowed-grace-ms` explicitly; 0 turns it
+    // off and restores the old unbounded behaviour.
+    //
+    // Not applied to a single-member pair: with no peer ever, the grace would
+    // shed every write once it expired, which is a standalone node being
+    // punished for a redundancy it was never configured to have.
+    match (inv.widowed_grace_ms, replicated) {
+        (Some(v), _) => push("--widowed-grace-ms", v.to_string()),
+        (None, true) => push("--widowed-grace-ms", DEFAULT_WIDOWED_GRACE_MS.to_string()),
+        (None, false) => {}
     }
     if let Some(v) = inv.max_conns {
         push("--max-conns", v.to_string());
@@ -1594,7 +1711,7 @@ fn start_pair_nodes(inv: &Inventory, pair: &[String]) {
             args.extend(["--replica-of".into(), pair[0].clone()]);
         }
         args.extend(internal_args(inv));
-        args.extend(node_tuning_args(inv));
+        args.extend(node_tuning_args(inv, pair.len() > 1));
         spawn(
             inv,
             &runner_for(inv, addr),
@@ -2476,7 +2593,8 @@ fn add_replica(inv: &Inventory, inventory_path: &str, pair_ref: &str, new: &str)
         master.clone(),
     ];
     args.extend(internal_args(inv));
-    args.extend(node_tuning_args(inv));
+    // Spawned with --replica-of: a pair member by construction.
+    args.extend(node_tuning_args(inv, true));
     spawn(
         inv,
         &runner_for(inv, new),
@@ -2515,6 +2633,10 @@ fn add_replica(inv: &Inventory, inventory_path: &str, pair_ref: &str, new: &str)
         &format!("pair {}", members.join(",")),
     );
     std::fs::write(inventory_path, updated).expect("inventory update");
+    // The mirror of decommission's call: a pair that just grew back past one
+    // member has a peer again, so the existing node — which may have been
+    // spawned alone, with the grace off — must start honouring it.
+    reconcile_widowed_grace(inv, &members, &tls);
     if inv.controller {
         let t0 = now_ms();
         let mut inv2 = inv.clone();
@@ -2563,7 +2685,8 @@ fn swap_node(inv: &Inventory, inventory_path: &str, bad: &str, new: &str) {
         master.clone(),
     ];
     args.extend(internal_args(inv));
-    args.extend(node_tuning_args(inv));
+    // Spawned with --replica-of: a pair member by construction.
+    args.extend(node_tuning_args(inv, true));
     spawn(
         inv,
         &runner_for(inv, new),
@@ -2719,7 +2842,8 @@ fn roll_node(
         master.to_string(),
     ];
     args.extend(internal_args(inv));
-    args.extend(node_tuning_args(inv));
+    // Spawned with --replica-of: a pair member by construction.
+    args.extend(node_tuning_args(inv, true));
     spawn_env(
         inv,
         &runner_for(inv, addr),
@@ -3025,6 +3149,9 @@ fn decommission_node(
         &format!("pair {}", remaining.join(",")),
     );
     std::fs::write(inventory_path, updated).expect("inventory update");
+    // The pair just got smaller. If it is down to one node, that node is no
+    // longer waiting on a peer and must stop behaving as though it were.
+    reconcile_widowed_grace(inv, &remaining, &tls);
     if inv.controller {
         let t0 = now_ms();
         let mut inv2 = inv.clone();

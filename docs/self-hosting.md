@@ -136,6 +136,12 @@ wal-fsync-ms 500      node  HOT   WAL fsync cadence (host-loss RPO bound)
 lag-soft-ms 500       node  HOT   soft replication lag cap (delays writes)
 lag-hard-ms 1000      node  HOT   hard lag cap (sheds; bounds at-risk VOLUME)
 min-replicas 1        node  HOT   min-replicas-to-write safety gate (default 0)
+widowed-grace-ms N    node  HOT   max time accepting writes with NO live
+                                  replica (flintctl default 10000 on pair
+                                  members, off for a peerless node; 0 off).
+                                  The lag cap cannot fire without a replica
+                                  to measure, so this is the only bound on
+                                  that window.
 max-conns 10000       node+proxy HOT  connection admission cap
 cache-ttl-ms 300      proxy HOT   near-cache TTL default (PROXYCACHE)
 cache-max-bytes N     proxy HOT   near-cache byte budget

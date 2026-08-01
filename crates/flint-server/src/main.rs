@@ -609,6 +609,15 @@ fn main() -> std::io::Result<()> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
     let hub = Arc::new(ReplHub::new(lag_soft, lag_hard, min_replicas));
+    // --widowed-grace-ms: how long this node may keep accepting writes with
+    // NO live replica before it sheds. The lag cap cannot bound that window
+    // (no replica, nothing to measure), and min-replicas-to-write bounds it
+    // at zero, which also freezes every freshly promoted master until its
+    // replacement syncs. 0 = off, which is right for a standalone node;
+    // flintctl turns it on for pair members. See ReplHub::widowed_beyond_grace.
+    if let Some(v) = arg("--widowed-grace-ms").and_then(|v| v.parse().ok()) {
+        hub.set_widowed_grace_ms(v);
+    }
 
     // Size policies. --max-value-bytes (Valkey's proto-max-bulk-len
     // analog, extended to collections): writes that would grow any single
@@ -1180,13 +1189,14 @@ fn execute(
             b"lag-soft-ms" => hub.set_lag_soft_ms(parse!()),
             b"lag-hard-ms" => hub.set_lag_hard_ms(parse!()),
             b"min-replicas-to-write" => hub.set_min_replicas_to_write(parse!()),
+            b"widowed-grace-ms" => hub.set_widowed_grace_ms(parse!()),
             b"max-conns" => MAX_CONNS.store(std::cmp::max(1, parse!()), Ordering::Relaxed),
             b"migrate-rate-bytes" => MIGRATE_RATE_BYTES.store(parse!(), Ordering::Relaxed),
             other => {
                 return Value::Error(format!(
                     "ERR unknown or restart-only config key {:?} (hot: wal-fsync-ms, \
-                     lag-soft-ms, lag-hard-ms, min-replicas-to-write, max-conns, \
-                     migrate-rate-bytes)",
+                     lag-soft-ms, lag-hard-ms, min-replicas-to-write, widowed-grace-ms, \
+                     max-conns, migrate-rate-bytes)",
                     String::from_utf8_lossy(other)
                 ));
             }
@@ -1405,6 +1415,16 @@ fn execute(
         if hub.below_write_quorum(now) {
             return Value::Error(
                 "THROTTLED live replicas below min-replicas-to-write, retry with backoff".into(),
+            );
+        }
+        // The widowed grace: the only gate that bounds how OLD the at-risk
+        // tail may get. Checked after the quorum gate (which is stricter and
+        // shares the cause) and before the lag cap, which cannot fire at all
+        // in this state because there is no replica to measure lag against.
+        if hub.widowed_beyond_grace(now) {
+            return Value::Error(
+                "THROTTLED no live replica for longer than --widowed-grace-ms, retry with backoff"
+                    .into(),
             );
         }
         match hub.lag_ms(now) {
@@ -1658,7 +1678,7 @@ fn flintinfo(
     };
     let (disk_free, disk_total, disk_unknown) = DISK.snapshot();
     let info = format!(
-        "role:{}\r\nrole_epoch:{role_epoch}\r\nbuild:{build}\r\nsst_bytes:{sst}\r\nlatest_seq:{latest}\r\nlast_applied:{last_applied}\r\nacked_seq:{}\r\nseq_lag:{seq_lag}\r\nlive_replicas:{}\r\nlag_ms:{}\r\nlag_soft_ms:{soft}\r\nlag_hard_ms:{hard}\r\nmin_replicas_to_write:{minr}\r\nfullsync_active:{fsa}\r\nfullsync_max:{fsm}\r\nasync_write_queue:{aqd}\r\nwal_fsync_ms:{wfm}\r\nwal_fsync_total:{wft}\r\ncert_days_remaining:{cdr}\r\nactive_conns:{ac}\r\nmax_conns:{mc}\r\nconns_shed_total:{cs}\r\nwrite_stopped:{wst}\r\ndelayed_write_rate:{dwr}\r\ndisk_free_bytes:{dfb}\r\ndisk_total_bytes:{dtb}\r\ndisk_free_pct:{dfp}\r\ndisk_verdict:{dv}\r\ndisk_unknown_samples:{dus}\r\n",
+        "role:{}\r\nrole_epoch:{role_epoch}\r\nbuild:{build}\r\nsst_bytes:{sst}\r\nlatest_seq:{latest}\r\nlast_applied:{last_applied}\r\nacked_seq:{}\r\nseq_lag:{seq_lag}\r\nlive_replicas:{}\r\nlag_ms:{}\r\nlag_soft_ms:{soft}\r\nlag_hard_ms:{hard}\r\nmin_replicas_to_write:{minr}\r\nwidowed_grace_ms:{wgm}\r\nwidowed_shed:{wsh}\r\nfullsync_active:{fsa}\r\nfullsync_max:{fsm}\r\nasync_write_queue:{aqd}\r\nwal_fsync_ms:{wfm}\r\nwal_fsync_total:{wft}\r\ncert_days_remaining:{cdr}\r\nactive_conns:{ac}\r\nmax_conns:{mc}\r\nconns_shed_total:{cs}\r\nwrite_stopped:{wst}\r\ndelayed_write_rate:{dwr}\r\ndisk_free_bytes:{dfb}\r\ndisk_total_bytes:{dtb}\r\ndisk_free_pct:{dfp}\r\ndisk_verdict:{dv}\r\ndisk_unknown_samples:{dus}\r\n",
         if read_only { "replica" } else { "master" },
         hub.effective_acked(now)
             .map_or_else(|| "none".into(), |a| a.to_string()),
@@ -1668,6 +1688,12 @@ fn flintinfo(
         soft = hub.lag_soft_ms(),
         hard = hub.lag_hard_ms(),
         minr = hub.min_replicas_to_write(),
+        wgm = hub.widowed_grace_ms(),
+        // Whether the grace is CURRENTLY shedding, not just configured.
+        // A knob that is set and a knob that is biting are different
+        // facts, and only the second explains a -THROTTLED to an
+        // operator reading this during an incident.
+        wsh = hub.widowed_beyond_grace(now) as u8,
         build = build_version(),
         sst = rocks.as_ref().map(|kv| kv.sst_bytes()).unwrap_or(0),
         fsa = FULLSYNC_ACTIVE.load(Ordering::Relaxed),

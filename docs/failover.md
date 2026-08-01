@@ -55,23 +55,49 @@ otherwise accept unbounded at-risk writes. `min-replicas-to-write`
 while fewer than N replicas are live. Together with the lease this closes
 the widowed-master hole.
 
-**It is off unless you turn it on, and turning it on costs write
-availability on every failover.** The default is 0 and nothing in the
-shipping path sets it, so out of the box a master whose replica has been
-gone longer than the 2 s liveness window accepts writes with no replica
-and no throttling at all — measured at 539 writes in ~4 s on an
-unmanaged pair. A controller-managed fleet is covered by the lease
-instead (`--lease-ttl-ms`, default 3000), which is a 3 s bound rather
-than the cap's 1 s.
+**It stays off by default, and the reason is worth knowing.** Setting it
+to 1 does close the hole, but a **freshly promoted master has no replica
+either**, and the gate cannot tell "the peer died" from "I was just
+promoted": it would shed every write until a replacement attaches *and*
+acks, which on a large dataset means the whole full-sync. That trades
+failover RTO for durability on every single failover — the same reason
+Redis ships `min-replicas-to-write 0`. Set it to 1 only when a write
+outage is genuinely preferable to losing acked writes.
 
-Setting it to 1 closes that, but a **freshly promoted master has no
-replica either**, and the gate cannot tell "the peer died" from "I was
-just promoted": it sheds every write until a replacement replica attaches
-*and* acks, which on a large dataset means the whole full-sync. That is a
-straight trade of failover RTO for durability, which is why the default
-is 0 — the same reason Redis ships `min-replicas-to-write 0`. Set it to 1
-when losing acked writes is worse than a write outage, and size
-`--lease-ttl-ms` and your replacement-attach time accordingly.
+The gate that IS on by default for pair members is the widowed grace,
+below, which buys the same bound without that trade.
+
+### The widowed grace (the bound on how long you can be alone)
+
+`--widowed-grace-ms` is how long a node may keep accepting writes while
+**no replica has acked at all**. Past it, writes are shed with
+`-THROTTLED`; the moment a replica acks again the gate lifts on its own,
+with no restart.
+
+This is the gate that makes the loss bound real in the one state where
+every other mechanism is blind. With no live replica `lag_ms` is `None`,
+so the lag cap cannot fire — it has nothing to measure — and the write
+path falls through to no backpressure at all. Before this existed, a
+default pair whose replica was frozen shed 88 writes while the replica
+was still inside the 2 s liveness window and then accepted **539 more in
+~4 s** with zero replicas, unbounded and climbing. Every shipped cluster
+was in that state.
+
+- **flintctl sets it to 10 000 ms on pair members**, matching the
+  published RPO envelope, and leaves it off for a seat with no peer — a
+  standalone node must not be punished for redundancy it was never
+  configured to have. Set `widowed-grace-ms` in the inventory to choose
+  another value; `0` restores the old unbounded behaviour.
+- It has to be decided by flintctl rather than the server, because from
+  inside the process a lone node and a pair member that just lost its
+  peer look identical. Only the inventory knows which one you have.
+- `FLINTINFO` reports `widowed_grace_ms` and `widowed_shed`, so during
+  an incident "the knob is set" and "the knob is biting" are separate,
+  checkable facts.
+
+Size it comfortably above a promotion plus the replacement replica's
+first ack, and below the loss you are willing to publish.
+`tools/widowed_grace_drill.sh` holds all four properties in the gate.
 
 ### The lag cap (the RPO bound)
 
@@ -218,7 +244,7 @@ kill to writable again at the defaults.
 | Master process crashes (replica live) | controller confirms, promotes the converged replica, attaches a fresh replica | brief retry (proxy chases) | ≤ one lag-hard window of writes |
 | Master + replica both crash | controller REFUSES (not converged), pages; spare-restore from durable snapshot | writes unavailable until restore | up to last snapshot (rare) |
 | Network partition strands the master | master self-fences read-only on lease expiry; controller promotes the reachable survivor | brief retry; reads may `-TRYAGAIN` then fall back | ≤ one lag-hard window of writes |
-| Replica dies, master keeps serving | controller attaches a fresh replica; master is widowed until it syncs | none | **unbounded** at the default `min-replicas-to-write 0` (no replica ⇒ no lag ⇒ no cap); bounded by `--lease-ttl-ms` in a managed fleet, or by setting the gate to 1 and accepting the write freeze |
+| Replica dies, master keeps serving | controller attaches a fresh replica; master is widowed until it syncs | none, then `-THROTTLED` if it is still alone when the grace expires | ≤ `--widowed-grace-ms` worth (10 s on a pair by default) — the lag cap is blind here, so this gate is the whole bound |
 | Old master returns after promotion | fenced by stale epoch; demoted; rejoins as fresh replica | none | none |
 | Controller itself dies | data plane keeps serving; leases still expire so no zombie master; any HA-set survivor resumes supervision | none (a *new* failure during the gap waits for a controller) | none |
 | Planned handoff (maintenance/upgrade) | `flintctl failover`: demote → drain → promote | brief retry | **zero** (drained) |

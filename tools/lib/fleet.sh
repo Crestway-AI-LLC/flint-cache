@@ -182,6 +182,53 @@ fleet_guard() {
 # tenant_quota fail, because the sweep had killed seats the drill still
 # needed. Opening and cleanup sweeps take no argument; mid-run kills name
 # what they mean.
+# fleet_signal <signal> <component ...> — send a NON-fatal signal to our own
+# seats, with the same ownership check fleet_kill applies.
+#
+# Exists so a drill can SIGSTOP a node to simulate a stalled or unreachable
+# peer without reaching for `pkill -STOP -f flint-server`, which matches every
+# Flint process on the box — the exact unscoped pattern this file was written
+# to remove. A stray -STOP is quieter than a stray -9 and therefore worse: the
+# process is still there, still listening, and simply never answers, which
+# reads as a replication bug in whatever else is running.
+#
+# Returns nonzero when it signalled nothing, so a caller can tell "frozen" from
+# "I matched no process and carried on testing the wrong thing".
+fleet_signal() {
+  local sig="$1"; shift
+  local want="$*"
+  local pid args hit=1
+  for pid in $(_fleet_ours "$want"); do
+    args="$(ps -o args= -p "$pid" 2>/dev/null)"
+    case "$args" in
+      *flint-*) ;;
+      *) continue ;;
+    esac
+    kill "$sig" "$pid" 2>/dev/null && hit=0
+  done
+  return $hit
+}
+
+# fleet_signal_port <port> <signal> — the same, narrowed to one seat.
+#
+# _fleet_ours already treats a declared port as ownership, so this is the
+# component filter plus a literal `--port N` match. Kept separate because
+# freezing ONE member of a pair is the whole point: freezing both proves
+# nothing about a widowed master.
+fleet_signal_port() {
+  local port="$1" sig="$2"
+  local pid args hit=1
+  for pid in $(_fleet_ours server); do
+    args="$(ps -o args= -p "$pid" 2>/dev/null)"
+    case "$args" in
+      *"--port $port"*) ;;
+      *) continue ;;
+    esac
+    kill "$sig" "$pid" 2>/dev/null && hit=0
+  done
+  return $hit
+}
+
 fleet_kill() {
   local want="$*"
   local pid args
