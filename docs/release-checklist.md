@@ -54,6 +54,7 @@ disagrees with the oracle, the case is wrong.
     tools/reseed_drill.sh             # a replica outside the WAL re-seeds, warm restart does not
     tools/lag_cap_drill.sh            # the lag cap is OBSERVED to shed, not just configured
     tools/widowed_grace_drill.sh      # a master with NO replica stops accepting, eventually
+    tools/controller_drill.sh         # hands-free failover; RTO asserted against the budget
     tools/attached_chaos_drill.sh     # chaos through the OPERATOR path, fleet's own controller
 
 ## 3b. Integrity — the cluster agrees with itself

@@ -234,8 +234,17 @@ CAP is what bounds how much is at risk; it does **not** bound how old the
 oldest at-risk write is, which grows with the length of the replication
 stall (see "the lag cap" above for the measurements). A replica kill
 loses nothing (the master is untouched). **RTO.** Detection + verify +
-promote + proxy rediscovery; drill-measured **~0.6–1.2 s** from master
-kill to writable again at the defaults.
+promote + proxy rediscovery. Measured kill→writable at the defaults:
+**~0.4–0.5 s on loopback** (`flint-chaos --driver controller`, p50
+404 ms over 14 promotions with a writer hammering through the kill;
+`controller_drill.sh` reads 514 ms p50 idle, the difference being a
+fresh client process per probe) and **757 ms on a 7-host cluster over a
+real network**, which is the figure to quote because it is the only one
+paying network RTT.
+
+Through the proxy edge a client sees **no outage at all** — the proxy
+chases the promotion underneath, so the workload records a slower write
+rather than an error. The numbers above are the direct-to-master path.
 
 ## Failure scenarios
 
