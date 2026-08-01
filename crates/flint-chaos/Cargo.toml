@@ -13,6 +13,11 @@ flint-slot = { path = "../flint-slot" }
 # Attached mode talks to a REAL fleet, whose node ports speak internal mTLS.
 flint-tls = { path = "../flint-tls" }
 rand = { version = "0.9", features = ["small_rng"] }
+# kill(pid, 0) for the stale-directory sweep: proves a leftover run's process
+# is really gone before deleting its data. Already in the tree via
+# flint-storage, and cheaper than forking `kill -0` once per candidate when
+# the backlog runs to thousands of directories.
+libc = "0.2"
 
 [lints]
 workspace = true

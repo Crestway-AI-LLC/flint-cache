@@ -524,6 +524,7 @@ dependencies = [
  "flint-resp",
  "flint-slot",
  "flint-tls",
+ "libc",
  "rand 0.9.5",
 ]
 

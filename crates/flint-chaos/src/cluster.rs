@@ -562,7 +562,158 @@ impl Drop for Fleet {
             let _ = c.kill();
             let _ = c.wait();
         }
+        // ...and take the data with them. Killing the processes but leaving
+        // their RocksDB directories behind is what let 9,795 of them and 13 GB
+        // accumulate under $TMPDIR on one laptop: enough to cross
+        // flint-server's own disk headroom guard, at which point every node in
+        // every drill answered `-QUOTA server is low on disk space` and three
+        // unrelated drills went red at once. repl_drill reported
+        // `errors: 50500, replies: 50500`, which reads exactly like a
+        // catastrophic replication regression and is nothing of the sort.
+        //
+        // A harness that fails for a reason it invented, and reports it as a
+        // product failure, costs more than the disk does.
+        //
+        // Runs on the panic path too — the oracle asserts, and an assert
+        // unwinds — which matters because a FAILING run is the one that
+        // leaked before. FLINT_CHAOS_KEEP=1 preserves the state for a
+        // post-mortem, which is the only reason to want it.
+        if std::env::var("FLINT_CHAOS_KEEP").is_ok_and(|v| v != "0") {
+            eprintln!(
+                "  (FLINT_CHAOS_KEEP: leaving {}* in {})",
+                our_prefix(),
+                std::env::temp_dir().display()
+            );
+            return;
+        }
+        // On the way out of a FAILING run, keep the node logs and drop only
+        // the data. Those two differ in both size and worth: a pair's RocksDB
+        // directories are hundreds of megabytes and reconstructible from the
+        // seed, while the logs are a few kilobytes and are the only record of
+        // what the server thought it was doing when the oracle fired. Keeping
+        // the small useful thing and discarding the large reproducible one is
+        // the whole trade.
+        //
+        // `thread::panicking()` is what makes the distinction possible at all
+        // — it is true here precisely when an assert is unwinding through us,
+        // which is exactly the run whose evidence is worth saving.
+        let failing = std::thread::panicking();
+        remove_run_files(&our_prefix(), !failing);
+        if failing {
+            eprintln!(
+                "  node logs kept for the post-mortem: {}/{}*.log",
+                std::env::temp_dir().display(),
+                our_prefix()
+            );
+        }
     }
+}
+
+/// The name prefix every node of THIS process owns — both its data directory
+/// and the `<dir>.log` beside it.
+fn our_prefix() -> String {
+    format!("flint-chaos-{}-", std::process::id())
+}
+
+/// Remove this run's files. `logs_too` is false when a panic is unwinding.
+///
+/// Handles directories AND plain files deliberately. The first cut of this
+/// called only `remove_dir_all`, which silently does nothing to a regular
+/// file, so the data directories vanished while 4,742 `.log` files stayed —
+/// a cleanup that reported success and left most of the mess. Same failure
+/// shape as every other half-check this harness has grown out of.
+fn remove_run_files(prefix: &str, logs_too: bool) {
+    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        if !name.starts_with(prefix) {
+            continue;
+        }
+        if name.ends_with(".log") {
+            if logs_too {
+                let _ = std::fs::remove_file(e.path());
+            }
+        } else {
+            let _ = std::fs::remove_dir_all(e.path());
+        }
+    }
+}
+
+/// Sweep directories left by chaos runs whose process is gone.
+///
+/// Drop covers this run; it cannot cover the ones already on the box, and it
+/// cannot cover a run killed with SIGKILL or ended by `process::exit`, which
+/// skip destructors entirely. So each run also clears the corpses of dead
+/// ones. Ownership is proven by the pid embedded in the name: `kill(pid, 0)`
+/// failing with ESRCH means no such process, so nothing can still be using
+/// that directory. A live pid is left strictly alone — two concurrent chaos
+/// runs must not delete each other's data, which is the same scoping rule
+/// tools/lib/fleet.sh applies to processes.
+pub fn sweep_stale_dirs() {
+    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+        return;
+    };
+    let me = std::process::id();
+    let (mut swept, mut bytes) = (0u32, 0u64);
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        let Some(rest) = name.strip_prefix("flint-chaos-") else {
+            continue;
+        };
+        let Some(pid) = rest.split('-').next().and_then(|p| p.parse::<u32>().ok()) else {
+            continue;
+        };
+        if pid == me || pid_is_alive(pid) {
+            continue;
+        }
+        let path = e.path();
+        let removed = if path.is_dir() {
+            bytes += dir_bytes(&path);
+            std::fs::remove_dir_all(&path).is_ok()
+        } else {
+            bytes += path.metadata().map(|m| m.len()).unwrap_or(0);
+            std::fs::remove_file(&path).is_ok()
+        };
+        if removed {
+            swept += 1;
+        }
+    }
+    if swept > 0 {
+        eprintln!(
+            "  swept {swept} stale chaos dir(s), {} MB reclaimed",
+            bytes / 1_048_576
+        );
+    }
+}
+
+fn pid_is_alive(pid: u32) -> bool {
+    // Reject 0 BEFORE asking the kernel. `kill(0, sig)` does not address
+    // process 0 — it addresses the caller's whole process group — so it
+    // returns success and would report a directory named `flint-chaos-0-*`
+    // as owned by something alive, forever, un-sweepable. No real process is
+    // pid 0, so any such directory is garbage by definition.
+    if pid == 0 {
+        return false;
+    }
+    // Signal 0 performs the permission and existence checks without sending
+    // anything. Cheaper and far more precise than parsing `ps`.
+    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+}
+
+fn dir_bytes(p: &std::path::Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(p) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .map(|e| match e.metadata() {
+            Ok(m) if m.is_dir() => dir_bytes(&e.path()),
+            Ok(m) => m.len(),
+            Err(_) => 0,
+        })
+        .sum()
 }
 
 fn spawn_node(port: u16, dir: &str, replica_of: Option<u16>) -> Child {
@@ -1011,6 +1162,105 @@ impl Cluster {
         assert!(
             wait_for_pong(self.replica_port, Duration::from_secs(15)),
             "replacement replica up"
+        );
+    }
+}
+
+#[cfg(test)]
+mod sweep_tests {
+    use super::*;
+
+    /// The sweep must never touch a LIVE run's directory.
+    ///
+    /// Two chaos runs on one box is normal — the gate runs `chaos` and
+    /// `proxy_chaos` back to back, and a developer may have one going. A sweep
+    /// that deleted by name alone would pull the RocksDB directory out from
+    /// under a running node, and the victim would report corruption: a data
+    /// bug that never happened, in the one harness whose entire job is to
+    /// tell real corruption from noise. Ownership is decided by whether the
+    /// pid in the name is still alive, exactly as fleet.sh scopes processes.
+    #[test]
+    fn sweep_spares_a_living_runs_directory() {
+        let tmp = std::env::temp_dir();
+        // Our own pid: alive by construction, and the sweep skips it twice
+        // over (pid == me, and pid_is_alive).
+        let mine = tmp.join(format!("flint-chaos-{}-sweeptest", std::process::id()));
+        // A pid that cannot be running: pid 0 is never a normal process, and
+        // kill(0, 0) addresses the process GROUP rather than a process, so
+        // the sweep must decide this one on the ESRCH path, not by accident.
+        let dead = tmp.join("flint-chaos-4294967294-sweeptest");
+        std::fs::create_dir_all(&mine).expect("make live-run dir");
+        std::fs::create_dir_all(&dead).expect("make dead-run dir");
+        std::fs::write(mine.join("CURRENT"), b"live").expect("seed live-run data");
+
+        sweep_stale_dirs();
+
+        assert!(mine.exists(), "sweep deleted a LIVE run's data directory");
+        assert!(!dead.exists(), "sweep left a dead run's directory behind");
+        let _ = std::fs::remove_dir_all(&mine);
+    }
+
+    /// A FAILING run keeps its logs and drops its data.
+    ///
+    /// This is the asymmetry the cleanup exists for. The run that fails is
+    /// the one whose evidence matters, and it is also the one that used to
+    /// leak, because the oracle asserts and an assert skipped the tidy-up
+    /// path entirely. Data directories are hundreds of megabytes and fully
+    /// reproducible from the printed seed; logs are kilobytes and are the
+    /// only record of what the server believed at the moment it broke.
+    #[test]
+    fn a_failing_run_keeps_logs_and_drops_data() {
+        let tmp = std::env::temp_dir();
+        let prefix = format!("flint-chaos-panictest{}-", std::process::id());
+        let data = tmp.join(format!("{prefix}0"));
+        let log = tmp.join(format!("{prefix}0.log"));
+        std::fs::create_dir_all(&data).expect("make data dir");
+        std::fs::write(data.join("CURRENT"), b"sst").expect("seed data dir");
+        std::fs::write(&log, b"what the server thought").expect("seed node log");
+
+        // logs_too=false is exactly what Drop passes while panicking.
+        remove_run_files(&prefix, false);
+        assert!(!data.exists(), "a failing run must still drop its data");
+        assert!(log.exists(), "a failing run must KEEP its node logs");
+
+        // And the passing path takes both.
+        remove_run_files(&prefix, true);
+        assert!(!log.exists(), "a passing run must remove its logs too");
+    }
+
+    /// The first cut called only `remove_dir_all`, which returns an error on
+    /// a regular file and was ignored — so 4,742 `.log` files survived a
+    /// cleanup that reported success. Pin the file half specifically.
+    #[test]
+    fn cleanup_removes_log_files_not_only_directories() {
+        let tmp = std::env::temp_dir();
+        let prefix = format!("flint-chaos-filetest{}-", std::process::id());
+        let log = tmp.join(format!("{prefix}7.log"));
+        std::fs::write(&log, b"x").expect("seed log file");
+        remove_run_files(&prefix, true);
+        assert!(
+            !log.exists(),
+            "cleanup skipped a plain file — remove_dir_all does nothing to one"
+        );
+    }
+
+    #[test]
+    fn pid_zero_is_not_reported_as_a_live_process() {
+        // kill(0, 0) returns success — it signals the caller's process GROUP,
+        // not a process numbered 0 — so a check that just forwards to the
+        // kernel would call pid 0 alive forever and leak any directory named
+        // after it. The guard is an explicit early return, and this is what
+        // holds it in place.
+        assert!(
+            !pid_is_alive(0),
+            "pid 0 reported alive: kill(0,0) signals the process GROUP and \
+             always succeeds, so a directory named for it would never be swept"
+        );
+        // The live case still has to work, or the guard above could be
+        // "return false" and this file would still be green.
+        assert!(
+            pid_is_alive(std::process::id()),
+            "our own pid must read as alive"
         );
     }
 }

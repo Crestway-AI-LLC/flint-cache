@@ -14,7 +14,7 @@
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use flint_chaos::cluster::{Attached, Cluster, Target, arg};
+use flint_chaos::cluster::{Attached, Cluster, Target, arg, sweep_stale_dirs};
 
 /// Wall clock in ms. The RPO bound is a statement about TIME — "acked longer
 /// ago than the cap must have replicated" — so the ledger needs a real clock,
@@ -81,6 +81,11 @@ fn main() {
     // for). Needs a tenant credential because a CP-fed proxy is gated.
     let edge_addr: String = arg("--edge", String::new());
     let edge_auth: String = arg("--auth", String::new());
+    // Clear the corpses of runs whose process is gone before allocating any
+    // of our own. Drop handles this run; only a sweep can handle the ones
+    // that were SIGKILLed or ended via process::exit, and only a sweep drains
+    // a backlog that already exists on the box.
+    sweep_stale_dirs();
     println!(
         "chaos-kv: {iterations} kills, {key_count} keys, mode={mode}, driver={}, min_replicas={min_replicas}, seed={seed} (replay with --seed {seed})",
         if !inventory.is_empty() {
