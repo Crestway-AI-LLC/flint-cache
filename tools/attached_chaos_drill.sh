@@ -43,6 +43,11 @@ cargo build --release -q -p flint-server -p flint-proxy -p flint-controlplane \
   -p flint-controller -p flint-ctl -p flint-chaos --features flint-server/rocks \
   || { echo "FAIL: build"; exit 1; }
 
+# The controller timing knobs are overridable so the detection latency can be
+# SWEPT without editing this file. They dominate the client-visible stall:
+# detection is poll-ms x confirm (450ms at the defaults below) against a
+# measured p50 stall of 646ms, i.e. ~70% of it. The gate keeps the defaults;
+# tools/detection_sweep.sh drives the alternatives.
 cat > "$INV" <<EOF
 disposable on
 statedir $D/state
@@ -53,9 +58,9 @@ pair 127.0.0.1:7361,127.0.0.1:7362
 pair 127.0.0.1:7363,127.0.0.1:7364
 proxy 127.0.0.1:7692
 controller on
-poll-ms 150
-confirm 3
-lease-ttl-ms 3000
+poll-ms ${FLINT_POLL_MS:-150}
+confirm ${FLINT_CONFIRM:-3}
+lease-ttl-ms ${FLINT_LEASE_TTL_MS:-3000}
 EOF
 
 echo "== bootstrap a real fleet (TLS, control plane, controller supervising)"
