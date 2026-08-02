@@ -44,6 +44,24 @@ $CTL -f "$D/cluster.flint" tenant add acme tok-acme acme 1 >/dev/null 2>&1
 C="$D/state/certs"
 sleep 1
 
+# A valkey-cli WITHOUT TLS fails this drill in a way that reads as a product
+# bug. This is the only drill that runs a fleet with `client-tls on`, so it is
+# the only one that dials with `valkey-cli --tls`; a cli built without
+# BUILD_TLS=yes has no such flag, the dial returns nothing, and the assertion
+# below announces "fresh mesh dial with new leaf refused" — i.e. it blames
+# cert hot-reload. The first CI run did exactly that while the product was
+# fine: every serial had already rotated with zero restarts.
+#
+# Checked here, up front, so the message names the real cause. Deliberately a
+# hard failure and not a SKIP: this drill covers a shipped feature, and
+# "quietly not run" is the outcome the whole gate exists to prevent.
+valkey-cli --help 2>&1 | grep -q -- '--tls' || {
+  echo "FAIL: valkey-cli has no --tls (built without BUILD_TLS=yes)."
+  echo "      This drill needs a TLS-capable valkey-cli; it is not a"
+  echo "      statement about cert reload. Rebuild valkey with BUILD_TLS=yes."
+  exit 1
+}
+
 # The serial a live listener PRESENTS (not the file): s_client with the
 # current mesh identity for mutual-TLS ports, plain verify for the edge.
 mesh_serial() { # <port>

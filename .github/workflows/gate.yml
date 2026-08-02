@@ -58,7 +58,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: /usr/local/bin/valkey-*
-          key: valkey-9.1.0-${{ runner.os }}
+          # BUILD_TLS is part of the identity of this binary, not a detail:
+          # a cached non-TLS valkey-cli is useless to the cert drills.
+          key: valkey-9.1.0-tls-${{ runner.os }}
 
       - name: Build valkey 9.1.0
         if: steps.valkey-cache.outputs.cache-hit != 'true'
@@ -71,19 +73,40 @@ jobs:
         # validated against locally. A floating oracle turns a Valkey release
         # into a mysterious Flint conformance failure — the oracle has to be
         # a fixed reference or it is not an oracle.
+        #
+        # BUILD_TLS=yes is REQUIRED, not optional. Valkey's default make
+        # produces a valkey-cli with no --tls flag at all, and
+        # cert_reload_fleet_drill.sh — the one drill that runs a fleet with
+        # `client-tls on` — dials the mesh and the edge with it. Without TLS
+        # the dial fails and the drill reports "fresh mesh dial with new leaf
+        # refused", which reads as a product bug in cert hot-reload. That is
+        # exactly what the first CI run reported, and the product was fine:
+        # the rotation had already advanced every serial with zero restarts.
         run: |
           set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libssl-dev
           git clone --depth 1 --branch 9.1.0 https://github.com/valkey-io/valkey.git /tmp/valkey
-          make -C /tmp/valkey -j"$(nproc)"
+          make -C /tmp/valkey BUILD_TLS=yes -j"$(nproc)"
           sudo install -m 0755 /tmp/valkey/src/valkey-server /usr/local/bin/
           sudo install -m 0755 /tmp/valkey/src/valkey-cli    /usr/local/bin/
 
-      - name: Verify the oracle runs
-        # A cache that restored a truncated or wrong-arch binary would
-        # otherwise surface as "conformance failed", i.e. as a Flint bug.
+      - name: Verify the oracle runs AND speaks TLS
+        # "It runs" is not "it can do what the drills need". The first version
+        # of this step checked --version only, which a TLS-less build passes
+        # happily; the missing capability then surfaced two steps later as a
+        # failing cert drill. Assert the capability, at the point where the
+        # message can still name the cause.
         run: |
+          set -euo pipefail
           valkey-server --version
           valkey-cli --version
+          valkey-cli --help 2>&1 | grep -q -- '--tls' || {
+            echo "valkey-cli has no --tls: built without BUILD_TLS=yes."
+            echo "cert_reload_fleet_drill.sh needs it and will report the"
+            echo "absence as a cert hot-reload failure. Clear the valkey cache."
+            exit 1
+          }
 
       - name: Client libraries for client_compat_drill
         # The drill installs these itself when missing, into exactly these
