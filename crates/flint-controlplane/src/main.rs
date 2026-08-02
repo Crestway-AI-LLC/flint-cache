@@ -863,6 +863,27 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
                 .into_bytes(),
             ))
         }
+        b"CPPROMOTED" => {
+            // The controller reporting a promotion it just completed. This
+            // does NOT set routing: it bumps a generation so the next
+            // snapshot wakes every watching proxy and names the pair worth
+            // re-probing. Authority stays with the epoch-fenced nodes, so a
+            // wrong or replayed hint costs one probe and cannot misroute.
+            let Some(addr) = text(1) else {
+                return err("CPPROMOTED <addr>");
+            };
+            let Ok(mut st) = shared.state.lock() else {
+                return err("state lock");
+            };
+            let next = st.promoted.as_ref().map_or(1, |(_, g)| g + 1);
+            st.promoted = Some((addr.clone(), next));
+            // Bump the version so watch() stops waiting. No commit(): the
+            // hint is deliberately not durable (tenant::promote_hint).
+            st.version += 1;
+            drop(st);
+            shared.changed.notify_all();
+            Value::Simple(format!("OK promoted {addr} gen {next}"))
+        }
         b"CPSNAPSHOT" => {
             let Some(proxy) = text(1) else {
                 return err("CPSNAPSHOT <proxy-addr>");
@@ -870,14 +891,21 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
             let Ok(st) = shared.state.lock() else {
                 return err("state lock");
             };
-            let (v, pairs, tenants, admin, exc) = st.snapshot_for(&proxy);
-            snapshot_frame(v, &pairs, &tenants, &admin, &exc)
+            let (v, pairs, tenants, admin, exc, promo) = st.snapshot_for(&proxy);
+            snapshot_frame(v, &pairs, &tenants, &admin, &exc, &promo)
         }
         _ => err("unknown control-plane command"),
     }
 }
 
-fn snapshot_frame(version: u64, pairs: &str, tenants: &str, admin: &str, exc: &str) -> Value {
+fn snapshot_frame(
+    version: u64,
+    pairs: &str,
+    tenants: &str,
+    admin: &str,
+    exc: &str,
+    promo: &str,
+) -> Value {
     Value::Array(Some(vec![
         Value::Bulk(Some(b"SNAPSHOT".to_vec())),
         Value::Integer(version as i64),
@@ -889,6 +917,11 @@ fn snapshot_frame(version: u64, pairs: &str, tenants: &str, admin: &str, exc: &s
         // Option B: slot-ownership exceptions ("ns:slot:pair;..."), the
         // 6th element; older proxies ignore it, older CPs omit it.
         Value::Bulk(Some(exc.as_bytes().to_vec())),
+        // 7th element: the promotion hint ("<addr>|<gen>", empty if none).
+        // Same compatibility contract as the 6th: older proxies ignore it,
+        // older CPs omit it, and a proxy that never sees one simply keeps
+        // its pre-existing reactive rediscovery.
+        Value::Bulk(Some(promo.as_bytes().to_vec())),
     ]))
 }
 
@@ -910,10 +943,15 @@ fn watch(
     // sharding most mutations touch a small subset of proxies, so most
     // pushes are no-ops. State is tiny, so suppress-identical beats
     // computing diffs.
-    let mut last_view: Option<(String, String, String, String)> = None;
+    // The promotion hint is part of the view ON PURPOSE. A promotion changes
+    // nothing else a proxy can see -- same pairs, same tenants -- so leaving
+    // it out would let delta suppression swallow exactly the push this
+    // feature exists to deliver, and the failure would look like "the hint
+    // never arrived" rather than "the hint was discarded here".
+    let mut last_view: Option<(String, String, String, String, String)> = None;
     loop {
         // Wait until there is something newer than the proxy has ACKed.
-        let (v, pairs, tenants, admin, exc) = {
+        let (v, pairs, tenants, admin, exc, promo) = {
             let Ok(mut st) = shared.state.lock() else {
                 return Ok(());
             };
@@ -927,16 +965,26 @@ fn watch(
             }
             st.snapshot_for(&proxy)
         };
-        if last_view.as_ref() == Some(&(pairs.clone(), tenants.clone(), admin.clone(), exc.clone()))
+        if last_view.as_ref()
+            == Some(&(
+                pairs.clone(),
+                tenants.clone(),
+                admin.clone(),
+                exc.clone(),
+                promo.clone(),
+            ))
         {
             eprintln!("watch {proxy}: suppressed push at version {v} (view unchanged)");
             acked = v;
             continue;
         }
         let mut out = Vec::new();
-        encode(&snapshot_frame(v, &pairs, &tenants, &admin, &exc), &mut out);
+        encode(
+            &snapshot_frame(v, &pairs, &tenants, &admin, &exc, &promo),
+            &mut out,
+        );
         stream.write_all(&out)?;
-        last_view = Some((pairs, tenants, admin, exc));
+        last_view = Some((pairs, tenants, admin, exc, promo));
         // Read the ACK (Array ["ACK", <version>]).
         loop {
             match decode(&buf) {

@@ -629,6 +629,34 @@ impl Pair {
                     Some(format!("(0,{next})")),
                     "epoch-fenced promotion of the freshest survivor",
                 );
+                // TELL THE PROXIES, instead of letting them find out.
+                //
+                // Until this, a promotion was a fact only the nodes and this
+                // log knew. Every proxy learned it reactively: a client's
+                // write had to fail (dead backend, or -READONLY from the
+                // demoted ex-master) before the proxy re-probed the pair,
+                // and that retry loop sleeps 50-100ms between attempts. So
+                // the promotion landed and the traffic kept missing it for
+                // most of another poll of nobody's clock.
+                //
+                // One CPPROMOTED bumps the CP's version, which wakes every
+                // proxy already parked in CPWATCH — the push channel that
+                // already exists, already mTLS, already tested. The hint
+                // carries no routing authority (tenant::promote_hint): the
+                // proxy still probes and believes the epoch-fenced node.
+                //
+                // BEST EFFORT ON PURPOSE. If the CP is unreachable the old
+                // reactive path is still there and still correct, just
+                // slower — a failover must not depend on the CP being up.
+                if let Some(cp) = &cfg.commit_cp {
+                    let r = call(cp, &[b"CPPROMOTED", survivor.addr.as_bytes()]);
+                    if !matches!(r, Ok(Value::Simple(_))) {
+                        eprintln!(
+                            "[{}][{}] CPPROMOTED {} failed ({r:?}) — proxies fall back to reactive rediscovery",
+                            cfg.id, self.label, survivor.addr
+                        );
+                    }
+                }
                 self.converged_ever = false; // new master has no replica yet
                 self.no_master_streak = 0;
             }

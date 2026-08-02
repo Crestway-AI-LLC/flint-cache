@@ -355,7 +355,14 @@ fn args_of(frame: Value) -> Option<Vec<Vec<u8>>> {
     Some(out)
 }
 
-fn snapshot_frame(v: u64, pairs: &str, tenants: &str, admin: &str, exc: &str) -> Value {
+fn snapshot_frame(
+    v: u64,
+    pairs: &str,
+    tenants: &str,
+    admin: &str,
+    exc: &str,
+    promo: &str,
+) -> Value {
     Value::Array(Some(vec![
         Value::Bulk(Some(b"SNAPSHOT".to_vec())),
         Value::Integer(v as i64),
@@ -363,6 +370,11 @@ fn snapshot_frame(v: u64, pairs: &str, tenants: &str, admin: &str, exc: &str) ->
         Value::Bulk(Some(tenants.as_bytes().to_vec())),
         Value::Bulk(Some(admin.as_bytes().to_vec())),
         Value::Bulk(Some(exc.as_bytes().to_vec())),
+        // 7th element: the promotion hint ("<addr>|<gen>", empty if none).
+        // Same compatibility contract as the 6th: older proxies ignore it,
+        // older CPs omit it, and a proxy that never sees one simply keeps
+        // its pre-existing reactive rediscovery.
+        Value::Bulk(Some(promo.as_bytes().to_vec())),
     ]))
 }
 
@@ -618,6 +630,18 @@ async fn handle_admin(ha: &Ha, args: &[Vec<u8>]) -> Value {
                 return Value::Error("ERR CPDROPPREV <name>".into());
             };
             match ha.propose(Mutation::DropPrev { name }).await {
+                Ok(_) => Value::Simple("OK".into()),
+                Err(l) => redirect(l),
+            }
+        }
+        b"CPPROMOTED" => {
+            // See the single-node CP: a wakeup hint, not routing authority.
+            // Proposed through Raft like every other registry mutation so
+            // followers serving CPWATCH render the same hint.
+            let Some(addr) = text(1) else {
+                return Value::Error("ERR CPPROMOTED <addr>".into());
+            };
+            match ha.propose(Mutation::Promoted { addr }).await {
                 Ok(_) => Value::Simple("OK".into()),
                 Err(l) => redirect(l),
             }
@@ -1035,8 +1059,8 @@ async fn handle_admin(ha: &Ha, args: &[Vec<u8>]) -> Value {
                 return Value::Error("ERR CPSNAPSHOT <proxy-addr>".into());
             };
             let reg = ha.store.registry().await;
-            let (v, pairs, tenants, admin, exc) = reg.snapshot_for(&proxy);
-            snapshot_frame(v, &pairs, &tenants, &admin, &exc)
+            let (v, pairs, tenants, admin, exc, promo) = reg.snapshot_for(&proxy);
+            snapshot_frame(v, &pairs, &tenants, &admin, &exc, &promo)
         }
         _ => Value::Error("ERR unknown control-plane command".into()),
     }
@@ -1054,21 +1078,38 @@ async fn watch_loop<S: AsyncRead + AsyncWrite + Unpin>(
     // acknowledged locally, not pushed (see the single-node watch()).
     // The tuple must cover EVERY pushed field — omitting one (as the
     // exception spec once was) makes changes to it silently suppressible.
-    let mut last_view: Option<(String, String, String, String)> = None;
+    // See the single-node watch(): the promotion hint is part of the view or
+    // suppression eats the one push that carries it.
+    let mut last_view: Option<(String, String, String, String, String)> = None;
     loop {
         let reg = ha.store.registry().await;
         if reg.version > acked {
-            let (v, pairs, tenants, admin, exc) = reg.snapshot_for(&proxy);
+            let (v, pairs, tenants, admin, exc, promo) = reg.snapshot_for(&proxy);
             if last_view.as_ref()
-                == Some(&(pairs.clone(), tenants.clone(), admin.clone(), exc.clone()))
+                == Some(&(
+                    pairs.clone(),
+                    tenants.clone(),
+                    admin.clone(),
+                    exc.clone(),
+                    promo.clone(),
+                ))
             {
                 eprintln!("watch {proxy}: suppressed push at version {v} (view unchanged)");
                 acked = v;
                 continue;
             }
-            last_view = Some((pairs.clone(), tenants.clone(), admin.clone(), exc.clone()));
+            last_view = Some((
+                pairs.clone(),
+                tenants.clone(),
+                admin.clone(),
+                exc.clone(),
+                promo.clone(),
+            ));
             let mut o = Vec::new();
-            encode(&snapshot_frame(v, &pairs, &tenants, &admin, &exc), &mut o);
+            encode(
+                &snapshot_frame(v, &pairs, &tenants, &admin, &exc, &promo),
+                &mut o,
+            );
             sock.write_all(&o).await?;
             // Read the ACK.
             loop {

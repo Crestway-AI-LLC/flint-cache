@@ -53,6 +53,9 @@ pub struct State {
     /// Previous admin token during a rotation window (both valid until the
     /// agent's drop-on-adoption retires it).
     pub admin_prev: Option<String>,
+    /// Last promotion reported by the controller: (addr, generation). NOT
+    /// persisted and NOT routing authority — see tenant::promote_hint.
+    pub promoted: Option<(String, u64)>,
     path: Option<PathBuf>,
 }
 
@@ -287,7 +290,7 @@ impl State {
     /// The snapshot a given proxy should see (shared renderer — the subset
     /// filter is the blast-radius/security boundary: a proxy never holds
     /// tokens it does not serve).
-    pub fn snapshot_for(&self, proxy: &str) -> (u64, String, String, String, String) {
+    pub fn snapshot_for(&self, proxy: &str) -> (u64, String, String, String, String, String) {
         let (pairs, tenants) =
             crate::tenant::snapshot_for(&self.pairs, &self.ranges, self.tenants.values(), proxy);
         (
@@ -296,6 +299,7 @@ impl State {
             tenants,
             self.admin_digests(),
             crate::tenant::exceptions_spec_for(&self.exceptions, self.tenants.values(), proxy),
+            crate::tenant::promote_hint(&self.promoted),
         )
     }
 
@@ -371,25 +375,25 @@ mod tests {
         // them at pair 1 is a real exception.
         s.set_exception("acme", 100, 1);
         s.set_exception("bravo", 200, 1);
-        let (_, _, _, _, exc1) = s.snapshot_for("p1");
-        let (_, _, _, _, exc2) = s.snapshot_for("p2");
+        let (_, _, _, _, exc1, _) = s.snapshot_for("p1");
+        let (_, _, _, _, exc2, _) = s.snapshot_for("p2");
         // Each proxy sees ONLY its served tenants' rows (R4 boundary).
         assert_eq!(exc1, "acme:100:1");
         assert_eq!(exc2, "bravo:200:1");
         // Adjacent same-pair commits COMPRESS into one run row.
         s.set_exception("acme", 101, 1);
         s.set_exception("acme", 102, 1);
-        let (_, _, _, _, exc1) = s.snapshot_for("p1");
+        let (_, _, _, _, exc1, _) = s.snapshot_for("p1");
         assert_eq!(exc1, "acme:100-102:1");
         assert_eq!(s.exceptions.len(), 2, "one acme run + one bravo single");
         // An interior clear SPLITS the run.
         assert!(s.clear_exception("acme", 101));
-        let (_, _, _, _, exc1) = s.snapshot_for("p1");
+        let (_, _, _, _, exc1, _) = s.snapshot_for("p1");
         assert_eq!(exc1, "acme:100:1;acme:102:1");
         // Committing a move BACK to the default owner self-retires the row
         // (the safe alternative to CPCLEARSLOT).
         s.set_exception("acme", 100, 0);
-        let (_, _, _, _, exc1) = s.snapshot_for("p1");
+        let (_, _, _, _, exc1, _) = s.snapshot_for("p1");
         assert_eq!(exc1, "acme:102:1");
         // Runs survive the line-format round-trip.
         s.commit().expect("commit");
@@ -508,11 +512,11 @@ mod tests {
             );
         }
         s.version = 7;
-        let (v, pairs, tenants, _admin, _exc) = s.snapshot_for("p1");
+        let (v, pairs, tenants, _admin, _exc, _) = s.snapshot_for("p1");
         assert_eq!(v, 7);
         assert_eq!(pairs, "a:1,b:1");
         assert_eq!(tenants, "tok-t1=t1,tok-t3=t3");
-        let (_, _, t2, _, _) = s.snapshot_for("p2");
+        let (_, _, t2, _, _, _) = s.snapshot_for("p2");
         assert_eq!(t2, "tok-t2=t2", "p2 must not see p1's tokens");
     }
 }

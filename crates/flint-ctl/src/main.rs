@@ -2934,6 +2934,26 @@ fn controlled_failover(
             &other,
         ),
     }
+    // Tell the proxies, exactly as the controller does after an automatic
+    // promotion (#91). This path matters MORE, not less: a PLANNED failover
+    // demotes the old master in place, so it stays up and answers, and the
+    // only signal a proxy gets is -READONLY on a write it already accepted
+    // from a client. Every `upgrade` roll walks a master through this. One
+    // notice turns that bounce into a re-probe the proxy makes before the
+    // client's next request.
+    //
+    // Best effort, like the controller's: a CP that is down must never make
+    // a maintenance failover fail, and the reactive path still converges.
+    if let Some(cp) = inv.cp.first()
+        && !matches!(
+            call(cp, tls, &["CPPROMOTED", new_master]),
+            Ok(Value::Simple(_))
+        )
+    {
+        eprintln!(
+            "  note: CPPROMOTED {new_master} did not land — proxies fall back to reactive rediscovery"
+        );
+    }
     next + 1
 }
 

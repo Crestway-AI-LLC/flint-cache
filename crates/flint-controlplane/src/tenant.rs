@@ -213,6 +213,35 @@ pub fn normalize(runs: &mut Vec<SlotRun>, ranges: &[Option<(u16, u16)>], pair_co
 }
 
 /// Render the exception table for the snapshot's 6th frame element:
+/// Render the promotion HINT a proxy receives: `"<addr>|<generation>"`, or
+/// empty when no promotion has ever been reported.
+///
+/// A HINT, NOT AUTHORITY. The address names the node the controller just
+/// promoted, but the proxy does not route on it — it re-probes that pair and
+/// believes whoever answers as master, exactly as it does when a backend
+/// dies. Authority stays with the epoch-fenced nodes, so a stale, delayed or
+/// simply wrong hint costs one probe and cannot misroute a write. What the
+/// hint buys is only WHEN the probe happens: immediately, instead of when
+/// some client's request next fails.
+///
+/// The generation exists because the address alone is not distinguishing:
+/// promote A, fail back to A, and two real events render identically. It is
+/// compared for INEQUALITY rather than ordering, so a CP restart that resets
+/// it (the hint is deliberately not persisted — it is a live wakeup, not a
+/// fact worth surviving) still triggers one harmless re-probe instead of
+/// going permanently quiet against a proxy that remembers a higher number.
+///
+/// Lives here, called by BOTH the single-node `State` and the Raft
+/// `RegistryState`, because those two render snapshots separately and a
+/// second copy of this is how one deployment mode silently loses the
+/// feature.
+pub fn promote_hint(promoted: &Option<(String, u64)>) -> String {
+    match promoted {
+        Some((addr, generation)) => format!("{addr}|{generation}"),
+        None => String::new(),
+    }
+}
+
 /// `ns:slot:pair` for single-slot runs, `ns:lo-hi:pair` for wider ones,
 /// joined by ';' (empty when none).
 ///

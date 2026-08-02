@@ -5,6 +5,12 @@ use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Mutation {
+    /// The controller promoted `addr`. Carries no routing authority: it
+    /// bumps a generation so the next snapshot wakes every watching proxy
+    /// and tells it which pair to re-probe. See tenant::promote_hint.
+    Promoted {
+        addr: String,
+    },
     AddProxy(String),
     /// Retire a proxy registration.
     ///
@@ -157,6 +163,11 @@ pub struct RegistryState {
     pub admin_token: Option<String>,
     #[serde(default)]
     pub admin_prev: Option<String>,
+    /// Last promotion reported by the controller: (addr, generation).
+    /// Deliberately NOT persisted across a CP restart — it is a live wakeup,
+    /// not a durable fact (tenant::promote_hint explains why that is safe).
+    #[serde(skip)]
+    pub promoted: Option<(String, u64)>,
 }
 
 /// FNV-1a seed for deterministic subset placement (not a security
@@ -193,7 +204,15 @@ pub fn shuffle_shard(name: &str, fleet: &[String], k: usize) -> Vec<String> {
 impl RegistryState {
     pub fn apply(&mut self, m: Mutation) {
         self.version += 1;
+
         match m {
+            Mutation::Promoted { addr } => {
+                // Monotonic per CP process. Compared for INEQUALITY by the
+                // proxy, never for ordering, so a restart resetting it to 1
+                // costs one extra probe rather than going permanently quiet.
+                let next = self.promoted.as_ref().map_or(1, |(_, g)| g + 1);
+                self.promoted = Some((addr, next));
+            }
             Mutation::AddProxy(a) => {
                 if !self.proxies.contains(&a) {
                     self.proxies.push(a);
@@ -329,7 +348,7 @@ impl RegistryState {
 
     /// The snapshot a given proxy should see: shared pair topology + ONLY
     /// the tenants whose subset includes it (the sub-group boundary).
-    pub fn snapshot_for(&self, proxy: &str) -> (u64, String, String, String, String) {
+    pub fn snapshot_for(&self, proxy: &str) -> (u64, String, String, String, String, String) {
         let (pairs, tenants) =
             crate::tenant::snapshot_for(&self.pairs, &self.ranges, self.tenants.values(), proxy);
         let d = |t: &Option<String>| {
@@ -344,6 +363,98 @@ impl RegistryState {
             tenants,
             admin,
             crate::tenant::exceptions_spec_for(&self.exceptions, self.tenants.values(), proxy),
+            crate::tenant::promote_hint(&self.promoted),
         )
+    }
+}
+
+#[cfg(test)]
+mod promote_tests {
+    use super::*;
+
+    fn reg() -> RegistryState {
+        RegistryState {
+            pairs: vec![vec!["a:1".into(), "b:1".into()]],
+            ..Default::default()
+        }
+    }
+
+    /// The view `watch()` compares for delta suppression.
+    fn pushed_view(
+        t: &(u64, String, String, String, String, String),
+    ) -> (String, String, String, String, String) {
+        (
+            t.1.clone(),
+            t.2.clone(),
+            t.3.clone(),
+            t.4.clone(),
+            t.5.clone(),
+        )
+    }
+
+    /// THE trap this feature had to avoid. A promotion changes nothing else a
+    /// proxy can see — same pairs, same tenants, same admin, same exceptions
+    /// — so if the hint were left out of the pushed view, `watch()` would
+    /// suppress the push as "view unchanged" and the notice would never
+    /// reach anyone. The bug would present as "the hint never arrives",
+    /// pointing at the network rather than at the four-field tuple that
+    /// discarded it.
+    #[test]
+    fn a_promotion_changes_the_pushed_view_so_suppression_cannot_eat_it() {
+        let mut r = reg();
+        let before = r.snapshot_for("p1");
+        r.apply(Mutation::Promoted { addr: "b:1".into() });
+        let after = r.snapshot_for("p1");
+        assert_ne!(
+            pushed_view(&before),
+            pushed_view(&after),
+            "a promotion must change the pushed view or delta suppression eats it"
+        );
+        assert_eq!(
+            before.1, after.1,
+            "a promotion must not disturb the pair topology"
+        );
+        assert_eq!(
+            before.2, after.2,
+            "a promotion must not disturb the tenant table"
+        );
+    }
+
+    #[test]
+    fn generation_advances_per_promotion_so_repeats_are_distinguishable() {
+        let mut r = reg();
+        r.apply(Mutation::Promoted { addr: "b:1".into() });
+        let first = r.snapshot_for("p1").5;
+        // The SAME address promoted again is a genuinely new event (promote
+        // b, fail back to a, promote b again). Without the generation the
+        // two render identically and the second is silently dropped.
+        r.apply(Mutation::Promoted { addr: "b:1".into() });
+        let second = r.snapshot_for("p1").5;
+        assert_ne!(
+            first, second,
+            "re-promoting the same node must still be visible"
+        );
+        assert_eq!(first, "b:1|1");
+        assert_eq!(second, "b:1|2");
+    }
+
+    #[test]
+    fn no_promotion_renders_an_empty_hint() {
+        assert_eq!(reg().snapshot_for("p1").5, "");
+    }
+
+    /// The hint must not survive a restart — it is a live wakeup, not a
+    /// fact. If it were persisted, a proxy would re-probe on every reconnect
+    /// for a promotion that happened days ago.
+    #[test]
+    fn the_hint_is_not_persisted() {
+        let mut r = reg();
+        r.apply(Mutation::Promoted { addr: "b:1".into() });
+        let json = serde_json::to_string(&r).expect("serialize");
+        let back: RegistryState = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(
+            back.promoted, None,
+            "the promotion hint must not round-trip through persistence"
+        );
     }
 }

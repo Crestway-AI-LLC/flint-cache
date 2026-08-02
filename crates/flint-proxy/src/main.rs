@@ -381,6 +381,9 @@ struct Topology {
     /// --admin-token (hashed at parse) OR pushed by the CP snapshot, so it
     /// rotates without a proxy restart. Empty => open surface (dev).
     admin_digests: RwLock<Vec<String>>,
+    /// Last promotion hint applied ("<addr>|<gen>"). Compared for
+    /// INEQUALITY — see apply_promote_hint.
+    last_promote_hint: RwLock<String>,
 }
 
 impl Topology {
@@ -538,6 +541,36 @@ impl Topology {
                 }
             }
         }
+    }
+
+    /// Act on the controller's promotion hint: if it DIFFERS from the last
+    /// one seen, re-probe the named node's pair right now.
+    ///
+    /// Differs, not "is greater". The hint is not persisted across a CP
+    /// restart, so a generation can legitimately go backwards; ordering
+    /// would then ignore every later hint forever, and the symptom would be
+    /// an intermittently slow failover that looks like a network problem.
+    /// Re-probing is idempotent and costs one round trip per pair member, so
+    /// erring toward an extra probe is the cheap direction.
+    ///
+    /// The address is a POINTER TO WHAT TO PROBE, never a routing decision:
+    /// `rediscover_for` asks the pair who claims to be master and believes
+    /// the epoch-fenced answer. A stale, duplicated, or outright wrong hint
+    /// therefore cannot misroute a write — the worst case is a wasted probe.
+    fn apply_promote_hint(&self, hint: &str) {
+        if hint.is_empty() {
+            return;
+        }
+        match self.last_promote_hint.write() {
+            Ok(mut last) if *last != hint => *last = hint.to_string(),
+            // Unchanged (a re-push of the same view, or a reconnect replay):
+            // nothing to do. Poisoned lock: leave the reactive path to it.
+            _ => return,
+        }
+        let Some((addr, _gen)) = hint.split_once('|') else {
+            return;
+        };
+        self.rediscover_for(addr);
     }
 
     /// Apply a control-plane snapshot: replace the tenant table, and — only
@@ -1961,12 +1994,20 @@ fn watch_control_plane(
                         Some(Value::Bulk(Some(e))) => String::from_utf8_lossy(e).to_string(),
                         _ => String::new(),
                     };
+                    // #91: element 6 = the controller's promotion hint
+                    // ("<addr>|<gen>"); CPs without it omit it, and a proxy
+                    // that never sees one keeps the reactive path unchanged.
+                    let promo = match items.get(6) {
+                        Some(Value::Bulk(Some(p))) => String::from_utf8_lossy(p).to_string(),
+                        _ => String::new(),
+                    };
                     topo.apply_snapshot(
                         &String::from_utf8_lossy(pairs),
                         &String::from_utf8_lossy(tenants),
                         &admin,
                         &exc,
                     );
+                    topo.apply_promote_hint(&promo);
                     *last_version = *version as u64;
                     eprintln!("control-plane snapshot v{version} applied");
                     out.clear();
@@ -2159,6 +2200,7 @@ fn main() -> std::io::Result<()> {
         open_mode,
         backend_tls,
         cert_path: arg("--internal-cert"),
+        last_promote_hint: RwLock::new(String::new()),
         admin_digests: RwLock::new(
             arg("--admin-token")
                 .map(|t| vec![flint_tls::sha256_hex(t.as_bytes())])
@@ -2286,6 +2328,7 @@ mod route_tests {
             backend_tls: None,
             cert_path: None,
             admin_digests: RwLock::new(Vec::new()),
+            last_promote_hint: RwLock::new(String::new()),
         }
     }
 
@@ -2294,6 +2337,78 @@ mod route_tests {
             vec![vec!["a:1".into()], vec!["b:1".into()]],
             vec![Some("a:1".into()), Some("b:1".into())],
         )
+    }
+
+    /// Pair 0's master is "a:1", which nothing answers on in a unit test, so
+    /// a re-probe necessarily resolves to None. That makes masters[0]
+    /// flipping Some -> None the OBSERVABLE PROOF that rediscover_for ran —
+    /// and re-seeding it before a suppressed hint proves the negative just
+    /// as directly. A test that only asserted the stored hint string would
+    /// pass even if the re-probe were never wired up at all.
+    fn master0(t: &Topology) -> Option<String> {
+        t.clusters[0].routing.read().expect("routing lock").masters[0].clone()
+    }
+    fn seed_master0(t: &Topology) {
+        t.clusters[0].routing.write().expect("routing lock").masters[0] = Some("a:1".into());
+    }
+
+    #[test]
+    fn a_changed_promote_hint_reprobes_the_pair() {
+        let t = two_pair_topo();
+        assert_eq!(master0(&t), Some("a:1".into()), "precondition");
+        t.apply_promote_hint("a:1|1");
+        assert_eq!(master0(&t), None, "a new hint must trigger a re-probe");
+    }
+
+    #[test]
+    fn a_repeated_promote_hint_does_not_reprobe() {
+        let t = two_pair_topo();
+        t.apply_promote_hint("a:1|1");
+        seed_master0(&t);
+        t.apply_promote_hint("a:1|1");
+        assert_eq!(
+            master0(&t),
+            Some("a:1".into()),
+            "replaying the same hint (a re-push, or a reconnect) must not re-probe"
+        );
+    }
+
+    /// The CP does not persist the hint, so after a CP restart a generation
+    /// legitimately goes BACKWARDS. Comparing for ordering would ignore
+    /// every subsequent hint forever, and the symptom would be a failover
+    /// that is intermittently slow for reasons that look like the network.
+    #[test]
+    fn a_lower_generation_after_a_cp_restart_still_reprobes() {
+        let t = two_pair_topo();
+        t.apply_promote_hint("a:1|7");
+        seed_master0(&t);
+        t.apply_promote_hint("a:1|1");
+        assert_eq!(master0(&t), None, "a reset generation must still re-probe");
+    }
+
+    /// A CP that predates this feature omits the field entirely; the proxy
+    /// must then behave exactly as it did before — reactive rediscovery only.
+    #[test]
+    fn an_empty_promote_hint_is_ignored() {
+        let t = two_pair_topo();
+        t.apply_promote_hint("");
+        assert_eq!(
+            master0(&t),
+            Some("a:1".into()),
+            "an absent hint must change nothing"
+        );
+    }
+
+    /// A hint naming a node this proxy does not serve must not disturb it.
+    #[test]
+    fn a_hint_for_an_unknown_node_leaves_routing_alone() {
+        let t = two_pair_topo();
+        t.apply_promote_hint("zzz:9|1");
+        assert_eq!(master0(&t), Some("a:1".into()));
+        assert_eq!(
+            t.clusters[0].routing.read().expect("routing lock").masters[1],
+            Some("b:1".into())
+        );
     }
 
     #[test]
