@@ -146,7 +146,7 @@ max-conns 10000       node+proxy HOT  connection admission cap
 cache-ttl-ms 300      proxy HOT   near-cache TTL default (PROXYCACHE)
 cache-max-bytes N     proxy HOT   near-cache byte budget
 async-queue-cap 4096  node  restart  async write-queue depth
-poll-ms 200           ctlr  restart  failure-probe interval (RTO)
+poll-ms 100           ctlr  restart  failure-probe interval (RTO)
 confirm 3             ctlr  restart  consecutive fails before promote
 lease-ttl-ms 3000     ctlr  restart  master lease TTL
 ```

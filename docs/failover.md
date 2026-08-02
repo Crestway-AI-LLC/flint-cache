@@ -209,9 +209,9 @@ flowchart LR
 ```
 
 - **Detect.** The controller polls each node's `FLINTINFO` every
-  `--poll-ms` (default 200). A master is declared down only after
+  `--poll-ms` (default 100). A master is declared down only after
   `--confirm` consecutive missed ticks (default 3) — a transient blip
-  never triggers a failover. ~600 ms to a confirmed detection at the
+  never triggers a failover. ~300 ms to a confirmed detection at the
   defaults.
 - **Verify.** Before promoting it checks the pair is **converged** — a
   survivor observed at `seq_lag == 0` within `--max-stale-ms` (default

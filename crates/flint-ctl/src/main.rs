@@ -40,7 +40,7 @@
 //!   async-queue-cap 4096  node  restart  async write-queue depth
 //!   cache-ttl-ms 300      proxy HOT   near-cache TTL (via PROXYCACHE)
 //!   cache-max-bytes N     proxy HOT   near-cache byte budget
-//!   poll-ms 200           ctlr  restart  failure-probe interval (RTO)
+//!   poll-ms 100           ctlr  restart  failure-probe interval (RTO)
 //!   confirm 3             ctlr  restart  consecutive fails before promote
 //!   lease-ttl-ms 3000     ctlr  restart  master lease TTL
 //!
@@ -1845,7 +1845,7 @@ fn controller_args(inv: &Inventory) -> Vec<String> {
         "ctl".into(),
         // RTO timing knobs — inventory-tunable (config edit + restart).
         "--poll-ms".into(),
-        inv.ctl_poll_ms.unwrap_or(200).to_string(),
+        inv.ctl_poll_ms.unwrap_or(100).to_string(),
         "--confirm".into(),
         inv.ctl_confirm.unwrap_or(3).to_string(),
         "--journal".into(),

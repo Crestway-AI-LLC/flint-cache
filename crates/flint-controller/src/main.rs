@@ -42,7 +42,7 @@
 //!   flint-controller --pairs "a1,b1;a2,b2" [--id A]
 //!   flint-controller --manage-slots 6460:/data/a,6470:/data/b [--id A]
 //!   flint-controller --manage-pairs "6500:/d/a,6501:/d/b;6510:/d/c,6511:/d/d"
-//!   common: [--poll-ms 200] [--confirm 3] [--max-stale-ms 5000] [--lease-ttl-ms 3000]
+//!   common: [--poll-ms 100] [--confirm 3] [--max-stale-ms 5000] [--lease-ttl-ms 3000]
 
 // The rebalance planner + balance-policy seam lives in the shared
 // `flint-balance` library so the managed plane reuses the same
@@ -722,7 +722,20 @@ fn main() {
     });
 
     let cfg = Config {
-        poll: Duration::from_millis(arg_or("--poll-ms", 200)),
+        // 100ms, halved from 200 on 2026-08-02. Detection is poll x confirm
+        // and it dominates the client-visible failover stall — measured at
+        // ~70% of it. On 7 EC2 hosts through the proxy edge, 30 kills per
+        // setting: 200:3 gave p50 644ms / worst 753ms over 15 promotions,
+        // 100:2 gave p50 317ms / worst 322ms over 18. This lands between
+        // them at ~430ms (loopback 100:3 measured 433 and 467ms p50).
+        //
+        // CONFIRM STAYS AT 3, deliberately. confirm is the tolerance for a
+        // transient miss — a dropped probe, a GC pause, a busy host — and
+        // 100:2 was never tested where that tolerance can fail: every
+        // "zero spurious promotions" number came from an idle loopback
+        // soak. Halving the interval keeps all three misses required; it
+        // only shortens the window they must occur in.
+        poll: Duration::from_millis(arg_or("--poll-ms", 100)),
         confirm: arg_or("--confirm", 3),
         max_stale: Duration::from_millis(arg_or("--max-stale-ms", 5_000)),
         // Lease TTL handed to each master per renewal. Generous vs the poll

@@ -50,17 +50,52 @@ echo "== start controller with --rebalance-execute (deadband 0.2, 2 slots/cycle)
 # EXECUTE, or fills numerically balanced.
 BALANCED=0
 for i in $(seq 1 120); do
+  # DBSIZE can answer -TRYAGAIN (the stale-read fence, when a replica is
+  # behind), and an error string is not a number. Unguarded, `[ "$D1" -gt ...`
+  # then parsed the message as shell words and `set -u` died on "sync:
+  # unbound variable" — a drill crash that named nothing about the product.
+  # Treat a non-numeric reply as "not settled yet" and poll again.
   D0=$(valkey-cli -p $P0 DBSIZE); D1=$(valkey-cli -p $P1 DBSIZE); D2=$(valkey-cli -p $P2 DBSIZE)
+  case "$D0$D1$D2" in *[!0-9]*) sleep 0.5; continue ;; esac
   MAX=$D0; [ "$D1" -gt "$MAX" ] && MAX=$D1; [ "$D2" -gt "$MAX" ] && MAX=$D2
   MEAN=$(( (D0+D1+D2) / 3 ))
-  if [ "$MEAN" -gt 0 ] && [ $((MAX*100)) -le $((MEAN*125)) ] && grep -q "rebalance EXECUTE" /tmp/flint-rbx.log; then
+  # CONSERVATION IS PART OF "SETTLED", not a separate check afterwards.
+  #
+  # A slot move copies to the destination and only then drops the source, so
+  # mid-flight the same keys are counted on BOTH pairs and every DBSIZE is
+  # inflated. The balance criterion is purely distributional, so it can go
+  # true during that window — and the conservation check immediately below
+  # then reads the duplicates and reports "total keys changed: 28000 ->
+  # 29171", which looks exactly like the group having invented data.
+  #
+  # It is a race in the ruler, not a defect in the product: the drill was
+  # asking "are the sizes balanced yet" when it meant "has the migration
+  # finished". Requiring the total to be intact makes the loop wait for the
+  # cutover, and turns the check below into a confirmation instead of a
+  # coin toss.
+  SUM=$((D0+D1+D2))
+  if [ "$MEAN" -gt 0 ] && [ $((MAX*100)) -le $((MEAN*125)) ] \
+     && [ "$SUM" -eq "$TOTAL" ] && grep -q "rebalance EXECUTE" /tmp/flint-rbx.log; then
     BALANCED=1; break
   fi
   sleep 1
 done
-D0=$(valkey-cli -p $P0 DBSIZE); D1=$(valkey-cli -p $P1 DBSIZE); D2=$(valkey-cli -p $P2 DBSIZE)
+# The loop already established these are numeric and conserved; re-reading
+# here re-opens the -TRYAGAIN window it just closed. Guarding inside the loop
+# and not here was half a fix, and the half that was missing is the one that
+# printed "fills after: g0=TRYAGAIN replica out of sync...".
 echo "  fills after: g0=$D0 g1=$D1 g2=$D2 (executes: $(grep -c "rebalance EXECUTE" /tmp/flint-rbx.log), slot moves: $(grep -c "MIGRATEIN-OK" /tmp/flint-rbx.log))"
-[ "$BALANCED" = "1" ] || { echo "FAIL: did not converge to balance"; tail -15 /tmp/flint-rbx.log; exit 1; }
+# Say WHICH half of "settled" never arrived — a conservation failure that
+# persists is a product bug, and must not be reported as "did not balance".
+[ "$BALANCED" = "1" ] || {
+  if [ $((D0+D1+D2)) -ne "$TOTAL" ]; then
+    echo "FAIL: keys not conserved after 120s: $TOTAL -> $((D0+D1+D2))"
+    echo "      a migration that never completed its cutover, or duplicated rows"
+  else
+    echo "FAIL: did not converge to balance"
+  fi
+  tail -15 /tmp/flint-rbx.log; exit 1
+}
 
 echo "== conservation: every key exactly once across the group"
 AFTER=$((D0+D1+D2))
