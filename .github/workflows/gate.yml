@@ -1,0 +1,131 @@
+name: gate
+# The drills and conformance, as a merge gate.
+#
+# ci.yml already runs fmt + clippy + tests. That is the cheap half of
+# docs/release-checklist.md; this is the half that actually exercises the
+# product — conformance against a reference implementation, the 23 core
+# drills, and the two randomized chaos runs. Until now every one of those was
+# a thing a human remembered to run, which is the same failure mode
+# tools/gates.sh was written to remove one level down.
+#
+# RUNS ON PUSH TO MAIN AS WELL AS ON PULL REQUESTS, which is a deliberate
+# departure from ci.yml's check-rocks leg.
+#
+# check-rocks is pull-request-only because a RocksDB compile is expensive and
+# the merge gate is where it pays. That reasoning assumes merges exist. This
+# repository has ZERO merge commits in its last fifty: every change, including
+# every one in this session, went straight to main. A pull_request-only gate
+# here would never have run once — a check that cannot fire, which is the
+# precise thing tools/gates.sh was written to stop shipping.
+#
+# The cost is real and worth stating: this repo is private, so Actions minutes
+# are billed. ~12 min warm, ~35 min cold, at maybe 50-100 pushes a month, is
+# roughly 600-1200 minutes — inside the free allowance, but not free forever.
+# If that stops being the right trade, delete the `push:` block and adopt pull
+# requests for feature work; do not leave the trigger in place while assuming
+# something else is checking.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # Hand-runnable, because "did my CI change work" should not require
+  # opening a pull request to find out.
+  workflow_dispatch:
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    # Cold cache pays for a RocksDB compile; the default 360 is generous but
+    # an explicit number turns a hang into a failure with a reason.
+    timeout-minutes: 60
+    env:
+      # In CI a skipped drill is a failed drill. See tools/gates.sh — locally
+      # a skip is correct (no mkfs.ext4 on macOS), here it silently deletes
+      # coverage from a run someone is about to trust.
+      FLINT_GATE_STRICT: "1"
+      # fleet.sh refuses to run on a box that already has a Flint fleet. A
+      # fresh runner never does, and the guard cannot tell "clean CI host"
+      # from "someone's laptop" on its own.
+      FLINT_DRILL_FORCE: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      # ORDER MATTERS. Everything cheap and likely-to-break goes BEFORE the
+      # RocksDB compile, so a bad toolchain or a moved valkey tag fails in two
+      # minutes instead of twenty-seven.
+      - name: Cache valkey (the conformance oracle)
+        id: valkey-cache
+        uses: actions/cache@v4
+        with:
+          path: /usr/local/bin/valkey-*
+          key: valkey-9.1.0-${{ runner.os }}
+
+      - name: Build valkey 9.1.0
+        if: steps.valkey-cache.outputs.cache-hit != 'true'
+        # Not apt: Valkey forked from Redis in March 2024, AFTER ubuntu
+        # noble's package freeze, so there is no valkey-server on
+        # ubuntu-latest. redis-tools ships redis-cli under a different name
+        # and the drills call valkey-cli by name.
+        #
+        # PINNED, not "latest", and pinned to the version the corpus is
+        # validated against locally. A floating oracle turns a Valkey release
+        # into a mysterious Flint conformance failure — the oracle has to be
+        # a fixed reference or it is not an oracle.
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch 9.1.0 https://github.com/valkey-io/valkey.git /tmp/valkey
+          make -C /tmp/valkey -j"$(nproc)"
+          sudo install -m 0755 /tmp/valkey/src/valkey-server /usr/local/bin/
+          sudo install -m 0755 /tmp/valkey/src/valkey-cli    /usr/local/bin/
+
+      - name: Verify the oracle runs
+        # A cache that restored a truncated or wrong-arch binary would
+        # otherwise surface as "conformance failed", i.e. as a Flint bug.
+        run: |
+          valkey-server --version
+          valkey-cli --version
+
+      - name: Client libraries for client_compat_drill
+        # The drill installs these itself when missing, into exactly these
+        # paths (tools/client_compat_drill.sh: VENV=/tmp/flint-compat-venv,
+        # NODE_DIR=/tmp/flint-compat-node). Doing it here as a NAMED step is
+        # purely for diagnosis: an npm registry hiccup then reads as "client
+        # libraries" failing rather than as "client_compat failed", which is a
+        # different investigation.
+        #
+        # It matters because that drill exits 0 with a SKIP line when these
+        # are absent, and FLINT_GATE_STRICT turns that into a failure on
+        # purpose. These are the real clients customers use; "we could not
+        # check" must never render as "it works".
+        run: |
+          set -euo pipefail
+          python3 -m venv /tmp/flint-compat-venv
+          /tmp/flint-compat-venv/bin/pip install --quiet redis
+          mkdir -p /tmp/flint-compat-node
+          cd /tmp/flint-compat-node
+          npm init -y >/dev/null
+          npm install --no-fund --no-audit --silent redis
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Shares the rocks build with ci.yml's check-rocks leg.
+          key: rocks
+
+      # `check` is deliberately omitted: ci.yml already runs fmt, clippy and
+      # tests in both feature configs, and running them twice per PR buys
+      # nothing. This job is the stages that were never automated.
+      - name: Conformance, drills, chaos
+        run: tools/gates.sh conformance drills chaos
+
+      - name: Keep the logs
+        # gates.sh writes one file per step and keeps them whether they passed
+        # or failed. Without this they die with the runner, and a failure that
+        # cannot be read is a failure that gets re-run instead of fixed —
+        # which is exactly what the script exists to prevent.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-logs
+          path: /tmp/flint-gates
+          retention-days: 14

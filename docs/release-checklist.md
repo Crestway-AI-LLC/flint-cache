@@ -1,8 +1,23 @@
 # Release checklist
 
-The pre-release ritual, in order. CI enforces the first block; the drill
-and chaos blocks are deliberately manual (minutes-long, randomized) and
-MUST be run before tagging.
+The pre-release ritual, in order. **CI now enforces all four blocks on
+every pull request** (`.github/workflows/gate.yml` runs
+`tools/gates.sh conformance drills chaos`; `ci.yml` runs the `check`
+stage). Running it yourself before tagging is still the rule — a tag is
+cut from a working tree, not from a green pull request — but the drills
+and chaos are no longer a thing anyone has to remember.
+
+Two CI-specific notes:
+
+- **`FLINT_GATE_STRICT=1` makes a skipped drill a failed one.** Locally a
+  skip is right (no `mkfs.ext4` on macOS). In CI it is not: a drill that
+  skipped reads identically to one that passed, so a forgotten dependency
+  would silently delete coverage from every future run.
+- **The conformance oracle is pinned to Valkey 9.1.0** and built from
+  source, because Valkey forked after Ubuntu noble's package freeze and
+  is not installable with apt there. Pinned rather than latest: a
+  floating oracle turns a Valkey release into a mysterious Flint
+  conformance failure.
 
 **Run it, don't retype it:**
 

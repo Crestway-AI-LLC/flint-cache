@@ -36,11 +36,41 @@ CORE="restart repl failover proxy slot_migrate slot_map rebalance_execute
       attached_chaos"
 CHAOS="chaos proxy_chaos"
 
+# FLINT_GATE_STRICT=1 turns a SKIPPED drill into a FAILED one.
+#
+# Several drills exit 0 with a "SKIP:" line when a dependency is missing —
+# client_compat without redis-py or node, disk_pressure without mkfs.ext4 or
+# passwordless sudo. On a developer's laptop that is right: a macOS box has
+# no mkfs.ext4 and should not fail the suite over it.
+#
+# In CI it is the opposite of right. CI is where "the gate is green" gets
+# believed and merges get unblocked, and a drill that skipped is
+# indistinguishable there from a drill that passed. A forgotten `pip install`
+# would quietly delete client-compatibility coverage from every future run,
+# and nothing would say so.
+#
+# So the environment that trusts the result is the environment that must
+# refuse a skip.
 FAILED=""
 step() {  # step <name> <log-suffix> <command...>
   local name="$1" log="$LOGS/$2.log"; shift 2
   local start; start=$(date +%s)
   if "$@" >"$log" 2>&1; then
+    # `SKIP:` and `SKIP (` are the two forms a drill uses to say "I did not
+    # test this because a dependency was missing". Deliberately NOT plain
+    # /SKIP/: attached_chaos prints "data plane SKIPPED (pass --probe ...)",
+    # a known and documented limitation of that drill rather than a broken
+    # environment, and failing every pull request over a pre-existing gap
+    # would teach people to ignore this gate — the one outcome worse than
+    # not having it.
+    if [ -n "${FLINT_GATE_STRICT:-}" ] && grep -qE 'SKIP[: (]' "$log"; then
+      printf 'FAIL  %-22s (%ss)  %s\n' "$name" "$(( $(date +%s) - start ))" "$log"
+      grep -m2 'SKIP' "$log" | sed 's/^/        /'
+      echo "        skipped under FLINT_GATE_STRICT: install the dependency"
+      echo "        or drop the drill from CORE deliberately, not by accident."
+      FAILED="$FAILED $name(skipped)"
+      return
+    fi
     printf 'PASS  %-22s (%ss)\n' "$name" "$(( $(date +%s) - start ))"
   else
     printf 'FAIL  %-22s (%ss)  %s\n' "$name" "$(( $(date +%s) - start ))" "$log"
