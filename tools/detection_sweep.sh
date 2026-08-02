@@ -35,11 +35,20 @@ SOAK=${1:-45}
 OUT=/tmp/flint-detection-sweep
 rm -rf "$OUT"; mkdir -p "$OUT"
 
-# poll-ms:confirm — the shipped default first, so every row is read against it.
-SETTINGS="150:3 100:3 100:2 75:2"
+# poll-ms:confirm. 200:3 FIRST because that is the actual shipped default —
+# flint-controller's compiled arg_or("--poll-ms", 200)/confirm 3, what
+# self-hosting.md documents, and what the multi-host runner renders.
+#
+# The first version of this sweep called 150:3 "the shipped default" and
+# never measured 200:3 at all. 150:3 is only what attached_chaos_drill.sh
+# happens to configure. Every improvement was therefore quoted against a
+# baseline 150ms of detection FASTER than anything a customer runs, which
+# understated the win — the same shape of error as the RTO number in #119,
+# where a label claimed one thing and the measurement was of another.
+SETTINGS="${FLINT_SWEEP_SETTINGS:-200:3 150:3 100:3 100:2}"
 
 echo "== detection sweep: sensitivity (real kills) + specificity (no kills)"
-echo "   soak ${SOAK}s per setting; shipped default is 150:3"
+echo "   soak ${SOAK}s per setting; SHIPPED DEFAULT is 200:3 (first row)"
 echo
 
 printf '%-12s %-11s %-26s %s\n' "poll:confirm" "detect(ms)" "stall p50/worst (kills)" "spurious promotions"
