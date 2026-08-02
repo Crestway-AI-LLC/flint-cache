@@ -229,6 +229,19 @@ flowchart LR
   revisiting only if RTO becomes the binding constraint, and then on
   evidence from adverse conditions (controller-host CPU contention,
   cross-AZ RTT), not a longer quiet run.
+- **Notify.** A successful promotion is reported to the control plane
+  (`CPPROMOTED`), which bumps its version and wakes every proxy parked in
+  `CPWATCH`. The notice is a HINT to re-probe, not a routing instruction:
+  the proxy still asks the pair who claims master and believes the
+  epoch-fenced answer, so a stale or wrong hint costs one probe and cannot
+  misroute a write. Best effort — a CP that is down leaves the older
+  reactive path (rediscover on a failed write), which is slower but equally
+  correct. `flintctl failover` and `flintctl upgrade` send the same notice,
+  where it matters most: a planned handoff demotes the old master in place,
+  so it stays up answering `-READONLY` and a proxy's only other signal is a
+  client write bouncing off it. Measured on loopback, the first write after
+  a handoff costs ~+62 ms above steady state without the notice and ~+6 ms
+  with it (`tools/promote_notice_drill.sh`).
 - **Verify.** Before promoting it checks the pair is **converged** — a
   survivor observed at `seq_lag == 0` within `--max-stale-ms` (default
   5000). If no survivor is caught up (both nodes died, or the replica
