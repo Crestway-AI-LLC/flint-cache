@@ -213,6 +213,22 @@ flowchart LR
   `--confirm` consecutive missed ticks (default 3) — a transient blip
   never triggers a failover. ~300 ms to a confirmed detection at the
   defaults.
+
+  `confirm 3` is deliberate, and `confirm 2` was measured rather than
+  assumed. On a 7-host cluster under load through the edge, a 300 s soak
+  with **nothing killed** recorded zero spurious promotions at both
+  settings (68,665 and 69,294 writes respectively) — the counter was first
+  shown to move by killing a real master, so the zeros mean something.
+
+  We still ship 3. `confirm` is the tolerance for a transient miss, and
+  dropping to 2 spends a full miss of it to buy 100 ms of detection —
+  against a measured 757 ms RTO and a published `≤ 2 s` bound, which is
+  already met with better than 2× margin. A clean five-minute window on a
+  same-subnet fleet is also close to the best case for a failure mode
+  driven by tails: GC pauses, scheduler hiccups, packet-loss bursts. Worth
+  revisiting only if RTO becomes the binding constraint, and then on
+  evidence from adverse conditions (controller-host CPU contention,
+  cross-AZ RTT), not a longer quiet run.
 - **Verify.** Before promoting it checks the pair is **converged** — a
   survivor observed at `seq_lag == 0` within `--max-stale-ms` (default
   5000). If no survivor is caught up (both nodes died, or the replica
