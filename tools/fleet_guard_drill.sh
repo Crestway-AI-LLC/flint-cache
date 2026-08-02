@@ -34,6 +34,21 @@ spawn_as() { bash -c "exec -a $1 sleep 60" & PIDS="$PIDS $!"; }
 cleanup() { [ -n "$PIDS" ] && kill $PIDS 2>/dev/null; wait 2>/dev/null; true; }
 trap cleanup EXIT
 
+# THIS DRILL MUST CONTROL FLINT_DRILL_FORCE, NOT INHERIT IT.
+#
+# CI exports FLINT_DRILL_FORCE=1 for the whole job, because a fresh runner
+# is genuinely a clean box and the guard cannot tell that from someone's
+# laptop. Every other drill wants that. This one is ABOUT the guard, so
+# inheriting it made the refusal assertions unprovable: the guard returned 0
+# by design and the drill read that as "did NOT refuse". It passed locally,
+# where the variable is unset, and failed on the first CI run — the exact
+# environment-difference class the multi-host work exists to catch.
+#
+# So: clear it here, and set it explicitly in the one step that tests it.
+FORCE_WAS="${FLINT_DRILL_FORCE:-}"
+unset FLINT_DRILL_FORCE
+[ -n "$FORCE_WAS" ] && echo "   (FLINT_DRILL_FORCE=$FORCE_WAS cleared for this drill; step E sets it back)"
+
 fleet_init /tmp/flint-guard-drill 6999
 
 echo "== A) a quiet box: the guard must let the drill run"
@@ -86,6 +101,8 @@ echo "$OUT" | grep -q "outside /tmp/flint-guard-drill" \
 echo "  refused for the out-of-scope reason, not the sibling one"
 
 echo "== E) FLINT_DRILL_FORCE still overrides both"
+# Set explicitly, so this asserts the override rather than whatever the
+# surrounding environment happened to be.
 OUT=$(FLINT_DRILL_FORCE=1 fleet_guard 2>&1); RC=$?
 [ "$RC" = 0 ] || { echo "FAIL: FORCE did not override (exit $RC)"; echo "$OUT"; exit 1; }
 echo "  force proceeds"

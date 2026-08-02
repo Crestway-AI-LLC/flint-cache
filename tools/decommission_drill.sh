@@ -70,7 +70,14 @@ echo "  seeded 5000"
 ( n=0
   while [ -f "$RUN" ]; do
     n=$((n+1))
-    if [ "$($A SET writer:last $n 2>/dev/null)" = "OK" ]; then echo "$n" > "$ACKFILE"; fi
+    # tmp+mv, not `>`: a bare redirect truncates then writes, and the main
+    # shell reads this file WHILE the loop runs. CI caught the window — the
+    # check read an empty file as "no write was ever acked" while
+    # writer:last=713 proved the opposite, and the drill reported acked-write
+    # loss against a failover that lost nothing.
+    if [ "$($A SET writer:last $n 2>/dev/null)" = "OK" ]; then
+      echo "$n" > "$ACKFILE.tmp" && mv "$ACKFILE.tmp" "$ACKFILE"
+    fi
   done ) &
 WRITER_PID=$!
 sleep 1.5
