@@ -66,6 +66,38 @@ fleet_init() {
   [ -n "$FLEET_SCOPE" ] || { echo "fleet_init: empty scope"; exit 1; }
 }
 
+# Fleet processes belonging to ANOTHER Flint-family project, as "pid argv"
+# lines. Today that means flint-kv (flint-kv-server, flint-kv-chaos, ...).
+#
+# WHY THIS IS SEPARATE FROM _fleet_foreign. That one is anchored
+# `^flint-(server|proxy|...)$`, so `flint-kv-server` never matched it and the
+# guard reported a clean box while another project's chaos fleet was running.
+# Both suites then competed for CPU, disk and the machine's patience, and the
+# result presented as a flaky drill rather than as a collision — which is the
+# expensive kind of wrong, because it sends you debugging the drill.
+#
+# DETECTION ONLY, AND DELIBERATELY SO. Nothing here feeds a kill path. This
+# repo must never signal another project's processes: those fleets are owned,
+# and possibly being watched, by someone else's run. The guard's job is to
+# refuse and name what it saw, not to tidy up.
+#
+# The rule is structural rather than a list of names: sibling projects
+# namespace their binaries `flint-<project>-<component>`, while everything
+# THIS workspace builds is a single segment (flint-server, flint-chaos,
+# flint-controlplane) or flintctl. If this repo ever ships a two-segment
+# binary, exclude it here — otherwise the guard will start calling our own
+# processes a sibling project's and refuse to run at all.
+_fleet_sibling() {
+  ps -eo pid=,args= 2>/dev/null | awk '
+    {
+      n = split($2, parts, "/")
+      exe = parts[n]
+      if (exe ~ /^flint-(server|proxy|controlplane|controller|agent|console|ops|register|exporter|meter|chaos|bench|conformance|balance)$/) next
+      if (exe !~ /^flint-[a-z0-9]+-[a-z0-9-]+$/) next
+      print
+    }'
+}
+
 # Fleet processes on this box that are NOT ours, as "pid argv" lines.
 _fleet_foreign() {
   ps -eo pid=,args= 2>/dev/null | awk -v scope="$FLEET_SCOPE" -v ports="$FLEET_PORTS" '
@@ -154,18 +186,35 @@ fleet_wait_listen() {
 # stopping with an explanation is the right thing loudly.
 # FLINT_DRILL_FORCE=1 proceeds anyway (a CI box that really is ours alone).
 fleet_guard() {
-  local foreign
+  local foreign sibling
   foreign="$(_fleet_foreign)"
-  [ -z "$foreign" ] && return 0
+  sibling="$(_fleet_sibling)"
+  [ -z "$foreign" ] && [ -z "$sibling" ] && return 0
   if [ "${FLINT_DRILL_FORCE:-0}" = "1" ]; then
-    echo "  (FLINT_DRILL_FORCE=1: proceeding despite $(echo "$foreign" | wc -l | tr -d ' ') foreign flint process(es))"
+    local n=0
+    [ -n "$foreign" ] && n=$(( n + $(echo "$foreign" | wc -l | tr -d ' ') ))
+    [ -n "$sibling" ] && n=$(( n + $(echo "$sibling" | wc -l | tr -d ' ') ))
+    echo "  (FLINT_DRILL_FORCE=1: proceeding despite $n other flint process(es))"
     return 0
   fi
-  echo "REFUSING TO RUN: this box already has Flint processes outside $FLEET_SCOPE"
-  echo "$foreign" | cut -c1-120 | sed 's/^/    /'
-  echo "  A drill that killed those would destroy a fleet it does not own —"
-  echo "  a live cluster, or another suite's nodes. Stop them, or re-run with"
-  echo "  FLINT_DRILL_FORCE=1 if this box really is yours alone."
+  if [ -n "$foreign" ]; then
+    echo "REFUSING TO RUN: this box already has Flint processes outside $FLEET_SCOPE"
+    echo "$foreign" | cut -c1-120 | sed 's/^/    /'
+    echo "  A drill that killed those would destroy a fleet it does not own —"
+    echo "  a live cluster, or another suite's nodes."
+  fi
+  if [ -n "$sibling" ]; then
+    # A DIFFERENT reason, said differently. These are not ours to stop, and a
+    # message telling you to kill them would be wrong: another project's run
+    # may be mid-measurement. The contention is the problem, not the process.
+    echo "REFUSING TO RUN: another Flint-family project has a fleet up on this box"
+    echo "$sibling" | cut -c1-120 | sed 's/^/    /'
+    echo "  These are NOT ours and this suite will not touch them. Two fleets"
+    echo "  sharing a box contend for CPU and disk, and the result shows up as"
+    echo "  a flaky drill rather than as the collision it is. Wait for that run"
+    echo "  to finish, or stop it from ITS project."
+  fi
+  echo "  Re-run with FLINT_DRILL_FORCE=1 if this box really is yours alone."
   exit 1
 }
 
