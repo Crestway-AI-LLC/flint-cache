@@ -33,7 +33,7 @@ CORE="restart repl failover proxy slot_migrate slot_map rebalance_execute
       tenant_quota token_rotation cert_reload_fleet controlplane_ha
       decommission config_file federation_plumbing disk_pressure ctl_error
       client_compat proxy_registry reseed lag_cap widowed_grace controller
-      promote_notice fleet_guard attached_chaos"
+      promote_notice fleet_guard ctl_cpha attached_chaos"
 CHAOS="chaos proxy_chaos"
 
 # FLINT_GATE_STRICT=1 turns a SKIPPED drill into a FAILED one.

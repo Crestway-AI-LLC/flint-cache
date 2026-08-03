@@ -214,10 +214,14 @@ fn parse_inventory(path: &str) -> Inventory {
         !inv.cp.is_empty(),
         "inventory needs at least one `cp <addr>`"
     );
-    assert_eq!(
-        inv.cp.len(),
-        1,
-        "multi-node CP bootstrap is the HA follow-on"
+    // One cp line = single-node CP; three = a Raft group (cp_seat_args
+    // derives node ids, raft ports and peer lists from inventory order).
+    // Two is refused: an even group cannot form a majority after one loss,
+    // which is the only reason to run more than one seat at all.
+    assert!(
+        inv.cp.len() == 1 || inv.cp.len() == 3,
+        "cp seats must number 1 (single-node) or 3 (raft); {} is neither",
+        inv.cp.len()
     );
     assert!(
         !inv.pairs.is_empty(),
@@ -1455,7 +1459,7 @@ fn wait_supervised(inv: &Inventory, n_pairs: usize, since_ms: u64) {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let mut armed = std::collections::HashSet::new();
-        if let Ok(Value::Bulk(Some(raw))) = call(&inv.cp[0], &tls, &["CPJOURNALREAD", "500"]) {
+        if let Ok(Value::Bulk(Some(raw))) = call_cp(inv, &tls, &["CPJOURNALREAD", "500"]) {
             for line in String::from_utf8_lossy(&raw).lines() {
                 if line.contains("\"kind\":\"Supervised\"")
                     && let Some(at) = line
@@ -1732,20 +1736,106 @@ fn start_pair_nodes(inv: &Inventory, pair: &[String]) {
 /// differently: an upgrade that respawns the proxy with a subtly different
 /// argv is a config change disguised as a version bump, and it would show up
 /// as behaviour nobody chose. One builder, two callers.
+/// One CP call that FOLLOWS THE LEADER. A single-seat CP never redirects and
+/// this is exactly `call`. A Raft follower answers `-LEADER <addr>`; during
+/// an election every seat answers "no leader elected yet". Mutating through
+/// `call(&inv.cp[0], ...)` therefore breaks the moment seat 1 is not the
+/// leader — which after the FIRST leader failover is the steady state, and
+/// the failure would read as "the CP rejected the command" rather than as
+/// mis-routing. Every flintctl CP call goes through here so that cannot
+/// happen; the hop/retry budget is small because elections settle in
+/// hundreds of milliseconds.
+fn call_cp(
+    inv: &Inventory,
+    tls: &Option<Arc<flint_tls::ClientConfig>>,
+    args: &[&str],
+) -> std::io::Result<Value> {
+    let mut target = inv.cp[0].clone();
+    let mut last: std::io::Result<Value> = Err(std::io::Error::other("unreached"));
+    for attempt in 0..24 {
+        // Patience on EVERY retry path, not only "no leader": right after a
+        // leader dies, survivors keep advertising the DEAD seat until the
+        // election converges, so a redirect can point at a corpse. The first
+        // version slept only on "no leader elected" and burned its whole
+        // attempt budget ping-ponging stale redirects inside the election
+        // window — found by ctl_cpha_drill killing the leader.
+        if attempt > 0 {
+            std::thread::sleep(Duration::from_millis(350));
+        }
+        last = call(&target, tls, args);
+        match &last {
+            Ok(Value::Error(e)) if e.starts_with("LEADER ") => {
+                target = e["LEADER ".len()..].trim().to_string();
+            }
+            Ok(Value::Error(e)) if e.contains("no leader elected") => {}
+            // A dead seat: rotate to the next one rather than giving up —
+            // with a single seat this falls through and returns the error.
+            Err(_) if inv.cp.len() > 1 => {
+                let pos = inv.cp.iter().position(|a| *a == target).unwrap_or(0);
+                target = inv.cp[(pos + 1) % inv.cp.len()].clone();
+            }
+            _ => return last,
+        }
+    }
+    last
+}
+
 fn cp_args(inv: &Inventory) -> Vec<String> {
+    cp_seat_args(inv, 0)
+}
+
+/// Arguments for CP seat `i`. One `cp` line in the inventory is the
+/// single-node CP, unchanged. THREE lines are a Raft group: node ids are
+/// 1-based inventory order, the raft port is the client port + 10 (the
+/// controlplane_ha drill's convention, now a flintctl contract — open it in
+/// the security group), and each seat gets its own state dir so co-located
+/// drill seats cannot share one.
+fn cp_seat_args(inv: &Inventory, i: usize) -> Vec<String> {
     let d = &inv.statedir;
+    let seat = &inv.cp[i];
     let mut args = vec![
         "--port".to_string(),
-        port_of(&inv.cp[0]).to_string(),
+        port_of(seat).to_string(),
         // Bind the address the inventory tells everyone else to dial. On a
         // loopback fleet this is 127.0.0.1 and nothing changes; on a fleet
         // with real addresses it is the difference between a control plane
         // and an unreachable process.
         "--bind".into(),
-        host_of(&inv.cp[0]).to_string(),
+        host_of(seat).to_string(),
         "--state".into(),
-        format!("{d}/cp-state"),
+        if inv.cp.len() == 1 {
+            format!("{d}/cp-state")
+        } else {
+            format!("{d}/cp-state-n{}", i + 1)
+        },
     ];
+    if inv.cp.len() > 1 {
+        let peers = inv
+            .cp
+            .iter()
+            .enumerate()
+            .map(|(j, a)| format!("{}={}:{}", j + 1, host_of(a), port_of(a) + 10))
+            .collect::<Vec<_>>()
+            .join(",");
+        let clients = inv
+            .cp
+            .iter()
+            .enumerate()
+            .map(|(j, a)| format!("{}={a}", j + 1))
+            .collect::<Vec<_>>()
+            .join(",");
+        args.extend([
+            "--raft".into(),
+            "--node-id".into(),
+            (i + 1).to_string(),
+            "--raft-port".into(),
+            (port_of(seat) + 10).to_string(),
+            "--peers".into(),
+            peers,
+            "--client-addrs".into(),
+            clients,
+        ]);
+    }
     args.extend(internal_args(inv));
     if let Some(tok) = &inv.admin_token {
         // ADR-0006 D4: the admin token lives in the CP and is pushed to
@@ -1780,7 +1870,17 @@ fn proxy_args(inv: &Inventory, i: usize) -> Vec<String> {
         "--bind".to_string(),
         bind_host.to_string(),
         "--control-plane".into(),
-        inv.cp[0].clone(),
+        // ALL seats, comma-joined: the proxy rotates to the next on watch
+        // failure, so no single CP host's loss can stop snapshot delivery.
+        // Each proxy STARTS at a different seat (rotation of the list) so
+        // steady-state watch load also spreads.
+        {
+            let n = inv.cp.len();
+            (0..n)
+                .map(|k| inv.cp[(i + k) % n].clone())
+                .collect::<Vec<_>>()
+                .join(",")
+        },
         "--advertise".into(),
         advertise,
     ];
@@ -1918,26 +2018,46 @@ fn launch(inv: &Inventory, register: bool) {
     }
     let tls = tls_client(inv);
 
-    // 1. Control plane, then the registry (proxies + pairs).
-    let cp = &inv.cp[0];
-    spawn(
-        inv,
-        &runner_for(inv, cp),
-        "cp",
-        "flint-controlplane",
-        &cp_args(inv),
-    );
-    assert!(
-        wait_pong(cp, &tls, Duration::from_secs(10)),
-        "control plane up"
-    );
+    // 1. Control plane — every seat (one for the single-node CP, three for
+    // Raft), then the registry (proxies + pairs).
+    for i in 0..inv.cp.len() {
+        let seat = &inv.cp[i];
+        let name = if inv.cp.len() == 1 {
+            "cp".to_string()
+        } else {
+            format!("cp-n{}", i + 1)
+        };
+        spawn(
+            inv,
+            &runner_for(inv, seat),
+            &name,
+            "flint-controlplane",
+            &cp_seat_args(inv, i),
+        );
+    }
+    for seat in &inv.cp {
+        assert!(
+            wait_pong(seat, &tls, Duration::from_secs(10)),
+            "control plane seat {seat} up"
+        );
+    }
+    // A Raft group that answers PING has not necessarily ELECTED: prove a
+    // leader exists before registering anything, or the registration calls
+    // spend their retry budget on the election instead of on real failures.
+    if inv.cp.len() > 1 {
+        assert!(
+            matches!(call_cp(inv, &tls, &["PING"]), Ok(Value::Simple(_))),
+            "raft CP elected a leader"
+        );
+        eprintln!("  cp: {} raft seats up, leader elected", inv.cp.len());
+    }
     if register {
         for i in 0..inv.proxies.len() {
             // The registry is what clients and portals dial, so it holds the
             // proxy's identity — same definition as the --advertise it was
             // started with and the address verify expects. One function.
             let adv = proxy_dial(inv, i);
-            must("register proxy", call(cp, &tls, &["CPADDPROXY", &adv]));
+            must("register proxy", call_cp(inv, &tls, &["CPADDPROXY", &adv]));
         }
         // Initial pairs carry the even slot split as EXPLICIT level-1
         // routing state; expansion pairs later join with "-" (no range) so
@@ -1948,8 +2068,8 @@ fn launch(inv: &Inventory, register: bool) {
             let end = (i + 1) * 16384 / n - 1;
             must(
                 "register pair",
-                call(
-                    cp,
+                call_cp(
+                    inv,
                     &tls,
                     &["CPADDPAIR", &pair.join(","), &format!("{start}-{end}")],
                 ),
@@ -2129,9 +2249,10 @@ fn verify_checks(inv: &Inventory, probe: Option<&str>, loud: bool) -> Vec<String
     };
 
     head("== control plane");
-    let cp = &inv.cp[0];
-    let cp_ok = matches!(call(cp, &tls, &["PING"]), Ok(Value::Simple(s)) if s == "PONG");
-    note(cp_ok, "reachable", cp.clone());
+    for seat in &inv.cp {
+        let ok = matches!(call(seat, &tls, &["PING"]), Ok(Value::Simple(s)) if s == "PONG");
+        note(ok, "reachable", seat.clone());
+    }
 
     head("== pairs: one master each, coherent epochs, one build");
     let mut builds: BTreeSet<String> = BTreeSet::new();
@@ -2247,7 +2368,7 @@ fn verify_checks(inv: &Inventory, probe: Option<&str>, loud: bool) -> Vec<String
     let declared: Vec<String> = (0..inv.proxies.len())
         .map(|i| probe_target(inv, i))
         .collect();
-    match call(&inv.cp[0], &tls, &["CPPROXIES"]) {
+    match call_cp(inv, &tls, &["CPPROXIES"]) {
         Ok(Value::Bulk(Some(raw))) => {
             let listed: Vec<String> = String::from_utf8_lossy(&raw)
                 .split(',')
@@ -2398,9 +2519,12 @@ fn probe_inline(proxy: &str, token: &str, tls: &Option<Arc<flint_tls::ClientConf
 
 fn status(inv: &Inventory) {
     let tls = tls_client(inv);
-    let cp = &inv.cp[0];
-    let cp_ok = matches!(call(cp, &tls, &["PING"]), Ok(Value::Simple(s)) if s == "PONG");
-    println!("cp        {cp}  {}", if cp_ok { "up" } else { "DOWN" });
+    // Every CP seat, not just the first: with a Raft group, "cp[0] answers"
+    // hides a dead follower until the NEXT failure makes it a lost quorum.
+    for seat in &inv.cp {
+        let ok = matches!(call(seat, &tls, &["PING"]), Ok(Value::Simple(s)) if s == "PONG");
+        println!("cp        {seat}  {}", if ok { "up" } else { "DOWN" });
+    }
     for (i, pair) in inv.pairs.iter().enumerate() {
         for addr in pair {
             match info_field(addr, &tls, "role:") {
@@ -2437,7 +2561,7 @@ fn tenant_add(inv: &Inventory, rest: &[String]) {
     let mut args = vec!["CPADDTENANT"];
     let strs: Vec<&str> = rest.iter().map(|s| s.as_str()).collect();
     args.extend(strs);
-    match call(&inv.cp[0], &tls, &args) {
+    match call_cp(inv, &tls, &args) {
         Ok(Value::Simple(s)) => println!("{s}"),
         other => fail("tenant add failed", &other),
     }
@@ -2470,7 +2594,7 @@ fn retire_proxy(inv: &Inventory, addr: &str) {
              proxy from every tenant subset. Remove the proxy line first if that is the intent."
         ));
     }
-    match call(&inv.cp[0], &tls, &["CPDELPROXY", addr]) {
+    match call_cp(inv, &tls, &["CPDELPROXY", addr]) {
         Ok(Value::Simple(s)) => println!("{s}"),
         other => fail("retire-proxy failed", &other),
     }
@@ -2479,7 +2603,7 @@ fn retire_proxy(inv: &Inventory, addr: &str) {
 fn tenant_remove(inv: &Inventory, name: &str) {
     let tls = tls_client(inv);
     // Namespace lookup BEFORE deletion (the record dies with the delete).
-    let ns = match call(&inv.cp[0], &tls, &["CPTENANTS"]) {
+    let ns = match call_cp(inv, &tls, &["CPTENANTS"]) {
         Ok(Value::Bulk(Some(raw))) => String::from_utf8_lossy(&raw)
             .lines()
             .find_map(|l| {
@@ -2489,7 +2613,7 @@ fn tenant_remove(inv: &Inventory, name: &str) {
             .unwrap_or_else(|| die(&format!("tenant remove failed: no such tenant {name:?}"))),
         other => fail("CPTENANTS failed", &other),
     };
-    match call(&inv.cp[0], &tls, &["CPDELTENANT", name]) {
+    match call_cp(inv, &tls, &["CPDELTENANT", name]) {
         Ok(Value::Simple(s)) => eprintln!("== {s}"),
         other => fail("tenant remove failed", &other),
     }
@@ -2530,7 +2654,7 @@ fn expand(inv: &Inventory, inventory_path: &str, pair_spec: &str) {
     // re-routing; migration (controller rebalance) moves slots later.
     must(
         "register new pair",
-        call(&inv.cp[0], &tls, &["CPADDPAIR", pair_spec, "-"]),
+        call_cp(inv, &tls, &["CPADDPAIR", pair_spec, "-"]),
     );
     // Persist to the inventory, then reroll the controller with the new
     // pair list. Controllers are STATELESS (ADR-0004): restarting one is a
@@ -2765,7 +2889,7 @@ fn epoch_counter(epoch: &str) -> Option<u32> {
 /// means the fleet is fighting something else; stop adding variables.
 fn journal_clean(inv: &Inventory, since_ms: u64, disallowed: &[&str]) -> Result<(), String> {
     let tls = tls_client(inv);
-    let Ok(Value::Bulk(Some(raw))) = call(&inv.cp[0], &tls, &["CPJOURNALREAD", "500"]) else {
+    let Ok(Value::Bulk(Some(raw))) = call_cp(inv, &tls, &["CPJOURNALREAD", "500"]) else {
         // FAIL CLOSED: an upgrade must not roll blind. If the journal is
         // unreadable we cannot distinguish "quiet fleet" from "on fire".
         return Err("fleet journal unreachable — refusing to roll without the gate".into());
@@ -3808,7 +3932,7 @@ fn main() {
                 rest.get(1).expect("usage: tenant-reads <name> <on|off>"),
             );
             let tls = tls_client(&inv);
-            match call(&inv.cp[0], &tls, &["CPTENANTREADS", name, mode]) {
+            match call_cp(&inv, &tls, &["CPTENANTREADS", name, mode]) {
                 Ok(Value::Simple(s)) => println!("{s}"),
                 other => fail("tenant-reads failed", &other),
             }
@@ -3821,7 +3945,7 @@ fn main() {
                 rest.get(1).expect("usage: tenant-async <name> <on|off>"),
             );
             let tls = tls_client(&inv);
-            match call(&inv.cp[0], &tls, &["CPTENANTASYNC", name, mode]) {
+            match call_cp(&inv, &tls, &["CPTENANTASYNC", name, mode]) {
                 Ok(Value::Simple(s)) => println!("{s}"),
                 other => fail("tenant-async failed", &other),
             }
@@ -3835,7 +3959,7 @@ fn main() {
                 rest.get(1).expect("usage: tenant-federate <name> <on|off>"),
             );
             let tls = tls_client(&inv);
-            match call(&inv.cp[0], &tls, &["CPTENANTFEDERATE", name, mode]) {
+            match call_cp(&inv, &tls, &["CPTENANTFEDERATE", name, mode]) {
                 Ok(Value::Simple(s)) => println!("{s}"),
                 other => fail("tenant-federate failed", &other),
             }
@@ -3851,7 +3975,7 @@ fn main() {
                     .expect("usage: tenant-quota <name> <ops_per_sec> <max_bytes>"),
             );
             let tls = tls_client(&inv);
-            match call(&inv.cp[0], &tls, &["CPTENANTQUOTA", name, ops, bytes]) {
+            match call_cp(&inv, &tls, &["CPTENANTQUOTA", name, ops, bytes]) {
                 Ok(Value::Simple(s)) => println!("{s}"),
                 other => fail("tenant-quota failed", &other),
             }
@@ -3869,7 +3993,7 @@ fn main() {
         "rotate-certs" => rotate_certs(&inv),
         "rotate-admin" => {
             let tls = tls_client(&inv);
-            match call(&inv.cp[0], &tls, &["CPADMINROTATE"]) {
+            match call_cp(&inv, &tls, &["CPADMINROTATE"]) {
                 Ok(Value::Bulk(Some(t))) => {
                     println!("{}", String::from_utf8_lossy(&t));
                     eprintln!(
@@ -3913,7 +4037,7 @@ fn main() {
                 rest.get(1).expect("usage: tenant-cache <name> <on|off>"),
             );
             let tls = tls_client(&inv);
-            match call(&inv.cp[0], &tls, &["CPTENANTCACHE", name, mode]) {
+            match call_cp(&inv, &tls, &["CPTENANTCACHE", name, mode]) {
                 Ok(Value::Simple(s)) => println!("{s}"),
                 other => fail("tenant-cache failed", &other),
             }

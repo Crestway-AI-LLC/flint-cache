@@ -2057,17 +2057,15 @@ fn frame_to_args(frame: Value) -> Option<Vec<Vec<u8>>> {
 
 fn main() -> std::io::Result<()> {
     let port: u16 = arg("--port").and_then(|p| p.parse().ok()).unwrap_or(7379);
-    // Comma-list ready (ADR-0007: a federated proxy group subscribes to
-    // each member cluster's CP). Exactly ONE is supported until the
-    // fleet-map work lands — reject more with an honest error rather than
-    // silently ignoring extras.
+    // A comma-list is the SEATS of one cluster's Raft CP, tried in order —
+    // any seat serves CPWATCH from its local applied registry, so the proxy
+    // rotates on failure rather than starving when its pinned seat dies.
+    // (Federation, ADR-0007, is a list of CLUSTERS and remains unwired;
+    // that will need its own syntax precisely because this one now means
+    // seats.)
     let control_planes: Vec<String> = arg("--control-plane")
         .map(|v| v.split(',').map(str::trim).map(String::from).collect())
         .unwrap_or_default();
-    assert!(
-        control_planes.len() <= 1,
-        "multiple --control-plane addresses are federation (ADR-0007) and not wired yet; give one"
-    );
     let control_plane = control_planes.first().cloned();
 
     // Client-facing TLS termination: both flags together enable it, neither
@@ -2212,14 +2210,25 @@ fn main() -> std::io::Result<()> {
     // + THIS proxy's tenants); we apply and ACK. Reconnect with backoff on
     // any error — the last-applied table keeps serving in the meantime
     // (control-plane outage never touches the data path).
-    if let Some(cp) = control_plane {
+    if control_plane.is_some() {
         let advertise = arg("--advertise").expect("--control-plane requires --advertise <addr>");
+        let seats = control_planes.clone();
         let topo = Arc::clone(&topo);
         std::thread::spawn(move || {
             let mut last_version: u64 = 0;
+            // ROTATE ON FAILURE. With one seat this is the old loop exactly.
+            // With three, a watch that dies moves to the next seat — the
+            // failure this closes: the drill killed the seat this proxy was
+            // pinned to, the quorum stayed healthy, and a new tenant's
+            // snapshot was never delivered because the proxy sat reconnecting
+            // to a corpse. Version tracking spans seats (any seat's applied
+            // registry carries the same versions), so rotation never replays.
+            let mut i = 0usize;
             loop {
-                if let Err(e) = watch_control_plane(&cp, &advertise, &topo, &mut last_version) {
-                    eprintln!("control-plane watch: {e}; reconnecting");
+                let cp = &seats[i % seats.len()];
+                if let Err(e) = watch_control_plane(cp, &advertise, &topo, &mut last_version) {
+                    eprintln!("control-plane watch ({cp}): {e}; trying next seat");
+                    i += 1;
                 }
                 std::thread::sleep(Duration::from_millis(1000));
             }
