@@ -1205,7 +1205,11 @@ fn run_raft(port: u16, state_path: String) -> std::io::Result<()> {
     let peers = arg("--peers").expect("--raft requires --peers \"1=addr,2=addr,...\"");
     let clients =
         arg("--client-addrs").expect("--raft requires --client-addrs \"1=addr,2=addr,...\"");
-    let raft_addr = format!("127.0.0.1:{raft_port}");
+    // The address peers DIAL this node at, and the interface both Raft
+    // listeners bind. --bind is the same flag the single-node path honours;
+    // on a loopback fleet it defaults to 127.0.0.1 and nothing changes.
+    let bind_host = arg("--bind").unwrap_or_else(|| "127.0.0.1".into());
+    let raft_addr = format!("{bind_host}:{raft_port}");
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -1219,6 +1223,7 @@ fn run_raft(port: u16, state_path: String) -> std::io::Result<()> {
         let ha = ha::start(
             node_id,
             &raft_addr,
+            &bind_host,
             raft_port,
             state_path.into(),
             &peers,
@@ -1235,6 +1240,6 @@ fn run_raft(port: u16, state_path: String) -> std::io::Result<()> {
                 ha.maybe_initialize().await;
             });
         }
-        ha::run_client(ha, port, tls_server).await
+        ha::run_client(ha, port, bind_host, tls_server).await
     })
 }

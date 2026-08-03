@@ -260,6 +260,7 @@ pub struct Ha {
 pub async fn start(
     node_id: NodeId,
     raft_addr: &str,
+    bind_host: &str,
     raft_port: u16,
     state_path: std::path::PathBuf,
     peers_spec: &str,
@@ -285,7 +286,15 @@ pub async fn start(
         .await
         .expect("raft new");
 
-    let listener = TcpListener::bind(("127.0.0.1", raft_port)).await?;
+    // BIND THE ADDRESS THIS NODE IS DIALED AT, not loopback. Both Raft
+    // listeners hardcoded 127.0.0.1, so an HA control plane was reachable
+    // only from its own host — peers could never connect and no proxy or
+    // flintctl on another machine could reach the client port. Invisible on
+    // loopback (where 127.0.0.1 IS the right answer), which is why
+    // controlplane_ha_drill and ctl_cpha_drill both pass; found by the
+    // production rehearsal, where three seats on three machines started
+    // cleanly and then nothing could talk to them.
+    let listener = TcpListener::bind((bind_host, raft_port)).await?;
     {
         let raft = raft.clone();
         tokio::spawn(serve_rpc(raft, listener, tls_server));
@@ -384,9 +393,10 @@ fn snapshot_frame(
 pub async fn run_client(
     ha: Arc<Ha>,
     port: u16,
+    bind_host: String,
     tls_server: Option<Arc<flint_tls::ReloadableServerConfig>>,
 ) -> std::io::Result<()> {
-    let listener = TcpListener::bind(("127.0.0.1", port)).await?;
+    let listener = TcpListener::bind((bind_host.as_str(), port)).await?;
     eprintln!(
         "flint-controlplane[raft node {}] client on :{port} ({})",
         ha.node_id,
