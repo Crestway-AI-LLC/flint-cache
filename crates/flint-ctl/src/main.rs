@@ -770,7 +770,16 @@ fn all_runners(inv: &Inventory) -> Vec<Runner> {
             out.push(r);
         }
     };
-    push(runner_for(inv, &inv.cp[0]));
+    // EVERY CP seat, not just the first. all_runners drives push-bins, cert
+    // distribution and the orphan sweep, so a host carrying ONLY seat 2 or 3
+    // was invisible to all of them: the production rehearsal distributed
+    // binaries and certs to two of three remotes, then panicked spawning
+    // seat 2 on a host with neither. The seat started (the spawn is by
+    // inventory), which is precisely why the omission was silent until the
+    // remote flintctl printed its usage banner.
+    for seat in &inv.cp {
+        push(runner_for(inv, seat));
+    }
     for pair in &inv.pairs {
         for node in pair {
             push(runner_for(inv, node));
