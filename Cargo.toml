@@ -40,6 +40,12 @@ default-members = [
 [workspace.package]
 version = "0.0.1"
 edition = "2024"
+# Edition 2024 needs 1.85. Stated so that a distro toolchain fails with
+# "requires rustc 1.85 or newer" instead of an opaque edition error — the
+# first thing a self-hoster on RHEL or Debian stable would have hit.
+# CI and development run stable (1.96 at time of writing); anything between
+# 1.85 and that is permitted by cargo but not exercised by us.
+rust-version = "1.85"
 license = "Elastic-2.0"
 repository = "https://github.com/Crestway-AI-LLC/flint-cache"
 # These crates are the product, not libraries for crates.io. Elastic-2.0 is

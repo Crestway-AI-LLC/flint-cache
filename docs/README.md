@@ -1,5 +1,16 @@
 # Flint docs
 
+Start here if you are deploying Flint:
+
+- `self-hosting.md` — the operator's guide: prerequisites, the inventory,
+  running it as a service, sizing, monitoring, tenants, rotation.
+- `capacity-model.md` — how much disk and how many nodes for a working set.
+- `tenant-guide.md` — what to hand an application team connecting to it.
+- `failover.md` — the failure model: planned handoff, crash, partition,
+  and why split-brain is impossible.
+
+Reference:
+
 - `command-support.md` — the supported command matrix, semantics notes,
   and what is excluded by design.
 - `release-checklist.md` — the pre-release ritual: gates, conformance,

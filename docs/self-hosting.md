@@ -12,8 +12,13 @@ verb and inventory reference; this guide is the operator's version of it.
 
 ## Quick start (single box)
 
+Build prerequisites (Rust 1.85+, a C++ toolchain and libclang for RocksDB,
+`valkey-cli`) are listed in the [README](../README.md#prerequisites).
+
 ```sh
-cargo build --release --features flint-server/rocks   # or use a release bundle
+# Stamp the build with the version you are deploying. flintctl refuses to
+# MUTATE a fleet from an unstamped build — see "Why the tag" below.
+FLINT_RELEASE_TAG=v0.1.0 cargo build --release --features flint-server/rocks
 
 cat > cluster.flint <<'EOF'
 statedir ./state
@@ -27,9 +32,28 @@ controller on
 EOF
 
 ./target/release/flintctl -f cluster.flint bootstrap
-./target/release/flintctl -f cluster.flint tenant add acme <token> acme 1
-valkey-cli -p 7379 --tls --cacert state/certs/ca.crt -a <token> SET hello world
+./target/release/flintctl -f cluster.flint tenant add acme tok-acme acme 1
+valkey-cli -p 7379 --tls --cacert state/certs/ca.crt -a tok-acme SET hello world
 ```
+
+### Why the tag
+
+A build straight from source reports no version, carries no manifest and no
+checksums. `flintctl` therefore refuses the fleet-*changing* verbs from one —
+`bootstrap`, `upgrade`, `failover`, tenant edits — while always allowing the
+read-only ones (`status`, `verify`). Two ways to satisfy it:
+
+- `FLINT_RELEASE_TAG=<tag>` at **compile** time, as above. The tag is baked
+  into every binary, so `verify` can hold the whole fleet to one build and an
+  `upgrade` can prove the new binaries actually took. This is the self-host
+  path.
+- `disposable on` in the inventory — for a cluster you will throw away. Never
+  put it in an inventory whose data you would miss: it is the line that says
+  "an unverifiable binary may rewrite this fleet."
+
+Use a tag that means something to you (`v0.1.0`, or your own build number in
+the same `v<major>.<minor>.<patch>` shape). It is a claim about *which* build
+this is, not a claim of blessing from us.
 
 `bootstrap` mints the internal CA, starts the control plane, registers the
 topology, starts the nodes, proxy, and controller, and confirms
@@ -153,6 +177,89 @@ lease-ttl-ms 3000     ctlr  restart  master lease TTL
 
 On a replicated pair, set `min-replicas 1` — it closes the widowed-master
 write hole ([failover.md](failover.md)).
+
+## 2b. Running it as a service, and surviving a reboot
+
+`flintctl` starts processes; it is not itself a daemon. Nothing above keeps
+the fleet running across a reboot, so wire that up before you rely on it.
+
+**Install layout.** Put the binaries and the inventory somewhere stable,
+outside a build tree:
+
+```
+/opt/flint/bin/            flint-server, flint-proxy, flint-controlplane,
+                           flint-controller, flintctl
+/opt/flint/cluster.flint   the inventory   (bins /opt/flint/bin)
+/var/lib/flint/            statedir — certs, CP state, node data, logs, pids
+```
+
+**`bootstrap` once, `start` forever after.** This is the distinction that
+matters at boot time and it is not symmetric:
+
+- `bootstrap` mints the CA, **registers** the topology with the control plane
+  and starts everything. It is a first-time act.
+- `start` spawns every process against **existing** state — no cert minting,
+  no registry writes. Re-registering would append duplicate topology, so a
+  boot path that runs `bootstrap` a second time corrupts the registry.
+
+So the boot unit must choose, and the cheapest honest test is whether the CP
+state file already exists:
+
+```ini
+# /etc/systemd/system/flint.service
+[Unit]
+Description=Flint fleet (idempotent boot)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/opt/flint/boot.sh
+ExecStop=/opt/flint/bin/flintctl -f /opt/flint/cluster.flint stop
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```sh
+#!/usr/bin/env bash
+# /opt/flint/boot.sh
+set -euo pipefail
+CTL=/opt/flint/bin/flintctl
+INV=/opt/flint/cluster.flint
+if [ -e /var/lib/flint/cp-state ] || [ -e /var/lib/flint/cp-state-n1 ]; then
+  "$CTL" -f "$INV" start          # already bootstrapped: idempotent boot
+else
+  "$CTL" -f "$INV" bootstrap
+fi
+"$CTL" -f "$INV" verify
+```
+
+`Type=oneshot` with `RemainAfterExit=yes` is deliberate: the unit's job is to
+*bring the fleet up*, not to be its parent. Ending with `verify` means a boot
+that half-worked fails the unit instead of looking healthy.
+
+On a multi-host fleet only the orchestrator host needs this unit — `flintctl`
+reaches the others over ssh, so that host also needs key-based access to them.
+That also means a whole-datacentre restart is a race: the orchestrator can boot
+before its peers are accepting ssh, and `start` will fail against whichever host
+is not up yet. Handle it in the script: systemd refuses to load a
+`Type=oneshot` unit whose `Restart=` is anything but `no`, so the retry has to
+live in `boot.sh`, not in the unit:
+
+```sh
+for i in $(seq 1 20); do
+  "$CTL" -f "$INV" start && break
+  echo "peers not ready yet (attempt $i); retrying in 15s" >&2
+  sleep 15
+done
+```
+
+**Verify it for real.** A reboot path that has never been rebooted is a
+guess. Reboot the box, then check `systemctl status flint`, `flintctl -f
+/opt/flint/cluster.flint status` for the expected roles, and read a key you
+wrote before the reboot.
 
 ## 3. Monitoring & Grafana
 

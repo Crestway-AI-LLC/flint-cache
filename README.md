@@ -78,6 +78,19 @@ failover RTO, slot migration and cutover, quota enforcement, token and
 certificate rotation under live traffic, chaos) that run against real
 processes, not mocks.
 
+## Prerequisites
+
+- **Rust 1.85 or newer** (edition 2024). `rustup` recommended; several distro
+  toolchains are older and will refuse to build.
+- **A C++ toolchain and libclang** — RocksDB is compiled from source by the
+  `rocksdb` crate. Debian/Ubuntu: `build-essential clang libclang-dev`.
+  RHEL/Amazon Linux: `gcc-c++ clang clang-devel`. macOS: Xcode command line
+  tools.
+- **`valkey-cli`** (or `redis-cli`) for the examples below, and for the drills.
+
+The first build compiles RocksDB and takes a while — on the order of ten
+minutes on a laptop, and a couple of GB in `target/`.
+
 ## Quick start
 
 ```sh
@@ -99,15 +112,35 @@ cat > cluster.flint <<EOF
 statedir ./state
 bins ./target/release
 tls on
+disposable on
 cp 127.0.0.1:7500
 pair 127.0.0.1:7001,127.0.0.1:7002
 proxy 127.0.0.1:7379
 controller on
 EOF
 ./target/release/flintctl -f cluster.flint bootstrap
-./target/release/flintctl -f cluster.flint tenant add acme <token> acme 1
-valkey-cli -p 7379 -a <token> SET hello world
+./target/release/flintctl -f cluster.flint tenant add acme tok-acme acme 1
+valkey-cli -p 7379 -a tok-acme SET hello world
 ```
+
+**`disposable on` is doing real work there, and you should take it off for
+anything you intend to keep.** A build straight from source reports no
+release version, carries no manifest and no checksums, so `flintctl` refuses
+to *mutate* a fleet with it — bootstrap, upgrade, failover, tenant changes —
+unless the inventory admits the fleet is throwaway. Read-only verbs (`status`,
+`verify`) are always allowed.
+
+To self-host for real, stamp the build with the version you are deploying and
+drop the line:
+
+```sh
+FLINT_RELEASE_TAG=v0.1.0 cargo build --release --features flint-server/rocks
+```
+
+The tag is baked in at compile time, so every binary reports it and `verify`
+can hold the whole fleet to a single build — which is the property the guard
+exists to protect. [docs/self-hosting.md](docs/self-hosting.md) covers this
+and the rest of a production install.
 
 The drills in `tools/` are runnable, asserting examples of every topology
 and failure mode (`repl_drill.sh`, `failover_drill.sh`, `proxy_drill.sh`,
@@ -116,20 +149,30 @@ and failure mode (`repl_drill.sh`, `failover_drill.sh`, `proxy_drill.sh`,
 
 ## Verifying
 
-```sh
-cargo fmt --all --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
-# and the production engine configuration:
-cargo clippy --workspace --all-targets --features flint-server/rocks -- -D warnings
-cargo test --workspace --features flint-server/rocks
-```
-
-Conformance against a local Valkey:
+One command runs the whole gate, keeps every log, and its exit status is the
+answer:
 
 ```sh
-./target/release/flint-conformance --target 127.0.0.1:6400
+tools/gates.sh
 ```
+
+Stages run individually too — `tools/gates.sh check`, `conformance`, `drills`,
+`chaos`:
+
+| Stage | What it runs |
+|---|---|
+| `check` | fmt, clippy and tests, in **both** feature configurations |
+| `conformance` | the compatibility oracle against Valkey, Flint mem, Flint rocks |
+| `drills` | the 20 core drills — real processes, no mocks |
+| `chaos` | the two randomized kill-and-verify drills |
+
+Logs land in `$FLINT_GATE_LOGS` (default `/tmp/flint-gates`), one file per
+step, kept whether it passed or failed. `conformance` needs a local Valkey to
+compare against; `drills` need `valkey-cli`.
+
+That script *is* the release gate — [docs/release-checklist.md](docs/release-checklist.md)
+stays as the explanation of why each step exists, because a checklist that has
+to be retyped is a checklist with steps missing.
 
 ## License
 

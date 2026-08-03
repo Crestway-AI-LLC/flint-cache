@@ -3780,16 +3780,68 @@ fn require_release_or_disposable(inv: &Inventory, cmd: &str) {
          version anyone can check, so it may only mutate a fleet that exists to \
          be thrown away. Read-only commands (status, verify) are always allowed.\n\
          \n\
-         For a throwaway cluster add `disposable on` to its inventory. For a real \
-         one, deploy a release bundle."
+         Pick the one that matches what you are doing:\n\
+         \n\
+         * Trying Flint out, or running a fleet you will delete — add \
+         `disposable on` to the inventory.\n\
+         \n\
+         * Self-hosting for real from source — stamp the build with the version \
+         you are deploying:\n\
+         \n      FLINT_RELEASE_TAG=v0.1.0 cargo build --release --features flint-server/rocks\n\
+         \n  The tag is baked in at compile time, so every binary reports it \
+         and `verify` can hold the whole fleet to one build.\n\
+         \n\
+         * Running a published release bundle — deploy it as-is; it carries the \
+         tag, the manifest and the sha256s."
     ));
 }
 
+/// Deliberately a map, not a manual: every verb, one line each, and a pointer
+/// to where the detail lives. The module header above is the full reference.
+const USAGE: &str = "\
+flintctl — drive a Flint cluster from one inventory file.
+
+    flintctl -f <inventory> <command> [args...]
+    flintctl --version | --help
+
+Lifecycle    bootstrap  start  stop  status  verify [--probe <tenant>:<token>]
+Topology     expand  add-replica  swap-node  decommission-node  migrate-slots
+Failure      failover <node>  kill-node <node>  restart-node <node>
+Tenants      tenant add|rm|list  tenant-quota  tenant-reads  tenant-cache
+             tenant-async  tenant-federate
+Edge         retire-proxy  proxy-cache
+Secrets      rotate-certs  rotate-admin
+Releases     push-bins <tarball>  upgrade --version-tag <tag>
+Config       reload            (edit the inventory; pushes hot knobs, no restart)
+
+A minimal inventory:
+
+    statedir ./state
+    bins ./target/release
+    tls on
+    disposable on          # required for a source build; drop it for a release
+    cp 127.0.0.1:7500
+    pair 127.0.0.1:7001,127.0.0.1:7002
+    proxy 127.0.0.1:7379
+    controller on
+
+Guide: docs/self-hosting.md   Failure model: docs/failover.md";
+
 fn main() {
     let argv: Vec<String> = std::env::args().collect();
-    // Ask the binary what it is without starting anything.
-    if argv.iter().any(|a| a == "--build-version") {
+    // Ask the binary what it is without starting anything. `--version`/`-V` are
+    // aliases because that is what an operator types first, and answering it
+    // with `panic!("usage: flintctl -f <inventory> ...")` reads as "this tool
+    // is broken" on the very first command of an evaluation.
+    if argv
+        .iter()
+        .any(|a| a == "--build-version" || a == "--version" || a == "-V")
+    {
         println!("{}", build_version());
+        return;
+    }
+    if argv.iter().any(|a| a == "--help" || a == "-h") || argv.len() == 1 {
+        println!("{USAGE}");
         return;
     }
     // Host-side commands come with no inventory: dispatch before requiring -f.
@@ -3800,7 +3852,9 @@ fn main() {
         .iter()
         .position(|a| a == "-f")
         .and_then(|i| argv.get(i + 1))
-        .unwrap_or_else(|| panic!("usage: flintctl -f <inventory> <command> [...]"))
+        .unwrap_or_else(|| {
+            die("no inventory: flintctl -f <inventory> <command>  (--help for the map)")
+        })
         .clone();
     let inv = parse_inventory(&inv_path);
     let cmd_at = argv
