@@ -48,15 +48,30 @@ echo "== start controller with --rebalance-execute (deadband 0.2, 2 slots/cycle)
 
 # Wait for convergence: balanced-within-deadband logged AFTER at least one
 # EXECUTE, or fills numerically balanced.
+# DBSIZE can answer -TRYAGAIN (the stale-read fence, when a replica is
+# behind), and an error string is not a number. Feeding one to `$(( ))` is
+# worse than a type error: bash arithmetic dereferences BARE WORDS as
+# variable names, so "TRYAGAIN replica out of sync" evaluates `sync`, and
+# under `set -u` the drill died with "line 91: sync: unbound variable" — a
+# transient replica lag reported as a shell fault, naming nothing about the
+# product.
+#
+# Guarding inside the poll loop was only half the fix, because the guard
+# `continue`s and leaves the ERROR STRING in D0/D1/D2. On the timeout path
+# the loop then falls out with those strings still set, and the report and
+# the conservation check below both consume them. So: keep the raw reply for
+# diagnostics, and promote to N0/N1/N2 only once proven numeric. Nothing
+# downstream touches anything but N*.
+is_num() { case "${1:-}" in '' | *[!0-9]*) return 1 ;; *) return 0 ;; esac; }
 BALANCED=0
+N0=""; N1=""; N2=""; LASTREPLY="(no reply at all)"
 for i in $(seq 1 120); do
-  # DBSIZE can answer -TRYAGAIN (the stale-read fence, when a replica is
-  # behind), and an error string is not a number. Unguarded, `[ "$D1" -gt ...`
-  # then parsed the message as shell words and `set -u` died on "sync:
-  # unbound variable" — a drill crash that named nothing about the product.
-  # Treat a non-numeric reply as "not settled yet" and poll again.
-  D0=$(valkey-cli -p $P0 DBSIZE); D1=$(valkey-cli -p $P1 DBSIZE); D2=$(valkey-cli -p $P2 DBSIZE)
-  case "$D0$D1$D2" in *[!0-9]*) sleep 0.5; continue ;; esac
+  D0=$(valkey-cli -p $P0 DBSIZE 2>&1); D1=$(valkey-cli -p $P1 DBSIZE 2>&1); D2=$(valkey-cli -p $P2 DBSIZE 2>&1)
+  if ! is_num "$D0" || ! is_num "$D1" || ! is_num "$D2"; then
+    LASTREPLY="g0='$D0' g1='$D1' g2='$D2'"
+    sleep 0.5; continue
+  fi
+  N0=$D0; N1=$D1; N2=$D2
   MAX=$D0; [ "$D1" -gt "$MAX" ] && MAX=$D1; [ "$D2" -gt "$MAX" ] && MAX=$D2
   MEAN=$(( (D0+D1+D2) / 3 ))
   # CONSERVATION IS PART OF "SETTLED", not a separate check afterwards.
@@ -80,16 +95,21 @@ for i in $(seq 1 120); do
   fi
   sleep 1
 done
-# The loop already established these are numeric and conserved; re-reading
-# here re-opens the -TRYAGAIN window it just closed. Guarding inside the loop
-# and not here was half a fix, and the half that was missing is the one that
-# printed "fills after: g0=TRYAGAIN replica out of sync...".
-echo "  fills after: g0=$D0 g1=$D1 g2=$D2 (executes: $(grep -c "rebalance EXECUTE" /tmp/flint-rbx.log), slot moves: $(grep -c "MIGRATEIN-OK" /tmp/flint-rbx.log))"
+# Never re-read here: that re-opens the -TRYAGAIN window the loop just closed.
+# If not one poll in 120s produced three numbers, say exactly that and show
+# the last reply — the group being permanently fenced is a real finding, and
+# it is not "did not converge to balance".
+if [ -z "$N0" ]; then
+  echo "FAIL: no numeric DBSIZE from the group in 120s — every poll was fenced or errored"
+  echo "      last reply: $LASTREPLY"
+  tail -15 /tmp/flint-rbx.log; exit 1
+fi
+echo "  fills after: g0=$N0 g1=$N1 g2=$N2 (executes: $(grep -c "rebalance EXECUTE" /tmp/flint-rbx.log), slot moves: $(grep -c "MIGRATEIN-OK" /tmp/flint-rbx.log))"
 # Say WHICH half of "settled" never arrived — a conservation failure that
 # persists is a product bug, and must not be reported as "did not balance".
 [ "$BALANCED" = "1" ] || {
-  if [ $((D0+D1+D2)) -ne "$TOTAL" ]; then
-    echo "FAIL: keys not conserved after 120s: $TOTAL -> $((D0+D1+D2))"
+  if [ $((N0+N1+N2)) -ne "$TOTAL" ]; then
+    echo "FAIL: keys not conserved after 120s: $TOTAL -> $((N0+N1+N2))"
     echo "      a migration that never completed its cutover, or duplicated rows"
   else
     echo "FAIL: did not converge to balance"
@@ -98,7 +118,7 @@ echo "  fills after: g0=$D0 g1=$D1 g2=$D2 (executes: $(grep -c "rebalance EXECUT
 }
 
 echo "== conservation: every key exactly once across the group"
-AFTER=$((D0+D1+D2))
+AFTER=$((N0+N1+N2))
 [ "$AFTER" = "$TOTAL" ] || { echo "FAIL: total keys changed: $TOTAL -> $AFTER"; exit 1; }
 
 echo "== moved tags: -MOVED on g0, served with correct value on the new owner"
