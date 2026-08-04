@@ -64,6 +64,29 @@ Everything needed to run AND operate Flint yourself:
   (both dialects), slot hashing, the shared read/write command classifier,
   and the typed fleet event log.
 
+## What "durable" means here, precisely
+
+Flint is a **cache with real durability, not a system of record.** It survives
+restarts, fails over in seconds, and it *will* lose a bounded amount of
+recently-acknowledged data when a master dies — because replication is
+asynchronous and the WAL is fsynced on a bounded cadence.
+
+- Warm restart, and the loss of a **replica**: nothing lost.
+- Master failover with the replica caught up: nothing lost. Measured RTO
+  **p50 506 ms** across 5 hosts on a real network.
+- Master failover with the replica behind: the un-replicated tail may be lost.
+  Bounded by **volume** — at most one lag-cap window's worth is ever at risk —
+  **not by age**. Measured deepest loss with a deliberately stalled replica:
+  **1757 ms**. In healthy runs it is 0.
+
+If your data lives *only* in Flint and losing the last second of it would
+matter, run a database as well. Every number above is measured by a drill in
+this repository with the command to reproduce it: **[docs/slo.md](docs/slo.md)**.
+
+[docs/security.md](docs/security.md) is the security posture — mutual TLS
+everywhere internally, tokens stored as digests, and an explicit list of what
+Flint does *not* do (no encryption at rest, no RBAC, no IAM).
+
 [docs/architecture.md](docs/architecture.md) is the system map — the three
 planes, and a normal write and read traced end to end.
 [docs/failover.md](docs/failover.md) covers failover — master handoff
