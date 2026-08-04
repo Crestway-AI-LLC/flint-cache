@@ -1,0 +1,65 @@
+# SPDX-License-Identifier: Elastic-2.0
+#
+# Build the dev container and prove it can do the job it exists for.
+#
+# It was written on a machine with no container runtime, so it shipped
+# inspection-verified only. A container definition that has never been built
+# is a guess; one built once by hand is a guess with a timestamp. This runs on
+# every change to .devcontainer/, so it stays true instead of having been true.
+name: devcontainer
+on:
+  push:
+    paths: [".devcontainer/**", ".github/workflows/devcontainer.yml"]
+  pull_request:
+    paths: [".devcontainer/**", ".github/workflows/devcontainer.yml"]
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the image
+        run: docker build -t flint-dev .devcontainer
+
+      # Building is not the claim. The claim is "you can run tools/gates.sh in
+      # here", and that needs three things the Dockerfile argues for at length.
+      - name: The toolchain is present and new enough for edition 2024
+        run: |
+          docker run --rm flint-dev bash -eux -c '
+            rustc --version
+            cargo --version
+            clang --version | head -1
+            # Cargo.toml declares rust-version 1.85; anything older cannot
+            # build this workspace at all.
+            v=$(rustc --version | awk "{print \$2}")
+            maj=${v%%.*}; min=${v#*.}; min=${min%%.*}
+            [ "$maj" -gt 1 ] || [ "$min" -ge 85 ]
+          '
+
+      - name: The conformance oracle is Valkey, and it speaks TLS
+        # BUILD_TLS is load-bearing, not a detail: without it valkey-cli has no
+        # --tls flag, and cert_reload_fleet_drill.sh — the one drill that runs
+        # a client-tls fleet — reports a cert hot-reload bug that does not
+        # exist. Asserting the flag exists is asserting the drill can pass.
+        run: |
+          docker run --rm flint-dev bash -eux -c '
+            valkey-server --version
+            valkey-cli --version
+            valkey-cli --help 2>&1 | grep -q -- "--tls"
+          '
+
+      - name: A Valkey the drills can actually talk to
+        # Presence of a binary is not the same as a working server; start one
+        # and complete a round trip, which is what every drill assumes.
+        run: |
+          docker run --rm flint-dev bash -eux -c '
+            valkey-server --port 6399 --save "" --appendonly no --daemonize yes
+            for i in $(seq 1 30); do
+              [ "$(valkey-cli -p 6399 PING 2>/dev/null)" = "PONG" ] && break
+              sleep 0.2
+            done
+            [ "$(valkey-cli -p 6399 PING)" = "PONG" ]
+            [ "$(valkey-cli -p 6399 SET k v)" = "OK" ]
+            [ "$(valkey-cli -p 6399 GET k)" = "v" ]
+            valkey-cli -p 6399 SHUTDOWN NOSAVE || true
+          '

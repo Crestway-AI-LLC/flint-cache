@@ -70,6 +70,19 @@ fn main() {
     // is stated as a wall-clock age and no gate bounds the age of an
     // already-acked write. See the assertion's own note.
     let stall_replica_ms: u64 = arg("--stall-replica-ms", 0);
+    // TEST-ONLY fault injector, off unless asked for. Reproduces on demand the
+    // pair of conditions that once turned a master-kill artefact into a
+    // data-loss verdict on the NEXT replica kill:
+    //
+    //   1. the write really is gone from the survivor, and
+    //   2. the oracle cannot read it to find that out.
+    //
+    // Both co-occur in the wild — a key lost in the failover, read back while
+    // the proxy is still chasing the promotion and answering -TRYAGAIN — but
+    // only under load and only sometimes, so the retire path that handles it
+    // shipped unexercised: every run reported `unreadable: 0`. A fix nothing
+    // has ever executed is a belief. This makes it a test.
+    let inject_unreadable: u64 = arg("--inject-unreadable", 0);
     // Slack for measurement, not for the engine: the master samples lag
     // slightly before it decides to ack, and our ack clock is taken after the
     // reply arrives. Small next to the cap it qualifies.
@@ -201,6 +214,7 @@ fn main() {
 
     let mut acked_lost_total = 0u64;
     let mut unverifiable_total = 0u64;
+    let mut injected = 0u64;
     let mut rtos: Vec<u64> = Vec::new();
     let mut deepest_loss_ms: u64 = 0;
     // Acked writes lost that were older than the cap: the AGE reading of the
@@ -387,7 +401,33 @@ fn main() {
                 // unreadable do we give up — and then RETIRE the key's
                 // pre-kill acks so that nothing downstream judges it on
                 // evidence we could not gather, and report the count.
-                let got: Option<u64> = {
+                // The injector simulates the OUTCOME of an unreadable reply —
+                // "still unreadable after the retries" — rather than the
+                // transport error itself; reaching that outcome is all the
+                // retry loop is for. It also DELs the key first, because
+                // without that the key is still on the master and a later
+                // replica-kill check would find it and pass whether or not the
+                // retire worked, which would make this test prove nothing.
+                //
+                // It injects the FAULT ONLY. The retire that follows is the
+                // real code path, untouched — if the injector did the retiring
+                // itself the test would pass with the fix removed, which is
+                // the difference between a regression test and a decoration.
+                // Only inject into a key with NO post-kill ack. Post-kill acks
+                // belong to the NEW master and the retire keeps them on
+                // purpose, so deleting such a key manufactures a loss the
+                // ledger is right to complain about — which is a bug in the
+                // injector, not a finding. The real condition is a write lost
+                // in the failover that nothing rewrote afterwards.
+                let inject_now =
+                    injected < inject_unreadable && acked_at.iter().all(|&(_, at)| at < kill_ms);
+                if inject_now {
+                    injected += 1;
+                    let _ = c.call(&[b"DEL", key.as_bytes()]);
+                }
+                let got: Option<u64> = if inject_now {
+                    None
+                } else {
                     let mut attempt = 0;
                     loop {
                         match c.call(&[b"GET", key.as_bytes()]) {
