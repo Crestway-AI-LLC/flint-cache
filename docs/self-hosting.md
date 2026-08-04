@@ -153,6 +153,19 @@ cp 10.0.1.11:7500
 cp 10.0.1.12:7500
 pair 10.0.2.10:7001,10.0.2.11:7001   # pair 0: master, replica (separate hosts)
 pair 10.0.2.12:7001,10.0.2.13:7001   # pair 1: master, replica
+
+# Failure domains. Separate HOSTS survive a host failure; separate DOMAINS
+# survive losing a zone, a rack or a power feed — which is the likelier
+# event and the one that takes both copies at once. Declare them and
+# `verify` refuses a pair whose members share one.
+#
+# All-or-nothing on purpose: zoning some pair hosts and not others is
+# REFUSED rather than half-checked, because a partial declaration reads as
+# anti-affinity without being one.
+zone 10.0.2.10 az-a
+zone 10.0.2.11 az-b
+zone 10.0.2.12 az-a
+zone 10.0.2.13 az-b
 proxy 10.0.1.20:7379         # 2 proxies -> a proxy loss is invisible
 proxy 10.0.1.21:7379
 controller on

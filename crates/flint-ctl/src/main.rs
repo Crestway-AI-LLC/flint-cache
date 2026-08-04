@@ -86,6 +86,20 @@ struct Inventory {
     /// agent keeps no billing journal (self-hosters who do not bill).
     billing: Option<String>,
     controller: bool,
+    /// Failure domain per HOST (`zone <host> <name>`): an availability zone
+    /// on a cloud, a rack or a power domain on your own hardware.
+    ///
+    /// Declaring them is what lets `verify` assert that a pair's two members
+    /// never share one. The inventory already requires separate *hosts*, and
+    /// separate hosts in one zone survive a host failure but not the loss of
+    /// the zone — which is the far likelier event, and the one that takes
+    /// both copies at once. On instance-store families the data goes with
+    /// them (docs/slo.md).
+    ///
+    /// Optional, and deliberately ALL-OR-NOTHING: an inventory that zones
+    /// some pair hosts and not others is refused rather than half-checked,
+    /// because a partial declaration reads as anti-affinity and is not one.
+    zones: std::collections::HashMap<String, String>,
     agent: Option<String>,
     /// Per-node storage capacity in bytes (capacity model, question 2);
     /// passed to the agent so it can compute fill + expansion ETAs.
@@ -198,6 +212,20 @@ fn parse_inventory(path: &str) -> Inventory {
             "ssh-key" => inv.ssh_key = Some(val.to_string()),
             "ssh-sudo" => inv.ssh_sudo = val == "on",
             "proxy-host" => inv.proxy_hosts.push(val.to_string()),
+            // `zone <host> <name>`. Malformed lines DIE rather than being
+            // dropped: a silently-ignored zone line would leave verify
+            // reporting anti-affinity it never checked.
+            "zone" => {
+                let mut it = val.split_whitespace();
+                match (it.next(), it.next(), it.next()) {
+                    (Some(host), Some(name), None) => {
+                        inv.zones.insert(host.to_string(), name.to_string());
+                    }
+                    _ => die(&format!(
+                        "inventory: `zone` takes exactly a host and a name, got `zone {val}`"
+                    )),
+                }
+            }
             "controller-host" => inv.controller_host = Some(val.to_string()),
             // Declares this fleet THROWAWAY: a non-release flintctl may
             // mutate it. Absent means a real cluster, which is the safe
@@ -2461,6 +2489,64 @@ fn verify_checks(inv: &Inventory, probe: Option<&str>, loud: bool) -> Vec<String
                     );
                 }
             }
+        }
+    }
+
+    // Anti-affinity. Checked here rather than at bootstrap because every
+    // topology-changing verb already ends in verify, so one implementation
+    // gates bootstrap, expand, add-replica and swap-node alike.
+    head("== failure domains");
+    if inv.zones.is_empty() {
+        if loud {
+            println!(
+                "  --   not declared. Add `zone <host> <name>` lines and a pair whose\n\
+                 \x20      members share a domain becomes a FAILED verify instead of a\n\
+                 \x20      surprise (docs/self-hosting.md)."
+            );
+        }
+    } else {
+        for (i, pair) in inv.pairs.iter().enumerate() {
+            let placed: Vec<(String, Option<&String>)> = pair
+                .iter()
+                .map(|a| {
+                    let h = host_of(a).to_string();
+                    let z = inv.zones.get(&h);
+                    (h, z)
+                })
+                .collect();
+            // Fail closed on a partial declaration: knowing SOME of the
+            // topology is the state that looks safe and is not.
+            let unzoned: Vec<&str> = placed
+                .iter()
+                .filter(|(_, z)| z.is_none())
+                .map(|(h, _)| h.as_str())
+                .collect();
+            if !unzoned.is_empty() {
+                note(
+                    false,
+                    &format!("pair {i} every member has a zone"),
+                    format!(
+                        "no `zone` line for {} — partial declaration is refused, \
+                         because it reads as anti-affinity without being one",
+                        unzoned.join(", ")
+                    ),
+                );
+                continue;
+            }
+            let zones: Vec<&str> = placed
+                .iter()
+                .filter_map(|(_, z)| z.map(|s| s.as_str()))
+                .collect();
+            let distinct = zones.iter().collect::<std::collections::HashSet<_>>().len();
+            let shown: Vec<String> = placed
+                .iter()
+                .map(|(h, z)| format!("{h} ({})", z.map(|s| s.as_str()).unwrap_or("?")))
+                .collect();
+            note(
+                distinct == zones.len(),
+                &format!("pair {i} members are in distinct failure domains"),
+                shown.join(" + "),
+            );
         }
     }
 
