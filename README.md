@@ -114,7 +114,9 @@ It checks prerequisites and names anything missing, builds if needed, writes a
 throwaway inventory, bootstraps, adds a tenant, and proves the cluster serves a
 write through the proxy. Then `tools/quickstart.sh down` (keep the data) or
 `purge` (delete it). Deliberately a pair rather than a single node, so
-`tools/failover_drill.sh` has a master to kill and a replica to promote.
+`tools/quickstart.sh failover` can SIGKILL the master and let you watch the
+controller promote the replica — with a replicated witness key proving the
+data came through.
 
 The rest of this section is the same thing by hand, if you would rather see the
 pieces.

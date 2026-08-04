@@ -9,6 +9,7 @@
 #
 #   tools/quickstart.sh          bring it up (builds first if needed)
 #   tools/quickstart.sh status   roles, lag, liveness
+#   tools/quickstart.sh failover kill this cluster's master, watch the promote
 #   tools/quickstart.sh down     stop it, keep the data
 #   tools/quickstart.sh purge    stop it and delete the data
 #
@@ -174,11 +175,16 @@ Flint is up in $(( $(date +%s) - t0 ))s. Connect with any Redis client:
 Worth doing next, in rough order of how much it tells you:
 
     tools/quickstart.sh status     roles, epochs, lag, liveness
-    tools/failover_drill.sh        kill a master, watch the controller promote
+    tools/quickstart.sh failover   kill THIS cluster's master and watch the
+                                   controller promote the replica — a replicated
+                                   witness key proves the data came through
+    tools/failover_drill.sh        the self-contained proof of the same thing,
+                                   plus epoch fencing (own throwaway topology)
     tools/gates.sh                 the whole release gate: checks, conformance,
                                    20 drills, chaos
-    $bins_rel/flintctl -f $inv_rel verify
-                                   reconcile every view of the cluster
+    $bins_rel/flintctl -f $inv_rel verify --probe $TENANT:$TOKEN
+                                   reconcile every view of the cluster, with a
+                                   live write/read through the data plane
 
     tools/quickstart.sh down       stop it, keep the data
     tools/quickstart.sh purge      stop it and delete the data
@@ -188,8 +194,111 @@ For a deployment you intend to keep, docs/self-hosting.md.
 EOF
 }
 
+# The wow moment: SIGKILL this cluster's own master and watch the controller
+# do its job, with a witness key proving no acked write was lost. Distinct
+# from tools/failover_drill.sh, which proves the epoch-fencing machinery on a
+# throwaway topology of its own — this one acts on the cluster you are looking
+# at, which is what "kill the master" naturally reads as.
+failover() {
+  [ -f "$INV" ] || die "nothing here yet — run tools/quickstart.sh"
+  local out mport rport pidfile
+  out=$("$BINS/flintctl" -f "$INV" status)
+  # status prints:  pair 0    127.0.0.1:7001  master  ...
+  # No `exit` in these awk programs: quitting early closes the pipe while
+  # flintctl is still printing, and its stdout EPIPE panic (exit 101) then
+  # reads as a flintctl failure. Read everything, print once.
+  mport=$(echo "$out" | awk '!done && $1=="pair" && $4=="master" {split($3,a,":"); print a[2]; done=1}')
+  [ -n "$mport" ] || die "no master found — is the cluster up?
+      tools/quickstart.sh status"
+  rport=$R_PORT; [ "$mport" = "$R_PORT" ] && rport=$M_PORT
+  pidfile="$QS/state/pids/node-$mport.pid"
+  [ -f "$pidfile" ] || die "no pidfile at $pidfile — was this cluster started by quickstart?"
+
+  if [ -n "$CLI" ]; then
+    # Retry THROTTLED for a while: right after a previous failover the
+    # rejoining replica is still reseeding, min-replicas is unmet, and the
+    # proxy correctly refuses writes until the pair is whole again.
+    local reply=""
+    for i in $(seq 1 120); do
+      reply=$("$CLI" -p $PX_PORT -a "$TOKEN" --no-auth-warning SET witness "written before the kill" 2>&1 | tr -d '\r')
+      [ "$reply" = "OK" ] && break
+      case "$reply" in THROTTLED*) sleep 0.5 ;; *) break ;; esac
+    done
+    [ "$reply" = "OK" ] || die "could not write the witness key through the proxy (got '$reply') —
+      fix that before killing anything. tools/quickstart.sh status"
+    # Wait until the replica HAS the write. Replication is async with a bounded
+    # loss window, so a write acked only by the master may legitimately die
+    # with it — the first run of this script did exactly that. seq_lag 0 means
+    # the replica is caught up, and from there survival is the contract.
+    local lag=""
+    for i in $(seq 1 40); do
+      lag=$("$BINS/flintctl" -f "$INV" status 2>/dev/null \
+        | awk '!done && $1=="pair" && $4=="master" {for(j=1;j<NF;j++) if($j=="seq_lag") print $(j+1); done=1}')
+      [ "$lag" = "0" ] && break
+      sleep 0.25
+    done
+    [ "$lag" = "0" ] || die "the replica never caught up (seq_lag $lag) — not killing a master
+      whose replica is behind. tools/quickstart.sh status"
+    echo "wrote witness key through the proxy, and the replica has it (seq_lag 0)"
+  fi
+
+  say "killing the master 127.0.0.1:$mport — SIGKILL, no goodbye"
+  # Trust the pidfile only after checking it names a live flint-server: a
+  # stale pidfile would make this drill "kill" a corpse and then report the
+  # controller broken when nothing ever died.
+  local pid
+  pid=$(cat "$pidfile" 2>/dev/null || true)
+  if [ -z "$pid" ] || ! ps -p "$pid" -o comm= 2>/dev/null | grep -q flint-server; then
+    command -v lsof >/dev/null 2>&1 \
+      && pid=$(lsof -ti "tcp:$mport" -s tcp:LISTEN 2>/dev/null | head -1)
+  fi
+  [ -n "$pid" ] || die "could not find the flint-server process on port $mport (stale pidfile, no lsof)"
+  kill -9 "$pid"
+
+  say "watching the controller detect, verify, promote and fence"
+  local t0 promoted="" i
+  t0=$(date +%s)
+  for i in $(seq 1 60); do
+    if "$BINS/flintctl" -f "$INV" status 2>/dev/null \
+        | awk -v a="127.0.0.1:$rport" '$1=="pair" && $3==a && $4=="master" {found=1} END {exit !found}'; then
+      promoted=1; break
+    fi
+    sleep 0.5
+  done
+  [ -n "$promoted" ] || die "127.0.0.1:$rport was not promoted within 30s.
+      $QS/state/logs/controller.log is where the controller explains itself"
+  echo "  127.0.0.1:$rport is master, ~$(( $(date +%s) - t0 ))s after the kill"
+
+  if [ -n "$CLI" ]; then
+    local got
+    got=$("$CLI" -p $PX_PORT -a "$TOKEN" --no-auth-warning GET witness 2>/dev/null | tr -d '\r')
+    [ "$got" = "written before the kill" ] \
+      || die "witness key read back '$got' after the failover — that is a real problem, report it"
+    echo "  witness key survived: the acked write is still there"
+  fi
+
+  say "restarting the killed node — it rejoins as the replica of the new master"
+  "$BINS/flintctl" -f "$INV" start >/dev/null
+  local rejoined=""
+  for i in $(seq 1 60); do
+    if "$BINS/flintctl" -f "$INV" status 2>/dev/null \
+        | awk -v a="127.0.0.1:$mport" '$1=="pair" && $3==a && $4=="replica" {found=1} END {exit !found}'; then
+      rejoined=1; break
+    fi
+    sleep 0.5
+  done
+  [ -n "$rejoined" ] || die "the ex-master did not come back as a replica within 30s.
+      tools/quickstart.sh status, and $QS/state/logs/"
+
+  echo
+  "$BINS/flintctl" -f "$INV" status
+  echo
+  echo "Roles are now swapped. Run it again to fail back."
+}
+
 case "$CMD" in
   up)     up ;;
+  failover) failover ;;
   status) [ -f "$INV" ] || die "nothing here yet — run tools/quickstart.sh"
           "$BINS/flintctl" -f "$INV" status ;;
   down)   [ -f "$INV" ] || die "nothing here yet — run tools/quickstart.sh"
@@ -198,5 +307,5 @@ case "$CMD" in
   purge)  if [ -f "$INV" ]; then "$BINS/flintctl" -f "$INV" stop 2>/dev/null || true; fi
           rm -rf "$QS"
           echo "purged $QS" ;;
-  *)      die "usage: tools/quickstart.sh [up|status|down|purge]" ;;
+  *)      die "usage: tools/quickstart.sh [up|status|failover|down|purge]" ;;
 esac

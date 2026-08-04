@@ -954,9 +954,27 @@ fn pids_matching(bin: &str, ident: &str) -> Vec<u32> {
     let Ok(out) = Command::new("ps").args(["-eo", "pid=,args="]).output() else {
         return Vec::new();
     };
+    pids_in_ps(&String::from_utf8_lossy(&out.stdout), bin, ident)
+}
+
+/// Is this seat's process running on its host? Same exact-token discipline as
+/// `pids_matching`, but usable through a Runner: the ps listing is taken ON
+/// the seat's host and parsed here, so there is one parser and two
+/// transports — no new host-* verb for an old remote flintctl to lack.
+fn seat_alive(r: &Runner, bin: &str, ident: &str) -> bool {
+    if r.is_remote() {
+        let Ok(out) = r.output(&["ps".to_string(), "-eo".into(), "pid=,args=".into()]) else {
+            return false;
+        };
+        return !pids_in_ps(&String::from_utf8_lossy(&out.stdout), bin, ident).is_empty();
+    }
+    !pids_matching(bin, ident).is_empty()
+}
+
+fn pids_in_ps(ps: &str, bin: &str, ident: &str) -> Vec<u32> {
     let me = std::process::id();
     let mut hits = Vec::new();
-    for line in String::from_utf8_lossy(&out.stdout).lines() {
+    for line in ps.lines() {
         let Some((pid, args)) = line.trim().split_once(char::is_whitespace) else {
             continue;
         };
@@ -1714,8 +1732,42 @@ fn proxy_up(inv: &Inventory, i: usize) -> bool {
 fn start_pair_nodes(inv: &Inventory, pair: &[String]) {
     let d = &inv.statedir;
     let cp = &inv.cp[0];
+    let tls = tls_client(inv);
+    // The fleet's OWN view of who is master outranks inventory order. After a
+    // failover the promoted node is the file's pair[1]; starting the dead
+    // pair[0] bare would boot an ex-master claiming the lineage — the
+    // controller fences it (no split-brain), but the pair then sits degraded
+    // forever: a fenced replica that never resyncs, writes THROTTLED below
+    // min-replicas. So ask the live members first, and only fall back to
+    // inventory order when nobody is up (a cold start of the whole pair).
+    let roles: Vec<Option<String>> = pair.iter().map(|a| info_field(a, &tls, "role:")).collect();
+    let live_master = pair
+        .iter()
+        .zip(&roles)
+        .find(|(_, r)| r.as_deref() == Some("master"))
+        .map(|(a, _)| a.clone());
     for (i, addr) in pair.iter().enumerate() {
         let port = port_of(addr);
+        // A live seat keeps its process; respawning it would lose the port
+        // race AND overwrite its pidfile with the corpse's pid, so every
+        // later stop/kill through that pidfile would aim at nothing.
+        if let Some(role) = &roles[i] {
+            eprintln!("  node-{port} already up ({role})");
+            continue;
+        }
+        let replica_of = match &live_master {
+            // Dead seat rejoining a live lineage: same contract as roll_node —
+            // its replication cursor may be an ex-master's and its suffix may
+            // have diverged, so it resyncs fresh from a checkpoint.
+            Some(m) => {
+                if let Err(e) = wipe_node(inv, &runner_for(inv, addr), port) {
+                    die(&format!("wiping node-{port} before rejoin: {e}"));
+                }
+                Some(m.clone())
+            }
+            None if i > 0 => Some(pair[0].clone()),
+            None => None,
+        };
         let mut args = vec![
             "--port".to_string(),
             port.to_string(),
@@ -1729,8 +1781,8 @@ fn start_pair_nodes(inv: &Inventory, pair: &[String]) {
             "--journal".into(),
             cp.clone(),
         ];
-        if i > 0 {
-            args.extend(["--replica-of".into(), pair[0].clone()]);
+        if let Some(m) = replica_of {
+            args.extend(["--replica-of".into(), m]);
         }
         args.extend(internal_args(inv));
         args.extend(node_tuning_args(inv, pair.len() > 1));
@@ -1742,7 +1794,7 @@ fn start_pair_nodes(inv: &Inventory, pair: &[String]) {
             &args,
         );
         // The master must be up before its replicas dial in.
-        if i == 0 {
+        if i == 0 && live_master.is_none() {
             std::thread::sleep(Duration::from_millis(700));
         }
     }
@@ -2038,6 +2090,13 @@ fn launch(inv: &Inventory, register: bool) {
 
     // 1. Control plane — every seat (one for the single-node CP, three for
     // Raft), then the registry (proxies + pairs).
+    // Every role below spawns ONLY if its seat is not already serving. On a
+    // partially-live fleet (a start right after a failover, a boot unit
+    // re-running) the respawned duplicate loses the port race and dies — but
+    // not before overwriting the live seat's pidfile with its own pid, after
+    // which every stop/kill through that pidfile aims at a corpse. The
+    // controller is worse: it has no port to lose, so the duplicate LIVES,
+    // and the pair gets two supervisors.
     for i in 0..inv.cp.len() {
         let seat = &inv.cp[i];
         let name = if inv.cp.len() == 1 {
@@ -2045,6 +2104,10 @@ fn launch(inv: &Inventory, register: bool) {
         } else {
             format!("cp-n{}", i + 1)
         };
+        if matches!(call(seat, &tls, &["PING"]), Ok(Value::Simple(s)) if s == "PONG") {
+            eprintln!("  {name} already up");
+            continue;
+        }
         spawn(
             inv,
             &runner_for(inv, seat),
@@ -2120,6 +2183,10 @@ fn launch(inv: &Inventory, register: bool) {
         // reports of itself (subset identity): the proxy-advertise line
         // when declared, else the bind line — must match what bootstrap
         // registered.
+        if proxy_up(inv, i) {
+            eprintln!("  proxy-{} already up", port_of(proxy));
+            continue;
+        }
         spawn(
             inv,
             &proxy_runner(inv, i),
@@ -2149,24 +2216,44 @@ fn launch(inv: &Inventory, register: bool) {
 
     // 4. Supervision + observability.
     let ctl_since = now_ms();
+    let mut ctl_started = false;
     if inv.controller {
-        start_controller(inv);
+        if seat_alive(
+            &controller_runner(inv),
+            "flint-controller",
+            &format!("{d}/snaps"),
+        ) {
+            eprintln!("  controller already up");
+        } else {
+            start_controller(inv);
+            ctl_started = true;
+        }
     }
     // Optional fleet-agent add-on: the `agent <addr>` inventory key starts
     // a flint-agent binary if one sits in the bins dir. The agent (fleet
     // metering/insights/automation) is not part of this repository; without
     // the binary the key simply has nothing to start.
     if inv.agent.is_some() {
-        spawn(
-            inv,
+        if seat_alive(
             &agent_runner(inv),
-            "agent",
             "flint-agent",
-            &agent_args(inv).expect("agent args"),
-        );
+            &format!("{d}/shadow.jsonl"),
+        ) {
+            eprintln!("  agent already up");
+        } else {
+            spawn(
+                inv,
+                &agent_runner(inv),
+                "agent",
+                "flint-agent",
+                &agent_args(inv).expect("agent args"),
+            );
+        }
     }
 
-    if inv.controller {
+    // Only a controller started HERE emits fresh Supervised events; waiting
+    // on one that was already up would time out into a spurious warning.
+    if ctl_started {
         wait_supervised(inv, inv.pairs.len(), ctl_since);
     }
     eprintln!(
@@ -2550,7 +2637,19 @@ fn status(inv: &Inventory) {
                     let lag = info_field(addr, &tls, "seq_lag:").unwrap_or_default();
                     let live = info_field(addr, &tls, "live_replicas:").unwrap_or_default();
                     let epoch = info_field(addr, &tls, "role_epoch:").unwrap_or_default();
+                    // A from-source build reports its crate version, which
+                    // reads like a real (if oddly old) release to someone who
+                    // just cloned a tagged repo. Name what it is instead; the
+                    // dev-channel stamp (0.0.0-dev+<sha>) already names itself.
                     let build = info_field(addr, &tls, "build:").unwrap_or_default();
+                    let build = if build.is_empty()
+                        || build.contains("dev")
+                        || flint_build::is_release(&build)
+                    {
+                        build
+                    } else {
+                        "unstamped".to_string()
+                    };
                     println!(
                         "pair {i}    {addr}  {role:<7} epoch {epoch:<7} build {build:<10} seq_lag {lag:<5} live_replicas {live}"
                     );
