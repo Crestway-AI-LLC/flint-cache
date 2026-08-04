@@ -67,9 +67,52 @@ pub fn is_release(v: &str) -> bool {
             .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
 }
 
+/// How a reported build string should be SHOWN to an operator.
+///
+/// Exactly ONE value is rewritten: the crate-version fallback that a
+/// from-source build reports when nothing stamped it. `0.0.1` reads like a
+/// real (if oddly old) release to someone who has just cloned a tagged
+/// repository, and saying `unstamped` is the difference between a version
+/// and an admission that there isn't one.
+///
+/// Everything else passes through VERBATIM, and that is the load-bearing
+/// half. The first version of this rewrote anything that was not a release
+/// tag, which swallowed `upgrade --version-tag v2` into "unstamped" — so the
+/// status column an operator reads to confirm a roll actually took could no
+/// longer tell two builds apart, and it disagreed with the build label the
+/// exporter publishes for the same node. A display rule that hides the fact
+/// it is displaying is worse than the confusion it set out to fix.
+pub fn display<'a>(reported: &'a str, crate_version: &str) -> &'a str {
+    if reported == crate_version {
+        "unstamped"
+    } else {
+        reported
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_crate_fallback_admits_it_is_not_a_version() {
+        assert_eq!(display("0.0.1", "0.0.1"), "unstamped");
+    }
+
+    /// The regression that shipped in rc.29 and was caught by the fleet
+    /// repo's canary drill: an operator-chosen build number is not a release
+    /// tag, and hiding it breaks the one column that confirms an upgrade.
+    #[test]
+    fn an_operator_chosen_build_number_survives_display() {
+        for v in ["v2", "build-1234", "2026-08-04.3", "v0.1.0-rc.29"] {
+            assert_eq!(display(v, "0.0.1"), v, "{v} must be shown as itself");
+        }
+    }
+
+    #[test]
+    fn the_dev_channel_stamp_already_names_itself() {
+        assert_eq!(display("0.0.0-dev+117cd15", "0.0.1"), "0.0.0-dev+117cd15");
+    }
 
     #[test]
     fn a_baked_tag_outranks_whatever_the_launcher_says() {

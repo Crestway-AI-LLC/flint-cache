@@ -2637,19 +2637,8 @@ fn status(inv: &Inventory) {
                     let lag = info_field(addr, &tls, "seq_lag:").unwrap_or_default();
                     let live = info_field(addr, &tls, "live_replicas:").unwrap_or_default();
                     let epoch = info_field(addr, &tls, "role_epoch:").unwrap_or_default();
-                    // A from-source build reports its crate version, which
-                    // reads like a real (if oddly old) release to someone who
-                    // just cloned a tagged repo. Name what it is instead; the
-                    // dev-channel stamp (0.0.0-dev+<sha>) already names itself.
-                    let build = info_field(addr, &tls, "build:").unwrap_or_default();
-                    let build = if build.is_empty()
-                        || build.contains("dev")
-                        || flint_build::is_release(&build)
-                    {
-                        build
-                    } else {
-                        "unstamped".to_string()
-                    };
+                    let reported = info_field(addr, &tls, "build:").unwrap_or_default();
+                    let build = flint_build::display(&reported, env!("CARGO_PKG_VERSION"));
                     println!(
                         "pair {i}    {addr}  {role:<7} epoch {epoch:<7} build {build:<10} seq_lag {lag:<5} live_replicas {live}"
                     );
