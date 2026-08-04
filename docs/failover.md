@@ -137,6 +137,34 @@ bounds age. Wording that promised "at most N seconds of acked writes"
 described a guarantee no code here provides, and has been corrected to
 the volume form above.
 
+**And the volume half was measured too**, because a claim that rests on
+"past the cap the master stops accepting" is worth nothing if the cap
+never actually bites. Same stall, same seed, only the cap changed:
+
+| stall | lag cap | writes shed `-THROTTLED` | deepest acked-write loss |
+|---|---|---|---|
+| 1800 ms | 1000 ms | 75 | 1757 ms |
+| 1800 ms | **200 ms** | **140** | 1753 ms |
+
+Both halves of the statement are visible in those two rows. Tightening the
+cap fivefold nearly doubled the shedding — the master really does stop
+adding to the pile, and sooner — while the age of the oldest lost write
+did not move, because it is set by how long replication was stalled and
+not by the cap. A reader who takes only one thing from this section should
+take that: **the cap is a valve on what is still arriving, never a rescue
+for what was already acked.**
+
+Reproduce with:
+
+```sh
+flint-chaos --iterations 6 --keys 300 --seed 5 --mode mixed \
+  --stall-replica-ms 1800 --lag-hard-ms 200
+```
+
+`--stall-replica-ms` uses SIGSTOP on the replica process, so it works only
+against a local cluster; the multi-host runner cannot exercise this path
+and says so rather than reporting a quiet pass.
+
 ## Planned failover
 
 `flintctl failover <node>` (also the last phase of `flintctl upgrade`,
