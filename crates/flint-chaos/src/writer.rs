@@ -245,12 +245,17 @@ pub fn run(shared: &Shared, seed: u64) {
             entry.last_written = seq;
         }
 
+        // Stamped BEFORE the call. A request already in flight when a master
+        // dies can still be acked by it, and the reply is read after the kill
+        // instant — so the ack time alone cannot say which master served it.
+        // See KeyLedger::acked_at.
+        let sent = now_ms();
         match c.call(&[b"SET", key.as_bytes(), value.as_bytes()]) {
             Ok(Value::Simple(s)) if s == "OK" => {
                 let at = now_ms();
                 {
                     let mut led = shared.ledger.lock().unwrap_or_else(|e| e.into_inner());
-                    led.entry(key).or_default().record_ack(seq, at);
+                    led.entry(key).or_default().record_ack(seq, sent, at);
                 }
                 let kill = shared.kill_ms.load(Ordering::SeqCst);
                 // Stall accounting, for the client path. Measured on every

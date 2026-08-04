@@ -51,14 +51,29 @@ pub struct KeyLedger {
     pub written: Vec<u64>,
     pub last_acked: u64,
     pub last_written: u64,
-    /// (seq, ack wall-clock ms), ascending by seq.
-    pub acked_at: Vec<(u64, u64)>,
+    /// `(seq, SENT wall-clock ms, ACKED wall-clock ms)`, ascending by seq.
+    ///
+    /// Both times are kept because they answer different questions and
+    /// conflating them caused a false data-loss verdict (#130):
+    ///
+    /// * **Which master could have served this?** — the SEND time. A request
+    ///   already in flight when a master is killed may be acked by that dying
+    ///   master, and the reply is read *after* the kill instant. Judging by
+    ///   ack time therefore files it under "acked after the kill, so it
+    ///   belongs to the new master", the ledger keeps claiming a value the
+    ///   survivor never had, and the next REPLICA kill — which is allowed no
+    ///   loss at all — reports data loss for a write the MASTER kill lost
+    ///   legitimately, inside the async window.
+    /// * **Was the durability promise honoured?** — the ACK time. That is
+    ///   when the client was told the write was safe, which is what the RPO
+    ///   bound is a claim about.
+    pub acked_at: Vec<(u64, u64, u64)>,
 }
 
 impl KeyLedger {
-    pub fn record_ack(&mut self, seq: u64, at_ms: u64) {
+    pub fn record_ack(&mut self, seq: u64, sent_ms: u64, acked_ms: u64) {
         self.last_acked = seq;
-        self.acked_at.push((seq, at_ms));
+        self.acked_at.push((seq, sent_ms, acked_ms));
     }
 
     /// Acked writes that did NOT survive a promotion and were acked at or
@@ -72,8 +87,8 @@ impl KeyLedger {
     pub fn breaches(&self, got: u64, must_have_replicated_by_ms: u64) -> Vec<(u64, u64)> {
         self.acked_at
             .iter()
-            .filter(|&&(seq, at)| seq > got && at <= must_have_replicated_by_ms)
-            .copied()
+            .filter(|&&(seq, _sent, acked)| seq > got && acked <= must_have_replicated_by_ms)
+            .map(|&(seq, _sent, acked)| (seq, acked))
             .collect()
     }
 
@@ -82,8 +97,8 @@ impl KeyLedger {
     pub fn newest_lost_ack_ms(&self, got: u64) -> Option<u64> {
         self.acked_at
             .iter()
-            .filter(|&&(seq, _)| seq > got)
-            .map(|&(_, at)| at)
+            .filter(|&&(seq, _sent, _acked)| seq > got)
+            .map(|&(_, _sent, acked)| acked)
             .max()
     }
 }

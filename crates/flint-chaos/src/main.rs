@@ -350,7 +350,7 @@ fn main() {
             // only what was recorded at snapshot time.
             struct KeySnap {
                 key: String,
-                acked_at: Vec<(u64, u64)>,
+                acked_at: Vec<(u64, u64, u64)>,
                 last_acked: u64,
             }
             let snapshot: Vec<KeySnap> = {
@@ -420,7 +420,7 @@ fn main() {
                 // injector, not a finding. The real condition is a write lost
                 // in the failover that nothing rewrote afterwards.
                 let inject_now =
-                    injected < inject_unreadable && acked_at.iter().all(|&(_, at)| at < kill_ms);
+                    injected < inject_unreadable && acked_at.iter().all(|&(_, _, at)| at < kill_ms);
                 if inject_now {
                     injected += 1;
                     let _ = c.call(&[b"DEL", key.as_bytes()]);
@@ -453,9 +453,9 @@ fn main() {
                     unverifiable += 1;
                     let mut led = shared.ledger.lock().unwrap_or_else(|e| e.into_inner());
                     if let Some(entry) = led.get_mut(key) {
-                        entry.acked_at.retain(|&(_, at)| at >= kill_ms);
+                        entry.acked_at.retain(|&(_, sent, _)| sent >= kill_ms);
                         entry.last_acked =
-                            entry.acked_at.iter().map(|&(s, _)| s).max().unwrap_or(0);
+                            entry.acked_at.iter().map(|&(s, _, _)| s).max().unwrap_or(0);
                     }
                     continue;
                 };
@@ -481,7 +481,7 @@ fn main() {
                 // writes (about one cap-window's worth), not on their age.
                 // Until the claim and the mechanism are reconciled the
                 // assertion stays as-is, because it is the published promise.
-                for &(seq, at) in acked_at {
+                for &(seq, _sent, at) in acked_at {
                     // The writer may have re-acked this key AFTER the kill;
                     // those acks belong to the new master and say nothing
                     // about what the old one lost.
@@ -534,8 +534,10 @@ fn main() {
                 // master and are not this failover's business.
                 let mut led = shared.ledger.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(entry) = led.get_mut(key) {
-                    entry.acked_at.retain(|&(s, at)| s <= got || at >= kill_ms);
-                    entry.last_acked = entry.acked_at.iter().map(|&(s, _)| s).max().unwrap_or(0);
+                    entry
+                        .acked_at
+                        .retain(|&(s, sent, _)| s <= got || sent >= kill_ms);
+                    entry.last_acked = entry.acked_at.iter().map(|&(s, _, _)| s).max().unwrap_or(0);
                 }
             }
             acked_lost_total += lost_here;
