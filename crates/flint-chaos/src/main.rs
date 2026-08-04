@@ -176,6 +176,29 @@ fn main() {
         .collect();
 
     let mut rng = SmallRng::seed_from_u64(seed);
+
+    // COVERAGE FIRST, then randomness.
+    //
+    // Picking uniformly at random every iteration leaves a real chance that a
+    // short run never touches one of the pairs: with 2 pairs and 6 kills that
+    // is (1/2)^6 on each side, about 3% of runs. attached_chaos_drill.sh then
+    // reports "no kill ever landed on pair 0 / the harness is single-pair
+    // again" — which is precisely the regression that assertion exists to
+    // catch (the 7-host runs once reported "16 cross-host kills" while every
+    // one hit pair 0). A check that cries wolf on its own headline finding is
+    // worse than no check, because it teaches you to wave the real one
+    // through.
+    //
+    // So deal every pair exactly once, in a shuffled order, before any pair
+    // takes a second kill. Which pair goes first, master versus replica, and
+    // all the timing stay random — only the coverage becomes certain. Note
+    // this changes the sequence a given --seed produces, so seeds recorded
+    // before this change no longer replay to the same run.
+    let mut deal: Vec<usize> = (0..targets.len()).collect();
+    for i in (1..deal.len()).rev() {
+        deal.swap(i, rng.random_range(0..=i));
+    }
+
     let mut acked_lost_total = 0u64;
     let mut rtos: Vec<u64> = Vec::new();
     let mut deepest_loss_ms: u64 = 0;
@@ -191,7 +214,13 @@ fn main() {
 
         // Which pair takes this kill. Every pair's writer keeps hammering
         // regardless; only the chosen pair's ledger is judged afterwards.
-        let pair_idx = rng.random_range(0..targets.len());
+        // The first pass walks `deal` so every pair is hit once; after that it
+        // is uniform again.
+        let pair_idx = if (iteration as usize) <= deal.len() {
+            deal[iteration as usize - 1]
+        } else {
+            rng.random_range(0..targets.len())
+        };
         let cluster = &mut targets[pair_idx];
         let shared = &shareds[pair_idx];
 
