@@ -15,3 +15,9 @@ Cargo.lock.orig
 
 # tools/quickstart.sh — a throwaway laptop cluster's state, logs and inventory
 /.flint-quickstart/
+
+# Private keys, all of them. minisign.pub is committed on purpose; its secret
+# half never is, nor is any CA or leaf key a drill happens to mint in the tree.
+# Belt and braces, so a keypair generated here by accident cannot be staged.
+# See docs/release-signing.md.
+*.key
