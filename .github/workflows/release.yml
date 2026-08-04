@@ -137,9 +137,61 @@ jobs:
     if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     steps:
+      # Checkout FIRST and into a subdirectory. actions/checkout cleans its
+      # working directory, so running it after download-artifact would delete
+      # the very bundle we are about to publish.
+      - uses: actions/checkout@v4
+        with:
+          path: repo
       - uses: actions/download-artifact@v4
         with:
           name: release-artifacts
+
+      - name: Sign the bundle and the manifest (minisign)
+        env:
+          MINISIGN_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+        # WHY, in one line: the sha256 in manifest.json proves the tarball
+        # matches THAT MANIFEST, and anyone who can swap the tarball can swap
+        # the manifest beside it. A signature proves the bytes came from this
+        # pipeline no matter which mirror, CDN or USB stick delivered them.
+        #
+        # FAIL CLOSED. If the key or the published public key is missing this
+        # stops the release rather than shipping unsigned artifacts quietly —
+        # an unsigned release that looks like every other release is worse
+        # than a failed one, because nobody finds out until they need it.
+        run: |
+          set -euo pipefail
+          trap 'rm -f sk.key' EXIT
+          if [ ! -f repo/minisign.pub ]; then
+            echo "no repo/minisign.pub — the release signing key has not been set up."
+            echo "See docs/release-signing.md for the two commands that create it."
+            exit 1
+          fi
+          if [ -z "${MINISIGN_KEY:-}" ]; then
+            echo "secret MINISIGN_SECRET_KEY is not set on this repository."
+            echo "See docs/release-signing.md."
+            exit 1
+          fi
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends minisign
+          printf '%s\n' "$MINISIGN_KEY" > sk.key
+          chmod 600 sk.key
+          BUNDLE=$(ls flint-*.tar.gz)
+          for f in "$BUNDLE" manifest.json; do
+            # -t is the TRUSTED comment: it is covered by the signature, so it
+            # cannot be edited after the fact the way the untrusted one can.
+            minisign -S -s sk.key -m "$f" -t "flint ${GITHUB_REF_NAME} — $f"
+          done
+          # Verify against the key we PUBLISH, not merely the one we hold. If
+          # the CI secret ever drifts from the committed public key, every
+          # signature would be unverifiable by users and nothing else would
+          # notice. This is the assert that makes the signing meaningful.
+          PUB=$(tail -1 repo/minisign.pub)
+          for f in "$BUNDLE" manifest.json; do
+            minisign -V -P "$PUB" -m "$f"
+          done
+          echo "signed and verified against the published key: $BUNDLE, manifest.json"
+
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -157,14 +209,24 @@ jobs:
           (RHEL 8 and friends, glibc 2.28) build from source instead; the README
           lists what that needs.
 
-          **Install**
+          **Verify before you unpack.** The signature is what proves these
+          bytes came from the Flint release pipeline — a checksum alone only
+          proves the tarball matches the manifest shipped beside it, and
+          whoever can replace one can replace the other.
 
-              tar xzf flint-${V}-linux-x86_64.tar.gz -C /opt/flint/bin
+              minisign -Vm flint-${V}-linux-x86_64.tar.gz \\
+                -P \$(tail -1 minisign.pub)
 
-          Verify it first against the checksum in \`manifest.json\`:
+          \`minisign.pub\` lives in the repository root, so you can pin it once
+          out of band and check every future release against it. The checksum
+          is still there if you want it:
 
               sha256sum flint-${V}-linux-x86_64.tar.gz
               jq -r .sha256 manifest.json
+
+          **Install**
+
+              tar xzf flint-${V}-linux-x86_64.tar.gz -C /opt/flint/bin
 
           Point your inventory's \`bins\` at that directory. These binaries carry
           the release stamp, so \`flintctl\` will operate a real fleet with them —
@@ -178,8 +240,13 @@ jobs:
           That rolls a canary replica first, soaks it, then the remaining
           replicas, and the masters last.
           NOTES
+          # minisign.pub ships WITH the release as well as living in the repo:
+          # someone who only ever sees the assets can still pin the key, and
+          # the two copies being identical is checkable.
           gh release create "$V" \
-            flint-*.tar.gz manifest.json \
+            flint-*.tar.gz flint-*.tar.gz.minisig \
+            manifest.json manifest.json.minisig \
+            repo/minisign.pub \
             --repo "${GITHUB_REPOSITORY}" \
             --title "Flint $V" \
             --notes-file notes.md

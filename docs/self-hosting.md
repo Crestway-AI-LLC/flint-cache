@@ -49,9 +49,14 @@ read-only ones (`status`, `verify`). Three ways to satisfy it:
   `bins` points at:
 
   ```sh
+  # Verify FIRST — the signature is what proves these bytes are ours.
+  minisign -Vm flint-<version>-linux-x86_64.tar.gz -P "$(tail -1 minisign.pub)"
   tar xzf flint-<version>-linux-x86_64.tar.gz -C /opt/flint/bin
-  sha256sum flint-<version>-linux-x86_64.tar.gz   # compare with manifest.json
   ```
+
+  Pin `minisign.pub` once, out of band, and check every later release against
+  your pinned copy — [release-signing.md](release-signing.md) explains why the
+  sha256 in `manifest.json` is not a substitute.
 
   Built on Amazon Linux 2023, so glibc 2.34 — fine on RHEL 9, AL2023, Ubuntu
   22.04 and newer; older hosts should build from source.
