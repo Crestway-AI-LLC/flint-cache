@@ -4,6 +4,10 @@ Every published release is signed with [minisign](https://jedisct1.github.io/min
 The public key is [`minisign.pub`](../minisign.pub) in the repository root and
 is also attached to each release.
 
+**Key ID `6A8EB70496EA74A1`** — in use since v0.1.0-rc.28. Quote this when
+confirming the key through a second channel; a key fetched from the same place
+as the artifact proves nothing about the artifact.
+
 ## Verifying a release
 
 ```sh
