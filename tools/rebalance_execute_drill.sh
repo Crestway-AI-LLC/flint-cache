@@ -108,9 +108,25 @@ echo "  fills after: g0=$N0 g1=$N1 g2=$N2 (executes: $(grep -c "rebalance EXECUT
 # Say WHICH half of "settled" never arrived — a conservation failure that
 # persists is a product bug, and must not be reported as "did not balance".
 [ "$BALANCED" = "1" ] || {
+  MOVES=$(grep -c "MIGRATEIN-OK" /tmp/flint-rbx.log)
+  EXECS=$(grep -c "rebalance EXECUTE" /tmp/flint-rbx.log)
   if [ $((N0+N1+N2)) -ne "$TOTAL" ]; then
-    echo "FAIL: keys not conserved after 120s: $TOTAL -> $((N0+N1+N2))"
-    echo "      a migration that never completed its cutover, or duplicated rows"
+    # An INFLATED sum with a migration still running is the mid-move window,
+    # not invented data: a slot copies to the destination and only then drops
+    # from the source, so both count it. Saying "duplicated rows" there
+    # accuses the product of the one thing this drill exists to disprove,
+    # when what actually happened is that a loaded box did not finish inside
+    # 120s. Distinguish, and only cry duplication when nothing is in flight.
+    if [ $((N0+N1+N2)) -gt "$TOTAL" ] && [ "$EXECS" -gt 0 ] && [ "$MOVES" -lt "$EXECS" ]; then
+      echo "FAIL: did not settle within 120s — a slot move was STILL IN FLIGHT"
+      echo "      ($EXECS execute(s), $MOVES completed; sum $TOTAL -> $((N0+N1+N2)) is the"
+      echo "      mid-move double count, not duplicated rows). On a loaded box this is a"
+      echo "      timeout; re-run on a quiet one before reading it as a product fault."
+    else
+      echo "FAIL: keys not conserved after 120s: $TOTAL -> $((N0+N1+N2))"
+      echo "      a migration that never completed its cutover, or duplicated rows"
+      echo "      ($EXECS execute(s), $MOVES completed)"
+    fi
   else
     echo "FAIL: did not converge to balance"
   fi

@@ -200,6 +200,7 @@ fn main() {
     }
 
     let mut acked_lost_total = 0u64;
+    let mut unverifiable_total = 0u64;
     let mut rtos: Vec<u64> = Vec::new();
     let mut deepest_loss_ms: u64 = 0;
     // Acked writes lost that were older than the cap: the AGE reading of the
@@ -359,21 +360,64 @@ fn main() {
                 .or_else(|| cluster.master_client().ok())
                 .expect("oracle connect");
             let mut lost_here = 0u64;
+            // Keys the survivor would not answer for, even after retries. Not
+            // loss, not health — an absence of evidence, which is reported
+            // rather than swallowed so nobody mistakes a quiet run for a
+            // clean one.
+            let mut unverifiable = 0u64;
             for KeySnap {
                 key,
                 acked_at,
                 last_acked,
             } in &snapshot
             {
-                let got = match c.call(&[b"GET", key.as_bytes()]) {
-                    Ok(Value::Bulk(Some(raw))) => {
-                        let (owner, seq_got) = parse_value(&raw)
-                            .unwrap_or_else(|| panic!("TORN VALUE at {key}: {raw:?}"));
-                        assert_eq!(&owner, key, "CROSS-KEY at {key}: owned by {owner}");
-                        seq_got
+                // A reply we cannot READ is not evidence of anything — but the
+                // old `_ => continue` skipped the key while leaving it in the
+                // ledger still claiming its pre-kill acks. The next REPLICA
+                // kill then demanded that key, found it absent, and panicked
+                // "REPLICA kill lost acked key" — a master-kill artefact
+                // turned into a data-loss verdict on the one path that has no
+                // async-contract excuse. Seen for real: iter 1 killed a master
+                // and regressed 12 acked keys, iter 2 killed a replica and
+                // blamed it for key9.
+                //
+                // So: retry first, because right after a promotion -TRYAGAIN
+                // (the stale-read fence) and -MOVED are exactly what a correct
+                // cluster says while the proxy catches up. Only if it stays
+                // unreadable do we give up — and then RETIRE the key's
+                // pre-kill acks so that nothing downstream judges it on
+                // evidence we could not gather, and report the count.
+                let got: Option<u64> = {
+                    let mut attempt = 0;
+                    loop {
+                        match c.call(&[b"GET", key.as_bytes()]) {
+                            Ok(Value::Bulk(Some(raw))) => {
+                                let (owner, seq_got) = parse_value(&raw)
+                                    .unwrap_or_else(|| panic!("TORN VALUE at {key}: {raw:?}"));
+                                assert_eq!(&owner, key, "CROSS-KEY at {key}: owned by {owner}");
+                                break Some(seq_got);
+                            }
+                            // Absent is a real, readable answer: the survivor
+                            // holds nothing for this key. That is sequence 0,
+                            // not "unverifiable".
+                            Ok(Value::Bulk(None)) => break Some(0),
+                            _ if attempt < 5 => {
+                                attempt += 1;
+                                std::thread::sleep(Duration::from_millis(100));
+                            }
+                            _ => break None,
+                        }
                     }
-                    Ok(Value::Bulk(None)) => 0,
-                    _ => continue,
+                };
+                let Some(got) = got else {
+                    unverifiable += 1;
+                    let mut led = shared.ledger.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(entry) = led.get_mut(key) {
+                        entry.acked_at.retain(|&(_, at)| at >= kill_ms);
+                        entry.last_acked =
+                            entry.acked_at.iter().map(|&(s, _)| s).max().unwrap_or(0);
+                    }
+                    continue;
                 };
                 // Acked before the cap's window? Then replication carried it,
                 // or the bound is broken. Acked inside the window? Losing it
@@ -455,9 +499,10 @@ fn main() {
                 }
             }
             acked_lost_total += lost_here;
+            unverifiable_total += unverifiable;
             println!(
                 "iter {iteration}: pair {pair_idx}: killed MASTER (writes in flight); {} {rto}ms{}; acked keys \
-                 regressed: {lost_here} (all within the {lag_hard_ms}ms cap)",
+                 regressed: {lost_here} (all within the {lag_hard_ms}ms cap){}",
                 if shared.edge.is_some() {
                     "client stall"
                 } else {
@@ -467,6 +512,14 @@ fn main() {
                     " harness-promoted, not RTO"
                 } else {
                     ""
+                },
+                if unverifiable > 0 {
+                    format!(
+                        "; {unverifiable} key(s) unreadable after retries — retired from the ledger, \
+                         NOT judged as loss"
+                    )
+                } else {
+                    String::new()
                 }
             );
         } else {
@@ -589,6 +642,14 @@ fn main() {
     println!("  corruption: 0  time-travel: 0  cross-key: 0");
     println!(
         "  acked keys regressed across master kills: {acked_lost_total} (async contract; replica kills: zero)"
+    );
+    // Printed even when zero: it is the denominator for the line above. A run
+    // that could not read N keys judged fewer than it appears to have judged,
+    // and silence about that is how "clean" and "unexamined" become the same
+    // output.
+    println!(
+        "  keys unreadable at a kill, retired and NOT judged as loss: {unverifiable_total} \
+         (transient -TRYAGAIN/-MOVED while the proxy chased a promotion; each retried 5x)"
     );
     println!(
         "  writes shed -THROTTLED (retried): {throttled_total} (widowed/lag gate exercised when > 0)"

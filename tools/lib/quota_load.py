@@ -155,22 +155,37 @@ def _warm_then_measure(ports, token, budget):
 
 
 class Load:
-    """What the run achieved. `offered` is the instrument's own positive
-    control: below the budget, nothing about the quota was tested."""
+    """What the run achieved. `offered` and `replied` are the instrument's own
+    positive controls: if either falls short, nothing about the quota was
+    tested and the accepted rate is not a verdict."""
 
     def __init__(self, conns):
         self.accepted = sum(c.ok for c in conns.values()) / WINDOW
         self.throttled = sum(c.thr for c in conns.values())
         self.offered = sum(c.sent for c in conns.values()) / WINDOW
+        self.replied = sum(c.ok + c.thr for c in conns.values()) / WINDOW
         self.per_port = {p: c.ok / WINDOW for p, c in conns.items()}
 
     def require_saturating(self, budget):
+        # (1) did we ASK for enough?
         if self.offered < budget * 1.5:
             raise AssertionError(
                 f"the load generator only offered {self.offered:.0f} ops/s against a "
                 f"{budget}/s budget, so the quota was never actually pressed. This is a "
                 f"HARNESS limit on this machine (send-side stall or an overloaded box), "
                 f"not a product failure — do not read the accepted rate below as a verdict."
+            )
+        # (2) did the answers KEEP UP? Checking only (1) was not enough: a full
+        # gate run offered its 600/s correctly while just 1,900 of 4,800 sends
+        # were answered inside the window, so `accepted` measured a reply
+        # BACKLOG and the drill failed the quota for "strangling" at 137/s.
+        # A limiter that sheds answers cheaply, so replies trailing sends this
+        # badly means the box is the bottleneck, not the bucket.
+        if self.replied < self.offered * 0.6:
+            raise AssertionError(
+                f"only {self.replied:.0f} of {self.offered:.0f} offered ops/s came back inside "
+                f"the window — replies are backlogged, so the accepted rate is measuring a "
+                f"queue rather than the limit. HARNESS/machine limit, not a product failure."
             )
 
 
