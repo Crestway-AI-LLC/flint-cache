@@ -954,7 +954,12 @@ fn pids_matching(bin: &str, ident: &str) -> Vec<u32> {
     let Ok(out) = Command::new("ps").args(["-eo", "pid=,args="]).output() else {
         return Vec::new();
     };
-    pids_in_ps(&String::from_utf8_lossy(&out.stdout), bin, ident)
+    pids_in_ps(
+        &String::from_utf8_lossy(&out.stdout),
+        bin,
+        ident,
+        Some(std::process::id()),
+    )
 }
 
 /// Is this seat's process running on its host? Same exact-token discipline as
@@ -966,13 +971,16 @@ fn seat_alive(r: &Runner, bin: &str, ident: &str) -> bool {
         let Ok(out) = r.output(&["ps".to_string(), "-eo".into(), "pid=,args=".into()]) else {
             return false;
         };
-        return !pids_in_ps(&String::from_utf8_lossy(&out.stdout), bin, ident).is_empty();
+        // No self-pid to exclude: OUR pid numbers a process on the
+        // orchestrator, and the listing is another machine's. Passing it
+        // would let a remote seat that happens to hold the same number be
+        // read as dead, and `start` would spawn a duplicate beside it.
+        return !pids_in_ps(&String::from_utf8_lossy(&out.stdout), bin, ident, None).is_empty();
     }
     !pids_matching(bin, ident).is_empty()
 }
 
-fn pids_in_ps(ps: &str, bin: &str, ident: &str) -> Vec<u32> {
-    let me = std::process::id();
+fn pids_in_ps(ps: &str, bin: &str, ident: &str, exclude: Option<u32>) -> Vec<u32> {
     let mut hits = Vec::new();
     for line in ps.lines() {
         let Some((pid, args)) = line.trim().split_once(char::is_whitespace) else {
@@ -996,7 +1004,8 @@ fn pids_in_ps(ps: &str, bin: &str, ident: &str) -> Vec<u32> {
         if args.contains("flintctl") {
             continue;
         }
-        if pid != me && args.contains(bin) && args.split_whitespace().any(|t| t == ident) {
+        if Some(pid) != exclude && args.contains(bin) && args.split_whitespace().any(|t| t == ident)
+        {
             hits.push(pid);
         }
     }
