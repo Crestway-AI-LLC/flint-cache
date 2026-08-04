@@ -1626,9 +1626,17 @@ fn resign_leaves(d: &str, sh: &dyn Fn(&str), edge_sans: &[String]) {
         "openssl req -newkey rsa:2048 -nodes -keyout {d}/int.key -out {d}/int.csr \
          -subj /CN=flint-internal 2>/dev/null"
     ));
+    // -CAserial is EXPLICIT, not left to -CAcreateserial's default. The default
+    // is meant to be the CA path with .crt swapped for .srl, but LibreSSL (what
+    // /usr/bin/openssl is on macOS) drops the directory and writes `.srl` into
+    // the CURRENT DIRECTORY instead. Every bootstrap — every drill, every
+    // quickstart — silently littered the repo root with a dotfile, and on a
+    // real deployment it lands in whatever directory the operator happened to
+    // be standing in. Naming the path removes the implementation difference.
     sh(&format!(
         "printf 'subjectAltName=DNS:flint-internal\\nextendedKeyUsage=serverAuth,clientAuth\\nbasicConstraints=CA:FALSE' > {d}/ext.cnf && \
-         openssl x509 -req -in {d}/int.csr -CA {d}/ca.crt -CAkey {d}/ca.key -CAcreateserial \
+         openssl x509 -req -in {d}/int.csr -CA {d}/ca.crt -CAkey {d}/ca.key \
+         -CAcreateserial -CAserial {d}/ca.srl \
          -out {d}/int.crt -days 365 -extfile {d}/ext.cnf 2>/dev/null"
     ));
     sh(&format!(
@@ -1637,7 +1645,8 @@ fn resign_leaves(d: &str, sh: &dyn Fn(&str), edge_sans: &[String]) {
     ));
     sh(&format!(
         "printf 'subjectAltName={sans}\nextendedKeyUsage=serverAuth\nbasicConstraints=CA:FALSE' > {d}/edge-ext.cnf && \
-         openssl x509 -req -in {d}/edge.csr -CA {d}/ca.crt -CAkey {d}/ca.key -CAcreateserial \
+         openssl x509 -req -in {d}/edge.csr -CA {d}/ca.crt -CAkey {d}/ca.key \
+         -CAcreateserial -CAserial {d}/ca.srl \
          -out {d}/edge.crt -days 365 -extfile {d}/edge-ext.cnf 2>/dev/null",
         sans = edge_san_list(edge_sans),
     ));

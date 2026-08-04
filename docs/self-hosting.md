@@ -41,19 +41,29 @@ valkey-cli -p 7379 --tls --cacert state/certs/ca.crt -a tok-acme SET hello world
 A build straight from source reports no version, carries no manifest and no
 checksums. `flintctl` therefore refuses the fleet-*changing* verbs from one —
 `bootstrap`, `upgrade`, `failover`, tenant edits — while always allowing the
-read-only ones (`status`, `verify`). Two ways to satisfy it:
+read-only ones (`status`, `verify`). Three ways to satisfy it:
 
-- `FLINT_RELEASE_TAG=<tag>` at **compile** time, as above. The tag is baked
-  into every binary, so `verify` can hold the whole fleet to one build and an
-  `upgrade` can prove the new binaries actually took. This is the self-host
-  path.
+- **Download a release bundle** — the simplest, and no toolchain at all.
+  Tagged releases publish Linux x86_64 binaries plus a `manifest.json`
+  carrying the version and sha256. Unpack into the directory your inventory's
+  `bins` points at:
+
+  ```sh
+  tar xzf flint-<version>-linux-x86_64.tar.gz -C /opt/flint/bin
+  sha256sum flint-<version>-linux-x86_64.tar.gz   # compare with manifest.json
+  ```
+
+  Built on Amazon Linux 2023, so glibc 2.34 — fine on RHEL 9, AL2023, Ubuntu
+  22.04 and newer; older hosts should build from source.
+- `FLINT_RELEASE_TAG=<tag>` at **compile** time, as above, when you build it
+  yourself. The tag is baked into every binary, so `verify` can hold the whole
+  fleet to one build and an `upgrade` can prove the new binaries actually
+  took. Use a tag that means something to you (`v0.1.0`, or your own build
+  number in the same `v<major>.<minor>.<patch>` shape) — it is a claim about
+  *which* build this is, not a claim of blessing from us.
 - `disposable on` in the inventory — for a cluster you will throw away. Never
   put it in an inventory whose data you would miss: it is the line that says
   "an unverifiable binary may rewrite this fleet."
-
-Use a tag that means something to you (`v0.1.0`, or your own build number in
-the same `v<major>.<minor>.<patch>` shape). It is a claim about *which* build
-this is, not a claim of blessing from us.
 
 `bootstrap` mints the internal CA, starts the control plane, registers the
 topology, starts the nodes, proxy, and controller, and confirms

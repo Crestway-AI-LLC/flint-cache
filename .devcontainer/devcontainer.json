@@ -1,0 +1,29 @@
+{
+  "name": "Flint",
+  "build": { "dockerfile": "Dockerfile" },
+
+  // target/ lives in a named volume, not the bind mount. RocksDB produces a
+  // lot of object files, and on macOS and Windows a bind-mounted target/ makes
+  // the first build several times slower than it needs to be.
+  "mounts": [
+    "source=flint-target,target=${containerWorkspaceFolder}/target,type=volume"
+  ],
+  "postCreateCommand": "sudo chown -R vscode:vscode target && cargo fetch",
+
+  // The proxy edge, so a client on the host can reach the quickstart cluster.
+  "forwardPorts": [7379],
+  "portsAttributes": {
+    "7379": { "label": "flint proxy (edge)", "onAutoForward": "silent" }
+  },
+
+  "customizations": {
+    "vscode": {
+      "extensions": ["rust-lang.rust-analyzer", "tamasfe.even-better-toml"],
+      "settings": {
+        "rust-analyzer.cargo.features": ["flint-server/rocks"]
+      }
+    }
+  },
+
+  "remoteUser": "vscode"
+}

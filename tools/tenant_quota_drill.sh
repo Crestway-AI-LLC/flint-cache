@@ -65,26 +65,30 @@ echo "== rate, one proxy: acme hammers proxy 1 only -> its 200/s SHARE binds"
 # A +/-10% two-sided band on a laptop-measured rate is not a stricter test,
 # only a noisier one.
 python3 - <<'PY'
-import sys; sys.path.insert(0,"tools/lib"); from quota_load import measure_share
+import sys; sys.path.insert(0,"tools/lib"); from quota_load import measure
 BUDGET=200
-rate,thr=measure_share([7911],"tok-acme",BUDGET)
-print(f"  proxy1 alone: {rate:.0f} ops/s accepted (share {BUDGET}), {thr} throttled")
-assert rate <= BUDGET*1.25, f"share {rate:.0f} ops/s exceeds the {BUDGET}/s limit — the quota did not bind"
-assert rate >= BUDGET*0.75, f"share {rate:.0f} ops/s far under the {BUDGET}/s budget — the quota is strangling, not limiting"
-assert thr > 0, "never throttled although offered load was 3x the budget — the limiter is not shedding"
+r=measure([7911],"tok-acme",BUDGET)
+print(f"  proxy1 alone: {r.accepted:.0f} ops/s accepted (share {BUDGET}), "
+      f"{r.throttled} throttled, {r.offered:.0f} offered")
+r.require_saturating(BUDGET)   # the instrument first: was the limit even pressed?
+assert r.accepted <= BUDGET*1.25, f"share {r.accepted:.0f} ops/s exceeds the {BUDGET}/s limit — the quota did not bind"
+assert r.accepted >= BUDGET*0.75, f"share {r.accepted:.0f} ops/s far under the {BUDGET}/s budget — the quota is strangling, not limiting"
+assert r.throttled > 0, "never throttled although offered load exceeded the budget — the limiter is not shedding"
 PY
 [ $? -eq 0 ] || exit 1
 
 echo "== rate, fleet: acme hammers BOTH proxies -> shares sum to the 400/s budget"
 python3 - <<'PY'
-import sys; sys.path.insert(0,"tools/lib"); from quota_load import measure_per_port
+import sys; sys.path.insert(0,"tools/lib"); from quota_load import measure
 BUDGET=400
-total,per,thr=measure_per_port([7911,7912],"tok-acme",BUDGET)
-print(f"  fleet: {total:.0f} ops/s accepted across both proxies "
-      f"{ {p: f'{r:.0f}' for p,r in per.items()} } (budget {BUDGET}), {thr} throttled")
-assert total <= BUDGET*1.25, f"fleet rate {total:.0f} exceeds the {BUDGET}/s budget — shares do not sum to the limit"
-assert total >= BUDGET*0.75, f"fleet rate {total:.0f} far under the {BUDGET}/s budget — the split is losing capacity"
-assert all(r > 0 for r in per.values()), f"a proxy served nothing: {per}"
+r=measure([7911,7912],"tok-acme",BUDGET)
+print(f"  fleet: {r.accepted:.0f} ops/s accepted across both proxies "
+      f"{ {p: f'{v:.0f}' for p,v in r.per_port.items()} } (budget {BUDGET}), "
+      f"{r.throttled} throttled, {r.offered:.0f} offered")
+r.require_saturating(BUDGET)
+assert r.accepted <= BUDGET*1.25, f"fleet rate {r.accepted:.0f} exceeds the {BUDGET}/s budget — shares do not sum to the limit"
+assert r.accepted >= BUDGET*0.75, f"fleet rate {r.accepted:.0f} far under the {BUDGET}/s budget — the split is losing capacity"
+assert all(v > 0 for v in r.per_port.values()), f"a proxy served nothing: {r.per_port}"
 PY
 [ $? -eq 0 ] || exit 1
 

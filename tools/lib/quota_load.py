@@ -17,10 +17,25 @@ worth writing down, because the shape recurs in any rate-limit test.
    between 0 and 3 million depending on which regime the socket landed in. A
    flood tests admission control, not the quota.
 
-3. PACED (this file). Offer a fixed multiple of the budget, in small batches,
-   with a sleep to hold the rate. High enough that the bucket must shed, low
-   enough never to reach the buffer-backpressure regime. The generator's rate
-   is a property of the test, not of the machine.
+3. PACED, BUT STILL SEND-AND-WAIT (batches of 8, sleep to hold the rate).
+   Passed five times standalone and then failed inside the full drill suite:
+   128 accepted/s per connection and ZERO throttled against a 200/s share.
+   With N requests in flight, throughput is capped at N/RTT — 8/0.062s = 129/s
+   — so on a machine where the round trip had grown to ~62ms the generator
+   never reached its target and never approached the quota. Exactly failure 1
+   again, merely 8x less severe, and it reported "the split is losing
+   capacity": the instrument blaming the product.
+
+4. PACED, SEND AND RECEIVE DECOUPLED (this file). A sender thread emits at the
+   target rate without waiting for replies; a reader thread drains and
+   classifies them. Offered load is then a property of the test rather than of
+   the machine's latency, at a rate low enough never to reach the
+   buffer-backpressure regime of failure 2.
+
+   And the instrument reports on ITSELF: `measure` returns the offered rate it
+   actually achieved, so a drill can distinguish "the quota did not bind" from
+   "this machine could not generate enough load to find out". A test that
+   cannot tell those apart will eventually report the second as the first.
 
 The assertions built on this measure the SHAPE a token bucket guarantees —
 accepted bounded above by the budget, not strangled below it, and something
@@ -28,10 +43,11 @@ actually shed — rather than a narrow band around a laptop-measured number.
 """
 
 import socket
+import threading
 import time
 
 OVERSUBSCRIBE = 3  # offer 3x the budget: must shed, must not flood
-BATCH = 8  # in flight at once: amortizes RTT, stays under the buffer bound
+BATCH = 8  # per send, purely to amortize syscalls — NOT a window
 WARMUP = 2.0  # the bucket starts FULL; drain the burst before measuring
 WINDOW = 8.0  # long enough that one refill tick is not a big share of it
 
@@ -43,7 +59,13 @@ def _resp(args):
 
 
 class _Conn:
-    """One authenticated connection with a paced, pipelined SET generator."""
+    """One authenticated connection: a paced sender and an independent reader.
+
+    They are separate threads on purpose. If the sender waits for each batch's
+    replies, the offered rate collapses to BATCH/RTT and the test silently
+    stops exercising the limit on any machine slower than the one it was
+    written on.
+    """
 
     def __init__(self, port, token, offered_per_sec):
         self.s = socket.create_connection(("127.0.0.1", port), timeout=10)
@@ -51,45 +73,68 @@ class _Conn:
         self.s.sendall(_resp(["AUTH", token]))
         self.s.recv(64)
         self.set = _resp(["SET", "k", "v"])
-        self.buf = b""
         self.interval = BATCH / offered_per_sec
-        self.next_at = time.time()
+        self.counting = False
+        self.sent = self.ok = self.thr = 0
+        self._done = False
 
-    def pump(self):
-        """Send BATCH SETs, read exactly BATCH single-line replies, then pace."""
-        self.s.sendall(self.set * BATCH)
-        ok = thr = got = 0
-        while got < BATCH:
-            while b"\r\n" not in self.buf:
-                self.buf += self.s.recv(65536)
-            line, self.buf = self.buf.split(b"\r\n", 1)
-            got += 1
-            if b"THROTTLED" in line:
-                thr += 1
+    def _read_loop(self):
+        buf = b""
+        while not self._done:
+            try:
+                chunk = self.s.recv(65536)
+            except OSError:
+                return
+            if not chunk:
+                return
+            buf += chunk
+            while b"\r\n" in buf:
+                line, buf = buf.split(b"\r\n", 1)
+                if self.counting:
+                    if b"THROTTLED" in line:
+                        self.thr += 1
+                    else:
+                        self.ok += 1
+
+    def _send_loop(self, stop_at):
+        next_at = time.time()
+        while time.time() < stop_at:
+            try:
+                self.s.sendall(self.set * BATCH)
+            except OSError:
+                return
+            if self.counting:
+                self.sent += BATCH
+            next_at += self.interval
+            delay = next_at - time.time()
+            if delay > 0:
+                time.sleep(delay)
             else:
-                ok += 1
-        self.next_at += self.interval
-        delay = self.next_at - time.time()
-        if delay > 0:
-            time.sleep(delay)
-        else:
-            self.next_at = time.time()  # fell behind; do not chase a backlog
-        return ok, thr
+                next_at = time.time()  # fell behind; do not chase a backlog
 
-    def run_until(self, deadline):
-        ok = thr = 0
-        while time.time() < deadline:
-            o, t = self.pump()
-            ok += o
-            thr += t
-        return ok, thr
+    def run(self, start_counting_at, stop_at):
+        reader = threading.Thread(target=self._read_loop, daemon=True)
+        reader.start()
+        flip = threading.Timer(max(0.0, start_counting_at - time.time()),
+                               lambda: setattr(self, "counting", True))
+        flip.start()
+        self._send_loop(stop_at)
+        self.counting = False
+        flip.cancel()
+        time.sleep(0.3)  # let the last replies land before the reader stops
+        self._done = True
+        try:
+            self.s.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        reader.join(timeout=2)
 
 
 def _warm_then_measure(ports, token, budget):
-    """Offer 3x `budget` split across `ports`; return {port: (accepted, thr)}.
+    """Offer 3x `budget` split across `ports`. Returns the _Conn objects.
 
-    Every connection warms and measures inside ONE shared wall-clock window,
-    in its own thread. Two details that were bugs in earlier versions:
+    Every connection warms and measures inside ONE shared wall-clock window.
+    Two details that were bugs in earlier versions:
 
     * warming the connections in sequence means the second one's warmup
       deadline has already passed by the time its turn comes, so it measures
@@ -99,42 +144,50 @@ def _warm_then_measure(ports, token, budget):
       is how a healthy fleet once read 445/s against a 440 cap. Divide by the
       shared WINDOW, once.
     """
-    import threading
-
     per_conn = budget * OVERSUBSCRIBE / len(ports)
     conns = {p: _Conn(p, token, per_conn) for p in ports}
     start = time.time() + WARMUP
     stop = start + WINDOW
-    out = {}
-
-    def go(port, conn):
-        conn.run_until(start)  # drain the initial burst; discard the counts
-        out[port] = conn.run_until(stop)
-
-    ts = [threading.Thread(target=go, args=(p, c)) for p, c in conns.items()]
+    ts = [threading.Thread(target=c.run, args=(start, stop)) for c in conns.values()]
     [t.start() for t in ts]
     [t.join() for t in ts]
-    return out
+    return conns
 
 
-def measure_share(ports, token, budget):
-    """Return (accepted ops/s across all ports, total throttled)."""
-    out = _warm_then_measure(ports, token, budget)
-    return sum(o for o, _ in out.values()) / WINDOW, sum(t for _, t in out.values())
+class Load:
+    """What the run achieved. `offered` is the instrument's own positive
+    control: below the budget, nothing about the quota was tested."""
+
+    def __init__(self, conns):
+        self.accepted = sum(c.ok for c in conns.values()) / WINDOW
+        self.throttled = sum(c.thr for c in conns.values())
+        self.offered = sum(c.sent for c in conns.values()) / WINDOW
+        self.per_port = {p: c.ok / WINDOW for p, c in conns.items()}
+
+    def require_saturating(self, budget):
+        if self.offered < budget * 1.5:
+            raise AssertionError(
+                f"the load generator only offered {self.offered:.0f} ops/s against a "
+                f"{budget}/s budget, so the quota was never actually pressed. This is a "
+                f"HARNESS limit on this machine (send-side stall or an overloaded box), "
+                f"not a product failure — do not read the accepted rate below as a verdict."
+            )
 
 
-def measure_per_port(ports, token, budget):
-    """Return (total accepted ops/s, {port: accepted ops/s}, total throttled)."""
-    out = _warm_then_measure(ports, token, budget)
-    return (
-        sum(o for o, _ in out.values()) / WINDOW,
-        {p: o / WINDOW for p, (o, _) in out.items()},
-        sum(t for _, t in out.values()),
-    )
+def measure(ports, token, budget):
+    """Offer 3x `budget` across `ports` and report what happened."""
+    return Load(_warm_then_measure(ports, token, budget))
 
 
 def pin(port, token, budget, stop_flag):
-    """Hold a tenant AT its quota until stop_flag[0] — the noisy-neighbour."""
+    """Hold a tenant AT its quota until stop_flag[0] — the noisy neighbour."""
     conn = _Conn(port, token, budget * OVERSUBSCRIBE)
+    reader = threading.Thread(target=conn._read_loop, daemon=True)
+    reader.start()
     while not stop_flag[0]:
-        conn.pump()
+        try:
+            conn.s.sendall(conn.set * BATCH)
+        except OSError:
+            break
+        time.sleep(conn.interval)
+    conn._done = True

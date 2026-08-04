@@ -12,3 +12,6 @@ Cargo.lock.orig
 # Local env
 .env
 .env.*
+
+# tools/quickstart.sh — a throwaway laptop cluster's state, logs and inventory
+/.flint-quickstart/

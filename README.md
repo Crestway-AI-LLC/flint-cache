@@ -80,6 +80,11 @@ processes, not mocks.
 
 ## Prerequisites
 
+Only if you are building from source. **Tagged releases publish Linux x86_64
+binaries plus a `manifest.json` with the sha256** — for a deployment, download
+those instead and skip this section entirely
+([docs/self-hosting.md](docs/self-hosting.md)).
+
 - **Rust 1.85 or newer** (edition 2024). `rustup` recommended; several distro
   toolchains are older and will refuse to build.
 - **A C++ toolchain and libclang** — RocksDB is compiled from source by the
@@ -91,7 +96,28 @@ processes, not mocks.
 The first build compiles RocksDB and takes a while — on the order of ten
 minutes on a laptop, and a couple of GB in `target/`.
 
+**Or skip all of it and open the repo in the dev container**
+([`.devcontainer/`](.devcontainer/)) — it carries the toolchain, libclang, and
+the pinned Valkey the conformance oracle needs, so `tools/gates.sh` runs there
+too.
+
 ## Quick start
+
+One command brings up a real cluster — control plane, a replicated pair, a
+routing proxy and the failover controller — on your laptop:
+
+```sh
+tools/quickstart.sh
+```
+
+It checks prerequisites and names anything missing, builds if needed, writes a
+throwaway inventory, bootstraps, adds a tenant, and proves the cluster serves a
+write through the proxy. Then `tools/quickstart.sh down` (keep the data) or
+`purge` (delete it). Deliberately a pair rather than a single node, so
+`tools/failover_drill.sh` has a master to kill and a replica to promote.
+
+The rest of this section is the same thing by hand, if you would rather see the
+pieces.
 
 ```sh
 cargo build --release --features flint-server/rocks
