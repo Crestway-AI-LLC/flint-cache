@@ -2,10 +2,16 @@
 #
 # Build the dev container and prove it can do the job it exists for.
 #
-# It was written on a machine with no container runtime, so it shipped
-# inspection-verified only. A container definition that has never been built
-# is a guess; one built once by hand is a guess with a timestamp. This runs on
-# every change to .devcontainer/, so it stays true instead of having been true.
+# It was written on a machine with no container runtime, so it first shipped
+# inspection-verified only. It has since been built and exercised for real on
+# arm64: image builds in ~1m45s, and `cargo build --release --features
+# flint-server/rocks` completes inside it in ~4m47s — which is the assertion
+# that matters, because RocksDB compiling from source is the only thing that
+# actually needs clang and libclang.
+#
+# That was a one-off on one architecture, which is a guess with a timestamp.
+# This job runs on every change to .devcontainer/ and on amd64, so the claim
+# stays true instead of having been true once.
 name: devcontainer
 on:
   push:
