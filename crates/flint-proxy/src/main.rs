@@ -875,9 +875,16 @@ impl Backends {
             // types are flattened the proxy cannot put them back. RESP3
             // keeps them (`%`, `~`, `,`), so the proxy decodes a reply that
             // still knows what it means and re-renders it for whichever
-            // dialect the client asked for. Backend connections are pooled
-            // and shared across clients, so pinning them to one client's
-            // dialect was never an option anyway.
+            // dialect the client asked for.
+            //
+            // (This used to add "and connections are shared across clients
+            // anyway", which is FALSE and worth correcting rather than
+            // deleting: `Backends` lives inside `serve_client`, which is
+            // spawned per accepted connection, so the pool is per CLIENT —
+            // one connection per backend address, for that client alone.
+            // Believing otherwise would rule out transactions entirely,
+            // since two tenants' MULTIs would interleave on one socket. The
+            // RESP3 argument above stands on its own.)
             let mut hello = Vec::new();
             encode(
                 &Value::Array(Some(vec![
@@ -1465,6 +1472,10 @@ fn serve_client<S: Read + Write>(mut stream: S, topo: Arc<Topology>) -> std::io:
         None
     };
     let mut backends: Option<Backends> = None;
+    // This client's transaction, if any (ADR-0012 D7). Per connection, like
+    // the backends themselves — a transaction is connection state on the
+    // node, so it can only ever belong to one client.
+    let mut txn = ProxyTxn::default();
     // Replica-read opt-in for THIS connection's tenant (D7), set at AUTH.
     let mut replica_reads = false;
     // Proxy near-cache opt-in for THIS connection's tenant (D6), set at AUTH.
@@ -1591,6 +1602,7 @@ fn serve_client<S: Read + Write>(mut stream: S, topo: Arc<Topology>) -> std::io:
                         AuthStep::Proceed(ns) => data_command(
                             &topo,
                             &mut backends,
+                            &mut txn,
                             &ns,
                             &args,
                             &raw,
@@ -1656,9 +1668,255 @@ fn serve_client<S: Read + Write>(mut stream: S, topo: Arc<Topology>) -> std::io:
 /// forward. Extracted from `serve_client` so the connection loop stays a
 /// decode/auth/encode skeleton.
 #[allow(clippy::too_many_arguments)]
+/// One client's transaction, as the proxy sees it (ADR-0012 D7).
+///
+/// The proxy's normal instinct is to REPAIR a failed command — chase a
+/// MOVED, wait out a TRYAGAIN, re-dial a dead backend, fall back to the
+/// master. Every one of those is right for a single command and wrong
+/// inside a transaction, because the queue lives on one backend CONNECTION:
+/// retrying elsewhere, or on a fresh connection to the same address, lands
+/// the command on a node with no MULTI open, which EXECUTES it instead of
+/// queueing it. The client would see QUEUED and get a partial apply.
+#[derive(Default)]
+struct ProxyTxn {
+    /// The client has sent MULTI and neither EXEC nor DISCARD yet.
+    open: bool,
+    /// The backend this transaction is bound to. Set by WATCH or by the
+    /// first keyed command — NOT by MULTI, which carries no key and so
+    /// cannot name a slot.
+    addr: Option<String>,
+    /// MULTI has been forwarded to `addr`. Deferred because the proxy
+    /// cannot know which backend to open it on until a key appears.
+    opened: bool,
+}
+
+impl ProxyTxn {
+    fn reset(&mut self) {
+        self.open = false;
+        self.addr = None;
+        self.opened = false;
+    }
+}
+
+/// Abort a transaction and make it unrecoverable.
+///
+/// Dropping the backend connection is the point, not housekeeping: the
+/// node's queue and watches are connection state, so closing the socket is
+/// what guarantees a later EXEC cannot apply the half-built transaction.
+fn abort_txn(backends: &mut Backends, txn: &mut ProxyTxn, why: &str) -> Value {
+    if let Some(addr) = txn.addr.clone() {
+        backends.drop_conn(&addr);
+    }
+    txn.reset();
+    Value::Error(format!(
+        "EXECABORT Transaction discarded: {why}. Retry the transaction."
+    ))
+}
+
+/// Send one frame to a pinned backend with NO retry and no rerouting.
+fn call_pinned(backends: &mut Backends, addr: &str, frame: &[u8]) -> Result<Value, String> {
+    match backends.call(addr, frame) {
+        Ok(Value::Error(e))
+            if e.starts_with("MOVED ")
+                || e.starts_with("TRYAGAIN")
+                || e.starts_with("READONLY") =>
+        {
+            // Each of these means "this is no longer the right node, go
+            // again". Outside a transaction the proxy absorbs them; here
+            // going again is precisely what it must not do.
+            Err(format!("backend no longer owns this transaction ({e})"))
+        }
+        Ok(v) => Ok(v),
+        Err(e) => Err(format!("backend unavailable ({e})")),
+    }
+}
+
+fn encode_cmd(parts: &[&[u8]]) -> Vec<u8> {
+    let mut out = Vec::new();
+    encode(
+        &Value::Array(Some(
+            parts
+                .iter()
+                .map(|p| Value::Bulk(Some(p.to_vec())))
+                .collect(),
+        )),
+        &mut out,
+    );
+    out
+}
+
+/// Handle a command that is transaction business. `None` means it is not,
+/// and the caller should carry on with normal routing.
+fn transaction_step(
+    topo: &Topology,
+    backends: &mut Backends,
+    txn: &mut ProxyTxn,
+    ns: &[u8],
+    args: &[Vec<u8>],
+    raw: &[u8],
+) -> Option<Value> {
+    let name = args.first()?.to_ascii_uppercase();
+    // Where a command must go, if it names a key at all.
+    let routed = route_key(args)
+        .map(slot_for_key)
+        .and_then(|s| topo.route(ns, s));
+
+    match name.as_slice() {
+        b"WATCH" => {
+            // WATCH precedes MULTI and carries keys, so it is what usually
+            // fixes the backend. Binding here matters: the node keeps
+            // watches per CONNECTION, so the transaction must later run on
+            // the very connection that armed them.
+            if txn.open {
+                return Some(Value::Error(
+                    "ERR Command 'watch' not allowed inside a transaction".into(),
+                ));
+            }
+            let addr = routed?;
+            match call_pinned(backends, &addr, raw) {
+                Ok(v) => {
+                    txn.addr = Some(addr);
+                    Some(v)
+                }
+                Err(why) => Some(abort_txn(backends, txn, &why)),
+            }
+        }
+        b"UNWATCH" => {
+            let Some(addr) = txn.addr.clone() else {
+                // Nothing was ever watched through this proxy connection.
+                return Some(Value::Simple("OK".into()));
+            };
+            let reply = match call_pinned(backends, &addr, raw) {
+                Ok(v) => v,
+                Err(why) => return Some(abort_txn(backends, txn, &why)),
+            };
+            if !txn.open {
+                txn.addr = None;
+            }
+            Some(reply)
+        }
+        b"MULTI" => {
+            if txn.open {
+                return Some(Value::Error(
+                    "ERR Command 'multi' not allowed inside a transaction".into(),
+                ));
+            }
+            txn.open = true;
+            // If WATCH already bound a backend, open the transaction there
+            // NOW. Otherwise `opened` would stay false with node-side
+            // watches armed, and EXEC/DISCARD — answered locally in that
+            // state — would never tell the node to clear them, so the next
+            // transaction on this connection would abort against a watch
+            // the client had already discarded. Found by the differential
+            // probe, which is the only place a stale watch is visible.
+            if let Some(addr) = txn.addr.clone() {
+                match call_pinned(backends, &addr, &encode_cmd(&[b"MULTI"])) {
+                    Ok(Value::Simple(s)) if s == "OK" => txn.opened = true,
+                    Ok(other) => {
+                        return Some(abort_txn(
+                            backends,
+                            txn,
+                            &format!("backend refused MULTI ({other:?})"),
+                        ));
+                    }
+                    Err(why) => return Some(abort_txn(backends, txn, &why)),
+                }
+            } else {
+                // No key seen yet, so no backend can be chosen: MULTI names
+                // none, and opening it on whichever backend the keyless rule
+                // picks would queue the data commands somewhere else. The
+                // node holds nothing for this transaction until then, which
+                // is what makes answering locally safe.
+                txn.opened = false;
+            }
+            Some(Value::Simple("OK".into()))
+        }
+        b"DISCARD" => {
+            if !txn.open {
+                return Some(Value::Error("ERR DISCARD without MULTI".into()));
+            }
+            let pending = txn.opened.then(|| txn.addr.clone()).flatten();
+            txn.reset();
+            match pending {
+                // Nothing reached a backend, so there is nothing to discard
+                // there; the queue only ever existed in this proxy's intent.
+                None => Some(Value::Simple("OK".into())),
+                Some(addr) => Some(match call_pinned(backends, &addr, raw) {
+                    Ok(v) => v,
+                    // The connection is gone, which discarded it for us.
+                    Err(_) => Value::Simple("OK".into()),
+                }),
+            }
+        }
+        b"EXEC" => {
+            if !txn.open {
+                return Some(Value::Error("ERR EXEC without MULTI".into()));
+            }
+            let pending = txn.opened.then(|| txn.addr.clone()).flatten();
+            let mut ended = std::mem::take(txn);
+            match pending {
+                // MULTI ... EXEC with nothing in between: no backend was
+                // ever chosen, and the answer is the empty array.
+                None => Some(Value::Array(Some(Vec::new()))),
+                Some(addr) => Some(match call_pinned(backends, &addr, raw) {
+                    Ok(v) => v,
+                    Err(why) => abort_txn(backends, &mut ended, &why),
+                }),
+            }
+        }
+        _ if txn.open => {
+            // A command to queue. Bind the backend if this is the first one
+            // that names a key; otherwise fall back to the keyless rule.
+            let addr = match (txn.addr.clone(), routed) {
+                (Some(pinned), Some(target)) if pinned != target => {
+                    // The transaction is bound to one node and this key
+                    // lives on another. Rare — it needs a keyless command
+                    // to have bound the transaction first — but executing
+                    // it would write rows on a node that does not own the
+                    // slot, where nothing will ever read them.
+                    return Some(abort_txn(
+                        backends,
+                        txn,
+                        "a key in this transaction belongs to a different shard",
+                    ));
+                }
+                (Some(pinned), _) => pinned,
+                (None, Some(target)) => target,
+                (None, None) => topo.clusters[0]
+                    .routing
+                    .read()
+                    .ok()
+                    .and_then(|r| r.masters.first().cloned().flatten())?,
+            };
+            txn.addr = Some(addr.clone());
+            // Open the transaction on the backend now that one is known.
+            if !txn.opened {
+                match call_pinned(backends, &addr, &encode_cmd(&[b"MULTI"])) {
+                    Ok(Value::Simple(s)) if s == "OK" => txn.opened = true,
+                    Ok(other) => {
+                        return Some(abort_txn(
+                            backends,
+                            txn,
+                            &format!("backend refused MULTI ({other:?})"),
+                        ));
+                    }
+                    Err(why) => return Some(abort_txn(backends, txn, &why)),
+                }
+            }
+            match call_pinned(backends, &addr, raw) {
+                Ok(v) => Some(v),
+                Err(why) => Some(abort_txn(backends, txn, &why)),
+            }
+        }
+        _ => None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn data_command(
     topo: &Topology,
     backends: &mut Option<Backends>,
+    txn: &mut ProxyTxn,
     ns: &[u8],
     args: &[Vec<u8>],
     raw: &[u8],
@@ -1681,6 +1939,20 @@ fn data_command(
         && let Some(shed) = topo.quota_gate(ns, name, is_write)
     {
         return shed;
+    }
+    // Transactions come BEFORE the near-cache and the replica decision, and
+    // that order is the point (ADR-0012 D7). A queued command answered from
+    // the cache would never reach the node's queue, so EXEC would silently
+    // skip it; a read routed to a replica would queue on a different
+    // connection from the writes. Both are ruled out by handling the
+    // transaction here and returning.
+    {
+        let b = backends.get_or_insert_with(|| {
+            Backends::new(ns.to_vec(), topo.backend_tls.clone(), async_writes)
+        });
+        if let Some(reply) = transaction_step(topo, b, txn, ns, args, raw) {
+            return reply;
+        }
     }
     // D6 near-cache: a plain GET for an opted-in tenant may answer from the
     // proxy-local cache (TTL-bounded staleness, the tenant's choice). The
