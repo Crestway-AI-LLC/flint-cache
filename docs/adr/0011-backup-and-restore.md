@@ -70,13 +70,20 @@ stranded in an unarchived WAL, and the restored copy needs no replay.
 
 There is no fleet-wide freeze and no attempt at a global snapshot instant.
 The justification is not pragmatism: **Flint's own command surface makes
-cross-pair consistency undefined.** From `docs/command-support.md`, excluded
-by design: cross-slot multi-key commands, and `MULTI`/`EXEC`/`WATCH`. No
-operation a client can issue spans two pairs, so there is no multi-pair
-invariant a client could ever have observed, and none a backup can violate.
+cross-pair consistency undefined.** No operation a client can issue spans two
+pairs — a cross-slot multi-key command is refused with `CROSSSLOT`, and a
+transaction is confined to one slot by ADR-0012 D1, which puts it on exactly
+one pair. So there is no multi-pair invariant a client could ever have
+observed, and none a backup can violate.
 
-**If cross-slot transactions are ever added, this decision must be
-revisited** — that is the moment the argument stops holding.
+**The trigger to revisit is cross-PAIR atomicity, and only that.** This
+record first argued the point by citing `MULTI`/`EXEC`/`WATCH` as excluded by
+design, which was true when it was written and stopped being true when
+ADR-0012 shipped same-slot transactions. The conclusion survived the change —
+one slot is one pair — but the premise did not, and a decision resting on a
+fact that has quietly become false is worse than one with no reasoning at
+all. Cross-slot transactions would fire the trigger; nothing shipped so far
+does.
 
 ### D2 — A backup is the pairs plus the control plane, tied by one manifest
 
