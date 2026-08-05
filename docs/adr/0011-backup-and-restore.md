@@ -1,6 +1,13 @@
 # ADR-0011: Backup and restore — per-pair checkpoints, and restore that only ever creates
 
-Status: proposed — August 2026 (revised)
+Status: accepted — August 2026. Every decision below is implemented and
+drill-gated: the artifact (Phase A), the seat (B), whole-cluster restore
+with the D4 scrub, namespace-scoped restore (D5), the S3 store, the
+scheduler library with the three policy jobs, and `backup-to` in the
+flintctl inventory. Verification items 1–5, 8 and 9 are standing checks;
+6 (a format break refusing END TO END — the refusal itself is unit-tested)
+and 7 (the mTLS isolation of a restored cluster asserted live) remain open
+and are tracked with the follow-ons rather than silently assumed.
 
 > Numbering: 0005–0009 are private-plane records and 0010 is reserved for the
 > co-processor extension model. See [README](README.md) for why the sequence

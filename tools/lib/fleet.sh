@@ -116,7 +116,7 @@ _fleet_foreign() {
 # components (space separated, e.g. "controlplane proxy").
 _fleet_ours() {
   local want="${1:-}"
-  local re='^flint-(server|proxy|controlplane|controller|agent|console|ops|register|exporter|meter)$'
+  local re='^flint-(server|proxy|controlplane|controller|agent|console|ops|register|exporter|meter|backup)$'
   if [ -n "$want" ]; then
     re="^flint-($(printf '%s' "$want" | tr ' ' '|'))$"
   fi

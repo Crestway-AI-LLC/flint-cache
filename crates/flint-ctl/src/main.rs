@@ -157,6 +157,20 @@ struct Inventory {
     /// Which host runs the controller. It has no address of its own — it
     /// dials the nodes rather than serving — so placement must be declared.
     controller_host: Option<String>,
+    /// Backup policy (ADR-0011 D8): `backup-to <dir|s3://bucket/prefix>`
+    /// enables the flint-backup seat; the rest tune it. Object-store
+    /// CREDENTIALS are never inventory keys — the seat reads the standard
+    /// AWS environment, which for a local seat is flintctl's own and for a
+    /// remote `backup-host` must come from that host (an instance profile
+    /// is env-free and therefore does not work yet: the store is env-only).
+    backup_to: Option<String>,
+    backup_every: Option<String>,
+    backup_verify_every: Option<String>,
+    backup_rehearse_every: Option<String>,
+    backup_keep: Option<u32>,
+    /// Which host runs the backup seat. Like the controller it dials
+    /// rather than serves, so placement must be declared; absent = local.
+    backup_host: Option<String>,
 }
 
 fn parse_inventory(path: &str) -> Inventory {
@@ -227,6 +241,12 @@ fn parse_inventory(path: &str) -> Inventory {
                 }
             }
             "controller-host" => inv.controller_host = Some(val.to_string()),
+            "backup-to" => inv.backup_to = Some(val.to_string()),
+            "backup-every" => inv.backup_every = Some(val.to_string()),
+            "backup-verify-every" => inv.backup_verify_every = Some(val.to_string()),
+            "backup-rehearse-every" => inv.backup_rehearse_every = Some(val.to_string()),
+            "backup-keep" => inv.backup_keep = val.parse().ok(),
+            "backup-host" => inv.backup_host = Some(val.to_string()),
             // Declares this fleet THROWAWAY: a non-release flintctl may
             // mutate it. Absent means a real cluster, which is the safe
             // default and the one every existing inventory already has.
@@ -783,6 +803,13 @@ fn controller_runner(inv: &Inventory) -> Runner {
     }
 }
 
+fn backup_runner(inv: &Inventory) -> Runner {
+    match &inv.backup_host {
+        Some(h) => runner_for_host(inv, h),
+        None => Runner::Local,
+    }
+}
+
 fn agent_runner(inv: &Inventory) -> Runner {
     match &inv.agent {
         Some(a) => runner_for(inv, a),
@@ -821,6 +848,9 @@ fn all_runners(inv: &Inventory) -> Vec<Runner> {
     }
     if inv.agent.is_some() {
         push(agent_runner(inv));
+    }
+    if inv.backup_to.is_some() {
+        push(backup_runner(inv));
     }
     out
 }
@@ -1244,12 +1274,13 @@ fn reconcile_widowed_grace(
 const DEFAULT_WIDOWED_GRACE_MS: u64 = 10_000;
 
 /// The binaries `flintctl` starts — the orphan sweep's allowlist.
-const FLEET_BINARIES: [&str; 5] = [
+const FLEET_BINARIES: [&str; 6] = [
     "flint-server",
     "flint-proxy",
     "flint-controlplane",
     "flint-controller",
     "flint-agent",
+    "flint-backup",
 ];
 
 /// Kill fleet processes belonging to THIS inventory that the pidfiles do
@@ -2070,6 +2101,67 @@ fn controller_args(inv: &Inventory) -> Vec<String> {
     args
 }
 
+/// The backup seat's argv (ADR-0011 D8), None unless `backup-to` is set.
+///
+/// The pair LIST goes through verbatim — the seat asks each pair which
+/// member is master at run time, so a failover between backups needs no
+/// reroll. A pair-set change does (see the expand/decommission sites),
+/// exactly as the controller does.
+fn backup_args(inv: &Inventory) -> Option<Vec<String>> {
+    let to = inv.backup_to.as_ref()?;
+    let d = &inv.statedir;
+    let pairs_spec = inv
+        .pairs
+        .iter()
+        .map(|p| p.join(","))
+        .collect::<Vec<_>>()
+        .join(";");
+    let cp_state = if inv.cp.len() == 1 {
+        format!("{d}/cp-state")
+    } else {
+        // Multi-seat CP: the file is Raft-replicated; seat 1's copy is as
+        // legitimate as any, and the manifest records which one was taken.
+        format!("{d}/cp-state-n1")
+    };
+    let mut args = vec![
+        "schedule".to_string(),
+        "--pairs".into(),
+        pairs_spec,
+        "--cp-state".into(),
+        cp_state,
+        "--to".into(),
+        to.clone(),
+        "--every".into(),
+        inv.backup_every.clone().unwrap_or_else(|| "24h".into()),
+        // Its OWN snapshot root, never the controller's: FLINTSNAPSHOT
+        // repoints <root>/LATEST and spare-restore seeds from whatever
+        // LATEST names.
+        "--snap-root".into(),
+        format!("{d}/backup-snaps"),
+        "--status-file".into(),
+        format!("{d}/logs/backup-status"),
+    ];
+    if let Some(v) = &inv.backup_verify_every {
+        args.extend(["--verify-every".into(), v.clone()]);
+    }
+    if let Some(v) = &inv.backup_rehearse_every {
+        args.extend(["--rehearse-every".into(), v.clone()]);
+    }
+    if let Some(k) = inv.backup_keep {
+        args.extend(["--keep".into(), k.to_string()]);
+    }
+    if inv.tls {
+        args.extend(["--tls".into(), format!("{d}/certs")]);
+    }
+    Some(args)
+}
+
+fn start_backup(inv: &Inventory) {
+    if let Some(args) = backup_args(inv) {
+        spawn(inv, &backup_runner(inv), "backup", "flint-backup", &args);
+    }
+}
+
 fn start_controller(inv: &Inventory) {
     spawn(
         inv,
@@ -2285,6 +2377,18 @@ fn launch(inv: &Inventory, register: bool) {
                 "flint-agent",
                 &agent_args(inv).expect("agent args"),
             );
+        }
+    }
+
+    if inv.backup_to.is_some() {
+        if seat_alive(
+            &backup_runner(inv),
+            "flint-backup",
+            &format!("{d}/backup-snaps"),
+        ) {
+            eprintln!("  backup seat already up");
+        } else {
+            start_backup(inv);
         }
     }
 
@@ -2870,6 +2974,12 @@ fn expand(inv: &Inventory, inventory_path: &str, pair_spec: &str) {
         kill_pidfile(inv, &controller_runner(inv), "controller");
         start_controller(&inv2);
         wait_supervised(&inv2, inv2.pairs.len(), t0);
+        // The backup seat pins the SAME pair list; reroll it with the
+        // controller or every later set silently omits the change.
+        if inv2.backup_to.is_some() {
+            kill_pidfile(inv, &backup_runner(inv), "backup");
+            start_backup(&inv2);
+        }
         eprintln!(
             "  controller rerolled with {} pairs (stateless: a non-event)",
             inv2.pairs.len()
@@ -2969,6 +3079,12 @@ fn add_replica(inv: &Inventory, inventory_path: &str, pair_ref: &str, new: &str)
         kill_pidfile(inv, &controller_runner(inv), "controller");
         start_controller(&inv2);
         wait_supervised(&inv2, inv2.pairs.len(), t0);
+        // The backup seat pins the SAME pair list; reroll it with the
+        // controller or every later set silently omits the change.
+        if inv2.backup_to.is_some() {
+            kill_pidfile(inv, &backup_runner(inv), "backup");
+            start_backup(&inv2);
+        }
     }
     eprintln!(
         "== add-replica complete: pair {pair_idx} now has an extra replica for D7 read fan-out"
@@ -3068,6 +3184,12 @@ fn swap_node(inv: &Inventory, inventory_path: &str, bad: &str, new: &str) {
         kill_pidfile(inv, &controller_runner(inv), "controller");
         start_controller(&inv2);
         wait_supervised(&inv2, inv2.pairs.len(), t0);
+        // The backup seat pins the SAME pair list; reroll it with the
+        // controller or every later set silently omits the change.
+        if inv2.backup_to.is_some() {
+            kill_pidfile(inv, &backup_runner(inv), "backup");
+            start_backup(&inv2);
+        }
     }
     eprintln!(
         "== swap complete: pair {pair_idx} seat replaced, registry + inventory updated (supervision armed)"
@@ -3504,6 +3626,12 @@ fn decommission_node(
         kill_pidfile(inv, &controller_runner(inv), "controller");
         start_controller(&inv2);
         wait_supervised(&inv2, inv2.pairs.len(), t0);
+        // The backup seat pins the SAME pair list; reroll it with the
+        // controller or every later set silently omits the change.
+        if inv2.backup_to.is_some() {
+            kill_pidfile(inv, &backup_runner(inv), "backup");
+            start_backup(&inv2);
+        }
     }
     eprintln!(
         "== decommission-node complete: {addr} removed; pair {pair_idx} runs on its remaining node(s)"
@@ -3732,6 +3860,30 @@ fn roll_edge(inv: &Inventory, envs: &[(String, String)]) {
             "control plane",
             "did not answer after the binary swap".into(),
         );
+    }
+
+    if inv.backup_to.is_some() {
+        eprintln!("== backup seat");
+        if let Err(e) = stop_seat(
+            inv,
+            &backup_runner(inv),
+            "backup",
+            "flint-backup",
+            &format!("{d}/backup-snaps"),
+            None,
+        ) {
+            die_on("backup", e);
+        }
+        if let Some(args) = backup_args(inv) {
+            spawn_env(
+                inv,
+                &backup_runner(inv),
+                "backup",
+                "flint-backup",
+                &args,
+                envs,
+            );
+        }
     }
 
     eprintln!("== proxies last (clients see one blip, over an already-new fleet)");
