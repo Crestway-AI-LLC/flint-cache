@@ -125,15 +125,18 @@ fn main() {
         Some("run") => run(),
         Some("verify") => verify(),
         Some("restore") => restore(),
+        Some("restore-ns") => restore_ns(),
         Some("inspect") => inspect(),
         Some("--build-version") => println!("{}", flint_build::version(env!("CARGO_PKG_VERSION"))),
         _ => {
             eprintln!(
                 "usage:\n  \
-                 flint-backup run     --pairs <a,b;c,d> --cp-state <path> --to <dir> \
+                 flint-backup run        --pairs <a,b;c,d> --cp-state <path> --to <dir> \
                  [--tls <certs-dir>] [--snap-root <dir>]\n  \
-                 flint-backup verify  --from <dir>\n  \
-                 flint-backup restore --from <dir> --into <dir>"
+                 flint-backup verify     --from <dir>\n  \
+                 flint-backup restore    --from <dir> --into <dir>\n  \
+                 flint-backup restore-ns --from <dir> --ns <src> --into-ns <dest> \
+                 --cp <addr> --proxy-name <registered-proxy> [--tls <certs-dir>]"
             );
             std::process::exit(2)
         }
@@ -320,6 +323,267 @@ fn restore() {
 #[cfg(not(feature = "rocks"))]
 fn restore() {
     die("restore requires a build with --features rocks (the D4 scrub opens the engine)");
+}
+
+/// Namespace-scoped restore (ADR-0011 D5): materialise one tenant's data
+/// from a backup set into a NEW namespace in a LIVE cluster.
+///
+/// The load-bearing decision is WHERE each row lands: by the cluster's
+/// ownership NOW, never the topology recorded in the backup. Slots move
+/// between pairs on rebalance and expand, and placing by the backup's
+/// topology would put rows on a node the proxy never routes that slot to —
+/// present, checksummed, and unreachable. So ownership comes from the same
+/// place the proxies get it: the CP's snapshot (default ranges plus the
+/// exceptions table), fetched at restore time.
+///
+/// The set is opened READ-ONLY. A normal engine open rewrites CURRENT and
+/// the WAL, which would corrupt the set's own checksums — reading a backup
+/// must never be the thing that makes it unrestorable.
+///
+/// Nothing here touches the destination's live namespace: rows are
+/// re-enveloped from <src ns> to <dest ns> and applied there (D3b — a bug
+/// in restore cannot damage serving data). System rows never enter the
+/// picture: the scan covers user CFs only, which is why this mode needs no
+/// D4 scrub (the ADR calls this out as the structurally safer mode).
+#[cfg(feature = "rocks")]
+fn restore_ns() {
+    use flint_storage::Kv;
+    let from = arg("--from").unwrap_or_else(|| die("restore-ns needs --from <set>"));
+    let src_ns = arg("--ns").unwrap_or_else(|| die("restore-ns needs --ns <source-ns>"));
+    let dest_ns = arg("--into-ns").unwrap_or_else(|| die("restore-ns needs --into-ns <dest-ns>"));
+    let cp = arg("--cp").unwrap_or_else(|| die("restore-ns needs --cp <addr>"));
+    // The CP filters its snapshot per proxy (tokens and exceptions are a
+    // blast-radius boundary), so the map is requested AS a registered proxy
+    // that serves the destination tenant.
+    let proxy_name =
+        arg("--proxy-name").unwrap_or_else(|| die("restore-ns needs --proxy-name <proxy-addr>"));
+    if src_ns == dest_ns {
+        die(
+            "--into-ns must differ from --ns: restore materialises a NEW namespace \
+             beside the live one (ADR-0011 D3); activation is a separate step",
+        );
+    }
+    let tls = arg("--tls").map(|d| {
+        flint_tls::client_config(
+            &format!("{d}/ca.crt"),
+            &format!("{d}/int.crt"),
+            &format!("{d}/int.key"),
+        )
+        .unwrap_or_else(|e| die(&format!("load mesh certs from {d}: {e}")))
+    });
+
+    let store = LocalDir::new(&from);
+    let (manifest, report) = match flint_backup::load_verified(&store) {
+        Ok(v) => v,
+        Err(e) => die(&e.to_string()),
+    };
+    println!(
+        "set {} verified: {} objects, {} bytes",
+        report.id, report.objects, report.bytes
+    );
+
+    // Current ownership, from the CP: pair addresses + default ranges, and
+    // the exceptions that override them for the DESTINATION namespace.
+    let snap = match call(
+        &cp,
+        &tls,
+        &["CPSNAPSHOT", &proxy_name],
+        Duration::from_secs(5),
+    ) {
+        Ok(Value::Array(Some(items))) => items,
+        other => die(&format!("CPSNAPSHOT via {cp}: {other:?}")),
+    };
+    let bulk = |i: usize| -> String {
+        match snap.get(i) {
+            Some(Value::Bulk(Some(b))) => String::from_utf8_lossy(b).into_owned(),
+            _ => String::new(),
+        }
+    };
+    let (pairs_spec, exc_spec) = (bulk(2), bulk(5));
+    let mut pair_addrs: Vec<Vec<String>> = Vec::new();
+    let mut ranges: Vec<Option<(u16, u16)>> = Vec::new();
+    for entry in pairs_spec.split(';').filter(|s| !s.is_empty()) {
+        let (members, range) = match entry.split_once('|') {
+            Some((m, r)) => {
+                let range = r
+                    .split_once('-')
+                    .and_then(|(a, b)| Some((a.parse().ok()?, b.parse().ok()?)));
+                (m, range)
+            }
+            None => (entry, None),
+        };
+        pair_addrs.push(members.split(',').map(str::to_string).collect());
+        ranges.push(range);
+    }
+    if pair_addrs.is_empty() {
+        die("the CP snapshot names no pairs — is the cluster bootstrapped?");
+    }
+    // Exceptions for the destination namespace: "ns:lo[-hi]:pair;...".
+    let mut exceptions: Vec<(u16, u16, usize)> = Vec::new();
+    for entry in exc_spec.split(';').filter(|s| !s.is_empty()) {
+        let mut f = entry.split(':');
+        let (Some(ns), Some(span), Some(pair)) = (f.next(), f.next(), f.next()) else {
+            continue;
+        };
+        if ns != dest_ns {
+            continue;
+        }
+        let (lo, hi) = match span.split_once('-') {
+            Some((a, b)) => (a.parse().ok(), b.parse().ok()),
+            None => (span.parse().ok(), span.parse().ok()),
+        };
+        if let (Some(lo), Some(hi), Ok(pair)) = (lo, hi, pair.parse()) {
+            exceptions.push((lo, hi, pair));
+        }
+    }
+    let owner_of = |slot: u16| -> usize {
+        exceptions
+            .iter()
+            .find(|(lo, hi, _)| (*lo..=*hi).contains(&slot))
+            .map(|(_, _, p)| *p)
+            .or_else(|| flint_slot::default_pair(slot, &ranges, pair_addrs.len()))
+            .unwrap_or(0)
+    };
+    // Resolve each pair's MASTER once, the same way the backup side does:
+    // by asking, never by position.
+    let masters: Vec<String> = pair_addrs
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            master_of(p, &tls)
+                .unwrap_or_else(|| die(&format!("pair {i} has no master among {p:?}")))
+        })
+        .collect();
+
+    // Stream rows out of every pair checkpoint in the set. The tenant's
+    // rows can be on ANY source pair (the backup's topology), and each row
+    // routes independently — which is exactly what makes this correct
+    // across topology change.
+    const BATCH_ROWS: usize = 200;
+    const BATCH_BYTES: usize = 1 << 20;
+    let mut batches: Vec<Vec<(Vec<u8>, Vec<u8>)>> = vec![Vec::new(); pair_addrs.len()];
+    let mut batch_bytes: Vec<usize> = vec![0; pair_addrs.len()];
+    let mut sent: Vec<u64> = vec![0; pair_addrs.len()];
+    let flush = |pair: usize, batch: &mut Vec<(Vec<u8>, Vec<u8>)>, bytes: &mut usize| {
+        if batch.is_empty() {
+            return 0u64;
+        }
+        let mut cmd: Vec<Vec<u8>> = Vec::with_capacity(2 + batch.len() * 2);
+        cmd.push(b"FLINTNSRESTORE".to_vec());
+        cmd.push(dest_ns.as_bytes().to_vec());
+        for (k, v) in batch.iter() {
+            cmd.push(k.clone());
+            cmd.push(v.clone());
+        }
+        let n = batch.len() as u64;
+        match call_raw(&masters[pair], &tls, &cmd, Duration::from_secs(30)) {
+            Ok(Value::Simple(_)) => {}
+            other => die(&format!(
+                "restore batch to pair {pair} ({}): {other:?}",
+                masters[pair]
+            )),
+        }
+        batch.clear();
+        *bytes = 0;
+        n
+    };
+    for pair in &manifest.pairs {
+        // The checkpoint is read in place, read-only — see the fn comment.
+        let src_dir = std::path::Path::new(&from).join(format!("pairs/{}", pair.index));
+        let kv = flint_storage::rocks::RocksKv::open_read_only(&src_dir)
+            .unwrap_or_else(|e| die(&format!("open set pair {} read-only: {e}", pair.index)));
+        for cf in [b'M', b'S', b'Z'] {
+            let mut prefix = vec![cf, src_ns.len() as u8];
+            prefix.extend_from_slice(src_ns.as_bytes());
+            kv.for_each_prefix(&prefix, &mut |k, v| {
+                // Re-envelope: swap the namespace, keep everything from the
+                // slot onward — the slot derives from the USER key, which
+                // is unchanged, so it stays byte-identical.
+                let tail = &k[2 + src_ns.len()..];
+                let slot = u16::from_be_bytes([tail[0], tail[1]]);
+                let mut nk = Vec::with_capacity(2 + dest_ns.len() + tail.len());
+                nk.push(cf);
+                nk.push(dest_ns.len() as u8);
+                nk.extend_from_slice(dest_ns.as_bytes());
+                nk.extend_from_slice(tail);
+                let owner = owner_of(slot);
+                batches[owner].push((nk, v.to_vec()));
+                batch_bytes[owner] += k.len() + v.len();
+                if batches[owner].len() >= BATCH_ROWS || batch_bytes[owner] >= BATCH_BYTES {
+                    sent[owner] += flush(owner, &mut batches[owner], &mut batch_bytes[owner]);
+                }
+                true
+            });
+        }
+    }
+    for pair in 0..pair_addrs.len() {
+        sent[pair] += flush(pair, &mut batches[pair], &mut batch_bytes[pair]);
+    }
+
+    let total: u64 = sent.iter().sum();
+    if total == 0 {
+        // Loud, not a quiet success: an empty restore of a namespace the
+        // manifest was supposed to contain usually means the wrong --ns.
+        die(&format!(
+            "the set contains no rows for namespace {src_ns:?} — nothing was restored \
+             (wrong --ns, or the tenant was empty at backup time)"
+        ));
+    }
+    let placed: Vec<String> = sent
+        .iter()
+        .enumerate()
+        .filter(|(_, n)| **n > 0)
+        .map(|(i, n)| format!("pair {i}: {n} rows"))
+        .collect();
+    println!(
+        "OK restored {total} rows of {src_ns:?} into namespace {dest_ns:?} by current \
+         ownership ({}); the live namespace was not touched",
+        placed.join(", ")
+    );
+}
+
+#[cfg(not(feature = "rocks"))]
+fn restore_ns() {
+    die("restore-ns requires a build with --features rocks");
+}
+
+/// `call` for pre-encoded binary arguments (envelope keys are not UTF-8).
+#[cfg(feature = "rocks")]
+fn call_raw(
+    addr: &str,
+    tls: &Option<Arc<flint_tls::ClientConfig>>,
+    args: &[Vec<u8>],
+    timeout: Duration,
+) -> std::io::Result<Value> {
+    let mut s = flint_tls::connect(addr, tls)?;
+    s.set_read_timeout(Some(timeout))?;
+    s.set_write_timeout(Some(timeout))?;
+    let mut out = Vec::new();
+    encode(
+        &Value::Array(Some(
+            args.iter().map(|a| Value::Bulk(Some(a.clone()))).collect(),
+        )),
+        &mut out,
+    );
+    s.write_all(&out)?;
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 16384];
+    loop {
+        match decode(&buf) {
+            Ok(Decoded::Complete(v, _)) => return Ok(v),
+            Ok(Decoded::NeedMore) => {
+                let n = s.read(&mut chunk)?;
+                if n == 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "closed",
+                    ));
+                }
+                buf.extend_from_slice(&chunk[..n]);
+            }
+            Err(e) => return Err(std::io::Error::other(format!("{e:?}"))),
+        }
+    }
 }
 
 /// List a data dir's system rows — ADR-0011's verification item 2 made a

@@ -26,6 +26,9 @@ flint-build = { path = "../flint-build" }
 # restore only (feature `rocks`, mirroring flint-server): the D4 scrub opens
 # the restored checkpoint to rewrite system rows, which needs the engine.
 flint-storage = { path = "../flint-storage", optional = true }
+# restore-ns routing: the same default_pair the proxy routes by, so the
+# restore and the router cannot disagree about ownership.
+flint-slot = { path = "../flint-slot", optional = true }
 
 [features]
-rocks = ["dep:flint-storage", "flint-storage/rocksdb"]
+rocks = ["dep:flint-storage", "flint-storage/rocksdb", "dep:flint-slot"]

@@ -129,6 +129,22 @@ impl RocksKv {
 }
 
 impl RocksKv {
+    /// Open without the ability — or the side effects — of writing.
+    ///
+    /// A normal `open` MUTATES the directory (a fresh CURRENT, a new WAL,
+    /// an updated MANIFEST), which is invisible on a data dir and corrupting
+    /// on a backup set: every one of those files is checksummed in the set's
+    /// manifest, so reading a set with `open` makes it unrestorable. The
+    /// namespace-scoped restore reads checkpoints straight out of a set,
+    /// hence this. WAL contents are still visible (replayed in memory).
+    pub fn open_read_only(path: &Path) -> Result<Self, rocksdb::Error> {
+        Ok(Self {
+            db: DB::open_for_read_only(&Options::default(), path, false)?,
+            path: path.to_path_buf(),
+            wal_fsyncs: std::sync::atomic::AtomicU64::new(0),
+        })
+    }
+
     pub fn open(path: &Path) -> Result<Self, rocksdb::Error> {
         let mut opts = Options::default();
         opts.create_if_missing(true);

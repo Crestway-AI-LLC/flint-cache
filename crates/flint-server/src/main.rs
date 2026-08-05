@@ -1744,6 +1744,25 @@ fn execute(
     {
         return flintdemote(read_only, rocks, args);
     }
+    // FLINTNSRESTORE <ns> <k> <v> [<k> <v> ...]: apply pre-enveloped rows
+    // for namespace <ns> as ONE engine batch — the write half of the
+    // namespace-scoped restore (ADR-0011 D5). The CALLER routes: placement
+    // by current ownership comes from the CP map, which nodes do not hold
+    // for tenant namespaces, so this command applies what it is given the
+    // way FLINTNS trusts its caller — the data port is the internal
+    // surface. What it does NOT trust is the rows themselves: every key
+    // must be a well-formed envelope whose embedded namespace is <ns>,
+    // because the blast radius of a malformed batch is another tenant's
+    // keyspace.
+    if args
+        .first()
+        .is_some_and(|n| n.eq_ignore_ascii_case(b"FLINTNSRESTORE"))
+    {
+        if ro {
+            return Value::Error("READONLY cannot restore into a replica".into());
+        }
+        return flintnsrestore(rocks, args);
+    }
     // FLINTMIGRATEIN <src host:port> <slot>: pull a slot's data from a live
     // source into this master (bulk snapshot + slot-filtered tail). Rejected
     // on a replica — the imported slot must land on the destination's master.
@@ -1932,6 +1951,51 @@ fn execute(
         Dispatcher::with_limits(store, flint_storage::strings::system_clock, limits, conn_ns)
             .dispatch(args)
     }
+}
+
+/// The apply half of FLINTNSRESTORE (see the dispatch comment). One
+/// `apply_writes` per invocation: one WriteBatch, one WAL group, so a
+/// replica tailing this master applies the batch whole.
+#[cfg(feature = "rocks")]
+fn flintnsrestore(rocks: &Option<RocksHandle>, args: &[Vec<u8>]) -> Value {
+    let Some(kv) = rocks else {
+        return Value::Error("ERR FLINTNSRESTORE requires the rocks engine".into());
+    };
+    let (Some(ns), rows) = (args.get(1), &args[2..]) else {
+        return Value::Error("ERR FLINTNSRESTORE <ns> <key> <value> [...]".into());
+    };
+    if rows.is_empty() || !rows.len().is_multiple_of(2) {
+        return Value::Error("ERR FLINTNSRESTORE takes key/value pairs".into());
+    }
+    let mut ops = Vec::with_capacity(rows.len() / 2);
+    for pair in rows.chunks(2) {
+        let key = &pair[0];
+        // Envelope: cf(1) | ns_len(1) | ns | slot(2 BE) | user_key. The
+        // namespace check is the tenant boundary; the shape checks keep a
+        // truncated frame from becoming a row that no scan will ever find
+        // (or worse, a row in whatever namespace the garbage bytes spell).
+        let valid = key.len() >= 4
+            && matches!(key[0], b'M' | b'S' | b'Z')
+            && key.get(1).is_some_and(|&l| {
+                key.len() >= 2 + l as usize + 2 && &key[2..2 + l as usize] == ns.as_slice()
+            });
+        if !valid {
+            return Value::Error(format!(
+                "ERR row is not a well-formed envelope for namespace {:?} — nothing applied",
+                String::from_utf8_lossy(ns)
+            ));
+        }
+        ops.push((key.clone(), Some(pair[1].clone())));
+    }
+    match kv.apply_writes(&ops) {
+        Ok(()) => Value::Simple(format!("OK {} rows", ops.len())),
+        Err(e) => Value::Error(format!("ERR restore batch: {e}")),
+    }
+}
+
+#[cfg(not(feature = "rocks"))]
+fn flintnsrestore(_rocks: &Option<RocksHandle>, _args: &[Vec<u8>]) -> Value {
+    Value::Error("ERR FLINTNSRESTORE requires a build with --features rocks".into())
 }
 
 /// FLINTPROMOTE <generation> <counter>: epoch-fenced promotion of a
