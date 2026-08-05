@@ -191,11 +191,62 @@ so it cannot be silently rolled forward by a restore either.
 The target is any S3-compatible endpoint, not AWS S3 specifically; on-prem
 evaluators have their own object stores and are part of the audience.
 
-Backup and restore ship in **`flintctl`, in this repository**, under ELv2. The
-open-core promise is "everything needed to run AND operate Flint yourself",
-and an operator who cannot back up cannot operate. Scheduling, retention
-policy, the tenant-facing catalog and fleet orchestration live in the managed
-plane; the primitive does not.
+Backup and restore ship **in this repository** under ELv2. The open-core
+promise is "everything needed to run AND operate Flint yourself", and an
+operator who cannot back up cannot operate. The tenant-facing catalog,
+retention sold as a product, billing and fleet-wide orchestration live in the
+managed plane; the primitive and its scheduling do not.
+
+**They ship as their own seat, `flint-backup`, not inside `flintctl`** — this
+supersedes the first version of D8, which put them in `flintctl`. Three
+reasons, in the order they matter:
+
+- **Supply chain.** `flintctl` has no external dependencies at all. It runs as
+  root on every host and performs bootstrap, failover and rolls. Linking an S3
+  SDK into it makes every CVE in that dependency tree a CVE in the tool that
+  controls the cluster, to buy nothing the cluster's control path uses.
+- **Credentials.** Backup holds object-store keys; `flintctl` holds mesh certs
+  and SSH. Separate processes mean a leaked bucket key does not reach cluster
+  control, and a compromised orchestrator does not hand over the archive.
+- **Lifecycle.** `flintctl` is a short-lived CLI. Backup is scheduled,
+  retrying and monitored — the shape `flint-controller`, the agent and
+  `flint-exporter` already have. `flintctl backup on` declares and supervises
+  the seat exactly as `controller on` does, and never links the SDK.
+
+The artifact itself — manifest, checksums, layout, verify, restore — lives in
+a **library** both the seat and any future caller use, because a format with
+two implementations has two formats.
+
+**Restore must not require the backup service to be healthy.** Disaster
+recovery is precisely when the scheduler, the monitoring and possibly the
+control plane are down, so `flint-backup restore` is a one-shot needing only
+credentials, a manifest location and a target inventory: no daemon, no local
+state, no CP. A recovery path that depends on the policy layer has made the
+policy layer a single point of failure for recovery.
+
+**Backup is a scheduled JOB under a policy, not a bespoke timer**, and the
+policy drives three job types:
+
+| Job | What it proves |
+|---|---|
+| `backup` | an artifact exists |
+| `verify` | it is intact |
+| `restore-rehearsal` | it can actually be restored |
+
+The alertable metric is **the age of the newest artifact that has been
+restored**, not the age of the newest artifact. A nightly job that succeeds
+and produces unrestorable output is indistinguishable from a healthy one by
+run count, and that is the failure this whole record exists to prevent.
+
+Scheduling lives in a small shared library rather than a scheduler *seat*: a
+separate scheduler process is a new failure domain that must reach into other
+components to fire them. The hard parts — missed windows, clock jumps,
+overlap prevention (a checkpoint pins SSTs against compaction, so two
+overlapping backups pin twice), jitter, backoff, last-outcome reporting — get
+one implementation. The controller's snapshot cadence, the agent's
+consolidation cron and the GC sweeper are existing hand-rolled instances and
+are candidates to migrate, but not speculatively: backup proves the library
+first.
 
 **Checkpoint cadence is a property of the cluster, not the tenant** —
 checkpoints are physical and shared by every tenant on the pair. The managed
@@ -290,3 +341,13 @@ Nothing here is believed until a drill fails without it.
 7. **Isolation is real.** A restored cluster and its source running
    simultaneously must fail to reach each other — assert the mTLS failure, so
    D4's second defence is evidence rather than reasoning.
+8. **The scheduler does not overlap itself.** Drive a job whose run outlasts
+   its own interval and assert exactly one is in flight. Two concurrent
+   backups pin two checkpoints' worth of SSTs against compaction, so this
+   fails as disk exhaustion on a healthy cluster rather than as a backup
+   error.
+9. **A corrupt artifact reads as UNRESTORABLE, not as a healthy backup.**
+   Corrupt the newest artifact, run the policy, and assert the alertable
+   metric goes stale — the restore-rehearsal age, not the run count. This is
+   the assertion that must fail if the metric is ever changed back to
+   counting job runs.
