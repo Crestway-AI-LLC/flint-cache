@@ -29,6 +29,7 @@ pub mod manifest;
 pub mod migration;
 pub mod sets;
 pub mod strings;
+pub mod watch;
 pub mod zsets;
 
 #[cfg(feature = "rocksdb")]

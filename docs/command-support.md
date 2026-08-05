@@ -50,8 +50,7 @@ DB 0), RENAME, RENAMENX.
 > re-aim: renaming a collection costs what copying it costs. Strings and
 > JSON documents are O(1), since their metadata row *is* the value.
 
-**Transactions**: MULTI, EXEC, DISCARD (same-slot). WATCH/UNWATCH are not
-implemented yet — see ADR-0012.
+**Transactions**: MULTI, EXEC, DISCARD, WATCH, UNWATCH (same-slot).
 
 > **What a Flint transaction guarantees, and what it does not.** Three
 > promises, all of them real: every command's writes land in ONE engine
@@ -81,6 +80,18 @@ implemented yet — see ADR-0012.
 > Commands inside a transaction see each other's effects, collections
 > included — `SADD` then `SMEMBERS` in one transaction returns the member
 > just added.
+>
+> **WATCH** arms optimistic concurrency: if any watched key is modified
+> between WATCH and EXEC — by any client including your own connection, and
+> counting expiry and deletion as modifications — EXEC does nothing and
+> replies with a null array, and you retry. EXEC and DISCARD both clear the
+> watches. WATCH is refused inside a transaction, since a watch added after
+> MULTI could only describe a window that has already closed.
+>
+> Detection is conservative by construction: it may occasionally abort a
+> transaction whose watched key did not actually change, and it will never
+> miss one that did. A needless abort costs a retry; a missed modification
+> would cost an update.
 
 **JSON documents**: JSON.SET (NX, XX), JSON.GET, JSON.DEL / JSON.FORGET,
 JSON.TYPE, JSON.NUMINCRBY, JSON.ARRAPPEND, JSON.ARRLEN.

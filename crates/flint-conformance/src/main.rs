@@ -19,9 +19,13 @@ use flint_resp::{Decoded, Proto, Value, decode, encode};
 /// What a step's reply must look like.
 #[derive(Debug, Clone)]
 enum Expect {
-    Ok,                   // +OK
-    Pong,                 // +PONG
-    Nil,                  // $-1
+    Ok,   // +OK
+    Pong, // +PONG
+    Nil,  // $-1
+    /// `*-1` — a null ARRAY, which is a different reply from a null bulk
+    /// and the one an aborted EXEC returns. Kept separate so a case cannot
+    /// assert "nil" and accidentally accept either.
+    NilArray,
     Int(i64),             // :n
     IntRange(i64, i64),   // :n where lo <= n <= hi (TTL imprecision)
     Simple(&'static str), // +text
@@ -1100,6 +1104,71 @@ fn corpus() -> Vec<Case> {
                     ],
                     Expect::Int(8),
                 ),
+            ],
+        },
+        Case {
+            family: "transactions",
+            name: "watch unwatch (single connection)",
+            steps: vec![
+                // The multi-CLIENT races WATCH exists for cannot be
+                // expressed here — this harness is one connection — so they
+                // live in the differential probe instead. What IS expressible
+                // is everything a single connection can observe, and the
+                // self-write case below is the one that proves the mechanism
+                // rather than just the plumbing.
+                s(&[b"SET", b"{wt}k", b"1"], Expect::Ok),
+                s(&[b"WATCH", b"{wt}k"], Expect::Ok),
+                s(&[b"MULTI"], Expect::Ok),
+                s(&[b"SET", b"{wt}k", b"2"], Expect::Simple("QUEUED")),
+                // Untouched since WATCH: commits.
+                s(&[b"EXEC"], Expect::Arr(vec![Expect::Ok])),
+                s(&[b"GET", b"{wt}k"], Expect::Str(b"2")),
+                // A write by THIS connection between WATCH and EXEC still
+                // breaks the watch — WATCH tracks the key, not the author.
+                s(&[b"WATCH", b"{wt}k"], Expect::Ok),
+                s(&[b"SET", b"{wt}k", b"3"], Expect::Ok),
+                s(&[b"MULTI"], Expect::Ok),
+                s(&[b"SET", b"{wt}k", b"4"], Expect::Simple("QUEUED")),
+                s(&[b"EXEC"], Expect::NilArray),
+                s(&[b"GET", b"{wt}k"], Expect::Str(b"3")),
+                // EXEC clears the watch, so the NEXT transaction is armed
+                // by nothing and commits despite the intervening write.
+                s(&[b"SET", b"{wt}k", b"5"], Expect::Ok),
+                s(&[b"MULTI"], Expect::Ok),
+                s(&[b"SET", b"{wt}k", b"6"], Expect::Simple("QUEUED")),
+                s(&[b"EXEC"], Expect::Arr(vec![Expect::Ok])),
+                // UNWATCH disarms.
+                s(&[b"WATCH", b"{wt}k"], Expect::Ok),
+                s(&[b"UNWATCH"], Expect::Ok),
+                s(&[b"SET", b"{wt}k", b"7"], Expect::Ok),
+                s(&[b"MULTI"], Expect::Ok),
+                s(&[b"GET", b"{wt}k"], Expect::Simple("QUEUED")),
+                s(&[b"EXEC"], Expect::Arr(vec![Expect::Str(b"7")])),
+                // DISCARD clears watches as well as the queue.
+                s(&[b"WATCH", b"{wt}k"], Expect::Ok),
+                s(&[b"MULTI"], Expect::Ok),
+                s(&[b"DISCARD"], Expect::Ok),
+                s(&[b"SET", b"{wt}k", b"8"], Expect::Ok),
+                s(&[b"MULTI"], Expect::Ok),
+                s(&[b"GET", b"{wt}k"], Expect::Simple("QUEUED")),
+                s(&[b"EXEC"], Expect::Arr(vec![Expect::Str(b"8")])),
+                // A watched COLLECTION: the mutation lands in rows a watch
+                // does not track, so this is what proves the watch follows
+                // the metadata row every type updates.
+                s(&[b"SADD", b"{wt}s", b"a"], Expect::Int(1)),
+                s(&[b"WATCH", b"{wt}s"], Expect::Ok),
+                s(&[b"SADD", b"{wt}s", b"b"], Expect::Int(1)),
+                s(&[b"MULTI"], Expect::Ok),
+                s(&[b"SCARD", b"{wt}s"], Expect::Simple("QUEUED")),
+                s(&[b"EXEC"], Expect::NilArray),
+                // WATCH is refused inside a transaction; UNWATCH outside one
+                // is fine.
+                s(&[b"MULTI"], Expect::Ok),
+                s(&[b"WATCH", b"{wt}k"], Expect::AnyError),
+                s(&[b"DISCARD"], Expect::Ok),
+                s(&[b"UNWATCH"], Expect::Ok),
+                s(&[b"WATCH"], Expect::AnyError),
+                s(&[b"DEL", b"{wt}k", b"{wt}s"], Expect::Int(2)),
             ],
         },
         Case {
@@ -2724,6 +2793,7 @@ fn matches(expect: &Expect, got: &Value) -> bool {
         Expect::Ok => *got == Value::Simple("OK".into()),
         Expect::Pong => *got == Value::Simple("PONG".into()),
         Expect::Nil => *got == Value::Bulk(None),
+        Expect::NilArray => *got == Value::Array(None),
         Expect::Int(i) => *got == Value::Integer(*i),
         Expect::IntRange(lo, hi) => matches!(got, Value::Integer(n) if n >= lo && n <= hi),
         Expect::Simple(t) => *got == Value::Simple((*t).into()),

@@ -589,6 +589,18 @@ fn main() -> std::io::Result<()> {
         }
     }
 
+    // WATCH's modification tracking (ADR-0012 D5). Wrapped around the store
+    // HERE, once, before anything clones it — so the GC sweeper, the
+    // read-path lazy expiry, a transaction's commit and the async queue's
+    // commit are all covered by construction. Wrapping at the command layer
+    // instead would miss every one of those, and a missed modification is a
+    // lost update.
+    let watch = Arc::new(flint_storage::watch::WatchTable::new());
+    let store: Arc<dyn Kv> = Arc::new(flint_storage::watch::WatchedKv::new(
+        store,
+        Arc::clone(&watch),
+    ));
+
     // RPO knobs: --lag-soft-ms delays writes, --lag-hard-ms sheds them.
     // The hard cap is the advertised worst-case failover RPO (per-tenant
     // tiers arrive with the control plane).
@@ -829,6 +841,7 @@ fn main() -> std::io::Result<()> {
         let lease_deadline = Arc::clone(&lease_deadline);
         let migration_active = Arc::clone(&migration_active);
         let write_queue = write_queue.clone();
+        let watch = Arc::clone(&watch);
         // Snapshot the CURRENT leaf per connection — a hot-reload between
         // connections is picked up here (ADR-0006 D4).
         let internal_tls = internal_reload.as_ref().and_then(|r| r.current());
@@ -854,6 +867,7 @@ fn main() -> std::io::Result<()> {
                 &migration_active,
                 limits,
                 write_queue.as_ref(),
+                &watch,
             );
         });
     }
@@ -884,6 +898,7 @@ fn serve(
     migration_active: &Arc<AtomicBool>,
     limits: commands::Limits,
     write_queue: Option<&Arc<write_queue::WriteQueue>>,
+    watch: &Arc<flint_storage::watch::WatchTable>,
 ) -> std::io::Result<()> {
     let mut buf: Vec<u8> = Vec::with_capacity(16 * 1024);
     let mut chunk = [0u8; 16 * 1024];
@@ -899,7 +914,7 @@ fn serve(
     // Connection-scoped transaction (ADR-0012). None = no MULTI open. It
     // dies with the connection, which is what makes a transaction unable to
     // survive a failover half-applied.
-    let mut conn_txn: Option<Txn> = None;
+    let mut conn_txn = TxnState::default();
     loop {
         let mut consumed = 0;
         out.clear();
@@ -945,6 +960,7 @@ fn serve(
                     &mut conn_async,
                     &mut conn_proto,
                     &mut conn_txn,
+                    watch,
                     &args,
                 );
                 encode_proto(&reply, conn_proto, &mut out);
@@ -1010,6 +1026,7 @@ fn serve(
                         &mut conn_async,
                         &mut conn_proto,
                         &mut conn_txn,
+                        watch,
                         &args,
                     );
                     encode_proto(&reply, conn_proto, &mut out);
@@ -1055,6 +1072,38 @@ fn serve(
 /// promoted master has no queue and no watch state, so a transaction can
 /// never survive a failover into a half-applied form — the connection to
 /// the dead master goes with it (D8).
+/// Everything transactional about ONE connection.
+///
+/// Watches and the command queue are separate because their lifetimes are:
+/// WATCH is issued BEFORE MULTI and must survive until EXEC or DISCARD,
+/// while the queue exists only between MULTI and EXEC.
+#[derive(Default)]
+pub(crate) struct TxnState {
+    open: Option<Txn>,
+    /// (metadata envelope of a watched key, its stripe value when watched).
+    /// Empty is the overwhelmingly common case, so this allocates nothing
+    /// for connections that never WATCH.
+    watches: Vec<(Vec<u8>, u64)>,
+}
+
+impl TxnState {
+    /// Every path out of a transaction clears the watches — EXEC whether it
+    /// committed or aborted, and DISCARD. Upstream does this and it matters:
+    /// a watch left armed would abort the NEXT transaction for a change the
+    /// client has already accounted for.
+    fn end(&mut self) {
+        self.open = None;
+        self.watches.clear();
+    }
+
+    /// Has anything we watched moved since we watched it?
+    fn watches_broken(&self, table: &flint_storage::watch::WatchTable) -> bool {
+        self.watches
+            .iter()
+            .any(|(envelope, seen)| table.version(envelope) != *seen)
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct Txn {
     /// Commands accepted so far, in order.
@@ -1077,7 +1126,8 @@ fn transaction_control(
     rocks: &Option<RocksHandle>,
     limits: commands::Limits,
     conn_ns: &[u8],
-    conn_txn: &mut Option<Txn>,
+    conn_txn: &mut TxnState,
+    watch: &Arc<flint_storage::watch::WatchTable>,
     args: &[Vec<u8>],
 ) -> Option<Value> {
     let name = args
@@ -1086,7 +1136,7 @@ fn transaction_control(
         .unwrap_or_default();
     match name.as_slice() {
         b"MULTI" => {
-            if conn_txn.is_some() {
+            if conn_txn.open.is_some() {
                 // Upstream's wording, checked against a live server rather
                 // than recalled — it is the generic "not allowed inside a
                 // transaction" form, not the older "cannot be nested".
@@ -1094,24 +1144,70 @@ fn transaction_control(
                     "ERR Command 'multi' not allowed inside a transaction".into(),
                 ));
             }
-            *conn_txn = Some(Txn::default());
+            conn_txn.open = Some(Txn::default());
+            return Some(Value::Simple("OK".into()));
+        }
+        // WATCH / UNWATCH. Both are connection state, and WATCH is refused
+        // inside a transaction: the point of a watch is to be armed BEFORE
+        // the commands that depend on it are queued, so one added midway
+        // could only ever describe a window that has already closed.
+        b"WATCH" => {
+            if conn_txn.open.is_some() {
+                return Some(Value::Error(
+                    "ERR Command 'watch' not allowed inside a transaction".into(),
+                ));
+            }
+            if args.len() < 2 {
+                return Some(Value::Error(
+                    "ERR wrong number of arguments for 'watch' command".into(),
+                ));
+            }
+            for key in &args[1..] {
+                // A watch records the key's METADATA row, which every
+                // mutation of every type writes — including the lazy-expiry
+                // and GC deletes that never pass through a command.
+                let envelope = flint_storage::encoding::envelope(
+                    flint_storage::encoding::Cf::Metadata,
+                    conn_ns,
+                    flint_slot::slot_for_key(key),
+                    key,
+                );
+                let seen = watch.version(&envelope);
+                conn_txn.watches.push((envelope, seen));
+            }
+            return Some(Value::Simple("OK".into()));
+        }
+        b"UNWATCH" => {
+            conn_txn.watches.clear();
             return Some(Value::Simple("OK".into()));
         }
         b"DISCARD" => {
-            return Some(if conn_txn.take().is_some() {
+            let had = conn_txn.open.is_some();
+            conn_txn.end();
+            return Some(if had {
                 Value::Simple("OK".into())
             } else {
                 Value::Error("ERR DISCARD without MULTI".into())
             });
         }
         b"EXEC" => {
-            let Some(txn) = conn_txn.take() else {
+            let Some(txn) = conn_txn.open.take() else {
                 return Some(Value::Error("ERR EXEC without MULTI".into()));
             };
             if txn.poisoned {
+                conn_txn.end();
                 return Some(Value::Error(
                     "EXECABORT Transaction discarded because of previous errors.".into(),
                 ));
+            }
+            // The optimistic check. A watched key that moved means the
+            // world changed under the client's assumptions, so the whole
+            // transaction is abandoned and the client retries — reported as
+            // a null reply, which is how a Redis client recognises it.
+            let broken = conn_txn.watches_broken(watch);
+            conn_txn.end();
+            if broken {
+                return Some(Value::Array(None));
             }
             return Some(exec_transaction(
                 store, read_only, rocks, limits, conn_ns, txn,
@@ -1121,7 +1217,7 @@ fn transaction_control(
     }
     // Not a transaction verb. If one is open, this command is queued
     // instead of run.
-    let txn = conn_txn.as_mut()?;
+    let txn = conn_txn.open.as_mut()?;
     if let Some(e) = commands::queue_time_error(args) {
         // Poison and report. The client sees the error now, while it still
         // knows which command it sent; EXEC will refuse the whole batch.
@@ -1276,7 +1372,8 @@ fn execute(
     conn_ns: &mut Vec<u8>,
     conn_async: &mut bool,
     conn_proto: &mut flint_resp::Proto,
-    conn_txn: &mut Option<Txn>,
+    conn_txn: &mut TxnState,
+    watch: &Arc<flint_storage::watch::WatchTable>,
     args: &[Vec<u8>],
 ) -> Value {
     // HELLO: protocol negotiation, answered here rather than in the
@@ -1333,9 +1430,9 @@ fn execute(
     // MULTI / EXEC / DISCARD (ADR-0012). Answered here rather than in the
     // command table for the reason HELLO and FLINTNS are: they mutate THIS
     // connection's state, and the dispatcher is deliberately stateless.
-    if let Some(reply) =
-        transaction_control(store, read_only, rocks, limits, conn_ns, conn_txn, args)
-    {
+    if let Some(reply) = transaction_control(
+        store, read_only, rocks, limits, conn_ns, conn_txn, watch, args,
+    ) {
         return reply;
     }
     if args
@@ -2722,6 +2819,7 @@ mod serve_tests {
                         &Arc::new(AtomicBool::new(false)),
                         commands::Limits::default(),
                         None,
+                        &Arc::new(flint_storage::watch::WatchTable::new()),
                     );
                 });
             }
