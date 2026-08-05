@@ -97,6 +97,36 @@ If your data lives *only* in Flint and losing the last second of it would
 matter, run a database as well. Every number above is measured by a drill in
 this repository with the command to reproduce it: **[docs/slo.md](docs/slo.md)**.
 
+## What happens when the disk fills — there is no eviction
+
+Flint never evicts an unexpired key. Coming from Redis you might expect a
+`maxmemory-policy`; there deliberately isn't one — an eviction policy is a
+way of silently losing data the client believed was stored, and this
+project's whole posture is that loss should be bounded, loud, and chosen.
+Instead, pressure is handled by refusal, in layers:
+
+- **Per-tenant quotas** shed a tenant's writes with `-QUOTA` at their own
+  cap, long before the host is at risk.
+- **The host disk guard** fires EARLY (defaults: under 10% free or under
+  2 GiB, whichever is stricter) — an LSM needs headroom to compact, and a
+  disk allowed to actually fill produces a node that cannot dig itself
+  out, because freeing space means deleting, deletes are writes, and
+  reclaiming the bytes needs the compaction that has no room to run.
+  While shedding: space-growing writes are refused with an error that says
+  it is the server and not the tenant's cap, **reads serve normally**, and
+  the delete path (`DEL`, `UNLINK`, `EXPIRE`, `FLUSHALL`) keeps working so
+  the condition can clear itself. The node reopens on its own once space
+  returns, with hysteresis so it does not flap. `tools/disk_pressure_drill.sh`
+  proves all of this against a genuinely full filesystem, including that
+  nothing already written is lost.
+- **Space returns** through TTL expiry (a compaction filter reclaims
+  expired rows as compaction rewrites them) and on-demand `FLINTCOMPACT`.
+
+The operational consequence: size for the working set and use TTLs. A
+cache that is full of unexpired data does not silently shed someone
+else's keys to make room for yours — it tells you, and keeps serving
+reads while you decide.
+
 [docs/security.md](docs/security.md) is the security posture — mutual TLS
 everywhere internally, tokens stored as digests, and an explicit list of what
 Flint does *not* do (no encryption at rest, no RBAC, no IAM).

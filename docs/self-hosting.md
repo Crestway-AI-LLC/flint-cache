@@ -108,6 +108,17 @@ fill target.
 > and per-tenant sizing — is in [capacity-model.md](capacity-model.md); the
 > numbers above are its load-bearing conclusions.
 
+**Size for the working set: Flint never evicts.** There is no
+`maxmemory-policy` equivalent — an unexpired key is never dropped to make
+room. When a tenant hits their quota, their writes shed with `-QUOTA`;
+when the HOST runs low on disk (under 10% free or 2 GiB, whichever is
+stricter — an LSM needs headroom to compact), the node refuses
+space-growing writes early, keeps serving reads and the delete path, and
+reopens by itself once space returns. So the plan is: provision for the
+full working set, use TTLs so space returns on its own, and alert on
+`disk_free_pct` / `disk_verdict` in `FLINTINFO` (the exporter surfaces
+both) well before the guard fires.
+
 ## 2. Configuration files
 
 One file: the **flintctl inventory** (`cluster.flint` above). It is the
