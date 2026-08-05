@@ -14,6 +14,16 @@ pub struct SetStore<'a> {
     max_value_bytes: u64,
 }
 
+/// Which fold `sop` performs. Named rather than three near-identical
+/// methods so the shared "read each key once, stop early when the answer
+/// cannot change" logic has exactly one implementation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SetOp {
+    Inter,
+    Union,
+    Diff,
+}
+
 impl<'a> SetStore<'a> {
     pub fn new(kv: &'a dyn Kv, ns: &[u8], clock: Clock) -> Self {
         Self::with_max_value_bytes(kv, ns, clock, crate::DEFAULT_MAX_VALUE_BYTES)
@@ -145,6 +155,42 @@ impl<'a> SetStore<'a> {
 
     pub fn scard(&self, slot: u16, key: &[u8]) -> Result<u64, StoreError> {
         Ok(self.read_meta(slot, key)?.map_or(0, |m| m.size as u64))
+    }
+
+    /// SINTER / SUNION / SDIFF over keys the CALLER has already established
+    /// live in one slot.
+    ///
+    /// Slot agreement is the proxy's job, not this layer's: the proxy owns
+    /// routing and is the only component that can reject a cross-slot request
+    /// before it reaches a node that holds only some of the keys. A node
+    /// asked for a key it does not own would return an empty set, and an
+    /// intersection against a phantom empty set is silently wrong rather than
+    /// loudly refused — so the assertion lives where it can be enforced.
+    ///
+    /// Order is Redis's: the first key seeds the accumulator and the rest
+    /// fold into it. Membership is a set, so results are unordered — the
+    /// conformance corpus compares them as sets, not sequences.
+    pub fn sop(&self, slot: u16, op: SetOp, keys: &[Vec<u8>]) -> Result<Vec<Vec<u8>>, StoreError> {
+        let Some((first, rest)) = keys.split_first() else {
+            return Ok(Vec::new());
+        };
+        let mut acc: std::collections::HashSet<Vec<u8>> =
+            self.smembers(slot, first)?.into_iter().collect();
+        for k in rest {
+            let other: std::collections::HashSet<Vec<u8>> =
+                self.smembers(slot, k)?.into_iter().collect();
+            match op {
+                SetOp::Inter => acc.retain(|m| other.contains(m)),
+                SetOp::Union => acc.extend(other),
+                SetOp::Diff => acc.retain(|m| !other.contains(m)),
+            }
+            // An empty intersection or difference cannot grow again, so stop
+            // reading keys whose contents can no longer change the answer.
+            if acc.is_empty() && !matches!(op, SetOp::Union) {
+                break;
+            }
+        }
+        Ok(acc.into_iter().collect())
     }
 
     /// SPOP: remove and return up to `count` random members. Randomness is

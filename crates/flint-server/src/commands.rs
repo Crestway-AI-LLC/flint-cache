@@ -446,6 +446,42 @@ impl<'a> Dispatcher<'a> {
                     Value::Integer(n as i64)
                 })
             }),
+            // SINTER / SUNION / SDIFF: multi-key, and therefore same-slot
+            // only. The node refuses a cross-slot request rather than
+            // answering it, because it would answer WRONGLY: a key this node
+            // does not own reads as an empty set, and an intersection against
+            // a phantom empty set is a plausible-looking answer that is
+            // silently incorrect. The proxy rejects these before they arrive;
+            // this check is the second line, for a client dialling a node
+            // directly.
+            b"SINTER" | b"SUNION" | b"SDIFF" => {
+                if args.len() < 2 {
+                    return Value::Error(format!(
+                        "ERR wrong number of arguments for '{}' command",
+                        String::from_utf8_lossy(&args[0]).to_lowercase()
+                    ));
+                }
+                let keys = &args[1..];
+                let slot = slot_for_key(&keys[0]);
+                if let Some(bad) = keys.iter().find(|k| slot_for_key(k) != slot) {
+                    return Value::Error(format!(
+                        "CROSSSLOT Keys in request don't hash to the same slot ({} is slot {}, \
+                         {} is slot {}) — use a hash tag such as {{tag}}key to colocate them",
+                        String::from_utf8_lossy(&keys[0]),
+                        slot,
+                        String::from_utf8_lossy(bad),
+                        slot_for_key(bad)
+                    ));
+                }
+                let op = match args[0].to_ascii_uppercase().as_slice() {
+                    b"SINTER" => flint_storage::sets::SetOp::Inter,
+                    b"SUNION" => flint_storage::sets::SetOp::Union,
+                    _ => flint_storage::sets::SetOp::Diff,
+                };
+                reply(self.sets.sop(slot, op, keys), |ms| {
+                    Value::Set(ms.into_iter().map(|m| Value::Bulk(Some(m))).collect())
+                })
+            }
             b"SPOP" => self.cmd_spop(args),
             b"SRANDMEMBER" => self.cmd_srandmember(args),
             b"HSCAN" => self.cmd_scan_typed(args, ScanKind::Hash),

@@ -42,7 +42,14 @@ INCR, DECR, INCRBY, DECRBY, INCRBYFLOAT.
 HINCRBY, HSTRLEN, HSCAN (MATCH, COUNT, NOVALUES).
 
 **Sets**: SADD, SREM, SISMEMBER, SMISMEMBER, SMEMBERS, SCARD, SPOP,
-SRANDMEMBER, SSCAN (MATCH, COUNT).
+SRANDMEMBER, SSCAN (MATCH, COUNT), SINTER, SUNION, SDIFF.
+
+> SINTER / SUNION / SDIFF are **same-slot only**, exactly as in Redis
+> Cluster: colocate the keys with a hash tag (`SINTER {u1}:a {u1}:b`) or the
+> request is refused with `CROSSSLOT`. Refused rather than answered, because
+> a key the node does not own reads as an empty set and an intersection
+> against a phantom empty set is silently wrong. The `STORE` variants
+> (SINTERSTORE etc.) remain excluded — see below.
 
 **Lists**: LPUSH, RPUSH, LPOP, RPOP, LLEN, LRANGE, LINDEX, LSET, LTRIM,
 LREM, LINSERT, LPOS (RANK, COUNT, MAXLEN).

@@ -492,6 +492,63 @@ fn corpus() -> Vec<Case> {
         },
         Case {
             family: "sets",
+            // Same-slot only, so every key carries one hash tag. That is not
+            // a Flint restriction: Redis Cluster requires it too, and a
+            // corpus case without the tag would pass here and fail against
+            // any real cluster.
+            name: "sinter sunion sdiff (same slot)",
+            steps: vec![
+                s(&[b"SADD", b"{so}a", b"1", b"2", b"3"], Expect::Int(3)),
+                s(&[b"SADD", b"{so}b", b"2", b"3", b"4"], Expect::Int(3)),
+                s(&[b"SADD", b"{so}c", b"3", b"9"], Expect::Int(2)),
+                s(
+                    &[b"SINTER", b"{so}a", b"{so}b"],
+                    Expect::UnorderedStrs(vec![b"2", b"3"]),
+                ),
+                s(
+                    &[b"SINTER", b"{so}a", b"{so}b", b"{so}c"],
+                    Expect::UnorderedStrs(vec![b"3"]),
+                ),
+                s(
+                    &[b"SUNION", b"{so}a", b"{so}c"],
+                    Expect::UnorderedStrs(vec![b"1", b"2", b"3", b"9"]),
+                ),
+                s(
+                    &[b"SDIFF", b"{so}a", b"{so}b"],
+                    Expect::UnorderedStrs(vec![b"1"]),
+                ),
+                // A single key is the degenerate fold: the set itself.
+                s(
+                    &[b"SINTER", b"{so}a"],
+                    Expect::UnorderedStrs(vec![b"1", b"2", b"3"]),
+                ),
+                // A missing key is an empty set, and it propagates: an
+                // intersection with nothing is nothing, a difference against
+                // nothing is unchanged, a union ignores it.
+                s(
+                    &[b"SINTER", b"{so}a", b"{so}gone"],
+                    Expect::UnorderedStrs(vec![]),
+                ),
+                s(
+                    &[b"SDIFF", b"{so}a", b"{so}gone"],
+                    Expect::UnorderedStrs(vec![b"1", b"2", b"3"]),
+                ),
+                s(
+                    &[b"SUNION", b"{so}a", b"{so}gone"],
+                    Expect::UnorderedStrs(vec![b"1", b"2", b"3"]),
+                ),
+                // Wrong type is an error, not an empty set.
+                s(&[b"SET", b"{so}str", b"x"], Expect::Ok),
+                s(&[b"SINTER", b"{so}a", b"{so}str"], Expect::AnyError),
+                s(&[b"SINTER"], Expect::AnyError),
+                s(
+                    &[b"DEL", b"{so}a", b"{so}b", b"{so}c", b"{so}str"],
+                    Expect::Int(4),
+                ),
+            ],
+        },
+        Case {
+            family: "sets",
             name: "sadd srem sismember smembers scard",
             steps: vec![
                 s(&[b"SADD", b"s1", b"a", b"b", b"a"], Expect::Int(2)),
