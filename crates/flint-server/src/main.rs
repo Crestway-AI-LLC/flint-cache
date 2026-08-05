@@ -159,6 +159,15 @@ static WAL_FSYNC_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 #[cfg_attr(not(feature = "rocks"), allow(dead_code))]
 static MIGRATE_RATE_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Sweep cadence for the GC pass that reclaims expired metadata and
+/// orphaned collection bodies (#133). 0 disables. Hot via FLINTCONFIG.
+static GC_SWEEP_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(10 * 60 * 1000);
+/// Lifetime counts, for FLINTINFO and the drill's positive control: a
+/// sweeper whose counters never leave zero is not known to sweep.
+static GC_EXPIRED_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static GC_ORPHANS_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Releases a full-sync slot on any exit (including a mid-stream error), so a
 /// dropped connection can never leak a slot and wedge the cap.
 #[cfg_attr(not(feature = "rocks"), allow(dead_code))]
@@ -800,6 +809,49 @@ fn main() -> std::io::Result<()> {
                         flint_journal::EventKind::SelfFenced,
                         None,
                         "lease expired: no controller renewal",
+                    );
+                }
+            }
+        });
+    }
+
+    // The GC sweeper (#133): the compaction filter reclaims expired
+    // METADATA rows, but a filter sees one row at a time and cannot look up
+    // a subkey row's metadata — so the bodies of expired collections are
+    // reclaimable only by this pass. Unwired, they leak forever: a slow,
+    // unbounded loss of the very disk the guard is trying to protect.
+    //
+    // Master-only per ITERATION, not at spawn: a replica must never write
+    // to its own store (the master's swept deletes replicate through the
+    // WAL), and roles change at runtime — a node promoted at 3am starts
+    // sweeping on its next tick without a restart. Every delete runs under
+    // the same per-key write lock every writer takes, with the judgment
+    // re-run inside it, so a key revived mid-sweep is spared (the race is
+    // pinned by a test in gc.rs).
+    {
+        let store = Arc::clone(&store);
+        let read_only = Arc::clone(&read_only);
+        std::thread::spawn(move || {
+            let mut since_ms: u64 = 0;
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                let cadence = GC_SWEEP_MS.load(Ordering::Relaxed);
+                since_ms += 1000;
+                if cadence == 0 || since_ms < cadence || read_only.load(Ordering::Relaxed) {
+                    continue;
+                }
+                since_ms = 0;
+                let report = flint_storage::gc::sweep(
+                    store.as_ref(),
+                    flint_storage::strings::system_clock(),
+                    &|ns, key| Box::new(write_lock::lock_key(ns, key)),
+                );
+                GC_EXPIRED_TOTAL.fetch_add(report.expired_meta, Ordering::Relaxed);
+                GC_ORPHANS_TOTAL.fetch_add(report.orphan_rows, Ordering::Relaxed);
+                if report.expired_meta + report.orphan_rows > 0 {
+                    eprintln!(
+                        "gc sweep: reclaimed {} expired meta row(s), {} orphaned subkey row(s)",
+                        report.expired_meta, report.orphan_rows
                     );
                 }
             }
@@ -1680,6 +1732,10 @@ fn execute(
                     "migrate-rate-bytes",
                     MIGRATE_RATE_BYTES.load(Ordering::Relaxed).to_string(),
                 ),
+                field(
+                    "gc-sweep-ms",
+                    GC_SWEEP_MS.load(Ordering::Relaxed).to_string(),
+                ),
             ]
             .join("\r\n");
             return Value::Bulk(Some(dump.into_bytes()));
@@ -1708,11 +1764,12 @@ fn execute(
             b"widowed-grace-ms" => hub.set_widowed_grace_ms(parse!()),
             b"max-conns" => MAX_CONNS.store(std::cmp::max(1, parse!()), Ordering::Relaxed),
             b"migrate-rate-bytes" => MIGRATE_RATE_BYTES.store(parse!(), Ordering::Relaxed),
+            b"gc-sweep-ms" => GC_SWEEP_MS.store(parse!(), Ordering::Relaxed),
             other => {
                 return Value::Error(format!(
                     "ERR unknown or restart-only config key {:?} (hot: wal-fsync-ms, \
                      lag-soft-ms, lag-hard-ms, min-replicas-to-write, widowed-grace-ms, \
-                     max-conns, migrate-rate-bytes)",
+                     max-conns, migrate-rate-bytes, gc-sweep-ms)",
                     String::from_utf8_lossy(other)
                 ));
             }
@@ -2180,7 +2237,7 @@ fn flintinfo(
     };
     let (disk_free, disk_total, disk_unknown) = DISK.snapshot();
     let info = format!(
-        "role:{}\r\nrole_epoch:{role_epoch}\r\nbuild:{build}\r\nsst_bytes:{sst}\r\nlatest_seq:{latest}\r\nlast_applied:{last_applied}\r\nacked_seq:{}\r\nseq_lag:{seq_lag}\r\nlive_replicas:{}\r\nlag_ms:{}\r\nlag_soft_ms:{soft}\r\nlag_hard_ms:{hard}\r\nmin_replicas_to_write:{minr}\r\nwidowed_grace_ms:{wgm}\r\nwidowed_shed:{wsh}\r\nfullsync_active:{fsa}\r\nfullsync_max:{fsm}\r\nasync_write_queue:{aqd}\r\nwal_fsync_ms:{wfm}\r\nwal_fsync_total:{wft}\r\ncert_days_remaining:{cdr}\r\nactive_conns:{ac}\r\nmax_conns:{mc}\r\nconns_shed_total:{cs}\r\nwrite_stopped:{wst}\r\ndelayed_write_rate:{dwr}\r\ndisk_free_bytes:{dfb}\r\ndisk_total_bytes:{dtb}\r\ndisk_free_pct:{dfp}\r\ndisk_verdict:{dv}\r\ndisk_unknown_samples:{dus}\r\n",
+        "role:{}\r\nrole_epoch:{role_epoch}\r\nbuild:{build}\r\nsst_bytes:{sst}\r\nlatest_seq:{latest}\r\nlast_applied:{last_applied}\r\nacked_seq:{}\r\nseq_lag:{seq_lag}\r\nlive_replicas:{}\r\nlag_ms:{}\r\nlag_soft_ms:{soft}\r\nlag_hard_ms:{hard}\r\nmin_replicas_to_write:{minr}\r\nwidowed_grace_ms:{wgm}\r\nwidowed_shed:{wsh}\r\nfullsync_active:{fsa}\r\nfullsync_max:{fsm}\r\nasync_write_queue:{aqd}\r\nwal_fsync_ms:{wfm}\r\nwal_fsync_total:{wft}\r\ncert_days_remaining:{cdr}\r\nactive_conns:{ac}\r\nmax_conns:{mc}\r\nconns_shed_total:{cs}\r\nwrite_stopped:{wst}\r\ndelayed_write_rate:{dwr}\r\ndisk_free_bytes:{dfb}\r\ndisk_total_bytes:{dtb}\r\ndisk_free_pct:{dfp}\r\ndisk_verdict:{dv}\r\ndisk_unknown_samples:{dus}\r\ngc_swept_expired:{gse}\r\ngc_swept_orphans:{gso}\r\n",
         if read_only { "replica" } else { "master" },
         hub.effective_acked(now)
             .map_or_else(|| "none".into(), |a| a.to_string()),
@@ -2224,6 +2281,8 @@ fn flintinfo(
             diskguard::Verdict::Shed => "shed",
         },
         dus = disk_unknown,
+        gse = GC_EXPIRED_TOTAL.load(Ordering::Relaxed),
+        gso = GC_ORPHANS_TOTAL.load(Ordering::Relaxed),
     );
     Value::Bulk(Some(info.into_bytes()))
 }
