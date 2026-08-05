@@ -48,8 +48,39 @@ cleanup() {
   fi
   rm -rf "$IMG" "$MNT" 2>/dev/null
 }
+
+# NEVER TRUST detach's EXIT — verify the mount is gone.
+#
+# `hdiutil detach ... 2>/dev/null` in cleanup discards its status, so a mount
+# that refuses to detach survives, and every later run attaches ON TOP of the
+# wedged one. The server then starts against a directory that is not the
+# volume it thinks it is, dies before writing a single log line, and the drill
+# reports "server did not start" with a ZERO-BYTE server log. It failed three
+# runs in a row that way, then passed immediately after the stale mount was
+# detached by hand — which is the whole diagnosis.
+#
+# Same rule the suite already applies to pkill: the kill is not the evidence,
+# the absence afterwards is.
+assert_unmounted() {
+  local i real
+  # macOS reports /private/tmp/... in `mount` even when the path given was
+  # /tmp/... , so matching the literal never fires and the guard silently
+  # passes. Resolve the path first. (Caught by its own positive control:
+  # a deliberately wedged mount was reported as absent.)
+  real=$(cd "$MNT" 2>/dev/null && pwd -P) || real="$MNT"
+  for i in $(seq 1 20); do
+    mount | grep -qE " on (${MNT}|${real}) " || return 0
+    [ "$(uname)" = "Darwin" ] && hdiutil detach "$MNT" -force -quiet 2>/dev/null       || sudo umount "$MNT" 2>/dev/null
+    sleep 0.5
+  done
+  echo "FAIL: $MNT is still mounted after 10s of detach attempts."
+  echo "      A wedged image poisons every later run of this drill; clear it with"
+  echo "      'hdiutil detach $MNT -force' (macOS) or 'sudo umount $MNT' and re-run."
+  exit 1
+}
 trap cleanup EXIT
 cleanup
+assert_unmounted
 
 echo "== a $SIZE_MB MB filesystem to run out of"
 if [ "$(uname)" = "Darwin" ]; then
