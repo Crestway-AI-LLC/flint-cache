@@ -16,7 +16,7 @@
 # Usage: tools/gates.sh [stage ...]     (default: all)
 #   check        fmt + clippy + tests, both feature configs
 #   conformance  the compatibility oracle vs valkey, flint mem, flint rocks
-#   drills       the 20 core drills
+#   drills       the core drills (the CORE list below is the count)
 #   chaos        the two randomized chaos drills
 #
 # Logs land in $FLINT_GATE_LOGS (default /tmp/flint-gates) — one file per
@@ -34,7 +34,7 @@ CORE="restart repl failover proxy slot_migrate slot_map rebalance_execute
       decommission config_file federation_plumbing disk_pressure ctl_error
       client_compat proxy_registry reseed lag_cap widowed_grace controller
       promote_notice fleet_guard ctl_cpha upgrade anti_affinity attached_chaos
-      async_flag async_writes"
+      async_flag async_writes txn_failure"
 CHAOS="chaos proxy_chaos"
 
 # FLINT_GATE_STRICT=1 turns a SKIPPED drill into a FAILED one.

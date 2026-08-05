@@ -1124,6 +1124,8 @@ fn transaction_control(
     store: &dyn Kv,
     read_only: &Arc<AtomicBool>,
     rocks: &Option<RocksHandle>,
+    migration_active: &AtomicBool,
+    hub: &ReplHub,
     limits: commands::Limits,
     conn_ns: &[u8],
     conn_txn: &mut TxnState,
@@ -1210,7 +1212,14 @@ fn transaction_control(
                 return Some(Value::Array(None));
             }
             return Some(exec_transaction(
-                store, read_only, rocks, limits, conn_ns, txn,
+                store,
+                read_only,
+                rocks,
+                migration_active,
+                hub,
+                limits,
+                conn_ns,
+                txn,
             ));
         }
         _ => {}
@@ -1246,6 +1255,173 @@ fn transaction_control(
     Some(Value::Simple("QUEUED".into()))
 }
 
+/// How the admission gates see a unit of work.
+///
+/// A single command classifies itself. A transaction classifies its WHOLE
+/// queue, because a transaction is admitted or refused as one unit — half a
+/// transaction is precisely the outcome ADR-0012 exists to prevent. So one
+/// write among ten reads makes the unit a write, and it clears the write
+/// gates or none of it runs.
+#[derive(Clone, Copy)]
+pub(crate) struct Work<'a> {
+    /// Does anything in the unit mutate? Eager, because every command asks.
+    write: bool,
+    /// The unit's commands — one for a single command, the whole queue for
+    /// a transaction. The other classifications are computed on demand:
+    /// each one costs an uppercase copy of the command name, and a healthy
+    /// master never asks whether a command frees space (only a shedding
+    /// disk does) or whether it is a read (only a replica does). Eager
+    /// fields here would put two extra allocations on every command.
+    cmds: &'a [&'a [Vec<u8>]],
+}
+
+impl<'a> Work<'a> {
+    fn new(cmds: &'a [&'a [Vec<u8>]]) -> Self {
+        Self {
+            write: cmds.iter().any(|c| Self::is_write(c)),
+            cmds,
+        }
+    }
+
+    fn is_write(cmd: &[Vec<u8>]) -> bool {
+        cmd.first().is_some_and(|n| commands::is_write_command(n))
+    }
+
+    /// True only when EVERY write in the unit frees space. One growing
+    /// write is enough to put the whole unit behind the disk guard, because
+    /// the unit lands whole or not at all.
+    fn frees_space(&self) -> bool {
+        self.cmds
+            .iter()
+            .filter(|c| Self::is_write(c))
+            .all(|c| c.first().is_some_and(|n| flint_commands::reduces_space(n)))
+    }
+
+    fn reads(&self) -> bool {
+        self.cmds.iter().any(|c| {
+            c.first()
+                .is_some_and(|n| flint_commands::is_read_command(n))
+        })
+    }
+}
+
+/// Gate 1 of 2: may this node do this KIND of work at all right now?
+///
+/// Role, disk headroom, and a replica's staleness fence — the conditions
+/// that depend on nothing but the node's own state. Two callers, ONE
+/// implementation: a gate that refuses `SET` but waves through
+/// `MULTI; SET; EXEC` is a hole exactly the size of the gate, and before
+/// ADR-0012 Phase E every gate here was one (a write on a read-only replica
+/// answered `+OK` inside a transaction and wrote nothing).
+fn check_node_health(work: Work<'_>, ro: bool) -> Option<Value> {
+    if ro && work.write {
+        return Some(Value::Error(
+            "READONLY You can't write against a read only replica.".into(),
+        ));
+    }
+    // Disk headroom. Space-REDUCING writes stay allowed, because deleting is
+    // the only way out and blocking it makes the condition self-sustaining;
+    // reads are untouched. Same classifier the proxy uses for the per-tenant
+    // quota verdict, so the two planes cannot disagree about what frees
+    // space.
+    if work.write && DISK.shedding() && !work.frees_space() {
+        return Some(Value::Error(diskguard::DISK_FULL_ERROR.into()));
+    }
+    // R1: a replica self-fences READS once it has lost live contact with the
+    // master for longer than the staleness bound. Admin/FLINT* commands are
+    // exempt (they are diagnostics, not tenant reads); a fresh replica that
+    // has never heard from the master (contact 0) also fences.
+    if ro && work.reads() {
+        let contact = REPLICA_CONTACT_MS.load(Ordering::Relaxed);
+        let now = flint_storage::strings::system_clock();
+        let stale = REPLICA_STALE_MS.load(Ordering::Relaxed);
+        if contact == 0 || now.saturating_sub(contact) > stale {
+            return Some(Value::Error(
+                "TRYAGAIN replica out of sync (stale reads fenced); retry — the proxy will route to the master".into(),
+            ));
+        }
+    }
+    None
+}
+
+/// Gate 2 of 2: may this land HERE, NOW? Slot ownership and the
+/// replication backpressure that bounds the RPO — the conditions that
+/// depend on the fleet around the node.
+///
+/// The slot gate reads only the unit's first keyed command, which is sound
+/// because D1 already forced every key in a transaction into one slot.
+///
+/// Also records slot heat, positioned exactly where the single-command path
+/// has always recorded it — between the slot gate and the throttles, so a
+/// shed write still counts as demand on its slot. Recorded per command, so
+/// a transaction weighs what it actually is.
+fn admit_write_path(
+    work: Work<'_>,
+    ro: bool,
+    conn_ns: &[u8],
+    rocks: &Option<RocksHandle>,
+    migration_active: &AtomicBool,
+    hub: &ReplHub,
+) -> Option<Value> {
+    // Per-slot gate: after a migration, a command for a key in a slot this
+    // node no longer owns is redirected with -MOVED; a write to a slot frozen
+    // mid-cutover is shed with -TRYAGAIN. Guarded by `migration_active` so
+    // ordinary traffic (no overrides) never pays the extra manifest read.
+    if migration_active.load(Ordering::Relaxed)
+        && let Some(keyed) = work
+            .cmds
+            .iter()
+            .find(|c| commands::command_key(c).is_some())
+        && let Some(reply) = migrate::check_slot_gate(rocks, conn_ns, keyed, work.write)
+    {
+        return Some(reply);
+    }
+    // Per-slot heat: count every keyed op destined for a slot this node owns
+    // (the slot gate above already redirected/shed the ones it doesn't). Done
+    // before the throttle/queue branches diverge so async-queued writes are
+    // counted too. Cheap (a CRC16 + relaxed add); FLINTSLOTHEAT exposes it for
+    // the traffic-balance policy.
+    for cmd in work.cmds {
+        if let Some(k) = commands::command_key(cmd) {
+            heat::record_key(k);
+        }
+    }
+    // Lag-cap backpressure: the write path enforces the RPO bound. The
+    // min-replicas gate comes first — with no live replica there is no lag
+    // to measure, and that widowed state is exactly where accepted writes
+    // are most at risk (isolated master, dead pair peer).
+    if work.write && !ro {
+        let now = flint_storage::strings::system_clock();
+        if hub.below_write_quorum(now) {
+            return Some(Value::Error(
+                "THROTTLED live replicas below min-replicas-to-write, retry with backoff".into(),
+            ));
+        }
+        // The widowed grace: the only gate that bounds how OLD the at-risk
+        // tail may get. Checked after the quorum gate (which is stricter and
+        // shares the cause) and before the lag cap, which cannot fire at all
+        // in this state because there is no replica to measure lag against.
+        if hub.widowed_beyond_grace(now) {
+            return Some(Value::Error(
+                "THROTTLED no live replica for longer than --widowed-grace-ms, retry with backoff"
+                    .into(),
+            ));
+        }
+        match hub.lag_ms(now) {
+            Some(lag) if lag >= hub.lag_hard_ms() => {
+                return Some(Value::Error(
+                    "THROTTLED replication lag exceeds limit, retry with backoff".into(),
+                ));
+            }
+            Some(lag) if lag >= hub.lag_soft_ms() => {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// Run a transaction's queued commands and commit them as one write.
 ///
 /// The shape is the async write queue's, deliberately (ADR-0012 D3): hold
@@ -1254,10 +1430,13 @@ fn transaction_control(
 /// commit the accumulated buffer in a single engine write. On rocks that
 /// is one `WriteBatch`, hence one WAL group, so a replica applies the
 /// whole transaction or none of it.
+#[allow(clippy::too_many_arguments)]
 fn exec_transaction(
     store: &dyn Kv,
     read_only: &Arc<AtomicBool>,
     rocks: &Option<RocksHandle>,
+    migration_active: &AtomicBool,
+    hub: &ReplHub,
     limits: commands::Limits,
     conn_ns: &[u8],
     txn: Txn,
@@ -1265,25 +1444,28 @@ fn exec_transaction(
     if txn.queued.is_empty() {
         return Value::Array(Some(Vec::new()));
     }
-    // The slot gate, checked ONCE for the whole transaction. One check is
-    // sound only because every key shares a slot (D1) — that invariant is
-    // what makes a per-command gate unnecessary here. A slot mid-handoff
-    // aborts rather than half-applying (D8).
-    let is_write = txn.queued.iter().any(|c| {
-        c.first()
-            .is_some_and(|n| flint_commands::is_write_command(n))
-    });
-    if let Some(keyed) = txn
-        .queued
-        .iter()
-        .find(|c| commands::command_key(c).is_some())
-        && let Some(gate) = migrate::check_slot_gate(rocks, conn_ns, keyed, is_write)
-    {
-        return gate;
+    // D8, and the whole of it: a transaction clears the SAME admission gates
+    // a single command clears, evaluated over the queue as one unit and in
+    // the same order — so a demoted master, a shedding disk, a slot
+    // mid-handoff or an unmet write quorum aborts the transaction instead of
+    // half-applying it or, worse, acking a write that went nowhere.
+    //
+    // Gates run BEFORE the lock, exactly as the single-command path runs
+    // them before its write guard. That leaves the same narrow window (a
+    // demotion landing between the check and the commit) that a single write
+    // has always had, rather than a new one: durable role fencing is what
+    // closes it, at the manifest.
+    let ro = read_only.load(Ordering::Relaxed);
+    let cmds: Vec<&[Vec<u8>]> = txn.queued.iter().map(Vec::as_slice).collect();
+    let work = Work::new(&cmds);
+    if let Some(refusal) = check_node_health(work, ro) {
+        return refusal;
+    }
+    if let Some(refusal) = admit_write_path(work, ro, conn_ns, rocks, migration_active, hub) {
+        return refusal;
     }
 
     let _all = write_lock::lock_all();
-    let ro = read_only.load(Ordering::Relaxed);
     let batching = flint_storage::batch::BatchingKv::new(store);
     let mut replies = Vec::with_capacity(txn.queued.len());
     {
@@ -1431,7 +1613,16 @@ fn execute(
     // command table for the reason HELLO and FLINTNS are: they mutate THIS
     // connection's state, and the dispatcher is deliberately stateless.
     if let Some(reply) = transaction_control(
-        store, read_only, rocks, limits, conn_ns, conn_txn, watch, args,
+        store,
+        read_only,
+        rocks,
+        migration_active,
+        hub,
+        limits,
+        conn_ns,
+        conn_txn,
+        watch,
+        args,
     ) {
         return reply;
     }
@@ -1529,42 +1720,11 @@ fn execute(
         return Value::Simple("OK".into());
     }
     let ro = read_only.load(Ordering::Relaxed);
-    let is_write = args
-        .first()
-        .is_some_and(|name| commands::is_write_command(name));
-    if ro && is_write {
-        return Value::Error("READONLY You can't write against a read only replica.".into());
-    }
-    // Disk headroom. Space-REDUCING writes stay allowed, because deleting is
-    // the only way out and blocking it makes the condition self-sustaining;
-    // reads are untouched. Same classifier the proxy uses for the per-tenant
-    // quota verdict, so the two planes cannot disagree about what frees
-    // space.
-    if is_write
-        && DISK.shedding()
-        && !args
-            .first()
-            .is_some_and(|n| flint_commands::reduces_space(n))
-    {
-        return Value::Error(diskguard::DISK_FULL_ERROR.into());
-    }
-    // R1: a replica self-fences READS once it has lost live contact with the
-    // master for longer than the staleness bound. Admin/FLINT* commands are
-    // exempt (they are diagnostics, not tenant reads); a fresh replica that
-    // has never heard from the master (contact 0) also fences.
-    if ro
-        && args
-            .first()
-            .is_some_and(|name| flint_commands::is_read_command(name))
-    {
-        let contact = REPLICA_CONTACT_MS.load(Ordering::Relaxed);
-        let now = flint_storage::strings::system_clock();
-        let stale = REPLICA_STALE_MS.load(Ordering::Relaxed);
-        if contact == 0 || now.saturating_sub(contact) > stale {
-            return Value::Error(
-                "TRYAGAIN replica out of sync (stale reads fenced); retry — the proxy will route to the master".into(),
-            );
-        }
+    let unit = std::slice::from_ref(&args);
+    let work = Work::new(unit);
+    let is_write = work.write;
+    if let Some(refusal) = check_node_health(work, ro) {
+        return refusal;
     }
     if args
         .first()
@@ -1714,55 +1874,8 @@ fn execute(
         }
         return migrate::flintslotabort(rocks, args);
     }
-    // Per-slot gate: after a migration, a command for a key in a slot this
-    // node no longer owns is redirected with -MOVED; a write to a slot frozen
-    // mid-cutover is shed with -TRYAGAIN. Guarded by `migration_active` so
-    // ordinary traffic (no overrides) never pays the extra manifest read.
-    if migration_active.load(Ordering::Relaxed)
-        && let Some(reply) = migrate::check_slot_gate(rocks, conn_ns, args, is_write)
-    {
-        return reply;
-    }
-    // Per-slot heat: count every keyed op destined for a slot this node owns
-    // (the slot gate above already redirected/shed the ones it doesn't). Done
-    // before the throttle/queue branches diverge so async-queued writes are
-    // counted too. Cheap (a CRC16 + relaxed add); FLINTSLOTHEAT exposes it for
-    // the traffic-balance policy.
-    if let Some(k) = commands::command_key(args) {
-        heat::record_key(k);
-    }
-    // Lag-cap backpressure: the write path enforces the RPO bound. The
-    // min-replicas gate comes first — with no live replica there is no lag
-    // to measure, and that widowed state is exactly where accepted writes
-    // are most at risk (isolated master, dead pair peer).
-    if is_write && !ro {
-        let now = flint_storage::strings::system_clock();
-        if hub.below_write_quorum(now) {
-            return Value::Error(
-                "THROTTLED live replicas below min-replicas-to-write, retry with backoff".into(),
-            );
-        }
-        // The widowed grace: the only gate that bounds how OLD the at-risk
-        // tail may get. Checked after the quorum gate (which is stricter and
-        // shares the cause) and before the lag cap, which cannot fire at all
-        // in this state because there is no replica to measure lag against.
-        if hub.widowed_beyond_grace(now) {
-            return Value::Error(
-                "THROTTLED no live replica for longer than --widowed-grace-ms, retry with backoff"
-                    .into(),
-            );
-        }
-        match hub.lag_ms(now) {
-            Some(lag) if lag >= hub.lag_hard_ms() => {
-                return Value::Error(
-                    "THROTTLED replication lag exceeds limit, retry with backoff".into(),
-                );
-            }
-            Some(lag) if lag >= hub.lag_soft_ms() => {
-                std::thread::sleep(std::time::Duration::from_millis(2));
-            }
-            _ => {}
-        }
+    if let Some(refusal) = admit_write_path(work, ro, conn_ns, rocks, migration_active, hub) {
+        return refusal;
     }
     // ADR-0005 D4: for an opted-in namespace, route a batchable string/counter
     // write through the async queue — the connection blocks on the consumer's
@@ -2791,6 +2904,79 @@ mod replica {
             last_seq: *last_seq as u64,
             ops,
         })
+    }
+}
+
+/// ADR-0012 D8: a transaction faces the same admission gates a single
+/// command does, evaluated over the whole queue.
+///
+/// The end-to-end proof is `tools/txn_failure_drill.sh`, which needs a
+/// replica, a frozen slot and a killed master to make each gate fire. These
+/// cover the part that is pure and easy to get subtly wrong: how a queue of
+/// mixed commands classifies. Every one of them fails if the aggregate is
+/// taken from the FIRST command instead of all of them — which is the shape
+/// the bug had.
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+
+    fn cmd(parts: &[&str]) -> Vec<Vec<u8>> {
+        parts.iter().map(|p| p.as_bytes().to_vec()).collect()
+    }
+
+    /// `Work` borrows the unit's commands, so the queue has to outlive it;
+    /// each test owns its queue and hands the borrowed view to `unit`.
+    fn unit(queue: &[Vec<Vec<u8>>]) -> Vec<&[Vec<u8>]> {
+        queue.iter().map(Vec::as_slice).collect()
+    }
+
+    #[test]
+    fn a_queue_is_a_write_if_anything_in_it_writes() {
+        let mixed = [cmd(&["GET", "k"]), cmd(&["SET", "k", "v"])];
+        let m = unit(&mixed);
+        let w = Work::new(&m);
+        assert!(w.write, "a queue that ends in SET is a write");
+        assert!(w.reads(), "and it is also a read");
+        // The negative control — otherwise `write: true` could just be a
+        // constant.
+        let reads = [cmd(&["GET", "k"]), cmd(&["HGETALL", "h"])];
+        let r = unit(&reads);
+        assert!(!Work::new(&r).write);
+    }
+
+    #[test]
+    fn one_growing_write_puts_the_whole_queue_behind_the_disk_guard() {
+        // The disk guard lets space-FREEING writes through, because deleting
+        // is the only way out of a full disk. A transaction qualifies only if
+        // EVERY write in it frees space: the unit lands whole or not at all,
+        // so one growing write commits the rest of them too.
+        let freeing = [cmd(&["DEL", "a"]), cmd(&["UNLINK", "b"])];
+        let f = unit(&freeing);
+        assert!(Work::new(&f).frees_space());
+        let mixed = [cmd(&["DEL", "a"]), cmd(&["SET", "b", "v"])];
+        let m = unit(&mixed);
+        assert!(!Work::new(&m).frees_space());
+    }
+
+    #[test]
+    fn a_replica_refuses_a_queue_that_writes_even_if_it_reads_first() {
+        // Before Phase E this exact queue answered `+OK` on a replica and
+        // wrote nothing — the false ack the gate exists to prevent.
+        let q = [cmd(&["GET", "k"]), cmd(&["SET", "k", "v"])];
+        let u = unit(&q);
+        match check_node_health(Work::new(&u), true) {
+            Some(Value::Error(e)) => assert!(e.starts_with("READONLY"), "{e}"),
+            other => panic!("a write on a replica must be refused, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_same_queue_is_admitted_on_a_master() {
+        // Discrimination: the gate must be reading the ROLE, not refusing
+        // every transaction it is shown.
+        let q = [cmd(&["GET", "k"]), cmd(&["SET", "k", "v"])];
+        let u = unit(&q);
+        assert!(check_node_health(Work::new(&u), false).is_none());
     }
 }
 

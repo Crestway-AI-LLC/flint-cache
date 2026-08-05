@@ -174,6 +174,31 @@ async queue benefits from it immediately:
 - **E. Failure semantics** (D8) + a drill that kills a master mid-transaction
   and asserts the client sees an abort rather than a partial apply.
 
+### What Phase E actually found
+
+D8 was written as if failover and migration were the two ways a transaction
+could be lost. Probing a running node found the gap was wider and the
+statement of it was too narrow: EXEC checked the slot gate and nothing else,
+so a transaction skipped **every** admission gate a single command clears.
+On a demoted master `MULTI; SET; EXEC` answered `+OK` and wrote nothing —
+a false ack, which is worse than the partial apply D8 was guarding against —
+and below the write quorum it applied writes the single-command path was
+shedding with `-THROTTLED`, quietly stepping outside the published RPO.
+
+So D8 ships wider than written: a transaction faces the same gates a single
+command faces, in the same order, evaluated over the whole queue
+(`Work::of_queue` — any write makes it a write, and every write must free
+space for it to pass the disk guard). One implementation, two callers, for
+the same reason the remote runner invokes the remote `flintctl` rather than
+reimplementing its checks: a gate that refuses `SET` but waves through
+`MULTI; SET; EXEC` is a hole exactly the size of the gate, and nothing in
+the type system would have told us.
+
+The resulting contract is one sentence, and `command-support.md` states it:
+**an error reply to EXEC means nothing was applied.** Queue-time poisoning,
+a broken watch, a refused gate and a dead backend all land on the same side
+of it, so a client needs no case analysis to know what to retry.
+
 Conformance gets a transaction family compared against real Valkey, as
 every other family is. Two behaviours cannot be oracle-compared and need
 flint-only assertions, for the reason the CROSSSLOT refusal did: a stock

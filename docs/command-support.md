@@ -81,6 +81,27 @@ DB 0), RENAME, RENAMENX.
 > included — `SADD` then `SMEMBERS` in one transaction returns the member
 > just added.
 >
+> **An error reply to EXEC means nothing was applied.** EXEC answers either
+> with the array of per-command replies, or with an error, and there is no
+> third outcome — so a client that sees an error can retry the whole
+> transaction without checking what landed. A transaction is admitted as one
+> unit and faces the same conditions a single write faces, evaluated over
+> every command in it: `READONLY` if the node has become a replica since
+> MULTI (a failover fenced it), `THROTTLED` if replication lag or the live
+> replica count is outside the bound writes must clear, `TRYAGAIN` if the
+> slot is frozen mid-cutover, `MOVED` if it has been handed off, or the disk
+> guard's error if the disk is shedding and any queued write would grow the
+> keyspace. One write among ten reads makes the whole transaction a write;
+> one growing write puts the whole transaction behind the disk guard.
+>
+> If the node dies between MULTI and EXEC, the queue dies with it, and the
+> client is told: a direct connection breaks, and through the proxy EXEC
+> returns `EXECABORT`. The proxy will not repair a transaction the way it
+> transparently repairs a single command — no retry, no MOVED chase, no
+> replica routing, no cached answer — because a repaired transaction is one
+> whose queue was silently discarded, and the EXEC that followed would apply
+> a subset.
+>
 > **WATCH** arms optimistic concurrency: if any watched key is modified
 > between WATCH and EXEC — by any client including your own connection, and
 > counting expiry and deletion as modifications — EXEC does nothing and
