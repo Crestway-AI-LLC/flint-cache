@@ -548,6 +548,237 @@ fn corpus() -> Vec<Case> {
             ],
         },
         Case {
+            family: "connection",
+            name: "select",
+            steps: vec![
+                // Index 0 is the database every connection is already in.
+                s(&[b"SELECT", b"0"], Expect::Ok),
+                // 99 is out of range on BOTH sides, so it is a shared
+                // assertion. A small nonzero index is deliberately absent:
+                // a stock Valkey has sixteen databases and would answer OK
+                // to SELECT 7, while a namespace here has one — asserting
+                // that against the oracle would be asserting the divergence,
+                // not the behaviour.
+                s(&[b"SELECT", b"99"], Expect::AnyError),
+                s(&[b"SELECT", b"abc"], Expect::AnyError),
+                s(&[b"SELECT"], Expect::AnyError),
+            ],
+        },
+        Case {
+            family: "zsets",
+            name: "zrangebylex zrevrangebylex",
+            steps: vec![
+                // Every member at score 0: the lex family is only defined
+                // over a uniformly-scored set, so a corpus with mixed scores
+                // would be asserting behaviour upstream calls undefined.
+                s(
+                    &[
+                        b"ZADD", b"zlex", b"0", b"a", b"0", b"b", b"0", b"c", b"0", b"d",
+                    ],
+                    Expect::Int(4),
+                ),
+                s(
+                    &[b"ZRANGEBYLEX", b"zlex", b"-", b"+"],
+                    Expect::Arr(vec![
+                        Expect::Str(b"a"),
+                        Expect::Str(b"b"),
+                        Expect::Str(b"c"),
+                        Expect::Str(b"d"),
+                    ]),
+                ),
+                s(
+                    &[b"ZRANGEBYLEX", b"zlex", b"[b", b"[c"],
+                    Expect::Arr(vec![Expect::Str(b"b"), Expect::Str(b"c")]),
+                ),
+                // Exclusive on both ends leaves the interior only.
+                s(
+                    &[b"ZRANGEBYLEX", b"zlex", b"(a", b"(d"],
+                    Expect::Arr(vec![Expect::Str(b"b"), Expect::Str(b"c")]),
+                ),
+                // A bare `[` is the inclusive EMPTY string, which sorts
+                // below every member — not a malformed token.
+                s(
+                    &[b"ZRANGEBYLEX", b"zlex", b"[", b"[b"],
+                    Expect::Arr(vec![Expect::Str(b"a"), Expect::Str(b"b")]),
+                ),
+                s(
+                    &[b"ZRANGEBYLEX", b"zlex", b"-", b"+", b"LIMIT", b"1", b"2"],
+                    Expect::Arr(vec![Expect::Str(b"b"), Expect::Str(b"c")]),
+                ),
+                // Negative count means "to the end", as in the score forms.
+                s(
+                    &[b"ZRANGEBYLEX", b"zlex", b"-", b"+", b"LIMIT", b"2", b"-1"],
+                    Expect::Arr(vec![Expect::Str(b"c"), Expect::Str(b"d")]),
+                ),
+                s(
+                    &[b"ZREVRANGEBYLEX", b"zlex", b"+", b"-"],
+                    Expect::Arr(vec![
+                        Expect::Str(b"d"),
+                        Expect::Str(b"c"),
+                        Expect::Str(b"b"),
+                        Expect::Str(b"a"),
+                    ]),
+                ),
+                // The reversed form takes (max, min): arguments in ascending
+                // order return nothing rather than silently being reordered.
+                s(
+                    &[b"ZREVRANGEBYLEX", b"zlex", b"[c", b"[b"],
+                    Expect::Arr(vec![Expect::Str(b"c"), Expect::Str(b"b")]),
+                ),
+                s(
+                    &[b"ZREVRANGEBYLEX", b"zlex", b"-", b"+"],
+                    Expect::Arr(vec![]),
+                ),
+                // An inverted range is empty, not an error.
+                s(&[b"ZRANGEBYLEX", b"zlex", b"+", b"-"], Expect::Arr(vec![])),
+                s(
+                    &[b"ZRANGEBYLEX", b"nosuchz", b"-", b"+"],
+                    Expect::Arr(vec![]),
+                ),
+                // A bound with no [ or ( prefix is malformed. This is the
+                // case that makes bare `-`/`+` special rather than general.
+                s(&[b"ZRANGEBYLEX", b"zlex", b"b", b"d"], Expect::AnyError),
+                s(
+                    &[b"ZRANGEBYLEX", b"zlex", b"-", b"+", b"WITHSCORES"],
+                    Expect::AnyError,
+                ),
+                s(&[b"ZRANGEBYLEX", b"zlex", b"-"], Expect::AnyError),
+                s(&[b"SET", b"zlexstr", b"x"], Expect::Ok),
+                s(&[b"ZRANGEBYLEX", b"zlexstr", b"-", b"+"], Expect::AnyError),
+                s(&[b"DEL", b"zlex", b"zlexstr"], Expect::Int(2)),
+            ],
+        },
+        Case {
+            family: "strings",
+            name: "getex",
+            steps: vec![
+                s(&[b"SET", b"gx", b"v", b"EX", b"100"], Expect::Ok),
+                // No option is a plain GET: the TTL must survive untouched.
+                // Getting this backwards would make every GETEX a PERSIST.
+                s(&[b"GETEX", b"gx"], Expect::Str(b"v")),
+                s(&[b"TTL", b"gx"], Expect::IntRange(95, 100)),
+                s(&[b"GETEX", b"gx", b"PERSIST"], Expect::Str(b"v")),
+                s(&[b"TTL", b"gx"], Expect::Int(-1)),
+                s(&[b"GETEX", b"gx", b"EX", b"50"], Expect::Str(b"v")),
+                s(&[b"TTL", b"gx"], Expect::IntRange(45, 50)),
+                s(&[b"GETEX", b"gx", b"PX", b"80000"], Expect::Str(b"v")),
+                s(&[b"TTL", b"gx"], Expect::IntRange(75, 80)),
+                // PERSIST after a TTL, then confirm a second bare GETEX does
+                // not reintroduce one.
+                s(&[b"GETEX", b"gx", b"PERSIST"], Expect::Str(b"v")),
+                s(&[b"GETEX", b"gx"], Expect::Str(b"v")),
+                s(&[b"TTL", b"gx"], Expect::Int(-1)),
+                s(&[b"GETEX", b"gxmissing"], Expect::Nil),
+                s(&[b"GETEX", b"gx", b"EX", b"0"], Expect::AnyError),
+                // Two expiry options contradict; last-one-wins would half
+                // apply a command the client did not mean.
+                s(
+                    &[b"GETEX", b"gx", b"EX", b"60", b"PERSIST"],
+                    Expect::AnyError,
+                ),
+                s(&[b"GETEX", b"gx", b"BOGUS"], Expect::AnyError),
+                s(&[b"GETEX"], Expect::AnyError),
+                s(&[b"RPUSH", b"gxlist", b"a"], Expect::Int(1)),
+                s(&[b"GETEX", b"gxlist"], Expect::AnyError),
+                s(&[b"DEL", b"gx", b"gxlist"], Expect::Int(2)),
+            ],
+        },
+        Case {
+            family: "keyspace",
+            name: "copy (same slot)",
+            steps: vec![
+                s(&[b"SET", b"{cp}s", b"v", b"EX", b"100"], Expect::Ok),
+                s(&[b"COPY", b"{cp}s", b"{cp}d"], Expect::Int(1)),
+                s(&[b"GET", b"{cp}d"], Expect::Str(b"v")),
+                // The TTL travels with the value.
+                s(&[b"TTL", b"{cp}d"], Expect::IntRange(95, 100)),
+                // An occupied destination refuses without REPLACE.
+                s(&[b"SET", b"{cp}e", b"old"], Expect::Ok),
+                s(&[b"COPY", b"{cp}s", b"{cp}e"], Expect::Int(0)),
+                s(&[b"GET", b"{cp}e"], Expect::Str(b"old")),
+                s(&[b"COPY", b"{cp}s", b"{cp}e", b"REPLACE"], Expect::Int(1)),
+                s(&[b"GET", b"{cp}e"], Expect::Str(b"v")),
+                s(&[b"COPY", b"{cp}missing", b"{cp}x"], Expect::Int(0)),
+                // Copying a key onto itself is an error, not a quiet 0.
+                s(&[b"COPY", b"{cp}s", b"{cp}s"], Expect::AnyError),
+                // DB 0 is the database the client is already in, so clients
+                // that send it explicitly are accommodated. (A nonzero index
+                // is deliberately NOT in this corpus: Valkey has sixteen
+                // databases and would copy into one, while a namespace here
+                // has exactly one — the divergence is by design, so asserting
+                // it against the oracle would assert the wrong thing.)
+                s(&[b"COPY", b"{cp}s", b"{cp}db", b"DB", b"0"], Expect::Int(1)),
+                s(&[b"COPY", b"{cp}s", b"{cp}y", b"BOGUS"], Expect::AnyError),
+                s(&[b"COPY", b"{cp}s"], Expect::AnyError),
+                // Every collection type, because each keeps its contents in
+                // a different shape of row and a copy that forgets one of
+                // them is not visible from the string case at all.
+                s(&[b"RPUSH", b"{cp}L", b"a", b"b", b"c"], Expect::Int(3)),
+                s(&[b"COPY", b"{cp}L", b"{cp}L2"], Expect::Int(1)),
+                s(
+                    &[b"LRANGE", b"{cp}L2", b"0", b"-1"],
+                    Expect::Arr(vec![
+                        Expect::Str(b"a"),
+                        Expect::Str(b"b"),
+                        Expect::Str(b"c"),
+                    ]),
+                ),
+                s(
+                    &[b"HSET", b"{cp}H", b"f1", b"v1", b"f2", b"v2"],
+                    Expect::Int(2),
+                ),
+                s(&[b"COPY", b"{cp}H", b"{cp}H2"], Expect::Int(1)),
+                s(
+                    &[b"HGETALL", b"{cp}H2"],
+                    Expect::UnorderedPairs(vec![(b"f1", b"v1"), (b"f2", b"v2")]),
+                ),
+                s(&[b"SADD", b"{cp}S", b"m1", b"m2"], Expect::Int(2)),
+                s(&[b"COPY", b"{cp}S", b"{cp}S2"], Expect::Int(1)),
+                s(
+                    &[b"SMEMBERS", b"{cp}S2"],
+                    Expect::UnorderedStrs(vec![b"m1", b"m2"]),
+                ),
+                s(&[b"ZADD", b"{cp}Z", b"1", b"a", b"2", b"b"], Expect::Int(2)),
+                s(&[b"COPY", b"{cp}Z", b"{cp}Z2"], Expect::Int(1)),
+                // Both zset row families must have come across: ZSCORE reads
+                // the member rows, ZRANGE reads the score index. A copy that
+                // moved only one would pass exactly one of these.
+                s(&[b"ZSCORE", b"{cp}Z2", b"b"], Expect::Str(b"2")),
+                s(
+                    &[b"ZRANGE", b"{cp}Z2", b"0", b"-1"],
+                    Expect::Arr(vec![Expect::Str(b"a"), Expect::Str(b"b")]),
+                ),
+                // The copy is independent, not an alias: writing to one and
+                // deleting the other must leave the survivor whole.
+                s(&[b"RPUSH", b"{cp}L2", b"zz"], Expect::Int(4)),
+                s(
+                    &[b"LRANGE", b"{cp}L", b"0", b"-1"],
+                    Expect::Arr(vec![
+                        Expect::Str(b"a"),
+                        Expect::Str(b"b"),
+                        Expect::Str(b"c"),
+                    ]),
+                ),
+                s(&[b"DEL", b"{cp}L"], Expect::Int(1)),
+                s(
+                    &[b"LRANGE", b"{cp}L2", b"0", b"-1"],
+                    Expect::Arr(vec![
+                        Expect::Str(b"a"),
+                        Expect::Str(b"b"),
+                        Expect::Str(b"c"),
+                        Expect::Str(b"zz"),
+                    ]),
+                ),
+                s(
+                    &[
+                        b"DEL", b"{cp}s", b"{cp}d", b"{cp}e", b"{cp}db", b"{cp}L2", b"{cp}H",
+                        b"{cp}H2", b"{cp}S", b"{cp}S2", b"{cp}Z", b"{cp}Z2",
+                    ],
+                    Expect::Int(11),
+                ),
+            ],
+        },
+        Case {
             family: "sets",
             name: "sadd srem sismember smembers scard",
             steps: vec![

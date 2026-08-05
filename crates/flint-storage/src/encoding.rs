@@ -179,6 +179,18 @@ impl ComplexMeta {
         out
     }
 
+    /// Rewrite the version of an ENCODED metadata row, leaving every other
+    /// byte alone — including whatever a type appends past the common tail.
+    ///
+    /// This exists because `decode` then `encode` is NOT a round trip for
+    /// every type: a list's metadata carries head/tail counters after the
+    /// shared fields, and rebuilding the row from a `ComplexMeta` silently
+    /// truncates them, leaving a row that no longer decodes as a list. COPY
+    /// found this the honest way, by disagreeing with Valkey.
+    pub fn write_version(row: &mut [u8], version: u64) {
+        row[HEADER_LEN..HEADER_LEN + 8].copy_from_slice(&version.to_be_bytes());
+    }
+
     pub fn decode(row: &[u8]) -> Option<Self> {
         let header = MetaHeader::decode(row)?;
         if row.len() < HEADER_LEN + COMPLEX_TAIL_LEN {

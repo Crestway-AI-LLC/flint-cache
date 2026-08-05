@@ -20,12 +20,28 @@ on-demand rather than in CI, because it needs a module you have to compile.
 
 ## Supported
 
-**Connection / server**: PING, ECHO, AUTH (at the proxy), COMMAND, SELECT,
-HELLO, QUIT (minimal, compatibility-shaped), DBSIZE, FLUSHALL (both scoped
-to the tenant namespace).
+**Connection / server**: PING, ECHO, AUTH (at the proxy), COMMAND,
+SELECT (index 0 only), HELLO, QUIT (minimal, compatibility-shaped), DBSIZE,
+FLUSHALL (both scoped to the tenant namespace).
+
+> A namespace is one logical database, so `SELECT 0` succeeds and any other
+> index is refused. Tenancy replaces numbered databases here: isolation is
+> the namespace, which the proxy pins per connection.
 
 **Keyspace**: DEL, UNLINK, EXISTS, TYPE, EXPIRE, PEXPIRE, EXPIREAT,
-PEXPIREAT, TTL, PTTL, EXPIRETIME, PEXPIRETIME, PERSIST.
+PEXPIREAT, TTL, PTTL, EXPIRETIME, PEXPIRETIME, PERSIST, COPY (REPLACE,
+DB 0).
+
+> COPY is **same-slot only**, for the same reason as the set operations: the
+> destination is written into the node's local rows, so a destination in a
+> slot the node does not own would be stored where nothing can read it and
+> COPY would report success having created nothing. Colocate with a hash tag
+> (`COPY {u1}:a {u1}:b`) or the request is refused with `CROSSSLOT`.
+>
+> `DB` is accepted only as `DB 0`. A namespace has exactly one logical
+> database, so index 0 names the one the client is already in; any other
+> index is refused rather than quietly redirected into database 0. This is a
+> deliberate divergence from a stock Valkey, which has sixteen.
 
 **JSON documents**: JSON.SET (NX, XX), JSON.GET, JSON.DEL / JSON.FORGET,
 JSON.TYPE, JSON.NUMINCRBY, JSON.ARRAPPEND, JSON.ARRLEN.
@@ -35,8 +51,9 @@ through the proxy across all shard pairs as one cursor stream (redis-cli
 `--scan`, RedisInsight, and client iterators work as-is).
 
 **Strings**: SET (NX, XX, EX, PX, EXAT, PXAT, KEEPTTL, GET), SETNX, SETEX,
-GET, GETDEL, GETSET, MSET, MGET, APPEND, STRLEN, GETRANGE, SETRANGE,
-INCR, DECR, INCRBY, DECRBY, INCRBYFLOAT.
+GET, GETDEL, GETEX (EX, PX, EXAT, PXAT, PERSIST), GETSET, MSET, MGET,
+APPEND, STRLEN, GETRANGE, SETRANGE, INCR, DECR, INCRBY, DECRBY,
+INCRBYFLOAT.
 
 **Hashes**: HSET, HSETNX, HGET, HMGET, HGETALL, HDEL, HLEN, HEXISTS,
 HINCRBY, HSTRLEN, HSCAN (MATCH, COUNT, NOVALUES).
@@ -56,8 +73,15 @@ LREM, LINSERT, LPOS (RANK, COUNT, MAXLEN).
 
 **Sorted sets**: ZADD, ZSCORE, ZMSCORE, ZINCRBY, ZREM, ZCARD, ZRANGE,
 ZREVRANGE, ZRANGEBYSCORE, ZREVRANGEBYSCORE (WITHSCORES, LIMIT, exclusive
-bounds, ±inf), ZRANK, ZREVRANK, ZCOUNT, ZPOPMIN, ZPOPMAX,
-ZREMRANGEBYSCORE, ZREMRANGEBYRANK, ZSCAN (MATCH, COUNT).
+bounds, ±inf), ZRANGEBYLEX, ZREVRANGEBYLEX (LIMIT, exclusive bounds,
+`-`/`+`), ZRANK, ZREVRANK, ZCOUNT, ZPOPMIN, ZPOPMAX, ZREMRANGEBYSCORE,
+ZREMRANGEBYRANK, ZSCAN (MATCH, COUNT).
+
+> The lex forms are meaningful only when every member shares one score —
+> the same condition Redis states — because the index is ordered by
+> (score, member). Flint matches upstream's seek-then-walk behaviour rather
+> than filtering, so a mixed-score set returns what Valkey returns even
+> though neither defines it.
 
 ## Protocols: RESP2 and RESP3
 

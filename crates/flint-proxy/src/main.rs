@@ -1728,6 +1728,15 @@ fn data_command(
                     topo.cache.invalidate(ns, k);
                 }
             }
+            // COPY src dst [REPLACE]: the DESTINATION is the key that
+            // changed. The default arm below drops args[1], which for COPY
+            // is the SOURCE — nothing wrote it, while a cached destination
+            // would go on serving its pre-copy value through this proxy.
+            b"COPY" => {
+                if let Some(k) = args.get(2) {
+                    topo.cache.invalidate(ns, k);
+                }
+            }
             b"FLUSHALL" => topo.cache.invalidate_ns(ns),
             _ => {
                 if let Some(k) = args.get(1) {

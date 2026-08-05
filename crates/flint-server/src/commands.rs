@@ -16,7 +16,7 @@ use flint_storage::keyspace::{Keyspace, Ttl};
 use flint_storage::lists::{ListStore, LsetOutcome};
 use flint_storage::sets::SetStore;
 use flint_storage::strings::{Clock, SetExpiry, SetOptions, SetOutcome, StoreError, StringStore};
-use flint_storage::zsets::{ScoreBound, ZSetStore};
+use flint_storage::zsets::{LexBound, ScoreBound, ZSetStore};
 
 /// True for commands that mutate the keyspace (rejected on replicas).
 /// Delegates to the SHARED classifier (flint-commands, ADR-0005 D1): the
@@ -211,6 +211,7 @@ impl<'a> Dispatcher<'a> {
                     Value::Bulk,
                 )
             }),
+            b"GETEX" => self.cmd_getex(args),
             b"GETSET" => exact(args, 3, "getset", |a| {
                 // Set new, return old (nil if absent; WRONGTYPE if non-string).
                 let slot = slot_for_key(&a[1]);
@@ -624,6 +625,8 @@ impl<'a> Dispatcher<'a> {
             b"ZREVRANGE" => self.cmd_zrange_idx(args, "zrevrange", true),
             b"ZRANGEBYSCORE" => self.cmd_zrangebyscore(args, "zrangebyscore", false),
             b"ZREVRANGEBYSCORE" => self.cmd_zrangebyscore(args, "zrevrangebyscore", true),
+            b"ZRANGEBYLEX" => self.cmd_zrangebylex(args, "zrangebylex", false),
+            b"ZREVRANGEBYLEX" => self.cmd_zrangebylex(args, "zrevrangebylex", true),
             b"ZRANK" => self.cmd_zrank(args, "zrank", false),
             b"ZREVRANK" => self.cmd_zrank(args, "zrevrank", true),
             b"ZCOUNT" => self.cmd_zcount(args),
@@ -646,6 +649,22 @@ impl<'a> Dispatcher<'a> {
                     None => Value::Simple("none".into()),
                 }
             }),
+            // SELECT: docs/command-support.md has listed this as supported
+            // since the connection family was written, and it answered
+            // "unknown command" until now — found by probing rather than by
+            // reading, which is the only way a claim like this ever surfaces.
+            //
+            // Index 0 is the only database a namespace has, so that is the
+            // only index accepted. The error texts are Valkey's own, checked
+            // against a live server: a non-integer and an out-of-range index
+            // fail differently there, and a client that distinguishes them
+            // should not have to care which server it is talking to.
+            b"SELECT" => exact(args, 2, "select", |a| match parse_i64(&a[1]) {
+                Ok(0) => Value::Simple("OK".into()),
+                Ok(_) => err("ERR DB index is out of range"),
+                Err(_) => err("ERR value is not an integer or out of range"),
+            }),
+            b"COPY" => self.cmd_copy(args),
             b"EXPIRE" => self.cmd_expire(args, "expire", 1000),
             b"PEXPIRE" => self.cmd_expire(args, "pexpire", 1),
             b"EXPIREAT" => self.cmd_expire_at(args, "expireat", 1000),
@@ -726,6 +745,61 @@ impl<'a> Dispatcher<'a> {
                 err(&format!("ERR unknown command '{name}'"))
             }
         }
+    }
+
+    /// GETEX key [EX s | PX ms | EXAT ts | PXAT ts | PERSIST].
+    ///
+    /// The default is KEEP, not CLEAR — the opposite of SET. A bare GETEX is
+    /// a plain GET and must leave the TTL alone; reusing SetOptions::default
+    /// here would silently make every GETEX a PERSIST.
+    fn cmd_getex(&self, args: &[Vec<u8>]) -> Value {
+        if args.len() < 2 {
+            return arity_err("getex");
+        }
+        let mut expiry = SetExpiry::Keep;
+        let mut set_once = false;
+        let mut i = 2;
+        while i < args.len() {
+            // Redis takes at most one expiry option; a second is a syntax
+            // error rather than last-one-wins, so a client cannot half-apply
+            // a contradiction like "EX 60 PERSIST".
+            if set_once {
+                return err("ERR syntax error");
+            }
+            match args[i].to_ascii_uppercase().as_slice() {
+                b"PERSIST" => {
+                    expiry = SetExpiry::Clear;
+                    set_once = true;
+                }
+                opt @ (b"EX" | b"PX" | b"EXAT" | b"PXAT") => {
+                    let unit_ms = matches!(opt, b"EX" | b"EXAT");
+                    let absolute = matches!(opt, b"EXAT" | b"PXAT");
+                    let Some(raw) = args.get(i + 1) else {
+                        return err("ERR syntax error");
+                    };
+                    let Ok(n) = parse_i64(raw) else {
+                        return err("ERR value is not an integer or out of range");
+                    };
+                    if n <= 0 && !absolute {
+                        return err("ERR invalid expire time in 'getex' command");
+                    }
+                    let ms = if unit_ms { n.saturating_mul(1000) } else { n } as u64;
+                    expiry = SetExpiry::AtMs(if absolute {
+                        ms
+                    } else {
+                        ((self.clock)()).saturating_add(ms)
+                    });
+                    set_once = true;
+                    i += 1;
+                }
+                _ => return err("ERR syntax error"),
+            }
+            i += 1;
+        }
+        reply(
+            self.strings.getex(slot_for_key(&args[1]), &args[1], expiry),
+            Value::Bulk,
+        )
     }
 
     fn cmd_set(&self, args: &[Vec<u8>]) -> Value {
@@ -928,6 +1002,134 @@ impl<'a> Dispatcher<'a> {
             ),
             |r| Self::zrows(r, withscores),
         )
+    }
+
+    /// ZRANGEBYLEX / ZREVRANGEBYLEX key min max [LIMIT offset count].
+    /// The reversed form takes (max, min), as the score forms do.
+    ///
+    /// No WITHSCORES here: the lex family exists for sets whose scores are
+    /// all equal, so a score column would be a constant. Redis does not
+    /// accept it either.
+    fn cmd_zrangebylex(&self, args: &[Vec<u8>], name: &str, rev: bool) -> Value {
+        if args.len() < 4 {
+            return arity_err(name);
+        }
+        let (lo_raw, hi_raw) = if rev {
+            (&args[3], &args[2])
+        } else {
+            (&args[2], &args[3])
+        };
+        let (Some(min), Some(max)) = (LexBound::parse(lo_raw), LexBound::parse(hi_raw)) else {
+            return err("ERR min or max not valid string range item");
+        };
+        let (mut offset, mut count) = (0i64, -1i64);
+        let mut i = 4;
+        while i < args.len() {
+            match args[i].to_ascii_uppercase().as_slice() {
+                b"LIMIT" => {
+                    let (Some(o), Some(c)) = (args.get(i + 1), args.get(i + 2)) else {
+                        return err("ERR syntax error");
+                    };
+                    let (Ok(o), Ok(c)) = (parse_i64(o), parse_i64(c)) else {
+                        return err("ERR value is not an integer or out of range");
+                    };
+                    offset = o;
+                    count = c;
+                    i += 2;
+                }
+                // Not a generic syntax error: WITHSCORES is the option a
+                // client reaches for by habit after the score forms, and
+                // upstream spells out why it cannot apply here. Worth
+                // copying verbatim — the generic message would leave the
+                // caller re-reading their own argument list.
+                b"WITHSCORES" => {
+                    return err(
+                        "ERR syntax error, WITHSCORES not supported in combination with BYLEX",
+                    );
+                }
+                _ => return err("ERR syntax error"),
+            }
+            i += 1;
+        }
+        reply(
+            self.zsets.zrange_by_lex(
+                slot_for_key(&args[1]),
+                &args[1],
+                &min,
+                &max,
+                rev,
+                offset,
+                count,
+            ),
+            |ms| Value::Array(Some(ms.into_iter().map(|m| Value::Bulk(Some(m))).collect())),
+        )
+    }
+
+    /// COPY source destination [REPLACE]. Same slot only, for the reason
+    /// the set operations are: the destination is written into this node's
+    /// local rows, so a destination in a slot this node does not own would
+    /// be stored where nothing will ever read it and COPY would return 1
+    /// having created nothing anybody can find. A wrong answer, not a slow
+    /// one — refuse it.
+    ///
+    /// DB is accepted only as `DB 0`. A namespace has exactly one logical
+    /// database, so index 0 names the one the client is already in and the
+    /// option is a no-op worth tolerating — clients emit it. Any other index
+    /// names a database that does not exist here, and Valkey's own answer
+    /// for an index it cannot reach is "DB index is out of range", so that
+    /// is the answer. Silently copying into db 0 instead would be the real
+    /// hazard: the caller believes the data went somewhere else.
+    fn cmd_copy(&self, args: &[Vec<u8>]) -> Value {
+        if args.len() < 3 {
+            return arity_err("copy");
+        }
+        let mut replace = false;
+        let mut i = 3;
+        while i < args.len() {
+            match args[i].to_ascii_uppercase().as_slice() {
+                b"REPLACE" => replace = true,
+                b"DB" => {
+                    let Some(raw) = args.get(i + 1) else {
+                        return err("ERR syntax error");
+                    };
+                    let Ok(n) = parse_i64(raw) else {
+                        return err("ERR value is not an integer or out of range");
+                    };
+                    if n != 0 {
+                        return err("ERR DB index is out of range");
+                    }
+                    i += 1;
+                }
+                _ => return err("ERR syntax error"),
+            }
+            i += 1;
+        }
+        let (src, dst) = (&args[1], &args[2]);
+        let slot = slot_for_key(src);
+        if slot_for_key(dst) != slot {
+            return Value::Error(format!(
+                "CROSSSLOT Keys in request don't hash to the same slot ({} is slot {}, \
+                 {} is slot {}) — use a hash tag such as {{tag}}key to colocate them",
+                String::from_utf8_lossy(src),
+                slot,
+                String::from_utf8_lossy(dst),
+                slot_for_key(dst)
+            ));
+        }
+        // Copying a key onto itself is an ERROR upstream, not a quiet 0 —
+        // verified against Valkey rather than inferred, because the two are
+        // easy to confuse and only one of them tells the caller they wrote a
+        // command that cannot mean anything.
+        //
+        // The store must not see this case at all. With REPLACE it would
+        // delete the destination's metadata first, which here IS the
+        // source's, and for a collection it would then re-key every row to a
+        // fresh version under the same name: the key survives, but its whole
+        // contents are duplicated on disk until the sweeper catches up.
+        if src == dst {
+            return err("ERR source and destination objects are the same");
+        }
+        Value::Integer(self.keyspace.copy(slot, src, dst, replace) as i64)
     }
 
     fn cmd_zrank(&self, args: &[Vec<u8>], name: &str, rev: bool) -> Value {

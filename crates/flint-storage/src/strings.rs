@@ -157,6 +157,38 @@ impl<'a> StringStore<'a> {
         Ok(existing)
     }
 
+    /// GETEX: return the value and, unless `expiry` is Keep, rewrite the
+    /// key's TTL in the same pass. WRONGTYPE if the key holds a non-string.
+    ///
+    /// A past absolute expiry is written verbatim rather than special-cased
+    /// into a delete. `read_live` already treats an elapsed expire_ms as
+    /// absent, so the key becomes invisible immediately and the GC sweeper
+    /// reclaims it — the same path SET ... PXAT in the past takes. Two ways
+    /// to retire a key would be two ways to get it wrong.
+    pub fn getex(
+        &self,
+        slot: u16,
+        key: &[u8],
+        expiry: SetExpiry,
+    ) -> Result<Option<Vec<u8>>, StoreError> {
+        let Some(mut meta) = self.read_live(slot, key)? else {
+            return Ok(None);
+        };
+        let new_expire = match expiry {
+            // GETEX with no option is a plain GET: the TTL is untouched,
+            // which is NOT the same as clearing it.
+            SetExpiry::Keep => return Ok(Some(meta.payload)),
+            SetExpiry::AtMs(at) => at,
+            // PERSIST.
+            SetExpiry::Clear => 0,
+        };
+        if new_expire != meta.expire_ms {
+            meta.expire_ms = new_expire;
+            self.kv.put(&self.meta_key(slot, key), &meta.encode());
+        }
+        Ok(Some(meta.payload))
+    }
+
     /// INCRBY/DECRBY. Creates the key at 0. Preserves TTL.
     pub fn incr_by(&self, slot: u16, key: &[u8], delta: i64) -> Result<i64, StoreError> {
         let existing = self.read_live(slot, key)?;

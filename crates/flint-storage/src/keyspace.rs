@@ -8,7 +8,9 @@
 //! filters later.
 
 use crate::Kv;
-use crate::encoding::{Cf, MetaHeader, ValueType, envelope};
+use crate::encoding::{
+    Cf, ComplexMeta, MetaHeader, ValueType, VersionGen, envelope, subkey_prefix, zscore_prefix,
+};
 use crate::strings::Clock;
 
 /// TTL query result, Redis-shaped.
@@ -66,6 +68,107 @@ impl<'a> Keyspace<'a> {
             self.kv.delete(&self.meta_key(slot, key));
         }
         live
+    }
+
+    /// COPY src dst [REPLACE], within one slot. False = nothing copied:
+    /// either the source is absent or the destination exists without
+    /// REPLACE. The TTL travels with the value, as in Redis.
+    ///
+    /// SAME SLOT IS THE CALLER'S JOB. Both keys are addressed with the one
+    /// `slot` argument because a copy spanning slots is not a copy this node
+    /// can perform — it would write the destination into local rows the node
+    /// may not own. The command layer refuses that case; this signature
+    /// makes it unrepresentable here rather than merely unlikely.
+    ///
+    /// COST. O(1) for strings and JSON documents, whose metadata row IS the
+    /// value. O(size) for collections, which must be re-keyed row by row:
+    /// subkey rows embed the user key, so there is no aliasing trick that
+    /// would let two keys share one set of rows. Redis's COPY is O(N) for
+    /// the same reason.
+    pub fn copy(&self, slot: u16, src: &[u8], dst: &[u8], replace: bool) -> bool {
+        let Some((header, row)) = self.read_live_row(slot, src) else {
+            return false;
+        };
+        // `exists` is expiry-aware, so a destination that is merely awaiting
+        // collection never blocks a copy.
+        if self.exists(slot, dst) {
+            if !replace {
+                return false;
+            }
+            // O(1), exactly as DEL: the displaced subkey rows become
+            // unreachable orphans under a version no live metadata claims,
+            // and the sweeper reclaims them.
+            self.kv.delete(&self.meta_key(slot, dst));
+        }
+        let Some(kind) = header.value_type() else {
+            return false;
+        };
+        match kind {
+            // One row holds flags, TTL and payload together, so copying the
+            // row verbatim copies all three and cannot drift from however
+            // the value type encodes itself.
+            ValueType::String | ValueType::Json => {
+                self.kv.put(&self.meta_key(slot, dst), &row);
+                true
+            }
+            ValueType::Hash | ValueType::Set | ValueType::ZSet | ValueType::List => {
+                let Some(meta) = ComplexMeta::decode(&row) else {
+                    return false;
+                };
+                // A fresh version for the destination. The sweeper matches a
+                // row's version against the live metadata OF ITS OWN KEY, so
+                // reusing the source's number would in fact be safe — this
+                // is about keeping "a version identifies one incarnation of
+                // one key" true, so nothing downstream can read shared
+                // numbering as shared lineage. It costs one increment.
+                let version = VersionGen::next((self.clock)());
+                // PATCH the row, never rebuild it. A list's metadata carries
+                // head/tail counters past the shared fields, and re-encoding
+                // a decoded ComplexMeta drops them — the destination then
+                // fails to decode as a list at all. Patching in place is
+                // type-agnostic by construction.
+                let mut dst_row = row.clone();
+                ComplexMeta::write_version(&mut dst_row, version);
+                self.rekey_rows(
+                    &subkey_prefix(&self.ns, slot, src, meta.version),
+                    &subkey_prefix(&self.ns, slot, dst, version),
+                );
+                if kind == ValueType::ZSet {
+                    // The score index is a second family of rows under its
+                    // own CF. Miss it and the copy has members with no
+                    // ordering: ZSCORE would answer and ZRANGE would not.
+                    self.rekey_rows(
+                        &zscore_prefix(&self.ns, slot, src, meta.version),
+                        &zscore_prefix(&self.ns, slot, dst, version),
+                    );
+                }
+                // Metadata LAST. Until it lands the destination does not
+                // exist, so a crash mid-copy leaves unreachable rows for the
+                // sweeper rather than a key whose contents are half there.
+                self.kv.put(&self.meta_key(slot, dst), &dst_row);
+                true
+            }
+        }
+    }
+
+    /// Re-write every row under `from` to the same suffix under `to`.
+    ///
+    /// Both prefixes end at the version field, so whatever follows — a hash
+    /// field, a list index, a score-and-member — is opaque here and copies
+    /// across untouched. That is what lets one routine serve every
+    /// collection type and both of the zset's row families.
+    ///
+    /// Streams rather than materializing: a collection can be far larger
+    /// than RAM on a disk-first engine, which is the whole premise. Writing
+    /// into a different prefix than the one being scanned keeps this clear
+    /// of the visit-time mutation caveat in the `Kv` contract.
+    fn rekey_rows(&self, from: &[u8], to: &[u8]) {
+        self.kv.for_each_prefix(from, &mut |k, v| {
+            let mut nk = to.to_vec();
+            nk.extend_from_slice(&k[from.len()..]);
+            self.kv.put(&nk, v);
+            true
+        });
     }
 
     /// EXPIRE/PEXPIRE (absolute). False if the key does not exist.

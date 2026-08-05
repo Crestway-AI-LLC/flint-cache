@@ -66,6 +66,62 @@ impl ScoreBound {
     }
 }
 
+/// A ZRANGEBYLEX bound. Lexicographic ranges are only meaningful when every
+/// member shares one score — then the index's (score, member) order collapses
+/// to plain member order. Redis leaves the mixed-score case undefined; see
+/// `zrange_by_lex` for what we do about that.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LexBound {
+    /// `-`: below every member.
+    NegInf,
+    /// `+`: above every member.
+    PosInf,
+    /// `[value`
+    Incl(Vec<u8>),
+    /// `(value`
+    Excl(Vec<u8>),
+}
+
+impl LexBound {
+    /// Parse a Redis lex-range token. None = malformed, which the caller
+    /// must report rather than coerce: a token with no `[`/`(` prefix is a
+    /// mistake worth surfacing, not an implied inclusive bound.
+    pub fn parse(raw: &[u8]) -> Option<LexBound> {
+        match raw.first()? {
+            // `-` and `+` are infinities only when they are the WHOLE token.
+            // "(-" is an exclusive bound on the member "-", and "[+x" is an
+            // inclusive bound on "+x".
+            b'-' if raw.len() == 1 => Some(LexBound::NegInf),
+            b'+' if raw.len() == 1 => Some(LexBound::PosInf),
+            // An empty body is legal: `[` is the inclusive empty string,
+            // which sorts below every non-empty member.
+            b'[' => Some(LexBound::Incl(raw[1..].to_vec())),
+            b'(' => Some(LexBound::Excl(raw[1..].to_vec())),
+            _ => None,
+        }
+    }
+
+    /// Is `member` at or above this bound read as the range's LOWER end?
+    fn ge_lower(&self, member: &[u8]) -> bool {
+        match self {
+            LexBound::NegInf => true,
+            LexBound::PosInf => false,
+            LexBound::Incl(v) => member >= v.as_slice(),
+            LexBound::Excl(v) => member > v.as_slice(),
+        }
+    }
+
+    /// Is `member` at or below this bound read as the range's UPPER end?
+    fn le_upper(&self, member: &[u8]) -> bool {
+        match self {
+            LexBound::NegInf => false,
+            LexBound::PosInf => true,
+            LexBound::Incl(v) => member <= v.as_slice(),
+            LexBound::Excl(v) => member < v.as_slice(),
+        }
+    }
+}
+
 fn member_cost(member: &[u8]) -> u64 {
     member.len() as u64 + 8
 }
@@ -274,6 +330,62 @@ impl<'a> ZSetStore<'a> {
             hits.reverse();
         }
         // LIMIT offset count (count < 0 = to the end); no LIMIT => all.
+        if offset > 0 {
+            let off = (offset as usize).min(hits.len());
+            hits.drain(..off);
+        }
+        if count >= 0 {
+            hits.truncate(count as usize);
+        }
+        Ok(hits)
+    }
+
+    /// ZRANGEBYLEX / ZREVRANGEBYLEX: members inside a lexicographic range,
+    /// then LIMIT offset/count. Ascending output unless `rev`.
+    ///
+    /// WHY THIS WALKS AND STOPS INSTEAD OF FILTERING. The obvious body is
+    /// `all_ordered().filter(in range)`, and it is subtly not Redis. Redis
+    /// seeks to the first member in range and walks until one falls out,
+    /// which differs from a filter exactly when scores are NOT uniform:
+    /// the index is ordered by (score, member), so with mixed scores the
+    /// member sequence is not monotonic and a filter would collect members
+    /// that lie beyond the point Redis stops at.
+    ///
+    /// That case is documented as undefined, which is precisely why it must
+    /// not be improvised — the conformance suite compares us against real
+    /// Valkey, and "undefined" is only undefined until a corpus case lands
+    /// on it. Matching the walk keeps us bit-identical wherever a client
+    /// might stray, not merely wherever the docs promise.
+    #[allow(clippy::too_many_arguments)]
+    pub fn zrange_by_lex(
+        &self,
+        slot: u16,
+        key: &[u8],
+        min: &LexBound,
+        max: &LexBound,
+        rev: bool,
+        offset: i64,
+        count: i64,
+    ) -> Result<Vec<Vec<u8>>, StoreError> {
+        let mut ordered: Vec<Vec<u8>> = self
+            .all_ordered(slot, key)?
+            .into_iter()
+            .map(|(m, _)| m)
+            .collect();
+        if rev {
+            ordered.reverse();
+        }
+        // Seek to the first member inside the range, then walk until one
+        // falls out. "Inside" needs no sense of direction, so reversing the
+        // sequence is the ONLY thing `rev` changes — the reversed form seeks
+        // the last member in range and walks back, which is what this is
+        // once the order is flipped.
+        let in_range = |m: &[u8]| min.ge_lower(m) && max.le_upper(m);
+        let mut hits: Vec<Vec<u8>> = ordered
+            .into_iter()
+            .skip_while(|m| !in_range(m))
+            .take_while(|m| in_range(m))
+            .collect();
         if offset > 0 {
             let off = (offset as usize).min(hits.len());
             hits.drain(..off);

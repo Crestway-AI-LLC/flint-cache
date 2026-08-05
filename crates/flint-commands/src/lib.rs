@@ -38,6 +38,7 @@ pub fn is_write_command(name: &[u8]) -> bool {
             | b"SETNX"
             | b"SETEX"
             | b"MSET"
+            | b"COPY"
             | b"DEL"
             | b"EXPIRE"
             | b"PEXPIRE"
@@ -45,6 +46,11 @@ pub fn is_write_command(name: &[u8]) -> bool {
             | b"PEXPIREAT"
             | b"UNLINK"
             | b"GETDEL"
+            // GETEX reads a value but may rewrite or clear the key's TTL, so
+            // it is a write: it must stay on the master, and it must drop the
+            // proxy's cached entry — a GETEX that shortens a TTL otherwise
+            // leaves a cached value outliving the expiry it just set.
+            | b"GETEX"
             | b"GETSET"
             | b"HSETNX"
             | b"PERSIST"
@@ -130,6 +136,8 @@ pub fn is_read_command(name: &[u8]) -> bool {
             | b"ZREVRANGE"
             | b"ZRANGEBYSCORE"
             | b"ZREVRANGEBYSCORE"
+            | b"ZRANGEBYLEX"
+            | b"ZREVRANGEBYLEX"
             | b"ZRANK"
             | b"ZREVRANK"
             | b"ZCOUNT"
