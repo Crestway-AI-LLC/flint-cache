@@ -492,7 +492,7 @@ fn restore_ns() {
         let src_dir = std::path::Path::new(&from).join(format!("pairs/{}", pair.index));
         let kv = flint_storage::rocks::RocksKv::open_read_only(&src_dir)
             .unwrap_or_else(|e| die(&format!("open set pair {} read-only: {e}", pair.index)));
-        for cf in [b'M', b'S', b'Z'] {
+        for cf in *b"MSZ" {
             let mut prefix = vec![cf, src_ns.len() as u8];
             prefix.extend_from_slice(src_ns.as_bytes());
             kv.for_each_prefix(&prefix, &mut |k, v| {

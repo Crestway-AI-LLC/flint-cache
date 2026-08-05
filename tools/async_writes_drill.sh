@@ -95,14 +95,25 @@ def resp(a):
     return f"*{len(a)}\r\n".encode()+b"".join(f"${len(x)}\r\n{x}\r\n".encode() for x in a)
 seen=[0]
 lock=threading.Lock()
+# A BARRIER, and a payload heavy enough to matter. Without the barrier the
+# GIL staggers the 64 threads so far apart on a fast machine that each
+# submit is acked before the next arrives — the 16-core gate box measured
+# ZERO sheds from this storm while the laptop shed hundreds, because the
+# queue's depth never reached a cap the arrivals were too polite to fill.
+# The barrier lands each volley together, and the 16 KB value keeps the
+# consumer's WriteBatch busy long enough for the volley to stack.
+barrier=threading.Barrier(64)
+PAYLOAD="x"*16384
 def worker(wid):
-    s=socket.create_connection(("127.0.0.1",6995),timeout=10); s.settimeout(10)
+    s=socket.create_connection(("127.0.0.1",6995),timeout=30); s.settimeout(30)
     s.sendall(resp(["FLINTNS","acme"])); s.recv(64)
     local=0
-    for i in range(400):
-        s.sendall(resp(["SET",f"k:{wid}:{i}","payload-value-to-keep-consumer-busy"]))
+    for i in range(120):
+        try: barrier.wait(timeout=20)
+        except threading.BrokenBarrierError: pass
+        s.sendall(resp(["SET",f"k:{wid}:{i}",PAYLOAD]))
         b=b""
-        while not b.endswith(b"\r\n"): b+=s.recv(128)
+        while not b.endswith(b"\r\n"): b+=s.recv(4096)
         if b"THROTTLED" in b: local+=1
     with lock: seen[0]+=local
     s.close()

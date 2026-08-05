@@ -101,7 +101,12 @@ def check(name, fn, expect_unsupported=False):
 
 # The default constructor, with NOTHING special set: this is the line every
 # tutorial and framework uses, and it is what was broken.
-r = redis.Redis(host="127.0.0.1", port=PORT, password=PW, decode_responses=True)
+# protocol=3 EXPLICITLY: redis-py defaults to RESP3 only from major 8,
+# and a host whose python caps redis-py below that would silently demote
+# this whole battery to RESP2 — the check below would then fail against a
+# server whose RESP3 is fine. Requesting it makes the check about the
+# SERVER, which is the thing under test.
+r = redis.Redis(host="127.0.0.1", port=PORT, password=PW, decode_responses=True, protocol=3)
 print("== the default client connects and serves")
 check("connect (default RESP3 + inline HELLO AUTH)", lambda: r.ping())
 check("protocol really is RESP3",
@@ -118,7 +123,12 @@ check("HGETALL is a dict", hashes)
 def zsets():
     r.delete("z"); r.zadd("z", {"a": 1, "b": 2.5})
     got = r.zrange("z", 0, -1, withscores=True)
-    assert got == [("a", 1.0), ("b", 2.5)], f"zrange -> {got!r}"
+    # Compare as (member, float) PAIRS, not as a literal: redis-py 7 hands
+    # RESP3 pairs back as lists, 8 as tuples. Both are correct client
+    # behavior; what this check pins is the SERVER's pairing and typing —
+    # a member next to its float score, never a flat interleave and never
+    # a string score.
+    assert [(m, float(sc)) for (m, sc) in got] == [("a", 1.0), ("b", 2.5)], f"zrange -> {got!r}"
     assert r.zscore("z", "b") == 2.5, r.zscore("z", "b")
 check("ZRANGE WITHSCORES pairs, ZSCORE is a float", zsets)
 def sets():
@@ -158,7 +168,12 @@ def json_client():
     assert j.get("doc", "$.name") == ["flint"], j.get("doc", "$.name")
     assert j.get("doc", ".name") == "flint"
     assert j.get("doc")["name"] == "flint"
-    assert j.type("doc", "$.tags") == ["array"], j.type("doc", "$.tags")
+    # ["array"] from redis-py 8 (its JSON client unwraps the RESP3
+    # nesting), [["array"]] from 7 (it does not). The server sends the
+    # SAME bytes to both — the module-quirk nesting the real RedisJSON
+    # sends — so both spellings are the genuine article for that client
+    # major, and pinning one of them pins the client, not the product.
+    assert j.type("doc", "$.tags") in (["array"], [["array"]]), j.type("doc", "$.tags")
     assert j.arrlen("doc", "$.tags") == [2]
     assert j.arrappend("doc", "$.tags", "c") == [3]
     assert j.numincrby("doc", "$.n", 5) == [6]
@@ -178,9 +193,28 @@ async def _async():
     await ar.aclose()
 check("asyncio client", lambda: asyncio.run(_async()))
 
+print("== transactions (ADR-0012): the real client machinery works same-slot")
+def txn():
+    # The full optimistic-locking shape a real application uses: WATCH,
+    # read, MULTI, conditional write, EXEC — all keys under one hash tag,
+    # which is the documented contract. This check asserted the OPPOSITE
+    # (expect_unsupported) until transactions shipped, and the stale
+    # expectation was caught by the gate box, not by a person.
+    r.delete("{ct}:bal")
+    r.set("{ct}:bal", "100")
+    with r.pipeline(transaction=True) as pipe:
+        pipe.watch("{ct}:bal")
+        bal = int(pipe.get("{ct}:bal"))
+        pipe.multi()
+        pipe.set("{ct}:bal", str(bal - 30))
+        pipe.set("{ct}:log", "debit")
+        got = pipe.execute()
+    assert got == [True, True], f"EXEC -> {got!r}"
+    assert r.get("{ct}:bal") == "70", r.get("{ct}:bal")
+    assert r.get("{ct}:log") == "debit"
+check("MULTI/EXEC/WATCH (same slot)", txn)
+
 print("== commands we exclude by design still fail HONESTLY")
-check("MULTI/EXEC", lambda: r.pipeline(transaction=True).set("t", "1").execute(),
-      expect_unsupported=True)
 check("SUBSCRIBE", lambda: r.pubsub().subscribe("c") or r.execute_command("SUBSCRIBE", "c"),
       expect_unsupported=True)
 check("BLPOP", lambda: r.blpop("nolist", timeout=1), expect_unsupported=True)
@@ -293,7 +327,11 @@ await check('node-redis JSON client', async () => {
   eq(n, [6], 'json.numIncrBy');
   if (typeof n[0] !== 'number') throw new Error(`numIncrBy element is ${typeof n[0]}`);
 });
-await check('MULTI/EXEC', async () => { await c.multi().set('nr:t', '1').exec(); }, true);
+await check('MULTI/EXEC (same slot)', async () => {
+  const got = await c.multi().set('{nrt}:a', '1').set('{nrt}:b', '2').exec();
+  if (!Array.isArray(got) || got.length !== 2) throw new Error(`exec -> ${JSON.stringify(got)}`);
+  if (await c.get('{nrt}:a') !== '1') throw new Error('txn write missing');
+});
 await check('BLPOP', async () => { await c.blPop('nr:nolist', 1); }, true);
 await check('KEYS', async () => { await c.keys('*'); }, true);
 await c.quit();

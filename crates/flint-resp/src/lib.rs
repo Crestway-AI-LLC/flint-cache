@@ -502,6 +502,39 @@ fn decode_at(input: &[u8], depth: usize) -> Result<Decoded, ProtocolError> {
                         .map(|p| (p[0].clone(), p[1].clone()))
                         .collect(),
                 ),
+                // An array whose every element is a [member, double] pair is
+                // a SCORED result, and the decoder says so. This is not a
+                // heuristic: `Value::Double` can only have come from an
+                // RESP3 frame (`,` does not exist in RESP2), and in this
+                // command surface bulk+double pairs occur only as scores.
+                // Without the canonicalization, a proxy that decodes a
+                // backend's RESP3 ZRANGE..WITHSCORES gets a generic nested
+                // array and faithfully re-encodes the NESTING to an RESP2
+                // client — which is how every pre-RESP3 client library
+                // received corrupt WITHSCORES replies through the edge while
+                // conformance, which dials the node, stayed green.
+                _ if !items.is_empty()
+                    && items.iter().all(|i| {
+                        matches!(
+                            i,
+                            Value::Array(Some(p))
+                                if matches!(p.as_slice(), [Value::Bulk(Some(_)), Value::Double(_)])
+                        )
+                    }) =>
+                {
+                    Value::ScorePairs(
+                        items
+                            .into_iter()
+                            .map(|i| match i {
+                                Value::Array(Some(p)) => match (&p[0], &p[1]) {
+                                    (Value::Bulk(Some(m)), Value::Double(s)) => (m.clone(), *s),
+                                    _ => unreachable!("checked by the guard"),
+                                },
+                                _ => unreachable!("checked by the guard"),
+                            })
+                            .collect(),
+                    )
+                }
                 _ => Value::Array(Some(items)),
             };
             Ok(Decoded::Complete(value, offset))
@@ -559,6 +592,50 @@ fn parse_int(line: &[u8]) -> Result<i64, ProtocolError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_decoded_resp3_scored_reply_flattens_for_a_resp2_client() {
+        // The proxy's whole downgrade path in one assertion: decode the
+        // backend's RESP3 nested pairs, re-encode for RESP2, and the client
+        // must see the flat interleave — NOT the nesting. This was client
+        // bug zero of the edge: every pre-RESP3 library got nested arrays
+        // through the proxy while the node answered flat.
+        let resp3_frame = b"*2\r\n*2\r\n$1\r\na\r\n,1\r\n*2\r\n$1\r\nb\r\n,2.5\r\n";
+        let Ok(Decoded::Complete(v, used)) = decode(resp3_frame) else {
+            panic!("frame did not decode");
+        };
+        assert_eq!(used, resp3_frame.len());
+        assert!(
+            matches!(&v, Value::ScorePairs(p) if p.len() == 2),
+            "decode must canonicalize bulk+double pairs to ScorePairs, got {v:?}"
+        );
+        let mut resp2 = Vec::new();
+        encode_proto(&v, Proto::Resp2, &mut resp2);
+        assert_eq!(
+            resp2, b"*4\r\n$1\r\na\r\n$1\r\n1\r\n$1\r\nb\r\n$3\r\n2.5\r\n",
+            "RESP2 client must get the flat interleave"
+        );
+        // And the RESP3 re-encode is byte-identical to what arrived: the
+        // canonicalization must be invisible to an RESP3 client.
+        let mut resp3 = Vec::new();
+        encode_proto(&v, Proto::Resp3, &mut resp3);
+        assert_eq!(resp3, resp3_frame);
+    }
+
+    #[test]
+    fn ordinary_nested_arrays_are_not_flattened() {
+        // The negative control: nesting without doubles (EXEC replies,
+        // SCAN cursors) must survive untouched — the canonicalization keys
+        // on Double, which only an RESP3 frame can carry.
+        let frame = b"*2\r\n*2\r\n$1\r\na\r\n$1\r\n1\r\n*2\r\n$1\r\nb\r\n$3\r\n2.5\r\n";
+        let Ok(Decoded::Complete(v, _)) = decode(frame) else {
+            panic!("frame did not decode");
+        };
+        assert!(
+            matches!(&v, Value::Array(Some(items)) if matches!(items[0], Value::Array(_))),
+            "bulk-only nesting must stay nested, got {v:?}"
+        );
+    }
+
     use super::*;
 
     fn roundtrip(value: Value) {
@@ -745,17 +822,19 @@ mod tests {
                 "{v:?} did not survive a RESP3 round trip"
             );
         }
-        // ScorePairs is the one variant that does NOT round-trip to itself:
-        // on the wire it is an array of pairs, and that is what comes back.
-        // The proxy re-renders it from that array, which is equivalent.
+        // ScorePairs DOES round-trip to itself — the decoder canonicalizes
+        // an array of bulk+double pairs back to the variant. This assertion
+        // used to pin the opposite ("the proxy re-renders it from that
+        // array, which is equivalent"), and that claim was the bug: for an
+        // RESP2 client the re-render kept the RESP3 NESTING, so every
+        // pre-RESP3 library got corrupt WITHSCORES replies through the
+        // proxy while the node answered flat. Meaning must survive the
+        // decode, or the downgrade has nothing to downgrade from.
         let buf = enc(&Value::ScorePairs(vec![(b"a".to_vec(), 1.0)]), Proto::Resp3);
         assert_eq!(
             decode(&buf),
             Ok(Decoded::Complete(
-                Value::Array(Some(vec![Value::Array(Some(vec![
-                    Value::Bulk(Some(b"a".to_vec())),
-                    Value::Double(1.0),
-                ]))])),
+                Value::ScorePairs(vec![(b"a".to_vec(), 1.0)]),
                 buf.len()
             ))
         );
