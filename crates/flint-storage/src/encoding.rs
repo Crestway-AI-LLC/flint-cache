@@ -66,6 +66,36 @@ impl ValueType {
 /// only variant today; the tag is what makes future variants (e.g. inlined
 /// small collections) coexist per key with no format migration.
 pub const ENCODING_V1: u8 = 0;
+/// v2 (ADR-0013): identical to v1 except `written_ms (8B BE)` is inserted
+/// immediately after the 9-byte common header, stamped on every write. Old
+/// v1 rows keep decoding forever and report the stamp as unknown; a key
+/// upgrades lazily the next time its metadata row is rewritten — which for
+/// every type is every mutation.
+pub const ENCODING_V2: u8 = 1;
+
+/// Offset of the type-specific portion of a metadata row: past the common
+/// header, plus the v2 write stamp when present. Every fixed-offset access
+/// into a row read back from storage must go through this — a v1 row and a
+/// v2 row for the same key differ by exactly these 8 bytes.
+pub fn head_len(flags: u8) -> usize {
+    if encoding_of(flags) == ENCODING_V2 {
+        HEADER_LEN + 8
+    } else {
+        HEADER_LEN
+    }
+}
+
+/// The write stamp of an encoded metadata row; 0 = unknown (a v1 row).
+pub fn written_ms_of(row: &[u8]) -> u64 {
+    if row.first().is_some_and(|f| encoding_of(*f) == ENCODING_V2) {
+        row.get(HEADER_LEN..HEADER_LEN + 8)
+            .and_then(|b| b.try_into().ok())
+            .map(u64::from_be_bytes)
+            .unwrap_or(0)
+    } else {
+        0
+    }
+}
 
 pub fn make_flags(t: ValueType, encoding: u8) -> u8 {
     (t as u8) | (encoding << 4)
@@ -149,6 +179,10 @@ impl MetaHeader {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ComplexMeta {
     pub header: MetaHeader,
+    /// Last data mutation, unix ms; 0 = unknown (decoded from a v1 row).
+    /// EXPIRE/PERSIST rewrite the header in place and deliberately do NOT
+    /// count — this stamps writes, not touches.
+    pub written_ms: u64,
     pub version: u64,
     pub size: u32,
     pub bytes: u64,
@@ -161,18 +195,40 @@ impl ComplexMeta {
     pub fn new(t: ValueType, version: u64) -> Self {
         Self {
             header: MetaHeader {
-                flags: make_flags(t, ENCODING_V1),
+                flags: make_flags(t, ENCODING_V2),
                 expire_ms: 0,
             },
+            // A version mints as (now_ms << 20) + counter, so a fresh key's
+            // write stamp IS its creation instant.
+            written_ms: version >> 20,
             version,
             size: 0,
             bytes: 0,
         }
     }
 
+    /// Stamp a data mutation. Every store calls this before re-encoding the
+    /// metadata row it is about to put — which also upgrades a v1 row to v2
+    /// in place, since encode always writes v2.
+    pub fn touch(&mut self, now_ms: u64) {
+        self.header.flags = make_flags(
+            ValueType::from_flags(self.header.flags).unwrap_or(ValueType::Hash),
+            ENCODING_V2,
+        );
+        self.written_ms = now_ms;
+    }
+
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(HEADER_LEN + COMPLEX_TAIL_LEN);
-        self.header.encode_into(&mut out);
+        let mut out = Vec::with_capacity(HEADER_LEN + 8 + COMPLEX_TAIL_LEN);
+        MetaHeader {
+            flags: make_flags(
+                ValueType::from_flags(self.header.flags).unwrap_or(ValueType::Hash),
+                ENCODING_V2,
+            ),
+            expire_ms: self.header.expire_ms,
+        }
+        .encode_into(&mut out);
+        out.extend_from_slice(&self.written_ms.to_be_bytes());
         out.extend_from_slice(&self.version.to_be_bytes());
         out.extend_from_slice(&self.size.to_be_bytes());
         out.extend_from_slice(&self.bytes.to_be_bytes());
@@ -188,19 +244,22 @@ impl ComplexMeta {
     /// truncates them, leaving a row that no longer decodes as a list. COPY
     /// found this the honest way, by disagreeing with Valkey.
     pub fn write_version(row: &mut [u8], version: u64) {
-        row[HEADER_LEN..HEADER_LEN + 8].copy_from_slice(&version.to_be_bytes());
+        let off = head_len(row[0]);
+        row[off..off + 8].copy_from_slice(&version.to_be_bytes());
     }
 
     pub fn decode(row: &[u8]) -> Option<Self> {
         let header = MetaHeader::decode(row)?;
-        if row.len() < HEADER_LEN + COMPLEX_TAIL_LEN {
+        let off = head_len(header.flags);
+        if row.len() < off + COMPLEX_TAIL_LEN {
             return None;
         }
         Some(Self {
             header,
-            version: u64::from_be_bytes(row[9..17].try_into().ok()?),
-            size: u32::from_be_bytes(row[17..21].try_into().ok()?),
-            bytes: u64::from_be_bytes(row[21..29].try_into().ok()?),
+            written_ms: written_ms_of(row),
+            version: u64::from_be_bytes(row[off..off + 8].try_into().ok()?),
+            size: u32::from_be_bytes(row[off + 8..off + 12].try_into().ok()?),
+            bytes: u64::from_be_bytes(row[off + 12..off + 20].try_into().ok()?),
         })
     }
 }
@@ -269,14 +328,17 @@ pub struct StringMeta {
     pub flags: u8,
     /// Absolute expiry in unix milliseconds; 0 = never.
     pub expire_ms: u64,
+    /// Write stamp, unix ms; 0 = unknown (a v1 row).
+    pub written_ms: u64,
     pub payload: Vec<u8>,
 }
 
 impl StringMeta {
-    pub fn new(payload: Vec<u8>, expire_ms: u64) -> Self {
+    pub fn new(payload: Vec<u8>, expire_ms: u64, written_ms: u64) -> Self {
         Self {
-            flags: make_flags(ValueType::String, ENCODING_V1),
+            flags: make_flags(ValueType::String, ENCODING_V2),
             expire_ms,
+            written_ms,
             payload,
         }
     }
@@ -286,30 +348,36 @@ impl StringMeta {
     /// (one row, no subkeys), so they reuse this layout and differ only in
     /// the type tag. Keeps the encoding layer honest: one payload row
     /// format, several types wearing it.
-    pub fn new_typed(t: ValueType, payload: Vec<u8>, expire_ms: u64) -> Self {
+    pub fn new_typed(t: ValueType, payload: Vec<u8>, expire_ms: u64, written_ms: u64) -> Self {
         Self {
-            flags: make_flags(t, ENCODING_V1),
+            flags: make_flags(t, ENCODING_V2),
             expire_ms,
+            written_ms,
             payload,
         }
     }
 
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(9 + self.payload.len());
+        let mut out = Vec::with_capacity(HEADER_LEN + 8 + self.payload.len());
         out.push(self.flags);
         out.extend_from_slice(&self.expire_ms.to_be_bytes());
+        if encoding_of(self.flags) == ENCODING_V2 {
+            out.extend_from_slice(&self.written_ms.to_be_bytes());
+        }
         out.extend_from_slice(&self.payload);
         out
     }
 
     pub fn decode(row: &[u8]) -> Option<Self> {
-        if row.len() < 9 {
+        let off = head_len(*row.first()?);
+        if row.len() < off {
             return None;
         }
         Some(Self {
             flags: row[0],
             expire_ms: u64::from_be_bytes(row[1..9].try_into().ok()?),
-            payload: row[9..].to_vec(),
+            written_ms: written_ms_of(row),
+            payload: row[off..].to_vec(),
         })
     }
 
@@ -353,11 +421,11 @@ mod tests {
 
     #[test]
     fn string_meta_roundtrip() {
-        let m = StringMeta::new(b"hello".to_vec(), 1234567890123);
+        let m = StringMeta::new(b"hello".to_vec(), 1234567890123, 5_000);
         let row = m.encode();
         assert_eq!(StringMeta::decode(&row), Some(m));
         // Empty payload is legal (SET k "").
-        let empty = StringMeta::new(Vec::new(), 0);
+        let empty = StringMeta::new(Vec::new(), 0, 5_000);
         assert_eq!(StringMeta::decode(&empty.encode()), Some(empty));
         // Truncated rows are rejected.
         assert_eq!(StringMeta::decode(&[0u8; 8]), None);
@@ -375,11 +443,11 @@ mod tests {
 
     #[test]
     fn expiry_check() {
-        let m = StringMeta::new(b"v".to_vec(), 1000);
+        let m = StringMeta::new(b"v".to_vec(), 1000, 5_000);
         assert!(!m.is_expired(999));
         assert!(m.is_expired(1000));
         assert!(m.is_expired(1001));
-        let never = StringMeta::new(b"v".to_vec(), 0);
+        let never = StringMeta::new(b"v".to_vec(), 0, 5_000);
         assert!(!never.is_expired(u64::MAX));
     }
 }
@@ -401,7 +469,7 @@ mod complex_tests {
 
     #[test]
     fn header_is_common_prefix_of_both_layouts() {
-        let s = StringMeta::new(b"v".to_vec(), 99);
+        let s = StringMeta::new(b"v".to_vec(), 99, 5_000);
         let c = ComplexMeta::new(ValueType::Hash, 1);
         let hs = MetaHeader::decode(&s.encode()).expect("string header");
         let hc = MetaHeader::decode(&c.encode()).expect("complex header");
@@ -478,15 +546,115 @@ impl ListMeta {
 
     pub fn decode(row: &[u8]) -> Option<Self> {
         let base = ComplexMeta::decode(row)?;
-        if row.len() < HEADER_LEN + COMPLEX_TAIL_LEN + 16 {
+        let off = head_len(row[0]) + COMPLEX_TAIL_LEN;
+        if row.len() < off + 16 {
             return None;
         }
-        let off = HEADER_LEN + COMPLEX_TAIL_LEN;
         Some(Self {
             base,
             head: unbias_index(u64::from_be_bytes(row[off..off + 8].try_into().ok()?)),
             tail: unbias_index(u64::from_be_bytes(row[off + 8..off + 16].try_into().ok()?)),
         })
+    }
+}
+
+#[cfg(test)]
+mod v2_tests {
+    use super::*;
+
+    /// A v1 row laid down by a pre-ADR-0013 binary: no stamp, tail right
+    /// after the 9-byte header. It must decode forever.
+    fn v1_complex_row(
+        t: ValueType,
+        expire_ms: u64,
+        version: u64,
+        size: u32,
+        bytes: u64,
+    ) -> Vec<u8> {
+        let mut row = vec![make_flags(t, ENCODING_V1)];
+        row.extend_from_slice(&expire_ms.to_be_bytes());
+        row.extend_from_slice(&version.to_be_bytes());
+        row.extend_from_slice(&size.to_be_bytes());
+        row.extend_from_slice(&bytes.to_be_bytes());
+        row
+    }
+
+    #[test]
+    fn a_v1_row_still_decodes_and_reports_unknown_stamp() {
+        let row = v1_complex_row(ValueType::Hash, 7_000, 42 << 20, 3, 99);
+        let m = ComplexMeta::decode(&row).expect("v1 decodes");
+        assert_eq!(
+            m.written_ms, 0,
+            "v1 rows have no stamp: unknown, not garbage"
+        );
+        assert_eq!((m.version, m.size, m.bytes), (42 << 20, 3, 99));
+        assert_eq!(m.header.expire_ms, 7_000);
+    }
+
+    #[test]
+    fn v2_round_trips_and_is_8_bytes_longer() {
+        let mut m = ComplexMeta::new(ValueType::ZSet, VersionGen::next(5_000));
+        m.size = 2;
+        m.bytes = 10;
+        m.touch(6_000);
+        let row = m.encode();
+        assert_eq!(row.len(), HEADER_LEN + 8 + COMPLEX_TAIL_LEN);
+        assert_eq!(ComplexMeta::decode(&row), Some(m));
+        assert_eq!(written_ms_of(&row), 6_000);
+    }
+
+    #[test]
+    fn encode_upgrades_a_decoded_v1_row_to_v2() {
+        let v1 = v1_complex_row(ValueType::Set, 0, 1 << 20, 1, 4);
+        let mut m = ComplexMeta::decode(&v1).expect("decode");
+        m.touch(9_000);
+        let row = m.encode();
+        assert_eq!(encoding_of(row[0]), ENCODING_V2);
+        let back = ComplexMeta::decode(&row).expect("re-decode");
+        assert_eq!(back.written_ms, 9_000);
+        assert_eq!((back.version, back.size, back.bytes), (1 << 20, 1, 4));
+    }
+
+    #[test]
+    fn write_version_hits_the_right_offset_in_both_variants() {
+        let mut v1 = v1_complex_row(ValueType::Hash, 0, 5, 0, 0);
+        ComplexMeta::write_version(&mut v1, 77);
+        assert_eq!(ComplexMeta::decode(&v1).expect("v1").version, 77);
+
+        let mut v2 = ComplexMeta::new(ValueType::Hash, 5).encode();
+        ComplexMeta::write_version(&mut v2, 88);
+        let m = ComplexMeta::decode(&v2).expect("v2");
+        assert_eq!(m.version, 88);
+        assert_eq!(m.written_ms, 5 >> 20, "the stamp must not be clobbered");
+    }
+
+    #[test]
+    fn string_v1_row_decodes_with_full_payload() {
+        // v1 string: header then payload, no stamp byte range.
+        let mut row = vec![make_flags(ValueType::String, ENCODING_V1)];
+        row.extend_from_slice(&0u64.to_be_bytes());
+        row.extend_from_slice(b"hello");
+        let m = StringMeta::decode(&row).expect("v1 string decodes");
+        assert_eq!(m.payload, b"hello");
+        assert_eq!(m.written_ms, 0);
+
+        let v2 = StringMeta::new(b"hello".to_vec(), 0, 4_000).encode();
+        let m2 = StringMeta::decode(&v2).expect("v2 string decodes");
+        assert_eq!(
+            m2.payload, b"hello",
+            "the stamp must not bleed into the payload"
+        );
+        assert_eq!(m2.written_ms, 4_000);
+    }
+
+    #[test]
+    fn list_meta_round_trips_under_v2() {
+        let mut lm = ListMeta::new(VersionGen::next(3_000));
+        lm.head = -2;
+        lm.tail = 5;
+        lm.base.size = 7;
+        lm.base.touch(3_500);
+        assert_eq!(ListMeta::decode(&lm.encode()), Some(lm));
     }
 }
 

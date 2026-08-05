@@ -759,6 +759,26 @@ impl<'a> Dispatcher<'a> {
                 Value::Integer(self.keyspace.persist(slot_for_key(&a[1]), &a[1]) as i64)
             }),
 
+            // ADR-0013: the ranking primitives for user-driven GC. Both are
+            // O(1) reads of the metadata row; nil for a missing/expired key.
+            b"FLINTKEYSIZE" => exact(args, 2, "flintkeysize", |a| {
+                match self.keyspace.key_stat(slot_for_key(&a[1]), &a[1]) {
+                    Some(st) => Value::Integer(st.size_bytes as i64),
+                    None => Value::Bulk(None),
+                }
+            }),
+            b"FLINTKEYSTAMP" => exact(args, 2, "flintkeystamp", |a| {
+                match self.keyspace.key_stat(slot_for_key(&a[1]), &a[1]) {
+                    // [written_ms, created_ms]; 0 = unknown (a pre-stamp row,
+                    // or a type with no version to derive creation from).
+                    Some(st) => Value::Array(Some(vec![
+                        Value::Integer(st.written_ms as i64),
+                        Value::Integer(st.created_ms as i64),
+                    ])),
+                    None => Value::Bulk(None),
+                }
+            }),
+
             // JSON documents
             b"JSON.SET" => self.cmd_json_set(args),
             b"JSON.GET" => self.cmd_json_get(args),

@@ -173,6 +173,27 @@ AGGREGATE SUM/MIN/MAX).
 > than filtering, so a mixed-score set returns what Valkey returns even
 > though neither defines it.
 
+### Flint-specific: the GC ranking primitives (ADR-0013)
+
+Flint never evicts, so "what should my cleanup daemon delete first" has to
+be answerable from the client side. Two commands exist for exactly that,
+both O(1) reads of the metadata every write already maintains:
+
+- `FLINTKEYSIZE key` — the stored payload size in bytes: a collection's
+  cumulative member bytes, a string's or JSON document's payload length.
+  Nil if the key is missing or expired.
+- `FLINTKEYSTAMP key` — `[written_ms, created_ms]` (unix milliseconds).
+  `written_ms` moves on every data mutation and deliberately NOT on
+  `EXPIRE`/`PERSIST`; `created_ms` is the current incarnation's creation
+  instant for collections and `0` (unknown) for payload-in-metadata types.
+  A `0` in either slot means "not tracked", never a guess — keys written
+  by a pre-stamp binary report `written_ms` as 0 until their next write.
+
+Together they support least-recently-written and size-weighted policies
+without the server tracking read recency (which would turn every read
+into a write — the wrong trade under the disk pressure that makes anyone
+reach for these).
+
 ## Protocols: RESP2 and RESP3
 
 Both, negotiated per connection with `HELLO`. Connections start at RESP2;

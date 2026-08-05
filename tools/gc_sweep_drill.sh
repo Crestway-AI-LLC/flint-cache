@@ -19,7 +19,7 @@
 #      (the hash/zset bodies went, not just their meta)
 #   3. live collections survive the sweep byte-for-byte
 #   4. the race shape: a key expired then RECREATED before the sweep
-#      keeps its new fields — the version-1-reuse case from gc.rs
+#      keeps its new fields — the recreate-vs-delete race from gc.rs
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
@@ -61,8 +61,8 @@ valkey-cli -p 6975 PEXPIRE doomed:h 100 >/dev/null
 valkey-cli -p 6975 PEXPIRE doomed:z 100 >/dev/null
 valkey-cli -p 6975 PEXPIRE reborn:h 100 >/dev/null
 sleep 0.3
-# The recreate-before-sweep case: reborn:h died and comes back (version 1
-# again — the same version its dead rows carry) BEFORE any sweep ran.
+# The recreate-before-sweep case: reborn:h expired and comes back BEFORE
+# any sweep ran — the sweep must reclaim only the old incarnation's rows.
 valkey-cli -p 6975 HSET reborn:h new fresh >/dev/null
 E1=""; O1=""
 for _ in $(seq 1 20); do
@@ -78,7 +78,7 @@ echo "== 3. live collections survive the sweep"
 [ "$(valkey-cli -p 6975 HGET live:h keep)" = "me" ] || {
   echo "FAIL: the sweep took a live hash field"; exit 1; }
 
-echo "== 4. the recreated key kept its NEW fields (version-1 reuse race)"
+echo "== 4. the recreated key kept its NEW fields (recreate-before-sweep race)"
 [ "$(valkey-cli -p 6975 HGET reborn:h new)" = "fresh" ] || {
   echo "FAIL: sweep deleted a field of the recreated key"; exit 1; }
 [ -z "$(valkey-cli -p 6975 HGET reborn:h old)" ] || {

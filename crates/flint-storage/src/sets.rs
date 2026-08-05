@@ -110,6 +110,7 @@ impl<'a> SetStore<'a> {
         }
         meta.size += fresh.len() as u32;
         meta.bytes = bytes;
+        meta.touch((self.clock)());
         self.kv.put(&self.meta_key(slot, key), &meta.encode());
         Ok(fresh.len() as u64)
     }
@@ -132,6 +133,7 @@ impl<'a> SetStore<'a> {
         if meta.size == 0 {
             self.kv.delete(&self.meta_key(slot, key));
         } else {
+            meta.touch((self.clock)());
             self.kv.put(&self.meta_key(slot, key), &meta.encode());
         }
         Ok(removed)

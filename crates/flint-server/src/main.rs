@@ -695,11 +695,24 @@ fn main() -> std::io::Result<()> {
                 let v = diskguard::verdict(usage, thresholds, last);
                 if v != last {
                     // Transitions are the thing an operator needs in the
-                    // log; steady state is what the metrics are for.
-                    eprintln!(
-                        "disk guard: {last:?} -> {v:?} (free {} of {} bytes)",
+                    // log; steady state is what the metrics are for. The
+                    // journal event is the subscribable half (ADR-0013 D3):
+                    // an external GC policy daemon triggers on this edge
+                    // instead of tight-polling FLINTINFO.
+                    let detail = format!(
+                        "free {} of {} bytes",
                         usage.map(|u| u.free_bytes).unwrap_or(0),
                         usage.map(|u| u.total_bytes).unwrap_or(0)
+                    );
+                    eprintln!("disk guard: {last:?} -> {v:?} ({detail})");
+                    journal_event(
+                        if v == diskguard::Verdict::Shed {
+                            flint_journal::EventKind::DiskShed
+                        } else {
+                            flint_journal::EventKind::DiskResumed
+                        },
+                        None,
+                        &detail,
                     );
                 }
                 DISK.apply(usage, v);

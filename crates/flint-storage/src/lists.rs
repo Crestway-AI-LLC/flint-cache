@@ -90,6 +90,7 @@ impl<'a> ListStore<'a> {
         } else {
             let mut m = *meta;
             m.base.size = (meta.tail - meta.head) as u32;
+            m.base.touch((self.clock)());
             self.kv.put(&self.meta_key(slot, key), &m.encode());
         }
     }

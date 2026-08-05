@@ -108,6 +108,7 @@ impl<'a> HashStore<'a> {
         }
         meta.size += added as u32;
         meta.bytes = bytes;
+        meta.touch((self.clock)());
         self.kv.put(&self.meta_key(slot, key), &meta.encode());
         Ok(added)
     }
@@ -160,6 +161,7 @@ impl<'a> HashStore<'a> {
         if meta.size == 0 {
             self.kv.delete(&self.meta_key(slot, key));
         } else {
+            meta.touch((self.clock)());
             self.kv.put(&self.meta_key(slot, key), &meta.encode());
         }
         Ok(removed)

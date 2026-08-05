@@ -107,7 +107,8 @@ impl<'a> JsonStore<'a> {
         if doc.len() as u64 > self.max_value_bytes {
             return Err(StoreError::ValueTooLarge);
         }
-        let row = StringMeta::new_typed(ValueType::Json, doc.to_vec(), expire_ms).encode();
+        let row = StringMeta::new_typed(ValueType::Json, doc.to_vec(), expire_ms, (self.clock)())
+            .encode();
         self.kv.put(&self.meta_key(slot, key), &row);
         Ok(())
     }
@@ -185,7 +186,8 @@ mod tests {
         // is the one that matters: a TTL'd document must not become
         // immortal because someone replaced its contents.
         let far = system_clock() + 60_000;
-        let row = StringMeta::new_typed(ValueType::Json, br#"{"a":1}"#.to_vec(), far).encode();
+        let row =
+            StringMeta::new_typed(ValueType::Json, br#"{"a":1}"#.to_vec(), far, 5_000).encode();
         kv.put(&envelope(Cf::Metadata, b"t", 1, b"d"), &row);
         for doc in [&br#"{"a":2}"#[..], &br#"[9]"#[..]] {
             j.set(1, b"d", doc).expect("write");
@@ -201,7 +203,7 @@ mod tests {
         let kv = MemKv::new();
         let j = store(&kv);
         let past = system_clock() - 1;
-        let row = StringMeta::new_typed(ValueType::Json, b"{}".to_vec(), past).encode();
+        let row = StringMeta::new_typed(ValueType::Json, b"{}".to_vec(), past, 5_000).encode();
         kv.put(&envelope(Cf::Metadata, b"t", 1, b"d"), &row);
         assert_eq!(j.get(1, b"d").expect("get"), None);
     }

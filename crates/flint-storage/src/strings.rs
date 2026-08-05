@@ -138,7 +138,7 @@ impl<'a> StringStore<'a> {
             SetExpiry::Keep => existing.map(|h| h.expire_ms).unwrap_or(0),
             SetExpiry::AtMs(at) => at,
         };
-        let meta = StringMeta::new(value.to_vec(), expire_ms);
+        let meta = StringMeta::new(value.to_vec(), expire_ms, (self.clock)());
         self.kv.put(&self.meta_key(slot, key), &meta.encode());
         Ok(SetOutcome::Done)
     }
@@ -201,7 +201,7 @@ impl<'a> StringStore<'a> {
             }
         };
         let next = current.checked_add(delta).ok_or(StoreError::Overflow)?;
-        let meta = StringMeta::new(next.to_string().into_bytes(), expire_ms);
+        let meta = StringMeta::new(next.to_string().into_bytes(), expire_ms, (self.clock)());
         self.kv.put(&self.meta_key(slot, key), &meta.encode());
         Ok(next)
     }
@@ -224,7 +224,7 @@ impl<'a> StringStore<'a> {
             return Err(StoreError::NanOrInfinity);
         }
         let repr = fmt_float_human(next);
-        let meta = StringMeta::new(repr.clone(), expire_ms);
+        let meta = StringMeta::new(repr.clone(), expire_ms, (self.clock)());
         self.kv.put(&self.meta_key(slot, key), &meta.encode());
         Ok(repr)
     }
@@ -243,7 +243,7 @@ impl<'a> StringStore<'a> {
         }
         payload.extend_from_slice(suffix);
         let len = payload.len();
-        let meta = StringMeta::new(payload, expire_ms);
+        let meta = StringMeta::new(payload, expire_ms, (self.clock)());
         self.kv.put(&self.meta_key(slot, key), &meta.encode());
         Ok(len)
     }
@@ -303,7 +303,7 @@ impl<'a> StringStore<'a> {
         }
         payload[offset as usize..end].copy_from_slice(patch);
         let len = payload.len();
-        let meta = StringMeta::new(payload, expire_ms);
+        let meta = StringMeta::new(payload, expire_ms, (self.clock)());
         self.kv.put(&self.meta_key(slot, key), &meta.encode());
         Ok(len)
     }

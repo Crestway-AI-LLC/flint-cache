@@ -111,6 +111,8 @@ pub fn is_read_command(name: &[u8]) -> bool {
     matches!(
         name.to_ascii_uppercase().as_slice(),
         b"GET"
+            | b"FLINTKEYSIZE"
+            | b"FLINTKEYSTAMP"
             | b"MGET"
             | b"EXISTS"
             | b"TTL"

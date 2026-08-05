@@ -33,6 +33,14 @@ pub enum Ttl {
     Ms(u64),  // remaining
 }
 
+/// What `key_stat` reports. See ADR-0013.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeyStat {
+    pub size_bytes: u64,
+    pub written_ms: u64,
+    pub created_ms: u64,
+}
+
 pub struct Keyspace<'a> {
     kv: &'a dyn Kv,
     ns: Vec<u8>,
@@ -247,6 +255,32 @@ impl<'a> Keyspace<'a> {
             Some((h, _)) if h.expire_ms == 0 => Ttl::NoExpiry,
             Some((h, _)) => Ttl::Ms(h.expire_ms - (self.clock)()),
         }
+    }
+
+    /// FLINTKEYSIZE/FLINTKEYSTAMP (ADR-0013): the stored size and time
+    /// stamps of a live key, read from state every write already maintains.
+    /// `size_bytes` is payload accounting (a collection's cumulative member
+    /// bytes; a payload-in-metadata type's payload length), not SST bytes.
+    /// `written_ms`/`created_ms` are 0 when unknown: a v1 row predating the
+    /// stamp, or a type with no version to derive creation from.
+    pub fn key_stat(&self, slot: u16, key: &[u8]) -> Option<KeyStat> {
+        let (header, row) = self.read_live_row(slot, key)?;
+        let written_ms = crate::encoding::written_ms_of(&row);
+        Some(match header.value_type()? {
+            ValueType::String | ValueType::Json => KeyStat {
+                size_bytes: (row.len() - crate::encoding::head_len(header.flags)) as u64,
+                written_ms,
+                created_ms: 0,
+            },
+            _ => {
+                let m = ComplexMeta::decode(&row)?;
+                KeyStat {
+                    size_bytes: m.bytes,
+                    written_ms,
+                    created_ms: m.version >> 20,
+                }
+            }
+        })
     }
 
     /// PERSIST: true if an expiry existed and was removed.

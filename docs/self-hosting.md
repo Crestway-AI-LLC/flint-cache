@@ -117,7 +117,11 @@ space-growing writes early, keeps serving reads and the delete path, and
 reopens by itself once space returns. So the plan is: provision for the
 full working set, use TTLs so space returns on its own, and alert on
 `disk_free_pct` / `disk_verdict` in `FLINTINFO` (the exporter surfaces
-both) well before the guard fires.
+both) well before the guard fires. The guard's flips are also fleet
+journal events (`DiskShed`/`DiskResumed`), so tooling can trigger on the
+edge instead of polling; if you run your own space-reclaim daemon, rank
+candidates with `FLINTKEYSIZE`/`FLINTKEYSTAMP` (see command-support.md)
+and remember the delete path stays open while writes shed.
 
 ## 2. Configuration files
 

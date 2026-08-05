@@ -27,12 +27,13 @@ pub type KeyLock<'a> = &'a dyn Fn(&[u8], &[u8]) -> Box<dyn std::any::Any>;
 ///
 /// Every delete is judge-lock-REJUDGE-delete. The scan's verdict is only a
 /// candidate: between reading a row and deleting it, a writer can recreate
-/// the key, and pass 2's window is the sharper one — a key recreated after
-/// its meta was reclaimed starts again at version 1, the same version the
-/// dead rows carry, so "orphan" judged before the recreation and deleted
-/// after it would take a LIVE field with it. Holding the caller's per-key
-/// lock and re-running the full judgment inside it makes the delete and
-/// any concurrent write strictly ordered; whichever loses re-observes.
+/// the key. Pass 1 is where that bites — meta judged expired, key recreated,
+/// delete lands on the LIVE row. Pass 2's re-judge is belt-and-braces:
+/// versions mint as (now_ms << 20) + counter and never recur, so an
+/// orphan verdict cannot be invalidated by a recreation — but the lock
+/// costs nothing extra here and keeps both passes on one discipline.
+/// Holding the caller's per-key lock and re-running the full judgment
+/// inside it makes the delete and any concurrent write strictly ordered.
 pub fn sweep(kv: &dyn Kv, now_ms: u64, lock_key: KeyLock) -> SweepReport {
     let mut report = SweepReport::default();
 
@@ -185,9 +186,8 @@ mod tests {
     /// lock closure RECREATES the key at the moment the sweeper acquires
     /// the lock — i.e., the concurrent writer wins the race just before
     /// the delete. The re-judgment inside the lock must then spare every
-    /// row of the revived key. Without the re-judge, this test deletes a
-    /// live field: a key recreated after its meta was reclaimed starts
-    /// again at version 1, exactly the version the dead rows carried.
+    /// row of the revived key; without it, pass 1 deletes the recreated
+    /// key's live metadata.
     #[test]
     fn a_key_revived_at_the_lock_is_spared() {
         use std::sync::atomic::AtomicBool;

@@ -67,6 +67,15 @@ pub enum EventKind {
     /// rows made redundant by topology change retired. detail carries
     /// "before -> after". No-op sweeps are not journaled.
     SlotsConsolidated,
+    /// The disk headroom guard began shedding writes on this node
+    /// (ADR-0013 D3). detail carries "free <bytes> of <bytes>". This is the
+    /// edge an external GC policy daemon triggers on — Flint never evicts,
+    /// so reclaiming space from here is the operator's (or their tooling's)
+    /// move.
+    DiskShed,
+    /// The guard cleared (with hysteresis) and writes resumed.
+    /// detail carries "free <bytes> of <bytes>".
+    DiskResumed,
     /// The rotation loop retired a drained previous token (ADR-0006 D3):
     /// its auth count stayed flat across the tenant's subset for a full
     /// drain window. detail carries the drained digest (non-secret).
