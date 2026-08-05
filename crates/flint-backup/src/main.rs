@@ -724,6 +724,22 @@ fn set_ids(store: &dyn ObjectStore) -> Vec<String> {
     ids
 }
 
+/// Does this set have its manifest — i.e., did its `run` COMPLETE? A set
+/// is written objects-first, manifest last, so a manifest-less prefix is a
+/// run that died mid-upload: refusable by verify/restore (no index), but
+/// invisible to a prune that ranks by id alone.
+fn manifested(store: &dyn ObjectStore, id: &str) -> bool {
+    !store
+        .list(&format!("{id}/{}", flint_backup::MANIFEST_KEY))
+        .unwrap_or_default()
+        .is_empty()
+}
+
+/// The millisecond timestamp a set id embeds, if it parses.
+fn set_id_ms(id: &str) -> Option<u64> {
+    id.strip_prefix("backup-").and_then(|t| t.parse().ok())
+}
+
 /// The policy loop — ADR-0011 D8's three job kinds on flint-sched.
 ///
 /// Each job re-invokes THIS binary's own subcommand rather than calling
@@ -784,6 +800,22 @@ fn schedule() {
     let mut sched = flint_sched::Scheduler::new();
     {
         let invoke = invoke.clone();
+        // Computed BEFORE the job closure takes `to`: the first-run delay
+        // reads the store once at startup.
+        let initial_delay = {
+            let store = open_store(&to);
+            let newest_ms = set_ids(store.as_ref())
+                .iter()
+                .rev()
+                .find(|id| manifested(store.as_ref(), id))
+                .and_then(|id| set_id_ms(id));
+            let since = newest_ms
+                .map(|ms| now_ms().saturating_sub(ms))
+                .unwrap_or(u64::MAX);
+            let remaining = (every.as_millis() as u64).saturating_sub(since);
+            std::time::Duration::from_millis(remaining)
+                + flint_sched::Scheduler::startup_jitter(jitter)
+        };
         let (to, pairs, cp_state) = (to.clone(), pairs.clone(), cp_state.clone());
         let tls = arg("--tls");
         let snap = arg("--snap-root");
@@ -806,42 +838,94 @@ fn schedule() {
                 }
                 let refs: Vec<&str> = a.iter().map(String::as_str).collect();
                 let summary = invoke(&refs)?;
-                // Retention: prune to the newest `keep` sets, AFTER the new
-                // one landed and self-verified. Failure to prune degrades
-                // to a bigger bucket, never to a lost backup — so it warns
-                // in the summary instead of failing the job.
                 let store = open_store(&to);
                 let ids = set_ids(store.as_ref());
+                let wipe = |id: &str| -> bool {
+                    store
+                        .list(&format!("{id}/"))
+                        .unwrap_or_default()
+                        .iter()
+                        .all(|key| store.delete(key).is_ok())
+                };
+                // Retention prunes to the newest `keep` COMPLETED sets, and
+                // sweeps dead partials, AFTER the new set landed and
+                // self-verified. The split matters twice over: a run killed
+                // mid-upload leaves a manifest-less prefix that verify and
+                // restore refuse but a rank-by-id prune would COUNT — so
+                // enough crashes would prune restorable sets while keeping
+                // husks, and the husks would accumulate storage forever
+                // (#123's shape, in the bucket). A partial is declared dead
+                // only once it is older than a full backup interval: newer
+                // ones may be another invocation mid-upload, and sweeping a
+                // set that is still being written is worse than waiting one
+                // interval to collect it.
+                let dead_before = now_ms().saturating_sub(every.as_millis() as u64);
+                let mut swept = 0usize;
+                let completed: Vec<&String> = ids
+                    .iter()
+                    .filter(|id| {
+                        if manifested(store.as_ref(), id) {
+                            return true;
+                        }
+                        if set_id_ms(id).is_some_and(|ms| ms < dead_before) && wipe(id) {
+                            swept += 1;
+                        }
+                        false
+                    })
+                    .collect();
                 let mut pruned = 0usize;
-                if ids.len() > keep {
-                    for id in &ids[..ids.len() - keep] {
-                        for key in store.list(&format!("{id}/")).unwrap_or_default() {
-                            if store.delete(&key).is_err() {
-                                return Ok(format!("{summary} (prune of {id} incomplete)"));
-                            }
+                if completed.len() > keep {
+                    for id in &completed[..completed.len() - keep] {
+                        if !wipe(id) {
+                            return Ok(format!("{summary} (prune of {id} incomplete)"));
                         }
                         pruned += 1;
                     }
                 }
-                Ok(if pruned > 0 {
-                    format!("{summary} (pruned {pruned} old set(s))")
-                } else {
+                let mut notes = Vec::new();
+                if pruned > 0 {
+                    notes.push(format!("pruned {pruned} old set(s)"));
+                }
+                if swept > 0 {
+                    notes.push(format!("swept {swept} dead partial(s)"));
+                }
+                Ok(if notes.is_empty() {
                     summary
+                } else {
+                    format!("{summary} ({})", notes.join(", "))
                 })
             }),
-            flint_sched::Scheduler::startup_jitter(jitter),
+            // Not plain jitter: a seat restarted minutes after its nightly
+            // backup would immediately cut a redundant one. The store
+            // already records when the newest completed set was taken, so
+            // the first run lands where the cadence would have put it —
+            // and a store with no sets, or one nobody can list, backs up
+            // immediately, because "cannot tell" must fail toward taking a
+            // backup, not skipping one.
+            initial_delay,
         );
     }
+    // Verify and rehearse target the newest COMPLETED set, never the
+    // newest prefix: a backup mid-upload is always briefly the newest
+    // prefix, and both jobs would chase a set that has no manifest yet —
+    // reporting a healthy backup pipeline as failing exactly while it
+    // works. (Found by the drill's planted partial, which sorted last.)
+    let newest_completed = |to: &str| -> Result<String, String> {
+        let store = open_store(to);
+        set_ids(store.as_ref())
+            .iter()
+            .rev()
+            .find(|id| manifested(store.as_ref(), id))
+            .cloned()
+            .ok_or_else(|| "no completed sets yet".into())
+    };
     if let Some(vd) = verify_every {
         let invoke = invoke.clone();
         let to = to.clone();
         sched.add(
             flint_sched::Job::new("verify", vd, vd / 8, move || {
-                let ids = set_ids(open_store(&to).as_ref());
-                let Some(newest) = ids.last() else {
-                    return Err("no sets to verify yet".into());
-                };
-                invoke(&["verify", "--from", &join_spec(&to, newest)])
+                let newest = newest_completed(&to)?;
+                invoke(&["verify", "--from", &join_spec(&to, &newest)])
             }),
             flint_sched::Scheduler::startup_jitter(jitter),
         );
@@ -851,10 +935,7 @@ fn schedule() {
         let rehearsed = rehearsed.clone();
         sched.add(
             flint_sched::Job::new("rehearse", rd, rd / 8, move || {
-                let ids = set_ids(open_store(&to).as_ref());
-                let Some(newest) = ids.last().cloned() else {
-                    return Err("no sets to rehearse yet".into());
-                };
+                let newest = newest_completed(&to)?;
                 let dest = std::env::temp_dir()
                     .join(format!("flint-rehearse-{}-{newest}", std::process::id()));
                 let _ = std::fs::remove_dir_all(&dest);

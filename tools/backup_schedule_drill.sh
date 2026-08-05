@@ -45,8 +45,20 @@ printf 'cp\n' >"$D/cp-state"
 status() { cat "$D/status" 2>/dev/null; }
 field() { status | grep "^$1" | head -1 | awk -v n="$2" '{print $n}'; }
 
+# Two planted partials — set prefixes WITHOUT a manifest, the litter of a
+# run killed mid-upload. The DEAD one (older than the backup interval)
+# must be swept; the FRESH one (timestamped now) must survive, because it
+# could be another invocation still uploading. Neither may count against
+# --keep: a prune that ranks husks would evict restorable sets while
+# keeping garbage.
+mkdir -p "$D/sets/backup-1000000000000/pairs/0"
+printf 'half an sst' > "$D/sets/backup-1000000000000/pairs/0/000004.sst"
+FRESH_ID="backup-$(($(date +%s) * 1000 + 999999))"   # timestamped in the future: never older than the interval
+mkdir -p "$D/sets/$FRESH_ID/pairs/0"
+printf 'still uploading' > "$D/sets/$FRESH_ID/pairs/0/000004.sst"
+
 echo
-echo "== 0/1. fast cadence with --keep 2: sets appear, verify, rehearse, prune"
+echo "== 0/1. fast cadence with --keep 2: sets appear, verify, rehearse, prune, sweep"
 $BK schedule --pairs "127.0.0.1:6944,127.0.0.1:6944" --cp-state "$D/cp-state" \
     --to "$D/sets" --snap-root "$D/snaps" \
     --every 3s --verify-every 4s --rehearse-every 4s --keep 2 \
@@ -62,10 +74,15 @@ done
 [ "${RUNS:-0}" -ge 3 ] || { echo "FAIL: backup ran ${RUNS:-0} time(s)"; status; cat "$D/sched.log"; exit 1; }
 [ "$(field "job backup" 6)" = "0" ] || { echo "FAIL: backup job reported failures"; status; exit 1; }
 
-SETS=$(ls "$D/sets" | grep -c '^backup-')
-[ "$SETS" -le 2 ] || { echo "FAIL: $SETS sets on disk with --keep 2 after $RUNS backups"; exit 1; }
-[ "$SETS" -ge 1 ] || { echo "FAIL: no sets on disk at all"; exit 1; }
-echo "  $RUNS backups, $SETS set(s) retained (keep 2)"
+# Completed sets: at most keep=2, and every one carries its manifest —
+# husks must not be counted as sets.
+COMPLETED=$(ls "$D/sets" 2>/dev/null | grep '^backup-' | while read -r id; do
+  [ -f "$D/sets/$id/manifest" ] && echo "$id"; done | wc -l | tr -d ' ')
+[ "$COMPLETED" -le 2 ] || { echo "FAIL: $COMPLETED completed sets with --keep 2 after $RUNS backups"; exit 1; }
+[ "$COMPLETED" -ge 1 ] || { echo "FAIL: no completed sets on disk at all"; exit 1; }
+[ -d "$D/sets/backup-1000000000000" ] && { echo "FAIL: the DEAD partial survived the sweep"; exit 1; }
+[ -d "$D/sets/$FRESH_ID" ] || { echo "FAIL: the FRESH partial was swept — a set still uploading is not garbage"; exit 1; }
+echo "  $RUNS backups, $COMPLETED completed set(s) retained (keep 2); dead partial swept, fresh partial spared"
 
 for _ in $(seq 1 60); do
   RS=$(field "rehearsed_set" 2); [ -n "$RS" ] && [ "$RS" != "none" ] && break; sleep 0.5
