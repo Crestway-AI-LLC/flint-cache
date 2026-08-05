@@ -142,6 +142,32 @@ pub fn sha256_hex(data: &[u8]) -> String {
     digest.as_ref().iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// SHA-256 of everything `r` yields, lowercase hex, in bounded memory.
+///
+/// The one-shot form above takes a slice, which is right for a token and
+/// wrong for a backup object: an SST is tens of megabytes by default and
+/// unbounded under a custom compaction setting, so hashing one by reading it
+/// whole would make integrity checking cost as much memory as the largest
+/// file anybody ever produced. Backup checksums every object twice — once on
+/// the way out, once to verify — so this is the hot path for both.
+pub fn sha256_stream_hex(r: &mut impl io::Read) -> io::Result<String> {
+    let mut ctx = ring::digest::Context::new(&ring::digest::SHA256);
+    let mut buf = vec![0u8; 256 * 1024];
+    loop {
+        let n = r.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        ctx.update(&buf[..n]);
+    }
+    Ok(ctx
+        .finish()
+        .as_ref()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect())
+}
+
 /// EDGE-client TLS: verify the server against `ca`, present no client cert
 /// (edge auth is tokens, not certs), and use the dialed host as the server
 /// name — how a tenant's own redis client or the console verifies the

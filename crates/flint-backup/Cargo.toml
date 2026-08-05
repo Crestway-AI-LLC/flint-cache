@@ -1,0 +1,17 @@
+[package]
+name = "flint-backup"
+description = "The backup ARTIFACT (ADR-0011): what a backup set contains, and whether it is intact. A library, because a format with two implementations has two formats — the flint-backup seat writes sets with it and restore reads them with it"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# sha256_stream_hex. No object-store SDK here, deliberately: this crate is
+# the FORMAT, and the format must be testable — and restorable — without
+# credentials or a network. The SDK lives behind ObjectStore in the seat.
+flint-tls = { path = "../flint-tls" }
