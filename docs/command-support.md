@@ -50,6 +50,38 @@ DB 0), RENAME, RENAMENX.
 > re-aim: renaming a collection costs what copying it costs. Strings and
 > JSON documents are O(1), since their metadata row *is* the value.
 
+**Transactions**: MULTI, EXEC, DISCARD (same-slot). WATCH/UNWATCH are not
+implemented yet — see ADR-0012.
+
+> **What a Flint transaction guarantees, and what it does not.** Three
+> promises, all of them real: every command's writes land in ONE engine
+> batch or none do; no other writer interleaves with an executing
+> transaction; and a replica applies the transaction whole, because that
+> batch is a single WAL group.
+>
+> It does **not** guarantee that a concurrent reader sees a serial history.
+> Redis is single-threaded and so gives transactions isolation against
+> everything; Flint's readers take no lock — deliberately, and since long
+> before transactions existed — so a reader performing a multi-part read
+> may observe a partial view of an executing transaction, exactly as one
+> already may racing a single HSET. If you need a reader to see all-or-
+> nothing, read the keys inside a transaction of your own.
+>
+> Same-slot, like every other multi-key command: the slot is taken from the
+> first key queued, and a later command naming a key elsewhere is refused
+> with `CROSSSLOT` at QUEUE time, which also poisons the transaction.
+>
+> Queue-time errors — an unknown command, a wrong argument count, a
+> cross-slot key — poison the transaction, and EXEC then returns
+> `EXECABORT` having applied nothing. Runtime errors (WRONGTYPE, a bad
+> float) do not: they appear as one element of EXEC's reply while every
+> other command applies. That is upstream's split and it is worth knowing,
+> because only the first kind protects you from partial application.
+>
+> Commands inside a transaction see each other's effects, collections
+> included — `SADD` then `SMEMBERS` in one transaction returns the member
+> just added.
+
 **JSON documents**: JSON.SET (NX, XX), JSON.GET, JSON.DEL / JSON.FORGET,
 JSON.TYPE, JSON.NUMINCRBY, JSON.ARRAPPEND, JSON.ARRLEN.
 
@@ -233,7 +265,7 @@ the write; ours says why.
   command. A multi-key command whose keys share a slot is fair game and
   several are supported (SINTER, ZUNIONSTORE, COPY); it is scattering one
   request across slots that is excluded. Colocate with a hash tag.
-  Also **MULTI/EXEC/WATCH**, **pub/sub**, **streams**, **blocking
+  Also **pub/sub**, **streams**, **blocking
   commands** (BLPOP, BLMOVE …), **KEYS/RANDOMKEY**, and **EVAL/EVALSHA**.
   These conflict with slot-sharded multi-tenancy or reintroduce the
   single-threaded bottlenecks Flint exists to avoid. Common patterns they

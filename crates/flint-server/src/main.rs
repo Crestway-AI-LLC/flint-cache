@@ -896,6 +896,10 @@ fn serve(
     // caller — flintctl, the controller, the agent, a bare redis-cli — is
     // untouched until something sends HELLO 3.
     let mut conn_proto = flint_resp::Proto::default();
+    // Connection-scoped transaction (ADR-0012). None = no MULTI open. It
+    // dies with the connection, which is what makes a transaction unable to
+    // survive a failover half-applied.
+    let mut conn_txn: Option<Txn> = None;
     loop {
         let mut consumed = 0;
         out.clear();
@@ -940,6 +944,7 @@ fn serve(
                     &mut conn_ns,
                     &mut conn_async,
                     &mut conn_proto,
+                    &mut conn_txn,
                     &args,
                 );
                 encode_proto(&reply, conn_proto, &mut out);
@@ -1004,6 +1009,7 @@ fn serve(
                         &mut conn_ns,
                         &mut conn_async,
                         &mut conn_proto,
+                        &mut conn_txn,
                         &args,
                     );
                     encode_proto(&reply, conn_proto, &mut out);
@@ -1043,6 +1049,219 @@ fn serve(
     }
 }
 
+/// A transaction being assembled on ONE connection (ADR-0012).
+///
+/// Lives on the connection, dies with it. That is not incidental: a
+/// promoted master has no queue and no watch state, so a transaction can
+/// never survive a failover into a half-applied form — the connection to
+/// the dead master goes with it (D8).
+#[derive(Default)]
+pub(crate) struct Txn {
+    /// Commands accepted so far, in order.
+    queued: Vec<Vec<Vec<u8>>>,
+    /// The one slot every key must hash to. None until a key is seen — a
+    /// transaction of keyless commands has no slot to violate.
+    slot: Option<u16>,
+    /// A queue-time error was reported. EXEC must refuse the whole
+    /// transaction rather than apply the commands that did parse.
+    poisoned: bool,
+}
+
+/// MULTI / EXEC / DISCARD, or the queueing of a command inside an open
+/// transaction. `None` means this is not transaction business and the
+/// caller should carry on.
+#[allow(clippy::too_many_arguments)]
+fn transaction_control(
+    store: &dyn Kv,
+    read_only: &Arc<AtomicBool>,
+    rocks: &Option<RocksHandle>,
+    limits: commands::Limits,
+    conn_ns: &[u8],
+    conn_txn: &mut Option<Txn>,
+    args: &[Vec<u8>],
+) -> Option<Value> {
+    let name = args
+        .first()
+        .map(|n| n.to_ascii_uppercase())
+        .unwrap_or_default();
+    match name.as_slice() {
+        b"MULTI" => {
+            if conn_txn.is_some() {
+                // Upstream's wording, checked against a live server rather
+                // than recalled — it is the generic "not allowed inside a
+                // transaction" form, not the older "cannot be nested".
+                return Some(Value::Error(
+                    "ERR Command 'multi' not allowed inside a transaction".into(),
+                ));
+            }
+            *conn_txn = Some(Txn::default());
+            return Some(Value::Simple("OK".into()));
+        }
+        b"DISCARD" => {
+            return Some(if conn_txn.take().is_some() {
+                Value::Simple("OK".into())
+            } else {
+                Value::Error("ERR DISCARD without MULTI".into())
+            });
+        }
+        b"EXEC" => {
+            let Some(txn) = conn_txn.take() else {
+                return Some(Value::Error("ERR EXEC without MULTI".into()));
+            };
+            if txn.poisoned {
+                return Some(Value::Error(
+                    "EXECABORT Transaction discarded because of previous errors.".into(),
+                ));
+            }
+            return Some(exec_transaction(
+                store, read_only, rocks, limits, conn_ns, txn,
+            ));
+        }
+        _ => {}
+    }
+    // Not a transaction verb. If one is open, this command is queued
+    // instead of run.
+    let txn = conn_txn.as_mut()?;
+    if let Some(e) = commands::queue_time_error(args) {
+        // Poison and report. The client sees the error now, while it still
+        // knows which command it sent; EXEC will refuse the whole batch.
+        txn.poisoned = true;
+        return Some(e);
+    }
+    if let Some(key) = commands::command_key(args) {
+        let slot = flint_slot::slot_for_key(key);
+        match txn.slot {
+            None => txn.slot = Some(slot),
+            Some(open) if open != slot => {
+                txn.poisoned = true;
+                return Some(Value::Error(format!(
+                    "CROSSSLOT Keys in request don't hash to the same slot ({} is slot {}, \
+                     the transaction is on slot {}) — use a hash tag such as {{tag}}key \
+                     to colocate them",
+                    String::from_utf8_lossy(key),
+                    slot,
+                    open
+                )));
+            }
+            Some(_) => {}
+        }
+    }
+    txn.queued.push(args.to_vec());
+    Some(Value::Simple("QUEUED".into()))
+}
+
+/// Run a transaction's queued commands and commit them as one write.
+///
+/// The shape is the async write queue's, deliberately (ADR-0012 D3): hold
+/// `lock_all()` so no other writer interleaves, dispatch every command
+/// against ONE `BatchingKv` so each sees its predecessors' effects, then
+/// commit the accumulated buffer in a single engine write. On rocks that
+/// is one `WriteBatch`, hence one WAL group, so a replica applies the
+/// whole transaction or none of it.
+fn exec_transaction(
+    store: &dyn Kv,
+    read_only: &Arc<AtomicBool>,
+    rocks: &Option<RocksHandle>,
+    limits: commands::Limits,
+    conn_ns: &[u8],
+    txn: Txn,
+) -> Value {
+    if txn.queued.is_empty() {
+        return Value::Array(Some(Vec::new()));
+    }
+    // The slot gate, checked ONCE for the whole transaction. One check is
+    // sound only because every key shares a slot (D1) — that invariant is
+    // what makes a per-command gate unnecessary here. A slot mid-handoff
+    // aborts rather than half-applying (D8).
+    let is_write = txn.queued.iter().any(|c| {
+        c.first()
+            .is_some_and(|n| flint_commands::is_write_command(n))
+    });
+    if let Some(keyed) = txn
+        .queued
+        .iter()
+        .find(|c| commands::command_key(c).is_some())
+        && let Some(gate) = migrate::check_slot_gate(rocks, conn_ns, keyed, is_write)
+    {
+        return gate;
+    }
+
+    let _all = write_lock::lock_all();
+    let ro = read_only.load(Ordering::Relaxed);
+    let batching = flint_storage::batch::BatchingKv::new(store);
+    let mut replies = Vec::with_capacity(txn.queued.len());
+    {
+        // A replica must not write to its own store; the read-only wrapper
+        // turns lazy-expiry deletes buried in read paths into no-ops, the
+        // same as the single-command path does.
+        let ro_store = flint_storage::ReadOnlyKv(&batching);
+        let engine: &dyn Kv = if ro { &ro_store } else { &batching };
+        for cmd in &txn.queued {
+            replies.push(
+                Dispatcher::with_limits(
+                    engine,
+                    flint_storage::strings::system_clock,
+                    limits,
+                    conn_ns,
+                )
+                .dispatch(cmd),
+            );
+        }
+    }
+    let ops = batching.into_ops();
+    if !ops.is_empty()
+        && let Err(e) = commit_ops(store, rocks, &ops)
+    {
+        return Value::Error(format!("ERR transaction commit failed: {e}"));
+    }
+    Value::Array(Some(replies))
+}
+
+/// Commit a transaction's buffered mutations.
+///
+/// On rocks this is one `WriteBatch` — atomic at the engine and a single
+/// WAL group, which is what gives replicas all-or-nothing. The mem engine
+/// has no batch primitive, so there the transaction's atomicity rests on
+/// `lock_all()` alone; mem is the dev/test engine and rocks is what ships,
+/// and D6 already declines to promise readers a serial history either way.
+#[cfg(feature = "rocks")]
+fn commit_ops(
+    store: &dyn Kv,
+    rocks: &Option<RocksHandle>,
+    ops: &[(Vec<u8>, Option<Vec<u8>>)],
+) -> Result<(), String> {
+    match rocks {
+        Some(r) => r.apply_writes(ops).map_err(|e| e.to_string()),
+        None => {
+            apply_inline(store, ops);
+            Ok(())
+        }
+    }
+}
+
+#[cfg(not(feature = "rocks"))]
+fn commit_ops(
+    store: &dyn Kv,
+    _rocks: &Option<RocksHandle>,
+    ops: &[(Vec<u8>, Option<Vec<u8>>)],
+) -> Result<(), String> {
+    apply_inline(store, ops);
+    Ok(())
+}
+
+/// Replay the buffer onto the store one op at a time — the fallback when
+/// there is no engine batch to commit into.
+fn apply_inline(store: &dyn Kv, ops: &[(Vec<u8>, Option<Vec<u8>>)]) {
+    for (k, v) in ops {
+        match v {
+            Some(val) => store.put(k, val),
+            None => {
+                store.delete(k);
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn execute(
     store: &dyn Kv,
@@ -1057,6 +1276,7 @@ fn execute(
     conn_ns: &mut Vec<u8>,
     conn_async: &mut bool,
     conn_proto: &mut flint_resp::Proto,
+    conn_txn: &mut Option<Txn>,
     args: &[Vec<u8>],
 ) -> Value {
     // HELLO: protocol negotiation, answered here rather than in the
@@ -1109,6 +1329,14 @@ fn execute(
         }
         *conn_ns = ns.clone();
         return Value::Simple("OK".into());
+    }
+    // MULTI / EXEC / DISCARD (ADR-0012). Answered here rather than in the
+    // command table for the reason HELLO and FLINTNS are: they mutate THIS
+    // connection's state, and the dispatcher is deliberately stateless.
+    if let Some(reply) =
+        transaction_control(store, read_only, rocks, limits, conn_ns, conn_txn, args)
+    {
+        return reply;
     }
     if args
         .first()

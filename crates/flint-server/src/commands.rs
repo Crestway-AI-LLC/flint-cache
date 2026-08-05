@@ -58,6 +58,75 @@ pub fn command_key(args: &[Vec<u8>]) -> Option<&[u8]> {
 /// FLINTNS (set by the proxy after token auth).
 pub const DEFAULT_NS: &[u8] = b"0";
 
+/// The error a command would fail with at QUEUE time inside MULTI, or None
+/// if it would be accepted (ADR-0012 D1).
+///
+/// Redis distinguishes two kinds of failure inside a transaction, and the
+/// distinction is not cosmetic. An unknown command or a wrong argument
+/// count is caught when the command is queued and POISONS the transaction,
+/// so EXEC applies nothing. A runtime failure — WRONGTYPE, a bad float —
+/// is discovered only at execution and appears as one element of EXEC's
+/// reply while every other command still applies. Collapsing the first into
+/// the second would partially apply a transaction the client was told would
+/// abort, which is the failure worth preventing.
+///
+/// WHY THIS PROBE-DISPATCHES RATHER THAN CONSULTING AN ARITY TABLE. Arity
+/// depends only on the command name and the argument COUNT — never on
+/// stored data — and every dispatch arm validates it before touching the
+/// store. So the verdict against a throwaway empty store is exactly the
+/// verdict against the real one, and reusing the dispatcher means there is
+/// no second table of ~90 arities to drift out of step the first time an
+/// arm changes. The probe cannot affect anything: its store is discarded.
+pub fn queue_time_error(args: &[Vec<u8>]) -> Option<Value> {
+    let probe = flint_storage::MemKv::new();
+    let reply = Dispatcher::new(&probe, crate::commands::probe_clock).dispatch(args);
+    match &reply {
+        // Both texts are produced in THIS file — `arity_err` and the
+        // dispatcher's unknown-command arm — so matching them is matching
+        // our own output, not parsing someone else's.
+        Value::Error(e)
+            if e.starts_with("ERR unknown command")
+                || e.starts_with("ERR wrong number of arguments") =>
+        {
+            Some(reply)
+        }
+        _ => None,
+    }
+}
+
+/// A fixed clock for the queue-time probe. The probe never reads or writes
+/// anything that outlives it, and pinning time keeps it from depending on
+/// the wall clock at all.
+fn probe_clock() -> u64 {
+    0
+}
+
+/// Upstream's unknown-command reply, byte for byte — name in the case the
+/// client SENT it, then each argument quoted and space-separated with a
+/// trailing space. Captured off the wire from a live server rather than
+/// recalled, because the punctuation is not what one would guess.
+///
+/// Worth matching rather than approximating: this is the reply a client
+/// sees when it uses a command Flint has not implemented, so it is the
+/// error most likely to be read by a human comparing the two systems, and
+/// inside MULTI it is what poisons a transaction.
+///
+/// Arguments are truncated so an unknown command carrying a large payload
+/// cannot turn a typo into a multi-megabyte error string.
+fn unknown_command(name: &[u8], rest: &[Vec<u8>]) -> Value {
+    const MAX_ARG: usize = 128;
+    const MAX_ARGS: usize = 20;
+    let mut msg = format!(
+        "ERR unknown command '{}', with args beginning with: ",
+        String::from_utf8_lossy(name)
+    );
+    for arg in rest.iter().take(MAX_ARGS) {
+        let shown = &arg[..arg.len().min(MAX_ARG)];
+        msg.push_str(&format!("'{}' ", String::from_utf8_lossy(shown)));
+    }
+    Value::Error(msg)
+}
+
 /// Wire-facing policy limits, plumbed from the CLI.
 #[derive(Clone, Copy)]
 pub struct Limits {
@@ -753,10 +822,7 @@ impl<'a> Dispatcher<'a> {
                 Value::Simple("OK".into())
             }
             b"COMMAND" => Value::Array(Some(vec![])),
-            other => {
-                let name = String::from_utf8_lossy(other).to_lowercase();
-                err(&format!("ERR unknown command '{name}'"))
-            }
+            other => unknown_command(other, &args[1..]),
         }
     }
 

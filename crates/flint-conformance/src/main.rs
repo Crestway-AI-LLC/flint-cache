@@ -989,6 +989,120 @@ fn corpus() -> Vec<Case> {
             ],
         },
         Case {
+            family: "transactions",
+            name: "multi exec discard (same slot)",
+            steps: vec![
+                s(&[b"MULTI"], Expect::Ok),
+                s(&[b"SET", b"{tx}a", b"1"], Expect::Simple("QUEUED")),
+                s(&[b"INCR", b"{tx}a"], Expect::Simple("QUEUED")),
+                s(&[b"GET", b"{tx}a"], Expect::Simple("QUEUED")),
+                // Each command sees its predecessors' effects, and the whole
+                // reply arrives as one array.
+                s(
+                    &[b"EXEC"],
+                    Expect::Arr(vec![Expect::Ok, Expect::Int(2), Expect::Str(b"2")]),
+                ),
+                s(&[b"GET", b"{tx}a"], Expect::Str(b"2")),
+                // An empty transaction is an empty array, not an error.
+                s(&[b"MULTI"], Expect::Ok),
+                s(&[b"EXEC"], Expect::Arr(vec![])),
+                // DISCARD drops the queue and nothing is applied.
+                s(&[b"MULTI"], Expect::Ok),
+                s(&[b"SET", b"{tx}d", b"9"], Expect::Simple("QUEUED")),
+                s(&[b"DISCARD"], Expect::Ok),
+                s(&[b"EXISTS", b"{tx}d"], Expect::Int(0)),
+                // Both verbs outside a transaction are errors, and MULTI
+                // inside one is too.
+                s(&[b"EXEC"], Expect::AnyError),
+                s(&[b"DISCARD"], Expect::AnyError),
+                s(&[b"MULTI"], Expect::Ok),
+                s(&[b"MULTI"], Expect::AnyError),
+                s(&[b"DISCARD"], Expect::Ok),
+                // A QUEUE-TIME error poisons the transaction: EXEC applies
+                // NOTHING. This is the distinction that matters most —
+                // collapsing it into a runtime error would partially apply a
+                // transaction the client was told would abort.
+                s(&[b"SET", b"{tx}keep", b"orig"], Expect::Ok),
+                s(&[b"MULTI"], Expect::Ok),
+                s(&[b"SET", b"{tx}keep", b"changed"], Expect::Simple("QUEUED")),
+                s(&[b"NOSUCHCOMMAND", b"x"], Expect::AnyError),
+                s(&[b"EXEC"], Expect::AnyError),
+                s(&[b"GET", b"{tx}keep"], Expect::Str(b"orig")),
+                // A wrong argument count is a queue-time error too, not a
+                // runtime one.
+                s(&[b"MULTI"], Expect::Ok),
+                s(&[b"SET", b"{tx}q", b"1"], Expect::Simple("QUEUED")),
+                s(&[b"SET"], Expect::AnyError),
+                s(&[b"EXEC"], Expect::AnyError),
+                s(&[b"EXISTS", b"{tx}q"], Expect::Int(0)),
+                // A RUNTIME error does NOT abort: it is one element of the
+                // reply and every other command still applies.
+                s(&[b"RPUSH", b"{tx}L", b"x"], Expect::Int(1)),
+                s(&[b"MULTI"], Expect::Ok),
+                s(&[b"SET", b"{tx}r", b"1"], Expect::Simple("QUEUED")),
+                s(&[b"INCR", b"{tx}L"], Expect::Simple("QUEUED")),
+                s(&[b"GET", b"{tx}r"], Expect::Simple("QUEUED")),
+                s(
+                    &[b"EXEC"],
+                    Expect::Arr(vec![Expect::Ok, Expect::AnyError, Expect::Str(b"1")]),
+                ),
+                s(&[b"GET", b"{tx}r"], Expect::Str(b"1")),
+                // COLLECTIONS read back their own in-transaction writes.
+                // This is the property the batch overlay exists for, and it
+                // is invisible from any string-only case: every collection
+                // type reads through a prefix scan.
+                s(&[b"MULTI"], Expect::Ok),
+                s(&[b"SADD", b"{tx}s", b"a", b"b"], Expect::Simple("QUEUED")),
+                s(&[b"SCARD", b"{tx}s"], Expect::Simple("QUEUED")),
+                s(&[b"HSET", b"{tx}h", b"f", b"v"], Expect::Simple("QUEUED")),
+                s(&[b"HGET", b"{tx}h", b"f"], Expect::Simple("QUEUED")),
+                s(&[b"RPUSH", b"{tx}l", b"x", b"y"], Expect::Simple("QUEUED")),
+                s(
+                    &[b"LRANGE", b"{tx}l", b"0", b"-1"],
+                    Expect::Simple("QUEUED"),
+                ),
+                s(&[b"ZADD", b"{tx}z", b"1", b"m"], Expect::Simple("QUEUED")),
+                s(&[b"ZSCORE", b"{tx}z", b"m"], Expect::Simple("QUEUED")),
+                s(
+                    &[b"EXEC"],
+                    Expect::Arr(vec![
+                        Expect::Int(2),
+                        Expect::Int(2),
+                        Expect::Int(1),
+                        Expect::Str(b"v"),
+                        Expect::Int(2),
+                        Expect::Arr(vec![Expect::Str(b"x"), Expect::Str(b"y")]),
+                        Expect::Int(1),
+                        Expect::Str(b"1"),
+                    ]),
+                ),
+                // A delete inside the transaction hides the key from a later
+                // command in the same transaction.
+                s(&[b"SET", b"{tx}del", b"v"], Expect::Ok),
+                s(&[b"MULTI"], Expect::Ok),
+                s(&[b"DEL", b"{tx}del"], Expect::Simple("QUEUED")),
+                s(&[b"EXISTS", b"{tx}del"], Expect::Simple("QUEUED")),
+                s(
+                    &[b"EXEC"],
+                    Expect::Arr(vec![Expect::Int(1), Expect::Int(0)]),
+                ),
+                s(
+                    &[
+                        b"DEL",
+                        b"{tx}a",
+                        b"{tx}keep",
+                        b"{tx}L",
+                        b"{tx}r",
+                        b"{tx}s",
+                        b"{tx}h",
+                        b"{tx}l",
+                        b"{tx}z",
+                    ],
+                    Expect::Int(8),
+                ),
+            ],
+        },
+        Case {
             family: "connection",
             name: "select",
             steps: vec![
