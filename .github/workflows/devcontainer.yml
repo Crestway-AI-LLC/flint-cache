@@ -5,7 +5,7 @@
 # It was written on a machine with no container runtime, so it first shipped
 # inspection-verified only. It has since been built and exercised for real on
 # arm64: image builds in ~1m45s, and `cargo build --release --features
-# flint-server/rocks` completes inside it in ~4m47s — which is the assertion
+# flint-server/rocks,flint-backup/rocks` completes inside it in ~4m47s — which is the assertion
 # that matters, because RocksDB compiling from source is the only thing that
 # actually needs clang and libclang.
 #

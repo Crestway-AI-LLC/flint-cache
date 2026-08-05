@@ -34,7 +34,7 @@ BUCKET="${FLINT_S3_BUCKET:-}"
 # The seat reads the standard AWS env; hydrate it from the profile the
 # operator uses so one variable is enough to opt in.
 if [ -z "${AWS_ACCESS_KEY_ID:-}" ]; then
-  eval "$(aws configure export-credentials --profile "${AWS_PROFILE:-flint-m64}" --format env 2>/dev/null)"
+  eval "$(aws configure export-credentials --profile "${AWS_PROFILE:-default}" --format env 2>/dev/null)"
 fi
 [ -n "${AWS_ACCESS_KEY_ID:-}" ] || { echo "SKIP: no AWS credentials in env or profile"; exit 0; }
 export AWS_REGION="${AWS_REGION:-us-east-1}"

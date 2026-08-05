@@ -24,7 +24,9 @@ Everything needed to run AND operate Flint yourself:
 - **`flint-server`** — the data-plane node: RESP over TCP in both dialects
   (RESP2 and RESP3, negotiated per connection with `HELLO`), strings /
   hashes / sets / lists / sorted sets / JSON documents with TTLs, cursor-
-  based keyspace `SCAN`, an in-memory engine for development
+  based keyspace `SCAN`, same-slot transactions (`MULTI`/`EXEC`/`WATCH`,
+  with [what they guarantee written down](docs/command-support.md)), an
+  in-memory engine for development
   and the RocksDB engine for production, WAL-based async replication with
   lag-capped back-pressure, checkpoint full sync, epoch-fenced promotion,
   warm restarts.
@@ -58,6 +60,18 @@ Everything needed to run AND operate Flint yourself:
   compaction benchmarks and a random-kill chaos harness with a ledger oracle.
 - **`flint-balance`** — the slot-rebalancing planner: a policy seam plus the
   size-based policy, so a cluster can be levelled by a rule you can read.
+- **`flint-backup`** — backup and restore (ADR-0011): per-pair checkpoint
+  sets with a checksummed manifest, to a directory or any S3-compatible
+  endpoint (SigV4 spoken directly — no SDK, no new dependencies); restore
+  that only ever creates, scrubs the copied cluster identity, and proves
+  its own scrub; namespace-scoped restore into a live cluster placed by
+  current slot ownership; and a `schedule` mode running backup / verify /
+  restore-rehearsal as a policy, whose alertable metric is the age of the
+  newest set that actually restored — never the run count. `backup-to` in
+  the flintctl inventory runs it as a supervised seat.
+- **`flint-sched`** — recurring jobs as a library: serial execution (a job
+  cannot overlap itself), completion-based cadence (no catch-up bursts),
+  monotonic time, capped backoff.
 - **`flint-exporter`** — Prometheus metrics for a self-hosted fleet.
 - **`flint-tls`**, **`flint-resp`**, **`flint-slot`**, **`flint-commands`**,
   **`flint-journal`** — TLS with hot-reloading certificates, the RESP codec
@@ -145,7 +159,7 @@ The rest of this section is the same thing by hand, if you would rather see the
 pieces.
 
 ```sh
-cargo build --release --features flint-server/rocks
+cargo build --release --features flint-server/rocks,flint-backup/rocks
 
 # One durable node
 ./target/release/flint-server --port 6400 --engine rocks --data-dir ./data
@@ -185,7 +199,7 @@ To self-host for real, stamp the build with the version you are deploying and
 drop the line:
 
 ```sh
-FLINT_RELEASE_TAG=v0.1.0 cargo build --release --features flint-server/rocks
+FLINT_RELEASE_TAG=v0.1.0 cargo build --release --features flint-server/rocks,flint-backup/rocks
 ```
 
 The tag is baked in at compile time, so every binary reports it and `verify`

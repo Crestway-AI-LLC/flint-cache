@@ -18,7 +18,7 @@ Build prerequisites (Rust 1.85+, a C++ toolchain and libclang for RocksDB,
 ```sh
 # Stamp the build with the version you are deploying. flintctl refuses to
 # MUTATE a fleet from an unstamped build — see "Why the tag" below.
-FLINT_RELEASE_TAG=v0.1.0 cargo build --release --features flint-server/rocks
+FLINT_RELEASE_TAG=v0.1.0 cargo build --release --features flint-server/rocks,flint-backup/rocks
 
 cat > cluster.flint <<'EOF'
 statedir ./state

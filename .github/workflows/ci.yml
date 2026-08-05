@@ -31,5 +31,5 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: rocks
-      - run: cargo clippy --workspace --all-targets --features flint-server/rocks -- -D warnings
-      - run: cargo test --workspace --features flint-server/rocks
+      - run: cargo clippy --workspace --all-targets --features flint-server/rocks,flint-backup/rocks -- -D warnings
+      - run: cargo test --workspace --features flint-server/rocks,flint-backup/rocks
