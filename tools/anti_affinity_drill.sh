@@ -32,12 +32,11 @@
 #      suite failed with "REFUSING TO RUN: this box already has Flint
 #      processes". The live topology now lives in its own file that no case
 #      ever touches.
-#   2. ASSERT THE SPECIFIC LINE, NOT THE EXIT CODE. Cases that need two
-#      distinct hosts use 127.0.0.2, which is a loopback alias on Linux and
-#      usually absent on macOS — so verify fails those for LIVENESS whatever
-#      the zones say. An exit-code assertion there would pass for the wrong
-#      reason. Only the shared-domain case, whose topology is genuinely live,
-#      asserts a non-zero exit.
+#   2. ASSERT THE SPECIFIC LINE, NOT THE EXIT CODE. Cases needing two
+#      distinct hosts point the second at a port nothing serves, so verify
+#      fails them for LIVENESS whatever the zones say. An exit-code assertion
+#      there would pass for the wrong reason. Only the shared-domain case,
+#      whose topology is genuinely live, asserts a non-zero exit.
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
@@ -59,7 +58,21 @@ cleanup() {
 trap cleanup EXIT
 fleet_kill server; fleet_kill proxy
 fleet_kill controlplane; fleet_kill controller
-sleep 0.4
+
+# WAIT for the ports, do not sleep at them. A fixed pause after a kill races
+# the kernel releasing the socket: back-to-back runs of this drill failed
+# bootstrap with "proxy 127.0.0.1:7855 did not come up (port busy?)" on a box
+# with no Flint process running at all. Same family as the fixed-sleep-after-
+# start bug the suite already fixed, pointing the other way.
+ports_free() {
+  local p
+  for p in 6855 6856 7155 7855; do
+    (exec 3<>"/dev/tcp/127.0.0.1/$p") 2>/dev/null && { exec 3>&- 2>/dev/null; return 1; }
+  done
+  return 0
+}
+for _ in $(seq 1 100); do ports_free && break; sleep 0.1; done
+ports_free || { echo "FAIL: ports still busy after 10s"; exit 1; }
 
 cargo build --release -q -p flint-server --features rocks || { echo "FAIL: build"; exit 1; }
 cargo build --release -q -p flint-ctl -p flint-proxy -p flint-controlplane -p flint-controller \
@@ -102,12 +115,23 @@ echo "$OUT" | grep -q "FAIL pair 0 members are in distinct failure domains" \
 echo "  failed, naming the anti-affinity check"
 
 # --- distinct domains ----------------------------------------------------
+# A SECOND HOST LITERAL THAT FAILS FAST. Zones are keyed on the host string,
+# so "localhost" and "127.0.0.1" are two domains even though both resolve to
+# loopback — which is all these cases need.
+#
+# The first version used 127.0.0.2. That is a loopback alias on Linux and
+# unassigned on macOS, so verify sat in connection timeouts probing it: two
+# cases at 75 SECONDS each, 150s of the drill's 153. A port nothing listens
+# on gets ECONNREFUSED immediately instead. Measured, not assumed — an
+# earlier attempt to time this with no cluster running showed 0s for both,
+# because verify short-circuits on the dead control plane and never reaches
+# the pair probes at all.
 two_host_base() {
-  sed 's|^pair 127.0.0.1:6855,127.0.0.1:6856$|pair 127.0.0.1:6855,127.0.0.2:6856|' "$LIVE"
+  sed 's|^pair 127.0.0.1:6855,127.0.0.1:6856$|pair 127.0.0.1:6855,localhost:6899|' "$LIVE"
 }
 
 echo "== distinct domains -> ok"
-{ two_host_base; echo "zone 127.0.0.1 az-a"; echo "zone 127.0.0.2 az-b"; } > "$CASE"
+{ two_host_base; echo "zone 127.0.0.1 az-a"; echo "zone localhost az-b"; } > "$CASE"
 OUT=$($CTL -f "$CASE" verify 2>&1 || true)
 echo "$OUT" | grep -q "ok   pair 0 members are in distinct failure domains" \
   || { echo "FAIL: distinct domains must report ok"; echo "$OUT"; exit 1; }
@@ -115,12 +139,12 @@ echo "  reported ok"
 
 # --- partial declaration -------------------------------------------------
 echo "== partial declaration -> FAIL (the false-assurance case)"
-{ two_host_base; echo "zone 127.0.0.1 az-a"; } > "$CASE"   # 127.0.0.2 unzoned
+{ two_host_base; echo "zone 127.0.0.1 az-a"; } > "$CASE"   # localhost deliberately unzoned
 OUT=$($CTL -f "$CASE" verify 2>&1 || true)
 echo "$OUT" | grep -q "FAIL pair 0 every member has a zone" \
   || { echo "FAIL: a half-declared topology must be refused by the zone check"
        echo "$OUT"; exit 1; }
-echo "$OUT" | grep -q "no .zone. line for 127.0.0.2" \
+echo "$OUT" | grep -q "no .zone. line for localhost" \
   || { echo "FAIL: the refusal must name the unzoned host"; echo "$OUT"; exit 1; }
 echo "  refused, naming the unzoned host"
 
