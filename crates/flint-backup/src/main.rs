@@ -23,6 +23,8 @@
 //! `verify` takes only a store location: it must work when the cluster it
 //! came from no longer exists, which is the case it is for.
 
+mod s3;
+
 use flint_backup::store::{LocalDir, ObjectStore};
 use flint_backup::{Manifest, ObjectRecord, PairRecord};
 use flint_resp::{Decoded, Value, decode, encode};
@@ -49,6 +51,66 @@ fn arg(name: &str) -> Option<String> {
         .position(|x| x == name)
         .and_then(|i| a.get(i + 1))
         .cloned()
+}
+
+/// A store from a location spec: `s3://bucket/prefix` or a filesystem
+/// path. Every subcommand goes through this, so the format code and the
+/// drills exercise the same call sites whichever store is behind them —
+/// S3 arrives as a second implementation, not a second code path.
+fn open_store(spec: &str) -> Box<dyn ObjectStore> {
+    if spec.starts_with("s3://") {
+        match s3::S3Store::from_spec(spec) {
+            Ok(s) => Box::new(s),
+            Err(e) => die(&format!("{spec}: {e}")),
+        }
+    } else {
+        Box::new(LocalDir::new(spec))
+    }
+}
+
+/// Join a set id onto a location spec, for either kind of store.
+fn join_spec(base: &str, id: &str) -> String {
+    format!("{}/{id}", base.trim_end_matches('/'))
+}
+
+/// Materialise a remote set into a temp directory, verified.
+///
+/// `restore-ns` reads pair checkpoints by opening them as RocksDB
+/// DIRECTORIES, which an object store cannot be — so a remote set stages
+/// through disk first. Verification happens against the STAGED copy: it is
+/// the copy that will be read, and a download that corrupted in transit
+/// must be refused with the same words a corrupted bucket would be.
+#[cfg(feature = "rocks")]
+fn stage_set(store: &dyn ObjectStore) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("flint-restore-stage-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let local = LocalDir::new(&dir);
+    let keys = store
+        .list("")
+        .unwrap_or_else(|e| die(&format!("list set: {e}")));
+    if keys.is_empty() {
+        die("the set location lists no objects");
+    }
+    for key in &keys {
+        let mut r = store
+            .open(key)
+            .unwrap_or_else(|e| die(&format!("fetch {key}: {e}")));
+        // Stream through a temp file, then let the local store place it
+        // with its own write-then-rename discipline.
+        let tmp = dir.join(".staging-one");
+        if let Some(parent) = tmp.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let mut f =
+            std::fs::File::create(&tmp).unwrap_or_else(|e| die(&format!("stage {key}: {e}")));
+        std::io::copy(&mut r, &mut f).unwrap_or_else(|e| die(&format!("stage {key}: {e}")));
+        drop(f);
+        local
+            .put_file(key, &tmp)
+            .unwrap_or_else(|e| die(&format!("place {key}: {e}")));
+        let _ = std::fs::remove_file(&tmp);
+    }
+    dir
 }
 
 /// One command to one node, over the mesh when the fleet is TLS.
@@ -131,11 +193,11 @@ fn main() {
         _ => {
             eprintln!(
                 "usage:\n  \
-                 flint-backup run        --pairs <a,b;c,d> --cp-state <path> --to <dir> \
+                 flint-backup run        --pairs <a,b;c,d> --cp-state <path> --to <dir|s3://bucket/prefix> \
                  [--tls <certs-dir>] [--snap-root <dir>]\n  \
-                 flint-backup verify     --from <dir>\n  \
-                 flint-backup restore    --from <dir> --into <dir>\n  \
-                 flint-backup restore-ns --from <dir> --ns <src> --into-ns <dest> \
+                 flint-backup verify     --from <dir|s3://...>\n  \
+                 flint-backup restore    --from <dir|s3://...> --into <dir>\n  \
+                 flint-backup restore-ns --from <dir|s3://...> --ns <src> --into-ns <dest> \
                  --cp <addr> --proxy-name <registered-proxy> [--tls <certs-dir>]"
             );
             std::process::exit(2)
@@ -144,9 +206,9 @@ fn main() {
 }
 
 fn verify() {
-    let from = arg("--from").unwrap_or_else(|| die("verify needs --from <dir>"));
-    let store = LocalDir::new(&from);
-    match flint_backup::load_verified(&store) {
+    let from = arg("--from").unwrap_or_else(|| die("verify needs --from <dir|s3://...>"));
+    let store = open_store(&from);
+    match flint_backup::load_verified(store.as_ref()) {
         Ok((m, r)) => {
             println!(
                 "OK {} — {} objects, {} bytes, taken {} by {}",
@@ -187,11 +249,11 @@ fn restore() {
              point --into at a path that does not exist"
         ));
     }
-    let store = LocalDir::new(&from);
+    let store = open_store(&from);
     // Verification is not separable from restore: the one entry point both
     // loads and checks, so a corrupt or tampered set is refused before a
     // single byte lands in the destination.
-    let (manifest, report) = match flint_backup::load_verified(&store) {
+    let (manifest, report) = match flint_backup::load_verified(store.as_ref()) {
         Ok(v) => v,
         Err(e) => die(&e.to_string()),
     };
@@ -372,6 +434,15 @@ fn restore_ns() {
         .unwrap_or_else(|e| die(&format!("load mesh certs from {d}: {e}")))
     });
 
+    // A remote set stages through disk (the checkpoints are opened as
+    // RocksDB directories); a local one is read in place. Either way the
+    // copy that gets VERIFIED is the copy that gets READ.
+    let from = if from.starts_with("s3://") {
+        let staged = stage_set(open_store(&from).as_ref());
+        staged.to_string_lossy().into_owned()
+    } else {
+        from
+    };
     let store = LocalDir::new(&from);
     let (manifest, report) = match flint_backup::load_verified(&store) {
         Ok(v) => v,
@@ -644,14 +715,17 @@ fn run() {
 
     let started = now_ms();
     let id = format!("backup-{started}");
-    // A set is written to its own directory and never into an existing one:
-    // a half-written set sharing a directory with a good one is how a
-    // restore picks up objects from two different backups.
-    let root = Path::new(&to).join(&id);
-    if root.exists() {
-        die(&format!("{} already exists", root.display()));
+    // A set is written to its own location and never into an occupied one:
+    // a half-written set sharing a prefix with a good one is how a restore
+    // picks up objects from two different backups. Checked by LISTING, the
+    // one emptiness probe both stores can answer.
+    let set_spec = join_spec(&to, &id);
+    let store = open_store(&set_spec);
+    match store.list("") {
+        Ok(keys) if keys.is_empty() => {}
+        Ok(_) => die(&format!("{set_spec} already holds objects")),
+        Err(e) => die(&format!("list {set_spec}: {e}")),
     }
-    let store = LocalDir::new(&root);
 
     // A dedicated snapshot root, NOT the controller's. FLINTSNAPSHOT writes
     // <root>/<id> and repoints <root>/LATEST, and the controller's
@@ -702,7 +776,7 @@ fn run() {
             store
                 .put_file(&key, &entry.path())
                 .unwrap_or_else(|e| die(&format!("store {key}: {e}")));
-            objects.push(record(&store, &key));
+            objects.push(record(store.as_ref(), &key));
         }
         // Delete the checkpoint as soon as its bytes are safe. A checkpoint
         // hard-links the live SSTs, so leaving one behind pins those files
@@ -723,7 +797,7 @@ fn run() {
     store
         .put_file("cp-state", Path::new(&cp_state))
         .unwrap_or_else(|e| die(&format!("capture cp-state from {cp_state}: {e}")));
-    objects.push(record(&store, "cp-state"));
+    objects.push(record(store.as_ref(), "cp-state"));
 
     let manifest = Manifest {
         id: id.clone(),
@@ -742,7 +816,7 @@ fn run() {
     // nobody has read back is a claim; the cost is one pass over bytes that
     // are still in page cache, and it is the only thing standing between
     // "the job succeeded" and "the job produced something restorable".
-    match flint_backup::load_verified(&store) {
+    match flint_backup::load_verified(store.as_ref()) {
         Ok((_, r)) => println!(
             "OK {id} — {} objects, {} bytes, verified",
             r.objects, r.bytes

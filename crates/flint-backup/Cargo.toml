@@ -19,6 +19,9 @@ workspace = true
 # the FORMAT, and the format must be testable — and restorable — without
 # credentials or a network. The SDK lives behind ObjectStore in the seat.
 flint-tls = { path = "../flint-tls" }
+# The S3 store's SigV4 chain. Already in the tree via flint-tls; taking it
+# directly beats re-exporting hmac through a TLS crate's public surface.
+ring = "0.17"
 # The seat only. Kept out of the library's own surface so a caller that just
 # reads a set — a restore, a test — links no RESP client and no build stamp.
 flint-resp = { path = "../flint-resp" }

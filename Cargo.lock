@@ -509,6 +509,7 @@ dependencies = [
  "flint-slot",
  "flint-storage",
  "flint-tls",
+ "ring",
 ]
 
 [[package]]
