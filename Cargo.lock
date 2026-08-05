@@ -506,6 +506,7 @@ version = "0.0.1"
 dependencies = [
  "flint-build",
  "flint-resp",
+ "flint-sched",
  "flint-slot",
  "flint-storage",
  "flint-tls",
@@ -617,6 +618,10 @@ dependencies = [
 
 [[package]]
 name = "flint-resp"
+version = "0.0.1"
+
+[[package]]
+name = "flint-sched"
 version = "0.0.1"
 
 [[package]]

@@ -188,6 +188,7 @@ fn main() {
         Some("verify") => verify(),
         Some("restore") => restore(),
         Some("restore-ns") => restore_ns(),
+        Some("schedule") => schedule(),
         Some("inspect") => inspect(),
         Some("--build-version") => println!("{}", flint_build::version(env!("CARGO_PKG_VERSION"))),
         _ => {
@@ -198,7 +199,10 @@ fn main() {
                  flint-backup verify     --from <dir|s3://...>\n  \
                  flint-backup restore    --from <dir|s3://...> --into <dir>\n  \
                  flint-backup restore-ns --from <dir|s3://...> --ns <src> --into-ns <dest> \
-                 --cp <addr> --proxy-name <registered-proxy> [--tls <certs-dir>]"
+                 --cp <addr> --proxy-name <registered-proxy> [--tls <certs-dir>]\n  \
+                 flint-backup schedule   --pairs <a,b;c,d> --cp-state <path> --to <dir|s3://...> \
+                 --every <dur> [--verify-every <dur>] [--rehearse-every <dur>] [--keep <n>] \
+                 [--status-file <path>] [--jitter <dur>] [--tls <certs-dir>] [--snap-root <dir>]"
             );
             std::process::exit(2)
         }
@@ -690,6 +694,245 @@ fn inspect() {
 #[cfg(not(feature = "rocks"))]
 fn inspect() {
     die("inspect requires a build with --features rocks");
+}
+
+/// `30s` / `15m` / `24h` / bare seconds.
+fn parse_dur(s: &str) -> Option<std::time::Duration> {
+    let (num, mul) = match s.as_bytes().last()? {
+        b's' => (&s[..s.len() - 1], 1u64),
+        b'm' => (&s[..s.len() - 1], 60),
+        b'h' => (&s[..s.len() - 1], 3600),
+        _ => (s, 1),
+    };
+    num.parse::<u64>()
+        .ok()
+        .map(|n| std::time::Duration::from_secs(n * mul))
+}
+
+/// Set ids under a store root, oldest first. The id embeds the start
+/// millisecond, so lexical order is age order.
+fn set_ids(store: &dyn ObjectStore) -> Vec<String> {
+    let mut ids: Vec<String> = store
+        .list("")
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|k| k.split('/').next().map(str::to_string))
+        .filter(|p| p.starts_with("backup-"))
+        .collect();
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
+/// The policy loop — ADR-0011 D8's three job kinds on flint-sched.
+///
+/// Each job re-invokes THIS binary's own subcommand rather than calling
+/// into shared functions: the thing being scheduled is exactly the command
+/// an operator would type, so a rehearsal that passes here proves the
+/// command that will be run during an incident, not a cousin of it. It
+/// also means a wedged job is a killable child process, not a poisoned
+/// thread in the scheduler.
+///
+/// The status file's load-bearing line is `rehearsed_set` / its age: the
+/// alertable metric is the age of the newest artifact that has actually
+/// been RESTORED, never the run count — a nightly job that succeeds and
+/// produces unrestorable output is indistinguishable from a healthy one by
+/// run count, and that is the failure this whole ADR exists to prevent.
+fn schedule() {
+    use std::sync::{Arc, Mutex};
+    let to = arg("--to").unwrap_or_else(|| die("schedule needs --to <dir|s3://...>"));
+    let pairs = arg("--pairs").unwrap_or_else(|| die("schedule needs --pairs"));
+    let cp_state = arg("--cp-state").unwrap_or_else(|| die("schedule needs --cp-state"));
+    let every = arg("--every")
+        .and_then(|v| parse_dur(&v))
+        .unwrap_or_else(|| die("schedule needs --every <dur>"));
+    let verify_every = arg("--verify-every").and_then(|v| parse_dur(&v));
+    let rehearse_every = arg("--rehearse-every").and_then(|v| parse_dur(&v));
+    let keep: usize = arg("--keep").and_then(|v| v.parse().ok()).unwrap_or(7);
+    if keep == 0 {
+        die("--keep 0 would prune every set the moment it lands");
+    }
+    let status_file = arg("--status-file");
+    let jitter = arg("--jitter")
+        .and_then(|v| parse_dur(&v))
+        .unwrap_or(std::time::Duration::ZERO);
+    let exe = std::env::current_exe().unwrap_or_else(|e| die(&format!("current_exe: {e}")));
+
+    // One child invocation; the trimmed last stdout line is the summary.
+    // Arc'd because each job closure keeps its own handle for the life of
+    // the scheduler.
+    let exe = std::sync::Arc::new(exe);
+    let invoke = move |args: &[&str]| -> Result<String, String> {
+        let out = std::process::Command::new(exe.as_ref())
+            .args(args)
+            .output()
+            .map_err(|e| format!("spawn: {e}"))?;
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let last = stdout.lines().last().unwrap_or("").to_string();
+        if out.status.success() {
+            Ok(last)
+        } else {
+            let err = String::from_utf8_lossy(&out.stderr);
+            Err(err.lines().last().unwrap_or(&last).to_string())
+        }
+    };
+
+    // The newest set that a REHEARSAL restored, and when. Shared with the
+    // status writer; the backup job never touches it, which is the point.
+    let rehearsed: Arc<Mutex<Option<(String, u64)>>> = Arc::new(Mutex::new(None));
+
+    let mut sched = flint_sched::Scheduler::new();
+    {
+        let invoke = invoke.clone();
+        let (to, pairs, cp_state) = (to.clone(), pairs.clone(), cp_state.clone());
+        let tls = arg("--tls");
+        let snap = arg("--snap-root");
+        sched.add(
+            flint_sched::Job::new("backup", every, every / 8, move || {
+                let mut a: Vec<String> = vec![
+                    "run".into(),
+                    "--pairs".into(),
+                    pairs.clone(),
+                    "--cp-state".into(),
+                    cp_state.clone(),
+                    "--to".into(),
+                    to.clone(),
+                ];
+                if let Some(t) = &tls {
+                    a.extend(["--tls".into(), t.clone()]);
+                }
+                if let Some(sr) = &snap {
+                    a.extend(["--snap-root".into(), sr.clone()]);
+                }
+                let refs: Vec<&str> = a.iter().map(String::as_str).collect();
+                let summary = invoke(&refs)?;
+                // Retention: prune to the newest `keep` sets, AFTER the new
+                // one landed and self-verified. Failure to prune degrades
+                // to a bigger bucket, never to a lost backup — so it warns
+                // in the summary instead of failing the job.
+                let store = open_store(&to);
+                let ids = set_ids(store.as_ref());
+                let mut pruned = 0usize;
+                if ids.len() > keep {
+                    for id in &ids[..ids.len() - keep] {
+                        for key in store.list(&format!("{id}/")).unwrap_or_default() {
+                            if store.delete(&key).is_err() {
+                                return Ok(format!("{summary} (prune of {id} incomplete)"));
+                            }
+                        }
+                        pruned += 1;
+                    }
+                }
+                Ok(if pruned > 0 {
+                    format!("{summary} (pruned {pruned} old set(s))")
+                } else {
+                    summary
+                })
+            }),
+            flint_sched::Scheduler::startup_jitter(jitter),
+        );
+    }
+    if let Some(vd) = verify_every {
+        let invoke = invoke.clone();
+        let to = to.clone();
+        sched.add(
+            flint_sched::Job::new("verify", vd, vd / 8, move || {
+                let ids = set_ids(open_store(&to).as_ref());
+                let Some(newest) = ids.last() else {
+                    return Err("no sets to verify yet".into());
+                };
+                invoke(&["verify", "--from", &join_spec(&to, newest)])
+            }),
+            flint_sched::Scheduler::startup_jitter(jitter),
+        );
+    }
+    if let Some(rd) = rehearse_every {
+        let to = to.clone();
+        let rehearsed = rehearsed.clone();
+        sched.add(
+            flint_sched::Job::new("rehearse", rd, rd / 8, move || {
+                let ids = set_ids(open_store(&to).as_ref());
+                let Some(newest) = ids.last().cloned() else {
+                    return Err("no sets to rehearse yet".into());
+                };
+                let dest = std::env::temp_dir()
+                    .join(format!("flint-rehearse-{}-{newest}", std::process::id()));
+                let _ = std::fs::remove_dir_all(&dest);
+                let r = invoke(&[
+                    "restore",
+                    "--from",
+                    &join_spec(&to, &newest),
+                    "--into",
+                    &dest.to_string_lossy(),
+                ]);
+                let _ = std::fs::remove_dir_all(&dest);
+                let summary = r?;
+                *rehearsed.lock().expect("rehearsed lock") = Some((newest.clone(), now_ms()));
+                Ok(summary)
+            }),
+            flint_sched::Scheduler::startup_jitter(jitter),
+        );
+    }
+
+    eprintln!(
+        "schedule: backup every {every:?}, verify {verify_every:?}, rehearse {rehearse_every:?}, keep {keep}, to {to}"
+    );
+    // The status file is rewritten after every pass — atomically, since an
+    // exporter may read it mid-write.
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    loop {
+        let next = sched.tick(std::time::Instant::now());
+        if let Some(path) = &status_file {
+            let mut s = String::new();
+            for (name, st) in sched.stats() {
+                let last = match &st.last {
+                    Some(Ok(m)) => format!("ok {m}"),
+                    Some(Err(e)) => format!("err {e}"),
+                    None => "pending".into(),
+                };
+                s.push_str(&format!(
+                    "job {name} runs {} failures {} consecutive {} last_ok_ms {} {last}
+",
+                    st.runs,
+                    st.failures,
+                    st.consecutive_failures,
+                    st.last_ok_wall_ms.unwrap_or(0),
+                ));
+            }
+            if let Some((id, at)) = rehearsed.lock().expect("rehearsed lock").clone() {
+                s.push_str(&format!(
+                    "rehearsed_set {id}
+"
+                ));
+                s.push_str(&format!(
+                    "rehearsed_at_ms {at}
+"
+                ));
+                s.push_str(&format!(
+                    "rehearsed_age_s {}
+",
+                    now_ms().saturating_sub(at) / 1000
+                ));
+            } else {
+                s.push_str(
+                    "rehearsed_set none
+",
+                );
+            }
+            let tmp = format!("{path}.tmp");
+            if std::fs::write(&tmp, &s).is_ok() {
+                let _ = std::fs::rename(&tmp, path);
+            }
+        }
+        let sleep = next
+            .map(|n| n.saturating_duration_since(std::time::Instant::now()))
+            .unwrap_or(std::time::Duration::from_secs(1))
+            .min(std::time::Duration::from_secs(1));
+        if stop.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        std::thread::sleep(sleep);
+    }
 }
 
 fn run() {

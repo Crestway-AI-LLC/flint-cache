@@ -1,0 +1,13 @@
+[package]
+name = "flint-sched"
+description = "Recurring-job scheduling as a LIBRARY (ADR-0011 D8): one implementation of the parts that are hard — overlap prevention, drift without catch-up bursts, jitter, failure backoff, last-outcome reporting — and no scheduler seat, because a separate scheduler process is a new failure domain that must reach into other components to fire them. First customer: flint-backup's policy jobs; the controller's snapshot cadence, the agent's consolidation cron and the GC sweeper are candidates to migrate once it has proven out"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]

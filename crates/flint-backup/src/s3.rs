@@ -322,6 +322,16 @@ impl ObjectStore for S3Store {
         Ok(v)
     }
 
+    fn delete(&self, key: &str) -> io::Result<()> {
+        let resp = self.simple("DELETE", key, &[])?;
+        match resp.status {
+            // 204 is the normal answer; S3 also answers 204 for an absent
+            // key, which matches the trait's absent-is-success contract.
+            200 | 204 => Ok(()),
+            s => Err(io::Error::other(format!("DELETE {key}: HTTP {s}"))),
+        }
+    }
+
     fn write(&self, key: &str, bytes: &[u8]) -> io::Result<()> {
         let sha = flint_tls::sha256_hex(bytes);
         let path = format!(

@@ -35,6 +35,11 @@ pub trait ObjectStore {
     /// can grow with the dataset must use `open`/`put_file`.
     fn read(&self, key: &str) -> io::Result<Vec<u8>>;
     fn write(&self, key: &str, bytes: &[u8]) -> io::Result<()>;
+
+    /// Remove one object. Absent is SUCCESS: retention pruning retries
+    /// after partial failures, and a delete that errors on already-gone
+    /// turns every retry into a false alarm.
+    fn delete(&self, key: &str) -> io::Result<()>;
 }
 
 /// A backup set in a directory. Also the shape every other store is
@@ -113,6 +118,27 @@ impl ObjectStore for LocalDir {
             f.sync_all()?;
         }
         std::fs::rename(&tmp, &dest)
+    }
+
+    fn delete(&self, key: &str) -> io::Result<()> {
+        let path = self.path(key)?;
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e),
+        }
+        // Sweep now-empty parents up to the root: an object store has no
+        // directories, so a LocalDir that leaves husks behind makes the
+        // two stores disagree about what a pruned set looks like — and
+        // leaks one empty dir per retention cycle forever (#123's shape).
+        let mut dir = path.parent().map(|p| p.to_path_buf());
+        while let Some(d) = dir {
+            if d == self.root || std::fs::remove_dir(&d).is_err() {
+                break; // non-empty or root: stop, both are fine
+            }
+            dir = d.parent().map(|p| p.to_path_buf());
+        }
+        Ok(())
     }
 }
 
