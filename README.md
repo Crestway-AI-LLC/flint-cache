@@ -37,9 +37,12 @@ fast enough that you stop thinking about it.
    microseconds (a cross-AZ round trip is ~500 µs–1 ms), and a RAM cache
    behind a proxy crosses the same wires — so both designs pay that part
    identically. The only difference is the last step inside the node, a RAM
-   lookup versus an NVMe read: 50–175 µs in our own measurements, a rounding
-   error against two hops. Holding 10× the data at NVMe prices is not a
-   rounding error — it shows up in the bill and in the miss rate.
+   lookup versus an NVMe read: 50–175 µs in our own measurements. Against
+   two hops plus TLS and auth, that step is **well under a tenth of the
+   latency your caller measures** — the smallest term in the equation, and
+   the only one Flint trades. The term that dominates is whether the key was
+   there at all, because a miss costs a full round trip to your origin.
+   Holding 10× the data at NVMe prices is what buys that.
 5. **Built to be operated by an agent.** From the first commit, every drill,
    failure claim, and operational lesson is captured in a form software can
    act on — runnable drills in this repo, journaled actions, allowlisted
