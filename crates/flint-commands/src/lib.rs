@@ -39,6 +39,10 @@ pub fn is_write_command(name: &[u8]) -> bool {
             | b"SETEX"
             | b"MSET"
             | b"COPY"
+            // The STORE variants write their DESTINATION, which is args[1] —
+            // so the proxy's default invalidation already drops the right key.
+            | b"ZUNIONSTORE"
+            | b"ZINTERSTORE"
             | b"DEL"
             | b"EXPIRE"
             | b"PEXPIRE"

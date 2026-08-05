@@ -548,6 +548,264 @@ fn corpus() -> Vec<Case> {
             ],
         },
         Case {
+            family: "zsets",
+            name: "zunionstore zinterstore (same slot)",
+            steps: vec![
+                s(&[b"ZADD", b"{zu}a", b"1", b"a", b"2", b"b"], Expect::Int(2)),
+                s(
+                    &[b"ZADD", b"{zu}b", b"10", b"b", b"20", b"c"],
+                    Expect::Int(2),
+                ),
+                // SUM is the default: b is 2 + 10.
+                s(
+                    &[b"ZUNIONSTORE", b"{zu}d", b"2", b"{zu}a", b"{zu}b"],
+                    Expect::Int(3),
+                ),
+                s(
+                    &[b"ZRANGE", b"{zu}d", b"0", b"-1", b"WITHSCORES"],
+                    Expect::Arr(vec![
+                        Expect::Str(b"a"),
+                        Expect::Str(b"1"),
+                        Expect::Str(b"b"),
+                        Expect::Str(b"12"),
+                        Expect::Str(b"c"),
+                        Expect::Str(b"20"),
+                    ]),
+                ),
+                s(
+                    &[b"ZINTERSTORE", b"{zu}i", b"2", b"{zu}a", b"{zu}b"],
+                    Expect::Int(1),
+                ),
+                s(
+                    &[b"ZRANGE", b"{zu}i", b"0", b"-1", b"WITHSCORES"],
+                    Expect::Arr(vec![Expect::Str(b"b"), Expect::Str(b"12")]),
+                ),
+                // WEIGHTS scale each input before aggregation.
+                s(
+                    &[
+                        b"ZUNIONSTORE",
+                        b"{zu}w",
+                        b"2",
+                        b"{zu}a",
+                        b"{zu}b",
+                        b"WEIGHTS",
+                        b"2",
+                        b"3",
+                    ],
+                    Expect::Int(3),
+                ),
+                s(
+                    &[b"ZRANGE", b"{zu}w", b"0", b"-1", b"WITHSCORES"],
+                    Expect::Arr(vec![
+                        Expect::Str(b"a"),
+                        Expect::Str(b"2"),
+                        Expect::Str(b"b"),
+                        Expect::Str(b"34"),
+                        Expect::Str(b"c"),
+                        Expect::Str(b"60"),
+                    ]),
+                ),
+                s(
+                    &[
+                        b"ZUNIONSTORE",
+                        b"{zu}mn",
+                        b"2",
+                        b"{zu}a",
+                        b"{zu}b",
+                        b"AGGREGATE",
+                        b"MIN",
+                    ],
+                    Expect::Int(3),
+                ),
+                s(
+                    &[b"ZRANGE", b"{zu}mn", b"0", b"-1", b"WITHSCORES"],
+                    Expect::Arr(vec![
+                        Expect::Str(b"a"),
+                        Expect::Str(b"1"),
+                        Expect::Str(b"b"),
+                        Expect::Str(b"2"),
+                        Expect::Str(b"c"),
+                        Expect::Str(b"20"),
+                    ]),
+                ),
+                s(
+                    &[
+                        b"ZUNIONSTORE",
+                        b"{zu}mx",
+                        b"2",
+                        b"{zu}a",
+                        b"{zu}b",
+                        b"AGGREGATE",
+                        b"MAX",
+                    ],
+                    Expect::Int(3),
+                ),
+                s(
+                    &[b"ZRANGE", b"{zu}mx", b"0", b"-1", b"WITHSCORES"],
+                    Expect::Arr(vec![
+                        Expect::Str(b"a"),
+                        Expect::Str(b"1"),
+                        Expect::Str(b"b"),
+                        Expect::Str(b"10"),
+                        Expect::Str(b"c"),
+                        Expect::Str(b"20"),
+                    ]),
+                ),
+                // A plain SET is a legal input, each member scoring 1.
+                s(&[b"SADD", b"{zu}s", b"b", b"q"], Expect::Int(2)),
+                s(
+                    &[b"ZUNIONSTORE", b"{zu}ds", b"2", b"{zu}a", b"{zu}s"],
+                    Expect::Int(3),
+                ),
+                s(
+                    &[b"ZRANGE", b"{zu}ds", b"0", b"-1", b"WITHSCORES"],
+                    Expect::Arr(vec![
+                        Expect::Str(b"a"),
+                        Expect::Str(b"1"),
+                        Expect::Str(b"q"),
+                        Expect::Str(b"1"),
+                        Expect::Str(b"b"),
+                        Expect::Str(b"3"),
+                    ]),
+                ),
+                // NaN has two ways in and upstream turns both into 0: a zero
+                // weight on an infinite score, and SUM over both infinities.
+                // A NaN score would order unpredictably against everything.
+                s(&[b"ZADD", b"{zu}pi", b"inf", b"x"], Expect::Int(1)),
+                s(&[b"ZADD", b"{zu}ni", b"-inf", b"x"], Expect::Int(1)),
+                s(
+                    &[b"ZUNIONSTORE", b"{zu}r", b"2", b"{zu}pi", b"{zu}ni"],
+                    Expect::Int(1),
+                ),
+                s(&[b"ZSCORE", b"{zu}r", b"x"], Expect::Str(b"0")),
+                s(
+                    &[b"ZUNIONSTORE", b"{zu}rw", b"1", b"{zu}pi", b"WEIGHTS", b"0"],
+                    Expect::Int(1),
+                ),
+                s(&[b"ZSCORE", b"{zu}rw", b"x"], Expect::Str(b"0")),
+                // MIN/MAX carry the infinities through untouched.
+                s(
+                    &[
+                        b"ZUNIONSTORE",
+                        b"{zu}rmn",
+                        b"2",
+                        b"{zu}pi",
+                        b"{zu}ni",
+                        b"AGGREGATE",
+                        b"MIN",
+                    ],
+                    Expect::Int(1),
+                ),
+                s(&[b"ZSCORE", b"{zu}rmn", b"x"], Expect::Str(b"-inf")),
+                // An empty result RETIRES the destination rather than
+                // leaving an empty sorted set that answers EXISTS 1.
+                s(&[b"SET", b"{zu}pre", b"v"], Expect::Ok),
+                s(
+                    &[b"ZINTERSTORE", b"{zu}pre", b"2", b"{zu}a", b"{zu}gone"],
+                    Expect::Int(0),
+                ),
+                s(&[b"EXISTS", b"{zu}pre"], Expect::Int(0)),
+                s(&[b"TYPE", b"{zu}pre"], Expect::Simple("none")),
+                // The destination is overwritten whatever it held before.
+                s(&[b"SET", b"{zu}str", b"v"], Expect::Ok),
+                s(
+                    &[b"ZUNIONSTORE", b"{zu}str", b"1", b"{zu}a"],
+                    Expect::Int(2),
+                ),
+                s(&[b"TYPE", b"{zu}str"], Expect::Simple("zset")),
+                // The destination may BE one of the sources: its old
+                // contents must be folded in before it is replaced.
+                s(
+                    &[b"ZUNIONSTORE", b"{zu}a", b"2", b"{zu}a", b"{zu}b"],
+                    Expect::Int(3),
+                ),
+                s(
+                    &[b"ZRANGE", b"{zu}a", b"0", b"-1", b"WITHSCORES"],
+                    Expect::Arr(vec![
+                        Expect::Str(b"a"),
+                        Expect::Str(b"1"),
+                        Expect::Str(b"b"),
+                        Expect::Str(b"12"),
+                        Expect::Str(b"c"),
+                        Expect::Str(b"20"),
+                    ]),
+                ),
+                // numkeys is checked against what is actually present, and
+                // the two ways of getting it wrong fail differently.
+                s(
+                    &[b"ZUNIONSTORE", b"{zu}e", b"0", b"{zu}a"],
+                    Expect::AnyError,
+                ),
+                s(
+                    &[b"ZUNIONSTORE", b"{zu}e", b"3", b"{zu}a", b"{zu}b"],
+                    Expect::AnyError,
+                ),
+                s(
+                    &[b"ZUNIONSTORE", b"{zu}e", b"1", b"{zu}a", b"{zu}b"],
+                    Expect::AnyError,
+                ),
+                s(
+                    &[b"ZUNIONSTORE", b"{zu}e", b"abc", b"{zu}a"],
+                    Expect::AnyError,
+                ),
+                // A short WEIGHTS list is an error, not a pad with ones.
+                s(
+                    &[
+                        b"ZUNIONSTORE",
+                        b"{zu}e",
+                        b"2",
+                        b"{zu}a",
+                        b"{zu}b",
+                        b"WEIGHTS",
+                        b"1",
+                    ],
+                    Expect::AnyError,
+                ),
+                s(
+                    &[
+                        b"ZUNIONSTORE",
+                        b"{zu}e",
+                        b"2",
+                        b"{zu}a",
+                        b"{zu}b",
+                        b"WEIGHTS",
+                        b"1",
+                        b"x",
+                    ],
+                    Expect::AnyError,
+                ),
+                s(
+                    &[
+                        b"ZUNIONSTORE",
+                        b"{zu}e",
+                        b"2",
+                        b"{zu}a",
+                        b"{zu}b",
+                        b"AGGREGATE",
+                        b"BOGUS",
+                    ],
+                    Expect::AnyError,
+                ),
+                s(&[b"ZUNIONSTORE", b"{zu}e"], Expect::AnyError),
+                // A non-set, non-zset input is WRONGTYPE, and the failure
+                // must leave the destination uncreated.
+                s(&[b"RPUSH", b"{zu}L", b"a"], Expect::Int(1)),
+                s(
+                    &[b"ZUNIONSTORE", b"{zu}e", b"2", b"{zu}a", b"{zu}L"],
+                    Expect::AnyError,
+                ),
+                s(&[b"EXISTS", b"{zu}e"], Expect::Int(0)),
+                s(
+                    &[
+                        b"DEL", b"{zu}a", b"{zu}b", b"{zu}d", b"{zu}i", b"{zu}w", b"{zu}mn",
+                        b"{zu}mx", b"{zu}s", b"{zu}ds", b"{zu}pi", b"{zu}ni", b"{zu}r", b"{zu}rw",
+                        b"{zu}rmn", b"{zu}str", b"{zu}L",
+                    ],
+                    Expect::Int(16),
+                ),
+            ],
+        },
+        Case {
             family: "connection",
             name: "select",
             steps: vec![

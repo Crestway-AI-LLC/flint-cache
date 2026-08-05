@@ -396,6 +396,36 @@ impl<'a> ZSetStore<'a> {
         Ok(hits)
     }
 
+    /// The destination side of ZUNIONSTORE / ZINTERSTORE: replace `key`
+    /// wholesale with `pairs`, returning the resulting cardinality.
+    ///
+    /// The old key goes unconditionally, whatever its type — the
+    /// destination is overwritten rather than merged, and it need not have
+    /// been a sorted set at all. Dropping only the metadata row is the same
+    /// O(1) retirement DEL performs; the displaced rows are orphans under a
+    /// version no live metadata claims.
+    ///
+    /// An EMPTY result removes the key instead of leaving an empty sorted
+    /// set behind. Redis has no empty collections, and a destination left
+    /// as one would answer EXISTS 1 and TYPE zset for something with no
+    /// members — a difference a client would see immediately.
+    pub fn zreplace(
+        &self,
+        slot: u16,
+        key: &[u8],
+        pairs: &[(f64, Vec<u8>)],
+    ) -> Result<u64, StoreError> {
+        self.kv.delete(&self.meta_key(slot, key));
+        if pairs.is_empty() {
+            return Ok(0);
+        }
+        self.zadd(slot, key, pairs)?;
+        // Read the cardinality back rather than trusting `pairs.len()`:
+        // zadd folds duplicate members, so the two agree only while the
+        // caller's input is distinct. This is O(1) — it is a metadata field.
+        self.zcard(slot, key)
+    }
+
     /// ZCOUNT: members with score in [min,max].
     pub fn zcount(
         &self,

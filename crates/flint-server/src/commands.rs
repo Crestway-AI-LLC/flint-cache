@@ -633,6 +633,8 @@ impl<'a> Dispatcher<'a> {
             b"ZMSCORE" => self.cmd_zmscore(args),
             b"ZPOPMIN" => self.cmd_zpop(args, "zpopmin", false),
             b"ZPOPMAX" => self.cmd_zpop(args, "zpopmax", true),
+            b"ZUNIONSTORE" => self.cmd_zstore(args, "zunionstore", false),
+            b"ZINTERSTORE" => self.cmd_zstore(args, "zinterstore", true),
             b"ZREMRANGEBYSCORE" => self.cmd_zremrangebyscore(args),
             b"ZREMRANGEBYRANK" => self.cmd_zremrangebyrank(args),
 
@@ -1130,6 +1132,176 @@ impl<'a> Dispatcher<'a> {
             return err("ERR source and destination objects are the same");
         }
         Value::Integer(self.keyspace.copy(slot, src, dst, replace) as i64)
+    }
+
+    /// One input to ZUNIONSTORE / ZINTERSTORE, read as (member, score).
+    ///
+    /// A plain SET is a legal input and contributes score 1 per member —
+    /// which is why this dispatches on the stored type rather than simply
+    /// asking the zset store. Anything else is WRONGTYPE; a missing key is
+    /// the empty input, not an error.
+    fn zstore_source(&self, slot: u16, key: &[u8]) -> Result<Vec<(Vec<u8>, f64)>, StoreError> {
+        use flint_storage::encoding::ValueType as VT;
+        match self.keyspace.value_type(slot, key) {
+            None => Ok(Vec::new()),
+            Some(VT::ZSet) => self.zsets.zrange(slot, key, 0, -1),
+            Some(VT::Set) => Ok(self
+                .sets
+                .smembers(slot, key)?
+                .into_iter()
+                .map(|m| (m, 1.0))
+                .collect()),
+            Some(_) => Err(StoreError::WrongType),
+        }
+    }
+
+    /// ZUNIONSTORE / ZINTERSTORE dst numkeys key [key ...]
+    /// [WEIGHTS w ...] [AGGREGATE SUM|MIN|MAX].
+    ///
+    /// Same slot as ever, and here it covers the DESTINATION too: this
+    /// writes, so a destination in a slot the node does not own would be
+    /// stored where nothing can read it while the reply claimed a
+    /// cardinality. The proxy routes by the first key, which for these is
+    /// the destination — correct precisely because every key shares its slot.
+    ///
+    /// TWO PLACES A NaN CAN APPEAR, both of which upstream turns into 0 and
+    /// neither of which is guesswork — they were confirmed against a live
+    /// server: `0 * inf` when a weight zeroes an infinite score, and
+    /// `+inf + -inf` when SUM meets both infinities. Left alone, a NaN score
+    /// would encode and then order unpredictably against every other member.
+    fn cmd_zstore(&self, args: &[Vec<u8>], name: &str, inter: bool) -> Value {
+        use std::collections::HashMap;
+        use std::collections::hash_map::Entry;
+
+        if args.len() < 4 {
+            return arity_err(name);
+        }
+        let Ok(declared) = parse_i64(&args[2]) else {
+            return err("ERR value is not an integer or out of range");
+        };
+        if declared <= 0 {
+            return err(&format!(
+                "ERR at least 1 input key is needed for '{name}' command"
+            ));
+        }
+        // Compare against what is actually there before widening: a huge
+        // declared count must not become an in-bounds index by wrapping.
+        let numkeys = declared as usize;
+        if numkeys > args.len() - 3 {
+            return err("ERR syntax error");
+        }
+        let keys = &args[3..3 + numkeys];
+
+        let mut weights = vec![1.0f64; numkeys];
+        let mut aggregate = b"SUM".to_vec();
+        let mut i = 3 + numkeys;
+        while i < args.len() {
+            match args[i].to_ascii_uppercase().as_slice() {
+                b"WEIGHTS" => {
+                    // Exactly one weight per key. A short list is a syntax
+                    // error rather than a padded-with-ones convenience: the
+                    // caller has miscounted, and quietly filling in 1.0 would
+                    // produce a plausible wrong answer.
+                    if args.len() - i - 1 < numkeys {
+                        return err("ERR syntax error");
+                    }
+                    for (n, w) in weights.iter_mut().enumerate() {
+                        let Ok(v) = parse_f64(&args[i + 1 + n]) else {
+                            return err("ERR weight value is not a float");
+                        };
+                        *w = v;
+                    }
+                    i += numkeys;
+                }
+                b"AGGREGATE" => {
+                    let Some(kind) = args.get(i + 1) else {
+                        return err("ERR syntax error");
+                    };
+                    aggregate = kind.to_ascii_uppercase();
+                    if !matches!(aggregate.as_slice(), b"SUM" | b"MIN" | b"MAX") {
+                        return err("ERR syntax error");
+                    }
+                    i += 1;
+                }
+                _ => return err("ERR syntax error"),
+            }
+            i += 1;
+        }
+
+        let dst = &args[1];
+        let slot = slot_for_key(dst);
+        if let Some(bad) = keys.iter().find(|k| slot_for_key(k) != slot) {
+            return Value::Error(format!(
+                "CROSSSLOT Keys in request don't hash to the same slot ({} is slot {}, \
+                 {} is slot {}) — use a hash tag such as {{tag}}key to colocate them",
+                String::from_utf8_lossy(dst),
+                slot,
+                String::from_utf8_lossy(bad),
+                slot_for_key(bad)
+            ));
+        }
+
+        let combine = |a: f64, b: f64| -> f64 {
+            let v = match aggregate.as_slice() {
+                b"MIN" => a.min(b),
+                b"MAX" => a.max(b),
+                _ => a + b,
+            };
+            if v.is_nan() { 0.0 } else { v }
+        };
+
+        // EVERY source is read before anything is written, because the
+        // destination is allowed to be one of them: ZUNIONSTORE k 2 k other
+        // is legal and must fold k's own contents in before k is replaced.
+        let mut acc: HashMap<Vec<u8>, f64> = HashMap::new();
+        for (n, key) in keys.iter().enumerate() {
+            let members = match self.zstore_source(slot, key) {
+                Ok(m) => m,
+                Err(e) => return store_err(e),
+            };
+            let weighted = members.into_iter().map(|(m, s)| {
+                let v = s * weights[n];
+                (m, if v.is_nan() { 0.0 } else { v })
+            });
+            if n == 0 {
+                acc = weighted.collect();
+                continue;
+            }
+            if inter {
+                // Intersection keeps only what survived every earlier input,
+                // so it is rebuilt each round rather than pruned in place.
+                let mut next = HashMap::with_capacity(acc.len());
+                for (m, v) in weighted {
+                    if let Some(prev) = acc.get(&m) {
+                        next.insert(m, combine(*prev, v));
+                    }
+                }
+                acc = next;
+                if acc.is_empty() {
+                    break;
+                }
+            } else {
+                for (m, v) in weighted {
+                    match acc.entry(m) {
+                        Entry::Occupied(mut e) => {
+                            let merged = combine(*e.get(), v);
+                            e.insert(merged);
+                        }
+                        // A member absent from the accumulator so far takes
+                        // its own weighted score: there is nothing to
+                        // aggregate it against yet.
+                        Entry::Vacant(e) => {
+                            e.insert(v);
+                        }
+                    }
+                }
+            }
+        }
+
+        let pairs: Vec<(f64, Vec<u8>)> = acc.into_iter().map(|(m, s)| (s, m)).collect();
+        reply(self.zsets.zreplace(slot, dst, &pairs), |n| {
+            Value::Integer(n as i64)
+        })
     }
 
     fn cmd_zrank(&self, args: &[Vec<u8>], name: &str, rev: bool) -> Value {

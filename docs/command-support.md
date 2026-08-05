@@ -65,8 +65,10 @@ SRANDMEMBER, SSCAN (MATCH, COUNT), SINTER, SUNION, SDIFF.
 > Cluster: colocate the keys with a hash tag (`SINTER {u1}:a {u1}:b`) or the
 > request is refused with `CROSSSLOT`. Refused rather than answered, because
 > a key the node does not own reads as an empty set and an intersection
-> against a phantom empty set is silently wrong. The `STORE` variants
-> (SINTERSTORE etc.) remain excluded — see below.
+> against a phantom empty set is silently wrong. The set `STORE` variants
+> (SINTERSTORE, SUNIONSTORE, SDIFFSTORE) are **not implemented yet** —
+> nothing about them is ruled out, they simply have not been written; the
+> sorted-set ones, ZUNIONSTORE and ZINTERSTORE, are supported.
 
 **Lists**: LPUSH, RPUSH, LPOP, RPOP, LLEN, LRANGE, LINDEX, LSET, LTRIM,
 LREM, LINSERT, LPOS (RANK, COUNT, MAXLEN).
@@ -75,7 +77,19 @@ LREM, LINSERT, LPOS (RANK, COUNT, MAXLEN).
 ZREVRANGE, ZRANGEBYSCORE, ZREVRANGEBYSCORE (WITHSCORES, LIMIT, exclusive
 bounds, ±inf), ZRANGEBYLEX, ZREVRANGEBYLEX (LIMIT, exclusive bounds,
 `-`/`+`), ZRANK, ZREVRANK, ZCOUNT, ZPOPMIN, ZPOPMAX, ZREMRANGEBYSCORE,
-ZREMRANGEBYRANK, ZSCAN (MATCH, COUNT).
+ZREMRANGEBYRANK, ZSCAN (MATCH, COUNT), ZUNIONSTORE, ZINTERSTORE (WEIGHTS,
+AGGREGATE SUM/MIN/MAX).
+
+> ZUNIONSTORE / ZINTERSTORE are **same-slot only**, and the rule covers the
+> destination as well as the inputs — these write, so a destination in an
+> unowned slot would be stored where nothing can read it while the reply
+> claimed a cardinality. Colocate everything with one hash tag
+> (`ZUNIONSTORE {u1}:out 2 {u1}:a {u1}:b`).
+>
+> A plain SET is a legal input, each member scoring 1. An empty result
+> removes the destination rather than leaving an empty sorted set behind.
+> Where a computed score would be NaN — a zero weight against an infinite
+> score, or SUM over both infinities — the score is 0, matching upstream.
 
 > The lex forms are meaningful only when every member shares one score —
 > the same condition Redis states — because the index is ordered by
@@ -203,8 +217,11 @@ the write; ours says why.
 
 ## Excluded by design
 
-- **Cross-slot multi-key commands** (SINTERSTORE, RENAME across slots,
-  etc.), **MULTI/EXEC/WATCH**, **pub/sub**, **streams**, **blocking
+- **Cross-slot multi-key commands** — the *cross-slot* form, not the
+  command. A multi-key command whose keys share a slot is fair game and
+  several are supported (SINTER, ZUNIONSTORE, COPY); it is scattering one
+  request across slots that is excluded. Colocate with a hash tag.
+  Also **MULTI/EXEC/WATCH**, **pub/sub**, **streams**, **blocking
   commands** (BLPOP, BLMOVE …), **KEYS/RANDOMKEY**, and **EVAL/EVALSHA**.
   These conflict with slot-sharded multi-tenancy or reintroduce the
   single-threaded bottlenecks Flint exists to avoid. Common patterns they
