@@ -339,16 +339,44 @@ impl State {
 mod tests {
     use super::*;
 
+    /// A test directory that lives exactly as long as the binding holds it.
+    ///
+    /// Removing the state FILE at the end of a test is not enough — the
+    /// directory outlives the process and accumulates one per `cargo test`
+    /// run, forever. Drop is also the only cleanup that survives a failing
+    /// assertion: a tail `remove_dir_all` never runs on the panicking path,
+    /// which is precisely when you re-run the test most.
+    struct TempDir(std::path::PathBuf);
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static N: AtomicU64 = AtomicU64::new(0);
+            let p = std::env::temp_dir().join(format!(
+                "flint-cp-test-{tag}-{}-{}",
+                std::process::id(),
+                N.fetch_add(1, Ordering::Relaxed)
+            ));
+            let _ = std::fs::remove_dir_all(&p);
+            std::fs::create_dir_all(&p).expect("temp dir");
+            Self(p)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     fn fleet(n: usize) -> Vec<String> {
         (0..n).map(|i| format!("10.0.0.{i}:7000")).collect()
     }
 
     #[test]
     fn exceptions_are_subset_filtered_per_proxy() {
-        let dir = std::env::temp_dir().join(format!("flint-exc-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("dir");
-        let mut s = State::load_or_new(dir.join("state"));
+        let dir = TempDir::new("exc");
+        let mut s = State::load_or_new(dir.0.join("state"));
         s.proxies = vec!["p1".into(), "p2".into()];
         s.pairs = vec![vec!["a:1".into()], vec!["b:1".into()]];
         s.ranges = vec![None, None];
@@ -397,7 +425,7 @@ mod tests {
         assert_eq!(exc1, "acme:102:1");
         // Runs survive the line-format round-trip.
         s.commit().expect("commit");
-        let r = State::load_or_new(dir.join("state"));
+        let r = State::load_or_new(dir.0.join("state"));
         assert_eq!(
             r.exceptions,
             vec![
@@ -408,7 +436,6 @@ mod tests {
         // consolidate() reports the surviving row count.
         let mut s = r;
         assert_eq!(s.consolidate(), 2);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -438,10 +465,8 @@ mod tests {
 
     #[test]
     fn state_roundtrips_through_disk() {
-        let dir = std::env::temp_dir().join(format!("flint-cp-test-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("state");
-        let _ = std::fs::remove_file(&path);
+        let dir = TempDir::new("roundtrip");
+        let path = dir.0.join("state");
 
         let mut s = State::load_or_new(path.clone());
         s.proxies.push("p1:7000".into());
@@ -485,7 +510,6 @@ mod tests {
             reloaded.tenants.get("acme").map(|t| t.token.clone()),
             Some(expected_digest)
         );
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

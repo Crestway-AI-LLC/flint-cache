@@ -191,6 +191,36 @@ pub fn tail(path: &str, n: usize) -> Vec<String> {
 mod append_tests {
     use super::*;
 
+    /// A test directory that lives exactly as long as the binding holds it.
+    ///
+    /// Removing the journal FILE at the end of a test is not enough — the
+    /// directory outlives the process and accumulates one per `cargo test`
+    /// run, forever. Drop is also the only cleanup that survives a failing
+    /// assertion: a tail `remove_dir_all` never runs on the panicking path,
+    /// which is precisely when you re-run the test most.
+    struct TempDir(std::path::PathBuf);
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static N: AtomicU64 = AtomicU64::new(0);
+            let p = std::env::temp_dir().join(format!(
+                "flint-journal-race-{tag}-{}-{}",
+                std::process::id(),
+                N.fetch_add(1, Ordering::Relaxed)
+            ));
+            let _ = std::fs::remove_dir_all(&p);
+            std::fs::create_dir_all(&p).expect("temp dir");
+            Self(p)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     /// Concurrent appenders must not interleave WITHIN a line.
     ///
     /// This failed before `append_line` built the line and its newline into one
@@ -207,11 +237,9 @@ mod append_tests {
     /// was clean: a line that cannot be parsed is a line that does not exist.
     #[test]
     fn concurrent_appends_never_interleave_within_a_line() {
-        let dir = std::env::temp_dir().join(format!("flint-journal-race-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("j.jsonl");
+        let dir = TempDir::new("interleave");
+        let path = dir.0.join("j.jsonl");
         let p = path.to_string_lossy().to_string();
-        let _ = std::fs::remove_file(&path);
 
         const WRITERS: usize = 8;
         const EACH: usize = 250;
@@ -252,6 +280,5 @@ mod append_tests {
                 )
             });
         }
-        let _ = std::fs::remove_file(&path);
     }
 }
