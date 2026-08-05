@@ -451,9 +451,24 @@ impl<'a> Dispatcher<'a> {
             // answering it, because it would answer WRONGLY: a key this node
             // does not own reads as an empty set, and an intersection against
             // a phantom empty set is a plausible-looking answer that is
-            // silently incorrect. The proxy rejects these before they arrive;
-            // this check is the second line, for a client dialling a node
-            // directly.
+            // silently incorrect.
+            //
+            // NOTHING UPSTREAM CATCHES THIS. The proxy routes multi-key
+            // commands by their FIRST key and never inspects the rest
+            // (flint-proxy/src/main.rs, v0-scope note), so a cross-slot
+            // request arrives here intact whether the client dialled a node
+            // directly or came through the edge. This check is the only
+            // enforcement in the system, not a second line.
+            //
+            // It is also what makes the MIGRATION gate correct for multi-key
+            // commands: check_slot_gate derives the slot from command_key,
+            // which is args[1] alone. Gating on one key is sound only once
+            // every key is known to share its slot. Without this refusal, a
+            // key in a handed-off slot would read as locally empty during a
+            // migration and no -MOVED would ever be emitted.
+            //
+            // See the cross-slot tests at the foot of this file before
+            // weakening any of it.
             b"SINTER" | b"SUNION" | b"SDIFF" => {
                 if args.len() < 2 {
                     return Value::Error(format!(
@@ -2608,5 +2623,126 @@ mod tests {
         assert_eq!(call(&s, &[b"TTL", b"k"]), Value::Integer(-1));
         assert_eq!(call(&s, &[b"EXPIRE", b"k", b"100"]), Value::Integer(1));
         assert_eq!(call(&s, &[b"PERSIST", b"k"]), Value::Integer(1));
+    }
+
+    /// Sorted members of a set reply, so assertions do not depend on the
+    /// hash order the store happens to produce.
+    fn members(v: Value) -> Vec<Vec<u8>> {
+        let Value::Set(ms) = v else {
+            panic!("expected a set reply, got {v:?}");
+        };
+        let mut out: Vec<Vec<u8>> = ms
+            .into_iter()
+            .map(|m| match m {
+                Value::Bulk(Some(b)) => b,
+                other => panic!("expected a bulk member, got {other:?}"),
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// A cross-slot set operation must be REFUSED with an error, never
+    /// answered.
+    ///
+    /// The failure guarded here is not a crash, which is why it needs a
+    /// test at all: it is a *plausible* answer. A key whose slot this node
+    /// does not own reads as an empty set, so an unchecked cross-slot
+    /// SINTER returns the empty set — a well-formed reply that is silently
+    /// wrong, and that no client can distinguish from a real empty
+    /// intersection.
+    ///
+    /// This assertion cannot live in the conformance suite: every case
+    /// there is compared against real Valkey, and standalone Valkey has no
+    /// slots, so it answers cross-slot set operations happily. The refusal
+    /// is a deliberate divergence from standalone semantics toward cluster
+    /// semantics, so it has to be asserted here.
+    #[test]
+    fn a_cross_slot_set_op_is_refused_rather_than_answered_wrongly() {
+        // Capability assert: this corpus tests what it claims only if the
+        // two keys genuinely hash apart. A hashing change must fail HERE,
+        // naming the reason, instead of quietly turning the test into a
+        // tautology that passes because nothing is cross-slot any more.
+        assert_ne!(
+            slot_for_key(b"alpha"),
+            slot_for_key(b"beta"),
+            "stale corpus: these keys no longer land in different slots, \
+             so this test would pass without exercising the refusal"
+        );
+
+        let s = MemKv::new();
+        call(&s, &[b"SADD", b"alpha", b"x", b"y"]);
+        call(&s, &[b"SADD", b"beta", b"y", b"z"]);
+
+        for op in [&b"SINTER"[..], b"SUNION", b"SDIFF"] {
+            let name = String::from_utf8_lossy(op).into_owned();
+            match call(&s, &[op, b"alpha", b"beta"]) {
+                Value::Error(e) => {
+                    assert!(
+                        e.starts_with("CROSSSLOT"),
+                        "{name}: the refusal must carry the CROSSSLOT code clients \
+                         already know from Redis Cluster, got: {e}"
+                    );
+                    // An operator reading this should not have to compute
+                    // slots by hand to find out which keys collided.
+                    assert!(
+                        e.contains("alpha") && e.contains("beta"),
+                        "{name}: the error must name both offending keys, got: {e}"
+                    );
+                }
+                other => panic!(
+                    "{name}: a cross-slot request must be refused, not answered — got {other:?}"
+                ),
+            }
+        }
+    }
+
+    /// The positive control for the refusal above.
+    ///
+    /// Without it, a build in which the set operations were broken outright
+    /// — always erroring, never dispatching — would still pass the
+    /// cross-slot test. This proves the same members under ONE hash tag are
+    /// answered, and answered correctly, so the refusal is discriminating
+    /// between slots rather than failing everything.
+    #[test]
+    fn the_same_members_under_one_hash_tag_are_answered() {
+        // The error tells users to colocate with a hash tag. If that advice
+        // ever stops working, this fails before the assertions below.
+        assert_eq!(
+            slot_for_key(b"{s}alpha"),
+            slot_for_key(b"{s}beta"),
+            "the hash tag the CROSSSLOT error recommends no longer colocates keys"
+        );
+
+        let s = MemKv::new();
+        call(&s, &[b"SADD", b"{s}alpha", b"x", b"y"]);
+        call(&s, &[b"SADD", b"{s}beta", b"y", b"z"]);
+
+        assert_eq!(
+            members(call(&s, &[b"SINTER", b"{s}alpha", b"{s}beta"])),
+            vec![b"y".to_vec()]
+        );
+        assert_eq!(
+            members(call(&s, &[b"SUNION", b"{s}alpha", b"{s}beta"])),
+            vec![b"x".to_vec(), b"y".to_vec(), b"z".to_vec()]
+        );
+        assert_eq!(
+            members(call(&s, &[b"SDIFF", b"{s}alpha", b"{s}beta"])),
+            vec![b"x".to_vec()]
+        );
+    }
+
+    /// The empty set is the answer a broken cross-slot path would forge, so
+    /// assert the node can still produce it legitimately. A refusal that
+    /// swallowed every empty intersection would be its own bug.
+    #[test]
+    fn a_genuinely_empty_intersection_is_still_an_empty_set() {
+        let s = MemKv::new();
+        call(&s, &[b"SADD", b"{s}alpha", b"x"]);
+        call(&s, &[b"SADD", b"{s}beta", b"z"]);
+        assert_eq!(
+            members(call(&s, &[b"SINTER", b"{s}alpha", b"{s}beta"])),
+            Vec::<Vec<u8>>::new()
+        );
     }
 }
