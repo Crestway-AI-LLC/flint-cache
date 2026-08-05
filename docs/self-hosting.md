@@ -122,6 +122,7 @@ journal events (`DiskShed`/`DiskResumed`), so tooling can trigger on the
 edge instead of polling; if you run your own space-reclaim daemon, rank
 candidates with `FLINTKEYSIZE`/`FLINTKEYSTAMP` (see command-support.md)
 and remember the delete path stays open while writes shed.
+space-reclaim.md is the full recipe for such a daemon.
 
 ## 2. Configuration files
 

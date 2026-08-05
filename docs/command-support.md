@@ -192,7 +192,8 @@ both O(1) reads of the metadata every write already maintains:
 Together they support least-recently-written and size-weighted policies
 without the server tracking read recency (which would turn every read
 into a write — the wrong trade under the disk pressure that makes anyone
-reach for these).
+reach for these). space-reclaim.md is the end-to-end guide for building
+a cleanup daemon on them.
 
 ## Protocols: RESP2 and RESP3
 

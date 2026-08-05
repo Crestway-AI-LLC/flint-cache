@@ -125,7 +125,11 @@ Instead, pressure is handled by refusal, in layers:
 The operational consequence: size for the working set and use TTLs. A
 cache that is full of unexpired data does not silently shed someone
 else's keys to make room for yours — it tells you, and keeps serving
-reads while you decide.
+reads while you decide. If you want an eviction-shaped policy anyway,
+build it client-side: [docs/space-reclaim.md](docs/space-reclaim.md) is
+the watch → rank → delete → verify loop, on primitives
+(`FLINTKEYSIZE`/`FLINTKEYSTAMP`, disk-guard journal events) the server
+maintains for exactly that.
 
 [docs/security.md](docs/security.md) is the security posture — mutual TLS
 everywhere internally, tokens stored as digests, and an explicit list of what
