@@ -279,8 +279,22 @@ await check('connect (default RESP3 + inline HELLO AUTH)', async () => {
   if (await c.ping() !== 'PONG') throw new Error('no pong');
 });
 await check('protocol really is RESP3', async () => {
+  // node-redis majors disagree about a map reply's spelling: 6 hands back
+  // a plain object, 5 an array of alternating field/value entries, and a
+  // Map is plausible under RESP3 options. Read proto out of whichever
+  // arrived — the check pins the SERVER's negotiated protocol, not the
+  // client major's decoding of it.
   const h = await c.sendCommand(['HELLO']);
-  if (h.proto !== 3) throw new Error(`proto ${h.proto}`);
+  let proto;
+  if (Array.isArray(h)) {
+    const i = h.findIndex((x) => String(x) === 'proto');
+    proto = i >= 0 ? Number(h[i + 1]) : undefined;
+  } else if (h instanceof Map) {
+    proto = Number(h.get('proto'));
+  } else if (h && typeof h === 'object') {
+    proto = Number(h.proto);
+  }
+  if (proto !== 3) throw new Error(`proto ${proto} (reply shape: ${h?.constructor?.name})`);
 });
 await check('set/get, nil is null', async () => {
   await c.set('nr:k', 'v');
