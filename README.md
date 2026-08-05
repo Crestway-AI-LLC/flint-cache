@@ -31,11 +31,15 @@ fast enough that you stop thinking about it.
    heat, absorbs hot reads in a bounded short-TTL near-cache at the edge,
    and offers an opt-in async write queue that soaks up write bursts on the
    hot path — while every write still lands in the WAL.
-4. **Large datasets at storage cost, without a latency sacrifice that your
-   users can feel.** A cache call already crosses the network: one cross-AZ
-   hop is ~500 µs–1 ms, an NVMe read ~100 µs. End to end, the network dwarfs
-   the medium, so RAM's microseconds are invisible — while holding 10× the
-   data at NVMe prices is very visible in the bill and in the miss rate.
+4. **Large datasets at storage cost, without a latency sacrifice your users
+   can feel.** A cache call is a network call, and in practice two of them:
+   client → proxy, then proxy → cache node. Each hop costs hundreds of
+   microseconds (a cross-AZ round trip is ~500 µs–1 ms), and a RAM cache
+   behind a proxy crosses the same wires — so both designs pay that part
+   identically. The only difference is the last step inside the node, a RAM
+   lookup versus an NVMe read: 50–175 µs in our own measurements, a rounding
+   error against two hops. Holding 10× the data at NVMe prices is not a
+   rounding error — it shows up in the bill and in the miss rate.
 5. **Built to be operated by an agent.** From the first commit, every drill,
    failure claim, and operational lesson is captured in a form software can
    act on — runnable drills in this repo, journaled actions, allowlisted
