@@ -34,8 +34,8 @@ Retyping the list is how a step silently leaves the gate.
     cargo fmt --all --check
     cargo clippy --workspace --all-targets -- -D warnings
     cargo test --workspace
-    cargo clippy --workspace --all-targets --features flint-server/rocks -- -D warnings
-    cargo test --workspace --features flint-server/rocks
+    cargo clippy --workspace --all-targets --features flint-server/rocks,flint-backup/rocks -- -D warnings
+    cargo test --workspace --features flint-server/rocks,flint-backup/rocks
 
 ## 2. Conformance — three targets, all 100%
 

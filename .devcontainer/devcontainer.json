@@ -20,7 +20,7 @@
     "vscode": {
       "extensions": ["rust-lang.rust-analyzer", "tamasfe.even-better-toml"],
       "settings": {
-        "rust-analyzer.cargo.features": ["flint-server/rocks"]
+        "rust-analyzer.cargo.features": ["flint-server/rocks", "flint-backup/rocks"]
       }
     }
   },

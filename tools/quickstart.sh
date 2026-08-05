@@ -88,7 +88,7 @@ preflight() {
 build() {
   [ -n "${FLINT_BINS:-}" ] && return 0
   say "building (first run compiles RocksDB — expect ~10 minutes and a couple of GB in target/)"
-  if ! cargo build --release --features flint-server/rocks; then
+  if ! cargo build --release --features flint-server/rocks,flint-backup/rocks; then
     die "the build failed. If it stopped inside the rocksdb or bindgen crate, the usual cause is a
       missing libclang:
       Debian/Ubuntu:  sudo apt-get install build-essential clang libclang-dev
