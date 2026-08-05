@@ -1,6 +1,6 @@
 # Flint architecture
 
-Flint is a durable, disk-first cache that speaks the Redis protocol. This
+Flint is a persistent, disk-first cache that speaks the Redis protocol. This
 document is the system-level map: the planes, what owns what, and the exact
 path a normal write and a normal read take through the code in this
 repository.
@@ -47,7 +47,7 @@ flowchart LR
   durable state and any proxy can serve any tenant.
 - **Consensus plane — `flint-controlplane` + `flint-controller`.** The
   control plane is the topology registry: pairs, slot ranges, tenants and
-  their token digests, quotas, opt-ins. It runs as a durable single node or
+  their token digests, quotas, opt-ins. It runs as a persistent single node or
   Raft-replicated for HA, and pushes snapshots to proxies on change
   (suppressing no-op pushes). The controller supervises pairs — probe,
   verify, promote, fence — using **epoch fencing**: every role carries a
@@ -119,7 +119,7 @@ Step by step:
 4. **The master's gates,** in order: role (a replica answers `-READONLY`),
    epoch/lease (a fenced ex-master refuses), slot ownership (a migrated
    slot answers `-MOVED`, mid-migration writes shed `-TRYAGAIN`), then the
-   durability-protection gates — if replication lag exceeds the soft cap
+   loss-protection gates — if replication lag exceeds the soft cap
    the write is *delayed*, past the hard cap it is *shed* with
    `-THROTTLED` (this is what makes the loss window a bound, not a hope),
    and `min-replicas-to-write` can require live replicas before accepting.

@@ -7,7 +7,7 @@ the code actually signs than one it does not.
 
 ## The short version
 
-Flint is a **cache with real durability**, not a system of record. It keeps
+Flint is a **persistent cache**, not a system of record. It keeps
 your working set on disk so it survives restarts and fails over in seconds,
 and it will lose a bounded amount of recently-acknowledged data when a master
 dies. If your data exists **only** in Flint and losing the last second of it

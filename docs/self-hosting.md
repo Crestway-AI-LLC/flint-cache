@@ -77,7 +77,7 @@ started.
 
 ## 1. Sizing — how many nodes
 
-A **pair** is the unit of durability: a master + a replica. A **cluster**
+A **pair** is the unit of redundancy: a master + a replica. A **cluster**
 is one control plane supervising some pairs behind a proxy tier.
 
 Per-node baseline (i4i.2xlarge-class, ~2 TB local NVMe, the benched

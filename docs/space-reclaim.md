@@ -4,7 +4,7 @@ Flint never evicts. An acked write stays until you delete it or its TTL
 passes — under disk pressure the node sheds *new* writes early and keeps
 serving reads and deletes, but it will not silently pick a victim for
 you. (README, "What happens when the disk fills", explains why: eviction
-breaks the durability an acked write promises, and LRU bookkeeping turns
+breaks the promise an acked write makes, and LRU bookkeeping turns
 every read into a write at exactly the moment the disk can least afford
 it.)
 

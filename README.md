@@ -1,6 +1,6 @@
 # Flint
 
-**A durable, disk-first cache that speaks Redis.** Flint keeps your working
+**A persistent, disk-first cache that speaks Redis.** Flint keeps your working
 set on local NVMe (RocksDB, Kvrocks-style encoding) instead of holding it
 hostage in RAM — so it survives restarts, replicates with a bounded loss
 window, fails over in seconds, and costs storage economics instead of memory
@@ -62,13 +62,13 @@ Everything needed to run AND operate Flint yourself:
   per-tenant latency histograms.
 - **`flint-controlplane`** — the topology registry: pairs, slot ranges,
   tenants and their (hashed-at-rest) tokens, quotas, opt-ins; pushes
-  versioned snapshots to proxies; runs durable single-node or Raft-replicated
+  versioned snapshots to proxies; runs persistent single-node or Raft-replicated
   (openraft) for HA; self-service token rotation with dual-version windows.
 - **`flint-ctl`** — cluster lifecycle from one inventory file: bootstrap
   (with full mTLS cert minting), expand, add-replica, swap-node, graceful
   failover, decommission-node, tenant management, canary upgrades,
   rotate-certs / rotate-admin, and hot config reload (edit the inventory,
-  `reload` pushes durability/RPO/admission knobs to the running fleet — no
+  `reload` pushes persistence/RPO/admission knobs to the running fleet — no
   restart).
 - **`flint-controller`** — automatic failover: detect → verify → promote →
   fence, with leases so a partitioned master self-demotes.
@@ -104,9 +104,11 @@ Everything needed to run AND operate Flint yourself:
   (both dialects), slot hashing, the shared read/write command classifier,
   and the typed fleet event log.
 
-## What "durable" means here, precisely
+## What "persistent" means here, precisely
 
-Flint is a **cache with real durability, not a system of record.** It survives
+Flint is a **persistent cache, not a system of record** — and deliberately
+not "durable" in the storage-engineering sense of that word, where it
+promises an acknowledged write survives any crash. Flint survives
 restarts, fails over in seconds, and it *will* lose a bounded amount of
 recently-acknowledged data when a master dies — because replication is
 asynchronous and the WAL is fsynced on a bounded cadence.
@@ -221,7 +223,7 @@ pieces.
 ```sh
 cargo build --release --features flint-server/rocks,flint-backup/rocks
 
-# One durable node
+# One persistent node
 ./target/release/flint-server --port 6400 --engine rocks --data-dir ./data
 
 # Talk to it with any Redis client
