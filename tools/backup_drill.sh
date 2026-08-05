@@ -28,7 +28,7 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init /tmp/flint-bkp 6950 6951 6952 6953
+fleet_init /tmp/flint-bkp 6950 6951 6952 6953 6954
 fleet_guard
 B=./target/release/flint-server
 BK=./target/release/flint-backup
@@ -73,6 +73,16 @@ for _ in $(seq 1 40); do
   [ "$(valkey-cli -p 6951 FLINTINFO | tr -d '\r' | grep '^role:' | cut -d: -f2)" = "master" ] && break
   sleep 0.2
 done
+
+echo
+echo "== plant a MIGRATION row for the scrub to find: freeze one slot on pair 0"
+# {frz}probe hashes to a fixed slot; learn it from the heat counter the same
+# way txn_failure does (heat leads with an uptime_ms row, hence the filter).
+valkey-cli -p 6951 SET '{bkfrz}probe' seed >/dev/null
+FSLOT=$(valkey-cli -p 6951 FLINTSLOTHEAT | tr -d '\r' | awk '$1 ~ /^[0-9]+$/ {print $1; exit}')
+valkey-cli -p 6951 FLINTSLOTFREEZE "$FSLOT" 127.0.0.1:6999 | tr -d '\r'
+ONE=$(valkey-cli -p 6951 SET '{bkfrz}later' x 2>&1)
+case "$ONE" in TRYAGAIN*) echo "  slot $FSLOT frozen (writes shed)";; *) echo "FAIL: freeze did not take: $ONE"; exit 1;; esac
 
 echo
 echo "== a stand-in control plane state file, and a controller snapshot root"
@@ -156,4 +166,59 @@ grep -q 'not listed' "$D/extra.out" || { echo "FAIL: refusal did not name the un
 echo "  $(head -1 "$D/extra.out")"
 
 echo
-echo "PASS: a set is produced from the live masters, cleans up after itself, and refuses corruption in both directions"
+echo "== 7. RESTORE refuses an existing destination (D3: only ever creates)"
+mkdir -p "$D/occupied"
+if $BK restore --from "$D/sets/$SET" --into "$D/occupied" >"$D/occ.out" 2>&1; then
+  echo "FAIL: restore wrote into an existing directory"; exit 1
+fi
+grep -q 'only ever creates' "$D/occ.out" || { echo "FAIL: refusal did not cite D3"; cat "$D/occ.out"; exit 1; }
+echo "  refused, citing D3"
+
+echo
+echo "== 8. destroy the fleet, restore, and boot from the copy"
+fleet_kill server; sleep 0.4
+$BK restore --from "$D/sets/$SET" --into "$D/restored" | sed 's/^/  /' || { echo "FAIL: restore refused an intact set"; exit 1; }
+grep -q 'pair0' <<<"$(ls "$D/restored")" || { echo "FAIL: no pair0 in the restore"; exit 1; }
+[ -f "$D/restored/cp-state" ] || { echo "FAIL: cp-state missing from the restore"; exit 1; }
+
+$B --port 6954 --engine rocks --data-dir "$D/restored/pair0" 2>"$D/n6954.log" &
+disown
+fleet_wait_listen 6954
+for _ in $(seq 1 40); do [ "$(valkey-cli -p 6954 PING 2>/dev/null)" = "PONG" ] && break; sleep 0.2; done
+
+echo
+echo "== 9. the data survived and the SYSTEM ROWS did not (D4)"
+V=$(valkey-cli -p 6954 GET bk:6950:0001)
+[ "$V" = "v-6950-0001" ] || { echo "FAIL: corpus key missing after restore: '$V'"; exit 1; }
+N=$(valkey-cli -p 6954 DBSIZE)
+echo "  corpus present ($N keys)"
+# The scrub is asserted by reading the system rows DIRECTLY, on the pair
+# that was never booted (ADR-0011 verification item 2). NOT via the boot
+# log, and not on the booted pair: every boot on a role-less dir writes
+# role (0,1) and the default claim first, then reads its own writes back
+# and announces "booting as MASTER from durable role" — so both the boot
+# log and a post-boot row scan say the same thing on a scrubbed dir and an
+# unscrubbed one. An assertion on the boot log cost this drill two false
+# failures before that was understood.
+INSPECT=$($BK inspect --data-dir "$D/restored/pair1" 2>&1)
+[ "$INSPECT" = "none — no system rows" ] || {
+  echo "FAIL: system rows survived the scrub on the unbooted pair:"; echo "$INSPECT"; exit 1; }
+echo "  pair1 (never booted): no system rows"
+# Migration row scrubbed, asserted behaviorally on the booted pair: the
+# slot frozen before the backup must accept writes on the restored copy. A
+# carried-forward Migrating row would shed this with TRYAGAIN toward a
+# peer that does not exist here.
+W=$(valkey-cli -p 6954 SET '{bkfrz}after-restore' ok)
+[ "$W" = "OK" ] || { echo "FAIL: the frozen slot is still frozen after restore: $W"; exit 1; }
+echo "  migration row: gone (the frozen slot accepts writes)"
+# And the booted pair runs on a FRESH epoch line, not the source's: the
+# source was promoted to (1,1) before the backup, so a resumed lineage
+# would report generation >= 1.
+EP=$(valkey-cli -p 6954 FLINTINFO | tr -d '\r' | grep '^role_epoch:' | cut -d: -f2)
+case "$EP" in
+  "(0,1)") echo "  epoch: fresh line $EP (the source was at (1,1))";;
+  *) echo "FAIL: restored node reports epoch $EP — it resumed the source's lineage"; exit 1;;
+esac
+
+echo
+echo "PASS: a set is produced from the live masters, cleans up after itself, refuses corruption in both directions, and restores into a fresh directory with the system rows scrubbed"

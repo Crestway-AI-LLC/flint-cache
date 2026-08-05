@@ -124,13 +124,16 @@ fn main() {
     match args.get(1).map(String::as_str) {
         Some("run") => run(),
         Some("verify") => verify(),
+        Some("restore") => restore(),
+        Some("inspect") => inspect(),
         Some("--build-version") => println!("{}", flint_build::version(env!("CARGO_PKG_VERSION"))),
         _ => {
             eprintln!(
                 "usage:\n  \
-                 flint-backup run    --pairs <a,b;c,d> --cp-state <path> --to <dir> \
+                 flint-backup run     --pairs <a,b;c,d> --cp-state <path> --to <dir> \
                  [--tls <certs-dir>] [--snap-root <dir>]\n  \
-                 flint-backup verify --from <dir>"
+                 flint-backup verify  --from <dir>\n  \
+                 flint-backup restore --from <dir> --into <dir>"
             );
             std::process::exit(2)
         }
@@ -151,6 +154,207 @@ fn verify() {
         // without parsing prose.
         Err(e) => die(&e.to_string()),
     }
+}
+
+/// Restore a verified set into a directory that does not exist yet.
+///
+/// D3: restore only ever CREATES. `--into` must be absent; each pair's
+/// checkpoint materialises under `<into>/pair<i>` and the control plane's
+/// state file lands beside them. Nothing that is currently serving is
+/// touched, so a bug here cannot damage a live cluster.
+///
+/// D4: the system rows are SCRUBBED before any node ever opens the copy.
+/// A checkpoint carries the source's manifest rows in the Kv — role,
+/// claims, migrations — so a naive restore produces a node that durably
+/// believes it is master at the source's epoch: the exact ingredient for
+/// the split-brain that epoch fencing exists to prevent. Role is cleared
+/// (the restored node starts on a fresh epoch line), claims are dropped
+/// (the restored CP registry is the authority they are re-derived from),
+/// and migration rows are dropped because they reference a peer that does
+/// not exist in the new cluster.
+#[cfg(feature = "rocks")]
+fn restore() {
+    use flint_storage::Kv;
+    let from = arg("--from").unwrap_or_else(|| die("restore needs --from <dir>"));
+    let into = arg("--into").unwrap_or_else(|| die("restore needs --into <dir>"));
+    let dest = Path::new(&into);
+    if dest.exists() {
+        die(&format!(
+            "{into} already exists — restore only ever creates (ADR-0011 D3); \
+             point --into at a path that does not exist"
+        ));
+    }
+    let store = LocalDir::new(&from);
+    // Verification is not separable from restore: the one entry point both
+    // loads and checks, so a corrupt or tampered set is refused before a
+    // single byte lands in the destination.
+    let (manifest, report) = match flint_backup::load_verified(&store) {
+        Ok(v) => v,
+        Err(e) => die(&e.to_string()),
+    };
+    println!(
+        "set {} verified: {} objects, {} bytes",
+        report.id, report.objects, report.bytes
+    );
+
+    for pair in &manifest.pairs {
+        let pair_dir = dest.join(format!("pair{}", pair.index));
+        std::fs::create_dir_all(&pair_dir)
+            .unwrap_or_else(|e| die(&format!("create {}: {e}", pair_dir.display())));
+        let prefix = format!("pairs/{}/", pair.index);
+        for obj in manifest
+            .objects
+            .iter()
+            .filter(|o| o.key.starts_with(&prefix))
+        {
+            let name = &obj.key[prefix.len()..];
+            let mut r = store
+                .open(&obj.key)
+                .unwrap_or_else(|e| die(&format!("open {}: {e}", obj.key)));
+            let mut f = std::fs::File::create(pair_dir.join(name))
+                .unwrap_or_else(|e| die(&format!("create {name}: {e}")));
+            std::io::copy(&mut r, &mut f).unwrap_or_else(|e| die(&format!("copy {name}: {e}")));
+        }
+
+        // The D4 scrub, counted so the report is evidence rather than a
+        // claim: "scrubbed nothing" on a checkpoint cut from a live master
+        // would mean the scan missed the rows, not that they were absent —
+        // every master has a role row.
+        let kv = flint_storage::rocks::RocksKv::open(&pair_dir)
+            .unwrap_or_else(|e| die(&format!("open restored pair {}: {e}", pair.index)));
+        let mut doomed: Vec<Vec<u8>> = Vec::new();
+        kv.for_each_prefix(b"\x00flint\x00", &mut |k, _| {
+            doomed.push(k.to_vec());
+            true
+        });
+        let mut roles = 0u32;
+        let mut claims = 0u32;
+        let mut migrations = 0u32;
+        let mut cursors = 0u32;
+        for k in &doomed {
+            if k.as_slice() == flint_storage::manifest::ROLE_KEY {
+                roles += 1;
+            } else if k.starts_with(flint_storage::manifest::CLAIM_KEY_PREFIX) {
+                claims += 1;
+            } else if k.starts_with(flint_storage::manifest::MIGRATION_KEY_PREFIX) {
+                migrations += 1;
+            } else if k.as_slice() == flint_storage::repl::REPL_STATE_KEY {
+                // The replication cursor: a position in the SOURCE master's
+                // WAL. That lineage does not exist in the restored cluster,
+                // so a carried cursor describes a stream nobody can serve —
+                // dropped for the same reason the migration rows are.
+                // (Found by this scrub's own fail-closed arm on the first
+                // real checkpoint, not by reading the code.)
+                cursors += 1;
+            } else {
+                // A system row this build does not recognise gets the same
+                // treatment an unknown manifest key gets: refusal. Carrying
+                // it forward restores state with a meaning nobody checked.
+                die(&format!(
+                    "restored pair {} holds a system row this build does not know: {:?} — \
+                     refusing to carry it into a new cluster",
+                    pair.index,
+                    String::from_utf8_lossy(k)
+                ));
+            }
+            kv.delete(k);
+        }
+        // Deletes must be DURABLE before this process reports success: the
+        // node that opens this dir next trusts the scrub already happened.
+        kv.flush_checked()
+            .unwrap_or_else(|e| die(&format!("pair {}: scrub flush failed: {e}", pair.index)));
+        if roles == 0 {
+            die(&format!(
+                "pair {} had no role row to scrub — the checkpoint was not cut on a \
+                 serving master, or the scan is broken; either way this set is not \
+                 what the manifest says it is",
+                pair.index
+            ));
+        }
+        // Trust nothing, including this process: drop the handle, reopen the
+        // directory cold, and prove the rows are gone THERE. The scrub was
+        // once observed reporting success while the role row survived a
+        // reopen — nondeterministically — and a scrub that is wrong is not
+        // a degraded restore, it is the split-brain ingredient D4 exists to
+        // remove. The reopen is the only observer position equivalent to
+        // the node that boots on this directory next.
+        drop(kv);
+        let kv = flint_storage::rocks::RocksKv::open(&pair_dir)
+            .unwrap_or_else(|e| die(&format!("reopen restored pair {}: {e}", pair.index)));
+        let mut survivors = Vec::new();
+        kv.for_each_prefix(b"\x00flint\x00", &mut |k, _| {
+            survivors.push(String::from_utf8_lossy(k).escape_debug().to_string());
+            true
+        });
+        if !survivors.is_empty() {
+            die(&format!(
+                "pair {}: system rows SURVIVED the scrub across a reopen: {} —                  the restore is not safe to boot; nothing further was written",
+                pair.index,
+                survivors.join(", ")
+            ));
+        }
+        println!(
+            "pair {} restored from {} (epoch {} at seq {}): scrubbed {} role, {} claim(s), {} migration(s), {} repl cursor(s) — verified gone across a reopen",
+            pair.index, pair.master, pair.epoch, pair.seq, roles, claims, migrations, cursors
+        );
+    }
+
+    // The CP state file: pairs, ranges, tenants, tokens, quotas. Placed for
+    // the operator to hand to `flintctl bootstrap`; restore does not start
+    // anything.
+    let mut r = store
+        .open("cp-state")
+        .unwrap_or_else(|e| die(&format!("open cp-state: {e}")));
+    let mut f = std::fs::File::create(dest.join("cp-state"))
+        .unwrap_or_else(|e| die(&format!("create cp-state: {e}")));
+    std::io::copy(&mut r, &mut f).unwrap_or_else(|e| die(&format!("copy cp-state: {e}")));
+
+    println!(
+        "OK restored {} into {into} — {} pair(s) + cp-state, system rows scrubbed; \
+         nothing was started, and the restored cluster must mint its own CA",
+        manifest.id,
+        manifest.pairs.len()
+    );
+}
+
+#[cfg(not(feature = "rocks"))]
+fn restore() {
+    die("restore requires a build with --features rocks (the D4 scrub opens the engine)");
+}
+
+/// List a data dir's system rows — ADR-0011's verification item 2 made a
+/// command. "The scrub is asserted, not assumed": a drill checking only
+/// user keys would pass with the split-brain hazard fully intact, so this
+/// reads the rows the scrub is about, directly, with no server in between.
+/// Exit 0 and `none` on a clean dir; exit 1 with one line per surviving row
+/// otherwise, so a drill can branch on the status.
+#[cfg(feature = "rocks")]
+fn inspect() {
+    use flint_storage::Kv;
+    let dir = arg("--data-dir").unwrap_or_else(|| die("inspect needs --data-dir <dir>"));
+    let kv = flint_storage::rocks::RocksKv::open(Path::new(&dir))
+        .unwrap_or_else(|e| die(&format!("open {dir}: {e}")));
+    let mut rows = Vec::new();
+    kv.for_each_prefix(b"\x00flint\x00", &mut |k, v| {
+        rows.push((k.to_vec(), v.len()));
+        true
+    });
+    if rows.is_empty() {
+        println!("none — no system rows");
+        return;
+    }
+    for (k, len) in &rows {
+        println!(
+            "{} ({len} bytes)",
+            String::from_utf8_lossy(k).escape_debug()
+        );
+    }
+    std::process::exit(1)
+}
+
+#[cfg(not(feature = "rocks"))]
+fn inspect() {
+    die("inspect requires a build with --features rocks");
 }
 
 fn run() {

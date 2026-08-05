@@ -118,15 +118,15 @@ if want check; then
   step "clippy (mem)" clippy-mem \
     cargo clippy --workspace --all-targets -- -D warnings
   step "clippy (rocks)" clippy-rocks \
-    cargo clippy --workspace --all-targets --features flint-server/rocks -- -D warnings
+    cargo clippy --workspace --all-targets --features flint-server/rocks,flint-backup/rocks -- -D warnings
   step "test (mem)" test-mem cargo test --workspace
-  step "test (rocks)" test-rocks cargo test --workspace --features flint-server/rocks
+  step "test (rocks)" test-rocks cargo test --workspace --features flint-server/rocks,flint-backup/rocks
 fi
 
 if want conformance || want drills || want chaos; then
   echo "== building the release binaries the drills run"
   step "build" build \
-    cargo build --release --workspace --features flint-server/rocks
+    cargo build --release --workspace --features flint-server/rocks,flint-backup/rocks
   # Execute the freshly linked flint-server ONCE, before any drill times it.
   #
   # Not superstition: the first exec of a just-written binary pays for

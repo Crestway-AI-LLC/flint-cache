@@ -198,6 +198,16 @@ impl RocksKv {
     pub fn flush(&self) {
         let _ = self.db.flush();
     }
+
+    /// Flush, and say whether it worked. The `flush()` above discards the
+    /// error, which is tolerable for its callers (tests forcing determinism,
+    /// where a failed flush surfaces as a failed assertion one line later)
+    /// and not for a caller whose CORRECTNESS is the flush — the restore
+    /// scrub reports "system rows scrubbed" on the strength of it, and a
+    /// swallowed error there turns into a split-brain hazard that boots.
+    pub fn flush_checked(&self) -> Result<(), rocksdb::Error> {
+        self.db.flush()
+    }
 }
 
 impl Kv for RocksKv {

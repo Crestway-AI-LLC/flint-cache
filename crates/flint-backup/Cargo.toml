@@ -23,3 +23,9 @@ flint-tls = { path = "../flint-tls" }
 # reads a set — a restore, a test — links no RESP client and no build stamp.
 flint-resp = { path = "../flint-resp" }
 flint-build = { path = "../flint-build" }
+# restore only (feature `rocks`, mirroring flint-server): the D4 scrub opens
+# the restored checkpoint to rewrite system rows, which needs the engine.
+flint-storage = { path = "../flint-storage", optional = true }
+
+[features]
+rocks = ["dep:flint-storage", "flint-storage/rocksdb"]
