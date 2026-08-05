@@ -1737,6 +1737,15 @@ fn data_command(
                     topo.cache.invalidate(ns, k);
                 }
             }
+            // RENAME / RENAMENX: BOTH keys change — the source ceases to
+            // exist and the destination takes its value. Dropping only one
+            // leaves the other answering from before the rename, so a
+            // cached source would resurrect a key that is now gone.
+            b"RENAME" | b"RENAMENX" => {
+                for k in args[1..].iter().take(2) {
+                    topo.cache.invalidate(ns, k);
+                }
+            }
             b"FLUSHALL" => topo.cache.invalidate_ns(ns),
             _ => {
                 if let Some(k) = args.get(1) {

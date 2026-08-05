@@ -13,6 +13,18 @@ use crate::encoding::{
 };
 use crate::strings::Clock;
 
+/// What a RENAME / RENAMENX did. Three outcomes rather than a bool because
+/// the two commands report the same three states differently: a missing
+/// source is an ERROR for both, while a taken destination is invisible to
+/// RENAME (it overwrites) and is the whole answer for RENAMENX.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RenameOutcome {
+    Renamed,
+    /// NX only: the destination was already taken, so nothing moved.
+    DestinationExists,
+    NoSuchKey,
+}
+
 /// TTL query result, Redis-shaped.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Ttl {
@@ -149,6 +161,43 @@ impl<'a> Keyspace<'a> {
                 true
             }
         }
+    }
+
+    /// RENAME / RENAMENX within one slot. Returns whether the source
+    /// existed at all, and — for the NX form — whether the rename happened.
+    ///
+    /// NOT O(1), unlike upstream, and that is a consequence of the encoding
+    /// rather than an oversight: a collection's subkey rows embed the user
+    /// key, so there is no pointer to re-aim. Renaming a large collection
+    /// costs the same as copying it. Documented in command-support.md so the
+    /// difference is not discovered under load.
+    ///
+    /// Renaming a key onto ITSELF is a success that must do nothing. Routed
+    /// through the copy path it would be destructive — the REPLACE step
+    /// retires the destination, which here is also the source.
+    pub fn rename(&self, slot: u16, src: &[u8], dst: &[u8], nx: bool) -> RenameOutcome {
+        if !self.exists(slot, src) {
+            return RenameOutcome::NoSuchKey;
+        }
+        if src == dst {
+            // NX asks whether the destination is free; onto itself it never
+            // is, which is why the two forms answer differently here.
+            return if nx {
+                RenameOutcome::DestinationExists
+            } else {
+                RenameOutcome::Renamed
+            };
+        }
+        if nx && self.exists(slot, dst) {
+            return RenameOutcome::DestinationExists;
+        }
+        if !self.copy(slot, src, dst, true) {
+            // Unreachable given the liveness check above; treated as a
+            // failure rather than reported as a rename that did not happen.
+            return RenameOutcome::NoSuchKey;
+        }
+        self.del(slot, src);
+        RenameOutcome::Renamed
     }
 
     /// Re-write every row under `from` to the same suffix under `to`.

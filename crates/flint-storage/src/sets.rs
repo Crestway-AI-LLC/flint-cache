@@ -63,6 +63,26 @@ impl<'a> SetStore<'a> {
             .map(Some)
     }
 
+    /// The destination side of SINTERSTORE / SUNIONSTORE / SDIFFSTORE:
+    /// replace `key` wholesale with `members`, returning the cardinality.
+    ///
+    /// Mirrors ZSetStore::zreplace, and for the same reasons: the old key
+    /// goes whatever its type, because the destination is overwritten rather
+    /// than merged and need not have been a set; and an EMPTY result removes
+    /// the key instead of leaving an empty set that would answer EXISTS 1
+    /// and TYPE set with nothing in it.
+    pub fn sreplace(&self, slot: u16, key: &[u8], members: &[Vec<u8>]) -> Result<u64, StoreError> {
+        self.kv.delete(&self.meta_key(slot, key));
+        if members.is_empty() {
+            return Ok(0);
+        }
+        self.sadd(slot, key, members)?;
+        // Read the cardinality back rather than trusting members.len():
+        // sadd folds duplicates, so the two agree only while the caller's
+        // input is distinct. This is a metadata field, so it is O(1).
+        self.scard(slot, key)
+    }
+
     pub fn sadd(&self, slot: u16, key: &[u8], members: &[Vec<u8>]) -> Result<u64, StoreError> {
         let mut meta = match self.read_meta(slot, key)? {
             Some(m) => m,
@@ -160,12 +180,12 @@ impl<'a> SetStore<'a> {
     /// SINTER / SUNION / SDIFF over keys the CALLER has already established
     /// live in one slot.
     ///
-    /// Slot agreement is the proxy's job, not this layer's: the proxy owns
-    /// routing and is the only component that can reject a cross-slot request
-    /// before it reaches a node that holds only some of the keys. A node
-    /// asked for a key it does not own would return an empty set, and an
-    /// intersection against a phantom empty set is silently wrong rather than
-    /// loudly refused — so the assertion lives where it can be enforced.
+    /// Slot agreement is the COMMAND layer's job, not this layer's. It is
+    /// emphatically not the proxy's: the proxy routes multi-key commands by
+    /// their first key and never inspects the rest, so a cross-slot request
+    /// reaches a node intact. The node refuses it there, because a key it
+    /// does not own reads as an empty set and an intersection against a
+    /// phantom empty set is silently wrong rather than loudly refused.
     ///
     /// Order is Redis's: the first key seeds the accumulator and the rest
     /// fold into it. Membership is a set, so results are unordered — the

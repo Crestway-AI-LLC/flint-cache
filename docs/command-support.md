@@ -30,7 +30,7 @@ FLUSHALL (both scoped to the tenant namespace).
 
 **Keyspace**: DEL, UNLINK, EXISTS, TYPE, EXPIRE, PEXPIRE, EXPIREAT,
 PEXPIREAT, TTL, PTTL, EXPIRETIME, PEXPIRETIME, PERSIST, COPY (REPLACE,
-DB 0).
+DB 0), RENAME, RENAMENX.
 
 > COPY is **same-slot only**, for the same reason as the set operations: the
 > destination is written into the node's local rows, so a destination in a
@@ -42,6 +42,13 @@ DB 0).
 > database, so index 0 names the one the client is already in; any other
 > index is refused rather than quietly redirected into database 0. This is a
 > deliberate divergence from a stock Valkey, which has sixteen.
+>
+> RENAME / RENAMENX are same-slot too, and both are **O(size) for
+> collections, where upstream is O(1)** — a difference in cost, not in
+> behaviour, and one worth knowing before renaming a large key on a hot
+> path. Flint's subkey rows embed the user key, so there is no pointer to
+> re-aim: renaming a collection costs what copying it costs. Strings and
+> JSON documents are O(1), since their metadata row *is* the value.
 
 **JSON documents**: JSON.SET (NX, XX), JSON.GET, JSON.DEL / JSON.FORGET,
 JSON.TYPE, JSON.NUMINCRBY, JSON.ARRAPPEND, JSON.ARRLEN.
@@ -59,16 +66,20 @@ INCRBYFLOAT.
 HINCRBY, HSTRLEN, HSCAN (MATCH, COUNT, NOVALUES).
 
 **Sets**: SADD, SREM, SISMEMBER, SMISMEMBER, SMEMBERS, SCARD, SPOP,
-SRANDMEMBER, SSCAN (MATCH, COUNT), SINTER, SUNION, SDIFF.
+SRANDMEMBER, SSCAN (MATCH, COUNT), SINTER, SUNION, SDIFF,
+SINTERSTORE, SUNIONSTORE, SDIFFSTORE.
 
 > SINTER / SUNION / SDIFF are **same-slot only**, exactly as in Redis
 > Cluster: colocate the keys with a hash tag (`SINTER {u1}:a {u1}:b`) or the
 > request is refused with `CROSSSLOT`. Refused rather than answered, because
 > a key the node does not own reads as an empty set and an intersection
-> against a phantom empty set is silently wrong. The set `STORE` variants
-> (SINTERSTORE, SUNIONSTORE, SDIFFSTORE) are **not implemented yet** —
-> nothing about them is ruled out, they simply have not been written; the
-> sorted-set ones, ZUNIONSTORE and ZINTERSTORE, are supported.
+> against a phantom empty set is silently wrong. SINTERSTORE, SUNIONSTORE
+> and SDIFFSTORE follow the same rule, extended to the destination they
+> write.
+>
+> A sorted set is **not** a legal input to the set commands, even though
+> ZUNIONSTORE accepts a plain set at score 1. That asymmetry is upstream's,
+> not ours.
 
 **Lists**: LPUSH, RPUSH, LPOP, RPOP, LLEN, LRANGE, LINDEX, LSET, LTRIM,
 LREM, LINSERT, LPOS (RANK, COUNT, MAXLEN).
@@ -76,7 +87,8 @@ LREM, LINSERT, LPOS (RANK, COUNT, MAXLEN).
 **Sorted sets**: ZADD, ZSCORE, ZMSCORE, ZINCRBY, ZREM, ZCARD, ZRANGE,
 ZREVRANGE, ZRANGEBYSCORE, ZREVRANGEBYSCORE (WITHSCORES, LIMIT, exclusive
 bounds, ±inf), ZRANGEBYLEX, ZREVRANGEBYLEX (LIMIT, exclusive bounds,
-`-`/`+`), ZRANK, ZREVRANK, ZCOUNT, ZPOPMIN, ZPOPMAX, ZREMRANGEBYSCORE,
+`-`/`+`), ZLEXCOUNT, ZREMRANGEBYLEX (exclusive bounds, `-`/`+`; no LIMIT,
+as upstream), ZRANK, ZREVRANK, ZCOUNT, ZPOPMIN, ZPOPMAX, ZREMRANGEBYSCORE,
 ZREMRANGEBYRANK, ZSCAN (MATCH, COUNT), ZUNIONSTORE, ZINTERSTORE (WEIGHTS,
 AGGREGATE SUM/MIN/MAX).
 

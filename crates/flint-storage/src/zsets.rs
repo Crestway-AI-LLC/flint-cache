@@ -426,6 +426,35 @@ impl<'a> ZSetStore<'a> {
         self.zcard(slot, key)
     }
 
+    /// ZLEXCOUNT: how many members the lex range covers.
+    ///
+    /// Deliberately the same walk as `zrange_by_lex` rather than a second
+    /// filter written to match it. A count that can disagree with the range
+    /// it claims to count is worse than no count at all, and the mixed-score
+    /// case is exactly where two implementations would drift apart.
+    pub fn zlexcount(
+        &self,
+        slot: u16,
+        key: &[u8],
+        min: &LexBound,
+        max: &LexBound,
+    ) -> Result<u64, StoreError> {
+        Ok(self.zrange_by_lex(slot, key, min, max, false, 0, -1)?.len() as u64)
+    }
+
+    /// ZREMRANGEBYLEX: drop every member the lex range covers, returning how
+    /// many went. Emptying the set removes the key, as zrem already does.
+    pub fn zremrangebylex(
+        &self,
+        slot: u16,
+        key: &[u8],
+        min: &LexBound,
+        max: &LexBound,
+    ) -> Result<u64, StoreError> {
+        let doomed = self.zrange_by_lex(slot, key, min, max, false, 0, -1)?;
+        self.zrem(slot, key, &doomed)
+    }
+
     /// ZCOUNT: members with score in [min,max].
     pub fn zcount(
         &self,

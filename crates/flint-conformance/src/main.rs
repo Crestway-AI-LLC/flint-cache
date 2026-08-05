@@ -806,6 +806,189 @@ fn corpus() -> Vec<Case> {
             ],
         },
         Case {
+            family: "sets",
+            name: "sinterstore sunionstore sdiffstore (same slot)",
+            steps: vec![
+                s(&[b"SADD", b"{ss}a", b"1", b"2", b"3"], Expect::Int(3)),
+                s(&[b"SADD", b"{ss}b", b"2", b"3", b"4"], Expect::Int(3)),
+                s(
+                    &[b"SINTERSTORE", b"{ss}i", b"{ss}a", b"{ss}b"],
+                    Expect::Int(2),
+                ),
+                s(
+                    &[b"SMEMBERS", b"{ss}i"],
+                    Expect::UnorderedStrs(vec![b"2", b"3"]),
+                ),
+                s(&[b"TYPE", b"{ss}i"], Expect::Simple("set")),
+                s(
+                    &[b"SUNIONSTORE", b"{ss}u", b"{ss}a", b"{ss}b"],
+                    Expect::Int(4),
+                ),
+                s(
+                    &[b"SMEMBERS", b"{ss}u"],
+                    Expect::UnorderedStrs(vec![b"1", b"2", b"3", b"4"]),
+                ),
+                s(
+                    &[b"SDIFFSTORE", b"{ss}d", b"{ss}a", b"{ss}b"],
+                    Expect::Int(1),
+                ),
+                s(&[b"SMEMBERS", b"{ss}d"], Expect::UnorderedStrs(vec![b"1"])),
+                // An empty result RETIRES the destination, so a pre-existing
+                // one is removed rather than left holding stale contents.
+                s(&[b"SET", b"{ss}pre", b"v"], Expect::Ok),
+                s(
+                    &[b"SINTERSTORE", b"{ss}pre", b"{ss}a", b"{ss}gone"],
+                    Expect::Int(0),
+                ),
+                s(&[b"EXISTS", b"{ss}pre"], Expect::Int(0)),
+                s(&[b"TYPE", b"{ss}pre"], Expect::Simple("none")),
+                // The destination is overwritten whatever it held.
+                s(&[b"SET", b"{ss}str", b"v"], Expect::Ok),
+                s(&[b"SUNIONSTORE", b"{ss}str", b"{ss}a"], Expect::Int(3)),
+                s(&[b"TYPE", b"{ss}str"], Expect::Simple("set")),
+                // The destination may BE a source.
+                s(
+                    &[b"SUNIONSTORE", b"{ss}a", b"{ss}a", b"{ss}b"],
+                    Expect::Int(4),
+                ),
+                s(
+                    &[b"SMEMBERS", b"{ss}a"],
+                    Expect::UnorderedStrs(vec![b"1", b"2", b"3", b"4"]),
+                ),
+                // A SORTED SET IS NOT A LEGAL INPUT HERE, even though
+                // ZUNIONSTORE accepts a plain set. The asymmetry is
+                // upstream's, and this is the assertion that pins it.
+                s(&[b"ZADD", b"{ss}z", b"1", b"m"], Expect::Int(1)),
+                s(&[b"SINTERSTORE", b"{ss}e", b"{ss}z"], Expect::AnyError),
+                s(&[b"RPUSH", b"{ss}L", b"x"], Expect::Int(1)),
+                s(&[b"SINTERSTORE", b"{ss}e", b"{ss}L"], Expect::AnyError),
+                s(&[b"EXISTS", b"{ss}e"], Expect::Int(0)),
+                s(&[b"SINTERSTORE", b"{ss}e"], Expect::AnyError),
+                s(
+                    &[
+                        b"DEL", b"{ss}a", b"{ss}b", b"{ss}i", b"{ss}u", b"{ss}d", b"{ss}str",
+                        b"{ss}z", b"{ss}L",
+                    ],
+                    Expect::Int(8),
+                ),
+            ],
+        },
+        Case {
+            family: "zsets",
+            name: "zlexcount zremrangebylex",
+            steps: vec![
+                s(
+                    &[
+                        b"ZADD", b"{zl}z", b"0", b"a", b"0", b"b", b"0", b"c", b"0", b"d", b"0",
+                        b"e",
+                    ],
+                    Expect::Int(5),
+                ),
+                s(&[b"ZLEXCOUNT", b"{zl}z", b"-", b"+"], Expect::Int(5)),
+                s(&[b"ZLEXCOUNT", b"{zl}z", b"[b", b"[d"], Expect::Int(3)),
+                s(&[b"ZLEXCOUNT", b"{zl}z", b"(b", b"(d"], Expect::Int(1)),
+                // An inverted range counts nothing rather than erroring.
+                s(&[b"ZLEXCOUNT", b"{zl}z", b"+", b"-"], Expect::Int(0)),
+                s(&[b"ZLEXCOUNT", b"{zl}nokey", b"-", b"+"], Expect::Int(0)),
+                s(&[b"ZLEXCOUNT", b"{zl}z", b"b", b"d"], Expect::AnyError),
+                s(&[b"ZLEXCOUNT", b"{zl}z", b"-"], Expect::AnyError),
+                s(&[b"ZREMRANGEBYLEX", b"{zl}z", b"[b", b"[c"], Expect::Int(2)),
+                s(
+                    &[b"ZRANGE", b"{zl}z", b"0", b"-1"],
+                    Expect::Arr(vec![
+                        Expect::Str(b"a"),
+                        Expect::Str(b"d"),
+                        Expect::Str(b"e"),
+                    ]),
+                ),
+                // Emptying the set removes the key.
+                s(&[b"ZREMRANGEBYLEX", b"{zl}z", b"-", b"+"], Expect::Int(3)),
+                s(&[b"EXISTS", b"{zl}z"], Expect::Int(0)),
+                s(
+                    &[b"ZREMRANGEBYLEX", b"{zl}nokey", b"-", b"+"],
+                    Expect::Int(0),
+                ),
+                s(&[b"SET", b"{zl}str", b"v"], Expect::Ok),
+                s(&[b"ZLEXCOUNT", b"{zl}str", b"-", b"+"], Expect::AnyError),
+                s(
+                    &[b"ZREMRANGEBYLEX", b"{zl}str", b"-", b"+"],
+                    Expect::AnyError,
+                ),
+                s(&[b"DEL", b"{zl}str"], Expect::Int(1)),
+            ],
+        },
+        Case {
+            family: "keyspace",
+            name: "rename renamenx (same slot)",
+            steps: vec![
+                s(&[b"SET", b"{rn}a", b"v1", b"EX", b"100"], Expect::Ok),
+                s(&[b"RENAME", b"{rn}a", b"{rn}b"], Expect::Ok),
+                s(&[b"GET", b"{rn}b"], Expect::Str(b"v1")),
+                // The TTL moves with the value.
+                s(&[b"TTL", b"{rn}b"], Expect::IntRange(95, 100)),
+                s(&[b"EXISTS", b"{rn}a"], Expect::Int(0)),
+                // A missing source is an ERROR for both forms, not a 0.
+                s(&[b"RENAME", b"{rn}gone", b"{rn}x"], Expect::AnyError),
+                s(&[b"RENAMENX", b"{rn}gone", b"{rn}x"], Expect::AnyError),
+                // RENAME overwrites an occupied destination; RENAMENX
+                // refuses and leaves the SOURCE in place — the difference
+                // that makes the outcome three-valued rather than a bool.
+                s(&[b"SET", b"{rn}o1", b"a"], Expect::Ok),
+                s(&[b"SET", b"{rn}o2", b"b"], Expect::Ok),
+                s(&[b"RENAME", b"{rn}o1", b"{rn}o2"], Expect::Ok),
+                s(&[b"GET", b"{rn}o2"], Expect::Str(b"a")),
+                s(&[b"EXISTS", b"{rn}o1"], Expect::Int(0)),
+                s(&[b"SET", b"{rn}n1", b"a"], Expect::Ok),
+                s(&[b"SET", b"{rn}n2", b"b"], Expect::Ok),
+                s(&[b"RENAMENX", b"{rn}n1", b"{rn}n2"], Expect::Int(0)),
+                s(&[b"GET", b"{rn}n2"], Expect::Str(b"b")),
+                s(&[b"EXISTS", b"{rn}n1"], Expect::Int(1)),
+                s(&[b"RENAMENX", b"{rn}n1", b"{rn}n3"], Expect::Int(1)),
+                s(&[b"EXISTS", b"{rn}n1"], Expect::Int(0)),
+                // Onto ITSELF: a no-op success for RENAME, and 0 for
+                // RENAMENX because the destination is by definition taken.
+                // Routed through the copy path this would be destructive.
+                s(&[b"SET", b"{rn}self", b"v"], Expect::Ok),
+                s(&[b"RENAME", b"{rn}self", b"{rn}self"], Expect::Ok),
+                s(&[b"GET", b"{rn}self"], Expect::Str(b"v")),
+                s(&[b"RENAMENX", b"{rn}self", b"{rn}self"], Expect::Int(0)),
+                s(&[b"GET", b"{rn}self"], Expect::Str(b"v")),
+                // Collections rename whole, both zset row families included.
+                s(&[b"RPUSH", b"{rn}L", b"a", b"b", b"c"], Expect::Int(3)),
+                s(&[b"RENAME", b"{rn}L", b"{rn}L2"], Expect::Ok),
+                s(
+                    &[b"LRANGE", b"{rn}L2", b"0", b"-1"],
+                    Expect::Arr(vec![
+                        Expect::Str(b"a"),
+                        Expect::Str(b"b"),
+                        Expect::Str(b"c"),
+                    ]),
+                ),
+                s(&[b"EXISTS", b"{rn}L"], Expect::Int(0)),
+                s(&[b"ZADD", b"{rn}Z", b"1", b"a", b"2", b"b"], Expect::Int(2)),
+                s(&[b"RENAME", b"{rn}Z", b"{rn}Z2"], Expect::Ok),
+                s(&[b"ZSCORE", b"{rn}Z2", b"b"], Expect::Str(b"2")),
+                s(
+                    &[b"ZRANGE", b"{rn}Z2", b"0", b"-1"],
+                    Expect::Arr(vec![Expect::Str(b"a"), Expect::Str(b"b")]),
+                ),
+                s(&[b"RENAME", b"{rn}b"], Expect::AnyError),
+                s(
+                    &[
+                        b"DEL",
+                        b"{rn}b",
+                        b"{rn}o2",
+                        b"{rn}n2",
+                        b"{rn}n3",
+                        b"{rn}self",
+                        b"{rn}L2",
+                        b"{rn}Z2",
+                    ],
+                    Expect::Int(7),
+                ),
+            ],
+        },
+        Case {
             family: "connection",
             name: "select",
             steps: vec![

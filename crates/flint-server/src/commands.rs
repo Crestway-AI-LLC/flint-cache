@@ -12,7 +12,7 @@ use flint_slot::slot_for_key;
 use flint_storage::Kv;
 use flint_storage::hashes::HashStore;
 use flint_storage::json::JsonStore;
-use flint_storage::keyspace::{Keyspace, Ttl};
+use flint_storage::keyspace::{Keyspace, RenameOutcome, Ttl};
 use flint_storage::lists::{ListStore, LsetOutcome};
 use flint_storage::sets::SetStore;
 use flint_storage::strings::{Clock, SetExpiry, SetOptions, SetOutcome, StoreError, StringStore};
@@ -470,6 +470,13 @@ impl<'a> Dispatcher<'a> {
             //
             // See the cross-slot tests at the foot of this file before
             // weakening any of it.
+            b"SINTERSTORE" => {
+                self.cmd_sstore(args, "sinterstore", flint_storage::sets::SetOp::Inter)
+            }
+            b"SUNIONSTORE" => {
+                self.cmd_sstore(args, "sunionstore", flint_storage::sets::SetOp::Union)
+            }
+            b"SDIFFSTORE" => self.cmd_sstore(args, "sdiffstore", flint_storage::sets::SetOp::Diff),
             b"SINTER" | b"SUNION" | b"SDIFF" => {
                 if args.len() < 2 {
                     return Value::Error(format!(
@@ -633,6 +640,8 @@ impl<'a> Dispatcher<'a> {
             b"ZMSCORE" => self.cmd_zmscore(args),
             b"ZPOPMIN" => self.cmd_zpop(args, "zpopmin", false),
             b"ZPOPMAX" => self.cmd_zpop(args, "zpopmax", true),
+            b"ZLEXCOUNT" => self.cmd_zlexrange(args, "zlexcount", false),
+            b"ZREMRANGEBYLEX" => self.cmd_zlexrange(args, "zremrangebylex", true),
             b"ZUNIONSTORE" => self.cmd_zstore(args, "zunionstore", false),
             b"ZINTERSTORE" => self.cmd_zstore(args, "zinterstore", true),
             b"ZREMRANGEBYSCORE" => self.cmd_zremrangebyscore(args),
@@ -667,6 +676,8 @@ impl<'a> Dispatcher<'a> {
                 Err(_) => err("ERR value is not an integer or out of range"),
             }),
             b"COPY" => self.cmd_copy(args),
+            b"RENAME" => self.cmd_rename(args, "rename", false),
+            b"RENAMENX" => self.cmd_rename(args, "renamenx", true),
             b"EXPIRE" => self.cmd_expire(args, "expire", 1000),
             b"PEXPIRE" => self.cmd_expire(args, "pexpire", 1),
             b"EXPIREAT" => self.cmd_expire_at(args, "expireat", 1000),
@@ -1081,6 +1092,94 @@ impl<'a> Dispatcher<'a> {
     /// for an index it cannot reach is "DB index is out of range", so that
     /// is the answer. Silently copying into db 0 instead would be the real
     /// hazard: the caller believes the data went somewhere else.
+    /// The CROSSSLOT refusal every multi-key command here shares. `first`
+    /// is the key whose slot the request is judged against — the
+    /// destination for the writing forms, since that is also what the proxy
+    /// routes by.
+    fn crossslot(first: &[u8], others: &[Vec<u8>]) -> Option<Value> {
+        let slot = slot_for_key(first);
+        let bad = others.iter().find(|k| slot_for_key(k) != slot)?;
+        Some(Value::Error(format!(
+            "CROSSSLOT Keys in request don't hash to the same slot ({} is slot {}, \
+             {} is slot {}) — use a hash tag such as {{tag}}key to colocate them",
+            String::from_utf8_lossy(first),
+            slot,
+            String::from_utf8_lossy(bad),
+            slot_for_key(bad)
+        )))
+    }
+
+    /// RENAME / RENAMENX key newkey. Same slot, and here that is not merely
+    /// a correctness rule but the only thing that makes the command cheap
+    /// enough to offer: across slots it would be a cross-node move.
+    fn cmd_rename(&self, args: &[Vec<u8>], name: &str, nx: bool) -> Value {
+        if args.len() != 3 {
+            return arity_err(name);
+        }
+        let (src, dst) = (&args[1], &args[2]);
+        if let Some(e) = Self::crossslot(src, &args[2..3]) {
+            return e;
+        }
+        match self.keyspace.rename(slot_for_key(src), src, dst, nx) {
+            RenameOutcome::NoSuchKey => err("ERR no such key"),
+            // RENAMENX answers 0/1; RENAME cannot reach DestinationExists
+            // unless it was asked to rename a key onto itself, which is a
+            // no-op success upstream.
+            RenameOutcome::DestinationExists if nx => Value::Integer(0),
+            RenameOutcome::DestinationExists => Value::Simple("OK".into()),
+            RenameOutcome::Renamed if nx => Value::Integer(1),
+            RenameOutcome::Renamed => Value::Simple("OK".into()),
+        }
+    }
+
+    /// SINTERSTORE / SUNIONSTORE / SDIFFSTORE dst key [key ...].
+    ///
+    /// No numkeys here, unlike the sorted-set forms — the destination is
+    /// args[1] and everything after it is a source.
+    ///
+    /// AND UNLIKE THEM, A SORTED SET IS NOT A LEGAL INPUT: ZUNIONSTORE
+    /// accepts a plain set at score 1, but the set commands answer
+    /// WRONGTYPE for a zset. The asymmetry is upstream's, verified against a
+    /// live server rather than assumed symmetric, and `smembers` already
+    /// enforces it by type-checking what it reads.
+    fn cmd_sstore(&self, args: &[Vec<u8>], name: &str, op: flint_storage::sets::SetOp) -> Value {
+        if args.len() < 3 {
+            return arity_err(name);
+        }
+        let dst = &args[1];
+        let keys = &args[2..];
+        if let Some(e) = Self::crossslot(dst, keys) {
+            return e;
+        }
+        let slot = slot_for_key(dst);
+        // Read every source before touching the destination: the
+        // destination is allowed to be one of them.
+        let members = match self.sets.sop(slot, op, keys) {
+            Ok(m) => m,
+            Err(e) => return store_err(e),
+        };
+        reply(self.sets.sreplace(slot, dst, &members), |n| {
+            Value::Integer(n as i64)
+        })
+    }
+
+    /// ZLEXCOUNT / ZREMRANGEBYLEX key min max.
+    fn cmd_zlexrange(&self, args: &[Vec<u8>], name: &str, remove: bool) -> Value {
+        if args.len() != 4 {
+            return arity_err(name);
+        }
+        let (Some(min), Some(max)) = (LexBound::parse(&args[2]), LexBound::parse(&args[3])) else {
+            return err("ERR min or max not valid string range item");
+        };
+        let slot = slot_for_key(&args[1]);
+        let outcome = if remove {
+            self.zsets.zremrangebylex(slot, &args[1], &min, &max)
+        } else {
+            self.zsets.zlexcount(slot, &args[1], &min, &max)
+        };
+        reply(outcome, |n| Value::Integer(n as i64))
+    }
+
     fn cmd_copy(&self, args: &[Vec<u8>]) -> Value {
         if args.len() < 3 {
             return arity_err("copy");
