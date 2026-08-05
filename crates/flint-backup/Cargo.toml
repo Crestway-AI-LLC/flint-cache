@@ -7,6 +7,10 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+[[bin]]
+name = "flint-backup"
+path = "src/main.rs"
+
 [lints]
 workspace = true
 
@@ -15,3 +19,7 @@ workspace = true
 # the FORMAT, and the format must be testable — and restorable — without
 # credentials or a network. The SDK lives behind ObjectStore in the seat.
 flint-tls = { path = "../flint-tls" }
+# The seat only. Kept out of the library's own surface so a caller that just
+# reads a set — a restore, a test — links no RESP client and no build stamp.
+flint-resp = { path = "../flint-resp" }
+flint-build = { path = "../flint-build" }
