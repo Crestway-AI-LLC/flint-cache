@@ -17,6 +17,32 @@ seconds at the origin. That is the trade this project exists to make, and
 [the measured numbers](docs/architecture.md) are there to show the hit is
 fast enough that you stop thinking about it.
 
+## Why a disk-first cache — the value in five claims
+
+1. **No eviction, no miss storms.** Nothing is ever dropped because RAM ran
+   low, so a hot key can't be evicted into a thundering herd against your
+   backend. The failure mode of a full Flint is a refused *write* with a
+   clear error — never a silently missing read.
+2. **No warm-up.** A restarted node serves its working set immediately from
+   disk; failover hands traffic to a replica that has the data; a fresh
+   replica seeds from a checkpoint. "The cache is cold, watch the database"
+   is not an operational event here.
+3. **Hot keys are handled in the architecture.** The proxy tracks per-key
+   heat, absorbs hot reads in a bounded short-TTL near-cache at the edge,
+   and offers an opt-in async write queue that soaks up write bursts on the
+   hot path — while every write still lands in the WAL.
+4. **Large datasets at storage cost, without a latency sacrifice that your
+   users can feel.** A cache call already crosses the network: one cross-AZ
+   hop is ~500 µs–1 ms, an NVMe read ~100 µs. End to end, the network dwarfs
+   the medium, so RAM's microseconds are invisible — while holding 10× the
+   data at NVMe prices is very visible in the bill and in the miss rate.
+5. **Built to be operated by an agent.** From the first commit, every drill,
+   failure claim, and operational lesson is captured in a form software can
+   act on — runnable drills in this repo, journaled actions, allowlisted
+   remediations that fail closed and page a human on escalation. The managed
+   fleet is run that way; the same evidence discipline is what you get here
+   for self-hosting.
+
 ## What's in this repository
 
 Everything needed to run AND operate Flint yourself:
