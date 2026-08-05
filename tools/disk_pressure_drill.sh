@@ -111,7 +111,33 @@ for _ in $(seq 1 60); do
   [ "$(valkey-cli -p $PORT PING 2>/dev/null)" = "PONG" ] && break; sleep 0.25
 done
 [ "$(valkey-cli -p $PORT PING 2>/dev/null)" = "PONG" ] || {
-  tail -5 /tmp/flint-diskpressure.log; fail "server did not start"; }
+  # Capture STATE, not just the log.
+  #
+  # This drill has failed intermittently under the full suite and never in
+  # isolation, and every previous investigation dead-ended on the same
+  # evidence: "server did not start" plus a log that said nothing. That
+  # framing is a guess, and it sent two investigations after the wrong
+  # thing — a wedged mount (none was present) and a cold binary (it starts
+  # in 0.3s on a fresh image, measured, with a 293-byte log). What was
+  # never captured is whether the process was even alive, whether the
+  # volume was mounted, and who else was on the port.
+  #
+  # So the failure path now records those, because the next occurrence is
+  # the only chance to learn anything and it has been wasted three times.
+  echo "---- diagnosis (the drill did not get a PONG within its budget) ----"
+  echo "process:"; pgrep -lf "flint-server --port $PORT" | sed 's/^/  /' || echo "  none alive"
+  echo "port $PORT:"; lsof -nP -iTCP:$PORT 2>/dev/null | sed 's/^/  /' | head -4 || echo "  free"
+  echo "mount:"; mount | grep -i diskpressure | sed 's/^/  /' || echo "  NOT MOUNTED"
+  echo "data dir:"; ls -la "$MNT/data" 2>&1 | head -4 | sed 's/^/  /'
+  echo "free space:"; df -h "$MNT" 2>&1 | tail -1 | sed 's/^/  /'
+  echo "server log ($(wc -c </tmp/flint-diskpressure.log 2>/dev/null || echo 0) bytes):"
+  sed 's/^/  /' /tmp/flint-diskpressure.log 2>/dev/null | tail -10
+  echo "load:"; uptime | sed 's/^/  /'
+  echo "other flint seats (a busy box is the leading remaining hypothesis):"
+  pgrep -lf 'flint-(server|proxy|controlplane|controller|chaos)' | grep -v "port $PORT" \
+    | sed 's/^/  /' | head -6 || echo "  none"
+  echo "--------------------------------------------------------------------"
+  fail "server did not start"; }
 
 info() { valkey-cli -p "$PORT" FLINTINFO 2>/dev/null | tr -d '\r' | grep "^$1:" | cut -d: -f2; }
 
