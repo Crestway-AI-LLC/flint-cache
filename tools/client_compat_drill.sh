@@ -272,7 +272,11 @@ async function check(name, fn, expectUnsupported = false) {
   console.log(`  ${ok ? 'ok ' : 'FAIL'} ${name}${note ? '  ' + note : ''}`);
   if (!ok) fails.push(name);
 }
-const c = createClient({ url: process.env.FLINT_URL, password: process.env.FLINT_TOKEN });
+// RESP: 3 EXPLICITLY — node-redis defaults to RESP3 only from major 6,
+// and an npm that resolves 5.x would silently demote this battery to
+// RESP2, failing the protocol check against a server whose RESP3 is fine
+// (the same trap redis-py < 8 sets, fixed the same way).
+const c = createClient({ url: process.env.FLINT_URL, password: process.env.FLINT_TOKEN, RESP: 3 });
 c.on('error', () => {});
 await c.connect();
 await check('connect (default RESP3 + inline HELLO AUTH)', async () => {
