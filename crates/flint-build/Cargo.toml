@@ -2,6 +2,12 @@
 name = "flint-build"
 version = "0.0.1"
 edition = "2024"
+# Inherited like every other crate. Without these two lines this was the
+# one workspace member with no licence field and no publish guard — so the
+# workspace comment promising a stray `cargo publish` fails closed was
+# true of six crates and false of the seventh.
+license.workspace = true
+publish = false
 
 [lints]
 workspace = true
