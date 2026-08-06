@@ -102,7 +102,7 @@ means "lost its data" and repair is always a full resync.
 ## How to check any of this yourself
 
 ```sh
-tools/gates.sh          # fmt, clippy, tests, conformance, 27 drills, chaos
+tools/gates.sh          # fmt, clippy, tests, conformance, every core drill, chaos
 ```
 
 Every claim above is an assertion in a drill that exits non-zero when it

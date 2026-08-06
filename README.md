@@ -300,7 +300,7 @@ Stages run individually too — `tools/gates.sh check`, `conformance`, `drills`,
 |---|---|
 | `check` | fmt, clippy and tests, in **both** feature configurations |
 | `conformance` | the compatibility oracle against Valkey, Flint mem, Flint rocks |
-| `drills` | the 20 core drills — real processes, no mocks |
+| `drills` | the core drills — real processes, no mocks. The `CORE` list in `tools/gates.sh` is the count; enumerating it here only drifts (it read 20 while the gate ran 39). |
 | `chaos` | the two randomized kill-and-verify drills |
 
 Logs land in `$FLINT_GATE_LOGS` (default `/tmp/flint-gates`), one file per

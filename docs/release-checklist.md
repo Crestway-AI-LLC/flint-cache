@@ -48,29 +48,19 @@ disagrees with the oracle, the case is wrong.
 
 ## 3. Core drills (each prints PASS or exits nonzero)
 
-    tools/restart_drill.sh            # warm restart, data intact
-    tools/repl_drill.sh               # replication parity + lag
-    tools/failover_drill.sh           # epoch-fenced promotion, zombie fenced
-    tools/proxy_drill.sh              # one endpoint across migration+failover
-    tools/slot_migrate_drill.sh       # bulk + tail slot move
-    tools/slot_map_drill.sh           # CP slot-ownership truth, cold proxy
-    tools/rebalance_execute_drill.sh  # planner + executor to convergence
-    tools/tenant_quota_drill.sh       # rate + storage quota enforcement
-    tools/token_rotation_drill.sh     # dual-version token roll, zero downtime
-    tools/cert_reload_fleet_drill.sh  # leaf rotation under live traffic
-    tools/controlplane_ha_drill.sh    # Raft CP: election, failover, watch push
-    tools/decommission_drill.sh       # graceful failover + single-node retire, guarded
-    tools/config_file_drill.sh        # config-file tunables + hot reload (no restart)
-    tools/federation_plumbing_drill.sh
-    tools/disk_pressure_drill.sh      # host out of room: shed, serve, self-recover
-    tools/ctl_error_drill.sh          # a refused command reports, never panics
-    tools/client_compat_drill.sh      # redis-py + node-redis, both on RESP3
-    tools/proxy_registry_drill.sh     # stray registrations cannot strand a tenant
-    tools/reseed_drill.sh             # a replica outside the WAL re-seeds, warm restart does not
-    tools/lag_cap_drill.sh            # the lag cap is OBSERVED to shed, not just configured
-    tools/widowed_grace_drill.sh      # a master with NO replica stops accepting, eventually
-    tools/controller_drill.sh         # hands-free failover; RTO asserted against the budget
-    tools/attached_chaos_drill.sh     # chaos through the OPERATOR path, fleet's own controller
+    tools/gates.sh drills
+
+**The list lives in `CORE` at the top of `tools/gates.sh`, and nowhere
+else.** This section used to enumerate the drills with a one-line gloss
+each, which is exactly the shape the top of this file warns about: the
+enumeration went stale at 23 while the gate grew to 39, so a reader
+checking what the suite covers would have undercounted it by 40%. Adding a
+drill to `CORE` is what puts it in the gate; there is no second list to
+keep in step.
+
+Each drill's own header says what it proves and which incident it was
+written for — `head -20 tools/<name>_drill.sh` is the gloss this section
+used to carry, kept next to the code it describes.
 
 ## 3b. Integrity — the cluster agrees with itself
 
