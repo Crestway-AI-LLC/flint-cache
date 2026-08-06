@@ -31,6 +31,10 @@ fn key(i: u64) -> String {
 const END: &[u8] = b"END";
 
 fn main() {
+    // Which 8-port block this run owns (see cluster::SPAN). The driving
+    // drill declares the same block to fleet_init, so every port bound here
+    // is a port some drill is accountable for.
+    let port_base: u16 = arg("--port-base", 6460u16);
     let n: u64 = arg("--elements", 1_000_000);
     let kills: u32 = arg("--kills", 12);
     let controller_driven = arg("--driver", "harness".to_string()) == "controller";
@@ -47,9 +51,9 @@ fn main() {
     let mut cluster = if controller_driven {
         // A real flint-controller makes every failover decision; the harness
         // only kills nodes and re-attaches replacements on fixed ports.
-        Cluster::bootstrap_controlled(150, 3, 3_000)
+        Cluster::bootstrap_controlled_at(port_base, 150, 3, 3_000)
     } else {
-        Cluster::bootstrap()
+        Cluster::bootstrap_at(port_base)
     };
 
     // --- Build phase: pipelined SETs, key{i} -> key{i+1}, key{N} -> END.

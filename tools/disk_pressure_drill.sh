@@ -25,6 +25,13 @@
 # than by writing a real terabyte. Linux and macOS.
 set -u
 cd "$(dirname "$0")/.."
+. "$(dirname "$0")/lib/fleet.sh"
+# Declared so the SET of drills can be checked for port collisions —
+# fleet_init only records the scope, it changes no behaviour here. A
+# drill that declares nothing is invisible to assert_no_port_overlap,
+# which is how failover and controller came to share 6440/6441 and
+# reseed and lag_cap to share 6471/6472, unseen.
+fleet_init /tmp/flint-diskpressure 6396
 
 PORT=6396
 # macOS: hdiutil APPENDS .dmg when the path lacks it, so a bare .img name

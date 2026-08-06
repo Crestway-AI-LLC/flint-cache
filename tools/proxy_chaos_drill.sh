@@ -10,7 +10,7 @@
 # this is the routing-plane end-to-end gate. Both share one oracle.
 set -euo pipefail
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init /tmp/flint-chaos-
+fleet_init /tmp/flint-proxychaos 6338 6339 6340 6341 6342 6343 6344 6345
 fleet_guard
 fleet_kill server
 fleet_kill proxy
@@ -22,7 +22,7 @@ SEEDS="${SEEDS:-7 19 42}"
 ITERS="${ITERS:-12}"
 for seed in $SEEDS; do
   echo "== proxy-chaos seed=$seed iters=$ITERS"
-  ./target/release/proxy_chaos --iterations "$ITERS" --keys 300 --seed "$seed"
+  ./target/release/proxy_chaos --port-base 6338 --iterations "$ITERS" --keys 300 --seed "$seed"
   fleet_kill server
   fleet_kill proxy
   fleet_kill controller

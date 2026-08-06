@@ -866,6 +866,27 @@ fn wait_until_role(port: u16, role: &str, budget: Duration) -> bool {
     false
 }
 
+/// How many ports one chaos cluster may bind, counting from its base. A
+/// caller declares `base .. base+SPAN-1` to `fleet_init` and this crate must
+/// stay inside that: base+0 master, base+1 replica, base+2 proxy, and
+/// base+FIRST_POOL upward for replacement replicas.
+///
+/// The number is a contract with the drills, so it lives here rather than
+/// being spelled out in seven shell scripts. Every port below is derived
+/// from `base` by construction — the pool wraps within `POOL` slots rather
+/// than climbing — so staying inside the block is a property of the
+/// arithmetic, not of anyone remembering.
+pub const SPAN: u16 = 8;
+const FIRST_POOL: u16 = 3;
+const POOL: u16 = SPAN - FIRST_POOL;
+
+/// Can this address be bound right now? Same bind-to-prove-it discipline the
+/// rest of the harness uses: a process holding the port is a fact about the
+/// kernel, not something to infer from a pidfile or a `ps` line.
+fn port_free(port: u16) -> bool {
+    std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
+}
+
 /// A master + one replica, managed like the trio will: promote-on-master-
 /// kill, replace-on-any-kill. Topology mechanics only — each workload owns
 /// its own data oracle.
@@ -880,19 +901,31 @@ fn wait_until_role(port: u16, role: &str, budget: Duration) -> bool {
 ///     stable addresses while roles float between them.
 pub struct Cluster {
     fleet: Fleet,
+    /// The first port of this cluster's declared block.
+    base: u16,
     master_port: u16,
     replica_port: u16,
     next_id: u32,
     controlled: bool,
     pub master_kills: u32,
     pub replica_kills: u32,
+    /// base + 2; only bound when start_proxy is called.
+    pub proxy_port: u16,
 }
 
 impl Cluster {
-    pub fn bootstrap() -> Self {
+    /// Ports come from a BASE rather than three constants.
+    ///
+    /// They used to be hardcoded 6460/6470/7690, which made them invisible
+    /// to the drill-port guards: a drill driving chaos binds them without
+    /// declaring them, so nothing could see that tenant_quota's control
+    /// plane also sits on 7690, or that two chaos-driven drills necessarily
+    /// share a cluster's worth of ports. A base makes each caller's block
+    /// declarable, which is what lets the guard do its job.
+    pub fn bootstrap_at(base: u16) -> Self {
         let fleet = Fleet::new();
-        let master_port = 6460;
-        let replica_port = 6470;
+        let master_port = base;
+        let replica_port = base + 1;
         fleet.track(spawn_node(master_port, &fresh_dir(0), None));
         assert!(
             wait_for_pong(master_port, Duration::from_secs(5)),
@@ -905,8 +938,13 @@ impl Cluster {
         );
         Self {
             fleet,
+            base,
             master_port,
             replica_port,
+            proxy_port: base + 2,
+            // 0 and 1 are the two seats bootstrap just made; `next_id` also
+            // names data directories, which must stay unique for the life of
+            // the run even though the PORT it maps to cycles.
             next_id: 2,
             controlled: false,
             master_kills: 0,
@@ -914,10 +952,22 @@ impl Cluster {
         }
     }
 
-    /// Bootstrap with a real flint-controller making failover decisions.
+    // There is deliberately NO `bootstrap()` / `bootstrap_controlled()`
+    // defaulting to 6460. Those wrappers existed for one commit and did the
+    // damage the port base was added to undo: `chain`, `hotkey` and
+    // `proxy_chaos` all kept them, so three of this crate's four binaries
+    // went on binding the hardcoded block while the drills driving them
+    // declared a different one. A default is an invitation to stay
+    // invisible; every caller now has to say which block it owns.
+
     /// Fixed ports; the controller watches both forever.
-    pub fn bootstrap_controlled(poll_ms: u64, confirm: u32, lease_ttl_ms: u64) -> Self {
-        let mut c = Self::bootstrap();
+    pub fn bootstrap_controlled_at(
+        base: u16,
+        poll_ms: u64,
+        confirm: u32,
+        lease_ttl_ms: u64,
+    ) -> Self {
+        let mut c = Self::bootstrap_at(base);
         c.controlled = true;
         let nodes = format!("127.0.0.1:{},127.0.0.1:{}", c.master_port, c.replica_port);
         let child = Command::new(controller_bin())
@@ -961,7 +1011,7 @@ impl Cluster {
             self.controlled,
             "start_proxy needs bootstrap_controlled (fixed ports)"
         );
-        let proxy_port = 7690;
+        let proxy_port = self.proxy_port;
         let pairs = format!(
             "127.0.0.1:{},127.0.0.1:{}",
             self.master_port, self.replica_port
@@ -1027,10 +1077,37 @@ impl Cluster {
         false
     }
 
+    /// A port for a replacement replica, from THIS cluster's block.
+    ///
+    /// This was `6470 + next_id`: hardcoded, base-independent, and unbounded.
+    /// Giving the cluster a `--port-base` moved the two seats that exist
+    /// before the first kill and nothing else, so every replacement after
+    /// that walked up from 6470 no matter what the caller asked for — a
+    /// 12-second run was measured binding 6472, which `reseed_drill`
+    /// declares. The seats a chaos run spends most of its life on were
+    /// exactly the ones still outside every drill's declared block, which is
+    /// the whole defect the base was supposed to fix.
+    ///
+    /// So the pool is base-relative AND bounded, because a drill can only
+    /// declare a bounded set. It cycles rather than climbing: only two nodes
+    /// are alive at a time, so `POOL` slots give that many kills of
+    /// separation before an address is reused. A slot still held by a
+    /// process that has not finished dying is skipped, not waited on — this
+    /// runs after `kill_by_port` has already sent -9.
     fn next_replica_port(&mut self) -> u16 {
-        let p = 6470 + self.next_id as u16;
-        self.next_id += 1;
-        p
+        for _ in 0..POOL {
+            let p = self.base + FIRST_POOL + (self.next_id % POOL as u32) as u16;
+            self.next_id += 1;
+            if p != self.master_port && port_free(p) {
+                return p;
+            }
+        }
+        panic!(
+            "no free replacement port in {}..{} — every slot in this cluster's \
+             block is still held. Widen SPAN or find what is not dying.",
+            self.base + FIRST_POOL,
+            self.base + SPAN - 1
+        );
     }
 
     /// Kill the master, promote the replica (read-then-bump epoch, exactly

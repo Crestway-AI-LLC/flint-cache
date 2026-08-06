@@ -49,7 +49,7 @@ FORCE_WAS="${FLINT_DRILL_FORCE:-}"
 unset FLINT_DRILL_FORCE
 [ -n "$FORCE_WAS" ] && echo "   (FLINT_DRILL_FORCE=$FORCE_WAS cleared for this drill; step E sets it back)"
 
-fleet_init /tmp/flint-guard-drill 6999
+fleet_init /tmp/flint-guard-drill 6999 6378 6379 6380 6381 6382 6383 6384 6385
 
 echo "== A) a quiet box: the guard must let the drill run"
 OUT=$(fleet_guard 2>&1); RC=$?

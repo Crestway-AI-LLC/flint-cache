@@ -6,10 +6,16 @@
 # (The meta trio will automate the decision; the mechanics are these.)
 set -euo pipefail
 . "$(dirname "$0")/lib/fleet.sh"
+# Declared so the SET of drills can be checked for port collisions —
+# fleet_init only records the scope, it changes no behaviour here. A
+# drill that declares nothing is invisible to assert_no_port_overlap,
+# which is how failover and controller came to share 6440/6441 and
+# reseed and lag_cap to share 6471/6472, unseen.
+fleet_init /tmp/flint-failover 6326 6327
 
 KEYS="${1:-20000}"
-MPORT="${2:-6440}"
-RPORT="${3:-6441}"
+MPORT="${2:-6326}"
+RPORT="${3:-6327}"
 MDIR="$(mktemp -d /tmp/flint-fo-m.XXXXXX)"
 RDIR="$(mktemp -d /tmp/flint-fo-r.XXXXXX)"
 BIN="$(dirname "$0")/../target/release/flint-server"

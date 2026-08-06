@@ -45,7 +45,7 @@
 # to chase today.
 set -euo pipefail
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init /tmp/flint-chaos-
+fleet_init /tmp/flint-chaosunread 6346 6347 6348 6349 6350 6351 6352 6353
 fleet_guard
 fleet_kill server
 sleep 0.5
@@ -58,7 +58,7 @@ INJECT=3
 
 echo "== master kill with $INJECT keys made unreadable AND really gone"
 set +e
-./target/release/flint-chaos --iterations 3 --keys 4000 --seed 1 --mode mixed \
+./target/release/flint-chaos --port-base 6346 --iterations 3 --keys 4000 --seed 1 --mode mixed \
   --inject-unreadable "$INJECT" >"$D/out.log" 2>&1
 RC=$?
 set -e

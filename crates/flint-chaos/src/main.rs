@@ -35,6 +35,12 @@ fn main() {
         unsafe { std::env::set_var("FLINT_CHAOS_MIN_REPLICAS", min_replicas.to_string()) };
     }
     let inventory: String = arg("--inventory", String::new());
+    // The cluster's ports, as a base: master, master+1, and master+2 for the
+    // proxy when --mode proxy is used. Default 6460 keeps the historical
+    // master port; the proxy moves off 7690, which tenant_quota's control
+    // plane also binds. Give concurrent or neighbouring drills distinct bases
+    // and each can DECLARE its block, which the port guards need.
+    let port_base: u16 = arg("--port-base", 6460u16);
     // A "randomized" gate that runs ONE path per topology explores nothing
     // after its first run. run.sh pinned --seed 22 and the attached drill
     // --seed 7, forever (#118 item 5). The seed now defaults to the clock and
@@ -123,9 +129,9 @@ fn main() {
     let mut targets: Vec<Target> = if inventory.is_empty() {
         vec![Target::Local {
             cluster: if controller_driven {
-                Cluster::bootstrap_controlled(150, 3, 3_000)
+                Cluster::bootstrap_controlled_at(port_base, 150, 3, 3_000)
             } else {
-                Cluster::bootstrap()
+                Cluster::bootstrap_at(port_base)
             },
             controller_driven,
         }]

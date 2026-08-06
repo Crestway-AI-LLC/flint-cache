@@ -5,6 +5,12 @@
 # Requires a release build with --features rocks and valkey-cli.
 set -euo pipefail
 . "$(dirname "$0")/lib/fleet.sh"
+# Declared so the SET of drills can be checked for port collisions —
+# fleet_init only records the scope, it changes no behaviour here. A
+# drill that declares nothing is invisible to assert_no_port_overlap,
+# which is how failover and controller came to share 6440/6441 and
+# reseed and lag_cap to share 6471/6472, unseen.
+fleet_init /tmp/flint-repl 6420 6421
 
 KEYS="${1:-50000}"
 MPORT="${2:-6420}"

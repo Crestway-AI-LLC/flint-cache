@@ -123,6 +123,10 @@ fn assert_fanout_healthy(client: &mut Client, proxy_port: u16, floor: u64, itera
 }
 
 fn main() {
+    // Which 8-port block this run owns (see cluster::SPAN). The driving
+    // drill declares the same block to fleet_init, so every port bound here
+    // is a port some drill is accountable for.
+    let port_base: u16 = arg("--port-base", 6460u16);
     let iterations: u32 = arg("--iterations", 12);
     let key_count: u64 = arg("--keys", 400);
     let mode: String = arg("--mode", "mixed".to_string());
@@ -131,7 +135,7 @@ fn main() {
     );
 
     // Always controller-driven: a real controller promotes, the proxy routes.
-    let mut cluster = Cluster::bootstrap_controlled(150, 3, 3_000);
+    let mut cluster = Cluster::bootstrap_controlled_at(port_base, 150, 3, 3_000);
     let proxy_port = cluster.start_proxy();
     let mut ledger: HashMap<String, KeyLedger> = HashMap::new();
     let mut rng = SmallRng::seed_from_u64(arg("--seed", 42));

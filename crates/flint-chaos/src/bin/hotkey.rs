@@ -201,6 +201,10 @@ fn audit(sh: &Shared, client: &mut Client, proxy_port: u16, key_count: usize) ->
 }
 
 fn main() {
+    // Which 8-port block this run owns (see cluster::SPAN). The driving
+    // drill declares the same block to fleet_init, so every port bound here
+    // is a port some drill is accountable for.
+    let port_base: u16 = arg("--port-base", 6460u16);
     let kills: u32 = arg("--kills", 6);
     let key_count: usize = arg("--keys", 8);
     let writers: usize = arg("--writers", 4);
@@ -221,7 +225,7 @@ fn main() {
         }
     );
 
-    let mut cluster = Cluster::bootstrap_controlled(150, 3, 3_000);
+    let mut cluster = Cluster::bootstrap_controlled_at(port_base, 150, 3, 3_000);
     let proxy_port = cluster.start_proxy();
     let t0 = Instant::now();
 

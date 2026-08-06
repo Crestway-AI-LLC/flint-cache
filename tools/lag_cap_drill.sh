@@ -43,7 +43,7 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init /tmp/flint-lagcap 6460 6470 6471 6472 6473
+fleet_init /tmp/flint-lagcap 6362 6363 6364 6365 6366 6367 6368 6369
 fleet_guard
 fleet_kill server; fleet_kill controller
 sleep 0.3
@@ -56,7 +56,7 @@ cargo build --release -q -p flint-chaos -p flint-server -p flint-controller \
 # 5ms hard / 4ms soft: low enough that an ordinary write burst outruns
 # replication, high enough that the pair still makes progress.
 echo "== chaos with the lag cap at 5ms, so the shed path is reachable"
-OUT=$(./target/release/flint-chaos --iterations 4 --keys 150 --mode master \
+OUT=$(./target/release/flint-chaos --port-base 6362 --iterations 4 --keys 150 --mode master \
   --driver controller --lag-hard-ms 5 --rpo-margin-ms 50 2>&1)
 echo "$OUT" | tail -8 | sed 's/^/  /'
 

@@ -7,7 +7,7 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init /tmp/flint-ctl-m 6440 6441
+fleet_init /tmp/flint-ctl-m 6440 6441 6370 6371 6372 6373 6374 6375 6376 6377
 fleet_guard
 fleet_kill server; fleet_kill controller; sleep 0.4
 MDIR=$(mktemp -d /tmp/flint-ctl-m.XXXXXX); RDIR=$(mktemp -d /tmp/flint-ctl-r.XXXXXX)
