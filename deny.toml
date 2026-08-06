@@ -1,0 +1,60 @@
+# SPDX-License-Identifier: Elastic-2.0
+# Dependency licence policy.
+#
+# Flint ships as BINARIES under the Elastic Licence 2.0 — a proprietary,
+# source-available licence. That makes the question here narrower and
+# harder than "is this crate open source": we redistribute these
+# dependencies inside a product we do not open-source, so anything with a
+# reciprocal obligation (GPL/AGPL/LGPL/SSPL) would either force us to
+# release our own source or make the distribution non-compliant.
+#
+# So the policy is an ALLOW-LIST of permissive licences, not a deny-list
+# of bad ones. A deny-list silently admits every licence nobody thought
+# to name; an allow-list fails closed on the one a new dependency drags
+# in next year, which is exactly when nobody is looking.
+#
+#   cargo deny check licenses
+[graph]
+# Only what we actually ship. Windows/wasm crates in the graph are not in
+# any artifact we distribute, and judging them would be theatre.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+]
+all-features = true
+
+[licenses]
+# Permissive only: attribution is the whole obligation, which we satisfy
+# by shipping the notices. No copyleft of any strength.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "Unlicense",
+    "0BSD",
+]
+# A licence inferred from file text rather than declared metadata needs to
+# be near-certain before it counts as satisfying the policy.
+confidence-threshold = 0.93
+
+# Our own crates are Elastic-2.0, which is deliberately NOT in the allow
+# list above — that list governs what we may redistribute inside the
+# product, and judging ourselves against it just reports nineteen false
+# violations that bury the real ones. `private` keys off `publish = false`,
+# which every workspace crate now sets, so this exemption cannot silently
+# widen to a crate that becomes publishable.
+private = { ignore = true }
+
+[bans]
+multiple-versions = "allow"   # a licence run, not a dependency-hygiene run
+
+[advisories]
+# Vulnerability scanning is a separate concern with a separate cadence;
+# `cargo deny check advisories` covers it and is not what this file is for.
+yanked = "warn"
