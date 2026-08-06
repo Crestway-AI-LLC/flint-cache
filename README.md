@@ -122,7 +122,7 @@ asynchronous and the WAL is fsynced on a bounded cadence.
 
 - Warm restart, and the loss of a **replica**: nothing lost.
 - Master failover with the replica caught up: nothing lost. Measured RTO
-  **p50 506 ms** across 5 hosts on a real network.
+  **p50 506 ms, worst 586 ms** across 5 hosts on a real network (rc.28).
 - Master failover with the replica behind: the un-replicated tail may be lost.
   Bounded by **volume** — at most one lag-cap window's worth is ever at risk —
   **not by age**. Measured deepest loss with a deliberately stalled replica:

@@ -250,8 +250,9 @@ flowchart LR
 
   We still ship 3. `confirm` is the tolerance for a transient miss, and
   dropping to 2 spends a full miss of it to buy 100 ms of detection —
-  against a measured 757 ms RTO and a published `≤ 2 s` bound, which is
-  already met with better than 2× margin. A clean five-minute window on a
+  against a measured RTO of 506–757 ms across real-network runs and a
+  published `≤ 2 s` bound, which is already met with better than 2×
+  margin. A clean five-minute window on a
   same-subnet fleet is also close to the best case for a failure mode
   driven by tails: GC pauses, scheduler hiccups, packet-loss bursts. Worth
   revisiting only if RTO becomes the binding constraint, and then on
