@@ -9,7 +9,10 @@ lost. Format and rationale: [0001](0001-record-architecture-decisions.md).
 | [0002](0002-encoding-abstraction.md) | Encoding abstraction: one envelope over a swappable `Kv` |
 | [0003](0003-rocksdb-baseline.md) | RocksDB as the v0 engine, measured rather than assumed |
 | [0004](0004-no-per-group-raft.md) | No per-group Raft: epoch fencing in the node's own manifest |
-| [0011](0011-backup-and-restore.md) | Backup and restore: per-pair checkpoints to object storage, restore only into a fresh cluster (proposed) |
+| [0011](0011-backup-and-restore.md) | Backup and restore: per-pair checkpoints to object storage, restore only into a fresh cluster |
+| [0012](0012-same-slot-transactions.md) | Same-slot MULTI / EXEC / WATCH: ship the three guarantees Flint can honestly give, document the fourth's absence |
+| [0013](0013-user-driven-gc-primitives.md) | User-driven GC primitives: no eviction, but a loop the operator can close |
+| [0014](0014-introspection-status-surface.md) | One status surface: a build stamp on every seat, `status --json` with drift detection, `CPMYSTATUS` for tenants (proposed) |
 
 ## Why the numbering has a gap
 
