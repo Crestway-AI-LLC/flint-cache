@@ -7,7 +7,7 @@
 # briefly and dies destroys its own evidence on the way back up, and the
 # more it crash-loops the less there is to read.
 #
-# That is not a hypothetical cost. #140 is a replica exiting silently ~90
+# That is not a hypothetical cost. docs/bugs/0005 is a replica exiting silently ~90
 # seconds after a clean start, and every attempt to diagnose it read a log
 # holding only the newest attempt, which showed a healthy boot every time.
 # The crash output existed and was overwritten before anyone looked.
@@ -96,4 +96,4 @@ $CTL -f "$INV" status 2>/dev/null | grep -q "$REPLICA.*replica" \
        $CTL -f "$INV" status; exit 1; }
 echo "  and the seat is serving again (the restart was real)"
 
-echo "PASS: a seat's log outlives the seat (#140 needs this to be debuggable)"
+echo "PASS: a seat's log outlives the seat (docs/bugs/0005 needs this to be debuggable)"

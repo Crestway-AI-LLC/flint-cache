@@ -12,7 +12,7 @@
 # That is not hypothetical. A supervise timer running `flintctl start` on the
 # playground restarted a killed replica four times in four minutes; the node
 # never reached serving and recovered on the first attempt once the timer was
-# stopped and one start ran alone (#139). Supervision cannot be switched on
+# stopped and one start ran alone (docs/bugs/0004). Supervision cannot be switched on
 # until this holds.
 #
 # The window is made deterministic with SIGSTOP rather than raced: a stopped
@@ -102,4 +102,4 @@ $CTL -f "$INV" status 2>/dev/null | grep -q "$REPLICA.*replica" \
   || { echo "FAIL: replica did not return to service after SIGCONT"; $CTL -f "$INV" status; exit 1; }
 echo "  serving again"
 
-echo "PASS: start never replaces a seat that already has a process (#139)"
+echo "PASS: start never replaces a seat that already has a process (docs/bugs/0004)"

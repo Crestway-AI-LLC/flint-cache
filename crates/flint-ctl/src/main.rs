@@ -900,7 +900,7 @@ fn spawn_env(
 /// It used to be `File::create`, which truncates. Every respawn therefore
 /// erased the previous run's output, and a seat that starts, runs briefly
 /// and dies destroys its own evidence on the way back up — the more it
-/// crash-loops, the less there is to read. That is what #140 ran into: a
+/// crash-loops, the less there is to read. That is what docs/bugs/0005-oneshot-kills-its-own-seat.md ran into: a
 /// replica exiting silently ~90s after a clean start, investigated against
 /// a log that only ever held the newest attempt, which looked like a
 /// perfectly healthy boot every time.
@@ -1878,7 +1878,7 @@ fn start_pair_nodes(inv: &Inventory, pair: &[String]) {
         // progress. Run on an interval it never converges. A supervise timer
         // did exactly that to the playground's replica — four restarts in
         // four minutes, never serving, healthy again the moment one `start`
-        // ran alone (#139).
+        // ran alone (docs/bugs/0004-start-replaces-a-starting-seat.md).
         //
         // So: a seat with a process is this seat's, and `start` leaves it
         // be. If it is genuinely wedged rather than starting, that is what
