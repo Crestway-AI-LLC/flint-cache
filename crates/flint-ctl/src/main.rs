@@ -1823,6 +1823,31 @@ fn start_pair_nodes(inv: &Inventory, pair: &[String]) {
             eprintln!("  node-{port} already up ({role})");
             continue;
         }
+        // SERVING is proved by the dial above. NOT serving is not proved by
+        // a failed dial — a seat doing wipe + full sync has a live process
+        // and an unbound port for as long as the sync takes, and reads
+        // exactly like a dead one.
+        //
+        // Treating that as absent is destructive here rather than merely
+        // wasteful: the branch below WIPES the data dir before respawning,
+        // so a `start` issued while a node is syncing deletes the sync in
+        // progress. Run on an interval it never converges. A supervise timer
+        // did exactly that to the playground's replica — four restarts in
+        // four minutes, never serving, healthy again the moment one `start`
+        // ran alone (#139).
+        //
+        // So: a seat with a process is this seat's, and `start` leaves it
+        // be. If it is genuinely wedged rather than starting, that is what
+        // `stop` then `start` is for — an operator decision, not one made
+        // once a minute by a timer that cannot tell the difference.
+        if seat_alive(
+            &runner_for(inv, addr),
+            "flint-server",
+            &format!("{d}/node-{port}"),
+        ) {
+            eprintln!("  node-{port} STARTING (process up, not serving yet) — left alone");
+            continue;
+        }
         let replica_of = match &live_master {
             // Dead seat rejoining a live lineage: same contract as roll_node —
             // its replication cursor may be an ex-master's and its suffix may
@@ -2237,6 +2262,18 @@ fn launch(inv: &Inventory, register: bool) {
             eprintln!("  {name} already up");
             continue;
         }
+        // Same rule as the pair nodes: a failed dial does not mean absent.
+        // A Raft seat replaying its log answers nothing until it is ready,
+        // and spawning beside it gives the duplicate a lost port race and a
+        // clobbered pidfile — after which every stop aims at a corpse.
+        if seat_alive(
+            &runner_for(inv, seat),
+            "flint-controlplane",
+            &format!("{d}/cp-state"),
+        ) {
+            eprintln!("  {name} STARTING (process up, not answering yet) — left alone");
+            continue;
+        }
         spawn(
             inv,
             &runner_for(inv, seat),
@@ -2314,6 +2351,15 @@ fn launch(inv: &Inventory, register: bool) {
         // registered.
         if proxy_up(inv, i) {
             eprintln!("  proxy-{} already up", port_of(proxy));
+            continue;
+        }
+        // And again for the routing plane: PROXYSTATS goes unanswered while
+        // the proxy is binding and pulling its first CP snapshot.
+        if seat_alive(&proxy_runner(inv, i), "flint-proxy", &proxy_dial(inv, i)) {
+            eprintln!(
+                "  proxy-{} STARTING (process up, not serving yet) — left alone",
+                port_of(proxy)
+            );
             continue;
         }
         spawn(
