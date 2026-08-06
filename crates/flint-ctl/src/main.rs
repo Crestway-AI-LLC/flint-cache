@@ -895,6 +895,38 @@ fn spawn_env(
     local_spawn_env(&inv.statedir, &inv.bins, name, bin, args, envs);
 }
 
+/// A seat's log, opened for APPEND, with one generation of rotation.
+///
+/// It used to be `File::create`, which truncates. Every respawn therefore
+/// erased the previous run's output, and a seat that starts, runs briefly
+/// and dies destroys its own evidence on the way back up — the more it
+/// crash-loops, the less there is to read. That is what #140 ran into: a
+/// replica exiting silently ~90s after a clean start, investigated against
+/// a log that only ever held the newest attempt, which looked like a
+/// perfectly healthy boot every time.
+///
+/// Appending is bounded by one rotation rather than left to grow forever;
+/// 64 MiB is far above what a seat writes in normal operation (the
+/// playground's busiest node reached ~1 MB in two weeks) and small enough
+/// that a crash loop cannot fill a disk. Keeping ONE generation is the
+/// trade: enough to hold the run before the one that broke, not so much
+/// that the guard stops being a guard.
+fn open_seat_log(statedir: &str, name: &str) -> std::fs::File {
+    let path = format!("{statedir}/logs/{name}.log");
+    const MAX_BYTES: u64 = 64 * 1024 * 1024;
+    if std::fs::metadata(&path)
+        .map(|m| m.len() > MAX_BYTES)
+        .unwrap_or(false)
+    {
+        let _ = std::fs::rename(&path, format!("{path}.1"));
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .expect("log file")
+}
+
 /// Start one seat on THIS machine, recording its pid.
 fn local_spawn_env(
     statedir: &str,
@@ -904,7 +936,19 @@ fn local_spawn_env(
     args: &[String],
     envs: &[(String, String)],
 ) {
-    let log = std::fs::File::create(format!("{statedir}/logs/{name}.log")).expect("log file");
+    let mut log = open_seat_log(statedir, name);
+    // A banner, because appending only helps if runs can be told apart.
+    let _ = writeln!(
+        log,
+        "=== flintctl start {name} at_ms={} bin={bin} args={} ===",
+        now_ms(),
+        args.join(" ")
+    );
+    let _ = log.flush();
+    // stdout as well as stderr, into the same file and in order. It used to
+    // go to /dev/null, so anything a seat reported there was gone before
+    // anyone could read it.
+    let log_out = log.try_clone().expect("clone seat log handle");
     let mut cmd = Command::new(format!("{bins}/{bin}"));
     cmd.args(args);
     for (k, v) in envs {
@@ -915,7 +959,7 @@ fn local_spawn_env(
     // pidfile plus `stop_seat`, not this process's exit status.
     #[allow(clippy::zombie_processes)]
     let child = cmd
-        .stdout(std::process::Stdio::null())
+        .stdout(log_out)
         .stderr(log)
         .spawn()
         .unwrap_or_else(|e| panic!("spawn {bin} ({name}): {e}"));
