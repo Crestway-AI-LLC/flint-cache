@@ -10,7 +10,7 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init /tmp/flint-tls 6760 7760 7761
+fleet_init /tmp/flint-tls 6310 7760 7761
 fleet_guard
 B=./target/release/flint-server
 PX=./target/release/flint-proxy
@@ -20,8 +20,8 @@ cleanup() { fleet_kill server; fleet_kill proxy; rm -rf "$D"; }
 trap cleanup EXIT
 
 # One backend; the proxy runs open-mode (no tenants) with a single static pair.
-$B --port 6760 --engine rocks --data-dir "$D/data" 2>/dev/null &
-fleet_wait_listen 6760
+$B --port 6310 --engine rocks --data-dir "$D/data" 2>/dev/null &
+fleet_wait_listen 6310
 sleep 0.6
 
 echo "== generate a self-signed server cert (dev only)"
@@ -54,7 +54,7 @@ PY
 }
 
 echo "== proxy with TLS termination"
-$PX --port 7760 --pairs "127.0.0.1:6760" \
+$PX --port 7760 --pairs "127.0.0.1:6310" \
     --tls-cert "$D/cert.pem" --tls-key "$D/key.pem" 2>"$D/px.log" &
 fleet_wait_listen 7760
 sleep 1.0
@@ -94,7 +94,7 @@ echo "  plaintext rejected (no PONG): $P"
 
 echo "== same binary, NO --tls-* flags: plaintext still works (no downgrade path)"
 fleet_kill proxy; sleep 0.4
-$PX --port 7761 --pairs "127.0.0.1:6760" 2>"$D/px2.log" &
+$PX --port 7761 --pairs "127.0.0.1:6310" 2>"$D/px2.log" &
 fleet_wait_listen 7761
 sleep 0.8
 grep -q "plaintext" "$D/px2.log" || { echo "FAIL: proxy did not report plaintext mode"; cat "$D/px2.log"; exit 1; }

@@ -11,7 +11,7 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init /tmp/flint-fedplumb 7091 7830 7831 7996 7997
+fleet_init /tmp/flint-fedplumb 7091 6305 7831 7996 7997
 fleet_guard
 CP=./target/release/flint-controlplane
 B=./target/release/flint-server
@@ -26,23 +26,23 @@ cleanup() {
 trap cleanup EXIT
 
 echo "== single-cluster fleet with one tenant"
-$CP --port 7830 --state "$D/cp" 2>/dev/null &
-for i in $(seq 1 30); do [ "$(valkey-cli -p 7830 PING 2>/dev/null)" = "PONG" ] && break; sleep 0.2; done
-valkey-cli -p 7830 CPADDPROXY 127.0.0.1:7997 >/dev/null
-valkey-cli -p 7830 CPADDPAIR 127.0.0.1:7091 >/dev/null
-valkey-cli -p 7830 CPADDTENANT acme tok-acme acme 1 >/dev/null
+$CP --port 6305 --state "$D/cp" 2>/dev/null &
+for i in $(seq 1 30); do [ "$(valkey-cli -p 6305 PING 2>/dev/null)" = "PONG" ] && break; sleep 0.2; done
+valkey-cli -p 6305 CPADDPROXY 127.0.0.1:7997 >/dev/null
+valkey-cli -p 6305 CPADDPAIR 127.0.0.1:7091 >/dev/null
+valkey-cli -p 6305 CPADDTENANT acme tok-acme acme 1 >/dev/null
 $B --port 7091 --engine rocks --data-dir "$D/m" 2>/dev/null &
-$PX --port 7997 --control-plane 127.0.0.1:7830 --advertise 127.0.0.1:7997 2>/dev/null &
+$PX --port 7997 --control-plane 127.0.0.1:6305 --advertise 127.0.0.1:7997 2>/dev/null &
 fleet_wait_listen 7091 7997
 sleep 1.5
 A="valkey-cli -p 7997 -a tok-acme --no-auth-warning"
 [ "$($A SET k v)" = "OK" ] || { echo "FAIL: baseline write"; exit 1; }
 
 echo "== flip the federation flag; the snapshot carries 'f'"
-[ "$(valkey-cli -p 7830 CPTENANTFEDERATE acme on)" = "OK" ] || { echo "FAIL: CPTENANTFEDERATE"; exit 1; }
-SNAP=$(valkey-cli -p 7830 CPSNAPSHOT 127.0.0.1:7997 2>/dev/null | tr '\n' ' ')
+[ "$(valkey-cli -p 6305 CPTENANTFEDERATE acme on)" = "OK" ] || { echo "FAIL: CPTENANTFEDERATE"; exit 1; }
+SNAP=$(valkey-cli -p 6305 CPSNAPSHOT 127.0.0.1:7997 2>/dev/null | tr '\n' ' ')
 echo "$SNAP" | grep -q "f" || true  # flags live in the tenants frame; assert precisely:
-TEN=$(valkey-cli -p 7830 CPSNAPSHOT 127.0.0.1:7997 | sed -n '4p')
+TEN=$(valkey-cli -p 6305 CPSNAPSHOT 127.0.0.1:7997 | sed -n '4p')
 echo "  tenants frame: $TEN"
 echo "$TEN" | grep -qE "#[rcq]*f" || { echo "FAIL: 'f' flag missing from snapshot ($TEN)"; exit 1; }
 
@@ -50,17 +50,17 @@ echo "== traffic identical with the flag set (plumbing is inert)"
 sleep 1  # let the push land
 [ "$($A GET k)" = "v" ] || { echo "FAIL: read with flag on"; exit 1; }
 [ "$($A SET k2 v2)" = "OK" ] || { echo "FAIL: write with flag on"; exit 1; }
-valkey-cli -p 7830 CPTENANTFEDERATE acme off >/dev/null
+valkey-cli -p 6305 CPTENANTFEDERATE acme off >/dev/null
 sleep 1
 [ "$($A GET k2)" = "v2" ] || { echo "FAIL: read after flag off"; exit 1; }
-TEN=$(valkey-cli -p 7830 CPSNAPSHOT 127.0.0.1:7997 | sed -n '4p')
+TEN=$(valkey-cli -p 6305 CPSNAPSHOT 127.0.0.1:7997 | sed -n '4p')
 echo "$TEN" | grep -qE "#[rcq]*f" && { echo "FAIL: 'f' flag persisted after off"; exit 1; }
 echo "  flag on -> snapshot 'f'; off -> gone; reads/writes unaffected"
 
 echo "== a CP seat list is ACCEPTED and the first live seat is watched"
 # The second seat does not exist; the proxy must still come up on the first
 # — a dead seat in the list is a rotation target, never a startup failure.
-$PX --port 7996 --control-plane 127.0.0.1:7830,127.0.0.1:7831 \
+$PX --port 7996 --control-plane 127.0.0.1:6305,127.0.0.1:7831 \
   --advertise 127.0.0.1:7996 2>"$D/px2.log" &
 fleet_wait_listen 7996
 sleep 1.5

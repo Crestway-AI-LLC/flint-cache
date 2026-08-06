@@ -9,7 +9,7 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init /tmp/flint-cpha 6730 6731 7501 7502 7503 7511 7512 7513 9001 9002 9009
+fleet_init /tmp/flint-cpha 6304 6731 7501 7502 7503 7511 7512 7513 9001 9002 9009
 fleet_guard
 CP=./target/release/flint-controlplane
 fleet_kill controlplane; sleep 0.5
@@ -59,7 +59,7 @@ echo "  leader elected: node $LEADER"
 echo "== register fleet + a tenant (follows LEADER redirect from any node)"
 cpw 7502 CPADDPROXY 127.0.0.1:9001 >/dev/null
 cpw 7502 CPADDPROXY 127.0.0.1:9002 >/dev/null
-cpw 7503 CPADDPAIR 127.0.0.1:6730 >/dev/null
+cpw 7503 CPADDPAIR 127.0.0.1:6304 >/dev/null
 cpw 7503 CPADDPAIR 127.0.0.1:6731 >/dev/null
 R=$(cpw 7501 CPADDTENANT acme tok-acme acme 1)
 echo "  $R"

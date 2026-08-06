@@ -13,7 +13,7 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init /tmp/flint-stalefence 7081 7082 7810 7999
+fleet_init /tmp/flint-stalefence 7081 7082 6314 7999
 fleet_guard
 B=./target/release/flint-server
 CP=./target/release/flint-controlplane
@@ -28,18 +28,18 @@ cleanup() {
 trap cleanup EXIT
 
 echo "== master + replica; acme opts into replica reads; stale bound 1.5s"
-$CP --port 7810 --state "$D/cp" 2>/dev/null &
-for i in $(seq 1 30); do [ "$(valkey-cli -p 7810 PING 2>/dev/null)" = "PONG" ] && break; sleep 0.2; done
-valkey-cli -p 7810 CPADDPROXY 127.0.0.1:7999 >/dev/null
-valkey-cli -p 7810 CPADDPAIR 127.0.0.1:7081,127.0.0.1:7082 >/dev/null
-valkey-cli -p 7810 CPADDTENANT acme tok-acme acme 1 >/dev/null
-valkey-cli -p 7810 CPTENANTREADS acme on >/dev/null
+$CP --port 6314 --state "$D/cp" 2>/dev/null &
+for i in $(seq 1 30); do [ "$(valkey-cli -p 6314 PING 2>/dev/null)" = "PONG" ] && break; sleep 0.2; done
+valkey-cli -p 6314 CPADDPROXY 127.0.0.1:7999 >/dev/null
+valkey-cli -p 6314 CPADDPAIR 127.0.0.1:7081,127.0.0.1:7082 >/dev/null
+valkey-cli -p 6314 CPADDTENANT acme tok-acme acme 1 >/dev/null
+valkey-cli -p 6314 CPTENANTREADS acme on >/dev/null
 $B --port 7081 --engine rocks --data-dir "$D/m" 2>/dev/null &
 fleet_wait_listen 7081
 sleep 0.7
 $B --port 7082 --engine rocks --data-dir "$D/r" --replica-of 127.0.0.1:7081 \
    --replica-read-stale-ms 1500 2>/dev/null &
-$PX --port 7999 --control-plane 127.0.0.1:7810 --advertise 127.0.0.1:7999 2>/dev/null &
+$PX --port 7999 --control-plane 127.0.0.1:6314 --advertise 127.0.0.1:7999 2>/dev/null &
 fleet_wait_listen 7082 7999
 sleep 1.5
 

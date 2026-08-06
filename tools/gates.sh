@@ -129,9 +129,43 @@ assert_no_default_ports() {
   FAILED="$FAILED default-ports"
 }
 
+# No two drills may claim the SAME port either.
+#
+# Ownership in fleet.sh is by scope directory OR port, so a shared port makes
+# one drill adopt the other's leftovers: fleet_guard waves them through and
+# fleet_kill sends them -9. In a serial suite the usual symptom is milder and
+# more confusing — a seat from the previous drill that has not finished dying
+# still holds the port, and the next drill's control plane times out waiting
+# to bind.
+#
+# 23 collisions across 14 drill pairs were sitting here when this guard was
+# written; the same defect in the fleet repo produced two spurious failures
+# in two consecutive runs, each drill green in isolation, before anyone
+# suspected the port map. A gate whose red means "unlucky ordering" is a gate
+# people re-run instead of read.
+#
+# It also catches its author: the fleet copy of this check fired on a block
+# picked by eyeballing adjacent numbers, within an hour of being added. That
+# is the argument for a fail-closed list over careful intentions.
+assert_no_port_overlap() {
+  local dupes
+  dupes=$(grep -h '^fleet_init' tools/*_drill.sh 2>/dev/null \
+    | awk '{for (i=3; i<=NF; i++) print $i}' | sort -n | uniq -d)
+  [ -z "$dupes" ] && return 0
+  echo "FAIL  two or more drills declare the same port(s):"
+  local p
+  for p in $dupes; do
+    echo "        $p: $(grep -l "^fleet_init.*[^0-9]$p\([^0-9]\|\$\)" tools/*_drill.sh | tr '\n' ' ')"
+  done
+  echo "        fleet_guard reads the other drill's seats as this drill's own."
+  echo "        Give each drill a disjoint block."
+  FAILED="$FAILED port-overlap"
+}
+
 if want check; then
   echo "== gates: fmt, clippy, tests (both feature configs)"
   assert_no_default_ports
+  assert_no_port_overlap
   step "fmt" fmt cargo fmt --all --check
   step "clippy (mem)" clippy-mem \
     cargo clippy --workspace --all-targets -- -D warnings

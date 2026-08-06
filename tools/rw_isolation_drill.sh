@@ -15,7 +15,7 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init /tmp/flint-rwiso 6940 7861
+fleet_init /tmp/flint-rwiso 6940 6316
 fleet_guard
 B=./target/release/flint-server
 PX=./target/release/flint-proxy
@@ -27,10 +27,10 @@ trap cleanup EXIT
 $B --port 6940 --engine rocks --data-dir "$D/m" 2>/dev/null &
 fleet_wait_listen 6940
 sleep 0.7
-$PX --port 7861 --pairs "127.0.0.1:6940" 2>/dev/null &
-fleet_wait_listen 7861
+$PX --port 6316 --pairs "127.0.0.1:6940" 2>/dev/null &
+fleet_wait_listen 6316
 sleep 1.0
-valkey-cli -p 7861 SET readkey readval >/dev/null
+valkey-cli -p 6316 SET readkey readval >/dev/null
 
 python3 - <<'PY'
 import json, socket, statistics, threading, time, os, sys
@@ -57,7 +57,7 @@ def read_reply(s, buf=b""):
         buf += s.recv(65536)
 
 def conn():
-    s = socket.create_connection(("127.0.0.1", 7861), timeout=5)
+    s = socket.create_connection(("127.0.0.1", 6316), timeout=5)
     s.settimeout(5)
     return s
 
@@ -122,7 +122,7 @@ PY
 [ $? -eq 0 ] || exit 1
 
 echo "== the shared classifier's traffic split counted both sides"
-STATS=$(valkey-cli -p 7861 PROXYSTATS)
+STATS=$(valkey-cli -p 6316 PROXYSTATS)
 READS=$(echo "$STATS" | tr '\r' '\n' | grep "^commands_read_total:" | cut -d: -f2)
 WRITES=$(echo "$STATS" | tr '\r' '\n' | grep "^commands_write_total:" | cut -d: -f2)
 echo "  commands_read_total=$READS commands_write_total=$WRITES"

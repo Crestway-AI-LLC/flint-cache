@@ -16,7 +16,7 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init /tmp/flint-d7 6970 6971 6972 7640 7881
+fleet_init /tmp/flint-d7 6311 6312 6972 7640 6313
 fleet_guard
 B=./target/release/flint-server
 CP=./target/release/flint-controlplane
@@ -32,28 +32,28 @@ trap cleanup EXIT
 
 $CP --port 7640 --state "$D/cp" 2>/dev/null &
 for i in $(seq 1 30); do [ "$(valkey-cli -p 7640 PING 2>/dev/null)" = "PONG" ] && break; sleep 0.2; done
-valkey-cli -p 7640 CPADDPROXY 127.0.0.1:7881 >/dev/null
-valkey-cli -p 7640 CPADDPAIR 127.0.0.1:6970,127.0.0.1:6971,127.0.0.1:6972 >/dev/null
+valkey-cli -p 7640 CPADDPROXY 127.0.0.1:6313 >/dev/null
+valkey-cli -p 7640 CPADDPAIR 127.0.0.1:6311,127.0.0.1:6312,127.0.0.1:6972 >/dev/null
 valkey-cli -p 7640 CPADDTENANT acme tok-acme acme 1 >/dev/null
-start_replica() { $B --port "$1" --engine rocks --data-dir "$D/$2" --replica-of 127.0.0.1:6970 2>/dev/null & }
-$B --port 6970 --engine rocks --data-dir "$D/m" 2>/dev/null &
-fleet_wait_listen 6970
+start_replica() { $B --port "$1" --engine rocks --data-dir "$D/$2" --replica-of 127.0.0.1:6311 2>/dev/null & }
+$B --port 6311 --engine rocks --data-dir "$D/m" 2>/dev/null &
+fleet_wait_listen 6311
 sleep 0.7
-start_replica 6971 r1
+start_replica 6312 r1
 start_replica 6972 r2
-$PX --port 7881 --control-plane 127.0.0.1:7640 --advertise 127.0.0.1:7881 2>/dev/null &
+$PX --port 6313 --control-plane 127.0.0.1:7640 --advertise 127.0.0.1:6313 2>/dev/null &
 # Gate on BOTH replicas being live before any test relies on them.
 for i in $(seq 1 50); do
-  [ "$(valkey-cli -p 6971 PING 2>/dev/null)" = "PONG" ] && [ "$(valkey-cli -p 6972 PING 2>/dev/null)" = "PONG" ] && break
+  [ "$(valkey-cli -p 6312 PING 2>/dev/null)" = "PONG" ] && [ "$(valkey-cli -p 6972 PING 2>/dev/null)" = "PONG" ] && break
   sleep 0.2
 done
-[ "$(valkey-cli -p 6971 PING 2>/dev/null)" = "PONG" ] || { echo "FAIL: replica 6971 never came up"; exit 1; }
+[ "$(valkey-cli -p 6312 PING 2>/dev/null)" = "PONG" ] || { echo "FAIL: replica 6312 never came up"; exit 1; }
 [ "$(valkey-cli -p 6972 PING 2>/dev/null)" = "PONG" ] || { echo "FAIL: replica 6972 never came up"; exit 1; }
 sleep 1
-a() { valkey-cli -p 7881 -a tok-acme --no-auth-warning "$@"; }
+a() { valkey-cli -p 6313 -a tok-acme --no-auth-warning "$@"; }
 [ "$(a SET rk masterval)" = "OK" ] || { echo "FAIL: seed"; exit 1; }
 for i in $(seq 1 40); do
-  [ "$(valkey-cli -p 6970 FLINTINFO | tr '\r' '\n' | grep '^seq_lag:' | cut -d: -f2)" = "0" ] && break
+  [ "$(valkey-cli -p 6311 FLINTINFO | tr '\r' '\n' | grep '^seq_lag:' | cut -d: -f2)" = "0" ] && break
   sleep 0.3
 done
 
@@ -62,21 +62,21 @@ valkey-cli -p 7640 CPTENANTREADS acme on >/dev/null
 sleep 1.5   # snapshot push carries the flag
 
 echo "== dead-replica fallback (master alive): kill BOTH replicas, reads survive"
-pkill -9 -f "flint-server --port 6971"; pkill -9 -f "flint-server --port 6972"; sleep 0.5
+pkill -9 -f "flint-server --port 6312"; pkill -9 -f "flint-server --port 6972"; sleep 0.5
 OK=1
 for i in $(seq 1 12); do [ "$(a GET rk)" = "masterval" ] || OK=0; done
 [ "$OK" = "1" ] || { echo "FAIL: reads did not fall back to master when replicas died"; exit 1; }
 echo "  replicas dead -> reads fell back to the master, none failed"
 # Bring the replicas back and reconverge for the master-down phase.
-start_replica 6971 r1b; start_replica 6972 r2b
+start_replica 6312 r1b; start_replica 6972 r2b
 for i in $(seq 1 50); do
-  [ "$(valkey-cli -p 6971 PING 2>/dev/null)" = "PONG" ] && [ "$(valkey-cli -p 6972 PING 2>/dev/null)" = "PONG" ] \
-    && { L=$(valkey-cli -p 6970 FLINTINFO | tr '\r' '\n' | grep '^live_replicas:' | cut -d: -f2); [ "$L" -ge 2 ] 2>/dev/null && break; }
+  [ "$(valkey-cli -p 6312 PING 2>/dev/null)" = "PONG" ] && [ "$(valkey-cli -p 6972 PING 2>/dev/null)" = "PONG" ] \
+    && { L=$(valkey-cli -p 6311 FLINTINFO | tr '\r' '\n' | grep '^live_replicas:' | cut -d: -f2); [ "$L" -ge 2 ] 2>/dev/null && break; }
   sleep 0.2
 done
 
 echo "== kill the MASTER (no controller -> stays down): the flag flips read success"
-pkill -9 -f "flint-server --port 6970"; sleep 0.6
+pkill -9 -f "flint-server --port 6311"; sleep 0.6
 # Flag ON: reads must SUCCEED (a replica serves them).
 ON=$(a GET rk)
 [ "$ON" = "masterval" ] || { echo "FAIL: flag-on read did not survive master death (got: $ON)"; exit 1; }

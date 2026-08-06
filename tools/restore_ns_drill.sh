@@ -27,7 +27,7 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init /tmp/flint-rns 7111 7112 7841 7996
+fleet_init /tmp/flint-rns 7111 7112 7841 6315
 fleet_guard
 CP=./target/release/flint-controlplane
 B=./target/release/flint-server
@@ -48,7 +48,7 @@ for _ in $(seq 1 50); do [ "$(valkey-cli -p 7841 PING 2>/dev/null)" = "PONG" ] &
 # WRONGPASS at the edge and a missing state file at backup — two symptoms
 # pointing everywhere except the cause.
 cp_must() { R=$(valkey-cli -p 7841 "$@" 2>&1); case "$R" in OK*) ;; *) echo "FAIL: $* -> $R"; exit 1;; esac; }
-cp_must CPADDPROXY 127.0.0.1:7996
+cp_must CPADDPROXY 127.0.0.1:6315
 cp_must CPADDPAIR 127.0.0.1:7111
 cp_must CPADDPAIR 127.0.0.1:7112
 cp_must CPADDTENANT acme tok-acme acme 1
@@ -58,12 +58,12 @@ $B --port 7111 --engine rocks --data-dir "$D/a" --advertise 127.0.0.1:7111 2>"$D
 disown
 $B --port 7112 --engine rocks --data-dir "$D/b" --advertise 127.0.0.1:7112 2>"$D/b.log" &
 disown
-$PX --port 7996 --control-plane 127.0.0.1:7841 --advertise 127.0.0.1:7996 2>"$D/px.log" &
+$PX --port 6315 --control-plane 127.0.0.1:7841 --advertise 127.0.0.1:6315 2>"$D/px.log" &
 disown
-fleet_wait_listen 7111 7112 7996
+fleet_wait_listen 7111 7112 6315
 sleep 1.5
-A="valkey-cli -p 7996 -a tok-acme --no-auth-warning"
-BT="valkey-cli -p 7996 -a tok-beta --no-auth-warning"
+A="valkey-cli -p 6315 -a tok-acme --no-auth-warning"
+BT="valkey-cli -p 6315 -a tok-beta --no-auth-warning"
 # The proxy learns tokens from the CP push; wait for BOTH tenants to be
 # servable rather than racing the push with 250 silent writes.
 for _ in $(seq 1 50); do [ "$($A PING 2>/dev/null)" = "PONG" ] && break; sleep 0.2; done
@@ -94,7 +94,7 @@ echo "== after the backup: move one dest-ns slot to the other pair (item 4)"
 # The restored namespace routes by ITS name. Learn which slot rk:1 lands in
 # under ns acme-r, then commit that slot to pair 1 — restore must follow.
 valkey-cli -p 7841 CPADDTENANT acme-r tok-acme-r acme-r 1 >/dev/null
-R="valkey-cli -p 7996 -a tok-acme-r --no-auth-warning"
+R="valkey-cli -p 6315 -a tok-acme-r --no-auth-warning"
 for _ in $(seq 1 50); do [ "$($R PING 2>/dev/null)" = "PONG" ] && break; sleep 0.2; done
 [ "$($R PING 2>/dev/null)" = "PONG" ] || { echo "FAIL: proxy never accepted acme-r's token"; exit 1; }
 $R SET rk:1 probe >/dev/null
@@ -114,7 +114,7 @@ sleep 2.2
 
 echo "== restore acme -> acme-r by current ownership"
 $BK restore-ns --from "$SET_DIR" --ns acme --into-ns acme-r \
-    --cp 127.0.0.1:7841 --proxy-name 127.0.0.1:7996 | tail -1 || {
+    --cp 127.0.0.1:7841 --proxy-name 127.0.0.1:6315 | tail -1 || {
   echo "FAIL: restore-ns refused"; exit 1; }
 
 echo

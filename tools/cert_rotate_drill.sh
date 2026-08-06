@@ -10,7 +10,7 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init /tmp/flint-certrot 7061 7062 7063 7795 7998
+fleet_init /tmp/flint-certrot 6300 6301 7063 6302 6303
 fleet_guard
 CTL=./target/release/flintctl
 B=./target/release/flint-server
@@ -31,9 +31,9 @@ disposable on
 statedir $D/state
 bins ./target/release
 tls on
-cp 127.0.0.1:7795
-pair 127.0.0.1:7061,127.0.0.1:7062
-proxy 127.0.0.1:7998
+cp 127.0.0.1:6302
+pair 127.0.0.1:6300,127.0.0.1:6301
+proxy 127.0.0.1:6303
 controller on
 EOF
 $CTL -f "$D/cluster.flint" bootstrap >/dev/null 2>&1 || { echo "FAIL: bootstrap"; exit 1; }
@@ -42,7 +42,7 @@ C="$D/state/certs"
 ninfo() { valkey-cli -p "$1" --tls --cacert "$C/ca.crt" --cert "$C/int.crt" --key "$C/int.key" FLINTINFO 2>/dev/null; }
 sleep 1
 # Confirm the pair is replicating (mTLS tail live).
-LR=$(ninfo 7061 | grep live_replicas | cut -d: -f2 | tr -d '\r')
+LR=$(ninfo 6300 | grep live_replicas | cut -d: -f2 | tr -d '\r')
 [ "$LR" = "1" ] || { echo "FAIL: replica not attached over mTLS ($LR)"; exit 1; }
 echo "  master + replica live over mutual TLS (live_replicas=1)"
 
@@ -58,7 +58,7 @@ python3 - <<'PY' &
 import socket, time, pathlib
 def resp(a):
     return f"*{len(a)}\r\n".encode()+b"".join(f"${len(x)}\r\n{x}\r\n".encode() for x in a)
-s=socket.create_connection(("127.0.0.1",7998),timeout=10); s.settimeout(10)
+s=socket.create_connection(("127.0.0.1",6303),timeout=10); s.settimeout(10)
 s.sendall(resp(["AUTH","tok-acme"])); s.recv(64)
 acked=errors=0
 end=time.time()+8   # spans the >2s reload poll
@@ -81,7 +81,7 @@ echo "== a NEW mesh dial verifies against the re-minted leaf"
 # A fresh replica bootstrapping now performs a full-sync + tail over mTLS —
 # its client dial must trust the CA (unchanged) and the master's listener
 # must serve the NEW leaf. If the reload were broken, the handshake fails.
-$B --port 7063 --engine rocks --data-dir "$D/r2" --replica-of 127.0.0.1:7061 \
+$B --port 7063 --engine rocks --data-dir "$D/r2" --replica-of 127.0.0.1:6300 \
    --internal-ca "$C/ca.crt" --internal-cert "$C/int.crt" --internal-key "$C/int.key" 2>"$D/r2.log" &
 CONV=""
 for i in $(seq 1 30); do
@@ -101,7 +101,7 @@ echo "== zero acked writes lost across the reload"
 wait "$WRITER" 2>/dev/null
 read -r ACKED ERRS < "$D/w"
 [ "$ERRS" = "0" ] || { echo "FAIL: writer saw $ERRS errors across the cert reload"; exit 1; }
-V=$(valkey-cli -p 7998 -a tok-acme --no-auth-warning GET ledger)
+V=$(valkey-cli -p 6303 -a tok-acme --no-auth-warning GET ledger)
 [ "$V" = "$ACKED" ] || { echo "FAIL: ledger $V != acked $ACKED"; exit 1; }
 echo "  writer: $ACKED acked, 0 errors across the reload; ledger reconciles"
 

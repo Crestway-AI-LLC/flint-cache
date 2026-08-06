@@ -16,7 +16,7 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init /tmp/flint-sweep-a 7501 7502 7601 7602 7810 7820 7879 7889
+fleet_init /tmp/flint-sweep-a 6317 6318 6319 6320 6321 7820 7879 7889
 fleet_guard
 A=/tmp/flint-sweep-a; B=/tmp/flint-sweep-b
 INVA=/tmp/flint-sweep-a.flint; INVB=/tmp/flint-sweep-b.flint
@@ -42,8 +42,8 @@ disposable on
 statedir $A
 bins ./target/release
 tls on
-cp 127.0.0.1:7810
-pair 127.0.0.1:7501,127.0.0.1:7502
+cp 127.0.0.1:6321
+pair 127.0.0.1:6317,127.0.0.1:6318
 proxy 127.0.0.1:7879
 controller on
 EOF
@@ -52,7 +52,7 @@ statedir $B
 bins ./target/release
 tls on
 cp 127.0.0.1:7820
-pair 127.0.0.1:7601,127.0.0.1:7602
+pair 127.0.0.1:6319,127.0.0.1:6320
 proxy 127.0.0.1:7889
 controller on
 EOF

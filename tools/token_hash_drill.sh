@@ -12,7 +12,7 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init /tmp/flint-tokhash 7031 7770 7991
+fleet_init /tmp/flint-tokhash 7031 6322 7991
 fleet_guard
 B=./target/release/flint-server
 CP=./target/release/flint-controlplane
@@ -27,15 +27,15 @@ cleanup() {
 trap cleanup EXIT
 
 echo "== cluster; tenant added with plaintext token 'super-secret-token'"
-$CP --port 7770 --state "$D/cp" 2>/dev/null &
-for i in $(seq 1 30); do [ "$(valkey-cli -p 7770 PING 2>/dev/null)" = "PONG" ] && break; sleep 0.2; done
-valkey-cli -p 7770 CPADDPROXY 127.0.0.1:7991 >/dev/null
-valkey-cli -p 7770 CPADDPAIR 127.0.0.1:7031 >/dev/null
-valkey-cli -p 7770 CPADDTENANT acme super-secret-token acme 1 >/dev/null
+$CP --port 6322 --state "$D/cp" 2>/dev/null &
+for i in $(seq 1 30); do [ "$(valkey-cli -p 6322 PING 2>/dev/null)" = "PONG" ] && break; sleep 0.2; done
+valkey-cli -p 6322 CPADDPROXY 127.0.0.1:7991 >/dev/null
+valkey-cli -p 6322 CPADDPAIR 127.0.0.1:7031 >/dev/null
+valkey-cli -p 6322 CPADDTENANT acme super-secret-token acme 1 >/dev/null
 $B --port 7031 --engine rocks --data-dir "$D/m" 2>/dev/null &
 fleet_wait_listen 7031
 sleep 0.7
-$PX --port 7991 --control-plane 127.0.0.1:7770 --advertise 127.0.0.1:7991 2>/dev/null &
+$PX --port 7991 --control-plane 127.0.0.1:6322 --advertise 127.0.0.1:7991 2>/dev/null &
 fleet_wait_listen 7991
 sleep 1.2
 
@@ -43,7 +43,7 @@ echo "== the plaintext exists NOWHERE server-side"
 grep -q "super-secret-token" "$D/cp" && { echo "FAIL: plaintext token in the CP state file"; exit 1; }
 DIGEST=$(printf 'super-secret-token' | shasum -a 256 | cut -d' ' -f1)
 grep -q "$DIGEST" "$D/cp" || { echo "FAIL: digest not in the state file"; exit 1; }
-SNAP=$(valkey-cli -p 7770 CPSNAPSHOT 127.0.0.1:7991)
+SNAP=$(valkey-cli -p 6322 CPSNAPSHOT 127.0.0.1:7991)
 echo "$SNAP" | grep -q "super-secret-token" && { echo "FAIL: plaintext in the snapshot push"; exit 1; }
 echo "$SNAP" | grep -q "$DIGEST" || { echo "FAIL: digest not in the snapshot"; exit 1; }
 echo "  state file + snapshot frame carry the digest only"
@@ -60,7 +60,7 @@ echo "  plaintext AUTHs; wrong token and the RAW DIGEST both rejected"
 
 echo "== CP restart from the digest-only file preserves auth"
 fleet_kill controlplane; sleep 0.3
-$CP --port 7770 --state "$D/cp" 2>/dev/null &
+$CP --port 6322 --state "$D/cp" 2>/dev/null &
 sleep 1.5   # proxy re-subscribes and gets a fresh push
 V=$(valkey-cli -p 7991 -a super-secret-token --no-auth-warning GET k)
 [ "$V" = "sealed" ] || { echo "FAIL: auth broken after CP restart: $V"; exit 1; }
@@ -78,13 +78,13 @@ proxy 127.0.0.1:7991
 pair 127.0.0.1:7031 0-16383
 tenant legacy legacy-plaintext-tok legacy 127.0.0.1:7991 - 0 0 0 0 0
 EOF
-$CP --port 7770 --state "$D/cp-old" 2>/dev/null &
-fleet_wait_listen 7770
+$CP --port 6322 --state "$D/cp-old" 2>/dev/null &
+fleet_wait_listen 6322
 sleep 1.5
 V=$(valkey-cli -p 7991 -a legacy-plaintext-tok --no-auth-warning PING 2>&1 | head -1)
 echo "$V" | grep -qi "PONG" || { echo "FAIL: legacy tenant cannot auth after migration: $V"; exit 1; }
 # Any commit rewrites the file; force one and check the plaintext is gone.
-valkey-cli -p 7770 CPTENANTQUOTA legacy 0 0 >/dev/null
+valkey-cli -p 6322 CPTENANTQUOTA legacy 0 0 >/dev/null
 grep -q "legacy-plaintext-tok" "$D/cp-old" && { echo "FAIL: plaintext survived the rewrite"; exit 1; }
 echo "  plaintext-era token hashed on load; auth works; rewrite holds digest only"
 
