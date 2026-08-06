@@ -12,7 +12,6 @@ ring = "0.17"
 # `ring` provider = pure-Rust build (no C toolchain); pinned explicitly, not
 # via the process-default provider.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
-rustls-pemfile = "2"
 x509-parser = "0.18.1"
 
 [lints]

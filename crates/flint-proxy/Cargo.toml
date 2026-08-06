@@ -15,7 +15,6 @@ flint-tls = { path = "../flint-tls" }
 # Client-facing TLS termination. `ring` provider = pure-Rust build (no C
 # toolchain); pinned explicitly, not via the process-default provider.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
-rustls-pemfile = "2"
 
 [lints]
 workspace = true

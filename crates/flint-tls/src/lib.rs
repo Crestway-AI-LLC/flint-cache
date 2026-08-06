@@ -21,10 +21,11 @@
 //! `ring` is the crypto provider (pure-Rust build), pinned explicitly so a
 //! stray `install_default` elsewhere can never change what these configs use.
 
-use std::io::{self, BufReader, Read, Write};
+use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::sync::Arc;
 
+use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::{ClientConnection, RootCertStore, ServerConnection};
 
@@ -41,17 +42,17 @@ fn provider() -> Arc<rustls::crypto::CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
 }
 
+// PEM parsing comes from rustls-pki-types, which rustls already re-exports.
+// It used to come from rustls-pemfile, archived upstream in August 2025
+// (RUSTSEC-2025-0134) with exactly this migration as the recommendation.
+// The error text is preserved verbatim: these strings are what an operator
+// sees when a cert path is wrong at boot, and they are worth more than the
+// two lines saved by letting the library phrase it.
 fn load_certs(path: &str) -> io::Result<Vec<CertificateDer<'static>>> {
-    let f = std::fs::File::open(path)
-        .map_err(|e| io::Error::new(e.kind(), format!("open cert {path}: {e}")))?;
-    let certs: Vec<_> = rustls_pemfile::certs(&mut BufReader::new(f))
+    let certs: Vec<_> = CertificateDer::pem_file_iter(path)
+        .map_err(|e| pem_err(path, "cert", e))?
         .collect::<Result<_, _>>()
-        .map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("parse cert {path}: {e}"),
-            )
-        })?;
+        .map_err(|e| pem_err(path, "cert", e))?;
     if certs.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -62,16 +63,31 @@ fn load_certs(path: &str) -> io::Result<Vec<CertificateDer<'static>>> {
 }
 
 fn load_key(path: &str) -> io::Result<PrivateKeyDer<'static>> {
-    let f = std::fs::File::open(path)
-        .map_err(|e| io::Error::new(e.kind(), format!("open key {path}: {e}")))?;
-    rustls_pemfile::private_key(&mut BufReader::new(f))
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("parse key {path}: {e}")))?
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("no private key in {path}"),
-            )
-        })
+    PrivateKeyDer::from_pem_file(path).map_err(|e| match e {
+        // The library folds "file had no key section" into its error enum;
+        // keep it distinguishable from a malformed one, because the fix is
+        // different (wrong file vs corrupt file).
+        rustls::pki_types::pem::Error::NoItemsFound => io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("no private key in {path}"),
+        ),
+        e => pem_err(path, "key", e),
+    })
+}
+
+/// Map a PEM error to the same shape the loader has always produced: an
+/// `Io` error keeps its original kind (so "not found" still reads as not
+/// found), anything else is invalid data.
+fn pem_err(path: &str, what: &str, e: rustls::pki_types::pem::Error) -> io::Error {
+    match e {
+        rustls::pki_types::pem::Error::Io(io_err) => {
+            io::Error::new(io_err.kind(), format!("open {what} {path}: {io_err}"))
+        }
+        other => io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("parse {what} {path}: {other:?}"),
+        ),
+    }
 }
 
 fn root_store(ca_path: &str) -> io::Result<RootCertStore> {

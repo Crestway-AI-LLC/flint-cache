@@ -83,6 +83,23 @@ step() {  # step <name> <log-suffix> <command...>
   fi
 }
 
+# Dependency licences (deny.toml). Flint ships as binaries under a
+# proprietary source-available licence, so a copyleft dependency would be a
+# distribution problem, not a style one — and the day it arrives is the day
+# nobody is looking at the dependency tree. The allow-list only protects
+# anything if something runs it, which is what this step is for.
+#
+# Skips when cargo-deny is absent, like the other optional-dependency
+# drills; FLINT_GATE_STRICT=1 promotes that skip to a failure, so CI and the
+# gate box cannot quietly lose the check.
+licence_check() {
+  if ! command -v cargo-deny >/dev/null 2>&1; then
+    echo "SKIP: cargo-deny not installed (cargo install --locked cargo-deny)"
+    return 0
+  fi
+  cargo deny check licenses
+}
+
 want() { case " ${STAGES} " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
 STAGES="${*:-check conformance drills chaos}"
 
@@ -122,6 +139,7 @@ if want check; then
     cargo clippy --workspace --all-targets --features flint-server/rocks,flint-backup/rocks -- -D warnings
   step "test (mem)" test-mem cargo test --workspace
   step "test (rocks)" test-rocks cargo test --workspace --features flint-server/rocks,flint-backup/rocks
+  step "licences" licences licence_check
 fi
 
 if want conformance || want drills || want chaos; then
