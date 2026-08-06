@@ -296,8 +296,10 @@ promote + proxy rediscovery. Measured kill→writable at the defaults:
 404 ms over 14 promotions with a writer hammering through the kill;
 `controller_drill.sh` reads 514 ms p50 idle, the difference being a
 fresh client process per probe) and **757 ms on a 7-host cluster over a
-real network**, which is the figure to quote because it is the only one
-paying network RTT.
+real network**. Quote a real-network figure, never loopback. slo.md
+carries the current one (rc.28, 5 hosts: p50 506 ms, worst 586 ms); this
+7-host number is the conservative end of the same class, not a different
+kind of measurement.
 
 Through the proxy edge a client sees **no outage at all** — the proxy
 chases the promotion underneath, so the workload records a slower write
