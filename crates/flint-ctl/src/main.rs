@@ -2520,11 +2520,7 @@ fn verify_checks(inv: &Inventory, probe: Option<&str>, loud: bool) -> Vec<String
         }
         let label = format!("pair {i}");
         match masters.len() {
-            1 => note(
-                true,
-                &label,
-                format!("master {} ({} down)", masters[0], down.len()),
-            ),
+            1 => note(true, &label, format!("master {}", masters[0])),
             0 => note(false, &label, format!("NO master; down: {down:?}")),
             // The invariant epoch fencing exists to make impossible. If this
             // ever prints, two nodes are accepting writes for the same slots.
@@ -2534,6 +2530,31 @@ fn verify_checks(inv: &Inventory, probe: Option<&str>, loud: bool) -> Vec<String
                 format!("SPLIT BRAIN: {} masters {masters:?}", masters.len()),
             ),
         }
+        // A declared member that is not there is a FAILURE, not a footnote.
+        //
+        // This line used to read `master X (1 down)` and count as ok, so a
+        // pair running on ONE node reported `VERIFY OK — all views agree`.
+        // The playground ran that way for five days: its replica hit a WAL
+        // gap on 2026-08-01, correctly marked itself for re-seed and exited,
+        // and nothing restarted it. The agent recommended AttachReplica 963
+        // times into the shadow journal; the watch that a human actually
+        // reads said OK the whole time, because a green summary line beats a
+        // parenthetical every time.
+        //
+        // Single-copy is exactly the state this command exists to surface:
+        // the inventory declares two members, reality has one, and until it
+        // is fixed there is no failover target and one disk holds the only
+        // copy. Operations that end in `verify_after` now refuse to report
+        // success while a fleet is in it.
+        note(
+            down.is_empty(),
+            &format!("pair {i} fully staffed"),
+            if down.is_empty() {
+                format!("{} member(s) up", pair.len())
+            } else {
+                format!("SINGLE-COPY: {down:?} down — no failover target, one copy on one disk")
+            },
+        );
     }
     note(
         builds.len() <= 1,
