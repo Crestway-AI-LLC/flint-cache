@@ -37,7 +37,8 @@ fast enough that you stop thinking about it.
    microseconds (a cross-AZ round trip is ~500 µs–1 ms), and a RAM cache
    behind a proxy crosses the same wires — so both designs pay that part
    identically. The only difference is the last step inside the node, a RAM
-   lookup versus an NVMe read: under 200 µs at p50 in our own measurements.
+   lookup versus an NVMe read: under 200 µs (0.2 ms) at p50 in our own
+   same-box measurements against Valkey.
    Against two hops plus TLS and auth, that step is **a small fraction of the
    latency your caller measures** — the smallest term in the equation, and
    the only one Flint trades. The term that dominates is whether the key was
