@@ -7,12 +7,12 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init /tmp/flint-mng- 6460 6470
+fleet_init /tmp/flint-mng- 6324 6325
 fleet_guard
 fleet_kill server; fleet_kill controller; sleep 0.4
 D1=/tmp/flint-mng-1; D2=/tmp/flint-mng-2
 rm -rf "$D1" "$D2" "$D1.log" "$D2.log"
-P1=6460; P2=6470
+P1=6324; P2=6325
 cleanup() {
   pkill -9 -f "flint-server --port 64" 2>/dev/null
   fleet_kill controller

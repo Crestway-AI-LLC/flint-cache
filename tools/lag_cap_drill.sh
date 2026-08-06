@@ -43,7 +43,7 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init /tmp/flint-lagcap 6306 6307 6471 6472 6473
+fleet_init /tmp/flint-lagcap 6460 6470 6471 6472 6473
 fleet_guard
 fleet_kill server; fleet_kill controller
 sleep 0.3

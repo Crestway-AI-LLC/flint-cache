@@ -147,16 +147,47 @@ assert_no_default_ports() {
 # It also catches its author: the fleet copy of this check fired on a block
 # picked by eyeballing adjacent numbers, within an hour of being added. That
 # is the argument for a fail-closed list over careful intentions.
+#
+# ONE exemption, and it is structural rather than a waiver: flint-chaos
+# HARDCODES the ports of the cluster it bootstraps (6460 master, 6470
+# replica, 7690 proxy — crates/flint-chaos/src/cluster.rs). Every drill that
+# drives it therefore binds those exact ports and MUST declare them, or its
+# fleet_guard and fleet_kill cover seats it never spawns. Disjointness is
+# unsatisfiable there until those ports become arguments.
+#
+# The exemption is narrow on purpose: shared only among drills that actually
+# invoke flint-chaos. A drill that claims 6460 without driving chaos is still
+# a collision, and still fails.
+#
+# This was learned by breaking it. A first pass at #138 reallocated
+# lag_cap's 6460/6470 to satisfy this check, on the strength of grepping the
+# SHELL SCRIPT and finding no use of them — the ports are in the Rust binary
+# the script calls. The guard went green over a drill whose declared scope
+# had just become fiction. Satisfying a check by moving the thing it measures
+# is the failure mode a fail-closed list is supposed to prevent, not cause.
+CHAOS_PORTS="6460 6470 7690"
 assert_no_port_overlap() {
-  local dupes
+  local dupes p owners nonchaos
   dupes=$(grep -h '^fleet_init' tools/*_drill.sh 2>/dev/null \
     | awk '{for (i=3; i<=NF; i++) print $i}' | sort -n | uniq -d)
-  [ -z "$dupes" ] && return 0
-  echo "FAIL  two or more drills declare the same port(s):"
-  local p
+  local bad=""
   for p in $dupes; do
-    echo "        $p: $(grep -l "^fleet_init.*[^0-9]$p\([^0-9]\|\$\)" tools/*_drill.sh | tr '\n' ' ')"
+    owners=$(grep -l "^fleet_init.*[^0-9]$p\([^0-9]\|\$\)" tools/*_drill.sh)
+    case " $CHAOS_PORTS " in
+      *" $p "*)
+        # Every owner must actually drive flint-chaos for the exemption to hold.
+        nonchaos=$(for f in $owners; do grep -q 'flint-chaos' "$f" || echo "$f"; done)
+        [ -z "$nonchaos" ] && continue
+        bad="$bad$p: $(echo "$nonchaos" | tr '\n' ' ')(does not drive flint-chaos)
+"
+        ;;
+      *) bad="$bad$p: $(echo "$owners" | tr '\n' ' ')
+" ;;
+    esac
   done
+  [ -z "$bad" ] && return 0
+  echo "FAIL  two or more drills declare the same port(s):"
+  printf '%s' "$bad" | sed 's/^/        /'
   echo "        fleet_guard reads the other drill's seats as this drill's own."
   echo "        Give each drill a disjoint block."
   FAILED="$FAILED port-overlap"
