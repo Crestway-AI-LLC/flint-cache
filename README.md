@@ -39,12 +39,13 @@ fast enough that you stop thinking about it.
    identically. The only difference is the last step inside the node, a RAM
    lookup versus an NVMe read: under 200 µs (0.2 ms) at p50 in our own
    same-box measurements against Valkey.
-   Against the two hops it sits between, that step stays a minority of what
-   your caller measures — **well under a fifth across AZs**, and still a
-   minority in a single-AZ fleet with the shortest hops available. It is the
-   one term Flint trades, against the term that actually dominates: whether
-   the key was there at all, because a miss costs a full round trip to your
-   origin. Holding 10× the data at NVMe prices is what buys that.
+   **That step is the whole of what Flint trades** — everything else on the
+   path is identical. What share of your latency it represents depends on
+   your topology, so run it against your own hop times; the more network
+   between client and cache, the smaller the medium's share. What does not
+   depend on topology: a miss costs a full round trip to your origin, and on
+   a hot key, all of them at once. Holding 10× the data at NVMe prices is
+   what buys that away.
 5. **Built to be operated by an agent.** From the first commit, every drill,
    failure claim, and operational lesson is captured in a form software can
    act on — runnable drills in this repo, journaled actions, allowlisted
