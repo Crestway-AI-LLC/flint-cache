@@ -122,12 +122,27 @@ the tag annotation — the pipeline records it in the manifest, and
 `flintctl upgrade --manifest` refuses the canary fast path for it
 (a format break cannot roll back; it ships via the migration runbook).
 
-## 6. What the tag triggers (fleet releases)
+## 6. What the tag builds (fleet releases)
 
-Pushing the tag to the fleet repo runs the release pipeline: tests on
-both workspaces against the exact bits shipped, then ONE artifact —
-the 14-binary Linux bundle plus `manifest.json` (version, bundle URL,
-sha256, format_break, public commit) attached to a GitHub release.
+The tag does not TRIGGER anything: the release is built by running
+`packaging/aws/release-box/run.sh --version <tag>` in the fleet repo,
+which brings up an Amazon Linux 2023 EC2 box, builds both workspaces
+there, and tears it down.
+
+It is a script rather than a CI job on purpose. The fleet runs AL2023,
+and a bundle linked against the Ubuntu runner's newer glibc will not
+start on it — so the build has to happen on the target OS either way.
+Making it a script one person runs also removes a hosted CI provider
+from the critical path of shipping a fix, which stopped being
+hypothetical when an Actions outage blocked rc.32 mid-release.
+
+It produces ONE artifact — the 14-binary Linux bundle plus
+`manifest.json` (version, bundle URL, sha256, format_break, public
+commit) — attached to a GitHub release on the fleet repo and mirrored
+to the public repo, with the same checks the CI job used to run: tests
+on both workspaces against the exact bits shipped, and an assert that
+the build stamp LANDED, by asking `flint-server --build-version` and
+`flintctl --build-version` rather than trusting the build.
 Deploying is then one command (or the ops portal's Canary-upgrade
 button): download, verify the sha256, unpack into the inventory's bins
 dir, and
