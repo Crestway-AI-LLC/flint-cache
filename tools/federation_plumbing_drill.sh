@@ -27,10 +27,10 @@ trap cleanup EXIT
 
 echo "== single-cluster fleet with one tenant"
 $CP --port 6305 --state "$D/cp" 2>/dev/null &
-for i in $(seq 1 30); do [ "$(valkey-cli -p 6305 PING 2>/dev/null)" = "PONG" ] && break; sleep 0.2; done
-valkey-cli -p 6305 CPADDPROXY 127.0.0.1:7997 >/dev/null
-valkey-cli -p 6305 CPADDPAIR 127.0.0.1:7091 >/dev/null
-valkey-cli -p 6305 CPADDTENANT acme tok-acme acme 1 >/dev/null
+fleet_wait_ping 6305
+fleet_cp 6305 CPADDPROXY 127.0.0.1:7997
+fleet_cp 6305 CPADDPAIR 127.0.0.1:7091
+fleet_cp 6305 CPADDTENANT acme tok-acme acme 1
 $B --port 7091 --engine rocks --data-dir "$D/m" 2>/dev/null &
 $PX --port 7997 --control-plane 127.0.0.1:6305 --advertise 127.0.0.1:7997 2>/dev/null &
 fleet_wait_listen 7091 7997

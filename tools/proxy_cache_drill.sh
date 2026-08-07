@@ -29,13 +29,13 @@ trap cleanup EXIT
 
 echo "== cluster: CP + master + proxy; acme consents to the cache, globex does not"
 $CP --port 7660 --state "$D/cp" 2>/dev/null &
-for i in $(seq 1 30); do [ "$(valkey-cli -p 7660 PING 2>/dev/null)" = "PONG" ] && break; sleep 0.2; done
-valkey-cli -p 7660 CPADDPROXY 127.0.0.1:7881 >/dev/null
+fleet_wait_ping 7660
+fleet_cp 7660 CPADDPROXY 127.0.0.1:7881
 # Both pair members registered so the proxy can chase a failover to 6971
 # (the FAILOVER section below promotes it).
-valkey-cli -p 7660 CPADDPAIR 127.0.0.1:6970,127.0.0.1:6971 >/dev/null
-valkey-cli -p 7660 CPADDTENANT acme tok-acme acme 1 >/dev/null
-valkey-cli -p 7660 CPADDTENANT globex tok-glx globex 1 >/dev/null
+fleet_cp 7660 CPADDPAIR 127.0.0.1:6970,127.0.0.1:6971
+fleet_cp 7660 CPADDTENANT acme tok-acme acme 1
+fleet_cp 7660 CPADDTENANT globex tok-glx globex 1
 valkey-cli -p 7660 CPTENANTCACHE acme on >/dev/null || { echo "FAIL: CPTENANTCACHE"; exit 1; }
 $B --port 6970 --engine rocks --data-dir "$D/m" 2>/dev/null &
 fleet_wait_listen 6970

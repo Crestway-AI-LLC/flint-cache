@@ -35,7 +35,7 @@ rm -rf "$D"; mkdir -p "$D"
 $B --port 6975 --engine rocks --data-dir "$D/n" 2>"$D/n.log" &
 disown
 fleet_wait_listen 6975
-for _ in $(seq 1 40); do [ "$(valkey-cli -p 6975 PING 2>/dev/null)" = "PONG" ] && break; sleep 0.2; done
+fleet_wait_ping 6975
 info() { valkey-cli -p 6975 FLINTINFO 2>/dev/null | tr -d '\r' | grep "^$1:" | cut -d: -f2; }
 
 echo "== 0. gc-sweep-ms is live-settable"

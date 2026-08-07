@@ -34,12 +34,12 @@ rm -rf "$D" "$STATE"
 echo "== node (rocks, queue cap 2, NO --async-writes scope), CP, proxy"
 $B --port 6760 --engine rocks --data-dir "$D" --async-queue-cap 2 2>/tmp/flint-af-node.log &
 $CP --port 7520 --state "$STATE" 2>/tmp/flint-af-cp.log &
-for i in $(seq 1 40); do [ "$(valkey-cli -p 7520 PING 2>/dev/null)" = "PONG" ] && break; sleep 0.2; done
-for i in $(seq 1 40); do [ "$(valkey-cli -p 6760 PING 2>/dev/null)" = "PONG" ] && break; sleep 0.2; done
-valkey-cli -p 7520 CPADDPROXY 127.0.0.1:7611 >/dev/null
-valkey-cli -p 7520 CPADDPAIR 127.0.0.1:6760 >/dev/null
-valkey-cli -p 7520 CPADDTENANT hot tok-hot hot 1 >/dev/null
-valkey-cli -p 7520 CPADDTENANT cold tok-cold cold 1 >/dev/null
+fleet_wait_ping 7520
+fleet_wait_ping 6760
+fleet_cp 7520 CPADDPROXY 127.0.0.1:7611
+fleet_cp 7520 CPADDPAIR 127.0.0.1:6760
+fleet_cp 7520 CPADDTENANT hot tok-hot hot 1
+fleet_cp 7520 CPADDTENANT cold tok-cold cold 1
 R=$(valkey-cli -p 7520 CPTENANTASYNC hot on)
 [ "$R" = "OK" ] || { echo "FAIL: CPTENANTASYNC: $R"; exit 1; }
 $PX --port 7611 --control-plane 127.0.0.1:7520 --advertise 127.0.0.1:7611 2>/tmp/flint-af-proxy.log &

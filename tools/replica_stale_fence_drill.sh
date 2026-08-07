@@ -29,10 +29,10 @@ trap cleanup EXIT
 
 echo "== master + replica; acme opts into replica reads; stale bound 1.5s"
 $CP --port 6314 --state "$D/cp" 2>/dev/null &
-for i in $(seq 1 30); do [ "$(valkey-cli -p 6314 PING 2>/dev/null)" = "PONG" ] && break; sleep 0.2; done
-valkey-cli -p 6314 CPADDPROXY 127.0.0.1:7999 >/dev/null
-valkey-cli -p 6314 CPADDPAIR 127.0.0.1:7081,127.0.0.1:7082 >/dev/null
-valkey-cli -p 6314 CPADDTENANT acme tok-acme acme 1 >/dev/null
+fleet_wait_ping 6314
+fleet_cp 6314 CPADDPROXY 127.0.0.1:7999
+fleet_cp 6314 CPADDPAIR 127.0.0.1:7081,127.0.0.1:7082
+fleet_cp 6314 CPADDTENANT acme tok-acme acme 1
 valkey-cli -p 6314 CPTENANTREADS acme on >/dev/null
 $B --port 7081 --engine rocks --data-dir "$D/m" 2>/dev/null &
 fleet_wait_listen 7081

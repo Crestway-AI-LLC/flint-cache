@@ -93,7 +93,7 @@ $A DEL doomed:after-backup >/dev/null       # absent live, exists in backup
 echo "== after the backup: move one dest-ns slot to the other pair (item 4)"
 # The restored namespace routes by ITS name. Learn which slot rk:1 lands in
 # under ns acme-r, then commit that slot to pair 1 — restore must follow.
-valkey-cli -p 7841 CPADDTENANT acme-r tok-acme-r acme-r 1 >/dev/null
+fleet_cp 7841 CPADDTENANT acme-r tok-acme-r acme-r 1
 R="valkey-cli -p 6315 -a tok-acme-r --no-auth-warning"
 for _ in $(seq 1 50); do [ "$($R PING 2>/dev/null)" = "PONG" ] && break; sleep 0.2; done
 [ "$($R PING 2>/dev/null)" = "PONG" ] || { echo "FAIL: proxy never accepted acme-r's token"; exit 1; }
@@ -105,7 +105,7 @@ for port in 7111 7112; do
 done
 [ -n "$MOVED_SLOT" ] || { echo "FAIL: could not locate rk:1's slot for acme-r"; exit 1; }
 $R DEL rk:1 >/dev/null   # the probe must not mask the restored value
-valkey-cli -p 7841 CPSETSLOT acme-r "$MOVED_SLOT" 127.0.0.1:7112 >/dev/null
+fleet_cp 7841 CPSETSLOT acme-r "$MOVED_SLOT" 127.0.0.1:7112
 echo "  slot $MOVED_SLOT (ns acme-r) committed to pair 1 AFTER the backup"
 sleep 1.2   # exception push settles before restore reads the map
 

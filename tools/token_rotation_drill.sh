@@ -31,9 +31,9 @@ sleep 0.6
 $CP --port 7550 --state "$STATE" 2>/tmp/flint-rot-cp.log &
 fleet_wait_listen 7550
 sleep 0.4
-valkey-cli -p 7550 CPADDPROXY 127.0.0.1:6323 >/dev/null
-valkey-cli -p 7550 CPADDPAIR 127.0.0.1:6750 >/dev/null
-valkey-cli -p 7550 CPADDTENANT acme tok-v1 acme 1 >/dev/null
+fleet_cp 7550 CPADDPROXY 127.0.0.1:6323
+fleet_cp 7550 CPADDPAIR 127.0.0.1:6750
+fleet_cp 7550 CPADDTENANT acme tok-v1 acme 1
 $PX --port 6323 --control-plane 127.0.0.1:7550 --advertise 127.0.0.1:6323 2>/tmp/flint-rot-px.log &
 fleet_wait_listen 6323
 sleep 1.2

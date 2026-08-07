@@ -32,21 +32,21 @@ sleep 0.6
 $CP --port 7595 --state "$D/cp" 2>"$D/cp.log" &
 fleet_wait_listen 7595
 sleep 0.5
-valkey-cli -p 7595 CPADDPROXY 127.0.0.1:7821 >/dev/null
-valkey-cli -p 7595 CPADDPROXY 127.0.0.1:7822 >/dev/null
-valkey-cli -p 7595 CPADDPAIR 127.0.0.1:6890 >/dev/null
+fleet_cp 7595 CPADDPROXY 127.0.0.1:7821
+fleet_cp 7595 CPADDPROXY 127.0.0.1:7822
+fleet_cp 7595 CPADDPAIR 127.0.0.1:6890
 $PX --port 7821 --control-plane 127.0.0.1:7595 --advertise 127.0.0.1:7821 2>/dev/null &
 $PX --port 7822 --control-plane 127.0.0.1:7595 --advertise 127.0.0.1:7822 2>/dev/null &
 fleet_wait_listen 7821 7822
 sleep 1.5
 
 echo "== A) tenant pinned to proxy1 only: proxy2's push is SUPPRESSED"
-valkey-cli -p 7595 CPADDTENANT acme tok-acme acme 1 >/dev/null
-valkey-cli -p 7595 CPSETSUBSET acme 127.0.0.1:7821 >/dev/null
+fleet_cp 7595 CPADDTENANT acme tok-acme acme 1
+fleet_cp 7595 CPSETSUBSET acme 127.0.0.1:7821
 sleep 1.2
 # Deterministic no-op bump: re-assert the same subset. The version advances
 # but NEITHER proxy's filtered view changes — both watchers must suppress.
-valkey-cli -p 7595 CPSETSUBSET acme 127.0.0.1:7821 >/dev/null
+fleet_cp 7595 CPSETSUBSET acme 127.0.0.1:7821
 sleep 1.2
 grep -q "watch 127.0.0.1:7822: suppressed push" "$D/cp.log" \
   || { echo "FAIL: no suppression logged for the unaffected proxy"; grep watch "$D/cp.log"; exit 1; }
@@ -57,7 +57,7 @@ echo "$V2" | grep -q "WRONGPASS" || { echo "FAIL: proxy2 should not hold acme's 
 echo "  proxy1 pushed + serves; proxy2 suppressed + holds no foreign token"
 
 echo "== A2) the suppressed watcher is NOT wedged: a change FOR proxy2 arrives"
-valkey-cli -p 7595 CPSETSUBSET acme 127.0.0.1:7822 >/dev/null
+fleet_cp 7595 CPSETSUBSET acme 127.0.0.1:7822
 OK=0
 for i in $(seq 1 20); do
   [ "$(valkey-cli -p 7822 -a tok-acme --no-auth-warning GET pk 2>/dev/null)" = "pv" ] && { OK=1; break; }
@@ -67,7 +67,7 @@ done
 echo "  re-subset to proxy2 -> pushed and serving (suppression is per-view, not a wedge)"
 
 echo "== B) CPDNSZONE renders each tenant -> ONLY its subset"
-valkey-cli -p 7595 CPADDTENANT globex tok-glx globex 2 >/dev/null
+fleet_cp 7595 CPADDTENANT globex tok-glx globex 2
 ZONE=$(valkey-cli -p 7595 CPDNSZONE flint.test)
 echo "$ZONE" | sed 's/^/  | /'
 # acme is pinned to exactly one member; globex shuffle-sharded across 2.

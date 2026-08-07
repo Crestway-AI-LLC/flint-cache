@@ -114,7 +114,7 @@ start_pair
   --pairs "127.0.0.1:6960,127.0.0.1:6961" 2>"$D/proxy.log" &
 disown
 fleet_wait_listen 6962
-for _ in $(seq 1 40); do [ "$(valkey-cli -p 6962 PING 2>/dev/null)" = "PONG" ] && break; sleep 0.2; done
+fleet_wait_ping 6962
 [ "$(valkey-cli -p 6962 PING)" = "PONG" ] || { echo "FAIL: proxy not up"; exit 1; }
 
 echo
@@ -252,7 +252,7 @@ start_pair
   --pairs "127.0.0.1:6960,127.0.0.1:6961" 2>"$D/proxy2.log" &
 disown
 fleet_wait_listen 6962
-for _ in $(seq 1 40); do [ "$(valkey-cli -p 6962 PING 2>/dev/null)" = "PONG" ] && break; sleep 0.2; done
+fleet_wait_ping 6962
 python3 - <<'PY' || exit 1
 from resp import *
 import subprocess, time

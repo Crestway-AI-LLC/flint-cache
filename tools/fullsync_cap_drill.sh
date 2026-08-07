@@ -21,7 +21,7 @@ trap cleanup EXIT
 
 echo "== master (--max-fullsync 1) + a dataset worth streaming"
 $B --port 6990 --engine rocks --data-dir "$D/m" --max-fullsync 1 2>"$D/m.log" &
-for i in $(seq 1 30); do [ "$(valkey-cli -p 6990 PING 2>/dev/null)" = "PONG" ] && break; sleep 0.2; done
+fleet_wait_ping 6990
 # ~8MB across the SSTs so a full sync takes long enough for the herd to overlap.
 python3 - <<'PY'
 import socket, os

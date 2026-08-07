@@ -31,10 +31,10 @@ cleanup() {
 trap cleanup EXIT
 
 $CP --port 7640 --state "$D/cp" 2>/dev/null &
-for i in $(seq 1 30); do [ "$(valkey-cli -p 7640 PING 2>/dev/null)" = "PONG" ] && break; sleep 0.2; done
-valkey-cli -p 7640 CPADDPROXY 127.0.0.1:6313 >/dev/null
-valkey-cli -p 7640 CPADDPAIR 127.0.0.1:6311,127.0.0.1:6312,127.0.0.1:6972 >/dev/null
-valkey-cli -p 7640 CPADDTENANT acme tok-acme acme 1 >/dev/null
+fleet_wait_ping 7640
+fleet_cp 7640 CPADDPROXY 127.0.0.1:6313
+fleet_cp 7640 CPADDPAIR 127.0.0.1:6311,127.0.0.1:6312,127.0.0.1:6972
+fleet_cp 7640 CPADDTENANT acme tok-acme acme 1
 start_replica() { $B --port "$1" --engine rocks --data-dir "$D/$2" --replica-of 127.0.0.1:6311 2>/dev/null & }
 $B --port 6311 --engine rocks --data-dir "$D/m" 2>/dev/null &
 fleet_wait_listen 6311

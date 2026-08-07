@@ -38,10 +38,10 @@ echo "== control plane + registrations"
 $CP --port 7241 --state "$STATE" 2>/tmp/flint-cpd-cp.log &
 fleet_wait_listen 7241
 sleep 0.5
-valkey-cli -p 7241 CPADDPROXY 127.0.0.1:7601 >/dev/null
-valkey-cli -p 7241 CPADDPROXY 127.0.0.1:7602 >/dev/null
-valkey-cli -p 7241 CPADDPAIR 127.0.0.1:6730 >/dev/null
-valkey-cli -p 7241 CPADDPAIR 127.0.0.1:6740 >/dev/null
+fleet_cp 7241 CPADDPROXY 127.0.0.1:7601
+fleet_cp 7241 CPADDPROXY 127.0.0.1:7602
+fleet_cp 7241 CPADDPAIR 127.0.0.1:6730
+fleet_cp 7241 CPADDPAIR 127.0.0.1:6740
 
 echo "== two proxies in control-plane mode (no --pairs/--tenants flags)"
 $PX --port 7601 --control-plane 127.0.0.1:7241 --advertise 127.0.0.1:7601 2>/tmp/flint-cpd-p1.log &
@@ -68,7 +68,7 @@ echo "$X" | grep -q "WRONGPASS" || { echo "FAIL: non-assigned proxy :$OPORT acce
 echo "  assigned :$APORT serves; other :$OPORT refuses (WRONGPASS) — blast radius bounded"
 
 echo "== runtime add with k=2: appears on BOTH proxies, no restarts"
-valkey-cli -p 7241 CPADDTENANT globex tok-glx globex 2 >/dev/null
+fleet_cp 7241 CPADDTENANT globex tok-glx globex 2
 sleep 1.5
 for p in 7601 7602; do
   W=$(valkey-cli -p $p -a tok-glx --no-auth-warning SET g 1 2>&1)
@@ -77,7 +77,7 @@ done
 echo "  globex live on both proxies within one push cycle"
 
 echo "== CPSETSUBSET: drain globex to :$APORT only (live re-assignment)"
-valkey-cli -p 7241 CPSETSUBSET globex "127.0.0.1:$APORT" >/dev/null
+fleet_cp 7241 CPSETSUBSET globex "127.0.0.1:$APORT"
 sleep 1.5
 X=$(valkey-cli -p "$OPORT" -a tok-glx --no-auth-warning SET g 2 2>&1)
 echo "$X" | grep -q "WRONGPASS" || { echo "FAIL: drained proxy :$OPORT still accepts globex: $X"; exit 1; }
@@ -99,7 +99,7 @@ V_AFTER=$(valkey-cli -p 7241 CPINFO | tr '\r' '\n' | grep "^version" | cut -d: -
 echo "  wrote+read during CP outage; restart restored version $V_AFTER"
 
 echo "== tenant added after CP restart still propagates (watch reconnected)"
-valkey-cli -p 7241 CPADDTENANT initech tok-ini initech 2 >/dev/null
+fleet_cp 7241 CPADDTENANT initech tok-ini initech 2
 OK=0
 for i in $(seq 1 10); do
   [ "$(valkey-cli -p 7601 -a tok-ini --no-auth-warning SET i 1 2>&1)" = "OK" ] && { OK=1; break; }

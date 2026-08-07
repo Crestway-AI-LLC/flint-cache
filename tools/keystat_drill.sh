@@ -31,7 +31,7 @@ rm -rf "$D"; mkdir -p "$D"
 $B --port 6976 --engine rocks --data-dir "$D/n" 2>"$D/n.log" &
 disown
 fleet_wait_listen 6976
-for _ in $(seq 1 40); do [ "$(valkey-cli -p 6976 PING 2>/dev/null)" = "PONG" ] && break; sleep 0.2; done
+fleet_wait_ping 6976
 V() { valkey-cli -p 6976 "$@" | tr -d '\r'; }
 written() { V FLINTKEYSTAMP "$1" | sed -n 1p; }
 created() { V FLINTKEYSTAMP "$1" | sed -n 2p; }

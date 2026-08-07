@@ -30,13 +30,13 @@ trap cleanup EXIT
 
 echo "== cluster: CP + master + TWO proxies; acme quota 400 ops/s (subset 2), globex unlimited"
 $CP --port 7690 --state "$D/cp" 2>/dev/null &
-for i in $(seq 1 30); do [ "$(valkey-cli -p 7690 PING 2>/dev/null)" = "PONG" ] && break; sleep 0.2; done
-valkey-cli -p 7690 CPADDPROXY 127.0.0.1:7911 >/dev/null
-valkey-cli -p 7690 CPADDPROXY 127.0.0.1:7912 >/dev/null
-valkey-cli -p 7690 CPADDPAIR 127.0.0.1:6985 >/dev/null
+fleet_wait_ping 7690
+fleet_cp 7690 CPADDPROXY 127.0.0.1:7911
+fleet_cp 7690 CPADDPROXY 127.0.0.1:7912
+fleet_cp 7690 CPADDPAIR 127.0.0.1:6985
 # acme's subset spans BOTH proxies: the fleet quota must divide across them.
-valkey-cli -p 7690 CPADDTENANT acme tok-acme acme 2 >/dev/null
-valkey-cli -p 7690 CPADDTENANT globex tok-glx globex 1 >/dev/null
+fleet_cp 7690 CPADDTENANT acme tok-acme acme 2
+fleet_cp 7690 CPADDTENANT globex tok-glx globex 1
 valkey-cli -p 7690 CPTENANTQUOTA acme 400 0 >/dev/null || { echo "FAIL: CPTENANTQUOTA"; exit 1; }
 $B --port 6985 --engine rocks --data-dir "$D/m" 2>/dev/null &
 fleet_wait_listen 6985

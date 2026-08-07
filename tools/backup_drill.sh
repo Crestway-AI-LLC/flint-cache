@@ -184,7 +184,7 @@ grep -q 'pair0' <<<"$(ls "$D/restored")" || { echo "FAIL: no pair0 in the restor
 $B --port 6954 --engine rocks --data-dir "$D/restored/pair0" 2>"$D/n6954.log" &
 disown
 fleet_wait_listen 6954
-for _ in $(seq 1 40); do [ "$(valkey-cli -p 6954 PING 2>/dev/null)" = "PONG" ] && break; sleep 0.2; done
+fleet_wait_ping 6954
 
 echo
 echo "== 9. the data survived and the SYSTEM ROWS did not (D4)"

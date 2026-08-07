@@ -28,10 +28,10 @@ trap cleanup EXIT
 
 echo "== cluster; tenant added with plaintext token 'super-secret-token'"
 $CP --port 6322 --state "$D/cp" 2>/dev/null &
-for i in $(seq 1 30); do [ "$(valkey-cli -p 6322 PING 2>/dev/null)" = "PONG" ] && break; sleep 0.2; done
-valkey-cli -p 6322 CPADDPROXY 127.0.0.1:7991 >/dev/null
-valkey-cli -p 6322 CPADDPAIR 127.0.0.1:7031 >/dev/null
-valkey-cli -p 6322 CPADDTENANT acme super-secret-token acme 1 >/dev/null
+fleet_wait_ping 6322
+fleet_cp 6322 CPADDPROXY 127.0.0.1:7991
+fleet_cp 6322 CPADDPAIR 127.0.0.1:7031
+fleet_cp 6322 CPADDTENANT acme super-secret-token acme 1
 $B --port 7031 --engine rocks --data-dir "$D/m" 2>/dev/null &
 fleet_wait_listen 7031
 sleep 0.7

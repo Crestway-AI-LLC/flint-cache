@@ -53,9 +53,9 @@ boot_fleet() {
   $CP --port 7596 --state "$D/cp" 2>"$D/cp.log" &
   fleet_wait_listen 7596
   sleep 0.5
-  valkey-cli -p 7596 CPADDPROXY 127.0.0.1:7823 >/dev/null
-  valkey-cli -p 7596 CPADDPAIR "$M,$R" >/dev/null
-  valkey-cli -p 7596 CPADDTENANT acme tok-acme acme 1 >/dev/null
+  fleet_cp 7596 CPADDPROXY 127.0.0.1:7823
+  fleet_cp 7596 CPADDPAIR "$M,$R"
+  fleet_cp 7596 CPADDTENANT acme tok-acme acme 1
   $PX --port 7823 --control-plane 127.0.0.1:7596 --advertise 127.0.0.1:7823 2>"$D/px.log" &
   fleet_wait_listen 7823
   sleep 1.5

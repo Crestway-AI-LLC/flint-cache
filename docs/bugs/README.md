@@ -26,3 +26,4 @@ New references should use the path, so a reader can follow them.
 | `0003-drill-port-overlap.md` | drills sharing ports adopt and kill each other's seats |
 | `0004-start-replaces-a-starting-seat.md` | `start` wiped a seat that was mid-sync |
 | `0005-oneshot-kills-its-own-seat.md` | a systemd oneshot killed the daemons it spawned |
+| `0006-silent-bootstrap-fakes-auth-failures.md` | a silent drill bootstrap reports WRONGPASS on a token it never created |

@@ -179,6 +179,52 @@ fleet_wait_listen() {
   return 0
 }
 
+# fleet_wait_ping <port> [valkey-cli opts ...] — block until the seat answers
+# PONG, or FAIL the drill on the spot.
+#
+# fleet_wait_listen proves a socket accepts; a control plane additionally has
+# to speak RESP before the bootstrap commands after it mean anything. Drills
+# used to hand-roll this as `for i in $(seq 1 30); do ... PING ... done` — a
+# loop whose expiry falls through SILENTLY, so on a loaded box the CPADD*
+# lines after it failed one by one and the drill reported WRONGPASS on a
+# token that was never registered: a product-shaped failure with a harness
+# cause (see the warm-up note in gates.sh). This helper exists so a CP that
+# never comes up says so, here, and nothing later runs against it.
+#
+# Extra arguments ride through to valkey-cli (a TLS control plane needs
+# --tls --cacert ... to answer at all).
+fleet_wait_ping() {
+  local port="$1"; shift
+  local deadline=$(( $(date +%s) + 30 ))
+  while :; do
+    [ "$(valkey-cli -p "$port" "$@" PING 2>/dev/null)" = "PONG" ] && return 0
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      echo "FAIL: no PONG from 127.0.0.1:$port after 30s"
+      exit 1
+    fi
+    sleep 0.2
+  done
+}
+
+# fleet_cp <port> [opts ...] <command ...> — a control-plane bootstrap command
+# that MUST succeed, or the drill dies here.
+#
+# valkey-cli exits 0 whether the CP replied OK or ERR, so `>/dev/null` on a
+# CPADDTENANT was discarding the only evidence that the tenant exists. Every
+# assertion after a silently failed bootstrap tests a cluster that was never
+# built. Success is a reply starting with OK (CPADDTENANT says "OK tenant
+# ..."); anything else — ERR, an empty reply, connection refused — is fatal.
+fleet_cp() {
+  local port="$1"; shift
+  local r
+  r=$(valkey-cli -p "$port" "$@" 2>&1)
+  case "$r" in
+    OK*) return 0 ;;
+  esac
+  echo "FAIL: CP bootstrap on 127.0.0.1:$port: $* -> ${r:-<no reply>}"
+  exit 1
+}
+
 # fleet_guard — refuse to run on a box that already has a foreign fleet.
 #
 # The point is to FAIL rather than destroy. A drill that silently killed a

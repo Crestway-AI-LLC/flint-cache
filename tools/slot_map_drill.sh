@@ -25,11 +25,11 @@ trap cleanup EXIT
 
 echo "== fleet: CP, two pairs, proxy, one tenant"
 $CP --port 7840 --state "$D/cp" 2>/dev/null &
-for i in $(seq 1 30); do [ "$(valkey-cli -p 7840 PING 2>/dev/null)" = "PONG" ] && break; sleep 0.2; done
-valkey-cli -p 7840 CPADDPROXY 127.0.0.1:7995 >/dev/null
-valkey-cli -p 7840 CPADDPAIR 127.0.0.1:7101 >/dev/null
-valkey-cli -p 7840 CPADDPAIR 127.0.0.1:7102 >/dev/null
-valkey-cli -p 7840 CPADDTENANT acme tok-acme acme 1 >/dev/null
+fleet_wait_ping 7840
+fleet_cp 7840 CPADDPROXY 127.0.0.1:7995
+fleet_cp 7840 CPADDPAIR 127.0.0.1:7101
+fleet_cp 7840 CPADDPAIR 127.0.0.1:7102
+fleet_cp 7840 CPADDTENANT acme tok-acme acme 1
 $B --port 7101 --engine rocks --data-dir "$D/a" --advertise 127.0.0.1:7101 2>/dev/null &
 $B --port 7102 --engine rocks --data-dir "$D/b" --advertise 127.0.0.1:7102 2>/dev/null &
 $PX --port 7995 --control-plane 127.0.0.1:7840 --advertise 127.0.0.1:7995 2>/dev/null &
@@ -62,7 +62,7 @@ echo "  committed: CPSLOTS row + CPINFO slot_exceptions:1"
 echo "== the truth survives a CP restart (durable, not session state)"
 pkill -9 -f "flint-controlplane --port 7840"; sleep 0.3
 $CP --port 7840 --state "$D/cp" 2>/dev/null &
-for i in $(seq 1 30); do [ "$(valkey-cli -p 7840 PING 2>/dev/null)" = "PONG" ] && break; sleep 0.2; done
+fleet_wait_ping 7840
 valkey-cli -p 7840 CPSLOTS | grep -q "acme $SLOT" || { echo "FAIL: exception lost across CP restart"; exit 1; }
 echo "  CP restarted; exception row intact"
 
@@ -102,9 +102,9 @@ valkey-cli -p 7840 CPSLOTS | grep -q "acme $SLOT" && { echo "FAIL: row survived 
 echo "  cleared; CPSLOTS empty"
 
 echo "== consolidation: adjacent commits compress; move-backs self-retire"
-valkey-cli -p 7840 CPSETSLOT acme 1000 1 >/dev/null
-valkey-cli -p 7840 CPSETSLOT acme 1001 1 >/dev/null
-valkey-cli -p 7840 CPSETSLOT acme 1002 1 >/dev/null
+fleet_cp 7840 CPSETSLOT acme 1000 1
+fleet_cp 7840 CPSETSLOT acme 1001 1
+fleet_cp 7840 CPSETSLOT acme 1002 1
 ROWS=$(valkey-cli -p 7840 CPSLOTS | grep -c "acme")
 RUN=$(valkey-cli -p 7840 CPSLOTS | grep "acme 1000")
 [ "$ROWS" = "1" ] && echo "$RUN" | grep -q "acme 1000 1002 1" || { echo "FAIL: adjacent commits did not compress ($ROWS rows: $RUN)"; exit 1; }
@@ -112,13 +112,13 @@ SNAP=$(valkey-cli -p 7840 CPSNAPSHOT 127.0.0.1:7995 | sed -n '6p')
 echo "$SNAP" | grep -q "acme:1000-1002:1" || { echo "FAIL: run form missing from snapshot ($SNAP)"; exit 1; }
 echo "  three commits -> ONE row (acme 1000 1002 1); snapshot carries acme:1000-1002:1"
 # Interior move-back: splits the run AND self-retires (default owner).
-valkey-cli -p 7840 CPSETSLOT acme 1001 0 >/dev/null
+fleet_cp 7840 CPSETSLOT acme 1001 0
 ROWS=$(valkey-cli -p 7840 CPSLOTS | grep -c "acme")
 [ "$ROWS" = "2" ] || { echo "FAIL: interior move-back should split to 2 rows (got $ROWS)"; exit 1; }
 [ "$(valkey-cli -p 7840 CPCONSOLIDATE)" = "2" ] || { echo "FAIL: CPCONSOLIDATE count"; exit 1; }
 # Full move-back retires everything without CPCLEARSLOT.
-valkey-cli -p 7840 CPSETSLOT acme 1000 0 >/dev/null
-valkey-cli -p 7840 CPSETSLOT acme 1002 0 >/dev/null
+fleet_cp 7840 CPSETSLOT acme 1000 0
+fleet_cp 7840 CPSETSLOT acme 1002 0
 [ "$(valkey-cli -p 7840 CPSLOTS | grep -c acme)" = "0" ] || { echo "FAIL: move-backs did not self-retire"; exit 1; }
 echo "  interior split -> 2 rows; CPCONSOLIDATE=2; move-backs self-retired to 0 rows"
 

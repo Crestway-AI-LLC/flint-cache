@@ -79,7 +79,7 @@ $BK restore --from "$SPEC/$SET_ID" --into "$D/restored" | tail -1 || {
 $B --port 6947 --engine rocks --data-dir "$D/restored/pair0" 2>"$D/r.log" &
 disown
 fleet_wait_listen 6947
-for _ in $(seq 1 40); do [ "$(valkey-cli -p 6947 PING 2>/dev/null)" = "PONG" ] && break; sleep 0.2; done
+fleet_wait_ping 6947
 [ "$(valkey-cli -p 6947 GET s3k:0042)" = "val-0042" ] || {
   echo "FAIL: corpus key missing after S3 restore"; exit 1; }
 [ "$(valkey-cli -p 6947 DBSIZE)" = "300" ] || {
