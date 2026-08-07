@@ -85,6 +85,11 @@ struct Inventory {
     /// usage record a metering reporter aggregates from. Absent = the
     /// agent keeps no billing journal (self-hosters who do not bill).
     billing: Option<String>,
+    /// Local retention for the agent's daily billing segments
+    /// (agent --billing-retain-days). Absent = the agent's default; the
+    /// archive timer must ship a segment before it ages out, so this only
+    /// ever needs raising, not lowering.
+    billing_retain_days: Option<u64>,
     controller: bool,
     /// Failure domain per HOST (`zone <host> <name>`): an availability zone
     /// on a cloud, a rack or a power domain on your own hardware.
@@ -201,6 +206,7 @@ fn parse_inventory(path: &str) -> Inventory {
             "proxy-advertise" => inv.proxy_advertise.push(val.to_string()),
             "edge-trust" => inv.edge_trust = Some(val.to_string()),
             "billing" => inv.billing = Some(val.to_string()),
+            "billing-retain-days" => inv.billing_retain_days = val.parse().ok(),
             "controller" => inv.controller = val == "on",
             "agent" => inv.agent = Some(val.to_string()),
             "capacity" => inv.capacity_bytes = val.parse().ok(),
@@ -2125,6 +2131,9 @@ fn agent_args(inv: &Inventory) -> Option<Vec<String>> {
     // (e.g. the system bundle).
     if let Some(billing) = &inv.billing {
         args.extend(["--billing".to_string(), billing.clone()]);
+        if let Some(days) = inv.billing_retain_days {
+            args.extend(["--billing-retain-days".into(), days.to_string()]);
+        }
     }
     if inv.client_tls {
         let trust = inv
