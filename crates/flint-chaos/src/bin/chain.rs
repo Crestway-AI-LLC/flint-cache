@@ -30,6 +30,31 @@ fn key(i: u64) -> String {
 
 const END: &[u8] = b"END";
 
+/// Send one build batch, retrying transport errors instead of dying on them.
+///
+/// EAGAIN here is the client's 1500ms read timeout firing while a loaded box
+/// stalls the server — a retryable condition, not a verdict about the data
+/// (a run died on exactly this at "pipeline build: WouldBlock"). The batch is
+/// all SETs of deterministic values, so resending it is idempotent. A timeout
+/// mid-batch leaves unread replies on the old stream, so every retry starts
+/// from a fresh connection rather than a desynced one.
+fn pipeline_retry(w: &mut Client, master: u16, batch: &[Vec<Vec<u8>>]) {
+    let mut last: Option<std::io::Error> = None;
+    for attempt in 0..5u32 {
+        match w.pipeline(batch) {
+            Ok(()) => return,
+            Err(e) => {
+                last = Some(e);
+                std::thread::sleep(Duration::from_millis(100 << attempt));
+                if let Ok(fresh) = Client::connect(master) {
+                    *w = fresh;
+                }
+            }
+        }
+    }
+    panic!("pipeline build failed after 5 attempts: {last:?}");
+}
+
 fn main() {
     // Which 8-port block this run owns (see cluster::SPAN). The driving
     // drill declares the same block to fleet_init, so every port bound here
@@ -68,12 +93,12 @@ fn main() {
         };
         batch.push(vec![b"SET".to_vec(), key(i).into_bytes(), next]);
         if batch.len() == 1000 {
-            w.pipeline(&batch).expect("pipeline build");
+            pipeline_retry(&mut w, cluster.master(), &batch);
             batch.clear();
         }
     }
     if !batch.is_empty() {
-        w.pipeline(&batch).expect("pipeline build tail");
+        pipeline_retry(&mut w, cluster.master(), &batch);
     }
     println!(
         "built {n} links in {:.1}s; waiting for replica to catch up",

@@ -299,7 +299,16 @@ fn main() {
             shared.acks_after_kill.store(0, Ordering::SeqCst);
             let kill_ms = now_ms();
             shared.kill_ms.store(kill_ms, Ordering::SeqCst);
-            cluster.kill_master_hot();
+            // Two clocks on purpose. `kill_ms` is armed BEFORE the kill and
+            // times the outage (RTO/stall) from the writer's vantage.
+            // `dead_ms` is stamped AFTER the SIGKILL landed and is the only
+            // boundary the LEDGER may use: in the gap between the two — an
+            // epoch read plus a pkill spawn, tens of ms on a busy box — the
+            // old master is alive and still acking. Judging those acks as
+            // "sent after the kill, so the new master's" left the ledger
+            // claiming values the survivor never had, and the NEXT replica
+            // kill reported them as data loss (seed 7: key270 216 < 239).
+            let dead_ms = cluster.kill_master_hot();
             // Harness-mode replacement replicas get fresh ports; republish
             // so the writer can find the pair again. (Attached and
             // controlled-local endpoints are fixed; this is a no-op there.)
@@ -459,7 +468,7 @@ fn main() {
                     unverifiable += 1;
                     let mut led = shared.ledger.lock().unwrap_or_else(|e| e.into_inner());
                     if let Some(entry) = led.get_mut(key) {
-                        entry.acked_at.retain(|&(_, sent, _)| sent >= kill_ms);
+                        entry.acked_at.retain(|&(_, sent, _)| sent >= dead_ms);
                         entry.last_acked =
                             entry.acked_at.iter().map(|&(s, _, _)| s).max().unwrap_or(0);
                     }
@@ -487,11 +496,15 @@ fn main() {
                 // writes (about one cap-window's worth), not on their age.
                 // Until the claim and the mechanism are reconciled the
                 // assertion stays as-is, because it is the published promise.
-                for &(seq, _sent, at) in acked_at {
+                for &(seq, sent, at) in acked_at {
                     // The writer may have re-acked this key AFTER the kill;
                     // those acks belong to the new master and say nothing
-                    // about what the old one lost.
-                    if at >= kill_ms {
+                    // about what the old one lost. Judged by SEND time
+                    // against the post-SIGKILL clock: a request sent at or
+                    // after `dead_ms` cannot have been served by the dead
+                    // master, whereas one sent in the arming gap — or in
+                    // flight at the kill and acked afterwards — can.
+                    if sent >= dead_ms {
                         continue;
                     }
                     // NO LONGER AN ASSERTION — see the note above. This used
@@ -542,7 +555,7 @@ fn main() {
                 if let Some(entry) = led.get_mut(key) {
                     entry
                         .acked_at
-                        .retain(|&(s, sent, _)| s <= got || sent >= kill_ms);
+                        .retain(|&(s, sent, _)| s <= got || sent >= dead_ms);
                     entry.last_acked = entry.acked_at.iter().map(|&(s, _, _)| s).max().unwrap_or(0);
                 }
             }

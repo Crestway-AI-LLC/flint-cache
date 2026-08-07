@@ -344,7 +344,11 @@ impl Target {
     /// writer::Shared::pause); the standard kill_master's own wait can never
     /// observe seq_lag==0 under a live hammer and would burn its whole
     /// timeout before killing anyway.
-    pub fn kill_master_hot(&mut self) {
+    /// Returns the wall clock stamped right after the SIGKILL landed — the
+    /// earliest instant at which no write can have been served by the dead
+    /// master. Acks SENT at or after this are provably the new master's;
+    /// anything earlier may be the old master's last words.
+    pub fn kill_master_hot(&mut self) -> u64 {
         match self {
             Target::Local {
                 cluster,
@@ -355,12 +359,15 @@ impl Target {
                 } else {
                     cluster.kill_master();
                 }
+                cluster.last_kill_dead_ms
             }
             Target::Attached(a) => {
                 let dead = a.master();
                 a.kill(&dead).unwrap_or_else(|e| panic!("kill master: {e}"));
+                let dead_ms = crate::writer::now_ms();
                 a.restart(&dead)
                     .unwrap_or_else(|e| panic!("restart {dead}: {e}"));
+                dead_ms
             }
         }
     }
@@ -911,6 +918,13 @@ pub struct Cluster {
     pub replica_kills: u32,
     /// base + 2; only bound when start_proxy is called.
     pub proxy_port: u16,
+    /// Wall clock stamped immediately AFTER the most recent master kill's
+    /// SIGKILL was delivered. The ledger needs this boundary, not the one
+    /// armed before the kill: between arming and pkill actually landing the
+    /// old master is alive and acking, and an ack from that gap judged as
+    /// "the new master's" leaves the ledger claiming a value the survivor
+    /// never had.
+    pub last_kill_dead_ms: u64,
 }
 
 impl Cluster {
@@ -927,13 +941,17 @@ impl Cluster {
         let master_port = base;
         let replica_port = base + 1;
         fleet.track(spawn_node(master_port, &fresh_dir(0), None));
+        // Same 15s budget replacement spawns get: a loaded box (another
+        // drill building its dataset, RocksDB opening) can hold a fresh
+        // node past 5s before it answers PING, and bootstrap dying on that
+        // is a flake, not a finding.
         assert!(
-            wait_for_pong(master_port, Duration::from_secs(5)),
+            wait_for_pong(master_port, Duration::from_secs(15)),
             "master up"
         );
         fleet.track(spawn_node(replica_port, &fresh_dir(1), Some(master_port)));
         assert!(
-            wait_for_pong(replica_port, Duration::from_secs(5)),
+            wait_for_pong(replica_port, Duration::from_secs(15)),
             "replica up"
         );
         Self {
@@ -949,6 +967,7 @@ impl Cluster {
             controlled: false,
             master_kills: 0,
             replica_kills: 0,
+            last_kill_dead_ms: 0,
         }
     }
 
@@ -1126,6 +1145,7 @@ impl Cluster {
             })
             .unwrap_or(1);
         kill_by_port(self.master_port);
+        self.last_kill_dead_ms = crate::writer::now_ms();
         let next = current + 1;
         let mut c = Client::connect(self.replica_port).expect("survivor connect");
         match c.call(&[b"FLINTPROMOTE", b"0", next.to_string().as_bytes()]) {
@@ -1192,6 +1212,7 @@ impl Cluster {
         let dead = self.master_port;
         let survivor = self.replica_port;
         kill_by_port(dead);
+        self.last_kill_dead_ms = crate::writer::now_ms();
         assert!(
             wait_until_role(survivor, "master", Duration::from_secs(20)),
             "controller did not promote survivor :{survivor} within 20s"

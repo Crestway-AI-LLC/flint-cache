@@ -64,6 +64,47 @@ fleet_init() {
   FLEET_SCOPE="$1"; shift
   FLEET_PORTS="$(printf '%s' "$*" | tr ' ' '|')"
   [ -n "$FLEET_SCOPE" ] || { echo "fleet_init: empty scope"; exit 1; }
+  # ONE drill per scope at a time. Two drills declaring the same scope and
+  # port block pass each other's fleet_guard — shared scope and ports read as
+  # "ours" by construction — and the second one's opening fleet_kill sweep
+  # then SIGKILLs the first's freshly spawned seats. Seen for real: two
+  # chaos_drill.sh runs on one box, and the loser died at "master up" with an
+  # EMPTY node log, which reads as a boot bug rather than as the collision it
+  # is (docs/bugs/0003 is the same collision through a different door).
+  #
+  # mkdir is the atomic take. Release is NOT a trap: 76 drills already set
+  # their own `trap cleanup EXIT`, and the last trap installed wins, so a
+  # trap here would be silently clobbered by most callers. Reclaiming a dead
+  # owner's lock is therefore the path that has to work, not the fallback.
+  #
+  # Liveness is pid PLUS process START TIME, never the pid alone. These
+  # drills spawn hundreds of short-lived processes, so a recorded pid can
+  # exit and be REUSED — the same window fleet_kill re-verifies against
+  # before signalling. A bare `kill -0` landing on an unrelated live process
+  # would refuse every drill on this scope forever, turning one crashed run
+  # into a permanently wedged box. The start time settles it exactly: a
+  # reused pid always has a different one. (Matching on argv instead was
+  # tried and is too loose — any process whose command line merely MENTIONS
+  # a tools script matches, which a test caught immediately.)
+  FLEET_LOCK="${FLEET_SCOPE}.lock"
+  local owner owner_started now_started
+  while ! mkdir "$FLEET_LOCK" 2>/dev/null; do
+    owner="$(cat "$FLEET_LOCK/pid" 2>/dev/null || true)"
+    owner_started="$(cat "$FLEET_LOCK/started" 2>/dev/null || true)"
+    now_started=""
+    if [ -n "$owner" ]; then
+      now_started="$(ps -o lstart= -p "$owner" 2>/dev/null || true)"
+    fi
+    if [ -n "$now_started" ] && [ "$now_started" = "$owner_started" ]; then
+      echo "REFUSING TO RUN: drill scope $FLEET_SCOPE is held by a live run (pid $owner)"
+      echo "  Two drills on one scope kill each other's seats mid-boot."
+      echo "  Wait for that run, or stop it from its own session."
+      exit 1
+    fi
+    rm -rf "$FLEET_LOCK"
+  done
+  printf '%s\n' "$$" > "$FLEET_LOCK/pid"
+  ps -o lstart= -p "$$" > "$FLEET_LOCK/started" 2>/dev/null || true
 }
 
 # Fleet processes belonging to ANOTHER Flint-family project, as "pid argv"

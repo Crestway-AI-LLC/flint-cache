@@ -27,3 +27,4 @@ New references should use the path, so a reader can follow them.
 | `0004-start-replaces-a-starting-seat.md` | `start` wiped a seat that was mid-sync |
 | `0005-oneshot-kills-its-own-seat.md` | a systemd oneshot killed the daemons it spawned |
 | `0006-silent-bootstrap-fakes-auth-failures.md` | a silent drill bootstrap reports WRONGPASS on a token it never created |
+| `0007-armed-clock-blames-replica-kill.md` | ledger judged old-master acks by the pre-kill clock; a replica kill got blamed for a master kill's loss |
