@@ -64,7 +64,37 @@ for _ in $(seq 1 60); do [ "$(replicas_of "$A")" = "1" ] && break; sleep 0.5; do
 echo "  $A master, live_replicas 1"
 
 echo "== write something, so a lost replica would be losing real data"
-for i in $(seq 1 200); do valkey-cli -p 7250 SET "cold:$i" "v$i" >/dev/null; done
+FIRST=$(valkey-cli -p 7250 SET cold:1 v1 2>&1)
+for i in $(seq 2 200); do valkey-cli -p 7250 SET "cold:$i" "v$i" >/dev/null; done
+# ASSERT THE SEED LANDED. Without this the drill's final "data lost" could
+# equally mean "data never written", and those need different fixes — the
+# KB already carries this lesson and this drill was written ignoring it.
+SEEDED=$(valkey-cli -p 7250 DBSIZE)
+[ "${SEEDED:-0}" -ge 200 ] || {
+  echo "FAIL: seed writes not accepted — DBSIZE=$SEEDED on $A after 200 SETs; first SET replied: $FIRST"
+  echo "      (nothing downstream can be interpreted; the drill never had data)"
+  exit 1
+}
+echo "  $SEEDED keys on $A"
+# WAIT for the replica to hold them before promoting it. This inventory
+# leaves min-replicas at 0, so a write acks without any replica confirming
+# it, and `failover` immediately after the loop could promote a node still
+# behind — losing writes this drill later asserts are present. Correct
+# product behaviour for min-replicas 0, and a race the drill should not
+# leave open.
+#
+# Precautionary, not diagnosed: the failure that prompted it turned out to
+# be a full disk (see the seed assertion above), not replication timing.
+for _ in $(seq 1 60); do
+  [ "$(valkey-cli -p 7250 FLINTINFO 2>/dev/null | tr -d '\r' | sed -n 's/^seq_lag://p')" = "0" ] && break
+  sleep 0.5
+done
+[ "$(valkey-cli -p 7250 FLINTINFO 2>/dev/null | tr -d '\r' | sed -n 's/^seq_lag://p')" = "0" ] || {
+  echo "FAIL: replica never caught up before the failover; promoting now would"
+  echo "      lose writes and the data assertion at the end would be measuring"
+  echo "      that, not the cold-start path this drill is about"
+  exit 1
+}
 
 echo "== fail over: the durable roles now disagree with inventory order"
 $CTL failover "$A" >/dev/null 2>&1
@@ -145,7 +175,13 @@ grep -q "durable roles disagree with inventory order" /tmp/flint-coldrole.out ||
 echo "  $MASTER master, $A replica, live_replicas 1"
 
 echo "== and the data survived the re-seed"
-[ "$(valkey-cli -p 7251 GET cold:200)" = "v200" ] || { echo "FAIL: data lost"; exit 1; }
+[ "$(valkey-cli -p 7251 GET cold:200)" = "v200" ] || {
+  echo "FAIL: data lost — GET cold:200 on master $B returned '$(valkey-cli -p 7251 GET cold:200)'"
+  echo "      master  DBSIZE=$(valkey-cli -p 7251 DBSIZE) latest_seq=$(valkey-cli -p 7251 FLINTINFO | tr -d '\r' | sed -n 's/^latest_seq://p')"
+  echo "      replica DBSIZE=$(valkey-cli -p 7250 DBSIZE) latest_seq=$(valkey-cli -p 7250 FLINTINFO | tr -d '\r' | sed -n 's/^latest_seq://p')"
+  echo "      sample: $(valkey-cli -p 7251 KEYS 'cold:*' | head -3 | tr '\n' ' ')"
+  exit 1
+}
 COUNT=$(valkey-cli -p 7251 DBSIZE)
 [ "${COUNT:-0}" -ge 200 ] || { echo "FAIL: expected >=200 keys, got $COUNT"; exit 1; }
 echo "  $COUNT keys on the master"
