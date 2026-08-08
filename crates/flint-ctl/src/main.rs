@@ -1941,6 +1941,73 @@ fn start_pair_nodes(inv: &Inventory, pair: &[String]) {
             std::thread::sleep(Duration::from_millis(700));
         }
     }
+    reconcile_cold_start(inv, pair, &tls, live_master.is_none());
+}
+
+/// After a COLD start, check that inventory order was actually right.
+///
+/// The loop above falls back to position when nothing is up: pair[0] is
+/// started bare and the rest get `--replica-of pair[0]`. If the pair last
+/// failed over, the durable roles are the reverse of that — and a node's
+/// manifest outranks the flag, correctly, because a flag must never be able
+/// to demote a master holding the newest data. The two safety rules compose
+/// into a fleet that replicates nothing:
+///
+///   pair[0], durable replica, started bare  -> replica of NOBODY
+///   pair[1], durable master, given the flag -> "ignoring --replica-of"
+///
+/// and `status` looks structurally fine — both up, roles coherent, epochs
+/// agreed. Only `live_replicas 0` gives it away. Seen on the playground:
+/// a `stop`/`start` for an unrelated address change left the pair with no
+/// replication and no error, on a fleet that had failed over weeks earlier.
+///
+/// So once the seats are serving, ask them who is master and repair if the
+/// answer is not pair[0]. Costs one extra probe on the common path, where
+/// the assumption holds and nothing is rolled.
+fn reconcile_cold_start(
+    inv: &Inventory,
+    pair: &[String],
+    tls: &Option<Arc<flint_tls::ClientConfig>>,
+    was_cold: bool,
+) {
+    if !was_cold || pair.len() < 2 {
+        return;
+    }
+    // A member that boots into a full sync is alive and not yet serving, so
+    // give the probe the same budget the rest of `start` gives a seat.
+    let mut roles: Vec<Option<String>> = Vec::new();
+    for _ in 0..40 {
+        roles = pair.iter().map(|a| info_field(a, tls, "role:")).collect();
+        if roles.iter().all(Option::is_some) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let Some(master) = pair
+        .iter()
+        .zip(&roles)
+        .find(|(_, r)| r.as_deref() == Some("master"))
+        .map(|(a, _)| a.clone())
+    else {
+        // No master anywhere is a different failure — the controller's to
+        // resolve, and re-seeding blind against no lineage would be worse
+        // than leaving it visible.
+        eprintln!("  pair has no reachable master after cold start — left for the controller");
+        return;
+    };
+    if master == pair[0] {
+        return;
+    }
+    eprintln!(
+        "  durable roles disagree with inventory order: {master} is master, not {}",
+        pair[0]
+    );
+    for addr in pair.iter().filter(|a| **a != master) {
+        eprintln!("  re-seeding {addr} as a replica of {master}");
+        if let Err(e) = roll_node(inv, addr, &master, &[], &None, true) {
+            die(&format!("re-seeding {addr} onto {master}: {e}"));
+        }
+    }
 }
 
 /// Argument builders, one per fleet role.
@@ -2661,6 +2728,35 @@ fn verify_checks(inv: &Inventory, probe: Option<&str>, loud: bool) -> Vec<String
                 format!("SINGLE-COPY: {down:?} down — no failover target, one copy on one disk")
             },
         );
+        // Present is not the same as attached, and the check above only
+        // knows about present. BUG-0008: both members of a failed-over pair
+        // came up serving, with correct roles and agreed epochs, and
+        // replicated nothing — so `fully staffed` said `2 member(s) up` and
+        // was telling the truth about the wrong thing. The fleet was
+        // single-copy with nobody down.
+        //
+        // Ask the master how many replicas are actually streaming. That is
+        // the number the phrase "no failover target, one copy on one disk"
+        // was always about.
+        if pair.len() > 1 && masters.len() == 1 {
+            let attached: usize = info_field(&masters[0], &tls, "live_replicas:")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            let want = pair.len() - 1;
+            note(
+                attached >= want,
+                &format!("pair {i} replicating"),
+                if attached >= want {
+                    format!("{attached} replica(s) streaming from {}", masters[0])
+                } else {
+                    format!(
+                        "SINGLE-COPY: every member up, but {attached} of {want} streaming \
+                         from {} — one disk holds the only copy",
+                        masters[0]
+                    )
+                },
+            );
+        }
     }
     note(
         builds.len() <= 1,
