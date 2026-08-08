@@ -21,12 +21,12 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init /tmp/flint-coldrole-state 7221 7222 7223 7224
+fleet_init /tmp/flint-coldrole-state 7250 7251 7252 7253
 fleet_guard
 STATE=/tmp/flint-coldrole-state
 INV=/tmp/flint-coldrole.flint
-A=127.0.0.1:7221   # inventory pair[0]
-B=127.0.0.1:7222   # inventory pair[1] — the one we promote
+A=127.0.0.1:7250   # inventory pair[0]
+B=127.0.0.1:7251   # inventory pair[1] — the one we promote
 fleet_kill server; fleet_kill proxy
 fleet_kill controlplane; fleet_kill controller
 sleep 0.4
@@ -46,9 +46,9 @@ cat > "$INV" <<EOF
 disposable on
 statedir $STATE
 bins ./target/release
-cp 127.0.0.1:7224
+cp 127.0.0.1:7253
 pair $A,$B
-proxy 127.0.0.1:7223
+proxy 127.0.0.1:7252
 controller on
 EOF
 
@@ -64,7 +64,7 @@ for _ in $(seq 1 60); do [ "$(replicas_of "$A")" = "1" ] && break; sleep 0.5; do
 echo "  $A master, live_replicas 1"
 
 echo "== write something, so a lost replica would be losing real data"
-for i in $(seq 1 200); do valkey-cli -p 7221 SET "cold:$i" "v$i" >/dev/null; done
+for i in $(seq 1 200); do valkey-cli -p 7250 SET "cold:$i" "v$i" >/dev/null; done
 
 echo "== fail over: the durable roles now disagree with inventory order"
 $CTL failover "$A" >/dev/null 2>&1
@@ -75,7 +75,7 @@ echo "  $B is master, and it is the file's pair[1]"
 echo "== full stop, then cold start — the case with nobody left to ask"
 $CTL stop >/dev/null 2>&1
 sleep 2
-for p in 7221 7222; do
+for p in 7250 7251; do
   ! valkey-cli -p "$p" PING >/dev/null 2>&1 || { echo "FAIL: $p still serving after stop"; exit 1; }
 done
 echo "== first, build the broken shape by hand: verify must refuse it"
@@ -87,11 +87,11 @@ echo "== first, build the broken shape by hand: verify must refuse it"
 # This is the positive control for verify's new check. Without it, "verify
 # passes after the fix" would be equally true of a verify that looks at
 # nothing.
-./target/release/flint-controlplane --port 7224 --state "$STATE/cp" >/dev/null 2>&1 &
-for _ in $(seq 1 40); do [ "$(valkey-cli -p 7224 PING 2>/dev/null)" = "PONG" ] && break; sleep 0.25; done
-for p in 7221 7222; do
+./target/release/flint-controlplane --port 7253 --state "$STATE/cp" >/dev/null 2>&1 &
+for _ in $(seq 1 40); do [ "$(valkey-cli -p 7253 PING 2>/dev/null)" = "PONG" ] && break; sleep 0.25; done
+for p in 7250 7251; do
   ./target/release/flint-server --port "$p" --bind 127.0.0.1 --engine rocks \
-    --data-dir "$STATE/node-$p" --journal 127.0.0.1:7224 >/dev/null 2>&1 &
+    --data-dir "$STATE/node-$p" --journal 127.0.0.1:7253 >/dev/null 2>&1 &
 done
 for _ in $(seq 1 60); do
   [ -n "$(role_of "$A")" ] && [ -n "$(role_of "$B")" ] && break; sleep 0.5
@@ -111,7 +111,7 @@ echo "  verify refuses it: $(grep -o 'SINGLE-COPY: every member up.*' /tmp/flint
 # Clear the hand-spawned seats so `start` below sees a genuine cold fleet;
 # flintctl has no pidfiles for these, and a live process would be read as
 # "already up" and left alone.
-for p in 7221 7222 7224; do pkill -f "port $p " 2>/dev/null; done
+for p in 7250 7251 7253; do pkill -f "port $p " 2>/dev/null; done
 sleep 2
 rm -f /tmp/flint-coldrole.verify
 
@@ -145,8 +145,8 @@ grep -q "durable roles disagree with inventory order" /tmp/flint-coldrole.out ||
 echo "  $MASTER master, $A replica, live_replicas 1"
 
 echo "== and the data survived the re-seed"
-[ "$(valkey-cli -p 7222 GET cold:200)" = "v200" ] || { echo "FAIL: data lost"; exit 1; }
-COUNT=$(valkey-cli -p 7222 DBSIZE)
+[ "$(valkey-cli -p 7251 GET cold:200)" = "v200" ] || { echo "FAIL: data lost"; exit 1; }
+COUNT=$(valkey-cli -p 7251 DBSIZE)
 [ "${COUNT:-0}" -ge 200 ] || { echo "FAIL: expected >=200 keys, got $COUNT"; exit 1; }
 echo "  $COUNT keys on the master"
 
