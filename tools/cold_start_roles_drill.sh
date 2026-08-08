@@ -21,12 +21,12 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init /tmp/flint-coldrole-state 7250 7251 7252 7253
+fleet_init /tmp/flint-coldrole-state 7403 7404 7405 7406
 fleet_guard
 STATE=/tmp/flint-coldrole-state
 INV=/tmp/flint-coldrole.flint
-A=127.0.0.1:7250   # inventory pair[0]
-B=127.0.0.1:7251   # inventory pair[1] — the one we promote
+A=127.0.0.1:7403   # inventory pair[0]
+B=127.0.0.1:7404   # inventory pair[1] — the one we promote
 fleet_kill server; fleet_kill proxy
 fleet_kill controlplane; fleet_kill controller
 sleep 0.4
@@ -46,9 +46,9 @@ cat > "$INV" <<EOF
 disposable on
 statedir $STATE
 bins ./target/release
-cp 127.0.0.1:7253
+cp 127.0.0.1:7406
 pair $A,$B
-proxy 127.0.0.1:7252
+proxy 127.0.0.1:7405
 controller on
 EOF
 
@@ -64,12 +64,12 @@ for _ in $(seq 1 60); do [ "$(replicas_of "$A")" = "1" ] && break; sleep 0.5; do
 echo "  $A master, live_replicas 1"
 
 echo "== write something, so a lost replica would be losing real data"
-FIRST=$(valkey-cli -p 7250 SET cold:1 v1 2>&1)
-for i in $(seq 2 200); do valkey-cli -p 7250 SET "cold:$i" "v$i" >/dev/null; done
+FIRST=$(valkey-cli -p 7403 SET cold:1 v1 2>&1)
+for i in $(seq 2 200); do valkey-cli -p 7403 SET "cold:$i" "v$i" >/dev/null; done
 # ASSERT THE SEED LANDED. Without this the drill's final "data lost" could
 # equally mean "data never written", and those need different fixes — the
 # KB already carries this lesson and this drill was written ignoring it.
-SEEDED=$(valkey-cli -p 7250 DBSIZE)
+SEEDED=$(valkey-cli -p 7403 DBSIZE)
 [ "${SEEDED:-0}" -ge 200 ] || {
   echo "FAIL: seed writes not accepted — DBSIZE=$SEEDED on $A after 200 SETs; first SET replied: $FIRST"
   echo "      (nothing downstream can be interpreted; the drill never had data)"
@@ -86,10 +86,10 @@ echo "  $SEEDED keys on $A"
 # Precautionary, not diagnosed: the failure that prompted it turned out to
 # be a full disk (see the seed assertion above), not replication timing.
 for _ in $(seq 1 60); do
-  [ "$(valkey-cli -p 7250 FLINTINFO 2>/dev/null | tr -d '\r' | sed -n 's/^seq_lag://p')" = "0" ] && break
+  [ "$(valkey-cli -p 7403 FLINTINFO 2>/dev/null | tr -d '\r' | sed -n 's/^seq_lag://p')" = "0" ] && break
   sleep 0.5
 done
-[ "$(valkey-cli -p 7250 FLINTINFO 2>/dev/null | tr -d '\r' | sed -n 's/^seq_lag://p')" = "0" ] || {
+[ "$(valkey-cli -p 7403 FLINTINFO 2>/dev/null | tr -d '\r' | sed -n 's/^seq_lag://p')" = "0" ] || {
   echo "FAIL: replica never caught up before the failover; promoting now would"
   echo "      lose writes and the data assertion at the end would be measuring"
   echo "      that, not the cold-start path this drill is about"
@@ -105,7 +105,7 @@ echo "  $B is master, and it is the file's pair[1]"
 echo "== full stop, then cold start — the case with nobody left to ask"
 $CTL stop >/dev/null 2>&1
 sleep 2
-for p in 7250 7251; do
+for p in 7403 7404; do
   ! valkey-cli -p "$p" PING >/dev/null 2>&1 || { echo "FAIL: $p still serving after stop"; exit 1; }
 done
 echo "== first, build the broken shape by hand: verify must refuse it"
@@ -117,11 +117,11 @@ echo "== first, build the broken shape by hand: verify must refuse it"
 # This is the positive control for verify's new check. Without it, "verify
 # passes after the fix" would be equally true of a verify that looks at
 # nothing.
-./target/release/flint-controlplane --port 7253 --state "$STATE/cp" >/dev/null 2>&1 &
-for _ in $(seq 1 40); do [ "$(valkey-cli -p 7253 PING 2>/dev/null)" = "PONG" ] && break; sleep 0.25; done
-for p in 7250 7251; do
+./target/release/flint-controlplane --port 7406 --state "$STATE/cp" >/dev/null 2>&1 &
+for _ in $(seq 1 40); do [ "$(valkey-cli -p 7406 PING 2>/dev/null)" = "PONG" ] && break; sleep 0.25; done
+for p in 7403 7404; do
   ./target/release/flint-server --port "$p" --bind 127.0.0.1 --engine rocks \
-    --data-dir "$STATE/node-$p" --journal 127.0.0.1:7253 >/dev/null 2>&1 &
+    --data-dir "$STATE/node-$p" --journal 127.0.0.1:7406 >/dev/null 2>&1 &
 done
 for _ in $(seq 1 60); do
   [ -n "$(role_of "$A")" ] && [ -n "$(role_of "$B")" ] && break; sleep 0.5
@@ -141,7 +141,7 @@ echo "  verify refuses it: $(grep -o 'SINGLE-COPY: every member up.*' /tmp/flint
 # Clear the hand-spawned seats so `start` below sees a genuine cold fleet;
 # flintctl has no pidfiles for these, and a live process would be read as
 # "already up" and left alone.
-for p in 7250 7251 7253; do pkill -f "port $p " 2>/dev/null; done
+for p in 7403 7404 7406; do pkill -f "port $p " 2>/dev/null; done
 sleep 2
 rm -f /tmp/flint-coldrole.verify
 
@@ -175,14 +175,14 @@ grep -q "durable roles disagree with inventory order" /tmp/flint-coldrole.out ||
 echo "  $MASTER master, $A replica, live_replicas 1"
 
 echo "== and the data survived the re-seed"
-[ "$(valkey-cli -p 7251 GET cold:200)" = "v200" ] || {
-  echo "FAIL: data lost — GET cold:200 on master $B returned '$(valkey-cli -p 7251 GET cold:200)'"
-  echo "      master  DBSIZE=$(valkey-cli -p 7251 DBSIZE) latest_seq=$(valkey-cli -p 7251 FLINTINFO | tr -d '\r' | sed -n 's/^latest_seq://p')"
-  echo "      replica DBSIZE=$(valkey-cli -p 7250 DBSIZE) latest_seq=$(valkey-cli -p 7250 FLINTINFO | tr -d '\r' | sed -n 's/^latest_seq://p')"
-  echo "      sample: $(valkey-cli -p 7251 KEYS 'cold:*' | head -3 | tr '\n' ' ')"
+[ "$(valkey-cli -p 7404 GET cold:200)" = "v200" ] || {
+  echo "FAIL: data lost — GET cold:200 on master $B returned '$(valkey-cli -p 7404 GET cold:200)'"
+  echo "      master  DBSIZE=$(valkey-cli -p 7404 DBSIZE) latest_seq=$(valkey-cli -p 7404 FLINTINFO | tr -d '\r' | sed -n 's/^latest_seq://p')"
+  echo "      replica DBSIZE=$(valkey-cli -p 7403 DBSIZE) latest_seq=$(valkey-cli -p 7403 FLINTINFO | tr -d '\r' | sed -n 's/^latest_seq://p')"
+  echo "      sample: $(valkey-cli -p 7404 KEYS 'cold:*' | head -3 | tr '\n' ' ')"
   exit 1
 }
-COUNT=$(valkey-cli -p 7251 DBSIZE)
+COUNT=$(valkey-cli -p 7404 DBSIZE)
 [ "${COUNT:-0}" -ge 200 ] || { echo "FAIL: expected >=200 keys, got $COUNT"; exit 1; }
 echo "  $COUNT keys on the master"
 
