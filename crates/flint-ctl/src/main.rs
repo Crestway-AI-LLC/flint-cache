@@ -2119,6 +2119,13 @@ fn agent_args(inv: &Inventory) -> Option<Vec<String>> {
         inv.cp[0].clone(),
         "--metrics-port".into(),
         port_of(agent).to_string(),
+        // The host half of `agent <addr>` used to be parsed and dropped, so
+        // an inventory naming a routable address still got a loopback
+        // listener and said nothing about it. Honour the whole address: an
+        // off-box scraper cannot reach 127.0.0.1, and the operator's fix
+        // was to edit the line that already existed.
+        "--metrics-bind".into(),
+        host_of(agent).to_string(),
         "--journal".into(),
         format!("{d}/shadow.jsonl"),
     ];
