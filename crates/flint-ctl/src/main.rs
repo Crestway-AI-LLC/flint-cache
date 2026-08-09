@@ -1907,20 +1907,44 @@ fn rotate_certs(inv: &Inventory) {
     println!("re-signed mesh + edge leaf certs from the CA; components hot-reload within ~2s");
 }
 
-/// Proxy liveness that respects the front door: plaintext fleets answer
-/// PROXYSTATS; a client-TLS fleet is probed at the TCP layer (flintctl is
-/// not an edge client — real encrypted traffic is verified by the drills).
+/// Proxy liveness: does it ANSWER, through its own front door.
+///
+/// This used to fall back to a bare `TcpStream::connect` on a client-TLS
+/// fleet, under the reasoning that "flintctl is not an edge client — real
+/// encrypted traffic is verified by the drills". That stopped being true
+/// when `verify --probe` learned to speak the edge (#102), and the fallback
+/// was measuring the wrong thing in the meantime: a TCP accept proves
+/// something holds the port, not that a proxy serves. An edge whose cert had
+/// expired, whose TLS handshake failed, or which was wedged short of RESP
+/// read as UP.
+///
+/// That mattered because FIVE of the six callers ask "is it serving":
+/// `verify`'s `proxy up` assertion, both `status` renderings, `roll_edge`'s
+/// "did not serve after the binary swap", and `start`'s wait-for-ready. On a
+/// TLS-edge fleet every one of them was answering the weaker question, so
+/// `roll_edge` could accept a proxy that had never served.
+///
+/// The sixth caller — `start` deciding whether to spawn — is the reason to
+/// be careful rather than the reason not to fix it. It is left on this same
+/// predicate deliberately: if a proxy holds the port but will not answer,
+/// `start` SHOULD notice and say so, which is what it already did on every
+/// plaintext fleet. Making the two fleet kinds agree is the point.
+///
+/// PROXYSTATS answers a Bulk when ungated; once the CP pushes an admin
+/// digest (ADR-0006 D4) it answers -NOAUTH pre-auth. EITHER proves the proxy
+/// is up and serving — only a failure to get a reply means down.
 fn proxy_up(inv: &Inventory, i: usize) -> bool {
     // Resolved here rather than by the caller: passing an address in is what
     // let the BIND address reach the liveness check in the first place.
     let proxy = &proxy_dial(inv, i);
-    if inv.client_tls {
-        return std::net::TcpStream::connect(proxy).is_ok();
-    }
-    // PROXYSTATS answers a Bulk when ungated; once the CP pushes an admin
-    // digest (ADR-0006 D4) it answers -NOAUTH pre-auth. EITHER proves the
-    // proxy is up and serving — only connect failure means down.
-    match call(proxy, &None, &["PROXYSTATS"]) {
+    let tls = edge_tls_client(inv);
+    match call_seq_on(
+        proxy,
+        &tls,
+        &[&["PROXYSTATS"]],
+        Duration::from_millis(1500),
+        inv.client_tls,
+    ) {
         Ok(Value::Bulk(_)) => true,
         Ok(Value::Error(e)) => e.starts_with("NOAUTH"),
         _ => false,

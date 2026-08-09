@@ -112,4 +112,46 @@ CPS=$(echo "$ST"  | grep -c "^cp .*build $TAG" || true)
   echo "FAIL: pair $PAIRS/2, cp $CPS on $TAG — the roll itself is wrong, not just the report"; exit 1; }
 echo "  proxy $PXS, pair $PAIRS/2, cp $CPS — all on $TAG over a TLS edge"
 
-echo "PASS: a client-TLS fleet rolls to completion and every seat REPORTS the build — the branch no other drill executes"
+echo "== a bare TCP listener must NOT read as a serving proxy"
+# THE POSITIVE CONTROL for proxy_up. Until today a client-TLS fleet's
+# liveness check was `TcpStream::connect`, which proves only that something
+# holds the port — an edge with an expired cert, a failed handshake, or a
+# proxy wedged short of RESP all read as UP, and `roll_edge` would accept
+# "served after the binary swap" from a proxy that never served.
+#
+# Asserting the healthy case cannot catch that: a real proxy passes either
+# way. So take the proxy away and leave something that accepts the
+# connection and says nothing. A TCP-only check calls that UP; a check that
+# waits for a RESP reply calls it DOWN. Last assertion in the file, because
+# it deliberately ends with no proxy running.
+PXPID="$STATE/pids/proxy-7972.pid"
+[ -r "$PXPID" ] && kill "$(cat "$PXPID")" 2>/dev/null
+for _ in $(seq 1 40); do
+  nc -z 127.0.0.1 7972 2>/dev/null || break
+  sleep 0.25
+done
+python3 -c '
+import socket
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", 7972)); s.listen(8)
+while True:
+    c, _ = s.accept()      # accept, then say nothing at all
+' &
+MUTE=$!
+# disown so bash does not print "Terminated: 15" and its whole source when we
+# kill it — a drill's output is read for its assertions, not its plumbing.
+disown $MUTE 2>/dev/null || true
+trap 'kill $MUTE 2>/dev/null; cleanup' EXIT
+sleep 1
+ROW=$($CTL status 2>&1 | grep "^proxy" | head -1)
+kill $MUTE 2>/dev/null
+case "$ROW" in
+  *DOWN*) echo "  $(echo "$ROW" | tr -s ' ')" ;;
+  *)      echo "  $ROW"
+          echo "FAIL: a socket that accepts and never replies reads as a serving proxy."
+          echo "      proxy_up is measuring the TCP layer, not whether the edge ANSWERS."
+          exit 1 ;;
+esac
+
+echo "PASS: a client-TLS fleet rolls to completion and every seat REPORTS the build, and liveness means ANSWERING rather than merely holding the port — the branch no other drill executes"
