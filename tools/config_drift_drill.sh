@@ -42,8 +42,15 @@ cleanup() {
 trap cleanup EXIT
 rm -rf "$STATE" "$INV"
 
+# UNGUARDED, this silently tests whatever binaries were already in
+# target/release. A build that fails (a disk that filled, a compile error in
+# an unrelated crate) then leaves the drill asserting against the PREVIOUS
+# build, which is how a drill certifies a change it never compiled. Every
+# other drill in this suite checks it; these two did not, and one of them
+# produced a HELLO failure that vanished on re-run with no cause found.
 cargo build --release -q -p flint-server -p flint-proxy -p flint-controlplane \
-  -p flint-controller -p flint-ctl --features flint-server/rocks
+  -p flint-controller -p flint-ctl --features flint-server/rocks \
+  || { echo "FAIL: build"; exit 1; }
 
 cat > "$INV" <<EOF
 disposable on

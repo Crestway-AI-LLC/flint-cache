@@ -117,6 +117,34 @@ if [ "${PAIRS:-0}" -ne 2 ] || [ "${CPS:-0}" -lt 1 ] || [ "${PXS:-0}" -lt 1 ]; th
 fi
 echo "  pair $PAIRS/2, cp $CPS, proxy $PXS — all on $TAG"
 
+echo "== and so does HELLO, the only version string a CLIENT ever reads"
+# Every assertion above reads an OPERATOR surface. HELLO is the one a client
+# library reads, and it was wrong for the entire life of the project: both
+# handlers passed env!("CARGO_PKG_VERSION") — the workspace version, the
+# literal 0.0.1 — so a fleet where status, CPINFO, PROXYSTATS and
+# --build-version all correctly said v0.1.0-rc.37 told redis-py 0.0.1.
+#
+# ADR-0014 D1 is marked implemented in full and shipped every operator-facing
+# stamp; nothing in this repository looked at the client-facing one. It was
+# found by speaking RESP to the playground edge from outside, which is the
+# only vantage point from which it is visible at all.
+#
+# $TAG is what gives this teeth. In a from-source build the crate fallback IS
+# 0.0.1, so asserting "HELLO agrees with the build" against an unstamped
+# fleet would pass on the broken code — the self-fulfilling shape this file's
+# sibling drill warns about. After the roll the build is `build-1234`, which
+# the old code could not produce by any route.
+HOUT=$($CLI -p 7845 -a tok-acme --no-auth-warning HELLO 2>/dev/null | tr -d '\r"')
+echo "$HOUT" | grep -qxF "$TAG" || {
+  echo "$HOUT" | sed 's/^/  | /'
+  echo "FAIL: HELLO does not report '$TAG'. If it says 0.0.1 the reply is"
+  echo "      carrying the crate version instead of the build (flint_build::wire)."
+  exit 1; }
+echo "$HOUT" | grep -qxF "0.0.1" && {
+  echo "$HOUT" | sed 's/^/  | /'
+  echo "FAIL: HELLO still carries the crate version 0.0.1 alongside the build"; exit 1; }
+echo "  HELLO version = $TAG"
+
 echo "== the data survived the roll (warm restart, not a resync)"
 GOT=$($CLI -p 7845 -a tok-acme --no-auth-warning GET before-roll 2>/dev/null | tr -d '\r')
 [ "$GOT" = "kept" ] \

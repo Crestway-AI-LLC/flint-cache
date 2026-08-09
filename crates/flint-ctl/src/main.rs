@@ -4800,7 +4800,7 @@ flintctl — drive a Flint cluster from one inventory file.
 Lifecycle    bootstrap  start  stop  status [--json]  verify [--probe <t>:<tok>]
 Topology     expand  add-replica  swap-node  decommission-node  migrate-slots
 Failure      failover <node>  kill-node <node>  restart-node <node>
-Tenants      tenant add|rm|list  tenant-quota  tenant-reads  tenant-cache
+Tenants      tenant add|remove  tenant-quota  tenant-reads  tenant-cache
              tenant-async  tenant-federate
 Edge         retire-proxy  proxy-cache
 Secrets      rotate-certs  rotate-admin

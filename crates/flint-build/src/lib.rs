@@ -67,6 +67,31 @@ pub fn is_release(v: &str) -> bool {
             .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
 }
 
+/// How a reported build string goes out on the RESP WIRE, in `HELLO`'s
+/// `version` field.
+///
+/// A separate form from [`display`] because the reader is a program, not a
+/// person. Real Redis answers `7.2.4` there, and client libraries feature-gate
+/// on it by parsing it as a version number — so the leading `v` of a release
+/// tag is dropped, and the operator-facing `unstamped` rewrite is NOT applied:
+/// a word where a number belongs is worse to a parser than an honest `0.0.1`.
+///
+/// This existing at all is the fix for a real defect. Both `HELLO` handlers
+/// passed `env!("CARGO_PKG_VERSION")` — the workspace version, literally
+/// `0.0.1` — so on a fleet where `flintctl status`, `CPINFO`, `PROXYSTATS` and
+/// `--build-version` all correctly said `v0.1.0-rc.37`, the ONE version string
+/// a client library ever reads said `0.0.1`. ADR-0014 D1 shipped every
+/// operator-facing stamp and missed the only client-facing one; it was found
+/// by speaking RESP to the playground edge from outside, which is the only
+/// vantage point that can see it.
+///
+/// Everything that is not a release tag passes through verbatim, for the same
+/// reason [`display`] does: an operator who rolled `--version-tag v2` must see
+/// `2`, not a value invented here.
+pub fn wire(reported: &str) -> &str {
+    reported.strip_prefix('v').unwrap_or(reported)
+}
+
 /// How a reported build string should be SHOWN to an operator.
 ///
 /// Exactly ONE value is rewritten: the crate-version fallback that a
@@ -107,6 +132,31 @@ mod tests {
         for v in ["v2", "build-1234", "2026-08-04.3", "v0.1.0-rc.29"] {
             assert_eq!(display(v, "0.0.1"), v, "{v} must be shown as itself");
         }
+    }
+
+    /// The defect this function fixes: the wire form must be the BUILD, not
+    /// the crate version that `HELLO` used to hardcode.
+    #[test]
+    fn the_wire_form_carries_the_release_without_its_v() {
+        assert_eq!(wire("v0.1.0-rc.37"), "0.1.0-rc.37");
+        assert_ne!(wire(&resolve(Some("v0.1.0-rc.37"), None, "0.0.1")), "0.0.1");
+    }
+
+    /// A client library parses this field. `unstamped` would not parse, so
+    /// the operator-facing rewrite must NOT leak onto the wire.
+    #[test]
+    fn the_wire_form_never_says_unstamped() {
+        assert_eq!(wire("0.0.1"), "0.0.1");
+        assert_eq!(display("0.0.1", "0.0.1"), "unstamped");
+    }
+
+    #[test]
+    fn a_wire_version_is_stripped_at_most_once_and_only_at_the_front() {
+        assert_eq!(wire("0.0.0-dev+117cd15"), "0.0.0-dev+117cd15");
+        assert_eq!(wire("v2"), "2");
+        assert_eq!(wire("build-1234"), "build-1234");
+        assert_eq!(wire("vv1.0.0"), "v1.0.0");
+        assert_eq!(wire(""), "");
     }
 
     #[test]

@@ -1649,7 +1649,9 @@ fn execute(
         } else {
             "master"
         };
-        return flint_resp::hello_reply(*conn_proto, env!("CARGO_PKG_VERSION"), role);
+        // The build, not the crate version — see flint_build::wire.
+        let build = build_version();
+        return flint_resp::hello_reply(*conn_proto, flint_build::wire(&build), role);
     }
     // FLINTNS <ns>: select this connection's namespace — the tenant
     // boundary. Sent by the proxy right after token auth; every subsequent

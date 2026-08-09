@@ -19,9 +19,15 @@
 # WHAT THIS DRILL PROVES, and what it does not:
 #
 #   PROVES  every seat kind reports a build, the values agree with what the
-#           binaries say about themselves via --build-version, and the
+#           binaries say about themselves via --build-version, the
 #           controller — which has no listener and must not gain one —
-#           reaches `status` by registering with the CP.
+#           reaches `status` by registering with the CP, and the RESP
+#           `HELLO` reply carries the same build to CLIENTS.
+#
+#           That last one was added after the fact. D1 shipped every
+#           operator-facing stamp and left the only client-facing one
+#           reading the crate version, which no drill here could see
+#           because none of them had ever asked a seat `HELLO`.
 #
 #   DOES NOT PROVE  that `upgrade` aborts on a build MISMATCH. With dev
 #           binaries it cannot: `upgrade --version-tag T` exports
@@ -41,6 +47,23 @@ cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
 fleet_init /tmp/flint-buildstamp-state 7411 7412 7413 7414
 fleet_guard
+
+# A STAMP THE CRATE VERSION CANNOT IMITATE, exported before anything runs so
+# the binaries, the seats flintctl spawns, and every surface below all read
+# the same value.
+#
+# Without it the HELLO assertion at the end would be vacuous in exactly the
+# way this file's header warns about: a from-source build's fallback IS
+# `0.0.1`, which is also the wrong value the broken code produced, so
+# "HELLO agrees with the build" would pass on both. Read at RUNTIME by
+# flint_build::version (option_env! FLINT_RELEASE_TAG is the compile-time
+# one), so this does not touch what cargo bakes in.
+#
+# Release-SHAPED on purpose — the leading `v` is the half of flint_build::wire
+# that only a real release exercises, and shipping a `v` prefix to a client
+# library that parses this field is the failure mode being guarded against.
+export FLINT_BUILD_VERSION=v9.9.9-stamp-probe
+WIRE=9.9.9-stamp-probe
 STATE=/tmp/flint-buildstamp-state
 INV=/tmp/flint-buildstamp.flint
 A=127.0.0.1:7411
@@ -59,8 +82,15 @@ cleanup() {
 trap cleanup EXIT
 rm -rf "$STATE" "$INV"
 
+# UNGUARDED, this silently tests whatever binaries were already in
+# target/release. A build that fails (a disk that filled, a compile error in
+# an unrelated crate) then leaves the drill asserting against the PREVIOUS
+# build, which is how a drill certifies a change it never compiled. Every
+# other drill in this suite checks it; these two did not, and one of them
+# produced a HELLO failure that vanished on re-run with no cause found.
 cargo build --release -q -p flint-server -p flint-proxy -p flint-controlplane \
-  -p flint-controller -p flint-ctl --features flint-server/rocks
+  -p flint-controller -p flint-ctl --features flint-server/rocks \
+  || { echo "FAIL: build"; exit 1; }
 
 cat > "$INV" <<EOF
 disposable on
@@ -152,4 +182,34 @@ echo "$OUT" | grep "^controller" | grep -q "build=$WANT" || {
 echo "$OUT" | grep -q "NONE REPORTING" && {
   echo "FAIL: status says no controller reported, but one is running"; exit 1; }
 
-echo "PASS: build stamps — cp, proxy and controller all report a build and status shows all five seat kinds; CPINFO renames version: to registry_version: while keeping the alias CPWATCH parses"
+echo "== HELLO carries the build too — the one stamp a CLIENT reads"
+# The surface D1 missed. Every assertion above reads an operator surface;
+# this is the field a client library parses to decide what the server can
+# do, and both handlers passed env!("CARGO_PKG_VERSION") instead of the
+# build. On the playground that meant a uniformly v0.1.0-rc.37 fleet
+# answering redis-py with `0.0.1`.
+#
+# Checked at the NODE as well as the proxy because they are two separate
+# handlers in two crates that were wrong in the same way — and the node's
+# is unreachable from tools/upgrade_drill.sh, whose fleet puts internal
+# TLS in front of it. `WIRE` is the tag WITHOUT its leading `v`: real Redis
+# answers `7.2.4` here, so a parser must not meet a `v`.
+#
+# Matched with -x against the whole line: piped valkey-cli prints each array
+# element raw, one per line, so a substring match would also accept
+# `v9.9.9-stamp-probe` — the exact case the second assertion exists to catch.
+for p in 7411 7413; do
+  H=$(valkey-cli -p $p HELLO 2>/dev/null | tr -d '\r"')
+  echo "$H" | grep -qxF "$WIRE" || {
+    echo "$H" | sed 's/^/  | /'
+    echo "FAIL: port $p HELLO does not report '$WIRE'"
+    echo "      '0.0.1' means the crate version, 'v$WIRE' means flint_build::wire was skipped."
+    exit 1; }
+  echo "$H" | grep -qxF "v$WIRE" && {
+    echo "FAIL: port $p HELLO ships the leading 'v' — clients parse this field"; exit 1; }
+  echo "$H" | grep -qxF "0.0.1" && {
+    echo "FAIL: port $p HELLO still carries the crate version 0.0.1"; exit 1; }
+  echo "  port $p HELLO version = $WIRE"
+done
+
+echo "PASS: build stamps — cp, proxy and controller all report a build and status shows all five seat kinds; HELLO carries it to clients as well; CPINFO renames version: to registry_version: while keeping the alias CPWATCH parses"

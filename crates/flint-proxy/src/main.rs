@@ -1415,9 +1415,13 @@ fn auth_step(
         if let Some(p) = req.proto {
             *proto = p;
         }
+        // The build, not the crate version. This is the ONLY version string
+        // a client library ever reads, and it used to be the workspace
+        // `0.0.1` on a fleet whose every other surface said v0.1.0-rc.37.
+        let build = build_version();
         return AuthStep::Reply(flint_resp::hello_reply(
             *proto,
-            env!("CARGO_PKG_VERSION"),
+            flint_build::wire(&build),
             "master",
         ));
     }
