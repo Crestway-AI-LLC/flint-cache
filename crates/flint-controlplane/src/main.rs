@@ -31,7 +31,16 @@
 //!                                           opposite: a tenant set to `-`
 //!                                           is served nowhere and answers
 //!                                           -WRONGPASS at every edge.
-//!   CPINFO                                  version + counts
+//!   CPINFO                                  build, registry version, counts,
+//!                                           and the controllers that have
+//!                                           registered (ADR-0014 D1)
+//!   CPCONTROLLER <host:pid> <build>         a controller announcing itself;
+//!                                           it has no listener, so this is
+//!                                           the only way its build reaches
+//!                                           `status` without ssh
+//!   CPMYSTATUS <token>                      TENANT-scoped self-view: quota,
+//!                                           usage, flags, own endpoint,
+//!                                           service build (ADR-0014 D3)
 //!   CPSNAPSHOT <proxy-addr>                 one-shot filtered snapshot
 //!
 //! v1 scope: single node, durable file state (the serialized form is the
@@ -638,6 +647,68 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
                     t.replica_reads as u8,
                     t.local_cache as u8,
                     t.async_writes as u8
+                )
+                .into_bytes(),
+            ))
+        }
+        b"CPMYSTATUS" => {
+            // ADR-0014 D3. CPMYCONFIG is a SETTER and CPMYUSAGE returns a
+            // bare positional line; a tenant had no way to ask "what is my
+            // quota, which flags am I on, what am I connected to". The
+            // console's /api/overview answers some of it for the SaaS path
+            // only, so self-hosted and marketplace tenants had nothing.
+            //
+            // Same token-digest lookup as CPMYUSAGE — no new
+            // authentication path, and the scoping is therefore the one
+            // already in use rather than a second implementation of it.
+            let Some(token) = text(1) else {
+                return err("CPMYSTATUS <token>");
+            };
+            let token = flint_tls::sha256_hex(token.as_bytes());
+            let Ok(st) = shared.state.lock() else {
+                return err("state lock");
+            };
+            let Some(t) = st
+                .tenants
+                .values()
+                .find(|t| t.token == token || t.prev_token.as_deref() == Some(token.as_str()))
+            else {
+                return Value::Error("WRONGPASS invalid token".into());
+            };
+            let bytes = shared
+                .usage
+                .lock()
+                .ok()
+                .and_then(|u| u.get(&t.name).copied())
+                .unwrap_or(0);
+            // `endpoint` is the tenant's OWN proxy subset — what they
+            // already dial, and what CPSNAPSHOT already tells them. Not a
+            // topology leak, and the distinction the ADR draws: their
+            // endpoint yes, node addresses and pair layout no. Nothing
+            // below reads any tenant but this one.
+            Value::Bulk(Some(
+                format!(
+                    "tenant:{}\r\nnamespace:{}\r\nendpoint:{}\r\n\
+                     quota_ops_per_sec:{}\r\nquota_max_bytes:{}\r\n\
+                     usage_bytes:{}\r\nover_quota:{}\r\n\
+                     replica_reads:{}\r\nlocal_cache:{}\r\nasync_writes:{}\r\n\
+                     federated:{}\r\nbuild:{}\r\n",
+                    t.name,
+                    t.ns,
+                    if t.subset.is_empty() {
+                        "-".to_string()
+                    } else {
+                        t.subset.join(",")
+                    },
+                    t.ops_per_sec,
+                    t.max_bytes,
+                    bytes,
+                    t.over_quota as u8,
+                    t.replica_reads as u8,
+                    t.local_cache as u8,
+                    t.async_writes as u8,
+                    t.federated as u8,
+                    build_version(),
                 )
                 .into_bytes(),
             ))

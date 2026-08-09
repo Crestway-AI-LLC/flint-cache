@@ -1,6 +1,6 @@
 # ADR-0014: One status surface — every seat says what it is running
 
-Status: **D1 and D2 accepted and implemented, August 2026. D3 proposed.**
+Status: **Accepted and implemented in full — D1, D2, D3 — August 2026.**
 Filed originally because the evidence was gathered during launch prep and
 would otherwise be lost, and because one part of it (D1) is a gap in the
 upgrade path rather than a feature request — which is why it was brought
@@ -43,6 +43,23 @@ that boundary and asserts a healthy pair reports nothing.
 
 `--json` exits 0 with drift present: D2 REPORTS, it does not reconcile. The
 array is always emitted, empty when clean, so a caller can gate on it.
+
+D3 as built: `CPMYSTATUS <token>` on the control plane, behind the same
+token-digest lookup `CPMYUSAGE` already uses — no second authentication
+path, so the scoping is the one already in production rather than a new
+implementation of it. Returns the tenant's name, namespace, its own proxy
+endpoint, quota (ops/sec and bytes) with current usage, `over_quota`, the
+three feature flags plus `federated`, and the service build.
+
+The tenant's own endpoint is included and node addresses are not: they
+already dial that endpoint and already receive it via `CPSNAPSHOT`, while
+the pair layout is not theirs to have. Covered by
+`tools/tenant_status_drill.sh` (core gate), which follows the verification
+this ADR specified — two tenants provisioned with deliberately distinctive
+names, and the isolation asserted by grepping both responses in both
+directions rather than by reading the code. The mirror direction is the
+positive control: three greps that find nothing prove nothing unless the
+same greps can find something.
 
 > Numbering: 0005–0009 are private-plane records and 0010 is reserved for the
 > co-processor extension model. See [README](README.md) for why the sequence
