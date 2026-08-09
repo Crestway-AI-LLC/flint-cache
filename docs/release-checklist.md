@@ -29,6 +29,23 @@ reproduced. This document stays as the explanation of why each step exists
 and what it is allowed to be red about; the script is what actually runs.
 Retyping the list is how a step silently leaves the gate.
 
+## 0. Publication safety
+
+    tools/public_preflight.sh
+
+Every other step here guards something recoverable. This one guards the
+step that is not: a tag can be deleted and a release replaced, but a
+commit that has been public for five minutes has been cloned, mirrored and
+indexed. It scans HISTORY as well as the working tree, because a
+credential added in one commit and removed in the next is in every clone
+forever — and it carries a positive control on each pattern, because a
+grep that finds nothing and a grep that cannot find anything print the
+same thing.
+
+Not a one-off for the flip. It runs before every push to a public
+repository, and the reason it exists as a script rather than a paragraph
+here is the reason at the top of this file.
+
 ## 1. Gates (CI order — fmt first)
 
     cargo fmt --all --check
