@@ -8,11 +8,35 @@
 //! failure, so CI can gate on it.
 //!
 //! Usage: `flint-conformance --target 127.0.0.1:6380`
+//!
+//! # Running it against a REAL deployment
+//!
+//! For most of this project's life the corpus could only reach a bare
+//! endpoint: plaintext, no credential. Every production edge has both TLS and
+//! auth, so the strongest compatibility evidence in the repository was
+//! structurally unable to touch the thing customers connect to, and
+//! `flintctl verify --probe`'s five data-plane assertions stood in for
+//! ninety-nine cases.
+//!
+//! That gap is not academic. The `HELLO` reply carried the crate version
+//! rather than the build to every client for the life of the project, and it
+//! was found by hand-writing RESP to the playground edge — precisely the job
+//! this binary exists to do, and could not.
+//!
+//!     flint-conformance --target try.example.com:7379 \
+//!         --tls --ca /etc/pki/tls/certs/ca-bundle.crt \
+//!         --auth <tenant>:<token> --yes-flushall
+//!
+//! `--yes-flushall` is mandatory with `--auth` and is not a formality: every
+//! case starts by FLUSHALL-ing to get a clean keyspace, which through a proxy
+//! means **erasing that tenant's namespace**. Point it at a throwaway tenant,
+//! never at one holding data. Requiring the flag makes the destruction a
+//! thing someone typed rather than a thing they discovered.
 
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
-use std::net::TcpStream;
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use flint_resp::{Decoded, Proto, Value, decode, encode};
 
@@ -2646,23 +2670,59 @@ fn corpus() -> Vec<Case> {
     ]
 }
 
+/// The host part of a `host:port`, leaving a bracketed IPv6 literal intact.
+fn endpoint_host(target: &str) -> &str {
+    match target.strip_prefix('[').and_then(|r| r.split_once(']')) {
+        Some((v6, _)) => v6,
+        None => target.split(':').next().unwrap_or(target),
+    }
+}
+
+/// Where the corpus runs, and what it takes to get in.
+///
+/// One value rather than three loose arguments, because the three are not
+/// independent: TLS without a trust anchor cannot be validated, and auth
+/// without TLS ships a token in the clear.
+struct Endpoint {
+    target: String,
+    tls: Option<Arc<flint_tls::ClientConfig>>,
+    /// `(tenant, token)` for the two-argument AUTH a proxy expects.
+    auth: Option<(Vec<u8>, Vec<u8>)>,
+}
+
 struct Client {
-    stream: TcpStream,
+    stream: flint_tls::Stream,
     buf: Vec<u8>,
     proto: Proto,
 }
 
 impl Client {
-    fn connect(target: &str, proto: Proto) -> std::io::Result<Self> {
+    fn connect(ep: &Endpoint, proto: Proto) -> std::io::Result<Self> {
         // The handshake runs with normalization still OFF: the server
         // answers HELLO 3 in the dialect it just switched to, and folding
         // that map down to an array here would hide the very thing we are
         // checking. Adopt the dialect only once it is confirmed.
+        //
+        // connect_edge with a None config IS a plain TcpStream, so the local
+        // targets every drill uses behave exactly as before. Edge SNI (the
+        // host part of the address) rather than the mesh's fixed name,
+        // because this dials the tenant-facing listener.
         let mut c = Self {
-            stream: TcpStream::connect(target)?,
+            stream: flint_tls::connect_edge(&ep.target, &ep.tls)?,
             buf: Vec::new(),
             proto: Proto::Resp2,
         };
+        // Before HELLO, so a rejected credential fails here with -WRONGPASS
+        // rather than as ninety-nine identical case failures.
+        if let Some((user, token)) = &ep.auth {
+            let auth = vec![b"AUTH".to_vec(), user.clone(), token.clone()];
+            match c.call(&auth)? {
+                Value::Simple(s) if s == "OK" => {}
+                other => {
+                    return Err(std::io::Error::other(format!("AUTH refused: {other:?}")));
+                }
+            }
+        }
         if proto == Proto::Resp3 {
             let hello = vec![b"HELLO".to_vec(), b"3".to_vec()];
             match c.call(&hello)? {
@@ -2876,6 +2936,86 @@ fn main() -> ExitCode {
         _ => Proto::Resp2,
     };
 
+    let flag = |name: &str| std::env::args().any(|a| a == name);
+    let opt = |name: &'static str| -> Option<String> {
+        std::env::args()
+            .skip_while(move |a| a != name)
+            .nth(1)
+            .filter(|v| !v.starts_with("--"))
+    };
+
+    // TLS needs a trust anchor named explicitly. There is no "use the system
+    // store" default on purpose: which bundle validates the edge is a fact
+    // about the deployment (an internal CA for a default install, a public
+    // bundle for a Let's Encrypt edge), and guessing it wrong fails as a
+    // handshake error that reads like the server being down.
+    let tls = if flag("--tls") {
+        let ca = match opt("--ca") {
+            Some(p) => p,
+            None => {
+                eprintln!(
+                    "--tls needs --ca <trust-bundle> (e.g. /etc/pki/tls/certs/ca-bundle.crt)"
+                );
+                return ExitCode::FAILURE;
+            }
+        };
+        match flint_tls::edge_client_config(&ca) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                eprintln!("--ca {ca}: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        None
+    };
+
+    let auth = match opt("--auth") {
+        None => None,
+        Some(spec) => match spec.split_once(':') {
+            Some((u, t)) if !u.is_empty() && !t.is_empty() => {
+                Some((u.as_bytes().to_vec(), t.as_bytes().to_vec()))
+            }
+            _ => {
+                eprintln!("--auth takes <tenant>:<token>");
+                return ExitCode::FAILURE;
+            }
+        },
+    };
+
+    // The guard that makes remote mode safe to hand to someone else. Every
+    // case FLUSHALLs for a clean keyspace; through a proxy that erases the
+    // authenticated tenant's namespace. Refusing without the acknowledgement
+    // is the difference between destroying data someone chose to destroy and
+    // destroying data they did not know was in scope.
+    if auth.is_some() && !flag("--yes-flushall") {
+        eprintln!("refusing to run against an authenticated endpoint without --yes-flushall.");
+        eprintln!();
+        eprintln!("Every case begins with FLUSHALL to get a clean keyspace. Through a proxy");
+        eprintln!("that ERASES THE TENANT'S NAMESPACE. Use a throwaway tenant, then pass");
+        eprintln!("--yes-flushall to say so.");
+        return ExitCode::FAILURE;
+    }
+    // A token in clear text is a problem when it crosses a network, not when
+    // it goes to a socket on this machine. Refusing loopback too would ban
+    // the case this whole feature exists to enable in CI: the corpus through
+    // a drill fleet's plaintext proxy, which is the ONLY way to exercise the
+    // proxy's own RESP behaviour — every gate run before this dialled a node
+    // directly and never saw the edge at all.
+    let loopback = matches!(
+        endpoint_host(&target),
+        "127.0.0.1" | "::1" | "localhost" | "[::1]"
+    );
+    if auth.is_some() && tls.is_none() && !loopback {
+        eprintln!(
+            "--auth over a non-loopback target without --tls would send the token in clear text;"
+        );
+        eprintln!("add --tls --ca <bundle>.");
+        return ExitCode::FAILURE;
+    }
+
+    let endpoint = Endpoint { target, tls, auth };
+
     let mut per_family: BTreeMap<&str, (u32, u32)> = BTreeMap::new();
     let mut failures: Vec<String> = Vec::new();
     let mut skipped = 0u32;
@@ -2887,7 +3027,7 @@ fn main() -> ExitCode {
         }
         let entry = per_family.entry(case.family).or_insert((0, 0));
         entry.1 += 1;
-        let result = run_case(&target, &case, proto);
+        let result = run_case(&endpoint, &case, proto);
         match result {
             Ok(None) => entry.0 += 1,
             Ok(Some(failure)) => {
@@ -2897,7 +3037,21 @@ fn main() -> ExitCode {
         }
     }
 
-    println!("target: {target} (RESP{})", proto.version());
+    // The transport is part of the result, not decoration: "99/99 against
+    // localhost plaintext" and "99/99 through a TLS edge as a tenant" are
+    // different claims, and a run that silently fell back to the weaker one
+    // would read identically without this.
+    println!(
+        "target: {} (RESP{}{}{})",
+        endpoint.target,
+        proto.version(),
+        if endpoint.tls.is_some() { ", TLS" } else { "" },
+        if endpoint.auth.is_some() {
+            ", authenticated"
+        } else {
+            ""
+        },
+    );
     let (mut pass, mut total) = (0, 0);
     for (family, (p, t)) in &per_family {
         println!("  {family:<12} {p}/{t}");
@@ -2924,8 +3078,8 @@ fn main() -> ExitCode {
 
 /// Runs one case on a fresh connection with a clean keyspace.
 /// Ok(None) = pass; Ok(Some(msg)) = semantic failure; Err = transport failure.
-fn run_case(target: &str, case: &Case, proto: Proto) -> std::io::Result<Option<String>> {
-    let mut client = Client::connect(target, proto)?;
+fn run_case(ep: &Endpoint, case: &Case, proto: Proto) -> std::io::Result<Option<String>> {
+    let mut client = Client::connect(ep, proto)?;
     let flushed = client.call(&cmd(&[b"FLUSHALL"]))?;
     if flushed != Value::Simple("OK".into()) {
         return Ok(Some(format!("FLUSHALL failed: {flushed:?}")));
