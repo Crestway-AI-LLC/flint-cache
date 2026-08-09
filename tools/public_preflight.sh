@@ -40,22 +40,28 @@ for probe in 'AKIAIOSFODNN7EXAMPLE' \
 done
 [ "$FAILED" = 0 ] && echo "  credential pattern matches all 6 known-bad probes"
 
+# THIS FILE is excluded from every scan below, and only this file: it has
+# to spell out the strings it searches for, so it matches itself -- in the
+# working tree AND in history, where its own probe strings now live
+# permanently. Excluding it from the tree greps alone was not enough, and
+# the first run after committing it said so.
+#
+# It is a real hole: a secret pasted into this script is invisible to this
+# script. Narrow, deliberate, and written down rather than hidden behind a
+# clever regex that would rot. Review this one file by eye. The exclusion
+# is also verified to be narrow -- planting AKIAIOSFODNN7EXAMPLE in a
+# scratch file and committing it is still caught.
+SELF=':(exclude)tools/public_preflight.sh'
+
 # And the history pipeline itself: it must be able to see into the past.
-HIST_PROBE=$(git log -p --all 2>/dev/null | grep -cE "^\+" || true)
+HIST_PROBE=$(git log -p --all -- . "$SELF" 2>/dev/null | grep -cE "^\+" || true)
 [ "${HIST_PROBE:-0}" -gt 100 ] \
   || fail "the history scan saw only ${HIST_PROBE:-0} added lines across $(git rev-list --count HEAD) commits — it is not reading history"
 echo "  history pipeline sees $HIST_PROBE added lines"
 
 echo "== no credentials, ever committed"
-HITS=$(git log -p --all 2>/dev/null | grep -E "^\+.*$CREDS" | head -5 || true)
+HITS=$(git log -p --all -- . "$SELF" 2>/dev/null | grep -E "^\+.*$CREDS" | head -5 || true)
 [ -z "$HITS" ] || { echo "$HITS" | sed 's/^/    /'; fail "credential-shaped strings in history"; }
-
-# THIS FILE is excluded from the next three greps, and only this file: it
-# has to spell out the strings it looks for, so it matches itself. That is
-# a real hole -- a secret pasted into this script would not be caught by
-# this script -- and it is narrow, deliberate, and written down rather than
-# hidden behind a clever regex that would rot.
-SELF=':(exclude)tools/public_preflight.sh'
 
 echo "== no AWS account id"
 # The account number is not a secret on its own, but it is the first thing
