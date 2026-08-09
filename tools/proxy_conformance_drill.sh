@@ -21,13 +21,12 @@
 # see edge bugs, and "the server is conformant" is not the claim customers
 # rely on.
 #
-# NOT ASSERTED YET: RESP3. `--proto 3` currently fails this same EXEC case
-# WITHOUT a proxy in the path — a pre-existing divergence in how the harness
-# folds RESP3's single null back to a RESP2 shape, which is a corpus question
-# rather than a product one. The gate has never run `--proto 3` at all. Left
-# out rather than papered over, because a drill that quietly drops the half
-# that fails is exactly the "check that verifies nothing" this suite keeps
-# finding. Tracked separately.
+# BOTH DIALECTS, and RESP3 is not the afterthought. redis-py 8 and node-redis
+# negotiate it by default, so it is what most clients actually speak; it was
+# also the last thing here with no gate at all. It is a different protocol,
+# not a re-spelling — one null instead of two — and that difference is
+# exactly what hid the EXEC bug above, so running only RESP2 through the
+# proxy would leave the more common path unmeasured.
 #
 # Requires: a release build with --features rocks.
 set -u
@@ -87,20 +86,26 @@ echo "$NODE" | grep -q "(100.0%)" || {
   exit 1; }
 echo "  $(echo "$NODE" | grep '^overall')"
 
-echo "== the corpus through the proxy, authenticated as a tenant"
+echo "== the corpus through the proxy, authenticated as a tenant, both dialects"
 # --yes-flushall because every case FLUSHALLs for a clean keyspace, which
 # through a proxy erases the tenant's namespace. `conf` exists for exactly
 # that and holds nothing else.
-OUT=$(./target/release/flint-conformance --target 127.0.0.1:7962 \
-        --auth conf:tok-conf --yes-flushall 2>&1)
-echo "$OUT" | grep -q "authenticated" || {
-  echo "FAIL: the run did not authenticate — it did not go through the tenant path"; exit 1; }
-echo "$OUT" | grep -q "(100.0%)" || {
-  echo "$OUT" | tail -8 | sed 's/^/  | /'
-  echo "FAIL: the corpus is not clean THROUGH THE PROXY."
-  echo "      The node control above passed, so this is the edge: routing, the"
-  echo "      RESP re-encode, transaction pinning or the near-cache."
-  exit 1; }
-echo "  $(echo "$OUT" | grep '^overall')"
+for PROTO in 2 3; do
+  ARGS=(--target 127.0.0.1:7962 --auth conf:tok-conf --yes-flushall)
+  [ "$PROTO" = 3 ] && ARGS+=(--proto 3)
+  OUT=$(./target/release/flint-conformance "${ARGS[@]}" 2>&1)
+  # A run that quietly fell back to an unauthenticated connection would be
+  # measuring something else entirely, and the pass rate would look the same.
+  echo "$OUT" | grep -q "authenticated" || {
+    echo "FAIL: the RESP$PROTO run did not authenticate — it did not go through the tenant path"
+    exit 1; }
+  echo "$OUT" | grep -q "(100.0%)" || {
+    echo "$OUT" | tail -8 | sed 's/^/  | /'
+    echo "FAIL: the corpus is not clean THROUGH THE PROXY on RESP$PROTO."
+    echo "      The node control above passed, so this is the edge: routing, the"
+    echo "      RESP re-encode, transaction pinning or the near-cache."
+    exit 1; }
+  echo "  RESP$PROTO  $(echo "$OUT" | grep '^overall')"
+done
 
-echo "PASS: the compatibility corpus is clean through the proxy as a tenant, not just against a bare node — the path a client actually takes"
+echo "PASS: the compatibility corpus is clean through the proxy as a tenant on RESP2 and RESP3 — the path a client actually takes, in the dialect it actually speaks"

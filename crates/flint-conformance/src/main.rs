@@ -2836,6 +2836,21 @@ impl Client {
             }
             other => other,
         };
+        // The one value the RESP2 downgrade must NOT touch. RESP3 has a
+        // single null, `_`; RESP2 has two, `$-1` and `*-1`. Re-encoding a
+        // top-level `Value::Null` as RESP2 has to pick one, it picks the
+        // null bulk, and the null ARRAY an aborted EXEC returns then reads
+        // as a null bulk — a case asserting NilArray fails against a server
+        // that answered correctly.
+        //
+        // Kept as itself so `matches` can decide with the protocol in hand
+        // and the failure text can say `Null` rather than a shape the
+        // server never sent. Nulls NESTED inside an array still downgrade,
+        // which is right: RESP2 spells those `$-1` and the corpus expects
+        // Nil for them.
+        if matches!(v, Value::Null) {
+            return v;
+        }
         let mut buf = Vec::new();
         flint_resp::encode_proto(&v, Proto::Resp2, &mut buf);
         match decode(&buf) {
@@ -2848,12 +2863,22 @@ impl Client {
     }
 }
 
-fn matches(expect: &Expect, got: &Value) -> bool {
+fn matches(expect: &Expect, got: &Value, proto: Proto) -> bool {
+    // RESP3 has exactly ONE null. The `Nil` / `NilArray` split is a
+    // statement about RESP2, where `$-1` and `*-1` are different replies and
+    // a case must not be allowed to accept either; under RESP3 both are `_`,
+    // and demanding a distinction the protocol deleted would fail a server
+    // that answered correctly.
+    //
+    // So the strictness is preserved exactly where it means something and
+    // dropped exactly where it cannot. This is NOT a widening of the RESP2
+    // side: `Value::Null` only ever reaches here from a RESP3 run.
+    let sole_resp3_null = proto == Proto::Resp3 && *got == Value::Null;
     match expect {
         Expect::Ok => *got == Value::Simple("OK".into()),
         Expect::Pong => *got == Value::Simple("PONG".into()),
-        Expect::Nil => *got == Value::Bulk(None),
-        Expect::NilArray => *got == Value::Array(None),
+        Expect::Nil => *got == Value::Bulk(None) || sole_resp3_null,
+        Expect::NilArray => *got == Value::Array(None) || sole_resp3_null,
         Expect::Int(i) => *got == Value::Integer(*i),
         Expect::IntRange(lo, hi) => matches!(got, Value::Integer(n) if n >= lo && n <= hi),
         Expect::Simple(t) => *got == Value::Simple((*t).into()),
@@ -2862,7 +2887,7 @@ fn matches(expect: &Expect, got: &Value) -> bool {
         Expect::AnyError => matches!(got, Value::Error(_)),
         Expect::Arr(items) => match got {
             Value::Array(Some(vals)) if vals.len() == items.len() => {
-                items.iter().zip(vals).all(|(e, v)| matches(e, v))
+                items.iter().zip(vals).all(|(e, v)| matches(e, v, proto))
             }
             _ => false,
         },
@@ -3086,7 +3111,7 @@ fn run_case(ep: &Endpoint, case: &Case, proto: Proto) -> std::io::Result<Option<
     }
     for (step_no, (args, expect, delay_ms)) in case.steps.iter().enumerate() {
         let got = client.call(args)?;
-        if !matches(expect, &got) {
+        if !matches(expect, &got, proto) {
             return Ok(Some(format!(
                 "step {}: `{}` expected {:?}, got {:?}",
                 step_no + 1,
@@ -3100,4 +3125,105 @@ fn run_case(ep: &Endpoint, case: &Case, proto: Proto) -> std::io::Result<Option<
         }
     }
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// RESP3 has one null; RESP2 has two. The matcher must relax EXACTLY
+    /// there and nowhere else — this is the whole content of the change, and
+    /// the direction that matters is the RESP2 half: relaxing it would let a
+    /// case assert `NilArray` and silently accept a null bulk, which is the
+    /// bug that shipped through the proxy (an aborted EXEC answering `$-1`).
+    #[test]
+    fn resp2_keeps_the_two_nulls_apart() {
+        assert!(matches(&Expect::Nil, &Value::Bulk(None), Proto::Resp2));
+        assert!(matches(
+            &Expect::NilArray,
+            &Value::Array(None),
+            Proto::Resp2
+        ));
+        // The crossings, which must all stay refused.
+        assert!(!matches(&Expect::Nil, &Value::Array(None), Proto::Resp2));
+        assert!(!matches(
+            &Expect::NilArray,
+            &Value::Bulk(None),
+            Proto::Resp2
+        ));
+        // RESP2 never carries the RESP3 null, and must not learn to accept
+        // it: that would make the relaxation leak across protocols.
+        assert!(!matches(&Expect::Nil, &Value::Null, Proto::Resp2));
+        assert!(!matches(&Expect::NilArray, &Value::Null, Proto::Resp2));
+    }
+
+    #[test]
+    fn resp3_has_exactly_one_null_and_both_expectations_take_it() {
+        assert!(matches(&Expect::Nil, &Value::Null, Proto::Resp3));
+        assert!(matches(&Expect::NilArray, &Value::Null, Proto::Resp3));
+    }
+
+    /// The relaxation accepts the RESP3 null — NOT "any null-ish thing".
+    /// A server that answers a RESP3 client with `$-1` is violating the
+    /// protocol (a RESP3 parser sits waiting for a payload that never
+    /// comes), and this is the assertion that keeps the EXEC bug class
+    /// visible on the dialect most clients negotiate.
+    #[test]
+    fn resp3_still_refuses_the_resp2_spellings() {
+        assert!(!matches(
+            &Expect::NilArray,
+            &Value::Bulk(None),
+            Proto::Resp3
+        ));
+        assert!(!matches(&Expect::Nil, &Value::Array(None), Proto::Resp3));
+    }
+
+    /// Relaxing the null must not turn into relaxing anything else — a
+    /// matcher that accepted a null for a real value would pass a server
+    /// that answered nothing at all.
+    #[test]
+    fn a_null_still_satisfies_nothing_but_a_null() {
+        for p in [Proto::Resp2, Proto::Resp3] {
+            assert!(!matches(&Expect::Ok, &Value::Null, p));
+            assert!(!matches(&Expect::Int(0), &Value::Null, p));
+            assert!(!matches(&Expect::Str(b"x"), &Value::Null, p));
+            assert!(!matches(&Expect::Arr(vec![]), &Value::Null, p));
+            assert!(!matches(&Expect::AnyError, &Value::Null, p));
+        }
+        // And the reverse: a real value never satisfies a null expectation.
+        assert!(!matches(
+            &Expect::NilArray,
+            &Value::Array(Some(vec![])),
+            Proto::Resp3
+        ));
+        assert!(!matches(
+            &Expect::Nil,
+            &Value::Bulk(Some(b"".to_vec())),
+            Proto::Resp3
+        ));
+    }
+
+    /// The downgrade that produced the bug: re-encoding a top-level RESP3
+    /// null as RESP2 has to pick one of the two spellings, so `normalize`
+    /// leaves it alone. Nested nulls still downgrade, because RESP2 really
+    /// does spell those `$-1`.
+    #[test]
+    fn a_nested_null_still_downgrades_to_the_null_bulk() {
+        let mut buf = Vec::new();
+        flint_resp::encode_proto(
+            &Value::Array(Some(vec![Value::Null, Value::Bulk(Some(b"v".to_vec()))])),
+            Proto::Resp2,
+            &mut buf,
+        );
+        let Ok(Decoded::Complete(down, _)) = decode(&buf) else {
+            panic!("array with a null did not round-trip through RESP2");
+        };
+        assert_eq!(
+            down,
+            Value::Array(Some(vec![
+                Value::Bulk(None),
+                Value::Bulk(Some(b"v".to_vec()))
+            ]))
+        );
+    }
 }
