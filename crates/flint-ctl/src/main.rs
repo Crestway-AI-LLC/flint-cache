@@ -1946,9 +1946,35 @@ fn proxy_up(inv: &Inventory, i: usize) -> bool {
         inv.client_tls,
     ) {
         Ok(Value::Bulk(_)) => true,
-        Ok(Value::Error(e)) => e.starts_with("NOAUTH"),
+        // -NOAUTH PROVES THE PROXY IS SERVING: only a live proxy that has
+        // received the CP's admin digest can refuse this way (ADR-0006 D4).
+        //
+        // It arrives as Err, not Ok(Value::Error). `call_seq_on` turns any
+        // RESP error into an io::Error, so the `Ok(Value::Error(..))` arm
+        // this replaces was DEAD CODE from the moment proxy_up moved off
+        // `call` — which returned the error as a value. Every fleet with an
+        // admin token then read its own proxy as down: bootstrap failed,
+        // `status` said DOWN, and `roll_edge` aborted the upgrade. The
+        // playground was untouched only because its inventory sets no
+        // admin-token, so its proxy answers with a Bulk.
+        //
+        // Matched on the message because that is the only place the error
+        // survives; `is_noauth_error` exists so the shape is testable
+        // without a live proxy.
+        Err(e) if is_noauth_error(&e.to_string()) => true,
         _ => false,
     }
+}
+
+/// Does this transport error carry a RESP `-NOAUTH` reply?
+///
+/// Separated from [`proxy_up`] purely so it can be tested: the branch it
+/// guards was silently unreachable for two releases, and a predicate with
+/// no test is how that happened twice.
+fn is_noauth_error(msg: &str) -> bool {
+    msg.trim_start_matches('-')
+        .trim_start()
+        .starts_with("NOAUTH")
 }
 
 fn start_pair_nodes(inv: &Inventory, pair: &[String]) {
@@ -5250,5 +5276,35 @@ mod port_free_tests {
             wait_port_free(port, Duration::from_secs(2)).is_ok(),
             "once released, the port must be reported free"
         );
+    }
+}
+
+#[cfg(test)]
+mod proxy_liveness_tests {
+    use super::*;
+
+    /// The exact string `call_seq_on` produces for a -NOAUTH reply, taken
+    /// from a live admin-gated proxy rather than invented: it answers
+    /// "NOAUTH admin token required for this command", and call_seq_on
+    /// wraps that verbatim into an io::Error.
+    ///
+    /// This test is the positive control the branch never had. proxy_up
+    /// matched `Ok(Value::Error(..))` for two releases while call_seq_on
+    /// could only ever return `Err`, so the arm was dead and every
+    /// admin-token fleet read its own proxy as down. Nothing failed at
+    /// compile time and no test noticed.
+    #[test]
+    fn a_noauth_refusal_is_recognised_as_a_serving_proxy() {
+        assert!(is_noauth_error(
+            "NOAUTH admin token required for this command"
+        ));
+        assert!(is_noauth_error("-NOAUTH admin token required"));
+        // Nothing else may pass. A connection refused or a timeout means
+        // the proxy is genuinely unreachable, and treating either as "up"
+        // would invert the check this protects.
+        assert!(!is_noauth_error("Connection refused (os error 61)"));
+        assert!(!is_noauth_error("timed out"));
+        assert!(!is_noauth_error("WRONGPASS invalid token"));
+        assert!(!is_noauth_error(""));
     }
 }
