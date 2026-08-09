@@ -118,6 +118,40 @@ licence_check() {
 want() { case " ${STAGES} " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
 STAGES="${*:-check conformance drills chaos}"
 
+# FREE DISK, checked before anything runs and named as the host problem it is.
+#
+# Every node starts a disk guard that sheds writes below `min-free 10% or 2 GiB`
+# (#95). That guard is doing its job, but it does not distinguish "this cluster
+# filled its disk" from "the laptop was already full" — so on a host below the
+# threshold, drills fail as an application symptom. On 2026-08-09 the chaos
+# drill died with
+#
+#     iter 12: writer saw no ack within 10000ms x2 of the kill
+#
+# and the cause was 2 MB: free space was 24,508,858,368 against a threshold of
+# 24,510,719,590, and the node log said `disk guard: Ok -> Shed`. Eleven
+# iterations had passed. Nothing in the gate's output pointed at the disk, so
+# it read exactly like a replication regression on the eve of a release.
+#
+# A red gate has to name its own cause, or the next person spends an hour
+# proving the product is fine. Refuse up front instead, and say the number.
+_gate_free_pct() { df -k . | awk 'NR==2 {printf "%d", $4/$2*100}'; }
+_GATE_FREE_PCT=$(_gate_free_pct)
+if [ "${_GATE_FREE_PCT:-100}" -lt 12 ]; then
+  echo "REFUSING TO RUN: only ${_GATE_FREE_PCT}% of this filesystem is free."
+  echo
+  echo "  Nodes shed writes below 10% (the disk guard), so drills would fail as"
+  echo "  replication or ack timeouts with no mention of the disk. 12% is the"
+  echo "  floor because a chaos run needs headroom of its own on top of the 10%."
+  echo
+  df -h . | sed 's/^/  /'
+  echo
+  echo "  Free space and re-run, or set FLINT_GATE_SKIP_DISK=1 to override"
+  echo "  (and read every failure with this in mind)."
+  [ -n "${FLINT_GATE_SKIP_DISK:-}" ] || exit 2
+  echo "  FLINT_GATE_SKIP_DISK=1 set — continuing anyway."
+fi
+
 # No drill may claim the DEFAULT cluster ports.
 #
 # fleet.sh decides ownership by scope directory OR port: a process on one of
@@ -244,8 +278,24 @@ if want conformance; then
     ./target/release/flint-conformance --target 127.0.0.1:6398
   step "conformance rocks" conf-rocks-run \
     ./target/release/flint-conformance --target 127.0.0.1:6397
-  grep -h '^overall:' "$LOGS"/conf-*-run.log "$LOGS"/conf-oracle.log 2>/dev/null \
-    | sed 's/^/      /'
+  # RESP3, which until now was never gated at all — and it is the dialect
+  # redis-py 8 and node-redis negotiate BY DEFAULT, so the protocol most
+  # clients actually speak had less coverage than the one they don't.
+  #
+  # The oracle run is the load-bearing one: RESP3 is not a re-spelling of
+  # RESP2 (one null instead of two, maps instead of flat arrays, doubles
+  # instead of bulk strings), so the corpus's RESP3 expectations are a claim
+  # about real Redis behaviour that only a real Redis can settle. Green here
+  # means the folding in `Client::normalize` matches Valkey, and only then
+  # does a green Flint run mean anything.
+  step "conformance oracle (RESP3)" conf-oracle3 \
+    ./target/release/flint-conformance --target 127.0.0.1:6399 --reference --proto 3
+  step "conformance mem (RESP3)" conf-mem3-run \
+    ./target/release/flint-conformance --target 127.0.0.1:6398 --proto 3
+  step "conformance rocks (RESP3)" conf-rocks3-run \
+    ./target/release/flint-conformance --target 127.0.0.1:6397 --proto 3
+  grep -h '^overall:' "$LOGS"/conf-*-run.log "$LOGS"/conf-oracle.log \
+    "$LOGS"/conf-oracle3.log 2>/dev/null | sed 's/^/      /'
   for p in 6399 6398 6397; do valkey-cli -p $p SHUTDOWN NOSAVE >/dev/null 2>&1; done
   sleep 0.3
   # Belt and braces: SHUTDOWN is a request, and a wedged process would
