@@ -3278,6 +3278,7 @@ fn status_json(inv: &Inventory) {
     }
 
     let mut drift: Vec<String> = Vec::new();
+    let mut suppressed: Vec<String> = Vec::new();
     out.push_str("  \"pairs\": [\n");
     for (i, pair) in inv.pairs.iter().enumerate() {
         out.push_str(&format!("    {{\"pair\": {i}, \"members\": [\n"));
@@ -3320,28 +3321,51 @@ fn status_json(inv: &Inventory) {
             .filter_map(|(a, f)| f.as_ref().map(|f| (a, f)))
             .collect();
         if live.len() > 1 {
+            // Why a difference might not be reportable. THREE states, not
+            // two: reported, held back because a member is mid-roll, and
+            // held back because we cannot tell — a node predating
+            // ADR-0014 D2 serves no `uptime_ms` at all.
+            //
+            // That third case was silently folded into the second. Every
+            // fleet older than this change would have had ALL drift
+            // suppressed with no trace, and `drift: []` read as "clean"
+            // when it meant "not evaluated". Found by running it against
+            // the rc.37 playground and noticing `uptime_ms: ['-','-']`
+            // rather than by reading the code — the values happened to
+            // match, so the empty array looked right.
+            let unknown_uptime = live.iter().any(|(_, f)| f.get("uptime_ms").is_none());
             let young = live.iter().any(|(_, f)| {
                 f.get("uptime_ms")
                     .and_then(|v| v.parse::<u64>().ok())
-                    .is_none_or(|u| u < roll_grace_ms())
+                    .is_some_and(|u| u < roll_grace_ms())
             });
+            let hold = unknown_uptime || young;
             let (base_addr, base) = live[0];
             for (addr, f) in &live[1..] {
                 for knob in PAIR_KNOBS {
                     let k = knob.trim_end_matches(':');
                     let (a, b) = (base.get(k), f.get(k));
                     if a.is_some() && a != b {
-                        let note = if young {
-                            " (SUPPRESSED: a member has been up less than a roll window)"
+                        let note = if unknown_uptime {
+                            " (NOT EVALUATED: a member reports no uptime_ms — it predates \
+                             ADR-0014 D2, so a roll cannot be told from drift. Roll the \
+                             fleet to a build that reports it.)"
                         } else {
-                            ""
+                            " (held back: a member has been up less than a roll window)"
                         };
                         let row = format!(
-                            "pair {i} {k}: {base_addr}={} {addr}={}{note}",
+                            "pair {i} {k}: {base_addr}={} {addr}={}{}",
                             a.map(String::as_str).unwrap_or("-"),
-                            b.map(String::as_str).unwrap_or("-")
+                            b.map(String::as_str).unwrap_or("-"),
+                            if hold { note } else { "" }
                         );
-                        if !young {
+                        if hold {
+                            // Emitted, not discarded. A suppression nobody
+                            // can see is indistinguishable from a clean
+                            // fleet, which is the whole failure this
+                            // report exists to avoid.
+                            suppressed.push(row);
+                        } else {
                             drift.push(row);
                         }
                     }
@@ -3367,6 +3391,16 @@ fn status_json(inv: &Inventory) {
     out.push_str("  \"drift\": [");
     out.push_str(
         &drift
+            .iter()
+            .map(|d| json_str(d))
+            .collect::<Vec<_>>()
+            .join(", "),
+    );
+    // `drift: []` is only trustworthy when this is empty too. A caller
+    // gating on drift alone would read "not evaluated" as "clean".
+    out.push_str("],\n  \"drift_not_evaluated\": [");
+    out.push_str(
+        &suppressed
             .iter()
             .map(|d| json_str(d))
             .collect::<Vec<_>>()

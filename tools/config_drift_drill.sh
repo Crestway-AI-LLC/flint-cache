@@ -124,8 +124,29 @@ echo "$J" | grep -q "lag_hard_ms" || { echo "FAIL: drift does not name the knob"
 echo "$J" | grep -q "127.0.0.1:$REPLICA" || { echo "FAIL: drift does not name the seat"; exit 1; }
 echo "$J" | grep -q "127.0.0.1:$MASTER" || { echo "FAIL: drift does not name the other seat"; exit 1; }
 
+J_SEEN="$J"   # the grace-0 document, where the difference IS reported
+
+echo "== a difference held back is REPORTED as held back, never as clean"
+# The state this missed on its first real run: a node predating ADR-0014
+# D2 serves no uptime_ms, "is a member young?" cannot be answered, and the
+# difference was suppressed with nothing emitted. `drift: []` then reads as
+# a clean fleet when it means the check did not run. Every pre-rc.44 fleet
+# was in exactly that state.
+J=$(FLINT_ROLL_GRACE_MS=600000 $CTL status --json 2>/dev/null)
+echo "$J" | grep -q '"drift_not_evaluated": \[\]' && {
+  echo "FAIL: drift was held back but drift_not_evaluated is empty — a"
+  echo "      suppression nobody can see is indistinguishable from clean"
+  exit 1; }
+echo "$J" | grep -o '"drift_not_evaluated": \[[^]]*\]' | cut -c1-140 | sed 's/^/  /'
+# And the mirror: when the difference IS reported, nothing is also sitting
+# unreported. Without this the two arrays could both be populated and the
+# drill would still pass.
+echo "$J_SEEN" | grep -q '"drift_not_evaluated": \[\]' \
+  || { echo "FAIL: grace-0 run reported drift AND held something back"; exit 1; }
+echo "  and with the window passed, nothing is held back"
+
 echo "== the document is valid JSON, not just greppable text"
-echo "$J" | python3 -c "
+echo "$J_SEEN" | python3 -c "
 import json,sys
 d = json.load(sys.stdin)
 assert isinstance(d['drift'], list) and d['drift'], 'drift must be a non-empty list'
@@ -133,8 +154,10 @@ assert d['pairs'] and d['pairs'][0]['members'], 'pairs/members missing'
 # State must NOT be compared: a master and its replica differ on role by
 # definition, and a drift check that flagged it would be red on every
 # healthy fleet.
-assert not any('role' in x for x in d['drift']), f'role must never be drift: {d[\"drift\"]}'
-print('  parsed: %d pair(s), %d drift row(s)' % (len(d['pairs']), len(d['drift'])))
+assert not any('role' in x for x in d['drift']), 'role must never be drift'
+assert 'drift_not_evaluated' in d, 'the not-evaluated array must always be present'
+print('  parsed: %d pair(s), %d drift, %d not-evaluated'
+      % (len(d['pairs']), len(d['drift']), len(d['drift_not_evaluated'])))
 " || { echo "FAIL: --json did not parse"; exit 1; }
 
 echo "PASS: config drift — a knob differing between pair members is reported with the knob and both seats named, and is held back while a member is younger than a roll window"
