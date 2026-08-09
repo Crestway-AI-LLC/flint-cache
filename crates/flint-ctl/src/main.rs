@@ -612,15 +612,40 @@ fn cpinfo_controllers(
     )
 }
 
-/// One `key:` line out of a proxy's PROXYSTATS. Uses the same dial and the
-/// same admin-gating tolerance as `proxy_up`: a -NOAUTH proxy is up, it
-/// just will not tell us its build without the admin token, and reporting
-/// `-` there is honest where reporting DOWN would not be.
+/// One `key:` line out of a proxy's PROXYSTATS.
+///
+/// Admin-gating tolerance matches `proxy_up`: a -NOAUTH proxy is up, it just
+/// will not tell us its build without the admin token, and reporting `-`
+/// there is honest where reporting DOWN would not be.
+///
+/// THE EDGE DIAL IS THE POINT. This used to open with
+///
+///     if inv.client_tls { return None; }
+///
+/// — giving up without attempting the call, because the call it would then
+/// make was plaintext (`&None`) against a TLS edge. Correct as far as it
+/// went, and it meant `roll_edge`, which treats "no build" as fatal, ABORTED
+/// EVERY UPGRADE on a client-TLS fleet: the playground and every production
+/// deployment. The rc.47 roll on 2026-08-09 rolled all six seats, then:
+///
+///     == UPGRADE ABORTED rolling proxy-7379: came up but would not report
+///        a build ... this roll cannot be verified
+///
+/// while the proxy was serving happily and answering PROXYSTATS over its
+/// edge with `build:v0.1.0-rc.47`. This is #102 in a second place.
+///
+/// `call_seq_on(.., edge)` already dials the client port with the edge SNI,
+/// and `edge_tls_client` is None on a plaintext fleet, so ONE path now
+/// serves both rather than a branch that opts out of asking.
 fn proxystats_field(inv: &Inventory, i: usize, field: &str) -> Option<String> {
-    if inv.client_tls {
-        return None;
-    }
-    let Ok(Value::Bulk(Some(raw))) = call(&proxy_dial(inv, i), &None, &["PROXYSTATS"]) else {
+    let tls = edge_tls_client(inv);
+    let Ok(Value::Bulk(Some(raw))) = call_seq_on(
+        &proxy_dial(inv, i),
+        &tls,
+        &[&["PROXYSTATS"]],
+        Duration::from_millis(1500),
+        inv.client_tls,
+    ) else {
         return None;
     };
     String::from_utf8_lossy(&raw)
