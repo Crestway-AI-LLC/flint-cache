@@ -14,6 +14,24 @@ registering via a new `CPCONTROLLER <host:pid> <build>` every 30s with a
 `roll_edge` asserting the observed build for the control plane, each proxy,
 and the controller. Covered by `tools/build_stamp_drill.sh` (core gate).
 
+**Amended August 2026, after D1 was already marked complete.** Every surface
+listed above faces an OPERATOR. The RESP `HELLO` reply — the only version
+string a client library ever reads — was still passing
+`env!("CARGO_PKG_VERSION")` in both the proxy and the server, so a fleet on
+which all five of those surfaces correctly said `v0.1.0-rc.37` answered
+redis-py with `0.0.1`. Nothing here caught it because no drill had ever sent
+a seat `HELLO`; it was found by speaking RESP to the playground edge from
+outside. `flint_build::wire` now supplies that field (the release tag without
+its leading `v`, since real Redis answers `7.2.4` and the operator-facing
+`unstamped` rewrite would not parse), asserted at both the node and the proxy
+by `build_stamp_drill.sh` against a stamp the crate version cannot imitate,
+and at the proxy after a real roll by `upgrade_drill.sh`.
+
+The lesson is the general one, and it is why this paragraph is here rather
+than in a commit message: **"every seat reports its build" is a claim about
+READERS.** Enumerating the writers is what let a complete-looking D1 ship
+with the most-read surface of the five still wrong.
+
 One deliberate gap, recorded rather than papered over: the drill cannot
 prove the MISMATCH abort, because `upgrade --version-tag T` exports
 `FLINT_BUILD_VERSION=T` to the seats it spawns and an unbaked dev binary
