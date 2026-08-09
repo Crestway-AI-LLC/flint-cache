@@ -1,10 +1,13 @@
 # Flint
 
-**A persistent, disk-first cache that speaks Redis.** Flint keeps your working
-set on local NVMe (RocksDB, Kvrocks-style encoding) instead of holding it
-hostage in RAM — so it survives restarts, replicates with a bounded loss
-window, fails over in seconds, and costs storage economics instead of memory
-economics. Clients connect with any Redis client; no SDK, no new protocol.
+**A persistent, multi-threaded, multi-tenant cache that speaks Redis and
+never evicts.** Flint keeps your working set on local NVMe (RocksDB,
+Kvrocks-style encoding) instead of holding it hostage in RAM — so it
+survives restarts, replicates with a bounded loss window, fails over in
+seconds, and costs storage economics instead of memory economics. Commands
+run concurrently on every core rather than queued behind a single thread,
+and every tenant lives in its own isolated keyspace behind its own token
+and quota. Clients connect with any Redis client; no SDK, no new protocol.
 
 **Fewer misses beats faster hits.** A RAM cache is faster on a hit and that
 is not the number your users feel. When the working set does not fit — and
@@ -17,7 +20,7 @@ seconds at the origin. That is the trade this project exists to make, and
 [the measured numbers](docs/architecture.md) are there to show the hit is
 fast enough that you stop thinking about it.
 
-## Why a disk-first cache — the value in five claims
+## Why a disk-first cache — the value in six claims
 
 1. **No eviction, no miss storms.** Nothing is ever dropped because RAM ran
    low, so a hot key can't be evicted into a thundering herd against your
@@ -52,6 +55,17 @@ fast enough that you stop thinking about it.
    remediations that fail closed and page a human on escalation. The managed
    fleet is run that way; the same evidence discipline is what you get here
    for self-hosting.
+6. **Multi-threaded execution and real multi-tenancy.** Each connection is
+   served on its own thread against a shared store with no global lock, so
+   concurrent commands actually run at the same time and a higher-core box
+   is faster rather than merely larger — the reason the excluded commands
+   (blocking, whole-keyspace, cross-slot) stay excluded is that they would
+   put that bottleneck back. Tenancy is enforced rather than agreed: a
+   token maps to an isolated keyspace at the proxy, so clients use ordinary
+   key names with nothing to prefix, and a bug in one tenant's key naming
+   cannot reach another's data. Each tenant carries an ops/second quota and
+   a storage cap; crossing the cap sheds *writes* while reads and deletes
+   keep working, so the way out is never blocked by the limit itself.
 
 ## What's in this repository
 
