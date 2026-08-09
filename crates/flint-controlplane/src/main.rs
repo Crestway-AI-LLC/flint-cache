@@ -851,9 +851,28 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
                 .as_deref()
                 .and_then(flint_tls::cert_days_remaining)
                 .map_or_else(|| "none".into(), |d: i64| d.to_string());
+            // `version:` was NEVER a software version — it is the registry
+            // generation counter that drives CPWATCH, sitting in an
+            // operator-visible response right next to cert_days_remaining
+            // and reading exactly like a build. ADR-0014 D1 renames it to
+            // registry_version: and adds the real one.
+            //
+            // The old key stays for one release as an ALIAS, because
+            // CPWATCH clients parse it: the rename is the point, breaking
+            // the watch protocol to achieve it is not. Emitting both is
+            // also what lets a mixed fleet roll in either order.
+            //
+            // controller_build is what the CONTROLLER last registered
+            // (CPCONTROLLER). It has no listener and must not gain one, so
+            // its build is as fresh as the last thing it said — and a
+            // controller that has said nothing since a roll is itself the
+            // signal, which is why the timestamp travels with it.
+            let controllers = st.controller_line();
             Value::Bulk(Some(
                 format!(
-                    "version:{}\r\nproxies:{}\r\npairs:{}\r\ntenants:{}\r\nslot_exceptions:{}\r\ncert_days_remaining:{cdr}\r\n",
+                    "build:{}\r\nregistry_version:{}\r\nversion:{}\r\nproxies:{}\r\npairs:{}\r\ntenants:{}\r\nslot_exceptions:{}\r\ncert_days_remaining:{cdr}\r\n{controllers}",
+                    build_version(),
+                    st.version,
                     st.version,
                     st.proxies.len(),
                     st.pairs.len(),
@@ -883,6 +902,34 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
             drop(st);
             shared.changed.notify_all();
             Value::Simple(format!("OK promoted {addr} gen {next}"))
+        }
+        b"CPCONTROLLER" => {
+            // `CPCONTROLLER <host:pid> <build>` — the controller telling us
+            // what it is (ADR-0014 D1). It has no listener, so registration
+            // is the only way its build can reach `status` without ssh.
+            //
+            // Does NOT bump st.version and does NOT commit: this is
+            // observability, not registry state. Waking every watching
+            // proxy because a controller said hello would make a heartbeat
+            // into fleet-wide work, and persisting it would let a stamp
+            // outlive the process it describes.
+            let (Some(id), Some(build)) = (text(1), text(2)) else {
+                return err("CPCONTROLLER <host:pid> <build>");
+            };
+            let Ok(mut st) = shared.state.lock() else {
+                return err("state lock");
+            };
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            st.controllers.insert(id.clone(), (build.clone(), now));
+            // Forget controllers that stopped reporting LONG ago (10x the
+            // stale window), so a box replaced months back does not
+            // accumulate. Well past STALE, which stays visible on purpose.
+            let cutoff = now.saturating_sub(state::CONTROLLER_STALE_MS * 10);
+            st.controllers.retain(|_, (_, at)| *at >= cutoff);
+            Value::Simple(format!("OK {id} {build}"))
         }
         b"CPSNAPSHOT" => {
             let Some(proxy) = text(1) else {
@@ -1126,7 +1173,20 @@ fn internal_client_config() -> Option<Arc<flint_tls::ReloadableClientConfig>> {
     }
 }
 
+/// The build stamp surfaced in CPINFO (ADR-0014 D1). One definition for
+/// every Flint binary; see the flint-build crate for why it is not written
+/// out here.
+fn build_version() -> String {
+    flint_build::version(env!("CARGO_PKG_VERSION"))
+}
+
 fn main() -> std::io::Result<()> {
+    // Before --raft dispatch: asking a binary what it is must not depend on
+    // which mode it would have started in.
+    if std::env::args().any(|a| a == "--build-version") {
+        println!("{}", build_version());
+        return Ok(());
+    }
     let port: u16 = arg("--port").and_then(|p| p.parse().ok()).unwrap_or(7500);
     let path = arg("--state").unwrap_or_else(|| "./flint-cp-state".into());
 

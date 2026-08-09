@@ -557,6 +557,7 @@ name = "flint-controller"
 version = "0.0.1"
 dependencies = [
  "flint-balance",
+ "flint-build",
  "flint-journal",
  "flint-resp",
  "flint-tls",
@@ -566,6 +567,7 @@ dependencies = [
 name = "flint-controlplane"
 version = "0.0.1"
 dependencies = [
+ "flint-build",
  "flint-journal",
  "flint-resp",
  "flint-slot",
@@ -608,6 +610,7 @@ dependencies = [
 name = "flint-proxy"
 version = "0.0.1"
 dependencies = [
+ "flint-build",
  "flint-commands",
  "flint-resp",
  "flint-slot",

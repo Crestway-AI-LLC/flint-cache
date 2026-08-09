@@ -574,6 +574,61 @@ fn info_field(
         .map(|l| l.trim_start_matches(field).trim().to_string())
 }
 
+/// One `key:` line out of a CPINFO response (ADR-0014 D1). Separate from
+/// `info_field` because that one asks FLINTINFO, which only data nodes
+/// serve — asking a CP for it is how "the CP has no build" reads as "the
+/// CP is down".
+fn cpinfo_field(
+    addr: &str,
+    tls: &Option<Arc<flint_tls::ClientConfig>>,
+    field: &str,
+) -> Option<String> {
+    let Ok(Value::Bulk(Some(raw))) = call(addr, tls, &["CPINFO"]) else {
+        return None;
+    };
+    String::from_utf8_lossy(&raw)
+        .split(['\r', '\n'])
+        .find(|l| l.starts_with(field))
+        .map(|l| l.trim_start_matches(field).trim().to_string())
+}
+
+/// The `controller:` rows a CP is repeating back. `None` when the CP could
+/// not be reached at all, which is different from an empty list ("reached
+/// it, nobody has registered") — the caller renders those differently
+/// because only one of them means the controller might be missing.
+fn cpinfo_controllers(
+    addr: &str,
+    tls: &Option<Arc<flint_tls::ClientConfig>>,
+) -> Option<Vec<String>> {
+    let Ok(Value::Bulk(Some(raw))) = call(addr, tls, &["CPINFO"]) else {
+        return None;
+    };
+    Some(
+        String::from_utf8_lossy(&raw)
+            .split(['\r', '\n'])
+            .filter(|l| l.starts_with("controller:"))
+            .map(|l| l.trim_start_matches("controller:").trim().to_string())
+            .collect(),
+    )
+}
+
+/// One `key:` line out of a proxy's PROXYSTATS. Uses the same dial and the
+/// same admin-gating tolerance as `proxy_up`: a -NOAUTH proxy is up, it
+/// just will not tell us its build without the admin token, and reporting
+/// `-` there is honest where reporting DOWN would not be.
+fn proxystats_field(inv: &Inventory, i: usize, field: &str) -> Option<String> {
+    if inv.client_tls {
+        return None;
+    }
+    let Ok(Value::Bulk(Some(raw))) = call(&proxy_dial(inv, i), &None, &["PROXYSTATS"]) else {
+        return None;
+    };
+    String::from_utf8_lossy(&raw)
+        .split(['\r', '\n'])
+        .find(|l| l.starts_with(field))
+        .map(|l| l.trim_start_matches(field).trim().to_string())
+}
+
 // ---------- process runner (local; pidfiles for stop/status) ----------
 
 // flintctl is a short-lived CLI: spawned fleet processes deliberately
@@ -3048,9 +3103,26 @@ fn status(inv: &Inventory) {
     let tls = tls_client(inv);
     // Every CP seat, not just the first: with a Raft group, "cp[0] answers"
     // hides a dead follower until the NEXT failure makes it a lost quorum.
+    // ADR-0014 D1: `status` used to print `cp <addr> up` beside pair nodes
+    // reporting `build v0.1.0-rc.33`. Three of five seat kinds carried no
+    // stamp, and `upgrade` rolls all five — so the tiers that CHANGE during
+    // an upgrade were the tiers nothing could identify.
+    let mut controller_rows: Vec<String> = Vec::new();
     for seat in &inv.cp {
         let ok = matches!(call(seat, &tls, &["PING"]), Ok(Value::Simple(s)) if s == "PONG");
-        println!("cp        {seat}  {}", if ok { "up" } else { "DOWN" });
+        let build = cpinfo_field(seat, &tls, "build:")
+            .map(|b| flint_build::display(&b, env!("CARGO_PKG_VERSION")).to_string())
+            .unwrap_or_else(|| "-".into());
+        println!(
+            "cp        {seat}  {:<6} build {build}",
+            if ok { "up" } else { "DOWN" }
+        );
+        // The controller has no listener, so it is not a row we can probe —
+        // it is a row the CP repeats back to us. Collected here and printed
+        // after the seats it supervises.
+        if let Some(lines) = cpinfo_controllers(seat, &tls) {
+            controller_rows.extend(lines);
+        }
     }
     for (i, pair) in inv.pairs.iter().enumerate() {
         for addr in pair {
@@ -3073,7 +3145,24 @@ fn status(inv: &Inventory) {
         // The proxy's client port is plaintext (frontend TLS is separate
         // from the internal mesh): probe it without the mesh cert.
         let up = proxy_up(inv, i);
-        println!("proxy     {proxy}  {}", if up { "up" } else { "DOWN" });
+        let build = proxystats_field(inv, i, "build:")
+            .map(|b| flint_build::display(&b, env!("CARGO_PKG_VERSION")).to_string())
+            .unwrap_or_else(|| "-".into());
+        println!(
+            "proxy     {proxy}  {:<6} build {build}",
+            if up { "up" } else { "DOWN" }
+        );
+    }
+    // Printed even when empty is NOT an option here: an absent controller
+    // row means the CP has heard from nobody, which during a roll is the
+    // difference between "supervised" and "not". Say so rather than
+    // rendering nothing and letting silence read as fine.
+    if controller_rows.is_empty() {
+        println!("controller          NONE REPORTING  (no controller has registered with the CP)");
+    } else {
+        for row in controller_rows {
+            println!("controller  {row}");
+        }
     }
     // Optional fleet-agent add-on: the `agent <addr>` inventory key starts
     // a flint-agent binary if one sits in the bins dir. The agent (fleet
@@ -3995,7 +4084,7 @@ fn upgrade(inv: &Inventory, version_tag: Option<String>, soak_ms: u64, nodes_onl
         status(inv);
         return;
     }
-    roll_edge(inv, &envs);
+    roll_edge(inv, &envs, &expect);
     eprintln!("== upgrade complete (whole fleet)");
     status(inv);
 }
@@ -4013,13 +4102,41 @@ fn upgrade(inv: &Inventory, version_tag: Option<String>, soak_ms: u64, nodes_onl
 /// `upgrade` rolls the two pair nodes and reports success — which is exactly
 /// what would have happened shipping rc.12, whose entire point was two fixes
 /// in the PROXY. A release that cannot deliver a proxy fix is not a release.
-fn roll_edge(inv: &Inventory, envs: &[(String, String)]) {
+fn roll_edge(inv: &Inventory, envs: &[(String, String)], expect_build: &Option<String>) {
     let d = &inv.statedir;
     let tls = tls_client(inv);
     let die_on = |seat: &str, e: String| -> ! {
         eprintln!("== UPGRADE ABORTED rolling {seat}: {e}");
         eprintln!("   the data plane is already on the new build (roll forward)");
         std::process::exit(3);
+    };
+    // ADR-0014 D1. Pair nodes have been build-asserted since #105; these
+    // three seats could not be, because they carried no stamp — so this
+    // function's own abort message ("the data plane is already on the new
+    // build") named the one tier it could see. A half-completed edge roll
+    // was indistinguishable from a finished one.
+    //
+    // Skipped without --version-tag, exactly like the node assertion: there
+    // is nothing to compare against, and inventing an expectation would
+    // make a source build unrollable.
+    let assert_build = |seat: &str, got: Option<String>| {
+        let Some(want) = expect_build else { return };
+        match got {
+            Some(got) if &got == want => eprintln!("  {seat} reports {got}"),
+            Some(got) => die_on(
+                seat,
+                format!(
+                    "reports build {got:?}, expected {want:?} — the binary it restarted from is not the one that was staged"
+                ),
+            ),
+            None => die_on(
+                seat,
+                "came up but would not report a build. Either it predates ADR-0014 D1 \
+                 (roll it once more, from a binary that stamps) or it is not answering \
+                 the info command at all — both mean this roll cannot be verified"
+                    .into(),
+            ),
+        }
     };
 
     if inv.controller {
@@ -4084,6 +4201,7 @@ fn roll_edge(inv: &Inventory, envs: &[(String, String)]) {
             "did not answer after the binary swap".into(),
         );
     }
+    assert_build("control plane", cpinfo_field(&inv.cp[0], &tls, "build:"));
 
     if inv.backup_to.is_some() {
         eprintln!("== backup seat");
@@ -4142,7 +4260,55 @@ fn roll_edge(inv: &Inventory, envs: &[(String, String)]) {
             }
             std::thread::sleep(Duration::from_millis(150));
         }
+        assert_build(&seat, proxystats_field(inv, i, "build:"));
         eprintln!("  {seat} rolled and serving");
+    }
+
+    // The controller last, because it is the only seat whose build arrives
+    // by REGISTRATION rather than by asking. It re-registers on startup, so
+    // a rolled controller has already reported by the time the proxies are
+    // done — but give it a bounded wait rather than assuming that ordering
+    // holds on a slower machine.
+    //
+    // This is the seat the recorded failure happened to: "a controller from
+    // a previous start survived two upgrade cycles". Two cycles, because
+    // nothing could be asked what build it was. If the CP now reports a
+    // controller on the OLD build, that orphan is still running.
+    if inv.controller && expect_build.is_some() {
+        let deadline = Instant::now() + Duration::from_secs(45);
+        loop {
+            let rows = cpinfo_controllers(&inv.cp[0], &tls).unwrap_or_default();
+            let want = expect_build.as_deref().unwrap_or_default();
+            let live: Vec<&String> = rows.iter().filter(|r| r.contains(" live ")).collect();
+            let all_new =
+                !live.is_empty() && live.iter().all(|r| r.contains(&format!("build={want}")));
+            if all_new {
+                eprintln!("  controller reports {want} ({} live)", live.len());
+                if live.len() > 1 {
+                    eprintln!(
+                        "  NOTE {} live controllers registered — expected one. \
+                         They are epoch-fenced so the fleet is safe, but a duplicate \
+                         supervisor is how an orphan survived two rolls unnoticed.",
+                        live.len()
+                    );
+                }
+                break;
+            }
+            if Instant::now() > deadline {
+                for r in &rows {
+                    eprintln!("   controller {r}");
+                }
+                die_on(
+                    "controller",
+                    format!(
+                        "no live controller reported build {want} within 45s. Either the \
+                         rolled controller cannot reach the CP to register, or an OLD \
+                         controller is still running (see rows above)"
+                    ),
+                );
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
     }
 }
 

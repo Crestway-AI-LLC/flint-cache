@@ -56,7 +56,57 @@ pub struct State {
     /// Last promotion reported by the controller: (addr, generation). NOT
     /// persisted and NOT routing authority — see tenant::promote_hint.
     pub promoted: Option<(String, u64)>,
+    /// Build stamps the CONTROLLERS registered (ADR-0014 D1), keyed by the
+    /// identity they gave: `host:pid` -> (build, unix_ms of the report).
+    ///
+    /// The controller has no listener and must not gain one, so it cannot
+    /// be asked; it tells us instead, on startup and on every heartbeat.
+    /// NOT persisted, deliberately: a build stamp that outlived the process
+    /// that reported it would be a claim about a controller that may not be
+    /// running, which is the exact confusion this closes. A cold CP starts
+    /// knowing nothing and learns within one heartbeat.
+    ///
+    /// A MAP rather than one value because duplicate controllers are the
+    /// recorded failure — "a controller from a previous start survived two
+    /// upgrade cycles" — and one slot would have hidden the second one by
+    /// overwriting it, reproducing the bug in the surface built to find it.
+    pub controllers: BTreeMap<String, (String, u64)>,
     path: Option<PathBuf>,
+}
+
+/// How long after its last report a controller is still believed present.
+/// Three heartbeats: one missed report is a scheduling hiccup, three is a
+/// process that is gone.
+pub const CONTROLLER_STALE_MS: u64 = 90_000;
+
+impl State {
+    /// The `controller:` lines for CPINFO — one per registered controller,
+    /// each carrying how long ago it last spoke, because "which build" and
+    /// "still running" are the same question for a seat with no listener.
+    ///
+    /// Renders STALE rather than dropping the row. A controller that
+    /// stopped reporting is the single most interesting thing this surface
+    /// can say, and hiding it would restore the silence that let an
+    /// orphaned controller survive two upgrade cycles.
+    pub fn controller_line(&self) -> String {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let mut out = String::new();
+        for (id, (build, at)) in &self.controllers {
+            let age = now.saturating_sub(*at);
+            let state = if age > CONTROLLER_STALE_MS {
+                "STALE"
+            } else {
+                "live"
+            };
+            out.push_str(&format!(
+                "controller:{id} build={build} {state} last_seen_ms_ago={age}\r\n"
+            ));
+        }
+        out
+    }
 }
 
 /// FNV-1a — a stable, dependency-free seed for deterministic subset
@@ -542,5 +592,64 @@ mod tests {
         assert_eq!(tenants, "tok-t1=t1,tok-t3=t3");
         let (_, _, t2, _, _, _) = s.snapshot_for("p2");
         assert_eq!(t2, "tok-t2=t2", "p2 must not see p1's tokens");
+    }
+}
+
+#[cfg(test)]
+mod controller_registry_tests {
+    use super::*;
+
+    fn now() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn a_controller_that_stopped_reporting_reads_stale_not_absent() {
+        // The failure this whole surface exists for: "a controller from a
+        // previous start survived two upgrade cycles". Dropping the row
+        // would restore exactly the silence that let it.
+        let mut s = State::default();
+        s.controllers
+            .insert("box:1".into(), ("v0.1.0-rc.40".into(), now()));
+        s.controllers.insert(
+            "box:2".into(),
+            ("v0.1.0-rc.33".into(), now() - CONTROLLER_STALE_MS - 5_000),
+        );
+        let out = s.controller_line();
+        assert!(
+            out.contains("controller:box:1 build=v0.1.0-rc.40 live"),
+            "{out}"
+        );
+        assert!(
+            out.contains("controller:box:2 build=v0.1.0-rc.33 STALE"),
+            "the orphan must still be NAMED, and named as stale: {out}"
+        );
+    }
+
+    #[test]
+    fn two_controllers_are_both_reported() {
+        // One slot would have overwritten the duplicate and hidden the
+        // recorded bug inside the feature built to find it.
+        let mut s = State::default();
+        s.controllers
+            .insert("box:1".into(), ("v0.1.0-rc.40".into(), now()));
+        s.controllers
+            .insert("box:2".into(), ("v0.1.0-rc.40".into(), now()));
+        assert_eq!(
+            s.controller_line().lines().count(),
+            2,
+            "a duplicate controller is the thing we are looking for"
+        );
+    }
+
+    #[test]
+    fn no_controllers_renders_nothing_rather_than_a_reassuring_line() {
+        // An empty registry means "none has reported", which is NOT "none
+        // is running" — a CP restarted a moment ago knows nothing yet.
+        // Saying nothing is honest; a "controller: none" line would not be.
+        assert_eq!(State::default().controller_line(), "");
     }
 }

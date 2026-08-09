@@ -1,9 +1,26 @@
 # ADR-0014: One status surface — every seat says what it is running
 
-Status: proposed — August 2026, scheduled after the public flip. Nothing
-below is implemented. Filed now because the evidence was gathered during
-launch prep and would otherwise be lost, and because one part of it (D1) is
-a gap in the upgrade path rather than a feature request.
+Status: **D1 accepted and implemented, August 2026. D2 and D3 proposed.**
+Filed originally because the evidence was gathered during launch prep and
+would otherwise be lost, and because one part of it (D1) is a gap in the
+upgrade path rather than a feature request — which is why it was brought
+forward ahead of the flip instead of waiting.
+
+D1 as built: `flint_build` in the proxy, control plane and controller, each
+with `--build-version`; `build:` in `PROXYSTATS` and `CPINFO`;
+`registry_version:` with `version:` retained as an alias; the controller
+registering via a new `CPCONTROLLER <host:pid> <build>` every 30s with a
+90s staleness window; `flintctl status` rendering all five seat kinds; and
+`roll_edge` asserting the observed build for the control plane, each proxy,
+and the controller. Covered by `tools/build_stamp_drill.sh` (core gate).
+
+One deliberate gap, recorded rather than papered over: the drill cannot
+prove the MISMATCH abort, because `upgrade --version-tag T` exports
+`FLINT_BUILD_VERSION=T` to the seats it spawns and an unbaked dev binary
+reports the environment — the assertion would read back the value it just
+set. That is the self-fulfilling check `flint_build` already documents, and
+the reason a baked `FLINT_RELEASE_TAG` wins over the environment. Proving
+it needs two release builds with different baked tags.
 
 > Numbering: 0005–0009 are private-plane records and 0010 is reserved for the
 > co-processor extension model. See [README](README.md) for why the sequence

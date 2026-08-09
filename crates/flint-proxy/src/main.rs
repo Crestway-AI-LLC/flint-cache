@@ -1255,8 +1255,12 @@ fn auth_step(
         let quota_throttled = topo.stat_quota_throttled_total.load(Ordering::Relaxed);
         let moved_learned = topo.stat_moved_learned.load(Ordering::Relaxed);
         let quota_write_shed = topo.stat_quota_write_shed_total.load(Ordering::Relaxed);
+        // build: FIRST (ADR-0014 D1). The edge is rolled by `flintctl
+        // upgrade` like everything else, and until now carried no stamp at
+        // all — so a half-completed edge roll looked exactly like a
+        // finished one.
         let info = format!(
-            "active:{}\r\nconns_total:{}\r\nshed_total:{}\r\nauth_ok_total:{}\r\nauth_fail_total:{}\r\ncommands_total:{}\r\ncommands_read_total:{}\r\ncommands_write_total:{}\r\nhotkey_sample_rate:{}\r\ncache_ttl_ms:{cache_ttl}\r\ncache_max_bytes:{cache_max}\r\ncache_hits_total:{cache_hits}\r\ncache_misses_total:{cache_misses}\r\ncache_entries:{cache_entries}\r\ncache_bytes:{cache_bytes}\r\nmoved_learned_total:{moved_learned}\r\nquota_throttled_total:{quota_throttled}\r\nquota_write_shed_total:{quota_write_shed}\r\ncert_days_remaining:{cdr}\r\n",
+            "build:{build}\r\nactive:{}\r\nconns_total:{}\r\nshed_total:{}\r\nauth_ok_total:{}\r\nauth_fail_total:{}\r\ncommands_total:{}\r\ncommands_read_total:{}\r\ncommands_write_total:{}\r\nhotkey_sample_rate:{}\r\ncache_ttl_ms:{cache_ttl}\r\ncache_max_bytes:{cache_max}\r\ncache_hits_total:{cache_hits}\r\ncache_misses_total:{cache_misses}\r\ncache_entries:{cache_entries}\r\ncache_bytes:{cache_bytes}\r\nmoved_learned_total:{moved_learned}\r\nquota_throttled_total:{quota_throttled}\r\nquota_write_shed_total:{quota_write_shed}\r\ncert_days_remaining:{cdr}\r\n",
             topo.stat_active.load(Ordering::Relaxed),
             load(&topo.stat_conns_total),
             load(&topo.stat_shed_total),
@@ -1269,6 +1273,7 @@ fn auth_step(
             // already scaled back up by this, so it IS the estimated ops/s.
             // Exposed for transparency about the estimate's granularity.
             HOTKEY_SAMPLE_RATE,
+            build = build_version(),
             cdr = topo
                 .cert_path
                 .as_deref()
@@ -2370,7 +2375,22 @@ fn frame_to_args(frame: Value) -> Option<Vec<Vec<u8>>> {
     Some(args)
 }
 
+/// The build stamp surfaced in PROXYSTATS (ADR-0014 D1). One definition for
+/// every Flint binary; see the flint-build crate for why it is not written
+/// out here.
+fn build_version() -> String {
+    flint_build::version(env!("CARGO_PKG_VERSION"))
+}
+
 fn main() -> std::io::Result<()> {
+    // Ask the binary what it is, without starting it. Same flag surface as
+    // flint-server. Until ADR-0014 D1 the proxy carried no stamp at all, so
+    // `flintctl upgrade` rolled the edge with no way to check what landed —
+    // a half-completed edge roll was indistinguishable from a finished one.
+    if std::env::args().any(|a| a == "--build-version") {
+        println!("{}", build_version());
+        return Ok(());
+    }
     let port: u16 = arg("--port").and_then(|p| p.parse().ok()).unwrap_or(7379);
     // A comma-list is the SEATS of one cluster's Raft CP, tried in order —
     // any seat serves CPWATCH from its local applied registry, so the proxy

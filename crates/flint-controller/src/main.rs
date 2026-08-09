@@ -720,7 +720,22 @@ fn build_pairs() -> Vec<Pair> {
     Vec::new()
 }
 
+/// The build stamp this controller registers with the CP (ADR-0014 D1).
+/// One definition for every Flint binary; see the flint-build crate.
+fn build_version() -> String {
+    flint_build::version(env!("CARGO_PKG_VERSION"))
+}
+
 fn main() {
+    // The controller has NO LISTENER and must not gain one — a supervisor
+    // that accepts connections is a supervisor that can be asked to do
+    // things, and its safety today rests on being unreachable. So this flag
+    // is the only way to interrogate the file directly, and the running
+    // process reports itself by REGISTERING with the CP instead (below).
+    if std::env::args().any(|a| a == "--build-version") {
+        println!("{}", build_version());
+        return;
+    }
     // Internal-mesh mutual TLS toward the nodes (the controller is a client
     // everywhere — it has no listener). Same both-or-none-plus-ca gating as
     // the other components.
@@ -808,10 +823,52 @@ fn main() {
         cfg.balance_policy.name(),
     );
 
+    // ADR-0014 D1: say what we are, since nobody can ask. Once at startup
+    // and every REGISTER_EVERY thereafter — the CP's staleness window is
+    // three of these, so one missed report is a hiccup and three is a
+    // process that is gone.
+    //
+    // Registering repeatedly rather than once is what makes an ORPHANED
+    // controller visible: the recorded failure is one surviving two upgrade
+    // cycles unnoticed, and a single startup announcement would have gone
+    // just as unnoticed the moment the CP restarted.
+    const REGISTER_EVERY: Duration = Duration::from_secs(30);
+    let identity = format!(
+        "{}:{}",
+        std::process::Command::new("hostname")
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|| "unknown".into()),
+        std::process::id()
+    );
+    let register = |cfg: &Config| {
+        // Best effort, exactly like CPPROMOTED: supervision must never
+        // depend on the CP being up, and a controller that cannot announce
+        // itself is still a controller that must keep supervising.
+        if let Some(cp) = &cfg.commit_cp {
+            let _ = call(
+                cp,
+                &[
+                    b"CPCONTROLLER",
+                    identity.as_bytes(),
+                    build_version().as_bytes(),
+                ],
+            );
+        }
+    };
+    register(&cfg);
+
     let mut last_rebalance = Instant::now();
     let mut last_recover = Instant::now();
+    let mut last_register = Instant::now();
     loop {
         std::thread::sleep(cfg.poll);
+        if last_register.elapsed() > REGISTER_EVERY {
+            last_register = Instant::now();
+            register(&cfg);
+        }
         for pair in pairs.iter_mut() {
             pair.tick(&cfg);
         }
