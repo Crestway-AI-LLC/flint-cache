@@ -39,6 +39,7 @@
 //!                    [--tenants "tokenA=nsA,tokenB=nsB"]
 
 mod cache;
+mod errors;
 mod latency;
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -351,6 +352,10 @@ struct Topology {
     /// Per-tenant latency histograms (M4 client-metrics substitute):
     /// tenant-perceived latency measured one hop from the client.
     latency: latency::LatencyHistograms,
+    /// Per-tenant error counts by kind. PROXYSTATS' flat counters answer
+    /// "are there errors" and never "whose, and which" — the only two
+    /// questions an incident actually poses.
+    errors: errors::ErrorCounts,
     /// M5 quota state by NAMESPACE (rate share + over-quota verdict),
     /// rebuilt on every snapshot so a mid-connection verdict flip applies
     /// without re-auth. Buckets carry the running token count.
@@ -719,8 +724,10 @@ impl Topology {
         if let Ok(mut tenants) = self.tenants.write() {
             *tenants = new_tenants;
         }
-        // A removed tenant's latency lanes and bucket must not live forever.
+        // A removed tenant's latency lanes, error counts and bucket must
+        // not live forever.
         self.latency.retain(&keep);
+        self.errors.retain(&keep);
         if let Ok(mut buckets) = self.buckets.lock() {
             buckets.retain(|ns, _| keep.contains(ns));
         }
@@ -1284,6 +1291,16 @@ fn auth_step(
         }
         return AuthStep::Reply(Value::Bulk(Some(topo.latency.report(scope).into_bytes())));
     }
+    // Per-tenant error counts by kind. Same scoping as PROXYLATENCY and
+    // for the same reason: an error profile is tenant data — it exposes
+    // their client's health, and via QUOTA their commercial limits.
+    if name.as_deref() == Some(b"PROXYERRORS") {
+        let scope = authed_ns.as_deref().filter(|_| !topo.open_mode);
+        if scope.is_none() && admin_locked {
+            return admin_denied();
+        }
+        return AuthStep::Reply(Value::Bulk(Some(topo.errors.report(scope).into_bytes())));
+    }
     // Ops knob: the proxy near-cache (D6). No args -> report; two args ->
     // set (ttl_ms, max_bytes) at RUNTIME; ttl 0 disables and clears. Same
     // pre-auth operator surface as the other PROXY* commands (mTLS-gated in
@@ -1625,6 +1642,14 @@ fn serve_client<S: Read + Write>(mut stream: S, topo: Arc<Topology>) -> std::io:
                                 started.elapsed().as_micros() as u64,
                             );
                         }
+                    }
+                    // Every error a client is told about passes here —
+                    // the same funnel the latency histogram uses. Counting
+                    // at the ~20 construction sites instead would leave
+                    // whichever one is added next uncounted, silently.
+                    if let Value::Error(msg) = &reply {
+                        topo.errors
+                            .observe(authed_ns.as_deref(), errors::classify(msg));
                     }
                     encode_proto(&reply, proto, &mut out);
                     if out.len() >= OUT_FLUSH_THRESHOLD {
@@ -2471,6 +2496,7 @@ fn main() -> std::io::Result<()> {
         replica_rr: AtomicUsize::new(0),
         hotkeys: HotKeySketch::new(),
         latency: latency::LatencyHistograms::default(),
+        errors: errors::ErrorCounts::default(),
         // D6 near-cache defaults: TTL 300 ms, budget 256 MB (Jeff,
         // 2026-07-20). ON by default at the proxy — but caching still
         // requires the tenant's 'c' opt-in per request, so an un-opted
@@ -2618,6 +2644,7 @@ mod route_tests {
             stat_active: AtomicUsize::new(0),
             hotkeys: HotKeySketch::new(),
             latency: latency::LatencyHistograms::default(),
+            errors: errors::ErrorCounts::default(),
             quota: RwLock::new(HashMap::new()),
             buckets: std::sync::Mutex::new(HashMap::new()),
             stat_quota_throttled_total: std::sync::atomic::AtomicU64::new(0),
