@@ -91,16 +91,31 @@ echo "== upgrade --version-tag $TAG (an operator's own build number, not a relea
 $CTL -f "$D/cluster.flint" upgrade --version-tag "$TAG" --soak-ms 1500 >"$D/upgrade.log" 2>&1 \
   || { echo "FAIL: upgrade exited non-zero"; tail -15 "$D/upgrade.log"; exit 1; }
 
-echo "== every pair node reports the build that was asked for"
+echo "== EVERY seat reports the build that was asked for, not just the pair"
+# This counted a flat `grep -c "build $TAG"` against 2, because the pair
+# nodes were the only seats that carried a stamp. ADR-0014 D1 gave the
+# control plane and the proxy one too, and the count became 4 — the drill
+# went red on a fleet that had rolled correctly, which is the shape of
+# "a drill can assert the OLD contract" from the field notes.
+#
+# Counting 4 instead would fix the red and waste the change. #105 made
+# `upgrade` roll all five seat kinds while it could only verify one, and
+# the whole point of D1 is that the other tiers are now checkable. So
+# assert them BY KIND: a magic total would also go stale the next time the
+# inventory grows a seat.
 ST=$($CTL -f "$D/cluster.flint" status 2>/dev/null || true)
-N=$(echo "$ST" | grep -c "build $TAG" || true)
-if [ "${N:-0}" -ne 2 ]; then
+PAIRS=$(echo "$ST" | grep -c "^pair .*build $TAG" || true)
+CPS=$(echo "$ST"   | grep -c "^cp .*build $TAG" || true)
+PXS=$(echo "$ST"   | grep -c "^proxy .*build $TAG" || true)
+if [ "${PAIRS:-0}" -ne 2 ] || [ "${CPS:-0}" -lt 1 ] || [ "${PXS:-0}" -lt 1 ]; then
   echo "$ST" | sed 's/^/  | /'
-  echo "FAIL: expected 2 nodes reporting build '$TAG', got ${N:-0}"
+  echo "FAIL: after the roll, seats on '$TAG': ${PAIRS:-0}/2 pair nodes, ${CPS:-0} cp, ${PXS:-0} proxy"
   echo "      the roll may have worked — check whether status is REPORTING it."
+  echo "      A cp or proxy at 0 means the EDGE roll did not land, which is"
+  echo "      the half that used to be invisible."
   exit 1
 fi
-echo "  both nodes on $TAG"
+echo "  pair $PAIRS/2, cp $CPS, proxy $PXS — all on $TAG"
 
 echo "== the data survived the roll (warm restart, not a resync)"
 GOT=$($CLI -p 7845 -a tok-acme --no-auth-warning GET before-roll 2>/dev/null | tr -d '\r')
