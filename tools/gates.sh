@@ -77,9 +77,23 @@ step() {  # step <name> <log-suffix> <command...>
     printf 'PASS  %-22s (%ss)\n' "$name" "$(( $(date +%s) - start ))"
   else
     printf 'FAIL  %-22s (%ss)  %s\n' "$name" "$(( $(date +%s) - start ))" "$log"
-    # The first line that looks like a diagnosis, so a failure is readable
-    # here and fully readable in the log.
-    grep -m1 -E '^(FAIL|error|REFUSING)' "$log" | sed 's/^/        /'
+    # The drill's OWN verdict first, then the looser patterns.
+    #
+    # This was one `grep -m1 -E '^(FAIL|error|REFUSING)'`, and `^error`
+    # matched repl_drill's benign progress line "errors: 0, replies:
+    # 50500". The gate therefore reported a passing statistic as the
+    # diagnosis of a failure, and the actual FAIL line -- further down the
+    # same file -- was never shown. Two runs were spent reading "errors: 0"
+    # and wondering what was wrong with zero errors.
+    #
+    # A summary that can print a HEALTHY line as the reason for a failure
+    # is worse than printing nothing, because it is read as the answer.
+    # `^FAIL` is the drills' own contract (every one of them exits through
+    # a `FAIL:` line); the rest are fallbacks for a drill that died before
+    # reaching its own verdict.
+    { grep -m1 -E '^FAIL' "$log" \
+        || grep -m1 -E '^(REFUSING|thread .* panicked|error(\[|:))' "$log" \
+        || tail -3 "$log"; } | sed 's/^/        /' 
     FAILED="$FAILED $name"
   fi
 }
