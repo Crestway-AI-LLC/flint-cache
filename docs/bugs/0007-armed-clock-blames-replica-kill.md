@@ -1,4 +1,8 @@
-# 0007: the armed kill clock blames a replica kill for a master kill's loss
+# BUG-0007: the armed kill clock blames a replica kill for a master kill's loss (RESOLVED)
+
+Status: RESOLVED 2026-08-07 · Found by `chaos_drill.sh` failing three
+different ways on one seed · Severity: high (misattributed data loss —
+sends the investigation at the wrong subsystem)
 
 ## Symptom
 

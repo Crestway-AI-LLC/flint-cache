@@ -3173,6 +3173,232 @@ fn status(inv: &Inventory) {
     }
 }
 
+/// Knobs that MUST agree between the members of a pair (ADR-0014 D2).
+///
+/// Every one of these is read from a node's own arguments, so a roll that
+/// updated one member and not the other leaves a pair that behaves one way
+/// while its survivor behaves another — visible only during the failover
+/// that needed it. Nothing in the fleet compared them before this.
+///
+/// Deliberately excludes everything that is STATE rather than
+/// configuration: role, epoch, seq_lag, live_replicas, sst_bytes, disk_*,
+/// and every counter. Those differ between a master and its replica by
+/// definition, and listing them here would produce drift on every healthy
+/// pair — a red that means nothing is a red nobody reads.
+const PAIR_KNOBS: &[&str] = &[
+    "lag_soft_ms:",
+    "lag_hard_ms:",
+    "min_replicas_to_write:",
+    "widowed_grace_ms:",
+    "fullsync_max:",
+    "wal_fsync_ms:",
+    "max_conns:",
+];
+
+/// Below this, a difference is assumed to be a roll in progress rather
+/// than drift. `upgrade` restarts one member at a time and waits for it to
+/// converge, so a seat younger than this may legitimately not match its
+/// partner yet.
+///
+/// The ADR names the failure this avoids: a check whose red means "unlucky
+/// timing" is a check people re-run instead of read. Suppressing here
+/// costs a delayed report; not suppressing costs the report's credibility.
+/// Overridable with FLINT_ROLL_GRACE_MS so a drill can exercise both sides
+/// of the boundary without a two-minute sleep — the same shrink the
+/// rotation drill applies to its drain window.
+fn roll_grace_ms() -> u64 {
+    std::env::var("FLINT_ROLL_GRACE_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(120_000)
+}
+
+fn json_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// One JSON document describing the whole fleet (ADR-0014 D2).
+///
+/// Rendered from the same dials the human `status` uses, so the two cannot
+/// disagree. `--json` rather than a daemon or a port: the AMI already ships
+/// flintctl, a new listener would be attack surface for questions flintctl
+/// can already ask, and the time-series surface is the exporter.
+fn status_json(inv: &Inventory) {
+    let tls = tls_client(inv);
+    let mut out = String::from("{\n");
+
+    out.push_str("  \"cp\": [\n");
+    let mut controllers: Vec<String> = Vec::new();
+    for (i, seat) in inv.cp.iter().enumerate() {
+        let up = matches!(call(seat, &tls, &["PING"]), Ok(Value::Simple(s)) if s == "PONG");
+        let build = cpinfo_field(seat, &tls, "build:");
+        out.push_str(&format!(
+            "    {{\"addr\": {}, \"up\": {}, \"build\": {}}}{}\n",
+            json_str(seat),
+            up,
+            build.map(|b| json_str(&b)).unwrap_or("null".into()),
+            if i + 1 < inv.cp.len() { "," } else { "" }
+        ));
+        if let Some(rows) = cpinfo_controllers(seat, &tls) {
+            controllers.extend(rows);
+        }
+    }
+    out.push_str("  ],\n");
+
+    // Controllers are reported by the CP, not probed: no listener, by
+    // design. `null` vs `[]` is load-bearing — null means no CP could be
+    // reached to ask, [] means one was and knows of none, and during a
+    // roll those mean very different things.
+    if inv.cp.is_empty() {
+        out.push_str("  \"controllers\": null,\n");
+    } else {
+        out.push_str("  \"controllers\": [");
+        out.push_str(
+            &controllers
+                .iter()
+                .map(|r| json_str(r))
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+        out.push_str("],\n");
+    }
+
+    let mut drift: Vec<String> = Vec::new();
+    out.push_str("  \"pairs\": [\n");
+    for (i, pair) in inv.pairs.iter().enumerate() {
+        out.push_str(&format!("    {{\"pair\": {i}, \"members\": [\n"));
+        // Field maps per member, kept for the drift comparison below.
+        let mut seen: Vec<(String, Option<std::collections::BTreeMap<String, String>>)> =
+            Vec::new();
+        for (m, addr) in pair.iter().enumerate() {
+            let fields = flintinfo_all(addr, &tls);
+            match &fields {
+                Some(f) => {
+                    let mut kv: Vec<String> = f
+                        .iter()
+                        .map(|(k, v)| format!("{}: {}", json_str(k), json_str(v)))
+                        .collect();
+                    kv.sort();
+                    out.push_str(&format!(
+                        "      {{\"addr\": {}, \"up\": true, {}}}{}\n",
+                        json_str(addr),
+                        kv.join(", "),
+                        if m + 1 < pair.len() { "," } else { "" }
+                    ));
+                }
+                None => out.push_str(&format!(
+                    "      {{\"addr\": {}, \"up\": false}}{}\n",
+                    json_str(addr),
+                    if m + 1 < pair.len() { "," } else { "" }
+                )),
+            }
+            seen.push((addr.clone(), fields));
+        }
+        out.push_str(&format!(
+            "    ]}}{}\n",
+            if i + 1 < inv.pairs.len() { "," } else { "" }
+        ));
+
+        // THE CHECK NO PER-NODE VIEW CAN DO. Compare every member against
+        // the first that answered.
+        let live: Vec<_> = seen
+            .iter()
+            .filter_map(|(a, f)| f.as_ref().map(|f| (a, f)))
+            .collect();
+        if live.len() > 1 {
+            let young = live.iter().any(|(_, f)| {
+                f.get("uptime_ms")
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .is_none_or(|u| u < roll_grace_ms())
+            });
+            let (base_addr, base) = live[0];
+            for (addr, f) in &live[1..] {
+                for knob in PAIR_KNOBS {
+                    let k = knob.trim_end_matches(':');
+                    let (a, b) = (base.get(k), f.get(k));
+                    if a.is_some() && a != b {
+                        let note = if young {
+                            " (SUPPRESSED: a member has been up less than a roll window)"
+                        } else {
+                            ""
+                        };
+                        let row = format!(
+                            "pair {i} {k}: {base_addr}={} {addr}={}{note}",
+                            a.map(String::as_str).unwrap_or("-"),
+                            b.map(String::as_str).unwrap_or("-")
+                        );
+                        if !young {
+                            drift.push(row);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out.push_str("  ],\n");
+
+    out.push_str("  \"proxies\": [\n");
+    for (i, proxy) in inv.proxies.iter().enumerate() {
+        let build = proxystats_field(inv, i, "build:");
+        out.push_str(&format!(
+            "    {{\"addr\": {}, \"up\": {}, \"build\": {}}}{}\n",
+            json_str(proxy),
+            proxy_up(inv, i),
+            build.map(|b| json_str(&b)).unwrap_or("null".into()),
+            if i + 1 < inv.proxies.len() { "," } else { "" }
+        ));
+    }
+    out.push_str("  ],\n");
+
+    out.push_str("  \"drift\": [");
+    out.push_str(
+        &drift
+            .iter()
+            .map(|d| json_str(d))
+            .collect::<Vec<_>>()
+            .join(", "),
+    );
+    out.push_str("]\n}\n");
+    print!("{out}");
+    // Exit 0 even with drift: this is a REPORT, and ADR-0014 is explicit
+    // that D2 does not reconcile. A caller that wants to gate reads the
+    // array — which is why it is always present, empty when clean, rather
+    // than omitted.
+}
+
+/// Every `key: value` line of one node's FLINTINFO. `None` when the node
+/// did not answer — distinct from an empty map, which would mean it
+/// answered with nothing.
+fn flintinfo_all(
+    addr: &str,
+    tls: &Option<Arc<flint_tls::ClientConfig>>,
+) -> Option<std::collections::BTreeMap<String, String>> {
+    let Ok(Value::Bulk(Some(raw))) = call(addr, tls, &["FLINTINFO"]) else {
+        return None;
+    };
+    Some(
+        String::from_utf8_lossy(&raw)
+            .split(['\r', '\n'])
+            .filter_map(|l| l.split_once(':'))
+            .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+            .collect(),
+    )
+}
+
 fn tenant_add(inv: &Inventory, rest: &[String]) {
     let tls = tls_client(inv);
     let mut args = vec!["CPADDTENANT"];
@@ -4537,7 +4763,7 @@ flintctl — drive a Flint cluster from one inventory file.
     flintctl -f <inventory> <command> [args...]
     flintctl --version | --help
 
-Lifecycle    bootstrap  start  stop  status  verify [--probe <tenant>:<token>]
+Lifecycle    bootstrap  start  stop  status [--json]  verify [--probe <t>:<tok>]
 Topology     expand  add-replica  swap-node  decommission-node  migrate-slots
 Failure      failover <node>  kill-node <node>  restart-node <node>
 Tenants      tenant add|rm|list  tenant-quota  tenant-reads  tenant-cache
@@ -4649,7 +4875,13 @@ fn main() {
             let tarball = rest.first().expect("usage: push-bins <bundle.tar.gz>");
             push_bins(&inv, tarball);
         }
-        "status" => status(&inv),
+        "status" => {
+            if rest.iter().any(|a| a == "--json") {
+                status_json(&inv)
+            } else {
+                status(&inv)
+            }
+        }
         "retire-proxy" => {
             let addr = rest.first().expect("usage: retire-proxy <addr>");
             retire_proxy(&inv, addr);

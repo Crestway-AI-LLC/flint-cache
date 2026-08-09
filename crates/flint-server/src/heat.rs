@@ -63,6 +63,38 @@ pub fn uptime_ms() -> u64 {
     }
 }
 
+/// Wall clock (ms) at which this PROCESS started. Distinct from
+/// `STARTED_MS` above, which is the first-op clock: a node that has served
+/// no traffic reports zero there, which is right for a rate estimate and
+/// wrong for "how long has this seat been up".
+///
+/// The difference matters for ADR-0014 D2's config-drift check. Drift
+/// between a master and its replica is legitimate mid-roll, so the check
+/// suppresses it while either seat is young — and using the first-op clock
+/// would have made an IDLE seat look permanently young, silently
+/// suppressing real drift forever. Wrong in the direction that hides
+/// things.
+static PROC_STARTED_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Call once, early in main. Idempotent.
+pub fn mark_process_start() {
+    PROC_STARTED_MS
+        .compare_exchange(0, now_ms(), Ordering::Relaxed, Ordering::Relaxed)
+        .ok();
+}
+
+/// Milliseconds this process has been running, or 0 if never marked.
+///
+/// Only read from the rocks-gated FLINTINFO block; the mem-only build
+/// still marks the start, it just has no info response to report it in.
+#[cfg_attr(not(feature = "rocks"), allow(dead_code))]
+pub fn process_uptime_ms() -> u64 {
+    match PROC_STARTED_MS.load(Ordering::Relaxed) {
+        0 => 0,
+        started => now_ms().saturating_sub(started),
+    }
+}
+
 /// Non-zero (slot, cumulative-ops) rows, ascending by slot. Bounded by the
 /// number of slots that have seen traffic.
 pub fn snapshot() -> Vec<(u16, u64)> {

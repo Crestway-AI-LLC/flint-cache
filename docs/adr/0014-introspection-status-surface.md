@@ -1,6 +1,6 @@
 # ADR-0014: One status surface — every seat says what it is running
 
-Status: **D1 accepted and implemented, August 2026. D2 and D3 proposed.**
+Status: **D1 and D2 accepted and implemented, August 2026. D3 proposed.**
 Filed originally because the evidence was gathered during launch prep and
 would otherwise be lost, and because one part of it (D1) is a gap in the
 upgrade path rather than a feature request — which is why it was brought
@@ -21,6 +21,28 @@ reports the environment — the assertion would read back the value it just
 set. That is the self-fulfilling check `flint_build` already documents, and
 the reason a baked `FLINT_RELEASE_TAG` wins over the environment. Proving
 it needs two release builds with different baked tags.
+
+D2 as built: `flintctl status --json` renders the whole fleet — every
+seat's build, each node's full `FLINTINFO`, the controller rows the CP is
+repeating back — and carries a `drift` array comparing `lag_soft_ms`,
+`lag_hard_ms`, `min_replicas_to_write`, `widowed_grace_ms`, `fullsync_max`,
+`wal_fsync_ms` and `max_conns` between the members of each pair. State is
+deliberately excluded from that comparison: role and lag differ between a
+master and its replica by definition, and flagging them would be red on
+every healthy fleet.
+
+The cry-wolf problem the Consequences section anticipated needed one thing
+that did not exist: `FLINTINFO` had no uptime. `heat::uptime_ms` was the
+wrong clock — it measures time since the first OP, so an idle seat reports
+zero and would have looked permanently young, suppressing real drift
+forever. A separate process clock (`uptime_ms:`) was added, and drift is
+held back while either member is younger than `ROLL_GRACE_MS` (120s,
+`FLINT_ROLL_GRACE_MS` for drills). Covered by
+`tools/config_drift_drill.sh` (core gate), which exercises both sides of
+that boundary and asserts a healthy pair reports nothing.
+
+`--json` exits 0 with drift present: D2 REPORTS, it does not reconcile. The
+array is always emitted, empty when clean, so a caller can gate on it.
 
 > Numbering: 0005–0009 are private-plane records and 0010 is reserved for the
 > co-processor extension model. See [README](README.md) for why the sequence
