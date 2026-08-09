@@ -1893,6 +1893,19 @@ fn transaction_step(
                 // ever chosen, and the answer is the empty array.
                 None => Some(Value::Array(Some(Vec::new()))),
                 Some(addr) => Some(match call_pinned(backends, &addr, raw) {
+                    // RESP3 has exactly ONE null, and the backend hop always
+                    // speaks it (see the HELLO 3 handshake). So the node's
+                    // aborted-EXEC reply — a null ARRAY — reaches us as
+                    // Value::Null, and forwarding that verbatim to a RESP2
+                    // client emits `$-1`, a null BULK. Redis answers `*-1`.
+                    //
+                    // Re-typed here rather than anywhere upstream because
+                    // this is the only place that knows the reply is EXEC's:
+                    // the sole null EXEC can return is the null array, so the
+                    // information RESP3 discarded is recoverable exactly here
+                    // and nowhere else. Array(None) still encodes to `_` for
+                    // a RESP3 client, so this costs that path nothing.
+                    Ok(Value::Null) => Value::Array(None),
                     Ok(v) => v,
                     Err(why) => abort_txn(backends, &mut ended, &why),
                 }),
