@@ -639,10 +639,28 @@ fn cpinfo_controllers(
 /// serves both rather than a branch that opts out of asking.
 fn proxystats_field(inv: &Inventory, i: usize, field: &str) -> Option<String> {
     let tls = edge_tls_client(inv);
+    // PRESENT THE ADMIN TOKEN when the inventory has one. PROXYSTATS is an
+    // operator surface: once the CP has pushed the admin digest (ADR-0006
+    // D4) the proxy refuses it pre-auth, so an unauthenticated read returns
+    // -NOAUTH and this function returned None — "would not report a build".
+    //
+    // `roll_edge` treats that as fatal, so `upgrade` aborted at the last
+    // seat on every admin-token fleet, after rolling all of them. Same
+    // shape as the proxy_up regression beside it and found the same way:
+    // the drill for one uncovered the other.
+    //
+    // The token is right there in the inventory that named the proxy, and
+    // `verify` already dials this way — [AUTH, cmd] over one connection is
+    // exactly what call_seq_on's sequence is for.
+    let cmds: Vec<Vec<&str>> = match inv.admin_token.as_deref() {
+        Some(tok) => vec![vec!["AUTH", tok], vec!["PROXYSTATS"]],
+        None => vec![vec!["PROXYSTATS"]],
+    };
+    let seq: Vec<&[&str]> = cmds.iter().map(|c| c.as_slice()).collect();
     let Ok(Value::Bulk(Some(raw))) = call_seq_on(
         &proxy_dial(inv, i),
         &tls,
-        &[&["PROXYSTATS"]],
+        &seq,
         Duration::from_millis(1500),
         inv.client_tls,
     ) else {
