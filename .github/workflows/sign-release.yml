@@ -1,0 +1,128 @@
+name: sign-release
+
+# Sign a PUBLISHED release's artifacts with minisign and attach the
+# signatures to it.
+#
+# WHY THIS IS A SEPARATE, SIGN-ONLY WORKFLOW. Signing used to be a step
+# inside .github/workflows/release.yml, which also built the bundle. 67835ce
+# deleted that workflow wholesale when packaging/aws/release-box took over
+# building — correctly, because an Actions outage had blocked a release four
+# days before launch — and the signing step went out with the build step
+# unnoticed. Result: rc.28-rc.31 are signed, rc.32 onward are not, while
+# docs/release-signing.md still says every release is signed.
+#
+# Building on Actions put an outage between a tag and a DEPLOYABLE ARTIFACT.
+# Signing does not: the release box publishes the bundle either way, and if
+# this workflow is down the signature arrives late and can be dispatched
+# later against the same immutable bytes. That is the whole reason it is
+# safe to bring this one part back to Actions — the secret key is reachable
+# from nowhere else, and it should stay that way.
+#
+# WHAT IT SIGNS. The assets as PUBLISHED, downloaded back from the release,
+# so the signature covers the exact bytes a user will fetch. Note the
+# manifest differs per repo — release-box rewrites `bundle` to point at this
+# repo — so this signature is over the public manifest specifically, which
+# is the one the public downloads.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to sign (e.g. v0.1.0-rc.48)
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  sign:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve the tag
+        id: t
+        run: |
+          set -euo pipefail
+          # release:published carries the tag on the event; workflow_dispatch
+          # carries it as an input. Resolve once so the trusted comment — which
+          # IS covered by the signature — names the right release either way.
+          TAG="${{ github.event.release.tag_name }}"
+          [ -n "$TAG" ] || TAG="${{ inputs.tag }}"
+          [ -n "$TAG" ] || { echo "no tag on the event and none given"; exit 1; }
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "signing $TAG"
+
+      - name: Sign the bundle and the manifest (minisign)
+        env:
+          MINISIGN_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.t.outputs.tag }}
+        # WHY, in one line: the sha256 in manifest.json proves the tarball
+        # matches THAT MANIFEST, and anyone who can swap the tarball can swap
+        # the manifest beside it. A signature proves the bytes came from this
+        # pipeline no matter which mirror, CDN or USB stick delivered them.
+        #
+        # FAIL CLOSED. If the key or the published public key is missing this
+        # stops rather than reporting success on unsigned artifacts — an
+        # unsigned release that looks like every other release is worse than a
+        # failed job, because nobody finds out until they need it.
+        run: |
+          set -euo pipefail
+          trap 'rm -f sk.key' EXIT
+          if [ ! -f minisign.pub ]; then
+            echo "no minisign.pub in the repo root — the signing key has not been set up."
+            echo "See docs/release-signing.md for the two commands that create it."
+            exit 1
+          fi
+          if [ -z "${MINISIGN_KEY:-}" ]; then
+            echo "secret MINISIGN_SECRET_KEY is not set on this repository."
+            echo "See docs/release-signing.md."
+            exit 1
+          fi
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends minisign
+
+          mkdir -p sign && cd sign
+          # Download what was PUBLISHED rather than rebuilding it. A signature
+          # over a local rebuild would attest to bytes no user ever receives.
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --clobber \
+            --pattern 'flint-*-linux-x86_64.tar.gz' --pattern 'manifest.json'
+          BUNDLE=$(ls flint-*.tar.gz)
+          [ -f manifest.json ] || { echo "release $TAG has no manifest.json"; exit 1; }
+          cd ..
+
+          printf '%s\n' "$MINISIGN_KEY" > sk.key
+          chmod 600 sk.key
+          for f in "sign/$BUNDLE" sign/manifest.json; do
+            # -t is the TRUSTED comment: it is covered by the signature, so it
+            # cannot be edited after the fact the way the untrusted one can.
+            minisign -S -s sk.key -m "$f" -t "flint $TAG — $(basename "$f")"
+          done
+
+          # Verify against the key we PUBLISH, not merely the one we hold. If
+          # the CI secret ever drifts from the committed public key, every
+          # signature would be unverifiable by users and nothing else would
+          # notice. This is the assert that makes the signing meaningful.
+          PUB=$(tail -1 minisign.pub)
+          for f in "sign/$BUNDLE" sign/manifest.json; do
+            minisign -V -P "$PUB" -m "$f"
+          done
+          echo "signed and verified against the published key: $BUNDLE, manifest.json"
+
+      - name: Attach the signatures
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.t.outputs.tag }}
+        # minisign.pub goes up too because release-signing.md tells readers it
+        # is attached to each release. --clobber so a re-run is idempotent
+        # rather than a half-signed release nobody can verify.
+        run: |
+          set -euo pipefail
+          cp minisign.pub sign/
+          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber \
+            sign/*.minisig sign/minisign.pub
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --json assets -q '.assets[].name'
