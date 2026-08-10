@@ -14,7 +14,14 @@ MDIR=$(mktemp -d /tmp/flint-lease-m.XXXXXX); RDIR=$(mktemp -d /tmp/flint-lease-r
 B=./target/release/flint-server
 MPORT=6308; RPORT=6309
 cleanup() {
-  pkill -9 -f "flint-server --port 644" 2>/dev/null
+  # This used to be `pkill -9 -f "flint-server --port 644"` — a copy-paste
+  # from a drill on the 644x ports. This drill runs on 6308/6309, so cleanup
+  # matched nothing and every failing run LEAKED both seats. That is how one
+  # failure here cascaded: fleet_guard in the next five drills correctly
+  # refused to start, seeing Flint processes it did not own, and five drills
+  # that were fine reported failure. fleet_kill is scoped to this drill's
+  # own ports (fleet_init above), which is the point of using it.
+  fleet_kill server
   fleet_kill controller
   rm -rf "$MDIR" "$RDIR"
 }
@@ -50,8 +57,37 @@ done
 echo "self-fenced after ~$(( i * 200 ))ms of no renewal (TTL 1500ms)"
 grep -q "self-fenced" "$MDIR.log" 2>/dev/null && echo "  (server logged the self-fence)"
 
-echo "== data still readable on the self-fenced master (read-only, not down)"
-[ "$(valkey-cli -p $MPORT GET k)" = "v" ] || { echo "FAIL: reads broken after self-fence"; exit 1; }
+echo "== the self-fenced master FENCES tenant reads, and is alive rather than down"
+# This assertion used to be `GET k` = "v", with the heading "data still
+# readable on the self-fenced master". That was true when the self-fence
+# landed (97b1426, 2026-07-12) and stopped being true five days later when
+# the R1 stale-read fence landed (9b4f685, 2026-07-17). It has been failing
+# deterministically ever since, and nothing caught it because this drill is
+# not in gates.sh CORE.
+#
+# The SERVER is right and the old assertion was wrong. A master that
+# self-fenced has lost contact with every controller, so it cannot know
+# whether a replica was promoted behind the partition — serving a read would
+# risk serving data that has already been superseded. R1
+# (crates/flint-server/src/main.rs:1402) covers this node because a
+# self-fenced ex-master has REPLICA_CONTACT_MS == 0: it was never a replica,
+# and will not have contact until it is demoted and resynced. docs/failover.md:315
+# is the published contract — "reads may -TRYAGAIN then fall back".
+R=$(valkey-cli -p $MPORT GET k 2>&1 | tr -d '\r')
+case "$R" in
+  TRYAGAIN*) echo "  tenant reads fenced: ${R%%;*}" ;;
+  v) echo "FAIL: the self-fenced master SERVED a read."
+     echo "      It cannot know whether it was superseded, so this is a stale read."
+     echo "      Expected -TRYAGAIN (docs/failover.md:315, R1 fence)."; exit 1 ;;
+  *) echo "FAIL: expected -TRYAGAIN from a self-fenced master, got: ${R:-(no reply)}"; exit 1 ;;
+esac
+# "Fenced" must mean fenced, not dead — the distinction the old heading was
+# reaching for, asserted against commands that are exempt from R1 by design.
+[ "$(valkey-cli -p $MPORT PING 2>&1 | tr -d '\r')" = "PONG" ] \
+  || { echo "FAIL: the self-fenced master stopped answering PING — that is DOWN, not fenced"; exit 1; }
+valkey-cli -p $MPORT FLINTINFO 2>&1 | tr -d '\r' | grep -q '^role:' \
+  || { echo "FAIL: FLINTINFO is exempt from the read fence and must still answer"; exit 1; }
+echo "  still answering PING and FLINTINFO — fenced, not down"
 
 echo "== self-fence is NOT auto-undone by a later renewal (no resurrection)"
 valkey-cli -p $MPORT FLINTLEASE 5000 >/dev/null
