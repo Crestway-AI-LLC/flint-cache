@@ -44,14 +44,28 @@ jobs:
 
       - name: Resolve the tag
         id: t
+        env:
+          # Through the environment, never interpolated into the shell line:
+          # ${{ inputs.tag }} is attacker-influenced text, and pasting it into
+          # a script is the standard Actions injection hole.
+          EVENT_TAG: ${{ github.event.release.tag_name }}
+          INPUT_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
           # release:published carries the tag on the event; workflow_dispatch
           # carries it as an input. Resolve once so the trusted comment — which
           # IS covered by the signature — names the right release either way.
-          TAG="${{ github.event.release.tag_name }}"
-          [ -n "$TAG" ] || TAG="${{ inputs.tag }}"
+          TAG="${EVENT_TAG:-}"
+          [ -n "$TAG" ] || TAG="${INPUT_TAG:-}"
           [ -n "$TAG" ] || { echo "no tag on the event and none given"; exit 1; }
+          # Must be ONE tag-shaped token. A dispatch that passed every tag as a
+          # single newline-joined string got this far and died inside
+          # $GITHUB_OUTPUT with "Invalid format 'v0.1.0-rc.45'" — which reads
+          # like the workflow is broken rather than the input. Fail here, where
+          # the message can name the real problem.
+          case "$TAG" in
+            *[!A-Za-z0-9._-]*) printf 'refusing tag: expected one [A-Za-z0-9._-] token, got: %s\n' "$TAG"; exit 1 ;;
+          esac
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "signing $TAG"
 
