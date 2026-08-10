@@ -20,6 +20,11 @@ seconds at the origin. That is the trade this project exists to make, and
 [the measured numbers](docs/architecture.md) are there to show the hit is
 fast enough that you stop thinking about it.
 
+**Try it now** — `tools/quickstart.sh` builds and brings up a real cluster
+(control plane, replicated pair, proxy, failover controller) on your laptop
+and proves it serves a write. [Details below](#quick-start). Prefer binaries
+to a build? [Releases](https://github.com/Crestway-AI-LLC/flint-cache/releases/latest).
+
 ## Why a disk-first cache — the value in six claims
 
 1. **No eviction, no miss storms.** Nothing is ever dropped because RAM ran
@@ -236,7 +241,15 @@ tools/quickstart.sh
 
 It checks prerequisites and names anything missing, builds if needed, writes a
 throwaway inventory, bootstraps, adds a tenant, and proves the cluster serves a
-write through the proxy. Then `tools/quickstart.sh down` (keep the data) or
+write through the proxy.
+
+**Expect `build unstamped` in that first status output**, on every seat. It is
+not a warning: a build straight from source carries no release tag, and saying
+so is the point — see [below](#disposable-and-unstamped-builds) for why the
+same fact makes `flintctl` refuse to mutate a fleet it does not consider
+throwaway.
+
+Then `tools/quickstart.sh down` (keep the data) or
 `purge` (delete it). Deliberately a pair rather than a single node, so
 `tools/quickstart.sh failover` can SIGKILL the master and let you watch the
 controller promote the replica — with a replicated witness key proving the
@@ -274,6 +287,8 @@ EOF
 ./target/release/flintctl -f cluster.flint tenant add acme tok-acme acme 1
 valkey-cli -p 7379 -a tok-acme SET hello world
 ```
+
+### Disposable and unstamped builds
 
 **`disposable on` is doing real work there, and you should take it off for
 anything you intend to keep.** A build straight from source reports no

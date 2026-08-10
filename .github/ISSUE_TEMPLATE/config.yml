@@ -1,0 +1,11 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/Crestway-AI-LLC/flint-cache/security/advisories/new
+    about: Report privately. Never in a public issue — see SECURITY.md.
+  - name: Is this command supported?
+    url: https://github.com/Crestway-AI-LLC/flint-cache/blob/main/docs/command-support.md
+    about: Every command, what it guarantees, and what is deliberately excluded.
+  - name: Running it yourself
+    url: https://github.com/Crestway-AI-LLC/flint-cache/blob/main/docs/self-hosting.md
+    about: Deploy, upgrade, back up, and what a real inventory looks like.
