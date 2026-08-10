@@ -149,7 +149,18 @@ step() {  # step <name> <log-suffix> <command...>
 
   # Leak check, on the PASS path as much as the FAIL path — the leak that
   # cost 24 false failures came from a drill that passed.
-  local leaked; leaked=$(_leaked_seats)
+  #
+  # DRILLS ONLY ($LEAKCHECK, set around the CORE/CHAOS loops). Not every step
+  # is supposed to leave a clean box: the conformance stage starts its
+  # servers in one step and RUNS AGAINST THEM in the four that follow, so a
+  # blanket check reads that as a leak and kills the oracle the rest of the
+  # stage needs. It did exactly that on 2026-08-10 — "conformance oracle
+  # left 2 Flint processes running", then all four conformance steps failed
+  # at 0s, a regression introduced by the fix for the previous cascade.
+  #
+  # "Every step must leave nothing behind" was an assumption, not a contract,
+  # and it was wrong for the stage that happens to run first.
+  local leaked; leaked=$([ -n "${LEAKCHECK:-}" ] && _leaked_seats)
   if [ -n "$leaked" ]; then
     echo "      LEAKED: $name left $(echo "$leaked" | wc -l | tr -d ' ') Flint process(es) running"
     ps -o pid=,args= -p $(echo "$leaked" | tr '\n' ' ') 2>/dev/null \
@@ -372,12 +383,16 @@ fi
 
 if want drills; then
   echo "== core drills"
+  LEAKCHECK=1
   for d in $CORE; do step "$d" "drill-$d" bash "tools/${d}_drill.sh"; done
+  LEAKCHECK=
 fi
 
 if want chaos; then
   echo "== chaos drills (randomized; the honesty step)"
+  LEAKCHECK=1
   for d in $CHAOS; do step "$d" "chaos-$d" bash "tools/${d}_drill.sh"; done
+  LEAKCHECK=
 fi
 
 echo

@@ -126,7 +126,23 @@ STATS=$(valkey-cli -p 6316 PROXYSTATS)
 READS=$(echo "$STATS" | tr '\r' '\n' | grep "^commands_read_total:" | cut -d: -f2)
 WRITES=$(echo "$STATS" | tr '\r' '\n' | grep "^commands_write_total:" | cut -d: -f2)
 echo "  commands_read_total=$READS commands_write_total=$WRITES"
-[ "$READS" -ge 900 ] || { echo "FAIL: read counter did not track GETs"; exit 1; }
-[ "$WRITES" -ge 500 ] || { echo "FAIL: write counter did not track the storm"; exit 1; }
+# Compare against what the client ACTUALLY SENT, which the storm recorded on
+# its way out — not against a constant.
+#
+# This was `-ge 500`, and the storm is TIME-bounded: it runs until the read
+# sampler finishes, so the number of writes it lands is a function of how
+# fast the machine is. 500 therefore encoded "at least as quick as the
+# laptop this was written on". It passed here and failed on the CI runner
+# with "write counter did not track the storm" — which reads as a broken
+# counter and was really a slower box.
+#
+# The invariant worth asserting is that the proxy counted the traffic it was
+# given, whatever that was. A drill that measures the machine instead of the
+# product will go green on the fastest CI you buy and tell you nothing.
+EXP=$(python3 -c "import json;d=json.load(open('/tmp/flint-rwiso/counts'));print(d['reads'],d['writes'])")
+EXP_R=${EXP% *}; EXP_W=${EXP#* }
+[ "$READS"  -ge "$EXP_R" ] || { echo "FAIL: read counter says $READS, the client sent $EXP_R"; exit 1; }
+[ "$WRITES" -ge "$EXP_W" ] || { echo "FAIL: write counter says $WRITES, the storm sent $EXP_W"; exit 1; }
+echo "  counters track what was sent: reads >= $EXP_R, writes >= $EXP_W"
 
 echo "PASS: cross-client read/write isolation pinned (storm-proof reads) + shared-classifier traffic split live"
