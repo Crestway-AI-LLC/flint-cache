@@ -73,12 +73,29 @@ done
 echo "== multi-tenant load: 6 tenants write continuously; KILL pair-0 master"
 rm -f /tmp/m3-stop
 for i in 01 09 17 25 33 41; do
-  ( j=1000
+  # RECORD WHAT WAS ACKED, not what was attempted. `j` used to be incremented
+  # unconditionally with the reply discarded, so it counted ATTEMPTS — and
+  # the check at the end took the MIDPOINT of 1000..j and demanded that key
+  # be readable. During the failover this drill deliberately causes, writes
+  # are refused; those attempts still advanced the counter, so the midpoint
+  # could land squarely in the hole and the drill reported
+  #
+  #     FAIL: writer tenant17 live:1869 = ''
+  #
+  # which reads as a cache losing an acked write — the most serious claim
+  # this product can make about itself — for a write that was never acked.
+  # Green on a fast laptop, red on an 8-vCPU box, because what changes is the
+  # width of the outage relative to the write rate.
+  #
+  # Writes are still allowed to fail here: racing a kill is the point. Only
+  # the BOOKKEEPING has to be honest about which ones landed.
+  ( j=1000; last_acked=""
     while [ ! -f /tmp/m3-stop ]; do
-      valkey-cli -p 6669 -a "tok$i" --no-auth-warning SET "live:$j" "L$i-$j" >/dev/null 2>&1
+      [ "$(valkey-cli -p 6669 -a "tok$i" --no-auth-warning SET "live:$j" "L$i-$j" 2>/dev/null)" = "OK" ] \
+        && last_acked=$j
       j=$((j+1))
     done
-    echo $j > "/tmp/flint-m3-writer$i" ) &
+    echo "${last_acked:-none}" > "/tmp/flint-m3-writer$i" ) &
 done
 sleep 2
 pkill -9 -f "flint-server --port 6710"
@@ -124,10 +141,14 @@ echo "  all 50 tenants: seeded keys correct, DBSIZE sane, writes OK"
 
 echo "== the mid-failover writers' data landed under the right tenants"
 for i in 01 09 17; do
-  LAST=$(cat "/tmp/flint-m3-writer$i" 2>/dev/null || echo 1000)
-  MID=$(( (1000 + LAST) / 2 ))
-  G=$(valkey-cli -p 6669 -a "tok$i" --no-auth-warning GET "live:$MID")
-  [ "$G" = "L$i-$MID" ] || { echo "FAIL: writer tenant$i live:$MID = '$G'"; exit 1; }
+  # The LAST key this writer saw acked — a key we watched the cluster accept,
+  # rather than the midpoint of a range that includes everything it refused
+  # mid-failover. "A write we were told landed is still there" is the claim
+  # worth making, and it is the claim an operator cares about.
+  LAST=$(cat "/tmp/flint-m3-writer$i" 2>/dev/null || echo none)
+  [ "$LAST" != "none" ] || { echo "FAIL: writer tenant$i never had a single write acked"; exit 1; }
+  G=$(valkey-cli -p 6669 -a "tok$i" --no-auth-warning GET "live:$LAST")
+  [ "$G" = "L$i-$LAST" ] || { echo "FAIL: writer tenant$i live:$LAST = '$G' — an ACKED write is missing"; exit 1; }
 done
 echo "  live-writer keys verified on their tenants"
 

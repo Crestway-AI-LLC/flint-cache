@@ -92,7 +92,20 @@ echo "== drain counters: digest-keyed, plaintext lookups still answered"
 for i in 1 2 3; do valkey-cli -p 7991 -a legacy-plaintext-tok --no-auth-warning PING >/dev/null; done
 C=$(valkey-cli -p 7991 PROXYAUTHCOUNT legacy-plaintext-tok)
 [ "$C" -ge 3 ] || { echo "FAIL: plaintext drain lookup ($C)"; exit 1; }
-LDIG=$(printf 'legacy-plaintext-tok' | shasum -a 256 | cut -d' ' -f1)
+# PORTABLE sha256. `shasum` is a Perl script and is not guaranteed present —
+# on the AL2023 gate box it is not, so LDIG came out EMPTY, PROXYAUTHCOUNT ""
+# answered 0, and the drill reported "digest drain lookup (0)" as though the
+# digest-keyed counter were broken. The plaintext assertion three lines above
+# passed, which is the tell: the server was fine and the drill could not
+# compute the key it was asking about.
+sha256hex() {
+  if command -v sha256sum >/dev/null 2>&1; then printf '%s' "$1" | sha256sum | cut -d' ' -f1
+  elif command -v shasum   >/dev/null 2>&1; then printf '%s' "$1" | shasum -a 256 | cut -d' ' -f1
+  else python3 -c 'import hashlib,sys;print(hashlib.sha256(sys.argv[1].encode()).hexdigest())' "$1"
+  fi
+}
+LDIG=$(sha256hex 'legacy-plaintext-tok')
+[ ${#LDIG} -eq 64 ] || { echo "FAIL: could not compute a sha256 digest here (got '${LDIG}')"; exit 1; }
 C2=$(valkey-cli -p 7991 PROXYAUTHCOUNT "$LDIG")
 [ "$C2" -ge 3 ] || { echo "FAIL: digest drain lookup ($C2)"; exit 1; }
 echo "  PROXYAUTHCOUNT answers for plaintext ($C) and digest ($C2) alike"
