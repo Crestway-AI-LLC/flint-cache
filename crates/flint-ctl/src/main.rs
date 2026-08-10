@@ -340,16 +340,36 @@ fn call_slow(
 /// `UnknownType(21)` five times over. So the half of verify that actually
 /// catches a stale routing table was unusable exactly where it matters, and
 /// it failed in a way that named neither TLS nor the port.
+/// The CA bundle that anything dialling THIS fleet's edge must validate
+/// against: `edge-trust` when declared, otherwise the internal CA, which
+/// signs the edge cert `bootstrap` mints.
+///
+/// ONE function on purpose. This derivation had three copies — flintctl's
+/// own dials, the `--edge-ca` handed to the agent, and the bring-up failure
+/// message — and copies of it are precisely how this fleet accumulated five
+/// separate bugs in a single day, each one the rediscovery of the same fact:
+///
+///     the edge cert is not the internal cert, and every component that
+///     dials the edge must be told SEPARATELY which CA to trust
+///
+/// Every one of those was fixed where it was found and none of the fixes
+/// generalised, because there was no single place for the fix to live. A
+/// fourth consumer written against a fourth copy is the next instance;
+/// against this function it is correct by construction. The diagnostic
+/// mattered too: while the copies agreed the failure text was accurate by
+/// luck, and a mutation that changed only the dial made it report a trust
+/// anchor that was never used.
+fn edge_trust_path(inv: &Inventory) -> String {
+    inv.edge_trust
+        .clone()
+        .unwrap_or_else(|| format!("{}/certs/ca.crt", inv.statedir))
+}
+
 fn edge_tls_client(inv: &Inventory) -> Option<Arc<flint_tls::ClientConfig>> {
     if !inv.client_tls {
         return None;
     }
-    // Default trust is the internal CA (it signs the default edge cert); a
-    // fleet serving a PUBLIC edge cert declares `edge-trust <bundle>`.
-    let trust = inv
-        .edge_trust
-        .clone()
-        .unwrap_or_else(|| format!("{}/certs/ca.crt", inv.statedir));
+    let trust = edge_trust_path(inv);
     Some(
         flint_tls::edge_client_config(&trust)
             .unwrap_or_else(|e| die(&format!("edge trust {trust}: {e}"))),
@@ -375,7 +395,7 @@ fn probe_target(inv: &Inventory, i: usize) -> String {
 /// is invisible. Give the proxy its own machine and the same dial reaches
 /// nothing, so bootstrap declares a perfectly healthy proxy dead —
 ///
-///     proxy 0.0.0.0:7379 did not come up (port busy?)
+///     proxy 0.0.0.0:7379 never answered PROXYSTATS within 10s
 ///
 /// — which is exactly how the first 7-host run failed. Every smaller topology
 /// hid it, including the 2-host chaos run, because there the proxy and the
@@ -385,6 +405,45 @@ fn probe_target(inv: &Inventory, i: usize) -> String {
 /// use, and what the edge cert is issued for), else the declared `proxy-host`
 /// with the bind port, else the bind address — which is correct for the
 /// single-host fleet every drill exercises.
+/// Why a proxy that is holding its port might still read as down.
+///
+/// The message used to be `did not come up (port busy?)`, which names the
+/// one cause that is almost never it. On a client-TLS fleet the usual cause
+/// is TRUST: flintctl validates the edge chain against the fleet's internal
+/// CA unless the inventory says otherwise, so an edge cert signed by anyone
+/// else — which is every deployment holding a public certificate — fails the
+/// handshake and reports a healthy proxy as absent, with nothing in the text
+/// suggesting a certificate was involved. An operator reads "port busy" and
+/// goes to `lsof` while the proxy serves customers beside them.
+///
+/// So the message NAMES THE TRUST ANCHOR IT ACTUALLY USED. That single line
+/// is the whole diagnostic: seeing `.../certs/ca.crt` when the edge holds a
+/// public cert ends the investigation immediately.
+///
+/// Exercised by `tools/edge_ca_trust_drill.sh`.
+fn proxy_down_help(inv: &Inventory, proxy: &str, dial: &str) -> String {
+    let mut m = format!("proxy {proxy} (dialled at {dial}) never answered PROXYSTATS within 10s");
+    if inv.client_tls {
+        // The SAME derivation the dial used, not a second copy of it.
+        let trust = edge_trust_path(inv);
+        m.push_str(&format!(
+            "\n  the edge speaks TLS, and flintctl validated its certificate against:\n    {trust}"
+        ));
+        if inv.edge_trust.is_none() {
+            m.push_str(
+                "\n  which is this fleet's INTERNAL CA — the inventory declares no `edge-trust`.\
+                 \n  If this edge serves a public certificate, name the bundle that signs it:\
+                 \n    edge-trust /etc/pki/tls/certs/ca-bundle.crt",
+            );
+        }
+    }
+    m.push_str(
+        "\n  other causes: the port is held by something else, or the proxy exited at\
+         \n  startup — check logs/proxy-*.log under the statedir.",
+    );
+    m
+}
+
 fn proxy_dial(inv: &Inventory, i: usize) -> String {
     if let Some(adv) = inv.proxy_advertise.get(i) {
         return adv.clone();
@@ -2347,22 +2406,19 @@ fn agent_args(inv: &Inventory) -> Option<Vec<String>> {
     if let Some(cap) = inv.capacity_bytes {
         args.extend(["--node-capacity-bytes".into(), cap.to_string()]);
     }
-    // Edge trust for the agent's PROXY* dials. Default = the internal
-    // CA (it signs the default edge cert); a fleet serving a PUBLIC
-    // edge cert (LE on a DNS name) overrides with `edge-trust <path>`
-    // (e.g. the system bundle).
     if let Some(billing) = &inv.billing {
         args.extend(["--billing".to_string(), billing.clone()]);
         if let Some(days) = inv.billing_retain_days {
             args.extend(["--billing-retain-days".into(), days.to_string()]);
         }
     }
+    // Edge trust for the agent's own PROXY* dials — the agent is a SEPARATE
+    // consumer of the edge and has to be told, which is the whole hazard
+    // `edge_trust_path` exists to contain. (This comment had drifted onto
+    // the billing block above it, so the one line documenting the hazard was
+    // attached to unrelated code.)
     if inv.client_tls {
-        let trust = inv
-            .edge_trust
-            .clone()
-            .unwrap_or_else(|| format!("{}/certs/ca.crt", inv.statedir));
-        args.extend(["--edge-ca".into(), trust]);
+        args.extend(["--edge-ca".into(), edge_trust_path(inv)]);
     }
     args.extend(internal_args(inv));
     Some(args)
@@ -2658,7 +2714,8 @@ fn launch(inv: &Inventory, register: bool) {
             }
             assert!(
                 Instant::now() < deadline,
-                "proxy {proxy} (dialled at {dial}) did not come up (port busy?)"
+                "{}",
+                proxy_down_help(inv, proxy, &dial)
             );
             std::thread::sleep(Duration::from_millis(150));
         }
