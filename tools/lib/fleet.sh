@@ -385,3 +385,51 @@ fleet_kill() {
   done
   return 0
 }
+
+# --- reply assertions -------------------------------------------------------
+#
+# valkey-cli prints RESP ERRORS TO STDOUT AND EXITS 0. Measured 2026-08-10
+# against a local valkey-server:
+#
+#     $ out=$(valkey-cli -p P SET 2>/dev/null); echo "rc=$? '$out'"
+#     rc=0 'ERR wrong number of arguments for 'set' command'
+#     $ valkey-cli -p P GET <a-list-key> 2>&1 >/dev/null      # stderr
+#     (empty)
+#
+# So `cmd >/dev/null 2>&1 || die` detects nothing, and neither does discarding
+# stdout: a refused write — `-QUOTA` from the disk guard, `-NOAUTH`,
+# `-READONLY` on a replica, a tenant over its cap — is indistinguishable from
+# a successful one. The reply is the ONLY signal, and an error carries no
+# marker in this output: no leading '-', no "(error)", just the code.
+#
+# This is not hypothetical. A drill's discarded seed write turned a `-QUOTA`
+# into a false data-loss alarm 60 lines later, and the same defect was still
+# in tools/quickstart.sh — the first command a new user runs — on 2026-08-10.
+#
+# Use these for any write whose success is a PRECONDITION of what follows.
+# Do NOT use them where a failure is expected or tolerated: a writer racing a
+# deliberate kill, or a probe that is measuring whether a write is refused.
+#
+#   cli_ok  valkey-cli -p 6379 SET k v          # expects +OK
+#   cli_int valkey-cli -p 6379 HSET h f v       # expects an integer reply
+#
+cli_ok() {
+  local r
+  r=$("$@" 2>&1 | tr -d '\r')
+  [ "$r" = "OK" ] && return 0
+  echo "FAIL: expected OK from: $*"
+  echo "      server said: ${r:-(no reply — is it still listening?)}"
+  exit 1
+}
+
+cli_int() {
+  local r
+  r=$("$@" 2>&1 | tr -d '\r')
+  case "$r" in
+    ''|*[!0-9]*)
+      echo "FAIL: expected an integer reply from: $*"
+      echo "      server said: ${r:-(no reply — is it still listening?)}"
+      exit 1 ;;
+  esac
+  return 0
+}

@@ -38,9 +38,9 @@ echo "$R" | grep -q "WRONGPASS" || { echo "FAIL: expected WRONGPASS, got: $R"; e
 echo "  NOAUTH + WRONGPASS enforced"
 
 echo "== two tenants, same key names, different values"
-valkey-cli -p 6667 -a tokA --no-auth-warning SET shared "from-alpha" >/dev/null
-valkey-cli -p 6667 -a tokA --no-auth-warning SET alpha-only 1 >/dev/null
-valkey-cli -p 6667 -a tokB --no-auth-warning SET shared "from-beta" >/dev/null
+cli_ok valkey-cli -p 6667 -a tokA --no-auth-warning SET shared "from-alpha"
+cli_ok valkey-cli -p 6667 -a tokA --no-auth-warning SET alpha-only 1
+cli_ok valkey-cli -p 6667 -a tokB --no-auth-warning SET shared "from-beta"
 GA=$(valkey-cli -p 6667 -a tokA --no-auth-warning GET shared)
 GB=$(valkey-cli -p 6667 -a tokB --no-auth-warning GET shared)
 [ "$GA" = "from-alpha" ] || { echo "FAIL: tenant A sees '$GA'"; exit 1; }

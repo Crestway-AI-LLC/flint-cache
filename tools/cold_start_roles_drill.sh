@@ -65,7 +65,7 @@ echo "  $A master, live_replicas 1"
 
 echo "== write something, so a lost replica would be losing real data"
 FIRST=$(valkey-cli -p 7403 SET cold:1 v1 2>&1)
-for i in $(seq 2 200); do valkey-cli -p 7403 SET "cold:$i" "v$i" >/dev/null; done
+for i in $(seq 2 200); do cli_ok valkey-cli -p 7403 SET "cold:$i" "v$i"; done
 # ASSERT THE SEED LANDED. Without this the drill's final "data lost" could
 # equally mean "data never written", and those need different fixes — the
 # KB already carries this lesson and this drill was written ignoring it.

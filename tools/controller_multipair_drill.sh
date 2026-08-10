@@ -50,8 +50,8 @@ master_of() {  # args: two ports
 for pair in "A" "B" "C"; do
   eval "ports=(\${$pair[@]})"
   m=$(master_of ${ports[@]})
-  valkey-cli -p $m SET "owner" "$pair" >/dev/null
-  valkey-cli -p $m SET "seed-$pair" "v-$pair" >/dev/null
+  cli_ok valkey-cli -p $m SET "owner" "$pair"
+  cli_ok valkey-cli -p $m SET "seed-$pair" "v-$pair"
 done
 sleep 2.0  # let replicas converge and the controller observe each pair
 

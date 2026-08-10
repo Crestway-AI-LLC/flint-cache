@@ -145,7 +145,7 @@ echo "== 1. the SLOT is frozen mid-cutover at EXEC -> abort, nothing applied"
 # (FLINTSLOTHEAT leads with an `uptime_ms <n>` row, hence the numeric filter.)
 heat() { valkey-cli -p 6960 FLINTSLOTHEAT | tr -d '\r' | awk '$1 ~ /^[0-9]+$/ {print $1, $2}'; }
 heat >"$D/heat.before"
-valkey-cli -p 6960 SET "{frz}probe" seed >/dev/null
+cli_ok valkey-cli -p 6960 SET "{frz}probe" seed
 heat >"$D/heat.after"
 SLOT=$(awk 'NR==FNR {b[$1]=$2; next} ($2+0) > (b[$1]+0) {print $1; exit}' \
        "$D/heat.before" "$D/heat.after")

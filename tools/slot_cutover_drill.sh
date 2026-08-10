@@ -37,7 +37,7 @@ echo "== slot {mover}=$SLOT; seed 30000 keys on the source"
 awk 'BEGIN{for(i=0;i<30000;i++){k=sprintf("{mover}:key%05d",i);v=sprintf("val-%05d",i);printf "*3\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n",length(k),k,length(v),v}}' \
   | valkey-cli -p $SPORT --pipe | tail -1
 # A key in a DIFFERENT slot that must be untouched.
-valkey-cli -p $SPORT SET "{other}:k" "keepme" >/dev/null
+cli_ok valkey-cli -p $SPORT SET "{other}:k" "keepme"
 OTHER_SLOT=$(python3 -c '
 def c(d):
  p=0x1021;x=0

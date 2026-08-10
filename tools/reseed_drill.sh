@@ -66,7 +66,7 @@ wait_port() {
 echo "== master + replica, in sync"
 start_master; wait_port $MPORT || { echo "FAIL: master never came up"; exit 1; }
 start_replica; wait_port $RPORT || { echo "FAIL: replica never came up"; exit 1; }
-valkey-cli -p $MPORT SET before v-before >/dev/null
+cli_ok valkey-cli -p $MPORT SET before v-before
 for _ in $(seq 1 50); do
   [ "$(valkey-cli -p $RPORT GET before 2>/dev/null)" = "v-before" ] && break
   sleep 0.1

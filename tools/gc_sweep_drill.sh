@@ -43,10 +43,10 @@ R=$(valkey-cli -p 6975 FLINTCONFIG gc-sweep-ms 1000 | tr -d '\r')
 [ "$R" = "OK" ] || { echo "FAIL: FLINTCONFIG gc-sweep-ms: $R"; exit 1; }
 
 echo "== corpus: expiring hash+zset, live hash, and the recreate case"
-valkey-cli -p 6975 HSET doomed:h f1 v1 f2 v2 f3 v3 >/dev/null
-valkey-cli -p 6975 ZADD doomed:z 1 m1 2 m2 >/dev/null
-valkey-cli -p 6975 HSET live:h keep me >/dev/null
-valkey-cli -p 6975 HSET reborn:h old stale >/dev/null
+cli_int valkey-cli -p 6975 HSET doomed:h f1 v1 f2 v2 f3 v3
+cli_int valkey-cli -p 6975 ZADD doomed:z 1 m1 2 m2
+cli_int valkey-cli -p 6975 HSET live:h keep me
+cli_int valkey-cli -p 6975 HSET reborn:h old stale
 
 echo "== 1. positive control: nothing expired yet, a cadence passes, counters stay 0"
 sleep 2.5
@@ -63,7 +63,7 @@ valkey-cli -p 6975 PEXPIRE reborn:h 100 >/dev/null
 sleep 0.3
 # The recreate-before-sweep case: reborn:h expired and comes back BEFORE
 # any sweep ran — the sweep must reclaim only the old incarnation's rows.
-valkey-cli -p 6975 HSET reborn:h new fresh >/dev/null
+cli_int valkey-cli -p 6975 HSET reborn:h new fresh
 E1=""; O1=""
 for _ in $(seq 1 20); do
   E1=$(info gc_swept_expired); O1=$(info gc_swept_orphans)

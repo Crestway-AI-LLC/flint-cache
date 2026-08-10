@@ -47,8 +47,8 @@ done
 echo "  pair bootstrapped (confirm-gated)"
 
 echo "== write data, then wait for a snapshot that INCLUDES it"
-for i in $(seq 1 50); do valkey-cli -p 6870 SET "sk:$i" "sv:$i" >/dev/null; done
-valkey-cli -p 6870 SET golden pre-disaster >/dev/null
+for i in $(seq 1 50); do cli_ok valkey-cli -p 6870 SET "sk:$i" "sv:$i"; done
+cli_ok valkey-cli -p 6870 SET golden pre-disaster
 SNAP=""
 for i in $(seq 1 40); do
   SNAP=$(cat "$D/snaps/g0/LATEST" 2>/dev/null || true)

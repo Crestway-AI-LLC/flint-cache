@@ -149,8 +149,8 @@ done
 info() { valkey-cli -p "$PORT" FLINTINFO 2>/dev/null | tr -d '\r' | grep "^$1:" | cut -d: -f2; }
 
 echo "== healthy: writes land, and the gauge reports real numbers"
-valkey-cli -p $PORT SET keep-a aaa >/dev/null
-valkey-cli -p $PORT SET keep-b bbb >/dev/null
+cli_ok valkey-cli -p $PORT SET keep-a aaa
+cli_ok valkey-cli -p $PORT SET keep-b bbb
 [ "$(info disk_verdict)" = "ok" ] || fail "verdict is $(info disk_verdict), expected ok"
 [ "$(info disk_total_bytes)" -gt 0 ] || fail "disk_total_bytes not reported"
 [ "$(info disk_unknown_samples)" = "0" ] || fail "the sampler could not read the filesystem"

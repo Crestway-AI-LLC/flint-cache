@@ -30,7 +30,7 @@ sleep 0.7
 $PX --port 6316 --pairs "127.0.0.1:6940" 2>/dev/null &
 fleet_wait_listen 6316
 sleep 1.0
-valkey-cli -p 6316 SET readkey readval >/dev/null
+cli_ok valkey-cli -p 6316 SET readkey readval
 
 python3 - <<'PY'
 import json, socket, statistics, threading, time, os, sys

@@ -42,8 +42,8 @@ def c(d):
 print(c(b"beta")%16384)')
 echo "== slot for {alpha}=$SLOT_A, {beta}=$SLOT_B"
 
-valkey-cli -p $PORT SET "{alpha}:k" "va" >/dev/null
-valkey-cli -p $PORT SET "{beta}:k"  "vb" >/dev/null
+cli_ok valkey-cli -p $PORT SET "{alpha}:k" "va"
+cli_ok valkey-cli -p $PORT SET "{beta}:k"  "vb"
 
 echo "== before any move: both keys serve normally"
 [ "$(valkey-cli -p $PORT GET "{alpha}:k")" = "va" ] || { echo "FAIL: alpha not served pre-move"; exit 1; }

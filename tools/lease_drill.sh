@@ -26,7 +26,7 @@ sleep 0.5
 $B --port $RPORT --engine rocks --data-dir "$RDIR" --replica-of 127.0.0.1:$MPORT 2>/dev/null &
 fleet_wait_listen $RPORT
 sleep 0.9
-valkey-cli -p $MPORT SET k v >/dev/null
+cli_ok valkey-cli -p $MPORT SET k v
 
 echo "== controller manages the master with a 1.5s lease TTL"
 ./target/release/flint-controller --nodes 127.0.0.1:$MPORT,127.0.0.1:$RPORT --id L \

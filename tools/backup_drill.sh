@@ -78,7 +78,7 @@ echo
 echo "== plant a MIGRATION row for the scrub to find: freeze one slot on pair 0"
 # {frz}probe hashes to a fixed slot; learn it from the heat counter the same
 # way txn_failure does (heat leads with an uptime_ms row, hence the filter).
-valkey-cli -p 6951 SET '{bkfrz}probe' seed >/dev/null
+cli_ok valkey-cli -p 6951 SET '{bkfrz}probe' seed
 FSLOT=$(valkey-cli -p 6951 FLINTSLOTHEAT | tr -d '\r' | awk '$1 ~ /^[0-9]+$/ {print $1; exit}')
 valkey-cli -p 6951 FLINTSLOTFREEZE "$FSLOT" 127.0.0.1:6999 | tr -d '\r'
 ONE=$(valkey-cli -p 6951 SET '{bkfrz}later' x 2>&1)
