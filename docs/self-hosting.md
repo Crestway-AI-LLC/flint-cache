@@ -50,17 +50,33 @@ read-only ones (`status`, `verify`). Three ways to satisfy it:
   Unpack into the directory your inventory's `bins` points at:
 
   ```sh
-  # Pick a version from the Releases page, then fetch the bundle beside its
-  # manifest — flintctl needs both, the manifest for its format-break guard.
-  V=v0.1.0-rc.48
-  B=https://github.com/Crestway-AI-LLC/flint-cache/releases/download/$V
-  curl -fLO "$B/flint-$V-linux-x86_64.tar.gz"
-  curl -fLO "$B/manifest.json"
+  # manifest.json has a CONSTANT name while the bundle name carries the
+  # version, so `releases/latest/download/manifest.json` is a stable entry
+  # point that never goes stale: it always describes the newest release, and
+  # the bundle URL and sha256 come out of it rather than out of this page.
+  R=https://github.com/Crestway-AI-LLC/flint-cache/releases
+  curl -fLO "$R/latest/download/manifest.json"
+  BUNDLE=$(python3 -c 'import json;print(json.load(open("manifest.json"))["bundle"])')
+  curl -fLO "$BUNDLE"          # flintctl needs both — the manifest is its
+  TAR=$(basename "$BUNDLE")    # format-break guard
 
-  # Verify FIRST — the signature is what proves these bytes are ours.
-  minisign -Vm flint-$V-linux-x86_64.tar.gz -P "$(tail -1 minisign.pub)"
-  tar xzf flint-$V-linux-x86_64.tar.gz -C /opt/flint/bin
+  # The sha256 says the bytes match THIS manifest. The signature says they
+  # came from us — check it first, and see below on which key to trust.
+  # minisign.pub lives in the repository root; the note below is about
+  # keeping YOUR copy rather than re-fetching it beside every download.
+  curl -fLO https://raw.githubusercontent.com/Crestway-AI-LLC/flint-cache/main/minisign.pub
+  curl -fLO "$BUNDLE.minisig"
+  minisign -Vm "$TAR" -P "$(tail -1 minisign.pub)"
+  python3 -c "import json,hashlib,sys
+m=json.load(open('manifest.json'))
+d=hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest()
+sys.exit(0 if d==m['sha256'] else f\"sha256 mismatch: {d} != {m['sha256']}\")" "$TAR"
+
+  tar xzf "$TAR" -C /opt/flint/bin
   ```
+
+  For a specific version instead of the newest, take its tag from the
+  Releases page and use `$R/download/<tag>/manifest.json`.
 
   Pin `minisign.pub` once, out of band, and check every later release against
   your pinned copy — [release-signing.md](release-signing.md) explains why the
