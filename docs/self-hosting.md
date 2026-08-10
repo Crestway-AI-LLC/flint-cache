@@ -45,13 +45,21 @@ read-only ones (`status`, `verify`). Three ways to satisfy it:
 
 - **Download a release bundle** — the simplest, and no toolchain at all.
   Tagged releases publish Linux x86_64 binaries plus a `manifest.json`
-  carrying the version and sha256. Unpack into the directory your inventory's
-  `bins` points at:
+  carrying the version and sha256, on the
+  [Releases page](https://github.com/Crestway-AI-LLC/flint-cache/releases/latest).
+  Unpack into the directory your inventory's `bins` points at:
 
   ```sh
+  # Pick a version from the Releases page, then fetch the bundle beside its
+  # manifest — flintctl needs both, the manifest for its format-break guard.
+  V=v0.1.0-rc.48
+  B=https://github.com/Crestway-AI-LLC/flint-cache/releases/download/$V
+  curl -fLO "$B/flint-$V-linux-x86_64.tar.gz"
+  curl -fLO "$B/manifest.json"
+
   # Verify FIRST — the signature is what proves these bytes are ours.
-  minisign -Vm flint-<version>-linux-x86_64.tar.gz -P "$(tail -1 minisign.pub)"
-  tar xzf flint-<version>-linux-x86_64.tar.gz -C /opt/flint/bin
+  minisign -Vm flint-$V-linux-x86_64.tar.gz -P "$(tail -1 minisign.pub)"
+  tar xzf flint-$V-linux-x86_64.tar.gz -C /opt/flint/bin
   ```
 
   Pin `minisign.pub` once, out of band, and check every later release against

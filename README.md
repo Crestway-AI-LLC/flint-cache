@@ -205,8 +205,9 @@ processes, not mocks.
 
 Only if you are building from source. **Tagged releases publish Linux x86_64
 binaries plus a `manifest.json` with the sha256** — for a deployment, download
-those instead and skip this section entirely
-([docs/self-hosting.md](docs/self-hosting.md)).
+those from the
+[Releases page](https://github.com/Crestway-AI-LLC/flint-cache/releases/latest)
+and skip this section entirely ([docs/self-hosting.md](docs/self-hosting.md)).
 
 - **Rust 1.85 or newer** (edition 2024). `rustup` recommended; several distro
   toolchains are older and will refuse to build.
