@@ -68,6 +68,34 @@ preflight() {
     [ -x "$BINS/flintctl" ] || die "FLINT_BINS=$BINS has no flintctl in it"
   fi
 
+  # Disk BEFORE anything is built or started. Nodes shed writes below
+  # `min-free 10% or 2 GiB` (the disk guard), and a shedding node still
+  # bootstraps, still reports healthy, still passes `verify` — it only
+  # refuses the write. So a laptop under the floor produces a cluster that
+  # comes up perfectly and then fails the one step that proves it works,
+  # which is the worst possible first impression of a cache: it looks like
+  # the data went missing.
+  #
+  # Measured here on 2026-08-10 at 6.6% free: the whole fleet started, verify
+  # said "bootstrap left the cluster consistent", and the run died on
+  # `read back '', expected 'it works'`. 12% rather than 10% so the guard is
+  # not tripped by the state this very cluster is about to write.
+  local free_pct
+  free_pct=$(df -k "$(dirname "$QS")" 2>/dev/null | awk 'NR==2 {printf "%d", $4/$2*100}')
+  if [ "${free_pct:-100}" -lt 12 ]; then
+    echo "quickstart: only ${free_pct}% of this filesystem is free." >&2
+    echo >&2
+    df -h "$(dirname "$QS")" 2>/dev/null | sed 's/^/  /' >&2
+    echo >&2
+    echo "  Flint nodes shed WRITES below 10% free (min-free 10% or 2 GiB) and" >&2
+    echo "  keep serving reads. The cluster would come up clean and then refuse" >&2
+    echo "  the write test, which reads like data loss and is not." >&2
+    echo >&2
+    echo "  Free some space and re-run, or FLINT_QS_SKIP_DISK=1 to continue." >&2
+    [ -n "${FLINT_QS_SKIP_DISK:-}" ] || exit 2
+    echo "  FLINT_QS_SKIP_DISK=1 set — continuing; expect -QUOTA on writes." >&2
+  fi
+
   local busy=""
   for p in $CP_PORT $M_PORT $R_PORT $PX_PORT; do
     port_busy "$p" && busy="$busy $p"
@@ -145,13 +173,31 @@ up() {
 
   if [ -n "$CLI" ]; then
     say "proving it serves"
-    local got
-    "$CLI" -p $PX_PORT -a "$TOKEN" --no-auth-warning SET quickstart "it works" >/dev/null 2>&1 \
-      || die "the cluster came up but the write through the proxy failed.
+    local got put
+    # KEEP THE SERVER'S REPLY. This used to be `SET … >/dev/null 2>&1 || die`,
+    # which discarded it — and valkey-cli EXITS 0 on an error reply, so `|| die`
+    # never fired either. A `-QUOTA server is low on disk space` was thrown away
+    # and surfaced one step later as `read back '', expected 'it works'`, which
+    # reads as data loss from the first command a new user ever runs.
+    #
+    # The rule this violated is already written down: a step that establishes a
+    # precondition must assert the REPLY, not just send the command and trust
+    # the exit status of a client that does not use it.
+    put=$("$CLI" -p $PX_PORT -a "$TOKEN" --no-auth-warning SET quickstart "it works" 2>&1 | tr -d '\r')
+    # Anything that is not OK is a refusal, and the server's own sentence is
+    # the most useful thing we can print. Note valkey-cli renders an error
+    # WITHOUT the protocol's leading '-' and without "(error)" when it is not
+    # on a tty, so matching on '-*' would miss every real case.
+    if [ "$put" != "OK" ]; then
+      die "the write through the proxy did not return OK. The server said:
+      ${put:-(nothing — is the proxy still listening on $PX_PORT?)}
       tools/quickstart.sh status     what flintctl thinks
       $QS/state/logs/                the process logs"
-    got=$("$CLI" -p $PX_PORT -a "$TOKEN" --no-auth-warning GET quickstart 2>/dev/null | tr -d '\r')
-    [ "$got" = "it works" ] || die "read back '$got', expected 'it works'"
+    fi
+    got=$("$CLI" -p $PX_PORT -a "$TOKEN" --no-auth-warning GET quickstart 2>&1 | tr -d '\r')
+    [ "$got" = "it works" ] || die "wrote OK but read back '$got', expected 'it works'.
+      The write was ACCEPTED, so this is not the disk guard — check replication
+      and the proxy's backend routing in $QS/state/logs/"
     echo "  wrote and read a key through the proxy"
   else
     echo "  (no valkey-cli or redis-cli found — skipping the write test)"
