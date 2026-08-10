@@ -29,6 +29,15 @@ rm -rf "$LOGS"; mkdir -p "$LOGS"
 
 # Section 3 of the checklist, in its order. Adding a drill here is what puts
 # it in the gate — there is no second list.
+#
+# AUDITED 2026-08-10. Until then this list held 48 of the 82 drills in
+# tools/, and nothing recorded why the other 34 were absent — so "the gate is
+# green" was a quieter claim than it sounded. All 34 were run: 31 passed, and
+# they are now here. Two of them had been broken for weeks with nobody
+# looking: lease_drill asserted a read behaviour the R1 stale-read fence
+# changed on 2026-07-17 (fixed, 432a5d5), and the reply-assertion sweep found
+# discarded writes throughout. A drill outside the gate rots, and rots
+# silently.
 CORE="restart repl failover proxy slot_migrate slot_map rebalance_execute
       tenant_quota token_rotation cert_reload_fleet controlplane_ha
       decommission config_file federation_plumbing disk_pressure ctl_error
@@ -37,8 +46,32 @@ CORE="restart repl failover proxy slot_migrate slot_map rebalance_execute
       async_flag async_writes txn_failure backup restore_ns backup_schedule
       backup_seat gc_sweep keystat start_guard seat_log cold_start_roles
       build_stamp config_drift tenant_status proxy_conformance edge_roll
-      admin_gated_proxy"
-CHAOS="chaos proxy_chaos"
+      admin_gated_proxy
+      cert_rotate control_tls controller_ha controller_managed
+      controller_multipair controlplane cp_publish internal_mtls json lease
+      m3_exit migrate_slots min_replicas node_tls proxy_backpressure
+      proxy_cache proxy_tls replica_reads replica_stale_fence rw_isolation
+      scan slot_cutover slot_cutover_recovery slot_moved snapshot_restore
+      tenant tenant_rebalance tenant_remove token_hash"
+CHAOS="chaos proxy_chaos chaos_unreadable hotkey_chaos"
+
+# DELIBERATELY OUT, with the reason. An absence with no reason beside it is
+# indistinguishable from an oversight, which is what the audit above had to
+# spend an evening establishing.
+#
+#   backup_s3     needs a real bucket: exits 0 with "SKIP: set FLINT_S3_BUCKET".
+#                 FLINT_GATE_STRICT=1 turns a SKIP into a FAIL, so adding it
+#                 here would make the strict gate unrunnable without AWS.
+#                 Run it by hand against a scratch bucket when touching the
+#                 backup path.
+#   fullsync_cap  FAILS on a fast host: "no replica was throttled — herd
+#                 didn't overlap (raise the dataset size)". The drill cannot
+#                 reliably create the condition it asserts on. Same family as
+#                 the RPO/THROTTLED work — pressure, not scale. Fix before
+#                 adding.
+#   stop_sweep    FAILS in setup: "fleet B did not start". It declares eight
+#                 ports across two fleets (6317-6321, 7820, 7879, 7889), so a
+#                 collision is the first thing to check. Fix before adding.
 
 # FLINT_GATE_STRICT=1 turns a SKIPPED drill into a FAILED one.
 #
@@ -56,6 +89,22 @@ CHAOS="chaos proxy_chaos"
 # So the environment that trusts the result is the environment that must
 # refuse a skip.
 FAILED=""
+# Seats a drill left behind. The gate starts from a box with no Flint on it
+# (assert_clean_box below), and every drill is supposed to clean up after
+# itself, so anything alive after drill N came FROM drill N.
+#
+# Why this exists: on 2026-08-10 a single leaked seat turned into 24 reported
+# failures. controlplane_drill passed, leaked its 6740 node — its cleanup
+# matched `--port 673`, which covers 6730 and not 6740 — and every drill
+# after it hit fleet_guard's refusal to run on a box holding Flint processes
+# it does not own. fleet_guard was right; the gate's OUTPUT was the problem.
+# It named 24 innocent drills and not the one that did it, which is the most
+# expensive way for a suite to be wrong.
+#
+# So: attribute the leak to the drill that caused it, and clear it, so one
+# leak costs one accurate failure rather than a cascade of false ones.
+_leaked_seats() { pgrep -f 'target/release/flint-(server|proxy|controlplane|controller|agent)' 2>/dev/null; }
+
 step() {  # step <name> <log-suffix> <command...>
   local name="$1" log="$LOGS/$2.log"; shift 2
   local start; start=$(date +%s)
@@ -94,8 +143,22 @@ step() {  # step <name> <log-suffix> <command...>
     # reaching its own verdict.
     { grep -m1 -E '^FAIL' "$log" \
         || grep -m1 -E '^(REFUSING|thread .* panicked|error(\[|:))' "$log" \
-        || tail -3 "$log"; } | sed 's/^/        /' 
+        || tail -3 "$log"; } | sed 's/^/        /'
     FAILED="$FAILED $name"
+  fi
+
+  # Leak check, on the PASS path as much as the FAIL path — the leak that
+  # cost 24 false failures came from a drill that passed.
+  local leaked; leaked=$(_leaked_seats)
+  if [ -n "$leaked" ]; then
+    echo "      LEAKED: $name left $(echo "$leaked" | wc -l | tr -d ' ') Flint process(es) running"
+    ps -o pid=,args= -p $(echo "$leaked" | tr '\n' ' ') 2>/dev/null \
+      | sed 's/^/        /' | cut -c1-110
+    echo "        Its cleanup does not cover every seat it starts. Prefer"
+    echo "        fleet_kill (scoped to the drill's fleet_init ports) over a"
+    echo "        hand-written pkill pattern, which goes stale silently."
+    kill -9 $(echo "$leaked" | tr '\n' ' ') 2>/dev/null
+    case " $FAILED " in *" $name "*) ;; *) FAILED="$FAILED $name(leaked)" ;; esac
   fi
 }
 

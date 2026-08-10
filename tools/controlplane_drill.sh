@@ -19,7 +19,12 @@ CP=./target/release/flint-controlplane
 PX=./target/release/flint-proxy
 STATE=/tmp/flint-cp-drill-state
 cleanup() {
-  pkill -9 -f "flint-server --port 673" 2>/dev/null
+  # Was `pkill -9 -f "flint-server --port 673"`, which covers 6730 and NOT
+  # 6740 — so this drill passed while leaking its second node on every run.
+  # On 2026-08-10 that orphan made fleet_guard refuse the next 23 drills and
+  # the gate reported 24 failures, exactly one of which was real.
+  # fleet_kill is scoped to this drill's fleet_init ports, all of them.
+  fleet_kill server 2>/dev/null
   fleet_kill proxy
   fleet_kill controlplane
   rm -rf /tmp/flint-cpd-* "$STATE" "$STATE.tmp"

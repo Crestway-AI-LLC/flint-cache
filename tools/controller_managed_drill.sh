@@ -14,8 +14,23 @@ D1=/tmp/flint-mng-1; D2=/tmp/flint-mng-2
 rm -rf "$D1" "$D2" "$D1.log" "$D2.log"
 P1=6324; P2=6325
 cleanup() {
-  pkill -9 -f "flint-server --port 64" 2>/dev/null
+  # CONTROLLER FIRST. This drill's whole subject is a controller that
+  # RESPAWNS nodes, so killing seats while it is still running just gives it
+  # something to replace: the replacement is parented to the controller, not
+  # to this drill, and outlives the run.
+  #
+  # It also used to match `flint-server --port 64` while this fleet runs on
+  # 6324/6325 — a copy-paste from a 64xx drill, so the pattern hit nothing
+  # even in the right order. The two bugs together leaked both seats on every
+  # single run. Invisible until 2026-08-10, because this drill was not in
+  # gates.sh; the moment it was added, the two orphans it left made
+  # fleet_guard refuse the next 25 drills and the gate reported 25 failures
+  # that were nothing of the sort.
+  #
+  # fleet_kill is scoped to this drill's own ports (fleet_init above), which
+  # is why it does not need — and must not have — a hand-written pattern.
   fleet_kill controller
+  fleet_kill server
   rm -rf "$D1" "$D2"
 }
 trap cleanup EXIT
