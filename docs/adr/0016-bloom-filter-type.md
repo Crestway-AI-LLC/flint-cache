@@ -4,9 +4,9 @@ Date: 2026-08-10
 
 ## Status
 
-Accepted. The sizing constants in D2 and the chain bound in D5 are chosen
-from reasoning, not measurement, and are marked where they need a number
-before they ship.
+Accepted. D2's block size was reasoned when this was written and has since
+been **measured** (D2, Verification 4). The chain bound in D5 remains a
+choice rather than a measurement, and is marked as such.
 
 ## Context
 
@@ -118,8 +118,28 @@ comes from cache-line-sized (512-bit) blocks, where a block holds ~50
 items and the variance is enormous — a size that makes sense when the
 motivation is one cache miss, and no sense when it is one disk read.
 
-**This number is reasoned, not measured. The premium gets measured against
-a flat filter before the constant is fixed** (Verification, below).
+**MEASURED, 2026-08-10** (`cargo run --release -p flint-storage --example
+bloom_blocking_premium`; 1 M items, 4 M absent trials per cell, 1% target,
+premium read at 9.75 bits/item):
+
+| layout | measured FPR | premium vs flat |
+|---|---|---|
+| flat | 0.00933 | — |
+| blocked, 64 B blocks | 0.01256 | **6.11%** |
+| blocked, 512 B blocks | 0.00972 | 0.84% |
+| blocked, **4 KiB** blocks | 0.00926 | **−0.16%** |
+
+At 4 KiB the premium is **at the measurement's resolution floor (0.15% of
+bits/item), which means indistinguishable from zero — not measured to be
+zero.** The reading is slightly negative, which is scatter: confining
+probes to a block cannot improve the rate in expectation.
+
+The 64 B row is the reason to believe the rest of the table. Blocking is
+supposed to cost real space at cache-line block sizes, so it doubles as
+this measurement's positive control — a harness reporting ~0% everywhere
+would be one that cannot detect a premium at all, and would "confirm" this
+ADR by being blind. It resolves at 6.11%, and the harness fails loudly if
+it ever stops doing so.
 
 Two consequences fall out for free:
 
@@ -289,11 +309,13 @@ applies, plus three things it cannot cover:
 And one measurement that gates a constant rather than a behaviour:
 
 4. **The blocking premium, measured before the block size is fixed.**
-   Same item count and same target error rate, flat filter versus blocked
-   at 4 KiB, reporting bits/item needed to hit the measured FPR. D2 claims
-   the premium is under a percent at this block size; if it is not, the
-   block size moves, and it is much cheaper to learn that now than after
-   the layout version is in a release.
+   **DONE** — `crates/flint-storage/examples/bloom_blocking_premium.rs`,
+   results in D2. The premium at 4 KiB is below the measurement's
+   resolution floor, and the harness carries its own positive control (the
+   64 B row, which must resolve above 5% or the run fails). Re-run it if
+   the hash, the probe derivation or the block size ever change — all
+   three move where bits land, and none of them would show up as a failure
+   anywhere else.
 
 ## Implementation order
 
