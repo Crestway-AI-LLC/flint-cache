@@ -23,10 +23,10 @@ cleanup() {
   ./target/release/flintctl -f "$INV" stop 2>/dev/null
   fleet_kill server; fleet_kill proxy
   fleet_kill controlplane; fleet_kill controller
-  rm -rf "$STATE" "$INV" "$ACK"
+  rm -rf "$STATE" "$INV" "$ACK" "$ACK.tmp"
 }
 trap cleanup EXIT
-rm -rf "$STATE" "$INV" "$RUN" "$ACK"
+rm -rf "$STATE" "$INV" "$RUN" "$ACK" "$ACK.tmp"
 
 cargo build --release -q -p flint-server -p flint-proxy -p flint-controlplane \
   -p flint-controller -p flint-ctl --features flint-server/rocks
@@ -62,7 +62,17 @@ echo "  seeded; sample {mig2}:k00000 = $BEFORE"
 ( n=0
   while [ -f "$RUN" ]; do
     n=$((n+1))
-    if [ "$($A SET '{mig2}:writer' $n 2>/dev/null)" = "OK" ]; then echo "$n" > "$ACK"; fi
+    # tmp+mv, not `>`: a bare redirect truncates then writes, and the main
+    # shell reads this file WHILE the loop runs. The window is small and
+    # real — CI hit it on 2026-08-11 and the drill announced "acked write
+    # lost across the move (acked=, read=1696)" about a migration that lost
+    # nothing. `mv` on the same filesystem is atomic, so a reader sees the
+    # previous complete value or the new one, never a truncated file.
+    # decommission_drill.sh had the identical bug and the identical fix;
+    # this one was missed then.
+    if [ "$($A SET '{mig2}:writer' $n 2>/dev/null)" = "OK" ]; then
+      echo "$n" > "$ACK.tmp" && mv "$ACK.tmp" "$ACK"
+    fi
   done ) &
 WPID=$!
 sleep 1
@@ -116,7 +126,18 @@ echo "$HELD" | grep -q 'v00000' || { echo "FAIL: new owner 7233 does not hold th
 echo "  pair 1 master (7233) serves {mig2}:k00000 directly"
 
 ACKED=$(cat "$ACK"); GOT=$($A GET '{mig2}:writer')
-[ -n "$ACKED" ] && [ "$GOT" -ge "$ACKED" ] 2>/dev/null \
+# "No ack was captured" and "an acked write was lost" are DIFFERENT results
+# and must not share a message. Folding them together is what turned a
+# harness race into a data-loss report; anyone reading that CI log would
+# have gone looking for a migration bug that was not there.
+[ -n "$ACKED" ] || {
+  echo "FAIL (HARNESS, not the system): no acked write was ever recorded."
+  echo "      The writer loop never got an OK, or the ack file was read"
+  echo "      mid-write. This says nothing about whether the move lost data."
+  echo "      key reads back as: $GOT"
+  exit 1
+}
+[ "$GOT" -ge "$ACKED" ] 2>/dev/null \
   || { echo "FAIL: acked write lost across the move (acked=$ACKED, read=$GOT)"; exit 1; }
 echo "  live writer: zero acked-write loss across the cutover (acked=$ACKED, read=$GOT)"
 

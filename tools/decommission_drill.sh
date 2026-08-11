@@ -94,7 +94,16 @@ M1=$(master); echo "== new master: $M1"
 echo "  ex-master rejoined as replica; both nodes live"
 
 ACKED=$(cat "$ACKFILE"); GOT=$($A GET writer:last)
-[ -n "$ACKED" ] && [ "$GOT" -ge "$ACKED" ] 2>/dev/null \
+# Same split as migrate_slots: an empty ack file is a HARNESS failure, not
+# evidence of loss. The tmp+mv above should make it impossible, which is
+# exactly why it deserves its own message if it ever happens again.
+[ -n "$ACKED" ] || {
+  echo "FAIL (HARNESS, not the system): no acked write was ever recorded."
+  echo "      Says nothing about whether the failover lost data."
+  echo "      key reads back as: $GOT"
+  exit 1
+}
+[ "$GOT" -ge "$ACKED" ] 2>/dev/null \
   || { echo "FAIL: acked write lost (acked=$ACKED, read=$GOT)"; exit 1; }
 [ "$($A DBSIZE)" -ge 5000 ] || { echo "FAIL: seeded data lost after failover"; exit 1; }
 echo "  zero acked-write loss across failover (acked=$ACKED, read=$GOT); 5000+ keys intact"
