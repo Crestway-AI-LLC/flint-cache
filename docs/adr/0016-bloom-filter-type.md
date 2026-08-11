@@ -328,6 +328,29 @@ applies, plus three things it cannot cover:
    false-negative test that has never failed is indistinguishable from one
    that asserts nothing, which is this codebase's most expensive recurring
    bug class (docs/field-notes.md §1).
+
+   **DONE 2026-08-11** — `tools/bloom_drill.sh`, 5000 items into a filter
+   reserved for 500, so the chain grew to **4 links** and every assertion
+   covers items living in older links. `5000/5000` present at all five
+   checkpoints (built, warm restart after `kill -9`, replica after full
+   sync, destination after slot migration, destination after a further
+   add), with `8/2000` never-added items reading present at each — the
+   vacuity control, well under the 10% bound, so the no-false-negative
+   result is not the trivial one a fully-set filter would produce.
+
+   **The control was run, not just specified.** Sabotaging `add` to set
+   `k-1` of its `k` probe bits — so the write path and the read path
+   disagree by exactly one bit — took the drill red at the first
+   checkpoint: `FAIL [built]: 1546/5000 added items still present — 3454
+   FALSE NEGATIVES`. Reverted, rebuilt, re-run green. The drill can fail,
+   which is the only thing that makes its passing worth anything.
+
+   Note the shape of the sabotage, because the obvious perturbation does
+   NOT work: changing `place()` itself moves the bits for inserts and
+   lookups together, so the filter stays self-consistent and the drill
+   correctly stays green. A false negative needs the two paths to
+   disagree, which is also why D6's write ordering is the other thing
+   worth breaking on purpose.
 3. **`tools/redisbloom_compare.sh`**, mirroring `redisjson_compare.sh`: the
    same corpus against a real RedisBloom, asserting the only failures are
    D7's divergences. Without it, `flint_only("bloom")` means the corpus
