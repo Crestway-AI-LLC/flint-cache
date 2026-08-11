@@ -1973,6 +1973,51 @@ fn resign_leaves(d: &str, sh: &dyn Fn(&str), edge_sans: &[String]) {
          -out {d}/edge.crt -days 365 -extfile {d}/edge-ext.cnf 2>/dev/null",
         sans = edge_san_list(edge_sans),
     ));
+    // The co-processor leaf (ADR-0010 step 1). SAN flint-internal like the mesh
+    // leaf — the proxy verifies it on an internal dial at INTERNAL_SNI — but
+    // `serverAuth` ONLY, no `clientAuth`. That absence IS the isolation
+    // guarantee: a node's mutual-TLS verifier refuses a serverAuth-only leaf as
+    // a client certificate, so a co-processor holding this leaf cannot dial the
+    // mesh as a member. Nothing consumes it yet (the PROXYCHAN arm is step 2);
+    // it is minted now because "a certificate and a test" is the whole of step
+    // 1, and the mint is where the security property is either created or lost.
+    sh(&format!(
+        "openssl req -newkey rsa:2048 -nodes -keyout {d}/coproc.key -out {d}/coproc.csr \
+         -subj /CN=flint-coproc 2>/dev/null"
+    ));
+    sh(&format!(
+        "printf 'subjectAltName=DNS:flint-internal\\nextendedKeyUsage=serverAuth\\nbasicConstraints=CA:FALSE' > {d}/coproc-ext.cnf && \
+         openssl x509 -req -in {d}/coproc.csr -CA {d}/ca.crt -CAkey {d}/ca.key \
+         -CAcreateserial -CAserial {d}/ca.srl \
+         -out {d}/coproc.crt -days 365 -extfile {d}/coproc-ext.cnf 2>/dev/null"
+    ));
+
+    // Assert the EKU the mint PRODUCED, not the recipe it was asked to run
+    // (ADR-0010 D2: "the mint recipe becomes security-critical"). A co-processor
+    // leaf accidentally minted by copying the mesh line above would serve
+    // correctly and every server-side handshake would still pass, silently
+    // keeping the clientAuth that must never be here. Fail the mint instead —
+    // on bootstrap AND on every rotate-certs, since both route through here.
+    let coproc = flint_tls::cert_eku(&format!("{d}/coproc.crt"))
+        .expect("co-processor leaf unreadable/unparseable immediately after minting it");
+    assert!(
+        coproc.server_auth && !coproc.client_auth,
+        "co-processor leaf minted with the WRONG EKU (server_auth={}, client_auth={}); \
+         it must be serverAuth-ONLY. A clientAuth bit here is exactly the hole \
+         ADR-0010 D2 exists to close — it would let a co-processor dial the mesh as a \
+         member. Fix the coproc-ext.cnf line above; do not relax this assert.",
+        coproc.server_auth, coproc.client_auth
+    );
+    // The mirror: the mesh leaf must KEEP clientAuth, or every internal dial
+    // stops working. Same helper, opposite verdict — the pair is the point.
+    let mesh = flint_tls::cert_eku(&format!("{d}/int.crt"))
+        .expect("mesh leaf unreadable/unparseable immediately after minting it");
+    assert!(
+        mesh.server_auth && mesh.client_auth,
+        "mesh leaf must be serverAuth,clientAuth (got server_auth={}, client_auth={}); \
+         without clientAuth every internal dial stops working.",
+        mesh.server_auth, mesh.client_auth
+    );
 }
 
 /// The edge cert's SAN list: loopback always, plus every `edge-san` entry —

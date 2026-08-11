@@ -458,3 +458,99 @@ pub fn cert_days_remaining(path: &str) -> Option<i64> {
         .as_secs() as i64;
     Some((not_after - now) / 86_400)
 }
+
+/// The Extended Key Usage a leaf carries — read from the first certificate in
+/// `path`. `None` if the file is unreadable, unparseable, or carries no EKU
+/// extension at all.
+///
+/// Exists so a MINT can refuse to ship a co-processor leaf that is wrong,
+/// rather than waiting for a drill to catch it. A co-processor leaf must be
+/// `serverAuth` and NOT `clientAuth`: that absence is the whole isolation
+/// argument (a node's mutual-TLS verifier refuses a `serverAuth`-only leaf as
+/// a client certificate, so the co-processor cannot dial the mesh). A leaf
+/// minted by copying the mesh line — `serverAuth,clientAuth`, the obvious
+/// thing to do — would keep serving correctly and silently retain the
+/// clientAuth that must not be there, and every server-side handshake test
+/// would still pass. rustls enforces this bit on the wire; this reads the same
+/// bit off the cert so the mint can assert it the moment it is produced.
+pub struct CertEku {
+    pub server_auth: bool,
+    pub client_auth: bool,
+}
+
+pub fn cert_eku(path: &str) -> Option<CertEku> {
+    cert_eku_from_pem(&std::fs::read(path).ok()?)
+}
+
+/// The file-free core of [`cert_eku`], split out so the EKU reader can be
+/// unit-tested against embedded fixtures without touching the filesystem.
+fn cert_eku_from_pem(pem: &[u8]) -> Option<CertEku> {
+    // First certificate in the file is the leaf.
+    let (_, der) = x509_parser::pem::parse_x509_pem(pem).ok()?;
+    let cert = der.parse_x509().ok()?;
+    let ext = cert.extended_key_usage().ok()??;
+    Some(CertEku {
+        server_auth: ext.value.server_auth,
+        client_auth: ext.value.client_auth,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cert_eku_from_pem;
+
+    // Two self-signed leaves (P-256) that differ in exactly ONE thing: the EKU.
+    // If `cert_eku` could not tell them apart — e.g. a bug that always reported
+    // client_auth=false — the mint-time assert in flint-ctl's `resign_leaves`
+    // would be vacuous, and a co-processor leaf minted by copying the mesh line
+    // (ADR-0010 D2's exact failure) would ship unnoticed. This is that assert's
+    // positive control: prove the reader actually discriminates, in BOTH
+    // directions, so a "passing" assert is known to be checking something.
+    const SERVER_ONLY: &str = "-----BEGIN CERTIFICATE-----
+MIICGjCCAcCgAwIBAgIJAKz1YYmNVE8zMAoGCCqGSM49BAMCMAwxCjAIBgNVBAMM
+AXQwHhcNMjYwODExMjE1ODE5WhcNMzYwODA4MjE1ODE5WjAMMQowCAYDVQQDDAF0
+MIIBSzCCAQMGByqGSM49AgEwgfcCAQEwLAYHKoZIzj0BAQIhAP////8AAAABAAAA
+AAAAAAAAAAAA////////////////MFsEIP////8AAAABAAAAAAAAAAAAAAAA////
+///////////8BCBaxjXYqjqT57PrvVV2mIa8ZR0GsMxTsPY7zjw+J9JgSwMVAMSd
+NgiG5wSTamZ44ROdJreBn36QBEEEaxfR8uEsQkf4vOblY6RA8ncDfYEt6zOg9KE5
+RdiYwpZP40Li/hp/m47n60p8D54WK84zV2sxXs7LtkBoN79R9QIhAP////8AAAAA
+//////////+85vqtpxeehPO5ysL8YyVRAgEBA0IABAL1u0pCNXEA554ZoH24q5N4
+R851I/1BaC+bonFk2/T7FkasaTyuywqIuena8Yr18Yj7OBeYUCIH++ewQYczHjqj
+FzAVMBMGA1UdJQQMMAoGCCsGAQUFBwMBMAoGCCqGSM49BAMCA0gAMEUCIH349r1G
+RAL+o0xF4qapYlxXw08qybwMASFPnQPZ23pGAiEAhrWYikuqE1+8rKOyFrz9df1O
+MlkuqcVf24zbBv9criw=
+-----END CERTIFICATE-----
+";
+    const DUAL: &str = "-----BEGIN CERTIFICATE-----
+MIICJTCCAcqgAwIBAgIJAK7fHzNG9fUhMAoGCCqGSM49BAMCMAwxCjAIBgNVBAMM
+AXQwHhcNMjYwODExMjE1ODE5WhcNMzYwODA4MjE1ODE5WjAMMQowCAYDVQQDDAF0
+MIIBSzCCAQMGByqGSM49AgEwgfcCAQEwLAYHKoZIzj0BAQIhAP////8AAAABAAAA
+AAAAAAAAAAAA////////////////MFsEIP////8AAAABAAAAAAAAAAAAAAAA////
+///////////8BCBaxjXYqjqT57PrvVV2mIa8ZR0GsMxTsPY7zjw+J9JgSwMVAMSd
+NgiG5wSTamZ44ROdJreBn36QBEEEaxfR8uEsQkf4vOblY6RA8ncDfYEt6zOg9KE5
+RdiYwpZP40Li/hp/m47n60p8D54WK84zV2sxXs7LtkBoN79R9QIhAP////8AAAAA
+//////////+85vqtpxeehPO5ysL8YyVRAgEBA0IABNWpcDwSPjSh++CpLujR5of6
+0Z8cmM5JcXPjI/3C2eM4yY4Zu5q/5XsablfXPkn+ZrLvDV2MDLZ0Zx/SZwo2+Uaj
+ITAfMB0GA1UdJQQWMBQGCCsGAQUFBwMBBggrBgEFBQcDAjAKBggqhkjOPQQDAgNJ
+ADBGAiEAkKTfR8gfMzWaDyPP1ncKWfIgu4F18JG7wWlDqr3yvDECIQCrEJV+9xmk
++J+nrpwyN2JwnpqBiopfGtB9+4yT1LUJyg==
+-----END CERTIFICATE-----
+";
+
+    #[test]
+    fn cert_eku_distinguishes_server_only_from_dual() {
+        let s = cert_eku_from_pem(SERVER_ONLY.as_bytes()).expect("server-only leaf should parse");
+        assert!(s.server_auth, "server-only leaf must report serverAuth");
+        assert!(
+            !s.client_auth,
+            "server-only leaf must NOT report clientAuth — that absence is the isolation bit"
+        );
+
+        let d = cert_eku_from_pem(DUAL.as_bytes()).expect("dual leaf should parse");
+        assert!(d.server_auth, "dual leaf must report serverAuth");
+        assert!(
+            d.client_auth,
+            "dual leaf must report clientAuth — proves the reader is not stuck at false"
+        );
+    }
+}
