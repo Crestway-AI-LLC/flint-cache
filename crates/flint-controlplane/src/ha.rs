@@ -252,6 +252,16 @@ pub struct Ha {
     /// Latest metered resident bytes per tenant name (CPTENANTUSAGE) —
     /// node-local telemetry for CPMYUSAGE, never Rafted.
     pub usage: std::sync::Mutex<std::collections::HashMap<String, u64>>,
+    /// Controllers that have announced themselves (CPCONTROLLER), node-local
+    /// and never Rafted for the same reason as `usage`: a heartbeat is
+    /// observability, and committing one would wake every watching proxy
+    /// because a controller said hello.
+    ///
+    /// Node-local means each CP seat knows only the controllers that talked
+    /// to IT — a controller names one `--commit-cp`. `flintctl status` already
+    /// unions the rows across every CP in the inventory, so the fleet-wide
+    /// answer is assembled by the reader rather than by consensus.
+    pub controllers: std::sync::Mutex<crate::state::Controllers>,
 }
 
 /// Build the Raft node and start the RPC server. Returns the handle the
@@ -318,6 +328,7 @@ pub async fn start(
         client_addrs,
         journal_path,
         usage: std::sync::Mutex::new(std::collections::HashMap::new()),
+        controllers: std::sync::Mutex::new(crate::state::Controllers::new()),
     })
 }
 
@@ -1051,18 +1062,59 @@ async fn handle_admin(ha: &Ha, args: &[Vec<u8>]) -> Value {
                 .as_deref()
                 .and_then(flint_tls::cert_days_remaining)
                 .map_or_else(|| "none".into(), |d: i64| d.to_string());
+            // Parity with the single-node CPINFO is not cosmetic. `flintctl
+            // upgrade` calls assert_build("control plane", cpinfo_field(…,
+            // "build:")) and DIES when that is absent, so a CPINFO without
+            // `build:` made every Raft fleet unrollable — the seats swapped,
+            // then the roll aborted claiming the control plane would not
+            // report a build. ADR-0014 D1 had landed on one of the two
+            // control planes and nothing noticed, because no drill has ever
+            // upgraded a multi-seat CP.
+            //
+            // `registry_version:` is the same rename D1 made on the other
+            // path: `version:` was never a software version, it is the
+            // registry generation that drives CPWATCH. Both are emitted —
+            // the alias because CPWATCH clients parse it.
+            let controllers = ha
+                .controllers
+                .lock()
+                .map(|c| crate::state::render_controllers(&c))
+                .unwrap_or_default();
             Value::Bulk(Some(
                 format!(
-                    "version:{}\r\nproxies:{}\r\npairs:{}\r\ntenants:{}\r\nnode:{}\r\nleader:{}\r\ncert_days_remaining:{cdr}\r\n",
+                    "build:{}\r\nregistry_version:{}\r\nversion:{}\r\nproxies:{}\r\npairs:{}\r\ntenants:{}\r\nslot_exceptions:{}\r\nnode:{}\r\nleader:{}\r\ncert_days_remaining:{cdr}\r\n{controllers}",
+                    crate::build_version(),
+                    reg.version,
                     reg.version,
                     reg.proxies.len(),
                     reg.pairs.len(),
                     reg.tenants.len(),
+                    reg.exceptions.len(),
                     ha.node_id,
                     leader.map(|l| l.to_string()).unwrap_or_else(|| "none".into()),
                 )
                 .into_bytes(),
             ))
+        }
+        b"CPCONTROLLER" => {
+            // The HA counterpart of main.rs's handler. A controller has no
+            // listener and must not gain one, so announcing itself is the
+            // only way its build reaches `status` without ssh — and that has
+            // to work whichever control plane it is pointed at.
+            let (Some(id), Some(build)) = (text(1), text(2)) else {
+                return Value::Error("ERR CPCONTROLLER <host:pid> <build>".into());
+            };
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            match ha.controllers.lock() {
+                Ok(mut c) => {
+                    crate::state::record_controller(&mut c, &id, &build, now);
+                    Value::Simple(format!("OK {id} {build}"))
+                }
+                Err(_) => Value::Error("ERR controller registry lock".into()),
+            }
         }
         b"CPSNAPSHOT" => {
             let Some(proxy) = text(1) else {

@@ -2297,8 +2297,31 @@ fn call_cp(
     last
 }
 
-fn cp_args(inv: &Inventory) -> Vec<String> {
-    cp_seat_args(inv, 0)
+/// The seat name for CP `i` — `cp` alone, `cp-n1..N` for a Raft group.
+///
+/// ONE definition, because this is a pidfile name and two spellings of it
+/// means one caller stopping a seat the other never started. `roll_edge`
+/// used the literal "cp" against a three-seat fleet: `stop_seat` looked for
+/// `cp.pid`, found nothing, reported the process already gone, and then
+/// failed `wait_port_free` because the real `cp-n1` was alive and holding
+/// the port. The abort read "port still bound after the process was gone",
+/// which is exactly what it looks like when you kill the wrong thing.
+fn cp_seat_name(inv: &Inventory, i: usize) -> String {
+    if inv.cp.len() == 1 {
+        "cp".to_string()
+    } else {
+        format!("cp-n{}", i + 1)
+    }
+}
+
+/// The state dir for CP seat `i`, matching `cp_seat_args`.
+fn cp_seat_state(inv: &Inventory, i: usize) -> String {
+    let d = &inv.statedir;
+    if inv.cp.len() == 1 {
+        format!("{d}/cp-state")
+    } else {
+        format!("{d}/cp-state-n{}", i + 1)
+    }
 }
 
 /// Arguments for CP seat `i`. One `cp` line in the inventory is the
@@ -2614,11 +2637,9 @@ fn launch(inv: &Inventory, register: bool) {
     // and the pair gets two supervisors.
     for i in 0..inv.cp.len() {
         let seat = &inv.cp[i];
-        let name = if inv.cp.len() == 1 {
-            "cp".to_string()
-        } else {
-            format!("cp-n{}", i + 1)
-        };
+        // Shared with roll_edge. Two spellings of a pidfile name is how the
+        // roll came to stop a seat this never started.
+        let name = cp_seat_name(inv, i);
         if matches!(call(seat, &tls, &["PING"]), Ok(Value::Simple(s)) if s == "PONG") {
             eprintln!("  {name} already up");
             continue;
@@ -4666,31 +4687,46 @@ fn roll_edge(inv: &Inventory, envs: &[(String, String)], expect_build: &Option<S
     }
 
     eprintln!("== control plane");
-    if let Err(e) = stop_seat(
-        inv,
-        &runner_for(inv, &inv.cp[0]),
-        "cp",
-        "flint-controlplane",
-        &format!("{d}/cp-state"),
-        Some(port_of(&inv.cp[0])),
-    ) {
-        die_on("control plane", e);
-    }
-    spawn_env(
-        inv,
-        &runner_for(inv, &inv.cp[0]),
-        "cp",
-        "flint-controlplane",
-        &cp_args(inv),
-        envs,
-    );
-    if !wait_pong(&inv.cp[0], &tls, Duration::from_secs(15)) {
-        die_on(
-            "control plane",
-            "did not answer after the binary swap".into(),
+    // EVERY seat, one at a time, under the name bootstrap gave it.
+    //
+    // This rolled only inv.cp[0] and always called it "cp". On a Raft group
+    // that is the wrong name (bootstrap writes cp-n1/n2/n3), so the stop
+    // aimed at a pidfile nobody wrote, decided the seat was already gone,
+    // and then timed out waiting for a port its still-living process held.
+    // Even had it worked, two of three seats would have kept the old binary
+    // and the build gate would not have noticed, because it only ever asked
+    // cp[0] — a mixed-build control plane reported as a finished roll.
+    //
+    // Sequential is the point: a Raft group keeps serving while a minority
+    // is down, so one seat at a time is what makes this a rolling upgrade
+    // instead of a control-plane outage. Each seat must answer AND report
+    // the new build before the next one is touched.
+    for i in 0..inv.cp.len() {
+        let seat = inv.cp[i].clone();
+        let name = cp_seat_name(inv, i);
+        if let Err(e) = stop_seat(
+            inv,
+            &runner_for(inv, &seat),
+            &name,
+            "flint-controlplane",
+            &cp_seat_state(inv, i),
+            Some(port_of(&seat)),
+        ) {
+            die_on(&name, e);
+        }
+        spawn_env(
+            inv,
+            &runner_for(inv, &seat),
+            &name,
+            "flint-controlplane",
+            &cp_seat_args(inv, i),
+            envs,
         );
+        if !wait_pong(&seat, &tls, Duration::from_secs(15)) {
+            die_on(&name, "did not answer after the binary swap".into());
+        }
+        assert_build(&name, cpinfo_field(&seat, &tls, "build:"));
     }
-    assert_build("control plane", cpinfo_field(&inv.cp[0], &tls, "build:"));
 
     if inv.backup_to.is_some() {
         eprintln!("== backup seat");
@@ -4766,7 +4802,18 @@ fn roll_edge(inv: &Inventory, envs: &[(String, String)], expect_build: &Option<S
     if inv.controller && expect_build.is_some() {
         let deadline = Instant::now() + Duration::from_secs(45);
         loop {
-            let rows = cpinfo_controllers(&inv.cp[0], &tls).unwrap_or_default();
+            // Every CP, not just the first. The controller registry is
+            // node-local in both control planes — a controller names ONE
+            // --commit-cp — so on a 3-seat Raft fleet asking cp[0] alone
+            // reports nothing whenever the controller happens to be pointed
+            // at cp[1], and this gate would time out on a healthy fleet.
+            // `status --json` already unions across seats; this now matches.
+            let rows: Vec<String> = inv
+                .cp
+                .iter()
+                .filter_map(|c| cpinfo_controllers(c, &tls))
+                .flatten()
+                .collect();
             let want = expect_build.as_deref().unwrap_or_default();
             let live: Vec<&String> = rows.iter().filter(|r| r.contains(" live ")).collect();
             let all_new =

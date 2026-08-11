@@ -89,24 +89,58 @@ impl State {
     /// can say, and hiding it would restore the silence that let an
     /// orphaned controller survive two upgrade cycles.
     pub fn controller_line(&self) -> String {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-        let mut out = String::new();
-        for (id, (build, at)) in &self.controllers {
-            let age = now.saturating_sub(*at);
-            let state = if age > CONTROLLER_STALE_MS {
-                "STALE"
-            } else {
-                "live"
-            };
-            out.push_str(&format!(
-                "controller:{id} build={build} {state} last_seen_ms_ago={age}\r\n"
-            ));
-        }
-        out
+        render_controllers(&self.controllers)
     }
+}
+
+/// The controller registry, as a map from `<host:pid>` to `(build, last_seen_ms)`.
+///
+/// Node-local in BOTH control planes and never Rafted: a heartbeat is
+/// observability, not registry state, and committing one would wake every
+/// watching proxy because a controller said hello.
+pub type Controllers = BTreeMap<String, (String, u64)>;
+
+/// Record an announcement and forget the long-dead.
+///
+/// Shared by the single-node and HA control planes deliberately. These two
+/// paths had already drifted once — ADR-0014 D1 landed the build stamp, the
+/// registry_version rename and this registry on the single-node CP only, so
+/// `flintctl upgrade` aborted at the control plane on any Raft fleet and
+/// `status` showed it no controllers. Two copies of a rendering rule is how
+/// that happens; one function with two callers is the fix that stays fixed.
+pub fn record_controller(map: &mut Controllers, id: &str, build: &str, now: u64) {
+    map.insert(id.to_string(), (build.to_string(), now));
+    // Forget controllers that stopped reporting LONG ago (10x the stale
+    // window), so a box replaced months back does not accumulate. Well past
+    // STALE, which stays visible on purpose.
+    let cutoff = now.saturating_sub(CONTROLLER_STALE_MS * 10);
+    map.retain(|_, (_, at)| *at >= cutoff);
+}
+
+/// Render one `controller:` line per registered controller.
+///
+/// Renders STALE rather than dropping the row. A controller that stopped
+/// reporting is the single most interesting thing this surface can say, and
+/// hiding it would restore the silence that let an orphaned controller
+/// survive two upgrade cycles.
+pub fn render_controllers(map: &Controllers) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let mut out = String::new();
+    for (id, (build, at)) in map {
+        let age = now.saturating_sub(*at);
+        let state = if age > CONTROLLER_STALE_MS {
+            "STALE"
+        } else {
+            "live"
+        };
+        out.push_str(&format!(
+            "controller:{id} build={build} {state} last_seen_ms_ago={age}\r\n"
+        ));
+    }
+    out
 }
 
 /// FNV-1a — a stable, dependency-free seed for deterministic subset

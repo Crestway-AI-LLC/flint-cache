@@ -994,12 +994,7 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0);
-            st.controllers.insert(id.clone(), (build.clone(), now));
-            // Forget controllers that stopped reporting LONG ago (10x the
-            // stale window), so a box replaced months back does not
-            // accumulate. Well past STALE, which stays visible on purpose.
-            let cutoff = now.saturating_sub(state::CONTROLLER_STALE_MS * 10);
-            st.controllers.retain(|_, (_, at)| *at >= cutoff);
+            state::record_controller(&mut st.controllers, &id, &build, now);
             Value::Simple(format!("OK {id} {build}"))
         }
         b"CPSNAPSHOT" => {
