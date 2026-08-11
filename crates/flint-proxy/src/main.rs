@@ -413,9 +413,37 @@ struct Topology {
     /// command) and consumed by `PROXYCHAN`. Swept of dead entries on each
     /// mint so it cannot grow without bound.
     channel_tokens: std::sync::Mutex<HashMap<String, ChannelGrant>>,
+    /// Family route table (ADR-0010 D1): command prefix, uppercased (e.g.
+    /// `VEC.`) -> co-processor endpoint addresses. Fed by `--families` or
+    /// CPSNAPSHOT element 7. Global today; D1's "per-cluster" table is the
+    /// ADR-0007 federation shape. A command that matches a prefix here — and
+    /// is NOT a known read or write — takes the family path instead of routing
+    /// to a backend; anything unregistered routes exactly as before.
+    families: RwLock<Vec<(Vec<u8>, Vec<String>)>>,
 }
 
 impl Topology {
+    /// True if `name` matches a registered family prefix (ADR-0010 D1).
+    /// Case-insensitive on the name, since the wire is. Callers gate this
+    /// behind "not a known read/write" so the resolution order holds:
+    /// known write → known read → registered family → unknown.
+    fn family_registered(&self, name: &[u8]) -> bool {
+        let upper = name.to_ascii_uppercase();
+        self.families
+            .read()
+            .map(|f| f.iter().any(|(p, _)| upper.starts_with(p.as_slice())))
+            .unwrap_or(false)
+    }
+
+    /// Replace the family route table from CPSNAPSHOT element 7. Only called
+    /// when the element is PRESENT — an older CP that omits it leaves the
+    /// table (static `--families`, or a prior snapshot) untouched.
+    fn apply_families(&self, s: &str) {
+        if let Ok(mut f) = self.families.write() {
+            *f = parse_families(s);
+        }
+    }
+
     /// The address a command for `slot` in `ns` should go to right now.
     /// Range-based default owner (pair i serves slots [i*N/16384 ..)),
     /// overridden per (ns, slot) by the moved cache.
@@ -2145,6 +2173,44 @@ fn transaction_step(
     }
 }
 
+/// Parse the family route table wire form: `PREFIX=addr,addr;PREFIX=addr`
+/// (`--families` and CPSNAPSHOT element 7 share it). Prefixes are uppercased so
+/// matching is case-insensitive; empty entries and empty prefixes are skipped.
+/// An empty string yields no families.
+fn parse_families(s: &str) -> Vec<(Vec<u8>, Vec<String>)> {
+    let mut out = Vec::new();
+    for entry in s.split(';').map(str::trim).filter(|e| !e.is_empty()) {
+        let Some((prefix, addrs)) = entry.split_once('=') else {
+            continue;
+        };
+        let prefix = prefix.trim().to_ascii_uppercase().into_bytes();
+        if prefix.is_empty() {
+            continue;
+        }
+        let addrs: Vec<String> = addrs
+            .split(',')
+            .map(str::trim)
+            .filter(|a| !a.is_empty())
+            .map(str::to_string)
+            .collect();
+        out.push((prefix, addrs));
+    }
+    out
+}
+
+/// Handle a registered family command (ADR-0010 D1/D2). Step 3 lands the route
+/// table and this recognition; the FORWARD to a co-processor — dialing an
+/// endpoint, minting a channel token, relaying the reply — is the next slice
+/// and needs its own backend pool (D3, step 4). Until a co-processor is
+/// reachable, a recognized family answers `-COPROCUNAVAIL` — which is ALSO the
+/// correct steady-state reply when a registered family's endpoints are all
+/// down (ADR-0015's agent watches for exactly this). `topo`/`ns`/`args` are
+/// threaded now because the forward slice needs the endpoint set, the channel
+/// namespace, and the command to forward.
+fn family_command(_topo: &Topology, _ns: &[u8], _args: &[Vec<u8>]) -> Value {
+    Value::Error("COPROCUNAVAIL no co-processor is available for this command family".into())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn data_command(
     topo: &Topology,
@@ -2157,16 +2223,32 @@ fn data_command(
     local_cache: bool,
     async_writes: bool,
 ) -> Value {
-    // M5 quota gate FIRST: a shed command must not touch the cache, a
-    // backend, or the bucket-bypassing fast paths. Only data commands are
-    // charged (PING/ECHO/QUIT are free; they cost this proxy nothing).
     let is_write = args
         .first()
         .is_some_and(|n| flint_commands::is_write_command(n));
-    let is_data = is_write
-        || args
-            .first()
-            .is_some_and(|n| flint_commands::is_read_command(n));
+    let is_read = args
+        .first()
+        .is_some_and(|n| flint_commands::is_read_command(n));
+    // ADR-0010 D1 resolution order: known write → known read → registered
+    // family → unknown. A command that is neither a known write nor a known
+    // read, but matches a registered family prefix, takes the family path;
+    // everything else — INCLUDING an unregistered unknown command, which still
+    // routes to a master and earns the server's error — is untouched. That
+    // equivalence is the whole safety argument for shipping the table without
+    // re-validating the command surface, and the drill proves it. Checked
+    // before the quota gate: a family command is charged once at admission by
+    // the forward slice, not through the read/write bucket (D1).
+    if !is_write
+        && !is_read
+        && let Some(name) = args.first()
+        && topo.family_registered(name)
+    {
+        return family_command(topo, ns, args);
+    }
+    // M5 quota gate: a shed command must not touch the cache, a backend, or
+    // the bucket-bypassing fast paths. Only data commands are charged
+    // (PING/ECHO/QUIT are free; they cost this proxy nothing).
+    let is_data = is_write || is_read;
     if is_data
         && let Some(name) = args.first()
         && let Some(shed) = topo.quota_gate(ns, name, is_write)
@@ -2524,6 +2606,15 @@ fn watch_control_plane(
                         Some(Value::Bulk(Some(p))) => String::from_utf8_lossy(p).to_string(),
                         _ => String::new(),
                     };
+                    // ADR-0010 D1: element 7 = the family route table. Option,
+                    // not empty-string: ABSENT (older CP) leaves the table as
+                    // it is, PRESENT-but-empty clears it. Everything else in
+                    // this frame collapses absent to empty because empty is a
+                    // valid steady state for it; for families it is not.
+                    let families = match items.get(7) {
+                        Some(Value::Bulk(Some(f))) => Some(String::from_utf8_lossy(f).to_string()),
+                        _ => None,
+                    };
                     topo.apply_snapshot(
                         &String::from_utf8_lossy(pairs),
                         &String::from_utf8_lossy(tenants),
@@ -2531,6 +2622,9 @@ fn watch_control_plane(
                         &exc,
                     );
                     topo.apply_promote_hint(&promo);
+                    if let Some(f) = &families {
+                        topo.apply_families(f);
+                    }
                     *last_version = *version as u64;
                     eprintln!("control-plane snapshot v{version} applied");
                     out.clear();
@@ -2739,6 +2833,7 @@ fn main() -> std::io::Result<()> {
         cert_path: arg("--internal-cert"),
         last_promote_hint: RwLock::new(String::new()),
         channel_tokens: std::sync::Mutex::new(HashMap::new()),
+        families: RwLock::new(parse_families(&arg("--families").unwrap_or_default())),
         admin_digests: RwLock::new(
             arg("--admin-token")
                 .map(|t| vec![flint_tls::sha256_hex(t.as_bytes())])
@@ -2880,6 +2975,7 @@ mod route_tests {
             admin_digests: RwLock::new(Vec::new()),
             last_promote_hint: RwLock::new(String::new()),
             channel_tokens: std::sync::Mutex::new(HashMap::new()),
+            families: RwLock::new(Vec::new()),
         }
     }
 
@@ -2909,6 +3005,40 @@ mod route_tests {
         assert_eq!(master0(&t), Some("a:1".into()), "precondition");
         t.apply_promote_hint("a:1|1");
         assert_eq!(master0(&t), None, "a new hint must trigger a re-probe");
+    }
+
+    #[test]
+    fn family_table_parses_and_matches_by_prefix() {
+        // Wire form -> table. "=skipme" has an empty prefix (dropped); "JSON.="
+        // has empty endpoints (KEPT — a registered family with no endpoint is
+        // still -COPROCUNAVAIL, not "unregistered and routed to the master").
+        let fams = parse_families(" VEC.=a:1, b:2 ; se=c:3 ; =skipme ; JSON.= ");
+        let prefixes: Vec<String> = fams
+            .iter()
+            .map(|(p, _)| String::from_utf8_lossy(p).into_owned())
+            .collect();
+        assert_eq!(
+            prefixes,
+            vec!["VEC.", "SE", "JSON."],
+            "prefixes uppercased, empty-prefix entry dropped"
+        );
+        assert_eq!(fams[0].1, vec!["a:1", "b:2"]);
+        assert!(fams[2].1.is_empty(), "JSON. registered with no endpoints");
+
+        // family_registered is a pure, case-insensitive prefix match. The
+        // caller (data_command) gates it behind !is_write && !is_read, so the
+        // fact that "SETEX" matches the SE family here is harmless — the
+        // resolution order, not this fn, keeps SETEX a write.
+        let t = two_pair_topo();
+        t.apply_families("VEC.=a:1;SE=b:2");
+        assert!(t.family_registered(b"VEC.SET"));
+        assert!(t.family_registered(b"vec.get"), "case-insensitive");
+        assert!(t.family_registered(b"SETEX"), "prefix match, resolution order handles the rest");
+        assert!(!t.family_registered(b"MAT.MUL"), "unregistered prefix");
+        assert!(!t.family_registered(b"GET"));
+        // An emptied table registers nothing (a CP that clears element 7).
+        t.apply_families("");
+        assert!(!t.family_registered(b"VEC.SET"));
     }
 
     #[test]
