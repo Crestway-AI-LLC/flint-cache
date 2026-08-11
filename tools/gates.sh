@@ -439,8 +439,49 @@ if want conformance; then
   rm -rf "$CDIR"
 fi
 
+# Every drill SHARES ./target/release, so a drill that rebuilds flint-server
+# WITHOUT `--features flint-server/rocks` replaces the rocks binary with a
+# mem-only one. The next drill starts `--engine rocks`, the server prints
+# "unknown --engine" and exits, and that drill reports "nothing listening
+# after 30s" — pointing at a component that is perfectly fine.
+#
+# Cost of learning this: on 2026-08-11 one new drill silently took out the
+# next three, and the failures read as a proxy bug.
+#
+# Checked STATICALLY, before anything runs. A runtime probe is not an option:
+# `flint-server --engine rocks` ignores `--help` and BOOTS, so asking the
+# binary what it supports means starting a server (and writing a data dir)
+# after every drill. Reading the scripts is free, deterministic, and names
+# the file to fix instead of the drill that tripped over it.
+assert_drill_builds_keep_rocks() {
+  local bad=""
+  for f in tools/*_drill.sh; do
+    # Strip whole-line comments BEFORE matching, then join backslash
+    # continuations — most of these build lines wrap. Without the strip,
+    # a comment that merely quotes a build command is flagged as one
+    # (this check's own first version flagged the drill whose comment
+    # explains the rule).
+    local joined
+    joined=$(grep -v '^[[:space:]]*#' "$f" | sed -e :a -e '/\\$/N; s/\\\n//; ta')
+    # `--features rocks` and `--features flint-server/rocks` are equivalent
+    # when -p flint-server is the selected package, and drills use both.
+    # The rule is simply: if it rebuilds flint-server, it must say rocks.
+    echo "$joined" | grep 'cargo build.*-p flint-server' | grep -qv 'rocks' \
+      && bad="$bad $f"
+  done
+  [ -z "$bad" ] && return 0
+  echo "GATES FAILED: drill(s) rebuild flint-server WITHOUT flint-server/rocks:"
+  for f in $bad; do echo "    $f"; done
+  echo "  That downgrades ./target/release/flint-server to a mem-only build,"
+  echo "  and every later drill using --engine rocks then reports"
+  echo "  'nothing listening'. Add to the build line:"
+  echo "      --features flint-server/rocks"
+  exit 1
+}
+
 if want drills; then
   echo "== core drills"
+  assert_drill_builds_keep_rocks
   LEAKCHECK=1
   for d in $CORE; do step "$d" "drill-$d" bash "tools/${d}_drill.sh"; done
   LEAKCHECK=

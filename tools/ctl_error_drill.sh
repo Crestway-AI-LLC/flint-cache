@@ -32,7 +32,14 @@ cleanup() {
 trap cleanup EXIT
 rm -rf "$STATE" "$INV" "$DEAD"
 
-cargo build --release -q -p flint-server -p flint-controlplane -p flint-ctl
+# --features flint-server/rocks even though THIS drill never starts a rocks
+# engine: the build output is shared, so omitting it replaces
+# ./target/release/flint-server with a mem-only binary and the next drill
+# that wants rocks dies with "unknown --engine". Harmless here only by
+# accident of ordering — reseed happens to rebuild with rocks a few drills
+# later. gates.sh now lints for this.
+cargo build --release -q -p flint-server -p flint-controlplane -p flint-ctl \
+  --features flint-server/rocks
 
 cat > "$INV" <<EOF
 disposable on

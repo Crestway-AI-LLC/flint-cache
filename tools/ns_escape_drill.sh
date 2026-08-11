@@ -31,7 +31,15 @@ fleet_kill server; fleet_kill proxy; sleep 0.4
 cleanup() { fleet_kill server; fleet_kill proxy; rm -rf "$D"; }
 trap cleanup EXIT
 
-cargo build --release -q -p flint-server -p flint-proxy
+# The FEATURE FLAG IS NOT OPTIONAL, even though this drill only ever runs
+# `--engine mem`. `cargo build -p flint-server` without it REPLACES the
+# shared ./target/release/flint-server with a mem-only binary, and every
+# later drill in the gate that starts `--engine rocks` then dies with
+# "unknown --engine 'rocks'" and reports "nothing listening". The first
+# version of this file did exactly that and took out tenant_quota,
+# token_rotation and cert_reload_fleet — three failures that looked like a
+# proxy bug and were this line.
+cargo build --release -q -p flint-server -p flint-proxy --features flint-server/rocks
 
 $B --port 6851 --engine mem 2>"$D/node.log" &
 fleet_wait_listen 6851
