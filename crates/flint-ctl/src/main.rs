@@ -3595,7 +3595,11 @@ fn status_json(inv: &Inventory) {
     //
     // First CP that answers wins. They serve the same journal, and asking
     // all of them would concatenate duplicates into a fake history.
-    match inv.cp.iter().find_map(|s| journal_head(s, &tls, JOURNAL_HEAD_N)) {
+    match inv
+        .cp
+        .iter()
+        .find_map(|s| journal_head(s, &tls, JOURNAL_HEAD_N))
+    {
         Some(lines) => {
             out.push_str("  \"journal_head\": [");
             out.push_str(
