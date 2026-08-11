@@ -1,5 +1,8 @@
 # Rust
-/target/
+# No trailing slash: `/target/` matches only a DIRECTORY, so a target/ that
+# has been symlinked onto another disk shows up as untracked and can be
+# committed by `git add -A` — as an absolute path to somebody's mount point.
+/target
 **/*.rs.bk
 Cargo.lock.orig
 
