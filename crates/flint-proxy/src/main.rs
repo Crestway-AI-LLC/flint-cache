@@ -1201,6 +1201,20 @@ fn fan_out(
     combine(replies)
 }
 
+/// Commands the proxy must NEVER relay to a backend, in any connection
+/// state — authenticated or not, inside a transaction or not.
+///
+/// `FLINT*` is the node's INTERNAL admin surface. The data port trusts its
+/// callers about the namespace (`FLINTNS <ns>` is how the proxy itself pins
+/// a backend connection), so relaying one from a tenant hands that tenant
+/// the ability to re-point its connection at any namespace it can name.
+///
+/// Uppercased first: the wire is case-insensitive and `flintns` is the same
+/// command.
+fn is_internal_only(name: &[u8]) -> bool {
+    name.to_ascii_uppercase().starts_with(b"FLINT")
+}
+
 /// Outcome of the per-command auth check.
 enum AuthStep {
     /// Answer the client directly (AUTH result, NOAUTH, WRONGPASS).
@@ -1614,28 +1628,51 @@ fn serve_client<S: Read + Write>(mut stream: S, topo: Arc<Topology>) -> std::io:
                     // backend round trip, MOVED/failover retries — is what
                     // the client waits for.
                     let started = Instant::now();
-                    let reply = match auth_step(
-                        &topo,
-                        &mut authed_ns,
-                        &mut replica_reads,
-                        &mut local_cache,
-                        &mut async_writes,
-                        &mut is_admin,
-                        &mut proto,
-                        &args,
-                    ) {
-                        AuthStep::Reply(v) => v,
-                        AuthStep::Proceed(ns) => data_command(
+                    // REFUSED HERE, BEFORE ANYTHING CAN FORWARD IT.
+                    //
+                    // The per-command match further down also refuses
+                    // `FLINT*`, but only on the path that reaches it. Inside
+                    // a MULTI, `transaction_step` relays the raw bytes to the
+                    // backend and returns before that match is consulted — so
+                    // the refusal held outside a transaction and not inside
+                    // one. A tenant could open MULTI, send `FLINTNS <other>`,
+                    // and re-point its own backend connection at another
+                    // tenant's namespace: full read and write access to
+                    // anyone whose namespace name they could guess.
+                    //
+                    // The property wanted is "these bytes never leave the
+                    // proxy", and that is only true if it is checked before
+                    // any code that could forward them. Checked pre-auth
+                    // deliberately: an unauthenticated connection has no more
+                    // business naming a namespace than an authenticated one.
+                    let reply = if args.first().is_some_and(|n| is_internal_only(n)) {
+                        Value::Error(
+                            "ERR admin commands are not available through the proxy".into(),
+                        )
+                    } else {
+                        match auth_step(
                             &topo,
-                            &mut backends,
-                            &mut txn,
-                            &ns,
+                            &mut authed_ns,
+                            &mut replica_reads,
+                            &mut local_cache,
+                            &mut async_writes,
+                            &mut is_admin,
+                            &mut proto,
                             &args,
-                            &raw,
-                            replica_reads,
-                            local_cache,
-                            async_writes,
-                        ),
+                        ) {
+                            AuthStep::Reply(v) => v,
+                            AuthStep::Proceed(ns) => data_command(
+                                &topo,
+                                &mut backends,
+                                &mut txn,
+                                &ns,
+                                &args,
+                                &raw,
+                                replica_reads,
+                                local_cache,
+                                async_writes,
+                            ),
+                        }
                     };
                     // Record into this tenant's read/write histogram — data
                     // commands only (the D1 classifier; AUTH/PROXY* are
