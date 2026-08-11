@@ -171,6 +171,10 @@ struct ChannelGrant {
 /// Per-namespace token bucket state (tokens, last refill).
 type BucketMap = HashMap<Vec<u8>, (f64, Instant)>;
 
+/// Co-processor connection pool (ADR-0010 D6): endpoint -> idle connections,
+/// each a stream plus its read buffer (as `Backends` keeps them).
+type CoprocPool = HashMap<String, Vec<(flint_tls::Stream, Vec<u8>)>>;
+
 struct HotKeySketch {
     /// Capped at K entries (space-saving).
     entries: std::sync::Mutex<HotKeyMap>,
@@ -420,6 +424,21 @@ struct Topology {
     /// is NOT a known read or write — takes the family path instead of routing
     /// to a backend; anything unregistered routes exactly as before.
     families: RwLock<Vec<(Vec<u8>, Vec<String>)>>,
+    /// Co-processor connection pool (ADR-0010 D6): endpoint -> idle connections.
+    /// Proxy-GLOBAL and shared across clients — a co-processor connection carries
+    /// no per-tenant state (the namespace rides the channel token, not the
+    /// socket), so unlike the per-client tenant `Backends` this one pool serves
+    /// everyone. Synchronous: one family command per connection, checked out
+    /// then returned. Dials via `backend_tls` (mutual TLS to the co-processor's
+    /// serverAuth leaf in prod, plaintext when unset). Unbounded here; step 4
+    /// (D3) adds the size cap and the shed order.
+    coproc_pool: std::sync::Mutex<CoprocPool>,
+    /// This proxy's ADVERTISED edge address (`--edge-advertise`), handed to a
+    /// co-processor as the `PROXYCHAN` callback (D6) — not derived from the
+    /// accept socket, since the inbound peer address is not a reachable edge.
+    /// `None` => the forward has no callback to hand out and answers
+    /// `-COPROCUNAVAIL`.
+    edge_advertise: Option<String>,
 }
 
 impl Topology {
@@ -442,6 +461,88 @@ impl Topology {
         if let Ok(mut f) = self.families.write() {
             *f = parse_families(s);
         }
+    }
+
+    /// The co-processor endpoints registered for the family `name` matches, or
+    /// empty if none (ADR-0010 D1).
+    fn family_endpoints(&self, name: &[u8]) -> Vec<String> {
+        let upper = name.to_ascii_uppercase();
+        self.families
+            .read()
+            .ok()
+            .and_then(|f| {
+                f.iter()
+                    .find(|(p, _)| upper.starts_with(p.as_slice()))
+                    .map(|(_, addrs)| addrs.clone())
+            })
+            .unwrap_or_default()
+    }
+
+    /// Mint a single-use channel token for (ns, budget, deadline) and record
+    /// it (ADR-0010 D2). Shared by `PROXYCHANMINT` and the family forward.
+    /// Sweeps dead entries first so the table cannot grow without bound.
+    fn mint_channel_token(&self, ns: &[u8], budget: u64, deadline: Instant) -> Option<String> {
+        let token = flint_tls::mint_token();
+        let mut tokens = self.channel_tokens.lock().ok()?;
+        let now = Instant::now();
+        tokens.retain(|_, g| !g.used && g.deadline > now);
+        tokens.insert(
+            token.clone(),
+            ChannelGrant {
+                ns: ns.to_vec(),
+                budget,
+                deadline,
+                used: false,
+            },
+        );
+        Some(token)
+    }
+
+    /// Send one `FLINTFAM` frame to the first reachable co-processor endpoint
+    /// and return its reply (ADR-0010 D6). Synchronous and pooled: check out an
+    /// idle connection or dial a new one, exchange, return it on success / drop
+    /// it on failure. The pool lock is held ONLY across checkout and return,
+    /// never across the blocking exchange — D3's "no lock the data path needs
+    /// is held across a co-processor call". `deadline` bounds the I/O.
+    fn coproc_call(&self, endpoints: &[String], frame: &[u8], deadline: Duration) -> Result<Value, ()> {
+        for addr in endpoints {
+            // Try a pooled connection first, then a fresh dial. A pooled
+            // connection can be stale — the co-processor idled it out — without
+            // the endpoint being down, so a single pooled failure must not
+            // condemn the endpoint before a fresh dial is tried.
+            let pooled = self
+                .coproc_pool
+                .lock()
+                .ok()
+                .and_then(|mut p| p.get_mut(addr).and_then(|v| v.pop()));
+            for (from_pool, conn) in [(true, pooled), (false, None)] {
+                let (mut stream, mut buf) = match conn {
+                    Some(c) => c,
+                    // No pooled connection: fall through to the fresh-dial pass.
+                    None if from_pool => continue,
+                    None => match flint_tls::connect_reloadable(addr, &self.backend_tls) {
+                        Ok(s) => (s, Vec::new()),
+                        Err(_) => break, // endpoint down; next endpoint
+                    },
+                };
+                let _ = stream.set_read_timeout(Some(deadline));
+                let _ = stream.set_write_timeout(Some(deadline));
+                match call_raw(&mut stream, &mut buf, frame) {
+                    Ok(v) => {
+                        if let Ok(mut p) = self.coproc_pool.lock() {
+                            p.entry(addr.clone()).or_default().push((stream, buf));
+                        }
+                        return Ok(v);
+                    }
+                    // A failed exchange may have desynchronised the reply stream:
+                    // drop the connection (never return it). A pooled failure
+                    // falls to the fresh dial; a fresh-dial failure ends this
+                    // endpoint. Same discipline `Backends::call` follows.
+                    Err(_) => continue,
+                }
+            }
+        }
+        Err(())
     }
 
     /// The address a command for `slot` in `ns` should go to right now.
@@ -1336,24 +1437,11 @@ fn auth_step(
         else {
             return AuthStep::Reply(Value::Error("ERR deadline-ms must be an integer".into()));
         };
-        let token = flint_tls::mint_token();
         let deadline = Instant::now() + std::time::Duration::from_millis(deadline_ms);
-        let Ok(mut tokens) = topo.channel_tokens.lock() else {
-            return AuthStep::Reply(Value::Error("ERR channel token lock".into()));
+        return match topo.mint_channel_token(ns, budget, deadline) {
+            Some(token) => AuthStep::Reply(Value::Bulk(Some(token.into_bytes()))),
+            None => AuthStep::Reply(Value::Error("ERR channel token lock".into())),
         };
-        // Sweep dead entries first, so the table cannot grow without bound.
-        let now = Instant::now();
-        tokens.retain(|_, g| !g.used && g.deadline > now);
-        tokens.insert(
-            token.clone(),
-            ChannelGrant {
-                ns: ns.clone(),
-                budget,
-                deadline,
-                used: false,
-            },
-        );
-        return AuthStep::Reply(Value::Bulk(Some(token.into_bytes())));
     }
     if name.as_deref() == Some(b"PROXYCHAN") {
         // Opened on a FRESH connection: a channel must never be layerable onto
@@ -2198,17 +2286,62 @@ fn parse_families(s: &str) -> Vec<(Vec<u8>, Vec<String>)> {
     out
 }
 
-/// Handle a registered family command (ADR-0010 D1/D2). Step 3 lands the route
-/// table and this recognition; the FORWARD to a co-processor — dialing an
-/// endpoint, minting a channel token, relaying the reply — is the next slice
-/// and needs its own backend pool (D3, step 4). Until a co-processor is
-/// reachable, a recognized family answers `-COPROCUNAVAIL` — which is ALSO the
-/// correct steady-state reply when a registered family's endpoints are all
-/// down (ADR-0015's agent watches for exactly this). `topo`/`ns`/`args` are
-/// threaded now because the forward slice needs the endpoint set, the channel
-/// namespace, and the command to forward.
-fn family_command(_topo: &Topology, _ns: &[u8], _args: &[Vec<u8>]) -> Value {
-    Value::Error("COPROCUNAVAIL no co-processor is available for this command family".into())
+/// A family channel's data-command budget and deadline, fixed at token-mint
+/// time (ADR-0010 D3). The deadline is enforced by the channel loop (step 2);
+/// the budget is recorded now and enforced in step 4. Constants here; step 4
+/// makes them configurable and measures them (drills 4 and 6).
+const FAMILY_CHANNEL_BUDGET: u64 = 256;
+const FAMILY_CHANNEL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Handle a registered family command (ADR-0010 D1/D2/D6). Charge the tenant
+/// once, mint a single-use channel token, and forward
+/// `FLINTFAM <token> <callback> <command…>` to a co-processor over the pooled,
+/// synchronous hop, relaying its reply. A co-processor's OWN `-ERR` is relayed
+/// as-is (its logic said no); a TRANSPORT failure — no endpoint, dial refused,
+/// deadline, dropped reply — and a missing callback both become
+/// `-COPROCUNAVAIL`, kept distinct from the unknown-command error a non-family
+/// command earns from the master (reading one as the other is how an outage is
+/// misdiagnosed, D3).
+fn family_command(topo: &Topology, ns: &[u8], args: &[Vec<u8>]) -> Value {
+    let unavail =
+        || Value::Error("COPROCUNAVAIL no co-processor is available for this command family".into());
+    let Some(name) = args.first() else {
+        return unavail();
+    };
+    let endpoints = topo.family_endpoints(name);
+    if endpoints.is_empty() {
+        return unavail();
+    }
+    // The co-processor calls back over PROXYCHAN to this address (D6); with no
+    // advertised edge there is nowhere to call back.
+    let Some(callback) = topo.edge_advertise.clone() else {
+        return unavail();
+    };
+    // D1: charge the tenant ONCE, at admission, before the dial. If shed
+    // (throttled), the command is not forwarded — nothing was admitted.
+    if let Some(shed) = topo.quota_gate(ns, name, false) {
+        return shed;
+    }
+    // Mint the single-use channel token the co-processor will PROXYCHAN with.
+    let deadline = Instant::now() + FAMILY_CHANNEL_DEADLINE;
+    let Some(token) = topo.mint_channel_token(ns, FAMILY_CHANNEL_BUDGET, deadline) else {
+        return unavail();
+    };
+    // FLINTFAM <token> <callback> <original command…>. FLINTFAM is safe as a
+    // proxy-only verb because the edge refuses every FLINT* before auth (#151),
+    // so a client can never speak it.
+    let token_b = token.into_bytes();
+    let callback_b = callback.into_bytes();
+    let mut parts: Vec<&[u8]> = Vec::with_capacity(args.len() + 3);
+    parts.push(b"FLINTFAM");
+    parts.push(&token_b);
+    parts.push(&callback_b);
+    parts.extend(args.iter().map(|a| a.as_slice()));
+    let frame = encode_cmd(&parts);
+    match topo.coproc_call(&endpoints, &frame, FAMILY_CHANNEL_DEADLINE) {
+        Ok(v) => v,
+        Err(()) => unavail(),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2834,6 +2967,8 @@ fn main() -> std::io::Result<()> {
         last_promote_hint: RwLock::new(String::new()),
         channel_tokens: std::sync::Mutex::new(HashMap::new()),
         families: RwLock::new(parse_families(&arg("--families").unwrap_or_default())),
+        coproc_pool: std::sync::Mutex::new(HashMap::new()),
+        edge_advertise: arg("--edge-advertise"),
         admin_digests: RwLock::new(
             arg("--admin-token")
                 .map(|t| vec![flint_tls::sha256_hex(t.as_bytes())])
@@ -2976,6 +3111,8 @@ mod route_tests {
             last_promote_hint: RwLock::new(String::new()),
             channel_tokens: std::sync::Mutex::new(HashMap::new()),
             families: RwLock::new(Vec::new()),
+            coproc_pool: std::sync::Mutex::new(HashMap::new()),
+            edge_advertise: None,
         }
     }
 
