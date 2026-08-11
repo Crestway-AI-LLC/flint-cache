@@ -28,3 +28,5 @@ New references should use the path, so a reader can follow them.
 | `0005-oneshot-kills-its-own-seat.md` | a systemd oneshot killed the daemons it spawned |
 | `0006-silent-bootstrap-fakes-auth-failures.md` | a silent drill bootstrap reports WRONGPASS on a token it never created |
 | `0007-armed-clock-blames-replica-kill.md` | ledger judged old-master acks by the pre-kill clock; a replica kill got blamed for a master kill's loss |
+| `0008-cold-start-of-a-failed-over-pair.md` | cold start of a failed-over pair replicated nothing |
+| `0009-unknown-stage-passes-the-gate.md` | an unrecognised stage argument ran nothing and printed GATES PASSED |

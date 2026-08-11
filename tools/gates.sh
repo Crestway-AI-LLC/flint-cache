@@ -36,7 +36,8 @@ set -u
 #
 # That is the failure this whole file was written against — a check that
 # verifies nothing and reads as green — arriving through the argument channel.
-# Found 2026-08-11 while adding bloom to CORE.
+# Found 2026-08-11 while adding bloom to CORE;
+# docs/bugs/0009-unknown-stage-passes-the-gate.md is the write-up.
 #
 # So: fail closed on any unrecognised stage, and serve --help deliberately
 # rather than through the same hole.
@@ -62,8 +63,13 @@ for arg in "$@"; do
         echo
         usage
         echo
-        echo "Refusing to run. An unrecognised stage used to run no stage at"
-        echo "all and still print GATES PASSED, which is worse than an error."
+        # Deliberately NOT the words of the verdict line: anything grepping
+        # this output for the pass string must not match an explanation of
+        # it. The same collision in the other direction (`^error` matching a
+        # drill's "errors: 0") is recorded below.
+        echo "Refusing to run. An unrecognised stage used to select no stage"
+        echo "at all and still report the gate as green, which is worse than"
+        echo "an error."
       } >&2
       exit 2 ;;
   esac
@@ -97,7 +103,7 @@ CORE="restart repl failover proxy slot_migrate slot_map rebalance_execute
       build_stamp config_drift tenant_status proxy_conformance edge_roll
       cpha_roll admin_gated_proxy edge_ca_trust
       cert_rotate control_tls controller_ha controller_managed
-      controller_multipair controlplane cp_publish internal_mtls json lease
+      controller_multipair controlplane cp_publish gates internal_mtls json lease
       m3_exit migrate_slots min_replicas node_tls proxy_backpressure
       proxy_cache proxy_tls replica_reads replica_stale_fence rw_isolation
       scan slot_cutover slot_cutover_recovery slot_moved snapshot_restore
