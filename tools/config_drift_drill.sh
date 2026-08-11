@@ -87,6 +87,61 @@ echo "$J" | grep -q '"drift": \[\]' || {
   echo "FAIL: a matched pair reported drift:"; echo "$J" | grep -A2 '"drift"'; exit 1; }
 echo "  drift: []"
 
+# ADR-0014 D2 lists the fleet-journal head among what `--json` carries. It
+# was specified, never built, and never recorded as dropped — the as-built
+# note just stopped mentioning it, so for months the ADR described a key the
+# document did not have. Asserted here so it cannot quietly leave again.
+#
+# The KEY's presence is the assertion, not its contents: a fresh drill fleet
+# may legitimately have written nothing yet, so requiring events would make
+# this flaky for the wrong reason. What must never happen is the key going
+# missing, or reading `null` when a CP is right there answering.
+echo "== the fleet-journal head is in the document"
+echo "$J" | grep -q '"journal_head":' || {
+  echo "FAIL: --json has no journal_head key. ADR-0014 D2 lists it; if it was"
+  echo "      removed on purpose, the ADR has to say so — silently dropping a"
+  echo "      documented field is how it went missing the first time."
+  exit 1; }
+echo "$J" | grep -q '"journal_head": null' && {
+  echo "FAIL: journal_head is null while the CP is up and answering CPINFO."
+  echo "      null means NO CP COULD BE ASKED; an empty array means one was"
+  echo "      and the journal is empty. Collapsing them tells a reader the"
+  echo "      fleet has done nothing during a control-plane outage."
+  exit 1; }
+echo "  journal_head present, and not null while the CP answers"
+
+# POSITIVE CONTROL on that check: with no CP reachable it MUST read null.
+# Asserting only the healthy case would pass just as well against a field
+# hardcoded to `[]`, which is the failure the null/empty split exists to
+# prevent — so prove the null branch is reachable by taking the CP away.
+echo "== with no CP to ask, journal_head is null (not an empty array)"
+JN=$(FLINT_ROLL_GRACE_MS=0 ./target/release/flintctl -f /dev/stdin status --json 2>/dev/null <<INV || true
+statedir $STATE
+bins ./target/release
+cp 127.0.0.1:7999
+pair 127.0.0.1:7421,127.0.0.1:7422
+INV
+)
+case "$JN" in
+  *'"journal_head": null'*) echo "  journal_head: null — the branch is reachable" ;;
+  *) echo "FAIL: an unreachable CP did not produce journal_head: null."
+     echo "$JN" | grep -o '"journal_head":[^,]*' | head -1
+     exit 1 ;;
+esac
+# Same question of a field that answers it wrongly until now. `controllers`
+# keyed off whether a CP was CONFIGURED rather than whether one ANSWERED, so
+# a dead CP produced `[]` — "asked, none exist" — during the outage when the
+# difference matters most. Asserted alongside journal_head because the two
+# are read together and a reader cannot tell which one to believe.
+case "$JN" in
+  *'"controllers": null'*) echo "  controllers: null — asked-and-empty is distinguishable from could-not-ask" ;;
+  *) echo "FAIL: an unreachable CP reported controllers as something other than null:"
+     echo "$JN" | grep -o '"controllers":[^,]*' | head -1
+     echo "      [] here means 'a CP answered and knows of no controllers', which"
+     echo "      is a claim nothing established."
+     exit 1 ;;
+esac
+
 echo "== uptime_ms is present and advancing (the suppression depends on it)"
 U1=$(valkey-cli -p 7421 FLINTINFO 2>/dev/null | tr -d '\r' | sed -n 's/^uptime_ms://p')
 [ -n "$U1" ] || { echo "FAIL: FLINTINFO has no uptime_ms — the roll-grace check has nothing to read"; exit 1; }

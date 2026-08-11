@@ -42,7 +42,8 @@ it needs two release builds with different baked tags.
 
 D2 as built: `flintctl status --json` renders the whole fleet — every
 seat's build, each node's full `FLINTINFO`, the controller rows the CP is
-repeating back — and carries a `drift` array comparing `lag_soft_ms`,
+repeating back, the newest ten fleet-journal lines as `journal_head` — and
+carries a `drift` array comparing `lag_soft_ms`,
 `lag_hard_ms`, `min_replicas_to_write`, `widowed_grace_ms`, `fullsync_max`,
 `wal_fsync_ms` and `max_conns` between the members of each pair. State is
 deliberately excluded from that comparison: role and lag differ between a
@@ -61,6 +62,25 @@ that boundary and asserts a healthy pair reports nothing.
 
 `--json` exits 0 with drift present: D2 REPORTS, it does not reconcile. The
 array is always emitted, empty when clean, so a caller can gate on it.
+
+`journal_head` arrived late, and the reason is worth recording. The Decision
+above listed it from the start; the first as-built note simply stopped
+mentioning it, so for months this ADR described a key the document did not
+have — neither built nor consciously dropped. Nothing was wrong at any one
+step and no single diff said a capability was going, which is the same shape
+as the release-signing step that left with `release.yml`. Lines are strings
+rather than spliced-in JSON: each IS a JSON object, but #116 was two JSON
+objects on one journal line, and one malformed line must not be able to make
+the whole status document unparseable.
+
+Adding it also exposed a defect in the field beside it. `controllers` chose
+`null` on `inv.cp.is_empty()` — whether a CP was CONFIGURED, not whether one
+ANSWERED — so a fleet whose CP was down reported `controllers: []`, meaning
+"asked, and there are none", during precisely the outage when a reader needs
+"could not ask". Found because the positive control for `journal_head`
+pointed an inventory at a dead CP and the two fields disagreed. Both now key
+off an answer, and `config_drift_drill.sh` asserts the unreachable-CP case
+for both — a null branch nothing exercises is a null branch that rots.
 
 D3 as built: `CPMYSTATUS <token>` on the control plane, behind the same
 token-digest lookup `CPMYUSAGE` already uses — no second authentication

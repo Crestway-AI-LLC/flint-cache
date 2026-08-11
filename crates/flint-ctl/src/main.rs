@@ -671,6 +671,36 @@ fn cpinfo_controllers(
     )
 }
 
+/// How many fleet-journal lines the status document carries. The HEAD, not
+/// the journal: this is a snapshot taken beside the fleet's configuration,
+/// and a caller who wants history has `CPJOURNALREAD` directly.
+const JOURNAL_HEAD_N: usize = 10;
+
+/// The newest fleet-journal lines, as the CP serves them.
+///
+/// `None` when no CP answered, `Some(vec![])` when one did and the journal is
+/// empty — the same distinction `controllers` makes, and for the same reason:
+/// during a roll, "nothing could be asked" and "nothing has happened" look
+/// identical once collapsed, and only one of them is reassuring.
+fn journal_head(
+    addr: &str,
+    tls: &Option<Arc<flint_tls::ClientConfig>>,
+    n: usize,
+) -> Option<Vec<String>> {
+    let n = n.to_string();
+    let Ok(Value::Bulk(Some(raw))) = call(addr, tls, &["CPJOURNALREAD", &n]) else {
+        return None;
+    };
+    Some(
+        String::from_utf8_lossy(&raw)
+            .split('\n')
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect(),
+    )
+}
+
 /// One `key:` line out of a proxy's PROXYSTATS.
 ///
 /// Admin-gating tolerance matches `proxy_up`: a -NOAUTH proxy is up, it just
@@ -3393,6 +3423,8 @@ fn status_json(inv: &Inventory) {
 
     out.push_str("  \"cp\": [\n");
     let mut controllers: Vec<String> = Vec::new();
+    // Did any CP actually answer? Not "is one configured" — see below.
+    let mut answered = false;
     for (i, seat) in inv.cp.iter().enumerate() {
         let up = matches!(call(seat, &tls, &["PING"]), Ok(Value::Simple(s)) if s == "PONG");
         let build = cpinfo_field(seat, &tls, "build:");
@@ -3404,6 +3436,7 @@ fn status_json(inv: &Inventory) {
             if i + 1 < inv.cp.len() { "," } else { "" }
         ));
         if let Some(rows) = cpinfo_controllers(seat, &tls) {
+            answered = true;
             controllers.extend(rows);
         }
     }
@@ -3413,7 +3446,17 @@ fn status_json(inv: &Inventory) {
     // design. `null` vs `[]` is load-bearing — null means no CP could be
     // reached to ask, [] means one was and knows of none, and during a
     // roll those mean very different things.
-    if inv.cp.is_empty() {
+    //
+    // The condition used to be `inv.cp.is_empty()`, which is not that
+    // distinction: it asks whether a CP was CONFIGURED, not whether one
+    // ANSWERED. A fleet with a CP in its inventory that was down reported
+    // `controllers: []` — "asked, and there are none" — during exactly the
+    // control-plane outage when a reader most needs to know the answer is
+    // unavailable rather than empty. Found by the positive control on
+    // journal_head: pointing an inventory at a dead CP showed
+    // `journal_head: null` beside `controllers: []`, and only one of them
+    // could be right.
+    if !answered {
         out.push_str("  \"controllers\": null,\n");
     } else {
         out.push_str("  \"controllers\": [");
@@ -3537,6 +3580,38 @@ fn status_json(inv: &Inventory) {
         ));
     }
     out.push_str("  ],\n");
+
+    // ADR-0014 D2 named "the fleet-journal head" among what this document
+    // carries. It was never built and never recorded as dropped — the
+    // as-built note simply stopped mentioning it, so the ADR claimed
+    // something the code did not do. Same shape as the signing step that
+    // left with release.yml: nothing wrong at any one step, and no single
+    // diff that said a capability was going.
+    //
+    // Lines are emitted as STRINGS, not spliced in as raw JSON, even though
+    // each is a JSON object. #116 was two JSON objects on one journal line;
+    // splicing would let one malformed line make the whole status document
+    // unparseable, which is a bad trade for saving the caller a `fromjson`.
+    //
+    // First CP that answers wins. They serve the same journal, and asking
+    // all of them would concatenate duplicates into a fake history.
+    match inv.cp.iter().find_map(|s| journal_head(s, &tls, JOURNAL_HEAD_N)) {
+        Some(lines) => {
+            out.push_str("  \"journal_head\": [");
+            out.push_str(
+                &lines
+                    .iter()
+                    .map(|l| json_str(l))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            );
+            out.push_str("],\n");
+        }
+        // null, not []: no CP could be asked. An empty array here would say
+        // the fleet has done nothing, which during a control-plane outage is
+        // the most misleading thing this document could report.
+        None => out.push_str("  \"journal_head\": null,\n"),
+    }
 
     out.push_str("  \"drift\": [");
     out.push_str(
