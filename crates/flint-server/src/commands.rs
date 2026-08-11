@@ -3161,6 +3161,82 @@ mod tests {
     }
 
     #[test]
+    fn flushall_is_namespace_scoped() {
+        // FLUSHALL is a fan-out command: the proxy sends it to every master
+        // on a backend connection pinned to ONE tenant's namespace
+        // (Backends::call). Its blast radius is therefore a SERVER promise —
+        // a tenant flushing its own keyspace must never touch another
+        // tenant's rows, where a naive kv.clear() would wipe the shared
+        // store. The FLINTNS-escape fix (proxy #151) stops a tenant naming
+        // another namespace; this guards the other half: that a legitimately
+        // scoped FLUSHALL stays scoped. Seeds string + hash + zset so a
+        // regression in any one of the three CFs the handler clears
+        // (Metadata, Subkey, ZScore) is caught, not just the string case.
+        let s = MemKv::new();
+        let a = Dispatcher::with_limits(&s, system_clock, Limits::default(), b"tenant-a");
+        let b = Dispatcher::with_limits(&s, system_clock, Limits::default(), b"tenant-b");
+        for d in [&a, &b] {
+            d.dispatch(&[b"SET".to_vec(), b"str".to_vec(), b"v".to_vec()]);
+            d.dispatch(&[b"HSET".to_vec(), b"hash".to_vec(), b"f".to_vec(), b"v".to_vec()]);
+            d.dispatch(&[b"ZADD".to_vec(), b"zset".to_vec(), b"1".to_vec(), b"m".to_vec()]);
+        }
+        // Control: B holds its own data before A's flush.
+        assert_eq!(
+            b.dispatch(&[b"GET".to_vec(), b"str".to_vec()]),
+            Value::Bulk(Some(b"v".to_vec()))
+        );
+
+        assert_eq!(a.dispatch(&[b"FLUSHALL".to_vec()]), Value::Simple("OK".into()));
+
+        // A's keyspace is empty across all three types.
+        assert_eq!(
+            a.dispatch(&[b"GET".to_vec(), b"str".to_vec()]),
+            Value::Bulk(None)
+        );
+        assert_eq!(
+            a.dispatch(&[b"HGET".to_vec(), b"hash".to_vec(), b"f".to_vec()]),
+            Value::Bulk(None)
+        );
+        assert_eq!(
+            a.dispatch(&[b"ZSCORE".to_vec(), b"zset".to_vec(), b"m".to_vec()]),
+            Value::Null
+        );
+        assert_eq!(a.dispatch(&[b"DBSIZE".to_vec()]), Value::Integer(0));
+
+        // B is UNTOUCHED across all three types.
+        assert_eq!(
+            b.dispatch(&[b"GET".to_vec(), b"str".to_vec()]),
+            Value::Bulk(Some(b"v".to_vec()))
+        );
+        assert_eq!(
+            b.dispatch(&[b"HGET".to_vec(), b"hash".to_vec(), b"f".to_vec()]),
+            Value::Bulk(Some(b"v".to_vec()))
+        );
+        assert!(matches!(
+            b.dispatch(&[b"ZSCORE".to_vec(), b"zset".to_vec(), b"m".to_vec()]),
+            Value::Double(_)
+        ));
+    }
+
+    #[test]
+    fn dbsize_is_namespace_scoped() {
+        // The other fan-out command. A tenant must count only its own keys,
+        // never the shared backend's cross-tenant total.
+        let s = MemKv::new();
+        let a = Dispatcher::with_limits(&s, system_clock, Limits::default(), b"tenant-a");
+        let b = Dispatcher::with_limits(&s, system_clock, Limits::default(), b"tenant-b");
+        for i in 0..3 {
+            a.dispatch(&[b"SET".to_vec(), format!("a{i}").into_bytes(), b"v".to_vec()]);
+        }
+        for i in 0..7 {
+            b.dispatch(&[b"SET".to_vec(), format!("b{i}").into_bytes(), b"v".to_vec()]);
+        }
+        // Each sees only its own count, not the 10 rows in the shared store.
+        assert_eq!(a.dispatch(&[b"DBSIZE".to_vec()]), Value::Integer(3));
+        assert_eq!(b.dispatch(&[b"DBSIZE".to_vec()]), Value::Integer(7));
+    }
+
+    #[test]
     fn json_document_lifecycle_and_paths() {
         let s = MemKv::new();
         // Root write creates the document; TYPE and GET see it.
