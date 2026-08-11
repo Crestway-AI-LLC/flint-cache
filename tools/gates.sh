@@ -22,6 +22,54 @@
 # Logs land in $FLINT_GATE_LOGS (default /tmp/flint-gates) — one file per
 # step, kept whether it passed or failed.
 set -u
+
+# STAGE ARGUMENTS, validated before anything else runs.
+#
+# This was one line — `STAGES="${*:-check conformance drills chaos}"`, with a
+# `want()` that substring-matched against it — so an argument that was not a
+# stage name matched nothing at all: every stage was skipped, FAILED stayed
+# empty, and the script printed "GATES PASSED" and exited 0. `gates.sh --help`
+# and `gates.sh drill` (the stage is `drills`) were both a green run of
+# nothing, in under a second, and the singular/plural slip is the typo made at
+# 1am. The release checklist names this script as the authority, so the answer
+# it gave for an unrecognised argument was the most expensive one available.
+#
+# That is the failure this whole file was written against — a check that
+# verifies nothing and reads as green — arriving through the argument channel.
+# Found 2026-08-11 while adding bloom to CORE.
+#
+# So: fail closed on any unrecognised stage, and serve --help deliberately
+# rather than through the same hole.
+#
+# Parsed BEFORE the `cd` (so $0 still resolves against the caller's directory)
+# and before the log directory is cleared — `--help` should not delete the
+# previous run's logs on its way to printing a usage block.
+ALL_STAGES="check conformance drills chaos"
+want() { case " ${STAGES} " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
+
+# The header comment IS the usage text, printed out of the file itself. One
+# copy, for the same reason the CORE list below has no second home.
+usage() { awk '/^# Usage:/{u=1} u&&!/^#/{exit} u{sub(/^# ?/,""); print}' "$0"; }
+
+for arg in "$@"; do
+  case "$arg" in -h|--help) usage; exit 0 ;; esac
+done
+for arg in "$@"; do
+  case " $ALL_STAGES " in
+    *" $arg "*) ;;
+    *)
+      { echo "gates.sh: unrecognised stage: $arg"
+        echo
+        usage
+        echo
+        echo "Refusing to run. An unrecognised stage used to run no stage at"
+        echo "all and still print GATES PASSED, which is worse than an error."
+      } >&2
+      exit 2 ;;
+  esac
+done
+STAGES="${*:-$ALL_STAGES}"
+
 cd "$(dirname "$0")/.."
 
 LOGS="${FLINT_GATE_LOGS:-/tmp/flint-gates}"
@@ -90,6 +138,11 @@ CHAOS="chaos proxy_chaos chaos_unreadable hotkey_chaos"
 # So the environment that trusts the result is the environment that must
 # refuse a skip.
 FAILED=""
+# Steps actually executed. A gate that ran nothing must not report a pass, and
+# the argument validation above is only the hole we know about — this counts
+# the work instead of trusting the dispatch, so a future refactor cannot
+# reintroduce a green run of nothing by some other route.
+RAN_STEPS=0
 # Seats a drill left behind. The gate starts from a box with no Flint on it
 # (assert_clean_box below), and every drill is supposed to clean up after
 # itself, so anything alive after drill N came FROM drill N.
@@ -109,6 +162,7 @@ _leaked_seats() { pgrep -f 'target/release/flint-(server|proxy|controlplane|cont
 step() {  # step <name> <log-suffix> <command...>
   local name="$1" log="$LOGS/$2.log"; shift 2
   local start; start=$(date +%s)
+  RAN_STEPS=$((RAN_STEPS + 1))
   if "$@" >"$log" 2>&1; then
     # `SKIP:` and `SKIP (` are the two forms a drill uses to say "I did not
     # test this because a dependency was missing". Deliberately NOT plain
@@ -190,9 +244,6 @@ licence_check() {
   fi
   cargo deny check licenses
 }
-
-want() { case " ${STAGES} " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
-STAGES="${*:-check conformance drills chaos}"
 
 # FREE DISK, checked before anything runs and named as the host problem it is.
 #
@@ -402,4 +453,12 @@ if [ -n "$FAILED" ]; then
   echo "  logs: $LOGS"
   exit 1
 fi
-echo "GATES PASSED — logs kept in $LOGS"
+if [ "$RAN_STEPS" -eq 0 ]; then
+  echo "GATES DID NOT RUN: stages '$STAGES' executed no steps."
+  echo
+  echo "  This is not a pass. Every stage runs at least one step, so reaching"
+  echo "  here means the dispatch above selected nothing — the shape of the"
+  echo "  unknown-stage bug this guard exists to keep closed. Fix gates.sh."
+  exit 2
+fi
+echo "GATES PASSED — $RAN_STEPS steps, logs kept in $LOGS"
