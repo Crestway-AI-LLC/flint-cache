@@ -233,7 +233,12 @@ and correctness would have to be bought with the atomic batch path.
 ### D7 — The deliberate divergences from RedisBloom
 
 Named here so they are choices on the record rather than gaps found later,
-in the same spirit as JSON's three (docs/command-support.md):
+in the same spirit as JSON's three (docs/command-support.md). Each has a
+case to ITSELF in the conformance corpus — see Verification 3 for why that
+turned out to be load-bearing rather than tidy.
+
+**All four were confirmed against RedisBloom 2.8.16 on 2026-08-11**, which
+is also when the list stopped being three:
 
 1. **`TYPE` returns `bloom`, not `MBbloom--`.** Following the precedent
    already set: Flint's JSON type answers `json` where RedisJSON answers
@@ -245,7 +250,29 @@ in the same spirit as JSON's three (docs/command-support.md):
    end of somebody's migration. Refusing is the honest failure. Importing
    a real RedisBloom dump is a genuine future feature and belongs to a
    format reader, not to a command that pretends.
-3. **Defaults differ** (D5), because a link costs a disk read here.
+3. **`BF.INFO … SIZE` reports MATERIALISED bytes, not reserved ones.** A
+   filter reserved for 5000 items reads 0 here and ~9984 on RedisBloom,
+   because blocks are written lazily (D3) where RedisBloom allocates the
+   whole filter up front. Both answer "how big is this filter" honestly;
+   they answer different questions, and ours is the one that matches what
+   the tenant is billed for and what the disk actually holds.
+4. **An unknown `BF.RESERVE` option is refused, not ignored** — the one
+   divergence where WE are the stricter side. RedisBloom 2.8.16 accepts and
+   silently drops trailing tokens it does not recognise: `BF.RESERVE k 0.01
+   100 WAT WAT WAT` returns `OK`, and so does `EXPANSION notanum`.
+   Matching that would mean a misspelled `NONSCALNG` quietly produces a
+   SCALING filter — the caller believes the size is capped and it grows
+   instead. An error is recoverable in one line; a filter that silently
+   disobeys the flag it was handed is found much later, by capacity.
+
+   Stated as a decision because it has a cost: if RedisBloom later adds an
+   option we do not implement, a client using it gets `OK` there and an
+   error here. That is still the safer direction — the client learns at
+   once instead of getting a filter that ignored the request.
+
+**Defaults also differ** (D5), because a link costs a disk read here. Not
+numbered with the above: it changes what you get when you ask for nothing,
+not how a given command is answered.
 
 ## What we are explicitly NOT building
 
@@ -302,9 +329,36 @@ applies, plus three things it cannot cover:
    that asserts nothing, which is this codebase's most expensive recurring
    bug class (docs/field-notes.md §1).
 3. **`tools/redisbloom_compare.sh`**, mirroring `redisjson_compare.sh`: the
-   same corpus against RedisBloom built from source, asserting the only
-   failures are D7's divergences. Without it, `flint_only("bloom")` means
-   the corpus proves only that Flint matches the contract we wrote.
+   same corpus against a real RedisBloom, asserting the only failures are
+   D7's divergences. Without it, `flint_only("bloom")` means the corpus
+   proves only that Flint matches the contract we wrote.
+
+   **DONE 2026-08-11, against RedisBloom 2.8.16** (`docker run -d -p
+   6391:6379 redis/redis-stack-server`, then `REBLOOM_ADDR=127.0.0.1:6391`).
+   Result: PASS — every non-divergent step agrees — but only after it found
+   two things reasoning had not:
+
+   - **`BF.INFO key FIELD` is a ONE-ELEMENT ARRAY, not a bare value.**
+     RedisBloom answers `*1\r\n:5000\r\n`, and its client libraries index
+     `[0]`. Flint returned `:5000`, so a real client would have broken on
+     the single-field form. This was a genuine compatibility bug written
+     from the documented behaviour, which does not state the shape; only
+     the wire does. Fixed, with the nil for a NONSCALING filter wrapped
+     the same way and a bad section name left as a BARE error, both
+     verified on the wire rather than assumed.
+   - **D7.4 above** — RedisBloom's lax option parsing, which nothing in
+     its documentation mentions.
+
+   Two lessons are now built into the script and the corpus. First, **the
+   run must refuse a non-oracle**: `BF.ADD` answering does not prove the
+   module is loaded, because Flint answers `BF.ADD` too, so the script
+   demands a numeric `bf` version from `MODULE LIST` and fails otherwise.
+   Second, **each divergence gets its own case**, because `run_case` stops
+   a case at its first failing step: on the first run, `TYPE` failing at
+   step 6 of the lifecycle case meant `BF.SCANDUMP` at step 20 was never
+   sent, so a divergence this ADR claimed was under test had never once
+   been exercised against RedisBloom. A gate that cannot reach half its own
+   assertions is not a gate.
 
 And one measurement that gates a constant rather than a behaviour:
 

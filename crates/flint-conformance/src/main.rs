@@ -2600,10 +2600,6 @@ fn corpus() -> Vec<Case> {
                 s(&[b"BF.EXISTS", b"bf", b"a"], Expect::Int(1)),
                 s(&[b"BF.EXISTS", b"bf", b"missing"], Expect::Int(0)),
                 s(&[b"BF.CARD", b"bf"], Expect::Int(1)),
-                // DIVERGENCE (deliberate, ADR-0016 D7.1): RedisBloom
-                // answers its module type name, `MBbloom--`. We answer the
-                // type, matching what JSON already does.
-                s(&[b"TYPE", b"bf"], Expect::Simple("bloom")),
                 s(
                     &[b"BF.MADD", b"bf", b"a", b"b", b"c"],
                     Expect::Arr(vec![Expect::Int(0), Expect::Int(1), Expect::Int(1)]),
@@ -2632,36 +2628,138 @@ fn corpus() -> Vec<Case> {
                 s(&[b"EXISTS", b"t"], Expect::Int(0)),
             ],
         },
+        // The three cases below are SEPARATE because each is a deliberate
+        // divergence from RedisBloom (ADR-0016 D7), and `run_case` stops a
+        // case at its first failing step. Folded into the lifecycle cases,
+        // the first divergence would mask every step after it — which is
+        // exactly what happened the first time this corpus met the real
+        // module: `TYPE` failing at step 6 meant `BF.SCANDUMP` at step 20
+        // was never sent, so a divergence we believed was under test had
+        // never once been exercised against RedisBloom.
         Case {
             family: "bloom",
-            name: "BF.RESERVE parameters, BF.INSERT, and the refused dump",
+            name: "DIVERGENCE D7.1: TYPE names the type, not the module",
             steps: vec![
-                // Error rate FIRST, then capacity — RedisBloom's order.
+                s(&[b"BF.ADD", b"bf", b"a"], Expect::Int(1)),
+                // RedisBloom answers its module type name, `MBbloom--`. We
+                // answer the type, matching what JSON already does.
+                s(&[b"TYPE", b"bf"], Expect::Simple("bloom")),
+            ],
+        },
+        Case {
+            family: "bloom",
+            name: "DIVERGENCE D7.3: BF.INFO SIZE counts materialised bytes",
+            steps: vec![
                 s(&[b"BF.RESERVE", b"r", b"0.001", b"5000"], Expect::Ok),
-                s(&[b"BF.RESERVE", b"r", b"0.001", b"5000"], Expect::AnyError),
-                s(&[b"BF.INFO", b"r", b"CAPACITY"], Expect::Int(5000)),
-                s(&[b"BF.INFO", b"r", b"ITEMS"], Expect::Int(0)),
-                s(&[b"BF.INFO", b"r", b"FILTERS"], Expect::Int(1)),
-                // Nothing on disk until a block is touched (ADR-0016 D3).
-                s(&[b"BF.INFO", b"r", b"SIZE"], Expect::Int(0)),
-                s(&[b"BF.ADD", b"r", b"x"], Expect::Int(1)),
-                s(&[b"BF.EXISTS", b"r", b"x"], Expect::Int(1)),
-                // NONSCALING has no growth factor, reported as nil.
+                // Nothing on disk until a block is touched (ADR-0016 D3),
+                // so a freshly reserved filter is 0 bytes. RedisBloom
+                // allocates the whole filter up front and reports ~6992.
+                // Both are honest answers to "how big is this filter"; they
+                // are answers to different questions, and ours is the one
+                // that matches what the tenant is billed for.
                 s(
-                    &[b"BF.RESERVE", b"n", b"0.01", b"100", b"NONSCALING"],
-                    Expect::Ok,
+                    &[b"BF.INFO", b"r", b"SIZE"],
+                    Expect::Arr(vec![Expect::Int(0)]),
                 ),
-                s(&[b"BF.INFO", b"n", b"EXPANSION"], Expect::Nil),
+                // The full form is asserted HERE, in the case already known
+                // to diverge, because it carries Size inside it. Against
+                // Flint's own engines this is a real regression test on the
+                // whole reply — field names included, which is otherwise
+                // untested anywhere.
                 s(
-                    &[b"BF.RESERVE", b"e", b"0.01", b"100", b"EXPANSION", b"4"],
-                    Expect::Ok,
+                    &[b"BF.INFO", b"r"],
+                    Expect::Arr(vec![
+                        Expect::Simple("Capacity"),
+                        Expect::Int(5000),
+                        Expect::Simple("Size"),
+                        Expect::Int(0),
+                        Expect::Simple("Number of filters"),
+                        Expect::Int(1),
+                        Expect::Simple("Number of items inserted"),
+                        Expect::Int(0),
+                        Expect::Simple("Expansion rate"),
+                        Expect::Int(2),
+                    ]),
                 ),
-                s(&[b"BF.INFO", b"e", b"EXPANSION"], Expect::Int(4)),
-                s(&[b"BF.RESERVE", b"q", b"nope", b"100"], Expect::AnyError),
+            ],
+        },
+        Case {
+            family: "bloom",
+            name: "DIVERGENCE D7.4: an unknown BF.RESERVE option is refused",
+            steps: vec![
+                // The one divergence where WE are the stricter side, and
+                // deliberately. RedisBloom 2.8.16 ignores trailing tokens
+                // it does not recognise: `BF.RESERVE z 0.01 100 WAT WAT
+                // WAT` returns OK, and so does `EXPANSION notanum`.
+                //
+                // Matching that would mean a misspelled `NONSCALNG` quietly
+                // produces a SCALING filter — the caller believes the size
+                // is capped, and it grows. An error is recoverable in one
+                // line; a filter that silently disobeys the flag it was
+                // given is found much later, by capacity.
                 s(
                     &[b"BF.RESERVE", b"q", b"0.01", b"100", b"WAT"],
                     Expect::AnyError,
                 ),
+            ],
+        },
+        Case {
+            family: "bloom",
+            name: "DIVERGENCE D7.2: BF.SCANDUMP is refused, not served",
+            steps: vec![
+                s(&[b"BF.ADD", b"i", b"x"], Expect::Int(1)),
+                // RedisBloom serves these. Our block layout differs, so a
+                // dump would be a blob that looks portable and is accepted
+                // by nothing.
+                s(&[b"BF.SCANDUMP", b"i", b"0"], Expect::AnyError),
+            ],
+        },
+        Case {
+            family: "bloom",
+            name: "BF.RESERVE parameters and BF.INSERT",
+            steps: vec![
+                // Error rate FIRST, then capacity — RedisBloom's order.
+                s(&[b"BF.RESERVE", b"r", b"0.001", b"5000"], Expect::Ok),
+                s(&[b"BF.RESERVE", b"r", b"0.001", b"5000"], Expect::AnyError),
+                // A SINGLE-FIELD BF.INFO IS A ONE-ELEMENT ARRAY, not a bare
+                // value — RedisBloom answers `*1\r\n:5000\r\n`, and its own
+                // client libraries index [0]. Flint returned the bare
+                // integer until this was run against the real module.
+                s(
+                    &[b"BF.INFO", b"r", b"CAPACITY"],
+                    Expect::Arr(vec![Expect::Int(5000)]),
+                ),
+                s(
+                    &[b"BF.INFO", b"r", b"ITEMS"],
+                    Expect::Arr(vec![Expect::Int(0)]),
+                ),
+                s(
+                    &[b"BF.INFO", b"r", b"FILTERS"],
+                    Expect::Arr(vec![Expect::Int(1)]),
+                ),
+                s(&[b"BF.ADD", b"r", b"x"], Expect::Int(1)),
+                s(&[b"BF.EXISTS", b"r", b"x"], Expect::Int(1)),
+                // NONSCALING has no growth factor: a nil, and the nil is
+                // wrapped in the one-element array like any other field.
+                s(
+                    &[b"BF.RESERVE", b"n", b"0.01", b"100", b"NONSCALING"],
+                    Expect::Ok,
+                ),
+                s(
+                    &[b"BF.INFO", b"n", b"EXPANSION"],
+                    Expect::Arr(vec![Expect::Nil]),
+                ),
+                s(
+                    &[b"BF.RESERVE", b"e", b"0.01", b"100", b"EXPANSION", b"4"],
+                    Expect::Ok,
+                ),
+                s(
+                    &[b"BF.INFO", b"e", b"EXPANSION"],
+                    Expect::Arr(vec![Expect::Int(4)]),
+                ),
+                // An unknown section is a BARE error, not a wrapped one.
+                s(&[b"BF.INFO", b"e", b"NOSUCH"], Expect::AnyError),
+                s(&[b"BF.RESERVE", b"q", b"nope", b"100"], Expect::AnyError),
                 // BF.INSERT reserves and adds in one round trip.
                 s(
                     &[
@@ -2680,10 +2778,6 @@ fn corpus() -> Vec<Case> {
                     &[b"BF.INSERT", b"absent", b"NOCREATE", b"ITEMS", b"x"],
                     Expect::AnyError,
                 ),
-                // DIVERGENCE (deliberate, ADR-0016 D7.2): RedisBloom
-                // serves these. Our block layout differs, so a dump would
-                // be a blob that looks portable and is accepted by nothing.
-                s(&[b"BF.SCANDUMP", b"i", b"0"], Expect::AnyError),
                 // WRONGTYPE both directions.
                 s(&[b"SET", b"str", b"v"], Expect::Ok),
                 s(&[b"BF.ADD", b"str", b"x"], Expect::AnyError),

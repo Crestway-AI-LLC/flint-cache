@@ -211,7 +211,13 @@ first use, so a filter reserved for a million items and holding three
 occupies three rows, and `FLINTKEYSIZE`/`BF.INFO SIZE` report what is
 actually on disk rather than the reserved capacity.
 
-Three deliberate differences:
+`BF.INFO key FIELD` answers with a **one-element array**, not a bare value
+— `*1\r\n:5000\r\n` — matching RedisBloom, whose own clients index `[0]`.
+The nil for a `NONSCALING` filter's expansion is wrapped the same way; an
+unknown field name is a bare error.
+
+Four deliberate differences, all confirmed against RedisBloom 2.8.16 by
+`tools/redisbloom_compare.sh`:
 
 - **`TYPE` answers `bloom`**, where RedisBloom answers `MBbloom--`. Same
   choice JSON already makes against `ReJSON-RL`.
@@ -221,7 +227,16 @@ Three deliberate differences:
   is accepted by nothing, and fails at the far end of a migration.
   Importing a real RedisBloom dump is a format-reader feature, not a
   command that pretends.
-- **Defaults differ.** An auto-created filter (a `BF.ADD` with no prior
+- **`BF.INFO … SIZE` is what is on disk, not what was reserved.** A filter
+  reserved for 5000 items reads 0 here and ~9984 on RedisBloom, which
+  allocates up front. Ours is the number you are billed for.
+- **An unknown `BF.RESERVE` option is an error, not ignored** — the one
+  place we are STRICTER. RedisBloom accepts and drops tokens it does not
+  recognise (`BF.RESERVE k 0.01 100 WAT` returns `OK`, as does `EXPANSION
+  notanum`). Matching that would let a misspelled `NONSCALNG` hand back a
+  scaling filter the caller believes is capped.
+
+Plus **defaults differ.** An auto-created filter (a `BF.ADD` with no prior
   `BF.RESERVE`) is sized for 100,000 items rather than RedisBloom's 100,
   and a scaling chain is capped at 32 links. Both are constants today, not
   yet flags. Every link in a chain is another disk read on every lookup

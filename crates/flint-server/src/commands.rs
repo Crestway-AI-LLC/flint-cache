@@ -1960,25 +1960,42 @@ impl<'a> Dispatcher<'a> {
             n => Value::Integer(n as i64),
         };
         if let Some(field) = args.get(2) {
-            return match field.to_ascii_uppercase().as_slice() {
+            // ONE-ELEMENT ARRAY, not a bare value. RedisBloom answers
+            // `*1\r\n:5000\r\n` to `BF.INFO k CAPACITY`, and a client that
+            // indexes [0] — which is what its own libraries do — gets an
+            // error against a bare integer instead of a number.
+            //
+            // Verified on the wire against RedisBloom 2.8.16, not inferred:
+            // the nil for a NONSCALING filter is wrapped too (`*1\r\n$-1`),
+            // while a bad section name stays a BARE error.
+            let one = match field.to_ascii_uppercase().as_slice() {
                 b"CAPACITY" => Value::Integer(info.capacity as i64),
                 b"SIZE" => Value::Integer(info.size_bytes as i64),
                 b"FILTERS" => Value::Integer(info.filters as i64),
                 b"ITEMS" => Value::Integer(info.items as i64),
                 b"EXPANSION" => expansion,
-                _ => err("ERR invalid information section"),
+                // RedisBloom's exact text, which carries no `ERR` code —
+                // the first word is the code, as in every RESP error.
+                _ => return err("Invalid information value"),
             };
+            return Value::Array(Some(vec![one]));
         }
+        // SIMPLE strings for the field names, matching RedisBloom on the
+        // wire (`+Capacity`, not `$8\r\nCapacity`). Most clients coerce
+        // both to a string, so this is not the load-bearing half — but the
+        // whole claim of this family is that the bytes match, and a
+        // difference nobody can name is the kind that surfaces in one
+        // unlucky client a year from now.
         Value::Array(Some(vec![
-            Value::Bulk(Some(b"Capacity".to_vec())),
+            Value::Simple("Capacity".into()),
             Value::Integer(info.capacity as i64),
-            Value::Bulk(Some(b"Size".to_vec())),
+            Value::Simple("Size".into()),
             Value::Integer(info.size_bytes as i64),
-            Value::Bulk(Some(b"Number of filters".to_vec())),
+            Value::Simple("Number of filters".into()),
             Value::Integer(info.filters as i64),
-            Value::Bulk(Some(b"Number of items inserted".to_vec())),
+            Value::Simple("Number of items inserted".into()),
             Value::Integer(info.items as i64),
-            Value::Bulk(Some(b"Expansion rate".to_vec())),
+            Value::Simple("Expansion rate".into()),
             expansion,
         ]))
     }
@@ -2960,17 +2977,31 @@ mod tests {
             call(&s, &[b"BF.RESERVE", b"r", b"0.001", b"5000"]),
             Value::Error(e) if e.contains("exists")
         ));
+        // A single-field BF.INFO is a ONE-ELEMENT ARRAY. Verified on the
+        // wire against RedisBloom 2.8.16, which answers `*1\r\n:5000\r\n`
+        // — its clients index [0], so a bare integer breaks them.
         assert_eq!(
             call(&s, &[b"BF.INFO", b"r", b"CAPACITY"]),
-            Value::Integer(5000)
+            Value::Array(Some(vec![Value::Integer(5000)]))
         );
-        assert_eq!(call(&s, &[b"BF.INFO", b"r", b"ITEMS"]), Value::Integer(0));
+        assert_eq!(
+            call(&s, &[b"BF.INFO", b"r", b"ITEMS"]),
+            Value::Array(Some(vec![Value::Integer(0)]))
+        );
+        // An unknown section is a BARE error, NOT a wrapped one — also
+        // checked on the wire, because "everything is wrapped" would have
+        // been the natural guess and is wrong.
+        assert!(matches!(
+            call(&s, &[b"BF.INFO", b"r", b"NOSUCH"]),
+            Value::Error(_)
+        ));
 
-        // NONSCALING reports a nil expansion rate, not a zero.
+        // NONSCALING reports a nil expansion rate, not a zero — and the
+        // nil is wrapped like any other field.
         call(&s, &[b"BF.RESERVE", b"n", b"0.01", b"100", b"NONSCALING"]);
         assert_eq!(
             call(&s, &[b"BF.INFO", b"n", b"EXPANSION"]),
-            Value::Bulk(None)
+            Value::Array(Some(vec![Value::Bulk(None)]))
         );
         call(
             &s,
@@ -2978,7 +3009,7 @@ mod tests {
         );
         assert_eq!(
             call(&s, &[b"BF.INFO", b"e", b"EXPANSION"]),
-            Value::Integer(4)
+            Value::Array(Some(vec![Value::Integer(4)]))
         );
 
         // BF.INSERT reserves and adds in one trip; NOCREATE refuses to.
@@ -3008,11 +3039,9 @@ mod tests {
             panic!("BF.INFO should reply an array");
         };
         assert_eq!(rows.len(), 10);
-        assert_eq!(rows[0], Value::Bulk(Some(b"Capacity".to_vec())));
-        assert_eq!(
-            rows[6],
-            Value::Bulk(Some(b"Number of items inserted".to_vec()))
-        );
+        // SIMPLE strings for the names, as RedisBloom sends them (`+Capacity`).
+        assert_eq!(rows[0], Value::Simple("Capacity".into()));
+        assert_eq!(rows[6], Value::Simple("Number of items inserted".into()));
         assert_eq!(rows[7], Value::Integer(3));
 
         // Wrong type both ways, and the dump commands refuse rather than
