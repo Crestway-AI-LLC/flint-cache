@@ -98,6 +98,11 @@ fn cmd(parts: &[&[u8]]) -> Vec<Vec<u8>> {
 /// run proves neither, so it is skipped rather than reported as a failure
 /// that would say nothing about either side.
 ///
+/// Bloom is the same shape: `BF.*` comes from the RedisBloom module, so
+/// `--reference` cannot serve it, and `tools/redisbloom_compare.sh` is the
+/// script that turns "matches the contract we wrote" into "matches
+/// RedisBloom". Its divergences are ADR-0016 D7.
+///
 /// JSON does have an oracle, just not one `--reference` can reach: the
 /// RedisJSON module, which has to be built from source and loaded into a
 /// module-capable server. `tools/redisjson_compare.sh` runs this same
@@ -106,7 +111,7 @@ fn cmd(parts: &[&[u8]]) -> Vec<Vec<u8>> {
 /// Run it whenever these cases change; a green run there is what lets us
 /// say "matches RedisJSON" rather than "matches the contract we wrote".
 fn flint_only(family: &str) -> bool {
-    matches!(family, "json")
+    matches!(family, "json" | "bloom")
 }
 
 fn corpus() -> Vec<Case> {
@@ -2583,6 +2588,106 @@ fn corpus() -> Vec<Case> {
                 sd(&[b"PING"], Expect::Pong, 80),
                 s(&[b"JSON.GET", b"t", b"$"], Expect::Nil),
                 s(&[b"EXISTS", b"t"], Expect::Int(0)),
+            ],
+        },
+        Case {
+            family: "bloom",
+            name: "BF lifecycle: add, exists, card, multi forms, TTL",
+            steps: vec![
+                // BF.ADD auto-creates the filter. 1 = newly added.
+                s(&[b"BF.ADD", b"bf", b"a"], Expect::Int(1)),
+                s(&[b"BF.ADD", b"bf", b"a"], Expect::Int(0)),
+                s(&[b"BF.EXISTS", b"bf", b"a"], Expect::Int(1)),
+                s(&[b"BF.EXISTS", b"bf", b"missing"], Expect::Int(0)),
+                s(&[b"BF.CARD", b"bf"], Expect::Int(1)),
+                // DIVERGENCE (deliberate, ADR-0016 D7.1): RedisBloom
+                // answers its module type name, `MBbloom--`. We answer the
+                // type, matching what JSON already does.
+                s(&[b"TYPE", b"bf"], Expect::Simple("bloom")),
+                s(
+                    &[b"BF.MADD", b"bf", b"a", b"b", b"c"],
+                    Expect::Arr(vec![Expect::Int(0), Expect::Int(1), Expect::Int(1)]),
+                ),
+                s(
+                    &[b"BF.MEXISTS", b"bf", b"b", b"nope"],
+                    Expect::Arr(vec![Expect::Int(1), Expect::Int(0)]),
+                ),
+                s(&[b"BF.CARD", b"bf"], Expect::Int(3)),
+                // A missing key is 0 for EXISTS and CARD, an error for INFO.
+                s(&[b"BF.EXISTS", b"gone", b"a"], Expect::Int(0)),
+                s(&[b"BF.CARD", b"gone"], Expect::Int(0)),
+                s(&[b"BF.INFO", b"gone"], Expect::AnyError),
+                // A filter is an ordinary key for the generic commands.
+                s(&[b"EXPIRE", b"bf", b"100"], Expect::Int(1)),
+                s(&[b"TTL", b"bf"], Expect::IntRange(90, 100)),
+                s(&[b"BF.ADD", b"bf", b"d"], Expect::Int(1)),
+                s(&[b"TTL", b"bf"], Expect::IntRange(90, 100)),
+                s(&[b"DEL", b"bf"], Expect::Int(1)),
+                s(&[b"BF.CARD", b"bf"], Expect::Int(0)),
+                // An expired filter reads as gone, not as an empty one.
+                s(&[b"BF.ADD", b"t", b"x"], Expect::Int(1)),
+                s(&[b"PEXPIRE", b"t", b"40"], Expect::Int(1)),
+                sd(&[b"PING"], Expect::Pong, 80),
+                s(&[b"BF.EXISTS", b"t", b"x"], Expect::Int(0)),
+                s(&[b"EXISTS", b"t"], Expect::Int(0)),
+            ],
+        },
+        Case {
+            family: "bloom",
+            name: "BF.RESERVE parameters, BF.INSERT, and the refused dump",
+            steps: vec![
+                // Error rate FIRST, then capacity — RedisBloom's order.
+                s(&[b"BF.RESERVE", b"r", b"0.001", b"5000"], Expect::Ok),
+                s(&[b"BF.RESERVE", b"r", b"0.001", b"5000"], Expect::AnyError),
+                s(&[b"BF.INFO", b"r", b"CAPACITY"], Expect::Int(5000)),
+                s(&[b"BF.INFO", b"r", b"ITEMS"], Expect::Int(0)),
+                s(&[b"BF.INFO", b"r", b"FILTERS"], Expect::Int(1)),
+                // Nothing on disk until a block is touched (ADR-0016 D3).
+                s(&[b"BF.INFO", b"r", b"SIZE"], Expect::Int(0)),
+                s(&[b"BF.ADD", b"r", b"x"], Expect::Int(1)),
+                s(&[b"BF.EXISTS", b"r", b"x"], Expect::Int(1)),
+                // NONSCALING has no growth factor, reported as nil.
+                s(
+                    &[b"BF.RESERVE", b"n", b"0.01", b"100", b"NONSCALING"],
+                    Expect::Ok,
+                ),
+                s(&[b"BF.INFO", b"n", b"EXPANSION"], Expect::Nil),
+                s(
+                    &[b"BF.RESERVE", b"e", b"0.01", b"100", b"EXPANSION", b"4"],
+                    Expect::Ok,
+                ),
+                s(&[b"BF.INFO", b"e", b"EXPANSION"], Expect::Int(4)),
+                s(&[b"BF.RESERVE", b"q", b"nope", b"100"], Expect::AnyError),
+                s(
+                    &[b"BF.RESERVE", b"q", b"0.01", b"100", b"WAT"],
+                    Expect::AnyError,
+                ),
+                // BF.INSERT reserves and adds in one round trip.
+                s(
+                    &[
+                        b"BF.INSERT",
+                        b"i",
+                        b"CAPACITY",
+                        b"1000",
+                        b"ITEMS",
+                        b"x",
+                        b"y",
+                    ],
+                    Expect::Arr(vec![Expect::Int(1), Expect::Int(1)]),
+                ),
+                s(&[b"BF.EXISTS", b"i", b"y"], Expect::Int(1)),
+                s(
+                    &[b"BF.INSERT", b"absent", b"NOCREATE", b"ITEMS", b"x"],
+                    Expect::AnyError,
+                ),
+                // DIVERGENCE (deliberate, ADR-0016 D7.2): RedisBloom
+                // serves these. Our block layout differs, so a dump would
+                // be a blob that looks portable and is accepted by nothing.
+                s(&[b"BF.SCANDUMP", b"i", b"0"], Expect::AnyError),
+                // WRONGTYPE both directions.
+                s(&[b"SET", b"str", b"v"], Expect::Ok),
+                s(&[b"BF.ADD", b"str", b"x"], Expect::AnyError),
+                s(&[b"GET", b"i"], Expect::AnyError),
             ],
         },
         Case {

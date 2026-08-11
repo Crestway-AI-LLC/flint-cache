@@ -195,6 +195,46 @@ into a write — the wrong trade under the disk pressure that makes anyone
 reach for these). space-reclaim.md is the end-to-end guide for building
 a cleanup daemon on them.
 
+### Bloom filters: `BF.*`, and where we differ from RedisBloom (ADR-0016)
+
+The RedisBloom command surface, so an existing client works unchanged:
+`BF.RESERVE`, `BF.ADD`, `BF.MADD`, `BF.EXISTS`, `BF.MEXISTS`, `BF.CARD`,
+`BF.INFO`, `BF.INSERT`. Note `BF.RESERVE key error_rate capacity` — the
+error rate comes FIRST, which reads backwards to most people and is kept
+because the point of this family is that nothing about your client has to
+change.
+
+Stored as a **blocked** filter: each item hashes to one 4 KiB block and all
+its probes land inside it, so `BF.EXISTS` is one disk read and `BF.ADD` is
+a read plus a write — the same cost as `HGET`/`HSET`. Blocks materialize on
+first use, so a filter reserved for a million items and holding three
+occupies three rows, and `FLINTKEYSIZE`/`BF.INFO SIZE` report what is
+actually on disk rather than the reserved capacity.
+
+Three deliberate differences:
+
+- **`TYPE` answers `bloom`**, where RedisBloom answers `MBbloom--`. Same
+  choice JSON already makes against `ReJSON-RL`.
+- **`BF.SCANDUMP` and `BF.LOADCHUNK` are refused**, with an error saying
+  why. Their payload is a serialized filter and our layout is not
+  RedisBloom's, so implementing them would emit a blob that looks portable,
+  is accepted by nothing, and fails at the far end of a migration.
+  Importing a real RedisBloom dump is a format-reader feature, not a
+  command that pretends.
+- **Defaults differ.** An auto-created filter (a `BF.ADD` with no prior
+  `BF.RESERVE`) is sized for 100,000 items rather than RedisBloom's 100,
+  and a scaling chain is capped at 32 links. Both are constants today, not
+  yet flags. Every link in a chain is another disk read on every lookup
+  here, not a pointer chase, so RedisBloom's default would leave a filter
+  that grew to a million items reading ~14 blocks per `BF.EXISTS` — a p99
+  set by a default nobody chose. Reaching the cap is an error, not a
+  silent degradation past the error rate you asked for.
+
+`BF.CARD` counts items the filter ACCEPTED. An item that false-positives on
+insert is reported already-present and never counted, so the card can read
+slightly low on a full filter. That is inherent — the filter cannot tell a
+collision from a repeat — and RedisBloom under-counts the same way.
+
 ## Protocols: RESP2 and RESP3
 
 Both, negotiated per connection with `HELLO`. Connections start at RESP2;

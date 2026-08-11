@@ -131,7 +131,16 @@ impl<'a> Keyspace<'a> {
                 self.kv.put(&self.meta_key(slot, dst), &row);
                 true
             }
-            ValueType::Hash | ValueType::Set | ValueType::ZSet | ValueType::List => {
+            // Bloom belongs here, not with the payload-in-metadata types:
+            // its blocks are subkey rows under the same versioned prefix,
+            // so the generic rekey below moves them. Its metadata tail
+            // rides along untouched because this arm patches the row rather
+            // than rebuilding it.
+            ValueType::Hash
+            | ValueType::Set
+            | ValueType::ZSet
+            | ValueType::List
+            | ValueType::Bloom => {
                 let Some(meta) = ComplexMeta::decode(&row) else {
                     return false;
                 };

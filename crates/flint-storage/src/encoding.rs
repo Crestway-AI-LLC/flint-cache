@@ -35,6 +35,11 @@ pub enum ValueType {
     /// like any value. Parsing/manipulation is the command layer's job;
     /// storage sees opaque bytes plus this tag.
     Json = 5,
+    /// A Bloom filter (ADR-0016), stored as blocks in subkey rows: one
+    /// block per row, one block per item, all of an item's probes inside
+    /// it. Blocks materialize on first use, so an absent row reads as
+    /// all-zero — which is already the right answer for "nothing here".
+    Bloom = 6,
 }
 
 impl ValueType {
@@ -46,6 +51,7 @@ impl ValueType {
             3 => Some(Self::ZSet),
             4 => Some(Self::List),
             5 => Some(Self::Json),
+            6 => Some(Self::Bloom),
             _ => None,
         }
     }
@@ -58,6 +64,10 @@ impl ValueType {
             Self::ZSet => "zset",
             Self::List => "list",
             Self::Json => "json",
+            // RedisBloom answers `MBbloom--` here. Deliberate divergence
+            // (ADR-0016 D7.1), following the precedent JSON already set by
+            // answering `json` where RedisJSON answers `ReJSON-RL`.
+            Self::Bloom => "bloom",
         }
     }
 }
@@ -554,6 +564,147 @@ impl ListMeta {
             base,
             head: unbias_index(u64::from_be_bytes(row[off..off + 8].try_into().ok()?)),
             tail: unbias_index(u64::from_be_bytes(row[off + 8..off + 16].try_into().ok()?)),
+        })
+    }
+}
+
+/// Hash-algorithm id recorded in every Bloom filter's metadata row.
+///
+/// 1 = MurmurHash3 x64_128, seed 0. See `bloom::murmur3_x64_128`.
+pub const BLOOM_HASH_MURMUR3_X64_128: u8 = 1;
+
+/// Layout id recorded in every Bloom filter's metadata row.
+///
+/// 1 = blocked, power-of-two block bits, probes by odd-stride double
+/// hashing within one block. See `bloom` and ADR-0016 D2.
+pub const BLOOM_LAYOUT_BLOCKED_V1: u8 = 1;
+
+/// One filter in a Bloom key's chain. A non-scaling filter has exactly one.
+///
+/// `k`, `block_bits_log2` and `blocks` are STORED rather than recomputed
+/// from `capacity`/`error` on read. That is the whole point: a future
+/// change to the sizing function must not silently relocate the bits of
+/// filters already on disk (ADR-0016 D4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BloomLink {
+    /// Probes per item, all inside one block.
+    pub k: u8,
+    /// log2 of the bits per block — a power of two by construction, which
+    /// is what lets the probe stride be odd and therefore collision-free.
+    pub block_bits_log2: u8,
+    pub blocks: u64,
+    /// Items added to THIS link. Summed across the chain for `BF.CARD`,
+    /// and compared against `capacity` to decide when to scale.
+    pub items: u64,
+    /// Items this link was sized for. Stored rather than derived from the
+    /// chain position and expansion factor, for the same reason `k` and
+    /// `blocks` are: the growth rule may change, a filter already on disk
+    /// may not.
+    pub capacity: u64,
+}
+
+/// Bloom filter metadata (ADR-0016), appended past `ComplexMeta`'s shared
+/// tail in the `ListMeta` mould.
+///
+/// Never rebuild this row by decoding to `ComplexMeta` and re-encoding: the
+/// tail is dropped and the key stops decoding as a Bloom filter at all.
+/// That is the bug `ComplexMeta::write_version` exists for.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BloomMeta {
+    pub base: ComplexMeta,
+    pub hash_id: u8,
+    pub layout: u8,
+    /// Capacity the FIRST link was sized for, as the user asked for it.
+    pub capacity: u64,
+    /// Error rate the user asked for. Kept exactly so `BF.INFO` answers
+    /// with the request rather than something reconstructed from the
+    /// rounded bit count.
+    pub error: f64,
+    /// Scaling factor for the next link; 0 means non-scaling.
+    pub expansion: u8,
+    pub links: Vec<BloomLink>,
+}
+
+const BLOOM_TAIL_HEAD_LEN: usize = 1 + 1 + 8 + 8 + 1 + 1;
+const BLOOM_LINK_LEN: usize = 1 + 1 + 8 + 8 + 8;
+
+impl BloomMeta {
+    pub fn new(version: u64, capacity: u64, error: f64, expansion: u8, first: BloomLink) -> Self {
+        Self {
+            base: ComplexMeta::new(ValueType::Bloom, version),
+            hash_id: BLOOM_HASH_MURMUR3_X64_128,
+            layout: BLOOM_LAYOUT_BLOCKED_V1,
+            capacity,
+            error,
+            expansion,
+            links: vec![first],
+        }
+    }
+
+    /// Items across the whole chain — `BF.CARD`. A `u64` on purpose:
+    /// `ComplexMeta.size` is a `u32`, and a filter at the 512 MB value cap
+    /// holds ~448 M items, close enough to that ceiling to be worth not
+    /// counting there.
+    pub fn card(&self) -> u64 {
+        self.links.iter().map(|l| l.items).sum()
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = self.base.encode();
+        out.push(self.hash_id);
+        out.push(self.layout);
+        out.extend_from_slice(&self.capacity.to_be_bytes());
+        out.extend_from_slice(&self.error.to_bits().to_be_bytes());
+        out.push(self.expansion);
+        // Bounded by the chain cap the store enforces, so this cannot
+        // overflow a byte in practice; saturating rather than truncating
+        // means a bug here reads as a short chain, not a corrupt row.
+        out.push(u8::try_from(self.links.len()).unwrap_or(u8::MAX));
+        for l in &self.links {
+            out.push(l.k);
+            out.push(l.block_bits_log2);
+            out.extend_from_slice(&l.blocks.to_be_bytes());
+            out.extend_from_slice(&l.items.to_be_bytes());
+            out.extend_from_slice(&l.capacity.to_be_bytes());
+        }
+        out
+    }
+
+    pub fn decode(row: &[u8]) -> Option<Self> {
+        let base = ComplexMeta::decode(row)?;
+        let off = head_len(row[0]) + COMPLEX_TAIL_LEN;
+        if row.len() < off + BLOOM_TAIL_HEAD_LEN {
+            return None;
+        }
+        let hash_id = row[off];
+        let layout = row[off + 1];
+        let capacity = u64::from_be_bytes(row[off + 2..off + 10].try_into().ok()?);
+        let error = f64::from_bits(u64::from_be_bytes(row[off + 10..off + 18].try_into().ok()?));
+        let expansion = row[off + 18];
+        let n = row[off + 19] as usize;
+        let mut links = Vec::with_capacity(n);
+        let mut p = off + BLOOM_TAIL_HEAD_LEN;
+        for _ in 0..n {
+            if row.len() < p + BLOOM_LINK_LEN {
+                return None;
+            }
+            links.push(BloomLink {
+                k: row[p],
+                block_bits_log2: row[p + 1],
+                blocks: u64::from_be_bytes(row[p + 2..p + 10].try_into().ok()?),
+                items: u64::from_be_bytes(row[p + 10..p + 18].try_into().ok()?),
+                capacity: u64::from_be_bytes(row[p + 18..p + 26].try_into().ok()?),
+            });
+            p += BLOOM_LINK_LEN;
+        }
+        Some(Self {
+            base,
+            hash_id,
+            layout,
+            capacity,
+            error,
+            expansion,
+            links,
         })
     }
 }

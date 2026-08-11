@@ -18,6 +18,7 @@
 //! layer.
 
 pub mod batch;
+pub mod bloom;
 pub mod disk;
 pub mod encoding;
 pub mod gc;

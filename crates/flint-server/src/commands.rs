@@ -10,6 +10,7 @@
 use flint_resp::Value;
 use flint_slot::slot_for_key;
 use flint_storage::Kv;
+use flint_storage::bloom::BloomStore;
 use flint_storage::hashes::HashStore;
 use flint_storage::json::JsonStore;
 use flint_storage::keyspace::{Keyspace, RenameOutcome, Ttl};
@@ -165,6 +166,7 @@ pub struct Dispatcher<'a> {
     lists: ListStore<'a>,
     zsets: ZSetStore<'a>,
     json: JsonStore<'a>,
+    bloom: BloomStore<'a>,
     kv: &'a dyn Kv,
     clock: Clock,
     limits: Limits,
@@ -192,6 +194,7 @@ impl<'a> Dispatcher<'a> {
             lists: ListStore::with_max_value_bytes(kv, ns, clock, max),
             zsets: ZSetStore::with_max_value_bytes(kv, ns, clock, max),
             json: JsonStore::with_max_value_bytes(kv, ns, clock, max),
+            bloom: BloomStore::with_max_value_bytes(kv, ns, clock, max),
             kv,
             clock,
             limits,
@@ -787,6 +790,34 @@ impl<'a> Dispatcher<'a> {
             b"JSON.NUMINCRBY" => self.cmd_json_numincrby(args),
             b"JSON.ARRAPPEND" => self.cmd_json_arrappend(args),
             b"JSON.ARRLEN" => self.cmd_json_arrlen(args),
+            b"BF.RESERVE" => self.cmd_bf_reserve(args),
+            b"BF.ADD" => exact(args, 3, "bf.add", |a| {
+                reply(self.bloom.add(slot_for_key(&a[1]), &a[1], &a[2]), |b| {
+                    Value::Integer(b as i64)
+                })
+            }),
+            b"BF.EXISTS" => exact(args, 3, "bf.exists", |a| {
+                reply(self.bloom.exists(slot_for_key(&a[1]), &a[1], &a[2]), |b| {
+                    Value::Integer(b as i64)
+                })
+            }),
+            b"BF.MADD" | b"BF.MEXISTS" => self.cmd_bf_multi(name, args),
+            b"BF.CARD" => exact(args, 2, "bf.card", |a| {
+                reply(self.bloom.card(slot_for_key(&a[1]), &a[1]), |n| {
+                    Value::Integer(n as i64)
+                })
+            }),
+            b"BF.INFO" => self.cmd_bf_info(args),
+            b"BF.INSERT" => self.cmd_bf_insert(args),
+            // ADR-0016 D7.2: our block layout is not RedisBloom's, so a
+            // dump would be a blob that looks portable and is accepted by
+            // nothing. Refusing is the honest failure; the alternative is
+            // discovered at the far end of somebody's migration.
+            b"BF.SCANDUMP" | b"BF.LOADCHUNK" => {
+                err("ERR BF.SCANDUMP/BF.LOADCHUNK are not supported: \
+                 Flint's filter layout differs from RedisBloom's, so the \
+                 chunk format is not interchangeable")
+            }
 
             // keyspace iteration
             b"SCAN" => self.cmd_scan(args),
@@ -1842,6 +1873,200 @@ impl<'a> Dispatcher<'a> {
         ))
     }
 
+    /// BF.RESERVE key error_rate capacity [EXPANSION n] [NONSCALING]
+    ///
+    /// Note the argument order — error rate BEFORE capacity, which is
+    /// RedisBloom's and reads backwards to most people. Kept because the
+    /// point of this family is that existing clients work unchanged.
+    fn cmd_bf_reserve(&self, args: &[Vec<u8>]) -> Value {
+        if args.len() < 4 {
+            return arity_err("bf.reserve");
+        }
+        let Ok(error) = parse_f64(&args[2]) else {
+            return err("ERR bad error rate");
+        };
+        let Some(capacity) = parse_u64(&args[3]) else {
+            return err("ERR bad capacity");
+        };
+        let mut expansion = flint_storage::bloom::DEFAULT_EXPANSION;
+        let mut i = 4;
+        while i < args.len() {
+            match args[i].to_ascii_uppercase().as_slice() {
+                b"NONSCALING" => {
+                    expansion = 0;
+                    i += 1;
+                }
+                b"EXPANSION" => {
+                    let Some(n) = args.get(i + 1).and_then(|v| parse_u64(v)) else {
+                        return err("ERR bad expansion");
+                    };
+                    if n == 0 || n > u8::MAX as u64 {
+                        return err("ERR bad expansion");
+                    }
+                    expansion = n as u8;
+                    i += 2;
+                }
+                _ => return err("ERR syntax error"),
+            }
+        }
+        match self
+            .bloom
+            .reserve(slot_for_key(&args[1]), &args[1], capacity, error, expansion)
+        {
+            Ok(()) => Value::Simple("OK".into()),
+            Err(e) => store_err(e),
+        }
+    }
+
+    /// BF.MADD key item [item ...] and BF.MEXISTS key item [item ...] —
+    /// one reply element per item, in request order.
+    fn cmd_bf_multi(&self, name: &[u8], args: &[Vec<u8>]) -> Value {
+        if args.len() < 3 {
+            return arity_err(if name == b"BF.MADD" {
+                "bf.madd"
+            } else {
+                "bf.mexists"
+            });
+        }
+        let slot = slot_for_key(&args[1]);
+        let items = &args[2..];
+        let out = if name == b"BF.MADD" {
+            self.bloom.madd(slot, &args[1], items)
+        } else {
+            self.bloom.mexists(slot, &args[1], items)
+        };
+        match out {
+            Ok(v) => Value::Array(Some(
+                v.into_iter().map(|b| Value::Integer(b as i64)).collect(),
+            )),
+            Err(e) => store_err(e),
+        }
+    }
+
+    /// BF.INFO key [CAPACITY|SIZE|FILTERS|ITEMS|EXPANSION]
+    fn cmd_bf_info(&self, args: &[Vec<u8>]) -> Value {
+        if args.len() < 2 || args.len() > 3 {
+            return arity_err("bf.info");
+        }
+        let info = match self.bloom.info(slot_for_key(&args[1]), &args[1]) {
+            Ok(Some(i)) => i,
+            Ok(None) => return err("ERR not found"),
+            Err(e) => return store_err(e),
+        };
+        // Expansion 0 means NONSCALING, which RedisBloom reports as a nil
+        // rather than a zero — the filter has no growth factor at all.
+        let expansion = match info.expansion {
+            0 => Value::Bulk(None),
+            n => Value::Integer(n as i64),
+        };
+        if let Some(field) = args.get(2) {
+            return match field.to_ascii_uppercase().as_slice() {
+                b"CAPACITY" => Value::Integer(info.capacity as i64),
+                b"SIZE" => Value::Integer(info.size_bytes as i64),
+                b"FILTERS" => Value::Integer(info.filters as i64),
+                b"ITEMS" => Value::Integer(info.items as i64),
+                b"EXPANSION" => expansion,
+                _ => err("ERR invalid information section"),
+            };
+        }
+        Value::Array(Some(vec![
+            Value::Bulk(Some(b"Capacity".to_vec())),
+            Value::Integer(info.capacity as i64),
+            Value::Bulk(Some(b"Size".to_vec())),
+            Value::Integer(info.size_bytes as i64),
+            Value::Bulk(Some(b"Number of filters".to_vec())),
+            Value::Integer(info.filters as i64),
+            Value::Bulk(Some(b"Number of items inserted".to_vec())),
+            Value::Integer(info.items as i64),
+            Value::Bulk(Some(b"Expansion rate".to_vec())),
+            expansion,
+        ]))
+    }
+
+    /// BF.INSERT key [CAPACITY n] [ERROR e] [EXPANSION n] [NOCREATE]
+    /// [NONSCALING] ITEMS item [item ...]
+    ///
+    /// Reserve-if-absent and add, in one round trip. The options bind only
+    /// when the filter is CREATED here; against an existing filter they are
+    /// ignored, exactly as RedisBloom does, because its parameters were
+    /// fixed when it was made.
+    fn cmd_bf_insert(&self, args: &[Vec<u8>]) -> Value {
+        if args.len() < 4 {
+            return arity_err("bf.insert");
+        }
+        let mut capacity = flint_storage::bloom::DEFAULT_CAPACITY;
+        let mut error = flint_storage::bloom::DEFAULT_ERROR;
+        let mut expansion = flint_storage::bloom::DEFAULT_EXPANSION;
+        let mut nocreate = false;
+        let mut items: Option<&[Vec<u8>]> = None;
+
+        let mut i = 2;
+        while i < args.len() {
+            match args[i].to_ascii_uppercase().as_slice() {
+                b"CAPACITY" => match args.get(i + 1).and_then(|v| parse_u64(v)) {
+                    Some(n) => {
+                        capacity = n;
+                        i += 2;
+                    }
+                    None => return err("ERR bad capacity"),
+                },
+                b"ERROR" => match args.get(i + 1).and_then(|v| parse_f64(v).ok()) {
+                    Some(e) => {
+                        error = e;
+                        i += 2;
+                    }
+                    None => return err("ERR bad error rate"),
+                },
+                b"EXPANSION" => match args.get(i + 1).and_then(|v| parse_u64(v)) {
+                    Some(n) if n > 0 && n <= u8::MAX as u64 => {
+                        expansion = n as u8;
+                        i += 2;
+                    }
+                    _ => return err("ERR bad expansion"),
+                },
+                b"NOCREATE" => {
+                    nocreate = true;
+                    i += 1;
+                }
+                b"NONSCALING" => {
+                    expansion = 0;
+                    i += 1;
+                }
+                b"ITEMS" => {
+                    items = Some(&args[i + 1..]);
+                    break;
+                }
+                _ => return err("ERR syntax error"),
+            }
+        }
+        let Some(items) = items.filter(|i| !i.is_empty()) else {
+            return err("ERR syntax error");
+        };
+
+        let slot = slot_for_key(&args[1]);
+        let exists = match self.bloom.info(slot, &args[1]) {
+            Ok(v) => v.is_some(),
+            Err(e) => return store_err(e),
+        };
+        if !exists {
+            if nocreate {
+                return err("ERR not found");
+            }
+            if let Err(e) = self
+                .bloom
+                .reserve(slot, &args[1], capacity, error, expansion)
+            {
+                return store_err(e);
+            }
+        }
+        match self.bloom.madd(slot, &args[1], items) {
+            Ok(v) => Value::Array(Some(
+                v.into_iter().map(|b| Value::Integer(b as i64)).collect(),
+            )),
+            Err(e) => store_err(e),
+        }
+    }
+
     /// JSON.NUMINCRBY key path number — atomically add to a number at the
     /// path, replying with the new value.
     fn cmd_json_numincrby(&self, args: &[Vec<u8>]) -> Value {
@@ -2537,6 +2762,9 @@ fn store_err(e: StoreError) -> Value {
         StoreError::ValueTooLarge => {
             err("ERR value exceeds maximum allowed size (max-value-bytes)")
         }
+        StoreError::KeyExists => err("ERR item exists"),
+        StoreError::BadParameter => err("ERR bad capacity or error rate"),
+        StoreError::FilterFull => err("ERR non scaling filter is full"),
     }
 }
 
@@ -2576,6 +2804,12 @@ fn parse_i64(raw: &[u8]) -> Result<i64, ()> {
         .map_err(|_| ())?
         .parse()
         .map_err(|_| ())
+}
+
+/// A non-negative count argument. `Option` rather than `Result<_, ()>`
+/// because every caller wants to substitute its own error string.
+fn parse_u64(raw: &[u8]) -> Option<u64> {
+    std::str::from_utf8(raw).ok()?.parse().ok()
 }
 
 /// The legacy-dialect JSON errors. Only ever reached from a non-`$` path:
@@ -2679,6 +2913,165 @@ mod tests {
         assert_eq!(got, vec![b"h:1".to_vec()]);
         // Unknown TYPE matches nothing, errors nothing.
         assert!(scan_all(&s, &[b"TYPE", b"stream"]).is_empty());
+    }
+
+    /// The RESP surface of the Bloom family, in the shapes a RedisBloom
+    /// client already expects (ADR-0016). Reply TYPES are the contract
+    /// here as much as the values: an integer where a client parses an
+    /// integer, an array of integers for the multi forms.
+    #[test]
+    fn bloom_speaks_redisbloom() {
+        let s = MemKv::new();
+
+        // BF.ADD auto-creates. 1 = newly added, 0 = already present.
+        assert_eq!(call(&s, &[b"BF.ADD", b"bf", b"a"]), Value::Integer(1));
+        assert_eq!(call(&s, &[b"BF.ADD", b"bf", b"a"]), Value::Integer(0));
+        assert_eq!(call(&s, &[b"BF.EXISTS", b"bf", b"a"]), Value::Integer(1));
+        assert_eq!(call(&s, &[b"BF.EXISTS", b"bf", b"nope"]), Value::Integer(0));
+        assert_eq!(call(&s, &[b"BF.CARD", b"bf"]), Value::Integer(1));
+        assert_eq!(call(&s, &[b"TYPE", b"bf"]), Value::Simple("bloom".into()));
+
+        assert_eq!(
+            call(&s, &[b"BF.MADD", b"bf", b"a", b"b", b"c"]),
+            Value::Array(Some(vec![
+                Value::Integer(0),
+                Value::Integer(1),
+                Value::Integer(1)
+            ]))
+        );
+        assert_eq!(
+            call(&s, &[b"BF.MEXISTS", b"bf", b"b", b"zzz"]),
+            Value::Array(Some(vec![Value::Integer(1), Value::Integer(0)]))
+        );
+
+        // A missing key is not an error for EXISTS/CARD, and is for INFO —
+        // matching RedisBloom, where INFO is the one that must find a
+        // filter to describe.
+        assert_eq!(call(&s, &[b"BF.EXISTS", b"gone", b"a"]), Value::Integer(0));
+        assert_eq!(call(&s, &[b"BF.CARD", b"gone"]), Value::Integer(0));
+        assert!(matches!(call(&s, &[b"BF.INFO", b"gone"]), Value::Error(_)));
+
+        // BF.RESERVE takes ERROR RATE FIRST, then capacity.
+        assert_eq!(
+            call(&s, &[b"BF.RESERVE", b"r", b"0.001", b"5000"]),
+            Value::Simple("OK".into())
+        );
+        assert!(matches!(
+            call(&s, &[b"BF.RESERVE", b"r", b"0.001", b"5000"]),
+            Value::Error(e) if e.contains("exists")
+        ));
+        assert_eq!(
+            call(&s, &[b"BF.INFO", b"r", b"CAPACITY"]),
+            Value::Integer(5000)
+        );
+        assert_eq!(call(&s, &[b"BF.INFO", b"r", b"ITEMS"]), Value::Integer(0));
+
+        // NONSCALING reports a nil expansion rate, not a zero.
+        call(&s, &[b"BF.RESERVE", b"n", b"0.01", b"100", b"NONSCALING"]);
+        assert_eq!(
+            call(&s, &[b"BF.INFO", b"n", b"EXPANSION"]),
+            Value::Bulk(None)
+        );
+        call(
+            &s,
+            &[b"BF.RESERVE", b"e", b"0.01", b"100", b"EXPANSION", b"4"],
+        );
+        assert_eq!(
+            call(&s, &[b"BF.INFO", b"e", b"EXPANSION"]),
+            Value::Integer(4)
+        );
+
+        // BF.INSERT reserves and adds in one trip; NOCREATE refuses to.
+        assert_eq!(
+            call(
+                &s,
+                &[
+                    b"BF.INSERT",
+                    b"i",
+                    b"CAPACITY",
+                    b"1000",
+                    b"ITEMS",
+                    b"x",
+                    b"y"
+                ]
+            ),
+            Value::Array(Some(vec![Value::Integer(1), Value::Integer(1)]))
+        );
+        assert_eq!(call(&s, &[b"BF.EXISTS", b"i", b"x"]), Value::Integer(1));
+        assert!(matches!(
+            call(&s, &[b"BF.INSERT", b"absent", b"NOCREATE", b"ITEMS", b"x"]),
+            Value::Error(e) if e.contains("not found")
+        ));
+
+        // The full BF.INFO reply is the five documented name/value pairs.
+        let Value::Array(Some(rows)) = call(&s, &[b"BF.INFO", b"bf"]) else {
+            panic!("BF.INFO should reply an array");
+        };
+        assert_eq!(rows.len(), 10);
+        assert_eq!(rows[0], Value::Bulk(Some(b"Capacity".to_vec())));
+        assert_eq!(
+            rows[6],
+            Value::Bulk(Some(b"Number of items inserted".to_vec()))
+        );
+        assert_eq!(rows[7], Value::Integer(3));
+
+        // Wrong type both ways, and the dump commands refuse rather than
+        // emitting a chunk format that is not interchangeable (D7.2).
+        call(&s, &[b"SET", b"str", b"v"]);
+        assert!(matches!(
+            call(&s, &[b"BF.ADD", b"str", b"x"]),
+            Value::Error(e) if e.starts_with("WRONGTYPE")
+        ));
+        assert!(matches!(
+            call(&s, &[b"GET", b"bf"]),
+            Value::Error(e) if e.starts_with("WRONGTYPE")
+        ));
+        assert!(matches!(
+            call(&s, &[b"BF.SCANDUMP", b"bf", b"0"]),
+            Value::Error(e) if e.contains("not supported")
+        ));
+
+        // Arity and syntax are refused, not guessed at.
+        assert!(matches!(call(&s, &[b"BF.ADD", b"bf"]), Value::Error(_)));
+        assert!(matches!(
+            call(&s, &[b"BF.RESERVE", b"q", b"0.01"]),
+            Value::Error(_)
+        ));
+        assert!(matches!(
+            call(&s, &[b"BF.RESERVE", b"q", b"nope", b"100"]),
+            Value::Error(e) if e.contains("error rate")
+        ));
+        assert!(matches!(
+            call(&s, &[b"BF.RESERVE", b"q", b"0.01", b"100", b"WAT"]),
+            Value::Error(e) if e.contains("syntax")
+        ));
+    }
+
+    /// The classifier is what keeps a write off a replica, so the family's
+    /// entries are asserted here rather than assumed.
+    #[test]
+    fn bloom_commands_classify() {
+        for w in [
+            b"BF.ADD".as_slice(),
+            b"BF.MADD",
+            b"BF.RESERVE",
+            b"BF.INSERT",
+        ] {
+            assert!(flint_commands::is_write_command(w), "{w:?} must be a write");
+            assert!(!flint_commands::is_read_command(w));
+        }
+        for r in [
+            b"BF.EXISTS".as_slice(),
+            b"BF.MEXISTS",
+            b"BF.CARD",
+            b"BF.INFO",
+        ] {
+            assert!(flint_commands::is_read_command(r), "{r:?} must be a read");
+            assert!(!flint_commands::is_write_command(r));
+        }
+        // A Bloom filter never shrinks, so nothing here frees space; DEL
+        // is the only way out and is already in that set.
+        assert!(!flint_commands::reduces_space(b"BF.ADD"));
     }
 
     #[test]

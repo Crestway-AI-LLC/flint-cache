@@ -58,6 +58,16 @@ pub enum StoreError {
     /// (Valkey's `checkStringLength` analog, extended to collections).
     /// Enforced atomically: the store is untouched when this returns.
     ValueTooLarge,
+    /// BF.RESERVE on a key that already holds a filter. Its parameters are
+    /// fixed at creation, so the alternatives are to ignore the new ones or
+    /// to discard the data — both silent, both wrong.
+    KeyExists,
+    /// A parameter the store cannot honour: a capacity of zero, an error
+    /// rate outside (0, 1).
+    BadParameter,
+    /// A non-scaling filter is full, or a scaling one hit the chain cap
+    /// (ADR-0016 D5). Refusing keeps the promised error rate true.
+    FilterFull,
 }
 
 pub struct StringStore<'a> {

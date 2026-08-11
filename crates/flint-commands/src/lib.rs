@@ -100,6 +100,14 @@ pub fn is_write_command(name: &[u8]) -> bool {
             | b"JSON.FORGET"
             | b"JSON.NUMINCRBY"
             | b"JSON.ARRAPPEND"
+            // Bloom filters (ADR-0016). BF.RESERVE creates the key and
+            // BF.ADD sets bits, so both mutate. None of them is
+            // `reduces_space`: a Bloom filter never shrinks — the only way
+            // to free its bytes is DEL, which is already in that set.
+            | b"BF.ADD"
+            | b"BF.MADD"
+            | b"BF.RESERVE"
+            | b"BF.INSERT"
     )
 }
 
@@ -159,6 +167,10 @@ pub fn is_read_command(name: &[u8]) -> bool {
             | b"JSON.GET"
             | b"JSON.TYPE"
             | b"JSON.ARRLEN"
+            | b"BF.EXISTS"
+            | b"BF.MEXISTS"
+            | b"BF.CARD"
+            | b"BF.INFO"
     )
 }
 
