@@ -13,6 +13,7 @@ lost. Format and rationale: [0001](0001-record-architecture-decisions.md).
 | [0012](0012-same-slot-transactions.md) | Same-slot MULTI / EXEC / WATCH: ship the three guarantees Flint can honestly give, document the fourth's absence |
 | [0013](0013-user-driven-gc-primitives.md) | User-driven GC primitives: no eviction, but a loop the operator can close |
 | [0014](0014-introspection-status-surface.md) | One status surface: a build stamp on every seat, `status --json` with drift detection, `CPMYSTATUS` for tenants (proposed) |
+| [0016](0016-bloom-filter-type.md) | Bloom filters as a native type: RedisBloom's `BF.*` protocol over a blocked filter, one row per block |
 
 ## Why the numbering has a gap
 
