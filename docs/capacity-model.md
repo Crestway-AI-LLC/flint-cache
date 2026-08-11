@@ -159,3 +159,39 @@ ceiling with balanced slots (expand); proxy `active` conns pinned at the
 admission cap fleet-wide (add proxies, not pairs); replication lag
 persistently near the cap under normal load (the pair is write-saturated:
 expand and drain its hottest slots first).
+
+## What rebalancing cannot fix: a single key that is too hot
+
+Every mechanism above moves SLOTS. A slot is the smallest unit the planner
+has, so a hot slot can be relocated but never divided — and one key is
+always entirely inside one slot. When the heat is one key, adding pairs and
+rebalancing move the problem rather than reducing it, and the dashboard will
+keep reporting a hot slot that no policy can flatten.
+
+**A large Bloom filter is the sharpest case, because it is hot by
+construction** (ADR-0016). `BF.*` stores a filter as subkey rows under one
+logical key: every `BF.ADD` and `BF.EXISTS` for that filter lands on the
+same slot, no matter how large the filter grows or how many pairs the
+cluster has. A filter sized for 100 M items is one hot key, and
+`FLINTSLOTHEAT` will correctly report it as a hotspot.
+
+Say this plainly before someone files it as a bug in the rebalancer: it is
+not a rebalancer defect, and the fix is not a bigger cluster. The options,
+in the order worth trying:
+
+- **Shard at the application level** — `filter:{0}`, `filter:{1}`, … with
+  the item's own hash choosing the shard. Different hash tags mean
+  different slots, so N shards spread across N slots and the planner can
+  place them. This is the answer nearly every time; a Bloom filter shards
+  cleanly because membership is per-item and needs no cross-shard read.
+- **Accept it** if the rate fits inside one pair. One pair serves the whole
+  filter, and a filter answering under the per-node ops ceiling is simply a
+  well-used key, not a problem.
+- **Read replicas** if the load is read-dominated (`BF.EXISTS` far
+  outnumbering `BF.ADD`), which the replica-reads tenant flag already
+  allows and which costs nothing new here.
+
+The same reasoning applies to any single key large or busy enough to matter
+— a huge hash, a hot list — but Bloom filters are where a user is most
+likely to build one deliberately, because the natural mental model is "one
+filter for the whole dataset".

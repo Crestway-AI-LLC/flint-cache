@@ -237,13 +237,23 @@ Four deliberate differences, all confirmed against RedisBloom 2.8.16 by
   scaling filter the caller believes is capped.
 
 Plus **defaults differ.** An auto-created filter (a `BF.ADD` with no prior
-  `BF.RESERVE`) is sized for 100,000 items rather than RedisBloom's 100,
-  and a scaling chain is capped at 32 links. Both are constants today, not
-  yet flags. Every link in a chain is another disk read on every lookup
-  here, not a pointer chase, so RedisBloom's default would leave a filter
-  that grew to a million items reading ~14 blocks per `BF.EXISTS` — a p99
-  set by a default nobody chose. Reaching the cap is an error, not a
-  silent degradation past the error rate you asked for.
+`BF.RESERVE`) is sized for 100,000 items rather than RedisBloom's 100, and a
+scaling chain is capped at 32 links. Every link in a chain is another disk
+read on every lookup here, not a pointer chase, so RedisBloom's default would
+leave a filter that grew to a million items reading ~14 blocks per
+`BF.EXISTS` — a p99 set by a default nobody chose. Reaching the cap is an
+error, not a silent degradation past the error rate you asked for.
+
+Both stay **constants, deliberately, rather than becoming node flags.** The
+default capacity is baked into a filter's stored metadata at creation, so a
+per-node flag would mean two nodes in one cluster creating differently sized
+filters for the same tenant depending on which slot the key landed in — and
+a slot migration would then move a filter built to another node's idea of
+the default. That is a data-consistency knob wearing a tuning knob's
+clothes. If these become configurable they belong on the CP snapshot beside
+`replica_reads` and `async_writes`, where a cluster has one answer; a
+`--bloom-default-capacity` on `flint-server` would be a mistake that only
+shows up on a multi-node fleet.
 
 `BF.CARD` counts items the filter ACCEPTED. An item that false-positives on
 insert is reported already-present and never counted, so the card can read
