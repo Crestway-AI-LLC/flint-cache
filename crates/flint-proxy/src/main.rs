@@ -149,6 +149,25 @@ struct TenantGrant {
     rate: u64,
 }
 
+/// A single-use channel grant (ADR-0010 D2). The proxy mints one when it
+/// admits a family command — mapping an unguessable token to the tenant
+/// namespace a co-processor may act in, a per-command budget, and a deadline —
+/// and `PROXYCHAN <token>` consumes it to open a channel connection pinned to
+/// `ns`. The token names a namespace the CO-PROCESSOR never can: `FLINTNS`, like
+/// every `FLINT*`, is refused at the edge before auth (the #151 guard), so the
+/// grant is the ONLY way a channel's namespace is set.
+///
+/// `budget` is recorded here and enforced in step 4 (D3, the resource class);
+/// step 2 enforces single-use (`used`) and the deadline (refused at open, and
+/// the channel is closed once it outlives the deadline).
+struct ChannelGrant {
+    ns: Vec<u8>,
+    #[allow(dead_code)]
+    budget: u64,
+    deadline: Instant,
+    used: bool,
+}
+
 /// Per-namespace token bucket state (tokens, last refill).
 type BucketMap = HashMap<Vec<u8>, (f64, Instant)>;
 
@@ -389,6 +408,11 @@ struct Topology {
     /// Last promotion hint applied ("<addr>|<gen>"). Compared for
     /// INEQUALITY — see apply_promote_hint.
     last_promote_hint: RwLock<String>,
+    /// Single-use channel tokens (ADR-0010 D2): token -> grant. Populated by
+    /// `PROXYCHANMINT` (step 3 will mint internally when admitting a family
+    /// command) and consumed by `PROXYCHAN`. Swept of dead entries on each
+    /// mint so it cannot grow without bound.
+    channel_tokens: std::sync::Mutex<HashMap<String, ChannelGrant>>,
 }
 
 impl Topology {
@@ -1221,6 +1245,10 @@ enum AuthStep {
     Reply(Value),
     /// Authorized: proceed in this namespace.
     Proceed(Vec<u8>),
+    /// `PROXYCHAN` opened a single-use channel (ADR-0010 D2). The namespace is
+    /// already pinned into `authed_ns`; this carries the grant's deadline so
+    /// the connection loop closes the channel once it outlives it.
+    ChannelOpen(Instant),
 }
 
 /// Redis-shaped auth gate. AUTH <token> or AUTH <user> <token> (the user is
@@ -1253,6 +1281,99 @@ fn auth_step(
             "NOAUTH admin token required for this command".into(),
         ))
     };
+    // ADR-0010 D2 step 2. PROXYCHANMINT mints a single-use channel token for
+    // (namespace, budget, deadline); PROXYCHAN consumes one to open a channel
+    // connection pinned to that namespace. In production step 3 mints
+    // internally when it admits a family command — this admin command is the
+    // ops/test entry to the same table until then. Both are PROXY*, NOT FLINT*,
+    // precisely so they reach this arm: the #151 guard refuses every FLINT*
+    // above auth, which is why the opener could not keep its FLINTCHAN name.
+    if name.as_deref() == Some(b"PROXYCHANMINT") {
+        if admin_locked {
+            return admin_denied();
+        }
+        // PROXYCHANMINT <namespace> <budget> <deadline-ms>
+        let Some([ns, budget_a, deadline_a]) = args.get(1..4) else {
+            return AuthStep::Reply(Value::Error(
+                "ERR usage: PROXYCHANMINT <namespace> <budget> <deadline-ms>".into(),
+            ));
+        };
+        let Some(budget) = std::str::from_utf8(budget_a).ok().and_then(|s| s.parse::<u64>().ok())
+        else {
+            return AuthStep::Reply(Value::Error("ERR budget must be an integer".into()));
+        };
+        let Some(deadline_ms) = std::str::from_utf8(deadline_a)
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+        else {
+            return AuthStep::Reply(Value::Error("ERR deadline-ms must be an integer".into()));
+        };
+        let token = flint_tls::mint_token();
+        let deadline = Instant::now() + std::time::Duration::from_millis(deadline_ms);
+        let Ok(mut tokens) = topo.channel_tokens.lock() else {
+            return AuthStep::Reply(Value::Error("ERR channel token lock".into()));
+        };
+        // Sweep dead entries first, so the table cannot grow without bound.
+        let now = Instant::now();
+        tokens.retain(|_, g| !g.used && g.deadline > now);
+        tokens.insert(
+            token.clone(),
+            ChannelGrant {
+                ns: ns.clone(),
+                budget,
+                deadline,
+                used: false,
+            },
+        );
+        return AuthStep::Reply(Value::Bulk(Some(token.into_bytes())));
+    }
+    if name.as_deref() == Some(b"PROXYCHAN") {
+        // Opened on a FRESH connection: a channel must never be layerable onto
+        // an already-authed tenant session, or a tenant holding a leaked token
+        // could re-point itself at the grant's namespace.
+        if authed_ns.is_some() || *is_admin {
+            return AuthStep::Reply(Value::Error(
+                "ERR PROXYCHAN must open a channel on a fresh connection".into(),
+            ));
+        }
+        let Some(tok_arg) = args.get(1) else {
+            return AuthStep::Reply(Value::Error("ERR usage: PROXYCHAN <token>".into()));
+        };
+        let token = String::from_utf8_lossy(tok_arg).into_owned();
+        let Ok(mut tokens) = topo.channel_tokens.lock() else {
+            return AuthStep::Reply(Value::Error("ERR channel token lock".into()));
+        };
+        // Decide from an immutable read, THEN mutate — no borrow held across
+        // the remove/mark.
+        enum V {
+            Invalid,
+            Used,
+            Expired,
+            Open(Vec<u8>, Instant),
+        }
+        let verdict = match tokens.get(&token) {
+            None => V::Invalid,
+            Some(g) if g.used => V::Used,
+            Some(g) if Instant::now() >= g.deadline => V::Expired,
+            Some(g) => V::Open(g.ns.clone(), g.deadline),
+        };
+        return match verdict {
+            V::Invalid => AuthStep::Reply(Value::Error("WRONGPASS invalid channel token".into())),
+            V::Used => AuthStep::Reply(Value::Error("ERR channel token already used".into())),
+            V::Expired => {
+                tokens.remove(&token);
+                AuthStep::Reply(Value::Error("ERR channel token expired".into()))
+            }
+            V::Open(ns, deadline) => {
+                // Single-use: consume on open, so a second PROXYCHAN finds it used.
+                if let Some(g) = tokens.get_mut(&token) {
+                    g.used = true;
+                }
+                *authed_ns = Some(ns);
+                AuthStep::ChannelOpen(deadline)
+            }
+        };
+    }
     // Ops query: per-token AUTH count (drain check during token rotation).
     // Requires knowing the exact token; low-sensitivity, answered pre-auth.
     // (A real deploy gates this behind mTLS/admin.)
@@ -1525,6 +1646,10 @@ fn serve_client<S: Read + Write>(mut stream: S, topo: Arc<Topology>) -> std::io:
     let mut async_writes = false;
     // Admin session (AUTH <admin-token>): unlocks the operator surface only.
     let mut is_admin = false;
+    // Set once `PROXYCHAN` opens a channel (ADR-0010 D2): the grant's deadline.
+    // A channel that outlives it is closed on its next command — the token
+    // dies with the family command it was minted for. `None` for tenants.
+    let mut channel_deadline: Option<Instant> = None;
     // The RESP dialect THIS client negotiated, set by HELLO. Backends
     // always answer us in RESP3 so their replies keep their types; this is
     // what we downgrade to on the way back out.
@@ -1623,6 +1748,23 @@ fn serve_client<S: Read + Write>(mut stream: S, topo: Arc<Topology>) -> std::io:
                             }
                         }
                     }
+                    // A channel (PROXYCHAN) dies with the family command's
+                    // deadline: past it the connection is closed on its next
+                    // command rather than served (ADR-0010 D2). Checked after
+                    // decode and before any auth or forward, so an expired
+                    // channel cannot issue even one more command. `None` for
+                    // tenants — their path is untouched.
+                    if let Some(dl) = channel_deadline
+                        && Instant::now() >= dl
+                    {
+                        encode_proto(
+                            &Value::Error("ERR channel deadline exceeded".into()),
+                            proto,
+                            &mut out,
+                        );
+                        stream.write_all(&out)?;
+                        return Ok(());
+                    }
                     // Tenant-perceived latency starts here: everything the
                     // proxy does for this command — cache lookup, routing,
                     // backend round trip, MOVED/failover retries — is what
@@ -1661,6 +1803,13 @@ fn serve_client<S: Read + Write>(mut stream: S, topo: Arc<Topology>) -> std::io:
                             &args,
                         ) {
                             AuthStep::Reply(v) => v,
+                            AuthStep::ChannelOpen(deadline) => {
+                                // PROXYCHAN pinned authed_ns to the grant's
+                                // namespace; record the deadline so this
+                                // connection is closed once it outlives it.
+                                channel_deadline = Some(deadline);
+                                Value::Simple("OK".into())
+                            }
                             AuthStep::Proceed(ns) => data_command(
                                 &topo,
                                 &mut backends,
@@ -2589,6 +2738,7 @@ fn main() -> std::io::Result<()> {
         backend_tls,
         cert_path: arg("--internal-cert"),
         last_promote_hint: RwLock::new(String::new()),
+        channel_tokens: std::sync::Mutex::new(HashMap::new()),
         admin_digests: RwLock::new(
             arg("--admin-token")
                 .map(|t| vec![flint_tls::sha256_hex(t.as_bytes())])
@@ -2729,6 +2879,7 @@ mod route_tests {
             cert_path: None,
             admin_digests: RwLock::new(Vec::new()),
             last_promote_hint: RwLock::new(String::new()),
+            channel_tokens: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
