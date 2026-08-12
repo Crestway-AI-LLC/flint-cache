@@ -289,6 +289,40 @@ fn parse_vector(bytes: &[u8]) -> Result<Vec<f32>, String> {
     Ok(out)
 }
 
+/// Inverse of [`durable_key`]: split a co-processor key into `(kind, set, id)`,
+/// or `None` for any key not under [`KEY_PREFIX`] (a foreign key the rebuild
+/// scan skips). `id` is empty for a config key. Used by the cold-start rebuild
+/// to reconstruct the index from the durable rows (ADR-0017 D3).
+pub fn parse_durable_key(key: &[u8]) -> Option<(u8, Vec<u8>, Vec<u8>)> {
+    let rest = key.strip_prefix(KEY_PREFIX)?;
+    if rest.len() < 2 || rest[1] != 0 {
+        return None; // expected <kind><NUL>...
+    }
+    let kind = rest[0];
+    let after = &rest[2..];
+    match after.iter().position(|&b| b == 0) {
+        Some(i) => Some((kind, after[..i].to_vec(), after[i + 1..].to_vec())),
+        None => Some((kind, after.to_vec(), Vec::new())),
+    }
+}
+
+/// Inverse of [`encode_vec_row`]: `(vector, optional meta)` from a durable
+/// vector value (comma-floats, then meta after a 0x1f separator).
+pub fn decode_vec_row(val: &[u8]) -> Result<(Vec<f32>, Option<Vec<u8>>), String> {
+    let (floats, meta) = match val.iter().position(|&b| b == 0x1f) {
+        Some(i) => (&val[..i], Some(val[i + 1..].to_vec())),
+        None => (val, None),
+    };
+    Ok((parse_vector(floats)?, meta))
+}
+
+/// Inverse of a config row: `<dim>|<metric>`.
+pub fn decode_config(val: &[u8]) -> Option<(usize, Metric)> {
+    let s = std::str::from_utf8(val).ok()?;
+    let (d, m) = s.split_once('|')?;
+    Some((d.parse().ok()?, Metric::parse(m.as_bytes())?))
+}
+
 fn valid_name(b: &[u8]) -> bool {
     !b.is_empty() && !b.contains(&0)
 }
@@ -743,6 +777,49 @@ mod tests {
         let mut want_cfg = vec![b'c', 0];
         want_cfg.extend_from_slice(b"docs");
         assert_eq!(&cfg[KEY_PREFIX.len()..], want_cfg.as_slice());
+    }
+
+    #[test]
+    fn durable_rows_round_trip_for_rebuild() {
+        let st = Store::new();
+        // CREATE's config Put decodes back to (dim, metric).
+        match st.plan(
+            b"n",
+            &cmd(&["VEC.CREATE", "docs", "DIM", "4", "METRIC", "cosine"]),
+        ) {
+            Plan::Write {
+                persist: Persist::Put { key, val },
+                ..
+            } => {
+                assert_eq!(parse_durable_key(&key), Some((b'c', v("docs"), Vec::new())));
+                assert_eq!(decode_config(&val), Some((4, Metric::Cosine)));
+            }
+            _ => panic!("create should plan a config Put"),
+        }
+        // SET's vector Put decodes back to (vec, meta).
+        let mut st = st;
+        run(
+            &mut st,
+            b"n",
+            &cmd(&["VEC.CREATE", "docs", "DIM", "4", "METRIC", "cosine"]),
+        );
+        match st.plan(
+            b"n",
+            &cmd(&["VEC.SET", "docs", "id9", "1,2,3,4", "META", "m!"]),
+        ) {
+            Plan::Write {
+                persist: Persist::Put { key, val },
+                ..
+            } => {
+                assert_eq!(parse_durable_key(&key), Some((b'v', v("docs"), v("id9"))));
+                let (vec, meta) = decode_vec_row(&val).expect("decode vec row");
+                assert_eq!(vec, vec![1.0, 2.0, 3.0, 4.0]);
+                assert_eq!(meta, Some(v("m!")));
+            }
+            _ => panic!("set should plan a vector Put"),
+        }
+        // A foreign (non-prefixed) key is not one of ours — the scan skips it.
+        assert_eq!(parse_durable_key(b"regular:key"), None);
     }
 
     #[test]
