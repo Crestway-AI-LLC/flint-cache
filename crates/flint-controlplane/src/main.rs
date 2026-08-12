@@ -543,6 +543,11 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
             if prefix.is_empty() || endpoints.is_empty() {
                 return err("CPFAMILY <prefix> <host:port[,host:port]>");
             }
+            if !crate::tenant::valid_family_prefix(&prefix) {
+                return err(
+                    "CPFAMILY <prefix> must be printable ASCII without spaces, '=', ';' or ','",
+                );
+            }
             let Ok(mut st) = shared.state.lock() else {
                 return err("state lock");
             };

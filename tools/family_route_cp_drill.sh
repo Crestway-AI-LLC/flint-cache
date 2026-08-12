@@ -47,7 +47,15 @@ fleet_cp 6683 CPADDPAIR 127.0.0.1:6698
 fleet_cp 6683 CPADDTENANT t1 tok1 ns1 1
 $B --port 6698 --engine rocks --data-dir "$D/m" 2>/dev/null &
 fleet_wait_listen 6698
-$PX --port 6699 --control-plane 127.0.0.1:6683 --advertise 127.0.0.1:6699 2>"$D/px.log" &
+# --edge-advertise is REQUIRED for this drill to test what it claims: without a
+# callback address family_command short-circuits to -COPROCUNAVAIL at the
+# edge_advertise guard BEFORE ever dialing the endpoint, so the dead-endpoint
+# dial path (the thing the -COPROCUNAVAIL is supposed to prove reached) would
+# never run. With it set, VEC.SET mints a token and actually dials the DEAD
+# 127.0.0.1:1, which is refused — so -COPROCUNAVAIL means "registered + dialed +
+# endpoint down", the mechanism the comments describe.
+$PX --port 6699 --control-plane 127.0.0.1:6683 --advertise 127.0.0.1:6699 \
+    --edge-advertise 127.0.0.1:6699 2>"$D/px.log" &
 fleet_wait_listen 6699
 
 A="valkey-cli -p 6699 -a tok1 --no-auth-warning"
@@ -76,7 +84,10 @@ echo "$R" | grep -qi "COPROCUNAVAIL" \
 echo "  VEC.SET -> $R  (master's unknown-command, as expected)"
 
 echo "== CPFAMILY VEC. propagates from the CP to the flag-less proxy"
-valkey-cli -p 6683 CPFAMILY VEC. "$DEAD" >/dev/null || { echo "FAIL: CPFAMILY rejected"; exit 1; }
+# fleet_cp, not `valkey-cli ... || exit`: valkey-cli exits 0 even on a -ERR
+# reply, so a rejected CPFAMILY would slip past `||` and only surface 10s later
+# as the misleading "never reached the proxy". fleet_cp checks the OK reply.
+fleet_cp 6683 CPFAMILY VEC. "$DEAD"
 R=$(wait_reply COPROCUNAVAIL VEC.SET k v) \
   || { echo "FAIL: CPFAMILY never reached the proxy (VEC.SET never became COPROCUNAVAIL): $R"; exit 1; }
 echo "  VEC.SET -> $R  (registered via CP, endpoint dead)"
@@ -89,7 +100,7 @@ echo "$E" | grep -qi "COPROCUNAVAIL" \
 echo "  MAT.MUL -> $E  (still the master; element 7 applied precisely)"
 
 echo "== CPFAMILYCLEAR propagates: the emptied element 7 CLEARS the table"
-valkey-cli -p 6683 CPFAMILYCLEAR VEC. >/dev/null || { echo "FAIL: CPFAMILYCLEAR rejected"; exit 1; }
+fleet_cp 6683 CPFAMILYCLEAR VEC.
 # Success = VEC.SET stops being COPROCUNAVAIL (falls back to the master).
 ok=0
 for _ in $(seq 1 100); do

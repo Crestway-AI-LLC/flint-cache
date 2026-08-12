@@ -845,6 +845,12 @@ async fn handle_admin(ha: &Ha, args: &[Vec<u8>]) -> Value {
             if prefix.is_empty() || endpoints.is_empty() {
                 return Value::Error("ERR CPFAMILY <prefix> <host:port[,host:port]>".into());
             }
+            if !crate::tenant::valid_family_prefix(&prefix) {
+                return Value::Error(
+                    "ERR CPFAMILY <prefix> must be printable ASCII without spaces, '=', ';' or ','"
+                        .into(),
+                );
+            }
             match ha.propose(Mutation::SetFamily { prefix, endpoints }).await {
                 Ok(_) => Value::Simple("OK".into()),
                 Err(l) => redirect(l),

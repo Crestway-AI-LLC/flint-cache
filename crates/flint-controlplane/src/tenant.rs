@@ -242,6 +242,24 @@ pub fn promote_hint(promoted: &Option<(String, u64)>) -> String {
     }
 }
 
+/// A command-family prefix must survive BOTH serialization grammars unchanged:
+/// the snapshot wire spec `PREFIX=addr,addr;PREFIX=addr` (so no `=` `;` `,`)
+/// and the single-node persistence line `family PREFIX addr,addr`, which the
+/// reload splits on spaces (so no ASCII whitespace). It must also be printable
+/// ASCII — a control byte or DEL is not a real command prefix. Enforced at the
+/// CPFAMILY handlers because a prefix that violates this round-trips one way in
+/// and a different way out: registered as `VEC SET`, reloaded after a CP
+/// restart as prefix `VEC` routing to a bogus endpoint `SET`, with no command
+/// ever re-issued to reveal the drift. `is_ascii_graphic` is exactly the
+/// 0x21..=0x7E printable-non-space range, so it already excludes space, tab,
+/// newline, CR and NUL; the `matches!` adds the three wire delimiters.
+pub fn valid_family_prefix(prefix: &str) -> bool {
+    !prefix.is_empty()
+        && prefix
+            .bytes()
+            .all(|b| b.is_ascii_graphic() && !matches!(b, b'=' | b';' | b','))
+}
+
 /// Render the co-processor family route table (ADR-0010 D1) into snapshot
 /// element 7's wire grammar `PREFIX=addr,addr;PREFIX=addr` — the ONE format
 /// the proxy's `parse_families` reads, produced by the ONE function (this
@@ -339,5 +357,29 @@ mod tests {
         rot.prev_token = Some("old-tok".into());
         let (_, ts) = snapshot_for(&pairs, &ranges, [rot].iter(), "p1");
         assert_eq!(ts, "tok-rot=rot#r,old-tok=rot#r");
+    }
+
+    #[test]
+    fn a_family_prefix_that_breaks_a_grammar_is_rejected() {
+        // Real prefixes: alphanumerics, the dot separator, underscores/dashes.
+        for ok in ["VEC.", "JSON.", "BF.", "FT.", "TS.", "A", "X_Y-Z.1"] {
+            assert!(valid_family_prefix(ok), "{ok:?} should be accepted");
+        }
+        // Empty, whitespace (breaks the single-node `family P addr` line), the
+        // three wire delimiters, and control/DEL bytes are all rejected — each
+        // would round-trip inconsistently through one of the two grammars.
+        for bad in [
+            "",        // never a valid prefix
+            "VEC SET", // space → reload splits it, prefix becomes "VEC"
+            "A\tB",    // tab is ASCII whitespace too
+            "A\nB",    // newline drops the family entirely on reload
+            "A=B",     // wire `PREFIX=addr` delimiter
+            "A;B",     // wire family separator
+            "A,B",     // wire endpoint separator
+            "A\x01B",  // control byte
+            "A\x7fB",  // DEL
+        ] {
+            assert!(!valid_family_prefix(bad), "{bad:?} should be rejected");
+        }
     }
 }

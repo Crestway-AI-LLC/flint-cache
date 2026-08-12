@@ -94,8 +94,11 @@ fleet_wait_ping 6674
 fleet_cp 6674 CPADDPROXY 127.0.0.1:6673
 fleet_cp 6674 CPADDPAIR 127.0.0.1:6672
 fleet_cp 6674 CPADDTENANT tenX tokX nsX 1          # subset 1 -> the proxy sees the full rate
-valkey-cli -p 6674 CPTENANTQUOTA tenX 2 0 >/dev/null || { echo "FAIL: CPTENANTQUOTA"; exit 1; }
-valkey-cli -p 6674 CPFAMILY VEC. 127.0.0.1:6675 >/dev/null || { echo "FAIL: CPFAMILY"; exit 1; }
+# fleet_cp, not `valkey-cli ... || exit`: valkey-cli exits 0 on a -ERR reply, so
+# a rejected CPTENANTQUOTA/CPFAMILY would slip past `||` and mislead the failure
+# into "exemption broke" when the real cause was a rejected bootstrap command.
+fleet_cp 6674 CPTENANTQUOTA tenX 2 0
+fleet_cp 6674 CPFAMILY VEC. 127.0.0.1:6675
 $B --port 6672 --engine rocks --data-dir "$D/m" 2>/dev/null &
 fleet_wait_listen 6672
 # --edge-advertise is what a co-processor dials back on for the channel; it is

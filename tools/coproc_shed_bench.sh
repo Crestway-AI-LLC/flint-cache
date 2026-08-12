@@ -63,7 +63,15 @@ def bump():
     with _lock:
         _handled += 1
         if _handled % 50 == 0:
-            try: open(CNTFILE, "w").write(str(_handled))
+            # Write atomically: open("w") TRUNCATES before the buffered write
+            # flushes, so a handled() cat landing in that window reads an empty
+            # file and `$((h1 - h0))` gets an empty operand -> spurious MIN_FAM
+            # fail. A temp file + os.replace lets a reader see the old count or
+            # the new one, never a truncated one.
+            try:
+                tmp = CNTFILE + ".tmp"
+                with open(tmp, "w") as fh: fh.write(str(_handled))
+                os.replace(tmp, CNTFILE)
             except OSError: pass
 def read_array(f):
     line = f.readline()

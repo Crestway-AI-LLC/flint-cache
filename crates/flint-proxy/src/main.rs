@@ -558,8 +558,17 @@ impl Topology {
                         Err(_) => break, // endpoint down; next endpoint
                     },
                 };
-                let _ = stream.set_read_timeout(Some(deadline));
-                let _ = stream.set_write_timeout(Some(deadline));
+                // A socket we cannot bound is a socket that can hang an
+                // in-flight slot forever (a co-processor that accepts but never
+                // replies). If the deadline cannot be applied, drop this
+                // connection rather than proceed unbounded — the boot check
+                // already rejects a zero deadline, so this is the belt to that
+                // suspenders.
+                if stream.set_read_timeout(Some(deadline)).is_err()
+                    || stream.set_write_timeout(Some(deadline)).is_err()
+                {
+                    continue;
+                }
                 match call_raw(&mut stream, &mut buf, frame) {
                     Ok(v) => {
                         if let Ok(mut p) = self.coproc_pool.lock() {
@@ -924,11 +933,26 @@ impl Topology {
     /// then the ops/s token bucket (burst = one second of rate). Returns
     /// the error reply to send, or None to proceed. Tenants with no quota
     /// row (or the static/open modes) pay one read-lock lookup and pass.
-    fn quota_gate(&self, ns: &[u8], name: &[u8], is_write: bool) -> Option<Value> {
+    ///
+    /// `rate_exempt` skips ONLY the ops/s bucket, not the storage verdict.
+    /// A co-processor channel's writes are rate-exempt (ADR-0010 D1: the family
+    /// command paid the ops/s charge once at admission, so re-charging each
+    /// channel write would make one `VEC.SET` cost an implementation-defined
+    /// number of tokens) — but they still GROW storage, so a channel that
+    /// writes to an over-quota tenant must be shed just like a direct write, or
+    /// the per-tenant storage cap is unenforceable on the co-processor path.
+    fn quota_gate(
+        &self,
+        ns: &[u8],
+        name: &[u8],
+        is_write: bool,
+        rate_exempt: bool,
+    ) -> Option<Value> {
         let (rate, over) = *self.quota.read().ok()?.get(ns)?;
         // Space-REDUCING writes stay allowed over-quota — the self-clear
         // path is the tenant deleting data, which must never be blocked by
-        // the very state it cures. Shared with the server's disk gate.
+        // the very state it cures. Shared with the server's disk gate. This
+        // verdict applies to a channel's writes too (see `rate_exempt`).
         if over && is_write && !flint_commands::reduces_space(name) {
             self.stat_quota_write_shed_total
                 .fetch_add(1, Ordering::Relaxed);
@@ -937,7 +961,7 @@ impl Topology {
                     .into(),
             ));
         }
-        if rate == 0 {
+        if rate_exempt || rate == 0 {
             return None;
         }
         let mut buckets = self.buckets.lock().ok()?;
@@ -2352,6 +2376,18 @@ fn parse_families(s: &str) -> Vec<(Vec<u8>, Vec<String>)> {
     out
 }
 
+/// Parse an optional non-negative integer proxy knob. Absent → None (the caller
+/// applies the default); present-but-unparseable is an operator error caught at
+/// boot — the same fail-fast discipline `--tenants` uses. A silently-defaulted
+/// knob (`--family-deadline-ms fife` quietly becoming 5 s) is a footgun that
+/// only surfaces as mysterious behavior under load, long after the typo.
+fn parse_u64_knob(flag: &str, raw: Option<String>) -> Option<u64> {
+    raw.map(|s| {
+        s.parse::<u64>()
+            .unwrap_or_else(|_| panic!("{flag}: expected a non-negative integer, got {s:?}"))
+    })
+}
+
 /// A family channel's data-command budget and deadline, fixed at token-mint
 /// time (ADR-0010 D3). The deadline is enforced by the channel loop (step 2);
 /// the budget is recorded now and enforced in step 4. Constants here; step 4
@@ -2393,8 +2429,9 @@ fn family_command(topo: &Topology, ns: &[u8], args: &[Vec<u8>]) -> Value {
         return unavail();
     };
     // D1: charge the tenant ONCE, at admission, before the dial. If shed
-    // (throttled), the command is not forwarded — nothing was admitted.
-    if let Some(shed) = topo.quota_gate(ns, name, false) {
+    // (throttled), the command is not forwarded — nothing was admitted. Not
+    // rate-exempt: this IS the single ops/s charge for the whole operation.
+    if let Some(shed) = topo.quota_gate(ns, name, false, false) {
         return shed;
     }
     // Mint the single-use channel token the co-processor will PROXYCHAN with.
@@ -2426,19 +2463,6 @@ impl Drop for InflightGuard<'_> {
     fn drop(&mut self) {
         self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
     }
-}
-
-/// Does the granting tenant's ops/s + storage quota apply to THIS command?
-/// (ADR-0010 D1.) Only data commands are ever charged — PING/ECHO/QUIT cost
-/// the proxy nothing — and a CHANNEL's data commands are EXEMPT: the family
-/// command that opened the channel was already charged once at admission
-/// (`family_command`), so re-charging the co-processor's storage would make one
-/// `VEC.SET` cost an implementation-defined number of tokens. Named and tested
-/// because the exemption is a single easily-deleted `!is_channel`, and the
-/// symptom of deleting it (a co-processor throttled mid-operation on a busy
-/// tenant) would not surface in any static, CP-less drill.
-fn tenant_quota_applies(is_data: bool, is_channel: bool) -> bool {
-    is_data && !is_channel
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2474,18 +2498,33 @@ fn data_command(
         && let Some(name) = args.first()
         && topo.family_registered(name)
     {
+        // A co-processor's CHANNEL must not itself issue a family command. If it
+        // did, family_command would reserve a FRESH in-flight slot and mint a
+        // NEW channel token with a fresh budget and deadline — so a looping or
+        // buggy co-processor could re-enter the family path without bound, which
+        // is exactly the runaway the D3 resource class exists to cap. The
+        // channel does STORAGE (read/write); families are a client-edge verb.
+        // Refuse it flatly: no slot, no token, no dial (D3).
+        if is_channel {
+            return Value::Error(
+                "ERR family commands are not available on a co-processor channel".into(),
+            );
+        }
         return family_command(topo, ns, args);
     }
     // M5 quota gate: a shed command must not touch the cache, a backend, or
     // the bucket-bypassing fast paths. Only data commands are charged
     // (PING/ECHO/QUIT are free; they cost this proxy nothing). A CHANNEL's
-    // data commands are EXEMPT (ADR-0010 D1): the family command was charged
-    // once at admission, and re-charging the co-processor's storage would make
-    // one VEC.SET cost an implementation-defined number of tokens.
+    // data commands are RATE-exempt (ADR-0010 D1): the family command was
+    // charged the ops/s rate once at admission, and re-charging each channel
+    // write would make one VEC.SET cost an implementation-defined number of
+    // tokens. They are NOT storage-exempt — a channel that writes to an
+    // over-quota tenant is shed just like a direct write (quota_gate's storage
+    // verdict), or the per-tenant storage cap leaks through the co-processor.
     let is_data = is_write || is_read;
-    if tenant_quota_applies(is_data, is_channel)
+    if is_data
         && let Some(name) = args.first()
-        && let Some(shed) = topo.quota_gate(ns, name, is_write)
+        && let Some(shed) = topo.quota_gate(ns, name, is_write, is_channel)
     {
         return shed;
     }
@@ -3084,16 +3123,33 @@ fn main() -> std::io::Result<()> {
         coproc_pool: std::sync::Mutex::new(HashMap::new()),
         edge_advertise: arg("--edge-advertise"),
         coproc_inflight: std::sync::atomic::AtomicUsize::new(0),
-        coproc_max_inflight: arg("--family-max-inflight")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(64),
-        family_budget: arg("--family-budget")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(FAMILY_CHANNEL_BUDGET),
-        family_deadline: arg("--family-deadline-ms")
-            .and_then(|s| s.parse().ok())
-            .map(Duration::from_millis)
-            .unwrap_or(FAMILY_CHANNEL_DEADLINE),
+        coproc_max_inflight: {
+            let v =
+                parse_u64_knob("--family-max-inflight", arg("--family-max-inflight")).unwrap_or(64);
+            assert!(
+                v >= 1,
+                "--family-max-inflight must be >= 1 (a 0 cap sheds every family command; to disable families, omit --families)"
+            );
+            v as usize
+        },
+        family_budget: {
+            let v = parse_u64_knob("--family-budget", arg("--family-budget"))
+                .unwrap_or(FAMILY_CHANNEL_BUDGET);
+            assert!(
+                v >= 1,
+                "--family-budget must be >= 1 (a 0 budget refuses all channel I/O)"
+            );
+            v
+        },
+        family_deadline: {
+            let ms = parse_u64_knob("--family-deadline-ms", arg("--family-deadline-ms"))
+                .unwrap_or(FAMILY_CHANNEL_DEADLINE.as_millis() as u64);
+            assert!(
+                (1..=300_000).contains(&ms),
+                "--family-deadline-ms must be 1..=300000 (0 disables the co-processor socket read timeout; a huge value risks Instant overflow)"
+            );
+            Duration::from_millis(ms)
+        },
         admin_digests: RwLock::new(
             arg("--admin-token")
                 .map(|t| vec![flint_tls::sha256_hex(t.as_bytes())])
@@ -3348,19 +3404,134 @@ mod route_tests {
         );
     }
 
-    /// D1: a channel's data commands are exempt from the tenant quota; a
-    /// tenant's are charged; nobody charges a non-data command. This is the
-    /// invariant the co-processor forward leans on — the family command pays
-    /// once at admission and the channel storage it fans out to pays nothing.
+    /// D1 (corrected): a channel's data commands are exempt from the ops/s
+    /// RATE — the family command paid that once at admission — but NOT from the
+    /// storage over-quota shed. A co-processor that keeps writing to a tenant
+    /// already over its storage cap would otherwise defeat the cap entirely, so
+    /// the channel's writes are shed exactly like a direct write. This is the
+    /// review gap: `rate_exempt` must not become storage-exempt.
     #[test]
-    fn channel_data_is_quota_exempt() {
-        // tenant data: charged.
-        assert!(tenant_quota_applies(true, false));
-        // channel data: EXEMPT — the whole point of D1.
-        assert!(!tenant_quota_applies(true, true));
-        // non-data (PING/ECHO/QUIT): never charged, tenant or channel.
-        assert!(!tenant_quota_applies(false, false));
-        assert!(!tenant_quota_applies(false, true));
+    fn channel_data_is_rate_exempt_but_not_storage_exempt() {
+        let t = two_pair_topo();
+        let ns = b"nsA".as_slice();
+
+        // over_quota=true, no ops/s limit: only the storage verdict is live.
+        t.quota
+            .write()
+            .expect("quota lock")
+            .insert(ns.to_vec(), (0, true));
+        // A channel WRITE to an over-quota tenant is still shed with -QUOTA,
+        // even though it is rate-exempt (rate_exempt=true).
+        match t.quota_gate(ns, b"SET", true, true) {
+            Some(Value::Error(e)) => {
+                assert!(
+                    e.starts_with("QUOTA"),
+                    "storage shed must apply to a channel write: {e}"
+                )
+            }
+            other => panic!("expected -QUOTA on an over-quota channel write, got {other:?}"),
+        }
+        // A channel READ is served — the storage verdict only sheds writes.
+        assert!(
+            t.quota_gate(ns, b"GET", false, true).is_none(),
+            "reads are served over-quota, channel or not"
+        );
+
+        // rate=1, not over quota: now the ops/s bucket is the only gate.
+        t.quota
+            .write()
+            .expect("quota lock")
+            .insert(ns.to_vec(), (1, false));
+        // Direct tenant traffic (rate_exempt=false) spends its one burst token,
+        // then the next op in the same instant is THROTTLED.
+        assert!(
+            t.quota_gate(ns, b"GET", false, false).is_none(),
+            "first tenant op passes"
+        );
+        match t.quota_gate(ns, b"GET", false, false) {
+            Some(Value::Error(e)) => {
+                assert!(
+                    e.starts_with("THROTTLED"),
+                    "tenant throttled after burst: {e}"
+                )
+            }
+            other => panic!("expected THROTTLED on the second tenant op, got {other:?}"),
+        }
+        // A channel (rate_exempt=true) is never throttled by the ops/s bucket,
+        // however many times it is called — the D1 rate exemption still holds.
+        for _ in 0..1000 {
+            assert!(
+                t.quota_gate(ns, b"GET", false, true).is_none(),
+                "channel data commands are rate-exempt"
+            );
+        }
+    }
+
+    /// D3: a co-processor's CHANNEL must not itself trigger a family command.
+    /// A channel issuing `VEC.SET` would re-enter family_command, reserve a
+    /// fresh in-flight slot and mint a new token with a fresh budget/deadline —
+    /// the unbounded re-entry the resource class exists to cap. It is refused
+    /// flatly with no slot taken, while the SAME command on a normal connection
+    /// still routes to the family path.
+    #[test]
+    fn a_channel_cannot_issue_a_family_command() {
+        let t = two_pair_topo();
+        t.families
+            .write()
+            .expect("families lock")
+            .push((b"VEC.".to_vec(), vec!["127.0.0.1:1".into()]));
+        let args: Vec<Vec<u8>> = vec![b"VEC.SET".to_vec(), b"k".to_vec(), b"v".to_vec()];
+        let mut backends = None;
+
+        // On a CHANNEL: refused flatly, and no in-flight slot is reserved (D3).
+        let mut txn_ch = ProxyTxn::default();
+        let on_channel = data_command(
+            &t,
+            &mut backends,
+            &mut txn_ch,
+            b"nsA",
+            &args,
+            b"",
+            false,
+            false,
+            false,
+            true,
+        );
+        match on_channel {
+            Value::Error(e) => assert!(
+                e.contains("not available on a co-processor channel"),
+                "a channel's family command must be refused flatly: {e}"
+            ),
+            other => panic!("expected a flat refusal on a channel, got {other:?}"),
+        }
+        assert_eq!(
+            t.coproc_inflight.load(std::sync::atomic::Ordering::Acquire),
+            0,
+            "the refused channel command must NOT reserve an in-flight slot"
+        );
+
+        // On a NORMAL connection: the SAME command still takes the family path
+        // (COPROCUNAVAIL here, since the test topo advertises no callback edge).
+        let mut txn = ProxyTxn::default();
+        let on_client = data_command(
+            &t,
+            &mut backends,
+            &mut txn,
+            b"nsA",
+            &args,
+            b"",
+            false,
+            false,
+            false,
+            false,
+        );
+        match on_client {
+            Value::Error(e) => assert!(
+                e.contains("COPROCUNAVAIL"),
+                "a normal connection's family command still routes to the family path: {e}"
+            ),
+            other => panic!("expected COPROCUNAVAIL on a normal connection, got {other:?}"),
+        }
     }
 
     #[test]
