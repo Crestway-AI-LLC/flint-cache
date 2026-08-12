@@ -664,6 +664,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "flint-vec"
+version = "0.0.1"
+dependencies = [
+ "flint-resp",
+]
+
+[[package]]
 name = "funty"
 version = "2.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

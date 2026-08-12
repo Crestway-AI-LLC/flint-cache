@@ -20,6 +20,7 @@ members = [
     "crates/flint-journal",
     "crates/flint-ctl",
     "crates/flint-exporter",
+    "crates/flint-vec",
 ]
 default-members = [
     "crates/flint-build",
@@ -39,6 +40,7 @@ default-members = [
     "crates/flint-journal",
     "crates/flint-ctl",
     "crates/flint-exporter",
+    "crates/flint-vec",
 ]
 
 [workspace.package]
