@@ -242,6 +242,22 @@ pub fn promote_hint(promoted: &Option<(String, u64)>) -> String {
     }
 }
 
+/// Render the co-processor family route table (ADR-0010 D1) into snapshot
+/// element 7's wire grammar `PREFIX=addr,addr;PREFIX=addr` — the ONE format
+/// the proxy's `parse_families` reads, produced by the ONE function (this
+/// module's whole reason to exist), shared by both CP modes. Ordered input
+/// (a `BTreeMap`) in, deterministic string out, so the watch loops can
+/// compare it for delta-suppression. Families with no endpoints are still
+/// emitted (`PREFIX=`): a registered-but-unreachable family answers
+/// `-COPROCUNAVAIL`, which is not the same as an unregistered one.
+pub fn families_spec(families: &std::collections::BTreeMap<String, Vec<String>>) -> String {
+    families
+        .iter()
+        .map(|(prefix, addrs)| format!("{prefix}={}", addrs.join(",")))
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
 /// `ns:slot:pair` for single-slot runs, `ns:lo-hi:pair` for wider ones,
 /// joined by ';' (empty when none).
 ///

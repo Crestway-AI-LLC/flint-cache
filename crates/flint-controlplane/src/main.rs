@@ -526,6 +526,61 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
             shared.changed.notify_all();
             ok()
         }
+        // Co-processor command families (ADR-0010 D1): the CP is the fleet's
+        // single source for the family route table (proxies otherwise only get
+        // it from the static --families flag). Prefix uppercased so state is
+        // canonical; endpoints are opaque host:port strings the proxy dials.
+        b"CPFAMILY" => {
+            let (Some(prefix), Some(addrs)) = (text(1), text(2)) else {
+                return err("CPFAMILY <prefix> <host:port[,host:port]>");
+            };
+            let prefix = prefix.to_ascii_uppercase();
+            let endpoints: Vec<String> = addrs
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if prefix.is_empty() || endpoints.is_empty() {
+                return err("CPFAMILY <prefix> <host:port[,host:port]>");
+            }
+            let Ok(mut st) = shared.state.lock() else {
+                return err("state lock");
+            };
+            st.families.insert(prefix, endpoints);
+            match st.commit() {
+                Ok(_) => {}
+                Err(e) => return err(&format!("persist: {e}")),
+            }
+            shared.changed.notify_all();
+            ok()
+        }
+        b"CPFAMILYCLEAR" => {
+            let Some(prefix) = text(1) else {
+                return err("CPFAMILYCLEAR <prefix>");
+            };
+            let Ok(mut st) = shared.state.lock() else {
+                return err("state lock");
+            };
+            st.families.remove(&prefix.to_ascii_uppercase());
+            match st.commit() {
+                Ok(_) => {}
+                Err(e) => return err(&format!("persist: {e}")),
+            }
+            shared.changed.notify_all();
+            ok()
+        }
+        b"CPFAMILIES" => {
+            let Ok(st) = shared.state.lock() else {
+                return err("state lock");
+            };
+            let body = st
+                .families
+                .iter()
+                .map(|(p, a)| format!("{p} {}", a.join(",")))
+                .collect::<Vec<_>>()
+                .join("\n");
+            Value::Bulk(Some(body.into_bytes()))
+        }
         // The metering loop's storage verdict (M5): flips the 'q' flag the
         // proxies shed writes on. Operator-invocable too (support cases).
         b"CPTENANTOVERQUOTA" => {
@@ -1005,12 +1060,14 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
                 return err("state lock");
             };
             let (v, pairs, tenants, admin, exc, promo) = st.snapshot_for(&proxy);
-            snapshot_frame(v, &pairs, &tenants, &admin, &exc, &promo)
+            let families = crate::tenant::families_spec(&st.families);
+            snapshot_frame(v, &pairs, &tenants, &admin, &exc, &promo, &families)
         }
         _ => err("unknown control-plane command"),
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn snapshot_frame(
     version: u64,
     pairs: &str,
@@ -1018,6 +1075,7 @@ fn snapshot_frame(
     admin: &str,
     exc: &str,
     promo: &str,
+    families: &str,
 ) -> Value {
     Value::Array(Some(vec![
         Value::Bulk(Some(b"SNAPSHOT".to_vec())),
@@ -1030,11 +1088,17 @@ fn snapshot_frame(
         // Option B: slot-ownership exceptions ("ns:slot:pair;..."), the
         // 6th element; older proxies ignore it, older CPs omit it.
         Value::Bulk(Some(exc.as_bytes().to_vec())),
-        // 7th element: the promotion hint ("<addr>|<gen>", empty if none).
-        // Same compatibility contract as the 6th: older proxies ignore it,
-        // older CPs omit it, and a proxy that never sees one simply keeps
+        // 7th element (index 6): the promotion hint ("<addr>|<gen>", empty if
+        // none). Same compatibility contract as the 6th: older proxies ignore
+        // it, older CPs omit it, and a proxy that never sees one simply keeps
         // its pre-existing reactive rediscovery.
         Value::Bulk(Some(promo.as_bytes().to_vec())),
+        // 8th element (index 7): the co-processor family route table (ADR-0010
+        // D1), `PREFIX=addr;...`. ALWAYS emitted so the CP is authoritative —
+        // an empty string CLEARS the proxy's table (how DEL of the last family
+        // lands), distinct from an ABSENT element (older CP -> leave it alone).
+        // Older proxies index 0..6 and ignore it, so appending is safe.
+        Value::Bulk(Some(families.as_bytes().to_vec())),
     ]))
 }
 
@@ -1061,10 +1125,13 @@ fn watch(
     // it out would let delta suppression swallow exactly the push this
     // feature exists to deliver, and the failure would look like "the hint
     // never arrived" rather than "the hint was discarded here".
-    let mut last_view: Option<(String, String, String, String, String)> = None;
+    // families (ADR-0010) is GLOBAL, not per-proxy, but it is a pushed field,
+    // so it MUST be in this tuple or a family-only change is silently
+    // suppressed — the exact trap the promotion hint carries a warning about.
+    let mut last_view: Option<(String, String, String, String, String, String)> = None;
     loop {
         // Wait until there is something newer than the proxy has ACKed.
-        let (v, pairs, tenants, admin, exc, promo) = {
+        let (v, pairs, tenants, admin, exc, promo, families) = {
             let Ok(mut st) = shared.state.lock() else {
                 return Ok(());
             };
@@ -1076,7 +1143,9 @@ fn watch(
                 };
                 st = guard;
             }
-            st.snapshot_for(&proxy)
+            let (v, pairs, tenants, admin, exc, promo) = st.snapshot_for(&proxy);
+            let families = crate::tenant::families_spec(&st.families);
+            (v, pairs, tenants, admin, exc, promo, families)
         };
         if last_view.as_ref()
             == Some(&(
@@ -1085,6 +1154,7 @@ fn watch(
                 admin.clone(),
                 exc.clone(),
                 promo.clone(),
+                families.clone(),
             ))
         {
             eprintln!("watch {proxy}: suppressed push at version {v} (view unchanged)");
@@ -1093,11 +1163,11 @@ fn watch(
         }
         let mut out = Vec::new();
         encode(
-            &snapshot_frame(v, &pairs, &tenants, &admin, &exc, &promo),
+            &snapshot_frame(v, &pairs, &tenants, &admin, &exc, &promo, &families),
             &mut out,
         );
         stream.write_all(&out)?;
-        last_view = Some((pairs, tenants, admin, exc, promo));
+        last_view = Some((pairs, tenants, admin, exc, promo, families));
         // Read the ACK (Array ["ACK", <version>]).
         loop {
             match decode(&buf) {

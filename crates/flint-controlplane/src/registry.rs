@@ -116,6 +116,19 @@ pub enum Mutation {
         token: Option<String>,
         prev: Option<String>,
     },
+    /// Register (or replace) a co-processor command family (ADR-0010 D1):
+    /// `prefix` (e.g. "VEC.") routes to `endpoints`. Global, not per-tenant —
+    /// the CP is the fleet's single source for the family route table, which
+    /// proxies otherwise only get from the static `--families` flag.
+    SetFamily {
+        prefix: String,
+        endpoints: Vec<String>,
+    },
+    /// Retire a family registration. Emitting the now-smaller table (possibly
+    /// empty) is how a proxy learns to stop routing that prefix.
+    ClearFamily {
+        prefix: String,
+    },
 }
 
 pub use crate::tenant::Tenant;
@@ -163,6 +176,12 @@ pub struct RegistryState {
     pub admin_token: Option<String>,
     #[serde(default)]
     pub admin_prev: Option<String>,
+    /// Co-processor command families (ADR-0010 D1): prefix -> endpoints.
+    /// Global (not shuffle-sharded like tenants); serialized into snapshot
+    /// element 7 for every proxy. `#[serde(default)]` so a pre-family Raft
+    /// snapshot / log loads with an empty table.
+    #[serde(default)]
+    pub families: BTreeMap<String, Vec<String>>,
     /// Last promotion reported by the controller: (addr, generation).
     /// Deliberately NOT persisted across a CP restart — it is a live wakeup,
     /// not a durable fact (tenant::promote_hint explains why that is safe).
@@ -343,7 +362,22 @@ impl RegistryState {
                 self.admin_token = token;
                 self.admin_prev = prev;
             }
+            Mutation::SetFamily { prefix, endpoints } => {
+                self.families.insert(prefix, endpoints);
+            }
+            Mutation::ClearFamily { prefix } => {
+                self.families.remove(&prefix);
+            }
         }
+    }
+
+    /// Render the family route table into snapshot element 7's wire grammar
+    /// (`PREFIX=addr,addr;PREFIX=addr`), the same the proxy's `parse_families`
+    /// reads and the `--families` flag uses. `BTreeMap` iteration is ordered,
+    /// so the string is deterministic — required for the watch loop's
+    /// delta-suppression to compare views correctly.
+    pub fn families_spec(&self) -> String {
+        crate::tenant::families_spec(&self.families)
     }
 
     /// The snapshot a given proxy should see: shared pair topology + ONLY
@@ -456,5 +490,60 @@ mod promote_tests {
             back.promoted, None,
             "the promotion hint must not round-trip through persistence"
         );
+    }
+}
+
+#[cfg(test)]
+mod family_tests {
+    use super::*;
+
+    /// The SAME trap as the promotion hint, one field over (ADR-0010 D1).
+    /// families is GLOBAL and lives OUTSIDE snapshot_for's tuple, so the watch
+    /// loops must fold `families_spec()` into the view they compare — or a
+    /// family-only change is suppressed and "the co-processor route never
+    /// arrived" looks like a network fault. This asserts the field the view
+    /// must include actually moves on a family mutation.
+    #[test]
+    fn a_family_change_moves_the_families_spec_so_suppression_cannot_eat_it() {
+        let mut r = RegistryState::default();
+        assert_eq!(r.families_spec(), "", "no families -> empty element 7");
+        let before = r.families_spec();
+
+        r.apply(Mutation::SetFamily {
+            prefix: "VEC.".into(),
+            endpoints: vec!["c:9".into()],
+        });
+        assert_eq!(r.families_spec(), "VEC.=c:9");
+        assert_ne!(
+            before,
+            r.families_spec(),
+            "a family registration must change the pushed families view"
+        );
+
+        // A second family: ordered, ';'-joined (BTreeMap determinism).
+        r.apply(Mutation::SetFamily {
+            prefix: "JSON.".into(),
+            endpoints: vec!["d:1".into(), "d:2".into()],
+        });
+        assert_eq!(r.families_spec(), "JSON.=d:1,d:2;VEC.=c:9");
+
+        // Clearing the LAST family must render empty (NOT absent) so the proxy
+        // learns to drop it — the whole reason element 7 is always emitted.
+        r.apply(Mutation::ClearFamily {
+            prefix: "VEC.".into(),
+        });
+        r.apply(Mutation::ClearFamily {
+            prefix: "JSON.".into(),
+        });
+        assert_eq!(r.families_spec(), "", "clearing all families -> empty spec");
+    }
+
+    /// #[serde(default)] lets a pre-family Raft snapshot / log load clean.
+    #[test]
+    fn families_default_when_absent_from_serialized_state() {
+        let json = r#"{"version":3,"proxies":[],"pairs":[],"tenants":{}}"#;
+        let r: RegistryState = serde_json::from_str(json).expect("deserialize pre-family state");
+        assert!(r.families.is_empty());
+        assert_eq!(r.families_spec(), "");
     }
 }

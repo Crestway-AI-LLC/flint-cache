@@ -53,6 +53,11 @@ pub struct State {
     /// Previous admin token during a rotation window (both valid until the
     /// agent's drop-on-adoption retires it).
     pub admin_prev: Option<String>,
+    /// Co-processor command families (ADR-0010 D1): prefix -> endpoints.
+    /// Global; rendered into snapshot element 7 for every proxy. Persisted
+    /// (a `family` line) so a CP restart keeps the route table. BTreeMap for
+    /// deterministic serialization, like `tenants`.
+    pub families: BTreeMap<String, Vec<String>>,
     /// Last promotion reported by the controller: (addr, generation). NOT
     /// persisted and NOT routing authority — see tenant::promote_hint.
     pub promoted: Option<(String, u64)>,
@@ -298,6 +303,16 @@ impl State {
                     s.admin_token = parts.next().filter(|v| *v != "-").map(String::from);
                     s.admin_prev = parts.next().filter(|v| *v != "-").map(String::from);
                 }
+                Some("family") => {
+                    // "family <PREFIX> <addr,addr>" (ADR-0010 D1). Endpoints
+                    // carry no spaces, so one field holds the comma list.
+                    if let (Some(prefix), Some(addrs)) = (parts.next(), parts.next()) {
+                        s.families.insert(
+                            prefix.to_string(),
+                            addrs.split(',').map(String::from).collect(),
+                        );
+                    }
+                }
                 _ => {}
             }
         }
@@ -345,6 +360,9 @@ impl State {
                 t.over_quota as u8,
                 subset = subset
             ));
+        }
+        for (prefix, addrs) in &self.families {
+            out.push_str(&format!("family {prefix} {}\n", addrs.join(",")));
         }
         out
     }

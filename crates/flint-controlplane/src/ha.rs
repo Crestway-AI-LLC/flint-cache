@@ -375,6 +375,7 @@ fn args_of(frame: Value) -> Option<Vec<Vec<u8>>> {
     Some(out)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn snapshot_frame(
     v: u64,
     pairs: &str,
@@ -382,6 +383,7 @@ fn snapshot_frame(
     admin: &str,
     exc: &str,
     promo: &str,
+    families: &str,
 ) -> Value {
     Value::Array(Some(vec![
         Value::Bulk(Some(b"SNAPSHOT".to_vec())),
@@ -390,11 +392,18 @@ fn snapshot_frame(
         Value::Bulk(Some(tenants.as_bytes().to_vec())),
         Value::Bulk(Some(admin.as_bytes().to_vec())),
         Value::Bulk(Some(exc.as_bytes().to_vec())),
-        // 7th element: the promotion hint ("<addr>|<gen>", empty if none).
-        // Same compatibility contract as the 6th: older proxies ignore it,
-        // older CPs omit it, and a proxy that never sees one simply keeps
+        // 7th element (index 6): the promotion hint ("<addr>|<gen>", empty if
+        // none). Same compatibility contract as the 6th: older proxies ignore
+        // it, older CPs omit it, and a proxy that never sees one simply keeps
         // its pre-existing reactive rediscovery.
         Value::Bulk(Some(promo.as_bytes().to_vec())),
+        // 8th element (index 7): the co-processor family route table (ADR-0010
+        // D1), `PREFIX=addr;...`. ALWAYS emitted so the CP is authoritative —
+        // an empty string CLEARS the proxy's table (that is how DEL of the last
+        // family lands), which the proxy distinguishes from an ABSENT element
+        // (older CP -> leave the table alone). Older proxies index 0..6 and
+        // ignore this, so appending it is backward-safe.
+        Value::Bulk(Some(families.as_bytes().to_vec())),
     ]))
 }
 
@@ -819,6 +828,50 @@ async fn handle_admin(ha: &Ha, args: &[Vec<u8>]) -> Value {
                 Err(l) => redirect(l),
             }
         }
+        b"CPFAMILY" => {
+            // CPFAMILY <prefix> <host:port[,host:port...]> — register/replace a
+            // co-processor family (ADR-0010 D1). Prefix uppercased so the CP
+            // state is canonical (the proxy uppercases too); endpoints are
+            // opaque host:port strings the proxy dials.
+            let (Some(prefix), Some(addrs)) = (text(1), text(2)) else {
+                return Value::Error("ERR CPFAMILY <prefix> <host:port[,host:port]>".into());
+            };
+            let prefix = prefix.to_ascii_uppercase();
+            let endpoints: Vec<String> = addrs
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if prefix.is_empty() || endpoints.is_empty() {
+                return Value::Error("ERR CPFAMILY <prefix> <host:port[,host:port]>".into());
+            }
+            match ha.propose(Mutation::SetFamily { prefix, endpoints }).await {
+                Ok(_) => Value::Simple("OK".into()),
+                Err(l) => redirect(l),
+            }
+        }
+        b"CPFAMILYCLEAR" => {
+            let Some(prefix) = text(1) else {
+                return Value::Error("ERR CPFAMILYCLEAR <prefix>".into());
+            };
+            let prefix = prefix.to_ascii_uppercase();
+            match ha.propose(Mutation::ClearFamily { prefix }).await {
+                Ok(_) => Value::Simple("OK".into()),
+                Err(l) => redirect(l),
+            }
+        }
+        b"CPFAMILIES" => {
+            // Read the registered family table (ordered, one per line):
+            // "<prefix> <addr,addr>". The observability + drill read path.
+            let reg = ha.store.registry().await;
+            let body = reg
+                .families
+                .iter()
+                .map(|(p, a)| format!("{p} {}", a.join(",")))
+                .collect::<Vec<_>>()
+                .join("\n");
+            Value::Bulk(Some(body.into_bytes()))
+        }
         b"CPSETPAIR" => {
             let (Some(idx), Some(nodes)) = (
                 text(1).and_then(|v| v.parse::<usize>().ok()),
@@ -1122,7 +1175,8 @@ async fn handle_admin(ha: &Ha, args: &[Vec<u8>]) -> Value {
             };
             let reg = ha.store.registry().await;
             let (v, pairs, tenants, admin, exc, promo) = reg.snapshot_for(&proxy);
-            snapshot_frame(v, &pairs, &tenants, &admin, &exc, &promo)
+            let families = reg.families_spec();
+            snapshot_frame(v, &pairs, &tenants, &admin, &exc, &promo, &families)
         }
         _ => Value::Error("ERR unknown control-plane command".into()),
     }
@@ -1142,11 +1196,15 @@ async fn watch_loop<S: AsyncRead + AsyncWrite + Unpin>(
     // exception spec once was) makes changes to it silently suppressible.
     // See the single-node watch(): the promotion hint is part of the view or
     // suppression eats the one push that carries it.
-    let mut last_view: Option<(String, String, String, String, String)> = None;
+    // families is GLOBAL (not per-proxy), but it IS a pushed field, so it must
+    // be in this tuple or a family-only change is silently suppressed — the
+    // exact trap the promotion hint hit (registry.rs promote tests).
+    let mut last_view: Option<(String, String, String, String, String, String)> = None;
     loop {
         let reg = ha.store.registry().await;
         if reg.version > acked {
             let (v, pairs, tenants, admin, exc, promo) = reg.snapshot_for(&proxy);
+            let families = reg.families_spec();
             if last_view.as_ref()
                 == Some(&(
                     pairs.clone(),
@@ -1154,6 +1212,7 @@ async fn watch_loop<S: AsyncRead + AsyncWrite + Unpin>(
                     admin.clone(),
                     exc.clone(),
                     promo.clone(),
+                    families.clone(),
                 ))
             {
                 eprintln!("watch {proxy}: suppressed push at version {v} (view unchanged)");
@@ -1166,10 +1225,11 @@ async fn watch_loop<S: AsyncRead + AsyncWrite + Unpin>(
                 admin.clone(),
                 exc.clone(),
                 promo.clone(),
+                families.clone(),
             ));
             let mut o = Vec::new();
             encode(
-                &snapshot_frame(v, &pairs, &tenants, &admin, &exc, &promo),
+                &snapshot_frame(v, &pairs, &tenants, &admin, &exc, &promo, &families),
                 &mut o,
             );
             sock.write_all(&o).await?;
