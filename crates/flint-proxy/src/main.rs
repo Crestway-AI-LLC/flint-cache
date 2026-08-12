@@ -439,6 +439,19 @@ struct Topology {
     /// `None` => the forward has no callback to hand out and answers
     /// `-COPROCUNAVAIL`.
     edge_advertise: Option<String>,
+    /// In-flight family commands (ADR-0010 D3): incremented while a family
+    /// command holds a co-processor connection. Family admission is shed once
+    /// this reaches `coproc_max_inflight` — family commands shed FIRST under
+    /// pressure, and the data path is never bounded by it.
+    coproc_inflight: std::sync::atomic::AtomicUsize,
+    /// Cap on concurrent family commands (`--family-max-inflight`). Bounds the
+    /// aggregate channel I/O — inflight x per-command budget — so it cannot
+    /// exhaust the data path's backend capacity (D3).
+    coproc_max_inflight: usize,
+    /// Per-family-command channel budget and deadline (`--family-budget`,
+    /// `--family-deadline-ms`), fixed into the token at mint time (D3).
+    family_budget: u64,
+    family_deadline: Duration,
 }
 
 impl Topology {
@@ -498,13 +511,33 @@ impl Topology {
         Some(token)
     }
 
+    /// Reserve a family-command in-flight slot (ADR-0010 D3), returning a guard
+    /// that releases it on drop, or `None` if the cap is reached — in which case
+    /// the family command is shed. Family admission is bounded FIRST under
+    /// pressure; the data path is never bounded by this.
+    fn try_reserve_family(&self) -> Option<InflightGuard<'_>> {
+        self.coproc_inflight
+            .fetch_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |n| (n < self.coproc_max_inflight).then_some(n + 1),
+            )
+            .ok()
+            .map(|_| InflightGuard(&self.coproc_inflight))
+    }
+
     /// Send one `FLINTFAM` frame to the first reachable co-processor endpoint
     /// and return its reply (ADR-0010 D6). Synchronous and pooled: check out an
     /// idle connection or dial a new one, exchange, return it on success / drop
     /// it on failure. The pool lock is held ONLY across checkout and return,
     /// never across the blocking exchange — D3's "no lock the data path needs
     /// is held across a co-processor call". `deadline` bounds the I/O.
-    fn coproc_call(&self, endpoints: &[String], frame: &[u8], deadline: Duration) -> Result<Value, ()> {
+    fn coproc_call(
+        &self,
+        endpoints: &[String],
+        frame: &[u8],
+        deadline: Duration,
+    ) -> Result<Value, ()> {
         for addr in endpoints {
             // Try a pooled connection first, then a fresh dial. A pooled
             // connection can be stale — the co-processor idled it out — without
@@ -1374,10 +1407,11 @@ enum AuthStep {
     Reply(Value),
     /// Authorized: proceed in this namespace.
     Proceed(Vec<u8>),
-    /// `PROXYCHAN` opened a single-use channel (ADR-0010 D2). The namespace is
-    /// already pinned into `authed_ns`; this carries the grant's deadline so
-    /// the connection loop closes the channel once it outlives it.
-    ChannelOpen(Instant),
+    /// `PROXYCHAN` opened a single-use channel (ADR-0010 D2/D3). The namespace
+    /// is already pinned into `authed_ns`; this carries the grant's deadline
+    /// and data-command budget so the connection loop closes the channel once
+    /// it outlives either bound.
+    ChannelOpen { deadline: Instant, budget: u64 },
 }
 
 /// Redis-shaped auth gate. AUTH <token> or AUTH <user> <token> (the user is
@@ -1427,7 +1461,9 @@ fn auth_step(
                 "ERR usage: PROXYCHANMINT <namespace> <budget> <deadline-ms>".into(),
             ));
         };
-        let Some(budget) = std::str::from_utf8(budget_a).ok().and_then(|s| s.parse::<u64>().ok())
+        let Some(budget) = std::str::from_utf8(budget_a)
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
         else {
             return AuthStep::Reply(Value::Error("ERR budget must be an integer".into()));
         };
@@ -1465,13 +1501,13 @@ fn auth_step(
             Invalid,
             Used,
             Expired,
-            Open(Vec<u8>, Instant),
+            Open(Vec<u8>, Instant, u64),
         }
         let verdict = match tokens.get(&token) {
             None => V::Invalid,
             Some(g) if g.used => V::Used,
             Some(g) if Instant::now() >= g.deadline => V::Expired,
-            Some(g) => V::Open(g.ns.clone(), g.deadline),
+            Some(g) => V::Open(g.ns.clone(), g.deadline, g.budget),
         };
         return match verdict {
             V::Invalid => AuthStep::Reply(Value::Error("WRONGPASS invalid channel token".into())),
@@ -1480,13 +1516,13 @@ fn auth_step(
                 tokens.remove(&token);
                 AuthStep::Reply(Value::Error("ERR channel token expired".into()))
             }
-            V::Open(ns, deadline) => {
+            V::Open(ns, deadline, budget) => {
                 // Single-use: consume on open, so a second PROXYCHAN finds it used.
                 if let Some(g) = tokens.get_mut(&token) {
                     g.used = true;
                 }
                 *authed_ns = Some(ns);
-                AuthStep::ChannelOpen(deadline)
+                AuthStep::ChannelOpen { deadline, budget }
             }
         };
     }
@@ -1766,6 +1802,11 @@ fn serve_client<S: Read + Write>(mut stream: S, topo: Arc<Topology>) -> std::io:
     // A channel that outlives it is closed on its next command — the token
     // dies with the family command it was minted for. `None` for tenants.
     let mut channel_deadline: Option<Instant> = None;
+    // Remaining data-command budget for a channel (ADR-0010 D3): decremented on
+    // each data command it issues; at zero the channel is closed. Bounds a
+    // looping co-processor at the mint-time budget instead of a latency graph.
+    // `None` for tenants (unbounded, as always).
+    let mut channel_budget: Option<u64> = None;
     // The RESP dialect THIS client negotiated, set by HELLO. Backends
     // always answer us in RESP3 so their replies keep their types; this is
     // what we downgrade to on the way back out.
@@ -1881,6 +1922,28 @@ fn serve_client<S: Read + Write>(mut stream: S, topo: Arc<Topology>) -> std::io:
                         stream.write_all(&out)?;
                         return Ok(());
                     }
+                    // Channel data-command budget (ADR-0010 D3): a channel gets
+                    // a fixed number of data commands, then it is closed. A
+                    // looping co-processor is cut off at the bound, not found
+                    // later in a latency graph. Counts data commands only — a
+                    // PING or HELLO on the channel is free.
+                    if let Some(budget) = channel_budget.as_mut()
+                        && args.first().is_some_and(|n| {
+                            flint_commands::is_write_command(n)
+                                || flint_commands::is_read_command(n)
+                        })
+                    {
+                        if *budget == 0 {
+                            encode_proto(
+                                &Value::Error("ERR channel budget exhausted".into()),
+                                proto,
+                                &mut out,
+                            );
+                            stream.write_all(&out)?;
+                            return Ok(());
+                        }
+                        *budget -= 1;
+                    }
                     // Tenant-perceived latency starts here: everything the
                     // proxy does for this command — cache lookup, routing,
                     // backend round trip, MOVED/failover retries — is what
@@ -1919,11 +1982,13 @@ fn serve_client<S: Read + Write>(mut stream: S, topo: Arc<Topology>) -> std::io:
                             &args,
                         ) {
                             AuthStep::Reply(v) => v,
-                            AuthStep::ChannelOpen(deadline) => {
+                            AuthStep::ChannelOpen { deadline, budget } => {
                                 // PROXYCHAN pinned authed_ns to the grant's
-                                // namespace; record the deadline so this
-                                // connection is closed once it outlives it.
+                                // namespace; record the deadline and budget so
+                                // this connection is closed once it outlives
+                                // either bound.
                                 channel_deadline = Some(deadline);
+                                channel_budget = Some(budget);
                                 Value::Simple("OK".into())
                             }
                             AuthStep::Proceed(ns) => data_command(
@@ -1936,6 +2001,7 @@ fn serve_client<S: Read + Write>(mut stream: S, topo: Arc<Topology>) -> std::io:
                                 replica_reads,
                                 local_cache,
                                 async_writes,
+                                channel_deadline.is_some(),
                             ),
                         }
                     };
@@ -2303,8 +2369,9 @@ const FAMILY_CHANNEL_DEADLINE: std::time::Duration = std::time::Duration::from_s
 /// command earns from the master (reading one as the other is how an outage is
 /// misdiagnosed, D3).
 fn family_command(topo: &Topology, ns: &[u8], args: &[Vec<u8>]) -> Value {
-    let unavail =
-        || Value::Error("COPROCUNAVAIL no co-processor is available for this command family".into());
+    let unavail = || {
+        Value::Error("COPROCUNAVAIL no co-processor is available for this command family".into())
+    };
     let Some(name) = args.first() else {
         return unavail();
     };
@@ -2317,14 +2384,22 @@ fn family_command(topo: &Topology, ns: &[u8], args: &[Vec<u8>]) -> Value {
     let Some(callback) = topo.edge_advertise.clone() else {
         return unavail();
     };
+    // Reserve a family-command slot (D3): family commands shed FIRST under
+    // pressure — before the tenant is charged or a co-processor is dialed —
+    // and the data path is never bounded by this counter. The reservation
+    // caps concurrent family commands, which caps the aggregate channel I/O.
+    // The guard releases the slot on EVERY return below — shed, error, success.
+    let Some(_slot) = topo.try_reserve_family() else {
+        return unavail();
+    };
     // D1: charge the tenant ONCE, at admission, before the dial. If shed
     // (throttled), the command is not forwarded — nothing was admitted.
     if let Some(shed) = topo.quota_gate(ns, name, false) {
         return shed;
     }
     // Mint the single-use channel token the co-processor will PROXYCHAN with.
-    let deadline = Instant::now() + FAMILY_CHANNEL_DEADLINE;
-    let Some(token) = topo.mint_channel_token(ns, FAMILY_CHANNEL_BUDGET, deadline) else {
+    let deadline = Instant::now() + topo.family_deadline;
+    let Some(token) = topo.mint_channel_token(ns, topo.family_budget, deadline) else {
         return unavail();
     };
     // FLINTFAM <token> <callback> <original command…>. FLINTFAM is safe as a
@@ -2338,10 +2413,32 @@ fn family_command(topo: &Topology, ns: &[u8], args: &[Vec<u8>]) -> Value {
     parts.push(&callback_b);
     parts.extend(args.iter().map(|a| a.as_slice()));
     let frame = encode_cmd(&parts);
-    match topo.coproc_call(&endpoints, &frame, FAMILY_CHANNEL_DEADLINE) {
+    match topo.coproc_call(&endpoints, &frame, topo.family_deadline) {
         Ok(v) => v,
         Err(()) => unavail(),
     }
+}
+
+/// Releases a family-command in-flight slot on drop, so every return path from
+/// `family_command` — shed, error, or success — decrements the counter (D3).
+struct InflightGuard<'a>(&'a std::sync::atomic::AtomicUsize);
+impl Drop for InflightGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+/// Does the granting tenant's ops/s + storage quota apply to THIS command?
+/// (ADR-0010 D1.) Only data commands are ever charged — PING/ECHO/QUIT cost
+/// the proxy nothing — and a CHANNEL's data commands are EXEMPT: the family
+/// command that opened the channel was already charged once at admission
+/// (`family_command`), so re-charging the co-processor's storage would make one
+/// `VEC.SET` cost an implementation-defined number of tokens. Named and tested
+/// because the exemption is a single easily-deleted `!is_channel`, and the
+/// symptom of deleting it (a co-processor throttled mid-operation on a busy
+/// tenant) would not surface in any static, CP-less drill.
+fn tenant_quota_applies(is_data: bool, is_channel: bool) -> bool {
+    is_data && !is_channel
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2355,6 +2452,7 @@ fn data_command(
     replica_reads: bool,
     local_cache: bool,
     async_writes: bool,
+    is_channel: bool,
 ) -> Value {
     let is_write = args
         .first()
@@ -2380,9 +2478,12 @@ fn data_command(
     }
     // M5 quota gate: a shed command must not touch the cache, a backend, or
     // the bucket-bypassing fast paths. Only data commands are charged
-    // (PING/ECHO/QUIT are free; they cost this proxy nothing).
+    // (PING/ECHO/QUIT are free; they cost this proxy nothing). A CHANNEL's
+    // data commands are EXEMPT (ADR-0010 D1): the family command was charged
+    // once at admission, and re-charging the co-processor's storage would make
+    // one VEC.SET cost an implementation-defined number of tokens.
     let is_data = is_write || is_read;
-    if is_data
+    if tenant_quota_applies(is_data, is_channel)
         && let Some(name) = args.first()
         && let Some(shed) = topo.quota_gate(ns, name, is_write)
     {
@@ -2861,9 +2962,22 @@ fn main() -> std::io::Result<()> {
             spec.split(',')
                 .filter_map(|pair| {
                     let (token, ns) = pair.split_once('=')?;
+                    // Validate the namespace to the SERVER's rule ([A-Za-z0-9._-],
+                    // 1..=64), not a looser one. A looser check here is a silent
+                    // footgun: `token=nsA#flags@rate` (the CP push format, which
+                    // static mode does NOT parse — see below) passes a length/NUL
+                    // check, so the namespace becomes the literal "nsA#flags@rate";
+                    // the tenant then authenticates fine but every backend command
+                    // fails the server's FLINTNS handshake and surfaces as the
+                    // baffling "backend unavailable (failover did not settle)".
+                    // Rejecting it here turns that into a clear boot-time error.
+                    let ok_ns =
+                        |b: &u8| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.');
                     assert!(
-                        !ns.is_empty() && ns.len() <= 64 && !ns.contains('\0'),
-                        "invalid namespace in --tenants"
+                        (1..=64).contains(&ns.len()) && ns.bytes().all(|b| ok_ns(&b)),
+                        "invalid namespace {ns:?} in --tenants: expected 1..=64 chars of \
+                         [A-Za-z0-9._-] (static mode takes token=ns only — flags and \
+                         quotas come from the control plane, not this argument)"
                     );
                     // Static mode has no CP flags; opt-ins and quotas
                     // default off/unlimited. Keyed by digest like the CP
@@ -2969,6 +3083,17 @@ fn main() -> std::io::Result<()> {
         families: RwLock::new(parse_families(&arg("--families").unwrap_or_default())),
         coproc_pool: std::sync::Mutex::new(HashMap::new()),
         edge_advertise: arg("--edge-advertise"),
+        coproc_inflight: std::sync::atomic::AtomicUsize::new(0),
+        coproc_max_inflight: arg("--family-max-inflight")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(64),
+        family_budget: arg("--family-budget")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(FAMILY_CHANNEL_BUDGET),
+        family_deadline: arg("--family-deadline-ms")
+            .and_then(|s| s.parse().ok())
+            .map(Duration::from_millis)
+            .unwrap_or(FAMILY_CHANNEL_DEADLINE),
         admin_digests: RwLock::new(
             arg("--admin-token")
                 .map(|t| vec![flint_tls::sha256_hex(t.as_bytes())])
@@ -3113,6 +3238,10 @@ mod route_tests {
             families: RwLock::new(Vec::new()),
             coproc_pool: std::sync::Mutex::new(HashMap::new()),
             edge_advertise: None,
+            coproc_inflight: std::sync::atomic::AtomicUsize::new(0),
+            coproc_max_inflight: 64,
+            family_budget: FAMILY_CHANNEL_BUDGET,
+            family_deadline: FAMILY_CHANNEL_DEADLINE,
         }
     }
 
@@ -3170,12 +3299,68 @@ mod route_tests {
         t.apply_families("VEC.=a:1;SE=b:2");
         assert!(t.family_registered(b"VEC.SET"));
         assert!(t.family_registered(b"vec.get"), "case-insensitive");
-        assert!(t.family_registered(b"SETEX"), "prefix match, resolution order handles the rest");
+        assert!(
+            t.family_registered(b"SETEX"),
+            "prefix match, resolution order handles the rest"
+        );
         assert!(!t.family_registered(b"MAT.MUL"), "unregistered prefix");
         assert!(!t.family_registered(b"GET"));
         // An emptied table registers nothing (a CP that clears element 7).
         t.apply_families("");
         assert!(!t.family_registered(b"VEC.SET"));
+    }
+
+    /// D3: family admission is bounded FIRST under pressure. Reservations up to
+    /// the cap succeed; the next is shed (`None`); dropping a guard frees
+    /// exactly one slot, so the next reservation succeeds again. This is the
+    /// counter that caps aggregate channel I/O — the data path is never bounded
+    /// by it, which is why the shed here (a family command) is the correct one.
+    #[test]
+    fn family_inflight_cap_sheds() {
+        let mut t = two_pair_topo();
+        t.coproc_max_inflight = 2;
+
+        let g1 = t.try_reserve_family();
+        let g2 = t.try_reserve_family();
+        assert!(
+            g1.is_some() && g2.is_some(),
+            "reservations up to the cap succeed"
+        );
+        assert!(
+            t.try_reserve_family().is_none(),
+            "at the cap, the next family command is shed"
+        );
+
+        drop(g1);
+        let g3 = t.try_reserve_family();
+        assert!(g3.is_some(), "dropping a guard frees exactly one slot");
+        assert!(
+            t.try_reserve_family().is_none(),
+            "and only one — still at the cap"
+        );
+
+        drop(g2);
+        drop(g3);
+        // Fully drained: the cap is available again, counting up from zero.
+        assert!(
+            t.try_reserve_family().is_some(),
+            "back to zero in-flight after every guard drops"
+        );
+    }
+
+    /// D1: a channel's data commands are exempt from the tenant quota; a
+    /// tenant's are charged; nobody charges a non-data command. This is the
+    /// invariant the co-processor forward leans on — the family command pays
+    /// once at admission and the channel storage it fans out to pays nothing.
+    #[test]
+    fn channel_data_is_quota_exempt() {
+        // tenant data: charged.
+        assert!(tenant_quota_applies(true, false));
+        // channel data: EXEMPT — the whole point of D1.
+        assert!(!tenant_quota_applies(true, true));
+        // non-data (PING/ECHO/QUIT): never charged, tenant or channel.
+        assert!(!tenant_quota_applies(false, false));
+        assert!(!tenant_quota_applies(false, true));
     }
 
     #[test]
