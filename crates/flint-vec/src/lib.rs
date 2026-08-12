@@ -4,17 +4,18 @@
 //! ADR-0010 co-processor mechanism as the `VEC.*` command family.
 //!
 //! This crate is the co-processor's LOGIC — the flat index, the per-tenant
-//! store, and the `VEC.*` command dispatch — with no networking. A `VEC.SEARCH`
-//! is answered entirely from the in-memory index; a `VEC.SET`/`VEC.DEL`/
-//! `VEC.CREATE` additionally emits a [`Persist`] intent that the networked
-//! co-processor performs over the channel, so vectors are durable in the
-//! tenant's namespace (ADR-0017 D2) and the index rebuilds from them on a cold
-//! start (D3). Keeping the logic here, `Value`-typed and unit-tested, means the
-//! wire layer is a thin translation and the recall/latency oracle (`flat`) can
-//! be validated without a cluster.
+//! store, and the `VEC.*` command planning — with no networking (the binary in
+//! `main.rs` wraps it). A read (`VEC.SEARCH`/`GET`/`INFO`) is answered from the
+//! in-memory index. A write plans in TWO phases so the in-memory index is never
+//! ahead of the durable copy: [`Store::plan`] validates and returns a
+//! [`Plan::Write`] carrying the [`Persist`] to perform over the channel and the
+//! [`Apply`] to make to the index; the caller performs the durable write FIRST
+//! and only [`Store::commit`]s the index if it lands. That ordering matters
+//! because a channel write can be SHED (e.g. `-QUOTA` on a tenant over its
+//! storage cap), and a search must never return a vector that isn't durable.
 //!
 //! v0.1 is flat/exact — the recall oracle. v0.2 replaces [`VectorSet`]'s search
-//! with an HNSW graph behind the SAME dispatch; v1 makes it disk-resident
+//! with an HNSW graph behind the SAME plan; v1 makes it disk-resident
 //! (DiskANN). None of those changes the `VEC.*` surface or the durable format.
 
 use flint_resp::Value;
@@ -112,6 +113,9 @@ impl VectorSet {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
+    fn contains(&self, id: &[u8]) -> bool {
+        self.entries.contains_key(id)
+    }
 
     fn set(&mut self, id: Vec<u8>, vec: Vec<f32>, meta: Option<Vec<u8>>) {
         let norm = dot(&vec, &vec).sqrt();
@@ -174,22 +178,56 @@ impl VectorSet {
     }
 }
 
-/// A durability intent: what the co-processor must do over the channel as a
-/// side effect of a command, so the vectors survive a co-processor crash
-/// (ADR-0017 D2). The networked layer performs it; the logic here only decides
-/// it, which keeps the decision unit-testable. Keys live under a reserved
-/// co-processor prefix in the tenant namespace ([`durable_key`]).
+/// The durable side of a write: what the co-processor must do over the channel
+/// so the vectors survive a crash (ADR-0017 D2). Performed by the networked
+/// layer BEFORE the matching [`Apply`] touches the index. Keys live under a
+/// reserved co-processor prefix in the tenant namespace ([`durable_key`]).
 #[derive(Debug, PartialEq)]
 pub enum Persist {
-    None,
     Put { key: Vec<u8>, val: Vec<u8> },
     Del { key: Vec<u8> },
+}
+
+/// The in-memory side of a write, applied by [`Store::commit`] only after its
+/// [`Persist`] lands. Kept as data (not a closure) so [`Store::plan`] stays
+/// immutable and the durable write can happen in between.
+#[derive(Debug, PartialEq)]
+pub enum Apply {
+    CreateSet {
+        set: Vec<u8>,
+        dim: usize,
+        metric: Metric,
+    },
+    Insert {
+        set: Vec<u8>,
+        id: Vec<u8>,
+        vec: Vec<f32>,
+        meta: Option<Vec<u8>>,
+    },
+    Remove {
+        set: Vec<u8>,
+        id: Vec<u8>,
+    },
+}
+
+/// The outcome of planning one command.
+pub enum Plan {
+    /// Serve now; no durable effect (reads, errors, and a no-op delete).
+    Reply(Value),
+    /// A validated write: perform `persist` over the channel FIRST; on success
+    /// `commit(apply)` and reply `ok`; on a shed/failed write reply the
+    /// channel's error and leave the index untouched.
+    Write {
+        persist: Persist,
+        apply: Apply,
+        ok: Value,
+    },
 }
 
 /// The reserved key prefix for co-processor-owned rows in a tenant namespace.
 /// A leading NUL keeps these out of any ordinary keyspace a client walks, and
 /// the `vec` tag namespaces this co-processor from any future one.
-const KEY_PREFIX: &[u8] = b"\x00vec\x00";
+pub const KEY_PREFIX: &[u8] = b"\x00vec\x00";
 
 /// Durable key for a set's config (`kind = b'c'`) or a vector (`kind = b'v'`).
 /// NUL-separated; set and id are validated NUL-free at admission so the parse
@@ -259,9 +297,9 @@ fn err(msg: &str) -> Value {
     Value::Error(msg.to_string())
 }
 
-/// The co-processor's per-tenant, per-set state and the `VEC.*` dispatch. One
-/// `Store` per running co-processor; tenants are isolated by the namespace
-/// component of the key (ADR-0017 D1/D4).
+/// The co-processor's per-tenant, per-set state. One `Store` per running
+/// co-processor; tenants are isolated by the namespace component of the key
+/// (ADR-0017 D1/D4).
 #[derive(Default)]
 pub struct Store {
     sets: HashMap<(Vec<u8>, Vec<u8>), VectorSet>,
@@ -277,124 +315,153 @@ impl Store {
         self.sets.len()
     }
 
-    /// Dispatch one `VEC.*` command for tenant `ns`. Returns the reply and any
-    /// durability side effect the caller must perform over the channel.
-    /// `args[0]` is the command name (`VEC.SET`, …).
-    pub fn dispatch(&mut self, ns: &[u8], args: &[Vec<u8>]) -> (Value, Persist) {
+    /// Plan one `VEC.*` command for tenant `ns` WITHOUT mutating the index.
+    /// `args[0]` is the command name. Reads return [`Plan::Reply`]; writes
+    /// return [`Plan::Write`] for the caller to persist-then-`commit`.
+    pub fn plan(&self, ns: &[u8], args: &[Vec<u8>]) -> Plan {
         let Some(name) = args.first() else {
-            return (err("ERR empty command"), Persist::None);
+            return Plan::Reply(err("ERR empty command"));
         };
         match name.to_ascii_uppercase().as_slice() {
-            b"VEC.CREATE" => self.create(ns, args),
-            b"VEC.SET" => self.set(ns, args),
-            b"VEC.GET" => (self.get(ns, args), Persist::None),
-            b"VEC.DEL" => self.delete(ns, args),
-            b"VEC.SEARCH" => (self.search(ns, args), Persist::None),
-            b"VEC.INFO" => (self.info(ns, args), Persist::None),
-            other => (
-                err(&format!(
-                    "ERR unknown VEC command '{}'",
-                    String::from_utf8_lossy(other)
-                )),
-                Persist::None,
-            ),
+            b"VEC.CREATE" => self.plan_create(ns, args),
+            b"VEC.SET" => self.plan_set(ns, args),
+            b"VEC.GET" => Plan::Reply(self.get(ns, args)),
+            b"VEC.DEL" => self.plan_del(ns, args),
+            b"VEC.SEARCH" => Plan::Reply(self.search(ns, args)),
+            b"VEC.INFO" => Plan::Reply(self.info(ns, args)),
+            other => Plan::Reply(err(&format!(
+                "ERR unknown VEC command '{}'",
+                String::from_utf8_lossy(other)
+            ))),
+        }
+    }
+
+    /// Apply a planned write's index mutation, AFTER its durable write landed.
+    pub fn commit(&mut self, ns: &[u8], apply: Apply) {
+        match apply {
+            Apply::CreateSet { set, dim, metric } => {
+                self.sets
+                    .entry((ns.to_vec(), set))
+                    .or_insert_with(|| VectorSet::new(dim, metric));
+            }
+            Apply::Insert { set, id, vec, meta } => {
+                if let Some(vs) = self.sets.get_mut(&(ns.to_vec(), set)) {
+                    vs.set(id, vec, meta);
+                }
+            }
+            Apply::Remove { set, id } => {
+                if let Some(vs) = self.sets.get_mut(&(ns.to_vec(), set)) {
+                    vs.del(&id);
+                }
+            }
         }
     }
 
     /// VEC.CREATE <set> DIM <d> METRIC <cosine|l2|ip> [INDEX flat]
-    fn create(&mut self, ns: &[u8], args: &[Vec<u8>]) -> (Value, Persist) {
-        // args: 0=cmd 1=set 2="DIM" 3=<d> 4="METRIC" 5=<m> [6="INDEX" 7=flat]
+    fn plan_create(&self, ns: &[u8], args: &[Vec<u8>]) -> Plan {
         if args.len() < 6 {
-            return (
-                err("ERR VEC.CREATE <set> DIM <d> METRIC <cosine|l2|ip>"),
-                Persist::None,
-            );
+            return Plan::Reply(err("ERR VEC.CREATE <set> DIM <d> METRIC <cosine|l2|ip>"));
         }
         let set = &args[1];
         if !valid_name(set) {
-            return (err("ERR invalid set name"), Persist::None);
+            return Plan::Reply(err("ERR invalid set name"));
         }
         if !args[2].eq_ignore_ascii_case(b"DIM") || !args[4].eq_ignore_ascii_case(b"METRIC") {
-            return (
-                err("ERR VEC.CREATE <set> DIM <d> METRIC <cosine|l2|ip>"),
-                Persist::None,
-            );
+            return Plan::Reply(err("ERR VEC.CREATE <set> DIM <d> METRIC <cosine|l2|ip>"));
         }
         let dim = match std::str::from_utf8(&args[3])
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
         {
             Some(d) if d >= 1 => d,
-            _ => return (err("ERR DIM must be a positive integer"), Persist::None),
+            _ => return Plan::Reply(err("ERR DIM must be a positive integer")),
         };
         let Some(metric) = Metric::parse(&args[5]) else {
-            return (
-                err("ERR METRIC must be one of cosine, l2, ip"),
-                Persist::None,
-            );
+            return Plan::Reply(err("ERR METRIC must be one of cosine, l2, ip"));
         };
-        let key = (ns.to_vec(), set.to_vec());
-        if self.sets.contains_key(&key) {
-            return (err("ERR set already exists"), Persist::None);
+        if self.sets.contains_key(&(ns.to_vec(), set.to_vec())) {
+            return Plan::Reply(err("ERR set already exists"));
         }
-        self.sets.insert(key, VectorSet::new(dim, metric));
-        let cfg = format!("{dim}|{}", metric.as_str()).into_bytes();
-        (
-            Value::Simple("OK".into()),
-            Persist::Put {
+        Plan::Write {
+            persist: Persist::Put {
                 key: durable_key(b'c', set, b""),
-                val: cfg,
+                val: format!("{dim}|{}", metric.as_str()).into_bytes(),
             },
-        )
+            apply: Apply::CreateSet {
+                set: set.to_vec(),
+                dim,
+                metric,
+            },
+            ok: Value::Simple("OK".into()),
+        }
     }
 
     /// VEC.SET <set> <id> <vec> [META <json>]
-    fn set(&mut self, ns: &[u8], args: &[Vec<u8>]) -> (Value, Persist) {
+    fn plan_set(&self, ns: &[u8], args: &[Vec<u8>]) -> Plan {
         if args.len() < 4 {
-            return (
-                err("ERR VEC.SET <set> <id> <vec> [META <json>]"),
-                Persist::None,
-            );
+            return Plan::Reply(err("ERR VEC.SET <set> <id> <vec> [META <json>]"));
         }
         let (set, id, raw) = (&args[1], &args[2], &args[3]);
         if !valid_name(set) || !valid_name(id) {
-            return (
-                err("ERR invalid set or id (must be non-empty, no NUL)"),
-                Persist::None,
-            );
+            return Plan::Reply(err("ERR invalid set or id (must be non-empty, no NUL)"));
         }
         let meta: Option<Vec<u8>> = if args.len() >= 6 && args[4].eq_ignore_ascii_case(b"META") {
             Some(args[5].clone())
         } else {
             None
         };
-        let Some(vs) = self.sets.get_mut(&(ns.to_vec(), set.to_vec())) else {
-            return (err("ERR no such set (VEC.CREATE it first)"), Persist::None);
+        let Some(vs) = self.sets.get(&(ns.to_vec(), set.to_vec())) else {
+            return Plan::Reply(err("ERR no such set (VEC.CREATE it first)"));
         };
         let vec = match parse_vector(raw) {
             Ok(v) => v,
-            Err(e) => return (err(&format!("ERR {e}")), Persist::None),
+            Err(e) => return Plan::Reply(err(&format!("ERR {e}"))),
         };
         if vec.len() != vs.dim() {
-            return (
-                err(&format!(
-                    "WRONGDIM set is {}, vector is {}",
-                    vs.dim(),
-                    vec.len()
-                )),
-                Persist::None,
-            );
+            return Plan::Reply(err(&format!(
+                "WRONGDIM set is {}, vector is {}",
+                vs.dim(),
+                vec.len()
+            )));
         }
-        let dkey = durable_key(b'v', set, id);
-        let dval = encode_vec_row(&vec, meta.as_deref());
-        vs.set(id.to_vec(), vec, meta);
-        (
-            Value::Simple("OK".into()),
-            Persist::Put {
-                key: dkey,
-                val: dval,
+        Plan::Write {
+            persist: Persist::Put {
+                key: durable_key(b'v', set, id),
+                val: encode_vec_row(&vec, meta.as_deref()),
             },
-        )
+            apply: Apply::Insert {
+                set: set.to_vec(),
+                id: id.to_vec(),
+                vec,
+                meta,
+            },
+            ok: Value::Simple("OK".into()),
+        }
+    }
+
+    /// VEC.DEL <set> <id>
+    fn plan_del(&self, ns: &[u8], args: &[Vec<u8>]) -> Plan {
+        if args.len() < 3 {
+            return Plan::Reply(err("ERR VEC.DEL <set> <id>"));
+        }
+        let (set, id) = (&args[1], &args[2]);
+        let Some(vs) = self.sets.get(&(ns.to_vec(), set.to_vec())) else {
+            return Plan::Reply(err("ERR no such set"));
+        };
+        if vs.contains(id) {
+            Plan::Write {
+                persist: Persist::Del {
+                    key: durable_key(b'v', set, id),
+                },
+                apply: Apply::Remove {
+                    set: set.to_vec(),
+                    id: id.to_vec(),
+                },
+                ok: Value::Integer(1),
+            }
+        } else {
+            Plan::Reply(Value::Integer(0))
+        }
     }
 
     fn get(&self, ns: &[u8], args: &[Vec<u8>]) -> Value {
@@ -413,27 +480,6 @@ impl Store {
                 }
                 Value::Array(Some(row))
             }
-        }
-    }
-
-    /// VEC.DEL <set> <id>
-    fn delete(&mut self, ns: &[u8], args: &[Vec<u8>]) -> (Value, Persist) {
-        if args.len() < 3 {
-            return (err("ERR VEC.DEL <set> <id>"), Persist::None);
-        }
-        let (set, id) = (&args[1], &args[2]);
-        let Some(vs) = self.sets.get_mut(&(ns.to_vec(), set.to_vec())) else {
-            return (err("ERR no such set"), Persist::None);
-        };
-        if vs.del(id) {
-            (
-                Value::Integer(1),
-                Persist::Del {
-                    key: durable_key(b'v', set, id),
-                },
-            )
-        } else {
-            (Value::Integer(0), Persist::None)
         }
     }
 
@@ -510,46 +556,54 @@ mod tests {
         parts.iter().map(|p| v(p)).collect()
     }
 
+    /// Drive a command through the two-phase path as the networked co-processor
+    /// would with a durable store that never sheds: plan, then (for a write)
+    /// commit and return `ok`.
+    fn run(st: &mut Store, ns: &[u8], args: &[Vec<u8>]) -> Value {
+        match st.plan(ns, args) {
+            Plan::Reply(v) => v,
+            Plan::Write { apply, ok, .. } => {
+                st.commit(ns, apply);
+                ok
+            }
+        }
+    }
+
     #[test]
     fn create_set_search_end_to_end() {
         let mut st = Store::new();
         let ns = b"nsA";
 
-        // CREATE
-        let (r, p) = st.dispatch(
-            ns,
-            &cmd(&["VEC.CREATE", "docs", "DIM", "2", "METRIC", "l2"]),
+        assert_eq!(
+            run(
+                &mut st,
+                ns,
+                &cmd(&["VEC.CREATE", "docs", "DIM", "2", "METRIC", "l2"])
+            ),
+            Value::Simple("OK".into())
         );
-        assert_eq!(r, Value::Simple("OK".into()));
-        assert!(
-            matches!(p, Persist::Put { .. }),
-            "create persists its config"
-        );
+        // duplicate CREATE errors (and plans no write)
+        assert!(matches!(
+            st.plan(ns, &cmd(&["VEC.CREATE", "docs", "DIM", "2", "METRIC", "l2"])),
+            Plan::Reply(Value::Error(e)) if e.contains("already exists")
+        ));
 
-        // duplicate CREATE errors
-        let (r, _) = st.dispatch(
-            ns,
-            &cmd(&["VEC.CREATE", "docs", "DIM", "2", "METRIC", "l2"]),
-        );
-        assert!(matches!(r, Value::Error(e) if e.contains("already exists")));
-
-        // SET three vectors, each persisted
         for (id, vec) in [("a", "0,0"), ("b", "1,0"), ("c", "3,4")] {
-            let (r, p) = st.dispatch(ns, &cmd(&["VEC.SET", "docs", id, vec]));
-            assert_eq!(r, Value::Simple("OK".into()));
-            assert!(matches!(p, Persist::Put { .. }));
+            assert_eq!(
+                run(&mut st, ns, &cmd(&["VEC.SET", "docs", id, vec])),
+                Value::Simple("OK".into())
+            );
         }
 
-        // wrong dimension is refused
-        let (r, p) = st.dispatch(ns, &cmd(&["VEC.SET", "docs", "d", "1,2,3"]));
-        assert!(matches!(r, Value::Error(e) if e.starts_with("WRONGDIM")));
-        assert_eq!(p, Persist::None, "a refused write persists nothing");
+        // wrong dimension: an error, and NOT a Write (nothing to persist/apply)
+        assert!(matches!(
+            st.plan(ns, &cmd(&["VEC.SET", "docs", "d", "1,2,3"])),
+            Plan::Reply(Value::Error(e)) if e.starts_with("WRONGDIM")
+        ));
 
-        // SEARCH from the origin: a (0), b (1), c (5)
-        let r = st.search(ns, &cmd(&["VEC.SEARCH", "docs", "0,0", "2"]));
-        match r {
+        // SEARCH from the origin: a (0), b (1), then c (5)
+        match run(&mut st, ns, &cmd(&["VEC.SEARCH", "docs", "0,0", "2"])) {
             Value::Array(Some(rows)) => {
-                assert_eq!(rows.len(), 2, "k=2");
                 let ids: Vec<Vec<u8>> = rows
                     .iter()
                     .map(|row| match row {
@@ -567,57 +621,109 @@ mod tests {
     }
 
     #[test]
-    fn get_and_del_and_count() {
+    fn a_write_plans_the_durable_side_before_the_index_side() {
+        let st = Store::new();
+        let mut st = st;
+        run(
+            &mut st,
+            b"n",
+            &cmd(&["VEC.CREATE", "s", "DIM", "2", "METRIC", "ip"]),
+        );
+        // A VEC.SET returns a Write whose Persist::Put targets the vector's
+        // durable key and whose Apply::Insert carries the parsed vector — the
+        // caller performs the Put, THEN commits the Insert.
+        match st.plan(b"n", &cmd(&["VEC.SET", "s", "id7", "1,2"])) {
+            Plan::Write {
+                persist: Persist::Put { key, .. },
+                apply: Apply::Insert { id, vec, .. },
+                ok,
+            } => {
+                assert_eq!(key, durable_key(b'v', b"s", b"id7"));
+                assert_eq!(id, v("id7"));
+                assert_eq!(vec, vec![1.0, 2.0]);
+                assert_eq!(ok, Value::Simple("OK".into()));
+            }
+            _ => panic!("VEC.SET should plan a Write"),
+        }
+        // Because plan() does not mutate, the index is still empty until commit.
+        assert!(matches!(
+            st.plan(b"n", &cmd(&["VEC.GET", "s", "id7"])),
+            Plan::Reply(Value::Null)
+        ));
+    }
+
+    #[test]
+    fn get_and_del_and_meta() {
         let mut st = Store::new();
         let ns = b"nsA";
-        st.dispatch(
+        run(
+            &mut st,
             ns,
             &cmd(&["VEC.CREATE", "s", "DIM", "3", "METRIC", "cosine"]),
         );
-        st.dispatch(
+        run(
+            &mut st,
             ns,
             &cmd(&["VEC.SET", "s", "x", "1,2,3", "META", "{\"t\":1}"]),
         );
 
-        // GET returns the vector and the meta.
-        match st.get(ns, &cmd(&["VEC.GET", "s", "x"])) {
+        match run(&mut st, ns, &cmd(&["VEC.GET", "s", "x"])) {
             Value::Array(Some(row)) => {
                 assert_eq!(row[0], Value::Bulk(Some(v("1,2,3"))));
                 assert_eq!(row[1], Value::Bulk(Some(v("{\"t\":1}"))));
             }
             other => panic!("expected array, got {other:?}"),
         }
-        assert_eq!(st.get(ns, &cmd(&["VEC.GET", "s", "missing"])), Value::Null);
+        assert_eq!(
+            run(&mut st, ns, &cmd(&["VEC.GET", "s", "missing"])),
+            Value::Null
+        );
 
-        // DEL returns 1 then 0, and persists a delete only when it hit.
-        let (r, p) = st.delete(ns, &cmd(&["VEC.DEL", "s", "x"]));
-        assert_eq!(r, Value::Integer(1));
-        assert!(matches!(p, Persist::Del { .. }));
-        let (r, p) = st.delete(ns, &cmd(&["VEC.DEL", "s", "x"]));
-        assert_eq!(r, Value::Integer(0));
-        assert_eq!(p, Persist::None);
+        // DEL of a present id plans a Write (durable delete); of an absent id
+        // is a plain Reply(0) with nothing to persist.
+        assert!(matches!(
+            st.plan(ns, &cmd(&["VEC.DEL", "s", "x"])),
+            Plan::Write {
+                persist: Persist::Del { .. },
+                ok: Value::Integer(1),
+                ..
+            }
+        ));
+        assert_eq!(
+            run(&mut st, ns, &cmd(&["VEC.DEL", "s", "x"])),
+            Value::Integer(1)
+        );
+        assert!(matches!(
+            st.plan(ns, &cmd(&["VEC.DEL", "s", "x"])),
+            Plan::Reply(Value::Integer(0))
+        ));
     }
 
     #[test]
     fn tenants_are_isolated_by_namespace() {
         let mut st = Store::new();
-        st.dispatch(
+        run(
+            &mut st,
             b"tenantA",
             &cmd(&["VEC.CREATE", "s", "DIM", "2", "METRIC", "ip"]),
         );
-        st.dispatch(b"tenantA", &cmd(&["VEC.SET", "s", "secret", "9,9"]));
+        run(
+            &mut st,
+            b"tenantA",
+            &cmd(&["VEC.SET", "s", "secret", "9,9"]),
+        );
         // tenantB has no set named "s" of its own.
         assert!(matches!(
-            st.search(b"tenantB", &cmd(&["VEC.SEARCH", "s", "9,9", "1"])),
-            Value::Error(e) if e.contains("no such set")
+            st.plan(b"tenantB", &cmd(&["VEC.SEARCH", "s", "9,9", "1"])),
+            Plan::Reply(Value::Error(e)) if e.contains("no such set")
         ));
-        // Same set name under B is a DIFFERENT index and cannot see A's vector.
-        st.dispatch(
+        run(
+            &mut st,
             b"tenantB",
             &cmd(&["VEC.CREATE", "s", "DIM", "2", "METRIC", "ip"]),
         );
-        match st.search(b"tenantB", &cmd(&["VEC.SEARCH", "s", "9,9", "5"])) {
-            Value::Array(Some(rows)) => assert!(rows.is_empty(), "B's index is empty"),
+        match run(&mut st, b"tenantB", &cmd(&["VEC.SEARCH", "s", "9,9", "5"])) {
+            Value::Array(Some(rows)) => assert!(rows.is_empty(), "B's index cannot see A's vector"),
             other => panic!("expected empty array, got {other:?}"),
         }
     }
@@ -643,15 +749,25 @@ mod tests {
     fn invalid_names_and_bad_vectors_are_refused() {
         let mut st = Store::new();
         let ns = b"n";
-        st.dispatch(ns, &cmd(&["VEC.CREATE", "s", "DIM", "2", "METRIC", "l2"]));
+        run(
+            &mut st,
+            ns,
+            &cmd(&["VEC.CREATE", "s", "DIM", "2", "METRIC", "l2"]),
+        );
         // NUL in id
-        let (r, _) = st.dispatch(ns, &[v("VEC.SET"), v("s"), vec![0], v("1,2")]);
-        assert!(matches!(r, Value::Error(e) if e.contains("invalid set or id")));
+        assert!(matches!(
+            st.plan(ns, &[v("VEC.SET"), v("s"), vec![0], v("1,2")]),
+            Plan::Reply(Value::Error(e)) if e.contains("invalid set or id")
+        ));
         // non-numeric vector
-        let (r, _) = st.dispatch(ns, &cmd(&["VEC.SET", "s", "id", "1,x"]));
-        assert!(matches!(r, Value::Error(e) if e.contains("not a float")));
+        assert!(matches!(
+            st.plan(ns, &cmd(&["VEC.SET", "s", "id", "1,x"])),
+            Plan::Reply(Value::Error(e)) if e.contains("not a float")
+        ));
         // unknown VEC command
-        let (r, _) = st.dispatch(ns, &cmd(&["VEC.NOPE", "s"]));
-        assert!(matches!(r, Value::Error(e) if e.contains("unknown VEC command")));
+        assert!(matches!(
+            st.plan(ns, &cmd(&["VEC.NOPE", "s"])),
+            Plan::Reply(Value::Error(e)) if e.contains("unknown VEC command")
+        ));
     }
 }
