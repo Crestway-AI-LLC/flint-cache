@@ -4,7 +4,7 @@
 #
 # Drill 1's positive half, end to end. A registered family command (VEC.SET) is
 # charged once, minted a single-use channel token, and forwarded as
-# `FLINTFAM <token> <callback> VEC.SET k v` to a co-processor; the co-processor
+# `FLINTFAM <token> <callback> <ns> VEC.SET k v` to a co-processor; the co-processor
 # opens `PROXYCHAN` back to the callback and stores in the GRANTED namespace;
 # its reply relays to the client. Then the properties that matter:
 #   - the storage landed in that tenant's namespace and NO other (scoping, now
@@ -58,7 +58,9 @@ def handle(conn):
         if a is None: break
         if a[0].upper() != b'FLINTFAM':
             conn.sendall(b'-ERR expected FLINTFAM\r\n'); continue
-        token, callback, orig = a[1], a[2].decode(), a[3:]
+        # FLINTFAM <token> <callback> <ns> <original command...> (ADR-0017 D2:
+        # ns is a per-tenant index-selection label, not a credential).
+        token, callback, ns, orig = a[1], a[2].decode(), a[3], a[4:]
         if len(orig) >= 3 and orig[0].upper() == b'VEC.SET':
             host, port = callback.split(':')
             ch = socket.create_connection((host, int(port)), timeout=3); cf = ch.makefile('rb')

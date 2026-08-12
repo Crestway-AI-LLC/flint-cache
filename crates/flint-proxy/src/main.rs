@@ -2397,7 +2397,7 @@ const FAMILY_CHANNEL_DEADLINE: std::time::Duration = std::time::Duration::from_s
 
 /// Handle a registered family command (ADR-0010 D1/D2/D6). Charge the tenant
 /// once, mint a single-use channel token, and forward
-/// `FLINTFAM <token> <callback> <command…>` to a co-processor over the pooled,
+/// `FLINTFAM <token> <callback> <ns> <command…>` to a co-processor over the pooled,
 /// synchronous hop, relaying its reply. A co-processor's OWN `-ERR` is relayed
 /// as-is (its logic said no); a TRANSPORT failure — no endpoint, dial refused,
 /// deadline, dropped reply — and a missing callback both become
@@ -2439,15 +2439,20 @@ fn family_command(topo: &Topology, ns: &[u8], args: &[Vec<u8>]) -> Value {
     let Some(token) = topo.mint_channel_token(ns, topo.family_budget, deadline) else {
         return unavail();
     };
-    // FLINTFAM <token> <callback> <original command…>. FLINTFAM is safe as a
-    // proxy-only verb because the edge refuses every FLINT* before auth (#151),
-    // so a client can never speak it.
+    // FLINTFAM <token> <callback> <ns> <original command…>. FLINTFAM is safe as
+    // a proxy-only verb because the edge refuses every FLINT* before auth
+    // (#151), so a client can never speak it. The namespace rides as a LABEL
+    // (ADR-0017 D2): a co-processor needs a stable per-tenant key to select the
+    // right in-memory index on a query — the single-use token cannot serve that
+    // — but it is NOT a credential. All storage still flows only through the
+    // namespace-bound channel token; the label selects an index, nothing more.
     let token_b = token.into_bytes();
     let callback_b = callback.into_bytes();
-    let mut parts: Vec<&[u8]> = Vec::with_capacity(args.len() + 3);
+    let mut parts: Vec<&[u8]> = Vec::with_capacity(args.len() + 4);
     parts.push(b"FLINTFAM");
     parts.push(&token_b);
     parts.push(&callback_b);
+    parts.push(ns);
     parts.extend(args.iter().map(|a| a.as_slice()));
     let frame = encode_cmd(&parts);
     match topo.coproc_call(&endpoints, &frame, topo.family_deadline) {
