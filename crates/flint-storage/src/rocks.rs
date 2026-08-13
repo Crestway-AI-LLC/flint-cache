@@ -10,7 +10,7 @@
 
 use std::path::Path;
 
-use rocksdb::{BlockBasedOptions, DB, Options, WriteBatch};
+use rocksdb::{BlockBasedIndexType, BlockBasedOptions, Cache, DB, Options, WriteBatch};
 
 use crate::Kv;
 
@@ -128,16 +128,35 @@ impl RocksKv {
     }
 }
 
-/// Block-based table options every data SST is written with. The whole-key
-/// bloom filter (S0.1) is the load-bearing part at scale — a point-read MISS is
-/// ruled out by the per-SST filter rather than seeking a data block on each
-/// level. 10 bits/key is ≈1% false-positive; whole-key filtering (the RocksDB
-/// default) is what a `get()` consults. The RAM budget for those filter/index
-/// blocks at 100 TB (partitioned filters, cache pinning) is S0.2, layered on
-/// this same factory.
+/// Block cache capacity — THE index/filter/data RAM bound at scale (S0.2). A
+/// large node should raise this toward a fraction of its RAM (follow-on: a knob
+/// threaded from node config); the LRU fills lazily, so small nodes and the
+/// drills use only what they touch.
+const BLOCK_CACHE_BYTES: usize = 512 * 1024 * 1024;
+
+/// Block-based table options every data SST is written with.
+///
+/// S0.1 — the whole-key bloom filter is the load-bearing part for point reads:
+/// a MISS is ruled out by the per-SST filter rather than seeking a data block
+/// on each level. 10 bits/key ≈ 1% false-positive; whole-key filtering (the
+/// RocksDB default) is what a `get()` consults.
+///
+/// S0.2 — keep index + filter RAM BOUNDED as the keyspace grows past RAM.
+/// Two-level (partitioned) index + partitioned filters split those blocks so
+/// only the small top level is resident; the rest live in the bounded block
+/// cache instead of pinned unboundedly per open table. The top level and the
+/// hot L0 blocks are pinned in cache so lookups don't pay I/O for them. Without
+/// this, index+filter RAM grows linearly with data and a multi-TB node OOMs
+/// long before its disk fills (docs/scale-to-100tb.md).
 fn table_options() -> BlockBasedOptions {
     let mut bbt = BlockBasedOptions::default();
     bbt.set_bloom_filter(10.0, false);
+    bbt.set_index_type(BlockBasedIndexType::TwoLevelIndexSearch);
+    bbt.set_partition_filters(true);
+    bbt.set_cache_index_and_filter_blocks(true);
+    bbt.set_pin_top_level_index_and_filter(true);
+    bbt.set_pin_l0_filter_and_index_blocks_in_cache(true);
+    bbt.set_block_cache(&Cache::new_lru_cache(BLOCK_CACHE_BYTES));
     bbt
 }
 
@@ -433,6 +452,24 @@ mod audit {
             .and_then(|l| l.split("COUNT :").nth(1))
             .and_then(|n| n.trim().parse().ok())
             .unwrap_or(0)
+    }
+
+    /// S0.2: the production `open()` path must bound index/filter/data RAM to
+    /// our block cache rather than let it grow per open table with the dataset.
+    /// The configured capacity is observable, so assert open() wired it.
+    #[test]
+    fn open_bounds_the_block_cache() {
+        let dir = TempDir::new("cache");
+        let kv = RocksKv::open(&dir.0).expect("open");
+        let cap = kv
+            .db()
+            .property_int_value("rocksdb.block-cache-capacity")
+            .expect("property")
+            .expect("some");
+        assert_eq!(
+            cap as usize, BLOCK_CACHE_BYTES,
+            "open() must wire the bounded block cache (S0.2)"
+        );
     }
 
     #[test]
