@@ -22,7 +22,7 @@
 
 use flint_resp::{Decoded, Value, decode, encode};
 use flint_vec::{
-    Apply, KEY_PREFIX, Metric, Persist, Plan, Store, decode_config, decode_vec_row,
+    Apply, IndexKind, KEY_PREFIX, Metric, Persist, Plan, Store, decode_config, decode_vec_row,
     parse_durable_key,
 };
 use std::collections::HashMap;
@@ -40,8 +40,8 @@ enum LoadState {
 }
 type Loads = Arc<Mutex<HashMap<Vec<u8>, LoadState>>>;
 
-/// A decoded config row awaiting install: `(set, dim, metric)`.
-type LoadedConfig = (Vec<u8>, usize, Metric);
+/// A decoded config row awaiting install: `(set, dim, metric, index)`.
+type LoadedConfig = (Vec<u8>, usize, Metric, IndexKind);
 /// A decoded vector row awaiting install: `(set, id, vector, meta)`.
 type LoadedVector = (Vec<u8>, Vec<u8>, Vec<f32>, Option<Vec<u8>>);
 
@@ -223,8 +223,8 @@ fn rebuild_inner(
         }
         match read_reply(&mut ch) {
             Ok(Value::Bulk(Some(val))) if kind == b'c' => {
-                if let Some((dim, metric)) = decode_config(&val) {
-                    configs.push((set, dim, metric));
+                if let Some((dim, metric, index)) = decode_config(&val) {
+                    configs.push((set, dim, metric, index));
                 }
             }
             Ok(Value::Bulk(Some(val))) if kind == b'v' => {
@@ -260,8 +260,16 @@ fn install(
     vectors: Vec<LoadedVector>,
 ) -> usize {
     let mut st = store.lock().expect("store lock");
-    for (set, dim, metric) in configs {
-        st.commit(ns, Apply::CreateSet { set, dim, metric });
+    for (set, dim, metric, index) in configs {
+        st.commit(
+            ns,
+            Apply::CreateSet {
+                set,
+                dim,
+                metric,
+                index,
+            },
+        );
     }
     let n = vectors.len();
     for (set, id, vec, meta) in vectors {

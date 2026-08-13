@@ -18,7 +18,10 @@
 //! with an HNSW graph behind the SAME plan; v1 makes it disk-resident
 //! (DiskANN). None of those changes the `VEC.*` surface or the durable format.
 
+mod hnsw;
+
 use flint_resp::Value;
+use hnsw::Hnsw;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
 
@@ -65,12 +68,117 @@ struct Entry {
     meta: Option<Vec<u8>>,
 }
 
-/// One vector set: fixed dim + metric, an id->Entry map for O(1) upsert/delete,
-/// and exact top-k. `search` is the only method v0.2/v1 re-implement.
+/// Which engine backs a set. Chosen at VEC.CREATE and recorded in the durable
+/// config so a rebuild restores the same kind.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum IndexKind {
+    /// Exact brute-force scan — the recall oracle. Default.
+    Flat,
+    /// HNSW graph — approximate, sublinear, the recall/latency `EF` knob.
+    Hnsw,
+}
+impl IndexKind {
+    pub fn parse(s: &[u8]) -> Option<IndexKind> {
+        match s.to_ascii_lowercase().as_slice() {
+            b"flat" => Some(IndexKind::Flat),
+            b"hnsw" => Some(IndexKind::Hnsw),
+            _ => None,
+        }
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            IndexKind::Flat => "flat",
+            IndexKind::Hnsw => "hnsw",
+        }
+    }
+}
+
+/// The engine behind a set. Both hold the vectors (a rebuild restores either);
+/// flat scans them exactly, HNSW keeps a navigable graph over them.
+enum Index {
+    Flat(HashMap<Vec<u8>, Entry>),
+    Hnsw(Hnsw),
+}
+
+/// One vector set: fixed dim + metric + index engine. `search` dispatches to the
+/// engine; the `VEC.*` surface never sees which — the whole point of v0.2 being
+/// a drop-in behind the same commands.
 pub struct VectorSet {
     dim: usize,
     metric: Metric,
-    entries: HashMap<Vec<u8>, Entry>,
+    index: Index,
+}
+
+impl VectorSet {
+    pub fn new(dim: usize, metric: Metric, kind: IndexKind) -> Self {
+        let index = match kind {
+            IndexKind::Flat => Index::Flat(HashMap::new()),
+            IndexKind::Hnsw => Index::Hnsw(Hnsw::new(metric)),
+        };
+        VectorSet { dim, metric, index }
+    }
+
+    pub fn dim(&self) -> usize {
+        self.dim
+    }
+    pub fn metric(&self) -> Metric {
+        self.metric
+    }
+    pub fn index_name(&self) -> &'static str {
+        match &self.index {
+            Index::Flat(_) => "flat",
+            Index::Hnsw(_) => "hnsw",
+        }
+    }
+    pub fn len(&self) -> usize {
+        match &self.index {
+            Index::Flat(m) => m.len(),
+            Index::Hnsw(h) => h.len(),
+        }
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    fn contains(&self, id: &[u8]) -> bool {
+        match &self.index {
+            Index::Flat(m) => m.contains_key(id),
+            Index::Hnsw(h) => h.contains(id),
+        }
+    }
+
+    fn set(&mut self, id: Vec<u8>, vec: Vec<f32>, meta: Option<Vec<u8>>) {
+        match &mut self.index {
+            Index::Flat(m) => {
+                let norm = dot(&vec, &vec).sqrt();
+                m.insert(id, Entry { vec, norm, meta });
+            }
+            Index::Hnsw(h) => h.set(id, vec, meta),
+        }
+    }
+
+    fn del(&mut self, id: &[u8]) -> bool {
+        match &mut self.index {
+            Index::Flat(m) => m.remove(id).is_some(),
+            Index::Hnsw(h) => h.del(id),
+        }
+    }
+
+    /// The stored vector + meta for VEC.GET (lossless), or None.
+    fn get(&self, id: &[u8]) -> Option<(Vec<f32>, Option<Vec<u8>>)> {
+        match &self.index {
+            Index::Flat(m) => m.get(id).map(|e| (e.vec.clone(), e.meta.clone())),
+            Index::Hnsw(h) => h.get(id).map(|(v, m)| (v.to_vec(), m.map(|x| x.to_vec()))),
+        }
+    }
+
+    /// Top-k nearest, nearest first. `ef` is HNSW's recall/latency knob; flat
+    /// ignores it (it is always exact).
+    fn search(&self, query: &[f32], k: usize, ef: usize) -> Vec<(Vec<u8>, f32)> {
+        match &self.index {
+            Index::Flat(m) => flat_search(m, self.metric, query, k),
+            Index::Hnsw(h) => h.knn(query, k, ef),
+        }
+    }
 }
 
 #[derive(PartialEq)]
@@ -92,90 +200,59 @@ impl Ord for Scored {
     }
 }
 
-impl VectorSet {
-    pub fn new(dim: usize, metric: Metric) -> Self {
-        VectorSet {
-            dim,
-            metric,
-            entries: HashMap::new(),
-        }
-    }
-
-    pub fn dim(&self) -> usize {
-        self.dim
-    }
-    pub fn metric(&self) -> Metric {
-        self.metric
-    }
-    pub fn len(&self) -> usize {
-        self.entries.len()
-    }
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-    fn contains(&self, id: &[u8]) -> bool {
-        self.entries.contains_key(id)
-    }
-
-    fn set(&mut self, id: Vec<u8>, vec: Vec<f32>, meta: Option<Vec<u8>>) {
-        let norm = dot(&vec, &vec).sqrt();
-        self.entries.insert(id, Entry { vec, norm, meta });
-    }
-
-    fn del(&mut self, id: &[u8]) -> bool {
-        self.entries.remove(id).is_some()
-    }
-
-    fn score(&self, query: &[f32], q_norm: f32, e: &Entry) -> f32 {
-        match self.metric {
-            Metric::Ip => dot(query, &e.vec),
-            Metric::L2 => {
-                // -||q - v||^2, without allocating a diff vector.
-                -query
-                    .iter()
-                    .zip(&e.vec)
-                    .map(|(q, x)| {
-                        let d = q - x;
-                        d * d
-                    })
-                    .sum::<f32>()
-            }
-            Metric::Cosine => {
-                let denom = q_norm * e.norm;
-                if denom == 0.0 {
-                    0.0
-                } else {
-                    dot(query, &e.vec) / denom
-                }
+/// Flat score: HIGHER is nearer. HNSW converts its internal distances into this
+/// same convention so a mixed fleet answers VEC.SEARCH identically.
+fn flat_score(metric: Metric, query: &[f32], q_norm: f32, e: &Entry) -> f32 {
+    match metric {
+        Metric::Ip => dot(query, &e.vec),
+        Metric::L2 => -query
+            .iter()
+            .zip(&e.vec)
+            .map(|(q, x)| {
+                let d = q - x;
+                d * d
+            })
+            .sum::<f32>(),
+        Metric::Cosine => {
+            let denom = q_norm * e.norm;
+            if denom == 0.0 {
+                0.0
+            } else {
+                dot(query, &e.vec) / denom
             }
         }
     }
+}
 
-    /// Exact top-k, nearest first (recall 1.0). O(n log k).
-    pub fn search(&self, query: &[f32], k: usize) -> Vec<(Vec<u8>, f32)> {
-        if k == 0 {
-            return Vec::new();
-        }
-        let q_norm = if self.metric == Metric::Cosine {
-            dot(query, query).sqrt()
-        } else {
-            0.0
-        };
-        let mut heap: BinaryHeap<std::cmp::Reverse<Scored>> = BinaryHeap::with_capacity(k + 1);
-        for (id, e) in &self.entries {
-            let score = self.score(query, q_norm, e);
-            heap.push(std::cmp::Reverse(Scored {
-                score,
-                id: id.clone(),
-            }));
-            if heap.len() > k {
-                heap.pop();
-            }
-        }
-        let mut out: Vec<(Vec<u8>, f32)> = heap.into_iter().map(|r| (r.0.id, r.0.score)).collect();
-        out.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        out
+/// Exact flat top-k, nearest first (recall 1.0). O(n log k).
+fn flat_search(
+    entries: &HashMap<Vec<u8>, Entry>,
+    metric: Metric,
+    query: &[f32],
+    k: usize,
+) -> Vec<(Vec<u8>, f32)> {
+    if k == 0 {
+        return Vec::new();
     }
+    let q_norm = if metric == Metric::Cosine {
+        dot(query, query).sqrt()
+    } else {
+        0.0
+    };
+    let mut heap: BinaryHeap<std::cmp::Reverse<Scored>> = BinaryHeap::with_capacity(k + 1);
+    for (id, e) in entries {
+        let score = flat_score(metric, query, q_norm, e);
+        heap.push(std::cmp::Reverse(Scored {
+            score,
+            id: id.clone(),
+        }));
+        if heap.len() > k {
+            heap.pop();
+        }
+    }
+    let mut out: Vec<(Vec<u8>, f32)> = heap.into_iter().map(|r| (r.0.id, r.0.score)).collect();
+    out.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    out
 }
 
 /// The durable side of a write: what the co-processor must do over the channel
@@ -197,6 +274,7 @@ pub enum Apply {
         set: Vec<u8>,
         dim: usize,
         metric: Metric,
+        index: IndexKind,
     },
     Insert {
         set: Vec<u8>,
@@ -316,11 +394,18 @@ pub fn decode_vec_row(val: &[u8]) -> Result<(Vec<f32>, Option<Vec<u8>>), String>
     Ok((parse_vector(floats)?, meta))
 }
 
-/// Inverse of a config row: `<dim>|<metric>`.
-pub fn decode_config(val: &[u8]) -> Option<(usize, Metric)> {
+/// Inverse of a config row: `<dim>|<metric>[|<index>]`. A 2-field config
+/// (written before v0.2 added the index kind) is flat.
+pub fn decode_config(val: &[u8]) -> Option<(usize, Metric, IndexKind)> {
     let s = std::str::from_utf8(val).ok()?;
-    let (d, m) = s.split_once('|')?;
-    Some((d.parse().ok()?, Metric::parse(m.as_bytes())?))
+    let mut it = s.split('|');
+    let dim = it.next()?.parse().ok()?;
+    let metric = Metric::parse(it.next()?.as_bytes())?;
+    let index = match it.next() {
+        Some(k) => IndexKind::parse(k.as_bytes())?,
+        None => IndexKind::Flat,
+    };
+    Some((dim, metric, index))
 }
 
 fn valid_name(b: &[u8]) -> bool {
@@ -373,10 +458,15 @@ impl Store {
     /// Apply a planned write's index mutation, AFTER its durable write landed.
     pub fn commit(&mut self, ns: &[u8], apply: Apply) {
         match apply {
-            Apply::CreateSet { set, dim, metric } => {
+            Apply::CreateSet {
+                set,
+                dim,
+                metric,
+                index,
+            } => {
                 self.sets
                     .entry((ns.to_vec(), set))
-                    .or_insert_with(|| VectorSet::new(dim, metric));
+                    .or_insert_with(|| VectorSet::new(dim, metric, index));
             }
             Apply::Insert { set, id, vec, meta } => {
                 if let Some(vs) = self.sets.get_mut(&(ns.to_vec(), set)) {
@@ -413,18 +503,28 @@ impl Store {
         let Some(metric) = Metric::parse(&args[5]) else {
             return Plan::Reply(err("ERR METRIC must be one of cosine, l2, ip"));
         };
+        // Optional trailing `INDEX flat|hnsw`; default flat (exact, the oracle).
+        let index = if args.len() >= 8 && args[6].eq_ignore_ascii_case(b"INDEX") {
+            match IndexKind::parse(&args[7]) {
+                Some(k) => k,
+                None => return Plan::Reply(err("ERR INDEX must be flat or hnsw")),
+            }
+        } else {
+            IndexKind::Flat
+        };
         if self.sets.contains_key(&(ns.to_vec(), set.to_vec())) {
             return Plan::Reply(err("ERR set already exists"));
         }
         Plan::Write {
             persist: Persist::Put {
                 key: durable_key(b'c', set, b""),
-                val: format!("{dim}|{}", metric.as_str()).into_bytes(),
+                val: format!("{dim}|{}|{}", metric.as_str(), index.as_str()).into_bytes(),
             },
             apply: Apply::CreateSet {
                 set: set.to_vec(),
                 dim,
                 metric,
+                index,
             },
             ok: Value::Simple("OK".into()),
         }
@@ -505,12 +605,12 @@ impl Store {
         let Some(vs) = self.sets.get(&(ns.to_vec(), args[1].to_vec())) else {
             return err("ERR no such set");
         };
-        match vs.entries.get(&args[2]) {
+        match vs.get(&args[2]) {
             None => Value::Null,
-            Some(e) => {
-                let mut row = vec![Value::Bulk(Some(floats_to_ascii(&e.vec).into_bytes()))];
-                if let Some(m) = &e.meta {
-                    row.push(Value::Bulk(Some(m.clone())));
+            Some((vec, meta)) => {
+                let mut row = vec![Value::Bulk(Some(floats_to_ascii(&vec).into_bytes()))];
+                if let Some(m) = meta {
+                    row.push(Value::Bulk(Some(m)));
                 }
                 Value::Array(Some(row))
             }
@@ -543,10 +643,17 @@ impl Store {
             Some(k) => k,
             None => return err("ERR k must be a non-negative integer"),
         };
-        // EF (args[4..]) is the HNSW recall/latency knob; flat ignores it, but
-        // accepting it keeps the wire stable across the flat->HNSW swap.
+        // Optional `EF <n>`: HNSW's recall/latency knob. Flat ignores it.
+        let ef = if args.len() >= 6 && args[4].eq_ignore_ascii_case(b"EF") {
+            std::str::from_utf8(&args[5])
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(hnsw::EF_SEARCH_DEFAULT)
+        } else {
+            hnsw::EF_SEARCH_DEFAULT
+        };
         let rows: Vec<Value> = vs
-            .search(&query, k)
+            .search(&query, k, ef)
             .into_iter()
             .map(|(id, score)| {
                 Value::Array(Some(vec![
@@ -572,7 +679,7 @@ impl Store {
             bulk("metric"),
             bulk(vs.metric().as_str()),
             bulk("index"),
-            bulk("flat"),
+            bulk(vs.index_name()),
             bulk("count"),
             Value::Integer(vs.len() as i64),
         ]))
@@ -651,6 +758,108 @@ mod tests {
                 assert_eq!(ids, vec![v("a"), v("b")], "nearest two, in order");
             }
             other => panic!("expected array, got {other:?}"),
+        }
+    }
+
+    /// `INDEX hnsw` end-to-end through the same VEC.* surface: the durable config
+    /// records the kind (so a rebuild restores HNSW, not the flat default), the
+    /// engine dispatches on SET/GET/SEARCH, `EF` is accepted, and INFO reports it.
+    #[test]
+    fn hnsw_index_end_to_end() {
+        let mut st = Store::new();
+        let ns = b"nsH";
+
+        // CREATE ... INDEX hnsw: the persisted config value ends with the kind,
+        // which is what rebuild reads back to pick the engine.
+        match st.plan(
+            ns,
+            &cmd(&[
+                "VEC.CREATE",
+                "d",
+                "DIM",
+                "2",
+                "METRIC",
+                "l2",
+                "INDEX",
+                "hnsw",
+            ]),
+        ) {
+            Plan::Write {
+                persist: Persist::Put { val, .. },
+                ..
+            } => assert!(
+                val.ends_with(b"|hnsw"),
+                "durable config must record the hnsw kind for rebuild, got {:?}",
+                String::from_utf8_lossy(&val)
+            ),
+            _ => panic!("CREATE should plan a Write"),
+        }
+        run(
+            &mut st,
+            ns,
+            &cmd(&[
+                "VEC.CREATE",
+                "d",
+                "DIM",
+                "2",
+                "METRIC",
+                "l2",
+                "INDEX",
+                "hnsw",
+            ]),
+        );
+
+        // Points spread along the x-axis: nearest-to-origin order is unambiguous,
+        // and 24 of them exercises more than the entry node.
+        for i in 0..24u32 {
+            let (id, vec) = (format!("p{i}"), format!("{i},0"));
+            assert_eq!(
+                run(&mut st, ns, &cmd(&["VEC.SET", "d", &id, &vec])),
+                Value::Simple("OK".into())
+            );
+        }
+
+        // INFO reports the hnsw engine and the live count.
+        match run(&mut st, ns, &cmd(&["VEC.INFO", "d"])) {
+            Value::Array(Some(f)) => {
+                assert_eq!(f[4], Value::Bulk(Some(b"index".to_vec())));
+                assert_eq!(f[5], Value::Bulk(Some(b"hnsw".to_vec())), "INFO index");
+                assert_eq!(f[7], Value::Integer(24), "INFO count");
+            }
+            other => panic!("INFO should be an array, got {other:?}"),
+        }
+
+        // GET routes through the HNSW engine and is lossless.
+        assert_eq!(
+            run(&mut st, ns, &cmd(&["VEC.GET", "d", "p5"])),
+            Value::Array(Some(vec![Value::Bulk(Some(b"5,0".to_vec()))])),
+        );
+
+        // SEARCH from the origin with an explicit EF: the three nearest are the
+        // three smallest x, nearest first (score conversion keeps the ordering).
+        match run(
+            &mut st,
+            ns,
+            &cmd(&["VEC.SEARCH", "d", "0,0", "3", "EF", "64"]),
+        ) {
+            Value::Array(Some(rows)) => {
+                let ids: Vec<Vec<u8>> = rows
+                    .iter()
+                    .map(|row| match row {
+                        Value::Array(Some(pair)) => match &pair[0] {
+                            Value::Bulk(Some(id)) => id.clone(),
+                            _ => panic!("row[0] not a bulk id"),
+                        },
+                        _ => panic!("search row not a pair"),
+                    })
+                    .collect();
+                assert_eq!(
+                    ids,
+                    vec![v("p0"), v("p1"), v("p2")],
+                    "nearest three in order"
+                );
+            }
+            other => panic!("SEARCH should be an array, got {other:?}"),
         }
     }
 
@@ -792,7 +1001,10 @@ mod tests {
                 ..
             } => {
                 assert_eq!(parse_durable_key(&key), Some((b'c', v("docs"), Vec::new())));
-                assert_eq!(decode_config(&val), Some((4, Metric::Cosine)));
+                assert_eq!(
+                    decode_config(&val),
+                    Some((4, Metric::Cosine, IndexKind::Flat))
+                );
             }
             _ => panic!("create should plan a config Put"),
         }
