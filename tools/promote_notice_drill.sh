@@ -115,7 +115,13 @@ echo "  that is ${SLOW_DELTA}ms above steady state"
   || { echo "FAIL: expected the reactive path to cost >=30ms above baseline (the 50ms
       retry sleep), got ${SLOW_DELTA}ms. The comparison in B is meaningless if
       the no-notice path is already fast."; exit 1; }
-HINT_A=$(valkey-cli -p 7596 CPSNAPSHOT 127.0.0.1:7823 | tail -1)
+# The promotion hint is the 7th CPSNAPSHOT frame element (index 6), so line 7
+# of the piped output — NOT `tail -1`. c29bc22 appended an 8th element (the
+# co-processor families table, ADR-0010 D1), always emitted and empty here, so
+# tail now reads that empty line instead of the hint. The frame is append-only
+# (older readers index a fixed prefix), so line 7 is stable; sibling drills read
+# tenants at line 4 and exceptions at line 6 the same way.
+HINT_A=$(valkey-cli -p 7596 CPSNAPSHOT 127.0.0.1:7823 | sed -n '7p')
 echo "  cp promotion hint: '${HINT_A}' (expected empty)"
 
 echo "== B) WITH the notice: the CP is told, and tells the proxy"
@@ -133,7 +139,7 @@ echo "  first write after failover: ${FAST}ms"
 # MECHANISM, not just timing: the hint must actually be in the snapshot the
 # proxy is served. A timing win with an empty hint would mean something else
 # got fast and the notice is doing nothing.
-HINT_B=$(valkey-cli -p 7596 CPSNAPSHOT 127.0.0.1:7823 | tail -1)
+HINT_B=$(valkey-cli -p 7596 CPSNAPSHOT 127.0.0.1:7823 | sed -n '7p')  # 7th frame element (see run A)
 echo "  cp promotion hint: '${HINT_B}'"
 case "$HINT_B" in
   "$R|"*) ;;
