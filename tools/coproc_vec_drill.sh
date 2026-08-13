@@ -67,9 +67,22 @@ case "$(vexec VEC.GET docs a)" in *"1,0,0"*) : ;; *) echo "FAIL: VEC.GET"; exit 
 case "$(vexec VEC.INFO docs)" in *count*3*) : ;; *) echo "FAIL: VEC.INFO count"; exit 1 ;; esac
 echo "  VEC.SEARCH -> $PRE"
 
+echo "== a second set on the HNSW engine (INDEX hnsw) serves through the same surface"
+[ "$(vexec VEC.CREATE docsh DIM 3 METRIC l2 INDEX hnsw)" = "OK " ] \
+  || { echo "FAIL: VEC.CREATE INDEX hnsw"; exit 1; }
+for kv in "a 1,0,0" "b 0,1,0" "c 0,0,1"; do
+  set -- $kv
+  [ "$(vexec VEC.SET docsh "$1" "$2")" = "OK " ] || { echo "FAIL: VEC.SET docsh $1"; exit 1; }
+done
+PREH="$(vexec VEC.SEARCH docsh 0.9,0.1,0 2)"
+case "$PREH" in *a*b*) : ;; *) echo "FAIL: HNSW SEARCH order, got: $PREH"; exit 1 ;; esac
+case "$(vexec VEC.INFO docsh)" in *index*hnsw*) : ;; *) echo "FAIL: VEC.INFO should report the hnsw engine"; exit 1 ;; esac
+echo "  HNSW VEC.SEARCH -> $PREH"
+
 echo "== durable rows exist in KV independent of the co-processor"
-[ "$($A DBSIZE 2>&1 | tr -d '\r')" = "4" ] \
-  || { echo "FAIL: expected 4 durable keys (1 config + 3 vectors), got $($A DBSIZE)"; exit 1; }
+# 8 = docs (1 config + 3 vectors) + docsh (1 config + 3 vectors).
+[ "$($A DBSIZE 2>&1 | tr -d '\r')" = "8" ] \
+  || { echo "FAIL: expected 8 durable keys (2 configs + 6 vectors), got $($A DBSIZE)"; exit 1; }
 
 echo "== CRASH DURABILITY: kill the co-processor, restart it EMPTY, SEARCH rebuilds"
 kill -9 "$COPROC_PID" 2>/dev/null; wait "$COPROC_PID" 2>/dev/null; COPROC_PID=""
@@ -84,6 +97,14 @@ case "$(vexec VEC.GET docs a)" in *"1,0,0"*) : ;; *) echo "FAIL: GET after rebui
 grep -qi "rebuilt ns" "$D/vec2.log" || { echo "FAIL: no rebuild logged"; exit 1; }
 echo "  post-restart VEC.SEARCH -> $POST  (rebuilt from durable rows)"
 
+# The HNSW set must rebuild AS hnsw: the durable config records the engine kind,
+# so the co-processor restores the graph, not the flat default.
+POSTH="$(vexec VEC.SEARCH docsh 0.9,0.1,0 2)"
+[ "$POSTH" = "$PREH" ] \
+  || { echo "FAIL: HNSW rebuild changed results. pre=[$PREH] post=[$POSTH]"; exit 1; }
+case "$(vexec VEC.INFO docsh)" in *index*hnsw*) : ;; *) echo "FAIL: rebuilt set is not hnsw (kind lost in the durable config)"; exit 1 ;; esac
+echo "  post-restart HNSW VEC.SEARCH -> $POSTH  (rebuilt as hnsw)"
+
 echo "== VEC.DEL is durable too"
 [ "$(vexec VEC.DEL docs a)" = "1 " ] || { echo "FAIL: VEC.DEL"; exit 1; }
 case "$(vexec VEC.SEARCH docs 1,0,0 5)" in *a*) echo "FAIL: 'a' still present after DEL"; exit 1 ;; *) : ;; esac
@@ -92,5 +113,5 @@ echo "== CONTROL: the ordinary tenant data path is untouched"
 cli_ok $A SET plain value
 [ "$($A GET plain)" = "value" ] || { echo "FAIL (control): tenant SET/GET broke"; exit 1; }
 
-echo "PASS: flint-vec serves VEC.* end to end, writes are durable, and a restarted"
-echo "      co-processor rebuilds its index from KV (D3) and returns identical results."
+echo "PASS: flint-vec serves VEC.* end to end (flat + hnsw), writes are durable, and a"
+echo "      restarted co-processor rebuilds each set from KV (D3) as its own engine kind."
