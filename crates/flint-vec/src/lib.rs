@@ -130,6 +130,12 @@ impl VectorSet {
             Index::Hnsw(_) => "hnsw",
         }
     }
+    fn kind(&self) -> IndexKind {
+        match &self.index {
+            Index::Flat(_) => IndexKind::Flat,
+            Index::Hnsw(_) => IndexKind::Hnsw,
+        }
+    }
     pub fn len(&self) -> usize {
         match &self.index {
             Index::Flat(m) => m.len(),
@@ -342,6 +348,22 @@ fn floats_to_ascii(vec: &[f32]) -> String {
         .join(",")
 }
 
+/// Rough RAM an indexed vector costs — what the D4 cap meters against, since no
+/// allocator hands back a live per-key heap figure cheaply. Deliberately a
+/// slight OVER-estimate (the guard should trip before a real OOM, not after):
+/// the vector (dim×4) + id + meta + a fixed per-engine structural cost, where
+/// HNSW's neighbour lists dwarf flat's hashmap slot.
+fn entry_bytes(dim: usize, id_len: usize, meta_len: usize, kind: IndexKind) -> usize {
+    let structural = match kind {
+        // Entry { vec, norm, meta } + a HashMap bucket.
+        IndexKind::Flat => 64,
+        // Node { vec, norm, meta, deleted, links } + the per-node link Vecs
+        // (M0 at layer 0 plus a few at upper layers).
+        IndexKind::Hnsw => 256,
+    };
+    dim * 4 + id_len + meta_len + structural
+}
+
 /// Parse a query/stored vector from one bulk argument: comma-separated floats,
 /// optionally wrapped in `[ ]`. (`VEC.SET set id "0.1,0.2,0.3"`.) A packed-f32
 /// blob is a later addition behind the same argument.
@@ -422,11 +444,32 @@ fn err(msg: &str) -> Value {
 #[derive(Default)]
 pub struct Store {
     sets: HashMap<(Vec<u8>, Vec<u8>), VectorSet>,
+    /// Per-namespace estimated index bytes — what the D4 cap meters against.
+    /// The index lives only in this co-processor's RAM, so one tenant's set
+    /// growing without bound would starve every other tenant's search; this is
+    /// the accounting that stops it.
+    ns_bytes: HashMap<Vec<u8>, usize>,
+    /// Per-namespace index-memory cap in bytes; 0 = unlimited (opt-in, set by
+    /// the binary from `--index-mem-bytes`).
+    index_cap: usize,
 }
 
 impl Store {
     pub fn new() -> Self {
         Store::default()
+    }
+
+    /// Cap the RAM one tenant's indexes may consume (ADR-0017 D4). 0 =
+    /// unlimited. A `VEC.SET` that would push a namespace past this is refused
+    /// with `-VECFULL` BEFORE its durable write — so nothing is ever
+    /// stored-but-unsearchable; the tenant frees space with `VEC.DEL`.
+    pub fn set_index_cap(&mut self, bytes: usize) {
+        self.index_cap = bytes;
+    }
+
+    /// Estimated index bytes currently attributed to `ns` (for INFO/metrics).
+    pub fn ns_mem_bytes(&self, ns: &[u8]) -> usize {
+        self.ns_bytes.get(ns).copied().unwrap_or(0)
     }
 
     /// Number of sets held (across all tenants) — for INFO/metrics.
@@ -469,13 +512,37 @@ impl Store {
                     .or_insert_with(|| VectorSet::new(dim, metric, index));
             }
             Apply::Insert { set, id, vec, meta } => {
+                // Charge the byte delta to the namespace (new entry, or the meta
+                // change on an upsert), computed BEFORE the set replaces it.
+                let mut charge: Option<(usize, usize)> = None;
                 if let Some(vs) = self.sets.get_mut(&(ns.to_vec(), set)) {
+                    let (dim, kind) = (vs.dim(), vs.kind());
+                    let old = vs.get(&id).map_or(0, |(_, m)| {
+                        entry_bytes(dim, id.len(), m.map_or(0, |x| x.len()), kind)
+                    });
+                    let new =
+                        entry_bytes(dim, id.len(), meta.as_ref().map_or(0, |m| m.len()), kind);
                     vs.set(id, vec, meta);
+                    charge = Some((new, old));
+                }
+                if let Some((new, old)) = charge {
+                    let e = self.ns_bytes.entry(ns.to_vec()).or_default();
+                    *e = e.saturating_add(new).saturating_sub(old);
                 }
             }
             Apply::Remove { set, id } => {
+                let mut freed = 0usize;
                 if let Some(vs) = self.sets.get_mut(&(ns.to_vec(), set)) {
+                    let (dim, kind) = (vs.dim(), vs.kind());
+                    if let Some((_, m)) = vs.get(&id) {
+                        freed = entry_bytes(dim, id.len(), m.map_or(0, |x| x.len()), kind);
+                    }
                     vs.del(&id);
+                }
+                if freed > 0
+                    && let Some(e) = self.ns_bytes.get_mut(ns)
+                {
+                    *e = e.saturating_sub(freed);
                 }
             }
         }
@@ -557,6 +624,26 @@ impl Store {
                 vs.dim(),
                 vec.len()
             )));
+        }
+        // D4: refuse a write that would push this tenant's index past its RAM
+        // cap. Because the durable write happens BEFORE the index mutation, a
+        // refusal here means the vector is not persisted either — a hard bound,
+        // never an evict-and-desync. An UPSERT of an existing id only costs its
+        // meta delta, so it is charged that, not a whole new entry.
+        if self.index_cap > 0 {
+            let kind = vs.kind();
+            let meta_len = meta.as_ref().map_or(0, |m| m.len());
+            let new = entry_bytes(vs.dim(), id.len(), meta_len, kind);
+            let old = vs.get(id).map_or(0, |(_, m)| {
+                entry_bytes(vs.dim(), id.len(), m.map_or(0, |x| x.len()), kind)
+            });
+            let used = self.ns_bytes.get(ns).copied().unwrap_or(0);
+            if used.saturating_add(new).saturating_sub(old) > self.index_cap {
+                return Plan::Reply(err(&format!(
+                    "VECFULL index memory limit reached ({used} of {} bytes for this namespace)",
+                    self.index_cap
+                )));
+            }
         }
         Plan::Write {
             persist: Persist::Put {
@@ -682,6 +769,12 @@ impl Store {
             bulk(vs.index_name()),
             bulk("count"),
             Value::Integer(vs.len() as i64),
+            // Namespace-wide (D4): this tenant's estimated index RAM and its cap
+            // (0 = unlimited). Reported here so a tenant can see the headroom.
+            bulk("ns_mem_bytes"),
+            Value::Integer(self.ns_mem_bytes(ns) as i64),
+            bulk("ns_mem_cap"),
+            Value::Integer(self.index_cap as i64),
         ]))
     }
 }
@@ -1058,5 +1151,93 @@ mod tests {
             st.plan(ns, &cmd(&["VEC.NOPE", "s"])),
             Plan::Reply(Value::Error(e)) if e.contains("unknown VEC command")
         ));
+    }
+
+    /// D4: the per-namespace index-memory cap refuses a write over the limit
+    /// (before persisting), frees on DEL, doesn't double-charge an upsert, and
+    /// is isolated per tenant. INFO surfaces the usage and the cap.
+    #[test]
+    fn index_memory_cap_bounds_a_namespace() {
+        let mut st = Store::new();
+        st.set_index_cap(200); // ~2 dim-4 flat vectors (81 B each by the estimate)
+        let ns = b"nsM";
+        run(
+            &mut st,
+            ns,
+            &cmd(&["VEC.CREATE", "s", "DIM", "4", "METRIC", "l2"]),
+        );
+
+        // Two fit.
+        assert_eq!(
+            run(&mut st, ns, &cmd(&["VEC.SET", "s", "a", "1,0,0,0"])),
+            Value::Simple("OK".into())
+        );
+        assert_eq!(
+            run(&mut st, ns, &cmd(&["VEC.SET", "s", "b", "0,1,0,0"])),
+            Value::Simple("OK".into())
+        );
+        // The third is refused, and refused as a REPLY — no durable write is
+        // planned, so the vector is not stored either.
+        assert!(matches!(
+            st.plan(ns, &cmd(&["VEC.SET", "s", "c", "0,0,1,0"])),
+            Plan::Reply(Value::Error(e)) if e.starts_with("VECFULL")
+        ));
+        // An upsert of an existing id is charged only its meta delta (~0), so it
+        // still fits even at the cap.
+        assert_eq!(
+            run(&mut st, ns, &cmd(&["VEC.SET", "s", "a", "9,9,9,9"])),
+            Value::Simple("OK".into())
+        );
+        // Freeing one makes room for a new id again.
+        assert_eq!(
+            run(&mut st, ns, &cmd(&["VEC.DEL", "s", "a"])),
+            Value::Integer(1)
+        );
+        assert_eq!(
+            run(&mut st, ns, &cmd(&["VEC.SET", "s", "c", "0,0,1,0"])),
+            Value::Simple("OK".into())
+        );
+        // INFO surfaces the cap and non-zero usage for this namespace.
+        match run(&mut st, ns, &cmd(&["VEC.INFO", "s"])) {
+            Value::Array(Some(f)) => {
+                assert_eq!(f[10], Value::Bulk(Some(b"ns_mem_cap".to_vec())));
+                assert_eq!(f[11], Value::Integer(200));
+                assert!(
+                    matches!(f[9], Value::Integer(n) if n > 0),
+                    "ns_mem_bytes > 0"
+                );
+            }
+            other => panic!("INFO should be an array, got {other:?}"),
+        }
+
+        // A different tenant has its own budget — isolation, the whole point.
+        let ns2 = b"nsN";
+        run(
+            &mut st,
+            ns2,
+            &cmd(&["VEC.CREATE", "s", "DIM", "4", "METRIC", "l2"]),
+        );
+        assert_eq!(
+            run(&mut st, ns2, &cmd(&["VEC.SET", "s", "a", "1,2,3,4"])),
+            Value::Simple("OK".into())
+        );
+    }
+
+    #[test]
+    fn unlimited_cap_never_refuses() {
+        let mut st = Store::new(); // cap 0 = unlimited (default)
+        let ns = b"nsU";
+        run(
+            &mut st,
+            ns,
+            &cmd(&["VEC.CREATE", "s", "DIM", "2", "METRIC", "l2"]),
+        );
+        for i in 0..64 {
+            let id = format!("v{i}");
+            assert_eq!(
+                run(&mut st, ns, &cmd(&["VEC.SET", "s", &id, "1,1"])),
+                Value::Simple("OK".into())
+            );
+        }
     }
 }

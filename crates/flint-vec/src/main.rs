@@ -51,10 +51,23 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(6700);
     let bind = format!("0.0.0.0:{port}");
-    let store: Arc<Mutex<Store>> = Arc::new(Mutex::new(Store::new()));
+    // D4: per-namespace index-memory cap in bytes; 0 (default) = unlimited. On
+    // a co-processor shared by many tenants, set this so one tenant's set cannot
+    // exhaust the process RAM and starve every other tenant's search.
+    let index_cap: usize = arg(&args, "--index-mem-bytes")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let mut initial = Store::new();
+    initial.set_index_cap(index_cap);
+    let store: Arc<Mutex<Store>> = Arc::new(Mutex::new(initial));
     let loads: Loads = Arc::new(Mutex::new(HashMap::new()));
     let listener = TcpListener::bind(&bind).unwrap_or_else(|e| panic!("bind {bind}: {e}"));
-    eprintln!("flint-vec co-processor on {bind} (plaintext, v0.1 flat/exact)");
+    let cap_note = if index_cap == 0 {
+        "index mem unlimited".to_string()
+    } else {
+        format!("index mem cap {index_cap} B/ns")
+    };
+    eprintln!("flint-vec co-processor on {bind} (plaintext, v0.2 flat+hnsw, {cap_note})");
     for conn in listener.incoming().flatten() {
         let (store, loads) = (store.clone(), loads.clone());
         std::thread::spawn(move || serve(conn, store, loads));

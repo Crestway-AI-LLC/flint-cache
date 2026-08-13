@@ -108,10 +108,31 @@ echo "  post-restart HNSW VEC.SEARCH -> $POSTH  (rebuilt as hnsw)"
 echo "== VEC.DEL is durable too"
 [ "$(vexec VEC.DEL docs a)" = "1 " ] || { echo "FAIL: VEC.DEL"; exit 1; }
 case "$(vexec VEC.SEARCH docs 1,0,0 5)" in *a*) echo "FAIL: 'a' still present after DEL"; exit 1 ;; *) : ;; esac
+# 7 durable keys now: 2 configs + docs{b,c} + docsh{a,b,c}.
+DBSIZE_BEFORE_D4="$($A DBSIZE 2>&1 | tr -d '\r')"
+
+echo "== D4: a tiny per-namespace index-memory cap sheds new writes; reads unaffected"
+kill -9 "$COPROC_PID" 2>/dev/null; wait "$COPROC_PID" 2>/dev/null; COPROC_PID=""
+sleep 0.3
+# 100 bytes is far below the namespace's already-durable footprint. Rebuild
+# loads those rows regardless (they are already durable, ADR-0017 D3); the cap
+# governs only NEW writes, so this restart comes up ALREADY over budget.
+$VEC --port 6678 --index-mem-bytes 100 2>"$D/vec3.log" & COPROC_PID=$!
+fleet_wait_listen 6678
+# Reads still serve (the index rebuilt past the cap from the durable rows)...
+case "$(vexec VEC.SEARCH docs 1,0,0 3)" in *b*) : ;; *) echo "FAIL: read after cap-restart"; exit 1 ;; esac
+# ...but a fresh VEC.SET is refused with -VECFULL, BEFORE any durable write.
+R="$(vexec VEC.SET docs znew 0,0,1)"
+case "$R" in *VECFULL*) : ;; *) echo "FAIL: expected VECFULL over the cap, got: $R"; exit 1 ;; esac
+# The shed write did not persist: durable key count is unchanged.
+[ "$($A DBSIZE 2>&1 | tr -d '\r')" = "$DBSIZE_BEFORE_D4" ] \
+  || { echo "FAIL: a VECFULL-shed write still persisted (DBSIZE moved off $DBSIZE_BEFORE_D4)"; exit 1; }
+echo "  new VEC.SET -> ${R}(refused, not persisted); reads still served"
 
 echo "== CONTROL: the ordinary tenant data path is untouched"
 cli_ok $A SET plain value
 [ "$($A GET plain)" = "value" ] || { echo "FAIL (control): tenant SET/GET broke"; exit 1; }
 
-echo "PASS: flint-vec serves VEC.* end to end (flat + hnsw), writes are durable, and a"
-echo "      restarted co-processor rebuilds each set from KV (D3) as its own engine kind."
+echo "PASS: flint-vec serves VEC.* end to end (flat + hnsw), writes are durable, a"
+echo "      restarted co-processor rebuilds each set from KV (D3) as its own engine kind,"
+echo "      and a per-namespace index-memory cap (D4) sheds new writes with -VECFULL."
