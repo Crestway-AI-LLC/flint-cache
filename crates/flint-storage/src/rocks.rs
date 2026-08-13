@@ -10,7 +10,7 @@
 
 use std::path::Path;
 
-use rocksdb::{DB, Options, WriteBatch};
+use rocksdb::{BlockBasedOptions, DB, Options, WriteBatch};
 
 use crate::Kv;
 
@@ -128,6 +128,19 @@ impl RocksKv {
     }
 }
 
+/// Block-based table options every data SST is written with. The whole-key
+/// bloom filter (S0.1) is the load-bearing part at scale — a point-read MISS is
+/// ruled out by the per-SST filter rather than seeking a data block on each
+/// level. 10 bits/key is ≈1% false-positive; whole-key filtering (the RocksDB
+/// default) is what a `get()` consults. The RAM budget for those filter/index
+/// blocks at 100 TB (partitioned filters, cache pinning) is S0.2, layered on
+/// this same factory.
+fn table_options() -> BlockBasedOptions {
+    let mut bbt = BlockBasedOptions::default();
+    bbt.set_bloom_filter(10.0, false);
+    bbt
+}
+
 impl RocksKv {
     /// Open without the ability — or the side effects — of writing.
     ///
@@ -167,6 +180,13 @@ impl RocksKv {
                 Decision::Keep
             }
         });
+        // S0.1: every data SST carries a bloom filter, so a point-read MISS is
+        // answered from the per-SST filter instead of a data-block seek on each
+        // level. This is what keeps GET tail latency flat as the dataset grows
+        // past RAM — the read-path prerequisite for the 100 TB target
+        // (docs/scale-to-100tb.md). RocksDB reads pre-filter SSTs fine, so this
+        // is forward-compatible; filters populate as compaction rewrites data.
+        opts.set_block_based_table_factory(&table_options());
         Ok(Self {
             db: DB::open(&opts, path)?,
             path: path.to_path_buf(),
@@ -371,6 +391,48 @@ mod audit {
         assert_eq!(kv.count_prefix(b"k"), 25_000);
         kv.clear();
         assert_eq!(kv.count_prefix(b""), 0);
+    }
+
+    /// S0.1: a point-read MISS on data that lives in an SST must be answered by
+    /// the bloom filter, not a data-block seek on every level. Disk I/O is not
+    /// directly observable, but the filter's own `useful` ticker is exactly
+    /// "reads the filter short-circuited", so with statistics on it must move
+    /// for IN-RANGE absent keys (out-of-range keys are excluded by the SST
+    /// key-range check before the filter is even consulted).
+    #[test]
+    fn bloom_filter_catches_in_range_misses() {
+        let dir = TempDir::new("bloom");
+        let mut opts = Options::default();
+        opts.create_if_missing(true);
+        opts.enable_statistics();
+        opts.set_block_based_table_factory(&table_options());
+        let db = DB::open(&opts, &dir.0).expect("open");
+        // Even keys only, zero-padded so they sort as written; flush to an SST
+        // (a memtable has no filter).
+        for i in (0..10_000u32).step_by(2) {
+            db.put(format!("k{i:08}"), b"v").expect("put");
+        }
+        db.flush().expect("flush to sst");
+        // Odd keys are absent but IN RANGE [k00000000, k00009998], so the SST is
+        // not ruled out by key range — the bloom filter is what excludes them.
+        for i in (1..10_000u32).step_by(2) {
+            assert!(db.get(format!("k{i:08}")).expect("get").is_none());
+        }
+        let stats = opts.get_statistics().expect("statistics enabled");
+        assert!(
+            stat_count(&stats, "rocksdb.bloom.filter.useful") > 0,
+            "bloom filter never fired on ~5000 in-range misses — not configured?\n{stats}"
+        );
+    }
+
+    /// Pull a COUNT ticker out of RocksDB's statistics dump.
+    fn stat_count(stats: &str, name: &str) -> u64 {
+        stats
+            .lines()
+            .find(|l| l.trim_start().starts_with(name))
+            .and_then(|l| l.split("COUNT :").nth(1))
+            .and_then(|n| n.trim().parse().ok())
+            .unwrap_or(0)
     }
 
     #[test]
