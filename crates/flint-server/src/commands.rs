@@ -3177,8 +3177,18 @@ mod tests {
         let b = Dispatcher::with_limits(&s, system_clock, Limits::default(), b"tenant-b");
         for d in [&a, &b] {
             d.dispatch(&[b"SET".to_vec(), b"str".to_vec(), b"v".to_vec()]);
-            d.dispatch(&[b"HSET".to_vec(), b"hash".to_vec(), b"f".to_vec(), b"v".to_vec()]);
-            d.dispatch(&[b"ZADD".to_vec(), b"zset".to_vec(), b"1".to_vec(), b"m".to_vec()]);
+            d.dispatch(&[
+                b"HSET".to_vec(),
+                b"hash".to_vec(),
+                b"f".to_vec(),
+                b"v".to_vec(),
+            ]);
+            d.dispatch(&[
+                b"ZADD".to_vec(),
+                b"zset".to_vec(),
+                b"1".to_vec(),
+                b"m".to_vec(),
+            ]);
         }
         // Control: B holds its own data before A's flush.
         assert_eq!(
@@ -3186,7 +3196,10 @@ mod tests {
             Value::Bulk(Some(b"v".to_vec()))
         );
 
-        assert_eq!(a.dispatch(&[b"FLUSHALL".to_vec()]), Value::Simple("OK".into()));
+        assert_eq!(
+            a.dispatch(&[b"FLUSHALL".to_vec()]),
+            Value::Simple("OK".into())
+        );
 
         // A's keyspace is empty across all three types.
         assert_eq!(

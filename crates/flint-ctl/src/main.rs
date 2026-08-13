@@ -2006,7 +2006,8 @@ fn resign_leaves(d: &str, sh: &dyn Fn(&str), edge_sans: &[String]) {
          it must be serverAuth-ONLY. A clientAuth bit here is exactly the hole \
          ADR-0010 D2 exists to close — it would let a co-processor dial the mesh as a \
          member. Fix the coproc-ext.cnf line above; do not relax this assert.",
-        coproc.server_auth, coproc.client_auth
+        coproc.server_auth,
+        coproc.client_auth
     );
     // The mirror: the mesh leaf must KEEP clientAuth, or every internal dial
     // stops working. Same helper, opposite verdict — the pair is the point.
@@ -2016,7 +2017,8 @@ fn resign_leaves(d: &str, sh: &dyn Fn(&str), edge_sans: &[String]) {
         mesh.server_auth && mesh.client_auth,
         "mesh leaf must be serverAuth,clientAuth (got server_auth={}, client_auth={}); \
          without clientAuth every internal dial stops working.",
-        mesh.server_auth, mesh.client_auth
+        mesh.server_auth,
+        mesh.client_auth
     );
 }
 
