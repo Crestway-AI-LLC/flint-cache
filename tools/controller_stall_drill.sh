@@ -36,7 +36,7 @@ fleet_kill server; fleet_kill proxy; fleet_kill controlplane; fleet_kill control
 sleep 0.4
 cleanup() {
   # CONT first: a still-STOPPED controller cannot be asked to stop cleanly.
-  pkill -CONT -f flint-controller 2>/dev/null
+  pkill -CONT -f 'flint-[c]ontroller' 2>/dev/null
   $CTL -f "$INV" stop >/dev/null 2>&1
   fleet_kill server; fleet_kill proxy; fleet_kill controlplane; fleet_kill controller
   rm -rf "$D"
@@ -64,8 +64,12 @@ lease-ttl-ms $LEASE
 EOF
 
 echo "== bootstrap (CP, 2 pairs, proxy, controller; lease-ttl-ms=$LEASE)"
-$CTL -f "$INV" bootstrap >/dev/null 2>&1 || { echo "FAIL: bootstrap"; exit 1; }
-$CTL -f "$INV" verify   >/dev/null 2>&1 || { echo "FAIL: fleet did not verify before the stall"; exit 1; }
+# Show what failed. A drill that swallows its setup error costs a debugging
+# round trip every time it trips, which is the whole lesson of #168's harness.
+$CTL -f "$INV" bootstrap >"$D/bootstrap.log" 2>&1 \
+  || { echo "FAIL: bootstrap"; tail -20 "$D/bootstrap.log" | sed 's/^/  | /'; exit 1; }
+$CTL -f "$INV" verify >"$D/verify.log" 2>&1 \
+  || { echo "FAIL: fleet did not verify before the stall"; tail -15 "$D/verify.log" | sed 's/^/  | /'; exit 1; }
 $CTL -f "$INV" tenant add stall tok-stall stall 1 >/dev/null 2>&1 \
   || { echo "FAIL: could not create the tenant"; exit 1; }
 
@@ -77,10 +81,31 @@ pairs() { $CTL -f "$INV" status 2>/dev/null | grep -E '^pair' | sed 's/^/    /';
 [ "$(edge_set)" = OK ] || { echo "FAIL: edge not writable before the stall"; exit 1; }
 echo "  baseline: 2/2 masters, edge writable"
 
-CPID=$(pgrep -f 'flint-controller' | head -1)
+# BRACKET THE PATTERN. `pgrep -f 'flint-controller'` also matches any shell
+# whose own command line merely CONTAINS that string — including the wrapper
+# that invoked this drill (a `pkill -f 'flint-controller'` in someone's
+# terminal history is enough). That is not theoretical: it picked the calling
+# shell here, so the SIGSTOP below froze the wrong process and the fleet
+# "refused to fence" — a green-looking mechanism testing nothing. The bracket
+# makes the pattern text unable to match itself. Same defect, same fix, as
+# packaging/aws/chaos-cluster/run.sh's ctl_count.
+CPID=$(pgrep -f 'flint-[c]ontroller' | head -1)
 [ -n "$CPID" ] || { echo "FAIL: no controller process to stall"; exit 1; }
+# `pgrep -c` is a Linux extension; macOS pgrep has no such flag and prints a
+# usage error to stderr while yielding an empty count. Pipe to wc -l instead so
+# the drill counts the same way on the dev laptop and in CI.
+NCTL=$(pgrep -f 'flint-[c]ontroller' | wc -l | tr -cd '0-9')
+[ "${NCTL:-0}" = 1 ] || { echo "FAIL: expected exactly 1 controller, found ${NCTL:-0} — stalling one of several proves nothing"; pgrep -fl 'flint-[c]ontroller' | sed 's/^/    /'; exit 1; }
 echo "== SIGSTOP the controller (pid $CPID) for ${STALL_S}s — lease is ${LEASE}ms"
 kill -STOP "$CPID"
+# Prove the stop took: without this, a SIGSTOP that silently did nothing would
+# look exactly like a fleet that refused to fence.
+sleep 0.5
+CSTAT=$(ps -o stat= -p "$CPID" 2>/dev/null | tr -d ' ')
+case "$CSTAT" in
+  T*) echo "  controller is stopped (state $CSTAT)" ;;
+  *)  echo "FAIL: controller pid $CPID is in state '${CSTAT:-gone}', not stopped — the stall never happened"; exit 1 ;;
+esac
 # POSITIVE CONTROL. Assert the fence actually happened: if a future change
 # stopped leases expiring, the recovery assertion below would pass vacuously
 # and this drill would guard nothing.
