@@ -43,6 +43,7 @@
 //!   flint-controller --manage-slots 6460:/data/a,6470:/data/b [--id A]
 //!   flint-controller --manage-pairs "6500:/d/a,6501:/d/b;6510:/d/c,6511:/d/d"
 //!   common: [--poll-ms 100] [--confirm 3] [--max-stale-ms 5000] [--lease-ttl-ms 3000]
+//!           [--slow-promote-ms 4000]  (patience for a listening-but-slow master)
 
 // The rebalance planner + balance-policy seam lives in the shared
 // `flint-balance` library so the managed plane reuses the same
@@ -213,16 +214,60 @@ fn call(addr: &str, args: &[&[u8]]) -> std::io::Result<Value> {
 struct Node {
     addr: String,
     reachable: bool,
+    /// The process still accepts TCP connections even if the app did not
+    /// answer FLINTINFO/PING — i.e. ALIVE but slow, not dead. Only meaningful
+    /// when `reachable` is false; true whenever `reachable` is true.
+    socket_alive: bool,
     role: String, // "master" | "replica" | "" (unknown/unreachable)
     epoch: u32,
     live_replicas: u32,
     seq_lag: Option<u64>,
 }
 
+/// Does a process still accept TCP connections on this address? A plain,
+/// non-TLS connect answers "is the port open" at the KERNEL level: a
+/// CPU-starved master whose app cannot answer FLINTINFO still reads as alive
+/// here, because the kernel completes the handshake without the process being
+/// scheduled. A dead process refuses (or resets) the connection; a partitioned
+/// one times out. Either non-alive case falls through to the fast promote.
+fn socket_open(addr: &str) -> bool {
+    use std::net::ToSocketAddrs;
+    let Ok(mut addrs) = addr.to_socket_addrs() else {
+        return false;
+    };
+    addrs.any(|sa| std::net::TcpStream::connect_timeout(&sa, Duration::from_millis(500)).is_ok())
+}
+
+/// Should the pair promote now? A master that REFUSES the connection is a dead
+/// process — promote after `confirm` ticks (fast, RTO-critical, the killed-
+/// master path every chaos drill exercises; a refused connect returns instantly
+/// so the streak accrues at the poll rate). A master whose socket still accepts
+/// connections but whose app times out is ALIVE but slow (CPU starvation, a
+/// compaction burst); promoting away from it just flaps, and on a uniformly-
+/// loaded fleet the target is equally slow. Hold it for `slow_promote` of
+/// WALL-CLOCK — not ticks: observe() blocks on the timeouts of an unresponsive
+/// node, so ticks no longer run at the poll rate and a tick count would mis-time
+/// the escape by an order of magnitude. `slow_elapsed` is how long the pair has
+/// been in the alive-but-slow state.
+fn should_promote(
+    slow: bool,
+    no_master_streak: u32,
+    confirm: u32,
+    slow_elapsed: Option<Duration>,
+    slow_promote: Duration,
+) -> bool {
+    if slow {
+        slow_elapsed.is_some_and(|e| e >= slow_promote)
+    } else {
+        no_master_streak >= confirm
+    }
+}
+
 fn observe(addr: &str) -> Node {
     let mut node = Node {
         addr: addr.to_string(),
         reachable: false,
+        socket_alive: false,
         role: String::new(),
         epoch: 0,
         live_replicas: 0,
@@ -231,9 +276,14 @@ fn observe(addr: &str) -> Node {
     let Ok(Value::Bulk(Some(raw))) = call(addr, &[b"FLINTINFO"]) else {
         // Distinguish "down" from "up but FLINTINFO hiccup" with a PING.
         node.reachable = matches!(call(addr, &[b"PING"]), Ok(Value::Simple(s)) if s == "PONG");
+        // App unresponsive: is the process DEAD (connection refused) or ALIVE
+        // but slow (socket still accepts)? The promote decision needs this to
+        // avoid flapping a starved-but-listening master to death.
+        node.socket_alive = node.reachable || socket_open(addr);
         return node;
     };
     node.reachable = true;
+    node.socket_alive = true;
     for line in String::from_utf8_lossy(&raw)
         .split(['\r', '\n'])
         .filter(|l| !l.is_empty())
@@ -263,6 +313,11 @@ fn observe(addr: &str) -> Node {
 struct Config {
     poll: Duration,
     confirm: u32,
+    /// Patience for a master that still accepts TCP connections but whose app
+    /// is unresponsive (slow, not dead) before promoting anyway. Far longer
+    /// than `poll * confirm` so a compaction burst or a CPU-starved node does
+    /// not flap. See `required_no_master_ticks`.
+    slow_promote: Duration,
     max_stale: Duration,
     lease_ttl: u64,
     min_replicas: u32,
@@ -311,6 +366,13 @@ struct Pair {
     last_converged: Instant,
     converged_ever: bool,
     no_master_streak: u32,
+    /// When the pair first had no legit master but a node still ACCEPTING TCP
+    /// (alive-but-slow). Wall-clock, not ticks: observe() blocks on an
+    /// unresponsive node's probe timeouts, so the loop is observe-bound rather
+    /// than poll-bound, and a tick count would badly mis-time the escalation.
+    slow_since: Option<Instant>,
+    /// One "detected" journal per outage, not one per tick.
+    outage_announced: bool,
     slot_miss: Vec<u32>,
     slot_cooldown: Vec<Instant>,
     slot_child: Vec<Option<std::process::Child>>,
@@ -331,6 +393,8 @@ impl Pair {
             last_converged: Instant::now(),
             converged_ever: false,
             no_master_streak: 0,
+            slow_since: None,
+            outage_announced: false,
             slot_miss: vec![0; n],
             slot_cooldown: vec![Instant::now(); n],
             slot_child: (0..n).map(|_| None).collect(),
@@ -470,6 +534,8 @@ impl Pair {
             let legit_addr = legit.addr.clone();
             let legit_converged = legit.live_replicas >= 1 && legit.seq_lag == Some(0);
             self.no_master_streak = 0;
+            self.slow_since = None;
+            self.outage_announced = false;
             // Renew the legit master's lease (idempotent across the HA set;
             // only extends life, never un-fences).
             if cfg.lease_ttl > 0 {
@@ -572,18 +638,33 @@ impl Pair {
             return;
         }
 
-        // No reachable master. Confirm across `confirm` ticks before acting.
+        // No reachable master. A master that still ACCEPTS connections but whose
+        // app is unresponsive is alive-but-slow, not dead: promoting away from it
+        // just flaps (and on a uniformly-loaded fleet the target is equally slow).
+        // Require far more confirmation for that case than for a dead process.
         self.no_master_streak += 1;
-        if self.no_master_streak < cfg.confirm {
+        let slow = states.iter().any(|n| !n.reachable && n.socket_alive);
+        if slow {
+            self.slow_since.get_or_insert_with(Instant::now);
+        } else {
+            self.slow_since = None;
+        }
+        let slow_elapsed = self.slow_since.map(|t| t.elapsed());
+        if !should_promote(slow, self.no_master_streak, cfg.confirm, slow_elapsed, cfg.slow_promote) {
             return;
         }
-        if self.no_master_streak == cfg.confirm {
+        if !self.outage_announced {
+            self.outage_announced = true;
             journal_event(
                 &cfg.id,
                 flint_journal::EventKind::Detected,
                 &self.label,
                 None,
-                "master unreachable, confirmed across required ticks",
+                if slow {
+                    "master unresponsive but still listening — slow past patience window"
+                } else {
+                    "master unreachable, confirmed across required ticks"
+                },
             );
         }
 
@@ -780,6 +861,11 @@ fn main() {
         // only shortens the window they must occur in.
         poll: Duration::from_millis(arg_or("--poll-ms", 100)),
         confirm: arg_or("--confirm", 3),
+        // A dead master (connection refused) still promotes on poll*confirm.
+        // This is only the tolerance for a master that is LISTENING but slow —
+        // 4s rides out compaction bursts and CPU starvation without flapping,
+        // while still failing over a genuinely hung-but-listening process.
+        slow_promote: Duration::from_millis(arg_or("--slow-promote-ms", 4_000)),
         max_stale: Duration::from_millis(arg_or("--max-stale-ms", 5_000)),
         // Lease TTL handed to each master per renewal. Generous vs the poll
         // interval so transient controller unavailability never trips a
@@ -1221,5 +1307,53 @@ fn fence(id: &str, zombie: &str, epoch: u32) {
             eprintln!("[{id}] fence of {zombie} already done by a peer: {e}")
         }
         other => eprintln!("[{id}] fence of {zombie} failed: {other:?}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dead_master_promotes_on_confirm_ticks() {
+        // A refused connection (dead) escalates on the streak alone — fast,
+        // RTO-critical, the killed-master path every chaos drill exercises.
+        assert!(!should_promote(false, 2, 3, None, Duration::from_millis(4000)));
+        assert!(should_promote(false, 3, 3, None, Duration::from_millis(4000)));
+    }
+
+    #[test]
+    fn slow_master_waits_for_wall_clock_not_ticks() {
+        // A listening-but-slow master ignores the streak entirely: it escalates
+        // only once it has been slow for slow_promote of WALL-CLOCK, however many
+        // (slow, timeout-bound) ticks that took. This is the whole fix — a
+        // starved master is held, not flapped, and the knob means real time.
+        let sp = Duration::from_millis(4000);
+        assert!(!should_promote(true, 999, 3, Some(Duration::from_millis(3999)), sp));
+        assert!(should_promote(true, 1, 3, Some(Duration::from_millis(4000)), sp));
+    }
+
+    #[test]
+    fn slow_master_with_no_elapsed_never_promotes() {
+        // Just entered the slow state (slow_since not yet set): never promote on
+        // the same tick.
+        assert!(!should_promote(true, 100, 3, None, Duration::from_millis(4000)));
+    }
+
+    #[test]
+    fn socket_open_true_for_a_listener_false_for_a_closed_port() {
+        // The slow-vs-dead primitive: a bound listener answers "alive" at the
+        // kernel level even without accept()ing (a SIGSTOPped master is exactly
+        // this); a port with nothing on it is refused.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr").to_string();
+        assert!(socket_open(&addr), "a bound listener must read as socket-alive");
+
+        // Bind then drop to get an address nothing is listening on.
+        let closed = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+            l.local_addr().expect("local addr").to_string()
+        };
+        assert!(!socket_open(&closed), "a closed port must read as dead");
     }
 }
