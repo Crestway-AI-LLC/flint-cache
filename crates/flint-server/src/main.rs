@@ -1811,7 +1811,7 @@ fn execute(
         .first()
         .is_some_and(|n| n.eq_ignore_ascii_case(b"FLINTPROMOTE"))
     {
-        return flintpromote(read_only, tailer_stop, rocks, args);
+        return flintpromote(read_only, tailer_stop, lease_deadline, rocks, args);
     }
     if args
         .first()
@@ -2083,6 +2083,7 @@ fn flintnsrestore(_rocks: &Option<RocksHandle>, _args: &[Vec<u8>]) -> Value {
 fn flintpromote(
     read_only: &Arc<AtomicBool>,
     tailer_stop: &Arc<AtomicBool>,
+    lease_deadline: &Arc<std::sync::atomic::AtomicU64>,
     rocks: &Option<RocksHandle>,
     args: &[Vec<u8>],
 ) -> Value {
@@ -2115,6 +2116,15 @@ fn flintpromote(
             // Durable role first; only then flip runtime state.
             tailer_stop.store(true, Ordering::Relaxed);
             read_only.store(false, Ordering::Relaxed);
+            // DROP THE OLD LEASE DEADLINE (#168). It was issued to the
+            // PREVIOUS lineage and says nothing about this one — but the
+            // watchdog only compares it to the clock, so a deadline already in
+            // the past re-fences this node within 100ms, before the promoting
+            // controller's next renewal (~poll interval) can land. That turned
+            // recovery from a self-fence into a promote/re-fence flap. 0 =
+            // unmanaged until the next FLINTLEASE, which the controller that
+            // just promoted us sends on its next tick.
+            lease_deadline.store(0, Ordering::Relaxed);
             // This node IS the lineage now. Any re-seed marker left by an
             // earlier demotion describes a position nobody follows any more,
             // and leaving it would make a later start-as-replica throw away
@@ -2139,6 +2149,7 @@ fn flintpromote(
 fn flintpromote(
     _read_only: &Arc<AtomicBool>,
     _tailer_stop: &Arc<AtomicBool>,
+    _lease_deadline: &Arc<std::sync::atomic::AtomicU64>,
     _rocks: &Option<RocksHandle>,
     _args: &[Vec<u8>],
 ) -> Value {

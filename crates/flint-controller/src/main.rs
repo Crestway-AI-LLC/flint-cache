@@ -263,6 +263,42 @@ fn should_promote(
     }
 }
 
+/// The pair's own master, self-fenced but still serving its replica (#168).
+///
+/// flint-server flips a master to read-only when its lease goes unrenewed, and
+/// FLINTINFO renders `role:` FROM that read-only flag — so a controller stall
+/// longer than `--lease-ttl-ms` leaves a pair with no master-CLAIMER even
+/// though nothing died and nothing diverged. That state is self-perpetuating:
+/// `last_converged` only advances while a legitimate master exists, so once
+/// every master fences, the degraded-window gate refuses forever and the pair
+/// never takes another write without an operator. Measured on a healthy
+/// 2-pair fleet: a 10s controller stall took it to zero masters, and it was
+/// still at zero 45s after the controller came back.
+///
+/// So recognise the state instead of paging on it. A reachable node at the
+/// top epoch reporting `live_replicas >= 1` with `seq_lag == 0` has a replica
+/// ATTACHED AND CAUGHT UP — and a replica still following this node cannot
+/// itself have been promoted, so there is no successor to split-brain
+/// against. Promoting it is the same master resuming, not a degraded-window
+/// gamble, and the epoch bump fences any stale lineage exactly as an ordinary
+/// promotion does.
+///
+/// Deliberately strict, because this bypasses a data-safety gate: the node
+/// must hold the TOP epoch among reachable nodes (never an ex-master that a
+/// successor has already superseded) and its replica must be exactly caught
+/// up (`seq_lag == 0`, not merely draining), so "in sync" is observed, not
+/// assumed.
+fn insync_lineage_holder(states: &[Node]) -> Option<&Node> {
+    let top = states
+        .iter()
+        .filter(|n| n.reachable)
+        .map(|n| n.epoch)
+        .max()?;
+    states
+        .iter()
+        .find(|n| n.reachable && n.epoch == top && n.live_replicas >= 1 && n.seq_lag == Some(0))
+}
+
 fn observe(addr: &str) -> Node {
     let mut node = Node {
         addr: addr.to_string(),
@@ -650,7 +686,13 @@ impl Pair {
             self.slow_since = None;
         }
         let slow_elapsed = self.slow_since.map(|t| t.elapsed());
-        if !should_promote(slow, self.no_master_streak, cfg.confirm, slow_elapsed, cfg.slow_promote) {
+        if !should_promote(
+            slow,
+            self.no_master_streak,
+            cfg.confirm,
+            slow_elapsed,
+            cfg.slow_promote,
+        ) {
             return;
         }
         if !self.outage_announced {
@@ -668,14 +710,37 @@ impl Pair {
             );
         }
 
-        // Degraded-window gate: only auto-promote a recently-converged pair.
+        // Degraded-window gate: only auto-promote a recently-converged pair —
+        // UNLESS the pair is holding its own self-fenced master with a
+        // caught-up replica (#168). That pair is provably in sync, and
+        // refusing it is precisely what turns a few seconds of controller
+        // unavailability into a permanent, fleet-wide write outage: no master
+        // means no convergence, and no convergence means this gate refuses
+        // forever.
         if !self.converged_ever || self.last_converged.elapsed() > cfg.max_stale {
-            let (id, label, ms) = (cfg.id.clone(), self.label.clone(), cfg.max_stale);
-            self.page(format_args!(
-                "[{id}][{label}] no master and pair not converged within {ms:?} — REFUSING (degraded window; needs spare/S3). PAGE."
-            ));
-            self.no_master_streak = 0;
-            return;
+            match insync_lineage_holder(&states) {
+                Some(h) => {
+                    eprintln!(
+                        "[{}][{}] no master-claimer, but {} holds the top epoch with a caught-up replica — self-fenced, recovering it (#168)",
+                        cfg.id, self.label, h.addr
+                    );
+                    journal_event(
+                        &cfg.id,
+                        flint_journal::EventKind::Detected,
+                        &self.label,
+                        None,
+                        "self-fenced master still serving a caught-up replica: recovering, not a degraded window",
+                    );
+                }
+                None => {
+                    let (id, label, ms) = (cfg.id.clone(), self.label.clone(), cfg.max_stale);
+                    self.page(format_args!(
+                        "[{id}][{label}] no master and pair not converged within {ms:?} — REFUSING (degraded window; needs spare/S3). PAGE."
+                    ));
+                    self.no_master_streak = 0;
+                    return;
+                }
+            }
         }
 
         // Survivor = reachable node with the highest epoch; ties by lowest
@@ -1314,12 +1379,83 @@ fn fence(id: &str, zombie: &str, epoch: u32) {
 mod tests {
     use super::*;
 
+    /// A node as `observe` would report it.
+    fn node(addr: &str, epoch: u32, live_replicas: u32, seq_lag: Option<u64>) -> Node {
+        Node {
+            addr: addr.into(),
+            reachable: true,
+            socket_alive: true,
+            // Every node in this state reports role:replica — that IS the bug
+            // signature (#168): FLINTINFO renders role from the read-only flag,
+            // so a self-fenced master calls itself a replica.
+            role: "replica".into(),
+            epoch,
+            live_replicas,
+            seq_lag,
+        }
+    }
+
+    #[test]
+    fn self_fenced_master_with_caught_up_replica_is_recoverable() {
+        // The exact fleet state a controller stall leaves behind: nobody claims
+        // master, but one node is still streaming to a caught-up replica.
+        let states = vec![node("a:1", 3, 1, Some(0)), node("b:2", 3, 0, None)];
+        assert_eq!(
+            insync_lineage_holder(&states).map(|n| n.addr.as_str()),
+            Some("a:1")
+        );
+    }
+
+    #[test]
+    fn genuinely_degraded_pair_is_not_recoverable() {
+        // No live replica anywhere: this IS a degraded window (the survivor
+        // cannot prove it holds the data), so the gate must still refuse and
+        // page rather than gamble.
+        let states = vec![node("a:1", 3, 0, None), node("b:2", 3, 0, None)];
+        assert!(insync_lineage_holder(&states).is_none());
+    }
+
+    #[test]
+    fn lagging_replica_does_not_qualify() {
+        // Attached but NOT caught up: "in sync" must be observed, not assumed.
+        let states = vec![node("a:1", 3, 1, Some(42))];
+        assert!(insync_lineage_holder(&states).is_none());
+    }
+
+    #[test]
+    fn superseded_ex_master_never_qualifies() {
+        // A stale ex-master at a LOWER epoch with a lingering follower must not
+        // be resurrected — a successor already holds the lineage.
+        let states = vec![node("old:1", 2, 1, Some(0)), node("new:2", 5, 0, None)];
+        assert!(insync_lineage_holder(&states).is_none());
+    }
+
+    #[test]
+    fn unreachable_node_never_qualifies() {
+        let mut down = node("a:1", 9, 1, Some(0));
+        down.reachable = false;
+        let states = vec![down, node("b:2", 3, 0, None)];
+        assert!(insync_lineage_holder(&states).is_none());
+    }
+
     #[test]
     fn dead_master_promotes_on_confirm_ticks() {
         // A refused connection (dead) escalates on the streak alone — fast,
         // RTO-critical, the killed-master path every chaos drill exercises.
-        assert!(!should_promote(false, 2, 3, None, Duration::from_millis(4000)));
-        assert!(should_promote(false, 3, 3, None, Duration::from_millis(4000)));
+        assert!(!should_promote(
+            false,
+            2,
+            3,
+            None,
+            Duration::from_millis(4000)
+        ));
+        assert!(should_promote(
+            false,
+            3,
+            3,
+            None,
+            Duration::from_millis(4000)
+        ));
     }
 
     #[test]
@@ -1329,15 +1465,33 @@ mod tests {
         // (slow, timeout-bound) ticks that took. This is the whole fix — a
         // starved master is held, not flapped, and the knob means real time.
         let sp = Duration::from_millis(4000);
-        assert!(!should_promote(true, 999, 3, Some(Duration::from_millis(3999)), sp));
-        assert!(should_promote(true, 1, 3, Some(Duration::from_millis(4000)), sp));
+        assert!(!should_promote(
+            true,
+            999,
+            3,
+            Some(Duration::from_millis(3999)),
+            sp
+        ));
+        assert!(should_promote(
+            true,
+            1,
+            3,
+            Some(Duration::from_millis(4000)),
+            sp
+        ));
     }
 
     #[test]
     fn slow_master_with_no_elapsed_never_promotes() {
         // Just entered the slow state (slow_since not yet set): never promote on
         // the same tick.
-        assert!(!should_promote(true, 100, 3, None, Duration::from_millis(4000)));
+        assert!(!should_promote(
+            true,
+            100,
+            3,
+            None,
+            Duration::from_millis(4000)
+        ));
     }
 
     #[test]
@@ -1347,7 +1501,10 @@ mod tests {
         // this); a port with nothing on it is refused.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
         let addr = listener.local_addr().expect("local addr").to_string();
-        assert!(socket_open(&addr), "a bound listener must read as socket-alive");
+        assert!(
+            socket_open(&addr),
+            "a bound listener must read as socket-alive"
+        );
 
         // Bind then drop to get an address nothing is listening on.
         let closed = {
