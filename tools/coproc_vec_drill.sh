@@ -133,6 +133,31 @@ echo "== CONTROL: the ordinary tenant data path is untouched"
 cli_ok $A SET plain value
 [ "$($A GET plain)" = "value" ] || { echo "FAIL (control): tenant SET/GET broke"; exit 1; }
 
+echo "== TTL (D7): a PX vector expires from the index; a permanent one in the same set survives"
+# Restart WITHOUT the D4 cap so these writes are not shed (the prior section left
+# the namespace deliberately over a 100-byte cap).
+kill -9 "$COPROC_PID" 2>/dev/null; wait "$COPROC_PID" 2>/dev/null; COPROC_PID=""
+sleep 0.3
+$VEC --port 6678 2>"$D/vec4.log" & COPROC_PID=$!
+fleet_wait_listen 6678
+[ "$(vexec VEC.CREATE sess DIM 3 METRIC l2)" = "OK " ] || { echo "FAIL: VEC.CREATE sess"; exit 1; }
+[ "$(vexec VEC.SET sess keep 1,0,0)" = "OK " ] || { echo "FAIL: VEC.SET sess keep"; exit 1; }
+# PX 1200ms: searchable now; gone within one sweep (--sweep-ms 1000) after it lapses.
+[ "$(vexec VEC.SET sess gone 0,1,0 PX 1200)" = "OK " ] || { echo "FAIL: VEC.SET sess gone PX"; exit 1; }
+case "$(vexec VEC.SEARCH sess 0,1,0 2)" in *gone*) : ;; *) echo "FAIL: TTL'd vector not searchable before expiry"; exit 1 ;; esac
+case "$(vexec VEC.GET sess gone)" in *"0,1,0"*) : ;; *) echo "FAIL: TTL'd VEC.GET before expiry"; exit 1 ;; esac
+echo "  before expiry: 'gone' is searchable"
+sleep 2.4   # past PX (1.2s) plus at least one sweep tick
+# The expired id reads absent and is masked from SEARCH; the permanent 'keep' stays.
+case "$(vexec VEC.GET sess gone)" in *"0,1,0"*) echo "FAIL: expired VEC.GET still returns the vector"; exit 1 ;; esac
+case "$(vexec VEC.SEARCH sess 0,1,0 5)" in *gone*) echo "FAIL: expired vector still in SEARCH"; exit 1 ;; esac
+case "$(vexec VEC.SEARCH sess 1,0,0 5)" in *keep*) : ;; *) echo "FAIL: permanent 'keep' vanished with the TTL'd one"; exit 1 ;; esac
+# The sweep reclaimed it from the index: INFO count is back to 1 (only 'keep').
+case "$(vexec VEC.INFO sess)" in *count*1*) : ;; *) echo "FAIL: sweep did not reclaim the expired id (count != 1)"; exit 1 ;; esac
+grep -qi "swept" "$D/vec4.log" || { echo "FAIL: no expiry sweep logged"; exit 1; }
+echo "  after expiry: 'gone' masked and swept; 'keep' still served"
+
 echo "PASS: flint-vec serves VEC.* end to end (flat + hnsw), writes are durable, a"
 echo "      restarted co-processor rebuilds each set from KV (D3) as its own engine kind,"
-echo "      and a per-namespace index-memory cap (D4) sheds new writes with -VECFULL."
+echo "      a per-namespace index-memory cap (D4) sheds new writes with -VECFULL, and a"
+echo "      per-vector TTL (D7) expires and is swept from the index while permanent ids stay."

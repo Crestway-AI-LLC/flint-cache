@@ -107,6 +107,12 @@ pub struct VectorSet {
     dim: usize,
     metric: Metric,
     index: Index,
+    /// Absolute expiry (ms since epoch) for TTL'd ids only — the ephemeral-
+    /// vector-memory wedge. Overlaid on either engine: search/get skip an
+    /// expired id and the sweep removes it, so no engine needs its own TTL. The
+    /// durable row carries the same expiry and the data-plane key its own PX,
+    /// so a restart's rebuild and the tenant's metering agree without this map.
+    expiry: HashMap<Vec<u8>, u64>,
 }
 
 impl VectorSet {
@@ -115,7 +121,12 @@ impl VectorSet {
             IndexKind::Flat => Index::Flat(HashMap::new()),
             IndexKind::Hnsw => Index::Hnsw(Hnsw::new(metric)),
         };
-        VectorSet { dim, metric, index }
+        VectorSet {
+            dim,
+            metric,
+            index,
+            expiry: HashMap::new(),
+        }
     }
 
     pub fn dim(&self) -> usize {
@@ -152,7 +163,17 @@ impl VectorSet {
         }
     }
 
-    fn set(&mut self, id: Vec<u8>, vec: Vec<f32>, meta: Option<Vec<u8>>) {
+    fn set(&mut self, id: Vec<u8>, vec: Vec<f32>, meta: Option<Vec<u8>>, expires_at: Option<u64>) {
+        match expires_at {
+            Some(e) => {
+                self.expiry.insert(id.clone(), e);
+            }
+            // An upsert with no TTL clears any prior one — a re-set makes the id
+            // permanent again, matching SET-clears-TTL for a native key.
+            None => {
+                self.expiry.remove(&id);
+            }
+        }
         match &mut self.index {
             Index::Flat(m) => {
                 let norm = dot(&vec, &vec).sqrt();
@@ -163,10 +184,30 @@ impl VectorSet {
     }
 
     fn del(&mut self, id: &[u8]) -> bool {
+        self.expiry.remove(id);
         match &mut self.index {
             Index::Flat(m) => m.remove(id).is_some(),
             Index::Hnsw(h) => h.del(id),
         }
+    }
+
+    fn is_expired(&self, id: &[u8], now: u64) -> bool {
+        self.expiry.get(id).is_some_and(|&e| e <= now)
+    }
+
+    /// How many indexed ids have already expired — how far to over-fetch a
+    /// top-k so expired hits cannot starve the k live ones.
+    fn expired_count(&self, now: u64) -> usize {
+        self.expiry.values().filter(|&&e| e <= now).count()
+    }
+
+    /// Ids whose TTL has passed, for the sweep to remove.
+    fn expired_ids(&self, now: u64) -> Vec<Vec<u8>> {
+        self.expiry
+            .iter()
+            .filter(|&(_, &e)| e <= now)
+            .map(|(id, _)| id.clone())
+            .collect()
     }
 
     /// The stored vector + meta for VEC.GET (lossless), or None.
@@ -267,8 +308,17 @@ fn flat_search(
 /// reserved co-processor prefix in the tenant namespace ([`durable_key`]).
 #[derive(Debug, PartialEq)]
 pub enum Persist {
-    Put { key: Vec<u8>, val: Vec<u8> },
-    Del { key: Vec<u8> },
+    /// `ttl_ms` mirrors the row's expiry onto the data-plane key itself, so the
+    /// durable store reclaims it on the same clock the index does (metering and
+    /// quota fall for free); `None` is a key that never expires.
+    Put {
+        key: Vec<u8>,
+        val: Vec<u8>,
+        ttl_ms: Option<u64>,
+    },
+    Del {
+        key: Vec<u8>,
+    },
 }
 
 /// The in-memory side of a write, applied by [`Store::commit`] only after its
@@ -287,6 +337,8 @@ pub enum Apply {
         id: Vec<u8>,
         vec: Vec<f32>,
         meta: Option<Vec<u8>>,
+        /// Absolute expiry in ms since epoch; `None` never expires.
+        expires_at: Option<u64>,
     },
     Remove {
         set: Vec<u8>,
@@ -329,11 +381,20 @@ fn durable_key(kind: u8, set: &[u8], id: &[u8]) -> Vec<u8> {
     k
 }
 
-/// Serialise a vector row for durability: comma-joined floats, then the raw
-/// metadata after a unit-separator when present. Chosen for legibility in v0.1;
-/// a packed-f32 encoding is a later, wire-compatible swap.
-fn encode_vec_row(vec: &[f32], meta: Option<&[u8]>) -> Vec<u8> {
-    let mut v = floats_to_ascii(vec).into_bytes();
+/// Serialise a vector row for durability: an optional absolute-ms expiry header
+/// (`@<ms>` then a 0x1e record-separator), the comma-joined floats, then the raw
+/// metadata after a 0x1f unit-separator when present. The header is
+/// backward-compatible — a row without a leading `@` is a no-TTL v0.1 row, and
+/// floats never start with `@`. A packed-f32 encoding is a later, wire-
+/// compatible swap.
+fn encode_vec_row(vec: &[f32], meta: Option<&[u8]>, expires_at: Option<u64>) -> Vec<u8> {
+    let mut v = Vec::new();
+    if let Some(ms) = expires_at {
+        v.push(b'@');
+        v.extend_from_slice(ms.to_string().as_bytes());
+        v.push(0x1e);
+    }
+    v.extend_from_slice(floats_to_ascii(vec).as_bytes());
     if let Some(m) = meta {
         v.push(0x1f);
         v.extend_from_slice(m);
@@ -406,14 +467,32 @@ pub fn parse_durable_key(key: &[u8]) -> Option<(u8, Vec<u8>, Vec<u8>)> {
     }
 }
 
-/// Inverse of [`encode_vec_row`]: `(vector, optional meta)` from a durable
-/// vector value (comma-floats, then meta after a 0x1f separator).
-pub fn decode_vec_row(val: &[u8]) -> Result<(Vec<f32>, Option<Vec<u8>>), String> {
-    let (floats, meta) = match val.iter().position(|&b| b == 0x1f) {
-        Some(i) => (&val[..i], Some(val[i + 1..].to_vec())),
-        None => (val, None),
+/// A decoded durable vector row: `(vector, optional meta, optional absolute
+/// expiry in ms since epoch)`. See [`decode_vec_row`].
+pub type DecodedVecRow = (Vec<f32>, Option<Vec<u8>>, Option<u64>);
+
+/// Inverse of [`encode_vec_row`]: `(vector, optional meta, optional expiry-ms)`
+/// from a durable vector value. A leading `@<ms>` + 0x1e is the optional expiry
+/// header; its absence is a no-TTL v0.1 row.
+pub fn decode_vec_row(val: &[u8]) -> Result<DecodedVecRow, String> {
+    let (expires_at, rest) = if val.first() == Some(&b'@') {
+        let i = val
+            .iter()
+            .position(|&b| b == 0x1e)
+            .ok_or("truncated vector expiry header")?;
+        let ms = std::str::from_utf8(&val[1..i])
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .ok_or("bad vector expiry header")?;
+        (Some(ms), &val[i + 1..])
+    } else {
+        (None, val)
     };
-    Ok((parse_vector(floats)?, meta))
+    let (floats, meta) = match rest.iter().position(|&b| b == 0x1f) {
+        Some(i) => (&rest[..i], Some(rest[i + 1..].to_vec())),
+        None => (rest, None),
+    };
+    Ok((parse_vector(floats)?, meta, expires_at))
 }
 
 /// Inverse of a config row: `<dim>|<metric>[|<index>]`. A 2-field config
@@ -480,16 +559,16 @@ impl Store {
     /// Plan one `VEC.*` command for tenant `ns` WITHOUT mutating the index.
     /// `args[0]` is the command name. Reads return [`Plan::Reply`]; writes
     /// return [`Plan::Write`] for the caller to persist-then-`commit`.
-    pub fn plan(&self, ns: &[u8], args: &[Vec<u8>]) -> Plan {
+    pub fn plan(&self, ns: &[u8], args: &[Vec<u8>], now: u64) -> Plan {
         let Some(name) = args.first() else {
             return Plan::Reply(err("ERR empty command"));
         };
         match name.to_ascii_uppercase().as_slice() {
             b"VEC.CREATE" => self.plan_create(ns, args),
-            b"VEC.SET" => self.plan_set(ns, args),
-            b"VEC.GET" => Plan::Reply(self.get(ns, args)),
+            b"VEC.SET" => self.plan_set(ns, args, now),
+            b"VEC.GET" => Plan::Reply(self.get(ns, args, now)),
             b"VEC.DEL" => self.plan_del(ns, args),
-            b"VEC.SEARCH" => Plan::Reply(self.search(ns, args)),
+            b"VEC.SEARCH" => Plan::Reply(self.search(ns, args, now)),
             b"VEC.INFO" => Plan::Reply(self.info(ns, args)),
             other => Plan::Reply(err(&format!(
                 "ERR unknown VEC command '{}'",
@@ -511,7 +590,13 @@ impl Store {
                     .entry((ns.to_vec(), set))
                     .or_insert_with(|| VectorSet::new(dim, metric, index));
             }
-            Apply::Insert { set, id, vec, meta } => {
+            Apply::Insert {
+                set,
+                id,
+                vec,
+                meta,
+                expires_at,
+            } => {
                 // Charge the byte delta to the namespace (new entry, or the meta
                 // change on an upsert), computed BEFORE the set replaces it.
                 let mut charge: Option<(usize, usize)> = None;
@@ -522,7 +607,7 @@ impl Store {
                     });
                     let new =
                         entry_bytes(dim, id.len(), meta.as_ref().map_or(0, |m| m.len()), kind);
-                    vs.set(id, vec, meta);
+                    vs.set(id, vec, meta, expires_at);
                     charge = Some((new, old));
                 }
                 if let Some((new, old)) = charge {
@@ -546,6 +631,38 @@ impl Store {
                 }
             }
         }
+    }
+
+    /// Remove every id whose TTL has passed as of `now`, across all tenants, and
+    /// credit the freed index bytes back to each namespace; returns how many
+    /// vectors were reclaimed. This is a RAM-reclamation path, not a correctness
+    /// one: `get`/`search` already mask an expired id the instant its deadline
+    /// passes, and the durable row carries its own PX, so a sweep that runs late
+    /// only holds memory longer — it can never serve or resurrect an expired
+    /// vector. Called on a timer by the networked layer.
+    pub fn sweep_expired(&mut self, now: u64) -> usize {
+        let mut swept = 0usize;
+        for ((ns, _set), vs) in self.sets.iter_mut() {
+            let ids = vs.expired_ids(now);
+            if ids.is_empty() {
+                continue;
+            }
+            let (dim, kind) = (vs.dim(), vs.kind());
+            let mut freed = 0usize;
+            for id in &ids {
+                if let Some((_, m)) = vs.get(id) {
+                    freed += entry_bytes(dim, id.len(), m.map_or(0, |x| x.len()), kind);
+                }
+                vs.del(id);
+            }
+            swept += ids.len();
+            if freed > 0
+                && let Some(e) = self.ns_bytes.get_mut(ns)
+            {
+                *e = e.saturating_sub(freed);
+            }
+        }
+        swept
     }
 
     /// VEC.CREATE <set> DIM <d> METRIC <cosine|l2|ip> [INDEX flat]
@@ -586,6 +703,8 @@ impl Store {
             persist: Persist::Put {
                 key: durable_key(b'c', set, b""),
                 val: format!("{dim}|{}|{}", metric.as_str(), index.as_str()).into_bytes(),
+                // A set's config row never expires; TTL is per-vector.
+                ttl_ms: None,
             },
             apply: Apply::CreateSet {
                 set: set.to_vec(),
@@ -597,20 +716,60 @@ impl Store {
         }
     }
 
-    /// VEC.SET <set> <id> <vec> [META <json>]
-    fn plan_set(&self, ns: &[u8], args: &[Vec<u8>]) -> Plan {
+    /// VEC.SET <set> <id> <vec> [META <json>] [EX <secs> | PX <ms>]
+    fn plan_set(&self, ns: &[u8], args: &[Vec<u8>], now: u64) -> Plan {
         if args.len() < 4 {
-            return Plan::Reply(err("ERR VEC.SET <set> <id> <vec> [META <json>]"));
+            return Plan::Reply(err(
+                "ERR VEC.SET <set> <id> <vec> [META <json>] [EX secs | PX ms]",
+            ));
         }
         let (set, id, raw) = (&args[1], &args[2], &args[3]);
         if !valid_name(set) || !valid_name(id) {
             return Plan::Reply(err("ERR invalid set or id (must be non-empty, no NUL)"));
         }
-        let meta: Option<Vec<u8>> = if args.len() >= 6 && args[4].eq_ignore_ascii_case(b"META") {
-            Some(args[5].clone())
-        } else {
-            None
-        };
+        // Optional trailing options in any order: META <json>, and at most one of
+        // EX <secs> / PX <ms> (the ephemeral-memory TTL). EX/PX mirror SET: a
+        // re-SET without one makes the id permanent again (handled in `set`).
+        let mut meta: Option<Vec<u8>> = None;
+        let mut ttl_ms: Option<u64> = None;
+        let mut i = 4;
+        while i < args.len() {
+            let opt = args[i].to_ascii_uppercase();
+            match opt.as_slice() {
+                b"META" => {
+                    let Some(val) = args.get(i + 1) else {
+                        return Plan::Reply(err("ERR META needs a value"));
+                    };
+                    meta = Some(val.clone());
+                    i += 2;
+                }
+                b"EX" | b"PX" => {
+                    if ttl_ms.is_some() {
+                        return Plan::Reply(err("ERR EX and PX are mutually exclusive"));
+                    }
+                    let n = match args
+                        .get(i + 1)
+                        .and_then(|a| std::str::from_utf8(a).ok())
+                        .and_then(|s| s.parse::<u64>().ok())
+                    {
+                        Some(n) if n > 0 => n,
+                        _ => return Plan::Reply(err("ERR EX/PX needs a positive integer")),
+                    };
+                    ttl_ms = Some(if opt.eq_ignore_ascii_case(b"EX") {
+                        n.saturating_mul(1000)
+                    } else {
+                        n
+                    });
+                    i += 2;
+                }
+                _ => {
+                    return Plan::Reply(err("ERR unknown VEC.SET option (want META, EX, or PX)"));
+                }
+            }
+        }
+        // Absolute deadline off the caller-supplied clock, so plan/commit and the
+        // durable row all agree on one instant.
+        let expires_at = ttl_ms.map(|t| now.saturating_add(t));
         let Some(vs) = self.sets.get(&(ns.to_vec(), set.to_vec())) else {
             return Plan::Reply(err("ERR no such set (VEC.CREATE it first)"));
         };
@@ -648,13 +807,15 @@ impl Store {
         Plan::Write {
             persist: Persist::Put {
                 key: durable_key(b'v', set, id),
-                val: encode_vec_row(&vec, meta.as_deref()),
+                val: encode_vec_row(&vec, meta.as_deref(), expires_at),
+                ttl_ms,
             },
             apply: Apply::Insert {
                 set: set.to_vec(),
                 id: id.to_vec(),
                 vec,
                 meta,
+                expires_at,
             },
             ok: Value::Simple("OK".into()),
         }
@@ -685,13 +846,18 @@ impl Store {
         }
     }
 
-    fn get(&self, ns: &[u8], args: &[Vec<u8>]) -> Value {
+    fn get(&self, ns: &[u8], args: &[Vec<u8>], now: u64) -> Value {
         if args.len() < 3 {
             return err("ERR VEC.GET <set> <id>");
         }
         let Some(vs) = self.sets.get(&(ns.to_vec(), args[1].to_vec())) else {
             return err("ERR no such set");
         };
+        // An expired id reads as absent until the sweep removes it — the vector
+        // is logically gone the instant its TTL passes, sweep or no sweep.
+        if vs.is_expired(&args[2], now) {
+            return Value::Null;
+        }
         match vs.get(&args[2]) {
             None => Value::Null,
             Some((vec, meta)) => {
@@ -705,7 +871,7 @@ impl Store {
     }
 
     /// VEC.SEARCH <set> <query> <k> [EF <n>]
-    fn search(&self, ns: &[u8], args: &[Vec<u8>]) -> Value {
+    fn search(&self, ns: &[u8], args: &[Vec<u8>], now: u64) -> Value {
         if args.len() < 4 {
             return err("ERR VEC.SEARCH <set> <query> <k> [EF <n>]");
         }
@@ -739,9 +905,16 @@ impl Store {
         } else {
             hnsw::EF_SEARCH_DEFAULT
         };
+        // Expired-but-unswept ids still sit in the index and can outrank live
+        // ones, so over-fetch by the expired count and drop them post-hoc: with
+        // at most `expired` stale hits, k+expired candidates always yield k live
+        // ones. Engine-agnostic — no flat/HNSW code knows about TTL.
+        let expired = vs.expired_count(now);
         let rows: Vec<Value> = vs
-            .search(&query, k, ef)
+            .search(&query, k.saturating_add(expired), ef)
             .into_iter()
+            .filter(|(id, _)| !vs.is_expired(id, now))
+            .take(k)
             .map(|(id, score)| {
                 Value::Array(Some(vec![
                     Value::Bulk(Some(id)),
@@ -792,15 +965,24 @@ mod tests {
 
     /// Drive a command through the two-phase path as the networked co-processor
     /// would with a durable store that never sheds: plan, then (for a write)
-    /// commit and return `ok`.
+    /// commit and return `ok`. `run` uses t=0; `run_at` takes an explicit clock
+    /// so the TTL tests can set and cross a deadline.
     fn run(st: &mut Store, ns: &[u8], args: &[Vec<u8>]) -> Value {
-        match st.plan(ns, args) {
+        run_at(st, ns, args, 0)
+    }
+    fn run_at(st: &mut Store, ns: &[u8], args: &[Vec<u8>], now: u64) -> Value {
+        match st.plan(ns, args, now) {
             Plan::Reply(v) => v,
             Plan::Write { apply, ok, .. } => {
                 st.commit(ns, apply);
                 ok
             }
         }
+    }
+    /// Plan at t=0 for the tests that inspect the returned [`Plan`] directly
+    /// (durable rows, error shapes) and do not care about the clock.
+    fn plan0(st: &Store, ns: &[u8], args: &[Vec<u8>]) -> Plan {
+        st.plan(ns, args, 0)
     }
 
     #[test]
@@ -818,7 +1000,7 @@ mod tests {
         );
         // duplicate CREATE errors (and plans no write)
         assert!(matches!(
-            st.plan(ns, &cmd(&["VEC.CREATE", "docs", "DIM", "2", "METRIC", "l2"])),
+            plan0(&st, ns, &cmd(&["VEC.CREATE", "docs", "DIM", "2", "METRIC", "l2"])),
             Plan::Reply(Value::Error(e)) if e.contains("already exists")
         ));
 
@@ -831,7 +1013,7 @@ mod tests {
 
         // wrong dimension: an error, and NOT a Write (nothing to persist/apply)
         assert!(matches!(
-            st.plan(ns, &cmd(&["VEC.SET", "docs", "d", "1,2,3"])),
+            plan0(&st, ns, &cmd(&["VEC.SET", "docs", "d", "1,2,3"])),
             Plan::Reply(Value::Error(e)) if e.starts_with("WRONGDIM")
         ));
 
@@ -864,7 +1046,8 @@ mod tests {
 
         // CREATE ... INDEX hnsw: the persisted config value ends with the kind,
         // which is what rebuild reads back to pick the engine.
-        match st.plan(
+        match plan0(
+            &st,
             ns,
             &cmd(&[
                 "VEC.CREATE",
@@ -968,7 +1151,7 @@ mod tests {
         // A VEC.SET returns a Write whose Persist::Put targets the vector's
         // durable key and whose Apply::Insert carries the parsed vector — the
         // caller performs the Put, THEN commits the Insert.
-        match st.plan(b"n", &cmd(&["VEC.SET", "s", "id7", "1,2"])) {
+        match plan0(&st, b"n", &cmd(&["VEC.SET", "s", "id7", "1,2"])) {
             Plan::Write {
                 persist: Persist::Put { key, .. },
                 apply: Apply::Insert { id, vec, .. },
@@ -983,7 +1166,7 @@ mod tests {
         }
         // Because plan() does not mutate, the index is still empty until commit.
         assert!(matches!(
-            st.plan(b"n", &cmd(&["VEC.GET", "s", "id7"])),
+            plan0(&st, b"n", &cmd(&["VEC.GET", "s", "id7"])),
             Plan::Reply(Value::Null)
         ));
     }
@@ -1018,7 +1201,7 @@ mod tests {
         // DEL of a present id plans a Write (durable delete); of an absent id
         // is a plain Reply(0) with nothing to persist.
         assert!(matches!(
-            st.plan(ns, &cmd(&["VEC.DEL", "s", "x"])),
+            plan0(&st, ns, &cmd(&["VEC.DEL", "s", "x"])),
             Plan::Write {
                 persist: Persist::Del { .. },
                 ok: Value::Integer(1),
@@ -1030,7 +1213,7 @@ mod tests {
             Value::Integer(1)
         );
         assert!(matches!(
-            st.plan(ns, &cmd(&["VEC.DEL", "s", "x"])),
+            plan0(&st, ns, &cmd(&["VEC.DEL", "s", "x"])),
             Plan::Reply(Value::Integer(0))
         ));
     }
@@ -1050,7 +1233,7 @@ mod tests {
         );
         // tenantB has no set named "s" of its own.
         assert!(matches!(
-            st.plan(b"tenantB", &cmd(&["VEC.SEARCH", "s", "9,9", "1"])),
+            plan0(&st, b"tenantB", &cmd(&["VEC.SEARCH", "s", "9,9", "1"])),
             Plan::Reply(Value::Error(e)) if e.contains("no such set")
         ));
         run(
@@ -1085,15 +1268,17 @@ mod tests {
     fn durable_rows_round_trip_for_rebuild() {
         let st = Store::new();
         // CREATE's config Put decodes back to (dim, metric).
-        match st.plan(
+        match plan0(
+            &st,
             b"n",
             &cmd(&["VEC.CREATE", "docs", "DIM", "4", "METRIC", "cosine"]),
         ) {
             Plan::Write {
-                persist: Persist::Put { key, val },
+                persist: Persist::Put { key, val, ttl_ms },
                 ..
             } => {
                 assert_eq!(parse_durable_key(&key), Some((b'c', v("docs"), Vec::new())));
+                assert_eq!(ttl_ms, None, "a set's config row never expires");
                 assert_eq!(
                     decode_config(&val),
                     Some((4, Metric::Cosine, IndexKind::Flat))
@@ -1108,18 +1293,21 @@ mod tests {
             b"n",
             &cmd(&["VEC.CREATE", "docs", "DIM", "4", "METRIC", "cosine"]),
         );
-        match st.plan(
+        match plan0(
+            &st,
             b"n",
             &cmd(&["VEC.SET", "docs", "id9", "1,2,3,4", "META", "m!"]),
         ) {
             Plan::Write {
-                persist: Persist::Put { key, val },
+                persist: Persist::Put { key, val, ttl_ms },
                 ..
             } => {
                 assert_eq!(parse_durable_key(&key), Some((b'v', v("docs"), v("id9"))));
-                let (vec, meta) = decode_vec_row(&val).expect("decode vec row");
+                assert_eq!(ttl_ms, None, "no EX/PX given, so no data-plane TTL");
+                let (vec, meta, expires_at) = decode_vec_row(&val).expect("decode vec row");
                 assert_eq!(vec, vec![1.0, 2.0, 3.0, 4.0]);
                 assert_eq!(meta, Some(v("m!")));
+                assert_eq!(expires_at, None, "no EX/PX given, so no row expiry header");
             }
             _ => panic!("set should plan a vector Put"),
         }
@@ -1138,17 +1326,17 @@ mod tests {
         );
         // NUL in id
         assert!(matches!(
-            st.plan(ns, &[v("VEC.SET"), v("s"), vec![0], v("1,2")]),
+            plan0(&st, ns, &[v("VEC.SET"), v("s"), vec![0], v("1,2")]),
             Plan::Reply(Value::Error(e)) if e.contains("invalid set or id")
         ));
         // non-numeric vector
         assert!(matches!(
-            st.plan(ns, &cmd(&["VEC.SET", "s", "id", "1,x"])),
+            plan0(&st, ns, &cmd(&["VEC.SET", "s", "id", "1,x"])),
             Plan::Reply(Value::Error(e)) if e.contains("not a float")
         ));
         // unknown VEC command
         assert!(matches!(
-            st.plan(ns, &cmd(&["VEC.NOPE", "s"])),
+            plan0(&st, ns, &cmd(&["VEC.NOPE", "s"])),
             Plan::Reply(Value::Error(e)) if e.contains("unknown VEC command")
         ));
     }
@@ -1179,7 +1367,7 @@ mod tests {
         // The third is refused, and refused as a REPLY — no durable write is
         // planned, so the vector is not stored either.
         assert!(matches!(
-            st.plan(ns, &cmd(&["VEC.SET", "s", "c", "0,0,1,0"])),
+            plan0(&st, ns, &cmd(&["VEC.SET", "s", "c", "0,0,1,0"])),
             Plan::Reply(Value::Error(e)) if e.starts_with("VECFULL")
         ));
         // An upsert of an existing id is charged only its meta delta (~0), so it
@@ -1239,5 +1427,216 @@ mod tests {
                 Value::Simple("OK".into())
             );
         }
+    }
+
+    /// Plan a read-only command at clock `now` and return its reply.
+    fn plan_reply(st: &Store, ns: &[u8], args: &[Vec<u8>], now: u64) -> Value {
+        match st.plan(ns, args, now) {
+            Plan::Reply(v) => v,
+            Plan::Write { .. } => panic!("expected a read"),
+        }
+    }
+
+    /// The ids of a VEC.SEARCH reply, nearest first.
+    fn search_ids(v: &Value) -> Vec<Vec<u8>> {
+        match v {
+            Value::Array(Some(rows)) => rows
+                .iter()
+                .map(|row| match row {
+                    Value::Array(Some(pair)) => match &pair[0] {
+                        Value::Bulk(Some(id)) => id.clone(),
+                        _ => panic!("id not a bulk string"),
+                    },
+                    _ => panic!("row not a pair"),
+                })
+                .collect(),
+            other => panic!("expected an array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ttl_masks_get_and_search_then_sweep_reclaims() {
+        let mut st = Store::new();
+        let ns = b"nsT";
+        run(
+            &mut st,
+            ns,
+            &cmd(&["VEC.CREATE", "s", "DIM", "2", "METRIC", "l2"]),
+        );
+
+        // "a" is the nearest to the origin but expires at t=1000; b, c never do.
+        assert_eq!(
+            run_at(
+                &mut st,
+                ns,
+                &cmd(&["VEC.SET", "s", "a", "0,0", "PX", "1000"]),
+                0
+            ),
+            Value::Simple("OK".into())
+        );
+        run(&mut st, ns, &cmd(&["VEC.SET", "s", "b", "1,0"]));
+        run(&mut st, ns, &cmd(&["VEC.SET", "s", "c", "2,0"]));
+
+        // Before the deadline: GET returns "a" and SEARCH ranks it first.
+        assert!(matches!(
+            plan_reply(&st, ns, &cmd(&["VEC.GET", "s", "a"]), 500),
+            Value::Array(Some(_))
+        ));
+        assert_eq!(
+            search_ids(&plan_reply(
+                &st,
+                ns,
+                &cmd(&["VEC.SEARCH", "s", "0,0", "2"]),
+                500
+            )),
+            vec![v("a"), v("b")]
+        );
+
+        // At the deadline (expiry is `<= now`): "a" reads absent, and SEARCH masks
+        // it even though it is nearest — the over-fetch still yields k live ids.
+        assert_eq!(
+            plan_reply(&st, ns, &cmd(&["VEC.GET", "s", "a"]), 1000),
+            Value::Null
+        );
+        assert_eq!(
+            search_ids(&plan_reply(
+                &st,
+                ns,
+                &cmd(&["VEC.SEARCH", "s", "0,0", "2"]),
+                1000
+            )),
+            vec![v("b"), v("c")],
+            "expired nearest is skipped; the next two live ids are returned"
+        );
+
+        // The masked vector is still indexed until a sweep runs; the sweep frees
+        // exactly it and credits the bytes back, and re-sweeping is a no-op.
+        let before = st.ns_mem_bytes(ns);
+        assert_eq!(
+            st.sweep_expired(1000),
+            1,
+            "exactly the expired id reclaimed"
+        );
+        assert!(
+            st.ns_mem_bytes(ns) < before,
+            "freed the expired entry's index bytes"
+        );
+        assert_eq!(st.sweep_expired(2000), 0, "nothing left to reclaim");
+    }
+
+    #[test]
+    fn ttl_ex_px_encode_into_row_and_key() {
+        let mut st = Store::new();
+        let ns = b"n";
+        run(
+            &mut st,
+            ns,
+            &cmd(&["VEC.CREATE", "s", "DIM", "2", "METRIC", "l2"]),
+        );
+
+        // EX is seconds, PX is ms; both land as the same absolute deadline in the
+        // row header, the Apply, AND the data-plane key's PX (so metering agrees).
+        for (opt, unit, ttl) in [("EX", "5", 5000u64), ("PX", "250", 250u64)] {
+            match st.plan(ns, &cmd(&["VEC.SET", "s", "x", "1,1", opt, unit]), 10_000) {
+                Plan::Write {
+                    persist: Persist::Put { val, ttl_ms, .. },
+                    apply,
+                    ..
+                } => {
+                    assert_eq!(ttl_ms, Some(ttl), "{opt} sets the data-plane PX");
+                    let (_, _, expires_at) = decode_vec_row(&val).expect("decode");
+                    assert_eq!(expires_at, Some(10_000 + ttl), "row expiry = now + ttl");
+                    match apply {
+                        Apply::Insert { expires_at, .. } => {
+                            assert_eq!(expires_at, Some(10_000 + ttl))
+                        }
+                        _ => panic!("a SET is an Insert"),
+                    }
+                }
+                _ => panic!("{opt} SET should plan a write"),
+            }
+        }
+
+        // EX and PX together, and a non-positive/garbage duration, are refused.
+        assert!(matches!(
+            plan0(&st, ns, &cmd(&["VEC.SET", "s", "x", "1,1", "EX", "5", "PX", "5"])),
+            Plan::Reply(Value::Error(e)) if e.contains("mutually exclusive")
+        ));
+        assert!(matches!(
+            plan0(&st, ns, &cmd(&["VEC.SET", "s", "x", "1,1", "EX", "0"])),
+            Plan::Reply(Value::Error(e)) if e.contains("positive")
+        ));
+    }
+
+    #[test]
+    fn ttl_reset_without_option_makes_id_permanent() {
+        let mut st = Store::new();
+        let ns = b"n";
+        run(
+            &mut st,
+            ns,
+            &cmd(&["VEC.CREATE", "s", "DIM", "2", "METRIC", "l2"]),
+        );
+        // Set with a short TTL, confirm it expires, then re-set with no TTL: the
+        // id becomes permanent again (SET-clears-TTL, like a native key).
+        run_at(
+            &mut st,
+            ns,
+            &cmd(&["VEC.SET", "s", "y", "3,3", "PX", "100"]),
+            0,
+        );
+        assert_eq!(
+            plan_reply(&st, ns, &cmd(&["VEC.GET", "s", "y"]), 200),
+            Value::Null,
+            "expired at its deadline"
+        );
+        run_at(&mut st, ns, &cmd(&["VEC.SET", "s", "y", "3,3"]), 200);
+        assert!(
+            matches!(
+                plan_reply(&st, ns, &cmd(&["VEC.GET", "s", "y"]), 10_000),
+                Value::Array(Some(_))
+            ),
+            "a re-set with no EX/PX is permanent"
+        );
+    }
+
+    #[test]
+    fn ttl_restored_from_durable_row_on_rebuild() {
+        // The D3 rebuild path: a durable row's expiry header decodes back to an
+        // absolute deadline, and committing the Insert re-establishes the TTL, so
+        // a restarted co-processor masks the same vectors the crashed one would.
+        let mut st = Store::new();
+        let ns = b"n";
+        st.commit(
+            ns,
+            Apply::CreateSet {
+                set: v("s"),
+                dim: 2,
+                metric: Metric::L2,
+                index: IndexKind::Flat,
+            },
+        );
+        let row = encode_vec_row(&[9.0, 9.0], None, Some(500));
+        let (vec, meta, expires_at) = decode_vec_row(&row).expect("decode");
+        assert_eq!(expires_at, Some(500));
+        st.commit(
+            ns,
+            Apply::Insert {
+                set: v("s"),
+                id: v("z"),
+                vec,
+                meta,
+                expires_at,
+            },
+        );
+        assert!(matches!(
+            plan_reply(&st, ns, &cmd(&["VEC.GET", "s", "z"]), 499),
+            Value::Array(Some(_))
+        ));
+        assert_eq!(
+            plan_reply(&st, ns, &cmd(&["VEC.GET", "s", "z"]), 500),
+            Value::Null,
+            "restored TTL fires on the same deadline"
+        );
     }
 }

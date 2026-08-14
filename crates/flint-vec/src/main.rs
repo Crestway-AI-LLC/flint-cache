@@ -42,8 +42,8 @@ type Loads = Arc<Mutex<HashMap<Vec<u8>, LoadState>>>;
 
 /// A decoded config row awaiting install: `(set, dim, metric, index)`.
 type LoadedConfig = (Vec<u8>, usize, Metric, IndexKind);
-/// A decoded vector row awaiting install: `(set, id, vector, meta)`.
-type LoadedVector = (Vec<u8>, Vec<u8>, Vec<f32>, Option<Vec<u8>>);
+/// A decoded vector row awaiting install: `(set, id, vector, meta, expires_at)`.
+type LoadedVector = (Vec<u8>, Vec<u8>, Vec<f32>, Option<Vec<u8>>, Option<u64>);
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -68,6 +68,27 @@ fn main() {
         format!("index mem cap {index_cap} B/ns")
     };
     eprintln!("flint-vec co-processor on {bind} (plaintext, v0.2 flat+hnsw, {cap_note})");
+
+    // Background reclamation of expired vectors. Reads/searches already mask an
+    // expired id the instant its deadline passes (so cadence is not a correctness
+    // knob — only how promptly the RAM and the D4 accounting are freed), and the
+    // durable rows carry their own PX and expire independently. 0 disables it.
+    let sweep_ms: u64 = arg(&args, "--sweep-ms")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1000);
+    if sweep_ms > 0 {
+        let store = store.clone();
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(Duration::from_millis(sweep_ms));
+                let swept = store.lock().expect("store lock").sweep_expired(now_ms());
+                if swept > 0 {
+                    eprintln!("flint-vec: swept {swept} expired vector(s)");
+                }
+            }
+        });
+    }
+
     for conn in listener.incoming().flatten() {
         let (store, loads) = (store.clone(), loads.clone());
         std::thread::spawn(move || serve(conn, store, loads));
@@ -153,7 +174,10 @@ fn handle_flintfam(frame: &Value, store: &Arc<Mutex<Store>>, loads: &Loads) -> V
         }
     }
 
-    let plan = store.lock().expect("store lock").plan(ns, &cmd_args);
+    let plan = store
+        .lock()
+        .expect("store lock")
+        .plan(ns, &cmd_args, now_ms());
     match plan {
         Plan::Reply(v) => v,
         Plan::Write { persist, apply, ok } => match perform_persist(callback, token, &persist) {
@@ -241,8 +265,10 @@ fn rebuild_inner(
                 }
             }
             Ok(Value::Bulk(Some(val))) if kind == b'v' => {
-                if let Ok((vec, meta)) = decode_vec_row(&val) {
-                    vectors.push((set, id, vec, meta));
+                // The expiry rides the durable row, so a rebuilt index restores
+                // each id's TTL for free — no separate expiry store to replay.
+                if let Ok((vec, meta, expires_at)) = decode_vec_row(&val) {
+                    vectors.push((set, id, vec, meta, expires_at));
                 }
             }
             Ok(Value::Bulk(Some(_))) | Ok(Value::Null) | Ok(Value::Bulk(None)) => {} // skip
@@ -285,8 +311,17 @@ fn install(
         );
     }
     let n = vectors.len();
-    for (set, id, vec, meta) in vectors {
-        st.commit(ns, Apply::Insert { set, id, vec, meta });
+    for (set, id, vec, meta, expires_at) in vectors {
+        st.commit(
+            ns,
+            Apply::Insert {
+                set,
+                id,
+                vec,
+                meta,
+                expires_at,
+            },
+        );
     }
     n
 }
@@ -335,8 +370,21 @@ fn perform_persist(callback: &[u8], token: &[u8], persist: &Persist) -> Result<(
         return Err(err(&format!("COPROCUNAVAIL channel refused: {e}")));
     }
 
+    // A TTL'd row is written `SET key val PX <ms>`, so the durable copy expires on
+    // the same deadline the index does — the data-plane key's own metering and
+    // quota reclamation then come for free. `ttl_buf` outlives the borrow in the
+    // command vector.
+    let ttl_buf;
     let dcmd: Vec<&[u8]> = match persist {
-        Persist::Put { key, val } => vec![b"SET", key, val],
+        Persist::Put {
+            key,
+            val,
+            ttl_ms: Some(ms),
+        } => {
+            ttl_buf = ms.to_string().into_bytes();
+            vec![b"SET", key, val, b"PX", &ttl_buf]
+        }
+        Persist::Put { key, val, .. } => vec![b"SET", key, val],
         Persist::Del { key } => vec![b"DEL", key],
     };
     send_cmd(&mut ch, &dcmd)
@@ -391,4 +439,14 @@ fn read_reply(ch: &mut TcpStream) -> std::io::Result<Value> {
 
 fn err(msg: &str) -> Value {
     Value::Error(msg.to_string())
+}
+
+/// Wall-clock ms since the Unix epoch — the clock every TTL is measured against,
+/// and the same one the data plane stamps native keys with, so a vector's index
+/// expiry and its durable key's PX agree.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }

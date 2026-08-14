@@ -90,7 +90,8 @@ fn vec_str(v: &[f32]) -> String {
 /// Run a command through the two-phase path (commit a write, return a reply),
 /// as the co-processor would against a store that never sheds.
 fn exec(st: &mut Store, ns: &[u8], args: &[Vec<u8>]) -> Value {
-    match st.plan(ns, args) {
+    // The bench uses no TTLs, so a fixed t=0 clock is sufficient.
+    match st.plan(ns, args, 0) {
         Plan::Reply(v) => v,
         Plan::Write { apply, ok, .. } => {
             st.commit(ns, apply);
@@ -173,7 +174,7 @@ fn search_all(
         // Pre-build the arg vector so only plan() (parse + search) is timed.
         let args = [b("VEC.SEARCH"), b(set), b(q), b(&k_s), b("EF"), b(&ef_s)];
         let t0 = Instant::now();
-        let reply = st.plan(ns, &args);
+        let reply = st.plan(ns, &args, 0);
         lat.push(t0.elapsed().as_micros());
         let Plan::Reply(v) = reply else {
             unreachable!("SEARCH is a read")
