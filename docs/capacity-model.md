@@ -175,6 +175,17 @@ same slot, no matter how large the filter grows or how many pairs the
 cluster has. A filter sized for 100 M items is one hot key, and
 `FLINTSLOTHEAT` will correctly report it as a hotspot.
 
+Size it before you build it: a Bloom filter costs **~9.6 bits per item at a
+1 % false-positive rate** (≈1.2 MB per million items; fewer bits at looser
+rates, more at tighter). Blocks are materialised lazily in 4 KiB units as
+items land, so the footprint grows with the items actually added rather than
+jumping to the reserved capacity up front — but the ceiling that one slot must
+eventually hold is set by that reserved capacity. An auto-created filter's
+default capacity (100 000 items) and its 32-link chain cap are fixed constants
+(`command-support.md` explains why they are deliberately not per-node flags); a
+deployment that expects much larger filters should shard as above rather than
+lean on one giant filter.
+
 Say this plainly before someone files it as a bug in the rebalancer: it is
 not a rebalancer defect, and the fix is not a bigger cluster. The options,
 in the order worth trying:
