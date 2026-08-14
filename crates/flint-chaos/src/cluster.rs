@@ -126,6 +126,50 @@ impl Attached {
         &self.tls
     }
 
+    /// Everything an operator would ask for when a promotion does not happen,
+    /// gathered at the moment it does not happen.
+    ///
+    /// THE COST OF NOT HAVING THIS. The 5 TB scale run (#171) died on
+    /// "controller did not promote within 30s" at iteration 11 of 12, and the
+    /// panic carried nothing but that sentence. The fleet tore down seconds
+    /// later — teardown is unconditional, and correctly so — taking the
+    /// controller's log with it. An intermittent failure that destroys its own
+    /// evidence costs one whole multi-host run per attempt, and the local
+    /// repro (tools/failover_churn_drill.sh) does NOT reproduce it, so there
+    /// is no cheaper way to see the state that matters.
+    ///
+    /// Deliberately best-effort and infallible: this runs on a path that is
+    /// already failing, and a diagnostic that can itself fail would replace
+    /// the real error with its own.
+    fn failure_context(&self, dead: &str, survivor: &str) -> String {
+        let mut s = String::new();
+        s.push_str(&format!(
+            "\n  pair members: {:?}\n  killed: {dead}\n  awaited promotion of: {survivor}\n",
+            self.members
+        ));
+        match self.ctl(&["status"]) {
+            Ok(o) => s.push_str(&format!("  --- flintctl status ---\n{o}\n")),
+            Err(e) => s.push_str(&format!("  --- flintctl status FAILED: {e}\n")),
+        }
+        // Both seats' raw view. The survivor's own numbers are the crux: a
+        // lone survivor reports live_replicas 0 and seq_lag none, and whether
+        // the controller can still promote from that is the open question.
+        for m in &self.members {
+            let info = self.info(m);
+            if info.is_empty() {
+                s.push_str(&format!("  {m}: UNREACHABLE\n"));
+                continue;
+            }
+            let f = |k: &str| info.get(k).cloned().unwrap_or_else(|| "-".into());
+            s.push_str(&format!(
+                "  {m}: role={} epoch={} latest_seq={} acked_seq={} seq_lag={} live_replicas={} write_stopped={}\n",
+                f("role"), f("role_epoch"), f("latest_seq"), f("acked_seq"),
+                f("seq_lag"), f("live_replicas"), f("write_stopped"),
+            ));
+        }
+        s
+    }
+
     fn role_of(&self, addr: &str) -> Option<String> {
         let mut c = Client::connect_addr(addr, &self.tls).ok()?;
         let Ok(Value::Bulk(Some(raw))) = c.call(&[b"FLINTINFO"]) else {
@@ -229,7 +273,10 @@ impl Attached {
                 }
                 std::thread::sleep(Duration::from_millis(200));
             }
-            return Err(format!("controller did not promote {s} within 30s"));
+            return Err(format!(
+                "controller did not promote {s} within 30s (#171){}",
+                self.failure_context(addr, &s)
+            ));
         }
         Ok(())
     }
