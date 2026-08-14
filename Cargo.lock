@@ -586,6 +586,7 @@ version = "0.0.1"
 dependencies = [
  "flint-build",
  "flint-resp",
+ "flint-slot",
  "flint-tls",
 ]
 

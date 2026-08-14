@@ -3279,21 +3279,70 @@ fn verify_checks(inv: &Inventory, probe: Option<&str>, loud: bool) -> Vec<String
                 other => note(false, "SCAN opens a cursor", format!("{other:?}")),
             }
             // A write read back and cleaned up: the keyed path end to end.
-            let k = format!("__verify__:{}", std::process::id());
-            let wrote = call_seq_on(
-                proxy,
-                &edge,
-                &[&["AUTH", token], &["SET", &k, "1"], &["GET", &k]],
-                t,
-                true,
-            );
-            match wrote {
-                Ok(Value::Bulk(Some(ref b))) if b == b"1" => {
-                    note(true, "write/read round trip", String::new())
+            // A write read back and cleaned up: the keyed path end to end —
+            // for EVERY PAIR, not for whichever one a single key happened to
+            // hash to (#170).
+            //
+            // This check used to write exactly one key. One key is one slot on
+            // one pair, so a pair that could not take a write at all still
+            // passed as long as `__verify__:<pid>` hashed somewhere else — and
+            // the DBSIZE fan-out above walks the master LIST without checking
+            // role, so it stayed green too. That combination is what made the
+            // first 10 TB run so confusing: two checks called the fleet healthy
+            // while a quarter of it was refusing keyed writes (#167/#168).
+            //
+            // So synthesise one key per pair using the SAME slot hash and
+            // default-owner function the proxy routes with, and report which
+            // pair failed. Attribution is by the DEFAULT slot map: a live
+            // migration exception can move a slot off its default owner, so a
+            // failure names the pair the key belongs to by default — the
+            // failure itself is always real, only the label could be off
+            // mid-migration, which the message says.
+            let npairs = inv.pairs.len();
+            let mut probe: Vec<Option<String>> = vec![None; npairs];
+            let mut have = 0usize;
+            let mut n: u32 = 0;
+            while have < npairs && n < 200_000 {
+                let k = format!("__verify__:{}:{n}", std::process::id());
+                let slot = flint_slot::slot_for_key(k.as_bytes());
+                if let Some(p) = flint_slot::default_pair(slot, &[], npairs)
+                    && p < npairs
+                    && probe[p].is_none()
+                {
+                    probe[p] = Some(k);
+                    have += 1;
                 }
-                other => note(false, "write/read round trip", format!("{other:?}")),
+                n += 1;
             }
-            let _ = call_seq_on(proxy, &edge, &[&["AUTH", token], &["DEL", &k]], t, true);
+            let mut bad: Vec<String> = Vec::new();
+            for (i, key) in probe.iter().enumerate() {
+                let Some(k) = key else {
+                    // No key found for this pair: a search failure, not a
+                    // fleet failure. Say so rather than quietly skipping it.
+                    bad.push(format!("pair {i}: no probe key synthesised"));
+                    continue;
+                };
+                let got = call_seq_on(
+                    proxy,
+                    &edge,
+                    &[&["AUTH", token], &["SET", k, "1"], &["GET", k]],
+                    t,
+                    true,
+                );
+                if !matches!(got, Ok(Value::Bulk(Some(ref b))) if b == b"1") {
+                    bad.push(format!("pair {i}: {got:?}"));
+                }
+                let _ = call_seq_on(proxy, &edge, &[&["AUTH", token], &["DEL", k]], t, true);
+            }
+            note(
+                bad.is_empty(),
+                &format!("write/read round trip on all {npairs} pair(s)"),
+                if bad.is_empty() {
+                    String::new()
+                } else {
+                    format!("{} (pair by default slot map)", bad.join("; "))
+                },
+            );
             // Inline command support: `redis-cli --pipe` and telnet debugging
             // both depend on it, and it failed silently when absent.
             note(
