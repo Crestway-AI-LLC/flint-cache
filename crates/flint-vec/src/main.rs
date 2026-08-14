@@ -13,12 +13,21 @@
 //! command's channel to SCAN + GET the reserved-prefix rows, and replies
 //! `-LOADING`; the client retries and is served once the index is warm.
 //!
-//! v0.1 is PLAINTEXT, exactly like the ADR-0010 drill stand-ins the proxy
-//! dials over plain TCP without `--internal-cert`; mesh TLS (a serverAuth-only
-//! leaf, ADR-0010 D5) is a follow-on. Rebuild rides one channel, so its size is
-//! bounded by the proxy's `--family-budget`/`--family-deadline-ms`; a vector
-//! deployment raises those from the shed-order defaults. A set larger than one
-//! channel allows rebuilds partially (logged) — multi-channel bulk load is v0.2.
+//! Mesh TLS (ADR-0010 D5) is opt-in and matches the rest of the fleet's flag
+//! convention. With `--internal-ca/--internal-cert/--internal-key` the inbound
+//! FLINTFAM listener is a mutual-TLS server that presents the co-processor's
+//! **serverAuth-only** leaf (`coproc.crt`, minted by flintctl) and verifies the
+//! proxy's mesh client leaf — the co-processor holds no clientAuth credential,
+//! so it can never dial the mesh as a member (that absence IS the isolation
+//! boundary). With `--client-tls` the outbound PROXYCHAN dial-back to the proxy
+//! edge is an edge client that verifies the edge's server cert against the same
+//! CA and presents nothing (edge auth is the channel token, not a cert). Omit
+//! the flags and every hop is plaintext, exactly like the ADR-0010 stand-ins.
+//!
+//! Rebuild rides one channel, so its size is bounded by the proxy's
+//! `--family-budget`/`--family-deadline-ms`; a vector deployment raises those
+//! from the shed-order defaults. A set larger than one channel allows rebuilds
+//! partially (logged) — multi-channel bulk load is v0.2.
 
 use flint_resp::{Decoded, Value, decode, encode};
 use flint_vec::{
@@ -45,6 +54,21 @@ type LoadedConfig = (Vec<u8>, usize, Metric, IndexKind);
 /// A decoded vector row awaiting install: `(set, id, vector, meta, expires_at)`.
 type LoadedVector = (Vec<u8>, Vec<u8>, Vec<f32>, Option<Vec<u8>>, Option<u64>);
 
+/// The co-processor's mesh identity (ADR-0010 D5). Cheaply cloned (Arcs) into
+/// every connection and rebuild thread. Both fields `None` = all-plaintext.
+#[derive(Clone, Default)]
+struct Tls {
+    /// Inbound FLINTFAM listener: a mutual-TLS server presenting the co-proc's
+    /// serverAuth-only leaf and verifying the proxy's mesh client leaf. Hot-
+    /// reloadable so `rotate-certs` swaps the leaf without a restart.
+    inbound: Option<Arc<flint_tls::ReloadableServerConfig>>,
+    /// Outbound PROXYCHAN dial-back to the proxy edge: verify the edge server
+    /// cert against the internal CA, present no client cert. Built once — the CA
+    /// is stable across leaf rotations, and this is the only thing the edge dial
+    /// needs.
+    edge: Option<Arc<flint_tls::ClientConfig>>,
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let port: u16 = arg(&args, "--port")
@@ -61,13 +85,20 @@ fn main() {
     initial.set_index_cap(index_cap);
     let store: Arc<Mutex<Store>> = Arc::new(Mutex::new(initial));
     let loads: Loads = Arc::new(Mutex::new(HashMap::new()));
+    let tls = build_tls(&args);
     let listener = TcpListener::bind(&bind).unwrap_or_else(|e| panic!("bind {bind}: {e}"));
     let cap_note = if index_cap == 0 {
         "index mem unlimited".to_string()
     } else {
         format!("index mem cap {index_cap} B/ns")
     };
-    eprintln!("flint-vec co-processor on {bind} (plaintext, v0.2 flat+hnsw, {cap_note})");
+    let tls_note = match (tls.inbound.is_some(), tls.edge.is_some()) {
+        (false, false) => "plaintext",
+        (true, false) => "mesh mTLS",
+        (true, true) => "mesh mTLS + edge TLS",
+        (false, true) => "edge TLS only",
+    };
+    eprintln!("flint-vec co-processor on {bind} ({tls_note}, v0.2 flat+hnsw, {cap_note})");
 
     // Background reclamation of expired vectors. Reads/searches already mask an
     // expired id the instant its deadline passes (so cadence is not a correctness
@@ -90,8 +121,8 @@ fn main() {
     }
 
     for conn in listener.incoming().flatten() {
-        let (store, loads) = (store.clone(), loads.clone());
-        std::thread::spawn(move || serve(conn, store, loads));
+        let (store, loads, tls) = (store.clone(), loads.clone(), tls.clone());
+        std::thread::spawn(move || serve(conn, store, loads, tls));
     }
 }
 
@@ -102,9 +133,48 @@ fn arg(args: &[String], flag: &str) -> Option<String> {
         .cloned()
 }
 
+/// Build the mesh-TLS identity from the flags (ADR-0010 D5). The three
+/// `--internal-*` flags are all-or-nothing (matching flint-server/flint-proxy);
+/// `--client-tls` additionally TLS-wraps the PROXYCHAN dial-back and reuses the
+/// internal CA to verify the edge.
+fn build_tls(args: &[String]) -> Tls {
+    let inbound = match (
+        arg(args, "--internal-ca"),
+        arg(args, "--internal-cert"),
+        arg(args, "--internal-key"),
+    ) {
+        (Some(ca), Some(cert), Some(key)) => Some(
+            flint_tls::ReloadableServerConfig::watch(&ca, &cert, &key)
+                .unwrap_or_else(|e| panic!("internal TLS config: {e}")),
+        ),
+        (None, None, None) => None,
+        _ => panic!("--internal-ca, --internal-cert, --internal-key must be given together"),
+    };
+    let edge = if args.iter().any(|a| a == "--client-tls") {
+        let ca = arg(args, "--internal-ca").unwrap_or_else(|| {
+            panic!(
+                "--client-tls needs --internal-ca (the edge is verified against the internal CA)"
+            )
+        });
+        Some(flint_tls::edge_client_config(&ca).unwrap_or_else(|e| panic!("edge TLS config: {e}")))
+    } else {
+        None
+    };
+    Tls { inbound, edge }
+}
+
 /// One FLINTFAM connection from the proxy (its co-proc pool keeps the
 /// connection warm and sends one command at a time over it).
-fn serve(mut stream: TcpStream, store: Arc<Mutex<Store>>, loads: Loads) {
+fn serve(tcp: TcpStream, store: Arc<Mutex<Store>>, loads: Loads, tls: Tls) {
+    // Drive the server-side handshake when mesh TLS is on: present the co-proc's
+    // serverAuth-only leaf and REQUIRE + verify the proxy's mesh client leaf. A
+    // plaintext prober or any dialer without a CA-signed client cert fails the
+    // handshake on first read and drops — the isolation boundary at the transport.
+    let cfg = tls.inbound.as_ref().and_then(|r| r.current());
+    let mut stream = match flint_tls::accept(tcp, &cfg) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
     let _ = stream.set_read_timeout(Some(Duration::from_secs(60)));
     let mut buf = Vec::new();
     let mut chunk = [0u8; 16 * 1024];
@@ -123,7 +193,7 @@ fn serve(mut stream: TcpStream, store: Arc<Mutex<Store>>, loads: Loads) {
             },
             Err(_) => return, // protocol error: drop the connection
         };
-        let reply = handle_flintfam(&frame, &store, &loads);
+        let reply = handle_flintfam(&frame, &store, &loads, &tls);
         let mut out = Vec::new();
         encode(&reply, &mut out);
         if stream.write_all(&out).is_err() {
@@ -135,7 +205,7 @@ fn serve(mut stream: TcpStream, store: Arc<Mutex<Store>>, loads: Loads) {
 /// Parse `FLINTFAM <token> <callback> <ns> <cmd...>`. Gate on the namespace's
 /// load state (rebuild-on-first-touch, D3), then plan the command; for a write
 /// perform the durable side over the channel before committing.
-fn handle_flintfam(frame: &Value, store: &Arc<Mutex<Store>>, loads: &Loads) -> Value {
+fn handle_flintfam(frame: &Value, store: &Arc<Mutex<Store>>, loads: &Loads, tls: &Tls) -> Value {
     let Value::Array(Some(parts)) = frame else {
         return err("ERR expected FLINTFAM array");
     };
@@ -167,8 +237,8 @@ fn handle_flintfam(frame: &Value, store: &Arc<Mutex<Store>>, loads: &Loads) -> V
                 lk.insert(ns.to_vec(), LoadState::Loading);
                 drop(lk);
                 let (ns, token, callback) = (ns.to_vec(), token.to_vec(), callback.to_vec());
-                let (store, loads) = (store.clone(), loads.clone());
-                std::thread::spawn(move || rebuild(ns, token, callback, store, loads));
+                let (store, loads, edge) = (store.clone(), loads.clone(), tls.edge.clone());
+                std::thread::spawn(move || rebuild(ns, token, callback, store, loads, edge));
                 return err("LOADING vector index is warming, retry");
             }
         }
@@ -180,15 +250,17 @@ fn handle_flintfam(frame: &Value, store: &Arc<Mutex<Store>>, loads: &Loads) -> V
         .plan(ns, &cmd_args, now_ms());
     match plan {
         Plan::Reply(v) => v,
-        Plan::Write { persist, apply, ok } => match perform_persist(callback, token, &persist) {
-            Ok(()) => {
-                store.lock().expect("store lock").commit(ns, apply);
-                ok
+        Plan::Write { persist, apply, ok } => {
+            match perform_persist(callback, token, &persist, &tls.edge) {
+                Ok(()) => {
+                    store.lock().expect("store lock").commit(ns, apply);
+                    ok
+                }
+                // A shed or failed durable write (e.g. -QUOTA on an over-quota
+                // tenant) is relayed; the index is left untouched.
+                Err(e) => e,
             }
-            // A shed or failed durable write (e.g. -QUOTA on an over-quota
-            // tenant) is relayed; the index is left untouched.
-            Err(e) => e,
-        },
+        }
     }
 }
 
@@ -197,8 +269,15 @@ fn handle_flintfam(frame: &Value, store: &Arc<Mutex<Store>>, loads: &Loads) -> V
 /// logs, so a persistent fault cannot pin the namespace in `-LOADING` forever —
 /// subsequent `VEC.SET`s repopulate. Runs on its own thread with the first
 /// command's token; the channel it opens is the rebuild's whole budget.
-fn rebuild(ns: Vec<u8>, token: Vec<u8>, callback: Vec<u8>, store: Arc<Mutex<Store>>, loads: Loads) {
-    match rebuild_inner(&ns, &token, &callback, &store) {
+fn rebuild(
+    ns: Vec<u8>,
+    token: Vec<u8>,
+    callback: Vec<u8>,
+    store: Arc<Mutex<Store>>,
+    loads: Loads,
+    edge: Option<Arc<flint_tls::ClientConfig>>,
+) {
+    match rebuild_inner(&ns, &token, &callback, &store, &edge) {
         Ok(n) => eprintln!(
             "flint-vec: rebuilt ns {:?} ({n} vectors) from durable rows",
             String::from_utf8_lossy(&ns)
@@ -219,9 +298,10 @@ fn rebuild_inner(
     token: &[u8],
     callback: &[u8],
     store: &Arc<Mutex<Store>>,
+    edge: &Option<Arc<flint_tls::ClientConfig>>,
 ) -> Result<usize, String> {
     let addr = std::str::from_utf8(callback).map_err(|_| "bad callback".to_string())?;
-    let mut ch = TcpStream::connect(addr).map_err(|e| format!("channel dial: {e}"))?;
+    let mut ch = flint_tls::connect_edge(addr, edge).map_err(|e| format!("channel dial: {e}"))?;
     let _ = ch.set_read_timeout(Some(Duration::from_secs(5)));
     let _ = ch.set_write_timeout(Some(Duration::from_secs(5)));
     send_cmd(&mut ch, &[b"PROXYCHAN", token]).map_err(|e| format!("channel open: {e}"))?;
@@ -327,7 +407,7 @@ fn install(
 }
 
 /// One SCAN page over the channel: `(next_cursor, keys)`.
-fn scan_page(ch: &mut TcpStream, cursor: &[u8]) -> Result<(Vec<u8>, Vec<Vec<u8>>), String> {
+fn scan_page(ch: &mut flint_tls::Stream, cursor: &[u8]) -> Result<(Vec<u8>, Vec<Vec<u8>>), String> {
     send_cmd(ch, &[b"SCAN", cursor, b"COUNT", b"512"]).map_err(|e| format!("SCAN: {e}"))?;
     match read_reply(ch).map_err(|e| format!("SCAN: {e}"))? {
         Value::Array(Some(items)) if items.len() == 2 => {
@@ -355,9 +435,14 @@ fn scan_page(ch: &mut TcpStream, cursor: &[u8]) -> Result<(Vec<u8>, Vec<Vec<u8>>
 /// Open a single-use `PROXYCHAN` channel to the proxy edge and perform one
 /// durable data command. `Ok(())` on a non-error reply; `Err(reply)` carries
 /// the channel's error for the co-processor to relay to the client.
-fn perform_persist(callback: &[u8], token: &[u8], persist: &Persist) -> Result<(), Value> {
+fn perform_persist(
+    callback: &[u8],
+    token: &[u8],
+    persist: &Persist,
+    edge: &Option<Arc<flint_tls::ClientConfig>>,
+) -> Result<(), Value> {
     let addr = std::str::from_utf8(callback).map_err(|_| err("ERR bad callback address"))?;
-    let mut ch = TcpStream::connect(addr)
+    let mut ch = flint_tls::connect_edge(addr, edge)
         .map_err(|e| err(&format!("COPROCUNAVAIL channel dial failed: {e}")))?;
     let _ = ch.set_read_timeout(Some(Duration::from_secs(5)));
     let _ = ch.set_write_timeout(Some(Duration::from_secs(5)));
@@ -399,7 +484,7 @@ fn perform_persist(callback: &[u8], token: &[u8], persist: &Persist) -> Result<(
     }
 }
 
-fn send_cmd(ch: &mut TcpStream, parts: &[&[u8]]) -> std::io::Result<()> {
+fn send_cmd(ch: &mut flint_tls::Stream, parts: &[&[u8]]) -> std::io::Result<()> {
     let arr = Value::Array(Some(
         parts
             .iter()
@@ -411,7 +496,7 @@ fn send_cmd(ch: &mut TcpStream, parts: &[&[u8]]) -> std::io::Result<()> {
     ch.write_all(&out)
 }
 
-fn read_reply(ch: &mut TcpStream) -> std::io::Result<Value> {
+fn read_reply(ch: &mut flint_tls::Stream) -> std::io::Result<Value> {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 4096];
     loop {

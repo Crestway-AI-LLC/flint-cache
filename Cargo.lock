@@ -668,6 +668,7 @@ name = "flint-vec"
 version = "0.0.1"
 dependencies = [
  "flint-resp",
+ "flint-tls",
 ]
 
 [[package]]
