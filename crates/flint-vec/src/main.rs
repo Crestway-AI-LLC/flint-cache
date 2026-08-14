@@ -24,10 +24,15 @@
 //! CA and presents nothing (edge auth is the channel token, not a cert). Omit
 //! the flags and every hop is plaintext, exactly like the ADR-0010 stand-ins.
 //!
-//! Rebuild rides one channel, so its size is bounded by the proxy's
-//! `--family-budget`/`--family-deadline-ms`; a vector deployment raises those
-//! from the shed-order defaults. A set larger than one channel allows rebuilds
-//! partially (logged) — multi-channel bulk load is v0.2.
+//! Rebuild is RESUMABLE across channels (D3): each channel is bounded by the
+//! proxy's `--family-budget` (a per-channel data-command count), so a set larger
+//! than one channel is loaded over several — each `FLINTFAM` retry donates a
+//! fresh channel, the co-processor GETs as many rows as that budget allows, and
+//! the namespace is marked warm only when the LAST row is in. A partially-loaded
+//! index is never served (a partial k-NN is a wrong answer, not a slow one). The
+//! one bound is that a set's KEY LIST must fit a single channel's SCAN — keys
+//! are tiny next to the vectors, and a set that overflows even that surfaces a
+//! raise-the-budget error rather than a silent partial.
 
 use flint_resp::{Decoded, Value, decode, encode};
 use flint_vec::{
@@ -40,14 +45,41 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-/// Per-namespace load state: absent = never touched; `Loading` = a background
-/// rebuild is in flight (commands get `-LOADING`); `Loaded` = the index
-/// reflects the durable rows and serves normally.
+/// Per-namespace load state: absent = never touched; `Loading` = a rebuild is
+/// in flight or paused between channels (commands get `-LOADING`); `Loaded` = the
+/// index reflects every durable row and serves normally.
+///
+/// A large set can exceed one channel's data-command budget (D3), so the rebuild
+/// resumes across channels: each `FLINTFAM` retry donates a fresh budget, and the
+/// namespace is marked `Loaded` ONLY when the last row is in — a partially-loaded
+/// index is never served (a partial k-NN is a wrong answer, not a slow one).
 enum LoadState {
-    Loading,
+    Loading {
+        /// A chunk is actively draining a channel right now (guards against two
+        /// chunks racing on one namespace).
+        running: bool,
+        /// The ordered durable-key list (configs before vectors) — `None` until
+        /// the first chunk's SCAN completes.
+        keys: Option<Vec<Vec<u8>>>,
+        /// GET cursor into `keys`: how many have been fetched and installed.
+        next: usize,
+    },
     Loaded,
 }
 type Loads = Arc<Mutex<HashMap<Vec<u8>, LoadState>>>;
+
+/// The result of one rebuild chunk (one channel's worth of budget).
+enum Chunk {
+    /// Every row is loaded; the set is warm. Carries the total vector count.
+    Done(usize),
+    /// The channel's budget ran out; carries the ordered keys and the GET cursor
+    /// to resume from on the next channel, plus how many this chunk installed.
+    More {
+        keys: Vec<Vec<u8>>,
+        next: usize,
+        installed: usize,
+    },
+}
 
 /// A decoded config row awaiting install: `(set, dim, metric, index)`.
 type LoadedConfig = (Vec<u8>, usize, Metric, IndexKind);
@@ -225,22 +257,42 @@ fn handle_flintfam(frame: &Value, store: &Arc<Mutex<Store>>, loads: &Loads, tls:
     let (token, callback, ns) = (bulks[1], bulks[2], bulks[3]);
     let cmd_args: Vec<Vec<u8>> = bulks[4..].iter().map(|b| b.to_vec()).collect();
 
-    // Load gate (D3): serve only a warm namespace. The first touch spawns the
-    // rebuild (reusing this command's channel) and answers -LOADING; the client
-    // retries and lands on a warm index.
+    // Load gate (D3): serve only a fully-warm namespace. A cold or paused
+    // namespace claims THIS command's channel to run one rebuild chunk (resuming
+    // where the previous channel's budget ran out) and answers -LOADING; the
+    // client retries, donating another channel, until the whole set is in. `keys`
+    // being cloned into both the state and the thread lets a concurrent retry see
+    // `running` without waiting on the chunk.
     {
         let mut lk = loads.lock().expect("loads lock");
-        match lk.get(ns) {
-            Some(LoadState::Loaded) => {}
-            Some(LoadState::Loading) => return err("LOADING vector index is warming, retry"),
-            None => {
-                lk.insert(ns.to_vec(), LoadState::Loading);
-                drop(lk);
-                let (ns, token, callback) = (ns.to_vec(), token.to_vec(), callback.to_vec());
-                let (store, loads, edge) = (store.clone(), loads.clone(), tls.edge.clone());
-                std::thread::spawn(move || rebuild(ns, token, callback, store, loads, edge));
+        let resume = match lk.get(ns) {
+            Some(LoadState::Loaded) => None,
+            Some(LoadState::Loading { running: true, .. }) => {
                 return err("LOADING vector index is warming, retry");
             }
+            Some(LoadState::Loading {
+                running: false,
+                keys,
+                next,
+            }) => Some((keys.clone(), *next)),
+            None => Some((None, 0)),
+        };
+        if let Some((keys, next)) = resume {
+            lk.insert(
+                ns.to_vec(),
+                LoadState::Loading {
+                    running: true,
+                    keys: keys.clone(),
+                    next,
+                },
+            );
+            drop(lk);
+            let (ns, token, callback) = (ns.to_vec(), token.to_vec(), callback.to_vec());
+            let (store, loads, edge) = (store.clone(), loads.clone(), tls.edge.clone());
+            std::thread::spawn(move || {
+                rebuild_chunk(ns, token, callback, store, loads, edge, keys, next)
+            });
+            return err("LOADING vector index is warming, retry");
         }
     }
 
@@ -264,42 +316,76 @@ fn handle_flintfam(frame: &Value, store: &Arc<Mutex<Store>>, loads: &Loads, tls:
     }
 }
 
-/// Rebuild a namespace's index from its durable rows, then mark it `Loaded`.
-/// Fails OPEN: on any error it still marks `Loaded` (serving what loaded) and
-/// logs, so a persistent fault cannot pin the namespace in `-LOADING` forever —
-/// subsequent `VEC.SET`s repopulate. Runs on its own thread with the first
-/// command's token; the channel it opens is the rebuild's whole budget.
-fn rebuild(
+/// Run ONE rebuild chunk on `token`'s channel: continue the SCAN (first chunk)
+/// and GET as many rows as the channel's data-command budget allows, installing
+/// them. Marks the namespace `Loaded` only when the LAST row is in; otherwise
+/// saves the resume point and stays `Loading` for the next channel. On a
+/// transient channel failure it clears `running` (keeping prior progress) so the
+/// next touch retries — a partially-loaded index is NEVER marked warm (D3: a
+/// partial k-NN is a wrong answer, not a slow one).
+#[allow(clippy::too_many_arguments)]
+fn rebuild_chunk(
     ns: Vec<u8>,
     token: Vec<u8>,
     callback: Vec<u8>,
     store: Arc<Mutex<Store>>,
     loads: Loads,
     edge: Option<Arc<flint_tls::ClientConfig>>,
+    keys: Option<Vec<Vec<u8>>>,
+    next: usize,
 ) {
-    match rebuild_inner(&ns, &token, &callback, &store, &edge) {
-        Ok(n) => eprintln!(
-            "flint-vec: rebuilt ns {:?} ({n} vectors) from durable rows",
-            String::from_utf8_lossy(&ns)
-        ),
-        Err(e) => eprintln!(
-            "flint-vec: rebuild of ns {:?} incomplete: {e} (serving what loaded)",
-            String::from_utf8_lossy(&ns)
-        ),
+    let name = String::from_utf8_lossy(&ns).into_owned();
+    match rebuild_chunk_inner(&ns, &token, &callback, &store, &edge, keys, next) {
+        Ok(Chunk::Done(total)) => {
+            eprintln!("flint-vec: rebuilt ns {name:?} ({total} vectors) from durable rows");
+            loads
+                .lock()
+                .expect("loads lock")
+                .insert(ns, LoadState::Loaded);
+        }
+        Ok(Chunk::More {
+            keys,
+            next,
+            installed,
+        }) => {
+            eprintln!(
+                "flint-vec: ns {name:?} rebuild chunk loaded {installed} ({next}/{} keys); resuming on the next channel",
+                keys.len()
+            );
+            loads.lock().expect("loads lock").insert(
+                ns,
+                LoadState::Loading {
+                    running: false,
+                    keys: Some(keys),
+                    next,
+                },
+            );
+        }
+        Err(e) => {
+            eprintln!(
+                "flint-vec: ns {name:?} rebuild chunk failed: {e} (will retry on next touch; index not served partial)"
+            );
+            if let Some(LoadState::Loading { running, .. }) =
+                loads.lock().expect("loads lock").get_mut(&ns)
+            {
+                *running = false;
+            }
+        }
     }
-    loads
-        .lock()
-        .expect("loads lock")
-        .insert(ns, LoadState::Loaded);
 }
 
-fn rebuild_inner(
+/// The channel side of one rebuild chunk. Returns [`Chunk::Done`] when the last
+/// row lands, [`Chunk::More`] when the budget runs out mid-set (resume point
+/// attached), or `Err` for a transient failure the caller should retry.
+fn rebuild_chunk_inner(
     ns: &[u8],
     token: &[u8],
     callback: &[u8],
     store: &Arc<Mutex<Store>>,
     edge: &Option<Arc<flint_tls::ClientConfig>>,
-) -> Result<usize, String> {
+    keys: Option<Vec<Vec<u8>>>,
+    next: usize,
+) -> Result<Chunk, String> {
     let addr = std::str::from_utf8(callback).map_err(|_| "bad callback".to_string())?;
     let mut ch = flint_tls::connect_edge(addr, edge).map_err(|e| format!("channel dial: {e}"))?;
     let _ = ch.set_read_timeout(Some(Duration::from_secs(5)));
@@ -309,64 +395,90 @@ fn rebuild_inner(
         return Err(format!("channel refused: {e}"));
     }
 
-    // Enumerate the co-processor's rows: SCAN the namespace (cursor-paginated)
-    // and keep only KEY_PREFIX keys — a client-side filter, robust to any
-    // binary-MATCH glob quirk.
-    let mut cursor = b"0".to_vec();
-    let mut keys: Vec<Vec<u8>> = Vec::new();
-    loop {
-        let (next, page) = scan_page(&mut ch, &cursor)?;
-        keys.extend(page.into_iter().filter(|k| k.starts_with(KEY_PREFIX)));
-        if next == b"0" {
-            break;
+    // Phase 1 (first chunk only): SCAN the whole namespace, keep the reserved-
+    // prefix keys, and order them configs-before-vectors so a set exists before
+    // its Inserts commit — an ordering that must hold ACROSS chunks, hence one
+    // global sort here rather than per page. The SCAN must fit one channel (keys
+    // are tens of bytes; the vectors that dominate the budget come later); a set
+    // whose key list alone overflows a channel surfaces as a raise-the-budget
+    // error, never a silent partial.
+    let keys = match keys {
+        Some(k) => k,
+        None => {
+            let mut cursor = b"0".to_vec();
+            let mut all: Vec<Vec<u8>> = Vec::new();
+            loop {
+                let (nc, page) = scan_page(&mut ch, &cursor).map_err(|e| {
+                    if e.contains("budget") {
+                        format!(
+                            "the namespace key list exceeds one channel's SCAN budget ({e}); raise --family-budget"
+                        )
+                    } else {
+                        e
+                    }
+                })?;
+                all.extend(page.into_iter().filter(|k| k.starts_with(KEY_PREFIX)));
+                if nc == b"0" {
+                    break;
+                }
+                cursor = nc;
+            }
+            all.sort_by_key(|k| !matches!(parse_durable_key(k), Some((b'c', _, _))));
+            all
         }
-        cursor = next;
-    }
+    };
 
-    // GET each row and decode. Configs (kind 'c') must land before their
-    // vectors (kind 'v'), so a set exists when its Inserts commit. A channel
-    // error mid-scan (e.g. budget exhausted) stops collection; what was
-    // gathered is still installed, and the rebuild is reported partial.
+    // Phase 2: GET from `next` onward, installing each row, until the channel's
+    // data-command budget is exhausted (resume next chunk) or the set is done.
     let mut configs: Vec<LoadedConfig> = Vec::new();
     let mut vectors: Vec<LoadedVector> = Vec::new();
-    let mut partial: Option<String> = None;
-    for key in &keys {
-        let Some((kind, set, id)) = parse_durable_key(key) else {
+    let mut i = next;
+    let mut budget_done = false;
+    while i < keys.len() {
+        let Some((kind, set, id)) = parse_durable_key(&keys[i]) else {
+            i += 1;
             continue;
         };
-        if let Err(e) = send_cmd(&mut ch, &[b"GET", key]) {
-            partial = Some(format!("GET send: {e}"));
-            break;
-        }
-        match read_reply(&mut ch) {
-            Ok(Value::Bulk(Some(val))) if kind == b'c' => {
+        send_cmd(&mut ch, &[b"GET", &keys[i]]).map_err(|e| format!("GET send: {e}"))?;
+        match read_reply(&mut ch).map_err(|e| format!("GET read: {e}"))? {
+            Value::Bulk(Some(val)) if kind == b'c' => {
                 if let Some((dim, metric, index)) = decode_config(&val) {
                     configs.push((set, dim, metric, index));
                 }
+                i += 1;
             }
-            Ok(Value::Bulk(Some(val))) if kind == b'v' => {
+            Value::Bulk(Some(val)) if kind == b'v' => {
                 // The expiry rides the durable row, so a rebuilt index restores
                 // each id's TTL for free — no separate expiry store to replay.
                 if let Ok((vec, meta, expires_at)) = decode_vec_row(&val) {
                     vectors.push((set, id, vec, meta, expires_at));
                 }
+                i += 1;
             }
-            Ok(Value::Bulk(Some(_))) | Ok(Value::Null) | Ok(Value::Bulk(None)) => {} // skip
-            Ok(Value::Error(e)) => {
-                partial = Some(format!("channel error mid-rebuild: {e}"));
+            // A budget-exhausted channel is the EXPECTED end of a chunk, not a
+            // failure: install what this chunk got and resume from `i` next time.
+            Value::Error(e) if e.contains("budget") => {
+                budget_done = true;
                 break;
             }
-            Ok(_) => {} // unexpected shape: skip this key
-            Err(e) => {
-                partial = Some(format!("GET read: {e}"));
-                break;
-            }
+            Value::Error(e) => return Err(format!("channel error mid-rebuild: {e}")),
+            _ => i += 1, // null / wrong shape: skip
         }
     }
-    let n = install(store, ns, configs, vectors);
-    match partial {
-        Some(e) => Err(format!("{e} ({n} vectors installed first)")),
-        None => Ok(n),
+    install(store, ns, configs, vectors);
+    let installed = i - next;
+    if i >= keys.len() && !budget_done {
+        let total = keys
+            .iter()
+            .filter(|k| matches!(parse_durable_key(k), Some((b'v', _, _))))
+            .count();
+        Ok(Chunk::Done(total))
+    } else {
+        Ok(Chunk::More {
+            keys,
+            next: i,
+            installed,
+        })
     }
 }
 

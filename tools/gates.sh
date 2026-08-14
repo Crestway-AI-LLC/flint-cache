@@ -93,7 +93,7 @@ rm -rf "$LOGS"; mkdir -p "$LOGS"
 # discarded writes throughout. A drill outside the gate rots, and rots
 # silently.
 CORE="restart repl failover proxy slot_migrate slot_map rebalance_execute
-      bloom ns_escape coproc_cred coproc_channel family_route family_route_cp coproc_forward coproc_budget coproc_exempt coproc_vec coproc_vec_tls
+      bloom ns_escape coproc_cred coproc_channel family_route family_route_cp coproc_forward coproc_budget coproc_exempt coproc_vec coproc_vec_tls coproc_vec_rebuild
       tenant_quota token_rotation cert_reload_fleet controlplane_ha
       decommission config_file federation_plumbing disk_pressure ctl_error
       client_compat proxy_registry reseed lag_cap widowed_grace controller
