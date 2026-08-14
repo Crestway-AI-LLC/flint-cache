@@ -146,18 +146,32 @@ fleet_wait_listen 6678
 [ "$(vexec VEC.SET sess gone 0,1,0 PX 1200)" = "OK " ] || { echo "FAIL: VEC.SET sess gone PX"; exit 1; }
 case "$(vexec VEC.SEARCH sess 0,1,0 2)" in *gone*) : ;; *) echo "FAIL: TTL'd vector not searchable before expiry"; exit 1 ;; esac
 case "$(vexec VEC.GET sess gone)" in *"0,1,0"*) : ;; *) echo "FAIL: TTL'd VEC.GET before expiry"; exit 1 ;; esac
-echo "  before expiry: 'gone' is searchable"
+# Introspection: VEC.TTL -> -1 for permanent 'keep', a positive ms for 'gone'.
+case "$(vexec VEC.TTL sess keep)" in *-1*) : ;; *) echo "FAIL: VEC.TTL of a permanent id should be -1"; exit 1 ;; esac
+TT="$(vexec VEC.TTL sess gone)"; case "$TT" in -*) echo "FAIL: VEC.TTL 'gone' negative ($TT)"; exit 1 ;; *[0-9]*) : ;; *) echo "FAIL: VEC.TTL 'gone' not numeric ($TT)"; exit 1 ;; esac
+# Management: EXPIRE then PERSIST round-trip a TTL onto 'keep' and back off, leaving it permanent.
+[ "$(vexec VEC.EXPIRE sess keep 100)" = "1 " ] || { echo "FAIL: VEC.EXPIRE should return 1"; exit 1; }
+case "$(vexec VEC.TTL sess keep)" in *-1*) echo "FAIL: 'keep' should carry a TTL after EXPIRE"; exit 1 ;; esac
+[ "$(vexec VEC.PERSIST sess keep)" = "1 " ] || { echo "FAIL: VEC.PERSIST should return 1"; exit 1; }
+case "$(vexec VEC.TTL sess keep)" in *-1*) : ;; *) echo "FAIL: 'keep' should be permanent after PERSIST"; exit 1 ;; esac
+# INFO's expiring count sees the one live TTL'd id ('gone').
+case "$(vexec VEC.INFO sess)" in *expiring*1*) : ;; *) echo "FAIL: INFO expiring should be 1 before expiry"; exit 1 ;; esac
+echo "  before expiry: 'gone' searchable, VEC.TTL positive; EXPIRE/PERSIST round-trip on 'keep'"
 sleep 2.4   # past PX (1.2s) plus at least one sweep tick
 # The expired id reads absent and is masked from SEARCH; the permanent 'keep' stays.
 case "$(vexec VEC.GET sess gone)" in *"0,1,0"*) echo "FAIL: expired VEC.GET still returns the vector"; exit 1 ;; esac
 case "$(vexec VEC.SEARCH sess 0,1,0 5)" in *gone*) echo "FAIL: expired vector still in SEARCH"; exit 1 ;; esac
 case "$(vexec VEC.SEARCH sess 1,0,0 5)" in *keep*) : ;; *) echo "FAIL: permanent 'keep' vanished with the TTL'd one"; exit 1 ;; esac
-# The sweep reclaimed it from the index: INFO count is back to 1 (only 'keep').
+# VEC.TTL of the now-absent id is -2.
+case "$(vexec VEC.TTL sess gone)" in *-2*) : ;; *) echo "FAIL: VEC.TTL of an expired id should be -2"; exit 1 ;; esac
+# The sweep reclaimed it from the index: INFO count is back to 1 (only 'keep'), expiring 0.
 case "$(vexec VEC.INFO sess)" in *count*1*) : ;; *) echo "FAIL: sweep did not reclaim the expired id (count != 1)"; exit 1 ;; esac
+case "$(vexec VEC.INFO sess)" in *expiring*0*) : ;; *) echo "FAIL: INFO expiring should be 0 after expiry"; exit 1 ;; esac
 grep -qi "swept" "$D/vec4.log" || { echo "FAIL: no expiry sweep logged"; exit 1; }
-echo "  after expiry: 'gone' masked and swept; 'keep' still served"
+echo "  after expiry: 'gone' masked/swept, VEC.TTL -2; 'keep' still served"
 
 echo "PASS: flint-vec serves VEC.* end to end (flat + hnsw), writes are durable, a"
 echo "      restarted co-processor rebuilds each set from KV (D3) as its own engine kind,"
 echo "      a per-namespace index-memory cap (D4) sheds new writes with -VECFULL, and a"
-echo "      per-vector TTL (D7) expires and is swept from the index while permanent ids stay."
+echo "      per-vector TTL (D7) expires+sweeps while permanent ids stay — with VEC.TTL/"
+echo "      EXPIRE/PERSIST introspection and the INFO expiring count over the wire."

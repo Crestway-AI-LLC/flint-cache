@@ -195,6 +195,16 @@ impl VectorSet {
         self.expiry.get(id).is_some_and(|&e| e <= now)
     }
 
+    /// The absolute expiry (ms since epoch) for `id`, or None if it has no TTL.
+    fn expiry_at(&self, id: &[u8]) -> Option<u64> {
+        self.expiry.get(id).copied()
+    }
+
+    /// Ids that currently carry a not-yet-expired TTL — for VEC.INFO.
+    fn ttl_count(&self, now: u64) -> usize {
+        self.expiry.values().filter(|&&e| e > now).count()
+    }
+
     /// How many indexed ids have already expired — how far to over-fetch a
     /// top-k so expired hits cannot starve the k live ones.
     fn expired_count(&self, now: u64) -> usize {
@@ -569,7 +579,11 @@ impl Store {
             b"VEC.GET" => Plan::Reply(self.get(ns, args, now)),
             b"VEC.DEL" => self.plan_del(ns, args),
             b"VEC.SEARCH" => Plan::Reply(self.search(ns, args, now)),
-            b"VEC.INFO" => Plan::Reply(self.info(ns, args)),
+            b"VEC.INFO" => Plan::Reply(self.info(ns, args, now)),
+            b"VEC.TTL" => Plan::Reply(self.ttl(ns, args, now)),
+            b"VEC.EXPIRE" => self.plan_expire(ns, args, now, 1000),
+            b"VEC.PEXPIRE" => self.plan_expire(ns, args, now, 1),
+            b"VEC.PERSIST" => self.plan_persist(ns, args, now),
             other => Plan::Reply(err(&format!(
                 "ERR unknown VEC command '{}'",
                 String::from_utf8_lossy(other)
@@ -925,7 +939,7 @@ impl Store {
         Value::Array(Some(rows))
     }
 
-    fn info(&self, ns: &[u8], args: &[Vec<u8>]) -> Value {
+    fn info(&self, ns: &[u8], args: &[Vec<u8>], now: u64) -> Value {
         if args.len() < 2 {
             return err("ERR VEC.INFO <set>");
         }
@@ -942,6 +956,11 @@ impl Store {
             bulk(vs.index_name()),
             bulk("count"),
             Value::Integer(vs.len() as i64),
+            // How many of `count` carry a live TTL — the ephemeral-memory feature
+            // made observable (D7), so a tenant sees permanent vs expiring at a
+            // glance without walking the set.
+            bulk("expiring"),
+            Value::Integer(vs.ttl_count(now) as i64),
             // Namespace-wide (D4): this tenant's estimated index RAM and its cap
             // (0 = unlimited). Reported here so a tenant can see the headroom.
             bulk("ns_mem_bytes"),
@@ -949,6 +968,109 @@ impl Store {
             bulk("ns_mem_cap"),
             Value::Integer(self.index_cap as i64),
         ]))
+    }
+
+    /// VEC.TTL <set> <id> — remaining life in ms (PTTL semantics): `>= 0` ms when
+    /// the id is live and carries a TTL, `-1` when it exists without one, `-2`
+    /// when it is absent or already expired.
+    fn ttl(&self, ns: &[u8], args: &[Vec<u8>], now: u64) -> Value {
+        if args.len() < 3 {
+            return err("ERR VEC.TTL <set> <id>");
+        }
+        let Some(vs) = self.sets.get(&(ns.to_vec(), args[1].to_vec())) else {
+            return err("ERR no such set");
+        };
+        let id = &args[2];
+        // Expired-but-unswept, or never present: report absent, matching VEC.GET.
+        if vs.is_expired(id, now) || !vs.contains(id) {
+            return Value::Integer(-2);
+        }
+        match vs.expiry_at(id) {
+            Some(e) => Value::Integer(e.saturating_sub(now) as i64),
+            None => Value::Integer(-1),
+        }
+    }
+
+    /// VEC.EXPIRE <set> <id> <secs> / VEC.PEXPIRE <set> <id> <ms> (`unit_ms` is
+    /// 1000 or 1): (re)set the TTL on an existing live id WITHOUT resending the
+    /// vector — the co-processor already holds it, so it re-encodes the durable
+    /// row with the new deadline. Redis EXPIRE reply: 1 applied, 0 if the id is
+    /// absent or already expired.
+    fn plan_expire(&self, ns: &[u8], args: &[Vec<u8>], now: u64, unit_ms: u64) -> Plan {
+        if args.len() < 4 {
+            return Plan::Reply(err("ERR VEC.EXPIRE <set> <id> <ttl>"));
+        }
+        let (set, id) = (&args[1], &args[2]);
+        let Some(vs) = self.sets.get(&(ns.to_vec(), set.to_vec())) else {
+            return Plan::Reply(err("ERR no such set"));
+        };
+        if vs.is_expired(id, now) {
+            return Plan::Reply(Value::Integer(0));
+        }
+        let Some((vec, meta)) = vs.get(id) else {
+            return Plan::Reply(Value::Integer(0));
+        };
+        let ttl_ms = match std::str::from_utf8(&args[3])
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+        {
+            Some(n) if n > 0 => n.saturating_mul(unit_ms),
+            _ => return Plan::Reply(err("ERR ttl must be a positive integer")),
+        };
+        let expires_at = now.saturating_add(ttl_ms);
+        Plan::Write {
+            persist: Persist::Put {
+                key: durable_key(b'v', set, id),
+                val: encode_vec_row(&vec, meta.as_deref(), Some(expires_at)),
+                ttl_ms: Some(ttl_ms),
+            },
+            apply: Apply::Insert {
+                set: set.to_vec(),
+                id: id.to_vec(),
+                vec,
+                meta,
+                expires_at: Some(expires_at),
+            },
+            ok: Value::Integer(1),
+        }
+    }
+
+    /// VEC.PERSIST <set> <id>: remove the TTL, making the id permanent. Rewrites
+    /// the durable row without an expiry header and re-`SET`s the data-plane key
+    /// with no PX (so its native TTL clears too). Redis PERSIST reply: 1 if a TTL
+    /// was removed, 0 if the id is absent/expired or already permanent.
+    fn plan_persist(&self, ns: &[u8], args: &[Vec<u8>], now: u64) -> Plan {
+        if args.len() < 3 {
+            return Plan::Reply(err("ERR VEC.PERSIST <set> <id>"));
+        }
+        let (set, id) = (&args[1], &args[2]);
+        let Some(vs) = self.sets.get(&(ns.to_vec(), set.to_vec())) else {
+            return Plan::Reply(err("ERR no such set"));
+        };
+        if vs.is_expired(id, now) {
+            return Plan::Reply(Value::Integer(0));
+        }
+        let Some((vec, meta)) = vs.get(id) else {
+            return Plan::Reply(Value::Integer(0));
+        };
+        if vs.expiry_at(id).is_none() {
+            return Plan::Reply(Value::Integer(0)); // nothing to persist
+        }
+        Plan::Write {
+            persist: Persist::Put {
+                key: durable_key(b'v', set, id),
+                val: encode_vec_row(&vec, meta.as_deref(), None),
+                ttl_ms: None,
+            },
+            apply: Apply::Insert {
+                set: set.to_vec(),
+                id: id.to_vec(),
+                vec,
+                meta,
+                expires_at: None,
+            },
+            ok: Value::Integer(1),
+        }
     }
 }
 
@@ -1385,15 +1507,19 @@ mod tests {
             run(&mut st, ns, &cmd(&["VEC.SET", "s", "c", "0,0,1,0"])),
             Value::Simple("OK".into())
         );
-        // INFO surfaces the cap and non-zero usage for this namespace.
+        // INFO surfaces the cap and non-zero usage for this namespace, plus the
+        // expiring count (0 here — none of these ids carry a TTL).
         match run(&mut st, ns, &cmd(&["VEC.INFO", "s"])) {
             Value::Array(Some(f)) => {
-                assert_eq!(f[10], Value::Bulk(Some(b"ns_mem_cap".to_vec())));
-                assert_eq!(f[11], Value::Integer(200));
+                assert_eq!(f[8], Value::Bulk(Some(b"expiring".to_vec())));
+                assert_eq!(f[9], Value::Integer(0));
+                assert_eq!(f[10], Value::Bulk(Some(b"ns_mem_bytes".to_vec())));
                 assert!(
-                    matches!(f[9], Value::Integer(n) if n > 0),
+                    matches!(f[11], Value::Integer(n) if n > 0),
                     "ns_mem_bytes > 0"
                 );
+                assert_eq!(f[12], Value::Bulk(Some(b"ns_mem_cap".to_vec())));
+                assert_eq!(f[13], Value::Integer(200));
             }
             other => panic!("INFO should be an array, got {other:?}"),
         }
@@ -1637,6 +1763,131 @@ mod tests {
             plan_reply(&st, ns, &cmd(&["VEC.GET", "s", "z"]), 500),
             Value::Null,
             "restored TTL fires on the same deadline"
+        );
+    }
+
+    #[test]
+    fn ttl_introspection_via_vec_ttl_and_info() {
+        let mut st = Store::new();
+        let ns = b"nsM";
+        run(
+            &mut st,
+            ns,
+            &cmd(&["VEC.CREATE", "s", "DIM", "2", "METRIC", "l2"]),
+        );
+
+        // Permanent id -> -1; absent id -> -2 (PTTL semantics).
+        run_at(&mut st, ns, &cmd(&["VEC.SET", "s", "perm", "1,0"]), 0);
+        assert_eq!(
+            plan_reply(&st, ns, &cmd(&["VEC.TTL", "s", "perm"]), 0),
+            Value::Integer(-1)
+        );
+        assert_eq!(
+            plan_reply(&st, ns, &cmd(&["VEC.TTL", "s", "nope"]), 0),
+            Value::Integer(-2)
+        );
+
+        // TTL'd id -> remaining ms, counting down with the clock; -2 once expired.
+        run_at(
+            &mut st,
+            ns,
+            &cmd(&["VEC.SET", "s", "temp", "0,1", "PX", "1000"]),
+            0,
+        );
+        assert_eq!(
+            plan_reply(&st, ns, &cmd(&["VEC.TTL", "s", "temp"]), 200),
+            Value::Integer(800)
+        );
+        assert_eq!(
+            plan_reply(&st, ns, &cmd(&["VEC.TTL", "s", "temp"]), 1000),
+            Value::Integer(-2)
+        );
+
+        // INFO's `expiring` counts only LIVE TTL'd ids ('perm' excluded)...
+        match plan_reply(&st, ns, &cmd(&["VEC.INFO", "s"]), 200) {
+            Value::Array(Some(f)) => {
+                assert_eq!(f[8], Value::Bulk(Some(b"expiring".to_vec())));
+                assert_eq!(f[9], Value::Integer(1), "only 'temp' is expiring");
+            }
+            other => panic!("INFO array, got {other:?}"),
+        }
+        // ...and drops to 0 once 'temp' lapses — a live count, not the raw map size.
+        match plan_reply(&st, ns, &cmd(&["VEC.INFO", "s"]), 2000) {
+            Value::Array(Some(f)) => assert_eq!(f[9], Value::Integer(0)),
+            other => panic!("INFO array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ttl_expire_and_persist_manage_lifetime_without_resend() {
+        let mut st = Store::new();
+        let ns = b"nsE";
+        run(
+            &mut st,
+            ns,
+            &cmd(&["VEC.CREATE", "s", "DIM", "2", "METRIC", "l2"]),
+        );
+        run_at(&mut st, ns, &cmd(&["VEC.SET", "s", "x", "1,2"]), 0); // permanent
+
+        // EXPIRE gives a permanent id a TTL (reply 1); TTL reflects it, and the
+        // vector is untouched (no resend).
+        assert_eq!(
+            run_at(&mut st, ns, &cmd(&["VEC.EXPIRE", "s", "x", "5"]), 1_000),
+            Value::Integer(1)
+        );
+        assert_eq!(
+            plan_reply(&st, ns, &cmd(&["VEC.TTL", "s", "x"]), 1_000),
+            Value::Integer(5000)
+        );
+        assert_eq!(
+            plan_reply(&st, ns, &cmd(&["VEC.GET", "s", "x"]), 1_000),
+            Value::Array(Some(vec![Value::Bulk(Some(b"1,2".to_vec()))]))
+        );
+
+        // The durable-row rewrite carries the new deadline + data-plane PX, so a
+        // rebuild and metering agree without the vector being resent.
+        match st.plan(ns, &cmd(&["VEC.EXPIRE", "s", "x", "7"]), 2_000) {
+            Plan::Write {
+                persist: Persist::Put { val, ttl_ms, .. },
+                ..
+            } => {
+                assert_eq!(ttl_ms, Some(7000));
+                let (vec, _, expires_at) = decode_vec_row(&val).expect("decode");
+                assert_eq!(vec, vec![1.0, 2.0], "stored vector preserved across EXPIRE");
+                assert_eq!(expires_at, Some(2_000 + 7000));
+            }
+            _ => panic!("EXPIRE on a live id plans a write"),
+        }
+
+        // PEXPIRE overrides in ms; PERSIST removes the TTL (reply 1 -> then -1).
+        assert_eq!(
+            run_at(&mut st, ns, &cmd(&["VEC.PEXPIRE", "s", "x", "250"]), 1_000),
+            Value::Integer(1)
+        );
+        assert_eq!(
+            plan_reply(&st, ns, &cmd(&["VEC.TTL", "s", "x"]), 1_000),
+            Value::Integer(250)
+        );
+        assert_eq!(
+            run_at(&mut st, ns, &cmd(&["VEC.PERSIST", "s", "x"]), 1_000),
+            Value::Integer(1)
+        );
+        assert_eq!(
+            plan_reply(&st, ns, &cmd(&["VEC.TTL", "s", "x"]), 1_000),
+            Value::Integer(-1)
+        );
+        // PERSIST with no TTL, and EXPIRE/PERSIST on an absent id, all report 0.
+        assert_eq!(
+            run_at(&mut st, ns, &cmd(&["VEC.PERSIST", "s", "x"]), 1_000),
+            Value::Integer(0)
+        );
+        assert_eq!(
+            run_at(&mut st, ns, &cmd(&["VEC.EXPIRE", "s", "ghost", "5"]), 1_000),
+            Value::Integer(0)
+        );
+        assert_eq!(
+            run_at(&mut st, ns, &cmd(&["VEC.PERSIST", "s", "ghost"]), 1_000),
+            Value::Integer(0)
         );
     }
 }
