@@ -299,6 +299,46 @@ fn insync_lineage_holder(states: &[Node]) -> Option<&Node> {
         .find(|n| n.reachable && n.epoch == top && n.live_replicas >= 1 && n.seq_lag == Some(0))
 }
 
+/// The member this controller last OBSERVED holding the pair's full lineage,
+/// still reachable but no longer claiming to be master (#171).
+///
+/// [`insync_lineage_holder`] asks "is someone RIGHT NOW provably holding the
+/// full lineage", and to answer yes it needs a live replica: `live_replicas >=
+/// 1 && seq_lag == Some(0)`. That question is UNANSWERABLE for a pair whose
+/// master died or self-fenced and whose partner has not re-attached — FLINTINFO
+/// renders `seq_lag` as the string "none" whenever no live replica is attached,
+/// so BOTH members report `live_replicas 0, seq_lag none` and nothing can
+/// satisfy it. The gate then refuses a pair that is sitting there intact, on
+/// every tick, forever. Measured on the 5 TB scale run: two pairs of four
+/// permanently write-dead with every node alive and holding its data.
+///
+/// So REMEMBER rather than re-derive. `remembered` is the member this
+/// controller last watched hold the whole lineage — a legitimate master with a
+/// caught-up replica, or the survivor it promoted itself. If that member is
+/// still reachable AND at the top epoch, promoting it cannot lose an
+/// acknowledged write: it had everything at the last observation, and this
+/// branch only runs when the pair has NO master, so nothing can have advanced
+/// past it since.
+///
+/// This is strictly MORE information than the live predicate, not weaker
+/// fencing. A survivor that was never observed in sync — the genuine degraded
+/// window, where the pair's data may only exist on a node we cannot reach —
+/// matches nothing here and still pages.
+fn remembered_lineage_holder<'a>(
+    states: &'a [Node],
+    remembered: Option<&(String, u32)>,
+) -> Option<&'a Node> {
+    let (addr, epoch) = remembered?;
+    let top = states
+        .iter()
+        .filter(|n| n.reachable)
+        .map(|n| n.epoch)
+        .max()?;
+    states
+        .iter()
+        .find(|n| n.reachable && n.epoch == top && n.epoch >= *epoch && &n.addr == addr)
+}
+
 /// What the decision loop publishes for the renewer: the master it currently
 /// believes in, and when it last said so.
 struct LeaseTarget {
@@ -517,6 +557,12 @@ struct Pair {
     /// the per-pair renewer thread — the decision loop no longer renews inline
     /// (#168 follow-up; see `spawn_lease_renewer`).
     lease: LeaseSlot,
+    /// (addr, epoch) of the member last OBSERVED holding the full lineage: a
+    /// legitimate master with a caught-up replica, or the survivor this
+    /// controller promoted. Read only by the degraded-window gate, to recover a
+    /// pair whose lineage holder is alive but has lost its replica (#171) —
+    /// the case `insync_lineage_holder` structurally cannot answer.
+    last_insync: Option<(String, u32)>,
 }
 
 impl Pair {
@@ -538,6 +584,7 @@ impl Pair {
             dark_streak: 0,
             last_snapshot: Instant::now(),
             lease: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            last_insync: None,
             slots,
         }
     }
@@ -738,6 +785,10 @@ impl Pair {
                 }
                 self.last_converged = Instant::now();
                 self.converged_ever = true;
+                // Remember WHO held it. The degraded-window gate needs this
+                // later, when this same node may be alive but replica-less and
+                // therefore unable to prove the same thing about itself (#171).
+                self.last_insync = Some((legit_addr.clone(), legit.epoch));
             }
 
             // Redundancy repair (managed): a non-master slot dead for
@@ -846,14 +897,34 @@ impl Pair {
                         "self-fenced master still serving a caught-up replica: recovering, not a degraded window",
                     );
                 }
-                None => {
-                    let (id, label, ms) = (cfg.id.clone(), self.label.clone(), cfg.max_stale);
-                    self.page(format_args!(
-                        "[{id}][{label}] no master and pair not converged within {ms:?} — REFUSING (degraded window; needs spare/S3). PAGE."
-                    ));
-                    self.no_master_streak = 0;
-                    return;
-                }
+                // Nobody can prove it RIGHT NOW. Fall back to what this
+                // controller already watched happen (#171): a replica-less
+                // lineage holder cannot satisfy the live predicate however
+                // intact it is, and refusing it turns a pair that is sitting
+                // there whole into a permanent write outage.
+                None => match remembered_lineage_holder(&states, self.last_insync.as_ref()) {
+                    Some(h) => {
+                        eprintln!(
+                            "[{}][{}] no master-claimer and no PROVABLE in-sync node, but {} is the member last observed holding the lineage and still holds the top epoch — recovering it (#171)",
+                            cfg.id, self.label, h.addr
+                        );
+                        journal_event(
+                            &cfg.id,
+                            flint_journal::EventKind::Detected,
+                            &self.label,
+                            None,
+                            "lineage holder alive but replica-less: recovering on the last observation, not a degraded window",
+                        );
+                    }
+                    None => {
+                        let (id, label, ms) = (cfg.id.clone(), self.label.clone(), cfg.max_stale);
+                        self.page(format_args!(
+                            "[{id}][{label}] no master and pair not converged within {ms:?}, and no member was ever observed holding the lineage — REFUSING (degraded window; needs spare/S3). PAGE."
+                        ));
+                        self.no_master_streak = 0;
+                        return;
+                    }
+                },
             }
         }
 
@@ -918,6 +989,11 @@ impl Pair {
                     }
                 }
                 self.converged_ever = false; // new master has no replica yet
+                // ...but it IS the lineage holder as of right now, and it will
+                // not be able to demonstrate that until a replica re-attaches.
+                // Without this the pair is unrecoverable for exactly that
+                // window if the fresh master then fences (#171).
+                self.last_insync = Some((survivor.addr.clone(), next));
                 self.no_master_streak = 0;
             }
             // -FENCED here means another controller already promoted at this
@@ -1547,6 +1623,54 @@ mod tests {
             insync_lineage_holder(&states).map(|n| n.addr.as_str()),
             Some("a:1")
         );
+    }
+
+    /// #171: the lineage holder is alive but replica-less, so it reports
+    /// live_replicas 0 / seq_lag none and cannot prove anything about itself.
+    /// The controller watched it hold the lineage; that observation is what
+    /// makes promoting it safe.
+    #[test]
+    fn replica_less_lineage_holder_is_recovered_from_memory() {
+        let states = vec![node("a:1", 3, 0, None), node("b:2", 2, 0, None)];
+        // The live predicate cannot help here — that is the bug.
+        assert!(insync_lineage_holder(&states).is_none());
+        let remembered = ("a:1".to_string(), 3u32);
+        assert_eq!(
+            remembered_lineage_holder(&states, Some(&remembered)).map(|n| n.addr.as_str()),
+            Some("a:1")
+        );
+    }
+
+    /// The genuine degraded window must STILL refuse. A survivor this
+    /// controller never observed holding the lineage may be missing writes that
+    /// only exist on a node it cannot reach, and guessing there is the one
+    /// thing the gate exists to prevent.
+    #[test]
+    fn never_observed_survivor_still_refuses() {
+        let states = vec![node("a:1", 3, 0, None), node("b:2", 2, 0, None)];
+        assert!(remembered_lineage_holder(&states, None).is_none());
+        let someone_else = ("c:3".to_string(), 3u32);
+        assert!(remembered_lineage_holder(&states, Some(&someone_else)).is_none());
+    }
+
+    /// Being remembered is not enough: a remembered member that is NOT at the
+    /// top reachable epoch has been overtaken, and promoting it would discard
+    /// the newer lineage sitting right there.
+    #[test]
+    fn remembered_but_overtaken_does_not_qualify() {
+        let states = vec![node("a:1", 2, 0, None), node("b:2", 5, 0, None)];
+        let remembered = ("a:1".to_string(), 2u32);
+        assert!(remembered_lineage_holder(&states, Some(&remembered)).is_none());
+    }
+
+    /// An unreachable remembered member cannot be promoted, however perfect its
+    /// record — this is the host-loss case, and it must page.
+    #[test]
+    fn remembered_but_unreachable_does_not_qualify() {
+        let mut states = vec![node("a:1", 3, 0, None), node("b:2", 3, 0, None)];
+        states[0].reachable = false;
+        let remembered = ("a:1".to_string(), 3u32);
+        assert!(remembered_lineage_holder(&states, Some(&remembered)).is_none());
     }
 
     #[test]
