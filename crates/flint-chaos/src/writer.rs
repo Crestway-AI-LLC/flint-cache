@@ -99,6 +99,25 @@ pub struct Shared {
     /// stall on the new master produce the same figure. Only the instant
     /// says which, by placing it against the fleet journal.
     pub max_stall_at_ms: AtomicU64,
+    /// The longest a SINGLE request was held before getting any answer at all
+    /// — an ack, a `-THROTTLED`, or a dropped connection. Same post-kill
+    /// window as `max_stall_ms`, and deliberately its complement.
+    ///
+    /// `max_stall_ms` is the gap between consecutive ACKS, so it cannot tell
+    /// "one write hung for 9 s" apart from "writes were refused promptly for
+    /// 9 s": in both cases no ack lands for 9 s. Those are opposite outcomes.
+    /// The first is the failure #186 exists to remove; the second is #186
+    /// WORKING — the client got an immediate, unambiguous retry signal and
+    /// spent none of its own budget waiting.
+    ///
+    /// So this is the number the write deadline actually bounds, and reading
+    /// the two together is what says which happened. Without it a run where
+    /// fast-fail worked perfectly would report the same headline figure as the
+    /// stall it replaced.
+    pub max_hold_ms: AtomicU64,
+    /// When the longest hold ended, for the same reason `max_stall_at_ms`
+    /// exists: the magnitude alone cannot be placed against the journal.
+    pub max_hold_at_ms: AtomicU64,
     /// Acks observed strictly after the kill instant — proof that service
     /// continued, and how the client path knows the window has closed.
     pub acks_after_kill: AtomicU64,
@@ -148,6 +167,8 @@ impl Shared {
             last_ack_ms: AtomicU64::new(0),
             max_stall_ms: AtomicU64::new(0),
             max_stall_at_ms: AtomicU64::new(0),
+            max_hold_ms: AtomicU64::new(0),
+            max_hold_at_ms: AtomicU64::new(0),
             acks_after_kill: AtomicU64::new(0),
             key_count,
             edge: None,
@@ -223,6 +244,29 @@ impl Shared {
 /// which is what lets the oracle separate "lost, but acked inside the cap's
 /// window" (the async contract) from "lost, though acked long enough ago that
 /// replication must have carried it" (a breach of the published bound).
+/// Fold one request's held time into `max_hold_ms`. Post-kill only, so it
+/// covers exactly the window `max_stall_ms` covers and the two can be read
+/// side by side.
+fn record_hold(shared: &Shared, sent: u64, answered: u64) {
+    if shared.kill_ms.load(Ordering::SeqCst) == 0 {
+        return;
+    }
+    let held = answered.saturating_sub(sent);
+    let mut cur = shared.max_hold_ms.load(Ordering::SeqCst);
+    while held > cur {
+        match shared
+            .max_hold_ms
+            .compare_exchange(cur, held, Ordering::SeqCst, Ordering::SeqCst)
+        {
+            Ok(_) => {
+                shared.max_hold_at_ms.store(answered, Ordering::SeqCst);
+                break;
+            }
+            Err(actual) => cur = actual,
+        }
+    }
+}
+
 pub fn run(shared: &Shared, seed: u64) {
     use rand::{Rng, SeedableRng, rngs::SmallRng};
     let mut rng = SmallRng::seed_from_u64(seed);
@@ -258,7 +302,12 @@ pub fn run(shared: &Shared, seed: u64) {
         // instant — so the ack time alone cannot say which master served it.
         // See KeyLedger::acked_at.
         let sent = now_ms();
-        match c.call(&[b"SET", key.as_bytes(), value.as_bytes()]) {
+        let reply = c.call(&[b"SET", key.as_bytes(), value.as_bytes()]);
+        // Recorded before the match, so a reconnect in the error arm is not
+        // counted as time the server held the request. Every answer closes a
+        // hold, including a refusal — that is the point of the measure.
+        record_hold(shared, sent, now_ms());
+        match reply {
             Ok(Value::Simple(s)) if s == "OK" => {
                 let at = now_ms();
                 {

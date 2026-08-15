@@ -284,6 +284,10 @@ fn main() {
     let mut unverifiable_total = 0u64;
     let mut injected = 0u64;
     let mut rtos: Vec<u64> = Vec::new();
+    // Worst single unanswered request across every master kill — the figure
+    // the write deadline bounds, reported next to the ack-gap so the two are
+    // never confused for each other (#186).
+    let mut worst_hold_ms: u64 = 0;
     let mut deepest_loss_ms: u64 = 0;
     // Acked writes lost that were older than the cap: the AGE reading of the
     // RPO, reported because it is interesting, not asserted because it is not
@@ -388,6 +392,8 @@ fn main() {
             shared.outage_seen.store(false, Ordering::SeqCst);
             shared.max_stall_ms.store(0, Ordering::SeqCst);
             shared.max_stall_at_ms.store(0, Ordering::SeqCst);
+            shared.max_hold_ms.store(0, Ordering::SeqCst);
+            shared.max_hold_at_ms.store(0, Ordering::SeqCst);
             shared.acks_after_kill.store(0, Ordering::SeqCst);
             let kill_ms = now_ms();
             shared.kill_ms.store(kill_ms, Ordering::SeqCst);
@@ -691,9 +697,19 @@ fn main() {
             }
             acked_lost_total += lost_here;
             unverifiable_total += unverifiable;
+            // The pair, always together. `{rto}` is the widest gap between
+            // ACKS; `max_hold_ms` is the longest a single request went
+            // unanswered. A window where the node fast-failed shows a large
+            // gap and a SMALL hold — writes were refused promptly, which is
+            // the deadline working, not a stall (#186). A window where the
+            // node held on shows both large. Reporting only the first cannot
+            // tell those apart, and for three runs it did not.
+            let held = shared.max_hold_ms.load(Ordering::SeqCst);
+            worst_hold_ms = worst_hold_ms.max(held);
             println!(
                 "iter {iteration}: pair {pair_idx}: killed MASTER (writes in flight); {} {rto}ms{} \
-                 [kill_ms={kill_ms} dead_ms={dead_ms} recovered_at_ms={recovered_at_ms}]; acked keys \
+                 [kill_ms={kill_ms} dead_ms={dead_ms} recovered_at_ms={recovered_at_ms} \
+                 max_hold_ms={held}]; acked keys \
                  regressed: {lost_here} (all within the {lag_hard_ms}ms cap){}",
                 if shared.edge.is_some() {
                     "client stall"
@@ -866,6 +882,16 @@ fn main() {
             sorted.len()
         );
     }
+    // The figure above is a gap between ACKS, so it cannot separate "one write
+    // was held for the whole window" from "writes were refused promptly for
+    // the whole window". This one can: it is the longest any single request
+    // went unanswered. Small here with a large gap above means the node
+    // fast-failed — the write deadline doing its job, not an outage the
+    // client absorbed (#186).
+    println!(
+        "  worst single write held: {worst_hold_ms}ms before any answer (ack or -THROTTLED); \
+         --write-deadline-ms is what bounds this, docs/slo.md"
+    );
     println!(
         "  deepest acked-write loss: {deepest_loss_ms}ms before the kill (cap {lag_hard_ms}ms + {rpo_margin_ms}ms margin; older-than-cap losses are COUNTED, not failed — the cap bounds volume, not age)"
     );
