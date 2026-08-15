@@ -134,16 +134,16 @@ struct Inventory {
     /// before it sheds. Absent = flintctl's own default for pair members
     /// (DEFAULT_WIDOWED_GRACE_MS); explicit 0 turns it off.
     widowed_grace_ms: Option<u64>,
-    max_conns: Option<u64>,        // node + proxy: connection admission cap
-    async_queue_cap: Option<u64>,  // node: async write-queue depth
-    cache_ttl_ms: Option<u64>,     // proxy: near-cache TTL default
-    cache_max_bytes: Option<u64>,  // proxy: near-cache byte budget default
+    max_conns: Option<u64>,       // node + proxy: connection admission cap
+    async_queue_cap: Option<u64>, // node: async write-queue depth
+    cache_ttl_ms: Option<u64>,    // proxy: near-cache TTL default
+    cache_max_bytes: Option<u64>, // proxy: near-cache byte budget default
     /// proxy: read budget for the O(keys) admin class (DBSIZE/FLUSHALL/SCAN
     /// step), which scales with the KEYSPACE — not with keyed-traffic
     /// latency. Default 60_000; raise it above ~20M keys per node.
     fanout_timeout_ms: Option<u64>,
-    ctl_poll_ms: Option<u64>,      // controller: failure-probe interval (RTO)
-    ctl_confirm: Option<u32>,      // controller: consecutive fails to promote
+    ctl_poll_ms: Option<u64>, // controller: failure-probe interval (RTO)
+    ctl_confirm: Option<u32>, // controller: consecutive fails to promote
     ctl_lease_ttl_ms: Option<u64>, // NODE master lease TTL (ADR-0018: renewed at the CP)
     /// How long a freshly (re)spawned replica may take to answer PING.
     /// A wiped node full-syncs its checkpoint BEFORE binding its listener,

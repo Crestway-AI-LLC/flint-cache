@@ -2636,13 +2636,14 @@ fn data_command(
         && args
             .first()
             .is_some_and(|n| flint_commands::is_read_command(n));
-    let b = backends
-        .get_or_insert_with(|| Backends::new(
-                ns.to_vec(),
-                topo.backend_tls.clone(),
-                async_writes,
-                topo.fanout_timeout,
-            ));
+    let b = backends.get_or_insert_with(|| {
+        Backends::new(
+            ns.to_vec(),
+            topo.backend_tls.clone(),
+            async_writes,
+            topo.fanout_timeout,
+        )
+    });
     let reply = handle(topo, b, ns, args, raw, read_replica);
     if cacheable && let Value::Bulk(Some(v)) = &reply {
         topo.cache.put(ns, &args[1], v);
