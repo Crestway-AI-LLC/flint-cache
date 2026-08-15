@@ -40,6 +40,41 @@ packaging/aws/chaos-cluster/run.sh --hosts 5 --tag <tag>   # fleet repo, real ho
 tools/controller_drill.sh                                  # locally, budget asserted
 ```
 
+## The recovery window — a SEPARATE promise from RTO
+
+Failover ends when writes are served again. **Recovery** — getting the pair
+back to two copies — starts there and lasts much longer, and for a while the
+surviving master is doing three jobs at once:
+
+1. serving ordinary traffic,
+2. absorbing the **retry burst** that piled up during the blackout, because
+   every client that queued or errored replays the moment the endpoint opens,
+3. streaming a full checkpoint to the replacement replica.
+
+So demand goes UP exactly as capacity goes DOWN — one node instead of two.
+Conflating this with RTO hides it: measured through the proxy edge, the
+reported figure is the worst gap between consecutive acknowledged writes
+anywhere in the window, so a slow recovery is easily mistaken for a slow
+failover. It is not the same event and it does not have the same cause.
+
+**What is bounded today.** The checkpoint transfer is rate-limited
+(`--fullsync-rate-bytes`, default 64 MiB/s) so a re-seed cannot take the disk
+and link the write path needs. Uncapped, this was measured starving a freshly
+promoted master for **11.9 s** while the failover itself had completed in
+700 ms. The cap trades recovery speed for write latency in the obvious
+direction: a slower re-seed means longer at one copy, so raise it if you would
+rather have redundancy back sooner and can absorb the latency.
+
+**What is NOT bounded today, stated plainly:** items 1 and 2 above. If demand
+during recovery exceeds what the surviving master can serve, the excess
+currently QUEUES, and queueing turns a capacity shortfall into a latency
+violation for every client rather than a clean failure for some. The intended
+contract is to shed past a threshold with `-THROTTLED` — retry-with-backoff,
+the same reply the lag cap already uses — so that whatever is admitted is
+served inside the budget. That is designed and not yet built; until it is, a
+recovery under heavy load can exceed the RTO budget above, and this document
+would rather say so than let you discover it.
+
 ## Data loss on failover (RPO)
 
 **The bound is on VOLUME, not on age**, and the distinction matters enough

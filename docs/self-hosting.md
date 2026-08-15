@@ -252,6 +252,19 @@ async-queue-cap 4096  node  restart  async write-queue depth
 poll-ms 100           ctlr  restart  failure-probe interval (RTO)
 confirm 3             ctlr  restart  consecutive fails before promote
 lease-ttl-ms 5000     node  restart  master lease TTL (self-renewed at the CP)
+fullsync-rate-bytes 67108864  node HOT  cap on how fast a node SERVES a full
+                                  sync, bytes/sec; 0 = uncapped. Not an
+                                  inventory key — it is a server flag
+                                  (--fullsync-rate-bytes) with this default,
+                                  changeable live with FLINTCONFIG. A
+                                  re-seeding replica pulls its checkpoint from
+                                  the pair's MASTER, which after a failover was
+                                  promoted seconds ago and is carrying the pair
+                                  alone; uncapped, that was measured stalling
+                                  its write path for 11.9 s. Raise it or set 0
+                                  to get redundancy back sooner at the cost of
+                                  write latency during recovery; see the
+                                  recovery window in docs/slo.md.
 node-ready-s 15       ctl   ctl-only PING budget for a freshly spawned replica.
                                   A wiped node full-syncs its checkpoint
                                   BEFORE it binds its listener, so on a
