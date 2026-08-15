@@ -161,24 +161,55 @@ impl ReplHub {
     /// "some replica is live" is exactly `now - last_ack <= LIVENESS_WINDOW`,
     /// and since a sane grace is far longer than that window, a live replica
     /// already fails the comparison below. Two relaxed loads, no lock.
+    /// PURE — safe for observers. FLINTINFO renders this on every node,
+    /// and the arming used to live inside this check: the controller's
+    /// routine status sweeps armed the widow clock on every REPLICA (whose
+    /// last_ack_ms is always 0) at bring-up, so a survivor promoted hours
+    /// later had already outlived its whole grace and shed its very first
+    /// write — writes stayed down for the replacement's entire re-seed,
+    /// the exact failover freeze the grace design exists to avoid (60.4 s
+    /// measured at 100 GB, scale run 18). The clock is armed only by the
+    /// write path (arming variant) and re-armed by FLINTPROMOTE.
     pub fn widowed_beyond_grace(&self, now_ms: u64) -> bool {
         let grace = self.widowed_grace_ms.load(Ordering::Relaxed);
         if grace == 0 {
             return false;
         }
-        let last = self.last_ack_ms.load(Ordering::Relaxed);
-        if last != 0 {
-            return now_ms.saturating_sub(last) > grace;
+        // The newest of "a replica acked" and "the clock was (re)armed".
+        // max() rather than last-wins keeps a re-promoted ex-master from
+        // inheriting a stale ack time from its previous mastership.
+        let basis = self
+            .last_ack_ms
+            .load(Ordering::Relaxed)
+            .max(self.widow_since_ms.load(Ordering::Relaxed));
+        basis != 0 && now_ms.saturating_sub(basis) > grace
+    }
+
+    /// Write-path variant: additionally arms the clock on the first gated
+    /// write of a never-acked, never-armed master (a bootstrap master whose
+    /// configured replica has not attached), so such a node still converges
+    /// on shedding after one grace instead of never.
+    pub fn widowed_beyond_grace_arming(&self, now_ms: u64) -> bool {
+        let grace = self.widowed_grace_ms.load(Ordering::Relaxed);
+        if grace == 0 {
+            return false;
         }
-        // Never acked by anyone this process-life. Start the clock now, so a
-        // just-promoted master gets the whole grace to find a replacement
-        // rather than inheriting a deadline from process start.
-        let since = self.widow_since_ms.load(Ordering::Relaxed);
-        if since == 0 {
+        let basis = self
+            .last_ack_ms
+            .load(Ordering::Relaxed)
+            .max(self.widow_since_ms.load(Ordering::Relaxed));
+        if basis == 0 {
             self.widow_since_ms.store(now_ms, Ordering::Relaxed);
             return false;
         }
-        now_ms.saturating_sub(since) > grace
+        now_ms.saturating_sub(basis) > grace
+    }
+
+    /// A just-promoted master gets the WHOLE grace to find a replacement
+    /// rather than inheriting a deadline from its replica life or an
+    /// earlier mastership. FLINTPROMOTE calls this.
+    pub fn rearm_widow_clock(&self, now_ms: u64) {
+        self.widow_since_ms.store(now_ms, Ordering::Relaxed);
     }
 
     /// True when the write path must shed because fewer replicas are live
@@ -347,6 +378,45 @@ mod tests {
         assert!(!hub.widowed_beyond_grace(30_100));
     }
 
+    /// The scale-run-18 regression: FLINTINFO polls a REPLICA (last_ack 0)
+    /// for hours, then the node is promoted. The observer must not have
+    /// armed the widow clock — the promoted master gets its WHOLE grace,
+    /// not an instant shed followed by a re-seed-long write outage.
+    #[test]
+    fn an_observer_cannot_spend_a_future_masters_grace() {
+        let hub = ReplHub::default();
+        hub.set_widowed_grace_ms(10_000);
+
+        // Hours of status sweeps against the replica. Pure: never arms.
+        for t in (0..7_200_000).step_by(30_000) {
+            assert!(!hub.widowed_beyond_grace(t), "observer armed the clock");
+        }
+
+        // Promotion at t=7_200_000 re-arms; the first gated write moments
+        // later is inside a FRESH grace even though the process is hours old.
+        hub.rearm_widow_clock(7_200_000);
+        assert!(!hub.widowed_beyond_grace_arming(7_200_500));
+        assert!(!hub.widowed_beyond_grace(7_200_500));
+        // Still alone one whole grace later: NOW the age gate sheds.
+        assert!(hub.widowed_beyond_grace_arming(7_210_001));
+
+        // A replacement replica's first ack lifts it without a restart.
+        let r = hub.register_replica();
+        hub.record_ack(r, 42, 7_215_000);
+        assert!(!hub.widowed_beyond_grace_arming(7_215_100));
+    }
+
+    /// A never-promoted bootstrap master (configured replica absent) still
+    /// converges on shedding: the WRITE path arms the clock lazily.
+    #[test]
+    fn the_write_path_still_arms_a_bootstrap_master() {
+        let hub = ReplHub::default();
+        hub.set_widowed_grace_ms(10_000);
+        assert!(!hub.widowed_beyond_grace_arming(1_000)); // arms here
+        assert!(!hub.widowed_beyond_grace_arming(5_000)); // inside grace
+        assert!(hub.widowed_beyond_grace_arming(11_001)); // beyond it
+    }
+
     #[test]
     fn widowed_grace_never_takes_the_replicas_lock() {
         // The gate runs on every write, alongside a lag check that already
@@ -385,15 +455,20 @@ mod tests {
     fn a_promoted_master_gets_the_whole_grace_to_find_a_replacement() {
         // The case that rules out min-replicas-to-write as the default: a
         // master that has never been acked is either a fresh standalone or
-        // one promoted moments ago. Neither should shed instantly.
+        // one promoted moments ago. Neither should shed instantly. The clock
+        // starts on the first GATED WRITE — "first look" was the run-18 bug:
+        // an INFO observer's look must never start it.
         let hub = ReplHub::default();
         hub.set_widowed_grace_ms(10_000);
         assert!(
-            !hub.widowed_beyond_grace(50_000),
-            "clock starts on first look"
+            !hub.widowed_beyond_grace_arming(50_000),
+            "clock starts on the first gated write"
         );
-        assert!(!hub.widowed_beyond_grace(59_000), "still inside the grace");
-        assert!(hub.widowed_beyond_grace(60_001), "and then it bites");
+        assert!(
+            !hub.widowed_beyond_grace_arming(59_000),
+            "still inside the grace"
+        );
+        assert!(hub.widowed_beyond_grace_arming(60_001), "and then it bites");
     }
 
     #[test]

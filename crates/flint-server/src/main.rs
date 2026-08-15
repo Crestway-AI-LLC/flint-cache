@@ -1645,7 +1645,7 @@ fn admit_write_path(
         // tail may get. Checked after the quorum gate (which is stricter and
         // shares the cause) and before the lag cap, which cannot fire at all
         // in this state because there is no replica to measure lag against.
-        if hub.widowed_beyond_grace(now) {
+        if hub.widowed_beyond_grace_arming(now) {
             return Some(Value::Error(
                 "THROTTLED no live replica for longer than --widowed-grace-ms, retry with backoff"
                     .into(),
@@ -1987,7 +1987,7 @@ fn execute(
         .first()
         .is_some_and(|n| n.eq_ignore_ascii_case(b"FLINTPROMOTE"))
     {
-        return flintpromote(read_only, tailer_stop, lease_deadline, rocks, args);
+        return flintpromote(read_only, tailer_stop, lease_deadline, hub, rocks, args);
     }
     if args
         .first()
@@ -2260,6 +2260,7 @@ fn flintpromote(
     read_only: &Arc<AtomicBool>,
     tailer_stop: &Arc<AtomicBool>,
     lease_deadline: &Arc<std::sync::atomic::AtomicU64>,
+    hub: &Arc<repl_hub::ReplHub>,
     rocks: &Option<RocksHandle>,
     args: &[Vec<u8>],
 ) -> Value {
@@ -2301,6 +2302,10 @@ fn flintpromote(
             // unmanaged until the next FLINTLEASE, which the controller that
             // just promoted us sends on its next tick.
             lease_deadline.store(0, Ordering::Relaxed);
+            // The widow clock likewise belonged to the previous life: this
+            // node earns the whole --widowed-grace-ms to attach a replacement
+            // before the age gate may shed a write.
+            hub.rearm_widow_clock(flint_storage::strings::system_clock());
             // This node IS the lineage now. Any re-seed marker left by an
             // earlier demotion describes a position nobody follows any more,
             // and leaving it would make a later start-as-replica throw away
@@ -2326,6 +2331,7 @@ fn flintpromote(
     _read_only: &Arc<AtomicBool>,
     _tailer_stop: &Arc<AtomicBool>,
     _lease_deadline: &Arc<std::sync::atomic::AtomicU64>,
+    _hub: &Arc<repl_hub::ReplHub>,
     _rocks: &Option<RocksHandle>,
     _args: &[Vec<u8>],
 ) -> Value {
