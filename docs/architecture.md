@@ -33,10 +33,18 @@ flowchart LR
     P -->|mTLS| MN
     P -.->|replica reads, opt-in| R0
     CP -->|versioned snapshot push| P
-    CTL -->|FLINTINFO probes / CPFENCE + FLINTPROMOTE| M0
-    M0 -->|CPLEASE self-renewal| CP
-    CTL --> R0
+    CTL -->|FLINTINFO probes| M0
+    CTL -->|1 · CPFENCE, Raft-committed| CP
+    CTL -->|2 · FLINTPROMOTE| R0
+    M0 -->|CPLEASE every ttl/3| CP
 ```
+
+The fence lives on the `CTL → CP` edge, not on an edge to a node, and it is
+numbered ahead of `FLINTPROMOTE` because that order is the safety property:
+a promotion whose record cannot commit does not happen (ADR-0018). Note also
+that no arrow runs from the CP down into the data plane — a master learns it
+has been superseded by asking, in the reply to its own renewal, so a fence
+needs nothing to be reachable except the CP the master already talks to.
 
 - **Routing plane — `flint-proxy`.** Stateless. Terminates client TLS,
   authenticates tenant tokens (comparing SHA-256 digests — the proxy never
@@ -51,7 +59,7 @@ flowchart LR
   their token digests, quotas, opt-ins. It runs as a persistent single node or
   Raft-replicated for HA, and pushes snapshots to proxies on change
   (suppressing no-op pushes). The controller supervises pairs — probe,
-  verify, promote, fence — using **epoch fencing**: every role carries a
+  verify, fence, promote — using **epoch fencing**: every role carries a
   `(generation, counter)` epoch, and a deposed master that comes back is
   fenced read-only by its own lease expiry. The lease lives at the control
   plane and each master renews it itself (`CPLEASE`, ADR-0018), so the

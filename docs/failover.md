@@ -235,8 +235,8 @@ first). Proven by `decommission_drill.sh` with a live writer.
 
 ## Unexpected failover
 
-The `flint-controller` supervises each pair: **detect → verify → promote
-→ fence**, epoch-fenced throughout. It is stateless (its truth is the
+The `flint-controller` supervises each pair: **detect → verify → fence →
+promote**, epoch-fenced throughout. It is stateless (its truth is the
 nodes' manifests + the fleet journal), so it can crash and restart, or
 run as an HA set where any survivor acts.
 
@@ -244,10 +244,12 @@ run as an HA set where any survivor acts.
 flowchart LR
     A[probe FLINTINFO<br/>every --poll-ms] --> B{master reachable?}
     B -- yes --> C[fence any zombie master<br/>leases renew node-side, ADR-0018]
-    B -- no, for --confirm ticks --> D{pair converged<br/>within --max-stale-ms?}
+    B -->|"no, for --confirm ticks"| D{pair converged<br/>within --max-stale-ms?}
     D -- no --> E[REFUSE + page<br/>degraded: needs spare/S3]
-    D -- yes --> F[promote highest-epoch<br/>survivor at epoch+1]
-    F --> G[attach fresh replacement<br/>replica; proxy rediscovers]
+    D -- yes --> F[CPFENCE the survivor<br/>durable, Raft-committed at the CP]
+    F -- committed --> G[promote highest-epoch<br/>survivor at epoch+1]
+    F -- cannot commit --> H[NO promotion<br/>the record is the permission]
+    G --> I[attach fresh replacement<br/>replica; proxy rediscovers]
 ```
 
 - **Detect.** The controller polls each node's `FLINTINFO` every
