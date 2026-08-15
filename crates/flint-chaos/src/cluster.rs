@@ -225,17 +225,77 @@ impl Attached {
             let m = self.master();
             let info = self.info(&m);
             let live = info.get("live_replicas").is_some_and(|v| v.trim() != "0");
-            let converged = !need_converged
-                || info
-                    .get("seq_lag")
-                    .and_then(|v| v.trim().parse::<u64>().ok())
-                    .is_some_and(|l| l == 0);
+            let converged = !need_converged || self.replica_holds_the_lineage(&m, &info);
             if live && converged {
                 return true;
             }
             std::thread::sleep(Duration::from_millis(200));
         }
         false
+    }
+
+    /// Converged means the REPLICA says it took the data — not that the
+    /// master says it is caught up.
+    ///
+    /// Both halves of this used to come from the master alone:
+    /// `live_replicas != 0` and `seq_lag == 0`. Soak run 22 showed why that
+    /// is the wrong vantage. Iteration 3 killed pair 3's replica; iteration
+    /// 8 killed the same pair's MASTER. The replacement replica was still
+    /// re-seeding, but the master's numbers satisfied the gate, so the kill
+    /// went ahead — and the controller then, correctly, refused to promote a
+    /// survivor it had never observed in-sync:
+    ///
+    ///   [ctl][g3] no master and pair not converged within 5s, and no member
+    ///   was ever observed holding the lineage — REFUSING (degraded window)
+    ///
+    /// The run died on a promotion timeout for a kill it should never have
+    /// made, wearing the #171 signature of a bug that is actually fixed.
+    /// Promoting that member would have frozen an incomplete dataset, so the
+    /// controller was right and the harness was wrong.
+    ///
+    /// The controller's predicate is replica-side, so this one has to be too.
+    /// A member reporting `acked_seq:none` holds nothing, however the master
+    /// scores its lag, and `fullsync_active` on the master says a re-seed is
+    /// in flight even when the ack counter has started moving.
+    fn replica_holds_the_lineage(
+        &self,
+        master: &str,
+        master_info: &std::collections::HashMap<String, String>,
+    ) -> bool {
+        let lag_zero = master_info
+            .get("seq_lag")
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .is_some_and(|l| l == 0);
+        let no_reseed = master_info
+            .get("fullsync_active")
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .is_none_or(|n| n == 0);
+        if !lag_zero || !no_reseed {
+            return false;
+        }
+        let Some(replica) = self.members.iter().find(|m| m.as_str() != master) else {
+            return false;
+        };
+        // Asked of the replica itself, and it must be `last_applied`.
+        //
+        // The first cut of this asked the replica for `acked_seq` and never
+        // converged, failing iteration 1 of a healthy local pair. Measured on
+        // a live pair, both sides answer:
+        //
+        //   master   role:master  latest_seq:5   last_applied:0  acked_seq:5     seq_lag:0
+        //   replica  role:replica latest_seq:10  last_applied:5  acked_seq:none  seq_lag:none
+        //
+        // `acked_seq`, `seq_lag` and `live_replicas` are MASTER-side metrics —
+        // a replica reports none/0 for them however healthy it is — so that
+        // gate could not pass, ever. `latest_seq` is a RocksDB WAL position
+        // private to each instance (10 vs 5 here), so it is not comparable
+        // across nodes either. `last_applied` is the one field that means
+        // "how far into the MASTER's stream this member has got", which is
+        // the lineage question.
+        self.info(replica)
+            .get("last_applied")
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .is_some_and(|applied| applied > 0)
     }
 
     fn info(&self, addr: &str) -> std::collections::HashMap<String, String> {

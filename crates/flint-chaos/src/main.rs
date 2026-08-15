@@ -317,17 +317,27 @@ fn main() {
         // the RPO number describes; requiring seq_lag==0 first (the old
         // guard) left nothing unreplicated to lose, so the oracle's verdict
         // was a property of this harness.
-        if want_master && cluster.wait_replica_live(Duration::from_secs(8)) {
-            let harness_promoted = cluster.promotion_is_harness();
-            // ARM, RESUME, THEN KILL. The controller arms auto-failover only
-            // after observing the pair converged, and under a live hammer it
-            // never does — the first run of this loop killed an unarmed pair
-            // and died on "controller did not promote within 20s". So: park
-            // the writer until convergence has been visible long enough for
-            // the controller's confirm*poll window (the hotkey drill's
-            // precedent), resume the hammer, give it a beat so the replica is
-            // genuinely behind again, and only then kill. Writes are in
-            // flight AT the kill, which is the point of this whole change.
+        // ARM, RESUME, THEN KILL. The controller arms auto-failover only after
+        // observing the pair converged, and under a live hammer it never does
+        // — the first run of this loop killed an unarmed pair and died on
+        // "controller did not promote within 20s". So: park the writer until
+        // convergence has been visible long enough for the controller's
+        // confirm*poll window (the hotkey drill's precedent), resume the
+        // hammer, give it a beat so the replica is genuinely behind again, and
+        // only then kill. Writes are in flight AT the kill, which is the point.
+        //
+        // A pair that is NOT converged costs this iteration's master kill, not
+        // the run. Soak run 22 aborted outright: iteration 3 killed pair 3's
+        // replica, iteration 8 killed the same pair's master while the
+        // replacement was still re-seeding, and the controller then correctly
+        // refused to promote a survivor it had never seen hold the lineage.
+        // The run died on a promotion timeout wearing #171's signature, for a
+        // kill it should never have made. A re-seeding pair is a NORMAL state
+        // mid-soak; the harness picks a different victim and carries on.
+        //
+        // Not silent: the skip prints, and run.sh separately asserts at least
+        // one master was killed, so a run that skipped every one cannot pass.
+        let kill_master = want_master && cluster.wait_replica_live(Duration::from_secs(8)) && {
             // Quiesce EVERYONE, not just ourselves — see Quiesce. Resumed
             // together with our own writer, so the kill still lands with
             // writes in flight from every source.
@@ -337,25 +347,23 @@ fn main() {
             std::thread::sleep(Duration::from_millis(1_500)); // controller confirm*poll
             shared.pause.store(false, Ordering::SeqCst);
             drop(quiesce);
-            // Asserted AFTER the load is back on. A panic here aborts the run
-            // either way, but leaving the fleet quiesced on the way out makes
-            // the evidence bundle describe a system nobody was writing to.
-            assert!(
-                converged,
-                "iter {iteration}: pair never converged within {converge_s}s while the \
-                 writer was parked{}",
-                if quiesce_file.is_empty() {
-                    " — and NO --quiesce-file was set, so any load outside this \
-                     harness kept writing and seq_lag could not reach 0 (#183)"
-                        .to_string()
-                } else {
-                    format!(
-                        " — --quiesce-file {quiesce_file} was armed, so either the \
-                         load does not honour it or the replica needs longer than \
-                         --converge-s {converge_s}"
-                    )
-                }
-            );
+            if !converged {
+                println!(
+                    "iter {iteration}: pair {pair_idx}: master kill SKIPPED — the replica \
+                         has not taken the lineage within {converge_s}s (still re-seeding from \
+                         an earlier kill?); killing a REPLICA this iteration instead{}",
+                    if quiesce_file.is_empty() {
+                        " [no --quiesce-file: load outside this harness keeps seq_lag \
+                             above 0, see #183]"
+                    } else {
+                        ""
+                    }
+                );
+            }
+            converged
+        };
+        if kill_master {
+            let harness_promoted = cluster.promotion_is_harness();
             std::thread::sleep(Duration::from_millis(300)); // hammer re-established
 
             // Deliberately push the replica behind, so the master is acking
