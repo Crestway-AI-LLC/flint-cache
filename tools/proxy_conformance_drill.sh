@@ -32,9 +32,9 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init /tmp/flint-proxyconf-state 7960 7961 7962 7963
+fleet_init $FLINT_DRILL_ROOT/flint-proxyconf-state 7960 7961 7962 7963
 fleet_guard
-D=/tmp/flint-proxyconf; STATE=/tmp/flint-proxyconf-state
+D=$FLINT_DRILL_ROOT/flint-proxyconf; STATE=$FLINT_DRILL_ROOT/flint-proxyconf-state
 INV=$D/cluster.flint
 rm -rf "$D" "$STATE"; mkdir -p "$D"
 

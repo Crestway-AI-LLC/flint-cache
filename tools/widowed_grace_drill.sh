@@ -36,7 +36,7 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-D=/tmp/flint-widowed
+D=$FLINT_DRILL_ROOT/flint-widowed
 MPORT=6465; RPORT=6466; SPORT=6467
 fleet_init "$D" $MPORT $RPORT $SPORT
 fleet_guard

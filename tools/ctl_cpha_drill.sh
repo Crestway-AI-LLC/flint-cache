@@ -17,10 +17,10 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init /tmp/flint-cpha-ctl 6930 6931 7561 7562 7563 7861
+fleet_init $FLINT_DRILL_ROOT/flint-cpha-ctl 6930 6931 7561 7562 7563 7861
 fleet_guard
 CTL=./target/release/flintctl
-D=/tmp/flint-cpha-ctl; INV=$D/cluster.flint
+D=$FLINT_DRILL_ROOT/flint-cpha-ctl; INV=$D/cluster.flint
 fleet_kill server; fleet_kill proxy; fleet_kill controlplane; sleep 0.4
 cleanup() {
   $CTL -f "$INV" stop 2>/dev/null

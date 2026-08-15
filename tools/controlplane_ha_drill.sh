@@ -9,11 +9,11 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init /tmp/flint-cpha 6304 6731 7501 7502 7503 7511 7512 7513 9001 9002 9009
+fleet_init $FLINT_DRILL_ROOT/flint-cpha 6304 6731 7501 7502 7503 7511 7512 7513 9001 9002 9009
 fleet_guard
 CP=./target/release/flint-controlplane
 fleet_kill controlplane; sleep 0.5
-D=/tmp/flint-cpha; rm -rf "$D"; mkdir -p "$D"
+D=$FLINT_DRILL_ROOT/flint-cpha; rm -rf "$D"; mkdir -p "$D"
 PEERS="1=127.0.0.1:7511,2=127.0.0.1:7512,3=127.0.0.1:7513"
 CLIENTS="1=127.0.0.1:7501,2=127.0.0.1:7502,3=127.0.0.1:7503"
 cleanup() { fleet_kill controlplane; rm -rf "$D"; }

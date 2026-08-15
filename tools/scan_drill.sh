@@ -11,9 +11,9 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init /tmp/flint-scan-state 7301 7302 7303 7304 7679 7720
+fleet_init $FLINT_DRILL_ROOT/flint-scan-state 7301 7302 7303 7304 7679 7720
 fleet_guard
-STATE=/tmp/flint-scan-state; INV=/tmp/flint-scan.flint
+STATE=$FLINT_DRILL_ROOT/flint-scan-state; INV=$FLINT_DRILL_ROOT/flint-scan.flint
 fleet_kill server; fleet_kill proxy
 fleet_kill controlplane; fleet_kill controller
 sleep 0.4
@@ -56,8 +56,8 @@ C1=$($A GET key:0000 >/dev/null; echo ok)  # proxy routing sanity
 # distribution check via CPSLOTS-backed routing is implicit: DBSIZE is a
 # fan-out sum (500) while each master's own count is < 500.
 M1=$(python3 - <<'PY'
-import socket, ssl
-d="/tmp/flint-scan-state/certs"
+import socket, ssl, os
+d=os.environ.get("FLINT_DRILL_ROOT","/tmp")+"/flint-scan-state/certs"
 ctx=ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT); ctx.load_verify_locations(f"{d}/ca.crt")
 ctx.load_cert_chain(f"{d}/int.crt", f"{d}/int.key"); ctx.check_hostname=False
 s=ctx.wrap_socket(socket.create_connection(("127.0.0.1",7301),timeout=5),server_hostname="flint-internal")

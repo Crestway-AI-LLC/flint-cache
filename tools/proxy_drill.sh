@@ -9,7 +9,7 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init /tmp/flint-px- 6630 6631 6640 6641 6666
+fleet_init $FLINT_DRILL_ROOT/flint-px- 6630 6631 6640 6641 6666
 fleet_guard
 fleet_kill server; fleet_kill controller; fleet_kill proxy; sleep 0.4
 B=./target/release/flint-server
@@ -18,13 +18,13 @@ cleanup() {
   pkill -9 -f "flint-server --port 66" 2>/dev/null
   fleet_kill controller
   fleet_kill proxy
-  rm -rf /tmp/flint-px-*
+  rm -rf $FLINT_DRILL_ROOT/flint-px-*
 }
 trap cleanup EXIT
 
 for spec in "6630:" "6631:127.0.0.1:6630" "6640:" "6641:127.0.0.1:6640"; do
   p=${spec%%:*}; m=${spec#*:}
-  d="/tmp/flint-px-$p"; rm -rf "$d"
+  d="$FLINT_DRILL_ROOT/flint-px-$p"; rm -rf "$d"
   if [ -n "$m" ]; then
     $B --port $p --engine rocks --data-dir "$d" --replica-of "$m" 2>/dev/null &
   else
@@ -36,8 +36,8 @@ sleep 0.8
 
 echo "== start controller (failover) and proxy (routing)"
 ./target/release/flint-controller --pairs "127.0.0.1:6630,127.0.0.1:6631;127.0.0.1:6640,127.0.0.1:6641" \
-  --id PX --poll-ms 150 --confirm 3 2>/tmp/flint-px-ctl.log &
-./target/release/flint-proxy --port 6666 --pairs "127.0.0.1:6630,127.0.0.1:6631;127.0.0.1:6640,127.0.0.1:6641" 2>/tmp/flint-px-proxy.log &
+  --id PX --poll-ms 150 --confirm 3 2>$FLINT_DRILL_ROOT/flint-px-ctl.log &
+./target/release/flint-proxy --port 6666 --pairs "127.0.0.1:6630,127.0.0.1:6631;127.0.0.1:6640,127.0.0.1:6641" 2>$FLINT_DRILL_ROOT/flint-px-proxy.log &
 fleet_wait_listen 6666
 sleep 1.2
 [ "$(valkey-cli -p 6666 PING)" = "PONG" ] || { echo "FAIL: proxy not up"; exit 1; }
@@ -133,7 +133,7 @@ for i in $(seq 1 100); do
   if [ "$R" = "val-000001" ]; then OK=1; break; fi
   sleep 0.2
 done
-[ "$OK" = "1" ] || { echo "FAIL: reads did not recover after failover"; tail -6 /tmp/flint-px-proxy.log; exit 1; }
+[ "$OK" = "1" ] || { echo "FAIL: reads did not recover after failover"; tail -6 $FLINT_DRILL_ROOT/flint-px-proxy.log; exit 1; }
 echo "  reads recovered after failover ($((i*200))ms observed via client)"
 W2=$(valkey-cli -p 6666 SET post-failover ok 2>&1)
 [ "$W2" = "OK" ] || echo "  (write settling: $W2)"

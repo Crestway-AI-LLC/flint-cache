@@ -21,10 +21,10 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init /tmp/flint-coldrole-state 7403 7404 7405 7406
+fleet_init $FLINT_DRILL_ROOT/flint-coldrole-state 7403 7404 7405 7406
 fleet_guard
-STATE=/tmp/flint-coldrole-state
-INV=/tmp/flint-coldrole.flint
+STATE=$FLINT_DRILL_ROOT/flint-coldrole-state
+INV=$FLINT_DRILL_ROOT/flint-coldrole.flint
 A=127.0.0.1:7403   # inventory pair[0]
 B=127.0.0.1:7404   # inventory pair[1] — the one we promote
 fleet_kill server; fleet_kill proxy
@@ -131,22 +131,22 @@ done
   exit 1
 }
 [ "$(replicas_of "$B")" = "0" ] || { echo "FAIL: hand-spawned pair is replicating; no broken state to judge"; exit 1; }
-$CTL verify > /tmp/flint-coldrole.verify 2>&1
-grep -q "SINGLE-COPY: every member up" /tmp/flint-coldrole.verify || {
+$CTL verify > $FLINT_DRILL_ROOT/flint-coldrole.verify 2>&1
+grep -q "SINGLE-COPY: every member up" $FLINT_DRILL_ROOT/flint-coldrole.verify || {
   echo "FAIL: verify passed a pair with both members up and zero replication"
   echo "      — this is the state that ran the playground for five days"
-  cat /tmp/flint-coldrole.verify; exit 1
+  cat $FLINT_DRILL_ROOT/flint-coldrole.verify; exit 1
 }
-echo "  verify refuses it: $(grep -o 'SINGLE-COPY: every member up.*' /tmp/flint-coldrole.verify | head -1)"
+echo "  verify refuses it: $(grep -o 'SINGLE-COPY: every member up.*' $FLINT_DRILL_ROOT/flint-coldrole.verify | head -1)"
 # Clear the hand-spawned seats so `start` below sees a genuine cold fleet;
 # flintctl has no pidfiles for these, and a live process would be read as
 # "already up" and left alone.
 for p in 7403 7404 7406; do pkill -f "port $p " 2>/dev/null; done
 sleep 2
-rm -f /tmp/flint-coldrole.verify
+rm -f $FLINT_DRILL_ROOT/flint-coldrole.verify
 
 echo "== now the real cold start"
-$CTL start > /tmp/flint-coldrole.out 2>&1
+$CTL start > $FLINT_DRILL_ROOT/flint-coldrole.out 2>&1
 sleep 3
 
 echo "== the fleet must replicate, and must say why it had to intervene"
@@ -160,17 +160,17 @@ for _ in $(seq 1 80); do [ "$(replicas_of "$MASTER")" = "1" ] && break; sleep 0.
 [ "$(replicas_of "$MASTER")" = "1" ] || {
   echo "FAIL: live_replicas $(replicas_of "$MASTER") after cold start — the pair is storing one copy"
   echo "      and nothing errored, which is exactly the failure this drill exists for"
-  cat /tmp/flint-coldrole.out; exit 1
+  cat $FLINT_DRILL_ROOT/flint-coldrole.out; exit 1
 }
 [ "$(role_of "$A")" = "replica" ] || { echo "FAIL: $A did not come back as a replica"; exit 1; }
 # Corroboration, not the headline: proves the healthy answer came from the
 # repair path rather than from a setup that quietly failed to build the
 # broken case this drill is named for.
-grep -q "durable roles disagree with inventory order" /tmp/flint-coldrole.out || {
+grep -q "durable roles disagree with inventory order" $FLINT_DRILL_ROOT/flint-coldrole.out || {
   echo "FAIL: the pair replicates, but start never reported the role/order"
   echo "      disagreement — so the failover above probably did not leave"
   echo "      pair[1] as the durable master, and this run proved nothing"
-  cat /tmp/flint-coldrole.out; exit 1
+  cat $FLINT_DRILL_ROOT/flint-coldrole.out; exit 1
 }
 echo "  $MASTER master, $A replica, live_replicas 1"
 
@@ -186,5 +186,5 @@ COUNT=$(valkey-cli -p 7404 DBSIZE)
 [ "${COUNT:-0}" -ge 200 ] || { echo "FAIL: expected >=200 keys, got $COUNT"; exit 1; }
 echo "  $COUNT keys on the master"
 
-rm -f /tmp/flint-coldrole.out
+rm -f $FLINT_DRILL_ROOT/flint-coldrole.out
 echo "PASS: cold start of a failed-over pair — durable roles beat inventory order, replication restored, no silent single-copy fleet"

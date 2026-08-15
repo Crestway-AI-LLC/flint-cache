@@ -23,15 +23,15 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init /tmp/flint-bloom- 6402 6403 6404
+fleet_init $FLINT_DRILL_ROOT/flint-bloom- 6402 6403 6404
 fleet_guard
 fleet_kill server; sleep 0.4
 
 B=./target/release/flint-server
 MPORT=6402; RPORT=6403; DPORT=6404
-MDIR=$(mktemp -d /tmp/flint-bloom-m.XXXXXX)
-RDIR=$(mktemp -d /tmp/flint-bloom-r.XXXXXX)
-DDIR=$(mktemp -d /tmp/flint-bloom-d.XXXXXX)
+MDIR=$(mktemp -d $FLINT_DRILL_ROOT/flint-bloom-m.XXXXXX)
+RDIR=$(mktemp -d $FLINT_DRILL_ROOT/flint-bloom-r.XXXXXX)
+DDIR=$(mktemp -d $FLINT_DRILL_ROOT/flint-bloom-d.XXXXXX)
 
 # Hash tag pins the filter to one known slot, which phase 3 needs.
 TAG="{bloomer}"

@@ -39,11 +39,11 @@ fi
 [ -n "${AWS_ACCESS_KEY_ID:-}" ] || { echo "SKIP: no AWS credentials in env or profile"; exit 0; }
 export AWS_REGION="${AWS_REGION:-us-east-1}"
 
-fleet_init /tmp/flint-s3bk 6946 6947
+fleet_init $FLINT_DRILL_ROOT/flint-s3bk 6946 6947
 fleet_guard
 B=./target/release/flint-server
 BK=./target/release/flint-backup
-D=/tmp/flint-s3bk
+D=$FLINT_DRILL_ROOT/flint-s3bk
 PREFIX="drill-$(date +%s)-$$"
 SPEC="s3://$BUCKET/$PREFIX"
 fleet_kill server; sleep 0.4

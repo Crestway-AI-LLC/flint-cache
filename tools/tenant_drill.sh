@@ -8,11 +8,11 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init /tmp/flint-tn 6650 6667
+fleet_init $FLINT_DRILL_ROOT/flint-tn 6650 6667
 fleet_guard
 fleet_kill server; fleet_kill proxy; sleep 0.4
 B=./target/release/flint-server
-D=$(mktemp -d /tmp/flint-tn.XXXXXX)
+D=$(mktemp -d $FLINT_DRILL_ROOT/flint-tn.XXXXXX)
 cleanup() {
   pkill -9 -f "flint-server --port 6650" 2>/dev/null
   fleet_kill proxy
@@ -24,7 +24,7 @@ $B --port 6650 --engine rocks --data-dir "$D" 2>/dev/null &
 fleet_wait_listen 6650
 sleep 0.6
 ./target/release/flint-proxy --port 6667 --pairs "127.0.0.1:6650" \
-  --tenants "tokA=alpha,tokB=beta" 2>/tmp/flint-tn-proxy.log &
+  --tenants "tokA=alpha,tokB=beta" 2>$FLINT_DRILL_ROOT/flint-tn-proxy.log &
 fleet_wait_listen 6667
 sleep 0.5
 

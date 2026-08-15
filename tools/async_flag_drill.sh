@@ -13,27 +13,27 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init /tmp/flint-af-state 6760 7520 7611
+fleet_init $FLINT_DRILL_ROOT/flint-af-state 6760 7520 7611
 fleet_guard
 fleet_kill server; fleet_kill proxy
 fleet_kill controlplane; sleep 0.4
 B=./target/release/flint-server
 CP=./target/release/flint-controlplane
 PX=./target/release/flint-proxy
-STATE=/tmp/flint-af-state
-D=/tmp/flint-af-node
+STATE=$FLINT_DRILL_ROOT/flint-af-state
+D=$FLINT_DRILL_ROOT/flint-af-node
 cleanup() {
   pkill -9 -f "flint-server --port 6760" 2>/dev/null
   fleet_kill proxy
   fleet_kill controlplane
-  rm -rf "$D" "$STATE" "$STATE.tmp" /tmp/flint-af-*.log
+  rm -rf "$D" "$STATE" "$STATE.tmp" $FLINT_DRILL_ROOT/flint-af-*.log
 }
 trap cleanup EXIT
 rm -rf "$D" "$STATE"
 
 echo "== node (rocks, queue cap 2, NO --async-writes scope), CP, proxy"
-$B --port 6760 --engine rocks --data-dir "$D" --async-queue-cap 2 2>/tmp/flint-af-node.log &
-$CP --port 7520 --state "$STATE" 2>/tmp/flint-af-cp.log &
+$B --port 6760 --engine rocks --data-dir "$D" --async-queue-cap 2 2>$FLINT_DRILL_ROOT/flint-af-node.log &
+$CP --port 7520 --state "$STATE" 2>$FLINT_DRILL_ROOT/flint-af-cp.log &
 fleet_wait_ping 7520
 fleet_wait_ping 6760
 fleet_cp 7520 CPADDPROXY 127.0.0.1:7611
@@ -42,7 +42,7 @@ fleet_cp 7520 CPADDTENANT hot tok-hot hot 1
 fleet_cp 7520 CPADDTENANT cold tok-cold cold 1
 R=$(valkey-cli -p 7520 CPTENANTASYNC hot on)
 [ "$R" = "OK" ] || { echo "FAIL: CPTENANTASYNC: $R"; exit 1; }
-$PX --port 7611 --control-plane 127.0.0.1:7520 --advertise 127.0.0.1:7611 2>/tmp/flint-af-proxy.log &
+$PX --port 7611 --control-plane 127.0.0.1:7520 --advertise 127.0.0.1:7611 2>$FLINT_DRILL_ROOT/flint-af-proxy.log &
 fleet_wait_listen 7611
 sleep 1.5
 

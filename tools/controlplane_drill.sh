@@ -11,13 +11,13 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init /tmp/flint-cp-drill-state 6730 6740 7241 7601 7602
+fleet_init $FLINT_DRILL_ROOT/flint-cp-drill-state 6730 6740 7241 7601 7602
 fleet_guard
 fleet_kill server; fleet_kill proxy; fleet_kill controlplane; sleep 0.4
 B=./target/release/flint-server
 CP=./target/release/flint-controlplane
 PX=./target/release/flint-proxy
-STATE=/tmp/flint-cp-drill-state
+STATE=$FLINT_DRILL_ROOT/flint-cp-drill-state
 cleanup() {
   # Was `pkill -9 -f "flint-server --port 673"`, which covers 6730 and NOT
   # 6740 — so this drill passed while leaking its second node on every run.
@@ -27,20 +27,20 @@ cleanup() {
   fleet_kill server 2>/dev/null
   fleet_kill proxy
   fleet_kill controlplane
-  rm -rf /tmp/flint-cpd-* "$STATE" "$STATE.tmp"
+  rm -rf $FLINT_DRILL_ROOT/flint-cpd-* "$STATE" "$STATE.tmp"
 }
 trap cleanup EXIT
 rm -f "$STATE"
 
 echo "== data plane: two single-master pairs"
 for p in 6730 6740; do
-  d="/tmp/flint-cpd-$p"; rm -rf "$d"
+  d="$FLINT_DRILL_ROOT/flint-cpd-$p"; rm -rf "$d"
   $B --port $p --engine rocks --data-dir "$d" 2>/dev/null &
 done
 sleep 0.8
 
 echo "== control plane + registrations"
-$CP --port 7241 --state "$STATE" 2>/tmp/flint-cpd-cp.log &
+$CP --port 7241 --state "$STATE" 2>$FLINT_DRILL_ROOT/flint-cpd-cp.log &
 fleet_wait_listen 7241
 sleep 0.5
 fleet_cp 7241 CPADDPROXY 127.0.0.1:7601
@@ -49,8 +49,8 @@ fleet_cp 7241 CPADDPAIR 127.0.0.1:6730
 fleet_cp 7241 CPADDPAIR 127.0.0.1:6740
 
 echo "== two proxies in control-plane mode (no --pairs/--tenants flags)"
-$PX --port 7601 --control-plane 127.0.0.1:7241 --advertise 127.0.0.1:7601 2>/tmp/flint-cpd-p1.log &
-$PX --port 7602 --control-plane 127.0.0.1:7241 --advertise 127.0.0.1:7602 2>/tmp/flint-cpd-p2.log &
+$PX --port 7601 --control-plane 127.0.0.1:7241 --advertise 127.0.0.1:7601 2>$FLINT_DRILL_ROOT/flint-cpd-p1.log &
+$PX --port 7602 --control-plane 127.0.0.1:7241 --advertise 127.0.0.1:7602 2>$FLINT_DRILL_ROOT/flint-cpd-p2.log &
 fleet_wait_listen 7601 7602
 sleep 1.5
 
@@ -65,7 +65,7 @@ sleep 1.5   # push cycle
 
 echo "== sub-group enforcement: AUTH works ONLY on the assigned proxy"
 W=$(valkey-cli -p "$APORT" -a tok-acme --no-auth-warning SET hello world 2>&1)
-[ "$W" = "OK" ] || { echo "FAIL: assigned proxy :$APORT rejected tenant: $W"; tail -4 /tmp/flint-cpd-p1.log /tmp/flint-cpd-p2.log; exit 1; }
+[ "$W" = "OK" ] || { echo "FAIL: assigned proxy :$APORT rejected tenant: $W"; tail -4 $FLINT_DRILL_ROOT/flint-cpd-p1.log $FLINT_DRILL_ROOT/flint-cpd-p2.log; exit 1; }
 G=$(valkey-cli -p "$APORT" -a tok-acme --no-auth-warning GET hello)
 [ "$G" = "world" ] || { echo "FAIL: data path via CP-fed proxy: '$G'"; exit 1; }
 X=$(valkey-cli -p "$OPORT" -a tok-acme --no-auth-warning GET hello 2>&1)
@@ -96,7 +96,7 @@ fleet_kill controlplane; sleep 0.5
 W=$(valkey-cli -p "$APORT" -a tok-acme --no-auth-warning SET during-outage ok 2>&1)
 [ "$W" = "OK" ] || { echo "FAIL: data path depends on CP being up: $W"; exit 1; }
 [ "$(valkey-cli -p "$APORT" -a tok-acme --no-auth-warning GET during-outage)" = "ok" ] || { echo "FAIL: read during outage"; exit 1; }
-$CP --port 7241 --state "$STATE" 2>>/tmp/flint-cpd-cp.log &
+$CP --port 7241 --state "$STATE" 2>>$FLINT_DRILL_ROOT/flint-cpd-cp.log &
 fleet_wait_listen 7241
 sleep 1
 V_AFTER=$(valkey-cli -p 7241 CPINFO | tr '\r' '\n' | grep "^version" | cut -d: -f2)

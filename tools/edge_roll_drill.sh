@@ -33,9 +33,9 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init /tmp/flint-edgeroll-state 7970 7971 7972 7973
+fleet_init $FLINT_DRILL_ROOT/flint-edgeroll-state 7970 7971 7972 7973
 fleet_guard
-D=/tmp/flint-edgeroll; STATE=/tmp/flint-edgeroll-state
+D=$FLINT_DRILL_ROOT/flint-edgeroll; STATE=$FLINT_DRILL_ROOT/flint-edgeroll-state
 INV=$D/cluster.flint
 TAG=edge-roll-9
 rm -rf "$D" "$STATE"; mkdir -p "$D"

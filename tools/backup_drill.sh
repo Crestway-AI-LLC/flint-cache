@@ -28,11 +28,11 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init /tmp/flint-bkp 6950 6951 6952 6953 6954
+fleet_init $FLINT_DRILL_ROOT/flint-bkp 6950 6951 6952 6953 6954
 fleet_guard
 B=./target/release/flint-server
 BK=./target/release/flint-backup
-D=/tmp/flint-bkp
+D=$FLINT_DRILL_ROOT/flint-bkp
 fleet_kill server; sleep 0.4
 cleanup() { fleet_kill server; rm -rf "$D"; }
 trap cleanup EXIT

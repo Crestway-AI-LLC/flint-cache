@@ -48,9 +48,9 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init /tmp/flint-edgeca 7451 7452 7453 7454
+fleet_init $FLINT_DRILL_ROOT/flint-edgeca 7451 7452 7453 7454
 fleet_guard
-D=/tmp/flint-edgeca
+D=$FLINT_DRILL_ROOT/flint-edgeca
 STATE=$D/state
 CERTS=$STATE/certs
 OUTER=$D/outer

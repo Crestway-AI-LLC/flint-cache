@@ -40,11 +40,11 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init /tmp/flint-affinity 6855 6856 7155 7855
+fleet_init $FLINT_DRILL_ROOT/flint-affinity 6855 6856 7155 7855
 fleet_guard
 
 CTL=./target/release/flintctl
-D=/tmp/flint-affinity; rm -rf "$D"; mkdir -p "$D"
+D=$FLINT_DRILL_ROOT/flint-affinity; rm -rf "$D"; mkdir -p "$D"
 LIVE="$D/live.flint"     # the running topology. NEVER rewritten.
 CASE="$D/case.flint"     # rewritten per assertion.
 

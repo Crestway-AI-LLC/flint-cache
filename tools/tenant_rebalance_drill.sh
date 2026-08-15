@@ -11,7 +11,7 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init /tmp/flint-tr- 6668 6700 6701
+fleet_init $FLINT_DRILL_ROOT/flint-tr- 6668 6700 6701
 fleet_guard
 fleet_kill server; fleet_kill controller; fleet_kill proxy; sleep 0.4
 B=./target/release/flint-server
@@ -20,18 +20,18 @@ cleanup() {
   pkill -9 -f "flint-server --port 670" 2>/dev/null
   fleet_kill controller
   fleet_kill proxy
-  rm -rf /tmp/flint-tr-*
+  rm -rf $FLINT_DRILL_ROOT/flint-tr-*
 }
 trap cleanup EXIT
 
 for p in $P0 $P1; do
-  d="/tmp/flint-tr-$p"; rm -rf "$d"
+  d="$FLINT_DRILL_ROOT/flint-tr-$p"; rm -rf "$d"
   $B --port $p --engine rocks --data-dir "$d" 2>/dev/null &
 done
 sleep 0.8
 
 ./target/release/flint-proxy --port 6668 --pairs "127.0.0.1:$P0;127.0.0.1:$P1" \
-  --tenants "tokA=alpha,tokB=beta" 2>/tmp/flint-tr-proxy.log &
+  --tenants "tokA=alpha,tokB=beta" 2>$FLINT_DRILL_ROOT/flint-tr-proxy.log &
 fleet_wait_listen 6668
 sleep 0.5
 
@@ -69,7 +69,7 @@ echo "  tenant DBSIZE: alpha=$DA beta=$DB; node g0 rows=$G0 (all on g0)"
 echo "== controller with --rebalance-execute ((ns,slot) units)"
 ./target/release/flint-controller --pairs "127.0.0.1:$P0;127.0.0.1:$P1" \
   --id TRX --poll-ms 200 --rebalance-deadband 0.2 --rebalance-execute --max-slots-per-cycle 3 \
-  2>/tmp/flint-tr-ctl.log &
+  2>$FLINT_DRILL_ROOT/flint-tr-ctl.log &
 
 BALANCED=0
 for i in $(seq 1 90); do
@@ -77,16 +77,16 @@ for i in $(seq 1 90); do
   N1=$(valkey-cli -p $P1 FLINTSLOTSTATS | awk '{s+=$2} END{print s+0}')
   MAX=$N0; [ "$N1" -gt "$MAX" ] && MAX=$N1
   MEAN=$(( (N0+N1) / 2 ))
-  if [ "$MEAN" -gt 0 ] && [ $((MAX*100)) -le $((MEAN*125)) ] && grep -q "rebalance EXECUTE" /tmp/flint-tr-ctl.log; then
+  if [ "$MEAN" -gt 0 ] && [ $((MAX*100)) -le $((MEAN*125)) ] && grep -q "rebalance EXECUTE" $FLINT_DRILL_ROOT/flint-tr-ctl.log; then
     BALANCED=1; break
   fi
   sleep 1
 done
 N0=$(valkey-cli -p $P0 FLINTSLOTSTATS | awk '{s+=$2} END{print s+0}')
 N1=$(valkey-cli -p $P1 FLINTSLOTSTATS | awk '{s+=$2} END{print s+0}')
-echo "  node fills after: g0=$N0 g1=$N1 (moves: $(grep -c 'MIGRATEIN-OK' /tmp/flint-tr-ctl.log))"
-grep -oE "units \[[^]]*\]" /tmp/flint-tr-ctl.log | head -3 | sed 's/^/  /'
-[ "$BALANCED" = "1" ] || { echo "FAIL: did not converge"; tail -12 /tmp/flint-tr-ctl.log; exit 1; }
+echo "  node fills after: g0=$N0 g1=$N1 (moves: $(grep -c 'MIGRATEIN-OK' $FLINT_DRILL_ROOT/flint-tr-ctl.log))"
+grep -oE "units \[[^]]*\]" $FLINT_DRILL_ROOT/flint-tr-ctl.log | head -3 | sed 's/^/  /'
+[ "$BALANCED" = "1" ] || { echo "FAIL: did not converge"; tail -12 $FLINT_DRILL_ROOT/flint-tr-ctl.log; exit 1; }
 
 echo "== per-tenant conservation via proxy fan-out"
 DA=$(valkey-cli -p 6668 -a tokA --no-auth-warning DBSIZE)

@@ -17,10 +17,10 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init /tmp/flint-slow- 6386 6387
+fleet_init $FLINT_DRILL_ROOT/flint-slow- 6386 6387
 fleet_guard
 fleet_kill server; fleet_kill controller; sleep 0.4
-D1=/tmp/flint-slow-1; D2=/tmp/flint-slow-2
+D1=$FLINT_DRILL_ROOT/flint-slow-1; D2=$FLINT_DRILL_ROOT/flint-slow-2
 rm -rf "$D1" "$D2" "$D1.log" "$D2.log"
 P1=6386; P2=6387
 
@@ -41,12 +41,12 @@ trap cleanup EXIT
 echo "== start managed controller (--slow-promote-ms 2000)"
 ./target/release/flint-controller --manage-slots "$P1:$D1,$P2:$D2" --id SLOW \
   --poll-ms 150 --confirm 3 --slow-promote-ms 2000 --max-stale-ms 8000 \
-  2>/tmp/flint-slow.log &
+  2>$FLINT_DRILL_ROOT/flint-slow.log &
 for i in $(seq 1 60); do
   [ "$(valkey-cli -p $P1 PING 2>/dev/null)" = "PONG" ] && [ "$(valkey-cli -p $P2 PING 2>/dev/null)" = "PONG" ] && break
   sleep 0.2
 done
-[ "$(valkey-cli -p $P1 PING 2>/dev/null)" = "PONG" ] || { echo "FAIL: controller never bootstrapped"; cat /tmp/flint-slow.log; exit 1; }
+[ "$(valkey-cli -p $P1 PING 2>/dev/null)" = "PONG" ] || { echo "FAIL: controller never bootstrapped"; cat $FLINT_DRILL_ROOT/flint-slow.log; exit 1; }
 
 master_port() {
   for p in $P1 $P2; do
@@ -61,7 +61,7 @@ for i in $(seq 1 60); do
   M=$(master_port); [ -n "$M" ] && [ "$(valkey-cli -p $M FLINTINFO 2>/dev/null | tr '\r' ' ' | grep -oE 'live_replicas:[0-9]+')" = "live_replicas:1" ] && break
   sleep 0.2
 done
-M=$(master_port); [ -n "$M" ] || { echo "FAIL: no master after bootstrap"; cat /tmp/flint-slow.log; exit 1; }
+M=$(master_port); [ -n "$M" ] || { echo "FAIL: no master after bootstrap"; cat $FLINT_DRILL_ROOT/flint-slow.log; exit 1; }
 OTHER=$([ "$M" = "$P1" ] && echo $P2 || echo $P1)
 echo "converged: master :$M, replica :$OTHER"
 
@@ -72,10 +72,10 @@ pkill -STOP -f "flint-server --port $M" || { echo "FAIL: could not SIGSTOP :$M";
 sleep 1.2
 R=$(role_of $OTHER)
 pkill -CONT -f "flint-server --port $M"
-[ "$R" = "role:replica" ] || { echo "FAIL: replica :$OTHER became '$R' during a brief stall — the slow master was FLAPPED"; tail -15 /tmp/flint-slow.log; exit 1; }
+[ "$R" = "role:replica" ] || { echo "FAIL: replica :$OTHER became '$R' during a brief stall — the slow master was FLAPPED"; tail -15 $FLINT_DRILL_ROOT/flint-slow.log; exit 1; }
 # Master resumes; its epoch must be unchanged (no promotion happened anywhere).
 for i in $(seq 1 40); do [ "$(role_of $M)" = "role:master" ] && break; sleep 0.2; done
-[ "$(role_of $M)" = "role:master" ] || { echo "FAIL: master :$M did not resume after SIGCONT"; tail -15 /tmp/flint-slow.log; exit 1; }
+[ "$(role_of $M)" = "role:master" ] || { echo "FAIL: master :$M did not resume after SIGCONT"; tail -15 $FLINT_DRILL_ROOT/flint-slow.log; exit 1; }
 EAFTER=$(epoch_of $M)
 [ "$EAFTER" = "$EBEFORE" ] || { echo "FAIL: epoch moved $EBEFORE -> $EAFTER — a promotion occurred during the stall"; exit 1; }
 echo "  brief stall rode through: :$OTHER stayed replica, :$M retained at $EBEFORE"
@@ -95,11 +95,11 @@ pkill -STOP -f "flint-server --port $M" || { echo "FAIL: could not SIGSTOP :$M";
 ESCALATED=0; WHY=""
 for i in $(seq 1 120); do   # up to ~24s: observe of a frozen node is timeout-bound, so ticks are slow
   [ "$(role_of $OTHER)" = "role:master" ] && { ESCALATED=1; WHY="promoted :$OTHER"; break; }
-  grep -q "REFUSING" /tmp/flint-slow.log 2>/dev/null && { ESCALATED=1; WHY="paged (degraded window)"; break; }
+  grep -q "REFUSING" $FLINT_DRILL_ROOT/flint-slow.log 2>/dev/null && { ESCALATED=1; WHY="paged (degraded window)"; break; }
   sleep 0.2
 done
 pkill -CONT -f "flint-server --port $M"   # unfreeze the old master (fenced if a promotion happened)
-[ "$ESCALATED" = "1" ] || { echo "FAIL: a hung-but-listening master was held forever — no promote, no page"; tail -15 /tmp/flint-slow.log; exit 1; }
+[ "$ESCALATED" = "1" ] || { echo "FAIL: a hung-but-listening master was held forever — no promote, no page"; tail -15 $FLINT_DRILL_ROOT/flint-slow.log; exit 1; }
 echo "  sustained stall escalated: $WHY"
 
 echo "PASS: a listening-but-slow master is retained on a brief stall and escalated only when sustained"

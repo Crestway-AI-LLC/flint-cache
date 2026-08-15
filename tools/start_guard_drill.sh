@@ -23,10 +23,10 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init /tmp/flint-startguard 6963 6964 7655 7895
+fleet_init $FLINT_DRILL_ROOT/flint-startguard 6963 6964 7655 7895
 fleet_guard
-STATE=/tmp/flint-startguard
-INV=/tmp/flint-startguard.flint
+STATE=$FLINT_DRILL_ROOT/flint-startguard
+INV=$FLINT_DRILL_ROOT/flint-startguard.flint
 fleet_kill server; fleet_kill proxy; fleet_kill controlplane; sleep 0.3
 cleanup() {
   ./target/release/flintctl -f "$INV" stop >/dev/null 2>&1

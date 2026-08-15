@@ -16,10 +16,10 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init /tmp/flint-sweep-a 6317 6318 6319 6320 6321 7820 7879 7889
+fleet_init $FLINT_DRILL_ROOT/flint-sweep-a 6317 6318 6319 6320 6321 7820 7879 7889
 fleet_guard
-A=/tmp/flint-sweep-a; B=/tmp/flint-sweep-b
-INVA=/tmp/flint-sweep-a.flint; INVB=/tmp/flint-sweep-b.flint
+A=$FLINT_DRILL_ROOT/flint-sweep-a; B=$FLINT_DRILL_ROOT/flint-sweep-b
+INVA=$FLINT_DRILL_ROOT/flint-sweep-a.flint; INVB=$FLINT_DRILL_ROOT/flint-sweep-b.flint
 CTL=./target/release/flintctl
 fleet_kill server; fleet_kill proxy
 fleet_kill controlplane; fleet_kill controller

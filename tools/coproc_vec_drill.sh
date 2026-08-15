@@ -15,12 +15,12 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init /tmp/flint-vecd 6676 6677 6678
+fleet_init $FLINT_DRILL_ROOT/flint-vecd 6676 6677 6678
 fleet_guard
 B=./target/release/flint-server
 PX=./target/release/flint-proxy
 VEC=./target/release/flint-vec
-D=/tmp/flint-vecd; rm -rf "$D"; mkdir -p "$D"
+D=$FLINT_DRILL_ROOT/flint-vecd; rm -rf "$D"; mkdir -p "$D"
 COPROC_PID=""
 fleet_kill server; fleet_kill proxy; sleep 0.4
 cleanup() {

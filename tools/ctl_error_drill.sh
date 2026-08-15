@@ -17,17 +17,17 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init /tmp/flint-ctlerr-state 7701 7702 7830
+fleet_init $FLINT_DRILL_ROOT/flint-ctlerr-state 7701 7702 7830
 fleet_guard
-STATE=/tmp/flint-ctlerr-state; INV=/tmp/flint-ctlerr.flint
-DEAD=/tmp/flint-ctlerr-dead.flint
+STATE=$FLINT_DRILL_ROOT/flint-ctlerr-state; INV=$FLINT_DRILL_ROOT/flint-ctlerr.flint
+DEAD=$FLINT_DRILL_ROOT/flint-ctlerr-dead.flint
 CTL=./target/release/flintctl
 fleet_kill server; fleet_kill controlplane
 sleep 0.4
 cleanup() {
   $CTL -f "$INV" stop >/dev/null 2>&1
   fleet_kill server; fleet_kill controlplane
-  rm -rf "$STATE" "$INV" "$DEAD" /tmp/flint-ctlerr.out /tmp/flint-ctlerr.err
+  rm -rf "$STATE" "$INV" "$DEAD" $FLINT_DRILL_ROOT/flint-ctlerr.out $FLINT_DRILL_ROOT/flint-ctlerr.err
 }
 trap cleanup EXIT
 rm -rf "$STATE" "$INV" "$DEAD"
@@ -55,10 +55,10 @@ sed 's/7830/7839/' "$INV" > "$DEAD"
 # fails_cleanly <expected-stderr-substring> <flintctl args...>
 fails_cleanly() {
   local want=$1; shift
-  "$@" >/tmp/flint-ctlerr.out 2>/tmp/flint-ctlerr.err
+  "$@" >$FLINT_DRILL_ROOT/flint-ctlerr.out 2>$FLINT_DRILL_ROOT/flint-ctlerr.err
   local rc=$?
   local out err
-  out=$(cat /tmp/flint-ctlerr.out); err=$(cat /tmp/flint-ctlerr.err)
+  out=$(cat $FLINT_DRILL_ROOT/flint-ctlerr.out); err=$(cat $FLINT_DRILL_ROOT/flint-ctlerr.err)
   [ "$rc" = "1" ] || { echo "FAIL: [$*] exit $rc (want 1)"; echo "  stderr: $err"; exit 1; }
   case "$err" in
     *"$want"*) ;;

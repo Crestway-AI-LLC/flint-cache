@@ -14,12 +14,12 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init /tmp/flint-quota 6985 7690 7911 7912
+fleet_init $FLINT_DRILL_ROOT/flint-quota 6985 7690 7911 7912
 fleet_guard
 B=./target/release/flint-server
 CP=./target/release/flint-controlplane
 PX=./target/release/flint-proxy
-D=/tmp/flint-quota; rm -rf "$D"; mkdir -p "$D"
+D=$FLINT_DRILL_ROOT/flint-quota; rm -rf "$D"; mkdir -p "$D"
 fleet_kill server; fleet_kill proxy
 fleet_kill controlplane; sleep 0.4
 cleanup() {

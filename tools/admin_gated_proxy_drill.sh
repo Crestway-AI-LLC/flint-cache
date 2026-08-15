@@ -32,9 +32,9 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init /tmp/flint-admingate 7441 7442 7443 7444
+fleet_init $FLINT_DRILL_ROOT/flint-admingate 7441 7442 7443 7444
 fleet_guard
-STATE=/tmp/flint-admingate
+STATE=$FLINT_DRILL_ROOT/flint-admingate
 INV=$STATE/cluster.flint
 A=127.0.0.1:7441
 B=127.0.0.1:7442

@@ -56,9 +56,9 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init /tmp/flint-bystander 7490 7491 7492 7493 7495
+fleet_init $FLINT_DRILL_ROOT/flint-bystander 7490 7491 7492 7493 7495
 fleet_guard
-D=/tmp/flint-bystander; INV=$D/cluster.flint
+D=$FLINT_DRILL_ROOT/flint-bystander; INV=$D/cluster.flint
 CTL=./target/release/flintctl
 LEASE="${FLINT_LEASE_TTL_MS:-3000}"
 STALL_S="${FLINT_STALL_S:-10}"

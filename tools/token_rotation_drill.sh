@@ -9,32 +9,32 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init /tmp/flint-rot-state 6750 7550 6323
+fleet_init $FLINT_DRILL_ROOT/flint-rot-state 6750 7550 6323
 fleet_guard
 fleet_kill server; fleet_kill proxy; fleet_kill controlplane; sleep 0.4
 B=./target/release/flint-server
 CP=./target/release/flint-controlplane
 PX=./target/release/flint-proxy
-STATE=/tmp/flint-rot-state
+STATE=$FLINT_DRILL_ROOT/flint-rot-state
 cleanup() {
   pkill -9 -f "flint-server --port 675" 2>/dev/null
   fleet_kill proxy
   fleet_kill controlplane
-  rm -rf /tmp/flint-rot-* "$STATE" "$STATE.tmp"
+  rm -rf $FLINT_DRILL_ROOT/flint-rot-* "$STATE" "$STATE.tmp"
 }
 trap cleanup EXIT
 rm -f "$STATE"
 
-$B --port 6750 --engine rocks --data-dir /tmp/flint-rot-data 2>/dev/null &
+$B --port 6750 --engine rocks --data-dir $FLINT_DRILL_ROOT/flint-rot-data 2>/dev/null &
 fleet_wait_listen 6750
 sleep 0.6
-$CP --port 7550 --state "$STATE" 2>/tmp/flint-rot-cp.log &
+$CP --port 7550 --state "$STATE" 2>$FLINT_DRILL_ROOT/flint-rot-cp.log &
 fleet_wait_listen 7550
 sleep 0.4
 fleet_cp 7550 CPADDPROXY 127.0.0.1:6323
 fleet_cp 7550 CPADDPAIR 127.0.0.1:6750
 fleet_cp 7550 CPADDTENANT acme tok-v1 acme 1
-$PX --port 6323 --control-plane 127.0.0.1:7550 --advertise 127.0.0.1:6323 2>/tmp/flint-rot-px.log &
+$PX --port 6323 --control-plane 127.0.0.1:7550 --advertise 127.0.0.1:6323 2>$FLINT_DRILL_ROOT/flint-rot-px.log &
 fleet_wait_listen 6323
 sleep 1.2
 
@@ -80,7 +80,7 @@ echo "  v1 rejected, v2 serves"
 
 echo "== rotation state is durable (CP restart preserves current token)"
 fleet_kill controlplane; sleep 0.4
-$CP --port 7550 --state "$STATE" 2>>/tmp/flint-rot-cp.log &
+$CP --port 7550 --state "$STATE" 2>>$FLINT_DRILL_ROOT/flint-rot-cp.log &
 fleet_wait_listen 7550
 sleep 1.5
 [ "$(a tok-v2 GET k)" = "hello" ] || { echo "FAIL: v2 lost across CP restart"; exit 1; }

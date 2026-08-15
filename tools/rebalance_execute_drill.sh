@@ -8,7 +8,7 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init /tmp/flint-rb- 6600 6601 6602
+fleet_init $FLINT_DRILL_ROOT/flint-rb- 6600 6601 6602
 fleet_guard
 fleet_kill server; fleet_kill controller; sleep 0.4
 B=./target/release/flint-server
@@ -17,12 +17,12 @@ DIRS=""
 cleanup() {
   pkill -9 -f "flint-server --port 660" 2>/dev/null
   fleet_kill controller
-  rm -rf /tmp/flint-rb-*
+  rm -rf $FLINT_DRILL_ROOT/flint-rb-*
 }
 trap cleanup EXIT
 
 for p in $P0 $P1 $P2; do
-  d="/tmp/flint-rb-$p"; rm -rf "$d"
+  d="$FLINT_DRILL_ROOT/flint-rb-$p"; rm -rf "$d"
   $B --port $p --engine rocks --data-dir "$d" 2>/dev/null &
 done
 sleep 0.8
@@ -44,7 +44,7 @@ echo "== start controller with --rebalance-execute (deadband 0.2, 2 slots/cycle)
 ./target/release/flint-controller \
   --pairs "127.0.0.1:$P0;127.0.0.1:$P1;127.0.0.1:$P2" \
   --id RBX --poll-ms 200 --rebalance-deadband 0.2 --rebalance-execute --max-slots-per-cycle 2 \
-  2>/tmp/flint-rbx.log &
+  2>$FLINT_DRILL_ROOT/flint-rbx.log &
 
 # Wait for convergence: balanced-within-deadband logged AFTER at least one
 # EXECUTE, or fills numerically balanced.
@@ -90,7 +90,7 @@ for i in $(seq 1 120); do
   # coin toss.
   SUM=$((D0+D1+D2))
   if [ "$MEAN" -gt 0 ] && [ $((MAX*100)) -le $((MEAN*125)) ] \
-     && [ "$SUM" -eq "$TOTAL" ] && grep -q "rebalance EXECUTE" /tmp/flint-rbx.log; then
+     && [ "$SUM" -eq "$TOTAL" ] && grep -q "rebalance EXECUTE" $FLINT_DRILL_ROOT/flint-rbx.log; then
     BALANCED=1; break
   fi
   sleep 1
@@ -102,14 +102,14 @@ done
 if [ -z "$N0" ]; then
   echo "FAIL: no numeric DBSIZE from the group in 120s — every poll was fenced or errored"
   echo "      last reply: $LASTREPLY"
-  tail -15 /tmp/flint-rbx.log; exit 1
+  tail -15 $FLINT_DRILL_ROOT/flint-rbx.log; exit 1
 fi
-echo "  fills after: g0=$N0 g1=$N1 g2=$N2 (executes: $(grep -c "rebalance EXECUTE" /tmp/flint-rbx.log), slot moves: $(grep -c "MIGRATEIN-OK" /tmp/flint-rbx.log))"
+echo "  fills after: g0=$N0 g1=$N1 g2=$N2 (executes: $(grep -c "rebalance EXECUTE" $FLINT_DRILL_ROOT/flint-rbx.log), slot moves: $(grep -c "MIGRATEIN-OK" $FLINT_DRILL_ROOT/flint-rbx.log))"
 # Say WHICH half of "settled" never arrived — a conservation failure that
 # persists is a product bug, and must not be reported as "did not balance".
 [ "$BALANCED" = "1" ] || {
-  MOVES=$(grep -c "MIGRATEIN-OK" /tmp/flint-rbx.log)
-  EXECS=$(grep -c "rebalance EXECUTE" /tmp/flint-rbx.log)
+  MOVES=$(grep -c "MIGRATEIN-OK" $FLINT_DRILL_ROOT/flint-rbx.log)
+  EXECS=$(grep -c "rebalance EXECUTE" $FLINT_DRILL_ROOT/flint-rbx.log)
   if [ $((N0+N1+N2)) -ne "$TOTAL" ]; then
     # An INFLATED sum with a migration still running is the mid-move window,
     # not invented data: a slot copies to the destination and only then drops
@@ -130,7 +130,7 @@ echo "  fills after: g0=$N0 g1=$N1 g2=$N2 (executes: $(grep -c "rebalance EXECUT
   else
     echo "FAIL: did not converge to balance"
   fi
-  tail -15 /tmp/flint-rbx.log; exit 1
+  tail -15 $FLINT_DRILL_ROOT/flint-rbx.log; exit 1
 }
 
 echo "== conservation: every key exactly once across the group"

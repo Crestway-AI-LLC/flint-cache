@@ -20,10 +20,10 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init /tmp/flint-asyncw 6995 6996
+fleet_init $FLINT_DRILL_ROOT/flint-asyncw 6995 6996
 fleet_guard
 B=./target/release/flint-server
-D=/tmp/flint-asyncw; rm -rf "$D"; mkdir -p "$D"
+D=$FLINT_DRILL_ROOT/flint-asyncw; rm -rf "$D"; mkdir -p "$D"
 fleet_kill server; sleep 0.4
 cleanup() { fleet_kill server; rm -rf "$D"; }
 trap cleanup EXIT

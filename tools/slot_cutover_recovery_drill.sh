@@ -9,7 +9,7 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init /tmp/flint-rec- 6580 6581
+fleet_init $FLINT_DRILL_ROOT/flint-rec- 6580 6581
 fleet_guard
 B=./target/release/flint-server
 SPORT=6580; DPORT=6581
@@ -28,7 +28,7 @@ run_once() {
   local delay="$1"
   pkill -9 -f "flint-server --port 658" 2>/dev/null; fleet_kill controller; sleep 0.4
   local SDIR DDIR
-  SDIR=$(mktemp -d /tmp/flint-rec-s.XXXXXX); DDIR=$(mktemp -d /tmp/flint-rec-d.XXXXXX)
+  SDIR=$(mktemp -d $FLINT_DRILL_ROOT/flint-rec-s.XXXXXX); DDIR=$(mktemp -d $FLINT_DRILL_ROOT/flint-rec-d.XXXXXX)
   $B --port $SPORT --engine rocks --data-dir "$SDIR" 2>/dev/null &
   $B --port $DPORT --engine rocks --data-dir "$DDIR" 2>/dev/null &
   fleet_wait_listen $SPORT $DPORT
@@ -60,7 +60,7 @@ run_once() {
   echo "  [delay $delay] after restart: source=[$SM] dest=[$DM] -> $PHASE"
 
   # Recovery controller: reconciles from the manifests, no other input.
-  ./target/release/flint-controller --recover-nodes "$SADDR,$DADDR" --id REC --poll-ms 200 2>>/tmp/flint-rec.log &
+  ./target/release/flint-controller --recover-nodes "$SADDR,$DADDR" --id REC --poll-ms 200 2>>$FLINT_DRILL_ROOT/flint-rec.log &
   local CTL=$!
 
   # Wait until the move is fully resolved: dest owns (a write succeeds) AND
@@ -104,7 +104,7 @@ run_once() {
 test_half_done_flip() {
   pkill -9 -f "flint-server --port 658" 2>/dev/null; fleet_kill controller; sleep 0.4
   local SDIR DDIR
-  SDIR=$(mktemp -d /tmp/flint-rec-s.XXXXXX); DDIR=$(mktemp -d /tmp/flint-rec-d.XXXXXX)
+  SDIR=$(mktemp -d $FLINT_DRILL_ROOT/flint-rec-s.XXXXXX); DDIR=$(mktemp -d $FLINT_DRILL_ROOT/flint-rec-d.XXXXXX)
   $B --port $SPORT --engine rocks --data-dir "$SDIR" 2>/dev/null &
   $B --port $DPORT --engine rocks --data-dir "$DDIR" 2>/dev/null &
   fleet_wait_listen $SPORT $DPORT
@@ -117,7 +117,7 @@ test_half_done_flip() {
   valkey-cli -p $SPORT FLINTSLOTFREEZE "$SLOT" "$DADDR" >/dev/null
   echo "  [half-done-flip] source frozen (Migrating), dest owns; source records=[$(valkey-cli -p $SPORT FLINTMIGRATIONS)]"
 
-  ./target/release/flint-controller --recover-nodes "$SADDR,$DADDR" --id REC2 --poll-ms 200 2>>/tmp/flint-rec.log &
+  ./target/release/flint-controller --recover-nodes "$SADDR,$DADDR" --id REC2 --poll-ms 200 2>>$FLINT_DRILL_ROOT/flint-rec.log &
   local CTL=$! RESOLVED=0 i
   for i in $(seq 1 60); do
     if echo "$(valkey-cli -p $SPORT GET "{mover}:key000000" 2>&1)" | grep -qE "MOVED $SLOT $DADDR"; then RESOLVED=1; break; fi
@@ -131,7 +131,7 @@ test_half_done_flip() {
 }
 
 trap 'pkill -9 -f "flint-server --port 658" 2>/dev/null; fleet_kill controller' EXIT
-: > /tmp/flint-rec.log
+: > $FLINT_DRILL_ROOT/flint-rec.log
 echo "== slot {mover}=$SLOT, $KEYS keys; killing BOTH nodes mid-cutover (timing-based)"
 FAILS=0
 for d in 0.3 0.5 0.7; do

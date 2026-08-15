@@ -9,7 +9,7 @@ set -euo pipefail
 
 KEYS="${1:-100000}"
 PORT="${2:-6410}"
-DIR="$(mktemp -d /tmp/flint-drill.XXXXXX)"
+DIR="$(mktemp -d ${FLINT_DRILL_ROOT:-/tmp}/flint-drill.XXXXXX)"
 BIN="$(dirname "$0")/../target/release/flint-server"
 
 cleanup() { pkill -f "flint-server --port $PORT" 2>/dev/null || true; rm -rf "$DIR"; }

@@ -27,9 +27,9 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init /tmp/flint-cpharoll-state 7603 7604 7605 7606 7607 7608
+fleet_init $FLINT_DRILL_ROOT/flint-cpharoll-state 7603 7604 7605 7606 7607 7608
 fleet_guard
-D=/tmp/flint-cpharoll; STATE=/tmp/flint-cpharoll-state
+D=$FLINT_DRILL_ROOT/flint-cpharoll; STATE=$FLINT_DRILL_ROOT/flint-cpharoll-state
 INV=$D/cluster.flint
 TAG=cpha-roll-3
 rm -rf "$D" "$STATE"; mkdir -p "$D"

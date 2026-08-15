@@ -45,7 +45,7 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init /tmp/flint-buildstamp-state 7411 7412 7413 7414
+fleet_init $FLINT_DRILL_ROOT/flint-buildstamp-state 7411 7412 7413 7414
 fleet_guard
 
 # A STAMP THE CRATE VERSION CANNOT IMITATE, exported before anything runs so
@@ -64,8 +64,8 @@ fleet_guard
 # library that parses this field is the failure mode being guarded against.
 export FLINT_BUILD_VERSION=v9.9.9-stamp-probe
 WIRE=9.9.9-stamp-probe
-STATE=/tmp/flint-buildstamp-state
-INV=/tmp/flint-buildstamp.flint
+STATE=$FLINT_DRILL_ROOT/flint-buildstamp-state
+INV=$FLINT_DRILL_ROOT/flint-buildstamp.flint
 A=127.0.0.1:7411
 B=127.0.0.1:7412
 PROXY=127.0.0.1:7413

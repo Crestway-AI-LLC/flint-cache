@@ -14,13 +14,13 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init /tmp/flint-ctls 6795 6796 7541 7542 7543 7551 7552 7553 7790
+fleet_init $FLINT_DRILL_ROOT/flint-ctls 6795 6796 7541 7542 7543 7551 7552 7553 7790
 fleet_guard
 B=./target/release/flint-server
 CP=./target/release/flint-controlplane
 PX=./target/release/flint-proxy
 CTL=./target/release/flint-controller
-D=/tmp/flint-ctls; rm -rf "$D"; mkdir -p "$D"
+D=$FLINT_DRILL_ROOT/flint-ctls; rm -rf "$D"; mkdir -p "$D"
 fleet_kill server; fleet_kill proxy
 fleet_kill controlplane; fleet_kill controller; sleep 0.4
 cleanup() {
@@ -47,12 +47,12 @@ echo "  minted"
 # port; follow "-ERR LEADER 127.0.0.1:<port>" redirects to the leader.
 resp() {  # $1=port $2=timeout-s, rest = command words
   python3 - "$@" <<'PY'
-import re, socket, ssl, sys
+import re, socket, ssl, sys, os
 port, tmo, words = int(sys.argv[1]), float(sys.argv[2]), sys.argv[3:]
 ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
 ctx.check_hostname = False
 ctx.verify_mode = ssl.CERT_NONE
-ctx.load_cert_chain("/tmp/flint-ctls/int.crt", "/tmp/flint-ctls/int.key")
+ctx.load_cert_chain(os.environ.get("FLINT_DRILL_ROOT","/tmp")+"/flint-ctls/int.crt", os.environ.get("FLINT_DRILL_ROOT","/tmp")+"/flint-ctls/int.key")
 frame = f"*{len(words)}\r\n".encode() + b"".join(
     f"${len(w)}\r\n{w}\r\n".encode() for w in words)
 for _ in range(8):

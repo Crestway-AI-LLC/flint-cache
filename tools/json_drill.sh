@@ -15,9 +15,9 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init /tmp/flint-json-state 7311 7312 7313 7314 7681 7722
+fleet_init $FLINT_DRILL_ROOT/flint-json-state 7311 7312 7313 7314 7681 7722
 fleet_guard
-STATE=/tmp/flint-json-state; INV=/tmp/flint-json.flint
+STATE=$FLINT_DRILL_ROOT/flint-json-state; INV=$FLINT_DRILL_ROOT/flint-json.flint
 fleet_kill server; fleet_kill proxy
 fleet_kill controlplane; fleet_kill controller
 sleep 0.4
@@ -60,8 +60,8 @@ done
 # documents really span pairs rather than piling onto one.
 share() {
   python3 - "$1" <<'PY'
-import socket, ssl, sys
-d="/tmp/flint-json-state/certs"
+import socket, ssl, sys, os
+d=os.environ.get("FLINT_DRILL_ROOT","/tmp")+"/flint-json-state/certs"
 ctx=ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT); ctx.load_verify_locations(f"{d}/ca.crt")
 ctx.load_cert_chain(f"{d}/int.crt", f"{d}/int.key"); ctx.check_hostname=False
 s=ctx.wrap_socket(socket.create_connection(("127.0.0.1",int(sys.argv[1])),timeout=5),

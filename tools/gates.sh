@@ -19,8 +19,14 @@
 #   drills       the core drills (the CORE list below is the count)
 #   chaos        the two randomized chaos drills
 #
-# Logs land in $FLINT_GATE_LOGS (default /tmp/flint-gates) — one file per
-# step, kept whether it passed or failed.
+# Logs land in $FLINT_GATE_LOGS (default $FLINT_DRILL_ROOT/flint-gates) — one
+# file per step, kept whether it passed or failed.
+#
+# FLINT_DRILL_ROOT (default /tmp) is where every drill's scratch, seat logs
+# and these gate logs live, and it is the volume the disk guard measures.
+# Put drill I/O on another disk with:
+#
+#   FLINT_DRILL_ROOT=/Volumes/YourSSD/drillscratch tools/gates.sh
 set -u
 
 # STAGE ARGUMENTS, validated before anything else runs.
@@ -78,7 +84,7 @@ STAGES="${*:-$ALL_STAGES}"
 
 cd "$(dirname "$0")/.."
 
-LOGS="${FLINT_GATE_LOGS:-/tmp/flint-gates}"
+LOGS="${FLINT_GATE_LOGS:-${FLINT_DRILL_ROOT:-/tmp}/flint-gates}"
 rm -rf "$LOGS"; mkdir -p "$LOGS"
 
 # Section 3 of the checklist, in its order. Adding a drill here is what puts
@@ -179,7 +185,7 @@ step() {  # step <name> <log-suffix> <command...>
     # not having it.
     if [ -n "${FLINT_GATE_STRICT:-}" ] && grep -qE 'SKIP[: (]' "$log"; then
       printf 'FAIL  %-22s (%ss)  %s\n' "$name" "$(( $(date +%s) - start ))" "$log"
-      grep -m2 'SKIP' "$log" | sed 's/^/        /'
+      grep -m2 'SKIP' "$log" |  df -h "$_GATE_DISK_TARGET" | sed 's/^/        /'
       echo "        skipped under FLINT_GATE_STRICT: install the dependency"
       echo "        or drop the drill from CORE deliberately, not by accident."
       FAILED="$FAILED $name(skipped)"
@@ -204,7 +210,7 @@ step() {  # step <name> <log-suffix> <command...>
     # reaching its own verdict.
     { grep -m1 -E '^FAIL' "$log" \
         || grep -m1 -E '^(REFUSING|thread .* panicked|error(\[|:))' "$log" \
-        || tail -3 "$log"; } | sed 's/^/        /'
+        || tail -3 "$log"; } |  df -h "$_GATE_DISK_TARGET" | sed 's/^/        /'
     FAILED="$FAILED $name"
   fi
 
@@ -225,7 +231,7 @@ step() {  # step <name> <log-suffix> <command...>
   if [ -n "$leaked" ]; then
     echo "      LEAKED: $name left $(echo "$leaked" | wc -l | tr -d ' ') Flint process(es) running"
     ps -o pid=,args= -p $(echo "$leaked" | tr '\n' ' ') 2>/dev/null \
-      | sed 's/^/        /' | cut -c1-110
+      |  df -h "$_GATE_DISK_TARGET" | sed 's/^/        /' | cut -c1-110
     echo "        Its cleanup does not cover every seat it starts. Prefer"
     echo "        fleet_kill (scoped to the drill's fleet_init ports) over a"
     echo "        hand-written pkill pattern, which goes stale silently."
@@ -268,7 +274,18 @@ licence_check() {
 #
 # A red gate has to name its own cause, or the next person spends an hour
 # proving the product is fine. Refuse up front instead, and say the number.
-_gate_free_pct() { df -k . | awk 'NR==2 {printf "%d", $4/$2*100}'; }
+# MEASURE THE VOLUME THE DRILLS ACTUALLY WRITE TO, which is the scratch root
+# — not `.`. Those are the same filesystem in a plain checkout and DIFFERENT
+# the moment either target/ or the scratch root is moved to another volume, a
+# split this repo already has (target/ is commonly a symlink to an external
+# SSD). Measuring `.` there reports the volume holding the source while every
+# byte lands somewhere else: the guard would refuse on a full source disk the
+# drills never touch, and — worse — pass while the volume they DO fill is
+# nearly out. A guard that measures the wrong thing is not a weaker guard, it
+# is a guard pointed away from the hazard.
+_GATE_DISK_TARGET="${FLINT_DRILL_ROOT:-/tmp}"
+mkdir -p "$_GATE_DISK_TARGET" 2>/dev/null || true
+_gate_free_pct() { df -k "$_GATE_DISK_TARGET" | awk 'NR==2 {printf "%d", $4/$2*100}'; }
 _GATE_FREE_PCT=$(_gate_free_pct)
 if [ "${_GATE_FREE_PCT:-100}" -lt 12 ]; then
   echo "REFUSING TO RUN: only ${_GATE_FREE_PCT}% of this filesystem is free."
@@ -277,7 +294,7 @@ if [ "${_GATE_FREE_PCT:-100}" -lt 12 ]; then
   echo "  replication or ack timeouts with no mention of the disk. 12% is the"
   echo "  floor because a chaos run needs headroom of its own on top of the 10%."
   echo
-  df -h . | sed 's/^/  /'
+  df -h "$_GATE_DISK_TARGET" | sed 's/^/  /'
   echo
   echo "  Free space and re-run, or set FLINT_GATE_SKIP_DISK=1 to override"
   echo "  (and read every failure with this in mind)."
@@ -305,7 +322,7 @@ assert_no_default_ports() {
     tools/*_drill.sh 2>/dev/null || true)
   [ -z "$hits" ] && return 0
   echo "FAIL  drills claim the default cluster ports (7001/7002/7379/7500):"
-  echo "$hits" | sed 's/^/        /'
+  echo "$hits" |  df -h "$_GATE_DISK_TARGET" | sed 's/^/        /'
   echo "        fleet_kill would -9 a real cluster on those ports and"
   echo "        fleet_guard would not object. Move the drill to a free block."
   FAILED="$FAILED default-ports"
@@ -388,7 +405,7 @@ fi
 
 if want conformance; then
   echo "== conformance: valkey (oracle), flint mem, flint rocks"
-  CDIR=$(mktemp -d /tmp/flint-gate-conf.XXXXXX)
+  CDIR=$(mktemp -d "${FLINT_DRILL_ROOT:-/tmp}/flint-gate-conf.XXXXXX")
   # Each target starts inside its own subshell so THIS shell never owns it as
   # a job: a shell that owns a background job announces how it died, and
   # "Killed: 9" lines interleaved with the results make a clean gate look
@@ -428,7 +445,7 @@ if want conformance; then
   step "conformance rocks (RESP3)" conf-rocks3-run \
     ./target/release/flint-conformance --target 127.0.0.1:6397 --proto 3
   grep -h '^overall:' "$LOGS"/conf-*-run.log "$LOGS"/conf-oracle.log \
-    "$LOGS"/conf-oracle3.log 2>/dev/null | sed 's/^/      /'
+    "$LOGS"/conf-oracle3.log 2>/dev/null |  df -h "$_GATE_DISK_TARGET" | sed 's/^/      /'
   for p in 6399 6398 6397; do valkey-cli -p $p SHUTDOWN NOSAVE >/dev/null 2>&1; done
   sleep 0.3
   # Belt and braces: SHUTDOWN is a request, and a wedged process would
@@ -462,7 +479,7 @@ assert_drill_builds_keep_rocks() {
     # (this check's own first version flagged the drill whose comment
     # explains the rule).
     local joined
-    joined=$(grep -v '^[[:space:]]*#' "$f" | sed -e :a -e '/\\$/N; s/\\\n//; ta')
+    joined=$(grep -v '^[[:space:]]*#' "$f" |  df -h "$_GATE_DISK_TARGET" | sed -e :a -e '/\\$/N; s/\\\n//; ta')
     # `--features rocks` and `--features flint-server/rocks` are equivalent
     # when -p flint-server is the selected package, and drills use both.
     # The rule is simply: if it rebuilds flint-server, it must say rocks.

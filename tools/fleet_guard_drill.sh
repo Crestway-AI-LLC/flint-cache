@@ -49,7 +49,7 @@ FORCE_WAS="${FLINT_DRILL_FORCE:-}"
 unset FLINT_DRILL_FORCE
 [ -n "$FORCE_WAS" ] && echo "   (FLINT_DRILL_FORCE=$FORCE_WAS cleared for this drill; step E sets it back)"
 
-fleet_init /tmp/flint-guard-drill 6999 6378 6379 6380 6381 6382 6383 6384 6385
+fleet_init $FLINT_DRILL_ROOT/flint-guard-drill 6999 6378 6379 6380 6381 6382 6383 6384 6385
 
 echo "== A) a quiet box: the guard must let the drill run"
 OUT=$(fleet_guard 2>&1); RC=$?
@@ -96,7 +96,7 @@ echo "== D) ...but they are still caught as FOREIGN when out of scope"
 OUT=$(fleet_guard 2>&1); RC=$?
 [ "$RC" = 1 ] \
   || { echo "FAIL: guard ignored out-of-scope processes of our own (exit $RC)"; exit 1; }
-echo "$OUT" | grep -q "outside /tmp/flint-guard-drill" \
+echo "$OUT" | grep -q "outside $FLINT_DRILL_ROOT/flint-guard-drill" \
   || { echo "FAIL: refused, but not for the out-of-scope reason:"; echo "$OUT"; exit 1; }
 echo "  refused for the out-of-scope reason, not the sibling one"
 

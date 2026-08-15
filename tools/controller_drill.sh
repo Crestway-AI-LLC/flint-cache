@@ -7,10 +7,10 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init /tmp/flint-ctl-m 6440 6441 6370 6371 6372 6373 6374 6375 6376 6377
+fleet_init $FLINT_DRILL_ROOT/flint-ctl-m 6440 6441 6370 6371 6372 6373 6374 6375 6376 6377
 fleet_guard
 fleet_kill server; fleet_kill controller; sleep 0.4
-MDIR=$(mktemp -d /tmp/flint-ctl-m.XXXXXX); RDIR=$(mktemp -d /tmp/flint-ctl-r.XXXXXX)
+MDIR=$(mktemp -d $FLINT_DRILL_ROOT/flint-ctl-m.XXXXXX); RDIR=$(mktemp -d $FLINT_DRILL_ROOT/flint-ctl-r.XXXXXX)
 B=./target/release/flint-server
 MPORT=6440; RPORT=6441
 cleanup() {
@@ -33,7 +33,7 @@ awk 'BEGIN{for(i=0;i<20000;i++){k=sprintf("key:%07d",i);v=sprintf("value-%07d",i
 
 echo "== starting controller"
 ./target/release/flint-controller --nodes 127.0.0.1:$MPORT,127.0.0.1:$RPORT --id ctl \
-  --poll-ms 150 --confirm 3 2> /tmp/flint-ctl.log &
+  --poll-ms 150 --confirm 3 2> $FLINT_DRILL_ROOT/flint-ctl.log &
 sleep 1.5   # let it observe convergence
 
 # A REAL clock, because this drill's number is quoted as evidence in
@@ -75,7 +75,7 @@ while [ "$(date +%s)" -lt "$DEADLINE" ]; do
   sleep 0.02   # tight: the ruler must be finer than the thing measured
 done
 RTO_MS=$(( $(ms_now) - KILL_T ))
-[ "$PROMOTED" = "1" ] || { echo "FAIL: controller did not auto-promote in 12s"; echo "--- controller log:"; cat /tmp/flint-ctl.log; exit 1; }
+[ "$PROMOTED" = "1" ] || { echo "FAIL: controller did not auto-promote in 12s"; echo "--- controller log:"; cat $FLINT_DRILL_ROOT/flint-ctl.log; exit 1; }
 echo "auto-promotion OK (${RTO_MS}ms after kill, idle, real clock, reconnect per probe)"
 # The published budget, asserted rather than admired. docs/slo.md commits to
 # RTO <= 10 s; a drill that prints a number nobody checks is not evidence.
@@ -85,7 +85,7 @@ echo "== data intact on the new master"
 [ "$(valkey-cli -p $RPORT GET key:0000000)" = "value-0000000" ] || { echo "FAIL: head lost"; exit 1; }
 [ "$(valkey-cli -p $RPORT GET key:0019999)" = "value-0019999" ] || { echo "FAIL: tail lost"; exit 1; }
 [ "$(valkey-cli -p $RPORT GET ctl-probe)" = "ok" ] || { echo "FAIL: post-promotion write lost"; exit 1; }
-echo "$(grep -oE 'PROMOTED .* at \(0,[0-9]+\)' /tmp/flint-ctl.log | head -1)"
+echo "$(grep -oE 'PROMOTED .* at \(0,[0-9]+\)' $FLINT_DRILL_ROOT/flint-ctl.log | head -1)"
 
 echo "== bring the OLD master back; controller must fence it"
 $B --port $MPORT --engine rocks --data-dir "$MDIR" 2>/dev/null &
@@ -97,7 +97,7 @@ for i in $(seq 1 40); do
   if echo "$RO" | grep -q "READONLY"; then FENCED=1; break; fi
   sleep 0.2
 done
-[ "$FENCED" = "1" ] || { echo "FAIL: controller did not fence the returned master"; echo "--- controller log:"; tail -8 /tmp/flint-ctl.log; exit 1; }
-echo "$(grep -oE 'FENCED zombie .* at \(0,[0-9]+\)' /tmp/flint-ctl.log | head -1)"
+[ "$FENCED" = "1" ] || { echo "FAIL: controller did not fence the returned master"; echo "--- controller log:"; tail -8 $FLINT_DRILL_ROOT/flint-ctl.log; exit 1; }
+echo "$(grep -oE 'FENCED zombie .* at \(0,[0-9]+\)' $FLINT_DRILL_ROOT/flint-ctl.log | head -1)"
 
 echo "PASS: hands-free failover + automatic zombie fencing, data intact"

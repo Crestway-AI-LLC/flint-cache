@@ -14,12 +14,12 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init /tmp/flint-decom-state 7221 7222 7223 7224
+fleet_init $FLINT_DRILL_ROOT/flint-decom-state 7221 7222 7223 7224
 fleet_guard
-STATE=/tmp/flint-decom-state
-INV=/tmp/flint-decom.flint
-RUN=/tmp/flint-decom-run
-ACKFILE=/tmp/flint-decom-ack
+STATE=$FLINT_DRILL_ROOT/flint-decom-state
+INV=$FLINT_DRILL_ROOT/flint-decom.flint
+RUN=$FLINT_DRILL_ROOT/flint-decom-run
+ACKFILE=$FLINT_DRILL_ROOT/flint-decom-ack
 fleet_kill server; fleet_kill proxy
 fleet_kill controlplane; fleet_kill controller
 sleep 0.4
@@ -121,24 +121,24 @@ DOWN_R=$(status | awk '/replica/{print $3; exit}')
 echo "== CONTROL: verify must FAIL while a declared member is missing ($DOWN_R)"
 fleet_signal_port "${DOWN_R##*:}" -9
 for i in $(seq 1 20); do [ "$(nodes_live)" -eq 1 ] && break; sleep 0.3; done
-if ./target/release/flintctl -f "$INV" verify >/tmp/decom-sc.log 2>&1; then
+if ./target/release/flintctl -f "$INV" verify >$FLINT_DRILL_ROOT/decom-sc.log 2>&1; then
   echo "FAIL: verify reported OK with $DOWN_R down — single-copy read as healthy"
-  cat /tmp/decom-sc.log; exit 1
+  cat $FLINT_DRILL_ROOT/decom-sc.log; exit 1
 fi
-grep -q 'SINGLE-COPY' /tmp/decom-sc.log \
-  || { echo "FAIL: verify went red for some other reason"; cat /tmp/decom-sc.log; exit 1; }
-echo "  red: '$(grep -o 'SINGLE-COPY.*' /tmp/decom-sc.log | head -1)'"
+grep -q 'SINGLE-COPY' $FLINT_DRILL_ROOT/decom-sc.log \
+  || { echo "FAIL: verify went red for some other reason"; cat $FLINT_DRILL_ROOT/decom-sc.log; exit 1; }
+echo "  red: '$(grep -o 'SINGLE-COPY.*' $FLINT_DRILL_ROOT/decom-sc.log | head -1)'"
 ./target/release/flintctl -f "$INV" start >/dev/null 2>&1
 for i in $(seq 1 40); do [ "$(nodes_live)" -eq 2 ] && break; sleep 0.5; done
-./target/release/flintctl -f "$INV" verify >/tmp/decom-sc2.log 2>&1 \
-  || { echo "FAIL: verify still red after the member came back"; cat /tmp/decom-sc2.log; exit 1; }
+./target/release/flintctl -f "$INV" verify >$FLINT_DRILL_ROOT/decom-sc2.log 2>&1 \
+  || { echo "FAIL: verify still red after the member came back"; cat $FLINT_DRILL_ROOT/decom-sc2.log; exit 1; }
 echo "  green again once the member is back — the check discriminates"
 
 echo "== GUARD: decommission the LIVE MASTER ($M1) must be refused"
-if ./target/release/flintctl -f "$INV" decommission-node "$M1" 2>/tmp/decom-g1.log; then
+if ./target/release/flintctl -f "$INV" decommission-node "$M1" 2>$FLINT_DRILL_ROOT/decom-g1.log; then
   echo "FAIL: decommission of live master not refused"; exit 1; fi
-grep -q 'live MASTER' /tmp/decom-g1.log || { echo "FAIL: wrong guard"; cat /tmp/decom-g1.log; exit 1; }
-echo "  refused: '$(grep -o 'live MASTER.*failover [^ ]*' /tmp/decom-g1.log | head -1)'"
+grep -q 'live MASTER' $FLINT_DRILL_ROOT/decom-g1.log || { echo "FAIL: wrong guard"; cat $FLINT_DRILL_ROOT/decom-g1.log; exit 1; }
+echo "  refused: '$(grep -o 'live MASTER.*failover [^ ]*' $FLINT_DRILL_ROOT/decom-g1.log | head -1)'"
 
 VICTIM=$(status | awk '/replica/{print $3; exit}')
 echo "== DECOMMISSION the replica ($VICTIM) — pair keeps serving master-only"
@@ -151,9 +151,9 @@ grep -q "7221,127.0.0.1:7222" "$INV" && { echo "FAIL: inventory still lists both
 echo "  pair serves reads+writes on the remaining node; keys intact; inventory updated"
 
 echo "== GUARD: decommission the pair's LAST node ($M1) must be refused"
-if ./target/release/flintctl -f "$INV" decommission-node "$M1" 2>/tmp/decom-g2.log; then
+if ./target/release/flintctl -f "$INV" decommission-node "$M1" 2>$FLINT_DRILL_ROOT/decom-g2.log; then
   echo "FAIL: decommission of last node not refused"; exit 1; fi
-grep -q 'whole shard' /tmp/decom-g2.log || { echo "FAIL: wrong guard"; cat /tmp/decom-g2.log; exit 1; }
+grep -q 'whole shard' $FLINT_DRILL_ROOT/decom-g2.log || { echo "FAIL: wrong guard"; cat $FLINT_DRILL_ROOT/decom-g2.log; exit 1; }
 echo "  refused: whole-shard removal is out of scope"
 
 rm -f "$RUN"; wait "$WRITER_PID" 2>/dev/null

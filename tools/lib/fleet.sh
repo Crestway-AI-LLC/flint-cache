@@ -60,6 +60,27 @@
 #
 # Ports are matched EXACTLY, never as prefixes: `--port 653` would also match
 # 6531, and mistaking one seat for another is how #101 happened.
+
+# WHERE DRILL SCRATCH LIVES. Every drill's state directory, seat log and
+# fleet SCOPE hang off this root; it defaults to /tmp so nothing changes for
+# CI or a plain checkout. Point it elsewhere to put drill I/O on another
+# volume:
+#
+#     FLINT_DRILL_ROOT=/Volumes/FlintDev/drillscratch tools/gates.sh
+#
+# EXPORTED on purpose: several drills embed Python in a QUOTED heredoc
+# (<<'PY'), where the shell cannot expand a variable, so those snippets read
+# os.environ["FLINT_DRILL_ROOT"] instead. If this were a plain shell variable
+# the shell half and the Python half would disagree about where the state
+# lives — the drill would create certs in one place and open them from
+# another, and fail in a way that looks like a TLS bug.
+export FLINT_DRILL_ROOT="${FLINT_DRILL_ROOT:-/tmp}"
+if ! mkdir -p "$FLINT_DRILL_ROOT" 2>/dev/null || [ ! -w "$FLINT_DRILL_ROOT" ]; then
+  echo "fleet: FLINT_DRILL_ROOT=$FLINT_DRILL_ROOT is not writable" >&2
+  echo "       (an unmounted external volume looks exactly like this)" >&2
+  exit 1
+fi
+
 fleet_init() {
   FLEET_SCOPE="$1"; shift
   FLEET_PORTS="$(printf '%s' "$*" | tr ' ' '|')"

@@ -43,11 +43,11 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init /tmp/flint-lagcap 6362 6363 6364 6365 6366 6367 6368 6369
+fleet_init $FLINT_DRILL_ROOT/flint-lagcap 6362 6363 6364 6365 6366 6367 6368 6369
 fleet_guard
 fleet_kill server; fleet_kill controller
 sleep 0.3
-cleanup() { fleet_kill server; fleet_kill controller; rm -f /tmp/flint-lagcap.log; }
+cleanup() { fleet_kill server; fleet_kill controller; rm -f $FLINT_DRILL_ROOT/flint-lagcap.log; }
 trap cleanup EXIT
 
 cargo build --release -q -p flint-chaos -p flint-server -p flint-controller \

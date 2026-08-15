@@ -11,13 +11,13 @@ set -euo pipefail
 # drill that declares nothing is invisible to assert_no_port_overlap,
 # which is how failover and controller came to share 6440/6441 and
 # reseed and lag_cap to share 6471/6472, unseen.
-fleet_init /tmp/flint-failover 6326 6327
+fleet_init $FLINT_DRILL_ROOT/flint-failover 6326 6327
 
 KEYS="${1:-20000}"
 MPORT="${2:-6326}"
 RPORT="${3:-6327}"
-MDIR="$(mktemp -d /tmp/flint-fo-m.XXXXXX)"
-RDIR="$(mktemp -d /tmp/flint-fo-r.XXXXXX)"
+MDIR="$(mktemp -d $FLINT_DRILL_ROOT/flint-fo-m.XXXXXX)"
+RDIR="$(mktemp -d $FLINT_DRILL_ROOT/flint-fo-r.XXXXXX)"
 BIN="$(dirname "$0")/../target/release/flint-server"
 
 cleanup() {

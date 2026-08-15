@@ -13,7 +13,7 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init /tmp/flint-m3- 6669 6710 6711 6720 6721
+fleet_init $FLINT_DRILL_ROOT/flint-m3- 6669 6710 6711 6720 6721
 fleet_guard
 fleet_kill server; fleet_kill controller; fleet_kill proxy; sleep 0.4
 B=./target/release/flint-server
@@ -22,14 +22,14 @@ cleanup() {
   pkill -9 -f "flint-server --port 67" 2>/dev/null
   fleet_kill controller
   fleet_kill proxy
-  rm -rf /tmp/flint-m3-* /tmp/m3-stop
+  rm -rf $FLINT_DRILL_ROOT/flint-m3-* $FLINT_DRILL_ROOT/m3-stop
 }
 trap cleanup EXIT
 
 echo "== group: 2 replicated pairs (6710/6711, 6720/6721)"
 for spec in "6710:" "6711:127.0.0.1:6710" "6720:" "6721:127.0.0.1:6720"; do
   p=${spec%%:*}; m=${spec#*:}
-  d="/tmp/flint-m3-$p"; rm -rf "$d"
+  d="$FLINT_DRILL_ROOT/flint-m3-$p"; rm -rf "$d"
   if [ -n "$m" ]; then
     $B --port $p --engine rocks --data-dir "$d" --replica-of "$m" 2>/dev/null &
   else
@@ -41,10 +41,10 @@ sleep 0.8
 
 TENANTS=$(python3 -c 'print(",".join(f"tok{i:02d}=tenant{i:02d}" for i in range(50)))')
 ./target/release/flint-controller --pairs "127.0.0.1:6710,127.0.0.1:6711;127.0.0.1:6720,127.0.0.1:6721" \
-  --id M3 --poll-ms 150 --confirm 3 2>/tmp/flint-m3-ctl.log &
+  --id M3 --poll-ms 150 --confirm 3 2>$FLINT_DRILL_ROOT/flint-m3-ctl.log &
 ./target/release/flint-proxy --port 6669 \
   --pairs "127.0.0.1:6710,127.0.0.1:6711;127.0.0.1:6720,127.0.0.1:6721" \
-  --tenants "$TENANTS" 2>/tmp/flint-m3-proxy.log &
+  --tenants "$TENANTS" 2>$FLINT_DRILL_ROOT/flint-m3-proxy.log &
 fleet_wait_listen 6669
 sleep 1.2
 
@@ -71,7 +71,7 @@ for m in 6710 6720; do
 done
 
 echo "== multi-tenant load: 6 tenants write continuously; KILL pair-0 master"
-rm -f /tmp/m3-stop
+rm -f $FLINT_DRILL_ROOT/m3-stop
 for i in 01 09 17 25 33 41; do
   # RECORD WHAT WAS ACKED, not what was attempted. `j` used to be incremented
   # unconditionally with the reply discarded, so it counted ATTEMPTS — and
@@ -90,12 +90,12 @@ for i in 01 09 17 25 33 41; do
   # Writes are still allowed to fail here: racing a kill is the point. Only
   # the BOOKKEEPING has to be honest about which ones landed.
   ( j=1000; last_acked=""
-    while [ ! -f /tmp/m3-stop ]; do
+    while [ ! -f $FLINT_DRILL_ROOT/m3-stop ]; do
       [ "$(valkey-cli -p 6669 -a "tok$i" --no-auth-warning SET "live:$j" "L$i-$j" 2>/dev/null)" = "OK" ] \
         && last_acked=$j
       j=$((j+1))
     done
-    echo "${last_acked:-none}" > "/tmp/flint-m3-writer$i" ) &
+    echo "${last_acked:-none}" > "$FLINT_DRILL_ROOT/flint-m3-writer$i" ) &
 done
 sleep 2
 pkill -9 -f "flint-server --port 6710"
@@ -121,10 +121,10 @@ for i in $(seq 1 100); do
   sleep 0.2
 done
 NOW_T=$(python3 -c 'import time;print(int(time.time()*1000))')
-[ "$REC" = "1" ] || { echo "FAIL: writes did not recover after master kill"; tail -8 /tmp/flint-m3-ctl.log; exit 1; }
+[ "$REC" = "1" ] || { echo "FAIL: writes did not recover after master kill"; tail -8 $FLINT_DRILL_ROOT/flint-m3-ctl.log; exit 1; }
 echo "  failover recovered; client-observed write outage ~$((NOW_T - KILL_T))ms"
 sleep 2   # let writers churn on the promoted master
-touch /tmp/m3-stop; sleep 1
+touch $FLINT_DRILL_ROOT/m3-stop; sleep 1
 
 echo "== full 50-tenant integrity sweep through the proxy"
 for i in $(seq -w 0 49); do
@@ -145,7 +145,7 @@ for i in 01 09 17; do
   # rather than the midpoint of a range that includes everything it refused
   # mid-failover. "A write we were told landed is still there" is the claim
   # worth making, and it is the claim an operator cares about.
-  LAST=$(cat "/tmp/flint-m3-writer$i" 2>/dev/null || echo none)
+  LAST=$(cat "$FLINT_DRILL_ROOT/flint-m3-writer$i" 2>/dev/null || echo none)
   [ "$LAST" != "none" ] || { echo "FAIL: writer tenant$i never had a single write acked"; exit 1; }
   G=$(valkey-cli -p 6669 -a "tok$i" --no-auth-warning GET "live:$LAST")
   [ "$G" = "L$i-$LAST" ] || { echo "FAIL: writer tenant$i live:$LAST = '$G' — an ACKED write is missing"; exit 1; }

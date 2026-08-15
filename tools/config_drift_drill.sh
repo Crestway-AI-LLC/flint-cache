@@ -22,10 +22,10 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init /tmp/flint-drift-state 7421 7422 7423 7424
+fleet_init $FLINT_DRILL_ROOT/flint-drift-state 7421 7422 7423 7424
 fleet_guard
-STATE=/tmp/flint-drift-state
-INV=/tmp/flint-drift.flint
+STATE=$FLINT_DRILL_ROOT/flint-drift-state
+INV=$FLINT_DRILL_ROOT/flint-drift.flint
 A=127.0.0.1:7421
 B=127.0.0.1:7422
 PROXY=127.0.0.1:7423

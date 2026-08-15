@@ -4,7 +4,7 @@
 # Requires a release build with --features rocks. Kills stray servers first.
 set -euo pipefail
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init /tmp/flint-chaos-drill 6330 6331 6332 6333 6334 6335 6336 6337
+fleet_init $FLINT_DRILL_ROOT/flint-chaos-drill 6330 6331 6332 6333 6334 6335 6336 6337
 fleet_guard
 fleet_kill server
 sleep 0.5

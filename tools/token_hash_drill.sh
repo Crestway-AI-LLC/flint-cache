@@ -12,12 +12,12 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init /tmp/flint-tokhash 7031 6322 7991
+fleet_init $FLINT_DRILL_ROOT/flint-tokhash 7031 6322 7991
 fleet_guard
 B=./target/release/flint-server
 CP=./target/release/flint-controlplane
 PX=./target/release/flint-proxy
-D=/tmp/flint-tokhash; rm -rf "$D"; mkdir -p "$D"
+D=$FLINT_DRILL_ROOT/flint-tokhash; rm -rf "$D"; mkdir -p "$D"
 fleet_kill server; fleet_kill proxy
 fleet_kill controlplane; sleep 0.4
 cleanup() {

@@ -16,9 +16,9 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init /tmp/flint-compat-state 7321 7322 7323 7324 7683 7724
+fleet_init $FLINT_DRILL_ROOT/flint-compat-state 7321 7322 7323 7324 7683 7724
 fleet_guard
-STATE=/tmp/flint-compat-state; INV=/tmp/flint-compat.flint
+STATE=$FLINT_DRILL_ROOT/flint-compat-state; INV=$FLINT_DRILL_ROOT/flint-compat.flint
 PORT=7683
 
 fleet_kill server; fleet_kill proxy
@@ -42,7 +42,7 @@ if [ -z "$PY" ]; then
   done
 fi
 if [ -z "$PY" ]; then
-  VENV=/tmp/flint-compat-venv
+  VENV=$FLINT_DRILL_ROOT/flint-compat-venv
   BASE=""
   for cand in python3.14 python3.13 python3.12 python3.11 python3; do
     command -v "$cand" >/dev/null && { BASE=$(command -v "$cand"); break; }
@@ -243,7 +243,7 @@ NODE=${FLINT_COMPAT_NODE:-$(command -v node || true)}
 if [ -z "$NODE" ]; then
   echo "== node-redis: SKIP (no node on PATH)"
 else
-  NODE_DIR=${FLINT_COMPAT_NODE_DIR:-/tmp/flint-compat-node}
+  NODE_DIR=${FLINT_COMPAT_NODE_DIR:-$FLINT_DRILL_ROOT/flint-compat-node}
   mkdir -p "$NODE_DIR"
   if [ ! -d "$NODE_DIR/node_modules/redis" ]; then
     (cd "$NODE_DIR" && npm init -y >/dev/null 2>&1 && npm install redis --silent >/dev/null 2>&1)

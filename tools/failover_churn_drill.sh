@@ -46,9 +46,9 @@ cd "$(dirname "$0")/.."
 # assert_no_port_overlap greps the fleet_init line out of this file, so a
 # variable expansion here would silently exempt this drill from the one check
 # that stops two drills fighting over a port.
-fleet_init /tmp/flint-churn 7380 7381 7382 7383 7384 7385 7386 7387 7388 7389
+fleet_init $FLINT_DRILL_ROOT/flint-churn 7380 7381 7382 7383 7384 7385 7386 7387 7388 7389
 fleet_guard
-D=/tmp/flint-churn; INV=$D/cluster.flint
+D=$FLINT_DRILL_ROOT/flint-churn; INV=$D/cluster.flint
 CTL=./target/release/flintctl
 ITERS="${FLINT_CHURN_ITERS:-16}"
 # The budget flint-chaos gives the controller. Kept identical on purpose: this

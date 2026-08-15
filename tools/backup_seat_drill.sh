@@ -17,10 +17,10 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init /tmp/flint-bkseat 7121 7122 7123 7124
+fleet_init $FLINT_DRILL_ROOT/flint-bkseat 7121 7122 7123 7124
 fleet_guard
-STATE=/tmp/flint-bkseat
-INV=/tmp/flint-bkseat.flint
+STATE=$FLINT_DRILL_ROOT/flint-bkseat
+INV=$FLINT_DRILL_ROOT/flint-bkseat.flint
 CTL=./target/release/flintctl
 fleet_kill server; fleet_kill proxy; fleet_kill controlplane
 fleet_kill controller; fleet_kill backup
@@ -29,10 +29,10 @@ cleanup() {
   $CTL -f "$INV" stop 2>/dev/null
   fleet_kill server; fleet_kill proxy; fleet_kill controlplane
   fleet_kill controller; fleet_kill backup
-  rm -rf "$STATE" "$INV" /tmp/flint-bkseat-sets
+  rm -rf "$STATE" "$INV" $FLINT_DRILL_ROOT/flint-bkseat-sets
 }
 trap cleanup EXIT
-rm -rf "$STATE" "$INV" /tmp/flint-bkseat-sets
+rm -rf "$STATE" "$INV" $FLINT_DRILL_ROOT/flint-bkseat-sets
 
 cargo build --release -q -p flint-server -p flint-proxy -p flint-controlplane \
   -p flint-ctl --features flint-server/rocks,flint-backup/rocks -p flint-backup
@@ -45,7 +45,7 @@ tls on
 cp 127.0.0.1:7124
 pair 127.0.0.1:7121,127.0.0.1:7122
 proxy 127.0.0.1:7123
-backup-to /tmp/flint-bkseat-sets
+backup-to $FLINT_DRILL_ROOT/flint-bkseat-sets
 backup-every 3s
 backup-keep 2
 EOF
@@ -63,7 +63,7 @@ echo "== sets on cadence with a healthy status"
 # checkpoints exactly like a full one.
 SETS=0
 for _ in $(seq 1 90); do
-  SETS=$(ls /tmp/flint-bkseat-sets 2>/dev/null | grep -c '^backup-')
+  SETS=$(ls $FLINT_DRILL_ROOT/flint-bkseat-sets 2>/dev/null | grep -c '^backup-')
   RUNS=$(grep '^job backup' "$STATE/logs/backup-status" 2>/dev/null | awk '{print $4}')
   [ "${SETS:-0}" -ge 2 ] && [ "${RUNS:-0}" -ge 2 ] && break
   sleep 0.5

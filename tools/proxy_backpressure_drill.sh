@@ -11,11 +11,11 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init /tmp/flint-bp 6810 6811 7810 7811
+fleet_init $FLINT_DRILL_ROOT/flint-bp 6810 6811 7810 7811
 fleet_guard
 B=./target/release/flint-server
 PX=./target/release/flint-proxy
-D=/tmp/flint-bp; rm -rf "$D"; mkdir -p "$D"
+D=$FLINT_DRILL_ROOT/flint-bp; rm -rf "$D"; mkdir -p "$D"
 fleet_kill server; fleet_kill proxy; sleep 0.4
 cleanup() { fleet_kill server; fleet_kill proxy; rm -rf "$D"; }
 trap cleanup EXIT

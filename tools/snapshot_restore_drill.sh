@@ -15,12 +15,12 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init /tmp/flint-snap 6870 6871 7590
+fleet_init $FLINT_DRILL_ROOT/flint-snap 6870 6871 7590
 fleet_guard
 B=./target/release/flint-server
 CP=./target/release/flint-controlplane
 CTL=./target/release/flint-controller
-D=/tmp/flint-snap; rm -rf "$D"; mkdir -p "$D"
+D=$FLINT_DRILL_ROOT/flint-snap; rm -rf "$D"; mkdir -p "$D"
 fleet_kill server; fleet_kill controller
 fleet_kill controlplane; sleep 0.4
 cleanup() {

@@ -8,24 +8,24 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init /tmp/flint-mp- 6500 6501 6510 6511 6520
+fleet_init $FLINT_DRILL_ROOT/flint-mp- 6500 6501 6510 6511 6520
 fleet_guard
 fleet_kill server; fleet_kill controller; sleep 0.4
 # Three pairs on fixed ports; roles float within each pair.
 declare -a A=(6500 6501) B=(6510 6511) C=(6520 6521)
 DIRS=()
-for p in 6500 6501 6510 6511 6520 6521; do DIRS+=("/tmp/flint-mp-$p"); rm -rf "/tmp/flint-mp-$p" "/tmp/flint-mp-$p.log"; done
+for p in 6500 6501 6510 6511 6520 6521; do DIRS+=("$FLINT_DRILL_ROOT/flint-mp-$p"); rm -rf "$FLINT_DRILL_ROOT/flint-mp-$p" "$FLINT_DRILL_ROOT/flint-mp-$p.log"; done
 cleanup() {
   pkill -9 -f "flint-server --port 65" 2>/dev/null
   fleet_kill controller
-  for p in 6500 6501 6510 6511 6520 6521; do rm -rf "/tmp/flint-mp-$p"; done
+  for p in 6500 6501 6510 6511 6520 6521; do rm -rf "$FLINT_DRILL_ROOT/flint-mp-$p"; done
 }
 trap cleanup EXIT
 
 echo "== one controller manages 3 pairs (--manage-pairs g0;g1;g2)"
 ./target/release/flint-controller \
-  --manage-pairs "6500:/tmp/flint-mp-6500,6501:/tmp/flint-mp-6501;6510:/tmp/flint-mp-6510,6511:/tmp/flint-mp-6511;6520:/tmp/flint-mp-6520,6521:/tmp/flint-mp-6521" \
-  --id MP --poll-ms 150 --confirm 3 2>/tmp/flint-mp.log &
+  --manage-pairs "6500:$FLINT_DRILL_ROOT/flint-mp-6500,6501:$FLINT_DRILL_ROOT/flint-mp-6501;6510:$FLINT_DRILL_ROOT/flint-mp-6510,6511:$FLINT_DRILL_ROOT/flint-mp-6511;6520:$FLINT_DRILL_ROOT/flint-mp-6520,6521:$FLINT_DRILL_ROOT/flint-mp-6521" \
+  --id MP --poll-ms 150 --confirm 3 2>$FLINT_DRILL_ROOT/flint-mp.log &
 
 # Wait for all six nodes to come up (controller bootstraps each pair).
 for i in $(seq 1 80); do
@@ -36,7 +36,7 @@ for i in $(seq 1 80); do
   [ "$UP" = "6" ] && break
   sleep 0.2
 done
-[ "$UP" = "6" ] || { echo "FAIL: controller did not bootstrap all 3 pairs (up=$UP)"; tail -20 /tmp/flint-mp.log; exit 1; }
+[ "$UP" = "6" ] || { echo "FAIL: controller did not bootstrap all 3 pairs (up=$UP)"; tail -20 $FLINT_DRILL_ROOT/flint-mp.log; exit 1; }
 echo "all 3 pairs bootstrapped"
 
 # Which port in a pair currently holds master?
@@ -68,7 +68,7 @@ for i in $(seq 1 80); do
   valkey-cli -p $BO FLINTINFO 2>/dev/null | tr '\r' ' ' | grep -q "role:master" && { REC=1; break; }
   sleep 0.2
 done
-[ "$REC" = "1" ] || { echo "FAIL: pair B did not fail over"; tail -20 /tmp/flint-mp.log; exit 1; }
+[ "$REC" = "1" ] || { echo "FAIL: pair B did not fail over"; tail -20 $FLINT_DRILL_ROOT/flint-mp.log; exit 1; }
 # Wait for B to reconverge (replacement respawned + acking).
 for i in $(seq 1 80); do
   SL=$(valkey-cli -p $BO FLINTINFO 2>/dev/null | tr '\r' ' ' | grep -oE "seq_lag:[a-z0-9]+")
@@ -100,7 +100,7 @@ for i in $(seq 1 80); do
   valkey-cli -p $AO FLINTINFO 2>/dev/null | tr '\r' ' ' | grep -q "role:master" && { REC=1; break; }
   sleep 0.2
 done
-[ "$REC" = "1" ] || { echo "FAIL: pair A did not fail over"; tail -20 /tmp/flint-mp.log; exit 1; }
+[ "$REC" = "1" ] || { echo "FAIL: pair A did not fail over"; tail -20 $FLINT_DRILL_ROOT/flint-mp.log; exit 1; }
 [ "$(valkey-cli -p $AO GET owner)" = "A" ] || { echo "FAIL: pair A data lost after its failover"; exit 1; }
 # C still steady.
 [ "$(master_of ${C[@]})" = "$CM_AFTER" ] || { echo "FAIL: pair C disturbed by pair A failover"; exit 1; }

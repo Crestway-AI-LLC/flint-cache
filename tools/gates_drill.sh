@@ -29,7 +29,7 @@
 set -u
 cd "$(dirname "$0")/.."
 
-TMP=/tmp/flint-gates-drill
+TMP=${FLINT_DRILL_ROOT:-/tmp}/flint-gates-drill
 KEPT="$TMP/logs-kept"       # a log directory that must SURVIVE every refusal
 SCRATCH="$TMP/logs-scratch" # one the copies below are free to clear
 OUT="$TMP/out"; ERR="$TMP/err"

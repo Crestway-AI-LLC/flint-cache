@@ -20,9 +20,9 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init /tmp/flint-tstatus-state 7431 7432 7433 7434
+fleet_init $FLINT_DRILL_ROOT/flint-tstatus-state 7431 7432 7433 7434
 fleet_guard
-STATE=/tmp/flint-tstatus-state
+STATE=$FLINT_DRILL_ROOT/flint-tstatus-state
 CP=7434
 fleet_kill controlplane
 sleep 0.3

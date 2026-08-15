@@ -10,7 +10,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init /tmp/flint-hotkeychaos 6354 6355 6356 6357 6358 6359 6360 6361
+fleet_init $FLINT_DRILL_ROOT/flint-hotkeychaos 6354 6355 6356 6357 6358 6359 6360 6361
 fleet_guard
 fleet_kill server
 fleet_kill controller

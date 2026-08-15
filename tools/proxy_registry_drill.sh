@@ -19,9 +19,9 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init /tmp/flint-pxreg 7351 7352 7691 7733 9999
+fleet_init $FLINT_DRILL_ROOT/flint-pxreg 7351 7352 7691 7733 9999
 fleet_guard
-D=/tmp/flint-pxreg; INV=$D/cluster.flint
+D=$FLINT_DRILL_ROOT/flint-pxreg; INV=$D/cluster.flint
 CTL=./target/release/flintctl
 fleet_kill server; fleet_kill proxy
 fleet_kill controlplane; fleet_kill controller
@@ -54,8 +54,8 @@ $CTL -f "$INV" bootstrap >/dev/null 2>&1 || { echo "FAIL: bootstrap"; exit 1; }
 
 cp_cmd() {
   python3 - "$@" <<'PY'
-import socket, ssl, sys
-d = "/tmp/flint-pxreg/state/certs"
+import socket, ssl, sys, os
+d = os.environ.get("FLINT_DRILL_ROOT","/tmp")+"/flint-pxreg/state/certs"
 c = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT); c.load_verify_locations(f"{d}/ca.crt")
 c.load_cert_chain(f"{d}/int.crt", f"{d}/int.key"); c.check_hostname = False
 s = c.wrap_socket(socket.create_connection(("127.0.0.1", 7733), timeout=5),

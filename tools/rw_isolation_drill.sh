@@ -15,11 +15,11 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init /tmp/flint-rwiso 6940 6316
+fleet_init $FLINT_DRILL_ROOT/flint-rwiso 6940 6316
 fleet_guard
 B=./target/release/flint-server
 PX=./target/release/flint-proxy
-D=/tmp/flint-rwiso; rm -rf "$D"; mkdir -p "$D"
+D=$FLINT_DRILL_ROOT/flint-rwiso; rm -rf "$D"; mkdir -p "$D"
 fleet_kill server; fleet_kill proxy; sleep 0.4
 cleanup() { fleet_kill server; fleet_kill proxy; rm -rf "$D"; }
 trap cleanup EXIT
@@ -116,7 +116,7 @@ assert u_p50 < 5.0, f"read p50 degraded under a foreign write storm: {u_p50:.3f}
 assert u_p99 < 25.0, f"read p99 degraded under a foreign write storm: {u_p99:.3f}ms"
 print("isolation holds: another client's write storm did not queue our reads")
 
-with open("/tmp/flint-rwiso/counts", "w") as f:
+with open(os.environ.get("FLINT_DRILL_ROOT","/tmp")+"/flint-rwiso/counts", "w") as f:
     json.dump({"reads": 900, "writes": storm_count[0]}, f)
 PY
 [ $? -eq 0 ] || exit 1
@@ -139,7 +139,7 @@ echo "  commands_read_total=$READS commands_write_total=$WRITES"
 # The invariant worth asserting is that the proxy counted the traffic it was
 # given, whatever that was. A drill that measures the machine instead of the
 # product will go green on the fastest CI you buy and tell you nothing.
-EXP=$(python3 -c "import json;d=json.load(open('/tmp/flint-rwiso/counts'));print(d['reads'],d['writes'])")
+EXP=$(python3 -c "import json;d=json.load(open('$FLINT_DRILL_ROOT/flint-rwiso/counts'));print(d['reads'],d['writes'])")
 EXP_R=${EXP% *}; EXP_W=${EXP#* }
 [ "$READS"  -ge "$EXP_R" ] || { echo "FAIL: read counter says $READS, the client sent $EXP_R"; exit 1; }
 [ "$WRITES" -ge "$EXP_W" ] || { echo "FAIL: write counter says $WRITES, the storm sent $EXP_W"; exit 1; }

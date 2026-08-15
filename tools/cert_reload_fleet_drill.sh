@@ -13,10 +13,10 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init /tmp/flint-certreload 7061 7062 7795 7998
+fleet_init $FLINT_DRILL_ROOT/flint-certreload 7061 7062 7795 7998
 fleet_guard
 CTL=./target/release/flintctl
-D=/tmp/flint-certreload; rm -rf "$D"; mkdir -p "$D"
+D=$FLINT_DRILL_ROOT/flint-certreload; rm -rf "$D"; mkdir -p "$D"
 fleet_kill server; fleet_kill proxy
 fleet_kill controlplane; fleet_kill controller; sleep 0.4
 cleanup() {

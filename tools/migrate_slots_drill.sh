@@ -11,10 +11,10 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init /tmp/flint-migsl-state 7231 7232 7233 7234 7235 7236
+fleet_init $FLINT_DRILL_ROOT/flint-migsl-state 7231 7232 7233 7234 7235 7236
 fleet_guard
-STATE=/tmp/flint-migsl-state; INV=/tmp/flint-migsl.flint
-RUN=/tmp/flint-migsl-run; ACK=/tmp/flint-migsl-ack
+STATE=$FLINT_DRILL_ROOT/flint-migsl-state; INV=$FLINT_DRILL_ROOT/flint-migsl.flint
+RUN=$FLINT_DRILL_ROOT/flint-migsl-run; ACK=$FLINT_DRILL_ROOT/flint-migsl-ack
 fleet_kill server; fleet_kill proxy
 fleet_kill controlplane; fleet_kill controller
 sleep 0.4
@@ -88,8 +88,8 @@ sleep 1
 echo "== the CP now records slot 8450 owned by pair 1"
 ./target/release/flintctl -f "$INV" status >/dev/null 2>&1
 SLOTS=$(python3 - <<'PY'
-import socket, ssl
-d="/tmp/flint-migsl-state/certs"
+import socket, ssl, os
+d=os.environ.get("FLINT_DRILL_ROOT","/tmp")+"/flint-migsl-state/certs"
 ctx=ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT); ctx.load_verify_locations(f"{d}/ca.crt")
 ctx.load_cert_chain(f"{d}/int.crt", f"{d}/int.key"); ctx.check_hostname=False
 s=ctx.wrap_socket(socket.create_connection(("127.0.0.1",7236),timeout=5),server_hostname="flint-internal")
@@ -110,8 +110,8 @@ echo "  {mig2}:k00000 and k01999 both intact via the proxy"
 
 echo "== the NEW owner (pair 1 master, 7233) physically holds the slot"
 HELD=$(python3 - <<'PY'
-import socket, ssl
-d="/tmp/flint-migsl-state/certs"
+import socket, ssl, os
+d=os.environ.get("FLINT_DRILL_ROOT","/tmp")+"/flint-migsl-state/certs"
 ctx=ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT); ctx.load_verify_locations(f"{d}/ca.crt")
 ctx.load_cert_chain(f"{d}/int.crt", f"{d}/int.key"); ctx.check_hostname=False
 s=ctx.wrap_socket(socket.create_connection(("127.0.0.1",7233),timeout=5),server_hostname="flint-internal")

@@ -7,10 +7,10 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init /tmp/flint-mng- 6324 6325
+fleet_init $FLINT_DRILL_ROOT/flint-mng- 6324 6325
 fleet_guard
 fleet_kill server; fleet_kill controller; sleep 0.4
-D1=/tmp/flint-mng-1; D2=/tmp/flint-mng-2
+D1=$FLINT_DRILL_ROOT/flint-mng-1; D2=$FLINT_DRILL_ROOT/flint-mng-2
 rm -rf "$D1" "$D2" "$D1.log" "$D2.log"
 P1=6324; P2=6325
 cleanup() {
@@ -37,13 +37,13 @@ trap cleanup EXIT
 
 echo "== start the managed controller (it bootstraps the pair itself)"
 ./target/release/flint-controller --manage-slots "$P1:$D1,$P2:$D2" --id MNG \
-  --poll-ms 150 --confirm 3 2>/tmp/flint-mng.log &
+  --poll-ms 150 --confirm 3 2>$FLINT_DRILL_ROOT/flint-mng.log &
 # Wait for the controller to bootstrap master + replica.
 for i in $(seq 1 60); do
   [ "$(valkey-cli -p $P1 PING 2>/dev/null)" = "PONG" ] && [ "$(valkey-cli -p $P2 PING 2>/dev/null)" = "PONG" ] && break
   sleep 0.2
 done
-[ "$(valkey-cli -p $P1 PING 2>/dev/null)" = "PONG" ] || { echo "FAIL: controller never bootstrapped"; cat /tmp/flint-mng.log; exit 1; }
+[ "$(valkey-cli -p $P1 PING 2>/dev/null)" = "PONG" ] || { echo "FAIL: controller never bootstrapped"; cat $FLINT_DRILL_ROOT/flint-mng.log; exit 1; }
 echo "pair bootstrapped by the controller"
 
 master_port() {
@@ -70,7 +70,7 @@ for round in 1 2 3; do
     valkey-cli -p $OTHER FLINTINFO 2>/dev/null | tr '\r' ' ' | grep -q "role:master" && { PROMOTED=1; break; }
     sleep 0.2
   done
-  [ "$PROMOTED" = "1" ] || { echo "FAIL: controller did not promote :$OTHER"; tail -12 /tmp/flint-mng.log; exit 1; }
+  [ "$PROMOTED" = "1" ] || { echo "FAIL: controller did not promote :$OTHER"; tail -12 $FLINT_DRILL_ROOT/flint-mng.log; exit 1; }
   [ "$(valkey-cli -p $OTHER SET p$round ok 2>&1)" = "OK" ] || { echo "FAIL: promoted master not writable"; exit 1; }
 
   # Wait for the killed slot to be respawned as a fresh replica and reconverge.
@@ -81,7 +81,7 @@ for round in 1 2 3; do
     [ "$SL" = "seq_lag:0" ] && [ "$LR" = "live_replicas:1" ] && { RECONVERGED=1; break; }
     sleep 0.2
   done
-  [ "$RECONVERGED" = "1" ] || { echo "FAIL: controller did not respawn+reconverge a replica"; tail -12 /tmp/flint-mng.log; exit 1; }
+  [ "$RECONVERGED" = "1" ] || { echo "FAIL: controller did not respawn+reconverge a replica"; tail -12 $FLINT_DRILL_ROOT/flint-mng.log; exit 1; }
   # Let the controller independently observe the converged pair before the
   # next kill — it promotes only survivors IT has confirmed caught up
   # (killing faster than any monitor polls is a degraded window, correctly

@@ -22,9 +22,9 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init /tmp/flint-attached 7361 7362 7363 7364 7692 7744
+fleet_init $FLINT_DRILL_ROOT/flint-attached 7361 7362 7363 7364 7692 7744
 fleet_guard
-D=/tmp/flint-attached; INV=$D/cluster.flint
+D=$FLINT_DRILL_ROOT/flint-attached; INV=$D/cluster.flint
 CTL=./target/release/flintctl
 ITER="${1:-6}"
 fleet_kill server; fleet_kill proxy

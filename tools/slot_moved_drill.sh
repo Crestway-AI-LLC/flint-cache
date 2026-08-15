@@ -9,10 +9,10 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init /tmp/flint-moved 6560 7000
+fleet_init $FLINT_DRILL_ROOT/flint-moved 6560 7000
 fleet_guard
 fleet_kill server; sleep 0.4
-DIR=$(mktemp -d /tmp/flint-moved.XXXXXX)
+DIR=$(mktemp -d $FLINT_DRILL_ROOT/flint-moved.XXXXXX)
 B=./target/release/flint-server
 PORT=6560
 cleanup() { pkill -9 -f "flint-server --port 6560" 2>/dev/null; rm -rf "$DIR"; }

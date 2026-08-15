@@ -8,9 +8,9 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init /tmp/flint-tdel-state 7201 7202 7579 7710
+fleet_init $FLINT_DRILL_ROOT/flint-tdel-state 7201 7202 7579 7710
 fleet_guard
-STATE=/tmp/flint-tdel-state; INV=/tmp/flint-tdel.flint
+STATE=$FLINT_DRILL_ROOT/flint-tdel-state; INV=$FLINT_DRILL_ROOT/flint-tdel.flint
 fleet_kill server; fleet_kill proxy
 fleet_kill controlplane; fleet_kill controller
 sleep 0.4
@@ -60,8 +60,8 @@ echo "  acme rejected; beta still serves 50 keys"
 
 echo "== the namespace's data is physically gone on the master"
 GONE=$(python3 - <<'PY'
-import socket, ssl
-d="/tmp/flint-tdel-state/certs"
+import socket, ssl, os
+d=os.environ.get("FLINT_DRILL_ROOT","/tmp")+"/flint-tdel-state/certs"
 ctx=ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT); ctx.load_verify_locations(f"{d}/ca.crt")
 ctx.load_cert_chain(f"{d}/int.crt", f"{d}/int.key"); ctx.check_hostname=False
 s=ctx.wrap_socket(socket.create_connection(("127.0.0.1",7201),timeout=5),server_hostname="flint-internal")

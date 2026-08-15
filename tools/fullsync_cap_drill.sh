@@ -11,10 +11,10 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init /tmp/flint-fscap 6990
+fleet_init $FLINT_DRILL_ROOT/flint-fscap 6990
 fleet_guard
 B=./target/release/flint-server
-D=/tmp/flint-fscap; rm -rf "$D"; mkdir -p "$D"
+D=$FLINT_DRILL_ROOT/flint-fscap; rm -rf "$D"; mkdir -p "$D"
 fleet_kill server; sleep 0.4
 cleanup() { fleet_kill server; rm -rf "$D"; }
 trap cleanup EXIT
@@ -31,7 +31,7 @@ s=socket.create_connection(("127.0.0.1",6990),timeout=10); s.settimeout(10)
 v=os.urandom(2048).hex()
 for i in range(2000):
     s.sendall(resp(["SET",f"k:{i}",v])); s.recv(64)
-s.sendall(resp(["FLINTSNAPSHOT","/tmp/flint-fscap/snap"])); s.recv(256)  # flush to SSTs
+s.sendall(resp(["FLINTSNAPSHOT",os.environ.get("FLINT_DRILL_ROOT","/tmp")+"/flint-fscap/snap"])); s.recv(256)  # flush to SSTs
 PY
 echo "  master seeded"
 

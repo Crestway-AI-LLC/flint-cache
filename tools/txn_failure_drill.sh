@@ -32,10 +32,10 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init /tmp/flint-txnfail 6960 6961 6962
+fleet_init $FLINT_DRILL_ROOT/flint-txnfail 6960 6961 6962
 fleet_guard
 B=./target/release/flint-server
-D=/tmp/flint-txnfail
+D=$FLINT_DRILL_ROOT/flint-txnfail
 fleet_kill server; fleet_kill proxy; sleep 0.4
 cleanup() { fleet_kill server; fleet_kill proxy; rm -rf "$D"; }
 trap cleanup EXIT

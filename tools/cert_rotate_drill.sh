@@ -10,11 +10,11 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init /tmp/flint-certrot 6300 6301 7063 6302 6303
+fleet_init $FLINT_DRILL_ROOT/flint-certrot 6300 6301 7063 6302 6303
 fleet_guard
 CTL=./target/release/flintctl
 B=./target/release/flint-server
-D=/tmp/flint-certrot; rm -rf "$D"; mkdir -p "$D"
+D=$FLINT_DRILL_ROOT/flint-certrot; rm -rf "$D"; mkdir -p "$D"
 fleet_kill server; fleet_kill proxy
 fleet_kill controlplane; fleet_kill controller; sleep 0.4
 cleanup() {
@@ -55,7 +55,7 @@ echo "  leaf re-signed from the CA (fingerprint changed)"
 
 echo "== live writer runs THROUGH the reload window: zero errors"
 python3 - <<'PY' &
-import socket, time, pathlib
+import socket, time, pathlib, os
 def resp(a):
     return f"*{len(a)}\r\n".encode()+b"".join(f"${len(x)}\r\n{x}\r\n".encode() for x in a)
 s=socket.create_connection(("127.0.0.1",6303),timeout=10); s.settimeout(10)
@@ -72,7 +72,7 @@ while time.time()<end:
     if b.startswith(b":"): acked+=1
     else: errors+=1
     time.sleep(0.01)
-pathlib.Path("/tmp/flint-certrot/w").write_text(f"{acked} {errors}")
+pathlib.Path(os.environ.get("FLINT_DRILL_ROOT","/tmp")+"/flint-certrot/w").write_text(f"{acked} {errors}")
 PY
 WRITER=$!
 sleep 4   # let the watcher (2s poll) reload while traffic flows

@@ -8,10 +8,10 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init /tmp/flint-cfg-state 7211 7212 7213 7214
+fleet_init $FLINT_DRILL_ROOT/flint-cfg-state 7211 7212 7213 7214
 fleet_guard
-STATE=/tmp/flint-cfg-state
-INV=/tmp/flint-cfg.flint
+STATE=$FLINT_DRILL_ROOT/flint-cfg-state
+INV=$FLINT_DRILL_ROOT/flint-cfg.flint
 fleet_kill server; fleet_kill proxy
 fleet_kill controlplane; fleet_kill controller
 sleep 0.4
@@ -55,7 +55,7 @@ info() { # field -> value, off node 7211 (the master) using the mesh CA
   python3 - "$1" <<'PY'
 import socket, ssl, sys, os
 field = sys.argv[1]
-d = os.path.expanduser("/tmp/flint-cfg-state/certs")
+d = os.path.expanduser(os.environ.get("FLINT_DRILL_ROOT","/tmp")+"/flint-cfg-state/certs")
 ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
 ctx.load_verify_locations(f"{d}/ca.crt")
 ctx.load_cert_chain(f"{d}/int.crt", f"{d}/int.key")
@@ -97,7 +97,7 @@ echo "  applied live via FLINTCONFIG; node pid unchanged ($PID_AFTER) — no res
 echo "== FLINTCONFIG dump reflects the live values"
 DUMP=$(python3 -c '
 import socket, ssl, os
-d="/tmp/flint-cfg-state/certs"
+d="$FLINT_DRILL_ROOT/flint-cfg-state/certs"
 ctx=ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT); ctx.load_verify_locations(f"{d}/ca.crt")
 ctx.load_cert_chain(f"{d}/int.crt", f"{d}/int.key"); ctx.check_hostname=False
 s=ctx.wrap_socket(socket.create_connection(("127.0.0.1",7211),timeout=5),server_hostname="flint-internal")

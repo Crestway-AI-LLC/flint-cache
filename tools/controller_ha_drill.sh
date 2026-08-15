@@ -8,11 +8,11 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init /tmp/flint-ha- 6450 6451 6452
+fleet_init $FLINT_DRILL_ROOT/flint-ha- 6450 6451 6452
 fleet_guard
 fleet_kill server; fleet_kill controller; sleep 0.4
-D1=$(mktemp -d /tmp/flint-ha-1.XXXXXX); D2=$(mktemp -d /tmp/flint-ha-2.XXXXXX)
-D3=$(mktemp -d /tmp/flint-ha-3.XXXXXX)
+D1=$(mktemp -d $FLINT_DRILL_ROOT/flint-ha-1.XXXXXX); D2=$(mktemp -d $FLINT_DRILL_ROOT/flint-ha-2.XXXXXX)
+D3=$(mktemp -d $FLINT_DRILL_ROOT/flint-ha-3.XXXXXX)
 B=./target/release/flint-server
 P1=6450; P2=6451; P3=6452
 cleanup() {
@@ -55,11 +55,11 @@ echo "== starting THREE controllers on the same pair"
 # Truncate BEFORE the process starts, not after. The old `: > log` ran after
 # all three had been launched, which is a second race on the same file.
 for c in A B C; do
-  : > "/tmp/flint-ha-ctl-$c.log"
+  : > "$FLINT_DRILL_ROOT/flint-ha-ctl-$c.log"
   ./target/release/flint-controller --nodes 127.0.0.1:$P1,127.0.0.1:$P2 --id "$c" \
-    --poll-ms 150 --confirm 3 2>> "/tmp/flint-ha-ctl-$c.log" &
+    --poll-ms 150 --confirm 3 2>> "$FLINT_DRILL_ROOT/flint-ha-ctl-$c.log" &
 done
-HA_LOGS="/tmp/flint-ha-ctl-A.log /tmp/flint-ha-ctl-B.log /tmp/flint-ha-ctl-C.log"
+HA_LOGS="$FLINT_DRILL_ROOT/flint-ha-ctl-A.log $FLINT_DRILL_ROOT/flint-ha-ctl-B.log $FLINT_DRILL_ROOT/flint-ha-ctl-C.log"
 sleep 1.6
 
 echo "== KILL master; 3 controllers race to promote"
@@ -91,9 +91,9 @@ pkill -9 -f "flint-controller --nodes 127.0.0.1:$P1,127.0.0.1:$P2 --id A"
 pkill -9 -f "flint-controller --nodes 127.0.0.1:$P1,127.0.0.1:$P2 --id B"
 pkill -9 -f "flint-controller --nodes 127.0.0.1:$P1,127.0.0.1:$P2 --id C"
 sleep 0.3
-: > /tmp/flint-ha-ctl2.log
+: > $FLINT_DRILL_ROOT/flint-ha-ctl2.log
 ./target/release/flint-controller --nodes 127.0.0.1:$P2,127.0.0.1:$P3 --id SURV \
-  --poll-ms 150 --confirm 3 2>> /tmp/flint-ha-ctl2.log &
+  --poll-ms 150 --confirm 3 2>> $FLINT_DRILL_ROOT/flint-ha-ctl2.log &
 sleep 2.0  # let it observe convergence of the new pair
 
 echo "== KILL the new master :$P2; lone survivor controller must promote :$P3"
@@ -103,7 +103,7 @@ for i in $(seq 1 60); do
   [ "$(valkey-cli -p $P3 SET p2 ok 2>&1)" = "OK" ] && { RECOVERED=1; break; }
   sleep 0.2
 done
-[ "$RECOVERED" = "1" ] || { echo "FAIL: lone survivor controller did not recover"; cat /tmp/flint-ha-ctl2.log; exit 1; }
+[ "$RECOVERED" = "1" ] || { echo "FAIL: lone survivor controller did not recover"; cat $FLINT_DRILL_ROOT/flint-ha-ctl2.log; exit 1; }
 [ "$(valkey-cli -p $P3 GET key:0007500)" = "value-0007500" ] || { echo "FAIL: data lost after 2nd failover"; exit 1; }
 echo "  lone survivor promoted :$P3, data intact"
 

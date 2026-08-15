@@ -12,10 +12,10 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init /tmp/flint-ntls 6790 6791 6792
+fleet_init $FLINT_DRILL_ROOT/flint-ntls 6790 6791 6792
 fleet_guard
 B=./target/release/flint-server
-D=/tmp/flint-ntls; rm -rf "$D"; mkdir -p "$D"
+D=$FLINT_DRILL_ROOT/flint-ntls; rm -rf "$D"; mkdir -p "$D"
 fleet_kill server; sleep 0.4
 cleanup() { fleet_kill server; rm -rf "$D"; }
 trap cleanup EXIT
@@ -38,14 +38,14 @@ echo "  minted"
 # with a generous timeout (FLINTMIGRATEIN blocks until the move completes).
 resp() {  # $1=port $2=read-timeout-s, rest: command words (one command)
   python3 - "$@" <<'PY'
-import socket, ssl, sys
+import socket, ssl, sys, os
 port, tmo, words = int(sys.argv[1]), float(sys.argv[2]), sys.argv[3:]
 frame = f"*{len(words)}\r\n".encode() + b"".join(
     f"${len(w)}\r\n{w}\r\n".encode() for w in words)
 ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
 ctx.check_hostname = False
 ctx.verify_mode = ssl.CERT_NONE
-ctx.load_cert_chain(certfile="/tmp/flint-ntls/int.crt", keyfile="/tmp/flint-ntls/int.key")
+ctx.load_cert_chain(certfile=os.environ.get("FLINT_DRILL_ROOT","/tmp")+"/flint-ntls/int.crt", keyfile=os.environ.get("FLINT_DRILL_ROOT","/tmp")+"/flint-ntls/int.key")
 with socket.create_connection(("127.0.0.1", port), timeout=5) as raw:
     with ctx.wrap_socket(raw, server_hostname="flint-internal") as s:
         s.sendall(frame)
@@ -63,10 +63,10 @@ fleet_wait_listen 6790
 sleep 0.8
 # Seed: 2000 {mover} keys pipelined on one TLS connection.
 N=$(python3 - <<'PY'
-import socket, ssl
+import socket, ssl, os
 ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
 ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
-ctx.load_cert_chain("/tmp/flint-ntls/int.crt", "/tmp/flint-ntls/int.key")
+ctx.load_cert_chain(os.environ.get("FLINT_DRILL_ROOT","/tmp")+"/flint-ntls/int.crt", os.environ.get("FLINT_DRILL_ROOT","/tmp")+"/flint-ntls/int.key")
 buf = bytearray()
 for i in range(2000):
     k, v = f"{{mover}}:key{i:06d}", f"base-{i:06d}"

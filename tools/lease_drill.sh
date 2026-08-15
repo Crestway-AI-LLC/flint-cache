@@ -21,11 +21,11 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init /tmp/flint-lease-m 6306 6308 6309
+fleet_init $FLINT_DRILL_ROOT/flint-lease-m 6306 6308 6309
 fleet_guard
 fleet_kill server; fleet_kill controlplane; sleep 0.4
-MDIR=$(mktemp -d /tmp/flint-lease-m.XXXXXX); RDIR=$(mktemp -d /tmp/flint-lease-r.XXXXXX)
-CPSTATE=$(mktemp -d /tmp/flint-lease-cp.XXXXXX)
+MDIR=$(mktemp -d $FLINT_DRILL_ROOT/flint-lease-m.XXXXXX); RDIR=$(mktemp -d $FLINT_DRILL_ROOT/flint-lease-r.XXXXXX)
+CPSTATE=$(mktemp -d $FLINT_DRILL_ROOT/flint-lease-cp.XXXXXX)
 B=./target/release/flint-server
 CP=./target/release/flint-controlplane
 CPPORT=6306; MPORT=6308; RPORT=6309
@@ -45,7 +45,7 @@ cleanup() {
 trap cleanup EXIT
 
 echo "== CP + pair; both nodes carry --lease-ttl-ms $TTL and dial the CP themselves"
-$CP --port $CPPORT --state "$CPSTATE/state" 2>/tmp/flint-lease-cp.log &
+$CP --port $CPPORT --state "$CPSTATE/state" 2>$FLINT_DRILL_ROOT/flint-lease-cp.log &
 fleet_wait_ping $CPPORT
 # The membership guard: CPLEASE/CPFENCE refuse an address the registry does
 # not know, so the pair must be on record before the first renewal matters.
@@ -53,11 +53,11 @@ fleet_wait_ping $CPPORT
 # the deadline stays unarmed until the first success, so nothing fences.)
 fleet_cp $CPPORT CPADDPAIR 127.0.0.1:$MPORT,127.0.0.1:$RPORT
 $B --port $MPORT --engine rocks --data-dir "$MDIR" \
-   --lease-ttl-ms $TTL --journal 127.0.0.1:$CPPORT 2>/tmp/flint-lease-m.log &
+   --lease-ttl-ms $TTL --journal 127.0.0.1:$CPPORT 2>$FLINT_DRILL_ROOT/flint-lease-m.log &
 fleet_wait_listen $MPORT
 sleep 0.5
 $B --port $RPORT --engine rocks --data-dir "$RDIR" --replica-of 127.0.0.1:$MPORT \
-   --lease-ttl-ms $TTL --journal 127.0.0.1:$CPPORT 2>/tmp/flint-lease-r.log &
+   --lease-ttl-ms $TTL --journal 127.0.0.1:$CPPORT 2>$FLINT_DRILL_ROOT/flint-lease-r.log &
 fleet_wait_listen $RPORT
 sleep 0.9
 cli_ok valkey-cli -p $MPORT SET k v
@@ -93,7 +93,7 @@ done
 [ "$FENCED" = 1 ] || { echo "FAIL: master kept serving writes after a promotion was recorded over it"; exit 1; }
 ELAPSED_MS=$(( i * 200 ))
 echo "  superseded and fenced after ~${ELAPSED_MS}ms (TTL is ${TTL}ms)"
-grep -q "superseded" /tmp/flint-lease-m.log 2>/dev/null \
+grep -q "superseded" $FLINT_DRILL_ROOT/flint-lease-m.log 2>/dev/null \
   || { echo "FAIL: the master's log does not say the fence came from -SUPERSEDED — did it merely time out?"; exit 1; }
 
 echo "== the self-fenced master FENCES tenant reads, and is alive rather than down"

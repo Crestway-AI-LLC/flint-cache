@@ -10,13 +10,13 @@ set -euo pipefail
 # drill that declares nothing is invisible to assert_no_port_overlap,
 # which is how failover and controller came to share 6440/6441 and
 # reseed and lag_cap to share 6471/6472, unseen.
-fleet_init /tmp/flint-repl 6420 6421
+fleet_init $FLINT_DRILL_ROOT/flint-repl 6420 6421
 
 KEYS="${1:-50000}"
 MPORT="${2:-6420}"
 RPORT="${3:-6421}"
-MDIR="$(mktemp -d /tmp/flint-repl-m.XXXXXX)"
-RDIR="$(mktemp -d /tmp/flint-repl-r.XXXXXX)"
+MDIR="$(mktemp -d $FLINT_DRILL_ROOT/flint-repl-m.XXXXXX)"
+RDIR="$(mktemp -d $FLINT_DRILL_ROOT/flint-repl-r.XXXXXX)"
 BIN="$(dirname "$0")/../target/release/flint-server"
 
 cleanup() {
@@ -30,7 +30,7 @@ echo "== master :$MPORT, replica :$RPORT, $KEYS keys"
 "$BIN" --port "$MPORT" --engine rocks --data-dir "$MDIR" &
 fleet_wait_listen "$MPORT"
 sleep 0.4
-RLOG="$(mktemp /tmp/flint-replica-log.XXXXXX)"
+RLOG="$(mktemp $FLINT_DRILL_ROOT/flint-replica-log.XXXXXX)"
 "$BIN" --port "$RPORT" --engine rocks --data-dir "$RDIR" --replica-of "127.0.0.1:$MPORT" 2> "$RLOG" &
 fleet_wait_listen "$RPORT"
 sleep 0.6

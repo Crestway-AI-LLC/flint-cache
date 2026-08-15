@@ -45,14 +45,14 @@
 # to chase today.
 set -euo pipefail
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init /tmp/flint-chaosunread 6346 6347 6348 6349 6350 6351 6352 6353
+fleet_init $FLINT_DRILL_ROOT/flint-chaosunread 6346 6347 6348 6349 6350 6351 6352 6353
 fleet_guard
 fleet_kill server
 sleep 0.5
 cargo build --release -q -p flint-server --features rocks
 cargo build --release -q -p flint-chaos
 
-D=$(mktemp -d /tmp/flint-unreadable.XXXXXX)
+D=$(mktemp -d $FLINT_DRILL_ROOT/flint-unreadable.XXXXXX)
 trap 'fleet_kill server; rm -rf "$D"' EXIT
 INJECT=3
 

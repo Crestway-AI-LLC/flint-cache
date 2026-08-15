@@ -31,13 +31,13 @@ cd "$(dirname "$0")/.."
 # drill that declares nothing is invisible to assert_no_port_overlap,
 # which is how failover and controller came to share 6440/6441 and
 # reseed and lag_cap to share 6471/6472, unseen.
-fleet_init /tmp/flint-diskpressure 6396
+fleet_init $FLINT_DRILL_ROOT/flint-diskpressure 6396
 
 PORT=6396
 # macOS: hdiutil APPENDS .dmg when the path lacks it, so a bare .img name
 # creates one file and attaches another. Name it per platform.
-if [ "$(uname)" = "Darwin" ]; then IMG=/tmp/flint-diskpressure.dmg; else IMG=/tmp/flint-diskpressure.img; fi
-MNT=/tmp/flint-diskpressure-mnt
+if [ "$(uname)" = "Darwin" ]; then IMG=$FLINT_DRILL_ROOT/flint-diskpressure.dmg; else IMG=$FLINT_DRILL_ROOT/flint-diskpressure.img; fi
+MNT=$FLINT_DRILL_ROOT/flint-diskpressure-mnt
 SIZE_MB=512
 # Thresholds chosen so a 512 MB volume trips them with a ~400 MB ballast
 # file, not so tight that filesystem overhead alone trips them at boot.
@@ -70,8 +70,8 @@ cleanup() {
 # the absence afterwards is.
 assert_unmounted() {
   local i real
-  # macOS reports /private/tmp/... in `mount` even when the path given was
-  # /tmp/... , so matching the literal never fires and the guard silently
+  # macOS reports /private$FLINT_DRILL_ROOT/... in `mount` even when the path given was
+  # $FLINT_DRILL_ROOT/... , so matching the literal never fires and the guard silently
   # passes. Resolve the path first. (Caught by its own positive control:
   # a deliberately wedged mount was reported as absent.)
   real=$(cd "$MNT" 2>/dev/null && pwd -P) || real="$MNT"
@@ -113,7 +113,7 @@ cargo build --release -q -p flint-server --features rocks || fail "build"
 echo "== node up on it"
 ./target/release/flint-server --port "$PORT" --engine rocks --data-dir "$MNT/data" \
   --disk-min-free-pct "$MIN_PCT" --disk-min-free-bytes "$MIN_BYTES" \
-  --disk-sample-ms 500 >/tmp/flint-diskpressure.log 2>&1 &
+  --disk-sample-ms 500 >$FLINT_DRILL_ROOT/flint-diskpressure.log 2>&1 &
 for _ in $(seq 1 60); do
   [ "$(valkey-cli -p $PORT PING 2>/dev/null)" = "PONG" ] && break; sleep 0.25
 done
@@ -137,8 +137,8 @@ done
   echo "mount:"; mount | grep -i diskpressure | sed 's/^/  /' || echo "  NOT MOUNTED"
   echo "data dir:"; ls -la "$MNT/data" 2>&1 | head -4 | sed 's/^/  /'
   echo "free space:"; df -h "$MNT" 2>&1 | tail -1 | sed 's/^/  /'
-  echo "server log ($(wc -c </tmp/flint-diskpressure.log 2>/dev/null || echo 0) bytes):"
-  sed 's/^/  /' /tmp/flint-diskpressure.log 2>/dev/null | tail -10
+  echo "server log ($(wc -c <$FLINT_DRILL_ROOT/flint-diskpressure.log 2>/dev/null || echo 0) bytes):"
+  sed 's/^/  /' $FLINT_DRILL_ROOT/flint-diskpressure.log 2>/dev/null | tail -10
   echo "load:"; uptime | sed 's/^/  /'
   echo "other flint seats (a busy box is the leading remaining hypothesis):"
   pgrep -lf 'flint-(server|proxy|controlplane|controller|chaos)' | grep -v "port $PORT" \
@@ -161,7 +161,7 @@ dd if=/dev/zero of="$MNT/ballast" bs=1m count=400 2>/dev/null \
   || dd if=/dev/zero of="$MNT/ballast" bs=1M count=400 status=none
 sleep 2
 [ "$(info disk_verdict)" = "shed" ] || fail "verdict is $(info disk_verdict) at $(info disk_free_pct)% free, expected shed"
-grep -q "Ok -> Shed" /tmp/flint-diskpressure.log || fail "the transition was not logged"
+grep -q "Ok -> Shed" $FLINT_DRILL_ROOT/flint-diskpressure.log || fail "the transition was not logged"
 echo "  free $(info disk_free_pct)%, verdict shed, transition logged"
 
 echo "== the contract while shedding"
@@ -188,7 +188,7 @@ for _ in $(seq 1 40); do
   sleep 0.5
 done
 [ -n "$REOPENED" ] || fail "still shedding at $(info disk_free_pct)% free — no operator should be needed"
-grep -q "Shed -> Ok" /tmp/flint-diskpressure.log || fail "the recovery transition was not logged"
+grep -q "Shed -> Ok" $FLINT_DRILL_ROOT/flint-diskpressure.log || fail "the recovery transition was not logged"
 [ "$(valkey-cli -p $PORT SET newkey v)" = "OK" ] || fail "writes did not resume"
 [ "$(valkey-cli -p $PORT GET keep-a)" = "aaa" ] || fail "keep-a lost across recovery"
 echo "  free $(info disk_free_pct)%, verdict ok, writes resumed, data intact"

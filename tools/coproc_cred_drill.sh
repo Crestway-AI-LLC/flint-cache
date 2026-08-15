@@ -17,11 +17,11 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init /tmp/flint-coproc 6693 6694 6695
+fleet_init $FLINT_DRILL_ROOT/flint-coproc 6693 6694 6695
 fleet_guard
 B=./target/release/flint-server
 CTL=./target/release/flintctl
-D=/tmp/flint-coproc; INV=/tmp/flint-coproc.flint
+D=$FLINT_DRILL_ROOT/flint-coproc; INV=$FLINT_DRILL_ROOT/flint-coproc.flint
 rm -rf "$D"; mkdir -p "$D/certs"
 fleet_kill server; sleep 0.3
 cleanup() { fleet_kill server; rm -rf "$D" "$INV"; }

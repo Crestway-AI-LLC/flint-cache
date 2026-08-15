@@ -27,9 +27,9 @@ cd "$(dirname "$0")/.."
 # drill that declares nothing is invisible to assert_no_port_overlap,
 # which is how failover and controller came to share 6440/6441 and
 # reseed and lag_cap to share 6471/6472, unseen.
-fleet_init /tmp/flint-reseed 6471 6472
+fleet_init $FLINT_DRILL_ROOT/flint-reseed 6471 6472
 BIN=./target/release/flint-server
-D=/tmp/flint-reseed
+D=$FLINT_DRILL_ROOT/flint-reseed
 MPORT=6471; RPORT=6472
 MDIR=$D/master; RDIR=$D/replica
 MLOG=$D/master.log; RLOG=$D/replica.log

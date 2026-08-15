@@ -20,11 +20,11 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init /tmp/flint-bksched 6944
+fleet_init $FLINT_DRILL_ROOT/flint-bksched 6944
 fleet_guard
 B=./target/release/flint-server
 BK=./target/release/flint-backup
-D=/tmp/flint-bksched
+D=$FLINT_DRILL_ROOT/flint-bksched
 fleet_kill server; sleep 0.3
 SCHED_PID=""
 cleanup() {

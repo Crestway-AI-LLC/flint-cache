@@ -29,11 +29,11 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init /tmp/flint-upgrade 6845 6846 7145 7845
+fleet_init $FLINT_DRILL_ROOT/flint-upgrade 6845 6846 7145 7845
 fleet_guard
 
 CTL=./target/release/flintctl
-D=/tmp/flint-upgrade; rm -rf "$D"; mkdir -p "$D"
+D=$FLINT_DRILL_ROOT/flint-upgrade; rm -rf "$D"; mkdir -p "$D"
 TAG=build-1234
 
 cleanup() {
