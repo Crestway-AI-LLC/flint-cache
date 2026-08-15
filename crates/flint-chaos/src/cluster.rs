@@ -830,7 +830,31 @@ fn dir_bytes(p: &std::path::Path) -> u64 {
         .sum()
 }
 
+/// Execute the server binary ONCE, print-and-exit, before any spawn that is
+/// timed. Costs milliseconds when warm.
+///
+/// The first exec of a freshly linked binary pays for dynamic linking,
+/// signature validation and a cold page cache, and on this machine that was
+/// measured at TWENTY SECONDS — against `bootstrap_at`'s 15s PING budget. The
+/// failure is maximally misleading: the node log is EMPTY (the process has not
+/// reached its first print), no port is bound, and the run dies at `master up`
+/// as though the server were broken. Three chaos runs were spent on it, and
+/// the same shape once cost an afternoon elsewhere in this suite.
+///
+/// gates.sh already warms flint-server centrally for exactly this reason, but
+/// 49 drills build their own binaries and any of them run standalone skips
+/// that. Warming HERE covers every spawn path this harness has — bootstrap,
+/// promote-replace, respawn — from one place, and covers the soak too.
+fn warm_server_bin() {
+    static WARM: std::sync::Once = std::sync::Once::new();
+    WARM.call_once(|| {
+        // print-and-exit, so this can never bind a port or leave a seat.
+        let _ = Command::new(server_bin()).arg("--build-version").output();
+    });
+}
+
 fn spawn_node(port: u16, dir: &str, replica_of: Option<u16>) -> Child {
+    warm_server_bin();
     let mut cmd = Command::new(server_bin());
     cmd.args([
         "--port",
