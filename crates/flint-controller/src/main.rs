@@ -476,6 +476,9 @@ struct Pair {
     /// pair whose lineage holder is alive but has lost its replica (#171) —
     /// the case `insync_lineage_holder` structurally cannot answer.
     last_insync: Option<(String, u32)>,
+    /// A scheduled snapshot of this pair is still running on its own thread.
+    /// At most one in flight per pair; the SWEEP never waits on it (#172).
+    snapshot_inflight: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Pair {
@@ -497,6 +500,7 @@ impl Pair {
             dark_streak: 0,
             last_snapshot: Instant::now(),
             last_insync: None,
+            snapshot_inflight: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             slots,
         }
     }
@@ -636,30 +640,50 @@ impl Pair {
             // checkpoint of each managed master into <root>/<pair-label>/.
             // This is what makes whole-pair loss survivable (spare restore
             // above) instead of a total-loss page.
+            //
+            // OFF THE SWEEP THREAD (#172). This used to run inline with a
+            // 30s call_slow budget — and on a loaded fleet a snapshot USES
+            // that budget, so one snapshot round blinded the controller for
+            // up to pairs x 30s: no probes, no promotions, no CPCONTROLLER
+            // registration. That is the "controller goes silent for ~50s"
+            // signature from scale runs 12 and 14 — the sweep was not dead,
+            // it was in here, and every local drill missed it because a
+            // loopback snapshot of a toy dataset is instant. The sweep now
+            // only SCHEDULES: the call runs on its own thread, one in
+            // flight per pair, and the interval is measured schedule-to-
+            // schedule (a failing snapshot retries next interval instead of
+            // hammering every tick — logged either way).
             if let Some(root) = &cfg.snapshot_root
                 && self.last_snapshot.elapsed() >= cfg.snapshot_interval
+                && !self
+                    .snapshot_inflight
+                    .swap(true, std::sync::atomic::Ordering::SeqCst)
             {
+                self.last_snapshot = Instant::now();
                 let dir = format!("{root}/{}", self.label);
-                match call_slow(
-                    &legit_addr,
-                    &[b"FLINTSNAPSHOT", dir.as_bytes()],
-                    Duration::from_secs(30),
-                ) {
-                    Ok(Value::Simple(reply)) => {
-                        self.last_snapshot = Instant::now();
-                        journal_event(
-                            &cfg.id,
+                let addr = legit_addr.clone();
+                let id = cfg.id.clone();
+                let label = self.label.clone();
+                let inflight = std::sync::Arc::clone(&self.snapshot_inflight);
+                std::thread::spawn(move || {
+                    match call_slow(
+                        &addr,
+                        &[b"FLINTSNAPSHOT", dir.as_bytes()],
+                        Duration::from_secs(30),
+                    ) {
+                        Ok(Value::Simple(reply)) => journal_event(
+                            &id,
                             flint_journal::EventKind::SnapshotTaken,
-                            &legit_addr,
+                            &addr,
                             None,
                             &format!("scheduled snapshot into {dir}: {reply}"),
-                        );
+                        ),
+                        other => {
+                            eprintln!("[{id}][{label}] snapshot on {addr} failed: {other:?}")
+                        }
                     }
-                    other => eprintln!(
-                        "[{}][{}] snapshot on {legit_addr} failed: {other:?}",
-                        cfg.id, self.label
-                    ),
-                }
+                    inflight.store(false, std::sync::atomic::Ordering::SeqCst);
+                });
             }
             // Any other reachable master-claimer is a zombie: fence it.
             for m in &masters {

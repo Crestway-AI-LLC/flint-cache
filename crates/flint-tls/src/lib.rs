@@ -22,7 +22,7 @@
 //! stray `install_default` elsewhere can never change what these configs use.
 
 use std::io::{self, Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::Arc;
 
 use rustls::pki_types::pem::PemObject;
@@ -319,7 +319,17 @@ pub fn accept(tcp: TcpStream, cfg: &Option<Arc<ServerConfig>>) -> io::Result<Str
 /// is set (presenting our cert, verifying the server against the internal CA
 /// at [`INTERNAL_SNI`]).
 pub fn connect(addr: &str, cfg: &Option<Arc<ClientConfig>>) -> io::Result<Stream> {
-    let tcp = TcpStream::connect(addr)?;
+    // Bounded connect. A bare TcpStream::connect has no timeout of its own,
+    // so a blackholed peer (host down harder than a RST — partition, SG
+    // change, hung NIC) parks the CALLER for the kernel's SYN-retry budget,
+    // minutes, regardless of any read timeout set after. Every internal
+    // dialer (controller sweep, server lease renewals, proxy back-ends)
+    // comes through here; none of them can afford an unbounded wait.
+    let sockaddr = addr
+        .to_socket_addrs()?
+        .next()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, format!("no addr: {addr}")))?;
+    let tcp = TcpStream::connect_timeout(&sockaddr, std::time::Duration::from_secs(3))?;
     match cfg {
         None => Ok(Stream::Plain(tcp)),
         Some(cfg) => {
