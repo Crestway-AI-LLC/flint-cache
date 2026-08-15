@@ -763,7 +763,8 @@ impl Topology {
                 // promotions (#187).
                 if was != found {
                     eprintln!(
-                        "pair {i} master {} -> {} (re-probe triggered by {addr})",
+                        "[{}] pair {i} master {} -> {} (re-probe triggered by {addr})",
+                        log_ms(),
                         was.as_deref().unwrap_or("none"),
                         found.as_deref().unwrap_or("none")
                     );
@@ -817,7 +818,10 @@ impl Topology {
         // zero lines mentioning a promotion across a 25-minute run containing
         // several, which left "the hint never arrived" and "the hint arrived
         // and did nothing" indistinguishable — two very different bugs (#187).
-        eprintln!("promotion hint {hint}: re-probing the pair holding {addr}");
+        eprintln!(
+            "[{}] promotion hint {hint}: re-probing the pair holding {addr}",
+            log_ms()
+        );
         self.rediscover_for(addr);
     }
 
@@ -2937,6 +2941,24 @@ fn handle(
 /// One CPWATCH session: subscribe, apply pushed snapshots, ACK each. The
 /// snapshot frame is [SNAPSHOT, version, "a,b;c,d", "tok=ns,..."] — already
 /// filtered by the control plane to this proxy's assigned tenants.
+/// Wall-clock milliseconds, for the routing lines only.
+///
+/// Soak run 27's proxy log proved the promotion hint arrives and that routing
+/// moves — and then could not say HOW LONG the pair sat with no master,
+/// because the lines carried no time. That duration is the single number
+/// separating "repeated promotions, each with a short no-master window" from
+/// "one long window where the freshly promoted node would not claim the role"
+/// (#187), and the run had to end without it. Same mistake as #188 one level
+/// down: the event was logged, the instant was not. Milliseconds since the
+/// epoch so a line can be sliced straight against the fleet journal, which
+/// stamps the same way.
+fn log_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 fn watch_control_plane(
     cp: &str,
     advertise: &str,
