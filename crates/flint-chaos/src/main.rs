@@ -485,10 +485,31 @@ fn main() {
             };
             if !harness_promoted {
                 rtos.push(rto);
+                // The HOLD belongs in the breach message, not only in the
+                // summary. This assert fires before the per-iteration line
+                // prints, so on soak run 26 a 43850ms breach arrived with no
+                // hold figure at all — and the hold is the datum that says,
+                // on sight, whether clients were HELD for the window or
+                // refused promptly inside it. Those want opposite fixes, and
+                // establishing which cost a separate FLINTINFO sweep against
+                // a fleet that was already tearing down.
+                let held = shared.max_hold_ms.load(Ordering::SeqCst);
+                let held_at = shared.max_hold_at_ms.load(Ordering::SeqCst);
+                let reading = if held * 4 < rto {
+                    "the node FAST-FAILED: no single write waited anywhere near the gap, so \
+                     clients were being refused (-THROTTLED) rather than held. Look at the \
+                     ROUTING leg — promotion notices, the proxy's control-plane watch — not \
+                     at storage"
+                } else {
+                    "writes were genuinely HELD for most of the gap, so the write path itself \
+                     was blocked. Look at storage: fullsync_active, write_stopped, \
+                     delayed_write_rate, writes_shed_deadline"
+                };
                 assert!(
                     rto <= rto_budget_ms,
                     "iter {iteration}: {rto}ms exceeds the published budget {rto_budget_ms}ms \
                      (docs/slo.md) — {measured}. \
+                     Worst SINGLE write held: {held}ms (at {held_at}) — {reading}. \
                      WINDOW kill_ms={kill_ms} dead_ms={dead_ms} recovered_at_ms={recovered_at_ms} — \
                      slice the fleet journal to this window; the leg holding the \
                      time names itself"
