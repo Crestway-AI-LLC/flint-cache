@@ -42,7 +42,7 @@
 //!   cache-max-bytes N     proxy HOT   near-cache byte budget
 //!   poll-ms 100           ctlr  restart  failure-probe interval (RTO)
 //!   confirm 3             ctlr  restart  consecutive fails before promote
-//!   lease-ttl-ms 3000     ctlr  restart  master lease TTL
+//!   lease-ttl-ms 5000     node  restart  master lease TTL (self-renewed at the CP, ADR-0018)
 //!
 //! Exit status (flintctl is scriptable): 0 done; 1 the fleet refused the
 //! command — the CP's or node's OWN error text goes to stderr, never a
@@ -140,7 +140,7 @@ struct Inventory {
     cache_max_bytes: Option<u64>,  // proxy: near-cache byte budget default
     ctl_poll_ms: Option<u64>,      // controller: failure-probe interval (RTO)
     ctl_confirm: Option<u32>,      // controller: consecutive fails to promote
-    ctl_lease_ttl_ms: Option<u64>, // controller: master lease TTL
+    ctl_lease_ttl_ms: Option<u64>, // NODE master lease TTL (ADR-0018: renewed at the CP)
     /// SSH login for seats that live on OTHER machines. Absent = every seat
     /// is local, which is the single-host fleet every drill exercises.
     ssh_user: Option<String>,
@@ -1693,8 +1693,11 @@ fn reload(inv: &Inventory) {
     if inv.async_queue_cap.is_some() {
         restart_only.push("async-queue-cap");
     }
-    if inv.ctl_poll_ms.is_some() || inv.ctl_confirm.is_some() || inv.ctl_lease_ttl_ms.is_some() {
-        restart_only.push("controller timing (poll-ms/confirm/lease-ttl-ms)");
+    if inv.ctl_poll_ms.is_some() || inv.ctl_confirm.is_some() {
+        restart_only.push("controller timing (poll-ms/confirm)");
+    }
+    if inv.ctl_lease_ttl_ms.is_some() {
+        restart_only.push("lease-ttl-ms (node restart — ADR-0018)");
     }
     if !restart_only.is_empty() {
         println!(
@@ -1754,6 +1757,26 @@ fn node_tuning_args(inv: &Inventory, replicated: bool) -> Vec<String> {
         (Some(v), _) => push("--widowed-grace-ms", v.to_string()),
         (None, true) => push("--widowed-grace-ms", DEFAULT_WIDOWED_GRACE_MS.to_string()),
         (None, false) => {}
+    }
+    // ADR-0018: the write lease is the NODE's to renew (against the CP via
+    // its --journal target), not the controller's to push. Same inventory
+    // key as always; it now lands here. Only replicated pairs are leased —
+    // a standalone node has no successor to be fenced against — and 0
+    // disables, matching the server's own default.
+    if replicated {
+        // 5000, not ADR-0004's 3000: under SELF-renewal the fence's
+        // tolerance must cover a routine CP leader election (~2.4s of the
+        // lease path dark, measured by ctl_cpha), which the old
+        // controller-pushed renewals never had inside their window. Still
+        // seconds-scale; the reachable-superseded fence stays ~ttl/3.
+        push(
+            "--lease-ttl-ms",
+            inv.ctl_lease_ttl_ms.unwrap_or(5_000).to_string(),
+        );
+        // Every CP seat, not just the journal target: a renewer pinned to
+        // one seat fences the fleet when exactly that seat dies (the
+        // -LEADER redirect can only be followed from a seat that answers).
+        push("--lease-cp", inv.cp.join(","));
     }
     if let Some(v) = inv.max_conns {
         push("--max-conns", v.to_string());
@@ -2550,9 +2573,6 @@ fn controller_args(inv: &Inventory) -> Vec<String> {
         "--commit-cp".into(),
         inv.cp[0].clone(),
     ];
-    if let Some(v) = inv.ctl_lease_ttl_ms {
-        args.extend(["--lease-ttl-ms".into(), v.to_string()]);
-    }
     args.extend(internal_args(inv));
     args
 }
@@ -4250,7 +4270,8 @@ fn roll_node(
 /// The loss-critical failover core, shared by `upgrade` and `failover`:
 /// fence at an epoch above everything either member has seen, then DEMOTE
 /// the old master FIRST (it stops acking writes), DRAIN (its replica
-/// applies every acked write), and only THEN PROMOTE the new master.
+/// applies every acked write), commit the CPFENCE record (ADR-0018), and
+/// only THEN PROMOTE the new master.
 /// Demote-first is what makes it lossless — a promote-first window lets the
 /// old master ack writes the new lineage never contains; the no-master gap
 /// between demote and promote is absorbed by the proxy's retry budget
@@ -4264,7 +4285,6 @@ fn controlled_failover(
     old_master: &str,
     new_master: &str,
 ) -> u32 {
-    let _ = inv;
     let next = pair
         .iter()
         .filter_map(|a| info_field(a, tls, "role_epoch:"))
@@ -4288,6 +4308,33 @@ fn controlled_failover(
         );
         std::thread::sleep(Duration::from_millis(100));
     }
+    // ADR-0018: the fencing record commits BEFORE the promotion, exactly as
+    // the controller does. This is NOT the best-effort hint CPPROMOTED was —
+    // it is what makes the promotion stick: the new master's own lease
+    // renewals are answered against this record, so an unrecorded promotion
+    // gets -SUPERSEDED and re-fences within a renewal interval. CPFENCE also
+    // bumps the CP version and wakes watching proxies, subsuming CPPROMOTED's
+    // notify role (#91) — which matters MORE on this planned path, where the
+    // demoted old master stays up and the only reactive signal a proxy gets
+    // is -READONLY on a write it already accepted.
+    //
+    // Mandatory, deliberately inverting the old "a CP that is down must
+    // never make a maintenance failover fail": under CP-held leases a
+    // promotion the CP never recorded is not a failover, it is a ~ttl/3
+    // write window followed by a fence. Failing HERE is safe — the pair is
+    // demoted and drained, nothing is lost, and the controller (or a re-run)
+    // completes the handoff once the CP is reachable again.
+    match call_cp(inv, tls, &["CPFENCE", new_master]) {
+        Ok(Value::Simple(_)) => {}
+        other => fail(
+            &format!(
+                "CPFENCE {new_master} did not commit — refusing to promote without \
+                 a fencing record (the pair is demoted and drained; re-run once \
+                 the CP is reachable, or the controller will finish the handoff)"
+            ),
+            &other,
+        ),
+    }
     match call(
         new_master,
         tls,
@@ -4298,26 +4345,6 @@ fn controlled_failover(
             &format!("promotion of {new_master} at (0,{}) failed", next + 1),
             &other,
         ),
-    }
-    // Tell the proxies, exactly as the controller does after an automatic
-    // promotion (#91). This path matters MORE, not less: a PLANNED failover
-    // demotes the old master in place, so it stays up and answers, and the
-    // only signal a proxy gets is -READONLY on a write it already accepted
-    // from a client. Every `upgrade` roll walks a master through this. One
-    // notice turns that bounce into a re-probe the proxy makes before the
-    // client's next request.
-    //
-    // Best effort, like the controller's: a CP that is down must never make
-    // a maintenance failover fail, and the reactive path still converges.
-    if let Some(cp) = inv.cp.first()
-        && !matches!(
-            call(cp, tls, &["CPPROMOTED", new_master]),
-            Ok(Value::Simple(_))
-        )
-    {
-        eprintln!(
-            "  note: CPPROMOTED {new_master} did not land — proxies fall back to reactive rediscovery"
-        );
     }
     next + 1
 }

@@ -33,7 +33,8 @@ flowchart LR
     P -->|mTLS| MN
     P -.->|replica reads, opt-in| R0
     CP -->|versioned snapshot push| P
-    CTL -->|FLINTINFO probes / FLINTPROMOTE + lease| M0
+    CTL -->|FLINTINFO probes / CPFENCE + FLINTPROMOTE| M0
+    M0 -->|CPLEASE self-renewal| CP
     CTL --> R0
 ```
 
@@ -52,8 +53,12 @@ flowchart LR
   (suppressing no-op pushes). The controller supervises pairs — probe,
   verify, promote, fence — using **epoch fencing**: every role carries a
   `(generation, counter)` epoch, and a deposed master that comes back is
-  fenced read-only by its own lease expiry, so a partition never yields two
-  writable masters.
+  fenced read-only by its own lease expiry. The lease lives at the control
+  plane and each master renews it itself (`CPLEASE`, ADR-0018), so the
+  fence survives any controller silence; every promotion first commits a
+  durable fencing record there (`CPFENCE`), and an unrecorded promotion is
+  refused back to read-only by the superseded record. A partition never
+  yields two writable masters.
 - **Data plane — `flint-server` pairs on `flint-storage`.** Each pair is a
   master and replica running the storage engine: Kvrocks-style envelope
   encoding over RocksDB on local NVMe (an in-memory engine serves

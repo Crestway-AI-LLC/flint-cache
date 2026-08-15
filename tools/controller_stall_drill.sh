@@ -1,28 +1,32 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Elastic-2.0
-# A controller stall must not be a permanent fleet-wide write outage (#168).
+# A controller stall must cost NOTHING but failover capability (ADR-0018).
 #
-# THE BUG THIS PINS. flint-server flips a master to read-only when its lease
-# goes unrenewed, and FLINTINFO renders `role:` FROM that read-only flag — so a
-# controller stalled longer than --lease-ttl-ms leaves EVERY pair with no
-# master-CLAIMER although nothing died and nothing diverged. That state used to
-# be self-perpetuating: the controller's degraded-window gate only promotes a
-# pair that converged recently, `last_converged` only advances while a
-# legitimate master exists, so no master => no convergence => the gate refused
-# forever. Measured on this exact fleet before the fix: a 10s stall took it to
-# zero masters and it was STILL at zero 45s after the controller came back.
-# Found by the S2.2 scale test, where ~20k SET/s died after 110s and never
-# recovered.
+# THIS DRILL IS THE INVERSE OF WHAT IT WAS. Under ADR-0004 the controller
+# renewed every master's lease, so a stall longer than --lease-ttl-ms fenced
+# EVERY pair fleet-wide (#168) — and this drill asserted the fleet recovered
+# from that fence. Five scale runs (8-12) showed the shape was structural:
+# each mode of controller silence (#168 stall, #171 replica-less gate, #172
+# post-bringup silence) became a fleet-wide write outage, because the fence
+# was anchored to the least available component in the system.
 #
-# The fix is recovery, NOT weaker fencing: the controller now recognises a
-# self-fenced master that still serves a caught-up replica (top epoch,
-# live_replicas>=1, seq_lag==0) as the in-sync lineage holder and promotes it,
-# and FLINTPROMOTE drops the stale pre-promotion lease deadline so the watchdog
-# cannot immediately re-fence the node it just recovered.
+# ADR-0018 moved the lease to the CP: masters renew THEMSELVES (CPLEASE
+# every ttl/3 against the 3-seat CP), and the controller only commits the
+# fencing record (CPFENCE) before promoting. A stalled controller therefore
+# renews nothing and fences nobody. So the drill now asserts the fleet does
+# NOT fence during the stall and keeps serving writes throughout —
+# the exact scenario that killed run 12's fleet permanently.
 #
-# SIGSTOP is the honest stand-in for what actually happens in the field: a GC
-# pause, CPU starvation on the controller host, or a poll loop that overruns
-# the lease under load. It is deterministic and needs no fault injection.
+# POSITIVE CONTROL, because "nothing happened" is the easiest thing in the
+# world to assert vacuously: after the stall, stop the CP past the TTL and
+# every master must fence — same mechanism, correct anchor. This also proves
+# renewals were landing all along (an unmanaged lease never arms the
+# deadline, so it could not fence here). Then resume the CP and the
+# controller must recover both pairs (CPFENCE + promote, end to end).
+#
+# SIGSTOP is the honest stand-in for what actually happens in the field: a
+# GC pause, CPU starvation on the controller host, or a poll loop that
+# overruns under load. It is deterministic and needs no fault injection.
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
@@ -35,8 +39,9 @@ STALL_S="${FLINT_STALL_S:-10}"
 fleet_kill server; fleet_kill proxy; fleet_kill controlplane; fleet_kill controller
 sleep 0.4
 cleanup() {
-  # CONT first: a still-STOPPED controller cannot be asked to stop cleanly.
+  # CONT first: a still-STOPPED process cannot be asked to stop cleanly.
   pkill -CONT -f 'flint-[c]ontroller' 2>/dev/null
+  pkill -CONT -f 'flint-[c]ontrolplane' 2>/dev/null
   $CTL -f "$INV" stop >/dev/null 2>&1
   fleet_kill server; fleet_kill proxy; fleet_kill controlplane; fleet_kill controller
   rm -rf "$D"
@@ -85,64 +90,98 @@ echo "  baseline: 2/2 masters, edge writable"
 # whose own command line merely CONTAINS that string — including the wrapper
 # that invoked this drill (a `pkill -f 'flint-controller'` in someone's
 # terminal history is enough). That is not theoretical: it picked the calling
-# shell here, so the SIGSTOP below froze the wrong process and the fleet
-# "refused to fence" — a green-looking mechanism testing nothing. The bracket
-# makes the pattern text unable to match itself. Same defect, same fix, as
-# packaging/aws/chaos-cluster/run.sh's ctl_count.
+# shell here, so the SIGSTOP below froze the wrong process and the assertion
+# tested nothing. The bracket makes the pattern text unable to match itself.
 CPID=$(pgrep -f 'flint-[c]ontroller' | head -1)
 [ -n "$CPID" ] || { echo "FAIL: no controller process to stall"; exit 1; }
 # `pgrep -c` is a Linux extension; macOS pgrep has no such flag and prints a
 # usage error to stderr while yielding an empty count. Pipe to wc -l instead so
 # the drill counts the same way on the dev laptop and in CI.
 NCTL=$(pgrep -f 'flint-[c]ontroller' | wc -l | tr -cd '0-9')
-[ "${NCTL:-0}" = 1 ] || { echo "FAIL: expected exactly 1 controller, found ${NCTL:-0} — stalling one of several proves nothing"; pgrep -fl 'flint-[c]ontroller' | sed 's/^/    /'; exit 1; }
-echo "== SIGSTOP the controller (pid $CPID) for ${STALL_S}s — lease is ${LEASE}ms"
+[ "${NCTL:-0}" = 1 ] || { echo "FAIL: expected exactly 1 controller, found ${NCTL:-0} — stalling one of several proves nothing"; pgrep -fl 'flint-[c]ontroller ' | sed 's/^/    /'; exit 1; }
+echo "== SIGSTOP the controller (pid $CPID) for ${STALL_S}s — lease is ${LEASE}ms, held at the CP"
 kill -STOP "$CPID"
-# Prove the stop took: without this, a SIGSTOP that silently did nothing would
-# look exactly like a fleet that refused to fence.
+# Prove the stop took: a SIGSTOP that silently did nothing would make the
+# no-fence assertion below meaningless.
 sleep 0.5
 CSTAT=$(ps -o stat= -p "$CPID" 2>/dev/null | tr -d ' ')
 case "$CSTAT" in
   T*) echo "  controller is stopped (state $CSTAT)" ;;
   *)  echo "FAIL: controller pid $CPID is in state '${CSTAT:-gone}', not stopped — the stall never happened"; exit 1 ;;
 esac
-# POSITIVE CONTROL. Assert the fence actually happened: if a future change
-# stopped leases expiring, the recovery assertion below would pass vacuously
-# and this drill would guard nothing.
+
+# THE INVERTED ASSERTION: every second of the stall, both masters stand and
+# the edge serves writes. One fence, one refused write, and ADR-0018 has
+# regressed to the controller-anchored lease this drill used to document.
+for s in $(seq 1 "$STALL_S"); do
+  M=$(masters)
+  [ "$M" = 2 ] || {
+    echo "FAIL: ${s}s into the controller stall the fleet has $M/2 masters —"
+    echo "      a stalled controller fenced a healthy master (#168 is back)."
+    pairs; exit 1
+  }
+  W=$(edge_set)
+  [ "$W" = OK ] || {
+    echo "FAIL: ${s}s into the controller stall an edge write returned '$W' —"
+    echo "      writes must not depend on the controller being scheduled."
+    pairs; exit 1
+  }
+  sleep 1
+done
+echo "  ${STALL_S}s stalled: 2/2 masters, every edge write OK — nothing fenced"
+
+echo "== SIGCONT — nothing to recover; the fleet must simply still verify"
+kill -CONT "$CPID"
+sleep 1
+[ "$(masters)" = 2 ] || { echo "FAIL: masters lost right after the controller resumed"; pairs; exit 1; }
+$CTL -f "$INV" verify >/dev/null 2>&1 \
+  || { echo "FAIL: fleet does not verify after the stall"; $CTL -f "$INV" verify 2>&1 | tail -12 | sed 's/^/  /'; exit 1; }
+
+# POSITIVE CONTROL: the fence must still exist, anchored where ADR-0018 put
+# it. Stop the CP past the TTL: masters that cannot renew must fence...
+CPPID=$(pgrep -f 'flint-[c]ontrolplane' | head -1)
+[ -n "$CPPID" ] || { echo "FAIL: no control-plane process for the positive control"; exit 1; }
+NCP=$(pgrep -f 'flint-[c]ontrolplane' | wc -l | tr -cd '0-9')
+[ "${NCP:-0}" = 1 ] || { echo "FAIL: expected exactly 1 CP seat, found ${NCP:-0}"; exit 1; }
+echo "== positive control: SIGSTOP the CP (pid $CPPID) — masters must fence at TTL"
+kill -STOP "$CPPID"
 FENCED=0
-for _ in $(seq 1 "$STALL_S"); do
+for _ in $(seq 1 15); do
   [ "$(masters)" = 0 ] && { FENCED=1; break; }
   sleep 1
 done
-[ "$FENCED" = 1 ] || {
-  echo "FAIL: the fleet never self-fenced during a ${STALL_S}s stall (lease=${LEASE}ms) —"
-  echo "      this drill asserts RECOVERY from the fence, so without the fence it proves nothing."
+if [ "$FENCED" != 1 ]; then
+  kill -CONT "$CPPID"
+  echo "FAIL: masters kept serving with the CP stopped past the TTL —"
+  echo "      the lease is not being enforced at all, so the no-fence result"
+  echo "      above was vacuous."
   pairs; exit 1
-}
-echo "  fenced as designed: 0/2 masters while the controller is stalled"
+fi
+echo "  fenced as designed: 0/2 masters without a reachable CP"
 
-echo "== SIGCONT — the fleet must recover ITSELF"
-kill -CONT "$CPID"
+# ...and once the CP is back, the CONTROLLER recovers the fleet — the full
+# ADR-0018 promotion path (CPFENCE committed, then FLINTPROMOTE) end to end.
+echo "== SIGCONT the CP — the controller must recover both pairs"
+kill -CONT "$CPPID"
 HEAL=""
-for i in $(seq 1 30); do
-  if [ "$(masters)" -ge 2 ] 2>/dev/null && [ "$(edge_set)" = OK ]; then HEAL=$i; break; fi
+for i in $(seq 1 45); do
+  if [ "$(masters)" = 2 ] && [ "$(edge_set)" = OK ]; then HEAL=$i; break; fi
   sleep 1
 done
 [ -n "$HEAL" ] || {
-  echo "FAIL: 30s after the controller resumed the fleet still has $(masters)/2 masters and edge_set=$(edge_set)"
-  echo "      — a controller stall is once again a PERMANENT write outage (#168)."
-  pairs; exit 1
+  echo "FAIL: 45s after the CP resumed the fleet has $(masters)/2 masters and edge_set=$(edge_set)"
+  pairs
+  L=$(ls -t "$D"/state/logs/*ontroller* 2>/dev/null | head -1)
+  [ -n "$L" ] && { echo "  --- controller log (tail 25) ---"; tail -25 "$L" | sed 's/^/  | /'; }
+  exit 1
 }
-echo "  recovered ${HEAL}s after the controller resumed"
+echo "  recovered ${HEAL}s after the CP resumed"
 pairs
-
-# The pair must be whole again, not merely writable: a promotion that left the
-# replica behind would still answer SET while carrying a single copy.
 for _ in $(seq 1 30); do
   $CTL -f "$INV" verify >/dev/null 2>&1 && break
   sleep 1
 done
 $CTL -f "$INV" verify >/dev/null 2>&1 \
-  || { echo "FAIL: fleet does not verify after recovering from the stall"; $CTL -f "$INV" verify 2>&1 | tail -12 | sed 's/^/  /'; exit 1; }
+  || { echo "FAIL: fleet does not verify after the recovery"; $CTL -f "$INV" verify 2>&1 | tail -12 | sed 's/^/  /'; exit 1; }
 
-echo "PASS: a ${STALL_S}s controller stall fences the fleet, and the fleet recovers itself within ${HEAL}s and still verifies (#168)"
+echo "PASS: a ${STALL_S}s controller stall fences NOTHING (writes served throughout); the fence still fires on CP loss and the controller recovers the fleet (ADR-0018)"

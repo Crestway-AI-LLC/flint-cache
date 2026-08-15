@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Elastic-2.0
 # A self-fenced master with NO replica must still be recoverable (#171).
+# (Reworked for ADR-0018: the fence is now triggered by stalling the CP —
+# masters renew their own lease there — instead of the controller, whose
+# stall no longer fences anything. The gate under test is unchanged.)
 #
 # THE BUG THIS PINS, measured on the 5 TB scale run (run 11). The controller
 # refuses to auto-promote a pair that has not converged recently
@@ -31,13 +34,16 @@
 # so its `last_converged` freezes while the rest of the fleet carries on.
 #
 # THE SHAPE:
-#   pair 0  — healthy, master + caught-up replica. The CONTROL: #168's recovery
-#             already covers it, so it must still recover, proving the stall
-#             fired and that the fix did not simply disable the gate.
+#   pair 0  — healthy, master + caught-up replica. The CONTROL: the in-sync
+#             escape (#168) already covers it, so it must still recover,
+#             proving the fence fired and that the fix did not simply
+#             disable the gate.
 #   pair 1  — the BYSTANDER: replica killed, so its master has live_replicas 0
 #             and the pair stops converging.
-#   then    — SIGSTOP the controller past the lease so BOTH masters self-fence,
-#             SIGCONT, and require BOTH pairs to come back.
+#   then    — SIGSTOP the CP past the TTL so BOTH masters self-fence (under
+#             ADR-0018 masters renew their own lease at the CP; a stalled
+#             CONTROLLER no longer fences anything — see
+#             controller_stall_drill), SIGCONT, and require BOTH pairs back.
 #
 # Pair 1's surviving node is the same process that was master, at the top epoch,
 # holding all of the pair's data, with no competing lineage anywhere. Promoting
@@ -65,7 +71,7 @@ MAX_STALE_MS=5000
 fleet_kill server; fleet_kill proxy; fleet_kill controlplane; fleet_kill controller
 sleep 0.4
 cleanup() {
-  pkill -CONT -f 'flint-[c]ontroller' 2>/dev/null
+  pkill -CONT -f 'flint-[c]ontrolplane' 2>/dev/null
   $CTL -f "$INV" stop >/dev/null 2>&1
   fleet_kill server; fleet_kill proxy; fleet_kill controlplane; fleet_kill controller
   rm -rf "$D"
@@ -135,18 +141,24 @@ SLEEP_S=$(( MAX_STALE_MS / 1000 + 3 ))
 echo "== waiting ${SLEEP_S}s so pair 1's last_converged goes stale (> ${MAX_STALE_MS}ms)"
 sleep "$SLEEP_S"
 
-CPID=$(pgrep -f 'flint-[c]ontroller' | head -1)
-[ -n "$CPID" ] || { echo "FAIL: no controller process to stall"; exit 1; }
-NCTL=$(pgrep -f 'flint-[c]ontroller' | wc -l | tr -cd '0-9')
-[ "${NCTL:-0}" = 1 ] || { echo "FAIL: expected exactly 1 controller, found ${NCTL:-0}"; pgrep -fl 'flint-[c]ontroller' | sed 's/^/    /'; exit 1; }
+# The fence trigger (ADR-0018): masters renew their own lease at the CP, so
+# stopping the CP past the TTL fences every serving master — while the
+# CONTROLLER keeps running and keeps observing, which is truer to run 11
+# than the old controller-stall trigger anyway (there the controller was
+# alive and refusing, not absent). Bracketed pattern for the same
+# self-match reason as controller_stall_drill.
+CPPID=$(pgrep -f 'flint-[c]ontrolplane' | head -1)
+[ -n "$CPPID" ] || { echo "FAIL: no control-plane process to stall"; exit 1; }
+NCP=$(pgrep -f 'flint-[c]ontrolplane' | wc -l | tr -cd '0-9')
+[ "${NCP:-0}" = 1 ] || { echo "FAIL: expected exactly 1 CP seat, found ${NCP:-0}"; pgrep -fl 'flint-[c]ontrolplane' | sed 's/^/    /'; exit 1; }
 
-echo "== SIGSTOP the controller (pid $CPID) for ${STALL_S}s — lease is ${LEASE}ms"
-kill -STOP "$CPID"
+echo "== SIGSTOP the CP (pid $CPPID) for ${STALL_S}s — lease is ${LEASE}ms"
+kill -STOP "$CPPID"
 sleep 0.5
-CSTAT=$(ps -o stat= -p "$CPID" 2>/dev/null | tr -d ' ')
+CSTAT=$(ps -o stat= -p "$CPPID" 2>/dev/null | tr -d ' ')
 case "$CSTAT" in
-  T*) echo "  controller is stopped (state $CSTAT)" ;;
-  *)  echo "FAIL: controller pid $CPID is in state '${CSTAT:-gone}', not stopped"; exit 1 ;;
+  T*) echo "  CP is stopped (state $CSTAT)" ;;
+  *)  echo "FAIL: CP pid $CPPID is in state '${CSTAT:-gone}', not stopped"; exit 1 ;;
 esac
 
 # POSITIVE CONTROL: both masters must actually self-fence, or the recovery
@@ -157,21 +169,21 @@ for _ in $(seq 1 "$STALL_S"); do
   sleep 1
 done
 [ "$FENCED" = 1 ] || {
-  echo "FAIL: the fleet never self-fenced during a ${STALL_S}s stall (lease=${LEASE}ms) —"
+  echo "FAIL: the fleet never self-fenced during a ${STALL_S}s CP stall (lease=${LEASE}ms) —"
   echo "      without the fence this drill asserts nothing."
   pairs; exit 1
 }
-echo "  fenced as designed: 0/2 masters while the controller is stalled"
+echo "  fenced as designed: 0/2 masters while the CP is stalled"
 
 echo "== SIGCONT — BOTH pairs must recover, including the replica-less one"
-kill -CONT "$CPID"
+kill -CONT "$CPPID"
 HEAL=""
 for i in $(seq 1 45); do
   [ "$(masters)" = 2 ] && { HEAL=$i; break; }
   sleep 1
 done
 if [ -z "$HEAL" ]; then
-  echo "FAIL: 45s after the controller resumed only $(masters)/2 pairs have a master."
+  echo "FAIL: 45s after the CP resumed only $(masters)/2 pairs have a master."
   echo "      This is #171: the pair whose master self-fenced with NO replica cannot"
   echo "      satisfy insync_lineage_holder (live_replicas 0, seq_lag none), so the"
   echo "      degraded-window gate refuses it forever — while the node is alive and"
@@ -180,7 +192,7 @@ if [ -z "$HEAL" ]; then
   L=$(clog); [ -n "$L" ] && { echo "  --- controller log (tail 25) ---"; tail -25 "$L" | sed 's/^/  | /'; }
   exit 1
 fi
-echo "  both pairs recovered ${HEAL}s after the controller resumed"
+echo "  both pairs recovered ${HEAL}s after the CP resumed"
 pairs
 
 # The healthy pair must be whole again; the bystander legitimately has one copy

@@ -37,7 +37,7 @@ trap cleanup EXIT
 
 echo "== start the managed controller (it bootstraps the pair itself)"
 ./target/release/flint-controller --manage-slots "$P1:$D1,$P2:$D2" --id MNG \
-  --poll-ms 150 --confirm 3 --lease-ttl-ms 3000 2>/tmp/flint-mng.log &
+  --poll-ms 150 --confirm 3 2>/tmp/flint-mng.log &
 # Wait for the controller to bootstrap master + replica.
 for i in $(seq 1 60); do
   [ "$(valkey-cli -p $P1 PING 2>/dev/null)" = "PONG" ] && [ "$(valkey-cli -p $P2 PING 2>/dev/null)" = "PONG" ] && break

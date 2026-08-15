@@ -195,6 +195,76 @@ fn internal_connect(addr: &str) -> std::io::Result<flint_tls::Stream> {
     flint_tls::connect_reloadable(addr, INTERNAL_CLIENT.get().unwrap_or(&None))
 }
 
+enum LeaseRenewal {
+    Ok,
+    Superseded(String),
+    Unreachable,
+}
+
+/// One CPLEASE round trip (ADR-0018). A fresh dial per renewal, at ttl/3
+/// cadence — the reconnect cost is noise, and a persistent connection would
+/// need its own liveness machinery to avoid renewing into a dead socket.
+fn cp_lease_renew(target: &str, me: &str) -> LeaseRenewal {
+    use std::io::{Read, Write};
+    let attempt = |target: &str| -> std::io::Result<flint_resp::Value> {
+        let mut stream = internal_connect(target)?;
+        let mut out = Vec::new();
+        flint_resp::encode(
+            &flint_resp::Value::Array(Some(vec![
+                flint_resp::Value::Bulk(Some(b"CPLEASE".to_vec())),
+                flint_resp::Value::Bulk(Some(me.as_bytes().to_vec())),
+            ])),
+            &mut out,
+        );
+        stream.write_all(&out)?;
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let n = stream.read(&mut chunk)?;
+            if n == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "CP closed mid-reply",
+                ));
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            match flint_resp::decode(&buf) {
+                Ok(flint_resp::Decoded::Complete(v, _)) => return Ok(v),
+                Ok(flint_resp::Decoded::NeedMore) => continue,
+                Err(e) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("{e:?}"),
+                    ));
+                }
+            }
+        }
+    };
+    // On an HA control plane CPLEASE is served only by the LEADER — a
+    // follower's applied state can be stale, and a stale +OK would keep a
+    // superseded master alive. Followers answer `-LEADER <addr>`; follow
+    // exactly one hop per renewal, fresh each time (leadership moves).
+    let mut reply = attempt(target);
+    if let Ok(flint_resp::Value::Error(e)) = &reply
+        && let Some(leader) = e.strip_prefix("LEADER ")
+    {
+        reply = attempt(leader.trim());
+    }
+    match reply {
+        Ok(flint_resp::Value::Simple(s)) if s.starts_with("OK") => LeaseRenewal::Ok,
+        Ok(flint_resp::Value::Error(e)) if e.starts_with("SUPERSEDED") => {
+            LeaseRenewal::Superseded(e.split_whitespace().nth(1).unwrap_or("?").to_string())
+        }
+        // Any other reply — an old CP without CPLEASE ("ERR unknown"), a
+        // NOPAIR refusal, an election in progress, a protocol surprise — is
+        // treated as unreachable: the deadline simply is not extended, and
+        // the watchdog decides. Failing OPEN here (treating unknown as OK)
+        // would disable the fence against exactly the component drift it
+        // exists to survive.
+        _ => LeaseRenewal::Unreachable,
+    }
+}
+
 /// Fleet-journal target (--journal <cp-addr>) and this node's own address,
 /// for role-transition events. Reporting is best-effort and detached — a
 /// transition never waits on (or fails because of) the journal.
@@ -633,6 +703,16 @@ fn main() -> std::io::Result<()> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
     let hub = Arc::new(ReplHub::new(lag_soft, lag_hard, min_replicas));
+    // --lease-ttl-ms (ADR-0018): how long this node may serve as master
+    // without a successful CPLEASE renewal before self-fencing. 0 = lease
+    // management off (standalone / no CP), matching the old "no FLINTLEASE
+    // ever arrived" behaviour. The TTL bounds the post-promotion split-brain
+    // window, so it must stay SHORT — the availability win of ADR-0018 comes
+    // from who holds the fence, not from loosening it.
+    let lease_ttl_ms: u64 = arg("--lease-ttl-ms")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+
     // --widowed-grace-ms: how long this node may keep accepting writes with
     // NO live replica before it sheds. The lag cap cannot bound that window
     // (no replica, nothing to measure), and min-replicas-to-write bounds it
@@ -826,6 +906,102 @@ fn main() -> std::io::Result<()> {
                         None,
                         "lease expired: no controller renewal",
                     );
+                }
+            }
+        });
+    }
+
+    // LEASE SELF-RENEWAL (ADR-0018). The write lease used to be PUSHED by the
+    // controller (FLINTLEASE per tick), which anchored the fence to the least
+    // available component in the system: five scale runs in a row turned some
+    // flavour of controller silence into a fleet-wide self-fence of healthy
+    // masters (#168, #171, #172). The master now renews its OWN lease against
+    // the control plane — 3-seat Raft, already dialled for the journal —
+    // asking the only question that matters: "has a promotion been recorded
+    // over me?" (CPFENCE writes that record before any FLINTPROMOTE).
+    //
+    //   OK          -> extend the deadline by the TTL.
+    //   SUPERSEDED  -> a successor is on record: fence NOW, not at expiry.
+    //   unreachable -> deadline unchanged; the watchdog above fences at TTL,
+    //                  because while the CP is unreachable we cannot rule out
+    //                  a promotion committed on the other side of the split.
+    //
+    // Arming matches the old semantics exactly: the deadline stays 0 (never
+    // fences) until the FIRST successful renewal, so standalone and
+    // CP-less fleets behave as before. Renewal stops while read-only — a
+    // replica never held the lease, and a fenced ex-master must stay fenced
+    // (its way back is FLINTPROMOTE, which resets the deadline).
+    // --lease-cp: the CP seats renewals may dial, comma-separated. The
+    // journal target is ONE seat, and a renewer pinned to one seat dies
+    // with it: kill exactly that seat (it is usually cp[0], which is also
+    // usually the first elected leader) and every renewal is a connection
+    // refused — no -LEADER reply to follow — until the fleet fences at
+    // TTL. Found by ctl_cpha the moment nodes carried leases. flintctl
+    // passes the full seat list; absent, the journal target is the list.
+    let lease_cps: Vec<String> = arg("--lease-cp")
+        .map(|v| v.split(',').map(str::to_string).collect())
+        .or_else(|| JOURNAL_TARGET.get().cloned().flatten().map(|t| vec![t]))
+        .unwrap_or_default();
+    if lease_ttl_ms > 0 && !lease_cps.is_empty() {
+        let read_only = Arc::clone(&read_only);
+        let lease_deadline = Arc::clone(&lease_deadline);
+        let me = SELF_ADDR.get().cloned().unwrap_or_default();
+        std::thread::spawn(move || {
+            let every = std::time::Duration::from_millis((lease_ttl_ms / 3).max(200));
+            // After a FAILED attempt, retry fast instead of burning a whole
+            // ttl/3 slot. The failure that matters here is a routine CP
+            // leader election (a seat roll, a leader crash): renewals bounce
+            // for the ~1-2s the election takes, and at ttl/3 cadence a
+            // 3000ms TTL tolerates only TWO consecutive misses before a
+            // HEALTHY master fences — on a controller-less fleet,
+            // permanently (found by ctl_cpha once nodes carried leases).
+            // Fast retry turns an election into a blip well inside the TTL.
+            // The TTL itself is untouched: this narrows the miss window,
+            // it does not loosen the fence.
+            let retry = std::time::Duration::from_millis(250).min(every);
+            let mut last_failed = false;
+            loop {
+                std::thread::sleep(if last_failed { retry } else { every });
+                if read_only.load(Ordering::Relaxed) {
+                    last_failed = false;
+                    continue;
+                }
+                // Rotate across the seats until one ANSWERS (OK or
+                // SUPERSEDED both count — a definitive reply from the
+                // leader, reached directly or via one -LEADER hop). Only
+                // "every seat unreachable" is Unreachable.
+                let mut verdict = LeaseRenewal::Unreachable;
+                for cp in &lease_cps {
+                    match cp_lease_renew(cp, &me) {
+                        LeaseRenewal::Unreachable => continue,
+                        v => {
+                            verdict = v;
+                            break;
+                        }
+                    }
+                }
+                match verdict {
+                    LeaseRenewal::Ok => {
+                        last_failed = false;
+                        lease_deadline.store(
+                            flint_storage::strings::system_clock() + lease_ttl_ms,
+                            Ordering::Relaxed,
+                        );
+                    }
+                    LeaseRenewal::Superseded(successor) => {
+                        read_only.store(true, Ordering::Relaxed);
+                        eprintln!(
+                            "lease superseded by {successor}: a promotion is on record — self-fenced to read-only"
+                        );
+                        journal_event(
+                            flint_journal::EventKind::SelfFenced,
+                            None,
+                            "lease superseded: promotion on record at the CP",
+                        );
+                    }
+                    LeaseRenewal::Unreachable => {
+                        last_failed = true;
+                    }
                 }
             }
         });

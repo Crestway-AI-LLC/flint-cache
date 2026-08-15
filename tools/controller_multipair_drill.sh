@@ -25,7 +25,7 @@ trap cleanup EXIT
 echo "== one controller manages 3 pairs (--manage-pairs g0;g1;g2)"
 ./target/release/flint-controller \
   --manage-pairs "6500:/tmp/flint-mp-6500,6501:/tmp/flint-mp-6501;6510:/tmp/flint-mp-6510,6511:/tmp/flint-mp-6511;6520:/tmp/flint-mp-6520,6521:/tmp/flint-mp-6521" \
-  --id MP --poll-ms 150 --confirm 3 --lease-ttl-ms 3000 2>/tmp/flint-mp.log &
+  --id MP --poll-ms 150 --confirm 3 2>/tmp/flint-mp.log &
 
 # Wait for all six nodes to come up (controller bootstraps each pair).
 for i in $(seq 1 80); do

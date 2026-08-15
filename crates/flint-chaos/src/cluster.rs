@@ -1027,12 +1027,12 @@ impl Cluster {
     // invisible; every caller now has to say which block it owns.
 
     /// Fixed ports; the controller watches both forever.
-    pub fn bootstrap_controlled_at(
-        base: u16,
-        poll_ms: u64,
-        confirm: u32,
-        lease_ttl_ms: u64,
-    ) -> Self {
+    ///
+    /// No lease here: ADR-0018 moved the write lease to the CP, and these
+    /// local chaos fleets run without one (--nodes mode). The controller is
+    /// detection+promotion only; lease fencing is exercised by the drills
+    /// that stand up a real CP (lease/stall/bystander).
+    pub fn bootstrap_controlled_at(base: u16, poll_ms: u64, confirm: u32) -> Self {
         let mut c = Self::bootstrap_at(base);
         c.controlled = true;
         let nodes = format!("127.0.0.1:{},127.0.0.1:{}", c.master_port, c.replica_port);
@@ -1046,8 +1046,6 @@ impl Cluster {
                 &poll_ms.to_string(),
                 "--confirm",
                 &confirm.to_string(),
-                "--lease-ttl-ms",
-                &lease_ttl_ms.to_string(),
             ])
             .stderr(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())

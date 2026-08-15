@@ -44,6 +44,13 @@ pub struct State {
     /// pair's failovers automatically. The CP is the durable truth;
     /// proxy-learned -MOVED entries are only the bridge until this commits.
     pub exceptions: Vec<crate::tenant::SlotRun>,
+    /// Master-of-record per pair (ADR-0018): `(members, master, gen)`. THE
+    /// fencing record — written by CPFENCE before any promotion and by
+    /// first-touch adoption, read (via the fast mirror in main.rs) by every
+    /// CPLEASE renewal. Durable because a CP restart that forgot a promotion
+    /// would let a healed old master adopt itself back while its successor
+    /// serves — the exact split-brain the lease exists to close.
+    pub leases: Vec<(Vec<String>, String, u64)>,
     /// Fleet operator (admin) token, CURRENT (ADR-0006 D4). Stored PLAINTEXT
     /// — unlike tenant tokens it is RETRIEVED by our own components (the
     /// agent presents it to proxies over their token-auth front door), so it
@@ -299,6 +306,18 @@ impl State {
                         _ => {}
                     }
                 }
+                Some("lease") => {
+                    if let (Some(members), Some(master), Some(g)) =
+                        (parts.next(), parts.next(), parts.next())
+                        && let Ok(g) = g.parse()
+                    {
+                        s.leases.push((
+                            members.split(',').map(String::from).collect(),
+                            master.to_string(),
+                            g,
+                        ));
+                    }
+                }
                 Some("admin") => {
                     s.admin_token = parts.next().filter(|v| *v != "-").map(String::from);
                     s.admin_prev = parts.next().filter(|v| *v != "-").map(String::from);
@@ -337,6 +356,9 @@ impl State {
                 None => "-".to_string(),
             };
             out.push_str(&format!("pair {} {range}\n", pair.join(",")));
+        }
+        for (members, master, g) in &self.leases {
+            out.push_str(&format!("lease {} {master} {g}\n", members.join(",")));
         }
         for (ns, lo, hi, pair) in &self.exceptions {
             out.push_str(&format!("exc {ns} {lo} {hi} {pair}\n"));

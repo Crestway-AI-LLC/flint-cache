@@ -36,15 +36,29 @@ merely unlikely.
 
 ### Leases (the partition guard)
 
-A managed master holds a **lease** the controller renews every tick
-(`FLINTLEASE <ttl_ms>`). A master that stops hearing renewals — because
-it is partitioned away from every controller — **self-fences to
-read-only** when the lease deadline passes (`--lease-ttl-ms`, default
-3000). So a partitioned master stops accepting writes *on its own*,
-before any successor is promoted. The controller only renews the lease of
-a master it can see AND that is converged (a live replica, `seq_lag==0`),
-so it never keeps a doomed master alive. A standalone (unmanaged) node
-has no lease and never self-fences.
+A serving master holds a **lease at the control plane** and renews it
+ITSELF: `CPLEASE <self-addr>` every `ttl/3` against the CP it already
+journals to (ADR-0018). Two things fence it:
+
+- **It cannot reach the CP.** The deadline passes (`--lease-ttl-ms`,
+  default 5000 — sized so a routine CP leader election, ~2.4 s of the
+  lease path dark, rides through on renewal retries) and it **self-fences
+  to read-only** — it cannot rule out
+  a promotion committed on the other side of the split. So a partitioned
+  master stops accepting writes *on its own*, before any successor is
+  promoted.
+- **A promotion is on record over it.** Every promotion commits a durable
+  fencing record at the CP first (`CPFENCE`, see below); the superseded
+  master's next renewal is answered `-SUPERSEDED` and it fences
+  immediately — within one renewal interval, faster than TTL expiry.
+
+The lease used to be pushed by the controller (`FLINTLEASE` per tick),
+which anchored the fence to a single unquorumed process: every mode of
+controller silence — a stall, a crash-loop, a quiet hang — fenced every
+healthy master fleet-wide (#168, #171, #172, all found by the S2.2 scale
+runs). Under ADR-0018 a silent controller costs only failover capability;
+the fleet keeps serving. A standalone node (no CP, or `--lease-ttl-ms
+0`) has no lease and never self-fences.
 
 ### min-replicas-to-write (the widowed-master guard)
 
@@ -229,7 +243,7 @@ run as an HA set where any survivor acts.
 ```mermaid
 flowchart LR
     A[probe FLINTINFO<br/>every --poll-ms] --> B{master reachable?}
-    B -- yes --> C[renew lease if converged<br/>fence any zombie master]
+    B -- yes --> C[fence any zombie master<br/>leases renew node-side, ADR-0018]
     B -- no, for --confirm ticks --> D{pair converged<br/>within --max-stale-ms?}
     D -- no --> E[REFUSE + page<br/>degraded: needs spare/S3]
     D -- yes --> F[promote highest-epoch<br/>survivor at epoch+1]
@@ -258,19 +272,23 @@ flowchart LR
   revisiting only if RTO becomes the binding constraint, and then on
   evidence from adverse conditions (controller-host CPU contention,
   cross-AZ RTT), not a longer quiet run.
-- **Notify.** A successful promotion is reported to the control plane
-  (`CPPROMOTED`), which bumps its version and wakes every proxy parked in
-  `CPWATCH`. The notice is a HINT to re-probe, not a routing instruction:
-  the proxy still asks the pair who claims master and believes the
-  epoch-fenced answer, so a stale or wrong hint costs one probe and cannot
-  misroute a write. Best effort — a CP that is down leaves the older
-  reactive path (rediscover on a failed write), which is slower but equally
-  correct. `flintctl failover` and `flintctl upgrade` send the same notice,
-  where it matters most: a planned handoff demotes the old master in place,
-  so it stays up answering `-READONLY` and a proxy's only other signal is a
-  client write bouncing off it. Measured on loopback, the first write after
-  a handoff costs ~+62 ms above steady state without the notice and ~+6 ms
-  with it (`tools/promote_notice_drill.sh`).
+- **Record + notify.** Before any `FLINTPROMOTE`, the promoter commits
+  the fencing record at the control plane: `CPFENCE <survivor>`, durable
+  and Raft-committed (ADR-0018). A promotion that cannot commit its
+  record does not happen — an unrecorded promotion would just be
+  `-SUPERSEDED` back to read-only by the stale record within a renewal
+  interval. The commit also bumps the CP's version and wakes every proxy
+  parked in `CPWATCH` (subsuming the old best-effort `CPPROMOTED` hint).
+  The wake is still a HINT to re-probe, not a routing instruction: the
+  proxy still asks the pair who claims master and believes the
+  epoch-fenced answer, so a stale hint costs one probe and cannot
+  misroute a write. `flintctl failover` and `flintctl upgrade` commit the
+  same record, where the push matters most: a planned handoff demotes the
+  old master in place, so it stays up answering `-READONLY` and a proxy's
+  only other signal is a client write bouncing off it. Measured on
+  loopback, the first write after a handoff costs ~+62 ms above steady
+  state without the push and ~+6 ms with it
+  (`tools/promote_notice_drill.sh`).
 - **Verify.** Before promoting it checks the pair is **converged** — a
   survivor observed at `seq_lag == 0` within `--max-stale-ms` (default
   5000). If no survivor is caught up (both nodes died, or the replica
@@ -315,7 +333,8 @@ rather than an error. The numbers above are the direct-to-master path.
 | Network partition strands the master | master self-fences read-only on lease expiry; controller promotes the reachable survivor | brief retry; reads may `-TRYAGAIN` then fall back | ≤ one lag-hard window of writes |
 | Replica dies, master keeps serving | controller attaches a fresh replica; master is widowed until it syncs | none, then `-THROTTLED` if it is still alone when the grace expires | ≤ `--widowed-grace-ms` worth (10 s on a pair by default) — the lag cap is blind here, so this gate is the whole bound |
 | Old master returns after promotion | fenced by stale epoch; demoted; rejoins as fresh replica | none | none |
-| Controller itself dies | data plane keeps serving; leases still expire so no zombie master; any HA-set survivor resumes supervision | none (a *new* failure during the gap waits for a controller) | none |
+| Controller itself dies | data plane keeps serving indefinitely — masters renew their own leases at the CP, so nothing fences; any HA-set survivor resumes supervision | none (a *new* failure during the gap waits for a controller) | none |
+| CP quorum lost | masters cannot renew and fence at TTL; no promotion can commit its record either, so nothing races the fence | writes unavailable until quorum returns | none |
 | Planned handoff (maintenance/upgrade) | `flintctl failover`: demote → drain → promote | brief retry | **zero** (drained) |
 | Customer-style reboot of a node | warm restart: data intact on NVMe, WAL replay, back in ~seconds | brief retry if it was master | none |
 
@@ -332,11 +351,13 @@ scenario above.
 
 Two masters accepting writes for the same slot is impossible because a new
 master's epoch strictly exceeds the old one's, `FLINTPROMOTE`/`FLINTDEMOTE`
-reject non-increasing epochs, a partitioned old master self-fences on
-lease expiry (so it cannot serve writes while unreachable), and the proxy
-routes by the master it rediscovers — never two at once. Every layer
-(manifest epoch, node lease, controller promotion, proxy routing) agrees
-on a single lineage, and each is independently fenced.
+reject non-increasing epochs, every promotion is preceded by a durable
+CP-committed fencing record (`CPFENCE`) that turns the old master's own
+renewals into `-SUPERSEDED`, a master partitioned from the CP self-fences
+on lease expiry (so it cannot serve writes while unreachable), and the
+proxy routes by the master it rediscovers — never two at once. Every
+layer (manifest epoch, CP-held lease, recorded promotion, proxy routing)
+agrees on a single lineage, and each is independently fenced.
 
 ## Proxy instance failure (the stateless contrast)
 
@@ -398,8 +419,11 @@ proxy loss is invisible to clients.
   with a stale manifest cannot reclaim the role.
 - `controller_drill.sh` — kill → auto-promotion wall clock (RTO), data
   intact, post-promotion write survives restart.
-- `lease_drill.sh` — a master partitioned from controllers self-demotes
-  on lease expiry.
+- `lease_drill.sh` — both fence triggers: `-SUPERSEDED` within a renewal
+  interval, CP loss at TTL; no resurrection.
+- `controller_stall_drill.sh` — a stalled controller fences NOTHING (the
+  fleet serves throughout); the fence still fires on CP loss and the
+  controller recovers the fleet.
 - `min_replicas_drill.sh` — the widowed-master write gate.
 - `decommission_drill.sh` — planned failover with a live writer: zero
   acked-write loss, ex-master rejoins.

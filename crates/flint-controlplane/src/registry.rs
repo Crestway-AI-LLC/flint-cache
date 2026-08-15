@@ -95,6 +95,20 @@ pub enum Mutation {
     /// against the default ranges. Deterministic (pure function of state),
     /// so it is safe as a replicated mutation.
     ConsolidateSlots,
+    /// ADR-0018: commit `addr` as its pair's master-of-record BEFORE it is
+    /// promoted. The superseded master's next CPLEASE renewal trips over
+    /// this record and fences immediately. Also refreshes the promoted
+    /// hint, so the commit itself wakes watching proxies (subsuming
+    /// CPPROMOTED on the promotion path).
+    Fence {
+        addr: String,
+    },
+    /// First CPLEASE from a member of a pair with no master-of-record
+    /// adopts that member (gen 0). Only serving masters renew, so exactly
+    /// one node per converged pair ever asks.
+    LeaseAdopt {
+        addr: String,
+    },
     /// Set a tenant's quotas (M5): fleet ops/s and storage bytes; 0 =
     /// unlimited. Lowering max_bytes does NOT flip over_quota by itself —
     /// the metering loop owns that verdict.
@@ -182,6 +196,12 @@ pub struct RegistryState {
     /// snapshot / log loads with an empty table.
     #[serde(default)]
     pub families: BTreeMap<String, Vec<String>>,
+    /// Master-of-record write leases (ADR-0018): (pair members, master,
+    /// fencing generation). Rafted — a CP that forgot a fencing record
+    /// would let a healed old master adopt itself back while its successor
+    /// serves. `#[serde(default)]` so pre-lease snapshots load empty.
+    #[serde(default)]
+    pub leases: Vec<(Vec<String>, String, u64)>,
     /// Last promotion reported by the controller: (addr, generation).
     /// Deliberately NOT persisted across a CP restart — it is a live wakeup,
     /// not a durable fact (tenant::promote_hint explains why that is safe).
@@ -338,6 +358,32 @@ impl RegistryState {
             }
             Mutation::ClearSlotOwner { ns, slot } => {
                 crate::tenant::clear_slot_owner(&mut self.exceptions, &ns, slot);
+            }
+            Mutation::Fence { addr } => {
+                // Membership is checked by the serving handler; apply must
+                // stay total, so an addr outside every pair is a no-op
+                // rather than a divergence.
+                if let Some(members) = self.pairs.iter().find(|p| p.contains(&addr)).cloned() {
+                    match self.leases.iter_mut().find(|(m, _, _)| m == &members) {
+                        Some(rec) => {
+                            rec.1 = addr.clone();
+                            rec.2 += 1;
+                        }
+                        None => self.leases.push((members, addr.clone(), 1)),
+                    }
+                    // The version bump at the top of apply() plus this hint
+                    // is exactly what CPPROMOTED did — the wake now rides
+                    // the durable fencing commit instead of trailing it.
+                    let next = self.promoted.as_ref().map_or(1, |(_, g)| g + 1);
+                    self.promoted = Some((addr, next));
+                }
+            }
+            Mutation::LeaseAdopt { addr } => {
+                if let Some(members) = self.pairs.iter().find(|p| p.contains(&addr)).cloned()
+                    && !self.leases.iter().any(|(m, _, _)| m == &members)
+                {
+                    self.leases.push((members, addr, 0));
+                }
             }
             Mutation::ConsolidateSlots => {
                 let n = self.pairs.len();

@@ -80,6 +80,45 @@ struct Shared {
     /// the agent's metering sweep each interval). In-memory ONLY — telemetry
     /// for CPMYUSAGE/console reads, never persisted, never versioned.
     usage: Mutex<std::collections::HashMap<String, u64>>,
+    /// The LEASE FAST PATH (ADR-0018): master-of-record mirror + renewal
+    /// telemetry, under its OWN lock. CPLEASE touches only this — never
+    /// `state` — so a renewal can never queue behind a snapshot being
+    /// serialized or a commit being fsynced. A renewal that waits past the
+    /// TTL is indistinguishable from a partition to the master holding it,
+    /// and CP OVERLOAD must not be able to fence the fleet. Writes (CPFENCE,
+    /// adoption) go through `state` first for durability, then here; lock
+    /// order is always state -> leases, never both held for a renewal.
+    leases: Mutex<LeaseFast>,
+}
+
+/// See `Shared::leases`. `entries` mirrors `State::leases`; the ring holds
+/// the last 128 renewal latencies (µs) for CPINFO's `lease_p99_us` — the
+/// gauge that says whether the isolation above is actually holding.
+#[derive(Default)]
+struct LeaseFast {
+    entries: Vec<(Vec<String>, String, u64)>,
+    renewals_total: u64,
+    lat_us: Vec<u32>,
+    lat_idx: usize,
+}
+
+impl LeaseFast {
+    fn record_latency(&mut self, us: u32) {
+        if self.lat_us.len() < 128 {
+            self.lat_us.push(us);
+        } else {
+            self.lat_us[self.lat_idx % 128] = us;
+        }
+        self.lat_idx = (self.lat_idx + 1) % 128;
+    }
+    fn p99_us(&self) -> u32 {
+        if self.lat_us.is_empty() {
+            return 0;
+        }
+        let mut v = self.lat_us.clone();
+        v.sort_unstable();
+        v[(v.len() * 99 / 100).min(v.len() - 1)]
+    }
 }
 
 fn ok() -> Value {
@@ -999,9 +1038,17 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
             // controller that has said nothing since a roll is itself the
             // signal, which is why the timestamp travels with it.
             let controllers = st.controller_line();
+            // Lease telemetry from the FAST lock, taken after `st` is
+            // locked — same state -> leases order every writer uses, so
+            // CPINFO cannot deadlock against CPFENCE/adoption.
+            let (lr, lp99) = shared
+                .leases
+                .lock()
+                .map(|lf| (lf.renewals_total, lf.p99_us()))
+                .unwrap_or((0, 0));
             Value::Bulk(Some(
                 format!(
-                    "build:{}\r\nregistry_version:{}\r\nversion:{}\r\nproxies:{}\r\npairs:{}\r\ntenants:{}\r\nslot_exceptions:{}\r\ncert_days_remaining:{cdr}\r\n{controllers}",
+                    "build:{}\r\nregistry_version:{}\r\nversion:{}\r\nproxies:{}\r\npairs:{}\r\ntenants:{}\r\nslot_exceptions:{}\r\nlease_renewals_total:{lr}\r\nlease_p99_us:{lp99}\r\ncert_days_remaining:{cdr}\r\n{controllers}",
                     build_version(),
                     st.version,
                     st.version,
@@ -1012,6 +1059,107 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
                 )
                 .into_bytes(),
             ))
+        }
+        b"CPLEASE" => {
+            // `CPLEASE <addr>` — a serving master renewing its own write
+            // lease (ADR-0018). THE FAST PATH: touches Shared::leases only,
+            // never `state`, so it cannot queue behind a snapshot or a
+            // commit — a renewal delayed past the TTL fences a healthy
+            // master, so overload isolation here is a safety property, not
+            // a performance nicety. Adoption (a pair with no record yet) is
+            // the one slow case and takes the state lock exactly once per
+            // pair lifetime.
+            let Some(addr) = text(1) else {
+                return err("CPLEASE <addr>");
+            };
+            let t0 = std::time::Instant::now();
+            {
+                let Ok(mut lf) = shared.leases.lock() else {
+                    return err("lease lock");
+                };
+                if let Some((_, master, _)) = lf.entries.iter().find(|(m, _, _)| m.contains(&addr))
+                {
+                    let master = master.clone();
+                    lf.renewals_total += 1;
+                    let us = t0.elapsed().as_micros().min(u128::from(u32::MAX)) as u32;
+                    lf.record_latency(us);
+                    return if master == addr {
+                        Value::Simple("OK".into())
+                    } else {
+                        // A promotion is on record over this node. Refusal is
+                        // the FAST fence: the caller flips read-only now
+                        // instead of waiting out its TTL.
+                        Value::Error(format!("SUPERSEDED {master}"))
+                    };
+                }
+            }
+            // No record: first touch. Adopt — durably, because a CP restart
+            // that forgot a fencing record would let a healed old master
+            // adopt itself back while its successor serves. Membership is
+            // the guard: an address the registry does not know is refused.
+            let Ok(mut st) = shared.state.lock() else {
+                return err("state lock");
+            };
+            let Some(members) = st.pairs.iter().find(|p| p.contains(&addr)).cloned() else {
+                return err("NOPAIR address is not a member of any registered pair");
+            };
+            st.leases.push((members.clone(), addr.clone(), 0));
+            if let Err(e) = st.commit() {
+                st.leases.pop();
+                return err(&format!("persist: {e}"));
+            }
+            drop(st);
+            if let Ok(mut lf) = shared.leases.lock() {
+                lf.entries.push((members, addr.clone(), 0));
+                lf.renewals_total += 1;
+            }
+            Value::Simple("OK".into())
+        }
+        b"CPFENCE" => {
+            // `CPFENCE <addr>` — commit `addr` as its pair's master-of-record
+            // BEFORE it is promoted (ADR-0018). This is the fencing write the
+            // old master's next CPLEASE trips over (-SUPERSEDED), and it is
+            // durable for the same reason adoption is. Also bumps the version
+            // so watching proxies wake and re-probe — subsuming CPPROMOTED's
+            // hint role on the promotion path.
+            let Some(addr) = text(1) else {
+                return err("CPFENCE <addr>");
+            };
+            let Ok(mut st) = shared.state.lock() else {
+                return err("state lock");
+            };
+            let Some(members) = st.pairs.iter().find(|p| p.contains(&addr)).cloned() else {
+                return err("NOPAIR address is not a member of any registered pair");
+            };
+            let g = match st.leases.iter_mut().find(|(m, _, _)| m == &members) {
+                Some(rec) => {
+                    rec.1 = addr.clone();
+                    rec.2 += 1;
+                    rec.2
+                }
+                None => {
+                    st.leases.push((members.clone(), addr.clone(), 1));
+                    1
+                }
+            };
+            if let Err(e) = st.commit() {
+                return err(&format!("persist: {e}"));
+            }
+            let next = st.promoted.as_ref().map_or(1, |(_, n)| n + 1);
+            st.promoted = Some((addr.clone(), next));
+            st.version += 1;
+            drop(st);
+            if let Ok(mut lf) = shared.leases.lock() {
+                match lf.entries.iter_mut().find(|(m, _, _)| m == &members) {
+                    Some(rec) => {
+                        rec.1 = addr.clone();
+                        rec.2 = g;
+                    }
+                    None => lf.entries.push((members, addr.clone(), g)),
+                }
+            }
+            shared.changed.notify_all();
+            Value::Simple(format!("OK fenced {addr} gen {g}"))
         }
         b"CPPROMOTED" => {
             // The controller reporting a promotion it just completed. This
@@ -1354,11 +1502,16 @@ fn main() -> std::io::Result<()> {
         state.pairs.len(),
         state.tenants.len()
     );
+    let lease_seed = LeaseFast {
+        entries: state.leases.clone(),
+        ..Default::default()
+    };
     let shared = Arc::new(Shared {
         state: Mutex::new(state),
         changed: Condvar::new(),
         journal_path: format!("{path}.journal"),
         usage: Mutex::new(std::collections::HashMap::new()),
+        leases: Mutex::new(lease_seed),
     });
     let internal_tls = internal_server_config();
     // See the note on flint-server's --bind: loopback stays the default so

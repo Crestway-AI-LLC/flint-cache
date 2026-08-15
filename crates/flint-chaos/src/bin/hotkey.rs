@@ -225,7 +225,7 @@ fn main() {
         }
     );
 
-    let mut cluster = Cluster::bootstrap_controlled_at(port_base, 150, 3, 3_000);
+    let mut cluster = Cluster::bootstrap_controlled_at(port_base, 150, 3);
     let proxy_port = cluster.start_proxy();
     let t0 = Instant::now();
 

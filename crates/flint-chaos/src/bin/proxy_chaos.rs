@@ -135,7 +135,7 @@ fn main() {
     );
 
     // Always controller-driven: a real controller promotes, the proxy routes.
-    let mut cluster = Cluster::bootstrap_controlled_at(port_base, 150, 3, 3_000);
+    let mut cluster = Cluster::bootstrap_controlled_at(port_base, 150, 3);
     let proxy_port = cluster.start_proxy();
     let mut ledger: HashMap<String, KeyLedger> = HashMap::new();
     let mut rng = SmallRng::seed_from_u64(arg("--seed", 42));

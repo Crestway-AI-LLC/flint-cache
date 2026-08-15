@@ -40,7 +40,7 @@ trap cleanup EXIT
 # nor closes the degraded window before the escape-hatch promotion.
 echo "== start managed controller (--slow-promote-ms 2000)"
 ./target/release/flint-controller --manage-slots "$P1:$D1,$P2:$D2" --id SLOW \
-  --poll-ms 150 --confirm 3 --slow-promote-ms 2000 --lease-ttl-ms 5000 --max-stale-ms 8000 \
+  --poll-ms 150 --confirm 3 --slow-promote-ms 2000 --max-stale-ms 8000 \
   2>/tmp/flint-slow.log &
 for i in $(seq 1 60); do
   [ "$(valkey-cli -p $P1 PING 2>/dev/null)" = "PONG" ] && [ "$(valkey-cli -p $P2 PING 2>/dev/null)" = "PONG" ] && break

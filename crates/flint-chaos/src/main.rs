@@ -129,7 +129,7 @@ fn main() {
     let mut targets: Vec<Target> = if inventory.is_empty() {
         vec![Target::Local {
             cluster: if controller_driven {
-                Cluster::bootstrap_controlled_at(port_base, 150, 3, 3_000)
+                Cluster::bootstrap_controlled_at(port_base, 150, 3)
             } else {
                 Cluster::bootstrap_at(port_base)
             },

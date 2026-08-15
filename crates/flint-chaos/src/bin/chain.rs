@@ -76,7 +76,7 @@ fn main() {
     let mut cluster = if controller_driven {
         // A real flint-controller makes every failover decision; the harness
         // only kills nodes and re-attaches replacements on fixed ports.
-        Cluster::bootstrap_controlled_at(port_base, 150, 3, 3_000)
+        Cluster::bootstrap_controlled_at(port_base, 150, 3)
     } else {
         Cluster::bootstrap_at(port_base)
     };

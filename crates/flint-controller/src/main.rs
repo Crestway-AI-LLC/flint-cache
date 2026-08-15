@@ -23,7 +23,7 @@
 //!     failure → refuse and page (spare/S3 recovery is deferred).
 //!
 //! Push leases: the controller renews the master's lease each tick
-//! (FLINTLEASE); a master partitioned from every controller self-fences on
+//! (CPLEASE, self-renewed at the CP per ADR-0018); a master that cannot renew self-fences on
 //! TTL expiry on its own.
 //!
 //! Managed mode (--manage-slots PORT:DIR,...): the controller also SUPERVISES
@@ -42,8 +42,12 @@
 //!   flint-controller --pairs "a1,b1;a2,b2" [--id A]
 //!   flint-controller --manage-slots 6460:/data/a,6470:/data/b [--id A]
 //!   flint-controller --manage-pairs "6500:/d/a,6501:/d/b;6510:/d/c,6511:/d/d"
-//!   common: [--poll-ms 100] [--confirm 3] [--max-stale-ms 5000] [--lease-ttl-ms 3000]
+//!   common: [--poll-ms 100] [--confirm 3] [--max-stale-ms 5000]
 //!           [--slow-promote-ms 4000]  (patience for a listening-but-slow master)
+//!
+//! No lease flags: ADR-0018 moved the write lease to the CP. Masters renew
+//! their own lease (CPLEASE) against the CP they already journal to; this
+//! process only commits the fencing record (CPFENCE) before it promotes.
 
 // The rebalance planner + balance-policy seam lives in the shared
 // `flint-balance` library so the managed plane reuses the same
@@ -266,8 +270,9 @@ fn should_promote(
 /// The pair's own master, self-fenced but still serving its replica (#168).
 ///
 /// flint-server flips a master to read-only when its lease goes unrenewed, and
-/// FLINTINFO renders `role:` FROM that read-only flag — so a controller stall
-/// longer than `--lease-ttl-ms` leaves a pair with no master-CLAIMER even
+/// FLINTINFO renders `role:` FROM that read-only flag — so anything that
+/// starves renewals past the TTL (under ADR-0018, losing the CP; before it,
+/// a controller stall) leaves a pair with no master-CLAIMER even
 /// though nothing died and nothing diverged. That state is self-perpetuating:
 /// `last_converged` only advances while a legitimate master exists, so once
 /// every master fences, the degraded-window gate refuses forever and the pair
@@ -339,99 +344,15 @@ fn remembered_lineage_holder<'a>(
         .find(|n| n.reachable && n.epoch == top && n.epoch >= *epoch && &n.addr == addr)
 }
 
-/// What the decision loop publishes for the renewer: the master it currently
-/// believes in, and when it last said so.
-struct LeaseTarget {
-    addr: String,
-    at: Instant,
-}
-
-type LeaseSlot = std::sync::Arc<std::sync::Mutex<Option<LeaseTarget>>>;
-
-/// Renew one pair's master lease on its OWN cadence (#168 follow-up).
-///
-/// Renewal used to ride the decision loop: `tick()` sent FLINTLEASE inline, so
-/// a master's lease was renewed only as often as a whole sweep completed. But
-/// the sweep is SERIAL over every pair and every `observe()` carries an 800ms
-/// probe timeout, so one slow or unresponsive node stretches the sweep for
-/// EVERYONE — on the 4-pair scale fleet a bad sweep is 8 x 800ms = 6.4s
-/// against a 3s lease, and then every master in the fleet self-fences even
-/// though the controller is alive and perfectly able to reach them. That
-/// coupling is what turned a busy fleet into #168's outage.
-///
-/// So the decision loop now only PUBLISHES who it believes the master is, and
-/// this thread renews at ttl/3 — fast enough that a master never misses a
-/// renewal it could have had, and independent of how long a sweep takes. One
-/// thread PER PAIR on purpose: a single renewer looping over pairs would
-/// serialise on a sick master's 800ms timeout and reintroduce exactly the same
-/// cross-pair coupling one level down.
-///
-/// The lease still fences. This renews ONLY what the decision loop published:
-/// a pair whose master changed has its slot overwritten, so the old address
-/// stops being renewed the same tick; a pair with no legit master has its slot
-/// cleared; and if the decision loop stops publishing altogether the entry
-/// goes stale and renewal stops — so a master partitioned from every
-/// controller still self-fences on its own.
-fn spawn_lease_renewer(
-    slot: LeaseSlot,
-    ttl_ms: u64,
-    max_stale: Duration,
-    id: String,
-    label: String,
-) {
-    // A third of the TTL: two renewals can be lost to a blip before the master
-    // is at risk, the usual heartbeat margin.
-    let every = Duration::from_millis((ttl_ms / 3).max(50));
-    // Watch far more often than we renew. Renewing on the `every` cadence
-    // ALONE meant a newly published master waited up to a full interval for
-    // its FIRST lease — so a freshly promoted node, or a fleet seconds old,
-    // was briefly unleased (deadline 0 = unmanaged = cannot fence at all).
-    // Peeking is a mutex read, so this is cheap; the RENEWAL still only fires
-    // when due, or immediately when the target is new or has changed.
-    let watch = Duration::from_millis(100).min(every);
-    std::thread::spawn(move || {
-        let mut warned = false;
-        // (address, when we last renewed it) — address so a promotion is
-        // leased on the very next watch tick rather than on the next cadence.
-        let mut last: Option<(String, Instant)> = None;
-        loop {
-            std::thread::sleep(watch);
-            let target = slot
-                .lock()
-                .ok()
-                .and_then(|g| g.as_ref().map(|t| (t.addr.clone(), t.at)));
-            let Some((addr, at)) = target else {
-                last = None;
-                warned = false;
-                continue;
-            };
-            if at.elapsed() > max_stale {
-                // The decision loop is not merely slow, it has gone silent.
-                // Keeping a lease alive on a view nobody is refreshing would
-                // defeat the fence, so stop — and say so once, because a
-                // controller in this state is a real incident.
-                if !warned {
-                    warned = true;
-                    eprintln!(
-                        "[{id}][{label}] lease target unrefreshed for {:?} (> max-stale) — STOPPING renewal of {addr} so the lease can still fence it",
-                        at.elapsed()
-                    );
-                }
-                continue;
-            }
-            warned = false;
-            let due = match &last {
-                Some((prev, when)) => prev != &addr || when.elapsed() >= every,
-                None => true,
-            };
-            if due {
-                let _ = call(&addr, &[b"FLINTLEASE", ttl_ms.to_string().as_bytes()]);
-                last = Some((addr, Instant::now()));
-            }
-        }
-    });
-}
-
+/// ADR-0018 moved lease renewal OUT of the controller entirely. The renewer
+/// that lived here (#168's decoupling) kept the fence anchored to this one
+/// process: five scale runs in a row turned some flavour of controller
+/// silence into a fleet-wide self-fence of healthy masters (#168, #171,
+/// #172). Masters now renew their own lease against the control plane
+/// (CPLEASE), and this controller's contribution to fencing is exactly one
+/// write: CPFENCE, committed durably BEFORE any FLINTPROMOTE, which the old
+/// master's next renewal trips over. Controller death now costs failover
+/// capability while it lasts — and nothing else.
 fn observe(addr: &str) -> Node {
     let mut node = Node {
         addr: addr.to_string(),
@@ -488,10 +409,6 @@ struct Config {
     /// not flap. See `required_no_master_ticks`.
     slow_promote: Duration,
     max_stale: Duration,
-    lease_ttl: u64,
-    /// How stale the decision loop's published lease target may get before the
-    /// renewer stops renewing it (#168 follow-up; see `spawn_lease_renewer`).
-    lease_renew_stale: Duration,
     min_replicas: u32,
     /// Positive enables the rebalance planner. The value is the deadband
     /// fraction — imbalance below it is left alone. Without
@@ -553,10 +470,6 @@ struct Pair {
     /// past `confirm` — a transient double-blip must not wipe live nodes.
     dark_streak: u32,
     last_snapshot: Instant,
-    /// Who this pair's renewer should keep alive. Published by `tick`, read by
-    /// the per-pair renewer thread — the decision loop no longer renews inline
-    /// (#168 follow-up; see `spawn_lease_renewer`).
-    lease: LeaseSlot,
     /// (addr, epoch) of the member last OBSERVED holding the full lineage: a
     /// legitimate master with a caught-up replica, or the survivor this
     /// controller promoted. Read only by the degraded-window gate, to recover a
@@ -583,7 +496,6 @@ impl Pair {
             last_page: None,
             dark_streak: 0,
             last_snapshot: Instant::now(),
-            lease: std::sync::Arc::new(std::sync::Mutex::new(None)),
             last_insync: None,
             slots,
         }
@@ -720,21 +632,6 @@ impl Pair {
             self.no_master_streak = 0;
             self.slow_since = None;
             self.outage_announced = false;
-            // PUBLISH the lease target; the pair's renewer thread does the
-            // renewing on its own cadence. Renewing inline here tied a
-            // master's lease to how long a whole sweep took, and a sweep is
-            // serial over every pair with an 800ms probe timeout per node —
-            // so one sick node fenced every master in the fleet (#168).
-            // Overwriting the slot is also how a master CHANGE stops the old
-            // address being renewed: same tick, no extra bookkeeping.
-            if cfg.lease_ttl > 0
-                && let Ok(mut g) = self.lease.lock()
-            {
-                *g = Some(LeaseTarget {
-                    addr: legit_addr.clone(),
-                    at: Instant::now(),
-                });
-            }
             // Snapshot schedule (Tier-0, design.md §2.9): a periodic durable
             // checkpoint of each managed master into <root>/<pair-label>/.
             // This is what makes whole-pair loss survivable (spare restore
@@ -831,12 +728,6 @@ impl Pair {
                 }
             }
             return;
-        }
-
-        // No legit master: stop renewing. Nothing here should keep a lease
-        // alive — a node that lost mastership must be allowed to fence.
-        if let Ok(mut g) = self.lease.lock() {
-            *g = None;
         }
 
         // No reachable master. A master that still ACCEPTS connections but whose
@@ -944,6 +835,43 @@ impl Pair {
         };
 
         let next = max_epoch + 1;
+        // THE FENCING RECORD, BEFORE THE PROMOTION (ADR-0018). CPFENCE
+        // durably names the survivor as its pair's master-of-record; the old
+        // master's next CPLEASE renewal trips over it (-SUPERSEDED) and
+        // fences within a renewal interval, even if this controller never
+        // reaches it. A promotion whose record cannot commit does NOT happen:
+        // promoting without it would reopen the split-brain window the lease
+        // exists to close. This inverts ADR-0004's "failover must not depend
+        // on the CP" — deliberately, and argued in the ADR: the CP has a
+        // quorum under it; this process, as five scale runs proved, does not.
+        if let Some(cp) = &cfg.commit_cp {
+            let mut fenced = false;
+            for _ in 0..3 {
+                // An HA control plane serves lease writes only at its
+                // LEADER; a follower answers `-LEADER <addr>`. Follow one
+                // hop per attempt, fresh each time (leadership moves).
+                let mut reply = call(cp, &[b"CPFENCE", survivor.addr.as_bytes()]);
+                if let Ok(Value::Error(e)) = &reply
+                    && let Some(leader) = e.strip_prefix("LEADER ")
+                {
+                    reply = call(leader.trim(), &[b"CPFENCE", survivor.addr.as_bytes()]);
+                }
+                if matches!(reply, Ok(Value::Simple(_))) {
+                    fenced = true;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            if !fenced {
+                let (id, label) = (cfg.id.clone(), self.label.clone());
+                self.page(format_args!(
+                    "[{id}][{label}] cannot commit the fencing record (CPFENCE {} at {cp}) — REFUSING to promote without it. PAGE.",
+                    survivor.addr
+                ));
+                self.no_master_streak = 0;
+                return;
+            }
+        }
         match call(
             &survivor.addr,
             &[b"FLINTPROMOTE", b"0", next.to_string().as_bytes()],
@@ -960,34 +888,11 @@ impl Pair {
                     Some(format!("(0,{next})")),
                     "epoch-fenced promotion of the freshest survivor",
                 );
-                // TELL THE PROXIES, instead of letting them find out.
-                //
-                // Until this, a promotion was a fact only the nodes and this
-                // log knew. Every proxy learned it reactively: a client's
-                // write had to fail (dead backend, or -READONLY from the
-                // demoted ex-master) before the proxy re-probed the pair,
-                // and that retry loop sleeps 50-100ms between attempts. So
-                // the promotion landed and the traffic kept missing it for
-                // most of another poll of nobody's clock.
-                //
-                // One CPPROMOTED bumps the CP's version, which wakes every
-                // proxy already parked in CPWATCH — the push channel that
-                // already exists, already mTLS, already tested. The hint
-                // carries no routing authority (tenant::promote_hint): the
-                // proxy still probes and believes the epoch-fenced node.
-                //
-                // BEST EFFORT ON PURPOSE. If the CP is unreachable the old
-                // reactive path is still there and still correct, just
-                // slower — a failover must not depend on the CP being up.
-                if let Some(cp) = &cfg.commit_cp {
-                    let r = call(cp, &[b"CPPROMOTED", survivor.addr.as_bytes()]);
-                    if !matches!(r, Ok(Value::Simple(_))) {
-                        eprintln!(
-                            "[{}][{}] CPPROMOTED {} failed ({r:?}) — proxies fall back to reactive rediscovery",
-                            cfg.id, self.label, survivor.addr
-                        );
-                    }
-                }
+                // The proxies were already told: CPFENCE (above) bumps the
+                // CP's version and wakes every proxy parked in CPWATCH,
+                // subsuming the CPPROMOTED hint this arm used to send after
+                // the promote (#91 → ADR-0018). The push now precedes the
+                // promotion instead of trailing it, and it is durable.
                 self.converged_ever = false; // new master has no replica yet
                 // ...but it IS the lineage holder as of right now, and it will
                 // not be able to demonstrate that until a replica re-attaches.
@@ -1126,14 +1031,13 @@ fn main() {
         // interval so transient controller unavailability never trips a
         // healthy master; a master self-fences only after this long with NO
         // controller (of any in the HA set) reaching it. 0 disables leases.
-        lease_ttl: arg_or("--lease-ttl-ms", 3_000),
+
         // How stale the decision loop's published view may get before the
         // renewer stops renewing. Generous on purpose: it must comfortably
         // cover a SLOW sweep (the thing decoupling exists to survive) while
         // still bounding a decision loop that has died outright, so the lease
         // keeps its partition guarantee. 30s is ~10x the default lease and
         // ~2x the worst observed sweep on the 4-pair scale fleet.
-        lease_renew_stale: Duration::from_millis(arg_or("--lease-renew-max-stale-ms", 30_000)),
         // Passed to every managed node so a promoted-then-widowed master
         // sheds writes (Redis min-replicas-to-write). 0 = disabled.
         min_replicas: arg("--min-replicas-to-write")
@@ -1170,28 +1074,6 @@ fn main() {
         cfg.confirm,
         cfg.balance_policy.name(),
     );
-
-    // Lease renewal runs OFF the decision loop, one thread per pair (#168).
-    // Started before the first sweep so a master is never waiting on a sweep
-    // to complete before its lease is renewed.
-    if cfg.lease_ttl > 0 {
-        for pair in pairs.iter() {
-            spawn_lease_renewer(
-                std::sync::Arc::clone(&pair.lease),
-                cfg.lease_ttl,
-                cfg.lease_renew_stale,
-                cfg.id.clone(),
-                pair.label.clone(),
-            );
-        }
-        eprintln!(
-            "[{}] lease renewal decoupled: {} renewer(s) at {}ms, max-stale {:?}",
-            cfg.id,
-            pairs.len(),
-            (cfg.lease_ttl / 3).max(50),
-            cfg.lease_renew_stale,
-        );
-    }
 
     // ADR-0014 D1: say what we are, since nobody can ask. Once at startup
     // and every REGISTER_EVERY thereafter — the CP's staleness window is

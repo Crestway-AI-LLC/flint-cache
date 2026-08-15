@@ -262,6 +262,10 @@ pub struct Ha {
     /// unions the rows across every CP in the inventory, so the fleet-wide
     /// answer is assembled by the reader rather than by consensus.
     pub controllers: std::sync::Mutex<crate::state::Controllers>,
+    /// CPLEASE telemetry (ADR-0018) — node-local like `usage`: the leader
+    /// serves renewals, so its numbers are the fleet's. (total, 128-ring of
+    /// latencies in us, ring index.)
+    pub lease_meter: std::sync::Mutex<(u64, Vec<u32>, usize)>,
 }
 
 /// Build the Raft node and start the RPC server. Returns the handle the
@@ -329,6 +333,7 @@ pub async fn start(
         journal_path,
         usage: std::sync::Mutex::new(std::collections::HashMap::new()),
         controllers: std::sync::Mutex::new(crate::state::Controllers::new()),
+        lease_meter: std::sync::Mutex::new((0, Vec::new(), 0)),
     })
 }
 
@@ -661,6 +666,77 @@ async fn handle_admin(ha: &Ha, args: &[Vec<u8>]) -> Value {
             };
             match ha.propose(Mutation::DropPrev { name }).await {
                 Ok(_) => Value::Simple("OK".into()),
+                Err(l) => redirect(l),
+            }
+        }
+        b"CPLEASE" => {
+            // `CPLEASE <addr>` — a serving master renewing its own write
+            // lease (ADR-0018). LEADER-ONLY, unlike the other local reads
+            // here: a follower's applied state can be arbitrarily stale
+            // behind a partition, and a stale +OK would keep extending a
+            // superseded master's deadline — split-brain with no bound.
+            // The node's renewer follows one LEADER hop per attempt.
+            let Some(addr) = text(1) else {
+                return Value::Error("ERR CPLEASE <addr>".into());
+            };
+            let leader = ha.raft.current_leader().await;
+            if leader != Some(ha.node_id) {
+                return redirect(leader.and_then(|id| ha.client_addrs.get(&id).cloned()));
+            }
+            let t0 = std::time::Instant::now();
+            let reg = ha.store.registry().await;
+            if let Some((_, master, _)) = reg.leases.iter().find(|(m, _, _)| m.contains(&addr)) {
+                let master = master.clone();
+                drop(reg);
+                if let Ok(mut m) = ha.lease_meter.lock() {
+                    m.0 += 1;
+                    let us = t0.elapsed().as_micros().min(u128::from(u32::MAX)) as u32;
+                    if m.1.len() < 128 {
+                        m.1.push(us);
+                    } else {
+                        let i = m.2;
+                        m.1[i] = us;
+                    }
+                    m.2 = (m.2 + 1) % 128;
+                }
+                return if master == addr {
+                    Value::Simple("OK".into())
+                } else {
+                    Value::Error(format!("SUPERSEDED {master}"))
+                };
+            }
+            let member = reg.pairs.iter().any(|p| p.contains(&addr));
+            drop(reg);
+            if !member {
+                return Value::Error(
+                    "NOPAIR address is not a member of any registered pair".into(),
+                );
+            }
+            // First touch: adopt, durably — through Raft for the same
+            // reason the record itself is Rafted.
+            match ha.propose(Mutation::LeaseAdopt { addr }).await {
+                Ok(_) => Value::Simple("OK".into()),
+                Err(l) => redirect(l),
+            }
+        }
+        b"CPFENCE" => {
+            // `CPFENCE <addr>` — commit `addr` as its pair's master-of-record
+            // BEFORE it is promoted (ADR-0018). Raft-committed; the version
+            // bump wakes watching proxies (subsuming CPPROMOTED's hint role
+            // on the promotion path).
+            let Some(addr) = text(1) else {
+                return Value::Error("ERR CPFENCE <addr>".into());
+            };
+            let reg = ha.store.registry().await;
+            let member = reg.pairs.iter().any(|p| p.contains(&addr));
+            drop(reg);
+            if !member {
+                return Value::Error(
+                    "NOPAIR address is not a member of any registered pair".into(),
+                );
+            }
+            match ha.propose(Mutation::Fence { addr: addr.clone() }).await {
+                Ok(_) => Value::Simple(format!("OK fenced {addr}")),
                 Err(l) => redirect(l),
             }
         }
@@ -1139,9 +1215,23 @@ async fn handle_admin(ha: &Ha, args: &[Vec<u8>]) -> Value {
                 .lock()
                 .map(|c| crate::state::render_controllers(&c))
                 .unwrap_or_default();
+            let (lr, lp99) = ha
+                .lease_meter
+                .lock()
+                .map(|m| {
+                    let p99 = if m.1.is_empty() {
+                        0
+                    } else {
+                        let mut v = m.1.clone();
+                        v.sort_unstable();
+                        v[(v.len() * 99 / 100).min(v.len() - 1)]
+                    };
+                    (m.0, p99)
+                })
+                .unwrap_or((0, 0));
             Value::Bulk(Some(
                 format!(
-                    "build:{}\r\nregistry_version:{}\r\nversion:{}\r\nproxies:{}\r\npairs:{}\r\ntenants:{}\r\nslot_exceptions:{}\r\nnode:{}\r\nleader:{}\r\ncert_days_remaining:{cdr}\r\n{controllers}",
+                    "build:{}\r\nregistry_version:{}\r\nversion:{}\r\nproxies:{}\r\npairs:{}\r\ntenants:{}\r\nslot_exceptions:{}\r\nlease_renewals_total:{lr}\r\nlease_p99_us:{lp99}\r\nnode:{}\r\nleader:{}\r\ncert_days_remaining:{cdr}\r\n{controllers}",
                     crate::build_version(),
                     reg.version,
                     reg.version,
