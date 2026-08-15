@@ -65,15 +65,40 @@ promoted master for **11.9 s** while the failover itself had completed in
 direction: a slower re-seed means longer at one copy, so raise it if you would
 rather have redundancy back sooner and can absorb the latency.
 
-**What is NOT bounded today, stated plainly:** items 1 and 2 above. If demand
-during recovery exceeds what the surviving master can serve, the excess
-currently QUEUES, and queueing turns a capacity shortfall into a latency
-violation for every client rather than a clean failure for some. The intended
-contract is to shed past a threshold with `-THROTTLED` — retry-with-backoff,
-the same reply the lag cap already uses — so that whatever is admitted is
-served inside the budget. That is designed and not yet built; until it is, a
-recovery under heavy load can exceed the RTO budget above, and this document
-would rather say so than let you discover it.
+**What is NOT bounded today:** items 1 and 2 above. If demand during recovery
+exceeds what the surviving master can serve, the excess currently QUEUES. See
+the next section — this is a specific case of a general gap, not a recovery
+feature.
+
+## Overload — what we admit, and what we refuse
+
+Two different things, and only one of them is a guarantee.
+
+**Headroom is an opportunity reserve.** Running a fleet below its capacity
+makes trouble less likely to bind. It mitigates; it does not promise. Traffic
+grows into unenforced headroom precisely when you need it most.
+
+**Backpressure is the guarantee.** What actually bounds behaviour is refusing
+work we cannot serve, so that whatever we DO accept is served inside the
+budget. That applies always, not only during a failover — recovery is just
+where its absence shows up first, because that is when demand rises as
+capacity falls.
+
+**We should not hold a write for 30 s, because the client stopped waiting
+long ago.** A write that completes after its caller timed out is worse than
+one refused up front, for two reasons. It spends capacity that live traffic
+needed. And it is ambiguous: the caller saw a timeout and retried, so the
+mutation may apply twice — harmless for `SET`, a wrong answer for `INCR` and
+`INCRBY`. A prompt refusal has no such ambiguity, and `-THROTTLED` already
+means retry-with-backoff.
+
+**Status: designed, not built** — the pieces exist (`-THROTTLED` on the lag
+cap, `min-replicas-to-write`, per-tenant `-QUOTA`, the proxy's bounded buffer
+and retry budget) but as independent local limits rather than one stated
+end-to-end deadline, and nothing decides at ADMISSION whether a request can
+make it. Until that lands, a heavily loaded fleet — recovering or not — can
+hold a write well past the budgets above. This document would rather say so
+than let you discover it.
 
 ## Data loss on failover (RPO)
 
