@@ -6,6 +6,11 @@
 //!
 //! Usage: flint-chaos [--iterations 12] [--keys 400] [--mode mixed|replica|master] [--seed N]
 //!
+//! `--quiesce-file <path>` + `--converge-s N`: the pre-kill gate needs the
+//! pair at seq_lag == 0, and this harness can only park its OWN writer. When
+//! something else is also writing (the durability soak runs four feeders),
+//! pass a quiesce path that load agrees to honour, or the gate is a race.
+//!
 //! `--inventory <path>` attaches to a REAL flintctl-managed fleet instead of
 //! spawning a local pair, so the same oracle runs against seats that may be
 //! on different machines. Faults go through `flintctl kill-node` /
@@ -23,6 +28,47 @@ use flint_chaos::oracle::parse_value;
 use flint_chaos::writer::{self, Edge, Shared, now_ms};
 use flint_resp::Value;
 use rand::{Rng, SeedableRng, rngs::SmallRng};
+
+/// Ask the rest of the world to stop writing, for as long as this lives.
+///
+/// The harness parks its own writer with `shared.pause`, which is a complete
+/// quiesce only when the harness is the only writer. The durability soak runs
+/// four external feeder loops against the same edge, so parking one writer in
+/// five left the pre-kill convergence gate depending on a coin flip: soak run
+/// 20 won it and measured a kill, run 21 lost and died in the gate having
+/// killed nothing (#183). The file is the contract — while it exists,
+/// cooperating load holds off.
+///
+/// Dropped on EVERY path including a panic, because a quiesce left armed is a
+/// soak that silently stops ingesting and still reports its feeders alive.
+struct Quiesce(Option<std::path::PathBuf>);
+
+impl Quiesce {
+    fn begin(path: &str) -> Self {
+        if path.is_empty() {
+            return Self(None);
+        }
+        let p = std::path::PathBuf::from(path);
+        match std::fs::write(&p, b"flint-chaos: hold off writes\n") {
+            Ok(()) => Self(Some(p)),
+            Err(e) => {
+                // Loud, and NOT fatal: the gate that follows will fail on its
+                // own if the load really did keep writing, and it names this
+                // file when it does.
+                eprintln!("chaos: could not arm quiesce file {path}: {e}");
+                Self(None)
+            }
+        }
+    }
+}
+
+impl Drop for Quiesce {
+    fn drop(&mut self) {
+        if let Some(p) = self.0.take() {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}
 
 fn main() {
     let iterations: u32 = arg("--iterations", 12);
@@ -100,6 +146,22 @@ fn main() {
     // for). Needs a tenant credential because a CP-fed proxy is gated.
     let edge_addr: String = arg("--edge", String::new());
     let edge_auth: String = arg("--auth", String::new());
+    // --quiesce-file: the pre-kill convergence gate needs the pair to reach
+    // seq_lag == 0, and this harness can only park ITS OWN writer. Any load
+    // outside it keeps the replica behind and the gate becomes a coin flip
+    // (#183). While this file exists, cooperating load holds off; see the
+    // Quiesce guard. Empty = no external load to coordinate with, the
+    // historical behaviour.
+    let quiesce_file: String = arg("--quiesce-file", String::new());
+    // How long to wait for that convergence. A soak's replacement replica is
+    // still full-syncing from an earlier kill, so 10 s is not always enough
+    // once a dataset is real.
+    let converge_s: u64 = arg("--converge-s", 10);
+    // A quiesce left armed by a crashed run is a soak that silently stops
+    // ingesting, so start from a known-unquiesced state.
+    if !quiesce_file.is_empty() {
+        let _ = std::fs::remove_file(&quiesce_file);
+    }
     // Clear the corpses of runs whose process is gone before allocating any
     // of our own. Drop handles this run; only a sweep can handle the ones
     // that were SIGKILLed or ended via process::exit, and only a sweep drains
@@ -266,13 +328,34 @@ fn main() {
             // precedent), resume the hammer, give it a beat so the replica is
             // genuinely behind again, and only then kill. Writes are in
             // flight AT the kill, which is the point of this whole change.
+            // Quiesce EVERYONE, not just ourselves — see Quiesce. Resumed
+            // together with our own writer, so the kill still lands with
+            // writes in flight from every source.
+            let quiesce = Quiesce::begin(&quiesce_file);
             shared.pause.store(true, Ordering::SeqCst);
-            assert!(
-                cluster.wait_healthy(Duration::from_secs(10)),
-                "iter {iteration}: pair never converged while the writer was parked"
-            );
+            let converged = cluster.wait_healthy(Duration::from_secs(converge_s));
             std::thread::sleep(Duration::from_millis(1_500)); // controller confirm*poll
             shared.pause.store(false, Ordering::SeqCst);
+            drop(quiesce);
+            // Asserted AFTER the load is back on. A panic here aborts the run
+            // either way, but leaving the fleet quiesced on the way out makes
+            // the evidence bundle describe a system nobody was writing to.
+            assert!(
+                converged,
+                "iter {iteration}: pair never converged within {converge_s}s while the \
+                 writer was parked{}",
+                if quiesce_file.is_empty() {
+                    " — and NO --quiesce-file was set, so any load outside this \
+                     harness kept writing and seq_lag could not reach 0 (#183)"
+                        .to_string()
+                } else {
+                    format!(
+                        " — --quiesce-file {quiesce_file} was armed, so either the \
+                         load does not honour it or the replica needs longer than \
+                         --converge-s {converge_s}"
+                    )
+                }
+            );
             std::thread::sleep(Duration::from_millis(300)); // hammer re-established
 
             // Deliberately push the replica behind, so the master is acking
@@ -801,4 +884,62 @@ fn main() {
         );
     }
     println!("  final walk: {present} present, {missing} missing-or-regressed");
+}
+
+#[cfg(test)]
+mod quiesce_tests {
+    use super::*;
+
+    fn scratch(tag: &str) -> String {
+        let mut p = std::env::temp_dir();
+        p.push(format!("flint-quiesce-test-{}-{tag}", std::process::id()));
+        p.to_string_lossy().into_owned()
+    }
+
+    /// The guard has to actually create the file, or the feeders never hear
+    /// about it and the convergence gate stays the coin flip #183 describes.
+    #[test]
+    fn arming_creates_the_file_and_dropping_removes_it() {
+        let path = scratch("basic");
+        let _ = std::fs::remove_file(&path);
+        {
+            let _q = Quiesce::begin(&path);
+            assert!(
+                std::path::Path::new(&path).exists(),
+                "quiesce file was not created, so nothing would hold off"
+            );
+        }
+        assert!(
+            !std::path::Path::new(&path).exists(),
+            "quiesce file outlived the guard — ingestion would never resume"
+        );
+    }
+
+    /// A panic is the path that matters. flint-chaos aborts the whole run on a
+    /// failed gate, and if the file survived that, the next thing to look at
+    /// the fleet would find it idle and conclude the load was broken.
+    #[test]
+    fn a_panic_while_quiesced_still_resumes_the_load() {
+        let path = scratch("panic");
+        let _ = std::fs::remove_file(&path);
+        let p = path.clone();
+        let caught = std::panic::catch_unwind(move || {
+            let _q = Quiesce::begin(&p);
+            panic!("the convergence gate failing, as it did in run 21");
+        });
+        assert!(caught.is_err(), "the test's own panic did not happen");
+        assert!(
+            !std::path::Path::new(&path).exists(),
+            "a panic left the fleet quiesced: the soak would stop ingesting and \
+             still report its feeders alive"
+        );
+    }
+
+    /// No --quiesce-file is the historical behaviour (nothing external to
+    /// coordinate with) and must not litter the filesystem.
+    #[test]
+    fn an_empty_path_arms_nothing() {
+        let q = Quiesce::begin("");
+        assert!(q.0.is_none(), "an empty path should arm no file at all");
+    }
 }
