@@ -92,8 +92,10 @@ cargo build --release -q -p flint-server -p flint-proxy -p flint-controlplane \
   || { echo "FAIL: build"; exit 1; }
 
 # Same knobs the scale fleet runs (packaging/aws/chaos-cluster/run.sh's
-# inventory): poll-ms 100, confirm 3, lease-ttl-ms 4000. Copying them matters —
-# the detection window IS the thing under test.
+# inventory): poll-ms 100, confirm 3. Copying them matters — the detection
+# window IS the thing under test. The lease TTL is deliberately NOT copied:
+# it is inherited from flintctl's DEFAULT_LEASE_TTL_MS, which is what both
+# this drill and the fleet now get. Copying it is how it went stale (#182).
 {
   echo "disposable on"
   echo "statedir $D/state"
@@ -110,7 +112,6 @@ cargo build --release -q -p flint-server -p flint-proxy -p flint-controlplane \
   echo "controller on"
   echo "poll-ms 100"
   echo "confirm 3"
-  echo "lease-ttl-ms 4000"
 } > "$INV"
 
 echo "== bootstrap (CP, $NPAIRS pair(s), proxy, controller; poll-ms 100 confirm 3 lease 4000)"

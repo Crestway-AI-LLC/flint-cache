@@ -1529,6 +1529,27 @@ fn reconcile_widowed_grace(
 /// first ack, and shorter than the loss you are willing to publish.
 const DEFAULT_WIDOWED_GRACE_MS: u64 = 10_000;
 
+/// How long a master may serve without a successful `CPLEASE` renewal before
+/// it self-fences, when the inventory does not say (ADR-0018).
+///
+/// 5000, not ADR-0004's 3000: under SELF-renewal the fence's tolerance must
+/// cover a routine CP leader election (~2.4 s of the lease path dark, measured
+/// by ctl_cpha), which the old controller-pushed renewals never had inside
+/// their window. At 3000 a leader kill fenced a healthy fleet about as often
+/// as not; at 5000 the tolerance is ~3.3 s with fast retry filling the tail.
+/// Still seconds-scale, and the reachable-superseded fence stays ~ttl/3.
+///
+/// THIS IS THE ONLY PLACE THE NUMBER LIVES. Test rigs used to copy it into
+/// their inventories — the AWS chaos/soak fleet at 4000, two drills at 3000 —
+/// so when ADR-0018 moved the default the rigs silently stayed behind and
+/// every chaos result was measured on a fleet tuned tighter than any
+/// customer's (#182). An inventory that omits `lease-ttl-ms` inherits this,
+/// so rigs should omit it unless they are deliberately probing another value,
+/// and `assert_lease_ttl_single_source` in tools/gates.sh fails the build if
+/// one reappears. docs/self-hosting.md's table is checked against it by
+/// `the_documented_lease_ttl_is_the_one_we_ship`.
+const DEFAULT_LEASE_TTL_MS: u64 = 5_000;
+
 /// The binaries `flintctl` starts — the orphan sweep's allowlist.
 const FLEET_BINARIES: [&str; 6] = [
     "flint-server",
@@ -1783,14 +1804,11 @@ fn node_tuning_args(inv: &Inventory, replicated: bool) -> Vec<String> {
     // a standalone node has no successor to be fenced against — and 0
     // disables, matching the server's own default.
     if replicated {
-        // 5000, not ADR-0004's 3000: under SELF-renewal the fence's
-        // tolerance must cover a routine CP leader election (~2.4s of the
-        // lease path dark, measured by ctl_cpha), which the old
-        // controller-pushed renewals never had inside their window. Still
-        // seconds-scale; the reachable-superseded fence stays ~ttl/3.
         push(
             "--lease-ttl-ms",
-            inv.ctl_lease_ttl_ms.unwrap_or(5_000).to_string(),
+            inv.ctl_lease_ttl_ms
+                .unwrap_or(DEFAULT_LEASE_TTL_MS)
+                .to_string(),
         );
         // Every CP seat, not just the journal target: a renewer pinned to
         // one seat fences the fleet when exactly that seat dies (the
@@ -5638,6 +5656,40 @@ mod port_free_tests {
             wait_port_free(port, Duration::from_secs(2)).is_ok(),
             "once released, the port must be reported free"
         );
+    }
+}
+
+#[cfg(test)]
+mod lease_ttl_single_source_tests {
+    use super::*;
+
+    /// The documentation is the last remaining copy of DEFAULT_LEASE_TTL_MS,
+    /// so check it mechanically rather than by remembering.
+    ///
+    /// #182: when ADR-0018 moved the default from 3000 to 5000, three test
+    /// rigs kept their own hardcoded values (the AWS chaos/soak fleet at
+    /// 4000, two drills at 3000) and nothing noticed for weeks — every chaos
+    /// result was quietly measured on a fleet fenced tighter than any
+    /// customer's. The rigs no longer carry the number at all; an inventory
+    /// that omits `lease-ttl-ms` inherits the constant. These two strings are
+    /// what is left, and a stale doc is how the next person re-learns the
+    /// wrong number.
+    #[test]
+    fn the_documented_lease_ttl_is_the_one_we_ship() {
+        let want = format!("lease-ttl-ms {DEFAULT_LEASE_TTL_MS}");
+        for (what, text) in [
+            (
+                "docs/self-hosting.md",
+                include_str!("../../../docs/self-hosting.md"),
+            ),
+            ("this crate's usage header", include_str!("main.rs")),
+        ] {
+            assert!(
+                text.contains(&want),
+                "{what} does not say `{want}` — DEFAULT_LEASE_TTL_MS moved and \
+                 the documentation did not follow it"
+            );
+        }
     }
 }
 

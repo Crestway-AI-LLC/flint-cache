@@ -46,7 +46,6 @@ proxy 127.0.0.1:7482
 controller on
 poll-ms $POLL
 confirm $CONF
-lease-ttl-ms 3000
 EOF
 
 $CTL -f "$INV" bootstrap >"$D/bootstrap.log" 2>&1 || { echo "bootstrap failed"; exit 0; }

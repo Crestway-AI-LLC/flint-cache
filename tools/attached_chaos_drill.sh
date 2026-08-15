@@ -60,7 +60,6 @@ proxy 127.0.0.1:7692
 controller on
 poll-ms ${FLINT_POLL_MS:-150}
 confirm ${FLINT_CONFIRM:-3}
-lease-ttl-ms ${FLINT_LEASE_TTL_MS:-3000}
 EOF
 
 echo "== bootstrap a real fleet (TLS, control plane, controller supervising)"

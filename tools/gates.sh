@@ -367,10 +367,33 @@ assert_no_port_overlap() {
   FAILED="$FAILED port-overlap"
 }
 
+# #182: the lease TTL had four homes — flintctl's DEFAULT_LEASE_TTL_MS, the
+# AWS chaos/soak fleet's inventory, and two drills — and when ADR-0018 moved
+# it from 3000 to 5000 only flintctl followed. Nothing failed; every chaos run
+# afterwards was quietly measured on a fleet fenced tighter than any
+# customer's. An inventory that OMITS lease-ttl-ms inherits the constant, so
+# omitting it is the correct thing to write and a literal is a copy that will
+# go stale in silence. A drill deliberately testing a TTL passes a VARIABLE
+# (`lease-ttl-ms $LEASE`) — the number is then that drill's own subject rather
+# than a duplicate of the product default, and this check leaves it alone.
+assert_lease_ttl_single_source() {
+  local bad
+  bad=$(grep -rn 'lease-ttl-ms[[:space:]][[:space:]]*[0-9]' tools/ 2>/dev/null \
+    | grep -v ':[[:space:]]*#')
+  [ -z "$bad" ] && return 0
+  echo "FAIL  a literal lease-ttl-ms value is hardcoded outside flintctl:"
+  echo "$bad" | sed 's/^/        /'
+  echo "        DEFAULT_LEASE_TTL_MS (crates/flint-ctl/src/main.rs) is the only"
+  echo "        home for this number. Omit the key to inherit it, or pass a"
+  echo "        variable if the drill is deliberately testing another TTL."
+  FAILED="$FAILED lease-ttl-copy"
+}
+
 if want check; then
   echo "== gates: fmt, clippy, tests (both feature configs)"
   assert_no_default_ports
   assert_no_port_overlap
+  assert_lease_ttl_single_source
   step "fmt" fmt cargo fmt --all --check
   step "clippy (mem)" clippy-mem \
     cargo clippy --workspace --all-targets -- -D warnings
