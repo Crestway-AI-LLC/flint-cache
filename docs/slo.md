@@ -65,10 +65,10 @@ promoted master for **11.9 s** while the failover itself had completed in
 direction: a slower re-seed means longer at one copy, so raise it if you would
 rather have redundancy back sooner and can absorb the latency.
 
-**What is NOT bounded today:** items 1 and 2 above. If demand during recovery
-exceeds what the surviving master can serve, the excess currently QUEUES. See
-the next section — this is a specific case of a general gap, not a recovery
-feature.
+**What bounds items 1 and 2** is not a recovery feature at all — it is the
+write deadline in the next section, which refuses work the node cannot serve
+in time whether or not a failover is involved. Recovery is simply where its
+absence showed up first, because that is when demand rises as capacity falls.
 
 ## Overload — what we admit, and what we refuse
 
@@ -92,13 +92,45 @@ mutation may apply twice — harmless for `SET`, a wrong answer for `INCR` and
 `INCRBY`. A prompt refusal has no such ambiguity, and `-THROTTLED` already
 means retry-with-backoff.
 
-**Status: designed, not built** — the pieces exist (`-THROTTLED` on the lag
-cap, `min-replicas-to-write`, per-tenant `-QUOTA`, the proxy's bounded buffer
-and retry budget) but as independent local limits rather than one stated
-end-to-end deadline, and nothing decides at ADMISSION whether a request can
-make it. Until that lands, a heavily loaded fleet — recovering or not — can
-hold a write well past the budgets above. This document would rather say so
-than let you discover it.
+### The write deadline
+
+**Budget: 2000 ms, enforced at admission** (`--write-deadline-ms`, hot-settable
+via `FLINTCONFIG`; `0` disables it and restores unbounded queueing).
+
+A node estimates what a write arriving now would wait — `inflight × recent
+service time`, which is Little's law and nothing cleverer — and refuses it with
+`-THROTTLED` if that already exceeds the deadline. Two things follow from
+deciding at ARRIVAL rather than on expiry:
+
+- **The refusal is prompt.** Queue-then-timeout spends a full deadline of
+  capacity on work it then discards, on a node that by construction has none
+  to spare. It is the worst of both: the client waits *and* the node is busy
+  not serving anyone else.
+- **The accepted set stays inside what the node can serve.** That is the
+  actual guarantee. Refusing is not a failure mode here; it is the mechanism.
+
+What it does NOT promise is that every write completes within 2000 ms. The
+estimate is an estimate: a write admitted just before a stall still waits out
+the stall. It bounds what is *accepted*, which is what bounds the queue.
+
+`-THROTTLED` means retry with backoff, and it is the same signal the lag cap,
+`min-replicas-to-write` and the widowed grace already use. The chaos ledger
+counts a shed write as never-acked, so shedding can never be mistaken for data
+loss.
+
+Observable in `FLINTINFO`: `write_deadline_ms`, `write_inflight`,
+`write_service_us`, `write_wait_est_ms` (the estimate the gate itself decides
+on), and `writes_shed_deadline` (how often it has refused).
+
+```sh
+tools/write_deadline_drill.sh   # both arms: 0 shed at the default, sheds at 1ms
+```
+
+**Still local, not end-to-end.** The deadline is enforced per node, alongside
+the proxy's own bounded buffer and retry budget and per-tenant `-QUOTA`. A
+request crossing the proxy can therefore still spend more than one node's
+deadline in total. One stated end-to-end budget spanning both hops is the
+remaining work.
 
 ## Data loss on failover (RPO)
 

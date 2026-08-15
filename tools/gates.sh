@@ -113,7 +113,8 @@ CORE="restart repl failover proxy slot_migrate slot_map rebalance_execute
       fanout_timeout m3_exit migrate_slots min_replicas node_tls proxy_backpressure
       proxy_cache proxy_tls replica_reads replica_stale_fence rw_isolation
       scan slot_cutover slot_cutover_recovery slot_moved snapshot_restore
-      tenant tenant_rebalance tenant_remove token_hash"
+      tenant tenant_rebalance tenant_remove token_hash
+      write_deadline fullsync_rate"
 CHAOS="chaos proxy_chaos chaos_unreadable hotkey_chaos"
 
 # DELIBERATELY OUT, with the reason. An absence with no reason beside it is

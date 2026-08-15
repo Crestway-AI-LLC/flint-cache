@@ -187,6 +187,79 @@ static FULLSYNC_RATE_BYTES: std::sync::atomic::AtomicU64 =
 /// See `FULLSYNC_RATE_BYTES`. 64 MiB/s.
 const DEFAULT_FULLSYNC_RATE_BYTES: u64 = 64 * 1024 * 1024;
 
+/// Writes executing on this node right now, and an EWMA of how long recent
+/// ones took (microseconds). Together they ESTIMATE the wait a write arriving
+/// now would face — Little's law, `wait ~= inflight x service` — which is the
+/// only thing that can decide at ADMISSION whether the deadline is reachable
+/// (#186).
+///
+/// Deciding at admission is the point. Queue-then-timeout spends the whole
+/// deadline of capacity on work it then discards, which is the worst of both:
+/// the client waits AND the node is busy not serving anyone else.
+static WRITE_INFLIGHT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static WRITE_SERVICE_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Writes refused because their estimated wait exceeded the deadline. Exposed
+/// by FLINTINFO so the shed is observable rather than inferred — the lag cap
+/// shipped unexercised for months precisely because nothing counted it (#121).
+static WRITES_SHED_DEADLINE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How long a write may be EXPECTED to wait before we refuse it outright
+/// (milliseconds; 0 = no deadline, unbounded queueing).
+///
+/// A write that completes after its caller gave up is worse than one refused
+/// up front. It spends capacity live traffic needed, and it is ambiguous: the
+/// caller timed out and retried, so the mutation may apply twice — harmless
+/// for SET, a wrong answer for INCR. `-THROTTLED` already means
+/// retry-with-backoff and the chaos ledger already treats it as never-acked,
+/// so refusing is the one failure this system is built to absorb.
+///
+/// 2000 ms is a first calibration: orders of magnitude above normal service
+/// (sub-millisecond at any sane concurrency), far below any client's timeout,
+/// and well under the 8931 ms a client actually waited on soak run 24 while a
+/// re-seed had the write path. Wants revisiting against a measured p99 curve
+/// and against the headroom policy that should set it.
+static WRITE_DEADLINE_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(DEFAULT_WRITE_DEADLINE_MS);
+const DEFAULT_WRITE_DEADLINE_MS: u64 = 2_000;
+
+/// Counts a write for as long as it runs, and folds its duration into the
+/// service-time EWMA on the way out. Drop-based so every return path,
+/// including an error or a panic, is accounted.
+struct WriteInFlight(std::time::Instant);
+
+impl WriteInFlight {
+    fn enter() -> Self {
+        WRITE_INFLIGHT.fetch_add(1, Ordering::Relaxed);
+        Self(std::time::Instant::now())
+    }
+}
+
+impl Drop for WriteInFlight {
+    fn drop(&mut self) {
+        WRITE_INFLIGHT.fetch_sub(1, Ordering::Relaxed);
+        let us = self.0.elapsed().as_micros() as u64;
+        // 1/8-weight EWMA: recent enough to notice a stall within a handful of
+        // writes, damped enough that one slow write does not shed the next.
+        let prev = WRITE_SERVICE_US.load(Ordering::Relaxed);
+        let next = if prev == 0 {
+            us
+        } else {
+            prev - prev / 8 + us / 8
+        };
+        WRITE_SERVICE_US.store(next, Ordering::Relaxed);
+    }
+}
+
+/// The estimated wait, in ms, for a write arriving now. Public to the crate so
+/// FLINTINFO can report the same number the gate decides on — a gauge that
+/// disagrees with the gate is worse than no gauge.
+fn estimated_write_wait_ms() -> u64 {
+    WRITE_INFLIGHT
+        .load(Ordering::Relaxed)
+        .saturating_mul(WRITE_SERVICE_US.load(Ordering::Relaxed))
+        / 1_000
+}
+
 /// Sweep cadence for the GC pass that reclaims expired metadata and
 /// orphaned collection bodies (#133). 0 disables. Hot via FLINTCONFIG.
 static GC_SWEEP_MS: std::sync::atomic::AtomicU64 =
@@ -685,6 +758,17 @@ fn main() -> std::io::Result<()> {
             eprintln!(
                 "full-sync serve rate UNCAPPED (--fullsync-rate-bytes 0): a re-seed can \
                  starve this node's write path (#184)"
+            );
+        }
+        // End-to-end write deadline (ms; 0 = no deadline, unbounded queueing).
+        let write_deadline_ms: u64 = arg("--write-deadline-ms")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_WRITE_DEADLINE_MS);
+        WRITE_DEADLINE_MS.store(write_deadline_ms, Ordering::Relaxed);
+        if write_deadline_ms == 0 {
+            eprintln!(
+                "write deadline DISABLED (--write-deadline-ms 0): writes queue without bound \
+                 and may complete long after the client gave up (#186)"
             );
         }
         if wal_fsync_ms == 0 {
@@ -1702,6 +1786,27 @@ fn admit_write_path(
             }
             _ => {}
         }
+        // The deadline gate (#186), last because the gates above can NAME
+        // their cause and this one cannot: it is the catch-all for "this node
+        // cannot serve the write in time", whatever is making it slow —
+        // a re-seed on the disk, a retry burst after a promotion, or simply
+        // more offered load than the node has.
+        //
+        // Decided on ARRIVAL, not on expiry. Little's law says a write
+        // arriving now waits about `inflight x service`; if that is already
+        // past the deadline, queueing it only adds a deadline's worth of work
+        // that will be thrown away, on a node that by construction has none
+        // to spare. Refusing keeps the accepted set inside what we can serve.
+        let deadline_ms = WRITE_DEADLINE_MS.load(Ordering::Relaxed);
+        if deadline_ms > 0 {
+            let est_ms = estimated_write_wait_ms();
+            if est_ms > deadline_ms {
+                WRITES_SHED_DEADLINE.fetch_add(1, Ordering::Relaxed);
+                return Some(Value::Error(format!(
+                    "THROTTLED write would wait ~{est_ms}ms, past --write-deadline-ms {deadline_ms}, retry with backoff"
+                )));
+            }
+        }
     }
     None
 }
@@ -1748,6 +1853,9 @@ fn exec_transaction(
     if let Some(refusal) = admit_write_path(work, ro, conn_ns, rocks, migration_active, hub) {
         return refusal;
     }
+    // Held for the whole transaction, so the lock wait and the commit both
+    // land in the service-time estimate the next arrival is judged against.
+    let _inflight = (work.write && !ro).then(WriteInFlight::enter);
 
     let _all = write_lock::lock_all();
     let batching = flint_storage::batch::BatchingKv::new(store);
@@ -1971,6 +2079,10 @@ fn execute(
                     FULLSYNC_RATE_BYTES.load(Ordering::Relaxed).to_string(),
                 ),
                 field(
+                    "write-deadline-ms",
+                    WRITE_DEADLINE_MS.load(Ordering::Relaxed).to_string(),
+                ),
+                field(
                     "gc-sweep-ms",
                     GC_SWEEP_MS.load(Ordering::Relaxed).to_string(),
                 ),
@@ -2003,12 +2115,14 @@ fn execute(
             b"max-conns" => MAX_CONNS.store(std::cmp::max(1, parse!()), Ordering::Relaxed),
             b"migrate-rate-bytes" => MIGRATE_RATE_BYTES.store(parse!(), Ordering::Relaxed),
             b"fullsync-rate-bytes" => FULLSYNC_RATE_BYTES.store(parse!(), Ordering::Relaxed),
+            b"write-deadline-ms" => WRITE_DEADLINE_MS.store(parse!(), Ordering::Relaxed),
             b"gc-sweep-ms" => GC_SWEEP_MS.store(parse!(), Ordering::Relaxed),
             other => {
                 return Value::Error(format!(
                     "ERR unknown or restart-only config key {:?} (hot: wal-fsync-ms, \
                      lag-soft-ms, lag-hard-ms, min-replicas-to-write, widowed-grace-ms, \
-                     max-conns, migrate-rate-bytes, gc-sweep-ms)",
+                     max-conns, migrate-rate-bytes, fullsync-rate-bytes, \
+                     write-deadline-ms, gc-sweep-ms)",
                     String::from_utf8_lossy(other)
                 ));
             }
@@ -2192,6 +2306,10 @@ fn execute(
     if let Some(refusal) = admit_write_path(work, ro, conn_ns, rocks, migration_active, hub) {
         return refusal;
     }
+    // Counted from here to the end of the call, so a write that blocks on the
+    // async queue's consumer or on a contended stripe is measured as the slow
+    // write it is — those waits are exactly what the deadline is about.
+    let _inflight = (is_write && !ro).then(WriteInFlight::enter);
     // ADR-0005 D4: for an opted-in namespace, route a batchable string/counter
     // write through the async queue — the connection blocks on the consumer's
     // ack-after-apply (one group-committed engine WriteBatch per drained
@@ -2493,7 +2611,7 @@ fn flintinfo(
     };
     let (disk_free, disk_total, disk_unknown) = DISK.snapshot();
     let info = format!(
-        "role:{}\r\nrole_epoch:{role_epoch}\r\nbuild:{build}\r\nsst_bytes:{sst}\r\nlatest_seq:{latest}\r\nlast_applied:{last_applied}\r\nacked_seq:{}\r\nseq_lag:{seq_lag}\r\nlive_replicas:{}\r\nlag_ms:{}\r\nlag_soft_ms:{soft}\r\nlag_hard_ms:{hard}\r\nmin_replicas_to_write:{minr}\r\nwidowed_grace_ms:{wgm}\r\nwidowed_shed:{wsh}\r\nfullsync_active:{fsa}\r\nfullsync_max:{fsm}\r\nasync_write_queue:{aqd}\r\nwal_fsync_ms:{wfm}\r\nwal_fsync_total:{wft}\r\ncert_days_remaining:{cdr}\r\nactive_conns:{ac}\r\nmax_conns:{mc}\r\nconns_shed_total:{cs}\r\nwrite_stopped:{wst}\r\ndelayed_write_rate:{dwr}\r\ndisk_free_bytes:{dfb}\r\ndisk_total_bytes:{dtb}\r\ndisk_free_pct:{dfp}\r\ndisk_verdict:{dv}\r\ndisk_unknown_samples:{dus}\r\ngc_swept_expired:{gse}\r\ngc_swept_orphans:{gso}\r\nuptime_ms:{upms}\r\n",
+        "role:{}\r\nrole_epoch:{role_epoch}\r\nbuild:{build}\r\nsst_bytes:{sst}\r\nlatest_seq:{latest}\r\nlast_applied:{last_applied}\r\nacked_seq:{}\r\nseq_lag:{seq_lag}\r\nlive_replicas:{}\r\nlag_ms:{}\r\nlag_soft_ms:{soft}\r\nlag_hard_ms:{hard}\r\nmin_replicas_to_write:{minr}\r\nwidowed_grace_ms:{wgm}\r\nwidowed_shed:{wsh}\r\nfullsync_active:{fsa}\r\nfullsync_max:{fsm}\r\nasync_write_queue:{aqd}\r\nwrite_deadline_ms:{wdm}\r\nwrite_inflight:{wif}\r\nwrite_service_us:{wsu}\r\nwrite_wait_est_ms:{wwe}\r\nwrites_shed_deadline:{wsd}\r\nwal_fsync_ms:{wfm}\r\nwal_fsync_total:{wft}\r\ncert_days_remaining:{cdr}\r\nactive_conns:{ac}\r\nmax_conns:{mc}\r\nconns_shed_total:{cs}\r\nwrite_stopped:{wst}\r\ndelayed_write_rate:{dwr}\r\ndisk_free_bytes:{dfb}\r\ndisk_total_bytes:{dtb}\r\ndisk_free_pct:{dfp}\r\ndisk_verdict:{dv}\r\ndisk_unknown_samples:{dus}\r\ngc_swept_expired:{gse}\r\ngc_swept_orphans:{gso}\r\nuptime_ms:{upms}\r\n",
         if read_only { "replica" } else { "master" },
         hub.effective_acked(now)
             .map_or_else(|| "none".into(), |a| a.to_string()),
@@ -2514,6 +2632,15 @@ fn flintinfo(
         fsa = FULLSYNC_ACTIVE.load(Ordering::Relaxed),
         fsm = MAX_FULLSYNC.load(Ordering::Relaxed),
         aqd = async_queue_depth.map_or_else(|| "off".into(), |d| d.to_string()),
+        // The deadline, the two terms it is compared against, the estimate
+        // itself, and how often it has actually refused (#186). All five,
+        // because a shed counter with no visible estimate is unexplainable
+        // during an incident and an estimate with no counter is unfalsifiable.
+        wdm = WRITE_DEADLINE_MS.load(Ordering::Relaxed),
+        wif = WRITE_INFLIGHT.load(Ordering::Relaxed),
+        wsu = WRITE_SERVICE_US.load(Ordering::Relaxed),
+        wwe = estimated_write_wait_ms(),
+        wsd = WRITES_SHED_DEADLINE.load(Ordering::Relaxed),
         wfm = WAL_FSYNC_MS.load(Ordering::Relaxed),
         wft = rocks.as_ref().map(|kv| kv.wal_fsync_total()).unwrap_or(0),
         cdr = CERT_PATH

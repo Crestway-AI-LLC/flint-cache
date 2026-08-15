@@ -265,6 +265,19 @@ fullsync-rate-bytes 67108864  node HOT  cap on how fast a node SERVES a full
                                   to get redundancy back sooner at the cost of
                                   write latency during recovery; see the
                                   recovery window in docs/slo.md.
+write-deadline-ms 2000  node  HOT  refuse a write on ARRIVAL when its estimated
+                                  wait (inflight x recent service time) already
+                                  exceeds this; 0 = no deadline, unbounded
+                                  queueing. Also a server flag
+                                  (--write-deadline-ms), changeable live with
+                                  FLINTCONFIG. A write that completes after its
+                                  caller timed out spends capacity live traffic
+                                  needed AND is ambiguous — the caller retried,
+                                  so INCR may apply twice. Refusing early is
+                                  neither: -THROTTLED means retry with backoff.
+                                  Set it below your clients' timeout. Watch
+                                  writes_shed_deadline and write_wait_est_ms in
+                                  FLINTINFO.
 node-ready-s 15       ctl   ctl-only PING budget for a freshly spawned replica.
                                   A wiped node full-syncs its checkpoint
                                   BEFORE it binds its listener, so on a
