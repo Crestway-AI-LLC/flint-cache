@@ -296,6 +296,7 @@ fn main() {
             shared.recovered_ms.store(0, Ordering::SeqCst);
             shared.outage_seen.store(false, Ordering::SeqCst);
             shared.max_stall_ms.store(0, Ordering::SeqCst);
+            shared.max_stall_at_ms.store(0, Ordering::SeqCst);
             shared.acks_after_kill.store(0, Ordering::SeqCst);
             let kill_ms = now_ms();
             shared.kill_ms.store(kill_ms, Ordering::SeqCst);
@@ -350,12 +351,50 @@ fn main() {
                 }
             };
             shared.kill_ms.store(0, Ordering::SeqCst);
+            // The absolute window, not just the delta. A breach is only
+            // actionable if it can be JOINED to the fleet journal's `at_ms`,
+            // and for three runs it could not be: the message said "11.5s
+            // exceeds 10s" and nothing else, so the time could not be
+            // attributed to a leg (detect / fence / promote / re-route) and
+            // the finding stayed open. These three numbers are what turn a
+            // verdict into a diagnosis.
+            // On the EDGE path `rto` is the worst inter-ack gap, not an
+            // outage-to-first-ack, so "kill_ms + rto" would be a fiction.
+            // Report the instant the gap actually closed; the two paths
+            // measure different things and the window must say which.
+            let stall_at = shared.max_stall_at_ms.load(Ordering::SeqCst);
+            let recovered_at_ms = if shared.edge.is_some() && stall_at != 0 {
+                stall_at
+            } else {
+                kill_ms.saturating_add(rto)
+            };
+            // WHAT WAS MEASURED, in the message that reports the breach. The
+            // per-iteration line already distinguishes "client stall" from
+            // "RTO", but the ASSERT said "kill to first post-kill ack" on both
+            // paths — and the assert is the only line anyone reads, because it
+            // is the one that ends the run. Every scale run drives through
+            // --edge, so #181 ("failover blackout is 11.5s") was named from a
+            // sentence describing the OTHER path. On the edge the number is
+            // the worst gap between consecutive acks anywhere in the post-kill
+            // window; a write stall on the new master produces it just as
+            // readily as a slow promotion, and the two want opposite fixes.
+            let measured = if shared.edge.is_some() {
+                "worst gap between consecutive acks through the proxy edge. This is NOT \
+                 necessarily the failover: ANY stall in the post-kill window sets it \
+                 (a RocksDB write stall on the new master reads identically). Check \
+                 rocks-stalls-*.txt in the evidence bundle before blaming promotion"
+            } else {
+                "kill to first post-kill ack"
+            };
             if !harness_promoted {
                 rtos.push(rto);
                 assert!(
                     rto <= rto_budget_ms,
                     "iter {iteration}: {rto}ms exceeds the published budget {rto_budget_ms}ms \
-                     (docs/slo.md) — kill to first post-kill ack"
+                     (docs/slo.md) — {measured}. \
+                     WINDOW kill_ms={kill_ms} dead_ms={dead_ms} recovered_at_ms={recovered_at_ms} — \
+                     slice the fleet journal to this window; the leg holding the \
+                     time names itself"
                 );
             }
 
@@ -562,7 +601,8 @@ fn main() {
             acked_lost_total += lost_here;
             unverifiable_total += unverifiable;
             println!(
-                "iter {iteration}: pair {pair_idx}: killed MASTER (writes in flight); {} {rto}ms{}; acked keys \
+                "iter {iteration}: pair {pair_idx}: killed MASTER (writes in flight); {} {rto}ms{} \
+                 [kill_ms={kill_ms} dead_ms={dead_ms} recovered_at_ms={recovered_at_ms}]; acked keys \
                  regressed: {lost_here} (all within the {lag_hard_ms}ms cap){}",
                 if shared.edge.is_some() {
                     "client stall"

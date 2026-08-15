@@ -92,6 +92,13 @@ pub struct Shared {
     /// SLO cares about seen from where the customer sits.
     pub last_ack_ms: AtomicU64,
     pub max_stall_ms: AtomicU64,
+    /// WHEN the worst stall ended (the ack that closed it). The magnitude
+    /// alone is unattributable: on the edge path this gap is the number
+    /// gated against the RTO budget, and it is the worst gap ANYWHERE in
+    /// the post-kill window — a promotion blackout and a RocksDB write
+    /// stall on the new master produce the same figure. Only the instant
+    /// says which, by placing it against the fleet journal.
+    pub max_stall_at_ms: AtomicU64,
     /// Acks observed strictly after the kill instant — proof that service
     /// continued, and how the client path knows the window has closed.
     pub acks_after_kill: AtomicU64,
@@ -140,6 +147,7 @@ impl Shared {
             outage_seen: AtomicBool::new(false),
             last_ack_ms: AtomicU64::new(0),
             max_stall_ms: AtomicU64::new(0),
+            max_stall_at_ms: AtomicU64::new(0),
             acks_after_kill: AtomicU64::new(0),
             key_count,
             edge: None,
@@ -264,7 +272,27 @@ pub fn run(shared: &Shared, seed: u64) {
                 let prev = shared.last_ack_ms.swap(at, Ordering::SeqCst);
                 if kill != 0 && prev != 0 {
                     let gap = at.saturating_sub(prev);
-                    shared.max_stall_ms.fetch_max(gap, Ordering::SeqCst);
+                    // CAS rather than fetch_max, so the INSTANT can be stored
+                    // by whoever actually raised the maximum. Two writers can
+                    // still interleave between the swap and the store, which
+                    // for a diagnostic timestamp is acceptable: it can only
+                    // name a different ack of the same magnitude, never a
+                    // different window.
+                    let mut cur = shared.max_stall_ms.load(Ordering::SeqCst);
+                    while gap > cur {
+                        match shared.max_stall_ms.compare_exchange(
+                            cur,
+                            gap,
+                            Ordering::SeqCst,
+                            Ordering::SeqCst,
+                        ) {
+                            Ok(_) => {
+                                shared.max_stall_at_ms.store(at, Ordering::SeqCst);
+                                break;
+                            }
+                            Err(actual) => cur = actual,
+                        }
+                    }
                     if at > kill {
                         shared.acks_after_kill.fetch_add(1, Ordering::SeqCst);
                     }
