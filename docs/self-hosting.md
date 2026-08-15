@@ -241,6 +241,13 @@ async-queue-cap 4096  node  restart  async write-queue depth
 poll-ms 100           ctlr  restart  failure-probe interval (RTO)
 confirm 3             ctlr  restart  consecutive fails before promote
 lease-ttl-ms 5000     node  restart  master lease TTL (self-renewed at the CP)
+node-ready-s 15       ctl   ctl-only PING budget for a freshly spawned replica.
+                                  A wiped node full-syncs its checkpoint
+                                  BEFORE it binds its listener, so on a
+                                  loaded fleet this must cover the whole
+                                  transfer — size it to data-per-node, not
+                                  to taste. Too small and rolls/restarts
+                                  report a healthy syncing node as dead.
 ```
 
 On a replicated pair, set `min-replicas 1` — it closes the widowed-master

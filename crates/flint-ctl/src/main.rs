@@ -141,6 +141,11 @@ struct Inventory {
     ctl_poll_ms: Option<u64>,      // controller: failure-probe interval (RTO)
     ctl_confirm: Option<u32>,      // controller: consecutive fails to promote
     ctl_lease_ttl_ms: Option<u64>, // NODE master lease TTL (ADR-0018: renewed at the CP)
+    /// How long a freshly (re)spawned replica may take to answer PING.
+    /// A wiped node full-syncs its checkpoint BEFORE binding its listener,
+    /// so on a loaded fleet this must cover the whole transfer — the 15 s
+    /// default fits drills, not fleets carrying tens of GB per pair.
+    node_ready_s: Option<u64>,
     /// SSH login for seats that live on OTHER machines. Absent = every seat
     /// is local, which is the single-host fleet every drill exercises.
     ssh_user: Option<String>,
@@ -226,6 +231,7 @@ fn parse_inventory(path: &str) -> Inventory {
             "poll-ms" => inv.ctl_poll_ms = val.parse().ok(),
             "confirm" => inv.ctl_confirm = val.parse().ok(),
             "lease-ttl-ms" => inv.ctl_lease_ttl_ms = val.parse().ok(),
+            "node-ready-s" => inv.node_ready_s = val.parse().ok(),
             // Multi-host placement (see the Inventory struct). Omit them all
             // and the fleet is single-host, byte for byte as before.
             "ssh-user" => inv.ssh_user = Some(val.to_string()),
@@ -606,6 +612,14 @@ fn must(what: &str, reply: std::io::Result<Value>) -> Value {
         Ok(v) if !matches!(v, Value::Error(_)) => v,
         other => fail(what, &other),
     }
+}
+
+/// The PING budget for a freshly (re)spawned replica. A wiped node
+/// full-syncs its checkpoint before binding its listener (see
+/// flint-server's startup order), so this must cover the transfer on a
+/// loaded fleet — `node-ready-s` in the inventory raises it.
+fn node_ready_budget(inv: &Inventory) -> Duration {
+    Duration::from_secs(inv.node_ready_s.unwrap_or(15))
 }
 
 fn wait_pong(addr: &str, tls: &Option<Arc<flint_tls::ClientConfig>>, budget: Duration) -> bool {
@@ -3976,7 +3990,7 @@ fn add_replica(inv: &Inventory, inventory_path: &str, pair_ref: &str, new: &str)
         &args,
     );
     assert!(
-        wait_pong(new, &tls, Duration::from_secs(15)),
+        wait_pong(new, &tls, node_ready_budget(inv)),
         "new replica up"
     );
     let deadline = Instant::now() + Duration::from_secs(60);
@@ -4074,7 +4088,7 @@ fn swap_node(inv: &Inventory, inventory_path: &str, bad: &str, new: &str) {
         &args,
     );
     assert!(
-        wait_pong(new, &tls, Duration::from_secs(15)),
+        wait_pong(new, &tls, node_ready_budget(inv)),
         "replacement up"
     );
 
@@ -4237,7 +4251,7 @@ fn roll_node(
         &args,
         envs,
     );
-    if !wait_pong(addr, &tls, Duration::from_secs(15)) {
+    if !wait_pong(addr, &tls, node_ready_budget(inv)) {
         return Err(format!("{addr} did not come back after the binary swap"));
     }
     if let Some(want) = expect_build {
