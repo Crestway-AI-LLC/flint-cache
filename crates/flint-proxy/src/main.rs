@@ -742,10 +742,31 @@ impl Topology {
             };
             for (i, nodes) in pairs {
                 let found = discover_master(&nodes, &self.backend_tls);
+                let mut was: Option<String> = None;
                 if let Ok(mut routing) = view.routing.write()
                     && let Some(slot) = routing.masters.get_mut(i)
                 {
+                    was = slot.clone();
                     *slot = found.clone();
+                }
+                // Say when routing actually MOVED, and to what.
+                //
+                // Soak run 26 spent a 43850ms client-visible outage after a
+                // promotion that finished in 597ms, and the proxy log had
+                // NOTHING to say about it: no line here, none in
+                // apply_promote_hint, so "did the edge ever learn about the
+                // new master, and when" was unanswerable from the evidence
+                // bundle. Three separate hypotheses were raised and killed by
+                // code reading because no log could arbitrate them. One line
+                // per actual change is cheap — re-probes are frequent, but
+                // re-probes that CHANGE the master are exactly as rare as
+                // promotions (#187).
+                if was != found {
+                    eprintln!(
+                        "pair {i} master {} -> {} (re-probe triggered by {addr})",
+                        was.as_deref().unwrap_or("none"),
+                        found.as_deref().unwrap_or("none")
+                    );
                 }
                 // Moved entries pointing at the dead address migrate to the
                 // pair's new master (slot data survives failover via the
@@ -791,6 +812,12 @@ impl Topology {
         let Some((addr, _gen)) = hint.split_once('|') else {
             return;
         };
+        // The arrival of the hint is itself evidence, separate from whether
+        // the re-probe then moves anything. On soak run 26 the proxy log had
+        // zero lines mentioning a promotion across a 25-minute run containing
+        // several, which left "the hint never arrived" and "the hint arrived
+        // and did nothing" indistinguishable — two very different bugs (#187).
+        eprintln!("promotion hint {hint}: re-probing the pair holding {addr}");
         self.rediscover_for(addr);
     }
 
