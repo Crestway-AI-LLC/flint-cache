@@ -159,6 +159,34 @@ static WAL_FSYNC_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 #[cfg_attr(not(feature = "rocks"), allow(dead_code))]
 static MIGRATE_RATE_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Cap on how fast this node SERVES a full sync (bytes/sec; 0 = unlimited),
+/// hot-reloadable via FLINTCONFIG. Rocks-only.
+///
+/// Unlike the migration cap this defaults to a REAL number, because the
+/// default is the case that hurts. A re-seeding replica pulls its checkpoint
+/// from the pair's master, and after a failover that master was promoted
+/// seconds ago and is carrying the pair's whole write load by itself. Soak
+/// run 23 measured the consequence with no cap: promotion finished 700 ms
+/// after the kill, then the write path stalled 11.9 s while a 104-file
+/// checkpoint streamed out — a client waiting 11.9 s for a write, against a
+/// published 10 s budget, for a failover that was over in under a second
+/// (#184; #177's 43.6 s and #181's 11.5 s are the same mechanism at other
+/// dataset sizes).
+///
+/// 64 MiB/s is a FIRST CALIBRATION, not a measured optimum: it is an order of
+/// magnitude above the foreground demand those runs put on a pair (~5 MB/s)
+/// while still re-seeding a 5 GB checkpoint in ~80 s. The trade it encodes is
+/// deliberate — a slower re-seed means longer at RF=1, so this buys write
+/// latency with redundancy-restore time, and both are bounded and observable.
+/// Operators who would rather have redundancy back sooner set it higher or to
+/// 0; the number wants revisiting against a measured p99 curve.
+#[cfg_attr(not(feature = "rocks"), allow(dead_code))]
+static FULLSYNC_RATE_BYTES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(DEFAULT_FULLSYNC_RATE_BYTES);
+
+/// See `FULLSYNC_RATE_BYTES`. 64 MiB/s.
+const DEFAULT_FULLSYNC_RATE_BYTES: u64 = 64 * 1024 * 1024;
+
 /// Sweep cadence for the GC pass that reclaims expired metadata and
 /// orphaned collection bodies (#133). 0 disables. Hot via FLINTCONFIG.
 static GC_SWEEP_MS: std::sync::atomic::AtomicU64 =
@@ -647,6 +675,18 @@ fn main() -> std::io::Result<()> {
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
         MIGRATE_RATE_BYTES.store(migrate_rate_bytes, Ordering::Relaxed);
+        // Full-sync serve cap (bytes/sec; 0 = unlimited). Defaults non-zero —
+        // see FULLSYNC_RATE_BYTES for why the default is the case that hurts.
+        let fullsync_rate_bytes: u64 = arg("--fullsync-rate-bytes")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_FULLSYNC_RATE_BYTES);
+        FULLSYNC_RATE_BYTES.store(fullsync_rate_bytes, Ordering::Relaxed);
+        if fullsync_rate_bytes == 0 {
+            eprintln!(
+                "full-sync serve rate UNCAPPED (--fullsync-rate-bytes 0): a re-seed can \
+                 starve this node's write path (#184)"
+            );
+        }
         if wal_fsync_ms == 0 {
             eprintln!("wal fsync cadence DISABLED (--wal-fsync-ms 0): host-loss window unbounded");
         }
@@ -1927,6 +1967,10 @@ fn execute(
                     MIGRATE_RATE_BYTES.load(Ordering::Relaxed).to_string(),
                 ),
                 field(
+                    "fullsync-rate-bytes",
+                    FULLSYNC_RATE_BYTES.load(Ordering::Relaxed).to_string(),
+                ),
+                field(
                     "gc-sweep-ms",
                     GC_SWEEP_MS.load(Ordering::Relaxed).to_string(),
                 ),
@@ -1958,6 +2002,7 @@ fn execute(
             b"widowed-grace-ms" => hub.set_widowed_grace_ms(parse!()),
             b"max-conns" => MAX_CONNS.store(std::cmp::max(1, parse!()), Ordering::Relaxed),
             b"migrate-rate-bytes" => MIGRATE_RATE_BYTES.store(parse!(), Ordering::Relaxed),
+            b"fullsync-rate-bytes" => FULLSYNC_RATE_BYTES.store(parse!(), Ordering::Relaxed),
             b"gc-sweep-ms" => GC_SWEEP_MS.store(parse!(), Ordering::Relaxed),
             other => {
                 return Value::Error(format!(
@@ -2829,6 +2874,11 @@ fn flintfullsync(mut stream: flint_tls::Stream, rocks: Option<RocksHandle>) -> s
     ));
     kv.checkpoint_to(&ckpt)
         .map_err(|e| std::io::Error::other(format!("checkpoint: {e}")))?;
+    // Paced: this node is serving a checkpoint while also taking live writes,
+    // and after a failover it is the freshly promoted master carrying the
+    // pair alone. Unthrottled, that starved the write path for 11.9s on soak
+    // run 23 (#184). Same limiter as the migration copy (#83), same reason.
+    let mut pacer = migrate::Pacer::new(&FULLSYNC_RATE_BYTES);
     let result = (|| -> std::io::Result<()> {
         for entry in std::fs::read_dir(&ckpt)? {
             let entry = entry?;
@@ -2856,6 +2906,10 @@ fn flintfullsync(mut stream: flint_tls::Stream, rocks: Option<RocksHandle>) -> s
                     &mut out,
                 );
                 stream.write_all(&out)?;
+                // Paced on the PAYLOAD, after the write: an empty frame costs
+                // nothing, and sleeping before the send would just move the
+                // stall earlier.
+                pacer.pace(n);
                 sent_any = true;
                 if n == 0 {
                     break;

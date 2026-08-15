@@ -30,31 +30,44 @@ use crate::RocksHandle;
 #[cfg(feature = "rocks")]
 use crate::{commands, internal_connect};
 
-/// Average-rate limiter for the migration bulk copy. Reads the live
-/// `MIGRATE_RATE_BYTES` cap (bytes/sec; 0 = unlimited) after each flush and
-/// sleeps so cumulative throughput stays under it. Keeps a rebalance copy —
-/// above all a traffic-policy move shipping the HOTTEST slots — from
-/// saturating disk/net and inflating live p99. Reading the cap per flush makes
-/// it hot-reloadable (FLINTCONFIG) mid-migration.
+/// Average-rate limiter for a bulk copy that shares a node with live traffic.
+/// Reads its cap (bytes/sec; 0 = unlimited) after each flush and sleeps so
+/// cumulative throughput stays under it. Reading the cap per flush makes it
+/// hot-reloadable (FLINTCONFIG) mid-copy.
+///
+/// Two callers, same disease. Slot migration (`MIGRATE_RATE_BYTES`, #83) —
+/// above all a traffic-policy move shipping the HOTTEST slots — must not
+/// saturate disk/net and inflate live p99. Full-sync serving
+/// (`FULLSYNC_RATE_BYTES`, #184) is the same story with worse timing: the node
+/// streaming a checkpoint to a re-seeding replica is, after a failover, the
+/// master that was promoted seconds earlier and is now carrying the pair's
+/// whole write load alone. Measured on soak run 23, unthrottled: promotion
+/// completed at +700 ms and the write path then stalled 11.9 s while a
+/// 104-file checkpoint went out.
+///
+/// The cap is a `&'static` rather than a copied number so a FLINTCONFIG change
+/// reaches a copy already in flight.
 #[cfg(feature = "rocks")]
-struct Pacer {
+pub(crate) struct Pacer {
     start: std::time::Instant,
     sent: u64,
+    cap: &'static std::sync::atomic::AtomicU64,
 }
 
 #[cfg(feature = "rocks")]
 impl Pacer {
-    fn new() -> Self {
+    pub(crate) fn new(cap: &'static std::sync::atomic::AtomicU64) -> Self {
         Self {
             start: std::time::Instant::now(),
             sent: 0,
+            cap,
         }
     }
 
     /// Account `n` freshly-sent bytes, then sleep if we are ahead of the cap.
-    fn pace(&mut self, n: usize) {
+    pub(crate) fn pace(&mut self, n: usize) {
         self.sent += n as u64;
-        let rate = crate::MIGRATE_RATE_BYTES.load(std::sync::atomic::Ordering::Relaxed);
+        let rate = self.cap.load(std::sync::atomic::Ordering::Relaxed);
         if rate == 0 {
             return;
         }
@@ -133,7 +146,7 @@ pub(crate) fn flintmigrateout(
     // periodic flushes, so neither the row list nor the encode buffer ever
     // holds a whole slot in memory.
     let mut bulk_rows: u64 = 0;
-    let mut pacer = Pacer::new();
+    let mut pacer = Pacer::new(&crate::MIGRATE_RATE_BYTES);
     for prefix in &prefixes {
         out.clear();
         let mut io_err: Option<std::io::Error> = None;
