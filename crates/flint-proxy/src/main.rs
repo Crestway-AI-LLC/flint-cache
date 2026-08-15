@@ -55,9 +55,27 @@ use flint_slot::slot_for_key;
 /// waits, and failover rediscovery — the proxy's answer to "latency spike,
 /// not errors" during topology changes.
 const RETRY_BUDGET: Duration = Duration::from_secs(5);
-/// Backend I/O timeout. Generous: a frozen-slot drain or a slow disk read
-/// must not be misread as a dead node.
+/// Backend I/O timeout for KEYED traffic. Generous: a frozen-slot drain or a
+/// slow disk read must not be misread as a dead node. Deliberately short all
+/// the same — a client waiting on GET wants to fail over, not to wait.
 const BACKEND_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Backend read budget for the O(KEYS) ADMIN class — `DBSIZE`, `FLUSHALL`,
+/// `SCAN`'s per-master step. These are not keyed traffic and must not be
+/// judged by keyed traffic's clock: DBSIZE walks every metadata row on the
+/// node it asks, so its honest cost grows with the keyspace, and `SCAN`'s
+/// step and `FLUSHALL`'s chunked delete do the same.
+///
+/// Scale run 19 (2026-08-14) is why this exists as its own constant: on a
+/// 100 GB, 4-pair fleet with ~1.6M keys per pair, DBSIZE needed longer than
+/// BACKEND_TIMEOUT, so `flintctl verify --probe` reported FAILED — on a
+/// fleet that was healthy by every other check and had never been perturbed.
+/// A verify that cries wolf above a few hundred GB is worse than no verify.
+///
+/// This BUYS HEADROOM, it does not remove the wall: the fix that does is a
+/// maintained live-key counter making DBSIZE O(1) (#179). Size this to the
+/// keyspace — `fanout-timeout-ms` in the inventory.
+const FANOUT_TIMEOUT_DEFAULT: Duration = Duration::from_secs(60);
 
 /// Default cap on concurrent client connections — proxy admission control.
 /// Thread-per-connection means each connection costs a thread; without a
@@ -399,6 +417,9 @@ struct Topology {
     /// current config. `None` = plaintext backends (default). Set by
     /// `--internal-*`; the same triple the servers use, in the client role.
     backend_tls: Option<Arc<flint_tls::ReloadableClientConfig>>,
+    /// Read budget for the O(keys) admin class (`--fanout-timeout-ms`); see
+    /// FANOUT_TIMEOUT_DEFAULT and Backends::call_slow.
+    fanout_timeout: Duration,
     /// This proxy's own mesh leaf cert path (--internal-cert), for the
     /// cert-expiry gauge in PROXYSTATS. None => plaintext mesh.
     cert_path: Option<String>,
@@ -1057,6 +1078,8 @@ struct Backends {
     /// Async write-queue opt-in (D4): pin backend conns with the 'a'
     /// handshake flag so the node routes batchable writes via its queue.
     async_writes: bool,
+    /// Read budget for the O(keys) admin class only (see call_slow).
+    fanout_timeout: Duration,
 }
 
 impl Backends {
@@ -1064,12 +1087,14 @@ impl Backends {
         ns: Vec<u8>,
         tls: Option<Arc<flint_tls::ReloadableClientConfig>>,
         async_writes: bool,
+        fanout_timeout: Duration,
     ) -> Self {
         Self {
             conns: HashMap::new(),
             ns,
             tls,
             async_writes,
+            fanout_timeout,
         }
     }
 
@@ -1079,7 +1104,11 @@ impl Backends {
         self.conns.remove(addr);
     }
 
-    fn call(&mut self, addr: &str, frame: &[u8]) -> std::io::Result<Value> {
+    /// Dial + RESP3 + namespace handshake if this address is not already
+    /// pooled. Split out of `call` so the O(keys) path can reuse the ONE
+    /// dial implementation while giving only the command's own reply a
+    /// longer budget (see `call_slow`).
+    fn ensure_conn(&mut self, addr: &str) -> std::io::Result<()> {
         if !self.conns.contains_key(addr) {
             let mut stream = flint_tls::connect_reloadable(addr, &self.tls)?;
             stream.set_read_timeout(Some(BACKEND_TIMEOUT))?;
@@ -1142,6 +1171,12 @@ impl Backends {
             }
             self.conns.insert(addr.to_string(), (stream, Vec::new()));
         }
+        Ok(())
+    }
+
+    /// Keyed traffic: BACKEND_TIMEOUT, set once at dial.
+    fn call(&mut self, addr: &str, frame: &[u8]) -> std::io::Result<Value> {
+        self.ensure_conn(addr)?;
         let Some((stream, buf)) = self.conns.get_mut(addr) else {
             return Err(std::io::Error::other("conn cache"));
         };
@@ -1150,6 +1185,35 @@ impl Backends {
             // A failed connection is never reused: the reply stream may be
             // desynchronized (half-read reply), which would corrupt the next
             // exchange.
+            self.conns.remove(addr);
+        }
+        result
+    }
+
+    /// The O(keys) admin class — `DBSIZE`, `FLUSHALL`, `SCAN`'s per-master
+    /// step. Same wire, same pool, different clock: only the command's own
+    /// REPLY gets `fanout_timeout`.
+    ///
+    /// Connection setup deliberately keeps the keyed budget: a node that
+    /// cannot complete HELLO + FLINTNS inside BACKEND_TIMEOUT is a genuinely
+    /// sick node, and hiding that behind a minute of patience would trade one
+    /// misdiagnosis for another. And the budget is RESTORED before the socket
+    /// goes back in the pool — it is per-client and long-lived, so a leaked
+    /// 60 s read timeout would silently make every subsequent GET on this
+    /// connection wait a minute for a dead backend.
+    fn call_slow(&mut self, addr: &str, frame: &[u8]) -> std::io::Result<Value> {
+        self.ensure_conn(addr)?;
+        let budget = self.fanout_timeout;
+        let result = {
+            let Some((stream, buf)) = self.conns.get_mut(addr) else {
+                return Err(std::io::Error::other("conn cache"));
+            };
+            stream.set_read_timeout(Some(budget))?;
+            let r = call_raw(stream, buf, frame);
+            let _ = stream.set_read_timeout(Some(BACKEND_TIMEOUT));
+            r
+        };
+        if result.is_err() {
             self.conns.remove(addr);
         }
         result
@@ -1383,7 +1447,10 @@ fn fan_out(
             let mut refreshed = false;
             loop {
                 match attempt {
-                    Some(a) => match backends.call(&a, frame) {
+                    // call_slow: everything routed here is the O(keys) admin
+                    // class (DBSIZE, FLUSHALL), whose honest cost scales with
+                    // the keyspace on the node being asked.
+                    Some(a) => match backends.call_slow(&a, frame) {
                         Ok(v) => {
                             replies.push(v);
                             break;
@@ -2541,7 +2608,12 @@ fn data_command(
     // transaction here and returning.
     {
         let b = backends.get_or_insert_with(|| {
-            Backends::new(ns.to_vec(), topo.backend_tls.clone(), async_writes)
+            Backends::new(
+                ns.to_vec(),
+                topo.backend_tls.clone(),
+                async_writes,
+                topo.fanout_timeout,
+            )
         });
         if let Some(reply) = transaction_step(topo, b, txn, ns, args, raw) {
             return reply;
@@ -2565,7 +2637,12 @@ fn data_command(
             .first()
             .is_some_and(|n| flint_commands::is_read_command(n));
     let b = backends
-        .get_or_insert_with(|| Backends::new(ns.to_vec(), topo.backend_tls.clone(), async_writes));
+        .get_or_insert_with(|| Backends::new(
+                ns.to_vec(),
+                topo.backend_tls.clone(),
+                async_writes,
+                topo.fanout_timeout,
+            ));
     let reply = handle(topo, b, ns, args, raw, read_replica);
     if cacheable && let Value::Bulk(Some(v)) = &reply {
         topo.cache.put(ns, &args[1], v);
@@ -2702,7 +2779,10 @@ fn scan_forward(topo: &Topology, backends: &mut Backends, ns: &[u8], args: &[Vec
     ));
     let mut out = Vec::new();
     encode(&frame, &mut out);
-    let reply = match backends.call(&master, &out) {
+    // O(keys) class: a SCAN step is bounded by COUNT in ROWS RETURNED, not in
+    // rows EXAMINED — a cursor walking a mostly-expired or heavily-filtered
+    // region does arbitrary work for one page. Same budget as DBSIZE.
+    let reply = match backends.call_slow(&master, &out) {
         Ok(v) => v,
         Err(e) => return Value::Error(format!("ERR scan forward to {master}: {e}")),
     };
@@ -3121,6 +3201,13 @@ fn main() -> std::io::Result<()> {
         ),
         open_mode,
         backend_tls,
+        // Sized to the KEYSPACE, not to taste: DBSIZE walks every metadata
+        // row on the node it asks. Default 60s (~20M keys of headroom on
+        // NVMe); raise it on fleets bigger than that.
+        fanout_timeout: arg("--fanout-timeout-ms")
+            .and_then(|v| v.parse().ok())
+            .map(Duration::from_millis)
+            .unwrap_or(FANOUT_TIMEOUT_DEFAULT),
         cert_path: arg("--internal-cert"),
         last_promote_hint: RwLock::new(String::new()),
         channel_tokens: std::sync::Mutex::new(HashMap::new()),
@@ -3292,6 +3379,7 @@ mod route_tests {
             cache: cache::ProxyCache::new(0, 0),
             open_mode: true,
             backend_tls: None,
+            fanout_timeout: FANOUT_TIMEOUT_DEFAULT,
             cert_path: None,
             admin_digests: RwLock::new(Vec::new()),
             last_promote_hint: RwLock::new(String::new()),

@@ -138,6 +138,10 @@ struct Inventory {
     async_queue_cap: Option<u64>,  // node: async write-queue depth
     cache_ttl_ms: Option<u64>,     // proxy: near-cache TTL default
     cache_max_bytes: Option<u64>,  // proxy: near-cache byte budget default
+    /// proxy: read budget for the O(keys) admin class (DBSIZE/FLUSHALL/SCAN
+    /// step), which scales with the KEYSPACE — not with keyed-traffic
+    /// latency. Default 60_000; raise it above ~20M keys per node.
+    fanout_timeout_ms: Option<u64>,
     ctl_poll_ms: Option<u64>,      // controller: failure-probe interval (RTO)
     ctl_confirm: Option<u32>,      // controller: consecutive fails to promote
     ctl_lease_ttl_ms: Option<u64>, // NODE master lease TTL (ADR-0018: renewed at the CP)
@@ -228,6 +232,7 @@ fn parse_inventory(path: &str) -> Inventory {
             "async-queue-cap" => inv.async_queue_cap = val.parse().ok(),
             "cache-ttl-ms" => inv.cache_ttl_ms = val.parse().ok(),
             "cache-max-bytes" => inv.cache_max_bytes = val.parse().ok(),
+            "fanout-timeout-ms" => inv.fanout_timeout_ms = val.parse().ok(),
             "poll-ms" => inv.ctl_poll_ms = val.parse().ok(),
             "confirm" => inv.ctl_confirm = val.parse().ok(),
             "lease-ttl-ms" => inv.ctl_lease_ttl_ms = val.parse().ok(),
@@ -1814,6 +1819,9 @@ fn proxy_tuning_args(inv: &Inventory) -> Vec<String> {
     if let Some(v) = inv.max_conns {
         push("--max-conns", v.to_string());
     }
+    if let Some(v) = inv.fanout_timeout_ms {
+        push("--fanout-timeout-ms", v.to_string());
+    }
     a
 }
 
@@ -3294,7 +3302,23 @@ fn verify_checks(inv: &Inventory, probe: Option<&str>, loud: bool) -> Vec<String
                 other => note(false, "auth + ping", format!("{other:?}")),
             }
             // DBSIZE fans out to EVERY master: one stale entry fails it.
-            match call_seq_on(proxy, &edge, &[&["AUTH", token], &["DBSIZE"]], t, true) {
+            //
+            // It is also the O(keys) class — the node walks every metadata
+            // row — so it gets a budget sized for that, not the 10 s the
+            // cheap probes use. The client budget must EXCEED the proxy's
+            // own fan-out timeout (60 s by default, `fanout-timeout-ms`):
+            // whoever gives up first writes the error, and the proxy's
+            // version names the pair that was slow while ours would say
+            // only "timeout". Scale run 19 was diagnosable in one pass
+            // precisely because the proxy answered first.
+            let t_fanout = Duration::from_secs(90);
+            match call_seq_on(
+                proxy,
+                &edge,
+                &[&["AUTH", token], &["DBSIZE"]],
+                t_fanout,
+                true,
+            ) {
                 Ok(Value::Integer(n)) => note(
                     true,
                     "DBSIZE fan-out reaches every master",

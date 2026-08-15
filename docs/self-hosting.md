@@ -235,6 +235,17 @@ widowed-grace-ms N    node  HOT   max time accepting writes with NO live
                                   to measure, so this is the only bound on
                                   that window.
 max-conns 10000       node+proxy HOT  connection admission cap
+fanout-timeout-ms 60000  proxy restart  read budget for the O(KEYS) admin
+                                  class — DBSIZE, FLUSHALL, a SCAN step.
+                                  Separate from keyed traffic's 5 s on
+                                  purpose: a GET should fail over fast,
+                                  while DBSIZE honestly costs more the more
+                                  keys a node holds (it walks every metadata
+                                  row). Size it to the KEYSPACE — the
+                                  default covers roughly 20M keys per node;
+                                  past that, `verify --probe` starts
+                                  reporting a DBSIZE timeout on a fleet
+                                  that is otherwise perfectly healthy.
 cache-ttl-ms 300      proxy HOT   near-cache TTL default (PROXYCACHE)
 cache-max-bytes N     proxy HOT   near-cache byte budget
 async-queue-cap 4096  node  restart  async write-queue depth
