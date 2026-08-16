@@ -81,6 +81,19 @@ struct Inventory {
     /// views). Absent = the internal CA, which signs the default edge
     /// cert; public-cert fleets point it at the system bundle.
     edge_trust: Option<String>,
+    /// ADR-0010 co-processors (`coproc <FAMILY.> <host:port>`, repeatable):
+    /// a command family and the seat that serves it. flintctl spawns the
+    /// seat and hands every proxy the matching `--families` mapping, so a
+    /// family is deployed by declaring it rather than by hand-passing flags
+    /// to two binaries and hoping they agree.
+    ///
+    /// The seat runs the binary named by the family (`VEC.` -> `flint-vec`),
+    /// which is how one key serves the families that exist today without a
+    /// per-family inventory dialect.
+    coprocs: Vec<(String, String)>,
+    /// coproc: per-namespace index RAM budget before the seat sheds
+    /// (`--index-mem-bytes`). Absent = [`DEFAULT_COPROC_INDEX_BYTES`].
+    coproc_index_bytes: Option<u64>,
     /// Billing journal path (agent --billing): the append-only per-tenant
     /// usage record a metering reporter aggregates from. Absent = the
     /// agent keeps no billing journal (self-hosters who do not bill).
@@ -214,6 +227,42 @@ fn parse_inventory(path: &str) -> Inventory {
             // the Nth proxy-advertise line pairs with the Nth proxy line.
             "proxy-advertise" => inv.proxy_advertise.push(val.to_string()),
             "edge-trust" => inv.edge_trust = Some(val.to_string()),
+            // `coproc <FAMILY.> <host:port>`. The prefix keeps its trailing
+            // dot because that is what the proxy matches on and what the
+            // ADR calls the family; normalising it here would hide a typo
+            // ("VEC" vs "VEC.") until a command silently took the keyed
+            // path instead of the family path.
+            "coproc-index-bytes" => inv.coproc_index_bytes = val.parse().ok(),
+            "coproc" => {
+                let mut it = val.split_whitespace();
+                match (it.next(), it.next(), it.next()) {
+                    (Some(family), Some(addr), None) => {
+                        if !family.ends_with('.') {
+                            die(&format!(
+                                "inventory: coproc family `{family}` must end with a dot \
+                                 (the proxy matches `VEC.`, not `VEC`)"
+                            ));
+                        }
+                        if coproc_bin(family).is_none() {
+                            die(&format!(
+                                "inventory: no co-processor binary is known for family \
+                                 `{family}`; this build serves {}",
+                                COPROC_FAMILIES
+                                    .iter()
+                                    .map(|(f, _)| *f)
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            ));
+                        }
+                        inv.coprocs
+                            .push((family.to_ascii_uppercase(), addr.to_string()));
+                    }
+                    _ => die(&format!(
+                        "inventory: `coproc` takes exactly a family and an address, \
+                         got `coproc {val}`"
+                    )),
+                }
+            }
             "billing" => inv.billing = Some(val.to_string()),
             "billing-retain-days" => inv.billing_retain_days = val.parse().ok(),
             "controller" => inv.controller = val == "on",
@@ -1000,6 +1049,97 @@ fn runner_for(inv: &Inventory, addr: &str) -> Runner {
 
 /// Proxies bind a wildcard, so their address does not name their machine —
 /// `proxy-host` does, positionally.
+/// Command family -> the co-processor binary that serves it (ADR-0010). A
+/// table, not a convention, because the mapping is a deployment fact the
+/// inventory must be able to REFUSE at parse time: an unknown family would
+/// otherwise spawn nothing and leave the proxy routing `VEC.*` into a hole.
+const COPROC_FAMILIES: &[(&str, &str)] = &[("VEC.", "flint-vec")];
+
+fn coproc_bin(family: &str) -> Option<&'static str> {
+    let f = family.to_ascii_uppercase();
+    COPROC_FAMILIES
+        .iter()
+        .find(|(name, _)| *name == f)
+        .map(|(_, bin)| *bin)
+}
+
+fn coproc_runner(inv: &Inventory, i: usize) -> Runner {
+    runner_for(inv, &inv.coprocs[i].1)
+}
+
+/// Seat name (pidfile/log stem): family without its dot, plus the port —
+/// `vec-7600`. Two co-processors of DIFFERENT families can share a host, so
+/// the family has to be in the name.
+fn coproc_seat(family: &str, addr: &str) -> String {
+    format!(
+        "{}-{}",
+        family.trim_end_matches('.').to_ascii_lowercase(),
+        port_of(addr)
+    )
+}
+
+/// A co-processor seat's flags. It presents the SERVER-ONLY `coproc` leaf
+/// (ADR-0010 D2): serverAuth without clientAuth, so a compromised
+/// co-processor cannot turn around and dial the mesh as a member. That is
+/// also why it does not get the `int` pair every other seat uses.
+///
+/// `--index-mem-bytes` is always passed. The binary's own default is 0 =
+/// unlimited, which is right for a laptop and wrong for a fleet: the index
+/// is RAM-resident (ADR-0017 v0), so an uncapped one grows until the host
+/// OOMs and takes the seat's PROXYCHAN writes with it.
+fn coproc_args(inv: &Inventory, i: usize) -> Vec<String> {
+    let (_, addr) = &inv.coprocs[i];
+    let d = &inv.statedir;
+    let bind_host = addr.rsplit_once(':').map(|(h, _)| h).unwrap_or("127.0.0.1");
+    let mut args = vec![
+        "--port".to_string(),
+        port_of(addr).to_string(),
+        "--bind".to_string(),
+        bind_host.to_string(),
+        "--index-mem-bytes".to_string(),
+        inv.coproc_index_bytes
+            .unwrap_or(DEFAULT_COPROC_INDEX_BYTES)
+            .to_string(),
+    ];
+    if inv.tls {
+        args.extend([
+            "--internal-ca".to_string(),
+            format!("{d}/certs/ca.crt"),
+            "--internal-cert".to_string(),
+            format!("{d}/certs/coproc.crt"),
+            "--internal-key".to_string(),
+            format!("{d}/certs/coproc.key"),
+        ]);
+    }
+    if inv.client_tls {
+        args.push("--client-tls".to_string());
+    }
+    args
+}
+
+/// The `--families` mapping every proxy gets: `VEC.=addr1,addr2;OTHER.=addr3`.
+/// Built from the inventory so the proxy's routing table and the seats that
+/// were actually spawned cannot disagree.
+fn families_arg(inv: &Inventory) -> Option<String> {
+    if inv.coprocs.is_empty() {
+        return None;
+    }
+    let mut by_family: Vec<(String, Vec<String>)> = Vec::new();
+    for (family, addr) in &inv.coprocs {
+        match by_family.iter_mut().find(|(f, _)| f == family) {
+            Some((_, addrs)) => addrs.push(addr.clone()),
+            None => by_family.push((family.clone(), vec![addr.clone()])),
+        }
+    }
+    Some(
+        by_family
+            .into_iter()
+            .map(|(f, addrs)| format!("{f}={}", addrs.join(",")))
+            .collect::<Vec<_>>()
+            .join(";"),
+    )
+}
+
 fn proxy_runner(inv: &Inventory, i: usize) -> Runner {
     match inv.proxy_hosts.get(i) {
         Some(h) => runner_for_host(inv, h),
@@ -1063,6 +1203,13 @@ fn all_runners(inv: &Inventory) -> Vec<Runner> {
     }
     if inv.backup_to.is_some() {
         push(backup_runner(inv));
+    }
+    // A co-processor commonly gets its OWN host (ADR-0010 D5 keeps its CPU
+    // off the proxy's), so omitting it here would hide that host from
+    // push-bins, cert distribution and the orphan sweep — the same silent
+    // omission the CP loop above documents, one role later.
+    for i in 0..inv.coprocs.len() {
+        push(coproc_runner(inv, i));
     }
     out
 }
@@ -1548,6 +1695,14 @@ fn reconcile_widowed_grace(
 /// first ack, and shorter than the loss you are willing to publish.
 const DEFAULT_WIDOWED_GRACE_MS: u64 = 10_000;
 
+/// Per-namespace index RAM a co-processor may hold before it sheds
+/// (`coproc-index-bytes`). 1 GiB is a deliberately SMALL default: the
+/// ADR-0017 v0 index is RAM-resident, the seat usually shares a host, and
+/// the failure mode of guessing high is an OOM that takes the seat out
+/// mid-run, where the failure mode of guessing low is a `-QUOTA` the caller
+/// sees immediately. Raise it per fleet once you know the host's headroom.
+const DEFAULT_COPROC_INDEX_BYTES: u64 = 1024 * 1024 * 1024;
+
 /// How long a master may serve without a successful `CPLEASE` renewal before
 /// it self-fences, when the inventory does not say (ADR-0018).
 ///
@@ -1569,14 +1724,18 @@ const DEFAULT_WIDOWED_GRACE_MS: u64 = 10_000;
 /// `the_documented_lease_ttl_is_the_one_we_ship`.
 const DEFAULT_LEASE_TTL_MS: u64 = 5_000;
 
-/// The binaries `flintctl` starts — the orphan sweep's allowlist.
-const FLEET_BINARIES: [&str; 6] = [
+/// The binaries `flintctl` starts — the orphan sweep's allowlist. Every
+/// co-processor binary in [`COPROC_FAMILIES`] belongs here too: a seat the
+/// sweep cannot see survives `stop` and then holds its port against the
+/// next `start`.
+const FLEET_BINARIES: [&str; 7] = [
     "flint-server",
     "flint-proxy",
     "flint-controlplane",
     "flint-controller",
     "flint-agent",
     "flint-backup",
+    "flint-vec",
 ];
 
 /// Kill fleet processes belonging to THIS inventory that the pidfiles do
@@ -2571,6 +2730,18 @@ fn proxy_args(inv: &Inventory, i: usize) -> Vec<String> {
     ];
     args.extend(internal_args(inv));
     args.extend(proxy_tuning_args(inv));
+    if let Some(families) = families_arg(inv) {
+        args.extend(["--families".to_string(), families]);
+        // The CALLBACK half of ADR-0010 D6. A family command's durable write
+        // goes co-processor -> PROXYCHAN -> this proxy's EDGE, so the
+        // co-processor has to be handed a reachable edge address; the proxy
+        // refuses to mint a channel without one and every VEC.* answers
+        // -COPROCUNAVAIL. It cannot be derived from the accept socket (the
+        // inbound peer is not an edge), which is why it is a flag — and
+        // `advertise` is already exactly this address: the proxy's identity
+        // IS its edge.
+        args.extend(["--edge-advertise".to_string(), proxy_dial(inv, i)]);
+    }
     if inv.client_tls {
         // ADR-0006 D2: the packaged default is an encrypted front door.
         args.extend([
@@ -2830,6 +3001,24 @@ fn launch(inv: &Inventory, register: bool) {
             let adv = proxy_dial(inv, i);
             must("register proxy", call_cp(inv, &tls, &["CPADDPROXY", &adv]));
         }
+        // Families go in the REGISTRY, not just on the proxy's command line.
+        // The proxy takes its route table from CPSNAPSHOT element 7 whenever
+        // the element is present, so a CP-fed proxy REPLACES whatever
+        // `--families` gave it — a static flag alone survives exactly until
+        // the first snapshot lands, which is why a co-processor spawned by
+        // the inventory still answered "unknown command". Registering here
+        // also means a proxy added later learns the family without a
+        // restart, the same way it learns pairs.
+        if let Some(families) = families_arg(inv) {
+            for entry in families.split(';') {
+                if let Some((prefix, addrs)) = entry.split_once('=') {
+                    must(
+                        "register family",
+                        call_cp(inv, &tls, &["CPFAMILY", prefix, addrs]),
+                    );
+                }
+            }
+        }
         // Initial pairs carry the even slot split as EXPLICIT level-1
         // routing state; expansion pairs later join with "-" (no range) so
         // capacity never re-routes unmigrated slots.
@@ -2862,6 +3051,27 @@ fn launch(inv: &Inventory, register: bool) {
             wait_pong(&pair[0], &tls, Duration::from_secs(10)),
             "master {} up",
             pair[0]
+        );
+    }
+
+    // 3a. Co-processors, BEFORE the proxies that route to them (ADR-0010).
+    // Ordering is not cosmetic: a proxy that admits a family command before
+    // the seat is listening answers the tenant with a connection error, and
+    // the family path has no retry of its own.
+    for i in 0..inv.coprocs.len() {
+        let (family, addr) = &inv.coprocs[i];
+        let bin = coproc_bin(family).expect("inventory parse rejected unknown families");
+        let seat = coproc_seat(family, addr);
+        if seat_alive(&coproc_runner(inv, i), bin, &seat) {
+            eprintln!("  {seat} already up");
+            continue;
+        }
+        spawn(
+            inv,
+            &coproc_runner(inv, i),
+            &seat,
+            bin,
+            &coproc_args(inv, i),
         );
     }
 

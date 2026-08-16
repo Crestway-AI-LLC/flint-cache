@@ -101,8 +101,22 @@ struct Tls {
     edge: Option<Arc<flint_tls::ClientConfig>>,
 }
 
+fn build_version() -> String {
+    flint_build::version(env!("CARGO_PKG_VERSION"))
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    // Ask the binary what it is, WITHOUT starting it — the same flag every
+    // other fleet binary answers (#111: the launcher stamps builds by asking
+    // each one). A co-processor that ignored it did not just miss a version
+    // string: the flag fell through to the serving path, so the caller got a
+    // process that bound a port and never returned. `flintctl upgrade`'s
+    // post-roll check and the drill warm-up both hang on exactly that.
+    if args.iter().any(|a| a == "--build-version") {
+        println!("{}", build_version());
+        return;
+    }
     let port: u16 = arg(&args, "--port")
         .and_then(|s| s.parse().ok())
         .unwrap_or(6700);
