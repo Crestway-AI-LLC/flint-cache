@@ -243,6 +243,21 @@ fn try_rewind(data_dir: &std::path::Path, snaps_dir: &str, target: &str) -> bool
             let _ = std::fs::remove_dir_all(&tmp);
             return false;
         }
+        // PROVE the restored copy opens before reporting success. Every
+        // failure past this point in the boot is a `?` that EXITS — and in a
+        // fleet nothing restarts a start-spawned seat, so a restore that
+        // does not open is not a degraded rejoin, it is a seat that stays
+        // DOWN until an operator notices (how soak run 28's bring-up died:
+        // one unopenable state and the recovery check timed out at 180s).
+        // Open-drop-open is safe — the lock releases on drop.
+        match flint_storage::rocks::RocksKv::open(data_dir) {
+            Ok(kv) => drop(kv),
+            Err(e) => {
+                eprintln!("rewind: restored copy does not open ({e}); full re-seed");
+                let _ = std::fs::remove_dir_all(data_dir);
+                return false;
+            }
+        }
         eprintln!(
             "rewound to {} (seq {seq} <= fence {bound}, epoch {epoch}): tailing incrementally \
              instead of a full re-seed",
@@ -690,7 +705,15 @@ fn main() -> std::io::Result<()> {
                             "{NEEDS_RESEED} present: this copy cannot be continued ({why}) — \
                              discarding it and re-seeding from a checkpoint"
                         );
-                        std::fs::remove_dir_all(&dir_path)?;
+                        // A failed rewind may already have removed the dir
+                        // (its swap is remove-then-rename); NotFound here is
+                        // the desired end state, not an error. Exiting on it
+                        // would strand the seat DOWN with the marker gone.
+                        match std::fs::remove_dir_all(&dir_path) {
+                            Ok(()) => {}
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                            Err(e) => return Err(e.into()),
+                        }
                     }
                 } else {
                     clear_needs_reseed(&dir_path);
