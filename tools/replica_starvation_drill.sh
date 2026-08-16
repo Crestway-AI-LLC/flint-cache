@@ -53,6 +53,15 @@ RPORT=6456
 MDIR="$FLINT_DRILL_ROOT/flint-starve/m"
 RDIR="$FLINT_DRILL_ROOT/flint-starve/r"
 BIN="./target/release/flint-server"
+# ~8 MB against a 4 MB window. The BYTE volume is what has to outrun the
+# window; the round-trip count is pure cost, and this drill now runs two arms,
+# so the same 8 MB goes in 400 larger writes rather than 800 small ones.
+#
+# The fill is a repeated byte, which #169 would normally forbid — but #169 is
+# about SST bytes, and the bound here is the WAL, which RocksDB does not
+# compress. A compressible value still occupies its full length in the window.
+WRITES=400
+VSIZE=20000
 
 cleanup() {
   # CONT first: a process left stopped cannot be killed by SIGTERM, and a
@@ -62,7 +71,6 @@ cleanup() {
   rm -rf "$MDIR" "$RDIR"
 }
 trap cleanup EXIT
-rm -rf "$MDIR" "$RDIR"; mkdir -p "$MDIR" "$RDIR"
 
 cargo build --release -q -p flint-server --features rocks || { echo "FAIL: build"; exit 1; }
 fleet_warm "$BIN"
@@ -72,101 +80,101 @@ fleet_warm "$BIN"
 export FLINT_WAL_RETAIN_MB=4
 export FLINT_WAL_RETAIN_SECS=3600
 
-# lag-hard 2000ms: the master must shed writes (-THROTTLED) once the freshest
-# replica is >2 s behind. With the replica stopped, that threshold is crossed
-# almost immediately, so ANY sustained write acceptance past it is the cap
-# failing to hold.
-MINREP="${MINREP:-1}"
-echo "== master :$MPORT (WAL window ${FLINT_WAL_RETAIN_MB}MB, lag-hard 2000ms, min-replicas $MINREP), replica :$RPORT"
-"$BIN" --port "$MPORT" --engine rocks --data-dir "$MDIR" \
-  --lag-soft-ms 1000 --lag-hard-ms 2000 --min-replicas-to-write "$MINREP" >"$MDIR/log" 2>&1 &
-fleet_wait_listen "$MPORT"
-"$BIN" --port "$RPORT" --engine rocks --data-dir "$RDIR" \
-  --replica-of "127.0.0.1:$MPORT" >"$RDIR/log" 2>&1 &
-fleet_wait_listen "$RPORT"
-RPID=$(pgrep -f "flint-server --port $RPORT" | head -1)
-[ -n "$RPID" ] || { echo "FAIL: no replica pid"; exit 1; }
+# BOTH ARMS RUN, EVERY TIME.
+#
+# This was one arm selected by a MINREP env var, defaulted to 1 — so the gate
+# only ever ran arm A, while the header claimed both were asserted. Arm B is
+# the one that describes the SHIPPED cache default (min-replicas-to-write 0:
+# writes are never blocked on replica health), so leaving it unrun meant the
+# gate said nothing about the configuration customers actually get.
+run_arm() {
+  local MINREP="$1" ACCEPTED=0 THROTTLED=0 CAUGHT=0 RESUMED=0 ESCALATED i OUT LAGMS LIVE LAG C
+  RPID=""
+  fleet_kill server
+  rm -rf "$MDIR" "$RDIR"; mkdir -p "$MDIR" "$RDIR"
 
-C="valkey-cli -p $MPORT"
-# Seed and let the replica catch up, so the starting state is provably healthy
-# (a drill that begins from an unknown state cannot attribute what follows).
-for i in $(seq 1 200); do $C SET "seed:$i" "v$i" >/dev/null; done
-CAUGHT=0
-for _ in $(seq 1 50); do
-  LAG=$($C FLINTINFO 2>/dev/null | tr -d '\r' | sed -n 's/^seq_lag://p')
-  [ "$LAG" = "0" ] && { CAUGHT=1; break; }
-  sleep 0.2
-done
-[ "$CAUGHT" = 1 ] || { echo "FAIL: replica never caught up before the test began"; exit 1; }
-echo "  replica streaming, seq_lag 0 — healthy start"
+  # lag-hard 2000ms: the master must shed writes (-THROTTLED) once the freshest
+  # replica is >2 s behind. With the replica stopped that threshold is crossed
+  # almost immediately, so any sustained acceptance past it is the cap failing.
+  echo "== ARM $([ "$MINREP" = 0 ] && echo B || echo A): master :$MPORT (WAL window ${FLINT_WAL_RETAIN_MB}MB, lag-hard 2000ms, min-replicas $MINREP), replica :$RPORT"
+  "$BIN" --port "$MPORT" --engine rocks --data-dir "$MDIR" \
+    --lag-soft-ms 1000 --lag-hard-ms 2000 --min-replicas-to-write "$MINREP" >"$MDIR/log" 2>&1 &
+  fleet_wait_listen "$MPORT"
+  "$BIN" --port "$RPORT" --engine rocks --data-dir "$RDIR" \
+    --replica-of "127.0.0.1:$MPORT" >"$RDIR/log" 2>&1 &
+  fleet_wait_listen "$RPORT"
+  RPID=$(pgrep -f "flint-server --port $RPORT" | head -1)
+  [ -n "$RPID" ] || { echo "FAIL: no replica pid"; exit 1; }
 
-echo "== 1. STOP the replica: its apply rate is now exactly zero"
-kill -STOP "$RPID"
+  C="valkey-cli -p $MPORT"
+  # Seed and let the replica catch up, so the starting state is provably
+  # healthy (a drill that begins from an unknown state cannot attribute what
+  # follows).
+  for i in $(seq 1 200); do $C SET "seed:$i" "v$i" >/dev/null; done
+  for _ in $(seq 1 50); do
+    LAG=$($C FLINTINFO 2>/dev/null | tr -d '\r' | sed -n 's/^seq_lag://p')
+    [ "$LAG" = "0" ] && { CAUGHT=1; break; }
+    sleep 0.2
+  done
+  [ "$CAUGHT" = 1 ] || { echo "FAIL: replica never caught up before the test began"; exit 1; }
+  echo "  replica streaming, seq_lag 0 — healthy start"
 
-echo "== 2. write hard, and watch whether the master ever stops accepting"
-# ~8 MB of values against a 4 MB window: without backpressure this MUST
-# recycle the WAL past the replica's cursor.
-ACCEPTED=0; THROTTLED=0
-for i in $(seq 1 800); do
-  OUT=$($C SET "load:$i" "$(head -c 10000 /dev/zero | tr '\0' 'x')" 2>&1 | tr -d '\r')
-  case "$OUT" in
-    OK) ACCEPTED=$((ACCEPTED+1)) ;;
-    *THROTTLED*|*QUOTA*) THROTTLED=$((THROTTLED+1)) ;;
-  esac
-done
-echo "  accepted=$ACCEPTED  throttled=$THROTTLED"
-LAGMS=$($C FLINTINFO 2>/dev/null | tr -d '\r' | sed -n 's/^lag_ms://p')
-LIVE=$($C FLINTINFO 2>/dev/null | tr -d '\r' | sed -n 's/^live_replicas://p')
-echo "  master reports lag_ms=$LAGMS live_replicas=$LIVE"
+  echo "  1. STOP the replica: its apply rate is now exactly zero"
+  kill -STOP "$RPID"
 
-# THE ASSERTION. A cap that holds cannot let 800 writes past a replica that is
-# 100% stalled and far beyond lag-hard. If the master accepted them all, the
-# backpressure is not protecting the window — which is the #197 hypothesis.
-if [ "$MINREP" = 0 ]; then
-  # ARM B: the exposure, asserted so a default change cannot pass silently.
-  if [ "$THROTTLED" != 0 ]; then
-    echo "FAIL: with min-replicas-to-write 0 the master SHED ($THROTTLED) — the"
-    echo "      default changed. That is likely an improvement, but this drill"
-    echo "      and the fleet inventories encode the old behaviour; update both."
-    exit 1
+  echo "  2. write hard, and watch whether the master ever stops accepting"
+  for i in $(seq 1 "$WRITES"); do
+    OUT=$($C SET "load:$i" "$(head -c "$VSIZE" /dev/zero | tr '\0' 'x')" 2>&1 | tr -d '\r')
+    case "$OUT" in
+      OK) ACCEPTED=$((ACCEPTED+1)) ;;
+      *THROTTLED*|*QUOTA*) THROTTLED=$((THROTTLED+1)) ;;
+    esac
+  done
+  LAGMS=$($C FLINTINFO 2>/dev/null | tr -d '\r' | sed -n 's/^lag_ms://p')
+  LIVE=$($C FLINTINFO 2>/dev/null | tr -d '\r' | sed -n 's/^live_replicas://p')
+  echo "     accepted=$ACCEPTED throttled=$THROTTLED (master reports lag_ms=$LAGMS live_replicas=$LIVE)"
+
+  if [ "$MINREP" = 0 ]; then
+    # ARM B: the exposure, asserted so a default change cannot pass silently.
+    [ "$THROTTLED" = 0 ] || {
+      echo "FAIL: with min-replicas-to-write 0 the master SHED ($THROTTLED) — the"
+      echo "      default changed. That is likely an improvement, but this drill"
+      echo "      and the fleet inventories encode the old behaviour; update both."
+      exit 1
+    }
+    echo "     arm B confirmed: guard OFF accepts all $ACCEPTED writes with no live replica"
+  else
+    # ARM A: a cap that holds cannot let every write past a replica that is
+    # 100% stalled and far beyond lag-hard.
+    [ "$THROTTLED" != 0 ] || {
+      echo "FAIL: the master accepted ALL $ACCEPTED writes while its only replica was"
+      echo "      frozen and past lag-hard (lag_ms=$LAGMS, live_replicas=$LIVE)."
+      echo "      The lag cap is measured in TIME and the WAL window in BYTES, and"
+      echo "      when the replica stops counting as live the cap evaluates to"
+      echo "      'no cap' — so backpressure disappears exactly when it is needed"
+      echo "      and the master races the replica out of its own WAL window (#197)."
+      exit 1
+    }
+    echo "     the cap engaged ($THROTTLED shed)"
   fi
-  echo "  arm B confirmed: guard OFF accepts all $ACCEPTED writes with no live replica"
-elif [ "$THROTTLED" = 0 ]; then
-  echo "FAIL: the master accepted ALL $ACCEPTED writes while its only replica was"
-  echo "      frozen and past lag-hard (lag_ms=$LAGMS, live_replicas=$LIVE)."
-  echo "      The lag cap is measured in TIME and the WAL window in BYTES, and"
-  echo "      when the replica stops counting as live the cap evaluates to"
-  echo "      'no cap' — so backpressure disappears exactly when it is needed"
-  echo "      and the master races the replica out of its own WAL window (#197)."
-  RESUMABLE=unknown
-else
-  echo "  the cap engaged ($THROTTLED shed)"
-fi
 
-echo "== 3. resume the replica: can it still tail, or must it full-sync?"
-kill -CONT "$RPID"
-RESUMED=0
-for _ in $(seq 1 60); do
-  LAG=$($C FLINTINFO 2>/dev/null | tr -d '\r' | sed -n 's/^seq_lag://p')
-  [ "$LAG" = "0" ] && { RESUMED=1; break; }
-  sleep 0.5
-done
-if grep -q "full sync\|FULLSYNC\|WALGAP" "$RDIR/log" 2>/dev/null; then
-  echo "  replica escalated to a FULL SYNC (it fell out of the window)"
-  ESCALATED=1
-else
-  ESCALATED=0
-fi
-[ "$RESUMED" = 1 ] || { echo "FAIL: replica never reconverged after CONT (escalated=$ESCALATED)"; exit 1; }
+  echo "  3. resume the replica: can it still tail, or must it full-sync?"
+  kill -CONT "$RPID"
+  for _ in $(seq 1 60); do
+    LAG=$($C FLINTINFO 2>/dev/null | tr -d '\r' | sed -n 's/^seq_lag://p')
+    [ "$LAG" = "0" ] && { RESUMED=1; break; }
+    sleep 0.5
+  done
+  if grep -q "full sync\|FULLSYNC\|WALGAP" "$RDIR/log" 2>/dev/null; then ESCALATED=1; else ESCALATED=0; fi
+  # Recovery is non-negotiable even when the cap is off by design: escalation
+  # to full sync is a legitimate answer (#106) — losing the replica is not.
+  [ "$RESUMED" = 1 ] || { echo "FAIL: replica never reconverged after CONT (escalated=$ESCALATED)"; exit 1; }
+  echo "     replica reconverged (escalated_to_full_sync=$ESCALATED)"
+}
 
-# Recovery is non-negotiable even if the cap failed: escalation to full sync
-# is a legitimate, designed answer (#106) — silently losing the replica is not.
-echo "  replica reconverged (escalated_to_full_sync=$ESCALATED)"
-
-if [ "$MINREP" != 0 ] && [ "$THROTTLED" = 0 ]; then
-  echo "FAIL: see above — the write gate did not hold the replica inside the WAL window"
-  exit 1
-fi
-echo "PASS: replica starvation drill — a frozen replica drives the master into"
-echo "      backpressure rather than out of its own WAL window, and the replica"
-echo "      reconverges when it resumes"
+run_arm 1
+run_arm 0
+echo "PASS: replica starvation drill — with the guard on, a frozen replica drives"
+echo "      the master into backpressure rather than out of its own WAL window;"
+echo "      with the cache default (guard off) the master accepts without limit,"
+echo "      as designed; and the replica reconverges either way"

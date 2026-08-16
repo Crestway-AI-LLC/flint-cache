@@ -48,6 +48,24 @@ fn wal_retain_mb() -> u64 {
         .unwrap_or(1024)
 }
 
+/// LSM shape knobs, unset by default so stock RocksDB behaviour is unchanged.
+///
+/// These exist for two reasons that turn out to be the same reason. A drill
+/// needs a DEEP LSM at small data to reproduce the compaction regime a fleet
+/// reaches at hundreds of GB — shrink the level base and 500 MB behaves like
+/// half a terabyte. And the write-path work needs the same dials to move the
+/// measured write amplification (11.5x interval on 2-vCPU nodes, 2026-08-16),
+/// which is the number that made physical bytes run ~3-4x ahead of logical
+/// and the fleet's progress meter lie.
+///
+/// Absent = do not call the setter at all, so RocksDB's own defaults apply and
+/// this cannot silently change behaviour for anyone not opting in. Named for
+/// the type rather than the unit: two of the three knobs are megabytes and one
+/// is seconds, and a name that says MB would be wrong a third of the time.
+fn env_u64(key: &str) -> Option<u64> {
+    std::env::var(key).ok().and_then(|v| v.parse().ok())
+}
+
 impl RocksKv {
     /// Bytes of live SST data on disk — the capacity-model fill signal
     /// (FLINTINFO `sst_bytes:`; expansion triggers derive fill fractions
@@ -214,6 +232,20 @@ impl RocksKv {
         opts.create_if_missing(true);
         opts.set_wal_ttl_seconds(wal_secs);
         opts.set_wal_size_limit_mb(wal_mb);
+        // See `env_u64`: opt-in only.
+        if let Some(mb) = env_u64("FLINT_LEVEL_BASE_MB") {
+            opts.set_max_bytes_for_level_base(mb * 1024 * 1024);
+        }
+        if let Some(mb) = env_u64("FLINT_WRITE_BUFFER_MB") {
+            opts.set_write_buffer_size((mb * 1024 * 1024) as usize);
+        }
+        // RocksDB dumps its compaction/amplification table to LOG every 600 s
+        // by default, so a short run produces NO stats at all — which is why
+        // the 2026-08-16 fleet (40 min) had them and a 10-second drill did
+        // not. Opt-in, same as the rest.
+        if let Some(secs) = env_u64("FLINT_STATS_DUMP_SEC") {
+            opts.set_stats_dump_period_sec(secs as u32);
+        }
         // Expired metadata rows are dropped organically as compaction
         // rewrites them (subkey orphans are reclaimed by gc::sweep until
         // the filter gains a metadata-lookup handle).

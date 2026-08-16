@@ -37,7 +37,19 @@ PORT=6396
 # macOS: hdiutil APPENDS .dmg when the path lacks it, so a bare .img name
 # creates one file and attaches another. Name it per platform.
 if [ "$(uname)" = "Darwin" ]; then IMG=$FLINT_DRILL_ROOT/flint-diskpressure.dmg; else IMG=$FLINT_DRILL_ROOT/flint-diskpressure.img; fi
-MNT=$FLINT_DRILL_ROOT/flint-diskpressure-mnt
+# THE MOUNTPOINT IS NOT UNDER $FLINT_DRILL_ROOT, DELIBERATELY.
+#
+# macOS refuses `hdiutil attach -mountpoint` when the mountpoint lives inside
+# ANOTHER MOUNTED VOLUME: "attach failed - Permission denied", naming nothing.
+# #180 made the drill root configurable precisely so it could be an external
+# SSD, which silently broke this drill for exactly that configuration — the
+# case the change existed to support. It reads as "could not attach the disk
+# image", so it looks like a broken image rather than a bad path.
+#
+# The IMAGE stays on $FLINT_DRILL_ROOT, which is what #180 is about: every
+# byte written lands on the configured volume. Only the directory entry the
+# volume is grafted onto has to be local.
+MNT=${TMPDIR:-/tmp}/flint-diskpressure-mnt
 SIZE_MB=512
 # Thresholds chosen so a 512 MB volume trips them with a ~400 MB ballast
 # file, not so tight that filesystem overhead alone trips them at boot.
