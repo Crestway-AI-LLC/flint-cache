@@ -95,15 +95,19 @@ PID_AFTER=$(cat "$STATE/pids/node-7211.pid")
 echo "  applied live via FLINTCONFIG; node pid unchanged ($PID_AFTER) — no restart"
 
 echo "== FLINTCONFIG dump reflects the live values"
+# The certs dir rides argv: the -c body is single-quoted, so a shell
+# variable inside it is a literal dollar string, not a path (the #180
+# scratch-root conversion put one there and this check failed on the
+# unexpanded name for every gate run after c539a0d).
 DUMP=$(python3 -c '
-import socket, ssl, os
-d="$FLINT_DRILL_ROOT/flint-cfg-state/certs"
+import socket, ssl, os, sys
+d=sys.argv[1]
 ctx=ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT); ctx.load_verify_locations(f"{d}/ca.crt")
 ctx.load_cert_chain(f"{d}/int.crt", f"{d}/int.key"); ctx.check_hostname=False
 s=ctx.wrap_socket(socket.create_connection(("127.0.0.1",7211),timeout=5),server_hostname="flint-internal")
 s.sendall(b"*1\r\n$11\r\nFLINTCONFIG\r\n")
 print(s.recv(65536).decode(errors="replace"))
-')
+' "$FLINT_DRILL_ROOT/flint-cfg-state/certs")
 echo "$DUMP" | grep -q 'wal-fsync-ms:1000' || { echo "FAIL: dump missing wal-fsync-ms:1000"; echo "$DUMP"; exit 1; }
 echo "  FLINTCONFIG dump: hot knobs reported live"
 
