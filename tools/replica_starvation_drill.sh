@@ -15,11 +15,18 @@
 #   * the replica: SIGSTOP makes its apply rate exactly zero, portably
 #     (no cgroups, no taskset — this runs the same on macOS and CI)
 #
-# WHAT IT FOUND (2026-08-16). The guard EXISTS and works — the fleets just do
-# not turn it on. With `--min-replicas-to-write 1` the master sheds (accepted
-# 104, throttled 696 of 800); with the default 0 it accepts all 800 while its
-# only replica is frozen. So run 4's lost replica was a CONFIGURATION gap, not
-# a missing mechanism, and this drill pins BOTH arms so neither can regress.
+# WHAT IT MEASURES, AND WHAT IT DOES NOT. This spawns flint-server DIRECTLY,
+# so it measures the SERVER's own bounds, not a deployed fleet's: flintctl
+# defaults `--widowed-grace-ms` to 10 s on every replicated seat, and this
+# drill passes no such flag. Arm B's "accepts everything" is therefore the
+# raw-server bound, NOT what a fleet does — do not read it as an exposure in
+# shipped clusters. (I read it that way once; see #197 for the correction.)
+#
+# The shipped bounds, for reference while reading the arms below:
+#   live but slow replica  -> lag-hard 1000 ms sheds (server default)
+#   no live replica        -> flintctl's 10 s widow grace, then sheds
+# min-replicas-to-write stays 0 by product decision: this is a cache with
+# async replication, and writes are not blocked on replica health.
 #
 # THE MECHANISM, AND WHY THE DEFAULT MATTERS. The two bounds are in different
 # currencies: the lag cap is TIME (`lag_ms`, the age of the oldest unacked
