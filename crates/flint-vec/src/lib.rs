@@ -329,6 +329,17 @@ pub enum Persist {
     Del {
         key: Vec<u8>,
     },
+    /// Add `member` to the durable id index at `key`. The index is what makes
+    /// recovery O(vectors): without it the only way to find this co-processor's
+    /// rows is to walk the tenant's whole keyspace (#194).
+    SAdd {
+        key: Vec<u8>,
+        member: Vec<u8>,
+    },
+    SRem {
+        key: Vec<u8>,
+        member: Vec<u8>,
+    },
 }
 
 /// The in-memory side of a write, applied by [`Store::commit`] only after its
@@ -364,7 +375,13 @@ pub enum Plan {
     /// `commit(apply)` and reply `ok`; on a shed/failed write reply the
     /// channel's error and leave the index untouched.
     Write {
-        persist: Persist,
+        /// EVERY command here must land before the index moves, in order.
+        /// Order is chosen for crash safety, not convenience: the index entry
+        /// goes down BEFORE the row it points at, so a crash in between leaves
+        /// a phantom id (the rebuild GETs nil and skips it) rather than a
+        /// durable row no index knows about, which would be silent data loss
+        /// that only shows up as a short corpus after the next restart.
+        persist: Vec<Persist>,
         apply: Apply,
         ok: Value,
     },
@@ -389,6 +406,60 @@ fn durable_key(kind: u8, set: &[u8], id: &[u8]) -> Vec<u8> {
         k.extend_from_slice(id);
     }
     k
+}
+
+/// How many buckets a set's id index is split across.
+///
+/// MIGRATION: vectors written by a co-processor OLDER than this index have no
+/// index entry, so a rebuild will not find them. ADR-0017 v0 calls the index
+/// the ephemeral half and the durable rows the authority, and that is still
+/// true — the rows are all still there — but the co-processor can no longer
+/// ENUMERATE them, because the only mechanism that could was the whole-
+/// namespace scan this replaced (#194). Re-SETting the corpus repopulates the
+/// index; a one-shot VEC.REINDEX is the obvious tool if that ever needs doing
+/// against a corpus too big to resend, and is deliberately not built yet.
+///
+/// The index exists to make recovery O(vectors); the BUCKETING exists so no
+/// single reply or single slot carries the whole corpus. One key per set would
+/// put every id of a 1M-vector set in one value on one node — and our SSCAN
+/// answers the whole collection in one reply, so recovery would hit the same
+/// channel-budget wall the full-namespace SCAN did, just from the other side.
+/// 256 keeps a 1M-vector set at ~4k ids per reply and spreads the write across
+/// the slot space instead of making one hot key.
+pub const INDEX_BUCKETS: u16 = 256;
+
+/// The durable index of SET NAMES (`kind = b's'`). Unbucketed on purpose: a
+/// tenant has a handful of vector sets, not millions, so this one is small.
+pub fn sets_index_key() -> Vec<u8> {
+    durable_key(b's', b"", b"")
+}
+
+/// Which bucket an id belongs to. FNV-1a, low byte — cheap, stable across
+/// processes and architectures, and it needs no distribution guarantee beyond
+/// "spreads", since a lopsided bucket costs a bigger reply and nothing else.
+pub fn bucket_of(id: &[u8]) -> u16 {
+    let mut h: u32 = 0x811c_9dc5;
+    for b in id {
+        h ^= *b as u32;
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    (h % INDEX_BUCKETS as u32) as u16
+}
+
+/// The durable id-index key for one bucket of a set (`kind = b'i'`).
+pub fn index_key(set: &[u8], bucket: u16) -> Vec<u8> {
+    durable_key(b'i', set, format!("{bucket:03}").as_bytes())
+}
+
+/// The durable config key for a set (`kind = b'c'`) — public so the rebuild can
+/// name it without re-deriving the layout.
+pub fn config_key(set: &[u8]) -> Vec<u8> {
+    durable_key(b'c', set, b"")
+}
+
+/// The durable row key for one vector (`kind = b'v'`).
+pub fn vector_key(set: &[u8], id: &[u8]) -> Vec<u8> {
+    durable_key(b'v', set, id)
 }
 
 /// Serialise a vector row for durability: an optional absolute-ms expiry header
@@ -714,12 +785,20 @@ impl Store {
             return Plan::Reply(err("ERR set already exists"));
         }
         Plan::Write {
-            persist: Persist::Put {
-                key: durable_key(b'c', set, b""),
-                val: format!("{dim}|{}|{}", metric.as_str(), index.as_str()).into_bytes(),
-                // A set's config row never expires; TTL is per-vector.
-                ttl_ms: None,
-            },
+            persist: vec![
+                // The set NAME first: recovery starts from this index, so a
+                // config row it does not list is a set the rebuild cannot find.
+                Persist::SAdd {
+                    key: sets_index_key(),
+                    member: set.to_vec(),
+                },
+                Persist::Put {
+                    key: durable_key(b'c', set, b""),
+                    val: format!("{dim}|{}|{}", metric.as_str(), index.as_str()).into_bytes(),
+                    // A set's config row never expires; TTL is per-vector.
+                    ttl_ms: None,
+                },
+            ],
             apply: Apply::CreateSet {
                 set: set.to_vec(),
                 dim,
@@ -819,11 +898,21 @@ impl Store {
             }
         }
         Plan::Write {
-            persist: Persist::Put {
-                key: durable_key(b'v', set, id),
-                val: encode_vec_row(&vec, meta.as_deref(), expires_at),
-                ttl_ms,
-            },
+            persist: vec![
+                // Index BEFORE row (see Plan::Write): a crash here leaves a
+                // phantom id the rebuild skips, never a durable vector that
+                // nothing points at. SADD is idempotent, so re-SETting an id
+                // costs a no-op rather than a duplicate.
+                Persist::SAdd {
+                    key: index_key(set, bucket_of(id)),
+                    member: id.to_vec(),
+                },
+                Persist::Put {
+                    key: durable_key(b'v', set, id),
+                    val: encode_vec_row(&vec, meta.as_deref(), expires_at),
+                    ttl_ms,
+                },
+            ],
             apply: Apply::Insert {
                 set: set.to_vec(),
                 id: id.to_vec(),
@@ -846,9 +935,18 @@ impl Store {
         };
         if vs.contains(id) {
             Plan::Write {
-                persist: Persist::Del {
-                    key: durable_key(b'v', set, id),
-                },
+                // Row first, then the index entry: a crash between them leaves
+                // a phantom id, which the rebuild skips on a nil GET. The other
+                // order would leave a row no index lists — harmless but leaked.
+                persist: vec![
+                    Persist::Del {
+                        key: durable_key(b'v', set, id),
+                    },
+                    Persist::SRem {
+                        key: index_key(set, bucket_of(id)),
+                        member: id.to_vec(),
+                    },
+                ],
                 apply: Apply::Remove {
                     set: set.to_vec(),
                     id: id.to_vec(),
@@ -1019,11 +1117,13 @@ impl Store {
         };
         let expires_at = now.saturating_add(ttl_ms);
         Plan::Write {
-            persist: Persist::Put {
+            // No index op: the id already exists, so its membership is
+            // unchanged — only the row's expiry header is being rewritten.
+            persist: vec![Persist::Put {
                 key: durable_key(b'v', set, id),
                 val: encode_vec_row(&vec, meta.as_deref(), Some(expires_at)),
                 ttl_ms: Some(ttl_ms),
-            },
+            }],
             apply: Apply::Insert {
                 set: set.to_vec(),
                 id: id.to_vec(),
@@ -1057,11 +1157,13 @@ impl Store {
             return Plan::Reply(Value::Integer(0)); // nothing to persist
         }
         Plan::Write {
-            persist: Persist::Put {
+            // No index op: the id already exists, so its membership is
+            // unchanged — only the row's expiry header is being rewritten.
+            persist: vec![Persist::Put {
                 key: durable_key(b'v', set, id),
                 val: encode_vec_row(&vec, meta.as_deref(), None),
                 ttl_ms: None,
-            },
+            }],
             apply: Apply::Insert {
                 set: set.to_vec(),
                 id: id.to_vec(),
@@ -1182,14 +1284,20 @@ mod tests {
                 "hnsw",
             ]),
         ) {
-            Plan::Write {
-                persist: Persist::Put { val, .. },
-                ..
-            } => assert!(
-                val.ends_with(b"|hnsw"),
-                "durable config must record the hnsw kind for rebuild, got {:?}",
-                String::from_utf8_lossy(&val)
-            ),
+            Plan::Write { persist, .. } => {
+                assert!(
+                    matches!(persist.first(), Some(Persist::SAdd { .. })),
+                    "the index entry must be written BEFORE the row (#194)"
+                );
+                let Some(Persist::Put { val, .. }) = persist.into_iter().nth(1) else {
+                    panic!("CREATE's second durable step must be the config row")
+                };
+                assert!(
+                    val.ends_with(b"|hnsw"),
+                    "durable config must record the hnsw kind for rebuild, got {:?}",
+                    String::from_utf8_lossy(&val)
+                );
+            }
             _ => panic!("CREATE should plan a Write"),
         }
         run(
@@ -1275,10 +1383,17 @@ mod tests {
         // caller performs the Put, THEN commits the Insert.
         match plan0(&st, b"n", &cmd(&["VEC.SET", "s", "id7", "1,2"])) {
             Plan::Write {
-                persist: Persist::Put { key, .. },
+                persist,
                 apply: Apply::Insert { id, vec, .. },
                 ok,
             } => {
+                assert!(
+                    matches!(persist.first(), Some(Persist::SAdd { .. })),
+                    "the index entry must be written BEFORE the row (#194)"
+                );
+                let Some(Persist::Put { key, .. }) = persist.into_iter().nth(1) else {
+                    panic!("SET's second durable step must be the vector row")
+                };
                 assert_eq!(key, durable_key(b'v', b"s", b"id7"));
                 assert_eq!(id, v("id7"));
                 assert_eq!(vec, vec![1.0, 2.0]);
@@ -1325,11 +1440,20 @@ mod tests {
         assert!(matches!(
             plan0(&st, ns, &cmd(&["VEC.DEL", "s", "x"])),
             Plan::Write {
-                persist: Persist::Del { .. },
+                // Row first, index entry second — the reverse would leak a
+                // durable row nothing lists (#194).
                 ok: Value::Integer(1),
                 ..
             }
         ));
+        match plan0(&st, ns, &cmd(&["VEC.DEL", "s", "x"])) {
+            Plan::Write { persist, .. } => assert!(
+                matches!(persist.first(), Some(Persist::Del { .. }))
+                    && matches!(persist.get(1), Some(Persist::SRem { .. })),
+                "DEL must drop the row THEN the index entry, got {persist:?}"
+            ),
+            _ => panic!("DEL of a present id plans a Write"),
+        }
         assert_eq!(
             run(&mut st, ns, &cmd(&["VEC.DEL", "s", "x"])),
             Value::Integer(1)
@@ -1370,6 +1494,65 @@ mod tests {
     }
 
     #[test]
+    /// The index keys must be distinguishable from the rows they index, and
+    /// from each other, or a rebuild reading one would load the other.
+    #[test]
+    fn index_keys_are_distinct_from_rows_and_from_each_other() {
+        assert!(sets_index_key().starts_with(KEY_PREFIX));
+        assert_eq!(
+            parse_durable_key(&sets_index_key()).map(|t| t.0),
+            Some(b's')
+        );
+        assert_eq!(
+            parse_durable_key(&index_key(b"docs", 7)).map(|t| t.0),
+            Some(b'i')
+        );
+        assert_eq!(
+            parse_durable_key(&vector_key(b"docs", b"7")).map(|t| t.0),
+            Some(b'v')
+        );
+        assert_eq!(
+            parse_durable_key(&config_key(b"docs")).map(|t| t.0),
+            Some(b'c')
+        );
+        // Two buckets of the same set are different keys, and bucket 7 of one
+        // set is not bucket 7 of another.
+        assert_ne!(index_key(b"docs", 7), index_key(b"docs", 8));
+        assert_ne!(index_key(b"docs", 7), index_key(b"other", 7));
+        // Fixed-width bucket labels: "007" and "070" must not collide with
+        // each other or with a set named so that the two run together.
+        assert_ne!(index_key(b"a", 7), index_key(b"a", 70));
+    }
+
+    /// Bucketing exists to bound each recovery reply, so it has to actually
+    /// SPREAD. A hash that piled ids into one bucket would pass every other
+    /// test here and reintroduce the single huge reply the buckets replaced.
+    #[test]
+    fn bucket_of_spreads_ids_across_the_index() {
+        let mut counts = std::collections::HashMap::new();
+        for i in 0..10_000u32 {
+            *counts
+                .entry(bucket_of(format!("id{i}").as_bytes()))
+                .or_insert(0u32) += 1;
+        }
+        assert!(
+            counts.len() > (INDEX_BUCKETS as usize) * 9 / 10,
+            "10k ids should reach nearly every bucket, reached {}",
+            counts.len()
+        );
+        let worst = counts.values().copied().max().unwrap_or(0);
+        // Uniform would be ~39 per bucket; 4x that is a generous ceiling and
+        // still catches a hash that clumps.
+        assert!(
+            worst < 160,
+            "worst bucket holds {worst} of 10000 ids — the hash is clumping"
+        );
+        // Stable across calls: a bucket computed at write time must be the one
+        // read at recovery time, in a DIFFERENT process.
+        assert_eq!(bucket_of(b"id42"), bucket_of(b"id42"));
+    }
+
+    #[test]
     fn durable_key_roundtrips_prefix_kind_set_id() {
         let k = durable_key(b'v', b"docs", b"42");
         assert!(k.starts_with(KEY_PREFIX));
@@ -1395,10 +1578,14 @@ mod tests {
             b"n",
             &cmd(&["VEC.CREATE", "docs", "DIM", "4", "METRIC", "cosine"]),
         ) {
-            Plan::Write {
-                persist: Persist::Put { key, val, ttl_ms },
-                ..
-            } => {
+            Plan::Write { persist, .. } => {
+                assert!(
+                    matches!(persist.first(), Some(Persist::SAdd { .. })),
+                    "the index entry must be written BEFORE the row (#194)"
+                );
+                let Some(Persist::Put { key, val, ttl_ms }) = persist.into_iter().nth(1) else {
+                    panic!("CREATE's second durable step must be the config row")
+                };
                 assert_eq!(parse_durable_key(&key), Some((b'c', v("docs"), Vec::new())));
                 assert_eq!(ttl_ms, None, "a set's config row never expires");
                 assert_eq!(
@@ -1420,10 +1607,14 @@ mod tests {
             b"n",
             &cmd(&["VEC.SET", "docs", "id9", "1,2,3,4", "META", "m!"]),
         ) {
-            Plan::Write {
-                persist: Persist::Put { key, val, ttl_ms },
-                ..
-            } => {
+            Plan::Write { persist, .. } => {
+                assert!(
+                    matches!(persist.first(), Some(Persist::SAdd { .. })),
+                    "the index entry must be written BEFORE the row (#194)"
+                );
+                let Some(Persist::Put { key, val, ttl_ms }) = persist.into_iter().nth(1) else {
+                    panic!("SET's second durable step must be the vector row")
+                };
                 assert_eq!(parse_durable_key(&key), Some((b'v', v("docs"), v("id9"))));
                 assert_eq!(ttl_ms, None, "no EX/PX given, so no data-plane TTL");
                 let (vec, meta, expires_at) = decode_vec_row(&val).expect("decode vec row");
@@ -1664,11 +1855,10 @@ mod tests {
         // row header, the Apply, AND the data-plane key's PX (so metering agrees).
         for (opt, unit, ttl) in [("EX", "5", 5000u64), ("PX", "250", 250u64)] {
             match st.plan(ns, &cmd(&["VEC.SET", "s", "x", "1,1", opt, unit]), 10_000) {
-                Plan::Write {
-                    persist: Persist::Put { val, ttl_ms, .. },
-                    apply,
-                    ..
-                } => {
+                Plan::Write { persist, apply, .. } => {
+                    let Some(Persist::Put { val, ttl_ms, .. }) = persist.into_iter().nth(1) else {
+                        panic!("SET's second durable step must be the vector row")
+                    };
                     assert_eq!(ttl_ms, Some(ttl), "{opt} sets the data-plane PX");
                     let (_, _, expires_at) = decode_vec_row(&val).expect("decode");
                     assert_eq!(expires_at, Some(10_000 + ttl), "row expiry = now + ttl");
@@ -1847,10 +2037,15 @@ mod tests {
         // The durable-row rewrite carries the new deadline + data-plane PX, so a
         // rebuild and metering agree without the vector being resent.
         match st.plan(ns, &cmd(&["VEC.EXPIRE", "s", "x", "7"]), 2_000) {
-            Plan::Write {
-                persist: Persist::Put { val, ttl_ms, .. },
-                ..
-            } => {
+            Plan::Write { persist, .. } => {
+                assert_eq!(
+                    persist.len(),
+                    1,
+                    "EXPIRE rewrites a row; membership is unchanged so it needs no index op"
+                );
+                let Some(Persist::Put { val, ttl_ms, .. }) = persist.into_iter().next() else {
+                    panic!("EXPIRE must rewrite the vector row")
+                };
                 assert_eq!(ttl_ms, Some(7000));
                 let (vec, _, expires_at) = decode_vec_row(&val).expect("decode");
                 assert_eq!(vec, vec![1.0, 2.0], "stored vector preserved across EXPIRE");

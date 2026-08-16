@@ -2104,25 +2104,50 @@ fn mint_certs(inv: &Inventory) {
 /// but its SANs come from the inventory's `edge-san` lines, so it too is
 /// correct everywhere once minted. It only goes to proxy hosts, which are the
 /// only seats that serve it.
+///
+/// The co-processor leaf is the same story one more time: server-auth only by
+/// design (ADR-0010 D2), so it goes to co-processor hosts and nowhere else.
+/// Which cert files belong on `r`, with their modes.
+///
+/// Split out as a PURE function so the answer can be asserted without a fleet.
+/// That matters more here than the tidiness suggests: push_certs skips every
+/// non-remote runner, and the local drills have nothing else, so on a laptop
+/// this code does not run AT ALL. The co-processor leaf was missing from it
+/// for a whole release and every drill stayed green, because on loopback all
+/// the seats share one certs dir and the file the seat wanted was simply
+/// already there. A table this small should not need a 12-host fleet to check.
+fn cert_manifest(inv: &Inventory, r: &Runner) -> Vec<(&'static str, &'static str)> {
+    // The mesh trio, everywhere: internal dials verify a FIXED name, so one
+    // leaf is correct on every host.
+    let mut out = vec![("ca.crt", "644"), ("int.crt", "644"), ("int.key", "600")];
+    // The edge pair, to proxy hosts, only when clients speak TLS.
+    if inv.client_tls && (0..inv.proxies.len()).any(|i| &proxy_runner(inv, i) == r) {
+        out.push(("edge.crt", "644"));
+        out.push(("edge.key", "600"));
+    }
+    // The co-processor leaf, to co-processor hosts. NOT gated on client_tls
+    // the way the edge pair is: this is a MESH leaf, the seat is spawned with
+    // --internal-cert pointing at it whenever a co-processor is declared, and
+    // push_certs only runs when tls is on at all. Omitting it is not a
+    // degraded mode — the seat panics on the missing file at startup and every
+    // family command then answers -COPROCUNAVAIL, which reads like a routing
+    // fault and is not one.
+    if (0..inv.coprocs.len()).any(|i| &coproc_runner(inv, i) == r) {
+        out.push(("coproc.crt", "644"));
+        out.push(("coproc.key", "600"));
+    }
+    out
+}
+
 fn push_certs(inv: &Inventory) {
     let d = format!("{}/certs", inv.statedir);
-    let proxy_hosts: Vec<Runner> = (0..inv.proxies.len())
-        .map(|i| proxy_runner(inv, i))
-        .collect();
     for r in all_runners(inv) {
         if !r.is_remote() {
             continue;
         }
-        for (f, mode) in [("ca.crt", "644"), ("int.crt", "644"), ("int.key", "600")] {
+        for (f, mode) in cert_manifest(inv, &r) {
             if let Err(e) = r.send_file(&format!("{d}/{f}"), &format!("{d}/{f}"), mode) {
                 die(&format!("distributing {f} to {}: {e}", r.label()));
-            }
-        }
-        if inv.client_tls && proxy_hosts.contains(&r) {
-            for (f, mode) in [("edge.crt", "644"), ("edge.key", "600")] {
-                if let Err(e) = r.send_file(&format!("{d}/{f}"), &format!("{d}/{f}"), mode) {
-                    die(&format!("distributing {f} to {}: {e}", r.label()));
-                }
             }
         }
         eprintln!("  certs -> {}", r.label());
@@ -5989,5 +6014,120 @@ mod proxy_liveness_tests {
         assert!(!is_noauth_error("timed out"));
         assert!(!is_noauth_error("WRONGPASS invalid token"));
         assert!(!is_noauth_error(""));
+    }
+}
+
+#[cfg(test)]
+mod cert_manifest_tests {
+    use super::*;
+    use std::io::Write;
+
+    /// Write an inventory and parse it, so the test exercises the same path a
+    /// fleet does rather than hand-building an Inventory whose fields could
+    /// drift away from the parser.
+    fn inv_from(body: &str, name: &str) -> Inventory {
+        let p = std::env::temp_dir().join(format!("flint-certman-{name}.flint"));
+        let mut f = std::fs::File::create(&p).expect("write inventory");
+        f.write_all(body.as_bytes()).expect("write inventory");
+        parse_inventory(p.to_str().expect("utf8 path"))
+    }
+
+    /// THE REGRESSION. A co-processor host must receive the co-processor leaf.
+    ///
+    /// It did not, for a whole release: push_certs had a case for the mesh
+    /// trio (everywhere) and the edge pair (proxy hosts) and none for the
+    /// co-processor. flintctl mints the leaf and then spawns the seat with
+    /// --internal-cert pointing at a file that was never sent, so the seat
+    /// panics at startup and every family command answers -COPROCUNAVAIL.
+    /// Found on a 12-host fleet on 2026-08-16; invisible to every local drill,
+    /// because on loopback all the seats share one certs dir and the file the
+    /// seat wanted happened to be sitting there already.
+    #[test]
+    fn a_coproc_host_gets_the_coproc_leaf() {
+        let inv = inv_from(
+            "statedir /var/lib/flint\n\
+             bins /opt/flint/bin\n\
+             tls on\n\
+             ssh-user ec2-user\n\
+             cp 10.0.0.1:7500\n\
+             pair 10.0.0.2:7001,10.0.0.3:7002\n\
+             proxy 0.0.0.0:7379\n\
+             proxy-host 10.0.0.4\n\
+             coproc VEC. 10.0.0.5:7411\n",
+            "coproc",
+        );
+        let files: Vec<&str> = cert_manifest(&inv, &coproc_runner(&inv, 0))
+            .into_iter()
+            .map(|(f, _)| f)
+            .collect();
+        assert!(
+            files.contains(&"coproc.crt") && files.contains(&"coproc.key"),
+            "a co-processor host must get its leaf; got {files:?}"
+        );
+        // The KEY must not be world-readable: it is an identity, and the mesh
+        // trio next to it already gets this right for int.key.
+        let mode = cert_manifest(&inv, &coproc_runner(&inv, 0))
+            .into_iter()
+            .find(|(f, _)| *f == "coproc.key")
+            .map(|(_, m)| m);
+        assert_eq!(mode, Some("600"), "the co-processor key must be 600");
+    }
+
+    /// ...and ONLY a co-processor host. The leaf is server-auth only by design
+    /// (ADR-0010 D2) precisely so a co-processor cannot dial the mesh as a
+    /// peer; shipping it to every host would quietly hand that isolation away
+    /// while every test still passed.
+    #[test]
+    fn other_hosts_do_not_get_the_coproc_leaf() {
+        let inv = inv_from(
+            "statedir /var/lib/flint\n\
+             bins /opt/flint/bin\n\
+             tls on\n\
+             ssh-user ec2-user\n\
+             cp 10.0.0.1:7500\n\
+             pair 10.0.0.2:7001,10.0.0.3:7002\n\
+             proxy 0.0.0.0:7379\n\
+             proxy-host 10.0.0.4\n\
+             coproc VEC. 10.0.0.5:7411\n",
+            "other",
+        );
+        for addr in ["10.0.0.1:7500", "10.0.0.2:7001", "10.0.0.4:7379"] {
+            let files: Vec<&str> = cert_manifest(&inv, &runner_for(&inv, addr))
+                .into_iter()
+                .map(|(f, _)| f)
+                .collect();
+            assert!(
+                !files.contains(&"coproc.key"),
+                "{addr} must NOT hold the co-processor leaf; got {files:?}"
+            );
+            // Positive control: the same call DOES return the mesh trio, so a
+            // vacuously-empty manifest cannot make the assertion above pass.
+            assert!(
+                files.contains(&"int.key"),
+                "{addr} should still get the mesh leaf; got {files:?}"
+            );
+        }
+    }
+
+    /// A fleet with no co-processor is unchanged — the manifest is exactly the
+    /// mesh trio, so this fix cannot have widened what an ordinary host holds.
+    #[test]
+    fn a_fleet_without_a_coproc_ships_only_the_mesh_trio() {
+        let inv = inv_from(
+            "statedir /var/lib/flint\n\
+             bins /opt/flint/bin\n\
+             tls on\n\
+             ssh-user ec2-user\n\
+             cp 10.0.0.1:7500\n\
+             pair 10.0.0.2:7001,10.0.0.3:7002\n\
+             proxy 0.0.0.0:7379\n\
+             proxy-host 10.0.0.4\n",
+            "nocoproc",
+        );
+        let files: Vec<&str> = cert_manifest(&inv, &runner_for(&inv, "10.0.0.4:7379"))
+            .into_iter()
+            .map(|(f, _)| f)
+            .collect();
+        assert_eq!(files, vec!["ca.crt", "int.crt", "int.key"]);
     }
 }

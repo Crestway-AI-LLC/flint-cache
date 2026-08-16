@@ -36,7 +36,7 @@
 
 use flint_resp::{Decoded, Value, decode, encode};
 use flint_vec::{
-    Apply, IndexKind, KEY_PREFIX, Metric, Persist, Plan, Store, decode_config, decode_vec_row,
+    Apply, IndexKind, Metric, Persist, Plan, Store, decode_config, decode_vec_row,
     parse_durable_key,
 };
 use std::collections::HashMap;
@@ -409,36 +409,37 @@ fn rebuild_chunk_inner(
         return Err(format!("channel refused: {e}"));
     }
 
-    // Phase 1 (first chunk only): SCAN the whole namespace, keep the reserved-
-    // prefix keys, and order them configs-before-vectors so a set exists before
-    // its Inserts commit — an ordering that must hold ACROSS chunks, hence one
-    // global sort here rather than per page. The SCAN must fit one channel (keys
-    // are tens of bytes; the vectors that dominate the budget come later); a set
-    // whose key list alone overflows a channel surfaces as a raise-the-budget
-    // error, never a silent partial.
+    // Phase 1 (first chunk only): build the key list from the co-processor's OWN
+    // durable indexes, configs before vectors so a set exists before its Inserts
+    // commit.
+    //
+    // This USED TO SCAN THE WHOLE NAMESPACE and keep the reserved-prefix keys,
+    // which made recovery cost the size of the TENANT rather than the number of
+    // vectors. Beside a 500 GB data plane that is ~500M keys: the seat sat in
+    // -LOADING until it tripped the per-channel SCAN budget, so a co-processor
+    // could never come back on any fleet big enough to want one — and restart
+    // is every upgrade, every host replacement, every OOM (#194). A prefix seek
+    // cannot fix it either: keys are encoded <ns><slot><user key> and the slot
+    // is a hash, so rows sharing a user-key prefix share no physical range.
+    //
+    // So the co-processor keeps its own index instead: a set of set NAMES, and
+    // per set an id index split across INDEX_BUCKETS keys. Reads are bounded
+    // (a bucket, not a corpus) and spread across slots (no hot key).
     let keys = match keys {
         Some(k) => k,
         None => {
-            let mut cursor = b"0".to_vec();
-            let mut all: Vec<Vec<u8>> = Vec::new();
-            loop {
-                let (nc, page) = scan_page(&mut ch, &cursor).map_err(|e| {
-                    if e.contains("budget") {
-                        format!(
-                            "the namespace key list exceeds one channel's SCAN budget ({e}); raise --family-budget"
-                        )
-                    } else {
-                        e
+            let mut configs: Vec<Vec<u8>> = Vec::new();
+            let mut vectors: Vec<Vec<u8>> = Vec::new();
+            for set in smembers(&mut ch, &flint_vec::sets_index_key())? {
+                configs.push(flint_vec::config_key(&set));
+                for b in 0..flint_vec::INDEX_BUCKETS {
+                    for id in smembers(&mut ch, &flint_vec::index_key(&set, b))? {
+                        vectors.push(flint_vec::vector_key(&set, &id));
                     }
-                })?;
-                all.extend(page.into_iter().filter(|k| k.starts_with(KEY_PREFIX)));
-                if nc == b"0" {
-                    break;
                 }
-                cursor = nc;
             }
-            all.sort_by_key(|k| !matches!(parse_durable_key(k), Some((b'c', _, _))));
-            all
+            configs.extend(vectors);
+            configs
         }
     };
 
@@ -532,29 +533,22 @@ fn install(
     n
 }
 
-/// One SCAN page over the channel: `(next_cursor, keys)`.
-fn scan_page(ch: &mut flint_tls::Stream, cursor: &[u8]) -> Result<(Vec<u8>, Vec<Vec<u8>>), String> {
-    send_cmd(ch, &[b"SCAN", cursor, b"COUNT", b"512"]).map_err(|e| format!("SCAN: {e}"))?;
-    match read_reply(ch).map_err(|e| format!("SCAN: {e}"))? {
-        Value::Array(Some(items)) if items.len() == 2 => {
-            let next = match &items[0] {
-                Value::Bulk(Some(b)) => b.clone(),
-                _ => return Err("SCAN cursor not a bulk string".into()),
-            };
-            let keys = match &items[1] {
-                Value::Array(Some(ks)) => ks
-                    .iter()
-                    .filter_map(|k| match k {
-                        Value::Bulk(Some(b)) => Some(b.clone()),
-                        _ => None,
-                    })
-                    .collect(),
-                _ => return Err("SCAN keys not an array".into()),
-            };
-            Ok((next, keys))
-        }
-        Value::Error(e) => Err(format!("SCAN rejected: {e}")),
-        _ => Err("SCAN unexpected reply".into()),
+/// Every member of a durable index key. A MISSING key is an empty set, not an
+/// error: a set with no vectors in a given bucket is the ordinary case, and
+/// there are INDEX_BUCKETS of them per set.
+fn smembers(ch: &mut flint_tls::Stream, key: &[u8]) -> Result<Vec<Vec<u8>>, String> {
+    send_cmd(ch, &[b"SMEMBERS", key]).map_err(|e| format!("SMEMBERS: {e}"))?;
+    match read_reply(ch).map_err(|e| format!("SMEMBERS: {e}"))? {
+        Value::Array(Some(items)) => Ok(items
+            .into_iter()
+            .filter_map(|v| match v {
+                Value::Bulk(Some(b)) => Some(b),
+                _ => None,
+            })
+            .collect()),
+        Value::Array(None) => Ok(Vec::new()),
+        Value::Error(e) => Err(format!("SMEMBERS rejected: {e}")),
+        _ => Err("SMEMBERS unexpected reply".into()),
     }
 }
 
@@ -564,7 +558,7 @@ fn scan_page(ch: &mut flint_tls::Stream, cursor: &[u8]) -> Result<(Vec<u8>, Vec<
 fn perform_persist(
     callback: &[u8],
     token: &[u8],
-    persist: &Persist,
+    persist: &[Persist],
     edge: &Option<Arc<flint_tls::ClientConfig>>,
 ) -> Result<(), Value> {
     let addr = std::str::from_utf8(callback).map_err(|_| err("ERR bad callback address"))?;
@@ -585,29 +579,37 @@ fn perform_persist(
     // the same deadline the index does — the data-plane key's own metering and
     // quota reclamation then come for free. `ttl_buf` outlives the borrow in the
     // command vector.
-    let ttl_buf;
-    let dcmd: Vec<&[u8]> = match persist {
-        Persist::Put {
-            key,
-            val,
-            ttl_ms: Some(ms),
-        } => {
-            ttl_buf = ms.to_string().into_bytes();
-            vec![b"SET", key, val, b"PX", &ttl_buf]
-        }
-        Persist::Put { key, val, .. } => vec![b"SET", key, val],
-        Persist::Del { key } => vec![b"DEL", key],
-    };
-    send_cmd(&mut ch, &dcmd)
-        .map_err(|e| err(&format!("COPROCUNAVAIL channel write failed: {e}")))?;
-    match read_reply(&mut ch)
-        .map_err(|e| err(&format!("COPROCUNAVAIL channel write failed: {e}")))?
-    {
+    // A write is a SEQUENCE now (the id index plus the row), and every command
+    // must land before the caller commits to the index. Executed in order and
+    // aborted on the first error: the orders are chosen so that stopping part
+    // way leaves a recoverable state (see Plan::Write).
+    for step in persist {
+        let ttl_buf;
+        let dcmd: Vec<&[u8]> = match step {
+            Persist::Put {
+                key,
+                val,
+                ttl_ms: Some(ms),
+            } => {
+                ttl_buf = ms.to_string().into_bytes();
+                vec![b"SET", key, val, b"PX", &ttl_buf]
+            }
+            Persist::Put { key, val, .. } => vec![b"SET", key, val],
+            Persist::Del { key } => vec![b"DEL", key],
+            Persist::SAdd { key, member } => vec![b"SADD", key, member],
+            Persist::SRem { key, member } => vec![b"SREM", key, member],
+        };
+        send_cmd(&mut ch, &dcmd)
+            .map_err(|e| err(&format!("COPROCUNAVAIL channel write failed: {e}")))?;
         // Relay the channel's own error verbatim — a -QUOTA (over storage quota)
         // is a truer, more actionable answer than a blanket COPROCUNAVAIL.
-        r @ Value::Error(_) => Err(r),
-        _ => Ok(()),
+        if let r @ Value::Error(_) = read_reply(&mut ch)
+            .map_err(|e| err(&format!("COPROCUNAVAIL channel write failed: {e}")))?
+        {
+            return Err(r);
+        }
     }
+    Ok(())
 }
 
 fn send_cmd(ch: &mut flint_tls::Stream, parts: &[&[u8]]) -> std::io::Result<()> {
