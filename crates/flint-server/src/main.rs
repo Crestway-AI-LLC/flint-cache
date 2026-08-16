@@ -712,7 +712,7 @@ fn main() -> std::io::Result<()> {
                         match std::fs::remove_dir_all(&dir_path) {
                             Ok(()) => {}
                             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                            Err(e) => return Err(e.into()),
+                            Err(e) => return Err(e),
                         }
                     }
                 } else {
