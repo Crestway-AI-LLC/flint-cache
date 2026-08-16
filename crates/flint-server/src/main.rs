@@ -134,6 +134,36 @@ fn parse_rewind_candidate(name: &str) -> Option<(u64, flint_storage::manifest::E
     ))
 }
 
+/// Ask `target` whether a copy at (`cursor`, `epoch`) can resume tailing its
+/// lineage — the exact FLINTSYNC handshake the tailer would send, dropped
+/// after the first reply. The master runs its full admission logic (fence
+/// check, cursor translation, WAL-span retention) and answers before any
+/// batch ships, so a refusal here is cheap where the same refusal at the
+/// tailer's first attach is not: by then the boot has committed to the copy,
+/// consumed the marker, and the tailer's WALGAP escalation EXITS a process
+/// that, in a fleet, nothing restarts (soak run 34 cycle 6).
+#[cfg(feature = "rocks")]
+fn probe_resume(
+    target: &str,
+    cursor: u64,
+    epoch: flint_storage::manifest::Epoch,
+) -> Result<(), String> {
+    match internal_call_once(
+        target,
+        &[
+            b"FLINTSYNC",
+            cursor.to_string().as_bytes(),
+            epoch.generation.to_string().as_bytes(),
+            epoch.counter.to_string().as_bytes(),
+        ],
+    ) {
+        Ok(Value::Simple(s)) if s.starts_with("FLINTSYNC-OK") => Ok(()),
+        Ok(Value::Error(e)) => Err(e),
+        Ok(other) => Err(format!("unexpected reply {other:?}")),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 /// The rewind rejoin (#187): instead of discarding a superseded copy and
 /// full re-seeding — a transfer that grows with the dataset while the new
 /// master's write gates hold every write — replace the data dir with this
@@ -261,7 +291,7 @@ fn try_rewind(data_dir: &std::path::Path, snaps_dir: &str, target: &str) -> bool
         // "fully staffed" and SINGLE-COPY at once. Reasserting replica
         // identity (and the cursor) here closes the window: any boot of
         // this dir, marker or not, is a replica that tails.
-        match flint_storage::rocks::RocksKv::open(data_dir) {
+        let restored_cursor = match flint_storage::rocks::RocksKv::open(data_dir) {
             Ok(kv) => {
                 use flint_storage::manifest::{self, Role, RoleClaim};
                 let cursor = kv.latest_seq();
@@ -279,9 +309,29 @@ fn try_rewind(data_dir: &std::path::Path, snaps_dir: &str, target: &str) -> bool
                     },
                 );
                 drop(kv);
+                cursor
             }
             Err(e) => {
                 eprintln!("rewind: restored copy does not open ({e}); full re-seed");
+                let _ = std::fs::remove_dir_all(data_dir);
+                return false;
+            }
+        };
+        // The fence vouched for the snapshot's PAST; nothing above vouched
+        // for its FUTURE — the catch-up span from the snapshot to the
+        // master's tip must still be in the master's WAL. A replica takes
+        // no snapshots, so its newest labeled snapshot dates from its LAST
+        // MASTERSHIP and ages without bound; soak run 34 cycle 6 rewound a
+        // caught-up replica to a 15-minute-old snapshot whose catch-up span
+        // the master had long recycled, and the seat died on the attach's
+        // WALGAP where a probe here would have chosen the re-seed while it
+        // was still cheap to choose.
+        match probe_resume(target, restored_cursor, epoch) {
+            Ok(()) => {}
+            Err(e) => {
+                eprintln!(
+                    "rewind: {target} refused the restored copy at attach ({e}); full re-seed"
+                );
                 let _ = std::fs::remove_dir_all(data_dir);
                 return false;
             }
@@ -714,7 +764,49 @@ fn main() -> std::io::Result<()> {
                         .unwrap_or_default()
                         .trim()
                         .to_string();
-                    // Rewind first (#187): the marker says this copy's TAIL
+                    // VERIFY the copy as-is before touching it. The marker
+                    // means "this copy cannot be trusted BLINDLY", not "this
+                    // copy is trash": flintctl marks every dead seat because
+                    // a corpse's role cannot be observed, so the common
+                    // marked boot is a killed REPLICA whose dir is a valid
+                    // near-tip copy of the lineage it is rejoining. The
+                    // master's admission logic can vet that copy exactly the
+                    // way it vets a rewound snapshot — one handshake, no
+                    // bytes moved. Skipping this and rewinding instead moves
+                    // a caught-up replica BACKWARD to its last-mastership
+                    // snapshot, which ages without bound (replicas take no
+                    // snapshots): soak run 34 cycle 6 rewound one 15 minutes
+                    // into the past and the catch-up span was already gone
+                    // from the master's WAL. Ex-masters never pass this
+                    // probe by construction — their durable role is Master,
+                    // and a master-role dir must go through the fence-
+                    // checked rewind below (#107's contract, unchanged).
+                    let mut warm = false;
+                    if let Ok(kv) = flint_storage::rocks::RocksKv::open(&dir_path) {
+                        use flint_storage::manifest::{self, Role};
+                        if let Some(claim) = manifest::read_role(&kv)
+                            && claim.role == Role::Replica
+                        {
+                            let cursor = kv.last_applied();
+                            drop(kv);
+                            match probe_resume(target, cursor, claim.epoch) {
+                                Ok(()) => {
+                                    clear_needs_reseed(&dir_path);
+                                    eprintln!(
+                                        "marked copy verified against the lineage held by \
+                                         {target}: warm rejoin at seq {cursor} (epoch {})",
+                                        claim.epoch
+                                    );
+                                    warm = true;
+                                }
+                                Err(e) => eprintln!(
+                                    "marked copy refused by {target} ({e}); trying a rewind"
+                                ),
+                            }
+                        }
+                    }
+                    rewound = warm;
+                    // Rewind next (#187): the marker says this copy's TAIL
                     // cannot be continued, but a local snapshot from before
                     // the branch point still can — and restoring one costs
                     // hard links, where the full re-seed costs the whole
@@ -723,7 +815,8 @@ fn main() -> std::io::Result<()> {
                     // already REFUSED a rewound cursor ("promotion fence")
                     // must not retry the same snapshot forever, so it goes
                     // straight to the re-seed.
-                    if !why.contains("promotion fence")
+                    if !warm
+                        && !why.contains("promotion fence")
                         && let Some(snaps) = arg("--rewind-snaps")
                     {
                         rewound = try_rewind(&dir_path, &snaps, target);
@@ -837,7 +930,13 @@ fn main() -> std::io::Result<()> {
                     .map_err(|e| std::io::Error::other(format!("cursor init: {e:?}")))?;
                 eprintln!("full sync complete; tailing from seq {cursor}");
             } else if rewound {
-                eprintln!("rewind complete; tailing from seq {}", kv.last_applied());
+                // Covers both marked-rejoin continuations: a verified warm
+                // copy and a fence-checked rewind ("rewound to" names the
+                // second in try_rewind's own log line).
+                eprintln!(
+                    "marked rejoin continues; tailing from seq {}",
+                    kv.last_applied()
+                );
             }
             // Initialize the manifest on first boot: default slot claim
             // and a role claim at epoch (0,1).

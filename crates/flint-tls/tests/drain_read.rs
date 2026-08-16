@@ -14,9 +14,10 @@
 //! directions until the kernel refuses more, proves the coupled jam exists
 //! (the plain read returns WouldBlock despite inbound data waiting — the
 //! positive control), and then proves drain_read reads through it.
+#![allow(clippy::unwrap_used)]
 
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpListener;
 use std::time::Duration;
 
 fn mint(dir: &std::path::Path) -> (String, String, String) {

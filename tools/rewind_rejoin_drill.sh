@@ -122,6 +122,40 @@ grep -q "adopted the master's role epoch (0,2)" "$D/a2.log" || {
 [ "$(valkey-cli -p 6405 GET pre:300)" = "v300" ] || { echo "FAIL: pre-snapshot key missing on A"; exit 1; }
 echo "  A rewound, adopted (0,2), converged: new-timeline and snapshot-base keys both served"
 
+echo "== arm C: a marked REPLICA must rejoin WARM — no rewind, no re-seed"
+# flintctl marks every dead seat (a corpse's role is unobservable), so the
+# most common marked boot is a killed replica whose dir is a valid near-tip
+# copy. Discarding or rewinding it moves the copy BACKWARD — to a last-
+# mastership snapshot that ages without bound, because replicas take no
+# snapshots. Soak run 34 cycle 6: a 15-minute-stale rewind target whose
+# catch-up span the master's WAL had recycled, and a dead seat. The boot now
+# VERIFIES the copy against the master first (the same FLINTSYNC admission a
+# tailer gets) and continues from its own cursor when the lineage vouches.
+kill -9 "$(pgrep -f "flint-server --port 6405" | head -1)" 2>/dev/null
+sleep 0.3
+for i in $(seq 51 80); do valkey-cli -p 6406 SET "post:$i" "n$i" >/dev/null; done
+echo "drill: superseded copy rejoining" > "$D/a/NEEDS_RESEED"
+$B --port 6405 --engine rocks --data-dir "$D/a" --replica-of 127.0.0.1:6406 \
+   --rewind-snaps "$D/snaps-a" >"$D/awarm.log" 2>&1 &
+fleet_wait_listen 6405
+grep -q "warm rejoin at seq" "$D/awarm.log" || {
+  echo "FAIL: marked replica did not rejoin warm. Boot log:"
+  sed 's/^/    /' "$D/awarm.log"; exit 1
+}
+grep -q "rewound to" "$D/awarm.log" && {
+  echo "FAIL: a valid near-tip replica was REWOUND — the copy moved backward"
+  echo "      for no reason, and on a fleet the rewind target can be"
+  echo "      arbitrarily stale (run 34 cycle 6)"; exit 1
+}
+grep -q "full sync: received" "$D/awarm.log" && {
+  echo "FAIL: a valid near-tip replica was RE-SEEDED — the marker was treated"
+  echo "      as a wipe order instead of a verification order"; exit 1
+}
+BTIP=$(valkey-cli -p 6406 FLINTINFO | tr '\r' '\n' | sed -n 's/^latest_seq://p')
+wait_seq 6405 "$BTIP" || { echo "FAIL: warm-rejoined A never converged"; exit 1; }
+[ "$(valkey-cli -p 6405 GET post:80)" = "n80" ] || { echo "FAIL: post-kill key missing after warm rejoin"; exit 1; }
+echo "  A verified against B and rejoined warm from its own cursor"
+
 echo "== protocol probe: a cursor past the fence is refused server-side"
 PROBE=$(valkey-cli -p 6406 FLINTSYNC 999999999 0 1 2>&1)
 echo "$PROBE" | grep -q "promotion fence" || {
