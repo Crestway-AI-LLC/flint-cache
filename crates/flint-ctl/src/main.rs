@@ -1187,39 +1187,10 @@ fn spawn(inv: &Inventory, r: &Runner, name: &str, bin: &str, args: &[String]) {
     spawn_env(inv, r, name, bin, args, &[]);
 }
 
-/// Discard a node's data dir ON THE HOST THAT HOLDS IT.
-///
-/// This was the last local-filesystem call still aimed at a remote seat, and
-/// it failed in the quietest possible way: `remove_dir_all` on the
-/// orchestrator deleted nothing (the path is not there), returned the `()` it
-/// always returns, and the caller carried on believing the seat had been
-/// wiped. The seat then rebooted on its OLD data, whose durable role still
-/// said master — so it came up as a master, the controller fenced it, and it
-/// sat demoted-but-unseeded forever because the demote contract's wipe had
-/// already "happened".
-fn wipe_node(inv: &Inventory, r: &Runner, port: u16) -> Result<(), String> {
-    let dir = format!("{}/node-{port}", inv.statedir);
-    if r.is_remote() {
-        let argv = vec![
-            format!("{}/flintctl", inv.bins),
-            "host-wipe-node".into(),
-            inv.statedir.clone(),
-            format!("node-{port}"),
-        ];
-        let out = r
-            .output(&argv)
-            .map_err(|e| format!("wipe {dir} on {}: {e}", r.label()))?;
-        if !out.status.success() {
-            return Err(format!(
-                "wipe {dir} on {}: {}",
-                r.label(),
-                String::from_utf8_lossy(&out.stderr).trim()
-            ));
-        }
-        return Ok(());
-    }
-    local_wipe_node(&inv.statedir, &format!("node-{port}"))
-}
+// wipe_node (the orchestrator-side wrapper) is gone: every rejoin path now
+// writes the NEEDS_RESEED marker instead (#187/#190) and lets the server
+// choose rewind-or-reseed. `host-wipe-node` and local_wipe_node stay — the
+// remote dispatch surface must keep serving an older orchestrator's calls.
 
 /// Remove one seat's data dir. Refuses anything that is not a node dir under
 /// the given statedir — this runs as root over ssh, so a malformed name must
@@ -4329,10 +4300,21 @@ fn roll_node(
         // Ex-masters NEVER warm-rejoin, even durably demoted: their
         // replication cursor is an ex-master's (not a tail position) and
         // their unreplicated suffix may have diverged from the new lineage.
-        // The demote contract is wipe + checkpoint resync; flintctl knows it
-        // just demoted this seat, so it applies the contract itself.
+        // The MARKER (not a wipe, #187/#190) hands the server the same
+        // contract with a cheap continuation: rewind to a local snapshot the
+        // master vouches for, or discard and full-sync when none exists —
+        // the exact behaviour the wipe used to force every time. Soak run 29
+        // measured the difference this path makes: its chaos driver restarts
+        // seats through restart-node -> HERE, so every mid-soak rejoin was
+        // still a full re-seed (97 files, 73s of shed writes) while the
+        // bring-up's `start` path rewound in under a second.
         std::thread::sleep(Duration::from_millis(300));
-        wipe_node(inv, &runner_for(inv, addr), port)?;
+        mark_reseed_node(
+            inv,
+            &runner_for(inv, addr),
+            port,
+            &format!("superseded copy rejoining the lineage held by {master}"),
+        )?;
     }
     let mut args = vec![
         "--port".to_string(),
@@ -4348,6 +4330,11 @@ fn roll_node(
         "--replica-of".into(),
         master.to_string(),
     ];
+    // The pair's snapshot dir on this seat's host, so a marked rejoin can
+    // rewind (same plumbing as start_pair_nodes).
+    if let Some(gi) = inv.pairs.iter().position(|p| p.iter().any(|a| a == addr)) {
+        args.extend(["--rewind-snaps".into(), format!("{d}/snaps/g{gi}")]);
+    }
     args.extend(internal_args(inv));
     // Spawned with --replica-of: a pair member by construction.
     args.extend(node_tuning_args(inv, true));
