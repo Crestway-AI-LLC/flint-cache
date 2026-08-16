@@ -229,12 +229,27 @@ impl RocksKv {
     ///
     /// The mapping is already durable in this node's WAL: every apply batch
     /// ends with the cursor-row put whose VALUE is the upstream seq it
-    /// reached. Scan forward from `upstream_seq` (own-space is always >=
-    /// upstream-space, the drift is non-negative) until the first apply
+    /// reached. Scan the retained WAL from its start until the FIRST apply
     /// batch that reached `upstream_seq`, and return that batch's own-space
     /// last seq — the position a tailer of THIS node resumes from. A scan
     /// that runs out of WAL or past the applies without finding the cursor
     /// row is a WalGap: the caller full-syncs, the safe default.
+    ///
+    /// From the START, not from `upstream_seq`. The first version began at
+    /// `get_updates_since(upstream_seq - 1)` on the assumption that
+    /// own-space always runs AHEAD of upstream-space (every apply batch
+    /// adds a cursor row). That holds only for a node whose whole history
+    /// is applies of that one stream. A node that REWOUND to its own
+    /// older-space snapshot tails a lineage whose numbers dwarf its own —
+    /// soak run 35 cycle 4: own tip 2.6M, upstream cursor 6.08M — so the
+    /// "optimized" start pointed past the end of this WAL, RocksDB said
+    /// "not yet written", and a perfectly mappable cursor was refused into
+    /// a 49-second full re-seed with the widow gate holding every write.
+    /// And when own-space has grown past the number again (a later
+    /// mastership), the same start lands BEYOND the mapping row and either
+    /// misses it or finds a later epoch's row — a silent overshoot. The
+    /// full scan is bounded by WAL retention and paid once per rewind
+    /// attach; correctness is worth it.
     pub fn own_seq_for_upstream(&self, upstream_seq: u64) -> Result<u64, ReplError> {
         struct CursorFind {
             seq: u64,
@@ -253,7 +268,7 @@ impl RocksKv {
         }
         let iter = self
             .db()
-            .get_updates_since(upstream_seq.saturating_sub(1))
+            .get_updates_since(0)
             .map_err(|e| ReplError::WalGap(e.to_string()))?;
         for item in iter {
             let (first_seq, batch) = item.map_err(|e| ReplError::Storage(e.to_string()))?;
@@ -663,6 +678,72 @@ mod tests {
                 .updates_since(replica.last_applied())
                 .expect("tail")
                 .is_empty()
+        );
+    }
+
+    /// Soak run 35 cycle 4: a node that rewound to its own older-space
+    /// snapshot tails a lineage whose numbers dwarf its own — its cursor
+    /// rows carry values in the MILLIONS while its RocksDB seqs are in the
+    /// tens. `own_seq_for_upstream` must still find the mapping row; the
+    /// original scan started at `get_updates_since(upstream_seq - 1)`,
+    /// which on this shape points past the end of the WAL entirely, and a
+    /// perfectly mappable cursor was refused into a 49-second full re-seed.
+    #[test]
+    fn own_seq_maps_an_upstream_space_far_ahead_of_our_own() {
+        let d = TempDir::new("map-behind");
+        let kv = RocksKv::open(&d.0).expect("open");
+        // This node's cursor sits at 6M in its upstream's space; its own
+        // seqs start near zero.
+        kv.set_last_applied(6_000_000).expect("cursor");
+        let b1 = ReplBatch {
+            first_seq: 6_000_001,
+            last_seq: 6_000_002,
+            ops: vec![
+                ReplOp::Put {
+                    key: b"Ma".to_vec(),
+                    value: b"1".to_vec(),
+                },
+                ReplOp::Put {
+                    key: b"Mb".to_vec(),
+                    value: b"2".to_vec(),
+                },
+            ],
+        };
+        kv.apply_batch(&b1).expect("apply b1");
+        let b2 = ReplBatch {
+            first_seq: 6_000_003,
+            last_seq: 6_000_004,
+            ops: vec![ReplOp::Put {
+                key: b"Mc".to_vec(),
+                value: b"3".to_vec(),
+            }],
+        };
+        kv.apply_batch(&b2).expect("apply b2");
+
+        // Map the position b1 reached. The answer is b1's OWN last seq —
+        // a single-digit number — and serving from it must hand b2 next.
+        let own = kv
+            .own_seq_for_upstream(6_000_002)
+            .expect("a retained mapping row must be found regardless of the spaces' offset");
+        assert!(
+            own < kv.latest_seq(),
+            "own-space position must be a local seq, got {own} (latest {})",
+            kv.latest_seq()
+        );
+        let next = kv.updates_since(own).expect("serve from mapped position");
+        assert!(
+            next.iter().flat_map(|b| &b.ops).any(|op| matches!(
+                op,
+                ReplOp::Put { key, .. } if key == b"Mc"
+            )),
+            "serving from the mapped position must deliver exactly the ops after it"
+        );
+        assert!(
+            !next.iter().flat_map(|b| &b.ops).any(|op| matches!(
+                op,
+                ReplOp::Put { key, .. } if key == b"Ma"
+            )),
+            "ops at or before the mapped position must not replay"
         );
     }
 }
