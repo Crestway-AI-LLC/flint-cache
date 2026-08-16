@@ -250,8 +250,36 @@ fn try_rewind(data_dir: &std::path::Path, snaps_dir: &str, target: &str) -> bool
         // DOWN until an operator notices (how soak run 28's bring-up died:
         // one unopenable state and the recovery check timed out at 180s).
         // Open-drop-open is safe — the lock releases on drop.
+        //
+        // And make the copy SAFE BY CONSTRUCTION while it is open: the
+        // snapshot carries its taker's MASTER role row, and the swap above
+        // consumed the marker. A kill landing between here and the boot's
+        // own reassert would otherwise leave a master-role dir with no
+        // marker — whose next start says "durable role is master; ignoring
+        // --replica-of", gets fenced by the controller as a zombie, and
+        // then sits as a demoted, never-tailing replica: a pair that is
+        // "fully staffed" and SINGLE-COPY at once. Reasserting replica
+        // identity (and the cursor) here closes the window: any boot of
+        // this dir, marker or not, is a replica that tails.
         match flint_storage::rocks::RocksKv::open(data_dir) {
-            Ok(kv) => drop(kv),
+            Ok(kv) => {
+                use flint_storage::manifest::{self, Role, RoleClaim};
+                let cursor = kv.latest_seq();
+                if let Err(e) = kv.set_last_applied(cursor) {
+                    eprintln!("rewind: cursor init on restored copy ({e:?}); full re-seed");
+                    drop(kv);
+                    let _ = std::fs::remove_dir_all(data_dir);
+                    return false;
+                }
+                manifest::force_role(
+                    &kv,
+                    RoleClaim {
+                        role: Role::Replica,
+                        epoch,
+                    },
+                );
+                drop(kv);
+            }
             Err(e) => {
                 eprintln!("rewind: restored copy does not open ({e}); full re-seed");
                 let _ = std::fs::remove_dir_all(data_dir);
@@ -787,7 +815,7 @@ fn main() -> std::io::Result<()> {
             }
             let kv = RocksKv::open(std::path::Path::new(&dir))
                 .map_err(|e| std::io::Error::other(format!("rocksdb open: {e}")))?;
-            if (fresh || rewound) && replica_of.is_some() {
+            if fresh && replica_of.is_some() {
                 // The checkpoint copies the SOURCE's system rows — including
                 // its replication cursor, which is the source's OLD upstream
                 // position (frozen at its promotion), not ours. Like the
@@ -795,17 +823,21 @@ fn main() -> std::io::Result<()> {
                 // reasserted at seed time: our true cursor is the copied
                 // DB's own latest sequence. (Found by chaos: the inherited
                 // marker caused a permanent SequenceGap loop against
-                // promoted masters, leaving pairs unreplicated.) The same
-                // holds for a rewound snapshot — its copied cursor is this
-                // node's own OLD tailing position, not the snapshot's seq.
+                // promoted masters, leaving pairs unreplicated.)
+                //
+                // FRESH ONLY, never for a rewound copy: try_rewind already
+                // asserted its cursor and role, and those asserts WROTE two
+                // system rows — so latest_seq here is the snapshot seq plus
+                // two, and re-asserting from it hands the master a cursor
+                // claiming entries this copy never applied. The master then
+                // dutifully skips them: two keys short, found by the loaded
+                // drill's keyspace-parity check on this exact line.
                 let cursor = kv.latest_seq();
                 kv.set_last_applied(cursor)
                     .map_err(|e| std::io::Error::other(format!("cursor init: {e:?}")))?;
-                if rewound {
-                    eprintln!("rewind complete; tailing from seq {cursor}");
-                } else {
-                    eprintln!("full sync complete; tailing from seq {cursor}");
-                }
+                eprintln!("full sync complete; tailing from seq {cursor}");
+            } else if rewound {
+                eprintln!("rewind complete; tailing from seq {}", kv.last_applied());
             }
             // Initialize the manifest on first boot: default slot claim
             // and a role claim at epoch (0,1).
@@ -885,9 +917,9 @@ fn main() -> std::io::Result<()> {
             // A checkpoint full sync copied the MASTER's manifest; the
             // seeded replica reasserts its own identity (same epoch, so
             // promotion fencing still measures against the copied history).
-            // A REWOUND copy reasserts under the snapshot's own epoch — the
-            // exact label FLINTSYNC then presents for the fence check.
-            if (fresh || rewound) && replica_of.is_some() {
+            // Fresh only — a rewound copy's identity was asserted inside
+            // try_rewind, before any other write could move its sequence.
+            if fresh && replica_of.is_some() {
                 let epoch = manifest::read_role(&kv).map(|c| c.epoch).unwrap_or(Epoch {
                     generation: 0,
                     counter: 1,
