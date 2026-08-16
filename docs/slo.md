@@ -57,13 +57,27 @@ reported figure is the worst gap between consecutive acknowledged writes
 anywhere in the window, so a slow recovery is easily mistaken for a slow
 failover. It is not the same event and it does not have the same cause.
 
-**What is bounded today.** The checkpoint transfer is rate-limited
-(`--fullsync-rate-bytes`, default 64 MiB/s) so a re-seed cannot take the disk
-and link the write path needs. Uncapped, this was measured starving a freshly
-promoted master for **11.9 s** while the failover itself had completed in
-700 ms. The cap trades recovery speed for write latency in the obvious
-direction: a slower re-seed means longer at one copy, so raise it if you would
-rather have redundancy back sooner and can absorb the latency.
+**What is bounded today.** Two things.
+
+The replacement's catch-up is bounded by the **snapshot cadence, not the
+dataset**: a rejoining ex-master rewinds to its own newest local snapshot at
+or before the promotion fence and tails the difference (`--rewind-snaps`,
+wired automatically by `flintctl`; see docs/failover.md §Rejoin). Before
+this, every rejoin was a full checkpoint transfer, and on a pair running a
+10 s widowed grace the measured effect was brutal and exact: writes flowed
+for the grace, then the widowed master shed everything until the transfer
+finished — a **26.2 s** ack gap at a few GB (soak run 27), and growing
+linearly with data. The full transfer remains only as the fallback when no
+safe snapshot exists (a master killed before its first labeled snapshot, or
+one whose snapshots all post-date the fence).
+
+The fallback transfer itself is rate-limited (`--fullsync-rate-bytes`,
+default 64 MiB/s) so a re-seed cannot take the disk and link the write path
+needs. Uncapped, this was measured starving a freshly promoted master for
+**11.9 s** while the failover itself had completed in 700 ms. The cap trades
+recovery speed for write latency in the obvious direction: a slower re-seed
+means longer at one copy, so raise it if you would rather have redundancy
+back sooner and can absorb the latency.
 
 **What bounds items 1 and 2** is not a recovery feature at all — it is the
 write deadline in the next section, which refuses work the node cannot serve

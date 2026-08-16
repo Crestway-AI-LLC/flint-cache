@@ -1237,6 +1237,54 @@ fn local_wipe_node(statedir: &str, name: &str) -> Result<(), String> {
     }
 }
 
+/// The re-seed marker filename, shared by contract with flint-server (its
+/// NEEDS_RESEED const): a data dir carrying it is a superseded copy the
+/// server must not tail from as-is. Writing the MARKER instead of wiping
+/// (#187) is what lets the server choose the cheap continuation — rewind to
+/// a local snapshot at or before the promotion fence — and reserve the full
+/// re-seed for when no safe snapshot exists.
+const NEEDS_RESEED_MARKER: &str = "NEEDS_RESEED";
+
+/// Mark one seat's data dir as needing re-seed-or-rewind before it may tail
+/// again. A missing dir is fine — a fresh seat has nothing to mark.
+fn mark_reseed_node(inv: &Inventory, r: &Runner, port: u16, why: &str) -> Result<(), String> {
+    if r.is_remote() {
+        let argv = vec![
+            format!("{}/flintctl", inv.bins),
+            "host-mark-reseed".into(),
+            inv.statedir.clone(),
+            format!("node-{port}"),
+            why.to_string(),
+        ];
+        let out = r
+            .output(&argv)
+            .map_err(|e| format!("mark-reseed node-{port} on {}: {e}", r.label()))?;
+        if !out.status.success() {
+            return Err(format!(
+                "mark-reseed node-{port} on {}: {}",
+                r.label(),
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        return Ok(());
+    }
+    local_mark_reseed(&inv.statedir, &format!("node-{port}"), why)
+}
+
+/// Same name discipline as local_wipe_node: this runs as root over ssh, so a
+/// malformed name must not be able to write outside the statedir.
+fn local_mark_reseed(statedir: &str, name: &str, why: &str) -> Result<(), String> {
+    if statedir.is_empty() || !name.starts_with("node-") || name.contains('/') {
+        return Err(format!("refusing to mark {statedir:?}/{name:?}"));
+    }
+    let dir = std::path::Path::new(statedir).join(name);
+    if !dir.exists() {
+        return Ok(());
+    }
+    std::fs::write(dir.join(NEEDS_RESEED_MARKER), format!("{why}\n"))
+        .map_err(|e| format!("write {}/{NEEDS_RESEED_MARKER}: {e}", dir.display()))
+}
+
 fn kill_pidfile(inv: &Inventory, r: &Runner, name: &str) {
     if r.is_remote() {
         let argv = vec![
@@ -2194,7 +2242,7 @@ fn is_noauth_error(msg: &str) -> bool {
         .starts_with("NOAUTH")
 }
 
-fn start_pair_nodes(inv: &Inventory, pair: &[String]) {
+fn start_pair_nodes(inv: &Inventory, pair: &[String], gi: usize) {
     let d = &inv.statedir;
     let cp = &inv.cp[0];
     let tls = tls_client(inv);
@@ -2248,10 +2296,22 @@ fn start_pair_nodes(inv: &Inventory, pair: &[String]) {
         let replica_of = match &live_master {
             // Dead seat rejoining a live lineage: same contract as roll_node —
             // its replication cursor may be an ex-master's and its suffix may
-            // have diverged, so it resyncs fresh from a checkpoint.
+            // have diverged, so it must not tail from its data as-is. The
+            // MARKER (not a wipe, #187) leaves the decision to the server:
+            // rewind to a local snapshot the master vouches for (cheap, and
+            // what keeps the failover RTO independent of dataset size), or
+            // discard and full-sync when no safe snapshot exists — the exact
+            // behaviour the wipe used to force every time.
             Some(m) => {
-                if let Err(e) = wipe_node(inv, &runner_for(inv, addr), port) {
-                    die(&format!("wiping node-{port} before rejoin: {e}"));
+                if let Err(e) = mark_reseed_node(
+                    inv,
+                    &runner_for(inv, addr),
+                    port,
+                    &format!("superseded copy rejoining the lineage held by {m}"),
+                ) {
+                    die(&format!(
+                        "marking node-{port} for re-seed before rejoin: {e}"
+                    ));
                 }
                 Some(m.clone())
             }
@@ -2274,6 +2334,10 @@ fn start_pair_nodes(inv: &Inventory, pair: &[String]) {
         if let Some(m) = replica_of {
             args.extend(["--replica-of".into(), m]);
         }
+        // Where THIS pair's masters snapshot on this host (the controller's
+        // FLINTSNAPSHOT cadence writes {snapshot-root}/g{i} locally on
+        // whichever member is master). A marked seat rewinds from here.
+        args.extend(["--rewind-snaps".into(), format!("{d}/snaps/g{gi}")]);
         args.extend(internal_args(inv));
         args.extend(node_tuning_args(inv, pair.len() > 1));
         spawn(
@@ -2819,8 +2883,8 @@ fn launch(inv: &Inventory, register: bool) {
     }
 
     // 2. Data plane.
-    for pair in &inv.pairs {
-        start_pair_nodes(inv, pair);
+    for (gi, pair) in inv.pairs.iter().enumerate() {
+        start_pair_nodes(inv, pair, gi);
     }
     for pair in &inv.pairs {
         assert!(
@@ -3944,7 +4008,9 @@ fn expand(inv: &Inventory, inventory_path: &str, pair_spec: &str) {
     let tls = tls_client(inv);
     let pair: Vec<String> = pair_spec.split(',').map(String::from).collect();
     eprintln!("== expand: new pair {pair_spec}");
-    start_pair_nodes(inv, &pair);
+    // The new pair's group index: appended after the existing pairs, which
+    // is where the controller reroll will number it.
+    start_pair_nodes(inv, &pair, inv.pairs.len());
     assert!(
         wait_pong(&pair[0], &tls, Duration::from_secs(10)),
         "new master up"
@@ -5131,6 +5197,12 @@ fn host_command(cmd: &str, a: &[String]) -> ! {
         "host-stop-all" => {
             local_stop_all(&need(0, "statedir"));
             std::process::exit(0)
+        }
+        "host-mark-reseed" => {
+            match local_mark_reseed(&need(0, "statedir"), &need(1, "name"), &need(2, "why")) {
+                Ok(()) => std::process::exit(0),
+                Err(e) => die(&e),
+            }
         }
         "host-wipe-node" => match local_wipe_node(&need(0, "statedir"), &need(1, "name")) {
             Ok(()) => std::process::exit(0),

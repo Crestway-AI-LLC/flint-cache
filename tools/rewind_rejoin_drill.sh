@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: Elastic-2.0
+# Does a superseded ex-master REJOIN from its own local snapshot instead of
+# a full re-seed — and refuse a snapshot the fence cannot vouch for?
+#
+# WHY THIS EXISTS. Soak runs 26 and 27 both breached the 10s RTO budget on
+# the same arithmetic: promotion + widowed grace + the killed ex-master's
+# FULL re-seed, back-to-back (26231ms on run 27 was `recovered - (promote +
+# grace)` to the millisecond). The re-seed grows with the dataset, so the
+# published RTO silently became a function of how much data a pair holds
+# (#187). The fix: FLINTPROMOTE records the branch point (promotion fence),
+# masters label their scheduled snapshots with their role epoch, and a
+# marked ex-master REWINDS to its newest local snapshot at or before the
+# fence and tails the difference — bounded by snapshot cadence, not bytes.
+#
+# ARM A (the mechanism): kill a master mid-stream, promote the survivor,
+# restart the ex-master marked. It must log "rewound to", must NOT transfer
+# a full checkpoint, must adopt the new master's epoch, and must converge —
+# including keys written only on the new timeline.
+#
+# ARM B (the negative control, #121's lesson): a node whose ONLY labeled
+# snapshot post-dates the fence must be refused ("past the fence"), fall
+# back to the full re-seed, and DROP its abandoned-branch writes. Without
+# this arm the drill would keep passing if the fence check were deleted —
+# the rewind would then be a machine for resurrecting dead timelines.
+#
+# Plus one direct protocol probe: FLINTSYNC with a cursor past the fence
+# must be refused server-side even when the client-side selection is
+# bypassed — the drill speaks the wire form the tailer would.
+set -u
+cd "$(dirname "$0")/.."
+. "$(dirname "$0")/lib/fleet.sh"
+fleet_init $FLINT_DRILL_ROOT/flint-rewind 6405 6406
+fleet_guard
+B=./target/release/flint-server
+D=$FLINT_DRILL_ROOT/flint-rewind; rm -rf "$D"; mkdir -p "$D"
+fleet_kill server
+sleep 0.3
+cleanup() { fleet_kill server; rm -rf "$D"; }
+trap cleanup EXIT
+
+cargo build --release -q -p flint-server --features rocks || { echo "FAIL: build"; exit 1; }
+"$B" --build-version >/dev/null 2>&1 || true
+
+wait_seq() { # wait until node $1's last_applied reaches $2 (budget: 20s)
+  for _ in $(seq 1 200); do
+    LA=$(valkey-cli -p "$1" FLINTINFO 2>/dev/null | tr '\r' '\n' | sed -n 's/^last_applied://p')
+    [ -n "$LA" ] && [ "$LA" -ge "$2" ] && return 0
+    sleep 0.1
+  done
+  return 1
+}
+
+echo "== pair up: A(6405) master, B(6406) replica"
+$B --port 6405 --engine rocks --data-dir "$D/a" >"$D/a1.log" 2>&1 &
+fleet_wait_listen 6405
+$B --port 6406 --engine rocks --data-dir "$D/b" --replica-of 127.0.0.1:6405 >"$D/b1.log" 2>&1 &
+fleet_wait_listen 6406
+
+for i in $(seq 1 300); do valkey-cli -p 6405 SET "pre:$i" "v$i" >/dev/null; done
+SNAP_OUT=$(valkey-cli -p 6405 FLINTSNAPSHOT "$D/snaps-a")
+case "$SNAP_OUT" in OK\ snap-*-e0.1) ;; *)
+  echo "FAIL: master snapshot id not epoch-labeled: '$SNAP_OUT' — without the"
+  echo "      label no snapshot is ever rewind-eligible and arm A cannot pass"
+  exit 1
+esac
+echo "  snapshot on A: $SNAP_OUT"
+for i in $(seq 301 600); do valkey-cli -p 6405 SET "pre:$i" "v$i" >/dev/null; done
+TIP=$(valkey-cli -p 6405 FLINTINFO | tr '\r' '\n' | sed -n 's/^latest_seq://p')
+wait_seq 6406 "$TIP" || { echo "FAIL: B never caught up to A before the kill"; exit 1; }
+
+echo "== arm A: kill A, promote B, rejoin A marked — it must REWIND, not re-seed"
+kill -9 "$(pgrep -f "flint-server --port 6405" | head -1)" 2>/dev/null
+sleep 0.3
+valkey-cli -p 6406 FLINTPROMOTE 0 2 | grep -q "OK promoted" || { echo "FAIL: promote B"; exit 1; }
+for i in $(seq 1 50); do valkey-cli -p 6406 SET "post:$i" "n$i" >/dev/null; done
+BTIP=$(valkey-cli -p 6406 FLINTINFO | tr '\r' '\n' | sed -n 's/^latest_seq://p')
+
+# The mark is flintctl's job in a real fleet (start_pair_nodes writes it via
+# host-mark-reseed); the drill writes the same marker to stay a raw-binary
+# test of the server's contract.
+echo "drill: superseded copy rejoining" > "$D/a/NEEDS_RESEED"
+$B --port 6405 --engine rocks --data-dir "$D/a" --replica-of 127.0.0.1:6406 \
+   --rewind-snaps "$D/snaps-a" >"$D/a2.log" 2>&1 &
+fleet_wait_listen 6405
+
+grep -q "rewound to" "$D/a2.log" || {
+  echo "FAIL: rejoin did not rewind. Boot log:"; sed 's/^/    /' "$D/a2.log"; exit 1
+}
+grep -q "full sync: received" "$D/a2.log" && {
+  echo "FAIL: a full checkpoint was transferred anyway — the rewind saved nothing"
+  exit 1
+}
+wait_seq 6405 "$BTIP" || { echo "FAIL: rewound A never converged to B's tip"; exit 1; }
+grep -q "adopted the master's role epoch (0,2)" "$D/a2.log" || {
+  echo "FAIL: A never adopted B's epoch; its next reconnect would present the"
+  echo "      old one and be refused at the fence its own cursor has outgrown"
+  exit 1
+}
+[ "$(valkey-cli -p 6405 GET post:50)" = "n50" ] || { echo "FAIL: new-timeline key missing on A"; exit 1; }
+[ "$(valkey-cli -p 6405 GET pre:300)" = "v300" ] || { echo "FAIL: pre-snapshot key missing on A"; exit 1; }
+echo "  A rewound, adopted (0,2), converged: new-timeline and snapshot-base keys both served"
+
+echo "== protocol probe: a cursor past the fence is refused server-side"
+PROBE=$(valkey-cli -p 6406 FLINTSYNC 999999999 0 1 2>&1)
+echo "$PROBE" | grep -q "promotion fence" || {
+  echo "FAIL: FLINTSYNC with a past-the-fence cursor answered '$PROBE' —"
+  echo "      the master-side check is the backstop against a promotion racing"
+  echo "      the client's own FLINTFENCE query, and it did not fire"
+  exit 1
+}
+echo "  refused: $PROBE"
+
+echo "== arm B: the only snapshot post-dates the fence — must re-seed, not rewind"
+# A (replica) dies; B keeps writing (grace off here) and snapshots at its tip;
+# then A comes back BARE and is promoted. B's snapshot now sits past the
+# promotion fence: its tail is the abandoned branch.
+kill -9 "$(pgrep -f "flint-server --port 6405" | head -1)" 2>/dev/null
+sleep 0.3
+for i in $(seq 1 200); do valkey-cli -p 6406 SET "orphan:$i" "x$i" >/dev/null; done
+SNAP_B=$(valkey-cli -p 6406 FLINTSNAPSHOT "$D/snaps-b")
+echo "  snapshot on B (to be orphaned): $SNAP_B"
+kill -9 "$(pgrep -f "flint-server --port 6406" | head -1)" 2>/dev/null
+sleep 0.3
+$B --port 6405 --engine rocks --data-dir "$D/a" >"$D/a3.log" 2>&1 &
+fleet_wait_listen 6405
+valkey-cli -p 6405 FLINTPROMOTE 0 3 | grep -q "OK promoted" || { echo "FAIL: promote A"; exit 1; }
+valkey-cli -p 6405 SET fence:probe yes >/dev/null
+
+echo "drill: superseded copy rejoining" > "$D/b/NEEDS_RESEED"
+$B --port 6406 --engine rocks --data-dir "$D/b" --replica-of 127.0.0.1:6405 \
+   --rewind-snaps "$D/snaps-b" >"$D/b2.log" 2>&1 &
+fleet_wait_listen 6406
+
+grep -q "past the fence" "$D/b2.log" || {
+  echo "FAIL: B's post-fence snapshot was not refused. Boot log:"
+  sed 's/^/    /' "$D/b2.log"; exit 1
+}
+grep -q "full sync: received" "$D/b2.log" || {
+  echo "FAIL: refusal without the re-seed fallback — B is stranded"; exit 1
+}
+ATIP=$(valkey-cli -p 6405 FLINTINFO | tr '\r' '\n' | sed -n 's/^latest_seq://p')
+wait_seq 6406 "$ATIP" || { echo "FAIL: re-seeded B never converged"; exit 1; }
+[ "$(valkey-cli -p 6406 GET orphan:200)" = "" ] || {
+  echo "FAIL: an abandoned-branch write SURVIVED the re-seed — the fence exists"
+  echo "      precisely so that timeline cannot come back"
+  exit 1
+}
+[ "$(valkey-cli -p 6406 GET fence:probe)" = "yes" ] || { echo "FAIL: B missing the new timeline"; exit 1; }
+echo "  B refused its orphaned snapshot, re-seeded, and the dead branch stayed dead"
+
+echo "PASS: rewind rejoin drill — ex-master rejoined from its own snapshot (no full transfer), adopted the new epoch, converged; a past-the-fence snapshot was refused client- and server-side and fell back to a re-seed that dropped the abandoned branch"

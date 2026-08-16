@@ -87,6 +87,173 @@ fn clear_needs_reseed(dir: &std::path::Path) {
     }
 }
 
+/// One RESP request/response over the internal mesh — enough protocol for
+/// the boot-time FLINTFENCE query below, nothing more.
+#[cfg(feature = "rocks")]
+fn internal_call_once(target: &str, args: &[&[u8]]) -> std::io::Result<Value> {
+    use std::io::Read;
+    let mut stream = internal_connect(target)?;
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+    let mut out = Vec::new();
+    encode(
+        &Value::Array(Some(
+            args.iter().map(|a| Value::Bulk(Some(a.to_vec()))).collect(),
+        )),
+        &mut out,
+    );
+    stream.write_all(&out)?;
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        if let Ok(Decoded::Complete(v, _)) = decode(&buf) {
+            return Ok(v);
+        }
+        let n = stream.read(&mut chunk)?;
+        if n == 0 {
+            return Err(std::io::ErrorKind::UnexpectedEof.into());
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+}
+
+/// A rewind candidate parsed from a snapshot id:
+/// `snap-<ms>-seq<N>-e<gen>.<counter>` (the epoch label FLINTSNAPSHOT adds
+/// on masters). Unlabeled ids are not candidates — see the label's comment.
+#[cfg(feature = "rocks")]
+fn parse_rewind_candidate(name: &str) -> Option<(u64, flint_storage::manifest::Epoch)> {
+    let mut parts = name.strip_prefix("snap-")?.splitn(3, '-');
+    let _ms = parts.next()?;
+    let seq: u64 = parts.next()?.strip_prefix("seq")?.parse().ok()?;
+    let (g, c) = parts.next()?.strip_prefix('e')?.split_once('.')?;
+    Some((
+        seq,
+        flint_storage::manifest::Epoch {
+            generation: g.parse().ok()?,
+            counter: c.parse().ok()?,
+        },
+    ))
+}
+
+/// The rewind rejoin (#187): instead of discarding a superseded copy and
+/// full re-seeding — a transfer that grows with the dataset while the new
+/// master's write gates hold every write — replace the data dir with this
+/// node's own newest LOCAL snapshot whose seq the master vouches for
+/// (FLINTFENCE: at or before the first branch point after the snapshot's
+/// epoch), and tail the difference. Catch-up is then bounded by the
+/// snapshot cadence, not the dataset.
+///
+/// Returns true when the data dir now holds the restored snapshot. Any
+/// failure returns false and the caller takes today's path: discard and
+/// full-sync. The master re-checks the same fence at FLINTSYNC, so a stale
+/// answer here (a promotion racing this boot) downgrades to a re-seed
+/// rather than a divergent copy.
+#[cfg(feature = "rocks")]
+fn try_rewind(data_dir: &std::path::Path, snaps_dir: &str, target: &str) -> bool {
+    use flint_storage::manifest::Epoch;
+    let snaps = std::path::Path::new(snaps_dir);
+    let Ok(entries) = std::fs::read_dir(snaps) else {
+        eprintln!("rewind: no snapshot dir at {snaps_dir}; full re-seed");
+        return false;
+    };
+    let mut candidates: Vec<(u64, Epoch, std::path::PathBuf)> = entries
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name();
+            let (seq, epoch) = parse_rewind_candidate(name.to_str()?)?;
+            Some((seq, epoch, e.path()))
+        })
+        .collect();
+    candidates.sort_by_key(|c| std::cmp::Reverse(c.0));
+    if candidates.is_empty() {
+        eprintln!("rewind: no epoch-labeled snapshots in {snaps_dir}; full re-seed");
+        return false;
+    }
+    // One fence query per distinct epoch; the master's answer is the highest
+    // seq it vouches for from that epoch's timeline (nil = it cannot).
+    let mut bounds: std::collections::BTreeMap<Epoch, Option<u64>> = Default::default();
+    for (seq, epoch, path) in candidates {
+        let bound = *bounds.entry(epoch).or_insert_with(|| {
+            match internal_call_once(
+                target,
+                &[
+                    b"FLINTFENCE",
+                    epoch.generation.to_string().as_bytes(),
+                    epoch.counter.to_string().as_bytes(),
+                ],
+            ) {
+                Ok(Value::Integer(b)) if b >= 0 => Some(b as u64),
+                Ok(_) => {
+                    eprintln!("rewind: {target} cannot vouch for epoch {epoch}");
+                    None
+                }
+                Err(e) => {
+                    eprintln!("rewind: FLINTFENCE {epoch} against {target} failed: {e}");
+                    None
+                }
+            }
+        });
+        let Some(bound) = bound else { continue };
+        if seq > bound {
+            eprintln!(
+                "rewind: snapshot {} is past the fence ({seq} > {bound}); trying older",
+                path.display()
+            );
+            continue;
+        }
+        // Build beside, then swap: a crash mid-restore must leave either the
+        // old dir (marker intact -> retried next boot) or the finished copy,
+        // never a half-restored dir that opens.
+        let tmp = data_dir.with_extension("rewind-tmp");
+        let _ = std::fs::remove_dir_all(&tmp);
+        if let Err(e) = std::fs::create_dir_all(&tmp) {
+            eprintln!("rewind: create {}: {e}; full re-seed", tmp.display());
+            return false;
+        }
+        let restored = std::fs::read_dir(&path).map(|dir| {
+            for entry in dir.flatten() {
+                if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                    continue;
+                }
+                let dst = tmp.join(entry.file_name());
+                // Hard links make the restore O(files), not O(bytes) — the
+                // snapshot and the data dir share the statedir filesystem.
+                // SSTs are immutable so sharing is safe; rocks rewrites the
+                // mutable members (MANIFEST/CURRENT/OPTIONS/log) by replace,
+                // and the copy fallback covers a cross-device snaps dir.
+                if std::fs::hard_link(entry.path(), &dst).is_err()
+                    && let Err(e) = std::fs::copy(entry.path(), &dst)
+                {
+                    return Err(e);
+                }
+            }
+            Ok(())
+        });
+        match restored {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) | Err(e) => {
+                eprintln!("rewind: restoring {}: {e}; full re-seed", path.display());
+                let _ = std::fs::remove_dir_all(&tmp);
+                return false;
+            }
+        }
+        if let Err(e) =
+            std::fs::remove_dir_all(data_dir).and_then(|_| std::fs::rename(&tmp, data_dir))
+        {
+            eprintln!("rewind: swapping in the restored copy: {e}; full re-seed");
+            let _ = std::fs::remove_dir_all(&tmp);
+            return false;
+        }
+        eprintln!(
+            "rewound to {} (seq {seq} <= fence {bound}, epoch {epoch}): tailing incrementally \
+             instead of a full re-seed",
+            path.display()
+        );
+        return true;
+    }
+    eprintln!("rewind: no snapshot at or before the fence; full re-seed");
+    false
+}
+
 /// Internal-mesh mutual-TLS client config (the --internal-* triple in the
 /// client role), set once at startup as a HOT-RELOADING handle (ADR-0006
 /// D4 follow-on): every node→node dial — replication tail, full-sync
@@ -497,16 +664,34 @@ fn main() -> std::io::Result<()> {
             // would be a far worse bug than the one this fixes.
             let dir_path = std::path::Path::new(&dir).to_path_buf();
             let reseed = dir_path.join(NEEDS_RESEED).exists();
+            let mut rewound = false;
             if reseed {
-                if replica_of.is_some() {
-                    eprintln!(
-                        "{NEEDS_RESEED} present: this copy cannot be continued ({}) — discarding \
-                         it and re-seeding from a checkpoint",
-                        std::fs::read_to_string(dir_path.join(NEEDS_RESEED))
-                            .unwrap_or_default()
-                            .trim()
-                    );
-                    std::fs::remove_dir_all(&dir_path)?;
+                if let Some(target) = &replica_of {
+                    let why = std::fs::read_to_string(dir_path.join(NEEDS_RESEED))
+                        .unwrap_or_default()
+                        .trim()
+                        .to_string();
+                    // Rewind first (#187): the marker says this copy's TAIL
+                    // cannot be continued, but a local snapshot from before
+                    // the branch point still can — and restoring one costs
+                    // hard links, where the full re-seed costs the whole
+                    // dataset over the wire with the new master's write
+                    // gates held shut. A marker written because a master
+                    // already REFUSED a rewound cursor ("promotion fence")
+                    // must not retry the same snapshot forever, so it goes
+                    // straight to the re-seed.
+                    if !why.contains("promotion fence")
+                        && let Some(snaps) = arg("--rewind-snaps")
+                    {
+                        rewound = try_rewind(&dir_path, &snaps, target);
+                    }
+                    if !rewound {
+                        eprintln!(
+                            "{NEEDS_RESEED} present: this copy cannot be continued ({why}) — \
+                             discarding it and re-seeding from a checkpoint"
+                        );
+                        std::fs::remove_dir_all(&dir_path)?;
+                    }
                 } else {
                     clear_needs_reseed(&dir_path);
                 }
@@ -579,7 +764,7 @@ fn main() -> std::io::Result<()> {
             }
             let kv = RocksKv::open(std::path::Path::new(&dir))
                 .map_err(|e| std::io::Error::other(format!("rocksdb open: {e}")))?;
-            if fresh && replica_of.is_some() {
+            if (fresh || rewound) && replica_of.is_some() {
                 // The checkpoint copies the SOURCE's system rows — including
                 // its replication cursor, which is the source's OLD upstream
                 // position (frozen at its promotion), not ours. Like the
@@ -587,11 +772,17 @@ fn main() -> std::io::Result<()> {
                 // reasserted at seed time: our true cursor is the copied
                 // DB's own latest sequence. (Found by chaos: the inherited
                 // marker caused a permanent SequenceGap loop against
-                // promoted masters, leaving pairs unreplicated.)
+                // promoted masters, leaving pairs unreplicated.) The same
+                // holds for a rewound snapshot — its copied cursor is this
+                // node's own OLD tailing position, not the snapshot's seq.
                 let cursor = kv.latest_seq();
                 kv.set_last_applied(cursor)
                     .map_err(|e| std::io::Error::other(format!("cursor init: {e:?}")))?;
-                eprintln!("full sync complete; tailing from seq {cursor}");
+                if rewound {
+                    eprintln!("rewind complete; tailing from seq {cursor}");
+                } else {
+                    eprintln!("full sync complete; tailing from seq {cursor}");
+                }
             }
             // Initialize the manifest on first boot: default slot claim
             // and a role claim at epoch (0,1).
@@ -644,6 +835,9 @@ fn main() -> std::io::Result<()> {
                     generation: old.generation + 1,
                     counter: 1,
                 };
+                // The restore is a branch point like any promotion: nodes of
+                // the dead generation must not resume past the snapshot.
+                manifest::record_promo_fence(&kv, bumped, kv.latest_seq());
                 manifest::force_role(
                     &kv,
                     RoleClaim {
@@ -668,7 +862,9 @@ fn main() -> std::io::Result<()> {
             // A checkpoint full sync copied the MASTER's manifest; the
             // seeded replica reasserts its own identity (same epoch, so
             // promotion fencing still measures against the copied history).
-            if fresh && replica_of.is_some() {
+            // A REWOUND copy reasserts under the snapshot's own epoch — the
+            // exact label FLINTSYNC then presents for the fence check.
+            if (fresh || rewound) && replica_of.is_some() {
                 let epoch = manifest::read_role(&kv).map(|c| c.epoch).unwrap_or(Epoch {
                     generation: 0,
                     counter: 1,
@@ -2154,6 +2350,18 @@ fn execute(
     {
         return flintdemote(read_only, rocks, args);
     }
+    // FLINTFENCE <generation> <counter>: the highest sequence a copy from
+    // that role epoch may resume from — the earliest recorded branch point
+    // after it (#187). A rejoining ex-master asks this to pick which local
+    // snapshot to rewind to. Nil = this node cannot vouch (no promotion
+    // recorded after that epoch while its own claim is newer), and the only
+    // safe rejoin is a full re-seed.
+    if args
+        .first()
+        .is_some_and(|n| n.eq_ignore_ascii_case(b"FLINTFENCE"))
+    {
+        return flintfence(rocks, args);
+    }
     // FLINTNSRESTORE <ns> <k> <v> [<k> <v> ...]: apply pre-enveloped rows
     // for namespace <ns> as ONE engine batch — the write half of the
     // namespace-scoped restore (ADR-0011 D5). The CALLER routes: placement
@@ -2445,6 +2653,14 @@ fn flintpromote(
         generation,
         counter,
     };
+    // The branch point, recorded BEFORE the role flips: everything this node
+    // has applied up to now is shared history; everything after is a new
+    // timeline the superseded master never had. A rejoining ex-master may
+    // rewind to a local snapshot at seq <= this fence and tail incrementally
+    // instead of full re-seeding (#187). Recording first means a crash
+    // between the two writes leaves a fence for an epoch never claimed —
+    // which only ever makes a later bound MORE conservative.
+    manifest::record_promo_fence(kv.as_ref(), epoch, kv.latest_seq());
     match manifest::set_role(
         kv.as_ref(),
         RoleClaim {
@@ -2499,6 +2715,52 @@ fn flintpromote(
     _args: &[Vec<u8>],
 ) -> Value {
     Value::Error("ERR FLINTPROMOTE requires a build with --features rocks".into())
+}
+
+/// FLINTFENCE <generation> <counter>: answer with the branch-point bound for
+/// a copy from that epoch (see manifest::promo_fence_bound for the safety
+/// argument). Integer = resume is safe from any seq <= it; nil = cannot
+/// vouch, re-seed. An epoch at or above this node's own claim is bounded by
+/// the node's latest sequence — the asker's copy claims to already be on
+/// this timeline.
+#[cfg(feature = "rocks")]
+fn flintfence(rocks: &Option<RocksHandle>, args: &[Vec<u8>]) -> Value {
+    use flint_storage::manifest::{self, Epoch, FenceBound};
+    let Some(kv) = rocks else {
+        return Value::Error("ERR FLINTFENCE requires the rocks engine".into());
+    };
+    let (Some(generation), Some(counter)) = (
+        args.get(1)
+            .and_then(|raw| std::str::from_utf8(raw).ok())
+            .and_then(|s| s.parse().ok()),
+        args.get(2)
+            .and_then(|raw| std::str::from_utf8(raw).ok())
+            .and_then(|s| s.parse().ok()),
+    ) else {
+        return Value::Error("ERR usage: FLINTFENCE <generation> <counter>".into());
+    };
+    let since = Epoch {
+        generation,
+        counter,
+    };
+    let mine = manifest::read_role(kv.as_ref())
+        .map(|c| c.epoch)
+        .unwrap_or(Epoch::ZERO);
+    if since >= mine {
+        return Value::Integer(kv.latest_seq() as i64);
+    }
+    match manifest::promo_fence_bound(kv.as_ref(), since) {
+        FenceBound::Bound(seq) => Value::Integer(seq as i64),
+        // My claim is newer than the asker's epoch, yet I hold no fence row
+        // above it: promotions happened that were never recorded (pre-fence
+        // binaries). Vouching here would be guessing.
+        FenceBound::Unfenced => Value::Bulk(None),
+    }
+}
+
+#[cfg(not(feature = "rocks"))]
+fn flintfence(_rocks: &Option<RocksHandle>, _args: &[Vec<u8>]) -> Value {
+    Value::Error("ERR FLINTFENCE requires a build with --features rocks".into())
 }
 
 /// FLINTDEMOTE <generation> <counter>: epoch-fenced fencing of a (possibly
@@ -2785,8 +3047,61 @@ fn flintsync(
         .and_then(|raw| std::str::from_utf8(raw).ok())
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
+    let my_epoch = flint_storage::manifest::read_role(kv.as_ref())
+        .map(|c| c.epoch)
+        .unwrap_or(flint_storage::manifest::Epoch::ZERO);
+    // Optional 3rd/4th args: the replica's role-claim epoch. A rewound
+    // ex-master presents the epoch its restored snapshot was taken under;
+    // if that predates this node's claim, the cursor must sit at or before
+    // the first branch point after it, or the copy carries abandoned-branch
+    // writes and only a re-seed can continue it (#187). The -WALGAP shape is
+    // deliberate: the replica's tailer already escalates it to exactly that
+    // re-seed. Absent args = a fresh full sync from THIS node (its cursor IS
+    // this timeline) or a pre-fence binary — checked by neither, as before.
+    if let (Some(g), Some(c)) = (
+        args.get(2)
+            .and_then(|raw| std::str::from_utf8(raw).ok())
+            .and_then(|s| s.parse().ok()),
+        args.get(3)
+            .and_then(|raw| std::str::from_utf8(raw).ok())
+            .and_then(|s| s.parse().ok()),
+    ) {
+        use flint_storage::manifest::{Epoch, FenceBound, promo_fence_bound};
+        let theirs = Epoch {
+            generation: g,
+            counter: c,
+        };
+        if theirs < my_epoch {
+            let refusal = match promo_fence_bound(kv.as_ref(), theirs) {
+                FenceBound::Bound(fence) if cursor > fence => Some(format!(
+                    "WALGAP cursor {cursor} is past the promotion fence {fence} for epoch \
+                     {theirs}: that span was never on this timeline"
+                )),
+                FenceBound::Bound(_) => None,
+                FenceBound::Unfenced => Some(format!(
+                    "WALGAP promotion fence history for epoch {theirs} is incomplete on this \
+                     node: cannot vouch for cursor {cursor}"
+                )),
+            };
+            if let Some(msg) = refusal {
+                let mut out = Vec::new();
+                encode(&Value::Error(msg), &mut out);
+                return stream.write_all(&out);
+            }
+        }
+    }
     let mut out = Vec::new();
-    encode(&Value::Simple(format!("FLINTSYNC-OK {cursor}")), &mut out);
+    // The OK carries this node's role epoch so an accepted lower-epoch
+    // replica can ADOPT it durably: its next reconnect then presents the
+    // adopted epoch, and a cursor that has legitimately grown past the old
+    // fence is not refused as if it were still the abandoned branch.
+    encode(
+        &Value::Simple(format!(
+            "FLINTSYNC-OK {cursor} e{}.{}",
+            my_epoch.generation, my_epoch.counter
+        )),
+        &mut out,
+    );
     stream.write_all(&out)?;
     // ACK-drain read timeout doubles as loop pacing, ADAPTIVELY: while
     // batches are flowing the drain must be near-nonblocking (1ms) or the
@@ -2924,10 +3239,22 @@ fn flintsnapshot(rocks: &Option<RocksHandle>, args: &[Vec<u8>]) -> Value {
     if let Err(e) = std::fs::create_dir_all(root) {
         return Value::Error(format!("ERR snapshot root: {e}"));
     }
+    // A MASTER's snapshot carries its role epoch in the id: that label is
+    // what lets a rejoin later prove the snapshot predates the promotion
+    // fence and rewind to it instead of full re-seeding (#187). A replica's
+    // snapshot gets no label — the fence-bound argument (manifest.rs,
+    // PROMO_FENCE_KEY_PREFIX) only covers epochs the labeling node itself
+    // held as master, so an unlabeled snapshot is simply never
+    // rewind-eligible.
+    let epoch_label = flint_storage::manifest::read_role(kv.as_ref())
+        .filter(|c| c.role == flint_storage::manifest::Role::Master)
+        .map(|c| format!("-e{}.{}", c.epoch.generation, c.epoch.counter))
+        .unwrap_or_default();
     let id = format!(
-        "snap-{}-seq{}",
+        "snap-{}-seq{}{}",
         flint_storage::strings::system_clock(),
-        kv.latest_seq()
+        kv.latest_seq(),
+        epoch_label
     );
     let dest = root.join(&id);
     if let Err(e) = kv.checkpoint_to(&dest) {
@@ -3148,10 +3475,11 @@ mod replica {
                     // than this failure warrants. Exiting is also the honest
                     // signal — under systemd (`Restart=on-failure`) the next
                     // start re-seeds unattended.
-                    super::mark_needs_reseed(
-                        kv.path(),
-                        "replication cursor fell outside the master's retained WAL",
-                    );
+                    // The marker carries the master's own words: a refusal at
+                    // the promotion fence must read differently from a purged
+                    // WAL, because the next boot's rewind decision keys off it
+                    // (retrying a fence-refused snapshot loops forever).
+                    super::mark_needs_reseed(kv.path(), &format!("cannot resume this tail: {why}"));
                     std::process::exit(3);
                 }
                 eprintln!("replication link lost ({e}); reconnecting in 1s");
@@ -3255,16 +3583,26 @@ mod replica {
         // Short read timeout so the stop flag is honored promptly.
         stream.set_read_timeout(Some(std::time::Duration::from_millis(300)))?;
         let cursor = kv.last_applied();
+        // Present our role-claim epoch — our timeline identity. Equal to the
+        // master's in steady state (fresh syncs copy it, and acceptance
+        // below adopts it), lower exactly when this copy was rewound to a
+        // pre-promotion snapshot — the case the master must fence-check
+        // before serving (#187).
+        let claim_epoch = flint_storage::manifest::read_role(kv.as_ref() as &dyn flint_storage::Kv)
+            .map(|c| c.epoch)
+            .unwrap_or(flint_storage::manifest::Epoch::ZERO);
         let mut out = Vec::new();
         encode(
             &Value::Array(Some(vec![
                 Value::Bulk(Some(b"FLINTSYNC".to_vec())),
                 Value::Bulk(Some(cursor.to_string().into_bytes())),
+                Value::Bulk(Some(claim_epoch.generation.to_string().into_bytes())),
+                Value::Bulk(Some(claim_epoch.counter.to_string().into_bytes())),
             ])),
             &mut out,
         );
         stream.write_all(&out)?;
-        eprintln!("replicating from {target} starting at seq {cursor}");
+        eprintln!("replicating from {target} starting at seq {cursor} (epoch {claim_epoch})");
 
         let mut buf: Vec<u8> = Vec::new();
         let mut chunk = [0u8; 64 * 1024];
@@ -3293,6 +3631,42 @@ mod replica {
                         .store(flint_storage::strings::system_clock(), Ordering::Relaxed);
                     match frame {
                         Value::Simple(s) if s.starts_with("FLINTSYNC-OK") => {
+                            // The master accepted us and named its epoch
+                            // ("FLINTSYNC-OK <cursor> e<gen>.<counter>").
+                            // ADOPT it durably if ours is older: from here on
+                            // our cursor advances on the MASTER's timeline,
+                            // and re-presenting the pre-rewind epoch would
+                            // get a legitimately grown cursor refused at the
+                            // old fence on the next reconnect (#187).
+                            if let Some(adopted) = s
+                                .split_whitespace()
+                                .nth(2)
+                                .and_then(|t| t.strip_prefix('e'))
+                                .and_then(|t| t.split_once('.'))
+                                .and_then(|(g, c)| {
+                                    Some(flint_storage::manifest::Epoch {
+                                        generation: g.parse().ok()?,
+                                        counter: c.parse().ok()?,
+                                    })
+                                })
+                            {
+                                use flint_storage::manifest::{self, Role, RoleClaim};
+                                let kv_dyn = kv.as_ref() as &dyn flint_storage::Kv;
+                                let mine = manifest::read_role(kv_dyn).map(|c| c.epoch);
+                                if mine.is_some_and(|m| m < adopted) {
+                                    manifest::force_role(
+                                        kv_dyn,
+                                        RoleClaim {
+                                            role: Role::Replica,
+                                            epoch: adopted,
+                                        },
+                                    );
+                                    eprintln!(
+                                        "adopted the master's role epoch {adopted}: this copy is \
+                                         on its timeline now"
+                                    );
+                                }
+                            }
                             out.clear();
                             encode(
                                 &Value::Array(Some(vec![

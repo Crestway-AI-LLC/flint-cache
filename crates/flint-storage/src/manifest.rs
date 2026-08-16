@@ -340,10 +340,98 @@ pub fn scan_all_migrations(kv: &dyn Kv) -> Vec<MigrationRecord> {
         .collect()
 }
 
+/// Where a promotion branched the timeline: the new master's applied
+/// sequence at the instant it claimed the role. A rejoining ex-master may
+/// resume incrementally from any state at seq <= this fence; past it, its
+/// copy carries writes the surviving branch never had, and only a re-seed
+/// can continue it (#187 — before this existed, every rejoin was a full
+/// re-seed, and the widowed master shed writes for the whole transfer).
+///
+/// System rows, so they never ride the replication stream — but checkpoints
+/// copy them, so every full sync or rewind hands the seeded node the
+/// seeder's accumulated history. That propagation is what makes the bound
+/// below sound for two-member pairs: the promotion that supersedes a dying
+/// master is always executed on the surviving peer, so by induction the
+/// CURRENT master's local rows cover every promotion at which the timeline
+/// actually diverged. (Same-node demote/re-promote cycles can be absent
+/// from a tailing replica's copy, but no other master accepted writes in
+/// between, so nothing diverged at those epochs.) A pair with more than two
+/// members breaks the induction — revisit before that exists.
+pub const PROMO_FENCE_KEY_PREFIX: &[u8] = b"\x00flint\x00promofence\x00";
+
+fn promo_fence_key(epoch: Epoch) -> Vec<u8> {
+    let mut k = PROMO_FENCE_KEY_PREFIX.to_vec();
+    k.extend_from_slice(&epoch.encode());
+    k
+}
+
+/// Record "the timeline branched at `seq`" for the promotion that claimed
+/// `epoch`. Written by the promoting node BEFORE it opens for writes;
+/// idempotent, last-write-wins (a re-recorded fence for the same epoch can
+/// only come from the same promotion replayed).
+pub fn record_promo_fence(kv: &dyn Kv, epoch: Epoch, seq: u64) {
+    kv.put(&promo_fence_key(epoch), &seq.to_be_bytes());
+}
+
+/// The answer to "may a copy from epoch `since` resume from seq S?".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FenceBound {
+    /// Safe iff S <= this seq: the earliest recorded branch point after
+    /// `since` (fences are seq-monotone in epoch, so min == first).
+    Bound(u64),
+    /// No promotion recorded after `since` on this node. The caller decides:
+    /// for a node whose own claim epoch is <= `since` this means "never
+    /// superseded"; for one whose claim is newer it means the history is
+    /// incomplete (pre-fence-era promotions) and the only safe answer is a
+    /// full re-seed.
+    Unfenced,
+}
+
+/// Earliest branch point strictly after `since`, from this node's local
+/// fence rows. See PROMO_FENCE_KEY_PREFIX for why local rows suffice on the
+/// current master of a two-member pair.
+pub fn promo_fence_bound(kv: &dyn Kv, since: Epoch) -> FenceBound {
+    let mut bound: Option<u64> = None;
+    for (k, v) in kv.scan_prefix(PROMO_FENCE_KEY_PREFIX) {
+        let Some(epoch) = Epoch::decode(&k[PROMO_FENCE_KEY_PREFIX.len()..]) else {
+            continue;
+        };
+        if epoch <= since {
+            continue;
+        }
+        let Some(seq) = v.try_into().ok().map(u64::from_be_bytes) else {
+            continue;
+        };
+        bound = Some(bound.map_or(seq, |b: u64| b.min(seq)));
+    }
+    bound.map_or(FenceBound::Unfenced, FenceBound::Bound)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::MemKv;
+
+    #[test]
+    fn promo_fence_bound_is_min_over_later_epochs() {
+        let kv = MemKv::new();
+        let e = |g, c| Epoch {
+            generation: g,
+            counter: c,
+        };
+        assert_eq!(promo_fence_bound(&kv, e(0, 1)), FenceBound::Unfenced);
+        record_promo_fence(&kv, e(0, 2), 100);
+        record_promo_fence(&kv, e(0, 4), 900);
+        record_promo_fence(&kv, e(1, 1), 5000);
+        // From (0,1): the first branch after it is (0,2) at 100.
+        assert_eq!(promo_fence_bound(&kv, e(0, 1)), FenceBound::Bound(100));
+        // From (0,2): its own fence does not bind it; the next is (0,4).
+        assert_eq!(promo_fence_bound(&kv, e(0, 2)), FenceBound::Bound(900));
+        // From (0,3): epochs strictly above, even without an exact row.
+        assert_eq!(promo_fence_bound(&kv, e(0, 3)), FenceBound::Bound(900));
+        // From (1,1): nothing recorded after it.
+        assert_eq!(promo_fence_bound(&kv, e(1, 1)), FenceBound::Unfenced);
+    }
 
     #[test]
     fn epoch_ordering_is_lexicographic() {

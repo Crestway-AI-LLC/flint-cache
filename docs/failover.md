@@ -209,14 +209,31 @@ sequenceDiagram
    promotion target is caught up, so a lagging replica can never freeze an
    incomplete dataset.
 3. **Promote** the replica at the next epoch.
-4. **Rejoin.** The ex-master wipes and full-syncs back as a fresh replica
-   of the new master (an ex-master's replication cursor is not a tail
-   position, so it never warm-rejoins — the demote contract is
-   wipe + checkpoint resync). `FLINTDEMOTE` records this itself, leaving a
-   `NEEDS_RESEED` marker in the data dir, so the wipe happens no matter
-   which tool restarts the seat. Starting the node **without**
+4. **Rejoin.** An ex-master's replication cursor is not a tail position,
+   so it never warm-rejoins as-is. `FLINTDEMOTE` records this itself,
+   leaving a `NEEDS_RESEED` marker in the data dir, so the contract holds
+   no matter which tool restarts the seat. Starting the node **without**
    `--replica-of` clears the marker instead: it is being started as the
    lineage, not as a tailer.
+
+   The marked rejoin has a cheap path and a fallback. Every `FLINTPROMOTE`
+   durably records the **promotion fence** — the new master's applied
+   sequence at the instant it claimed the role, i.e. where the timelines
+   branched — and every snapshot a master takes carries its role epoch in
+   the id. A marked node started with `--rewind-snaps <dir>` asks the new
+   master (`FLINTFENCE <epoch>`) for the highest sequence it vouches for,
+   **rewinds** to its own newest local snapshot at or before that fence
+   (hard links, not a transfer), and tails the difference — so rejoin
+   catch-up is bounded by the snapshot cadence, not the dataset. Only when
+   no safe snapshot exists does it fall back to the wipe + checkpoint
+   full sync. The master re-checks the same fence when the tail attaches
+   (`FLINTSYNC` carries the replica's claim epoch; past-the-fence cursors
+   are refused), so a promotion racing the rejoin downgrades it to a
+   re-seed rather than resurrecting an abandoned branch. This is what
+   keeps failover recovery time independent of how much data the pair
+   holds (#187): before it, the widowed new master could shed writes for
+   an entire dataset-sized transfer. `rewind_rejoin_drill.sh` proves both
+   the rewind and the refusal.
 
 **The same marker covers replication falling too far behind.** A replica
 whose cursor has aged out of the master's retained WAL cannot catch up by

@@ -300,7 +300,18 @@ fn restore() {
         let mut claims = 0u32;
         let mut migrations = 0u32;
         let mut cursors = 0u32;
+        let mut fences = 0u32;
         for k in &doomed {
+            if k.starts_with(flint_storage::manifest::PROMO_FENCE_KEY_PREFIX) {
+                // Promotion fences are LINEAGE history, not node identity:
+                // they record where the timeline the restored data descends
+                // from branched. They are precisely what refuses an
+                // old-world node's divergent snapshot when it limps back and
+                // asks to rewind against the restored cluster (#187), so
+                // unlike every row below they must CARRY.
+                fences += 1;
+                continue;
+            }
             if k.as_slice() == flint_storage::manifest::ROLE_KEY {
                 roles += 1;
             } else if k.starts_with(flint_storage::manifest::CLAIM_KEY_PREFIX) {
@@ -352,7 +363,11 @@ fn restore() {
             .unwrap_or_else(|e| die(&format!("reopen restored pair {}: {e}", pair.index)));
         let mut survivors = Vec::new();
         kv.for_each_prefix(b"\x00flint\x00", &mut |k, _| {
-            survivors.push(String::from_utf8_lossy(k).escape_debug().to_string());
+            // Fences carry by design (above); everything else surviving is
+            // the split-brain ingredient this check exists to catch.
+            if !k.starts_with(flint_storage::manifest::PROMO_FENCE_KEY_PREFIX) {
+                survivors.push(String::from_utf8_lossy(k).escape_debug().to_string());
+            }
             true
         });
         if !survivors.is_empty() {
@@ -363,8 +378,16 @@ fn restore() {
             ));
         }
         println!(
-            "pair {} restored from {} (epoch {} at seq {}): scrubbed {} role, {} claim(s), {} migration(s), {} repl cursor(s) — verified gone across a reopen",
-            pair.index, pair.master, pair.epoch, pair.seq, roles, claims, migrations, cursors
+            "pair {} restored from {} (epoch {} at seq {}): scrubbed {} role, {} claim(s), {} migration(s), {} repl cursor(s); kept {} promotion fence(s) — verified across a reopen",
+            pair.index,
+            pair.master,
+            pair.epoch,
+            pair.seq,
+            roles,
+            claims,
+            migrations,
+            cursors,
+            fences
         );
     }
 
