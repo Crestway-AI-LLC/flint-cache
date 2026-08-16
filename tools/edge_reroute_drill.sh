@@ -45,7 +45,7 @@ cargo build --release -q -p flint-server -p flint-proxy -p flint-controller \
   -p flint-controlplane --features flint-server/rocks || { echo "FAIL: build"; exit 1; }
 # The first exec of a freshly linked binary can spend 20s in the loader; pay
 # it here rather than inside a timed window (see the warm-up in gates.sh).
-./target/release/flint-server --build-version >/dev/null 2>&1 || true
+fleet_warm ./target/release/flint-server ./target/release/flint-proxy ./target/release/flint-controlplane ./target/release/flint-controller
 
 RTO_BUDGET_MS=10000
 

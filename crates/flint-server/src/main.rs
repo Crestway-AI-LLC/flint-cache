@@ -2683,7 +2683,16 @@ fn flintpromote(
     // instead of full re-seeding (#187). Recording first means a crash
     // between the two writes leaves a fence for an epoch never claimed —
     // which only ever makes a later bound MORE conservative.
-    manifest::record_promo_fence(kv.as_ref(), epoch, kv.latest_seq());
+    //
+    // last_applied, NOT latest_seq: sequence numbers are node-local, and the
+    // rejoiners this fence exists for present positions in the SUPERSEDED
+    // stream's space — which is exactly what last_applied tracks on the
+    // replica being promoted. latest_seq is this node's own space, drifted
+    // ahead by one cursor row per applied batch; recording it made the fence
+    // comparison cross-space and accidentally permissive (soak run 30). A
+    // same-node demote/re-promote records a stale last_applied — harmlessly
+    // conservative: rejoins it cannot vouch for fall back to a full sync.
+    manifest::record_promo_fence(kv.as_ref(), epoch, kv.last_applied());
     match manifest::set_role(
         kv.as_ref(),
         RoleClaim {
@@ -3110,6 +3119,33 @@ fn flintsync(
                 let mut out = Vec::new();
                 encode(&Value::Error(msg), &mut out);
                 return stream.write_all(&out);
+            }
+            // The accepted cursor is in the OLD stream's space; this node's
+            // WAL is indexed by its OWN. Translate before serving — the
+            // mapping is durable in every apply batch's cursor row. Serving
+            // the untranslated number was soak run 30's failure: the stream
+            // came out off-position (a SequenceGap when the strict check
+            // caught it, silent identical-value replays when it did not).
+            // The client adopts the translated cursor from the OK line.
+            match kv.own_seq_for_upstream(cursor) {
+                Ok(own) => {
+                    eprintln!(
+                        "rewind attach: upstream cursor {cursor} (epoch {theirs}) maps to \
+                         local seq {own}"
+                    );
+                    cursor = own;
+                }
+                Err(e) => {
+                    let mut out = Vec::new();
+                    encode(
+                        &Value::Error(format!(
+                            "WALGAP cannot map upstream cursor {cursor} into this WAL ({e:?}): \
+                             the span needed for an incremental rejoin is gone"
+                        )),
+                        &mut out,
+                    );
+                    return stream.write_all(&out);
+                }
             }
         }
     }
@@ -3654,13 +3690,33 @@ mod replica {
                         .store(flint_storage::strings::system_clock(), Ordering::Relaxed);
                     match frame {
                         Value::Simple(s) if s.starts_with("FLINTSYNC-OK") => {
-                            // The master accepted us and named its epoch
-                            // ("FLINTSYNC-OK <cursor> e<gen>.<counter>").
-                            // ADOPT it durably if ours is older: from here on
-                            // our cursor advances on the MASTER's timeline,
-                            // and re-presenting the pre-rewind epoch would
-                            // get a legitimately grown cursor refused at the
-                            // old fence on the next reconnect (#187).
+                            // The master accepted us: "FLINTSYNC-OK <cursor>
+                            // e<gen>.<counter>". On a rewind attach the
+                            // cursor is TRANSLATED into the master's own
+                            // sequence space — adopt it durably before any
+                            // batch arrives, or every apply trips the
+                            // contiguity check against the old-space number.
+                            // Guarded to only move FORWARD: keepalive OKs
+                            // repeat the serve-time cursor, which goes stale
+                            // as applies progress.
+                            if let Some(returned) = s
+                                .split_whitespace()
+                                .nth(1)
+                                .and_then(|t| t.parse::<u64>().ok())
+                                && returned > kv.last_applied()
+                            {
+                                let _ = kv.set_last_applied(returned);
+                                eprintln!(
+                                    "adopted the master's translated cursor {returned}: tailing \
+                                     its sequence space now"
+                                );
+                            }
+                            // And ADOPT its epoch if ours is older: from here
+                            // on our cursor advances on the MASTER's
+                            // timeline, and re-presenting the pre-rewind
+                            // epoch would get a legitimately grown cursor
+                            // refused at the old fence on the next reconnect
+                            // (#187).
                             if let Some(adopted) = s
                                 .split_whitespace()
                                 .nth(2)

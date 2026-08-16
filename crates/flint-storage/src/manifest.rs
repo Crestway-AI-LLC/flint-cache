@@ -376,8 +376,11 @@ pub fn record_promo_fence(kv: &dyn Kv, epoch: Epoch, seq: u64) {
 /// The answer to "may a copy from epoch `since` resume from seq S?".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FenceBound {
-    /// Safe iff S <= this seq: the earliest recorded branch point after
-    /// `since` (fences are seq-monotone in epoch, so min == first).
+    /// Safe iff S <= this seq: the FIRST recorded branch point after
+    /// `since`. First by EPOCH, not a min over seqs — each promotion
+    /// switches to the promoted node's own sequence space, so seqs from
+    /// different fence rows are not comparable numbers; only the row whose
+    /// epoch immediately supersedes `since` is in the asker's space.
     Bound(u64),
     /// No promotion recorded after `since` on this node. The caller decides:
     /// for a node whose own claim epoch is <= `since` this means "never
@@ -387,11 +390,12 @@ pub enum FenceBound {
     Unfenced,
 }
 
-/// Earliest branch point strictly after `since`, from this node's local
-/// fence rows. See PROMO_FENCE_KEY_PREFIX for why local rows suffice on the
-/// current master of a two-member pair.
+/// The branch point of the smallest recorded epoch strictly after `since` —
+/// the promotion that superseded that lineage, in that lineage's own
+/// sequence space. See PROMO_FENCE_KEY_PREFIX for why local rows suffice on
+/// the current master of a two-member pair.
 pub fn promo_fence_bound(kv: &dyn Kv, since: Epoch) -> FenceBound {
-    let mut bound: Option<u64> = None;
+    let mut first: Option<(Epoch, u64)> = None;
     for (k, v) in kv.scan_prefix(PROMO_FENCE_KEY_PREFIX) {
         let Some(epoch) = Epoch::decode(&k[PROMO_FENCE_KEY_PREFIX.len()..]) else {
             continue;
@@ -402,9 +406,11 @@ pub fn promo_fence_bound(kv: &dyn Kv, since: Epoch) -> FenceBound {
         let Some(seq) = v.try_into().ok().map(u64::from_be_bytes) else {
             continue;
         };
-        bound = Some(bound.map_or(seq, |b: u64| b.min(seq)));
+        if first.is_none_or(|(e, _)| epoch < e) {
+            first = Some((epoch, seq));
+        }
     }
-    bound.map_or(FenceBound::Unfenced, FenceBound::Bound)
+    first.map_or(FenceBound::Unfenced, |(_, seq)| FenceBound::Bound(seq))
 }
 
 #[cfg(test)]
@@ -413,7 +419,7 @@ mod tests {
     use crate::MemKv;
 
     #[test]
-    fn promo_fence_bound_is_min_over_later_epochs() {
+    fn promo_fence_bound_is_the_first_epoch_above_not_a_seq_min() {
         let kv = MemKv::new();
         let e = |g, c| Epoch {
             generation: g,
@@ -422,13 +428,20 @@ mod tests {
         assert_eq!(promo_fence_bound(&kv, e(0, 1)), FenceBound::Unfenced);
         record_promo_fence(&kv, e(0, 2), 100);
         record_promo_fence(&kv, e(0, 4), 900);
-        record_promo_fence(&kv, e(1, 1), 5000);
+        // A LATER promotion with a numerically SMALLER seq: legal, because
+        // every promotion switches to the promoted node's own sequence
+        // space. Only the first-epoch-above row is in the asker's space; a
+        // min over seqs would wrongly select this one.
+        record_promo_fence(&kv, e(1, 1), 50);
         // From (0,1): the first branch after it is (0,2) at 100.
         assert_eq!(promo_fence_bound(&kv, e(0, 1)), FenceBound::Bound(100));
-        // From (0,2): its own fence does not bind it; the next is (0,4).
+        // From (0,2): its own fence does not bind it; the next is (0,4) —
+        // NOT the numerically smaller (1,1) row.
         assert_eq!(promo_fence_bound(&kv, e(0, 2)), FenceBound::Bound(900));
         // From (0,3): epochs strictly above, even without an exact row.
         assert_eq!(promo_fence_bound(&kv, e(0, 3)), FenceBound::Bound(900));
+        // From (0,4): the (1,1) row is what supersedes it.
+        assert_eq!(promo_fence_bound(&kv, e(0, 4)), FenceBound::Bound(50));
         // From (1,1): nothing recorded after it.
         assert_eq!(promo_fence_bound(&kv, e(1, 1)), FenceBound::Unfenced);
     }

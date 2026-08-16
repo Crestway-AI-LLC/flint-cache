@@ -849,7 +849,14 @@ fn warm_server_bin() {
     static WARM: std::sync::Once = std::sync::Once::new();
     WARM.call_once(|| {
         // print-and-exit, so this can never bind a port or leave a seat.
-        let _ = Command::new(server_bin()).arg("--build-version").output();
+        // ALL the binaries this harness spawns, not just the server: gate
+        // run 3 lost its chaos leg to a freshly re-linked flint-controller
+        // spending its first-exec loader stall inside the 20s promotion
+        // window — the same failure this warm-up already prevented for
+        // flint-server, one binary over.
+        for bin in [server_bin(), controller_bin(), proxy_bin()] {
+            let _ = Command::new(bin).arg("--build-version").output();
+        }
     });
 }
 

@@ -24,6 +24,7 @@ trap cleanup EXIT
 rm -rf "$STATE" "$INV"
 
 cargo build --release -q -p flint-server -p flint-proxy -p flint-controlplane \
+fleet_warm ./target/release/flint-server ./target/release/flint-proxy ./target/release/flint-controlplane ./target/release/flint-controller
   -p flint-controller -p flint-ctl --features flint-server/rocks
 
 cat > "$INV" <<EOF

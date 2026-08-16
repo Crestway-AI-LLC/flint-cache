@@ -41,6 +41,7 @@ trap cleanup EXIT
 
 cargo build --release -q -p flint-server --features flint-server/rocks \
   || { echo "FAIL: build"; exit 1; }
+fleet_warm ./target/release/flint-server ./target/release/flint-proxy ./target/release/flint-controlplane ./target/release/flint-controller
 
 CAP=$((4 * 1024 * 1024))          # 4 MiB/s: slow enough to be unmistakable
 MARGIN=2                          # uncapped must beat the cap by this factor

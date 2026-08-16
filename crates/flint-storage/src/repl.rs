@@ -214,6 +214,65 @@ impl RocksKv {
         self.db().latest_sequence_number()
     }
 
+    /// Map a position in this node's UPSTREAM stream to this node's OWN
+    /// sequence space.
+    ///
+    /// Sequence numbers are node-local: a replica applies each upstream
+    /// batch together with its cursor row in one WriteBatch, so its own
+    /// numbers run ahead of the upstream position it tracks. A cursor from
+    /// the old master's space therefore does not index this node's WAL —
+    /// the mistake soak run 30 measured: a rewound ex-master presented its
+    /// snapshot's (old-space) seq, the freshly promoted master served its
+    /// own WAL from that number, and the stream landed off-position (a
+    /// SequenceGap when the strict check caught it; silent identical-value
+    /// replays when it did not).
+    ///
+    /// The mapping is already durable in this node's WAL: every apply batch
+    /// ends with the cursor-row put whose VALUE is the upstream seq it
+    /// reached. Scan forward from `upstream_seq` (own-space is always >=
+    /// upstream-space, the drift is non-negative) until the first apply
+    /// batch that reached `upstream_seq`, and return that batch's own-space
+    /// last seq — the position a tailer of THIS node resumes from. A scan
+    /// that runs out of WAL or past the applies without finding the cursor
+    /// row is a WalGap: the caller full-syncs, the safe default.
+    pub fn own_seq_for_upstream(&self, upstream_seq: u64) -> Result<u64, ReplError> {
+        struct CursorFind {
+            seq: u64,
+            reached: Option<u64>,
+        }
+        impl WriteBatchIterator for CursorFind {
+            fn put(&mut self, key: &[u8], value: &[u8]) {
+                self.seq += 1;
+                if key == REPL_STATE_KEY {
+                    self.reached = value.try_into().ok().map(u64::from_be_bytes);
+                }
+            }
+            fn delete(&mut self, _key: &[u8]) {
+                self.seq += 1;
+            }
+        }
+        let iter = self
+            .db()
+            .get_updates_since(upstream_seq.saturating_sub(1))
+            .map_err(|e| ReplError::WalGap(e.to_string()))?;
+        for item in iter {
+            let (first_seq, batch) = item.map_err(|e| ReplError::Storage(e.to_string()))?;
+            let mut find = CursorFind {
+                seq: first_seq - 1,
+                reached: None,
+            };
+            batch.iterate(&mut find);
+            if let Some(reached) = find.reached
+                && reached >= upstream_seq
+            {
+                return Ok(find.seq);
+            }
+        }
+        Err(ReplError::WalGap(format!(
+            "no apply batch reaching upstream seq {upstream_seq} is retained in this WAL"
+        )))
+    }
+
     /// Set the replica cursor directly (after a checkpoint full sync, the
     /// copied DB's own latest sequence IS the master cursor).
     pub fn set_last_applied(&self, seq: u64) -> Result<(), ReplError> {

@@ -293,6 +293,21 @@ fleet_cp() {
 # developer's cluster, or a sibling suite, was doing the wrong thing quietly;
 # stopping with an explanation is the right thing loudly.
 # FLINT_DRILL_FORCE=1 proceeds anyway (a CI box that really is ours alone).
+# fleet_warm <bin ...> — pay each binary's first-exec loader stall OUTSIDE
+# any timed window. macOS can spend 20-30s in the dynamic loader the first
+# time a freshly linked binary runs; a drill whose cargo build re-linked a
+# binary mid-gate then eats that stall inside its own 30s ping budget and
+# fails with "no PONG" against a perfectly healthy build (gate run 3 lost
+# five drills to exactly this). --build-version prints and exits, so this
+# can never bind a port or leave a seat.
+fleet_warm() {
+  local bin
+  for bin in "$@"; do
+    [ -x "$bin" ] && "$bin" --build-version >/dev/null 2>&1
+  done
+  return 0
+}
+
 fleet_guard() {
   local foreign sibling
   foreign="$(_fleet_foreign)"

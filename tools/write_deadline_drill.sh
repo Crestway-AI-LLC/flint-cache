@@ -46,6 +46,7 @@ trap cleanup EXIT
 
 cargo build --release -q -p flint-server --features flint-server/rocks \
   || { echo "FAIL: build"; exit 1; }
+fleet_warm ./target/release/flint-server ./target/release/flint-proxy ./target/release/flint-controlplane ./target/release/flint-controller
 
 echo "== master on the shipped default deadline"
 $B --port 6392 --engine rocks --data-dir "$D/m" 2>"$D/m.log" &

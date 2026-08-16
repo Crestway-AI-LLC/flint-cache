@@ -40,7 +40,7 @@ cleanup() { fleet_kill server; rm -rf "$D"; }
 trap cleanup EXIT
 
 cargo build --release -q -p flint-server --features rocks || { echo "FAIL: build"; exit 1; }
-"$B" --build-version >/dev/null 2>&1 || true
+fleet_warm "$B" ./target/release/flint-proxy ./target/release/flint-controlplane ./target/release/flint-controller
 
 wait_seq() { # wait until node $1's last_applied reaches $2 (budget: 20s)
   for _ in $(seq 1 200); do
@@ -73,6 +73,13 @@ echo "== arm A: kill A, promote B, rejoin A marked — it must REWIND, not re-se
 kill -9 "$(pgrep -f "flint-server --port 6405" | head -1)" 2>/dev/null
 sleep 0.3
 valkey-cli -p 6406 FLINTPROMOTE 0 2 | grep -q "OK promoted" || { echo "FAIL: promote B"; exit 1; }
+# LIVE LOAD through the whole rejoin. The quiet version of this drill passed
+# while the loaded fleet failed in one cycle (soak run 30): under writes, the
+# promoted master's own sequence numbers drift ahead of the stream positions
+# the snapshot labels carry, and an untranslated attach lands off-position.
+# A drill without the load never exercises the translation at all (#121).
+( i=0; while :; do valkey-cli -p 6406 SET "live:$((i+=1))" "L$i" >/dev/null 2>&1; done ) &
+LOADPID=$!
 for i in $(seq 1 50); do valkey-cli -p 6406 SET "post:$i" "n$i" >/dev/null; done
 BTIP=$(valkey-cli -p 6406 FLINTINFO | tr '\r' '\n' | sed -n 's/^latest_seq://p')
 
@@ -91,7 +98,21 @@ grep -q "full sync: received" "$D/a2.log" && {
   echo "FAIL: a full checkpoint was transferred anyway — the rewind saved nothing"
   exit 1
 }
+grep -q "rewind attach: upstream cursor" "$D/b1.log" || {
+  echo "FAIL: the master never translated the rewound cursor into its own"
+  echo "      sequence space — an untranslated attach is off-position under"
+  echo "      load (SequenceGap at best, silent replays at worst)"
+  exit 1
+}
+kill "$LOADPID" 2>/dev/null; wait "$LOADPID" 2>/dev/null
+BTIP=$(valkey-cli -p 6406 FLINTINFO | tr '\r' '\n' | sed -n 's/^latest_seq://p')
 wait_seq 6405 "$BTIP" || { echo "FAIL: rewound A never converged to B's tip"; exit 1; }
+DA=$(valkey-cli -p 6405 DBSIZE); DB=$(valkey-cli -p 6406 DBSIZE)
+[ "$DA" = "$DB" ] || {
+  echo "FAIL: keyspaces diverge after the loaded rejoin ($DA vs $DB) — the"
+  echo "      attach replayed or skipped writes"
+  exit 1
+}
 grep -q "adopted the master's role epoch (0,2)" "$D/a2.log" || {
   echo "FAIL: A never adopted B's epoch; its next reconnect would present the"
   echo "      old one and be refused at the fence its own cursor has outgrown"
