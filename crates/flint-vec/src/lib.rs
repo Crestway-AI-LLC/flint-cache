@@ -1493,7 +1493,6 @@ mod tests {
         }
     }
 
-    #[test]
     /// The index keys must be distinguishable from the rows they index, and
     /// from each other, or a rebuild reading one would load the other.
     #[test]

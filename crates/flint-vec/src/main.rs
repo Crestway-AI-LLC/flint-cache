@@ -58,13 +58,44 @@ enum LoadState {
         /// A chunk is actively draining a channel right now (guards against two
         /// chunks racing on one namespace).
         running: bool,
-        /// The ordered durable-key list (configs before vectors) — `None` until
-        /// the first chunk's SCAN completes.
-        keys: Option<Vec<Vec<u8>>>,
-        /// GET cursor into `keys`: how many have been fetched and installed.
-        next: usize,
+        /// How far the rebuild has got: still enumerating the indexes, or
+        /// fetching the rows they named.
+        phase: Phase,
     },
     Loaded,
+}
+
+/// Where a rebuild is up to. BOTH halves are resumable across channels, which
+/// discovery was not when it first landed: enumerating a set costs one command
+/// per bucket, so `1 + INDEX_BUCKETS` commands for a single set already exceeds
+/// a channel's 256-command budget (D3) and the rebuild could never finish.
+#[derive(Clone)]
+enum Phase {
+    /// Enumerating the co-processor's own indexes.
+    Discover {
+        /// Set names still to walk; `None` until the set index itself is read.
+        /// The front element is the set currently being enumerated.
+        sets: Option<Vec<Vec<u8>>>,
+        /// Next bucket to read for the front set.
+        bucket: u16,
+        /// Keys found so far — configs first, then vectors, so a set exists
+        /// before its Inserts commit.
+        configs: Vec<Vec<u8>>,
+        vectors: Vec<Vec<u8>>,
+    },
+    /// Enumeration finished; fetching rows from `next` onward.
+    Fetch { keys: Vec<Vec<u8>>, next: usize },
+}
+
+impl Phase {
+    fn start() -> Self {
+        Phase::Discover {
+            sets: None,
+            bucket: 0,
+            configs: Vec::new(),
+            vectors: Vec::new(),
+        }
+    }
 }
 type Loads = Arc<Mutex<HashMap<Vec<u8>, LoadState>>>;
 
@@ -72,13 +103,9 @@ type Loads = Arc<Mutex<HashMap<Vec<u8>, LoadState>>>;
 enum Chunk {
     /// Every row is loaded; the set is warm. Carries the total vector count.
     Done(usize),
-    /// The channel's budget ran out; carries the ordered keys and the GET cursor
-    /// to resume from on the next channel, plus how many this chunk installed.
-    More {
-        keys: Vec<Vec<u8>>,
-        next: usize,
-        installed: usize,
-    },
+    /// The channel's budget ran out; carries the resume point for the next
+    /// channel, plus how many rows this chunk installed.
+    More { phase: Phase, installed: usize },
 }
 
 /// A decoded config row awaiting install: `(set, dim, metric, index)`.
@@ -286,25 +313,23 @@ fn handle_flintfam(frame: &Value, store: &Arc<Mutex<Store>>, loads: &Loads, tls:
             }
             Some(LoadState::Loading {
                 running: false,
-                keys,
-                next,
-            }) => Some((keys.clone(), *next)),
-            None => Some((None, 0)),
+                phase,
+            }) => Some(phase.clone()),
+            None => Some(Phase::start()),
         };
-        if let Some((keys, next)) = resume {
+        if let Some(phase) = resume {
             lk.insert(
                 ns.to_vec(),
                 LoadState::Loading {
                     running: true,
-                    keys: keys.clone(),
-                    next,
+                    phase: phase.clone(),
                 },
             );
             drop(lk);
             let (ns, token, callback) = (ns.to_vec(), token.to_vec(), callback.to_vec());
             let (store, loads, edge) = (store.clone(), loads.clone(), tls.edge.clone());
             std::thread::spawn(move || {
-                rebuild_chunk(ns, token, callback, store, loads, edge, keys, next)
+                rebuild_chunk(ns, token, callback, store, loads, edge, phase)
             });
             return err("LOADING vector index is warming, retry");
         }
@@ -345,11 +370,10 @@ fn rebuild_chunk(
     store: Arc<Mutex<Store>>,
     loads: Loads,
     edge: Option<Arc<flint_tls::ClientConfig>>,
-    keys: Option<Vec<Vec<u8>>>,
-    next: usize,
+    phase: Phase,
 ) {
     let name = String::from_utf8_lossy(&ns).into_owned();
-    match rebuild_chunk_inner(&ns, &token, &callback, &store, &edge, keys, next) {
+    match rebuild_chunk_inner(&ns, &token, &callback, &store, &edge, phase) {
         Ok(Chunk::Done(total)) => {
             eprintln!("flint-vec: rebuilt ns {name:?} ({total} vectors) from durable rows");
             loads
@@ -357,21 +381,28 @@ fn rebuild_chunk(
                 .expect("loads lock")
                 .insert(ns, LoadState::Loaded);
         }
-        Ok(Chunk::More {
-            keys,
-            next,
-            installed,
-        }) => {
+        Ok(Chunk::More { phase, installed }) => {
+            let where_ = match &phase {
+                Phase::Discover {
+                    sets,
+                    bucket,
+                    vectors,
+                    ..
+                } => format!(
+                    "still enumerating ({} set(s) left, bucket {bucket}, {} vectors found)",
+                    sets.as_ref().map_or(0, |s| s.len()),
+                    vectors.len()
+                ),
+                Phase::Fetch { keys, next } => format!("{next}/{} keys fetched", keys.len()),
+            };
             eprintln!(
-                "flint-vec: ns {name:?} rebuild chunk loaded {installed} ({next}/{} keys); resuming on the next channel",
-                keys.len()
+                "flint-vec: ns {name:?} rebuild chunk loaded {installed}; {where_}; resuming on the next channel"
             );
             loads.lock().expect("loads lock").insert(
                 ns,
                 LoadState::Loading {
                     running: false,
-                    keys: Some(keys),
-                    next,
+                    phase,
                 },
             );
         }
@@ -397,8 +428,7 @@ fn rebuild_chunk_inner(
     callback: &[u8],
     store: &Arc<Mutex<Store>>,
     edge: &Option<Arc<flint_tls::ClientConfig>>,
-    keys: Option<Vec<Vec<u8>>>,
-    next: usize,
+    phase: Phase,
 ) -> Result<Chunk, String> {
     let addr = std::str::from_utf8(callback).map_err(|_| "bad callback".to_string())?;
     let mut ch = flint_tls::connect_edge(addr, edge).map_err(|e| format!("channel dial: {e}"))?;
@@ -409,37 +439,81 @@ fn rebuild_chunk_inner(
         return Err(format!("channel refused: {e}"));
     }
 
-    // Phase 1 (first chunk only): build the key list from the co-processor's OWN
-    // durable indexes, configs before vectors so a set exists before its Inserts
-    // commit.
+    // Phase 1: build the key list from the co-processor's OWN durable indexes,
+    // configs before vectors so a set exists before its Inserts commit.
     //
-    // This USED TO SCAN THE WHOLE NAMESPACE and keep the reserved-prefix keys,
+    // This USED TO SCAN THE WHOLE NAMESPACE and filter for the reserved prefix,
     // which made recovery cost the size of the TENANT rather than the number of
     // vectors. Beside a 500 GB data plane that is ~500M keys: the seat sat in
     // -LOADING until it tripped the per-channel SCAN budget, so a co-processor
-    // could never come back on any fleet big enough to want one — and restart
-    // is every upgrade, every host replacement, every OOM (#194). A prefix seek
-    // cannot fix it either: keys are encoded <ns><slot><user key> and the slot
-    // is a hash, so rows sharing a user-key prefix share no physical range.
+    // could never come back on any fleet big enough to want one — and restart is
+    // every upgrade, every host replacement, every OOM (#194). A prefix seek
+    // cannot fix it either: keys encode as <ns><slot><user key> and the slot is
+    // a hash, so rows sharing a user-key prefix share no physical range.
     //
-    // So the co-processor keeps its own index instead: a set of set NAMES, and
-    // per set an id index split across INDEX_BUCKETS keys. Reads are bounded
-    // (a bucket, not a corpus) and spread across slots (no hot key).
-    let keys = match keys {
-        Some(k) => k,
-        None => {
-            let mut configs: Vec<Vec<u8>> = Vec::new();
-            let mut vectors: Vec<Vec<u8>> = Vec::new();
-            for set in smembers(&mut ch, &flint_vec::sets_index_key())? {
-                configs.push(flint_vec::config_key(&set));
-                for b in 0..flint_vec::INDEX_BUCKETS {
-                    for id in smembers(&mut ch, &flint_vec::index_key(&set, b))? {
-                        vectors.push(flint_vec::vector_key(&set, &id));
+    // ENUMERATION IS ITSELF CHUNKED, which the first version of this got wrong.
+    // Walking a set costs one command per bucket, so `1 + INDEX_BUCKETS` already
+    // exceeds a channel's 256-command budget for a SINGLE set: discovery never
+    // finished and the seat rebuilt 0 vectors forever. Rather than hardcode the
+    // proxy's budget here — two constants that would drift apart silently — the
+    // budget is discovered the same way Phase 2 discovers it: an exhausted
+    // channel answers an error naming it, which is the EXPECTED end of a chunk.
+    let (keys, next) = match phase {
+        Phase::Fetch { keys, next } => (keys, next),
+        Phase::Discover {
+            mut sets,
+            mut bucket,
+            mut configs,
+            mut vectors,
+        } => {
+            // The set index itself, once. Its cost is one command, and a fleet
+            // has a handful of vector sets, so it is never the bottleneck.
+            if sets.is_none() {
+                match smembers(&mut ch, &flint_vec::sets_index_key())? {
+                    Some(names) => {
+                        configs.extend(names.iter().map(|n| flint_vec::config_key(n)));
+                        sets = Some(names);
+                    }
+                    None => {
+                        return Ok(Chunk::More {
+                            phase: Phase::Discover {
+                                sets: None,
+                                bucket: 0,
+                                configs,
+                                vectors,
+                            },
+                            installed: 0,
+                        });
                     }
                 }
             }
+            let mut remaining = sets.unwrap_or_default();
+            // Walk buckets of the front set until the channel is spent.
+            while let Some(set) = remaining.first().cloned() {
+                while bucket < flint_vec::INDEX_BUCKETS {
+                    match smembers(&mut ch, &flint_vec::index_key(&set, bucket))? {
+                        Some(ids) => {
+                            vectors.extend(ids.iter().map(|id| flint_vec::vector_key(&set, id)));
+                            bucket += 1;
+                        }
+                        None => {
+                            return Ok(Chunk::More {
+                                phase: Phase::Discover {
+                                    sets: Some(remaining),
+                                    bucket,
+                                    configs,
+                                    vectors,
+                                },
+                                installed: 0,
+                            });
+                        }
+                    }
+                }
+                remaining.remove(0);
+                bucket = 0;
+            }
             configs.extend(vectors);
-            configs
+            (configs, 0)
         }
     };
 
@@ -490,8 +564,7 @@ fn rebuild_chunk_inner(
         Ok(Chunk::Done(total))
     } else {
         Ok(Chunk::More {
-            keys,
-            next: i,
+            phase: Phase::Fetch { keys, next: i },
             installed,
         })
     }
@@ -536,17 +609,24 @@ fn install(
 /// Every member of a durable index key. A MISSING key is an empty set, not an
 /// error: a set with no vectors in a given bucket is the ordinary case, and
 /// there are INDEX_BUCKETS of them per set.
-fn smembers(ch: &mut flint_tls::Stream, key: &[u8]) -> Result<Vec<Vec<u8>>, String> {
+/// Every member of a durable index key, or `None` when the channel's budget is
+/// spent — which is the EXPECTED end of a chunk, not a fault, so the caller
+/// saves its place and resumes on the next channel. A MISSING key is an empty
+/// set: most of a set's INDEX_BUCKETS buckets are empty for a small corpus.
+fn smembers(ch: &mut flint_tls::Stream, key: &[u8]) -> Result<Option<Vec<Vec<u8>>>, String> {
     send_cmd(ch, &[b"SMEMBERS", key]).map_err(|e| format!("SMEMBERS: {e}"))?;
     match read_reply(ch).map_err(|e| format!("SMEMBERS: {e}"))? {
-        Value::Array(Some(items)) => Ok(items
-            .into_iter()
-            .filter_map(|v| match v {
-                Value::Bulk(Some(b)) => Some(b),
-                _ => None,
-            })
-            .collect()),
-        Value::Array(None) => Ok(Vec::new()),
+        Value::Array(Some(items)) => Ok(Some(
+            items
+                .into_iter()
+                .filter_map(|v| match v {
+                    Value::Bulk(Some(b)) => Some(b),
+                    _ => None,
+                })
+                .collect(),
+        )),
+        Value::Array(None) => Ok(Some(Vec::new())),
+        Value::Error(e) if e.contains("budget") => Ok(None),
         Value::Error(e) => Err(format!("SMEMBERS rejected: {e}")),
         _ => Err("SMEMBERS unexpected reply".into()),
     }
