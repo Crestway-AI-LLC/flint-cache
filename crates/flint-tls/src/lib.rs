@@ -296,6 +296,64 @@ impl Stream {
     pub fn set_write_timeout(&self, d: Option<std::time::Duration>) -> io::Result<()> {
         self.sock().set_write_timeout(d)
     }
+
+    /// Read WITHOUT first flushing pending TLS write data.
+    ///
+    /// `rustls::StreamOwned::read` (the `Read` impl above) completes prior
+    /// io before reading: pending write bytes are flushed FIRST, and when
+    /// the send buffer is full that flush is a `WouldBlock` — the read
+    /// returns having consumed nothing. On a full-duplex hop (FLINTSYNC
+    /// batches one way, ACKs the other) that couples the directions: the
+    /// serving side cannot drain ACKs while its own send is jammed, the
+    /// replica is blocked writing the very ACK the drain would consume,
+    /// and the pair deadlocks with both send buffers full. Soak run 32
+    /// died exactly there — kernel stacks showed one thread per side in
+    /// `sk_stream_wait_memory`, the server cycling on its 50ms write
+    /// timeout and its "drain" never consuming a byte. The volume needed
+    /// to fill both buffers is why no loopback drill ever saw it.
+    ///
+    /// This path flushes only opportunistically (a jammed flush is skipped,
+    /// not fatal) and then reads regardless, so a jammed send direction can
+    /// never gate the receive direction. `WouldBlock` out of this call
+    /// means "no inbound data this tick", exactly like a plain read.
+    pub fn drain_read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        fn tls_read<C, D>(conn: &mut C, sock: &mut TcpStream, buf: &mut [u8]) -> io::Result<usize>
+        where
+            C: std::ops::DerefMut<Target = rustls::ConnectionCommon<D>>,
+        {
+            loop {
+                match io::Read::read(&mut conn.reader(), buf) {
+                    Ok(n) => return Ok(n),
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {} // nothing buffered
+                    Err(e) => return Err(e),
+                }
+                if conn.wants_write() {
+                    match conn.write_tls(sock) {
+                        Ok(_) => {}
+                        Err(e)
+                            if e.kind() == io::ErrorKind::WouldBlock
+                                || e.kind() == io::ErrorKind::TimedOut => {}
+                        Err(e) => return Err(e),
+                    }
+                }
+                match conn.read_tls(sock) {
+                    Ok(0) => return Ok(0), // peer closed
+                    Ok(_) => {
+                        conn.process_new_packets()
+                            .map_err(|e| io::Error::other(format!("tls: {e}")))?;
+                    }
+                    // Includes WouldBlock/TimedOut from the socket read
+                    // timeout: surfaced to the caller as "no data".
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+        match self {
+            Stream::Plain(s) => io::Read::read(s, buf),
+            Stream::ServerTls(s) => tls_read(&mut s.conn, &mut s.sock, buf),
+            Stream::ClientTls(s) => tls_read(&mut s.conn, &mut s.sock, buf),
+        }
+    }
 }
 
 /// Accept side: wrap an already-accepted `TcpStream` as plaintext, or drive a

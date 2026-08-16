@@ -3064,7 +3064,12 @@ fn drain_acks(
                     hub.record_ack(replica_id, seq, flint_storage::strings::system_clock());
                 }
             }
-            Ok(Decoded::NeedMore) => match stream.read(&mut chunk) {
+            // drain_read, NOT read: the plain read on a TLS stream flushes
+            // pending write data before reading, so with the batch send
+            // jammed this drain consumed nothing — the replica sat blocked
+            // writing the very ACK this loop exists to consume, and the two
+            // sides deadlocked with both send buffers full (soak run 32).
+            Ok(Decoded::NeedMore) => match stream.drain_read(&mut chunk) {
                 Ok(0) => {
                     eprintln!("replication stream ended: replica closed");
                     return Ok(false);
@@ -3673,6 +3678,13 @@ mod replica {
         let mut stream = internal_connect(target)?;
         // Short read timeout so the stop flag is honored promptly.
         stream.set_read_timeout(Some(std::time::Duration::from_millis(300)))?;
+        // Bounded ACK writes. An unbounded write here parked this thread in
+        // the kernel's send path for good when the master stopped draining
+        // (run 32's deadlock): the master's drain now reads through a jammed
+        // send (drain_read), so this should never fire — if it still does,
+        // the error tears the connection down and the tailer reconnects from
+        // its durable cursor, which is a 1s hiccup instead of a wedge.
+        stream.set_write_timeout(Some(std::time::Duration::from_millis(5_000)))?;
         let cursor = kv.last_applied();
         // Present our role-claim epoch — our timeline identity. Equal to the
         // master's in steady state (fresh syncs copy it, and acceptance

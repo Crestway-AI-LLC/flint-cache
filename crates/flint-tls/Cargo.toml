@@ -14,5 +14,10 @@ ring = "0.17"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 x509-parser = "0.18.1"
 
+[dev-dependencies]
+# In-test CA + leaf minting for the drain_read deadlock regression test —
+# same ring backend as the runtime stack, no extra toolchain.
+rcgen = { version = "0.13", default-features = false, features = ["pem", "ring"] }
+
 [lints]
 workspace = true
