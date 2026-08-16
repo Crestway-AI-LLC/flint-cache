@@ -10,6 +10,7 @@
 #   A  hot GET        100% GET over a small keyspace (page-cache resident)
 #   B  mixed 1:10     SET:GET=1:10, gaussian keys over the loaded range
 #   C  pipelined GET  scenario A with --pipeline=16 (throughput shape)
+#   D  SET only       100% SET — the PUT number, isolated
 # Each runs 30s after a data load. Values 1024B RANDOM (incompressible —
 # constant values compress ~15:1 in the engine and fake residency).
 #
@@ -17,7 +18,16 @@
 #   - name the exact instance type, dataset size vs RAM, and whether the
 #     dataset exceeds RAM (the row that matters for Flint);
 #   - never publish numbers from a laptop or shared box;
-#   - publish the competitor row from the SAME box, same script, same day.
+#   - publish the competitor row from the SAME box, same script, same day;
+#   - say where the CLIENT ran. Every Flint latency published up to
+#     2026-08-16 was loopback (client and server on one box), which omits
+#     the two hops a real caller pays. A loopback row and an off-box row
+#     are different measurements and must never share a table without
+#     saying which is which;
+#   - scenario D is NOT comparable across engines without its contract.
+#     Flint acks a SET fsync-bounded (WAL cadence, --wal-fsync-ms); Redis,
+#     Valkey and ElastiCache ack from RAM and fsync later (or never). The
+#     same column holds two different promises, so print the promise.
 set -euo pipefail
 HOST="${1:?host}"; PORT="${2:?port}"; shift 2
 EXTRA=()
@@ -47,5 +57,11 @@ echo "|---|---|---|---|---|---|"
 run "A-hot-get"      --ratio=0:1 --key-pattern=G:G --key-stddev=$((KEYS/100))
 run "B-mixed-1-10"   --ratio=1:10 --key-pattern=G:G
 run "C-get-pipe16"   --ratio=0:1 --key-pattern=G:G --pipeline=16
+# Over the SAME loaded keyspace, so these are overwrites — the steady-state
+# write a cache actually serves. Writing fresh keys instead would measure
+# the fill path (and grow the dataset mid-run, moving the read rows).
+run "D-set-only"     --ratio=1:0 --key-pattern=G:G
 echo
 echo "raw outputs: /tmp/memtier-*.out (Totals line: ops/s, avg, p50, p99, p99.9 latency ms)"
+echo "scenario D (SET) carries a durability contract — state it alongside the"
+echo "number: Flint acks fsync-bounded, RAM caches ack before any disk write."
