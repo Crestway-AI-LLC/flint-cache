@@ -29,6 +29,25 @@ pub struct RocksKv {
     wal_fsyncs: std::sync::atomic::AtomicU64,
 }
 
+/// WAL retention defaults (v0: 1h / 1GB). Read from the environment so that
+/// every `RocksKv::open` call site inherits an operator's or a drill's choice
+/// without threading the pair through a dozen signatures; `open_with_wal` is
+/// the explicit form. Invalid values fall back to the default rather than
+/// panicking a node at boot over a typo'd tunable.
+fn wal_retain_secs() -> u64 {
+    std::env::var("FLINT_WAL_RETAIN_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3600)
+}
+
+fn wal_retain_mb() -> u64 {
+    std::env::var("FLINT_WAL_RETAIN_MB")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1024)
+}
+
 impl RocksKv {
     /// Bytes of live SST data on disk — the capacity-model fill signal
     /// (FLINTINFO `sst_bytes:`; expansion triggers derive fill fractions
@@ -178,12 +197,23 @@ impl RocksKv {
     }
 
     pub fn open(path: &Path) -> Result<Self, rocksdb::Error> {
+        Self::open_with_wal(path, wal_retain_secs(), wal_retain_mb())
+    }
+
+    /// `open`, with the WAL retention window given explicitly.
+    ///
+    /// The window is what a lagging replica may resume-tail from; past it the
+    /// replica must escalate to a full sync (#106). Both bounds matter and the
+    /// SIZE one binds first under load: 1 GB at 40 MB/s of ingest is ~25
+    /// SECONDS of tolerance, not the hour the TTL suggests — a byte budget is
+    /// secretly a time budget divided by the ingest rate (#197). Exposed so a
+    /// drill can shrink the window to reach that boundary in seconds instead
+    /// of gigabytes, and so an operator can size it against measured rate.
+    pub fn open_with_wal(path: &Path, wal_secs: u64, wal_mb: u64) -> Result<Self, rocksdb::Error> {
         let mut opts = Options::default();
         opts.create_if_missing(true);
-        // Retain WAL long enough for replicas to tail it (v0: 1h / 1GB;
-        // beyond that a replica must full-sync from a checkpoint).
-        opts.set_wal_ttl_seconds(3600);
-        opts.set_wal_size_limit_mb(1024);
+        opts.set_wal_ttl_seconds(wal_secs);
+        opts.set_wal_size_limit_mb(wal_mb);
         // Expired metadata rows are dropped organically as compaction
         // rewrites them (subkey orphans are reclaimed by gc::sweep until
         // the filter gains a metadata-lookup handle).
