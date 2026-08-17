@@ -40,7 +40,8 @@
 # flattering result this file exists to avoid.
 #
 # Usage:
-#   tools/ingest_decay_sweep.sh                 # default sweep
+#   DECAY_PIN=0,1 tools/ingest_decay_sweep.sh   # seat on 2 cores of a big box
+#   tools/ingest_decay_sweep.sh                 # on a genuinely small host
 #   DECAY_JOBS='0 2 4 6' tools/ingest_decay_sweep.sh
 #   DECAY_KEYS=120000 tools/ingest_decay_sweep.sh    # deeper, slower
 #
@@ -72,17 +73,48 @@ INTERVALS="${DECAY_INTERVALS:-8}"    # ~100 MB per interval
 JOBS="${DECAY_JOBS:-0 2 4 6}"
 SETTLE="${DECAY_SETTLE:-20}"         # seconds after the feed, for the stats dump
 
-# THE HOST ASSERTS. Both are refusals, not warnings: a warning in a log is
-# how a number from the wrong machine ends up in a document.
-NCPU=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 0)
-if [ "${DECAY_ANY_HOST:-0}" != "1" ] && [ "$NCPU" -gt 4 ]; then
-  echo "REFUSED: $NCPU cores. This sweep is only meaningful where compaction"
-  echo "  and the write path contend — the 2-vCPU seat we ship. On this host"
-  echo "  more background jobs are close to free, so the answer would be"
-  echo "  'more is better' regardless of the truth on a real node."
-  echo "  Run it on an i4i.large (packaging/aws/gate-box/run.sh with"
-  echo "  FLINT_GATE_TYPE=i4i.large), or set DECAY_ANY_HOST=1 if you are"
-  echo "  deliberately measuring something else."
+# CONSTRAIN THE SERVER, NOT THE MACHINE — and prefer pinning to a small
+# instance. DECAY_PIN taskset-pins the SEAT to a couple of cores on a big host
+# and leaves the load generator the rest.
+#
+# That is not a convenience, it is the more faithful arrangement. On a real
+# 2-vCPU seat the load arrives from OTHER machines, so both cores are the
+# server's. Running the driver locally on a 2-vCPU box would have it competing
+# with the thing under test for exactly the resource in question, and every
+# column would carry the driver's appetite. Pinning separates them the way the
+# fleet does. It also sidesteps a cold RocksDB build on two cores, which costs
+# more wall-clock than the measurement.
+PIN="${DECAY_PIN:-}"
+if [ -n "$PIN" ]; then
+  command -v taskset >/dev/null || {
+    echo "REFUSED: DECAY_PIN=$PIN but no taskset on this host."; exit 2; }
+  # Count the CPUs in a list like "0,1" or "0-3".
+  SEAT_CPUS=$(python3 - "$PIN" <<'PYEOF'
+import sys
+n = 0
+for part in sys.argv[1].split(","):
+    if "-" in part:
+        a, b = part.split("-"); n += int(b) - int(a) + 1
+    else:
+        n += 1
+print(n)
+PYEOF
+)
+  RUN=(taskset -c "$PIN")
+else
+  SEAT_CPUS=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 0)
+  RUN=()
+fi
+
+# THE HOST ASSERTS. Refusals, not warnings: a warning in a log is how a number
+# from the wrong machine ends up in a document.
+if [ "${DECAY_ANY_HOST:-0}" != "1" ] && [ "$SEAT_CPUS" -gt 4 ]; then
+  echo "REFUSED: the seat would have $SEAT_CPUS cores. This sweep is only"
+  echo "  meaningful where compaction and the write path contend — the 2-vCPU"
+  echo "  seat we ship. With more, background jobs are close to free, so the"
+  echo "  answer is 'more is better' regardless of the truth on a real node."
+  echo "  Pin the seat (DECAY_PIN=0,1) or run on an i4i.large; DECAY_ANY_HOST=1"
+  echo "  if you are deliberately measuring something else."
   exit 2
 fi
 if [ ! -r /proc/self/stat ]; then
@@ -195,14 +227,27 @@ for J in $JOBS; do
   export FLINT_LEVEL_BASE_MB=8 FLINT_WRITE_BUFFER_MB=4 FLINT_STATS_DUMP_SEC=5
 
   echo
-  echo "== FLINT_BG_JOBS=$LABEL  ($KEYS x ${VSIZE}B, $INTERVALS intervals)"
-  "$BIN" --port "$PORT" --engine rocks --data-dir "$DIR" >"$DIR/out" 2>&1 &
+  echo "== FLINT_BG_JOBS=$LABEL  ($KEYS x ${VSIZE}B, $INTERVALS intervals, seat on $SEAT_CPUS core(s))"
+  "${RUN[@]+"${RUN[@]}"}" "$BIN" --port "$PORT" --engine rocks --data-dir "$DIR" >"$DIR/out" 2>&1 &
   # Ready, not merely listening: since #176 a node binds before it can serve,
   # and a first interval that started against a node still coming up would be
   # charged to compaction.
   fleet_wait_ready "$PORT"
   SPID=$(pgrep -f "flint-server --port $PORT( |$)" | head -1)
   [ -n "$SPID" ] || { echo "FAIL: no server pid for :$PORT"; exit 1; }
+
+  # THE PIN IS VERIFIED, NOT ASSUMED. taskset can succeed and still leave the
+  # process on every CPU if the mask was misread, and an unpinned seat on a
+  # 16-core box produces exactly the flattering "more jobs is free" answer
+  # this whole file refuses to produce. Ask the kernel what it actually did.
+  if [ -n "$PIN" ]; then
+    ALLOWED=$(grep -m1 '^Cpus_allowed_list:' "/proc/$SPID/status" 2>/dev/null | awk '{print $2}')
+    [ "$ALLOWED" = "$PIN" ] || {
+      echo "FAIL: asked for CPUs [$PIN], the seat is running on [${ALLOWED:-unknown}]."
+      echo "  An unpinned seat measures the host, not the node we ship."
+      exit 1
+    }
+  fi
 
   read -r E0 O0 <<<"$(cpu_snapshot "$SPID")"
   FIRST=""; LAST=""; ENG_TICKS=0; TOT_SECS=0
