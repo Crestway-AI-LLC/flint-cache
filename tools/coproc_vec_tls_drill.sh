@@ -100,8 +100,28 @@ done
 S="$(vexec VEC.SEARCH docs 0.9,0.1,0 2)"
 case "$S" in *a*b*) : ;; *) echo "FAIL: SEARCH order over mTLS, got: $S"; exit 1 ;; esac
 case "$(vexec VEC.GET docs a)" in *"1,0,0"*) : ;; *) echo "FAIL: VEC.GET over mTLS"; exit 1 ;; esac
-# The durable rows landed in KV through the (plaintext-edge, mTLS-backend) channel.
-[ "$($A DBSIZE 2>&1 | tr -d '\r')" = "4" ] || { echo "FAIL: expected 4 durable keys, got $($A DBSIZE)"; exit 1; }
+# The durable rows landed in KV through the (plaintext-edge, mTLS-backend)
+# channel. DERIVED, not a constant, for the reason spelled out at the same
+# assertion in coproc_vec_drill.sh: this said "4" (config + vectors) and stayed
+# at 4 when #194 added the durable id index, then reported that index as four
+# lost keys.
+EXPECT=$(python3 - <<'PY'
+def bucket(i):                       # flint_vec::bucket_of
+    h = 0x811c9dc5
+    for b in i.encode():
+        h ^= b
+        h = (h * 0x01000193) & 0xffffffff
+    return h % 256
+sets = {"docs": ["a", "b", "c"]}
+print(1 + sum(1 + len(ids) + len({bucket(i) for i in ids}) for ids in sets.values()))
+PY
+)
+GOT=$($A DBSIZE 2>&1 | tr -d '\r')
+[ "$GOT" = "$EXPECT" ] || {
+  echo "FAIL: expected $EXPECT durable keys (1 sets index + 1 config + 3 vectors"
+  echo "      + one id-index bucket per distinct id hash), got $GOT"
+  exit 1
+}
 echo "  VEC.SEARCH -> $S  (mutual handshake completed, or this would be COPROCUNAVAIL)"
 
 echo "== NEGATIVE: a PLAINTEXT dialer to the co-processor's FLINTFAM port is refused"

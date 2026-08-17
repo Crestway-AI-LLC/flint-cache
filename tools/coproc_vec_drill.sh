@@ -80,9 +80,40 @@ case "$(vexec VEC.INFO docsh)" in *index*hnsw*) : ;; *) echo "FAIL: VEC.INFO sho
 echo "  HNSW VEC.SEARCH -> $PREH"
 
 echo "== durable rows exist in KV independent of the co-processor"
-# 8 = docs (1 config + 3 vectors) + docsh (1 config + 3 vectors).
-[ "$($A DBSIZE 2>&1 | tr -d '\r')" = "8" ] \
-  || { echo "FAIL: expected 8 durable keys (2 configs + 6 vectors), got $($A DBSIZE)"; exit 1; }
+# DERIVED, not a constant — because the constant is what broke. This asserted
+# "8" (configs + vectors) and stayed at 8 when #194 added the durable id index
+# that makes recovery O(vectors) instead of O(namespace). The drill then
+# reported the new index as seven LOST keys, on a co-processor storing exactly
+# what it should.
+#
+# The layout (crates/flint-vec/src/lib.rs, `durable_key`):
+#   kind 's'  1 sets index per namespace, unbucketed
+#   kind 'c'  1 config per set
+#   kind 'v'  1 row per (set, id)
+#   kind 'i'  1 per (set, DISTINCT bucket among that set's ids)
+#
+# The bucket is FNV-1a over the id, mod INDEX_BUCKETS (256) — recomputed here
+# from the ids the drill actually writes, so changing them cannot silently
+# change the expected total, and a layout change fails saying WHICH part moved
+# instead of printing two numbers.
+EXPECT=$(python3 - <<'PY'
+def bucket(i):                       # flint_vec::bucket_of
+    h = 0x811c9dc5
+    for b in i.encode():
+        h ^= b
+        h = (h * 0x01000193) & 0xffffffff
+    return h % 256
+sets = {"docs": ["a", "b", "c"], "docsh": ["a", "b", "c"]}
+print(1 + sum(1 + len(ids) + len({bucket(i) for i in ids}) for ids in sets.values()))
+PY
+)
+GOT=$($A DBSIZE 2>&1 | tr -d '\r')
+[ "$GOT" = "$EXPECT" ] || {
+  echo "FAIL: expected $EXPECT durable keys (1 sets index + 2 configs + 6 vectors"
+  echo "      + one id-index bucket per distinct id hash per set), got $GOT"
+  exit 1
+}
+echo "  $GOT durable rows: sets index + configs + vectors + the #194 id index"
 
 echo "== CRASH DURABILITY: kill the co-processor, restart it EMPTY, SEARCH rebuilds"
 kill -9 "$COPROC_PID" 2>/dev/null; wait "$COPROC_PID" 2>/dev/null; COPROC_PID=""
