@@ -3824,17 +3824,26 @@ fn main() -> std::io::Result<()> {
     // (futures must be Send) or, with locks bolted back on, reproduce the
     // convoy this change exists to remove. Few owners is the property; a
     // single-threaded runtime per worker is how it is obtained.
-    // One runtime per worker. Defaults to core count because a worker is a
-    // scheduling unit, not a concurrency knob — more of them than cores just
-    // adds context switches. Overridable so a test can pin a shape (the
-    // chain-walk chaos gate runs 16 deliberately, to put many workers on one
-    // node and maximise the chance of a mis-correlated reply).
+    // One runtime per worker. Defaults to what this process may actually use —
+    // `available_parallelism` honours the CPU affinity mask and cgroup quotas,
+    // so a container limited to 2 CPUs on a 64-core host gets 2, which matters
+    // because worker count also sets backend connection and mTLS session
+    // count. Overridable so a deployment can pin a shape: the single-VM
+    // packaging co-locates the proxy with both nodes and wants fewer, and the
+    // chain-walk chaos gate runs 16 deliberately to maximise the number of
+    // independent FIFO streams a mis-correlated reply could cross.
+    //
+    // The fallback, for when the query fails outright, is deliberately HIGH.
+    // Measured on an 8-core box, 32 conns, pipeline 16: 1 worker 325k ops/s,
+    // 4 (the peak here) 540k, 32 workers 443k. Under-provisioning by 4x costs
+    // 40%; over-provisioning by 8x costs 18%. The curve is asymmetric, so when
+    // we cannot detect, guessing high is the cheaper error.
     let workers = arg("--workers")
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or_else(|| {
             std::thread::available_parallelism()
                 .map(|n| n.get())
-                .unwrap_or(4)
+                .unwrap_or(16)
         })
         .clamp(1, 64);
     eprintln!(
