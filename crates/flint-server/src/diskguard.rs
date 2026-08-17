@@ -113,6 +113,73 @@ pub fn verdict(
     }
 }
 
+/// Never sample slower than the configured cadence; never faster than this.
+/// A `statvfs` is microseconds, so the floor exists to bound the syscall rate
+/// under a pathological drain, not because the call is expensive.
+const MIN_SAMPLE: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// How close to the shed line one sample is allowed to bring us: the interval
+/// is set so at most a quarter of the remaining headroom can be consumed
+/// before the next look.
+const HEADROOM_DIVISOR: f64 = 4.0;
+
+/// The free-byte level at which [`verdict`] flips to `Shed` on this
+/// filesystem. Both thresholds apply and the stricter wins, so this is the
+/// higher of the two — the same rule `verdict` uses, expressed as a level
+/// instead of a test, because pacing needs the distance to it.
+pub fn shed_floor_bytes(u: flint_storage::disk::Usage, t: Thresholds) -> u64 {
+    let by_pct = if t.min_free_pct > 0 {
+        u.total_bytes.saturating_mul(t.min_free_pct) / 100
+    } else {
+        0
+    };
+    by_pct.max(t.min_free_bytes)
+}
+
+/// How long to wait before the next sample.
+///
+/// A FIXED cadence is a promise the guard cannot keep. Whether it holds the
+/// threshold depends entirely on how fast the disk is filling, and the write
+/// path can cross the whole headroom between two ticks — at which point the
+/// guard is not a headroom guard, it is a report of what already happened.
+/// Measured on `disk_selffill_drill.sh`: with a 500 ms cadence and a 20%
+/// threshold, three runs in five saw the first refusal at 7-10% free, because
+/// ~100 MB landed inside one interval.
+///
+/// So pace against the DRAIN RATE rather than the clock: estimate when free
+/// space will reach the shed floor at the rate just observed, and look again
+/// at a quarter of that. Bounded both ways — never slower than the configured
+/// cadence, never faster than [`MIN_SAMPLE`] — so an idle node costs exactly
+/// what it costs today and a filling one cannot outrun the guard by more than
+/// a quarter of its remaining headroom.
+///
+/// Deliberately only reacts to a FALLING sample. Space coming back is not
+/// urgent: writes are already being refused, and the reopen has its own
+/// hysteresis margin.
+pub fn pace(
+    prev_free: Option<u64>,
+    cur: flint_storage::disk::Usage,
+    t: Thresholds,
+    elapsed: std::time::Duration,
+    ceiling: std::time::Duration,
+) -> std::time::Duration {
+    let Some(prev) = prev_free else {
+        return ceiling;
+    };
+    let drained = prev.saturating_sub(cur.free_bytes);
+    let headroom = cur.free_bytes.saturating_sub(shed_floor_bytes(cur, t));
+    // Nothing draining, or already at the line: the ordinary cadence answers
+    // both. Below the line the space in play belongs to compaction, and
+    // watching it faster changes nothing about who gets refused.
+    if drained == 0 || headroom == 0 {
+        return ceiling;
+    }
+    let secs = elapsed.as_secs_f64().max(0.001);
+    let eta = headroom as f64 / (drained as f64 / secs);
+    let want = std::time::Duration::from_secs_f64((eta / HEADROOM_DIVISOR).max(0.0));
+    want.clamp(MIN_SAMPLE.min(ceiling), ceiling)
+}
+
 /// The live state every connection reads, and the sampler writes.
 #[derive(Debug, Default)]
 pub struct DiskGuard {
@@ -174,12 +241,19 @@ pub const DISK_FULL_ERROR: &str = "QUOTA server is low on disk space; writes rej
 mod tests {
     use super::*;
     use flint_storage::disk::Usage;
+    use std::time::Duration;
 
     fn u(free: u64, total: u64) -> Option<Usage> {
-        Some(Usage {
+        Some(raw(free, total))
+    }
+    /// The same reading unwrapped, for the pacing helpers — they take a
+    /// Usage rather than an Option, because pacing off a reading you do not
+    /// have is inventing one (see the `None` arm at the sampler).
+    fn raw(free: u64, total: u64) -> Usage {
+        Usage {
             free_bytes: free,
             total_bytes: total,
-        })
+        }
     }
     const GB: u64 = 1024 * 1024 * 1024;
 
@@ -263,5 +337,97 @@ mod tests {
             min_free_bytes: 0,
         };
         assert_eq!(verdict(u(0, 100 * GB), off, Verdict::Ok), Verdict::Ok);
+    }
+
+    // ---- pacing: the guard must not be outrunnable -----------------------
+
+    /// The two thresholds are a floor each, and the stricter one is the level
+    /// pacing has to steer by — the same rule `verdict` tests with.
+    #[test]
+    fn the_shed_floor_is_the_stricter_of_the_two_thresholds() {
+        let t = Thresholds {
+            min_free_pct: 10,
+            min_free_bytes: 2 * GB,
+        };
+        // 10% of 100GB = 10GB, which binds above the 2GB byte floor.
+        assert_eq!(shed_floor_bytes(raw(50 * GB, 100 * GB), t), 10 * GB);
+        // 10% of 10GB = 1GB, so here the byte floor is the stricter one.
+        assert_eq!(shed_floor_bytes(raw(5 * GB, 10 * GB), t), 2 * GB);
+    }
+
+    #[test]
+    fn an_idle_disk_keeps_the_configured_cadence() {
+        let t = Thresholds::default();
+        let every = Duration::from_secs(2);
+        let now = raw(50 * GB, 100 * GB);
+        // No previous reading, and nothing draining, both answer `every`.
+        assert_eq!(pace(None, now, t, every, every), every);
+        assert_eq!(
+            pace(Some(50 * GB), now, t, every, every),
+            every,
+            "a disk that is not filling costs exactly what it costs today"
+        );
+    }
+
+    /// THE BUG. A fixed cadence lets the write path cross the whole headroom
+    /// between two looks: 40GB of headroom against 100GB/s of drain is gone
+    /// in under half a second, and the guard would not look again for two.
+    #[test]
+    fn a_fast_drain_shortens_the_interval_far_below_the_cadence() {
+        let t = Thresholds::default(); // 10% -> floor 10GB on a 100GB disk
+        let every = Duration::from_secs(2);
+        // 10GB consumed in the last 100ms = 100GB/s; 40GB of headroom left.
+        let now = raw(50 * GB, 100 * GB);
+        let next = pace(Some(60 * GB), now, t, Duration::from_millis(100), every);
+        assert!(
+            next < Duration::from_millis(150),
+            "at 100GB/s the 40GB headroom is 0.4s away; sampling in {next:?} \
+             lets a quarter of it go unobserved at most"
+        );
+        assert!(next >= MIN_SAMPLE, "and never tighter than the floor");
+    }
+
+    /// Discrimination: the SAME headroom with a gentle drain must not panic
+    /// the sampler into spinning.
+    #[test]
+    fn a_slow_drain_keeps_the_cadence() {
+        let t = Thresholds::default();
+        let every = Duration::from_secs(2);
+        let now = raw(50 * GB, 100 * GB);
+        // 1MB in 100ms = 10MB/s: the 40GB headroom is over an hour away.
+        let next = pace(
+            Some(50 * GB + 1024 * 1024),
+            now,
+            t,
+            Duration::from_millis(100),
+            every,
+        );
+        assert_eq!(next, every);
+    }
+
+    /// Below the line there is nothing left to protect — writes are already
+    /// refused, and the space still moving belongs to compaction. Watching it
+    /// faster would burn syscalls to change nothing.
+    #[test]
+    fn at_or_below_the_floor_the_cadence_returns() {
+        let t = Thresholds::default();
+        let every = Duration::from_secs(2);
+        let now = raw(5 * GB, 100 * GB); // under the 10GB floor
+        assert_eq!(
+            pace(Some(20 * GB), now, t, Duration::from_millis(100), every),
+            every
+        );
+    }
+
+    /// The ceiling is a ceiling in both directions: a caller that configures a
+    /// cadence tighter than MIN_SAMPLE gets what it asked for, not a slower
+    /// interval imposed by the clamp.
+    #[test]
+    fn a_cadence_below_the_floor_is_honoured() {
+        let t = Thresholds::default();
+        let every = Duration::from_millis(10);
+        let now = raw(50 * GB, 100 * GB);
+        let next = pace(Some(60 * GB), now, t, Duration::from_millis(100), every);
+        assert_eq!(next, every);
     }
 }
