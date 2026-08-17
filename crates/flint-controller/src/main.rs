@@ -226,6 +226,56 @@ struct Node {
     epoch: u32,
     live_replicas: u32,
     seq_lag: Option<u64>,
+    /// Age of the oldest unacked write, and the soft cap it is measured
+    /// against. Both `None` when no replica is live (FLINTINFO renders
+    /// "none"). See [`Node::converged`] for why the pair is carried.
+    lag_ms: Option<u64>,
+    lag_soft_ms: Option<u64>,
+}
+
+/// The lag band to fall back on when a seat does not report `lag_soft_ms`
+/// (a pre-#191 build). Matches both the server's shipped `--lag-soft-ms` and
+/// flintctl's rejoin wait, so an old seat is judged by the number it was
+/// almost certainly running.
+const FALLBACK_LAG_SOFT_MS: u64 = 500;
+
+impl Node {
+    /// Is this node's replication CAUGHT UP ENOUGH to treat the pair as
+    /// converged?
+    ///
+    /// Not `seq_lag == 0`. That is an equality against a moving target, and
+    /// under sustained writes the target never stops moving: measured on a
+    /// 5-host fleet (2026-08-15) with a continuous writer through the edge,
+    /// the master's `seq_lag` sampled 82–151 across ten consecutive 1s
+    /// samples and was never once 0. Everything downstream of "converged"
+    /// therefore froze the moment load began — including `last_insync`, the
+    /// memory the degraded-window gate falls back on — and a master killed
+    /// five seconds into the load burst left the pair refusing to promote its
+    /// healthy in-sync replica 137 ticks running, write-dead until a human
+    /// ran `flintctl start`.
+    ///
+    /// So ask the question the product already answers elsewhere: is
+    /// replication INSIDE ITS HEALTHY BAND? Below the soft lag cap the master
+    /// is not even delaying writes — by the write path's own definition
+    /// replication is keeping up. `flintctl`'s rejoin wait made the same
+    /// judgement first ("under LIVE write load seq_lag hovers above zero by
+    /// design") and hardcoded 500 ms; this reads the seat's OWN
+    /// `lag_soft_ms` instead, so an operator who retunes the cap through
+    /// FLINTCONFIG retunes this with it and there is no second copy of the
+    /// number to drift.
+    ///
+    /// `seq_lag == 0` still qualifies on its own: an idle pair reports lag_ms
+    /// none, and idle is the most converged a pair can be.
+    fn converged(&self) -> bool {
+        if self.live_replicas < 1 {
+            return false;
+        }
+        if self.seq_lag == Some(0) {
+            return true;
+        }
+        let band = self.lag_soft_ms.unwrap_or(FALLBACK_LAG_SOFT_MS);
+        self.lag_ms.is_some_and(|ms| ms < band)
+    }
 }
 
 /// Does a process still accept TCP connections on this address? A plain,
@@ -331,17 +381,25 @@ fn insync_lineage_holder(states: &[Node]) -> Option<&Node> {
 /// matches nothing here and still pages.
 fn remembered_lineage_holder<'a>(
     states: &'a [Node],
-    remembered: Option<&(String, u32)>,
+    remembered: &[(String, u32)],
 ) -> Option<&'a Node> {
-    let (addr, epoch) = remembered?;
+    if remembered.is_empty() {
+        return None;
+    }
     let top = states
         .iter()
         .filter(|n| n.reachable)
         .map(|n| n.epoch)
         .max()?;
-    states
-        .iter()
-        .find(|n| n.reachable && n.epoch == top && n.epoch >= *epoch && &n.addr == addr)
+    // Any remembered member will do — master or the replica that was
+    // following it (#191). On a plain master death the master's own entry is
+    // a corpse and matches nothing; the replica's entry is the one that
+    // saves the pair.
+    remembered.iter().find_map(|(addr, epoch)| {
+        states
+            .iter()
+            .find(|n| n.reachable && n.epoch == top && n.epoch >= *epoch && &n.addr == addr)
+    })
 }
 
 /// ADR-0018 moved lease renewal OUT of the controller entirely. The renewer
@@ -362,6 +420,8 @@ fn observe(addr: &str) -> Node {
         epoch: 0,
         live_replicas: 0,
         seq_lag: None,
+        lag_ms: None,
+        lag_soft_ms: None,
     };
     let Ok(Value::Bulk(Some(raw))) = call(addr, &[b"FLINTINFO"]) else {
         // Distinguish "down" from "up but FLINTINFO hiccup" with a PING.
@@ -384,7 +444,11 @@ fn observe(addr: &str) -> Node {
         match k {
             "role" => node.role = v.to_string(),
             "live_replicas" => node.live_replicas = v.parse().unwrap_or(0),
+            // All three render the literal "none" with no live replica, so
+            // `parse().ok()` is the whole "unknown" handling.
             "seq_lag" => node.seq_lag = v.parse().ok(),
+            "lag_ms" => node.lag_ms = v.parse().ok(),
+            "lag_soft_ms" => node.lag_soft_ms = v.parse().ok(),
             "role_epoch" => {
                 node.epoch = v
                     .trim_matches(|c| c == '(' || c == ')')
@@ -470,12 +534,17 @@ struct Pair {
     /// past `confirm` — a transient double-blip must not wipe live nodes.
     dark_streak: u32,
     last_snapshot: Instant,
-    /// (addr, epoch) of the member last OBSERVED holding the full lineage: a
-    /// legitimate master with a caught-up replica, or the survivor this
-    /// controller promoted. Read only by the degraded-window gate, to recover a
-    /// pair whose lineage holder is alive but has lost its replica (#171) —
-    /// the case `insync_lineage_holder` structurally cannot answer.
-    last_insync: Option<(String, u32)>,
+    /// (addr, epoch) of every member last OBSERVED holding the full lineage:
+    /// a legitimate master AND the caught-up replica following it, or the
+    /// survivor this controller promoted. Read only by the degraded-window
+    /// gate, to recover a pair whose lineage holder is alive but has lost its
+    /// replica (#171) — the case `insync_lineage_holder` structurally cannot
+    /// answer.
+    ///
+    /// A LIST, not one member, because remembering only the master is useless
+    /// in the case that matters: when the master dies, the remembered holder
+    /// is the corpse (#191).
+    last_insync: Vec<(String, u32)>,
     /// A scheduled snapshot of this pair is still running on its own thread.
     /// At most one in flight per pair; the SWEEP never waits on it (#172).
     snapshot_inflight: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -499,7 +568,7 @@ impl Pair {
             last_page: None,
             dark_streak: 0,
             last_snapshot: Instant::now(),
-            last_insync: None,
+            last_insync: Vec::new(),
             snapshot_inflight: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             slots,
         }
@@ -632,7 +701,7 @@ impl Pair {
 
         if let Some(legit) = legit {
             let legit_addr = legit.addr.clone();
-            let legit_converged = legit.live_replicas >= 1 && legit.seq_lag == Some(0);
+            let legit_converged = legit.converged();
             self.no_master_streak = 0;
             self.slow_since = None;
             self.outage_announced = false;
@@ -709,7 +778,31 @@ impl Pair {
                 // Remember WHO held it. The degraded-window gate needs this
                 // later, when this same node may be alive but replica-less and
                 // therefore unable to prove the same thing about itself (#171).
-                self.last_insync = Some((legit_addr.clone(), legit.epoch));
+                //
+                // BOTH SIDES, not just the master (#191). Remembering only the
+                // master makes the memory useless in the case it exists for:
+                // on a plain master death the remembered holder IS the corpse,
+                // so `remembered_lineage_holder` finds nothing reachable and
+                // the gate refuses a pair whose healthy in-sync replica is
+                // sitting right there. Measured: 137 consecutive refusals with
+                // the replica up the whole time.
+                //
+                // The replica is a sound entry precisely because this branch
+                // ran: the pair was observed converged, so the replica held
+                // everything the master had at that observation. Promoting it
+                // can still lose writes the master acked afterwards — but that
+                // is ordinary async-replication failover, bounded by the same
+                // published RPO as any promotion, and the epoch bump fences
+                // the old master exactly as one does. What it is NOT is the
+                // degraded window this gate guards against, where the pair's
+                // data may only exist on a node nobody can reach.
+                self.last_insync = vec![(legit_addr.clone(), legit.epoch)];
+                self.last_insync.extend(
+                    states
+                        .iter()
+                        .filter(|n| n.reachable && n.addr != legit_addr && n.role == "replica")
+                        .map(|n| (n.addr.clone(), legit.epoch)),
+                );
             }
 
             // Redundancy repair (managed): a non-master slot dead for
@@ -817,7 +910,7 @@ impl Pair {
                 // lineage holder cannot satisfy the live predicate however
                 // intact it is, and refusing it turns a pair that is sitting
                 // there whole into a permanent write outage.
-                None => match remembered_lineage_holder(&states, self.last_insync.as_ref()) {
+                None => match remembered_lineage_holder(&states, &self.last_insync) {
                     Some(h) => {
                         eprintln!(
                             "[{}][{}] no master-claimer and no PROVABLE in-sync node, but {} is the member last observed holding the lineage and still holds the top epoch — recovering it (#171)",
@@ -833,8 +926,27 @@ impl Pair {
                     }
                     None => {
                         let (id, label, ms) = (cfg.id.clone(), self.label.clone(), cfg.max_stale);
+                        // SAY WHICH of the two refusals this is. They call for
+                        // opposite responses — one needs a spare or an S3
+                        // restore, the other needs whichever remembered member
+                        // is down brought back — and the message used to
+                        // report both as "no member was ever observed holding
+                        // the lineage", which was simply false whenever
+                        // last_insync held a dead master (#191).
+                        let why = if self.last_insync.is_empty() {
+                            "no member was ever observed holding the lineage".to_string()
+                        } else {
+                            format!(
+                                "the member(s) observed holding it are not reachable at the top epoch now [{}]",
+                                self.last_insync
+                                    .iter()
+                                    .map(|(a, e)| format!("{a}@{e}"))
+                                    .collect::<Vec<_>>()
+                                    .join(" ")
+                            )
+                        };
                         self.page(format_args!(
-                            "[{id}][{label}] no master and pair not converged within {ms:?}, and no member was ever observed holding the lineage — REFUSING (degraded window; needs spare/S3). PAGE."
+                            "[{id}][{label}] no master and pair not converged within {ms:?}, and {why} — REFUSING (degraded window; needs spare/S3). PAGE."
                         ));
                         self.no_master_streak = 0;
                         return;
@@ -922,7 +1034,10 @@ impl Pair {
                 // not be able to demonstrate that until a replica re-attaches.
                 // Without this the pair is unrecoverable for exactly that
                 // window if the fresh master then fences (#171).
-                self.last_insync = Some((survivor.addr.clone(), next));
+                // REPLACES the list rather than appending: the pair's lineage
+                // restarts here, and the member this promotion just fenced
+                // must never be remembered as a holder at the new epoch.
+                self.last_insync = vec![(survivor.addr.clone(), next)];
                 self.no_master_streak = 0;
             }
             // -FENCED here means another controller already promoted at this
@@ -1517,7 +1632,96 @@ mod tests {
             epoch,
             live_replicas,
             seq_lag,
+            // Idle by default: the lineage tests are about who holds what,
+            // not about lag. The band itself is exercised by converged_*.
+            lag_ms: None,
+            lag_soft_ms: Some(500),
         }
+    }
+
+    /// A node reporting a live replica that is BEHIND by `lag_ms` — what
+    /// every master looks like under sustained write load.
+    fn loaded(addr: &str, epoch: u32, seq_lag: u64, lag_ms: u64) -> Node {
+        Node {
+            role: "master".into(),
+            lag_ms: Some(lag_ms),
+            ..node(addr, epoch, 1, Some(seq_lag))
+        }
+    }
+
+    /// #191: the measured fleet state. A master under a continuous writer
+    /// sampled seq_lag 82-151 over ten consecutive seconds and never 0, so an
+    /// equality gate never fires and everything downstream of "converged"
+    /// freezes the moment load starts — including the memory the
+    /// degraded-window gate falls back on.
+    #[test]
+    fn sustained_load_still_counts_as_converged() {
+        let under_load = loaded("a:1", 3, 137, 40);
+        assert!(
+            under_load.seq_lag != Some(0),
+            "the premise of the bug is that seq_lag is NOT zero here"
+        );
+        assert!(under_load.converged(), "40ms lag is inside a 500ms band");
+    }
+
+    /// The band is the seat's OWN soft cap, so an operator who retunes it
+    /// through FLINTCONFIG retunes this with it — no second copy of 500 to
+    /// drift out of step with the write path.
+    #[test]
+    fn converged_band_follows_the_seats_own_soft_cap() {
+        let mut n = loaded("a:1", 3, 137, 400);
+        assert!(n.converged(), "400ms is inside the default 500ms band");
+        n.lag_soft_ms = Some(100);
+        assert!(!n.converged(), "400ms is outside a retuned 100ms band");
+    }
+
+    /// Genuinely behind is still not converged: the relaxation must not
+    /// quietly become "anything with a replica attached".
+    #[test]
+    fn badly_lagging_replica_is_not_converged() {
+        assert!(!loaded("a:1", 3, 90_000, 9_000).converged());
+        let mut widowed = loaded("a:1", 3, 0, 0);
+        widowed.live_replicas = 0;
+        assert!(!widowed.converged(), "no replica can never be converged");
+    }
+
+    /// An idle pair reports lag_ms none with seq_lag 0 — the most converged a
+    /// pair can be. It must not regress into "lag unknown, so no".
+    #[test]
+    fn idle_pair_is_converged_on_seq_lag_alone() {
+        let mut idle = loaded("a:1", 3, 0, 0);
+        idle.lag_ms = None;
+        assert!(idle.converged());
+    }
+
+    /// A seat too old to report lag_soft_ms is judged by the number it was
+    /// almost certainly running, not by "unknown band, so refuse".
+    #[test]
+    fn missing_soft_cap_falls_back_to_the_shipped_band() {
+        let mut old = loaded("a:1", 3, 137, 40);
+        old.lag_soft_ms = None;
+        assert!(old.converged());
+        old.lag_ms = Some(FALLBACK_LAG_SOFT_MS);
+        assert!(
+            !old.converged(),
+            "the fallback is a bound, not a rubber stamp"
+        );
+    }
+
+    /// #191, the half that made the outage permanent: on a plain master death
+    /// the remembered holder IS the corpse. Remembering the caught-up replica
+    /// too is what lets the pair recover itself instead of paging 137 times.
+    #[test]
+    fn remembered_replica_recovers_the_pair_when_the_master_dies() {
+        let mut states = vec![node("a:1", 3, 0, None), node("b:2", 3, 0, None)];
+        states[0].reachable = false; // the master died
+        let remembered = vec![("a:1".to_string(), 3u32), ("b:2".to_string(), 3u32)];
+        // Master-only memory finds nothing — that is the measured outage.
+        assert!(remembered_lineage_holder(&states, &remembered[..1]).is_none());
+        assert_eq!(
+            remembered_lineage_holder(&states, &remembered).map(|n| n.addr.as_str()),
+            Some("b:2")
+        );
     }
 
     #[test]
@@ -1542,7 +1746,8 @@ mod tests {
         assert!(insync_lineage_holder(&states).is_none());
         let remembered = ("a:1".to_string(), 3u32);
         assert_eq!(
-            remembered_lineage_holder(&states, Some(&remembered)).map(|n| n.addr.as_str()),
+            remembered_lineage_holder(&states, std::slice::from_ref(&remembered))
+                .map(|n| n.addr.as_str()),
             Some("a:1")
         );
     }
@@ -1554,9 +1759,9 @@ mod tests {
     #[test]
     fn never_observed_survivor_still_refuses() {
         let states = vec![node("a:1", 3, 0, None), node("b:2", 2, 0, None)];
-        assert!(remembered_lineage_holder(&states, None).is_none());
+        assert!(remembered_lineage_holder(&states, &[]).is_none());
         let someone_else = ("c:3".to_string(), 3u32);
-        assert!(remembered_lineage_holder(&states, Some(&someone_else)).is_none());
+        assert!(remembered_lineage_holder(&states, std::slice::from_ref(&someone_else)).is_none());
     }
 
     /// Being remembered is not enough: a remembered member that is NOT at the
@@ -1566,7 +1771,7 @@ mod tests {
     fn remembered_but_overtaken_does_not_qualify() {
         let states = vec![node("a:1", 2, 0, None), node("b:2", 5, 0, None)];
         let remembered = ("a:1".to_string(), 2u32);
-        assert!(remembered_lineage_holder(&states, Some(&remembered)).is_none());
+        assert!(remembered_lineage_holder(&states, std::slice::from_ref(&remembered)).is_none());
     }
 
     /// An unreachable remembered member cannot be promoted, however perfect its
@@ -1576,7 +1781,7 @@ mod tests {
         let mut states = vec![node("a:1", 3, 0, None), node("b:2", 3, 0, None)];
         states[0].reachable = false;
         let remembered = ("a:1".to_string(), 3u32);
-        assert!(remembered_lineage_holder(&states, Some(&remembered)).is_none());
+        assert!(remembered_lineage_holder(&states, std::slice::from_ref(&remembered)).is_none());
     }
 
     #[test]
