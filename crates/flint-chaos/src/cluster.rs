@@ -962,6 +962,31 @@ pub fn wait_for_pong(port: u16, budget: Duration) -> bool {
     false
 }
 
+/// Wait until a node is SERVING, not merely answering (#176).
+///
+/// A fresh replica now binds and answers PING from inside its initial full
+/// sync, so `wait_for_pong` on a seat just spawned with an upstream returns at
+/// the START of the seed. That is the right wire behaviour and the wrong
+/// assertion: "replacement replica up" would be satisfied by a node holding
+/// nothing, and a seed that never completed would surface later as an
+/// unexplained oracle result instead of here, at the spawn that caused it.
+///
+/// Only an explicit `loading:1` counts as not-ready, so a seat from a build
+/// before #176 reads exactly as `wait_for_pong` always read it.
+pub fn wait_for_ready(port: u16, budget: Duration) -> bool {
+    let start = Instant::now();
+    while start.elapsed() < budget {
+        if let Ok(mut c) = Client::connect(port)
+            && matches!(c.call(&[b"PING"]), Ok(Value::Simple(s)) if s == "PONG")
+            && flintinfo_field(port, "loading:").is_none_or(|v| v.trim() != "1")
+        {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    false
+}
+
 pub fn dbsize(port: u16) -> Option<i64> {
     let mut c = Client::connect(port).ok()?;
     match c.call(&[b"DBSIZE"]).ok()? {
@@ -1089,7 +1114,7 @@ impl Cluster {
         );
         fleet.track(spawn_node(replica_port, &fresh_dir(1), Some(master_port)));
         assert!(
-            wait_for_pong(replica_port, Duration::from_secs(15)),
+            wait_for_ready(replica_port, Duration::from_secs(15)),
             "replica up"
         );
         Self {
@@ -1295,7 +1320,7 @@ impl Cluster {
         self.fleet
             .track(spawn_node(self.replica_port, &dir, Some(self.master_port)));
         assert!(
-            wait_for_pong(self.replica_port, Duration::from_secs(15)),
+            wait_for_ready(self.replica_port, Duration::from_secs(15)),
             "replacement replica up"
         );
         self.master_port
@@ -1360,7 +1385,7 @@ impl Cluster {
         self.master_port = survivor;
         self.replica_port = dead;
         assert!(
-            wait_for_pong(dead, Duration::from_secs(15)),
+            wait_for_ready(dead, Duration::from_secs(15)),
             "replacement replica up on :{dead}"
         );
         self.master_port
@@ -1380,7 +1405,7 @@ impl Cluster {
         ));
         self.next_id += 1;
         assert!(
-            wait_for_pong(dead, Duration::from_secs(15)),
+            wait_for_ready(dead, Duration::from_secs(15)),
             "replacement replica up on :{dead}"
         );
     }
@@ -1394,7 +1419,7 @@ impl Cluster {
         self.fleet
             .track(spawn_node(self.replica_port, &dir, Some(self.master_port)));
         assert!(
-            wait_for_pong(self.replica_port, Duration::from_secs(15)),
+            wait_for_ready(self.replica_port, Duration::from_secs(15)),
             "replacement replica up"
         );
     }

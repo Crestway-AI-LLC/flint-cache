@@ -110,7 +110,7 @@ CORE="restart repl failover proxy slot_migrate slot_map rebalance_execute
       cpha_roll admin_gated_proxy edge_ca_trust
       cert_rotate control_tls controller_ha controller_managed controller_slow_master controller_stall
       controller_multipair controlplane cp_publish failover_bystander failover_churn gates internal_mtls json lease
-      fanout_timeout ingest_saturation loaded_promote m3_exit migrate_slots min_replicas node_tls proxy_backpressure
+      fanout_timeout ingest_saturation loaded_promote loading_visible m3_exit migrate_slots min_replicas node_tls proxy_backpressure
       proxy_cache proxy_tls replica_reads replica_starvation replica_stale_fence rw_isolation
       scan slot_cutover slot_cutover_recovery slot_moved snapshot_restore
       tenant tenant_rebalance tenant_remove token_hash

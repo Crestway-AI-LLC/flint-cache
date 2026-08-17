@@ -222,7 +222,15 @@ struct Node {
     /// answer FLINTINFO/PING — i.e. ALIVE but slow, not dead. Only meaningful
     /// when `reachable` is false; true whenever `reachable` is true.
     socket_alive: bool,
-    role: String, // "master" | "replica" | "" (unknown/unreachable)
+    role: String, // "master" | "replica" | "loading" | "" (unknown/unreachable)
+    /// The node is up and answering but has no store behind it yet — a fresh
+    /// replica inside its initial full sync (#176, FLINTINFO `loading:1`).
+    ///
+    /// ALIVE, and deliberately counted as reachable: that is the whole point
+    /// of #176, and it is what stops this controller respawning a seat that
+    /// is busy syncing. But NOT a candidate for anything — see
+    /// [`Node::promotable`].
+    loading: bool,
     epoch: u32,
     live_replicas: u32,
     seq_lag: Option<u64>,
@@ -275,6 +283,24 @@ impl Node {
         }
         let band = self.lag_soft_ms.unwrap_or(FALLBACK_LAG_SOFT_MS);
         self.lag_ms.is_some_and(|ms| ms < band)
+    }
+
+    /// May this node be handed a lineage?
+    ///
+    /// Since #176 a fresh replica answers the moment it starts, from inside
+    /// its initial full sync, with `role:loading` and no epoch — so on the
+    /// survivor rule alone ("reachable node with the highest epoch") a pair
+    /// whose master died while its partner was re-seeding would promote a
+    /// node holding a PARTIAL copy at epoch 0. Before #176 that pair simply
+    /// had no reachable node and paged, which is the correct outcome and the
+    /// one this preserves.
+    ///
+    /// The syncing node still counts as reachable everywhere else — for
+    /// redundancy repair, for the dark-pair bootstrap, for `slow` detection
+    /// — because it IS alive, and treating it as a corpse is the bug #176
+    /// fixed. It is unpromotable, not absent.
+    fn promotable(&self) -> bool {
+        self.reachable && !self.loading
     }
 }
 
@@ -346,12 +372,12 @@ fn should_promote(
 fn insync_lineage_holder(states: &[Node]) -> Option<&Node> {
     let top = states
         .iter()
-        .filter(|n| n.reachable)
+        .filter(|n| n.promotable())
         .map(|n| n.epoch)
         .max()?;
     states
         .iter()
-        .find(|n| n.reachable && n.epoch == top && n.live_replicas >= 1 && n.seq_lag == Some(0))
+        .find(|n| n.promotable() && n.epoch == top && n.live_replicas >= 1 && n.seq_lag == Some(0))
 }
 
 /// The member this controller last OBSERVED holding the pair's full lineage,
@@ -388,17 +414,21 @@ fn remembered_lineage_holder<'a>(
     }
     let top = states
         .iter()
-        .filter(|n| n.reachable)
+        .filter(|n| n.promotable())
         .map(|n| n.epoch)
         .max()?;
     // Any remembered member will do — master or the replica that was
     // following it (#191). On a plain master death the master's own entry is
     // a corpse and matches nothing; the replica's entry is the one that
     // saves the pair.
+    //
+    // A remembered member that has since been WIPED and is re-seeding is not
+    // that member any more: it is loading, so it is not promotable, and the
+    // memory of what it once held does not travel with the address (#176).
     remembered.iter().find_map(|(addr, epoch)| {
         states
             .iter()
-            .find(|n| n.reachable && n.epoch == top && n.epoch >= *epoch && &n.addr == addr)
+            .find(|n| n.promotable() && n.epoch == top && n.epoch >= *epoch && &n.addr == addr)
     })
 }
 
@@ -417,6 +447,7 @@ fn observe(addr: &str) -> Node {
         reachable: false,
         socket_alive: false,
         role: String::new(),
+        loading: false,
         epoch: 0,
         live_replicas: 0,
         seq_lag: None,
@@ -443,6 +474,10 @@ fn observe(addr: &str) -> Node {
         };
         match k {
             "role" => node.role = v.to_string(),
+            // Only an explicit 1 means loading. A seat from a build before
+            // #176 has no such line, and during a rolling upgrade it must
+            // keep reading exactly as it did before.
+            "loading" => node.loading = v == "1",
             "live_replicas" => node.live_replicas = v.parse().unwrap_or(0),
             // All three render the literal "none" with no live replica, so
             // `parse().ok()` is the whole "unknown" handling.
@@ -955,16 +990,19 @@ impl Pair {
             }
         }
 
-        // Survivor = reachable node with the highest epoch; ties by lowest
-        // address (deterministic across the HA set).
+        // Survivor = PROMOTABLE node with the highest epoch; ties by lowest
+        // address (deterministic across the HA set). Promotable rather than
+        // merely reachable because a node re-seeding from scratch answers
+        // now (#176) while holding a partial copy at epoch 0 — see
+        // `Node::promotable`.
         let Some(survivor) = states
             .iter()
-            .filter(|n| n.reachable)
+            .filter(|n| n.promotable())
             .max_by_key(|n| (n.epoch, std::cmp::Reverse(n.addr.as_str())))
         else {
             let (id, label) = (cfg.id.clone(), self.label.clone());
             self.page(format_args!(
-                "[{id}][{label}] no reachable node in the pair — cannot fail over. PAGE."
+                "[{id}][{label}] no promotable node in the pair — cannot fail over. PAGE."
             ));
             self.no_master_streak = 0;
             return;
@@ -1629,6 +1667,7 @@ mod tests {
             // signature (#168): FLINTINFO renders role from the read-only flag,
             // so a self-fenced master calls itself a replica.
             role: "replica".into(),
+            loading: false,
             epoch,
             live_replicas,
             seq_lag,
@@ -1782,6 +1821,38 @@ mod tests {
         states[0].reachable = false;
         let remembered = ("a:1".to_string(), 3u32);
         assert!(remembered_lineage_holder(&states, std::slice::from_ref(&remembered)).is_none());
+    }
+
+    /// #176: a node that answers from INSIDE its initial full sync is alive,
+    /// and must be treated as alive — but it holds a partial copy at epoch 0,
+    /// so it is not a survivor. Before #176 it was unreachable and this pair
+    /// paged; the point of this test is that it still does.
+    #[test]
+    fn a_syncing_node_is_alive_but_not_promotable() {
+        let mut syncing = node("b:2", 0, 0, None);
+        syncing.role = "loading".into();
+        syncing.loading = true;
+        // The premise: it IS reachable. Without this the test would pass for
+        // the old reason (nothing answered) rather than the new one.
+        assert!(syncing.reachable, "a loading node answers — that is #176");
+        assert!(!syncing.promotable(), "and holds no lineage to promote");
+
+        let mut dead_master = node("a:1", 4, 0, None);
+        dead_master.reachable = false;
+        dead_master.socket_alive = false;
+        let states = vec![dead_master, syncing];
+
+        // Neither gate may hand this pair to the node that is re-seeding.
+        assert!(insync_lineage_holder(&states).is_none());
+        let remembered = [("a:1".to_string(), 4u32), ("b:2".to_string(), 4u32)];
+        assert!(
+            remembered_lineage_holder(&states, &remembered).is_none(),
+            "being remembered does not survive a wipe — the copy is gone"
+        );
+        // And the survivor rule itself: PROMOTABLE finds nobody, where
+        // REACHABLE would have found the half-seeded node at epoch 0.
+        assert!(states.iter().any(|n| n.reachable), "the premise again");
+        assert!(!states.iter().any(|n| n.promotable()));
     }
 
     #[test]

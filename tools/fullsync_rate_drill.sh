@@ -67,10 +67,17 @@ SST=$(valkey-cli -p 6394 FLINTINFO | tr '\r' '\n' | grep '^sst_bytes:' | cut -d:
 echo "  master holds $SST bytes of SSTs"
 [ "${SST:-0}" -gt $((16 * 1024 * 1024)) ] || { echo "FAIL: dataset too small to time a transfer ($SST bytes)"; exit 1; }
 
-# A replica binds its listener only after its initial full sync completes, so
-# "spawn to first PONG" is the sync itself plus a fixed process/rocks-open
-# cost. That cost is identical in both arms and small against a 32MB transfer,
-# which is the other reason the assertion is a ratio.
+# "Spawn to SERVING" is the sync itself plus a fixed process/rocks-open cost.
+# That cost is identical in both arms and small against a 32MB transfer, which
+# is the other reason the assertion is a ratio.
+#
+# Serving, not PONG. Until #176 a replica bound its listener only after the
+# initial full sync finished, so the first PONG WAS the end of the sync and
+# this timed the transfer by accident. #176 moved the bind AHEAD of the sync
+# deliberately — a syncing node must not read as a dead one — so PONG now
+# arrives at the start of the transfer. Timing that would measure process
+# startup in both arms, collapse the ratio to noise, and report a working cap
+# as broken. `fleet_wait_ready` waits for the seat's own `loading:0`.
 time_reseed() {   # $1 = replica port, $2 = dir suffix
   local t0 t1
   t0=$(python3 -c 'import time; print(time.time())')
@@ -81,7 +88,7 @@ time_reseed() {   # $1 = replica port, $2 = dir suffix
   # nine minutes of looking like a hung full sync when the sync had finished
   # in under a second.
   $B --port "$1" --engine rocks --data-dir "$D/$2" --replica-of 127.0.0.1:6394 >"$D/$2.log" 2>&1 &
-  fleet_wait_ping "$1" >/dev/null 2>&1
+  fleet_wait_ready "$1" >/dev/null 2>&1
   t1=$(python3 -c 'import time; print(time.time())')
   python3 -c "print(f'{($t1 - $t0):.3f}')"
 }

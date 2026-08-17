@@ -377,6 +377,17 @@ the write; ours says why.
   (rate quota / back-pressure; retry with backoff), `-TRYAGAIN`
   (mid-migration write or fenced stale replica; the proxy retries/falls
   back for you).
+- **`-LOADING` means the same thing it means in Redis**: the node is up but
+  its dataset is not, so retry. A Flint node in this state is a fresh
+  replica pulling its initial copy from its master; it binds its port
+  immediately rather than staying dark (a dark port is indistinguishable
+  from a dead host, and operational tooling acted on that), answers `PING`
+  and `FLINTINFO` throughout, and refuses everything else with `-LOADING`
+  until it is serving. `FLINTINFO` reports `role:loading`, `loading:1` and
+  `loading_ms` — how long it has been at it — and `loading:0` once it
+  serves. **Tenants do not see this error**: the proxy pins each backend
+  connection to a namespace before any command travels on it, and a loading
+  node refuses that pin, so it stays out of the routing path entirely.
 
 ## Excluded by design
 

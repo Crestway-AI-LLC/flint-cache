@@ -668,18 +668,31 @@ fn must(what: &str, reply: std::io::Result<Value>) -> Value {
     }
 }
 
-/// The PING budget for a freshly (re)spawned replica. A wiped node
-/// full-syncs its checkpoint before binding its listener (see
-/// flint-server's startup order), so this must cover the transfer on a
-/// loaded fleet — `node-ready-s` in the inventory raises it.
+/// The readiness budget for a freshly (re)spawned replica. A wiped node
+/// full-syncs its whole checkpoint before it can serve, so this must cover
+/// the transfer on a loaded fleet — `node-ready-s` in the inventory raises
+/// it.
 fn node_ready_budget(inv: &Inventory) -> Duration {
     Duration::from_secs(inv.node_ready_s.unwrap_or(15))
 }
 
+/// Wait until a seat is SERVING, which since #176 is not the same question as
+/// "does the port answer".
+///
+/// A syncing node now binds and answers PING immediately — deliberately, so
+/// that nothing mistakes it for a corpse — and it says so on FLINTINFO with
+/// `loading:1`. Waiting on PING alone would therefore return the moment a
+/// re-seed STARTED and hand every caller a node that refuses data commands.
+///
+/// Only an explicit `loading:1` counts as not-ready: a node from a build
+/// before #176 has no such field, and during a rolling upgrade it must keep
+/// reading exactly as ready as it did before.
 fn wait_pong(addr: &str, tls: &Option<Arc<flint_tls::ClientConfig>>, budget: Duration) -> bool {
     let start = Instant::now();
     while start.elapsed() < budget {
-        if matches!(call(addr, tls, &["PING"]), Ok(Value::Simple(s)) if s == "PONG") {
+        if matches!(call(addr, tls, &["PING"]), Ok(Value::Simple(s)) if s == "PONG")
+            && info_field(addr, tls, "loading:").as_deref() != Some("1")
+        {
             return true;
         }
         std::thread::sleep(Duration::from_millis(150));
@@ -2419,22 +2432,30 @@ fn start_pair_nodes(inv: &Inventory, pair: &[String], gi: usize) {
         // A live seat keeps its process; respawning it would lose the port
         // race AND overwrite its pidfile with the corpse's pid, so every
         // later stop/kill through that pidfile would aim at nothing.
+        //
+        // `role:loading` lands here too, and that is the point: since #176 a
+        // seat SAYS it is coming up instead of leaving the question to a
+        // failed dial. Note it says so about ITSELF, over the wire, which is
+        // the one report that works when this flintctl and that seat are on
+        // different machines.
         if let Some(role) = &roles[i] {
             eprintln!("  node-{port} already up ({role})");
             continue;
         }
-        // SERVING is proved by the dial above. NOT serving is not proved by
-        // a failed dial — a seat doing wipe + full sync has a live process
-        // and an unbound port for as long as the sync takes, and reads
-        // exactly like a dead one.
+        // Below the dial there is still a real window: from exec until the
+        // listener binds, a starting seat has a live process and a closed
+        // port, and reads exactly like a dead one.
         //
         // Treating that as absent is destructive here rather than merely
         // wasteful: the branch below WIPES the data dir before respawning,
-        // so a `start` issued while a node is syncing deletes the sync in
+        // so a `start` issued while a node is coming up deletes the work in
         // progress. Run on an interval it never converges. A supervise timer
         // did exactly that to the playground's replica — four restarts in
         // four minutes, never serving, healthy again the moment one `start`
-        // ran alone (docs/bugs/0004-start-replaces-a-starting-seat.md).
+        // ran alone (docs/bugs/0004-start-replaces-a-starting-seat.md). That
+        // window used to be the whole full sync; #176 cut it to the
+        // milliseconds before the bind, and this guard is what covers what
+        // is left.
         //
         // So: a seat with a process is this seat's, and `start` leaves it
         // be. If it is genuinely wedged rather than starting, that is what

@@ -390,6 +390,19 @@ static MAX_CONNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsiz
 static ACTIVE_CONNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static CONNS_SHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Startup state (#176). Set from process start until the real accept loop
+/// takes the listener over; while it holds, the port is OPEN and answers, but
+/// there is no store behind it yet.
+///
+/// This is Redis's `LOADING`, and it is deliberately the same word on the
+/// wire: `-LOADING` is a documented reply every mainstream client library
+/// already retries rather than treating as a hard failure.
+static LOADING: AtomicBool = AtomicBool::new(true);
+/// The error data commands get while [`LOADING`] holds. The prefix is the
+/// contract — Redis's own text after it, so a client matching on the message
+/// as well as the code still recognises it.
+const LOADING_ERR: &str = "LOADING Flint is loading the dataset in memory";
+
 /// Decrements the live-connection counter on any exit (incl. panic).
 struct ConnGuard;
 impl Drop for ConnGuard {
@@ -729,6 +742,51 @@ fn main() -> std::io::Result<()> {
     // master partitioned from ALL controllers stops accepting writes on its
     // own, closing the split-brain window without anyone reaching it.
     let lease_deadline = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+    // BIND BEFORE THE INITIAL FULL SYNC, not after it (#176).
+    //
+    // A fresh replica downloads its whole dataset before this function ever
+    // reached the old bind site — minutes on a fleet, tens of minutes at
+    // scale — and for that entire window the port was CLOSED. The node did
+    // not merely look unhealthy: at the TCP layer it was indistinguishable
+    // from a dead host, which is the strongest wrong signal available.
+    // `flintctl start` reads it as absent and replaces it (#139's class);
+    // the controller cannot tell it from a corpse (#189); `verify` calls the
+    // pair single-copy.
+    //
+    // So the listener opens here and answers immediately, in the state Redis
+    // already defined for exactly this: LOADING. Data commands get
+    // `-LOADING`, which every mainstream client library already knows to
+    // retry rather than treat as a hard failure; PING and FLINTINFO answer,
+    // so liveness and progress are observable throughout.
+    //
+    // The listener is shared, not handed over: the loading acceptor and the
+    // real accept loop both take connections from this same Arc, and the
+    // loading one exits once LOADING clears (see `accept_while_loading`).
+    let bind = arg("--bind").unwrap_or_else(|| "127.0.0.1".into());
+    let listener = Arc::new(TcpListener::bind((bind.as_str(), port))?);
+    eprintln!(
+        "flint-server listening on {bind}:{port} ({}) — LOADING",
+        if internal_reload.is_some() {
+            "internal mTLS"
+        } else {
+            "plaintext"
+        }
+    );
+    let loading_acceptor = {
+        // Non-blocking for the loading acceptor ONLY, so it can notice
+        // LOADING clearing without a connection arriving to wake it. The
+        // main loop sets it back to blocking before it takes over, and the
+        // handover is a join, not a sleep: exactly one loop ever owns the
+        // listener. (Waking a blocked accept() with a throwaway self-
+        // connection was the alternative and it is worse — a connect that
+        // fails leaves the acceptor parked forever, holding a real client's
+        // connection hostage.)
+        listener.set_nonblocking(true)?;
+        let listener = Arc::clone(&listener);
+        let tls = internal_reload.clone();
+        std::thread::spawn(move || accept_while_loading(&listener, tls.as_ref()))
+    };
 
     #[allow(unused_mut)]
     let mut rocks: Option<RocksHandle> = None;
@@ -1534,22 +1592,16 @@ fn main() -> std::io::Result<()> {
             }
         });
     }
-    // Loopback by default — a node serves the internal mesh, and on the
-    // single-host fleets that have existed until now that is both correct and
-    // the safer default. `--bind` is what makes a node reachable from ANOTHER
-    // machine: without it a pair split across two hosts is unreachable in
-    // both directions, however correctly it was placed there. The proxy has
-    // carried the same flag since the marketplace needed external clients.
-    let bind = arg("--bind").unwrap_or_else(|| "127.0.0.1".into());
-    let listener = TcpListener::bind((bind.as_str(), port))?;
-    eprintln!(
-        "flint-server listening on {bind}:{port} ({})",
-        if internal_reload.is_some() {
-            "internal mTLS"
-        } else {
-            "plaintext"
-        }
-    );
+    // Everything the store needs is up: take the listener back (#176). The
+    // order is the whole point — clear the flag, then wait for the loading
+    // acceptor to actually be gone, THEN go blocking and serve. A node that
+    // announced itself ready while a second loop was still answering
+    // `-LOADING` from the same socket would be a worse signal than the closed
+    // port this replaced.
+    LOADING.store(false, Ordering::SeqCst);
+    let _ = loading_acceptor.join();
+    listener.set_nonblocking(false)?;
+    eprintln!("flint-server serving on {bind}:{port}");
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
         // B1: shed over the connection cap (drop = reset; the peer backs
@@ -1601,6 +1653,200 @@ fn main() -> std::io::Result<()> {
         });
     }
     Ok(())
+}
+
+/// Accept and answer connections while the node is still coming up (#176).
+///
+/// Runs on the SAME listener the real loop will take over, from just after
+/// the bind until [`LOADING`] clears. It exists because the alternative — the
+/// port staying shut through a fresh replica's initial full sync — is not
+/// "looks unhealthy": at the TCP layer a syncing node is indistinguishable
+/// from a dead one, which is the strongest wrong signal available. `flintctl
+/// start` read it as absent and replaced a seat that was busy syncing
+/// (#139's class); the controller could not tell it from a corpse (#189);
+/// `verify` called the pair single-copy.
+///
+/// Polls rather than blocks so it can exit on the flag alone — see the
+/// handover comment at the call site for why a wake-up connection is not
+/// used. The 20ms cadence bounds the handover, and nothing latency-sensitive
+/// runs here: a client that reaches this loop is by definition about to be
+/// told to come back.
+fn accept_while_loading(
+    listener: &TcpListener,
+    tls: Option<&Arc<flint_tls::ReloadableServerConfig>>,
+) {
+    while LOADING.load(Ordering::SeqCst) {
+        let (stream, _) = match listener.accept() {
+            Ok(pair) => pair,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                continue;
+            }
+            Err(_) => continue,
+        };
+        // A socket accepted from a non-blocking listener inherits O_NONBLOCK
+        // on the BSDs (macOS included) and does not on Linux. Say which one
+        // we want rather than inherit a platform's answer — a non-blocking
+        // stream would turn every read on this connection into a spin.
+        if stream.set_nonblocking(false).is_err() {
+            continue;
+        }
+        // The cap applies here too: a connection storm against a node that
+        // is merely syncing must not exhaust its threads either.
+        if ACTIVE_CONNS.fetch_add(1, Ordering::Relaxed) >= MAX_CONNS.load(Ordering::Relaxed) {
+            ACTIVE_CONNS.fetch_sub(1, Ordering::Relaxed);
+            CONNS_SHED.fetch_add(1, Ordering::Relaxed);
+            drop(stream);
+            continue;
+        }
+        let tls = tls.and_then(|r| r.current());
+        std::thread::spawn(move || {
+            let _conn_guard = ConnGuard;
+            let Ok(conn) = flint_tls::accept(stream, &tls) else {
+                return;
+            };
+            let _ = serve_loading(conn);
+        });
+    }
+}
+
+/// One connection's worth of the `-LOADING` state (#176).
+///
+/// Deliberately not `serve` with a flag: there is no store, no replication
+/// hub and no manifest to consult yet, so this answers only what is TRUE
+/// without them — the connection is up, the build is this, and the node is
+/// not ready — and refuses everything else with `-LOADING`.
+///
+/// FLINTNS is refused with the rest, and that is what makes the proxy safe
+/// with no change of its own: the proxy pins every backend connection to a
+/// namespace before any data command can travel on it, so a node in this
+/// state fails the handshake and lands in the existing dead-backend path
+/// (replica reads fall back to the master; a keyed call rediscovers).
+fn serve_loading(mut stream: flint_tls::Stream) -> std::io::Result<()> {
+    let started = std::time::Instant::now();
+    let mut buf: Vec<u8> = Vec::with_capacity(4 * 1024);
+    let mut chunk = [0u8; 4 * 1024];
+    let mut out: Vec<u8> = Vec::with_capacity(1024);
+    let mut proto = flint_resp::Proto::default();
+    loop {
+        let mut consumed = 0;
+        out.clear();
+        while consumed < buf.len() {
+            let pending = &buf[consumed..];
+            // Inline commands as well as RESP arrays: `redis-cli`, a bare
+            // telnet and flintctl's edge probe all speak the inline form,
+            // and being unreachable to them is the bug being fixed.
+            let args = if pending[0] == b'*' {
+                match decode(pending) {
+                    Ok(Decoded::Complete(frame, used)) => {
+                        consumed += used;
+                        match frame_to_args(frame) {
+                            Some(a) => a,
+                            None => return Ok(()),
+                        }
+                    }
+                    Ok(Decoded::NeedMore) => break,
+                    Err(_) => return Ok(()),
+                }
+            } else {
+                let Some(nl) = pending.iter().position(|&b| b == b'\n') else {
+                    if pending.len() > MAX_INLINE_LEN {
+                        return Ok(());
+                    }
+                    break;
+                };
+                let line = pending[..nl].strip_suffix(b"\r").unwrap_or(&pending[..nl]);
+                consumed += nl + 1;
+                line.split(|&b| b == b' ')
+                    .filter(|p| !p.is_empty())
+                    .map(<[u8]>::to_vec)
+                    .collect()
+            };
+            if args.is_empty() {
+                continue;
+            }
+            // The node became ready under this connection. It must not keep
+            // answering -LOADING — that would be a lie told forever, and the
+            // client would retry against a node that is serving everyone
+            // else. There is no store reachable from here to switch to, so
+            // close: RESP has no "reconnect" signal, and a closed connection
+            // is one every client already handles. Only connections opened
+            // DURING the sync can be here, and they are already retrying.
+            if !LOADING.load(Ordering::SeqCst) {
+                if !out.is_empty() {
+                    let _ = stream.write_all(&out);
+                }
+                return Ok(());
+            }
+            let name = args[0].to_ascii_uppercase();
+            let reply = match name.as_slice() {
+                // Liveness. Answering it is the whole point: PING is what
+                // every supervisor, controller and readiness wait asks.
+                b"PING" => match args.len() {
+                    1 => Value::Simple("PONG".into()),
+                    2 => Value::Bulk(Some(args[1].clone())),
+                    _ => Value::Error("ERR wrong number of arguments for 'ping' command".into()),
+                },
+                // Protocol negotiation mutates nothing but this connection,
+                // so it is answerable without a store — and refusing it
+                // would only hide the -LOADING behind a handshake failure.
+                b"HELLO" => match flint_resp::parse_hello(&args) {
+                    Ok(req) => {
+                        if let Some(p) = req.proto {
+                            proto = p;
+                        }
+                        flint_resp::hello_reply(
+                            proto,
+                            flint_build::wire(&build_version()),
+                            "loading",
+                        )
+                    }
+                    Err(e) => e.reply(),
+                },
+                // Progress, so "not ready" is observable and bounded rather
+                // than merely asserted. `role:loading` is a value no
+                // consumer mistakes for a master or a healthy replica.
+                b"FLINTINFO" => Value::Bulk(Some(
+                    format!(
+                        "role:loading\r\nloading:1\r\nloading_ms:{}\r\nbuild:{}\r\n",
+                        started.elapsed().as_millis(),
+                        build_version(),
+                    )
+                    .into_bytes(),
+                )),
+                b"QUIT" => {
+                    encode_proto(&Value::Simple("OK".into()), proto, &mut out);
+                    let _ = stream.write_all(&out);
+                    return Ok(());
+                }
+                _ => Value::Error(LOADING_ERR.into()),
+            };
+            encode_proto(&reply, proto, &mut out);
+            // Flush a long pipeline incrementally, exactly as `serve` does.
+            // Refusals are small, but a client may pipeline up to the query
+            // buffer's whole gigabyte and each refused command still owes a
+            // reply — buffering all of them is a multiple of the input, on a
+            // node that is already busy pulling a checkpoint.
+            if out.len() >= OUT_FLUSH_THRESHOLD {
+                stream.write_all(&out)?;
+                out.clear();
+            }
+        }
+        if consumed > 0 {
+            buf.drain(..consumed);
+            if !out.is_empty() {
+                stream.write_all(&out)?;
+            }
+        }
+        let n = stream.read(&mut chunk)?;
+        if n == 0 {
+            return Ok(());
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        if buf.len() > MAX_QUERY_BUF {
+            return Ok(());
+        }
+    }
 }
 
 /// Per-connection input ceiling (Redis `client-query-buffer-limit`). With
@@ -3047,7 +3293,7 @@ fn flintinfo(
     };
     let (disk_free, disk_total, disk_unknown) = DISK.snapshot();
     let info = format!(
-        "role:{}\r\nrole_epoch:{role_epoch}\r\nbuild:{build}\r\nsst_bytes:{sst}\r\nlatest_seq:{latest}\r\nlast_applied:{last_applied}\r\nacked_seq:{}\r\nseq_lag:{seq_lag}\r\nlive_replicas:{}\r\nlag_ms:{}\r\nlag_soft_ms:{soft}\r\nlag_hard_ms:{hard}\r\nmin_replicas_to_write:{minr}\r\nwidowed_grace_ms:{wgm}\r\nwidowed_shed:{wsh}\r\nfullsync_active:{fsa}\r\nfullsync_max:{fsm}\r\nasync_write_queue:{aqd}\r\nwrite_deadline_ms:{wdm}\r\nwrite_inflight:{wif}\r\nwrite_service_us:{wsu}\r\nwrite_wait_est_ms:{wwe}\r\nwrites_shed_deadline:{wsd}\r\nwal_fsync_ms:{wfm}\r\nwal_fsync_total:{wft}\r\ncert_days_remaining:{cdr}\r\nactive_conns:{ac}\r\nmax_conns:{mc}\r\nconns_shed_total:{cs}\r\nwrite_stopped:{wst}\r\ndelayed_write_rate:{dwr}\r\ndisk_free_bytes:{dfb}\r\ndisk_total_bytes:{dtb}\r\ndisk_free_pct:{dfp}\r\ndisk_verdict:{dv}\r\ndisk_unknown_samples:{dus}\r\ngc_swept_expired:{gse}\r\ngc_swept_orphans:{gso}\r\nuptime_ms:{upms}\r\n",
+        "role:{}\r\nloading:0\r\nrole_epoch:{role_epoch}\r\nbuild:{build}\r\nsst_bytes:{sst}\r\nlatest_seq:{latest}\r\nlast_applied:{last_applied}\r\nacked_seq:{}\r\nseq_lag:{seq_lag}\r\nlive_replicas:{}\r\nlag_ms:{}\r\nlag_soft_ms:{soft}\r\nlag_hard_ms:{hard}\r\nmin_replicas_to_write:{minr}\r\nwidowed_grace_ms:{wgm}\r\nwidowed_shed:{wsh}\r\nfullsync_active:{fsa}\r\nfullsync_max:{fsm}\r\nasync_write_queue:{aqd}\r\nwrite_deadline_ms:{wdm}\r\nwrite_inflight:{wif}\r\nwrite_service_us:{wsu}\r\nwrite_wait_est_ms:{wwe}\r\nwrites_shed_deadline:{wsd}\r\nwal_fsync_ms:{wfm}\r\nwal_fsync_total:{wft}\r\ncert_days_remaining:{cdr}\r\nactive_conns:{ac}\r\nmax_conns:{mc}\r\nconns_shed_total:{cs}\r\nwrite_stopped:{wst}\r\ndelayed_write_rate:{dwr}\r\ndisk_free_bytes:{dfb}\r\ndisk_total_bytes:{dtb}\r\ndisk_free_pct:{dfp}\r\ndisk_verdict:{dv}\r\ndisk_unknown_samples:{dus}\r\ngc_swept_expired:{gse}\r\ngc_swept_orphans:{gso}\r\nuptime_ms:{upms}\r\n",
         if read_only { "replica" } else { "master" },
         hub.effective_acked(now)
             .map_or_else(|| "none".into(), |a| a.to_string()),
@@ -3116,7 +3362,7 @@ fn flintinfo(
 ) -> Value {
     let now = flint_storage::strings::system_clock();
     let info = format!(
-        "role:{}\r\nlive_replica:{}\r\n",
+        "role:{}\r\nloading:0\r\nlive_replica:{}\r\n",
         if read_only { "replica" } else { "master" },
         hub.has_live_replica(now) as u8,
     );
@@ -4238,5 +4484,110 @@ mod serve_tests {
         );
         s.write_all(&ping).expect("send ping");
         assert_eq!(read_frames(&mut s, 1)[0], Value::Simple("PONG".into()));
+    }
+
+    /// Ephemeral server running `serve_loading` — a node that has bound its
+    /// port but has no store behind it yet (#176).
+    fn spawn_loading_server() -> std::net::SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { continue };
+                std::thread::spawn(move || {
+                    let _ = serve_loading(flint_tls::Stream::Plain(stream));
+                });
+            }
+        });
+        addr
+    }
+
+    /// The whole point of #176: a node inside its initial full sync answers,
+    /// so nothing mistakes it for a corpse — and says what it is.
+    #[test]
+    fn a_loading_node_answers_ping_and_reports_itself_loading() {
+        let mut s = connect(spawn_loading_server());
+        let mut out = Vec::new();
+        encode(
+            &Value::Array(Some(vec![Value::Bulk(Some(b"PING".to_vec()))])),
+            &mut out,
+        );
+        encode(
+            &Value::Array(Some(vec![Value::Bulk(Some(b"FLINTINFO".to_vec()))])),
+            &mut out,
+        );
+        s.write_all(&out).expect("send");
+        let frames = read_frames(&mut s, 2);
+        assert_eq!(frames[0], Value::Simple("PONG".into()));
+        let Value::Bulk(Some(info)) = &frames[1] else {
+            panic!("FLINTINFO must answer during loading, got {:?}", frames[1]);
+        };
+        let info = String::from_utf8_lossy(info);
+        let lines: Vec<&str> = info.split(['\r', '\n']).filter(|l| !l.is_empty()).collect();
+        // `loading:1` is the field every consumer keys on, and `role:loading`
+        // is what keeps the master/replica filters from matching this node.
+        assert!(lines.contains(&"loading:1"), "no loading:1 in {info:?}");
+        assert!(
+            lines.contains(&"role:loading"),
+            "no role:loading in {info:?}"
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|l| *l == "role:master" || *l == "role:replica"),
+            "a loading node must not claim a serving role: {info:?}"
+        );
+    }
+
+    /// And refuses the work it cannot do, with the error Redis defined for
+    /// exactly this and every mainstream client already retries on.
+    #[test]
+    fn a_loading_node_refuses_data_commands_with_loading() {
+        let mut s = connect(spawn_loading_server());
+        let mut out = Vec::new();
+        for cmd in [
+            vec!["GET", "k"],
+            vec!["SET", "k", "v"],
+            // FLINTNS is the one that matters for the fleet: the proxy pins
+            // every backend connection with it before any data command can
+            // travel, so refusing it is what keeps a syncing node out of the
+            // routing path with no change to the proxy at all.
+            vec!["FLINTNS", "tenant"],
+            vec!["FLINTPROMOTE", "1"],
+        ] {
+            encode(
+                &Value::Array(Some(
+                    cmd.iter()
+                        .map(|a| Value::Bulk(Some(a.as_bytes().to_vec())))
+                        .collect(),
+                )),
+                &mut out,
+            );
+        }
+        s.write_all(&out).expect("send");
+        for (i, f) in read_frames(&mut s, 4).into_iter().enumerate() {
+            match f {
+                Value::Error(e) => assert!(
+                    e.starts_with("LOADING "),
+                    "reply {i} must carry the LOADING code, got {e:?}"
+                ),
+                other => panic!("reply {i} must be refused while loading, got {other:?}"),
+            }
+        }
+    }
+
+    /// Inline commands too — `redis-cli`, a bare telnet and flintctl's edge
+    /// probe all speak the inline form, and being unreachable to them is the
+    /// bug being fixed.
+    #[test]
+    fn a_loading_node_answers_an_inline_ping() {
+        let mut s = connect(spawn_loading_server());
+        s.write_all(b"PING\r\nGET k\r\n").expect("send");
+        let frames = read_frames(&mut s, 2);
+        assert_eq!(frames[0], Value::Simple("PONG".into()));
+        match &frames[1] {
+            Value::Error(e) => assert!(e.starts_with("LOADING "), "{e:?}"),
+            other => panic!("inline GET must be refused while loading, got {other:?}"),
+        }
     }
 }
