@@ -46,12 +46,6 @@
 //! position is the whole correspondence. True of the shared pool, of
 //! twemproxy, and of Envoy.
 
-// TRANSITIONAL. This module is complete and tested but not yet reachable from
-// `serve_client`, which is still blocking — the edge conversion is the other
-// half of ADR-0021 stage 2. Remove this the moment the edge calls in; a stale
-// allow(dead_code) is how an unused module survives long enough to rot.
-#![allow(dead_code)]
-
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::rc::Rc;
@@ -60,6 +54,20 @@ use flint_resp::{Decoded, Value, decode};
 use flint_tls::aio::AsyncStream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, WriteHalf};
 use tokio::sync::oneshot;
+
+/// Observability, process-wide across all workers.
+///
+/// `batch_mean` (commands/batches) is the load-bearing one: it says whether a
+/// client's pipeline actually reached the node as a pipeline. It sat at 1.0
+/// through two implementations that looked correct, and reading it is what
+/// finally showed the batching had been disabled. Names match the previous
+/// pool's exactly, so existing harnesses and drills keep working.
+pub(crate) static BATCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) static COMMANDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) static INFLIGHT_MAX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) static DIAL_FAILURES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static LIVE_CONNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Replies outstanding on one connection, in request order.
 type Pending = Rc<RefCell<VecDeque<oneshot::Sender<std::io::Result<Value>>>>>;
@@ -150,6 +158,7 @@ impl AsyncConn {
             eprintln!("apool: backend {addr} died: {why} (failed={n} in flight)");
         });
         *conn.reader.borrow_mut() = Some(handle);
+        LIVE_CONNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         conn
     }
 
@@ -168,6 +177,7 @@ impl AsyncConn {
         }
         if let Some(h) = self.reader.borrow_mut().take() {
             h.abort();
+            LIVE_CONNS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
@@ -186,6 +196,9 @@ impl AsyncConn {
         // order. Both borrows end here; neither can reach an await.
         self.pending.borrow_mut().push_back(tx);
         self.staged.borrow_mut().extend_from_slice(frame);
+        let depth = self.pending.borrow().len() as u64;
+        COMMANDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        INFLIGHT_MAX.fetch_max(depth, std::sync::atomic::Ordering::Relaxed);
         Ok(rx)
     }
 
@@ -200,6 +213,7 @@ impl AsyncConn {
             }
             std::mem::take(&mut *s)
         };
+        BATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut w = self.w.lock().await;
         w.write_all(&buf).await
     }
@@ -208,6 +222,7 @@ impl AsyncConn {
         self.dead.get()
     }
 
+    #[cfg(test)]
     pub(crate) fn inflight(&self) -> usize {
         self.pending.borrow().len()
     }
@@ -517,7 +532,10 @@ pub(crate) async fn conn_for(
     {
         return Ok(c);
     }
-    let fresh = AsyncConn::new(dial(key, tls).await?, key.addr.clone());
+    let stream = dial(key, tls).await.inspect_err(|_| {
+        DIAL_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    })?;
+    let fresh = AsyncConn::new(stream, key.addr.clone());
     // Another task on this worker may have dialed the same key while we were
     // awaiting. Whoever is installed wins, and the loser is RETIRED rather
     // than dropped: dropping leaves its reader parked on a socket forever.
@@ -535,6 +553,19 @@ pub(crate) async fn conn_for(
         fresh.shutdown();
     }
     Ok(winner)
+}
+
+/// A connection for ONE client's exclusive use — handshaken like any other,
+/// but never entered into the registry.
+///
+/// Transactions need this: MULTI's queue and WATCH's watches are per-
+/// connection state on the node, so a queued command that travelled on a
+/// shared connection would EXECUTE instead of queueing.
+pub(crate) async fn dial_private(
+    key: &Key,
+    tls: &Option<std::sync::Arc<flint_tls::ReloadableClientConfig>>,
+) -> std::io::Result<Rc<AsyncConn>> {
+    Ok(AsyncConn::new(dial(key, tls).await?, key.addr.clone()))
 }
 
 /// Forget this worker's connection to `key`, retiring it.
