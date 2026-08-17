@@ -1,4 +1,12 @@
 // SPDX-License-Identifier: Elastic-2.0
+// Armed BEFORE the hazard it guards (ADR-0021). This crate holds ~62
+// `lock()`/`read()`/`write()` guards, and as the async conversion lands, a
+// guard still alive across an `.await` would deadlock the worker owning it and
+// take every client on that worker with it. That is a mistake review does not
+// reliably catch and the compiler otherwise permits, so it is denied from the
+// moment async code can exist here rather than after the first one ships.
+#![deny(clippy::await_holding_lock)]
+#![deny(clippy::await_holding_refcell_ref)]
 //! flint-proxy (v0): the routing plane's front door (docs/design.md §2.1).
 //!
 //! Clients get ONE plain-RESP endpoint and need no cluster awareness, ever.

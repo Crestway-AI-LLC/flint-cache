@@ -38,6 +38,11 @@ pub use rustls::{ClientConfig, ServerConfig};
 /// IP a peer happens to be reached at.
 pub const INTERNAL_SNI: &str = "flint-internal";
 
+/// Async counterparts of the stream helpers (ADR-0021). Feature-gated: the
+/// blocking consumers of this crate must not link a runtime they never enter.
+#[cfg(feature = "aio")]
+pub mod aio;
+
 fn provider() -> Arc<rustls::crypto::CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
 }
