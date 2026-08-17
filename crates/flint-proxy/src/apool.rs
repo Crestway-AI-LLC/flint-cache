@@ -75,6 +75,14 @@ pub(crate) struct AsyncConn {
     staged: RefCell<Vec<u8>>,
     pending: Pending,
     dead: Rc<Cell<bool>>,
+    /// The reader task, so a connection can be retired deliberately.
+    ///
+    /// Dropping the write half does not end the reader: it parks on a socket
+    /// the peer may hold open indefinitely. Without this handle a connection
+    /// discarded by a dial race — or by a routing change — leaves a task
+    /// reading forever on a worker that will never use it again, which is a
+    /// leak that only shows up as a slow drift in task count.
+    reader: RefCell<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl AsyncConn {
@@ -89,9 +97,10 @@ impl AsyncConn {
             staged: RefCell::new(Vec::with_capacity(16 * 1024)),
             pending: pending.clone(),
             dead: dead.clone(),
+            reader: RefCell::new(None),
         });
 
-        tokio::task::spawn_local(async move {
+        let handle = tokio::task::spawn_local(async move {
             let mut acc: Vec<u8> = Vec::with_capacity(64 * 1024);
             let mut chunk = [0u8; 64 * 1024];
             let why = 'read: loop {
@@ -140,7 +149,26 @@ impl AsyncConn {
             // so a fleet collapse could be observed but never explained.
             eprintln!("apool: backend {addr} died: {why} (failed={n} in flight)");
         });
+        *conn.reader.borrow_mut() = Some(handle);
         conn
+    }
+
+    /// Retire this connection: mark it dead, fail anyone still waiting, and
+    /// stop its reader.
+    ///
+    /// Callers that lose a dial race, or hold a connection to an address that
+    /// is no longer a master, must call this rather than just dropping their
+    /// handle — see the `reader` field for why a drop alone is not enough.
+    pub(crate) fn shutdown(&self) {
+        self.dead.set(true);
+        loop {
+            let slot = self.pending.borrow_mut().pop_front();
+            let Some(tx) = slot else { break };
+            let _ = tx.send(Err(std::io::Error::other("backend connection retired")));
+        }
+        if let Some(h) = self.reader.borrow_mut().take() {
+            h.abort();
+        }
     }
 
     /// Stage one command and return immediately — Envoy's
@@ -288,6 +316,78 @@ mod tests {
         });
     }
 
+    /// A backend that completes the handshake (RESP3 map, then +OK for
+    /// FLINTNS) and then stays silent, holding the connection open.
+    async fn handshake_backend() -> String {
+        let l = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = l.local_addr().expect("addr").to_string();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = l.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut buf: Vec<u8> = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    let mut done = 0;
+                    while done < 2 {
+                        let Ok(n) = sock.read(&mut chunk).await else {
+                            return;
+                        };
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                        while let Ok(Decoded::Complete(_, used)) = decode(&buf) {
+                            buf.drain(..used);
+                            let reply: &[u8] = if done == 0 { b"%0\r\n" } else { b"+OK\r\n" };
+                            if sock.write_all(reply).await.is_err() {
+                                return;
+                            }
+                            done += 1;
+                        }
+                    }
+                    // Hold the socket open so the connection stays live.
+                    let _ = sock.read(&mut chunk).await;
+                });
+            }
+        });
+        addr
+    }
+
+    /// A worker reuses its connection, and retiring it really replaces it.
+    ///
+    /// Reuse is the point of the registry: if every command dialled, this
+    /// would be worse than the per-client sockets ADR-0020 removed. Retire
+    /// must genuinely evict, or a stale connection to a demoted master would
+    /// be handed out forever.
+    #[test]
+    fn a_worker_reuses_its_connection_and_retire_replaces_it() {
+        run(async {
+            let addr = handshake_backend().await;
+            let key = Key {
+                addr: addr.clone(),
+                ns: b"0".to_vec(),
+                async_writes: false,
+            };
+
+            let a = conn_for(&key, &None).await.expect("dial a");
+            let b = conn_for(&key, &None).await.expect("dial b");
+            assert!(
+                Rc::ptr_eq(&a, &b),
+                "a second lookup must reuse this worker's connection, not dial again"
+            );
+
+            retire(&key);
+            assert!(a.is_dead(), "retire must mark the evicted connection dead");
+            let c = conn_for(&key, &None).await.expect("dial c");
+            assert!(
+                !Rc::ptr_eq(&a, &c),
+                "after retire the worker must dial a fresh connection"
+            );
+        });
+    }
+
     #[test]
     fn a_dead_backend_fails_every_caller_rather_than_hanging_them() {
         run(async {
@@ -315,5 +415,132 @@ mod tests {
             }
             assert!(conn.is_dead(), "the connection must be marked dead");
         });
+    }
+}
+
+/// A backend connection's identity within one worker. Namespace and the
+/// async-writes flag are part of it because `FLINTNS` pins the connection at
+/// open: a connection is only ever reusable for the SAME pair.
+#[derive(PartialEq, Eq, Hash, Clone)]
+pub(crate) struct Key {
+    pub addr: String,
+    pub ns: Vec<u8>,
+    pub async_writes: bool,
+}
+
+thread_local! {
+    /// THIS worker's backend connections, shared with no other worker. That
+    /// is the whole design (ADR-0021): a thread-local map needs no lock, and
+    /// a connection's death reaches only the clients this worker owns.
+    static REGISTRY: RefCell<std::collections::HashMap<Key, Rc<AsyncConn>>> =
+        RefCell::new(std::collections::HashMap::new());
+}
+
+/// Write one frame and read exactly one reply. Handshake use only — the data
+/// path stages and collects instead of round-tripping.
+async fn exchange(s: &mut AsyncStream, frame: &[u8]) -> std::io::Result<Value> {
+    s.write_all(frame).await?;
+    let mut acc = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        match decode(&acc) {
+            Ok(Decoded::Complete(v, _)) => return Ok(v),
+            Ok(Decoded::NeedMore) => {}
+            Err(e) => return Err(std::io::Error::other(format!("handshake decode: {e:?}"))),
+        }
+        match s.read(&mut chunk).await? {
+            0 => return Err(std::io::Error::other("backend closed during handshake")),
+            n => acc.extend_from_slice(&chunk[..n]),
+        }
+    }
+}
+
+/// Dial and hand-shake a backend connection: RESP3, then the namespace pin.
+///
+/// Deliberately the same two steps, in the same order, with the same
+/// acceptance checks as the blocking `dial_backend`. The namespace MUST be
+/// pinned before any data command can travel, or a connection could carry one
+/// tenant's command under another's binding — the handshake is the tenant
+/// boundary, not a formality.
+async fn dial(
+    key: &Key,
+    tls: &Option<std::sync::Arc<flint_tls::ReloadableClientConfig>>,
+) -> std::io::Result<AsyncStream> {
+    let mut s = flint_tls::aio::connect_reloadable(&key.addr, tls).await?;
+
+    let mut hello = Vec::new();
+    flint_resp::encode(
+        &Value::Array(Some(vec![
+            Value::Bulk(Some(b"HELLO".to_vec())),
+            Value::Bulk(Some(b"3".to_vec())),
+        ])),
+        &mut hello,
+    );
+    match exchange(&mut s, &hello).await? {
+        Value::Map(_) => {}
+        other => {
+            return Err(std::io::Error::other(format!(
+                "backend refused RESP3: {other:?}"
+            )));
+        }
+    }
+
+    let mut args = vec![
+        Value::Bulk(Some(b"FLINTNS".to_vec())),
+        Value::Bulk(Some(key.ns.clone())),
+    ];
+    if key.async_writes {
+        args.push(Value::Bulk(Some(b"a".to_vec())));
+    }
+    let mut hs = Vec::new();
+    flint_resp::encode(&Value::Array(Some(args)), &mut hs);
+    match exchange(&mut s, &hs).await? {
+        Value::Simple(_) => {}
+        other => {
+            return Err(std::io::Error::other(format!(
+                "namespace handshake rejected: {other:?}"
+            )));
+        }
+    }
+    Ok(s)
+}
+
+/// This worker's connection for `key`, dialing if absent or dead.
+pub(crate) async fn conn_for(
+    key: &Key,
+    tls: &Option<std::sync::Arc<flint_tls::ReloadableClientConfig>>,
+) -> std::io::Result<Rc<AsyncConn>> {
+    // Fast path: a live connection costs one borrow and no await at all.
+    let existing = REGISTRY.with(|r| r.borrow().get(key).cloned());
+    if let Some(c) = existing
+        && !c.is_dead()
+    {
+        return Ok(c);
+    }
+    let fresh = AsyncConn::new(dial(key, tls).await?, key.addr.clone());
+    // Another task on this worker may have dialed the same key while we were
+    // awaiting. Whoever is installed wins, and the loser is RETIRED rather
+    // than dropped: dropping leaves its reader parked on a socket forever.
+    let winner = REGISTRY.with(|r| {
+        let mut m = r.borrow_mut();
+        match m.get(key) {
+            Some(c) if !c.is_dead() => c.clone(),
+            _ => {
+                m.insert(key.clone(), fresh.clone());
+                fresh.clone()
+            }
+        }
+    });
+    if !Rc::ptr_eq(&winner, &fresh) {
+        fresh.shutdown();
+    }
+    Ok(winner)
+}
+
+/// Forget this worker's connection to `key`, retiring it.
+pub(crate) fn retire(key: &Key) {
+    let gone = REGISTRY.with(|r| r.borrow_mut().remove(key));
+    if let Some(c) = gone {
+        c.shutdown();
     }
 }
