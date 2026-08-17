@@ -234,7 +234,18 @@ cpu_snapshot() {
   python3 - "$1" <<'PYEOF'
 import sys, os
 pid = sys.argv[1]
-eng = other = 0
+
+def ticks(path):
+    with open(path) as f:
+        fields = f.read().rsplit(") ", 1)[1].split()
+    # utime, stime are fields 14,15 in proc(5); after the rsplit the first
+    # entry is field 3, so they land at indices 11 and 12.
+    return int(fields[11]) + int(fields[12])
+
+# ENGINE is summed per-thread, because only the thread name distinguishes
+# compaction from everything else. Those are long-lived pool threads, so they
+# are present whenever we look.
+eng = 0
 d = "/proc/%s/task" % pid
 try:
     tids = os.listdir(d)
@@ -242,16 +253,31 @@ except OSError:
     print("0 0"); sys.exit(0)
 for t in tids:
     try:
-        with open("%s/%s/comm" % (d, t)) as f: name = f.read().strip()
-        with open("%s/%s/stat" % (d, t)) as f: fields = f.read().rsplit(") ", 1)[1].split()
+        with open("%s/%s/comm" % (d, t)) as f:
+            name = f.read().strip()
+        n = ticks("%s/%s/stat" % (d, t))
     except OSError:
         continue
-    # utime, stime are fields 14,15 in proc(5); after the rsplit above the
-    # first entry is field 3, so they land at indices 11 and 12.
-    ticks = int(fields[11]) + int(fields[12])
-    if name.startswith("rocksdb"): eng += ticks
-    else: other += ticks
-print("%d %d" % (eng, other))
+    if name.startswith("rocksdb"):
+        eng += n
+
+# EVERYTHING ELSE is the PROCESS total minus the engine, NOT a sum over the
+# surviving non-engine threads.
+#
+# Measured 2026-08-17: summing live threads reported "other" as 0.00 in every
+# interval of every configuration — a node ingesting 200+ MB/s apparently
+# using no CPU to receive it. The connection thread serving the feed exits
+# when the pipe closes, and /proc/PID/task lists only LIVE threads, so its
+# time had already left the view by the time we sampled. The process-level
+# counters keep it, because they accumulate reaped threads too.
+#
+# It read as a plausible number rather than an obvious hole, which is why the
+# assert below exists.
+try:
+    total = ticks("/proc/%s/stat" % pid)
+except OSError:
+    total = eng
+print("%d %d" % (eng, max(total - eng, 0)))
 PYEOF
 }
 HZ=$(getconf CLK_TCK 2>/dev/null || echo 100)
@@ -301,7 +327,7 @@ for J in $JOBS; do
   fi
 
   read -r E0 O0 <<<"$(cpu_snapshot "$SPID")"
-  FIRST=""; LAST=""; ENG_TICKS=0; TOT_SECS=0
+  FIRST=""; LAST=""; ENG_TICKS=0; OTHER_TICKS=0; TOT_SECS=0
   printf '  %-4s %8s %8s %10s %10s\n' int MB secs MB/s "eng|other"
   for i in $(seq 0 $(( INTERVALS - 1 ))); do
     c=$(printf '%02d' "$i")
@@ -326,6 +352,7 @@ for J in $JOBS; do
     EC=$(awk -v d="$(( E1 - E0 ))" -v hz="$HZ" -v s="$SECS" 'BEGIN{printf "%.2f", d/hz/s}')
     OC=$(awk -v d="$(( O1 - O0 ))" -v hz="$HZ" -v s="$SECS" 'BEGIN{printf "%.2f", d/hz/s}')
     ENG_TICKS=$(( ENG_TICKS + E1 - E0 ))
+    OTHER_TICKS=$(( OTHER_TICKS + O1 - O0 ))
     E0=$E1; O0=$O1
     printf '  %-4s %8s %8s %10s %10s\n' "$c" "$CHUNK_MB" "$SECS" "$RATE" "$EC|$OC"
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$LABEL" "$c" "$CHUNK_MB" "$SECS" "$RATE" "$EC" "$OC" >> "$TSV"
@@ -346,6 +373,17 @@ for J in $JOBS; do
     echo "  The engine/serve split is not being measured — thread naming is"
     echo "  glibc-only and this host is not providing it. Every eng column"
     echo "  above is 0.00 for that reason and none of it is evidence."
+    exit 1
+  fi
+  # THE OTHER HALF OF THE SAME ASSERT, and it earned its place: the first run
+  # that produced real numbers reported other=0.00 in all 32 intervals, which
+  # says a node took 760 MB of writes without spending a cycle receiving them.
+  # Zero here means the accounting lost the serve path, not that serving is
+  # free.
+  if [ "$OTHER_TICKS" -eq 0 ]; then
+    echo "FAIL: no CPU attributed to anything but the engine across the run."
+    echo "  Receiving $(( CHUNK_MB * INTERVALS ))MB cannot cost zero. The serve"
+    echo "  column is not being measured, so the split above is not evidence."
     exit 1
   fi
 
