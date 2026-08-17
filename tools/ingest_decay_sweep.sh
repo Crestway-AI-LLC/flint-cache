@@ -128,6 +128,45 @@ if [ "${DECAY_ANY_HOST:-0}" != "1" ] && [ "$SEAT_CPUS" -gt 4 ]; then
   echo "  if you are deliberately measuring something else."
   exit 2
 fi
+
+# DOES THE ARITHMETIC EVALUATE? Asked here, in the first second, and runnable
+# anywhere with DECAY_SELFTEST=1 — including the laptop, which cannot run the
+# sweep itself.
+#
+# Every expression below was once written as `printf "%.1f", x > y ? a : b`,
+# which awk parses as `printf "%.1f", x` REDIRECTED TO THE FILE `y`, and then
+# chokes on the `?`. It is a syntax error in awk, not a runtime one, so
+# `bash -n` on this file says nothing about it: the shell only sees a quoted
+# string. It cost a full run on a paid box to find, and the run did not even
+# fail — it printed empty columns for four configurations and PASSED.
+#
+# So the expressions are exercised against known inputs before anything else
+# happens. Cheap, and it catches the whole class.
+selftest() {
+  local fail=0 got
+  got=$(awk -v a=1.0 -v b=2.5 'BEGIN{printf "%.2f", ((b-a)>0.01?(b-a):0.01)}')
+  [ "$got" = "1.50" ] || { echo "  elapsed: got '$got' want 1.50"; fail=1; }
+  got=$(awk -v m=200 -v s=8 'BEGIN{printf "%.1f", (s>0 ? m/s : 0)}')
+  [ "$got" = "25.0" ] || { echo "  mean: got '$got' want 25.0"; fail=1; }
+  got=$(awk -v f=100 -v l=60 'BEGIN{printf "%.0f", (f>0 ? (1 - l/f) * 100 : 0)}')
+  [ "$got" = "40" ] || { echo "  decay: got '$got' want 40"; fail=1; }
+  got=$(awk -v a=100 -v b=105 'BEGIN{printf "%.1f", (a>0 ? (b>a?(b-a):(a-b))/a*100 : 0)}')
+  [ "$got" = "5.0" ] || { echo "  noise: got '$got' want 5.0"; fail=1; }
+  got=$(awk -v a=1 -v b=3 'BEGIN{d=b-a; if(d<0.01)d=0.01; printf "%d", 512/d}')
+  [ "$got" = "256" ] || { echo "  disk: got '$got' want 256"; fail=1; }
+  return $fail
+}
+if ! selftest; then
+  echo "REFUSED: this script's own arithmetic does not evaluate on this awk."
+  echo "  Fix that before spending a machine on it — every number it would"
+  echo "  print derives from those expressions."
+  exit 2
+fi
+if [ "${DECAY_SELFTEST:-0}" = "1" ]; then
+  echo "selftest OK: the arithmetic evaluates on $(awk --version 2>/dev/null | head -1 || echo 'this awk')"
+  exit 0
+fi
+
 if [ ! -r /proc/self/stat ]; then
   echo "REFUSED: no /proc — the CPU split between compaction and the write"
   echo "  path is read per-thread from /proc, and without it this measures"
@@ -272,8 +311,18 @@ for J in $JOBS; do
     T1=$(date +%s.%N)
     read -r E1 O1 <<<"$(cpu_snapshot "$SPID")"
     [ "${ERR:-1}" = "0" ] || { echo "FAIL: interval $c reported errors=$ERR"; exit 1; }
-    SECS=$(awk -v a="$T0" -v b="$T1" 'BEGIN{printf "%.2f", (b-a)>0.01?(b-a):0.01}')
+    SECS=$(awk -v a="$T0" -v b="$T1" 'BEGIN{printf "%.2f", ((b-a)>0.01?(b-a):0.01)}')
     RATE=$(awk -v m="$CHUNK_MB" -v s="$SECS" 'BEGIN{printf "%.1f", m/s}')
+    # FAIL ON THE FIRST BLANK, not after four configs of empty columns. An
+    # arithmetic slip that yields "" propagates silently: every subsequent
+    # number derives from it, the summary prints "mean=  first= MB/s", and the
+    # final control has nothing to compare, so the run ends in a PASS made of
+    # holes. One empty cell is the whole measurement.
+    case "$SECS$RATE" in
+      *[!0-9.]*|"") echo "FAIL: interval $c produced no timing (secs='$SECS' rate='$RATE')."
+                    echo "  The arithmetic is broken; nothing below it would mean anything."
+                    exit 1 ;;
+    esac
     EC=$(awk -v d="$(( E1 - E0 ))" -v hz="$HZ" -v s="$SECS" 'BEGIN{printf "%.2f", d/hz/s}')
     OC=$(awk -v d="$(( O1 - O0 ))" -v hz="$HZ" -v s="$SECS" 'BEGIN{printf "%.2f", d/hz/s}')
     ENG_TICKS=$(( ENG_TICKS + E1 - E0 ))
@@ -284,7 +333,7 @@ for J in $JOBS; do
     [ -z "$FIRST" ] && FIRST=$RATE
     LAST=$RATE
   done
-  MEAN=$(awk -v m="$(( CHUNK_MB * INTERVALS ))" -v s="$TOT_SECS" 'BEGIN{printf "%.1f", s>0 ? m/s : 0}')
+  MEAN=$(awk -v m="$(( CHUNK_MB * INTERVALS ))" -v s="$TOT_SECS" 'BEGIN{printf "%.1f", (s>0 ? m/s : 0)}')
 
   # POSITIVE CONTROL ON THE INSTRUMENT. RocksDB names its background threads
   # only under glibc; where it does not, every thread falls into "other" and
@@ -306,7 +355,7 @@ for J in $JOBS; do
   STALLPCT=$(grep -E '^Cumulative stall:' "$LOG" 2>/dev/null | tail -1 \
              | sed -n 's/.*, \([0-9.]*\) percent.*/\1/p')
   PHYS=$(du -sk "$DIR" | awk '{print $1 / 1024}')
-  DECAY=$(awk -v f="$FIRST" -v l="$LAST" 'BEGIN{printf "%.0f", f>0 ? (1 - l/f) * 100 : 0}')
+  DECAY=$(awk -v f="$FIRST" -v l="$LAST" 'BEGIN{printf "%.0f", (f>0 ? (1 - l/f) * 100 : 0)}')
   LINE=$(printf 'bg_jobs=%-8s mean=%s  first=%s MB/s  last=%s MB/s  decay=%s%%  W-Amp=%s  stall=%s%%  phys=%.0fMB' \
     "$LABEL" "$MEAN" "$FIRST" "$LAST" "$DECAY" "${WAMP:-?}" "${STALLPCT:-0}" "$PHYS")
   echo "  $LINE"
@@ -327,7 +376,21 @@ echo "  per-interval rows: $TSV"
 # in, and every difference between the columns above is warm-up noise dressed
 # as a finding. Deeper is the fix — DECAY_KEYS — not a softer threshold.
 BASE_DECAY=$(awk '/^bg_jobs=default/{ for (i=1;i<=NF;i++) if ($i ~ /^decay=/) { sub(/decay=/,"",$i); sub(/%/,"",$i); print $i } }' "$SUMMARY" | head -1)
-if [ -n "${BASE_DECAY:-}" ] && [ "$BASE_DECAY" -lt 15 ]; then
+# ABSENCE IS NOT SUCCESS. This guard was written `[ -n "$BASE_DECAY" ] && [
+# "$BASE_DECAY" -lt 15 ]`, so a MISSING figure skipped the check entirely and
+# the run printed "PASS: the curve is real (baseline decayed ?%)". That is the
+# exact failure this file exists to prevent, in the file itself, and it is the
+# same shape as bugs/0009 — a check that verifies nothing and reads as green.
+# It fired for real: an awk slip emptied every rate and the sweep still passed.
+# So: no baseline figure is a HARDER failure than a bad one.
+if [ -z "${BASE_DECAY:-}" ]; then
+  echo
+  echo "MEASUREMENT INVALID: no decay figure for the baseline column at all."
+  echo "  Something above failed to produce a number, so there is nothing to"
+  echo "  check and nothing here is evidence. Read the run output, not this line."
+  exit 1
+fi
+if [ "$BASE_DECAY" -lt 15 ]; then
   echo
   echo "MEASUREMENT INVALID: the default configuration decayed only ${BASE_DECAY}%"
   echo "  across the run, so the LSM never got deep enough for compaction to"
@@ -344,9 +407,9 @@ fi
 D_MEAN=$(awk '/^bg_jobs=default/{for(i=1;i<=NF;i++) if($i ~ /^mean=/){sub(/mean=/,"",$i); print $i}}' "$SUMMARY" | head -1)
 T_MEAN=$(awk '/^bg_jobs=2 /{for(i=1;i<=NF;i++) if($i ~ /^mean=/){sub(/mean=/,"",$i); print $i}}' "$SUMMARY" | head -1)
 if [ -n "${D_MEAN:-}" ] && [ -n "${T_MEAN:-}" ]; then
-  NOISE=$(awk -v a="$D_MEAN" -v b="$T_MEAN" 'BEGIN{printf "%.1f", a>0 ? (b>a?(b-a):(a-b))/a*100 : 0}')
+  NOISE=$(awk -v a="$D_MEAN" -v b="$T_MEAN" 'BEGIN{printf "%.1f", (a>0 ? (b>a?(b-a):(a-b))/a*100 : 0)}')
   echo "  noise floor: default vs an explicit 2 (the same engine) differ by ${NOISE}%."
   echo "  Treat any column gap smaller than that as nothing."
 fi
 
-echo "PASS: the curve is real (baseline decayed ${BASE_DECAY:-?}%) — read the summary above"
+echo "PASS: the curve is real (baseline decayed ${BASE_DECAY}%) — read the summary above"
