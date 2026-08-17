@@ -3824,10 +3824,19 @@ fn main() -> std::io::Result<()> {
     // (futures must be Send) or, with locks bolted back on, reproduce the
     // convoy this change exists to remove. Few owners is the property; a
     // single-threaded runtime per worker is how it is obtained.
-    let workers = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
-        .clamp(1, 16);
+    // One runtime per worker. Defaults to core count because a worker is a
+    // scheduling unit, not a concurrency knob — more of them than cores just
+    // adds context switches. Overridable so a test can pin a shape (the
+    // chain-walk chaos gate runs 16 deliberately, to put many workers on one
+    // node and maximise the chance of a mis-correlated reply).
+    let workers = arg("--workers")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4)
+        })
+        .clamp(1, 64);
     eprintln!(
         "flint-proxy listening on {bind}:{port} ({}, max-conns {max_conns}, {workers} workers)",
         if tls.is_some() { "TLS" } else { "plaintext" }
