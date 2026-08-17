@@ -14,6 +14,9 @@ lost. Format and rationale: [0001](0001-record-architecture-decisions.md).
 | [0013](0013-user-driven-gc-primitives.md) | User-driven GC primitives: no eviction, but a loop the operator can close |
 | [0014](0014-introspection-status-surface.md) | One status surface: a build stamp on every seat, `status --json` with drift detection, `CPMYSTATUS` for tenants (proposed) |
 | [0016](0016-bloom-filter-type.md) | Bloom filters as a native type: RedisBloom's `BF.*` protocol over a blocked filter, one row per block |
+| [0018](0018-cp-held-leases.md) | The write lease is held at the control plane, not the controller |
+| [0019](0019-rewind-rejoin-promotion-fences.md) | Rewind rejoin: promotion fences make failover RTO independent of dataset size |
+| [0020](0020-proxy-backend-multiplexing.md) | Multiplex the proxy's backend hop: decouple send from receive so a pipeline survives it (proposed) |
 
 ## Why the numbering has a gap
 
