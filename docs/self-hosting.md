@@ -391,6 +391,14 @@ the metrics source you build on:
 - **`FLINTINFO`** on each node: role, epoch, `seq_lag`, `live_replicas`,
   `lag_ms`, the lag caps, `wal_fsync_ms`, `active_conns`/`max_conns`,
   `cert_days_remaining`, write-stall signals, and more.
+
+  Note `loading:` in particular if you write your own health checks. A node
+  that is pulling its initial copy from a master binds and answers `PING`
+  from the first moment — deliberately, so that nothing mistakes it for a
+  dead host — and reports `role:loading`, `loading:1` and `loading_ms`
+  until it can serve. **`PING` means alive; `loading:0` means ready.** A
+  health check that stops at `PING` will call a node ready while it still
+  refuses every data command with `-LOADING`.
 - **`PROXYSTATS`** on each proxy: connections, command/read/write totals,
   cache hit/miss/entries/bytes, `moved_learned_total`, quota sheds,
   `cert_days_remaining`. **`PROXYLATENCY`** gives per-lane read/write

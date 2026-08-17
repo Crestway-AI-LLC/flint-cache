@@ -27,6 +27,13 @@
 # Plus one direct protocol probe: FLINTSYNC with a cursor past the fence
 # must be refused server-side even when the client-side selection is
 # bypassed — the drill speaks the wire form the tailer would.
+#
+# Every wait here is `fleet_wait_ready`, not `fleet_wait_listen`, and that is
+# load-bearing rather than tidy: this drill reads each seat's BOOT LOG for the
+# decision it made — rewound, warm-rejoined, refused past the fence — and
+# since #176 the listener opens BEFORE that decision is taken. Waiting on the
+# socket would grep a log that is one line long ("listening ... — LOADING")
+# and report the rewind as missing on a build that rewinds correctly.
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
@@ -53,9 +60,9 @@ wait_seq() { # wait until node $1's last_applied reaches $2 (budget: 20s)
 
 echo "== pair up: A(6405) master, B(6406) replica"
 $B --port 6405 --engine rocks --data-dir "$D/a" >"$D/a1.log" 2>&1 &
-fleet_wait_listen 6405
+fleet_wait_ready 6405
 $B --port 6406 --engine rocks --data-dir "$D/b" --replica-of 127.0.0.1:6405 >"$D/b1.log" 2>&1 &
-fleet_wait_listen 6406
+fleet_wait_ready 6406
 
 for i in $(seq 1 300); do valkey-cli -p 6405 SET "pre:$i" "v$i" >/dev/null; done
 SNAP_OUT=$(valkey-cli -p 6405 FLINTSNAPSHOT "$D/snaps-a")
@@ -89,7 +96,7 @@ BTIP=$(valkey-cli -p 6406 FLINTINFO | tr '\r' '\n' | sed -n 's/^latest_seq://p')
 echo "drill: superseded copy rejoining" > "$D/a/NEEDS_RESEED"
 $B --port 6405 --engine rocks --data-dir "$D/a" --replica-of 127.0.0.1:6406 \
    --rewind-snaps "$D/snaps-a" >"$D/a2.log" 2>&1 &
-fleet_wait_listen 6405
+fleet_wait_ready 6405
 
 grep -q "rewound to" "$D/a2.log" || {
   echo "FAIL: rejoin did not rewind. Boot log:"; sed 's/^/    /' "$D/a2.log"; exit 1
@@ -137,7 +144,7 @@ for i in $(seq 51 80); do valkey-cli -p 6406 SET "post:$i" "n$i" >/dev/null; don
 echo "drill: superseded copy rejoining" > "$D/a/NEEDS_RESEED"
 $B --port 6405 --engine rocks --data-dir "$D/a" --replica-of 127.0.0.1:6406 \
    --rewind-snaps "$D/snaps-a" >"$D/awarm.log" 2>&1 &
-fleet_wait_listen 6405
+fleet_wait_ready 6405
 grep -q "warm rejoin at seq" "$D/awarm.log" || {
   echo "FAIL: marked replica did not rejoin warm. Boot log:"
   sed 's/^/    /' "$D/awarm.log"; exit 1
@@ -178,14 +185,14 @@ echo "  snapshot on B (to be orphaned): $SNAP_B"
 kill -9 "$(pgrep -f "flint-server --port 6406" | head -1)" 2>/dev/null
 sleep 0.3
 $B --port 6405 --engine rocks --data-dir "$D/a" >"$D/a3.log" 2>&1 &
-fleet_wait_listen 6405
+fleet_wait_ready 6405
 valkey-cli -p 6405 FLINTPROMOTE 0 3 | grep -q "OK promoted" || { echo "FAIL: promote A"; exit 1; }
 valkey-cli -p 6405 SET fence:probe yes >/dev/null
 
 echo "drill: superseded copy rejoining" > "$D/b/NEEDS_RESEED"
 $B --port 6406 --engine rocks --data-dir "$D/b" --replica-of 127.0.0.1:6405 \
    --rewind-snaps "$D/snaps-b" >"$D/b2.log" 2>&1 &
-fleet_wait_listen 6406
+fleet_wait_ready 6406
 
 grep -q "past the fence" "$D/b2.log" || {
   echo "FAIL: B's post-fence snapshot was not refused. Boot log:"

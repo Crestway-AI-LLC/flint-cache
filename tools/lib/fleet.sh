@@ -415,6 +415,35 @@ fleet_wait_ping() {
   done
 }
 
+# fleet_wait_ready <port> [valkey-cli opts ...] — block until a DATA node is
+# SERVING, or FAIL the drill on the spot.
+#
+# Since #176 a node binds and answers PING from INSIDE its initial full sync,
+# so PONG no longer means ready — it means alive, which is exactly the
+# distinction #176 exists to draw. Waiting on PONG where you meant ready
+# returns the instant a re-seed STARTS, and everything after it runs against a
+# node that refuses data commands with -LOADING.
+#
+# `loading:1` on FLINTINFO is the seat's own answer, and only an explicit 1
+# counts as not-ready: a seat from a build before #176 has no such field and
+# reads ready as soon as it answers, exactly as it always did.
+fleet_wait_ready() {
+  local port="$1"; shift
+  local deadline=$(( $(date +%s) + 120 ))
+  while :; do
+    if [ "$(valkey-cli -p "$port" "$@" PING 2>/dev/null)" = "PONG" ] &&
+       ! valkey-cli -p "$port" "$@" FLINTINFO 2>/dev/null | tr -d '\r' |
+         grep -qx 'loading:1'; then
+      return 0
+    fi
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      echo "FAIL: 127.0.0.1:$port never finished loading (120s)"
+      exit 1
+    fi
+    sleep 0.2
+  done
+}
+
 # fleet_cp <port> [opts ...] <command ...> — a control-plane bootstrap command
 # that MUST succeed, or the drill dies here.
 #

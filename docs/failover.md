@@ -357,6 +357,35 @@ rather than an error. The numbers above are the direct-to-master path.
 | Planned handoff (maintenance/upgrade) | `flintctl failover`: demote → drain → promote | brief retry | **zero** (drained) |
 | Customer-style reboot of a node | warm restart: data intact on NVMe, WAL replay, back in ~seconds | brief retry if it was master | none |
 
+## A node that is coming up says so
+
+A replacement replica cannot serve until it has pulled its master's whole
+dataset, which on a large node is minutes. It binds its port immediately
+anyway and reports `role:loading` / `loading:1` on `FLINTINFO`, answering
+`PING` throughout and refusing data commands with Redis's `-LOADING`.
+
+That is a deliberate choice about which wrong answer is worse. A closed
+port is indistinguishable from a dead host at the TCP layer, and three
+things acted on it: `flintctl start` replaced a seat that was busy
+syncing (wiping the sync it had already done), the controller could not
+tell it from a corpse, and `verify` called the pair single-copy.
+
+For operators, the practical rules:
+
+- **Readiness is `loading:0`, not a successful `PING`.** `flintctl` waits
+  on the former; anything you write against a fleet should too.
+
+  ```
+  valkey-cli -p 7001 FLINTINFO | grep -E '^(role|loading|loading_ms):'
+  ```
+
+- **A loading node is alive, not promotable.** The controller counts it as
+  reachable — so it will not respawn or wipe it — but never selects it as
+  a promotion survivor: it holds a partial copy and no epoch.
+- **Tenants never see `-LOADING`.** The proxy pins each backend connection
+  to a namespace before any command travels on it, and a loading node
+  refuses that pin, so it is not in the routing path until it serves.
+
 ## What the client sees
 
 Nothing but latency. The proxy holds one stable endpoint; on a backend
