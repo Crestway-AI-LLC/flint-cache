@@ -64,10 +64,31 @@ the fleet keeps serving. A standalone node (no CP, or `--lease-ttl-ms
 
 The lag cap (below) bounds loss *while a replica exists* — but with no
 live replica there is no lag to measure, so an isolated master could
-otherwise accept unbounded at-risk writes. `min-replicas-to-write`
-(default 0; set to 1 on a replicated pair) sheds writes with `-THROTTLED`
-while fewer than N replicas are live. Together with the lease this closes
-the widowed-master hole.
+otherwise accept unbounded at-risk writes. `min-replicas-to-write` sheds
+writes with `-THROTTLED` while fewer than N replicas are live. Together
+with the lease this closes the widowed-master hole.
+
+**You set it, Flint honours it, at any value** — as a `min-replicas` line
+in the inventory, as `--min-replicas-to-write` on a seat, or live with no
+restart:
+
+```sh
+valkey-cli -p 7001 FLINTCONFIG min-replicas-to-write 1
+valkey-cli -p 7001 FLINTCONFIG | grep min-replicas-to-write   # confirm
+```
+
+What you get:
+
+| Value | Behaviour |
+|---|---|
+| **0** (shipped, = Redis) | Writes are never blocked on replica health. A widowed master keeps accepting; those writes are at risk until the widowed grace below sheds them. |
+| **1+** | Writes shed with `-THROTTLED` whenever fewer than N replicas are live — including the window after a failover, until the replacement finishes its full sync. |
+
+Both arms run in the gate on every build
+(`tools/replica_starvation_drill.sh`): with the guard on, a frozen replica
+drives the master into backpressure and stays inside the WAL window; with
+the shipped default, the master accepts every write with no live replica,
+as designed. So the table above is asserted, not just described.
 
 **It stays off by default, and the reason is worth knowing.** Setting it
 to 1 does close the hole, but a **freshly promoted master has no replica

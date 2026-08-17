@@ -176,8 +176,9 @@ master**, the rest are replicas (`pair m,r1,r2` is a master with two
 replicas). Add a pair by adding another `pair` line. Pairs are numbered by
 line order (pair 0, pair 1, …) — that index is the stable identity
 `flintctl migrate-slots`, `CPSLOTS`, and `swap-node` refer to. A
-single-member `pair HOST:P` is a master with no replica: fine for dev, not
-for production (a `min-replicas 1` write would shed with no replica to ack).
+single-member `pair HOST:P` is a master with no replica: fine for dev, and
+in production it means losing that host loses the shard's data (and, if you
+have set `min-replicas 1`, that its writes shed with nothing to ack).
 `cp` follows the same shape — one line is a single-node control plane, three
 lines make a Raft HA set.
 
@@ -210,8 +211,13 @@ proxy 10.0.1.20:7379         # 2 proxies -> a proxy loss is invisible
 proxy 10.0.1.21:7379
 controller on
 capacity 1717986918400       # ~1.6 TB per-node fill budget
-min-replicas 1               # close the widowed-master write hole
 ```
+
+Note what this example does NOT set: `min-replicas`. Flint ships it at **0**,
+the same value Redis ships, and a production fleet is expected to leave it
+there — the widowed grace below is the bound that is on by default. Setting
+it to 1 is a deliberate trade of availability for durability, and
+[failover.md](failover.md) explains what you are trading before you do it.
 
 Don't hand-edit an inventory to *grow* a running cluster and re-bootstrap —
 add capacity live with `flintctl expand 10.0.2.14:7001,10.0.2.15:7001`
@@ -227,7 +233,16 @@ no restart, or `stop`/`start` for the restart-only ones:
 wal-fsync-ms 500      node  HOT   WAL fsync cadence (host-loss RPO bound)
 lag-soft-ms 500       node  HOT   soft replication lag cap (delays writes)
 lag-hard-ms 1000      node  HOT   hard lag cap (sheds; bounds at-risk VOLUME)
-min-replicas 1        node  HOT   min-replicas-to-write safety gate (default 0)
+min-replicas 0        node  HOT   shed writes while live replicas < N.
+                                  SHIPPED VALUE 0 = off, matching Redis.
+                                  0: writes always accepted; a widowed
+                                     master's writes are at risk until the
+                                     widowed grace below sheds them.
+                                  1: writes shed with -THROTTLED whenever no
+                                     replica is live — INCLUDING the window
+                                     after a failover, until the replacement
+                                     finishes its full sync. Availability
+                                     traded for durability; see failover.md.
 widowed-grace-ms N    node  HOT   max time accepting writes with NO live
                                   replica (flintctl default 10000 on pair
                                   members, off for a peerless node; 0 off).

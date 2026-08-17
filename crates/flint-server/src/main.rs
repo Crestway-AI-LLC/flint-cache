@@ -1170,9 +1170,20 @@ fn main() -> std::io::Result<()> {
         eprintln!("lag caps: soft={lag_soft}ms hard={lag_hard}ms");
     }
     // Safety gate: shed writes while live replicas < this (Redis
-    // min-replicas-to-write). Set to 1 on replicated pairs so a widowed or
-    // isolated master cannot accept unbounded at-risk writes; leave 0 for
-    // standalone nodes.
+    // min-replicas-to-write). Operator-settable, honoured at whatever value
+    // is given, and hot-reloadable through FLINTCONFIG.
+    //
+    // DEFAULT 0 — Redis's default, and the right one for a CACHE: writes are
+    // never blocked on replica health, because refusing a write is worse
+    // than risking one. Both values are drilled side by side in
+    // tools/replica_starvation_drill.sh (1 sheds, 0 accepts), so this
+    // comment cannot drift away from the behaviour.
+    //
+    // 1 is a real trade, not a strictly safer setting: a freshly promoted
+    // master has no replica either, and the gate cannot tell "my peer died"
+    // from "I was just promoted" — it sheds every write until a replacement
+    // attaches AND acks, which on a large dataset is a whole full sync.
+    // docs/failover.md states that trade for operators.
     let min_replicas: u32 = arg("--min-replicas-to-write")
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
