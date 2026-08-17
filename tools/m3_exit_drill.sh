@@ -58,9 +58,36 @@ for i in 00 13 27 38 49; do
   D=$(valkey-cli -p 6669 -a "tok$i" --no-auth-warning DBSIZE)
   [ "$D" = "$KEYS_PER_TENANT" ] || { echo "FAIL: tenant$i DBSIZE=$D after seed"; exit 1; }
 done
+EXPECT_ROWS=$((50 * KEYS_PER_TENANT))
 TOTAL_ROWS=$(( $(valkey-cli -p 6710 FLINTSLOTSTATS | awk '{s+=$2} END{print s+0}') + $(valkey-cli -p 6720 FLINTSLOTSTATS | awk '{s+=$2} END{print s+0}') ))
 echo "  50 tenants seeded; group holds $TOTAL_ROWS rows across 2 pairs"
-[ "$TOTAL_ROWS" = "15000" ] || { echo "FAIL: expected 15000 rows, got $TOTAL_ROWS"; exit 1; }
+[ "$TOTAL_ROWS" = "$EXPECT_ROWS" ] || {
+  # CARRY THE EVIDENCE OUT (#174). This mismatch is intermittent — it does not
+  # reproduce on a quiet box, and every occurrence so far has been on a
+  # contended one — so the count alone has never been enough to diagnose it.
+  # Two numbers and no breakdown is exactly the failure shape that costs a
+  # whole run per attempt, so print WHICH namespaces and slots hold the
+  # surplus, and what the nodes think is in flight, at the moment it fires.
+  echo "FAIL: expected $EXPECT_ROWS rows (50 tenants x $KEYS_PER_TENANT), got $TOTAL_ROWS"
+  echo "  --- per-namespace totals (slot count ns) ---"
+  for P in 6710 6720; do
+    echo "  node $P:"
+    valkey-cli -p $P FLINTSLOTSTATS | tr -d '\r' \
+      | awk '{n[$3] += $2; s[$3]++} END {for (k in n) printf "    %-12s %8d rows in %4d slot(s)\n", k, n[k], s[k]}' \
+      | sort
+    # A slot mid-move is counted on one side and suppressed on the other, so
+    # an in-flight migration is the first thing to rule in or out.
+    echo "    migrations in flight: $(valkey-cli -p $P FLINTMIGRATIONS | tr -d '\r' | tr '\n' ';')"
+  done
+  # Per-tenant DBSIZE through the proxy: says whether the surplus is visible
+  # to a tenant (real keys nobody asked for) or only to the row counter.
+  echo "  --- tenants whose DBSIZE is not $KEYS_PER_TENANT ---"
+  for i in $(seq -w 0 49); do
+    D=$(valkey-cli -p 6669 -a "tok$i" --no-auth-warning DBSIZE 2>/dev/null | tr -d '\r')
+    [ "$D" = "$KEYS_PER_TENANT" ] || echo "    tenant$i: $D"
+  done
+  exit 1
+}
 
 # Let replicas converge before inducing failure (steady-state failover).
 for m in 6710 6720; do
