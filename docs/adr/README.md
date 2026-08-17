@@ -17,6 +17,7 @@ lost. Format and rationale: [0001](0001-record-architecture-decisions.md).
 | [0018](0018-cp-held-leases.md) | The write lease is held at the control plane, not the controller |
 | [0019](0019-rewind-rejoin-promotion-fences.md) | Rewind rejoin: promotion fences make failover RTO independent of dataset size |
 | [0020](0020-proxy-backend-multiplexing.md) | Multiplex the proxy's backend hop: decouple send from receive so a pipeline survives it (proposed) |
+| [0021](0021-proxy-async-worker-model.md) | Give the proxy bounded worker threads and async IO, so backend connections have few owners (proposed) |
 
 ## Why the numbering has a gap
 
