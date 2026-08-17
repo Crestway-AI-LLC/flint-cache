@@ -231,8 +231,8 @@ PYEOF
 done
 rm -f "$FLINT_DRILL_ROOT/flint-selffill.resp"
 [ -n "$SHED_AT" ] || fail "the node never shed after $((MAX_CHUNKS * CHUNK_KEYS * VSIZE / 1048576))MB on a ${SIZE_MB}MB volume — raise MAX_CHUNKS or the guard is not sampling"
-SHED_FREE=$(info disk_free_pct)
-echo "  shed at chunk $SHED_AT, $((ACKED / 1048576))MB acked while ok, ${SHED_FREE}% free"
+NOW_FREE=$(info disk_free_pct)
+echo "  shed at chunk $SHED_AT, $((ACKED / 1048576))MB acked while ok, ${NOW_FREE}% free"
 
 # 0. THE GUARD WAS NOT OUTRUN — how late it fired, which is the only part of
 #    the headroom the guard actually controls.
@@ -242,13 +242,25 @@ echo "  shed at chunk $SHED_AT, $((ACKED / 1048576))MB acked while ok, ${SHED_FR
 #    as fast as the machine allows. Measured with a 500ms cadence, three runs
 #    in five saw the first refusal at 7-10% free against a 20% threshold —
 #    ~100MB gone inside one interval. `diskguard::pace` now shortens the
-#    interval as free space closes on the line, and the same runs land at
-#    15-18%. THAT is what this asserts: the guard fires near its threshold,
-#    not wherever the write path happened to be when the timer next went off.
-[ -n "$SHED_FREE" ] || fail "no disk_free_pct reading at the shed point"
+#    interval as free space closes on the line. THAT is what this asserts: the
+#    guard fires near its threshold, not wherever the write path happened to
+#    be when the timer next went off.
+#
+#    MEASURED AT THE DECISION, not after it. The obvious instrument — read
+#    `disk_free_pct` once the drill notices the verdict — is a poll too late,
+#    and the drain it misses is charged to the sampler: the same runs read
+#    3-7 points lower that way, so the assertion was partly measuring the
+#    drill's own polling interval. The server logs the reading it actually
+#    decided on ("Ok -> Shed (free N of M bytes)"), and that is the number
+#    the guard is answerable for.
+SHED_FREE=$(grep -m1 'Ok -> Shed' "$LOG" 2>/dev/null \
+  | sed -n 's/.*free \([0-9][0-9]*\) of \([0-9][0-9]*\) bytes.*/\1 \2/p' \
+  | awk '{ if ($2 > 0) printf "%d", $1 * 100 / $2 }')
+[ -n "$SHED_FREE" ] || fail "the server never logged an Ok -> Shed transition with a reading, so there is no decision point to measure"
 [ "$SHED_FREE" -ge "$((MIN_PCT / 2))" ] \
-  || fail "the guard fired at ${SHED_FREE}% free against a ${MIN_PCT}% threshold — it was outrun by more than half the headroom, which is a sampler that reports what already happened rather than a guard"
-echo "  fired at ${SHED_FREE}% against the ${MIN_PCT}% threshold (overshoot $((MIN_PCT - SHED_FREE)) points)"
+  || fail "the guard decided to shed at ${SHED_FREE}% free against a ${MIN_PCT}% threshold — it was outrun by more than half the headroom, which is a sampler that reports what already happened rather than a guard"
+echo "  decided at ${SHED_FREE}% against the ${MIN_PCT}% threshold (overshoot $((MIN_PCT - SHED_FREE)) points;"
+echo "  ${NOW_FREE}% by the time this drill polled, the difference being drain the guard does not own)"
 
 # 1. THE GUARD WON THE RACE.
 case "$FIRST_REFUSAL" in

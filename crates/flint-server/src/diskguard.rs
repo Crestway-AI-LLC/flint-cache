@@ -123,6 +123,20 @@ const MIN_SAMPLE: std::time::Duration = std::time::Duration::from_millis(50);
 /// before the next look.
 const HEADROOM_DIVISOR: f64 = 4.0;
 
+/// How far out the proximity term starts tightening, in multiples of the shed
+/// floor. It has to begin well ABOVE the line, because what it bounds is the
+/// FIRST tick of a burst — the one the rate term cannot yet have seen.
+///
+/// Derived, not picked. On the self-fill drill (768 MB, 20% floor, ~200 MB/s
+/// of physical growth) the whole approach from 40% free down to the line was
+/// still sampled at the full 500 ms ceiling, so that one unpaced tick cost
+/// ~13 points on its own — which is exactly the overshoot tail measured with
+/// the proximity term starting at ONE floor. Four floors puts the same tick
+/// at ~125 ms and ~3 points. On a real node (3.7 TB, 10% floor) the term
+/// costs nothing above 50% free and only reaches the 50 ms floor when the
+/// headroom left is a rounding error.
+const PROXIMITY_BAND: f64 = 4.0;
+
 /// The free-byte level at which [`verdict`] flips to `Shed` on this
 /// filesystem. Both thresholds apply and the stricter wins, so this is the
 /// higher of the two — the same rule `verdict` uses, expressed as a level
@@ -163,20 +177,40 @@ pub fn pace(
     elapsed: std::time::Duration,
     ceiling: std::time::Duration,
 ) -> std::time::Duration {
-    let Some(prev) = prev_free else {
-        return ceiling;
-    };
-    let drained = prev.saturating_sub(cur.free_bytes);
-    let headroom = cur.free_bytes.saturating_sub(shed_floor_bytes(cur, t));
-    // Nothing draining, or already at the line: the ordinary cadence answers
-    // both. Below the line the space in play belongs to compaction, and
+    let floor = shed_floor_bytes(cur, t);
+    let headroom = cur.free_bytes.saturating_sub(floor);
+    // Already at the line: the space still in play belongs to compaction, and
     // watching it faster changes nothing about who gets refused.
-    if drained == 0 || headroom == 0 {
+    if headroom == 0 || floor == 0 {
         return ceiling;
     }
-    let secs = elapsed.as_secs_f64().max(0.001);
-    let eta = headroom as f64 / (drained as f64 / secs);
-    let want = std::time::Duration::from_secs_f64((eta / HEADROOM_DIVISOR).max(0.0));
+    // PROXIMITY, which does not need a previous reading — and that is the
+    // point. The rate term below is REACTIVE: it can only shorten the interval
+    // AFTER an interval has been consumed at speed, so the first tick of a
+    // burst is always unpaced, and on a burst that eats half the headroom in
+    // one tick that single tick IS the overshoot. Measured: with the rate term
+    // alone the self-fill drill decided to shed anywhere from 1 to 9 points
+    // late against a 10-point bound — passing, with a point to spare, which is
+    // not a bound.
+    //
+    // So tighten with distance as well as speed: full cadence while headroom
+    // is still PROXIMITY_BAND floors deep, scaling down linearly from there. A
+    // quiet interval is not evidence the next one will be quiet, and the
+    // closer the line the more a single interval can cost.
+    let by_proximity =
+        ceiling.mul_f64((headroom as f64 / (PROXIMITY_BAND * floor as f64)).min(1.0));
+    let Some(prev) = prev_free else {
+        return by_proximity.clamp(MIN_SAMPLE.min(ceiling), ceiling);
+    };
+    let drained = prev.saturating_sub(cur.free_bytes);
+    let want = if drained == 0 {
+        by_proximity
+    } else {
+        let secs = elapsed.as_secs_f64().max(0.001);
+        let eta = headroom as f64 / (drained as f64 / secs);
+        let by_rate = std::time::Duration::from_secs_f64((eta / HEADROOM_DIVISOR).max(0.0));
+        by_rate.min(by_proximity)
+    };
     want.clamp(MIN_SAMPLE.min(ceiling), ceiling)
 }
 
@@ -357,16 +391,38 @@ mod tests {
 
     #[test]
     fn an_idle_disk_keeps_the_configured_cadence() {
-        let t = Thresholds::default();
+        let t = Thresholds::default(); // 10% -> floor 10GB on a 100GB disk
         let every = Duration::from_secs(2);
+        // 50GB free is 40GB of headroom over a 10GB floor — four times the
+        // floor, so proximity does not bind and an idle disk costs what it
+        // costs today.
         let now = raw(50 * GB, 100 * GB);
-        // No previous reading, and nothing draining, both answer `every`.
         assert_eq!(pace(None, now, t, every, every), every);
         assert_eq!(
             pace(Some(50 * GB), now, t, every, every),
             every,
             "a disk that is not filling costs exactly what it costs today"
         );
+    }
+
+    /// The rate term is reactive: it cannot shorten the interval until an
+    /// interval has already been spent at speed, so on a burst that eats the
+    /// headroom in one tick that tick IS the overshoot. Distance has to
+    /// tighten the interval on its own, with no previous reading at all.
+    #[test]
+    fn closing_on_the_line_tightens_the_interval_without_any_rate_evidence() {
+        let t = Thresholds::default(); // floor 10GB
+        let every = Duration::from_secs(2);
+        // 12GB free = 2GB of headroom over the floor: a fifth of it.
+        let near = raw(12 * GB, 100 * GB);
+        let next = pace(None, near, t, every, every);
+        assert!(
+            next <= every / 4,
+            "close to the line the cadence must tighten on distance alone, got {next:?}"
+        );
+        // And a QUIET interval near the line must not relax it back: quiet now
+        // is not evidence of quiet next.
+        assert_eq!(pace(Some(12 * GB), near, t, every, every), next);
     }
 
     /// THE BUG. A fixed cadence lets the write path cross the whole headroom
