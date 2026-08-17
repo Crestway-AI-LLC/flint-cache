@@ -361,6 +361,28 @@ impl RocksKv {
         if let Some(secs) = env_u64("FLINT_STATS_DUMP_SEC") {
             opts.set_stats_dump_period_sec(secs as u32);
         }
+        // Compaction parallelism. UNSET HERE BY DEFAULT, which means every
+        // shipped seat runs on RocksDB's own default of 2 background jobs.
+        //
+        // That is worth knowing rather than assuming, because flint-bench
+        // DOES call `increase_parallelism` (flint-bench/src/main.rs:78) — so
+        // the rig that produced the published throughput numbers has been
+        // configuring a knob the engine leaves alone. The instrument and the
+        // product differ in exactly the dimension #196 is about.
+        //
+        // On a 2-vCPU seat the default means compaction threads contend with
+        // the serve path for two cores, which matches the run-4 measurement
+        // (master load 3.25 of 2 vCPU: compaction ~0.43, serve ~1.2).
+        //
+        // DELIBERATELY NOT RETUNED HERE. #196 says minimize only what the
+        // measurement supports, and the measurement needs a CPU-constrained
+        // host: on an 8-core laptop with idle cores, raising this always
+        // looks like an improvement and would tell us nothing about an
+        // i4i.large. This knob is the INSTRUMENT for that sweep, not its
+        // conclusion.
+        if let Some(n) = env_u64("FLINT_BG_JOBS") {
+            opts.set_max_background_jobs(n as i32);
+        }
         // Expired metadata rows are dropped organically as compaction
         // rewrites them (subkey orphans are reclaimed by gc::sweep until
         // the filter gains a metadata-lookup handle).
