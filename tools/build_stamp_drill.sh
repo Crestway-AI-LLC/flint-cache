@@ -45,7 +45,7 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init $FLINT_DRILL_ROOT/flint-buildstamp-state 7411 7412 7413 7414
+fleet_init $FLINT_DRILL_ROOT/flint-buildstamp-state 7415 7416 7417 7418
 fleet_guard
 
 # A STAMP THE CRATE VERSION CANNOT IMITATE, exported before anything runs so
@@ -66,10 +66,10 @@ export FLINT_BUILD_VERSION=v9.9.9-stamp-probe
 WIRE=9.9.9-stamp-probe
 STATE=$FLINT_DRILL_ROOT/flint-buildstamp-state
 INV=$FLINT_DRILL_ROOT/flint-buildstamp.flint
-A=127.0.0.1:7411
-B=127.0.0.1:7412
-PROXY=127.0.0.1:7413
-CP=127.0.0.1:7414
+A=127.0.0.1:7415
+B=127.0.0.1:7416
+PROXY=127.0.0.1:7417
+CP=127.0.0.1:7418
 fleet_kill server; fleet_kill proxy
 fleet_kill controlplane; fleet_kill controller
 sleep 0.4
@@ -116,12 +116,12 @@ WANT=$(./target/release/flint-controlplane --build-version | head -1)
 echo "== bootstrap"
 $CTL bootstrap >/dev/null 2>&1
 for _ in $(seq 1 60); do
-  [ "$(valkey-cli -p 7411 FLINTINFO 2>/dev/null | tr -d '\r' | sed -n 's/^live_replicas://p')" = "1" ] && break
+  [ "$(valkey-cli -p 7415 FLINTINFO 2>/dev/null | tr -d '\r' | sed -n 's/^live_replicas://p')" = "1" ] && break
   sleep 0.5
 done
 
 echo "== CPINFO carries build:, registry_version:, and the version: alias"
-CPI=$(valkey-cli -p 7414 CPINFO 2>/dev/null | tr -d '\r')
+CPI=$(valkey-cli -p 7418 CPINFO 2>/dev/null | tr -d '\r')
 echo "$CPI" | grep -q "^build:$WANT$" || { echo "FAIL: CPINFO build: is not $WANT"; echo "$CPI"; exit 1; }
 echo "$CPI" | grep -q "^registry_version:" || { echo "FAIL: CPINFO has no registry_version:"; exit 1; }
 # The alias is the whole reason the rename is safe to ship: CPWATCH clients
@@ -135,14 +135,14 @@ AV=$(echo "$CPI" | sed -n 's/^version://p')
 echo "  build:$WANT  registry_version:$RV  version:$AV (alias)"
 
 echo "== PROXYSTATS carries build:"
-PS=$(valkey-cli -p 7413 PROXYSTATS 2>/dev/null | tr -d '\r')
+PS=$(valkey-cli -p 7417 PROXYSTATS 2>/dev/null | tr -d '\r')
 echo "$PS" | grep -q "^build:$WANT$" || { echo "FAIL: PROXYSTATS build: is not $WANT"; echo "$PS" | head -3; exit 1; }
 echo "  build:$WANT"
 
 echo "== the controller registers itself (it has no listener to ask)"
 FOUND=""
 for _ in $(seq 1 40); do
-  CPI=$(valkey-cli -p 7414 CPINFO 2>/dev/null | tr -d '\r')
+  CPI=$(valkey-cli -p 7418 CPINFO 2>/dev/null | tr -d '\r')
   FOUND=$(echo "$CPI" | grep "^controller:" | head -1)
   [ -n "$FOUND" ] && break
   sleep 0.5
@@ -198,7 +198,7 @@ echo "== HELLO carries the build too — the one stamp a CLIENT reads"
 # Matched with -x against the whole line: piped valkey-cli prints each array
 # element raw, one per line, so a substring match would also accept
 # `v9.9.9-stamp-probe` — the exact case the second assertion exists to catch.
-for p in 7411 7413; do
+for p in 7415 7417; do
   H=$(valkey-cli -p $p HELLO 2>/dev/null | tr -d '\r"')
   echo "$H" | grep -qxF "$WIRE" || {
     echo "$H" | sed 's/^/  | /'

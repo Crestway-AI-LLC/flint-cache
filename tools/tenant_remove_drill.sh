@@ -23,9 +23,17 @@ cleanup() {
 trap cleanup EXIT
 rm -rf "$STATE" "$INV"
 
+# The fleet_warm call below was once spliced INTO this command's continuation,
+# so `cargo build … \` swallowed it as positional arguments, the orphaned
+# `-p flint-controller …` line ran as a command of its own, and nothing was
+# warmed. It stayed invisible for three weeks because gates.sh pre-builds the
+# workspace, so the drill went on to pass on binaries someone else had built.
+# Hence the explicit failure check: a build that cannot fail loudly is a build
+# nobody reads.
 cargo build --release -q -p flint-server -p flint-proxy -p flint-controlplane \
+  -p flint-controller -p flint-ctl --features flint-server/rocks \
+  || { echo "FAIL: build"; exit 1; }
 fleet_warm ./target/release/flint-server ./target/release/flint-proxy ./target/release/flint-controlplane ./target/release/flint-controller
-  -p flint-controller -p flint-ctl --features flint-server/rocks
 
 cat > "$INV" <<EOF
 disposable on

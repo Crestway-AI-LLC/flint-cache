@@ -99,9 +99,9 @@ rm -rf "$LOGS"; mkdir -p "$LOGS"
 # discarded writes throughout. A drill outside the gate rots, and rots
 # silently.
 CORE="restart repl failover proxy slot_migrate slot_map rebalance_execute
-      bloom ns_escape coproc_cred coproc_channel family_route family_route_cp coproc_forward coproc_budget coproc_exempt coproc_vec coproc_vec_tls coproc_vec_rebuild
+      bloom ns_escape coproc_cred coproc_channel coproc_family family_route family_route_cp coproc_forward coproc_budget coproc_exempt coproc_vec coproc_vec_tls coproc_vec_rebuild
       tenant_quota token_rotation cert_reload_fleet controlplane_ha
-      decommission config_file federation_plumbing disk_pressure ctl_error
+      decommission config_file federation_plumbing disk_pressure disk_selffill ctl_error
       client_compat proxy_registry reseed lag_cap widowed_grace controller
       promote_notice fleet_guard ctl_cpha upgrade anti_affinity attached_chaos
       async_flag async_writes txn_failure backup restore_ns backup_schedule
@@ -110,8 +110,8 @@ CORE="restart repl failover proxy slot_migrate slot_map rebalance_execute
       cpha_roll admin_gated_proxy edge_ca_trust
       cert_rotate control_tls controller_ha controller_managed controller_slow_master controller_stall
       controller_multipair controlplane cp_publish failover_bystander failover_churn gates internal_mtls json lease
-      fanout_timeout m3_exit migrate_slots min_replicas node_tls proxy_backpressure
-      proxy_cache proxy_tls replica_reads replica_stale_fence rw_isolation
+      fanout_timeout ingest_saturation m3_exit migrate_slots min_replicas node_tls proxy_backpressure
+      proxy_cache proxy_tls replica_reads replica_starvation replica_stale_fence rw_isolation
       scan slot_cutover slot_cutover_recovery slot_moved snapshot_restore
       tenant tenant_rebalance tenant_remove token_hash
       write_deadline fullsync_rate edge_reroute rewind_rejoin"
@@ -134,6 +134,19 @@ CHAOS="chaos proxy_chaos chaos_unreadable hotkey_chaos"
 #   stop_sweep    FAILS in setup: "fleet B did not start". It declares eight
 #                 ports across two fleets (6317-6321, 7820, 7879, 7889), so a
 #                 collision is the first thing to check. Fix before adding.
+#
+# coproc_family is NOT in this list and never should have needed to be. It sat
+# in tools/ unregistered for three weeks, so it never ran, and its port block
+# silently overlapped build_stamp's — the only complaint came from
+# assert_no_port_overlap, which reads the FILES. Run on 2026-08-16 it passed
+# first time. It is in CORE now, and assert_every_drill_accounted_for below
+# makes the next one impossible to miss this quietly.
+
+# The machine-readable half of the paragraph above. Two halves because they
+# serve two readers: the prose is for the person deciding whether an absence
+# is still justified, and this is for assert_every_drill_accounted_for, which
+# is what makes an absence a decision rather than an oversight.
+EXCLUDED="backup_s3 fullsync_cap stop_sweep"
 
 # FLINT_GATE_STRICT=1 turns a SKIPPED drill into a FAILED one.
 #
@@ -186,7 +199,7 @@ step() {  # step <name> <log-suffix> <command...>
     # not having it.
     if [ -n "${FLINT_GATE_STRICT:-}" ] && grep -qE 'SKIP[: (]' "$log"; then
       printf 'FAIL  %-22s (%ss)  %s\n' "$name" "$(( $(date +%s) - start ))" "$log"
-      grep -m2 'SKIP' "$log" |  df -h "$_GATE_DISK_TARGET" | sed 's/^/        /'
+      grep -m2 'SKIP' "$log" | sed 's/^/        /'
       echo "        skipped under FLINT_GATE_STRICT: install the dependency"
       echo "        or drop the drill from CORE deliberately, not by accident."
       FAILED="$FAILED $name(skipped)"
@@ -211,7 +224,7 @@ step() {  # step <name> <log-suffix> <command...>
     # reaching its own verdict.
     { grep -m1 -E '^FAIL' "$log" \
         || grep -m1 -E '^(REFUSING|thread .* panicked|error(\[|:))' "$log" \
-        || tail -3 "$log"; } |  df -h "$_GATE_DISK_TARGET" | sed 's/^/        /'
+        || tail -3 "$log"; } | sed 's/^/        /'
     FAILED="$FAILED $name"
   fi
 
@@ -232,7 +245,7 @@ step() {  # step <name> <log-suffix> <command...>
   if [ -n "$leaked" ]; then
     echo "      LEAKED: $name left $(echo "$leaked" | wc -l | tr -d ' ') Flint process(es) running"
     ps -o pid=,args= -p $(echo "$leaked" | tr '\n' ' ') 2>/dev/null \
-      |  df -h "$_GATE_DISK_TARGET" | sed 's/^/        /' | cut -c1-110
+      | sed 's/^/        /' | cut -c1-110
     echo "        Its cleanup does not cover every seat it starts. Prefer"
     echo "        fleet_kill (scoped to the drill's fleet_init ports) over a"
     echo "        hand-written pkill pattern, which goes stale silently."
@@ -323,7 +336,7 @@ assert_no_default_ports() {
     tools/*_drill.sh 2>/dev/null || true)
   [ -z "$hits" ] && return 0
   echo "FAIL  drills claim the default cluster ports (7001/7002/7379/7500):"
-  echo "$hits" |  df -h "$_GATE_DISK_TARGET" | sed 's/^/        /'
+  echo "$hits" | sed 's/^/        /'
   echo "        fleet_kill would -9 a real cluster on those ports and"
   echo "        fleet_guard would not object. Move the drill to a free block."
   FAILED="$FAILED default-ports"
@@ -368,6 +381,72 @@ assert_no_port_overlap() {
   FAILED="$FAILED port-overlap"
 }
 
+# Every tools/*_drill.sh must appear in CORE, in CHAOS, or in EXCLUDED — and
+# every name in CORE/CHAOS must have a file.
+#
+# coproc_family_drill.sh was in none of them for three weeks. It arrived with
+# ADR-0010's flintctl deploy path, was never registered, therefore never ran,
+# and its port block silently overlapped build_stamp's — a collision that only
+# surfaced because assert_no_port_overlap reads the FILES rather than the
+# list. Nothing else said a word, because nothing else was looking.
+#
+# The prose above says an absence with no reason beside it is
+# indistinguishable from an oversight. That was true and still insufficient:
+# a convention only catches the person who remembers it. This is the same
+# statement with an exit code.
+assert_every_drill_accounted_for() {
+  local f name listed missing="" orphan=""
+  # FLATTEN FIRST. CORE spans seventeen lines, so a substring match for
+  # " $name " misses every name that ends a line — the character after it is a
+  # newline, not a space. This check's own first run reported sixteen
+  # perfectly-registered drills as unlisted, one per line of CORE, and it was
+  # a `tr '\n' ' '` in a throwaway hand-check that hid it: the hand-check
+  # normalised the whitespace the real code did not.
+  listed=" $(printf '%s %s %s' "$CORE" "$CHAOS" "$EXCLUDED" | tr '\n' ' ') "
+
+  # POSITIVE CONTROL, both directions, on a synthetic list with the SAME SHAPE
+  # as CORE — multi-line, with a name at the end of a line, which is exactly
+  # the case that failed. Deliberately synthetic rather than a real drill name:
+  # a control that hardcodes `token_hash` starts failing the day someone
+  # renames that drill, and a control people learn to edit is not a control.
+  local probe
+  probe=" $(printf 'alpha beta\n      gamma delta' | tr '\n' ' ') "
+  case "$probe" in
+    *" beta "*) ;;
+    *) echo "FAIL  the registration matcher cannot find a name at the end of a"
+       echo "        line, so it would report every such drill as unregistered."
+       FAILED="$FAILED drill-registration-matcher"; return ;;
+  esac
+  case "$probe" in
+    *" epsilon "*)
+       echo "FAIL  the registration matcher matches a name that is in no list,"
+       echo "        so it can never report anything as unregistered."
+       FAILED="$FAILED drill-registration-matcher"; return ;;
+    *) ;;
+  esac
+
+  for f in tools/*_drill.sh; do
+    name=${f#tools/}; name=${name%_drill.sh}
+    case "$listed" in *" $name "*) ;; *) missing="$missing $name" ;; esac
+  done
+  for name in $CORE $CHAOS; do
+    [ -f "tools/${name}_drill.sh" ] || orphan="$orphan $name"
+  done
+  [ -z "$missing" ] && [ -z "$orphan" ] && return 0
+  [ -n "$missing" ] && {
+    echo "FAIL  drill file(s) that no list mentions:$missing"
+    echo "        Put each in CORE (so it runs), in CHAOS, or in EXCLUDED with"
+    echo "        a reason in the comment above it. A drill outside the gate"
+    echo "        rots, and rots silently."
+  }
+  [ -n "$orphan" ] && {
+    echo "FAIL  name(s) listed with no drill file:$orphan"
+    echo "        The suite would fail on a missing file mid-run, after"
+    echo "        however many drills came first."
+  }
+  FAILED="$FAILED drill-registration"
+}
+
 # #182: the lease TTL had four homes — flintctl's DEFAULT_LEASE_TTL_MS, the
 # AWS chaos/soak fleet's inventory, and two drills — and when ADR-0018 moved
 # it from 3000 to 5000 only flintctl followed. Nothing failed; every chaos run
@@ -394,6 +473,7 @@ if want check; then
   echo "== gates: fmt, clippy, tests (both feature configs)"
   assert_no_default_ports
   assert_no_port_overlap
+  assert_every_drill_accounted_for
   assert_lease_ttl_single_source
   step "fmt" fmt cargo fmt --all --check
   step "clippy (mem)" clippy-mem \
@@ -469,7 +549,7 @@ if want conformance; then
   step "conformance rocks (RESP3)" conf-rocks3-run \
     ./target/release/flint-conformance --target 127.0.0.1:6397 --proto 3
   grep -h '^overall:' "$LOGS"/conf-*-run.log "$LOGS"/conf-oracle.log \
-    "$LOGS"/conf-oracle3.log 2>/dev/null |  df -h "$_GATE_DISK_TARGET" | sed 's/^/      /'
+    "$LOGS"/conf-oracle3.log 2>/dev/null | sed 's/^/      /'
   for p in 6399 6398 6397; do valkey-cli -p $p SHUTDOWN NOSAVE >/dev/null 2>&1; done
   sleep 0.3
   # Belt and braces: SHUTDOWN is a request, and a wedged process would
@@ -494,21 +574,52 @@ fi
 # binary what it supports means starting a server (and writing a data dir)
 # after every drill. Reading the scripts is free, deterministic, and names
 # the file to fix instead of the drill that tripped over it.
+#
+# True when FILE rebuilds flint-server and the build line does not say rocks.
+# Strip whole-line comments BEFORE matching, then join backslash continuations
+# — most of these build lines wrap. Without the strip, a comment that merely
+# quotes a build command is flagged as one (this check's own first version
+# flagged the drill whose comment explains the rule).
+#
+# `--features rocks` and `--features flint-server/rocks` are equivalent when
+# -p flint-server is the selected package, and drills use both. The rule is
+# simply: if it rebuilds flint-server, it must say rocks.
+_drill_drops_rocks() {
+  grep -v '^[[:space:]]*#' "$1" | sed -e :a -e '/\\$/N; s/\\\n//; ta' \
+    | grep 'cargo build.*-p flint-server' | grep -qv 'rocks'
+}
+
 assert_drill_builds_keep_rocks() {
+  # POSITIVE CONTROL, BOTH DIRECTIONS, BEFORE THE REAL SCAN.
+  #
+  # On 2026-08-14 an edit meant for ONE line of this file (#180's disk target)
+  # was applied as a blind replace of `| sed`, and landed `| df -h … |` in the
+  # middle of six unrelated pipelines — including the one below. `joined`
+  # became a disk-usage table, so this check could not flag anything, and it
+  # went on reporting nothing for two days while looking exactly like a check
+  # that had found nothing. A guard whose silence is indistinguishable from
+  # its success is not a guard; the two probes here make it say so instead.
+  local probe="${TMPDIR:-/tmp}/flint-gate-rocks-probe.$$"
+  printf 'cargo build --release -p flint-server\n' > "$probe"
+  if ! _drill_drops_rocks "$probe"; then
+    rm -f "$probe"
+    echo "GATES FAILED: the keep-rocks check does not flag a build line that"
+    echo "  drops rocks, so it cannot flag a real one either. Fix the check"
+    echo "  in _drill_drops_rocks before trusting any drill result below."
+    exit 1
+  fi
+  printf 'cargo build --release -p flint-server --features rocks\n' > "$probe"
+  if _drill_drops_rocks "$probe"; then
+    rm -f "$probe"
+    echo "GATES FAILED: the keep-rocks check flags a build line that DOES keep"
+    echo "  rocks. Left alone it would fail every correct drill in the suite."
+    exit 1
+  fi
+  rm -f "$probe"
+
   local bad=""
   for f in tools/*_drill.sh; do
-    # Strip whole-line comments BEFORE matching, then join backslash
-    # continuations — most of these build lines wrap. Without the strip,
-    # a comment that merely quotes a build command is flagged as one
-    # (this check's own first version flagged the drill whose comment
-    # explains the rule).
-    local joined
-    joined=$(grep -v '^[[:space:]]*#' "$f" |  df -h "$_GATE_DISK_TARGET" | sed -e :a -e '/\\$/N; s/\\\n//; ta')
-    # `--features rocks` and `--features flint-server/rocks` are equivalent
-    # when -p flint-server is the selected package, and drills use both.
-    # The rule is simply: if it rebuilds flint-server, it must say rocks.
-    echo "$joined" | grep 'cargo build.*-p flint-server' | grep -qv 'rocks' \
-      && bad="$bad $f"
+    _drill_drops_rocks "$f" && bad="$bad $f"
   done
   [ -z "$bad" ] && return 0
   echo "GATES FAILED: drill(s) rebuild flint-server WITHOUT flint-server/rocks:"
