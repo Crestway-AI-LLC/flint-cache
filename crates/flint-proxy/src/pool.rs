@@ -155,6 +155,10 @@ struct Conn {
     w: flint_tls::DuplexWriter,
     pending: Arc<Mutex<VecDeque<Pending>>>,
     dead: Arc<AtomicBool>,
+    /// Diagnostics only. A pooled connection's death is a fleet-visible event
+    /// — it fails every caller on it at once — so it must be attributable to
+    /// an address in a log, not just to whoever happened to receive the error.
+    addr: String,
 }
 
 impl Conn {
@@ -173,8 +177,10 @@ impl Conn {
             w: w.clone(),
             pending: pending.clone(),
             dead: dead.clone(),
+            addr: key.addr.clone(),
         });
-        std::thread::spawn(move || reader_loop(rd, w, pending, dead));
+        let addr = key.addr.clone();
+        std::thread::spawn(move || reader_loop(rd, w, pending, dead, addr));
         let _ = stats; // lanes gauge is maintained by the pool map
         Ok(conn)
     }
@@ -232,6 +238,7 @@ impl Conn {
             if let Err(e) = self.w.append(frame) {
                 self.dead.store(true, Ordering::Relaxed);
                 self.w.shutdown();
+                eprintln!("pool: backend {} staging failed: {e}", self.addr);
                 return Err(e);
             }
         }
@@ -256,6 +263,7 @@ impl Conn {
             Err(e) => {
                 self.dead.store(true, Ordering::Relaxed);
                 self.w.shutdown();
+                eprintln!("pool: backend {} flush failed: {e}", self.addr);
                 Err(e)
             }
         }
@@ -285,6 +293,41 @@ impl Conn {
         let rx = self.stage(frame, stats, None)?;
         self.flush_staged(stats)?;
         self.wait_slot(&rx)
+    }
+}
+
+/// ONE connection, held for the duration of one prefetch pass.
+///
+/// The connection is chosen once, when the lease is taken, and every command
+/// in the pass is staged onto it — that is what makes a pass a batch. Staging
+/// through `call`/`conn_for` per command instead advances the lane's
+/// round-robin on every command and scatters a 16-command run across all 8
+/// lane connections, two apiece.
+///
+/// That is not hypothetical, it shipped: raising the lane width from 2 to 8 on
+/// local throughput and p99 evidence silently disabled batching, and the fleet
+/// measured `pool_batch_mean` 1.04 against 4.77-4.96 locally at width 2. The
+/// change had stopped doing the one thing it exists to do, while looking
+/// faster on the metrics being watched.
+///
+/// Round-robin still applies BETWEEN passes, so concurrent clients spread
+/// across the lane; it just no longer runs inside one client's pipeline.
+pub(crate) struct PoolLease {
+    conn: Arc<Conn>,
+    stats: Arc<PoolStats>,
+}
+
+impl PoolLease {
+    /// Stage one command of this pass. `WouldBlock` means the connection is at
+    /// its in-flight cap: the caller should stop staging and let the rest of
+    /// the run take the ordinary serial path.
+    pub(crate) fn stage(&self, frame: &[u8]) -> std::io::Result<Ticket> {
+        let rx = self.conn.stage(frame, &self.stats, Some(MAX_INFLIGHT))?;
+        Ok(Ticket {
+            conn: self.conn.clone(),
+            rx,
+            stats: self.stats.clone(),
+        })
     }
 }
 
@@ -320,6 +363,7 @@ fn reader_loop(
     w: flint_tls::DuplexWriter,
     pending: Arc<Mutex<VecDeque<Pending>>>,
     dead: Arc<AtomicBool>,
+    addr: String,
 ) {
     let mut acc: Vec<u8> = Vec::with_capacity(64 * 1024);
     let mut chunk = [0u8; 64 * 1024];
@@ -333,8 +377,8 @@ fn reader_loop(
         // Envoy's close path: drain and fail every outstanding request. A
         // pooled failure takes down N callers where per-client took one, so
         // each must be TOLD rather than left to its timeout.
+        let mut n = 0;
         if let Ok(mut q) = pending.lock() {
-            let mut n = 0;
             while let Some(p) = q.pop_front() {
                 let _ = p.tx.send(Err(std::io::Error::other(format!(
                     "{why} ({n} earlier replies delivered)"
@@ -342,6 +386,14 @@ fn reader_loop(
                 n += 1;
             }
         }
+        // LOG IT. A pooled connection's death fails every caller on it at
+        // once, and each of those callers independently asks the topology to
+        // rediscover — so one death here becomes N re-probes and a routing
+        // flap. On a fleet that presented as a throughput collapse with
+        // multi-second tails, and the trigger could not be identified from
+        // the proxy log at all, because this reason string only ever reached
+        // the callers. `failed=` is the amplification factor, measured.
+        eprintln!("pool: backend {addr} connection died: {why} (failed={n} in flight)");
     };
     loop {
         loop {
@@ -439,18 +491,14 @@ impl BackendPool {
     /// The caller is expected to stage a whole run, flush, and only then
     /// collect — see `Ticket`. Nothing here blocks, so a single client thread
     /// can put its entire pipeline in flight before reading the first reply.
-    pub(crate) fn submit_nowait(
+    pub(crate) fn lease(
         &self,
         addr: &str,
         ns: &[u8],
         async_writes: bool,
-        frame: &[u8],
-    ) -> std::io::Result<Ticket> {
-        let conn = self.conn_for(addr, ns, async_writes)?;
-        let rx = conn.stage(frame, &self.stats, Some(MAX_INFLIGHT))?;
-        Ok(Ticket {
-            conn,
-            rx,
+    ) -> std::io::Result<PoolLease> {
+        Ok(PoolLease {
+            conn: self.conn_for(addr, ns, async_writes)?,
             stats: self.stats.clone(),
         })
     }
@@ -605,17 +653,25 @@ mod tests {
     fn one_caller_can_hold_its_whole_pipeline_in_flight() {
         const N: usize = 16;
         let addr = withholding_backend(N);
-        let p = BackendPool::new(None, 1); // width 1: ONE shared connection
+        // Lane width 8 ON PURPOSE. The bug this pins shipped: `conn_for`
+        // round-robins per CALL, so staging command-by-command through the
+        // pool spread one client's run across all 8 connections, two apiece,
+        // and `pool_batch_mean` fell from 4.9 to 1.04 on a fleet. A run must
+        // land on ONE connection whatever the lane width, so a width of 1
+        // could not have caught it — and the backend here accepts a single
+        // connection, so a scattering implementation cannot even complete.
+        let p = BackendPool::new(None, 8);
         let a = addr.to_string();
 
         // Stage the whole run first — no waiting — exactly as the prefetch
         // pass in serve_client does.
+        // ONE lease for the whole run — the connection is chosen once, which
+        // is what makes the run a batch rather than N scattered commands.
+        let lease = p.lease(&a, b"0", false).expect("lease");
         let mut tickets = Vec::new();
         for i in 0..N {
             let key = format!("k{i}");
-            let t = p
-                .submit_nowait(&a, b"0", false, &get_frame(&key))
-                .expect("stage");
+            let t = lease.stage(&get_frame(&key)).expect("stage");
             tickets.push((key, t));
         }
         for (_, t) in &tickets {

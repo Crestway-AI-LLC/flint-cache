@@ -357,6 +357,10 @@ struct Topology {
     /// Member-cluster views, indexed by the level-0 map's cluster index.
     /// Invariant: non-empty; index 0 is the home cluster and the fallback.
     clusters: Vec<ClusterView>,
+    /// address -> when a rediscovery for it last STARTED. Collapses the herd
+    /// of callers a single pooled-connection death produces into one re-probe
+    /// (see `rediscover_for`).
+    rediscover_gate: Mutex<HashMap<String, Instant>>,
     /// Level-0: slot range -> cluster index (ADR-0007). A non-federated
     /// proxy holds the single-interval default (everything -> cluster 0),
     /// so today this resolves to 0 unconditionally.
@@ -725,6 +729,40 @@ impl Topology {
     /// rediscover the master of every pair that lists it. (Moved entries are
     /// kept — the new master of that pair holds the moved slots too; only
     /// the address may change, which the next -MOVED corrects.)
+    /// Rediscover because a REQUEST FAILED — the reactive path, coalesced.
+    ///
+    /// A pooled connection's death fails EVERY in-flight command on it at once
+    /// (up to the in-flight cap), and each of those callers arrives here
+    /// independently. Measured on a fleet 2026-08-17: one connection death
+    /// became a storm — 198 routing transitions on the pooled arm against 0 on
+    /// the serial one — with the master flapping `addr -> none -> addr`
+    /// hundreds of times inside milliseconds as concurrent probes raced each
+    /// other's writes. Threads that saw `none` slept 100 ms, retried, and
+    /// probed again. Throughput fell to 0.12x with a 10 s p99.9.
+    ///
+    /// Whether a pair's master moved is a per-PAIR fact, not a per-request
+    /// one, so N simultaneous failures need exactly one probe.
+    ///
+    /// Deliberately NOT applied to `rediscover_for` itself: a control-plane
+    /// promote hint is authoritative news about a topology that just changed,
+    /// and suppressing it would delay real failover. Coalesce the symptom,
+    /// never the signal.
+    fn rediscover_after_failure(&self, addr: &str) {
+        {
+            let mut gate = match self.rediscover_gate.lock() {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+            if let Some(started) = gate.get(addr)
+                && started.elapsed() < REDISCOVER_DEBOUNCE
+            {
+                return;
+            }
+            gate.insert(addr.to_string(), Instant::now());
+        }
+        self.rediscover_for(addr);
+    }
+
     fn rediscover_for(&self, addr: &str) {
         // A dead address could belong to any member cluster: walk them all
         // (one, today).
@@ -1265,9 +1303,8 @@ impl Backends {
     /// 2, 2026-08-17). The caller stages a whole pipelined run, flushes, and
     /// only then collects — which is the difference between the node seeing a
     /// pipeline and the node seeing N round trips.
-    fn submit_nowait(&mut self, addr: &str, frame: &[u8]) -> std::io::Result<pool::Ticket> {
-        self.pool
-            .submit_nowait(addr, &self.ns, self.async_writes, frame)
+    fn lease(&mut self, addr: &str) -> std::io::Result<pool::PoolLease> {
+        self.pool.lease(addr, &self.ns, self.async_writes)
     }
 
     /// Keyed traffic on a connection belonging to THIS client alone.
@@ -1420,13 +1457,13 @@ fn forward_collect(
         Ok(Value::Error(e)) if e.starts_with("READONLY") => {
             // A demoted-in-place ex-master. Same recovery as the ordinary
             // path: rediscover this pair's master, then retry there.
-            topo.rediscover_for(&addr);
+            topo.rediscover_after_failure(&addr);
             backends.drop_conn(&addr);
             forward(topo, backends, ns, args, raw, false)
         }
         Ok(reply) => reply,
         Err(_) => {
-            topo.rediscover_for(&addr);
+            topo.rediscover_after_failure(&addr);
             forward(topo, backends, ns, args, raw, false)
         }
     }
@@ -1524,7 +1561,7 @@ fn forward(
                 if Instant::now() > deadline {
                     return Value::Error(e);
                 }
-                topo.rediscover_for(&addr);
+                topo.rediscover_after_failure(&addr);
                 backends.drop_conn(&addr);
                 std::thread::sleep(Duration::from_millis(50));
             }
@@ -1543,7 +1580,7 @@ fn forward(
                     use_replica = false;
                     backends.drop_conn(&addr);
                 } else {
-                    topo.rediscover_for(&addr);
+                    topo.rediscover_after_failure(&addr);
                 }
                 std::thread::sleep(Duration::from_millis(100));
             }
@@ -2798,6 +2835,15 @@ enum Prefetch {
 /// still correct.
 const MAX_PREFETCH: usize = 64;
 
+/// How long one rediscovery of an address suppresses the next.
+///
+/// Long enough to absorb the herd a single pooled-connection death produces
+/// (every in-flight caller on it arrives at `rediscover_for` at once), short
+/// enough that a real promotion is still learned promptly — and the control
+/// plane pushes promotion hints anyway, so this is the slow path, not the
+/// only one.
+const REDISCOVER_DEBOUNCE: Duration = Duration::from_millis(250);
+
 /// May this command be put on the wire before the ones ahead of it have been
 /// answered?
 ///
@@ -2874,6 +2920,12 @@ fn prefetch_run(
         return plan;
     }
     let mut staged = 0usize;
+    // One lease per target address, held for the whole pass. Taking a fresh
+    // connection per command would advance the lane's round-robin every time
+    // and scatter this run across every connection in the lane — which is
+    // exactly what happened when the lane widened to 8, and it cost the
+    // batching the pass exists to create.
+    let mut leases: HashMap<String, pool::PoolLease> = HashMap::new();
     for (i, (args, raw)) in cmds.iter().enumerate() {
         if i >= MAX_PREFETCH {
             break;
@@ -2914,13 +2966,23 @@ fn prefetch_run(
                 topo.pool.clone(),
             )
         });
-        match b.submit_nowait(&addr, raw) {
+        let lease = match leases.get(&addr) {
+            Some(l) => l,
+            None => match b.lease(&addr) {
+                // Dial failed: leave it to `forward`, which dials and retries
+                // with the full failover budget.
+                Err(_) => break,
+                Ok(l) => leases.entry(addr.clone()).or_insert(l),
+            },
+        };
+        match lease.stage(raw) {
             Ok(t) => {
                 plan[i] = Prefetch::InFlight(t, addr);
                 staged = i + 1;
             }
-            // Dial or stage failed: leave it to `forward`, which dials and
-            // retries with the full failover budget.
+            // At the connection's in-flight cap, or the connection died. Stop
+            // staging; the rest of the run takes the serial path, which is
+            // self-limiting and so is its own backpressure.
             Err(_) => break,
         }
     }
@@ -3627,6 +3689,7 @@ fn main() -> std::io::Result<()> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(pool::DEFAULT_LANE_WIDTH);
     let topo = Arc::new(Topology {
+        rediscover_gate: Mutex::new(HashMap::new()),
         pool: pool::BackendPool::new(backend_tls.clone(), lane_width),
         clusters: vec![ClusterView {
             routing: RwLock::new(Routing {
@@ -3905,6 +3968,7 @@ mod route_tests {
     /// only clusters/level0.
     fn topo(pairs: Vec<Vec<String>>, masters: Vec<Option<String>>) -> Topology {
         Topology {
+            rediscover_gate: Mutex::new(HashMap::new()),
             clusters: vec![ClusterView {
                 routing: RwLock::new(Routing {
                     pairs,
@@ -4198,6 +4262,56 @@ mod route_tests {
             master0(&t),
             Some("a:1".into()),
             "replaying the same hint (a re-push, or a reconnect) must not re-probe"
+        );
+    }
+
+    /// The herd a pooled-connection death produces must cost ONE re-probe.
+    ///
+    /// A pooled connection fails every in-flight command on it at once, and
+    /// each caller independently asks for rediscovery. On a fleet that turned
+    /// one death into 198 routing transitions, the master flapping
+    /// `addr -> none -> addr` inside milliseconds while concurrent probes
+    /// raced each other, and throughput collapsed to 0.12x with a 10 s p99.9.
+    #[test]
+    fn simultaneous_request_failures_cause_one_reprobe() {
+        let t = two_pair_topo();
+        seed_master0(&t);
+        // First failure probes for real: "a:1" does not resolve, so the probe
+        // finds no master and clears the slot.
+        t.rediscover_after_failure("a:1");
+        assert_eq!(
+            master0(&t),
+            None,
+            "the first failure must actually re-probe"
+        );
+        // The rest of the herd arrives while that probe is still fresh and
+        // must be absorbed — if they probed too, they would each race a write
+        // into the routing table.
+        seed_master0(&t);
+        for _ in 0..32 {
+            t.rediscover_after_failure("a:1");
+        }
+        assert_eq!(
+            master0(&t),
+            Some("a:1".into()),
+            "32 further failures within the debounce must not re-probe at all"
+        );
+    }
+
+    /// Coalescing must never swallow control-plane news. A promote hint says
+    /// the topology HAS changed; a request failure only says one caller saw a
+    /// symptom. Suppressing the former delays real failover.
+    #[test]
+    fn a_promote_hint_is_never_debounced() {
+        let t = two_pair_topo();
+        seed_master0(&t);
+        t.rediscover_after_failure("a:1"); // arms the gate
+        seed_master0(&t);
+        t.apply_promote_hint("a:1|9");
+        assert_eq!(
+            master0(&t),
+            None,
+            "a promote hint must re-probe even immediately after a failure-driven one"
         );
     }
 
