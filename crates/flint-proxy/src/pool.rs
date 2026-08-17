@@ -51,9 +51,12 @@
 //! cap was unnecessary because `submit` is synchronous per caller, so pending
 //! could not exceed the live client-connection count. That stopped being true
 //! when `stage` was split out so one caller could hold a whole pipeline in
-//! flight: depth became connections x pipeline depth. `serve_client` bounds
-//! how many commands one prefetch pass may stage (`MAX_PREFETCH`), which is
-//! what keeps both the staging buffer and the FIFO bounded.
+//! flight: depth became connections x pipeline depth. Two bounds replace the
+//! lost invariant — `serve_client` limits one prefetch pass (`MAX_PREFETCH`),
+//! and, because several callers share a connection, `MAX_INFLIGHT` limits what
+//! any ONE connection may carry. The per-connection bound is the load-bearing
+//! one: a per-pass limit alone still let 8 clients stack 255 commands onto a
+//! single socket and drive the node out of its lease.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -68,11 +71,47 @@ use crate::{BACKEND_TIMEOUT, dial_backend};
 /// Connections per (address, namespace, async-writes) lane. More than one
 /// spreads slow-command exposure across sockets without recreating the
 /// per-client socket explosion this pool replaces.
-pub(crate) const DEFAULT_LANE_WIDTH: usize = 2;
+///
+/// Raised from 2 to 8 on 2026-08-17, when staging made queue depth per
+/// connection matter. Measured on one fleet, 8 client connections, 1 KB GETs:
+///
+/// | | width 2 | width 8 |
+/// |---|---|---|
+/// | pipeline 16 | 228k ops/s, p99 2.27 ms | 268k ops/s, p99 0.86 ms |
+/// | pipeline 64 | 196k ops/s, p99 104.70 ms | 289k ops/s, p99 11.63 ms |
+///
+/// The p99 column is the reason. Head-of-line blocking was ADR-0020's named
+/// risk, and a narrow lane is what realises it: every client sharing a socket
+/// waits behind whatever is queued ahead of it, so a 32-deep queue on two
+/// sockets turns one slow command into a hundred-millisecond tail. Eight
+/// sockets per node is still far below the per-client connection count this
+/// pool replaced.
+pub(crate) const DEFAULT_LANE_WIDTH: usize = 8;
 
 /// The reader's socket poll. Short, so liveness checks run even when the
 /// backend is silent; each wakeup is two syscalls on an idle connection.
 const READ_POLL: Duration = Duration::from_secs(1);
+
+/// Most commands one pooled connection may have outstanding at once.
+///
+/// `submit` is self-limiting: one command per caller thread, so depth could
+/// never exceed the live client-connection count. `stage` deliberately breaks
+/// that — a caller puts its whole pipeline in flight — and several callers
+/// share a connection, so depth becomes callers x pipeline depth.
+///
+/// Measured 2026-08-17: 8 client connections at pipeline depth 64 put **255**
+/// commands on ONE socket. That saturated the node hard enough to starve its
+/// lease renewal — it self-fenced to read-only ("partitioned from
+/// controllers") three times, the proxy lost its master, and throughput
+/// collapsed to zero for seconds at a stretch. The same load bounded is
+/// stable, and one connection at depth 64 serves 215k ops/s through the
+/// proxy.
+///
+/// So this is a safety bound on how deep a client may drive a shared backend
+/// queue, not a tuning knob. Staging stops at the cap and the remaining
+/// commands take the ordinary serial path, which is self-limiting and
+/// therefore its own backpressure.
+const MAX_INFLIGHT: usize = 32;
 
 /// How long a submitter waits on its slot. Above BACKEND_TIMEOUT so the
 /// reader's no-progress liveness check fires first and produces an error that
@@ -149,10 +188,15 @@ impl Conn {
     /// the node as 16 separate round trips and the node saw no pipeline at
     /// all — measured 2026-08-17, and the reason `pool_batch_mean` sat at 1.0
     /// no matter how the load was shaped.
+    ///
+    /// `cap` bounds how many commands may be outstanding here (see
+    /// `MAX_INFLIGHT`). `None` is the self-limiting serial path, which adds at
+    /// most one command per caller thread and so needs no bound.
     fn stage(
         &self,
         frame: &[u8],
         stats: &PoolStats,
+        cap: Option<usize>,
     ) -> std::io::Result<Receiver<std::io::Result<Value>>> {
         if self.dead.load(Ordering::Relaxed) {
             return Err(std::io::Error::other("backend connection is down"));
@@ -168,6 +212,16 @@ impl Conn {
                     .pending
                     .lock()
                     .map_err(|_| std::io::Error::other("pending poisoned"))?;
+                // Checked under the same lock as the push, so the bound holds
+                // against concurrent stagers rather than merely usually.
+                if let Some(cap) = cap
+                    && q.len() >= cap
+                {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WouldBlock,
+                        "backend connection at in-flight capacity",
+                    ));
+                }
                 q.push_back(Pending { tx });
                 stats
                     .inflight_max
@@ -228,7 +282,7 @@ impl Conn {
     /// never ours — between our flush and our reply, any number of other
     /// commands travel on it.
     fn submit(&self, frame: &[u8], stats: &PoolStats) -> std::io::Result<Value> {
-        let rx = self.stage(frame, stats)?;
+        let rx = self.stage(frame, stats, None)?;
         self.flush_staged(stats)?;
         self.wait_slot(&rx)
     }
@@ -393,7 +447,7 @@ impl BackendPool {
         frame: &[u8],
     ) -> std::io::Result<Ticket> {
         let conn = self.conn_for(addr, ns, async_writes)?;
-        let rx = conn.stage(frame, &self.stats)?;
+        let rx = conn.stage(frame, &self.stats, Some(MAX_INFLIGHT))?;
         Ok(Ticket {
             conn,
             rx,
