@@ -1162,6 +1162,17 @@ impl Cluster {
     /// Both nodes' ordering is stable across failovers because roles float
     /// between the same two ports.
     pub fn start_proxy(&mut self) -> u16 {
+        self.start_proxy_with_workers(None)
+    }
+
+    /// Start the edge with an explicit worker count.
+    ///
+    /// Worker count is the variable that matters for the async proxy
+    /// (ADR-0021): backend connections are owned per worker, so N workers on
+    /// one node means N independent FIFO streams whose replies must never be
+    /// crossed. Pinning it makes that testable instead of dependent on
+    /// whatever core count the runner happens to have.
+    pub fn start_proxy_with_workers(&mut self, workers: Option<usize>) -> u16 {
         assert!(
             self.controlled,
             "start_proxy needs bootstrap_controlled (fixed ports)"
@@ -1176,8 +1187,18 @@ impl Cluster {
             std::env::temp_dir().display()
         ))
         .expect("proxy log");
+        let mut argv = vec![
+            "--port".to_string(),
+            proxy_port.to_string(),
+            "--pairs".to_string(),
+            pairs,
+        ];
+        if let Some(w) = workers {
+            argv.push("--workers".to_string());
+            argv.push(w.to_string());
+        }
         let child = Command::new(proxy_bin())
-            .args(["--port", &proxy_port.to_string(), "--pairs", &pairs])
+            .args(&argv)
             .stderr(log)
             .stdout(std::process::Stdio::null())
             .spawn()

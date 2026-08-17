@@ -46,16 +46,17 @@
 //! Usage: flint-proxy --port 7379 --pairs "m0,r0;m1,r1;..."
 //!                    [--tenants "tokenA=nsA,tokenB=nsB"]
 
+mod apool;
 mod cache;
 mod errors;
 mod latency;
-mod pool;
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::net::TcpListener;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use flint_resp::{Decoded, Value, decode, encode, encode_proto};
 use flint_slot::slot_for_key;
@@ -430,10 +431,6 @@ struct Topology {
     /// current config. `None` = plaintext backends (default). Set by
     /// `--internal-*`; the same triple the servers use, in the client role.
     backend_tls: Option<Arc<flint_tls::ReloadableClientConfig>>,
-    /// Shared multiplexed backend connections (ADR-0020). Process-wide, so
-    /// every client connection's ordinary traffic converges on the same few
-    /// sockets per (node, namespace) instead of opening its own.
-    pool: Arc<pool::BackendPool>,
     /// Read budget for the O(keys) admin class (`--fanout-timeout-ms`); see
     /// FANOUT_TIMEOUT_DEFAULT and Backends::call_slow.
     fanout_timeout: Duration,
@@ -1133,70 +1130,6 @@ fn call_raw(
     read_reply(stream, buf)
 }
 
-/// Dial one backend and bring it to a usable state: TLS, RESP3, namespace pin.
-///
-/// ONE dial implementation, shared by the per-client connections (transactions,
-/// co-processor channels, the O(keys) admin class) and by the shared dispatcher
-/// pool. Two dial paths would drift, and this handshake is where the tenant
-/// namespace boundary is enforced — the wrong place to keep a near-copy.
-///
-/// Speaks RESP3 to the backend ALWAYS, whatever the client negotiated: a RESP2
-/// reply is ambiguous (a flat array could be a hash, a list, or member/score
-/// pairs) and once flattened the proxy cannot put the types back. RESP3 keeps
-/// them (`%`, `~`, `,`), so the proxy decodes a reply that still knows what it
-/// means and re-renders it for whichever dialect the client asked for.
-pub(crate) fn dial_backend(
-    addr: &str,
-    ns: &[u8],
-    async_writes: bool,
-    tls: &Option<Arc<flint_tls::ReloadableClientConfig>>,
-) -> std::io::Result<flint_tls::Stream> {
-    let mut stream = flint_tls::connect_reloadable(addr, tls)?;
-    stream.set_read_timeout(Some(BACKEND_TIMEOUT))?;
-    stream.set_write_timeout(Some(BACKEND_TIMEOUT))?;
-    let mut hello = Vec::new();
-    encode(
-        &Value::Array(Some(vec![
-            Value::Bulk(Some(b"HELLO".to_vec())),
-            Value::Bulk(Some(b"3".to_vec())),
-        ])),
-        &mut hello,
-    );
-    let mut hello_buf = Vec::new();
-    match call_raw(&mut stream, &mut hello_buf, &hello)? {
-        Value::Map(_) => {}
-        other => {
-            return Err(std::io::Error::other(format!(
-                "backend refused RESP3: {other:?}"
-            )));
-        }
-    }
-    // Pin the connection to the tenant namespace before any data command can
-    // travel on it; the 'a' arg opts this connection's batchable writes into
-    // the node's async write queue (D4). A pooled connection is therefore only
-    // ever reusable for the SAME (namespace, async-writes) pair — that is why
-    // both are part of the pool key.
-    let mut hs_args = vec![
-        Value::Bulk(Some(b"FLINTNS".to_vec())),
-        Value::Bulk(Some(ns.to_vec())),
-    ];
-    if async_writes {
-        hs_args.push(Value::Bulk(Some(b"a".to_vec())));
-    }
-    let mut hs = Vec::new();
-    encode(&Value::Array(Some(hs_args)), &mut hs);
-    let mut hs_buf = Vec::new();
-    match call_raw(&mut stream, &mut hs_buf, &hs)? {
-        Value::Simple(_) => {}
-        other => {
-            return Err(std::io::Error::other(format!(
-                "namespace handshake rejected: {other:?}"
-            )));
-        }
-    }
-    Ok(stream)
-}
-
 /// Probe a pair's nodes for the current master (FLINTINFO role) — the same
 /// discovery rule the controller uses.
 fn discover_master(
@@ -1226,8 +1159,23 @@ fn discover_master(
 }
 
 /// Per-client-thread cache of backend connections.
+/// This client's view of the backend hop.
+///
+/// Ordinary keyed traffic goes through the WORKER's connection registry
+/// (`apool`), shared with the other clients this worker owns and with nobody
+/// else. What lives here is only what genuinely needs a connection to itself:
+///
+///   - TRANSACTIONS. A node keeps MULTI's queue and WATCH's watches per
+///     CONNECTION, so a queued command landing on a shared connection would
+///     EXECUTE instead of queueing, and the client would see QUEUED followed
+///     by a partial apply. This is the case the old per-client design was
+///     defending, and it is still right — it just does not need every GET to
+///     pay for it.
+///   - The O(keys) admin class (`call_slow`), whose minute-long budget would
+///     head-of-line block every ordinary read sharing its connection.
 struct Backends {
-    conns: HashMap<String, (flint_tls::Stream, Vec<u8>)>,
+    /// Connections belonging to THIS client alone, never in the registry.
+    private: HashMap<String, Rc<apool::AsyncConn>>,
     /// Tenant namespace every connection here is pinned to (FLINTNS
     /// handshake at open). One client = one tenant, so raw frames forward
     /// without per-command rewriting.
@@ -1240,10 +1188,6 @@ struct Backends {
     async_writes: bool,
     /// Read budget for the O(keys) admin class only (see call_slow).
     fanout_timeout: Duration,
-    /// Shared, multiplexed connections for ordinary keyed traffic (ADR-0020).
-    /// The `conns` map above is no longer the common path — it now serves only
-    /// the cases that genuinely need a connection to themselves.
-    pool: Arc<pool::BackendPool>,
 }
 
 impl Backends {
@@ -1252,117 +1196,120 @@ impl Backends {
         tls: Option<Arc<flint_tls::ReloadableClientConfig>>,
         async_writes: bool,
         fanout_timeout: Duration,
-        pool: Arc<pool::BackendPool>,
     ) -> Self {
         Self {
-            conns: HashMap::new(),
+            private: HashMap::new(),
             ns,
             tls,
             async_writes,
             fanout_timeout,
-            pool,
         }
     }
 
-    /// Discard the cached connection to `addr` (stale-routing recovery: the
-    /// next call dials whatever the refreshed masters map says).
+    /// A connection is only reusable for the SAME (address, namespace,
+    /// async-writes) triple, because `FLINTNS` pins it at open.
+    fn key(&self, addr: &str) -> apool::Key {
+        apool::Key {
+            addr: addr.to_string(),
+            ns: self.ns.clone(),
+            async_writes: self.async_writes,
+        }
+    }
+
+    /// Discard connections to `addr` (stale-routing recovery: the next call
+    /// dials whatever the refreshed masters map says). Both the shared one and
+    /// any private one, because a demoted master is wrong for either.
     fn drop_conn(&mut self, addr: &str) {
-        self.conns.remove(addr);
-    }
-
-    /// Dial + RESP3 + namespace handshake if this address is not already
-    /// pooled. Split out of `call` so the O(keys) path can reuse the ONE
-    /// dial implementation while giving only the command's own reply a
-    /// longer budget (see `call_slow`).
-    fn ensure_conn(&mut self, addr: &str) -> std::io::Result<()> {
-        if !self.conns.contains_key(addr) {
-            // ONE dial implementation, shared with the dispatcher pool — see
-            // `dial_backend`. These per-client connections are no longer the
-            // common path (ADR-0020 moved ordinary keyed traffic onto shared
-            // dispatchers); what is left here is the traffic that genuinely
-            // needs a socket to itself:
-            //
-            //   - TRANSACTIONS. A node keeps MULTI's queue and WATCH's watches
-            //     per CONNECTION, so a queued command that landed on a shared
-            //     connection would EXECUTE instead of queueing and the client
-            //     would see QUEUED followed by a partial apply. This is the
-            //     case the old per-client design was defending, and it is
-            //     still right — it just does not need every GET to pay for it.
-            //   - The O(keys) admin class (`call_slow`), whose 60 s budget
-            //     would head-of-line block every ordinary read sharing its
-            //     connection.
-            let stream = dial_backend(addr, &self.ns, self.async_writes, &self.tls)?;
-            self.conns.insert(addr.to_string(), (stream, Vec::new()));
+        apool::retire(&self.key(addr));
+        if let Some(c) = self.private.remove(addr) {
+            c.shutdown();
         }
-        Ok(())
     }
 
-    /// Keyed traffic: through the SHARED dispatcher pool (ADR-0020).
+    /// Await one staged reply.
     ///
-    /// This is the ordinary path — every routed read and write. Many client
-    /// threads land on few connections, so whatever they have queued at the
-    /// same instant is written as one batch and the internal hop is paid once
-    /// for the group instead of once per command.
-    fn call(&mut self, addr: &str, frame: &[u8]) -> std::io::Result<Value> {
-        self.pool.call(addr, &self.ns, self.async_writes, frame)
+    /// A timed-out request must NOT simply return. Its reply may still be in
+    /// flight, and correlation is by position, so the next caller on that
+    /// connection would receive it — one slow command would hand every
+    /// subsequent client someone else's data. Retiring the connection is what
+    /// makes the timeout safe rather than merely late.
+    async fn collect(
+        rx: tokio::sync::oneshot::Receiver<std::io::Result<Value>>,
+        budget: Duration,
+        on_timeout: impl FnOnce(),
+    ) -> std::io::Result<Value> {
+        match tokio::time::timeout(budget, rx).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(_)) => Err(std::io::Error::other("backend connection closed")),
+            Err(_) => {
+                on_timeout();
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "backend did not answer within the budget",
+                ))
+            }
+        }
     }
 
-    /// Put a command on the wire without waiting for it (ADR-0020 amendment
-    /// 2, 2026-08-17). The caller stages a whole pipelined run, flushes, and
-    /// only then collects — which is the difference between the node seeing a
-    /// pipeline and the node seeing N round trips.
-    fn lease(&mut self, addr: &str) -> std::io::Result<pool::PoolLease> {
-        self.pool.lease(addr, &self.ns, self.async_writes)
+    /// Keyed traffic: on this worker's shared connection.
+    async fn call(&mut self, addr: &str, frame: &[u8]) -> std::io::Result<Value> {
+        let key = self.key(addr);
+        let conn = apool::conn_for(&key, &self.tls).await?;
+        let rx = conn.stage(frame)?;
+        conn.flush().await?;
+        Self::collect(rx, BACKEND_TIMEOUT, || apool::retire(&key)).await
     }
 
-    /// Keyed traffic on a connection belonging to THIS client alone.
-    ///
-    /// For the cases where a shared connection would be wrong rather than
-    /// merely slower — a transaction's queue and watches are state on one node
-    /// connection, so the command must travel on the connection that owns
-    /// them. See `ensure_conn` for the full list.
-    fn call_private(&mut self, addr: &str, frame: &[u8]) -> std::io::Result<Value> {
-        self.ensure_conn(addr)?;
-        let Some((stream, buf)) = self.conns.get_mut(addr) else {
-            return Err(std::io::Error::other("conn cache"));
+    /// This worker's connection to `addr`, for staging a whole prefetch pass
+    /// onto ONE connection. Picking a connection per COMMAND instead scatters
+    /// a client's pipeline and destroys the batching (see ADR-0020's
+    /// amendment, and the fleet run that measured batch depth 1.04).
+    async fn lease(&mut self, addr: &str) -> std::io::Result<Rc<apool::AsyncConn>> {
+        apool::conn_for(&self.key(addr), &self.tls).await
+    }
+
+    /// One command on a connection belonging to THIS client alone, with an
+    /// explicit budget. Shared by transactions and the O(keys) admin class.
+    async fn private_call(
+        &mut self,
+        addr: &str,
+        frame: &[u8],
+        budget: Duration,
+    ) -> std::io::Result<Value> {
+        let conn = match self.private.get(addr) {
+            Some(c) if !c.is_dead() => c.clone(),
+            _ => {
+                let c = apool::dial_private(&self.key(addr), &self.tls).await?;
+                self.private.insert(addr.to_string(), c.clone());
+                c
+            }
         };
-        let result = call_raw(stream, buf, frame);
-        if result.is_err() {
+        let rx = conn.stage(frame)?;
+        conn.flush().await?;
+        let r = Self::collect(rx, budget, || conn.shutdown()).await;
+        if r.is_err() {
             // A failed connection is never reused: the reply stream may be
-            // desynchronized (half-read reply), which would corrupt the next
-            // exchange.
-            self.conns.remove(addr);
+            // desynchronised, which would corrupt the next exchange.
+            if let Some(c) = self.private.remove(addr) {
+                c.shutdown();
+            }
         }
-        result
+        r
+    }
+
+    /// Keyed traffic on a connection belonging to THIS client alone — where a
+    /// shared connection would be wrong rather than merely slower.
+    async fn call_private(&mut self, addr: &str, frame: &[u8]) -> std::io::Result<Value> {
+        self.private_call(addr, frame, BACKEND_TIMEOUT).await
     }
 
     /// The O(keys) admin class — `DBSIZE`, `FLUSHALL`, `SCAN`'s per-master
-    /// step. Same wire, same pool, different clock: only the command's own
-    /// REPLY gets `fanout_timeout`.
-    ///
-    /// Connection setup deliberately keeps the keyed budget: a node that
-    /// cannot complete HELLO + FLINTNS inside BACKEND_TIMEOUT is a genuinely
-    /// sick node, and hiding that behind a minute of patience would trade one
-    /// misdiagnosis for another. And the budget is RESTORED before the socket
-    /// goes back in the pool — it is per-client and long-lived, so a leaked
-    /// 60 s read timeout would silently make every subsequent GET on this
-    /// connection wait a minute for a dead backend.
-    fn call_slow(&mut self, addr: &str, frame: &[u8]) -> std::io::Result<Value> {
-        self.ensure_conn(addr)?;
+    /// step. Same wire, different clock: only the command's own reply gets
+    /// `fanout_timeout`, and it travels privately so a minute-long wait cannot
+    /// head-of-line block anyone else's reads.
+    async fn call_slow(&mut self, addr: &str, frame: &[u8]) -> std::io::Result<Value> {
         let budget = self.fanout_timeout;
-        let result = {
-            let Some((stream, buf)) = self.conns.get_mut(addr) else {
-                return Err(std::io::Error::other("conn cache"));
-            };
-            stream.set_read_timeout(Some(budget))?;
-            let r = call_raw(stream, buf, frame);
-            let _ = stream.set_read_timeout(Some(BACKEND_TIMEOUT));
-            r
-        };
-        if result.is_err() {
-            self.conns.remove(addr);
-        }
-        result
+        self.private_call(addr, frame, budget).await
     }
 }
 
@@ -1439,16 +1386,30 @@ fn repair_reply(args: &[Vec<u8>], v: Value) -> Value {
 /// duplicating that logic here to save one round trip on the unhappy path
 /// would be the wrong trade and a second place for failover to be subtly
 /// wrong.
-fn forward_collect(
-    topo: &Topology,
+async fn forward_collect(
+    topo: &Arc<Topology>,
     backends: &mut Backends,
     ns: &[u8],
     args: &[Vec<u8>],
     raw: &[u8],
-    ticket: pool::Ticket,
+    rx: tokio::sync::oneshot::Receiver<std::io::Result<Value>>,
     addr: String,
 ) -> Value {
-    match ticket.wait().map(|v| repair_reply(args, v)) {
+    // A staged command that never answers must take its connection with it:
+    // correlation is by position, so a late reply would be handed to whoever
+    // asked next.
+    let got = match tokio::time::timeout(BACKEND_TIMEOUT, rx).await {
+        Ok(Ok(r)) => r,
+        Ok(Err(_)) => Err(std::io::Error::other("backend connection closed")),
+        Err(_) => {
+            backends.drop_conn(&addr);
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "backend did not answer within the budget",
+            ))
+        }
+    };
+    match got.map(|v| repair_reply(args, v)) {
         Ok(Value::Error(e)) if e.starts_with("MOVED ") => {
             let mut parts = e.split(' ');
             let (_, s, new_addr) = (parts.next(), parts.next(), parts.next());
@@ -1457,28 +1418,28 @@ fn forward_collect(
             {
                 topo.learn_moved(ns, s, new_addr);
             }
-            forward(topo, backends, ns, args, raw, false)
+            forward(topo, backends, ns, args, raw, false).await
         }
         Ok(Value::Error(e)) if e.starts_with("TRYAGAIN") => {
-            forward(topo, backends, ns, args, raw, false)
+            forward(topo, backends, ns, args, raw, false).await
         }
         Ok(Value::Error(e)) if e.starts_with("READONLY") => {
             // A demoted-in-place ex-master. Same recovery as the ordinary
             // path: rediscover this pair's master, then retry there.
             topo.rediscover_after_failure(&addr);
             backends.drop_conn(&addr);
-            forward(topo, backends, ns, args, raw, false)
+            forward(topo, backends, ns, args, raw, false).await
         }
         Ok(reply) => reply,
         Err(_) => {
             topo.rediscover_after_failure(&addr);
-            forward(topo, backends, ns, args, raw, false)
+            forward(topo, backends, ns, args, raw, false).await
         }
     }
 }
 
-fn forward(
-    topo: &Topology,
+async fn forward(
+    topo: &Arc<Topology>,
     backends: &mut Backends,
     ns: &[u8],
     args: &[Vec<u8>],
@@ -1527,7 +1488,11 @@ fn forward(
             continue;
         };
 
-        match backends.call(&addr, frame).map(|v| repair_reply(args, v)) {
+        match backends
+            .call(&addr, frame)
+            .await
+            .map(|v| repair_reply(args, v))
+        {
             Ok(Value::Error(e)) if e.starts_with("MOVED ") => {
                 // "MOVED <slot> <addr>": learn and chase. The client must
                 // never see this — absorbing it is the proxy's reason to
@@ -1619,8 +1584,8 @@ fn refresh_pair_master(view: &ClusterView, idx: usize, topo: &Topology) -> Optio
     found
 }
 
-fn fan_out(
-    topo: &Topology,
+async fn fan_out(
+    topo: &Arc<Topology>,
     backends: &mut Backends,
     frame: &[u8],
     combine: impl Fn(Vec<Value>) -> Value,
@@ -1649,7 +1614,7 @@ fn fan_out(
                     // call_slow: everything routed here is the O(keys) admin
                     // class (DBSIZE, FLUSHALL), whose honest cost scales with
                     // the keyspace on the node being asked.
-                    Some(a) => match backends.call_slow(&a, frame) {
+                    Some(a) => match backends.call_slow(&a, frame).await {
                         Ok(v) => {
                             replies.push(v);
                             break;
@@ -1711,7 +1676,7 @@ enum AuthStep {
 /// so the backend-connection namespace pinning can never go stale.
 #[allow(clippy::too_many_arguments)]
 fn auth_step(
-    topo: &Topology,
+    topo: &Arc<Topology>,
     authed_ns: &mut Option<Vec<u8>>,
     replica_reads: &mut bool,
     local_cache: &mut bool,
@@ -1838,9 +1803,8 @@ fn auth_step(
         // null result could not be explained without re-reading the source —
         // which is why the ADR made instrumentation an acceptance gate rather
         // than a follow-up.
-        let ps = &topo.pool.stats;
-        let pool_batches = ps.batches.load(Ordering::Relaxed);
-        let pool_commands = ps.commands.load(Ordering::Relaxed);
+        let pool_batches = apool::BATCHES.load(Ordering::Relaxed);
+        let pool_commands = apool::COMMANDS.load(Ordering::Relaxed);
         let pool_batch_mean = if pool_batches == 0 {
             0.0
         } else {
@@ -1865,9 +1829,9 @@ fn auth_step(
             // already scaled back up by this, so it IS the estimated ops/s.
             // Exposed for transparency about the estimate's granularity.
             HOTKEY_SAMPLE_RATE,
-            pool_lanes = ps.lanes.load(Ordering::Relaxed),
-            pool_inflight_max = ps.inflight_max.load(Ordering::Relaxed),
-            pool_dials = ps.dial_failures.load(Ordering::Relaxed),
+            pool_lanes = apool::LIVE_CONNS.load(Ordering::Relaxed),
+            pool_inflight_max = apool::INFLIGHT_MAX.load(Ordering::Relaxed),
+            pool_dials = apool::DIAL_FAILURES.load(Ordering::Relaxed),
             build = build_version(),
             cdr = topo
                 .cert_path
@@ -2084,7 +2048,10 @@ fn auth_step(
     }
 }
 
-fn serve_client<S: Read + Write>(mut stream: S, topo: Arc<Topology>) -> std::io::Result<()> {
+async fn serve_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
+    mut stream: S,
+    topo: Arc<Topology>,
+) -> std::io::Result<()> {
     // Open mode (standalone, no tenants configured): the connection starts
     // authorized on the default namespace — the pre-tenancy behavior.
     let mut authed_ns: Option<Vec<u8>> = if topo.open_mode {
@@ -2214,17 +2181,20 @@ fn serve_client<S: Read + Write>(mut stream: S, topo: Arc<Topology>) -> std::io:
         // per-connection state on the node, so ordering is load-bearing while
         // either is armed.
         let plan = match authed_ns.as_deref() {
-            Some(ns) => prefetch_run(
-                &topo,
-                &mut backends,
-                &cmds,
-                ns,
-                txn.open || txn.addr.is_some(),
-                replica_reads,
-                local_cache,
-                async_writes,
-                channel_deadline.is_some(),
-            ),
+            Some(ns) => {
+                prefetch_run(
+                    &topo,
+                    &mut backends,
+                    &cmds,
+                    ns,
+                    txn.open || txn.addr.is_some(),
+                    replica_reads,
+                    local_cache,
+                    async_writes,
+                    channel_deadline.is_some(),
+                )
+                .await
+            }
             // Unauthenticated: nothing may be staged, and AUTH itself must be
             // executed before anything behind it is even classified.
             None => Vec::new(),
@@ -2270,7 +2240,7 @@ fn serve_client<S: Read + Write>(mut stream: S, topo: Arc<Topology>) -> std::io:
                     proto,
                     &mut out,
                 );
-                stream.write_all(&out)?;
+                stream.write_all(&out).await?;
                 return Ok(());
             }
             // Channel data-command budget (ADR-0010 D3): a channel gets
@@ -2289,7 +2259,7 @@ fn serve_client<S: Read + Write>(mut stream: S, topo: Arc<Topology>) -> std::io:
                         proto,
                         &mut out,
                     );
-                    stream.write_all(&out)?;
+                    stream.write_all(&out).await?;
                     return Ok(());
                 }
                 *budget -= 1;
@@ -2339,19 +2309,22 @@ fn serve_client<S: Read + Write>(mut stream: S, topo: Arc<Topology>) -> std::io:
                         channel_budget = Some(budget);
                         Value::Simple("OK".into())
                     }
-                    AuthStep::Proceed(ns) => data_command(
-                        &topo,
-                        &mut backends,
-                        &mut txn,
-                        &ns,
-                        args,
-                        raw,
-                        replica_reads,
-                        local_cache,
-                        async_writes,
-                        channel_deadline.is_some(),
-                        prefetch,
-                    ),
+                    AuthStep::Proceed(ns) => {
+                        data_command(
+                            &topo,
+                            &mut backends,
+                            &mut txn,
+                            &ns,
+                            args,
+                            raw,
+                            replica_reads,
+                            local_cache,
+                            async_writes,
+                            channel_deadline.is_some(),
+                            prefetch,
+                        )
+                        .await
+                    }
                 }
             };
             // Record into this tenant's read/write histogram — data
@@ -2376,7 +2349,7 @@ fn serve_client<S: Read + Write>(mut stream: S, topo: Arc<Topology>) -> std::io:
             }
             encode_proto(&reply, proto, &mut out);
             if out.len() >= OUT_FLUSH_THRESHOLD {
-                stream.write_all(&out)?;
+                stream.write_all(&out).await?;
                 out.clear();
             }
         }
@@ -2386,16 +2359,16 @@ fn serve_client<S: Read + Write>(mut stream: S, topo: Arc<Topology>) -> std::io:
         // naturally.
         if let Some(msg) = fatal {
             encode(&Value::Error(msg.into()), &mut out);
-            stream.write_all(&out)?;
+            stream.write_all(&out).await?;
             return Ok(());
         }
         if consumed > 0 {
             buf.drain(..consumed);
             if !out.is_empty() {
-                stream.write_all(&out)?;
+                stream.write_all(&out).await?;
             }
         }
-        let n = stream.read(&mut chunk)?;
+        let n = stream.read(&mut chunk).await?;
         if n == 0 {
             return Ok(());
         }
@@ -2406,7 +2379,7 @@ fn serve_client<S: Read + Write>(mut stream: S, topo: Arc<Topology>) -> std::io:
                 &Value::Error("ERR Protocol error: query buffer limit exceeded".into()),
                 &mut out,
             );
-            let _ = stream.write_all(&out);
+            let _ = stream.write_all(&out).await;
             return Ok(());
         }
     }
@@ -2468,8 +2441,8 @@ fn abort_txn(backends: &mut Backends, txn: &mut ProxyTxn, why: &str) -> Value {
 /// it must never ride the shared pool. Routing it through `call` would hand the
 /// queued command to whichever pooled connection was free, where the node —
 /// having no MULTI open on it — would execute it immediately.
-fn call_pinned(backends: &mut Backends, addr: &str, frame: &[u8]) -> Result<Value, String> {
-    match backends.call_private(addr, frame) {
+async fn call_pinned(backends: &mut Backends, addr: &str, frame: &[u8]) -> Result<Value, String> {
+    match backends.call_private(addr, frame).await {
         Ok(Value::Error(e))
             if e.starts_with("MOVED ")
                 || e.starts_with("TRYAGAIN")
@@ -2501,8 +2474,8 @@ fn encode_cmd(parts: &[&[u8]]) -> Vec<u8> {
 
 /// Handle a command that is transaction business. `None` means it is not,
 /// and the caller should carry on with normal routing.
-fn transaction_step(
-    topo: &Topology,
+async fn transaction_step(
+    topo: &Arc<Topology>,
     backends: &mut Backends,
     txn: &mut ProxyTxn,
     ns: &[u8],
@@ -2527,7 +2500,7 @@ fn transaction_step(
                 ));
             }
             let addr = routed?;
-            match call_pinned(backends, &addr, raw) {
+            match call_pinned(backends, &addr, raw).await {
                 Ok(v) => {
                     txn.addr = Some(addr);
                     Some(v)
@@ -2540,7 +2513,7 @@ fn transaction_step(
                 // Nothing was ever watched through this proxy connection.
                 return Some(Value::Simple("OK".into()));
             };
-            let reply = match call_pinned(backends, &addr, raw) {
+            let reply = match call_pinned(backends, &addr, raw).await {
                 Ok(v) => v,
                 Err(why) => return Some(abort_txn(backends, txn, &why)),
             };
@@ -2564,7 +2537,7 @@ fn transaction_step(
             // the client had already discarded. Found by the differential
             // probe, which is the only place a stale watch is visible.
             if let Some(addr) = txn.addr.clone() {
-                match call_pinned(backends, &addr, &encode_cmd(&[b"MULTI"])) {
+                match call_pinned(backends, &addr, &encode_cmd(&[b"MULTI"])).await {
                     Ok(Value::Simple(s)) if s == "OK" => txn.opened = true,
                     Ok(other) => {
                         return Some(abort_txn(
@@ -2595,7 +2568,7 @@ fn transaction_step(
                 // Nothing reached a backend, so there is nothing to discard
                 // there; the queue only ever existed in this proxy's intent.
                 None => Some(Value::Simple("OK".into())),
-                Some(addr) => Some(match call_pinned(backends, &addr, raw) {
+                Some(addr) => Some(match call_pinned(backends, &addr, raw).await {
                     Ok(v) => v,
                     // The connection is gone, which discarded it for us.
                     Err(_) => Value::Simple("OK".into()),
@@ -2612,7 +2585,7 @@ fn transaction_step(
                 // MULTI ... EXEC with nothing in between: no backend was
                 // ever chosen, and the answer is the empty array.
                 None => Some(Value::Array(Some(Vec::new()))),
-                Some(addr) => Some(match call_pinned(backends, &addr, raw) {
+                Some(addr) => Some(match call_pinned(backends, &addr, raw).await {
                     // RESP3 has exactly ONE null, and the backend hop always
                     // speaks it (see the HELLO 3 handshake). So the node's
                     // aborted-EXEC reply — a null ARRAY — reaches us as
@@ -2658,7 +2631,7 @@ fn transaction_step(
             txn.addr = Some(addr.clone());
             // Open the transaction on the backend now that one is known.
             if !txn.opened {
-                match call_pinned(backends, &addr, &encode_cmd(&[b"MULTI"])) {
+                match call_pinned(backends, &addr, &encode_cmd(&[b"MULTI"])).await {
                     Ok(Value::Simple(s)) if s == "OK" => txn.opened = true,
                     Ok(other) => {
                         return Some(abort_txn(
@@ -2670,7 +2643,7 @@ fn transaction_step(
                     Err(why) => return Some(abort_txn(backends, txn, &why)),
                 }
             }
-            match call_pinned(backends, &addr, raw) {
+            match call_pinned(backends, &addr, raw).await {
                 Ok(v) => Some(v),
                 Err(why) => Some(abort_txn(backends, txn, &why)),
             }
@@ -2732,7 +2705,7 @@ const FAMILY_CHANNEL_DEADLINE: std::time::Duration = std::time::Duration::from_s
 /// `-COPROCUNAVAIL`, kept distinct from the unknown-command error a non-family
 /// command earns from the master (reading one as the other is how an outage is
 /// misdiagnosed, D3).
-fn family_command(topo: &Topology, ns: &[u8], args: &[Vec<u8>]) -> Value {
+async fn family_command(topo: &Arc<Topology>, ns: &[u8], args: &[Vec<u8>]) -> Value {
     let unavail = || {
         Value::Error("COPROCUNAVAIL no co-processor is available for this command family".into())
     };
@@ -2824,7 +2797,10 @@ enum Prefetch {
     /// The near-cache already answered it.
     Cached(Value),
     /// Staged on a pooled connection to this address, awaiting collection.
-    InFlight(pool::Ticket, String),
+    InFlight(
+        tokio::sync::oneshot::Receiver<std::io::Result<Value>>,
+        String,
+    ),
 }
 
 /// Most commands one prefetch pass will stage before falling back to the
@@ -2909,8 +2885,8 @@ fn prefetchable(args: &[Vec<u8>], name: &[u8], replica_reads: bool) -> bool {
 /// homogeneous runs, so a prefix captures essentially all of the win for a
 /// fraction of the reasoning.
 #[allow(clippy::too_many_arguments)]
-fn prefetch_run(
-    topo: &Topology,
+async fn prefetch_run(
+    topo: &Arc<Topology>,
     backends: &mut Option<Backends>,
     cmds: &[(Vec<Vec<u8>>, Vec<u8>)],
     ns: &[u8],
@@ -2933,7 +2909,7 @@ fn prefetch_run(
     // and scatter this run across every connection in the lane — which is
     // exactly what happened when the lane widened to 8, and it cost the
     // batching the pass exists to create.
-    let mut leases: HashMap<String, pool::PoolLease> = HashMap::new();
+    let mut leases: HashMap<String, Rc<apool::AsyncConn>> = HashMap::new();
     for (i, (args, raw)) in cmds.iter().enumerate() {
         if i >= MAX_PREFETCH {
             break;
@@ -2971,12 +2947,11 @@ fn prefetch_run(
                 topo.backend_tls.clone(),
                 async_writes,
                 topo.fanout_timeout,
-                topo.pool.clone(),
             )
         });
         let lease = match leases.get(&addr) {
             Some(l) => l,
-            None => match b.lease(&addr) {
+            None => match b.lease(&addr).await {
                 // Dial failed: leave it to `forward`, which dials and retries
                 // with the full failover budget.
                 Err(_) => break,
@@ -2994,22 +2969,22 @@ fn prefetch_run(
             Err(_) => break,
         }
     }
-    // One flush per ticket. Flushing a connection whose frames another ticket
-    // already carried writes nothing, so this is N cheap calls rather than N
-    // syscalls — and it needs no bookkeeping about which lanes were touched.
+    // ONE flush per connection, not per command: that is the batch. The whole
+    // run was staged onto as few connections as it has target addresses, so a
+    // 16-command pipeline to one node is one write syscall.
+    //
     // A failed flush kills the connection, whose reader then fails every
     // waiter on it, so the error surfaces at collection rather than here.
-    for p in plan.iter().take(staged) {
-        if let Prefetch::InFlight(t, _) = p {
-            let _ = t.flush();
-        }
+    let _ = staged;
+    for conn in leases.values() {
+        let _ = conn.flush().await;
     }
     plan
 }
 
 #[allow(clippy::too_many_arguments)]
-fn data_command(
-    topo: &Topology,
+async fn data_command(
+    topo: &Arc<Topology>,
     backends: &mut Option<Backends>,
     txn: &mut ProxyTxn,
     ns: &[u8],
@@ -3041,10 +3016,9 @@ fn data_command(
                 topo.backend_tls.clone(),
                 async_writes,
                 topo.fanout_timeout,
-                topo.pool.clone(),
             )
         });
-        let reply = forward_collect(topo, b, ns, args, raw, ticket, addr);
+        let reply = forward_collect(topo, b, ns, args, raw, ticket, addr).await;
         cache_writeback(topo, ns, args, &reply, local_cache, cacheable);
         return reply;
     }
@@ -3080,7 +3054,7 @@ fn data_command(
                 "ERR family commands are not available on a co-processor channel".into(),
             );
         }
-        return family_command(topo, ns, args);
+        return family_command(topo, ns, args).await;
     }
     // M5 quota gate: a shed command must not touch the cache, a backend, or
     // the bucket-bypassing fast paths. Only data commands are charged
@@ -3111,10 +3085,9 @@ fn data_command(
                 topo.backend_tls.clone(),
                 async_writes,
                 topo.fanout_timeout,
-                topo.pool.clone(),
             )
         });
-        if let Some(reply) = transaction_step(topo, b, txn, ns, args, raw) {
+        if let Some(reply) = transaction_step(topo, b, txn, ns, args, raw).await {
             return reply;
         }
     }
@@ -3141,10 +3114,9 @@ fn data_command(
             topo.backend_tls.clone(),
             async_writes,
             topo.fanout_timeout,
-            topo.pool.clone(),
         )
     });
-    let reply = handle(topo, b, ns, args, raw, read_replica);
+    let reply = handle(topo, b, ns, args, raw, read_replica).await;
     cache_writeback(topo, ns, args, &reply, local_cache, cacheable);
     reply
 }
@@ -3157,7 +3129,7 @@ fn data_command(
 /// proxy serving its own stale value, breaking read-your-own-writes for the
 /// client that issued it.
 fn cache_writeback(
-    topo: &Topology,
+    topo: &Arc<Topology>,
     ns: &[u8],
     args: &[Vec<u8>],
     reply: &Value,
@@ -3248,7 +3220,12 @@ fn pscan_cursors() -> &'static Mutex<HashMap<u64, ProxyScanCursor>> {
 /// is rewritten per hop. Failover mid-scan invalidates the session (the
 /// dead master held its cursor state): the client gets "ERR invalid
 /// cursor" and restarts — Redis's weak scan guarantee, stated honestly.
-fn scan_forward(topo: &Topology, backends: &mut Backends, ns: &[u8], args: &[Vec<u8>]) -> Value {
+async fn scan_forward(
+    topo: &Arc<Topology>,
+    backends: &mut Backends,
+    ns: &[u8],
+    args: &[Vec<u8>],
+) -> Value {
     if args.len() < 2 {
         return Value::Error("ERR wrong number of arguments for 'scan' command".into());
     }
@@ -3301,7 +3278,7 @@ fn scan_forward(topo: &Topology, backends: &mut Backends, ns: &[u8], args: &[Vec
     // O(keys) class: a SCAN step is bounded by COUNT in ROWS RETURNED, not in
     // rows EXAMINED — a cursor walking a mostly-expired or heavily-filtered
     // region does arbitrary work for one page. Same budget as DBSIZE.
-    let reply = match backends.call_slow(&master, &out) {
+    let reply = match backends.call_slow(&master, &out).await {
         Ok(v) => v,
         Err(e) => return Value::Error(format!("ERR scan forward to {master}: {e}")),
     };
@@ -3371,8 +3348,8 @@ fn scan_forward(topo: &Topology, backends: &mut Backends, ns: &[u8], args: &[Vec
     ]))
 }
 
-fn handle(
-    topo: &Topology,
+async fn handle(
+    topo: &Arc<Topology>,
     backends: &mut Backends,
     ns: &[u8],
     args: &[Vec<u8>],
@@ -3401,27 +3378,33 @@ fn handle(
         // Keyspace iteration: one client cursor stream over every pair's
         // master, in pair order. Never the replica-read path (a node's
         // cursor state lives on the node that minted it).
-        b"SCAN" => scan_forward(topo, backends, ns, args),
+        b"SCAN" => scan_forward(topo, backends, ns, args).await,
         // Group-wide aggregates fan out.
-        b"DBSIZE" => fan_out(topo, backends, raw, |replies| {
-            let mut total = 0i64;
-            for r in replies {
-                match r {
-                    Value::Integer(n) => total += n,
-                    other => return Value::Error(format!("ERR dbsize fan-out: {other:?}")),
+        b"DBSIZE" => {
+            fan_out(topo, backends, raw, |replies| {
+                let mut total = 0i64;
+                for r in replies {
+                    match r {
+                        Value::Integer(n) => total += n,
+                        other => return Value::Error(format!("ERR dbsize fan-out: {other:?}")),
+                    }
                 }
-            }
-            Value::Integer(total)
-        }),
-        b"FLUSHALL" => fan_out(topo, backends, raw, |replies| {
-            for r in replies {
-                if !matches!(&r, Value::Simple(s) if s == "OK") {
-                    return Value::Error(format!("ERR flushall fan-out: {r:?}"));
+                Value::Integer(total)
+            })
+            .await
+        }
+        b"FLUSHALL" => {
+            fan_out(topo, backends, raw, |replies| {
+                for r in replies {
+                    if !matches!(&r, Value::Simple(s) if s == "OK") {
+                        return Value::Error(format!("ERR flushall fan-out: {r:?}"));
+                    }
                 }
-            }
-            Value::Simple("OK".into())
-        }),
-        _ => forward(topo, backends, ns, args, raw, read_replica),
+                Value::Simple("OK".into())
+            })
+            .await
+        }
+        _ => forward(topo, backends, ns, args, raw, read_replica).await,
     }
 }
 
@@ -3449,7 +3432,7 @@ fn log_ms() -> u64 {
 fn watch_control_plane(
     cp: &str,
     advertise: &str,
-    topo: &Topology,
+    topo: &Arc<Topology>,
     last_version: &mut u64,
 ) -> std::io::Result<()> {
     // Same internal-mesh client credentials as the backend hop: the control
@@ -3693,12 +3676,8 @@ fn main() -> std::io::Result<()> {
     // lane buys isolation from head-of-line blocking at the cost of more
     // sockets. Default deliberately small — the point of ADR-0020 is to STOP
     // opening a connection per client.
-    let lane_width: usize = arg("--backend-pool")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(pool::DEFAULT_LANE_WIDTH);
     let topo = Arc::new(Topology {
         rediscover_gate: Mutex::new(HashMap::new()),
-        pool: pool::BackendPool::new(backend_tls.clone(), lane_width),
         clusters: vec![ClusterView {
             routing: RwLock::new(Routing {
                 pairs,
@@ -3833,15 +3812,107 @@ fn main() -> std::io::Result<()> {
     // --bind: the listener address. Loopback by default; 0.0.0.0 for a
     // front door serving external clients (the marketplace single-VM shape).
     let bind = arg("--bind").unwrap_or_else(|| "127.0.0.1".into());
-    let listener = TcpListener::bind((bind.as_str(), port))?;
+    let listener = std::net::TcpListener::bind((bind.as_str(), port))?;
+
+    // ONE runtime per worker, each single-threaded, connections pinned to the
+    // worker that accepted them (ADR-0021).
+    //
+    // Deliberately NOT one multi-threaded runtime. Tokio's work-stealing
+    // scheduler may move a task between threads at any await, and `apool`'s
+    // connections are `Rc`/`RefCell` owned by exactly one thread — the whole
+    // reason they need no locks. A shared runtime would either not compile
+    // (futures must be Send) or, with locks bolted back on, reproduce the
+    // convoy this change exists to remove. Few owners is the property; a
+    // single-threaded runtime per worker is how it is obtained.
+    // One runtime per worker. Defaults to what this process may actually use —
+    // `available_parallelism` honours the CPU affinity mask and cgroup quotas,
+    // so a container limited to 2 CPUs on a 64-core host gets 2, which matters
+    // because worker count also sets backend connection and mTLS session
+    // count. Overridable so a deployment can pin a shape: the single-VM
+    // packaging co-locates the proxy with both nodes and wants fewer, and the
+    // chain-walk chaos gate runs 16 deliberately to maximise the number of
+    // independent FIFO streams a mis-correlated reply could cross.
+    //
+    // The fallback, for when the query fails outright, is deliberately HIGH.
+    // Measured on an 8-core box, 32 conns, pipeline 16: 1 worker 325k ops/s,
+    // 4 (the peak here) 540k, 32 workers 443k. Under-provisioning by 4x costs
+    // 40%; over-provisioning by 8x costs 18%. The curve is asymmetric, so when
+    // we cannot detect, guessing high is the cheaper error.
+    let workers = arg("--workers")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(16)
+        })
+        .clamp(1, 64);
     eprintln!(
-        "flint-proxy listening on {bind}:{port} ({}, max-conns {max_conns})",
+        "flint-proxy listening on {bind}:{port} ({}, max-conns {max_conns}, {workers} workers)",
         if tls.is_some() { "TLS" } else { "plaintext" }
     );
+
+    let mut inboxes = Vec::with_capacity(workers);
+    for w in 0..workers {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<std::net::TcpStream>();
+        inboxes.push(tx);
+        let topo = Arc::clone(&topo);
+        let tls = tls.clone();
+        std::thread::Builder::new()
+            .name(format!("flint-proxy-w{w}"))
+            .spawn(move || {
+                let rt = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        eprintln!("worker {w}: runtime: {e}");
+                        return;
+                    }
+                };
+                let local = tokio::task::LocalSet::new();
+                local.block_on(&rt, async move {
+                    while let Some(sock) = rx.recv().await {
+                        let topo = Arc::clone(&topo);
+                        let tls = tls.clone();
+                        // The guard decrements the active count on ANY exit,
+                        // including a panic inside the connection task.
+                        let guard = ConnGuard(Arc::clone(&topo));
+                        if sock.set_nonblocking(true).is_err() {
+                            continue;
+                        }
+                        let Ok(sock) = tokio::net::TcpStream::from_std(sock) else {
+                            continue;
+                        };
+                        let _ = sock.set_nodelay(true);
+                        tokio::task::spawn_local(async move {
+                            let _guard = guard;
+                            // The edge config is snapshotted per connection, so
+                            // a rotated cert applies to the next accept with no
+                            // restart. A plaintext client hitting the TLS port
+                            // fails the handshake and drops: no RESP is ever
+                            // processed.
+                            let cfg = tls.as_ref().and_then(|r| r.current());
+                            match flint_tls::aio::accept(sock, &cfg).await {
+                                Ok(s) => {
+                                    let _ = serve_client(s, topo).await;
+                                }
+                                Err(e) => eprintln!("tls: connection setup failed: {e}"),
+                            }
+                        });
+                    }
+                });
+            })?;
+    }
+
+    // The acceptor stays a plain blocking thread: it does one syscall per
+    // connection and holds no per-connection state, so it needs none of the
+    // machinery above.
+    let mut next = 0usize;
     for stream in listener.incoming() {
         let Ok(mut stream) = stream else { continue };
         // Admission control: reserve a slot with fetch_add, roll back and shed
-        // if it put us over the cap (no worker thread is spawned for a shed).
+        // if it put us over the cap (nothing is dispatched for a shed).
         topo.stat_conns_total.fetch_add(1, Ordering::Relaxed);
         if topo.stat_active.fetch_add(1, Ordering::Relaxed) >= max_conns {
             topo.stat_active.fetch_sub(1, Ordering::Relaxed);
@@ -3851,37 +3922,21 @@ fn main() -> std::io::Result<()> {
             // the guard) and just close — the client sees a reset and backs
             // off, the same contract.
             if tls.is_none() {
+                use std::io::Write as _;
                 let _ = stream.write_all(SHED_FRAME);
             }
             continue;
         }
-        let topo = Arc::clone(&topo);
-        let tls = tls.clone();
-        let guard = ConnGuard(Arc::clone(&topo));
-        std::thread::spawn(move || {
-            let _guard = guard; // decrements on any exit, including panic
-            match tls.as_ref().and_then(|r| r.current()) {
-                Some(cfg) => {
-                    // The handshake runs lazily on the first read/write inside
-                    // serve_client (the client sends the first command). A
-                    // plaintext client hitting the TLS port fails the handshake
-                    // and the connection drops — no RESP is ever processed.
-                    // The config is snapshotted per connection, so a rotated
-                    // edge cert applies to the next accept with no restart.
-                    let conn = match rustls::ServerConnection::new(cfg) {
-                        Ok(c) => c,
-                        Err(e) => {
-                            eprintln!("tls: connection setup failed: {e}");
-                            return;
-                        }
-                    };
-                    let _ = serve_client(rustls::StreamOwned::new(conn, stream), topo);
-                }
-                None => {
-                    let _ = serve_client(stream, topo);
-                }
-            }
-        });
+        // Round-robin. A connection belongs to its worker for life, which is
+        // what makes that worker's backend connections un-shared — and what
+        // keeps a connection's failures inside one worker.
+        let i = next % inboxes.len();
+        next = next.wrapping_add(1);
+        if inboxes[i].send(stream).is_err() {
+            // Only reachable if that worker's runtime is gone. Roll the
+            // admission slot back rather than leaking it.
+            topo.stat_active.fetch_sub(1, Ordering::Relaxed);
+        }
     }
     Ok(())
 }
@@ -4009,7 +4064,6 @@ mod route_tests {
             cache: cache::ProxyCache::new(0, 0),
             open_mode: true,
             backend_tls: None,
-            pool: pool::BackendPool::new(None, 1),
             fanout_timeout: FANOUT_TIMEOUT_DEFAULT,
             cert_path: None,
             admin_digests: RwLock::new(Vec::new()),
@@ -4199,7 +4253,15 @@ mod route_tests {
     /// still routes to the family path.
     #[test]
     fn a_channel_cannot_issue_a_family_command() {
-        let t = two_pair_topo();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("rt");
+        tokio::task::LocalSet::new().block_on(&rt, a_channel_cannot_issue_a_family_command_inner());
+    }
+
+    async fn a_channel_cannot_issue_a_family_command_inner() {
+        let t = Arc::new(two_pair_topo());
         t.families
             .write()
             .expect("families lock")
@@ -4221,7 +4283,8 @@ mod route_tests {
             false,
             true,
             Prefetch::None,
-        );
+        )
+        .await;
         match on_channel {
             Value::Error(e) => assert!(
                 e.contains("not available on a co-processor channel"),
@@ -4250,7 +4313,8 @@ mod route_tests {
             false,
             false,
             Prefetch::None,
-        );
+        )
+        .await;
         match on_client {
             Value::Error(e) => assert!(
                 e.contains("COPROCUNAVAIL"),
