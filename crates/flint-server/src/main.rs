@@ -3542,6 +3542,31 @@ fn flintsync(
             }
         }
     }
+    // ADMISSION: can this WAL still REACH the cursor? Until now the checks
+    // above were the only ones, and they only run when the caller's epoch is
+    // BELOW ours — the promotion-fence case. A replica at the SAME epoch whose
+    // cursor had simply aged out of the retained WAL was answered
+    // `FLINTSYNC-OK` and only found out inside the streaming loop.
+    //
+    // Mid-stream is soon enough for a tailer, which escalates either way. It
+    // is NOT soon enough for `probe_resume`, which reads exactly this first
+    // reply to decide whether a marked copy can be continued: it took the OK
+    // as a promise, cleared NEEDS_RESEED, warm-rejoined, hit the gap, exited 3
+    // and re-marked — on every restart, forever. That is the loop #106 exists
+    // to prevent, reintroduced from the other side by #187's warm-rejoin
+    // probe, and `reseed_drill` reported it as "replica did not come back".
+    //
+    // The check is the SAME call the stream makes, with a 1-byte budget, so
+    // there is one implementation of "can this cursor be served" rather than a
+    // cheaper proxy for it that can disagree. A caught-up replica costs
+    // nothing (the call returns early when there is nothing past the cursor);
+    // a reconnecting one materialises one batch that the loop below fetches
+    // again. `-WALGAP` is the shape the tailer already escalates on.
+    if let Err(ReplError::WalGap(why)) = kv.updates_since_budgeted(cursor, 1) {
+        let mut out = Vec::new();
+        encode(&Value::Error(format!("WALGAP {why}")), &mut out);
+        return stream.write_all(&out);
+    }
     let mut out = Vec::new();
     // The OK carries this node's role epoch so an accepted lower-epoch
     // replica can ADOPT it durably: its next reconnect then presents the
