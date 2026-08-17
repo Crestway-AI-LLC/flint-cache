@@ -12,7 +12,10 @@ flint-build = { path = "../flint-build" }
 flint-resp = { path = "../flint-resp" }
 flint-slot = { path = "../flint-slot" }
 flint-commands = { path = "../flint-commands" }
-flint-tls = { path = "../flint-tls" }
+flint-tls = { path = "../flint-tls", features = ["aio"] }
+# ADR-0021: bounded worker threads doing non-blocking IO. Same runtime and
+# tokio-rustls major flint-controlplane already runs.
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "sync", "macros"] }
 # Client-facing TLS termination. `ring` provider = pure-Rust build (no C
 # toolchain); pinned explicitly, not via the process-default provider.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }

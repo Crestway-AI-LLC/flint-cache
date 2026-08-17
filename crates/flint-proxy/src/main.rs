@@ -46,6 +46,7 @@
 //! Usage: flint-proxy --port 7379 --pairs "m0,r0;m1,r1;..."
 //!                    [--tenants "tokenA=nsA,tokenB=nsB"]
 
+mod apool;
 mod cache;
 mod errors;
 mod latency;

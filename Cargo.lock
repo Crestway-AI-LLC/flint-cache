@@ -618,6 +618,7 @@ dependencies = [
  "flint-slot",
  "flint-tls",
  "rustls",
+ "tokio",
 ]
 
 [[package]]
