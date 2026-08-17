@@ -41,6 +41,7 @@
 mod cache;
 mod errors;
 mod latency;
+mod pool;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -58,7 +59,7 @@ const RETRY_BUDGET: Duration = Duration::from_secs(5);
 /// Backend I/O timeout for KEYED traffic. Generous: a frozen-slot drain or a
 /// slow disk read must not be misread as a dead node. Deliberately short all
 /// the same — a client waiting on GET wants to fail over, not to wait.
-const BACKEND_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const BACKEND_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Backend read budget for the O(KEYS) ADMIN class — `DBSIZE`, `FLUSHALL`,
 /// `SCAN`'s per-master step. These are not keyed traffic and must not be
@@ -417,6 +418,10 @@ struct Topology {
     /// current config. `None` = plaintext backends (default). Set by
     /// `--internal-*`; the same triple the servers use, in the client role.
     backend_tls: Option<Arc<flint_tls::ReloadableClientConfig>>,
+    /// Shared multiplexed backend connections (ADR-0020). Process-wide, so
+    /// every client connection's ordinary traffic converges on the same few
+    /// sockets per (node, namespace) instead of opening its own.
+    pool: Arc<pool::BackendPool>,
     /// Read budget for the O(keys) admin class (`--fanout-timeout-ms`); see
     /// FANOUT_TIMEOUT_DEFAULT and Backends::call_slow.
     fanout_timeout: Duration,
@@ -1034,13 +1039,17 @@ impl Topology {
     }
 }
 
-/// One RESP request/response exchange on a raw connection.
-fn call_raw(
+/// Read exactly ONE reply off a backend connection, topping up `buf` from the
+/// socket until a frame completes.
+///
+/// Split out of `call_raw` so the dispatcher pool (ADR-0020) can read N replies
+/// in a row from one connection without a second implementation of the decode
+/// loop. Leaves any bytes beyond this reply in `buf` — which is what makes
+/// reading N in order work at all.
+pub(crate) fn read_reply(
     stream: &mut flint_tls::Stream,
     buf: &mut Vec<u8>,
-    frame: &[u8],
 ) -> std::io::Result<Value> {
-    stream.write_all(frame)?;
     let mut chunk = [0u8; 64 * 1024];
     loop {
         match decode(buf) {
@@ -1066,6 +1075,80 @@ fn call_raw(
             }
         }
     }
+}
+
+/// One RESP request/response exchange on a raw connection.
+fn call_raw(
+    stream: &mut flint_tls::Stream,
+    buf: &mut Vec<u8>,
+    frame: &[u8],
+) -> std::io::Result<Value> {
+    stream.write_all(frame)?;
+    read_reply(stream, buf)
+}
+
+/// Dial one backend and bring it to a usable state: TLS, RESP3, namespace pin.
+///
+/// ONE dial implementation, shared by the per-client connections (transactions,
+/// co-processor channels, the O(keys) admin class) and by the shared dispatcher
+/// pool. Two dial paths would drift, and this handshake is where the tenant
+/// namespace boundary is enforced — the wrong place to keep a near-copy.
+///
+/// Speaks RESP3 to the backend ALWAYS, whatever the client negotiated: a RESP2
+/// reply is ambiguous (a flat array could be a hash, a list, or member/score
+/// pairs) and once flattened the proxy cannot put the types back. RESP3 keeps
+/// them (`%`, `~`, `,`), so the proxy decodes a reply that still knows what it
+/// means and re-renders it for whichever dialect the client asked for.
+pub(crate) fn dial_backend(
+    addr: &str,
+    ns: &[u8],
+    async_writes: bool,
+    tls: &Option<Arc<flint_tls::ReloadableClientConfig>>,
+) -> std::io::Result<flint_tls::Stream> {
+    let mut stream = flint_tls::connect_reloadable(addr, tls)?;
+    stream.set_read_timeout(Some(BACKEND_TIMEOUT))?;
+    stream.set_write_timeout(Some(BACKEND_TIMEOUT))?;
+    let mut hello = Vec::new();
+    encode(
+        &Value::Array(Some(vec![
+            Value::Bulk(Some(b"HELLO".to_vec())),
+            Value::Bulk(Some(b"3".to_vec())),
+        ])),
+        &mut hello,
+    );
+    let mut hello_buf = Vec::new();
+    match call_raw(&mut stream, &mut hello_buf, &hello)? {
+        Value::Map(_) => {}
+        other => {
+            return Err(std::io::Error::other(format!(
+                "backend refused RESP3: {other:?}"
+            )));
+        }
+    }
+    // Pin the connection to the tenant namespace before any data command can
+    // travel on it; the 'a' arg opts this connection's batchable writes into
+    // the node's async write queue (D4). A pooled connection is therefore only
+    // ever reusable for the SAME (namespace, async-writes) pair — that is why
+    // both are part of the pool key.
+    let mut hs_args = vec![
+        Value::Bulk(Some(b"FLINTNS".to_vec())),
+        Value::Bulk(Some(ns.to_vec())),
+    ];
+    if async_writes {
+        hs_args.push(Value::Bulk(Some(b"a".to_vec())));
+    }
+    let mut hs = Vec::new();
+    encode(&Value::Array(Some(hs_args)), &mut hs);
+    let mut hs_buf = Vec::new();
+    match call_raw(&mut stream, &mut hs_buf, &hs)? {
+        Value::Simple(_) => {}
+        other => {
+            return Err(std::io::Error::other(format!(
+                "namespace handshake rejected: {other:?}"
+            )));
+        }
+    }
+    Ok(stream)
 }
 
 /// Probe a pair's nodes for the current master (FLINTINFO role) — the same
@@ -1111,6 +1194,10 @@ struct Backends {
     async_writes: bool,
     /// Read budget for the O(keys) admin class only (see call_slow).
     fanout_timeout: Duration,
+    /// Shared, multiplexed connections for ordinary keyed traffic (ADR-0020).
+    /// The `conns` map above is no longer the common path — it now serves only
+    /// the cases that genuinely need a connection to themselves.
+    pool: Arc<pool::BackendPool>,
 }
 
 impl Backends {
@@ -1119,6 +1206,7 @@ impl Backends {
         tls: Option<Arc<flint_tls::ReloadableClientConfig>>,
         async_writes: bool,
         fanout_timeout: Duration,
+        pool: Arc<pool::BackendPool>,
     ) -> Self {
         Self {
             conns: HashMap::new(),
@@ -1126,6 +1214,7 @@ impl Backends {
             tls,
             async_writes,
             fanout_timeout,
+            pool,
         }
     }
 
@@ -1141,72 +1230,44 @@ impl Backends {
     /// longer budget (see `call_slow`).
     fn ensure_conn(&mut self, addr: &str) -> std::io::Result<()> {
         if !self.conns.contains_key(addr) {
-            let mut stream = flint_tls::connect_reloadable(addr, &self.tls)?;
-            stream.set_read_timeout(Some(BACKEND_TIMEOUT))?;
-            stream.set_write_timeout(Some(BACKEND_TIMEOUT))?;
-            // Speak RESP3 to the backend ALWAYS, whatever this proxy's
-            // clients negotiated.
+            // ONE dial implementation, shared with the dispatcher pool — see
+            // `dial_backend`. These per-client connections are no longer the
+            // common path (ADR-0020 moved ordinary keyed traffic onto shared
+            // dispatchers); what is left here is the traffic that genuinely
+            // needs a socket to itself:
             //
-            // The reason is that a RESP2 reply is ambiguous: a flat array
-            // could be a hash, a list, or member/score pairs, and once the
-            // types are flattened the proxy cannot put them back. RESP3
-            // keeps them (`%`, `~`, `,`), so the proxy decodes a reply that
-            // still knows what it means and re-renders it for whichever
-            // dialect the client asked for.
-            //
-            // (This used to add "and connections are shared across clients
-            // anyway", which is FALSE and worth correcting rather than
-            // deleting: `Backends` lives inside `serve_client`, which is
-            // spawned per accepted connection, so the pool is per CLIENT —
-            // one connection per backend address, for that client alone.
-            // Believing otherwise would rule out transactions entirely,
-            // since two tenants' MULTIs would interleave on one socket. The
-            // RESP3 argument above stands on its own.)
-            let mut hello = Vec::new();
-            encode(
-                &Value::Array(Some(vec![
-                    Value::Bulk(Some(b"HELLO".to_vec())),
-                    Value::Bulk(Some(b"3".to_vec())),
-                ])),
-                &mut hello,
-            );
-            let mut hello_buf = Vec::new();
-            match call_raw(&mut stream, &mut hello_buf, &hello)? {
-                Value::Map(_) => {}
-                other => {
-                    return Err(std::io::Error::other(format!(
-                        "backend refused RESP3: {other:?}"
-                    )));
-                }
-            }
-            // Pin the connection to the tenant namespace before any data
-            // command can travel on it; the 'a' arg opts this connection's
-            // batchable writes into the node's async write queue (D4).
-            let mut hs_args = vec![
-                Value::Bulk(Some(b"FLINTNS".to_vec())),
-                Value::Bulk(Some(self.ns.clone())),
-            ];
-            if self.async_writes {
-                hs_args.push(Value::Bulk(Some(b"a".to_vec())));
-            }
-            let mut hs = Vec::new();
-            encode(&Value::Array(Some(hs_args)), &mut hs);
-            let mut hs_buf = Vec::new();
-            match call_raw(&mut stream, &mut hs_buf, &hs)? {
-                Value::Simple(_) => {}
-                other => {
-                    return Err(std::io::Error::other(format!(
-                        "namespace handshake rejected: {other:?}"
-                    )));
-                }
-            }
+            //   - TRANSACTIONS. A node keeps MULTI's queue and WATCH's watches
+            //     per CONNECTION, so a queued command that landed on a shared
+            //     connection would EXECUTE instead of queueing and the client
+            //     would see QUEUED followed by a partial apply. This is the
+            //     case the old per-client design was defending, and it is
+            //     still right — it just does not need every GET to pay for it.
+            //   - The O(keys) admin class (`call_slow`), whose 60 s budget
+            //     would head-of-line block every ordinary read sharing its
+            //     connection.
+            let stream = dial_backend(addr, &self.ns, self.async_writes, &self.tls)?;
             self.conns.insert(addr.to_string(), (stream, Vec::new()));
         }
         Ok(())
     }
 
-    /// Keyed traffic: BACKEND_TIMEOUT, set once at dial.
+    /// Keyed traffic: through the SHARED dispatcher pool (ADR-0020).
+    ///
+    /// This is the ordinary path — every routed read and write. Many client
+    /// threads land on few connections, so whatever they have queued at the
+    /// same instant is written as one batch and the internal hop is paid once
+    /// for the group instead of once per command.
     fn call(&mut self, addr: &str, frame: &[u8]) -> std::io::Result<Value> {
+        self.pool.call(addr, &self.ns, self.async_writes, frame)
+    }
+
+    /// Keyed traffic on a connection belonging to THIS client alone.
+    ///
+    /// For the cases where a shared connection would be wrong rather than
+    /// merely slower — a transaction's queue and watches are state on one node
+    /// connection, so the command must travel on the connection that owns
+    /// them. See `ensure_conn` for the full list.
+    fn call_private(&mut self, addr: &str, frame: &[u8]) -> std::io::Result<Value> {
         self.ensure_conn(addr)?;
         let Some((stream, buf)) = self.conns.get_mut(addr) else {
             return Err(std::io::Error::other("conn cache"));
@@ -1664,12 +1725,31 @@ fn auth_step(
         let quota_throttled = topo.stat_quota_throttled_total.load(Ordering::Relaxed);
         let moved_learned = topo.stat_moved_learned.load(Ordering::Relaxed);
         let quota_write_shed = topo.stat_quota_write_shed_total.load(Ordering::Relaxed);
+        // ADR-0020 pool counters. `pool_batch_mean` is the load-bearing one:
+        // it says whether multiplexing is actually coalescing anything. The
+        // reverted in-buffer batcher (1decd25) shipped no such number, so its
+        // null result could not be explained without re-reading the source —
+        // which is why the ADR made instrumentation an acceptance gate rather
+        // than a follow-up.
+        let ps = &topo.pool.stats;
+        let pool_batches = ps.batches.load(Ordering::Relaxed);
+        let pool_commands = ps.commands.load(Ordering::Relaxed);
+        let pool_batch_mean = if pool_batches == 0 {
+            0.0
+        } else {
+            pool_commands as f64 / pool_batches as f64
+        };
+        let pool_wait_mean_us = ps
+            .queue_wait_us
+            .load(Ordering::Relaxed)
+            .checked_div(pool_commands)
+            .unwrap_or(0);
         // build: FIRST (ADR-0014 D1). The edge is rolled by `flintctl
         // upgrade` like everything else, and until now carried no stamp at
         // all — so a half-completed edge roll looked exactly like a
         // finished one.
         let info = format!(
-            "build:{build}\r\nactive:{}\r\nconns_total:{}\r\nshed_total:{}\r\nauth_ok_total:{}\r\nauth_fail_total:{}\r\ncommands_total:{}\r\ncommands_read_total:{}\r\ncommands_write_total:{}\r\nhotkey_sample_rate:{}\r\ncache_ttl_ms:{cache_ttl}\r\ncache_max_bytes:{cache_max}\r\ncache_hits_total:{cache_hits}\r\ncache_misses_total:{cache_misses}\r\ncache_entries:{cache_entries}\r\ncache_bytes:{cache_bytes}\r\nmoved_learned_total:{moved_learned}\r\nquota_throttled_total:{quota_throttled}\r\nquota_write_shed_total:{quota_write_shed}\r\ncert_days_remaining:{cdr}\r\n",
+            "build:{build}\r\nactive:{}\r\nconns_total:{}\r\nshed_total:{}\r\nauth_ok_total:{}\r\nauth_fail_total:{}\r\ncommands_total:{}\r\ncommands_read_total:{}\r\ncommands_write_total:{}\r\nhotkey_sample_rate:{}\r\ncache_ttl_ms:{cache_ttl}\r\ncache_max_bytes:{cache_max}\r\ncache_hits_total:{cache_hits}\r\ncache_misses_total:{cache_misses}\r\ncache_entries:{cache_entries}\r\ncache_bytes:{cache_bytes}\r\nmoved_learned_total:{moved_learned}\r\nquota_throttled_total:{quota_throttled}\r\nquota_write_shed_total:{quota_write_shed}\r\npool_lanes:{pool_lanes}\r\npool_batches_total:{pool_batches}\r\npool_commands_total:{pool_commands}\r\npool_batch_mean:{pool_batch_mean:.2}\r\npool_batch_max:{pool_batch_max}\r\npool_queue_wait_mean_us:{pool_wait_mean_us}\r\npool_dial_failures_total:{pool_dials}\r\ncert_days_remaining:{cdr}\r\n",
             topo.stat_active.load(Ordering::Relaxed),
             load(&topo.stat_conns_total),
             load(&topo.stat_shed_total),
@@ -1682,6 +1762,9 @@ fn auth_step(
             // already scaled back up by this, so it IS the estimated ops/s.
             // Exposed for transparency about the estimate's granularity.
             HOTKEY_SAMPLE_RATE,
+            pool_lanes = ps.lanes.load(Ordering::Relaxed),
+            pool_batch_max = ps.batch_max.load(Ordering::Relaxed),
+            pool_dials = ps.dial_failures.load(Ordering::Relaxed),
             build = build_version(),
             cdr = topo
                 .cert_path
@@ -2238,8 +2321,13 @@ fn abort_txn(backends: &mut Backends, txn: &mut ProxyTxn, why: &str) -> Value {
 }
 
 /// Send one frame to a pinned backend with NO retry and no rerouting.
+///
+/// Deliberately `call_private`: a transaction lives on ONE node connection, so
+/// it must never ride the shared pool. Routing it through `call` would hand the
+/// queued command to whichever pooled connection was free, where the node —
+/// having no MULTI open on it — would execute it immediately.
 fn call_pinned(backends: &mut Backends, addr: &str, frame: &[u8]) -> Result<Value, String> {
-    match backends.call(addr, frame) {
+    match backends.call_private(addr, frame) {
         Ok(Value::Error(e))
             if e.starts_with("MOVED ")
                 || e.starts_with("TRYAGAIN")
@@ -2644,6 +2732,7 @@ fn data_command(
                 topo.backend_tls.clone(),
                 async_writes,
                 topo.fanout_timeout,
+                topo.pool.clone(),
             )
         });
         if let Some(reply) = transaction_step(topo, b, txn, ns, args, raw) {
@@ -2673,6 +2762,7 @@ fn data_command(
             topo.backend_tls.clone(),
             async_writes,
             topo.fanout_timeout,
+            topo.pool.clone(),
         )
     });
     let reply = handle(topo, b, ns, args, raw, read_replica);
@@ -3200,7 +3290,17 @@ fn main() -> std::io::Result<()> {
         tenants.len(),
         control_plane,
     );
+    // Dispatchers per (node, namespace, async-writes) lane. Tunable because
+    // the right width depends on how slow the slowest command on that node is:
+    // a batch owns its connection for a whole write-then-read cycle, so a wide
+    // lane buys isolation from head-of-line blocking at the cost of more
+    // sockets. Default deliberately small — the point of ADR-0020 is to STOP
+    // opening a connection per client.
+    let lane_width: usize = arg("--backend-pool")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(pool::DEFAULT_LANE_WIDTH);
     let topo = Arc::new(Topology {
+        pool: pool::BackendPool::new(backend_tls.clone(), lane_width),
         clusters: vec![ClusterView {
             routing: RwLock::new(Routing {
                 pairs,
@@ -3429,6 +3529,7 @@ mod route_tests {
             cache: cache::ProxyCache::new(0, 0),
             open_mode: true,
             backend_tls: None,
+            pool: pool::BackendPool::new(None, 1),
             fanout_timeout: FANOUT_TIMEOUT_DEFAULT,
             cert_path: None,
             admin_digests: RwLock::new(Vec::new()),

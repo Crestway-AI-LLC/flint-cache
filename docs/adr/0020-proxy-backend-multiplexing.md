@@ -141,8 +141,14 @@ Concretely:
 - **The O(keys) admin class stays off the shared pool.** `call_slow`
   (`DBSIZE`, `FLUSHALL`, `SCAN`'s per-master step) runs on a 60 s budget; on a
   shared connection it would head-of-line block every ordinary GET behind it.
-- **Co-processor channels** (ADR-0010) carry a per-command deadline and budget
-  and are connection-scoped; they check out a dedicated connection too.
+- **Co-processor channels** (ADR-0010) — **corrected during implementation.**
+  This originally said channels check out a dedicated connection too. They do
+  not, and should not: a channel's deadline and budget are enforced at the
+  PROXY, and the node sees only ordinary `FLINTNS`-pinned data commands, so
+  there is no node-side connection state for a shared socket to break. Pooling
+  them is safe and avoids handing every co-processor session its own
+  connection. The rule the private list is really drawing is "does this leave
+  state on the node's connection?" — transactions do, channels do not.
 - **The async write queue** (D4) pins backend connections with an `'a'`
   handshake flag, so pooling must key on that flag or keep those connections
   separate.
