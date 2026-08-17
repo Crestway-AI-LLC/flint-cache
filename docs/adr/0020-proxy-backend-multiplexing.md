@@ -101,6 +101,36 @@ backend connection**. That is the pool we do not have.
 - Of a 303 µs client-observed GET, ~104 µs is wire and ~170 µs is proxy and
   server framing; the storage engine is ~23–32 µs.
 
+## Amendment (2026-08-17): the first implementation was half-duplex, and was replaced
+
+The first implementation of this decision put a **dispatcher thread** in
+front of each pooled connection: receive a job, drain the queue, write the
+batch, then block reading every reply before writing anything more. Measured
+A/B against its parent it bought +6.7 % throughput and +12 % p50 — and
+nearly doubled p99.9. Reviewing Envoy's Redis client
+(`source/extensions/filters/network/common/redis/client_impl.cc`) showed
+why: Envoy **never stops writing to wait for replies**. `makeRequestInternal`
+appends to `pending_requests_`, encodes into `encoder_buffer_`, and returns;
+`onRespValue` completes the FIFO front as each reply arrives; close drains
+and fails everything pending. The dispatcher's write-then-read cycle put a
+bubble in the pipeline every batch, held arrived replies hostage to the
+slowest command in their batch (the p99.9), and charged two thread handoffs
+plus a frame copy per command.
+
+The second implementation is Envoy's shape adapted to blocking threads, and
+required a real duplex split in `flint-tls` (a `rustls::StreamOwned` cannot
+be cloned): the TLS state machine sits behind a mutex whose holds are
+memory-only, and **all socket IO happens outside that lock** — the reader
+owns a cloned fd, writers drain a shared ciphertext buffer under a separate
+socket-write lock. On the pool side, callers stage-and-flush and park on
+their own FIFO slot; one reader thread per connection completes the front
+continuously. Coalescing is flush-combining — whoever writes carries
+everything staged — rather than Envoy's `buffer_flush_timeout` (3 ms
+default), which against a 0.3 ms p50 would cost more than it recovers.
+Full-duplex operation is a tested property: a withholding backend that
+answers nothing until all N commands arrive deadlocks the dispatcher design
+and passes this one, with `pool_inflight_max == N` asserted.
+
 ## Decision
 
 **Make a backend connection a shared, multiplexed resource: a small pool per
