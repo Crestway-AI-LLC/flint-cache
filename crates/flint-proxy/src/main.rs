@@ -1739,17 +1739,13 @@ fn auth_step(
         } else {
             pool_commands as f64 / pool_batches as f64
         };
-        let pool_wait_mean_us = ps
-            .queue_wait_us
-            .load(Ordering::Relaxed)
-            .checked_div(pool_commands)
-            .unwrap_or(0);
+
         // build: FIRST (ADR-0014 D1). The edge is rolled by `flintctl
         // upgrade` like everything else, and until now carried no stamp at
         // all — so a half-completed edge roll looked exactly like a
         // finished one.
         let info = format!(
-            "build:{build}\r\nactive:{}\r\nconns_total:{}\r\nshed_total:{}\r\nauth_ok_total:{}\r\nauth_fail_total:{}\r\ncommands_total:{}\r\ncommands_read_total:{}\r\ncommands_write_total:{}\r\nhotkey_sample_rate:{}\r\ncache_ttl_ms:{cache_ttl}\r\ncache_max_bytes:{cache_max}\r\ncache_hits_total:{cache_hits}\r\ncache_misses_total:{cache_misses}\r\ncache_entries:{cache_entries}\r\ncache_bytes:{cache_bytes}\r\nmoved_learned_total:{moved_learned}\r\nquota_throttled_total:{quota_throttled}\r\nquota_write_shed_total:{quota_write_shed}\r\npool_lanes:{pool_lanes}\r\npool_batches_total:{pool_batches}\r\npool_commands_total:{pool_commands}\r\npool_batch_mean:{pool_batch_mean:.2}\r\npool_batch_max:{pool_batch_max}\r\npool_queue_wait_mean_us:{pool_wait_mean_us}\r\npool_dial_failures_total:{pool_dials}\r\ncert_days_remaining:{cdr}\r\n",
+            "build:{build}\r\nactive:{}\r\nconns_total:{}\r\nshed_total:{}\r\nauth_ok_total:{}\r\nauth_fail_total:{}\r\ncommands_total:{}\r\ncommands_read_total:{}\r\ncommands_write_total:{}\r\nhotkey_sample_rate:{}\r\ncache_ttl_ms:{cache_ttl}\r\ncache_max_bytes:{cache_max}\r\ncache_hits_total:{cache_hits}\r\ncache_misses_total:{cache_misses}\r\ncache_entries:{cache_entries}\r\ncache_bytes:{cache_bytes}\r\nmoved_learned_total:{moved_learned}\r\nquota_throttled_total:{quota_throttled}\r\nquota_write_shed_total:{quota_write_shed}\r\npool_lanes:{pool_lanes}\r\npool_batches_total:{pool_batches}\r\npool_commands_total:{pool_commands}\r\npool_batch_mean:{pool_batch_mean:.2}\r\npool_inflight_max:{pool_inflight_max}\r\npool_dial_failures_total:{pool_dials}\r\ncert_days_remaining:{cdr}\r\n",
             topo.stat_active.load(Ordering::Relaxed),
             load(&topo.stat_conns_total),
             load(&topo.stat_shed_total),
@@ -1763,7 +1759,7 @@ fn auth_step(
             // Exposed for transparency about the estimate's granularity.
             HOTKEY_SAMPLE_RATE,
             pool_lanes = ps.lanes.load(Ordering::Relaxed),
-            pool_batch_max = ps.batch_max.load(Ordering::Relaxed),
+            pool_inflight_max = ps.inflight_max.load(Ordering::Relaxed),
             pool_dials = ps.dial_failures.load(Ordering::Relaxed),
             build = build_version(),
             cdr = topo

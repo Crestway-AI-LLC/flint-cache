@@ -354,6 +354,225 @@ impl Stream {
             Stream::ClientTls(s) => tls_read(&mut s.conn, &mut s.sock, buf),
         }
     }
+
+    /// Split into independently-usable read and write halves (ADR-0020).
+    ///
+    /// A `rustls::StreamOwned` cannot be split by cloning — reads and writes
+    /// both need `&mut` on the one connection object — which is what forced
+    /// the proxy's first pool into a half-duplex write-batch-then-read-batch
+    /// cycle. The split here takes the other route: the TLS **state machine**
+    /// goes behind a mutex with short, memory-only critical sections, and all
+    /// **socket IO happens outside that lock** (the reader owns a cloned fd
+    /// for reads; writes drain a shared ciphertext buffer under a separate
+    /// socket-write lock). That keeps the two directions genuinely
+    /// independent: a send jammed on a slow peer never stops the reader from
+    /// draining inbound data — the drain_read lesson, made structural.
+    ///
+    /// Client-role streams only. The one caller is the proxy's backend pool;
+    /// a `ServerTls` stream has no business being pooled, and refusing it
+    /// here is clearer than a runtime deadlock later.
+    pub fn into_duplex(self) -> io::Result<(DuplexReader, DuplexWriter)> {
+        match self {
+            Stream::Plain(s) => {
+                let rsock = s.try_clone()?;
+                Ok((
+                    DuplexReader {
+                        sock: rsock,
+                        tls: None,
+                    },
+                    DuplexWriter {
+                        out: Arc::new(std::sync::Mutex::new(Vec::new())),
+                        tls: None,
+                        sock: Arc::new(std::sync::Mutex::new(s)),
+                    },
+                ))
+            }
+            Stream::ClientTls(s) => {
+                let owned = *s;
+                let rsock = owned.sock.try_clone()?;
+                let state = Arc::new(std::sync::Mutex::new(TlsHalf {
+                    conn: owned.conn,
+                    out: Vec::new(),
+                }));
+                Ok((
+                    DuplexReader {
+                        sock: rsock,
+                        tls: Some(state.clone()),
+                    },
+                    DuplexWriter {
+                        out: Arc::new(std::sync::Mutex::new(Vec::new())),
+                        tls: Some(state),
+                        sock: Arc::new(std::sync::Mutex::new(owned.sock)),
+                    },
+                ))
+            }
+            Stream::ServerTls(_) => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "into_duplex is for client-role (dial-side) streams",
+            )),
+        }
+    }
+}
+
+/// The shared TLS state machine behind a split stream: the `rustls`
+/// connection plus the ciphertext it has produced but nobody has flushed.
+/// Every lock hold is memory-only — encrypt, decrypt, buffer — never a
+/// blocking socket call, which is the whole deadlock-freedom argument.
+struct TlsHalf {
+    conn: ClientConnection,
+    out: Vec<u8>,
+}
+
+/// The read half. Owns its socket clone outright, so a blocking (or
+/// timeout-bounded) read never holds any lock another thread wants.
+pub struct DuplexReader {
+    sock: TcpStream,
+    tls: Option<Arc<std::sync::Mutex<TlsHalf>>>,
+}
+
+impl DuplexReader {
+    /// Socket read timeout. The pool's reader thread sets a short poll here
+    /// so it can run liveness checks between reads; `WouldBlock`/`TimedOut`
+    /// surface to the caller as exactly that.
+    pub fn set_read_timeout(&self, d: Option<std::time::Duration>) -> io::Result<()> {
+        self.sock.set_read_timeout(d)
+    }
+
+    fn lock_tls(
+        s: &Arc<std::sync::Mutex<TlsHalf>>,
+    ) -> io::Result<std::sync::MutexGuard<'_, TlsHalf>> {
+        s.lock().map_err(|_| io::Error::other("tls state poisoned"))
+    }
+
+    /// Read decrypted bytes. Plaintext sockets read straight through; TLS
+    /// alternates socket reads (no lock) with state-machine work (lock, but
+    /// memory only).
+    pub fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let Some(state) = self.tls.clone() else {
+            return io::Read::read(&mut self.sock, buf);
+        };
+        let mut chunk = [0u8; 64 * 1024];
+        loop {
+            {
+                let mut st = Self::lock_tls(&state)?;
+                match io::Read::read(&mut st.conn.reader(), buf) {
+                    Ok(n) => return Ok(n),
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            // Socket read OUTSIDE the lock: this is what lets the reader keep
+            // draining while a writer sits blocked in write_all on a jammed
+            // send — the two directions never share a wait.
+            let n = io::Read::read(&mut self.sock, &mut chunk)?;
+            if n == 0 {
+                return Ok(0);
+            }
+            let mut st = Self::lock_tls(&state)?;
+            let mut rd = &chunk[..n];
+            while !rd.is_empty() {
+                let k = st.conn.read_tls(&mut rd)?;
+                st.conn
+                    .process_new_packets()
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                if k == 0 {
+                    break;
+                }
+            }
+            // Post-handshake protocol bytes the peer may prompt (ticket acks,
+            // key-update replies) are ENCRYPTED here but flushed by the next
+            // writer flush — the reader never touches the socket-write path,
+            // so ciphertext ordering has a single owner.
+            while st.conn.wants_write() {
+                let TlsHalf { conn, out } = &mut *st;
+                conn.write_tls(out)?;
+            }
+        }
+    }
+}
+
+/// The write half. `append` is memory-only; `flush` swaps the accumulated
+/// bytes out under the socket-write lock and writes them in one call.
+///
+/// Sharing model (why this is `Clone` and every method takes `&self`): many
+/// client threads append concurrently and each then calls `flush`. Whoever
+/// holds the socket lock writes EVERYTHING accumulated so far — so under
+/// contention one syscall carries several threads' frames, and under no
+/// contention each frame goes out immediately. That is Envoy's
+/// `encoder_buffer_` coalescing with the flush timer replaced by the callers
+/// themselves: batching when busy, zero added latency when idle.
+#[derive(Clone)]
+pub struct DuplexWriter {
+    /// Plaintext staging (plain connections only).
+    out: Arc<std::sync::Mutex<Vec<u8>>>,
+    /// TLS state shared with the read half (TLS connections only).
+    tls: Option<Arc<std::sync::Mutex<TlsHalf>>>,
+    /// The socket, locked only for writes. Swap-then-write under this lock
+    /// keeps byte order equal to append order.
+    sock: Arc<std::sync::Mutex<TcpStream>>,
+}
+
+impl DuplexWriter {
+    /// Stage one frame: encrypt (TLS) or buffer (plain). Never touches the
+    /// socket, so callers can hold their own ordering locks across it.
+    pub fn append(&self, frame: &[u8]) -> io::Result<()> {
+        match &self.tls {
+            Some(state) => {
+                let mut st = DuplexReader::lock_tls(state)?;
+                io::Write::write_all(&mut st.conn.writer(), frame)?;
+                while st.conn.wants_write() {
+                    let TlsHalf { conn, out } = &mut *st;
+                    conn.write_tls(out)?;
+                }
+                Ok(())
+            }
+            None => {
+                self.out
+                    .lock()
+                    .map_err(|_| io::Error::other("out buffer poisoned"))?
+                    .extend_from_slice(frame);
+                Ok(())
+            }
+        }
+    }
+
+    /// Write everything staged so far. Returns the bytes this call wrote —
+    /// zero when a concurrent flusher already carried them.
+    pub fn flush(&self) -> io::Result<usize> {
+        let mut sock = self
+            .sock
+            .lock()
+            .map_err(|_| io::Error::other("socket lock poisoned"))?;
+        // Swap under the socket lock, AFTER acquiring it: two flushers can
+        // never reorder each other's bytes because the swap and the write are
+        // one critical section.
+        let bytes = match &self.tls {
+            Some(state) => {
+                let mut st = DuplexReader::lock_tls(state)?;
+                std::mem::take(&mut st.out)
+            }
+            None => std::mem::take(
+                &mut *self
+                    .out
+                    .lock()
+                    .map_err(|_| io::Error::other("out buffer poisoned"))?,
+            ),
+        };
+        if bytes.is_empty() {
+            return Ok(0);
+        }
+        io::Write::write_all(&mut *sock, &bytes)?;
+        Ok(bytes.len())
+    }
+
+    /// Tear the connection down from the write side: wakes a reader blocked
+    /// in a socket read so a poisoned connection fails everyone promptly
+    /// instead of leaking a parked thread.
+    pub fn shutdown(&self) {
+        if let Ok(sock) = self.sock.lock() {
+            let _ = sock.shutdown(std::net::Shutdown::Both);
+        }
+    }
 }
 
 /// Accept side: wrap an already-accepted `TcpStream` as plaintext, or drive a
