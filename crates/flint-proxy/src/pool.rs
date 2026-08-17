@@ -47,13 +47,17 @@
 //!   .empty())`), and the connection is torn down rather than reused — a
 //!   half-read stream would hand the next command somebody else's reply.
 //!
-//! In-flight depth needs no explicit cap: `submit` is synchronous per
-//! caller, so pending can never exceed the number of live client commands,
-//! which the proxy's connection cap already bounds.
+//! In-flight depth IS capped, by the caller. This module originally argued a
+//! cap was unnecessary because `submit` is synchronous per caller, so pending
+//! could not exceed the live client-connection count. That stopped being true
+//! when `stage` was split out so one caller could hold a whole pipeline in
+//! flight: depth became connections x pipeline depth. `serve_client` bounds
+//! how many commands one prefetch pass may stage (`MAX_PREFETCH`), which is
+//! what keeps both the staging buffer and the FIFO bounded.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::mpsc::{SyncSender, sync_channel};
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -71,8 +75,8 @@ pub(crate) const DEFAULT_LANE_WIDTH: usize = 2;
 const READ_POLL: Duration = Duration::from_secs(1);
 
 /// How long a submitter waits on its slot. Above BACKEND_TIMEOUT so the
-/// reader's oldest-pending liveness check fires first and produces an error
-/// that can say why.
+/// reader's no-progress liveness check fires first and produces an error that
+/// can say why.
 fn submit_budget() -> Duration {
     BACKEND_TIMEOUT + Duration::from_secs(5)
 }
@@ -95,7 +99,6 @@ pub(crate) struct PoolStats {
 }
 
 struct Pending {
-    at: Instant,
     tx: SyncSender<std::io::Result<Value>>,
 }
 
@@ -137,10 +140,20 @@ impl Conn {
         Ok(conn)
     }
 
-    /// One command: stage, flush, wait on our own slot. The connection is
-    /// never ours — between our flush and our reply, any number of other
-    /// commands travel on it.
-    fn submit(&self, frame: &[u8], stats: &PoolStats) -> std::io::Result<Value> {
+    /// Stage one command — push its reply slot and append its frame — and
+    /// **return**. No socket IO, no waiting: this is `makeRequestInternal`.
+    ///
+    /// Splitting this out of `submit` is what lets ONE caller hold N commands
+    /// in flight. `submit` (stage, flush, park) can only ever have one
+    /// outstanding command per thread, so a client pipelining 16 GETs reached
+    /// the node as 16 separate round trips and the node saw no pipeline at
+    /// all — measured 2026-08-17, and the reason `pool_batch_mean` sat at 1.0
+    /// no matter how the load was shaped.
+    fn stage(
+        &self,
+        frame: &[u8],
+        stats: &PoolStats,
+    ) -> std::io::Result<Receiver<std::io::Result<Value>>> {
         if self.dead.load(Ordering::Relaxed) {
             return Err(std::io::Error::other("backend connection is down"));
         }
@@ -155,10 +168,7 @@ impl Conn {
                     .pending
                     .lock()
                     .map_err(|_| std::io::Error::other("pending poisoned"))?;
-                q.push_back(Pending {
-                    at: Instant::now(),
-                    tx,
-                });
+                q.push_back(Pending { tx });
                 stats
                     .inflight_max
                     .fetch_max(q.len() as u64, Ordering::Relaxed);
@@ -171,20 +181,34 @@ impl Conn {
                 return Err(e);
             }
         }
-        // Socket write OUTSIDE the ordering lock: whoever gets the socket
-        // first carries every staged frame (flush-combining).
+        stats.commands.fetch_add(1, Ordering::Relaxed);
+        Ok(rx)
+    }
+
+    /// Push everything staged onto the socket, OUTSIDE the ordering lock:
+    /// whoever gets there first carries every staged frame (flush-combining).
+    ///
+    /// Idempotent and nearly free when there is nothing to write — another
+    /// thread's flush may already have carried our frames, which is precisely
+    /// the coalescing working. So a caller that staged N commands can simply
+    /// flush once per ticket without tracking which connections it touched.
+    fn flush_staged(&self, stats: &PoolStats) -> std::io::Result<()> {
         match self.w.flush() {
-            Ok(0) => {}
+            Ok(0) => Ok(()),
             Ok(_) => {
                 stats.batches.fetch_add(1, Ordering::Relaxed);
+                Ok(())
             }
             Err(e) => {
                 self.dead.store(true, Ordering::Relaxed);
                 self.w.shutdown();
-                return Err(e);
+                Err(e)
             }
         }
-        stats.commands.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Park on one staged command's slot until the reader completes it.
+    fn wait_slot(&self, rx: &Receiver<std::io::Result<Value>>) -> std::io::Result<Value> {
         match rx.recv_timeout(submit_budget()) {
             Ok(r) => r,
             Err(_) => {
@@ -199,6 +223,40 @@ impl Conn {
             }
         }
     }
+
+    /// One command: stage, flush, wait on our own slot. The connection is
+    /// never ours — between our flush and our reply, any number of other
+    /// commands travel on it.
+    fn submit(&self, frame: &[u8], stats: &PoolStats) -> std::io::Result<Value> {
+        let rx = self.stage(frame, stats)?;
+        self.flush_staged(stats)?;
+        self.wait_slot(&rx)
+    }
+}
+
+/// A command staged on a pooled connection but not yet answered.
+///
+/// The caller holds one per in-flight command, flushes, and then collects in
+/// issue order. Holding several at once is the whole point: that is what puts
+/// a client's pipeline onto the wire as a pipeline instead of N round trips.
+pub(crate) struct Ticket {
+    conn: Arc<Conn>,
+    rx: Receiver<std::io::Result<Value>>,
+    stats: Arc<PoolStats>,
+}
+
+impl Ticket {
+    /// Push this ticket's frame — and anything else staged on its connection
+    /// — onto the wire. Safe to call once per ticket even when several
+    /// tickets share a connection; the later calls find nothing staged.
+    pub(crate) fn flush(&self) -> std::io::Result<()> {
+        self.conn.flush_staged(&self.stats)
+    }
+
+    /// Block for this command's reply.
+    pub(crate) fn wait(self) -> std::io::Result<Value> {
+        self.conn.wait_slot(&self.rx)
+    }
 }
 
 /// The read half of every pooled connection: decode replies continuously,
@@ -211,6 +269,10 @@ fn reader_loop(
 ) {
     let mut acc: Vec<u8> = Vec::with_capacity(64 * 1024);
     let mut chunk = [0u8; 64 * 1024];
+    // When this connection last DELIVERED something. The liveness check below
+    // is written against progress rather than against the age of the oldest
+    // outstanding command — see the check for why the difference matters.
+    let mut last_reply = Instant::now();
     let die = |why: String| {
         dead.store(true, Ordering::Relaxed);
         w.shutdown();
@@ -232,6 +294,7 @@ fn reader_loop(
             match decode(&acc) {
                 Ok(Decoded::Complete(v, used)) => {
                     acc.drain(..used);
+                    last_reply = Instant::now();
                     let slot = pending.lock().ok().and_then(|mut q| q.pop_front());
                     match slot {
                         Some(p) => {
@@ -258,16 +321,20 @@ fn reader_loop(
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                 ) =>
             {
-                // Idle poll tick: the liveness check. A backend that accepted
-                // commands and answers nothing for a whole BACKEND_TIMEOUT is
-                // dead for our purposes, however open its socket is.
-                let stalled = pending
-                    .lock()
-                    .ok()
-                    .and_then(|q| q.front().map(|p| p.at.elapsed() > BACKEND_TIMEOUT))
-                    .unwrap_or(false);
-                if stalled {
-                    return die("backend stopped answering (oldest command over budget)".into());
+                // Idle poll tick: the liveness check. "Dead" means the backend
+                // has DELIVERED NOTHING for a whole BACKEND_TIMEOUT while we
+                // are waiting on it — not that the oldest outstanding command
+                // is old.
+                //
+                // Those were the same statement while a caller could only ever
+                // have one command outstanding. Once a caller stages its whole
+                // pipeline the oldest command is legitimately old for as long
+                // as the batch takes to drain, so measuring its age shoots a
+                // healthy connection under precisely the load this pool exists
+                // to carry — and takes every other caller on it down too.
+                let waiting = pending.lock().map(|q| !q.is_empty()).unwrap_or(false);
+                if waiting && last_reply.elapsed() > BACKEND_TIMEOUT {
+                    return die("backend stopped answering (no reply for the whole budget)".into());
                 }
             }
             Err(e) => return die(format!("backend read failed: {e}")),
@@ -309,6 +376,34 @@ impl BackendPool {
         async_writes: bool,
         frame: &[u8],
     ) -> std::io::Result<Value> {
+        self.conn_for(addr, ns, async_writes)?
+            .submit(frame, &self.stats)
+    }
+
+    /// Stage a command and return its ticket WITHOUT flushing or waiting.
+    ///
+    /// The caller is expected to stage a whole run, flush, and only then
+    /// collect — see `Ticket`. Nothing here blocks, so a single client thread
+    /// can put its entire pipeline in flight before reading the first reply.
+    pub(crate) fn submit_nowait(
+        &self,
+        addr: &str,
+        ns: &[u8],
+        async_writes: bool,
+        frame: &[u8],
+    ) -> std::io::Result<Ticket> {
+        let conn = self.conn_for(addr, ns, async_writes)?;
+        let rx = conn.stage(frame, &self.stats)?;
+        Ok(Ticket {
+            conn,
+            rx,
+            stats: self.stats.clone(),
+        })
+    }
+
+    /// Pick this lane's next connection, dialing if the slot is empty or its
+    /// occupant is dead. One dial implementation for both call shapes.
+    fn conn_for(&self, addr: &str, ns: &[u8], async_writes: bool) -> std::io::Result<Arc<Conn>> {
         let key = Key {
             addr: addr.to_string(),
             ns: ns.to_vec(),
@@ -316,24 +411,21 @@ impl BackendPool {
         };
         let lane = self.lane(&key)?;
         let i = lane.rr.fetch_add(1, Ordering::Relaxed) % lane.slots.len();
-        let conn = {
-            let mut slot = lane.slots[i]
-                .lock()
-                .map_err(|_| std::io::Error::other("lane slot poisoned"))?;
-            match slot.as_ref() {
-                Some(c) if !c.dead.load(Ordering::Relaxed) => c.clone(),
-                _ => {
-                    // Redial under the slot lock: a herd arriving at a dead
-                    // connection produces one dial, not one per caller.
-                    let c = Conn::dial(&key, &self.tls, &self.stats).inspect_err(|_| {
-                        self.stats.dial_failures.fetch_add(1, Ordering::Relaxed);
-                    })?;
-                    *slot = Some(c.clone());
-                    c
-                }
+        let mut slot = lane.slots[i]
+            .lock()
+            .map_err(|_| std::io::Error::other("lane slot poisoned"))?;
+        match slot.as_ref() {
+            Some(c) if !c.dead.load(Ordering::Relaxed) => Ok(c.clone()),
+            _ => {
+                // Redial under the slot lock: a herd arriving at a dead
+                // connection produces one dial, not one per caller.
+                let c = Conn::dial(&key, &self.tls, &self.stats).inspect_err(|_| {
+                    self.stats.dial_failures.fetch_add(1, Ordering::Relaxed);
+                })?;
+                *slot = Some(c.clone());
+                Ok(c)
             }
-        };
-        conn.submit(frame, &self.stats)
+        }
     }
 
     fn lane(&self, key: &Key) -> std::io::Result<Arc<Lane>> {
@@ -440,6 +532,65 @@ mod tests {
             &mut v,
         );
         v
+    }
+
+    /// ONE caller's pipeline must reach the backend as a pipeline.
+    ///
+    /// This is the property the pool was missing for a month. The test below
+    /// proves N THREADS can be in flight together, and it passed the whole
+    /// time — but every caller used `submit`, which stages one frame and
+    /// parks, so a single client pipelining N commands still produced N round
+    /// trips. Measured on a fleet and a laptop alike: `pool_batch_mean` stuck
+    /// at 1.0, `pool_inflight_max` tracking the CONNECTION count, and the node
+    /// paying its unpipelined per-command cost at every pipeline depth.
+    ///
+    /// The withholding backend answers nothing until all N commands arrive,
+    /// so a caller that parks after each `stage` cannot finish: command 0's
+    /// reply only exists once command N-1 has been written.
+    #[test]
+    fn one_caller_can_hold_its_whole_pipeline_in_flight() {
+        const N: usize = 16;
+        let addr = withholding_backend(N);
+        let p = BackendPool::new(None, 1); // width 1: ONE shared connection
+        let a = addr.to_string();
+
+        // Stage the whole run first — no waiting — exactly as the prefetch
+        // pass in serve_client does.
+        let mut tickets = Vec::new();
+        for i in 0..N {
+            let key = format!("k{i}");
+            let t = p
+                .submit_nowait(&a, b"0", false, &get_frame(&key))
+                .expect("stage");
+            tickets.push((key, t));
+        }
+        for (_, t) in &tickets {
+            t.flush().expect("flush");
+        }
+        assert_eq!(
+            p.stats.inflight_max.load(Ordering::Relaxed),
+            N as u64,
+            "one caller must be able to hold all {N} commands in flight; \
+             a lower depth means it parked between commands and the client's \
+             pipeline was serialised into round trips"
+        );
+
+        // Only now collect, in issue order.
+        for (key, t) in tickets {
+            match t.wait() {
+                Ok(Value::Bulk(Some(b))) => assert_eq!(
+                    b,
+                    key.as_bytes(),
+                    "reply for {key} went to the wrong caller — FIFO order and \
+                     wire order disagreed"
+                ),
+                other => panic!(
+                    "{key}: {other:?} — with a withholding backend this means \
+                     not every staged command reached the node"
+                ),
+            }
+        }
+        assert_eq!(p.stats.commands.load(Ordering::Relaxed), N as u64);
     }
 
     #[test]

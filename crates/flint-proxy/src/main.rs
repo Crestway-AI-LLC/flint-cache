@@ -1261,6 +1261,15 @@ impl Backends {
         self.pool.call(addr, &self.ns, self.async_writes, frame)
     }
 
+    /// Put a command on the wire without waiting for it (ADR-0020 amendment
+    /// 2, 2026-08-17). The caller stages a whole pipelined run, flushes, and
+    /// only then collects — which is the difference between the node seeing a
+    /// pipeline and the node seeing N round trips.
+    fn submit_nowait(&mut self, addr: &str, frame: &[u8]) -> std::io::Result<pool::Ticket> {
+        self.pool
+            .submit_nowait(addr, &self.ns, self.async_writes, frame)
+    }
+
     /// Keyed traffic on a connection belonging to THIS client alone.
     ///
     /// For the cases where a shared connection would be wrong rather than
@@ -1337,6 +1346,92 @@ fn route_key(args: &[Vec<u8>]) -> Option<&[u8]> {
 
 /// Forward one client command, absorbing -MOVED / -TRYAGAIN / backend death
 /// within the retry budget. Returns the reply the CLIENT should see.
+/// Put a backend reply into the dialect THIS client is owed.
+///
+/// Backends answer us in RESP3, so a reply the JSON.TYPE quirk applies to
+/// arrives already nested: peel that layer off and re-mark it, so the
+/// client's own dialect decides whether it goes back on. JSON.NUMINCRBY's
+/// dialects differ in reply KIND, so the RESP2 spelling is rebuilt from the
+/// RESP3 array (the array holds the matches; args[2] says which spelling the
+/// caller expects).
+///
+/// A free function rather than a closure inside `forward` because the
+/// prefetched path collects its replies elsewhere and must repair them
+/// identically.
+fn repair_reply(args: &[Vec<u8>], v: Value) -> Value {
+    if args
+        .first()
+        .is_some_and(|n| flint_resp::resp3_nests_reply(n))
+    {
+        return match v {
+            Value::Array(Some(mut items)) if items.len() == 1 => {
+                Value::Resp3Nested(Box::new(items.remove(0)))
+            }
+            other => other,
+        };
+    }
+    if args
+        .first()
+        .is_some_and(|n| flint_resp::resp3_differs_in_kind(n))
+        && !matches!(v, Value::Error(_))
+    {
+        let jsonpath = args.get(2).is_some_and(|p| p.first() == Some(&b'$'));
+        return Value::ByProto {
+            resp2: Box::new(flint_resp::json_numincrby_resp2(&v, jsonpath)),
+            resp3: Box::new(v),
+        };
+    }
+    v
+}
+
+/// Collect a prefetched command's reply.
+///
+/// The happy path — a plain reply for a command already on the wire — is the
+/// entire point of prefetching, and costs nothing beyond the wait. Every
+/// other outcome (a MOVED chase, a stale replica, a demoted master, a dead
+/// connection) hands the command to `forward`, which owns the retry,
+/// rediscovery and failover budget. Retries are rare and already expensive;
+/// duplicating that logic here to save one round trip on the unhappy path
+/// would be the wrong trade and a second place for failover to be subtly
+/// wrong.
+fn forward_collect(
+    topo: &Topology,
+    backends: &mut Backends,
+    ns: &[u8],
+    args: &[Vec<u8>],
+    raw: &[u8],
+    ticket: pool::Ticket,
+    addr: String,
+) -> Value {
+    match ticket.wait().map(|v| repair_reply(args, v)) {
+        Ok(Value::Error(e)) if e.starts_with("MOVED ") => {
+            let mut parts = e.split(' ');
+            let (_, s, new_addr) = (parts.next(), parts.next(), parts.next());
+            if let (Some(s), Some(new_addr)) = (s, new_addr)
+                && let Ok(s) = s.parse::<u16>()
+            {
+                topo.learn_moved(ns, s, new_addr);
+            }
+            forward(topo, backends, ns, args, raw, false)
+        }
+        Ok(Value::Error(e)) if e.starts_with("TRYAGAIN") => {
+            forward(topo, backends, ns, args, raw, false)
+        }
+        Ok(Value::Error(e)) if e.starts_with("READONLY") => {
+            // A demoted-in-place ex-master. Same recovery as the ordinary
+            // path: rediscover this pair's master, then retry there.
+            topo.rediscover_for(&addr);
+            backends.drop_conn(&addr);
+            forward(topo, backends, ns, args, raw, false)
+        }
+        Ok(reply) => reply,
+        Err(_) => {
+            topo.rediscover_for(&addr);
+            forward(topo, backends, ns, args, raw, false)
+        }
+    }
+}
+
 fn forward(
     topo: &Topology,
     backends: &mut Backends,
@@ -1387,40 +1482,7 @@ fn forward(
             continue;
         };
 
-        // Backends answer us in RESP3, so a reply the JSON.TYPE quirk
-        // applies to arrives already nested. Peel that layer back off and
-        // re-mark it, so THIS client's dialect is what decides whether it
-        // goes on again.
-        let renest = |v: Value| match v {
-            Value::Array(Some(mut items)) if items.len() == 1 => {
-                Value::Resp3Nested(Box::new(items.remove(0)))
-            }
-            other => other,
-        };
-        let nests = args
-            .first()
-            .is_some_and(|n| flint_resp::resp3_nests_reply(n));
-        // JSON.NUMINCRBY's dialects differ in reply KIND, so the RESP2
-        // spelling has to be rebuilt from the RESP3 array we just read
-        // (derivable: the array holds the matches, args[2] says which
-        // spelling the caller expects).
-        let kind_differs = args
-            .first()
-            .is_some_and(|n| flint_resp::resp3_differs_in_kind(n));
-        let jsonpath = args.get(2).is_some_and(|p| p.first() == Some(&b'$'));
-        let repair = |v: Value| {
-            if nests {
-                return renest(v);
-            }
-            if kind_differs && !matches!(v, Value::Error(_)) {
-                return Value::ByProto {
-                    resp2: Box::new(flint_resp::json_numincrby_resp2(&v, jsonpath)),
-                    resp3: Box::new(v),
-                };
-            }
-            v
-        };
-        match backends.call(&addr, frame).map(repair) {
+        match backends.call(&addr, frame).map(|v| repair_reply(args, v)) {
             Ok(Value::Error(e)) if e.starts_with("MOVED ") => {
                 // "MOVED <slot> <addr>": learn and chase. The client must
                 // never see this — absorbing it is the proxy's reason to
@@ -2019,9 +2081,22 @@ fn serve_client<S: Read + Write>(mut stream: S, topo: Arc<Topology>) -> std::io:
     let mut buf: Vec<u8> = Vec::with_capacity(16 * 1024);
     let mut chunk = [0u8; 16 * 1024];
     let mut out: Vec<u8> = Vec::with_capacity(4 * 1024);
+    // Every complete command in the current read, decoded once. Reused across
+    // reads so a pipelining client does not re-allocate it per batch.
+    let mut cmds: Vec<(Vec<Vec<u8>>, Vec<u8>)> = Vec::new();
     loop {
         let mut consumed = 0;
         out.clear();
+        // Phase 1 — decode every complete command now in the buffer.
+        //
+        // Decoding used to be interleaved with execution: decode one, block
+        // for its reply, decode the next. That is where a client's pipeline
+        // died — the node could not be told about command 2 until command 1
+        // had travelled all the way back, so it saw N round trips and never a
+        // batch. Separating decode from execution is what lets the prefetch
+        // pass below see the whole run at once.
+        cmds.clear();
+        let mut fatal: Option<&str> = None;
         loop {
             // Inline commands (`SET k v\r\n`), the same shape the server
             // already accepts. The proxy used to answer -ERR Protocol error
@@ -2040,12 +2115,7 @@ fn serve_client<S: Read + Write>(mut stream: S, topo: Arc<Topology>) -> std::io:
                 let pending = &buf[consumed..];
                 let Some(nl) = pending.iter().position(|&b| b == b'\n') else {
                     if pending.len() > MAX_INLINE_LEN {
-                        encode(
-                            &Value::Error("ERR Protocol error: too big inline request".into()),
-                            &mut out,
-                        );
-                        stream.write_all(&out)?;
-                        return Ok(());
+                        fatal = Some("ERR Protocol error: too big inline request");
                     }
                     break;
                 };
@@ -2076,172 +2146,203 @@ fn serve_client<S: Read + Write>(mut stream: S, topo: Arc<Topology>) -> std::io:
                 Ok(Decoded::Complete(frame, used)) => {
                     let raw = buf[consumed..consumed + used].to_vec();
                     consumed += used;
-                    let Some(args) = frame_to_args(frame) else {
-                        encode(
-                            &Value::Error(
-                                "ERR Protocol error: expected array of bulk strings".into(),
-                            ),
-                            &mut out,
-                        );
-                        stream.write_all(&out)?;
-                        return Ok(());
-                    };
-                    topo.stat_commands_total.fetch_add(1, Ordering::Relaxed);
-                    if let Some(name) = args.first() {
-                        let is_write = flint_commands::is_write_command(name);
-                        if is_write {
-                            topo.stat_commands_write_total
-                                .fetch_add(1, Ordering::Relaxed);
-                        } else if flint_commands::is_read_command(name) {
-                            topo.stat_commands_read_total
-                                .fetch_add(1, Ordering::Relaxed);
+                    match frame_to_args(frame) {
+                        Some(args) => cmds.push((args, raw)),
+                        None => {
+                            fatal = Some("ERR Protocol error: expected array of bulk strings");
+                            break;
                         }
-                        if is_write || flint_commands::is_read_command(name) {
-                            hotkey_tick = hotkey_tick.wrapping_add(1);
-                            if hotkey_tick.is_multiple_of(HOTKEY_SAMPLE_RATE)
-                                && let Some(ns) = authed_ns.as_deref()
-                                && let Some(key) = route_key(&args)
-                            {
-                                topo.hotkeys.observe(ns, key, is_write);
-                            }
-                        }
-                    }
-                    // A channel (PROXYCHAN) dies with the family command's
-                    // deadline: past it the connection is closed on its next
-                    // command rather than served (ADR-0010 D2). Checked after
-                    // decode and before any auth or forward, so an expired
-                    // channel cannot issue even one more command. `None` for
-                    // tenants — their path is untouched.
-                    if let Some(dl) = channel_deadline
-                        && Instant::now() >= dl
-                    {
-                        encode_proto(
-                            &Value::Error("ERR channel deadline exceeded".into()),
-                            proto,
-                            &mut out,
-                        );
-                        stream.write_all(&out)?;
-                        return Ok(());
-                    }
-                    // Channel data-command budget (ADR-0010 D3): a channel gets
-                    // a fixed number of data commands, then it is closed. A
-                    // looping co-processor is cut off at the bound, not found
-                    // later in a latency graph. Counts data commands only — a
-                    // PING or HELLO on the channel is free.
-                    if let Some(budget) = channel_budget.as_mut()
-                        && args.first().is_some_and(|n| {
-                            flint_commands::is_write_command(n)
-                                || flint_commands::is_read_command(n)
-                        })
-                    {
-                        if *budget == 0 {
-                            encode_proto(
-                                &Value::Error("ERR channel budget exhausted".into()),
-                                proto,
-                                &mut out,
-                            );
-                            stream.write_all(&out)?;
-                            return Ok(());
-                        }
-                        *budget -= 1;
-                    }
-                    // Tenant-perceived latency starts here: everything the
-                    // proxy does for this command — cache lookup, routing,
-                    // backend round trip, MOVED/failover retries — is what
-                    // the client waits for.
-                    let started = Instant::now();
-                    // REFUSED HERE, BEFORE ANYTHING CAN FORWARD IT.
-                    //
-                    // The per-command match further down also refuses
-                    // `FLINT*`, but only on the path that reaches it. Inside
-                    // a MULTI, `transaction_step` relays the raw bytes to the
-                    // backend and returns before that match is consulted — so
-                    // the refusal held outside a transaction and not inside
-                    // one. A tenant could open MULTI, send `FLINTNS <other>`,
-                    // and re-point its own backend connection at another
-                    // tenant's namespace: full read and write access to
-                    // anyone whose namespace name they could guess.
-                    //
-                    // The property wanted is "these bytes never leave the
-                    // proxy", and that is only true if it is checked before
-                    // any code that could forward them. Checked pre-auth
-                    // deliberately: an unauthenticated connection has no more
-                    // business naming a namespace than an authenticated one.
-                    let reply = if args.first().is_some_and(|n| is_internal_only(n)) {
-                        Value::Error(
-                            "ERR admin commands are not available through the proxy".into(),
-                        )
-                    } else {
-                        match auth_step(
-                            &topo,
-                            &mut authed_ns,
-                            &mut replica_reads,
-                            &mut local_cache,
-                            &mut async_writes,
-                            &mut is_admin,
-                            &mut proto,
-                            &args,
-                        ) {
-                            AuthStep::Reply(v) => v,
-                            AuthStep::ChannelOpen { deadline, budget } => {
-                                // PROXYCHAN pinned authed_ns to the grant's
-                                // namespace; record the deadline and budget so
-                                // this connection is closed once it outlives
-                                // either bound.
-                                channel_deadline = Some(deadline);
-                                channel_budget = Some(budget);
-                                Value::Simple("OK".into())
-                            }
-                            AuthStep::Proceed(ns) => data_command(
-                                &topo,
-                                &mut backends,
-                                &mut txn,
-                                &ns,
-                                &args,
-                                &raw,
-                                replica_reads,
-                                local_cache,
-                                async_writes,
-                                channel_deadline.is_some(),
-                            ),
-                        }
-                    };
-                    // Record into this tenant's read/write histogram — data
-                    // commands only (the D1 classifier; AUTH/PROXY* are
-                    // neither), and only once a namespace is bound.
-                    if let Some(ns) = authed_ns.as_deref()
-                        && let Some(name) = args.first()
-                    {
-                        let is_write = flint_commands::is_write_command(name);
-                        if is_write || flint_commands::is_read_command(name) {
-                            topo.latency.observe(
-                                ns,
-                                is_write,
-                                started.elapsed().as_micros() as u64,
-                            );
-                        }
-                    }
-                    // Every error a client is told about passes here —
-                    // the same funnel the latency histogram uses. Counting
-                    // at the ~20 construction sites instead would leave
-                    // whichever one is added next uncounted, silently.
-                    if let Value::Error(msg) = &reply {
-                        topo.errors
-                            .observe(authed_ns.as_deref(), errors::classify(msg));
-                    }
-                    encode_proto(&reply, proto, &mut out);
-                    if out.len() >= OUT_FLUSH_THRESHOLD {
-                        stream.write_all(&out)?;
-                        out.clear();
                     }
                 }
                 Ok(Decoded::NeedMore) => break,
                 Err(_) => {
-                    encode(&Value::Error("ERR Protocol error".into()), &mut out);
+                    fatal = Some("ERR Protocol error");
+                    break;
+                }
+            }
+        }
+
+        // Phase 2 — prefetch: stage the leading run of independent keyed
+        // commands so the node receives them as one pipeline instead of
+        // learning about each only after answering the last. Any transaction
+        // state at all is a barrier: MULTI's queue and WATCH's watches are
+        // per-connection state on the node, so ordering is load-bearing while
+        // either is armed.
+        let plan = match authed_ns.as_deref() {
+            Some(ns) => prefetch_run(
+                &topo,
+                &mut backends,
+                &cmds,
+                ns,
+                txn.open || txn.addr.is_some(),
+                replica_reads,
+                local_cache,
+                async_writes,
+                channel_deadline.is_some(),
+            ),
+            // Unauthenticated: nothing may be staged, and AUTH itself must be
+            // executed before anything behind it is even classified.
+            None => Vec::new(),
+        };
+        let mut plan = plan.into_iter();
+
+        // Phase 3 — execute in issue order. Per command this is unchanged;
+        // the only difference is that a prefetched command collects a reply
+        // already in flight instead of starting its own round trip.
+        for (args, raw) in cmds.iter() {
+            let prefetch = plan.next().unwrap_or(Prefetch::None);
+            topo.stat_commands_total.fetch_add(1, Ordering::Relaxed);
+            if let Some(name) = args.first() {
+                let is_write = flint_commands::is_write_command(name);
+                if is_write {
+                    topo.stat_commands_write_total
+                        .fetch_add(1, Ordering::Relaxed);
+                } else if flint_commands::is_read_command(name) {
+                    topo.stat_commands_read_total
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                if is_write || flint_commands::is_read_command(name) {
+                    hotkey_tick = hotkey_tick.wrapping_add(1);
+                    if hotkey_tick.is_multiple_of(HOTKEY_SAMPLE_RATE)
+                        && let Some(ns) = authed_ns.as_deref()
+                        && let Some(key) = route_key(args)
+                    {
+                        topo.hotkeys.observe(ns, key, is_write);
+                    }
+                }
+            }
+            // A channel (PROXYCHAN) dies with the family command's
+            // deadline: past it the connection is closed on its next
+            // command rather than served (ADR-0010 D2). Checked after
+            // decode and before any auth or forward, so an expired
+            // channel cannot issue even one more command. `None` for
+            // tenants — their path is untouched.
+            if let Some(dl) = channel_deadline
+                && Instant::now() >= dl
+            {
+                encode_proto(
+                    &Value::Error("ERR channel deadline exceeded".into()),
+                    proto,
+                    &mut out,
+                );
+                stream.write_all(&out)?;
+                return Ok(());
+            }
+            // Channel data-command budget (ADR-0010 D3): a channel gets
+            // a fixed number of data commands, then it is closed. A
+            // looping co-processor is cut off at the bound, not found
+            // later in a latency graph. Counts data commands only — a
+            // PING or HELLO on the channel is free.
+            if let Some(budget) = channel_budget.as_mut()
+                && args.first().is_some_and(|n| {
+                    flint_commands::is_write_command(n) || flint_commands::is_read_command(n)
+                })
+            {
+                if *budget == 0 {
+                    encode_proto(
+                        &Value::Error("ERR channel budget exhausted".into()),
+                        proto,
+                        &mut out,
+                    );
                     stream.write_all(&out)?;
                     return Ok(());
                 }
+                *budget -= 1;
             }
+            // Tenant-perceived latency starts here: everything the
+            // proxy does for this command — cache lookup, routing,
+            // backend round trip, MOVED/failover retries — is what
+            // the client waits for.
+            let started = Instant::now();
+            // REFUSED HERE, BEFORE ANYTHING CAN FORWARD IT.
+            //
+            // The per-command match further down also refuses
+            // `FLINT*`, but only on the path that reaches it. Inside
+            // a MULTI, `transaction_step` relays the raw bytes to the
+            // backend and returns before that match is consulted — so
+            // the refusal held outside a transaction and not inside
+            // one. A tenant could open MULTI, send `FLINTNS <other>`,
+            // and re-point its own backend connection at another
+            // tenant's namespace: full read and write access to
+            // anyone whose namespace name they could guess.
+            //
+            // The property wanted is "these bytes never leave the
+            // proxy", and that is only true if it is checked before
+            // any code that could forward them. Checked pre-auth
+            // deliberately: an unauthenticated connection has no more
+            // business naming a namespace than an authenticated one.
+            let reply = if args.first().is_some_and(|n| is_internal_only(n)) {
+                Value::Error("ERR admin commands are not available through the proxy".into())
+            } else {
+                match auth_step(
+                    &topo,
+                    &mut authed_ns,
+                    &mut replica_reads,
+                    &mut local_cache,
+                    &mut async_writes,
+                    &mut is_admin,
+                    &mut proto,
+                    args,
+                ) {
+                    AuthStep::Reply(v) => v,
+                    AuthStep::ChannelOpen { deadline, budget } => {
+                        // PROXYCHAN pinned authed_ns to the grant's
+                        // namespace; record the deadline and budget so
+                        // this connection is closed once it outlives
+                        // either bound.
+                        channel_deadline = Some(deadline);
+                        channel_budget = Some(budget);
+                        Value::Simple("OK".into())
+                    }
+                    AuthStep::Proceed(ns) => data_command(
+                        &topo,
+                        &mut backends,
+                        &mut txn,
+                        &ns,
+                        args,
+                        raw,
+                        replica_reads,
+                        local_cache,
+                        async_writes,
+                        channel_deadline.is_some(),
+                        prefetch,
+                    ),
+                }
+            };
+            // Record into this tenant's read/write histogram — data
+            // commands only (the D1 classifier; AUTH/PROXY* are
+            // neither), and only once a namespace is bound.
+            if let Some(ns) = authed_ns.as_deref()
+                && let Some(name) = args.first()
+            {
+                let is_write = flint_commands::is_write_command(name);
+                if is_write || flint_commands::is_read_command(name) {
+                    topo.latency
+                        .observe(ns, is_write, started.elapsed().as_micros() as u64);
+                }
+            }
+            // Every error a client is told about passes here —
+            // the same funnel the latency histogram uses. Counting
+            // at the ~20 construction sites instead would leave
+            // whichever one is added next uncounted, silently.
+            if let Value::Error(msg) = &reply {
+                topo.errors
+                    .observe(authed_ns.as_deref(), errors::classify(msg));
+            }
+            encode_proto(&reply, proto, &mut out);
+            if out.len() >= OUT_FLUSH_THRESHOLD {
+                stream.write_all(&out)?;
+                out.clear();
+            }
+        }
+        // A malformed frame ends the connection — but only AFTER the commands
+        // that arrived ahead of it in the same read have been answered, which
+        // is what the client is owed and what interleaved decoding did
+        // naturally.
+        if let Some(msg) = fatal {
+            encode(&Value::Error(msg.into()), &mut out);
+            stream.write_all(&out)?;
+            return Ok(());
         }
         if consumed > 0 {
             buf.drain(..consumed);
@@ -2653,6 +2754,190 @@ impl Drop for InflightGuard<'_> {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// What the prefetch pass already settled about one client command.
+///
+/// A client pipelining N commands used to reach the node as N round trips:
+/// `serve_client` decoded one command, blocked for its reply, and only then
+/// decoded the next. Measured 2026-08-17, the node's CPU per operation behind
+/// the proxy at pipeline depth 16 was its cost at depth 1 — it never saw a
+/// pipeline at all — while `pool_batch_mean` sat at 1.0 under every load
+/// shape and `pool_inflight_max` tracked the CONNECTION count rather than the
+/// pipeline depth. The pool was full-duplex and nothing drove it that way.
+///
+/// The prefetch pass walks the leading run of independent keyed commands in
+/// the read buffer and stages them all before collecting any. Because it runs
+/// BEFORE execution, every decision it takes is final: the quota bucket is
+/// charged there, the near-cache is consulted there, and `data_command` must
+/// not repeat either or the tenant is billed twice for one command.
+enum Prefetch {
+    /// Not eligible, or the run ended here. `data_command` takes its ordinary
+    /// path, unchanged — this is what every command saw before this pass
+    /// existed, and what most still see.
+    None,
+    /// The quota gate already shed it. The bucket was charged once, there.
+    Shed(Value),
+    /// The near-cache already answered it.
+    Cached(Value),
+    /// Staged on a pooled connection to this address, awaiting collection.
+    InFlight(pool::Ticket, String),
+}
+
+/// Most commands one prefetch pass will stage before falling back to the
+/// serial path for the rest of the read.
+///
+/// A cap is required, not tuning. Staging is what makes a pooled connection's
+/// in-flight depth `connections x pipeline depth` instead of `connections`,
+/// and both the writer's staging buffer and the pending FIFO grow with it. It
+/// also bounds how long the OLDEST outstanding command waits, which used to be
+/// the reader's liveness signal — an unbounded pass could make a healthy
+/// backend look stalled.
+///
+/// 64 covers the pipeline depths clients actually use (redis-benchmark and
+/// memtier default well below it) while keeping a pass's staged bytes small.
+/// Beyond it the remaining commands are simply served the old way: slower, and
+/// still correct.
+const MAX_PREFETCH: usize = 64;
+
+/// May this command be put on the wire before the ones ahead of it have been
+/// answered?
+///
+/// Conservative by construction: everything that could change how a LATER
+/// command is interpreted, or that `handle` answers without ever reaching
+/// `forward`, is refused. A false negative costs a round trip; a false
+/// positive corrupts a client's session.
+fn prefetchable(args: &[Vec<u8>], name: &[u8], replica_reads: bool) -> bool {
+    let is_write = flint_commands::is_write_command(name);
+    let is_read = flint_commands::is_read_command(name);
+    // Families, unknown verbs, and the connection-level commands are all
+    // neither, and all take paths of their own.
+    if !is_write && !is_read {
+        return false;
+    }
+    let upper = name.to_ascii_uppercase();
+    // Commands `handle` answers locally or fans out itself never reach
+    // `forward`, so they must not be staged as though they would. SCAN is
+    // classified as a read command, so this list is load-bearing rather than
+    // defensive.
+    if upper.starts_with(b"FLINT")
+        || matches!(
+            upper.as_slice(),
+            b"PING"
+                | b"ECHO"
+                | b"QUIT"
+                | b"SCAN"
+                | b"DBSIZE"
+                | b"FLUSHALL"
+                | b"MULTI"
+                | b"EXEC"
+                | b"DISCARD"
+                | b"WATCH"
+                | b"UNWATCH"
+        )
+    {
+        return false;
+    }
+    // A D7 replica read resolves its target differently and falls back to the
+    // master when a replica errors. Left on the ordinary path: the fallback
+    // is worth more than the batching.
+    if replica_reads && is_read {
+        return false;
+    }
+    // Needs a routable key — no-key commands go to pair 0 by a separate rule.
+    route_key(args).is_some()
+}
+
+/// Stage the leading run of independent keyed commands, then flush once.
+///
+/// Only a PREFIX is considered. The first command that is not prefetchable
+/// ends the run, because anything that changes connection state (AUTH binding
+/// a namespace, MULTI opening a transaction) invalidates every assumption
+/// this pass makes about the commands behind it. Real pipelines are
+/// homogeneous runs, so a prefix captures essentially all of the win for a
+/// fraction of the reasoning.
+#[allow(clippy::too_many_arguments)]
+fn prefetch_run(
+    topo: &Topology,
+    backends: &mut Option<Backends>,
+    cmds: &[(Vec<Vec<u8>>, Vec<u8>)],
+    ns: &[u8],
+    txn_open: bool,
+    replica_reads: bool,
+    local_cache: bool,
+    async_writes: bool,
+    is_channel: bool,
+) -> Vec<Prefetch> {
+    let mut plan: Vec<Prefetch> = Vec::with_capacity(cmds.len());
+    plan.resize_with(cmds.len(), || Prefetch::None);
+    // One command cannot overlap with anything, and a channel's per-command
+    // budget and an open transaction both make ordering load-bearing.
+    if cmds.len() < 2 || txn_open || is_channel {
+        return plan;
+    }
+    let mut staged = 0usize;
+    for (i, (args, raw)) in cmds.iter().enumerate() {
+        if i >= MAX_PREFETCH {
+            break;
+        }
+        let Some(name) = args.first() else { break };
+        if !prefetchable(args, name, replica_reads) {
+            break;
+        }
+        let is_write = flint_commands::is_write_command(name);
+        if let Some(shed) = topo.quota_gate(ns, name, is_write, false) {
+            plan[i] = Prefetch::Shed(shed);
+            continue;
+        }
+        let cacheable = local_cache
+            && topo.cache.enabled()
+            && args.len() == 2
+            && args[0].eq_ignore_ascii_case(b"GET");
+        if let Some(v) = cacheable.then(|| topo.cache.get(ns, &args[1])).flatten() {
+            plan[i] = Prefetch::Cached(Value::Bulk(Some(v)));
+            continue;
+        }
+        // Routing not settled (mid-failover): stop here and let `forward`'s
+        // rediscovery loop do what it already does well, one command at a
+        // time. Staging into an unknown topology would only queue commands
+        // for a node we are about to stop believing in.
+        let Some(addr) = route_key(args)
+            .map(slot_for_key)
+            .and_then(|s| topo.route(ns, s))
+        else {
+            break;
+        };
+        let b = backends.get_or_insert_with(|| {
+            Backends::new(
+                ns.to_vec(),
+                topo.backend_tls.clone(),
+                async_writes,
+                topo.fanout_timeout,
+                topo.pool.clone(),
+            )
+        });
+        match b.submit_nowait(&addr, raw) {
+            Ok(t) => {
+                plan[i] = Prefetch::InFlight(t, addr);
+                staged = i + 1;
+            }
+            // Dial or stage failed: leave it to `forward`, which dials and
+            // retries with the full failover budget.
+            Err(_) => break,
+        }
+    }
+    // One flush per ticket. Flushing a connection whose frames another ticket
+    // already carried writes nothing, so this is N cheap calls rather than N
+    // syscalls — and it needs no bookkeeping about which lanes were touched.
+    // A failed flush kills the connection, whose reader then fails every
+    // waiter on it, so the error surfaces at collection rather than here.
+    for p in plan.iter().take(staged) {
+        if let Prefetch::InFlight(t, _) = p {
+            let _ = t.flush();
+        }
+    }
+    plan
+}
+
+#[allow(clippy::too_many_arguments)]
 fn data_command(
     topo: &Topology,
     backends: &mut Option<Backends>,
@@ -2664,7 +2949,35 @@ fn data_command(
     local_cache: bool,
     async_writes: bool,
     is_channel: bool,
+    prefetch: Prefetch,
 ) -> Value {
+    // Decisions the prefetch pass already took are final — re-running the
+    // quota gate here would charge the tenant's bucket twice for one command.
+    let prefetched = match prefetch {
+        Prefetch::Shed(v) | Prefetch::Cached(v) => return v,
+        Prefetch::InFlight(t, addr) => Some((t, addr)),
+        Prefetch::None => None,
+    };
+    if let Some((ticket, addr)) = prefetched {
+        // Already gated, already a cache miss, already routed and on the
+        // wire. What remains is the reply and the cache write-back.
+        let cacheable = local_cache
+            && topo.cache.enabled()
+            && args.len() == 2
+            && args[0].eq_ignore_ascii_case(b"GET");
+        let b = backends.get_or_insert_with(|| {
+            Backends::new(
+                ns.to_vec(),
+                topo.backend_tls.clone(),
+                async_writes,
+                topo.fanout_timeout,
+                topo.pool.clone(),
+            )
+        });
+        let reply = forward_collect(topo, b, ns, args, raw, ticket, addr);
+        cache_writeback(topo, ns, args, &reply, local_cache, cacheable);
+        return reply;
+    }
     let is_write = args
         .first()
         .is_some_and(|n| flint_commands::is_write_command(n));
@@ -2762,7 +3075,26 @@ fn data_command(
         )
     });
     let reply = handle(topo, b, ns, args, raw, read_replica);
-    if cacheable && let Value::Bulk(Some(v)) = &reply {
+    cache_writeback(topo, ns, args, &reply, local_cache, cacheable);
+    reply
+}
+
+/// Cache write-back for one completed data command: store a fresh GET reply,
+/// and drop whatever a write just changed.
+///
+/// Shared by the ordinary path and the prefetched one, which must not
+/// diverge: a prefetched write that skipped invalidation would leave this
+/// proxy serving its own stale value, breaking read-your-own-writes for the
+/// client that issued it.
+fn cache_writeback(
+    topo: &Topology,
+    ns: &[u8],
+    args: &[Vec<u8>],
+    reply: &Value,
+    local_cache: bool,
+    cacheable: bool,
+) {
+    if cacheable && let Value::Bulk(Some(v)) = reply {
         topo.cache.put(ns, &args[1], v);
     }
     // A write through THIS proxy invalidates its local entries —
@@ -2814,7 +3146,6 @@ fn data_command(
             }
         }
     }
-    reply
 }
 
 /// One in-flight keyspace SCAN session THROUGH this proxy: which master
@@ -3485,6 +3816,87 @@ fn main() -> std::io::Result<()> {
 }
 
 #[cfg(test)]
+mod prefetch_tests {
+    use super::*;
+
+    fn may_stage(parts: &[&str], replica_reads: bool) -> bool {
+        let args: Vec<Vec<u8>> = parts.iter().map(|p| p.as_bytes().to_vec()).collect();
+        prefetchable(&args, &args[0], replica_reads)
+    }
+
+    /// The prefetch predicate is a safety boundary, not an optimisation knob:
+    /// a false positive puts a command on the wire BEFORE the proxy has
+    /// decided it may run, and before the commands ahead of it have been
+    /// answered.
+    ///
+    /// SCAN is the case that forces the explicit list. It is classified as a
+    /// READ command, so "is this a read or a write?" alone would happily
+    /// stage it — but `handle` intercepts SCAN and drives its own per-master
+    /// cursor session, so `forward` never sees it and the staged frame would
+    /// be answered by somebody else's reply.
+    #[test]
+    fn prefetch_refuses_every_command_that_does_not_reach_forward() {
+        // The ordinary keyed traffic this whole pass exists for.
+        assert!(may_stage(&["GET", "k"], false));
+        assert!(may_stage(&["SET", "k", "v"], false));
+        assert!(
+            may_stage(&["get", "k"], false),
+            "command names are case-insensitive on the wire"
+        );
+
+        // Answered by `handle` or fanned out by it — never reach `forward`.
+        for c in [
+            vec!["SCAN", "0"],
+            vec!["DBSIZE"],
+            vec!["FLUSHALL"],
+            vec!["PING"],
+            vec!["ECHO", "x"],
+            vec!["QUIT"],
+        ] {
+            assert!(
+                !may_stage(&c, false),
+                "{c:?} must not be staged: handle answers it without forwarding"
+            );
+        }
+
+        // Per-connection state on the node — ordering is load-bearing, and a
+        // queued command that executed instead of queueing would show the
+        // client QUEUED followed by a partial apply.
+        for c in [
+            vec!["MULTI"],
+            vec!["EXEC"],
+            vec!["DISCARD"],
+            vec!["WATCH", "k"],
+            vec!["UNWATCH"],
+        ] {
+            assert!(
+                !may_stage(&c, false),
+                "{c:?} must not be staged: it is transaction state"
+            );
+        }
+
+        // The tenant boundary: FLINT* must never leave the proxy, and the
+        // prefetch pass runs BEFORE the check that enforces that.
+        assert!(!may_stage(&["FLINTNS", "other"], false));
+        assert!(!may_stage(&["flintkeysize", "k"], false));
+
+        // A D7 replica read resolves its target differently and falls back to
+        // the master on error; writes are unaffected and still stage.
+        assert!(!may_stage(&["GET", "k"], true));
+        assert!(
+            may_stage(&["SET", "k", "v"], true),
+            "a replica-reading tenant's WRITES still go to the master and may stage"
+        );
+
+        // No routable key: those go to pair 0 by a separate rule.
+        assert!(!may_stage(&["MGET"], false));
+
+        // Unknown verbs earn the node's own error on the ordinary path.
+        assert!(!may_stage(&["NOTACOMMAND", "k"], false));
+    }
+}
+
+#[cfg(test)]
 mod route_tests {
     use super::*;
 
@@ -3736,6 +4148,7 @@ mod route_tests {
             false,
             false,
             true,
+            Prefetch::None,
         );
         match on_channel {
             Value::Error(e) => assert!(
@@ -3764,6 +4177,7 @@ mod route_tests {
             false,
             false,
             false,
+            Prefetch::None,
         );
         match on_client {
             Value::Error(e) => assert!(
