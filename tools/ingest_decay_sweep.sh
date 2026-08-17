@@ -84,24 +84,35 @@ SETTLE="${DECAY_SETTLE:-20}"         # seconds after the feed, for the stats dum
 # column would carry the driver's appetite. Pinning separates them the way the
 # fleet does. It also sidesteps a cold RocksDB build on two cores, which costs
 # more wall-clock than the measurement.
+# A cpuset has more than one spelling for the same set — "0,1" and "0-1" are
+# the same two CPUs, and the kernel reports back whichever form is shorter. So
+# canonicalise before counting or comparing, or the verification below rejects
+# a pin that is exactly right.
+cpuset_expand() {
+  python3 - "$1" <<'PYEOF'
+import sys
+out = []
+for part in sys.argv[1].split(","):
+    part = part.strip()
+    if not part:
+        continue
+    if "-" in part:
+        a, b = part.split("-"); out.extend(range(int(a), int(b) + 1))
+    else:
+        out.append(int(part))
+print(",".join(str(c) for c in sorted(set(out))))
+PYEOF
+}
+
 PIN="${DECAY_PIN:-}"
 if [ -n "$PIN" ]; then
   command -v taskset >/dev/null || {
     echo "REFUSED: DECAY_PIN=$PIN but no taskset on this host."; exit 2; }
-  # Count the CPUs in a list like "0,1" or "0-3".
-  SEAT_CPUS=$(python3 - "$PIN" <<'PYEOF'
-import sys
-n = 0
-for part in sys.argv[1].split(","):
-    if "-" in part:
-        a, b = part.split("-"); n += int(b) - int(a) + 1
-    else:
-        n += 1
-print(n)
-PYEOF
-)
+  PIN_SET=$(cpuset_expand "$PIN")
+  SEAT_CPUS=$(printf '%s' "$PIN_SET" | tr ',' '\n' | grep -c .)
   RUN=(taskset -c "$PIN")
 else
+  PIN_SET=""
   SEAT_CPUS=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 0)
   RUN=()
 fi
@@ -147,7 +158,7 @@ dd if=/dev/zero of="$ROOT/.probe" bs=1M count=512 conv=fsync >/dev/null 2>&1
 DT1=$(date +%s.%N)
 rm -f "$ROOT/.probe"
 DD_MBPS=$(awk -v a="$DT0" -v b="$DT1" 'BEGIN{d=b-a; if(d<0.01)d=0.01; printf "%d", 512/d}')
-echo "== host: $NCPU cores, scratch writes at ${DD_MBPS} MB/s (need >= ${DISK_MIN})"
+echo "== seat on $SEAT_CPUS core(s)${PIN:+ (pinned to $PIN)}, scratch writes at ${DD_MBPS} MB/s (need >= ${DISK_MIN})"
 if [ "$DD_MBPS" -lt "$DISK_MIN" ]; then
   echo "REFUSED: $FLINT_DRILL_ROOT sustains only ${DD_MBPS} MB/s. At that speed"
   echo "  the curve below would be the disk's, not compaction's. On an i4i,"
@@ -242,8 +253,9 @@ for J in $JOBS; do
   # this whole file refuses to produce. Ask the kernel what it actually did.
   if [ -n "$PIN" ]; then
     ALLOWED=$(grep -m1 '^Cpus_allowed_list:' "/proc/$SPID/status" 2>/dev/null | awk '{print $2}')
-    [ "$ALLOWED" = "$PIN" ] || {
-      echo "FAIL: asked for CPUs [$PIN], the seat is running on [${ALLOWED:-unknown}]."
+    ALLOWED_SET=$(cpuset_expand "${ALLOWED:-}")
+    [ "$ALLOWED_SET" = "$PIN_SET" ] || {
+      echo "FAIL: asked for CPUs [$PIN_SET], the seat is running on [${ALLOWED_SET:-unknown}]."
       echo "  An unpinned seat measures the host, not the node we ship."
       exit 1
     }
