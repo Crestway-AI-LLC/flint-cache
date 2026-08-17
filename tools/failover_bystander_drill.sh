@@ -145,12 +145,19 @@ sleep "$SLEEP_S"
 # stopping the CP past the TTL fences every serving master — while the
 # CONTROLLER keeps running and keeps observing, which is truer to run 11
 # than the old controller-stall trigger anyway (there the controller was
-# alive and refusing, not absent). Bracketed pattern for the same
-# self-match reason as controller_stall_drill.
-CPPID=$(pgrep -f 'flint-[c]ontrolplane' | head -1)
+# alive and refusing, not absent).
+#
+# Bracketed AND end-anchored, for the two reasons spelled out at the same
+# check in controller_stall_drill.sh: the bracket keeps the pattern from
+# matching its own command line, and the `( |$)` keeps it from matching a
+# process that merely NAMES the binary — an editor or agent opened on
+# `crates/flint-controlplane/src` carries that string and was being counted
+# as a second CP seat.
+CP_PAT='flint-[c]ontrolplane( |$)'
+CPPID=$(pgrep -f "$CP_PAT" | head -1)
 [ -n "$CPPID" ] || { echo "FAIL: no control-plane process to stall"; exit 1; }
-NCP=$(pgrep -f 'flint-[c]ontrolplane' | wc -l | tr -cd '0-9')
-[ "${NCP:-0}" = 1 ] || { echo "FAIL: expected exactly 1 CP seat, found ${NCP:-0}"; pgrep -fl 'flint-[c]ontrolplane' | sed 's/^/    /'; exit 1; }
+NCP=$(pgrep -f "$CP_PAT" | wc -l | tr -cd '0-9')
+[ "${NCP:-0}" = 1 ] || { echo "FAIL: expected exactly 1 CP seat, found ${NCP:-0}"; pgrep -fl "$CP_PAT" | sed 's/^/    /'; exit 1; }
 
 echo "== SIGSTOP the CP (pid $CPPID) for ${STALL_S}s — lease is ${LEASE}ms"
 kill -STOP "$CPPID"

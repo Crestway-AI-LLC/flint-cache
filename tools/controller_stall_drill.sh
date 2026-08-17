@@ -86,19 +86,30 @@ pairs() { $CTL -f "$INV" status 2>/dev/null | grep -E '^pair' | sed 's/^/    /';
 [ "$(edge_set)" = OK ] || { echo "FAIL: edge not writable before the stall"; exit 1; }
 echo "  baseline: 2/2 masters, edge writable"
 
-# BRACKET THE PATTERN. `pgrep -f 'flint-controller'` also matches any shell
-# whose own command line merely CONTAINS that string — including the wrapper
-# that invoked this drill (a `pkill -f 'flint-controller'` in someone's
-# terminal history is enough). That is not theoretical: it picked the calling
-# shell here, so the SIGSTOP below froze the wrong process and the assertion
-# tested nothing. The bracket makes the pattern text unable to match itself.
-CPID=$(pgrep -f 'flint-[c]ontroller' | head -1)
+# MATCH THE PROCESS, NOT A MENTION OF ITS NAME.
+#
+# Two traps, and this line has now been caught by both. The BRACKET stops the
+# pattern text matching its own command line — a `pkill -f 'flint-controller'`
+# in someone's terminal history was enough to pick the calling shell, so the
+# SIGSTOP froze the wrong process and the assertion tested nothing.
+#
+# The bracket does NOT stop a match on a process that merely NAMES the binary.
+# An editor, a grep, or an agent opened on `crates/flint-controller/src` has
+# that string in its own command line, so `flint-[c]ontroller` counted it and
+# this drill failed with "found 3" while printing one. The count and the
+# listing below disagreed for the whole time — the listing already had the
+# trailing space that saved it, and the count did not.
+#
+# So anchor on the name being the END of an argument: an executable path ends
+# there, a directory path (`.../flint-controller/src`) does not.
+CTL_PAT='flint-[c]ontroller( |$)'
+CPID=$(pgrep -f "$CTL_PAT" | head -1)
 [ -n "$CPID" ] || { echo "FAIL: no controller process to stall"; exit 1; }
 # `pgrep -c` is a Linux extension; macOS pgrep has no such flag and prints a
 # usage error to stderr while yielding an empty count. Pipe to wc -l instead so
 # the drill counts the same way on the dev laptop and in CI.
-NCTL=$(pgrep -f 'flint-[c]ontroller' | wc -l | tr -cd '0-9')
-[ "${NCTL:-0}" = 1 ] || { echo "FAIL: expected exactly 1 controller, found ${NCTL:-0} — stalling one of several proves nothing"; pgrep -fl 'flint-[c]ontroller ' | sed 's/^/    /'; exit 1; }
+NCTL=$(pgrep -f "$CTL_PAT" | wc -l | tr -cd '0-9')
+[ "${NCTL:-0}" = 1 ] || { echo "FAIL: expected exactly 1 controller, found ${NCTL:-0} — stalling one of several proves nothing"; pgrep -fl "$CTL_PAT" | sed 's/^/    /'; exit 1; }
 echo "== SIGSTOP the controller (pid $CPID) for ${STALL_S}s — lease is ${LEASE}ms, held at the CP"
 kill -STOP "$CPID"
 # Prove the stop took: a SIGSTOP that silently did nothing would make the
@@ -139,10 +150,12 @@ $CTL -f "$INV" verify >/dev/null 2>&1 \
 
 # POSITIVE CONTROL: the fence must still exist, anchored where ADR-0018 put
 # it. Stop the CP past the TTL: masters that cannot renew must fence...
-CPPID=$(pgrep -f 'flint-[c]ontrolplane' | head -1)
+# Bracketed AND end-anchored, for both reasons given at CTL_PAT above.
+CP_PAT='flint-[c]ontrolplane( |$)'
+CPPID=$(pgrep -f "$CP_PAT" | head -1)
 [ -n "$CPPID" ] || { echo "FAIL: no control-plane process for the positive control"; exit 1; }
-NCP=$(pgrep -f 'flint-[c]ontrolplane' | wc -l | tr -cd '0-9')
-[ "${NCP:-0}" = 1 ] || { echo "FAIL: expected exactly 1 CP seat, found ${NCP:-0}"; exit 1; }
+NCP=$(pgrep -f "$CP_PAT" | wc -l | tr -cd '0-9')
+[ "${NCP:-0}" = 1 ] || { echo "FAIL: expected exactly 1 CP seat, found ${NCP:-0}"; pgrep -fl "$CP_PAT" | sed 's/^/    /'; exit 1; }
 echo "== positive control: SIGSTOP the CP (pid $CPPID) — masters must fence at TTL"
 kill -STOP "$CPPID"
 FENCED=0

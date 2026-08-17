@@ -111,8 +111,26 @@ grep -q "rewind attach: upstream cursor" "$D/b1.log" || {
   echo "      load (SequenceGap at best, silent replays at worst)"
   exit 1
 }
+# QUIESCE, THEN MEASURE. Killing the loop's subshell does not stop the
+# `valkey-cli` it already has in flight, so one more write can land on B after
+# this line. Sampling the tip before that straggler arrives sets A a target
+# that is one write short of B's real state: A converges to the target, B has
+# one key more, and the comparison below reports "keyspaces diverge (772 vs
+# 773)" on a rejoin that did nothing wrong. Every observed failure of this
+# assertion was off by exactly one — the signature of a straggler, not of a
+# replayed or skipped span.
+#
+# So wait for B's tip to STOP MOVING before reading it. Same discipline as the
+# converge gate: never measure a quantity while it is still changing.
 kill "$LOADPID" 2>/dev/null; wait "$LOADPID" 2>/dev/null
-BTIP=$(valkey-cli -p 6406 FLINTINFO | tr '\r' '\n' | sed -n 's/^latest_seq://p')
+BTIP=""
+for _ in $(seq 1 50); do
+  CUR=$(valkey-cli -p 6406 FLINTINFO | tr '\r' '\n' | sed -n 's/^latest_seq://p')
+  [ -n "$CUR" ] && [ "$CUR" = "$BTIP" ] && break
+  BTIP=$CUR
+  sleep 0.1
+done
+[ -n "$BTIP" ] || { echo "FAIL: B's tip could not be read after the load stopped"; exit 1; }
 wait_seq 6405 "$BTIP" || { echo "FAIL: rewound A never converged to B's tip"; exit 1; }
 DA=$(valkey-cli -p 6405 DBSIZE); DB=$(valkey-cli -p 6406 DBSIZE)
 [ "$DA" = "$DB" ] || {
