@@ -1310,12 +1310,19 @@ fn main() -> std::io::Result<()> {
                 .unwrap_or(2_000),
         );
         eprintln!(
-            "disk guard: min-free {}% or {} bytes, sampling {} every {:?}",
+            "disk guard: min-free {}% or {} bytes, sampling {} every {:?} OR SOONER",
             thresholds.min_free_pct, thresholds.min_free_bytes, dir, every
         );
         std::thread::spawn(move || {
             let path = std::path::PathBuf::from(&dir);
             let mut last = diskguard::Verdict::Ok;
+            // `every` is the CEILING, not the cadence. The interval shortens
+            // as free space closes on the threshold, so a fast filler cannot
+            // cross the whole headroom between two looks — which is what a
+            // fixed cadence allowed, measured at 10-13 points of overshoot on
+            // the self-fill drill. See `diskguard::pace`.
+            let mut prev_free: Option<u64> = None;
+            let mut slept = every;
             loop {
                 let usage = flint_storage::disk::sample(&path);
                 let v = diskguard::verdict(usage, thresholds, last);
@@ -1343,7 +1350,15 @@ fn main() -> std::io::Result<()> {
                 }
                 DISK.apply(usage, v);
                 last = v;
-                std::thread::sleep(every);
+                slept = match usage {
+                    Some(u) => diskguard::pace(prev_free, u, thresholds, slept, every),
+                    // An unreadable filesystem is never treated as fullness
+                    // (see `verdict`), and pacing off a reading we do not
+                    // have would be inventing one. Fall back to the ceiling.
+                    None => every,
+                };
+                prev_free = usage.map(|u| u.free_bytes);
+                std::thread::sleep(slept);
             }
         });
     }
