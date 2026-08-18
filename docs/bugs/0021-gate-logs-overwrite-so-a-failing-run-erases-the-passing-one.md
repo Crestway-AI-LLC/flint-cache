@@ -61,7 +61,39 @@ The failing log was copied out by hand before anything could overwrite it. That
 is not a fix; it depends on someone realising the hazard while the file still
 exists, which is the same reliance on memory the header set out to remove.
 
+## The CI half is worse: the log is never captured at all
+
+Locally a log survives until the next run. In CI it does not survive the job.
+The gate prints the path and stops:
+
+    FAIL  chaos_unreadable       (5s)  /tmp/flint-gates/chaos-chaos_unreadable.log
+
+That file lives on the runner, is never dumped to the job log and is never
+uploaded as an artifact, so it dies with the container. **Everything CI can
+tell you about a failing drill is the word FAIL and a duration.**
+
+Measured cost, 2026-08-18: reconstructing BUG-0014's history meant reading all
+91 `gate` runs on `main` and scoring each by whether `chaos_unreadable`
+produced a PASS or FAIL line, because that line is the only surviving evidence.
+Four failures were found. **Three of them have no assertion text and never
+will** — they are known to be the same drill, not verified to be the same bug.
+A durability oracle fired three times in CI and left no record of what it saw.
+
+This also removed the cheapest check on a wrong hypothesis. Two separate
+"this was fixed" claims were argued that day from commit dates and run
+outcomes alone; had the drill logs been retrievable, comparing a failing
+assertion against a passing one would have settled it in minutes.
+
+## Fix, second half
+
+Upload `$FLINT_GATE_LOGS` as a job artifact whenever the gate fails, and dump
+the failing steps' logs inline so a red run is legible without downloading
+anything. Both halves are one change once the logs are namespaced per run: the
+directory that becomes safe to keep locally is the directory to upload.
+
 ## Related
 
 - BUG-0009 — also `gates.sh`, also a result that does not mean what it says
-- BUG-0014 — the intermittent whose diagnosis this retention loss obstructs
+- BUG-0014 — the intermittent whose diagnosis this retention loss obstructs;
+  three of its four CI firings have no recoverable assertion text because of
+  the second half above
