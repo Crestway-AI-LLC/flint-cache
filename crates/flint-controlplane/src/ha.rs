@@ -1295,6 +1295,14 @@ async fn handle_admin(ha: &Ha, args: &[Vec<u8>]) -> Value {
 /// tool. So they are pinned by a test HERE instead, in the crate where the
 /// edit would be made, so a reworded message breaks a test rather than a
 /// roll. Change either string and you must change flint-ctl to match.
+///
+/// That test is `cp_error_contract_tests`, AT THE END OF THIS FILE rather
+/// than here beside the constants it guards. Not preference: clippy's
+/// `items after a test module` fires on any item declared after a
+/// `#[cfg(test)] mod`, and there is real code below this point. Tidying the
+/// test back up next to these will not compile under `-D warnings` — noted
+/// because that is the obvious thing to want, and the lint does not explain
+/// itself.
 pub const ERR_UNKNOWN_CP_COMMAND: &str = "ERR unknown control-plane command";
 pub const ERR_CPFENCE_ARITY: &str = "ERR CPFENCE <addr>";
 
