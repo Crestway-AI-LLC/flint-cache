@@ -1,8 +1,8 @@
-# BUG-0019: `FLINT_DRILL_ROOT` on a mounted volume breaks `disk_pressure`, and the error blames the image (OPEN)
+# BUG-0019: `FLINT_DRILL_ROOT` on a mounted volume breaks `disk_pressure`, and the error blames the image (FIXED)
 
-Status: OPEN, found 2026-08-18 running the gate for the BUG-0017 fix ·
-Severity: **medium** — the gate reports a red that is not the product's, and its
-message points away from the cause
+Status: **FIXED** 2026-08-18, found the same day running the gate for the
+BUG-0017 fix · Severity was medium — the gate reported a red that was not the
+product's, and its message pointed away from the cause
 
 ## Symptom
 
@@ -70,20 +70,33 @@ misfiled as flakiness.** If those earlier runs used a non-default
 Not verified — the earlier runs' roots were not recorded, which is itself part
 of the problem. Stated as a lead so it is checked rather than rediscovered.
 
-## Fix
+## Fix — applied
 
-Any of these closes it; the first is the smallest:
+`tools/disk_pressure_drill.sh` now places the image and its mountpoint on the
+volume that accepts an attach, and leaves everything else on the drill root.
 
-- **Validate the root up front**, in `gates.sh` or in the drill's preflight:
-  if `FLINT_DRILL_ROOT` resolves inside a mount that is not the boot volume,
-  fail immediately naming the variable, or skip this one drill with that reason
-  stated. A skip that says why is honest; a red that misdirects is not.
-- **Decouple the image from the root** — place the `.dmg` and its mountpoint on
-  the boot volume unconditionally, since what the drill needs is *a small
-  filesystem*, not one on the drill root. The rest of its scratch can stay
-  wherever the root points.
-- **Record the root in the gate log header** regardless, so a future
-  "intermittent" failure can be correlated with it instead of guessed at.
+The choice was between refusing and removing the exception. Refusing is honest
+but leaves #180 with a permanent carve-out; removing it is possible because what
+this drill needs is *a* small filesystem, not one on the drill root. So the
+scope, lock and seat log still follow `FLINT_DRILL_ROOT` and only the ~512 MB
+image relocates — which is the price of the drill running at all.
+
+The predicate compares **devices**, not mount points, against the fallback:
+on APFS the sealed system volume and the data volume have different mount
+points, so testing against `/` would have relocated even the default root.
+Darwin only — the Linux loop-mount path has no such restriction and is
+untouched. The header now prints the image root, so a future "intermittent"
+failure can be correlated with it instead of guessed at.
+
+**Both controls run, which is what makes this a fix rather than a hope:**
+
+- *Positive* — the exact configuration that failed
+  (`FLINT_DRILL_ROOT=/Volumes/FlintDev/drillscratch`) now prints
+  `image + mountpoint go to ... instead (BUG-0019)` and reaches
+  `PASS: disk pressure`.
+- *Negative* — at the default root the relocation does **not** fire
+  (`image root /tmp`) and the drill passes unchanged, so the fix cannot be
+  passing by relocating unconditionally.
 
 ## Related
 

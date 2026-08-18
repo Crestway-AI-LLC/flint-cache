@@ -34,10 +34,45 @@ cd "$(dirname "$0")/.."
 fleet_init $FLINT_DRILL_ROOT/flint-diskpressure 6396
 
 PORT=6396
+
+# BUG-0019: where the IMAGE lives, which is not where the rest of the drill
+# lives.
+#
+# This drill mounts a filesystem at a path inside its own root, and macOS
+# refuses to attach an image beneath an already-mounted volume. FLINT_DRILL_ROOT
+# exists (#180) so drill I/O can be moved off the boot disk — so honouring it
+# here made this the ONE drill that cannot run off another volume, and it failed
+# with `could not attach the disk image`: a message pointing at hdiutil and the
+# image, never at the variable that actually decided it. The stale-mount note in
+# the cleanup section below is what a reader rules out first, costing the whole
+# diagnosis.
+#
+# What this drill needs is A small filesystem, not one on the drill root. So the
+# image and its mountpoint go somewhere known to accept an attach, and every
+# other artefact — scope, lock, seat log — still follows FLINT_DRILL_ROOT. Cost
+# is ~512 MB of boot-disk I/O when the root points elsewhere, which is the price
+# of the drill running at all.
+#
+# The predicate is "same volume as the fallback", compared by device rather than
+# by mount point: on APFS the sealed system volume and the data volume have
+# different mount points, so comparing against `/` would relocate even the
+# default root. Darwin only — the Linux loop-mount path has no such restriction
+# and is left exactly as it was.
+IMGROOT=$FLINT_DRILL_ROOT
+if [ "$(uname)" = "Darwin" ]; then
+  _root_dev=$(df -P "$FLINT_DRILL_ROOT" 2>/dev/null | awk 'END{print $1}')
+  _boot_dev=$(df -P "${TMPDIR:-/tmp}" 2>/dev/null | awk 'END{print $1}')
+  if [ -n "$_root_dev" ] && [ "$_root_dev" != "$_boot_dev" ]; then
+    IMGROOT=${TMPDIR:-/tmp}
+    echo "== drill root $FLINT_DRILL_ROOT is on $_root_dev, a separate volume;"
+    echo "   image + mountpoint go to $IMGROOT instead (BUG-0019)"
+  fi
+fi
+
 # macOS: hdiutil APPENDS .dmg when the path lacks it, so a bare .img name
 # creates one file and attaches another. Name it per platform.
-if [ "$(uname)" = "Darwin" ]; then IMG=$FLINT_DRILL_ROOT/flint-diskpressure.dmg; else IMG=$FLINT_DRILL_ROOT/flint-diskpressure.img; fi
-MNT=$FLINT_DRILL_ROOT/flint-diskpressure-mnt
+if [ "$(uname)" = "Darwin" ]; then IMG=$IMGROOT/flint-diskpressure.dmg; else IMG=$IMGROOT/flint-diskpressure.img; fi
+MNT=$IMGROOT/flint-diskpressure-mnt
 SIZE_MB=512
 # Thresholds chosen so a 512 MB volume trips them with a ~400 MB ballast
 # file, not so tight that filesystem overhead alone trips them at boot.
@@ -89,7 +124,7 @@ trap cleanup EXIT
 cleanup
 assert_unmounted
 
-echo "== a $SIZE_MB MB filesystem to run out of"
+echo "== a $SIZE_MB MB filesystem to run out of (image root $IMGROOT)"
 if [ "$(uname)" = "Darwin" ]; then
   mkdir -p "$MNT"
   hdiutil create -size "${SIZE_MB}m" -fs HFS+ -volname flintpressure -quiet "$IMG" \
