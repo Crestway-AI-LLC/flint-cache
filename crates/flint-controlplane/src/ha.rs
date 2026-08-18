@@ -1184,8 +1184,34 @@ async fn handle_admin(ha: &Ha, args: &[Vec<u8>]) -> Value {
             }
         }
         b"CPJOURNALREAD" => {
+            // CPJOURNALREAD <n> [KINDS <kind,kind,...>]
+            //
+            // ADR-0018 item 1: the kind filter exists so a consumer's horizon
+            // depends on the volume of what IT reasons about, not on total fleet
+            // chatter. Filtering is applied BEFORE the tail, so this returns the
+            // last n MATCHING lines — a client-side filter cannot do that, and
+            // tier2 already had one when the 2026-08-17 outage disarmed it.
+            //
+            // AN UNKNOWN KIND IS AN ERROR, NOT AN EMPTY RESULT. This is the
+            // safety-critical half. tier2 derives its action budget from a count
+            // of ActionExecuted in a window; zero rows reads as "no actions
+            // taken", i.e. full budget, i.e. act freely. The short-tail guard
+            // does not catch it either, because a filter matching nothing
+            // returns fewer than the scan size and so looks like a journal that
+            // simply reaches back far enough. A typo or a renamed variant would
+            // therefore not degrade the guard, it would REMOVE it, silently.
+            // Refusing here also gives clients a side-effect-free capability
+            // probe: a control plane that predates this filter ignores the extra
+            // arguments and returns rows, a current one rejects a deliberately
+            // invalid kind, so "did my filter actually apply" is answerable
+            // without writing anything (the CPFENCE probe, ADR-0018, same shape).
+            let kinds = match flint_journal::parse_kinds_arg(text(2).as_deref(), text(3).as_deref())
+            {
+                Ok(k) => k,
+                Err(e) => return Value::Error(format!("ERR {e}")),
+            };
             let n = text(1).and_then(|v| v.parse().ok()).unwrap_or(50);
-            let lines = flint_journal::tail(&ha.journal_path, n);
+            let lines = flint_journal::tail_kinds(&ha.journal_path, n, &kinds);
             Value::Bulk(Some(lines.join("\n").into_bytes()))
         }
         b"CPINFO" => {

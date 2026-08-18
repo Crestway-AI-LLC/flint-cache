@@ -1009,8 +1009,22 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
             }
         }
         b"CPJOURNALREAD" => {
+            // CPJOURNALREAD <n> [KINDS <kind,kind,...>]
+            //
+            // ADR-0018 item 1. See the twin arm in ha.rs for the full
+            // reasoning; the short version is that filtering happens BEFORE
+            // the tail, so a consumer's horizon is sized by the volume of
+            // what it reasons about rather than by total fleet chatter, and
+            // an unknown kind is an ERROR because for a budget counter an
+            // empty result reads as "no actions taken" — full budget, act
+            // freely — which removes the guard instead of degrading it.
+            let kinds = match flint_journal::parse_kinds_arg(text(2).as_deref(), text(3).as_deref())
+            {
+                Ok(k) => k,
+                Err(e) => return err(&e),
+            };
             let n = text(1).and_then(|v| v.parse().ok()).unwrap_or(50);
-            let lines = flint_journal::tail(&shared.journal_path, n);
+            let lines = flint_journal::tail_kinds(&shared.journal_path, n, &kinds);
             Value::Bulk(Some(lines.join("\n").into_bytes()))
         }
         b"CPINFO" => {
@@ -1596,4 +1610,157 @@ fn run_raft(port: u16, state_path: String) -> std::io::Result<()> {
         }
         ha::run_client(ha, port, bind_host, tls_server).await
     })
+}
+
+/// Wire-level tests for the `CPJOURNALREAD` kind filter (ADR-0018 item 1).
+///
+/// These call `handle` directly rather than dialing a control plane. That is
+/// the point: the behaviour being protected is a SAFETY guard's input, and a
+/// check that only runs against live infrastructure is a check nobody runs.
+/// `handle` is synchronous and `Shared` is cheap, so there is no excuse for
+/// the command surface to be untested.
+#[cfg(test)]
+mod cpjournalread_filter_tests {
+    use super::*;
+    use flint_journal::{Event, EventKind};
+
+    struct Tmp(std::path::PathBuf);
+    impl Tmp {
+        fn new() -> Self {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static N: AtomicU64 = AtomicU64::new(0);
+            let p = std::env::temp_dir().join(format!(
+                "flint-cpjr-{}-{}",
+                std::process::id(),
+                N.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&p).unwrap();
+            Self(p)
+        }
+        fn journal(&self) -> String {
+            self.0.join("j.jsonl").to_string_lossy().into_owned()
+        }
+    }
+    impl Drop for Tmp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn shared(journal_path: String) -> Shared {
+        Shared {
+            state: Mutex::new(State::default()),
+            changed: Condvar::new(),
+            journal_path,
+            usage: Mutex::new(std::collections::HashMap::new()),
+            leases: Mutex::new(LeaseFast::default()),
+        }
+    }
+
+    fn seed(path: &str) {
+        let mut body = String::new();
+        let mut push = |at: u64, kind: EventKind| {
+            let e = Event {
+                at_ms: at,
+                actor: "test".into(),
+                kind,
+                subject: format!("s{at}"),
+                epoch: None,
+                cause: None,
+                detail: None,
+            };
+            body.push_str(&serde_json::to_string(&e).unwrap());
+            body.push('\n');
+        };
+        push(1, EventKind::ActionExecuted);
+        for i in 0..300u64 {
+            push(100 + i, EventKind::Detected);
+        }
+        push(9_000, EventKind::ActionVerified);
+        std::fs::write(path, body).unwrap();
+    }
+
+    fn call(sh: &Shared, args: &[&str]) -> Value {
+        let a: Vec<Vec<u8>> = args.iter().map(|s| s.as_bytes().to_vec()).collect();
+        handle(sh, &a)
+    }
+
+    fn body(v: &Value) -> String {
+        match v {
+            Value::Bulk(Some(b)) => String::from_utf8_lossy(b).into_owned(),
+            other => panic!("expected bulk, got {other:?}"),
+        }
+    }
+
+    /// The filter reaches back PAST a flood that would otherwise fill the
+    /// window — the 2026-08-17 shape, at the command surface.
+    #[test]
+    fn the_filter_sees_actions_a_flood_would_have_buried() {
+        let t = Tmp::new();
+        let p = t.journal();
+        seed(&p);
+        let sh = shared(p);
+
+        let plain = body(&call(&sh, &["CPJOURNALREAD", "50"]));
+        assert!(
+            !plain.contains("ActionExecuted"),
+            "precondition: the flood must bury it unfiltered, else this proves nothing"
+        );
+
+        let filtered = body(&call(
+            &sh,
+            &[
+                "CPJOURNALREAD",
+                "50",
+                "KINDS",
+                "ActionExecuted,ActionVerified",
+            ],
+        ));
+        assert!(
+            filtered.contains("ActionExecuted"),
+            "the buried action surfaces"
+        );
+        assert!(filtered.contains("ActionVerified"));
+        assert!(!filtered.contains("Detected"), "and the flood is excluded");
+        assert_eq!(filtered.lines().count(), 2);
+    }
+
+    /// THE ONE THAT PROTECTS THE BUDGET. An unknown kind must be an error at
+    /// the wire, because an empty bulk reads to tier2 as "no actions taken"
+    /// — full budget — and nothing downstream can tell the two apart.
+    #[test]
+    fn an_unknown_kind_errors_rather_than_returning_no_rows() {
+        let t = Tmp::new();
+        let p = t.journal();
+        seed(&p);
+        let sh = shared(p);
+        match call(&sh, &["CPJOURNALREAD", "50", "KINDS", "ActionExecutd"]) {
+            Value::Error(e) => assert!(e.contains("ActionExecutd"), "must name it: {e}"),
+            other => panic!("a typo returned rows instead of refusing: {other:?}"),
+        }
+        // ...and the same for a malformed narrow request, which must never
+        // widen into an unfiltered read.
+        assert!(matches!(
+            call(&sh, &["CPJOURNALREAD", "50", "KINDS"]),
+            Value::Error(_)
+        ));
+        assert!(matches!(
+            call(&sh, &["CPJOURNALREAD", "50", "SINCE", "123"]),
+            Value::Error(_)
+        ));
+    }
+
+    /// Callers that predate the filter keep byte-identical behaviour.
+    #[test]
+    fn the_unfiltered_form_is_unchanged() {
+        let t = Tmp::new();
+        let p = t.journal();
+        seed(&p);
+        let sh = shared(p.clone());
+        let got = body(&call(&sh, &["CPJOURNALREAD", "50"]));
+        assert_eq!(got, flint_journal::tail(&p, 50).join("\n"));
+        // And the documented default when n is absent.
+        let dflt = body(&call(&sh, &["CPJOURNALREAD"]));
+        assert_eq!(dflt.lines().count(), 50);
+    }
 }
