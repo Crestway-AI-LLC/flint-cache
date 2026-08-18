@@ -23,6 +23,14 @@ but iter 3 panicked before it could print its kill line, so the drill's
 positive control saw a truncated sequence. **The failure to investigate is the
 panic, not the sequence check.**
 
+## It is INTERMITTENT — confirmed 2026-08-18
+
+The very next gate run (`32101901310`, an unrelated drill change) passed
+`chaos_unreadable` in 5s with the same seed, same iterations, same binary
+inputs. So this is not deterministic at seed 1, and any investigation that
+concludes from a single green run that it is fixed will be wrong. Reproducing
+it may take several runs; a fix needs several greens to mean anything.
+
 ## Established
 
 - The drill runs `flint-chaos --port-base 6346 --iterations 3 --keys 4000
