@@ -62,7 +62,22 @@ set +e
   --inject-unreadable "$INJECT" >"$D/out.log" 2>&1
 RC=$?
 set -e
-sed 's/^/  | /' "$D/out.log" | grep -E "iter |unreadable|PASS|FAIL|panick" || true
+# The filtered view is a readability choice for a PASSING run. On failure it
+# is actively harmful: the grep is line-based, and every line of the BUG-0014
+# diagnostic block — read_via, the resolved master, the ledger dump with
+# sent_before_prev_kill — matches none of these patterns. Verified against the
+# real format: of a 7-line panic only the "panicked at" header and the "iter N"
+# assertion survive, which is exactly the two lines every recovered CI log
+# shows. The probe we rely on to tell a harness bug from a durability
+# regression would have printed nothing, and $D is deleted on the trap.
+#
+# So on failure, print the log ENTIRE. The detail is the whole point of the run.
+if [ "$RC" -ne 0 ]; then
+  echo "  -- chaos run FAILED (rc=$RC); full output follows, unfiltered --"
+  sed 's/^/  | /' "$D/out.log"
+else
+  sed 's/^/  | /' "$D/out.log" | grep -E "iter |unreadable|PASS|FAIL|panick" || true
+fi
 
 # 1. POSITIVE CONTROL ON THE TEST ITSELF: the scenario has to have happened.
 #    A master kill with nothing after it proves nothing, and a run where the

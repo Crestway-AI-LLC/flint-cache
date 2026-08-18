@@ -531,17 +531,38 @@ fn main() {
                 acked_at: Vec<(u64, u64, u64)>,
                 last_acked: u64,
             }
-            let snapshot: Vec<KeySnap> = {
+            // BUG-0014 DIAGNOSTIC: the prune below runs INSIDE the loop over
+            // this snapshot, so a key excluded here is never pruned. If such a
+            // key later acquires an ack that predates the kill and was never
+            // replicated, the NEXT replica kill asserts it against a seat that
+            // never had it. That is the same class as the bug the comment at
+            // the prune describes, one level out: that fix widened the prune's
+            // CONDITION, this is a hole in its DOMAIN.
+            //
+            // Printed unconditionally, not only on failure: a zero here across
+            // many runs falsifies the mechanism, and a count that only appears
+            // when the bug fires could never do that.
+            let (snapshot, excluded) = {
                 let led = shared.ledger.lock().unwrap_or_else(|e| e.into_inner());
-                led.iter()
+                let excluded = led.iter().filter(|(_, e)| e.last_acked == 0).count();
+                let snap: Vec<KeySnap> = led
+                    .iter()
                     .filter(|(_, e)| e.last_acked != 0)
                     .map(|(k, e)| KeySnap {
                         key: k.clone(),
                         acked_at: e.acked_at.clone(),
                         last_acked: e.last_acked,
                     })
-                    .collect()
+                    .collect();
+                (snap, excluded)
             };
+            println!(
+                "  | BUG-0014 DIAGNOSTIC: master-kill prune domain: {} key(s) in \
+                 snapshot, {} ledger key(s) EXCLUDED (last_acked==0) and therefore \
+                 never pruned",
+                snapshot.len(),
+                excluded
+            );
             let must_have_replicated_by = kill_ms.saturating_sub(lag_hard_ms + rpo_margin_ms);
             // Read back the way the CLIENT would: through the edge when
             // that is the path under test, so a proxy that has not chased

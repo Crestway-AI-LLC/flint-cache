@@ -267,6 +267,69 @@ re-opened without new data:
 One line rests on silence under forced lag, the other on which real runs went
 red. They agree, and they agree against the hypothesis.
 
+## The probe would have printed NOTHING — fixed 2026-08-18
+
+Before the next firing could pay out, the drill would have thrown the payout
+away. `chaos_unreadable_drill.sh` captured the harness's stdout to `$D/out.log`
+and printed it as:
+
+    sed 's/^/  | /' "$D/out.log" | grep -E "iter |unreadable|PASS|FAIL|panick"
+
+with `rm -rf "$D"` on the trap. The grep is line-based and the BUG-0014
+diagnostic is a seven-line panic message. Run the real format through the real
+pipeline and only two lines survive — the `panicked at` header and the `iter N`
+assertion. Everything that decides the question is dropped:
+
+    DROPPED  == BUG-0014 DIAGNOSTIC ==
+    DROPPED  read_via: direct (cluster.master_client)
+    DROPPED  master:   127.0.0.1:6347 role=master epoch=3 last_applied=...
+    DROPPED  prev_master_kill dead_ms: ...
+    DROPPED  ledger last_acked=... entries_above_got=[... sent_before_prev_kill=true]
+    DROPPED  READ IT SO: ...
+
+**That is exactly the two-line shape every recovered CI log shows**, which had
+been read as "the panic is terse". It was not; the drill was filtering it. The
+probe, the `read_via` branch recorder and the `sent_before_prev_kill` flags —
+the whole apparatus for separating a harness bug from a durability regression —
+would have produced nothing, in CI and locally alike, and the unfiltered copy
+is deleted when the drill exits.
+
+Fixed: on a non-zero return the drill now prints the log entire, unfiltered.
+The filtered view is kept for a passing run, where it is a readability choice
+rather than a loss. **This drill was the only one of 108 that filtered a
+captured log this way**, so the fix is local, not a sweep.
+
+## FALSIFIED: the excluded-key mechanism, measured 2026-08-18
+
+A candidate mechanism for (b): the master-kill prune at `:743` runs *inside* the
+loop over the iteration-2 snapshot, so a key excluded from that snapshot
+(`last_acked == 0`) is never pruned. If it later acquires an ack predating the
+kill, iteration 3 asserts it against a seat that never had it. The two snapshot
+filters are identical (`:547`, `:789`), so membership turns purely on timing —
+and unlike regression volume, a single straggler would explain why the smallest
+regression failed and the largest passed.
+
+**Measured directly.** Instrumented the iteration-2 snapshot to count ledger
+entries with `last_acked == 0`:
+
+| configuration | in snapshot | EXCLUDED |
+|---|---|---|
+| `--keys 4000` (the drill's own), 5 runs | 4000 | **0, every run** |
+| `--keys 50000` | 37988 | 0 |
+| `--keys 200000` (positive control) | 69552 | **2** |
+
+**The counter is not vacuous** — `writer.rs:295` creates the entry with
+`or_default()` at write-issue time and only `record_ack` (`:315`) sets
+`last_acked`, so the excluded population is exactly the keys whose FIRST ack is
+in flight. At 200k keys that population is non-empty and the counter moved,
+which is the positive control; at the drill's 4000 keys every key is
+first-acked within the opening moments of the run, thousands of writes before
+iteration 2.
+
+**So the mechanism cannot fire at the configuration this bug actually runs.**
+Recorded with its positive control because a zero from an instrument that
+cannot move would have looked identical.
+
 ## Where to start
 
 The instrumentation for this landed in `581e074` and is in the binary
