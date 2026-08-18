@@ -92,13 +92,20 @@ echo "  baseline: 2/2 masters, edge writable"
 # terminal history is enough). That is not theoretical: it picked the calling
 # shell here, so the SIGSTOP below froze the wrong process and the assertion
 # tested nothing. The bracket makes the pattern text unable to match itself.
-CPID=$(pgrep -f 'flint-[c]ontroller' | head -1)
+# Anchored on the RELEASE PATH, not the binary name. `pgrep -f` matches the
+# WHOLE command line of every process on the box, so a bare 'flint-controller'
+# also matched this developer's editor and agent, whose argv carried
+# `--add-dir .../crates/flint-controller/src`. Both singleton guards then
+# reported three seats and failed a healthy fleet. CI never saw it: the runner
+# has no such processes, so the check was strictest exactly where it was least
+# needed and silent where it mattered.
+CPID=$(pgrep -f '/target/release/flint-[c]ontroller ' | head -1)
 [ -n "$CPID" ] || { echo "FAIL: no controller process to stall"; exit 1; }
 # `pgrep -c` is a Linux extension; macOS pgrep has no such flag and prints a
 # usage error to stderr while yielding an empty count. Pipe to wc -l instead so
 # the drill counts the same way on the dev laptop and in CI.
-NCTL=$(pgrep -f 'flint-[c]ontroller' | wc -l | tr -cd '0-9')
-[ "${NCTL:-0}" = 1 ] || { echo "FAIL: expected exactly 1 controller, found ${NCTL:-0} — stalling one of several proves nothing"; pgrep -fl 'flint-[c]ontroller ' | sed 's/^/    /'; exit 1; }
+NCTL=$(pgrep -f '/target/release/flint-[c]ontroller ' | wc -l | tr -cd '0-9')
+[ "${NCTL:-0}" = 1 ] || { echo "FAIL: expected exactly 1 controller, found ${NCTL:-0} — stalling one of several proves nothing"; pgrep -fl '/target/release/flint-[c]ontroller ' | sed 's/^/    /'; exit 1; }
 echo "== SIGSTOP the controller (pid $CPID) for ${STALL_S}s — lease is ${LEASE}ms, held at the CP"
 kill -STOP "$CPID"
 # Prove the stop took: a SIGSTOP that silently did nothing would make the
@@ -139,9 +146,9 @@ $CTL -f "$INV" verify >/dev/null 2>&1 \
 
 # POSITIVE CONTROL: the fence must still exist, anchored where ADR-0018 put
 # it. Stop the CP past the TTL: masters that cannot renew must fence...
-CPPID=$(pgrep -f 'flint-[c]ontrolplane' | head -1)
+CPPID=$(pgrep -f '/target/release/flint-[c]ontrolplane ' | head -1)
 [ -n "$CPPID" ] || { echo "FAIL: no control-plane process for the positive control"; exit 1; }
-NCP=$(pgrep -f 'flint-[c]ontrolplane' | wc -l | tr -cd '0-9')
+NCP=$(pgrep -f '/target/release/flint-[c]ontrolplane ' | wc -l | tr -cd '0-9')
 [ "${NCP:-0}" = 1 ] || { echo "FAIL: expected exactly 1 CP seat, found ${NCP:-0}"; exit 1; }
 echo "== positive control: SIGSTOP the CP (pid $CPPID) — masters must fence at TTL"
 kill -STOP "$CPPID"

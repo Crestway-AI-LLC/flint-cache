@@ -147,10 +147,17 @@ sleep "$SLEEP_S"
 # than the old controller-stall trigger anyway (there the controller was
 # alive and refusing, not absent). Bracketed pattern for the same
 # self-match reason as controller_stall_drill.
-CPPID=$(pgrep -f 'flint-[c]ontrolplane' | head -1)
+# Anchored on the RELEASE PATH, not the binary name. `pgrep -f` matches the
+# WHOLE command line of every process on the box, so a bare 'flint-controller'
+# also matched this developer's editor and agent, whose argv carried
+# `--add-dir .../crates/flint-controller/src`. Both singleton guards then
+# reported three seats and failed a healthy fleet. CI never saw it: the runner
+# has no such processes, so the check was strictest exactly where it was least
+# needed and silent where it mattered.
+CPPID=$(pgrep -f '/target/release/flint-[c]ontrolplane ' | head -1)
 [ -n "$CPPID" ] || { echo "FAIL: no control-plane process to stall"; exit 1; }
-NCP=$(pgrep -f 'flint-[c]ontrolplane' | wc -l | tr -cd '0-9')
-[ "${NCP:-0}" = 1 ] || { echo "FAIL: expected exactly 1 CP seat, found ${NCP:-0}"; pgrep -fl 'flint-[c]ontrolplane' | sed 's/^/    /'; exit 1; }
+NCP=$(pgrep -f '/target/release/flint-[c]ontrolplane ' | wc -l | tr -cd '0-9')
+[ "${NCP:-0}" = 1 ] || { echo "FAIL: expected exactly 1 CP seat, found ${NCP:-0}"; pgrep -fl '/target/release/flint-[c]ontrolplane ' | sed 's/^/    /'; exit 1; }
 
 echo "== SIGSTOP the CP (pid $CPPID) for ${STALL_S}s — lease is ${LEASE}ms"
 kill -STOP "$CPPID"
