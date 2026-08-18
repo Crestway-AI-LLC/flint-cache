@@ -42,3 +42,4 @@ New references should use the path, so a reader can follow them.
 | `0020-restart-drill-bypasses-fleet-sh.md` | `restart` declares no ports and cleans up with a bare `pkill`, so it is invisible to the overlap preflight and leaks (OPEN) |
 | `0021-gate-logs-overwrite-so-a-failing-run-erases-the-passing-one.md` | gate step logs are per-step not per-run, so re-running to diagnose destroys the evidence you were going to diff (OPEN) |
 | `0022-rocksdb-tickers-read-zero-when-statistics-are-disabled.md` | statistics are never enabled in production, so every RocksDB ticker reads a confident zero that means "never measured" (OPEN) |
+| `0023-chain-traversal-loses-a-link-but-only-inside-a-full-gate.md` | a chain link is nil after a master kill in a gate run; 5 solo runs never reproduce it, port collision ruled out (OPEN) |
