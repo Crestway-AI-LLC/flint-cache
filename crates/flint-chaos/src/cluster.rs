@@ -380,6 +380,31 @@ impl Target {
         }
     }
 
+    /// BUG-0014 diagnostic: what `master_client()` will actually dial, and
+    /// that node's own view of itself. Printed only on the acked-loss panic,
+    /// because the whole question is whether the harness read the seat it
+    /// believed it was reading.
+    pub fn master_diagnostic(&self) -> String {
+        match self {
+            Target::Local { cluster, .. } => {
+                let p = cluster.master();
+                let f = |k: &str| {
+                    flintinfo_field(p, k)
+                        .map(|v| v.trim().to_string())
+                        .unwrap_or_else(|| "?".to_string())
+                };
+                format!(
+                    "local port {p} role={} role_epoch={} seq_lag={} live_replicas={}",
+                    f("role:"),
+                    f("role_epoch:"),
+                    f("seq_lag:"),
+                    f("live_replicas:")
+                )
+            }
+            Target::Attached(a) => format!("attached {}", a.master()),
+        }
+    }
+
     pub fn wait_healthy(&self, budget: Duration) -> bool {
         match self {
             Target::Local { cluster, .. } => cluster.wait_healthy(budget),
@@ -970,7 +995,7 @@ pub fn dbsize(port: u16) -> Option<i64> {
     }
 }
 
-fn flintinfo_field(port: u16, field: &str) -> Option<String> {
+pub(crate) fn flintinfo_field(port: u16, field: &str) -> Option<String> {
     let mut c = Client::connect(port).ok()?;
     let Value::Bulk(Some(info)) = c.call(&[b"FLINTINFO"]).ok()? else {
         return None;

@@ -32,11 +32,19 @@ each read is the network.
 |---|---|---|---|---|
 | GETs, hot slice | 96,116/s | **0.32 ms** | **0.61 ms** | 0.98 ms |
 | Mixed 1:10 write:read | 96,480/s | 0.32 ms | 0.61 ms | 0.99 ms |
-| GETs, pipelined ×16 | 228,484/s | 2.24 ms | 2.86 ms | 4.26 ms |
+| GETs, pipelined ×16 (512 in flight) | 228,484/s | 2.24 ms | 2.86 ms | 4.26 ms |
 | SETs (WAL before ack) | 87,449/s | 0.35 ms | 0.71 ms | 4.58 ms |
 
 Every row is the *worse* of two independent runs. This dataset fits the box's
 61 GB of RAM, so it measures the request path, not the beyond-RAM case.
+
+**The pipelined row is measured differently from the rest.** It runs 16
+requests deep on each of the 32 connections — **512 in flight, not 32** — so
+its p50 is one request's wait in a queue sixteen deep, not a slower round
+trip. That row trades sixteen times the queue depth for the throughput jump
+beside it. Most clients do not pipeline by default — `redis-benchmark` and
+`memtier_benchmark` both ship with it off — so the hot-slice row is the one an
+ordinary application sees.
 
 **The beyond-RAM case (2026-08-18, same build, same fleet shape).** The
 dataset that does not fit: 100 M × 1 KB keys measuring **121 GB on NVMe
@@ -49,7 +57,7 @@ nothing else.
 |---|---|---|---|---|
 | GETs, hot slice | 78,827/s | **0.39 ms** | **0.94 ms** | 1.67 ms |
 | Mixed 1:10 write:read | 75,406/s | 0.41 ms | 0.98 ms | 1.79 ms |
-| GETs, pipelined ×16 | 181,035/s | 2.78 ms | 6.18 ms | 8.19 ms |
+| GETs, pipelined ×16 (512 in flight) | 181,035/s | 2.78 ms | 6.18 ms | 8.19 ms |
 | SETs (WAL before ack) | 81,844/s | 0.38 ms | 0.77 ms | 1.25 ms |
 
 **Leaving RAM costs about 72 µs at GET p50 and 24 µs at SET.** Reads pay,

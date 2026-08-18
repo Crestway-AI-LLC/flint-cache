@@ -4,6 +4,13 @@ Status: OPEN, found 2026-08-18 from CI · Severity: high if real — the oracle
 is asserting the durability claim, so either the claim broke or the oracle is
 crying wolf, and both are worth an hour
 
+**Numbering, because git log points the wrong way.** Commit `6613c15`, which
+fixed the other three gate failures, calls this one "BUG-0012" in its message.
+It is BUG-0014; the number was reassigned before filing, because 0012 was
+already the WAL-retention livelock. That commit carries the same correction as
+a git note (`git log --notes`), but a fresh clone does not fetch notes, so the
+correction lives here too. Do not follow the 0012 reference.
+
 ## Symptom
 
 `tools/chaos_unreadable_drill.sh`, every gate run since 2026-08-16:
@@ -135,6 +142,52 @@ Everything about the cause. In particular it is NOT established whether:
 
 The 5,544-deep gap is equally consistent with both, and no evidence in hand
 separates them.
+
+## Attempted reproduction, 2026-08-18 — 21 valid runs, ZERO reproductions
+
+**It does not reproduce outside a full gate.** Three configurations, all on an
+idle box with nothing else running:
+
+| configuration | runs | reproduced |
+|---|---|---|
+| raw binary, drill's exact args | 6 | 0 |
+| raw binary + `--stall-replica-ms` 600/1200/1800/3000 | 12 | 0 |
+| `tools/chaos_unreadable_drill.sh` itself | 3 | 0 |
+
+**"Valid" is load-bearing here.** An earlier attempt reported 8/8 failures that
+were nothing of the sort: the worktree had no `flint-server`, every run died at
+`cluster.rs:942` before reaching the assertion, and `rc=101` looked exactly like
+an oracle panic. The runs above are gated on a precondition (both binaries
+present and `flint-server` executes) and scored three ways — pass /
+reproduced-with-diagnostic / failed-other — so "it failed" and "it never ran"
+can no longer wear the same clothes. That guard immediately earned itself: the
+first drill-script attempt returned `rc=126`, scored `failed-other`, and was a
+missing exec bit on the volume, not a result.
+
+**The lag sweep engaged, and its result argues against a cause rather than for
+one.** `--stall-replica-ms` is real (`main.rs:124`, applied `:382-389`,
+SIGSTOP on the replica) and the injection is visible in the output — acked keys
+regressed at the master kill scaled 1688 / 2310 / 2343 / 2006 across the sweep.
+**The failing run in this write-up regressed 20.** So these runs carried roughly
+a hundred times more unreplicated tail than the failure did, and iteration 3's
+replica-kill assertion stayed silent every time (`replica kills: zero`).
+
+That weakens the third hypothesis — that a pre-kill ack survives the master-kill
+retire and is re-judged by the next replica kill (BUG-0007's mechanism). If that
+were it, more regression should make it fire more often, not never.
+
+**So the trigger is something about the GATE that neither load nor the drill
+script reproduces.** Everything this bug has ever fired in was a full gate run.
+The remaining differences are the other drills and the machine state they leave
+behind — and one is now known: `restart_drill.sh` leaks a seat (it is outside
+`fleet.sh` entirely, with no `fleet_init`, no `fleet_guard` and an unscoped
+`pkill -f` cleanup). Its port 6410 is disjoint from this drill's 6346-6353, so
+it cannot collide; it can only compete for CPU and IO.
+
+**Next step: run it inside a full gate with the instrumentation in place**, not
+solo. "Intermittent" may be the wrong label — nothing here was random, and the
+one environment it has ever failed in is the one not yet tried with a probe
+attached.
 
 ## Where to start
 
