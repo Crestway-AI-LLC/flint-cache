@@ -170,6 +170,32 @@ pub const DEFAULT_WAL_TTL_SECONDS: u64 = 21_600; // 6 h, was 1 h
 /// which is the term that actually fired in the incident.
 pub const DEFAULT_WAL_SIZE_LIMIT_MB: u64 = 8_192; // 8 GiB, was 1 GiB
 
+/// Cap the RocksDB info LOG.
+///
+/// RocksDB's defaults are "grow without limit, prune nothing", and the LOG is
+/// written by background machinery whose volume tracks WAL-archive churn, not
+/// stored data. Measured on the playground 2026-08-18: 883 MB of LOG against
+/// 248 KB of SSTs — about 3,600:1 — 92% of it one line from wal_manager.cc,
+/// at ~6 MB/hour steady state. Since BUG-0012's livelock IS sustained archive
+/// churn, leaving this unbounded lets a replication failure turn itself into a
+/// disk-capacity failure. See docs/bugs/0017.
+///
+/// 64 MiB x 5 is a 320 MB ceiling, which at that measured rate is roughly two
+/// days of history — deliberately more than one, because the incident that
+/// motivated this ran nine hours before anyone looked at it.
+pub const DEFAULT_MAX_LOG_FILE_SIZE: usize = 64 * 1024 * 1024;
+pub const DEFAULT_KEEP_LOG_FILE_NUM: usize = 5;
+
+/// Apply the LOG bounds to any `Options` that will open a real directory.
+///
+/// Shared rather than repeated because the read-only open is the easy one to
+/// forget: it takes no retention arguments, so it looks like it has nothing to
+/// configure, and it still makes RocksDB write a LOG.
+fn bound_info_log(opts: &mut Options) {
+    opts.set_max_log_file_size(DEFAULT_MAX_LOG_FILE_SIZE);
+    opts.set_keep_log_file_num(DEFAULT_KEEP_LOG_FILE_NUM);
+}
+
 impl RocksKv {
     /// Open without the ability — or the side effects — of writing.
     ///
@@ -180,8 +206,10 @@ impl RocksKv {
     /// namespace-scoped restore reads checkpoints straight out of a set,
     /// hence this. WAL contents are still visible (replayed in memory).
     pub fn open_read_only(path: &Path) -> Result<Self, rocksdb::Error> {
+        let mut opts = Options::default();
+        bound_info_log(&mut opts);
         Ok(Self {
-            db: DB::open_for_read_only(&Options::default(), path, false)?,
+            db: DB::open_for_read_only(&opts, path, false)?,
             path: path.to_path_buf(),
             wal_fsyncs: std::sync::atomic::AtomicU64::new(0),
         })
@@ -220,6 +248,10 @@ impl RocksKv {
         // rather than tailing. See docs/bugs/0012 and ADR-0022.
         opts.set_wal_ttl_seconds(wal_ttl_seconds);
         opts.set_wal_size_limit_mb(wal_size_limit_mb);
+        // The info LOG is bounded here too: its dominant writer is the archive
+        // manager these two terms drive, so the WAL settings and the log
+        // ceiling are the same subsystem seen from two sides.
+        bound_info_log(&mut opts);
         // Expired metadata rows are dropped organically as compaction
         // rewrites them (subkey orphans are reclaimed by gc::sweep until
         // the filter gains a metadata-lookup handle).
@@ -682,6 +714,51 @@ mod audit {
         batch.put(b"durable", b"yes");
         db.write_opt(batch, &wo).expect("sync write");
         assert_eq!(db.get(b"durable").expect("get"), Some(b"yes".to_vec()));
+    }
+
+    /// BUG-0017: the info LOG must be pruned, not merely rotated.
+    ///
+    /// RocksDB renames LOG to LOG.old.<micros> on EVERY open, so repeated opens
+    /// exercise `keep_log_file_num` directly — which is the exact term that
+    /// failed on the playground, where two retained LOG.old files held 883 MB
+    /// against 248 KB of SSTs. Asserting on reopens rather than on 64 MiB of
+    /// writes keeps this in the unit gate instead of a drill, and tests the
+    /// pruning rather than the rotation threshold.
+    ///
+    /// Without the assert this regresses silently: nothing else in the system
+    /// notices a large file, which is why it went a week unseen.
+    #[test]
+    fn info_log_is_pruned_across_reopens() {
+        let dir = TempDir::new("infolog");
+        let opens = DEFAULT_KEEP_LOG_FILE_NUM + 4;
+        for _ in 0..opens {
+            let kv = RocksKv::open(&dir.0).expect("open");
+            kv.put(b"k", b"v");
+            drop(kv);
+        }
+
+        let logs: Vec<String> = std::fs::read_dir(&dir.0)
+            .expect("read dir")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("LOG"))
+            .collect();
+
+        // Positive control: the reopens really did rotate, so a pass cannot be
+        // "no logs were ever produced".
+        assert!(
+            logs.iter().any(|n| n.starts_with("LOG.old.")),
+            "expected at least one rotated LOG after {opens} opens, got {logs:?}"
+        );
+        // The bound itself: live LOG plus at most KEEP retained.
+        assert!(
+            logs.len() <= DEFAULT_KEEP_LOG_FILE_NUM + 1,
+            "info LOG is not pruned: {} files after {} opens (bound {}): {:?}",
+            logs.len(),
+            opens,
+            DEFAULT_KEEP_LOG_FILE_NUM + 1,
+            logs
+        );
     }
 }
 
