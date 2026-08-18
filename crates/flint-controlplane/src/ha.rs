@@ -725,7 +725,7 @@ async fn handle_admin(ha: &Ha, args: &[Vec<u8>]) -> Value {
             // bump wakes watching proxies (subsuming CPPROMOTED's hint role
             // on the promotion path).
             let Some(addr) = text(1) else {
-                return Value::Error("ERR CPFENCE <addr>".into());
+                return Value::Error(ERR_CPFENCE_ARITY.into());
             };
             let reg = ha.store.registry().await;
             let member = reg.pairs.iter().any(|p| p.contains(&addr));
@@ -1274,9 +1274,29 @@ async fn handle_admin(ha: &Ha, args: &[Vec<u8>]) -> Value {
             let families = reg.families_spec();
             snapshot_frame(v, &pairs, &tenants, &admin, &exc, &promo, &families)
         }
-        _ => Value::Error("ERR unknown control-plane command".into()),
+        _ => Value::Error(ERR_UNKNOWN_CP_COMMAND.into()),
     }
 }
+
+/// Two error strings that are a CROSS-CRATE CONTRACT, not just wording.
+///
+/// `flintctl upgrade` decides whether a control plane predates `CPFENCE` by
+/// reading which of these it gets back from a bare `CPFENCE` probe (see
+/// flint-ctl's `cp_lacks_cpfence`). Capability-sniffing rather than a
+/// hardcoded "CPFENCE landed in rc.N" gate, which is the right instinct —
+/// but it means editing either string here silently reclassifies every CP.
+///
+/// The dangerous direction is not the obvious one. A CP wrongly read as OLD
+/// gets its control plane rolled on EVERY upgrade of EVERY healthy fleet,
+/// because the probe fires before the pairs are touched.
+///
+/// flint-ctl cannot import these — it does not depend on this crate, and
+/// adding the dependency would drag the whole Raft stack into the operator
+/// tool. So they are pinned by a test HERE instead, in the crate where the
+/// edit would be made, so a reworded message breaks a test rather than a
+/// roll. Change either string and you must change flint-ctl to match.
+pub const ERR_UNKNOWN_CP_COMMAND: &str = "ERR unknown control-plane command";
+pub const ERR_CPFENCE_ARITY: &str = "ERR CPFENCE <addr>";
 
 async fn watch_loop<S: AsyncRead + AsyncWrite + Unpin>(
     mut sock: S,
@@ -1358,5 +1378,37 @@ async fn watch_loop<S: AsyncRead + AsyncWrite + Unpin>(
         } else {
             tokio::time::sleep(Duration::from_millis(300)).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod cp_error_contract_tests {
+    use super::*;
+
+    /// Pinned literally, on purpose. This test has no logic to get wrong —
+    /// its whole job is to fail when someone rewords the string, so that the
+    /// person doing it is told flint-ctl matches on it.
+    #[test]
+    fn the_strings_flintctl_classifies_on_are_unchanged() {
+        assert_eq!(
+            ERR_UNKNOWN_CP_COMMAND, "ERR unknown control-plane command",
+            "flintctl's upgrade probe reads this to mean the CP predates CPFENCE \
+             and rolls the control plane first; see cp_lacks_cpfence"
+        );
+        assert_eq!(
+            ERR_CPFENCE_ARITY, "ERR CPFENCE <addr>",
+            "flintctl's upgrade probe reads this to mean the CP DOES know CPFENCE. \
+             If this ever starts matching the unknown-command text, every healthy \
+             fleet gets its control plane rolled on every upgrade"
+        );
+    }
+
+    /// The two must stay distinguishable by the substring flint-ctl uses.
+    /// A future rewording that made the arity error also contain "unknown
+    /// control-plane command" would pass the equality checks above while
+    /// inverting the classification.
+    #[test]
+    fn the_arity_error_is_not_mistakable_for_the_unknown_command_error() {
+        assert!(!ERR_CPFENCE_ARITY.contains("unknown control-plane command"));
     }
 }

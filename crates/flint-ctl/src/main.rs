@@ -6024,6 +6024,15 @@ fn main() {
     }
 }
 
+/// Both literals below are a CROSS-CRATE CONTRACT with the control plane.
+///
+/// They are emitted by `flint-controlplane`'s `ha.rs`, which now defines them
+/// as `ERR_UNKNOWN_CP_COMMAND` and `ERR_CPFENCE_ARITY` and pins them with its
+/// own test — this crate cannot import them without taking a dependency on
+/// the whole Raft stack. These tests fix what THIS side matches; that test
+/// fixes what the other side sends. Both are needed: pinning only here would
+/// keep passing while a reworded CP message silently reclassified every
+/// fleet, which is the failure mode a reviewer flagged.
 #[cfg(test)]
 mod cpfence_probe_tests {
     use super::*;
