@@ -38,24 +38,32 @@ each read is the network.
 Every row is the *worse* of two independent runs. This dataset fits the box's
 61 GB of RAM, so it measures the request path, not the beyond-RAM case.
 
-**The beyond-RAM case (2026-07-22, `v0.1.0-rc.6`).** The only run holding a
-dataset far past memory — **434 GB on a 61 GB box**, 7× beyond RAM, 100 M ×
-1 KB keys. It predates both August proxy rewrites and its client shared the
-box with the server, so read it as evidence for the *capacity* claim rather
-than as current latency:
+**The beyond-RAM case (2026-08-18, same build, same fleet shape).** The
+dataset that does not fit: 100 M × 1 KB keys measuring **121 GB on NVMe
+against 61 GB of RAM**, so a real share of every read has to reach the disk.
+Same client machine, same 32 connections, same 4 proxy workers, wire 94.5 µs
+against the 95.1 µs above — the two tables differ in dataset size and almost
+nothing else.
 
 | scenario | throughput | p50 | p99 | p99.9 |
 |---|---|---|---|---|
-| GETs, uniform over all 100 M keys | 87,141/s | 0.34 ms | 0.86 ms | 1.34 ms |
-| Mixed 1:10 write:read (gaussian) | 76,092/s | 0.36 ms | 1.68 ms | 3.63 ms |
+| GETs, hot slice | 78,827/s | **0.39 ms** | **0.94 ms** | 1.67 ms |
+| Mixed 1:10 write:read | 75,406/s | 0.41 ms | 0.98 ms | 1.79 ms |
+| GETs, pipelined ×16 | 181,035/s | 2.78 ms | 6.18 ms | 8.19 ms |
+| SETs (WAL before ack) | 81,844/s | 0.38 ms | 0.77 ms | 1.25 ms |
 
-Every write in every row went through the full persistent path — write-ahead
-log before the ack, fsync on a bounded cadence. The rc.6 read mixes included
-40–50% misses (the loader's key coverage), so those are mixed hit/miss
-distributions. An earlier version of this section called those misses
-"bloom-filter fast"; that was wrong — **Flint configures no Bloom filter**,
-and why the misses were cheap was never measured. The harness is in this
-repo: `tools/memtier_bench.sh`.
+**Leaving RAM costs about 72 µs at GET p50 and 24 µs at SET.** Reads pay,
+because past memory a share of them must reach NVMe. Writes barely notice — a
+write goes to the WAL and the memtable and never reads the data set, so its
+size hardly reaches it. The medium is only in the read path, and a result
+that slowed both equally would have meant something else was wrong.
+
+One run, said plainly rather than averaged in: a second was still loading when
+the test fleet's lifetime expired. Every write went through the full
+persistent path, WAL before the ack, fsync on a bounded cadence. Reads are
+hit-dominated — the corpus is loaded with full key coverage, so these are not
+flattered by cheap misses. The harness is in this repo:
+`tools/memtier_bench.sh`.
 
 ## Scale is a property of the architecture
 
