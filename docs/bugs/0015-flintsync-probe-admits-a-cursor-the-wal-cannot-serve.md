@@ -1,8 +1,17 @@
-# BUG-0015: the FLINTSYNC probe admits a cursor the WAL cannot serve, so a gapped replica never re-seeds (OPEN)
+# BUG-0015: the FLINTSYNC probe admits a cursor the WAL cannot serve, so a gapped replica never re-seeds (RESOLVED)
 
-Status: OPEN, root cause established 2026-08-18 · Severity: **high** — a
-replica that falls out of the WAL window can never recover unattended, and
-under a supervisor it crash-loops forever
+Status: **RESOLVED** 2026-08-18, landed in `0a763ff` ("repl: make WAL retention
+an admission term, not a discovery the stream makes"), now on `main` ·
+Severity was **high** — a replica that falls out of the WAL window could never
+recover unattended, and under a supervisor it crash-looped forever
+
+**This doc read OPEN for several hours after the fix was on `main`.** Caught
+2026-08-18 when a peer session auditing stale statuses checked the code rather
+than the docs. A bug that is fixed but still reads OPEN costs the next person a
+re-investigation, which is the same waste as a bug that is broken but reads
+closed — the status is a claim like any other, and it needs the same
+verification. Confirmed here by grepping `origin/main` for the admission term,
+not by trusting this file.
 
 ## Symptom
 

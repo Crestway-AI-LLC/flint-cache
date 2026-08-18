@@ -35,7 +35,7 @@ New references should use the path, so a reader can follow them.
 | `0012-walgap-livelock-retention-ignores-replicas.md` | WAL retention ignores replica progress, so a lagging replica can never catch up |
 | `0013-bulk-writes-stall-on-default-compaction.md` | compaction left at RocksDB defaults, so bulk ingest hits the write stall |
 | `0014-chaos-unreadable-acked-loss-on-replica-kill.md` | chaos oracle fails an acked write on a REPLICA kill, intermittently; cause not established (OPEN) |
-| `0015-flintsync-probe-admits-a-cursor-the-wal-cannot-serve.md` | marked boot clears its own re-seed marker on a probe that skips the WAL-retention check, then crash-loops (OPEN) |
+| `0015-flintsync-probe-admits-a-cursor-the-wal-cannot-serve.md` | marked boot clears its own re-seed marker on a probe that skips the WAL-retention check, then crash-loops (RESOLVED) |
 | `0016-retracted-du-is-not-the-dataset.md` | RETRACTED: `verify` was right; `du` on a data dir measures RocksDB's info LOG, not the dataset |
 | `0017-rocksdb-info-log-grows-without-bound.md` | 883 MB of RocksDB debug log against 248 KB of data, unbounded and fastest under replication churn (OPEN) |
 | `0019-drill-root-on-a-mounted-volume-breaks-disk-pressure.md` | `FLINT_DRILL_ROOT` on a mounted volume fails `disk_pressure` at `hdiutil attach`, and the message blames the image (FIXED) |
