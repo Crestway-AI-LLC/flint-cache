@@ -10,8 +10,7 @@ and every tenant lives in its own isolated keyspace behind its own token
 and quota. Clients connect with any Redis client; no SDK, no new protocol.
 
 **Fewer misses beats faster hits.** A RAM cache is faster on a hit and that
-is not the number your users feel. When the working set does not fit — and
-past a few hundred GB it does not, because the managed options cap out —
+is not the number your users feel. When the working set does not fit,
 what they feel is the evictions: every evicted key is a request that falls
 through to your origin, and on a hot key it is every concurrent request at
 once, the thundering herd that turns a cache miss into an incident. Holding
@@ -19,6 +18,43 @@ the whole set costs a few hundred microseconds on the hit and stops the
 seconds at the origin. That is the trade this project exists to make, and
 [the measured numbers](docs/architecture.md) are there to show the hit is
 fast enough that you stop thinking about it.
+
+## Our numbers
+
+Client-observed, end to end — client → TLS → token auth → proxy → storage
+engine and back — on a single AWS `i4i.2xlarge` (8 vCPU, 61 GB RAM, NVMe)
+holding **434 GB on a 61 GB box**, 7× beyond memory, with the full shipping
+stack running (proxy, engine, control plane, live replica pair, metering
+agent). 100 M × 1 KB incompressible keys, `memtier_benchmark`.
+
+| scenario | throughput | p50 | p99 | p99.9 |
+|---|---|---|---|---|
+| GETs, uniform over all 100 M keys | 87,141/s | **0.34 ms** | **0.86 ms** | 1.34 ms |
+| GETs, hot 5 GB slice | 82,923/s | 0.36 ms | 0.91 ms | 1.30 ms |
+| Mixed 1:10 write:read (gaussian) | 76,092/s | 0.36 ms | 1.68 ms | 3.63 ms |
+
+Every write in every row went through the full persistent path — write-ahead
+log before the ack, fsync on a bounded cadence. The read mixes included
+40–50% misses (the loader's key coverage; misses resolve via bloom filters),
+so these are mixed hit/miss distributions. The harness is in this repo:
+`tools/memtier_bench.sh`.
+
+## Scale is a property of the architecture
+
+Capacity is **disk × node pairs**, not RAM per node. Flint is slot-sharded
+behind a stateless proxy; add a pair and slots migrate to it live under a
+copy-rate throttle while the endpoint stays where it is.
+
+| node type | NVMe | ~usable per pair | pairs for 100 TB |
+|---|---|---|---|
+| `i4i.4xlarge` | 3.75 TB | ~3 TB | ~34 |
+| `i4i.16xlarge` | 15 TB | ~11 TB | ~9 |
+| `i4i.32xlarge` | 30 TB | ~23 TB | ~5 |
+
+That is arithmetic, not a benchmark — what the design permits, stated as
+such. There is no configured size ceiling in the product and no client-side
+sharding to write. Multi-terabyte validation runs are staged separately and
+reported as measurements when they land.
 
 **Try it now** — `tools/quickstart.sh` builds and brings up a real cluster
 (control plane, replicated pair, proxy, failover controller) on your laptop
@@ -46,7 +82,7 @@ to a build? [Releases](https://github.com/Crestway-AI-LLC/flint-cache/releases/l
    behind a proxy crosses the same wires — so both designs pay that part
    identically. The only difference is the last step inside the node, a RAM
    lookup versus an NVMe read: under 200 µs (0.2 ms) at p50 in our own
-   same-box measurements against Valkey.
+   same-box measurements.
    **That step is the whole of what Flint trades** — everything else on the
    path is identical. What share of your latency it represents depends on
    your topology, so run it against your own hop times; the more network
