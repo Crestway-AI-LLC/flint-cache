@@ -4971,6 +4971,101 @@ fn upgrade(inv: &Inventory, version_tag: Option<String>, soak_ms: u64, nodes_onl
     ];
     const MASTER_PHASE_DISALLOWED: &[&str] = &["Detected", "SelfFenced", "SpareRestored"];
 
+    // PRECONDITION: the CP must already speak the verbs the MASTER phase
+    // needs, because the phase that rolls the CP runs after it.
+    //
+    // `upgrade` goes canary -> replicas -> masters -> roll_edge, and
+    // roll_edge is what rolls the control plane. The master phase calls
+    // controlled_failover, which commits a CPFENCE record before promoting.
+    // So on any fleet whose CP predates CPFENCE, the master phase depends on
+    // a command that only exists after a phase that has not run yet -- and
+    // the roll stops halfway with the pair DEMOTED AND DRAINED:
+    //
+    //     CPFENCE 172.31.64.94:7001 did not commit -- refusing to promote
+    //     without a fencing record: ERR unknown control-plane command
+    //
+    // Observed on the playground's rc.51 -> rc.52 roll. The refusal is
+    // correct and stays; the defect is that the dependency is discovered
+    // after the fleet has been mutated instead of before it is touched.
+    //
+    // Checked with a BARE `CPFENCE`, which is side-effect free by
+    // construction: the handler's arity check returns `ERR CPFENCE <addr>`
+    // and returns before it proposes anything (controlplane/src/ha.rs). A CP
+    // that does not know the verb answers `unknown control-plane command`
+    // instead, and the two are trivially distinguishable. Probing with a real
+    // address would commit a fencing record as a side effect of asking a
+    // question, which is not a check, it is a mutation with an opinion.
+    if !nodes_only {
+        let probe = call_cp(inv, &tls, &["CPFENCE"]);
+        let unknown =
+            matches!(&probe, Ok(Value::Error(e)) if e.contains("unknown control-plane command"));
+        if unknown {
+            // ROLL THE CP FIRST rather than refusing. There is no CP-only verb
+            // to send an operator to — `--nodes-only` does the exact opposite,
+            // leaving the CP on the old binary — so a refusal would name a
+            // remedy the tool does not offer. The manual workaround is a hand
+            // stop-and-respawn with the seat's own argv, which is exactly what
+            // the primitives below do.
+            //
+            // Additive on purpose: roll_edge still rolls the CP at the end, so
+            // a crossing upgrade restarts it twice. That is one extra restart
+            // of a seat this command already restarts, and a Raft group keeps
+            // serving while a minority is down — cheaper than reordering a
+            // sequence whose current order is reasoned about in roll_edge's
+            // own header.
+            eprintln!(
+                "== control plane FIRST: this CP does not know CPFENCE, which the \
+                 master phase requires"
+            );
+            for i in 0..inv.cp.len() {
+                let seat = inv.cp[i].clone();
+                let name = cp_seat_name(inv, i);
+                if let Err(e) = stop_seat(
+                    inv,
+                    &runner_for(inv, &seat),
+                    &name,
+                    "flint-controlplane",
+                    &cp_seat_state(inv, i),
+                    Some(port_of(&seat)),
+                ) {
+                    eprintln!("== UPGRADE ABORTED rolling {name} (pairs untouched): {e}");
+                    std::process::exit(3);
+                }
+                spawn_env(
+                    inv,
+                    &runner_for(inv, &seat),
+                    &name,
+                    "flint-controlplane",
+                    &cp_seat_args(inv, i),
+                    &envs,
+                );
+                if !wait_pong(&seat, &tls, Duration::from_secs(15)) {
+                    eprintln!("== UPGRADE ABORTED: {name} did not answer after the binary swap");
+                    std::process::exit(3);
+                }
+                eprintln!("  {name} rolled");
+            }
+            // THE CHECK THAT KEEPS THIS HONEST. If the STAGED binary is also
+            // too old, continuing walks straight into the half-roll this
+            // exists to prevent — pair demoted and drained, which is the state
+            // the playground was actually left in.
+            let after = call_cp(inv, &tls, &["CPFENCE"]);
+            if matches!(&after, Ok(Value::Error(e)) if e.contains("unknown control-plane command"))
+            {
+                eprintln!(
+                    "== UPGRADE ABORTED: the control plane still does not know CPFENCE \
+                     after rolling it onto the staged binary."
+                );
+                eprintln!(
+                    "   The staged bundle predates CPFENCE, so the master phase can never \
+                     succeed. Stage a newer release. The pairs have not been touched."
+                );
+                std::process::exit(4);
+            }
+            eprintln!("  control plane speaks CPFENCE; continuing with the pairs");
+        }
+    }
+
     // Observe roles now: replicas roll first, masters last.
     let mut masters: Vec<String> = Vec::new();
     let mut replicas: Vec<(String, String)> = Vec::new(); // (replica, its master)
