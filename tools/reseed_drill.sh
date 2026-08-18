@@ -105,6 +105,31 @@ grep -q "full sync: received" "$RLOG" \
   || { echo "FAIL: warm restart lost data"; exit 1; }
 echo "  resumed from its durable cursor, no full sync"
 
+echo "== a MARKED boot whose cursor IS still serveable rejoins WARM"
+# The POSITIVE CONTROL for the retention term added to FLINTSYNC admission
+# (BUG-0015). Without this the suite only proves the probe can refuse, and a
+# probe that refuses EVERYTHING would pass: every dead seat would silently pay
+# a full re-seed, which is precisely what the marked warm rejoin exists to
+# avoid. flintctl marks every dead seat because it cannot observe a corpse's
+# role, so this — a killed replica whose copy is perfectly good — is the
+# COMMON case, not an exotic one.
+pkill -9 -f "flint-server --port $RPORT"; sleep 0.5
+echo "killed while marked by the harness" > "$RDIR/NEEDS_RESEED"
+: > "$RLOG"
+start_replica; wait_port $RPORT 600 || {
+  echo "FAIL: a marked replica with a serveable cursor never came back"
+  replica_forensics; exit 1; }
+grep -q "marked copy verified" "$RLOG" || {
+  echo "FAIL: a serveable marked copy did not warm-rejoin"
+  replica_forensics; exit 1; }
+grep -q "full sync: received" "$RLOG" && {
+  echo "FAIL: a serveable marked copy paid a full re-seed — admission is refusing what it should admit"
+  replica_forensics; exit 1; }
+[ -f "$RDIR/NEEDS_RESEED" ] && { echo "FAIL: the warm rejoin left the marker in place"; exit 1; }
+[ "$(valkey-cli -p $RPORT GET before)" = "v-before" ] \
+  || { echo "FAIL: warm-rejoined marked copy lost data"; exit 1; }
+echo "  marked copy verified against the master and rejoined warm, no re-seed"
+
 echo "== stage the purge: write past the replica, then drop the retained WAL"
 CURSOR=$(valkey-cli -p $RPORT FLINTINFO 2>/dev/null | tr -d '\r' | sed -n 's/^last_applied://p')
 pkill -9 -f "flint-server --port $RPORT"; sleep 0.5

@@ -3348,6 +3348,35 @@ fn flintsync(
             }
         }
     }
+    // RETENTION, the last admission term (BUG-0015). The fence check above
+    // says this cursor is on our timeline; it does not say the WAL can still
+    // REACH it. Those are different questions and only the second one is
+    // answered by the archive, which RocksDB prunes on a TTL/size budget that
+    // consults no replica (ADR-0022 sheds writes to make that rare; it cannot
+    // make it impossible).
+    //
+    // It matters here and not only in the stream because `probe_resume` drops
+    // the connection after this reply. A marked boot asks "is my copy still
+    // good?", and an OK makes it CLEAR its own NEEDS_RESEED marker and warm
+    // rejoin — after which the tailer discovers the gap, re-marks, and exits.
+    // The next start repeats it: a livelock that no supervisor can break,
+    // where a plain refusal here costs one re-seed and recovers.
+    //
+    // Ask the STREAM's own question rather than a second implementation of
+    // it: a budget of 1 byte materializes at most one batch (batches are
+    // never split), and `updates_since_budgeted` returns an empty Ok for a
+    // caught-up replica, so a healthy cursor never false-refuses.
+    if let Err(ReplError::WalGap(why)) = kv.updates_since_budgeted(cursor, 1) {
+        let mut out = Vec::new();
+        encode(
+            &Value::Error(format!(
+                "WALGAP cursor {cursor} is no longer reachable from this WAL ({why}): \
+                 full sync required"
+            )),
+            &mut out,
+        );
+        return stream.write_all(&out);
+    }
     let mut out = Vec::new();
     // The OK carries this node's role epoch so an accepted lower-epoch
     // replica can ADOPT it durably: its next reconnect then presents the
