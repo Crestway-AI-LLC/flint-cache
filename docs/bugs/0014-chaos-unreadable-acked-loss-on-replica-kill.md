@@ -144,12 +144,51 @@ but iter 3 panicked before it could print its kill line, so the drill's
 positive control saw a truncated sequence. **The failure to investigate is the
 panic, not the sequence check.**
 
-**This text is from one firing only.** CI prints `FAIL  chaos_unreadable  (5s)
-/tmp/flint-gates/chaos-chaos_unreadable.log` and never uploads or dumps that
-file, so the assertion text of the four CI failures is unrecoverable — they are
-known to be the same *drill*, not verified to be the same *assertion*. See
-BUG-0021; capturing failing drill logs as a CI artifact is the fix, and it
-would have made this entire reconstruction unnecessary.
+**All four firings were recovered from CI artifacts** (`gate-logs`, uploaded by
+`gate.yml` on every run, 14-day retention). An earlier revision of this file
+claimed they were unrecoverable; that was wrong — see the retraction in
+BUG-0021. The four are the same assertion: line 640 on the 2026-08-11 build and
+line 808 today, both the `got >= *last_acked` assert.
+
+## The four failures against three passes — the comparison that narrows it
+
+Every run has the identical kill order (fixed seed): REPLICA, MASTER, REPLICA.
+
+| Run | iter 2 regression | iter 3 outcome | gap |
+|---|---|---|---|
+| `31532171671` | 12 | **FAIL** key901: 30563 < 33119 | 2,556 |
+| `31921536272` | 32 | **FAIL** key418: 25687 < 33542 | 7,855 |
+| `32094370382` | 20 | **FAIL** key3121: 18195 < 23739 | 5,544 |
+| `32107656681` | **8** | **FAIL** key539: 31237 < 32008 | 771 |
+| `32102006432` | **54** | PASS — zero acked loss verified | — |
+| `32108137975` | 37 | PASS — zero acked loss verified | — |
+| `32181754512` | 25 | PASS — zero acked loss verified | — |
+
+**Two findings, both from this table.**
+
+**1. The master kill's regression does not predict the replica kill's failure,
+and points the wrong way.** The smallest regression (8) failed; the largest
+(54) passed. This is independent CI confirmation of the injected-lag result —
+which forced regression to 1688-2343 and never fired — and it is stronger,
+because it rests on observed failures rather than on silence. **Replication lag
+is not the knob.**
+
+**2. ITERATION 1 HAS NEVER FAILED.** In all seven logs, and every other log
+read, `iter 1: pair 0: killed REPLICA; zero acked loss verified` passes. Iter 1
+and iter 3 are the *same operation* — kill the replica, assert every acked key
+still reads back. The assertion only ever fails on the replica kill that
+**follows a master kill and a harness promotion.**
+
+That is the sharpest constraint this bug has. A defect in the replica-kill
+durability path should be able to fire on iter 1; this one cannot. It does not
+*select* a cause — evidence that eliminates one candidate does not select
+another — but it is consistent with the harness resolving a stale master after
+promotion (the #126 class on the other side of the same branch) and
+inconsistent with the replica-kill path itself being at fault.
+
+**What it does not establish:** which of the two remains. The probe landed in
+`581e074` prints `read_via` and the resolved address at the panic, which is
+exactly the discriminator; it has not yet fired.
 
 ## Established
 
@@ -176,25 +215,57 @@ edge landed on a node that had been demoted and was mid-re-seed — the shape
 this drill passes no `--edge`, so the read never touches a proxy. Recorded
 because it is the natural first guess and it costs an hour to re-derive.
 
-**Replication lag is not the knob** — and this one survives the base-rate
-re-read, because it rests on a positive control rather than on silence.
-`--stall-replica-ms` is real (`main.rs:124`, applied `:382-389`, SIGSTOP on the
-replica) and the injection is visible: acked-key regression at the master kill
-scaled **1688 / 2310 / 2343 / 2006** across the sweep, against the recorded
-failure's **20** — roughly a hundred times the unreplicated tail. The injector
-demonstrably worked, and the replica-kill assertion stayed silent through all
-of it. That specifically undercuts the BUG-0007-class mechanism: more
-regression should fire it more often, and it never fired at all.
+**Replication lag is not the knob.** Promoted to its own section below, now
+that CI evidence agrees with the injected-lag result from the other direction.
 
 ## Assumed, NOT established
 
-Everything about the cause. With `f9782c4` eliminated, the surviving question
-is narrower but unanswered: whether `cluster.master_client()` resolves to the
-pre-promotion seat for iteration 3 after the harness promoted in iteration 2
-(an oracle bug, the #126 class recurring on the OTHER side of the same branch),
-or whether a copy genuinely rejoins at a cursor the ledger has already passed
-(a real durability regression). The 5,544-deep gap is consistent with both, and
-no evidence in hand separates them.
+With `f9782c4` eliminated and iteration 1 never failing, what remains splits
+into two candidates that the code reading and the CI evidence disagree about.
+Both are recorded because neither is settled.
+
+**(a) The harness dials the pre-promotion seat.** This is the #126 class on the
+other side of the same branch. **The code argues against it:** both promotion
+paths assign the field synchronously before returning — `cluster.rs:1338`
+(`self.master_port = self.replica_port`) and `cluster.rs:1406`
+(`self.master_port = survivor`) — and `master_client()` reads that field at
+`:378`. There is no visible window between promotion and the next read. It is
+not ruled out, but nothing proposes a mechanism for it.
+
+**(b) The harness dials the RIGHT seat, before that seat serves what the ledger
+believes was acked.** This is a different failure from (a) and the code reading
+above does not touch it. The promoted seat is the former replica; the writes in
+question were acked by the seat that has just been killed. Iteration 2 already
+observes exactly this — `acked keys regressed: N` — and forgives it as inside
+the 1000 ms cap. The open question is whether the ledger snapshot iteration 3
+asserts against still carries pre-regression values for those keys, so the
+replica kill is blamed for a shortfall the master kill created and pardoned.
+
+**Why (b) is not simply BUG-0007 returning.** BUG-0007's mechanism predicts that
+more unreplicated tail fires it more often. Two independent lines say otherwise
+— see below — so if (b) is right, the size of the regression is not the trigger
+and something else selects which runs fail.
+
+**The discriminator exists and has not yet fired.** The probe in `581e074`
+prints, at the panic, both what `master_client()` resolved to and that node's
+own role/epoch/seq_lag. (a) predicts a resolution that is not the promoted seat.
+(b) predicts the promoted seat, with its own view showing it behind the ledger.
+
+## ESTABLISHED: replication lag is not the knob
+
+This one now has evidence from two independent directions and should not be
+re-opened without new data:
+
+- **Injected lag, 12 runs.** `--stall-replica-ms` (`main.rs:124`, applied
+  `:382-389`, SIGSTOP on the replica) drove acked-key regression to
+  **1688 / 2310 / 2343 / 2006** — roughly a hundred times the failures'
+  tail — and the replica-kill assertion stayed silent in every run. The
+  injector is positively controlled, so the silence is a result.
+- **Observed CI failures, 7 runs.** The smallest regression (**8**) FAILED and
+  the largest (**54**) PASSED.
+
+One line rests on silence under forced lag, the other on which real runs went
+red. They agree, and they agree against the hypothesis.
 
 ## Where to start
 
@@ -210,8 +281,10 @@ has not yet fired, which at 5 runs means nothing either way.
    this is an oracle bug and the fix belongs beside #126's.
 3. If it IS the promoted seat, compare its `last_applied` to the ledger and
    walk back to whether the rejoin admitted a cursor it should have refused.
-4. Fix BUG-0021 first if the next firing is in CI, or the drill log will be
-   discarded again and the run wasted.
+4. **Pull the artifact, do not re-run.** `gh run download <id> -n gate-logs`
+   retrieves the failing drill's full log for 14 days after the run. Reading
+   the artifact was worth more than every local reproduction attempt combined,
+   and it was available the whole time.
 
 **Run it alone.** Five drills were invalidated during BUG-0011's investigation
 by a manual reproduction left running in another shell; `fleet_guard` refused
@@ -221,7 +294,7 @@ them correctly and its message was the diagnosis.
 
 - `crates/flint-chaos/src/main.rs:790-801` — #126's fix and the comment that
   names this exact symptom on the direct path
-- BUG-0021 — CI discards the failing drill's log, which is why three of the
-  four firings above have no assertion text
+- BUG-0021 — gate log retention; contains the retraction of the claim that
+  these firings were unrecoverable
 - BUG-0007 — resolved, same assertion text, different drill; eliminated by date
 - BUG-0011 — the other open drill defect, and the run-it-alone rule

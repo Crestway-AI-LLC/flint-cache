@@ -61,39 +61,50 @@ The failing log was copied out by hand before anything could overwrite it. That
 is not a fix; it depends on someone realising the hazard while the file still
 exists, which is the same reliance on memory the header set out to remove.
 
-## The CI half is worse: the log is never captured at all
+## RETRACTED: "CI never captures the log" — it always did
 
-Locally a log survives until the next run. In CI it does not survive the job.
-The gate prints the path and stops:
+An earlier revision of this file claimed CI prints the failing drill's log path
+and never uploads it, so a durability oracle had fired three times leaving only
+the word FAIL. **That was wrong, and it was the most confident paragraph here.**
 
-    FAIL  chaos_unreadable       (5s)  /tmp/flint-gates/chaos-chaos_unreadable.log
+`gate.yml` has always ended with:
 
-That file lives on the runner, is never dumped to the job log and is never
-uploaded as an artifact, so it dies with the container. **Everything CI can
-tell you about a failing drill is the word FAIL and a duration.**
+      - name: Keep the logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with: { name: gate-logs, path: /tmp/flint-gates, retention-days: 14 }
 
-Measured cost, 2026-08-18: reconstructing BUG-0014's history meant reading all
-91 `gate` runs on `main` and scoring each by whether `chaos_unreadable`
-produced a PASS or FAIL line, because that line is the only surviving evidence.
-Four failures were found. **Three of them have no assertion text and never
-will** — they are known to be the same drill, not verified to be the same bug.
-A durability oracle fired three times in CI and left no record of what it saw.
+All four of BUG-0014's firings still had unexpired `gate-logs` artifacts,
+including the 2026-08-11 one. Downloading them recovered every assertion text
+and produced the sharpest narrowing that bug has had — see BUG-0014.
 
-This also removed the cheapest check on a wrong hypothesis. Two separate
-"this was fixed" claims were argued that day from commit dates and run
-outcomes alone; had the drill logs been retrievable, comparing a failing
-assertion against a passing one would have settled it in minutes.
+**How the claim was made:** `gh run view --log` returns the JOB log, which
+carries only the one-line `FAIL  chaos_unreadable  (5s)  <path>`. One channel
+was searched, nothing was found, and the absence was written up as an
+impossibility with the word "never" attached. The artifact channel was never
+checked. This is the same class as everything else in this file — a check that
+could not see the thing reporting as though the thing were not there — and it
+was committed while documenting that class.
 
-## Fix, second half
+**The real defects, both much smaller than the retracted claim:**
 
-Upload `$FLINT_GATE_LOGS` as a job artifact whenever the gate fails, and dump
-the failing steps' logs inline so a red run is legible without downloading
-anything. Both halves are one change once the logs are namespaced per run: the
-directory that becomes safe to keep locally is the directory to upload.
+1. **The failure detail is not inline in the job log.** Reading a red gate
+   requires knowing that artifacts exist and downloading one. Dumping the
+   failing steps' logs into the job output costs nothing and removes the step
+   where someone concludes the evidence is gone.
+2. **14-day retention is thin for a rare intermittent.** BUG-0014 fires about
+   once every 14 gate runs, so its evidence and its next occurrence are on
+   comparable timescales. For the drills that assert durability, a longer
+   retention is worth the storage.
+
+Neither justifies the alarm. Recorded at length because the retraction is more
+instructive than the finding would have been: the local overwrite problem
+below is real and was verified by hand, and its neighbour in the same file was
+invented from a single unchecked channel.
 
 ## Related
 
 - BUG-0009 — also `gates.sh`, also a result that does not mean what it says
-- BUG-0014 — the intermittent whose diagnosis this retention loss obstructs;
-  three of its four CI firings have no recoverable assertion text because of
-  the second half above
+- BUG-0014 — the intermittent this file was written in service of; its four
+  CI firings were all recoverable from artifacts, which is what the retraction
+  above is about
