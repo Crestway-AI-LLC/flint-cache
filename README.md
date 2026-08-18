@@ -21,23 +21,41 @@ fast enough that you stop thinking about it.
 
 ## Our numbers
 
-Client-observed, end to end — client → TLS → token auth → proxy → storage
-engine and back — on a single AWS `i4i.2xlarge` (8 vCPU, 61 GB RAM, NVMe)
-holding **434 GB on a 61 GB box**, 7× beyond memory, with the full shipping
-stack running (proxy, engine, control plane, live replica pair, metering
-agent). 100 M × 1 KB incompressible keys, `memtier_benchmark`.
+**Current build, measured off-box (2026-08-17).** Client on a *separate*
+machine from the server, so every number includes a real network hop: two
+`i4i.2xlarge` in one AZ, 20 M × 1 KB incompressible values, 32 connections,
+`memtier_benchmark`. End to end — client → TLS → token auth → proxy → storage
+engine and back. The wire alone measured **95 µs p50**, so roughly a third of
+each read is the network.
 
 | scenario | throughput | p50 | p99 | p99.9 |
 |---|---|---|---|---|
-| GETs, uniform over all 100 M keys | 87,141/s | **0.34 ms** | **0.86 ms** | 1.34 ms |
-| GETs, hot 5 GB slice | 82,923/s | 0.36 ms | 0.91 ms | 1.30 ms |
+| GETs, hot slice | 96,116/s | **0.32 ms** | **0.61 ms** | 0.98 ms |
+| Mixed 1:10 write:read | 96,480/s | 0.32 ms | 0.61 ms | 0.99 ms |
+| GETs, pipelined ×16 | 228,484/s | 2.24 ms | 2.86 ms | 4.26 ms |
+| SETs (WAL before ack) | 87,449/s | 0.35 ms | 0.71 ms | 4.58 ms |
+
+Every row is the *worse* of two independent runs. This dataset fits the box's
+61 GB of RAM, so it measures the request path, not the beyond-RAM case.
+
+**The beyond-RAM case (2026-07-22, `v0.1.0-rc.6`).** The only run holding a
+dataset far past memory — **434 GB on a 61 GB box**, 7× beyond RAM, 100 M ×
+1 KB keys. It predates both August proxy rewrites and its client shared the
+box with the server, so read it as evidence for the *capacity* claim rather
+than as current latency:
+
+| scenario | throughput | p50 | p99 | p99.9 |
+|---|---|---|---|---|
+| GETs, uniform over all 100 M keys | 87,141/s | 0.34 ms | 0.86 ms | 1.34 ms |
 | Mixed 1:10 write:read (gaussian) | 76,092/s | 0.36 ms | 1.68 ms | 3.63 ms |
 
 Every write in every row went through the full persistent path — write-ahead
-log before the ack, fsync on a bounded cadence. The read mixes included
-40–50% misses (the loader's key coverage; misses resolve via bloom filters),
-so these are mixed hit/miss distributions. The harness is in this repo:
-`tools/memtier_bench.sh`.
+log before the ack, fsync on a bounded cadence. The rc.6 read mixes included
+40–50% misses (the loader's key coverage), so those are mixed hit/miss
+distributions. An earlier version of this section called those misses
+"bloom-filter fast"; that was wrong — **Flint configures no Bloom filter**,
+and why the misses were cheap was never measured. The harness is in this
+repo: `tools/memtier_bench.sh`.
 
 ## Scale is a property of the architecture
 
