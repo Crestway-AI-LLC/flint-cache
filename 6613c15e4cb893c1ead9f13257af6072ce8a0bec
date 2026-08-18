@@ -1,0 +1,9 @@
+Correction: this message's "BUG-0012 is the fourth" names what was filed as
+BUG-0014 — docs/bugs/0014-chaos-unreadable-acked-loss-on-replica-kill.md. The
+number was reassigned before filing, because 0012 was already taken by the
+WALGAP retention livelock. BUG-0012 and BUG-0013 have nothing to do with this
+commit, so the reference should not be followed.
+
+The message itself is left as written: this commit was already pushed with
+three commits on top of it, and correcting it in place would mean a force-push
+to main while another session holds a clone.
