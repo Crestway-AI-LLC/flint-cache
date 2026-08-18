@@ -22,6 +22,18 @@ pub const DEFAULT_LAG_SOFT_MS: u64 = 500;
 /// The hard cap bounds the VOLUME of at-risk writes: past it the master
 /// stops accepting new ones. It does NOT bound their age — see
 /// `widowed_beyond_grace` for the gate that does.
+/// Shed writes once the master runs this far ahead of its slowest live
+/// replica. The unit is SEQUENCES, which is a proxy for the retained BYTES
+/// RocksDB actually budgets — the conversion depends on value size, so this
+/// default assumes roughly 1 KB values and works out near half of
+/// `DEFAULT_WAL_SIZE_LIMIT_MB` (8 GiB). Half, not all, so a replica meets
+/// backpressure well before it meets a deleted segment.
+///
+/// An operator whose values are much larger or smaller should retune from
+/// the exported `wal_headroom_seq`, which is why that metric exists. 0
+/// disables the gate entirely.
+pub const DEFAULT_WAL_HEADROOM_SHED_SEQ: u64 = 4_000_000;
+
 pub const DEFAULT_LAG_HARD_MS: u64 = 1_000;
 /// Default widowed grace: 0 = disabled, so a standalone node and every
 /// existing deployment keep their current behaviour. flintctl turns it on
@@ -51,6 +63,9 @@ pub struct ReplHub {
     lag_hard_ms: AtomicU64,
     min_replicas_to_write: AtomicU32,
     widowed_grace_ms: AtomicU64,
+    /// Shed writes once the master is this many sequences ahead of its
+    /// SLOWEST live replica (ADR-0022). 0 disables the gate.
+    wal_headroom_shed_seq: AtomicU64,
     next_id: AtomicU64,
     /// Newest ack timestamp from ANY replica, ever, this process-life.
     /// Deliberately separate from `replicas`, which drops an entry on
@@ -87,6 +102,7 @@ impl ReplHub {
             lag_hard_ms: AtomicU64::new(lag_hard_ms.max(lag_soft_ms)),
             min_replicas_to_write: AtomicU32::new(min_replicas_to_write),
             widowed_grace_ms: AtomicU64::new(DEFAULT_WIDOWED_GRACE_MS),
+            wal_headroom_shed_seq: AtomicU64::new(DEFAULT_WAL_HEADROOM_SHED_SEQ),
             next_id: AtomicU64::new(1),
             last_ack_ms: AtomicU64::new(0),
             widow_since_ms: AtomicU64::new(0),
@@ -269,6 +285,69 @@ impl ReplHub {
             .max()
     }
 
+    /// Cursor of the SLOWEST live replica — the mirror of `effective_acked`,
+    /// and the one WAL retention has to respect.
+    ///
+    /// The two differ on purpose. RPO asks "if I promote now, what is the
+    /// best copy I can promote?", so it takes the MAX: promotion can only
+    /// choose among the living, and the freshest survivor bounds the loss.
+    /// Retention asks "what may I still delete?", so it takes the MIN: a
+    /// segment is only safe to drop once EVERY live consumer is past it.
+    /// Using the freshest here would delete out from under the slowest
+    /// replica, which is exactly the failure ADR-0022 exists for.
+    ///
+    /// LIVE, not all: a replica that has stopped acking drops out of the
+    /// window and stops pinning retention. Without that a dead seat would
+    /// hold the WAL open forever and turn a replication problem into a disk
+    /// problem — the naive min is worse than no min at all.
+    pub fn wal_headroom_shed_seq(&self) -> u64 {
+        self.wal_headroom_shed_seq.load(Ordering::Relaxed)
+    }
+
+    pub fn set_wal_headroom_shed_seq(&self, v: u64) {
+        self.wal_headroom_shed_seq.store(v, Ordering::Relaxed);
+    }
+
+    /// True when the master has outrun its slowest live replica far enough
+    /// that the WAL it still needs is at risk of being recycled.
+    ///
+    /// Returns false with NO live replica: retention is pinned by nobody
+    /// then, and `widowed_beyond_grace_arming` is the gate that bounds that
+    /// state. Two gates firing on one cause would report the wrong one.
+    pub fn wal_headroom_exhausted(&self, latest_seq: u64, now_ms: u64) -> bool {
+        let limit = self.wal_headroom_shed_seq();
+        if limit == 0 {
+            return false;
+        }
+        self.wal_headroom_seq(latest_seq, now_ms)
+            .is_some_and(|h| h >= limit)
+    }
+
+    pub fn min_acked_live(&self, now_ms: u64) -> Option<u64> {
+        self.replicas
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .filter(|(_, last)| *last != 0 && now_ms.saturating_sub(*last) <= LIVENESS_WINDOW_MS)
+            .map(|(acked, _)| *acked)
+            .min()
+    }
+
+    /// How far the master has run ahead of its slowest live replica, in
+    /// sequences. `None` = no live replica, where retention cannot be
+    /// pinned by anyone and the widowed-grace gate governs instead.
+    ///
+    /// Sequences are a PROXY for retained bytes, which is what RocksDB
+    /// actually budgets (`wal_size_limit_mb`). The mapping depends on value
+    /// size, so a threshold set on this is approximate by construction —
+    /// which is why the headroom is exported as a metric rather than only
+    /// consulted: an operator has to be able to see the real curve for their
+    /// workload and tune against it.
+    pub fn wal_headroom_seq(&self, latest_seq: u64, now_ms: u64) -> Option<u64> {
+        self.min_acked_live(now_ms)
+            .map(|acked| latest_seq.saturating_sub(acked))
+    }
+
     pub fn live_replica_count(&self, now_ms: u64) -> usize {
         self.replicas
             .lock()
@@ -317,6 +396,121 @@ mod tests {
         hub.record_ack(fast, 30, 2_000);
         assert_eq!(hub.lag_ms(2_050), Some(0), "freshest fully caught up");
         assert_eq!(hub.live_replica_count(2_050), 2);
+    }
+
+    #[test]
+    fn retention_follows_the_slowest_live_replica_not_the_freshest() {
+        let hub = ReplHub::default();
+        let fast = hub.register_replica();
+        let slow = hub.register_replica();
+        hub.record_ack(fast, 500, 1_000);
+        hub.record_ack(slow, 100, 1_000);
+        // RPO looks at the best copy it could promote...
+        assert_eq!(hub.effective_acked(1_100), Some(500));
+        // ...retention at the one that would lose data if we deleted.
+        assert_eq!(hub.min_acked_live(1_100), Some(100));
+        // Headroom is measured against the SLOW one, so it is the larger,
+        // more conservative number. Taking the freshest here would report
+        // 100 sequences of headroom while the slow replica is 900 behind.
+        assert_eq!(hub.wal_headroom_seq(1_000, 1_100), Some(900));
+    }
+
+    #[test]
+    fn a_dead_slow_replica_stops_pinning_retention() {
+        let hub = ReplHub::default();
+        let fast = hub.register_replica();
+        let slow = hub.register_replica();
+        hub.record_ack(fast, 500, 1_000);
+        hub.record_ack(slow, 100, 1_000);
+        assert_eq!(hub.min_acked_live(1_100), Some(100));
+        // The slow one stops acking; the fast one keeps going. A naive
+        // min-across-ALL would hold the WAL at 100 forever and turn a
+        // replication problem into a disk-exhaustion one.
+        let later = 1_000 + LIVENESS_WINDOW_MS + 1;
+        hub.record_ack(fast, 900, later);
+        assert_eq!(
+            hub.min_acked_live(later),
+            Some(900),
+            "a replica outside the liveness window must not pin retention"
+        );
+        assert_eq!(hub.wal_headroom_seq(1_000, later), Some(100));
+    }
+
+    #[test]
+    fn no_live_replica_means_no_headroom_bound() {
+        let hub = ReplHub::default();
+        // Nobody has ever acked: retention is pinned by nobody, and the
+        // widowed-grace gate — not this one — is what bounds the risk.
+        assert_eq!(hub.min_acked_live(5_000), None);
+        assert_eq!(hub.wal_headroom_seq(9_999, 5_000), None);
+    }
+
+    #[test]
+    fn headroom_never_underflows_when_a_replica_reports_ahead() {
+        let hub = ReplHub::default();
+        let r = hub.register_replica();
+        // A replica acking past the master's latest is not expected, but a
+        // saturating gap is the difference between "0" and a number near
+        // u64::MAX being fed to a shed comparison.
+        hub.record_ack(r, 100, 1_000);
+        assert_eq!(hub.wal_headroom_seq(50, 1_100), Some(0));
+    }
+
+    #[test]
+    fn headroom_gate_fires_on_the_slowest_replica_not_the_freshest() {
+        let hub = ReplHub::default();
+        hub.set_wal_headroom_shed_seq(1_000);
+        let fast = hub.register_replica();
+        let slow = hub.register_replica();
+        hub.record_ack(fast, 9_500, 1_000);
+        hub.record_ack(slow, 8_000, 1_000);
+        // Freshest is 500 behind; slowest is 2_000 behind. The gate must
+        // read the slowest, or it protects nobody.
+        assert!(hub.wal_headroom_exhausted(10_000, 1_100));
+        // Slow one catches up: back under the limit.
+        hub.record_ack(slow, 9_800, 1_100);
+        assert!(!hub.wal_headroom_exhausted(10_000, 1_150));
+    }
+
+    #[test]
+    fn headroom_gate_is_silent_without_a_live_replica() {
+        let hub = ReplHub::default();
+        hub.set_wal_headroom_shed_seq(1);
+        // Nobody live: retention is pinned by nobody, and the widowed-grace
+        // gate owns this state. Firing here would report the wrong cause for
+        // a condition another gate already names.
+        assert!(!hub.wal_headroom_exhausted(u64::MAX, 5_000));
+
+        let r = hub.register_replica();
+        hub.record_ack(r, 0, 1_000);
+        let dead = 1_000 + LIVENESS_WINDOW_MS + 1;
+        assert!(
+            !hub.wal_headroom_exhausted(u64::MAX, dead),
+            "a replica outside the liveness window must not hold the gate open"
+        );
+    }
+
+    #[test]
+    fn headroom_gate_disabled_at_zero() {
+        let hub = ReplHub::default();
+        hub.set_wal_headroom_shed_seq(0);
+        let r = hub.register_replica();
+        hub.record_ack(r, 0, 1_000);
+        assert!(
+            !hub.wal_headroom_exhausted(u64::MAX, 1_100),
+            "0 must disable the gate, not shed everything"
+        );
+    }
+
+    #[test]
+    fn headroom_gate_fires_exactly_at_the_limit() {
+        let hub = ReplHub::default();
+        hub.set_wal_headroom_shed_seq(100);
+        let r = hub.register_replica();
+        hub.record_ack(r, 900, 1_000);
+        assert!(!hub.wal_headroom_exhausted(999, 1_100), "99 behind: under");
+        assert!(hub.wal_headroom_exhausted(1_000, 1_100), "100 behind: at");
+        assert!(hub.wal_headroom_exhausted(1_001, 1_100), "101 behind: over");
     }
 
     #[test]

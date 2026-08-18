@@ -1177,6 +1177,15 @@ fn main() -> std::io::Result<()> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
     let hub = Arc::new(ReplHub::new(lag_soft, lag_hard, min_replicas));
+    // ADR-0022: shed writes once the master outruns its SLOWEST live replica
+    // by this many sequences, so a lagging replica meets backpressure before
+    // it meets a WAL segment that has already been recycled. 0 disables.
+    // Sequences are a proxy for retained bytes; retune from `wal_headroom_seq`
+    // in INFO if values are much bigger or smaller than ~1 KB.
+    if let Some(v) = arg("--wal-headroom-seq").and_then(|v| v.parse::<u64>().ok()) {
+        hub.set_wal_headroom_shed_seq(v);
+        eprintln!("wal headroom shed threshold: {v} sequences");
+    }
     // --lease-ttl-ms (ADR-0018): how long this node may serve as master
     // without a successful CPLEASE renewal before self-fencing. 0 = lease
     // management off (standalone / no CP), matching the old "no FLINTLEASE
@@ -2073,6 +2082,22 @@ fn check_node_health(work: Work<'_>, ro: bool) -> Option<Value> {
 /// has always recorded it — between the slot gate and the throttles, so a
 /// shed write still counts as demand on its slot. Recorded per command, so
 /// a transaction weighs what it actually is.
+/// The engine's newest sequence, or 0 when there is no engine to ask.
+///
+/// Feature-split because `admit_write_path` is compiled for both engines
+/// while only rocks has a WAL. Returning 0 under `mem` makes the ADR-0022
+/// headroom gate inert there by construction — there is no WAL to recycle,
+/// so there is nothing for a replica to fall off the back of — rather than
+/// by a separate `cfg` around the gate itself, which would drift.
+#[cfg(feature = "rocks")]
+fn latest_seq_of(rocks: &Option<RocksHandle>) -> u64 {
+    rocks.as_ref().map(|kv| kv.latest_seq()).unwrap_or(0)
+}
+#[cfg(not(feature = "rocks"))]
+fn latest_seq_of(_rocks: &Option<RocksHandle>) -> u64 {
+    0
+}
+
 fn admit_write_path(
     work: Work<'_>,
     ro: bool,
@@ -2135,6 +2160,24 @@ fn admit_write_path(
                 std::thread::sleep(std::time::Duration::from_millis(2));
             }
             _ => {}
+        }
+        // ADR-0022: WAL headroom. Distinct from the lag gates above, which
+        // bound the RPO in TIME; this one bounds how far the master may
+        // outrun the WAL its slowest live replica still has to read.
+        //
+        // A replica that loses this race does not degrade, it DIES: the
+        // segment holding its cursor is recycled, `updates_since` yields
+        // nothing, and the seat exits for a re-seed that re-runs the same
+        // race (docs/bugs/0012). Shedding converts an unbounded outage into
+        // a bounded, retryable, nameable one — the trade the lag caps
+        // already make for the same underlying problem.
+        //
+        // After the lag gates on purpose: when both would fire, lag is the
+        // more familiar cause and the more actionable message.
+        if hub.wal_headroom_exhausted(latest_seq_of(rocks), now) {
+            return Some(Value::Error(
+                "THROTTLED replica too far behind the retained WAL, retry with backoff".into(),
+            ));
         }
         // The deadline gate (#186), last because the gates above can NAME
         // their cause and this one cannot: it is the catch-all for "this node
@@ -2415,6 +2458,7 @@ fn execute(
                 ),
                 field("lag-soft-ms", hub.lag_soft_ms().to_string()),
                 field("lag-hard-ms", hub.lag_hard_ms().to_string()),
+                field("wal-headroom-seq", hub.wal_headroom_shed_seq().to_string()),
                 field(
                     "min-replicas-to-write",
                     hub.min_replicas_to_write().to_string(),
@@ -2460,6 +2504,10 @@ fn execute(
             b"wal-fsync-ms" => WAL_FSYNC_MS.store(parse!(), Ordering::Relaxed),
             b"lag-soft-ms" => hub.set_lag_soft_ms(parse!()),
             b"lag-hard-ms" => hub.set_lag_hard_ms(parse!()),
+            // Live-tunable on purpose: the right value depends on value size
+            // and on how far replicas actually fall behind under this
+            // workload, and neither is knowable before the fleet runs.
+            b"wal-headroom-seq" => hub.set_wal_headroom_shed_seq(parse!()),
             b"min-replicas-to-write" => hub.set_min_replicas_to_write(parse!()),
             b"widowed-grace-ms" => hub.set_widowed_grace_ms(parse!()),
             b"max-conns" => MAX_CONNS.store(std::cmp::max(1, parse!()), Ordering::Relaxed),
@@ -2470,7 +2518,8 @@ fn execute(
             other => {
                 return Value::Error(format!(
                     "ERR unknown or restart-only config key {:?} (hot: wal-fsync-ms, \
-                     lag-soft-ms, lag-hard-ms, min-replicas-to-write, widowed-grace-ms, \
+                     lag-soft-ms, lag-hard-ms, wal-headroom-seq, \
+                     min-replicas-to-write, widowed-grace-ms, \
                      max-conns, migrate-rate-bytes, fullsync-rate-bytes, \
                      write-deadline-ms, gc-sweep-ms)",
                     String::from_utf8_lossy(other)
@@ -3036,7 +3085,7 @@ fn flintinfo(
     };
     let (disk_free, disk_total, disk_unknown) = DISK.snapshot();
     let info = format!(
-        "role:{}\r\nrole_epoch:{role_epoch}\r\nbuild:{build}\r\nsst_bytes:{sst}\r\nlatest_seq:{latest}\r\nlast_applied:{last_applied}\r\nacked_seq:{}\r\nseq_lag:{seq_lag}\r\nlive_replicas:{}\r\nlag_ms:{}\r\nlag_soft_ms:{soft}\r\nlag_hard_ms:{hard}\r\nmin_replicas_to_write:{minr}\r\nwidowed_grace_ms:{wgm}\r\nwidowed_shed:{wsh}\r\nfullsync_active:{fsa}\r\nfullsync_max:{fsm}\r\nasync_write_queue:{aqd}\r\nwrite_deadline_ms:{wdm}\r\nwrite_inflight:{wif}\r\nwrite_service_us:{wsu}\r\nwrite_wait_est_ms:{wwe}\r\nwrites_shed_deadline:{wsd}\r\nwal_fsync_ms:{wfm}\r\nwal_fsync_total:{wft}\r\ncert_days_remaining:{cdr}\r\nactive_conns:{ac}\r\nmax_conns:{mc}\r\nconns_shed_total:{cs}\r\nwrite_stopped:{wst}\r\ndelayed_write_rate:{dwr}\r\ndisk_free_bytes:{dfb}\r\ndisk_total_bytes:{dtb}\r\ndisk_free_pct:{dfp}\r\ndisk_verdict:{dv}\r\ndisk_unknown_samples:{dus}\r\ngc_swept_expired:{gse}\r\ngc_swept_orphans:{gso}\r\nuptime_ms:{upms}\r\n",
+        "role:{}\r\nrole_epoch:{role_epoch}\r\nbuild:{build}\r\nsst_bytes:{sst}\r\nlatest_seq:{latest}\r\nlast_applied:{last_applied}\r\nacked_seq:{}\r\nseq_lag:{seq_lag}\r\nwal_headroom_seq:{whs}\r\nwal_min_acked_seq:{wma}\r\nwal_headroom_shed_seq:{whl}\r\nlive_replicas:{}\r\nlag_ms:{}\r\nlag_soft_ms:{soft}\r\nlag_hard_ms:{hard}\r\nmin_replicas_to_write:{minr}\r\nwidowed_grace_ms:{wgm}\r\nwidowed_shed:{wsh}\r\nfullsync_active:{fsa}\r\nfullsync_max:{fsm}\r\nasync_write_queue:{aqd}\r\nwrite_deadline_ms:{wdm}\r\nwrite_inflight:{wif}\r\nwrite_service_us:{wsu}\r\nwrite_wait_est_ms:{wwe}\r\nwrites_shed_deadline:{wsd}\r\nwal_fsync_ms:{wfm}\r\nwal_fsync_total:{wft}\r\ncert_days_remaining:{cdr}\r\nactive_conns:{ac}\r\nmax_conns:{mc}\r\nconns_shed_total:{cs}\r\nwrite_stopped:{wst}\r\ndelayed_write_rate:{dwr}\r\ndisk_free_bytes:{dfb}\r\ndisk_total_bytes:{dtb}\r\ndisk_free_pct:{dfp}\r\ndisk_verdict:{dv}\r\ndisk_unknown_samples:{dus}\r\ngc_swept_expired:{gse}\r\ngc_swept_orphans:{gso}\r\nuptime_ms:{upms}\r\n",
         if read_only { "replica" } else { "master" },
         hub.effective_acked(now)
             .map_or_else(|| "none".into(), |a| a.to_string()),
@@ -3045,6 +3094,20 @@ fn flintinfo(
             .map_or_else(|| "none".into(), |l| l.to_string()),
         soft = hub.lag_soft_ms(),
         hard = hub.lag_hard_ms(),
+        // ADR-0022. Exported because the shed threshold is expressed in
+        // SEQUENCES while RocksDB budgets BYTES: an operator can only pick a
+        // sane threshold by watching what their own workload actually does.
+        // `-1` for "no live replica", which is a different state from zero
+        // headroom and must not read as healthy.
+        whs = hub
+            .wal_headroom_seq(latest, now)
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "-1".into()),
+        wma = hub
+            .min_acked_live(now)
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "-1".into()),
+        whl = hub.wal_headroom_shed_seq(),
         minr = hub.min_replicas_to_write(),
         wgm = hub.widowed_grace_ms(),
         // Whether the grace is CURRENTLY shedding, not just configured.

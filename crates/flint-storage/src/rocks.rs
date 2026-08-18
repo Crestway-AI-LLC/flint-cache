@@ -160,6 +160,16 @@ fn table_options() -> BlockBasedOptions {
     bbt
 }
 
+/// WAL retention: how long an obsolete segment stays in `archive/` for a
+/// replica to tail. Generous on purpose — the point is that ADR-0022's shed
+/// gate, not this window, is what a lagging replica hits first. A window
+/// this size makes shedding rare; the shedding is what makes the window safe.
+pub const DEFAULT_WAL_TTL_SECONDS: u64 = 21_600; // 6 h, was 1 h
+/// Companion byte budget. RocksDB applies whichever bound trips first, so
+/// raising only the TTL would have left the 1 GiB limit doing the pruning —
+/// which is the term that actually fired in the incident.
+pub const DEFAULT_WAL_SIZE_LIMIT_MB: u64 = 8_192; // 8 GiB, was 1 GiB
+
 impl RocksKv {
     /// Open without the ability — or the side effects — of writing.
     ///
@@ -178,12 +188,38 @@ impl RocksKv {
     }
 
     pub fn open(path: &Path) -> Result<Self, rocksdb::Error> {
+        Self::open_with_retention(path, DEFAULT_WAL_TTL_SECONDS, DEFAULT_WAL_SIZE_LIMIT_MB)
+    }
+
+    /// `open`, with the WAL retention window stated explicitly.
+    ///
+    /// Retention is what a replica tails, so it is really a replication
+    /// parameter wearing a storage parameter's clothes. It is separated here
+    /// because ADR-0022 makes the master shed writes when its slowest live
+    /// replica approaches the window, and a shed threshold that cannot be
+    /// related to the window it protects is untunable.
+    ///
+    /// Both terms still come from RocksDB and are immutable after open: the
+    /// archive is deleted when a segment is older than the TTL **or** the
+    /// archive exceeds the size limit, whichever happens first, and neither
+    /// consults a replica. That is the reason the shedding in ADR-0022 exists
+    /// rather than a cleverer retention rule.
+    pub fn open_with_retention(
+        path: &Path,
+        wal_ttl_seconds: u64,
+        wal_size_limit_mb: u64,
+    ) -> Result<Self, rocksdb::Error> {
         let mut opts = Options::default();
         opts.create_if_missing(true);
-        // Retain WAL long enough for replicas to tail it (v0: 1h / 1GB;
-        // beyond that a replica must full-sync from a checkpoint).
-        opts.set_wal_ttl_seconds(3600);
-        opts.set_wal_size_limit_mb(1024);
+        // Retain WAL long enough for replicas to tail it. The v0 values (1 h
+        // / 1 GiB) were chosen before anything measured how far a replica
+        // actually falls behind, and a replica died against them twice in
+        // three weeks — the second time one sequence short of the boundary,
+        // on a fleet serving ~50 ops/s. Volume was never the driver: what
+        // consumed the window was a replica spending its life full-syncing
+        // rather than tailing. See docs/bugs/0012 and ADR-0022.
+        opts.set_wal_ttl_seconds(wal_ttl_seconds);
+        opts.set_wal_size_limit_mb(wal_size_limit_mb);
         // Expired metadata rows are dropped organically as compaction
         // rewrites them (subkey orphans are reclaimed by gc::sweep until
         // the filter gains a metadata-lookup handle).
