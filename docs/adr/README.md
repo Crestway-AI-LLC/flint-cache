@@ -18,6 +18,7 @@ lost. Format and rationale: [0001](0001-record-architecture-decisions.md).
 | [0019](0019-rewind-rejoin-promotion-fences.md) | Rewind rejoin: promotion fences make failover RTO independent of dataset size |
 | [0020](0020-proxy-backend-multiplexing.md) | Multiplex the proxy's backend hop: decouple send from receive so a pipeline survives it (proposed) |
 | [0021](0021-proxy-async-worker-model.md) | Give the proxy bounded worker threads and async IO, so backend connections have few owners (proposed) |
+| [ADR-0022](0022-wal-retention-bounded-by-replica-progress.md) | WAL retention follows the slowest live replica; the master sheds instead of letting it die |
 
 ## Why the numbering has a gap
 
