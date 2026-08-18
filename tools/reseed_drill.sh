@@ -55,12 +55,32 @@ start_replica() {
   ( "$BIN" --port $RPORT --engine rocks --data-dir "$RDIR" \
       --replica-of "127.0.0.1:$MPORT" >>"$RLOG" 2>&1 ; echo $? > "$D/replica.rc" ) &
 }
+# $2 = tenths of a second to wait, default 100 (10s).
+#
+# The budget is an argument because this drill waits on two different KINDS
+# of event with the same call. A process coming up is sub-second, and 10s of
+# patience for it is generous. A RE-SEED is a data transfer: the marked boot
+# first probes the master (internal_call_once allows itself a 5s read
+# timeout), then pulls a checkpoint, then opens RocksDB, and only THEN binds
+# the port (#176 — a syncing replica is invisible). Sharing one constant
+# between the two meant a re-seed that was merely slow reported as "the
+# replica did not come back", which reads as a crash.
 wait_port() {
-  for _ in $(seq 1 100); do
+  for _ in $(seq 1 "${2:-100}"); do
     [ "$(valkey-cli -p "$1" PING 2>/dev/null)" = "PONG" ] && return 0
     sleep 0.1
   done
   return 1
+}
+
+# Everything known about why the replica is not answering. A bare "did not
+# come back" cost a CI cycle to distinguish "still syncing" from "exited
+# again", and both are visible from here.
+replica_forensics() {
+  echo "  still running? $(pgrep -f "flint-server --port $RPORT" >/dev/null && echo yes || echo no)"
+  [ -f "$D/replica.rc" ] && echo "  exit status: $(cat "$D/replica.rc")"
+  [ -f "$RDIR/NEEDS_RESEED" ] && echo "  marker still present: $(cat "$RDIR/NEEDS_RESEED")"
+  echo "  replica log tail:"; tail -12 "$RLOG" 2>/dev/null | sed 's/^/    | /'
 }
 
 echo "== master + replica, in sync"
@@ -122,7 +142,10 @@ echo "  exit 3, marked: $(cat "$RDIR/NEEDS_RESEED")"
 
 echo "== and the next start re-seeds itself, unattended"
 : > "$RLOG"
-start_replica; wait_port $RPORT || { echo "FAIL: replica did not come back"; exit 1; }
+# 60s, not 10: this wait spans a probe plus a whole checkpoint transfer.
+start_replica; wait_port $RPORT 600 || {
+  echo "FAIL: replica did not come back within 60s of the marked boot"
+  replica_forensics; exit 1; }
 grep -q "full sync: received" "$RLOG" \
   || { echo "FAIL: the marker did not trigger a full sync"; tail -5 "$RLOG"; exit 1; }
 [ -f "$RDIR/NEEDS_RESEED" ] && { echo "FAIL: marker survived the re-seed; the next start would wipe again"; exit 1; }
