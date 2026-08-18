@@ -31,6 +31,28 @@ inputs. So this is not deterministic at seed 1, and any investigation that
 concludes from a single green run that it is fixed will be wrong. Reproducing
 it may take several runs; a fix needs several greens to mean anything.
 
+### Observations, so the ratio exists
+
+A bug whose record contains only its failures can never say when it stopped
+happening. So passes are logged here too, with what they ran against.
+
+| Date | Result | Ran against | Context |
+|---|---|---|---|
+| 2026-08-18 | FAIL | (CI) | the observation this bug was filed from |
+| 2026-08-18 | PASS (7s) | `04df62e` `drill-pgrep-anchor` | full local gate, 116 steps, 0 fail |
+
+**The PASS is one sample, not an acquittal.** `chaos_unreadable` is in the
+gate's randomized CHAOS set (`tools/gates.sh:118`), and this bug's own finding
+is that it fails on some runs and not others — so a green run is exactly what
+an unfixed intermittent bug looks like most of the time. Recorded because the
+ratio is the only thing that will eventually separate "fixed by something we
+changed" from "did not fire today", and because a gate summary reading
+"116 steps, zero failures" would otherwise retire this silently.
+
+Nothing between these two rows was aimed at this bug; the storage change in
+that gate (BUG-0017, info-LOG bounds) has no relationship to the acked-write
+path.
+
 ## Established
 
 - The drill runs `flint-chaos --port-base 6346 --iterations 3 --keys 4000
