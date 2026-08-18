@@ -4,6 +4,13 @@ Status: OPEN, found 2026-08-18 from CI · Severity: high if real — the oracle
 is asserting the durability claim, so either the claim broke or the oracle is
 crying wolf, and both are worth an hour
 
+**Numbering, because git log points the wrong way.** Commit `6613c15`, which
+fixed the other three gate failures, calls this one "BUG-0012" in its message.
+It is BUG-0014; the number was reassigned before filing, because 0012 was
+already the WAL-retention livelock. That commit carries the same correction as
+a git note (`git log --notes`), but a fresh clone does not fetch notes, so the
+correction lives here too. Do not follow the 0012 reference.
+
 ## Symptom
 
 `tools/chaos_unreadable_drill.sh`, every gate run since 2026-08-16:
