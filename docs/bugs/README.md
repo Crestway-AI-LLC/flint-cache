@@ -37,5 +37,5 @@ New references should use the path, so a reader can follow them.
 | `0014-chaos-unreadable-acked-loss-on-replica-kill.md` | chaos oracle fails an acked write on a REPLICA kill, intermittently; cause not established (OPEN) |
 | `0015-flintsync-probe-admits-a-cursor-the-wal-cannot-serve.md` | marked boot clears its own re-seed marker on a probe that skips the WAL-retention check, then crash-loops (OPEN) |
 | `0016-retracted-du-is-not-the-dataset.md` | RETRACTED: `verify` was right; `du` on a data dir measures RocksDB's info LOG, not the dataset |
-| `0017-rocksdb-info-log-grows-without-bound.md` | 883 MB of RocksDB debug log against 248 KB of data; the disk guard, capacity model and meter all count it (OPEN) |
+| `0017-rocksdb-info-log-grows-without-bound.md` | 883 MB of RocksDB debug log against 248 KB of data, unbounded and fastest under replication churn (OPEN) |
 | `0018-upgrade-needs-the-new-cp-before-it-can-roll-masters.md` | `upgrade` rolls masters using a CP verb that only the not-yet-rolled CP understands (OPEN) |

@@ -1,8 +1,8 @@
-# BUG-0017: the RocksDB info LOG grows without bound, and three subsystems mistake it for data (OPEN)
+# BUG-0017: the RocksDB info LOG grows without bound (OPEN)
 
-Status: OPEN, found 2026-08-18 on the playground · Severity: **high** — it is a
-disk-exhaustion path that scales with replication churn rather than with stored
-data, and it silently corrupts every measurement taken with `du`
+Status: OPEN, found 2026-08-18 on the playground · Severity: **medium** — an
+unbounded disk consumer that scales with replication churn rather than with
+stored data. **Scope corrected 2026-08-18** — see "Three claims withdrawn".
 
 ## Symptom
 
@@ -24,50 +24,83 @@ Sampling 200,000 lines of the big file, one message is 92% of it:
 ## Root cause
 
 `crates/flint-storage/src/rocks.rs` sets **neither `keep_log_file_num` nor
-`max_log_file_size`** — six `opts.set_` calls in total, none about logging. So
-RocksDB's defaults stand: the info LOG grows without limit and rotated LOGs are
-never pruned.
+`max_log_file_size`**. `open_with_retention` (:207) makes six `opts.set_` calls
+and none concerns logging, so RocksDB's defaults stand: the info LOG grows
+without limit and rotated LOGs are never pruned. `open_read_only` (:183) passes
+a bare `Options::default()` for the same reason.
+
+Those two are the only production open sites; everything from :388 is
+`#[cfg(test)]`.
 
 This is the same gap as BUG-0013, which found compaction left at defaults in the
-same file. Two findings from one omission argues the fix is an audit of what
+same file. Two findings from one omission argues the fix is deciding what
 `rocks.rs` should PIN, not a third one-off.
 
-## Why it is not housekeeping
+## Why it is worth fixing rather than sweeping
 
-**1. It scales with churn, not with data.** The dominant line is emitted by the
-WAL archive manager. The harder a node churns WAL archive, the faster it fills
-its disk — and churning WAL archive is exactly what BUG-0012's livelock does.
-So a replication failure converts itself into a disk failure. The file spans
-`2026/08/11-21:06:56` to a rotation at ~05:02Z on 2026-08-18, the week that
-ended in nine hours with no master; steady state after that measured
+**It scales with churn, not with data.** The dominant line is emitted by the WAL
+archive manager, so the harder a node churns WAL archive the faster it fills its
+disk — and churning WAL archive is exactly what BUG-0012's livelock does. A
+replication failure thereby converts itself into a disk-capacity failure. The
+file spans `2026/08/11-21:06:56` to a rotation at ~05:02Z on 2026-08-18, the week
+that ended in nine hours with no master; steady state after that measured
 **~6 MB/hour**, unbounded.
 
-**2. The disk guard sheds writes on it.** The guard samples the data directory
-for free space. On a small node it will refuse tenant traffic because of debug
-logging, with no relationship to what the tenant stored.
+That is the whole of the defect: a diagnostic file can consume a volume the data
+does not need. It is resource exhaustion, not corrupted measurement.
 
-**3. The capacity model and the meter count it.** `capacity 467771486208` and
-`FLINTNSBYTES` are read against the same directory. On this box the dataset
-reads as 918 MB when it is 248 KB — a 3,600x overstatement that would flow
-straight into a bill.
+## Three claims withdrawn
+
+The first version of this bug asserted that three subsystems mistake the log for
+data. **All three were wrong**, and none was checked before filing:
+
+1. **"The disk guard sheds writes on it."** `crates/flint-server/src/diskguard.rs`
+   thresholds on FREE SPACE — `min_free_pct: 10`, `min_free_bytes: 2 GiB`,
+   `u.free_pct()` over `flint_storage::disk::Usage` — not on directory size.
+   Free space is the correct sensor for ENOSPC: if any file fills the volume the
+   guard *should* shed. The guard was working as designed.
+2. **"The meter counts it."** `RocksKv::ns_bytes` (`rocks.rs:84`) sums
+   `db.get_approximate_sizes()` over the namespace's `MSZ` CF ranges — RocksDB's
+   own SST estimate for those key ranges. It never reads directory size, so
+   there is no 3,600x billing overstatement.
+3. **"The capacity model counts it."** `capacity 467771486208` is a DECLARED
+   inventory value: `"capacity" => inv.capacity_bytes`
+   (`flint-ctl/src/main.rs:276`) forwarded as `--node-capacity-bytes` (:2811).
+   Nothing measures anything.
+
+The withdrawn fix that followed from them — *"stop measuring datasets with `du`,
+and more important than log retention"* — has **no target in the product**. A
+grep of `crates/` finds no `du`, no `walkdir`, and no directory-size summation on
+any metering path. `du` was the tool I measured with by hand; the product never
+used it. The 3,600:1 ratio is real, but it inflates a log file, not a meter.
+
+Filed an hour after BUG-0016 was retracted for the same mistake — asserting a
+blast radius without reading the consumers — which is why the fix below is
+deliberately narrower than the one first proposed.
 
 ## Fix
 
-- Pin `max_log_file_size` and `keep_log_file_num` to something bounded and
-  small in `rocks.rs`. A drill that writes enough to force a rotation and
-  asserts old logs are pruned; without the assert this regresses silently,
-  because nothing else in the system notices a large file.
-- **Separately, and more important: stop measuring datasets with `du`.** The
-  guard, the capacity model and the meter should count SST + live WAL, not
-  directory size. That is a correctness fix independent of log retention — with
-  the logs bounded, a large `archive/` or a stray checkpoint would still
-  mislead all three.
+- Pin `max_log_file_size` and `keep_log_file_num` in `open_with_retention`, and
+  give `open_read_only` the same options rather than a bare default. Proposed
+  **64 MiB x 5 = a 320 MB ceiling**, which at the measured ~6 MB/hour is roughly
+  two days of history — deliberately more than one, because the incident that
+  motivated this ran nine hours before anyone looked.
+- A drill that writes enough to force a rotation and asserts old logs are
+  pruned. Without the assert this regresses silently, because nothing else in
+  the system notices a large file.
 
-## Also worth deciding
+Explicitly NOT changing:
 
-Whether the info LOG belongs in the data directory at all. `set_db_log_dir`
-would move it out, which fixes the guard and the meter by construction rather
-than by remembering to exclude it — at the cost of one more path to manage.
+- **The disk guard and the meter.** Both are already correct; editing them would
+  be a regression driven by the withdrawn claims.
+- **The log level.** Dropping INFO to WARN would cut 92% of the volume, but the
+  compaction and flush records are what BUG-0013 and #196 are diagnosed from.
+  Bound the size, keep the fidelity.
+- **`set_db_log_dir`.** Moving the log off the data dir was floated as fixing
+  the guard "by construction". With claims 1-3 withdrawn there is nothing to fix
+  by construction, and it would make things worse: on the guarded volume an
+  unbounded log is at least SEEN by the free-space check. Off it, it grows
+  invisibly until the root fills.
 
 ## Reproduced / cleared
 
