@@ -32,3 +32,4 @@ New references should use the path, so a reader can follow them.
 | `0009-unknown-stage-passes-the-gate.md` | an unrecognised stage argument ran nothing and printed GATES PASSED |
 | `0010-drill-port-overlap-recurs-on-7411.md` | BUG-0003 again: 7411 claimed by two drills, so every gate exits FAILED (OPEN) |
 | `0011-conformance-drill-cp-never-pongs.md` | `flintctl bootstrap` spawns the CP seat, then its own probe never gets PONG (OPEN) |
+| `0012-walgap-livelock-retention-ignores-replicas.md` | WAL retention ignores replica progress, so a lagging replica can never catch up |
