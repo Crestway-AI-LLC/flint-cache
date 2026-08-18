@@ -36,17 +36,45 @@ it may take several runs; a fix needs several greens to mean anything.
 A bug whose record contains only its failures can never say when it stopped
 happening. So passes are logged here too, with what they ran against.
 
-| Date | Result | Ran against | **Box load** | Context |
-|---|---|---|---|---|
-| 2026-08-18 | FAIL | (CI) | **loaded** | the observation this bug was filed from |
-| 2026-08-18 | PASS (7s) | `04df62e` | **loaded** | full local gate, 116 steps |
-| 2026-08-18 | PASS (6s) | `c1371d9` | **loaded** | full local gate + a peer's cargo build competing |
-| 2026-08-18 | PASS x6 | (peer worktree) | **idle** | solo runs, no gate, nothing else on the box |
+| Date | Result | Ran against | **Invocation** | **Box load** | Notes |
+|---|---|---|---|---|---|
+| 2026-08-18 | **FAIL** | (CI) | full gate | loaded | the observation this bug was filed from |
+| 2026-08-18 | PASS (7s) | `04df62e` | full gate | loaded | 116 steps, 0 fail |
+| 2026-08-18 | PASS (6s) | `c1371d9` | full gate | loaded + a peer's `cargo` build competing | |
+| 2026-08-18 | PASS x6 | `581e074` | raw binary, drill's exact args | idle | precondition asserted both binaries present |
+| 2026-08-18 | PASS x12 | `581e074` | raw binary + `--stall-replica-ms` 600/1200/1800/3000 | idle | injector verified working — see below |
+| 2026-08-18 | PASS x3 | `581e074` | `chaos_unreadable_drill.sh` | idle | |
 
-**The load column is the point, and it was missing until 2026-08-18.** Without
-it this table pools two populations as if they were one. Every FAILURE of this
-bug has occurred on a loaded box; every green on an idle box is close to
-uninformative.
+**Both columns matter, and pooling either would repeat the same mistake.** The
+21 runs on 2026-08-18 span three *invocations* as well as two load states;
+recording them as bare passes treats six distributions as one.
+
+### What the evidence rules OUT
+
+**Load is not sufficient, and may not be necessary.** The tempting reading of
+the table is load-dependence. It does not survive: two of the passes above ran
+under a *full gate*, one with a competing build. If load were the missing
+condition those runs should have fired, and they did not.
+
+**Replication lag is not the knob either.** The 12-run sweep injected lag until
+acked-key regression at the master kill reached **1688 / 2310 / 2343 / 2006**,
+against the recorded failure's **20** — roughly a hundred times the
+unreplicated tail — and the replica-kill assertion stayed silent through all of
+it. That is a positive control on the injector, so the silence is a real
+result. It specifically undercuts the BUG-0007-class hypothesis (a pre-kill ack
+surviving the master-kill retire): more regression should fire it more often,
+and it never fired at all.
+
+### What survives
+
+**It has only ever fired inside a full gate**, and 21 runs outside one — 12 of
+them with injected lag — did not fire it. That is a statement about *where* it
+fires, not *why*, and it should not be dressed as a mechanism. It points at
+drill-to-drill interaction or leftover state rather than at the write path.
+
+**So "INTERMITTENT" is probably the wrong word.** Nothing in 21 runs behaved
+randomly. Whatever the trigger is, it is a property of the gate environment
+that no one has isolated yet.
 
 **A PASS is one sample, not an acquittal — and "INTERMITTENT" may be the wrong
 word.** BUG-0007, the resolved bug with this exact assertion text, records that
