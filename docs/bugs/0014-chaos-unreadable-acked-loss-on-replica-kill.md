@@ -36,12 +36,27 @@ it may take several runs; a fix needs several greens to mean anything.
 A bug whose record contains only its failures can never say when it stopped
 happening. So passes are logged here too, with what they ran against.
 
-| Date | Result | Ran against | Context |
-|---|---|---|---|
-| 2026-08-18 | FAIL | (CI) | the observation this bug was filed from |
-| 2026-08-18 | PASS (7s) | `04df62e` `drill-pgrep-anchor` | full local gate, 116 steps, 0 fail |
+| Date | Result | Ran against | **Box load** | Context |
+|---|---|---|---|---|
+| 2026-08-18 | FAIL | (CI) | **loaded** | the observation this bug was filed from |
+| 2026-08-18 | PASS (7s) | `04df62e` | **loaded** | full local gate, 116 steps |
+| 2026-08-18 | PASS (6s) | `c1371d9` | **loaded** | full local gate + a peer's cargo build competing |
+| 2026-08-18 | PASS x6 | (peer worktree) | **idle** | solo runs, no gate, nothing else on the box |
 
-**The PASS is one sample, not an acquittal.** `chaos_unreadable` is in the
+**The load column is the point, and it was missing until 2026-08-18.** Without
+it this table pools two populations as if they were one. Every FAILURE of this
+bug has occurred on a loaded box; every green on an idle box is close to
+uninformative.
+
+**A PASS is one sample, not an acquittal — and "INTERMITTENT" may be the wrong
+word.** BUG-0007, the resolved bug with this exact assertion text, records that
+its mechanism "needs replication lag, hence the intermittency". An idle box has
+almost none. If this is **load-dependence** rather than randomness, it is a
+property of the machine, not of the code — and a green on a quiet box and a
+green on a loaded one are not the same evidence, which is what the column above
+now records.
+
+Also: `chaos_unreadable` is in the
 gate's randomized CHAOS set (`tools/gates.sh:118`), and this bug's own finding
 is that it fails on some runs and not others — so a green run is exactly what
 an unfixed intermittent bug looks like most of the time. Recorded because the
