@@ -248,6 +248,16 @@ fanout-timeout-ms 60000  proxy restart  read budget for the O(KEYS) admin
                                   that is otherwise perfectly healthy.
 cache-ttl-ms 300      proxy HOT   near-cache TTL default (PROXYCACHE)
 cache-max-bytes N     proxy HOT   near-cache byte budget
+proxy-workers N       proxy restart  bounded worker threads (ADR-0021).
+                                  Default is available_parallelism(), which
+                                  is right for a DEDICATED proxy host. On a
+                                  CO-LOCATED box — proxy, node and CP sharing
+                                  the vCPUs, which is what the single-VM
+                                  image runs — the proxy competes with the
+                                  node for the same cores and roughly half
+                                  the core count has measured faster. Set it
+                                  there; leave it unset on a proxy that owns
+                                  its host.
 async-queue-cap 4096  node  restart  async write-queue depth
 poll-ms 100           ctlr  restart  failure-probe interval (RTO)
 confirm 3             ctlr  restart  consecutive fails before promote

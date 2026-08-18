@@ -155,6 +155,12 @@ struct Inventory {
     /// step), which scales with the KEYSPACE — not with keyed-traffic
     /// latency. Default 60_000; raise it above ~20M keys per node.
     fanout_timeout_ms: Option<u64>,
+    /// proxy: bounded worker threads (ADR-0021). Absent = the proxy's own
+    /// default, `available_parallelism()`, which is right for a DEDICATED
+    /// proxy host and over-provisions a co-located one: on a box where the
+    /// proxy shares vCPUs with a node and the CP, half the cores measured
+    /// faster than all of them. Restart-only, like the other proxy tunables.
+    proxy_workers: Option<u64>,
     ctl_poll_ms: Option<u64>, // controller: failure-probe interval (RTO)
     ctl_confirm: Option<u32>, // controller: consecutive fails to promote
     ctl_lease_ttl_ms: Option<u64>, // NODE master lease TTL (ADR-0018: renewed at the CP)
@@ -282,6 +288,7 @@ fn parse_inventory(path: &str) -> Inventory {
             "cache-ttl-ms" => inv.cache_ttl_ms = val.parse().ok(),
             "cache-max-bytes" => inv.cache_max_bytes = val.parse().ok(),
             "fanout-timeout-ms" => inv.fanout_timeout_ms = val.parse().ok(),
+            "proxy-workers" => inv.proxy_workers = val.parse().ok(),
             "poll-ms" => inv.ctl_poll_ms = val.parse().ok(),
             "confirm" => inv.ctl_confirm = val.parse().ok(),
             "lease-ttl-ms" => inv.ctl_lease_ttl_ms = val.parse().ok(),
@@ -2017,6 +2024,9 @@ fn proxy_tuning_args(inv: &Inventory) -> Vec<String> {
     }
     if let Some(v) = inv.fanout_timeout_ms {
         push("--fanout-timeout-ms", v.to_string());
+    }
+    if let Some(v) = inv.proxy_workers {
+        push("--workers", v.to_string());
     }
     a
 }
