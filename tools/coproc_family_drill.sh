@@ -25,7 +25,12 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init $FLINT_DRILL_ROOT/flint-coproc 7407 7408 7409 7410 7411
+# 7402 rather than 7411 for the co-processor: build_stamp_drill claims
+# 7411-7414 and a port claimed twice makes fleet_guard read the other
+# drill's seats as this one's own (BUG-0003, recurred as BUG-0010). The
+# block is deliberately not contiguous — 7403-7406 belong to
+# cold_start_roles_drill.
+fleet_init $FLINT_DRILL_ROOT/flint-coproc 7402 7407 7408 7409 7410
 fleet_guard
 STATE=$FLINT_DRILL_ROOT/flint-coproc
 INV=$FLINT_DRILL_ROOT/flint-coproc.flint
@@ -57,7 +62,7 @@ bins ./target/release
 cp 127.0.0.1:7410
 pair 127.0.0.1:7407,127.0.0.1:7408
 proxy 127.0.0.1:7409
-coproc VEC. 127.0.0.1:7411
+coproc VEC. 127.0.0.1:7402
 coproc-index-bytes 268435456
 EOF
 CTL="./target/release/flintctl -f $INV"
@@ -67,14 +72,14 @@ $CTL bootstrap >/dev/null 2>&1 || { echo "FAIL: bootstrap"; $CTL status; exit 1;
 $CTL tenant add vt tok-vt vt 1 >/dev/null 2>&1
 
 echo "== 1. flintctl spawned the family's binary, and it is listening"
-pgrep -f "flint-vec --port 7411" >/dev/null || {
+pgrep -f "flint-vec --port 7402" >/dev/null || {
   echo "FAIL: no flint-vec seat for the declared 'coproc VEC.' line — flintctl"
   echo "      parsed the key and started nothing"
   ls "$STATE/logs" 2>/dev/null | sed 's/^/    log: /'
   exit 1
 }
-[ -f "$STATE/pids/vec-7411.pid" ] || {
-  echo "FAIL: seat has no pidfile at vec-7411.pid — stop/sweep cannot reap what"
+[ -f "$STATE/pids/vec-7402.pid" ] || {
+  echo "FAIL: seat has no pidfile at vec-7402.pid — stop/sweep cannot reap what"
   echo "      it cannot name"; exit 1
 }
 
@@ -100,7 +105,7 @@ case "$OUT" in
       *COPROCUNAVAIL*) echo "      -> the family IS routed but the proxy could not reach the"
                        echo "         seat. Dial/TLS problem, not a routing one." ;;
     esac
-    echo "  co-processor log:"; tail -15 "$STATE/logs/vec-7411.log" 2>/dev/null | sed 's/^/    vec| /'
+    echo "  co-processor log:"; tail -15 "$STATE/logs/vec-7402.log" 2>/dev/null | sed 's/^/    vec| /'
     echo "  proxy log:";        tail -15 "$STATE/logs/proxy-7409.log" 2>/dev/null | sed 's/^/    px | /'
     exit 1 ;;
 esac
@@ -121,24 +126,24 @@ DBS=$($C DBSIZE 2>/dev/null | tr -d '\r')
 # rebuild (of an empty namespace). Waiting for the string alone matches that
 # stale line and reads "(0 vectors)" back as if it were the restart's answer —
 # so count the rebuilds present BEFORE the kill and wait for one MORE.
-BEFORE=$(grep -c "rebuilt ns" "$STATE/logs/vec-7411.log" 2>/dev/null || echo 0)
-pkill -9 -f "flint-vec --port 7411" 2>/dev/null
+BEFORE=$(grep -c "rebuilt ns" "$STATE/logs/vec-7402.log" 2>/dev/null || echo 0)
+pkill -9 -f "flint-vec --port 7402" 2>/dev/null
 sleep 0.3
 $CTL start >/dev/null 2>&1
 # The rebuild is chunked and driven by channel touches (main.rs rebuild_chunk),
 # so it needs a command to make progress: poke the set each tick.
 for _ in $(seq 1 150); do
-  NOW=$(grep -c "rebuilt ns" "$STATE/logs/vec-7411.log" 2>/dev/null || echo 0)
+  NOW=$(grep -c "rebuilt ns" "$STATE/logs/vec-7402.log" 2>/dev/null || echo 0)
   [ "$NOW" -gt "$BEFORE" ] && break
   $C VEC.INFO s >/dev/null 2>&1
   sleep 0.2
 done
-REBUILT=$(grep -o 'rebuilt ns "vt" ([0-9]* vectors)' "$STATE/logs/vec-7411.log" | tail -1)
+REBUILT=$(grep -o 'rebuilt ns "vt" ([0-9]* vectors)' "$STATE/logs/vec-7402.log" | tail -1)
 case "$REBUILT" in
   *"(3 vectors)"*) ;;
   "") echo "FAIL: the restarted co-processor never logged a rebuild — the cold-start"
       echo "      path did not run (DBSIZE through the edge was $DBS)"
-      tail -12 "$STATE/logs/vec-7411.log" | sed 's/^/    vec| /'; exit 1 ;;
+      tail -12 "$STATE/logs/vec-7402.log" | sed 's/^/    vec| /'; exit 1 ;;
   *)  echo "FAIL: cold start recovered '$REBUILT', expected 3 vectors — the durable"
       echo "      half of the two-phase write did not land for every VEC.SET"
       exit 1 ;;
@@ -169,8 +174,8 @@ echo "  top-2 = a, c (by cosine), served through the proxy over mTLS"
 echo "== 5. stop reaps the co-processor seat"
 $CTL stop >/dev/null 2>&1
 sleep 0.5
-pgrep -f "flint-vec --port 7411" >/dev/null && {
-  echo "FAIL: the co-processor survived 'stop' — it will hold port 7411 against"
+pgrep -f "flint-vec --port 7402" >/dev/null && {
+  echo "FAIL: the co-processor survived 'stop' — it will hold port 7402 against"
   echo "      the next start, which then fails on a bind error naming no family"
   exit 1
 }

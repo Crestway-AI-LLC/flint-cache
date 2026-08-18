@@ -100,8 +100,13 @@ done
 S="$(vexec VEC.SEARCH docs 0.9,0.1,0 2)"
 case "$S" in *a*b*) : ;; *) echo "FAIL: SEARCH order over mTLS, got: $S"; exit 1 ;; esac
 case "$(vexec VEC.GET docs a)" in *"1,0,0"*) : ;; *) echo "FAIL: VEC.GET over mTLS"; exit 1 ;; esac
-# The durable rows landed in KV through the (plaintext-edge, mTLS-backend) channel.
-[ "$($A DBSIZE 2>&1 | tr -d '\r')" = "4" ] || { echo "FAIL: expected 4 durable keys, got $($A DBSIZE)"; exit 1; }
+# The durable rows landed in KV through the (plaintext-edge, mTLS-backend)
+# channel. 8 = 1 config + 3 vectors + 1 set-name index + 3 id-index buckets;
+# the last two are #194's durable index (see coproc_vec_drill for the full
+# breakdown).
+[ "$($A DBSIZE 2>&1 | tr -d '\r')" = "8" ] \
+  || { echo "FAIL: expected 8 durable keys (1 config + 3 vectors + 1 set-name index + 3 id-index buckets), got $($A DBSIZE)"
+       $A SCAN 0 COUNT 200 2>/dev/null | sed 's/^/    key| /'; exit 1; }
 echo "  VEC.SEARCH -> $S  (mutual handshake completed, or this would be COPROCUNAVAIL)"
 
 echo "== NEGATIVE: a PLAINTEXT dialer to the co-processor's FLINTFAM port is refused"

@@ -1,7 +1,12 @@
-# BUG-0010: the port-overlap guard is back in the red — 7411 claimed twice (OPEN)
+# BUG-0010: the port-overlap guard is back in the red — 7411 claimed twice (FIXED)
 
-Status: OPEN, found 2026-08-16 · Severity: medium, but corrosive — `gates.sh`
-now exits FAILED on every run, which trains readers to ignore a red gate
+Status: FIXED 2026-08-18 · Severity: medium, but corrosive — `gates.sh`
+exited FAILED on every run, which trains readers to ignore a red gate
+
+**Fix:** `coproc_family_drill.sh` moved its co-processor seat from 7411 to
+7402. The block is deliberately non-contiguous (7403-7406 belong to
+`cold_start_roles_drill.sh`); disjointness is what the guard requires, and a
+comment on the `fleet_init` line says why the number looks odd.
 
 This is **BUG-0003 recurring**. That write-up fixed the overlaps that existed
 in August 2026 and added the preflight that catches new ones. The preflight is

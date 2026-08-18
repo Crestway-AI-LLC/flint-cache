@@ -80,9 +80,17 @@ case "$(vexec VEC.INFO docsh)" in *index*hnsw*) : ;; *) echo "FAIL: VEC.INFO sho
 echo "  HNSW VEC.SEARCH -> $PREH"
 
 echo "== durable rows exist in KV independent of the co-processor"
-# 8 = docs (1 config + 3 vectors) + docsh (1 config + 3 vectors).
-[ "$($A DBSIZE 2>&1 | tr -d '\r')" = "8" ] \
-  || { echo "FAIL: expected 8 durable keys (2 configs + 6 vectors), got $($A DBSIZE)"; exit 1; }
+# 15 = docs (1 config + 3 vectors) + docsh (1 config + 3 vectors)
+#    +  1 set-name index ('s', one per namespace, unbucketed)
+#    +  6 id-index buckets ('i', one per (set, bucket) that holds an id;
+#       a,b,c hash to distinct buckets in each of the two sets)
+# The last two are #194's durable index — the co-processor used to find its
+# vectors by SCANning the whole tenant keyspace on every cold start. A change
+# to the durable layout is SUPPOSED to move this number; the breakdown above
+# and the key dump below are what make the next move take a minute.
+[ "$($A DBSIZE 2>&1 | tr -d '\r')" = "15" ] \
+  || { echo "FAIL: expected 15 durable keys (2 configs + 6 vectors + 1 set-name index + 6 id-index buckets), got $($A DBSIZE)"
+       $A SCAN 0 COUNT 200 2>/dev/null | sed 's/^/    key| /'; exit 1; }
 
 echo "== CRASH DURABILITY: kill the co-processor, restart it EMPTY, SEARCH rebuilds"
 kill -9 "$COPROC_PID" 2>/dev/null; wait "$COPROC_PID" 2>/dev/null; COPROC_PID=""
@@ -108,7 +116,9 @@ echo "  post-restart HNSW VEC.SEARCH -> $POSTH  (rebuilt as hnsw)"
 echo "== VEC.DEL is durable too"
 [ "$(vexec VEC.DEL docs a)" = "1 " ] || { echo "FAIL: VEC.DEL"; exit 1; }
 case "$(vexec VEC.SEARCH docs 1,0,0 5)" in *a*) echo "FAIL: 'a' still present after DEL"; exit 1 ;; *) : ;; esac
-# 7 durable keys now: 2 configs + docs{b,c} + docsh{a,b,c}.
+# Captured, not asserted: VEC.DEL drops the vector row and may drop its
+# id-index bucket too (if 'a' was alone in it), so the absolute number is
+# layout-coupled. What D4 needs is only that it does not MOVE.
 DBSIZE_BEFORE_D4="$($A DBSIZE 2>&1 | tr -d '\r')"
 
 echo "== D4: a tiny per-namespace index-memory cap sheds new writes; reads unaffected"
