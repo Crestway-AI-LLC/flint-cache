@@ -290,9 +290,43 @@ fn migrate_in(
         }
         migration_active.store(true, Ordering::Relaxed);
     }
+    // Whether the SOURCE has been frozen. A Cell, not a plain bool, because
+    // `rollback` below has to read the CURRENT value: whether a rollback must
+    // also reach the source depends on how far the cutover got.
+    let frozen = std::cell::Cell::new(false);
+
+    // Roll back OUR Importing record — and, if we froze the source, unfreeze
+    // it too (docs/bugs/0024).
+    //
+    // Clearing only our own record leaves the source in Migrating, shedding
+    // every write to the slot with -TRYAGAIN, with no migration in flight and
+    // nobody driving one. The destination is the right actor here because it
+    // KNOWS it aborted; the controller's reconcile can only infer that from an
+    // absent record, and inferring it is what destroys data (docs/bugs/0025).
+    //
+    // FLINTSLOTABORT refuses a slot that is already Moved, so this cannot
+    // un-disown a handoff that actually completed — the safety is in the
+    // source's own check, not in our timing.
     let rollback = || {
         if self_addr.is_some() {
             manifest::clear_migration(kv.as_ref(), ns, slot);
+        }
+        if frozen.get() {
+            let r = call_retrying(
+                src,
+                &[b"FLINTSLOTABORT", slot.to_string().as_bytes(), ns],
+                3,
+                std::time::Duration::from_secs(5),
+            );
+            if !matches!(r, Ok(Value::Simple(_))) {
+                // Say so rather than pretending the rollback was complete: the
+                // slot is still frozen on the source and needs an operator or
+                // a reconcile. Silence here is what made this state invisible.
+                eprintln!(
+                    "cutover rollback: slot {slot} could not be unfrozen on {src} ({r:?}) \
+                     — the source is still shedding writes for it"
+                );
+            }
         }
     };
 
@@ -322,7 +356,6 @@ fn migrate_in(
     let mut chunk = [0u8; 64 * 1024];
     let mut applied: u64 = 0;
     let mut past_bulk = false;
-    let mut frozen = false; // cutover: has the source been frozen yet?
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
     loop {
         match decode(&buf) {
@@ -362,9 +395,16 @@ fn migrate_in(
                                 // Data-ship only: caught up, done.
                                 None => return Value::Simple(format!("MIGRATEIN-OK {applied}")),
                                 Some(me) => {
-                                    if !frozen {
+                                    if !frozen.get() {
                                         // Step 3: freeze the slot on the source.
-                                        match call_once(
+                                        //
+                                        // Retried, because a lost REPLY here
+                                        // used to roll us back while leaving
+                                        // the source frozen — the source acts
+                                        // on the command, not on our reading
+                                        // of its answer. FLINTSLOTFREEZE is
+                                        // idempotent at a bumped epoch.
+                                        match call_retrying(
                                             src,
                                             &[
                                                 b"FLINTSLOTFREEZE",
@@ -372,8 +412,10 @@ fn migrate_in(
                                                 me.as_bytes(),
                                                 ns,
                                             ],
+                                            3,
+                                            std::time::Duration::from_secs(5),
                                         ) {
-                                            Ok(Value::Simple(_)) => frozen = true,
+                                            Ok(Value::Simple(_)) => frozen.set(true),
                                             other => {
                                                 rollback();
                                                 return Value::Error(format!(
@@ -385,7 +427,13 @@ fn migrate_in(
                                     } else {
                                         // Step 5: flip dest-first, then source.
                                         manifest::clear_migration(kv.as_ref(), ns, slot);
-                                        match call_once(
+                                        // A generous budget, retried. The
+                                        // source does not reply until it has
+                                        // purged every row of the slot, so
+                                        // this reply's latency scales with the
+                                        // data — a fixed 5s was a guess about
+                                        // someone else's slot size.
+                                        match call_retrying(
                                             src,
                                             &[
                                                 b"FLINTSLOTMOVED",
@@ -393,19 +441,39 @@ fn migrate_in(
                                                 me.as_bytes(),
                                                 ns,
                                             ],
+                                            3,
+                                            std::time::Duration::from_secs(60),
                                         ) {
                                             Ok(Value::Simple(_)) => {
                                                 return Value::Simple(format!(
                                                     "MIGRATEIN-OK {applied} cutover"
                                                 ));
                                             }
-                                            other => {
-                                                // We already own (Importing
-                                                // cleared); the source failing
-                                                // to disown is a controller
-                                                // reconcile, not data loss.
+                                            // The source ANSWERED, with a
+                                            // refusal. That is a real claim
+                                            // about its state and is reported
+                                            // as one.
+                                            Ok(other) => {
                                                 return Value::Error(format!(
-                                                    "ERR cutover handoff incomplete (we own; source not disowned): {other:?}"
+                                                    "ERR cutover handoff refused by source (we own): {other:?}"
+                                                ));
+                                            }
+                                            // No answer. This used to read
+                                            // "source not disowned", which is
+                                            // a claim about the source made
+                                            // without asking it — and the one
+                                            // case it can fire, the source has
+                                            // usually disowned anyway, because
+                                            // the durable Moved record commits
+                                            // BEFORE the reply is generated
+                                            // (docs/bugs/0024). Say what is
+                                            // known and what is not.
+                                            Err(e) => {
+                                                return Value::Error(format!(
+                                                    "ERR cutover handoff UNCONFIRMED after retries (we own the slot; \
+                                                     the source may or may not have disowned it — its Moved record \
+                                                     commits before it replies, so a lost reply does not mean a lost \
+                                                     handoff; check the source before acting): {e}"
                                                 ));
                                             }
                                         }
@@ -788,12 +856,57 @@ pub(crate) fn check_slot_gate(
     None
 }
 
-/// Send one command to `addr` and read one reply (used by the cutover
-/// orchestration to freeze and hand off the slot on the source).
+/// `call_once` with a bounded retry, for the cutover's two control calls.
+///
+/// A timeout is NOT evidence about the peer (docs/bugs/0024). `call_once`
+/// ending in `Err` means only "no reply arrived in the budget" — the source
+/// may have done the work and had its reply lost, which is exactly what
+/// happens when the reply is gated behind unbounded work. Both cutover
+/// commands are idempotent at a bumped epoch (see `flintslotmoved`), so
+/// asking again is the cheap way to turn "I do not know" into an answer.
+///
+/// Only `Err` is retried. A `Value::Error` reply is the source ANSWERING with
+/// a refusal — retrying that would just re-run a decision the source already
+/// made, and would hide it behind the last attempt's text.
 #[cfg(feature = "rocks")]
-fn call_once(addr: &str, args: &[&[u8]]) -> std::io::Result<Value> {
+fn call_retrying(
+    addr: &str,
+    args: &[&[u8]],
+    attempts: u32,
+    budget: std::time::Duration,
+) -> std::io::Result<Value> {
+    let mut last = None;
+    for i in 0..attempts.max(1) {
+        match call_once_with(addr, args, budget) {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                last = Some(e);
+                // Brief, growing pause: if the source is mid-purge, hammering
+                // it competes with the very work we are waiting on.
+                if i + 1 < attempts {
+                    std::thread::sleep(std::time::Duration::from_millis(200 * u64::from(i + 1)));
+                }
+            }
+        }
+    }
+    Err(last.unwrap_or_else(|| std::io::Error::other("no attempt made")))
+}
+
+/// As `call_once`, with the read budget named by the caller.
+///
+/// The budget is a parameter because the two cutover calls are not the same
+/// shape of work. `FLINTSLOTMOVED` does not reply until the source has purged
+/// every row of the slot — measured at ~3.8us/row, so 30k rows is 0.125s but
+/// the cost scales with the slot, and rebalancing exists precisely to move the
+/// biggest ones. A fixed 5s is a guess about someone else's dataset.
+#[cfg(feature = "rocks")]
+fn call_once_with(
+    addr: &str,
+    args: &[&[u8]],
+    budget: std::time::Duration,
+) -> std::io::Result<Value> {
     let mut s = internal_connect(addr)?;
-    s.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+    s.set_read_timeout(Some(budget))?;
     let mut out = Vec::new();
     encode(
         &Value::Array(Some(

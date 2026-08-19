@@ -1,9 +1,11 @@
-# BUG-0024: a slot cutover reports a handoff failure that did not happen, and the same call can strand a slot write-frozen (OPEN)
+# BUG-0024: a slot cutover reports a handoff failure that did not happen, and the same call can strand a slot write-frozen (FIXED; trigger still unexplained)
 
-Status: OPEN, found 2026-08-18 · Severity: **medium as observed** (a false
+Status: **FIXED 2026-08-19** (the trigger is still unexplained; the defect is not) · found 2026-08-18 · Severity: **medium as observed** (a false
 failure report on a cutover that actually succeeded) · **high for the
-untriggered half** (the identical pattern on the freeze call leaves a slot
-shedding every write, indefinitely, with no path that clears it)
+untriggered half** (the identical pattern on the freeze call left a slot
+shedding every write with nothing in a deployed fleet to clear it — see the
+CORRECTION below: a reconcile exists but is not enabled, and enabling it as-is
+would have been worse)
 
 ## Symptom
 
@@ -225,3 +227,79 @@ needed is a fault-injection drill that drops or delays the source's reply to
 **both** nodes — that a lost `Moved` reply still ends with the destination
 serving and the source redirecting, and that a lost freeze reply never leaves
 the source shedding writes with no migration in flight.
+
+## Fixed 2026-08-19
+
+All four items landed, in the safe form. The trigger — whatever stalled that
+reply for 5 s at a size the purge crosses in 0.125 s — is **still
+unexplained**, and the failing log that would narrow it is gone (BUG-0021).
+None of this depends on knowing it.
+
+**1. Both control calls retry.** `call_retrying` replaces `call_once` at the
+freeze and the flip. Only `Err` is retried: a `Value::Error` is the source
+ANSWERING with a refusal, and re-running a decision it already made would hide
+it behind the last attempt's text. Both commands are idempotent at a bumped
+epoch, which the code already relied on for crash safety.
+
+**2. The error no longer claims what it did not check.** Three outcomes now,
+where there were two:
+
+| outcome | what it says |
+|---|---|
+| `Ok(Simple)` | `MIGRATEIN-OK … cutover` |
+| `Ok(other)` | `cutover handoff refused by source (we own)` — the source answered |
+| `Err` | `cutover handoff UNCONFIRMED after retries` — plus the fact that the source's `Moved` record commits *before* it replies, so a lost reply is not a lost handoff |
+
+The old text asserted "source not disowned" on the `Err` path, which is the one
+case where the source has usually disowned anyway.
+
+**3. The budget is sized to the work.** `call_once_with` takes the read budget
+from the caller: 5 s for the freeze, **60 s** for the flip, whose reply waits
+behind a purge of every row in the slot. A fixed 5 s was a guess about someone
+else's slot size, and rebalancing exists to move the biggest ones.
+
+**4. The rollback reaches the source.** `rollback()` now calls `FLINTSLOTABORT`
+on the source when — and only when — this destination is the one that froze it.
+`frozen` became a `Cell` so the closure reads the current value. A failure to
+unfreeze is printed rather than swallowed; silence is what made the state
+invisible.
+
+The destination is the right actor because it KNOWS it aborted. The controller
+can only infer that from an absent record, and inferring it is what destroys
+data (BUG-0025) — which is why item 4 is emphatically *not* satisfied by
+enabling the reconcile.
+
+### Verified
+
+The safety property first, because it is the one that could make things worse —
+a rollback must never un-disown a handoff that really completed:
+
+    === A. FROZEN source ===
+      while frozen:      SET -> TRYAGAIN slot migrating, retry
+      FLINTSLOTABORT  -> OK slot 13624 migration aborted
+      after abort:       SET -> OK
+      after abort:       GET -> v3
+
+    === B. MOVED source (the safety case) ===
+      after handoff:     GET -> MOVED 13624 127.0.0.1:6597
+      FLINTSLOTABORT  -> ERR slot is Moved (settled ownership), not in-flight
+      still disowned?    GET -> MOVED 13624 127.0.0.1:6597
+
+The refusal in B is enforced by the source's own phase check, not by the
+destination's timing — so the safety does not depend on the race being won.
+
+Five drills on the cutover path pass: `slot_cutover`,
+`slot_cutover_recovery` (both branches), `slot_migrate`, `migrate_slots`,
+`rebalance_execute`. Zero leaked seats.
+
+### Still open
+
+**Actually asking the source**, rather than reporting honest uncertainty. The
+`Err` path now says "unconfirmed", which is true and useful, but a destination
+that re-dialled could often turn it into a definite answer. It cannot today:
+`FLINTMIGRATIONS` filters to in-flight records, so a `Moved` source reports
+nothing, and reading that absence as "disowned" is precisely the inference
+BUG-0025 is about. Doing this properly needs a read-only phase query — an
+additive `FLINTMIGRATIONS ALL` would do it, and the controller's parser already
+ignores phases it does not recognise. Deliberately not built alongside the
+retry, so the safe core lands without a protocol change attached to it.
