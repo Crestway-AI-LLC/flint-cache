@@ -368,6 +368,35 @@ assert_no_port_overlap() {
   FAILED="$FAILED port-overlap"
 }
 
+# A drill that STARTS seats but never calls fleet_init declares nothing to
+# assert_no_port_overlap above — which then passes because it had nothing to
+# check, the same defect one level up. restart_drill.sh sat in that blind spot
+# from the day it was written (docs/bugs/0020): its port lived in
+# `PORT="${2:-6410}"`, invisible to a parser that reads fleet_init lines, and
+# its teardown was a bare `pkill -f` that owned nothing — so a full gate
+# reported `restart(leaked)` while the drill's own assertions all passed.
+#
+# The rule is NOT "every drill declares ports". gates_drill.sh exercises
+# gates.sh itself and starts no seats, so it has nothing to declare and a
+# blanket rule would need an allowlist, which is how a check starts drifting
+# from what it means. The rule is that a drill which starts something must say
+# what it owns.
+assert_spawning_drills_declare_ports() {
+  local bad="" f
+  for f in tools/*_drill.sh; do
+    grep -q '^fleet_init' "$f" && continue
+    grep -qE 'target/release/flint-|flintctl' "$f" || continue
+    bad="$bad $f"
+  done
+  [ -z "$bad" ] && return 0
+  echo "FAIL  a drill starts Flint processes but declares no ports:"
+  for f in $bad; do echo "        $f"; done
+  echo "        With no fleet_init line the port-overlap preflight cannot see it,"
+  echo "        and its cleanup is scoped to nothing it owns. Add fleet_init with"
+  echo "        the drill's own scope and a LITERAL port block."
+  FAILED="$FAILED undeclared-ports"
+}
+
 # #182: the lease TTL had four homes — flintctl's DEFAULT_LEASE_TTL_MS, the
 # AWS chaos/soak fleet's inventory, and two drills — and when ADR-0018 moved
 # it from 3000 to 5000 only flintctl followed. Nothing failed; every chaos run
@@ -394,6 +423,7 @@ if want check; then
   echo "== gates: fmt, clippy, tests (both feature configs)"
   assert_no_default_ports
   assert_no_port_overlap
+  assert_spawning_drills_declare_ports
   assert_lease_ttl_single_source
   step "fmt" fmt cargo fmt --all --check
   step "clippy (mem)" clippy-mem \

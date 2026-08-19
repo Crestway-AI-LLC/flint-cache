@@ -39,7 +39,7 @@ New references should use the path, so a reader can follow them.
 | `0016-retracted-du-is-not-the-dataset.md` | RETRACTED: `verify` was right; `du` on a data dir measures RocksDB's info LOG, not the dataset |
 | `0017-rocksdb-info-log-grows-without-bound.md` | 883 MB of RocksDB debug log against 248 KB of data, unbounded and fastest under replication churn (OPEN) |
 | `0019-drill-root-on-a-mounted-volume-breaks-disk-pressure.md` | `FLINT_DRILL_ROOT` on a mounted volume fails `disk_pressure` at `hdiutil attach`, and the message blames the image (FIXED) |
-| `0020-restart-drill-bypasses-fleet-sh.md` | `restart` declares no ports and cleans up with a bare `pkill`, so it is invisible to the overlap preflight and leaks (OPEN) |
+| `0020-restart-drill-bypasses-fleet-sh.md` | `restart` declared no ports and cleaned up with a bare `pkill`, so it was invisible to the overlap preflight and leaked (FIXED) |
 | `0021-gate-logs-overwrite-so-a-failing-run-erases-the-passing-one.md` | gate step logs are per-step not per-run, so re-running to diagnose destroys the evidence you were going to diff (OPEN) |
 | `0022-rocksdb-tickers-read-zero-when-statistics-are-disabled.md` | statistics are never enabled in production, so every RocksDB ticker reads a confident zero that means "never measured" (OPEN) |
 | `0023-chain-traversal-loses-a-link-but-only-inside-a-full-gate.md` | a chain link is nil after a master kill in a gate run; 5 solo runs never reproduce it, port collision ruled out (OPEN) |
