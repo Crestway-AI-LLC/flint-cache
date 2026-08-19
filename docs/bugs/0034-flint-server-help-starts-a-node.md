@@ -1,4 +1,4 @@
-# BUG-0033: `flint-server --help` starts a node on the default port (FIXED, one half open)
+# BUG-0034: `flint-server --help` starts a node on the default port (FIXED, one half open)
 
 Status: `--help` FIXED 2026-08-19 · the unknown-argument half is OPEN ·
 Severity: medium — an operator asking for usage gets a running node instead,

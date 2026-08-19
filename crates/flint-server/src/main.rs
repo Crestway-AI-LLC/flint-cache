@@ -564,7 +564,7 @@ fn usage() -> String {
         "  --help, -h        print this and exit\n",
         "\n",
         "Defaults: --port 6380, --bind 127.0.0.1, --engine mem.\n",
-        "Unrecognised arguments are currently IGNORED, not rejected (bugs/0033).\n",
+        "Unrecognised arguments are currently IGNORED, not rejected (bugs/0034).\n",
     )
     .to_string()
 }
@@ -696,7 +696,7 @@ fn main() -> std::io::Result<()> {
     // --help must not START A NODE. Until now `--build-version` was the only
     // flag handled before the listener, and every other argument was simply
     // ignored — so `flint-server --help` fell through, bound the DEFAULT port
-    // 6380, printed "listening", and ran until killed (docs/bugs/0033).
+    // 6380, printed "listening", and ran until killed (docs/bugs/0034).
     //
     // That is bad for an operator reaching for usage and worse for a gate: the
     // resulting process sits on a port no drill declares, so it is outside
