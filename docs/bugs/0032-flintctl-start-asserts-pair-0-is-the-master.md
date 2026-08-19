@@ -53,7 +53,33 @@ member answers, that is the real finding and deserves a message that says
 so. A member being down while the other serves is normal after a failover
 and must not be fatal to `start`.
 
-## Verification the fix needs
+## Fixed 2026-08-19 — and the second site is NOT the same bug
+
+`start` now requires that SOME member of each pair answers, stopping at the
+first that does (the common post-failover case is that the second one does, and
+paying the full 10 s budget on a dead first member would add ten seconds to
+every supervise tick). One member down while the other serves is reported and
+tolerated; no member answering keeps its non-zero exit and says plainly that
+this is not a stopped seat.
+
+**There is a second `wait_pong(&pair[0], …)` in this file, and it is correct.**
+`expand()` asserts on `pair[0]` of a BRAND-NEW pair it has just started — no
+failover history exists, so position and role coincide, and "new master up" is
+accurate. A pair that will not come up is also a genuine error for `expand`,
+where it is not for `start`. Two lines that look identical; only one is the
+defect, and changing both would have been pattern-matching rather than fixing.
+
+### Verification status: BLOCKED ON THE BOX, not done
+
+Compiles and lints clean in both feature configs. The behavioural checks below
+have NOT been run: this machine is at 92% swap and cannot bootstrap a fleet —
+`cold_start_roles_drill.sh` fails at bootstrap with "127.0.0.1:7403 is not
+master after bootstrap", and it fails **identically with this change stashed**,
+so the failure is environmental rather than a regression. That baseline
+comparison is the only reason the fix is committed unverified; it is not
+evidence the fix works.
+
+## Verification the fix still needs
 
 - a pair whose inventory-first member is down: `start` restarts it and exits
   0, with a positive control that the same command still fails when NEITHER

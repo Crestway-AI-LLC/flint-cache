@@ -3103,12 +3103,44 @@ fn launch(inv: &Inventory, register: bool) {
     for (gi, pair) in inv.pairs.iter().enumerate() {
         start_pair_nodes(inv, pair, gi);
     }
-    for pair in &inv.pairs {
-        assert!(
-            wait_pong(&pair[0], &tls, Duration::from_secs(10)),
-            "master {} up",
-            pair[0]
-        );
+    // A PAIR must answer, not a POSITION. `pair[0]` is the member as WRITTEN
+    // IN THE INVENTORY, and nothing keeps that member master: the playground
+    // declares `pair …:7002,…:7001` and 7001 has held mastership since the
+    // 2026-08-18 failover, so demanding a PONG from pair[0] demanded it from
+    // the REPLICA — and the panic called that member "master", which sent the
+    // investigation at the wrong node for several minutes (docs/bugs/0032).
+    //
+    // It was also FATAL, and `start` is the wrong verb to be fatal here: a
+    // seat that is down is start's INPUT, not an error. flint-supervise runs
+    // this every two minutes precisely to restore stopped seats, so panicking
+    // on a stopped seat disabled the mechanism that exists to fix it — six
+    // panics in eleven minutes, and the pair stayed single-copy throughout.
+    //
+    // So: at least one member must answer. One member down while the other
+    // serves is the normal shape of a fleet mid-recovery and is reported, not
+    // fatal. No member answering is a real finding and keeps its exit.
+    for (gi, pair) in inv.pairs.iter().enumerate() {
+        // Stop at the first member that answers: the common post-failover
+        // case is that the SECOND one does, and paying the full budget on the
+        // first would add ten seconds to every supervise tick.
+        let live = pair
+            .iter()
+            .find(|m| wait_pong(m, &tls, Duration::from_secs(10)));
+        match live {
+            Some(m) if m == &pair[0] => eprintln!("  pair {gi}: {m} answering"),
+            Some(m) => eprintln!(
+                "  pair {gi}: {m} answering ({} did not, which is normal after a failover)",
+                pair[0]
+            ),
+            None => {
+                eprintln!(
+                    "FAIL: pair {gi} has no reachable member — tried {}. This is not a \
+                     stopped seat; nothing in the pair is serving.",
+                    pair.join(", ")
+                );
+                std::process::exit(1);
+            }
+        }
     }
 
     // 3a. Co-processors, BEFORE the proxies that route to them (ADR-0010).
