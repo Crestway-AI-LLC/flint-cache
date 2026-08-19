@@ -461,6 +461,38 @@ assert_spawning_drills_declare_ports() {
   FAILED="$FAILED undeclared-ports"
 }
 
+# docs/bugs/0025: `recover_migrations` completes a slot flip onto a destination
+# that may hold nothing, purging the source — measured acked-write loss. It is
+# gated on a non-empty --recover-nodes list, and the ONLY reason it never fires
+# in a real fleet is that flintctl does not pass one. That is load-bearing
+# absence: it reads as an oversight, someone "fixes" it, and a latent data-loss
+# path goes live with no test failing (the recovery drill asserts the source
+# redirects and never reads a key from the destination).
+#
+# This check is deliberately narrow. It is not "recovery must stay off forever"
+# — it is "recovery must not be switched on by editing one argv list while the
+# reconcile still infers ownership from an absent record instead of observing
+# it". Whoever makes the reconcile observe should delete this check in the same
+# commit, and the bug write-up says so too.
+assert_recovery_stays_off_until_it_observes() {
+  # COMMENTS EXCLUDED, and that is not a detail. The doc comment above
+  # controller_args names the flag in order to warn about it, so a naive grep
+  # matches the warning as readily as the violation and fires on a clean tree —
+  # caught here by running the negative control before the positive one.
+  local hit
+  hit=$(grep -n -- '--recover-nodes' crates/flint-ctl/src/main.rs 2>/dev/null \
+    | grep -v ':[[:space:]]*//')
+  [ -z "$hit" ] && return 0
+  echo "FAIL  flintctl now passes --recover-nodes to the controller:"
+  echo "$hit" | sed 's/^/        /'
+  echo "        That switches on recover_migrations, which completes a slot flip"
+  echo "        from an INFERENCE (the destination's Importing record is absent)"
+  echo "        that an aborted import writes just as readily as a completed one."
+  echo "        The source then purges every row of the slot. See"
+  echo "        docs/bugs/0025-recovery-completes-a-flip-onto-a-destination-that-never-imported.md"
+  FAILED="$FAILED recovery-enabled-on-an-inference"
+}
+
 # #182: the lease TTL had four homes — flintctl's DEFAULT_LEASE_TTL_MS, the
 # AWS chaos/soak fleet's inventory, and two drills — and when ADR-0018 moved
 # it from 3000 to 5000 only flintctl followed. Nothing failed; every chaos run
@@ -488,6 +520,7 @@ if want check; then
   assert_no_default_ports
   assert_no_port_overlap
   assert_spawning_drills_declare_ports
+  assert_recovery_stays_off_until_it_observes
   assert_lease_ttl_single_source
   step "fmt" fmt cargo fmt --all --check
   step "clippy (mem)" clippy-mem \

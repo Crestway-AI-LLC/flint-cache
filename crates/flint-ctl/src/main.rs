@@ -2828,6 +2828,28 @@ fn agent_args(inv: &Inventory) -> Option<Vec<String>> {
     Some(args)
 }
 
+/// DO NOT ADD `--recover-nodes` HERE without reading
+/// docs/bugs/0025-recovery-completes-a-flip-onto-a-destination-that-never-imported.md.
+///
+/// Its absence looks like an oversight and is currently the only thing keeping
+/// a data-loss path shut. `recover_migrations` is gated on a non-empty
+/// recover-nodes list, and its rule for a frozen source — "the destination's
+/// Importing record is gone, therefore the destination owns the slot,
+/// therefore complete the flip" — is an inference from an absence that THREE
+/// different situations write, two of them the same function call. Completing
+/// the flip makes the source purge every row of the slot.
+///
+/// Measured: an acked write present on the source and absent on the
+/// destination is gone from both nodes within seconds, with the controller
+/// logging success and slot_cutover_recovery_drill.sh still passing (it
+/// asserts the source redirects, and never reads a key from the destination).
+///
+/// BUG-0024's fix list recommends making a rolled-back cutover unfreeze the
+/// source. Do that from the DESTINATION, which knows it aborted — it can call
+/// FLINTSLOTABORT itself. The controller only infers, and this is the wrong
+/// place to act on an inference. Enabling recovery is safe once it observes
+/// the destination instead of deducing it; tools/gates.sh asserts this line
+/// stays out until then.
 fn controller_args(inv: &Inventory) -> Vec<String> {
     let pairs_spec = inv
         .pairs
