@@ -121,23 +121,41 @@ NOW=$(valkey-cli -p 6392 FLINTCONFIG | tr '\r' '\n' | grep '^write-deadline-ms:'
 [ "$NOW" = "1" ] || { echo "FAIL: FLINTCONFIG did not move the deadline (got '$NOW')"; exit 1; }
 echo "  deadline hot-set to ${NOW}ms without a restart"
 
-BOUT=$(python3 "$D/drive.py" 6392 32 100 arm-b)
-echo "  $BOUT"
-B_THR=$(echo "$BOUT" | sed -n 's/.*throttled=\([0-9]*\).*/\1/p')
+# THE LOAD IS RAMPED, because a fixed one is a guess about the machine.
+# The shed fires when in-flight x service-time exceeds the deadline. A write
+# services in ~30us here, so arming a 1ms deadline needs >30 writes genuinely
+# in flight — and a fixed 32-thread load sits one or two ABOVE that threshold
+# on an 8-core box and BELOW it on a 2-vCPU CI runner, where the client cannot
+# hold 32 sends outstanding at once. That is exactly how this drill failed on
+# main at 53d2380: ok=3200 throttled=0, write_inflight 0, write_service_us 33,
+# write_wait_est_ms 0. The server met the deadline; the drill had simply not
+# created the condition, and said so in words that read like a product defect.
+# See docs/bugs/0030. So: escalate until the control actually arms.
+B_THR=0; RUNG=0; BOUT=""
+for T in 32 64 128 256; do
+  BOUT=$(python3 "$D/drive.py" 6392 $T 100 arm-b-$T)
+  echo "  threads=$T -> $BOUT"
+  B_THR=$(echo "$BOUT" | sed -n 's/.*throttled=\([0-9]*\).*/\1/p')
+  if [ "${B_THR:-0}" -gt 0 ]; then RUNG=$T; break; fi
+done
 B_OK=$(echo "$BOUT" | sed -n 's/^ok=\([0-9]*\).*/\1/p')
 B_OTHER=$(echo "$BOUT" | sed -n 's/.*other=\([0-9]*\).*/\1/p')
 B_PRESENT=$(echo "$BOUT" | sed -n 's/.*refused-but-present=\([0-9]*\).*/\1/p')
 B_ABSENT=$(echo "$BOUT" | sed -n 's/.*accepted-but-absent=\([0-9]*\).*/\1/p')
 
 [ "$B_OTHER" = "0" ] || { echo "FAIL: a refusal came back as something other than -THROTTLED"; exit 1; }
-[ "${B_THR:-0}" -gt 0 ] || {
-  echo "FAIL: nothing was refused even at a 1ms deadline. Either the gate is not"
-  echo "      wired into admit_write_path, or this machine served 32 concurrent"
-  echo "      4 KiB writes inside 1ms — check write_wait_est_ms below:"
+[ "${RUNG:-0}" -gt 0 ] || {
+  echo "FAIL: the positive control COULD NOT BE ARMED on this machine — 256"
+  echo "      concurrent 4 KiB writes were all served inside 1ms. This is a"
+  echo "      failure to create the condition, NOT evidence about the shed:"
+  echo "      nothing here says the deadline is unwired. Distinguish the two"
+  echo "      before filing anything against the write path."
   valkey-cli -p 6392 FLINTINFO | tr '\r' '\n' | grep -E '^write_(inflight|service_us|wait_est_ms):' | sed 's/^/        /'
+  echo "      If write_wait_est_ms is 0 at 256 threads the ladder is too short"
+  echo "      for this box; raise it rather than concluding the gate is off."
   exit 1
 }
-echo "  refused $B_THR write(s) with -THROTTLED, accepted $B_OK"
+echo "  armed at $RUNG threads: refused $B_THR write(s) with -THROTTLED, accepted $B_OK"
 
 # Assertion 3. A shed that still wrote would make -THROTTLED a lie and would
 # silently corrupt every RPO number the chaos oracle has ever reported.
@@ -149,10 +167,34 @@ SHED_B=$(valkey-cli -p 6392 FLINTINFO | tr '\r' '\n' | grep '^writes_shed_deadli
 echo "  writes_shed_deadline: $SHED_B"
 [ "${SHED_B:-0}" -ge "$B_THR" ] || { echo "FAIL: the server's shed counter ($SHED_B) is below the refusals clients saw ($B_THR)"; exit 1; }
 
+# ARM C. Ramping the load meant arm B changed TWO variables against arm A —
+# the deadline AND the concurrency — so a refusal at 1ms/$RUNG threads no
+# longer isolates the deadline as its cause. Re-running the WINNING load at
+# the shipped default restores the single-variable comparison: same load, two
+# deadlines, opposite outcomes. Without this, a drill that ramps until
+# something sheds would eventually shed on load alone and call it a pass.
+echo "== arm C (isolating control): the SAME $RUNG-thread load at the ${DEFAULT}ms default"
+valkey-cli -p 6392 FLINTCONFIG write-deadline-ms "$DEFAULT" >/dev/null
+SHED_BEFORE_C=$(valkey-cli -p 6392 FLINTINFO | tr '\r' '\n' | grep '^writes_shed_deadline:' | cut -d: -f2)
+COUT=$(python3 "$D/drive.py" 6392 "$RUNG" 100 arm-c)
+echo "  $COUT"
+C_THR=$(echo "$COUT" | sed -n 's/.*throttled=\([0-9]*\).*/\1/p')
+C_OTHER=$(echo "$COUT" | sed -n 's/.*other=\([0-9]*\).*/\1/p')
+[ "$C_OTHER" = "0" ] || { echo "FAIL: unexpected replies at the default deadline under the armed load"; exit 1; }
+[ "${C_THR:-1}" = "0" ] || {
+  echo "FAIL: the same $RUNG-thread load shed $C_THR write(s) at the ${DEFAULT}ms"
+  echo "      default too, so arm B did not isolate the deadline — the LOAD is"
+  echo "      shedding, and the positive control proves nothing about the knob."
+  exit 1
+}
+SHED_AFTER_C=$(valkey-cli -p 6392 FLINTINFO | tr '\r' '\n' | grep '^writes_shed_deadline:' | cut -d: -f2)
+[ "$SHED_AFTER_C" = "$SHED_BEFORE_C" ] || { echo "FAIL: the server counted a deadline shed at the default under the armed load"; exit 1; }
+echo "  same load, ${DEFAULT}ms deadline: 0 shed — the deadline is the variable, not the load"
+
 echo "== the node still serves after shedding (a refusal is not a fault)"
 valkey-cli -p 6392 FLINTCONFIG write-deadline-ms "$DEFAULT" >/dev/null
 valkey-cli -p 6392 SET wdl:after ok >/dev/null
 [ "$(valkey-cli -p 6392 GET wdl:after)" = "ok" ] || { echo "FAIL: node did not recover once the deadline was restored"; exit 1; }
 echo "  deadline restored to ${DEFAULT}ms, writes accepted again"
 
-echo "PASS: write deadline drill — ordinary load at the ${DEFAULT}ms default shed 0, a 1ms deadline refused $B_THR write(s) with -THROTTLED, every refusal was a real refusal (0 refused-but-present, 0 accepted-but-absent), and the knob moved hot"
+echo "PASS: write deadline drill — ordinary load at the ${DEFAULT}ms default shed 0, a 1ms deadline refused $B_THR write(s) with -THROTTLED at $RUNG threads (same load at the default shed 0), every refusal was a real refusal (0 refused-but-present, 0 accepted-but-absent), and the knob moved hot"
