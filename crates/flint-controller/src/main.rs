@@ -1378,6 +1378,10 @@ struct InFlight {
 fn recover_migrations(cfg: &Config) {
     let mut importing: Vec<InFlight> = Vec::new();
     let mut migrating: Vec<InFlight> = Vec::new();
+    // Destinations that started an import and said so when they gave up
+    // (docs/bugs/0025). Without this the only signal was the ABSENCE of an
+    // Importing record, which a completed flip writes just as readily.
+    let mut aborted: Vec<InFlight> = Vec::new();
     for node in &cfg.recover_nodes {
         let Ok(Value::Array(Some(rows))) = call(node, &[b"FLINTMIGRATIONS"]) else {
             continue;
@@ -1401,11 +1405,12 @@ fn recover_migrations(cfg: &Config) {
             match *phase {
                 "importing" => importing.push(rec),
                 "migrating" => migrating.push(rec),
+                "aborted" => aborted.push(rec),
                 _ => {}
             }
         }
     }
-    if importing.is_empty() && migrating.is_empty() {
+    if importing.is_empty() && migrating.is_empty() && aborted.is_empty() {
         return;
     }
 
@@ -1456,6 +1461,42 @@ fn recover_migrations(cfg: &Config) {
         {
             continue;
         }
+        // THE DESTINATION SAID IT GAVE UP (docs/bugs/0025). Completing the flip
+        // here purges every row on the source and hands the slot to a node
+        // holding a partial copy at best. This branch used to be reached by
+        // inference — "the dest has no Importing record, therefore it owns the
+        // slot" — and an abort writes that same absence. Measured before the
+        // marker existed: an acked write on the source, absent on the dest,
+        // gone from both within seconds with this loop logging success.
+        if aborted
+            .iter()
+            .any(|a| &a.node == dest && a.slot == rec.slot)
+        {
+            eprintln!(
+                "[{}] recovery: dest {dest} ABORTED slot {} — unfreezing {src} \
+                 instead of completing the flip",
+                cfg.id, rec.slot
+            );
+            let _ = call(
+                src,
+                &[
+                    b"FLINTSLOTABORT",
+                    rec.slot.to_string().as_bytes(),
+                    rec.ns.as_bytes(),
+                ],
+            );
+            // Clear the destination's marker too, or it redirects its own
+            // clients to the source forever.
+            let _ = call(
+                dest,
+                &[
+                    b"FLINTSLOTABORT",
+                    rec.slot.to_string().as_bytes(),
+                    rec.ns.as_bytes(),
+                ],
+            );
+            continue;
+        }
         if reachable(dest) {
             eprintln!(
                 "[{}] recovery: completing flip of slot {} — {src} -> Moved to {dest}",
@@ -1484,6 +1525,31 @@ fn recover_migrations(cfg: &Config) {
                 ],
             );
         }
+    }
+
+    // An Aborted marker whose source is no longer frozen has done its job and
+    // is now only redirecting the destination's clients. Clear it.
+    for rec in &aborted {
+        let (dest, src) = (&rec.node, &rec.peer);
+        if migrating
+            .iter()
+            .any(|m| &m.node == src && m.slot == rec.slot)
+        {
+            continue; // handled above, or will be next cycle
+        }
+        eprintln!(
+            "[{}] recovery: clearing stale abort marker for slot {} on {dest} \
+             (source {src} is not frozen for it)",
+            cfg.id, rec.slot
+        );
+        let _ = call(
+            dest,
+            &[
+                b"FLINTSLOTABORT",
+                rec.slot.to_string().as_bytes(),
+                rec.ns.as_bytes(),
+            ],
+        );
     }
 }
 

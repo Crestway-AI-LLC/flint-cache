@@ -85,7 +85,9 @@ pub struct SlotClaim {
 }
 
 /// A node's relationship to a slot that is (or was) being moved. Importing
-/// and Migrating are in-flight; Moved is terminal.
+/// and Migrating are in-flight; Moved is terminal; Aborted is a destination
+/// saying it gave up, which is a DIFFERENT fact from having no record at all
+/// (docs/bugs/0025).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MigrationPhase {
     /// The DESTINATION is pulling this slot and does not own it yet — it
@@ -99,6 +101,23 @@ pub enum MigrationPhase {
     /// whole-range base claim cannot exclude one interior slot; this override
     /// is how a moved-away slot is represented.
     Moved = 3,
+    /// The DESTINATION started an import and ABANDONED it. It does not own the
+    /// slot and holds at best a partial copy, so it redirects to `peer` (the
+    /// source, which still owns it).
+    ///
+    /// This phase exists because deleting the record instead was ambiguous in
+    /// a way that destroyed data (docs/bugs/0025). A destination clears its
+    /// Importing record at TWO opposite moments — one step before the cutover
+    /// flip, when it genuinely owns the slot, and on rollback, when it
+    /// emphatically does not — using the same call. A recovering controller,
+    /// seeing a frozen source and no record on the destination, read that one
+    /// absence as "the flip half-completed" and told the source to disown and
+    /// purge. Measured: an acked write present on the source and absent on the
+    /// destination, gone from both within seconds, controller logging success.
+    ///
+    /// Writing the reason rather than erasing the record is what makes the two
+    /// states tellable apart, which is what ADR-0004 assumes throughout.
+    Aborted = 4,
 }
 
 impl MigrationPhase {
@@ -106,6 +125,14 @@ impl MigrationPhase {
     /// Moved is a settled ownership override, not an in-flight move.
     pub fn is_inflight(self) -> bool {
         matches!(self, MigrationPhase::Importing | MigrationPhase::Migrating)
+    }
+
+    /// Phases a recovering controller must ACT on. Wider than `is_inflight`:
+    /// nothing is in flight for an Aborted record, but it is precisely the
+    /// record that tells the controller to unfreeze a source rather than
+    /// complete a flip onto a destination that gave up.
+    pub fn needs_recovery(self) -> bool {
+        self.is_inflight() || matches!(self, MigrationPhase::Aborted)
     }
 }
 
@@ -125,9 +152,19 @@ pub enum SlotOwnership {
 }
 
 /// Resolve ownership of `slot` for this node: base claim, overridden per-slot
-/// by any migration record. Owned unless the slot is outside the range or has
-/// an Importing/Moved override (both of which redirect to the record's peer).
+/// by any migration record. Owned unless the slot is outside the range or the
+/// record says otherwise.
+///
 /// Migrating still counts as Owned — the source serves until the cutover flip.
+/// Importing, Moved and Aborted all redirect to the record's peer, and in every
+/// case that peer is the node that does own it: the source we are pulling from,
+/// the destination we handed off to, and — for Aborted — the source we gave up
+/// on, which never stopped owning it.
+///
+/// Aborted redirecting is a deliberate consequence of recording the abort
+/// rather than deleting the record. A destination that abandoned an import
+/// holds a PARTIAL copy, and falling back to the base claim let it serve that
+/// partial copy as though it were the slot.
 pub fn slot_ownership(kv: &dyn Kv, ns: &[u8], slot: u16, base: &SlotClaim) -> SlotOwnership {
     if slot < base.start || slot > base.end {
         return SlotOwnership::NotInRange;
@@ -138,7 +175,14 @@ pub fn slot_ownership(kv: &dyn Kv, ns: &[u8], slot: u16, base: &SlotClaim) -> Sl
             phase: MigrationPhase::Migrating,
             ..
         }) => SlotOwnership::Owned,
-        Some(rec) => SlotOwnership::MovedTo(rec.peer),
+        Some(rec) => match rec.phase {
+            MigrationPhase::Importing | MigrationPhase::Moved | MigrationPhase::Aborted => {
+                SlotOwnership::MovedTo(rec.peer)
+            }
+            // Unreachable — matched above — but spelled out so a new phase
+            // has to state its ownership rather than inherit "redirect".
+            MigrationPhase::Migrating => SlotOwnership::Owned,
+        },
     }
 }
 
@@ -268,6 +312,7 @@ fn decode_migration(ns: &[u8], slot: u16, raw: &[u8]) -> Option<MigrationRecord>
         1 => MigrationPhase::Importing,
         2 => MigrationPhase::Migrating,
         3 => MigrationPhase::Moved,
+        4 => MigrationPhase::Aborted,
         _ => return None,
     };
     Some(MigrationRecord {

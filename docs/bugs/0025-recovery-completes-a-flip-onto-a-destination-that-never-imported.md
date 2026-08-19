@@ -1,6 +1,6 @@
-# BUG-0025: migration recovery completes a flip onto a destination that never imported, destroying acked writes (OPEN)
+# BUG-0025: migration recovery completes a flip onto a destination that never imported, destroying acked writes (FIXED)
 
-Status: OPEN, found 2026-08-18 while acting on BUG-0024's fix list ·
+Status: **FIXED 2026-08-19** with an `Aborted` phase · found 2026-08-18 while acting on BUG-0024's fix list ·
 Severity: **high but LATENT** — measured acked-write loss with the recovery
 controller reporting success, but no deployed controller enables the reconcile
 today (see "Why this is not on fire"). It is primed to fire the moment
@@ -143,3 +143,79 @@ stranded slot into a destroyed one.
 - BUG-0024 — the cutover timeout that reaches this state; its item 4 is
   corrected there
 - ADR-0004 — the observability premise this function no longer satisfies
+
+## Fixed 2026-08-19 — the destination records WHY it stopped
+
+The inference was unfixable while an abort and a completed flip wrote the same
+bytes. They no longer do. `MigrationPhase::Aborted` (4) is a destination saying
+"I started an import and gave up", which is a different fact from having no
+record — and it is the fact the reconcile needed.
+
+**Where it is written.** `rollback()` sets `Aborted` *before* it does anything
+else, so dying anywhere below leaves a recoverable fact rather than a lie. If it
+then unfreezes the source successfully, it clears the marker — the source is
+released and nothing is owed. If the unfreeze **fails**, the marker stays: it is
+now the only durable evidence that a source is frozen on this destination's
+account. `FLINTSLOTABORT` on a destination mid-import records the abort too,
+instead of deleting the record and dropping the node back to its base claim
+where it would serve a partial copy as though it were whole.
+
+**Where it is read.** `FLINTMIGRATIONS` reports it — via a new
+`needs_recovery()` rather than `is_inflight()`, because nothing is in flight for
+an aborted import and it is still precisely the row the controller must act on.
+`recover_migrations` checks for it before completing a flip, and unfreezes the
+source instead, clearing both markers. A stale marker whose source is no longer
+frozen is swept on a later pass so it cannot redirect a destination's clients
+forever.
+
+**Where it changes serving.** `slot_ownership` and `check_slot_gate` treat
+Aborted like Importing: redirect to `peer`, which for an abort is the source
+that never stopped owning the slot.
+
+### Verified — a differential, with the negative control first
+
+Constructed deterministically. Three attempts to hit the window by killing the
+source mid-cutover were all VOID — the freeze-to-flip gap is one loopback round
+trip and the cutover completed first every time, twice leaving the source
+`Moved` and once leaving 75863 orphan rows from an interrupted purge. The
+recovery drill makes the same call for the same reason.
+
+Same source state, same controller, one bit of difference:
+
+| | ARM A — no marker | ARM B — marker |
+|---|---|---|
+| controller says | `completing flip of slot 13624` | `dest ABORTED slot 13624 — unfreezing instead of completing the flip` |
+| source DBSIZE | 20001 -> **0** | 20001 -> **20001** |
+| `{mover}:late` (acked before the freeze) | gone — `MOVED` | **`ACKED`** |
+| source write afterwards | `MOVED` | `OK` — unfrozen |
+
+The marker also survives a destination restart, which it must: it is read after
+a crash, which is when it matters.
+
+### What ARM A means, and what is left
+
+ARM A is a **hand-built inconsistent state**, not a live path: a source frozen
+against a destination that never imported anything. After this fix every
+mechanically reachable route either records the abort or leaves a destination
+that legitimately holds the data —
+
+- `rollback()` after a freeze -> writes `Aborted`
+- `FLINTSLOTABORT` on an importing destination -> writes `Aborted`
+- crash mid-cutover -> the destination's `Importing` is durable, so recovery
+  takes the **resume** branch and never reaches this one
+- data-ship-only `FLINTMIGRATEIN` then a manual freeze -> no record, but the
+  destination **does** hold the slot, so completing the flip is correct (this
+  is the recovery drill's half-done-flip case)
+
+What remains is that the reconcile still completes a flip on the *absence* of a
+marker rather than on positive evidence that the destination holds the slot. The
+absence is now only produced by states where completing is right, so the trap is
+closed — but the stronger form, where the destructive action requires the
+destination to affirm it owns the data, is still the better design and is worth
+doing if this path ever grows another writer. Filed as the follow-up rather than
+built here, because it needs a read-only ownership query that does not exist.
+
+**`--recover-nodes` is still not wired into `controller_args`,** and the
+`gates.sh` guard still enforces that. Enabling recovery is now safe from this
+defect, but that is a separate decision with its own testing, and the guard
+should be removed by whoever makes it deliberately.

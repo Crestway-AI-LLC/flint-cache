@@ -308,25 +308,58 @@ fn migrate_in(
     // un-disown a handoff that actually completed — the safety is in the
     // source's own check, not in our timing.
     let rollback = || {
-        if self_addr.is_some() {
-            manifest::clear_migration(kv.as_ref(), ns, slot);
+        if self_addr.is_none() {
+            // Data-ship only: we never claimed the slot, so there is nothing
+            // of ours to roll back and no source state we created.
+            return;
         }
-        if frozen.get() {
-            let r = call_retrying(
-                src,
-                &[b"FLINTSLOTABORT", slot.to_string().as_bytes(), ns],
-                3,
-                std::time::Duration::from_secs(5),
+        if !frozen.get() {
+            // The source was never frozen, so no other node is holding state
+            // on our behalf. Clearing our own record is the whole rollback.
+            manifest::clear_migration(kv.as_ref(), ns, slot);
+            return;
+        }
+
+        // We froze the source. RECORD WHY WE STOPPED before doing anything
+        // else (docs/bugs/0025).
+        //
+        // Deleting our Importing record here is what made an abort and a
+        // completed flip the same bytes: the cutover clears the SAME record
+        // one step before the flip, when we genuinely own the slot. A
+        // controller seeing a frozen source and no record on us read that
+        // absence as "the flip half-completed", told the source to disown, and
+        // the source purged every row. Aborted says which of the two happened.
+        //
+        // It is durable and it lands FIRST, so dying anywhere below leaves the
+        // fact recoverable rather than leaving a lie.
+        if let Err(e) = set_slot_phase(kv.as_ref(), ns, slot, MigrationPhase::Aborted, src) {
+            eprintln!("cutover rollback: slot {slot} could not record Aborted: {e:?}");
+        }
+
+        // Then unfreeze the source. We are the right actor: we KNOW we
+        // aborted, where the controller could only infer it. FLINTSLOTABORT
+        // refuses a slot that is already Moved, so this cannot un-disown a
+        // handoff that actually completed.
+        let r = call_retrying(
+            src,
+            &[b"FLINTSLOTABORT", slot.to_string().as_bytes(), ns],
+            3,
+            std::time::Duration::from_secs(5),
+        );
+        if matches!(r, Ok(Value::Simple(_))) {
+            // Source is released and we own nothing: the marker has served its
+            // purpose and would otherwise redirect our clients to the source
+            // forever.
+            manifest::clear_migration(kv.as_ref(), ns, slot);
+        } else {
+            // KEEP the Aborted marker. It is now the only durable evidence
+            // that the source is frozen on our account, and it is what stops a
+            // reconcile from mistaking that freeze for a half-done flip.
+            eprintln!(
+                "cutover rollback: slot {slot} could not be unfrozen on {src} ({r:?}) \
+                 — Aborted marker retained so recovery unfreezes it rather than \
+                 completing a flip onto us"
             );
-            if !matches!(r, Ok(Value::Simple(_))) {
-                // Say so rather than pretending the rollback was complete: the
-                // slot is still frozen on the source and needs an operator or
-                // a reconcile. Silence here is what made this state invisible.
-                eprintln!(
-                    "cutover rollback: slot {slot} could not be unfrozen on {src} ({r:?}) \
-                     — the source is still shedding writes for it"
-                );
-            }
         }
     };
 
@@ -748,23 +781,30 @@ pub(crate) fn flintslotstats(store: &dyn Kv) -> Value {
     ))
 }
 
-/// FLINTMIGRATIONS: the in-flight (Importing/Migrating) records on this node
-/// across ALL namespaces, one "slot phase peer ns" bulk each — the recovery
-/// input for the controller.
+/// FLINTMIGRATIONS: the records on this node that a recovering controller must
+/// ACT on — Importing, Migrating and Aborted — across ALL namespaces, one
+/// "slot phase peer ns" bulk each. Moved is excluded: it is settled ownership,
+/// not a move awaiting resolution.
 #[cfg(feature = "rocks")]
 pub(crate) fn flintmigrations(rocks: &Option<RocksHandle>) -> Value {
     use flint_storage::manifest::{self, MigrationPhase};
     let Some(kv) = rocks else {
         return Value::Error("ERR FLINTMIGRATIONS requires the rocks engine".into());
     };
+    // needs_recovery, not is_inflight: an Aborted record has nothing in flight
+    // and is exactly the row that tells the controller to unfreeze a source
+    // instead of completing a flip onto a destination that gave up
+    // (docs/bugs/0025). Omitting it would leave the controller reading the same
+    // absence it used to misread.
     let rows: Vec<Value> = manifest::scan_all_migrations(kv.as_ref())
         .into_iter()
-        .filter(|r| r.phase.is_inflight())
+        .filter(|r| r.phase.needs_recovery())
         .map(|r| {
             let phase = match r.phase {
                 MigrationPhase::Importing => "importing",
                 MigrationPhase::Migrating => "migrating",
                 MigrationPhase::Moved => "moved",
+                MigrationPhase::Aborted => "aborted",
             };
             Value::Bulk(Some(
                 format!(
@@ -805,6 +845,21 @@ pub(crate) fn flintslotabort(rocks: &Option<RocksHandle>, args: &[Vec<u8>]) -> V
         Some(r) if r.phase == MigrationPhase::Moved => {
             Value::Error("ERR slot is Moved (settled ownership), not in-flight".into())
         }
+        // ABANDONING AN IMPORT IS NOT THE SAME AS HAVING NEVER STARTED ONE
+        // (docs/bugs/0025). This node pulled part of a slot it does not own;
+        // deleting the record would drop it back to its base claim and let it
+        // serve that partial copy as though it were whole, and would leave a
+        // recovering controller unable to tell this from a completed flip.
+        // Record the abort instead. `peer` is preserved: it is the source,
+        // which still owns the slot and is where clients must go.
+        Some(r) if r.phase == MigrationPhase::Importing => {
+            match set_slot_phase(kv.as_ref(), ns, slot, MigrationPhase::Aborted, &r.peer) {
+                Ok(()) => Value::Simple(format!("OK slot {slot} import aborted (recorded)")),
+                Err(e) => Value::Error(format!("ERR slot abort fenced: {e:?}")),
+            }
+        }
+        // Migrating: a SOURCE being unfrozen resumes owning the slot outright,
+        // so its record goes away. Aborted: the marker has done its job.
         Some(_) => {
             manifest::clear_migration(kv.as_ref(), ns, slot);
             Value::Simple(format!("OK slot {slot} migration aborted"))
@@ -835,7 +890,11 @@ pub(crate) fn check_slot_gate(
     // Migration records are per (ns, slot): tenant A's moved slot must not
     // redirect tenant B, whose rows did not move.
     match manifest::read_migration(kv.as_ref(), ns, slot)?.phase {
-        MigrationPhase::Moved | MigrationPhase::Importing => {
+        // Aborted belongs with Importing, not with "no record": this node
+        // started an import and gave up, so it holds a PARTIAL copy and the
+        // peer (the source) still owns the slot. Serving from here would hand
+        // clients a truncated slot that looks whole (docs/bugs/0025).
+        MigrationPhase::Moved | MigrationPhase::Importing | MigrationPhase::Aborted => {
             let peer = manifest::read_migration(kv.as_ref(), ns, slot)?.peer;
             Some(Value::Error(format!("MOVED {slot} {peer}")))
         }
