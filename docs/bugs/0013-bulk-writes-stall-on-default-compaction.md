@@ -74,6 +74,71 @@ future build where these do become statistics-gated. A zero from an instrument
 that cannot move is worth nothing, and this criterion's whole weight rests on
 one.
 
+## Measured 2026-08-19 — INCONCLUSIVE, and the criterion above cannot be applied as written
+
+Ran the confirming measurement on the local SSD: 3.0 GB in 25k x 4KB batches
+into a fresh engine, then a **refill of the same keyspace**, sampling FLINTINFO
+every 200 ms throughout.
+
+| phase | first 5 batches | last 5 batches | change | mean |
+|---|---|---|---|---|
+| fill | 62 929 ops/s | 39 457 ops/s | **-37.3%** | 49 920 |
+| refill | 18 233 ops/s | 18 874 ops/s | **+3.5%** | 18 350 |
+
+    write_stall_readable : 1 throughout   (the counters were measurable)
+    max write_stopped    : 0
+    max delayed_write_rate : 0
+
+**The refill costs 2.7x the fill** — the direction the symptom describes — but it
+is FLAT across its own 30 batches, and the engine never applied back-pressure.
+At this scale the cost is compaction *work*, not compaction *stalling*. The
+stall regime was not reached, so this neither confirms nor refutes the
+hypothesis.
+
+### The criterion as written silently acquits
+
+> **If `write_stopped` is zero the hypothesis above is wrong**
+
+That has no clause requiring the run to have ENTERED the regime. Applied to the
+numbers above it reads "hypothesis wrong" — from a fill that never stressed
+compaction hard enough to stall anything. A zero from an instrument that was
+never exercised is not evidence in either direction. BUG-0022 predicted exactly
+this ("its three-way criterion collapses to 'hypothesis dead' on every run")
+and this is the concrete instance.
+
+Score it three ways, not two: **CONFIRMED** (stall signalled), **FALSIFIED**
+(throughput collapsed with no stall signal — cause is elsewhere), or
+**INCONCLUSIVE** (throughput never collapsed, so the instrument was never
+exercised). Only the middle one can kill the hypothesis.
+
+`write_stall_readable: 1` is what makes even the inconclusive verdict
+defensible — before BUG-0022's fix there was no way to tell a measured zero
+from an absent one, and this run would have been unreportable.
+
+### The wrong verdict this nearly published
+
+The first automated verdict said **FALSIFIED**, and it was an artifact of the
+harness, not a result. The script appended the refill rates to the fill's file
+and then compared `rates[:5]` against `rates[-5:]` — so "first" was the fill's
+opening and "last" was the refill's close, two different workloads. Of course
+it read as a collapse. Within the refill there is none: +3.5%.
+
+Had that shipped, it would have closed a live bug on a comparison across two
+phases that were never comparable. The tell was that the refill's own first and
+last five were both ~18k, which is only visible if the phases are scored
+separately — the same failure as every check today that could not distinguish
+two states, this time inside the instrument built to test the hypothesis.
+
+### What would settle it
+
+The original observation was ~120 GB of LSM and a refill still running after 85
+minutes. This run is 3 GB — 2.5% of that. The next attempt should scale until
+either `write_stopped` goes to 1 or throughput degrades WITHIN a single pass,
+and should report the L0 file count so "did not stall" and "did not reach the
+trigger" stay distinguishable. `rocksdb.num-files-at-level0` is a live DB
+property (BUG-0022 established the property/ticker distinction), so it can be
+read without enabling statistics.
+
 ## Then
 
 Raise `max_background_jobs` toward the core count, size the write buffers for
