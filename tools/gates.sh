@@ -107,7 +107,7 @@ CORE="restart repl failover proxy slot_migrate slot_map rebalance_execute
       async_flag async_writes txn_failure backup restore_ns backup_schedule
       backup_seat gc_sweep keystat start_guard seat_log cold_start_roles
       build_stamp config_drift tenant_status proxy_conformance edge_roll
-      cpha_roll admin_gated_proxy edge_ca_trust
+      cpha_roll admin_gated_proxy edge_ca_trust chaos_edge_tls
       cert_rotate control_tls controller_ha controller_managed controller_slow_master controller_stall
       controller_multipair controlplane cp_publish failover_bystander failover_churn gates internal_mtls json lease
       fanout_timeout m3_exit migrate_slots min_replicas node_tls proxy_backpressure

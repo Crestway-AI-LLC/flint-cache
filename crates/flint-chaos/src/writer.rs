@@ -145,6 +145,15 @@ pub struct Edge {
     pub addr: String,
     pub tenant: String,
     pub token: String,
+    /// The tenant's view of the proxy's edge certificate. None = plaintext.
+    ///
+    /// Separate from `Shared::tls`, which is the internal MESH config: they
+    /// are different trust roots and different server-name rules, and the
+    /// reason this field exists is that chaos used to hardcode plaintext here
+    /// (see `connect`). Not `Option<Arc<..>>` collapsed into the mesh one on
+    /// purpose — a fleet can run a TLS mesh behind a plaintext edge, or the
+    /// reverse, and both are postures a customer actually deploys.
+    pub tls: Option<Arc<flint_tls::ClientConfig>>,
 }
 
 impl Shared {
@@ -201,9 +210,23 @@ impl Shared {
             return self.connect_master();
         };
         // The edge is a FIXED address that outlives every failover — that is
-        // the point of it. The proxy speaks plaintext to clients (frontend
-        // TLS is a separate concern from the internal mesh), so no config.
-        let mut c = Client::connect_addr(&e.addr, &None).ok()?;
+        // the point of it.
+        //
+        // THIS USED TO PASS `&None` UNCONDITIONALLY, with a comment saying
+        // frontend TLS was "a separate concern from the internal mesh". It is
+        // a separate concern, and it is also the concern: every release note
+        // claiming the fleet is chaos-tested was describing a plaintext edge,
+        // while the posture a customer deploys is a TLS one.
+        //
+        // AND IT FAILED BY MISATTRIBUTION, which is worse than failing
+        // silently. The TCP connect succeeds, the proxy waits for a handshake
+        // that never comes, AUTH times out, and `connect` returns None
+        // forever — until the post-kill stall detector trips and panics with
+        // "the proxy never recovered". So the run does end, pointing at a
+        // perfectly healthy proxy. Measured, not assumed: that is verbatim
+        // what chaos_edge_tls_drill.sh's negative control produces
+        // (ADR-0018 item 9, #20).
+        let mut c = Client::connect_edge_addr(&e.addr, &e.tls).ok()?;
         match c.call(&[b"AUTH", e.token.as_bytes()]) {
             Ok(Value::Simple(_)) => Some(c),
             // A CP-fed proxy answers -NOAUTH until a tenant authenticates and
