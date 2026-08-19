@@ -246,7 +246,7 @@ step() {  # step <name> <log-suffix> <command...>
     # not having it.
     if [ -n "${FLINT_GATE_STRICT:-}" ] && grep -qE 'SKIP[: (]' "$log"; then
       printf 'FAIL  %-22s (%ss)  %s\n' "$name" "$(( $(date +%s) - start ))" "$log"
-      grep -m2 'SKIP' "$log" |  df -h "$_GATE_DISK_TARGET" | sed 's/^/        /'
+      grep -m2 'SKIP' "$log" | sed 's/^/        /'
       echo "        skipped under FLINT_GATE_STRICT: install the dependency"
       echo "        or drop the drill from CORE deliberately, not by accident."
       FAILED="$FAILED $name(skipped)"
@@ -271,7 +271,7 @@ step() {  # step <name> <log-suffix> <command...>
     # reaching its own verdict.
     { grep -m1 -E '^FAIL' "$log" \
         || grep -m1 -E '^(REFUSING|thread .* panicked|error(\[|:))' "$log" \
-        || tail -3 "$log"; } |  df -h "$_GATE_DISK_TARGET" | sed 's/^/        /'
+        || tail -3 "$log"; } | sed 's/^/        /'
     FAILED="$FAILED $name"
     FAILED_LOGS="$FAILED_LOGS $log"
   fi
@@ -293,7 +293,7 @@ step() {  # step <name> <log-suffix> <command...>
   if [ -n "$leaked" ]; then
     echo "      LEAKED: $name left $(echo "$leaked" | wc -l | tr -d ' ') Flint process(es) running"
     ps -o pid=,args= -p $(echo "$leaked" | tr '\n' ' ') 2>/dev/null \
-      |  df -h "$_GATE_DISK_TARGET" | sed 's/^/        /' | cut -c1-110
+      | sed 's/^/        /' | cut -c1-110
     echo "        Its cleanup does not cover every seat it starts. Prefer"
     echo "        fleet_kill (scoped to the drill's fleet_init ports) over a"
     echo "        hand-written pkill pattern, which goes stale silently."
@@ -387,7 +387,7 @@ assert_no_default_ports() {
     tools/*_drill.sh 2>/dev/null || true)
   [ -z "$hits" ] && return 0
   echo "FAIL  drills claim the default cluster ports (7001/7002/7379/7500):"
-  echo "$hits" |  df -h "$_GATE_DISK_TARGET" | sed 's/^/        /'
+  echo "$hits" | sed 's/^/        /'
   echo "        fleet_kill would -9 a real cluster on those ports and"
   echo "        fleet_guard would not object. Move the drill to a free block."
   FAILED="$FAILED default-ports"
@@ -596,7 +596,7 @@ if want conformance; then
   step "conformance rocks (RESP3)" conf-rocks3-run \
     ./target/release/flint-conformance --target 127.0.0.1:6397 --proto 3
   grep -h '^overall:' "$LOGS"/conf-*-run.log "$LOGS"/conf-oracle.log \
-    "$LOGS"/conf-oracle3.log 2>/dev/null |  df -h "$_GATE_DISK_TARGET" | sed 's/^/      /'
+    "$LOGS"/conf-oracle3.log 2>/dev/null | sed 's/^/      /'
   for p in 6399 6398 6397; do valkey-cli -p $p SHUTDOWN NOSAVE >/dev/null 2>&1; done
   sleep 0.3
   # Belt and braces: SHUTDOWN is a request, and a wedged process would
@@ -630,7 +630,7 @@ assert_drill_builds_keep_rocks() {
     # (this check's own first version flagged the drill whose comment
     # explains the rule).
     local joined
-    joined=$(grep -v '^[[:space:]]*#' "$f" |  df -h "$_GATE_DISK_TARGET" | sed -e :a -e '/\\$/N; s/\\\n//; ta')
+    joined=$(grep -v '^[[:space:]]*#' "$f" | sed -e :a -e '/\\$/N; s/\\\n//; ta')
     # `--features rocks` and `--features flint-server/rocks` are equivalent
     # when -p flint-server is the selected package, and drills use both.
     # The rule is simply: if it rebuilds flint-server, it must say rocks.
