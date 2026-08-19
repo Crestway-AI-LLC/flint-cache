@@ -41,6 +41,6 @@ New references should use the path, so a reader can follow them.
 | `0019-drill-root-on-a-mounted-volume-breaks-disk-pressure.md` | `FLINT_DRILL_ROOT` on a mounted volume fails `disk_pressure` at `hdiutil attach`, and the message blames the image (FIXED) |
 | `0020-restart-drill-bypasses-fleet-sh.md` | `restart` declared no ports and cleaned up with a bare `pkill`, so it was invisible to the overlap preflight and leaked (FIXED) |
 | `0021-gate-logs-overwrite-so-a-failing-run-erases-the-passing-one.md` | gate logs were per-step not per-run and the next run `rm -rf`'d the lot, so re-running to diagnose destroyed the evidence you were going to diff (FIXED) |
-| `0022-rocksdb-tickers-read-zero-when-statistics-are-disabled.md` | statistics are never enabled in production, so every RocksDB ticker reads a confident zero that means "never measured" (OPEN) |
+| `0022-rocksdb-tickers-read-zero-when-statistics-are-disabled.md` | PARTLY RETRACTED: the two stall counters are DB properties and were live all along, so BUG-0013 was never blocked; the real defect — `.unwrap_or(0)` discarding a readable "cannot answer" — is FIXED |
 | `0023-chain-traversal-loses-a-link-but-only-inside-a-full-gate.md` | a chain link is nil after a master kill in a gate run; 5 solo runs never reproduce it, port collision ruled out (OPEN) |
 | `0024-cutover-reports-a-handoff-failure-that-did-not-happen.md` | a 5 s read timeout on the cutover handoff is reported as "source not disowned"; the source disowns anyway, and the same call on the freeze can strand a slot write-frozen (OPEN) |

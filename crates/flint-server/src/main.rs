@@ -3084,8 +3084,13 @@ fn flintinfo(
         None => "none".into(),
     };
     let (disk_free, disk_total, disk_unknown) = DISK.snapshot();
+    // Read the stall pair ONCE. Two reads could straddle a change, and would
+    // let write_stall_readable describe a different call than the values
+    // beside it. None here means the engine could not answer, which is a
+    // different fact from a healthy zero (docs/bugs/0022).
+    let write_stall = rocks.as_ref().and_then(|kv| kv.write_stall());
     let info = format!(
-        "role:{}\r\nrole_epoch:{role_epoch}\r\nbuild:{build}\r\nsst_bytes:{sst}\r\nlatest_seq:{latest}\r\nlast_applied:{last_applied}\r\nacked_seq:{}\r\nseq_lag:{seq_lag}\r\nwal_headroom_seq:{whs}\r\nwal_min_acked_seq:{wma}\r\nwal_headroom_shed_seq:{whl}\r\nlive_replicas:{}\r\nlag_ms:{}\r\nlag_soft_ms:{soft}\r\nlag_hard_ms:{hard}\r\nmin_replicas_to_write:{minr}\r\nwidowed_grace_ms:{wgm}\r\nwidowed_shed:{wsh}\r\nfullsync_active:{fsa}\r\nfullsync_max:{fsm}\r\nasync_write_queue:{aqd}\r\nwrite_deadline_ms:{wdm}\r\nwrite_inflight:{wif}\r\nwrite_service_us:{wsu}\r\nwrite_wait_est_ms:{wwe}\r\nwrites_shed_deadline:{wsd}\r\nwal_fsync_ms:{wfm}\r\nwal_fsync_total:{wft}\r\ncert_days_remaining:{cdr}\r\nactive_conns:{ac}\r\nmax_conns:{mc}\r\nconns_shed_total:{cs}\r\nwrite_stopped:{wst}\r\ndelayed_write_rate:{dwr}\r\ndisk_free_bytes:{dfb}\r\ndisk_total_bytes:{dtb}\r\ndisk_free_pct:{dfp}\r\ndisk_verdict:{dv}\r\ndisk_unknown_samples:{dus}\r\ngc_swept_expired:{gse}\r\ngc_swept_orphans:{gso}\r\nuptime_ms:{upms}\r\n",
+        "role:{}\r\nrole_epoch:{role_epoch}\r\nbuild:{build}\r\nsst_bytes:{sst}\r\nlatest_seq:{latest}\r\nlast_applied:{last_applied}\r\nacked_seq:{}\r\nseq_lag:{seq_lag}\r\nwal_headroom_seq:{whs}\r\nwal_min_acked_seq:{wma}\r\nwal_headroom_shed_seq:{whl}\r\nlive_replicas:{}\r\nlag_ms:{}\r\nlag_soft_ms:{soft}\r\nlag_hard_ms:{hard}\r\nmin_replicas_to_write:{minr}\r\nwidowed_grace_ms:{wgm}\r\nwidowed_shed:{wsh}\r\nfullsync_active:{fsa}\r\nfullsync_max:{fsm}\r\nasync_write_queue:{aqd}\r\nwrite_deadline_ms:{wdm}\r\nwrite_inflight:{wif}\r\nwrite_service_us:{wsu}\r\nwrite_wait_est_ms:{wwe}\r\nwrites_shed_deadline:{wsd}\r\nwal_fsync_ms:{wfm}\r\nwal_fsync_total:{wft}\r\ncert_days_remaining:{cdr}\r\nactive_conns:{ac}\r\nmax_conns:{mc}\r\nconns_shed_total:{cs}\r\nwrite_stopped:{wst}\r\ndelayed_write_rate:{dwr}\r\nwrite_stall_readable:{wsr}\r\ndisk_free_bytes:{dfb}\r\ndisk_total_bytes:{dtb}\r\ndisk_free_pct:{dfp}\r\ndisk_verdict:{dv}\r\ndisk_unknown_samples:{dus}\r\ngc_swept_expired:{gse}\r\ngc_swept_orphans:{gso}\r\nuptime_ms:{upms}\r\n",
         if read_only { "replica" } else { "master" },
         hub.effective_acked(now)
             .map_or_else(|| "none".into(), |a| a.to_string()),
@@ -3139,8 +3144,19 @@ fn flintinfo(
         ac = ACTIVE_CONNS.load(Ordering::Relaxed),
         mc = MAX_CONNS.load(Ordering::Relaxed),
         cs = CONNS_SHED.load(Ordering::Relaxed),
-        wst = rocks.as_ref().map(|kv| kv.write_stall().0).unwrap_or(0),
-        dwr = rocks.as_ref().map(|kv| kv.write_stall().1).unwrap_or(0),
+        // ONE read, not two: the pair has to describe one moment, and
+        // write_stall() is now fallible, so calling it twice could also
+        // report readable=1 beside a value from a read that failed.
+        wst = write_stall.map(|s| s.0).unwrap_or(0),
+        dwr = write_stall.map(|s| s.1).unwrap_or(0),
+        // Says whether the two fields above were MEASURED. Without it a
+        // disabled, absent or unreadable counter and a genuinely idle engine
+        // are the same bytes on the wire (docs/bugs/0022), and the reading
+        // that means "never measured" is also the healthiest-looking one.
+        // Same shape as disk_unknown_samples: keep the metric numeric and
+        // publish its readability beside it rather than poisoning the value.
+        // 0 on the mem engine, which honestly cannot answer at all.
+        wsr = u8::from(write_stall.is_some()),
         dfb = disk_free,
         dtb = disk_total,
         dfp = disk_free

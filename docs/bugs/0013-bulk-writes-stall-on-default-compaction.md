@@ -61,6 +61,19 @@ elsewhere — disk throughput, the WAL fsync cadence, or the proxy. Tuning an
 LSM from reasoning instead of from its own stall counters is how a write
 problem becomes a read problem.
 
+**The counter is running — verified, not assumed.** BUG-0022 claimed this
+criterion could never fail to acquit because statistics are disabled in
+production. That was wrong: `rocksdb.is-write-stopped` is a DB *property*, not
+a statistics *ticker*, and properties are live regardless. Measured on the
+production open path, it reads `Ok(Some(0))` rather than `Ok(None)`.
+
+Even so, **check `write_stall_readable:1` before believing any zero here.**
+FLINTINFO now publishes it beside the two fields (BUG-0022's fix): 1 means the
+pair was measured, 0 means the engine could not answer — the mem engine, or a
+future build where these do become statistics-gated. A zero from an instrument
+that cannot move is worth nothing, and this criterion's whole weight rests on
+one.
+
 ## Then
 
 Raise `max_background_jobs` toward the core count, size the write buffers for

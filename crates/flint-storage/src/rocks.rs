@@ -63,15 +63,29 @@ impl RocksKv {
 
     /// Engine write-stall signals (W2 back-pressure visibility): RocksDB's
     /// L0/pending-compaction back-pressure that silently slows or stops
-    /// writes. Returns (write_stopped, delayed_write_rate_bytes_per_sec):
+    /// writes. `Some((write_stopped, delayed_write_rate_bytes_per_sec))`:
     /// stopped=1 means writes are fully halted; a nonzero rate means writes
     /// are being throttled (soft stall). Both 0 = healthy.
-    pub fn write_stall(&self) -> (u64, u64) {
-        let prop = |name: &str| self.db.property_int_value(name).ok().flatten().unwrap_or(0);
-        (
-            prop("rocksdb.is-write-stopped"),
-            prop("rocksdb.actual-delayed-write-rate"),
-        )
+    ///
+    /// `None` MEANS "I COULD NOT ANSWER" AND IS NOT THE SAME AS `Some((0, 0))`
+    /// (docs/bugs/0022). This used to end in `.unwrap_or(0)`, which folded an
+    /// engine that could not answer into the healthiest possible reading — in
+    /// the direction an investigator expects, which is the worst direction for
+    /// a wrong answer to point. BUG-0013's falsification criterion is "if
+    /// write_stopped is zero the hypothesis is wrong", and a zero that means
+    /// "never measured" would have acquitted it every time.
+    ///
+    /// These two are DB PROPERTIES, not statistics tickers, so they are live
+    /// on the production open path with `enable_statistics()` off — measured,
+    /// see the test below. A genuine ticker (`rocksdb.stall.micros`) reads
+    /// `Ok(None)` there, which is precisely the case this signature now keeps
+    /// distinguishable.
+    pub fn write_stall(&self) -> Option<(u64, u64)> {
+        let prop = |name: &str| self.db.property_int_value(name).ok().flatten();
+        Some((
+            prop("rocksdb.is-write-stopped")?,
+            prop("rocksdb.actual-delayed-write-rate")?,
+        ))
     }
 
     /// Approximate resident bytes for one namespace — the storage-metering
@@ -445,6 +459,63 @@ mod audit {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    /// docs/bugs/0022. Two things are pinned here, and the second rots
+    /// silently if it is not.
+    ///
+    /// 1. POSITIVE CONTROL — the PRODUCTION open path can read the stall
+    ///    pair. `enable_statistics()` is called nowhere outside this test
+    ///    module, and the write-up that filed 0022 concluded from that alone
+    ///    that the stall counters were inert in production. They are not:
+    ///    `rocksdb.is-write-stopped` and `rocksdb.actual-delayed-write-rate`
+    ///    are DB PROPERTIES, not statistics tickers. If that ever stops being
+    ///    true, `write_stall()` starts returning None and this test says so,
+    ///    instead of FLINTINFO quietly publishing a healthy-looking zero.
+    ///
+    /// 2. `Ok(None)` is what "cannot answer" looks like. The whole
+    ///    distinction rests on it. A rocksdb upgrade that answered an unknown
+    ///    property with `Ok(Some(0))` would fold "cannot answer" back into
+    ///    "answered zero" without a line of Flint changing.
+    #[test]
+    fn write_stall_is_readable_on_the_production_open_path() {
+        let dir = TempDir::new("stall");
+        let kv = RocksKv::open(&dir.0).expect("open");
+        for i in 0..2000u32 {
+            kv.put(format!("Mk{i}").as_bytes(), b"v");
+        }
+
+        let stall = kv.write_stall();
+        assert!(
+            stall.is_some(),
+            "the production open path could not read the write-stall pair, so \
+             every zero FLINTINFO reports for it would mean 'never measured'"
+        );
+        assert_eq!(
+            stall,
+            Some((0, 0)),
+            "2000 small puts stalled the engine; that is not flake, it is \
+             either a real regression in the write path or the stall \
+             thresholds have moved (docs/bugs/0013)"
+        );
+
+        assert_eq!(
+            kv.db
+                .property_int_value("rocksdb.no-such-property")
+                .expect("reading an unknown property must not error"),
+            None,
+            "an unavailable property no longer reads as Ok(None), so \
+             'cannot answer' and 'answered zero' are one value again and \
+             write_stall()'s Option no longer distinguishes anything"
+        );
+        // A statistics TICKER is genuinely unavailable on this path, and reads
+        // as that same Ok(None). This is the case the Option exists for.
+        assert_eq!(
+            kv.db
+                .property_int_value("rocksdb.stall.micros")
+                .expect("reading a ticker name as a property must not error"),
+            None
+        );
     }
 
     #[test]
