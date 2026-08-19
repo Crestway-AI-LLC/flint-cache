@@ -43,3 +43,4 @@ New references should use the path, so a reader can follow them.
 | `0021-gate-logs-overwrite-so-a-failing-run-erases-the-passing-one.md` | gate step logs are per-step not per-run, so re-running to diagnose destroys the evidence you were going to diff (OPEN) |
 | `0022-rocksdb-tickers-read-zero-when-statistics-are-disabled.md` | statistics are never enabled in production, so every RocksDB ticker reads a confident zero that means "never measured" (OPEN) |
 | `0023-chain-traversal-loses-a-link-but-only-inside-a-full-gate.md` | a chain link is nil after a master kill in a gate run; 5 solo runs never reproduce it, port collision ruled out (OPEN) |
+| `0024-cutover-reports-a-handoff-failure-that-did-not-happen.md` | a 5 s read timeout on the cutover handoff is reported as "source not disowned"; the source disowns anyway, and the same call on the freeze can strand a slot write-frozen (OPEN) |
