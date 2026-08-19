@@ -448,10 +448,10 @@ mod tail_kinds_tests {
                     cause: None,
                     detail: None,
                 };
-                format!("{}\n", serde_json::to_string(&e).unwrap())
+                format!("{}\n", serde_json::to_string(&e).expect("event serializes"))
             })
             .collect();
-        std::fs::write(path, body).unwrap();
+        std::fs::write(path, body).expect("write the fixture journal");
     }
 
     /// THE REGRESSION FOR THE 2026-08-17 OUTAGE, in its actual shape: a
@@ -552,7 +552,7 @@ mod tail_kinds_tests {
                 cause: None,
                 detail: None,
             })
-            .unwrap()
+            .expect("event serializes")
         };
         std::fs::write(
             &p,
@@ -562,7 +562,7 @@ mod tail_kinds_tests {
                 good(9)
             ),
         )
-        .unwrap();
+        .expect("write the torn-line fixture");
         let got = tail_kinds(&p, 50, &[EventKind::ActionExecuted]);
         assert_eq!(got.len(), 2, "the lines around the tear still read");
     }
@@ -597,7 +597,8 @@ mod tail_kinds_tests {
         let e = parse_kinds_arg(Some("KINDS"), Some("ActionExecuted,Bogus"));
         assert!(e.is_err(), "must refuse, got {e:?}");
         assert!(
-            e.unwrap_err().contains("Bogus"),
+            e.expect_err("an unknown kind must be an error")
+                .contains("Bogus"),
             "and must name the offender"
         );
         // The near-miss spellings a human or a rename would actually produce.

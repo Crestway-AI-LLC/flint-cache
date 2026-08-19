@@ -1634,7 +1634,7 @@ mod cpjournalread_filter_tests {
                 std::process::id(),
                 N.fetch_add(1, Ordering::Relaxed)
             ));
-            std::fs::create_dir_all(&p).unwrap();
+            std::fs::create_dir_all(&p).expect("scratch dir for the journal fixture");
             Self(p)
         }
         fn journal(&self) -> String {
@@ -1669,7 +1669,7 @@ mod cpjournalread_filter_tests {
                 cause: None,
                 detail: None,
             };
-            body.push_str(&serde_json::to_string(&e).unwrap());
+            body.push_str(&serde_json::to_string(&e).expect("event serializes"));
             body.push('\n');
         };
         push(1, EventKind::ActionExecuted);
@@ -1677,7 +1677,7 @@ mod cpjournalread_filter_tests {
             push(100 + i, EventKind::Detected);
         }
         push(9_000, EventKind::ActionVerified);
-        std::fs::write(path, body).unwrap();
+        std::fs::write(path, body).expect("write the journal fixture");
     }
 
     fn call(sh: &Shared, args: &[&str]) -> Value {
