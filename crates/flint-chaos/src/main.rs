@@ -70,6 +70,35 @@ impl Drop for Quiesce {
     }
 }
 
+/// Why an edge dial might have failed, in the words of the thing most
+/// likely to be wrong.
+///
+/// An undialable edge surfaces in at least two places — the post-kill stall
+/// detector and the final walk's `connect()` — and which one you hit is a
+/// timing race. Before this, one blamed the proxy ("the proxy never
+/// recovered") and the other said `edge client` and nothing else. Both sent
+/// the reader to the fleet. The dial is the cheaper thing to rule out, so it
+/// gets named first, and the hint lives here rather than at each site so the
+/// two cannot drift apart.
+fn edge_hint(edge_addr: &str, edge_ca: &str) -> String {
+    if edge_ca.is_empty() {
+        format!(
+            "dialling {edge_addr} in PLAINTEXT (no --edge-ca). Against a \
+             client-TLS proxy this looks exactly like a fleet that never \
+             recovered: the TCP connect succeeds, the handshake never \
+             happens, and every write times out. Suspect the dial before \
+             the fleet."
+        )
+    } else {
+        format!(
+            "dialling {edge_addr} with TLS trusting {edge_ca}. If the proxy \
+             is up, check that the edge cert's SANs cover the dialled host — \
+             the edge uses the dialled name, not the mesh's fixed SNI. \
+             Suspect the dial before the fleet."
+        )
+    }
+}
+
 fn main() {
     let iterations: u32 = arg("--iterations", 12);
     let key_count: u64 = arg("--keys", 400);
@@ -146,6 +175,10 @@ fn main() {
     // for). Needs a tenant credential because a CP-fed proxy is gated.
     let edge_addr: String = arg("--edge", String::new());
     let edge_auth: String = arg("--auth", String::new());
+    // The CA that signs the proxy's EDGE certificate — the tenant's trust
+    // root, not the mesh's. Omitted means a plaintext edge, which is what
+    // every chaos run before ADR-0018 item 9 silently assumed.
+    let edge_ca: String = arg("--edge-ca", String::new());
     // --quiesce-file: the pre-kill convergence gate needs the pair to reach
     // seq_lag == 0, and this harness can only park ITS OWN writer. Any load
     // outside it keeps the replica behind and the gate becomes a coin flip
@@ -220,11 +253,32 @@ fn main() {
         let (tenant, token) = edge_auth
             .split_once(':')
             .unwrap_or_else(|| panic!("--edge needs --auth <tenant>:<token>"));
-        println!("  client path: proxy edge {edge_addr} as tenant {tenant}");
+        // Built here rather than lazily in the writer so a bad path fails
+        // the run at startup with the reason, instead of turning into an
+        // endless retry loop against a healthy fleet forty minutes in.
+        let etls = if edge_ca.is_empty() {
+            None
+        } else {
+            Some(
+                flint_tls::edge_client_config(&edge_ca)
+                    .unwrap_or_else(|e| panic!("--edge-ca {edge_ca}: {e}")),
+            )
+        };
+        println!(
+            "  client path: proxy edge {edge_addr} as tenant {tenant} ({})",
+            if etls.is_some() {
+                format!("TLS, trusting {edge_ca}")
+            } else {
+                // Said out loud, because it is the posture that used to be
+                // the only one and the one a release note would misdescribe.
+                "PLAINTEXT — not the posture a TLS customer runs".to_string()
+            }
+        );
         Some(Edge {
             addr: edge_addr.clone(),
             tenant: tenant.to_string(),
             token: token.to_string(),
+            tls: etls,
         })
     };
     let pair_count = targets.len();
@@ -433,10 +487,20 @@ fn main() {
                     if shared.acks_after_kill.load(Ordering::SeqCst) >= 50 {
                         break shared.max_stall_ms.load(Ordering::SeqCst).max(1);
                     }
+                    // NAMES THE POSTURE, not just the symptom. This fires
+                    // identically whether the proxy really failed to recover
+                    // or whether chaos never completed a single handshake
+                    // with it — and the second case sends someone to debug a
+                    // healthy proxy. It is exactly what a plaintext dial
+                    // against a TLS edge looked like before --edge-ca
+                    // existed: zero writes served, blamed on the fleet.
                     assert!(
                         Instant::now() < deadline,
                         "iter {iteration}: edge served fewer than 50 writes in \
-                         {rto_budget_ms}ms x2 after the kill — the proxy never recovered"
+                         {rto_budget_ms}ms x2 after the kill ({} since) — the \
+                         proxy never recovered, OR this run never reached it: {}",
+                        shared.acks_after_kill.load(Ordering::SeqCst),
+                        edge_hint(&edge_addr, &edge_ca),
                     );
                     std::thread::sleep(Duration::from_millis(10));
                 }
@@ -831,7 +895,12 @@ fn main() {
                 "direct (cluster.master_client)"
             };
             let mut c = if shared.edge.is_some() {
-                shared.connect().expect("edge client")
+                shared.connect().unwrap_or_else(|| {
+                    panic!(
+                        "no edge client for the post-kill snapshot check — {}",
+                        edge_hint(&edge_addr, &edge_ca)
+                    )
+                })
             } else {
                 cluster.master_client().expect("master client")
             };
@@ -919,10 +988,31 @@ fn main() {
     let (mut present, mut missing) = (0u64, 0u64);
     for (t, sh) in targets.iter_mut().zip(&shareds) {
         let ledger = std::mem::take(&mut *sh.ledger.lock().unwrap_or_else(|e| e.into_inner()));
-        let mut c = sh
-            .connect()
-            .or_else(|| t.master_client().ok())
-            .expect("final connect");
+        // NO FALLBACK OFF THE EDGE. This used to be
+        // `.connect().or_else(|| t.master_client().ok())`, so when the edge
+        // could not be dialled the final walk quietly verified the ledger
+        // against the pair masters instead — and printed PASS. A run whose
+        // whole claim is "the client path holds" would then have checked a
+        // different path than the one under test, and said nothing. That is
+        // the same defect as dialling the edge in plaintext (ADR-0018 item
+        // 9), one layer further in.
+        //
+        // The fallback stays for DIRECT mode, where there is no edge and
+        // master_client is the only path there ever was.
+        let mut c = if sh.edge.is_some() {
+            sh.connect().unwrap_or_else(|| {
+                panic!(
+                    "final walk cannot reach the edge, and will NOT fall back to \
+                     the masters — that would verify a path this run is not \
+                     testing: {}",
+                    edge_hint(&edge_addr, &edge_ca)
+                )
+            })
+        } else {
+            sh.connect()
+                .or_else(|| t.master_client().ok())
+                .expect("final connect")
+        };
         for (key, entry) in &ledger {
             match c.call(&[b"GET", key.as_bytes()]) {
                 Ok(Value::Bulk(Some(raw))) => {
@@ -1076,5 +1166,58 @@ mod quiesce_tests {
     fn an_empty_path_arms_nothing() {
         let q = Quiesce::begin("");
         assert!(q.0.is_none(), "an empty path should arm no file at all");
+    }
+}
+
+/// ADR-0018 item 9. The edge-dial hint, which is the only thing standing
+/// between an undialable edge and a reader who goes to debug the fleet.
+#[cfg(test)]
+mod edge_hint_tests {
+    use super::edge_hint;
+
+    /// The plaintext case is the one that produced the bug: chaos dialled a
+    /// client-TLS proxy without TLS, and the failure read as "the proxy never
+    /// recovered".
+    #[test]
+    fn the_plaintext_hint_names_the_dial_and_the_flag() {
+        let h = edge_hint("127.0.0.1:7193", "");
+        assert!(h.contains("127.0.0.1:7193"), "{h}");
+        assert!(
+            h.contains("--edge-ca"),
+            "the fix has to be in the message: {h}"
+        );
+        assert!(h.contains("PLAINTEXT"), "{h}");
+        assert!(h.contains("Suspect the dial before the fleet"), "{h}");
+    }
+
+    /// With TLS configured the likely cause is different — a SAN that does
+    /// not cover the dialled host — so pointing at --edge-ca would be
+    /// misdirection of the same kind, one step along.
+    #[test]
+    fn the_tls_hint_points_at_sans_not_at_the_flag_already_set() {
+        let h = edge_hint("10.0.0.1:7002", "/etc/flint/ca.crt");
+        assert!(
+            h.contains("10.0.0.1:7002") && h.contains("/etc/flint/ca.crt"),
+            "{h}"
+        );
+        assert!(h.contains("SANs"), "{h}");
+        assert!(
+            !h.contains("PLAINTEXT"),
+            "must not blame plaintext when TLS is configured: {h}"
+        );
+        assert!(h.contains("Suspect the dial before the fleet"), "{h}");
+    }
+
+    /// Both branches carry the phrase the drill's negative control greps
+    /// for. Without this the drill could pass while the message it is
+    /// asserting on had drifted to something else.
+    #[test]
+    fn both_branches_carry_the_phrase_the_drill_asserts_on() {
+        for ca in ["", "/tmp/ca.crt"] {
+            assert!(
+                edge_hint("h:1", ca).contains("Suspect the dial before the fleet"),
+                "ca={ca:?}"
+            );
+        }
     }
 }

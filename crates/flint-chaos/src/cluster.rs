@@ -618,6 +618,24 @@ impl Client {
         })
     }
 
+    /// Dial the CUSTOMER-FACING edge, which is a different handshake from the
+    /// mesh even when both are TLS: `connect_edge` uses the dialed host as the
+    /// server name, matching the edge cert's IP/DNS SANs, where the mesh pins
+    /// one fixed internal SNI. Using the mesh dial here would fail the name
+    /// check against a correctly-issued edge cert — so a chaos run "covering
+    /// the customer path" would report a broken edge on a healthy fleet.
+    pub fn connect_edge_addr(
+        addr: &str,
+        tls: &Option<std::sync::Arc<flint_tls::ClientConfig>>,
+    ) -> std::io::Result<Self> {
+        let stream = flint_tls::connect_edge(addr, tls)?;
+        stream.set_read_timeout(Some(Duration::from_millis(1500)))?;
+        Ok(Self {
+            stream,
+            buf: Vec::new(),
+        })
+    }
+
     pub fn call(&mut self, args: &[&[u8]]) -> std::io::Result<Value> {
         let frame = Value::Array(Some(
             args.iter().map(|a| Value::Bulk(Some(a.to_vec()))).collect(),

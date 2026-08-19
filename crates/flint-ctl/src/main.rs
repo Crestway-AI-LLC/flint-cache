@@ -4965,6 +4965,23 @@ fn decommission_node(
 /// failover (promote the already-upgraded replica, demote the old master,
 /// warm-restart it on the new build as a replica). Any unexpected journal
 /// transition aborts the roll — already-upgraded nodes stay (roll forward).
+/// Does this control plane predate `CPFENCE`?
+///
+/// Split out of `upgrade` so the decision can be tested without a fleet. The
+/// branch it guards rolls the control plane, and reproducing its true case
+/// needs a CP binary older than CPFENCE — which no drill on this box can
+/// currently produce, so without this the branch is reasoned about and never
+/// executed. A branch that cannot run looks exactly like one that works.
+///
+/// Only the literal "unknown command" reply counts. In particular a
+/// TRANSPORT error must not: a CP that is briefly unreachable is the
+/// transient case `controlled_failover`'s refusal already handles correctly,
+/// and treating it as "old" would restart a healthy control plane because of
+/// a network blip.
+fn cp_lacks_cpfence(reply: &std::io::Result<Value>) -> bool {
+    matches!(reply, Ok(Value::Error(e)) if e.contains("unknown control-plane command"))
+}
+
 fn upgrade(inv: &Inventory, version_tag: Option<String>, soak_ms: u64, nodes_only: bool) {
     let tls = tls_client(inv);
     // Kept for binaries built before the tag was compiled in: release builds
@@ -4992,6 +5009,99 @@ fn upgrade(inv: &Inventory, version_tag: Option<String>, soak_ms: u64, nodes_onl
         "SpareRestored",
     ];
     const MASTER_PHASE_DISALLOWED: &[&str] = &["Detected", "SelfFenced", "SpareRestored"];
+
+    // PRECONDITION: the CP must already speak the verbs the MASTER phase
+    // needs, because the phase that rolls the CP runs after it.
+    //
+    // `upgrade` goes canary -> replicas -> masters -> roll_edge, and
+    // roll_edge is what rolls the control plane. The master phase calls
+    // controlled_failover, which commits a CPFENCE record before promoting.
+    // So on any fleet whose CP predates CPFENCE, the master phase depends on
+    // a command that only exists after a phase that has not run yet -- and
+    // the roll stops halfway with the pair DEMOTED AND DRAINED:
+    //
+    //     CPFENCE 172.31.64.94:7001 did not commit -- refusing to promote
+    //     without a fencing record: ERR unknown control-plane command
+    //
+    // Observed on the playground's rc.51 -> rc.52 roll. The refusal is
+    // correct and stays; the defect is that the dependency is discovered
+    // after the fleet has been mutated instead of before it is touched.
+    //
+    // Checked with a BARE `CPFENCE`, which is side-effect free by
+    // construction: the handler's arity check returns `ERR CPFENCE <addr>`
+    // and returns before it proposes anything (controlplane/src/ha.rs). A CP
+    // that does not know the verb answers `unknown control-plane command`
+    // instead, and the two are trivially distinguishable. Probing with a real
+    // address would commit a fencing record as a side effect of asking a
+    // question, which is not a check, it is a mutation with an opinion.
+    if !nodes_only {
+        let probe = call_cp(inv, &tls, &["CPFENCE"]);
+        if cp_lacks_cpfence(&probe) {
+            // ROLL THE CP FIRST rather than refusing. There is no CP-only verb
+            // to send an operator to — `--nodes-only` does the exact opposite,
+            // leaving the CP on the old binary — so a refusal would name a
+            // remedy the tool does not offer. The manual workaround is a hand
+            // stop-and-respawn with the seat's own argv, which is exactly what
+            // the primitives below do.
+            //
+            // Additive on purpose: roll_edge still rolls the CP at the end, so
+            // a crossing upgrade restarts it twice. That is one extra restart
+            // of a seat this command already restarts, and a Raft group keeps
+            // serving while a minority is down — cheaper than reordering a
+            // sequence whose current order is reasoned about in roll_edge's
+            // own header.
+            eprintln!(
+                "== control plane FIRST: this CP does not know CPFENCE, which the \
+                 master phase requires"
+            );
+            for i in 0..inv.cp.len() {
+                let seat = inv.cp[i].clone();
+                let name = cp_seat_name(inv, i);
+                if let Err(e) = stop_seat(
+                    inv,
+                    &runner_for(inv, &seat),
+                    &name,
+                    "flint-controlplane",
+                    &cp_seat_state(inv, i),
+                    Some(port_of(&seat)),
+                ) {
+                    eprintln!("== UPGRADE ABORTED rolling {name} (pairs untouched): {e}");
+                    std::process::exit(3);
+                }
+                spawn_env(
+                    inv,
+                    &runner_for(inv, &seat),
+                    &name,
+                    "flint-controlplane",
+                    &cp_seat_args(inv, i),
+                    &envs,
+                );
+                if !wait_pong(&seat, &tls, Duration::from_secs(15)) {
+                    eprintln!("== UPGRADE ABORTED: {name} did not answer after the binary swap");
+                    std::process::exit(3);
+                }
+                eprintln!("  {name} rolled");
+            }
+            // THE CHECK THAT KEEPS THIS HONEST. If the STAGED binary is also
+            // too old, continuing walks straight into the half-roll this
+            // exists to prevent — pair demoted and drained, which is the state
+            // the playground was actually left in.
+            let after = call_cp(inv, &tls, &["CPFENCE"]);
+            if matches!(&after, Ok(Value::Error(e)) if e.contains("unknown control-plane command"))
+            {
+                eprintln!(
+                    "== UPGRADE ABORTED: the control plane still does not know CPFENCE \
+                     after rolling it onto the staged binary."
+                );
+                eprintln!(
+                    "   The staged bundle predates CPFENCE, so the master phase can never \
+                     succeed. Stage a newer release. The pairs have not been touched."
+                );
+                std::process::exit(4);
+            }
+            eprintln!("  control plane speaks CPFENCE; continuing with the pairs");
+        }
+    }
 
     // Observe roles now: replicas roll first, masters last.
     let mut masters: Vec<String> = Vec::new();
@@ -5933,6 +6043,60 @@ fn main() {
                 "unknown command {other:?} (bootstrap|start|status|reload|tenant|tenant-reads|tenant-cache|tenant-async|tenant-federate|tenant-quota|rotate-admin|rotate-certs|proxy-cache|expand|swap-node|add-replica|migrate-slots|failover|decommission-node|upgrade|stop)"
             )
         }
+    }
+}
+
+/// Both literals below are a CROSS-CRATE CONTRACT with the control plane.
+///
+/// They are emitted by `flint-controlplane`'s `ha.rs`, which now defines them
+/// as `ERR_UNKNOWN_CP_COMMAND` and `ERR_CPFENCE_ARITY` and pins them with its
+/// own test — this crate cannot import them without taking a dependency on
+/// the whole Raft stack. These tests fix what THIS side matches; that test
+/// fixes what the other side sends. Both are needed: pinning only here would
+/// keep passing while a reworded CP message silently reclassified every
+/// fleet, which is the failure mode a reviewer flagged.
+#[cfg(test)]
+mod cpfence_probe_tests {
+    use super::*;
+
+    /// The reply that stopped the playground's rc.51 -> rc.52 roll halfway,
+    /// with the pair demoted and drained (BUG-0018).
+    #[test]
+    fn an_old_control_plane_is_detected() {
+        let reply = Ok(Value::Error("ERR unknown control-plane command".into()));
+        assert!(cp_lacks_cpfence(&reply));
+    }
+
+    /// THE CONTROL THAT MATTERS. A current CP answers the bare probe with an
+    /// ARITY error, because the handler checks its argument before it
+    /// proposes anything — which is what makes the probe side-effect free.
+    /// Reading that as "old" would roll the control plane of every healthy
+    /// fleet on every upgrade.
+    #[test]
+    fn a_current_control_plane_answers_with_an_arity_error_and_is_not_old() {
+        let reply = Ok(Value::Error("ERR CPFENCE <addr>".into()));
+        assert!(!cp_lacks_cpfence(&reply));
+    }
+
+    /// An unreachable CP is NOT an old one. This is the transient case
+    /// `controlled_failover`'s existing refusal handles; restarting a
+    /// control plane over a network blip would be a self-inflicted outage.
+    #[test]
+    fn a_transport_error_is_not_an_old_control_plane() {
+        let reply: std::io::Result<Value> = Err(std::io::Error::other("connection refused"));
+        assert!(!cp_lacks_cpfence(&reply));
+    }
+
+    /// And neither is any other error the CP might return, e.g. the NOPAIR
+    /// the handler gives for an address it does not recognise.
+    #[test]
+    fn an_unrelated_error_is_not_an_old_control_plane() {
+        let reply = Ok(Value::Error(
+            "NOPAIR address is not a member of any registered pair".into(),
+        ));
+        assert!(!cp_lacks_cpfence(&reply));
+        let ok = Ok(Value::Simple("OK fenced 127.0.0.1:7001".into()));
+        assert!(!cp_lacks_cpfence(&ok));
     }
 }
 
