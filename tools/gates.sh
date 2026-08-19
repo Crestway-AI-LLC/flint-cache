@@ -230,7 +230,52 @@ RAN_STEPS=0
 #
 # So: attribute the leak to the drill that caused it, and clear it, so one
 # leak costs one accurate failure rather than a cascade of false ones.
-_leaked_seats() { pgrep -f 'target/release/flint-(server|proxy|controlplane|controller|agent)' 2>/dev/null; }
+# Flint daemons running anywhere on this box. DELIBERATELY UNSCOPED — the
+# scoping happens in _leaked_seats below, which needs to see everything in
+# order to tell ours from someone else's.
+_all_flint_seats() { pgrep -f 'target/release/flint-(server|proxy|controlplane|controller|agent)' 2>/dev/null; }
+
+# Of those, the ones the NAMED DRILL could plausibly own (docs/bugs/0027).
+#
+# This used to be the unscoped list, and the caller kill -9'd it. So any Flint
+# process on the box was attributed to whichever drill had just finished and
+# destroyed — including another session's fleet. Measured on 2026-08-19: a
+# peer's 4-seat TLS fleet on 7191-7194 was killed four times in one run, blamed
+# on restart, ctl_error, proxy_tls and coproc_vec_rebuild, none of which had
+# anything to do with it. fleet_guard had already refused those drills for the
+# right reason, one layer down, and then this killed what it had declined to
+# touch. tools/lib/fleet.sh exists because of exactly that harm — "anyone with
+# a live Flint fleet on the same machine loses it" — and the gate reintroduced
+# it above the abstraction written to prevent it.
+#
+# Ownership is decided the same way fleet.sh decides it: the drill's scope
+# directory OR one of the ports it declares. Both are needed — a proxy started
+# `--port 6666 --pairs ...` and a controller started `--pairs ... --id PX`
+# carry no path at all, so a directory-only match would miss them.
+_leaked_seats() {  # <drill-name>
+  local drill="tools/${1}_drill.sh" ports pid args
+  ports=$(grep -h '^fleet_init' "$drill" 2>/dev/null \
+    | awk '{for (i = 3; i <= NF; i++) print $i}' | grep -E '^[0-9]+$' \
+    | tr '\n' '|' | sed 's/|$//')
+  for pid in $(_all_flint_seats); do
+    args=$(ps -o args= -p "$pid" 2>/dev/null) || continue
+    case "$args" in
+      *"${FLINT_DRILL_ROOT:-/tmp}"*) echo "$pid"; continue ;;
+    esac
+    [ -n "$ports" ] && echo "$args" | grep -qE "(^|[^0-9])($ports)([^0-9]|$)" && echo "$pid"
+  done
+}
+
+# Flint daemons that are NOT this drill's. Reported, never killed: they belong
+# to another session or a live cluster, and a stray kill is worse than a stray
+# process.
+_foreign_seats() {  # <drill-name>
+  local mine; mine=$(_leaked_seats "$1" | tr '\n' ' ')
+  local pid
+  for pid in $(_all_flint_seats); do
+    case " $mine " in *" $pid "*) ;; *) echo "$pid" ;; esac
+  done
+}
 
 step() {  # step <name> <log-suffix> <command...>
   local name="$1" log="$LOGS/$2.log"; shift 2
@@ -289,7 +334,14 @@ step() {  # step <name> <log-suffix> <command...>
   #
   # "Every step must leave nothing behind" was an assumption, not a contract,
   # and it was wrong for the stage that happens to run first.
-  local leaked; leaked=$([ -n "${LEAKCHECK:-}" ] && _leaked_seats)
+  local leaked; leaked=$([ -n "${LEAKCHECK:-}" ] && _leaked_seats "$name")
+  local foreign; foreign=$([ -n "${LEAKCHECK:-}" ] && _foreign_seats "$name")
+  if [ -n "$foreign" ]; then
+    # NOT a failure and NOT killed. Someone else's fleet on a shared box is a
+    # fact about the box, not a defect in this drill — and it is exactly what
+    # this check used to destroy.
+    echo "      note: $(echo "$foreign" | wc -l | tr -d ' ') Flint process(es) on this box are not $name's; left alone"
+  fi
   if [ -n "$leaked" ]; then
     echo "      LEAKED: $name left $(echo "$leaked" | wc -l | tr -d ' ') Flint process(es) running"
     ps -o pid=,args= -p $(echo "$leaked" | tr '\n' ' ') 2>/dev/null \
