@@ -501,13 +501,48 @@ fn migrate_in(
                                             // BEFORE the reply is generated
                                             // (docs/bugs/0024). Say what is
                                             // known and what is not.
+                                            // No answer to the flip. Rather
+                                            // than report uncertainty we
+                                            // could resolve, ASK the source —
+                                            // FLINTMIGRATIONS ALL is
+                                            // read-only and shows the
+                                            // terminal Moved records the bare
+                                            // form hides. Two of the four
+                                            // answers are definite; the other
+                                            // two stay uncertain and say so,
+                                            // because a source with no record
+                                            // is NOT a source that disowned
+                                            // (docs/bugs/0025).
                                             Err(e) => {
-                                                return Value::Error(format!(
-                                                    "ERR cutover handoff UNCONFIRMED after retries (we own the slot; \
-                                                     the source may or may not have disowned it — its Moved record \
-                                                     commits before it replies, so a lost reply does not mean a lost \
-                                                     handoff; check the source before acting): {e}"
-                                                ));
+                                                return match ask_source_phase(src, slot, ns) {
+                                                    SourcePhase::Disowned => {
+                                                        Value::Simple(format!(
+                                                            "MIGRATEIN-OK {applied} cutover (reply lost; source confirms Moved on re-query)"
+                                                        ))
+                                                    }
+                                                    SourcePhase::StillHeld(phase) => {
+                                                        Value::Error(format!(
+                                                            "ERR cutover handoff INCOMPLETE (we own the slot; the source \
+                                                         answered a re-query and still holds it in phase '{phase}' — \
+                                                         it has NOT disowned, so retry the flip): {e}"
+                                                        ))
+                                                    }
+                                                    SourcePhase::NoRecord => Value::Error(format!(
+                                                        "ERR cutover handoff UNCONFIRMED (we own the slot; the source \
+                                                         answered a re-query and has NO record for this slot, which is \
+                                                         not the same as having disowned it — it may have cleaned up \
+                                                         after a completed move or never held one; check the source's \
+                                                         slot ownership before acting): {e}"
+                                                    )),
+                                                    SourcePhase::Unreachable(why) => {
+                                                        Value::Error(format!(
+                                                            "ERR cutover handoff UNCONFIRMED after retries (we own the slot; \
+                                                         the re-query also failed: {why}. Its Moved record commits \
+                                                         before it replies, so a lost reply does not mean a lost \
+                                                         handoff; check the source before acting): {e}"
+                                                        ))
+                                                    }
+                                                };
                                             }
                                         }
                                     }
@@ -545,6 +580,62 @@ fn migrate_in(
             }
         }
     }
+}
+
+/// What the SOURCE says about a slot, asked rather than inferred.
+///
+/// Four outcomes, and only two of them are definite. `NoRecord` is
+/// deliberately NOT folded into "disowned": the whole point of BUG-0025 is
+/// that a missing record and a completed handoff produce the same silence,
+/// and collapsing them here would reintroduce the bug one layer up.
+#[cfg(feature = "rocks")]
+enum SourcePhase {
+    /// The source holds a terminal Moved record: it HAS disowned the slot.
+    Disowned,
+    /// The source holds a live record in some other phase: it has NOT disowned.
+    StillHeld(String),
+    /// The source answered and has no record at all. Ambiguous by construction
+    /// — it may have cleaned up after a completed move, or never had one.
+    NoRecord,
+    /// We could not ask. Says nothing about the source.
+    Unreachable(String),
+}
+
+/// Ask the source for its own view of `slot`, using the read-only ALL form.
+#[cfg(feature = "rocks")]
+fn ask_source_phase(src: &str, slot: u16, ns: &[u8]) -> SourcePhase {
+    let reply = call_retrying(
+        src,
+        &[b"FLINTMIGRATIONS", b"ALL"],
+        2,
+        std::time::Duration::from_secs(10),
+    );
+    let rows = match reply {
+        Ok(Value::Array(Some(rows))) => rows,
+        Ok(other) => return SourcePhase::Unreachable(format!("unexpected reply: {other:?}")),
+        Err(e) => return SourcePhase::Unreachable(e.to_string()),
+    };
+    let want_slot = slot.to_string();
+    for r in rows {
+        let Value::Bulk(Some(b)) = r else { continue };
+        let line = String::from_utf8_lossy(&b).into_owned();
+        // "slot phase peer ns"
+        let mut f = line.splitn(4, ' ');
+        let (Some(s_slot), Some(s_phase), Some(_peer), Some(s_ns)) =
+            (f.next(), f.next(), f.next(), f.next())
+        else {
+            continue;
+        };
+        if s_slot != want_slot || s_ns.as_bytes() != ns {
+            continue;
+        }
+        return if s_phase == "moved" {
+            SourcePhase::Disowned
+        } else {
+            SourcePhase::StillHeld(s_phase.to_string())
+        };
+    }
+    SourcePhase::NoRecord
 }
 
 /// FLINTMIGRATEIN <src host:port> <slot> [<self advertise addr>]. With the
@@ -786,10 +877,35 @@ pub(crate) fn flintslotstats(store: &dyn Kv) -> Value {
 /// "slot phase peer ns" bulk each. Moved is excluded: it is settled ownership,
 /// not a move awaiting resolution.
 #[cfg(feature = "rocks")]
-pub(crate) fn flintmigrations(rocks: &Option<RocksHandle>) -> Value {
+pub(crate) fn flintmigrations(rocks: &Option<RocksHandle>, args: &[Vec<u8>]) -> Value {
     use flint_storage::manifest::{self, MigrationPhase};
     let Some(kv) = rocks else {
         return Value::Error("ERR FLINTMIGRATIONS requires the rocks engine".into());
+    };
+    // FLINTMIGRATIONS ALL: every record regardless of phase, including the
+    // terminal Moved ones the bare form deliberately hides. Read-only, and
+    // additive — the controller's parser already ignores phases it does not
+    // recognise, so an older controller talking to a newer node is unaffected.
+    //
+    // It exists so a destination holding an UNCONFIRMED handoff can ASK the
+    // source what it thinks, instead of reading the bare form's silence as
+    // "disowned". That inference is what BUG-0025 is about: the bare form
+    // filters to needs_recovery(), so a source that HAS disowned reports
+    // nothing, and so does a source that never had the record at all.
+    let all = match args.get(1) {
+        None => false,
+        Some(a) if a.eq_ignore_ascii_case(b"ALL") => true,
+        // An unrecognised argument must not quietly answer the bare question.
+        // Returning the filtered set here would make `FLINTMIGRATIONS ALLL`
+        // indistinguishable from `FLINTMIGRATIONS ALL` that found no terminal
+        // records — the same two-states-one-output defect this command was
+        // added to remove.
+        Some(a) => {
+            return Value::Error(format!(
+                "ERR FLINTMIGRATIONS takes no argument or ALL, got '{}'",
+                String::from_utf8_lossy(a)
+            ));
+        }
     };
     // needs_recovery, not is_inflight: an Aborted record has nothing in flight
     // and is exactly the row that tells the controller to unfreeze a source
@@ -798,7 +914,7 @@ pub(crate) fn flintmigrations(rocks: &Option<RocksHandle>) -> Value {
     // absence it used to misread.
     let rows: Vec<Value> = manifest::scan_all_migrations(kv.as_ref())
         .into_iter()
-        .filter(|r| r.phase.needs_recovery())
+        .filter(|r| all || r.phase.needs_recovery())
         .map(|r| {
             let phase = match r.phase {
                 MigrationPhase::Importing => "importing",
@@ -821,7 +937,7 @@ pub(crate) fn flintmigrations(rocks: &Option<RocksHandle>) -> Value {
 }
 
 #[cfg(not(feature = "rocks"))]
-pub(crate) fn flintmigrations(_rocks: &Option<RocksHandle>) -> Value {
+pub(crate) fn flintmigrations(_rocks: &Option<RocksHandle>, _args: &[Vec<u8>]) -> Value {
     Value::Error("ERR FLINTMIGRATIONS requires a build with --features rocks".into())
 }
 

@@ -292,14 +292,62 @@ Five drills on the cutover path pass: `slot_cutover`,
 `slot_cutover_recovery` (both branches), `slot_migrate`, `migrate_slots`,
 `rebalance_execute`. Zero leaked seats.
 
+### Item 4 completed 2026-08-19: the destination now ASKS the source
+
+`FLINTMIGRATIONS ALL` added — read-only, additive, and returning every record
+regardless of phase, including the terminal `Moved` ones the bare form
+deliberately hides. The controller's parser already ignores phases it does not
+recognise, so an older controller against a newer node is unaffected.
+
+The unconfirmed flip path uses it. Where it previously reported honest
+uncertainty and stopped, it now re-queries the source and resolves two of the
+four cases:
+
+| source says | verdict |
+|---|---|
+| `moved` | **definite** — handoff completed, returns `MIGRATEIN-OK ... (reply lost; source confirms Moved on re-query)` |
+| any other phase | **definite** — it has NOT disowned; retry the flip |
+| no record at all | still UNCONFIRMED, and says so |
+| could not be asked | still UNCONFIRMED, and names the re-query failure |
+
+**Absence is still not disownership.** `NoRecord` is deliberately not folded
+into "disowned" — that collapse is precisely BUG-0025, and doing it here would
+have reintroduced the bug one layer up, in the code written to fix it. A source
+that cleaned up after a completed move and a source that never held the record
+produce the same empty answer, so the empty answer stays uncertain.
+
+An unrecognised argument is an error rather than a silent fallback to the bare
+form: `FLINTMIGRATIONS ALLL` returning the filtered set would be
+indistinguishable from `ALL` finding no terminal records — the same
+two-states-one-output defect the command exists to remove.
+
+**Verified against a real cutover.** Before any migration both forms are empty
+(so `ALL` is not inventing rows). After a completed move, asked of the source:
+
+    bare : ''
+    ALL  : '13624 moved 127.0.0.1:6571 0'
+    typo : ERR FLINTMIGRATIONS takes no argument or ALL, got 'ALLL'
+
+The lost-reply branch was then FORCED, because it is the branch that matters
+and nothing reaches it in normal operation. Temporarily cutting the flip budget
+to 1 ms against a 40 000-key slot made the source complete the move while the
+destination timed out:
+
+    MIGRATEIN-OK 40000 cutover (reply lost; source confirms Moved on re-query)
+
+Before this change that same run returned `ERR cutover handoff UNCONFIRMED`.
+Aiming the re-query at a dead address exercised the other reachable arm:
+
+    ERR cutover handoff UNCONFIRMED after retries (... the re-query also
+    failed: Connection refused (os error 61) ...)
+
 ### Still open
 
-**Actually asking the source**, rather than reporting honest uncertainty. The
-`Err` path now says "unconfirmed", which is true and useful, but a destination
-that re-dialled could often turn it into a definite answer. It cannot today:
-`FLINTMIGRATIONS` filters to in-flight records, so a `Moved` source reports
-nothing, and reading that absence as "disowned" is precisely the inference
-BUG-0025 is about. Doing this properly needs a read-only phase query — an
-additive `FLINTMIGRATIONS ALL` would do it, and the controller's parser already
-ignores phases it does not recognise. Deliberately not built alongside the
-retry, so the safe core lands without a protocol change attached to it.
+Nothing. The last item — "actually asking the source" — is the section above,
+built 2026-08-19 and deliberately landed separately from the retry so the safe
+core shipped without a protocol change attached to it.
+
+Two cases remain genuinely UNCONFIRMED by design, and that is the correct
+answer rather than a gap: a source with no record at all, and a source that
+cannot be reached. Neither can be resolved by asking harder, because neither
+distinguishes a completed handoff from one that never happened.

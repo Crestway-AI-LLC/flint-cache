@@ -2624,11 +2624,15 @@ fn execute(
     // "slot phase peer" bulk per line), so a recovering controller can
     // observe and reconcile moves interrupted by a restart. Terminal Moved
     // overrides are ownership state, not in-flight, and are excluded.
+    //
+    // FLINTMIGRATIONS ALL includes them. Read-only, and the one way to turn
+    // "the source did not answer" into a fact about the source rather than an
+    // inference from its silence (docs/bugs/0024, docs/bugs/0025).
     if args
         .first()
         .is_some_and(|n| n.eq_ignore_ascii_case(b"FLINTMIGRATIONS"))
     {
-        return migrate::flintmigrations(rocks);
+        return migrate::flintmigrations(rocks, args);
     }
     // FLINTSNAPSHOT <root>: durable off-node snapshot — a consistent RocksDB
     // checkpoint written under <root>/<id>/ with <root>/LATEST atomically
