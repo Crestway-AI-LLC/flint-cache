@@ -142,13 +142,26 @@ jobs:
         run: tools/gates.sh conformance drills chaos
 
       - name: Keep the logs
-        # gates.sh writes one file per step and keeps them whether they passed
-        # or failed. Without this they die with the runner, and a failure that
-        # cannot be read is a failure that gets re-run instead of fixed —
-        # which is exactly what the script exists to prevent.
+        # gates.sh writes one DIRECTORY PER RUN — <utc-stamp>-<short-sha>/ —
+        # and keeps every step's log whether it passed or failed. Without this
+        # they die with the runner, and a failure that cannot be read is a
+        # failure that gets re-run instead of fixed, which is exactly what the
+        # script exists to prevent.
+        #
+        # NOTE FOR ANYONE PARSING THESE: as of docs/bugs/0021 the artifact
+        # holds <run-id>/<step>.log, not <step>.log at the top level. `latest`
+        # is a symlink to the run directory and is excluded so the artifact
+        # does not carry a second copy of everything.
+        #
+        # 90 days, not 14. BUG-0014 fires about once every 14 gate runs, so its
+        # evidence and its next occurrence were on comparable timescales — the
+        # retention expired at roughly the rate the bug recurred. For drills
+        # asserting durability the storage is worth it.
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: gate-logs
-          path: /tmp/flint-gates
-          retention-days: 14
+          path: |
+            /tmp/flint-gates
+            !/tmp/flint-gates/latest
+          retention-days: 90

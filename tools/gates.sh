@@ -19,8 +19,15 @@
 #   drills       the core drills (the CORE list below is the count)
 #   chaos        the two randomized chaos drills
 #
-# Logs land in $FLINT_GATE_LOGS (default $FLINT_DRILL_ROOT/flint-gates) — one
-# file per step, kept whether it passed or failed.
+# Logs land in $FLINT_GATE_LOGS (default $FLINT_DRILL_ROOT/flint-gates), one
+# DIRECTORY PER RUN — <utc-stamp>-<short-sha>[-dirty]/<step>.log — kept whether
+# the step passed or failed, and kept across the NEXT run. The newest 20 runs
+# are retained; $FLINT_GATE_LOGS/latest points at the most recent.
+#
+# "Kept whether it passed or failed" was true within a run and false across
+# runs until 2026-08-18: this was a flat directory the next run opened with
+# `rm -rf`. See docs/bugs/0021 — telling a flake from a real bug IS a cross-run
+# comparison, so the retention evaporated at exactly the moment it was needed.
 #
 # FLINT_DRILL_ROOT (default /tmp) is where every drill's scratch, seat logs
 # and these gate logs live, and it is the volume the disk guard measures.
@@ -84,8 +91,60 @@ STAGES="${*:-$ALL_STAGES}"
 
 cd "$(dirname "$0")/.."
 
-LOGS="${FLINT_GATE_LOGS:-${FLINT_DRILL_ROOT:-/tmp}/flint-gates}"
-rm -rf "$LOGS"; mkdir -p "$LOGS"
+# ONE DIRECTORY PER RUN, not one file per step (docs/bugs/0021).
+#
+# This used to be a flat directory that the next run opened with `rm -rf`. So
+# the retention this file was built to provide — "keep the output, a flake and
+# a real bug look identical without it" — lasted exactly until the second run,
+# which is the first moment the question can be asked. Worse than an
+# overwrite: `rm -rf` also took the logs of steps the new run never reached,
+# so re-running a subset erased evidence the subset had nothing to do with.
+# It cost the failing log for BUG-0024 while that bug was being investigated.
+#
+# The run id carries the TREE as well as the time, because a log could not
+# previously say which commit produced it, and two branches differing in one
+# file was already enough to make identical line numbers disagree. A dirty
+# tree says so — a bare sha for a tree with uncommitted changes names a
+# commit that was never the thing under test.
+_gate_tree_id() {
+  local sha
+  sha="$(git rev-parse --short HEAD 2>/dev/null)" || { echo "nogit"; return; }
+  if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
+    echo "${sha}-dirty"
+  else
+    echo "$sha"
+  fi
+}
+
+# Keep the newest N run directories. The id starts with a UTC timestamp, so a
+# reverse sort BY NAME is a reverse sort by time and needs no stat(1). Bounded
+# retention does not reintroduce the bug: the point is to survive the NEXT
+# run, not to keep everything forever.
+_gate_prune_runs() {
+  local keep="$1" d n=0
+  for d in $(ls -1 "$LOGS_ROOT" 2>/dev/null | sort -r); do
+    [ -d "$LOGS_ROOT/$d" ] || continue
+    [ "$d" = "latest" ] && continue
+    n=$((n + 1))
+    [ "$n" -le "$keep" ] && continue
+    rm -rf "${LOGS_ROOT:?}/$d"
+  done
+}
+
+LOGS_ROOT="${FLINT_GATE_LOGS:-${FLINT_DRILL_ROOT:-/tmp}/flint-gates}"
+mkdir -p "$LOGS_ROOT"
+_gate_run_base="$(date -u +%Y%m%dT%H%M%SZ)-$(_gate_tree_id)"
+GATE_RUN_ID="$_gate_run_base"
+_gate_n=1
+# Two runs inside one second collide on the id — gates_drill.sh does exactly
+# that. Suffix rather than let the second run write into the first's directory.
+while [ -e "$LOGS_ROOT/$GATE_RUN_ID" ]; do
+  GATE_RUN_ID="$_gate_run_base.$_gate_n"; _gate_n=$((_gate_n + 1))
+done
+LOGS="$LOGS_ROOT/$GATE_RUN_ID"
+mkdir -p "$LOGS"
+ln -sfn "$GATE_RUN_ID" "$LOGS_ROOT/latest" 2>/dev/null || true
+_gate_prune_runs 20
 
 # Section 3 of the checklist, in its order. Adding a drill here is what puts
 # it in the gate — there is no second list.
@@ -151,6 +210,7 @@ CHAOS="chaos proxy_chaos chaos_unreadable hotkey_chaos"
 # So the environment that trusts the result is the environment that must
 # refuse a skip.
 FAILED=""
+FAILED_LOGS=""
 # Steps actually executed. A gate that ran nothing must not report a pass, and
 # the argument validation above is only the hole we know about — this counts
 # the work instead of trusting the dispatch, so a future refactor cannot
@@ -213,6 +273,7 @@ step() {  # step <name> <log-suffix> <command...>
         || grep -m1 -E '^(REFUSING|thread .* panicked|error(\[|:))' "$log" \
         || tail -3 "$log"; } |  df -h "$_GATE_DISK_TARGET" | sed 's/^/        /'
     FAILED="$FAILED $name"
+    FAILED_LOGS="$FAILED_LOGS $log"
   fi
 
   # Leak check, on the PASS path as much as the FAIL path — the leak that
@@ -237,7 +298,10 @@ step() {  # step <name> <log-suffix> <command...>
     echo "        fleet_kill (scoped to the drill's fleet_init ports) over a"
     echo "        hand-written pkill pattern, which goes stale silently."
     kill -9 $(echo "$leaked" | tr '\n' ' ') 2>/dev/null
-    case " $FAILED " in *" $name "*) ;; *) FAILED="$FAILED $name(leaked)" ;; esac
+    case " $FAILED " in
+      *" $name "*) ;;
+      *) FAILED="$FAILED $name(leaked)"; FAILED_LOGS="$FAILED_LOGS $log" ;;
+    esac
   fi
 }
 
@@ -569,6 +633,23 @@ echo
 if [ -n "$FAILED" ]; then
   echo "GATES FAILED:$FAILED"
   echo "  logs: $LOGS"
+  # DUMP THE FAILING LOGS INLINE (docs/bugs/0021).
+  #
+  # The one-line summary above names the log and stops. Locally that is a path
+  # you can open; in CI it is a path inside an artifact, and reading a red gate
+  # then requires knowing artifacts exist and downloading one. That extra step
+  # is where someone concludes the evidence is gone — it is how "CI never
+  # captures the drill log" got written down as a fact and committed to two
+  # repos, when gate.yml had been uploading them all along.
+  #
+  # Tail, not the whole file: a chaos log runs to tens of thousands of lines
+  # and the artifact still holds every one of them. The failure is at the end.
+  for _fl in $FAILED_LOGS; do
+    [ -f "$_fl" ] || continue
+    echo
+    echo "  ---- $_fl (last 200 lines; the full log is in the run directory) ----"
+    tail -200 "$_fl" | sed 's/^/  | /'
+  done
   exit 1
 fi
 if [ "$RAN_STEPS" -eq 0 ]; then
@@ -579,4 +660,4 @@ if [ "$RAN_STEPS" -eq 0 ]; then
   echo "  unknown-stage bug this guard exists to keep closed. Fix gates.sh."
   exit 2
 fi
-echo "GATES PASSED — $RAN_STEPS steps, logs kept in $LOGS"
+echo "GATES PASSED — $RAN_STEPS steps, logs kept in $LOGS (also $LOGS_ROOT/latest)"

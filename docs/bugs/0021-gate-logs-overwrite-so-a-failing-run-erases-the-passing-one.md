@@ -1,7 +1,8 @@
-# BUG-0021: gate step logs are overwritten, so a failing run destroys the passing run's evidence (OPEN)
+# BUG-0021: gate step logs are overwritten, so a failing run destroys the passing run's evidence (FIXED)
 
-Status: OPEN, found 2026-08-18 · Severity: **medium** — it costs exactly the
-comparison you need at the moment you need it, and it costs it silently
+Status: **FIXED 2026-08-18**, found the same day · Severity: **medium** — it
+cost exactly the comparison you need at the moment you need it, and it cost it
+silently
 
 ## Symptom
 
@@ -101,6 +102,77 @@ Neither justifies the alarm. Recorded at length because the retraction is more
 instructive than the finding would have been: the local overwrite problem
 below is real and was verified by hand, and its neighbour in the same file was
 invented from a single unchecked channel.
+
+## The root cause was worse than this file said
+
+The section above blamed one file per STEP. The line is stronger than that:
+
+    LOGS="${FLINT_GATE_LOGS:-${FLINT_DRILL_ROOT:-/tmp}/flint-gates}"
+    rm -rf "$LOGS"; mkdir -p "$LOGS"
+
+Every run **deleted the whole directory**. Not just same-named steps — a
+re-run of one stage erased the logs of steps it never touched, so narrowing an
+investigation by re-running a subset destroyed evidence the subset had nothing
+to do with. That is what it did to BUG-0024 the same day: the local gate log
+holding the `slot_cutover` EWOULDBLOCK was gone, replaced by two later passing
+runs, and the trigger for that bug is still open partly because of it.
+
+## Fixed
+
+`tools/gates.sh` now writes **one directory per run**:
+
+    $FLINT_GATE_LOGS/<utc-stamp>-<short-sha>[-dirty]/<step>.log
+
+with `$FLINT_GATE_LOGS/latest` pointing at the newest and the **newest 20 runs
+retained**. Bounded retention does not reintroduce the bug: the point is to
+survive the *next* run, not to keep everything forever.
+
+The id carries the tree as well as the time. `-dirty` is not decoration — a
+bare sha on a tree with uncommitted changes names a commit that was never the
+thing under test, and two branches differing in one file was already enough
+that day to make identical line numbers disagree.
+
+Two runs inside one second collide on the id (`gates_drill.sh` does exactly
+that), so a colliding id gets a `.1` suffix rather than letting the second run
+write into the first run's directory.
+
+### The failing logs are dumped inline
+
+A red gate now prints the last 200 lines of each failing step's log, marked and
+prefixed, after the `GATES FAILED:` line. The full log stays in the run
+directory and in the CI artifact; the tail is there so nobody has to know an
+artifact exists to read a failure. That extra step is exactly where the
+retracted claim below came from.
+
+### CI
+
+`gate.yml` retention goes 14 days -> **90**. BUG-0014 fires about once every 14
+gate runs, so its evidence and its next occurrence were on comparable
+timescales — the retention was expiring at roughly the rate the bug recurred.
+
+**Anything parsing these artifacts must be updated**: the artifact now holds
+`<run-id>/<step>.log`, not `<step>.log` at the top level. The `latest` symlink
+is excluded from the upload so the artifact does not carry a second copy of
+every log.
+
+### Verified
+
+The assertion is layout-independent and was shown able to fail. Run the gate
+once, drop a sentinel beside whatever logs it wrote, run it again:
+
+    NEGATIVE CONTROL (gates.sh committed before the fix):
+    before   run1 wrote 100 logs -> after run2 the tree holds 100; SENTINEL DESTROYED
+    FIXED:
+    after    run1 wrote 100 logs -> after run2 the tree holds 200; SENTINEL SURVIVED
+
+The pre-fix column is the point: without it, "the sentinel survived" is equally
+satisfied by a test that could never have destroyed it.
+
+The inline dump was verified by running a forged gate whose single drill emits
+a distinctive string and exits 1 — the string appears in the gate's **output**,
+not only in the file, and the 200-line cap held at 200. `gates_drill.sh`, which
+asserts against `gates.sh` itself including its log retention, passes
+unchanged.
 
 ## Related
 
