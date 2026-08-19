@@ -39,7 +39,7 @@ rm -rf "$STATE" "$INV" "$DEAD"
 # accident of ordering — reseed happens to rebuild with rocks a few drills
 # later. gates.sh now lints for this.
 cargo build --release -q -p flint-server -p flint-controlplane -p flint-ctl \
-  --features flint-server/rocks
+  --features flint-server/rocks || { echo "FAIL: build"; exit 1; }
 
 cat > "$INV" <<EOF
 disposable on

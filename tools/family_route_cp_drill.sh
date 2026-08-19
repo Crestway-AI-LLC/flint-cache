@@ -31,7 +31,7 @@ fleet_kill server; fleet_kill proxy; fleet_kill controlplane; sleep 0.4
 cleanup() { fleet_kill server; fleet_kill proxy; fleet_kill controlplane; rm -rf "$D"; }
 trap cleanup EXIT
 
-cargo build --release -q -p flint-server -p flint-controlplane -p flint-proxy --features flint-server/rocks
+cargo build --release -q -p flint-server -p flint-controlplane -p flint-proxy --features flint-server/rocks || { echo "FAIL: build"; exit 1; }
 
 # A DEAD co-processor endpoint: nothing listens on port 1, so a registered
 # family whose endpoint is down answers -COPROCUNAVAIL. That is exactly the

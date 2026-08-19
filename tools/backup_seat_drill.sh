@@ -35,7 +35,7 @@ trap cleanup EXIT
 rm -rf "$STATE" "$INV" $FLINT_DRILL_ROOT/flint-bkseat-sets
 
 cargo build --release -q -p flint-server -p flint-proxy -p flint-controlplane \
-  -p flint-ctl --features flint-server/rocks,flint-backup/rocks -p flint-backup
+  -p flint-ctl --features flint-server/rocks,flint-backup/rocks -p flint-backup || { echo "FAIL: build"; exit 1; }
 
 cat > "$INV" <<EOF
 disposable on

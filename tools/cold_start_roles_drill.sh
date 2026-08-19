@@ -40,7 +40,7 @@ trap cleanup EXIT
 rm -rf "$STATE" "$INV"
 
 cargo build --release -q -p flint-server -p flint-proxy -p flint-controlplane \
-  -p flint-controller -p flint-ctl --features flint-server/rocks
+  -p flint-controller -p flint-ctl --features flint-server/rocks || { echo "FAIL: build"; exit 1; }
 
 cat > "$INV" <<EOF
 disposable on

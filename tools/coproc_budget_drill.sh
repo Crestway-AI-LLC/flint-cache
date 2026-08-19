@@ -36,7 +36,7 @@ fleet_kill server; fleet_kill proxy; sleep 0.4
 cleanup() { fleet_kill server; fleet_kill proxy; rm -rf "$D"; }
 trap cleanup EXIT
 
-cargo build --release -q -p flint-server -p flint-proxy --features flint-server/rocks
+cargo build --release -q -p flint-server -p flint-proxy --features flint-server/rocks || { echo "FAIL: build"; exit 1; }
 
 ADMIN="admin-secret-token"
 $B --port 6688 --engine mem 2>"$D/node.log" &

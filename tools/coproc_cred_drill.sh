@@ -31,7 +31,7 @@ trap cleanup EXIT
 # build output is SHARED, and omitting it downgrades ./target/release/flint-server
 # to a mem-only binary that breaks every later drill wanting rocks. gates.sh lints
 # for this.
-cargo build --release -q -p flint-server -p flint-ctl --features flint-server/rocks
+cargo build --release -q -p flint-server -p flint-ctl --features flint-server/rocks || { echo "FAIL: build"; exit 1; }
 
 # --- mint the REAL cert set through flintctl (the path the product runs) -------
 # Place a CA by hand, then let `rotate-certs` mint int + edge + coproc leaves AND

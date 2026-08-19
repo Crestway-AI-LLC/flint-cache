@@ -121,6 +121,23 @@ notion of ownership has to be at least as strict as the guard that already
 refused to touch that resource.** Here the two disagreed and the destructive
 one won.
 
+## The peer's side of it
+
+The session whose fleet this destroyed wrote up the two chaos defects it exposed
+— an undialable edge reported as "the proxy never recovered", and a final
+keyspace walk that fell back off the edge to the pair masters and still printed
+PASS. Both are fixed and pinned by `tools/chaos_edge_tls_drill.sh`; the anchor is
+`docs/field-notes.md`, "Chaos-tested, in a posture no customer runs", in the OPS
+repo (`Crestway-AI-LLC/flint-cache-ops`), with the reproduction. Not duplicated
+here — a bug doc for a fixed-and-drilled defect would be a third copy.
+
+Worth reading beside this one. The walk defect is the same shape in the product:
+a green that could not tell you which path it verified. And it is narrower than
+it first sounds — the fallback is unreachable while the edge is up, so healthy
+runs verified the path they claimed. Only a run where the edge was down AT
+FINAL-WALK TIME silently checked the masters, and nothing in the output
+separated those greens from the real ones.
+
 ## Related
 
 - BUG-0026 — same shape, same file, no data loss

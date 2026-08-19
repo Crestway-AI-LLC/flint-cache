@@ -686,6 +686,111 @@ fi
 # binary what it supports means starting a server (and writing a data dir)
 # after every drill. Reading the scripts is free, deterministic, and names
 # the file to fix instead of the drill that tripped over it.
+# Every drill that builds must CHECK the build (docs/bugs/0028).
+#
+# Drills declare `set -u`, not `set -e`, so an unguarded `cargo build` that
+# fails does not stop the drill — it carries on against whatever is already in
+# target/release. Under the gate that is masked, because the gate builds the
+# workspace in its own step first and the drill's rebuild is a no-op. Run by
+# hand it is not masked: the drill tests a stale binary, or one from the other
+# feature config, and says nothing about which.
+#
+# That masking is how 35569c8 survived. tenant_remove_drill.sh had a fleet_warm
+# call spliced into its build's continuation, so cargo ran with fleet_warm as an
+# argument and the remainder ran as a command. Both failed, both silently, and
+# the drill passed for months because it only ever ran under the gate.
+#
+# 27 of 53 drills already guarded, in one verbatim idiom, before this check
+# existed — so it went in with 26 mechanical edits and no design argument. Half
+# a convention is worse than none: a single unguarded drill among 52 guarded
+# ones is a visible omission, 26 of 53 is a coin flip that looks like a standard.
+#
+# THE ORDERING IS PART OF THE CHECK. `set -e` only guards a build that comes
+# after it. Crediting it wherever it appears in the file is the rule this was
+# first written with, and it happened not to bite — one drill sets -e below its
+# build, and that build carries its own inline guard. "There are none today" is
+# not "the rule is right".
+assert_no_continuation_splice() {
+  local bad
+  bad=$(python3 - "$@" <<'PY'
+import glob, io, re, sys
+
+# A new command begins here, rather than an argument continuing.
+STARTS_COMMAND = re.compile(r'^\s*(fleet_[a-z_]+|step|assert_[a-z_]+|cd|export|trap|source)\b')
+# The previous line ends in an operator or opens a group, so a command on the
+# next line is correct.
+OPERATOR_END = re.compile(r'(\|\||&&|\||;|\{|\(|\bthen|\bdo|\belse)\s*\\$')
+
+def quotes_open(chunk):
+    # Cheap and deliberately conservative: an odd count of either quote in
+    # the recent window means we are probably inside a multi-line string, so
+    # skip rather than risk a false positive on an ssh heredoc-ish payload.
+    return chunk.count('"') % 2 == 1 or chunk.count("'") % 2 == 1
+
+hits = []
+for f in sorted(set(glob.glob('tools/*.sh') + glob.glob('tools/lib/*.sh')
+                    + glob.glob('packaging/**/*.sh', recursive=True))):
+    lines = io.open(f, encoding='utf-8', errors='replace').read().splitlines()
+    for i, line in enumerate(lines[:-1]):
+        s = line.rstrip()
+        if not s.endswith('\\') or s.lstrip().startswith('#'):
+            continue
+        if OPERATOR_END.search(s):
+            continue
+        if quotes_open('\n'.join(lines[max(0, i - 3):i + 1])):
+            continue
+        if STARTS_COMMAND.match(lines[i + 1]):
+            # Print what MATCHED, not what we expect to be there. The public
+            # repo's build-guard census nearly shipped a wrong number because
+            # its evidence line was chosen separately from its verdict.
+            hits.append(f"{f}:{i+2}\n      continued: {s.strip()[:72]}\n      spliced:   {lines[i+1].strip()[:72]}")
+print("\n".join(hits))
+PY
+)
+  [ -z "$bad" ] && return 0
+  echo "GATES FAILED: a command is spliced into a backslash continuation:"
+  printf '    %s\n' "$bad"
+  echo "  The line above it swallows this one as an argument, and the line"
+  echo "  BELOW it then runs as a command. Both halves fail silently: the"
+  echo "  spliced call never happens, and the drill can still pass if"
+  echo "  something else already did its work (the gate pre-builds, which is"
+  echo "  how 35569c8 survived in tenant_remove_drill.sh)."
+  echo "  Fix: move the spliced line above or below the whole continuation."
+  exit 1
+}
+
+assert_drill_build_is_checked() {
+  local bad
+  bad=$(python3 - <<'PY_INNER'
+import glob, re
+bad = []
+for f in sorted(glob.glob("tools/*_drill.sh")):
+    lines = open(f, errors="replace").read().split("\n")
+    e = next((i for i, l in enumerate(lines) if re.match(r'set -\S*e', l.strip())), None)
+    b = next((i for i, l in enumerate(lines) if l.strip().startswith("cargo build")), None)
+    if b is None:
+        continue
+    last = b
+    while last < len(lines) - 1 and lines[last].rstrip().endswith("\\"):
+        last += 1
+    stmt = " ".join(l.rstrip().rstrip("\\") for l in lines[b:last + 1])
+    if (e is not None and e < b) or "||" in stmt or "&&" in stmt:
+        continue
+    bad.append(f"{f}:{b+1}\n      {lines[b].strip()[:78]}")
+print("\n".join(bad))
+PY_INNER
+)
+  [ -z "$bad" ] && return 0
+  echo "GATES FAILED: drill(s) run cargo build without checking it:"
+  printf '    %s\n' "$bad"
+  echo "  set -u does not stop a failed build, so the drill continues against"
+  echo "  whatever is already in target/release. Under the gate that is hidden"
+  echo "  by the pre-build step; run by hand it silently tests a stale binary."
+  echo "  Add the idiom the other drills use:"
+  echo "      cargo build ... || { echo \"FAIL: build\"; exit 1; }"
+  exit 1
+}
+
 assert_drill_builds_keep_rocks() {
   local bad=""
   for f in tools/*_drill.sh; do
@@ -715,6 +820,8 @@ assert_drill_builds_keep_rocks() {
 if want drills; then
   echo "== core drills"
   assert_drill_builds_keep_rocks
+  assert_drill_build_is_checked
+  assert_no_continuation_splice
   LEAKCHECK=1
   for d in $CORE; do step "$d" "drill-$d" bash "tools/${d}_drill.sh"; done
   LEAKCHECK=

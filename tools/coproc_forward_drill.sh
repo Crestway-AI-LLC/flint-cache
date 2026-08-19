@@ -28,7 +28,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-cargo build --release -q -p flint-server -p flint-proxy --features flint-server/rocks
+cargo build --release -q -p flint-server -p flint-proxy --features flint-server/rocks || { echo "FAIL: build"; exit 1; }
 
 # --- the stand-in co-processor (the D6 contract, plaintext for the drill) -----
 # On each FLINTFAM frame it opens PROXYCHAN <token> back to the callback and,

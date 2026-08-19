@@ -30,7 +30,7 @@ cleanup() { fleet_kill controlplane; rm -rf "$STATE"; }
 trap cleanup EXIT
 rm -rf "$STATE"; mkdir -p "$STATE"
 
-cargo build --release -q -p flint-controlplane
+cargo build --release -q -p flint-controlplane || { echo "FAIL: build"; exit 1; }
 
 ./target/release/flint-controlplane --port $CP --state "$STATE/cp" \
   > "$STATE/cp.log" 2>&1 &

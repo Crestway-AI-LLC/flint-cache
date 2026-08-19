@@ -36,7 +36,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-cargo build --release -q -p flint-server -p flint-controlplane -p flint-proxy --features flint-server/rocks
+cargo build --release -q -p flint-server -p flint-controlplane -p flint-proxy --features flint-server/rocks || { echo "FAIL: build"; exit 1; }
 
 # The stand-in co-processor: on each FLINTFAM it opens PROXYCHAN back and does
 # WRITES=50 channel SETs into the granted namespace, stopping early if any is

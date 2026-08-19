@@ -26,7 +26,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-cargo build --release -q -p flint-server -p flint-proxy -p flint-vec --features flint-server/rocks
+cargo build --release -q -p flint-server -p flint-proxy -p flint-vec --features flint-server/rocks || { echo "FAIL: build"; exit 1; }
 
 $VEC --port 6707 2>"$D/vec1.log" & COPROC_PID=$!
 fleet_wait_listen 6707

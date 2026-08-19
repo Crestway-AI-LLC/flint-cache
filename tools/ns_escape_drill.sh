@@ -45,7 +45,7 @@ trap cleanup EXIT
 # `--engine mem`: the build output is SHARED, and omitting it replaces
 # ./target/release/flint-server with a mem-only binary, breaking every later
 # drill that wants rocks. gates.sh lints for this.
-cargo build --release -q -p flint-server -p flint-proxy --features flint-server/rocks
+cargo build --release -q -p flint-server -p flint-proxy --features flint-server/rocks || { echo "FAIL: build"; exit 1; }
 
 SECRET="tenant-B-private"
 

@@ -29,7 +29,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-cargo build --release -q -p flint-server -p flint-proxy -p flint-vec --features flint-server/rocks
+cargo build --release -q -p flint-server -p flint-proxy -p flint-vec --features flint-server/rocks || { echo "FAIL: build"; exit 1; }
 
 echo "== cluster: master + proxy (static --families) + the real flint-vec co-processor"
 $VEC --port 6678 2>"$D/vec1.log" & COPROC_PID=$!

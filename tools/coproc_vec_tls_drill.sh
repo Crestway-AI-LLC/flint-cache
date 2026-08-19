@@ -32,7 +32,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-cargo build --release -q -p flint-server -p flint-proxy -p flint-vec -p flint-ctl --features flint-server/rocks
+cargo build --release -q -p flint-server -p flint-proxy -p flint-vec -p flint-ctl --features flint-server/rocks || { echo "FAIL: build"; exit 1; }
 
 # --- mint the REAL cert set through flintctl (same path the product runs) ------
 # A CA by hand, then rotate-certs mints int + edge + coproc leaves AND asserts
