@@ -72,7 +72,16 @@ edge_serial() { # <port>
   openssl s_client -connect "127.0.0.1:$1" -CAfile "$C/ca.crt" </dev/null 2>/dev/null \
     | openssl x509 -noout -serial 2>/dev/null | cut -d= -f2
 }
-pids() { pgrep -f "flint-(server|proxy|controlplane|controller)" | sort | tr '\n' ' '; }
+# Scoped, because this census is an ASSERTION: line ~105 turns a change in
+# this set into "something restarted", a claim about hot-reload. An unscoped
+# pgrep -f made that claim about the whole machine — it counted another
+# session's fleet, and it counted any process whose COMMAND LINE merely
+# contained the string, which on this box includes the Claude agents
+# themselves (`--add-dir .../crates/flint-proxy`). Starting or exiting an
+# editor between the two samples turned this drill red. _fleet_ours matches
+# on the executable's basename and then requires the scope dir or a declared
+# port, so neither can enter the set. See docs/bugs/0029.
+pids() { _fleet_ours "server proxy controlplane controller" | sort | tr '\n' ' '; }
 
 CP1=$(mesh_serial 7795); N1=$(mesh_serial 7061); E1=$(edge_serial 7998)
 [ -n "$CP1" ] && [ -n "$N1" ] && [ -n "$E1" ] || { echo "FAIL: baseline serials unreadable (cp=$CP1 node=$N1 edge=$E1)"; exit 1; }

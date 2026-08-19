@@ -497,6 +497,30 @@ assert_no_port_overlap() {
   FAILED="$FAILED port-overlap"
 }
 
+# Ports are only HALF of ownership. _fleet_ours takes a pid if the ps line
+# contains the scope dir OR a declared port, so two drills sharing a scope dir
+# can select each other's seats even with disjoint port blocks — and each
+# rm -rf's that dir at start. assert_no_port_overlap checks the ports and was
+# read as covering ownership; it never looked at $2. coproc_cred and
+# coproc_family both claimed $FLINT_DRILL_ROOT/flint-coproc for months,
+# benign only because the gate runs drills sequentially. Found by a peer
+# session reading this file for a different reason, which is the second time
+# today the check that was missing was the one nobody thought to write.
+assert_no_scope_overlap() {
+  local dupes d
+  dupes=$(grep -h '^fleet_init' tools/*_drill.sh 2>/dev/null \
+    | awk '{print $2}' | sort | uniq -d)
+  [ -z "$dupes" ] && return 0
+  echo "FAIL  two or more drills declare the same scope dir:"
+  for d in $dupes; do
+    echo "        $d: $(grep -l "^fleet_init $(printf '%s' "$d" | sed 's/[][\.*^$/]/\\&/g') " tools/*_drill.sh | tr '\n' ' ')"
+  done
+  echo "        scope is the other half of _fleet_ours's ownership test, so each"
+  echo "        drill can select the other's seats and rm -rf its state."
+  echo "        Give each drill its own directory."
+  FAILED="$FAILED scope-overlap"
+}
+
 # A drill that STARTS seats but never calls fleet_init declares nothing to
 # assert_no_port_overlap above — which then passes because it had nothing to
 # check, the same defect one level up. restart_drill.sh sat in that blind spot
@@ -584,6 +608,7 @@ if want check; then
   echo "== gates: fmt, clippy, tests (both feature configs)"
   assert_no_default_ports
   assert_no_port_overlap
+  assert_no_scope_overlap
   assert_spawning_drills_declare_ports
   assert_recovery_stays_off_until_it_observes
   assert_lease_ttl_single_source

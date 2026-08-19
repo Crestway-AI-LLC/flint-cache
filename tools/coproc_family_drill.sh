@@ -30,7 +30,7 @@ cd "$(dirname "$0")/.."
 # drill's seats as this one's own (BUG-0003, recurred as BUG-0010). The
 # block is deliberately not contiguous — 7403-7406 belong to
 # cold_start_roles_drill.
-fleet_init $FLINT_DRILL_ROOT/flint-coproc 7402 7407 7408 7409 7410
+fleet_init $FLINT_DRILL_ROOT/flint-coproc-family 7402 7407 7408 7409 7410
 fleet_guard
 STATE=$FLINT_DRILL_ROOT/flint-coproc
 INV=$FLINT_DRILL_ROOT/flint-coproc.flint
