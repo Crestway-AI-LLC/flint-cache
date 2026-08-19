@@ -139,10 +139,28 @@ The freeze call one step earlier (`migrate.rs:366-381`) uses the same
 `call_once`, inherits the same 5 s timeout, and on failure calls `rollback()`.
 
 `rollback()` clears **only the destination's** `Importing` record
-(`migrate.rs:293-297`). It never contacts the source. And nothing outside
-`migrate.rs` ever clears a `Migrating` phase — the only `clear_migration`
-callers in the tree are that rollback and the dest-side pre-flip clear. There
-is no controller reconcile and no GC sweep for a stranded source-side freeze.
+(`migrate.rs:293-297`). It never contacts the source.
+
+> **CORRECTION (same day).** An earlier revision continued: "nothing outside
+> `migrate.rs` ever clears a `Migrating` phase ... there is no controller
+> reconcile and no GC sweep for a stranded source-side freeze." **That was
+> wrong**, and it was reached by grepping for `clear_migration` callers — one
+> channel — and reading the absence as proof. Both exist: `FLINTSLOTABORT`
+> (`migrate.rs:723`) unfreezes a source, and `recover_migrations`
+> (`flint-controller/src/main.rs:1378`) runs **every 2 seconds** and handles
+> exactly this shape. `slot_cutover_recovery_drill.sh` tests it.
+>
+> What is true is narrower, and took reading `controller_args` to establish:
+> **no deployed controller enables the reconcile.** `flintctl` never passes
+> `--recover-nodes`; only the drill does. So the stranded freeze below does
+> persist in a real fleet — because the recovery is not wired in, not because
+> it does not exist.
+>
+> And enabling it is not the fix. Doing so makes this state **worse**: the
+> reconcile reads the destination's absent `Importing` as "the destination
+> owns it" and completes the flip onto a node that may hold nothing, purging
+> the source. Measured, with acked-write loss —
+> `0025-recovery-completes-a-flip-onto-a-destination-that-never-imported.md`.
 
 Same control, on the freeze:
 
@@ -185,8 +203,16 @@ Both halves are cheap, and the code has already written down why they are safe:
    (the durable record has already landed, which is what makes that correct)
    or derive the budget from the row count.
 4. **The freeze rollback must reach the source.** If the destination rolls
-   back its `Importing`, it must also unfreeze the source, or a reconcile must
-   exist that clears a `Migrating` phase whose destination is gone.
+   back its `Importing`, it must also unfreeze the source — `FLINTSLOTABORT`
+   already exists and does exactly that, so this is a call the rollback path
+   does not make, not a mechanism that has to be built.
+
+   **Do NOT satisfy this by enabling the existing reconcile.** As filed, item
+   4 said "or a reconcile must exist that clears a `Migrating` phase whose
+   destination is gone". One does, it is not enabled in production, and
+   enabling it as-is destroys acked writes in this exact state (BUG-0025).
+   The destination unfreezing the source it froze is the safe half, because
+   the destination knows it aborted; the controller only infers it.
 
 Item 4 is the one that matters most and is the least like a timeout tweak.
 
