@@ -73,13 +73,27 @@ carry no path at all, so a directory-only match misses them.
 The declared ports come from the drill's own `fleet_init` line, parsed the same
 way `assert_no_port_overlap` already parses it — no new source of truth.
 
-And the two populations are now reported differently:
+And the two populations are now handled differently:
 
-- **ours** -> `LEAKED`, the step fails, the processes are killed (unchanged)
-- **not ours** -> a one-line note, left running, the step does **not** fail
+- **attributable to this drill** -> `LEAKED`, the step fails, killed (unchanged)
+- **not attributable** -> a note, left running, the step does **not** fail
 
 Not killing is the point. A stray kill is worse than a stray process, which is
 `fleet.sh`'s rule and now the gate's.
+
+**The search stays global; only the kill is scoped.** Raised by the peer whose
+fleet this destroyed, and it is the sharper half of the fix: if the *search*
+narrowed too, an absent report would mean either "the box is clean" or "the
+check can no longer see", and those must not look alike. Global search plus a
+scoped kill means no report is a real statement about the whole machine.
+
+The note also says only what the check establishes. It reads "not attributable
+to `<drill>`", not "someone else's" — all that is known is that the argv carries
+neither the drill's scope directory nor a port it declares. Another session's
+fleet looks like that; so does a drill that leaked a seat carrying neither
+marker. Calling that "foreign" would be this same bug's confident attribution
+pointed the other way, inside its own fix. The first draft of this fix did
+exactly that.
 
 ### Verified, both directions, with a harness self-check
 

@@ -266,9 +266,20 @@ _leaked_seats() {  # <drill-name>
   done
 }
 
-# Flint daemons that are NOT this drill's. Reported, never killed: they belong
-# to another session or a live cluster, and a stray kill is worse than a stray
-# process.
+# Flint daemons this drill cannot be shown to own. Reported, never killed.
+#
+# NOT "someone else's" — that is more than the check establishes. All that is
+# known is that the argv carries neither this drill's scope directory nor a port
+# it declares. Another session's fleet looks like that, and so does a drill that
+# leaked a seat carrying neither marker. Reporting it as foreign would be the
+# same confident attribution this whole check was just fixed for, pointed the
+# other way.
+#
+# The sweep behind it stays GLOBAL on purpose (a peer's point). Scoping the KILL
+# is what stops the damage; scoping the SEARCH as well would mean an absent
+# report could equally mean "the box is clean" or "the check narrowed until it
+# could not see". Global search, scoped kill: no report means no unaccounted
+# Flint process anywhere on the machine.
 _foreign_seats() {  # <drill-name>
   local mine; mine=$(_leaked_seats "$1" | tr '\n' ' ')
   local pid
@@ -340,7 +351,9 @@ step() {  # step <name> <log-suffix> <command...>
     # NOT a failure and NOT killed. Someone else's fleet on a shared box is a
     # fact about the box, not a defect in this drill — and it is exactly what
     # this check used to destroy.
-    echo "      note: $(echo "$foreign" | wc -l | tr -d ' ') Flint process(es) on this box are not $name's; left alone"
+    echo "      note: $(echo "$foreign" | wc -l | tr -d ' ') Flint process(es) on this box are not attributable to $name"
+    echo "            (no match on its scope dir or declared ports) — left running, not a failure."
+    echo "            Another session's fleet looks like this; so would a leak carrying neither marker."
   fi
   if [ -n "$leaked" ]; then
     echo "      LEAKED: $name left $(echo "$leaked" | wc -l | tr -d ' ') Flint process(es) running"
