@@ -48,15 +48,36 @@ deadline, varying only client concurrency:
 | **32** | 3001 | **199** | 62 |
 | 64 | 75 | 6325 | 2525 |
 
-Shedding begins at 16 and is marginal at 32. On an 8-core box the drill sits
-just inside the armed region. On a 2-vCPU CI runner the Python client cannot
-hold 32 sends simultaneously outstanding, effective in-flight never exceeds
-~30, and nothing sheds — so the positive control silently fails to arm and the
-drill reports it in the language of a product defect.
+Shedding begins at 16 and is marginal at 32, so the drill sits astride the
+arming threshold rather than inside the armed region.
 
-Run-to-run variance is large in both directions: a later run armed at **2**
-threads. A fixed rung is fragile whichever value is chosen, which is the
-argument against choosing one.
+### It is marginal, not deterministic — an earlier revision of this file overstated it
+
+That revision said a small CI runner "never arms". **That is wrong, and the
+correction is the more useful finding.** Measured across the last 30 `gate`
+runs: 6 red, and `write_deadline` was the failing step in exactly **one** of
+them.
+
+| | |
+|---|---|
+| gate runs sampled | 30 |
+| runs where `write_deadline` FAILED | **1** (`53d2380`) |
+| measured failure rate | **~3%** |
+
+The very next CI run, `2621aff`, passed the step. Locally the same fixed rung
+produced **12**, **199**, and **3059** refusals on three runs of the same
+machine — three orders of magnitude apart, one of them 0.4% of the load.
+
+So arming at 32 threads is close to a coin flip whose bias depends on the
+machine and the moment. **That is worse than a deterministic break, not
+better:** a positive control that fails outright gets fixed on day one, while
+one that arms 97% of the time looks healthy, and the 3% arrives looking like an
+intermittent product defect in the write path. This is the same reasoning
+BUG-0014 records about base rates — a green streak is not evidence a marginal
+condition has been fixed.
+
+A fixed rung is fragile whichever value is chosen, which is the argument
+against choosing one.
 
 ## Why this is the day's pattern again
 
