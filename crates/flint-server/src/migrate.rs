@@ -615,10 +615,24 @@ fn ask_source_phase(src: &str, slot: u16, ns: &[u8]) -> SourcePhase {
         Ok(other) => return SourcePhase::Unreachable(format!("unexpected reply: {other:?}")),
         Err(e) => return SourcePhase::Unreachable(e.to_string()),
     };
+    classify_source_phase(&rows, slot, ns)
+}
+
+/// The row-reading half of `ask_source_phase`, split out so it can be tested
+/// without a server.
+///
+/// This is the part that ROTS: it parses `"slot phase peer ns"` positionally,
+/// a format produced somewhere else entirely (`flintmigrations`). A column
+/// added there, or a phase renamed, turns a definite answer into `NoRecord` —
+/// and `NoRecord` is the arm that reports UNCERTAINTY, so the failure mode is
+/// silent: the cutover keeps working and merely stops being able to resolve a
+/// lost reply. Nothing would have caught that.
+#[cfg(feature = "rocks")]
+fn classify_source_phase(rows: &[Value], slot: u16, ns: &[u8]) -> SourcePhase {
     let want_slot = slot.to_string();
     for r in rows {
         let Value::Bulk(Some(b)) = r else { continue };
-        let line = String::from_utf8_lossy(&b).into_owned();
+        let line = String::from_utf8_lossy(b).into_owned();
         // "slot phase peer ns"
         let mut f = line.splitn(4, ' ');
         let (Some(s_slot), Some(s_phase), Some(_peer), Some(s_ns)) =
@@ -626,6 +640,9 @@ fn ask_source_phase(src: &str, slot: u16, ns: &[u8]) -> SourcePhase {
         else {
             continue;
         };
+        // BOTH must match. A row for the right slot in the WRONG namespace is
+        // a different slot as far as ownership goes, and treating it as a hit
+        // would report another tenant's phase as this one's.
         if s_slot != want_slot || s_ns.as_bytes() != ns {
             continue;
         }
@@ -1127,4 +1144,101 @@ pub(crate) fn flintmigrateout(
         &mut out,
     );
     stream.write_all(&out)
+}
+
+#[cfg(all(test, feature = "rocks"))]
+mod source_phase_tests {
+    use super::{SourcePhase, classify_source_phase};
+    use flint_resp::Value;
+
+    fn row(s: &str) -> Value {
+        Value::Bulk(Some(s.as_bytes().to_vec()))
+    }
+
+    /// The shape that made BUG-0024's lost-reply branch resolvable: the source
+    /// reports the slot as `moved`, so the handoff DID complete and an
+    /// unconfirmed flip becomes a definite success.
+    #[test]
+    fn a_moved_row_for_this_slot_is_disowned() {
+        let rows = [row("13624 moved 127.0.0.1:6571 0")];
+        assert!(matches!(
+            classify_source_phase(&rows, 13624, b"0"),
+            SourcePhase::Disowned
+        ));
+    }
+
+    #[test]
+    fn any_other_phase_is_still_held_and_carries_the_phase() {
+        for phase in ["migrating", "importing", "aborted"] {
+            let rows = [row(&format!("13624 {phase} 127.0.0.1:6571 0"))];
+            match classify_source_phase(&rows, 13624, b"0") {
+                SourcePhase::StillHeld(p) => assert_eq!(p, phase),
+                other => panic!("{phase} must be StillHeld, got {:?}", DebugArm(&other)),
+            }
+        }
+    }
+
+    /// The two ways a row can look like a match and not be one. Both must fall
+    /// through to NoRecord rather than being read as this slot's phase —
+    /// reporting another namespace's ownership as ours is the failure this
+    /// guards.
+    #[test]
+    fn wrong_slot_or_wrong_namespace_is_not_a_match() {
+        let rows = [row("13624 moved 127.0.0.1:6571 0")];
+        assert!(
+            matches!(
+                classify_source_phase(&rows, 99, b"0"),
+                SourcePhase::NoRecord
+            ),
+            "a different slot must not match"
+        );
+        assert!(
+            matches!(
+                classify_source_phase(&rows, 13624, b"other-ns"),
+                SourcePhase::NoRecord
+            ),
+            "the same slot in a different namespace must not match"
+        );
+    }
+
+    /// Absence stays absence. This is the arm BUG-0025 exists to protect: an
+    /// empty answer must NOT be folded into "disowned".
+    #[test]
+    fn no_rows_is_no_record_not_disowned() {
+        assert!(matches!(
+            classify_source_phase(&[], 13624, b"0"),
+            SourcePhase::NoRecord
+        ));
+    }
+
+    /// A malformed row must be skipped, not panic and not match. The format is
+    /// produced by another function and a truncated line is what a version
+    /// skew looks like.
+    #[test]
+    fn malformed_rows_are_skipped_and_the_good_one_still_wins() {
+        let rows = [
+            row("13624"),
+            row("13624 moved"),
+            Value::Integer(7),
+            row("13624 moved 127.0.0.1:6571 0"),
+        ];
+        assert!(matches!(
+            classify_source_phase(&rows, 13624, b"0"),
+            SourcePhase::Disowned
+        ));
+    }
+
+    // SourcePhase has no Debug (it is only ever rendered into operator text),
+    // so give the panic above something to print without widening the type.
+    struct DebugArm<'a>(&'a SourcePhase);
+    impl std::fmt::Debug for DebugArm<'_> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self.0 {
+                SourcePhase::Disowned => write!(f, "Disowned"),
+                SourcePhase::StillHeld(p) => write!(f, "StillHeld({p})"),
+                SourcePhase::NoRecord => write!(f, "NoRecord"),
+                SourcePhase::Unreachable(e) => write!(f, "Unreachable({e})"),
+            }
+        }
+    }
 }

@@ -79,6 +79,46 @@ so the failure is environmental rather than a regression. That baseline
 comparison is the only reason the fix is committed unverified; it is not
 evidence the fix works.
 
+## Three drill constructions that do NOT reproduce this, 2026-08-19
+
+Attempted to add the verification below to `cold_start_roles_drill.sh`, which
+ends with exactly the right precondition — a failed-over pair where inventory
+`pair[0]` is the replica. Three constructions failed, each for a different and
+instructive reason. Recorded so the next attempt starts from the fourth.
+
+**1. Stop `pair[0]`, run `start`.** PASSED against the UNFIXED binary, so it
+tested nothing. `start` SPAWNS every seat before it checks any of them, so the
+command under test restarts the stopped seat and it then answers. A merely
+stopped seat cannot reproduce a bug about a seat that will not answer.
+
+**2. Hold `pair[0]`'s port via `HOLDER=$(hold_ports 7403)`.** The holder never
+held: command substitution runs the function in a SUBSHELL, so the background
+process did not outlive it. `start` brought `pair[0]` up and reported
+`pair 0: 127.0.0.1:7403 answering`. The precondition was set up and never
+checked — which is the same defect as the bug being tested, one level up. Any
+future version must ASSERT the port is held (bind-probe) before running `start`.
+
+**3. Hold the port correctly.** `start` refuses earlier, with its own guard:
+
+    re-seeding 127.0.0.1:7403 onto 127.0.0.1:7404: port 7403 still bound after
+    the process was gone — refusing to start a replacement that would die with
+    AddrInUse and leave nothing serving
+
+That refusal is correct and unrelated to this bug. A held port is a DIFFERENT
+condition from the one on the playground, where `pair[0]`'s port was FREE: the
+seat started, marked itself for re-seed, and exited, over and over
+(docs/bugs/0031). It never answered because it kept dying, not because
+something else held its address.
+
+**So the fourth construction needs a seat that STARTS AND EXITS**, leaving its
+port free — the crash-loop shape. Candidates not yet tried: a data directory
+the engine cannot open, or a pair whose roles AGREE so `start` takes no
+re-seed path and the AddrInUse guard is never reached.
+
+**Status: this fix remains behaviourally unverified.** It lints clean in both
+feature configs and the reasoning is in the commit, but no test has yet
+demonstrated it fixes anything, and three that looked like they had did not.
+
 ## Verification the fix still needs
 
 - a pair whose inventory-first member is down: `start` restarts it and exits

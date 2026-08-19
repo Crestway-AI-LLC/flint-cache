@@ -545,6 +545,30 @@ impl Drop for FullSyncGuard {
 /// The build stamp surfaced in FLINTINFO — what canary rollouts gate on.
 /// One definition for every Flint binary; see the flint-build crate for why
 /// it is not written out here.
+/// The flags an operator can reach for, printed by --help.
+///
+/// Deliberately NOT generated from a parser: this binary has no parser, it
+/// scans `env::args()` per flag. So this is a hand-kept list and it WILL drift
+/// — which is still strictly better than the previous behaviour of starting a
+/// node when asked for help.
+fn usage() -> String {
+    concat!(
+        "flint-server — a Flint data-plane node\n",
+        "\n",
+        "Usage: flint-server [--port N] [--bind ADDR] [--engine mem|rocks]\n",
+        "                    [--data-dir DIR] [--replica-of HOST:PORT]\n",
+        "                    [--journal HOST:PORT] [--rewind-snaps DIR]\n",
+        "                    [--wal-fsync-ms N] [--max-fullsync N]\n",
+        "\n",
+        "  --build-version   print the build stamp and exit\n",
+        "  --help, -h        print this and exit\n",
+        "\n",
+        "Defaults: --port 6380, --bind 127.0.0.1, --engine mem.\n",
+        "Unrecognised arguments are currently IGNORED, not rejected (bugs/0033).\n",
+    )
+    .to_string()
+}
+
 fn build_version() -> String {
     flint_build::version(env!("CARGO_PKG_VERSION"))
 }
@@ -667,6 +691,25 @@ fn main() -> std::io::Result<()> {
     // asserts against to prove the stamp actually landed.
     if std::env::args().any(|a| a == "--build-version") {
         println!("{}", build_version());
+        return Ok(());
+    }
+    // --help must not START A NODE. Until now `--build-version` was the only
+    // flag handled before the listener, and every other argument was simply
+    // ignored — so `flint-server --help` fell through, bound the DEFAULT port
+    // 6380, printed "listening", and ran until killed (docs/bugs/0033).
+    //
+    // That is bad for an operator reaching for usage and worse for a gate: the
+    // resulting process sits on a port no drill declares, so it is outside
+    // every drill's scope, and fleet_guard correctly refuses. One stray --help
+    // refused 64 drills in the run of 2026-08-19T22:27Z.
+    //
+    // The narrower defect — an UNRECOGNISED flag is silently ignored, so a
+    // typo'd `--prot 7001` starts a node on 6380 rather than failing — is real
+    // and is NOT fixed here: rejecting unknown arguments needs the full
+    // accepted set enumerated, and doing that blind risks refusing a flag some
+    // caller depends on. Filed as the open half of 0033.
+    if std::env::args().any(|a| a == "--help" || a == "-h") {
+        println!("{}", usage());
         return Ok(());
     }
     // ADR-0014 D2: the drift check needs to know how long this seat has
