@@ -388,10 +388,32 @@ impl Target {
         match self {
             Target::Local { cluster, .. } => {
                 let p = cluster.master();
-                let f = |k: &str| {
-                    flintinfo_field(p, k)
-                        .map(|v| v.trim().to_string())
-                        .unwrap_or_else(|| "?".to_string())
+                // ONE snapshot, and a distinct answer when the node cannot be
+                // asked at all.
+                //
+                // This renders inside BUG-0014's panic, which fires on a
+                // REPLICA kill that FOLLOWS a master kill — so the master
+                // being unreachable is a live possibility at exactly the
+                // moment this runs. The previous version called a
+                // field-at-a-time helper four times and mapped every failure
+                // to "?", so a DEAD node and a RENAMED FIELD printed the same
+                // four question marks, and four separate dials could each land
+                // in a different instant of a promotion. The sibling
+                // diagnostic above already says UNREACHABLE; this one is the
+                // diagnostic for the bug that has been open longest and did
+                // not.
+                let info = match Client::connect(p).and_then(|mut c| c.call(&[b"FLINTINFO"])) {
+                    Ok(Value::Bulk(Some(v))) => String::from_utf8_lossy(&v).into_owned(),
+                    Ok(other) => {
+                        return format!("local port {p} UNREACHABLE (unexpected reply: {other:?})");
+                    }
+                    Err(e) => return format!("local port {p} UNREACHABLE ({e})"),
+                };
+                let f = |k: &str| -> String {
+                    info.split(['\r', '\n'])
+                        .find(|l| l.starts_with(k))
+                        .map(|l| l.trim_start_matches(k).trim().to_string())
+                        .unwrap_or_else(|| "<absent>".to_string())
                 };
                 format!(
                     "local port {p} role={} role_epoch={} seq_lag={} live_replicas={}",
