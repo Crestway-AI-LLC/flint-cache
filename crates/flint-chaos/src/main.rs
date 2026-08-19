@@ -876,7 +876,7 @@ fn main() {
             let mut c = if shared.edge.is_some() {
                 shared.connect().unwrap_or_else(|| {
                     panic!(
-                        "no edge client for the final walk — {}",
+                        "no edge client for the post-kill snapshot check — {}",
                         edge_hint(&edge_addr, &edge_ca)
                     )
                 })
