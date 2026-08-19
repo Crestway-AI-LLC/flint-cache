@@ -348,6 +348,11 @@ fn main() {
     // promised. See the note at the check site.
     let mut beyond_cap: u64 = 0;
 
+    // BUG-0014: the ledger boundary from the PREVIOUS master kill, carried
+    // across iterations. The replica-kill assertion needs it to say whether a
+    // failing ack predates that kill (never retired -> harness, BUG-0007
+    // class) or postdates it (served by the current master -> real loss).
+    let mut last_dead_ms: u64 = 0;
     for iteration in 1..=iterations {
         // Let the writer run for a spell BETWEEN kills; it keeps writing
         // through what follows.
@@ -461,6 +466,7 @@ fn main() {
             // claiming values the survivor never had, and the NEXT replica
             // kill reported them as data loss (seed 7: key270 216 < 239).
             let dead_ms = cluster.kill_master_hot();
+            last_dead_ms = dead_ms; // BUG-0014: carry it to the next iteration
             // Harness-mode replacement replicas get fresh ports; republish
             // so the writer can find the pair again. (Attached and
             // controlled-local endpoints are fixed; this is a no-op there.)
@@ -858,6 +864,15 @@ fn main() {
             // full-sync yields a sequence just behind the ledger — the
             // original #126 symptom. So: edge through the edge, direct via
             // the port the harness KNOWS is master.
+            // BUG-0014: record WHICH BRANCH was taken, not only what it
+            // resolved to. If --edge is ever added to this drill, a
+            // diagnostic that printed only the resolution would measure
+            // nothing and read as "ruled out".
+            let read_via = if shared.edge.is_some() {
+                "edge (shared.connect)"
+            } else {
+                "direct (cluster.master_client)"
+            };
             let mut c = if shared.edge.is_some() {
                 shared.connect().unwrap_or_else(|| {
                     panic!(
@@ -874,11 +889,55 @@ fn main() {
                         let (owner, got) = parse_value(&raw)
                             .unwrap_or_else(|| panic!("TORN VALUE at {key}: {raw:?}"));
                         assert_eq!(&owner, key, "CROSS-KEY at {key}: owned by {owner}");
-                        assert!(
-                            got >= *last_acked,
-                            "iter {iteration}: REPLICA kill lost acked write at {key}: \
-                             {got} < {last_acked}"
-                        );
+                        if got < *last_acked {
+                            // BUG-0014: three candidate causes, and the
+                            // ledger entry separates them. Dump before dying.
+                            let dump = {
+                                let led = shared.ledger.lock().unwrap_or_else(|e| e.into_inner());
+                                match led.get(key) {
+                                    Some(e) => {
+                                        let mut v: Vec<String> = e
+                                            .acked_at
+                                            .iter()
+                                            .filter(|&&(sq, _, _)| sq > got)
+                                            .map(|&(sq, sent, at)| {
+                                                format!(
+                                                    "(seq={sq} sent={sent} at={at} \
+                                                     sent_before_prev_kill={})",
+                                                    sent < last_dead_ms
+                                                )
+                                            })
+                                            .collect();
+                                        if v.len() > 10 {
+                                            v.truncate(10);
+                                            v.push("...".to_string());
+                                        }
+                                        format!(
+                                            "ledger last_acked={} entries_above_got=[{}]",
+                                            e.last_acked,
+                                            v.join(" ")
+                                        )
+                                    }
+                                    None => "<no ledger entry>".to_string(),
+                                }
+                            };
+                            panic!(
+                                "iter {iteration}: REPLICA kill lost acked write at {key}: \
+                                 {got} < {last_acked}\n\
+                                 == BUG-0014 DIAGNOSTIC ==\n\
+                                 read_via: {read_via}\n\
+                                 master:   {}\n\
+                                 prev_master_kill dead_ms: {last_dead_ms}\n\
+                                 {dump}\n\
+                                 READ IT SO: any offending seq with \
+                                 sent_before_prev_kill=true was acked BEFORE the \
+                                 previous master kill and never retired -> harness \
+                                 ledger bug, BUG-0007 class, NOT a durability \
+                                 regression. All false -> the write was served by \
+                                 the CURRENT master and lost -> real.",
+                                cluster.master_diagnostic()
+                            );
+                        }
                     }
                     other => {
                         panic!("iter {iteration}: REPLICA kill lost acked key {key}: {other:?}")
