@@ -125,8 +125,13 @@ impl RocksKv {
             .map_err(|e| ReplError::WalGap(e.to_string()))?;
         let mut out = Vec::new();
         let mut bytes = 0usize;
+        // The RAW start of the first batch we are handed, before the clamp
+        // below hides it. A gap has TWO shapes and the empty-iterator check
+        // at the end only sees one of them (docs/bugs/0031).
+        let mut raw_first: Option<u64> = None;
         for item in iter {
             let (first_seq, batch) = item.map_err(|e| ReplError::Storage(e.to_string()))?;
+            raw_first.get_or_insert(first_seq);
             let mut collector = OpCollector {
                 seq: first_seq - 1,
                 floor: last_applied,
@@ -171,6 +176,35 @@ impl RocksKv {
         if out.is_empty() {
             return Err(ReplError::WalGap(format!(
                 "sequence {} is no longer in the WAL (latest is {})",
+                last_applied + 1,
+                self.db().latest_sequence_number()
+            )));
+        }
+        // THE OTHER SHAPE OF THE SAME GAP (docs/bugs/0031). The check above
+        // catches a cursor so old the WAL yields NOTHING. It cannot catch a
+        // cursor whose successor was recycled while LATER batches survive:
+        // the iterator then hands back a batch that starts PAST the sequence
+        // we need, `out` is non-empty, and this returned Ok.
+        //
+        // That Ok is what the admission term in FLINTSYNC calls to decide
+        // whether a marked replica may warm-rejoin (BUG-0015). So the master
+        // said "your copy is fine", the replica CLEARED its NEEDS_RESEED
+        // marker on the strength of it, attached, and only then did the
+        // stream's contiguity check see the hole and exit — re-marking on the
+        // way out. The next start repeated it: a livelock that ran for 13
+        // minutes on the playground and needed a data-dir wipe by hand.
+        //
+        // The two checks were asking different questions. "Are there batches
+        // after my cursor" is not "does the span START where I need it", and
+        // only the second one is admission. `first_seq.max(last_applied + 1)`
+        // above deliberately clamps a batch that BEGINS below the floor —
+        // legitimate at the cursor boundary — which is why the raw value has
+        // to be captured before the clamp rather than read back from `out`.
+        if let Some(first) = raw_first
+            && first > last_applied + 1
+        {
+            return Err(ReplError::WalGap(format!(
+                "oldest retained batch starts at {first}, past the {} needed                  (latest is {})",
                 last_applied + 1,
                 self.db().latest_sequence_number()
             )));
@@ -605,19 +639,24 @@ mod tests {
         // on counting it live. RocksDB answers a recycled sequence either by
         // yielding nothing or by starting at the oldest segment it kept, so
         // both shapes are legal; what is NOT legal is silence.
+        // BOTH shapes must be a GAP HERE, not just the empty one. This used
+        // to accept a non-empty span that started past the cursor and leave it
+        // to "the replica's own contiguity check" — which does catch it, but
+        // only after the replica has been ADMITTED, has cleared its
+        // NEEDS_RESEED marker on the strength of that admission, and has
+        // attached. It then exits and re-marks, and the next start is admitted
+        // again: the 13-minute livelock in docs/bugs/0031.
+        //
+        // Accepting either answer made this test unable to fail for the shape
+        // that actually shipped. A test that permits both branches of a
+        // question is not testing the question.
         match master.updates_since(stranded) {
             Err(ReplError::WalGap(_)) => {}
-            Ok(batches) if !batches.is_empty() => {
-                // The replica's own contiguity check catches this one: the
-                // span visibly starts past the sequence it asked for.
-                assert!(
-                    batches[0].first_seq > stranded + 1,
-                    "a batch starting at the cursor would mean nothing was actually stranded"
-                );
-            }
-            other => {
-                panic!("a cursor outside the retained WAL must not read as caught up: {other:?}")
-            }
+            other => panic!(
+                "a cursor outside the retained WAL must be a WalGap at ADMISSION, \
+                 whether the WAL yields nothing or yields a span starting past it — \
+                 deferring the second shape to the stream is bug 0031: {other:?}"
+            ),
         }
 
         // And the caught-up case must stay quiet: a cursor at or past the

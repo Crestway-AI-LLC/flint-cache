@@ -35,7 +35,72 @@ Then the next start prints the first line again.
 The last line of the FATAL is a promise the next start breaks. The node is
 right about what it needs and never does it.
 
-## Root cause
+## Root cause — MEASURED, and it is not the clear (2026-08-19)
+
+The filed cause was "the clear is unconditional and happens too early". The
+clear is real and is worth hardening, but it is not why the loop ran: an
+admission guard for exactly this livelock **already shipped** in `0a763ff`
+(BUG-0015) and **is present in rc.52**, the build the playground was running.
+Its comment describes this loop almost word for word. It did not fire.
+
+It did not fire because **a WAL gap has two shapes and the guard only saw
+one.**
+
+`updates_since_budgeted` reports a gap when the iterator yields NOTHING:
+
+    if out.is_empty() { return Err(ReplError::WalGap(...)) }
+
+It said nothing about the other shape — a span that is non-empty but STARTS
+past the sequence the replica needs. RocksDB answers a recycled sequence
+either way, and the playground got the second: batches existed, beginning at
+100817900, when 100817896 was needed.
+
+So the two checks were asking different questions:
+
+| | question | answer on 2026-08-19 |
+|---|---|---|
+| admission (`FLINTSYNC`) | are there batches after my cursor? | yes → **OK** |
+| the stream (`main.rs:4037`) | does the span START where I need it? | no → **FATAL** |
+
+Admission said the copy was good, the replica cleared `NEEDS_RESEED` on the
+strength of that, attached, and only then did the contiguity check see the
+hole. Exit, re-mark, restart, admitted again.
+
+**The existing unit test could not have caught it.** `a_cursor_the_wal_cannot_
+reach_is_a_gap_not_silence` explicitly ACCEPTED both outcomes — the non-empty
+arm asserted only that the span started past the cursor, with the comment
+"the replica's own contiguity check catches this one". It does catch it, after
+admission, which is the whole bug. A test that permits both branches of a
+question is not testing the question.
+
+### Fix
+
+`updates_since_budgeted` now captures the RAW `first_seq` of the first batch
+before `first_seq.max(last_applied + 1)` clamps it, and returns `WalGap` when
+that start is past `last_applied + 1`. Admission refuses, `warm` stays false,
+and the boot falls through to rewind-or-re-seed — the branch BUG-0015 intended.
+
+The clamp has to be read around rather than through: it deliberately hides a
+batch that BEGINS below the floor, which is legitimate at the cursor boundary.
+
+### Verified by removing the fix
+
+The tightened test now REQUIRES a `WalGap` from admission. With the fix
+removed it fails with the playground's exact shape:
+
+    a cursor outside the retained WAL must be a WalGap at ADMISSION ...:
+    Ok([ReplBatch { first_seq: 9, last_seq: 9, ... }, ...])
+
+cursor stranded at 4, oldest retained batch at 9, returned as OK. 133 storage
+tests pass with the fix in place.
+
+**One thing this does not settle**: whether the clear-on-probe should also be
+deferred until a sync completes. It should — a prediction that fails must not
+consume the marker — but with admission now refusing, the loop cannot form,
+so that change is defence in depth rather than the fix, and is best made with
+its own test.
+
+## Root cause as originally filed
 
 The clear is unconditional and happens too early. `NEEDS_RESEED` is a
 REQUEST for a full sync; clearing it on start turns it into a record that a
