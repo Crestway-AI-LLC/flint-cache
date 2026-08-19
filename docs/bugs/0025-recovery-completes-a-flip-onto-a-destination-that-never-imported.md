@@ -92,6 +92,29 @@ proves works is not enabled anywhere real. A drill that green-lights a
 capability the product never turns on is a claim about code, not about the
 system.
 
+## Reachability narrowed by BUG-0024's fix (2026-08-19), not removed
+
+The dangerous state is "source `Migrating`, destination holds no `Importing`".
+Since `35aea11` the destination unfreezes the source it froze, via
+`FLINTSLOTABORT`, as part of `rollback()`. That closes the ordinary route into
+this state. What remains:
+
+| route | status after 35aea11 |
+|---|---|
+| `rollback()` after the freeze | now calls `FLINTSLOTABORT`; reaches this state only if that call **fails** (logged, not silent) |
+| crash mid-cutover | never reached it — the destination's `Importing` is durable, so a crash preserves it and the reconcile takes the **resume** branch |
+| data-ship-only `FLINTMIGRATEIN` (no self-addr) | **unchanged** — it never writes `Importing` at all, so a source frozen against such a destination is indistinguishable from a half-done flip |
+
+The third row is the one to keep in view: it is how
+`slot_cutover_recovery_drill.sh` constructs its half-done-flip case, so the
+state is not hypothetical and is reachable by an operator sequence with no
+failure involved.
+
+**This does not close the bug.** The defect is that the reconcile decides an
+unrecoverable action — the source purges every row — from an inference, and the
+inference is still there. A narrower entrance to a trap is still a trap, and
+the entrance that remains is the one a drill walks through deliberately.
+
 ## Fix
 
 1. **Observe, do not infer.** Before completing a flip, ask the destination
