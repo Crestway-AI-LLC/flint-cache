@@ -30,6 +30,150 @@ fn key(i: u64) -> String {
 
 const END: &[u8] = b"END";
 
+/// What a direct GET on one member found.
+///
+/// Three-way on purpose. "Could not ask" and "asked, and it is not there"
+/// are the two states this probe exists to tell apart, and an `Option` that
+/// folded a transport error into `None` would report a dead node as a
+/// missing key — which is the very confusion the panic below is trying to
+/// resolve. BUG-0022 is the same mistake one layer down.
+enum Probe {
+    Present(usize),
+    Absent,
+    Unreachable(String),
+}
+
+impl std::fmt::Display for Probe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Probe::Present(n) => write!(f, "PRESENT ({n} bytes)"),
+            Probe::Absent => write!(f, "ABSENT"),
+            Probe::Unreachable(e) => write!(f, "UNREACHABLE ({e})"),
+        }
+    }
+}
+
+/// Ask one member directly for one key, bypassing whatever the walk resolved.
+fn probe_key(port: u16, k: &str) -> Probe {
+    let mut c = match Client::connect(port) {
+        Ok(c) => c,
+        Err(e) => return Probe::Unreachable(format!("connect: {e}")),
+    };
+    match c.call(&[b"GET", k.as_bytes()]) {
+        Ok(Value::Bulk(Some(v))) => Probe::Present(v.len()),
+        Ok(Value::Bulk(None)) => Probe::Absent,
+        Ok(other) => Probe::Unreachable(format!("unexpected reply: {other:?}")),
+        Err(e) => Probe::Unreachable(format!("call: {e}")),
+    }
+}
+
+/// One coherent FLINTINFO snapshot per node, rendered as a single line.
+///
+/// Deliberately ONE round trip rather than a field-at-a-time helper called
+/// six times: this fires while a promotion may still be settling, so six
+/// separate reads would be six different instants, and the resulting line
+/// could describe a state the node was never in.
+fn node_line(port: u16) -> String {
+    let info = match Client::connect(port).and_then(|mut c| c.call(&[b"FLINTINFO"])) {
+        Ok(Value::Bulk(Some(v))) => String::from_utf8_lossy(&v).into_owned(),
+        Ok(other) => return format!(":{port} FLINTINFO unreadable (unexpected reply: {other:?})"),
+        Err(e) => return format!(":{port} FLINTINFO unreadable ({e})"),
+    };
+    let f = |name: &str| -> String {
+        info.split(['\r', '\n'])
+            .find(|l| l.starts_with(name))
+            .map(|l| l.trim_start_matches(name).to_string())
+            .unwrap_or_else(|| "<absent>".into())
+    };
+    format!(
+        ":{port} role={} epoch={} latest_seq={} last_applied={} acked_seq={} seq_lag={} live_replicas={} dbsize={}",
+        f("role:"),
+        f("role_epoch:"),
+        f("latest_seq:"),
+        f("last_applied:"),
+        f("acked_seq:"),
+        f("seq_lag:"),
+        f("live_replicas:"),
+        dbsize(port)
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "<unreadable>".into()),
+    )
+}
+
+/// Prove the lost-link probe works, on a healthy cluster, before any kill.
+///
+/// The probe it checks fires on maybe 7% of gate runs (BUG-0014's measured
+/// rate for its sibling) and has never reproduced standalone. An instrument
+/// that rare cannot be left unexercised: a renamed FLINTINFO field or a
+/// wrong port would turn the one dump that matters into a page of
+/// `<absent>`, and nobody would learn that until the next firing — weeks
+/// later, from the log that was supposed to answer the question.
+///
+/// Negative control FIRST: `key0000000` is never written (the chain starts
+/// at 1), so a probe that reports it PRESENT is hallucinating and every
+/// later ABSENT is meaningless. Then the positive control: `key0000001` is
+/// always written, so a probe that reports it ABSENT cannot see keys at all
+/// and would blame the product for its own blindness.
+fn verify_probe(master: u16, replica: u16) {
+    let never = key(0);
+    match probe_key(master, &never) {
+        Probe::Absent => {}
+        other => panic!(
+            "probe self-check: {never} was never written, but the probe reports {other} on :{master} — the probe cannot be trusted to tell ABSENT from PRESENT, so this run's diagnostics are void"
+        ),
+    }
+    let always = key(1);
+    match probe_key(master, &always) {
+        Probe::Present(_) => {}
+        other => panic!(
+            "probe self-check: {always} was just built and verified replicated, but the probe reports {other} on :{master} — the probe cannot see keys that exist"
+        ),
+    }
+    for (label, port) in [("master", master), ("replica", replica)] {
+        let line = node_line(port);
+        if line.contains("<absent>") || line.contains("unreadable") {
+            panic!(
+                "probe self-check: FLINTINFO on the {label} did not yield the expected fields — a field was renamed and the lost-link dump would print nothing usable: {line}"
+            );
+        }
+    }
+    eprintln!(
+        "  [probe] self-check ok: ABSENT/PRESENT discriminated, FLINTINFO fields resolve on both members"
+    );
+}
+
+/// The dump BUG-0023 asks for, printed at the instant of a lost link.
+///
+/// The discriminating line is the direct GET on each member. It separates
+/// "never replicated" (absent everywhere) from "lost by the promoted node"
+/// (present on the other member, absent on the master) from "the walk was
+/// reading the wrong node" (present on the master the instant we ask it
+/// ourselves) — three causes that the bare panic text cannot tell apart,
+/// and which no amount of re-running distinguishes because this has never
+/// reproduced outside a full gate.
+fn diagnose_lost_link(cur: &str, master: u16, replica: u16, hops: u64, retries: u32) {
+    eprintln!("  [lost-link] key={cur} hop={hops} retries={retries}");
+    eprintln!("  [lost-link] master  {}", node_line(master));
+    eprintln!("  [lost-link] replica {}", node_line(replica));
+    let on_master = probe_key(master, cur);
+    let on_replica = probe_key(replica, cur);
+    eprintln!("  [lost-link] direct GET on master  :{master} -> {on_master}");
+    eprintln!("  [lost-link] direct GET on replica :{replica} -> {on_replica}");
+    let verdict = match (&on_master, &on_replica) {
+        (Probe::Present(_), _) => {
+            "READ PATH — the key IS on the master when asked directly, so the walk's reads went elsewhere"
+        }
+        (Probe::Absent, Probe::Present(_)) => {
+            "PROMOTION LOSS — replicated to the other member but missing on the promoted master"
+        }
+        (Probe::Absent, Probe::Absent) => {
+            "NEVER LANDED — absent on both members, so it was lost at or before the build/replication"
+        }
+        _ => "UNDETERMINED — a member could not be asked; see the UNREACHABLE line above",
+    };
+    eprintln!("  [lost-link] verdict: {verdict}");
+}
+
 /// Send one build batch, retrying transport errors instead of dying on them.
 ///
 /// EAGAIN here is the client's 1500ms read timeout firing while a loaded box
@@ -113,6 +257,7 @@ fn main() {
         dbsize(cluster.master()),
         dbsize(cluster.replica())
     );
+    verify_probe(cluster.master(), cluster.replica());
 
     // --- Traverse phase: follow pointers, killing at random intervals.
     // Schedule kills at distinct random hop positions across the walk.
@@ -189,6 +334,13 @@ fn main() {
                     // Nil: could be a transient window right at a promotion.
                     // Reconnect to the (possibly new) master and retry.
                     if std::time::Instant::now() >= deadline {
+                        diagnose_lost_link(
+                            &cur,
+                            cluster.master(),
+                            cluster.replica(),
+                            hops,
+                            retries,
+                        );
                         panic!(
                             "BROKEN CHAIN at {cur} (hop {hops}): still nil after {retries} retries over 3s on master :{} — a truly lost link",
                             cluster.master()

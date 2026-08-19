@@ -83,13 +83,62 @@ lines). It survived only because it was copied out by hand: per BUG-0021 the
 gate writes one log per STEP, so the next run would have overwritten it — and
 the natural response to an intermittent failure is to re-run.
 
-## Next step
+## Next step — the probe is landed and verified (2026-08-19)
 
-Do **not** chase this with more solo runs; five say what they are going to say.
-The probe has to ride along on a real gate. What that dump needs to print at
-the moment of failure: the resolved master, the epoch, `last_applied` on both
-members, and whether key0013595 exists on the OTHER member — which separates
-"never replicated" from "lost by the promoted node" in one line.
+`crates/flint-chaos/src/bin/chain.rs` now dumps, at the instant the walk gives
+up on a link, exactly what this section asked for:
+
+    [lost-link] key=key0013595 hop=13594 retries=55
+    [lost-link] master  :6331 role=master epoch=(0,2) latest_seq=... last_applied=... acked_seq=... seq_lag=... live_replicas=... dbsize=...
+    [lost-link] replica :6330 role=replica epoch=(0,2) ...
+    [lost-link] direct GET on master  :6331 -> ABSENT
+    [lost-link] direct GET on replica :6330 -> PRESENT (10 bytes)
+    [lost-link] verdict: PROMOTION LOSS — replicated to the other member but missing on the promoted master
+
+The direct GET on each member is the discriminator. It separates three causes
+the bare panic cannot:
+
+| master | other member | verdict |
+|---|---|---|
+| PRESENT | any | **READ PATH** — the walk's reads were going somewhere else |
+| ABSENT | PRESENT | **PROMOTION LOSS** — replicated, then lost by the promoted node |
+| ABSENT | ABSENT | **NEVER LANDED** — lost at or before build/replication |
+
+The first row is not in this file's original request, and it is there because
+of BUG-0014: that bug's sharpest constraint is that iteration 1 has *never*
+failed, so its assertion only ever fires on the operation that **follows a
+harness promotion**. A stale-master resolution is therefore a live hypothesis
+for both, and a dump that could not distinguish it would have handed back an
+answer to half the question.
+
+Every outcome is three-way — `PRESENT` / `ABSENT` / `UNREACHABLE`. A member
+that cannot be reached must not render as a missing key, or the dump commits
+the same error it exists to diagnose.
+
+### The probe checks itself on every run
+
+A dump that fires on ~7% of gate runs and has never reproduced standalone
+cannot be left unexercised — a renamed FLINTINFO field would turn the one log
+that matters into a page of `<absent>`, discovered weeks later. So before any
+kill, on the healthy just-built cluster, `verify_probe` runs:
+
+- **negative control first**: `key0000000` is never written (the chain starts
+  at 1), so if the probe calls it PRESENT it is hallucinating and every later
+  ABSENT is worthless;
+- **then the positive control**: `key0000001` always exists, so if the probe
+  calls it ABSENT it cannot see keys at all and would blame the product for
+  its own blindness;
+- **then both members' FLINTINFO** must yield all seven fields, or the run
+  aborts saying the dump would print nothing usable.
+
+It prints `[probe] self-check ok: ...` on success rather than staying silent,
+because a self-check that only speaks on failure is indistinguishable from one
+that never ran — which is how the first verification of this probe was caught
+reading a stale binary that predated it.
+
+Verified on a live pair: both verdict arms render, all seven fields resolve on
+master and replica, and the self-check passes. What remains is for a real gate
+to fire it.
 
 ## Related
 
