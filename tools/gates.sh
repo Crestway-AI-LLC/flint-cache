@@ -131,13 +131,19 @@ _gate_prune_runs() {
   done
 }
 
-# A gate is 25 minutes of work and a sibling project's test sweep is a few.
-# Refusing a drill outright throws the whole run away over a collision that
-# would have cleared on its own, so drills QUEUE by default here: fleet_guard
-# waits this long for a sibling to finish before it gives up. Standalone
-# drills keep the old behaviour (no wait) — this is the gate's choice, not
-# the library's default. See BUG-0036.
-export FLINT_DRILL_WAIT="${FLINT_DRILL_WAIT:-900}"
+# Refusing a drill outright throws a 25-minute run away over a collision that
+# would have cleared on its own, so drills QUEUE here rather than fail:
+# fleet_guard waits this long for a sibling's build to finish. Standalone
+# drills keep the old behaviour (no wait) — the gate's choice, not the
+# library's default. See BUG-0036.
+#
+# THE BUDGET IS PER DRILL, WHICH IS WHY IT IS SMALL. There are ~117 steps, so
+# a generous per-drill budget multiplies: 900s each would let one long sibling
+# sweep stall a gate for hours while every step waits its turn and times out
+# in sequence. Two minutes absorbs the gap between cargo test binaries — the
+# thing that actually interrupts a run — and a sweep longer than that is worth
+# a human deciding to wait for, not 117 drills each discovering it alone.
+export FLINT_DRILL_WAIT="${FLINT_DRILL_WAIT:-120}"
 
 LOGS_ROOT="${FLINT_GATE_LOGS:-${FLINT_DRILL_ROOT:-/tmp}/flint-gates}"
 mkdir -p "$LOGS_ROOT"

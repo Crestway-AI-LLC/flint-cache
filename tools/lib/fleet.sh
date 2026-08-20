@@ -149,6 +149,31 @@ fleet_init() {
 # flint-controlplane) or flintctl. If this repo ever ships a two-segment
 # binary, exclude it here — otherwise the guard will start calling our own
 # processes a sibling project's and refuse to run at all.
+# TWO KINDS OF SIBLING, and they do not deserve the same answer.
+#
+#   NAMED (flint-kv-server, flint-kv-chaos): a sibling FLEET. Those are
+#   servers -- idle this second and saturating the box the next, because that
+#   is what a fleet under a drill does. Presence is the signal; refuse.
+#
+#   BUILD/TEST (.../flint-kv/debug/deps/ttl-ccba…): cargo artifacts. A long
+#   -running one at 0.04 cores is background noise, and refusing on its
+#   presence blocks the gate indefinitely for nothing.
+#
+# Getting this wrong in the permissive direction is what fleet_guard_drill
+# caught: measuring contention for BOTH collapsed the fleet contract, which
+# that drill has asserted since it was written, into "is it busy right now".
+# A sleeping fake fleet is not busy right now and never was the question.
+_fleet_sibling_named() {
+  ps -eo pid=,args= 2>/dev/null | awk '
+    {
+      n = split($2, parts, "/")
+      exe = parts[n]
+      if (exe ~ /^flint-(server|proxy|controlplane|controller|agent|console|ops|register|exporter|meter|chaos|bench|conformance|balance)$/) next
+      if (exe !~ /^flint-[a-z0-9]+-[a-z0-9-]+$/) next
+      print
+    }'
+}
+
 _fleet_sibling() {
   ps -eo pid=,args= 2>/dev/null | awk '
     {
@@ -468,11 +493,11 @@ fleet_guard() {
     echo "  (FLINT_DRILL_FORCE=1: proceeding despite $n other flint process(es))"
     return 0
   fi
-  # A sibling alone is resolved by MEASUREMENT (and possibly by waiting)
-  # before any refusal: presence is not contention. `foreign` is different --
-  # those are OUR binaries, which fleet_kill can and would signal — so that
-  # path still refuses on sight.
-  if [ -n "$sibling" ] && [ -z "$foreign" ]; then
+  # A sibling project's FLEET refuses on sight, as it always has. Only its
+  # build/test artifacts are resolved by measurement and waiting, because
+  # presence of a cargo binary is not contention. `foreign` is different
+  # again -- those are OUR binaries, which fleet_kill would signal.
+  if [ -n "$sibling" ] && [ -z "$foreign" ] && [ -z "$(_fleet_sibling_named)" ]; then
     _fleet_sibling_settle && return 0
   fi
   if [ -n "$foreign" ]; then

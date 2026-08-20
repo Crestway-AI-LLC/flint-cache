@@ -52,10 +52,26 @@ unset FLINT_DRILL_FORCE
 fleet_init $FLINT_DRILL_ROOT/flint-guard-drill 6999 6378 6379 6380 6381 6382 6383 6384 6385
 
 echo "== A) a quiet box: the guard must let the drill run"
-OUT=$(fleet_guard 2>&1); RC=$?
-[ "$RC" = 0 ] \
-  || { echo "FAIL: guard refused on a quiet box (exit $RC)"; echo "$OUT"; exit 1; }
-echo "  no refusal, as expected"
+# THIS CASE NEEDS A QUIET BOX AND CANNOT CREATE ONE. Another project's build
+# or another session's fleet is not ours to stop, and when one is up the
+# guard is RIGHT to refuse — failing here would report a correct refusal as a
+# defect, and the fix someone reaches for is to weaken the guard.
+#
+# So say NOT EXERCISED and name what blocked it. A case that cannot reach its
+# own precondition must not report a verdict about the thing it never tested;
+# a precondition that quietly stops holding is how a check passes forever.
+PRE_SIB=$(_fleet_sibling); PRE_FOR=$(_fleet_foreign)
+if [ -n "$PRE_SIB" ] || [ -n "$PRE_FOR" ]; then
+  echo "  n/a — the box is NOT quiet, so this case did not run:"
+  [ -n "$PRE_SIB" ] && printf '%s\n' "$PRE_SIB" | cut -c1-90 | sed 's/^/      sibling: /'
+  [ -n "$PRE_FOR" ] && printf '%s\n' "$PRE_FOR" | cut -c1-90 | sed 's/^/      foreign: /'
+  A_SKIPPED=1
+else
+  OUT=$(fleet_guard 2>&1); RC=$?
+  [ "$RC" = 0 ] \
+    || { echo "FAIL: guard refused on a quiet box (exit $RC)"; echo "$OUT"; exit 1; }
+  echo "  no refusal, as expected"
+fi
 
 echo "== B) a SIBLING project's fleet is up: the guard must refuse"
 spawn_as flint-kv-server
@@ -88,8 +104,18 @@ for n in flint-server flint-proxy flint-controlplane flint-controller \
 done
 sleep 1
 SIB=$(_fleet_sibling)
-[ -z "$SIB" ] \
-  || { echo "FAIL: our own binaries were classified as another project's:"; echo "$SIB" | sed 's/^/    /'; exit 1; }
+# SCOPED TO OUR OWN FAKES, not to the whole box.
+#
+# This asserted `_fleet_sibling` was EMPTY, which quietly assumed no real
+# sibling project was running here. That held only while the detector could
+# not see one. Once BUG-0036 taught it to match a sibling's cargo target
+# path, a genuine flint-kv test binary on the box failed this case — and the
+# message blamed OUR binaries and printed a line that was not one of them,
+# asserting a cause it had never checked. The question this case asks is
+# whether OUR fourteen are misread; answer exactly that.
+MINE=$(for p in $PIDS; do printf '%s\n' "$SIB" | awk -v p="$p" '$1 == p'; done)
+[ -z "$MINE" ] \
+  || { echo "FAIL: our own binaries were classified as another project's:"; echo "$MINE" | sed 's/^/    /'; exit 1; }
 echo "  all 14 of our own binaries classified correctly"
 
 echo "== D) ...but they are still caught as FOREIGN when out of scope"
@@ -108,3 +134,6 @@ OUT=$(FLINT_DRILL_FORCE=1 fleet_guard 2>&1); RC=$?
 echo "  force proceeds"
 
 echo "PASS: fleet_guard sees sibling projects' fleets, refuses without claiming ownership, does not misread our own binaries, and still honours FORCE"
+
+[ "${A_SKIPPED:-0}" = "1" ] \
+  && echo "NOTE: case A (quiet box) was NOT exercised on this run — see above"
