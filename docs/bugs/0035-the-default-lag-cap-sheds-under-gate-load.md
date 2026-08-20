@@ -1,4 +1,4 @@
-# BUG-0035: the default lag cap sheds under gate load, and `repl` reports it as a replication failure (OPEN)
+# BUG-0035: the default lag cap sheds under gate load, and two drills misreport it (drills FIXED; the shed itself OPEN)
 
 Status: OPEN 2026-08-20 · Severity: medium — one half is a documented claim
 with a counter-example, the other is a drill that reports a verdict for
@@ -163,19 +163,55 @@ kind of evidence to misread in both directions — as a product bug, or as
 "just my load" when a real one is hiding underneath. The discriminator was a
 timestamp, and it was available the whole time in the gate log directory name.
 
-## Why this is not being fixed by raising the drill's caps yet
+## The drills are fixed; the shed is not
 
-`--lag-soft-ms` and `--lag-hard-ms` are read by `flint-server`
-(`main.rs:1211,1214`), so `repl_drill` could pass caps high enough that a
-50k-key firehose never sheds, and its FAIL would then mean what it claims.
-That is probably the right fix for half two.
+Not by raising the caps. `-THROTTLED` means the write was NEVER ACKED, so a
+key absent because of it is correctly absent, and the fix is for the drills to
+say so rather than to stop the master saying it.
 
-It is deliberately not applied in the same change that discovered half one.
-Raising the cap makes the phenomenon unobservable, and the phenomenon is
-currently a single observation contradicting two written claims. The order is:
-reproduce it, or fail to reproduce it a stated number of times, THEN make the
-drill deterministic. Fixing it first would leave the contradiction in
-`slo.md` with nothing left that could ever surface it again.
+`tools/lib/fleet.sh` gained three helpers:
+
+- `fleet_load_resp` pipes the load, PRINTS what was shed, and does not fail on
+  shed alone. It does fail when the load delivered nothing at all, because
+  "nothing was written" and "everything was refused" must not look alike.
+- `fleet_retry_write` retries one write past `-THROTTLED`.
+- `fleet_ensure_keys` repairs, one write at a time, exactly the keys a drill
+  asserts on. Everything else the load shed stays absent on purpose.
+
+**A wrong fix, measured, before the right one.** The first version replayed the
+whole stream until nothing shed. Against a 5 ms cap the attempts shed 19388,
+19469, 19667, 19413 and 19337 of 20000 and it gave up: the replay is itself a
+firehose and recreates the lag that caused the shed. A retry whose load
+profile equals the load that failed is not a retry. Single writes converge
+because they let the replica drain between them.
+
+## Verification, both directions, both drills
+
+| drill | condition | shed | result |
+|---|---|---|---|
+| `repl` | ordinary load | 0 of 50500 | PASS |
+| `repl` | master forced to `--lag-hard-ms 5` | **49229 of 50500** | PASS, every assertion reached |
+| `controller` | ordinary load | 2428 of 20000 | PASS |
+
+The `controller` row is the one that matters: 2428 writes shed on a quiet box
+in an ordinary standalone run, and the OLD drill would have printed
+`FAIL: tail lost` for it. That is this product's most serious claim —
+acked-write loss across a failover — being asserted from evidence that the
+master had openly refused the write. The positive control was not induced; it
+arrived on its own, which is also a third independent sighting of the shed.
+
+## What is still open
+
+The drills no longer lie about it, and that is all that changed. The shipped
+1000 ms cap is still being reached by ordinary load on loopback, which
+`lag_cap_drill.sh`'s header and `slo.md`'s no-stall row both say cannot
+happen. Sightings so far: gate 21 `repl` (20328), gate 23 `repl` (19932),
+gate 23 `controller` (356), and a standalone `controller` (2428).
+
+`slo.md`'s table needs correcting once the trigger is understood — not before,
+because "0 shed with no stall" is currently the only written statement that
+this contradicts, and replacing it with a vaguer sentence would lose the
+contradiction rather than resolve it.
 
 ## Note
 

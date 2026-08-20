@@ -36,7 +36,13 @@ fleet_wait_listen "$RPORT"
 sleep 0.6
 
 echo "== loading $KEYS strings + 500 hashes into the master"
-{
+# Loaded through fleet_load_resp, which replays whatever the master sheds.
+# The previous form piped once under `set -euo pipefail`; valkey-cli --pipe
+# exits non-zero when it counts errors, so a single -THROTTLED aborted the
+# run HERE and the EXIT trap killed both seats. The drill then reported
+# "FAIL repl" for parity, full sync, roles, idle liveness, READONLY, live
+# tail and survivor reads — none of which it had reached (BUG-0035).
+_repl_load_gen() {
   awk -v n="$KEYS" 'BEGIN {
     for (i = 0; i < n; i++) {
       k = sprintf("key:%07d", i); v = sprintf("value-%07d", i)
@@ -49,7 +55,19 @@ echo "== loading $KEYS strings + 500 hashes into the master"
       printf "*4\r\n$4\r\nHSET\r\n$%d\r\n%s\r\n$2\r\nf1\r\n$%d\r\n%s\r\n", length(k), k, length(v), v
     }
   }'
-} | valkey-cli -p "$MPORT" --pipe | tail -1
+}
+fleet_load_resp "$MPORT" _repl_load_gen || exit 1
+# Repair exactly what the parity checks below sample. Anything else the load
+# shed stays absent on purpose: it was never acked, and the drill asserts
+# nothing about it.
+_P0="key:$(printf '%07d' 0)"
+_PM="key:$(printf '%07d' $((KEYS / 2)))"
+_PL="key:$(printf '%07d' $((KEYS - 1)))"
+fleet_ensure_keys "$MPORT" \
+  "$_P0=value-$(printf '%07d' 0)" \
+  "$_PM=value-$(printf '%07d' $((KEYS / 2)))" \
+  "$_PL=value-$(printf '%07d' $((KEYS - 1)))" || exit 1
+fleet_retry_write "$MPORT" HSET hash:0250 f1 v250 || exit 1
 
 echo "== waiting for replica catch-up"
 for i in $(seq 1 100); do

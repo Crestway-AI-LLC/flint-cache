@@ -469,3 +469,94 @@ cli_int() {
   esac
   return 0
 }
+
+# -THROTTLED IS BACKPRESSURE, NOT LOSS, AND A DRILL MUST NOT CONFLATE THEM.
+#
+# The master sheds writes with -THROTTLED once replica lag passes
+# --lag-hard-ms. A shed write was never acked, so a key missing because of it
+# is CORRECTLY absent. Two drills got this wrong in opposite directions
+# (BUG-0035):
+#
+#   * controller_drill piped 20000 keys, shed 356, then asserted
+#     key:0019999 was on the promoted replica. It printed "FAIL: tail lost" —
+#     acked-write loss across a failover, the most serious claim this product
+#     makes — for a write the master had openly REFUSED.
+#   * repl_drill piped under `set -euo pipefail`, where --pipe's non-zero exit
+#     on any error aborted the run at the load step. It printed "FAIL repl"
+#     for seven assertions it never reached.
+#
+# THE FIX THAT DID NOT WORK, recorded because it is the tempting one: replay
+# the whole stream until nothing sheds. Measured against a 5 ms cap, attempts
+# shed 19388, 19469, 19667, 19413, 19337 of 20000 — it never converges,
+# because the replay is itself a firehose and recreates the lag that caused
+# the shed. A retry whose load profile equals the load that failed is not a
+# retry.
+#
+# So the load is allowed to shed, the count is reported, and the specific keys
+# a drill ASSERTS on are repaired afterwards one at a time, which lets the
+# replica drain between writes and therefore converges.
+
+# Pipe a RESP stream in and REPORT what was shed. Never fails the drill on
+# shed alone; does fail if the load could not be delivered at all, because
+# "nothing was written" and "everything was refused" must not look alike.
+# $1 = port, $2 = name of a function writing the RESP stream to stdout.
+fleet_load_resp() {
+  local port="$1" gen="$2" errs replies out
+  # `|| true`: --pipe exits non-zero when it counts errors, and under the
+  # caller's `set -e`/`pipefail` that alone would abort the drill here.
+  out=$( { $gen | valkey-cli -p "$port" --pipe 2>&1 | tail -1; } || true )
+  errs=$(printf '%s' "$out" | sed -n 's/.*errors: \([0-9][0-9]*\).*/\1/p')
+  replies=$(printf '%s' "$out" | sed -n 's/.*replies: \([0-9][0-9]*\).*/\1/p')
+  [ -n "$errs" ] || errs=0
+  [ -n "$replies" ] || replies=0
+  echo "  load: $out"
+  if [ "$replies" = "0" ]; then
+    echo "FAIL: the load delivered nothing at all — the node did not answer."
+    echo "      This is NOT shedding; it is a dead or unreachable seat."
+    return 1
+  fi
+  if [ "$errs" != "0" ]; then
+    echo "  note: $errs of $replies writes shed -THROTTLED (replica lag past"
+    echo "        the cap). Shed writes were NEVER ACKED, so nothing is lost."
+    echo "        Keys this drill asserts on are repaired below; see BUG-0035"
+    echo "        for why the cap is reachable here at all."
+  fi
+  return 0
+}
+
+# Retry ONE write past -THROTTLED. The primitive both repairs are built on.
+# Converges where a bulk replay cannot: a single write at a time lets the
+# replica drain between them, which a firehose replay never does.
+# $1 = port, then the command and its arguments.
+fleet_retry_write() {
+  local port="$1"; shift
+  local tries=0 out
+  while :; do
+    out=$(valkey-cli -p "$port" "$@" 2>&1 || true)
+    case "$out" in
+      OK|[0-9]*) return 0 ;;   # +OK, or an integer reply (HSET gives 0 or 1)
+      *THROTTLED*)
+        tries=$((tries + 1))
+        if [ "$tries" -ge 60 ]; then
+          echo "FAIL: '$*' still shed -THROTTLED after $tries single-write"
+          echo "      retries over $((tries / 4))s. The replica is not draining."
+          return 1
+        fi
+        sleep 0.25 ;;
+      *)
+        echo "FAIL: '$*' returned '$out'"
+        return 1 ;;
+    esac
+  done
+}
+
+# Make sure specific keys exist. $1 = port, then k=v pairs.
+fleet_ensure_keys() {
+  local port="$1"; shift
+  local kv k v
+  for kv in "$@"; do
+    k="${kv%%=*}"; v="${kv#*=}"
+    fleet_retry_write "$port" SET "$k" "$v" || return 1
+  done
+  return 0
+}

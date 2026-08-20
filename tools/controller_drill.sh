@@ -28,8 +28,20 @@ fleet_wait_listen $RPORT
 sleep 0.9
 
 echo "== loading 20000 keys"
-awk 'BEGIN{for(i=0;i<20000;i++){k=sprintf("key:%07d",i);v=sprintf("value-%07d",i);printf "*3\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n",length(k),k,length(v),v}}' \
-  | valkey-cli -p $MPORT --pipe | tail -1
+# Loaded through fleet_load_resp, which replays anything the master sheds.
+# Piping once and then asserting on key:0019999 made this drill print
+# "FAIL: tail lost" for a write the master had openly REFUSED — reporting
+# acked-write loss across a failover for a write that was never acked
+# (BUG-0035). The tail assertion below is only meaningful once the load is
+# known complete.
+_ctl_load_gen() {
+  awk 'BEGIN{for(i=0;i<20000;i++){k=sprintf("key:%07d",i);v=sprintf("value-%07d",i);printf "*3\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n",length(k),k,length(v),v}}'
+}
+fleet_load_resp "$MPORT" _ctl_load_gen || exit 1
+# The head and tail this drill asserts on must exist before the assertion
+# means anything. Repaired individually so a shed write cannot masquerade as
+# failover data loss.
+fleet_ensure_keys "$MPORT" "key:0000000=value-0000000" "key:0019999=value-0019999" || exit 1
 
 echo "== starting controller"
 ./target/release/flint-controller --nodes 127.0.0.1:$MPORT,127.0.0.1:$RPORT --id ctl \
