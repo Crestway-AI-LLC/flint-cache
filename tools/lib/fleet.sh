@@ -155,7 +155,25 @@ _fleet_sibling() {
       n = split($2, parts, "/")
       exe = parts[n]
       if (exe ~ /^flint-(server|proxy|controlplane|controller|agent|console|ops|register|exporter|meter|chaos|bench|conformance|balance)$/) next
-      if (exe !~ /^flint-[a-z0-9]+-[a-z0-9-]+$/) next
+      sib = 0
+      # By NAME: sibling components are flint-<project>-<component>.
+      if (exe ~ /^flint-[a-z0-9]+-[a-z0-9-]+$/) sib = 1
+      # By PATH, because the name rule only holds for a sibling projects
+      # SHIPPED binaries. Its tests and helpers are named whatever cargo
+      # calls them -- cold-modify, ttl-ccbacfe2d0cd3f35 -- and those are
+      # exactly the processes a test run puts on the box. What they DO
+      # carry is the project cargo target dir.
+      #   .../flint-kv/release/cold-modify
+      #   .../flint-kv/debug/deps/ttl-ccbacfe2d0cd3f35
+      # Ours never match: this workspace builds to .../target/release/,
+      # and "target" is not flint-<project>. Nor is a bare "flint", so a
+      # sibling checkout of THIS project is left to _fleet_foreign.
+      if (n >= 3 && (parts[n-1] == "release" || parts[n-1] == "debug") \
+          && parts[n-2] ~ /^flint-[a-z0-9]+$/) sib = 1
+      if (n >= 4 && parts[n-1] == "deps" \
+          && (parts[n-2] == "release" || parts[n-2] == "debug") \
+          && parts[n-3] ~ /^flint-[a-z0-9]+$/) sib = 1
+      if (!sib) next
       print
     }'
 }
