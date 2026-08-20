@@ -70,11 +70,31 @@ fleet_ensure_keys "$MPORT" \
 fleet_retry_write "$MPORT" HSET hash:0250 f1 v250 || exit 1
 
 echo "== waiting for replica catch-up"
-for i in $(seq 1 100); do
-  SAMPLE=$(valkey-cli -p "$RPORT" GET "key:$(printf '%07d' $((KEYS - 1)))" 2>/dev/null || true)
-  [ "$SAMPLE" = "value-$(printf '%07d' $((KEYS - 1)))" ] && break
+# WAIT ON A SENTINEL WRITTEN LAST, not on the last STRING key.
+#
+# The probe used to be key:<KEYS-1>, which is written before the 500 hashes
+# and before the repairs above. Replication is ordered, so seeing that key
+# proves only that the stream reached THAT point -- the hashes were still in
+# flight, and the parity check below reads one. On an idle box they landed
+# inside the sampling interval and it passed for months; under a loaded box it
+# fails as "hash mismatch ('v250' vs '')", which reads as replication losing
+# a write rather than as the drill asking the wrong question.
+#
+# A sentinel written after everything else makes the readiness check cover
+# exactly what the assertions read: ordered delivery means its arrival implies
+# all of it.
+fleet_retry_write "$MPORT" SET repl-drill-sentinel ready || exit 1
+CAUGHT_UP=0
+for i in $(seq 1 200); do
+  SAMPLE=$(valkey-cli -p "$RPORT" GET repl-drill-sentinel 2>/dev/null || true)
+  [ "$SAMPLE" = "ready" ] && { CAUGHT_UP=1; break; }
   sleep 0.1
 done
+[ "$CAUGHT_UP" = "1" ] || {
+  echo "FAIL: replica never reached the sentinel in 20s — it is not caught up,"
+  echo "      so every parity result below would be about timing, not parity."
+  exit 1
+}
 
 echo "== parity samples"
 for probe in 0 $((KEYS / 2)) $((KEYS - 1)); do
