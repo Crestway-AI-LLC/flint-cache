@@ -30,8 +30,8 @@ fleet_cp 7840 CPADDPROXY 127.0.0.1:7995
 fleet_cp 7840 CPADDPAIR 127.0.0.1:7101
 fleet_cp 7840 CPADDPAIR 127.0.0.1:7102
 fleet_cp 7840 CPADDTENANT acme tok-acme acme 1
-$B --port 7101 --engine rocks --data-dir "$D/a" --advertise 127.0.0.1:7101 2>/dev/null &
-$B --port 7102 --engine rocks --data-dir "$D/b" --advertise 127.0.0.1:7102 2>/dev/null &
+$B --port 7101 --engine rocks --data-dir "$D/a" 2>/dev/null &
+$B --port 7102 --engine rocks --data-dir "$D/b" 2>/dev/null &
 $PX --port 7995 --control-plane 127.0.0.1:7840 --advertise 127.0.0.1:7995 2>/dev/null &
 fleet_wait_listen 7101 7102 7995
 sleep 1.5

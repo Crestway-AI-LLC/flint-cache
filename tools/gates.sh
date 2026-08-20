@@ -521,6 +521,74 @@ assert_no_scope_overlap() {
   FAILED="$FAILED scope-overlap"
 }
 
+# AN ARGUMENT LIST HAS TWO ENDS. flint-server has no parser: it scans
+# env::args() once per flag it cares about, so ANY other token is ignored in
+# silence. That is how `--help` came to start a node on the default port and
+# `--version` hung a box with a 30-minute TTL (docs/bugs/0034).
+#
+# The tempting fix is to refuse unrecognised arguments. It was written, and it
+# hung the gate twice: slot_map and restore_ns each start a seat with
+# `--advertise`, a PROXY flag flint-server has never read, so a silent no-op
+# became exit 2 and a drill waited forever for a seat that would never bind.
+# The accepted set had been enumerated from the CALLEE, correctly and
+# exhaustively — and that proves nothing about what the CALLERS send.
+#
+# So this asserts the property instead of assuming it: every flag a drill hands
+# flint-server must be one flint-server reads. Keep that true and rejection
+# becomes safe BY CONSTRUCTION rather than by an enumeration someone has to
+# re-run whenever a flag is added.
+#
+# ON THE ANCHOR, because the discarded method is the part worth copying:
+# matching the literal `flint-server` finds nine false positives from
+# `cargo build --bin flint-server` lines and MISSES the real ones, because
+# drills spawn through `$B`. `--data-dir` is the anchor that works — no cargo
+# line and no AWS call carries one — and it is paired with the binary variable
+# so a flint-backup line cannot drift in later.
+assert_server_flags_are_read() {
+  local read_flags passed bad f
+  # CALLEE: arg("--x") plus the flags compared directly before the listener.
+  read_flags=$( {
+      grep -oE 'arg\("--[a-z0-9-]+"\)' crates/flint-server/src/main.rs \
+        | sed 's/arg("//; s/")//'
+      grep -oE 'a == "--?[a-zA-Z0-9-]+"' crates/flint-server/src/main.rs \
+        | sed 's/a == "//; s/"//'
+    } | sort -u )
+  if [ -z "$read_flags" ]; then
+    echo "FAIL  could not read flint-server's accepted flags — this check cannot answer"
+    FAILED="$FAILED server-flags"
+    return 0
+  fi
+  # CALLERS: shell lines that spawn a flint-server, doubly anchored.
+  passed=$( grep -hE '(\$B|\$BIN|/flint-server)' tools/*_drill.sh tools/lib/*.sh 2>/dev/null \
+    | grep -- '--data-dir' \
+    | grep -oE ' --[a-z0-9-]+' | tr -d ' ' | sort -u )
+  # Symmetric to the read_flags guard. If the anchor stops matching — the glob
+  # moves, a drill renames $B — `passed` empties, `bad` empties with it, and the
+  # check reports success having examined nothing. Empty is not clean here: the
+  # drills always spawn a server with at least --port and --data-dir.
+  if [ -z "$passed" ]; then
+    echo "FAIL  found no flint-server spawn lines in tools/ — this check cannot answer"
+    FAILED="$FAILED server-flags"
+    return 0
+  fi
+  bad=$( comm -23 <(printf '%s\n' "$passed") <(printf '%s\n' "$read_flags") )
+  [ -z "$bad" ] && return 0
+  echo "FAIL  a drill passes flint-server a flag it does not read:"
+  # Blame the LINE, not the file. A first version listed every file containing
+  # the flag anywhere, which named eighteen drills for one offender because
+  # `--advertise` is legitimate on proxy spawns in most of them. A check that
+  # fires correctly and accuses the wrong file is the leak-attribution bug
+  # again, and it wastes exactly the time it was meant to save.
+  for f in $bad; do
+    grep -nE '(\$B|\$BIN|/flint-server)' tools/*_drill.sh tools/lib/*.sh 2>/dev/null \
+      | grep -- '--data-dir' | grep -- " $f" \
+      | cut -d: -f1,2 | sed "s/^/        $f at /"
+  done
+  echo "        flint-server IGNORES these, so they do nothing today — and they are"
+  echo "        exactly what makes refusing unknown arguments unsafe. Delete them."
+  FAILED="$FAILED server-flags"
+}
+
 # A drill that STARTS seats but never calls fleet_init declares nothing to
 # assert_no_port_overlap above — which then passes because it had nothing to
 # check, the same defect one level up. restart_drill.sh sat in that blind spot
@@ -609,6 +677,7 @@ if want check; then
   assert_no_default_ports
   assert_no_port_overlap
   assert_no_scope_overlap
+  assert_server_flags_are_read
   assert_spawning_drills_declare_ports
   assert_recovery_stays_off_until_it_observes
   assert_lease_ttl_single_source

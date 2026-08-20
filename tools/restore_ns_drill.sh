@@ -54,9 +54,9 @@ cp_must CPADDPAIR 127.0.0.1:7112
 cp_must CPADDTENANT acme tok-acme acme 1
 cp_must CPADDTENANT beta tok-beta beta 1
 [ -f "$D/cp" ] || { echo "FAIL: CP state file absent after five committed registrations"; exit 1; }
-$B --port 7111 --engine rocks --data-dir "$D/a" --advertise 127.0.0.1:7111 2>"$D/a.log" &
+$B --port 7111 --engine rocks --data-dir "$D/a" 2>"$D/a.log" &
 disown
-$B --port 7112 --engine rocks --data-dir "$D/b" --advertise 127.0.0.1:7112 2>"$D/b.log" &
+$B --port 7112 --engine rocks --data-dir "$D/b" 2>"$D/b.log" &
 disown
 $PX --port 6315 --control-plane 127.0.0.1:7841 --advertise 127.0.0.1:6315 2>"$D/px.log" &
 disown
