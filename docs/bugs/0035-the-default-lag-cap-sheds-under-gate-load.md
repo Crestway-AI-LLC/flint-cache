@@ -72,14 +72,29 @@ Standalone at the same commit, on the same box, immediately after the gate:
 | attempt | conditions | idle CPU during load | THROTTLED | result |
 |---|---|---|---|---|
 | 1 | idle box | — | 0 | PASS |
-| 2 | 6 CPU burners on 8 cores | not measured | 0 | PASS |
-| 3 | `restart_drill` then `repl_drill` back to back, as the gate runs them | 9.6 / 9.2 / 20.2% | 0 | PASS |
-| 4 | two `dd conv=fsync` loops on the same filesystem | 2.4 / 6.1 / 14.2% | 0 | PASS |
+| 2 | 6 CPU burners on 8 cores | — | 0 | PASS |
+| 3 | `restart_drill` then `repl_drill` back to back, as the gate runs them, burners still live | 9.6 / 9.2 / 20.2% | 0 | PASS |
+| 4 | two `dd conv=fsync` loops on the same filesystem, burners still live | 2.4 / 6.1 / 14.2% | 0 | PASS |
 
-Attempt 4 pegged both CPU and disk and still did not reach a 1000 ms cap.
-Attempt 2 is the weakest — the burners' effect during the drill window was not
-measured, only their creation — and counts as inconclusive rather than as a
-negative.
+**Attempts 3 and 4 ran under MORE load than intended**, which is worth stating
+plainly because the reason is a mistake of the exact kind this file is about.
+Attempt 2's six burners were never killed. The teardown ran
+
+    kill $BURNERS ; echo "burners left: $(jobs -p | wc -l)"
+
+and printed `burners left: 0`, which was read as confirmation. `jobs -p` in a
+non-interactive shell had never tracked them, so `BURNERS` was empty, `kill`
+received no arguments, and the count of zero meant "this shell knows of no
+jobs" — output identical to "all six were killed". They span at ~99% CPU each
+for 34 minutes and were found only when the box showed load 9.2 on 8 cores.
+
+So attempts 3 and 4 were run with six spinners plus their own load — 2.4% idle
+at the floor — and still did not reach a 1000 ms cap. The mistake made those
+two negatives STRONGER, not weaker, and it makes attempt 2 a real negative
+rather than the inconclusive one this file first called it.
+
+Verify a kill by asking after the PIDs, not by asking the shell how many jobs
+it remembers.
 
 ## A hypothesis, tested and dead
 
@@ -100,18 +115,53 @@ that was already sitting in the failing run's own directory.
 ## What is actually left
 
 Not CPU (attempts 2, 3), not disk (4), not the restart-then-repl sequence (3),
-not a fresh binary (build.log). The one variable present during gate 21 and
-absent from all four attempts is ANOTHER SESSION'S WORKLOAD: a `flint-kv`
-`cold-modify` process was observed on the box two minutes into the gate and
-was gone for every attempt afterwards. That is not a controlled input and this
-is not a claim that it was the cause — it is the honest remaining difference.
-There is precedent: gate 17's ten bootstrap failures were concurrent peer load
-and nothing else, confirmed only when the peer independently reported their
-own bootstraps failing in the same shape at the same time.
+not a fresh binary (build.log).
 
-If that is the trigger, the finding stands and strengthens: a busy host is an
-ordinary production condition, and it reached a cap two documents describe as
-unreachable.
+A `flint-kv` `cold-modify` process from another session was on the box two
+minutes into gate 21, and another was running an hour later. **That is not
+offered as the differentiator**, because the box was not sampled for it during
+each of the four attempts — so "present during the gate, absent from the
+attempts" is a claim the evidence does not support, and writing it that way
+was the first draft of this file. What can be said is narrower: another
+session's workload comes and goes on this box unmeasured, and it is the
+largest uncontrolled input remaining.
+
+There is precedent for it mattering. Gate 17's ten bootstrap failures were
+concurrent peer load and nothing else, and that was confirmed only when the
+peer independently reported their own bootstraps failing in the same shape at
+the same time — neither session could have concluded it alone.
+
+The way to settle this is to sample the box during the drill rather than
+reason about it afterwards: record load average and the non-flint process set
+into the drill log at the moment the load phase starts. Then a shed run and a
+clean run differ by a recorded fact instead of by a recollection.
+
+If concurrent load IS the trigger, the finding stands and strengthens rather
+than dissolving: a busy host is an ordinary production condition, and it
+reached a cap two documents describe as unreachable under any load.
+
+## Gate 22 is not more evidence — it is the same mistake, downstream
+
+The re-run at `6fea7c2` came out 114 PASS / 3 FAIL: `edge_roll` (bootstrap),
+`json` ("Could not connect to Valkey at 127.0.0.1:7681: Connection refused"),
+and `chaos` (a BUG-0023 lost link). `repl` PASSED in that run.
+
+**Those three are the burners, not the product.** The timeline is
+unambiguous: the burners started ~18:31 local and were killed at 19:06; gate
+22 ran 18:35-19:03, entirely inside that window, at load 9.2 on 8 cores. Both
+new drill failures are startup-timing failures — a seat that did not begin
+listening inside its wait budget — which is exactly what a saturated box
+produces. None of them is filed as a defect.
+
+Gate 21, the run this file is about, ended at ~18:20, ELEVEN MINUTES BEFORE
+the first burner existed. Its `repl` failure is not explained by this and
+still stands.
+
+The lesson is about attribution, not about load: an intermittent failure
+arriving right after a self-inflicted change to the environment is the easiest
+kind of evidence to misread in both directions — as a product bug, or as
+"just my load" when a real one is hiding underneath. The discriminator was a
+timestamp, and it was available the whole time in the gate log directory name.
 
 ## Why this is not being fixed by raising the drill's caps yet
 
