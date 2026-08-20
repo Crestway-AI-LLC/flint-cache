@@ -462,6 +462,32 @@ static WRITE_SERVICE_US: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomi
 /// by FLINTINFO so the shed is observable rather than inferred — the lag cap
 /// shipped unexercised for months precisely because nothing counted it (#121).
 static WRITES_SHED_DEADLINE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Writes refused by each REPLICATION gate. The note above applies with more
+/// force here: these gates have counted nothing since they shipped, so
+/// BUG-0035 had to reconstruct "20328 of 50500" from a drill's client-side
+/// error log. The master refused 40% of a run and kept no record of it.
+static WRITES_SHED_LAG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static WRITES_SHED_QUORUM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static WRITES_SHED_WIDOWED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static WRITES_SHED_HEADROOM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// DELAYED, not refused — the soft band's sleep. Counted apart from the shed
+/// because the two say opposite things about the same node: a run that is all
+/// delay is backpressure doing its job, while one that jumps straight to shed
+/// with this near zero never spent time in the band that exists to absorb it.
+static WRITES_DELAYED_SOFT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Peak lag seen by the write path, and the master-to-replica sequence gap at
+/// that peak. FLINTINFO's `lag_ms` is instantaneous, so a spike short enough
+/// to shed thousands of writes is invisible to every poll that straddles it —
+/// which is how four reproduction attempts of BUG-0035 each found a healthy
+/// node. The peak alone still cannot say WHY; the gap beside it can, and the
+/// three signatures were measured rather than reasoned about:
+///
+///   gap large and GROWING with the lag  -> replica slower than the master
+///   gap large and FROZEN while lag climbs -> replica not running at all
+///                                            (SIGSTOP: 78157, unmoving)
+///   gap small while lag climbs          -> the ack path, not the data path
+static LAG_MS_MAX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static LAG_MAX_GAP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// How long a write may be EXPECTED to wait before we refuse it outright
 /// (milliseconds; 0 = no deadline, unbounded queueing).
@@ -2184,6 +2210,7 @@ fn admit_write_path(
     if work.write && !ro {
         let now = flint_storage::strings::system_clock();
         if hub.below_write_quorum(now) {
+            WRITES_SHED_QUORUM.fetch_add(1, Ordering::Relaxed);
             return Some(Value::Error(
                 "THROTTLED live replicas below min-replicas-to-write, retry with backoff".into(),
             ));
@@ -2193,21 +2220,38 @@ fn admit_write_path(
         // shares the cause) and before the lag cap, which cannot fire at all
         // in this state because there is no replica to measure lag against.
         if hub.widowed_beyond_grace_arming(now) {
+            WRITES_SHED_WIDOWED.fetch_add(1, Ordering::Relaxed);
             return Some(Value::Error(
                 "THROTTLED no live replica for longer than --widowed-grace-ms, retry with backoff"
                     .into(),
             ));
         }
-        match hub.lag_ms(now) {
-            Some(lag) if lag >= hub.lag_hard_ms() => {
+        if let Some(lag) = hub.lag_ms(now) {
+            // The peak is recorded BEFORE the gates read it, so a sample that
+            // sheds is also a sample that is counted. The gap is read only
+            // when this sample RAISES the peak, so the extra `replicas` lock
+            // is paid a handful of times per process life instead of on every
+            // write — a monotone maximum stops updating almost at once. Two
+            // threads raising it together can leave the gap belonging to the
+            // lower of the two peaks; for a diagnostic that is the right trade
+            // against another lock on the write path.
+            if LAG_MS_MAX.fetch_max(lag, Ordering::Relaxed) < lag {
+                let acked = hub.effective_acked(now).unwrap_or(0);
+                LAG_MAX_GAP.store(
+                    latest_seq_of(rocks).saturating_sub(acked),
+                    Ordering::Relaxed,
+                );
+            }
+            if lag >= hub.lag_hard_ms() {
+                WRITES_SHED_LAG.fetch_add(1, Ordering::Relaxed);
                 return Some(Value::Error(
                     "THROTTLED replication lag exceeds limit, retry with backoff".into(),
                 ));
             }
-            Some(lag) if lag >= hub.lag_soft_ms() => {
+            if lag >= hub.lag_soft_ms() {
+                WRITES_DELAYED_SOFT.fetch_add(1, Ordering::Relaxed);
                 std::thread::sleep(std::time::Duration::from_millis(2));
             }
-            _ => {}
         }
         // ADR-0022: WAL headroom. Distinct from the lag gates above, which
         // bound the RPO in TIME; this one bounds how far the master may
@@ -2223,6 +2267,7 @@ fn admit_write_path(
         // After the lag gates on purpose: when both would fire, lag is the
         // more familiar cause and the more actionable message.
         if hub.wal_headroom_exhausted(latest_seq_of(rocks), now) {
+            WRITES_SHED_HEADROOM.fetch_add(1, Ordering::Relaxed);
             return Some(Value::Error(
                 "THROTTLED replica too far behind the retained WAL, retry with backoff".into(),
             ));
@@ -3142,7 +3187,7 @@ fn flintinfo(
     // different fact from a healthy zero (docs/bugs/0022).
     let write_stall = rocks.as_ref().and_then(|kv| kv.write_stall());
     let info = format!(
-        "role:{}\r\nrole_epoch:{role_epoch}\r\nbuild:{build}\r\nsst_bytes:{sst}\r\nlatest_seq:{latest}\r\nlast_applied:{last_applied}\r\nacked_seq:{}\r\nseq_lag:{seq_lag}\r\nwal_headroom_seq:{whs}\r\nwal_min_acked_seq:{wma}\r\nwal_headroom_shed_seq:{whl}\r\nlive_replicas:{}\r\nlag_ms:{}\r\nlag_soft_ms:{soft}\r\nlag_hard_ms:{hard}\r\nmin_replicas_to_write:{minr}\r\nwidowed_grace_ms:{wgm}\r\nwidowed_shed:{wsh}\r\nfullsync_active:{fsa}\r\nfullsync_max:{fsm}\r\nasync_write_queue:{aqd}\r\nwrite_deadline_ms:{wdm}\r\nwrite_inflight:{wif}\r\nwrite_service_us:{wsu}\r\nwrite_wait_est_ms:{wwe}\r\nwrites_shed_deadline:{wsd}\r\nwal_fsync_ms:{wfm}\r\nwal_fsync_total:{wft}\r\ncert_days_remaining:{cdr}\r\nactive_conns:{ac}\r\nmax_conns:{mc}\r\nconns_shed_total:{cs}\r\nwrite_stopped:{wst}\r\ndelayed_write_rate:{dwr}\r\nwrite_stall_readable:{wsr}\r\ndisk_free_bytes:{dfb}\r\ndisk_total_bytes:{dtb}\r\ndisk_free_pct:{dfp}\r\ndisk_verdict:{dv}\r\ndisk_unknown_samples:{dus}\r\ngc_swept_expired:{gse}\r\ngc_swept_orphans:{gso}\r\nuptime_ms:{upms}\r\n",
+        "role:{}\r\nrole_epoch:{role_epoch}\r\nbuild:{build}\r\nsst_bytes:{sst}\r\nlatest_seq:{latest}\r\nlast_applied:{last_applied}\r\nacked_seq:{}\r\nseq_lag:{seq_lag}\r\nwal_headroom_seq:{whs}\r\nwal_min_acked_seq:{wma}\r\nwal_headroom_shed_seq:{whl}\r\nlive_replicas:{}\r\nlag_ms:{}\r\nlag_ms_max:{lmx}\r\nlag_max_gap:{lmg}\r\nlag_soft_ms:{soft}\r\nlag_hard_ms:{hard}\r\nmin_replicas_to_write:{minr}\r\nwidowed_grace_ms:{wgm}\r\nwidowed_shed:{wsh}\r\nfullsync_active:{fsa}\r\nfullsync_max:{fsm}\r\nasync_write_queue:{aqd}\r\nwrite_deadline_ms:{wdm}\r\nwrite_inflight:{wif}\r\nwrite_service_us:{wsu}\r\nwrite_wait_est_ms:{wwe}\r\nwrites_shed_deadline:{wsd}\r\nwrites_shed_lag:{wsl}\r\nwrites_shed_quorum:{wsq}\r\nwrites_shed_widowed:{wswd}\r\nwrites_shed_headroom:{wshr}\r\nwrites_delayed_soft:{wdsf}\r\nwal_fsync_ms:{wfm}\r\nwal_fsync_total:{wft}\r\ncert_days_remaining:{cdr}\r\nactive_conns:{ac}\r\nmax_conns:{mc}\r\nconns_shed_total:{cs}\r\nwrite_stopped:{wst}\r\ndelayed_write_rate:{dwr}\r\nwrite_stall_readable:{wsr}\r\ndisk_free_bytes:{dfb}\r\ndisk_total_bytes:{dtb}\r\ndisk_free_pct:{dfp}\r\ndisk_verdict:{dv}\r\ndisk_unknown_samples:{dus}\r\ngc_swept_expired:{gse}\r\ngc_swept_orphans:{gso}\r\nuptime_ms:{upms}\r\n",
         if read_only { "replica" } else { "master" },
         hub.effective_acked(now)
             .map_or_else(|| "none".into(), |a| a.to_string()),
@@ -3186,6 +3231,13 @@ fn flintinfo(
         wsu = WRITE_SERVICE_US.load(Ordering::Relaxed),
         wwe = estimated_write_wait_ms(),
         wsd = WRITES_SHED_DEADLINE.load(Ordering::Relaxed),
+        wsl = WRITES_SHED_LAG.load(Ordering::Relaxed),
+        wsq = WRITES_SHED_QUORUM.load(Ordering::Relaxed),
+        wswd = WRITES_SHED_WIDOWED.load(Ordering::Relaxed),
+        wshr = WRITES_SHED_HEADROOM.load(Ordering::Relaxed),
+        wdsf = WRITES_DELAYED_SOFT.load(Ordering::Relaxed),
+        lmx = LAG_MS_MAX.load(Ordering::Relaxed),
+        lmg = LAG_MAX_GAP.load(Ordering::Relaxed),
         wfm = WAL_FSYNC_MS.load(Ordering::Relaxed),
         wft = rocks.as_ref().map(|kv| kv.wal_fsync_total()).unwrap_or(0),
         cdr = CERT_PATH
