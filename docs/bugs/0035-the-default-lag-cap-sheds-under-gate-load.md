@@ -235,6 +235,23 @@ The drills no longer lie about it, and that is all that changed. The shipped
 happen. Sightings so far: gate 21 `repl` (20328), gate 23 `repl` (19932),
 gate 23 `controller` (356), and a standalone `controller` (2428).
 
+**AND ONE IN PRODUCTION, 2026-08-20, which the four above were not.** Rolling
+the playground to rc.59 shed **210 writes on the demoted seat** during a
+CONTROLLED failover, with the canary replica at 0 — reported by the ops
+session, on the live fleet, at shipped defaults, with nobody trying to
+provoke it.
+
+That matters more than any of the drill sightings, for two reasons. It is not
+a laptop and not a synthetic firehose: it is the roll procedure this product
+runs on purpose. And it is the first time the number was COUNTABLE at all,
+because `writes_shed_lag` did not exist until 2026-08-20 — every earlier roll
+shed an unknown amount and reported nothing, so "0 shed" in the historical
+record means "not counted", not "none".
+
+So the honest state of `slo.md`'s no-stall row is worse than "contradicted by
+one laptop observation": the shed happens during an ordinary controlled
+failover, and the reason nobody saw it is that nothing counted it.
+
 `slo.md`'s table needs correcting once the trigger is understood — not before,
 because "0 shed with no stall" is currently the only written statement that
 this contradicts, and replacing it with a vaguer sentence would lose the
