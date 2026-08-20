@@ -1626,16 +1626,16 @@ mod client_tests {
     #[test]
     fn a_refused_write_is_not_a_successful_pipeline() {
         use std::io::{Read, Write};
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a fake server");
+        let port = listener.local_addr().expect("fake server addr").port();
         let server = std::thread::spawn(move || {
-            let (mut sock, _) = listener.accept().unwrap();
+            let (mut sock, _) = listener.accept().expect("accept the client");
             let mut scratch = [0u8; 64 * 1024];
             let _ = sock.read(&mut scratch);
             // Three replies: accepted, REFUSED, accepted.
             sock.write_all(b"+OK\r\n-THROTTLED replication lag exceeds limit\r\n+OK\r\n")
-                .unwrap();
-            sock.flush().unwrap();
+                .expect("write the three replies");
+            sock.flush().expect("flush the replies");
             std::thread::sleep(Duration::from_millis(200));
         });
         let mut c = Client::connect(port).expect("connect to the fake");
