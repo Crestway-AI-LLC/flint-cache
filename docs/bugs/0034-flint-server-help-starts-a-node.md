@@ -1,4 +1,4 @@
-# BUG-0034: `flint-server` ignored unrecognised arguments and started a node (FIXED)
+# BUG-0034: `flint-server` ignores unrecognised arguments and starts a node (help/version FIXED; rejection ATTEMPTED AND REVERTED)
 
 Status: `--help` FIXED 2026-08-19 · the unknown-argument half is OPEN ·
 Severity: medium — an operator asking for usage gets a running node instead,
@@ -45,7 +45,56 @@ print usage, exit 0.
 which calls `"$bin" --build-version` on every drill startup — was never
 affected. That was checked rather than assumed.
 
-## The other half, fixed the same day after it cost a second incident
+## Rejection was implemented, hung two gates, and was reverted the same hour
+
+**Do not attempt this again from a grep.** The general fix — refuse any
+unrecognised argument — was written, verified against every flag `flintctl`
+passes when spawning a node, and it still broke the suite. `slot_map_drill.sh`
+starts a seat like this:
+
+    $B --port 7101 --engine rocks --data-dir "$D/a" --advertise 127.0.0.1:7101
+
+`--advertise` is a PROXY flag. `flint-server` has never read it — `arg("--advertise")`
+appears zero times — so passing it was always a silent no-op, and rejection
+turned that no-op into `exit 2`. The drill then waited forever for a seat that
+would never bind: `slot_map` normally finishes in **6 s** and hung for **4:45**
+before the gate was killed. It hung two runs before the cause was found, and
+the first was misread as contention because three earlier reds that day
+genuinely were.
+
+**Why the enumeration failed even though it was checked.** The accepted set was
+derived correctly from the CALLEE — `arg()` is the only way a value reaches
+this binary, so the 32 call sites really are exhaustive. The unchecked half was
+the CALLER: flintctl was verified, the drills were not, and the drills pass
+flags that flint-server has always ignored. An argument list has two ends and
+enumerating one of them proves nothing about the other.
+
+That is the concrete reason the original write-up deferred this, and the
+deferral was right. Reinstating it needs the caller side enumerated too, which
+means every direct `flint-server` invocation in `tools/` — and ideally the
+spurious flags removed there first, so rejection cannot break anything by
+construction.
+
+### What IS fixed
+
+`--help`, `-h` print usage and exit 0. `--version` and `-V` now alias
+`--build-version` and print the stamp and exit 0.
+
+Those cover both incidents this defect actually caused: the stray `--help` node
+on port 6380 that put 64 drills into `fleet_guard` refusals, and `--version`
+hanging a box with a 30-minute TTL during release acceptance. Narrow, and safe
+because they add early exits rather than removing a fall-through.
+
+### What is still open, and is still a real hazard
+
+    flint-server --prot 7001    # typo
+    → listening on 127.0.0.1:6380
+
+A mistyped flag still starts a node on the default port and reports success.
+That is worse than the two fixed cases, because the operator believes they
+specified a port.
+
+## What the half-fix looked like before this
 
 `--help` was the symptom; **ignoring unknown input was the defect**. A peer
 session hit the same bug from a different direction while building release

@@ -545,83 +545,6 @@ impl Drop for FullSyncGuard {
 /// The build stamp surfaced in FLINTINFO — what canary rollouts gate on.
 /// One definition for every Flint binary; see the flint-build crate for why
 /// it is not written out here.
-/// Every flag this binary reads a VALUE for. Kept beside `arg()` because it is
-/// the same list by construction: `arg("--x")` is the only way a value reaches
-/// this program, and `env::args()` is read in exactly three places — here, the
-/// `--build-version` check, and the `--help` check.
-const VALUE_FLAGS: &[&str] = &[
-    "--async-queue-cap",
-    "--async-writes",
-    "--bind",
-    "--data-dir",
-    "--disk-min-free-bytes",
-    "--disk-min-free-pct",
-    "--disk-sample-ms",
-    "--engine",
-    "--fullsync-rate-bytes",
-    "--internal-ca",
-    "--internal-cert",
-    "--internal-key",
-    "--journal",
-    "--lag-hard-ms",
-    "--lag-soft-ms",
-    "--lease-cp",
-    "--lease-ttl-ms",
-    "--max-conns",
-    "--max-fullsync",
-    "--max-key-bytes",
-    "--max-value-bytes",
-    "--migrate-rate-bytes",
-    "--min-replicas-to-write",
-    "--port",
-    "--replica-of",
-    "--replica-read-stale-ms",
-    "--restore-from",
-    "--rewind-snaps",
-    "--wal-fsync-ms",
-    "--wal-headroom-seq",
-    "--widowed-grace-ms",
-    "--write-deadline-ms",
-];
-
-/// Flags that take no value.
-const BARE_FLAGS: &[&str] = &["--build-version", "--help", "-h"];
-
-/// Refuse an argument this binary does not understand, instead of ignoring it.
-///
-/// The old behaviour was to ignore every unrecognised token, so `--help`,
-/// `--version` and a typo'd `--prot 7001` all fell through to "start a node on
-/// the default port 6380" and reported success. `--help` and `--version` each
-/// cost a real incident: one left a stray node that put 64 drills into
-/// fleet_guard refusals, the other hung a box building release acceptance.
-/// Those were symptoms; ignoring unknown input is the defect (docs/bugs/0034).
-///
-/// Rejecting was deferred once because it needs the accepted set enumerated and
-/// guessing risks refusing a flag a caller depends on. It is not a guess: the
-/// set is the `arg()` call sites, and every flag flintctl passes when spawning
-/// a node — port, bind, engine, data-dir, journal, replica-of, rewind-snaps,
-/// the three internal-* and the five tuning flags — is in it.
-fn reject_unknown_args() -> Result<(), String> {
-    let argv: Vec<String> = std::env::args().skip(1).collect();
-    let mut i = 0;
-    while i < argv.len() {
-        let a = argv[i].as_str();
-        if BARE_FLAGS.contains(&a) {
-            i += 1;
-        } else if VALUE_FLAGS.contains(&a) {
-            // A value flag with nothing after it is also a mistake, and saying
-            // so beats defaulting it silently.
-            if i + 1 >= argv.len() {
-                return Err(format!("{a} expects a value and got none"));
-            }
-            i += 2;
-        } else {
-            return Err(format!("unrecognised argument '{a}'"));
-        }
-    }
-    Ok(())
-}
-
 /// The flags an operator can reach for, printed by --help.
 ///
 /// Deliberately NOT generated from a parser: this binary has no parser, it
@@ -637,11 +560,11 @@ fn usage() -> String {
         "                    [--journal HOST:PORT] [--rewind-snaps DIR]\n",
         "                    [--wal-fsync-ms N] [--max-fullsync N]\n",
         "\n",
-        "  --build-version   print the build stamp and exit\n",
+        "  --build-version, --version, -V   print the build stamp and exit\n",
         "  --help, -h        print this and exit\n",
         "\n",
         "Defaults: --port 6380, --bind 127.0.0.1, --engine mem.\n",
-        "Unrecognised arguments are REFUSED with exit 2.\n",
+        "Unrecognised arguments are IGNORED, not rejected (bugs/0034).\n",
     )
     .to_string()
 }
@@ -766,7 +689,12 @@ fn main() -> std::io::Result<()> {
     // to tell which release a file was came from `ls -la` and process start
     // times — inference, not an answer — and it is what the release build
     // asserts against to prove the stamp actually landed.
-    if std::env::args().any(|a| a == "--build-version") {
+    // --version and -V answer the same question as --build-version. They are
+    // here because a peer's release-acceptance check reached for `--version`,
+    // got a RUNNING NODE, and hung a box with a 30-minute TTL (docs/bugs/0034).
+    // Adding the aliases is narrow and safe; refusing every unrecognised
+    // argument is the general fix and is NOT safe yet — see the bug.
+    if std::env::args().any(|a| a == "--build-version" || a == "--version" || a == "-V") {
         println!("{}", build_version());
         return Ok(());
     }
@@ -788,12 +716,6 @@ fn main() -> std::io::Result<()> {
     if std::env::args().any(|a| a == "--help" || a == "-h") {
         println!("{}", usage());
         return Ok(());
-    }
-    // Validate AFTER the two early exits, so --help and --build-version still
-    // work, and BEFORE anything binds — a refused argument must cost nothing.
-    if let Err(why) = reject_unknown_args() {
-        eprintln!("flint-server: {why}\n\n{}", usage());
-        std::process::exit(2);
     }
     // ADR-0014 D2: the drift check needs to know how long this seat has
     // been up, to tell real divergence from a node mid-roll.
