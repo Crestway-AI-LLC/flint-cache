@@ -337,11 +337,13 @@ about 1.6x the natural operating point.
 
 That changes what each candidate fix is worth:
 
-- **Fix the shipper (BUG-0038).** 50 MiB/s in serial 80 ms cycles is what puts
-  the operating point at 631 ms. Halving the cycle puts it near 380 ms and the
-  SHIPPED 500/1000 caps suddenly have the margin they were always assumed to
-  have. This is the root cause and the only option that makes the published
-  RPO honest without widening it. **Do this first.**
+- **Fix the shipper (BUG-0038).** **DONE, and it was better than predicted.**
+  The prediction here was ~380 ms from halving the cycle. The actual cause was
+  not the cycle's structure but the replica burning its CPU on one ACK syscall
+  per WAL batch; acking once per read group instead took the operating point to
+  **115 ms** and `writes_delayed_soft` to **zero**. The shipped 500/1000 caps
+  now have ~885 ms of margin instead of ~370, and ordinary traffic no longer
+  touches the soft band. The published RPO is honest without being widened.
 
 - **Raise the caps to match reality** (soft ~1500 / hard ~3000). Cheap, and
   it stops the brake firing on healthy traffic — but it pays for a slow

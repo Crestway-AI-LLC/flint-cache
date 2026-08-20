@@ -166,16 +166,19 @@ as the stall lasts. Measured, with the replica frozen for 1800 ms:
 | 1800 ms | 1000 ms | 75 | 1757 ms |
 | 1800 ms | 200 ms | 140 | 1753 ms |
 
-† **The first row has almost no margin behind it, which the zero hides.** A
-sustained pipelined writer against a healthy pair on an idle box — no stall,
-shipped defaults — peaks at **631 ms of lag**, 63% of the way to the cap
-(measured on a local pair; `lag_ms_max` in `FLINTINFO` reports it). The
-remaining ~370 ms is all that separates a clean run from a shedding one, so
-anything that pauses the replica for longer than that crosses the cap without
-any fault in the product. Frozen for 1.2 s, the same pair shed 323862 writes
-at these defaults. Read the row as "zero, with 370 ms to spare", not as
-"zero, comfortably" — BUG-0035 is the gate hitting exactly that margin on a
-contended box.
+† **The margin behind this zero was ~370 ms until BUG-0038 was fixed; it is
+now ~885 ms.** A sustained pipelined writer against a healthy pair on an idle
+box — no stall, shipped defaults — used to peak at **631 ms of lag**, 63% of
+the way to the cap, because the replica spent its CPU on one ACK syscall per
+WAL batch rather than on applying. Acking once per read group instead moved
+that peak to **115 ms**, and `writes_delayed_soft` from ~250 to zero: ordinary
+traffic no longer enters the soft band at all. `lag_ms_max` in `FLINTINFO`
+reports the peak, so this is checkable rather than assumed.
+
+The row's zero was never wrong; what it hid was how little stood behind it.
+Frozen for 1.2 s, the same pair still sheds — 323862 writes at these defaults —
+because no amount of headroom survives a replica that has stopped running.
+That is the shed working, and it is why the refusal stays.
 
 Both halves are visible there. Tightening the cap fivefold nearly doubled the
 shedding — the valve really does close harder — while the age of the oldest
