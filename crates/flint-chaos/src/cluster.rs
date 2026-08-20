@@ -679,8 +679,29 @@ impl Client {
             encode(&frame, &mut out);
         }
         self.stream.write_all(&out)?;
+        // CHECK THE REPLIES. `read_one` returns Ok(Value::Error(..)) for a
+        // `-THROTTLED` or `-READONLY`: those are well-formed frames, not I/O
+        // failures. Discarding them made this pipeline unable to tell an
+        // ACCEPTED write from a REFUSED one, and it is the build path for the
+        // chain — so a write the master openly refused became a link the
+        // traversal later found missing on both members and reported as
+        // "a truly lost link" (BUG-0023). Every instance of that bug to date
+        // was recorded through this hole.
+        let mut first_err: Option<String> = None;
+        let mut errs = 0usize;
         for _ in 0..cmds.len() {
-            self.read_one()?;
+            if let Value::Error(e) = self.read_one()? {
+                errs += 1;
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
+        }
+        if let Some(e) = first_err {
+            return Err(std::io::Error::other(format!(
+                "{errs} of {} writes REFUSED by the master, first: {e}",
+                cmds.len()
+            )));
         }
         Ok(())
     }
@@ -1488,6 +1509,7 @@ impl Cluster {
 
 #[cfg(test)]
 mod sweep_tests {
+
     use super::*;
 
     /// The sweep must never touch a LIVE run's directory.
@@ -1582,5 +1604,60 @@ mod sweep_tests {
             pid_is_alive(std::process::id()),
             "our own pid must read as alive"
         );
+    }
+}
+
+#[cfg(test)]
+mod client_tests {
+    use super::*;
+
+    // A REFUSED WRITE MUST NOT LOOK LIKE AN ACCEPTED ONE.
+    //
+    // `pipeline` used to read each reply and drop it, so `-THROTTLED` (the
+    // master shedding when replica lag passes --lag-hard-ms) and `-READONLY`
+    // both returned Ok. That is the build path for the chain, so a refused
+    // write became a link the traversal later found absent on both members
+    // and called "a truly lost link" — every BUG-0023 instance on record was
+    // observed through that hole.
+    //
+    // No server here on purpose: the decision under test is "what does the
+    // client do with an error FRAME", which is a pure question. A fake
+    // listener answers it in milliseconds and cannot be flaky.
+    #[test]
+    fn a_refused_write_is_not_a_successful_pipeline() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut scratch = [0u8; 64 * 1024];
+            let _ = sock.read(&mut scratch);
+            // Three replies: accepted, REFUSED, accepted.
+            sock.write_all(b"+OK\r\n-THROTTLED replication lag exceeds limit\r\n+OK\r\n")
+                .unwrap();
+            sock.flush().unwrap();
+            std::thread::sleep(Duration::from_millis(200));
+        });
+        let mut c = Client::connect(port).expect("connect to the fake");
+        let batch: Vec<Vec<Vec<u8>>> = (1..=3)
+            .map(|i| {
+                vec![
+                    b"SET".to_vec(),
+                    format!("key{i}").into_bytes(),
+                    b"v".to_vec(),
+                ]
+            })
+            .collect();
+        let err = c
+            .pipeline(&batch)
+            .expect_err("one -THROTTLED among three replies must NOT be Ok");
+        let msg = err.to_string();
+        assert!(msg.contains("REFUSED"), "message should say refused: {msg}");
+        assert!(msg.contains("THROTTLED"), "message should name it: {msg}");
+        assert!(
+            msg.contains("1 of 3"),
+            "message should count the refusals: {msg}"
+        );
+        let _ = server.join();
     }
 }

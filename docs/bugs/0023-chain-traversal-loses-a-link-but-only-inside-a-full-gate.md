@@ -1,8 +1,10 @@
-# BUG-0023: the chain traversal loses a link across a master kill — but only inside a full gate (OPEN)
+# BUG-0023: the chain traversal loses a link across a master kill — but only inside a full gate (CAUSE FOUND: the build could not see a refused write)
 
-Status: OPEN, found 2026-08-18 · Severity: **high if real** — the assertion is
-a durability claim, and it has fired once against five clean solo runs, so the
-open question is whether the product or the gate environment is at fault
+Status: instrument FIXED 2026-08-20; every instance recorded so far is
+UNINTERPRETABLE and none of them is evidence of data loss · found 2026-08-18 ·
+Severity: was **high if real** — the assertion is a durability claim. It is
+now known that the harness could not tell an ACCEPTED write from a REFUSED
+one, so "a truly lost link" was never a supportable conclusion.
 
 ## Symptom
 
@@ -139,6 +141,85 @@ reading a stale binary that predated it.
 Verified on a live pair: both verdict arms render, all seven fields resolve on
 master and replica, and the self-check passes. What remains is for a real gate
 to fire it.
+
+## The cause, found 2026-08-20: the build could not see a refused write
+
+`chain.rs` builds the links with pipelined batches of 1000 SETs through
+`Client::pipeline`. That function was:
+
+    self.stream.write_all(&out)?;
+    for _ in 0..cmds.len() {
+        self.read_one()?;
+    }
+    Ok(())
+
+It reads every reply and **discards it**. `read_one` returns
+`Ok(Value::Error(..))` for `-THROTTLED` or `-READONLY` — those are well-formed
+frames, not I/O failures — so the `?` passes them through and the batch
+reports success. A write the master OPENLY REFUSED was indistinguishable from
+one it stored.
+
+That is the whole bug. The traversal later reads a key that was never written,
+finds it absent, and prints "a truly lost link" — a durability verdict about a
+write that was never accepted.
+
+### Why it only ever appeared inside a gate
+
+The build is a firehose: 1000 pipelined SETs at a time, with no flow control.
+That is the same load profile that shed 20328 of 50500 writes in `repl_drill`
+and 2428 of 20000 in `controller_drill` (BUG-0035) once replica lag passed the
+shipped `--lag-hard-ms 1000`. A gate loads the box; a solo run on an idle box
+does not shed. Five solo runs reproduced nothing because the CONDITION was
+never created, not because the defect was absent — the same shape as
+BUG-0030's positive control.
+
+### The two diagnosed instances agree, and agree on the frontier
+
+The probe landed on 2026-08-19 caught two, gates 22 and 23:
+
+    [lost-link] key=key0149272 hop=149271 ... dbsize=149271
+    [lost-link] verdict: NEVER LANDED — absent on both members
+
+    [lost-link] key=key0025145 hop=25144 ... dbsize=184496
+    [lost-link] verdict: NEVER LANDED — absent on both members
+
+In both, the missing key is exactly `hop + 1`: the next link the walk needs,
+never any earlier one. A write lost in replication or dropped by a promotion
+would not land preferentially on the frontier. A write REFUSED during the
+build, in a batch the client never checked, lands exactly there.
+
+"NEVER LANDED — absent on both members, so it was lost at or before the
+build/replication" was right, and the probe was pointing at the build the
+whole time.
+
+## Fix, and what it does NOT claim
+
+`Client::pipeline` now inspects every reply and returns an error naming the
+count and the first refusal: `"N of M writes REFUSED by the master, first:
+THROTTLED ..."`. `pipeline_retry` already retries with exponential backoff on
+a fresh connection, which is the correct response to `-THROTTLED` — the batch
+is all SETs of deterministic values, so replaying is idempotent — and it
+panics after five attempts, which now names the refusal instead of an I/O
+error.
+
+Pinned by `cluster::client_tests::a_refused_write_is_not_a_successful_pipeline`:
+a fake listener answers three SETs with `+OK`, `-THROTTLED`, `+OK`, and the
+test requires an Err naming "1 of 3". Mutation-verified — restore the
+discarding loop and it fails.
+
+**This does not prove the product never lost a link.** It proves the harness
+could not have known, and that every recorded instance was observed through
+that hole. The next occurrence will say which it is: a refused build now fails
+loudly at the build, so a BROKEN CHAIN after this change means the write was
+accepted and then lost, which is the durability claim this drill was always
+supposed to be making.
+
+One caveat kept deliberately: the retry resends the whole 1000-SET batch, and
+per BUG-0035 a retry whose load profile equals the load that failed is not a
+retry. The backoff (100/200/400/800 ms) gives the replica time to drain and
+the batch is 1000 rather than 50000, so this is expected to converge where the
+full-stream replay did not — but if a build ever panics with five straight
+refusals, that is the reason to look at, not the master.
 
 ## Related
 
