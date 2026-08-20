@@ -18,7 +18,29 @@ fleet_guard
 fleet_kill server; fleet_kill controller; fleet_kill proxy; sleep 0.4
 B=./target/release/flint-server
 KEYS_PER_TENANT=300
+# The writer subshells below loop until a stop FILE appears, and this cleanup
+# used to DELETE that file — so the teardown that is supposed to guarantee
+# they stop was removing their only stop signal. On the `exit 1` path (the
+# recovery probe failing) they were never signalled at all.
+#
+# Both leave six subshells looping forever at ppid=1, each forking a
+# valkey-cli per iteration. That is not a tidiness problem: a runnable
+# process adds 1 to load average, so six of them add SIX on an 8-core box,
+# and the next gate's m3_exit then fails its own 20 s recovery probe and
+# leaks six more. Observed three gates running: 681 s, 696 s, 668 s, each
+# leaving exactly six, each slowing the run that followed it.
+#
+# So the writers are killed by PID, which holds on every exit path. WRITERS
+# is read at call time, so it being empty before the loop runs is fine.
 cleanup() {
+  # `wait` with NO arguments waits for every background job — including the
+  # four seats, the controller and the proxy, which this function does not
+  # kill until the lines below. That deadlocks: the drill printed PASS and
+  # then hung for 29 minutes. Wait for the WRITER pids specifically.
+  if [ -n "${WRITERS:-}" ]; then
+    kill -9 $WRITERS 2>/dev/null
+    wait $WRITERS 2>/dev/null
+  fi
   pkill -9 -f "flint-server --port 67" 2>/dev/null
   fleet_kill controller
   fleet_kill proxy
@@ -72,6 +94,7 @@ done
 
 echo "== multi-tenant load: 6 tenants write continuously; KILL pair-0 master"
 rm -f $FLINT_DRILL_ROOT/m3-stop
+WRITERS=""
 for i in 01 09 17 25 33 41; do
   # RECORD WHAT WAS ACKED, not what was attempted. `j` used to be incremented
   # unconditionally with the reply discarded, so it counted ATTEMPTS — and
@@ -96,6 +119,7 @@ for i in 01 09 17 25 33 41; do
       j=$((j+1))
     done
     echo "${last_acked:-none}" > "$FLINT_DRILL_ROOT/flint-m3-writer$i" ) &
+  WRITERS="$WRITERS $!"
 done
 sleep 2
 pkill -9 -f "flint-server --port 6710"
