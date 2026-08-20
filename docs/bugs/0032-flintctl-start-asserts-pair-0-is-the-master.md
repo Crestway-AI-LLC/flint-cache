@@ -1,7 +1,9 @@
-# BUG-0032: `flintctl start` asserts the inventory's FIRST pair member is a live master (OPEN)
+# BUG-0032: `flintctl start` asserts the inventory's FIRST pair member is a live master (FIXED in code; NO drill covers it)
 
-Status: OPEN, found 2026-08-19 on the playground · Severity: medium — after
-any failover, `start` panics whenever the declared-first member is down,
+Status: FIXED 2026-08-19 in `flint-ctl`, and NOT covered by any drill — three
+constructions were attempted and all three failed, recorded below. Found
+2026-08-19 on the playground · Severity: medium — after
+any failover, `start` panicked whenever the declared-first member was down,
 which converts "one seat needs restarting" into "the start path is dead"
 
 ## Symptom
@@ -119,13 +121,24 @@ re-seed path and the AddrInUse guard is never reached.
 feature configs and the reasoning is in the commit, but no test has yet
 demonstrated it fixes anything, and three that looked like they had did not.
 
-## Verification the fix still needs
+## Verification the fix still needs — STILL OUTSTANDING
+
+Unchanged, and stated here as an open gap rather than left implied by a
+"FIXED" in the title:
 
 - a pair whose inventory-first member is down: `start` restarts it and exits
   0, with a positive control that the same command still fails when NEITHER
   member answers
 - the message names the role it actually checked, and a failover before the
   check does not change which member the message refers to
+
+The fix is small and read carefully — `find(|m| wait_pong(m, ...))` over the
+pair, with three arms: first member answering, another member answering (with
+the note that this is normal after a failover), and NONE answering, which is
+the only one that exits non-zero. But read carefully is not tested, and the
+three dead ends below are why there is no drill: each construction either
+passed against the UNFIXED binary or failed to create the precondition at all.
+Whoever tries a fourth should start from that section, not from scratch.
 
 ## Related
 

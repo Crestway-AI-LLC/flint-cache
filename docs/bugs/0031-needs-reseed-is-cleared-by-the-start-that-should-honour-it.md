@@ -1,9 +1,9 @@
-# BUG-0031: `NEEDS_RESEED` is cleared by the very start that should honour it, so a marked replica loops forever (OPEN)
+# BUG-0031: `NEEDS_RESEED` is cleared by the very start that should honour it, so a marked replica loops forever (FIXED)
 
-Status: OPEN, found 2026-08-19 on the playground · Severity: **high** — a
-replica that needs a full sync can never get one. It restarts every two
-minutes until a human wipes its data directory by hand, and the pair stays
-single-copy the whole time.
+Status: FIXED 2026-08-20, shipped in v0.1.0-rc.57 · found 2026-08-19 on the
+playground · Severity: **high** — a replica that needs a full sync could
+never get one. It restarted every two minutes until a human wiped its data
+directory by hand, and the pair stayed single-copy the whole time.
 
 ## Symptom
 
@@ -131,14 +131,50 @@ made against the master's retained WAL floor BEFORE committing to it. The
 node already learns that floor one step later; asking first turns a fatal
 into a branch.
 
-## Verification the fix needs
+## Verification — done, and by the strongest form available
 
-- a replica stopped long enough for the master's WAL to advance past its
-  position restarts and full-syncs WITHOUT intervention — the positive
-  control is that it took a wipe by hand to recover on 2026-08-19
-- `NEEDS_RESEED` survives a start that does not complete a full sync
-- a marked node that is killed mid-full-sync still full-syncs on the next
-  start rather than warm-rejoining
+The fix is `WalGap` on the narrow shape (`repl.rs:177`): a retained span that
+begins PAST the cursor is a gap, not silence. A unit test pins it —
+`a_cursor_the_wal_cannot_reach_is_a_gap_not_silence` — and that test earned
+its place: as first written it accepted BOTH arms and passed against the code
+with the fix removed. Tightened to REQUIRE `WalGap`, it fails against the
+stashed fix with `Ok([ReplBatch { first_seq: 9 }])` for a cursor stranded at
+4.
+
+The end-to-end check was run by the ops session, not here, and it is a
+BRACKET rather than a green: one acceptance file frozen at `b68dca7`, run
+unchanged against two release bundles.
+
+    rc.56 bundle:  FAIL  the re-seed loop never converged: 3 starts,
+                         3 warm-rejoin refusal(s), span 8503 vs needed 7003
+    rc.57 bundle:  ok    narrow gap refused at admission and converged in
+                         1 start(s), marker cleared
+
+Red without the fix, green with it, same code judging both sides. That covers
+the first item this section used to list — a replica whose cursor the master's
+WAL can no longer reach recovers with NO intervention, where on 2026-08-19 it
+took a wipe by hand. The playground has run rc.57 clean since.
+
+**The second call site is now covered too, which it was not when this was
+filed.** `probe_resume` is called from `try_rewind` (`main.rs:329`) as well as
+from the marked-boot path, and a production fleet reaches the rewind one
+FIRST, because it has snapshots and a fresh drill fleet does not. On refusal
+there the code does `remove_dir_all(data_dir)` before falling through to the
+checkpoint path — same correct outcome, roughly double the single-copy
+window. The ops acceptance suite now stages a rewind-eligible snapshot and
+asserts `rewind entered and probe_resume REFUSED at main.rs:329`.
+
+### Still not covered
+
+- `NEEDS_RESEED` surviving a start that does not COMPLETE a full sync. The
+  bracket shows the marker cleared after a successful convergence, which is
+  the happy path; the interesting case is a start that fails midway.
+- a marked node killed mid-full-sync full-syncing on the next start rather
+  than warm-rejoining.
+
+Both are about crash-during-recovery, and neither is exercised by anything
+today. Recorded here rather than dropped, because a fix verified on its happy
+path is not the same as a fix verified.
 
 ## Related
 
