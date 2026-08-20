@@ -500,6 +500,29 @@ fleet_guard() {
   if [ -n "$sibling" ] && [ -z "$foreign" ] && [ -z "$(_fleet_sibling_named)" ]; then
     _fleet_sibling_settle && return 0
   fi
+  # A SEAT ON ITS WAY OUT IS NOT A FLEET. The gate runs drills back to back,
+  # and the previous drill's seats can still be exiting when the next one's
+  # guard samples: gate 31 refused backup_schedule over two flint-lagreach
+  # servers that were gone seconds later. Refusing there fails a run over a
+  # teardown race.
+  #
+  # So give it a few seconds. A real foreign fleet -- someone's live cluster,
+  # another suite mid-run -- is still there afterwards and still refuses; only
+  # the dying case clears. The budget is deliberately small and separate from
+  # FLINT_DRILL_WAIT, which is about a sibling's BUILD finishing (minutes).
+  # This is about a process exiting (seconds).
+  if [ -n "$foreign" ]; then
+    local _fw=0
+    while [ -n "$foreign" ] && [ "$_fw" -lt "${FLINT_FOREIGN_SETTLE:-15}" ]; do
+      sleep 1
+      _fw=$(( _fw + 1 ))
+      foreign="$(_fleet_foreign)"
+    done
+    if [ -z "$foreign" ]; then
+      echo "  out-of-scope seats exited during teardown (${_fw}s) — proceeding"
+      [ -z "$sibling" ] && return 0
+    fi
+  fi
   if [ -n "$foreign" ]; then
     echo "REFUSING TO RUN: this box already has Flint processes outside $FLEET_SCOPE"
     echo "$foreign" | cut -c1-120 | sed 's/^/    /'
