@@ -1,4 +1,4 @@
-# BUG-0034: `flint-server --help` starts a node on the default port (FIXED, one half open)
+# BUG-0034: `flint-server` ignored unrecognised arguments and started a node (FIXED)
 
 Status: `--help` FIXED 2026-08-19 · the unknown-argument half is OPEN ·
 Severity: medium — an operator asking for usage gets a running node instead,
@@ -45,7 +45,48 @@ print usage, exit 0.
 which calls `"$bin" --build-version` on every drill startup — was never
 affected. That was checked rather than assumed.
 
-## The half that is NOT fixed
+## The other half, fixed the same day after it cost a second incident
+
+`--help` was the symptom; **ignoring unknown input was the defect**. A peer
+session hit the same bug from a different direction while building release
+acceptance:
+
+    flint-server --version   → starts a node, never exits
+
+That hung a box with a 30-minute TTL. A "report the build" check reached for
+the flag every operator reaches for, and got a running server. (`flintctl
+--version` is the one that answers, and since `FLINT_RELEASE_TAG` is baked at
+compile time it is also the check that catches a bundle built from the wrong
+commit.)
+
+Two incidents from one defect settled that adding flags to an early-exit list
+one at a time is not a fix. Unrecognised arguments are now REFUSED with exit 2.
+
+**The enumeration is not a guess, which is what deferring it was waiting on.**
+`arg()` is the only way a value reaches this program and `env::args()` is read
+in exactly three places — that helper, the `--build-version` check, and the
+`--help` check. So the accepted set is the `arg()` call sites: 32 value flags
+plus three bare ones. Every flag flintctl passes when spawning a node — port,
+bind, engine, data-dir, journal, replica-of, rewind-snaps, the three
+`internal-*` and the five tuning flags — is in it, checked before the change
+rather than after.
+
+A value flag with nothing after it is also refused, rather than silently
+defaulting.
+
+Measured:
+
+| argument | exit | |
+|---|---|---|
+| `--version` | **2** | `unrecognised argument '--version'` |
+| `--prot 7001` (typo) | **2** | `unrecognised argument '--prot'` |
+| `wat` | **2** | `unrecognised argument 'wat'` |
+| `--port` (no value) | **2** | `--port expects a value and got none` |
+| `--help` | 0 | usage |
+| `--build-version` | 0 | the stamp |
+| `--port 6390 --engine mem --bind 127.0.0.1` | — | still starts and serves |
+
+## What the half-fix looked like before this
 
 **An unrecognised argument is silently ignored.** This binary has no argument
 parser; it scans `env::args()` once per flag it cares about. So:
