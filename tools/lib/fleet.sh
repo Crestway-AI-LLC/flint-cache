@@ -326,8 +326,34 @@ fleet_warm() {
   return 0
 }
 
+# What the box looked like AT THIS MOMENT, in the drill's own log.
+#
+# BUG-0035 cost an evening reconstructing whether another project was building
+# during a gate that shed 20328 writes -- from ps snapshots taken at unrelated
+# times and from what anyone remembered. A flaky run and a clean run must
+# differ by a RECORD, not by a recollection. This is the cheap half of that:
+# one line, at the moments that matter, in the log that is kept.
+#
+# Reads args, never comm. comm truncates at 15 characters, which silently
+# turns flint-controlplane into flint-controlpl and drops seats from a census
+# -- that cost a peer session a wrong seat count during a release verification
+# on the day this was written.
+fleet_env_note() {
+  local where="${1:-}" sib load
+  load="$(uptime | sed 's/.*averages*: //')"
+  sib="$(_fleet_sibling | cut -c1-90 | tr '\n' ';' | sed 's/;$//')"
+  if [ -n "$sib" ]; then
+    echo "  env${where:+ [$where]}: load $load | SIBLING BUILD/TEST ON THIS BOX: $sib"
+  else
+    echo "  env${where:+ [$where]}: load $load | no sibling processes"
+  fi
+}
+
 fleet_guard() {
   local foreign sibling
+  # Before the decision, not after it: a refused run is exactly the run whose
+  # environment someone will want to read later.
+  fleet_env_note guard
   foreign="$(_fleet_foreign)"
   sibling="$(_fleet_sibling)"
   [ -z "$foreign" ] && [ -z "$sibling" ] && return 0
@@ -520,6 +546,10 @@ cli_int() {
 # $1 = port, $2 = name of a function writing the RESP stream to stdout.
 fleet_load_resp() {
   local port="$1" gen="$2" errs replies out
+  # The load phase is where the shed happens, and it can be minutes after
+  # fleet_guard ran. Record here too, so a -THROTTLED count and the box that
+  # produced it sit on adjacent lines.
+  fleet_env_note load
   # `|| true`: --pipe exits non-zero when it counts errors, and under the
   # caller's `set -e`/`pipefail` that alone would abort the drill here.
   out=$( { $gen | valkey-cli -p "$port" --pipe 2>&1 | tail -1; } || true )

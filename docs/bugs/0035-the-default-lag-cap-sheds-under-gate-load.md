@@ -136,6 +136,25 @@ reason about it afterwards: record load average and the non-flint process set
 into the drill log at the moment the load phase starts. Then a shed run and a
 clean run differ by a recorded fact instead of by a recollection.
 
+**Done.** `fleet_env_note` writes one line — load average plus any sibling
+project build/test on the box — from `fleet_guard` (before it decides, so a
+REFUSED run still says what it saw) and from `fleet_load_resp` (the load phase
+itself, which can be minutes later and is where the shed happens). It reads
+`args`, never `comm`, which truncates at 15 characters and silently turns
+`flint-controlplane` into `flint-controlpl`. The next sighting will carry its
+environment on the adjacent line instead of needing an evening of
+reconstruction.
+
+A note on how that was verified, because one control failed in the day's own
+manner. The intended positive control copied `/bin/sleep` to
+`…/flint-fake/release/probe-harness` and ran it — macOS refused to start a
+copied system binary, so the process never existed and the check printed "no
+sibling processes" for a box that genuinely had none. That is a control that
+could not create its condition, reporting the same output as a working one.
+Coverage rests instead on three things that did run: the eight-path table test
+with its mutation (BUG-0036), a live `_fleet_sibling` naming a real flint-kv
+test binary, and the formatting branch driven with a stubbed detector.
+
 If concurrent load IS the trigger, the finding stands and strengthens rather
 than dissolving: a busy host is an ordinary production condition, and it
 reached a cap two documents describe as unreachable under any load.
