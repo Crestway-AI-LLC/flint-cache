@@ -318,6 +318,27 @@ impl RocksKv {
         // (docs/scale-to-100tb.md). RocksDB reads pre-filter SSTs fine, so this
         // is forward-compatible; filters populate as compaction rewrites data.
         opts.set_block_based_table_factory(&table_options());
+        // S0.1'S OTHER HALF: the MEMTABLE has no filter by default, so every
+        // point read seeks its skiplist before it can reach an SST — proving
+        // a key ABSENT from a structure it was almost never in. In a
+        // read-mostly cache that is the common case, not the rare one: a
+        // hot-GET profile spent 104 samples in SkipListRep::Iterator::Seek
+        // and 56 in MemTable::KeyComparator, ~14% of the RocksDB read path,
+        // doing exactly that. A whole-key memtable bloom turns the seek into
+        // a bit test.
+        //
+        // BOTH LINES ARE LOAD-BEARING. `memtable_whole_key_filtering` is
+        // documented as effective only while `memtable_prefix_bloom_size_ratio`
+        // is non-zero, so setting the flag alone yields a config that reads as
+        // enabled and filters nothing. The test below fails if either goes.
+        //
+        // 0.02 of the write buffer is generous for whole keys: a 64 MiB
+        // memtable of 100-byte values holds ~640 k keys, and 10 bits each is
+        // ~0.8 MiB, about 1.2%. The ratio caps at 0.25 and the filter is
+        // allocated per live memtable, so this trades a little RAM for a
+        // skiplist seek on every point read that misses it.
+        opts.set_memtable_prefix_bloom_ratio(0.02);
+        opts.set_memtable_whole_key_filtering(true);
         Ok(Self {
             db: DB::open(&opts, path)?,
             path: path.to_path_buf(),
@@ -602,6 +623,7 @@ mod audit {
     /// "reads the filter short-circuited", so with statistics on it must move
     /// for IN-RANGE absent keys (out-of-range keys are excluded by the SST
     /// key-range check before the filter is even consulted).
+
     #[test]
     fn bloom_filter_catches_in_range_misses() {
         let dir = TempDir::new("bloom");
@@ -625,6 +647,51 @@ mod audit {
         assert!(
             stat_count(&stats, "rocksdb.bloom.filter.useful") > 0,
             "bloom filter never fired on ~5000 in-range misses — not configured?\n{stats}"
+        );
+    }
+
+    /// The memtable bloom must SKIP the skiplist, not merely be configured.
+    ///
+    /// `memtable_whole_key_filtering` is documented as effective only while
+    /// `memtable_prefix_bloom_size_ratio` is non-zero, so either setting
+    /// alone is a config that reads as enabled and filters nothing. No
+    /// assertion about the OPTIONS can tell those apart — only the counter
+    /// for "the bloom ruled this key out" can, which is why this asserts the
+    /// capability and not the settings.
+    ///
+    /// It opens through `RocksKv::open`, the production path, so deleting
+    /// either line from the shipped options fails this test rather than a
+    /// copy of them kept in the test.
+    #[test]
+    fn memtable_bloom_skips_the_skiplist_for_absent_keys() {
+        use rocksdb::perf::{PerfContext, PerfMetric, PerfStatsLevel, set_perf_stats};
+        let dir = TempDir::new("memtable-bloom");
+        let kv = RocksKv::open(&dir.0).expect("open");
+        // Land the even keys in an SST, so the memtable no longer holds them.
+        for i in (0..2_000u32).step_by(2) {
+            kv.put(format!("k{i:08}").as_bytes(), b"v");
+        }
+        kv.flush_checked().expect("flush to sst");
+        // Then put something else, so a memtable EXISTS to be consulted. A
+        // read against an empty memtable would skip it for a different
+        // reason and prove nothing about the filter.
+        kv.put(b"resident", b"v");
+
+        set_perf_stats(PerfStatsLevel::EnableCount);
+        let mut perf = PerfContext::default();
+        perf.reset();
+        // Odd keys: absent everywhere, and absent from the MEMTABLE in
+        // particular, which is the lookup the filter is meant to skip.
+        for i in (1..2_000u32).step_by(2) {
+            assert!(kv.get(format!("k{i:08}").as_bytes()).is_none());
+        }
+        let ruled_out = perf.metric(PerfMetric::BloomMemtableMissCount);
+        set_perf_stats(PerfStatsLevel::Disable);
+        assert!(
+            ruled_out > 0,
+            "the memtable bloom ruled out NOTHING across 1000 reads of keys \
+             absent from the memtable: whole-key filtering is off, or the \
+             size ratio is 0, so every one of those paid a skiplist seek"
         );
     }
 
