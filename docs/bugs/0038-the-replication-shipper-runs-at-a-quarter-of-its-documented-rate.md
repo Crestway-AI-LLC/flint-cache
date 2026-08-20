@@ -1,6 +1,6 @@
-# BUG-0038: the replication shipper runs at a quarter of its documented rate, and the lag caps were set against the documented one (OPEN)
+# BUG-0038: the replication shipper runs at a quarter of its documented rate, and the lag caps were set against the documented one (FIXED)
 
-Status: OPEN 2026-08-20 · Severity: medium — nothing is lost or corrupted;
+Status: FIXED 2026-08-20 · Severity: medium — nothing is lost or corrupted;
 what is wrong is that a shipped default (`--lag-soft-ms 500`) sits BELOW the
 system's ordinary operating point, so the brake is engaged during healthy
 traffic and BUG-0035's margin is thin by construction
@@ -89,3 +89,82 @@ continuously-fed drain may not reach it.
 The baseline was re-run twice afterwards to confirm the harness was not the
 variable: both completed the full 400k load and reproduced 222.9 MiB at
 79.7-88.2 ms per cycle.
+
+## Fixed: 615 ms -> 115 ms, by acking once per read group instead of per batch
+
+**The attribution above is wrong and is corrected here rather than edited out.**
+This file said the loop was copy-bound and serial and proposed overlapping the
+master's ~18 ms of fetch+encode. That would have bought almost nothing.
+
+Instrumenting *inside* `drain_acks` — counting reads and frames and timing the
+reads themselves — settles it:
+
+    drain_acks total          23.7 ms
+      BLOCKED inside read()   21.4 ms   <- 90%
+      CPU                      2.2 ms
+      reads per cycle            179
+      ACK frames per cycle      3626
+
+`drain_acks` was not computing, it was **waiting**. Add the 42 ms socket write,
+also waiting, and **~63 of every 80 ms was the master blocked on the replica**.
+The master's own work was ~20 ms. The loop was never the bottleneck; the
+replica's apply path was, and every master-side optimisation was aimed at 2 ms.
+
+### The fix
+
+The replica sent one ACK **per applied WAL batch** — a 30-byte `write()` each,
+3626 per shipped cycle. Replication is ordered, so every ACK but the highest
+is the same fact retold. It now accumulates `pending_ack` and flushes one frame
+when the loop is about to block on `read()`.
+
+    ACK frames per cycle   3626 -> 38
+    reads per cycle         179 -> 36
+
+Measured interleaved, four rounds each, quiet box:
+
+| arm | load s | `lag_ms_max` | `lag_max_gap` | `writes_delayed_soft` |
+|---|---|---|---|---|
+| main | 5.74 | 622 | 39473 | 266 |
+| fixed | 5.43 | **120** | 10178 | **0** |
+| main | 5.40 | 627 | 22429 | 227 |
+| fixed | 5.40 | **109** | 7798 | **0** |
+| main | 5.72 | 585 | 33928 | 240 |
+| fixed | 5.60 | **105** | 7725 | **0** |
+| main | 5.82 | 608 | 31666 | 250 |
+| fixed | 5.38 | **190** | 14070 | **0** |
+
+**615 ms -> 115 ms of steady-state lag, and `writes_delayed_soft` is zero in
+every run** — ordinary traffic stops entering the soft band at all. Load time
+is unchanged, so this is not a throughput win: the replica spends its CPU
+applying instead of on 3626 syscalls, and the replica was the constraint.
+
+Margin to the shipped 1000 ms hard cap goes from ~370 ms to ~885 ms, which is
+the whole of BUG-0035's thin margin.
+
+### Two hypotheses that died, so they are not retried
+
+**The mutex.** `record_ack` took the `replicas` mutex once per frame, ~7870
+per cycle. Coalescing that on the MASTER side — accumulate the max, record
+once — ran clean three times and changed nothing measurable. It was chasing
+2.2 ms of CPU. Not shipped: a change that buys nothing should not ship.
+
+**The memmove.** `ack_buf.drain(..used)` per frame looked O(N^2). It is not:
+the old code read in 4 KiB chunks and drained after each frame, so the buffer
+never exceeded ~4 KB and the total movement is ~1.6 ms per cycle. A cursor
+version measured *worse*, which was contention, not the change.
+
+### The measurement trap, which caught me three times in one session
+
+I first concluded the replica coalescing "buys zero latency" — drain time was
+23.7 ms before and 23.8 ms after. That measurement was taken at load average
+14-25 on 8 cores. On a quiet box the same change is a 5.3x win.
+
+Every wrong turn here has the same shape: a latency measurement taken while a
+peer's benchmark had the box at 7x oversubscription. What worked:
+
+- **counts instead of times** where possible — ACK frames per cycle is
+  load-insensitive, and 3626 -> 38 was true at load 59;
+- **interleaved A/B** (A B A B) rather than AAA then BBB, so drift hits both
+  arms;
+- **checking `uptime` before believing any number**, and checking that the two
+  binaries under test actually differ by sha before trusting an A/B at all.

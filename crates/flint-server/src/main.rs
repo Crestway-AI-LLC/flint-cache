@@ -4033,6 +4033,29 @@ mod replica {
         // after applied batches would make a healthy idle pair look dead
         // after the liveness window.
         let mut last_ack_sent = std::time::Instant::now();
+        // Applied but not yet told to the master. One ACK per WAL batch meant
+        // a 30-byte write() per batch — 3626 of them per shipped cycle — and
+        // the master spent 21ms of every 80ms cycle BLOCKED in read() draining
+        // them, 179 reads to collect one cycle's worth (measured, BUG-0038).
+        // Replication is ordered, so only the highest applied sequence carries
+        // information; the ones before it are the same fact, retold.
+        //
+        // Flushed when this loop is about to block on read(), which is the
+        // moment there is nothing better to do, so the master never learns
+        // later than it could have. Measured interleaved on a quiet box, four
+        // rounds each: steady-state lag_ms_max 615ms -> 115ms, and
+        // writes_delayed_soft 250 -> ZERO, i.e. the soft cap stops being
+        // entered by ordinary traffic at all. Throughput is unchanged; what
+        // changes is that the replica spends its CPU applying instead of on
+        // 3626 write() calls per cycle, and it is the replica that was the
+        // bottleneck.
+        //
+        // THE HEARTBEAT IS NOW LOAD-BEARING FOR MORE THAN LIVENESS. It sends
+        // kv.last_applied() every 500ms whatever else happens, which is what
+        // bounds ack latency if the stream is ever saturated enough that this
+        // loop stops reaching NeedMore. Do not weaken it to a liveness-only
+        // check that skips when an ACK was recently sent.
+        let mut pending_ack: Option<u64> = None;
         loop {
             if last_ack_sent.elapsed() >= std::time::Duration::from_millis(500) {
                 out.clear();
@@ -4153,19 +4176,25 @@ mod replica {
                                     "apply: {other:?}"
                                 ))),
                             })?;
-                            out.clear();
-                            encode(
-                                &Value::Array(Some(vec![
-                                    Value::Bulk(Some(b"ACK".to_vec())),
-                                    Value::Bulk(Some(batch.last_seq.to_string().into_bytes())),
-                                ])),
-                                &mut out,
-                            );
-                            stream.write_all(&out)?;
+                            pending_ack = Some(batch.last_seq);
                         }
                     }
                 }
                 Ok(Decoded::NeedMore) => {
+                    // About to block: tell the master everything applied since
+                    // the last flush, as one frame.
+                    if let Some(seq) = pending_ack.take() {
+                        out.clear();
+                        encode(
+                            &Value::Array(Some(vec![
+                                Value::Bulk(Some(b"ACK".to_vec())),
+                                Value::Bulk(Some(seq.to_string().into_bytes())),
+                            ])),
+                            &mut out,
+                        );
+                        stream.write_all(&out)?;
+                        last_ack_sent = std::time::Instant::now();
+                    }
                     if stop.load(Ordering::Relaxed) {
                         return Ok(());
                     }
