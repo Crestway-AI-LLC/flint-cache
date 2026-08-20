@@ -148,6 +148,36 @@ impl RocksKv {
 /// drills use only what they touch.
 const BLOCK_CACHE_BYTES: usize = 512 * 1024 * 1024;
 
+/// The block cache capacity actually used, so the "follow-on" above is
+/// reachable without a rebuild.
+///
+/// 512 MiB is a floor chosen for a laptop, not for the box this ships on. A
+/// hot-GET profile on a 1 GiB dataset spent 44.8% of on-CPU work in the
+/// RocksDB read path and 6.1% in `pread`, and every one of those preads is a
+/// block the cache had room to hold on any real node — an i4i.2xlarge has
+/// 61 GiB and this asks for under 1% of it.
+///
+/// Env rather than a config file on purpose: this needs to be measurable
+/// before it is made adaptive, and a default that changes with the machine
+/// is a default nobody can reproduce. Sizing from system RAM is the next
+/// step and should land WITH the measurement that justifies the fraction.
+fn block_cache_bytes() -> usize {
+    match std::env::var("FLINT_BLOCK_CACHE_MB") {
+        Ok(v) => match v.trim().parse::<usize>() {
+            Ok(mb) if mb > 0 => mb * 1024 * 1024,
+            _ => {
+                eprintln!(
+                    "FLINT_BLOCK_CACHE_MB={v:?} is not a positive integer; \
+                     using the {} MiB default",
+                    BLOCK_CACHE_BYTES / (1024 * 1024)
+                );
+                BLOCK_CACHE_BYTES
+            }
+        },
+        Err(_) => BLOCK_CACHE_BYTES,
+    }
+}
+
 /// Block-based table options every data SST is written with.
 ///
 /// S0.1 — the whole-key bloom filter is the load-bearing part for point reads:
@@ -170,7 +200,7 @@ fn table_options() -> BlockBasedOptions {
     bbt.set_cache_index_and_filter_blocks(true);
     bbt.set_pin_top_level_index_and_filter(true);
     bbt.set_pin_l0_filter_and_index_blocks_in_cache(true);
-    bbt.set_block_cache(&Cache::new_lru_cache(BLOCK_CACHE_BYTES));
+    bbt.set_block_cache(&Cache::new_lru_cache(block_cache_bytes()));
     bbt
 }
 
@@ -352,12 +382,27 @@ impl Kv for RocksKv {
         self.db.get(key).ok().flatten()
     }
 
+    /// `get_pinned` hands back a slice that borrows the block-cache entry,
+    /// so the caller reads the bytes where they already are instead of
+    /// allocating and copying them first.
+    fn with_value(&self, key: &[u8], f: &mut dyn FnMut(&[u8])) -> bool {
+        match self.db.get_pinned(key) {
+            Ok(Some(p)) => {
+                f(&p);
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn put(&self, key: &[u8], value: &[u8]) {
         let _ = self.db.put(key, value);
     }
 
     fn delete(&self, key: &[u8]) -> bool {
-        let existed = self.get(key).is_some();
+        // Existence only — `get` here allocated and copied the whole value
+        // just to throw it away.
+        let existed = self.db.get_pinned(key).ok().flatten().is_some();
         let _ = self.db.delete(key);
         existed
     }

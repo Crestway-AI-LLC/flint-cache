@@ -111,20 +111,52 @@ impl<'a> StringStore<'a> {
     /// Live string row; WRONGTYPE if the key holds another type.
     fn read_live(&self, slot: u16, key: &[u8]) -> Result<Option<StringMeta>, StoreError> {
         let mk = self.meta_key(slot, key);
-        let Some(row) = self.kv.get(&mk) else {
-            return Ok(None);
-        };
-        let Some(header) = MetaHeader::decode(&row) else {
-            return Ok(None);
-        };
-        if header.is_expired((self.clock)()) {
-            self.kv.delete(&mk);
-            return Ok(None);
+        // BORROW THE ROW, COPY ONLY THE PAYLOAD. `kv.get` allocated the whole
+        // row and copied it out of the block cache, and then
+        // `StringMeta::decode` allocated the payload and copied it AGAIN out
+        // of that row — two allocations and two ~1 KB copies where the reader
+        // needs one. Decoding against a borrowed row leaves exactly the
+        // payload allocation, which is the one the caller actually keeps.
+        //
+        // The expiry delete happens AFTER the borrow ends: `with_value` may
+        // hold a block-cache handle for the closure's lifetime, and calling
+        // back into the store while holding one is what its contract forbids.
+        enum Row {
+            Missing,
+            Undecodable,
+            Expired,
+            WrongType,
+            Live(Box<StringMeta>),
         }
-        if header.value_type() != Some(ValueType::String) {
-            return Err(StoreError::WrongType);
+        let mut outcome = Row::Missing;
+        let now = (self.clock)();
+        self.kv.with_value(&mk, &mut |row| {
+            let Some(header) = MetaHeader::decode(row) else {
+                outcome = Row::Undecodable;
+                return;
+            };
+            if header.is_expired(now) {
+                outcome = Row::Expired;
+                return;
+            }
+            if header.value_type() != Some(ValueType::String) {
+                outcome = Row::WrongType;
+                return;
+            }
+            outcome = match StringMeta::decode(row) {
+                Some(m) => Row::Live(Box::new(m)),
+                None => Row::Undecodable,
+            };
+        });
+        match outcome {
+            Row::Missing | Row::Undecodable => Ok(None),
+            Row::Expired => {
+                self.kv.delete(&mk);
+                Ok(None)
+            }
+            Row::WrongType => Err(StoreError::WrongType),
+            Row::Live(m) => Ok(Some(*m)),
         }
-        Ok(StringMeta::decode(&row))
     }
 
     /// Plain SET overwrites any existing type (Redis semantics), so the

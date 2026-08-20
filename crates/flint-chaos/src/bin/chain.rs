@@ -67,6 +67,23 @@ fn probe_key(port: u16, k: &str) -> Probe {
     }
 }
 
+/// One FLINTINFO field, or None if the node cannot be read.
+///
+/// Added for BUG-0023: the build is a firehose of pipelined SETs, and until
+/// `writes_shed_lag` existed the only way to know whether the master had
+/// REFUSED any of them was to infer it from a key going missing thousands of
+/// hops later. A counter read straight off the master replaces that whole
+/// chain of reasoning with one number.
+fn info_field(port: u16, name: &str) -> Option<String> {
+    let info = match Client::connect(port).and_then(|mut c| c.call(&[b"FLINTINFO"])) {
+        Ok(Value::Bulk(Some(v))) => String::from_utf8_lossy(&v).into_owned(),
+        _ => return None,
+    };
+    info.split(['\r', '\n'])
+        .find(|l| l.starts_with(name))
+        .map(|l| l.trim_start_matches(name).to_string())
+}
+
 /// One coherent FLINTINFO snapshot per node, rendered as a single line.
 ///
 /// Deliberately ONE round trip rather than a field-at-a-time helper called
@@ -248,6 +265,25 @@ fn main() {
         "built {n} links in {:.1}s; waiting for replica to catch up",
         build_start.elapsed().as_secs_f64()
     );
+    // WAS THE BUILD REFUSED, AND HOW CLOSE DID IT COME? Measured, not inferred.
+    //
+    // `pipeline` now fails loudly on a refusal, so shed>0 here should be
+    // unreachable — printing it anyway is the check on that claim. `lag_ms_max`
+    // is the more useful number day to day: it is the PEAK, where FLINTINFO's
+    // `lag_ms` is instantaneous and a spike that would shed thousands is
+    // invisible to any poll that straddles it. A build that ran at 900ms of a
+    // 1000ms cap passed, and should not be reported the same way as one that
+    // ran at 40ms.
+    {
+        let m = cluster.master();
+        let shed = info_field(m, "writes_shed_lag:").unwrap_or_else(|| "<unreadable>".into());
+        let peak = info_field(m, "lag_ms_max:").unwrap_or_else(|| "<unreadable>".into());
+        let soft = info_field(m, "lag_soft_ms:").unwrap_or_else(|| "?".into());
+        let hard = info_field(m, "lag_hard_ms:").unwrap_or_else(|| "?".into());
+        eprintln!(
+            "  [build] writes_shed_lag={shed} lag_ms_max={peak} (caps soft={soft} hard={hard})"
+        );
+    }
     assert!(
         cluster.wait_healthy(Duration::from_secs(60)),
         "replica must fully catch up before traversal"

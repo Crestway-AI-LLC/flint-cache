@@ -79,6 +79,38 @@ pub const MAX_KEY_BYTES: u64 = u16::MAX as u64;
 /// depend on it.
 pub trait Kv: Send + Sync {
     fn get(&self, key: &[u8]) -> Option<Vec<u8>>;
+    /// Borrow a value IN PLACE instead of copying it out. Returns whether the
+    /// key existed; `f` runs only when it did.
+    ///
+    /// `get`'s signature forces an owned `Vec`, so every reader pays an
+    /// allocation and a full copy no matter what it intends to do with the
+    /// bytes. Under hot-GET load that is not a rounding error: a profile put
+    /// malloc/free at 18.7% and memcpy at 14.7% of the server's on-CPU work,
+    /// and a single GET allocated and copied ~1 KB THREE times — once out of
+    /// the block cache into the row, once out of the row into the payload,
+    /// once into the socket buffer.
+    ///
+    /// A store that can hand back a borrowed slice (RocksDB's `get_pinned`
+    /// keeps the block-cache entry alive and hands out a pointer into it)
+    /// removes the first of those entirely.
+    ///
+    /// The default body calls `get`, so every existing implementation stays
+    /// correct and only stores that can genuinely borrow override it.
+    ///
+    /// CONTRACT: `f` must not call back into this store. A borrowed value may
+    /// pin an internal resource — a block-cache handle — for its lifetime,
+    /// and re-entering while holding one is how a self-deadlock gets written.
+    /// Do the work that needs the store AFTER this returns; `read_live`'s
+    /// expiry delete is the worked example.
+    fn with_value(&self, key: &[u8], f: &mut dyn FnMut(&[u8])) -> bool {
+        match self.get(key) {
+            Some(v) => {
+                f(&v);
+                true
+            }
+            None => false,
+        }
+    }
     fn put(&self, key: &[u8], value: &[u8]);
     /// Returns true if the key existed.
     fn delete(&self, key: &[u8]) -> bool;
