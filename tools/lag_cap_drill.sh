@@ -12,8 +12,19 @@
 #     writes shed -THROTTLED (retried): 0
 #
 # Not evidence of correctness: evidence that the condition was never created.
-# Loopback replication acks in ~0.2ms and cross-host was not much slower, so a
-# 1000ms cap is simply unreachable under any load the harness generates.
+#
+# THAT ORIGINAL DIAGNOSIS WAS WRONG, and the sentence it justified is retracted.
+# It read: "Loopback replication acks in ~0.2ms and cross-host was not much
+# slower, so a 1000ms cap is simply unreachable under any load the harness
+# generates." Both clauses are true and the conclusion does not follow. A
+# single ack is fast; a PIPELINED stream does not wait for one. On an idle
+# laptop, one continuous 500k-write pipe against a healthy pair at shipped
+# defaults peaked at lag_ms_max=631 -- 63% of the cap, no stall, nothing
+# else running. Freeze that replica for 700ms and the cap is crossed.
+#
+# The measurement that hid it for a year: every earlier probe used BURSTY
+# load, which drains between batches and never lets a backlog build. Reaching
+# for a mean ack latency to reason about a queue was the error underneath.
 #
 # So this drill lowers the cap until it is reachable and asserts the shed path
 # actually fires. It is the cheap half of the RPO evidence problem: no AWS, no

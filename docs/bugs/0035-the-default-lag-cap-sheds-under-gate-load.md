@@ -4,6 +4,14 @@ Status: OPEN 2026-08-20 · Severity: medium — one half is a documented claim
 with a counter-example, the other is a drill that reports a verdict for
 assertions it never reached
 
+**Update 2026-08-20, later:** the mechanism is reproduced at shipped defaults
+and both false claims are corrected — see "Reproduced at shipped defaults" at
+the foot of this file. The design half is answered too ("The design half,
+answered", below): the caps are mis-POSITIONED, not mis-shaped, because the
+soft cap of 500 ms sits BELOW the 631 ms ordinary operating point. The cause
+of that operating point is BUG-0038. Still open: BUG-0038's fix, and gate
+21's specific perturbation — now merely unnamed rather than unexplained.
+
 ## Symptom
 
 Gate 21 on `flintmigrations-all` at `5e3d81e`: 116 PASS, 1 FAIL.
@@ -237,3 +245,123 @@ contradiction rather than resolve it.
 `ReplHub::new` stores `lag_hard_ms.max(lag_soft_ms)`, so any fix must move
 both caps together — passing only `--lag-hard-ms` leaves the 500 ms default
 soft cap in force. `lag_cap_drill.sh`'s header records this trap already.
+
+## Reproduced at shipped defaults — the margin is ~370 ms, not 1000 ms
+
+The open half is closed as a mechanism, though not as a named culprit for
+gate 21 specifically. Two facts, both measured on an idle laptop against a
+plain local pair with no config changed:
+
+**1. Ordinary sustained load already sits two thirds of the way to the cap.**
+One continuous 500k-write pipe, healthy replica, shipped 500/1000 caps:
+
+    t=1s lag_ms=303  t=2s lag_ms=472  t=3s lag_ms=56  t=4s lag_ms=266  t=5s lag_ms=514
+    FINAL lag_ms_max=631  lag_max_gap=40161  shed_lag=0  delayed_soft=217
+
+`lag_ms_max=631`. Nothing was stalled, nothing else was running, and the run
+shed zero — but it did so with **369 ms of margin, not 1000 ms**. The soft
+band engaged 217 times and held, which is the design working.
+
+**2. Spend that margin and the shed is immediate.** Same pair, same defaults,
+replica SIGSTOPped for 1.2 s inside the load:
+
+    t=1.0 mid-load  lag_ms=325   seq_lag=40733   shed=0
+    STOP  +0.3s     lag_ms=563   seq_lag=78016   shed=0        delayed=29
+          +0.6s     lag_ms=900   seq_lag=78128   shed=0        delayed=143
+          +0.9s     lag_ms=1246  seq_lag=78157   shed=99163    delayed=166
+          +1.2s     lag_ms=1579  seq_lag=78157   shed=232814   delayed=166
+          +1.5s     lag_ms=1914  seq_lag=78157   shed=323862   delayed=166
+          +1.8s     lag_ms=none  live=0          shed=323862   (liveness window
+                                                                expired; no
+                                                                replica, no cap,
+                                                                writes flow again)
+
+323862 writes shed at the shipped defaults. **A ~700 ms pause of the replica
+process is all it takes**, and a contended box supplies one for free — which
+is exactly the largest uncontrolled input this file already identified, now
+with a mechanism attached rather than a suspicion.
+
+Note the last two rows. Between the hard cap (1000 ms) and `LIVENESS_WINDOW_MS`
+(2000 ms) there is a one-second band where a replica that is *frozen* still
+counts as *live*, so the master sheds against it; past 2000 ms it stops
+counting at all and the shed stops. The widowed grace exists for that second
+half and is what `flintctl` turns on for pair members. A bare pair started by
+hand, as here, has it at 0.
+
+## Why five more negatives came first, and the mistake they share
+
+Before the above, a load sweep at shipped defaults — 1, 2, 4, 8, 16 concurrent
+writers, 20k each, up to 320000 writes — produced peak lags of 47, 76, 36, 34,
+35 ms. Flat. Load-independent. A sixth negative, and it looked conclusive.
+
+It was wrong for the same reason the four attempts above it were: **bursty
+load drains between batches.** Every one of those probes wrote in chunks that
+finished faster than a backlog could build, so replication caught up in the
+gaps and the peak never moved no matter how much total volume went through.
+The single continuous pipe reaches 631 ms because nothing ever lets the queue
+empty.
+
+The generalisation is the same one `lag_cap_drill.sh`'s header got wrong: a
+mean ack latency (~0.2 ms on loopback) says nothing about the depth of a
+pipelined queue, and scaling total volume does not create a backlog if the
+offered load is still bursty. Only *sustained* offered load does. Both that
+header and `slo.md`'s no-stall row are corrected in the same commit as this.
+
+## What this does not settle
+
+No claim that gate 21's specific perturbation is identified. What changes is
+that it no longer has to be exotic: the headroom is ~370 ms, and any pause of
+the replica past that crosses the cap. `fleet_env_note` will name the
+environment at the next sighting, and the master now keeps its own record —
+`writes_shed_lag`, `lag_ms_max` and `lag_max_gap` in `FLINTINFO`, so the next
+occurrence does not have to be reconstructed from a client's error log.
+
+`lag_max_gap` is the discriminator, and the three signatures are now measured
+rather than reasoned about: a gap that GROWS with the lag is a replica slower
+than the master; a gap that FREEZES while lag climbs (78157, unmoving, above)
+is a replica not running at all; a SMALL gap under a climbing lag would be the
+ack path rather than the data path, and has not been seen.
+
+## The design half, answered: the caps are mis-POSITIONED, not mis-shaped
+
+The open question was whether shedding is the right response or whether the
+soft band should push back harder first. Measuring the shipper (BUG-0038)
+answers it, and the answer is neither — it reverses the intuition this file
+started with.
+
+**`--lag-soft-ms` ships at 500 ms and the ordinary operating peak is 631 ms.**
+So the soft band is not a margin the system occasionally touches under stress;
+it is territory the system sits in during healthy traffic. Two clean no-stall
+runs delayed 217 and 423 writes with nothing wrong. `--lag-hard-ms 1000` is
+about 1.6x the natural operating point.
+
+That changes what each candidate fix is worth:
+
+- **Fix the shipper (BUG-0038).** 50 MiB/s in serial 80 ms cycles is what puts
+  the operating point at 631 ms. Halving the cycle puts it near 380 ms and the
+  SHIPPED 500/1000 caps suddenly have the margin they were always assumed to
+  have. This is the root cause and the only option that makes the published
+  RPO honest without widening it. **Do this first.**
+
+- **Raise the caps to match reality** (soft ~1500 / hard ~3000). Cheap, and
+  it stops the brake firing on healthy traffic — but it pays for a slow
+  shipper with three times the RPO, which is selling the product's headline
+  bound to avoid an engineering problem. Defensible only as a stated interim,
+  and `slo.md` would have to say that is what it is.
+
+- **Proportional backpressure in the soft band** — a delay rising with depth
+  instead of a flat 2 ms. This was the first instinct and it is the WEAKEST of
+  the three, because the operating point is already inside the band: a
+  stronger brake there throttles ordinary healthy traffic, harder and more
+  often, to solve a problem that is not the brake's shape but its position.
+
+**The terminal shed stays either way.** Two reasons, both now measured. A
+frozen replica cannot be backpressured — the stall trace above went 563 ->
+1914 ms with the master shedding and the replica simply not running, and no
+delay curve reaches a stopped process. And the shed is what makes "at most one
+lag-cap window's worth is at risk" TRUE rather than aspirational: remove the
+refusal and the bound is enforced by nothing, which is the position Redis is
+in when it keeps acking and lets a replica fall arbitrarily behind.
+
+What stays open here is now only BUG-0038's fix and gate 21's unnamed
+perturbation.

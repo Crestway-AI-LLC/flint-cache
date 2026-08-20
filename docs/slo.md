@@ -162,9 +162,20 @@ as the stall lasts. Measured, with the replica frozen for 1800 ms:
 
 | stall | lag cap | writes shed `-THROTTLED` | deepest acked-write loss |
 |---|---|---|---|
-| none | 1000 ms | 0 | **0 ms** |
+| none | 1000 ms | 0 † | **0 ms** |
 | 1800 ms | 1000 ms | 75 | 1757 ms |
 | 1800 ms | 200 ms | 140 | 1753 ms |
+
+† **The first row has almost no margin behind it, which the zero hides.** A
+sustained pipelined writer against a healthy pair on an idle box — no stall,
+shipped defaults — peaks at **631 ms of lag**, 63% of the way to the cap
+(measured on a local pair; `lag_ms_max` in `FLINTINFO` reports it). The
+remaining ~370 ms is all that separates a clean run from a shedding one, so
+anything that pauses the replica for longer than that crosses the cap without
+any fault in the product. Frozen for 1.2 s, the same pair shed 323862 writes
+at these defaults. Read the row as "zero, with 370 ms to spare", not as
+"zero, comfortably" — BUG-0035 is the gate hitting exactly that margin on a
+contended box.
 
 Both halves are visible there. Tightening the cap fivefold nearly doubled the
 shedding — the valve really does close harder — while the age of the oldest
