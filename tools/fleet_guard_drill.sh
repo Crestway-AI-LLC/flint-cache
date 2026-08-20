@@ -135,5 +135,12 @@ echo "  force proceeds"
 
 echo "PASS: fleet_guard sees sibling projects' fleets, refuses without claiming ownership, does not misread our own binaries, and still honours FORCE"
 
-[ "${A_SKIPPED:-0}" = "1" ] \
-  && echo "NOTE: case A (quiet box) was NOT exercised on this run — see above"
+# `[ test ] && echo` as the LAST command makes the script's exit status the
+# TEST's: when case A did run, the test is false, the echo is skipped, and the
+# drill exited 1 having printed PASS. The gate read that as a failure and it
+# was right to. Same family as appending an echo to a command whose exit code
+# you meant to capture — the last statement owns the status, so say so.
+if [ "${A_SKIPPED:-0}" = "1" ]; then
+  echo "NOTE: case A (quiet box) was NOT exercised on this run — see above"
+fi
+exit 0
