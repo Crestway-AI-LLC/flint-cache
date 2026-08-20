@@ -987,3 +987,102 @@ mod gc_integration {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+/// COUNT WHAT THE CHANGE ACTUALLY CHANGED.
+///
+/// `with_value` removes an allocation and a ~1 KB copy per read. Trying to
+/// see that in TIME on a shared laptop failed twice — the same binary
+/// measured 17.81-24.47 us/op across three rounds, so a 3% effect sat well
+/// inside the noise and a throughput claim had to be withdrawn from a commit
+/// message after it was written.
+///
+/// An allocation count does not care how long a scheduler made anyone wait.
+/// The counter is THREAD-LOCAL on purpose: the test harness runs tests in
+/// parallel, so a process-wide counter would be measuring whatever else
+/// happened to be running.
+#[cfg(test)]
+mod alloc_count {
+    use super::*;
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+
+    thread_local! {
+        static ALLOCS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    struct Counting;
+    // SAFETY: every method forwards to `System` unchanged; the only addition
+    // is a thread-local increment. `try_with` because TLS may be torn down
+    // while allocations are still happening at thread exit, and a `const`
+    // initializer keeps the counter itself from allocating.
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+            let _ = ALLOCS.try_with(|c| c.set(c.get() + 1));
+            unsafe { System.alloc(l) }
+        }
+        unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+            unsafe { System.dealloc(p, l) }
+        }
+        unsafe fn realloc(&self, p: *mut u8, l: Layout, n: usize) -> *mut u8 {
+            let _ = ALLOCS.try_with(|c| c.set(c.get() + 1));
+            unsafe { System.realloc(p, l, n) }
+        }
+    }
+
+    #[global_allocator]
+    static COUNTING: Counting = Counting;
+
+    fn count<F: FnMut()>(iters: usize, mut f: F) -> usize {
+        let before = ALLOCS.with(|c| c.get());
+        for _ in 0..iters {
+            f();
+        }
+        ALLOCS.with(|c| c.get()) - before
+    }
+
+    #[test]
+    fn borrowing_a_value_allocates_less_than_copying_it_out() {
+        let dir = std::env::temp_dir().join(format!("flint-alloc-count-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let kv = RocksKv::open(&dir).expect("open");
+        let value = vec![7u8; 1024];
+        kv.put(b"k", &value);
+        // Warm every lazy path first, so the counts are steady state.
+        for _ in 0..20 {
+            let _ = kv.get(b"k");
+            kv.with_value(b"k", &mut |_| {});
+        }
+        const N: usize = 200;
+        let copying = count(N, || {
+            let v = kv.get(b"k").expect("present");
+            assert_eq!(v.len(), 1024);
+        });
+        let borrowing = count(N, || {
+            let mut seen = 0;
+            assert!(kv.with_value(b"k", &mut |v| seen = v.len()));
+            assert_eq!(seen, 1024);
+        });
+        // Pin the PROPERTY, not an inequality. Measured: get allocates
+        // exactly once per read (the row it copies out of the block cache)
+        // and with_value allocates not at all. The bounds carry margin so a
+        // rocksdb version that allocates somewhere new fails loudly instead
+        // of silently eroding the point.
+        assert!(
+            copying >= N,
+            "get should allocate at least once per read, got {copying} over {N}"
+        );
+        assert!(
+            borrowing <= N / 10,
+            "with_value should allocate ~never — it borrows the block-cache \
+             entry — but allocated {borrowing} times over {N} reads"
+        );
+        eprintln!(
+            "  [alloc] {N} reads: get={copying} with_value={borrowing} \
+             ({:.2} vs {:.2} per read)",
+            copying as f64 / N as f64,
+            borrowing as f64 / N as f64
+        );
+        drop(kv);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
