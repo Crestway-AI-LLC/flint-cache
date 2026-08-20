@@ -173,7 +173,7 @@ does not shed. Five solo runs reproduced nothing because the CONDITION was
 never created, not because the defect was absent — the same shape as
 BUG-0030's positive control.
 
-### The two diagnosed instances agree, and agree on the frontier
+### The two diagnosed instances, and a corroboration that was worth nothing
 
 The probe landed on 2026-08-19 caught two, gates 22 and 23:
 
@@ -183,11 +183,26 @@ The probe landed on 2026-08-19 caught two, gates 22 and 23:
     [lost-link] key=key0025145 hop=25144 ... dbsize=184496
     [lost-link] verdict: NEVER LANDED — absent on both members
 
-In both, the missing key is exactly `hop + 1`: the next link the walk needs,
-never any earlier one. A write lost in replication or dropped by a promotion
-would not land preferentially on the frontier. A write REFUSED during the
-build, in a batch the client never checked, lands exactly there.
+**RETRACTED, 2026-08-20.** This section originally argued that the missing
+key being exactly `hop + 1` in both instances was evidence for the build
+explanation — that "a write lost in replication would not land preferentially
+on the frontier", and that two instances agreeing on it was worth more than
+either alone.
 
+It is worth nothing. The traversal walks serially, `cur` following each
+pointer, and `diagnose_lost_link` fires on the FIRST nil it meets. It cannot
+report an earlier key missing, because it already traversed those
+successfully. So the reported key is `hop + 1` BY CONSTRUCTION, for any cause
+whatever — a refused build write, a replication loss, a promotion drop.
+Two instances agreeing on it is two instances of the traversal working as
+designed.
+
+Caught by the ops session reading the argument rather than the conclusion.
+It is the same shape as the defect this file is about: a check that could not
+have come out any other way, read as though it had.
+
+The conclusion is unaffected, because it never rested on this. The discarded
+replies are a confirmed defect in the code, and that alone is sufficient:
 "NEVER LANDED — absent on both members, so it was lost at or before the
 build/replication" was right, and the probe was pointing at the build the
 whole time.
