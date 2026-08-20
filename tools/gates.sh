@@ -131,6 +131,14 @@ _gate_prune_runs() {
   done
 }
 
+# A gate is 25 minutes of work and a sibling project's test sweep is a few.
+# Refusing a drill outright throws the whole run away over a collision that
+# would have cleared on its own, so drills QUEUE by default here: fleet_guard
+# waits this long for a sibling to finish before it gives up. Standalone
+# drills keep the old behaviour (no wait) — this is the gate's choice, not
+# the library's default. See BUG-0036.
+export FLINT_DRILL_WAIT="${FLINT_DRILL_WAIT:-900}"
+
 LOGS_ROOT="${FLINT_GATE_LOGS:-${FLINT_DRILL_ROOT:-/tmp}/flint-gates}"
 mkdir -p "$LOGS_ROOT"
 _gate_run_base="$(date -u +%Y%m%dT%H%M%SZ)-$(_gate_tree_id)"

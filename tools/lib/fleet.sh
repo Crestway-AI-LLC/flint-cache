@@ -349,6 +349,110 @@ fleet_env_note() {
   fi
 }
 
+# IS A SIBLING ACTUALLY CONTENDING, or merely present?
+#
+# The refusal below used to fire on PRESENCE, which blocks indefinitely on a
+# long-lived background process. That matters because the sibling branch is
+# not protecting anything: fleet_kill only ever signals pids from
+# _fleet_ours, anchored to our single-segment binary names, so a sibling can
+# never be killed by this suite. The only harm a sibling does is CONTENTION,
+# and contention is a matter of degree.
+#
+# WHY NOT ZERO-VS-NONZERO CPU, which would need no magic number: measured on
+# the box that prompted this, a flint-kv background process used 0.13s of CPU
+# across 3s -- about 4% of one core out of eight. Non-zero, and nowhere near
+# enough to disturb a drill. A categorical test would keep blocking forever,
+# which is the behaviour being fixed.
+#
+# So two signals, and the cheap one carries most of the weight:
+#
+#   * THE PROCESS SET CHANGING. A `cargo test` sweep spawns and reaps a
+#     rotating cast -- engine-…, stress-…, d5_sst_shape-…, load-… -- so its
+#     signature is churn, not any particular process. This needs no threshold
+#     at all and is what actually broke gates 25, 27 and 28.
+#   * AGGREGATE CPU, for the case churn cannot see: one long-running heavy
+#     test binary. Only here is a magnitude used, and it is expressed in
+#     CORES so it means the same thing on a different machine.
+#
+# BUG-0030's lesson is that a threshold calibrated on one machine is a bug in
+# waiting, so the measurement is PRINTED every time it decides. If this ever
+# proceeds when it should not, the drill log says what it measured and which
+# signal it read, which is the difference between a wrong call and a mystery.
+
+# pid and cumulative CPU centiseconds for each sibling process.
+_fleet_sibling_sample() {
+  local p t
+  _fleet_sibling | awk '{print $1}' | while read -r p; do
+    t="$(ps -p "$p" -o time= 2>/dev/null | tr -d ' ')"
+    [ -n "$t" ] || continue
+    # M:SS.cc, or H:MM:SS.cc once a process has been up an hour.
+    printf '%s %s\n' "$p" "$(printf '%s' "$t" | awk -F: '{
+        secs = 0; mult = 1
+        for (i = NF; i >= 1; i--) { secs += $i * mult; mult *= 60 }
+        printf "%d", secs * 100
+      }')"
+  done
+}
+
+# Prints "<set-changed:0|1> <cores>" across a short window.
+_fleet_sibling_activity() {
+  local win="${FLINT_SIBLING_WINDOW:-3}" s1 s2
+  s1="$(_fleet_sibling_sample)"
+  [ -n "$s1" ] || { echo "0 0.00"; return 0; }
+  sleep "$win"
+  s2="$(_fleet_sibling_sample)"
+  printf '%s\n---\n%s\n' "$s1" "$s2" | awk -v win="$win" '
+    /^---$/ { second = 1; next }
+    !second { t1[$1] = $2; next }
+             { t2[$1] = $2 }
+    END {
+      changed = 0
+      for (p in t1) if (!(p in t2)) changed = 1
+      for (p in t2) if (!(p in t1)) changed = 1
+      d = 0
+      for (p in t2) if (p in t1) { x = t2[p] - t1[p]; if (x > 0) d += x }
+      printf "%d %.2f\n", changed, d / (win * 100)
+    }'
+}
+
+# 0 = safe to proceed, 1 = still contending. Waits up to FLINT_DRILL_WAIT
+# seconds, which turns an indefinite block into a QUEUE: a sweep that ends
+# lets the drill run instead of failing it. Waiting never proceeds under
+# contention, so this weakens nothing -- it only stops throwing away a run
+# that would have been fine five minutes later.
+_fleet_sibling_settle() {
+  local budget="${FLINT_DRILL_WAIT:-0}" waited=0 act changed cores
+  local floor="${FLINT_SIBLING_CORES:-0.5}"
+  while :; do
+    act="$(_fleet_sibling_activity)"
+    changed="${act%% *}"
+    cores="${act##* }"
+    if [ -z "$(_fleet_sibling)" ]; then
+      [ "$waited" -gt 0 ] && echo "  sibling work finished after ${waited}s — proceeding"
+      return 0
+    fi
+    if [ "$changed" = "0" ] && awk "BEGIN{exit !($cores < $floor)}"; then
+      echo "  sibling present but NOT contending: ${cores} core(s) over ${FLINT_SIBLING_WINDOW:-3}s,"
+      echo "  process set unchanged (floor ${floor}). Proceeding; the env line above names it."
+      return 0
+    fi
+    if [ "$waited" -ge "$budget" ]; then
+      if [ "$changed" = "1" ]; then
+        echo "  sibling is CONTENDING: process set changing — a build or test sweep"
+        echo "  (${cores} core(s) over ${FLINT_SIBLING_WINDOW:-3}s)"
+      else
+        echo "  sibling is CONTENDING: ${cores} core(s) over ${FLINT_SIBLING_WINDOW:-3}s,"
+        echo "  at or above the ${floor}-core floor"
+      fi
+      [ "$budget" -gt 0 ] && echo "  waited ${waited}s of the ${budget}s FLINT_DRILL_WAIT budget"
+      return 1
+    fi
+    echo "  waiting for sibling work to finish (${cores} core(s), ${waited}s/${budget}s)"
+    sleep 10
+    waited=$(( waited + 10 + ${FLINT_SIBLING_WINDOW:-3} ))
+  done
+}
+
 fleet_guard() {
   local foreign sibling
   # Before the decision, not after it: a refused run is exactly the run whose
@@ -363,6 +467,13 @@ fleet_guard() {
     [ -n "$sibling" ] && n=$(( n + $(echo "$sibling" | wc -l | tr -d ' ') ))
     echo "  (FLINT_DRILL_FORCE=1: proceeding despite $n other flint process(es))"
     return 0
+  fi
+  # A sibling alone is resolved by MEASUREMENT (and possibly by waiting)
+  # before any refusal: presence is not contention. `foreign` is different --
+  # those are OUR binaries, which fleet_kill can and would signal — so that
+  # path still refuses on sight.
+  if [ -n "$sibling" ] && [ -z "$foreign" ]; then
+    _fleet_sibling_settle && return 0
   fi
   if [ -n "$foreign" ]; then
     echo "REFUSING TO RUN: this box already has Flint processes outside $FLEET_SCOPE"
@@ -456,9 +567,17 @@ fleet_kill() {
     # from the snapshot landed on a live flint-server and killed the node the
     # drill was still using, which presented as "data path disturbed" — a
     # product failure that was really a harness race.
+    # ANCHORED, exactly as _fleet_ours selected it. A substring test for
+    # "flint-" was looser than the selection that fed this loop, so a reused
+    # pid now owned by a SIBLING project (.../cargo-target/flint-kv/...
+    # contains "flint-") would pass a check whose whole job is to confirm the
+    # pid is still one of OURS -- and this repo must never signal another
+    # project's processes. A re-verification weaker than the selection is not
+    # a re-verification.
     args="$(ps -o args= -p "$pid" 2>/dev/null)"
-    case "$args" in
-      *flint-*) ;;                 # still one of ours
+    case "$(basename "${args%% *}")" in
+      flint-server|flint-proxy|flint-controlplane|flint-controller|flint-agent) ;;
+      flint-console|flint-ops|flint-register|flint-exporter|flint-meter|flint-backup) ;;
       *) continue ;;               # exited, or the pid now belongs elsewhere
     esac
     kill -9 "$pid" 2>/dev/null
