@@ -6,9 +6,11 @@ assertions it never reached
 
 **Update 2026-08-20, later:** the mechanism is reproduced at shipped defaults
 and both false claims are corrected — see "Reproduced at shipped defaults" at
-the foot of this file. Still open: whether shedding is the right response at
-all, and gate 21's specific perturbation, which is now merely unnamed rather
-than unexplained.
+the foot of this file. The design half is answered too ("The design half,
+answered", below): the caps are mis-POSITIONED, not mis-shaped, because the
+soft cap of 500 ms sits BELOW the 631 ms ordinary operating point. The cause
+of that operating point is BUG-0038. Still open: BUG-0038's fix, and gate
+21's specific perturbation — now merely unnamed rather than unexplained.
 
 ## Symptom
 
@@ -319,3 +321,47 @@ rather than reasoned about: a gap that GROWS with the lag is a replica slower
 than the master; a gap that FREEZES while lag climbs (78157, unmoving, above)
 is a replica not running at all; a SMALL gap under a climbing lag would be the
 ack path rather than the data path, and has not been seen.
+
+## The design half, answered: the caps are mis-POSITIONED, not mis-shaped
+
+The open question was whether shedding is the right response or whether the
+soft band should push back harder first. Measuring the shipper (BUG-0038)
+answers it, and the answer is neither — it reverses the intuition this file
+started with.
+
+**`--lag-soft-ms` ships at 500 ms and the ordinary operating peak is 631 ms.**
+So the soft band is not a margin the system occasionally touches under stress;
+it is territory the system sits in during healthy traffic. Two clean no-stall
+runs delayed 217 and 423 writes with nothing wrong. `--lag-hard-ms 1000` is
+about 1.6x the natural operating point.
+
+That changes what each candidate fix is worth:
+
+- **Fix the shipper (BUG-0038).** 50 MiB/s in serial 80 ms cycles is what puts
+  the operating point at 631 ms. Halving the cycle puts it near 380 ms and the
+  SHIPPED 500/1000 caps suddenly have the margin they were always assumed to
+  have. This is the root cause and the only option that makes the published
+  RPO honest without widening it. **Do this first.**
+
+- **Raise the caps to match reality** (soft ~1500 / hard ~3000). Cheap, and
+  it stops the brake firing on healthy traffic — but it pays for a slow
+  shipper with three times the RPO, which is selling the product's headline
+  bound to avoid an engineering problem. Defensible only as a stated interim,
+  and `slo.md` would have to say that is what it is.
+
+- **Proportional backpressure in the soft band** — a delay rising with depth
+  instead of a flat 2 ms. This was the first instinct and it is the WEAKEST of
+  the three, because the operating point is already inside the band: a
+  stronger brake there throttles ordinary healthy traffic, harder and more
+  often, to solve a problem that is not the brake's shape but its position.
+
+**The terminal shed stays either way.** Two reasons, both now measured. A
+frozen replica cannot be backpressured — the stall trace above went 563 ->
+1914 ms with the master shedding and the replica simply not running, and no
+delay curve reaches a stopped process. And the shed is what makes "at most one
+lag-cap window's worth is at risk" TRUE rather than aspirational: remove the
+refusal and the bound is enforced by nothing, which is the position Redis is
+in when it keeps acking and lets a replica fall arbitrarily behind.
+
+What stays open here is now only BUG-0038's fix and gate 21's unnamed
+perturbation.

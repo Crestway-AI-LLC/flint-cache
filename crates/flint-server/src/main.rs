@@ -3317,8 +3317,17 @@ fn frame_to_args(frame: Value) -> Option<Vec<Vec<u8>>> {
 /// it replaces the old sleep), then pushes any new WAL batches. Single-
 /// threaded duplex means no socket cloning, so the stream can be TLS — a
 /// rustls session is one stateful object and cannot be `try_clone`d the way
-/// the old dedicated ACK-reader thread required. Throughput ceiling is
-/// REPL_TAIL_BUDGET_BYTES per ~20ms cycle (~200MB/s), far above a link.
+/// the old dedicated ACK-reader thread required — so a fix for the rate
+/// below may NOT simply put that reader back on its own thread.
+///
+/// MEASURED ceiling is REPL_TAIL_BUDGET_BYTES per ~80ms cycle, about
+/// 50 MiB/s on loopback — not the ~20ms and ~200MB/s this comment claimed,
+/// and on loopback there is no link for it to be "far above". Per 4.4 MiB
+/// cycle: 42ms socket write, 19ms drain_acks, 13ms materialize, 5ms encode,
+/// so ~77% is spent blocked or draining rather than producing, and the two
+/// halves never overlap. That cycle time times the queue depth IS the
+/// steady-state lag the caps are set against (BUG-0038; it is also the
+/// whole of BUG-0035's thin margin).
 /// Drain whatever ACK frames are already available on the replication
 /// stream without blocking beyond the socket's read timeout. Returns false
 /// when the replica is gone (clean close or protocol garbage). Called from
