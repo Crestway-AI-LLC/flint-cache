@@ -166,6 +166,18 @@ as the stall lasts. Measured, with the replica frozen for 1800 ms:
 | 1800 ms | 1000 ms | 75 | 1757 ms |
 | 1800 ms | 200 ms | 140 | 1753 ms |
 
+† **Every "0 shed" recorded before 2026-08-20 means NOT COUNTED, not none.**
+`writes_shed_lag` did not exist until then, so the master kept no record of a
+refusal; the only evidence was whatever a client happened to log. BUG-0035 had
+to reconstruct "20328 of 50500" from a drill's error output for exactly this
+reason. Read every historical roll summary and chaos run that says `writes
+shed -THROTTLED: 0` as silent on the question.
+
+The first counted figure came from an ordinary operation rather than a
+harness: rolling the playground to rc.59 shed **210** writes on the demoted
+seat during the controlled failover, canary replica at 0, shipped defaults,
+nobody provoking it.
+
 † **The margin behind this zero was ~370 ms until BUG-0038 was fixed; it is
 now ~885 ms.** A sustained pipelined writer against a healthy pair on an idle
 box — no stall, shipped defaults — used to peak at **631 ms of lag**, 63% of
