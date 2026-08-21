@@ -3034,10 +3034,52 @@ fn launch(inv: &Inventory, register: bool) {
             &cp_seat_args(inv, i),
         );
     }
-    for seat in &inv.cp {
-        assert!(
-            wait_pong(seat, &tls, Duration::from_secs(10)),
-            "control plane seat {seat} up"
+    // A TIMEOUT HERE HAS TWO CAUSES AND THEY LOOK IDENTICAL FROM wait_pong.
+    // Either the seat never really started — spawn returned, the process died
+    // at once, and this is just counting to ten — or it started and something
+    // blocked it. "control plane seat <addr> up" said neither, and that is the
+    // whole of what an operator got.
+    //
+    // The budget is not the problem and must not be raised to quiet this. CP
+    // spawn to first PONG was MEASURED at 23-27 ms on an idle box and 29-64 ms
+    // under twelve burners on eight cores, with whole-fleet bootstrap at 1.25 s
+    // end to end (ops session, 2026-08-20). Ten seconds is ~370x the idle need.
+    // A seat that has not answered by then is not slow, so a larger number
+    // would only postpone the same silence.
+    //
+    // So say which case it is. `seat_alive` is the same check used above to
+    // decide whether to respawn, and the seat's own stderr is the only place
+    // the reason can be.
+    for (i, seat) in inv.cp.iter().enumerate() {
+        if wait_pong(seat, &tls, Duration::from_secs(10)) {
+            continue;
+        }
+        let name = cp_seat_name(inv, i);
+        let alive = seat_alive(
+            &runner_for(inv, seat),
+            "flint-controlplane",
+            &format!("{d}/cp-state"),
+        );
+        let log = format!("{d}/logs/{name}.log");
+        let tail = std::fs::read_to_string(&log)
+            .map(|t| {
+                t.lines()
+                    .rev()
+                    .take(8)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect::<Vec<_>>()
+                    .join("\n      ")
+            })
+            .unwrap_or_else(|e| format!("<{log} unreadable: {e}>"));
+        if alive {
+            panic!(
+                "control plane seat {seat} ({name}) did not answer PING in 10s,                  but its PROCESS IS RUNNING — it started and something is                  holding it. Not a slow start: 10s is ~370x the measured                  23-27ms spawn-to-PONG.\n  last of {log}:\n      {tail}"
+            );
+        }
+        panic!(
+            "control plane seat {seat} ({name}) did not answer PING in 10s and              NO PROCESS IS RUNNING — it exited or never execed, and this wait              was counting to ten against nothing.\n  last of {log}:\n      {tail}"
         );
     }
     // A Raft group that answers PING has not necessarily ELECTED: prove a
