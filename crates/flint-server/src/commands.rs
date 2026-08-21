@@ -2541,7 +2541,7 @@ impl<'a> Dispatcher<'a> {
             i += 2;
         }
         // No COUNT still needs just one hit; COUNT 0 lifts the cap.
-        let cap = count.map_or(1, |c| c);
+        let cap = count.unwrap_or(1);
         match self.lists.lpos(
             slot_for_key(&args[1]),
             &args[1],

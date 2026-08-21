@@ -13,7 +13,7 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo clippy --workspace --all-targets --keep-going -- -D warnings
       - run: cargo test --workspace
   # The rocks engine is the production configuration; without this leg the
   # entire cfg(feature = "rocks") surface (replication, full sync, the async
@@ -31,5 +31,5 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: rocks
-      - run: cargo clippy --workspace --all-targets --features flint-server/rocks,flint-backup/rocks -- -D warnings
+      - run: cargo clippy --workspace --all-targets --features flint-server/rocks,flint-backup/rocks --keep-going -- -D warnings
       - run: cargo test --workspace --features flint-server/rocks,flint-backup/rocks
