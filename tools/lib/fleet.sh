@@ -380,6 +380,16 @@ fleet_warm() {
 # turns flint-controlplane into flint-controlpl and drops seats from a census
 # -- that cost a peer session a wrong seat count during a release verification
 # on the day this was written.
+#
+# AND NEVER FILTER FOREIGN LOAD BY %CPU. A threshold on a SHARE under-reports
+# a cohort exactly when the cohort is large, because share is not conserved:
+# twelve spinners on this box sat at ~57% each, so `awk $1>40` found them,
+# but killing eight left the survivors at 92% -- and a snapshot taken after a
+# partial cleanup would have looked clean while four were still running. That
+# happened: a `>40%` census reported 8 of 12 orphaned burners, honestly, and
+# acting on it would have produced a second corrupt gate behind a teardown
+# that looked verified. Filter on the INVARIANT -- ppid 1 plus a name you
+# recognise -- which does not move when the cohort does.
 fleet_env_note() {
   local where="${1:-}" sib load
   load="$(uptime | sed 's/.*averages*: //')"
