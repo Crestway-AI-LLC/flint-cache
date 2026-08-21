@@ -106,6 +106,12 @@ impl RaftNetworkFactory<TypeConfig> for Network {
 }
 
 impl Conn {
+    // openraft fixes this signature, not us: `append_entries` and `vote` in
+    // the `RaftNetwork` impl below return exactly this `Result`, so boxing
+    // the error here would only be unboxed again one line later. The lint is
+    // reporting the size of a dependency's error type, which is not a
+    // decision this crate gets to make.
+    #[allow(clippy::result_large_err)]
     async fn call<Resp: for<'de> Deserialize<'de>>(
         &self,
         rpc: &Rpc,

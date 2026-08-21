@@ -108,6 +108,11 @@ impl Store {
         self.inner.lock().await.registry.clone()
     }
 
+    // `SErr` is openraft's `StorageError<NodeId>`, which every `RaftStorage`
+    // method must return; all seven callers of this helper are in that impl.
+    // Boxing here buys an allocation on the write path and unboxing at each
+    // call site, and the large error crosses the trait boundary regardless.
+    #[allow(clippy::result_large_err)]
     async fn flush(&self, p: &Persisted) -> Result<(), SErr> {
         let bytes = serde_json::to_vec(p).map_err(|e| io(ErrorVerb::Write, e))?;
         atomic_write(&self.path, &bytes).map_err(|e| io(ErrorVerb::Write, e))

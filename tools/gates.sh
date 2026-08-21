@@ -697,9 +697,9 @@ if want check; then
   assert_lease_ttl_single_source
   step "fmt" fmt cargo fmt --all --check
   step "clippy (mem)" clippy-mem \
-    cargo clippy --workspace --all-targets -- -D warnings
+    cargo clippy --workspace --all-targets --keep-going -- -D warnings
   step "clippy (rocks)" clippy-rocks \
-    cargo clippy --workspace --all-targets --features flint-server/rocks,flint-backup/rocks -- -D warnings
+    cargo clippy --workspace --all-targets --features flint-server/rocks,flint-backup/rocks --keep-going -- -D warnings
   step "test (mem)" test-mem cargo test --workspace
   step "test (rocks)" test-rocks cargo test --workspace --features flint-server/rocks,flint-backup/rocks
   step "licences" licences licence_check

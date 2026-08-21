@@ -496,12 +496,19 @@ fn decode_at(input: &[u8], depth: usize) -> Result<Decoded, ProtocolError> {
             }
             let value = match type_byte {
                 b'~' => Value::Set(items),
-                b'%' => Value::Map(
-                    items
-                        .chunks_exact(2)
-                        .map(|p| (p[0].clone(), p[1].clone()))
-                        .collect(),
-                ),
+                // Consumed two at a time rather than cloned. `items` holds
+                // exactly `2 * len` elements by construction above, so the
+                // pairing is total and no element can be dropped; taking them
+                // by value also removes two clones per field from a path the
+                // proxy runs on every reply it forwards.
+                b'%' => {
+                    let mut pairs = Vec::with_capacity(items.len() / 2);
+                    let mut rest = items.into_iter();
+                    while let (Some(k), Some(v)) = (rest.next(), rest.next()) {
+                        pairs.push((k, v));
+                    }
+                    Value::Map(pairs)
+                }
                 // An array whose every element is a [member, double] pair is
                 // a SCORED result, and the decoder says so. This is not a
                 // heuristic: `Value::Double` can only have come from an
