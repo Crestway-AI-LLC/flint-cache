@@ -171,7 +171,7 @@ _gate_prune_runs 20
 # changed on 2026-07-17 (fixed, 432a5d5), and the reply-assertion sweep found
 # discarded writes throughout. A drill outside the gate rots, and rots
 # silently.
-CORE="restart repl failover proxy slot_migrate slot_map rebalance_execute
+CORE="${FLINT_CORE_ORDER:-restart repl failover proxy slot_migrate slot_map rebalance_execute
       bloom ns_escape coproc_cred coproc_channel family_route family_route_cp coproc_forward coproc_budget coproc_exempt coproc_vec coproc_vec_tls coproc_vec_rebuild
       tenant_quota token_rotation cert_reload_fleet controlplane_ha
       decommission config_file federation_plumbing disk_pressure ctl_error
@@ -187,7 +187,7 @@ CORE="restart repl failover proxy slot_migrate slot_map rebalance_execute
       proxy_cache proxy_tls replica_reads replica_stale_fence rw_isolation
       scan slot_cutover slot_cutover_recovery slot_moved snapshot_restore
       tenant tenant_rebalance tenant_remove token_hash
-      write_deadline fullsync_rate edge_reroute rewind_rejoin"
+      write_deadline fullsync_rate edge_reroute rewind_rejoin}"
 CHAOS="chaos proxy_chaos chaos_unreadable hotkey_chaos"
 
 # DELIBERATELY OUT, with the reason. An absence with no reason beside it is
