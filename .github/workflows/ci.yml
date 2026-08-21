@@ -20,8 +20,12 @@ jobs:
   # write queue, manifests) would merge unchecked. It compiles RocksDB
   # (~25 min cold), so it runs on PULL REQUESTS only — the merge gate holds,
   # while direct pushes to main spend only the cheap mem-config job.
+  # Runs on push too, not only pull_request. This job covers the RocksDB
+  # feature configuration — the storage engine that actually ships — and
+  # work lands here by pushing to main, so gating it on pull_request meant
+  # the release checklist claimed a coverage the normal flow never ran.
+  # It costs ~90s with a warm cache; there was no saving worth that gap.
   check-rocks:
-    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

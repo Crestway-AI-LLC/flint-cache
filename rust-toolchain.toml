@@ -1,0 +1,22 @@
+# Pin the toolchain, because an unpinned one reds this repo on Rust's release
+# schedule rather than on ours.
+#
+# On 2026-08-20 three consecutive commits failed `ci` on a clippy lint none of
+# them introduced: `chunks_exact_to_as_chunks` and `map_or_identity` ship in
+# 1.98, and `result_large_err` — which is NOT new — began firing on code that
+# had been there for months. Every workflow step installed
+# `dtolnay/rust-toolchain@stable` and ran `-D warnings`, so the set of things
+# that fail this repo changed with no commit here, in the middle of a release
+# cut. See docs/bugs/0039-ci-floats-on-stable-so-a-rust-release-reds-the-repo.md
+#
+# This also pins the RELEASE build. packaging/aws/release-box/run.sh installs
+# rustup with `--default-toolchain stable`, so until now the compiler that
+# produced shipped binaries was whichever stable happened to be current that
+# day. rustup reads this file from the working directory, so the artifact is
+# now built by a compiler named in the repo.
+#
+# Bumping it is a commit with a diff and a CI run of its own. That is the
+# point: upgrades stay deliberate instead of arriving unannounced.
+[toolchain]
+channel = "1.98.0"
+components = ["clippy", "rustfmt"]
