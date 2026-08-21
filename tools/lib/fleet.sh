@@ -204,15 +204,32 @@ _fleet_sibling() {
 }
 
 # Fleet processes on this box that are NOT ours, as "pid argv" lines.
+# Emits "pid ppid argv". The PPID is the discriminator between a fleet
+# somebody is driving and a corpse nobody is: an orphan has been reparented
+# to init, so ppid 1 means whoever started it is gone.
+#
+# That distinction cost the ops session FIVE HOURS. They saw /tmp/flint-m3-67*
+# on the box, read it as "a peer is running their gate", and waited politely
+# three times. The processes were orphans from a leak in m3_exit and nobody
+# was driving them. One `ps -o ppid=` would have said so, and neither session
+# ran it in four separate inspections — so it belongs in the tool rather than
+# in anyone's head.
 _fleet_foreign() {
-  ps -eo pid=,args= 2>/dev/null | awk -v scope="$FLEET_SCOPE" -v ports="$FLEET_PORTS" '
+  ps -eo pid=,ppid=,args= 2>/dev/null | awk -v scope="$FLEET_SCOPE" -v ports="$FLEET_PORTS" '
     {
-      n = split($2, parts, "/")
+      # Rebuild argv from field 3 on, and match scope/ports against THAT
+      # rather than the whole line. $0 now carries the ppid, and a ppid that
+      # happens to equal one of our declared ports would exclude a genuinely
+      # foreign process as "ours" — a false clean, which is the direction
+      # that hurts.
+      args = ""
+      for (k = 3; k <= NF; k++) args = args (k > 3 ? " " : "") $k
+      n = split($3, parts, "/")
       exe = parts[n]
       if (exe !~ /^flint-(server|proxy|controlplane|controller|agent|console|ops|register|exporter|meter)$/) next
-      if (index($0, scope) > 0) next
-      if (ports != "" && $0 ~ ("(^|[^0-9])(" ports ")([^0-9]|$)")) next
-      print
+      if (index(args, scope) > 0) next
+      if (ports != "" && args ~ ("(^|[^0-9])(" ports ")([^0-9]|$)")) next
+      print $1, $2, args
     }'
 }
 
@@ -524,10 +541,22 @@ fleet_guard() {
     fi
   fi
   if [ -n "$foreign" ]; then
+    local _orph _live
+    _orph=$(printf '%s\n' "$foreign" | awk '$2 == 1' | wc -l | tr -d ' ')
+    _live=$(printf '%s\n' "$foreign" | awk '$2 != 1' | wc -l | tr -d ' ')
     echo "REFUSING TO RUN: this box already has Flint processes outside $FLEET_SCOPE"
-    echo "$foreign" | cut -c1-120 | sed 's/^/    /'
+    printf '%s\n' "$foreign" | awk '{ printf "    pid %-7s ppid %-7s %s\n", $1, $2, substr($0, index($0,$3), 100) }'
     echo "  A drill that killed those would destroy a fleet it does not own —"
     echo "  a live cluster, or another suite's nodes."
+    # Say whether WAITING can possibly help. An orphan has no parent left to
+    # finish and clear it, so "wait for the other session" is wrong advice.
+    if [ "$_live" = "0" ]; then
+      echo "  ALL $_orph ARE ORPHANS (ppid 1): nobody is driving them, so"
+      echo "  waiting will not clear this. Someone has to remove them."
+    elif [ "$_orph" != "0" ]; then
+      echo "  $_orph of $((_orph + _live)) are ORPHANS (ppid 1) — those will"
+      echo "  never clear on their own; the other $_live have a live parent."
+    fi
   fi
   if [ -n "$sibling" ]; then
     # A DIFFERENT reason, said differently. These are not ours to stop, and a
