@@ -10,25 +10,34 @@ name: msrv
 # `as_chunks::<2>()` was declined on 2026-08-20 because it postdates 1.85, a
 # restriction obeyed on trust while nothing enforced it.
 #
-# DISPATCH-ONLY ON PURPOSE, and this is the whole design.
+# IT WAS DISPATCH-ONLY UNTIL THE ANSWER WAS KNOWN, and that mattered.
 #
-# Nobody knows whether this passes. Adding an unverified check to the blocking
-# path is precisely how repair_path_drill.sh held the ops gate red for three
-# commits — registered to obtain a diagnosis, and the shared gate became the
-# instrument. Run this by hand, read the answer, and only then decide whether
-# it becomes a push-triggered gate or whether `rust-version` gets corrected to
-# whatever is true. Either outcome is progress; guessing is not.
+# The first run said 1.85 was false: hdrhistogram, time and validit all require
+# 1.88, and cargo refuses at RESOLUTION, so our own code was never compiled. A
+# second run at 1.88 passed. Only then did this become blocking and the
+# declaration get corrected to 1.88. Had it been added to the blocking path
+# first, main would have been red on a claim nobody had ever checked — which is
+# exactly how repair_path_drill.sh held the ops gate red for three commits.
+#
+# IT TESTS THE DECLARATION, NOT A NUMBER. The version comes from Cargo.toml's
+# `rust-version` unless a dispatch input overrides it, so raising or lowering
+# the declaration automatically changes what is verified. A hardcoded version
+# here would be a second claim that could drift from the first, which is the
+# bug this file exists to close.
 #
 # RUSTUP_TOOLCHAIN, not `cargo +1.85`: rust-toolchain.toml pins 1.98 for this
 # directory and the env var is the one override that outranks it.
 
 on:
+  push:
+    branches: [main]
+  pull_request:
   workflow_dispatch:
     inputs:
       version:
-        description: "Toolchain to test (should match Cargo.toml rust-version)"
-        required: true
-        default: "1.85.0"
+        description: "Override the toolchain (default: Cargo.toml rust-version)"
+        required: false
+        default: ""
         type: string
 
 jobs:
@@ -38,31 +47,32 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: The declared MSRV, read from Cargo.toml rather than assumed
+      - name: The version under test comes from the declaration
         id: declared
+        env:
+          OVERRIDE: ${{ inputs.version }}
         run: |
           set -euo pipefail
           D=$(sed -n 's/^rust-version[[:space:]]*=[[:space:]]*"\([0-9.]*\)".*/\1/p' Cargo.toml | head -1)
-          echo "declared=$D" >> "$GITHUB_OUTPUT"
-          echo "Cargo.toml declares rust-version = $D"
-          echo "Testing against ${{ inputs.version }}"
-          case "${{ inputs.version }}" in
-            "$D"|"$D".*) echo "matches the declaration" ;;
-            *) echo "::warning::testing ${{ inputs.version }} which is NOT the declared $D" ;;
-          esac
+          [ -n "$D" ] || { echo "::error::Cargo.toml has no rust-version to verify"; exit 1; }
+          USE="${OVERRIDE:-$D}"
+          echo "declared=$D"  >> "$GITHUB_OUTPUT"
+          echo "use=$USE"     >> "$GITHUB_OUTPUT"
+          echo "Cargo.toml declares rust-version = $D; testing $USE"
+          [ "$USE" = "$D" ] || echo "::warning::testing $USE, which is NOT the declared $D"
 
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: ${{ inputs.version }}
+          toolchain: ${{ steps.declared.outputs.use }}
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: msrv-${{ inputs.version }}
+          key: msrv-${{ steps.declared.outputs.use }}
 
       - name: Build the workspace at that toolchain
         env:
           # Outranks rust-toolchain.toml, which pins 1.98 for this directory.
-          RUSTUP_TOOLCHAIN: ${{ inputs.version }}
+          RUSTUP_TOOLCHAIN: ${{ steps.declared.outputs.use }}
         run: |
           set -uo pipefail
           rustc --version
@@ -70,6 +80,6 @@ jobs:
           cargo check --workspace --all-targets
           rc=$?
           if [ "$rc" -ne 0 ]; then
-            echo "::error::the workspace does NOT build at ${{ inputs.version }}, which Cargo.toml declares as rust-version (${{ steps.declared.outputs.declared }}). Either the code needs to stop using newer APIs, or the declaration is wrong and should be raised to what is true."
+            echo "::error::the workspace does NOT build at ${{ steps.declared.outputs.use }}, which Cargo.toml declares as rust-version (${{ steps.declared.outputs.declared }}). Either the code stops using newer APIs, or the declaration is wrong and is raised to what is true. Do not silence this by deleting the job."
           fi
           exit "$rc"
