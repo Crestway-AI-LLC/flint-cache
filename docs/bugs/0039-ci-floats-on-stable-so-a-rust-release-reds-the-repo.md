@@ -1,6 +1,7 @@
 # BUG-0039 — CI floats on `@stable`, so a Rust release reds the repo on its own
 
-**Status:** the occurrence is fixed (`6ff8ca8`); the mechanism is OPEN.
+**Status:** occurrence fixed (`6ff8ca8`, `096aa63`, `c9487f3`); toolchain now
+PINNED and the rocks gap CLOSED (`3f2d701`). The MSRV half remains OPEN.
 
 ## Symptom
 
@@ -106,12 +107,46 @@ fixes those signatures through `RaftNetwork` and `RaftStorage`, so boxing in
 the private helper is unboxed again at every call site and the large error
 crosses the trait boundary regardless.
 
-Separately: `check-rocks` is gated on `if: github.event_name ==
-'pull_request'`. Work lands here by pushing to `main`, so **that job has not
-run on any commit in this repo's normal flow** — the rocks feature
-configuration is clippy-checked and tested only if someone opens a PR. It is
-listed in the release checklist as a thing CI covers. It is not.
+Separately — and this one turned out to be real after a check that nearly
+retracted it: `check-rocks` was gated on `if: github.event_name ==
+'pull_request'`. Work lands here by pushing to `main`, so **that job did not
+run on any commit in this repo's normal flow**.
 
-## The check that now holds it
+The near-retraction is worth keeping. `tools/gates.sh` DOES run both feature
+configurations — `clippy (rocks)` and `test (rocks)` are steps in its `check`
+stage — which looks like CI coverage and is not. `gate.yml` invokes
+`tools/gates.sh conformance drills chaos` and deliberately omits `check`,
+because its own header says ci.yml already covers fmt, clippy and tests. So
+`check` ran in exactly one place, ci.yml, whose rocks half was PR-gated. Two
+workflows each reasonably assuming the other covered it.
 
-None. That is the open half, and this file is the record of it.
+FIXED in `3f2d701`: the `if:` is removed and check-rocks runs on push. It had
+been running on PRs as recently as 2026-08-19 and takes ~90s with a warm
+cache, so the gap bought nothing.
+
+## What now holds it
+
+- **The toolchain is pinned** — `rust-toolchain.toml` at 1.98.0 (`3f2d701`).
+  This also pins the RELEASE build, which was the stronger reason:
+  `packaging/aws/release-box/run.sh` installs rustup with
+  `--default-toolchain stable`, so until now the compiler that produced every
+  shipped binary was whichever stable was current that day.
+- **The local/CI toolchain gap is now printed** — `report_toolchain_vs_pin` in
+  `tools/gates.sh`, before the clippy steps. Deliberately not pass/fail: a
+  contributor without rustup is fine, and the mismatch is not an error but a
+  fact about what a green clippy is evidence OF. On this laptop (1.96, no
+  rustup) it prints the NOTE, which is correct — the pin does not close the
+  gap here, it makes it stable and visible instead of moving and silent.
+- **check-rocks runs on push** (`3f2d701`).
+
+## Still open
+
+The **MSRV**. `Cargo.toml` declares `rust-version = "1.85"` and nothing builds
+at it — `devcontainer.yml` only asserts the toolchain is *at least* 1.85. The
+claim cannot fail, which is why clippy's `as_chunks::<2>()` suggestion was not
+adopted: it postdates 1.85 and nothing would have caught the violation.
+
+Not fixed on 2026-08-20 because adding a blocking job for an unverified claim,
+immediately after a release, risks leaving `main` red overnight on something
+nobody has checked. That is a scheduling judgement, not a technical one, and
+the job is a few lines whenever someone wants to find out.
