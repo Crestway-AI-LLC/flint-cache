@@ -84,12 +84,52 @@ TOTAL_ROWS=$(( $(valkey-cli -p 6710 FLINTSLOTSTATS | awk '{s+=$2} END{print s+0}
 echo "  50 tenants seeded; group holds $TOTAL_ROWS rows across 2 pairs"
 [ "$TOTAL_ROWS" = "15000" ] || { echo "FAIL: expected 15000 rows, got $TOTAL_ROWS"; exit 1; }
 
-# Let replicas converge before inducing failure (steady-state failover).
+# Let replicas converge before inducing failure (steady-state failover), and
+# PROVE the controller could have observed it.
+#
+# The controller records a lineage holder only for a master satisfying
+# `live_replicas >= 1 && seq_lag == Some(0)` (insync_lineage_holder), and it
+# needs --confirm consecutive polls at --poll-ms to commit that memory. A fresh
+# controller that never saw such a moment REFUSES to promote when the master
+# dies -- "no member was ever observed holding the lineage ... PAGE" -- which is
+# CORRECT, and which this drill then reported as
+#
+#     FAIL: writes did not recover after master kill
+#
+# i.e. as a failover defect. It is not one. It is this setup step never having
+# established the precondition the assertion depends on.
+#
+# The previous loop could not catch that. It sampled seq_lag ONCE, never looked
+# at live_replicas -- half the predicate the controller actually uses -- and,
+# decisively, fell through SILENTLY after 50 tries. A setup step that cannot
+# fail hands the kill whatever state happens to exist. On a loaded box, where
+# the replica trails the 6 continuous writers, that state is "never in sync",
+# and the drill failed 5 of 12 runs while the controller was behaving exactly
+# as designed.
+INSYNC_HOLDS=6            # x 0.2s = 1.2s > --poll-ms 150 * --confirm 3
 for m in 6710 6720; do
-  for i in $(seq 1 50); do
-    SL=$(valkey-cli -p $m FLINTINFO | tr '\r' ' ' | grep -oE "seq_lag:[a-z0-9]+")
-    [ "$SL" = "seq_lag:0" ] && break; sleep 0.2
+  held=0
+  for i in $(seq 1 100); do
+    INFO=$(valkey-cli -p $m FLINTINFO | tr '\r' ' ')
+    SL=$(printf '%s' "$INFO" | grep -oE 'seq_lag:[a-z0-9]+')
+    LR=$(printf '%s' "$INFO" | grep -oE 'live_replicas:[0-9]+' | cut -d: -f2)
+    if [ "$SL" = "seq_lag:0" ] && [ "${LR:-0}" -ge 1 ]; then
+      held=$((held+1))
+      [ "$held" -ge "$INSYNC_HOLDS" ] && break
+    else
+      held=0
+    fi
+    sleep 0.2
   done
+  if [ "$held" -lt "$INSYNC_HOLDS" ]; then
+    echo "FAIL: master $m never held live_replicas>=1 with seq_lag:0 for $((INSYNC_HOLDS*200))ms"
+    echo "      (last seen: ${SL:-<none>} live_replicas:${LR:-<none>})."
+    echo "      The controller cannot have observed a lineage holder, so it will"
+    echo "      correctly REFUSE to promote when the master is killed. This is a"
+    echo "      SETUP failure -- the precondition was never established -- and NOT"
+    echo "      evidence that failover is broken. Do not read it as data loss."
+    exit 1
+  fi
 done
 
 echo "== multi-tenant load: 6 tenants write continuously; KILL pair-0 master"
