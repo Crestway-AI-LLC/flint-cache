@@ -673,6 +673,33 @@ assert_recovery_stays_off_until_it_observes() {
 # go stale in silence. A drill deliberately testing a TTL passes a VARIABLE
 # (`lease-ttl-ms $LEASE`) — the number is then that drill's own subject rather
 # than a duplicate of the product default, and this check leaves it alone.
+report_toolchain_vs_pin() {
+  # NOT a pass/fail check - a third state, said out loud.
+  #
+  # On 2026-08-20 local clippy was green on three commits CI rejected. Both
+  # were correct: the lints ship in 1.98 and this laptop runs 1.96, so the
+  # local gate could not fail on them - not "did not", COULD NOT. The green
+  # was real and meant nothing about CI, and nothing on screen said so.
+  #
+  # So this prints the comparison rather than judging it. A mismatch is not an
+  # error - the pin exists for CI and the release box, and a contributor
+  # without rustup is fine - it is a fact that changes what a green clippy
+  # below is evidence OF.
+  local pinned have
+  pinned=$(sed -n 's/^channel[[:space:]]*=[[:space:]]*"\(.*\)"/\1/p' rust-toolchain.toml 2>/dev/null)
+  have=$(rustc --version 2>/dev/null | awk '{print $2}')
+  [ -z "$pinned" ] && return 0
+  if [ "$pinned" = "$have" ]; then
+    echo "  toolchain ${have} matches the pin"
+    return 0
+  fi
+  echo "  NOTE  toolchain ${have:-unknown} does NOT match the pinned ${pinned}."
+  echo "        clippy below is this toolchain's opinion, not CI's. A lint added"
+  echo "        or widened between the two fires there and cannot fire here, so"
+  echo "        a green clippy is not evidence that CI will pass."
+  echo "        docs/bugs/0039-ci-floats-on-stable-so-a-rust-release-reds-the-repo.md"
+}
+
 assert_lease_ttl_single_source() {
   local bad
   bad=$(grep -rn 'lease-ttl-ms[[:space:]][[:space:]]*[0-9]' tools/ 2>/dev/null \
@@ -695,6 +722,7 @@ if want check; then
   assert_spawning_drills_declare_ports
   assert_recovery_stays_off_until_it_observes
   assert_lease_ttl_single_source
+  report_toolchain_vs_pin
   step "fmt" fmt cargo fmt --all --check
   step "clippy (mem)" clippy-mem \
     cargo clippy --workspace --all-targets --keep-going -- -D warnings

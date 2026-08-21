@@ -25,7 +25,8 @@ below.
 | **measured failure rate** | **7.0%** |
 | gate runs excluded because the drill did not run at all | 34 (predate the drill) |
 
-The four firings:
+The firings (the rate table above is scoped to the first window; the last
+row postdates it):
 
 | When | Run | Commit under test | Other drills failing |
 |---|---|---|---|
@@ -33,12 +34,50 @@ The four firings:
 | 2026-08-16T02:16Z | `31921536272` | `056e5930` | none — it was the only failure |
 | 2026-08-18T03:08Z | `32094370382` | `0946d1a5` | coproc_vec, coproc_vec_tls, reseed |
 | 2026-08-18T06:36Z | `32107656681` | `a7b742f4` | coproc_vec, coproc_vec_tls, reseed |
+| 2026-08-21T01:06Z | `32435117583` | `c9487f3` | none — it was the only failure |
 
-Green streaks between them, in order: **17, 13, 16, 2, 5**.
+Green streaks between them, in order: **17, 13, 16, 2, 5, 21**.
 
 **That series is the whole finding.** Three separate streaks of 13+ green gate
 runs have already happened, and every one of them ended in another failure. The
-current streak is 5 — the shortest of the long ones. Nothing has stopped.
+current streak was 5 when this was written; it reached **21** — the longest
+yet — and then ended the same way on 2026-08-21. Nothing has stopped.
+
+## Fifth firing, 2026-08-21 — the longest green streak yet, ended the same way
+
+Run `32435117583`, commit `c9487f3`, during the rc.60 release cut. Twenty-one
+consecutive green gate runs preceded it, beating the previous best of 17.
+
+    iter 3: REPLICA kill lost acked write at key954: 19573 < 24264
+    entries_above_got=[(seq=24264 sent_before_prev_kill=false)]
+
+`sent_before_prev_kill=false`, so by this file's own decision rule the write
+was served by the CURRENT master and lost — the "real" branch, not the
+harness-ledger branch.
+
+**The surface message was a consequence, not the cause,** and is worth
+recording because it will mislead the next reader:
+
+    FAIL: scenario not exercised — need a MASTER kill followed by a REPLICA
+    kill, got: REPLICA MASTER
+          the seed's kill order changed; pick a seed that yields MASTER then REPLICA
+
+Nothing about the seed changed. The chaos run PANICKED at iteration 3, which
+truncated the observed kill sequence to the two completed iterations, and the
+scenario assertion then failed on the truncated list. Reading that message at
+face value sends you to look for RNG drift that is not there.
+
+**Attribution, because the commit it landed on invites the wrong one.** The
+diff from the last green gate (`096aa63`) to `c9487f3` is two
+`#[allow(clippy::result_large_err)]` attributes, their comments, and a
+markdown file — no executable change whatsoever. The one change in this
+stretch that could plausibly affect behaviour (the RESP3 map-decode rewrite)
+is in `6ff8ca8`, two commits earlier, and that commit's own gate was green.
+A re-run of `32435117583` at the identical sha passed.
+
+Failure rate including this firing: **5 of ~78 runs, ~6.4%** — consistent
+with the 7.0% measured over the first window, which is the point: it has not
+drifted, improved, or gone away in ten days.
 
 ## There is no "it stopped failing" transition, and two of us went looking for one
 
