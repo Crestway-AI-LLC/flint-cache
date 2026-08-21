@@ -90,6 +90,28 @@ order they seem worth considering:
 Not done during a release cut deliberately — changing the compiler that
 builds shipped binaries is not a thing to fold into unblocking a gate.
 
+## A third hole, found while clearing the second round
+
+`--keep-going` made one run report every remaining lint instead of one per
+round, and that surfaced the last two: `result_large_err` on openraft's
+`RPCError` and `StorageError` in flint-controlplane. Notable because
+**`result_large_err` is not new in 1.98** — it has been in `clippy::perf` for
+many releases, and 1.96 does not fire it on these functions. Something about
+its detection or threshold changed, which means "new toolchain adds lints" is
+too narrow a description: a toolchain can also start firing an OLD lint on
+code that has been there for months.
+
+Both were allowed rather than boxed, with the reason at the site: openraft
+fixes those signatures through `RaftNetwork` and `RaftStorage`, so boxing in
+the private helper is unboxed again at every call site and the large error
+crosses the trait boundary regardless.
+
+Separately: `check-rocks` is gated on `if: github.event_name ==
+'pull_request'`. Work lands here by pushing to `main`, so **that job has not
+run on any commit in this repo's normal flow** — the rocks feature
+configuration is clippy-checked and tested only if someone opens a PR. It is
+listed in the release checklist as a thing CI covers. It is not.
+
 ## The check that now holds it
 
 None. That is the open half, and this file is the record of it.
