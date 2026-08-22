@@ -3237,8 +3237,9 @@ fn flintinfo(
     // beside it. None here means the engine could not answer, which is a
     // different fact from a healthy zero (docs/bugs/0022).
     let write_stall = rocks.as_ref().and_then(|kv| kv.write_stall());
+    let compaction = rocks.as_ref().and_then(|kv| kv.compaction_pressure());
     let info = format!(
-        "role:{}\r\nrole_epoch:{role_epoch}\r\nbuild:{build}\r\nsst_bytes:{sst}\r\nlatest_seq:{latest}\r\nlast_applied:{last_applied}\r\nacked_seq:{}\r\nseq_lag:{seq_lag}\r\nwal_headroom_seq:{whs}\r\nwal_min_acked_seq:{wma}\r\nwal_headroom_shed_seq:{whl}\r\nlive_replicas:{}\r\nlag_ms:{}\r\nlag_ms_max:{lmx}\r\nlag_max_gap:{lmg}\r\nlag_soft_ms:{soft}\r\nlag_hard_ms:{hard}\r\nmin_replicas_to_write:{minr}\r\nwidowed_grace_ms:{wgm}\r\nwidowed_shed:{wsh}\r\nfullsync_active:{fsa}\r\nfullsync_max:{fsm}\r\nasync_write_queue:{aqd}\r\nwrite_deadline_ms:{wdm}\r\nwrite_inflight:{wif}\r\nwrite_service_us:{wsu}\r\nwrite_wait_est_ms:{wwe}\r\nwrites_shed_deadline:{wsd}\r\nwrites_shed_lag:{wsl}\r\nwrites_shed_quorum:{wsq}\r\nwrites_shed_widowed:{wswd}\r\nwrites_shed_headroom:{wshr}\r\nwrites_delayed_soft:{wdsf}\r\nwal_fsync_ms:{wfm}\r\nwal_fsync_total:{wft}\r\ncert_days_remaining:{cdr}\r\nactive_conns:{ac}\r\nmax_conns:{mc}\r\nconns_shed_total:{cs}\r\nwrite_stopped:{wst}\r\ndelayed_write_rate:{dwr}\r\nwrite_stall_readable:{wsr}\r\ndisk_free_bytes:{dfb}\r\ndisk_total_bytes:{dtb}\r\ndisk_free_pct:{dfp}\r\ndisk_verdict:{dv}\r\ndisk_unknown_samples:{dus}\r\ngc_swept_expired:{gse}\r\ngc_swept_orphans:{gso}\r\nuptime_ms:{upms}\r\n",
+        "role:{}\r\nrole_epoch:{role_epoch}\r\nbuild:{build}\r\nsst_bytes:{sst}\r\nlatest_seq:{latest}\r\nlast_applied:{last_applied}\r\nacked_seq:{}\r\nseq_lag:{seq_lag}\r\nwal_headroom_seq:{whs}\r\nwal_min_acked_seq:{wma}\r\nwal_headroom_shed_seq:{whl}\r\nlive_replicas:{}\r\nlag_ms:{}\r\nlag_ms_max:{lmx}\r\nlag_max_gap:{lmg}\r\nlag_soft_ms:{soft}\r\nlag_hard_ms:{hard}\r\nmin_replicas_to_write:{minr}\r\nwidowed_grace_ms:{wgm}\r\nwidowed_shed:{wsh}\r\nfullsync_active:{fsa}\r\nfullsync_max:{fsm}\r\nasync_write_queue:{aqd}\r\nwrite_deadline_ms:{wdm}\r\nwrite_inflight:{wif}\r\nwrite_service_us:{wsu}\r\nwrite_wait_est_ms:{wwe}\r\nwrites_shed_deadline:{wsd}\r\nwrites_shed_lag:{wsl}\r\nwrites_shed_quorum:{wsq}\r\nwrites_shed_widowed:{wswd}\r\nwrites_shed_headroom:{wshr}\r\nwrites_delayed_soft:{wdsf}\r\nwal_fsync_ms:{wfm}\r\nwal_fsync_total:{wft}\r\ncert_days_remaining:{cdr}\r\nactive_conns:{ac}\r\nmax_conns:{mc}\r\nconns_shed_total:{cs}\r\nwrite_stopped:{wst}\r\ndelayed_write_rate:{dwr}\r\nwrite_stall_readable:{wsr}\r\nl0_files:{l0f}\r\npending_compaction_bytes:{pcb}\r\ncompaction_readable:{cr}\r\ndisk_free_bytes:{dfb}\r\ndisk_total_bytes:{dtb}\r\ndisk_free_pct:{dfp}\r\ndisk_verdict:{dv}\r\ndisk_unknown_samples:{dus}\r\ngc_swept_expired:{gse}\r\ngc_swept_orphans:{gso}\r\nuptime_ms:{upms}\r\n",
         if read_only { "replica" } else { "master" },
         hub.effective_acked(now)
             .map_or_else(|| "none".into(), |a| a.to_string()),
@@ -3312,6 +3313,11 @@ fn flintinfo(
         // publish its readability beside it rather than poisoning the value.
         // 0 on the mem engine, which honestly cannot answer at all.
         wsr = u8::from(write_stall.is_some()),
+        // Same three-way contract as the stall pair: 0 from a live instrument
+        // and 0 from an absent one must not read alike (BUG-0022, BUG-0013).
+        l0f = compaction.map(|c| c.0).unwrap_or(0),
+        pcb = compaction.map(|c| c.1).unwrap_or(0),
+        cr = u8::from(compaction.is_some()),
         dfb = disk_free,
         dtb = disk_total,
         dfp = disk_free

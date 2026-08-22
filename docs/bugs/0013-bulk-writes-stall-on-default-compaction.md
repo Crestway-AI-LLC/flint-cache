@@ -139,6 +139,38 @@ trigger" stay distinguishable. `rocksdb.num-files-at-level0` is a live DB
 property (BUG-0022 established the property/ticker distinction), so it can be
 read without enabling statistics.
 
+## 2026-08-22 — the missing instrument now exists
+
+The section above asks the next run to "report the L0 file count so 'did not
+stall' and 'did not reach the trigger' stay distinguishable". It could not:
+`rocksdb.num-files-at-level0` was never exported, so every run so far could
+only say `write_stopped: 0` — the number that made the 3 GB measurement
+unscoreable.
+
+FLINTINFO now carries three more fields, on the same three-way contract the
+stall pair uses:
+
+    l0_files                  rocksdb.num-files-at-level0
+    pending_compaction_bytes  rocksdb.estimate-pending-compaction-bytes
+    compaction_readable       1 = the pair was measured, 0 = engine cannot answer
+
+L0 file count is what the defaults are actually compared against —
+`level0_slowdown_writes_trigger` 20 and `level0_stop_writes_trigger` 36 — so a
+run can now report "reached 4 of 20" or "reached 19 of 20" where before both
+read as `write_stopped: 0`.
+
+**Verified in both directions rather than only the useful one**, because an
+instrument nobody has seen move is worth what an absent one is worth:
+
+- rocks engine, ~150 MB written in three batches: `l0_files` 0 -> 1 -> 2 as
+  flushes landed. It moves.
+- mem engine: `compaction_readable: 0`, not a fake zero. It admits when it
+  cannot answer, which is the whole point of BUG-0022's distinction.
+
+This does not confirm or refute the hypothesis — it makes the next attempt
+scoreable. The verdict rules stand as written above: CONFIRMED, FALSIFIED, or
+INCONCLUSIVE, and only the middle one kills it.
+
 ## Then
 
 Raise `max_background_jobs` toward the core count, size the write buffers for

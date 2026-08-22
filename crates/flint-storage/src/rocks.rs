@@ -88,6 +88,33 @@ impl RocksKv {
         ))
     }
 
+    /// How close compaction is to the back-pressure triggers: (L0 files,
+    /// pending compaction bytes).
+    ///
+    /// `write_stall()` says whether back-pressure IS being applied. It cannot
+    /// say whether a run got anywhere near it, and BUG-0013's measurement
+    /// stalled on exactly that: a 3 GB fill reported `write_stopped: 0` and the
+    /// criterion as written read that as "hypothesis refuted", when the truth
+    /// was that the trigger was never approached. A zero from an instrument
+    /// that was never exercised is not evidence in either direction.
+    ///
+    /// L0 file count is the number the default `level0_slowdown_writes_trigger`
+    /// (20) and `level0_stop_writes_trigger` (36) are compared against, so it
+    /// turns "did not stall" into "reached 4 of 20" or "reached 19 of 20" —
+    /// two very different runs that `write_stopped: 0` renders identical.
+    ///
+    /// `None` on the same contract as `write_stall`: these are DB PROPERTIES,
+    /// live regardless of whether statistics are enabled (BUG-0022), but if a
+    /// future engine stops answering, the caller must be able to tell a
+    /// measured zero from an absent one.
+    pub fn compaction_pressure(&self) -> Option<(u64, u64)> {
+        let prop = |name: &str| self.db.property_int_value(name).ok().flatten();
+        Some((
+            prop("rocksdb.num-files-at-level0")?,
+            prop("rocksdb.estimate-pending-compaction-bytes")?,
+        ))
+    }
+
     /// Approximate resident bytes for one namespace — the storage-metering
     /// signal (M5 quotas). Uses the engine's SST range estimator over the
     /// namespace's three envelope prefixes (Metadata/Subkey/ZScore), so it
