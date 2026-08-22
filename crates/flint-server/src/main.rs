@@ -2573,6 +2573,24 @@ fn execute(
                     "gc-sweep-ms",
                     GC_SWEEP_MS.load(Ordering::Relaxed).to_string(),
                 ),
+                // Reported even on a node with no queue, so the absence is a
+                // stated value rather than a missing line someone has to
+                // interpret. `-` means this build/engine has no queue at all.
+                field(
+                    "async-writes",
+                    write_queue
+                        .map(|q| q.scope_desc())
+                        .unwrap_or_else(|| "-".to_string()),
+                ),
+                // Both numbers, because only one of them is tunable and the
+                // other is why: the cap cannot be raised past the channel
+                // capacity fixed at startup.
+                field(
+                    "async-queue-cap",
+                    write_queue
+                        .map(|q| format!("{} (hard {})", q.soft_cap(), q.hard_cap()))
+                        .unwrap_or_else(|| "-".to_string()),
+                ),
             ]
             .join("\r\n");
             return Value::Bulk(Some(dump.into_bytes()));
@@ -2608,13 +2626,46 @@ fn execute(
             b"fullsync-rate-bytes" => FULLSYNC_RATE_BYTES.store(parse!(), Ordering::Relaxed),
             b"write-deadline-ms" => WRITE_DEADLINE_MS.store(parse!(), Ordering::Relaxed),
             b"gc-sweep-ms" => GC_SWEEP_MS.store(parse!(), Ordering::Relaxed),
+            // The queue is constructed on every rocks node whether or not
+            // --async-writes was passed, so turning it on is a scope swap and
+            // never needs a restart. On a node without one, say so instead of
+            // accepting a value that would do nothing.
+            b"async-writes" => match write_queue {
+                Some(q) => {
+                    if let Err(e) = q.set_scope(write_queue::AsyncScope::parse(&val)) {
+                        return Value::Error(e);
+                    }
+                }
+                None => {
+                    return Value::Error(
+                        "ERR async-writes needs a rocks node with a write queue".into(),
+                    );
+                }
+            },
+            b"async-queue-cap" => match write_queue {
+                Some(q) => {
+                    let n: usize = match val.parse() {
+                        Ok(v) => v,
+                        Err(_) => return Value::Error(format!("ERR bad value {val:?}")),
+                    };
+                    if let Err(e) = q.set_soft_cap(n) {
+                        return Value::Error(e);
+                    }
+                }
+                None => {
+                    return Value::Error(
+                        "ERR async-queue-cap needs a rocks node with a write queue".into(),
+                    );
+                }
+            },
             other => {
                 return Value::Error(format!(
                     "ERR unknown or restart-only config key {:?} (hot: wal-fsync-ms, \
                      lag-soft-ms, lag-hard-ms, wal-headroom-seq, \
                      min-replicas-to-write, widowed-grace-ms, \
                      max-conns, migrate-rate-bytes, fullsync-rate-bytes, \
-                     write-deadline-ms, gc-sweep-ms)",
+                     write-deadline-ms, gc-sweep-ms, async-writes, \
+                     async-queue-cap)",
                     String::from_utf8_lossy(other)
                 ));
             }
