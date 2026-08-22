@@ -161,6 +161,14 @@ info_field() {  # $1=port $2=field
   mesh "$1" FLINTINFO 2>/dev/null | tr '\r' '\n' | grep "^$2:" | cut -d: -f2 | tr -d ' ' | head -1
 }
 shed_lag() { local v; v=$(info_field "$1" writes_shed_lag); echo "${v:-0}"; }
+# The SOFT gate is reported beside the hard one because the pair is a graded
+# response and only reading the hard end hides whether the grading works. Past
+# lag_soft_ms every write sleeps 2ms (main.rs:2277); past lag_hard_ms it is
+# refused. A hard shed with NO soft delays beneath it means the band was
+# crossed faster than a flat 2ms step can matter — a different problem from
+# "backpressure engaged and was not enough", and indistinguishable from it if
+# only the shed is counted.
+delayed_soft() { local v; v=$(info_field "$1" writes_delayed_soft); echo "${v:-0}"; }
 
 # ---------------------------------------------------------------- control 1
 echo "== control 1: the seats are on the SHIPPED lag cap"
@@ -214,8 +222,9 @@ writer_start() {
 writer_stop() { touch "$D/stop"; wait "$WRITER_PID" 2>/dev/null; WRITER_PID=""; }
 
 roll_under_load() {  # $1=tag $2=load-prefix -> echoes the lag-shed delta
-  local tag="$1" pre_a pre_b post_a post_b
+  local tag="$1" pre_a pre_b post_a post_b pre_sa pre_sb post_sa post_sb
   pre_a=$(shed_lag $A); pre_b=$(shed_lag $B)
+  pre_sa=$(delayed_soft $A); pre_sb=$(delayed_soft $B)
   writer_start "$2"
   sleep 2   # let the firehose actually build lag before the roll starts
   $CTL -f "$D/cluster.flint" upgrade --version-tag "$tag" --soak-ms 1500 \
@@ -224,7 +233,9 @@ roll_under_load() {  # $1=tag $2=load-prefix -> echoes the lag-shed delta
   writer_stop
   sleep 1
   post_a=$(shed_lag $A); post_b=$(shed_lag $B)
+  post_sa=$(delayed_soft $A); post_sb=$(delayed_soft $B)
   echo "  seat :$A writes_shed_lag ${pre_a} -> ${post_a} | seat :$B ${pre_b} -> ${post_b}" >&2
+  echo "  soft delays across the roll: :$A +$(( post_sa - pre_sa )) | :$B +$(( post_sb - pre_sb ))" >&2
   echo $(( (post_a - pre_a) + (post_b - pre_b) ))
 }
 
@@ -268,18 +279,42 @@ echo "  master :$MASTER, replica :$REPLICA"
 WG=$(info_field $MASTER widowed_grace_ms); WG=${WG:-5000}
 STALL_MS=$(( WG / 3 )); [ "$STALL_MS" -gt 1500 ] && STALL_MS=1500
 [ "$STALL_MS" -lt 300 ] && STALL_MS=300
-TIGHT=50
+# Overridable so the soft..hard band can be widened for a soft-gate study
+# without editing the drill. Defaults keep the band narrow, which is right for
+# arming the HARD gate quickly; a wide band is a different experiment and says
+# so at the call site.
+TIGHT="${ROLL_SHED_TIGHT:-50}"
+TIGHT_SOFT="${ROLL_SHED_TIGHT_SOFT:-$(( TIGHT / 2 ))}"
 [ "$STALL_MS" -gt "$TIGHT" ] \
   || { echo "FAIL: stall ${STALL_MS}ms is not longer than the ${TIGHT}ms cap; the control cannot arm"; exit 1; }
-echo "  widowed_grace_ms=$WG, stalling the replica for ${STALL_MS}ms against a ${TIGHT}ms lag cap"
+# Print the variable that is APPLIED, never a second computation of it. This
+# line recomputed TIGHT/2 and so reported 700ms soft on a run that applied
+# 25ms from the environment — a log disagreeing with the config it describes,
+# in the one line an operator would trust to tell them what was tested.
+echo "  widowed_grace_ms=$WG, stalling the replica for ${STALL_MS}ms against a ${TIGHT}ms hard cap (${TIGHT_SOFT}ms soft)"
 
-mesh $MASTER FLINTCONFIG lag-soft-ms $TIGHT >/dev/null 2>&1
+# THE BAND MUST HAVE WIDTH OR THE SOFT GATE IS DEAD CODE.
+#
+# These were both set to $TIGHT, which collapsed soft..hard to zero width. The
+# write path checks hard FIRST and returns (main.rs:2271), so with soft == hard
+# the `lag >= lag_soft_ms` branch is unreachable and writes_delayed_soft can
+# only ever read 0. The drill then printed that 0 next to a hard-shed count and
+# a note reasoning about why the soft gate had not helped — a statement about
+# the product, produced by a setting of this script.
+#
+# Half the hard cap gives the soft gate a real band to act in, so the number
+# beside the shed means what it appears to mean.
+mesh $MASTER FLINTCONFIG lag-soft-ms $TIGHT_SOFT >/dev/null 2>&1
 mesh $MASTER FLINTCONFIG lag-hard-ms $TIGHT >/dev/null 2>&1
+gots=$(info_field $MASTER lag_soft_ms)
+[ "$gots" = "$TIGHT_SOFT" ] \
+  || { echo "FAIL: lag-soft-ms $TIGHT_SOFT did not take (seat reports ${gots:-none})"; exit 1; }
 got=$(info_field $MASTER lag_hard_ms)
 [ "$got" = "$TIGHT" ] \
   || { echo "FAIL: FLINTCONFIG lag-hard-ms $TIGHT did not take (seat reports ${got:-none}) — see BUG-0043"; exit 1; }
 
 PRE_LAG=$(shed_lag $MASTER)
+PRE_SOFT=$(delayed_soft $MASTER)
 PRE_WID=$(info_field $MASTER writes_shed_widowed); PRE_WID=${PRE_WID:-0}
 fleet_signal_port $REPLICA -STOP || { echo "FAIL: could not SIGSTOP the replica on :$REPLICA"; exit 1; }
 STOPPED=$REPLICA
@@ -290,8 +325,27 @@ fleet_signal_port $STOPPED -CONT; STOPPED=""
 sleep 1
 POST_LAG=$(shed_lag $MASTER)
 POST_WID=$(info_field $MASTER writes_shed_widowed); POST_WID=${POST_WID:-0}
+POST_SOFT=$(delayed_soft $MASTER)
 D_LAG=$(( POST_LAG - PRE_LAG )); D_WID=$(( POST_WID - PRE_WID ))
-echo "  writes_shed_lag ${PRE_LAG} -> ${POST_LAG} (+$D_LAG) | writes_shed_widowed +$D_WID"
+D_SOFT=$(( POST_SOFT - PRE_SOFT ))
+echo "  writes_shed_lag ${PRE_LAG} -> ${POST_LAG} (+$D_LAG) | writes_delayed_soft +$D_SOFT | writes_shed_widowed +$D_WID"
+# Reported, not asserted. The soft gate is a flat 2ms step across the whole
+# soft..hard band, so how many writes land in it depends on how fast the band
+# is crossed — a real property, but not one with a threshold worth failing on
+# until it has been characterised on more than one machine.
+#
+# This only means anything because TIGHT_SOFT < TIGHT above. When the two were
+# equal the count was structurally zero and the note below was a conclusion
+# about the product drawn from a setting of this script.
+if [ "$D_SOFT" -eq 0 ]; then
+  echo "  NOTE: the hard gate fired with NO soft delays beneath it, across a real"
+  echo "        ${TIGHT_SOFT}..${TIGHT}ms band — the band was crossed faster than a flat 2ms step"
+  echo "        could act. Worth knowing before anyone tunes the soft cap expecting"
+  echo "        it to smooth this."
+else
+  echo "  the soft gate engaged $D_SOFT time(s) before the hard gate refused — the"
+  echo "        graded response is doing something, not merely present"
+fi
 if [ "$D_LAG" -le 0 ]; then
   echo "FAIL: with the replica stalled ${STALL_MS}ms behind a ${TIGHT}ms cap, the master shed"
   echo "      NOTHING by the lag cause. That is not a pass — it means control 2 above proves"

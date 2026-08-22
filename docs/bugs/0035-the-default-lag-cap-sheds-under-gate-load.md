@@ -544,3 +544,53 @@ at any burst, the shed is macOS-only on loopback — the rc.15 class, where a
 platform difference hid a whole behaviour — and the production sighting is
 environmental (real network RTT, disk, fleet size), leaving the playground the
 only place it can be measured.
+
+## 2026-08-22, decisive — LINUX does not shed at any burst, and every shed so far was macOS
+
+The cell the previous section named as empty is now filled. On the 16-vCPU
+Linux gate box, `GAP=0` at the shipped 1000ms cap:
+
+| burst, one `--pipe` | shed |
+|---|---|
+| 500 | 0 |
+| 4000 | 0 |
+| 20000 | 0 |
+
+macOS sheds at burst 4000. Linux sheds at nothing, including a single
+uninterrupted 20000-command pipeline.
+
+**So every loopback shed ever recorded against this bug is macOS.** That is
+the rc.15 class again — a platform difference that hides an entire behaviour —
+though pointing the other way: rc.15 was macOS PERMITTING something Linux
+refused, and here macOS EXHIBITS a shed Linux does not. The playground is
+Linux.
+
+### What follows, and what does not
+
+**Follows:** the production 210 is not a burst-or-rate phenomenon that loopback
+can reproduce. Loopback-Linux replication keeps up with anything this
+generator can produce, so the lag cap never engages, so there is nothing on
+that machine for rate to explain. The remaining candidates are environmental —
+a real network RTT between seats, disk under a real working set, fleet size —
+and the playground is the only place they exist.
+
+**Does NOT follow: that Linux cannot be made to shed.** This experiment cannot
+distinguish "the server kept up" from "the client could not push hard enough".
+Delivered throughput was never measured — the same gap that made the earlier
+rate sweep measure burst size instead of rate — and `valkey-cli --pipe` is a
+single-connection generator competing for the same CPUs. A saturating client
+(`valkey-benchmark -c`, several connections) might well reach the cap. The
+claim supported is the narrow one: **at these load shapes, on this machine,
+the lag gate does not engage.**
+
+### The consequence for the drill
+
+`roll_shed_drill.sh`'s control 2 cannot fail from load on the Linux gate box,
+because no load reaches the cap there. Its regression value on that machine is
+limited to catching a change that makes a roll shed for some OTHER reason.
+
+**Control 3 is what carries the drill on Linux**, which is exactly why forcing
+the condition with SIGSTOP rather than provoking it with load was necessary
+rather than tidy. Had the positive control stayed load-based, the drill would
+now be green on the gate box while exercising nothing at all — the failure it
+was written to prevent, arrived at by a different road.
