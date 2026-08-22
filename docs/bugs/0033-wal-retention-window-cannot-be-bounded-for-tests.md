@@ -1,6 +1,6 @@
 # BUG-0033: the WAL retention window cannot be bounded (OPEN)
 
-Status: OPEN, found 2026-08-19 while building release acceptance · Severity:
+Status: **FIXED** 2026-08-22 · found 2026-08-19 while building release acceptance · Severity:
 medium — this is not a fault in the running product, it is the reason the
 fault that took a production pair single-copy for thirteen minutes has no
 automated coverage anywhere
@@ -134,6 +134,37 @@ pre-fix build, which recovered cleanly through both `restart-node` and
 mid-segment, which `latest_seq() / 2` gives an in-process test and no socket
 offers. It belongs in `a_cursor_the_wal_cannot_reach_is_a_gap_not_silence`
 and no drill will take it away.
+
+## Fixed 2026-08-22 — the seam has a caller
+
+`flint-server` now accepts `--wal-ttl-seconds` and `--wal-size-limit-mb` and
+routes them to the `open_with_retention` that already existed. Defaults are
+unchanged, as this bug requires: the flags are for tests and for operators who
+have measured their own fleet, and a short window IS the livelock in BUG-0012.
+Overriding either prints a line saying so with the defaults beside it, so a
+node running a test window cannot be mistaken for a normal one.
+
+**Verified that they BITE, not merely that they parse.** A flag that is read
+and printed but changes no behaviour is the failure mode this repository keeps
+finding, so the check was end-to-end:
+
+    master --wal-ttl-seconds 1 --wal-size-limit-mb 1, replica attached and live
+    SIGSTOP the replica at seq 235
+    ~36 MB of writes -> master latest_seq 9002
+    SIGCONT
+
+    FATAL: WALGAP full sync required: sequence 235 is no longer in the WAL
+           (latest is 9002) — this link can never resume.
+
+Seconds and 36 MB, against the 8 GiB or six hours this bug was filed about.
+(The archive directory was empty at that point: retention dropped the segments
+outright rather than archiving them. The gap is the same either way.)
+
+The two follow-ons this bug lists are now unblocked — a `flint-storage` unit
+test for `updates_since_budgeted` returning `Ok` on a span starting past the
+requested sequence, and a real gap drill with its acceptance check. Neither is
+written here; this makes them possible, and claiming them would be the same
+overreach this bug corrects itself for above.
 
 ## Fix
 

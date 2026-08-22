@@ -31,11 +31,12 @@ The threshold is RAMPED down until it arms rather than fixed, per BUG-0030 —
 on this box nothing armed until 2 sequences, so a fixed 10 or 100 would have
 failed to create the condition and reported it as a product defect.
 
-Still not done, and deliberately not claimed here: `--wal-retain-seconds` /
-`--wal-retain-mb` from ADR-0022 part 3 do not exist as flags. The defaults were
-raised and the values are plumbed as parameters to `open_with_retention`, but
-an operator cannot retune retention itself without a rebuild. Filed as the
-remaining half rather than folded into "fixed".
+The remaining half is now done too: `--wal-ttl-seconds` and
+`--wal-size-limit-mb` reached `flint-server` on 2026-08-22 (BUG-0033), routed
+to the same `open_with_retention`, defaults untouched. Verified end to end
+rather than by parsing — a replica stopped at seq 235 against a master driven
+to 9002 under a 1 MB window reports `WALGAP ... sequence 235 is no longer in
+the WAL`, in seconds instead of 8 GiB or six hours.
 
 **This is a recurrence.** `packaging/aws/verify-watch.sh` (private ops repo)
 was written because of the first one, and its header records it: *"on

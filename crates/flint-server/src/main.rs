@@ -585,6 +585,7 @@ fn usage() -> String {
         "                    [--data-dir DIR] [--replica-of HOST:PORT]\n",
         "                    [--journal HOST:PORT] [--rewind-snaps DIR]\n",
         "                    [--wal-fsync-ms N] [--max-fullsync N]\n",
+        "                    [--wal-ttl-seconds N] [--wal-size-limit-mb N]\n",
         "\n",
         "  --build-version, --version, -V   print the build stamp and exit\n",
         "  --help, -h        print this and exit\n",
@@ -980,7 +981,32 @@ fn main() -> std::io::Result<()> {
                 eprintln!("restored data dir from snapshot {id}");
                 restored_from_id = Some(id);
             }
-            let kv = RocksKv::open(std::path::Path::new(&dir))
+            // BUG-0033: the retention seam existed with no caller, so nothing
+            // could put a replica outside the WAL window without writing 8 GiB
+            // or waiting six hours — which is why BUG-0031's class had no drill
+            // and was found by a production incident instead.
+            //
+            // DEFAULTS ARE UNCHANGED on purpose. These are for tests and for
+            // operators who have measured their own fleet, not a new
+            // recommended value: a short window is the livelock in BUG-0012.
+            let wal_ttl = arg("--wal-ttl-seconds")
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(flint_storage::rocks::DEFAULT_WAL_TTL_SECONDS);
+            let wal_mb = arg("--wal-size-limit-mb")
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(flint_storage::rocks::DEFAULT_WAL_SIZE_LIMIT_MB);
+            if wal_ttl != flint_storage::rocks::DEFAULT_WAL_TTL_SECONDS
+                || wal_mb != flint_storage::rocks::DEFAULT_WAL_SIZE_LIMIT_MB
+            {
+                eprintln!(
+                    "WAL retention OVERRIDDEN: ttl={wal_ttl}s size={wal_mb}MB \
+                     (defaults {}s / {}MB) — a replica that falls outside this \
+                     window needs a full re-seed",
+                    flint_storage::rocks::DEFAULT_WAL_TTL_SECONDS,
+                    flint_storage::rocks::DEFAULT_WAL_SIZE_LIMIT_MB
+                );
+            }
+            let kv = RocksKv::open_with_retention(std::path::Path::new(&dir), wal_ttl, wal_mb)
                 .map_err(|e| std::io::Error::other(format!("rocksdb open: {e}")))?;
             if fresh && replica_of.is_some() {
                 // The checkpoint copies the SOURCE's system rows — including
