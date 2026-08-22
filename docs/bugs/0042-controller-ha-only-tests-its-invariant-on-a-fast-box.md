@@ -154,6 +154,39 @@ returns `-FENCED` only when `next <= current`, so a stale-role controller
 proposing `current + 1` passes by construction. Answering it needs the failing
 shape reproduced, not another passing run.
 
+## Candidate 3 examined, 2026-08-22: the counting was wrong, in the other direction
+
+Candidate 3 above guessed the epoch window `\(0,[3-9]` was "too narrow and a
+legitimate later promotion is being counted" — i.e. that it over-counted. It
+does not. It under-counts, and it hides something worse.
+
+**The window is a string PREFIX test wearing the shape of a comparison.** It
+matches `(0,3)` through `(0,9)`, and also `(0,30)` and `(0,300)`, but NOT
+`(0,10)` through `(0,29)` — those begin with 1 or 2. A promotion at epoch 10
+was counted by neither `REAL` nor `HIGHER` and simply disappeared. Checked
+against synthetic log lines: where the truth is three higher-epoch promotions
+(epochs 10, 29, 5), the old counter reported **one**.
+
+**Both counters also pinned `:$P2`, the expected survivor.** A promotion of any
+OTHER seat was invisible to both — and that is exactly the case ADR-0004's
+bounded-transient allowance excludes: *"two controllers promoting different
+survivors"*. The drill could not see the one shape the ADR itself calls
+dangerous. That is the worse of the two blind spots, and it is why the fix
+adds a third counter rather than widening a regex.
+
+Both are now numeric and seat-aware, and a promotion of another seat FAILS
+with no allowance, because every allowance in this drill is about the SAME
+survivor being re-promoted at a higher epoch, which is idempotent for data.
+Split-brain is not that.
+
+**Candidate 3 is NOT ruled out by this.** The narrowness causes misses, not
+false positives, so it cannot explain the original `higher epoch: 1` — a
+falsely-counted promotion would have required the opposite defect. What
+changed is that the counting is now correct enough for the question to be
+asked. The original observation stands unexplained, and candidates 1 and 2
+(a controller observing the pair as master-less after the first promotion, and
+a fence checked against a stale epoch read) are untouched.
+
 ## Where to start
 
 1. Reproduce on a box with >= 16 vCPU; on 8 cores the race did not start in

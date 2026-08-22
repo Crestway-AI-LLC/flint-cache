@@ -73,10 +73,44 @@ done
 sleep 1.0  # let all controllers observe the new state
 
 echo "== exactly ONE effective promotion (the rest -FENCED, no double promote)"
-REAL=$(grep -h -c "PROMOTED 127.0.0.1:$P2 at (0,2)" $HA_LOGS | awk '{s+=$1} END {print s+0}')
-HIGHER=$(grep -h -cE "PROMOTED 127.0.0.1:$P2 at \(0,[3-9]" $HA_LOGS | awk '{s+=$1} END {print s+0}')
+# COUNTED NUMERICALLY, AND FOR EVERY SEAT. Both counters used to be lexical.
+#
+# The higher-epoch one was `grep -cE "... at \(0,[3-9]"` — a string PREFIX test
+# wearing the shape of a comparison. It matches (0,3) through (0,9), and also
+# (0,30) and (0,300), but NOT (0,10) through (0,29), which begin with 1 or 2.
+# A promotion there was counted by neither total and simply disappeared. This
+# drill's epochs stay small so it happened to work, and nothing in it said
+# when it would stop.
+#
+# Both also pinned :$P2, the expected survivor, so a promotion of any OTHER
+# seat was invisible to both. That is precisely the case ADR-0004's
+# bounded-transient allowance excludes — "two controllers promoting different
+# survivors" — so the drill could not see the one shape the ADR calls
+# dangerous. That is the worse of the two blind spots, and the reason this is
+# a third counter rather than a widened regex.
+read -r REAL HIGHER OTHER <<EOF
+$(grep -h -oE "PROMOTED 127\.0\.0\.1:[0-9]+ at \(0,[0-9]+\)" $HA_LOGS 2>/dev/null \
+  | sed -E 's/.*:([0-9]+) at \(0,([0-9]+)\)/\1 \2/' \
+  | awk -v p2="$P2" '
+      $1 == p2 && $2 == 2 { real++;   next }
+      $1 == p2 && $2 >  2 { higher++; next }
+                          { other++ }
+      END { printf "%d %d %d\n", real+0, higher+0, other+0 }')
+EOF
 FENCED=$(grep -h -c "promotion fenced" $HA_LOGS | awk '{s+=$1} END {print s+0}')
-echo "  real promotions at (0,2): $REAL | promotions at higher epoch: $HIGHER | fenced attempts: $FENCED"
+echo "  real promotions at (0,2): $REAL | promotions at higher epoch: $HIGHER | fenced attempts: $FENCED | promotions of another seat: $OTHER"
+
+# SPLIT-BRAIN IS NOT A BOUNDED TRANSIENT. Every allowance below is about the
+# SAME survivor being re-promoted at a higher epoch, which is idempotent for
+# data. A promotion of a different seat is the other thing entirely, and it
+# gets no allowance at all.
+if [ "${OTHER:-0}" -gt 0 ]; then
+  echo "FAIL: $OTHER promotion(s) of a seat other than the expected survivor :$P2."
+  echo "      Two controllers promoting DIFFERENT survivors is split-brain, and it is"
+  echo "      the one case ADR-0004's bounded-transient allowance explicitly excludes."
+  grep -h -oE "PROMOTED 127\.0\.0\.1:[0-9]+ at \(0,[0-9]+\)" $HA_LOGS | sort | uniq -c | sed 's/^/        /'
+  exit 1
+fi
 
 # SAY WHEN THE RACE DID NOT START. `fenced attempts: 0` means no second
 # controller ever reached FLINTPROMOTE — one controller got there first and the
@@ -123,7 +157,9 @@ fi
 # intervals, and require it to stop moving instead.
 SETTLE_AFTER=$HIGHER
 sleep 1.5   # 10x --poll-ms 150; ADR-0004 claims reconvergence "within a tick"
-HIGHER2=$(grep -h -cE "PROMOTED 127.0.0.1:$P2 at \(0,[3-9]" $HA_LOGS | awk '{s+=$1} END {print s+0}')
+HIGHER2=$(grep -h -oE "PROMOTED 127\.0\.0\.1:[0-9]+ at \(0,[0-9]+\)" $HA_LOGS 2>/dev/null \
+  | sed -E 's/.*:([0-9]+) at \(0,([0-9]+)\)/\1 \2/' \
+  | awk -v p2="$P2" '$1 == p2 && $2 > 2 { n++ } END { print n+0 }')
 if [ "$HIGHER2" -gt "$SETTLE_AFTER" ]; then
   echo "FAIL: promotions still arriving 1.5s after the race ($SETTLE_AFTER -> $HIGHER2)."
   echo "      ADR-0004 promises the controllers reconverge within a tick; this is a livelock."
