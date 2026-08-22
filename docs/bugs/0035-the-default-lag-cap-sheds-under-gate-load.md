@@ -430,3 +430,69 @@ in when it keeps acking and lets a replica fall arbitrarily behind.
 
 What stays open here is now only BUG-0038's fix and gate 21's unnamed
 perturbation.
+
+## 2026-08-22 — the roll now has a drill that could see it, and at ordinary rate it sheds nothing
+
+`tools/roll_shed_drill.sh`, in CORE. Four controls: the seats are on the
+shipped cap, a roll under load sheds zero by the lag cause, the same roll at a
+tightened cap DOES shed, and restoring the cap restores writes.
+
+**The coverage gap it closes is the point.** `upgrade_drill.sh` rolls a fleet
+and asserts the build lands on every seat, and contains no reference to lag,
+shed, or any counter — checked, not assumed. So the only production defect the
+roll procedure has ever produced was invisible to the only drill exercising
+that procedure, and every green gate since 2026-08-20 has been silent about it
+rather than reassuring.
+
+### What was measured
+
+At a paced ~200 writes/sec through the proxy — modest, and what an operator
+would recognise — a controlled roll sheds **0** by the lag cause at the shipped
+1000ms cap, on both a laptop and the 16-vCPU Linux gate box. That zero is
+measured rather than unobserved: the positive control stalls a replica with
+SIGSTOP behind a 50ms cap and the master sheds (250 writes on the gate box,
+`writes_shed_widowed` unmoved, so it is the lag gate and not the widowed one).
+
+**The first version of that control was wrong in an instructive way.** It
+ramped the cap down and re-rolled at each step, expecting the roll itself to
+manufacture lag. On the laptop it armed every time — 50, 350, 95 writes at a
+50ms cap. On the Linux gate box it shed NOTHING even at 1ms, and the drill
+failed on its own positive control. That failure was correct: a roll sheds
+only while a replica is LIVE and BEHIND, and the width of that window belongs
+to the machine, not the product. A fast box re-syncs a restarted replica
+before any lag accumulates. So the control armed on slow hardware and quietly
+stopped arming on fast hardware — where it would have gone green while
+testing nothing, while asserting that control 2's zero meant something.
+
+**At an unpaced firehose the same roll shed 20651.** That number is true and
+proves nothing about the claim: this file already records that a replay at
+firehose rate recreates the lag that caused the shed, and `slo.md`'s no-stall
+row makes no promise about a client saturating the pipe. A first cut of the
+drill asserted zero against that load and failed by construction — a test that
+red-lights on behaviour the docs explicitly permit, which is the shape this
+file warns about two sections above. The rate is now a knob
+(`ROLL_SHED_BATCH`, `ROLL_SHED_GAP`) precisely because the interesting question
+is at WHICH rate a roll begins to shed.
+
+### What this does NOT establish
+
+**The production sighting is not reproduced.** 210 writes shed on the
+playground during an ordinary rc.59 roll; the same procedure on loopback at a
+comparable rate sheds nothing. The gap is unexplained, and the honest list of
+candidates is: a real network RTT the loopback pair does not have, disk
+behaviour under a real working set, fleet size, or a playground write rate
+materially above the paced default here.
+
+So `slo.md`'s no-stall row stays as written. It is still contradicted by one
+production observation, and it is now also supported by a repeatable local
+measurement — which is a sharper disagreement than before, not a resolution.
+The next step is a rate sweep to find the threshold, and if none is found
+below firehose rate, the difference is environmental and the playground is
+where it must be measured.
+
+### A defect found on the way
+
+The ramp asked for `lag-hard-ms 200` and the seat reported 500:
+`set_lag_hard_ms` clamps to `v.max(lag_soft_ms)` and says nothing. Filed as
+BUG-0043. Without the drill's read-back the positive control would have tested
+one threshold five times while reporting five.
