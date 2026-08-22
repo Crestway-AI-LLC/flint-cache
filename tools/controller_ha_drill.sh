@@ -83,7 +83,7 @@ echo "  real promotions at (0,2): $REAL | promotions at higher epoch: $HIGHER | 
 # other two observed finished state. The exactly-once property was then NOT
 # exercised, and a PASS on that run says nothing about the fence. Observed on an
 # 8-core laptop four times in a row while a 16-vCPU box raced on the first try
-# (BUG-0041). Not a failure: the drill cannot make the machine faster. But a
+# (BUG-0042). Not a failure: the drill cannot make the machine faster. But a
 # silent pass and a tested pass must not look identical.
 [ "$FENCED" = "0" ] && {
   echo "  NOTE: no controller was fenced — the race did not start on this box, so the"
@@ -113,7 +113,7 @@ if [ "$HIGHER" -gt "$HIGHER_MAX" ]; then
   cat $HA_LOGS
   exit 1
 fi
-[ "$HIGHER" = "0" ] || echo "  NOTE: $HIGHER re-promotion(s) of :$P2 at a higher epoch — bounded transient (BUG-0041)"
+[ "$HIGHER" = "0" ] || echo "  NOTE: $HIGHER re-promotion(s) of :$P2 at a higher epoch — bounded transient (BUG-0042)"
 
 # CONVERGENCE, which is the property ADR-0004 actually promises and which no
 # count above tests: the transient must SETTLE. A first draft of this asserted

@@ -1,4 +1,9 @@
-# BUG-0041: `controller_ha` only tests its invariant on a fast box — and the once it did, a second promotion landed
+# BUG-0042: `controller_ha` only tests its invariant on a fast box — and the once it did, a second promotion landed
+
+Renumbered from 0041 on 2026-08-22: a peer filed a different BUG-0041
+(client error escaping the retry budget) and pushed first. Commit messages
+c134191 and 8767399 say 0041 and are left as written — history is not
+rewritten to tidy a number.
 
 Status: drill half FIXED 2026-08-22; the product question OPEN · found 2026-08-22 · Severity: medium — the second promotion is of
 the SAME survivor at a higher epoch, so it is not split-brain and not acked-write
