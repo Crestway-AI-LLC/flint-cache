@@ -393,7 +393,7 @@ attempt 1, `c9487f3`):
 `role=master role_epoch=(0,2)` — the harness dialled the promoted seat, not a
 pre-promotion one. The code reading was right.
 
-**But the verdict on (b) cannot be taken.** The probe's rule is: all
+**But the verdict on (b) rests on a single entry at the clock's resolution limit** (and see the correction below, which narrows this). The probe's rule is: all
 `sent_before_prev_kill=false` means "served by the CURRENT master and lost ->
 real". The single offending entry has
 
@@ -410,6 +410,39 @@ At 1 ms granularity that write is genuinely unclassifiable: it may have been
 acked by the old master microseconds before it died, which is the BUG-0007
 ledger class this probe exists to separate out, or by the new one after, which
 is a durability regression. **The instrument cannot tell, and says it can.**
+
+### Correction, same day: the strict `<` is a deliberate convention, not an oversight
+
+The paragraph above called the comparison a boundary artifact without reading
+why it is written that way. It is documented, and the reasoning is sound
+(`main.rs:478`):
+
+    Two clocks on purpose. `kill_ms` is armed BEFORE the kill and times the
+    outage from the writer's vantage. `dead_ms` is stamped AFTER the SIGKILL
+    landed and is the only boundary the LEDGER may use: in the gap between the
+    two — an epoch read plus a pkill spawn, tens of ms on a busy box — the old
+    master is alive and still acking. Judging those acks as "sent after the
+    kill, so the new master's" left the ledger claiming values the survivor
+    never had, and the NEXT replica kill reported them as data loss.
+
+So `sent >= dead_ms` means "the new master's write", and `main.rs:772` skips
+exactly those entries for the same reason. The probe is consistent with the
+codebase, and a write classified that way, if missing, IS a real loss. On that
+reading the verdict of "real" is defensible rather than meaningless.
+
+**What survives the correction is narrower and still worth acting on.** Because
+`dead_ms` is stamped after the kill, the death instant lies at or before it —
+so a send stamped in the SAME truncated millisecond may have preceded the death
+and been served by the old master. The classification is probably right and is
+not certain, and here the entire verdict rested on **one** entry sitting exactly
+on that truncation boundary. "Probably a durability regression, on a single
+sample at the one point the clock cannot resolve" is not a conclusion to act on,
+and it is not the same statement as "unusable".
+
+The remedy is unchanged and cheaper than the argument: microsecond stamps make
+the comparison decidable at the only point where it is contested, and an
+explicit AMBIGUOUS state for `sent == dead_ms` stops a tie from being reported
+as either answer. Nothing about the convention needs to change.
 
 ### What this needs before the next firing
 
