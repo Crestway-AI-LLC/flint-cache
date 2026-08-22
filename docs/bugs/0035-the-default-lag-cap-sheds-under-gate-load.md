@@ -496,3 +496,51 @@ The ramp asked for `lag-hard-ms 200` and the seat reported 500:
 `set_lag_hard_ms` clamps to `v.max(lag_soft_ms)` and says nothing. Filed as
 BUG-0043. Without the drill's read-back the positive control would have tested
 one threshold five times while reporting five.
+
+## 2026-08-22, later — the sweep's axis was mislabelled, and the real variable is burst size
+
+A rate sweep was run on the 16-vCPU gate box to answer "at WHICH rate does a
+roll begin to shed at the shipped cap". Nominal 200, 500, 1000, 2000, 5000 and
+10000 writes/sec: **all six shed zero.**
+
+**That table's rate axis does not mean what it says, and the finding is the
+instrument, not the result.** The load generator sends BATCH commands through
+one `valkey-cli --pipe`, sleeps GAP, and repeats. Nominal rate was computed as
+BATCH/GAP — but each cycle also pays a process spawn, a TCP connect and an
+auth, and that overhead is not in the arithmetic. Delivered throughput is
+`BATCH / (pipe_time + spawn + GAP)`, which was never measured. Varying BATCH
+with GAP fixed therefore varied the BURST SIZE far more than the rate.
+
+Three follow-ups on the laptop, at GAP=0 so no sleep confounds it:
+
+| burst, one `--pipe` | shed at the shipped cap |
+|---|---|
+| 50 | 0 |
+| 500 | 0 |
+| 4000 | **416** |
+
+So the threshold is a single uninterrupted pipeline burst somewhere between
+500 and 4000 commands. Small batches never shed however tightly they are
+looped, because the per-invocation overhead is itself a throttle that lets the
+replica drain. **The gap was not the variable either** — GAP=0 at BATCH=50
+sheds nothing, which killed that hypothesis as soon as it was tested.
+
+Magnitude is highly variable at a fixed shape: the same BATCH=4000/GAP=0 run
+shed 416 here and 20651 earlier the same day. That is what a threshold
+phenomenon looks like — once lag crosses the cap, how much sheds depends on
+how long it stays crossed — and it means single-run magnitudes should not be
+compared.
+
+### The cell that decides it, and is not yet filled
+
+**Large burst on LINUX has not been tested.** Every shed observed so far is on
+macOS; every Linux run used a paced generator whose overhead throttled it. The
+playground is Linux, so until loopback-Linux is driven at a 4000-command burst
+the production 210 has not been given a fair chance to reproduce.
+
+If Linux sheds there, rate/burst explains the playground and `slo.md`'s
+no-stall row needs a qualifier about sustained bursts. If Linux does NOT shed
+at any burst, the shed is macOS-only on loopback — the rc.15 class, where a
+platform difference hid a whole behaviour — and the production sighting is
+environmental (real network RTT, disk, fleet size), leaving the playground the
+only place it can be measured.
