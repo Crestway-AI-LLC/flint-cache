@@ -123,6 +123,37 @@ The mechanism. Candidates, in order of cheapness to test:
    promotion is being counted. Cheapest to rule out first, and it would make
    this a drill bug rather than a product one.
 
+## Second 16-vCPU observation, 2026-08-22: the race engaged and the invariant held
+
+Gate run `20260822T163154Z` on the c7i.4xlarge gate box, the same class of
+machine as the original failure:
+
+    real promotions at (0,2): 1 | promotions at higher epoch: 0 | fenced attempts: 2
+    PASS: concurrent controllers safe (exactly-once promotion), HA survives losing 2 of 3
+
+**`fenced attempts: 2` is the load-bearing number.** Finding 2 above is that
+the drill passes on an ordinary box without testing anything, and `fenced
+attempts: 0` is how that announces itself. Here two controllers genuinely
+raced, both were fenced, and no higher-epoch promotion landed — so on this run
+the property ADR-0004 depends on was exercised and held.
+
+**This does not narrow the product question, and must not be read as closing
+it.** The original failure was `fenced: 1 | higher epoch: 1`; this is
+`fenced: 2 | higher epoch: 0`. Two 16-vCPU runs disagreeing is what an
+intermittent race looks like, and one contrary observation is not evidence of
+absence — it establishes only that the second promotion is not deterministic
+on fast hardware, which nobody claimed.
+
+What it does establish is that the reworked assertion behaves as designed: it
+distinguished a run that exercised the race from one that did not, which is
+precisely the distinction the four green laptop runs could not draw.
+
+The open question is unchanged and is a design question, not a flake: **should
+a controller that has lost its role propose a promotion at all?** `FLINTPROMOTE`
+returns `-FENCED` only when `next <= current`, so a stale-role controller
+proposing `current + 1` passes by construction. Answering it needs the failing
+shape reproduced, not another passing run.
+
 ## Where to start
 
 1. Reproduce on a box with >= 16 vCPU; on 8 cores the race did not start in
