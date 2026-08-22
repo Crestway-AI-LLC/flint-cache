@@ -55,6 +55,53 @@ dependency in any `Cargo.toml` — so proxy changes cannot affect `flintctl` or
 (`proxy`, `cache`, `tls`, `backpressure`, `admin_gated`, `registry`, `chaos`)
 pass at the same HEAD, so this is specific to the conformance drill's setup.
 
+## Update 2026-08-21: step 1 is done, and it changes the diagnosis
+
+**"The seat is fine and the failure is in how `flintctl` probes it" is wrong.**
+The seat is not fine — it never reaches `main`.
+
+Step 1 below (make the probe say WHY) shipped as `fa7227a`: the bare
+`assert!(wait_pong(...))` became a check that asks whether the process is still
+there and reports which way it failed. Across every gate run after that commit:
+
+    seat ALIVE, never answered PING     9
+    NO process at all                   1
+
+And `sample` on a stalled control-plane seat: **2935 of 2935 frames in
+`_dyld_start`, `main` never entered.** So the process exists — which is why
+`seat_alive` says yes and why the old assert read as a probe problem — but no
+code of ours has run. It emits nothing because nothing of ours is running, it
+never binds, and `boot.log` holds only flintctl's own banner.
+
+**The TLS-mode-mismatch suspect is refuted, on two independent grounds.**
+
+1. A config mismatch is deterministic. This is not: 20 gate runs at one commit
+   were clean in 6. A mismatch between spawn flags and probe config would fail
+   every time, not 70% of the time.
+2. Same code, same drill, on Linux CI: `gate.yml` is green in **29 of its last
+   30 runs** on `ubuntu-latest`, against 6 of 20 locally on macOS. A TLS
+   mismatch is platform-independent; a loader stall is not — Linux has no
+   `dyld`.
+
+`proxy_conformance` is therefore not special. It is one of the drills that
+happens to bring up a control-plane seat, and it fails whenever the burst
+catches it. The same signature accounts for `FAIL: bootstrap` across 20 other
+drills.
+
+**What is still not established: the TRIGGER.** Why `dyld` stalls before `main`
+on a box with no memory pressure, where a direct `exec` of the same binary
+measured instantly (5 consecutive runs at 0.00s). Excluded as the trigger, each
+with evidence: sibling build/test load (a run at 87% sibling exposure was
+clean), drill order (reordered runs sit inside the default range at matched
+exposure), load average (15 failures at load 2.5-3.0; a clean 117/0 at load
+rising to 8.04), and the quiet-start guard built to control them (guarded runs
+clean 2 of 7, unguarded 5 of 13).
+
+Severity is unchanged but the scope is wider than this drill, and the practical
+mitigation is already available: run the gate on Linux. `packaging/aws/gate-box/run.sh`
+in the ops repo does exactly that, and a run there was 117/0 with
+`FLINT_GATE_STRICT=1`.
+
 ## Where to start
 
 1. `crates/flint-ctl/src/main.rs:3006` and `wait_pong` at :679 — print what
