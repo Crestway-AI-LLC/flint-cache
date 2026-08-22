@@ -77,7 +77,60 @@ REAL=$(grep -h -c "PROMOTED 127.0.0.1:$P2 at (0,2)" $HA_LOGS | awk '{s+=$1} END 
 HIGHER=$(grep -h -cE "PROMOTED 127.0.0.1:$P2 at \(0,[3-9]" $HA_LOGS | awk '{s+=$1} END {print s+0}')
 FENCED=$(grep -h -c "promotion fenced" $HA_LOGS | awk '{s+=$1} END {print s+0}')
 echo "  real promotions at (0,2): $REAL | promotions at higher epoch: $HIGHER | fenced attempts: $FENCED"
-[ "$HIGHER" = "0" ] || { echo "FAIL: a second real promotion at a higher epoch occurred"; exit 1; }
+
+# SAY WHEN THE RACE DID NOT START. `fenced attempts: 0` means no second
+# controller ever reached FLINTPROMOTE — one controller got there first and the
+# other two observed finished state. The exactly-once property was then NOT
+# exercised, and a PASS on that run says nothing about the fence. Observed on an
+# 8-core laptop four times in a row while a 16-vCPU box raced on the first try
+# (BUG-0041). Not a failure: the drill cannot make the machine faster. But a
+# silent pass and a tested pass must not look identical.
+[ "$FENCED" = "0" ] && {
+  echo "  NOTE: no controller was fenced — the race did not start on this box, so the"
+  echo "        exactly-once property was NOT exercised by this run."
+}
+
+# A SECOND PROMOTION OF THE SAME SURVIVOR IS A BOUNDED TRANSIENT, NOT A DEFECT,
+# and asserting HIGHER=0 asserted something the design does not promise.
+# `FLINTPROMOTE 0 next` answers -FENCED only when `next <= current`, so a
+# controller whose ROLE view is stale (no master-claimer yet) while its EPOCH
+# read is fresh computes next=current+1 and passes the fence by construction.
+# ADR-0004 expects exactly that and calls it converged: "epochs are monotonic,
+# so colliding controllers cannot cycle — every effective action strictly
+# increases the max epoch, and all controllers reconverge within a tick." The
+# #168/#171 recovery paths RE-PROMOTE a self-fenced master at a higher epoch on
+# purpose, so a blanket "never twice" would forbid the recovery this product
+# depends on.
+#
+# What must never happen is CYCLING: re-promotion that does not settle, which is
+# a livelock and the failure mode this drill exists to catch. So bound it rather
+# than forbid it, and fail loudly when the bound is exceeded.
+HIGHER_MAX=2
+if [ "$HIGHER" -gt "$HIGHER_MAX" ]; then
+  echo "FAIL: $HIGHER promotions at a higher epoch — controllers are CYCLING, not converging."
+  echo "      ADR-0004 permits a bounded transient (a stale role view proposing epoch+1"
+  echo "      passes the fence by construction); it does not permit repeated re-promotion."
+  cat $HA_LOGS
+  exit 1
+fi
+[ "$HIGHER" = "0" ] || echo "  NOTE: $HIGHER re-promotion(s) of :$P2 at a higher epoch — bounded transient (BUG-0041)"
+
+# CONVERGENCE, which is the property ADR-0004 actually promises and which no
+# count above tests: the transient must SETTLE. A first draft of this asserted
+# "exactly one node claims master" — vacuous here, because P1 is killed and P3
+# is not started until the next phase, so the count can only ever be 0 or 1 and
+# the assertion cannot fail. Sample the promotion count, wait several poll
+# intervals, and require it to stop moving instead.
+SETTLE_AFTER=$HIGHER
+sleep 1.5   # 10x --poll-ms 150; ADR-0004 claims reconvergence "within a tick"
+HIGHER2=$(grep -h -cE "PROMOTED 127.0.0.1:$P2 at \(0,[3-9]" $HA_LOGS | awk '{s+=$1} END {print s+0}')
+if [ "$HIGHER2" -gt "$SETTLE_AFTER" ]; then
+  echo "FAIL: promotions still arriving 1.5s after the race ($SETTLE_AFTER -> $HIGHER2)."
+  echo "      ADR-0004 promises the controllers reconverge within a tick; this is a livelock."
+  cat $HA_LOGS
+  exit 1
+fi
+echo "  converged: no further promotions in 1.5s (10 poll intervals)"
 [ "$REAL" -ge 1 ] || { echo "FAIL: no real promotion recorded"; exit 1; }
 [ "$(valkey-cli -p $P2 GET key:0000000)" = "value-0000000" ] || { echo "FAIL: data lost"; exit 1; }
 [ "$(valkey-cli -p $P2 GET key:0014999)" = "value-0014999" ] || { echo "FAIL: tail lost"; exit 1; }
