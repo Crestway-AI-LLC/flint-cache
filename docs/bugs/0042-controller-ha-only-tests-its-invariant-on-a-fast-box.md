@@ -245,6 +245,60 @@ whole harm. Here it is not established that it is. So: the mechanism first,
 this second, and if the mechanism turns out to be benign then this is the
 right shape of answer.
 
+## 2026-08-22 — candidate 1 has a named code path, and the next firing will say so
+
+Candidate 1 was "a controller observes the pair as master-less after the first
+promotion and promotes the same node again". Reading the controller, that is
+not a hypothetical race — **there is a deliberate path that does exactly
+this**, and it cannot tell the two situations apart.
+
+`flint-controller/src/main.rs:800-841` carries two recovery paths for a pair
+with no master-claimer:
+
+- **#168**: *"no master-claimer, but X holds the top epoch with a caught-up
+  replica — self-fenced, recovering it"*
+- **#171**: the same, falling back to the member last observed holding the
+  lineage when no in-sync node can be proven right now
+
+Both were added for real outages, and both are correct for what they were
+built for: a master that self-fenced on lease expiry is exactly "nobody claims
+master, one node holds the top epoch". They then promote that node at
+`max_epoch + 1` (:861).
+
+**A survivor promoted moments ago presents identically.** No master-claimer
+yet — the role flip has not landed in this controller's view — and it holds
+the top epoch, because the promotion is what gave it that epoch. The predicate
+cannot separate "self-fenced, needs recovery" from "just promoted, needs
+nothing", and the second reading produces a second effective promotion of the
+same survivor at a higher epoch. Which is the observation.
+
+Note the guard that makes this rare rather than constant: the recovery block
+sits behind `!converged_ever || last_converged.elapsed() > max_stale`, so it
+needs the pair to look unconverged too — which it briefly is after a
+promotion, while the replica catches up. That is consistent with a defect that
+fires on a fast box and never on a slow one.
+
+### This is a hypothesis with a name, not a confirmation
+
+The failing shape has not been reproduced, and nothing above is measured. What
+HAS changed is that the next firing will answer it without needing to be
+caught live: `controller_ha_drill.sh` now greps the controller logs for those
+two lines whenever `HIGHER > 0` and prints which path was taken.
+
+    recovery paths taken: #168 self-fenced=N | #171 remembered-lineage=N
+
+A hit supports candidate 1 and names the predicate to fix. No hit sends the
+next reader to candidate 2 — the fence checked against a stale epoch read —
+instead of re-deriving the whole space.
+
+**The discriminator was verified in both directions before landing**, against
+synthetic logs with and without the recovery line, because it lives in a
+branch that only runs when the bug fires and would otherwise have been code
+nobody had ever executed. The first attempt reported NOT SUPPORTED on a log
+that contained the line — the test harness was zsh, which does not word-split
+`$HA_LOGS`, while the drill runs under bash, which does. Under bash it is
+correct both ways.
+
 ## Where to start
 
 1. Reproduce on a box with >= 16 vCPU; on 8 cores the race did not start in

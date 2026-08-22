@@ -147,7 +147,31 @@ if [ "$HIGHER" -gt "$HIGHER_MAX" ]; then
   cat $HA_LOGS
   exit 1
 fi
-[ "$HIGHER" = "0" ] || echo "  NOTE: $HIGHER re-promotion(s) of :$P2 at a higher epoch — bounded transient (BUG-0042)"
+if [ "$HIGHER" != "0" ]; then
+  echo "  NOTE: $HIGHER re-promotion(s) of :$P2 at a higher epoch — bounded transient (BUG-0042)"
+  # WHICH PATH PRODUCED IT. BUG-0042 candidate 1 says a second controller sees
+  # no master-claimer while the just-promoted survivor already holds the top
+  # epoch, and takes the #168/#171 recovery path — which cannot tell a
+  # SELF-FENCED master needing recovery from one promoted moments ago whose
+  # role claim this controller has not observed yet. Both present identically.
+  #
+  # The controller names the path it took. Grepping for it turns the next
+  # firing into an answer instead of another sighting: the whole cost of this
+  # bug so far is that it fires rarely and says nothing when it does.
+  R168=$(grep -h -c 'self-fenced, recovering it (#168)' $HA_LOGS 2>/dev/null | awk '{s+=$1} END {print s+0}')
+  R171=$(grep -h -c 'recovering it (#171)' $HA_LOGS 2>/dev/null | awk '{s+=$1} END {print s+0}')
+  echo "        recovery paths taken: #168 self-fenced=$R168 | #171 remembered-lineage=$R171"
+  if [ "$R168" -gt 0 ] || [ "$R171" -gt 0 ]; then
+    echo "        -> BUG-0042 candidate 1 SUPPORTED: a recovery path re-promoted the"
+    echo "           survivor. Those paths fire on 'no master-claimer + holds top epoch',"
+    echo "           which is indistinguishable from a promotion this controller has not"
+    echo "           seen land yet. Capture these logs; that is the evidence the bug needs."
+  else
+    echo "        -> BUG-0042 candidate 1 NOT supported on this run: the higher-epoch"
+    echo "           promotion came from the ordinary path, so candidate 2 (fence checked"
+    echo "           against a stale epoch read) is where to look next."
+  fi
+fi
 
 # CONVERGENCE, which is the property ADR-0004 actually promises and which no
 # count above tests: the transient must SETTLE. A first draft of this asserted
