@@ -209,17 +209,39 @@ _gen() {
   awk -v s="$1" -v n="$BATCH" 'BEGIN{for(i=0;i<n;i++){k=sprintf("roll:%s:%06d",s,i);v=sprintf("v-%06d",i);
     printf "*3\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n",length(k),k,length(v),v}}'
 }
+# DELIVERED THROUGHPUT IS MEASURED, not inferred from BATCH and GAP.
+#
+# Two earlier conclusions in this investigation rested on a rate that was
+# computed rather than observed. A sweep labelled its axis BATCH/GAP and was
+# read as a rate sweep, when each cycle also pays a process spawn, a TCP
+# connect and an auth that the arithmetic ignores. And "Linux does not shed at
+# any burst" could not be separated from "this client cannot push hard enough
+# to make it", because nobody knew what the client actually delivered.
+#
+# `--pipe` reports `replies: N` per invocation. Summing those over a measured
+# wall-clock interval gives the number both claims needed and neither had.
+_now_s() { python3 -c 'import time; print(time.time())'; }
 writer_start() {
-  rm -f "$D/stop"
+  rm -f "$D/stop" "$D/replies"
+  _now_s > "$D/wstart"
   ( n=0
     while [ ! -f "$D/stop" ]; do
       n=$((n+1))
-      _gen "$1-$n" | $CLI -p $PROXY -a tok-acme --no-auth-warning --pipe >/dev/null 2>&1 || true
-      sleep "$GAP"
+      _gen "$1-$n" | $CLI -p $PROXY -a tok-acme --no-auth-warning --pipe 2>/dev/null \
+        | sed -nE 's/.*replies: ([0-9]+).*/\1/p' >> "$D/replies" || true
+      [ "$GAP" = "0" ] || sleep "$GAP"
     done ) &
   WRITER_PID=$!
 }
-writer_stop() { touch "$D/stop"; wait "$WRITER_PID" 2>/dev/null; WRITER_PID=""; }
+writer_stop() {
+  touch "$D/stop"; wait "$WRITER_PID" 2>/dev/null; WRITER_PID=""
+  local end start delivered
+  end=$(_now_s); start=$(cat "$D/wstart" 2>/dev/null || echo "$end")
+  delivered=$(awk '{s+=$1} END {print s+0}' "$D/replies" 2>/dev/null)
+  DELIVERED=$delivered
+  RATE_OBS=$(awk -v d="$delivered" -v e="$end" -v s="$start" \
+    'BEGIN { t = e - s; if (t <= 0) print "n/a"; else printf "%.0f", d / t }')
+}
 
 roll_under_load() {  # $1=tag $2=load-prefix -> echoes the lag-shed delta
   local tag="$1" pre_a pre_b post_a post_b pre_sa pre_sb post_sa post_sb
@@ -236,6 +258,7 @@ roll_under_load() {  # $1=tag $2=load-prefix -> echoes the lag-shed delta
   post_sa=$(delayed_soft $A); post_sb=$(delayed_soft $B)
   echo "  seat :$A writes_shed_lag ${pre_a} -> ${post_a} | seat :$B ${pre_b} -> ${post_b}" >&2
   echo "  soft delays across the roll: :$A +$(( post_sa - pre_sa )) | :$B +$(( post_sb - pre_sb ))" >&2
+  echo "  load actually DELIVERED: ${DELIVERED:-?} writes at ${RATE_OBS:-?}/s observed (batch=$BATCH gap=$GAP)" >&2
   echo $(( (post_a - pre_a) + (post_b - pre_b) ))
 }
 

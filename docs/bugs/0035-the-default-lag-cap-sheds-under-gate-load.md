@@ -594,3 +594,54 @@ the condition with SIGSTOP rather than provoking it with load was necessary
 rather than tidy. Had the positive control stayed load-based, the drill would
 now be green on the gate box while exercising nothing at all — the failure it
 was written to prevent, arrived at by a different road.
+
+## 2026-08-22 — delivered throughput measured at last, and the previous section overstated its case
+
+The drill now reports what the generator actually delivered, summing
+`replies:` from each `--pipe` over a measured wall-clock interval. Every
+number below is observed rather than computed. macOS laptop, shipped 1000ms
+cap:
+
+| batch | gap | nominal | DELIVERED | shed |
+|---|---|---|---|---|
+| 50 | 0.25 | 200/s | 184/s | 0 |
+| 2500 | 0.25 | 10000/s | **7411/s** | 0 |
+| 500 | 0 | — | **28153/s** | 0 |
+| 4000 | 0 | — | **33379/s** | 3316 |
+
+**The shedding threshold is a delivered rate between 28k and 33k writes/sec.**
+Burst size is not a separate mechanism; it is how the generator reaches that
+rate, by amortising the process spawn, connect and auth that each `--pipe`
+invocation pays.
+
+### Correcting the section above
+
+That section claimed the rate sweep "measured burst size, not rate". Now that
+the rates are measured, that is too strong. The sweep's labels were optimistic
+by roughly a quarter — 7411/s where it printed 10000/s — which is a real
+error but a modest one, and its axis did vary delivered rate across a 40x
+range, from 184/s to 7411/s.
+
+**The disqualifying problem was RANGE, not axis.** The sweep's highest setting
+delivered about four times less than the lowest rate that has ever produced a
+shed. Six clean rows meant only that every row sat below the threshold. A
+sweep that cannot reach the phenomenon returns a column of zeros that looks
+exactly like a sweep that bracketed it and found nothing — which is the same
+failure as a control that cannot arm, one level up: the individual runs were
+each honest, and their arrangement was not.
+
+The fix is the same one that has now been applied three times in this
+investigation: report the quantity actually achieved beside the setting that
+was requested. A sweep whose rows had carried `DELIVERED` would have shown its
+own ceiling in the first table.
+
+### What this does to the Linux result
+
+The Linux burst experiment ran WITHOUT this instrument, so its zeros carry the
+same ambiguity the sweep's did. "Linux does not shed at burst 20000" is only
+meaningful if Linux reached a delivered rate near 30k/s, and that was never
+measured. The claim stands as recorded — at those load SHAPES nothing shed —
+but the stronger reading, that Linux tolerates rates macOS does not, is not
+yet supported and must not be quoted as though it were.
+
+Re-running it with `DELIVERED` attached is the next step, and it is cheap.
