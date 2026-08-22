@@ -24,7 +24,7 @@ use flint_chaos::cluster::{Attached, Cluster, Target, arg, sweep_stale_dirs};
 /// Wall clock in ms. The RPO bound is a statement about TIME — "acked longer
 /// ago than the cap must have replicated" — so the ledger needs a real clock,
 /// not the monotonic Instant used for pacing.
-use flint_chaos::oracle::parse_value;
+use flint_chaos::oracle::{Served, classify_send, parse_value};
 use flint_chaos::writer::{self, Edge, Shared, now_ms};
 use flint_resp::Value;
 use rand::{Rng, SeedableRng, rngs::SmallRng};
@@ -347,12 +347,18 @@ fn main() {
     // RPO, reported because it is interesting, not asserted because it is not
     // promised. See the note at the check site.
     let mut beyond_cap: u64 = 0;
+    // BUG-0014: acks whose SEND stamp equals the death stamp exactly. Neither
+    // master can be ruled out for these, so they are excluded from every
+    // measurement and surfaced on their own. A run that reports a durability
+    // finding resting on these has reported nothing; that is the whole point
+    // of counting them apart.
+    let mut ambiguous_at_boundary: u64 = 0;
 
     // BUG-0014: the ledger boundary from the PREVIOUS master kill, carried
     // across iterations. The replica-kill assertion needs it to say whether a
     // failing ack predates that kill (never retired -> harness, BUG-0007
     // class) or postdates it (served by the current master -> real loss).
-    let mut last_dead_ms: u64 = 0;
+    let mut last_dead_us: u64 = 0;
     // Mixed mode flips a coin per iteration, so a run can land on a replica
     // every time — six tails is 1/64 — and `attached_chaos_drill.sh` then
     // correctly refuses to pass a failover path it never exercised. That
@@ -475,15 +481,16 @@ fn main() {
             shared.kill_ms.store(kill_ms, Ordering::SeqCst);
             // Two clocks on purpose. `kill_ms` is armed BEFORE the kill and
             // times the outage (RTO/stall) from the writer's vantage.
-            // `dead_ms` is stamped AFTER the SIGKILL landed and is the only
-            // boundary the LEDGER may use: in the gap between the two — an
+            // `dead_us` is stamped AFTER the SIGKILL landed, in MICROSECONDS,
+            // and is the only boundary the LEDGER may use: in the gap between
+            // the two — an
             // epoch read plus a pkill spawn, tens of ms on a busy box — the
             // old master is alive and still acking. Judging those acks as
             // "sent after the kill, so the new master's" left the ledger
             // claiming values the survivor never had, and the NEXT replica
             // kill reported them as data loss (seed 7: key270 216 < 239).
-            let dead_ms = cluster.kill_master_hot();
-            last_dead_ms = dead_ms; // BUG-0014: carry it to the next iteration
+            let dead_us = cluster.kill_master_hot();
+            last_dead_us = dead_us; // BUG-0014: carry it to the next iteration
             // Harness-mode replacement replicas get fresh ports; republish
             // so the writer can find the pair again. (Attached and
             // controlled-local endpoints are fixed; this is a no-op there.)
@@ -597,7 +604,7 @@ fn main() {
                     "iter {iteration}: {rto}ms exceeds the published budget {rto_budget_ms}ms \
                      (docs/slo.md) — {measured}. \
                      Worst SINGLE write held: {held}ms (at {held_at}) — {reading}. \
-                     WINDOW kill_ms={kill_ms} dead_ms={dead_ms} recovered_at_ms={recovered_at_ms} — \
+                     WINDOW kill_ms={kill_ms} dead_us={dead_us} recovered_at_ms={recovered_at_ms} — \
                      slice the fleet journal to this window; the leg holding the \
                      time names itself"
                 );
@@ -733,7 +740,7 @@ fn main() {
                     unverifiable += 1;
                     let mut led = shared.ledger.lock().unwrap_or_else(|e| e.into_inner());
                     if let Some(entry) = led.get_mut(key) {
-                        entry.acked_at.retain(|&(_, sent, _)| sent >= dead_ms);
+                        entry.acked_at.retain(|&(_, sent_us, _)| sent_us >= dead_us);
                         entry.last_acked =
                             entry.acked_at.iter().map(|&(s, _, _)| s).max().unwrap_or(0);
                     }
@@ -761,15 +768,41 @@ fn main() {
                 // writes (about one cap-window's worth), not on their age.
                 // Until the claim and the mechanism are reconciled the
                 // assertion stays as-is, because it is the published promise.
-                for &(seq, sent, at) in acked_at {
+                for &(seq, sent_us, at) in acked_at {
                     // The writer may have re-acked this key AFTER the kill;
                     // those acks belong to the new master and say nothing
                     // about what the old one lost. Judged by SEND time
-                    // against the post-SIGKILL clock: a request sent at or
-                    // after `dead_ms` cannot have been served by the dead
+                    // against the post-SIGKILL clock: a request sent strictly
+                    // after `dead_us` cannot have been served by the dead
                     // master, whereas one sent in the arming gap — or in
                     // flight at the kill and acked afterwards — can.
-                    if sent >= dead_ms {
+                    let served = classify_send(sent_us, dead_us);
+                    if served == Served::NewMaster {
+                        continue;
+                    }
+                    // THE BOUNDARY ITSELF IS NEITHER, AND SAYS SO.
+                    //
+                    // `dead_us` is stamped just AFTER the SIGKILL returned, so
+                    // the death instant lies at or before it. A send sharing
+                    // that exact stamp may have preceded the death and been
+                    // served by the old master, or followed it and been served
+                    // by the new one, and nothing recorded distinguishes them.
+                    //
+                    // This used to be folded into the `>=` above, which
+                    // silently assigned every tie to the new master. At
+                    // millisecond resolution ties were common enough that one
+                    // carried an entire durability verdict (BUG-0014): the run
+                    // reported a regression whose whole evidence was a single
+                    // entry at the one point the clock could not resolve.
+                    //
+                    // Microseconds make this rare rather than impossible, so
+                    // it is counted and reported instead of being decided. An
+                    // ambiguous entry feeds NEITHER `beyond_cap` nor
+                    // `deepest_loss_ms`: a measurement taken on an
+                    // unattributable write is not a conservative estimate, it
+                    // is a number with no referent.
+                    if served == Served::Ambiguous {
+                        ambiguous_at_boundary += 1;
                         continue;
                     }
                     // NO LONGER AN ASSERTION — see the note above. This used
@@ -820,7 +853,7 @@ fn main() {
                 if let Some(entry) = led.get_mut(key) {
                     entry
                         .acked_at
-                        .retain(|&(s, sent, _)| s <= got || sent >= dead_ms);
+                        .retain(|&(s, sent_us, _)| s <= got || sent_us >= dead_us);
                     entry.last_acked = entry.acked_at.iter().map(|&(s, _, _)| s).max().unwrap_or(0);
                 }
             }
@@ -837,7 +870,7 @@ fn main() {
             worst_hold_ms = worst_hold_ms.max(held);
             println!(
                 "iter {iteration}: pair {pair_idx}: killed MASTER (writes in flight); {} {rto}ms{} \
-                 [kill_ms={kill_ms} dead_ms={dead_ms} recovered_at_ms={recovered_at_ms} \
+                 [kill_ms={kill_ms} dead_us={dead_us} recovered_at_ms={recovered_at_ms} \
                  max_hold_ms={held}]; acked keys \
                  regressed: {lost_here} (all within the {lag_hard_ms}ms cap){}",
                 if shared.edge.is_some() {
@@ -938,11 +971,30 @@ fn main() {
                                             .acked_at
                                             .iter()
                                             .filter(|&&(sq, _, _)| sq > got)
-                                            .map(|&(sq, sent, at)| {
+                                            .map(|&(sq, sent_us, at)| {
+                                                // Three states, because two
+                                                // cannot express "the stamps
+                                                // are equal and the order is
+                                                // therefore unrecorded". The
+                                                // boolean this replaces read
+                                                // `sent < last_dead_us`, so a
+                                                // tie printed as `false` —
+                                                // indistinguishable from a
+                                                // write provably sent after
+                                                // the kill, which is the
+                                                // reading that made BUG-0014
+                                                // look decided.
+                                                let rel = match classify_send(sent_us, last_dead_us)
+                                                {
+                                                    Served::MaybeOldMaster => "before_prev_kill",
+                                                    Served::Ambiguous => {
+                                                        "AMBIGUOUS_ON_PREV_KILL_BOUNDARY"
+                                                    }
+                                                    Served::NewMaster => "after_prev_kill",
+                                                };
                                                 format!(
-                                                    "(seq={sq} sent={sent} at={at} \
-                                                     sent_before_prev_kill={})",
-                                                    sent < last_dead_ms
+                                                    "(seq={sq} sent_us={sent_us} at_ms={at} \
+                                                     vs_prev_kill={rel})"
                                                 )
                                             })
                                             .collect();
@@ -965,14 +1017,20 @@ fn main() {
                                  == BUG-0014 DIAGNOSTIC ==\n\
                                  read_via: {read_via}\n\
                                  master:   {}\n\
-                                 prev_master_kill dead_ms: {last_dead_ms}\n\
+                                 prev_master_kill dead_us: {last_dead_us}\n\
                                  {dump}\n\
                                  READ IT SO: any offending seq with \
-                                 sent_before_prev_kill=true was acked BEFORE the \
+                                 vs_prev_kill=before_prev_kill was acked BEFORE the \
                                  previous master kill and never retired -> harness \
                                  ledger bug, BUG-0007 class, NOT a durability \
-                                 regression. All false -> the write was served by \
-                                 the CURRENT master and lost -> real.",
+                                 regression. All after_prev_kill -> the write was \
+                                 served by the CURRENT master and lost -> real. \
+                                 Any AMBIGUOUS_ON_PREV_KILL_BOUNDARY entry is \
+                                 NEITHER: its send stamp equals the death stamp to \
+                                 the microsecond, so the order is not recorded and \
+                                 no verdict may rest on it. If the offending set is \
+                                 only those, this run has found nothing and the \
+                                 report says so rather than picking a side.",
                                 cluster.master_diagnostic()
                             );
                         }
@@ -1111,6 +1169,14 @@ fn main() {
             "  NOTE: {beyond_cap} lost acked write(s) were older than the {lag_hard_ms}ms cap. \
              That is permitted: the cap bounds the VOLUME at risk (past it the master stops \
              accepting), not the AGE of a write already acked while replication was healthy."
+        );
+    }
+    if ambiguous_at_boundary > 0 {
+        println!(
+            "  NOTE: {ambiguous_at_boundary} acked write(s) carried a send stamp equal to the \
+             death stamp, to the microsecond. Which master served them is not recorded, so they \
+             were excluded from the loss measurements rather than attributed to either. This is \
+             expected to be rare; if it is not, the clock is coarser than the race."
         );
     }
     if deepest_loss_ms == 0 {

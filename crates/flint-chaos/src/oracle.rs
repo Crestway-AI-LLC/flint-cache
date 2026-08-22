@@ -46,12 +46,53 @@ pub fn parse_value(raw: &[u8]) -> Option<(String, u64)> {
 /// some acked writes legitimately do not survive: async replication with a
 /// lag cap promises only that the loss window is BOUNDED. Bounded by what is
 /// checkable only if each ack carries the wall-clock time it happened.
+/// Which master could have served an ack, judged by its SEND stamp against the
+/// instant the dead master stopped being able to serve anything. Both stamps
+/// are wall-clock MICROSECONDS.
+///
+/// This exists as a named three-way answer because the two-way version was
+/// wrong in a way that could not be seen: the old code wrote `sent >= dead`
+/// and folded the boundary case into "the new master's", so a tie was reported
+/// with the same confidence as a decided case. BUG-0014 then rested an entire
+/// durability verdict on one entry sitting exactly there.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum Served {
+    /// Sent strictly before the death stamp — the dying master may have served
+    /// it, so its loss is the async-replication window, not a regression.
+    MaybeOldMaster,
+    /// Sent strictly after — provably the new master's, and not this
+    /// failover's business.
+    NewMaster,
+    /// Sent at the death stamp exactly. The death instant lies at or before
+    /// that stamp, so both readings remain possible and NOTHING recorded
+    /// separates them. Callers must exclude these from measurements rather
+    /// than assign them; an unattributable write is not a conservative
+    /// estimate, it is a number with no referent.
+    Ambiguous,
+}
+
+/// The single implementation of that judgement. Two call sites used to spell
+/// it out independently — the loss loop and the failure dump — and they
+/// disagreed at the boundary, which is how the dump could print `false` for a
+/// tie while the loop silently treated it as the new master's.
+pub fn classify_send(sent_us: u64, dead_us: u64) -> Served {
+    match sent_us.cmp(&dead_us) {
+        std::cmp::Ordering::Less => Served::MaybeOldMaster,
+        std::cmp::Ordering::Equal => Served::Ambiguous,
+        std::cmp::Ordering::Greater => Served::NewMaster,
+    }
+}
+
 #[derive(Default)]
 pub struct KeyLedger {
     pub written: Vec<u64>,
     pub last_acked: u64,
     pub last_written: u64,
-    /// `(seq, SENT wall-clock ms, ACKED wall-clock ms)`, ascending by seq.
+    /// `(seq, SENT wall-clock MICROSECONDS, ACKED wall-clock ms)`, ascending
+    /// by seq. The two stamps are deliberately in different units — see
+    /// `writer::now_us`. The send stamp answers an ORDERING question against
+    /// the death instant, which milliseconds cannot resolve; the ack stamp
+    /// feeds the RPO bound, which is a claim about milliseconds.
     ///
     /// Both times are kept because they answer different questions and
     /// conflating them caused a false data-loss verdict (#130):
@@ -71,9 +112,9 @@ pub struct KeyLedger {
 }
 
 impl KeyLedger {
-    pub fn record_ack(&mut self, seq: u64, sent_ms: u64, acked_ms: u64) {
+    pub fn record_ack(&mut self, seq: u64, sent_us: u64, acked_ms: u64) {
         self.last_acked = seq;
-        self.acked_at.push((seq, sent_ms, acked_ms));
+        self.acked_at.push((seq, sent_us, acked_ms));
     }
 
     /// Acked writes that did NOT survive a promotion and were acked at or
@@ -87,8 +128,8 @@ impl KeyLedger {
     pub fn breaches(&self, got: u64, must_have_replicated_by_ms: u64) -> Vec<(u64, u64)> {
         self.acked_at
             .iter()
-            .filter(|&&(seq, _sent, acked)| seq > got && acked <= must_have_replicated_by_ms)
-            .map(|&(seq, _sent, acked)| (seq, acked))
+            .filter(|&&(seq, _sent_us, acked)| seq > got && acked <= must_have_replicated_by_ms)
+            .map(|&(seq, _sent_us, acked)| (seq, acked))
             .collect()
     }
 
@@ -97,8 +138,51 @@ impl KeyLedger {
     pub fn newest_lost_ack_ms(&self, got: u64) -> Option<u64> {
         self.acked_at
             .iter()
-            .filter(|&&(seq, _sent, _acked)| seq > got)
-            .map(|&(_, _sent, acked)| acked)
+            .filter(|&&(seq, _sent_us, _acked)| seq > got)
+            .map(|&(_, _sent_us, acked)| acked)
             .max()
+    }
+}
+
+#[cfg(test)]
+mod boundary_tests {
+    use super::{Served, classify_send};
+
+    #[test]
+    fn a_send_strictly_before_the_death_stamp_may_be_the_old_masters() {
+        assert_eq!(classify_send(1_000_000, 1_000_001), Served::MaybeOldMaster);
+    }
+
+    #[test]
+    fn a_send_strictly_after_the_death_stamp_is_provably_the_new_masters() {
+        assert_eq!(classify_send(1_000_001, 1_000_000), Served::NewMaster);
+    }
+
+    /// The regression test for BUG-0014. The old code was `sent >= dead`, so a
+    /// tie took the same branch as a send provably after the kill and was
+    /// silently attributed to the new master — which is what let one entry at
+    /// the clock's resolution limit carry a durability verdict.
+    ///
+    /// Asserting `Ambiguous` here fails against that old behaviour, which is
+    /// the only reason this test is worth having: it distinguishes the fix
+    /// from the bug rather than confirming the code does what it says.
+    #[test]
+    fn a_tie_is_neither_master_and_must_not_be_silently_assigned() {
+        let verdict = classify_send(1_000_000, 1_000_000);
+        assert_eq!(verdict, Served::Ambiguous);
+        assert_ne!(verdict, Served::NewMaster, "the pre-fix `>=` reading");
+        assert_ne!(verdict, Served::MaybeOldMaster, "the opposite bias");
+    }
+
+    /// Ordering must come from the stamps alone. A classifier that read the
+    /// magnitudes rather than their relation would pass the three cases above
+    /// while breaking on any other epoch.
+    #[test]
+    fn the_judgement_is_relational_not_absolute() {
+        for &(sent, dead) in &[(0u64, 0u64), (u64::MAX, u64::MAX), (7, 7)] {
+            assert_eq!(classify_send(sent, dead), Served::Ambiguous);
+        }
+        assert_eq!(classify_send(0, u64::MAX), Served::MaybeOldMaster);
+        assert_eq!(classify_send(u64::MAX, 0), Served::NewMaster);
     }
 }

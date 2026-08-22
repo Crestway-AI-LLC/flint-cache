@@ -498,10 +498,16 @@ impl Target {
     /// writer::Shared::pause); the standard kill_master's own wait can never
     /// observe seq_lag==0 under a live hammer and would burn its whole
     /// timeout before killing anyway.
-    /// Returns the wall clock stamped right after the SIGKILL landed — the
-    /// earliest instant at which no write can have been served by the dead
-    /// master. Acks SENT at or after this are provably the new master's;
-    /// anything earlier may be the old master's last words.
+    /// Returns the wall clock in MICROSECONDS stamped right after the SIGKILL
+    /// landed — the earliest instant at which no write can have been served by
+    /// the dead master. Acks SENT strictly AFTER this are provably the new
+    /// master's; anything strictly earlier may be the old master's last words.
+    ///
+    /// The boundary itself is neither. This used to say "at or after", which
+    /// quietly assigned the tie to the new master, and at millisecond
+    /// resolution the tie was common enough to carry a verdict on its own
+    /// (BUG-0014). Microseconds make it rare; the caller still handles it
+    /// explicitly rather than letting a comparison operator decide.
     pub fn kill_master_hot(&mut self) -> u64 {
         match self {
             Target::Local {
@@ -513,15 +519,15 @@ impl Target {
                 } else {
                     cluster.kill_master();
                 }
-                cluster.last_kill_dead_ms
+                cluster.last_kill_dead_us
             }
             Target::Attached(a) => {
                 let dead = a.master();
                 a.kill(&dead).unwrap_or_else(|e| panic!("kill master: {e}"));
-                let dead_ms = crate::writer::now_ms();
+                let dead_us = crate::writer::now_us();
                 a.restart(&dead)
                     .unwrap_or_else(|e| panic!("restart {dead}: {e}"));
-                dead_ms
+                dead_us
             }
         }
     }
@@ -1148,7 +1154,7 @@ pub struct Cluster {
     /// old master is alive and acking, and an ack from that gap judged as
     /// "the new master's" leaves the ledger claiming a value the survivor
     /// never had.
-    pub last_kill_dead_ms: u64,
+    pub last_kill_dead_us: u64,
 }
 
 impl Cluster {
@@ -1191,7 +1197,7 @@ impl Cluster {
             controlled: false,
             master_kills: 0,
             replica_kills: 0,
-            last_kill_dead_ms: 0,
+            last_kill_dead_us: 0,
         }
     }
 
@@ -1388,7 +1394,7 @@ impl Cluster {
             })
             .unwrap_or(1);
         kill_by_port(self.master_port);
-        self.last_kill_dead_ms = crate::writer::now_ms();
+        self.last_kill_dead_us = crate::writer::now_us();
         let next = current + 1;
         let mut c = Client::connect(self.replica_port).expect("survivor connect");
         match c.call(&[b"FLINTPROMOTE", b"0", next.to_string().as_bytes()]) {
@@ -1455,7 +1461,7 @@ impl Cluster {
         let dead = self.master_port;
         let survivor = self.replica_port;
         kill_by_port(dead);
-        self.last_kill_dead_ms = crate::writer::now_ms();
+        self.last_kill_dead_us = crate::writer::now_us();
         assert!(
             wait_until_role(survivor, "master", Duration::from_secs(20)),
             "controller did not promote survivor :{survivor} within 20s"

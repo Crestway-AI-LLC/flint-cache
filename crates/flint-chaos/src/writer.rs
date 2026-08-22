@@ -44,6 +44,29 @@ pub fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Wall clock in MICROSECONDS, for the one question milliseconds cannot
+/// answer: which master served a write.
+///
+/// The ledger classifies an ack by comparing its SEND stamp against the
+/// instant the old master died. At millisecond resolution those two can land
+/// in the same tick, and then the ordering that decides "old master's last
+/// words" versus "the new master's write" is simply not recorded — the
+/// comparison picks a side anyway and reports the result as a fact. BUG-0014
+/// turned on exactly that: a whole durability verdict rested on ONE entry
+/// whose send stamp equalled the death stamp.
+///
+/// Microseconds do not make ties impossible, they make them rare enough to be
+/// reportable rather than routine — which is why the tie still has an explicit
+/// AMBIGUOUS outcome at the comparison site instead of a silent default.
+/// Kept separate from `now_ms` rather than replacing it: the RPO bound is a
+/// claim about milliseconds and its arithmetic reads better in them.
+pub fn now_us() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as u64)
+        .unwrap_or(0)
+}
+
 pub struct Shared {
     /// Candidate master addresses. Replaced by the main thread only in the
     /// mode where ports move; otherwise written once.
@@ -324,18 +347,19 @@ pub fn run(shared: &Shared, seed: u64) {
         // dies can still be acked by it, and the reply is read after the kill
         // instant — so the ack time alone cannot say which master served it.
         // See KeyLedger::acked_at.
-        let sent = now_ms();
+        let sent_us = now_us();
         let reply = c.call(&[b"SET", key.as_bytes(), value.as_bytes()]);
         // Recorded before the match, so a reconnect in the error arm is not
         // counted as time the server held the request. Every answer closes a
         // hold, including a refusal — that is the point of the measure.
-        record_hold(shared, sent, now_ms());
+        // record_hold measures a DURATION in ms; the send stamp is µs.
+        record_hold(shared, sent_us / 1_000, now_ms());
         match reply {
             Ok(Value::Simple(s)) if s == "OK" => {
                 let at = now_ms();
                 {
                     let mut led = shared.ledger.lock().unwrap_or_else(|e| e.into_inner());
-                    led.entry(key).or_default().record_ack(seq, sent, at);
+                    led.entry(key).or_default().record_ack(seq, sent_us, at);
                 }
                 let kill = shared.kill_ms.load(Ordering::SeqCst);
                 // Stall accounting, for the client path. Measured on every
@@ -400,5 +424,47 @@ pub fn run(shared: &Shared, seed: u64) {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod clock_resolution {
+    use super::{now_ms, now_us};
+
+    /// A POSITIVE CONTROL on the fix itself. Switching the send stamp to
+    /// microseconds only narrows the ambiguous boundary if the platform clock
+    /// actually resolves below a millisecond. If it did not — if
+    /// `SystemTime::now` advanced in 1ms steps — every sample would be an
+    /// exact multiple of 1000, ties would stay exactly as common as before,
+    /// and the whole change would be a no-op that reads like a fix.
+    ///
+    /// One sample landing on a multiple of 1000 is ordinary (1 in 1000). All
+    /// 200 doing so is a coarse clock.
+    #[test]
+    fn the_microsecond_clock_actually_resolves_below_a_millisecond() {
+        let samples: Vec<u64> = (0..200).map(|_| now_us()).collect();
+        assert!(
+            samples.iter().any(|us| us % 1_000 != 0),
+            "every one of 200 samples was a whole millisecond: this clock has \
+             no sub-ms resolution, so microsecond stamps do not narrow the \
+             BUG-0014 boundary at all"
+        );
+    }
+
+    /// The two clocks must describe the same instant in different units. A
+    /// `now_us` built on `as_millis` — or on the wrong epoch — would pass the
+    /// resolution test above while making every send stamp 1000x wrong
+    /// against the death stamp.
+    #[test]
+    fn the_two_clocks_agree_once_the_units_are_reconciled() {
+        let us = now_us();
+        let ms = now_ms();
+        let drift = (us / 1_000).abs_diff(ms);
+        assert!(
+            drift <= 50,
+            "now_us()/1000 = {} but now_ms() = {ms} (drift {drift}ms): the two \
+             clocks are not reading the same wall clock in compatible units",
+            us / 1_000
+        );
     }
 }

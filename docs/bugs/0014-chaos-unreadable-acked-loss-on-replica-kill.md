@@ -1,6 +1,6 @@
 # BUG-0014: chaos_unreadable fails an acked write on a REPLICA kill (OPEN)
 
-Status: OPEN · hypothesis (a) ELIMINATED 2026-08-22 by the first firing of the probe; (b) unresolved because the probe's verdict lands on its own boundary · First fired 2026-08-11, not 2026-08-18 · Severity: high if real
+Status: OPEN, instrument FIXED 2026-08-22 · hypothesis (a) ELIMINATED 2026-08-22 by the first firing of the probe; (b) still unresolved, but the probe can now state which it is · First fired 2026-08-11, not 2026-08-18 · Severity: high if real
 — the oracle is asserting the durability claim, so either the claim broke or
 the oracle is crying wolf, and both are worth an hour
 
@@ -488,6 +488,60 @@ has not yet fired, which at 5 runs means nothing either way.
 **Run it alone.** Five drills were invalidated during BUG-0011's investigation
 by a manual reproduction left running in another shell; `fleet_guard` refused
 them correctly and its message was the diagnosis.
+
+## The instrument is fixed; the verdict is not yet re-taken
+
+Implemented 2026-08-22. Both halves of the remedy the correction above asked
+for, and nothing else — the convention itself was sound and is unchanged.
+
+**1. The send stamp is now microseconds.** `writer::now_us` joins `now_ms`
+rather than replacing it, because the two answer different questions: the send
+stamp settles an ORDERING against the death instant, while the RPO bound is a
+claim about milliseconds and reads better in them. `KeyLedger::acked_at` is
+now `(seq, sent µs, acked ms)`, deliberately mixed and documented as such.
+`kill_master_hot` and `Cluster::last_kill_dead_us` return microseconds too.
+
+The rename from `dead_ms` to `dead_us` was not cosmetic: it turned three
+missed call sites into compile errors. Changing the unit while keeping the
+name would have left all three comparing microseconds against milliseconds,
+silently, by a factor of a thousand.
+
+**2. The tie has its own answer.** `oracle::classify_send` returns
+`MaybeOldMaster` / `NewMaster` / `Ambiguous`, and both call sites — the loss
+loop and the failure dump — now go through it. They used to spell the
+judgement out separately and disagreed at the boundary, which is why the dump
+could print `sent_before_prev_kill=false` for a tie, indistinguishable from a
+write provably sent after the kill. That is the reading which made this bug
+look decided.
+
+An ambiguous entry is counted in `ambiguous_at_boundary` and excluded from
+`beyond_cap` and `deepest_loss_ms` alike. It is not scored conservatively; it
+is not scored. A measurement taken on an unattributable write is a number with
+no referent, and averaging it into a bound corrupts the bound.
+
+### What was verified, and what that does not cover
+
+Both new assertions were mutation-tested — the only check that separates a
+test from a decoration:
+
+- reverting `classify_send` to the pre-fix `>=` reading (tie -> `NewMaster`)
+  fails `a_tie_is_neither_master_and_must_not_be_silently_assigned`.
+- rebuilding `now_us` on `as_millis() * 1000` — a microsecond clock in name
+  only — fails `the_microsecond_clock_actually_resolves_below_a_millisecond`.
+  Without that control the whole change could have been a no-op on a coarse
+  platform clock while reading exactly like a fix.
+
+`chaos_unreadable` and `chaos` both pass locally, and the drill log now
+carries `dead_us` beside `kill_ms`, with the two differing by the ~16ms arming
+gap the comment predicts.
+
+**The original verdict has NOT been re-taken.** This run reported
+`ambiguous_at_boundary` of zero and no regression, but the failure it was
+built to adjudicate has not fired since — it is roughly fourteen gate runs
+away by its historical rate. What changed is that when it next fires, the
+report will say which of the three it is instead of choosing for the reader.
+The bug stays OPEN until then, and closing it on the absence of a firing would
+repeat the error this entry exists to record.
 
 ## Related
 
