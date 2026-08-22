@@ -257,6 +257,52 @@ because "0 shed with no stall" is currently the only written statement that
 this contradicts, and replacing it with a vaguer sentence would lose the
 contradiction rather than resolve it.
 
+## 2026-08-22 — re-measured at HEAD after BUG-0038's fix: the loopback half no longer reproduces
+
+Every sighting in "What is still open" predates BUG-0038's fix, which moved the
+ordinary operating peak from 631 ms to 115 ms. Re-measured on today's HEAD, on
+a box at load 3.55 — deliberately not a quiet one — with 100k pipelined 1 KB
+writes through a live master/replica pair at shipped defaults:
+
+    caps: soft=500ms hard=1000ms
+    batch 1..5  lag_ms_max: 32 -> 84 -> 84 -> 139 -> 139
+    writes_delayed_soft: 0      writes_shed_lag: 0
+
+Peak 139 ms against a 500 ms soft cap. Ordinary load does not enter the soft
+band, so the claim this bug turns on — "the shipped 1000 ms cap is still being
+reached by ordinary load on loopback" — does not reproduce at HEAD.
+
+Second, independent line: the `repl` and `controller` drills are the two that
+shed in gates 21 and 23, and both have passed in every 118/0 gate run on Linux
+since. They were fixed to report shedding rather than swallow it (this file's
+"Half two"), so a pass now means the shed did not happen, which it did not mean
+before.
+
+### What this does NOT settle, and it is the more important half
+
+**The production sighting stands untouched.** 210 writes shed on the demoted
+seat during a CONTROLLED rc.59 failover, canary replica at 0. That is a
+different condition from steady pipelined load: a demoted seat mid-failover,
+not a master under traffic. Nothing above reproduces it and nothing above
+should be read as clearing it.
+
+So the shape of this bug has changed rather than closed:
+
+- loopback/gate-load half — **not reproducing at HEAD**, on two lines of
+  evidence, and attributable to BUG-0038's fix
+- failover half — **open and unmeasured**, and it is the one that happened on a
+  real fleet during a procedure this product runs on purpose
+
+`slo.md`'s no-stall row still should not be edited. The contradiction it needs
+to answer is now the failover case specifically, and softening the row before
+that is understood would lose the contradiction rather than resolve it — the
+same reasoning this file already gives for not editing it.
+
+Worth keeping beside that: `writes_shed_lag` did not exist until 2026-08-20, so
+"0 shed" in any earlier record means "not counted". The measurement above is
+worth something only because the counter is real, and its zero is a measured
+zero — the distinction BUG-0022 exists for.
+
 ## Note
 
 `ReplHub::new` stores `lag_hard_ms.max(lag_soft_ms)`, so any fix must move
