@@ -47,8 +47,10 @@
 //! twemproxy, and of Envoy.
 
 use std::cell::{Cell, RefCell};
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use flint_resp::{Decoded, Value, decode};
 use flint_tls::aio::AsyncStream;
@@ -69,6 +71,49 @@ pub(crate) static DIAL_FAILURES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 pub(crate) static LIVE_CONNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Commands forwarded, PER BACKEND. `COMMANDS` above is one number for the
+/// whole pool, which cannot answer "did traffic reach node X" — see BUG-0040,
+/// where a host-termination gate turned out to be unbuildable without this,
+/// and where the naive version passed automatically for every dead host.
+///
+/// WHY A REGISTRY AND NOT A FIELD ON THE CONNECTION. Connections live in
+/// per-worker thread-locals, so nothing outside a worker can enumerate them,
+/// and the admin command answering this runs on another thread. Keying the
+/// counters by address instead makes them reachable, and makes them survive
+/// connection churn — a backend that drops and redials keeps one running
+/// total, which is what a counter means.
+///
+/// WHY THE LOCK IS FREE. It is taken once per CONNECTION, in `AsyncConn::new`,
+/// which already dials a socket; the per-command path holds an `Arc` resolved
+/// at that moment and does the same relaxed `fetch_add` it did before. Putting
+/// a mutex on the command path would rebuild the convoy ADR-0021 removed.
+static PER_NODE: LazyLock<Mutex<BTreeMap<String, Arc<AtomicU64>>>> =
+    LazyLock::new(|| Mutex::new(BTreeMap::new()));
+
+/// The counter for one backend, created on first use. Called at connection
+/// setup, never per command.
+fn node_counter(addr: &str) -> Arc<AtomicU64> {
+    let mut m = PER_NODE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(c) = m.get(addr) {
+        return c.clone();
+    }
+    let c = Arc::new(AtomicU64::new(0));
+    m.insert(addr.to_string(), c.clone());
+    c
+}
+
+/// Every backend this proxy has forwarded to, with its running total.
+///
+/// Includes backends whose connections are all gone: a zero-traffic answer for
+/// a node that HAS a counter is evidence, where the absence of a counter is
+/// only ignorance, and BUG-0040 turns on being able to tell those apart.
+pub(crate) fn per_node_commands() -> Vec<(String, u64)> {
+    let m = PER_NODE.lock().unwrap_or_else(|e| e.into_inner());
+    m.iter()
+        .map(|(a, c)| (a.clone(), c.load(Ordering::Relaxed)))
+        .collect()
+}
+
 /// Replies outstanding on one connection, in request order.
 type Pending = Rc<RefCell<VecDeque<oneshot::Sender<std::io::Result<Value>>>>>;
 
@@ -83,6 +128,10 @@ pub(crate) struct AsyncConn {
     staged: RefCell<Vec<u8>>,
     pending: Pending,
     dead: Rc<Cell<bool>>,
+    /// This backend's running command total, shared with every other
+    /// connection to the same address and with the admin read path. Resolved
+    /// once here so the hot path never touches the registry lock.
+    node_commands: Arc<AtomicU64>,
     /// The reader task, so a connection can be retired deliberately.
     ///
     /// Dropping the write half does not end the reader: it parks on a socket
@@ -105,6 +154,7 @@ impl AsyncConn {
             staged: RefCell::new(Vec::with_capacity(16 * 1024)),
             pending: pending.clone(),
             dead: dead.clone(),
+            node_commands: node_counter(&addr),
             reader: RefCell::new(None),
         });
 
@@ -198,6 +248,7 @@ impl AsyncConn {
         self.staged.borrow_mut().extend_from_slice(frame);
         let depth = self.pending.borrow().len() as u64;
         COMMANDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.node_commands.fetch_add(1, Ordering::Relaxed);
         INFLIGHT_MAX.fetch_max(depth, std::sync::atomic::Ordering::Relaxed);
         Ok(rx)
     }
@@ -573,5 +624,58 @@ pub(crate) fn retire(key: &Key) {
     let gone = REGISTRY.with(|r| r.borrow_mut().remove(key));
     if let Some(c) = gone {
         c.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod per_node_tests {
+    use super::*;
+
+    /// The whole point of BUG-0040: a zero row and a missing row mean
+    /// different things, and a termination gate turns on telling them apart.
+    #[test]
+    fn a_backend_with_no_traffic_reports_zero_not_nothing() {
+        let c = node_counter("10.0.0.1:7001");
+        assert_eq!(c.load(Ordering::Relaxed), 0);
+        let seen = per_node_commands();
+        let row = seen.iter().find(|(a, _)| a == "10.0.0.1:7001");
+        assert!(
+            row.is_some(),
+            "a dialed backend must appear with 0, not be absent — absent is \
+             what a proxy reports about a node it has never seen, and reading \
+             that as 'no traffic' is the defect this exists to prevent"
+        );
+        assert_eq!(row.expect("row asserted present above").1, 0);
+        assert!(
+            !seen.iter().any(|(a, _)| a == "10.0.0.99:7001"),
+            "a backend never dialed must NOT appear at all"
+        );
+    }
+
+    #[test]
+    fn counts_are_attributed_to_the_backend_that_served_them() {
+        let a = node_counter("10.0.0.2:7001");
+        let b = node_counter("10.0.0.3:7001");
+        for _ in 0..7 {
+            a.fetch_add(1, Ordering::Relaxed);
+        }
+        b.fetch_add(1, Ordering::Relaxed);
+        let seen: BTreeMap<_, _> = per_node_commands().into_iter().collect();
+        assert_eq!(seen.get("10.0.0.2:7001"), Some(&7));
+        assert_eq!(seen.get("10.0.0.3:7001"), Some(&1));
+    }
+
+    /// A counter keyed by address outlives the connections to it, so a
+    /// backend that drops and redials keeps one running total. A per-
+    /// connection counter would reset on every reconnect, which is the one
+    /// thing a counter must not do — and reconnects are most frequent exactly
+    /// when a node is unhealthy.
+    #[test]
+    fn a_reconnect_does_not_reset_the_total() {
+        let first = node_counter("10.0.0.4:7001");
+        first.fetch_add(5, Ordering::Relaxed);
+        drop(first);
+        let after_redial = node_counter("10.0.0.4:7001");
+        assert_eq!(after_redial.load(Ordering::Relaxed), 5);
     }
 }

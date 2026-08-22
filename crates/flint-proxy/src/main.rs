@@ -1865,6 +1865,31 @@ fn auth_step(
         }
         return AuthStep::Reply(Value::Bulk(Some(topo.errors.report(scope).into_bytes())));
     }
+    // Commands forwarded PER BACKEND (BUG-0040). Ops data, not tenant data —
+    // it names nodes rather than namespaces — so it is admin-gated like
+    // PROXYCACHE below, not tenant-scoped like PROXYERRORS above.
+    //
+    // Why a command and not another info-block field: the info block is a
+    // fixed set of scalars, and this is one row per backend. Reporting it
+    // there would mean encoding a map into a field name.
+    //
+    // THE DISTINCTION CONSUMERS MUST KEEP. A backend with a zero row is
+    // EVIDENCE — this proxy has a counter for it and forwarded nothing. A
+    // backend with NO row is IGNORANCE — this proxy has never dialed it, which
+    // is also what a proxy that just restarted reports about everything.
+    // Collapsing those is the bug BUG-0040 exists to prevent: the host a
+    // termination gate is asked about is exactly the one most likely to be
+    // missing rather than idle.
+    if name.as_deref() == Some(b"PROXYBACKENDS") {
+        if admin_locked {
+            return admin_denied();
+        }
+        let mut out = String::new();
+        for (addr, n) in apool::per_node_commands() {
+            out.push_str(&format!("{addr} {n}\r\n"));
+        }
+        return AuthStep::Reply(Value::Bulk(Some(out.into_bytes())));
+    }
     // Ops knob: the proxy near-cache (D6). No args -> report; two args ->
     // set (ttl_ms, max_bytes) at RUNTIME; ttl 0 disables and clears. Same
     // pre-auth operator surface as the other PROXY* commands (mTLS-gated in
