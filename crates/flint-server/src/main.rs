@@ -2639,8 +2639,36 @@ fn execute(
         }
         match key.as_slice() {
             b"wal-fsync-ms" => WAL_FSYNC_MS.store(parse!(), Ordering::Relaxed),
-            b"lag-soft-ms" => hub.set_lag_soft_ms(parse!()),
-            b"lag-hard-ms" => hub.set_lag_hard_ms(parse!()),
+            // BOTH REFUSE RATHER THAN CLAMP (BUG-0043). The setters keep
+            // `soft <= hard` by silently moving the other end, which is right
+            // for the config-file path — a fleet should boot on a coherent
+            // pair rather than refuse to start. It is wrong for an
+            // interactive knob: `FLINTCONFIG lag-hard-ms 200` against the
+            // shipped 500ms soft cap returned success and applied 500, and
+            // the caller had no way to learn that. A drill ramping a
+            // threshold down then tests one value five times while reporting
+            // five, which is how a positive control goes green having never
+            // armed. Same choice WriteQueue::set_soft_cap already made.
+            b"lag-soft-ms" => {
+                let v: u64 = parse!();
+                let hard = hub.lag_hard_ms();
+                if v > hard {
+                    return Value::Error(format!(
+                        "ERR lag-soft-ms {v} is above lag-hard-ms {hard}; raise lag-hard-ms first"
+                    ));
+                }
+                hub.set_lag_soft_ms(v)
+            }
+            b"lag-hard-ms" => {
+                let v: u64 = parse!();
+                let soft = hub.lag_soft_ms();
+                if v < soft {
+                    return Value::Error(format!(
+                        "ERR lag-hard-ms {v} is below lag-soft-ms {soft}; lower lag-soft-ms first"
+                    ));
+                }
+                hub.set_lag_hard_ms(v)
+            }
             // Live-tunable on purpose: the right value depends on value size
             // and on how far replicas actually fall behind under this
             // workload, and neither is knowable before the fleet runs.

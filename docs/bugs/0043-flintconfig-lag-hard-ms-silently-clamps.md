@@ -1,6 +1,6 @@
 # BUG-0043: `FLINTCONFIG lag-hard-ms` reports success and applies a different value
 
-Status: OPEN · found 2026-08-22 · Severity: low as a defect, higher as a
+Status: FIXED 2026-08-22, same day · Severity: low as a defect, higher as a
 measurement hazard — the knob is used by drills to arm controls, and a knob
 that lies about its value makes every threshold-ramp above it meaningless.
 
@@ -62,6 +62,30 @@ above hard silently raises hard. Same treatment, same reason.
 
 Until then, callers must set `lag-soft-ms` first and read the value back.
 `roll_shed_drill.sh` does both, with the reason written at the call site.
+
+## Fixed
+
+The FLINTCONFIG handler now refuses an incoherent pair and names the fix:
+
+    ERR lag-hard-ms 200 is below lag-soft-ms 500; lower lag-soft-ms first
+    ERR lag-soft-ms 800 is above lag-hard-ms 500; raise lag-hard-ms first
+
+**The clamp in the setters stays, deliberately.** The two paths want opposite
+things. A config file with an incoherent pair should still boot the fleet on a
+coherent one rather than refuse to start; an operator typing a value at
+runtime needs to learn that it was not the value applied. So the refusal lives
+in the interactive handler and the clamp remains the safety net beneath it.
+
+The consequence for callers is that the ORDER now matters and reverses with
+direction: lowering the pair sets soft first, raising it sets hard first,
+because only one end moves per command and the pair must stay coherent
+throughout. `roll_shed_drill.sh` does both and says why at each site.
+
+Control 5 of that drill is the regression test: it asks for a hard cap one
+below the soft cap, requires an error mentioning `lag-soft-ms`, and then
+re-reads the cap to confirm the refused command moved nothing. The second half
+matters as much as the first — a handler that errors AND applies the value
+would pass a test that only checked the reply.
 
 ## Related
 

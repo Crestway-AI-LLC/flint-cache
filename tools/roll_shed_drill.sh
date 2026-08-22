@@ -305,14 +305,44 @@ echo "  $D_LAG write(s) shed by LAG — the gate and its counter are live"
 
 # ---------------------------------------------------------------- control 4
 echo "== control 4: restoring the cap restores writes"
+# HARD FIRST ON THE WAY UP, soft first on the way down. The pair must stay
+# coherent (`soft <= hard`) and only one end moves per command, so the order
+# reverses with the direction. Since BUG-0043 the server REFUSES the
+# incoherent order instead of silently fixing it, which is why this is
+# written out rather than left to luck.
 for p in $A $B; do
-  mesh $p FLINTCONFIG lag-soft-ms $SHIPPED_LAG_SOFT_MS >/dev/null 2>&1
   mesh $p FLINTCONFIG lag-hard-ms $SHIPPED_LAG_HARD_MS >/dev/null 2>&1
+  mesh $p FLINTCONFIG lag-soft-ms $SHIPPED_LAG_SOFT_MS >/dev/null 2>&1
 done
 sleep 1
+for p in $A $B; do
+  got=$(info_field $p lag_hard_ms)
+  [ "$got" = "$SHIPPED_LAG_HARD_MS" ] \
+    || { echo "FAIL: seat :$p did not return to the shipped cap (reports ${got:-none})"; exit 1; }
+done
 OUT=$($CLI -p $PROXY -a tok-acme --no-auth-warning SET after-restore ok 2>&1 | tr -d '\r')
 [ "$OUT" = "OK" ] || { echo "FAIL: after restoring the cap a write still failed: ${OUT:-(no reply)}"; exit 1; }
 echo "  writes accepted again at the shipped cap"
+
+# ---------------------------------------------------------------- control 5
+# BUG-0043 REGRESSION. The knob used to arm control 3 must report what it
+# applied. It used to accept a hard cap below the soft one, answer OK, and
+# store the soft value — so a ramp tested one threshold while reporting five.
+echo "== control 5: an incoherent lag pair is REFUSED, not silently clamped"
+BAD=$(( SHIPPED_LAG_SOFT_MS - 1 ))
+REPLY=$(mesh $A FLINTCONFIG lag-hard-ms $BAD 2>&1 | tr -d '\r')
+case "$REPLY" in
+  *ERR*lag-soft-ms*) echo "  refused as it should: ${REPLY%%$'\n'*}" ;;
+  *) echo "FAIL: FLINTCONFIG lag-hard-ms $BAD (below the ${SHIPPED_LAG_SOFT_MS}ms soft cap)"
+     echo "      answered ${REPLY:-(nothing)} instead of refusing. BUG-0043 has regressed:"
+     echo "      the knob reports success and applies a different number, which makes every"
+     echo "      threshold ramp built on it test one value while reporting several."
+     exit 1 ;;
+esac
+NOW=$(info_field $A lag_hard_ms)
+[ "$NOW" = "$SHIPPED_LAG_HARD_MS" ] \
+  || { echo "FAIL: the refused set still moved the cap to ${NOW:-none}"; exit 1; }
+echo "  and the cap is unchanged at ${NOW}ms"
 
 echo "PASS: a controlled roll under sustained load sheds nothing by the lag cause at the"
 echo "      shipped ${SHIPPED_LAG_HARD_MS}ms cap, and on this same machine a stalled replica"
