@@ -1,6 +1,6 @@
 # BUG-0014: chaos_unreadable fails an acked write on a REPLICA kill (OPEN)
 
-Status: OPEN · First fired 2026-08-11, not 2026-08-18 · Severity: high if real
+Status: OPEN · hypothesis (a) ELIMINATED 2026-08-22 by the first firing of the probe; (b) unresolved because the probe's verdict lands on its own boundary · First fired 2026-08-11, not 2026-08-18 · Severity: high if real
 — the oracle is asserting the durability claim, so either the claim broke or
 the oracle is crying wolf, and both are worth an hour
 
@@ -368,6 +368,70 @@ iteration 2.
 **So the mechanism cannot fire at the configuration this bug actually runs.**
 Recorded with its positive control because a zero from an instrument that
 cannot move would have looked identical.
+
+## 2026-08-22 — THE DISCRIMINATOR FIRED, and its verdict is not usable
+
+It fired on the fifth occurrence and the output has been sitting in a GitHub
+artifact since 2026-08-21. Nobody looked, for a reason worth recording: **the
+run was re-run and the second attempt passed, so `gh run list` reports that run
+as `success`.** The failure is only visible as `attempt=1`, and its artifact is
+a second, earlier `gate-logs` entry on the same run id. A scan for failed gate
+runs does not find it.
+
+From `chaos-chaos_unreadable.log` in artifact 9431051446 (run 32435117583,
+attempt 1, `c9487f3`):
+
+    iter 3: REPLICA kill lost acked write at key954: 19573 < 24264
+    == BUG-0014 DIAGNOSTIC ==
+    read_via: direct (cluster.master_client)
+    master:   local port 6351 role=master role_epoch=(0,2) seq_lag=43 live_replicas=1
+    prev_master_kill dead_ms: 1787276126708
+    ledger last_acked=24264 entries_above_got=[(seq=24264 sent=1787276126708
+                            at=1787276126708 sent_before_prev_kill=false)]
+
+**Hypothesis (a) is dead.** `read_via: direct` and the resolved node reports
+`role=master role_epoch=(0,2)` — the harness dialled the promoted seat, not a
+pre-promotion one. The code reading was right.
+
+**But the verdict on (b) cannot be taken.** The probe's rule is: all
+`sent_before_prev_kill=false` means "served by the CURRENT master and lost ->
+real". The single offending entry has
+
+    sent      = 1787276126708
+    dead_ms   = 1787276126708
+
+**the same millisecond**, and the test at `main.rs:945` is `sent <
+last_dead_ms` — strict. So "sent in the same millisecond the previous master
+died" is silently classified as "sent after it", and the probe reports a real
+durability regression on the strength of a strict inequality between two equal
+numbers.
+
+At 1 ms granularity that write is genuinely unclassifiable: it may have been
+acked by the old master microseconds before it died, which is the BUG-0007
+ledger class this probe exists to separate out, or by the new one after, which
+is a durability regression. **The instrument cannot tell, and says it can.**
+
+### What this needs before the next firing
+
+1. **A third outcome.** `sent == dead_ms` is neither `true` nor `false` for this
+   purpose; it is AMBIGUOUS and must print as such. The current two-valued
+   output converts a boundary into the more serious of the two answers.
+2. **Finer timestamps.** Both values come from millisecond clocks. Microseconds
+   would make the comparison meaningful at the only point where it is contested
+   — a kill and an in-flight write land in the same millisecond routinely.
+3. Only then is the "real vs harness bug" question answerable from this probe.
+
+Filed rather than fixed here because changing the probe changes what the next
+firing reports, and the next firing is roughly 14 gate runs away — the change
+should be deliberate, not folded into a bug-reading pass.
+
+### The reading rule that produced this
+
+The probe was written to be read by rule, and the rule was followed: "All false
+-> real." Following it here would have published a durability regression from a
+tie. That is the day's recurring shape once more — a check that cannot answer
+producing output indistinguishable from an answer — this time inside the
+instrument built to settle the question.
 
 ## Where to start
 
