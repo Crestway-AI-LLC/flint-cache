@@ -645,3 +645,51 @@ but the stronger reading, that Linux tolerates rates macOS does not, is not
 yet supported and must not be quoted as though it were.
 
 Re-running it with `DELIVERED` attached is the next step, and it is cheap.
+
+## 2026-08-22, resolved for loopback — Linux outruns macOS's shedding rate and sheds nothing
+
+The Linux burst experiment re-run with the delivered-throughput instrument
+attached. Gate box, GAP=0, shipped 1000ms cap:
+
+| batch | DELIVERED | shed |
+|---|---|---|
+| 500 | 29,026/s | 0 |
+| 4,000 | 37,066/s | 0 |
+| 20,000 | 38,968/s | 0 |
+| 50,000 | 39,466/s | 0 |
+
+macOS sheds **3,316 at 33,379/s**. Linux sustains **39,466/s with zero**, 18%
+past the rate at which the laptop falls behind.
+
+**This settles the ambiguity the previous entry recorded as open.** "Linux does
+not shed" was unsupported while delivered throughput was unmeasured, because
+nothing separated a server that kept up from a client that could not push. The
+client demonstrably reaches — and exceeds — the rate that sheds on macOS. So
+it is a real platform difference in whether loopback replication keeps up, not
+a weak generator.
+
+### The boundary of the claim, which the plateau draws
+
+Batch 20,000 to 50,000 moves delivered rate from 38,968 to 39,466/s: **1.3%
+for a 2.5x larger burst.** That is the GENERATOR saturating, not the server
+finding its limit. `valkey-cli --pipe` is one connection on the same box
+competing for the same CPUs.
+
+So the supported claim is **"Linux does not shed at rates where macOS does"**,
+and NOT "Linux's threshold is 39k/s" — the latter needs a generator that can
+go harder (`valkey-benchmark -c`, several connections, or an off-box client).
+Recording the distinction because the second sentence is the one that would
+get quoted, and it is the one the data does not support.
+
+### What remains open
+
+The production sighting. 210 writes shed on the playground during an ordinary
+rc.59 roll, at load nowhere near 30k/s. Loopback-Linux does not reproduce it
+at any rate this generator can reach, and loopback-macOS reproduces something
+different — a laptop-specific replication stall at high rate, which is not
+what the playground did.
+
+That exhausts loopback as an avenue. The remaining candidates are all
+environmental — a real network RTT between seats, disk under a real working
+set, fleet size — and the playground is where they exist. `slo.md`'s no-stall
+row stays as written until measured there.
