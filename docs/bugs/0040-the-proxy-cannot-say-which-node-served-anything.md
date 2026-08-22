@@ -1,7 +1,14 @@
 # BUG-0040 — the proxy cannot say which node served anything
 
-**Status:** OPEN. Found 2026-08-21 while designing a pre-termination safety
-gate that turned out to be unbuildable without it.
+**Status:** FIXED 2026-08-21, both halves, landed but NOT YET DEPLOYED —
+it reaches the fleet on the next release. Found while designing a
+pre-termination safety gate that turned out to be unbuildable without it.
+
+    proxy  8cf94e7  per-backend counters + PROXYBACKENDS
+    agent  ce48e96  polls it, exports flint_proxy_pool_node_commands_total{proxy,node}
+
+The gate itself is still unbuilt and is tracked in the ops repo's
+`docs/actions.md`; this bug was only ever about the missing signal.
 
 ## What is missing
 
@@ -75,3 +82,31 @@ defect:
 The third row is the whole point. "We watched for 12 hours and saw nothing"
 and "we have no data for 12 hours" must never collapse into one answer, and
 the second one is what a missing exporter produces.
+
+
+## How it was fixed, and the two things not to undo
+
+**A registry keyed by address, not a field on the connection.** Connections
+live in per-worker thread-locals, so nothing outside a worker can enumerate
+them and the admin command runs on another thread. Keying by address also
+makes a counter outlive connection churn — a backend that drops and redials
+keeps one running total. A per-connection counter would zero itself on every
+reconnect, and reconnects cluster exactly when a node is unhealthy, so it
+would reset precisely when the number is wanted.
+
+**The lock is taken once per connection**, in `AsyncConn::new`, beside a dial
+that already does I/O. The command path holds an `Arc` resolved at that moment
+and does the same relaxed `fetch_add` as before. A mutex on the command path
+would rebuild the convoy ADR-0021 removed.
+
+**A new metric name, not a label on the old one.**
+`flint_proxy_pool_commands_total` already exists unlabelled from the
+info-block passthrough. Publishing an unlabelled fleet total and per-node
+totals under one name makes `sum()` count every command twice, once globally
+and once per node, and whoever writes that query has no reason to suspect it.
+`flint_proxy_pool_node_commands_total{proxy,node}` keeps both summable and
+leaves existing dashboards untouched.
+
+The property the whole bug turns on is pinned by a test rather than left to a
+comment: a dialed backend with no traffic reports **0**, a never-dialed
+backend is **absent**. Evidence and ignorance stay distinguishable.
