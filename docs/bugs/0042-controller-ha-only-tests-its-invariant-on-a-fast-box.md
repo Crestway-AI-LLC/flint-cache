@@ -187,6 +187,64 @@ asked. The original observation stands unexplained, and candidates 1 and 2
 (a controller observing the pair as master-less after the first promotion, and
 a fence checked against a stale epoch read) are untouched.
 
+## 2026-08-22 — where the fence actually lives, and why current+1 passes
+
+The design question was "should a stale-role controller promote at all?" Read
+the two sides and the asymmetry is sharper than that framing.
+
+**The controller already refuses to promote unfenced.** ADR-0018's ordering is
+enforced in `flint-controller/src/main.rs:862-892`: commit `CPFENCE` to the
+control plane first, and if it cannot be committed, *"REFUSING to promote
+without it. PAGE."* That is a hard stop, on the correct side of the
+dependency, and it goes through the CP's 3-seat Raft.
+
+**The seat enforces none of it.** `CPFENCE` appears in `flint-server` exactly
+once, in a comment at `main.rs:1504`. Nothing in the promotion path verifies
+that a fencing record exists, matches, or is current. `FLINTPROMOTE` is
+honoured on one test — is the proposed epoch above mine — so **the ordering is
+controller DISCIPLINE, not a seat-enforced invariant.** Every promoter is
+trusted to have done the right thing before dialling.
+
+That is why `current + 1` passes by construction. It is not a gap in the
+epoch check; the epoch check is doing its job, which is fencing the OLD
+master. Nothing anywhere asks the other question: *is the promotion I am about
+to perform redundant?*
+
+- `CPFENCE` answers "has someone superseded the old master?"
+- Nothing answers "is this survivor already master, making my promotion a
+  no-op?"
+
+The second promotion at a higher epoch is exactly the unasked question
+arriving as a real event.
+
+### A candidate remedy, and the reason to distrust it
+
+The seat can answer it locally, with state it already holds. `read_only`
+(`main.rs:799`) distinguishes a healthy serving master from a self-fenced one.
+So:
+
+    FLINTPROMOTE targeting a seat that is ALREADY master and NOT read_only
+    is a no-op — acknowledged as already-master, epoch unchanged.
+
+This preserves the recovery path #168/#171 depends on, which re-promotes a
+SELF-FENCED master at a higher epoch: that seat is `read_only`, so it takes
+the real path and gets its lease deadline reset. It also leaves split-brain
+untouched — promoting a DIFFERENT seat is a different case and is now counted
+separately by the drill.
+
+**Do not land this yet, and the reason is the point of this whole file.** It
+makes ADR-0004's invariant true BY CONSTRUCTION at the seat. It does not
+explain why a controller with a stale role view proposed at all, and
+candidates 1 and 2 above are still unexamined. A stale-role proposal may be
+the visible edge of a coordination defect that matters for reasons unrelated
+to whether its effect lands — and silencing the effect would remove the only
+evidence anyone has of it.
+
+Making a symptom impossible is a legitimate fix ONLY when the symptom is the
+whole harm. Here it is not established that it is. So: the mechanism first,
+this second, and if the mechanism turns out to be benign then this is the
+right shape of answer.
+
 ## Where to start
 
 1. Reproduce on a box with >= 16 vCPU; on 8 cores the race did not start in
