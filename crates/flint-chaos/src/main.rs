@@ -353,6 +353,14 @@ fn main() {
     // failing ack predates that kill (never retired -> harness, BUG-0007
     // class) or postdates it (served by the current master -> real loss).
     let mut last_dead_ms: u64 = 0;
+    // Mixed mode flips a coin per iteration, so a run can land on a replica
+    // every time — six tails is 1/64 — and `attached_chaos_drill.sh` then
+    // correctly refuses to pass a failover path it never exercised. That
+    // turns a coverage gap into an intermittent red on commits that changed
+    // nothing; it reddened public main on a docs-only commit on 2026-08-22.
+    // Counted so the flip can stop once coverage is actually at risk.
+    let mut master_kills: u32 = 0;
+
     for iteration in 1..=iterations {
         // Let the writer run for a spell BETWEEN kills; it keeps writing
         // through what follows.
@@ -373,6 +381,14 @@ fn main() {
         let want_master = match mode.as_str() {
             "replica" => false,
             "master" => true,
+            // Past halfway with no master killed yet, stop flipping and ask
+            // for one every remaining iteration. The run stays random where
+            // randomness is the point — which pair, and in what order — and
+            // becomes deterministic only about covering the thing the drill
+            // is named for. A master kill can still be declined below when
+            // the pair is re-seeding, so this raises the floor rather than
+            // guaranteeing it, and the drill's own assert remains the check.
+            _ if master_kills == 0 && iteration * 2 > iterations => true,
             _ => rng.random_bool(0.5),
         };
         // Kill a master that HAS a live replica but is NOT required to be
@@ -426,6 +442,7 @@ fn main() {
             converged
         };
         if kill_master {
+            master_kills += 1;
             let harness_promoted = cluster.promotion_is_harness();
             std::thread::sleep(Duration::from_millis(300)); // hammer re-established
 
