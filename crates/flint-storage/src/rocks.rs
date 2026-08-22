@@ -263,8 +263,14 @@ pub const DEFAULT_KEEP_LOG_FILE_NUM: usize = 5;
 /// forget: it takes no retention arguments, so it looks like it has nothing to
 /// configure, and it still makes RocksDB write a LOG.
 fn bound_info_log(opts: &mut Options) {
-    opts.set_max_log_file_size(DEFAULT_MAX_LOG_FILE_SIZE);
-    opts.set_keep_log_file_num(DEFAULT_KEEP_LOG_FILE_NUM);
+    bound_info_log_with(opts, DEFAULT_MAX_LOG_FILE_SIZE, DEFAULT_KEEP_LOG_FILE_NUM);
+}
+
+/// The bounds, parameterised, so a test can drive the SAME code the production
+/// opens use without generating 64 MiB of diagnostic log to see one rotation.
+fn bound_info_log_with(opts: &mut Options, max_size: usize, keep: usize) {
+    opts.set_max_log_file_size(max_size);
+    opts.set_keep_log_file_num(keep);
 }
 
 impl RocksKv {
@@ -1027,6 +1033,107 @@ mod gc_integration {
 /// The counter is THREAD-LOCAL on purpose: the test harness runs tests in
 /// parallel, so a process-wide counter would be measuring whatever else
 /// happened to be running.
+#[cfg(test)]
+mod info_log_bounds {
+    use super::*;
+
+    /// BUG-0017: 883 MB of RocksDB info LOG against 248 KB of data on the
+    /// playground — about 3,600:1 — because neither `max_log_file_size` nor
+    /// `keep_log_file_num` was set. The fix is two lines; this is the assert
+    /// the bug asks for, and its reasoning is the point: "without the assert
+    /// this regresses silently, because nothing else in the system notices a
+    /// large file." No disk guard, meter or alert reads directory size.
+    ///
+    /// Drives `bound_info_log_with` — the same function both production opens
+    /// reach through `bound_info_log` — at a size small enough that ordinary
+    /// open/flush chatter rotates it, rather than writing 64 MiB to observe
+    /// one rotation.
+    ///
+    /// WHAT THIS DOES NOT COVER, stated rather than implied: it exercises the
+    /// bounding function, not the call SITES. Deleting `bound_info_log(&mut
+    /// opts)` from `open_with_retention` would leave this test green. The
+    /// constant assertion below is the partial guard against the other silent
+    /// regression — someone widening the ceiling without revisiting the
+    /// incident that set it.
+    #[test]
+    fn rotated_logs_are_pruned_to_the_keep_limit() {
+        let dir = std::env::temp_dir().join(format!(
+            "flint-infolog-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::UNIX_EPOCH
+                .elapsed()
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        // RocksDB rotates LOG -> LOG.old.<ts> on OPEN, not by size, so the way
+        // to generate rotations is to reopen. Six opens would leave five
+        // LOG.old files if nothing pruned; keep_log_file_num=2 must hold it to
+        // two. An earlier draft churned writes instead and produced exactly ONE
+        // rotated log however hard it worked — which passed `rotated <= keep`
+        // while pruning had never once run. That is the vacuous-assert failure
+        // this file is full of, so the check below requires the cap to be
+        // REACHED, not merely respected.
+        let keep = 2usize;
+        let opens = 6usize;
+        for _ in 0..opens {
+            let mut opts = Options::default();
+            opts.create_if_missing(true);
+            bound_info_log_with(&mut opts, 4096, keep);
+            let db = DB::open(&opts, &dir).expect("open");
+            for i in 0..200u32 {
+                db.put(format!("k{i}").as_bytes(), vec![b'v'; 256])
+                    .expect("put");
+            }
+            db.flush().expect("flush");
+        }
+
+        let logs: Vec<String> = std::fs::read_dir(&dir)
+            .expect("read_dir")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("LOG"))
+            .collect();
+        let rotated = logs.iter().filter(|n| n.starts_with("LOG.old")).count();
+
+        // `keep_log_file_num` bounds ALL info logs including the live one, not
+        // just the rotated ones — so keep=2 means LOG plus one LOG.old. Learned
+        // by asserting the wrong quantity and being told: six opens produced
+        // `rotated=1`, which is the cap, not a failure to rotate.
+        //
+        // Six opens with no pruning would leave six files. Seeing exactly `keep`
+        // is therefore both halves at once: pruning ran, AND it ran enough times
+        // to matter. Below `keep` would mean the rotations never happened and
+        // the test proved nothing.
+        assert_eq!(
+            logs.len(),
+            keep,
+            "keep_log_file_num={keep} after {opens} opens should leave exactly {keep} \
+             info logs ({rotated} rotated + the live LOG), saw {}: {logs:?}. More means \
+             pruning is not happening — which is how 883 MB of LOG accumulated against \
+             248 KB of data. Fewer means the opens did not rotate and this test \
+             exercised nothing.",
+            logs.len()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The ceiling is a decision with an incident behind it: 64 MiB x 5 is
+    /// ~320 MB, roughly two days at the measured ~6 MB/hour, chosen as more
+    /// than one day because the outage that motivated it ran nine hours before
+    /// anyone looked. Widening it silently is the regression this catches.
+    #[test]
+    fn the_ceiling_is_the_one_the_incident_justified() {
+        assert_eq!(DEFAULT_MAX_LOG_FILE_SIZE, 64 * 1024 * 1024);
+        assert_eq!(DEFAULT_KEEP_LOG_FILE_NUM, 5);
+        let ceiling = DEFAULT_MAX_LOG_FILE_SIZE * DEFAULT_KEEP_LOG_FILE_NUM;
+        assert!(
+            ceiling <= 512 * 1024 * 1024,
+            "info-LOG ceiling grew to {ceiling} bytes; BUG-0017 sized it at ~320 MB"
+        );
+    }
+}
+
 #[cfg(test)]
 mod alloc_count {
     use super::*;

@@ -1,6 +1,6 @@
 # BUG-0017: the RocksDB info LOG grows without bound (OPEN)
 
-Status: OPEN, found 2026-08-18 on the playground · Severity: **medium** — an
+Status: **FIXED and now tested** 2026-08-22 · found 2026-08-18 on the playground · Severity: **medium** — an
 unbounded disk consumer that scales with replication churn rather than with
 stored data. **Scope corrected 2026-08-18** — see "Three claims withdrawn".
 
@@ -77,6 +77,43 @@ used it. The 3,600:1 ratio is real, but it inflates a log file, not a meter.
 Filed an hour after BUG-0016 was retracted for the same mistake — asserting a
 blast radius without reading the consumers — which is why the fix below is
 deliberately narrower than the one first proposed.
+
+## Update 2026-08-22 — the fix had shipped; the assert had not
+
+`bound_info_log` pins exactly what this bug proposed — `max_log_file_size`
+64 MiB and `keep_log_file_num` 5, a ~320 MB ceiling — and it is applied at BOTH
+production open sites (`open_read_only` and `open_with_retention`). Only the
+status line was stale. Third bug today whose remedy was already in the tree.
+
+What was missing is this bug's own second requirement, and its reasoning is
+exactly right: *"Without the assert this regresses silently, because nothing
+else in the system notices a large file."* No disk guard, meter or alert reads
+directory size — that was established here by withdrawing three claims that
+said otherwise.
+
+`rocks::info_log_bounds` now covers it. Writing it took three attempts and each
+failure is worth more than the test:
+
+1. Churn writes to force a rotation — produced `rotated = 1` however hard it
+   worked, so `rotated <= keep` passed while pruning had never once run.
+2. Six times the churn — still 1. `LOG.old` is created **per DB open**, not by
+   size, so no amount of writing could make a second one.
+3. Restructured to six opens — still 1, and this time the assert FAILED, which
+   is what taught the semantics: **`keep_log_file_num` bounds all info logs
+   INCLUDING the live one.** Six opens at keep=2 leaves `LOG` + one `LOG.old`.
+
+The assert is therefore on the TOTAL count, which carries both halves: six opens
+with no pruning would leave six files, so exactly `keep` proves pruning ran and
+that enough rotations happened for it to matter. Fewer than `keep` now fails as
+"the opens did not rotate and this exercised nothing", rather than passing.
+
+A second test pins the ceiling itself, because 64 MiB x 5 is a decision with an
+incident behind it — roughly two days at the measured ~6 MB/hour, deliberately
+more than one because that outage ran nine hours before anyone looked.
+
+**What is still not covered, stated rather than implied:** the tests drive
+`bound_info_log_with`, not the call sites. Deleting `bound_info_log(&mut opts)`
+from `open_with_retention` would leave both green.
 
 ## Fix
 
