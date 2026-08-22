@@ -187,7 +187,7 @@ CORE="${FLINT_CORE_ORDER:-restart repl failover proxy slot_migrate slot_map reba
       proxy_cache proxy_tls replica_reads replica_stale_fence rw_isolation
       scan slot_cutover slot_cutover_recovery slot_moved snapshot_restore
       tenant tenant_rebalance tenant_remove token_hash
-      write_deadline fullsync_rate edge_reroute rewind_rejoin}"
+      write_deadline fullsync_rate edge_reroute rewind_rejoin wal_headroom}"
 CHAOS="chaos proxy_chaos chaos_unreadable hotkey_chaos"
 
 # DELIBERATELY OUT, with the reason. An absence with no reason beside it is

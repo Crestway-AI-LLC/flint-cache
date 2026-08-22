@@ -1,6 +1,12 @@
 # ADR-0022: Bound WAL retention by replica progress, not by time and size
 
-Status: PROPOSED — August 2026. Written after a replica livelocked on the
+Status: **ACCEPTED and IMPLEMENTED** — parts 1 and 2 in full, part 3's
+defaults raised (6 h / 8 GiB) but its `--wal-retain-*` flags not built. Gated
+by `tools/wal_headroom_drill.sh` since 2026-08-21. The "today nothing reports
+any of this" below was true when written and is not now — `wal_headroom_seq`,
+`wal_min_acked_seq` and `writes_shed_headroom` are all in FLINTINFO.
+
+Originally PROPOSED — August 2026. Written after a replica livelocked on the
 playground for the second time in three weeks and, on the second occasion,
 left a pair with no master for nine hours.
 

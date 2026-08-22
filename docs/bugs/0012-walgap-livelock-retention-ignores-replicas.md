@@ -1,7 +1,41 @@
 # BUG-0012: a lagging replica can never catch up — WAL retention ignores replica progress (OPEN)
 
-Status: OPEN, found 2026-08-18 · Severity: high — a pair silently degrades to
+Status: **FIXED and now GATED** 2026-08-21 · found 2026-08-18 · Severity: high — a pair silently degrades to
 one copy on one disk, and the seat churns full syncs until someone notices
+
+## Update 2026-08-21 — the fix had shipped; the gate had not
+
+ADR-0022's three parts are all in the tree, and this doc and the ADR were both
+stale about it:
+
+    min_acked_live / wal_headroom_seq / wal_headroom_exhausted   repl_hub.rs
+    writes_shed_headroom + "-THROTTLED replica too far behind"   main.rs:2269
+    DEFAULT_WAL_TTL_SECONDS   21_600   (6 h, was 1 h)
+    DEFAULT_WAL_SIZE_LIMIT_MB  8_192   (8 GiB, was 1 GiB)
+    DEFAULT_WAL_HEADROOM_SHED_SEQ 4_000_000 — the gate SHIPS ON
+
+So the remedy existed. What did not exist was this doc's own closing
+requirement — *"There is no drill for this, which is why it recurred
+silently"* — and that is the actual reason round two happened after round one
+was answered with detection. **A fix with no gate is round three waiting.**
+
+`tools/wal_headroom_drill.sh` now holds all of it, as controls rather than
+observations: the gate ships on (a threshold of 0 is a protection nobody has,
+and that branch is reachable — verified by booting with `--wal-headroom-seq 0`);
+ordinary traffic sheds nothing at the shipped threshold; tightened, the same
+traffic IS refused, by the headroom message specifically rather than the lag or
+deadline gate that would shed the same command for a different cause;
+restoring the threshold restores writes; and the replica never reaches WALGAP.
+
+The threshold is RAMPED down until it arms rather than fixed, per BUG-0030 —
+on this box nothing armed until 2 sequences, so a fixed 10 or 100 would have
+failed to create the condition and reported it as a product defect.
+
+Still not done, and deliberately not claimed here: `--wal-retain-seconds` /
+`--wal-retain-mb` from ADR-0022 part 3 do not exist as flags. The defaults were
+raised and the values are plumbed as parameters to `open_with_retention`, but
+an operator cannot retune retention itself without a rebuild. Filed as the
+remaining half rather than folded into "fixed".
 
 **This is a recurrence.** `packaging/aws/verify-watch.sh` (private ops repo)
 was written because of the first one, and its header records it: *"on
