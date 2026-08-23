@@ -1,4 +1,29 @@
 
+## The first thing rejection caught was ours, within hours
+
+`tools/` was clean — that is what made landing this safe. The first real catch
+came from outside the drills, in a scratch experiment for BUG-0013 that had
+been running for three sessions:
+
+    flint-server: unrecognised argument `--data`
+                 run `flint-server --help` for the accepted set
+
+The flag is `--data-dir`. The script had passed `--data` since it was written.
+The server ignored it silently and used the default `./flint-data`, so a line
+that read as "put the engine here" had never once done that — which is the
+defect this bug describes, in its own words: *a typo'd `--prot 7001` starts a
+node on 6380 rather than failing*.
+
+**It was checked rather than assumed whether this invalidated the earlier
+measurements.** Every one of those runs launched a FRESH box, so `./flint-data`
+was empty at the start of each and every "fresh fill" was genuinely fresh, on
+the same filesystem. The path was wrong; the behaviour was not. The `l0_files`
+peak of 22 against a slowdown trigger of 20 stands.
+
+Worth recording because it is the argument for the change that no commit
+message could make: the fix found a silent three-session-old defect on first
+contact, and the thing it found was the author's own.
+
 ## 2026-08-23 — the caller side is now enumerated, and it is clean
 
 The deferral above says reinstating rejection "needs the caller side
