@@ -255,3 +255,52 @@ produces the behaviour at all.
 
 Next run needs: a larger volume, a delivered-write count per pass, and the
 server's own log kept rather than dying with the box.
+
+## 2026-08-23 — at 100 M keys, compaction debt grows without bound. Fill measured; refill still not.
+
+A 400 GB box (`FLINT_GATE_VOL_GB`, added for this), 1 KB incompressible values,
+500 x 200 000 keys per pass, data on the ROOT volume.
+
+**PASS 1 ran to round 460 of 500 and the box then hit its TTL** — started
+22:21:55, terminated 01:22:11, exactly the 180 minutes configured. Not a
+crash; the time budget was wrong. Two 100 M-key passes need roughly six hours
+including build and bootstrap, and were given three.
+
+### What the fill established
+
+| round | written | `pending_compaction_bytes` | `l0_files` |
+|---|---|---|---|
+| 120 | ~24 GB | 54 GB | 10 |
+| 240 | ~48 GB | 84 GB | 4 |
+| 360 | ~72 GB | 120 GB | 3 |
+| 460 | ~92 GB | **168 GB** | 14 |
+
+**Compaction debt grows monotonically to 1.8x the logical data written, with no
+plateau.** `write_stopped` stayed 0 and `stall_readable` 1 throughout — a real
+zero — and `l0_files` oscillated 2 to 18 without reaching the stop trigger of
+36. So at the shipped defaults the engine never refuses a write and never
+catches up; it absorbs an unbounded backlog instead.
+
+That is the hypothesis stated at the top of this file, measured on an ordinary
+fill, four times larger than the previous attempt could reach. It is also why
+the earlier 24 M-key run saw debt reach 55 GB and read as a plateau: 55 GB was
+simply where that fill stopped.
+
+### What is STILL not measured, and it is the same half as before
+
+The refill. It never ran. Every claim in this file about a rewrite over an
+existing LSM being worse than a fresh fill remains untested at any scale that
+matters — the 24 M-key attempt saw a *gentler* refill, and this run did not
+reach one.
+
+**The fill result does not stand in for it.** Unbounded debt on a fresh fill
+says compaction is under-provisioned; it says nothing about whether rewriting
+an existing 120 GB tree costs multiples of writing it once, which is the
+original 38-minutes-versus-85-and-counting symptom.
+
+### For the next attempt
+
+Two passes at 100 M keys need ~6 h wall clock. Either budget that, or run 250
+rounds (50 M keys, ~85 min per pass) and get the contrast at a ~60 GB LSM —
+still 2.5x the largest tree this bug has ever been measured against, and it
+fits comfortably in four hours.
