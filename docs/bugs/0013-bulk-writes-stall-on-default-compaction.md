@@ -304,3 +304,69 @@ Two passes at 100 M keys need ~6 h wall clock. Either budget that, or run 250
 rounds (50 M keys, ~85 min per pass) and get the contrast at a ~60 GB LSM —
 still 2.5x the largest tree this bug has ever been measured against, and it
 fits comfortably in four hours.
+
+## 2026-08-23 — the two halves separate: the FILL is confirmed, the REFILL does not reproduce
+
+50 M keys per pass (250 x 200 000), 1 KB incompressible, 400 GB root volume,
+data under `$HOME`. Disk precheck reported 391 GB available. The box hit its
+TTL again at 270 minutes — PASS 1 complete, PASS 2 at round 220 of 250.
+
+### PASS 1, the fresh fill — CONFIRMED, and fully delivered
+
+    PASS 1 DELIVERED: 50 000 000 writes of 50 000 000 offered
+    PASS 1 peak l0_files: 24   (slowdown trigger 20, stop trigger 36)
+    pending_compaction_bytes: 18 GB @ round 40 -> 55 @ 120 -> 73 @ 200 -> 85 @ 240
+
+Every offered write landed — no shedding, `write_stopped` 0 with
+`stall_readable` 1 throughout. `l0_files` peaked at **24, above the slowdown
+trigger of 20**, so RocksDB was throttling foreground writes. Debt reached
+1.7x the logical data with no plateau, matching the 100 M run's 1.8x.
+
+**That is the "defaults are under-provisioned" half of this bug, measured
+twice at two scales, with full delivery proven rather than assumed.**
+
+### PASS 2, the refill — the opposite of the hypothesis
+
+    refill round  20: pending 44 GB, l0=4
+    refill round  40: pending 3.3 GB, l0=0
+    refill round  60: pending 162 MB, l0=2
+    ...
+    refill round 220: pending 0,      l0=3
+
+Debt **collapsed** from the fill's 44 GB backlog to zero within 40 rounds and
+stayed there, with `l0_files` at 0-4 against the fill's 2-24. Compaction did
+not merely keep up during the rewrite — it drained a backlog it could not
+drain while the tree was growing.
+
+That is mechanically unsurprising in hindsight: a refill overwrites existing
+keys, so the tree stops growing and compaction merges duplicate versions away.
+The work per byte written is lower, not higher.
+
+**The original symptom — 38 minutes to fill, 85+ and still running to refill —
+does not reproduce here.** The refill ran 220 rounds in comparable wall clock
+to the fill's 250.
+
+### The gap in that conclusion, stated rather than buried
+
+**The refill's delivered count never printed**: the TTL cut the run before its
+summary. So "the refill is easy" rests on eleven pending/L0 samples trending to
+zero, and NOT on proof that the refill's writes were landing. Debt falling to
+zero is also what a refill that stopped writing would look like. `write_stopped`
+stayed 0 and no `-QUOTA` appeared, which excludes server-side shedding but not
+a client-side stall.
+
+Closing that needs one run that finishes: 250 rounds at the measured **~1.9
+rounds/min** is ~4.4 h of drilling plus ~25 min of build, so **TTL 330**. Both
+attempts so far underestimated this — 180 for a 6 h job, then 270 for a 4.7 h
+one — because the rate was estimated from throughput rather than measured from
+rounds.
+
+### What this does to the bug
+
+It splits. The fill half is confirmed and actionable: raise
+`max_background_jobs`, size write buffers, consider a rate limiter, every value
+justified against these numbers. The refill half — the symptom this file is
+named for — has now failed to reproduce at 24 M and at 50 M keys, and the
+remaining explanations are the ones this run cannot test: the original was 100
+M keys on i4i NVMe instance storage, not 50 M on EBS gp3, and it predates a
+quarter's worth of WAL-retention and compaction-adjacent fixes.
