@@ -38,6 +38,84 @@ type RocksHandle = ();
 #[cfg(feature = "rocks")]
 type RocksHandle = Arc<RocksKv>;
 
+/// EVERY flag this binary accepts. An unrecognised argument is REFUSED
+/// (BUG-0034) rather than silently ignored, because ignoring it means a
+/// typo'd `--prot 7001` starts a node on the DEFAULT port 6380 and looks like
+/// it worked.
+///
+/// This list is checked against the `arg()` call sites by
+/// `accepted_flags::every_arg_call_site_is_listed` — a list maintained by
+/// hand beside call sites added by hand drifts, and the drift is invisible
+/// until a caller is refused a flag the binary really does read.
+///
+/// THE PREVIOUS ATTEMPT AT THIS BROKE THE SUITE AND WAS REVERTED THE SAME
+/// HOUR. It enumerated the CALLEE correctly and never checked the CALLER:
+/// `slot_map_drill.sh` passed `--advertise`, a PROXY flag flint-server has
+/// never read, so rejection turned a silent no-op into `exit 2` and the drill
+/// waited forever for a seat that would never bind. Before re-landing this,
+/// all 142 flint-server invocations in `tools/` were enumerated and every
+/// flag they pass is one this binary reads; `--advertise` now goes to the
+/// proxy, which is the binary that reads it. An argument list has two ends
+/// and enumerating one of them proves nothing about the other.
+const ACCEPTED_FLAGS: &[&str] = &[
+    "--async-queue-cap",
+    "--async-writes",
+    "--bind",
+    "--data-dir",
+    "--disk-min-free-bytes",
+    "--disk-min-free-pct",
+    "--disk-sample-ms",
+    "--engine",
+    "--fullsync-rate-bytes",
+    "--internal-ca",
+    "--internal-cert",
+    "--internal-key",
+    "--journal",
+    "--lag-hard-ms",
+    "--lag-soft-ms",
+    "--lease-cp",
+    "--lease-ttl-ms",
+    "--max-conns",
+    "--max-fullsync",
+    "--max-key-bytes",
+    "--max-value-bytes",
+    "--migrate-rate-bytes",
+    "--min-replicas-to-write",
+    "--port",
+    "--replica-of",
+    "--replica-read-stale-ms",
+    "--restore-from",
+    "--rewind-snaps",
+    "--wal-fsync-ms",
+    "--wal-headroom-seq",
+    "--wal-size-limit-mb",
+    "--wal-ttl-seconds",
+    "--widowed-grace-ms",
+    "--write-deadline-ms",
+    // Handled before this check, listed so the drift test sees a complete set.
+    "--build-version",
+    "--version",
+    "--help",
+];
+
+/// Refuse an argument this binary does not read. Called AFTER the --help and
+/// --version early exits so those keep working, and before anything binds so
+/// a refusal costs nothing.
+///
+/// Only `--`-prefixed tokens are inspected. Every accepted flag takes a value
+/// (they are all read through `arg()`, which returns the token after the
+/// name), and no value this binary takes begins with `--`: they are ports,
+/// paths, addresses, byte counts and engine names.
+fn reject_unknown_flags() {
+    for a in std::env::args().skip(1) {
+        if a.starts_with("--") && !ACCEPTED_FLAGS.contains(&a.as_str()) {
+            eprintln!("flint-server: unrecognised argument `{a}`");
+            eprintln!("             run `flint-server --help` for the accepted set");
+            std::process::exit(2);
+        }
+    }
+}
+
 fn arg(name: &str) -> Option<String> {
     std::env::args().skip_while(|a| a != name).nth(1)
 }
@@ -719,8 +797,8 @@ fn main() -> std::io::Result<()> {
     // --version and -V answer the same question as --build-version. They are
     // here because a peer's release-acceptance check reached for `--version`,
     // got a RUNNING NODE, and hung a box with a 30-minute TTL (docs/bugs/0034).
-    // Adding the aliases is narrow and safe; refusing every unrecognised
-    // argument is the general fix and is NOT safe yet — see the bug.
+    // Adding the aliases was the narrow fix; refusing every unrecognised
+    // argument is the general one and now lands too — see ACCEPTED_FLAGS.
     if std::env::args().any(|a| a == "--build-version" || a == "--version" || a == "-V") {
         println!("{}", build_version());
         return Ok(());
@@ -735,15 +813,17 @@ fn main() -> std::io::Result<()> {
     // every drill's scope, and fleet_guard correctly refuses. One stray --help
     // refused 64 drills in the run of 2026-08-19T22:27Z.
     //
-    // The narrower defect — an UNRECOGNISED flag is silently ignored, so a
-    // typo'd `--prot 7001` starts a node on 6380 rather than failing — is real
-    // and is NOT fixed here: rejecting unknown arguments needs the full
-    // accepted set enumerated, and doing that blind risks refusing a flag some
-    // caller depends on. Filed as the open half of 0033.
+    // The narrower defect — an UNRECOGNISED flag silently ignored, so a
+    // typo'd `--prot 7001` starts a node on 6380 rather than failing — is
+    // fixed by reject_unknown_flags() just below. It needed the accepted set
+    // enumerated at BOTH ends first; doing it blind is what broke the suite
+    // the first time.
     if std::env::args().any(|a| a == "--help" || a == "-h") {
         println!("{}", usage());
         return Ok(());
     }
+    // The general fix, now that the caller side is enumerated (BUG-0034).
+    reject_unknown_flags();
     // ADR-0014 D2: the drift check needs to know how long this seat has
     // been up, to tell real divergence from a node mid-roll.
     heat::mark_process_start();
@@ -4588,5 +4668,75 @@ mod serve_tests {
         );
         s.write_all(&ping).expect("send ping");
         assert_eq!(read_frames(&mut s, 1)[0], Value::Simple("PONG".into()));
+    }
+}
+
+#[cfg(test)]
+mod accepted_flags {
+    use super::ACCEPTED_FLAGS;
+
+    /// ACCEPTED_FLAGS is written by hand; `arg()` call sites are added by
+    /// hand; nothing connects them. A flag added to the code and forgotten
+    /// here becomes an argument the binary READS and REFUSES — the worst of
+    /// both behaviours, and invisible until a caller trips it.
+    ///
+    /// This reads the source and asserts the two agree.
+    #[test]
+    fn every_arg_call_site_is_listed() {
+        let src = include_str!("main.rs");
+        let needle = concat!("arg(", '"');
+        let mut missing: Vec<String> = Vec::new();
+        let mut seen = 0usize;
+        for (i, _) in src.match_indices(needle) {
+            let rest = &src[i + needle.len()..];
+            let Some(end) = rest.find('"') else { continue };
+            let flag = &rest[..end];
+            if !flag.starts_with("--") {
+                continue;
+            }
+            seen += 1;
+            if !ACCEPTED_FLAGS.contains(&flag) {
+                missing.push(flag.to_string());
+            }
+        }
+        // CONTROL. If the scan stops matching — the call shape changes, the
+        // file moves — it finds nothing and reports agreement, which is the
+        // same output as success. A count floor makes that failure loud.
+        assert!(
+            seen > 25,
+            "found only {seen} arg(\"--…\") call sites; this scan has stopped \
+             matching, so its empty complaint list means nothing"
+        );
+        missing.sort();
+        missing.dedup();
+        assert!(
+            missing.is_empty(),
+            "arg() reads flags that ACCEPTED_FLAGS omits, so the binary would \
+             refuse arguments it actually honours: {missing:?}"
+        );
+    }
+
+    /// The half the reverted attempt got wrong. These are flags real callers
+    /// pass — checked against `tools/` — and refusing any of them is how the
+    /// first attempt hung two gates.
+    #[test]
+    fn flags_the_drills_actually_pass_are_accepted() {
+        for f in [
+            "--port",
+            "--engine",
+            "--data-dir",
+            "--replica-of",
+            "--bind",
+            "--internal-ca",
+            "--internal-cert",
+            "--internal-key",
+            "--lag-hard-ms",
+            "--wal-fsync-ms",
+        ] {
+            assert!(
+                ACCEPTED_FLAGS.contains(&f),
+                "{f} is passed by drills in tools/ but would be REFUSED"
+            );
+        }
     }
 }
