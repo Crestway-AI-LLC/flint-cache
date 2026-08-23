@@ -197,6 +197,31 @@ the local gate repeatedly with the warm in place and see whether 6-of-20 moves.
 That measures the thing that matters — the clean rate — instead of a
 microbenchmark that stands in for it.
 
+### The clean-rate measurement was attempted and is VOID
+
+Six alternating pairs of `proxy_conformance_drill`, warm arm against a
+warm-disabled control. Result: **0/6 and 0/6.**
+
+That reads exactly like "the warm changes nothing" and it means nothing at
+all. Every one of the twelve runs was REFUSED by `fleet_guard` — a sibling
+`flint-kv` test was contending at 0.95 cores — so no drill executed in either
+arm. The harness counted any non-zero exit as a failure, which collapsed
+DECLINED TO RUN into RAN AND FAILED: the exact distinction `fleet_guard`
+exists to draw, erased by the thing consuming its output.
+
+**A future attempt must classify three outcomes, not two:** passed, failed,
+and refused-so-not-a-sample. A refusal is not a data point and must not be
+counted in a denominator.
+
+It also must not be worked around with `FLINT_DRILL_FORCE=1`. The guard was
+refusing because of contention, and contention is the confound the clean rate
+is trying to measure; forcing past it would produce numbers whose flakiness
+has a second cause mixed in.
+
+So the state is: the warm is landed and gated, justified by the reproducible
+10x first-exec cost, and its effect on the local clean rate is still
+UNMEASURED. That is the one open question and it needs a quiet box.
+
 ## Where to start
 
 **Steps 1-3 below are STALE.** They were written for the "the seat is fine and
