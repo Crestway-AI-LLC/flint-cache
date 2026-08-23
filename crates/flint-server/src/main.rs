@@ -66,6 +66,7 @@ const ACCEPTED_FLAGS: &[&str] = &[
     "--disk-min-free-pct",
     "--disk-sample-ms",
     "--engine",
+    "--evictable-ns",
     "--fullsync-rate-bytes",
     "--internal-ca",
     "--internal-cert",
@@ -681,6 +682,98 @@ fn build_version() -> String {
 // Callers are all rocks-gated dial sites (replication/migration/cutover);
 // the mem-only build still parses --internal-* for its listener.
 #[cfg_attr(not(feature = "rocks"), allow(dead_code))]
+/// Namespaces whose contents this seat is permitted to RECLAIM (ADR-0023 D7.1).
+///
+/// Empty by default and inert today: nothing evicts yet. It exists so the
+/// decision has a home before the policy that reads it, because the shape of
+/// the CHANNEL was the open question, not the policy.
+///
+/// SEAT-SIDE CONFIG, NOT A TENANT FLAG. The obvious model was the ADR-0005
+/// D6/D7 opt-ins, which pack per-tenant flags into a snapshot suffix — but
+/// that mechanism terminates at the PROXY. `flint-server` has no tenant
+/// awareness at all: no CPWATCH, no registry, no tenant record, and `ns` is
+/// an opaque key prefix used for isolation. Eviction has to run where the
+/// data is, so the flag has to reach the seat, and there was no channel to
+/// reach it by. This is the smallest one that fits what the seat already does.
+static EVICTABLE_NS: std::sync::RwLock<Vec<String>> = std::sync::RwLock::new(Vec::new());
+
+/// Does this seat agree with its master about which namespaces are evictable?
+/// 1 = agree, 0 = MISMATCH, -1 = not known yet (or not a replica).
+///
+/// Per-seat config lets the two members of a pair silently disagree, and a
+/// pair where one side reclaims while the other fills to `-QUOTA` is divergent
+/// POLICY rather than divergent decisions — strictly worse, and nothing else
+/// would surface it.
+static EVICTABLE_AGREE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(-1);
+
+/// Canonical form: trimmed, empties dropped, sorted, deduped. Two seats given
+/// the same namespaces in a different ORDER must compare equal, or the
+/// agreement check reports a mismatch that is not one.
+fn parse_evictable_ns(raw: &str) -> Vec<String> {
+    let mut v: Vec<String> = raw
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    v.sort();
+    v.dedup();
+    v
+}
+
+/// Read one FLINTINFO field from a peer seat over the internal mesh.
+///
+/// Returns None when the field is ABSENT — an older peer that predates this
+/// field, or an unreachable one. That is deliberately distinct from
+/// `Some("")`, which is a peer that answered and has no evictable namespaces:
+/// the first is "cannot compare", the second is a comparable value, and
+/// collapsing them would report agreement with a seat that never answered.
+#[cfg(feature = "rocks")]
+fn peer_info_field(addr: &str, field: &str) -> Option<String> {
+    use std::io::{Read, Write};
+    let mut st = internal_connect(addr).ok()?;
+    st.write_all(b"*1\r\n$9\r\nFLINTINFO\r\n").ok()?;
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        match st.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                // Bounded: a peer that streams forever must not wedge this.
+                if buf.len() > 128 * 1024 {
+                    break;
+                }
+                if find_info_field(&buf, field).is_some() {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    find_info_field(&buf, field)
+}
+
+/// `<field>:<value>\r\n` inside a FLINTINFO payload. Anchored on a preceding
+/// newline (or the payload start) so `writes_shed_lag` cannot be matched by a
+/// search for `lag` — the substring trap that has cost this repository four
+/// separate defects.
+#[cfg(feature = "rocks")]
+fn find_info_field(buf: &[u8], field: &str) -> Option<String> {
+    let needle = format!("{field}:");
+    let hay = String::from_utf8_lossy(buf);
+    for line in hay.split("\r\n") {
+        if let Some(rest) = line.strip_prefix(needle.as_str()) {
+            return Some(rest.to_string());
+        }
+    }
+    None
+}
+
+#[cfg(feature = "rocks")]
+fn evictable_ns_joined() -> String {
+    EVICTABLE_NS.read().map(|g| g.join(",")).unwrap_or_default()
+}
+
 fn internal_connect(addr: &str) -> std::io::Result<flint_tls::Stream> {
     flint_tls::connect_reloadable(addr, INTERNAL_CLIENT.get().unwrap_or(&None))
 }
@@ -876,6 +969,13 @@ fn main() -> std::io::Result<()> {
         _ => panic!("--internal-ca, --internal-cert, --internal-key must be given together"),
     };
     // Role is dynamic: FLINTPROMOTE flips a replica to master at runtime.
+    if let Some(raw) = arg("--evictable-ns") {
+        let parsed = parse_evictable_ns(&raw);
+        eprintln!("evictable namespaces: {}", parsed.join(","));
+        if let Ok(mut g) = EVICTABLE_NS.write() {
+            *g = parsed;
+        }
+    }
     let read_only = Arc::new(AtomicBool::new(replica_of.is_some()));
     let tailer_stop = Arc::new(AtomicBool::new(false));
     // Lease deadline (unix-ms). 0 = unmanaged (standalone: never self-fences).
@@ -1254,7 +1354,40 @@ fn main() -> std::io::Result<()> {
     if let (Some(target), Some(kv)) = (replica_of.clone(), rocks.clone()) {
         eprintln!("replica-of={target} (writes rejected with -READONLY)");
         let stop = Arc::clone(&tailer_stop);
+        // Cloned BEFORE the move: `target` goes into the replication closure.
+        let agree_target = target.clone();
         std::thread::spawn(move || replica::run(&target, &kv, &stop));
+
+        // ADR-0023 D7.1 pair-agreement. Per-seat config lets the two members
+        // of a pair disagree silently, and a pair where one side reclaims
+        // while the other fills to -QUOTA is divergent POLICY — worse than
+        // divergent decisions, and invisible without something that compares.
+        //
+        // REPLICA-INITIATED because only the replica knows its counterpart:
+        // it has --replica-of, while the hub tracks replicas by id and never
+        // records their addresses. A master therefore cannot run this check,
+        // which is why it lives here rather than in some symmetric place.
+        {
+            let master = agree_target;
+            std::thread::spawn(move || {
+                loop {
+                    let verdict = match peer_info_field(&master, "evictable_ns") {
+                        Some(theirs) if theirs == evictable_ns_joined() => 1,
+                        Some(theirs) => {
+                            eprintln!(
+                                "EVICTABLE-NS MISMATCH with master {master}: this seat [{}], master [{theirs}] \
+                                 — one side may reclaim while the other fills to -QUOTA",
+                                evictable_ns_joined()
+                            );
+                            0
+                        }
+                        None => -1,
+                    };
+                    EVICTABLE_AGREE.store(verdict, Ordering::Relaxed);
+                    std::thread::sleep(std::time::Duration::from_secs(10));
+                }
+            });
+        }
     }
 
     // Bounded-cadence WAL fsync (--wal-fsync-ms, default 500; 0 disables).
@@ -2729,6 +2862,22 @@ fn execute(
             // threshold down then tests one value five times while reporting
             // five, which is how a positive control goes green having never
             // armed. Same choice WriteQueue::set_soft_cap already made.
+            // ADR-0023 D7.1: hot-reloadable, because the whole point of a
+            // seat-side channel is that the decision can be changed without a
+            // restart. Set-and-read-back: the value stored is the CANONICAL
+            // one (sorted, deduped), so an operator comparing two seats
+            // compares the same string rather than two orderings of it.
+            b"evictable-ns" => {
+                let parsed = parse_evictable_ns(&val);
+                match EVICTABLE_NS.write() {
+                    Ok(mut g) => *g = parsed,
+                    Err(_) => return Value::Error("ERR evictable-ns lock poisoned".into()),
+                }
+                // The pair may now disagree; say "unknown" until the next
+                // check rather than leaving a stale verdict that reads as
+                // agreement.
+                EVICTABLE_AGREE.store(-1, Ordering::Relaxed);
+            }
             b"lag-soft-ms" => {
                 let v: u64 = parse!();
                 let hard = hub.lag_hard_ms();
@@ -3373,7 +3522,7 @@ fn flintinfo(
     let write_stall = rocks.as_ref().and_then(|kv| kv.write_stall());
     let compaction = rocks.as_ref().and_then(|kv| kv.compaction_pressure());
     let info = format!(
-        "role:{}\r\nrole_epoch:{role_epoch}\r\nbuild:{build}\r\nsst_bytes:{sst}\r\nlatest_seq:{latest}\r\nlast_applied:{last_applied}\r\nacked_seq:{}\r\nseq_lag:{seq_lag}\r\nwal_headroom_seq:{whs}\r\nwal_min_acked_seq:{wma}\r\nwal_headroom_shed_seq:{whl}\r\nlive_replicas:{}\r\nlag_ms:{}\r\nlag_ms_max:{lmx}\r\nlag_max_gap:{lmg}\r\nlag_soft_ms:{soft}\r\nlag_hard_ms:{hard}\r\nmin_replicas_to_write:{minr}\r\nwidowed_grace_ms:{wgm}\r\nwidowed_shed:{wsh}\r\nfullsync_active:{fsa}\r\nfullsync_max:{fsm}\r\nasync_write_queue:{aqd}\r\nwrite_deadline_ms:{wdm}\r\nwrite_inflight:{wif}\r\nwrite_service_us:{wsu}\r\nwrite_wait_est_ms:{wwe}\r\nwrites_shed_deadline:{wsd}\r\nwrites_shed_lag:{wsl}\r\nwrites_shed_quorum:{wsq}\r\nwrites_shed_widowed:{wswd}\r\nwrites_shed_headroom:{wshr}\r\nwrites_delayed_soft:{wdsf}\r\nwal_fsync_ms:{wfm}\r\nwal_fsync_total:{wft}\r\ncert_days_remaining:{cdr}\r\nactive_conns:{ac}\r\nmax_conns:{mc}\r\nconns_shed_total:{cs}\r\nwrite_stopped:{wst}\r\ndelayed_write_rate:{dwr}\r\nwrite_stall_readable:{wsr}\r\nl0_files:{l0f}\r\npending_compaction_bytes:{pcb}\r\ncompaction_readable:{cr}\r\ndisk_free_bytes:{dfb}\r\ndisk_total_bytes:{dtb}\r\ndisk_free_pct:{dfp}\r\ndisk_verdict:{dv}\r\ndisk_unknown_samples:{dus}\r\ngc_swept_expired:{gse}\r\ngc_swept_orphans:{gso}\r\nuptime_ms:{upms}\r\n",
+        "role:{}\r\nrole_epoch:{role_epoch}\r\nbuild:{build}\r\nsst_bytes:{sst}\r\nlatest_seq:{latest}\r\nlast_applied:{last_applied}\r\nacked_seq:{}\r\nseq_lag:{seq_lag}\r\nwal_headroom_seq:{whs}\r\nwal_min_acked_seq:{wma}\r\nwal_headroom_shed_seq:{whl}\r\nlive_replicas:{}\r\nlag_ms:{}\r\nlag_ms_max:{lmx}\r\nlag_max_gap:{lmg}\r\nlag_soft_ms:{soft}\r\nlag_hard_ms:{hard}\r\nmin_replicas_to_write:{minr}\r\nwidowed_grace_ms:{wgm}\r\nwidowed_shed:{wsh}\r\nfullsync_active:{fsa}\r\nfullsync_max:{fsm}\r\nasync_write_queue:{aqd}\r\nwrite_deadline_ms:{wdm}\r\nwrite_inflight:{wif}\r\nwrite_service_us:{wsu}\r\nwrite_wait_est_ms:{wwe}\r\nwrites_shed_deadline:{wsd}\r\nwrites_shed_lag:{wsl}\r\nwrites_shed_quorum:{wsq}\r\nwrites_shed_widowed:{wswd}\r\nwrites_shed_headroom:{wshr}\r\nwrites_delayed_soft:{wdsf}\r\nwal_fsync_ms:{wfm}\r\nwal_fsync_total:{wft}\r\ncert_days_remaining:{cdr}\r\nactive_conns:{ac}\r\nmax_conns:{mc}\r\nconns_shed_total:{cs}\r\nwrite_stopped:{wst}\r\ndelayed_write_rate:{dwr}\r\nwrite_stall_readable:{wsr}\r\nl0_files:{l0f}\r\npending_compaction_bytes:{pcb}\r\ncompaction_readable:{cr}\r\ndisk_free_bytes:{dfb}\r\ndisk_total_bytes:{dtb}\r\ndisk_free_pct:{dfp}\r\ndisk_verdict:{dv}\r\ndisk_unknown_samples:{dus}\r\nevictable_ns:{ens}\r\nevictable_ns_agree:{ensa}\r\ngc_swept_expired:{gse}\r\ngc_swept_orphans:{gso}\r\nuptime_ms:{upms}\r\n",
         if read_only { "replica" } else { "master" },
         hub.effective_acked(now)
             .map_or_else(|| "none".into(), |a| a.to_string()),
@@ -3382,6 +3531,12 @@ fn flintinfo(
             .map_or_else(|| "none".into(), |l| l.to_string()),
         soft = hub.lag_soft_ms(),
         hard = hub.lag_hard_ms(),
+        // ADR-0023 D7.1. Reported even while nothing evicts, because the
+        // operator-visible question is "does this pair agree", and a value
+        // nobody can read cannot be compared. -1 means not yet known, which
+        // is deliberately distinct from 0 (a real mismatch).
+        ens = evictable_ns_joined(),
+        ensa = EVICTABLE_AGREE.load(Ordering::Relaxed),
         // ADR-0022. Exported because the shed threshold is expressed in
         // SEQUENCES while RocksDB budgets BYTES: an operator can only pick a
         // sane threshold by watching what their own workload actually does.
@@ -4738,5 +4893,68 @@ mod accepted_flags {
                 "{f} is passed by drills in tools/ but would be REFUSED"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod evictable_ns_config {
+    #[cfg(feature = "rocks")]
+    use super::find_info_field;
+    use super::parse_evictable_ns;
+
+    /// Two seats given the same namespaces in a different order must compare
+    /// EQUAL, or the pair-agreement check reports a mismatch that is not one —
+    /// a false alarm about divergent policy is worse than no alarm, because it
+    /// trains an operator to ignore the real one.
+    #[test]
+    fn the_canonical_form_is_order_and_whitespace_independent() {
+        assert_eq!(
+            parse_evictable_ns(" beta, alpha ,beta,"),
+            parse_evictable_ns("alpha,beta")
+        );
+        assert_eq!(parse_evictable_ns("alpha,beta"), vec!["alpha", "beta"]);
+        assert!(parse_evictable_ns("").is_empty());
+        assert!(parse_evictable_ns("  , ,").is_empty());
+    }
+
+    /// ABSENT and EMPTY are different answers. A peer that predates this field
+    /// cannot be compared; a peer that answered with no evictable namespaces
+    /// can. Collapsing them would report agreement with a seat that never
+    /// answered the question.
+    #[test]
+    #[cfg(feature = "rocks")]
+    fn an_absent_field_is_not_an_empty_one() {
+        let with = b"role:master\r\nevictable_ns:cache\r\nuptime_ms:5\r\n";
+        let empty = b"role:master\r\nevictable_ns:\r\nuptime_ms:5\r\n";
+        let without = b"role:master\r\nuptime_ms:5\r\n";
+        assert_eq!(
+            find_info_field(with, "evictable_ns").as_deref(),
+            Some("cache")
+        );
+        assert_eq!(find_info_field(empty, "evictable_ns").as_deref(), Some(""));
+        assert_eq!(find_info_field(without, "evictable_ns"), None);
+    }
+
+    /// The substring trap, as a test. FLINTINFO carries `writes_shed_lag`,
+    /// `lag_ms` and `lag_hard_ms`; an unanchored search for `lag` would match
+    /// inside the first. Four separate defects in this repository have been
+    /// exactly this shape — argv matching its own pattern, `i-` matching
+    /// inside `ami-`, `$B` matching inside `$BK`, `flint-server` matching
+    /// inside `flint-server/rocks`.
+    #[test]
+    #[cfg(feature = "rocks")]
+    fn a_field_name_is_not_matched_as_a_substring_of_another() {
+        let info = b"writes_shed_lag:9\r\nlag_ms:3\r\nlag_hard_ms:1000\r\n";
+        assert_eq!(find_info_field(info, "lag_ms").as_deref(), Some("3"));
+        assert_eq!(
+            find_info_field(info, "lag_hard_ms").as_deref(),
+            Some("1000")
+        );
+        assert_eq!(
+            find_info_field(info, "writes_shed_lag").as_deref(),
+            Some("9")
+        );
+        // `shed_lag` is a suffix of a real field and must NOT resolve.
+        assert_eq!(find_info_field(info, "shed_lag"), None);
     }
 }
