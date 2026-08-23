@@ -222,6 +222,54 @@ So the state is: the warm is landed and gated, justified by the reproducible
 10x first-exec cost, and its effect on the local clean rate is still
 UNMEASURED. That is the one open question and it needs a quiet box.
 
+### The measurement finally ran, and it cannot answer the question
+
+Third harness. Counters verified independent before use. Result:
+
+    warm 6P/0F/0R    ctrl 6P/0F/0R
+
+**12 of 12 clean, both arms, zero refusals.** Valid data, and it says nothing
+about the warm — because the failure never happened in the CONTROL arm. Six
+runs with the mitigation disabled all passed, so there was nothing for the
+mitigation to prevent.
+
+**The flake did not reproduce tonight on a quiet box.** That is the finding,
+and it is about the box rather than about the fix. Against a historical 6-of-20
+it is a large swing, and the one variable that plainly differs is that nothing
+else was running: the earlier A/B attempt was refused twelve times for sibling
+contention, and by the time this one ran the sibling was gone.
+
+That does NOT resolve to "contention is the trigger". This file already
+excludes load average with evidence — 15 failures at load 2.5-3.0 and a clean
+117/0 at load rising to 8.04 — and a quiet box differs from a loaded one in
+more ways than load average. What it does say is that **the failure cannot be
+summoned on demand, so a null result from any A/B is uninformative unless the
+control arm actually fails.**
+
+**The next attempt needs the control arm to break.** Measuring a mitigation
+against conditions where the fault does not occur is the same error as a
+positive control that cannot arm, one level out: the experiment is well-formed
+and the situation is not.
+
+### Three harnesses, three outputs that read as results
+
+Worth recording, because each was published-shaped:
+
+1. `0/6 vs 0/6` — twelve `fleet_guard` refusals; the counter collapsed DECLINED
+   TO RUN into RAN AND FAILED. Zero samples, reads as "the warm does nothing".
+2. `6/6 vs 6/6` — `declare -A` is unsupported on macOS bash 3.2, so `pass[warm]`
+   and `pass[ctrl]` both index 0. **One counter behind two names.** Reads as
+   perfect agreement between arms, which is more convincing than either arm
+   alone.
+3. Summary printed empty — a patch whose later replacements silently no-opped
+   because only the FIRST was asserted. The loop data was correct and the
+   report was not.
+
+Number 2 is a variant worth naming separately from the family entry in
+`field-notes.md`: not a value that could only be one thing, but **two values
+that could not differ**. Agreement between arms is the shape people trust most,
+and it is exactly what an aliasing bug produces.
+
 ## Where to start
 
 **Steps 1-3 below are STALE.** They were written for the "the seat is fine and
