@@ -192,3 +192,66 @@ The last published write number, `51,191 ops/s` for a 32-minute pipelined
 ingest (rc.6, July), was measured under exactly this stall. It has since been
 removed from the public site, but it was a headline figure for a month. A
 number produced by an untuned default is not a property of the product.
+
+## 2026-08-22 — measured at 24 M keys: the SLOWDOWN trigger is reached; the refill half is still not scoreable
+
+Two runs on a 16-vCPU gate box, 1 KB values, 120 x 200 000 keys per pass,
+sampling `l0_files` and `pending_compaction_bytes` every 20 rounds.
+
+### Run 1 was invalidated by its own corpus, and said so in its own output
+
+Values were 1024 repeated `x`. `sst_bytes` came back **2.17 GB for 24 GB
+logical** — an 11x compression ratio, sitting two lines under the logical size
+in the same verdict block. Every number in that run was correct; it measured a
+real engine doing real compaction, a tenth the size of the one it claimed.
+
+The corpus the symptom was seen with is specified **incompressible** on
+purpose, and that word is the whole reason. The drill now generates from
+base64-of-urandom and **asserts the ratio**: past 2x it prints a warning
+naming the discrepancy, so this cannot recur silently.
+
+### Run 2, incompressible (ratio 0.8x — the LSM is larger than the data)
+
+| | peak `l0_files` | `pending_compaction_bytes` | `write_stopped` |
+|---|---|---|---|
+| fresh fill | **22** | climbs monotonically to **55.4 GB** | 0 (readable=1) |
+| refill | 19 | 42.6 GB falling to 32.2 GB | 0 (readable=1) |
+
+**The slowdown trigger is reached by an ordinary fill.** `level0_slowdown_writes_trigger`
+is 20 and L0 peaked at 22 during the FRESH fill of 24 M keys — so RocksDB was
+throttling foreground writes on the shipped defaults, at a scale far below the
+100 M that produced the original symptom. Pending compaction debt climbing
+monotonically to 55 GB while L0 oscillates is the same picture from the other
+side: flushes outrunning compaction, with the backlog never worked off.
+
+`write_stopped: 0` with `stall_readable: 1` is a REAL zero — the hard stop at
+36 was never reached. That is precisely the distinction the 2026-08-19 run
+could not draw, and the reason the instrument was built.
+
+### The refill half is NOT scoreable, and the fault is the instrument again
+
+Rounds 60, 80 and 100 of the refill report **byte-identical**
+`pending_compaction_bytes=38891523380` with `l0_files=6`, across 24 M writes.
+Live metrics do not freeze like that. Either compaction had genuinely gone
+quiet, or **the writes stopped landing** — and this run cannot tell which,
+because the load was piped to `/dev/null` and no delivered-write count was
+kept.
+
+That is the same gap closed for BUG-0035 earlier the same day, in a drill that
+now reports delivered throughput on every run precisely so a zero cannot be
+read as a measurement. It was not carried into this experiment. The lesson did
+not travel with the person who learned it.
+
+So: the fresh-fill result stands, the refill comparison does not, and the
+refill comparison is the one the original symptom is about.
+
+### What settling it actually needs
+
+An LSM near the original scale. This one is 30 GB of SSTs against the ~120 GB
+that stalled, on a 60 GB volume that cannot hold more. The refill's cost is a
+function of how much of the LSM a rewrite touches, so a 4x smaller tree is not
+a smaller version of the same experiment — it may be below whatever threshold
+produces the behaviour at all.
+
+Next run needs: a larger volume, a delivered-write count per pass, and the
+server's own log kept rather than dying with the box.
