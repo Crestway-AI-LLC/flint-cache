@@ -126,6 +126,36 @@ fleet_init() {
   done
   printf '%s\n' "$$" > "$FLEET_LOCK/pid"
   ps -o lstart= -p "$$" > "$FLEET_LOCK/started" 2>/dev/null || true
+
+  # WARM THE BINARIES HERE, NOT IN EACH DRILL (BUG-0011).
+  #
+  # On macOS the FIRST exec of a freshly built binary pays kernel code-signature
+  # validation — Rust ad-hoc/linker-signs, and this one carries 2971 page hashes
+  # — and it is paid in the loader, before `main`. Measured on this box against
+  # six fresh copies of flint-server, timing `--build-version`, which exits
+  # before any server work:
+  #
+  #     first exec of a new inode : 23403 ms, 43472 ms, then ~360 ms
+  #     immediate repeat exec     : ~25 ms, every time
+  #
+  # The seat-startup budget is 10 s. A 23-43 s stall blows it outright and
+  # produces exactly the recorded signature: the process is ALIVE, it never
+  # answers PING, and `sample` shows 2935 of 2935 frames in `_dyld_start` with
+  # `main` never entered — because no code of ours has run. It is absent on
+  # Linux (gate.yml green 29 of its last 30) because there is no dyld and no
+  # AMFI, which is why 20 local runs at one commit were clean in only 6.
+  #
+  # `fleet_warm` was built for exactly this and says so in its own header. It
+  # was called by 8 drills of 111, and only 5 of those warmed the control-plane
+  # binary — which is the seat that fails. A mitigation that every drill must
+  # remember to invoke is one most drills will not have.
+  #
+  # So it moves to the one function all 113 callers already run, before any
+  # seat is spawned. After the first drill it costs ~25 ms per binary, and the
+  # first drill pays the real stall OUTSIDE any startup budget, which is the
+  # whole point.
+  fleet_warm ./target/release/flint-server ./target/release/flint-proxy \
+             ./target/release/flint-controlplane ./target/release/flint-controller
 }
 
 # Fleet processes belonging to ANOTHER Flint-family project, as "pid argv"
