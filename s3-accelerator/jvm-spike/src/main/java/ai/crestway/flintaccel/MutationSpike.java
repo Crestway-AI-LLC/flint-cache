@@ -180,7 +180,7 @@ public final class MutationSpike {
 
   public static void main(String[] args) throws Exception {
     endpoint = args.length > 0 ? args[0] : "http://127.0.0.1:9000";
-    String redis = args.length > 1 ? args[1] : "redis://127.0.0.1:6399";
+    String redis = args.length > 1 ? args[1] : "redis://127.0.0.1:9399";
     String bucket = "bucket", key = "data/000003.bin";
     boolean ok = true;
 

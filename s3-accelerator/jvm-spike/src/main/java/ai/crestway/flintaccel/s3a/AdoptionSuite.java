@@ -40,7 +40,7 @@ public final class AdoptionSuite {
 
   public static void main(String[] a) throws Exception {
     String ep = a.length > 0 ? a[0] : "http://127.0.0.1:9000";
-    String tier = a.length > 1 ? a[1] : "redis://127.0.0.1:6399";
+    String tier = a.length > 1 ? a[1] : "redis://127.0.0.1:9399";
     String key = "data/000003.bin";
 
     // ---------- Path B: fs.s3a.impl (any Hadoop version) ----------

@@ -60,7 +60,7 @@ public final class SseCSuite {
 
   public static void main(String[] a) throws Exception {
     String ep = a.length > 0 ? a[0] : "http://127.0.0.1:9000";
-    String tier = a.length > 1 ? a[1] : "redis://127.0.0.1:6399";
+    String tier = a.length > 1 ? a[1] : "redis://127.0.0.1:9399";
     String key = "data/000007.bin";
     // a 32-byte AES key, base64, as S3A expects
     String k64 = Base64.getEncoder().encodeToString(new byte[32]);

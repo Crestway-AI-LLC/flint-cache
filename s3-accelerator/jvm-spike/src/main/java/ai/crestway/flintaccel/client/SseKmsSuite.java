@@ -56,7 +56,7 @@ public final class SseKmsSuite {
     // arg0 = a KMS-reporting origin, arg1 = a plain one, arg2 = tier
     String kmsEp   = args.length > 0 ? args[0] : "http://127.0.0.1:9530";
     String plainEp = args.length > 1 ? args[1] : "http://127.0.0.1:9531";
-    String tierUri = args.length > 2 ? args[2] : "redis://127.0.0.1:6399";
+    String tierUri = args.length > 2 ? args[2] : "redis://127.0.0.1:9399";
     Suite.endpoint = kmsEp;
 
     RedisClient rc = RedisClient.create(tierUri);

@@ -29,7 +29,7 @@ public class FlintContract extends AbstractFSContract {
   public static final String ENDPOINT =
       System.getProperty("flint.test.endpoint", "http://127.0.0.1:9000");
   public static final String TIER =
-      System.getProperty("flint.test.tier", "redis://127.0.0.1:6399");
+      System.getProperty("flint.test.tier", "redis://127.0.0.1:9399");
   public static final String BUCKET =
       System.getProperty("flint.test.bucket", "bucket");
 

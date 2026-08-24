@@ -9,7 +9,7 @@ on every request and THEN goes to the origin, so the cache adds latency to
 every read instead of removing it. A sick cache is worse than no cache, and
 nothing in the suites could produce that condition.
 
-  tools/slow_tier.py --listen 6398 --upstream 6399 --delay-ms 200
+  tools/slow_tier.py --listen 9398 --upstream 9399 --delay-ms 200
 
 --drop makes it accept connections and never answer, which is the pathological
 version: the client cannot even learn that anything is wrong except by timing
@@ -80,8 +80,8 @@ def _serve(listen: int, upstream: int, delay_s: float, drop: bool):
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--listen", type=int, default=6398)
-    ap.add_argument("--upstream", type=int, default=6399)
+    ap.add_argument("--listen", type=int, default=9398)
+    ap.add_argument("--upstream", type=int, default=9399)
     ap.add_argument("--delay-ms", type=float, default=200.0)
     ap.add_argument("--drop", action="store_true",
                     help="accept and never answer")

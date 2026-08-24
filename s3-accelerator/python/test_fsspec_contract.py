@@ -40,7 +40,7 @@ from fsspec.tests.abstract import (  # noqa: E402
 # So: counting_s3 for economics, moto for correctness. Each instrument used
 # for the question it can answer.
 ENDPOINT = os.environ.get("FLINT_TEST_ENDPOINT", "http://127.0.0.1:9810")
-TIER = os.environ.get("FLINT_TEST_TIER", "redis://127.0.0.1:6399")
+TIER = os.environ.get("FLINT_TEST_TIER", "redis://127.0.0.1:9399")
 BUCKET = os.environ.get("FLINT_TEST_BUCKET", "bucket")
 
 
