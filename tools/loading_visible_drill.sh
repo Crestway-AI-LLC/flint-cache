@@ -32,11 +32,12 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init $FLINT_DRILL_ROOT/flint-loading 6463 6464
+# 6958/6959: main gave 6460-6467 to proxy_chain after this branch diverged.
+fleet_init $FLINT_DRILL_ROOT/flint-loading 6958 6959
 fleet_guard
 B=./target/release/flint-server
 D=$FLINT_DRILL_ROOT/flint-loading; rm -rf "$D"; mkdir -p "$D"
-MPORT=6463; RPORT=6464
+MPORT=6958; RPORT=6959
 fleet_kill server; sleep 0.3
 cleanup() { fleet_kill server; rm -rf "$D"; }
 trap cleanup EXIT

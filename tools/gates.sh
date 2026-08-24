@@ -336,6 +336,34 @@ GATE_JOBS="${FLINT_GATE_JOBS:-1}"
 case "$GATE_JOBS" in ''|*[!0-9]*) echo "FLINT_GATE_JOBS must be a positive integer, got '$GATE_JOBS'"; exit 2 ;; esac
 [ "$GATE_JOBS" -ge 1 ] || { echo "FLINT_GATE_JOBS must be >= 1, got $GATE_JOBS"; exit 2; }
 
+# NO TWO DRILLS MAY DECLARE THE SAME PORT.
+#
+# Written after this bit twice in one afternoon. Both loaded_promote (6460/61)
+# and loading_visible (6463/64) arrived from a branch that predated main giving
+# 6460-6467 to proxy_chain, and both would have collided. A shared port is a
+# startup failure in whichever drill loses the race, reported against the
+# product rather than the clash — and serially it may not surface at all,
+# because the drills have to overlap for it to bite.
+#
+# A drill declaring its OWN port twice is legal: controller_ha does, harmlessly,
+# because ownership is not ambiguous.
+assert_no_duplicate_drill_ports() {
+  local drill d bad
+  bad=$(for drill in tools/*_drill.sh; do
+    d=$(basename "$drill" _drill.sh)
+    sed -e :a -e '/\\$/N; s/\\\n//; ta' "$drill" 2>/dev/null \
+      | grep -oE 'fleet_init [^;&|]+' | grep -oE '\b[0-9]{4,5}\b' | sort -u \
+      | while read -r p; do printf '%s %s\n' "$p" "$d"; done
+  done | sort -n | awk '{c[$1]=c[$1]" "$2} END {for (p in c) {n=split(c[p],a," "); if (n>1) print "    port "p" declared by"c[p]}}')
+  if [ -n "$bad" ]; then
+    echo "GATES FAILED: two drills declare the same port:"
+    printf '%s\n' "$bad"
+    echo "      A shared port is a startup failure in whichever drill loses,"
+    echo "      reported as a product defect. Give one of them a free port."
+    exit 1
+  fi
+}
+
 # NO DRILL MAY CARRY A KILL PATTERN THAT REACHES ANOTHER DRILL.
 #
 # `pkill -9 -f "flint-server --port 67"` is a substring match, so it kills
@@ -1149,6 +1177,7 @@ if want drills; then
   assert_drill_build_is_checked
   assert_no_continuation_splice
   assert_no_cross_drill_kill_patterns
+  assert_no_duplicate_drill_ports
   LEAKCHECK=1
   run_core_drills
   LEAKCHECK=
