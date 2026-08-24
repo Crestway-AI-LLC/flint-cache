@@ -150,7 +150,7 @@ Four of the ten checked against main's CODE rather than its commit subjects:
 |---|---|
 | `643d12e` controller convergence equality | **CONFIRMED LIVE on main** (`flint-controller/src/main.rs:635`), and the gate it feeds is at :800. Filed as **BUG-0045**, severity HIGH — a pair under write load can refuse to promote a healthy replica and stay write-dead. |
 | `28a0aa8` FLINTSYNC WAL reachability | **ALREADY FIXED on main** (`flint-server/src/main.rs:3859` carries the exact `updates_since_budgeted(cursor, 1)` guard). Not missing. Do not re-land. |
-| `775911c` a syncing node must not be dark | **NOT ESTABLISHED.** `loading:` and `wait_for_ready` are absent from main, but main opens its listener BEFORE it starts tailing, so a node is not dark in the ordinary case. Whether the FULL-SYNC path differs is unchecked. |
+| `775911c` a syncing node must not be dark | **CONFIRMED LIVE, and worse than the commit claims.** The full-sync path DOES differ: `flint-server/src/main.rs:1105` blocks before the bind at :1870. Its consequence is BUG-0046 — a managed controller wipes and restarts the transfer every ~20 s, so a replica that cannot sync inside that window never syncs at all. |
 | `e150289` configurable WAL retention | **PARTIALLY SUPERSEDED.** The env knobs are absent, but main threads `wal_ttl_seconds`/`wal_size_limit_mb` as parameters through `open_with_wal`, so the window IS configurable by a different route. Only the env-var spelling is missing. |
 
 One confirmed live defect, one already fixed, one unestablished, one
