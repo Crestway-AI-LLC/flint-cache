@@ -1321,8 +1321,32 @@ PY_INNER
   exit 1
 }
 
+# The predicate, factored out of the loop so it can be PROVED rather than
+# trusted. This check reports nothing when it is working and nothing when it is
+# broken, and it has been broken before: a stray edit once routed its input
+# through df's output, so it could not flag anything and said nothing for two
+# days. A guard whose silence is indistinguishable from its success is not a
+# guard.
+_drill_drops_rocks() {   # joined drill text on stdin; rc 0 = rebuilds without rocks
+  grep 'cargo build.*-p flint-server' | grep -qv 'rocks'
+}
+
 assert_drill_builds_keep_rocks() {
   local bad=""
+  # POSITIVE CONTROL, both directions, before scanning anything.
+  printf '%s\n' 'cargo build --release -q -p flint-server' | _drill_drops_rocks || {
+    echo "GATES FAILED: assert_drill_builds_keep_rocks did not flag a build line"
+    echo "      that plainly drops rocks. The check is broken; its silence on"
+    echo "      the real drills would mean nothing. Refusing to report."
+    exit 1
+  }
+  printf '%s\n' 'cargo build --release -q -p flint-server --features flint-server/rocks' \
+    | _drill_drops_rocks && {
+    echo "GATES FAILED: assert_drill_builds_keep_rocks flagged a build line that"
+    echo "      DOES keep rocks. The check is broken in the other direction and"
+    echo "      would fail healthy drills. Refusing to report."
+    exit 1
+  }
   for f in tools/*_drill.sh; do
     # Strip whole-line comments BEFORE matching, then join backslash
     # continuations — most of these build lines wrap. Without the strip,
@@ -1334,8 +1358,7 @@ assert_drill_builds_keep_rocks() {
     # `--features rocks` and `--features flint-server/rocks` are equivalent
     # when -p flint-server is the selected package, and drills use both.
     # The rule is simply: if it rebuilds flint-server, it must say rocks.
-    echo "$joined" | grep 'cargo build.*-p flint-server' | grep -qv 'rocks' \
-      && bad="$bad $f"
+    printf '%s\n' "$joined" | _drill_drops_rocks && bad="$bad $f"
   done
   [ -z "$bad" ] && return 0
   echo "GATES FAILED: drill(s) rebuild flint-server WITHOUT flint-server/rocks:"
