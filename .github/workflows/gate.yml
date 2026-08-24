@@ -44,6 +44,17 @@ on:
           rather than assumed.
         required: false
         default: "6"
+      core_order:
+        description: >-
+          Override FLINT_CORE_ORDER with a space-separated drill list, for a
+          TARGETED experiment instead of a 12-minute full gate. Empty = the
+          full CORE list, which is the only thing that should ever run on a
+          push. Exists because contention hypotheses have to be tested on the
+          machine that has the contention: this runner is 4 vCPU, so P=6 is
+          1.5 drills/core, and a developer laptop with 8 cores cannot
+          reproduce that condition however carefully the run is set up.
+        required: false
+        default: ""
 
 jobs:
   gate:
@@ -74,6 +85,10 @@ jobs:
       # Overridable per manual run, which is also the rollback: dispatch with
       # gate_jobs=1 to get the old serial gate back without touching a file.
       FLINT_GATE_JOBS: ${{ inputs.gate_jobs || '6' }}
+      # Empty on push/PR, so the full CORE list runs. gates.sh reads
+      # FLINT_CORE_ORDER with the full list as its default, and an empty
+      # string is falsy there, so this is inert unless a dispatch sets it.
+      FLINT_CORE_ORDER: ${{ inputs.core_order || '' }}
       # In CI a skipped drill is a failed drill. See tools/gates.sh — locally
       # a skip is correct (no mkfs.ext4 on macOS), here it silently deletes
       # coverage from a run someone is about to trust.
