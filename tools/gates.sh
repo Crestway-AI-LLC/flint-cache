@@ -346,8 +346,20 @@ _foreign_seats() {  # <drill-name>
 # the core count and says when it is oversubscribed, so the trade is visible in
 # the log rather than assumed — and a runner that silently changes shape shows
 # up as a changed ratio instead of as unexplained flakiness.
+# PERFORMANCE cores, not logical ones. On Apple silicon hw.ncpu counts
+# efficiency cores that run a drill at roughly a third of the speed, so an M2
+# reports 8 where only 4 are fast. Taking that number makes `auto` pick P=8,
+# and — worse — makes the ratio line below compute 8/8 = 1.0 and stay SILENT,
+# when the honest ratio against cores that can run a drill at speed is 2.0.
+# That is beyond the 1.5 where saturation was already measured: the warning
+# would go quiet exactly where oversubscription is worst.
+#
+# hw.perflevel0.logicalcpu is the P-core count and is absent on Linux and on
+# Intel Macs, so the fallback chain covers every box we run on.
 _gate_cores() {
-  if command -v nproc >/dev/null 2>&1; then nproc
+  if sysctl -n hw.perflevel0.logicalcpu >/dev/null 2>&1; then
+    sysctl -n hw.perflevel0.logicalcpu
+  elif command -v nproc >/dev/null 2>&1; then nproc
   elif command -v sysctl >/dev/null 2>&1; then sysctl -n hw.ncpu 2>/dev/null || echo 1
   else echo 1; fi
 }
