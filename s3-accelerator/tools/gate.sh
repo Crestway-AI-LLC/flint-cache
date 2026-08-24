@@ -196,6 +196,23 @@ run_bounded java -cp "$ROOT/jvm-spike/target/classes:$CP" \
     ai.crestway.flintaccel.s3a.SseKmsPathsSuite \
     http://127.0.0.1:9308 redis://127.0.0.1:6399 >/tmp/gate_kmspaths.log 2>&1
 verdict "SSE-KMS on all 3 adoption paths (7 checks)" $?
+
+# The counters, read the way an OPERATOR reads them -- through the platform
+# MBeanServer by object name, never from the reference we registered. Sixteen
+# counters existed and nothing surfaced them, so a customer could install this
+# and have no way to answer "is it working?" -- and the two
+# silent-zero-acceleration cases (an SSE-KMS bucket, a sick tier) were
+# invisible by construction.
+python3 tools/counting_s3.py --port 9311 --objects 4 --object-bytes 1048576 \
+    >/tmp/gate_origin_9311.log 2>&1 &
+PIDS+=($!)
+sleep 2
+"$TIER_CLI" -p 6399 flushall >/dev/null 2>&1
+run_bounded java -cp "$ROOT/jvm-spike/target/classes:$CP" \
+    ai.crestway.flintaccel.client.MetricsSuite \
+    http://127.0.0.1:9311 http://127.0.0.1:9308 redis://127.0.0.1:6399 \
+    >/tmp/gate_metrics.log 2>&1
+verdict "JMX metrics, read via MBeanServer (13 checks)" $?
 stop_origin
 
 # A SICK tier -- one that answers slowly rather than dying -- used to make

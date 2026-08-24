@@ -134,7 +134,7 @@ public final class Suite {
     conn.sync().flushall();
 
     try (var sdk = new S3SdkObjectClient(s3, false)) {
-      var c = new FlintObjectClient(sdk, conn.async(), 64 * 1024, 50, 2);
+      var c = new FlintObjectClient(sdk, conn.async(), 64 * 1024, 50, 2, false, s3, false);
 
       // 1. cold + warm, bytes verified
       String k = "data/000001.bin";
@@ -226,7 +226,7 @@ public final class Suite {
       stat("/__reset");
       conn.sync().flushall();
       String k6 = "data/000006.bin";
-      var bypassing = new FlintObjectClient(sdk, conn.async(), 64 * 1024, 50, 2, true);
+      var bypassing = new FlintObjectClient(sdk, conn.async(), 64 * 1024, 50, 2, true, s3, false);
       byte[] enc = read(bypassing, k6, 300_000, 8192);
       check(genOf(k6, 300_000, enc) == 0, "bypassing client still returns correct bytes");
       long keysAfterBypass = conn.sync().dbsize();

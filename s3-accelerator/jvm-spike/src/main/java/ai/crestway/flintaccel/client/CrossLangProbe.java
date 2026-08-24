@@ -34,7 +34,7 @@ public final class CrossLangProbe {
     StatefulRedisConnection<byte[], byte[]> cn = rc.connect(new ByteArrayCodec());
 
     try (var sdk = new S3SdkObjectClient(s3, false)) {
-      var c = new FlintObjectClient(sdk, cn.async(), 64 * 1024, 50, 2);
+      var c = new FlintObjectClient(sdk, cn.async(), 64 * 1024, 50, 2, false, s3, false);
       try (var f = new S3SeekableInputStreamFactory(c, S3SeekableInputStreamConfiguration.DEFAULT);
            var in = f.createStream(S3URI.of(bucket, key))) {
         byte[] b = new byte[len];

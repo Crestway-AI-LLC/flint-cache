@@ -116,6 +116,12 @@ public final class FlintObjectClient implements ObjectClient {
   private final AtomicLong openUntilNanos = new AtomicLong();
   private final AtomicLong cooldownMs = new AtomicLong(BREAKER_BASE_MS);
 
+  /** Whether the breaker is currently open. For metrics; does not probe. */
+  public boolean isBreakerOpen() {
+    long until = openUntilNanos.get();
+    return until != 0 && System.nanoTime() < until;
+  }
+
   /** True when the tier should be skipped entirely right now. */
   private boolean breakerOpen() {
     long until = openUntilNanos.get();
@@ -167,6 +173,19 @@ public final class FlintObjectClient implements ObjectClient {
   private final S3AsyncClient raw;
   private final Map<String, Boolean> kmsSeen = new ConcurrentHashMap<>();
 
+  /**
+   * REDUCED CAPABILITY, and not the production path.
+   *
+   * Without an S3AsyncClient this client cannot determine whether an object is
+   * SSE-KMS encrypted, so it caches NO metadata at all: writing an unverified
+   * "not encrypted" is worse than writing nothing, because a client that CAN
+   * check would then read and trust it. The consequence is that this overload
+   * also forfeits D3's metadata saving and its staleness window -- which the
+   * suites discovered by failing, not by being told.
+   *
+   * TierSupport always supplies the handle, so every adoption path has the
+   * full behaviour. These overloads exist for direct construction in tests.
+   */
   public FlintObjectClient(ObjectClient origin, RedisAsyncCommands<byte[], byte[]> tier,
                            int chunkBytes, long tierBudgetMs, long metaTtlSec) {
     this(origin, tier, chunkBytes, tierBudgetMs, metaTtlSec, false);
@@ -296,7 +315,12 @@ public final class FlintObjectClient implements ObjectClient {
    * age out under eviction.
    */
   private byte[] chunkKey(String etag, long id) { return utf8("c1/" + norm(etag) + "/" + id); }
-  private byte[] metaKey(Object uri) { return utf8("m/" + uri); }
+  /**
+   * Versioned like the chunk prefix, and for the same reason: the value now
+   * carries a third field and a mixed fleet must not read one format as the
+   * other. See chunkKey.
+   */
+  private byte[] metaKey(Object uri) { return utf8("m1/" + uri); }
 
   /** Bound every tier call and turn any failure into "no cache". */
   private <T> CompletableFuture<T> guarded(Supplier<CompletableFuture<T>> op) {
@@ -335,12 +359,22 @@ public final class FlintObjectClient implements ObjectClient {
         .thenCompose(v -> {
           if (v != null) {
             String s = new String(v, java.nio.charset.StandardCharsets.UTF_8);
-            int bar = s.indexOf('|');
-            if (bar > 0) {
+            // length|etag|kms. The third field is load-bearing: kmsSeen used to
+            // be populated ONLY by our own HEAD, so an object whose metadata
+            // came from the tier skipped detection entirely and was treated as
+            // unencrypted. That made the SSE-KMS rule depend on which client
+            // happened to populate the metadata first -- a client that could
+            // not detect (no SDK handle) poisoned the entry for every client
+            // that could. Carrying the answer with the metadata removes the
+            // ordering dependence rather than documenting it.
+            int b1 = s.indexOf('|');
+            int b2 = b1 < 0 ? -1 : s.indexOf('|', b1 + 1);
+            if (b1 > 0 && b2 > b1) {
               metaHits.incrementAndGet();
+              kmsSeen.put(String.valueOf(r.getS3Uri()), "1".equals(s.substring(b2 + 1)));
               return CompletableFuture.completedFuture(ObjectMetadata.builder()
-                  .contentLength(Long.parseLong(s.substring(0, bar)))
-                  .etag(s.substring(bar + 1)).build());
+                  .contentLength(Long.parseLong(s.substring(0, b1)))
+                  .etag(s.substring(b1 + 1, b2)).build());
             }
           }
           metaMisses.incrementAndGet();
@@ -351,10 +385,9 @@ public final class FlintObjectClient implements ObjectClient {
             // and "we checked and it was fine" must not look the same.
             kmsUndetectable.incrementAndGet();
             return origin.headObject(r).thenApply(m -> {
-              try {
-                tier.setex(metaKey(r.getS3Uri()), metaTtlSec,
-                    utf8(m.getContentLength() + "|" + m.getEtag()));
-              } catch (RuntimeException e) { tierFailures.incrementAndGet(); }
+              // No SDK handle means we could not check, so nothing is written:
+              // caching "kms=0" that we never verified is worse than caching
+              // nothing, because a client that CAN check would then trust it.
               return m;
             });
           }
@@ -380,7 +413,7 @@ public final class FlintObjectClient implements ObjectClient {
           }
           try {
             tier.setex(metaKey(r.getS3Uri()), metaTtlSec,
-                utf8(m.getContentLength() + "|" + m.getEtag()));
+                utf8(m.getContentLength() + "|" + m.getEtag() + "|" + (kms ? "1" : "0")));
           } catch (RuntimeException e) { tierFailures.incrementAndGet(); }
           return m;
         })

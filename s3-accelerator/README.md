@@ -136,6 +136,55 @@ the budget. The tier is an optimisation and is written as one.
 
 ---
 
+## Is it working?
+
+Every counter is exposed over **JMX** under `ai.crestway.flintaccel:type=Cache,*`.
+No dependency is added to do it — `javax.management` is in the JDK, and the JMX
+exporters Spark and Prometheus deployments already run will scrape it with no
+code from you.
+
+The one attribute to look at first is `Summary`:
+
+```
+flint-accel: 94.2% hit rate, 18104 hits / 1113 misses, 214 origin GETs, 806 MiB from S3
+```
+
+It only mentions a failure mode when one is happening, so a clean line means a
+clean cache. When something *is* wrong, it says which and what to do:
+
+```
+flint-accel: no chunk reads yet, 12 origin GETs, 0 MiB from S3; 12 reads BYPASSED
+(SSE-KMS, off by default -- set flint.cache.sse-kms=true to accelerate them)
+```
+
+```
+flint-accel: 3.1% hit rate, 44 hits / 1372 misses, 1372 origin GETs, 5.3 GiB from S3;
+breaker OPEN after 9 opens (the tier is sick)
+```
+
+Those two lines exist because both are **silent** otherwise: an SSE-KMS bucket
+and a sick tier both produce correct, unaccelerated reads with nothing to look
+at. "The cache does nothing" is the symptom for both, and they need opposite
+responses.
+
+Other attributes worth alerting on:
+
+| Attribute | Meaning |
+|---|---|
+| `ChunkHitRatePercent` | the headline. `NaN` means no reads yet — not a 0% cache |
+| `SseKmsBypassed` | reads skipped because the object is KMS-encrypted |
+| `SseKmsUndetectable` | objects whose encryption could not be determined and were cached anyway — the exact size of the hole in that guarantee |
+| `BreakerOpens` | non-zero means the tier has been sick |
+| `IntegrityFailures` | non-zero means the tier is corrupting or misplacing data |
+| `DegradedReads` | reads that fell through to S3 because the tier was unusable |
+
+Python exposes the same counters as a dict on the filesystem object:
+
+```python
+fs = fsspec.filesystem("s3")
+print(fs.counters)   # chunk_hits, chunk_misses, kms_bypassed, ...
+```
+
 ## What is verified
 
 ```bash

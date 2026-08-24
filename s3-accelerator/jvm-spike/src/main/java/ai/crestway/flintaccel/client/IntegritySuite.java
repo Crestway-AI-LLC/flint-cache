@@ -95,7 +95,7 @@ public final class IntegritySuite {
     final int LEN = 200_000;            // spans chunks 0..3
 
     try (var sdk = new S3SdkObjectClient(s3, false)) {
-      var c = new FlintObjectClient(sdk, conn.async(), CHUNK, 50, 2);
+      var c = new FlintObjectClient(sdk, conn.async(), CHUNK, 50, 2, false, s3, false);
 
       // ---------------------------------------------------------------- 0
       // Positive control. Without this, every check below could pass because
