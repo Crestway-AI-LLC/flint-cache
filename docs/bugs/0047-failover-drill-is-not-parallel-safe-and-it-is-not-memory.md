@@ -1,6 +1,8 @@
 # BUG-0047 — failover_drill is not parallel-safe, and it is not the OOM killer
 
-**Status:** OPEN. The measurement `tools/gates.sh` asked for has now been taken.
+**Status:** FIXED 2026-08-24, confirmed by experiment. The measurement
+`tools/gates.sh` asked for has been taken, and the OOM hypothesis it named is
+disproven.
 
 ## Why this matters
 
@@ -109,3 +111,31 @@ scope the harness is told about should be the scope actually used.
 Whether it is *sufficient* is decided by re-running the gate at
 `gate_jobs=3`. If failover still fails, the cause is elsewhere and this bug
 stays open with one more candidate eliminated.
+
+## Confirmed
+
+The scope alignment was sufficient. Same branch, same runner, `gate_jobs=3`:
+
+| run | wall clock | result | peak memory |
+|---|---|---|---|
+| serial (the rc.63 cut) | **31m15s** | green | not sampled |
+| P=3, before the fix | ~16m | **1 fail** (`failover`) | 1926 / 15989 MB |
+| P=3, after the fix | **16m09s** | **109 pass / 0 fail** | 1888 / 15989 MB |
+
+`failover` now reads `PASS (5s)` in parallel — identical to serial.
+
+So the cause was structural, not resource: a seat started outside fleet.sh's
+tracking, in a directory the drill had never declared, recognisable only by
+port. Nothing about memory, and nothing about the product.
+
+**The gate is 1.93x faster and green.** Memory sits at 12% of the box, so the
+job count is nowhere near its ceiling — the floor is `ns_escape` at 365s, about
+6 minutes, whatever P is. A P=6 run is queued to find where the curve flattens.
+
+## Before flipping the default
+
+`gates.sh` asks for "a parallel run green for a while", and one green run is
+not a while. The knob is dispatchable so that bar can be met with evidence
+rather than argued about. The remaining four scope mismatches should be
+aligned first, and then the durable form of this whole bug is one assertion:
+**a drill's data dirs must live under a scope it declares.**
