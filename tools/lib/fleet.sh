@@ -403,12 +403,42 @@ fleet_wait_listen() {
 # Extra arguments ride through to valkey-cli (a TLS control plane needs
 # --tls --cacert ... to answer at all).
 fleet_wait_ping() {
+  # PONG ALONE STOPPED MEANING READY, SO THIS CHECKS BOTH.
+  #
+  # Before #176 a node did not bind its listener until its initial full sync
+  # finished, so PONG and "serving" were the same event and every caller here
+  # spelled "ready" as PONG because that was the only spelling available.
+  # #176 makes a node answer PING from INSIDE the sync — deliberately, so it is
+  # not mistaken for dead — which silently converted 50 callers of this
+  # function from "wait until ready" to "wait until alive", and everything
+  # after them began racing a node that answers data commands with -LOADING.
+  #
+  # Measured: promote_notice ran in exactly 10s across 18 consecutive gates,
+  # then 43s / 8s / 42s once #176 landed, failing on the third. That is what a
+  # race looks like from the outside.
+  #
+  # 775911c converted four drills to fleet_wait_ready and left the rest. The
+  # fix belongs here instead: restore what the callers already meant, at the
+  # one place they all go through. `loading:1` is the seat's own answer and
+  # only an explicit 1 counts, so a build without the field behaves exactly as
+  # it always did.
   local port="$1"; shift
   local deadline=$(( $(date +%s) + 30 ))
   while :; do
-    [ "$(valkey-cli -p "$port" "$@" PING 2>/dev/null)" = "PONG" ] && return 0
+    if [ "$(valkey-cli -p "$port" "$@" PING 2>/dev/null)" = "PONG" ] &&
+       ! valkey-cli -p "$port" "$@" FLINTINFO 2>/dev/null | tr -d '\r' |
+         grep -qx 'loading:1'; then
+      return 0
+    fi
     if [ "$(date +%s)" -ge "$deadline" ]; then
-      echo "FAIL: no PONG from 127.0.0.1:$port after 30s"
+      # Say WHICH of the two conditions was not met. "no PONG" against a node
+      # that is answering fine but still loading sends the reader to the wrong
+      # half of the problem.
+      if [ "$(valkey-cli -p "$port" "$@" PING 2>/dev/null)" = "PONG" ]; then
+        echo "FAIL: 127.0.0.1:$port answers PING but still reports loading:1 after 30s"
+      else
+        echo "FAIL: no PONG from 127.0.0.1:$port after 30s"
+      fi
       exit 1
     fi
     sleep 0.2
