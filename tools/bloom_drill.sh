@@ -42,7 +42,10 @@ ERROR=0.01
 PROBES=2000         # never-added items sampled for the vacuity control
 
 cleanup() {
-  pkill -9 -f "flint-server --port 640" 2>/dev/null
+  # fleet_kill, not a truncated pkill pattern: "--port 640" is a substring
+  # match that reaches ports this drill does not own.
+  # Scoped to the ports this drill declared to fleet_init.
+  fleet_kill server
   rm -rf "$MDIR" "$RDIR" "$DDIR"
 }
 trap cleanup EXIT

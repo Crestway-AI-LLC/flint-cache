@@ -16,7 +16,10 @@ declare -a A=(6500 6501) B=(6510 6511) C=(6520 6521)
 DIRS=()
 for p in 6500 6501 6510 6511 6520 6521; do DIRS+=("$FLINT_DRILL_ROOT/flint-mp-$p"); rm -rf "$FLINT_DRILL_ROOT/flint-mp-$p" "$FLINT_DRILL_ROOT/flint-mp-$p.log"; done
 cleanup() {
-  pkill -9 -f "flint-server --port 65" 2>/dev/null
+  # fleet_kill, not a truncated pkill pattern: "--port 65" is a substring
+  # match that reaches ports this drill does not own.
+  # Scoped to the ports this drill declared to fleet_init.
+  fleet_kill server
   fleet_kill controller
   for p in 6500 6501 6510 6511 6520 6521; do rm -rf "$FLINT_DRILL_ROOT/flint-mp-$p"; done
 }

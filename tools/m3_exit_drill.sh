@@ -41,7 +41,10 @@ cleanup() {
     kill -9 $WRITERS 2>/dev/null
     wait $WRITERS 2>/dev/null
   fi
-  pkill -9 -f "flint-server --port 67" 2>/dev/null
+  # fleet_kill, not a truncated pkill pattern: "--port 67" is a substring
+  # match that also kills 6790-6792 (node_tls) and a dozen other drills.
+  # Scoped to the ports this drill declared to fleet_init.
+  fleet_kill server
   fleet_kill controller
   fleet_kill proxy
   rm -rf $FLINT_DRILL_ROOT/flint-m3-* $FLINT_DRILL_ROOT/m3-stop

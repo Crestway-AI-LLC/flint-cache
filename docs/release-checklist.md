@@ -7,12 +7,20 @@ stage). Running it yourself before tagging is still the rule — a tag is
 cut from a working tree, not from a green pull request — but the drills
 and chaos are no longer a thing anyone has to remember.
 
-Two CI-specific notes:
+Three CI-specific notes:
 
 - **`FLINT_GATE_STRICT=1` makes a skipped drill a failed one.** Locally a
   skip is right (no `mkfs.ext4` on macOS). In CI it is not: a drill that
   skipped reads identically to one that passed, so a forgotten dependency
   would silently delete coverage from every future run.
+- **`FLINT_GATE_JOBS=N` runs the drills stage N at a time.** Default 1,
+  which is the sequential gate; the parallel path is opt-in. Measured
+  2026-08-23 on a c7i.4xlarge over all 102 CORE drills: serial 17m33s,
+  `JOBS=4` 5m26s — 3.23x, about twelve minutes a run. It is opt-in rather
+  than the default because the cost of getting it wrong is a gate that goes
+  red for reasons unrelated to the change under test, which trains people to
+  re-run until green. Prefer it locally and when iterating; leave CI on the
+  default until a parallel run has been green for a while.
 - **The conformance oracle is pinned to Valkey 9.1.0** and built from
   source, because Valkey forked after Ubuntu noble's package freeze and
   is not installable with apt there. Pinned rather than latest: a

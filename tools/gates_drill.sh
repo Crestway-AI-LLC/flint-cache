@@ -31,6 +31,27 @@ cd "$(dirname "$0")/.."
 
 TMP=${FLINT_DRILL_ROOT:-/tmp}/flint-gates-drill
 KEPT="$TMP/logs-kept"       # a log directory that must SURVIVE every refusal
+# THIS DRILL MUST CONTROL FLINT_GATE_JOBS, NOT INHERIT IT.
+#
+# Same shape as fleet_guard_drill and FLINT_DRILL_FORCE. This drill forges a
+# tree whose `step` is STUBBED -- it counts and prints instead of executing,
+# which is what stops the suite running itself recursively -- and then asserts
+# the pass line counts CORE + 1 steps. Both assumptions are about the
+# SEQUENTIAL path: at FLINT_GATE_JOBS>1 the drills stage bypasses step() for
+# the drills (it reports through step_report instead), so the stub is skipped
+# and the forged run tries to execute drill scripts the forged tree does not
+# have; and the parallel path adds a prebuild step, so the count is CORE + 2.
+#
+# Measured 2026-08-24: inheriting JOBS=4 from the outer gate failed this drill
+# with "bash: tools/wal_headroom_drill.sh: No such file or directory" -- a
+# forged tree being asked to run the real suite.
+#
+# What this drill tests -- argument handling, refusing an unknown stage, and
+# the CORE-list-is-the-count contract -- is parallelism-independent, so pin it.
+FLINT_GATE_JOBS_WAS="${FLINT_GATE_JOBS:-}"
+unset FLINT_GATE_JOBS
+[ -n "$FLINT_GATE_JOBS_WAS" ] && echo "   (FLINT_GATE_JOBS=$FLINT_GATE_JOBS_WAS cleared: this drill asserts the sequential path)"
+
 SCRATCH="$TMP/logs-scratch" # one the copies below are free to clear
 OUT="$TMP/out"; ERR="$TMP/err"
 POISON=__not_a_stage__

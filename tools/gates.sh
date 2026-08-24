@@ -266,16 +266,34 @@ _all_flint_seats() { pgrep -f 'target/release/flint-(server|proxy|controlplane|c
 # directory OR one of the ports it declares. Both are needed — a proxy started
 # `--port 6666 --pairs ...` and a controller started `--pairs ... --id PX`
 # carry no path at all, so a directory-only match would miss them.
+# THE SCOPE DIRECTORY, NOT THE DRILL ROOT. The paragraph above already says
+# ownership is "the drill's scope directory OR one of the ports it declares" --
+# the code matched ${FLINT_DRILL_ROOT} instead, which is the parent of EVERY
+# drill's scope. Serially that is only imprecise: one fleet is up, so the drill
+# root and the drill's own scope select the same seats, and a stale orphan from
+# an earlier drill gets misattributed to whoever finished last. Run two drills
+# at once and it becomes destructive: every drill sees every sibling's seats as
+# its own leak, and step() kill -9s them. That is the single hardest blocker to
+# a parallel drills stage, and it was a comment describing a fix nobody wrote.
 _leaked_seats() {  # <drill-name>
-  local drill="tools/${1}_drill.sh" ports pid args
+  local drill="tools/${1}_drill.sh" ports pid args scope scopes root
+  root="${FLINT_DRILL_ROOT:-/tmp}"
   ports=$(grep -h '^fleet_init' "$drill" 2>/dev/null \
     | awk '{for (i = 3; i <= NF; i++) print $i}' | grep -E '^[0-9]+$' \
     | tr '\n' '|' | sed 's/|$//')
+  # A drill may call fleet_init more than once; take every scope it declares.
+  scopes=$(grep -h '^fleet_init' "$drill" 2>/dev/null | awk '{print $2}')
   for pid in $(_all_flint_seats); do
     args=$(ps -o args= -p "$pid" 2>/dev/null) || continue
-    case "$args" in
-      *"${FLINT_DRILL_ROOT:-/tmp}"*) echo "$pid"; continue ;;
-    esac
+    for scope in $scopes; do
+      scope=${scope//\$\{FLINT_DRILL_ROOT\}/$root}
+      scope=${scope//\$FLINT_DRILL_ROOT/$root}
+      [ -n "$scope" ] || continue
+      # Boundary, not substring: flint-cpha must not own flint-cpha-ctl.
+      case "$args" in
+        *"$scope"/*|*"$scope"|*"$scope "*) echo "$pid"; continue 2 ;;
+      esac
+    done
     [ -n "$ports" ] && echo "$args" | grep -qE "(^|[^0-9])($ports)([^0-9]|$)" && echo "$pid"
   done
 }
@@ -302,11 +320,183 @@ _foreign_seats() {  # <drill-name>
   done
 }
 
+
+# FLINT_GATE_JOBS -- how many drills run at once.
+#
+# Default 1, which is byte-identical to the sequential gate this file has
+# always run: same order, same step() calls, same accounting. Parallelism is
+# opt-in because it is not free. Measured 2026-08-23 on a c7i.4xlarge, all 102
+# CORE drills, same box: serial 1053s / 102 pass, P=4 326s / 98 pass -- 3.23x,
+# and the four failures were all drills measuring the BOX where they meant
+# their own fleet. Those are fixed (fleet_pids, _leaked_seats, fleet_guard peer
+# detection); the knob stays opt-in until a parallel run has been green for a
+# while, because the failure mode of getting this wrong is a gate that reports
+# red for reasons that have nothing to do with the change under test.
+GATE_JOBS="${FLINT_GATE_JOBS:-1}"
+case "$GATE_JOBS" in ''|*[!0-9]*) echo "FLINT_GATE_JOBS must be a positive integer, got '$GATE_JOBS'"; exit 2 ;; esac
+[ "$GATE_JOBS" -ge 1 ] || { echo "FLINT_GATE_JOBS must be >= 1, got $GATE_JOBS"; exit 2; }
+
+# NO DRILL MAY CARRY A KILL PATTERN THAT REACHES ANOTHER DRILL.
+#
+# `pkill -9 -f "flint-server --port 67"` is a substring match, so it kills
+# 6790, 6791 and 6792 as surely as 6700 — and those three belong to node_tls.
+# Serially that is invisible: one fleet is up, and the only seats matching are
+# the ones the drill meant. Run two drills at once and a truncated pattern is
+# a remote SIGKILL aimed at whoever else is running, which lands as "seat died
+# mid-drill" in a log that names no killer. It cost two rounds of elimination
+# and a memory sampler to find, having twice been attributed to the OOM killer
+# (peak memory: 792 MB of 15702 MB — it was never memory).
+#
+# The project had already found this twice, in controlplane_drill.sh and
+# lease_drill.sh, and fixed it in those two files. A fix applied where the bug
+# was SEEN and not where it LIVES is how the other twenty call sites survived.
+# So: assert it, once, for every drill.
+#
+# Truncation is only a defect when the prefix reaches ANOTHER drill's declared
+# ports; a drill sweeping its own range is a legitimate idiom and stays legal.
+assert_no_cross_drill_kill_patterns() {
+  local d drill pat owner bad=""
+  local portmap="$LOGS/.portmap"
+  for drill in tools/*_drill.sh; do
+    d=$(basename "$drill" _drill.sh)
+    sed -e :a -e '/\\$/N; s/\\\n//; ta' "$drill" 2>/dev/null \
+      | grep -oE 'fleet_init [^;&|]+' | grep -oE '\b[0-9]{4,5}\b' \
+      | while read -r port; do printf '%s %s\n' "$port" "$d"; done
+  done > "$portmap"
+  for drill in tools/*_drill.sh; do
+    d=$(basename "$drill" _drill.sh)
+    # COMMENTS ARE NOT CALL SITES. controlplane_drill and lease_drill both
+    # quote the pattern they used to have, in a comment explaining why it was
+    # wrong. Matching those would fail the gate over the write-up of the fix
+    # rather than the defect -- a check that cannot tell a cure from a disease.
+    for pat in $(grep -v '^[[:space:]]*#' "$drill" 2>/dev/null \
+                 | grep -hoE 'pkill[^|]*"[^"]*--port [0-9]{1,5}"' \
+                 | grep -oE -- '--port [0-9]{1,5}' | awk '{print $2}' | sort -u); do
+      while read -r port owner; do
+        case "$port" in
+          "$pat"*) [ "$owner" != "$d" ] && bad="$bad
+    $d: pattern '--port $pat' also matches port $port, declared by $owner" ;;
+        esac
+      done < "$portmap"
+    done
+  done
+  if [ -n "$bad" ]; then
+    echo "GATES FAILED: a drill's kill pattern reaches another drill's ports:$bad"
+    echo "      A truncated port in a pkill pattern is a substring match. It is"
+    echo "      harmless while drills run one at a time and a remote SIGKILL the"
+    echo "      moment they do not. Use fleet_kill (scoped to this drill's"
+    echo "      fleet_init ports), or name the full port."
+    exit 1
+  fi
+}
+
+run_core_drills() {
+  local d rc secs
+  if [ "$GATE_JOBS" -le 1 ]; then
+    for d in $CORE; do step "$d" "drill-$d" bash "tools/${d}_drill.sh"; done
+    return
+  fi
+
+  # PREBUILD, ONCE. Every drill runs its own cargo build. Several of those
+  # against one target/ relink target/release/flint-server between differing
+  # -p sets while a sibling fleet is mid-run, so a seat can be spawned from a
+  # binary that is being replaced. Paying the build once up front makes each
+  # drill's own build a no-op and closes that window.
+  step "prebuild" "drill-prebuild" \
+    cargo build --release -q --workspace --features flint-server/rocks,flint-backup/rocks
+
+  echo "   $(printf '%s\n' $CORE | grep -c .) drills, $GATE_JOBS at a time"
+  local res="$LOGS/.par"; rm -rf "$res"; mkdir -p "$res"
+  # The worker is a FILE, not a function shipped through `xargs bash -c`:
+  # that depends on quoting which breaks silently, and the breakage presents
+  # as every drill failing at once.
+  cat > "$res/worker.sh" <<'WORKER'
+#!/usr/bin/env bash
+d="$1"; log="$GATE_LOGS_DIR/drill-$d.log"; s=$(date +%s)
+bash "tools/${d}_drill.sh" >"$log" 2>&1; rc=$?
+printf '%s %s\n' "$rc" "$(( $(date +%s) - s ))" > "$GATE_PAR_DIR/$d.res"
+WORKER
+  chmod +x "$res/worker.sh"
+
+  export GATE_LOGS_DIR="$LOGS" GATE_PAR_DIR="$res"
+  # Tells fleet_guard that another drill from THIS suite on the box is a peer,
+  # not a foreign fleet. It still refuses a sibling PROJECT and still refuses
+  # seats with no live peer lock behind them.
+  export FLINT_DRILL_PARALLEL=1
+
+  # MEMORY HIGH-WATER, SAMPLED WHILE IT MATTERS.
+  #
+  # Seats have twice been SIGKILLed mid-drill under parallelism with no
+  # attributable killer: not a scope-prefix collision (checked, and fixed),
+  # not a port collision (checked -- 442 declarations, all distinct), and not
+  # the leak check (it runs after every drill has finished). The remaining
+  # candidate is the kernel OOM killer, and "we think it was memory" is a
+  # hypothesis, not a finding. So take the measurement during the window it
+  # would happen in; the next occurrence then arrives with a number beside it
+  # instead of another round of elimination. Silent on any host without
+  # `free` -- an absent sampler must not look like a low reading.
+  local memlog="$res/mem.peak"; echo 0 > "$memlog"
+  ( while :; do
+      _u=$(free -m 2>/dev/null | awk '/^Mem:/{print $3}')
+      [ -n "$_u" ] && [ "$_u" -gt "$(cat "$memlog" 2>/dev/null || echo 0)" ] \
+        && printf '%s\n' "$_u" > "$memlog"
+      sleep 3
+    done ) & local memwatch=$!
+
+  printf '%s\n' $CORE | xargs -P "$GATE_JOBS" -n1 "$res/worker.sh"
+  kill "$memwatch" 2>/dev/null
+  unset FLINT_DRILL_PARALLEL GATE_LOGS_DIR GATE_PAR_DIR
+
+  local peak total
+  peak=$(cat "$memlog" 2>/dev/null || echo 0)
+  total=$(free -m 2>/dev/null | awk '/^Mem:/{print $2}')
+  if [ -n "$total" ] && [ "${peak:-0}" -gt 0 ]; then
+    echo "   peak memory during the parallel drills: ${peak} MB of ${total} MB"
+    if [ "$peak" -gt "$(( total * 85 / 100 ))" ]; then
+      echo "   NOTE: that is within 15% of this box. A seat killed with no"
+      echo "         attributable killer is then the OOM killer, not a harness"
+      echo "         collision — lower FLINT_GATE_JOBS or use a larger box."
+    fi
+  fi
+  # Direct evidence when the kernel log is readable; silent when it is not.
+  dmesg 2>/dev/null | grep -iE 'killed process|out of memory' | tail -5 > "$res/oom.txt" 2>/dev/null || true
+  if [ -s "$res/oom.txt" ]; then
+    echo "   OOM killer fired during this run:"
+    sed 's/^/     /' "$res/oom.txt"
+  fi
+
+  # REPLAY IN CORE ORDER, through the same step_report the serial path uses,
+  # and AFTER every drill has finished -- which is also when the leak check is
+  # most accurate, since nothing else is still legitimately holding seats.
+  for d in $CORE; do
+    if [ -f "$res/$d.res" ]; then
+      read -r rc secs < "$res/$d.res"
+    else
+      # A worker that died without writing a result must not vanish from the
+      # tally. An absent drill and a passing drill have to look different.
+      rc=127; secs=0
+      echo "FAIL: no result recorded for $d -- its worker died before writing one" >> "$LOGS/drill-$d.log"
+    fi
+    step_report "$d" "$LOGS/drill-$d.log" "${rc:-127}" "${secs:-0}"
+  done
+}
+
 step() {  # step <name> <log-suffix> <command...>
   local name="$1" log="$LOGS/$2.log"; shift 2
-  local start; start=$(date +%s)
+  local start rc=0; start=$(date +%s)
+  "$@" >"$log" 2>&1 || rc=$?
+  step_report "$name" "$log" "$rc" "$(( $(date +%s) - start ))"
+}
+
+# THE VERDICT LIVES HERE, ONCE. step() runs one command and reports it; the
+# parallel drills path runs many and reports each through this same function.
+# A second reporter would drift from this one, and a gate whose serial and
+# parallel modes disagree about what "failed" means is worse than having no
+# parallel mode at all.
+step_report() {  # step_report <name> <log> <exit-code> <elapsed-seconds>
+  local name="$1" log="$2" rc="$3" secs="$4"
   RAN_STEPS=$((RAN_STEPS + 1))
-  if "$@" >"$log" 2>&1; then
+  if [ "$rc" = 0 ]; then
     # `SKIP:` and `SKIP (` are the two forms a drill uses to say "I did not
     # test this because a dependency was missing". Deliberately NOT plain
     # /SKIP/: attached_chaos prints "data plane SKIPPED (pass --probe ...)",
@@ -315,16 +505,16 @@ step() {  # step <name> <log-suffix> <command...>
     # would teach people to ignore this gate — the one outcome worse than
     # not having it.
     if [ -n "${FLINT_GATE_STRICT:-}" ] && grep -qE 'SKIP[: (]' "$log"; then
-      printf 'FAIL  %-22s (%ss)  %s\n' "$name" "$(( $(date +%s) - start ))" "$log"
+      printf 'FAIL  %-22s (%ss)  %s\n' "$name" "$secs" "$log"
       grep -m2 'SKIP' "$log" | sed 's/^/        /'
       echo "        skipped under FLINT_GATE_STRICT: install the dependency"
       echo "        or drop the drill from CORE deliberately, not by accident."
       FAILED="$FAILED $name(skipped)"
       return
     fi
-    printf 'PASS  %-22s (%ss)\n' "$name" "$(( $(date +%s) - start ))"
+    printf 'PASS  %-22s (%ss)\n' "$name" "$secs"
   else
-    printf 'FAIL  %-22s (%ss)  %s\n' "$name" "$(( $(date +%s) - start ))" "$log"
+    printf 'FAIL  %-22s (%ss)  %s\n' "$name" "$secs" "$log"
     # The drill's OWN verdict first, then the looser patterns.
     #
     # This was one `grep -m1 -E '^(FAIL|error|REFUSING)'`, and `^error`
@@ -958,8 +1148,9 @@ if want drills; then
   assert_drill_builds_keep_rocks
   assert_drill_build_is_checked
   assert_no_continuation_splice
+  assert_no_cross_drill_kill_patterns
   LEAKCHECK=1
-  for d in $CORE; do step "$d" "drill-$d" bash "tools/${d}_drill.sh"; done
+  run_core_drills
   LEAKCHECK=
 fi
 

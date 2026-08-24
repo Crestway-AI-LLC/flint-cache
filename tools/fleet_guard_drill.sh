@@ -47,6 +47,15 @@ trap cleanup EXIT
 # So: clear it here, and set it explicitly in the one step that tests it.
 FORCE_WAS="${FLINT_DRILL_FORCE:-}"
 unset FLINT_DRILL_FORCE
+# AND FLINT_DRILL_PARALLEL, for the identical reason. The gate exports it for
+# the whole drills stage when FLINT_GATE_JOBS>1, and case G asserts what the
+# guard does WITHOUT it -- an assertion that inherits the flag tests nothing
+# and reports exit 0 as "did not refuse". Caught by its own negative control
+# on 2026-08-24, in the file that already documents this exact trap one
+# variable earlier.
+PARALLEL_WAS="${FLINT_DRILL_PARALLEL:-}"
+unset FLINT_DRILL_PARALLEL
+[ -n "$PARALLEL_WAS" ] && echo "   (FLINT_DRILL_PARALLEL=$PARALLEL_WAS cleared for this drill; case G sets it explicitly)"
 [ -n "$FORCE_WAS" ] && echo "   (FLINT_DRILL_FORCE=$FORCE_WAS cleared for this drill; step E sets it back)"
 
 fleet_init $FLINT_DRILL_ROOT/flint-guard-drill 6999 6378 6379 6380 6381 6382 6383 6384 6385
@@ -133,7 +142,92 @@ OUT=$(FLINT_DRILL_FORCE=1 fleet_guard 2>&1); RC=$?
 [ "$RC" = 0 ] || { echo "FAIL: FORCE did not override (exit $RC)"; echo "$OUT"; exit 1; }
 echo "  force proceeds"
 
-echo "PASS: fleet_guard sees sibling projects' fleets, refuses without claiming ownership, does not misread our own binaries, and still honours FORCE"
+cleanup; PIDS=""; sleep 0.5
+
+# A process whose ARGV carries a path, which `spawn_as` cannot produce --
+# exec -a sets argv[0], so the whole string becomes the command line as ps
+# renders it. Scope matching reads that line, so the fake has to have one.
+spawn_argv() { bash -c "exec -a \"$1\" sleep 60" & PIDS="$PIDS $!"; }
+
+echo "== F) a scope must not own a scope it is merely a PREFIX of"
+# fleet.sh decided ownership with `index(args, scope) > 0`, so flint-cpha
+# owned flint-cpha-ctl. Four such pairs exist in tools/ today. Serially only
+# one fleet is up so it never fires; at P=4 the shorter-scoped drill SIGKILLs
+# the longer-scoped one and the victim reports a product failure.
+PFX="$FLINT_DRILL_ROOT/flint-guardpfx"
+spawn_argv "flint-server --data-dir $PFX-ctl/d"
+sleep 1
+ps -eo args= | grep -q -- "--data-dir $PFX-ctl/d" \
+  || { echo "FAIL: the fake prefix seat is not visible in ps — this case would pass vacuously"; exit 1; }
+SAVED_SCOPE="$FLEET_SCOPE"; SAVED_PORTS="$FLEET_PORTS"
+FLEET_SCOPE="$PFX"; FLEET_PORTS=""
+ADOPTED=$(_fleet_ours server)
+[ -z "$ADOPTED" ] \
+  || { echo "FAIL: scope $PFX adopted a seat living under $PFX-ctl:"; ps -o pid=,args= -p $ADOPTED | sed 's/^/    /'; FLEET_SCOPE="$SAVED_SCOPE"; FLEET_PORTS="$SAVED_PORTS"; exit 1; }
+# POSITIVE CONTROL: the exact scope must still own it, or this case would
+# pass just as well against a matcher that owns nothing at all.
+FLEET_SCOPE="$PFX-ctl"
+OWNED=$(_fleet_ours server)
+FLEET_SCOPE="$SAVED_SCOPE"; FLEET_PORTS="$SAVED_PORTS"
+[ -n "$OWNED" ] \
+  || { echo "FAIL: scope $PFX-ctl did not own its OWN seat — the matcher owns nothing, so the negative above proved nothing"; exit 1; }
+echo "  prefix disowned, exact scope still owns it"
+cleanup; PIDS=""; sleep 0.5
+
+echo "== G) a live PEER drill of this suite is not a foreign fleet (parallel only)"
+PEER="$FLINT_DRILL_ROOT/flint-guardpeer"
+rm -rf "$PEER.lock"; mkdir -p "$PEER.lock"
+sleep 300 & PEERPID=$!; PIDS="$PIDS $PEERPID"
+printf '%s\n' "$PEERPID" > "$PEER.lock/pid"
+ps -o lstart= -p "$PEERPID" > "$PEER.lock/started" 2>/dev/null
+printf '%s\n' "7788|7789" > "$PEER.lock/ports"
+spawn_argv "flint-server --data-dir $PEER/d"
+# A PEER SEAT THAT CARRIES NO PATH. A proxy or controller is started with
+# ports and no directory, and a drill keeps auxiliary state in a sibling
+# <scope>-state dir that the boundary rule deliberately does not call owned.
+# Matching peers on the scope path alone therefore misses most of a real
+# peer fleet: measured 2026-08-24, 9 of 24 seats matched and the gate refused
+# over the other 15. Ports are the second key, exactly as in _fleet_ours.
+spawn_argv "flint-controller --pairs 127.0.0.1:7788,127.0.0.1:7789 --id peerctl"
+sleep 1
+# Without the flag it is foreign, exactly as before. If this does not refuse,
+# the case below proves nothing about the flag.
+# Subshell, not `env -u`: fleet_guard is a shell FUNCTION, and env can only
+# exec a binary -- it returned 127, which this assert read as "did not
+# refuse". The unset above already clears the ambient value; this makes
+# the arm say so at the point it matters.
+OUT=$( unset FLINT_DRILL_PARALLEL; fleet_guard 2>&1 ); RC=$?
+[ "$RC" = 1 ] \
+  || { echo "FAIL: a peer seat did not refuse WITHOUT FLINT_DRILL_PARALLEL (exit $RC) — the flag would be untested"; rm -rf "$PEER.lock"; exit 1; }
+OUT=$(FLINT_DRILL_PARALLEL=1 fleet_guard 2>&1); RC=$?
+[ "$RC" = 0 ] \
+  || { echo "FAIL: FLINT_DRILL_PARALLEL=1 still refused a live peer drill (exit $RC):"; echo "$OUT" | sed 's/^/    /'; rm -rf "$PEER.lock"; exit 1; }
+# ISOLATE THE PORTS KEY, DO NOT COUNT THE BOX.
+#
+# This asserted the message read "2 seat(s) belong to", which is only true on
+# a box where nothing else is running. Under the parallel gate that message
+# reported 6 seats across 4 live peers and the case failed on a guard that had
+# worked perfectly -- an exact global count, which is the same unscoped-census
+# mistake this whole change set exists to remove, committed inside the test
+# for it. Ask the question locally instead: drop the ports the peer declared,
+# and the seat that had no path must become foreign again. Nothing else about
+# the box can move that answer.
+rm -f "$PEER.lock/ports"
+OUT2=$(FLINT_DRILL_PARALLEL=1 fleet_guard 2>&1); RC2=$?
+[ "$RC2" = 1 ] \
+  || { echo "FAIL: with the peer's declared ports removed, the path-less peer seat was still tolerated (exit $RC2) -- so it was never matched BY port, and the ports key is untested:"; echo "$OUT2" | sed 's/^/    /'; rm -rf "$PEER.lock"; exit 1; }
+printf '%s\n' "7788|7789" > "$PEER.lock/ports"
+# NEGATIVE CONTROL: no live lock behind the seat and it is foreign again,
+# flag or not. Otherwise the flag would be a blanket amnesty, which is what
+# FLINT_DRILL_FORCE already is.
+rm -rf "$PEER.lock"
+OUT=$(FLINT_DRILL_PARALLEL=1 fleet_guard 2>&1); RC=$?
+[ "$RC" = 1 ] \
+  || { echo "FAIL: with no live peer lock, FLINT_DRILL_PARALLEL=1 tolerated a foreign seat anyway (exit $RC) — that is an amnesty, not a distinction"; exit 1; }
+echo "  peer tolerated only while its lock is live; foreign otherwise"
+cleanup; PIDS=""; sleep 0.5
+
+echo "PASS: fleet_guard sees sibling projects' fleets, refuses without claiming ownership, does not misread our own binaries, honours FORCE, disowns prefix scopes, and tells a live peer drill from a foreign fleet"
 
 # `[ test ] && echo` as the LAST command makes the script's exit status the
 # TEST's: when case A did run, the test is false, the echo is skipped, and the

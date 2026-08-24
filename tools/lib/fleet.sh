@@ -126,6 +126,13 @@ fleet_init() {
   done
   printf '%s\n' "$$" > "$FLEET_LOCK/pid"
   ps -o lstart= -p "$$" > "$FLEET_LOCK/started" 2>/dev/null || true
+  # The declared ports, recorded for peer detection. A scope path alone cannot
+  # identify a peer's seats: a proxy started `--port 6666 --pairs ...` and a
+  # controller started `--pairs ... --id ctl` carry no path at all, and a drill
+  # keeps auxiliary state in sibling directories (<scope>-state) that the
+  # boundary rule in _fleet_ours deliberately does NOT treat as owned. Ports
+  # are what those seats always have. Same two keys ownership already uses.
+  printf '%s\n' "$FLEET_PORTS" > "$FLEET_LOCK/ports" 2>/dev/null || true
 
   # WARM THE BINARIES HERE, NOT IN EACH DRILL (BUG-0011).
   #
@@ -246,6 +253,31 @@ _fleet_sibling() {
 # in anyone's head.
 _fleet_foreign() {
   ps -eo pid=,ppid=,args= 2>/dev/null | awk -v scope="$FLEET_SCOPE" -v ports="$FLEET_PORTS" '
+
+    # OWNERSHIP IS A PATH-BOUNDARY TEST, NOT A SUBSTRING TEST.
+    #
+    # This was `index(args, scope) > 0`, so any scope that is a PREFIX of
+    # another scope adopts that other drills seats. Four such pairs exist in
+    # tools/ today -- flint-cpha vs flint-cpha-ctl and flint-cpharoll-state,
+    # flint-coproc vs flint-coproc-family, flint-fam vs flint-famcp -- so
+    # fleet_kill from the shorter-scoped drill would SIGKILL the longer-scoped
+    # one, and _fleet_foreign would report a false CLEAN for a genuinely
+    # foreign seat, which is the direction that hurts. Serially neither can
+    # happen (one fleet at a time), so it stayed invisible; it goes live the
+    # moment two drills share a box.
+    #
+    # A scope owns a process only when the path continues at a boundary: end
+    # of string, a slash, or a space. Same family as every other unanchored
+    # match in docs/field-notes.md.
+    function owns(hay, sc,   p, nxt, rest) {
+      rest = hay
+      while ((p = index(rest, sc)) > 0) {
+        nxt = substr(rest, p + length(sc), 1)
+        if (nxt == "" || nxt == "/" || nxt == " ") return 1
+        rest = substr(rest, p + length(sc))
+      }
+      return 0
+    }
     {
       # Rebuild argv from field 3 on, and match scope/ports against THAT
       # rather than the whole line. $0 now carries the ppid, and a ppid that
@@ -257,7 +289,7 @@ _fleet_foreign() {
       n = split($3, parts, "/")
       exe = parts[n]
       if (exe !~ /^flint-(server|proxy|controlplane|controller|agent|console|ops|register|exporter|meter)$/) next
-      if (index(args, scope) > 0) next
+      if (owns(args, scope)) next
       if (ports != "" && args ~ ("(^|[^0-9])(" ports ")([^0-9]|$)")) next
       print $1, $2, args
     }'
@@ -273,6 +305,31 @@ _fleet_ours() {
     re="^flint-($(printf '%s' "$want" | tr ' ' '|'))$"
   fi
   ps -eo pid=,args= 2>/dev/null | awk -v scope="$FLEET_SCOPE" -v ports="$FLEET_PORTS" -v re="$re" '
+
+    # OWNERSHIP IS A PATH-BOUNDARY TEST, NOT A SUBSTRING TEST.
+    #
+    # This was `index(args, scope) > 0`, so any scope that is a PREFIX of
+    # another scope adopts that other drills seats. Four such pairs exist in
+    # tools/ today -- flint-cpha vs flint-cpha-ctl and flint-cpharoll-state,
+    # flint-coproc vs flint-coproc-family, flint-fam vs flint-famcp -- so
+    # fleet_kill from the shorter-scoped drill would SIGKILL the longer-scoped
+    # one, and _fleet_foreign would report a false CLEAN for a genuinely
+    # foreign seat, which is the direction that hurts. Serially neither can
+    # happen (one fleet at a time), so it stayed invisible; it goes live the
+    # moment two drills share a box.
+    #
+    # A scope owns a process only when the path continues at a boundary: end
+    # of string, a slash, or a space. Same family as every other unanchored
+    # match in docs/field-notes.md.
+    function owns(hay, sc,   p, nxt, rest) {
+      rest = hay
+      while ((p = index(rest, sc)) > 0) {
+        nxt = substr(rest, p + length(sc), 1)
+        if (nxt == "" || nxt == "/" || nxt == " ") return 1
+        rest = substr(rest, p + length(sc))
+      }
+      return 0
+    }
     {
       n = split($2, parts, "/")
       exe = parts[n]
@@ -284,7 +341,7 @@ _fleet_ours() {
       # symptom was a NODE vanishing during a step that only kills the
       # control plane, which reads like a product bug.
       if (exe !~ re) next
-      mine = (index($0, scope) > 0)
+      mine = owns($0, scope)
       if (!mine && ports != "")
         mine = ($0 ~ ("(^|[^0-9])(" ports ")([^0-9]|$)"))
       if (mine) print $1
@@ -535,6 +592,58 @@ _fleet_sibling_settle() {
   done
 }
 
+# _fleet_live_peer_scopes -- scope dirs of drills from THIS suite running right
+# now, each proven live by its own fleet_init lock.
+#
+# This is the distinction fleet_guard could not previously make. _fleet_foreign
+# reports "one of OUR binaries, outside MY scope", which is true of a genuinely
+# foreign fleet AND of the drill running beside this one in a parallel gate --
+# and those two need opposite answers. Refusing a peer makes a parallel drills
+# stage impossible; tolerating a foreign fleet is the harm tools/lib/fleet.sh
+# was written to prevent.
+#
+# The lock settles it. fleet_init takes ${scope}.lock atomically and records
+# pid PLUS process start time; a peer drill therefore leaves a live lock, and
+# nothing else on the box does. Liveness is pid AND start time, never the pid
+# alone -- a reused pid would launder a dead run into a live peer, which is the
+# direction that hurts.
+_fleet_live_peer_scopes() {
+  local root="${FLINT_DRILL_ROOT:-/tmp}" lock owner started now scope
+  for lock in "$root"/*.lock; do
+    [ -d "$lock" ] || continue
+    owner="$(cat "$lock/pid" 2>/dev/null || true)"
+    [ -n "$owner" ] || continue
+    started="$(cat "$lock/started" 2>/dev/null || true)"
+    now="$(ps -o lstart= -p "$owner" 2>/dev/null || true)"
+    [ -n "$now" ] && [ "$now" = "$started" ] || continue
+    scope="${lock%.lock}"
+    [ "$scope" = "${FLEET_SCOPE:-}" ] && continue
+    # scope|ports -- neither key alone identifies every seat a peer owns.
+    printf '%s|%s\n' "$scope" "$(cat "$lock/ports" 2>/dev/null || true)"
+  done
+}
+
+# Drop the lines owned by a live peer scope. Boundary match, not substring:
+# flint-cpha must not adopt flint-cpha-ctl.
+_fleet_drop_peer_lines() {  # <peer entries: scope|ports>   (stdin: seat lines)
+  local peers="$1" line entry scope ports keep
+  while IFS= read -r line; do
+    keep=1
+    for entry in $peers; do
+      scope="${entry%%|*}"; ports="${entry#*|}"
+      [ "$ports" = "$entry" ] && ports=""
+      case "$line" in
+        *"$scope"/*|*"$scope"|*"$scope "*) keep=0; break ;;
+      esac
+      if [ -n "$ports" ] && printf '%s\n' "$line" | grep -qE "(^|[^0-9])($ports)([^0-9]|\$)"; then
+        keep=0; break
+      fi
+    done
+    [ "$keep" = 1 ] && printf '%s\n' "$line"
+  done
+  return 0
+}
+
 fleet_guard() {
   local foreign sibling
   # Before the decision, not after it: a refused run is exactly the run whose
@@ -542,6 +651,27 @@ fleet_guard() {
   fleet_env_note guard
   foreign="$(_fleet_foreign)"
   sibling="$(_fleet_sibling)"
+  # A PEER DRILL FROM THIS SUITE IS NOT A FOREIGN FLEET. Only under
+  # FLINT_DRILL_PARALLEL=1, which the gate sets when it runs the drills stage
+  # with more than one job -- outside that, a second fleet on the box is still
+  # refused exactly as before, because outside a parallel gate nobody should be
+  # starting one. A sibling PROJECT (flint-kv) is never tolerated here: that is
+  # contention, and it is not ours to reason about.
+  if [ -n "$foreign" ] && [ "${FLINT_DRILL_PARALLEL:-0}" = "1" ]; then
+    local peers peers_n before_n after_n
+    peers="$(_fleet_live_peer_scopes)"
+    if [ -n "$peers" ]; then
+      # `grep -c . || echo 0` prints TWO numbers when there is no match:
+      # grep emits its count of 0 AND exits 1, so the fallback fires too and
+      # the arithmetic sees "0\n0". Let grep report the count and swallow only
+      # its exit status.
+      before_n=$(printf '%s\n' "$foreign" | grep -c . || true)
+      foreign="$(printf '%s\n' "$foreign" | _fleet_drop_peer_lines "$peers")"
+      after_n=$(printf '%s\n' "$foreign" | grep -c . || true)
+      peers_n=$(( ${before_n:-0} - ${after_n:-0} ))
+      [ "$peers_n" -gt 0 ] && echo "  ($peers_n seat(s) belong to $(printf '%s\n' "$peers" | grep -c .) live peer drill(s) in this suite -- not foreign)"
+    fi
+  fi
   [ -z "$foreign" ] && [ -z "$sibling" ] && return 0
   if [ "${FLINT_DRILL_FORCE:-0}" = "1" ]; then
     local n=0
@@ -672,6 +802,17 @@ fleet_signal_port() {
   done
   return $hit
 }
+
+# fleet_pids <component ...> -- the pids of THIS fleet's seats, scoped by the
+# scope dir and ports the drill declared to fleet_init.
+#
+# Use this instead of `pgrep -f '/target/release/flint-<x> '`. pgrep answers
+# "how many are on this BOX", which is a different question with a different
+# answer the moment a second drill runs beside you: controller_stall and
+# failover_bystander both asserted "expected exactly 1" against a box-wide
+# count and failed at P=4 over a sibling's seat (2026-08-23 A/B run). Their
+# asserts were right to fire -- the census was measuring the wrong set.
+fleet_pids() { _fleet_ours "$@"; }
 
 fleet_kill() {
   local want="$*"

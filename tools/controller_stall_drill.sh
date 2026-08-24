@@ -40,8 +40,13 @@ fleet_kill server; fleet_kill proxy; fleet_kill controlplane; fleet_kill control
 sleep 0.4
 cleanup() {
   # CONT first: a still-STOPPED process cannot be asked to stop cleanly.
-  pkill -CONT -f 'flint-[c]ontroller' 2>/dev/null
-  pkill -CONT -f 'flint-[c]ontrolplane' 2>/dev/null
+  #
+  # SCOPED. `pkill -CONT -f flint-[c]ontroller` resumes every controller on the
+  # box, so this cleanup would un-stop a SIBLING drill's deliberately SIGSTOPped
+  # seat and silently invalidate that drill instead of this one. Harmless while
+  # drills run one at a time; a cross-drill defect the moment they do not.
+  _cont=$(fleet_pids controller controlplane 2>/dev/null | tr '\n' ' ')
+  [ -n "$_cont" ] && kill -CONT $_cont 2>/dev/null
   $CTL -f "$INV" stop >/dev/null 2>&1
   fleet_kill server; fleet_kill proxy; fleet_kill controlplane; fleet_kill controller
   rm -rf "$D"
@@ -99,13 +104,23 @@ echo "  baseline: 2/2 masters, edge writable"
 # reported three seats and failed a healthy fleet. CI never saw it: the runner
 # has no such processes, so the check was strictest exactly where it was least
 # needed and silent where it mattered.
-CPID=$(pgrep -f '/target/release/flint-[c]ontroller ' | head -1)
+# SCOPED TO THIS FLEET, not to the box. The anchoring above fixed FALSE
+# matches (an editor argv, the calling shell); it did not make the census ask
+# the right question. `pgrep` counts every seat on the machine, so the moment a
+# second drill runs beside this one -- which is what a parallel drills stage
+# does -- the count is 3 and the assert fails on a healthy fleet. Measured at
+# P=4 on 2026-08-23: this was one of exactly two drills in CORE that did it.
+#
+# fleet_pids answers "in MY fleet", scoped by the scope dir and ports declared
+# to fleet_init. The singleton assert is KEPT: stalling one of several still
+# proves nothing, and it must still fail if this fleet somehow has two.
+CPID=$(fleet_pids controller | head -1)
 [ -n "$CPID" ] || { echo "FAIL: no controller process to stall"; exit 1; }
 # `pgrep -c` is a Linux extension; macOS pgrep has no such flag and prints a
 # usage error to stderr while yielding an empty count. Pipe to wc -l instead so
 # the drill counts the same way on the dev laptop and in CI.
-NCTL=$(pgrep -f '/target/release/flint-[c]ontroller ' | wc -l | tr -cd '0-9')
-[ "${NCTL:-0}" = 1 ] || { echo "FAIL: expected exactly 1 controller, found ${NCTL:-0} — stalling one of several proves nothing"; pgrep -fl '/target/release/flint-[c]ontroller ' | sed 's/^/    /'; exit 1; }
+NCTL=$(fleet_pids controller | wc -l | tr -cd '0-9')
+[ "${NCTL:-0}" = 1 ] || { echo "FAIL: expected exactly 1 controller in this fleet, found ${NCTL:-0} — stalling one of several proves nothing"; ps -o pid=,args= -p $(fleet_pids controller | tr '\n' ' ') 2>/dev/null | sed 's/^/    /'; exit 1; }
 echo "== SIGSTOP the controller (pid $CPID) for ${STALL_S}s — lease is ${LEASE}ms, held at the CP"
 kill -STOP "$CPID"
 # Prove the stop took: a SIGSTOP that silently did nothing would make the
@@ -146,10 +161,10 @@ $CTL -f "$INV" verify >/dev/null 2>&1 \
 
 # POSITIVE CONTROL: the fence must still exist, anchored where ADR-0018 put
 # it. Stop the CP past the TTL: masters that cannot renew must fence...
-CPPID=$(pgrep -f '/target/release/flint-[c]ontrolplane ' | head -1)
+CPPID=$(fleet_pids controlplane | head -1)
 [ -n "$CPPID" ] || { echo "FAIL: no control-plane process for the positive control"; exit 1; }
-NCP=$(pgrep -f '/target/release/flint-[c]ontrolplane ' | wc -l | tr -cd '0-9')
-[ "${NCP:-0}" = 1 ] || { echo "FAIL: expected exactly 1 CP seat, found ${NCP:-0}"; exit 1; }
+NCP=$(fleet_pids controlplane | wc -l | tr -cd '0-9')
+[ "${NCP:-0}" = 1 ] || { echo "FAIL: expected exactly 1 CP seat in this fleet, found ${NCP:-0}"; exit 1; }
 echo "== positive control: SIGSTOP the CP (pid $CPPID) — masters must fence at TTL"
 kill -STOP "$CPPID"
 FENCED=0

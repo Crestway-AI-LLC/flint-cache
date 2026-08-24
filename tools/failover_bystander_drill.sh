@@ -71,7 +71,10 @@ MAX_STALE_MS=5000
 fleet_kill server; fleet_kill proxy; fleet_kill controlplane; fleet_kill controller
 sleep 0.4
 cleanup() {
-  pkill -CONT -f 'flint-[c]ontrolplane' 2>/dev/null
+  # SCOPED: a box-wide SIGCONT resumes a sibling drill's deliberately
+  # SIGSTOPped seat, invalidating that drill instead of this one.
+  _cont=$(fleet_pids controlplane 2>/dev/null | tr '\n' ' ')
+  [ -n "$_cont" ] && kill -CONT $_cont 2>/dev/null
   $CTL -f "$INV" stop >/dev/null 2>&1
   fleet_kill server; fleet_kill proxy; fleet_kill controlplane; fleet_kill controller
   rm -rf "$D"
@@ -154,10 +157,20 @@ sleep "$SLEEP_S"
 # reported three seats and failed a healthy fleet. CI never saw it: the runner
 # has no such processes, so the check was strictest exactly where it was least
 # needed and silent where it mattered.
-CPPID=$(pgrep -f '/target/release/flint-[c]ontrolplane ' | head -1)
+# SCOPED TO THIS FLEET, not to the box. The anchoring above fixed FALSE
+# matches (an editor argv, the calling shell); it did not make the census ask
+# the right question. `pgrep` counts every seat on the machine, so the moment a
+# second drill runs beside this one -- which is what a parallel drills stage
+# does -- the count is 3 and the assert fails on a healthy fleet. Measured at
+# P=4 on 2026-08-23: this was one of exactly two drills in CORE that did it.
+#
+# fleet_pids answers "in MY fleet", scoped by the scope dir and ports declared
+# to fleet_init. The singleton assert is KEPT: stalling one of several still
+# proves nothing, and it must still fail if this fleet somehow has two.
+CPPID=$(fleet_pids controlplane | head -1)
 [ -n "$CPPID" ] || { echo "FAIL: no control-plane process to stall"; exit 1; }
-NCP=$(pgrep -f '/target/release/flint-[c]ontrolplane ' | wc -l | tr -cd '0-9')
-[ "${NCP:-0}" = 1 ] || { echo "FAIL: expected exactly 1 CP seat, found ${NCP:-0}"; pgrep -fl '/target/release/flint-[c]ontrolplane ' | sed 's/^/    /'; exit 1; }
+NCP=$(fleet_pids controlplane | wc -l | tr -cd '0-9')
+[ "${NCP:-0}" = 1 ] || { echo "FAIL: expected exactly 1 CP seat in this fleet, found ${NCP:-0}"; ps -o pid=,args= -p $(fleet_pids controlplane | tr '\n' ' ') 2>/dev/null | sed 's/^/    /'; exit 1; }
 
 echo "== SIGSTOP the CP (pid $CPPID) for ${STALL_S}s — lease is ${LEASE}ms"
 kill -STOP "$CPPID"

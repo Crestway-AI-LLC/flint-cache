@@ -17,7 +17,10 @@ fleet_kill server; fleet_kill controller; fleet_kill proxy; sleep 0.4
 B=./target/release/flint-server
 P0=6700; P1=6701
 cleanup() {
-  pkill -9 -f "flint-server --port 670" 2>/dev/null
+  # fleet_kill, not a truncated pkill pattern: "--port 670" is a substring
+  # match that reaches ports this drill does not own.
+  # Scoped to the ports this drill declared to fleet_init.
+  fleet_kill server
   fleet_kill controller
   fleet_kill proxy
   rm -rf $FLINT_DRILL_ROOT/flint-tr-*
