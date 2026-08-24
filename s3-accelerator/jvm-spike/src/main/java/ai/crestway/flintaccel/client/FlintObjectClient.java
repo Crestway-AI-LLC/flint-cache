@@ -535,14 +535,44 @@ public final class FlintObjectClient implements ObjectClient {
         int off = (i - run[0]) * chunkBytes;
         byte[] piece = off >= all.length ? new byte[0]
             : Arrays.copyOfRange(all, off, Math.min(off + chunkBytes, all.length));
+        final String ik = norm(etag) + "/" + (first + i);
+
+        // Publish to the tier BEFORE releasing the claim.
+        //
+        // The claim used to be dropped the instant the SET was ISSUED, and the
+        // SET is asynchronous -- so a reader arriving in the gap found no
+        // chunk in the tier and no claim to join, and fetched the same bytes
+        // again. Every such reader is a duplicate origin request, and the
+        // window widens exactly when it hurts: on a loaded machine. Locally
+        // 24 concurrent readers cost 1-2 GETs and on a shared CI runner the
+        // same test cost 6, which is how the race was found at all.
+        //
+        // Holding the claim until the write lands means late readers JOIN
+        // instead of duplicating. Bounded by the tier budget and completed
+        // either way, because a slow tier must not strand readers who are
+        // waiting on us -- that would trade duplicate fetches for a hang.
+        Runnable release = () -> {
+          CompletableFuture<byte[]> slot = inflight.remove(ik);
+          if (slot != null) slot.complete(piece);
+        };
+        CompletableFuture<?> written = null;
         try {
           if (piece.length > 0 && tierUsable()) {
-            tier.set(chunkKey(etag, first + i), seal(etag, first + i, piece));
+            written = tier.set(chunkKey(etag, first + i), seal(etag, first + i, piece))
+                .toCompletableFuture()
+                .orTimeout(tierBudgetMs, TimeUnit.MILLISECONDS);
           }
+        } catch (RuntimeException e) {
+          tierFailures.incrementAndGet();
         }
-        catch (RuntimeException e) { tierFailures.incrementAndGet(); }
-        CompletableFuture<byte[]> slot = inflight.remove(norm(etag) + "/" + (first + i));
-        if (slot != null) slot.complete(piece);
+        if (written == null) {
+          release.run();
+        } else {
+          written.whenComplete((v, e) -> {
+            if (e != null) tierFailures.incrementAndGet();
+            release.run();
+          });
+        }
       }
     });
   }
