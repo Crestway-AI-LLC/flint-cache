@@ -1,6 +1,6 @@
 # BUG-0045: the convergence gate is an equality, so it never fires under write load
 
-Status: OPEN, found 2026-08-24 · Severity: HIGH — a pair under sustained write
+Status: FIXED 2026-08-24 · Severity: HIGH — a pair under sustained write
 load can lose its master and REFUSE to promote a healthy, in-sync replica,
 staying write-dead until a human intervenes. A fix exists and is stranded on
 an unmerged branch; see BUG-0044 for how that happened.
@@ -81,3 +81,35 @@ fix. The subject line alone was not evidence — several branch commits describe
 failure classes main has since fixed independently, so each needs its defect
 checked against main's code. This one was checked: the equality is on main at
 line 635, and the gate it feeds is on main at line 800.
+
+## 2026-08-24 — fixed
+
+`643d12e` cherry-picked onto main. `Node::converged()` accepts `seq_lag == 0`
+OR lag inside the band, the band being the seat's own `lag_soft_ms` from the
+FLINTINFO the controller already parses. `main.rs:704` now reads
+`legit.converged()`.
+
+Gate green, 121 steps, both feature configs, 0 leaks. `loaded_promote` — the
+drill that demands a promotion WHILE writes are in flight, which nothing on
+main did before — passes in 14 s.
+
+Two things had to change to land it, neither in the original commit:
+
+  - **Ports.** The drill was written against 6460/6461; main has since given
+    that block to `proxy_chain`. Moved to 6956/6957. Two drills on one port
+    collide as a startup failure in whichever loses, and it reads as a product
+    defect in a drill that was merely unlucky.
+  - **CORE.** The branch's list also added `ingest_saturation` and
+    `replica_starvation`, which come from `9f3b868` and do not exist on main.
+    Taken: `loaded_promote` only. A CORE name with no drill behind it fails the
+    gate for a reason that has nothing to do with the change under test.
+
+Finding the port clash needed a corrected check. The earlier port audit used
+`sort -n -u`, and with `-n` the uniqueness key is the LEADING NUMBER, so it
+collapsed exactly the duplicates it was looking for and reported 442 unique
+declarations. The real count is 447: `controller_ha` names two of its own
+ports twice (harmless, same owner) and this clash (not).
+
+The second `seq_lag == Some(0)` at main.rs:304, in the legitimate-master
+search, is UNCHANGED and its consequence remains unestablished — flagged when
+this bug was opened and still open now.
