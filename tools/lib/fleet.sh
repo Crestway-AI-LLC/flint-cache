@@ -858,7 +858,7 @@ fleet_signal() {
     args="$(ps -o args= -p "$pid" 2>/dev/null)"
     # Remember THIS seat's port, so the release wait below covers exactly the
     # seats killed and not the whole declared block.
-    _killed_ports="$_killed_ports $(printf '%s' "$args" | grep -oE -- '--port[= ]+[0-9]+' | grep -oE '[0-9]+')"
+    _killed_pids="$_killed_pids $pid"
     case "$args" in
       *flint-*) ;;
       *) continue ;;
@@ -901,7 +901,7 @@ fleet_pids() { _fleet_ours "$@"; }
 
 fleet_kill() {
   local want="$*"
-  local pid args _killed_ports=""
+  local pid args _killed_pids=""
   for pid in $(_fleet_ours "$want"); do
     # RE-VERIFY before signalling. `pkill` matches and signals as one act;
     # this is a snapshot followed by a kill, and between the two the pid can
@@ -944,25 +944,30 @@ fleet_kill() {
   # of sleeping past it. Bounded, and silent on timeout — a port still held
   # after 5s is a different problem and the caller's own wait will report it
   # with better context than this function has.
-  # ONLY THE PORTS OF SEATS THIS CALL ACTUALLY KILLED.
+  # WAIT FOR THE PROCESSES TO BE GONE, NOT FOR A PORT TO LOOK FREE.
   #
-  # The first version waited on every port in FLEET_PORTS, which includes seats
-  # this call deliberately left alone: `fleet_kill server` then burned its full
-  # budget waiting for the proxy and control-plane ports to free, and they never
-  # would, because nothing had killed them. Drills call fleet_kill two to four
-  # times in a row, so that was ~10s of pure waiting per drill — measured as
-  # +10s on twelve drills and +413s (+27%) across the suite, against a baseline
-  # taken before any of this landed.
-  local _p _t
-  if [ -n "${_killed_ports# }" ]; then
+  # kill -9 is delivery, not death: the socket is released when the process
+  # actually exits. Every caller papers over that with a fixed `sleep`, which
+  # held only while a restarted node did not bind until after its full sync.
+  # #176 binds in milliseconds, so promote_notice's 0.4s became the whole
+  # margin and its replacement took EADDRINUSE and exited — "nothing listening
+  # on 127.0.0.1:6911 after 30s", then a promotion measured into a node that
+  # was not there.
+  #
+  # Two earlier attempts polled PORTS and both were wrong. Waiting on every
+  # declared port waits for seats this call deliberately left alone (the proxy
+  # is still up; its port never frees) and cost +10s per drill, 27 percent
+  # across the suite. Waiting on only the killed seats ports does nothing when
+  # the seats were already dead, which is exactly when the previous process is
+  # still exiting. The pid is the precise signal: it is gone or it is not.
+  local _pid _t
+  if [ -n "${_killed_pids# }" ]; then
     _t=$(( $(date +%s) + 5 ))
-    for _p in $_killed_ports; do
-      while (exec 3<>"/dev/tcp/127.0.0.1/$_p") 2>/dev/null; do
-        exec 3>&- 2>/dev/null
+    for _pid in $_killed_pids; do
+      while kill -0 "$_pid" 2>/dev/null; do
         [ "$(date +%s)" -ge "$_t" ] && break
-        sleep 0.05
+        sleep 0.02
       done
-      exec 3>&- 2>/dev/null
     done
   fi
   return 0
