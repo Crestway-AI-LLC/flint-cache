@@ -67,8 +67,8 @@ public final class SickTierSuite {
 
   public static void main(String[] args) throws Exception {
     String endpoint = args.length > 0 ? args[0] : "http://127.0.0.1:9000";
-    String healthy  = args.length > 1 ? args[1] : "redis://127.0.0.1:6399";
-    String sick     = args.length > 2 ? args[2] : "redis://127.0.0.1:6398";
+    String healthy  = args.length > 1 ? args[1] : "redis://127.0.0.1:9399";
+    String sick     = args.length > 2 ? args[2] : "redis://127.0.0.1:9398";
     Suite.endpoint = endpoint;
     final String KEY = "data/000001.bin";
     final int ROUNDS = 9;

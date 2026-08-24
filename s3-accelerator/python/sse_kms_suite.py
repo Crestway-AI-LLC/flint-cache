@@ -50,7 +50,7 @@ def read(f, key, off, n):
 def main():
     kms_ep = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:9530"
     plain_ep = sys.argv[2] if len(sys.argv) > 2 else "http://127.0.0.1:9531"
-    tier = sys.argv[3] if len(sys.argv) > 3 else "redis://127.0.0.1:6399"
+    tier = sys.argv[3] if len(sys.argv) > 3 else "redis://127.0.0.1:9399"
     rc = redis_lib.Redis.from_url(tier)
     KEY, LEN = "data/000001.bin", 200_000
 

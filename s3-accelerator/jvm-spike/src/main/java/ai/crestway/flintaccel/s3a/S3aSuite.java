@@ -56,7 +56,7 @@ public final class S3aSuite {
 
   public static void main(String[] args) throws Exception {
     String endpoint = args.length > 0 ? args[0] : "http://127.0.0.1:9000";
-    String tier = args.length > 1 ? args[1] : "redis://127.0.0.1:6399";
+    String tier = args.length > 1 ? args[1] : "redis://127.0.0.1:9399";
 
     Configuration conf = new Configuration();
     conf.set("fs.s3a.endpoint", endpoint);

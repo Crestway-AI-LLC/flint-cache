@@ -38,7 +38,7 @@ def stats(ep, path="/__stats"):
 
 def main():
     ep = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:9000"
-    tier = sys.argv[2] if len(sys.argv) > 2 else "redis://127.0.0.1:6399"
+    tier = sys.argv[2] if len(sys.argv) > 2 else "redis://127.0.0.1:9399"
     key = "data/000002.bin"
     rc = redis_lib.Redis.from_url(tier)
 
@@ -156,18 +156,18 @@ def main():
     # FlintS3FileSystem DIRECTLY with explicit keywords, while the README tells
     # users to call install(). The tested path and the documented path were
     # different paths, and only the tested one worked.
-    flint_accel.install(tier_uri="redis://127.0.0.1:6399", cache_sse_kms=True,
+    flint_accel.install(tier_uri="redis://127.0.0.1:9399", cache_sse_kms=True,
                         anon=False, key="p", secret="p",
                         client_kwargs={"endpoint_url": ep, "region_name": "us-east-1"})
     inst = fsspec.filesystem("s3", skip_instance_cache=True)
-    check(inst._tier_uri == "redis://127.0.0.1:6399",
+    check(inst._tier_uri == "redis://127.0.0.1:9399",
           f"install() applies the tier endpoint it was given ({inst._tier_uri})")
     check(inst._cache_kms is True, "install() applies cache_sse_kms")
     check(inst.key == "p",
           "install() also passes s3fs options through, not just Flint ones")
     over = fsspec.filesystem("s3", skip_instance_cache=True,
-                             tier_uri="redis://127.0.0.1:6400")
-    check(over._tier_uri == "redis://127.0.0.1:6400",
+                             tier_uri="redis://127.0.0.1:9400")
+    check(over._tier_uri == "redis://127.0.0.1:9400",
           "an explicit argument OVERRIDES install()'s default")
     flint_accel.install()
     cleared = fsspec.filesystem("s3", skip_instance_cache=True)

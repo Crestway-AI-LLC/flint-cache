@@ -35,7 +35,7 @@ declare -a FAILED
 PIDS=()
 cleanup() {
   for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null; done
-  "$TIER_CLI" -p 6399 shutdown nosave 2>/dev/null
+  "$TIER_CLI" -p 9399 shutdown nosave 2>/dev/null
   # Prove it, rather than assume the kills landed.
   local left
   # Attribute a leaked process to THIS gate by something this gate declared --
@@ -51,7 +51,7 @@ cleanup() {
   # machine as our leak. A developer box runs more than this gate; a check that
   # blames a neighbour is worse than no check, because the next person learns
   # to ignore it.
-  local pat="counting_s3\.py|slow_tier\.py|(valkey|redis)-server[^|]*--port (6398|6399)|(valkey|redis)-server[^|]*:(6398|6399)"
+  local pat="counting_s3\.py|slow_tier\.py|(valkey|redis)-server[^|]*--port (9398|9399)|(valkey|redis)-server[^|]*:(9398|9399)"
   local leaked
   leaked=$(ps -ax -o command= | grep -E "$pat" | grep -v grep || true)
   left=$(printf "%s" "$leaked" | grep -c . || true)
@@ -114,6 +114,15 @@ verdict "counting-s3 self-test" $?
 bash tools/preflight.sh --self-test >/tmp/gate_preflight.log 2>&1
 verdict "preflight version predicates (4 checks)" $?
 
+# Do our ports belong to us alone? Claimed once that they did, from a grep
+# pattern listing the ports already believed to be in use -- which found
+# exactly those and nothing else. Two of ours were in fact a sibling harness's,
+# and our teardown SHUTS DOWN whatever answers on the tier port, so the
+# collision would have stopped a neighbour's node via a clean RESP shutdown
+# that looks like their seat exiting for no reason.
+run_bounded bash "$ROOT/tools/port_exclusivity_check.sh" >/tmp/gate_ports.log 2>&1
+verdict "port exclusivity vs the sibling harness (3 checks)" $?
+
 # The sick-tier proxy is an instrument like counting_s3, and gets the same
 # treatment: a proxy that quietly added no delay would make a broken client
 # look healthy, so it self-tests with a zero-delay transparency control.
@@ -146,7 +155,7 @@ SHIM=$(ls jvm-spike/target/*hadoop-shim.jar 2>/dev/null | head -1)
 
 # ---------------------------------------------------------------- services
 start_svcs() { # port, extra-args
-  "$TIER_SERVER" --port 6399 --save '' --appendonly no --daemonize yes 2>/dev/null
+  "$TIER_SERVER" --port 9399 --save '' --appendonly no --daemonize yes 2>/dev/null
   python3 tools/counting_s3.py --port "$1" --objects 8 --object-bytes 8388608 ${2:-} \
       >/tmp/gate_origin_$1.log 2>&1 &
   PIDS+=($!)
@@ -157,9 +166,9 @@ stop_origin() { for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null; done; PIDS=()
 
 run_suite() { # label, mainclass, port, classpath, extra-origin-args
   start_svcs "$3" "${5:-}"
-  "$TIER_CLI" -p 6399 flushall >/dev/null 2>&1
+  "$TIER_CLI" -p 9399 flushall >/dev/null 2>&1
   local log="/tmp/gate_$(echo "$1" | tr ' /()' '____').log"
-  run_bounded java -cp "$4" "$2" "http://127.0.0.1:$3" redis://127.0.0.1:6399 >"$log" 2>&1
+  run_bounded java -cp "$4" "$2" "http://127.0.0.1:$3" redis://127.0.0.1:9399 >"$log" 2>&1
   local rc=$?
   [ $rc -eq 124 ] && printf "   \033[31mHUNG\033[0m  %s (>${SUITE_TIMEOUT}s)\n" "$1"
   verdict "$1" $rc
@@ -201,10 +210,10 @@ python3 tools/counting_s3.py --port 9309 --objects 4 --object-bytes 1048576 \
     >/tmp/gate_origin_9309.log 2>&1 &
 PIDS+=($!)
 sleep 2
-"$TIER_CLI" -p 6399 flushall >/dev/null 2>&1
+"$TIER_CLI" -p 9399 flushall >/dev/null 2>&1
 run_bounded java -cp "$ROOT/jvm-spike/target/classes:$CP" \
     ai.crestway.flintaccel.client.SseKmsSuite \
-    http://127.0.0.1:9308 http://127.0.0.1:9309 redis://127.0.0.1:6399 \
+    http://127.0.0.1:9308 http://127.0.0.1:9309 redis://127.0.0.1:9399 \
     >/tmp/gate_ssekms.log 2>&1
 verdict "SSE-KMS bypass + opt-in (12 checks)" $?
 
@@ -215,7 +224,7 @@ verdict "SSE-KMS bypass + opt-in (12 checks)" $?
 # key. A check on any single path passes while the others are wrong.
 run_bounded java -cp "$ROOT/jvm-spike/target/classes:$CP" \
     ai.crestway.flintaccel.s3a.SseKmsPathsSuite \
-    http://127.0.0.1:9308 redis://127.0.0.1:6399 >/tmp/gate_kmspaths.log 2>&1
+    http://127.0.0.1:9308 redis://127.0.0.1:9399 >/tmp/gate_kmspaths.log 2>&1
 verdict "SSE-KMS on all 3 adoption paths (7 checks)" $?
 
 # The counters, read the way an OPERATOR reads them -- through the platform
@@ -228,10 +237,10 @@ python3 tools/counting_s3.py --port 9311 --objects 4 --object-bytes 1048576 \
     >/tmp/gate_origin_9311.log 2>&1 &
 PIDS+=($!)
 sleep 2
-"$TIER_CLI" -p 6399 flushall >/dev/null 2>&1
+"$TIER_CLI" -p 9399 flushall >/dev/null 2>&1
 run_bounded java -cp "$ROOT/jvm-spike/target/classes:$CP" \
     ai.crestway.flintaccel.client.MetricsSuite \
-    http://127.0.0.1:9311 http://127.0.0.1:9308 redis://127.0.0.1:6399 \
+    http://127.0.0.1:9311 http://127.0.0.1:9308 redis://127.0.0.1:9399 \
     >/tmp/gate_metrics.log 2>&1
 verdict "JMX metrics, read via MBeanServer (13 checks)" $?
 stop_origin
@@ -242,14 +251,14 @@ stop_origin
 # deliberately the no-tier client, not the healthy one: a cache may be slower
 # than a fast cache, and may never be slower than no cache.
 start_svcs 9310 "--delay-ms 20"
-python3 tools/slow_tier.py --listen 6398 --upstream 6399 --delay-ms 200 \
+python3 tools/slow_tier.py --listen 9398 --upstream 9399 --delay-ms 200 \
     >/tmp/gate_proxy.log 2>&1 &
 PIDS+=($!)
 sleep 2
-"$TIER_CLI" -p 6399 flushall >/dev/null 2>&1
+"$TIER_CLI" -p 9399 flushall >/dev/null 2>&1
 run_bounded java -cp "$ROOT/jvm-spike/target/classes:$CP" \
     ai.crestway.flintaccel.client.SickTierSuite \
-    http://127.0.0.1:9310 redis://127.0.0.1:6399 redis://127.0.0.1:6398 \
+    http://127.0.0.1:9310 redis://127.0.0.1:9399 redis://127.0.0.1:9398 \
     >/tmp/gate_sicktier.log 2>&1
 verdict "sick tier is not slower than NO tier (4 checks)" $?
 stop_origin
@@ -263,21 +272,21 @@ stop_origin
 # than our tier.
 step "iceberg io-impl, end to end (real tables, avro + parquet)"
 start_svcs 9306
-"$TIER_CLI" -p 6399 flushall >/dev/null 2>&1
+"$TIER_CLI" -p 9399 flushall >/dev/null 2>&1
 ( cd jvm-spike && run_bounded mvn -q test-compile ) >/tmp/gate_ice_build.log 2>&1
 run_bounded java -cp "$ROOT/jvm-spike/target/classes:$ROOT/jvm-spike/target/test-classes:$CP_TEST" \
     ai.crestway.flintaccel.iceberg.IcebergSuite \
-    http://127.0.0.1:9306 redis://127.0.0.1:6399 >/tmp/gate_iceberg.log 2>&1
+    http://127.0.0.1:9306 redis://127.0.0.1:9399 >/tmp/gate_iceberg.log 2>&1
 verdict "iceberg table read via io-impl, avro + parquet (20 checks)" $?
 stop_origin
 
 # --------------------------------------------------- inherited contract suite
 step "hadoop contract suite (45 tests we did not write)"
 start_svcs 9310
-"$TIER_CLI" -p 6399 flushall >/dev/null 2>&1
+"$TIER_CLI" -p 9399 flushall >/dev/null 2>&1
 ( cd jvm-spike && run_bounded mvn -q test -Dtest=ITestFlintSeek,ITestFlintOpen \
     -DfailIfNoTests=false -Dflint.test.endpoint=http://127.0.0.1:9310 \
-    -Dflint.test.tier=redis://127.0.0.1:6399 ) >/tmp/gate_contract.log 2>&1
+    -Dflint.test.tier=redis://127.0.0.1:9399 ) >/tmp/gate_contract.log 2>&1
 verdict "Hadoop AbstractContract{Seek,Open}Test" $?
 stop_origin
 
@@ -286,9 +295,9 @@ step "python path"
 PYENV="${FLINT_PYENV:-$ROOT/python/.venv}"
 if [ -x "$PYENV/bin/python" ]; then
   start_svcs 9401 "--delay-ms 80"
-  "$TIER_CLI" -p 6399 flushall >/dev/null 2>&1
+  "$TIER_CLI" -p 9399 flushall >/dev/null 2>&1
   ( cd python && run_bounded "$PYENV/bin/python" suite.py \
-      http://127.0.0.1:9401 redis://127.0.0.1:6399 ) >/tmp/gate_python.log 2>&1
+      http://127.0.0.1:9401 redis://127.0.0.1:9399 ) >/tmp/gate_python.log 2>&1
   verdict "python suite (19 checks)" $?
   stop_origin
 
@@ -299,9 +308,9 @@ if [ -x "$PYENV/bin/python" ]; then
   if "$PYENV/bin/python" -c "import moto, pytest" 2>/dev/null; then
     "$PYENV/bin/python" -m moto.server -p 9810 >/tmp/gate_moto.log 2>&1 &
     PIDS+=($!); sleep 4
-    "$TIER_CLI" -p 6399 flushall >/dev/null 2>&1
+    "$TIER_CLI" -p 9399 flushall >/dev/null 2>&1
     ( cd python && FLINT_TEST_ENDPOINT=http://127.0.0.1:9810 \
-        FLINT_TEST_TIER=redis://127.0.0.1:6399 \
+        FLINT_TEST_TIER=redis://127.0.0.1:9399 \
         run_bounded "$PYENV/bin/python" -m pytest test_fsspec_contract.py \
         -q --no-header --deselect \
         test_fsspec_contract.py::TestFlintOpen::test_open_exclusive \
@@ -336,9 +345,9 @@ if [ -x "$PYENV/bin/python" ]; then
       >/tmp/gate_origin_9319.log 2>&1 &
   PIDS+=($!)
   sleep 2
-  "$TIER_CLI" -p 6399 flushall >/dev/null 2>&1
+  "$TIER_CLI" -p 9399 flushall >/dev/null 2>&1
   ( cd python && run_bounded "$PYENV/bin/python" sse_kms_suite.py \
-      http://127.0.0.1:9318 http://127.0.0.1:9319 redis://127.0.0.1:6399 \
+      http://127.0.0.1:9318 http://127.0.0.1:9319 redis://127.0.0.1:9399 \
     ) >/tmp/gate_ssekms_py.log 2>&1
   verdict "SSE-KMS on the python path (11 checks)" $?
   stop_origin

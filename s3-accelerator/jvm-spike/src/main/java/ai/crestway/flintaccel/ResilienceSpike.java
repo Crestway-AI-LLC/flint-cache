@@ -201,7 +201,7 @@ public final class ResilienceSpike {
 
   public static void main(String[] args) throws Exception {
     String endpoint = args.length > 0 ? args[0] : "http://127.0.0.1:9000";
-    String redis = args.length > 1 ? args[1] : "redis://127.0.0.1:6399";
+    String redis = args.length > 1 ? args[1] : "redis://127.0.0.1:9399";
     String bucket = "bucket", key = "data/000006.bin";
     boolean ok = true;
 
@@ -240,7 +240,7 @@ public final class ResilienceSpike {
 
       // Phase 2: KILL the tier, then keep reading.
       System.out.println("     -- killing the tier --");
-      new ProcessBuilder("valkey-cli", "-p", "6399", "shutdown", "nosave")
+      new ProcessBuilder("valkey-cli", "-p", "9399", "shutdown", "nosave")
           .redirectErrorStream(true).start().waitFor();
       Thread.sleep(600);
 

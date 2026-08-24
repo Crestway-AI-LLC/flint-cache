@@ -72,7 +72,7 @@ public final class MetricsSuite {
   public static void main(String[] args) throws Exception {
     String plain = args.length > 0 ? args[0] : "http://127.0.0.1:9000";
     String kmsEp = args.length > 1 ? args[1] : "http://127.0.0.1:9530";
-    String tier  = args.length > 2 ? args[2] : "redis://127.0.0.1:6399";
+    String tier  = args.length > 2 ? args[2] : "redis://127.0.0.1:9399";
     final String KEY = "data/000001.bin";
 
     TierSupport t = build(plain, tier, false);

@@ -45,7 +45,7 @@ ck() { if [ "$1" = 0 ]; then PASS=$((PASS+1)); printf "[ok] %s\n" "$2";
 # job with exit 143 the first time a SKIP guard tripped.
 cleanup() {
   [ -n "${ORIGIN_PID:-}" ] && kill "$ORIGIN_PID" 2>/dev/null
-  [ -n "${TIER_CLI:-}" ] && "$TIER_CLI" -p 6399 shutdown nosave 2>/dev/null
+  [ -n "${TIER_CLI:-}" ] && "$TIER_CLI" -p 9399 shutdown nosave 2>/dev/null
   return 0
 }
 trap cleanup EXIT
@@ -54,7 +54,7 @@ command -v valkey-server >/dev/null || { echo "SKIP: no "$TIER_SERVER""; exit 0;
 [ -x "$PYENV/bin/python" ] || { echo "SKIP: no python env"; exit 0; }
 [ -f /tmp/cp.txt ] || { echo "SKIP: no maven classpath at /tmp/cp.txt"; exit 0; }
 
-"$TIER_SERVER" --port 6399 --save "" --appendonly no --daemonize yes
+"$TIER_SERVER" --port 9399 --save "" --appendonly no --daemonize yes
 python3 "$ROOT/tools/counting_s3.py" --port "$PORT" --objects 4 --object-bytes 4194304 \
   >/tmp/xlang_origin.log 2>&1 & ORIGIN_PID=$!
 sleep 3
@@ -73,7 +73,7 @@ sys.path.insert(0, sys.argv[1] + "/python")
 import flint_accel
 so = dict(anon=False, key="p", secret="p",
           client_kwargs={"endpoint_url": sys.argv[2], "region_name": "us-east-1"},
-          tier_uri="redis://127.0.0.1:6399")
+          tier_uri="redis://127.0.0.1:9399")
 f = flint_accel.FlintS3FileSystem(skip_instance_cache=True, **so)
 with f.open("s3://bucket/" + sys.argv[3], "rb") as h:
     h.seek(0)
@@ -93,9 +93,9 @@ print(FlintTier._seal_of('\"abc123\"', 7, b'flint-interop-vector'))" 2>/dev/null
 [ -n "$JV" ] && [ "$JV" = "$PV" ]; ck $? "the seal agrees across languages (java=$JV python=$PV)"
 
 # --- 2. wide writer, narrow reader: must cost NOTHING ------------------------
-"$TIER_CLI" -p 6399 flushall >/dev/null
+"$TIER_CLI" -p 9399 flushall >/dev/null
 pyread
-PK=$("$TIER_CLI" -p 6399 --scan --pattern 'c1/*' | wc -l | tr -d ' ')
+PK=$("$TIER_CLI" -p 9399 --scan --pattern 'c1/*' | wc -l | tr -d ' ')
 [ "$PK" -gt 0 ]; ck $? "armed: the Python client populated the tier ($PK chunks)"
 B=$(st gets); jread; A=$(st gets)
 [ $((A-B)) -eq 0 ]; ck $? "THE JVM READS PYTHON'S CACHE FOR FREE ($((A-B)) origin GETs, want 0)"
@@ -108,9 +108,9 @@ sys.exit(0 if b==w and len(b)==$LEN else 1)"
 ck $? "and the bytes the JVM got are correct, not merely cheap"
 
 # --- 3. narrow writer, wide reader: must REUSE, cannot be free ---------------
-"$TIER_CLI" -p 6399 flushall >/dev/null
+"$TIER_CLI" -p 9399 flushall >/dev/null
 jread
-JK=$("$TIER_CLI" -p 6399 --scan --pattern 'c1/*' | wc -l | tr -d ' ')
+JK=$("$TIER_CLI" -p 9399 --scan --pattern 'c1/*' | wc -l | tr -d ' ')
 [ "$JK" -gt 0 ]; ck $? "armed: the JVM client populated the tier ($JK chunks)"
 pyread
 HITS=$(pyc chunk_hits)
@@ -125,10 +125,10 @@ ck $? "and the bytes Python got are correct"
 # --- 4. negative controls ----------------------------------------------------
 # Without these, a broken origin counter or a client that never ran would
 # produce the same all-zero output as perfect sharing.
-"$TIER_CLI" -p 6399 flushall >/dev/null
+"$TIER_CLI" -p 9399 flushall >/dev/null
 B=$(st gets); jread; A=$(st gets)
 [ $((A-B)) -gt 0 ]; ck $? "negative control: a COLD JVM read DOES hit the origin ($((A-B)) GETs)"
-"$TIER_CLI" -p 6399 flushall >/dev/null
+"$TIER_CLI" -p 9399 flushall >/dev/null
 pyread
 CM=$(pyc chunk_misses)
 [ "${CM:-0}" -gt 0 ]; ck $? "negative control: a COLD Python read DOES miss ($CM misses)"

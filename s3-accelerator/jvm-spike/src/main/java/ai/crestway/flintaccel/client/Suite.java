@@ -105,20 +105,20 @@ public final class Suite {
 
   static void startTier() throws Exception {
     runTier("FLINT_TIER_SERVER", new String[] {"valkey-server", "redis-server"},
-        "--port", "6399", "--save", "", "--appendonly", "no", "--daemonize", "yes")
+        "--port", "9399", "--save", "", "--appendonly", "no", "--daemonize", "yes")
         .waitFor();
     Thread.sleep(700);
   }
 
   static void killTier() throws Exception {
     runTier("FLINT_TIER_CLI", new String[] {"valkey-cli", "redis-cli"},
-        "-p", "6399", "shutdown", "nosave").waitFor();
+        "-p", "9399", "shutdown", "nosave").waitFor();
     Thread.sleep(600);
   }
 
   public static void main(String[] args) throws Exception {
     endpoint = args.length > 0 ? args[0] : "http://127.0.0.1:9000";
-    redisUrl = args.length > 1 ? args[1] : "redis://127.0.0.1:6399";
+    redisUrl = args.length > 1 ? args[1] : "redis://127.0.0.1:9399";
 
     S3AsyncClient s3 = S3AsyncClient.builder()
         .endpointOverride(URI.create(endpoint)).region(Region.US_EAST_1)

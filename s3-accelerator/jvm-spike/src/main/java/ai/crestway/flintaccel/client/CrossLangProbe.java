@@ -30,7 +30,7 @@ public final class CrossLangProbe {
             software.amazon.awssdk.auth.credentials.StaticCredentialsProvider.create(
                 AwsBasicCredentials.create("x", "x")))
         .forcePathStyle(true).build();
-    RedisClient rc = RedisClient.create("redis://127.0.0.1:6399");
+    RedisClient rc = RedisClient.create("redis://127.0.0.1:9399");
     StatefulRedisConnection<byte[], byte[]> cn = rc.connect(new ByteArrayCodec());
 
     try (var sdk = new S3SdkObjectClient(s3, false)) {

@@ -74,7 +74,7 @@ public final class IntegritySuite {
 
   public static void main(String[] args) throws Exception {
     String endpoint = args.length > 0 ? args[0] : "http://127.0.0.1:9000";
-    String redisUrl = args.length > 1 ? args[1] : "redis://127.0.0.1:6399";
+    String redisUrl = args.length > 1 ? args[1] : "redis://127.0.0.1:9399";
     Suite.endpoint = endpoint;
 
     S3AsyncClient s3 = S3AsyncClient.builder()

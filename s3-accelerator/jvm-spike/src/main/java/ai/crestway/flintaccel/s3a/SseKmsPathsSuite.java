@@ -90,7 +90,7 @@ public final class SseKmsPathsSuite {
 
   public static void main(String[] args) throws Exception {
     String kmsEp = args.length > 0 ? args[0] : "http://127.0.0.1:9530";
-    tierUri = args.length > 1 ? args[1] : "redis://127.0.0.1:6399";
+    tierUri = args.length > 1 ? args[1] : "redis://127.0.0.1:9399";
     final String KEY = "data/000001.bin";
 
     RedisClient rc = RedisClient.create(tierUri);

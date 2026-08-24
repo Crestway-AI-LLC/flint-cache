@@ -66,7 +66,7 @@ public final class IcebergSuite {
 
   public static void main(String[] args) throws Exception {
     endpoint = args.length > 0 ? args[0] : "http://127.0.0.1:9000";
-    String tierUri = args.length > 1 ? args[1] : "redis://127.0.0.1:6399";
+    String tierUri = args.length > 1 ? args[1] : "redis://127.0.0.1:9399";
 
     RedisClient rc = RedisClient.create(tierUri);
     StatefulRedisConnection<byte[], byte[]> conn = rc.connect(new ByteArrayCodec());
