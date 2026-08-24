@@ -348,18 +348,56 @@ case "$GATE_JOBS" in ''|*[!0-9]*) echo "FLINT_GATE_JOBS must be a positive integ
 # A drill declaring its OWN port twice is legal: controller_ha does, harmlessly,
 # because ownership is not ambiguous.
 assert_no_duplicate_drill_ports() {
-  local drill d bad
-  bad=$(for drill in tools/*_drill.sh; do
-    d=$(basename "$drill" _drill.sh)
-    sed -e :a -e '/\\$/N; s/\\\n//; ta' "$drill" 2>/dev/null \
-      | grep -oE 'fleet_init [^;&|]+' | grep -oE '\b[0-9]{4,5}\b' | sort -u \
-      | while read -r p; do printf '%s %s\n' "$p" "$d"; done
-  done | sort -n | awk '{c[$1]=c[$1]" "$2} END {for (p in c) {n=split(c[p],a," "); if (n>1) print "    port "p" declared by"c[p]}}')
+  . tools/lib/drill-ports.sh
+  local bad d decl used u map
+  map=$(drill_declared_ports)
+  bad=$(printf '%s\n' "$map" | sort -n \
+    | awk '{c[$1]=c[$1]" "$2} END {for (p in c) {n=split(c[p],a," "); if (n>1) print "    port "p" declared by"c[p]}}')
   if [ -n "$bad" ]; then
     echo "GATES FAILED: two drills declare the same port:"
     printf '%s\n' "$bad"
     echo "      A shared port is a startup failure in whichever drill loses,"
-    echo "      reported as a product defect. Give one of them a free port."
+    echo "      reported as a product defect. tools/next-free-ports.sh N prints"
+    echo "      a run of unclaimed ports."
+    exit 1
+  fi
+  # AND EVERY PORT USED IN CODE MUST BE DECLARED.
+  #
+  # The declarations are not documentation: _fleet_ours identifies a drill's
+  # pathless seats (a proxy is started with ports and no directory) by exactly
+  # this list, and tools/next-free-ports.sh treats anything undeclared as
+  # available. A drill using an undeclared port therefore owns a seat nothing
+  # can attribute AND invites the next drill to be handed that port. True for
+  # every drill as of 2026-08-24; this keeps it true.
+  # The map is built ONCE. Calling drill_declared_ports per drill re-scanned
+  # all 114 files each time -- ~13k scans, and 30s added to every gate run.
+  # A check that taxes the gate that heavily is a check someone eventually
+  # deletes, so its cost is part of whether it works.
+  local map; map=$(drill_declared_ports)
+  bad=""
+  for f in tools/*_drill.sh; do
+    d=$(basename "$f" _drill.sh)
+    decl=$(printf '%s\n' "$map" | awk -v d="$d" '$2==d {print $1}' | tr '\n' '|' | sed 's/|$//')
+    [ -z "$decl" ] && continue
+    # PORT SYNTAX, not "any four-digit number". The first version of this
+    # matched every 6300-9999 literal and produced 22 hits, of which the real
+    # ports were none: 8192 is a buffer size, 8000/8500 are timeouts, 9999 is a
+    # slot. A check that cannot tell a port from a number that looks like one
+    # reports the suite as broken and gets deleted, which is worse than not
+    # having it.
+    used=$(grep -v '^[[:space:]]*#' "$f" \
+      | grep -oE '(--port|-p)[[:space:]]+[0-9]{4,5}|127\.0\.0\.1:[0-9]{4,5}' \
+      | grep -oE '[0-9]{4,5}$' | sort -u)
+    for u in $used; do
+      drill_is_dead_port "$u" && continue
+      printf '%s\n' "$u" | grep -qE "^($decl)$" || bad="$bad
+    $d uses $u in code but declares only: $(printf '%s' "$decl" | tr '|' ' ')"
+    done
+  done
+  if [ -n "$bad" ]; then
+    echo "GATES FAILED: a drill uses a port it never declared to fleet_init:$bad"
+    echo "      fleet_init's port list is how _fleet_ours attributes seats that"
+    echo "      carry no path, and how next-free-ports.sh knows what is taken."
     exit 1
   fi
 }

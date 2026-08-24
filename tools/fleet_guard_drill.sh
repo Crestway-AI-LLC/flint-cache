@@ -58,7 +58,10 @@ unset FLINT_DRILL_PARALLEL
 [ -n "$PARALLEL_WAS" ] && echo "   (FLINT_DRILL_PARALLEL=$PARALLEL_WAS cleared for this drill; case G sets it explicitly)"
 [ -n "$FORCE_WAS" ] && echo "   (FLINT_DRILL_FORCE=$FORCE_WAS cleared for this drill; step E sets it back)"
 
-fleet_init $FLINT_DRILL_ROOT/flint-guard-drill 6999 6378 6379 6380 6381 6382 6383 6384 6385
+# 7788/7789 are case G's fake peer ports. Nothing binds them — they appear in
+# a fake controller's argv — but they are DECLARED so no other drill is ever
+# handed them, and so the gate's declared-vs-used check stays clean.
+fleet_init $FLINT_DRILL_ROOT/flint-guard-drill 6999 6378 6379 6380 6381 6382 6383 6384 6385 7788 7789
 
 echo "== A) a quiet box: the guard must let the drill run"
 # THIS CASE NEEDS A QUIET BOX AND CANNOT CREATE ONE. Another project's build
