@@ -77,3 +77,35 @@ One drill failing for harness reasons is exactly the outcome `gates.sh` warns
 about. `workflow_dispatch` now takes a `gate_jobs` input (default `1`, so
 nothing changes) precisely so this can be re-measured on the real runner
 without betting the gate on it.
+
+## The same mismatch exists in four other drills
+
+A scan of all 113 drills for data dirs matching no scope the drill declares:
+
+| drill | creates | declares |
+|---|---|---|
+| `chaos_unreadable` | `flint-unreadable` | `flint-chaosunread` |
+| `controller` | `flint-ctl-r` | `flint-ctl-m` |
+| `lease` | `flint-lease-cp`, `flint-lease-r` | `flint-lease-m` |
+| `min_replicas` | `flint-minr-r1`, `flint-minr-r2` | `flint-minr-m` |
+
+**These four pass under P=3 today**, so the mismatch alone is not sufficient to
+break a drill — every one of their seats is still recognised by a declared
+port. `failover` is distinguished by its zombie being started *outside*
+fleet.sh's tracking, leaving the directory as the only other marker it could
+have had.
+
+So they are latent, not active, and they are listed here rather than fixed
+because a change with no failing test behind it is a guess. The durable fix is
+an assertion — a drill's data dirs must live under a scope it declares — which
+becomes possible once all five are aligned.
+
+## First candidate fix, and how it gets judged
+
+`failover_drill.sh` now creates `flint-failover-{m,r}` instead of
+`flint-fo-{m,r}`, matching its `fleet_init`. Correct regardless of this bug: a
+scope the harness is told about should be the scope actually used.
+
+Whether it is *sufficient* is decided by re-running the gate at
+`gate_jobs=3`. If failover still fails, the cause is elsewhere and this bug
+stays open with one more candidate eliminated.

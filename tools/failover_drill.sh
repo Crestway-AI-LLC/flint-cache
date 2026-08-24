@@ -16,8 +16,20 @@ fleet_init $FLINT_DRILL_ROOT/flint-failover 6326 6327
 KEYS="${1:-20000}"
 MPORT="${2:-6326}"
 RPORT="${3:-6327}"
-MDIR="$(mktemp -d $FLINT_DRILL_ROOT/flint-fo-m.XXXXXX)"
-RDIR="$(mktemp -d $FLINT_DRILL_ROOT/flint-fo-r.XXXXXX)"
+# UNDER THE DECLARED SCOPE, not a shorthand of it (BUG-0047). fleet_init
+# above declares `flint-failover`, and the harness decides which seats belong
+# to this drill by that prefix OR by a declared port. `flint-fo-` matches
+# neither, so every seat here was recognised by port alone and never by its
+# directory — and the ZOMBIE, started outside fleet.sh's tracking, had nothing
+# else identifying it. This drill passes serially and fails under
+# FLINT_GATE_JOBS=3 with that zombie SIGKILLed; memory was measured at 12% of
+# the box, so the OOM killer is ruled out.
+#
+# Whether this alone is the cause is what the next parallel run answers. It is
+# correct regardless: a scope the harness is told about should be the scope
+# actually used.
+MDIR="$(mktemp -d $FLINT_DRILL_ROOT/flint-failover-m.XXXXXX)"
+RDIR="$(mktemp -d $FLINT_DRILL_ROOT/flint-failover-r.XXXXXX)"
 BIN="$(dirname "$0")/../target/release/flint-server"
 
 cleanup() {
