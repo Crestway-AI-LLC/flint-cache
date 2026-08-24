@@ -38,8 +38,29 @@ cleanup() {
   "$TIER_CLI" -p 6399 shutdown nosave 2>/dev/null
   # Prove it, rather than assume the kills landed.
   local left
-  left=$(ps -ax -o command= | grep -E '^(/opt/homebrew/bin/)?(valkey|redis)-server|counting_s3\.py' | grep -v grep | wc -l | tr -d ' ')
-  [ "$left" = 0 ] && echo "teardown: clean" || { echo "teardown: $left PROCESS(ES) LEFT"; ps -ax -o command= | grep -E '"$TIER_SERVER"|counting_s3' | grep -v grep; }
+  # Attribute a leaked process to THIS gate by something this gate declared --
+  # our own fixture script names, or a tier server on one of OUR ports. Two
+  # reasons, both learned rather than designed:
+  #
+  # The previous pattern anchored on ^(/opt/homebrew/bin/)?, a macOS Homebrew
+  # path, so on any Linux runner -- where the binary is /usr/bin/redis-server
+  # -- a leaked tier server matched nothing and the check printed "clean". A
+  # leak check that cannot SEE a process reports the same thing as no leak.
+  #
+  # And matching any redis-server anywhere would flag OTHER work on a shared
+  # machine as our leak. A developer box runs more than this gate; a check that
+  # blames a neighbour is worse than no check, because the next person learns
+  # to ignore it.
+  local pat="counting_s3\.py|slow_tier\.py|(valkey|redis)-server[^|]*--port (6398|6399)|(valkey|redis)-server[^|]*:(6398|6399)"
+  local leaked
+  leaked=$(ps -ax -o command= | grep -E "$pat" | grep -v grep || true)
+  left=$(printf "%s" "$leaked" | grep -c . || true)
+  if [ "${left:-0}" = 0 ]; then
+    echo "teardown: clean"
+  else
+    echo "teardown: $left PROCESS(ES) LEFT"
+    printf "%s\n" "$leaked"
+  fi
 }
 trap cleanup EXIT
 
