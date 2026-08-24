@@ -349,7 +349,7 @@ case "$GATE_JOBS" in ''|*[!0-9]*) echo "FLINT_GATE_JOBS must be a positive integ
 # because ownership is not ambiguous.
 assert_no_duplicate_drill_ports() {
   . tools/lib/drill-ports.sh
-  local bad d decl used u map
+  local bad d decl used u map f
   map=$(drill_declared_ports)
   bad=$(printf '%s\n' "$map" | sort -n \
     | awk '{c[$1]=c[$1]" "$2} END {for (p in c) {n=split(c[p],a," "); if (n>1) print "    port "p" declared by"c[p]}}')
@@ -373,10 +373,18 @@ assert_no_duplicate_drill_ports() {
   # all 114 files each time -- ~13k scans, and 30s added to every gate run.
   # A check that taxes the gate that heavily is a check someone eventually
   # deletes, so its cost is part of whether it works.
-  local map; map=$(drill_declared_ports)
+  #
+  # It was still being built TWICE — once above for the duplicate half and
+  # again here — so the comment describing the fix outlived the fix. Reuse it.
   bad=""
-  for f in tools/*_drill.sh; do
-    d=$(basename "$f" _drill.sh)
+  for f in tools/*_drill.sh tools/gates.sh; do
+    case "$f" in
+      *_drill.sh) d=$(basename "$f" _drill.sh) ;;
+      # gates.sh is scanned for the same reason it is declared: its
+      # conformance stage binds ports, so a port it uses and does not declare
+      # is the same defect here as in any drill.
+      *)          d=gates-conformance ;;
+    esac
     decl=$(printf '%s\n' "$map" | awk -v d="$d" '$2==d {print $1}' | tr '\n' '|' | sed 's/|$//')
     [ -z "$decl" ] && continue
     # PORT SYNTAX, not "any four-digit number". The first version of this
@@ -872,10 +880,17 @@ assert_server_flags_are_read() {
 # blanket rule would need an allowlist, which is how a check starts drifting
 # from what it means. The rule is that a drill which starts something must say
 # what it owns.
+# gates.sh IS CHECKED TOO, because it was the one file that broke this rule
+# while being exempt from it. Its conformance stage started three seats and
+# declared nothing, and the glob above is the only reason the check stayed
+# quiet — the harness wrote the rule and excluded itself. The fleet_init match
+# tolerates leading whitespace so a declaration inside an `if` block counts;
+# every drill's is unindented, so nothing about them changes.
 assert_spawning_drills_declare_ports() {
   local bad="" f
-  for f in tools/*_drill.sh; do
-    grep -q '^fleet_init' "$f" && continue
+  for f in tools/*_drill.sh tools/gates.sh; do
+    [ -f "$f" ] || continue
+    grep -qE '^[[:space:]]*fleet_init ' "$f" && continue
     grep -qE 'target/release/flint-|flintctl' "$f" || continue
     bad="$bad $f"
   done
@@ -1014,28 +1029,43 @@ fi
 if want conformance; then
   echo "== conformance: valkey (oracle), flint mem, flint rocks"
   CDIR=$(mktemp -d "${FLINT_DRILL_ROOT:-/tmp}/flint-gate-conf.XXXXXX")
+  # DECLARE THE PORTS BEFORE BINDING THEM. This block is the one part of the
+  # harness that started seats without telling fleet_init, which is exactly
+  # what assert_spawning_drills_declare_ports refuses in a drill -- and that
+  # check scans tools/*_drill.sh, so gates.sh was excluded from its own rule
+  # by the glob. Sequential ordering hid it: conformance finishes before
+  # the drills stage, so its overlap with edge_reroute (6398-6401) and
+  # fullsync_rate (6395, 6397) could not fire. It became reachable the day the
+  # drills stage went parallel.
+  . tools/lib/fleet.sh
+  fleet_init "$CDIR" 6390 6389 6388
+  fleet_guard
   # Each target starts inside its own subshell so THIS shell never owns it as
   # a job: a shell that owns a background job announces how it died, and
   # "Killed: 9" lines interleaved with the results make a clean gate look
   # like something went wrong.
-  ( valkey-server --port 6399 --save '' --appendonly no --daemonize no \
-      >"$LOGS/valkey.log" 2>&1 & )
-  ( ./target/release/flint-server --port 6398 --engine mem \
-      >"$LOGS/conf-mem.log" 2>&1 & )
-  ( ./target/release/flint-server --port 6397 --engine rocks --data-dir "$CDIR/rocks" \
-      >"$LOGS/conf-rocks.log" 2>&1 & )
-  for p in 6399 6398 6397; do
+  #
+  # The subshell also costs us $! in this shell, so each one records its own
+  # child's pid. Teardown needs it: stopping by PORT stops whatever answers on
+  # that port, which is not necessarily what we started.
+  ( valkey-server --port 6390 --save '' --appendonly no --daemonize no \
+      >"$LOGS/valkey.log" 2>&1 & echo $! >"$CDIR/oracle.pid" )
+  ( ./target/release/flint-server --port 6389 --engine mem \
+      >"$LOGS/conf-mem.log" 2>&1 & echo $! >"$CDIR/mem.pid" )
+  ( ./target/release/flint-server --port 6388 --engine rocks --data-dir "$CDIR/rocks" \
+      >"$LOGS/conf-rocks.log" 2>&1 & echo $! >"$CDIR/rocks.pid" )
+  for p in 6390 6389 6388; do
     for _ in $(seq 1 100); do
       [ "$(valkey-cli -p $p PING 2>/dev/null)" = "PONG" ] && break
       sleep 0.1
     done
   done
   step "conformance oracle" conf-oracle \
-    ./target/release/flint-conformance --target 127.0.0.1:6399 --reference
+    ./target/release/flint-conformance --target 127.0.0.1:6390 --reference
   step "conformance mem" conf-mem-run \
-    ./target/release/flint-conformance --target 127.0.0.1:6398
+    ./target/release/flint-conformance --target 127.0.0.1:6389
   step "conformance rocks" conf-rocks-run \
-    ./target/release/flint-conformance --target 127.0.0.1:6397
+    ./target/release/flint-conformance --target 127.0.0.1:6388
   # RESP3, which until now was never gated at all — and it is the dialect
   # redis-py 8 and node-redis negotiate BY DEFAULT, so the protocol most
   # clients actually speak had less coverage than the one they don't.
@@ -1047,19 +1077,42 @@ if want conformance; then
   # means the folding in `Client::normalize` matches Valkey, and only then
   # does a green Flint run mean anything.
   step "conformance oracle (RESP3)" conf-oracle3 \
-    ./target/release/flint-conformance --target 127.0.0.1:6399 --reference --proto 3
+    ./target/release/flint-conformance --target 127.0.0.1:6390 --reference --proto 3
   step "conformance mem (RESP3)" conf-mem3-run \
-    ./target/release/flint-conformance --target 127.0.0.1:6398 --proto 3
+    ./target/release/flint-conformance --target 127.0.0.1:6389 --proto 3
   step "conformance rocks (RESP3)" conf-rocks3-run \
-    ./target/release/flint-conformance --target 127.0.0.1:6397 --proto 3
+    ./target/release/flint-conformance --target 127.0.0.1:6388 --proto 3
   grep -h '^overall:' "$LOGS"/conf-*-run.log "$LOGS"/conf-oracle.log \
     "$LOGS"/conf-oracle3.log 2>/dev/null | sed 's/^/      /'
-  for p in 6399 6398 6397; do valkey-cli -p $p SHUTDOWN NOSAVE >/dev/null 2>&1; done
-  sleep 0.3
+  # STOP WHAT WE STARTED, NOT WHAT ANSWERS. `valkey-cli -p P SHUTDOWN` is a
+  # broadcast wearing the clothes of a cleanup: it stops whichever process
+  # holds P. A neighbouring harness in this repo does the same thing to 6399
+  # -- and FLUSHALLs it besides -- so the two teardowns can stop each other's
+  # seats. The collision that leaves the process UP is the expensive one: an
+  # emptied replica presents as lost acknowledged data, and gets investigated
+  # through replication rather than through the harness.
+  #
+  # So speak to the port ONLY while our own pid still holds it. If our pid is
+  # gone, whatever is answering there belongs to somebody else.
+  conf_stop() {   # conf_stop <port> <pidfile>
+    local _p _t
+    _p=$(cat "$2" 2>/dev/null)
+    case "$_p" in ''|*[!0-9]*) return 0 ;; esac
+    kill -0 "$_p" 2>/dev/null || return 0
+    # Graceful first: rocks wants a clean close, and SHUTDOWN gives it one.
+    valkey-cli -p "$1" SHUTDOWN NOSAVE >/dev/null 2>&1
+    _t=$(( $(date +%s) + 5 ))
+    while kill -0 "$_p" 2>/dev/null; do
+      [ "$(date +%s)" -ge "$_t" ] && { kill -9 "$_p" 2>/dev/null; break; }
+      sleep 0.05
+    done
+  }
+  conf_stop 6390 "$CDIR/oracle.pid"
+  conf_stop 6389 "$CDIR/mem.pid"
+  conf_stop 6388 "$CDIR/rocks.pid"
   # Belt and braces: SHUTDOWN is a request, and a wedged process would
-  # otherwise be inherited by the drills as a foreign fleet.
-  . tools/lib/fleet.sh
-  fleet_init "$CDIR" 6398 6397
+  # otherwise be inherited by the drills as a foreign fleet. Scoped to this
+  # block's own fleet, which fleet_init declared at the top.
   fleet_kill server
   rm -rf "$CDIR"
 fi
