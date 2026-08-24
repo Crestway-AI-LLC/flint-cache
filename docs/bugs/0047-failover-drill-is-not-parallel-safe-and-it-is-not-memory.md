@@ -1,0 +1,79 @@
+# BUG-0047 — failover_drill is not parallel-safe, and it is not the OOM killer
+
+**Status:** OPEN. The measurement `tools/gates.sh` asked for has now been taken.
+
+## Why this matters
+
+`FLINT_GATE_JOBS` has been opt-in since it landed, for a stated reason:
+
+> the knob stays opt-in until a parallel run has been green for a while,
+> because the failure mode of getting this wrong is a gate that reports red
+> for reasons that have nothing to do with the change under test.
+
+That is the right bar. This bug is the one thing standing between the gate and
+that bar — and closing it takes the gate from **31 minutes to ~16**.
+
+## Measured, on the runner that matters
+
+The 3.23x figure in `gates.sh` was taken on a c7i.4xlarge: 16 vCPU, 32 GB.
+CI is `ubuntu-latest`: 4 vCPU, 16 GB. Different machine, different answer, so
+the run was repeated there (`workflow_dispatch`, `gate_jobs=3`):
+
+| | serial | P=3 |
+|---|---|---|
+| wall clock | **31.2 min** | **~16 min** |
+| result | green | **1 fail / 108 pass** |
+| peak memory | not sampled | **1926 MB of 15989** |
+| `failover` | `PASS (5s)` | **`FAIL (4s)`** |
+
+## The OOM hypothesis is disproven
+
+`gates.sh` records that seats have twice been SIGKILLed under parallelism with
+no attributable killer, and names the kernel OOM killer as "the remaining
+candidate". It added a memory sampler so the next occurrence would "arrive
+with a number beside it instead of another round of elimination".
+
+**The number is 1926 MB of 15989 — 12% of the box.** No OOM lines in `dmesg`.
+Whatever kills the seat, it is not memory pressure, and that candidate can now
+be struck off rather than re-argued.
+
+## What actually fails
+
+`failover_drill.sh` kills its own master on purpose (line 66 — the `Killed`
+message there is expected). It then restarts that old master as a **ZOMBIE** on
+the same port to demonstrate the split-brain hazard, and asserts the zombie
+accepts a write. Under P=3 the zombie is SIGKILLed before that assertion:
+
+    == ZOMBIE: restart the OLD master on its old data dir
+    flint-server listening on 127.0.0.1:6326 (plaintext)
+    tools/failover_drill.sh: line 101: 6631 Killed  "$BIN" --port "$MPORT" ...
+
+## Eliminated so far
+
+- **Memory / OOM** — 12% peak, no `dmesg` evidence.
+- **Port collision** — 6326/6327 appear in no other drill.
+- **An unscoped `pkill`** — no drill kills `flint-server` without scoping to
+  its own port or data dir; `fleet.sh` has no broad sweep either.
+- **`step()`'s leaked-seat reap** — in the parallel path `step_report` replays
+  *after every drill has finished*, so it cannot fire mid-drill.
+
+## The lead worth pulling next
+
+The zombie is started with a bare `"$BIN" … &`, outside fleet.sh's tracking,
+and its data dir is `$FLINT_DRILL_ROOT/flint-fo-m.XXXXXX` — **not** the scope
+the drill declares to the harness:
+
+    fleet_init $FLINT_DRILL_ROOT/flint-failover 6326 6327
+    MDIR="$(mktemp -d $FLINT_DRILL_ROOT/flint-fo-m.XXXXXX)"
+
+So the zombie is recognised as the drill's only by its **port**, never by its
+directory. Anything that reasons about ownership by scope prefix sees an
+untracked Flint server. Making the drill declare the prefix it actually uses is
+cheap, testable, and would rule the last structural difference in or out.
+
+## Do not flip the default until this is green
+
+One drill failing for harness reasons is exactly the outcome `gates.sh` warns
+about. `workflow_dispatch` now takes a `gate_jobs` input (default `1`, so
+nothing changes) precisely so this can be re-measured on the real runner
+without betting the gate on it.
