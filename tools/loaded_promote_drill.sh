@@ -38,11 +38,15 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init "$FLINT_DRILL_ROOT/flint-loadpromote" 6460 6461
+# 6956/6957, NOT the 6460/6461 this drill was written with: main gave that
+# block to proxy_chain after this branch diverged. Two drills on one port
+# collide as a startup failure in whichever loses, which reads as a product
+# defect in a drill that was merely unlucky.
+fleet_init "$FLINT_DRILL_ROOT/flint-loadpromote" 6956 6957
 fleet_guard
 
-MPORT=6460
-RPORT=6461
+MPORT=6956
+RPORT=6957
 MDIR="$FLINT_DRILL_ROOT/flint-loadpromote/m"
 RDIR="$FLINT_DRILL_ROOT/flint-loadpromote/r"
 CTLLOG="$FLINT_DRILL_ROOT/flint-loadpromote-ctl.log"
