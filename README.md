@@ -1,13 +1,14 @@
 # Flint
 
 **A persistent, multi-threaded, multi-tenant cache that speaks Redis and
-never evicts.** Flint keeps your working set on local NVMe (RocksDB,
-Kvrocks-style encoding) instead of holding it hostage in RAM — so it
-survives restarts, replicates with a bounded loss window, fails over in
-seconds, and costs storage economics instead of memory economics. Commands
-run concurrently on every core rather than queued behind a single thread,
-and every tenant lives in its own isolated keyspace behind its own token
-and quota. Clients connect with any Redis client; no SDK, no new protocol.
+never evicts. It runs on NVMe SSDs, not RAM.** Flint keeps your working
+set on local disk (RocksDB, Kvrocks-style encoding) instead of holding it
+hostage in memory — so it survives restarts, replicates with a bounded
+loss window, fails over in seconds, and costs storage economics instead of
+memory economics. Commands run concurrently on every core rather than
+queued behind a single thread, and every tenant lives in its own isolated
+keyspace behind its own token and quota. Clients connect with any Redis
+client; no SDK, no new protocol.
 
 **Fewer misses beats faster hits.** A RAM cache is faster on a hit and that
 is not the number your users feel. When the working set does not fit,
