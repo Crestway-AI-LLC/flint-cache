@@ -31,6 +31,19 @@ on:
   # Hand-runnable, because "did my CI change work" should not require
   # opening a pull request to find out.
   workflow_dispatch:
+    inputs:
+      gate_jobs:
+        description: >-
+          Drills to run at once (FLINT_GATE_JOBS). 1 = the serial gate.
+          Raising this is how the parallel path gets EVIDENCE ON THIS RUNNER
+          before it becomes the default: the 3.23x measurement in
+          tools/gates.sh was taken on a c7i.4xlarge (16 vCPU / 32 GB), and
+          ubuntu-latest is 4 vCPU / 16 GB. Different machine, different
+          answer — the parallel path OOM-killed seats when it was too high,
+          and gates.sh prints the memory high-water so the margin is visible
+          rather than assumed.
+        required: false
+        default: "1"
 
 jobs:
   gate:
@@ -39,6 +52,10 @@ jobs:
     # an explicit number turns a hang into a failure with a reason.
     timeout-minutes: 60
     env:
+      # Serial by default, exactly as before. Overridable per manual run so
+      # the parallel path can be measured ON THIS RUNNER before anyone makes
+      # it the default — the bar tools/gates.sh sets for itself.
+      FLINT_GATE_JOBS: ${{ inputs.gate_jobs || '1' }}
       # In CI a skipped drill is a failed drill. See tools/gates.sh — locally
       # a skip is correct (no mkfs.ext4 on macOS), here it silently deletes
       # coverage from a run someone is about to trust.
