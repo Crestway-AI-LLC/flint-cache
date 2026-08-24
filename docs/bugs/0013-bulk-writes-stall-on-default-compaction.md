@@ -437,3 +437,45 @@ storage, ~6 h of wall clock, and ideally at a commit near the original
 sighting. Until someone wants that, the honest state is: **a real defect was
 found and confirmed on the fill side, and the defect this file was opened for
 is unreproduced on current code.**
+
+## 2026-08-24 — before tuning anything, read this: the obvious remedy is already measured
+
+The confirmed fill half points straight at `max_background_jobs`. **That was
+swept on 2026-08-17 and the result inverts the intuition.** On an i4i.2xlarge
+with the seat pinned to two cores, five sweeps of ~760 MB of incompressible
+10 KB values into an 8 MB level base:
+
+| jobs | mean MB/s (n=5) | W-Amp |
+|---|---|---|
+| default | 221.9 | 3.85 |
+| 2 (explicit) | 215.1 | 3.83 |
+| 4 | 198.1 | 5.26 |
+| 6 | 199.1 | 4.90 |
+
+Pooled: **218.5 -> 198.6 MB/s, -9.1%**, against a 3.1% error bar. Write
+amplification is the cleaner signal — **3.84 -> 5.08, +32%, with no overlap.**
+More parallel compaction does more total rewriting and bills it to the cores
+the write path needs.
+
+**Both results stand and they do not conflict.** That sweep was a 2-core seat
+with an 8 MB level base; this bug is a 16-vCPU box building a 60 GB LSM. On a
+small seat extra compaction threads steal the cores the write path needs; on a
+big box with a large LSM, two jobs cannot keep up. The knob is a function of
+cores and LSM size, and **neither measurement licenses a fleet-wide default on
+its own.**
+
+### The instrument is not in main
+
+`FLINT_BG_JOBS`, added by flint `66e02f1` as the opt-in knob for exactly this
+question, is on `origin/phase1-drills` and **was never merged**. The ops
+testing-roadmap calls it "shipped"; it is not. So the 2026-08-17 numbers were
+taken against a build main cannot reproduce, and there is currently no way to
+re-open the question without landing that commit first. See BUG-0044, which
+covers the branch and a live disk-guard defect stranded on it.
+
+### So the next step here is not a tuning change
+
+It is: land `66e02f1`, then sweep the knob in THIS regime — a large LSM on a
+box with cores to spare — and only then argue about a default. Sizing write
+buffers and adding a rate limiter are also untested; the 2026-08-17 work swept
+background jobs alone.

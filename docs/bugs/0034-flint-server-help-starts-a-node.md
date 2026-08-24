@@ -1,6 +1,8 @@
 # BUG-0034: `flint-server` ignores unrecognised arguments and starts a node (help/version FIXED; rejection ATTEMPTED AND REVERTED)
 
-Status: `--help` FIXED 2026-08-19 · the unknown-argument half is OPEN ·
+Status: BOTH HALVES FIXED · `--help` 2026-08-19; unknown-argument rejection
+landed 2026-08-23 (`reject_unknown_flags`/`ACCEPTED_FLAGS` in flint-server,
+with a test asserting every arg() call site is listed) ·
 Severity: medium — an operator asking for usage gets a running node instead,
 and one stray copy refused 64 drills in a single gate
 
