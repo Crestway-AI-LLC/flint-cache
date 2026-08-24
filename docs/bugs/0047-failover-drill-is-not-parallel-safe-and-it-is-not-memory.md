@@ -195,8 +195,42 @@ arriving before the failure. Checked here across serial / P=3 / P=6:
     chaos          115 -> 129 -> 120
     edge_roll       40 -> 41 -> 56      <- +40%, the one to watch
 
-Mild monotonic inflation rather than instability. One sample per configuration
-rules nothing out, so this is a baseline to compare against, not an all-clear.
+One sample per configuration rules nothing out, so this is a baseline to
+compare against, not an all-clear.
+
+**A retracted claim, and why the retraction matters more than the claim.**
+This table originally read "mild monotonic inflation rather than instability".
+A peer session pointed out that the hedge was applied asymmetrically: the
+variance claim was flagged as unsupported by n=1, and the *pattern* claim
+sitting beside it — which needs at least as much evidence — was not. The
+unhedged one was the reassuring one, and that is the reading that gets adopted
+by default.
+
+The data is consistent with mild inflation. It is equally consistent with noise
+plus one real regression, and n=1 per cell cannot separate those.
+
+Checking the arithmetic: exactly **one** of six is non-monotonic (`chaos`,
+115 -> 129 -> 120). `edge_roll` at 40 -> 41 -> 56 *is* monotonic — an uneven
+step, not a reversal. But the step sizes are the real signal, and they make a
+better case than monotonicity would have:
+
+    drill            serial->P=3   P=3->P=6
+    promote_notice        +1          +1
+    upgrade               +7          +3     decelerating
+    decommission          +0          +4
+    cpha_roll             +0          +3
+    edge_roll             +1         +15     accelerating, 15x its first step
+
+Everything else inflates smoothly or decelerates as jobs increase. `edge_roll`
+is flat from 1->3 then adds 15s from 3->6. Uniform contention should not switch
+on between P=3 and P=6; a threshold — CPU starvation crossing a timing-sensitive
+wait, in a rolling-upgrade drill — should.
+
+**Open, with a designed experiment.** `edge_roll` plus five cheap drills via
+`FLINT_CORE_ORDER`, run at `FLINT_GATE_JOBS=1` and `=6`, five times each. Same
+set both arms. ~46s with a tight spread means uniform contention; a consistent
+~56s or a bimodal 40/56 split means a real wait is being missed, and bimodal is
+the outcome that says so loudest.
 
 **Correction: ranking that table by percentage was wrong.** A peer session
 pointed out that short drills pay a roughly FIXED contention cost — bring-up,
