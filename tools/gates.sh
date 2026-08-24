@@ -459,8 +459,20 @@ assert_declared_scopes_cover_data_dirs() {
   # declared scope" and this returns clean. That is exactly how a peer's port
   # check lied to them today: the pattern encoded its own answer, so it could
   # not fail. A check that cannot fail is not a check; refuse to pass on zero.
-  if [ "$seen" -eq 0 ]; then
-    echo "FAIL  the data-dir scan matched NOTHING across $(ls tools/*_drill.sh 2>/dev/null | wc -l | tr -d " ") drills."
+  local ndrills; ndrills=$(ls tools/*_drill.sh 2>/dev/null | wc -l | tr -d " ")
+  # ONLY when there was something to scan. gates_drill.sh forges a tree whose
+  # `step` is stubbed and runs a COPY of this script there — it has to, since
+  # the gate runs that drill and an invocation reaching a real stage would run
+  # the suite from inside itself. That tree holds no *_drill.sh, so an empty
+  # scan is the correct answer, not a broken parser.
+  #
+  # The first cut of this guard keyed on "$seen -eq 0" alone and failed the
+  # forged run, which turned the drill's own positive control red. Caught by
+  # the full gate, not by the unit checks, because the unit checks only ever
+  # ran in a tree that has drills — the guard was untestable in the one
+  # environment where it was wrong.
+  if [ "$seen" -eq 0 ] && [ "${ndrills:-0}" -gt 0 ]; then
+    echo "FAIL  the data-dir scan matched NOTHING across $ndrills drills."
     echo "        That is not a clean bill of health — the extractor is broken,"
     echo "        or the mktemp idiom it keys on has changed. Fix the parser."
     FAILED="$FAILED unscoped-data-dir-scan-empty"
