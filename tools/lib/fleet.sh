@@ -856,6 +856,9 @@ fleet_signal() {
   local pid args hit=1
   for pid in $(_fleet_ours "$want"); do
     args="$(ps -o args= -p "$pid" 2>/dev/null)"
+    # Remember THIS seat's port, so the release wait below covers exactly the
+    # seats killed and not the whole declared block.
+    _killed_ports="$_killed_ports $(printf '%s' "$args" | grep -oE -- '--port[= ]+[0-9]+' | grep -oE '[0-9]+')"
     case "$args" in
       *flint-*) ;;
       *) continue ;;
@@ -898,7 +901,7 @@ fleet_pids() { _fleet_ours "$@"; }
 
 fleet_kill() {
   local want="$*"
-  local pid args
+  local pid args _killed_ports=""
   for pid in $(_fleet_ours "$want"); do
     # RE-VERIFY before signalling. `pkill` matches and signals as one act;
     # this is a snapshot followed by a kill, and between the two the pid can
@@ -941,10 +944,19 @@ fleet_kill() {
   # of sleeping past it. Bounded, and silent on timeout — a port still held
   # after 5s is a different problem and the caller's own wait will report it
   # with better context than this function has.
+  # ONLY THE PORTS OF SEATS THIS CALL ACTUALLY KILLED.
+  #
+  # The first version waited on every port in FLEET_PORTS, which includes seats
+  # this call deliberately left alone: `fleet_kill server` then burned its full
+  # budget waiting for the proxy and control-plane ports to free, and they never
+  # would, because nothing had killed them. Drills call fleet_kill two to four
+  # times in a row, so that was ~10s of pure waiting per drill — measured as
+  # +10s on twelve drills and +413s (+27%) across the suite, against a baseline
+  # taken before any of this landed.
   local _p _t
-  if [ -n "${FLEET_PORTS:-}" ]; then
+  if [ -n "${_killed_ports# }" ]; then
     _t=$(( $(date +%s) + 5 ))
-    for _p in $(printf '%s' "$FLEET_PORTS" | tr '|' ' '); do
+    for _p in $_killed_ports; do
       while (exec 3<>"/dev/tcp/127.0.0.1/$_p") 2>/dev/null; do
         exec 3>&- 2>/dev/null
         [ "$(date +%s)" -ge "$_t" ] && break
