@@ -421,19 +421,32 @@ fi
 # name nobody declared reintroduces the bug, and would again present as one
 # unrelated drill failing only in parallel.
 assert_declared_scopes_cover_data_dirs() {
-  local drill d decl used bad="" hit
+  local drill d decl used bad="" hit seen=0
   for drill in tools/*_drill.sh; do
     d=$(basename "$drill" _drill.sh)
     decl=$(grep -hE '^fleet_init' "$drill" 2>/dev/null | awk '{print $2}' | sed 's|.*/||')
     [ -n "$decl" ] || continue
     used=$(grep -oE 'mktemp -d "?\$\{?FLINT_DRILL_ROOT\}?/[A-Za-z0-9_.-]+' "$drill" 2>/dev/null | sed 's|.*/||')
     for u in $used; do
+      seen=$((seen + 1))
       hit=0
       for p in $decl; do case "$u" in "$p"*) hit=1 ;; esac; done
       [ "$hit" = 0 ] && bad="$bad
     $d: creates '$u', declares $(echo $decl)"
     done
   done
+  # ARMED. If the extractor matches nothing — a changed mktemp idiom, a broken
+  # regex, a rename — then every drill trivially satisfies "no dir outside its
+  # declared scope" and this returns clean. That is exactly how a peer's port
+  # check lied to them today: the pattern encoded its own answer, so it could
+  # not fail. A check that cannot fail is not a check; refuse to pass on zero.
+  if [ "$seen" -eq 0 ]; then
+    echo "FAIL  the data-dir scan matched NOTHING across $(ls tools/*_drill.sh 2>/dev/null | wc -l | tr -d " ") drills."
+    echo "        That is not a clean bill of health — the extractor is broken,"
+    echo "        or the mktemp idiom it keys on has changed. Fix the parser."
+    FAILED="$FAILED unscoped-data-dir-scan-empty"
+    return 0
+  fi
   [ -z "$bad" ] && return 0
   echo "FAIL  data dir(s) outside every scope the drill declares:$bad"
   echo "        The harness can only attribute a seat by its fleet_init scope"
