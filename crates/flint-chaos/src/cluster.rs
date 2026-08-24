@@ -1065,6 +1065,45 @@ pub fn wait_for_pong(port: u16, budget: Duration) -> bool {
 ///
 /// Only an explicit `loading:1` counts as not-ready, so a seat from a build
 /// before #176 reads exactly as `wait_for_pong` always read it.
+/// How long a freshly attached replica may take to finish its initial full
+/// sync and stop reporting `loading:1`.
+///
+/// This is NOT the same question as "is the process up", and conflating the
+/// two is what broke. #176 made a syncing node visible, so `wait_for_ready`
+/// returns at the END of the seed where `wait_for_pong` returned at its
+/// START — and every call site kept the 15 s budget that had been chosen for
+/// the latter. The gate passed on a 16-vCPU box and CI failed on 4 vCPUs,
+/// which is the runner being right rather than slow.
+///
+/// 120 s matches `fleet_wait_ready` in tools/lib/fleet.sh, which draws the
+/// same alive-vs-ready line for the shell drills. A seed's duration is a
+/// function of the dataset and the machine, so this is a ceiling on a hang,
+/// not an estimate of the work.
+pub const SEED_READY_BUDGET: Duration = Duration::from_secs(120);
+
+/// Why a readiness wait ran out, in the words of the two distinct failures.
+///
+/// A bare "replacement replica up" cannot tell a seat that never bound from
+/// one that bound and never finished seeding. Those have different causes and
+/// the message is the only place the difference is cheap to record.
+pub fn ready_diagnosis(port: u16) -> String {
+    let bound = Client::connect(port)
+        .ok()
+        .and_then(|mut c| c.call(&[b"PING"]).ok())
+        .is_some_and(|v| matches!(v, Value::Simple(ref s) if s == "PONG"));
+    if !bound {
+        return format!(":{port} never bound — the seat is not answering at all");
+    }
+    match flintinfo_field(port, "loading:") {
+        Some(v) if v.trim() == "1" => format!(
+            ":{port} bound but is STILL LOADING — the initial full sync did not \
+             finish inside the budget; this is a seed that is slow or stuck, not \
+             a seat that failed to start"
+        ),
+        _ => format!(":{port} answers and reports not-loading — readiness raced"),
+    }
+}
+
 pub fn wait_for_ready(port: u16, budget: Duration) -> bool {
     let start = Instant::now();
     while start.elapsed() < budget {
@@ -1206,8 +1245,9 @@ impl Cluster {
         );
         fleet.track(spawn_node(replica_port, &fresh_dir(1), Some(master_port)));
         assert!(
-            wait_for_ready(replica_port, Duration::from_secs(15)),
-            "replica up"
+            wait_for_ready(replica_port, SEED_READY_BUDGET),
+            "replica up: {}",
+            ready_diagnosis(replica_port)
         );
         Self {
             fleet,
@@ -1433,8 +1473,9 @@ impl Cluster {
         self.fleet
             .track(spawn_node(self.replica_port, &dir, Some(self.master_port)));
         assert!(
-            wait_for_ready(self.replica_port, Duration::from_secs(15)),
-            "replacement replica up"
+            wait_for_ready(self.replica_port, SEED_READY_BUDGET),
+            "replacement replica up: {}",
+            ready_diagnosis(self.replica_port)
         );
         self.master_port
     }
@@ -1498,8 +1539,9 @@ impl Cluster {
         self.master_port = survivor;
         self.replica_port = dead;
         assert!(
-            wait_for_ready(dead, Duration::from_secs(15)),
-            "replacement replica up on :{dead}"
+            wait_for_ready(dead, SEED_READY_BUDGET),
+            "replacement replica up on :{dead}: {}",
+            ready_diagnosis(dead)
         );
         self.master_port
     }
@@ -1518,8 +1560,9 @@ impl Cluster {
         ));
         self.next_id += 1;
         assert!(
-            wait_for_ready(dead, Duration::from_secs(15)),
-            "replacement replica up on :{dead}"
+            wait_for_ready(dead, SEED_READY_BUDGET),
+            "replacement replica up on :{dead}: {}",
+            ready_diagnosis(dead)
         );
     }
 
@@ -1532,8 +1575,9 @@ impl Cluster {
         self.fleet
             .track(spawn_node(self.replica_port, &dir, Some(self.master_port)));
         assert!(
-            wait_for_ready(self.replica_port, Duration::from_secs(15)),
-            "replacement replica up"
+            wait_for_ready(self.replica_port, SEED_READY_BUDGET),
+            "replacement replica up: {}",
+            ready_diagnosis(self.replica_port)
         );
     }
 }
