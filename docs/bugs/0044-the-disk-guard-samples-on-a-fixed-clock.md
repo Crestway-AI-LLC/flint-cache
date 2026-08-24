@@ -78,3 +78,82 @@ commit, each rebased onto current main and gated, in this order:
 
 Each needs `tools/gates.sh` green in both feature configs. `diskguard.rs` has
 diverged by 222 lines, so (1) is a real rebase and not a fast-forward.
+
+## 2026-08-24 — batch 1 landed; the branch is deeper than this file first said
+
+**The live defect is fixed on main.** `ec73cd9` and `5554755` cherry-picked
+onto current main (as `f4aaad6`, `de92e2f`), plus the knobs and the drill that
+test them (`9b468c6`). Full gate green, 120 steps, both feature configs;
+`disk_selffill` passes on Linux in 18 s and on macOS locally, so both the
+`mkfs.ext4`/loop and `hdiutil` paths are covered. The guard now refuses at 15%
+against a 20% threshold where the fixed cadence let it reach 7-10%.
+
+`disk_selffill` joining CORE immediately tripped
+`assert_no_cross_drill_kill_patterns`: the new drill declares 6458, and
+`controller_ha`'s cleanup swept `--port 645`, which had been self-contained
+until that moment. Scoped to `fleet_kill server`. The check caught a
+collision as it was introduced rather than as an intermittent failure later,
+which is the entire reason it exists.
+
+Staged behind it and gating: `66e02f1` (`FLINT_BG_JOBS`), `c6f2a4c` (m3_exit
+evidence), and `4656b30` + its three fixes (`tools/ingest_decay_sweep.sh`),
+which is what makes BUG-0013's compaction question re-runnable at all.
+
+### One commit deliberately NOT taken
+
+`014d840` — "write_deadline: a positive control that fires on a spike is a
+coin toss". Main solved the same problem independently and better: it ramps
+the load 32 -> 64 -> 128 -> 256 until the control actually arms, and fails
+with "the positive control COULD NOT BE ARMED on this machine", distinguishing
+a failure to create the condition from evidence about the shed. The branch
+version predicts the load's cost instead. Two designs for one assertion is
+worse than either; main's stands, and it already cites docs/bugs/0030.
+
+### The audit this file should have opened with
+
+"19 commits ahead" undersold it. Ten commits remain stranded, and several
+touch product code, not drills:
+
+| commit | subject |
+|---|---|
+| `643d12e` | controller: a convergence gate written as an equality never fires |
+| `28a0aa8` | server: FLINTSYNC must prove the WAL can reach the cursor before promoting |
+| `775911c` | server: a node that cannot serve yet must be visible, not dark |
+| `e150289` | wal: make the retention window configurable, and drill the replica |
+| `d932c7c` | gates: a blind replace disabled the checks; restore them |
+| `9f3b868` | drills: write-path and capacity regimes (PARTIALLY taken — the rocks.rs knobs and `disk_selffill` landed; `ingest_saturation_drill.sh` and the `replica_starvation` rewrite did not) |
+| `542da86` | coproc drills: derive the durable-row count instead of asserting a constant |
+| `a46228c` | drills: match the process, not a mention of its name |
+| `247fefc` | drill: say what the starvation arms measure |
+| `f6b4780` | docs: min-replicas-to-write is the operator's to set |
+
+**That list is a starting point, not a verdict.** It was built by matching
+commit subjects against main's history, which is a weak test: main may well
+have fixed the same defect with different wording, and at least two of these
+describe failure classes main has demonstrably addressed since — `a46228c` is
+the unanchored-match family, which main has now fixed in several places, and
+`643d12e`'s equality-gate shape has a field-notes entry of its own dated
+2026-08-16. **Each remaining commit needs its defect checked against main's
+CODE before anyone concludes it is missing.**
+
+`643d12e` in particular is a 249-line controller change plus a new
+`loaded_promote_drill.sh`. A weak check suggests main still carries the
+pre-fix shape, but that is not established, and a change of that size to the
+promotion path deserves its own session and its own gate rather than being
+carried along on the momentum of a disk-guard fix.
+
+### Audit results so far — the list above was overstated, as warned
+
+Four of the ten checked against main's CODE rather than its commit subjects:
+
+| commit | verdict |
+|---|---|
+| `643d12e` controller convergence equality | **CONFIRMED LIVE on main** (`flint-controller/src/main.rs:635`), and the gate it feeds is at :800. Filed as **BUG-0045**, severity HIGH — a pair under write load can refuse to promote a healthy replica and stay write-dead. |
+| `28a0aa8` FLINTSYNC WAL reachability | **ALREADY FIXED on main** (`flint-server/src/main.rs:3859` carries the exact `updates_since_budgeted(cursor, 1)` guard). Not missing. Do not re-land. |
+| `775911c` a syncing node must not be dark | **NOT ESTABLISHED.** `loading:` and `wait_for_ready` are absent from main, but main opens its listener BEFORE it starts tailing, so a node is not dark in the ordinary case. Whether the FULL-SYNC path differs is unchecked. |
+| `e150289` configurable WAL retention | **PARTIALLY SUPERSEDED.** The env knobs are absent, but main threads `wal_ttl_seconds`/`wal_size_limit_mb` as parameters through `open_with_wal`, so the window IS configurable by a different route. Only the env-var spelling is missing. |
+
+One confirmed live defect, one already fixed, one unestablished, one
+superseded — from four commits whose subjects all read as missing fixes. That
+ratio is the argument for checking code over subjects, and it is why the six
+unchecked entries above remain claims rather than findings.
