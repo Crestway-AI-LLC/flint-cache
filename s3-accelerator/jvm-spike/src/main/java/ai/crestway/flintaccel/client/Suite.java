@@ -74,15 +74,45 @@ public final class Suite {
     return Integer.parseInt(b.substring(i + 7, b.indexOf(',', i)).trim());
   }
 
+  /**
+   * Valkey or Redis, whichever this machine has.
+   *
+   * The suites need a Redis-protocol server and do not care which
+   * implementation provides one; hardcoding `valkey-server` made this
+   * unrunnable on any CI image that does not package it, which is most of
+   * them. FLINT_TIER_SERVER / FLINT_TIER_CLI override, so the gate can pass
+   * down whatever it resolved rather than each layer guessing separately.
+   */
+  static Process runTier(String env, String[] candidates, String... args) throws Exception {
+    java.util.List<String> tries = new ArrayList<>();
+    String override = System.getenv(env);
+    if (override != null && !override.isEmpty()) tries.add(override);
+    tries.addAll(Arrays.asList(candidates));
+    IOException last = null;
+    for (String bin : tries) {
+      List<String> cmd = new ArrayList<>();
+      cmd.add(bin);
+      cmd.addAll(Arrays.asList(args));
+      try {
+        return new ProcessBuilder(cmd).redirectErrorStream(true).start();
+      } catch (IOException e) {
+        last = e;               // not on PATH; try the next
+      }
+    }
+    throw new IllegalStateException(
+        "no Redis-protocol server found (tried " + tries + ")", last);
+  }
+
   static void startTier() throws Exception {
-    new ProcessBuilder("valkey-server", "--port", "6399", "--save", "",
-        "--appendonly", "no", "--daemonize", "yes").start().waitFor();
+    runTier("FLINT_TIER_SERVER", new String[] {"valkey-server", "redis-server"},
+        "--port", "6399", "--save", "", "--appendonly", "no", "--daemonize", "yes")
+        .waitFor();
     Thread.sleep(700);
   }
 
   static void killTier() throws Exception {
-    new ProcessBuilder("valkey-cli", "-p", "6399", "shutdown", "nosave")
-        .redirectErrorStream(true).start().waitFor();
+    runTier("FLINT_TIER_CLI", new String[] {"valkey-cli", "redis-cli"},
+        "-p", "6399", "shutdown", "nosave").waitFor();
     Thread.sleep(600);
   }
 
