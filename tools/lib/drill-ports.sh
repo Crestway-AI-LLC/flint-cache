@@ -43,7 +43,14 @@ drill_declared_ports() {
 # and start testing something else entirely, while still passing. So the set is
 # named here: the allocator never hands them out, and the gate does not report
 # them as undeclared usage.
-DRILL_DEAD_PORTS="6999 7999"
+# 7788/7789 join the set for a different reason worth stating. They appear only
+# in the argv of fleet_guard case G's FAKE peer controller; nothing binds them.
+# DECLARING them to fleet_init was tried and reverted: the declaration is also
+# the ownership key, so _fleet_ours then claimed the fake as OURS, and case G's
+# negative control — "with the peer's ports removed, its path-less seat must
+# read as foreign again" — could no longer fire. The check that caught it was
+# the drill itself, on the next gate.
+DRILL_DEAD_PORTS="6999 7999 7788 7789"
 
 drill_is_dead_port() {
   case " $DRILL_DEAD_PORTS " in *" $1 "*) return 0 ;; *) return 1 ;; esac
