@@ -1555,9 +1555,22 @@ fn main() -> std::io::Result<()> {
         eprintln!("lag caps: soft={lag_soft}ms hard={lag_hard}ms");
     }
     // Safety gate: shed writes while live replicas < this (Redis
-    // min-replicas-to-write). Set to 1 on replicated pairs so a widowed or
-    // isolated master cannot accept unbounded at-risk writes; leave 0 for
-    // standalone nodes.
+    // min-replicas-to-write). Operator-settable, honoured at whatever value is
+    // given, and hot-reloadable through FLINTCONFIG.
+    //
+    // DEFAULT 0, and it stays there. This is a cache with async replication,
+    // and refusing a write is worse than risking one — the same reason Redis
+    // ships min-replicas-to-write 0. flintctl passes the flag only when an
+    // operator sets `min-replicas` in the inventory.
+    //
+    // 1 IS A REAL TRADE, NOT A STRICTLY SAFER SETTING, and this comment used
+    // to recommend it. A freshly promoted master has no replica either, and
+    // the gate cannot tell "my peer died" from "I was just promoted": it sheds
+    // every write until a replacement attaches AND acks, which on a large
+    // dataset is a whole full sync. So it trades failover RTO for durability
+    // on every single failover. docs/failover.md states that trade for
+    // operators; the guard that IS on by default for pair members is the
+    // widowed grace, which buys the same bound without it.
     let min_replicas: u32 = arg("--min-replicas-to-write")
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
