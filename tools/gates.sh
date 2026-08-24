@@ -366,8 +366,28 @@ case "$GATE_JOBS" in ''|*[!0-9]*) echo "FLINT_GATE_JOBS must be a positive integ
 #
 # A drill declaring its OWN port twice is legal: controller_ha does, harmlessly,
 # because ownership is not ambiguous.
+# IS THIS A REAL CHECKOUT? gates_drill.sh forges a gates.sh into a bare
+# directory holding nothing but tools/gates.sh — no tools/lib, no drills — to
+# test argument dispatch without running the suite recursively. Every
+# drill-scanning assertion is meaningless there, and the ones that predate this
+# helper coped by accident: assert_no_duplicate_drill_ports sourced a
+# drill-ports.sh that was not there, took `command not found` for an empty map,
+# and passed. That is a check passing because it could not run, which is the
+# defect these assertions exist to catch. Say it once, explicitly, and let the
+# missing library be LOUD wherever drills actually are.
+_have_drill_files() {
+  set -- tools/*_drill.sh
+  [ -f "$1" ]
+}
+
 assert_no_duplicate_drill_ports() {
-  . tools/lib/drill-ports.sh
+  _have_drill_files || return 0
+  . tools/lib/drill-ports.sh || {
+    echo "GATES FAILED: tools/lib/drill-ports.sh is missing, but drill files are"
+    echo "      present. The port checks would read an empty map and pass"
+    echo "      without having examined anything."
+    exit 1
+  }
   local bad d decl used u map f
   map=$(drill_declared_ports)
   bad=$(printf '%s\n' "$map" | sort -n \
@@ -451,12 +471,14 @@ assert_no_cross_drill_kill_patterns() {
   local d drill pat owner bad=""
   local portmap="$LOGS/.portmap"
   for drill in tools/*_drill.sh; do
+    [ -f "$drill" ] || continue
     d=$(basename "$drill" _drill.sh)
     sed -e :a -e '/\\$/N; s/\\\n//; ta' "$drill" 2>/dev/null \
       | grep -oE 'fleet_init [^;&|]+' | grep -oE '\b[0-9]{4,5}\b' \
       | while read -r port; do printf '%s %s\n' "$port" "$d"; done
   done > "$portmap"
   for drill in tools/*_drill.sh; do
+    [ -f "$drill" ] || continue
     d=$(basename "$drill" _drill.sh)
     # COMMENTS ARE NOT CALL SITES. controlplane_drill and lease_drill both
     # quote the pattern they used to have, in a comment explaining why it was
@@ -945,6 +967,9 @@ assert_spawning_drills_declare_ports() {
 # would pass for the wrong reason the day someone reorders CORE.
 assert_every_drill_accounted_for() {
   local flat name f missing="" orphan=""
+  # Nothing to say about a tree with no drills in it; see _have_drill_files.
+  # Abstaining is not the same as passing, so it is stated rather than silent.
+  _have_drill_files || { echo "  (no drill files in this tree — registration check abstains)"; return 0; }
   flat=" $(printf '%s %s %s' "$CORE" "$CHAOS" "$EXCLUDED" | tr '\n' ' ') "
 
   # POSITIVE CONTROL: prove the matcher can see a name that ends a line.
@@ -1348,6 +1373,9 @@ assert_drill_builds_keep_rocks() {
     exit 1
   }
   for f in tools/*_drill.sh; do
+    # An unmatched glob arrives here as the literal pattern; see
+    # _have_drill_files for why that state is reachable at all.
+    [ -f "$f" ] || continue
     # Strip whole-line comments BEFORE matching, then join backslash
     # continuations — most of these build lines wrap. Without the strip,
     # a comment that merely quotes a build command is flagged as one
