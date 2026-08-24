@@ -53,8 +53,23 @@ ck $? "every port the code binds is declared${UNDECLARED:+ -- UNDECLARED: $UNDEC
 # list of numbers we expected to find. That distinction is the whole lesson.
 SIB="$ROOT/../tools"
 if ls "$SIB"/*_drill.sh >/dev/null 2>&1; then
-  THEIRS="$(grep -rhoE 'fleet_init[^#]*' "$SIB"/*.sh 2>/dev/null \
-            | grep -oE '\b[0-9]{4}\b' | sort -un)"
+  # Two sources, unioned, because DECLARATIONS ARE NOT THE WHOLE TRUTH.
+  #
+  # fleet_init lines are what the sibling harness declares. But its conformance
+  # stage binds ports with no fleet_init on the line at all, so a
+  # declarations-only scan sees those ports only if some OTHER file happens to
+  # declare the same number. Today that is true for every one of them -- which
+  # is luck, not a property. The peer session found the same gap in its own
+  # assertion, which scans *_drill.sh and therefore exempts the harness that
+  # wrote the rule.
+  #
+  # So also take every port anything over there actually BINDS. A port that is
+  # bound but undeclared is exactly the case where the declaration cannot help.
+  THEIRS_DECLARED="$(grep -rhoE 'fleet_init[^#]*' "$SIB"/*.sh 2>/dev/null \
+                     | grep -oE '\b[0-9]{4}\b')"
+  THEIRS_BOUND="$(grep -rhoE -- '--port [0-9]{4}|--listen [0-9]{4}|--target [^ ]*:[0-9]{4}|-p [0-9]{4}' \
+                    "$SIB"/*.sh 2>/dev/null | grep -oE '[0-9]{4}')"
+  THEIRS="$(printf '%s\n%s\n' "$THEIRS_DECLARED" "$THEIRS_BOUND" | grep -E '^[0-9]{4}$' | sort -un)"
   N="$(printf '%s\n' "$THEIRS" | grep -c . || true)"
   [ "${N:-0}" -gt 0 ]
   ck $? "armed: parsed the sibling harness's declarations ($N ports) -- a check "\
