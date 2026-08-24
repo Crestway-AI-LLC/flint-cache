@@ -46,9 +46,17 @@ now_ms() { python3 -c 'import time; print(int(time.time()*1000))'; }
 boot_fleet() {
   fleet_kill server; fleet_kill proxy; fleet_kill controlplane; sleep 0.4
   rm -rf "$D"; mkdir -p "$D"
-  $B --port 6910 --engine rocks --data-dir "$D/m" 2>/dev/null &
-  $B --port 6911 --engine rocks --data-dir "$D/r" --replica-of "$M" 2>/dev/null &
-  fleet_wait_listen 6910 6911
+  # KEEP THE SEAT LOGS. These were 2>/dev/null, so when 6911 failed to come up
+  # on the gate box the only evidence was "nothing listening after 30s" — the
+  # drill's own observation, with the server's account of itself discarded.
+  # Three fixes were attempted against that absence and all three were wrong.
+  $B --port 6910 --engine rocks --data-dir "$D/m" 2>"$D/m.log" &
+  $B --port 6911 --engine rocks --data-dir "$D/r" --replica-of "$M" 2>"$D/r.log" &
+  if ! fleet_wait_listen 6910 6911; then
+    echo "  --- replica 6911 stderr ---"; tail -20 "$D/r.log" 2>/dev/null | sed 's/^/    /'
+    echo "  --- master 6910 stderr ---";  tail -10 "$D/m.log" 2>/dev/null | sed 's/^/    /'
+    exit 1
+  fi
   sleep 0.8
   $CP --port 7596 --state "$D/cp" 2>"$D/cp.log" &
   fleet_wait_listen 7596
