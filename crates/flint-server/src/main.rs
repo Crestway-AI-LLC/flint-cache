@@ -1171,9 +1171,23 @@ fn main() -> std::io::Result<()> {
                         // replica losing that race must wait, not die (the
                         // CFN stack lost it; the smoke instance won it).
                         // Genuinely malformed streams stay fatal.
+                        //
+                        // -LOADING IS THE SAME RACE WEARING A NEW SHAPE. Until
+                        // #176 a master that had not finished starting was not
+                        // listening, so losing this race arrived as
+                        // ConnectionRefused and the arm below already covered
+                        // it. #176 makes that master bind and answer -LOADING
+                        // instead — deliberately, so it is not mistaken for
+                        // dead — which turned a condition this loop was written
+                        // to survive into a fatal one. promote_notice starts
+                        // both seats in the same millisecond and died on it
+                        // roughly half the time: "master error: LOADING Flint
+                        // is loading the dataset in memory", replica exits,
+                        // "nothing listening on 127.0.0.1:6911 after 30s".
                         Err(e)
                             if attempt < 120
                                 && (e.to_string().contains("THROTTLED")
+                                    || e.to_string().contains("LOADING")
                                     || matches!(
                                         e.kind(),
                                         std::io::ErrorKind::ConnectionRefused
