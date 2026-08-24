@@ -1,5 +1,12 @@
 # BUG-0047 — failover_drill is not parallel-safe, and it is not the OOM killer
 
+> **Every duration in this document was measured on a clock that printed
+> integer seconds, which floored them.** `gates.sh` now times in milliseconds
+> (`4880d8c`). The tables below remain as the record of what was believed and
+> why, but they are NOT reproducible as measurement, and no number here should
+> be averaged with, or compared against, anything measured after that commit.
+> Absolute deltas are roughly right; ratios on sub-2s drills are not.
+
 **Status:** FIXED 2026-08-24, confirmed by experiment. The measurement
 `tools/gates.sh` asked for has been taken, and the OOM hypothesis it named is
 disproven.
@@ -342,3 +349,30 @@ Next, if anyone spends the runs: `client_compat` and `anti_affinity` — the
 drills actually costing wall clock in the environment that ships — at n=5, with
 a control set large enough that concurrency does not decay, and
 `coproc_forward` included as the one place the two datasets actively disagree.
+
+## The rule this whole thread produced
+
+**The shorter the baseline, the wider a ratio's error bar — and a contention
+study puts its headline on the shortest drill in the set, every time.**
+
+Both of us did it, independently, on the same day. A `10.67x` on a 1.2s
+baseline was honestly 5.8x-11.5x. An `18.00x` was division by a floored zero.
+Neither survived contact with the other's data, and neither was a claim about
+the system: both were claims about the clock.
+
+Three consequences worth carrying:
+
+- **Rank by absolute seconds added, not by ratio.** Percentage systematically
+  promotes short drills paying a fixed bring-up cost, and buries the drills
+  actually costing wall clock. Re-ranking moved `edge_roll` out of the top
+  eight and `client_compat` (+34s) into first.
+- **Suspicious uniformity is an instrument reading, not a system property.**
+  Five runs producing `[42,51,51,51,51]` looked like bimodality. Four identical
+  values at one-second resolution meant the resolution, not the behaviour.
+- **Fix the instrument rather than annotate its error.** Propagating error bars
+  through a bad clock documents the problem for one analysis; the next person
+  inherits it. One commit removed the class.
+
+Third time in one day that the instrument, not the system, produced the shape
+being read — after a leak check whose pattern encoded its own answer, and a
+scan that returned clean because it matched nothing.
