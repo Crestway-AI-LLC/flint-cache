@@ -82,18 +82,25 @@ jobs:
       # any job count and P=6 is already inside twice it. Splitting that drill
       # is worth more than raising this number.
       #
-      # A LITERAL, not `auto`, and the distinction is deliberate. `auto` would
-      # resolve to nproc = 4 here, which is defensible and UNMEASURED; 6 was
-      # measured three times on this runner shape. The table above is the
-      # provenance, because a reader who finds a bare 6 cannot tell a
-      # measurement from a guess — and gates.sh now prints the core count and
-      # the drills/core ratio on every run, so if GitHub changes the runner
-      # shape it shows up as a changed ratio in the log rather than as
-      # unexplained flakiness. Re-measure before raising it.
+      # BACK TO 1, and the three green runs above are why this line reads 1
+      # rather than 6. They were measured on a tree that did not yet contain
+      # the eleven concurrency commits (-LOADING as a retry, fleet_kill
+      # waiting for death, PONG no longer meaning ready). On the tree WITH
+      # them, the same P=6 gate fails:
       #
-      # Overridable per manual run, which is also the rollback: dispatch with
-      # gate_jobs=1 to get the old serial gate back without touching a file.
-      FLINT_GATE_JOBS: ${{ inputs.gate_jobs || '6' }}
+      #   reseed   P=1 PASS (4.2s)   P=6 FAIL (4.0s)   <- parallelism-only
+      #   chaos    P=1 FAIL          P=6 FAIL          <- tree-level, also red on main
+      #
+      # reseed is the blocker: same sha, same everything, only the job count
+      # differs, so it is a genuine parallel-only failure and P=6 would ship a
+      # gate that goes red for reasons unrelated to the change under test —
+      # exactly what gates.sh's own opt-in note warns about.
+      #
+      # Nothing else here is reverted. auto, core_order, the millisecond
+      # clock, the drills/core ratio and both attribution assertions all stand
+      # on their own and are what make the next attempt cheap: fix reseed
+      # under contention, dispatch gate_jobs=6, and flip this one number.
+      FLINT_GATE_JOBS: ${{ inputs.gate_jobs || '1' }}
       # Empty on push/PR, so the full CORE list runs. gates.sh reads
       # FLINT_CORE_ORDER with the full list as its default, and an empty
       # string is falsy there, so this is inert unless a dispatch sets it.

@@ -376,3 +376,35 @@ Three consequences worth carrying:
 Third time in one day that the instrument, not the system, produced the shape
 being read — after a leak check whose pattern encoded its own answer, and a
 scan that returned clean because it matched nothing.
+
+## The P value, closed: P=6 does NOT ship
+
+The three green P=6 runs were on a tree without the eleven concurrency
+commits. Once those landed, the same gate was re-run at both job counts on the
+**same sha** (`9940a50`), so only the job count differed:
+
+| drill | P=1 serial | P=6 parallel | verdict |
+|---|---|---|---|
+| `reseed` | **PASS** (4.2s) | **FAIL** (4.0s) | parallelism-only — **this is the blocker** |
+| `chaos` | FAIL (123.3s) | FAIL (122.7s) | tree-level, not parallelism |
+
+`reseed` fails with *"the marker did not trigger a full sync"* only under
+contention. That is the precise failure mode `gates.sh`'s own opt-in note
+exists to prevent — a gate going red for reasons unrelated to the change under
+test — so **the default is back to 1**.
+
+`chaos` is a separate matter and not this branch's: it panics at
+`cluster.rs:1520`, `assert!(wait_for_ready(dead, 15s))`, in a crate this branch
+never touches, and **main's own gate is failing** at `aead59d1`. A replacement
+replica is not reaching ready inside 15s — consistent with nodes now binding
+and answering while loading, where readiness means more than it used to.
+
+**What survives, and makes the next attempt cheap:** `auto`, `core_order`, the
+millisecond clock, the drills/core ratio, and both attribution assertions all
+stand on their own evidence. Fix `reseed` under contention, dispatch
+`gate_jobs=6`, and one number changes.
+
+The honest summary of the whole thread: **2.65x was real and is not available
+yet.** Three green runs measured a tree that no longer exists, and the one
+experiment that could tell parallelism from tree change is the only reason
+that is known rather than assumed.
