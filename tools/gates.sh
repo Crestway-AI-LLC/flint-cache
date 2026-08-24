@@ -332,9 +332,44 @@ _foreign_seats() {  # <drill-name>
 # detection); the knob stays opt-in until a parallel run has been green for a
 # while, because the failure mode of getting this wrong is a gate that reports
 # red for reasons that have nothing to do with the change under test.
+#
+# `auto` resolves to the core count. Prefer it to a literal: a number tuned on
+# one machine is a machine-specific constant with no provenance, which is the
+# same shape as the 2000ms disk-guard sample, the 0.4s respawn sleep and the
+# 20s roll cooldown — each chosen where the thing it waited for was fast, each
+# broken where it was not. `FLINT_GATE_JOBS=6` is right for a 4-vCPU runner,
+# wrong on a 16-vCPU box, wrong again when the runner shape changes, and
+# nothing here would notice.
+#
+# A literal is still allowed, because 6 on 4 vCPU was MEASURED (2.65x, three
+# green runs) and `auto` would give 4, which was not. But every run now prints
+# the core count and says when it is oversubscribed, so the trade is visible in
+# the log rather than assumed — and a runner that silently changes shape shows
+# up as a changed ratio instead of as unexplained flakiness.
+_gate_cores() {
+  if command -v nproc >/dev/null 2>&1; then nproc
+  elif command -v sysctl >/dev/null 2>&1; then sysctl -n hw.ncpu 2>/dev/null || echo 1
+  else echo 1; fi
+}
 GATE_JOBS="${FLINT_GATE_JOBS:-1}"
-case "$GATE_JOBS" in ''|*[!0-9]*) echo "FLINT_GATE_JOBS must be a positive integer, got '$GATE_JOBS'"; exit 2 ;; esac
+if [ "$GATE_JOBS" = "auto" ]; then
+  GATE_JOBS=$(_gate_cores)
+  echo "== FLINT_GATE_JOBS=auto -> $GATE_JOBS (core count)"
+fi
+case "$GATE_JOBS" in ''|*[!0-9]*) echo "FLINT_GATE_JOBS must be a positive integer or 'auto', got '$GATE_JOBS'"; exit 2 ;; esac
 [ "$GATE_JOBS" -ge 1 ] || { echo "FLINT_GATE_JOBS must be >= 1, got $GATE_JOBS"; exit 2; }
+if [ "$GATE_JOBS" -gt 1 ]; then
+  _cores=$(_gate_cores)
+  printf '== parallel: %s drills at a time on %s core(s) (%s drills/core)\n' \
+    "$GATE_JOBS" "$_cores" \
+    "$(awk -v j="$GATE_JOBS" -v c="$_cores" 'BEGIN{printf "%.2f", j/c}' 2>/dev/null || echo "?")"
+  if [ "$GATE_JOBS" -gt "$_cores" ]; then
+    echo "   OVERSUBSCRIBED. Measured cost of this on a 4-vCPU runner: +27% total"
+    echo "   drill-time for 2.65x wall clock, and short drills inflating +27-34s."
+    echo "   Per-drill DURATIONS are not measurements at this ratio — compare"
+    echo "   timings against a JOBS=1 run, not against another oversubscribed one."
+  fi
+fi
 
 # NO DRILL MAY CARRY A KILL PATTERN THAT REACHES ANOTHER DRILL.
 #

@@ -82,6 +82,15 @@ jobs:
       # any job count and P=6 is already inside twice it. Splitting that drill
       # is worth more than raising this number.
       #
+      # A LITERAL, not `auto`, and the distinction is deliberate. `auto` would
+      # resolve to nproc = 4 here, which is defensible and UNMEASURED; 6 was
+      # measured three times on this runner shape. The table above is the
+      # provenance, because a reader who finds a bare 6 cannot tell a
+      # measurement from a guess — and gates.sh now prints the core count and
+      # the drills/core ratio on every run, so if GitHub changes the runner
+      # shape it shows up as a changed ratio in the log rather than as
+      # unexplained flakiness. Re-measure before raising it.
+      #
       # Overridable per manual run, which is also the rollback: dispatch with
       # gate_jobs=1 to get the old serial gate back without touching a file.
       FLINT_GATE_JOBS: ${{ inputs.gate_jobs || '6' }}
