@@ -226,11 +226,40 @@ is flat from 1->3 then adds 15s from 3->6. Uniform contention should not switch
 on between P=3 and P=6; a threshold — CPU starvation crossing a timing-sensitive
 wait, in a rolling-upgrade drill — should.
 
-**Open, with a designed experiment.** `edge_roll` plus five cheap drills via
-`FLINT_CORE_ORDER`, run at `FLINT_GATE_JOBS=1` and `=6`, five times each. Same
-set both arms. ~46s with a tight spread means uniform contention; a consistent
-~56s or a bimodal 40/56 split means a real wait is being missed, and bimodal is
-the outcome that says so loudest.
+**Open, with a designed experiment.** `edge_roll` plus five cheap controls via
+`FLINT_CORE_ORDER`, at `FLINT_GATE_JOBS=1` and `=6`, five runs each, same set
+both arms. Predictions committed before any run:
+
+| | outcome | reading |
+|---|---|---|
+| A | ~44-46s, tight, controls inflate alike | uniform contention |
+| B | ~56s consistently, controls mild | threshold |
+| C | bimodal 40/56 across the five | a real wait is being missed |
+| **D** | ~40-42s, indistinguishable from P=1 | **the 56s never reproduces** |
+
+**D is the correction, not an addition.** The first version of this list held
+only B and C — both of which presuppose the 56s is real, resting on the same
+single sample this section had just finished conceding cannot support a
+pattern. The identical asymmetry, one paragraph after retracting it, inside the
+artefact written to prevent it. Committing to D in advance is what stops the
+run being read as confirmation whatever it returns.
+
+The five controls are a hard requirement, not a nicety: without their durations
+in both arms, "edge_roll inflated" cannot be distinguished from "everything
+inflated", and that falsifier holds whatever the absolute numbers are.
+
+**It must run on the CI runner, not a laptop.** The hypothesis is CPU
+starvation crossing a timing-sensitive wait:
+
+    developer box   8 cores  ->  P=6 = 0.75 drills/core
+    CI runner       4 vCPU   ->  P=6 = 1.50 drills/core
+
+At 0.75 there is no starvation to cross, so a careful local A/B yields a clean
+number answering a different question — and its null would be indistinguishable
+from D while actually meaning "the condition was never present". Same
+measured-on-a-different-machine trap as the 3.23x figure this bug opened by
+refusing to reuse. `gate.yml` therefore takes a `core_order` input so the short
+list can be dispatched to the 4 vCPU runner directly.
 
 **Correction: ranking that table by percentage was wrong.** A peer session
 pointed out that short drills pay a roughly FIXED contention cost — bring-up,
