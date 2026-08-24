@@ -90,6 +90,11 @@ public final class SseCSuite {
     Map<String, String> p = new HashMap<>();
     p.put("s3.endpoint", ep); p.put("s3.region", "us-east-1");
     p.put("s3.path-style-access", "true");
+    // Iceberg builds its own S3 client and reads client.region, NOT
+    // s3.region. Without it the SDK falls through to the ambient region
+    // chain -- a developer laptop with ~/.aws/config passes, a clean CI
+    // runner throws "Unable to load region from any of the providers".
+    p.put("client.region", "us-east-1");
     p.put("s3.access-key-id", "k"); p.put("s3.secret-access-key", "k");
     p.put("flint.tier.uri", tier);
     p.put("s3.sse.type", "custom"); p.put("s3.sse.key", k64);

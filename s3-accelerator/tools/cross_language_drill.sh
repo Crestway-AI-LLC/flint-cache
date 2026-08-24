@@ -22,6 +22,14 @@
 # not -- and a reset silently failing is exactly how the first version of this
 # drill produced three false failures.
 set -uo pipefail
+
+# Valkey or Redis, whichever this machine has. The suites need a
+# Redis-protocol server and do not care which implementation provides it --
+# and hardcoding `"$TIER_SERVER"` made the gate unrunnable on any CI image
+# where it is not packaged, which is most of them. Same flags work for both.
+TIER_SERVER="$(command -v valkey-server || command -v redis-server || true)"
+TIER_CLI="$(command -v valkey-cli || command -v redis-cli || true)"
+
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 export JAVA_HOME="${JAVA_HOME:-/opt/homebrew/opt/openjdk@21}"
 export PATH="$JAVA_HOME/bin:$PATH"
@@ -30,14 +38,23 @@ PORT=${PORT:-9407}
 PASS=0; FAIL=0
 ck() { if [ "$1" = 0 ]; then PASS=$((PASS+1)); printf "[ok] %s\n" "$2";
        else FAIL=$((FAIL+1)); printf "[FAIL] %s\n" "$2"; fi; }
-cleanup() { kill ${ORIGIN_PID:-0} 2>/dev/null; valkey-cli -p 6399 shutdown nosave 2>/dev/null; }
+# `kill ${VAR:-0}` is a process-group suicide: when the variable is unset the
+# command becomes `kill 0`, which signals EVERY process in the current process
+# group -- the calling shell included. It only fires on the paths that exit
+# before the pid is assigned, so it survived every local run and killed the CI
+# job with exit 143 the first time a SKIP guard tripped.
+cleanup() {
+  [ -n "${ORIGIN_PID:-}" ] && kill "$ORIGIN_PID" 2>/dev/null
+  [ -n "${TIER_CLI:-}" ] && "$TIER_CLI" -p 6399 shutdown nosave 2>/dev/null
+  return 0
+}
 trap cleanup EXIT
 
-command -v valkey-server >/dev/null || { echo "SKIP: no valkey-server"; exit 0; }
+command -v valkey-server >/dev/null || { echo "SKIP: no "$TIER_SERVER""; exit 0; }
 [ -x "$PYENV/bin/python" ] || { echo "SKIP: no python env"; exit 0; }
 [ -f /tmp/cp.txt ] || { echo "SKIP: no maven classpath at /tmp/cp.txt"; exit 0; }
 
-valkey-server --port 6399 --save "" --appendonly no --daemonize yes
+"$TIER_SERVER" --port 6399 --save "" --appendonly no --daemonize yes
 python3 "$ROOT/tools/counting_s3.py" --port "$PORT" --objects 4 --object-bytes 4194304 \
   >/tmp/xlang_origin.log 2>&1 & ORIGIN_PID=$!
 sleep 3
@@ -76,9 +93,9 @@ print(FlintTier._seal_of('\"abc123\"', 7, b'flint-interop-vector'))" 2>/dev/null
 [ -n "$JV" ] && [ "$JV" = "$PV" ]; ck $? "the seal agrees across languages (java=$JV python=$PV)"
 
 # --- 2. wide writer, narrow reader: must cost NOTHING ------------------------
-valkey-cli -p 6399 flushall >/dev/null
+"$TIER_CLI" -p 6399 flushall >/dev/null
 pyread
-PK=$(valkey-cli -p 6399 --scan --pattern 'c1/*' | wc -l | tr -d ' ')
+PK=$("$TIER_CLI" -p 6399 --scan --pattern 'c1/*' | wc -l | tr -d ' ')
 [ "$PK" -gt 0 ]; ck $? "armed: the Python client populated the tier ($PK chunks)"
 B=$(st gets); jread; A=$(st gets)
 [ $((A-B)) -eq 0 ]; ck $? "THE JVM READS PYTHON'S CACHE FOR FREE ($((A-B)) origin GETs, want 0)"
@@ -91,9 +108,9 @@ sys.exit(0 if b==w and len(b)==$LEN else 1)"
 ck $? "and the bytes the JVM got are correct, not merely cheap"
 
 # --- 3. narrow writer, wide reader: must REUSE, cannot be free ---------------
-valkey-cli -p 6399 flushall >/dev/null
+"$TIER_CLI" -p 6399 flushall >/dev/null
 jread
-JK=$(valkey-cli -p 6399 --scan --pattern 'c1/*' | wc -l | tr -d ' ')
+JK=$("$TIER_CLI" -p 6399 --scan --pattern 'c1/*' | wc -l | tr -d ' ')
 [ "$JK" -gt 0 ]; ck $? "armed: the JVM client populated the tier ($JK chunks)"
 pyread
 HITS=$(pyc chunk_hits)
@@ -108,10 +125,10 @@ ck $? "and the bytes Python got are correct"
 # --- 4. negative controls ----------------------------------------------------
 # Without these, a broken origin counter or a client that never ran would
 # produce the same all-zero output as perfect sharing.
-valkey-cli -p 6399 flushall >/dev/null
+"$TIER_CLI" -p 6399 flushall >/dev/null
 B=$(st gets); jread; A=$(st gets)
 [ $((A-B)) -gt 0 ]; ck $? "negative control: a COLD JVM read DOES hit the origin ($((A-B)) GETs)"
-valkey-cli -p 6399 flushall >/dev/null
+"$TIER_CLI" -p 6399 flushall >/dev/null
 pyread
 CM=$(pyc chunk_misses)
 [ "${CM:-0}" -gt 0 ]; ck $? "negative control: a COLD Python read DOES miss ($CM misses)"

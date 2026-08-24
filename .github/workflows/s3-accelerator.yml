@@ -1,0 +1,81 @@
+name: s3-accelerator
+
+# The accelerator's own gate, as a merge gate.
+#
+# 23 stages covering the JVM client, three adoption paths, the Python path and
+# the cross-language sharing between them. Until now every one of them was a
+# thing a human remembered to run before pushing -- the same failure mode
+# gate.yml exists to remove for the Rust side.
+#
+# Path-filtered, because none of this is affected by a change to the Rust
+# workspace and the Rust jobs are not affected by a change here.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 's3-accelerator/**'
+      - '.github/workflows/s3-accelerator.yml'
+  pull_request:
+    paths:
+      - 's3-accelerator/**'
+      - '.github/workflows/s3-accelerator.yml'
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    # Not configuration the suites rely on -- they set their own region and
+    # credentials, and the whole gate is verified locally with
+    # AWS_CONFIG_FILE=/dev/null to prove it. This makes the FAILURE MODE loud:
+    # without it, a suite that forgets its region falls through to the EC2
+    # metadata provider and hangs until the job timeout, which reads as "CI is
+    # slow" rather than "someone dropped a config line".
+    env:
+      AWS_EC2_METADATA_DISABLED: 'true'
+    defaults:
+      run:
+        working-directory: s3-accelerator
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # REDIS, not Valkey. Valkey is not in Ubuntu's default archive, and the
+      # suites need a Redis-protocol server rather than a specific
+      # implementation -- tools/gate.sh resolves whichever is present. Running
+      # CI on the other one is not a compromise: it is the only automated
+      # check that the "works against Valkey or Redis" claim in the README is
+      # true, since the developer machine only ever exercises Valkey.
+      - name: install a redis-protocol server
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq redis-server redis-tools
+
+      # The gate's default is $ROOT/python/.venv, so creating it there needs no
+      # environment variable and no coupling between this file and the script.
+      - name: python env
+        run: |
+          python -m venv python/.venv
+          python/.venv/bin/pip install -q --upgrade pip
+          python/.venv/bin/pip install -q -r python/requirements-dev.txt
+
+      - name: gate
+        run: bash tools/gate.sh
+
+      # A gate that fails with no evidence costs another full run to diagnose,
+      # and the per-stage logs are where the actual failure is.
+      - name: stage logs
+        if: failure()
+        run: |
+          for f in /tmp/gate_*.log; do
+            [ -f "$f" ] || continue
+            echo "::group::$(basename "$f")"
+            tail -60 "$f"
+            echo "::endgroup::"
+          done

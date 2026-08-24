@@ -1,0 +1,19 @@
+# Test dependencies for the Python path. Customers need none of this -- they
+# bring their own s3fs and fsspec; this is what the suites need.
+#
+# PINNED, and one pin is load-bearing: moto pulls a botocore newer than
+# aiobotocore accepts, which breaks s3fs -- the library under test -- from
+# underneath. Adding a test dependency silently degraded the subject. Re-pin
+# rather than unpin if this needs to move.
+botocore==1.41.5
+aiobotocore==2.26.0
+s3fs==2025.10.0
+fsspec==2025.10.0
+redis==7.0.1
+
+# Correctness suites run against moto, economic suites against
+# tools/counting_s3.py. counting_s3 exists to COUNT and cannot serve
+# DeleteObjects or CopyObject; moto is a faithful S3 and cannot count. Each
+# instrument answers the question it can answer.
+moto[s3,server]==5.1.22
+pytest==8.4.2

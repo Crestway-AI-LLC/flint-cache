@@ -80,6 +80,11 @@ public final class IcebergSuite {
     props.put(CatalogProperties.WAREHOUSE_LOCATION, "s3://bucket/wh");
     props.put("s3.endpoint", endpoint);
     props.put("s3.path-style-access", "true");
+    // Iceberg builds its own S3 client and reads client.region, NOT
+    // s3.region. Without it the SDK falls through to the ambient region
+    // chain -- a developer laptop with ~/.aws/config passes, a clean CI
+    // runner throws "Unable to load region from any of the providers".
+    props.put("client.region", "us-east-1");
     props.put("s3.access-key-id", "ice");
     props.put("s3.secret-access-key", "ice");
     props.put("s3.region", "us-east-1");

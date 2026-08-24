@@ -13,6 +13,14 @@
 # bytes while collapsing two distinct objects onto one key. So the drill
 # asserts the KEY SHAPE, with the single-part run as its control.
 set -uo pipefail
+
+# Valkey or Redis, whichever this machine has. The suites need a
+# Redis-protocol server and do not care which implementation provides it --
+# and hardcoding `"$TIER_SERVER"` made the gate unrunnable on any CI image
+# where it is not packaged, which is most of them. Same flags work for both.
+TIER_SERVER="$(command -v valkey-server || command -v redis-server || true)"
+TIER_CLI="$(command -v valkey-cli || command -v redis-cli || true)"
+
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 export JAVA_HOME="${JAVA_HOME:-/opt/homebrew/opt/openjdk@21}"
 export PATH="$JAVA_HOME/bin:$PATH"
@@ -20,15 +28,22 @@ MP=${MP_PORT:-9528}; SP=${SP_PORT:-9529}
 PASS=0; FAIL=0
 ck() { if [ "$1" = 0 ]; then PASS=$((PASS+1)); printf "[ok] %s\n" "$2";
        else FAIL=$((FAIL+1)); printf "[FAIL] %s\n" "$2"; fi; }
-cleanup() { kill ${A:-0} ${B:-0} 2>/dev/null; valkey-cli -p 6399 shutdown nosave 2>/dev/null; }
+# See cross_language_drill.sh: `kill ${VAR:-0}` becomes `kill 0` when unset,
+# which signals the whole process group including the calling shell.
+cleanup() {
+  [ -n "${A:-}" ] && kill "$A" 2>/dev/null
+  [ -n "${B:-}" ] && kill "$B" 2>/dev/null
+  [ -n "${TIER_CLI:-}" ] && "$TIER_CLI" -p 6399 shutdown nosave 2>/dev/null
+  return 0
+}
 trap cleanup EXIT
 
-command -v valkey-server >/dev/null || { echo "SKIP: no valkey-server"; exit 0; }
+command -v valkey-server >/dev/null || { echo "SKIP: no "$TIER_SERVER""; exit 0; }
 CP_FILE="${CP_FILE:-/tmp/gate_cp.txt}"
 [ -f "$CP_FILE" ] || { echo "SKIP: no maven classpath"; exit 0; }
 CP="$ROOT/jvm-spike/target/classes:$(cat "$CP_FILE")"
 
-valkey-server --port 6399 --save '' --appendonly no --daemonize yes
+"$TIER_SERVER" --port 6399 --save '' --appendonly no --daemonize yes
 python3 "$ROOT/tools/counting_s3.py" --port "$MP" --objects 4 --object-bytes 1048576 \
   --multipart-parts 4 >/tmp/mp_origin.log 2>&1 & A=$!
 python3 "$ROOT/tools/counting_s3.py" --port "$SP" --objects 4 --object-bytes 1048576 \
@@ -37,7 +52,7 @@ sleep 3
 
 probe() { java -cp "$CP" ai.crestway.flintaccel.client.CrossLangProbe \
           "http://127.0.0.1:$1" bucket data/000001.bin 100000 >/dev/null 2>&1; }
-nkeys() { valkey-cli -p 6399 --scan --pattern "$1" | wc -l | tr -d ' '; }
+nkeys() { "$TIER_CLI" -p 6399 --scan --pattern "$1" | wc -l | tr -d ' '; }
 
 # --- 1. the ETag really is multipart-shaped at the origin -------------------
 ET=$(curl -sI "http://127.0.0.1:$MP/bucket/data/000001.bin" | tr -d '\r' | grep -i '^etag' | cut -d' ' -f2)
@@ -46,7 +61,7 @@ ETSP=$(curl -sI "http://127.0.0.1:$SP/bucket/data/000001.bin" | tr -d '\r' | gre
 [[ "$ETSP" != *-4* ]]; ck $? "control: the other origin reports a plain one ($ETSP)"
 
 # --- 2. multipart: bytes correct AND the suffix survives into the key -------
-valkey-cli -p 6399 flushall >/dev/null; probe "$MP"
+"$TIER_CLI" -p 6399 flushall >/dev/null; probe "$MP"
 T=$(nkeys 'c1/*'); S=$(nkeys 'c1/*-4/*')
 [ "$T" -gt 0 ]; ck $? "armed: the multipart read populated the tier ($T chunks)"
 [ "$S" -eq "$T" ]; ck $? "EVERY key carries the -N suffix ($S of $T) -- the ETag is not being mangled"
@@ -61,7 +76,7 @@ ck $? "and the bytes are correct under a multipart ETag"
 
 # --- 3. the control. Without it, "0 suffixed keys" would be satisfied by a
 #        run that cached nothing at all -- which is how a dead origin looks.
-valkey-cli -p 6399 flushall >/dev/null; probe "$SP"
+"$TIER_CLI" -p 6399 flushall >/dev/null; probe "$SP"
 T2=$(nkeys 'c1/*'); S2=$(nkeys 'c1/*-4/*')
 [ "$T2" -gt 0 ]; ck $? "armed: the single-part read populated the tier ($T2 chunks)"
 [ "$S2" -eq 0 ]; ck $? "control: NO key carries a suffix under single-part ETags ($S2)"

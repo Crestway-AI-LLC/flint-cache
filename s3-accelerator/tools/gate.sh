@@ -12,6 +12,18 @@
 #   tools/gate.sh            # everything
 #   tools/gate.sh --quick    # skip the shaded-jar re-run
 set -uo pipefail
+
+# Valkey or Redis, whichever this machine has. The suites need a
+# Redis-protocol server and do not care which implementation provides it --
+# and hardcoding `"$TIER_SERVER"` made the gate unrunnable on any CI image
+# where it is not packaged, which is most of them. Same flags work for both.
+TIER_SERVER="${TIER_SERVER:-$(command -v valkey-server || command -v redis-server || true)}"
+TIER_CLI="${TIER_CLI:-$(command -v valkey-cli || command -v redis-cli || true)}"
+# Pass the resolution DOWN. Suite.java spawns a tier of its own for the
+# tier-death check, and two layers resolving independently is how they end up
+# disagreeing about which server is running.
+export FLINT_TIER_SERVER="$TIER_SERVER" FLINT_TIER_CLI="$TIER_CLI"
+
 cd "$(dirname "$0")/.."
 ROOT=$PWD
 export JAVA_HOME="${JAVA_HOME:-/opt/homebrew/opt/openjdk@21}"
@@ -23,11 +35,32 @@ declare -a FAILED
 PIDS=()
 cleanup() {
   for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null; done
-  valkey-cli -p 6399 shutdown nosave 2>/dev/null
+  "$TIER_CLI" -p 6399 shutdown nosave 2>/dev/null
   # Prove it, rather than assume the kills landed.
   local left
-  left=$(ps -ax -o command= | grep -E '^(/opt/homebrew/bin/)?(valkey|redis)-server|counting_s3\.py' | grep -v grep | wc -l | tr -d ' ')
-  [ "$left" = 0 ] && echo "teardown: clean" || { echo "teardown: $left PROCESS(ES) LEFT"; ps -ax -o command= | grep -E 'valkey-server|counting_s3' | grep -v grep; }
+  # Attribute a leaked process to THIS gate by something this gate declared --
+  # our own fixture script names, or a tier server on one of OUR ports. Two
+  # reasons, both learned rather than designed:
+  #
+  # The previous pattern anchored on ^(/opt/homebrew/bin/)?, a macOS Homebrew
+  # path, so on any Linux runner -- where the binary is /usr/bin/redis-server
+  # -- a leaked tier server matched nothing and the check printed "clean". A
+  # leak check that cannot SEE a process reports the same thing as no leak.
+  #
+  # And matching any redis-server anywhere would flag OTHER work on a shared
+  # machine as our leak. A developer box runs more than this gate; a check that
+  # blames a neighbour is worse than no check, because the next person learns
+  # to ignore it.
+  local pat="counting_s3\.py|slow_tier\.py|(valkey|redis)-server[^|]*--port (6398|6399)|(valkey|redis)-server[^|]*:(6398|6399)"
+  local leaked
+  leaked=$(ps -ax -o command= | grep -E "$pat" | grep -v grep || true)
+  left=$(printf "%s" "$leaked" | grep -c . || true)
+  if [ "${left:-0}" = 0 ]; then
+    echo "teardown: clean"
+  else
+    echo "teardown: $left PROCESS(ES) LEFT"
+    printf "%s\n" "$leaked"
+  fi
 }
 trap cleanup EXIT
 
@@ -38,7 +71,11 @@ verdict() { # name, rc
 }
 
 need() { command -v "$1" >/dev/null 2>&1; }
-for t in java mvn python3 valkey-server valkey-cli; do
+if [ -z "$TIER_SERVER" ] || [ -z "$TIER_CLI" ]; then
+  echo "need valkey-server/valkey-cli or redis-server/redis-cli on PATH" >&2
+  exit 2
+fi
+for t in java mvn python3 "$TIER_SERVER" "$TIER_CLI"; do
   need "$t" || { echo "missing prerequisite: $t"; exit 2; }
 done
 
@@ -109,7 +146,7 @@ SHIM=$(ls jvm-spike/target/*hadoop-shim.jar 2>/dev/null | head -1)
 
 # ---------------------------------------------------------------- services
 start_svcs() { # port, extra-args
-  valkey-server --port 6399 --save '' --appendonly no --daemonize yes 2>/dev/null
+  "$TIER_SERVER" --port 6399 --save '' --appendonly no --daemonize yes 2>/dev/null
   python3 tools/counting_s3.py --port "$1" --objects 8 --object-bytes 8388608 ${2:-} \
       >/tmp/gate_origin_$1.log 2>&1 &
   PIDS+=($!)
@@ -120,7 +157,7 @@ stop_origin() { for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null; done; PIDS=()
 
 run_suite() { # label, mainclass, port, classpath, extra-origin-args
   start_svcs "$3" "${5:-}"
-  valkey-cli -p 6399 flushall >/dev/null 2>&1
+  "$TIER_CLI" -p 6399 flushall >/dev/null 2>&1
   local log="/tmp/gate_$(echo "$1" | tr ' /()' '____').log"
   run_bounded java -cp "$4" "$2" "http://127.0.0.1:$3" redis://127.0.0.1:6399 >"$log" 2>&1
   local rc=$?
@@ -164,7 +201,7 @@ python3 tools/counting_s3.py --port 9309 --objects 4 --object-bytes 1048576 \
     >/tmp/gate_origin_9309.log 2>&1 &
 PIDS+=($!)
 sleep 2
-valkey-cli -p 6399 flushall >/dev/null 2>&1
+"$TIER_CLI" -p 6399 flushall >/dev/null 2>&1
 run_bounded java -cp "$ROOT/jvm-spike/target/classes:$CP" \
     ai.crestway.flintaccel.client.SseKmsSuite \
     http://127.0.0.1:9308 http://127.0.0.1:9309 redis://127.0.0.1:6399 \
@@ -180,6 +217,23 @@ run_bounded java -cp "$ROOT/jvm-spike/target/classes:$CP" \
     ai.crestway.flintaccel.s3a.SseKmsPathsSuite \
     http://127.0.0.1:9308 redis://127.0.0.1:6399 >/tmp/gate_kmspaths.log 2>&1
 verdict "SSE-KMS on all 3 adoption paths (7 checks)" $?
+
+# The counters, read the way an OPERATOR reads them -- through the platform
+# MBeanServer by object name, never from the reference we registered. Sixteen
+# counters existed and nothing surfaced them, so a customer could install this
+# and have no way to answer "is it working?" -- and the two
+# silent-zero-acceleration cases (an SSE-KMS bucket, a sick tier) were
+# invisible by construction.
+python3 tools/counting_s3.py --port 9311 --objects 4 --object-bytes 1048576 \
+    >/tmp/gate_origin_9311.log 2>&1 &
+PIDS+=($!)
+sleep 2
+"$TIER_CLI" -p 6399 flushall >/dev/null 2>&1
+run_bounded java -cp "$ROOT/jvm-spike/target/classes:$CP" \
+    ai.crestway.flintaccel.client.MetricsSuite \
+    http://127.0.0.1:9311 http://127.0.0.1:9308 redis://127.0.0.1:6399 \
+    >/tmp/gate_metrics.log 2>&1
+verdict "JMX metrics, read via MBeanServer (13 checks)" $?
 stop_origin
 
 # A SICK tier -- one that answers slowly rather than dying -- used to make
@@ -192,7 +246,7 @@ python3 tools/slow_tier.py --listen 6398 --upstream 6399 --delay-ms 200 \
     >/tmp/gate_proxy.log 2>&1 &
 PIDS+=($!)
 sleep 2
-valkey-cli -p 6399 flushall >/dev/null 2>&1
+"$TIER_CLI" -p 6399 flushall >/dev/null 2>&1
 run_bounded java -cp "$ROOT/jvm-spike/target/classes:$CP" \
     ai.crestway.flintaccel.client.SickTierSuite \
     http://127.0.0.1:9310 redis://127.0.0.1:6399 redis://127.0.0.1:6398 \
@@ -209,8 +263,8 @@ stop_origin
 # than our tier.
 step "iceberg io-impl, end to end (real tables, avro + parquet)"
 start_svcs 9306
-valkey-cli -p 6399 flushall >/dev/null 2>&1
-( cd jvm-spike && run_bounded mvn -q -o test-compile ) >/tmp/gate_ice_build.log 2>&1
+"$TIER_CLI" -p 6399 flushall >/dev/null 2>&1
+( cd jvm-spike && run_bounded mvn -q test-compile ) >/tmp/gate_ice_build.log 2>&1
 run_bounded java -cp "$ROOT/jvm-spike/target/classes:$ROOT/jvm-spike/target/test-classes:$CP_TEST" \
     ai.crestway.flintaccel.iceberg.IcebergSuite \
     http://127.0.0.1:9306 redis://127.0.0.1:6399 >/tmp/gate_iceberg.log 2>&1
@@ -220,7 +274,7 @@ stop_origin
 # --------------------------------------------------- inherited contract suite
 step "hadoop contract suite (45 tests we did not write)"
 start_svcs 9310
-valkey-cli -p 6399 flushall >/dev/null 2>&1
+"$TIER_CLI" -p 6399 flushall >/dev/null 2>&1
 ( cd jvm-spike && run_bounded mvn -q test -Dtest=ITestFlintSeek,ITestFlintOpen \
     -DfailIfNoTests=false -Dflint.test.endpoint=http://127.0.0.1:9310 \
     -Dflint.test.tier=redis://127.0.0.1:6399 ) >/tmp/gate_contract.log 2>&1
@@ -232,7 +286,7 @@ step "python path"
 PYENV="${FLINT_PYENV:-$ROOT/python/.venv}"
 if [ -x "$PYENV/bin/python" ]; then
   start_svcs 9401 "--delay-ms 80"
-  valkey-cli -p 6399 flushall >/dev/null 2>&1
+  "$TIER_CLI" -p 6399 flushall >/dev/null 2>&1
   ( cd python && run_bounded "$PYENV/bin/python" suite.py \
       http://127.0.0.1:9401 redis://127.0.0.1:6399 ) >/tmp/gate_python.log 2>&1
   verdict "python suite (19 checks)" $?
@@ -245,7 +299,7 @@ if [ -x "$PYENV/bin/python" ]; then
   if "$PYENV/bin/python" -c "import moto, pytest" 2>/dev/null; then
     "$PYENV/bin/python" -m moto.server -p 9810 >/tmp/gate_moto.log 2>&1 &
     PIDS+=($!); sleep 4
-    valkey-cli -p 6399 flushall >/dev/null 2>&1
+    "$TIER_CLI" -p 6399 flushall >/dev/null 2>&1
     ( cd python && FLINT_TEST_ENDPOINT=http://127.0.0.1:9810 \
         FLINT_TEST_TIER=redis://127.0.0.1:6399 \
         run_bounded "$PYENV/bin/python" -m pytest test_fsspec_contract.py \
@@ -282,7 +336,7 @@ if [ -x "$PYENV/bin/python" ]; then
       >/tmp/gate_origin_9319.log 2>&1 &
   PIDS+=($!)
   sleep 2
-  valkey-cli -p 6399 flushall >/dev/null 2>&1
+  "$TIER_CLI" -p 6399 flushall >/dev/null 2>&1
   ( cd python && run_bounded "$PYENV/bin/python" sse_kms_suite.py \
       http://127.0.0.1:9318 http://127.0.0.1:9319 redis://127.0.0.1:6399 \
     ) >/tmp/gate_ssekms_py.log 2>&1

@@ -38,6 +38,16 @@ public final class TierSupport {
   public final S3SeekableInputStreamFactory caching;
   public final S3SeekableInputStreamFactory bypass;
 
+  /**
+   * Registered for the CACHING client only.
+   *
+   * The bypass client exists to serve SSE-C reads straight from S3 and has no
+   * cache behaviour to report; a second bean beside the first would double
+   * every number an operator reads at a glance. Null when JMX is unavailable,
+   * which is a reason to have no metrics and never a reason to fail a read.
+   */
+  public FlintCacheMetrics metrics;
+
   private TierSupport(RedisClient r, StatefulRedisConnection<byte[], byte[]> c,
                       S3AsyncClient s3, FlintObjectClient cl,
                       S3SeekableInputStreamFactory ca, S3SeekableInputStreamFactory by) {
@@ -71,11 +81,13 @@ public final class TierSupport {
     FlintObjectClient cl =
         new FlintObjectClient(new S3SdkObjectClient(s3, false), conn.async(),
             chunk, budget, ttl, false, s3, cacheKms);
-    return new TierSupport(redis, conn, s3, cl,
+    TierSupport t = new TierSupport(redis, conn, s3, cl,
         new S3SeekableInputStreamFactory(cl, cfg),
         new S3SeekableInputStreamFactory(
             new FlintObjectClient(new S3SdkObjectClient(s3, false), conn.async(),
                 chunk, budget, ttl, true, s3, cacheKms), cfg));
+    t.metrics = FlintCacheMetrics.register(cl, uri);
+    return t;
   }
 
   private static S3AsyncClient asyncClient(Function<String, String> get) {
@@ -108,6 +120,7 @@ public final class TierSupport {
   }
 
   public void close() {
+    if (metrics != null) metrics.unregister();
     try { caching.close(); } catch (Exception ignored) { }
     try { bypass.close(); } catch (Exception ignored) { }
     try { conn.close(); } catch (Exception ignored) { }
