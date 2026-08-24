@@ -321,6 +321,25 @@ _foreign_seats() {  # <drill-name>
 }
 
 
+# MILLISECONDS, because integer seconds made two headline numbers wrong.
+#
+# `(%ss)` printed a floor, so a drill reading 1s was anywhere in [1,2) and one
+# reading 0s could be 999ms. Ratios computed from that are worst exactly where
+# they get quoted: a 10.67x speed-up claim on a 1.2s baseline is really
+# 5.8x-11.5x, and one sub-second drill produced an 18x ratio by dividing by a
+# floored zero. Absolute deltas survive truncation; ratios on short drills do
+# not, and short drills are where contention shows up most.
+#
+# GNU date does this for free and is what CI runs. BSD date has no %N, so macOS
+# pays one python3 spawn (~22ms) per timing call — two per drill, under 5s
+# across the suite, and it buys back the only measurement the parallel work has
+# been arguing over.
+if date +%s%3N 2>/dev/null | grep -qE '^[0-9]{13}$'; then
+  _now_ms() { date +%s%3N; }
+else
+  _now_ms() { python3 -c 'import time;print(int(time.time()*1000))'; }
+fi
+
 # FLINT_GATE_JOBS -- how many drills run at once.
 #
 # Default 1, which is byte-identical to the sequential gate this file has
@@ -515,9 +534,14 @@ run_core_drills() {
   # as every drill failing at once.
   cat > "$res/worker.sh" <<'WORKER'
 #!/usr/bin/env bash
-d="$1"; log="$GATE_LOGS_DIR/drill-$d.log"; s=$(date +%s)
+if date +%s%3N 2>/dev/null | grep -qE '^[0-9]{13}$'; then
+  _now_ms() { date +%s%3N; }
+else
+  _now_ms() { python3 -c 'import time;print(int(time.time()*1000))'; }
+fi
+d="$1"; log="$GATE_LOGS_DIR/drill-$d.log"; s=$(_now_ms)
 bash "tools/${d}_drill.sh" >"$log" 2>&1; rc=$?
-printf '%s %s\n' "$rc" "$(( $(date +%s) - s ))" > "$GATE_PAR_DIR/$d.res"
+printf '%s %s\n' "$rc" "$(( $(_now_ms) - s ))" > "$GATE_PAR_DIR/$d.res"
 WORKER
   chmod +x "$res/worker.sh"
 
@@ -586,9 +610,9 @@ WORKER
 
 step() {  # step <name> <log-suffix> <command...>
   local name="$1" log="$LOGS/$2.log"; shift 2
-  local start rc=0; start=$(date +%s)
+  local start rc=0; start=$(_now_ms)
   "$@" >"$log" 2>&1 || rc=$?
-  step_report "$name" "$log" "$rc" "$(( $(date +%s) - start ))"
+  step_report "$name" "$log" "$rc" "$(( $(_now_ms) - start ))"
 }
 
 # THE VERDICT LIVES HERE, ONCE. step() runs one command and reports it; the
@@ -597,7 +621,10 @@ step() {  # step <name> <log-suffix> <command...>
 # parallel modes disagree about what "failed" means is worse than having no
 # parallel mode at all.
 step_report() {  # step_report <name> <log> <exit-code> <elapsed-seconds>
-  local name="$1" log="$2" rc="$3" secs="$4"
+  local name="$1" log="$2" rc="$3" ms="$4"
+  # One decimal. Enough to stop a ratio being built on a floor, not so much
+  # that a log line implies precision the clock does not have.
+  local secs; secs=$(awk -v m="${ms:-0}" 'BEGIN{printf "%.1f", m/1000}')
   RAN_STEPS=$((RAN_STEPS + 1))
   if [ "$rc" = 0 ]; then
     # `SKIP:` and `SKIP (` are the two forms a drill uses to say "I did not
