@@ -1,8 +1,13 @@
 # BUG-0013: bulk writes stall because compaction is left at RocksDB defaults (OPEN)
 
-Status: OPEN, found 2026-08-18 · Severity: medium-high — it does not corrupt
-anything, it makes large ingests take multiples of the time they should, and
-it silently shaped a published benchmark number
+Status: OPEN, re-scoped 2026-08-24 (found 2026-08-18) · Severity: medium-high.
+Two separable claims, and they now have different answers. The FILL half is
+CONFIRMED twice: at RocksDB defaults a bulk load builds an unbounded
+compaction backlog and crosses the slowdown trigger, which is what silently
+shaped a published benchmark number. The REFILL half this file is NAMED for —
+a rewrite over an existing tree costing multiples of the first write — has
+failed to reproduce three times, most recently on a run that finished and
+proved its writes landed. Nothing here corrupts data.
 
 ## Symptom
 
@@ -370,3 +375,65 @@ named for — has now failed to reproduce at 24 M and at 50 M keys, and the
 remaining explanations are the ones this run cannot test: the original was 100
 M keys on i4i NVMe instance storage, not 50 M on EBS gp3, and it predates a
 quarter's worth of WAL-retention and compaction-adjacent fixes.
+
+## 2026-08-24 — the refill finished, its writes landed, and it still does not stall
+
+The rerun the section above asked for, at the TTL it asked for: 330 minutes,
+derived from the **measured** 1.9 rounds/min rather than estimated from
+throughput. That estimate is what made the two previous attempts run out of
+time. Both passes completed and both printed a delivered count — the one thing
+every earlier attempt lacked.
+
+50 M keys per pass (250 x 200 000), 1 KB incompressible values, 400 GB root
+volume, data under `$HOME`, `c7i.4xlarge`.
+
+| pass | peak `l0_files` / slowdown trigger | `pending_compaction_bytes` | delivered |
+|---|---|---|---|
+| fill   | **22** / 20 | climbs monotonically to 83 GB, no plateau | 50 000 000 of 50 000 000 |
+| refill | **8** / 20  | oscillates 0-34 GB, repeatedly returns to 0 | 50 000 000 of 50 000 000 |
+
+`write_stopped` 0 with `stall_readable` 1 for the whole run — a real zero from
+an instrument known to be readable, not the absence of one. Final SST bytes
+59.6 GB.
+
+### What this closes
+
+The previous section named its own gap: the refill's delivered count never
+printed, so "the refill is easy" rested on eleven debt samples and not on
+proof the writes were landing. **Debt falling to zero is also exactly what a
+refill that stopped writing would look like** — the two are indistinguishable
+from the pending-bytes trace alone.
+
+`PASS 2 DELIVERED: 50 000 000 of 50 000 000` settles it. The writes landed.
+The collapse is compaction draining a backlog it could not drain while the
+tree was growing, not a client that stopped offering work.
+
+### The two halves, both measured on one uninterrupted run
+
+**The fill half is confirmed, for the second time.** Peak `l0_files` 22 against
+a slowdown trigger of 20 (24 on the 2026-08-23 run), with debt growing
+monotonically and never plateauing. At the shipped defaults the engine absorbs
+an unbounded compaction backlog rather than refusing a write. Actionable, and
+the numbers to justify a tuning change against are here and in the section
+above.
+
+**The refill half — the symptom this file is named for — has now failed to
+reproduce three times**: at 24 M keys, at 50 M keys, and now at 50 M keys with
+delivery proof. Peak `l0_files` 8 against a trigger of 20; it does not come
+close. Mechanically unsurprising in hindsight: a refill overwrites existing
+keys, so the tree stops growing and compaction merges duplicate versions away.
+The work per byte written is lower during a rewrite, not higher.
+
+### What remains, and it is not a measurement this file can take
+
+The original symptom was 38 minutes to fill and 85+ still running to refill.
+That was **100 M keys on i4i NVMe instance storage**, not 50 M on EBS gp3, and
+it predates a quarter of WAL-retention and compaction-adjacent fixes. The
+remaining candidate explanations are therefore the environment and the elapsed
+fixes — neither of which a larger run on this hardware would distinguish.
+
+Reproducing it would mean the original shape: 100 M keys on i4i instance
+storage, ~6 h of wall clock, and ideally at a commit near the original
+sighting. Until someone wants that, the honest state is: **a real defect was
+found and confirmed on the fill side, and the defect this file was opened for
+is unreproduced on current code.**
