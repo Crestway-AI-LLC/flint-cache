@@ -197,3 +197,33 @@ arriving before the failure. Checked here across serial / P=3 / P=6:
 
 Mild monotonic inflation rather than instability. One sample per configuration
 rules nothing out, so this is a baseline to compare against, not an all-clear.
+
+**Correction: ranking that table by percentage was wrong.** A peer session
+pointed out that short drills pay a roughly FIXED contention cost — bring-up,
+port waits, the guard's settle — which percentage then ranks as catastrophic
+while absolutely they cost little. Confirmed here: 38 drills run <=5s serially
+and inflate by a mean of **+4.4s**.
+
+Ranked by absolute seconds added instead, `edge_roll` (+16s) does not make the
+top eight at all, and the real cost sits elsewhere:
+
+    client_compat    5s -> 39s   +34s
+    anti_affinity    3s -> 30s   +27s
+    proxy_registry   6s -> 32s   +26s
+    attached_chaos  19s -> 41s   +22s
+    fleet_guard     68s -> 88s   +20s
+
+**And the fixed-cost model has a limit.** On the peer's 16 vCPU box at P=4
+(0.25 drills/core) short drills paid 11-17s. Here, at P=6 on 4 vCPU (1.5
+drills/core), the worst pay 27-34s — large in absolute terms as well as
+relative, and top of both rankings. Total drill-time across the suite goes
+1828s serial -> 2321s at P=6: **27% more CPU-seconds bought 2.65x wall clock.**
+
+That trade is worth making, but it says the runner is saturated, and it means
+the clean fixed-cost model may hold only while there are spare cores. The
+ranking advice transfers between boxes; the magnitudes do not.
+
+`promote_notice`'s 43/8/42 swing is also now explained rather than open: the
+peer saw it only on trees containing #176, and neither of us sees it without.
+Two independent negatives, from different core counts. The variance had a
+cause and the cause is fixed — it was not parallelism hiding instability.
