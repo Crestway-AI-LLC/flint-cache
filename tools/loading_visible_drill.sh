@@ -84,7 +84,11 @@ echo "== fresh replica: the port must answer from INSIDE the initial full sync"
 T0=$(python3 -c 'import time; print(time.time())')
 $B --port $RPORT --engine rocks --data-dir "$D/r" --replica-of 127.0.0.1:$MPORT \
   >"$D/r.log" 2>&1 &
-fleet_wait_ping $RPORT
+# ALIVE, not READY. This drill's whole subject is the window in which the seat
+# answers but reports loading:1; fleet_wait_ping now waits for that flag to
+# clear, which would consume the state asserted three lines below and pass
+# without testing anything.
+fleet_wait_alive $RPORT
 T_PONG=$(python3 -c 'import time; print(time.time())')
 
 # Sample the loading state. Everything asserted here is asserted on a node

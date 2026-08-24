@@ -402,6 +402,29 @@ fleet_wait_listen() {
 #
 # Extra arguments ride through to valkey-cli (a TLS control plane needs
 # --tls --cacert ... to answer at all).
+# fleet_wait_alive <port> [opts] — block until the seat ANSWERS, loading or not.
+#
+# This is what fleet_wait_ping used to be, and it is now the rarer of the two.
+# Use it only when the loading window is the thing under test: loading_visible
+# has to catch a replica WHILE it reports loading:1, and a helper that waits
+# for that flag to clear would delete the very state the drill exists to
+# observe — a pass it did not earn.
+#
+# Everywhere else, wanting "alive" and meaning "ready" is the bug #176
+# introduced. Reach for fleet_wait_ping unless you can say why not.
+fleet_wait_alive() {
+  local port="$1"; shift
+  local deadline=$(( $(date +%s) + 30 ))
+  while :; do
+    [ "$(valkey-cli -p "$port" "$@" PING 2>/dev/null)" = "PONG" ] && return 0
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      echo "FAIL: no PONG from 127.0.0.1:$port after 30s"
+      exit 1
+    fi
+    sleep 0.2
+  done
+}
+
 fleet_wait_ping() {
   # PONG ALONE STOPPED MEANING READY, SO THIS CHECKS BOTH.
   #
