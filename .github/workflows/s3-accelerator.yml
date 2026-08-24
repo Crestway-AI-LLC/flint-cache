@@ -24,6 +24,14 @@ jobs:
   gate:
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    # Not configuration the suites rely on -- they set their own region and
+    # credentials, and the whole gate is verified locally with
+    # AWS_CONFIG_FILE=/dev/null to prove it. This makes the FAILURE MODE loud:
+    # without it, a suite that forgets its region falls through to the EC2
+    # metadata provider and hangs until the job timeout, which reads as "CI is
+    # slow" rather than "someone dropped a config line".
+    env:
+      AWS_EC2_METADATA_DISABLED: 'true'
     defaults:
       run:
         working-directory: s3-accelerator

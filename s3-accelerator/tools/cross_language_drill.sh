@@ -38,7 +38,16 @@ PORT=${PORT:-9407}
 PASS=0; FAIL=0
 ck() { if [ "$1" = 0 ]; then PASS=$((PASS+1)); printf "[ok] %s\n" "$2";
        else FAIL=$((FAIL+1)); printf "[FAIL] %s\n" "$2"; fi; }
-cleanup() { kill ${ORIGIN_PID:-0} 2>/dev/null; "$TIER_CLI" -p 6399 shutdown nosave 2>/dev/null; }
+# `kill ${VAR:-0}` is a process-group suicide: when the variable is unset the
+# command becomes `kill 0`, which signals EVERY process in the current process
+# group -- the calling shell included. It only fires on the paths that exit
+# before the pid is assigned, so it survived every local run and killed the CI
+# job with exit 143 the first time a SKIP guard tripped.
+cleanup() {
+  [ -n "${ORIGIN_PID:-}" ] && kill "$ORIGIN_PID" 2>/dev/null
+  [ -n "${TIER_CLI:-}" ] && "$TIER_CLI" -p 6399 shutdown nosave 2>/dev/null
+  return 0
+}
 trap cleanup EXIT
 
 command -v valkey-server >/dev/null || { echo "SKIP: no "$TIER_SERVER""; exit 0; }

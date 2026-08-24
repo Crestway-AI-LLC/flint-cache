@@ -28,7 +28,14 @@ MP=${MP_PORT:-9528}; SP=${SP_PORT:-9529}
 PASS=0; FAIL=0
 ck() { if [ "$1" = 0 ]; then PASS=$((PASS+1)); printf "[ok] %s\n" "$2";
        else FAIL=$((FAIL+1)); printf "[FAIL] %s\n" "$2"; fi; }
-cleanup() { kill ${A:-0} ${B:-0} 2>/dev/null; "$TIER_CLI" -p 6399 shutdown nosave 2>/dev/null; }
+# See cross_language_drill.sh: `kill ${VAR:-0}` becomes `kill 0` when unset,
+# which signals the whole process group including the calling shell.
+cleanup() {
+  [ -n "${A:-}" ] && kill "$A" 2>/dev/null
+  [ -n "${B:-}" ] && kill "$B" 2>/dev/null
+  [ -n "${TIER_CLI:-}" ] && "$TIER_CLI" -p 6399 shutdown nosave 2>/dev/null
+  return 0
+}
 trap cleanup EXIT
 
 command -v valkey-server >/dev/null || { echo "SKIP: no "$TIER_SERVER""; exit 0; }

@@ -72,6 +72,14 @@ which is also its safety: nothing outside table reads can be affected.
 --conf spark.sql.catalog.<cat>.flint.tier.uri=redis://<your-endpoint>:6379
 ```
 
+Iceberg builds its own S3 client and reads **`client.region`** — not
+`s3.region`. If your cluster has no ambient AWS region (no `AWS_REGION`, no
+`~/.aws/config`, not on EC2), add
+`--conf spark.sql.catalog.<cat>.client.region=<region>` or the SDK throws
+*"Unable to load region from any of the providers in the chain"* before any of
+this runs. Easy to miss, because a developer laptop almost always has one and a
+clean CI runner never does.
+
 ### Python / PyTorch / Ray
 
 `install()` re-registers the `s3` protocol, so existing `s3://` paths and
