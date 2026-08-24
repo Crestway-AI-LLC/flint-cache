@@ -899,6 +899,37 @@ fleet_kill() {
     esac
     kill -9 "$pid" 2>/dev/null
   done
+  # AND DO NOT RETURN UNTIL THE PORTS ARE ACTUALLY FREE.
+  #
+  # Every caller follows fleet_kill with a fixed `sleep`, which is a guess at
+  # exactly this postcondition. The guess held for as long as a restarted node
+  # did not bind until its initial full sync finished — seconds of slack. #176
+  # binds within milliseconds of exec, so a 0.4s sleep became the entire margin
+  # against the previous process releasing the socket, and 21 drills follow
+  # this call with a respawn on the same ports.
+  #
+  # Seen as promote_notice's "nothing listening on 127.0.0.1:6911 after 30s":
+  # the replacement lost the race, got EADDRINUSE and exited, and the drill
+  # then measured a promotion into a node that was not there (5064ms against a
+  # 19ms steady state). Intermittent, and invisible until #176 tightened the
+  # window.
+  #
+  # kill -9 is immediate; the socket release is not. Wait for the fact instead
+  # of sleeping past it. Bounded, and silent on timeout — a port still held
+  # after 5s is a different problem and the caller's own wait will report it
+  # with better context than this function has.
+  local _p _t
+  if [ -n "${FLEET_PORTS:-}" ]; then
+    _t=$(( $(date +%s) + 5 ))
+    for _p in $(printf '%s' "$FLEET_PORTS" | tr '|' ' '); do
+      while (exec 3<>"/dev/tcp/127.0.0.1/$_p") 2>/dev/null; do
+        exec 3>&- 2>/dev/null
+        [ "$(date +%s)" -ge "$_t" ] && break
+        sleep 0.05
+      done
+      exec 3>&- 2>/dev/null
+    done
+  fi
   return 0
 }
 
