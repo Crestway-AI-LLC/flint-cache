@@ -153,3 +153,47 @@ not a while. The knob is dispatchable so that bar can be met with evidence
 rather than argued about. The remaining four scope mismatches should be
 aligned first, and then the durable form of this whole bug is one assertion:
 **a drill's data dirs must live under a scope it declares.**
+
+## The default is flipped, and the evidence has a shelf life
+
+Three consecutive green runs at P=6 — 11m49s, 11m43s, and the P=3 pair before
+them — so `gate.yml` now defaults to `FLINT_GATE_JOBS: 6`, with
+`gate_jobs=1` on a manual dispatch as the rollback.
+
+**But that evidence was taken on a tree that is about to change.** A peer
+session has ~11 commits queued for main fixing races that a parallel gate makes
+*more* likely, and none of them are in what was measured here:
+
+- a master that BINDS and answers `-LOADING` while still loading, which is
+  fatal to a replica's full sync because the retry predicate covers
+  `-THROTTLED` and the connection errors but not `-LOADING`
+- `fleet_kill` returning on signal delivery rather than on the seat being gone,
+  where 53 drills respawn on the same ports after a fixed sub-second sleep
+- `PONG` no longer meaning ready, affecting 50 drills that wait on it and then
+  issue data commands
+
+Verified against this branch's base (`220364f3`): the only `-LOADING` in
+`crates/` is flint-vec's vector-index warming — a different concept wearing the
+same string — and `fleet_wait_ping` is still PONG-only.
+
+So 109/109 three times says the parallel path works **on the tree it ran
+against**. It does not say P=6 is safe once those land. Rebase onto them and
+re-run before treating the default as settled; that is a smaller claim than the
+numbers above invite, and the difference is exactly the kind of thing that
+turns into a gate going red for reasons unrelated to the change under test.
+
+## Watch durations, not just verdicts
+
+The same peer observed `promote_notice` sitting at exactly 10s for 18
+consecutive gates, then going 43 / 8 / 42 while still passing — the variance
+arriving before the failure. Checked here across serial / P=3 / P=6:
+
+    promote_notice  10 -> 11 -> 12      (stable; does not reproduce)
+    upgrade         56 -> 63 -> 66
+    decommission    43 -> 43 -> 47
+    cpha_roll       36 -> 36 -> 39
+    chaos          115 -> 129 -> 120
+    edge_roll       40 -> 41 -> 56      <- +40%, the one to watch
+
+Mild monotonic inflation rather than instability. One sample per configuration
+rules nothing out, so this is a baseline to compare against, not an all-clear.
