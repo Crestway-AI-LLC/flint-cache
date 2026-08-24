@@ -16,7 +16,10 @@ D3=$(mktemp -d $FLINT_DRILL_ROOT/flint-ha-3.XXXXXX)
 B=./target/release/flint-server
 P1=6450; P2=6451; P3=6452
 cleanup() {
-  pkill -9 -f "flint-server --port 645" 2>/dev/null
+  # fleet_kill, not "--port 645": that is a substring match, and it stopped
+  # being self-contained the moment disk_selffill declared 6458. Scoped to the
+  # ports this drill gave fleet_init (6450-6452).
+  fleet_kill server
   fleet_kill controller
   rm -rf "$D1" "$D2" "$D3"
 }
