@@ -128,9 +128,23 @@ So the cause was structural, not resource: a seat started outside fleet.sh's
 tracking, in a directory the drill had never declared, recognisable only by
 port. Nothing about memory, and nothing about the product.
 
-**The gate is 1.93x faster and green.** Memory sits at 12% of the box, so the
-job count is nowhere near its ceiling — the floor is `ns_escape` at 365s, about
-6 minutes, whatever P is. A P=6 run is queued to find where the curve flattens.
+**The gate is green in parallel, and the curve is measured:**
+
+| jobs | wall clock | speedup | result | peak memory |
+|---|---|---|---|---|
+| 1 (serial) | 31m15s | 1.00x | green | not sampled |
+| 3 | 16m09s | **1.93x** | 109 / 0 | 1888 MB (12%) |
+| 6 | **11m49s** | **2.65x** | 109 / 0 | 2084 MB (13%) |
+
+Memory barely moves between P=3 and P=6 — 1888 to 2084 MB, both ~12% of a
+16 GB box — which is the clearest possible answer to the question that kept
+this knob off. The drills are not memory-bound and they are not CPU-bound
+either: P=6 on 4 vCPU is 1.5x oversubscribed and still 27% faster than P=3,
+so most of the wall clock is waiting, not computing.
+
+Diminishing returns are visible and have a known cause. `ns_escape` alone runs
+365s, so ~6 minutes is the floor at any P; at P=6 the gate is already within
+twice that. P=8 would buy a little; splitting `ns_escape` would buy more.
 
 ## Before flipping the default
 
