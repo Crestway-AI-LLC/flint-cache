@@ -207,6 +207,25 @@ CHAOS="chaos proxy_chaos chaos_unreadable hotkey_chaos"
 #   stop_sweep    FAILS in setup: "fleet B did not start". It declares eight
 #                 ports across two fleets (6317-6321, 7820, 7879, 7889), so a
 #                 collision is the first thing to check. Fix before adding.
+#   coproc_family UNVERIFIED. It has not run since ADR-0010's deploy path
+#                 landed — not in CORE, not in CHAOS, and until now not here
+#                 either, so nothing ran it and nothing said why. Whether it
+#                 passes is unknown. Run it before moving it to CORE.
+#   proxy_chain   UNVERIFIED, same history. It also reserves 6460-6467, and
+#                 loaded_promote and loading_visible were both moved off that
+#                 block to avoid colliding with it — the suite is paying a
+#                 port-allocation tax to a drill nothing executes. Settle it:
+#                 run it and register it, or delete it and free the ports.
+
+# THE LIST ABOVE IS NOW LOAD-BEARING, so it is a variable and not only prose.
+# coproc_family and proxy_chain sat in tools/ registered nowhere for weeks:
+# absent from CORE, absent from CHAOS, and absent from the block above whose
+# own first line says an unexplained absence is indistinguishable from an
+# oversight. The list was written to prevent exactly this and could not,
+# because nothing checked that it was complete. A convention that depends on
+# being remembered will be forgotten; assert_every_drill_accounted_for is what
+# turns it into a check.
+EXCLUDED="backup_s3 fullsync_cap stop_sweep coproc_family proxy_chain"
 
 # FLINT_GATE_STRICT=1 turns a SKIPPED drill into a FAILED one.
 #
@@ -903,6 +922,72 @@ assert_spawning_drills_declare_ports() {
   FAILED="$FAILED undeclared-ports"
 }
 
+# EVERY DRILL FILE MUST BE ACCOUNTED FOR, and every listed name must exist.
+#
+# The failure this prevents is silence, not noise. coproc_family and
+# proxy_chain sat in tools/ for weeks in neither CORE, CHAOS nor the
+# exclusions block — so nothing ran them, nothing reported them, and the only
+# visible trace was proxy_chain's 6460-6467 being honoured by the port
+# allocator on behalf of a drill that never executes. A drill that is never
+# run is worse than a deleted one: it looks like coverage.
+#
+# The other direction matters too. A name listed with no file behind it makes
+# CORE claim coverage the tree cannot deliver, and the runner skips it without
+# comment.
+#
+# FLATTENED BEFORE MATCHING, and this is the whole trap. CORE is a multi-line
+# string, and `case " $CORE " in *" $name "*)` cannot see a name whose next
+# character is a newline — the first version of this check reported sixteen
+# perfectly-registered drills as unlisted, one per line of CORE. A hand-check
+# had passed it only because the hand-check piped CORE through `tr` first and
+# so tested different code than shipped. Hence the positive control below,
+# against a SYNTHETIC list with a name at the end of a line: a real drill name
+# would pass for the wrong reason the day someone reorders CORE.
+assert_every_drill_accounted_for() {
+  local flat name f missing="" orphan=""
+  flat=" $(printf '%s %s %s' "$CORE" "$CHAOS" "$EXCLUDED" | tr '\n' ' ') "
+
+  # POSITIVE CONTROL: prove the matcher can see a name that ends a line.
+  local probe
+  probe=" $(printf 'alpha beta\ngamma delta' | tr '\n' ' ') "
+  case "$probe" in
+    *" beta "*) : ;;
+    *) echo "GATES FAILED: assert_every_drill_accounted_for's matcher cannot see"
+       echo "      a name at the end of a line — the check would report every"
+       echo "      such drill as unregistered. Refusing to report a verdict."
+       exit 1 ;;
+  esac
+  case "$probe" in
+    *" epsilon "*)
+       echo "GATES FAILED: assert_every_drill_accounted_for's matcher matched a"
+       echo "      name that is not in the list. Refusing to report a verdict."
+       exit 1 ;;
+  esac
+
+  for f in tools/*_drill.sh; do
+    [ -f "$f" ] || continue
+    name=$(basename "$f" _drill.sh)
+    case "$flat" in *" $name "*) : ;; *) missing="$missing $name" ;; esac
+  done
+  for name in $flat; do
+    [ -f "tools/${name}_drill.sh" ] || orphan="$orphan $name"
+  done
+
+  if [ -n "$missing" ]; then
+    echo "GATES FAILED: drill file(s) in neither CORE, CHAOS nor EXCLUDED:$missing"
+    echo "      Nothing runs them and nothing says why. Add to CORE if they"
+    echo "      pass, or to EXCLUDED with the reason — an absence with no"
+    echo "      reason beside it is indistinguishable from an oversight."
+    exit 1
+  fi
+  if [ -n "$orphan" ]; then
+    echo "GATES FAILED: listed name(s) with no drill file:$orphan"
+    echo "      CORE claims coverage the tree cannot deliver, and the runner"
+    echo "      skips the name without comment."
+    exit 1
+  fi
+}
+
 # docs/bugs/0025: `recover_migrations` completes a slot flip onto a destination
 # that may hold nothing, purging the source — measured acked-write loss. It is
 # gated on a non-empty --recover-nodes list, and the ONLY reason it never fires
@@ -1269,6 +1354,7 @@ if want drills; then
   assert_no_continuation_splice
   assert_no_cross_drill_kill_patterns
   assert_no_duplicate_drill_ports
+  assert_every_drill_accounted_for
   LEAKCHECK=1
   run_core_drills
   LEAKCHECK=
