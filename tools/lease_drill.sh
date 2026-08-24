@@ -21,7 +21,12 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init $FLINT_DRILL_ROOT/flint-lease-m 6306 6308 6309
+# The scope declared here must COVER every data dir this drill creates
+# (BUG-0047). The harness attributes a seat to a drill by this prefix or
+# by a declared port; a seat matching neither is unattributable, and the
+# one such seat in the suite — failover's zombie, started outside
+# fleet.sh's tracking — is what broke the parallel gate.
+fleet_init $FLINT_DRILL_ROOT/flint-lease- 6306 6308 6309
 fleet_guard
 fleet_kill server; fleet_kill controlplane; sleep 0.4
 MDIR=$(mktemp -d $FLINT_DRILL_ROOT/flint-lease-m.XXXXXX); RDIR=$(mktemp -d $FLINT_DRILL_ROOT/flint-lease-r.XXXXXX)

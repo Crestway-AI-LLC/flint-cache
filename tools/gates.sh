@@ -354,6 +354,49 @@ case "$GATE_JOBS" in ''|*[!0-9]*) echo "FLINT_GATE_JOBS must be a positive integ
 #
 # Truncation is only a defect when the prefix reaches ANOTHER drill's declared
 # ports; a drill sweeping its own range is a legitimate idiom and stays legal.
+# EVERY DATA DIR A DRILL CREATES MUST SIT UNDER A SCOPE IT DECLARES (BUG-0047).
+#
+# The harness attributes a seat to a drill two ways: the scope prefix from
+# `fleet_init`, or a port the same line declares. A seat matching neither is
+# unattributable — `_foreign_seats` will report it and, correctly, refuse to
+# kill it, because it cannot tell that seat from another session's fleet.
+#
+# Serially that costs nothing: nothing else is running to be confused. Under
+# FLINT_GATE_JOBS>1 it is the difference between a green gate and a red one.
+# failover declared `flint-failover` and created `flint-fo-{m,r}`, so its
+# ZOMBIE — the one seat it starts outside fleet.sh's tracking — had no marker
+# at all beyond a port, and died. 31m15s serial became 16m09s at P=3 the
+# moment the two names agreed.
+#
+# Four more drills carried the same mismatch harmlessly, because every seat
+# they start also carries a declared port. "Harmless today" is why this is a
+# check and not a fixed list: the next drill to add an untracked seat under a
+# name nobody declared reintroduces the bug, and would again present as one
+# unrelated drill failing only in parallel.
+assert_declared_scopes_cover_data_dirs() {
+  local drill d decl used bad="" hit
+  for drill in tools/*_drill.sh; do
+    d=$(basename "$drill" _drill.sh)
+    decl=$(grep -hE '^fleet_init' "$drill" 2>/dev/null | awk '{print $2}' | sed 's|.*/||')
+    [ -n "$decl" ] || continue
+    used=$(grep -oE 'mktemp -d "?\$\{?FLINT_DRILL_ROOT\}?/[A-Za-z0-9_.-]+' "$drill" 2>/dev/null | sed 's|.*/||')
+    for u in $used; do
+      hit=0
+      for p in $decl; do case "$u" in "$p"*) hit=1 ;; esac; done
+      [ "$hit" = 0 ] && bad="$bad
+    $d: creates '$u', declares $(echo $decl)"
+    done
+  done
+  [ -z "$bad" ] && return 0
+  echo "FAIL  data dir(s) outside every scope the drill declares:$bad"
+  echo "        The harness can only attribute a seat by its fleet_init scope"
+  echo "        prefix or a declared port. One matching neither is invisible to"
+  echo "        the leak check and unkillable by it — which is exactly how"
+  echo "        failover's zombie broke the parallel gate (BUG-0047)."
+  echo "        Widen the fleet_init scope, or name the dir under it."
+  FAILED="$FAILED unscoped-data-dir"
+}
+
 assert_no_cross_drill_kill_patterns() {
   local d drill pat owner bad=""
   local portmap="$LOGS/.portmap"
@@ -1149,6 +1192,7 @@ if want drills; then
   assert_drill_build_is_checked
   assert_no_continuation_splice
   assert_no_cross_drill_kill_patterns
+  assert_declared_scopes_cover_data_dirs
   LEAKCHECK=1
   run_core_drills
   LEAKCHECK=

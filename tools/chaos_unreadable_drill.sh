@@ -45,6 +45,11 @@
 # to chase today.
 set -euo pipefail
 . "$(dirname "$0")/lib/fleet.sh"
+# The scope declared here must COVER every data dir this drill creates
+# (BUG-0047). The harness attributes a seat to a drill by this prefix or
+# by a declared port; a seat matching neither is unattributable, and the
+# one such seat in the suite — failover's zombie, started outside
+# fleet.sh's tracking — is what broke the parallel gate.
 fleet_init $FLINT_DRILL_ROOT/flint-chaosunread 6346 6347 6348 6349 6350 6351 6352 6353
 fleet_guard
 fleet_kill server
@@ -52,7 +57,7 @@ sleep 0.5
 cargo build --release -q -p flint-server --features rocks
 cargo build --release -q -p flint-chaos
 
-D=$(mktemp -d $FLINT_DRILL_ROOT/flint-unreadable.XXXXXX)
+D=$(mktemp -d $FLINT_DRILL_ROOT/flint-chaosunread-d.XXXXXX)
 trap 'fleet_kill server; rm -rf "$D"' EXIT
 INJECT=3
 
