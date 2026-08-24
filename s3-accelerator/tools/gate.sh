@@ -1,0 +1,315 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+#
+# Everything, in one command.
+#
+# The work is spread across seven suites and two languages, and until now
+# nothing ran them together. A verification you have to remember how to
+# assemble is one you will eventually assemble wrong -- and this project has
+# already produced a script that graded the wrong jar, a control that could not
+# arm, and a green SSE-C run whose reads would have failed in production.
+#
+#   tools/gate.sh            # everything
+#   tools/gate.sh --quick    # skip the shaded-jar re-run
+set -uo pipefail
+cd "$(dirname "$0")/.."
+ROOT=$PWD
+export JAVA_HOME="${JAVA_HOME:-/opt/homebrew/opt/openjdk@21}"
+export PATH="$JAVA_HOME/bin:$PATH"
+QUICK=${1:-}
+
+PASS=0; FAIL=0; SKIP=0
+declare -a FAILED
+PIDS=()
+cleanup() {
+  for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null; done
+  valkey-cli -p 6399 shutdown nosave 2>/dev/null
+  # Prove it, rather than assume the kills landed.
+  local left
+  left=$(ps -ax -o command= | grep -E '^(/opt/homebrew/bin/)?(valkey|redis)-server|counting_s3\.py' | grep -v grep | wc -l | tr -d ' ')
+  [ "$left" = 0 ] && echo "teardown: clean" || { echo "teardown: $left PROCESS(ES) LEFT"; ps -ax -o command= | grep -E 'valkey-server|counting_s3' | grep -v grep; }
+}
+trap cleanup EXIT
+
+step() { printf "\n\033[1m== %s\033[0m\n" "$1"; }
+verdict() { # name, rc
+  if [ "$2" -eq 0 ]; then PASS=$((PASS+1)); printf "   \033[32mPASS\033[0m  %s\n" "$1"
+  else FAIL=$((FAIL+1)); FAILED+=("$1"); printf "   \033[31mFAIL\033[0m  %s (rc=$2)\n" "$1"; fi
+}
+
+need() { command -v "$1" >/dev/null 2>&1; }
+for t in java mvn python3 valkey-server valkey-cli; do
+  need "$t" || { echo "missing prerequisite: $t"; exit 2; }
+done
+
+# ---------------------------------------------------------------- fixtures
+# A gate that can hang forever is worse than one that fails: the first run of
+# this script burned its whole budget on one stuck suite and produced NO
+# verdict at all. macOS has no timeout(1), so enforce it here.
+SUITE_TIMEOUT=${SUITE_TIMEOUT:-180}
+run_bounded() { # cmd...
+  "$@" & local pid=$! waited=0
+  while kill -0 "$pid" 2>/dev/null; do
+    sleep 2; waited=$((waited+2))
+    if [ "$waited" -ge "$SUITE_TIMEOUT" ]; then
+      kill -9 "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+      return 124
+    fi
+  done
+  wait "$pid"; return $?
+}
+
+# Defined HERE, above every use, because it was not: a stage added later called
+# run_bounded from line 60 while the definition sat at line 100, and bash
+# reported `command not found` -- rc 127, which the gate correctly failed on
+# but which reads like a missing interpreter rather than a helper used before
+# it exists. A helper defined halfway down a script is a footgun for whoever
+# adds the next stage above it.
+
+step "fixtures"
+python3 tools/counting_s3.py --self-test >/tmp/gate_harness.log 2>&1
+verdict "counting-s3 self-test" $?
+
+# The preflight script is the first thing a customer runs and the only one that
+# runs on THEIR cluster, so its version predicates are gated like anything else.
+# Each carries a negative control, because a warning nobody has watched fire is
+# indistinguishable from a warning that cannot.
+bash tools/preflight.sh --self-test >/tmp/gate_preflight.log 2>&1
+verdict "preflight version predicates (4 checks)" $?
+
+# The sick-tier proxy is an instrument like counting_s3, and gets the same
+# treatment: a proxy that quietly added no delay would make a broken client
+# look healthy, so it self-tests with a zero-delay transparency control.
+run_bounded python3 tools/slow_tier.py --self-test >/tmp/gate_slowtier.log 2>&1
+verdict "slow-tier proxy self-test (4 checks)" $?
+
+bash tools/shim_guard_test.sh >/tmp/gate_shim.log 2>&1
+verdict "shim guard (5 classpath states)" $?
+
+# ---------------------------------------------------------------- build
+step "build"
+( cd jvm-spike && mvn -q package -DskipTests ) >/tmp/gate_build.log 2>&1
+verdict "maven package" $?
+
+bash tools/verify_shading.sh >/tmp/gate_shade.log 2>&1
+verdict "shading (relocation + shim isolation)" $?
+
+CP_FILE=/tmp/gate_cp.txt
+( cd jvm-spike && mvn -q dependency:build-classpath -Dmdep.outputFile=$CP_FILE ) >/dev/null 2>&1
+CP=$(cat $CP_FILE 2>/dev/null)
+# Test scope too: the Iceberg suite needs iceberg-data and a newer Avro, both
+# test-scoped because customers bring their own Hadoop and Iceberg.
+CP_TEST_FILE=/tmp/gate_cp_test.txt
+( cd jvm-spike && mvn -q dependency:build-classpath -Dmdep.outputFile=$CP_TEST_FILE \
+    -DincludeScope=test ) >/dev/null 2>&1
+CP_TEST=$(cat $CP_TEST_FILE 2>/dev/null)
+CLASSES=$ROOT/jvm-spike/target/classes
+SHADED=$(ls jvm-spike/target/*.jar 2>/dev/null | grep -v original | grep -v hadoop-shim | head -1)
+SHIM=$(ls jvm-spike/target/*hadoop-shim.jar 2>/dev/null | head -1)
+
+# ---------------------------------------------------------------- services
+start_svcs() { # port, extra-args
+  valkey-server --port 6399 --save '' --appendonly no --daemonize yes 2>/dev/null
+  python3 tools/counting_s3.py --port "$1" --objects 8 --object-bytes 8388608 ${2:-} \
+      >/tmp/gate_origin_$1.log 2>&1 &
+  PIDS+=($!)
+  sleep 2
+}
+stop_origin() { for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null; done; PIDS=(); sleep 1; }
+
+
+run_suite() { # label, mainclass, port, classpath, extra-origin-args
+  start_svcs "$3" "${5:-}"
+  valkey-cli -p 6399 flushall >/dev/null 2>&1
+  local log="/tmp/gate_$(echo "$1" | tr ' /()' '____').log"
+  run_bounded java -cp "$4" "$2" "http://127.0.0.1:$3" redis://127.0.0.1:6399 >"$log" 2>&1
+  local rc=$?
+  [ $rc -eq 124 ] && printf "   \033[31mHUNG\033[0m  %s (>${SUITE_TIMEOUT}s)\n" "$1"
+  verdict "$1" $rc
+  stop_origin
+}
+
+step "suites (classes)"
+# --delay-ms is not decoration: the single-flight suites need a window wide
+# enough for readers to actually collide, and these are the values each suite
+# was developed and validated against.
+run_suite "client suite (18 checks)"   ai.crestway.flintaccel.client.Suite   9301 "$ROOT/jvm-spike/target/classes:$CP" "--delay-ms 120"
+run_suite "S3A properties (9 checks)"  ai.crestway.flintaccel.s3a.S3aSuite   9302 "$ROOT/jvm-spike/target/classes:$CP" "--delay-ms 150"
+run_suite "adoption paths (9 checks)"  ai.crestway.flintaccel.s3a.AdoptionSuite 9303 "$ROOT/jvm-spike/target/classes:$CP"
+run_suite "SSE-C bypass (5 checks)"    ai.crestway.flintaccel.s3a.SseCSuite  9304 "$ROOT/jvm-spike/target/classes:$CP"
+
+# The tier is the one dependency every other suite trusts implicitly. This one
+# corrupts it on purpose: absent, truncated, wrong-bytes, and right-bytes-wrong-
+# offset. The last two returned wrong data as truth until chunks were sealed
+# with their own identity, and no other suite could have seen it.
+run_suite "tier integrity, adversarial (20 checks)" ai.crestway.flintaccel.client.IntegritySuite 9305 "$ROOT/jvm-spike/target/classes:$CP"
+
+# Every fixture object had been single-part, so the ETag string that D3
+# content-addresses by had only ever taken one shape. Anything Spark writes at
+# size reports "<hash>-<partcount>" instead -- the workload this product exists
+# for. The whole 18-check suite runs again in that regime, and the drill checks
+# the suffix survives into the KEY, which correct bytes alone would not show.
+run_suite "client suite under MULTIPART etags (18 checks)" ai.crestway.flintaccel.client.Suite \
+    9307 "$ROOT/jvm-spike/target/classes:$CP" "--multipart-parts 4 --delay-ms 120"
+
+CP_FILE="$CP_FILE" run_bounded bash "$ROOT/tools/multipart_etag_drill.sh" \
+    >/tmp/gate_multipart.log 2>&1
+verdict "multipart etag key shape (7 checks)" $?
+
+# SSE-KMS bypasses the cache by default (D13.3). Needs TWO origins: one that
+# reports aws:kms and one that does not, because "it cached nothing" is only
+# evidence of the rule if the same client demonstrably caches a plain object.
+start_svcs 9308 "--sse-kms"
+python3 tools/counting_s3.py --port 9309 --objects 4 --object-bytes 1048576 \
+    >/tmp/gate_origin_9309.log 2>&1 &
+PIDS+=($!)
+sleep 2
+valkey-cli -p 6399 flushall >/dev/null 2>&1
+run_bounded java -cp "$ROOT/jvm-spike/target/classes:$CP" \
+    ai.crestway.flintaccel.client.SseKmsSuite \
+    http://127.0.0.1:9308 http://127.0.0.1:9309 redis://127.0.0.1:6399 \
+    >/tmp/gate_ssekms.log 2>&1
+verdict "SSE-KMS bypass + opt-in (12 checks)" $?
+
+# The same rule on ALL THREE adoption paths. Written because it was implemented
+# on two and absent from the one preflight recommends FIRST: the stream factory
+# built its client through the older constructor and could not detect KMS at
+# all, while fs.s3a.impl mapped config through a switch that dropped the opt-in
+# key. A check on any single path passes while the others are wrong.
+run_bounded java -cp "$ROOT/jvm-spike/target/classes:$CP" \
+    ai.crestway.flintaccel.s3a.SseKmsPathsSuite \
+    http://127.0.0.1:9308 redis://127.0.0.1:6399 >/tmp/gate_kmspaths.log 2>&1
+verdict "SSE-KMS on all 3 adoption paths (7 checks)" $?
+stop_origin
+
+# A SICK tier -- one that answers slowly rather than dying -- used to make
+# reads 165% SLOWER than having no cache at all, because every request burned
+# the whole budget and then went to the origin anyway. The reference here is
+# deliberately the no-tier client, not the healthy one: a cache may be slower
+# than a fast cache, and may never be slower than no cache.
+start_svcs 9310 "--delay-ms 20"
+python3 tools/slow_tier.py --listen 6398 --upstream 6399 --delay-ms 200 \
+    >/tmp/gate_proxy.log 2>&1 &
+PIDS+=($!)
+sleep 2
+valkey-cli -p 6399 flushall >/dev/null 2>&1
+run_bounded java -cp "$ROOT/jvm-spike/target/classes:$CP" \
+    ai.crestway.flintaccel.client.SickTierSuite \
+    http://127.0.0.1:9310 redis://127.0.0.1:6399 redis://127.0.0.1:6398 \
+    >/tmp/gate_sicktier.log 2>&1
+verdict "sick tier is not slower than NO tier (4 checks)" $?
+stop_origin
+
+# ------------------------------------------------------------ iceberg io-impl
+# The one adoption route with NO inheritable contract suite, so this is bespoke
+# on purpose: a real table, created by a catalog configured with nothing but
+# io-impl, written as Avro through the FileIO, and read back through Iceberg's
+# own planner. Each read phase uses a FRESH catalog, because one FileIO holds
+# one AAL factory and reading twice through it measures AAL's memory rather
+# than our tier.
+step "iceberg io-impl, end to end (real tables, avro + parquet)"
+start_svcs 9306
+valkey-cli -p 6399 flushall >/dev/null 2>&1
+( cd jvm-spike && run_bounded mvn -q -o test-compile ) >/tmp/gate_ice_build.log 2>&1
+run_bounded java -cp "$ROOT/jvm-spike/target/classes:$ROOT/jvm-spike/target/test-classes:$CP_TEST" \
+    ai.crestway.flintaccel.iceberg.IcebergSuite \
+    http://127.0.0.1:9306 redis://127.0.0.1:6399 >/tmp/gate_iceberg.log 2>&1
+verdict "iceberg table read via io-impl, avro + parquet (20 checks)" $?
+stop_origin
+
+# --------------------------------------------------- inherited contract suite
+step "hadoop contract suite (45 tests we did not write)"
+start_svcs 9310
+valkey-cli -p 6399 flushall >/dev/null 2>&1
+( cd jvm-spike && run_bounded mvn -q test -Dtest=ITestFlintSeek,ITestFlintOpen \
+    -DfailIfNoTests=false -Dflint.test.endpoint=http://127.0.0.1:9310 \
+    -Dflint.test.tier=redis://127.0.0.1:6399 ) >/tmp/gate_contract.log 2>&1
+verdict "Hadoop AbstractContract{Seek,Open}Test" $?
+stop_origin
+
+# ---------------------------------------------------------------- python
+step "python path"
+PYENV="${FLINT_PYENV:-$ROOT/python/.venv}"
+if [ -x "$PYENV/bin/python" ]; then
+  start_svcs 9401 "--delay-ms 80"
+  valkey-cli -p 6399 flushall >/dev/null 2>&1
+  ( cd python && run_bounded "$PYENV/bin/python" suite.py \
+      http://127.0.0.1:9401 redis://127.0.0.1:6399 ) >/tmp/gate_python.log 2>&1
+  verdict "python suite (19 checks)" $?
+  stop_origin
+
+  # fsspec's own abstract suite, against MOTO rather than counting_s3.
+  # counting_s3 exists to count and cannot serve DeleteObjects or CopyObject;
+  # running a correctness suite against it measures the fixture. Each
+  # instrument for the question it can answer.
+  if "$PYENV/bin/python" -c "import moto, pytest" 2>/dev/null; then
+    "$PYENV/bin/python" -m moto.server -p 9810 >/tmp/gate_moto.log 2>&1 &
+    PIDS+=($!); sleep 4
+    valkey-cli -p 6399 flushall >/dev/null 2>&1
+    ( cd python && FLINT_TEST_ENDPOINT=http://127.0.0.1:9810 \
+        FLINT_TEST_TIER=redis://127.0.0.1:6399 \
+        run_bounded "$PYENV/bin/python" -m pytest test_fsspec_contract.py \
+        -q --no-header --deselect \
+        test_fsspec_contract.py::TestFlintOpen::test_open_exclusive \
+      ) >/tmp/gate_fsspec.log 2>&1
+    verdict "fsspec abstract suite (90 tests)" $?
+    stop_origin
+  else
+    SKIP=$((SKIP+1))
+    printf "   \033[33mSKIP\033[0m  fsspec abstract suite (moto/pytest not installed)\n"
+  fi
+
+  # ------------------------------------------------- one tier, two languages
+  # The only check that can see whether the JVM and Python clients actually
+  # SHARE a cache. Every other suite speaks one language and populates the
+  # tier itself, so both stayed green while the two wrote different key
+  # prefixes and different value formats -- two copies of identical bytes and
+  # double the S3 bill, invisible by construction.
+  #
+  # The drill owns its own origin and tier and shuts BOTH down on exit, so any
+  # later stage must start its own. start_svcs does.
+  cp "$CP_FILE" /tmp/cp.txt 2>/dev/null
+  FLINT_PYENV="$PYENV" PORT=9407 run_bounded bash "$ROOT/tools/cross_language_drill.sh" \
+    >/tmp/gate_xlang.log 2>&1
+  verdict "cross-language cache sharing (9 checks)" $?
+
+  # The same SSE-KMS rule on the Python path. Not a duplicate of the JVM
+  # stage: the two clients SHARE one tier, so a rule only one of them enforces
+  # is not a rule -- a Python reader would cache the very plaintext the JVM
+  # reader refuses to cache.
+  start_svcs 9318 "--sse-kms"
+  python3 tools/counting_s3.py --port 9319 --objects 4 --object-bytes 1048576 \
+      >/tmp/gate_origin_9319.log 2>&1 &
+  PIDS+=($!)
+  sleep 2
+  valkey-cli -p 6399 flushall >/dev/null 2>&1
+  ( cd python && run_bounded "$PYENV/bin/python" sse_kms_suite.py \
+      http://127.0.0.1:9318 http://127.0.0.1:9319 redis://127.0.0.1:6399 \
+    ) >/tmp/gate_ssekms_py.log 2>&1
+  verdict "SSE-KMS on the python path (11 checks)" $?
+  stop_origin
+else
+  SKIP=$((SKIP+1))
+  printf "   \033[33mSKIP\033[0m  python suite (no venv; set FLINT_PYENV)\n"
+fi
+
+if [ "$QUICK" != "--quick" ]; then
+  step "suites (SHADED jar -- relocation can break reflection)"
+  if [ -f "$SHADED" ] && [ -f "$SHIM" ]; then
+    ( cd jvm-spike && mvn -q dependency:build-classpath -Dmdep.outputFile=/tmp/gate_cp_prov.txt -Dmdep.includeScope=provided ) >/dev/null 2>&1
+    PROV=$(cat /tmp/gate_cp_prov.txt 2>/dev/null)
+    run_suite "adoption paths on shaded jar" ai.crestway.flintaccel.s3a.AdoptionSuite 9305 \
+        "$ROOT/$SHADED:$ROOT/$SHIM:$PROV"
+  else
+    SKIP=$((SKIP+1)); printf "   \033[33mSKIP\033[0m  shaded jar not built\n"
+  fi
+fi
+
+# ---------------------------------------------------------------- verdict
+step "gate"
+printf "   %d passed, %d failed" "$PASS" "$FAIL"
+[ $SKIP -gt 0 ] && printf ", %d skipped" "$SKIP"
+printf "\n"
+for f in "${FAILED[@]:-}"; do [ -n "$f" ] && printf "   failed: %s  (see /tmp/gate_*.log)\n" "$f"; done
+[ $FAIL -eq 0 ] && echo "   GATE PASSED" || echo "   GATE FAILED"
+exit $FAIL

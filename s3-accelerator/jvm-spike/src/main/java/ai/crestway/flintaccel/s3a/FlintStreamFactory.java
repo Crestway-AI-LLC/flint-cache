@@ -1,0 +1,227 @@
+// SPDX-License-Identifier: Apache-2.0
+package ai.crestway.flintaccel.s3a;
+
+import java.io.IOException;
+import java.net.URI;
+
+import org.apache.hadoop.conf.Configuration;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.apache.hadoop.fs.s3a.S3AEncryptionMethods;
+import org.apache.hadoop.fs.s3a.S3ObjectAttributes;
+import org.apache.hadoop.fs.s3a.VectoredIOContext;
+import org.apache.hadoop.fs.s3a.impl.streams.AbstractObjectInputStreamFactory;
+import org.apache.hadoop.fs.s3a.impl.streams.InputStreamType;
+import org.apache.hadoop.fs.s3a.impl.streams.ObjectInputStream;
+import org.apache.hadoop.fs.s3a.impl.streams.ObjectReadParameters;
+import org.apache.hadoop.fs.s3a.impl.streams.StreamFactoryRequirements;
+
+import io.lettuce.core.ClientOptions;
+import io.lettuce.core.RedisClient;
+import io.lettuce.core.api.StatefulRedisConnection;
+import io.lettuce.core.codec.ByteArrayCodec;
+
+import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
+import software.amazon.awssdk.auth.credentials.DefaultCredentialsProvider;
+import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
+import software.amazon.awssdk.regions.Region;
+import software.amazon.awssdk.services.s3.S3AsyncClient;
+
+import software.amazon.s3.analyticsaccelerator.S3SeekableInputStreamConfiguration;
+import software.amazon.s3.analyticsaccelerator.S3SeekableInputStreamFactory;
+import software.amazon.s3.analyticsaccelerator.S3SdkObjectClient;
+import software.amazon.s3.analyticsaccelerator.util.S3URI;
+
+import ai.crestway.flintaccel.client.FlintObjectClient;
+
+/**
+ * The S3A entry point: `fs.s3a.input.stream.type=custom` plus
+ * `fs.s3a.input.stream.custom.factory=ai.crestway.flintaccel.s3a.FlintStreamFactory`.
+ *
+ * We construct AAL ourselves -- it is public and takes an ObjectClient by
+ * injection -- and hand it OUR client, so AAL keeps doing prefetch and
+ * Parquet-awareness while every byte it fetches passes through the Flint tier.
+ * S3A's own `analytics` factory hardcodes S3SdkObjectClient and cannot be
+ * extended, which is why we register beside it rather than modifying it.
+ *
+ * Originally a registration probe for ADR-0023 D12.2 / D12.14.
+ *
+ * Everything about the S3A seam has so far been read, never run. This is the
+ * smallest thing that can be RUN: a factory S3A can load from configuration.
+ * `readObject` deliberately throws -- the question here is only whether
+ * `StreamIntegration.factoryFromConfig` instantiates a third-party class named
+ * by `fs.s3a.input.stream.custom.factory`, which decides whether any of the
+ * deployment story is real.
+ *
+ * It also records whether SSE-C is visible at this layer. D13.1 concluded the
+ * encryption bypass must be decided HERE, because AAL 1.1.0 cannot see it;
+ * that conclusion rests on `ObjectReadParameters.getEncryptionSecrets()` being
+ * available and populated, which is asserted rather than assumed below.
+ */
+public final class FlintStreamFactory extends AbstractObjectInputStreamFactory {
+
+  /** Set when S3A actually constructs one, so the probe cannot pass vacuously. */
+  private static final Logger LOG = LoggerFactory.getLogger(FlintStreamFactory.class);
+
+  public static volatile boolean CONSTRUCTED = false;
+  public static volatile Configuration INIT_CONF = null;
+
+  /** Config keys, all under our own prefix so S3A never has to know them. */
+  public static final String TIER_URI      = "fs.s3a.flint.tier.uri";
+  public static final String CHUNK_BYTES   = "fs.s3a.flint.chunk.bytes";
+  public static final String TIER_BUDGET   = "fs.s3a.flint.tier.budget.ms";
+  public static final String META_TTL      = "fs.s3a.flint.meta.ttl.seconds";
+  public static final String CACHE_SSE_KMS = "fs.s3a.flint.cache.sse-kms";
+  /** Refuse to start on a shim collision. Default true: a customer's working
+   *  job is worth more than our cache. */
+  public static final String SHIM_FAIL_FAST = "fs.s3a.flint.shim.failfast";
+
+  private S3AsyncClient s3;
+  private RedisClient redis;
+  private StatefulRedisConnection<byte[], byte[]> conn;
+  private S3SeekableInputStreamFactory aalCaching;
+  private S3SeekableInputStreamFactory aalBypass;
+  private FlintObjectClient cachingClient;
+
+  public FlintStreamFactory() {
+    super("FlintStreamFactory");
+    CONSTRUCTED = true;
+  }
+
+  /** Visible for tests: the client every cached read flows through. */
+  public FlintObjectClient client() { return cachingClient; }
+
+  /** Set at init so callers can inspect what the guard found. */
+  public static volatile ShimGuard SHIM = null;
+
+  @Override
+  protected void serviceInit(Configuration conf) throws Exception {
+    INIT_CONF = conf;
+    // Check BEFORE any S3 request, so a classpath problem is a sentence at
+    // startup rather than a NoClassDefFoundError mid-job (ADR-0023 D12.20).
+    SHIM = ShimGuard.inspect(getClass().getClassLoader());
+    switch (SHIM.state) {
+      case SINGLE -> LOG.debug("flint-accel shim check: {}", SHIM);
+      case ABSENT -> LOG.warn("flint-accel: {}", SHIM.detail);
+      case COLLISION, WRONG_SHAPE -> {
+        LOG.error("flint-accel: {}", SHIM.detail);
+        for (String l : SHIM.locations) LOG.error("flint-accel:   found at {}", l);
+        if (conf.getBoolean(SHIM_FAIL_FAST, true)) {
+          throw new IllegalStateException("flint-accel: " + SHIM.detail
+              + " Set " + SHIM_FAIL_FAST + "=false to proceed anyway.");
+        }
+      }
+    }
+    super.serviceInit(conf);
+  }
+
+  @Override
+  public void bind(org.apache.hadoop.fs.s3a.impl.streams.FactoryBindingParameters p)
+      throws IOException {
+    super.bind(p);
+    Configuration conf = INIT_CONF != null ? INIT_CONF : new Configuration(false);
+    String uri = conf.get(TIER_URI, "redis://127.0.0.1:6379");
+    int chunk = conf.getInt(CHUNK_BYTES, 64 * 1024);
+    long budget = conf.getLong(TIER_BUDGET, 50);
+    long ttl = conf.getLong(META_TTL, 60);
+
+    redis = RedisClient.create(uri);
+    redis.setOptions(ClientOptions.builder()
+        .disconnectedBehavior(ClientOptions.DisconnectedBehavior.REJECT_COMMANDS)
+        .cancelCommandsOnReconnectFailure(true).autoReconnect(true).build());
+    conn = redis.connect(new ByteArrayCodec());
+
+    // We build our OWN S3AsyncClient rather than reusing S3A's sync client.
+    //
+    // Hadoop's callbacks offer getOrCreateSyncClient(), and hadoop-aws 3.4.3's
+    // own AnalyticsStreamFactory wraps it in S3SyncSdkObjectClient -- a class
+    // that exists in NO published AAL version (checked 0.0.1-0.0.4, 1.0.0,
+    // 1.1.0). Released Hadoop's analytics path is therefore compiled against
+    // an unreleased AAL and would fail at bind time against the Maven Central
+    // artifact. We cannot follow it. The published AAL offers only
+    // S3SdkObjectClient(S3AsyncClient), so an async client it is.
+    this.s3 = buildAsyncClient(conf);
+    var origin = new S3SdkObjectClient(s3, false);   // false: we own it, not AAL
+    // The S3AsyncClient is passed so SSE-KMS can be DETECTED (D13.3). Without
+    // it the client cannot check, and silently caches KMS plaintext -- which
+    // is what this path did until now, on the very route the preflight script
+    // recommends first. The default-safe behaviour was implemented on two of
+    // three paths and absent from the one most customers will use.
+    boolean cacheKms = conf.getBoolean(CACHE_SSE_KMS, false);
+    cachingClient = new FlintObjectClient(origin, conn.async(), chunk, budget, ttl,
+        false, s3, cacheKms);
+    aalCaching = new S3SeekableInputStreamFactory(
+        cachingClient, S3SeekableInputStreamConfiguration.DEFAULT);
+
+    // A second AAL factory over a BYPASSING client, for SSE-C (D13). Built
+    // eagerly so the SSE-C path cannot fail for want of setup at the moment it
+    // is needed -- which would turn a privacy control into an outage.
+    aalBypass = new S3SeekableInputStreamFactory(
+        new FlintObjectClient(new S3SdkObjectClient(s3, false),
+            conn.async(), chunk, budget, ttl, true, s3, cacheKms),
+        S3SeekableInputStreamConfiguration.DEFAULT);
+  }
+
+  /** Standard S3A keys, so this behaves like any other S3A component. */
+  private static S3AsyncClient buildAsyncClient(Configuration conf) {
+    var b = S3AsyncClient.builder()
+        .region(Region.of(conf.get("fs.s3a.endpoint.region", "us-east-1")));
+    String endpoint = conf.get("fs.s3a.endpoint", "");
+    if (!endpoint.isEmpty()) {
+      b.endpointOverride(URI.create(
+          endpoint.startsWith("http") ? endpoint : "https://" + endpoint));
+    }
+    if (conf.getBoolean("fs.s3a.path.style.access", false)) b.forcePathStyle(true);
+    String ak = conf.get("fs.s3a.access.key", ""), sk = conf.get("fs.s3a.secret.key", "");
+    b.credentialsProvider(ak.isEmpty()
+        ? DefaultCredentialsProvider.create()
+        : StaticCredentialsProvider.create(AwsBasicCredentials.create(ak, sk)));
+    return b.build();
+  }
+
+  /**
+   * SSE-C reads bypass the tier entirely (ADR-0023 D13).
+   *
+   * Only SSE_C. The others are deliberately NOT bypassed and the distinction
+   * is the whole point: with SSE-S3, SSE-KMS and DSSE-KMS the server decrypts
+   * for any caller the bucket policy already allows, so a cached plaintext sits
+   * inside the same trust boundary the object did. With SSE-C the key is
+   * supplied per request by the caller and is the ONLY thing standing between
+   * a reader and the bytes; caching plaintext there hands the object to anyone
+   * with tier access and no key at all. Client-side encryption (CSE_*) is
+   * decrypted above this stream, so what passes through us is ciphertext and
+   * is safe to cache.
+   */
+  private static boolean isSseC(ObjectReadParameters p) {
+    S3ObjectAttributes a = p.getObjectAttributes();
+    return a != null && a.getServerSideEncryptionAlgorithm() == S3AEncryptionMethods.SSE_C;
+  }
+
+  @Override
+  public ObjectInputStream readObject(ObjectReadParameters parameters) throws IOException {
+    S3ObjectAttributes attrs = parameters.getObjectAttributes();
+    S3URI uri = S3URI.of(attrs.getBucket(), attrs.getKey());
+    var factory = isSseC(parameters) ? aalBypass : aalCaching;
+    return new FlintObjectStream(parameters, factory.createStream(uri));
+  }
+
+  @Override
+  public InputStreamType streamType() {
+    return InputStreamType.Custom;
+  }
+
+  @Override
+  public StreamFactoryRequirements factoryRequirements() {
+    return new StreamFactoryRequirements(0, 0, new VectoredIOContext());
+  }
+
+  @Override
+  protected void serviceStop() throws Exception {
+    if (aalCaching != null) aalCaching.close();
+    if (aalBypass != null) aalBypass.close();
+    if (conn != null) conn.close();
+    if (redis != null) redis.shutdown();
+    if (s3 != null) s3.close();
+    super.serviceStop();
+  }
+}

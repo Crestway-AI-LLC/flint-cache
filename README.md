@@ -170,6 +170,12 @@ Everything needed to run AND operate Flint yourself:
   rotate-certs / rotate-admin, and hot config reload (edit the inventory,
   `reload` pushes persistence/RPO/admission knobs to the running fleet — no
   restart).
+- **`s3-accelerator/`** — a look-aside **S3 read cache** for Spark, Trino,
+  Iceberg and PyTorch. Runs as a library inside the customer's own process
+  under their own IAM role, so the cache tier never speaks S3 and never holds
+  a credential. Three JVM adoption paths plus fsspec for Python, all sharing
+  one tier. **Apache-2.0, not Elastic-2.0** — see the note in the License
+  section below. It speaks the Redis protocol and needs no Flint.
 - **`flint-controller`** — automatic failover: detect → verify → promote →
   fence, with leases so a partitioned master self-demotes.
 - **`flint-storage`** — the engine: envelope encoding, typed stores, GC,
@@ -413,6 +419,16 @@ stays as the explanation of why each step exists, because a checklist that has
 to be retyped is a checklist with steps missing.
 
 ## License
+
+**`s3-accelerator/` is Apache-2.0, and the Elastic licence below does not
+apply to it.** Its terms are in `s3-accelerator/LICENSE` and govern everything
+under that directory. It is deliberately permissive and deliberately
+backend-agnostic: it is a client library that runs inside someone else's Spark
+cluster, and asking them to accept a source-available licence for code in their
+own data path is a trust ask the library cannot afford. Nothing in it is
+derived from Flint's source.
+
+Everything else in this repository is:
 
 Elastic License 2.0 (Elastic-2.0). In plain terms: free to use, copy, modify,
 and redistribute for your own purposes — personal or commercial, at any

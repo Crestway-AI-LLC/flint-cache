@@ -1,0 +1,248 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>ai.crestway</groupId>
+  <artifactId>flint-accel-seam-spike</artifactId>
+  <version>0.1.0-SNAPSHOT</version>
+  <packaging>jar</packaging>
+  <properties>
+    <maven.compiler.release>21</maven.compiler.release>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+  </properties>
+  <dependencyManagement>
+    <dependencies>
+      <!-- Lettuce and the AWS SDK each bring Netty and they disagree.
+           Pinning one BOM is the difference between a working build and
+           'isExplicitNoPreferDirect' at runtime. See ADR-0023 D12.16: the
+           shipped artifact must relocate these, because a customer's Spark
+           cluster has its own opinions and we do not get to overrule them. -->
+      <dependency>
+        <groupId>io.netty</groupId>
+        <artifactId>netty-bom</artifactId>
+        <version>4.2.1.Final</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
+
+  <dependencies>
+    <dependency>
+      <groupId>software.amazon.s3.analyticsaccelerator</groupId>
+      <artifactId>analyticsaccelerator-s3</artifactId>
+      <version>1.1.0</version>
+    </dependency>
+    <dependency>
+      <groupId>software.amazon.awssdk</groupId>
+      <artifactId>s3</artifactId>
+      <scope>provided</scope>
+      <version>2.46.7</version>
+    </dependency>
+    <dependency>
+      <groupId>io.lettuce</groupId>
+      <artifactId>lettuce-core</artifactId>
+      <version>6.7.1.RELEASE</version>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.hadoop</groupId>
+      <artifactId>hadoop-aws</artifactId>
+      <scope>provided</scope>
+      <version>3.4.3</version>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.hadoop</groupId>
+      <artifactId>hadoop-common</artifactId>
+      <scope>provided</scope>
+      <version>3.4.3</version>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.iceberg</groupId>
+      <artifactId>iceberg-aws</artifactId>
+      <scope>provided</scope>
+      <version>1.9.0</version>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.iceberg</groupId>
+      <artifactId>iceberg-core</artifactId>
+      <scope>provided</scope>
+      <version>1.9.0</version>
+    </dependency>
+
+    <!-- Avro 1.12 for the TEST only. hadoop-common 3.4.3 brings 1.11.4, while
+         Iceberg 1.9's Avro writer calls LogicalTypes.timestampNanos(), which
+         was added in 1.12.0, so that combination throws NoSuchMethodError.
+         A real user-facing clash, not merely a harness one; recorded in the
+         Iceberg section of ADR-0023 rather than silently patched here.
+         Test scope only: the customer supplies their own Hadoop and Iceberg. -->
+    <dependency>
+      <groupId>org.apache.avro</groupId>
+      <artifactId>avro</artifactId>
+      <version>1.12.0</version>
+      <scope>test</scope>
+    </dependency>
+
+    <!-- parquet-hadoop reaches for hadoop-mapreduce classes when building
+         read options. Present on any real Spark or Hadoop classpath; needed
+         here only because this spike depends on hadoop-aws alone. -->
+    <dependency>
+      <groupId>org.apache.hadoop</groupId>
+      <artifactId>hadoop-mapreduce-client-core</artifactId>
+      <version>3.4.3</version>
+      <scope>test</scope>
+      <exclusions>
+        <!-- Only FileInputFormat is wanted; the YARN and netty transitives are
+             a large classpath for nothing, and netty-all in particular would
+             sit alongside the netty the Lettuce client uses. -->
+        <exclusion><groupId>io.netty</groupId><artifactId>netty-all</artifactId></exclusion>
+        <exclusion><groupId>org.apache.hadoop</groupId><artifactId>hadoop-yarn-client</artifactId></exclusion>
+        <exclusion><groupId>org.apache.hadoop</groupId><artifactId>hadoop-yarn-common</artifactId></exclusion>
+        <exclusion><groupId>org.apache.hadoop</groupId><artifactId>hadoop-hdfs-client</artifactId></exclusion>
+      </exclusions>
+    </dependency>
+
+    <!-- iceberg-parquet: Parquet is what real Iceberg tables use, and its
+         access pattern is the one that matters for a chunked cache. Avro is a
+         sequential scan; Parquet reads the footer length from the LAST bytes
+         of the object, seeks backwards to the footer, then jumps to individual
+         column chunks. Tiny reads at the end of an object and backward seeks
+         are exactly where a chunk grid can be wrong while a sequential test
+         stays green. -->
+    <dependency>
+      <groupId>org.apache.iceberg</groupId>
+      <artifactId>iceberg-parquet</artifactId>
+      <version>1.9.0</version>
+      <scope>test</scope>
+    </dependency>
+
+    <!-- iceberg-data: the generic record read/write path, so the Iceberg test
+         can build a REAL table and read it back rather than unit-testing our
+         FileIO against a mock. Test scope: customers bring their own. -->
+    <dependency>
+      <groupId>org.apache.iceberg</groupId>
+      <artifactId>iceberg-data</artifactId>
+      <version>1.9.0</version>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.iceberg</groupId>
+      <artifactId>iceberg-api</artifactId>
+      <scope>provided</scope>
+      <version>1.9.0</version>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.iceberg</groupId>
+      <artifactId>iceberg-bundled-guava</artifactId>
+      <scope>provided</scope>
+      <version>1.9.0</version>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.hadoop</groupId>
+      <artifactId>hadoop-common</artifactId>
+      <version>3.4.2</version>
+      <type>test-jar</type>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>junit</groupId>
+      <artifactId>junit</artifactId>
+      <version>4.13.2</version>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.assertj</groupId>
+      <artifactId>assertj-core</artifactId>
+      <version>3.12.2</version>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-jar-plugin</artifactId>
+        <version>3.4.2</version>
+        <executions>
+          <execution>
+            <!-- The optional compatibility shim, alone, in its own artifact.
+                 A customer adds it only if preflight says their hadoop-aws
+                 needs it, and ShimGuard refuses to start if adding it would
+                 collide with a class their distribution already provides. -->
+            <id>hadoop-shim</id>
+            <phase>package</phase>
+            <goals><goal>jar</goal></goals>
+            <configuration>
+              <classifier>hadoop-shim</classifier>
+              <includes>
+                <include>software/amazon/s3/analyticsaccelerator/request/Constants.class</include>
+              </includes>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-shade-plugin</artifactId>
+        <version>3.6.0</version>
+        <executions>
+          <execution>
+            <phase>package</phase>
+            <goals><goal>shade</goal></goals>
+            <configuration>
+              <createDependencyReducedPom>false</createDependencyReducedPom>
+              <relocations>
+                <!-- Relocate ONLY what is ours alone. These types never cross
+                     our API boundary, so renaming them is invisible to the
+                     customer and stops us imposing a Netty or Lettuce version
+                     on a Spark cluster that has its own. Getting this project
+                     to build needed a Netty BOM and an SDK bump; a customer
+                     cannot be asked to do either. -->
+                <relocation>
+                  <pattern>io.lettuce</pattern>
+                  <shadedPattern>ai.crestway.flintaccel.shaded.lettuce</shadedPattern>
+                </relocation>
+                <relocation>
+                  <pattern>io.netty</pattern>
+                  <shadedPattern>ai.crestway.flintaccel.shaded.netty</shadedPattern>
+                </relocation>
+                <relocation>
+                  <pattern>reactor</pattern>
+                  <shadedPattern>ai.crestway.flintaccel.shaded.reactor</shadedPattern>
+                </relocation>
+                <relocation>
+                  <pattern>org.reactivestreams</pattern>
+                  <shadedPattern>ai.crestway.flintaccel.shaded.reactivestreams</shadedPattern>
+                </relocation>
+              </relocations>
+              <filters>
+                <filter>
+                  <artifact>*:*</artifact>
+                  <excludes>
+                    <exclude>META-INF/*.SF</exclude>
+                    <exclude>META-INF/*.DSA</exclude>
+                    <exclude>META-INF/*.RSA</exclude>
+                    <exclude>module-info.class</exclude>
+                  </excludes>
+                </filter>
+                <filter>
+                  <!-- The compatibility shim NEVER ships in the main jar
+                       (ADR-0023 D12.18/D12.20). It occupies a package that is
+                       not ours; it goes in its own artifact so a customer can
+                       decline it, and so ShimGuard's collision check has
+                       something to detect rather than something to regret. -->
+                  <artifact>ai.crestway:flint-accel-seam-spike</artifact>
+                  <excludes>
+                    <exclude>software/amazon/s3/analyticsaccelerator/request/Constants.class</exclude>
+                  </excludes>
+                </filter>
+              </filters>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+    </plugins>
+  </build>
+</project>

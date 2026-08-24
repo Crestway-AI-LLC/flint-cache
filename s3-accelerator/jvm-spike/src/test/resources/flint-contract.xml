@@ -1,0 +1,26 @@
+<?xml version="1.0"?>
+<!-- SPDX-License-Identifier: Apache-2.0
+     What S3-backed storage can and cannot do, declared honestly. The contract
+     suite skips what we say we do not support and ENFORCES everything else,
+     so overclaiming here turns inherited tests into false failures and
+     underclaiming turns them into no tests at all. -->
+<configuration>
+  <property><name>fs.contract.test.root-tests-enabled</name><value>false</value></property>
+  <property><name>fs.contract.is-blobstore</name><value>true</value></property>
+  <property><name>fs.contract.is-case-sensitive</name><value>true</value></property>
+  <property><name>fs.contract.supports-seek</name><value>true</value></property>
+  <property><name>fs.contract.supports-seek-on-closed-file</name><value>false</value></property>
+  <property><name>fs.contract.supports-available-on-closed-file</name><value>false</value></property>
+  <property><name>fs.contract.rejects-seek-past-eof</name><value>false</value></property>
+  <property><name>fs.contract.supports-strict-exceptions</name><value>true</value></property>
+  <property><name>fs.contract.supports-append</name><value>false</value></property>
+  <property><name>fs.contract.supports-atomic-rename</name><value>false</value></property>
+  <property><name>fs.contract.supports-atomic-directory-delete</name><value>false</value></property>
+  <property><name>fs.contract.supports-block-locality</name><value>false</value></property>
+  <property><name>fs.contract.supports-concat</name><value>false</value></property>
+  <property><name>fs.contract.supports-settimes</name><value>false</value></property>
+  <property><name>fs.contract.supports-getfilestatus</name><value>true</value></property>
+  <property><name>fs.contract.supports-unbuffer</name><value>false</value></property>
+  <property><name>fs.contract.create-overwrites-directory</name><value>true</value></property>
+  <property><name>fs.contract.create-visibility-delayed</name><value>false</value></property>
+</configuration>
