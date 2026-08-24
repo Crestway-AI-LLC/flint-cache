@@ -183,7 +183,7 @@ CORE="${FLINT_CORE_ORDER:-restart repl failover proxy slot_migrate slot_map reba
       cpha_roll admin_gated_proxy edge_ca_trust chaos_edge_tls
       cert_rotate control_tls controller_ha controller_managed controller_slow_master controller_stall
       controller_multipair controlplane cp_publish failover_bystander failover_churn gates internal_mtls json lease
-      fanout_timeout loaded_promote m3_exit migrate_slots min_replicas node_tls proxy_backpressure
+      fanout_timeout loaded_promote loading_visible m3_exit migrate_slots min_replicas node_tls proxy_backpressure
       proxy_cache proxy_tls replica_reads replica_stale_fence rw_isolation
       scan slot_cutover slot_cutover_recovery slot_moved snapshot_restore
       tenant tenant_rebalance tenant_remove token_hash
@@ -401,6 +401,72 @@ if [ "$GATE_JOBS" -gt 1 ]; then
     echo "   timings against a JOBS=1 run, not against another oversubscribed one."
   fi
 fi
+
+# NO TWO DRILLS MAY DECLARE THE SAME PORT.
+#
+# Written after this bit twice in one afternoon. Both loaded_promote (6460/61)
+# and loading_visible (6463/64) arrived from a branch that predated main giving
+# 6460-6467 to proxy_chain, and both would have collided. A shared port is a
+# startup failure in whichever drill loses the race, reported against the
+# product rather than the clash — and serially it may not surface at all,
+# because the drills have to overlap for it to bite.
+#
+# A drill declaring its OWN port twice is legal: controller_ha does, harmlessly,
+# because ownership is not ambiguous.
+assert_no_duplicate_drill_ports() {
+  . tools/lib/drill-ports.sh
+  local bad d decl used u map
+  map=$(drill_declared_ports)
+  bad=$(printf '%s\n' "$map" | sort -n \
+    | awk '{c[$1]=c[$1]" "$2} END {for (p in c) {n=split(c[p],a," "); if (n>1) print "    port "p" declared by"c[p]}}')
+  if [ -n "$bad" ]; then
+    echo "GATES FAILED: two drills declare the same port:"
+    printf '%s\n' "$bad"
+    echo "      A shared port is a startup failure in whichever drill loses,"
+    echo "      reported as a product defect. tools/next-free-ports.sh N prints"
+    echo "      a run of unclaimed ports."
+    exit 1
+  fi
+  # AND EVERY PORT USED IN CODE MUST BE DECLARED.
+  #
+  # The declarations are not documentation: _fleet_ours identifies a drill's
+  # pathless seats (a proxy is started with ports and no directory) by exactly
+  # this list, and tools/next-free-ports.sh treats anything undeclared as
+  # available. A drill using an undeclared port therefore owns a seat nothing
+  # can attribute AND invites the next drill to be handed that port. True for
+  # every drill as of 2026-08-24; this keeps it true.
+  # The map is built ONCE. Calling drill_declared_ports per drill re-scanned
+  # all 114 files each time -- ~13k scans, and 30s added to every gate run.
+  # A check that taxes the gate that heavily is a check someone eventually
+  # deletes, so its cost is part of whether it works.
+  local map; map=$(drill_declared_ports)
+  bad=""
+  for f in tools/*_drill.sh; do
+    d=$(basename "$f" _drill.sh)
+    decl=$(printf '%s\n' "$map" | awk -v d="$d" '$2==d {print $1}' | tr '\n' '|' | sed 's/|$//')
+    [ -z "$decl" ] && continue
+    # PORT SYNTAX, not "any four-digit number". The first version of this
+    # matched every 6300-9999 literal and produced 22 hits, of which the real
+    # ports were none: 8192 is a buffer size, 8000/8500 are timeouts, 9999 is a
+    # slot. A check that cannot tell a port from a number that looks like one
+    # reports the suite as broken and gets deleted, which is worse than not
+    # having it.
+    used=$(grep -v '^[[:space:]]*#' "$f" \
+      | grep -oE '(--port|-p)[[:space:]]+[0-9]{4,5}|127\.0\.0\.1:[0-9]{4,5}' \
+      | grep -oE '[0-9]{4,5}$' | sort -u)
+    for u in $used; do
+      drill_is_dead_port "$u" && continue
+      printf '%s\n' "$u" | grep -qE "^($decl)$" || bad="$bad
+    $d uses $u in code but declares only: $(printf '%s' "$decl" | tr '|' ' ')"
+    done
+  done
+  if [ -n "$bad" ]; then
+    echo "GATES FAILED: a drill uses a port it never declared to fleet_init:$bad"
+    echo "      fleet_init's port list is how _fleet_ours attributes seats that"
+    echo "      carry no path, and how next-free-ports.sh knows what is taken."
+    exit 1
+  fi
+}
 
 # NO DRILL MAY CARRY A KILL PATTERN THAT REACHES ANOTHER DRILL.
 #
@@ -1291,6 +1357,13 @@ if want drills; then
   assert_drill_build_is_checked
   assert_no_continuation_splice
   assert_no_cross_drill_kill_patterns
+  # BOTH HALVES OF "UNATTRIBUTABLE SEAT", from opposite ends. The harness
+  # attributes a seat by its fleet_init scope prefix OR by a declared port, so
+  # a seat is invisible to the leak check when it matches neither. The port
+  # side and the dir side were written a day apart by different people; the
+  # zombie that broke the parallel gate had neither marker, which is why one
+  # of them alone would not have caught it.
+  assert_no_duplicate_drill_ports
   assert_declared_scopes_cover_data_dirs
   LEAKCHECK=1
   run_core_drills

@@ -402,13 +402,95 @@ fleet_wait_listen() {
 #
 # Extra arguments ride through to valkey-cli (a TLS control plane needs
 # --tls --cacert ... to answer at all).
-fleet_wait_ping() {
+# fleet_wait_alive <port> [opts] — block until the seat ANSWERS, loading or not.
+#
+# This is what fleet_wait_ping used to be, and it is now the rarer of the two.
+# Use it only when the loading window is the thing under test: loading_visible
+# has to catch a replica WHILE it reports loading:1, and a helper that waits
+# for that flag to clear would delete the very state the drill exists to
+# observe — a pass it did not earn.
+#
+# Everywhere else, wanting "alive" and meaning "ready" is the bug #176
+# introduced. Reach for fleet_wait_ping unless you can say why not.
+fleet_wait_alive() {
   local port="$1"; shift
   local deadline=$(( $(date +%s) + 30 ))
   while :; do
     [ "$(valkey-cli -p "$port" "$@" PING 2>/dev/null)" = "PONG" ] && return 0
     if [ "$(date +%s)" -ge "$deadline" ]; then
       echo "FAIL: no PONG from 127.0.0.1:$port after 30s"
+      exit 1
+    fi
+    sleep 0.2
+  done
+}
+
+fleet_wait_ping() {
+  # PONG ALONE STOPPED MEANING READY, SO THIS CHECKS BOTH.
+  #
+  # Before #176 a node did not bind its listener until its initial full sync
+  # finished, so PONG and "serving" were the same event and every caller here
+  # spelled "ready" as PONG because that was the only spelling available.
+  # #176 makes a node answer PING from INSIDE the sync — deliberately, so it is
+  # not mistaken for dead — which silently converted 50 callers of this
+  # function from "wait until ready" to "wait until alive", and everything
+  # after them began racing a node that answers data commands with -LOADING.
+  #
+  # Measured: promote_notice ran in exactly 10s across 18 consecutive gates,
+  # then 43s / 8s / 42s once #176 landed, failing on the third. That is what a
+  # race looks like from the outside.
+  #
+  # 775911c converted four drills to fleet_wait_ready and left the rest. The
+  # fix belongs here instead: restore what the callers already meant, at the
+  # one place they all go through. `loading:1` is the seat's own answer and
+  # only an explicit 1 counts, so a build without the field behaves exactly as
+  # it always did.
+  local port="$1"; shift
+  local deadline=$(( $(date +%s) + 30 ))
+  while :; do
+    if [ "$(valkey-cli -p "$port" "$@" PING 2>/dev/null)" = "PONG" ] &&
+       ! valkey-cli -p "$port" "$@" FLINTINFO 2>/dev/null | tr -d '\r' |
+         grep -qx 'loading:1'; then
+      return 0
+    fi
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      # Say WHICH of the two conditions was not met. "no PONG" against a node
+      # that is answering fine but still loading sends the reader to the wrong
+      # half of the problem.
+      if [ "$(valkey-cli -p "$port" "$@" PING 2>/dev/null)" = "PONG" ]; then
+        echo "FAIL: 127.0.0.1:$port answers PING but still reports loading:1 after 30s"
+      else
+        echo "FAIL: no PONG from 127.0.0.1:$port after 30s"
+      fi
+      exit 1
+    fi
+    sleep 0.2
+  done
+}
+
+# fleet_wait_ready <port> [valkey-cli opts ...] — block until a DATA node is
+# SERVING, or FAIL the drill on the spot.
+#
+# Since #176 a node binds and answers PING from INSIDE its initial full sync,
+# so PONG no longer means ready — it means alive, which is exactly the
+# distinction #176 exists to draw. Waiting on PONG where you meant ready
+# returns the instant a re-seed STARTS, and everything after it runs against a
+# node that refuses data commands with -LOADING.
+#
+# `loading:1` on FLINTINFO is the seat's own answer, and only an explicit 1
+# counts as not-ready: a seat from a build before #176 has no such field and
+# reads ready as soon as it answers, exactly as it always did.
+fleet_wait_ready() {
+  local port="$1"; shift
+  local deadline=$(( $(date +%s) + 120 ))
+  while :; do
+    if [ "$(valkey-cli -p "$port" "$@" PING 2>/dev/null)" = "PONG" ] &&
+       ! valkey-cli -p "$port" "$@" FLINTINFO 2>/dev/null | tr -d '\r' |
+         grep -qx 'loading:1'; then
+      return 0
+    fi
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      echo "FAIL: 127.0.0.1:$port never finished loading (120s)"
       exit 1
     fi
     sleep 0.2
@@ -774,6 +856,9 @@ fleet_signal() {
   local pid args hit=1
   for pid in $(_fleet_ours "$want"); do
     args="$(ps -o args= -p "$pid" 2>/dev/null)"
+    # Remember THIS seat's port, so the release wait below covers exactly the
+    # seats killed and not the whole declared block.
+    _killed_pids="$_killed_pids $pid"
     case "$args" in
       *flint-*) ;;
       *) continue ;;
@@ -816,7 +901,7 @@ fleet_pids() { _fleet_ours "$@"; }
 
 fleet_kill() {
   local want="$*"
-  local pid args
+  local pid args _killed_pids=""
   for pid in $(_fleet_ours "$want"); do
     # RE-VERIFY before signalling. `pkill` matches and signals as one act;
     # this is a snapshot followed by a kill, and between the two the pid can
@@ -840,6 +925,51 @@ fleet_kill() {
     esac
     kill -9 "$pid" 2>/dev/null
   done
+  # AND DO NOT RETURN UNTIL THE PORTS ARE ACTUALLY FREE.
+  #
+  # Every caller follows fleet_kill with a fixed `sleep`, which is a guess at
+  # exactly this postcondition. The guess held for as long as a restarted node
+  # did not bind until its initial full sync finished — seconds of slack. #176
+  # binds within milliseconds of exec, so a 0.4s sleep became the entire margin
+  # against the previous process releasing the socket, and 21 drills follow
+  # this call with a respawn on the same ports.
+  #
+  # Seen as promote_notice's "nothing listening on 127.0.0.1:6911 after 30s":
+  # the replacement lost the race, got EADDRINUSE and exited, and the drill
+  # then measured a promotion into a node that was not there (5064ms against a
+  # 19ms steady state). Intermittent, and invisible until #176 tightened the
+  # window.
+  #
+  # kill -9 is immediate; the socket release is not. Wait for the fact instead
+  # of sleeping past it. Bounded, and silent on timeout — a port still held
+  # after 5s is a different problem and the caller's own wait will report it
+  # with better context than this function has.
+  # WAIT FOR THE PROCESSES TO BE GONE, NOT FOR A PORT TO LOOK FREE.
+  #
+  # kill -9 is delivery, not death: the socket is released when the process
+  # actually exits. Every caller papers over that with a fixed `sleep`, which
+  # held only while a restarted node did not bind until after its full sync.
+  # #176 binds in milliseconds, so promote_notice's 0.4s became the whole
+  # margin and its replacement took EADDRINUSE and exited — "nothing listening
+  # on 127.0.0.1:6911 after 30s", then a promotion measured into a node that
+  # was not there.
+  #
+  # Two earlier attempts polled PORTS and both were wrong. Waiting on every
+  # declared port waits for seats this call deliberately left alone (the proxy
+  # is still up; its port never frees) and cost +10s per drill, 27 percent
+  # across the suite. Waiting on only the killed seats ports does nothing when
+  # the seats were already dead, which is exactly when the previous process is
+  # still exiting. The pid is the precise signal: it is gone or it is not.
+  local _pid _t
+  if [ -n "${_killed_pids# }" ]; then
+    _t=$(( $(date +%s) + 5 ))
+    for _pid in $_killed_pids; do
+      while kill -0 "$_pid" 2>/dev/null; do
+        [ "$(date +%s)" -ge "$_t" ] && break
+        sleep 0.02
+      done
+    done
+  fi
   return 0
 }
 

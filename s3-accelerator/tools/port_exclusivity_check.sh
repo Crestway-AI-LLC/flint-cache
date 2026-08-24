@@ -40,7 +40,15 @@ EXEMPT="6379"
 # ---- 1. the declaration covers what the code actually binds -----------------
 # Only port CONTEXTS, so a four-digit constant that is not a port cannot
 # masquerade as one.
-USED="$(grep -rhoE -- '(--port|--listen|--upstream|-p) ?[0-9]{4}|:[0-9]{4}\b|redis://[^ "]*:[0-9]{4}' \
+# This file is excluded from its own scan, and the reason is not convenience:
+# it is a file ABOUT ports, so its prose necessarily contains port-shaped text.
+# Writing the comment above -- which quotes `-p 6391:6379` while explaining that
+# very pattern -- made this check report 6390 and 6391 as ports this harness
+# binds. A detector that reads its own explanation as evidence is the same
+# defect the comment is warning about, so the exclusion is the honest fix rather
+# than rewording the prose until the regex stops noticing it.
+USED="$(grep -rhoE --exclude=port_exclusivity_check.sh -- \
+          '(--port|--listen|--upstream|-p) ?[0-9]{4}|:[0-9]{4}\b|redis://[^ "]*:[0-9]{4}' \
           "$ROOT/tools" "$ROOT/python" "$ROOT/jvm-spike/src" 2>/dev/null \
         | grep -oE '[0-9]{4}' | sort -un)"
 UNDECLARED="$(comm -23 <(printf '%s\n' "$USED") \
@@ -53,15 +61,54 @@ ck $? "every port the code binds is declared${UNDECLARED:+ -- UNDECLARED: $UNDEC
 # list of numbers we expected to find. That distinction is the whole lesson.
 SIB="$ROOT/../tools"
 if ls "$SIB"/*_drill.sh >/dev/null 2>&1; then
-  THEIRS="$(grep -rhoE 'fleet_init[^#]*' "$SIB"/*.sh 2>/dev/null \
-            | grep -oE '\b[0-9]{4}\b' | sort -un)"
+  # CONSERVATIVE ON PURPOSE: every 4-digit number in 6000-9999 anywhere in the
+  # sibling tree counts as theirs, not just the ones matching a port pattern.
+  #
+  # Three times in one thread a pattern here caught something by luck rather
+  # than by design. The last: 6391 was found only because a docker-run COMMENT
+  # happened to read `-p 6391:6379`, while 6390 -- the same idiom, same kind of
+  # script, no such comment -- was missed entirely. Scripts declare ports as
+  # `PORT=${PORT:-6390}`, as `ADDR=host:6390`, in comments, and in ways nobody
+  # has thought of yet, and a detector that must anticipate the spelling will
+  # keep being right by accident.
+  #
+  # The asymmetry decides it. A false positive costs one number I then do not
+  # use, out of 700 free in my own range. A false negative costs a silent
+  # cross-harness collision that presents as somebody else's durability bug.
+  # Measured: this reserves 467 numbers, 11.7% of the range, and exactly one of
+  # them falls in 9300-9999 where this harness lives.
+  #
+  # Precision stays where it is useful and harmless -- the failure message says
+  # whether a clash is fleet_init-DECLARED, explicitly BOUND, or merely present
+  # -- rather than in the detection, where being clever means being wrong.
+  THEIRS="$(grep -rhoE '\b[0-9]{4}\b' "$SIB"/*.sh 2>/dev/null \
+            | awk '$1 >= 6000 && $1 <= 9999' | sort -un)"
+  THEIRS_DECLARED="$(grep -rhoE 'fleet_init[^#]*' "$SIB"/*.sh 2>/dev/null \
+                     | grep -oE '\b[0-9]{4}\b' | sort -un)"
+  THEIRS_BOUND="$(grep -rhoE -- '--port [0-9]{4}|--listen [0-9]{4}|--target [^ ]*:[0-9]{4}|-p [0-9]{4}' \
+                    "$SIB"/*.sh 2>/dev/null | grep -oE '[0-9]{4}' | sort -un)"
   N="$(printf '%s\n' "$THEIRS" | grep -c . || true)"
   [ "${N:-0}" -gt 0 ]
   ck $? "armed: parsed the sibling harness's declarations ($N ports) -- a check "\
 "that found ZERO would pass check 3 for the wrong reason"
   CLASH="$(comm -12 <(printf '%s\n' "$DECLARED") <(printf '%s\n' "$THEIRS") | tr '\n' ' ')"
-  [ -z "$(echo "$CLASH" | tr -d ' ')" ]
-  ck $? "no port is claimed by both harnesses${CLASH:+ -- COLLISION: $CLASH}"
+  # Capture the verdict BEFORE printing anything. The diagnostic block below
+  # was added after this line and silently disabled the check: an `if`
+  # statement sets $?, so `ck $?` afterwards graded the if, not the test, and
+  # a real collision printed its explanation and then reported [ok]. Caught
+  # only by re-running the armed test after editing the checker -- which is
+  # the rule this file now earns twice over: an assertion is only armed as of
+  # the last time you watched it fail.
+  [ -z "$(echo "$CLASH" | tr -d ' ')" ]; clash_rc=$?
+  if [ -n "$(echo "$CLASH" | tr -d ' ')" ]; then
+    for c in $CLASH; do
+      kind="present in their tree"
+      printf '%s\n' "$THEIRS_BOUND" | grep -qx "$c" && kind="BOUND by them"
+      printf '%s\n' "$THEIRS_DECLARED" | grep -qx "$c" && kind="fleet_init DECLARED by them"
+      echo "     $c -- $kind"
+    done
+  fi
+  ck $clash_rc "no port is claimed by both harnesses${CLASH:+ -- COLLISION: $CLASH}"
 else
   echo "[--] sibling harness not present; exclusivity check skipped"
   echo "     (this directory is meant to work standalone, so its absence is"

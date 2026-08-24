@@ -1,7 +1,24 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Elastic-2.0
 # Warm-restart drill: load data into flint (rocks engine), kill -9 the
-# server, time restart-to-first-PONG, and verify the data survived.
+# server, time the restart, and verify the data survived.
+#
+# TWO times, since #176, because they are now genuinely different events and
+# only one of them is recovery:
+#
+#   restart-to-PONG      the listener is open and the node answers. It is
+#                        answering `-LOADING`: alive, not serving. This is
+#                        what a supervisor or a controller sees, and the
+#                        whole point of #176 is that it arrives immediately
+#                        instead of at the end.
+#   restart-to-SERVING   the store is open and data commands work. This is
+#                        the recovery number, and the one to compare across
+#                        builds.
+#
+# The drill used to print the first and call it recovery — which was true
+# only while the two were the same event, and stopped being true the moment
+# the listener moved ahead of the load. Reading a key on the first PONG now
+# gets `-LOADING`, correctly.
 #
 # Requires: a release build with --features rocks, valkey-cli on PATH.
 # Usage: tools/restart_drill.sh [KEYS]
@@ -91,21 +108,35 @@ fleet_signal_port "$PORT" -9 \
   || { echo "FAIL: no seat of ours on $PORT to kill — nothing below would be measuring a restart"; exit 1; }
 sleep 0.3
 
-echo "== restarting (timing to first successful PING)"
-START_NS=$(date +%s%N 2>/dev/null || python3 -c 'import time; print(int(time.time()*1e9))')
+echo "== restarting (timing to PONG, then to SERVING)"
+now_ns() { date +%s%N 2>/dev/null || python3 -c 'import time; print(int(time.time()*1e9))'; }
+START_NS=$(now_ns)
 "$BIN" --port "$PORT" --engine rocks --data-dir "$DIR" &
 # Polls far tighter than fleet_wait_ping (20 ms vs 200 ms) because this loop
-# IS the measurement — but it is bounded, because an unbounded `until` here
-# hangs the whole gate rather than failing this one drill, and gates.sh puts
-# no timeout around a step.
+# IS the measurement — but BOTH waits are bounded, because an unbounded
+# `until` here hangs the whole gate rather than failing this one drill, and
+# gates.sh puts no timeout around a step. 775911c added the second wait with
+# no deadline; that discipline is main's and it is kept.
 RESTART_DEADLINE=$(( $(date +%s) + 60 ))
 until valkey-cli -p "$PORT" PING 2>/dev/null | grep -q PONG; do
   [ "$(date +%s)" -lt "$RESTART_DEADLINE" ] \
     || { echo "FAIL: no PONG from $PORT 60s after restart"; exit 1; }
   sleep 0.02
 done
-END_NS=$(date +%s%N 2>/dev/null || python3 -c 'import time; print(int(time.time()*1e9))')
-echo "== restart-to-PONG: $(( (END_NS - START_NS) / 1000000 )) ms"
+PONG_NS=$(now_ns)
+# PONG means ALIVE, not SERVING. `loading:1` is the seat's own answer and only
+# an explicit 1 counts — the same rule flintctl and the controller use, so all
+# three agree on what ready means. Measuring only the first is what let a
+# recovering node look recovered.
+SERVE_DEADLINE=$(( $(date +%s) + 120 ))
+until ! valkey-cli -p "$PORT" FLINTINFO 2>/dev/null | tr -d '\r' | grep -qx 'loading:1'; do
+  [ "$(date +%s)" -lt "$SERVE_DEADLINE" ] \
+    || { echo "FAIL: $PORT still reports loading:1 120s after restart"; exit 1; }
+  sleep 0.02
+done
+SERVE_NS=$(now_ns)
+echo "== restart-to-PONG: $(( (PONG_NS - START_NS) / 1000000 )) ms (alive)"
+echo "== restart-to-SERVING: $(( (SERVE_NS - START_NS) / 1000000 )) ms (recovered)"
 
 echo "== verification after restart"
 AFTER_SAMPLE=$(valkey-cli -p "$PORT" GET "$SAMPLE_KEY")
