@@ -290,3 +290,55 @@ ranking advice transfers between boxes; the magnitudes do not.
 peer saw it only on trees containing #176, and neither of us sees it without.
 Two independent negatives, from different core counts. The variance had a
 cause and the cause is fixed — it was not parallelism hiding instability.
+
+## edge_roll: closed. The experiment answered no.
+
+Ten runs on `b0ed2a0`, five per arm, six-drill set, predictions named before
+interpreting. **`edge_roll` is not special**: 39.8s -> 49.2s, a 1.24x ratio and
+the second-lowest in the set. The 56s in the table above did not reproduce —
+max 51. The pre-registered falsifier was "if the controls inflate by the same
+proportion there is nothing specific to edge_roll", and they inflated *more*.
+
+It landed in none of A/B/C/D cleanly. Closest to A, but A required the controls
+to move together and they ranged 1.10x to 10.67x. The honest summary is that
+all four predictions were framed around a subject that turned out not to be the
+story.
+
+**The control group was the finding**, and only in that environment.
+`coproc_forward` went 1.2s -> 12.8s there. Against the full 109-drill run it
+ranks **sixth of 38** short drills by absolute inflation (+7s, mean +4.4s) —
+above average, not an outlier — and four of the five above it were absent from
+the six-drill set entirely:
+
+    client_compat      5 -> 39   +34s
+    anti_affinity      3 -> 30   +27s
+    proxy_conformance  3 -> 20   +17s
+    family_route_cp    1 -> 15   +14s
+
+Two readings survive and neither can be eliminated: the effect is specific to a
+six-drill set, where a drill overlaps five neighbours for its whole life rather
+than being one of 109; or the single sample here is simply wrong about it.
+
+## A measurement defect in this document's own table
+
+`family_route` reads **0s** serial here and 10.0s in the five-run P=1 arm. Both
+cannot be true, and the 0 is sub-second truncation in `gates.sh`'s integer
+seconds — so the 18.00x ratio it produces is an artifact of dividing by a
+rounded-down zero. Every drill under ~1s in the duration table has the same
+flaw, and that is a meaningful fraction of the 38.
+
+Where the two datasets disagree on these six, **the five-run numbers win**:
+n=5 with a control group beats n=1 with a rounding bug. This table's value is
+breadth, as a generator of leads, not as measurement.
+
+## A caveat on the method, not the run
+
+A six-drill set is not a small version of the full gate. Concurrency decays as
+members finish, and the neighbour mix is unrepresentative — both showed up
+here, in opposite directions. Worth remembering before the next quick targeted
+comparison.
+
+Next, if anyone spends the runs: `client_compat` and `anti_affinity` — the
+drills actually costing wall clock in the environment that ships — at n=5, with
+a control set large enough that concurrency does not decay, and
+`coproc_forward` included as the one place the two datasets actively disagree.
