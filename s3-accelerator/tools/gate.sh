@@ -139,6 +139,42 @@ TIER_OWNED=$("$TIER_CLI" -p "$TIER_PORT" info server 2>/dev/null | tr -d '\r' | 
 # A gate that can hang forever is worse than one that fails: the first run of
 # this script burned its whole budget on one stuck suite and produced NO
 # verdict at all. macOS has no timeout(1), so enforce it here.
+# Wait for a fixture to ANSWER, rather than for a number of seconds to pass.
+#
+# Every fixture here used to be followed by `sleep 2` (moto, `sleep 4`). That is
+# not a weak readiness signal, it is NO signal: it asserts that two seconds is
+# enough on every machine this will ever run on, which is false the moment the
+# box is loaded -- and this box regularly is, with a neighbouring session
+# building. The failure surfaces far downstream as a suite that could not reach
+# its origin, and the obvious repair, a longer sleep, only helps when the thing
+# waited on is genuinely SLOW rather than merely not started yet.
+#
+# counting_s3 and moto both answer HTTP; slow_tier is a TCP proxy, so it gets a
+# connect rather than a request.
+wait_http() { # url [tries]
+  local i
+  for i in $(seq 1 "${2:-150}"); do
+    curl -sf -o /dev/null "$1" 2>/dev/null && return 0
+    sleep 0.1
+  done
+  echo "fixture never answered: $1" >&2
+  return 1
+}
+wait_tcp() { # port [tries]
+  local i
+  for i in $(seq 1 "${2:-150}"); do
+    python3 -c "
+import socket,sys
+s=socket.socket(); s.settimeout(0.3)
+try: s.connect(('127.0.0.1', int(sys.argv[1])))
+except OSError: sys.exit(1)
+finally: s.close()" "$1" 2>/dev/null && return 0
+    sleep 0.1
+  done
+  echo "fixture never accepted on port $1" >&2
+  return 1
+}
+
 SUITE_TIMEOUT=${SUITE_TIMEOUT:-180}
 run_bounded() { # cmd...
   "$@" & local pid=$! waited=0
@@ -231,7 +267,7 @@ start_svcs() { # port, extra-args
   python3 tools/counting_s3.py --port "$1" --objects 8 --object-bytes 8388608 ${2:-} \
       >/tmp/gate_origin_$1.log 2>&1 &
   PIDS+=($!)
-  sleep 2
+  wait_http "http://127.0.0.1:$1/__stats" || exit 2
 }
 stop_origin() { for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null; done; PIDS=(); sleep 1; }
 
@@ -283,7 +319,7 @@ start_svcs 9308 "--sse-kms"
 python3 tools/counting_s3.py --port 9309 --objects 4 --object-bytes 1048576 \
     >/tmp/gate_origin_9309.log 2>&1 &
 PIDS+=($!)
-sleep 2
+wait_http "http://127.0.0.1:9309/__stats" || exit 2
 "$TIER_CLI" -p "$TIER_PORT" flushall >/dev/null 2>&1
 run_bounded java -cp "$ROOT/jvm-spike/target/classes:$CP" \
     ai.crestway.flintaccel.client.SseKmsSuite \
@@ -310,7 +346,7 @@ verdict "SSE-KMS on all 3 adoption paths (7 checks)" $?
 python3 tools/counting_s3.py --port 9311 --objects 4 --object-bytes 1048576 \
     >/tmp/gate_origin_9311.log 2>&1 &
 PIDS+=($!)
-sleep 2
+wait_http "http://127.0.0.1:9311/__stats" || exit 2
 "$TIER_CLI" -p "$TIER_PORT" flushall >/dev/null 2>&1
 run_bounded java -cp "$ROOT/jvm-spike/target/classes:$CP" \
     ai.crestway.flintaccel.client.MetricsSuite \
@@ -337,7 +373,7 @@ start_svcs 9310 "--delay-ms 20"
 python3 tools/slow_tier.py --listen "$SLOW_PORT" --upstream "$TIER_PORT" --delay-ms 200 \
     >/tmp/gate_proxy.log 2>&1 &
 PIDS+=($!)
-sleep 2
+wait_tcp "$SLOW_PORT" || exit 2
 "$TIER_CLI" -p "$TIER_PORT" flushall >/dev/null 2>&1
 run_bounded java -cp "$ROOT/jvm-spike/target/classes:$CP" \
     ai.crestway.flintaccel.client.SickTierSuite \
@@ -390,7 +426,7 @@ if [ -x "$PYENV/bin/python" ]; then
   # instrument for the question it can answer.
   if "$PYENV/bin/python" -c "import moto, pytest" 2>/dev/null; then
     "$PYENV/bin/python" -m moto.server -p 9810 >/tmp/gate_moto.log 2>&1 &
-    PIDS+=($!); sleep 4
+    PIDS+=($!); wait_http "http://127.0.0.1:9810" || exit 2
     "$TIER_CLI" -p "$TIER_PORT" flushall >/dev/null 2>&1
     ( cd python && FLINT_TEST_ENDPOINT=http://127.0.0.1:9810 \
         FLINT_TEST_TIER=redis://127.0.0.1:$TIER_PORT \
@@ -432,7 +468,7 @@ if [ -x "$PYENV/bin/python" ]; then
   python3 tools/counting_s3.py --port 9319 --objects 4 --object-bytes 1048576 \
       >/tmp/gate_origin_9319.log 2>&1 &
   PIDS+=($!)
-  sleep 2
+  wait_http "http://127.0.0.1:9319/__stats" || exit 2
   "$TIER_CLI" -p "$TIER_PORT" flushall >/dev/null 2>&1
   ( cd python && run_bounded "$PYENV/bin/python" sse_kms_suite.py \
       http://127.0.0.1:9318 http://127.0.0.1:9319 redis://127.0.0.1:$TIER_PORT \
