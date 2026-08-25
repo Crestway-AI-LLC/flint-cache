@@ -88,6 +88,29 @@ public final class FlintObjectClient implements ObjectClient {
    * rewrites by another process.
    */
   public final long metaTtlImmutableSec;
+  /** Objects above this are read from the origin and never chunk-cached.
+   *
+   *  512 MiB (Jeff, 2026-08-25), and the reasoning is PAYOFF rather than
+   *  keyspace. Measured: a warm read moves the SAME bytes as a cold one -- the
+   *  cache does not reduce data transferred, it changes where it comes from.
+   *  So for a large object read sequentially the whole benefit is
+   *  bytes x (1/S3_throughput - 1/tier_throughput): near zero against parallel
+   *  range GETs on a fast NIC, and NEGATIVE when the tier is slower. Past some
+   *  size the client is better off going to S3 directly.
+   *
+   *  512 MiB sits above the data files this cache is for -- Parquet and
+   *  Iceberg land at 128-512 MB -- so the analytics working set still caches
+   *  while objects whose only payoff is a throughput differential do not.
+   *
+   *  The keyspace argument still holds underneath: an object of size S occupies
+   *  S/chunkBytes keys, so a 1 TB object would cost ~1.7 GB of per-key overhead
+   *  before a byte of its data is stored.
+   *
+   *  THIS NUMBER IS AN ARGUMENT, NOT A FINDING -- the crossover wants measuring
+   *  on a cluster. Tracked, blocked on M0. */
+  public static final long DEFAULT_MAX_OBJECT_BYTES = 512L * 1024 * 1024;
+  public final long maxObjectBytes;
+  private final Map<String, Boolean> oversizeSeen = new ConcurrentHashMap<>();
   private final boolean immutable;
 
   private long ttlFor() { return immutable ? metaTtlImmutableSec : metaTtlSec; }
@@ -114,6 +137,7 @@ public final class FlintObjectClient implements ObjectClient {
   public final AtomicLong kmsUndetectable = new AtomicLong();
   public final AtomicLong breakerOpens = new AtomicLong();
   public final AtomicLong breakerSkips = new AtomicLong();
+  public final AtomicLong oversizeBypassed = new AtomicLong();
 
   /**
    * A breaker, because a SICK tier is worse than no tier.
@@ -227,13 +251,23 @@ public final class FlintObjectClient implements ObjectClient {
                            int chunkBytes, long tierBudgetMs, long metaTtlSec,
                            boolean bypass, S3AsyncClient raw, boolean cacheKms) {
     this(origin, tier, chunkBytes, tierBudgetMs, metaTtlSec, bypass, raw, cacheKms,
-        false, 86_400);
+        false, 86_400, DEFAULT_MAX_OBJECT_BYTES);
   }
 
   public FlintObjectClient(ObjectClient origin, RedisAsyncCommands<byte[], byte[]> tier,
                            int chunkBytes, long tierBudgetMs, long metaTtlSec,
                            boolean bypass, S3AsyncClient raw, boolean cacheKms,
                            boolean immutable, long metaTtlImmutableSec) {
+    this(origin, tier, chunkBytes, tierBudgetMs, metaTtlSec, bypass, raw, cacheKms,
+        immutable, metaTtlImmutableSec, DEFAULT_MAX_OBJECT_BYTES);
+  }
+
+  public FlintObjectClient(ObjectClient origin, RedisAsyncCommands<byte[], byte[]> tier,
+                           int chunkBytes, long tierBudgetMs, long metaTtlSec,
+                           boolean bypass, S3AsyncClient raw, boolean cacheKms,
+                           boolean immutable, long metaTtlImmutableSec,
+                           long maxObjectBytes) {
+    this.maxObjectBytes = maxObjectBytes;
     this.immutable = immutable;
     this.metaTtlImmutableSec = metaTtlImmutableSec;
     this.bypass = bypass;
@@ -408,8 +442,10 @@ public final class FlintObjectClient implements ObjectClient {
             if (b1 > 0 && b2 > b1) {
               metaHits.incrementAndGet();
               kmsSeen.put(String.valueOf(r.getS3Uri()), "1".equals(s.substring(b2 + 1)));
+              long cachedLen = Long.parseLong(s.substring(0, b1));
+              oversizeSeen.put(String.valueOf(r.getS3Uri()), cachedLen > maxObjectBytes);
               return CompletableFuture.completedFuture(ObjectMetadata.builder()
-                  .contentLength(Long.parseLong(s.substring(0, b1)))
+                  .contentLength(cachedLen)
                   .etag(s.substring(b1 + 1, b2)).build());
             }
           }
@@ -438,6 +474,8 @@ public final class FlintObjectClient implements ObjectClient {
         .thenApply(resp -> {
           boolean kms = resp.serverSideEncryption() == ServerSideEncryption.AWS_KMS;
           kmsSeen.put(String.valueOf(r.getS3Uri()), kms);
+          oversizeSeen.put(String.valueOf(r.getS3Uri()),
+              resp.contentLength() != null && resp.contentLength() > maxObjectBytes);
           ObjectMetadata m = ObjectMetadata.builder()
               .contentLength(resp.contentLength()).etag(resp.eTag()).build();
           if (kms && !cacheKms) {
@@ -489,6 +527,14 @@ public final class FlintObjectClient implements ObjectClient {
   private CompletableFuture<ObjectContent> get(GetRequest r, StreamContext ctx) {
     if (bypass) { bypassed.incrementAndGet(); return passthrough(r, ctx); }
     if (kmsBypass(r.getS3Uri())) { kmsBypassed.incrementAndGet(); return passthrough(r, ctx); }
+    // Capacity admission. Counted rather than silent: "not cached because too
+    // large" and "not cached because something broke" must never look alike.
+    // Unknown size does NOT reject -- refusing on an unknown is how a cap
+    // quietly becomes "cache nothing".
+    if (Boolean.TRUE.equals(oversizeSeen.get(String.valueOf(r.getS3Uri())))) {
+      oversizeBypassed.incrementAndGet();
+      return passthrough(r, ctx);
+    }
     final long start = r.getRange().getStart(), end = r.getRange().getEnd();
     final long first = start / chunkBytes, last = end / chunkBytes;
     final int n = (int) (last - first + 1);
@@ -701,10 +747,10 @@ public final class FlintObjectClient implements ObjectClient {
 
   public String counters() {
     return String.format(
-        "chunk %d/%d  meta %d/%d  origin %dG/%dB  sf %dc/%dj  tierFail %d  degraded %d  bypassed %d",
+        "chunk %d/%d  meta %d/%d  origin %dG/%dB  sf %dc/%dj  tierFail %d  degraded %d  bypassed %d  oversize %d",
         chunkHits.get(), chunkHits.get() + chunkMisses.get(),
         metaHits.get(), metaHits.get() + metaMisses.get(),
         originGets.get(), originBytes.get(), claimed.get(), joined.get(),
-        tierFailures.get(), degraded.get(), bypassed.get());
+        tierFailures.get(), degraded.get(), bypassed.get(), oversizeBypassed.get());
   }
 }

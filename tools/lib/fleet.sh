@@ -388,6 +388,34 @@ fleet_wait_listen() {
   return 0
 }
 
+# fleet_wait_log <logfile> <pattern> [budget-s] — block until PATTERN appears
+# in LOGFILE. Returns 0 if it appeared, 1 if the budget ran out.
+#
+# WHY THIS EXISTS. Eight sites across six drills spelled "wait until the seat
+# has logged what it decided" as a fixed sleep — 0.6s, 0.8s, 1.0s, 1.2s — and
+# then grepped the log on the very next line. The sleep is not the assertion;
+# the grep is. So when the sleep is too short the drill fails with its
+# CONFIGURATION message ("node not in mTLS mode", "proxy did not enable TLS")
+# for a purely TIMING reason, and sends the reader to the wrong half of the
+# problem. That misdirection dead-ended three investigations on disk_pressure
+# before anyone doubted the failure text.
+#
+# Those numbers were all chosen on an idle laptop where a seat logs its mode in
+# milliseconds. CI now runs drills four at a time, so they are being asked to
+# hold under contention they were never measured against.
+#
+# The CALLER KEEPS ITS OWN grep as the verdict, deliberately: this only removes
+# the race, so every drill's failure text stays exactly what its author wrote.
+fleet_wait_log() {
+  local _f="$1" _pat="$2" _budget="${3:-15}" _deadline
+  _deadline=$(( $(date +%s) + _budget ))
+  while :; do
+    grep -q -- "$_pat" "$_f" 2>/dev/null && return 0
+    [ "$(date +%s)" -ge "$_deadline" ] && return 1
+    sleep 0.05
+  done
+}
+
 # fleet_wait_ping <port> [valkey-cli opts ...] — block until the seat answers
 # PONG, or FAIL the drill on the spot.
 #

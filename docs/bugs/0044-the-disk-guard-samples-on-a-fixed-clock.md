@@ -230,6 +230,36 @@ registered drills as unlisted, one per line of CORE.
 #### Still open from this audit
 
 - `542da86`'s derived row count — the constant is correct and will not stay so.
+  **Do not take the branch's fix as written.** It derives the expected total by
+  reimplementing FNV-1a and `INDEX_BUCKETS` in Python, inside the drill. That
+  swaps a constant that goes stale for a second implementation of the hash that
+  can silently drift from `flint_vec::bucket_of` — two implementations of one
+  invariant, which is the thing this repo keeps paying for elsewhere (the
+  chaos harness's `port_free` beside flintctl's `wait_port_free` was the same
+  shape, fixed at 26d981a by sharing the reasoning and not the code).
+
+  **Assert the STRUCTURE instead, which needs no hash at all.** Durable keys
+  are `KEY_PREFIX + kind + NUL + set [+ NUL + id]` (`flint-vec/src/lib.rs`
+  `durable_key`), so each kind is countable directly:
+
+  - exactly 1 of kind `s` (set-name index, one per namespace)
+  - exactly 1 of kind `c` per set — 2 here
+  - exactly 1 of kind `v` per (set, id) — 6 here
+  - kind `i`: at least 1 and at most `len(ids)` per set, since distinct
+    buckets cannot exceed distinct ids and a collision only reduces the count
+  - `DBSIZE == 1 + 2 + 6 + i_count`
+
+  That last equality is what the bare total was really guarding — "no keys of
+  an unexpected kind" — and it is the only part that needs to know a total.
+  The bucket count becomes an observation rather than a prediction, so a
+  layout change names which kind moved instead of printing two numbers, and
+  nothing has to know how ids hash.
+
+  Attempted on 2026-08-25 and deferred, not abandoned: getting the `SCAN`
+  parsing right needs local iteration (`KEYS` is not implemented, so the dump
+  goes through `SCAN`), and the box was contended by a sibling project's
+  stress run — `fleet_guard` refused, correctly. Same treatment applies to
+  `coproc_vec_tls_drill.sh`, which hardcodes 8 in the same shape.
 - `ingest_saturation` and `replica_starvation` — real coverage main lacks.
 - ~~`coproc_family` and `proxy_chain` — run them, then register or delete.~~
   **CLOSED 2026-08-24: both PASS, both now in CORE.** Neither was broken; each

@@ -54,6 +54,12 @@ public interface FlintCacheMXBean {
    */
   long getSseKmsBypassed();
 
+  /** Reads that skipped the cache because the object exceeds
+   *  flint.max.object.bytes. A large steady number means the cap is doing
+   *  work; a large number the operator did not expect means it is set wrong,
+   *  and those must be distinguishable from a cache that is merely missing. */
+  long getOversizeBypassed();
+
   /** Objects whose encryption could not be determined, and were cached anyway.
    *  The exact size of the hole in the SSE-KMS guarantee. */
   long getSseKmsUndetectable();

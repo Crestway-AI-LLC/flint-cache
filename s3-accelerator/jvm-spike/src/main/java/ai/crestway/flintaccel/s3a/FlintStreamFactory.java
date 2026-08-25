@@ -72,6 +72,7 @@ public final class FlintStreamFactory extends AbstractObjectInputStreamFactory {
   public static final String TIER_BUDGET   = "fs.s3a.flint.tier.budget.ms";
   public static final String META_TTL      = "fs.s3a.flint.meta.ttl.seconds";
   public static final String CACHE_SSE_KMS = "fs.s3a.flint.cache.sse-kms";
+  public static final String MAX_OBJECT   = "fs.s3a.flint.max.object.bytes";
   /** Refuse to start on a shim collision. Default true: a customer's working
    *  job is worth more than our cache. */
   public static final String SHIM_FAIL_FAST = "fs.s3a.flint.shim.failfast";

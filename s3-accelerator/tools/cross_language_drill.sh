@@ -106,9 +106,23 @@ for _ in $(seq 1 40); do "$TIER_CLI" -p "$TIER_PORT" ping >/dev/null 2>&1 && bre
 TIER_OWNED=$("$TIER_CLI" -p "$TIER_PORT" info server 2>/dev/null | tr -d '\r' | awk -F: '/^process_id:/{print $2}')
 [ "$TIER_OWNED" = "$TIER_PID" ] \
   || { echo "FAIL: tier on $TIER_PORT has pid $TIER_OWNED, we started $TIER_PID -- not ours."; exit 1; }
+# Wait for the origin to ANSWER rather than for seconds to pass. `sleep 3` is
+# not a weak readiness signal, it is NO signal: it asserts three seconds is
+# enough on every machine this will ever run on, which stops being true the
+# moment the box is loaded. And the obvious repair -- a longer sleep -- only
+# helps when the thing waited on is genuinely slow rather than not yet started.
+wait_http() { # url [tries]
+  local i
+  for i in $(seq 1 "${2:-150}"); do
+    curl -sf -o /dev/null "$1" 2>/dev/null && return 0
+    sleep 0.1
+  done
+  echo "FAIL: fixture never answered: $1" >&2
+  return 1
+}
 python3 "$ROOT/tools/counting_s3.py" --port "$PORT" --objects 4 --object-bytes 4194304 \
   >/tmp/xlang_origin.log 2>&1 & ORIGIN_PID=$!
-sleep 3
+wait_http "http://127.0.0.1:$PORT/__stats" || exit 1
 CP="$ROOT/jvm-spike/target/classes:$(cat /tmp/cp.txt)"
 KEY="data/000001.bin"; LEN=100000
 

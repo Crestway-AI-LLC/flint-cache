@@ -26,7 +26,7 @@ fleet_wait_listen 6810
 sleep 0.6
 $PX --port 7810 --pairs "127.0.0.1:6810" --max-conns 4 2>"$D/px.log" &
 fleet_wait_listen 7810
-sleep 1.0
+fleet_wait_log "$D/px.log" "max-conns 4"   # not a sleep: wait for the line the grep below asserts
 grep -q "max-conns 4" "$D/px.log" || { echo "FAIL: proxy did not report the cap"; cat "$D/px.log"; exit 1; }
 
 python3 - <<'PY'

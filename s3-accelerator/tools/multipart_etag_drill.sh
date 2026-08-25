@@ -72,7 +72,22 @@ python3 "$ROOT/tools/counting_s3.py" --port "$MP" --objects 4 --object-bytes 104
   --multipart-parts 4 >/tmp/mp_origin.log 2>&1 & A=$!
 python3 "$ROOT/tools/counting_s3.py" --port "$SP" --objects 4 --object-bytes 1048576 \
   >/tmp/sp_origin.log 2>&1 & B=$!
-sleep 3
+# Wait for the origin to ANSWER rather than for seconds to pass. `sleep 3` is
+# not a weak readiness signal, it is NO signal: it asserts three seconds is
+# enough on every machine this will ever run on, which stops being true the
+# moment the box is loaded. And the obvious repair -- a longer sleep -- only
+# helps when the thing waited on is genuinely slow rather than not yet started.
+wait_http() { # url [tries]
+  local i
+  for i in $(seq 1 "${2:-150}"); do
+    curl -sf -o /dev/null "$1" 2>/dev/null && return 0
+    sleep 0.1
+  done
+  echo "FAIL: fixture never answered: $1" >&2
+  return 1
+}
+wait_http "http://127.0.0.1:$MP/__stats" || exit 1
+wait_http "http://127.0.0.1:$SP/__stats" || exit 1
 
 probe() { java -cp "$CP" ai.crestway.flintaccel.client.CrossLangProbe \
           "http://127.0.0.1:$1" bucket data/000001.bin 100000 "$TIER_URI" >/dev/null 2>&1; }

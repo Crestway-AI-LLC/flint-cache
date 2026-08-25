@@ -47,7 +47,7 @@ sleep 1.2
 # Deterministic no-op bump: re-assert the same subset. The version advances
 # but NEITHER proxy's filtered view changes — both watchers must suppress.
 fleet_cp 7595 CPSETSUBSET acme 127.0.0.1:7821
-sleep 1.2
+fleet_wait_log "$D/cp.log" "watch 127.0.0.1:7822: suppressed push"   # not a sleep: wait for the line the grep below asserts
 grep -q "watch 127.0.0.1:7822: suppressed push" "$D/cp.log" \
   || { echo "FAIL: no suppression logged for the unaffected proxy"; grep watch "$D/cp.log"; exit 1; }
 [ "$(valkey-cli -p 7821 -a tok-acme --no-auth-warning SET pk pv)" = "OK" ] \

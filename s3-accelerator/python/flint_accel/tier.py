@@ -20,6 +20,44 @@ import time
 import zlib
 
 CHUNK = 64 * 1024
+#: What fsspec's block cache fetches per miss. NOT the chunk size, and not
+#: fsspec's own 5 MiB either -- a chosen point on a trade that has no free one.
+#:
+#: MEASURED, 64 MiB object, counts exact. The two axes pull against each other:
+#:
+#:   block     sparse read pulls   small-sequential tier round trips
+#:   5 MiB     31x what was asked   3
+#:   1 MiB     17x                  9
+#:   256 KiB   5.0x                33
+#:   64 KiB    2.0x               122
+#:
+#: 256 KiB takes most of the amplification win while keeping small-sequential
+#: reads inside ~10x rather than 40x. Large sequential reads are indifferent at
+#: every value: identical bytes, 8 tier round trips, because contiguous chunk
+#: runs coalesce into one origin range GET however fsspec slices the request.
+BLOCK_BYTES = 256 * 1024
+#: Objects larger than this are read straight from the origin and never
+#: chunk-cached.
+#:
+#: 512 MiB (Jeff, 2026-08-25). The reasoning that sets it is PAYOFF, not
+#: keyspace. Measured: a warm read moves the SAME bytes as a cold one -- the
+#: cache does not reduce data transferred, it changes where the data comes
+#: from. So for a large object read sequentially the entire benefit is
+#: bytes x (1/S3_throughput - 1/tier_throughput), which is near zero against
+#: parallel range GETs on a fast NIC and NEGATIVE when the tier is slower.
+#: Past some size a client is better off going straight to S3.
+#:
+#: 512 MiB sits above the data files this cache is actually for -- Parquet and
+#: Iceberg land at 128-512 MB -- so the analytics working set still caches
+#: while objects whose only payoff is a throughput differential do not.
+#:
+#: The keyspace argument still holds underneath: an object of size S occupies
+#: S/CHUNK keys, and at ~100 B of per-key overhead a 1 TB object would cost
+#: ~1.7 GB of overhead before a single byte of its data is stored.
+#:
+#: THIS NUMBER IS AN ARGUMENT, NOT A FINDING. The real crossover wants
+#: measuring on a cluster; tracked, blocked on M0.
+MAX_OBJECT_BYTES = 512 * 1024 * 1024
 TIER_BUDGET_S = 0.05          # any tier call slower than this is a miss
 META_TTL_S = 60
 
@@ -30,7 +68,7 @@ class Counters:
     __slots__ = ("chunk_hits", "chunk_misses", "meta_hits", "meta_misses",
                  "origin_gets", "origin_bytes", "tier_failures", "degraded",
                  "claimed", "joined", "bypassed", "integrity_failures",
-                 "kms_bypassed", "kms_undetectable")
+                 "kms_bypassed", "kms_undetectable", "oversize_bypassed")
 
     def __init__(self):
         for s in self.__slots__:
@@ -49,7 +87,7 @@ class FlintTier:
 
     def __init__(self, redis_client, origin, chunk=CHUNK,
                  budget_s=TIER_BUDGET_S, meta_ttl_s=META_TTL_S, bypass=False,
-                 cache_kms=False):
+                 cache_kms=False, max_object_bytes=MAX_OBJECT_BYTES):
         self.r = redis_client
         self.origin = origin
         self.chunk = chunk
@@ -59,6 +97,7 @@ class FlintTier:
         # Default FALSE and it must stay false: a default that silently caches
         # KMS plaintext is the version of this that ends a security review.
         self.cache_kms = cache_kms
+        self.max_object_bytes = max_object_bytes
         self._kms = {}
         self.c = Counters()
         self._inflight = {}
@@ -259,6 +298,19 @@ class FlintTier:
         # SHARED with the JVM client by design, so a gap here would let a
         # Python reader cache plaintext the JVM reader refuses to cache -- the
         # guarantee is only as strong as its weakest client.
+        # Capacity admission. Checked BEFORE the KMS probe so an oversize
+        # object costs no HEAD to reject, and counted rather than silent --
+        # "not cached because too large" and "not cached because something
+        # broke" must never look alike in the counters.
+        #
+        # size is None when the caller could not tell us; we cache in that
+        # case rather than guess, because refusing on an unknown is how a cap
+        # quietly turns into "cache nothing".
+        if size is not None and size > self.max_object_bytes:
+            self.c.oversize_bypassed += 1
+            self.c.origin_gets += 1
+            return self.origin.get(bucket, key, start, start + length - 1)
+
         if not self.cache_kms and self._is_kms(bucket, key):
             self.c.kms_bypassed += 1
             self.c.origin_gets += 1

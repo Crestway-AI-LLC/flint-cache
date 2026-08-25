@@ -14,6 +14,7 @@ import redis as redis_lib
 
 sys.path.insert(0, ".")
 import flint_accel
+from flint_accel.tier import BLOCK_BYTES
 
 OK = [True]
 
@@ -171,6 +172,73 @@ def main():
     check(got_short == SHORT,
           f"and the rewritten object reads back WHOLE ({len(got_short)} bytes, want {len(SHORT)})"
           " -- not truncated to the cached length")
+
+    # D17 -- an object above the cap is read, but never cached
+    #
+    # The bound is on the KEYSPACE as much as the bytes: an object of size S
+    # occupies S/CHUNK keys, so a single very large object can cost more in
+    # per-key overhead than its data is worth to anyone.
+    rc.flushall(); stats(ep, "/__reset")
+    BIG = "s3://bucket/scratch/oversize.bin"
+    payload = b"O" * 200_000
+    fs().pipe_file(BIG, payload)
+
+    small = flint_accel.FlintS3FileSystem(skip_instance_cache=True,
+                                          max_object_bytes=100_000, **so)
+    with small.open(BIG, "rb") as h:
+        h.seek(0); over = h.read(len(payload))
+    check(over == payload, "an oversize object still READS correctly")
+    check(len([k for k in rc.scan_iter(match=b"c1/*")]) == 0,
+          "and wrote NO chunks to the tier")
+    check(small.counters["oversize_bypassed"] > 0,
+          f"counted, not silent ({small.counters['oversize_bypassed']} bypassed)"
+          " -- 'too large' must not look like 'the cache broke'")
+    # The control matters more than the check: without it, a client that
+    # cached nothing at all for any reason would pass the two checks above.
+    rc.flushall()
+    with fs().open(BIG, "rb") as h:
+        h.seek(0); h.read(len(payload))
+    check(len([k for k in rc.scan_iter(match=b"c1/*")]) > 0,
+          "negative control -- UNDER the cap the same object IS cached")
+
+    # D19 -- the block size defaults to our CHUNK, because fsspec's own
+    # default drags an order of magnitude more than a selective read asked for
+    K19 = "s3://bucket/data/000005.bin"
+    size19 = fs().info(K19)["size"]
+
+    def sparse_cost(fsys, n=16, sz=64 * 1024):
+        """Origin bytes for n scattered 64 KiB reads. Counts, not durations --
+        a duration on a shared machine is not a measurement."""
+        rc.flushall(); stats(ep, "/__reset")
+        step = size19 // n
+        with fsys.open(K19, "rb") as h:
+            for i in range(n):
+                h.seek(i * step); h.read(sz)
+        return stats(ep)["bytes_served"], n * sz
+
+    tuned, asked = sparse_cost(fs())
+    wide, _ = sparse_cost(flint_accel.FlintS3FileSystem(
+        skip_instance_cache=True, default_block_size=5 * 1024 * 1024, **so))
+    # Pin the DECISION, not a ratio. 256 KiB is a chosen point on a trade with
+    # no free point (ADR-0023 D19), so the value itself is the thing a
+    # regression would move -- and an exact check cannot drift the way a
+    # threshold tuned to whatever was measured that day does.
+    check(fs().default_block_size == BLOCK_BYTES,
+          f"the block size default is the chosen {BLOCK_BYTES // 1024} KiB")
+    check(tuned < wide,
+          f"our default block pulls LESS than fsspec's ({tuned} < {wide} bytes)")
+    # Bound DERIVED, not tuned: fsspec fetches a block per miss and reads one
+    # ahead, so a 64 KiB read against a 256 KiB block cannot exceed
+    # 2 x block / read = 8x. Measured 5.0x. A bound computed from the
+    # constants stays correct when the constants change; one copied from a
+    # measurement has to be rediscovered every time they do.
+    bound = 2 * BLOCK_BYTES / (64 * 1024)
+    check(tuned <= asked * bound,
+          f"a selective read drags <= {bound:.0f}x what it asked for ({tuned/asked:.1f}x)")
+    # Without this the two checks above would both pass against a client that
+    # had simply stopped reading anything.
+    check(wide > asked * 5,
+          f"negative control -- fsspec's own 5 MiB default drags {wide/asked:.1f}x")
 
     # how much does fsspec's block cache pull for a small read?
     rc.flushall(); stats(ep, "/__reset")

@@ -57,7 +57,7 @@ echo "== proxy with TLS termination"
 $PX --port 7760 --pairs "127.0.0.1:6310" \
     --tls-cert "$D/cert.pem" --tls-key "$D/key.pem" 2>"$D/px.log" &
 fleet_wait_listen 7760
-sleep 1.0
+fleet_wait_log "$D/px.log" "TLS"   # not a sleep: wait for the line the grep below asserts
 grep -q "TLS" "$D/px.log" || { echo "FAIL: proxy did not report TLS mode"; cat "$D/px.log"; exit 1; }
 echo "  proxy up in TLS mode"
 
@@ -96,7 +96,7 @@ echo "== same binary, NO --tls-* flags: plaintext still works (no downgrade path
 fleet_kill proxy; sleep 0.4
 $PX --port 7761 --pairs "127.0.0.1:6310" 2>"$D/px2.log" &
 fleet_wait_listen 7761
-sleep 0.8
+fleet_wait_log "$D/px2.log" "plaintext"   # not a sleep: wait for the line the grep below asserts
 grep -q "plaintext" "$D/px2.log" || { echo "FAIL: proxy did not report plaintext mode"; cat "$D/px2.log"; exit 1; }
 [ "$(valkey-cli -p 7761 PING)" = "PONG" ] || { echo "FAIL: plaintext mode broken"; exit 1; }
 [ "$(valkey-cli -p 7761 SET pk world; valkey-cli -p 7761 GET pk)" = "OK
