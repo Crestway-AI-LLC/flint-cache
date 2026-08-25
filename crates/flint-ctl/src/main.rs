@@ -4600,17 +4600,88 @@ fn epoch_counter(epoch: &str) -> Option<u32> {
         .and_then(|c| c.trim().parse().ok())
 }
 
+// Disallowed while replicas roll: ANY role transition. During the master
+// phase the promote/demote we issue are expected; Detected/SelfFenced/
+// SpareRestored still mean something else broke.
+//
+// At module scope rather than inside `upgrade` so the gate they configure can
+// be tested against them directly. A test that redeclared its own copy would
+// keep passing after a kind was added or removed here, which is the failure
+// this whole change is about.
+const REPLICA_PHASE_DISALLOWED: &[&str] = &[
+    "Detected",
+    "PromoteIssued",
+    "Promoted",
+    "Demoted",
+    "SelfFenced",
+    "SpareRestored",
+];
+const MASTER_PHASE_DISALLOWED: &[&str] = &["Detected", "SelfFenced", "SpareRestored"];
+
+/// A transition THIS roll is the cause of, and therefore expects to see.
+///
+/// The master phase takes a pair's master down on purpose. The controller,
+/// doing exactly its job, notices that seat unreachable and journals
+/// `Detected` — and the gate below then aborted the upgrade on a transition
+/// the upgrade had itself produced (OPS-0027). Under CI load the seat stays
+/// down long enough to clear "confirmed across required ticks", so it trips
+/// there and almost nowhere else.
+///
+/// The answer is NOT to stop disallowing `Detected`: an uncontrolled failover
+/// racing a controlled one is the real thing this gate exists to catch, and
+/// dropping the kind would give that up. Bound it instead, which is the shape
+/// c134191 already used for the same problem one caller over.
+///
+/// Three things must all hold, and each one is load-bearing:
+///   - the KIND is the one the roll causes (`Detected`, never `SelfFenced` or
+///     `SpareRestored` — the roll does not cause those, so they stay fatal);
+///   - the SUBJECT is the pair this roll just took down, so another pair
+///     failing over during the window is still an abort;
+///   - the event is AFTER the seat was stopped, not merely after the phase
+///     began. The controlled demote/drain/promote before it is fenced and
+///     should be quiet; a `Detected` in that sub-window is the uncontrolled
+///     race and must stay fatal.
+struct ExpectedTransition<'a> {
+    kind: &'a str,
+    subject: String,
+    since_ms: u64,
+}
+
 /// Journal gate: no event of a disallowed kind since `since_ms`. The fleet
 /// journal is the abort signal — an unexpected role transition mid-roll
 /// means the fleet is fighting something else; stop adding variables.
-fn journal_clean(inv: &Inventory, since_ms: u64, disallowed: &[&str]) -> Result<(), String> {
+fn journal_clean(
+    inv: &Inventory,
+    since_ms: u64,
+    disallowed: &[&str],
+    expected: Option<&ExpectedTransition>,
+) -> Result<(), String> {
     let tls = tls_client(inv);
     let Ok(Value::Bulk(Some(raw))) = call_cp(inv, &tls, &["CPJOURNALREAD", "500"]) else {
         // FAIL CLOSED: an upgrade must not roll blind. If the journal is
         // unreadable we cannot distinguish "quiet fleet" from "on fire".
         return Err("fleet journal unreachable — refusing to roll without the gate".into());
     };
-    for line in String::from_utf8_lossy(&raw).lines() {
+    scan_journal(
+        String::from_utf8_lossy(&raw).lines(),
+        since_ms,
+        disallowed,
+        expected,
+    )
+}
+
+/// The gate's decision, split from its I/O so the exemption above can be
+/// tested. The bug this guards is a WRONGLY WIDENED exemption, which is
+/// invisible in a passing roll and only shows up as a real failover being
+/// swallowed — so the tests below assert what still aborts, not just what
+/// passes.
+fn scan_journal<'a>(
+    lines: impl Iterator<Item = &'a str>,
+    since_ms: u64,
+    disallowed: &[&str],
+    expected: Option<&ExpectedTransition>,
+) -> Result<(), String> {
+    for line in lines {
         let at = line
             .split("\"at_ms\":")
             .nth(1)
@@ -4621,9 +4692,23 @@ fn journal_clean(inv: &Inventory, since_ms: u64, disallowed: &[&str]) -> Result<
             continue;
         }
         for kind in disallowed {
-            if line.contains(&format!("\"kind\":\"{kind}\"")) {
-                return Err(format!("unexpected {kind} in the fleet journal: {line}"));
+            if !line.contains(&format!("\"kind\":\"{kind}\"")) {
+                continue;
             }
+            if let Some(x) = expected
+                && *kind == x.kind
+                && at >= x.since_ms
+                && line.contains(&format!("\"subject\":\"{}\"", x.subject))
+            {
+                // SAY IT. A silently swallowed transition reads, later,
+                // exactly like a gate that never ran.
+                eprintln!(
+                    "  expected {kind} for {} — this roll took that master down",
+                    x.subject
+                );
+                continue;
+            }
+            return Err(format!("unexpected {kind} in the fleet journal: {line}"));
         }
     }
     Ok(())
@@ -5092,18 +5177,6 @@ fn upgrade(inv: &Inventory, version_tag: Option<String>, soak_ms: u64, nodes_onl
         .map(|t| ("FLINT_BUILD_VERSION".to_string(), t.clone()))
         .collect();
     let expect = version_tag.clone();
-    // Disallowed while replicas roll: ANY role transition. During the master
-    // phase the promote/demote we issue are expected; Detected/SelfFenced/
-    // SpareRestored still mean something else broke.
-    const REPLICA_PHASE_DISALLOWED: &[&str] = &[
-        "Detected",
-        "PromoteIssued",
-        "Promoted",
-        "Demoted",
-        "SelfFenced",
-        "SpareRestored",
-    ];
-    const MASTER_PHASE_DISALLOWED: &[&str] = &["Detected", "SelfFenced", "SpareRestored"];
 
     // PRECONDITION: the CP must already speak the verbs the MASTER phase
     // needs, because the phase that rolls the CP runs after it.
@@ -5229,7 +5302,7 @@ fn upgrade(inv: &Inventory, version_tag: Option<String>, soak_ms: u64, nodes_onl
     }
     eprintln!("  canary {canary} on new build, reconverged; soaking {soak_ms}ms");
     std::thread::sleep(Duration::from_millis(soak_ms));
-    if let Err(e) = journal_clean(inv, t0, REPLICA_PHASE_DISALLOWED) {
+    if let Err(e) = journal_clean(inv, t0, REPLICA_PHASE_DISALLOWED, None) {
         eprintln!("== UPGRADE ABORTED at canary soak: {e}");
         eprintln!("   canary stays on the new build (roll forward after diagnosis)");
         std::process::exit(3);
@@ -5258,7 +5331,7 @@ fn upgrade(inv: &Inventory, version_tag: Option<String>, soak_ms: u64, nodes_onl
             eprintln!("== UPGRADE ABORTED at {r}: {e}");
             std::process::exit(3);
         }
-        if let Err(e) = journal_clean(inv, t, REPLICA_PHASE_DISALLOWED) {
+        if let Err(e) = journal_clean(inv, t, REPLICA_PHASE_DISALLOWED, None) {
             eprintln!("== UPGRADE ABORTED after {r}: {e}");
             std::process::exit(3);
         }
@@ -5280,11 +5353,27 @@ fn upgrade(inv: &Inventory, version_tag: Option<String>, soak_ms: u64, nodes_onl
         eprintln!(
             "  pair {i}: {old_master} demoted + drained; {new_master} promoted at (0,{promoted})"
         );
+        // The window for the roll's OWN transient opens here, after the
+        // fenced failover and before the seat is taken down -- not at `t`,
+        // which is where the phase began. Anything the controlled part
+        // journals is still held to the unbounded rule.
+        let t_down = now_ms();
         if let Err(e) = roll_node(inv, old_master, &new_master, &envs, &expect, true) {
             eprintln!("== UPGRADE ABORTED after pair {i} failover, respawning {old_master}: {e}");
             std::process::exit(3);
         }
-        if let Err(e) = journal_clean(inv, t, MASTER_PHASE_DISALLOWED) {
+        // `g{i}` is the controller's label for this pair, and the index is
+        // the same one: controller_args builds --pairs from inv.pairs in
+        // order, and the controller splits that spec and enumerates it into
+        // `g{i}`. This loop enumerates inv.pairs too. If that ever stops
+        // being true the exemption starts excusing another pair's failover,
+        // which is the one outcome this gate must never produce.
+        let expected = ExpectedTransition {
+            kind: "Detected",
+            subject: format!("g{i}"),
+            since_ms: t_down,
+        };
+        if let Err(e) = journal_clean(inv, t, MASTER_PHASE_DISALLOWED, Some(&expected)) {
             eprintln!("== UPGRADE ABORTED after pair {i} master roll: {e}");
             std::process::exit(3);
         }
@@ -6420,5 +6509,153 @@ mod cert_manifest_tests {
             .map(|(f, _)| f)
             .collect();
         assert_eq!(files, vec!["ca.crt", "int.crt", "int.key"]);
+    }
+}
+
+#[cfg(test)]
+mod ops_0027_tests {
+    use super::*;
+
+    fn ev(at: u64, kind: &str, subject: &str) -> String {
+        format!(
+            "{{\"at_ms\":{at},\"actor\":\"controller:ctl\",\"kind\":\"{kind}\",\
+             \"subject\":\"{subject}\",\"cause\":\"master unreachable, confirmed\"}}"
+        )
+    }
+
+    fn expect_g(subject: &str, since_ms: u64) -> ExpectedTransition<'static> {
+        ExpectedTransition {
+            kind: "Detected",
+            subject: subject.to_string(),
+            since_ms,
+        }
+    }
+
+    // THE BUG: the roll takes pair 0's master down, the controller journals
+    // Detected for g0, and the upgrade aborted on its own doing.
+    #[test]
+    fn the_rolls_own_detected_is_expected() {
+        let x = expect_g("g0", 100);
+        let lines = [ev(150, "Detected", "g0")];
+        assert!(
+            scan_journal(
+                lines.iter().map(|s| s.as_str()),
+                50,
+                MASTER_PHASE_DISALLOWED,
+                Some(&x)
+            )
+            .is_ok(),
+            "the transition this roll caused must not abort it"
+        );
+    }
+
+    // EVERY ONE OF THESE MUST STILL ABORT. A widened exemption is invisible
+    // in a green roll -- it only shows as a real failover being swallowed --
+    // so these are the assertions that actually protect the guard.
+    #[test]
+    fn another_pair_failing_over_still_aborts() {
+        let x = expect_g("g0", 100);
+        let lines = [ev(150, "Detected", "g1")];
+        assert!(
+            scan_journal(
+                lines.iter().map(|s| s.as_str()),
+                50,
+                MASTER_PHASE_DISALLOWED,
+                Some(&x)
+            )
+            .is_err(),
+            "g1 failing over while g0 is rolled is the race the gate exists for"
+        );
+    }
+
+    #[test]
+    fn detected_before_the_seat_was_stopped_still_aborts() {
+        // Inside the phase window (>= 50) but BEFORE the roll took the seat
+        // down (< 100): the fenced demote/drain/promote should be quiet, so
+        // a Detected there is uncontrolled.
+        let x = expect_g("g0", 100);
+        let lines = [ev(75, "Detected", "g0")];
+        assert!(
+            scan_journal(
+                lines.iter().map(|s| s.as_str()),
+                50,
+                MASTER_PHASE_DISALLOWED,
+                Some(&x)
+            )
+            .is_err(),
+            "the controlled sub-window is still held to the unbounded rule"
+        );
+    }
+
+    #[test]
+    fn other_disallowed_kinds_are_never_excused() {
+        let x = expect_g("g0", 100);
+        for kind in ["SelfFenced", "SpareRestored"] {
+            let lines = [ev(150, kind, "g0")];
+            assert!(
+                scan_journal(
+                    lines.iter().map(|s| s.as_str()),
+                    50,
+                    MASTER_PHASE_DISALLOWED,
+                    Some(&x)
+                )
+                .is_err(),
+                "{kind} is not something the roll causes, so it stays fatal"
+            );
+        }
+    }
+
+    // The replica phase passes None and must be exactly as strict as before.
+    #[test]
+    fn without_an_expectation_nothing_is_excused() {
+        let lines = [ev(150, "Detected", "g0")];
+        assert!(
+            scan_journal(
+                lines.iter().map(|s| s.as_str()),
+                50,
+                MASTER_PHASE_DISALLOWED,
+                None
+            )
+            .is_err(),
+            "the replica phase and the pre-roll gate must not inherit the exemption"
+        );
+    }
+
+    // POSITIVE CONTROL for the harness itself: if `ev` stopped producing a
+    // line the scanner recognises, every assertion above would pass by
+    // matching nothing, and this file would report a guard it never tested.
+    #[test]
+    fn the_fixture_is_actually_seen_by_the_scanner() {
+        let lines = [ev(150, "Detected", "g0")];
+        let err = scan_journal(
+            lines.iter().map(|s| s.as_str()),
+            50,
+            MASTER_PHASE_DISALLOWED,
+            None,
+        )
+        .expect_err("fixture must trip the scanner");
+        assert!(
+            err.contains("Detected") && err.contains("g0"),
+            "the scanner reported something else entirely: {err}"
+        );
+    }
+
+    // And that the timestamp field is parsed at all: a fixture whose at_ms
+    // never parses reads as 0, lands before every since_ms, and is skipped --
+    // which would make the two window tests above vacuous.
+    #[test]
+    fn the_fixtures_timestamp_is_parsed() {
+        let lines = [ev(150, "Detected", "g0")];
+        assert!(
+            scan_journal(
+                lines.iter().map(|s| s.as_str()),
+                200,
+                MASTER_PHASE_DISALLOWED,
+                None
+            )
+            .is_ok(),
+            "an event at 150 must be skipped when since_ms is 200; if this \
+             fails the at_ms parse is broken and the window tests prove nothing"
+        );
     }
 }
