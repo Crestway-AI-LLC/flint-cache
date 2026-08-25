@@ -29,13 +29,23 @@ ROOT=$PWD
 export JAVA_HOME="${JAVA_HOME:-/opt/homebrew/opt/openjdk@21}"
 export PATH="$JAVA_HOME/bin:$PATH"
 QUICK=${1:-}
+# The tier ports are VARIABLES. Every stage below begins with `flushall`, so a
+# tier this gate did not start is not merely shared with a neighbouring
+# harness -- it is destroyed mid-run, and both runs then measure the debris.
+TIER_PORT=${TIER_PORT:-9399}
+SLOW_PORT=${SLOW_PORT:-9398}
 
 PASS=0; FAIL=0; SKIP=0
 declare -a FAILED
 PIDS=()
+ORIGIN_PORTS=()
 cleanup() {
   for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null; done
-  "$TIER_CLI" -p 9399 shutdown nosave 2>/dev/null
+  # By pid, not by telling whatever answers on the port to shut down --
+  # `--daemonize yes` used to start it, which reparents to init, so an
+  # abnormal exit left a tier holding the port indefinitely and the NEXT run
+  # adopted it.
+  [ -n "${TIER_PID:-}" ] && kill "$TIER_PID" 2>/dev/null
   # Prove it, rather than assume the kills landed.
   local left
   # Attribute a leaked process to THIS gate by something this gate declared --
@@ -51,7 +61,13 @@ cleanup() {
   # machine as our leak. A developer box runs more than this gate; a check that
   # blames a neighbour is worse than no check, because the next person learns
   # to ignore it.
-  local pat="counting_s3\.py|slow_tier\.py|(valkey|redis)-server[^|]*--port (9398|9399)|(valkey|redis)-server[^|]*:(9398|9399)"
+  # Scoped to ports THIS gate bound. Matching counting_s3.py by name alone
+  # blamed this gate for a neighbouring session's fixture on a port we never
+  # touched -- the precise false attribution the paragraph above forbids.
+  local mine
+  mine="$(printf '%s|' "${ORIGIN_PORTS[@]:-}" | sed 's/|$//')"
+  [ -n "$mine" ] || mine="$TIER_PORT"
+  local pat="counting_s3\.py[^|]*--port ($mine)|slow_tier\.py[^|]*--listen ($SLOW_PORT)|(valkey|redis)-server[^|]*--port ($SLOW_PORT|$TIER_PORT)|(valkey|redis)-server[^|]*:($SLOW_PORT|$TIER_PORT)"
   local leaked
   leaked=$(ps -ax -o command= | grep -E "$pat" | grep -v grep || true)
   left=$(printf "%s" "$leaked" | grep -c . || true)
@@ -78,6 +94,31 @@ fi
 for t in java mvn python3 "$TIER_SERVER" "$TIER_CLI"; do
   need "$t" || { echo "missing prerequisite: $t"; exit 2; }
 done
+
+# ------------------------------------------------------------------ the tier
+# Started once, here, rather than re-issued by start_svcs on every stage.
+# `--daemonize yes` returns 0 whether or not the bind succeeded, so a port
+# already held produced a "successful" start and a silent adoption of someone
+# else's tier. Prove the port is free by binding it, own the pid, then prove
+# the server answering is the one we started.
+python3 - "$TIER_PORT" <<'FREE' || { echo "port $TIER_PORT is in use -- refusing to adopt a tier this gate did not start. Set TIER_PORT to a free port." >&2; exit 2; }
+import socket, sys
+s = socket.socket()
+try:
+    s.bind(("127.0.0.1", int(sys.argv[1])))
+except OSError:
+    sys.exit(1)
+finally:
+    s.close()
+FREE
+"$TIER_SERVER" --port "$TIER_PORT" --save '' --appendonly no \
+    >/tmp/gate_tier.log 2>&1 & TIER_PID=$!
+for _ in $(seq 1 40); do "$TIER_CLI" -p "$TIER_PORT" ping >/dev/null 2>&1 && break; sleep 0.2; done
+"$TIER_CLI" -p "$TIER_PORT" ping >/dev/null 2>&1 \
+    || { echo "tier never answered on $TIER_PORT (see /tmp/gate_tier.log)" >&2; exit 2; }
+TIER_OWNED=$("$TIER_CLI" -p "$TIER_PORT" info server 2>/dev/null | tr -d '\r' | awk -F: '/^process_id:/{print $2}')
+[ "$TIER_OWNED" = "$TIER_PID" ] \
+    || { echo "tier on $TIER_PORT has pid $TIER_OWNED, we started $TIER_PID -- not ours." >&2; exit 2; }
 
 # ---------------------------------------------------------------- fixtures
 # A gate that can hang forever is worse than one that fails: the first run of
@@ -155,7 +196,23 @@ SHIM=$(ls jvm-spike/target/*hadoop-shim.jar 2>/dev/null | head -1)
 
 # ---------------------------------------------------------------- services
 start_svcs() { # port, extra-args
-  "$TIER_SERVER" --port 9399 --save '' --appendonly no --daemonize yes 2>/dev/null
+  # The tier is started once at the top and owned; this only proves it is
+  # still there, so a stage that flushes a DEAD tier fails here rather than
+  # further along as an inexplicable pile of cache misses.
+  "$TIER_CLI" -p "$TIER_PORT" ping >/dev/null 2>&1 \
+      || { echo "tier on $TIER_PORT stopped answering" >&2; exit 2; }
+  # Re-take ownership if a suite restarted the tier under us. Suite.java kills
+  # the tier deliberately (to prove readers survive it) and then starts a
+  # DAEMONIZED replacement to leave the box as it found it -- which the gate
+  # could not then clean up, because the pid it owned had already been shut
+  # down. Tracking whoever holds the port is safe here and only here: the gate
+  # proved the port free before binding it and has held it since, so anything
+  # answering on it now descends from this run.
+  local now
+  now=$("$TIER_CLI" -p "$TIER_PORT" info server 2>/dev/null | tr -d '\r' \
+        | awk -F: '/^process_id:/{print $2}')
+  [ -n "$now" ] && [ "$now" != "${TIER_PID:-}" ] && TIER_PID="$now"
+  ORIGIN_PORTS+=("$1")
   python3 tools/counting_s3.py --port "$1" --objects 8 --object-bytes 8388608 ${2:-} \
       >/tmp/gate_origin_$1.log 2>&1 &
   PIDS+=($!)
@@ -166,9 +223,9 @@ stop_origin() { for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null; done; PIDS=()
 
 run_suite() { # label, mainclass, port, classpath, extra-origin-args
   start_svcs "$3" "${5:-}"
-  "$TIER_CLI" -p 9399 flushall >/dev/null 2>&1
+  "$TIER_CLI" -p "$TIER_PORT" flushall >/dev/null 2>&1
   local log="/tmp/gate_$(echo "$1" | tr ' /()' '____').log"
-  run_bounded java -cp "$4" "$2" "http://127.0.0.1:$3" redis://127.0.0.1:9399 >"$log" 2>&1
+  run_bounded java -cp "$4" "$2" "http://127.0.0.1:$3" redis://127.0.0.1:$TIER_PORT >"$log" 2>&1
   local rc=$?
   [ $rc -eq 124 ] && printf "   \033[31mHUNG\033[0m  %s (>${SUITE_TIMEOUT}s)\n" "$1"
   verdict "$1" $rc
@@ -198,7 +255,9 @@ run_suite "tier integrity, adversarial (20 checks)" ai.crestway.flintaccel.clien
 run_suite "client suite under MULTIPART etags (18 checks)" ai.crestway.flintaccel.client.Suite \
     9307 "$ROOT/jvm-spike/target/classes:$CP" "--multipart-parts 4 --delay-ms 120"
 
-CP_FILE="$CP_FILE" run_bounded bash "$ROOT/tools/multipart_etag_drill.sh" \
+# Its own tier port, like the cross-language drill: this one starts and tears
+# down its tier, and tearing down the GATE's tier is what it used to do.
+CP_FILE="$CP_FILE" TIER_PORT=9400 run_bounded bash "$ROOT/tools/multipart_etag_drill.sh" \
     >/tmp/gate_multipart.log 2>&1
 verdict "multipart etag key shape (7 checks)" $?
 
@@ -210,10 +269,10 @@ python3 tools/counting_s3.py --port 9309 --objects 4 --object-bytes 1048576 \
     >/tmp/gate_origin_9309.log 2>&1 &
 PIDS+=($!)
 sleep 2
-"$TIER_CLI" -p 9399 flushall >/dev/null 2>&1
+"$TIER_CLI" -p "$TIER_PORT" flushall >/dev/null 2>&1
 run_bounded java -cp "$ROOT/jvm-spike/target/classes:$CP" \
     ai.crestway.flintaccel.client.SseKmsSuite \
-    http://127.0.0.1:9308 http://127.0.0.1:9309 redis://127.0.0.1:9399 \
+    http://127.0.0.1:9308 http://127.0.0.1:9309 redis://127.0.0.1:$TIER_PORT \
     >/tmp/gate_ssekms.log 2>&1
 verdict "SSE-KMS bypass + opt-in (12 checks)" $?
 
@@ -224,7 +283,7 @@ verdict "SSE-KMS bypass + opt-in (12 checks)" $?
 # key. A check on any single path passes while the others are wrong.
 run_bounded java -cp "$ROOT/jvm-spike/target/classes:$CP" \
     ai.crestway.flintaccel.s3a.SseKmsPathsSuite \
-    http://127.0.0.1:9308 redis://127.0.0.1:9399 >/tmp/gate_kmspaths.log 2>&1
+    http://127.0.0.1:9308 redis://127.0.0.1:$TIER_PORT >/tmp/gate_kmspaths.log 2>&1
 verdict "SSE-KMS on all 3 adoption paths (7 checks)" $?
 
 # The counters, read the way an OPERATOR reads them -- through the platform
@@ -237,12 +296,21 @@ python3 tools/counting_s3.py --port 9311 --objects 4 --object-bytes 1048576 \
     >/tmp/gate_origin_9311.log 2>&1 &
 PIDS+=($!)
 sleep 2
-"$TIER_CLI" -p 9399 flushall >/dev/null 2>&1
+"$TIER_CLI" -p "$TIER_PORT" flushall >/dev/null 2>&1
 run_bounded java -cp "$ROOT/jvm-spike/target/classes:$CP" \
     ai.crestway.flintaccel.client.MetricsSuite \
-    http://127.0.0.1:9311 http://127.0.0.1:9308 redis://127.0.0.1:9399 \
+    http://127.0.0.1:9311 http://127.0.0.1:9308 redis://127.0.0.1:$TIER_PORT \
     >/tmp/gate_metrics.log 2>&1
 verdict "JMX metrics, read via MBeanServer (13 checks)" $?
+
+# An immutability declaration should stop the revalidation HEADs. Measured as
+# origin HEAD count across a read taken AFTER the mutable TTL expires --
+# correct bytes or a hit counter would look identical whether or not the
+# declaration did anything.
+run_bounded java -cp "$ROOT/jvm-spike/target/classes:$CP" \
+    ai.crestway.flintaccel.client.ImmutableSuite \
+    http://127.0.0.1:9311 redis://127.0.0.1:$TIER_PORT >/tmp/gate_immutable.log 2>&1
+verdict "immutability declaration skips revalidation (3 checks)" $?
 stop_origin
 
 # A SICK tier -- one that answers slowly rather than dying -- used to make
@@ -251,14 +319,14 @@ stop_origin
 # deliberately the no-tier client, not the healthy one: a cache may be slower
 # than a fast cache, and may never be slower than no cache.
 start_svcs 9310 "--delay-ms 20"
-python3 tools/slow_tier.py --listen 9398 --upstream 9399 --delay-ms 200 \
+python3 tools/slow_tier.py --listen "$SLOW_PORT" --upstream "$TIER_PORT" --delay-ms 200 \
     >/tmp/gate_proxy.log 2>&1 &
 PIDS+=($!)
 sleep 2
-"$TIER_CLI" -p 9399 flushall >/dev/null 2>&1
+"$TIER_CLI" -p "$TIER_PORT" flushall >/dev/null 2>&1
 run_bounded java -cp "$ROOT/jvm-spike/target/classes:$CP" \
     ai.crestway.flintaccel.client.SickTierSuite \
-    http://127.0.0.1:9310 redis://127.0.0.1:9399 redis://127.0.0.1:9398 \
+    http://127.0.0.1:9310 redis://127.0.0.1:$TIER_PORT redis://127.0.0.1:$SLOW_PORT \
     >/tmp/gate_sicktier.log 2>&1
 verdict "sick tier is not slower than NO tier (4 checks)" $?
 stop_origin
@@ -272,21 +340,21 @@ stop_origin
 # than our tier.
 step "iceberg io-impl, end to end (real tables, avro + parquet)"
 start_svcs 9306
-"$TIER_CLI" -p 9399 flushall >/dev/null 2>&1
+"$TIER_CLI" -p "$TIER_PORT" flushall >/dev/null 2>&1
 ( cd jvm-spike && run_bounded mvn -q test-compile ) >/tmp/gate_ice_build.log 2>&1
 run_bounded java -cp "$ROOT/jvm-spike/target/classes:$ROOT/jvm-spike/target/test-classes:$CP_TEST" \
     ai.crestway.flintaccel.iceberg.IcebergSuite \
-    http://127.0.0.1:9306 redis://127.0.0.1:9399 >/tmp/gate_iceberg.log 2>&1
+    http://127.0.0.1:9306 redis://127.0.0.1:$TIER_PORT >/tmp/gate_iceberg.log 2>&1
 verdict "iceberg table read via io-impl, avro + parquet (20 checks)" $?
 stop_origin
 
 # --------------------------------------------------- inherited contract suite
 step "hadoop contract suite (45 tests we did not write)"
 start_svcs 9310
-"$TIER_CLI" -p 9399 flushall >/dev/null 2>&1
+"$TIER_CLI" -p "$TIER_PORT" flushall >/dev/null 2>&1
 ( cd jvm-spike && run_bounded mvn -q test -Dtest=ITestFlintSeek,ITestFlintOpen \
     -DfailIfNoTests=false -Dflint.test.endpoint=http://127.0.0.1:9310 \
-    -Dflint.test.tier=redis://127.0.0.1:9399 ) >/tmp/gate_contract.log 2>&1
+    -Dflint.test.tier=redis://127.0.0.1:$TIER_PORT ) >/tmp/gate_contract.log 2>&1
 verdict "Hadoop AbstractContract{Seek,Open}Test" $?
 stop_origin
 
@@ -295,9 +363,9 @@ step "python path"
 PYENV="${FLINT_PYENV:-$ROOT/python/.venv}"
 if [ -x "$PYENV/bin/python" ]; then
   start_svcs 9401 "--delay-ms 80"
-  "$TIER_CLI" -p 9399 flushall >/dev/null 2>&1
+  "$TIER_CLI" -p "$TIER_PORT" flushall >/dev/null 2>&1
   ( cd python && run_bounded "$PYENV/bin/python" suite.py \
-      http://127.0.0.1:9401 redis://127.0.0.1:9399 ) >/tmp/gate_python.log 2>&1
+      http://127.0.0.1:9401 redis://127.0.0.1:$TIER_PORT ) >/tmp/gate_python.log 2>&1
   verdict "python suite (19 checks)" $?
   stop_origin
 
@@ -308,9 +376,9 @@ if [ -x "$PYENV/bin/python" ]; then
   if "$PYENV/bin/python" -c "import moto, pytest" 2>/dev/null; then
     "$PYENV/bin/python" -m moto.server -p 9810 >/tmp/gate_moto.log 2>&1 &
     PIDS+=($!); sleep 4
-    "$TIER_CLI" -p 9399 flushall >/dev/null 2>&1
+    "$TIER_CLI" -p "$TIER_PORT" flushall >/dev/null 2>&1
     ( cd python && FLINT_TEST_ENDPOINT=http://127.0.0.1:9810 \
-        FLINT_TEST_TIER=redis://127.0.0.1:9399 \
+        FLINT_TEST_TIER=redis://127.0.0.1:$TIER_PORT \
         run_bounded "$PYENV/bin/python" -m pytest test_fsspec_contract.py \
         -q --no-header --deselect \
         test_fsspec_contract.py::TestFlintOpen::test_open_exclusive \
@@ -332,9 +400,14 @@ if [ -x "$PYENV/bin/python" ]; then
   # The drill owns its own origin and tier and shuts BOTH down on exit, so any
   # later stage must start its own. start_svcs does.
   cp "$CP_FILE" /tmp/cp.txt 2>/dev/null
-  FLINT_PYENV="$PYENV" PORT=9407 run_bounded bash "$ROOT/tools/cross_language_drill.sh" \
+  # Its OWN tier port, distinct from the gate's. The drill starts, owns and
+  # shuts down its tier, and now refuses to adopt one it did not start -- so
+  # sharing the gate's port makes it refuse to run at all, correctly. 9400 is
+  # declared and nothing binds it.
+  FLINT_PYENV="$PYENV" PORT=9407 TIER_PORT=9400 \
+    run_bounded bash "$ROOT/tools/cross_language_drill.sh" \
     >/tmp/gate_xlang.log 2>&1
-  verdict "cross-language cache sharing (9 checks)" $?
+  verdict "cross-language cache sharing (16 checks)" $?
 
   # The same SSE-KMS rule on the Python path. Not a duplicate of the JVM
   # stage: the two clients SHARE one tier, so a rule only one of them enforces
@@ -345,9 +418,9 @@ if [ -x "$PYENV/bin/python" ]; then
       >/tmp/gate_origin_9319.log 2>&1 &
   PIDS+=($!)
   sleep 2
-  "$TIER_CLI" -p 9399 flushall >/dev/null 2>&1
+  "$TIER_CLI" -p "$TIER_PORT" flushall >/dev/null 2>&1
   ( cd python && run_bounded "$PYENV/bin/python" sse_kms_suite.py \
-      http://127.0.0.1:9318 http://127.0.0.1:9319 redis://127.0.0.1:9399 \
+      http://127.0.0.1:9318 http://127.0.0.1:9319 redis://127.0.0.1:$TIER_PORT \
     ) >/tmp/gate_ssekms_py.log 2>&1
   verdict "SSE-KMS on the python path (11 checks)" $?
   stop_origin

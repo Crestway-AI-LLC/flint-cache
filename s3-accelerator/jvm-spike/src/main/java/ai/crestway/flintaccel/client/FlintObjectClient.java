@@ -66,6 +66,32 @@ public final class FlintObjectClient implements ObjectClient {
   public final long tierBudgetMs;
   public final long metaTtlSec;
 
+  /**
+   * Objects declared IMMUTABLE revalidate on a much longer TTL.
+   *
+   * D3 splits the cache in two: data addressed by ETag, metadata under a short
+   * TTL. The TTL exists because an object at a path can be replaced, and a
+   * stale length is not merely old -- D12.29 showed it makes reads hit EOF
+   * early, which is worse than a stale value because it looks like truncation.
+   *
+   * But for a format whose files are never rewritten, that revalidation is
+   * pure cost: a HEAD per object per minute, buying protection against a
+   * change that the format guarantees cannot happen. ADR-0023 left this as an
+   * open question; Alluxio's PrestoCacheContext is prior art for the shape of
+   * the answer -- the ENGINE knows facts about the data that the cache cannot
+   * infer, so let it say so.
+   *
+   * A long TTL rather than none. If a caller declares immutability and is
+   * wrong -- deletes a path and writes different bytes there -- an infinite
+   * TTL means permanent wrongness, while a day bounds it. Our own writes
+   * invalidate regardless (D12.29), so the exposure is only to out-of-band
+   * rewrites by another process.
+   */
+  public final long metaTtlImmutableSec;
+  private final boolean immutable;
+
+  private long ttlFor() { return immutable ? metaTtlImmutableSec : metaTtlSec; }
+
   private final ObjectClient origin;
   private final RedisAsyncCommands<byte[], byte[]> tier;
   private final ConcurrentMap<String, CompletableFuture<byte[]>> inflight =
@@ -200,6 +226,16 @@ public final class FlintObjectClient implements ObjectClient {
   public FlintObjectClient(ObjectClient origin, RedisAsyncCommands<byte[], byte[]> tier,
                            int chunkBytes, long tierBudgetMs, long metaTtlSec,
                            boolean bypass, S3AsyncClient raw, boolean cacheKms) {
+    this(origin, tier, chunkBytes, tierBudgetMs, metaTtlSec, bypass, raw, cacheKms,
+        false, 86_400);
+  }
+
+  public FlintObjectClient(ObjectClient origin, RedisAsyncCommands<byte[], byte[]> tier,
+                           int chunkBytes, long tierBudgetMs, long metaTtlSec,
+                           boolean bypass, S3AsyncClient raw, boolean cacheKms,
+                           boolean immutable, long metaTtlImmutableSec) {
+    this.immutable = immutable;
+    this.metaTtlImmutableSec = metaTtlImmutableSec;
     this.bypass = bypass;
     this.origin = origin; this.tier = tier;
     this.chunkBytes = chunkBytes; this.tierBudgetMs = tierBudgetMs;
@@ -412,7 +448,7 @@ public final class FlintObjectClient implements ObjectClient {
             return m;
           }
           try {
-            tier.setex(metaKey(r.getS3Uri()), metaTtlSec,
+            tier.setex(metaKey(r.getS3Uri()), ttlFor(),
                 utf8(m.getContentLength() + "|" + m.getEtag() + "|" + (kms ? "1" : "0")));
           } catch (RuntimeException e) { tierFailures.incrementAndGet(); }
           return m;

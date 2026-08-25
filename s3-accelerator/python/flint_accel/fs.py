@@ -149,6 +149,130 @@ class FlintS3FileSystem(S3FileSystem):
             self._tier_obj.origin = origin      # per-file origin, shared cache
         return self._tier_obj
 
+    def _meta_tier(self):
+        """The tier, for metadata only -- no per-file origin to attach."""
+        if self._redis is None or self._tier_obj is None:
+            try:
+                self._flint_tier(None)
+            except Exception:
+                return None
+        return self._tier_obj
+
+    async def _info(self, path, bucket=None, key=None, refresh=False, version_id=None):
+        """Serve object metadata from the tier.
+
+        MEASURED BEFORE WRITING THIS: six opens over three distinct objects cost
+        nine origin HEADs, and cost nine again against a fully warm tier, with
+        ZERO metadata keys written. The Python path's metadata caching did
+        nothing whatsoever -- FlintTier.head() is never reached, because s3fs
+        resolves details through _info long before our read path runs. D3 says
+        metadata caching carries most of the request saving; this side captured
+        none of it.
+
+        On a miss we issue head_object OURSELVES rather than delegating. s3fs
+        makes the identical call and then discards the encryption headers, so
+        doing it here costs nothing extra and yields the SSE state the cache
+        entry needs (D13.3) from the same round trip -- the same reasoning that
+        put ourHead() on the JVM side.
+        """
+        if refresh or version_id is not None:
+            return await super()._info(path, bucket, key, refresh, version_id)
+        try:
+            b, k, path_version_id = self.split_path(self._strip_protocol(path))
+        except Exception:
+            return await super()._info(path, bucket, key, refresh, version_id)
+        if not b or not k:
+            # buckets and pure prefixes are a listing question, not a HEAD
+            return await super()._info(path, bucket, key, refresh, version_id)
+        if path_version_id is not None:
+            # A version pinned in the path is a DIFFERENT object from the one
+            # our key addresses. Dropping it -- which this did -- serves the
+            # current version's metadata for an explicit version request.
+            return await super()._info(path, bucket, key, refresh, version_id)
+
+        # s3fs answers from its own directory cache BEFORE it ever heads, and
+        # that answer is authoritative about existence: a path absent from a
+        # cached listing is absent. Serving a tier entry ahead of it made
+        # deleted objects reappear -- three fsspec copy tests failed on exactly
+        # that, each asserting a nested file did NOT exist after a
+        # non-recursive copy. Hand the whole case back rather than
+        # reimplementing rules we would only get subtly wrong.
+        if self._ls_from_cache("/".join((b, k))) is not None:
+            return await super()._info(path, bucket, key, refresh, version_id)
+
+        t = self._meta_tier()
+        if t is None:
+            return await super()._info(path, bucket, key, refresh, version_id)
+
+        hit = t.meta_get(b, k)
+        if hit is not None:
+            length, etag, kms = hit
+            # Hand the SSE answer to the read path. Without this it re-probes
+            # with a raw HEAD per object per process (_OriginAdapter.sse), so a
+            # fully warm read still cost one origin HEAD -- the JVM avoids it
+            # the same way, by trusting the entry's third field.
+            t._kms[(b, k)] = kms
+            # LastModified is NOT carried: the entry's three fields are shared
+            # byte-for-byte with the JVM, whose parser reads the third field as
+            # everything after the second separator, so a fourth field would
+            # silently read as "not KMS". "" is what s3fs itself returns when
+            # S3 omits the header.
+            return {"ETag": etag, "LastModified": "", "size": length,
+                    "name": f"{b}/{k}", "type": "file",
+                    "StorageClass": "STANDARD", "VersionId": None,
+                    "ContentType": None}
+
+        try:
+            out = await self._call_s3("head_object", Bucket=b, Key=k, **self.req_kw)
+        except Exception:
+            # Directories, 404s, permission shapes -- anything that is not a
+            # plain object head. s3fs knows how to interpret all of those and we
+            # do not, so hand it back rather than guessing.
+            return await super()._info(path, bucket, key, refresh, version_id)
+
+        kms = (out.get("ServerSideEncryption") or "").lower() == "aws:kms"
+        t.meta_put(b, k, out["ContentLength"], (out.get("ETag") or ""), kms)
+        t._kms[(b, k)] = kms
+        return {"ETag": out.get("ETag", ""), "LastModified": out.get("LastModified", ""),
+                "size": out["ContentLength"], "name": f"{b}/{k}", "type": "file",
+                "StorageClass": out.get("StorageClass", "STANDARD"),
+                "VersionId": out.get("VersionId"),
+                "ContentType": out.get("ContentType")}
+
+    def invalidate_cache(self, path=None):
+        """Drop our tier metadata wherever s3fs drops its own.
+
+        s3fs funnels every mutation -- put, rm, copy, touch -- through here,
+        which makes it the one seam that sees all of them. Our entry has to die
+        with s3fs's: without this, ``exists()`` kept answering True for an
+        object THIS PROCESS had just deleted, and two fsspec copy tests failed
+        asserting a nested file was not there after a non-recursive copy.
+
+        A TTL is not an answer to that. It bounds how long a stale entry can
+        outlive a change made ELSEWHERE, which is the documented D3 contract;
+        it says nothing about a process contradicting itself, and that window
+        is precisely the one a caller can observe.
+
+        ``path=None`` means "forget everything", and s3fs implements it by
+        clearing its own dict. We deliberately do NOT do the equivalent: the
+        tier is SHARED, so flushing it on one client's invalidate would throw
+        away work every other reader paid for. The local memo is cleared and
+        the shared entries are left to their TTL.
+        """
+        super().invalidate_cache(path)
+        t = self._tier_obj
+        if t is None:
+            return
+        if path is None:
+            t._kms.clear()
+            return
+        try:
+            b, k, _v = self.split_path(self._strip_protocol(path))
+        except Exception:
+            return
+        if b and k:
+            t.meta_del(b, k)
+
     def _open(self, path, mode="rb", block_size=None, **kw):
         if "r" not in mode:
             return super()._open(path, mode=mode, block_size=block_size, **kw)

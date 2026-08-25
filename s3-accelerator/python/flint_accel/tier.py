@@ -125,7 +125,66 @@ class FlintTier:
         return f"c1/{self._norm(etag)}/{idx}".encode()
 
     def _mk(self, bucket, key):
-        return f"m/{bucket}/{key}".encode()
+        """Byte-identical to the JVM client's metadata key.
+
+        It was not, and nothing noticed: the JVM wrote m1/s3://bucket/key while
+        this wrote m/bucket/key -- different prefix AND different path form, so
+        the two never shared a metadata entry. The chunk keyspace was unified
+        and verified by a drill; the metadata keyspace was never checked, which
+        is what "we share one tier" quietly meant.
+        """
+        return f"m1/s3://{bucket}/{key}".encode()
+
+    # ------------------------------------------------------- metadata entries
+    # Value format matches the JVM exactly: length|etag|kms, where the third
+    # field is "1" when S3 decrypted the object with KMS. Carrying the answer
+    # WITH the metadata is what stops the SSE-KMS rule depending on which
+    # client happened to populate the entry first.
+    def meta_get(self, bucket, key):
+        """(length, etag, kms) from the tier, or None."""
+        if self.bypass:
+            return None
+        raw = self._guard(self.r.get, self._mk(bucket, key))
+        if not raw:
+            return None
+        try:
+            length, etag, kms = raw.decode().split("|", 2)
+            self.c.meta_hits += 1
+            return int(length), etag, kms == "1"
+        except ValueError:
+            return None
+
+    def meta_del(self, bucket, key):
+        """Forget one object's metadata, because the caller just changed it."""
+        if self.bypass:
+            self._kms.pop((bucket, key), None)
+            return
+        self._guard(self.r.delete, self._mk(bucket, key))
+        self._kms.pop((bucket, key), None)
+
+    def meta_put(self, bucket, key, length, etag, kms):
+        """Cache metadata. Refuses when the SSE state is UNKNOWN.
+
+        Writing an unverified "not encrypted" is worse than writing nothing,
+        because a client that CAN check would then read and trust it -- the
+        same rule the JVM side arrived at, and the reason a client with no way
+        to probe caches no metadata at all.
+        """
+        # Bypass is checked HERE and not only at the call sites, because a
+        # caller that forgets is exactly how this broke: `bypass` is set for
+        # SSE-C (D13), the chunk path honoured it, and _info wrote metadata for
+        # an SSE-C object anyway -- length and etag of bytes the tier is not
+        # allowed to know about. The JVM has this ordering right, testing
+        # bypass in the first line of headObject.
+        if self.bypass:
+            return
+        if kms is None:
+            self.c.kms_undetectable += 1
+            return
+        if kms and not self.cache_kms:
+            return                       # bypass means bypass: no metadata either
+        self._guard(self.r.setex, self._mk(bucket, key), self.meta_ttl_s,
+                    f"{length}|{etag}|{'1' if kms else '0'}".encode())
 
     # ------------------------------------------------------------ metadata
     def head(self, bucket, key):
@@ -138,15 +197,17 @@ class FlintTier:
         raw = self._guard(self.r.get, mk)
         if raw:
             try:
-                length, etag = raw.decode().split("|", 1)
+                length, etag, _kms = raw.decode().split("|", 2)
                 self.c.meta_hits += 1
                 return {"length": int(length), "etag": etag}
             except ValueError:
                 pass
         self.c.meta_misses += 1
         m = self.origin.head(bucket, key)
-        self._guard(self.r.setex, mk, self.meta_ttl_s,
-                    f"{m['length']}|{m['etag']}".encode())
+        # Third field required now. This path has no SSE answer to hand, so it
+        # defers to meta_put's refusal rather than inventing one.
+        self.meta_put(bucket, key, m["length"], m["etag"],
+                      self._is_kms(bucket, key) if hasattr(self.origin, "sse") else None)
         return m
 
     # ------------------------------------------------------------- SSE-KMS

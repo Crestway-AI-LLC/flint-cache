@@ -47,7 +47,15 @@ EXEMPT="6379"
 # binds. A detector that reads its own explanation as evidence is the same
 # defect the comment is warning about, so the exclusion is the honest fix rather
 # than rewording the prose until the regex stops noticing it.
-USED="$(grep -rhoE --exclude=port_exclusivity_check.sh -- \
+# --exclude-dir is not cosmetic. `$ROOT/python` contains `.venv` once anyone
+# has run the Python suites -- and CI creates it there too, before the gate --
+# so this scanned every installed third-party file and read `:0706`, `:1024`,
+# `:5432` out of their text as ports THIS harness binds. 45 phantom ports from
+# the venv against 0 from our own Python. The check has been failing on it in
+# CI since it was written; the numbers were so obviously not ports that the
+# failure read as noise, which is how a red gate stays red.
+USED="$(grep -rhoE --exclude=port_exclusivity_check.sh \
+          --exclude-dir=.venv --exclude-dir=site-packages --exclude-dir=target -- \
           '(--port|--listen|--upstream|-p) ?[0-9]{4}|:[0-9]{4}\b|redis://[^ "]*:[0-9]{4}' \
           "$ROOT/tools" "$ROOT/python" "$ROOT/jvm-spike/src" 2>/dev/null \
         | grep -oE '[0-9]{4}' | sort -un)"

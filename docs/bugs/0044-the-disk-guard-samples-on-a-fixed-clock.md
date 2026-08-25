@@ -157,3 +157,78 @@ One confirmed live defect, one already fixed, one unestablished, one
 superseded — from four commits whose subjects all read as missing fixes. That
 ratio is the argument for checking code over subjects, and it is why the six
 unchecked entries above remain claims rather than findings.
+
+### 2026-08-24 — audit complete: all ten checked against main's CODE
+
+The six remaining entries, checked the same way as the first four. The
+subject-matching list was overstated in both directions: it named commits whose
+defects main had already fixed, and it undersold one whose consequence is worse
+than the commit claims.
+
+| commit | verdict |
+|---|---|
+| `a46228c` match the process, not a mention of its name | **ONE THIRD LIVE.** Both seat-count fixes are superseded and improved on — main uses `fleet_pids`, scoped to the drill's own fleet rather than merely anchored, so it survives a parallel drills stage where the branch's `pgrep` would not. The third change never landed; see Finding 1. |
+| `d932c7c` a blind replace disabled the checks | **PARTLY LIVE.** The `df` splice is absent from main (one `df -h`, correct) and `tenant_remove_drill.sh`'s spliced `fleet_warm` is fixed — `assert_no_continuation_splice` landed under a different name. But `assert_drill_builds_keep_rocks` carried no positive control, and `assert_every_drill_accounted_for` did not exist; see Finding 2. |
+| `f6b4780` min-replicas-to-write is the operator's to set | **SUPERSEDED, one stale comment.** `docs/failover.md:72-82` states the trade more fully than the branch, including the freshly-promoted-master case, and `flint-ctl` never passes the flag unless an operator sets `min-replicas`. Only the code comment still recommended 1 on replicated pairs. Fixed. |
+| `542da86` derive the durable-row count | **NOT LIVE, still fragile.** Main fixed the breakage by correcting the constant 8 to 15 with the breakdown beside it. The branch DERIVES the total from the ids the drill writes, so a layout change names which part moved. Main's number is right today and goes stale the next time the durable layout changes. Open, low priority. |
+| `9f3b868` write-path and capacity regimes | **PARTLY TAKEN, as recorded.** `rocks.rs` knobs and `disk_selffill` landed. `ingest_saturation_drill.sh` and `replica_starvation_drill.sh` are absent from main entirely. A coverage gap, not a live defect. Open. |
+| `247fefc` say what the starvation arms measure | **NOT APPLICABLE** — edits a file main does not have. Its content is worth keeping regardless: arm B's "accepts everything" is the RAW SERVER's bound, not a deployed fleet's, because flintctl defaults `--widowed-grace-ms` to 10 s and the drill passes no such flag. Reading it as a shipped exposure is the error #197 corrected. |
+
+Tally across all ten: two confirmed live and now fixed (`643d12e` as BUG-0045,
+`775911c` as BUG-0046 plus the `-LOADING` fix), one already fixed on main
+before the audit started, one superseded by a different route, one partly live
+and now fixed, one not applicable, and three open as coverage or fragility
+rather than defects. **One in ten of the "missing fixes" was missing in the way
+the subject line implied.** That ratio is the argument for reading code.
+
+#### Finding 1 — rewind_rejoin accused the product of losing writes. FIXED.
+
+`tools/rewind_rejoin_drill.sh` was byte-identical to the branch's pre-fix
+state. `kill` signals the load subshell and `wait` returns when that subshell
+dies; neither stops the `valkey-cli` it already had in flight. That child is
+reparented and its `SET` lands on B after the tip is sampled, so A converges to
+the target it was given, B holds one key more, and the drill reports
+
+    keyspaces diverge after the loaded rejoin (772 vs 773) — the attach
+    replayed or skipped writes
+
+about a rejoin that did nothing wrong. Every observed failure was off by
+exactly one — a straggler's signature, not a replayed span.
+
+**The cost is not a flaky drill. It is a flaky drill that accuses the
+replication path of losing acknowledged data**, so it gets investigated through
+the attach, the cursor translation and the ack accounting, none of which is
+where it lives. Now polls until the tip stops moving. An earlier `BTIP` read
+taken while the load was still running, and overwritten before use, is gone
+too: a dead assignment that samples a moving quantity reads like a measurement
+and invites someone to trust it.
+
+#### Finding 2 — two drills were registered nowhere. FIXED.
+
+Of 114 `tools/*_drill.sh`, 109 were in CORE or CHAOS and three more named in
+the exclusions block. `coproc_family` and `proxy_chain` were in none of the
+three, referenced only in comments, executed by nothing.
+
+The block they slipped past opens with "An absence with no reason beside it is
+indistinguishable from an oversight." It was written to prevent this and could
+not, because nothing checked the list was complete.
+
+**The second-order cost was already being paid.** `proxy_chain` reserves
+6460-6467, and both `loaded_promote` and `loading_visible` were moved off that
+block earlier the same day to avoid colliding with it — during a port-collision
+investigation that had no way to know the claimant was dead.
+
+`EXCLUDED` is now a variable and both drills are in it marked UNVERIFIED, which
+is the honest status: neither has run since ADR-0010 and whether they pass is
+unknown. Running them was attempted and refused — `fleet_guard` found a sibling
+project's fleet on the box, correctly. **They still need a run**, after which
+they either join CORE or get deleted and free the ports.
+`assert_every_drill_accounted_for` closes both directions and positive-controls
+its own matcher, because the earlier attempt at this check reported sixteen
+registered drills as unlisted, one per line of CORE.
+
+#### Still open from this audit
+
+- `542da86`'s derived row count — the constant is correct and will not stay so.
+- `ingest_saturation` and `replica_starvation` — real coverage main lacks.
+- `coproc_family` and `proxy_chain` — run them, then register or delete.

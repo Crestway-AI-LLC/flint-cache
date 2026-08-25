@@ -88,7 +88,6 @@ valkey-cli -p 6406 FLINTPROMOTE 0 2 | grep -q "OK promoted" || { echo "FAIL: pro
 ( i=0; while :; do valkey-cli -p 6406 SET "live:$((i+=1))" "L$i" >/dev/null 2>&1; done ) &
 LOADPID=$!
 for i in $(seq 1 50); do valkey-cli -p 6406 SET "post:$i" "n$i" >/dev/null; done
-BTIP=$(valkey-cli -p 6406 FLINTINFO | tr '\r' '\n' | sed -n 's/^latest_seq://p')
 
 # The mark is flintctl's job in a real fleet (start_pair_nodes writes it via
 # host-mark-reseed); the drill writes the same marker to stay a raw-binary
@@ -111,8 +110,32 @@ grep -q "rewind attach: upstream cursor" "$D/b1.log" || {
   echo "      load (SequenceGap at best, silent replays at worst)"
   exit 1
 }
+# QUIESCE, THEN MEASURE. `kill` signals the load subshell and `wait` returns
+# when that subshell dies — neither stops the valkey-cli it already had in
+# flight. That child is reparented and its SET lands on B AFTER the tip is
+# sampled: A converges to the target it was given, B holds one key more, and
+# the comparison below reports "keyspaces diverge (772 vs 773) — the attach
+# replayed or skipped writes" about a rejoin that did nothing wrong.
+#
+# Every observed failure of that assertion was off by exactly one, which is a
+# straggler's signature and not a replayed span. The cost is not a flaky
+# drill; it is a flaky drill that accuses the replication path of losing
+# acknowledged data, which is the most expensive false positive this suite can
+# produce.
+#
+# So wait for B's tip to STOP MOVING before treating it as a target. Same
+# discipline as the converge gate, and the same shape as fleet_kill waiting
+# for the process to be GONE rather than for a port to look free: never
+# measure a quantity while it is still changing.
 kill "$LOADPID" 2>/dev/null; wait "$LOADPID" 2>/dev/null
-BTIP=$(valkey-cli -p 6406 FLINTINFO | tr '\r' '\n' | sed -n 's/^latest_seq://p')
+BTIP=""
+for _ in $(seq 1 50); do
+  CUR=$(valkey-cli -p 6406 FLINTINFO | tr '\r' '\n' | sed -n 's/^latest_seq://p')
+  [ -n "$CUR" ] && [ "$CUR" = "$BTIP" ] && break
+  BTIP=$CUR
+  sleep 0.1
+done
+[ -n "$BTIP" ] || { echo "FAIL: B's tip could not be read after the load stopped"; exit 1; }
 wait_seq 6405 "$BTIP" || { echo "FAIL: rewound A never converged to B's tip"; exit 1; }
 DA=$(valkey-cli -p 6405 DBSIZE); DB=$(valkey-cli -p 6406 DBSIZE)
 [ "$DA" = "$DB" ] || {

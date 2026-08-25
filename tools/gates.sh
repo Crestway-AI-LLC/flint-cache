@@ -225,6 +225,25 @@ CHAOS="chaos proxy_chaos chaos_unreadable hotkey_chaos"
 #   stop_sweep    FAILS in setup: "fleet B did not start". It declares eight
 #                 ports across two fleets (6317-6321, 7820, 7879, 7889), so a
 #                 collision is the first thing to check. Fix before adding.
+#   coproc_family UNVERIFIED. It has not run since ADR-0010's deploy path
+#                 landed — not in CORE, not in CHAOS, and until now not here
+#                 either, so nothing ran it and nothing said why. Whether it
+#                 passes is unknown. Run it before moving it to CORE.
+#   proxy_chain   UNVERIFIED, same history. It also reserves 6460-6467, and
+#                 loaded_promote and loading_visible were both moved off that
+#                 block to avoid colliding with it — the suite is paying a
+#                 port-allocation tax to a drill nothing executes. Settle it:
+#                 run it and register it, or delete it and free the ports.
+
+# THE LIST ABOVE IS NOW LOAD-BEARING, so it is a variable and not only prose.
+# coproc_family and proxy_chain sat in tools/ registered nowhere for weeks:
+# absent from CORE, absent from CHAOS, and absent from the block above whose
+# own first line says an unexplained absence is indistinguishable from an
+# oversight. The list was written to prevent exactly this and could not,
+# because nothing checked that it was complete. A convention that depends on
+# being remembered will be forgotten; assert_every_drill_accounted_for is what
+# turns it into a check.
+EXCLUDED="backup_s3 fullsync_cap stop_sweep coproc_family proxy_chain"
 
 # FLINT_GATE_STRICT=1 turns a SKIPPED drill into a FAILED one.
 #
@@ -431,9 +450,29 @@ fi
 #
 # A drill declaring its OWN port twice is legal: controller_ha does, harmlessly,
 # because ownership is not ambiguous.
+# IS THIS A REAL CHECKOUT? gates_drill.sh forges a gates.sh into a bare
+# directory holding nothing but tools/gates.sh — no tools/lib, no drills — to
+# test argument dispatch without running the suite recursively. Every
+# drill-scanning assertion is meaningless there, and the ones that predate this
+# helper coped by accident: assert_no_duplicate_drill_ports sourced a
+# drill-ports.sh that was not there, took `command not found` for an empty map,
+# and passed. That is a check passing because it could not run, which is the
+# defect these assertions exist to catch. Say it once, explicitly, and let the
+# missing library be LOUD wherever drills actually are.
+_have_drill_files() {
+  set -- tools/*_drill.sh
+  [ -f "$1" ]
+}
+
 assert_no_duplicate_drill_ports() {
-  . tools/lib/drill-ports.sh
-  local bad d decl used u map
+  _have_drill_files || return 0
+  . tools/lib/drill-ports.sh || {
+    echo "GATES FAILED: tools/lib/drill-ports.sh is missing, but drill files are"
+    echo "      present. The port checks would read an empty map and pass"
+    echo "      without having examined anything."
+    exit 1
+  }
+  local bad d decl used u map f
   map=$(drill_declared_ports)
   bad=$(printf '%s\n' "$map" | sort -n \
     | awk '{c[$1]=c[$1]" "$2} END {for (p in c) {n=split(c[p],a," "); if (n>1) print "    port "p" declared by"c[p]}}')
@@ -457,10 +496,18 @@ assert_no_duplicate_drill_ports() {
   # all 114 files each time -- ~13k scans, and 30s added to every gate run.
   # A check that taxes the gate that heavily is a check someone eventually
   # deletes, so its cost is part of whether it works.
-  local map; map=$(drill_declared_ports)
+  #
+  # It was still being built TWICE — once above for the duplicate half and
+  # again here — so the comment describing the fix outlived the fix. Reuse it.
   bad=""
-  for f in tools/*_drill.sh; do
-    d=$(basename "$f" _drill.sh)
+  for f in tools/*_drill.sh tools/gates.sh; do
+    case "$f" in
+      *_drill.sh) d=$(basename "$f" _drill.sh) ;;
+      # gates.sh is scanned for the same reason it is declared: its
+      # conformance stage binds ports, so a port it uses and does not declare
+      # is the same defect here as in any drill.
+      *)          d=gates-conformance ;;
+    esac
     decl=$(printf '%s\n' "$map" | awk -v d="$d" '$2==d {print $1}' | tr '\n' '|' | sed 's/|$//')
     [ -z "$decl" ] && continue
     # PORT SYNTAX, not "any four-digit number". The first version of this
@@ -576,12 +623,14 @@ assert_no_cross_drill_kill_patterns() {
   local d drill pat owner bad=""
   local portmap="$LOGS/.portmap"
   for drill in tools/*_drill.sh; do
+    [ -f "$drill" ] || continue
     d=$(basename "$drill" _drill.sh)
     sed -e :a -e '/\\$/N; s/\\\n//; ta' "$drill" 2>/dev/null \
       | grep -oE 'fleet_init [^;&|]+' | grep -oE '\b[0-9]{4,5}\b' \
       | while read -r port; do printf '%s %s\n' "$port" "$d"; done
   done > "$portmap"
   for drill in tools/*_drill.sh; do
+    [ -f "$drill" ] || continue
     d=$(basename "$drill" _drill.sh)
     # COMMENTS ARE NOT CALL SITES. controlplane_drill and lease_drill both
     # quote the pattern they used to have, in a comment explaining why it was
@@ -1052,10 +1101,17 @@ assert_server_flags_are_read() {
 # blanket rule would need an allowlist, which is how a check starts drifting
 # from what it means. The rule is that a drill which starts something must say
 # what it owns.
+# gates.sh IS CHECKED TOO, because it was the one file that broke this rule
+# while being exempt from it. Its conformance stage started three seats and
+# declared nothing, and the glob above is the only reason the check stayed
+# quiet — the harness wrote the rule and excluded itself. The fleet_init match
+# tolerates leading whitespace so a declaration inside an `if` block counts;
+# every drill's is unindented, so nothing about them changes.
 assert_spawning_drills_declare_ports() {
   local bad="" f
-  for f in tools/*_drill.sh; do
-    grep -q '^fleet_init' "$f" && continue
+  for f in tools/*_drill.sh tools/gates.sh; do
+    [ -f "$f" ] || continue
+    grep -qE '^[[:space:]]*fleet_init ' "$f" && continue
     grep -qE 'target/release/flint-|flintctl' "$f" || continue
     bad="$bad $f"
   done
@@ -1066,6 +1122,75 @@ assert_spawning_drills_declare_ports() {
   echo "        and its cleanup is scoped to nothing it owns. Add fleet_init with"
   echo "        the drill's own scope and a LITERAL port block."
   FAILED="$FAILED undeclared-ports"
+}
+
+# EVERY DRILL FILE MUST BE ACCOUNTED FOR, and every listed name must exist.
+#
+# The failure this prevents is silence, not noise. coproc_family and
+# proxy_chain sat in tools/ for weeks in neither CORE, CHAOS nor the
+# exclusions block — so nothing ran them, nothing reported them, and the only
+# visible trace was proxy_chain's 6460-6467 being honoured by the port
+# allocator on behalf of a drill that never executes. A drill that is never
+# run is worse than a deleted one: it looks like coverage.
+#
+# The other direction matters too. A name listed with no file behind it makes
+# CORE claim coverage the tree cannot deliver, and the runner skips it without
+# comment.
+#
+# FLATTENED BEFORE MATCHING, and this is the whole trap. CORE is a multi-line
+# string, and `case " $CORE " in *" $name "*)` cannot see a name whose next
+# character is a newline — the first version of this check reported sixteen
+# perfectly-registered drills as unlisted, one per line of CORE. A hand-check
+# had passed it only because the hand-check piped CORE through `tr` first and
+# so tested different code than shipped. Hence the positive control below,
+# against a SYNTHETIC list with a name at the end of a line: a real drill name
+# would pass for the wrong reason the day someone reorders CORE.
+assert_every_drill_accounted_for() {
+  local flat name f missing="" orphan=""
+  # Nothing to say about a tree with no drills in it; see _have_drill_files.
+  # Abstaining is not the same as passing, so it is stated rather than silent.
+  _have_drill_files || { echo "  (no drill files in this tree — registration check abstains)"; return 0; }
+  flat=" $(printf '%s %s %s' "$CORE" "$CHAOS" "$EXCLUDED" | tr '\n' ' ') "
+
+  # POSITIVE CONTROL: prove the matcher can see a name that ends a line.
+  local probe
+  probe=" $(printf 'alpha beta\ngamma delta' | tr '\n' ' ') "
+  case "$probe" in
+    *" beta "*) : ;;
+    *) echo "GATES FAILED: assert_every_drill_accounted_for's matcher cannot see"
+       echo "      a name at the end of a line — the check would report every"
+       echo "      such drill as unregistered. Refusing to report a verdict."
+       exit 1 ;;
+  esac
+  case "$probe" in
+    *" epsilon "*)
+       echo "GATES FAILED: assert_every_drill_accounted_for's matcher matched a"
+       echo "      name that is not in the list. Refusing to report a verdict."
+       exit 1 ;;
+  esac
+
+  for f in tools/*_drill.sh; do
+    [ -f "$f" ] || continue
+    name=$(basename "$f" _drill.sh)
+    case "$flat" in *" $name "*) : ;; *) missing="$missing $name" ;; esac
+  done
+  for name in $flat; do
+    [ -f "tools/${name}_drill.sh" ] || orphan="$orphan $name"
+  done
+
+  if [ -n "$missing" ]; then
+    echo "GATES FAILED: drill file(s) in neither CORE, CHAOS nor EXCLUDED:$missing"
+    echo "      Nothing runs them and nothing says why. Add to CORE if they"
+    echo "      pass, or to EXCLUDED with the reason — an absence with no"
+    echo "      reason beside it is indistinguishable from an oversight."
+    exit 1
+  fi
+  if [ -n "$orphan" ]; then
+    echo "GATES FAILED: listed name(s) with no drill file:$orphan"
+    echo "      CORE claims coverage the tree cannot deliver, and the runner"
+    echo "      skips the name without comment."
+    exit 1
+  fi
 }
 
 # docs/bugs/0025: `recover_migrations` completes a slot flip onto a destination
@@ -1194,28 +1319,43 @@ fi
 if want conformance; then
   echo "== conformance: valkey (oracle), flint mem, flint rocks"
   CDIR=$(mktemp -d "${FLINT_DRILL_ROOT:-/tmp}/flint-gate-conf.XXXXXX")
+  # DECLARE THE PORTS BEFORE BINDING THEM. This block is the one part of the
+  # harness that started seats without telling fleet_init, which is exactly
+  # what assert_spawning_drills_declare_ports refuses in a drill -- and that
+  # check scans tools/*_drill.sh, so gates.sh was excluded from its own rule
+  # by the glob. Sequential ordering hid it: conformance finishes before
+  # the drills stage, so its overlap with edge_reroute (6398-6401) and
+  # fullsync_rate (6395, 6397) could not fire. It became reachable the day the
+  # drills stage went parallel.
+  . tools/lib/fleet.sh
+  fleet_init "$CDIR" 6390 6389 6388
+  fleet_guard
   # Each target starts inside its own subshell so THIS shell never owns it as
   # a job: a shell that owns a background job announces how it died, and
   # "Killed: 9" lines interleaved with the results make a clean gate look
   # like something went wrong.
-  ( valkey-server --port 6399 --save '' --appendonly no --daemonize no \
-      >"$LOGS/valkey.log" 2>&1 & )
-  ( ./target/release/flint-server --port 6398 --engine mem \
-      >"$LOGS/conf-mem.log" 2>&1 & )
-  ( ./target/release/flint-server --port 6397 --engine rocks --data-dir "$CDIR/rocks" \
-      >"$LOGS/conf-rocks.log" 2>&1 & )
-  for p in 6399 6398 6397; do
+  #
+  # The subshell also costs us $! in this shell, so each one records its own
+  # child's pid. Teardown needs it: stopping by PORT stops whatever answers on
+  # that port, which is not necessarily what we started.
+  ( valkey-server --port 6390 --save '' --appendonly no --daemonize no \
+      >"$LOGS/valkey.log" 2>&1 & echo $! >"$CDIR/oracle.pid" )
+  ( ./target/release/flint-server --port 6389 --engine mem \
+      >"$LOGS/conf-mem.log" 2>&1 & echo $! >"$CDIR/mem.pid" )
+  ( ./target/release/flint-server --port 6388 --engine rocks --data-dir "$CDIR/rocks" \
+      >"$LOGS/conf-rocks.log" 2>&1 & echo $! >"$CDIR/rocks.pid" )
+  for p in 6390 6389 6388; do
     for _ in $(seq 1 100); do
       [ "$(valkey-cli -p $p PING 2>/dev/null)" = "PONG" ] && break
       sleep 0.1
     done
   done
   step "conformance oracle" conf-oracle \
-    ./target/release/flint-conformance --target 127.0.0.1:6399 --reference
+    ./target/release/flint-conformance --target 127.0.0.1:6390 --reference
   step "conformance mem" conf-mem-run \
-    ./target/release/flint-conformance --target 127.0.0.1:6398
+    ./target/release/flint-conformance --target 127.0.0.1:6389
   step "conformance rocks" conf-rocks-run \
-    ./target/release/flint-conformance --target 127.0.0.1:6397
+    ./target/release/flint-conformance --target 127.0.0.1:6388
   # RESP3, which until now was never gated at all — and it is the dialect
   # redis-py 8 and node-redis negotiate BY DEFAULT, so the protocol most
   # clients actually speak had less coverage than the one they don't.
@@ -1227,19 +1367,42 @@ if want conformance; then
   # means the folding in `Client::normalize` matches Valkey, and only then
   # does a green Flint run mean anything.
   step "conformance oracle (RESP3)" conf-oracle3 \
-    ./target/release/flint-conformance --target 127.0.0.1:6399 --reference --proto 3
+    ./target/release/flint-conformance --target 127.0.0.1:6390 --reference --proto 3
   step "conformance mem (RESP3)" conf-mem3-run \
-    ./target/release/flint-conformance --target 127.0.0.1:6398 --proto 3
+    ./target/release/flint-conformance --target 127.0.0.1:6389 --proto 3
   step "conformance rocks (RESP3)" conf-rocks3-run \
-    ./target/release/flint-conformance --target 127.0.0.1:6397 --proto 3
+    ./target/release/flint-conformance --target 127.0.0.1:6388 --proto 3
   grep -h '^overall:' "$LOGS"/conf-*-run.log "$LOGS"/conf-oracle.log \
     "$LOGS"/conf-oracle3.log 2>/dev/null | sed 's/^/      /'
-  for p in 6399 6398 6397; do valkey-cli -p $p SHUTDOWN NOSAVE >/dev/null 2>&1; done
-  sleep 0.3
+  # STOP WHAT WE STARTED, NOT WHAT ANSWERS. `valkey-cli -p P SHUTDOWN` is a
+  # broadcast wearing the clothes of a cleanup: it stops whichever process
+  # holds P. A neighbouring harness in this repo does the same thing to 6399
+  # -- and FLUSHALLs it besides -- so the two teardowns can stop each other's
+  # seats. The collision that leaves the process UP is the expensive one: an
+  # emptied replica presents as lost acknowledged data, and gets investigated
+  # through replication rather than through the harness.
+  #
+  # So speak to the port ONLY while our own pid still holds it. If our pid is
+  # gone, whatever is answering there belongs to somebody else.
+  conf_stop() {   # conf_stop <port> <pidfile>
+    local _p _t
+    _p=$(cat "$2" 2>/dev/null)
+    case "$_p" in ''|*[!0-9]*) return 0 ;; esac
+    kill -0 "$_p" 2>/dev/null || return 0
+    # Graceful first: rocks wants a clean close, and SHUTDOWN gives it one.
+    valkey-cli -p "$1" SHUTDOWN NOSAVE >/dev/null 2>&1
+    _t=$(( $(date +%s) + 5 ))
+    while kill -0 "$_p" 2>/dev/null; do
+      [ "$(date +%s)" -ge "$_t" ] && { kill -9 "$_p" 2>/dev/null; break; }
+      sleep 0.05
+    done
+  }
+  conf_stop 6390 "$CDIR/oracle.pid"
+  conf_stop 6389 "$CDIR/mem.pid"
+  conf_stop 6388 "$CDIR/rocks.pid"
   # Belt and braces: SHUTDOWN is a request, and a wedged process would
-  # otherwise be inherited by the drills as a foreign fleet.
-  . tools/lib/fleet.sh
-  fleet_init "$CDIR" 6398 6397
+  # otherwise be inherited by the drills as a foreign fleet. Scoped to this
+  # block's own fleet, which fleet_init declared at the top.
   fleet_kill server
   rm -rf "$CDIR"
 fi
@@ -1363,9 +1526,36 @@ PY_INNER
   exit 1
 }
 
+# The predicate, factored out of the loop so it can be PROVED rather than
+# trusted. This check reports nothing when it is working and nothing when it is
+# broken, and it has been broken before: a stray edit once routed its input
+# through df's output, so it could not flag anything and said nothing for two
+# days. A guard whose silence is indistinguishable from its success is not a
+# guard.
+_drill_drops_rocks() {   # joined drill text on stdin; rc 0 = rebuilds without rocks
+  grep 'cargo build.*-p flint-server' | grep -qv 'rocks'
+}
+
 assert_drill_builds_keep_rocks() {
   local bad=""
+  # POSITIVE CONTROL, both directions, before scanning anything.
+  printf '%s\n' 'cargo build --release -q -p flint-server' | _drill_drops_rocks || {
+    echo "GATES FAILED: assert_drill_builds_keep_rocks did not flag a build line"
+    echo "      that plainly drops rocks. The check is broken; its silence on"
+    echo "      the real drills would mean nothing. Refusing to report."
+    exit 1
+  }
+  printf '%s\n' 'cargo build --release -q -p flint-server --features flint-server/rocks' \
+    | _drill_drops_rocks && {
+    echo "GATES FAILED: assert_drill_builds_keep_rocks flagged a build line that"
+    echo "      DOES keep rocks. The check is broken in the other direction and"
+    echo "      would fail healthy drills. Refusing to report."
+    exit 1
+  }
   for f in tools/*_drill.sh; do
+    # An unmatched glob arrives here as the literal pattern; see
+    # _have_drill_files for why that state is reachable at all.
+    [ -f "$f" ] || continue
     # Strip whole-line comments BEFORE matching, then join backslash
     # continuations — most of these build lines wrap. Without the strip,
     # a comment that merely quotes a build command is flagged as one
@@ -1376,8 +1566,7 @@ assert_drill_builds_keep_rocks() {
     # `--features rocks` and `--features flint-server/rocks` are equivalent
     # when -p flint-server is the selected package, and drills use both.
     # The rule is simply: if it rebuilds flint-server, it must say rocks.
-    echo "$joined" | grep 'cargo build.*-p flint-server' | grep -qv 'rocks' \
-      && bad="$bad $f"
+    printf '%s\n' "$joined" | _drill_drops_rocks && bad="$bad $f"
   done
   [ -z "$bad" ] && return 0
   echo "GATES FAILED: drill(s) rebuild flint-server WITHOUT flint-server/rocks:"
@@ -1402,6 +1591,7 @@ if want drills; then
   # zombie that broke the parallel gate had neither marker, which is why one
   # of them alone would not have caught it.
   assert_no_duplicate_drill_ports
+  assert_every_drill_accounted_for
   assert_declared_scopes_cover_data_dirs
   LEAKCHECK=1
   run_core_drills

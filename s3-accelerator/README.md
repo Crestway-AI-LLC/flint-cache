@@ -130,6 +130,26 @@ assumed to be zero.
 | tier timeout | `fs.s3a.flint.tier.budget.ms` | `flint.tier.budget.ms` | `tier_budget_s` | 50 ms |
 | metadata TTL | `fs.s3a.flint.meta.ttl.seconds` | `flint.meta.ttl.seconds` | `meta_ttl_s` | 60 s |
 | cache SSE-KMS | `fs.s3a.flint.cache.sse-kms` | `flint.cache.sse-kms` | `cache_sse_kms` | `false` |
+| declare immutable | `fs.s3a.flint.immutable` | `flint.immutable` | — | `false` (**`true`** on the Iceberg path) |
+| immutable TTL | `fs.s3a.flint.meta.ttl.immutable.seconds` | `flint.meta.ttl.immutable.seconds` | — | 86400 s |
+
+**Immutability is a declaration the engine can make and the cache cannot
+infer.** Metadata normally revalidates on a 60 s TTL, because an object at a
+path can be replaced and a stale *length* makes reads hit EOF early — which
+looks like truncation, not staleness. If your data is write-once, that
+revalidation is a HEAD per object per minute guarding against something that
+cannot happen.
+
+The Iceberg path declares it **by default**, because the format guarantees it:
+Iceberg never rewrites a file — data files, manifests, manifest lists and
+metadata JSON are all write-once, and a change is a new file plus a commit. An
+arbitrary `s3a://` path carries no such promise, so that path keeps the short
+TTL unless you opt in.
+
+It is a long TTL, not an infinite one. If you declare immutability and are
+wrong — delete a path and write different bytes there out-of-band — a day
+bounds the damage where "never revalidate" would not. Writes made *through*
+this library invalidate regardless.
 
 Any tier failure — down, slow, or lying — degrades to a plain S3 read inside
 the budget. The tier is an optimisation and is written as one.

@@ -18,12 +18,29 @@
 # list with a trailing backslash, and reading only the first physical line
 # silently drops every port after the break — an under-count that reads exactly
 # like "no collision".
+# gates.sh IS IN THE LIST, and is not a drill. Its conformance stage starts
+# three seats and so claims ports exactly as a drill does. Left out, the
+# collision checks could not see the harness's own claims: conformance sat on
+# 6397-6399, inside edge_reroute's 6398-6401 and on fullsync_rate's 6397, and
+# no check could say so because nothing scanned the file the claim was in.
+#
+# ANCHORED, and that is not cosmetic. The unanchored match reported gates.sh as
+# declaring 7001 — picked out of assert_no_default_ports, whose grep PATTERN
+# contains the literal text `fleet_init .*(7001|7002|7379|7500)`. A scanner
+# that reads its own sibling check's regex as a declaration would mark the
+# default ports claimed and collide with every drill that legitimately uses
+# them. Requiring the line to BEGIN with fleet_init (indented or not) is what
+# separates a declaration from a mention of one.
 drill_declared_ports() {
   local dir="${1:-tools}" f d
-  for f in "$dir"/*_drill.sh; do
+  for f in "$dir"/*_drill.sh "$dir"/gates.sh; do
     [ -f "$f" ] || continue
-    d=$(basename "$f" _drill.sh)
+    case "$f" in
+      *_drill.sh) d=$(basename "$f" _drill.sh) ;;
+      *)          d=gates-conformance ;;
+    esac
     sed -e :a -e '/\\$/N; s/\\\n//; ta' "$f" 2>/dev/null \
+      | grep -E '^[[:space:]]*fleet_init ' \
       | grep -oE 'fleet_init [^;&|]+' \
       | grep -oE '\b[0-9]{4,5}\b' \
       | sort -u \

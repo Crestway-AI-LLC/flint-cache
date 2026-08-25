@@ -30,11 +30,22 @@ public final class CrossLangProbe {
             software.amazon.awssdk.auth.credentials.StaticCredentialsProvider.create(
                 AwsBasicCredentials.create("x", "x")))
         .forcePathStyle(true).build();
-    RedisClient rc = RedisClient.create("redis://127.0.0.1:9399");
+    // Takes the tier URI like every sibling suite does. It was the one
+    // hardcode left, so the drill's TIER_PORT moved the tier while this probe
+    // kept dialling 9399 -- which on a busy machine is not a connection error
+    // but a DIFFERENT tier that happens to be listening.
+    String tierUri = args.length > 4 ? args[4] : "redis://127.0.0.1:9399";
+    RedisClient rc = RedisClient.create(tierUri);
     StatefulRedisConnection<byte[], byte[]> cn = rc.connect(new ByteArrayCodec());
 
     try (var sdk = new S3SdkObjectClient(s3, false)) {
-      var c = new FlintObjectClient(sdk, cn.async(), 64 * 1024, 50, 2, false, s3, false);
+      // metaTtlSec was 2, which was harmless while nothing observed metadata
+      // and wrong the moment the drill started asserting it: JVM startup plus
+      // the read plus the shell's own --scan runs well past two seconds, so
+      // the entry expired before anyone looked and the drill reported "the JVM
+      // writes no metadata". It measured this constant, not the product.
+      long metaTtl = args.length > 5 ? Long.parseLong(args[5]) : 300;
+      var c = new FlintObjectClient(sdk, cn.async(), 64 * 1024, 50, metaTtl, false, s3, false);
       try (var f = new S3SeekableInputStreamFactory(c, S3SeekableInputStreamConfiguration.DEFAULT);
            var in = f.createStream(S3URI.of(bucket, key))) {
         byte[] b = new byte[len];
