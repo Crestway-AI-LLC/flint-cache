@@ -171,6 +171,24 @@ _gate_prune_runs 20
 # changed on 2026-07-17 (fixed, 432a5d5), and the reply-assertion sweep found
 # discarded writes throughout. A drill outside the gate rots, and rots
 # silently.
+# DRILLS THAT CANNOT SHARE THE BOX, and why this is a list rather than a fix.
+#
+# Everything else in CORE is isolated by construction: its own ports, its own
+# scope directory, its own seats. These two are not, because the thing they
+# ASSERT ON is global — free space on the runner's disk. disk_selffill fills a
+# volume and requires the guard to refuse writes before the volume is full;
+# disk_pressure requires a write to be ACCEPTED while space remains. Five
+# concurrent RocksDB drills moving the free-space number underneath either one
+# makes it read a value that is not about itself.
+#
+# Observed rather than theorised: both PASS serially and both PASS in one P=6
+# run and FAIL in another — disk_pressure 4.3s/4.8s/FAIL, disk_selffill
+# 23.7s/44.2s/FAIL. Intermittent in exactly the way a shared-resource
+# assertion is, and no amount of waiting fixes it, unlike reseed's timing race.
+#
+# So they run ALONE, before the parallel batch. Costs ~30s of the ~12 minutes.
+CORE_EXCLUSIVE="${FLINT_CORE_EXCLUSIVE:-disk_pressure disk_selffill}"
+
 CORE="${FLINT_CORE_ORDER:-restart repl failover proxy slot_migrate slot_map rebalance_execute
       bloom ns_escape coproc_cred coproc_channel family_route family_route_cp coproc_forward coproc_budget coproc_exempt coproc_vec coproc_vec_tls coproc_vec_rebuild
       tenant_quota token_rotation cert_reload_fleet controlplane_ha
@@ -605,6 +623,26 @@ run_core_drills() {
   step "prebuild" "drill-prebuild" \
     cargo build --release -q --workspace --features flint-server/rocks,flint-backup/rocks
 
+  # EXCLUSIVE FIRST, one at a time, through the same step() the serial path
+  # uses so their accounting is identical. Filtered out of the parallel batch
+  # below rather than merely ordered ahead of it — running them alone only
+  # helps if nothing else is running.
+  local par="" d_
+  for d_ in $CORE; do
+    case " $CORE_EXCLUSIVE " in
+      *" $d_ "*) ;;
+      *) par="$par $d_" ;;
+    esac
+  done
+  local excl=""
+  for d_ in $CORE_EXCLUSIVE; do
+    case " $CORE " in *" $d_ "*) excl="$excl $d_" ;; esac
+  done
+  if [ -n "$excl" ]; then
+    echo "  ==$(printf ' %s' $excl) run ALONE (they assert on shared disk state)"
+    for d_ in $excl; do step "$d_" "drill-$d_" bash "tools/${d_}_drill.sh"; done
+  fi
+  CORE="$par"
   echo "   $(printf '%s\n' $CORE | grep -c .) drills, $GATE_JOBS at a time"
   local res="$LOGS/.par"; rm -rf "$res"; mkdir -p "$res"
   # The worker is a FILE, not a function shipped through `xargs bash -c`:
