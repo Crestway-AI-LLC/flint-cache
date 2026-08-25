@@ -551,7 +551,7 @@ assert_no_duplicate_drill_ports() {
 #
 # Truncation is only a defect when the prefix reaches ANOTHER drill's declared
 # ports; a drill sweeping its own range is a legitimate idiom and stays legal.
-# EVERY DATA DIR A DRILL CREATES MUST SIT UNDER A SCOPE IT DECLARES (BUG-0047).
+# EVERY DATA DIR THE SUITE CREATES MUST SIT UNDER A SCOPE ITS FILE DECLARES.
 #
 # The harness attributes a seat to a drill two ways: the scope prefix from
 # `fleet_init`, or a port the same line declares. A seat matching neither is
@@ -571,46 +571,119 @@ assert_no_duplicate_drill_ports() {
 # name nobody declared reintroduces the bug, and would again present as one
 # unrelated drill failing only in parallel.
 assert_declared_scopes_cover_data_dirs() {
-  local drill d decl used bad="" hit seen=0
-  for drill in tools/*_drill.sh; do
-    d=$(basename "$drill" _drill.sh)
-    decl=$(grep -hE '^fleet_init' "$drill" 2>/dev/null | awk '{print $2}' | sed 's|.*/||')
-    [ -n "$decl" ] || continue
-    used=$(grep -oE 'mktemp -d "?\$\{?FLINT_DRILL_ROOT\}?/[A-Za-z0-9_.-]+' "$drill" 2>/dev/null | sed 's|.*/||')
-    for u in $used; do
-      seen=$((seen + 1))
-      hit=0
-      for p in $decl; do case "$u" in "$p"*) hit=1 ;; esac; done
-      [ "$hit" = 0 ] && bad="$bad
-    $d: creates '$u', declares $(echo $decl)"
-    done
-  done
-  # ARMED. If the extractor matches nothing — a changed mktemp idiom, a broken
-  # regex, a rename — then every drill trivially satisfies "no dir outside its
-  # declared scope" and this returns clean. That is exactly how a peer's port
-  # check lied to them today: the pattern encoded its own answer, so it could
-  # not fail. A check that cannot fail is not a check; refuse to pass on zero.
-  local ndrills; ndrills=$(ls tools/*_drill.sh 2>/dev/null | wc -l | tr -d " ")
-  # ONLY when there was something to scan. gates_drill.sh forges a tree whose
-  # `step` is stubbed and runs a COPY of this script there — it has to, since
-  # the gate runs that drill and an invocation reaching a real stage would run
-  # the suite from inside itself. That tree holds no *_drill.sh, so an empty
-  # scan is the correct answer, not a broken parser.
-  #
-  # The first cut of this guard keyed on "$seen -eq 0" alone and failed the
-  # forged run, which turned the drill's own positive control red. Caught by
-  # the full gate, not by the unit checks, because the unit checks only ever
-  # ran in a tree that has drills — the guard was untestable in the one
-  # environment where it was wrong.
-  if [ "$seen" -eq 0 ] && [ "${ndrills:-0}" -gt 0 ]; then
-    echo "FAIL  the data-dir scan matched NOTHING across $ndrills drills."
-    echo "        That is not a clean bill of health — the extractor is broken,"
-    echo "        or the mktemp idiom it keys on has changed. Fix the parser."
+  local out rc
+  out=$(python3 - <<'PY'
+import glob, os, re, sys
+
+# gates.sh IS SCANNED TOO. Its conformance stage mktemps a data dir under
+# FLINT_DRILL_ROOT exactly as a drill does, and the tools/*_drill.sh glob was
+# the only thing exempting it -- the same self-exemption
+# assert_spawning_drills_declare_ports had to close in this file, for the same
+# reason. A peer hit the identical shape from the other side: their duplicate
+# -port check sourced a lib absent from the forged sandbox, built an empty map,
+# and reported "no duplicates" on every run for as long as it existed. A scan's
+# own coverage is the thing that has to be asserted, never assumed.
+files = sorted(glob.glob("tools/*_drill.sh")) + ["tools/gates.sh"]
+
+# TWO IDIOMS, which is why widening the glob was not a one-word edit. Every
+# drill writes the literal `fleet_init $FLINT_DRILL_ROOT/flint-foo-` and
+# mktemps `$FLINT_DRILL_ROOT/flint-foo-m.XXXXXX`, so a prefix test decides it.
+# gates.sh instead declares `fleet_init "$CDIR"` -- the variable it just
+# mktemped into. That is a STRONGER statement than any prefix, the declared
+# scope IS the directory, but a prefix test reads it as the string `"$CDIR"`
+# and calls it a violation. Resolving the variable is what makes the widened
+# check true rather than merely louder.
+#
+# The template pattern also has to tolerate `${FLINT_DRILL_ROOT:-/tmp}`, which
+# only gates.sh writes. Without that branch, adding gates.sh to the list scans
+# it, matches nothing, and reports it clean -- a vacuous pass wearing the
+# costume of new coverage, which is worse than the exemption it replaced.
+MK   = re.compile(r'(?:([A-Za-z_][A-Za-z0-9_]*)=\$\()?'
+                  r'mktemp -d "?\$\{?FLINT_DRILL_ROOT(?::-[^}]*)?\}?/([A-Za-z0-9_.-]+)')
+INIT = re.compile(r'^[ \t]*fleet_init[ \t]+(\S+)', re.M)
+VAR  = re.compile(r'^\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?$')
+
+bad, seen_drills, seen_gates, ndrills = [], 0, 0, 0
+for f in files:
+    if not os.path.isfile(f):
+        continue
+    is_gates = os.path.basename(f) == "gates.sh"
+    if not is_gates:
+        ndrills += 1
+    src = open(f, errors="replace").read()
+
+    prefixes, varnames = [], set()
+    for tok in INIT.findall(src):
+        t = tok.strip('"').strip("'")
+        m = VAR.match(t)
+        if m:
+            varnames.add(m.group(1))
+        else:
+            prefixes.append(t.rsplit("/", 1)[-1])
+    if not prefixes and not varnames:
+        continue
+
+    for var, d in MK.findall(src):
+        if is_gates:
+            seen_gates += 1
+        else:
+            seen_drills += 1
+        if var and var in varnames:
+            continue
+        if any(p and d.startswith(p) for p in prefixes):
+            continue
+        decl = " ".join(sorted(prefixes) + sorted("$" + v for v in varnames))
+        bad.append("%s: creates '%s', declares %s" % (os.path.basename(f), d, decl))
+
+# ARMED IN TWO INDEPENDENT PLACES, because one total is satisfiable by the
+# wrong file. The moment gates.sh joined the list its own mktemp alone would
+# hold any single count above zero forever, so a drill-side parser break would
+# hide behind it: the guard would keep reporting "saw something" while seeing
+# nothing that mattered. Splitting the counts is what keeps each side honest.
+#
+# gates_drill.sh forges a tree whose `step` is stubbed and runs a COPY of this
+# script there -- it has to, since the gate runs that drill and an invocation
+# reaching a real stage would run the suite from inside itself. That tree holds
+# no *_drill.sh, so an empty drill-side scan is the correct answer there, not a
+# broken parser. The first cut of this guard keyed on a bare zero and failed
+# the forged run, turning the drill's own positive control red.
+if ndrills and not seen_drills:
+    print("the data-dir scan matched NOTHING across %d drills." % ndrills)
+    print("  That is not a clean bill of health: the extractor is broken, or")
+    print("  the mktemp idiom it keys on has changed. Fix the parser.")
+    sys.exit(2)
+
+# THE SECOND ANCHOR IS THE ONE THAT SURVIVES THE FORGED TREE. gates.sh's
+# conformance stage mktemps exactly one dir under FLINT_DRILL_ROOT -- a fact
+# about the very file this code lives in, so the scan can be held against a
+# ground truth rather than against a count that only proves the loop ran. It is
+# also the only arming that works where there are no drills at all, which is
+# precisely the environment the guard above must stay silent in.
+#
+# If conformance legitimately stops creating one, this fires and the anchor is
+# retired on purpose. That is the intent: a check whose own assumption has
+# moved should demand a decision, not go quiet.
+if os.path.isfile("tools/gates.sh") and not seen_gates:
+    print("the scan found no FLINT_DRILL_ROOT data dir in tools/gates.sh,")
+    print("  whose conformance stage creates one. Either the extractor broke,")
+    print("  or conformance changed -- retire this anchor deliberately.")
+    sys.exit(2)
+
+if bad:
+    for b in bad:
+        print(b)
+    sys.exit(1)
+PY
+  )
+  rc=$?
+  [ "$rc" = 0 ] && return 0
+  if [ "$rc" = 2 ]; then
+    echo "$out" | sed '1s/^/FAIL  /; 2,$s/^/      /'
     FAILED="$FAILED unscoped-data-dir-scan-empty"
     return 0
   fi
-  [ -z "$bad" ] && return 0
-  echo "FAIL  data dir(s) outside every scope the drill declares:$bad"
+  echo "FAIL  data dir(s) outside every scope the file declares:"
+  echo "$out" | sed 's/^/        /'
   echo "        The harness can only attribute a seat by its fleet_init scope"
   echo "        prefix or a declared port. One matching neither is invisible to"
   echo "        the leak check and unkillable by it — which is exactly how"
