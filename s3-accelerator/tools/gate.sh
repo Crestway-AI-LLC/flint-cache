@@ -46,7 +46,22 @@ cleanup() {
   # abnormal exit left a tier holding the port indefinitely and the NEXT run
   # adopted it.
   [ -n "${TIER_PID:-}" ] && kill "$TIER_PID" 2>/dev/null
-  # Prove it, rather than assume the kills landed.
+  # Prove it, rather than assume the kills landed -- and proving it means
+  # WAITING for them to land. `kill` returns once the signal is queued, not
+  # once the process is gone, so scanning straight afterwards samples the
+  # process table mid-exit and reports a leak that is already exiting. A
+  # passing gate that ends with a false "1 PROCESS LEFT" teaches the reader to
+  # skip the line, which is how the real leak this check exists for gets
+  # missed.
+  local w p alive
+  for w in $(seq 1 30); do
+    alive=0
+    for p in "${PIDS[@]:-}" "${TIER_PID:-}"; do
+      [ -n "$p" ] && kill -0 "$p" 2>/dev/null && alive=1
+    done
+    [ "$alive" = 0 ] && break
+    sleep 0.1
+  done
   local left
   # Attribute a leaked process to THIS gate by something this gate declared --
   # our own fixture script names, or a tier server on one of OUR ports. Two
