@@ -1171,6 +1171,41 @@ assert_server_flags_are_read() {
 # quiet — the harness wrote the rule and excluded itself. The fleet_init match
 # tolerates leading whitespace so a declaration inside an `if` block counts;
 # every drill's is unindented, so nothing about them changes.
+# THE GATE MUST BE EXECUTABLE, because CI runs it as `tools/gates.sh` and not
+# as `bash tools/gates.sh`. Losing the mode bit is a silent, total failure: the
+# runner exits 126 in under a minute, before a single stage, and every leg goes
+# red at once with nothing in the log resembling a test result.
+#
+# It is invisible locally for the same reason it is easy to cause. Every local
+# invocation in this repo -- this drill, gates_drill.sh's forged copy, the
+# habit of typing `bash tools/gates.sh` to skip a shebang question -- supplies
+# the interpreter and so never consults the bit. A rewrite-in-place that
+# replaces the file rather than editing it (awk into a temp, then mv) drops the
+# mode, passes every local check, and fails only on the runner.
+#
+# Checking it from inside the script cannot help CI, which already failed to
+# start. It is for the machine where the damage is done: `bash tools/gates.sh`
+# still runs here, reaches this line, and refuses before the push.
+assert_gate_is_executable() {
+  # ASK GIT, NOT THE FILESYSTEM. The bit that matters is the one that gets
+  # pushed: a working tree can be +x while the index still records 100644, and
+  # that is the version the runner checks out. It also makes the check inert
+  # exactly where it should be -- gates_drill.sh forges a tree that is not a
+  # git repo and writes its gates.sh copy with an awk redirect, so an on-disk
+  # test would fail that copy for a mode the drill never intended to set, and
+  # turn the drill's own positive control red. git ls-files answers nothing
+  # there, and nothing is the right answer.
+  local mode
+  mode=$(git ls-files -s tools/gates.sh 2>/dev/null | awk '{print $1}')
+  [ -z "$mode" ] && return 0
+  [ "$mode" = "100755" ] && return 0
+  echo "FAIL  git records tools/gates.sh as $mode, not 100755."
+  echo "        CI invokes it as \`tools/gates.sh\`, so this is exit 126 on every"
+  echo "        leg, in under a minute, with no stage output to read. Restore it:"
+  echo "          chmod +x tools/gates.sh && git update-index --chmod=+x tools/gates.sh"
+  FAILED="$FAILED gate-not-executable"
+}
+
 assert_spawning_drills_declare_ports() {
   local bad="" f
   for f in tools/*_drill.sh tools/gates.sh; do
@@ -1657,6 +1692,7 @@ if want drills; then
   assert_no_duplicate_drill_ports
   assert_every_drill_accounted_for
   assert_declared_scopes_cover_data_dirs
+  assert_gate_is_executable
   LEAKCHECK=1
   run_core_drills
   LEAKCHECK=
