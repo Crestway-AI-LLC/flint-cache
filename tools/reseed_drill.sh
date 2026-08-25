@@ -73,6 +73,34 @@ wait_port() {
   return 1
 }
 
+# PONG IS NOT "THE BOOT DECISION IS MADE" (#176). A node binds and answers
+# PING from inside its startup, so wait_port returns while the replica is
+# still deciding between a warm resume and a full re-seed — and every
+# assertion below reads $RLOG for the RESULT of that decision.
+#
+# Both directions are wrong and only one is loud. A positive grep run too
+# early FAILS a correct run: that is how this drill went red at
+# FLINT_GATE_JOBS=6 while passing serially on identical bytes — contention
+# widened the gap between "port open" and "the line is written". A NEGATIVE
+# grep run too early PASSES, because the line it is forbidding has not been
+# written yet, which is the same vacuous-pass shape as a check that matches
+# nothing and reports clean.
+#
+# `replicating from ...` is printed after the FLINTSYNC handshake on BOTH
+# paths, after any full-sync lines, so its arrival means the decision is
+# final and $RLOG can be read for what was decided. $RLOG is truncated before
+# each start, so this never matches a previous boot.
+wait_log() {  # <file> <pattern> [deciseconds]
+  for _ in $(seq 1 "${3:-600}"); do
+    grep -q "$2" "$1" 2>/dev/null && return 0
+    sleep 0.1
+  done
+  return 1
+}
+wait_boot_decided() {  # <logfile> — returns once warm-vs-reseed is settled
+  wait_log "$1" "replicating from" "${2:-600}"
+}
+
 # Everything known about why the replica is not answering. A bare "did not
 # come back" cost a CI cycle to distinguish "still syncing" from "exited
 # again", and both are visible from here.
@@ -99,6 +127,7 @@ echo "== a warm restart must NOT re-seed (the regression this fix could cause)"
 pkill -9 -f "flint-server --port $RPORT"; sleep 0.5
 : > "$RLOG"
 start_replica; wait_port $RPORT || { echo "FAIL: replica did not restart"; exit 1; }
+wait_boot_decided "$RLOG" || { echo "FAIL: replica never reached a boot decision"; tail -5 "$RLOG"; exit 1; }
 grep -q "full sync: received" "$RLOG" \
   && { echo "FAIL: an ordinary restart full-synced — every restart would now drag the whole dataset"; exit 1; }
 [ "$(valkey-cli -p $RPORT GET before)" = "v-before" ] \
@@ -118,6 +147,9 @@ echo "killed while marked by the harness" > "$RDIR/NEEDS_RESEED"
 : > "$RLOG"
 start_replica; wait_port $RPORT 600 || {
   echo "FAIL: a marked replica with a serveable cursor never came back"
+  replica_forensics; exit 1; }
+wait_boot_decided "$RLOG" || {
+  echo "FAIL: a marked replica never reached a boot decision"
   replica_forensics; exit 1; }
 grep -q "marked copy verified" "$RLOG" || {
   echo "FAIL: a serveable marked copy did not warm-rejoin"
@@ -170,6 +202,9 @@ echo "== and the next start re-seeds itself, unattended"
 # 60s, not 10: this wait spans a probe plus a whole checkpoint transfer.
 start_replica; wait_port $RPORT 600 || {
   echo "FAIL: replica did not come back within 60s of the marked boot"
+  replica_forensics; exit 1; }
+wait_boot_decided "$RLOG" || {
+  echo "FAIL: the re-seeding replica never reached a boot decision"
   replica_forensics; exit 1; }
 grep -q "full sync: received" "$RLOG" \
   || { echo "FAIL: the marker did not trigger a full sync"; tail -5 "$RLOG"; exit 1; }
