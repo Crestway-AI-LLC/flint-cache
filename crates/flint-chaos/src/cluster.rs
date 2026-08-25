@@ -958,6 +958,10 @@ fn spawn_node(port: u16, dir: &str, replica_of: Option<u16>) -> Child {
     cmd.args([
         "--port",
         &port.to_string(),
+        // Explicit, not inherited: see NODE_BIND. The check and the spawn have
+        // to read one value, or they agree only until someone changes a default.
+        "--bind",
+        NODE_BIND,
         "--engine",
         "rocks",
         "--data-dir",
@@ -1059,6 +1063,34 @@ fn kill_by_port(port: u16) {
         "warning: :{port} still had a live flint-server 10s after SIGKILL; \
          the respawn below is racing it"
     );
+}
+
+/// Kill the seat on `port` and do not return until that port can be bound again.
+///
+/// The invariant the fixed-port paths need, stated once: NOTHING REBINDS A PORT
+/// UNTIL A BIND ON THE ADDRESS THE SERVER WILL USE SUCCEEDS. A reaped process
+/// and a released socket are not the same instant, and those paths respawn on
+/// the very next statement — so the replacement dies immediately with AddrInUse
+/// and the readiness wait then watches a corpse for its entire budget. Raising
+/// that budget turns a fast failure into a slow one and fixes nothing, which is
+/// the trap this whole area keeps setting.
+///
+/// Only the two fixed-port callers need this. `kill_replica` and the promote
+/// path take a fresh port from the pool, and `next_replica_port` already proves
+/// it with `port_free` — which is exactly why they never showed this failure.
+fn kill_and_await_port(port: u16) {
+    kill_by_port(port);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !port_free(port) {
+        if Instant::now() >= deadline {
+            eprintln!(
+                "warning: :{port} is still bound 10s after its process died — \
+                 the respawn below will die with AddrInUse"
+            );
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 /// The tail of a spawned node's log, for an assertion that is about to fail.
@@ -1238,8 +1270,28 @@ const POOL: u16 = SPAN - FIRST_POOL;
 /// Can this address be bound right now? Same bind-to-prove-it discipline the
 /// rest of the harness uses: a process holding the port is a fact about the
 /// kernel, not something to infer from a pidfile or a `ps` line.
+/// The address every node this harness spawns binds, named ONCE so that the
+/// port check and the spawn cannot ask different questions.
+///
+/// They agreed until now only by coincidence: `port_free` hardcoded
+/// "127.0.0.1" and flint-server independently defaults `--bind` to the same
+/// literal. Two agreeing defaults is not agreement — it is a pair of guesses
+/// that happen to match, and the day someone passes `--bind` the check starts
+/// probing an address the server will not use. That is the rc.15 defect
+/// exactly: `wait_port_free` asked about one address, the server bound
+/// another, every local drill went green, and the first Linux roll refused to
+/// restart the seat it had just killed.
+///
+/// So the harness now PASSES this to every node rather than relying on the
+/// server's default, and the check reads the same constant. Deliberately not
+/// flintctl's two-address probe — that one checks 0.0.0.0 as well because its
+/// proxies bind the wildcard. These nodes never do, and demanding a wildcard
+/// bind here would refuse ports that are genuinely free for this server.
+const NODE_BIND: &str = "127.0.0.1";
+
+/// Can a replacement actually bind `port` — on the address it will really use?
 fn port_free(port: u16) -> bool {
-    std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
+    std::net::TcpListener::bind((NODE_BIND, port)).is_ok()
 }
 
 /// A master + one replica, managed like the trio will: promote-on-master-
@@ -1583,7 +1635,7 @@ impl Cluster {
         self.master_kills += 1;
         let dead = self.master_port;
         let survivor = self.replica_port;
-        kill_by_port(dead);
+        kill_and_await_port(dead);
         self.last_kill_dead_us = crate::writer::now_us();
         assert!(
             wait_until_role(survivor, "master", Duration::from_secs(20)),
@@ -1610,7 +1662,7 @@ impl Cluster {
         assert!(self.controlled, "use bootstrap_controlled");
         self.replica_kills += 1;
         let dead = self.replica_port;
-        kill_by_port(dead);
+        kill_and_await_port(dead);
         let kdir = fresh_dir(self.next_id);
         self.fleet
             .track(spawn_node(dead, &kdir, Some(self.master_port)));
