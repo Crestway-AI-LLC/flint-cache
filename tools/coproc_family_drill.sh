@@ -32,8 +32,8 @@ cd "$(dirname "$0")/.."
 # cold_start_roles_drill.
 fleet_init $FLINT_DRILL_ROOT/flint-coproc-family 7402 7407 7408 7409 7410
 fleet_guard
-STATE=$FLINT_DRILL_ROOT/flint-coproc
-INV=$FLINT_DRILL_ROOT/flint-coproc.flint
+STATE=$FLINT_DRILL_ROOT/flint-coproc-family
+INV=$FLINT_DRILL_ROOT/flint-coproc-family.flint
 fleet_kill server; fleet_kill proxy; fleet_kill controlplane; fleet_kill vec
 sleep 0.3
 cleanup() {

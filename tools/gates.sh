@@ -1186,6 +1186,72 @@ assert_server_flags_are_read() {
 # Checking it from inside the script cannot help CI, which already failed to
 # start. It is for the machine where the damage is done: `bash tools/gates.sh`
 # still runs here, reaches this line, and refuses before the push.
+# A FIXED NAME IS SHARED THE MOMENT TWO FILES SPELL IT THE SAME, and unlike
+# ports or declared scopes nothing was reading the names drills actually use.
+#
+# assert_no_scope_overlap compares the scope each drill DECLARES to fleet_init.
+# coproc_cred and coproc_family had been found sharing one and the declaration
+# was fixed -- coproc_family became flint-coproc-family. The two lines below it
+# still read STATE=$FLINT_DRILL_ROOT/flint-coproc and INV=.../flint-coproc.flint,
+# coproc_cred's dir and inventory, which coproc_family rm -rf's at start and
+# again from its EXIT trap. Disjoint ports, disjoint declarations, same
+# directory: every existing check passed.
+#
+# It could not bite while coproc_family sat in neither CORE nor CHAOS and never
+# ran. Promoting it to CORE and running the suite in parallel turned a dormant
+# name collision into one drill deleting a live peer's state mid-run, reported
+# against coproc_cred -- the drill that lost the race, not the one that caused
+# it.
+#
+# ONLY FIXED NAMES. A mktemp template ending in XXXXXX cannot collide however
+# many drills share the spelling, because mktemp resolves each to a distinct
+# directory; flagging those would be noise. Sibling names under one stem --
+# flint-foo-state beside flint-foo.flint -- are the house convention and stay
+# legal, because this asks whether two DIFFERENT files claim one name, not
+# whether a name sits under the drill's declared prefix.
+assert_no_used_path_overlap() {
+  local out
+  out=$(python3 - <<'PY2'
+import glob, os, re, sys
+from collections import defaultdict
+
+BARE = re.compile(r'[A-Za-z_][A-Za-z0-9_]*=\$\{?FLINT_DRILL_ROOT\}?/([A-Za-z0-9_.-]+)')
+owners = defaultdict(set)
+files = sorted(glob.glob("tools/*_drill.sh"))
+for f in files:
+    for name in BARE.findall(open(f, errors="replace").read()):
+        if name.endswith("XXXXXX"):
+            continue
+        owners[name].add(os.path.basename(f))
+
+# ARMED. No bare name anywhere means the idiom changed or the pattern rotted,
+# and an empty map would report "no collisions" forever -- the exact way a
+# duplicate-port check in this suite passed vacuously for as long as it existed.
+if files and not owners:
+    print("ARMED: no $FLINT_DRILL_ROOT/<name> assignment found in any of the")
+    print("  %d drills. The pattern is broken, not the tree clean." % len(files))
+    sys.exit(2)
+
+bad = {n: v for n, v in owners.items() if len(v) > 1}
+for n in sorted(bad):
+    print("%s: %s" % (n, " ".join(sorted(bad[n]))))
+sys.exit(1 if bad else 0)
+PY2
+  )
+  case $? in
+    0) return 0 ;;
+    2) echo "$out" | sed '1s/^/FAIL  /; 2,$s/^/      /'
+       FAILED="$FAILED used-path-scan-empty"; return 0 ;;
+  esac
+  echo "FAIL  two or more drills name the same path under FLINT_DRILL_ROOT:"
+  echo "$out" | sed 's/^/        /'
+  echo "        A fixed name is shared state. Serially that is invisible; in"
+  echo "        parallel one drill rm -rf's the other's directory mid-run, and"
+  echo "        the failure is reported against whichever lost the race."
+  echo "        Give each drill a name derived from its own declared scope."
+  FAILED="$FAILED used-path-overlap"
+}
+
 assert_gate_is_executable() {
   # ASK GIT, NOT THE FILESYSTEM. The bit that matters is the one that gets
   # pushed: a working tree can be +x while the index still records 100644, and
@@ -1693,6 +1759,7 @@ if want drills; then
   assert_every_drill_accounted_for
   assert_declared_scopes_cover_data_dirs
   assert_gate_is_executable
+  assert_no_used_path_overlap
   LEAKCHECK=1
   run_core_drills
   LEAKCHECK=
