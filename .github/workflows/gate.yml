@@ -34,16 +34,16 @@ on:
     inputs:
       gate_jobs:
         description: >-
-          Drills to run at once (FLINT_GATE_JOBS). 1 = the serial gate.
-          Raising this is how the parallel path gets EVIDENCE ON THIS RUNNER
-          before it becomes the default: the 3.23x measurement in
-          tools/gates.sh was taken on a c7i.4xlarge (16 vCPU / 32 GB), and
-          ubuntu-latest is 4 vCPU / 16 GB. Different machine, different
-          answer — the parallel path OOM-killed seats when it was too high,
-          and gates.sh prints the memory high-water so the margin is visible
-          rather than assumed.
+          Drills to run at once. LEAVE EMPTY for the repository default —
+          the number lives in exactly one place, the FLINT_GATE_JOBS line
+          below, and this input only overrides it for a single run. It used
+          to carry its own default of "6", which meant a dispatch silently
+          took 6 while a push took the env value: two different gates
+          depending on how the run was started, and the reason a "confirm the
+          new default" run came back reporting 1.50 drills/core. Set 1 here
+          for the serial gate; that is also the rollback.
         required: false
-        default: "6"
+        default: ""
       core_order:
         description: >-
           Override FLINT_CORE_ORDER with a space-separated drill list, for a
