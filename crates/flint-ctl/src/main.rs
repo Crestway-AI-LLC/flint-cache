@@ -4637,14 +4637,29 @@ const MASTER_PHASE_DISALLOWED: &[&str] = &["Detected", "SelfFenced", "SpareResto
 ///     `SpareRestored` — the roll does not cause those, so they stay fatal);
 ///   - the SUBJECT is the pair this roll just took down, so another pair
 ///     failing over during the window is still an abort;
-///   - the event is AFTER the seat was stopped, not merely after the phase
-///     began. The controlled demote/drain/promote before it is fenced and
-///     should be quiet; a `Detected` in that sub-window is the uncontrolled
-///     race and must stay fatal.
+///
+/// THE WINDOW IS THE SCAN'S OWN, and there is no second one. The first cut of
+/// this carried a `since_ms` of its own, opened after the seat was stopped,
+/// on the reasoning that the fenced demote/drain/promote before it should be
+/// quiet. That reasoning was wrong and the gate said so within one run:
+///
+///     UPGRADE ABORTED after pair 0 master roll: unexpected Detected in the
+///     fleet journal: {"at_ms":...,"kind":"Detected","subject":"g0",
+///     "cause":"master unreachable, confirmed across required ticks"}
+///
+/// The line provably matched on kind and on subject, so by elimination the
+/// only condition that could have rejected it was the window: under load the
+/// DRAIN itself makes the old master unreachable for long enough that the
+/// controller confirms it before the roll ever reaches the kill. The transient
+/// begins at the demote, not at the stop.
+///
+/// Re-adding a second window would also be dishonest arithmetic. The caller
+/// passes the same phase start to both, so `at >= expected.since_ms` could
+/// never be false once the scan's own filter had let the line through — a
+/// condition that cannot fail, dressed as a bound. One window, named once.
 struct ExpectedTransition<'a> {
     kind: &'a str,
     subject: String,
-    since_ms: u64,
 }
 
 /// Journal gate: no event of a disallowed kind since `since_ms`. The fleet
@@ -4697,7 +4712,6 @@ fn scan_journal<'a>(
             }
             if let Some(x) = expected
                 && *kind == x.kind
-                && at >= x.since_ms
                 && line.contains(&format!("\"subject\":\"{}\"", x.subject))
             {
                 // SAY IT. A silently swallowed transition reads, later,
@@ -4708,7 +4722,22 @@ fn scan_journal<'a>(
                 );
                 continue;
             }
-            return Err(format!("unexpected {kind} in the fleet journal: {line}"));
+            // CARRY THE NUMBERS. The previous version of this said only
+            // "unexpected Detected", which is a statement of surprise, not
+            // evidence -- working out WHY an exemption had not applied meant
+            // converting an epoch out of the payload by hand and correlating
+            // it against batched CI output. Say what was expected and what
+            // the window was, so the next occurrence is readable in one pass.
+            let ctx = match expected {
+                Some(x) => format!(
+                    " (expected only {} for {}, at_ms >= {since_ms}; this event is at_ms {at})",
+                    x.kind, x.subject
+                ),
+                None => format!(" (no transition is expected here; window at_ms >= {since_ms})"),
+            };
+            return Err(format!(
+                "unexpected {kind} in the fleet journal:{ctx} {line}"
+            ));
         }
     }
     Ok(())
@@ -5353,11 +5382,6 @@ fn upgrade(inv: &Inventory, version_tag: Option<String>, soak_ms: u64, nodes_onl
         eprintln!(
             "  pair {i}: {old_master} demoted + drained; {new_master} promoted at (0,{promoted})"
         );
-        // The window for the roll's OWN transient opens here, after the
-        // fenced failover and before the seat is taken down -- not at `t`,
-        // which is where the phase began. Anything the controlled part
-        // journals is still held to the unbounded rule.
-        let t_down = now_ms();
         if let Err(e) = roll_node(inv, old_master, &new_master, &envs, &expect, true) {
             eprintln!("== UPGRADE ABORTED after pair {i} failover, respawning {old_master}: {e}");
             std::process::exit(3);
@@ -5371,7 +5395,6 @@ fn upgrade(inv: &Inventory, version_tag: Option<String>, soak_ms: u64, nodes_onl
         let expected = ExpectedTransition {
             kind: "Detected",
             subject: format!("g{i}"),
-            since_ms: t_down,
         };
         if let Err(e) = journal_clean(inv, t, MASTER_PHASE_DISALLOWED, Some(&expected)) {
             eprintln!("== UPGRADE ABORTED after pair {i} master roll: {e}");
@@ -6523,137 +6546,123 @@ mod ops_0027_tests {
         )
     }
 
-    fn expect_g(subject: &str, since_ms: u64) -> ExpectedTransition<'static> {
+    fn expect_g(subject: &str) -> ExpectedTransition<'static> {
         ExpectedTransition {
             kind: "Detected",
             subject: subject.to_string(),
-            since_ms,
         }
+    }
+
+    fn scan(lines: &[String], since: u64, x: Option<&ExpectedTransition>) -> Result<(), String> {
+        scan_journal(
+            lines.iter().map(|s| s.as_str()),
+            since,
+            MASTER_PHASE_DISALLOWED,
+            x,
+        )
     }
 
     // THE BUG: the roll takes pair 0's master down, the controller journals
     // Detected for g0, and the upgrade aborted on its own doing.
     #[test]
     fn the_rolls_own_detected_is_expected() {
-        let x = expect_g("g0", 100);
-        let lines = [ev(150, "Detected", "g0")];
+        let x = expect_g("g0");
         assert!(
-            scan_journal(
-                lines.iter().map(|s| s.as_str()),
-                50,
-                MASTER_PHASE_DISALLOWED,
-                Some(&x)
-            )
-            .is_ok(),
+            scan(&[ev(150, "Detected", "g0")], 50, Some(&x)).is_ok(),
             "the transition this roll caused must not abort it"
         );
     }
 
-    // EVERY ONE OF THESE MUST STILL ABORT. A widened exemption is invisible
-    // in a green roll -- it only shows as a real failover being swallowed --
-    // so these are the assertions that actually protect the guard.
+    // THE REGRESSION THE FIRST FIX SHIPPED WITH. A second window opened after
+    // the seat was stopped, and under load the DRAIN makes the master
+    // unreachable before that -- so the real occurrence fell in the gap and
+    // aborted anyway. Any event inside the phase window counts, however early.
+    #[test]
+    fn a_detected_during_the_drain_is_still_the_rolls_own() {
+        let x = expect_g("g0");
+        assert!(
+            scan(&[ev(51, "Detected", "g0")], 50, Some(&x)).is_ok(),
+            "the transient begins at the demote, not at the kill"
+        );
+    }
+
+    // EVERY ONE OF THESE MUST STILL ABORT. A widened exemption is invisible in
+    // a green roll -- it shows only as a real failover being swallowed -- so
+    // these are the assertions that protect the guard.
     #[test]
     fn another_pair_failing_over_still_aborts() {
-        let x = expect_g("g0", 100);
-        let lines = [ev(150, "Detected", "g1")];
+        let x = expect_g("g0");
         assert!(
-            scan_journal(
-                lines.iter().map(|s| s.as_str()),
-                50,
-                MASTER_PHASE_DISALLOWED,
-                Some(&x)
-            )
-            .is_err(),
+            scan(&[ev(150, "Detected", "g1")], 50, Some(&x)).is_err(),
             "g1 failing over while g0 is rolled is the race the gate exists for"
         );
     }
 
     #[test]
-    fn detected_before_the_seat_was_stopped_still_aborts() {
-        // Inside the phase window (>= 50) but BEFORE the roll took the seat
-        // down (< 100): the fenced demote/drain/promote should be quiet, so
-        // a Detected there is uncontrolled.
-        let x = expect_g("g0", 100);
-        let lines = [ev(75, "Detected", "g0")];
-        assert!(
-            scan_journal(
-                lines.iter().map(|s| s.as_str()),
-                50,
-                MASTER_PHASE_DISALLOWED,
-                Some(&x)
-            )
-            .is_err(),
-            "the controlled sub-window is still held to the unbounded rule"
-        );
-    }
-
-    #[test]
     fn other_disallowed_kinds_are_never_excused() {
-        let x = expect_g("g0", 100);
+        let x = expect_g("g0");
         for kind in ["SelfFenced", "SpareRestored"] {
-            let lines = [ev(150, kind, "g0")];
             assert!(
-                scan_journal(
-                    lines.iter().map(|s| s.as_str()),
-                    50,
-                    MASTER_PHASE_DISALLOWED,
-                    Some(&x)
-                )
-                .is_err(),
+                scan(&[ev(150, kind, "g0")], 50, Some(&x)).is_err(),
                 "{kind} is not something the roll causes, so it stays fatal"
             );
         }
     }
 
-    // The replica phase passes None and must be exactly as strict as before.
     #[test]
     fn without_an_expectation_nothing_is_excused() {
-        let lines = [ev(150, "Detected", "g0")];
         assert!(
-            scan_journal(
-                lines.iter().map(|s| s.as_str()),
-                50,
-                MASTER_PHASE_DISALLOWED,
-                None
-            )
-            .is_err(),
+            scan(&[ev(150, "Detected", "g0")], 50, None).is_err(),
             "the replica phase and the pre-roll gate must not inherit the exemption"
         );
     }
 
-    // POSITIVE CONTROL for the harness itself: if `ev` stopped producing a
-    // line the scanner recognises, every assertion above would pass by
-    // matching nothing, and this file would report a guard it never tested.
+    // The window is the SCAN's, and it is still a window: an event from before
+    // this pair's phase is another phase's business and is not read at all.
+    #[test]
+    fn events_before_the_phase_window_are_not_read() {
+        let x = expect_g("g1");
+        assert!(
+            scan(&[ev(10, "SelfFenced", "g1")], 50, Some(&x)).is_ok(),
+            "a fatal kind BEFORE the window must be skipped by the window, not              excused by the exemption -- if this fails the filter is broken"
+        );
+    }
+
+    // The abort message is evidence, not surprise. Working out why an
+    // exemption had not applied once meant converting an epoch by hand out of
+    // the payload; an untested diagnostic rots silently, so assert it carries
+    // the numbers a reader needs.
+    #[test]
+    fn the_abort_message_says_what_was_expected_and_when() {
+        let x = expect_g("g0");
+        let err = scan(&[ev(150, "Detected", "g1")], 50, Some(&x)).expect_err("must abort");
+        for needle in ["Detected", "g0", "at_ms >= 50", "at_ms 150"] {
+            assert!(
+                err.contains(needle),
+                "abort message is missing {needle:?}: {err}"
+            );
+        }
+    }
+
+    // POSITIVE CONTROL for the harness: if `ev` stopped producing a line the
+    // scanner recognises, every assertion above would pass by matching
+    // nothing, and this file would report a guard it never tested.
     #[test]
     fn the_fixture_is_actually_seen_by_the_scanner() {
-        let lines = [ev(150, "Detected", "g0")];
-        let err = scan_journal(
-            lines.iter().map(|s| s.as_str()),
-            50,
-            MASTER_PHASE_DISALLOWED,
-            None,
-        )
-        .expect_err("fixture must trip the scanner");
+        let err = scan(&[ev(150, "Detected", "g0")], 50, None).expect_err("fixture must trip");
         assert!(
             err.contains("Detected") && err.contains("g0"),
             "the scanner reported something else entirely: {err}"
         );
     }
 
-    // And that the timestamp field is parsed at all: a fixture whose at_ms
-    // never parses reads as 0, lands before every since_ms, and is skipped --
-    // which would make the two window tests above vacuous.
+    // And that at_ms parses: a fixture whose timestamp never parses reads as
+    // 0, lands before every since_ms, and is skipped -- which would make the
+    // window tests above vacuous.
     #[test]
     fn the_fixtures_timestamp_is_parsed() {
-        let lines = [ev(150, "Detected", "g0")];
         assert!(
-            scan_journal(
-                lines.iter().map(|s| s.as_str()),
-                200,
-                MASTER_PHASE_DISALLOWED,
-                None
-            )
-            .is_ok(),
+            scan(&[ev(150, "Detected", "g0")], 200, None).is_ok(),
             "an event at 150 must be skipped when since_ms is 200; if this \
              fails the at_ms parse is broken and the window tests prove nothing"
         );
