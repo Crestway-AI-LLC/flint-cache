@@ -200,6 +200,33 @@ def main():
     check(len([k for k in rc.scan_iter(match=b"c1/*")]) > 0,
           "negative control -- UNDER the cap the same object IS cached")
 
+    # D19 -- the block size defaults to our CHUNK, because fsspec's own
+    # default drags an order of magnitude more than a selective read asked for
+    K19 = "s3://bucket/data/000005.bin"
+    size19 = fs().info(K19)["size"]
+
+    def sparse_cost(fsys, n=16, sz=64 * 1024):
+        """Origin bytes for n scattered 64 KiB reads. Counts, not durations --
+        a duration on a shared machine is not a measurement."""
+        rc.flushall(); stats(ep, "/__reset")
+        step = size19 // n
+        with fsys.open(K19, "rb") as h:
+            for i in range(n):
+                h.seek(i * step); h.read(sz)
+        return stats(ep)["bytes_served"], n * sz
+
+    tuned, asked = sparse_cost(fs())
+    wide, _ = sparse_cost(flint_accel.FlintS3FileSystem(
+        skip_instance_cache=True, default_block_size=5 * 1024 * 1024, **so))
+    check(tuned < wide,
+          f"our default block pulls LESS than fsspec's ({tuned} < {wide} bytes)")
+    check(tuned <= asked * 3,
+          f"a selective read drags <= 3x what it asked for ({tuned/asked:.1f}x)")
+    # Without this the two checks above would both pass against a client that
+    # had simply stopped reading anything.
+    check(wide > asked * 5,
+          f"negative control -- fsspec's own 5 MiB default drags {wide/asked:.1f}x")
+
     # how much does fsspec's block cache pull for a small read?
     rc.flushall(); stats(ep, "/__reset")
     with fs().open("s3://bucket/data/000006.bin", "rb") as fh:
