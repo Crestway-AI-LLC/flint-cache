@@ -192,8 +192,8 @@ CORE_EXCLUSIVE="${FLINT_CORE_EXCLUSIVE:-disk_pressure disk_selffill}"
 CORE="${FLINT_CORE_ORDER:-restart repl failover proxy slot_migrate slot_map rebalance_execute
       bloom ns_escape coproc_cred coproc_channel coproc_family family_route family_route_cp coproc_forward coproc_budget coproc_exempt coproc_vec coproc_vec_tls coproc_vec_rebuild
       tenant_quota token_rotation cert_reload_fleet controlplane_ha
-      decommission config_file federation_plumbing disk_pressure disk_selffill ctl_error
-      client_compat proxy_registry reseed lag_cap widowed_grace controller
+      decommission config_file federation_plumbing disk_pressure disk_selffill ingest_saturation ctl_error
+      client_compat proxy_registry reseed lag_cap widowed_grace replica_starvation controller
       promote_notice fleet_guard ctl_cpha upgrade anti_affinity attached_chaos
       async_flag async_writes txn_failure backup restore_ns backup_schedule
       backup_seat gc_sweep keystat start_guard seat_log cold_start_roles
