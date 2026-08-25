@@ -116,6 +116,25 @@ st() { curl -s "http://127.0.0.1:$PORT/__stats" \
        | python3 -c "import sys,json;print(json.load(sys.stdin)['$1'])"; }
 jread() { "$JAVA" -cp "$CP" ai.crestway.flintaccel.client.CrossLangProbe \
           "http://127.0.0.1:$PORT" bucket "$KEY" "$LEN" "$TIER_URI" >/dev/null 2>&1; }
+# Same probe, arbitrary key and length -- section 5 rewrites one object at two
+# different sizes, so neither can be the file-scoped $KEY/$LEN.
+jread_key() { "$JAVA" -cp "$CP" ai.crestway.flintaccel.client.CrossLangProbe \
+          "http://127.0.0.1:$PORT" bucket "$1" "$2" "$TIER_URI" >/dev/null 2>&1; }
+# Writes through the PYTHON client, so s3fs's own mutation path runs and our
+# invalidate_cache hook fires exactly as it would for a customer.
+pywrite() {
+  "$PYENV/bin/python" - "$ROOT" "http://127.0.0.1:$PORT" "$1" "$2" "$3" "$TIER_URI" \
+    >/dev/null 2>/tmp/xlang_pw.err <<'PY'
+import sys
+sys.path.insert(0, sys.argv[1] + "/python")
+import flint_accel
+so = dict(anon=False, key="p", secret="p",
+          client_kwargs={"endpoint_url": sys.argv[2], "region_name": "us-east-1"},
+          tier_uri=sys.argv[6])
+f = flint_accel.FlintS3FileSystem(skip_instance_cache=True, **so)
+f.pipe_file("s3://bucket/" + sys.argv[3], sys.argv[5].encode() * int(sys.argv[4]))
+PY
+}
 pyread() {
   "$PYENV/bin/python" - "$ROOT" "http://127.0.0.1:$PORT" "$KEY" "$LEN" "$TIER_URI" \
     >/tmp/xlang_py.json 2>/tmp/xlang_py.err <<'PY'
@@ -204,6 +223,33 @@ HB=$(st heads); pyread; HA=$(st heads)
 CM=$(pyc chunk_misses)
 [ "${CM:-0}" -gt 0 ]; ck $? "negative control: a COLD Python read DOES miss ($CM misses)"
 [ $((HA-HB)) -gt 0 ]; ck $? "negative control: a COLD Python read DOES HEAD the origin ($((HA-HB)) HEADs)"
+
+# --- 5. a rewrite in ONE language must not leave the other reading stale ----
+#
+# Both clients invalidate on write -- Python through s3fs's invalidate_cache,
+# the JVM through FlintS3AFileSystem.create/delete/rename -- and both delete
+# the SAME m1/ key. That the two therefore protect each other's readers is an
+# inference, and it had never once been executed.
+#
+# It matters more than ordinary staleness because the entry carries the object
+# LENGTH and the ETAG. A reader trusting a stale entry addresses chunks by the
+# OLD etag, hits them, and returns the ENTIRE PREVIOUS OBJECT -- not a short
+# read and not a torn one: a coherent, wrong, confidently-served answer.
+XK="scratch/xlang_rewrite.bin"
+"$TIER_CLI" -p "$TIER_PORT" flushall >/dev/null
+pywrite "$XK" 40000 L
+jread_key "$XK" 40000
+LB=$(head -c 40000 /tmp/xlang_java_bytes 2>/dev/null | tr -d 'L' | wc -c | tr -d ' ')
+[ "${LB:-1}" = 0 ]; ck $? "armed: the JVM reads what Python wrote (40000 bytes, all L)"
+MK=$("$TIER_CLI" -p "$TIER_PORT" --scan --pattern 'm1/*' | grep -c "$XK" || true)
+[ "${MK:-0}" -gt 0 ]; ck $? "armed: and that read cached its metadata ($MK entry)"
+
+pywrite "$XK" 900 S
+MK2=$("$TIER_CLI" -p "$TIER_PORT" --scan --pattern 'm1/*' | grep -c "$XK" || true)
+[ "${MK2:-1}" = 0 ]; ck $? "PYTHON'S REWRITE DROPPED THE SHARED METADATA ENTRY"
+jread_key "$XK" 900
+SB=$(head -c 900 /tmp/xlang_java_bytes 2>/dev/null | tr -d 'S' | wc -c | tr -d ' ')
+[ "${SB:-1}" = 0 ]; ck $? "AND THE JVM READS THE NEW OBJECT, not the old one it had cached"
 
 echo "--- $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
