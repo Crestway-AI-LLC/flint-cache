@@ -59,6 +59,38 @@ on:
 jobs:
   gate:
     runs-on: ubuntu-latest
+    # TWO CONCURRENT LEGS, and the split is by STAGE because gates.sh already
+    # draws that line — ALL_STAGES is "check conformance drills chaos".
+    #
+    # The chaos stage is a plain serial loop: FLINT_GATE_JOBS parallelises
+    # run_core_drills and nothing else, so at P=4 the gate was ~10 minutes of
+    # parallel drills followed by 4 minutes of chaos running one drill at a
+    # time (123 + 73 + 46 + 6 seconds). Nearly a third of the wall clock, on
+    # one core of four.
+    #
+    # Attribution is the better reason. Chaos is randomized — the source calls
+    # it "the honesty step" — and while it shared a job with the drills, every
+    # red run needed reading to find out which half broke. Today it failed
+    # three times and all three were tree-level rather than parallelism, which
+    # took a serial re-run to establish.
+    #
+    # STILL BLOCKING, deliberately. The temptation with a randomized suite is
+    # to demote it to nightly or advisory; today is the counterargument, since
+    # the #176 readiness regression surfaced here first, at
+    # wait_for_ready(dead, 15s). A randomized check that cannot fail the build
+    # is one people learn to ignore.
+    #
+    # fail-fast: false so a chaos failure does not cancel the drills leg. The
+    # whole point is to learn about both in one run.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: drills
+            stages: conformance drills
+          - name: chaos
+            stages: chaos
+    name: gate (${{ matrix.name }})
     # Cold cache pays for a RocksDB compile; the default 360 is generous but
     # an explicit number turns a hang into a failure with a reason.
     timeout-minutes: 60
@@ -212,8 +244,8 @@ jobs:
       # `check` is deliberately omitted: ci.yml already runs fmt, clippy and
       # tests in both feature configs, and running them twice per PR buys
       # nothing. This job is the stages that were never automated.
-      - name: Conformance, drills, chaos
-        run: tools/gates.sh conformance drills chaos
+      - name: Run stages — ${{ matrix.stages }}
+        run: tools/gates.sh ${{ matrix.stages }}
 
       - name: Keep the logs
         # gates.sh writes one DIRECTORY PER RUN — <utc-stamp>-<short-sha>/ —
@@ -234,7 +266,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: gate-logs
+          name: gate-logs-${{ matrix.name }}
           path: |
             /tmp/flint-gates
             !/tmp/flint-gates/latest
