@@ -32,6 +32,24 @@ cd "$(dirname "$0")/.."
 # cold_start_roles_drill.
 fleet_init $FLINT_DRILL_ROOT/flint-coproc-family 7402 7407 7408 7409 7410
 fleet_guard
+# UNDER THE DECLARED SCOPE, and this is not tidiness. These two named
+# coproc_cred's scope — the drill declared flint-coproc-family to fleet_init
+# and then put every file it owns in flint-coproc. When this pair was caught
+# sharing a scope once before (see the note in gates.sh), the fix went into
+# the fleet_init line and these two assignments below it were left pointing
+# where they always had: fixed where the bug was seen, not where it lived.
+#
+# Three consequences, worst first. The scope dir is an OWNERSHIP KEY, not a
+# storage location: _fleet_ours attributes seats by scope dir or declared
+# ports, so this drill's seats lived inside coproc_cred's scope and
+# coproc_cred's fleet_kill could adopt and kill them as its own. The rm -rf
+# below then deletes coproc_cred's state on entry AND from the EXIT trap. And
+# serially — which is all main does today — it destroys the post-mortem
+# directory of a coproc_cred that has just failed, because CORE runs
+# coproc_cred first.
+#
+# assert_no_scope_overlap could not see any of it: it compares what drills
+# DECLARE, and nothing read what a drill USES.
 STATE=$FLINT_DRILL_ROOT/flint-coproc-family
 INV=$FLINT_DRILL_ROOT/flint-coproc-family.flint
 fleet_kill server; fleet_kill proxy; fleet_kill controlplane; fleet_kill vec
