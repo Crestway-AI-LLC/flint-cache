@@ -149,10 +149,25 @@ echo "== node up on it"
 ./target/release/flint-server --port "$PORT" --engine rocks --data-dir "$MNT/data" \
   --disk-min-free-pct "$MIN_PCT" --disk-min-free-bytes "$MIN_BYTES" \
   --disk-sample-ms 500 >$FLINT_DRILL_ROOT/flint-diskpressure.log 2>&1 &
-for _ in $(seq 1 60); do
-  [ "$(valkey-cli -p $PORT PING 2>/dev/null)" = "PONG" ] && break; sleep 0.25
-done
-[ "$(valkey-cli -p $PORT PING 2>/dev/null)" = "PONG" ] || {
+# READY IS PONG *AND* NOT LOADING. This waited on PONG alone, and #176 is
+# exactly the change that made PONG stop meaning ready: a node now binds and
+# answers PING from inside its load, deliberately, so a client can tell
+# "starting" from "absent". The wait therefore SUCCEEDED in ~0.3s against a
+# node that was still loading, and the drill's first write came back
+# `-LOADING Flint is loading the dataset in memory`.
+#
+# This is the intermittency the block below was written to chase. Three
+# investigations dead-ended on "server did not start" and went after a wedged
+# mount and a cold binary; the server had started every time. It was never a
+# budget either -- the old 15s was never reached, because the loop broke early
+# on the wrong predicate. Widening the budget would have changed nothing, and
+# is the move this repo has now been wrong about three times in one day.
+ready() {
+  [ "$(valkey-cli -p $PORT PING 2>/dev/null)" = "PONG" ] &&
+    ! valkey-cli -p $PORT FLINTINFO 2>/dev/null | tr -d '\r' | grep -qx 'loading:1'
+}
+for _ in $(seq 1 120); do ready && break; sleep 0.25; done
+ready || {
   # Capture STATE, not just the log.
   #
   # This drill has failed intermittently under the full suite and never in
@@ -166,7 +181,10 @@ done
   #
   # So the failure path now records those, because the next occurrence is
   # the only chance to learn anything and it has been wasted three times.
-  echo "---- diagnosis (the drill did not get a PONG within its budget) ----"
+  echo "---- diagnosis (no PONG, or PONG but still loading, within 30s) ----"
+  echo "readiness:"
+  echo "  PING -> $(valkey-cli -p $PORT PING 2>/dev/null || echo "<no answer>")"
+  echo "  loading -> $(valkey-cli -p $PORT FLINTINFO 2>/dev/null | tr -d "\r" | sed -n "s/^loading://p" || echo "<unreadable>")"
   echo "process:"; pgrep -lf "flint-server --port $PORT" | sed 's/^/  /' || echo "  none alive"
   echo "port $PORT:"; lsof -nP -iTCP:$PORT 2>/dev/null | sed 's/^/  /' | head -4 || echo "  free"
   echo "mount:"; mount | grep -i diskpressure | sed 's/^/  /' || echo "  NOT MOUNTED"
@@ -179,7 +197,7 @@ done
   pgrep -lf 'flint-(server|proxy|controlplane|controller|chaos)' | grep -v "port $PORT" \
     | sed 's/^/  /' | head -6 || echo "  none"
   echo "--------------------------------------------------------------------"
-  fail "server did not start"; }
+  fail "the node never became ready (see readiness: above for which)"; }
 
 info() { valkey-cli -p "$PORT" FLINTINFO 2>/dev/null | tr -d '\r' | grep "^$1:" | cut -d: -f2; }
 

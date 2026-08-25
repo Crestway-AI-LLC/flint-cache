@@ -179,7 +179,13 @@ echo "== node up on it (min-free ${MIN_PCT}% / $((MIN_BYTES / 1048576))MB)"
 "$BIN" --port "$PORT" --engine rocks --data-dir "$DIR" \
   --disk-min-free-pct "$MIN_PCT" --disk-min-free-bytes "$MIN_BYTES" \
   --disk-sample-ms 500 >"$LOG" 2>&1 &
-fleet_wait_listen "$PORT"
+# fleet_wait_listen RETURNS ON THE BIND, which since #176 happens before the
+# node can answer anything: it binds and serves -LOADING from inside its load.
+# The first thing below reads disk_verdict out of FLINTINFO, which comes back
+# EMPTY in that window -- reported as "verdict is  before anything was
+# written", with the blank where the value should be. Same race as
+# disk_pressure_drill, one wait weaker.
+fleet_wait_ping "$PORT"
 
 info() { valkey-cli -p "$PORT" FLINTINFO 2>/dev/null | tr -d '\r' | sed -n "s/^$1://p"; }
 
