@@ -77,15 +77,22 @@ public final class TierSupport {
     // KMS plaintext is the version of this that ends a security review.
     boolean cacheKms = "true".equalsIgnoreCase(
         or(get.apply("flint.cache.sse-kms"), "false"));
+    // The ENGINE knows things the cache cannot infer. Iceberg's format
+    // guarantees every file it reads is write-once, so revalidating its
+    // metadata every 60s buys protection against a change the format forbids.
+    // Off by default: an arbitrary s3a:// path carries no such guarantee.
+    boolean immutable = "true".equalsIgnoreCase(
+        or(get.apply("flint.immutable"), "false"));
+    long immTtl = num(get.apply("flint.meta.ttl.immutable.seconds"), 86_400);
     var cfg = S3SeekableInputStreamConfiguration.DEFAULT;
     FlintObjectClient cl =
         new FlintObjectClient(new S3SdkObjectClient(s3, false), conn.async(),
-            chunk, budget, ttl, false, s3, cacheKms);
+            chunk, budget, ttl, false, s3, cacheKms, immutable, immTtl);
     TierSupport t = new TierSupport(redis, conn, s3, cl,
         new S3SeekableInputStreamFactory(cl, cfg),
         new S3SeekableInputStreamFactory(
             new FlintObjectClient(new S3SdkObjectClient(s3, false), conn.async(),
-                chunk, budget, ttl, true, s3, cacheKms), cfg));
+                chunk, budget, ttl, true, s3, cacheKms, immutable, immTtl), cfg));
     t.metrics = FlintCacheMetrics.register(cl, uri);
     return t;
   }

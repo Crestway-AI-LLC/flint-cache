@@ -58,7 +58,21 @@ public class FlintFileIO extends S3FileIO {
     if (t == null) {
       synchronized (this) {
         t = tier;
-        if (t == null) tier = t = TierSupport.build(TierSupport.from(props));
+        if (t == null) {
+      // ICEBERG FILES ARE IMMUTABLE BY THE FORMAT, so declare it unless the
+      // catalog says otherwise. Iceberg never rewrites a file -- data files,
+      // manifests, manifest lists and metadata JSON are all write-once, and a
+      // change is a NEW file plus a commit. So revalidating their metadata on
+      // the default 60s TTL is a HEAD per object per minute guarding against
+      // something the format forbids.
+      //
+      // Default here rather than in TierSupport because it is only sound where
+      // the format guarantees it: an arbitrary s3a:// path carries no such
+      // promise, so that path keeps the short TTL unless a user opts in.
+      java.util.Map<String, String> p2 = new java.util.HashMap<>(props);
+      p2.putIfAbsent("flint.immutable", "true");
+      tier = t = TierSupport.build(TierSupport.from(p2));
+    }
       }
     }
     return t;

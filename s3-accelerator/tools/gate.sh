@@ -243,6 +243,15 @@ run_bounded java -cp "$ROOT/jvm-spike/target/classes:$CP" \
     http://127.0.0.1:9311 http://127.0.0.1:9308 redis://127.0.0.1:9399 \
     >/tmp/gate_metrics.log 2>&1
 verdict "JMX metrics, read via MBeanServer (13 checks)" $?
+
+# An immutability declaration should stop the revalidation HEADs. Measured as
+# origin HEAD count across a read taken AFTER the mutable TTL expires --
+# correct bytes or a hit counter would look identical whether or not the
+# declaration did anything.
+run_bounded java -cp "$ROOT/jvm-spike/target/classes:$CP" \
+    ai.crestway.flintaccel.client.ImmutableSuite \
+    http://127.0.0.1:9311 redis://127.0.0.1:9399 >/tmp/gate_immutable.log 2>&1
+verdict "immutability declaration skips revalidation (3 checks)" $?
 stop_origin
 
 # A SICK tier -- one that answers slowly rather than dying -- used to make
