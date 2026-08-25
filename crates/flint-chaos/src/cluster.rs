@@ -1029,10 +1029,64 @@ fn signal_by_port(port: u16, sig: &str) {
         .status();
 }
 
+/// Kill the seat on `port` and DO NOT RETURN UNTIL IT IS GONE.
+///
+/// `pkill` returns when the signal has been delivered, not when the target has
+/// exited. Every caller here respawns on the same port immediately afterwards,
+/// so the new seat races the dying one for the socket and loses — presenting
+/// as "the replacement never bound", which names the seat that could not start
+/// rather than the one that would not finish dying.
+///
+/// This is the third instance of the same family in one day: fleet_kill in
+/// tools/lib/fleet.sh waited on a port looking free instead of a process being
+/// gone, and the disk guard sampled on a clock instead of on headroom. The
+/// shell harness was fixed; this one was not, because the bug is invisible on
+/// a fast idle box where the process dies between two statements.
 fn kill_by_port(port: u16) {
-    let _ = Command::new("pkill")
-        .args(["-9", "-f", &format!("flint-server --port {port}")])
-        .status();
+    let pat = format!("flint-server --port {port}");
+    let _ = Command::new("pkill").args(["-9", "-f", &pat]).status();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        match Command::new("pgrep").args(["-f", &pat]).output() {
+            // pgrep exits non-zero with empty stdout when nothing matches.
+            Ok(o) if o.stdout.is_empty() => return,
+            Ok(_) => std::thread::sleep(Duration::from_millis(20)),
+            // No pgrep: fall back to the old behaviour rather than hanging.
+            Err(_) => return,
+        }
+    }
+    eprintln!(
+        "warning: :{port} still had a live flint-server 10s after SIGKILL; \
+         the respawn below is racing it"
+    );
+}
+
+/// The tail of a spawned node's log, for an assertion that is about to fail.
+///
+/// `spawn_node` writes each seat's stderr to `{dir}.log` and the drill says it
+/// keeps them "for the post-mortem" — but nothing printed them, so a failure
+/// on CI left the one artefact that explains it on a runner that no longer
+/// exists. Same gap as promote_notice keeping its seat logs and not showing
+/// them: a log you cannot reach is not evidence.
+fn node_log_tail(dir: &str, lines: usize) -> String {
+    let path = format!("{dir}.log");
+    match std::fs::read_to_string(&path) {
+        Ok(t) => {
+            let tail: Vec<&str> = t.lines().rev().take(lines).collect();
+            let body = tail
+                .into_iter()
+                .rev()
+                .map(|l| format!("    | {l}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            if body.is_empty() {
+                format!("  node log {path} is EMPTY — the process wrote nothing")
+            } else {
+                format!("  node log {path} (last {lines} lines):\n{body}")
+            }
+        }
+        Err(e) => format!("  node log {path} unreadable: {e}"),
+    }
 }
 
 fn fresh_dir(n: u32) -> String {
@@ -1243,11 +1297,13 @@ impl Cluster {
             wait_for_pong(master_port, Duration::from_secs(15)),
             "master up"
         );
-        fleet.track(spawn_node(replica_port, &fresh_dir(1), Some(master_port)));
+        let rdir = fresh_dir(1);
+        fleet.track(spawn_node(replica_port, &rdir, Some(master_port)));
         assert!(
             wait_for_ready(replica_port, SEED_READY_BUDGET),
-            "replica up: {}",
-            ready_diagnosis(replica_port)
+            "replica up: {}\n{}",
+            ready_diagnosis(replica_port),
+            node_log_tail(&rdir, 30)
         );
         Self {
             fleet,
@@ -1474,8 +1530,9 @@ impl Cluster {
             .track(spawn_node(self.replica_port, &dir, Some(self.master_port)));
         assert!(
             wait_for_ready(self.replica_port, SEED_READY_BUDGET),
-            "replacement replica up: {}",
-            ready_diagnosis(self.replica_port)
+            "replacement replica up: {}\n{}",
+            ready_diagnosis(self.replica_port),
+            node_log_tail(&dir, 30)
         );
         self.master_port
     }
@@ -1533,15 +1590,16 @@ impl Cluster {
             "controller did not promote survivor :{survivor} within 20s"
         );
         // Bring the dead port back as a fresh replica of the new master.
-        self.fleet
-            .track(spawn_node(dead, &fresh_dir(self.next_id), Some(survivor)));
+        let sdir = fresh_dir(self.next_id);
+        self.fleet.track(spawn_node(dead, &sdir, Some(survivor)));
         self.next_id += 1;
         self.master_port = survivor;
         self.replica_port = dead;
         assert!(
             wait_for_ready(dead, SEED_READY_BUDGET),
-            "replacement replica up on :{dead}: {}",
-            ready_diagnosis(dead)
+            "replacement replica up on :{dead}: {}\n{}",
+            ready_diagnosis(dead),
+            node_log_tail(&sdir, 30)
         );
         self.master_port
     }
@@ -1553,16 +1611,15 @@ impl Cluster {
         self.replica_kills += 1;
         let dead = self.replica_port;
         kill_by_port(dead);
-        self.fleet.track(spawn_node(
-            dead,
-            &fresh_dir(self.next_id),
-            Some(self.master_port),
-        ));
+        let kdir = fresh_dir(self.next_id);
+        self.fleet
+            .track(spawn_node(dead, &kdir, Some(self.master_port)));
         self.next_id += 1;
         assert!(
             wait_for_ready(dead, SEED_READY_BUDGET),
-            "replacement replica up on :{dead}: {}",
-            ready_diagnosis(dead)
+            "replacement replica up on :{dead}: {}\n{}",
+            ready_diagnosis(dead),
+            node_log_tail(&kdir, 30)
         );
     }
 
@@ -1576,8 +1633,9 @@ impl Cluster {
             .track(spawn_node(self.replica_port, &dir, Some(self.master_port)));
         assert!(
             wait_for_ready(self.replica_port, SEED_READY_BUDGET),
-            "replacement replica up: {}",
-            ready_diagnosis(self.replica_port)
+            "replacement replica up: {}\n{}",
+            ready_diagnosis(self.replica_port),
+            node_log_tail(&dir, 30)
         );
     }
 }

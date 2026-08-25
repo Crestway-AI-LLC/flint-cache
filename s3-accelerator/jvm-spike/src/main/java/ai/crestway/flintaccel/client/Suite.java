@@ -195,6 +195,7 @@ public final class Suite {
       String k3 = "data/000003.bin";
       final int N = 24;
       long claimedBefore = c.claimed.get(), joinedBefore = c.joined.get();
+      long degradedBefore = c.degraded.get();
       ExecutorService pool = Executors.newFixedThreadPool(N);
       CountDownLatch ready = new CountDownLatch(N), go = new CountDownLatch(1);
       List<Future<Boolean>> fs = new ArrayList<>();
@@ -212,17 +213,35 @@ public final class Suite {
       check(allOk, N + " concurrent readers all got correct bytes");
       int g = gets();
       long claimedNow = c.claimed.get() - claimedBefore, joinedNow = c.joined.get() - joinedBefore;
+      long degradedNow = c.degraded.get() - degradedBefore;
       // <= 3 rather than == 1: the leader publishes to the tier asynchronously,
       // so a reader arriving between the SET being issued and it landing can
       // legitimately miss and claim a second time. That window is real and
       // narrow; 23 duplicate fetches would not fit in it.
-      check(g <= 3, N + " concurrent cold readers of one chunk caused " + g
-          + " origin GETs (<= 3), a " + (100 - 100 * g / N) + "% saving");
+      //
+      // PLUS one per degraded reader, and that term is not slack. A reader
+      // whose tier operation exceeds its budget takes passthrough() -- it
+      // skips the tier AND the single-flight, and fetches from the origin on
+      // its own. That is D12.36 working as designed: a cache may never make a
+      // read slower than no cache. So origin GETs are claims plus degraded
+      // passthroughs, and on a contended two-core runner the second term is
+      // routinely nonzero.
+      //
+      // Without the term this check failed every CI run -- 6 GETs, then 4 --
+      // while single-flight was working correctly and only two readers ever
+      // claimed. It was reporting the runner's CPU contention as a product
+      // defect. The check stays armed because a genuine single-flight
+      // regression raises CLAIMS, which this bound does not forgive.
+      check(g <= 3 + degradedNow, N + " concurrent cold readers of one chunk caused "
+          + g + " origin GETs (<= 3 + " + degradedNow + " degraded), a "
+          + (100 - 100 * g / N) + "% saving");
       check(claimedNow >= 1,
           "armed-check: the single-flight path ran (" + claimedNow + " claimed)");
       System.out.println("       of " + N + " readers: " + claimedNow + " claimed, "
           + joinedNow + " joined in-flight, " + (N - claimedNow - joinedNow)
-          + " arrived after the fill and hit -- all three are single-flight working");
+          + " arrived after the fill and hit -- all three are single-flight working"
+          + (degradedNow > 0 ? "; " + degradedNow + " degraded past the tier on budget"
+                             + " (D12.36), each paying its own origin GET" : ""));
 
       // 4. mutation contract
       stat("/__reset");
