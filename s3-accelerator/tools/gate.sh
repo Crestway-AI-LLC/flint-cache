@@ -422,7 +422,7 @@ if [ -x "$PYENV/bin/python" ]; then
   FLINT_PYENV="$PYENV" PORT=9407 TIER_PORT=9400 \
     run_bounded bash "$ROOT/tools/cross_language_drill.sh" \
     >/tmp/gate_xlang.log 2>&1
-  verdict "cross-language cache sharing (16 checks)" $?
+  verdict "cross-language cache sharing (20 checks)" $?
 
   # The same SSE-KMS rule on the Python path. Not a duplicate of the JVM
   # stage: the two clients SHARE one tier, so a rule only one of them enforces
