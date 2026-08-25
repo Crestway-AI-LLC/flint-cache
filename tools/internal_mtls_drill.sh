@@ -40,7 +40,7 @@ INT="--internal-ca $D/ca.crt --internal-cert $D/int.crt --internal-key $D/int.ke
 echo "== flint-server with internal mTLS on the data port"
 $B --port 6770 --engine rocks --data-dir "$D/data" $INT 2>"$D/srv.log" &
 fleet_wait_listen 6770
-sleep 0.8
+fleet_wait_log "$D/srv.log" "internal mTLS"   # not a sleep: wait for the line the grep below asserts
 grep -q "internal mTLS" "$D/srv.log" || { echo "FAIL: server not in mTLS mode"; cat "$D/srv.log"; exit 1; }
 echo "  server up in internal-mTLS mode"
 
@@ -102,7 +102,7 @@ echo "== no --internal-* flags: server+proxy plaintext, unchanged"
 fleet_kill server; fleet_kill proxy; sleep 0.4
 $B --port 6771 --engine rocks --data-dir "$D/data2" 2>"$D/srv2.log" &
 fleet_wait_listen 6771
-sleep 0.6
+fleet_wait_log "$D/srv2.log" "plaintext"   # not a sleep: wait for the line the grep below asserts
 grep -q "plaintext" "$D/srv2.log" || { echo "FAIL: server not plaintext without flags"; exit 1; }
 $PX --port 7772 --pairs "127.0.0.1:6771" 2>"$D/px2.log" &
 fleet_wait_listen 7772

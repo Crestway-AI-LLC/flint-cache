@@ -60,7 +60,7 @@ $B --port 6702 --engine mem \
    --internal-ca "$CA" --internal-cert "$D/certs/int.crt" --internal-key "$D/certs/int.key" \
    2>"$D/node.log" &
 fleet_wait_listen 6702
-sleep 0.6   # not fleet_wait_ping: a plaintext PING at a TLS port never answers
+fleet_wait_log "$D/node.log" "internal mTLS"   # not a sleep: wait for the line the grep below asserts
 grep -q "internal mTLS" "$D/node.log" || { echo "FAIL: node not in mTLS mode"; sed 's/^/    /' "$D/node.log"; exit 1; }
 
 # flint-vec presents the serverAuth-only coproc leaf and verifies the proxy.

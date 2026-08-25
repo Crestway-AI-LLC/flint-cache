@@ -79,7 +79,7 @@ $B --port 6693 --engine mem \
   --internal-ca "$D/certs/ca.crt" --internal-cert "$D/certs/int.crt" --internal-key "$D/certs/int.key" \
   2>"$D/srv.log" &
 fleet_wait_listen 6693
-sleep 0.8   # not fleet_wait_ping: a plaintext PING at a TLS port never answers
+fleet_wait_log "$D/srv.log" "internal mTLS"   # not a sleep: wait for the line the grep below asserts
 grep -q "internal mTLS" "$D/srv.log" || { echo "FAIL: server not in mTLS mode"; sed 's/^/    /' "$D/srv.log"; exit 1; }
 echo "== node up on 6693 in internal-mTLS mode"
 
