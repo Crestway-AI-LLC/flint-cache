@@ -24,7 +24,8 @@ import fsspec
 import redis as redis_lib
 from s3fs import S3FileSystem, S3File
 
-from .tier import FlintTier, CHUNK, TIER_BUDGET_S, META_TTL_S
+from .tier import (FlintTier, CHUNK, TIER_BUDGET_S, META_TTL_S,
+                   MAX_OBJECT_BYTES)
 
 
 class _OriginAdapter:
@@ -84,6 +85,7 @@ class FlintS3FileSystem(S3FileSystem):
         "tier_budget_s": TIER_BUDGET_S,
         "meta_ttl_s": META_TTL_S,
         "cache_sse_kms": False,
+        "max_object_bytes": MAX_OBJECT_BYTES,
     }
 
     #: Set by install(**defaults). Read HERE -- it previously was not.
@@ -121,6 +123,7 @@ class FlintS3FileSystem(S3FileSystem):
         self._chunk = opts["chunk"]
         self._budget = opts["tier_budget_s"]
         self._meta_ttl = opts["meta_ttl_s"]
+        self._max_object = opts["max_object_bytes"]
         self._redis = None
         self._tier_obj = None
         # D13: SSE-C means the tier never sees the bytes. s3fs carries the
@@ -144,7 +147,8 @@ class FlintS3FileSystem(S3FileSystem):
                                        budget_s=self._budget,
                                        meta_ttl_s=self._meta_ttl,
                                        bypass=self._sse_c,
-                                       cache_kms=self._cache_kms)
+                                       cache_kms=self._cache_kms,
+                                       max_object_bytes=self._max_object)
         else:
             self._tier_obj.origin = origin      # per-file origin, shared cache
         return self._tier_obj

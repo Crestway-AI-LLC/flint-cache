@@ -20,6 +20,14 @@ import time
 import zlib
 
 CHUNK = 64 * 1024
+#: Objects larger than this are read straight from the origin and never
+#: chunk-cached. 5 GiB is S3's own single-PUT ceiling -- a boundary the domain
+#: already has, rather than a round number we invented.
+#:
+#: The cost being bounded is the KEYSPACE as much as the bytes. An object of
+#: size S occupies S/CHUNK keys, and at ~100 B of per-key overhead a 1 TB
+#: object costs ~1.7 GB of overhead before a single byte of its data is stored.
+MAX_OBJECT_BYTES = 5 * 1024 * 1024 * 1024
 TIER_BUDGET_S = 0.05          # any tier call slower than this is a miss
 META_TTL_S = 60
 
@@ -30,7 +38,7 @@ class Counters:
     __slots__ = ("chunk_hits", "chunk_misses", "meta_hits", "meta_misses",
                  "origin_gets", "origin_bytes", "tier_failures", "degraded",
                  "claimed", "joined", "bypassed", "integrity_failures",
-                 "kms_bypassed", "kms_undetectable")
+                 "kms_bypassed", "kms_undetectable", "oversize_bypassed")
 
     def __init__(self):
         for s in self.__slots__:
@@ -49,7 +57,7 @@ class FlintTier:
 
     def __init__(self, redis_client, origin, chunk=CHUNK,
                  budget_s=TIER_BUDGET_S, meta_ttl_s=META_TTL_S, bypass=False,
-                 cache_kms=False):
+                 cache_kms=False, max_object_bytes=MAX_OBJECT_BYTES):
         self.r = redis_client
         self.origin = origin
         self.chunk = chunk
@@ -59,6 +67,7 @@ class FlintTier:
         # Default FALSE and it must stay false: a default that silently caches
         # KMS plaintext is the version of this that ends a security review.
         self.cache_kms = cache_kms
+        self.max_object_bytes = max_object_bytes
         self._kms = {}
         self.c = Counters()
         self._inflight = {}
@@ -259,6 +268,19 @@ class FlintTier:
         # SHARED with the JVM client by design, so a gap here would let a
         # Python reader cache plaintext the JVM reader refuses to cache -- the
         # guarantee is only as strong as its weakest client.
+        # Capacity admission. Checked BEFORE the KMS probe so an oversize
+        # object costs no HEAD to reject, and counted rather than silent --
+        # "not cached because too large" and "not cached because something
+        # broke" must never look alike in the counters.
+        #
+        # size is None when the caller could not tell us; we cache in that
+        # case rather than guess, because refusing on an unknown is how a cap
+        # quietly turns into "cache nothing".
+        if size is not None and size > self.max_object_bytes:
+            self.c.oversize_bypassed += 1
+            self.c.origin_gets += 1
+            return self.origin.get(bucket, key, start, start + length - 1)
+
         if not self.cache_kms and self._is_kms(bucket, key):
             self.c.kms_bypassed += 1
             self.c.origin_gets += 1

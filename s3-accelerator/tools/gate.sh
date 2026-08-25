@@ -251,7 +251,7 @@ step "suites (classes)"
 # --delay-ms is not decoration: the single-flight suites need a window wide
 # enough for readers to actually collide, and these are the values each suite
 # was developed and validated against.
-run_suite "client suite (18 checks)"   ai.crestway.flintaccel.client.Suite   9301 "$ROOT/jvm-spike/target/classes:$CP" "--delay-ms 120"
+run_suite "client suite (24 checks)"   ai.crestway.flintaccel.client.Suite   9301 "$ROOT/jvm-spike/target/classes:$CP" "--delay-ms 120"
 run_suite "S3A properties (9 checks)"  ai.crestway.flintaccel.s3a.S3aSuite   9302 "$ROOT/jvm-spike/target/classes:$CP" "--delay-ms 150"
 run_suite "adoption paths (9 checks)"  ai.crestway.flintaccel.s3a.AdoptionSuite 9303 "$ROOT/jvm-spike/target/classes:$CP"
 run_suite "SSE-C bypass (5 checks)"    ai.crestway.flintaccel.s3a.SseCSuite  9304 "$ROOT/jvm-spike/target/classes:$CP"
@@ -267,7 +267,7 @@ run_suite "tier integrity, adversarial (20 checks)" ai.crestway.flintaccel.clien
 # size reports "<hash>-<partcount>" instead -- the workload this product exists
 # for. The whole 18-check suite runs again in that regime, and the drill checks
 # the suffix survives into the KEY, which correct bytes alone would not show.
-run_suite "client suite under MULTIPART etags (18 checks)" ai.crestway.flintaccel.client.Suite \
+run_suite "client suite under MULTIPART etags (24 checks)" ai.crestway.flintaccel.client.Suite \
     9307 "$ROOT/jvm-spike/target/classes:$CP" "--multipart-parts 4 --delay-ms 120"
 
 # Its own tier port, like the cross-language drill: this one starts and tears
@@ -381,7 +381,7 @@ if [ -x "$PYENV/bin/python" ]; then
   "$TIER_CLI" -p "$TIER_PORT" flushall >/dev/null 2>&1
   ( cd python && run_bounded "$PYENV/bin/python" suite.py \
       http://127.0.0.1:9401 redis://127.0.0.1:$TIER_PORT ) >/tmp/gate_python.log 2>&1
-  verdict "python suite (23 checks)" $?
+  verdict "python suite (27 checks)" $?
   stop_origin
 
   # fsspec's own abstract suite, against MOTO rather than counting_s3.

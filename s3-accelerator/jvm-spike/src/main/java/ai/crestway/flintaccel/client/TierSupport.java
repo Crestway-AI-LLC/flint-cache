@@ -84,15 +84,20 @@ public final class TierSupport {
     boolean immutable = "true".equalsIgnoreCase(
         or(get.apply("flint.immutable"), "false"));
     long immTtl = num(get.apply("flint.meta.ttl.immutable.seconds"), 86_400);
+    // Capacity admission (D17). Objects above this are read from the origin
+    // and never chunk-cached, bounding the keyspace one object can occupy as
+    // much as the bytes.
+    long maxObj = num(get.apply("flint.max.object.bytes"),
+        FlintObjectClient.DEFAULT_MAX_OBJECT_BYTES);
     var cfg = S3SeekableInputStreamConfiguration.DEFAULT;
     FlintObjectClient cl =
         new FlintObjectClient(new S3SdkObjectClient(s3, false), conn.async(),
-            chunk, budget, ttl, false, s3, cacheKms, immutable, immTtl);
+            chunk, budget, ttl, false, s3, cacheKms, immutable, immTtl, maxObj);
     TierSupport t = new TierSupport(redis, conn, s3, cl,
         new S3SeekableInputStreamFactory(cl, cfg),
         new S3SeekableInputStreamFactory(
             new FlintObjectClient(new S3SdkObjectClient(s3, false), conn.async(),
-                chunk, budget, ttl, true, s3, cacheKms, immutable, immTtl), cfg));
+                chunk, budget, ttl, true, s3, cacheKms, immutable, immTtl, maxObj), cfg));
     t.metrics = FlintCacheMetrics.register(cl, uri);
     return t;
   }

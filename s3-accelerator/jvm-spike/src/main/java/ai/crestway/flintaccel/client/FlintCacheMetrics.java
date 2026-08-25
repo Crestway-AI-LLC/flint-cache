@@ -66,6 +66,7 @@ public final class FlintCacheMetrics implements FlintCacheMXBean {
   @Override public long getOriginBytes()        { return c.originBytes.get(); }
   @Override public long getSingleFlightJoins()  { return c.joined.get(); }
   @Override public long getSseKmsBypassed()     { return c.kmsBypassed.get(); }
+  @Override public long getOversizeBypassed()   { return c.oversizeBypassed.get(); }
   @Override public long getSseKmsUndetectable() { return c.kmsUndetectable.get(); }
   @Override public boolean isBreakerOpen()      { return c.isBreakerOpen(); }
   @Override public long getBreakerOpens()       { return c.breakerOpens.get(); }
@@ -96,6 +97,10 @@ public final class FlintCacheMetrics implements FlintCacheMXBean {
         getOriginGets(), getOriginBytes() / (1024 * 1024)));
     // Only mention the failure modes when they are happening. A summary that
     // always lists everything trains the reader to skip it.
+    if (getOversizeBypassed() > 0) {
+      b.append(String.format("; %d reads BYPASSED (object above "
+          + "flint.max.object.bytes = %d)", getOversizeBypassed(), c.maxObjectBytes));
+    }
     if (getSseKmsBypassed() > 0) {
       b.append(String.format("; %d reads BYPASSED (SSE-KMS, off by default -- "
           + "set flint.cache.sse-kms=true to accelerate them)", getSseKmsBypassed()));

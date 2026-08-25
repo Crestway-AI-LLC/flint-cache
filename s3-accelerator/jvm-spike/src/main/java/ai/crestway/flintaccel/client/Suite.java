@@ -279,6 +279,41 @@ public final class Suite {
           "negative control -- the CACHING client does populate the tier ("
               + keysAfterCaching + " keys)");
 
+      // 5b. D17: an object above the cap is READ, and never cached.
+      //
+      // The bound is on the KEYSPACE as much as the bytes -- an object of size
+      // S occupies S/chunkBytes keys, so one very large object can cost more
+      // in per-key overhead than its data is worth to anybody sharing the
+      // tier. The corpus objects here are 8 MiB, so a 1 MiB cap makes them
+      // oversize without needing a special fixture.
+      stat("/__reset");
+      conn.sync().flushall();
+      String k7 = "data/000007.bin";
+      var capped = new FlintObjectClient(sdk, conn.async(), 64 * 1024, 50, 2,
+          false, s3, false, false, 86_400, 1024 * 1024);
+      byte[] big = read(capped, k7, 300_000, 8192);
+      check(genOf(k7, 300_000, big) == 0, "an oversize object still READS correctly");
+      // CHUNK keys, not dbsize. The cap is a CAPACITY rule and metadata is
+      // ~50 bytes that saves a HEAD, so an oversize object still caches its
+      // metadata. Only D13's SSE-C bypass suppresses both, because that one
+      // is a SECURITY rule and the length and etag of bytes we must not see
+      // are themselves something we must not store. Asserting dbsize()==0
+      // here conflated the two policies and failed on the metadata entry.
+      long chunksAfterCap = conn.sync().keys("c1/*".getBytes(java.nio.charset.StandardCharsets.UTF_8)).size();
+      check(chunksAfterCap == 0,
+          "D17: above the cap the tier got NO CHUNKS (" + chunksAfterCap + ")");
+      check(conn.sync().keys("m1/*".getBytes(java.nio.charset.StandardCharsets.UTF_8)).size() > 0,
+          "and its METADATA is still cached -- a capacity cap, not a security bypass");
+      check(capped.oversizeBypassed.get() > 0,
+          "armed-check: counted as oversize (" + capped.oversizeBypassed.get()
+              + "), not silently missing");
+      // The control carries the weight: without it, a client that cached
+      // nothing for ANY reason would pass both checks above.
+      byte[] uncapped = read(c, k7, 300_000, 8192);
+      check(Arrays.equals(big, uncapped), "capped and uncapped return identical bytes");
+      check(conn.sync().dbsize() > 0,
+          "negative control -- UNDER the cap the same object IS cached");
+
       // 6. THE INTERACTION (LAST -- it kills the tier and does not restart it): tier dies while readers are joined in flight.
       //    Neither the resilience spike nor the concurrency spike covers this;
       //    a follower joined to a leader that dies with the tier could wait

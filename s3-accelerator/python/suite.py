@@ -172,6 +172,34 @@ def main():
           f"and the rewritten object reads back WHOLE ({len(got_short)} bytes, want {len(SHORT)})"
           " -- not truncated to the cached length")
 
+    # D17 -- an object above the cap is read, but never cached
+    #
+    # The bound is on the KEYSPACE as much as the bytes: an object of size S
+    # occupies S/CHUNK keys, so a single very large object can cost more in
+    # per-key overhead than its data is worth to anyone.
+    rc.flushall(); stats(ep, "/__reset")
+    BIG = "s3://bucket/scratch/oversize.bin"
+    payload = b"O" * 200_000
+    fs().pipe_file(BIG, payload)
+
+    small = flint_accel.FlintS3FileSystem(skip_instance_cache=True,
+                                          max_object_bytes=100_000, **so)
+    with small.open(BIG, "rb") as h:
+        h.seek(0); over = h.read(len(payload))
+    check(over == payload, "an oversize object still READS correctly")
+    check(len([k for k in rc.scan_iter(match=b"c1/*")]) == 0,
+          "and wrote NO chunks to the tier")
+    check(small.counters["oversize_bypassed"] > 0,
+          f"counted, not silent ({small.counters['oversize_bypassed']} bypassed)"
+          " -- 'too large' must not look like 'the cache broke'")
+    # The control matters more than the check: without it, a client that
+    # cached nothing at all for any reason would pass the two checks above.
+    rc.flushall()
+    with fs().open(BIG, "rb") as h:
+        h.seek(0); h.read(len(payload))
+    check(len([k for k in rc.scan_iter(match=b"c1/*")]) > 0,
+          "negative control -- UNDER the cap the same object IS cached")
+
     # how much does fsspec's block cache pull for a small read?
     rc.flushall(); stats(ep, "/__reset")
     with fs().open("s3://bucket/data/000006.bin", "rb") as fh:

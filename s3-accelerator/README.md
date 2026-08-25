@@ -131,6 +131,7 @@ assumed to be zero.
 | metadata TTL | `fs.s3a.flint.meta.ttl.seconds` | `flint.meta.ttl.seconds` | `meta_ttl_s` | 60 s |
 | cache SSE-KMS | `fs.s3a.flint.cache.sse-kms` | `flint.cache.sse-kms` | `cache_sse_kms` | `false` |
 | declare immutable | `fs.s3a.flint.immutable` | `flint.immutable` | — | `false` (**`true`** on the Iceberg path) |
+| max cached object | `fs.s3a.flint.max.object.bytes` | `flint.max.object.bytes` | `max_object_bytes` | 5 GiB |
 | immutable TTL | `fs.s3a.flint.meta.ttl.immutable.seconds` | `flint.meta.ttl.immutable.seconds` | — | 86400 s |
 
 **Immutability is a declaration the engine can make and the cache cannot
