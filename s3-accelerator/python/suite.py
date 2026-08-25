@@ -132,6 +132,46 @@ def main():
     check(rc.dbsize() > 0,
           f"negative control -- without SSE-C the tier IS populated ({rc.dbsize()} keys)")
 
+    # D16 -- a write through this client must FORGET the object's metadata
+    #
+    # The cached entry carries the object LENGTH, and that makes staleness
+    # worse than stale: a path rewritten SHORTER leaves a reader believing the
+    # object ends where the old one did, so reads stop early with EOF instead
+    # of returning old bytes. The JVM side hit exactly this and Hadoop's
+    # contract suite caught it, because it rewrites one path repeatedly.
+    # Nothing on this side did, because every suite we wrote read objects it
+    # never wrote.
+    #
+    # A TTL is not an answer here. It bounds how long an entry survives a
+    # change made ELSEWHERE, which is the D3 contract; it says nothing about
+    # this process contradicting itself, and that window is the only one a
+    # caller can actually observe.
+    rc.flushall(); stats(ep, "/__reset")
+    KW = "s3://bucket/scratch/rewrite.bin"
+    LONG, SHORT = b"L" * 40_000, b"S" * 900
+    w = fs()
+    w.pipe_file(KW, LONG)
+    # A FRESH reader. Reading back through the instance that just wrote hits
+    # s3fs's own dircache, so _info delegates and never reaches the tier --
+    # which is correct, and would have made the next check unarmed.
+    # open()/read(), not cat_file(): cat_file is a one-shot ranged GET that
+    # never resolves details, so it does not go through _info and would leave
+    # the tier empty -- making every check below pass on 0 == 0.
+    def _whole(path):
+        with fs().open(path, "rb") as h:
+            return h.read()
+    check(_whole(KW) == LONG, "armed: the origin stores and returns what we wrote")
+    mk = list(rc.scan_iter(match=b"m1/*"))
+    check(len(mk) > 0, f"armed: reading it cached the metadata ({len(mk)} m1/ entries)")
+
+    w.pipe_file(KW, SHORT)
+    check(len(list(rc.scan_iter(match=b"m1/*"))) == 0,
+          "a write through this client DROPS the cached metadata")
+    got_short = _whole(KW)
+    check(got_short == SHORT,
+          f"and the rewritten object reads back WHOLE ({len(got_short)} bytes, want {len(SHORT)})"
+          " -- not truncated to the cached length")
+
     # how much does fsspec's block cache pull for a small read?
     rc.flushall(); stats(ep, "/__reset")
     with fs().open("s3://bucket/data/000006.bin", "rb") as fh:

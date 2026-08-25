@@ -260,11 +260,21 @@ class FlintS3FileSystem(S3FileSystem):
         the shared entries are left to their TTL.
         """
         super().invalidate_cache(path)
-        t = self._tier_obj
-        if t is None:
-            return
         if path is None:
-            t._kms.clear()
+            # "Forget everything" clears the LOCAL memo only. s3fs implements
+            # it by clearing its own dict; the tier is SHARED, so doing the
+            # equivalent would throw away work every other reader paid for.
+            if self._tier_obj is not None:
+                self._tier_obj._kms.clear()
+            return
+        # Lazily, because an instance that has only ever WRITTEN has no tier
+        # object yet -- and it is exactly the instance whose writes must
+        # invalidate. Guarding on self._tier_obj meant a writer silently
+        # skipped invalidation and left a stale entry for every reader sharing
+        # the tier. The entry carries the object LENGTH, so that is not merely
+        # stale: a path rewritten shorter makes readers stop at EOF early.
+        t = self._meta_tier()
+        if t is None:
             return
         try:
             b, k, _v = self.split_path(self._strip_protocol(path))
