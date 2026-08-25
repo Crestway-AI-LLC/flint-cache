@@ -20,14 +20,44 @@ import time
 import zlib
 
 CHUNK = 64 * 1024
-#: Objects larger than this are read straight from the origin and never
-#: chunk-cached. 5 GiB is S3's own single-PUT ceiling -- a boundary the domain
-#: already has, rather than a round number we invented.
+#: What fsspec's block cache fetches per miss. NOT the chunk size, and not
+#: fsspec's own 5 MiB either -- a chosen point on a trade that has no free one.
 #:
-#: The cost being bounded is the KEYSPACE as much as the bytes. An object of
-#: size S occupies S/CHUNK keys, and at ~100 B of per-key overhead a 1 TB
-#: object costs ~1.7 GB of overhead before a single byte of its data is stored.
-MAX_OBJECT_BYTES = 5 * 1024 * 1024 * 1024
+#: MEASURED, 64 MiB object, counts exact. The two axes pull against each other:
+#:
+#:   block     sparse read pulls   small-sequential tier round trips
+#:   5 MiB     31x what was asked   3
+#:   1 MiB     17x                  9
+#:   256 KiB   5.0x                33
+#:   64 KiB    2.0x               122
+#:
+#: 256 KiB takes most of the amplification win while keeping small-sequential
+#: reads inside ~10x rather than 40x. Large sequential reads are indifferent at
+#: every value: identical bytes, 8 tier round trips, because contiguous chunk
+#: runs coalesce into one origin range GET however fsspec slices the request.
+BLOCK_BYTES = 256 * 1024
+#: Objects larger than this are read straight from the origin and never
+#: chunk-cached.
+#:
+#: 512 MiB (Jeff, 2026-08-25). The reasoning that sets it is PAYOFF, not
+#: keyspace. Measured: a warm read moves the SAME bytes as a cold one -- the
+#: cache does not reduce data transferred, it changes where the data comes
+#: from. So for a large object read sequentially the entire benefit is
+#: bytes x (1/S3_throughput - 1/tier_throughput), which is near zero against
+#: parallel range GETs on a fast NIC and NEGATIVE when the tier is slower.
+#: Past some size a client is better off going straight to S3.
+#:
+#: 512 MiB sits above the data files this cache is actually for -- Parquet and
+#: Iceberg land at 128-512 MB -- so the analytics working set still caches
+#: while objects whose only payoff is a throughput differential do not.
+#:
+#: The keyspace argument still holds underneath: an object of size S occupies
+#: S/CHUNK keys, and at ~100 B of per-key overhead a 1 TB object would cost
+#: ~1.7 GB of overhead before a single byte of its data is stored.
+#:
+#: THIS NUMBER IS AN ARGUMENT, NOT A FINDING. The real crossover wants
+#: measuring on a cluster; tracked, blocked on M0.
+MAX_OBJECT_BYTES = 512 * 1024 * 1024
 TIER_BUDGET_S = 0.05          # any tier call slower than this is a miss
 META_TTL_S = 60
 

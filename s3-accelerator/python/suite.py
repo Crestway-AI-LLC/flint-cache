@@ -14,6 +14,7 @@ import redis as redis_lib
 
 sys.path.insert(0, ".")
 import flint_accel
+from flint_accel.tier import BLOCK_BYTES
 
 OK = [True]
 
@@ -218,10 +219,22 @@ def main():
     tuned, asked = sparse_cost(fs())
     wide, _ = sparse_cost(flint_accel.FlintS3FileSystem(
         skip_instance_cache=True, default_block_size=5 * 1024 * 1024, **so))
+    # Pin the DECISION, not a ratio. 256 KiB is a chosen point on a trade with
+    # no free point (ADR-0023 D19), so the value itself is the thing a
+    # regression would move -- and an exact check cannot drift the way a
+    # threshold tuned to whatever was measured that day does.
+    check(fs().default_block_size == BLOCK_BYTES,
+          f"the block size default is the chosen {BLOCK_BYTES // 1024} KiB")
     check(tuned < wide,
           f"our default block pulls LESS than fsspec's ({tuned} < {wide} bytes)")
-    check(tuned <= asked * 3,
-          f"a selective read drags <= 3x what it asked for ({tuned/asked:.1f}x)")
+    # Bound DERIVED, not tuned: fsspec fetches a block per miss and reads one
+    # ahead, so a 64 KiB read against a 256 KiB block cannot exceed
+    # 2 x block / read = 8x. Measured 5.0x. A bound computed from the
+    # constants stays correct when the constants change; one copied from a
+    # measurement has to be rediscovered every time they do.
+    bound = 2 * BLOCK_BYTES / (64 * 1024)
+    check(tuned <= asked * bound,
+          f"a selective read drags <= {bound:.0f}x what it asked for ({tuned/asked:.1f}x)")
     # Without this the two checks above would both pass against a client that
     # had simply stopped reading anything.
     check(wide > asked * 5,

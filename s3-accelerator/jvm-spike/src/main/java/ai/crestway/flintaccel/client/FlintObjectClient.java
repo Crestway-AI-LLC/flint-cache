@@ -89,12 +89,26 @@ public final class FlintObjectClient implements ObjectClient {
    */
   public final long metaTtlImmutableSec;
   /** Objects above this are read from the origin and never chunk-cached.
-   *  5 GiB is S3's own single-PUT ceiling -- a boundary the domain already
-   *  has, rather than a round number we invented. The cost being bounded is
-   *  the KEYSPACE as much as the bytes: an object of size S occupies
-   *  S/chunkBytes keys, so at ~100 B of per-key overhead a 1 TB object costs
-   *  ~1.7 GB before a single byte of its data is stored. */
-  public static final long DEFAULT_MAX_OBJECT_BYTES = 5L * 1024 * 1024 * 1024;
+   *
+   *  512 MiB (Jeff, 2026-08-25), and the reasoning is PAYOFF rather than
+   *  keyspace. Measured: a warm read moves the SAME bytes as a cold one -- the
+   *  cache does not reduce data transferred, it changes where it comes from.
+   *  So for a large object read sequentially the whole benefit is
+   *  bytes x (1/S3_throughput - 1/tier_throughput): near zero against parallel
+   *  range GETs on a fast NIC, and NEGATIVE when the tier is slower. Past some
+   *  size the client is better off going to S3 directly.
+   *
+   *  512 MiB sits above the data files this cache is for -- Parquet and
+   *  Iceberg land at 128-512 MB -- so the analytics working set still caches
+   *  while objects whose only payoff is a throughput differential do not.
+   *
+   *  The keyspace argument still holds underneath: an object of size S occupies
+   *  S/chunkBytes keys, so a 1 TB object would cost ~1.7 GB of per-key overhead
+   *  before a byte of its data is stored.
+   *
+   *  THIS NUMBER IS AN ARGUMENT, NOT A FINDING -- the crossover wants measuring
+   *  on a cluster. Tracked, blocked on M0. */
+  public static final long DEFAULT_MAX_OBJECT_BYTES = 512L * 1024 * 1024;
   public final long maxObjectBytes;
   private final Map<String, Boolean> oversizeSeen = new ConcurrentHashMap<>();
   private final boolean immutable;

@@ -25,7 +25,7 @@ import redis as redis_lib
 from s3fs import S3FileSystem, S3File
 
 from .tier import (FlintTier, CHUNK, TIER_BUDGET_S, META_TTL_S,
-                   MAX_OBJECT_BYTES)
+                   MAX_OBJECT_BYTES, BLOCK_BYTES)
 
 
 class _OriginAdapter:
@@ -119,23 +119,20 @@ class FlintS3FileSystem(S3FileSystem):
                 kw.setdefault(k, v)
 
         # fsspec's block cache decides how much s3fs drags from the origin to
-        # serve a small read, and its default block is 80x our chunk. MEASURED
-        # on a 64 MiB object with 32 x 64 KiB sparse reads: 62.1 MiB pulled at
-        # the default -- 31x what the application asked for -- against 4.0 MiB
-        # at 64 KiB. AAL fetches exactly the requested range and has no such
-        # cost, so this was the Python path paying a penalty the JVM path did
-        # not, on the same access pattern.
+        # serve a read, and this default is a TRADE, not a tuning win. Smaller
+        # blocks cut read amplification and raise warm-path tier round trips;
+        # the two move monotonically against each other, so there is no free
+        # point. BLOCK_BYTES carries the measured table and the chosen value.
         #
-        # The amplified bytes are paid on EVERY read, warm ones included: they
-        # still have to cross the tier. And the trade-off that would normally
-        # block this does not exist -- measured, a smaller block does NOT cost
-        # more requests on sequential reads (2 origin GETs against 8 for the
-        # same 64 MiB, identical bytes), because contiguous chunk runs coalesce
-        # into one origin range GET regardless of how fsspec slices them.
+        # It was briefly set to the chunk size on the strength of the
+        # amplification number alone -- 31x down to 2.0x -- which looked free
+        # because every axis instrumented at the time lived on the S3 side of
+        # the cache. The cost was on the tier side, unmeasured: 8 MiB walked in
+        # 4 KiB reads went from 3 round trips to 122.
         #
         # setdefault, so an explicit argument still wins and so does anything
         # install() was handed.
-        kw.setdefault("default_block_size", opts["chunk"])
+        kw.setdefault("default_block_size", BLOCK_BYTES)
 
         super().__init__(*args, **kw)
         self._tier_uri = opts["tier_uri"]
