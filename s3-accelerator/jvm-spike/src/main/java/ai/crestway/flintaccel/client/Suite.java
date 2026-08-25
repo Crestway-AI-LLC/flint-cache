@@ -103,16 +103,33 @@ public final class Suite {
         "no Redis-protocol server found (tried " + tries + ")", last);
   }
 
+  /** The port of the tier this suite was GIVEN, not a constant.
+   *
+   * It was "9399" in both methods while the client dialled whatever redisUrl
+   * named. When the gate moved its tier to another port, killTier() shut down
+   * port 9399 -- a stranger's server, on a shared machine -- while the client's
+   * own tier stayed up, so "tier failures were observed" observed none and the
+   * suite failed pointing at the product. startTier() then left a NEW
+   * daemonized server on 9399 behind it. One hardcode, three wrong outcomes:
+   * a false failure, a neighbour's process killed, and a leak.
+   */
+  static int tierPort() {
+    int i = redisUrl.lastIndexOf(':');
+    if (i < 0) return 9399;
+    String tail = redisUrl.substring(i + 1).replaceAll("[^0-9].*$", "");
+    return tail.isEmpty() ? 9399 : Integer.parseInt(tail);
+  }
+
   static void startTier() throws Exception {
     runTier("FLINT_TIER_SERVER", new String[] {"valkey-server", "redis-server"},
-        "--port", "9399", "--save", "", "--appendonly", "no", "--daemonize", "yes")
-        .waitFor();
+        "--port", String.valueOf(tierPort()), "--save", "", "--appendonly", "no",
+        "--daemonize", "yes").waitFor();
     Thread.sleep(700);
   }
 
   static void killTier() throws Exception {
     runTier("FLINT_TIER_CLI", new String[] {"valkey-cli", "redis-cli"},
-        "-p", "9399", "shutdown", "nosave").waitFor();
+        "-p", String.valueOf(tierPort()), "shutdown", "nosave").waitFor();
     Thread.sleep(600);
   }
 

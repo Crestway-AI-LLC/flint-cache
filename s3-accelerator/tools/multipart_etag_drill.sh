@@ -25,6 +25,13 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 export JAVA_HOME="${JAVA_HOME:-/opt/homebrew/opt/openjdk@21}"
 export PATH="$JAVA_HOME/bin:$PATH"
 MP=${MP_PORT:-9528}; SP=${SP_PORT:-9529}
+# Its own tier, on its own port. This used to start a tier on the gate's 9399
+# -- adopting it, since --daemonize returns 0 on a failed bind -- and then
+# SHUT IT DOWN from its EXIT trap. Every later gate stage depended on that
+# tier. It survived only because start_svcs silently restarted one, so the
+# breakage looked like nothing at all.
+TIER_PORT=${TIER_PORT:-9399}
+TIER_URI="redis://127.0.0.1:$TIER_PORT"
 PASS=0; FAIL=0
 ck() { if [ "$1" = 0 ]; then PASS=$((PASS+1)); printf "[ok] %s\n" "$2";
        else FAIL=$((FAIL+1)); printf "[FAIL] %s\n" "$2"; fi; }
@@ -33,17 +40,34 @@ ck() { if [ "$1" = 0 ]; then PASS=$((PASS+1)); printf "[ok] %s\n" "$2";
 cleanup() {
   [ -n "${A:-}" ] && kill "$A" 2>/dev/null
   [ -n "${B:-}" ] && kill "$B" 2>/dev/null
-  [ -n "${TIER_CLI:-}" ] && "$TIER_CLI" -p 9399 shutdown nosave 2>/dev/null
+  [ -n "${TIER_PID:-}" ] && kill "$TIER_PID" 2>/dev/null
   return 0
 }
 trap cleanup EXIT
 
-command -v valkey-server >/dev/null || { echo "SKIP: no "$TIER_SERVER""; exit 0; }
+[ -n "$TIER_SERVER" ] && [ -n "$TIER_CLI" ] || { echo "SKIP: no redis/valkey server on PATH"; exit 0; }
 CP_FILE="${CP_FILE:-/tmp/gate_cp.txt}"
 [ -f "$CP_FILE" ] || { echo "SKIP: no maven classpath"; exit 0; }
 CP="$ROOT/jvm-spike/target/classes:$(cat "$CP_FILE")"
 
-"$TIER_SERVER" --port 9399 --save '' --appendonly no --daemonize yes
+python3 - "$TIER_PORT" <<'FREE' || { echo "FAIL: port $TIER_PORT in use -- refusing to adopt a tier this drill did not start."; exit 1; }
+import socket, sys
+s = socket.socket()
+try:
+    s.bind(("127.0.0.1", int(sys.argv[1])))
+except OSError:
+    sys.exit(1)
+finally:
+    s.close()
+FREE
+"$TIER_SERVER" --port "$TIER_PORT" --save '' --appendonly no \
+  >/tmp/mp_tier.log 2>&1 & TIER_PID=$!
+for _ in $(seq 1 40); do "$TIER_CLI" -p "$TIER_PORT" ping >/dev/null 2>&1 && break; sleep 0.2; done
+"$TIER_CLI" -p "$TIER_PORT" ping >/dev/null 2>&1 \
+  || { echo "FAIL: tier never answered on $TIER_PORT"; exit 1; }
+TIER_OWNED=$("$TIER_CLI" -p "$TIER_PORT" info server 2>/dev/null | tr -d '\r' | awk -F: '/^process_id:/{print $2}')
+[ "$TIER_OWNED" = "$TIER_PID" ] \
+  || { echo "FAIL: tier on $TIER_PORT has pid $TIER_OWNED, we started $TIER_PID -- not ours."; exit 1; }
 python3 "$ROOT/tools/counting_s3.py" --port "$MP" --objects 4 --object-bytes 1048576 \
   --multipart-parts 4 >/tmp/mp_origin.log 2>&1 & A=$!
 python3 "$ROOT/tools/counting_s3.py" --port "$SP" --objects 4 --object-bytes 1048576 \
@@ -51,8 +75,8 @@ python3 "$ROOT/tools/counting_s3.py" --port "$SP" --objects 4 --object-bytes 104
 sleep 3
 
 probe() { java -cp "$CP" ai.crestway.flintaccel.client.CrossLangProbe \
-          "http://127.0.0.1:$1" bucket data/000001.bin 100000 >/dev/null 2>&1; }
-nkeys() { "$TIER_CLI" -p 9399 --scan --pattern "$1" | wc -l | tr -d ' '; }
+          "http://127.0.0.1:$1" bucket data/000001.bin 100000 "$TIER_URI" >/dev/null 2>&1; }
+nkeys() { "$TIER_CLI" -p "$TIER_PORT" --scan --pattern "$1" | wc -l | tr -d ' '; }
 
 # --- 1. the ETag really is multipart-shaped at the origin -------------------
 ET=$(curl -sI "http://127.0.0.1:$MP/bucket/data/000001.bin" | tr -d '\r' | grep -i '^etag' | cut -d' ' -f2)
@@ -61,7 +85,7 @@ ETSP=$(curl -sI "http://127.0.0.1:$SP/bucket/data/000001.bin" | tr -d '\r' | gre
 [[ "$ETSP" != *-4* ]]; ck $? "control: the other origin reports a plain one ($ETSP)"
 
 # --- 2. multipart: bytes correct AND the suffix survives into the key -------
-"$TIER_CLI" -p 9399 flushall >/dev/null; probe "$MP"
+"$TIER_CLI" -p "$TIER_PORT" flushall >/dev/null; probe "$MP"
 T=$(nkeys 'c1/*'); S=$(nkeys 'c1/*-4/*')
 [ "$T" -gt 0 ]; ck $? "armed: the multipart read populated the tier ($T chunks)"
 [ "$S" -eq "$T" ]; ck $? "EVERY key carries the -N suffix ($S of $T) -- the ETag is not being mangled"
@@ -76,7 +100,7 @@ ck $? "and the bytes are correct under a multipart ETag"
 
 # --- 3. the control. Without it, "0 suffixed keys" would be satisfied by a
 #        run that cached nothing at all -- which is how a dead origin looks.
-"$TIER_CLI" -p 9399 flushall >/dev/null; probe "$SP"
+"$TIER_CLI" -p "$TIER_PORT" flushall >/dev/null; probe "$SP"
 T2=$(nkeys 'c1/*'); S2=$(nkeys 'c1/*-4/*')
 [ "$T2" -gt 0 ]; ck $? "armed: the single-part read populated the tier ($T2 chunks)"
 [ "$S2" -eq 0 ]; ck $? "control: NO key carries a suffix under single-part ETags ($S2)"
