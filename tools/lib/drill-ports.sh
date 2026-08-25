@@ -67,6 +67,31 @@ drill_declared_ports() {
 # negative control — "with the peer's ports removed, its path-less seat must
 # read as foreign again" — could no longer fire. The check that caught it was
 # the drill itself, on the next gate.
+# Ports bound ELSEWHERE IN THE REPO by things that are not drills.
+#
+# For the ALLOCATOR ONLY, and the distinction is deliberate. The gate's
+# assertions police tools/ — a drill's declaration is a contract with
+# _fleet_ours and with the other drills. s3-accelerator/ is a separate product
+# surface with its own gate, its own CI workflow and its own owners; making
+# assert_no_duplicate_drill_ports scan it would be this suite passing judgement
+# on a tree it does not own.
+#
+# But handing out a port that something in this repo is ALREADY BINDING is a
+# different question, and the answer is simply no. That was not hypothetical:
+# next-free-ports.sh gave out 6388-6390 for the conformance stage while the
+# accelerator's gate took 6391 for its tier. Adjacent by luck. Ask for four
+# ports instead of three that afternoon and the allocator would have handed
+# over a port already in use, and the collision would have surfaced as one of
+# the two gates failing for reasons neither could see.
+#
+# So the allocator RESERVES these and asserts nothing about them.
+repo_bound_ports() {
+  local root="${1:-.}"
+  grep -rhoE '(--port|--listen|-p)[[:space:]]+[0-9]{4,5}|127\.0\.0\.1:[0-9]{4,5}|localhost:[0-9]{4,5}' \
+    "$root/s3-accelerator" 2>/dev/null \
+    | grep -oE '[0-9]{4,5}$' | sort -un
+}
+
 DRILL_DEAD_PORTS="6999 7999 7788 7789"
 
 drill_is_dead_port() {

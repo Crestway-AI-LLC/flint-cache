@@ -39,7 +39,10 @@ case "$N" in ''|*[!0-9]*) echo "N must be a positive integer, got '$N'" >&2; exi
 [ "$N" -ge 1 ] || { echo "N must be >= 1" >&2; exit 2; }
 case "$BASE" in ''|*[!0-9]*) echo "--base must be an integer, got '$BASE'" >&2; exit 2 ;; esac
 
-CLAIMED=$(drill_declared_ports | awk '{print $1}' | sort -un)
+# Drill declarations UNION anything else in the repo already binding a port.
+# The gate asserts on the first set only; the allocator must avoid both, or it
+# suggests a port that is free according to tools/ and taken in fact.
+CLAIMED=$( { drill_declared_ports | awk '{print $1}'; repo_bound_ports "$(dirname "$0")/.."; } | sort -un)
 is_claimed() { printf '%s\n' "$CLAIMED" | grep -qx "$1"; }
 
 p="$BASE"
