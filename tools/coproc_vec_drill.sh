@@ -88,9 +88,40 @@ echo "== durable rows exist in KV independent of the co-processor"
 # vectors by SCANning the whole tenant keyspace on every cold start. A change
 # to the durable layout is SUPPOSED to move this number; the breakdown above
 # and the key dump below are what make the next move take a minute.
-[ "$($A DBSIZE 2>&1 | tr -d '\r')" = "15" ] \
-  || { echo "FAIL: expected 15 durable keys (2 configs + 6 vectors + 1 set-name index + 6 id-index buckets), got $($A DBSIZE)"
-       $A SCAN 0 COUNT 200 2>/dev/null | sed 's/^/    key| /'; exit 1; }
+# COUNTED BY KIND, not compared against a total. The total was 8 until #194
+# added the durable id index, and the drill then reported seven NEW keys as
+# seven LOST ones. Correcting 8 to 15 fixed that instance and left the shape:
+# a single number that says nothing about WHICH part moved when it next moves.
+#
+# The branch fix for this re-derived the total by reimplementing FNV-1a and
+# INDEX_BUCKETS in Python, inside the drill. That trades a stale constant for a
+# second copy of the hash which can drift from flint_vec::bucket_of silently —
+# and two implementations of one invariant is the thing this repo keeps paying
+# for. Counting kinds needs no hash at all.
+#
+# Keys are KEY_PREFIX + kind + NUL + set [+ NUL + id] (flint-vec durable_key),
+# so each kind is countable directly:
+#   s  one set-name index per namespace
+#   c  one config per set
+#   v  one row per (set, id)
+#   i  one per (set, DISTINCT bucket) — BOUNDED by the ids, not predicted from
+#      them, because a hash collision may only ever REDUCE this count
+# The total survives only as an equality, whose single job is to catch keys of
+# a kind nobody expected. That is what the bare number was really guarding.
+VKEYS=$($A --no-raw SCAN 0 COUNT 500 2>/dev/null)
+vkind() { printf '%s\n' "$VKEYS" | grep -cF "\\x00vec\\x00$1\\x00" || true; }
+N_S=$(vkind s); N_C=$(vkind c); N_V=$(vkind v); N_I=$(vkind i)
+N_TOT=$($A DBSIZE 2>&1 | tr -d '\r')
+vfail() { echo "FAIL: durable layout — $1"
+          echo "      counted: s=$N_S c=$N_C v=$N_V i=$N_I  dbsize=$N_TOT"
+          $A --no-raw SCAN 0 COUNT 500 2>/dev/null | sed 's/^/    key| /'; exit 1; }
+[ "$N_S" = 1 ] || vfail "expected 1 set-name index ('s'), got $N_S"
+[ "$N_C" = 2 ] || vfail "expected 2 configs ('c', one per set), got $N_C"
+[ "$N_V" = 6 ] || vfail "expected 6 vector rows ('v', 3 ids x 2 sets), got $N_V"
+[ "$N_I" -ge 2 ] && [ "$N_I" -le 6 ] \
+  || vfail "id-index buckets ('i') = $N_I, outside 2..6 (>=1 and <=3 per set)"
+[ "$N_TOT" = "$(( N_S + N_C + N_V + N_I ))" ] \
+  || vfail "dbsize $N_TOT != s+c+v+i = $(( N_S + N_C + N_V + N_I )) — a key of an unexpected kind exists"
 
 echo "== CRASH DURABILITY: kill the co-processor, restart it EMPTY, SEARCH rebuilds"
 kill -9 "$COPROC_PID" 2>/dev/null; wait "$COPROC_PID" 2>/dev/null; COPROC_PID=""

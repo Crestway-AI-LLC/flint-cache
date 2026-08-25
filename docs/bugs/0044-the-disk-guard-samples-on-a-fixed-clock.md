@@ -229,7 +229,9 @@ registered drills as unlisted, one per line of CORE.
 
 #### Still open from this audit
 
-- `542da86`'s derived row count — the constant is correct and will not stay so.
+- ~~`542da86`'s derived row count~~ **CLOSED 2026-08-25.** Both drills now count
+  durable keys BY KIND, so no total is predicted and no hash is reimplemented.
+  Details below; the specification that preceded it is kept for the reasoning.
   **Do not take the branch's fix as written.** It derives the expected total by
   reimplementing FNV-1a and `INDEX_BUCKETS` in Python, inside the drill. That
   swaps a constant that goes stale for a second implementation of the hash that
@@ -277,3 +279,33 @@ registered drills as unlisted, one per line of CORE.
   fast walk outruns the kill schedule. A contended CI runner walks slower and
   should land more. If this drill ever fails to arm, the machine got faster or
   quieter, and the fix is the one the message names — not a timeout.
+
+### 2026-08-25 — the durable-row check, closed by counting instead of predicting
+
+Both `coproc_vec` and `coproc_vec_tls` asserted a single durable-key total (15
+and 8). They now count by kind and assert the shape:
+
+    s  exactly 1      set-name index, one per namespace
+    c  one per set    2 and 1 respectively
+    v  one per (set, id)
+    i  BOUNDED by the ids, not predicted from them — a hash collision may only
+       ever reduce this count, so the assertion is a range
+    dbsize == s + c + v + i
+
+That last equality is the only thing a total was ever really guarding: "no key
+of a kind nobody expected". Everything else is now an observation.
+
+**The branch's fix was not taken, and the reason generalises.** It re-derived
+the total by reimplementing FNV-1a and `INDEX_BUCKETS` in Python inside the
+drill. That trades a constant that goes stale for a second copy of the hash
+that can drift from `flint_vec::bucket_of` in silence — and a drifting
+duplicate is strictly worse than a stale constant, because the constant fails
+with a number you can read while the duplicate fails with two numbers and no
+indication which is authoritative. Counting kinds needs no hash at all.
+
+Ground truth was read from the running drill rather than derived: keys render
+as `\x00vec\x00<kind>\x00<set>[\x00<id>]`, and the live corpus is
+`s=1 c=2 v=6 i=6`, dbsize 15. Negative-controlled by asserting 3 configs where
+there are 2: the drill exits 1 and prints the full count line plus a key dump,
+so the next layout change names which kind moved instead of printing two
+totals.
