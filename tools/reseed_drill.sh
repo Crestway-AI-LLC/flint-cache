@@ -65,9 +65,29 @@ start_replica() {
 # the port (#176 — a syncing replica is invisible). Sharing one constant
 # between the two meant a re-seed that was merely slow reported as "the
 # replica did not come back", which reads as a crash.
+# PONG AND NOT LOADING, the same predicate fleet_wait_ping uses.
+#
+# This drill sources lib/fleet.sh and could call fleet_wait_ping directly, but
+# that helper EXITS on timeout where this one RETURNS — every call site below
+# handles its own failure (`|| { ... replica_forensics; exit 1; }`), and
+# delegating would skip those diagnostics at exactly the moment they are worth
+# most. So the predicate is borrowed and the contract kept.
+#
+# Why it matters here: since #176 a node binds and answers PING from inside
+# its startup. A PONG-only wait therefore returns while the seat is still
+# loading, and the very next line reads data. That is how
+# "a start without --replica-of discarded the data (20008 -> )" happened at
+# P=3 — the value was not discarded, it was not loaded yet, and the empty
+# string is the node correctly saying "not yet" to a question asked too early.
+#
+# Only an explicit `loading:1` counts, so a build without the field behaves
+# exactly as before.
 wait_port() {
   for _ in $(seq 1 "${2:-100}"); do
-    [ "$(valkey-cli -p "$1" PING 2>/dev/null)" = "PONG" ] && return 0
+    if [ "$(valkey-cli -p "$1" PING 2>/dev/null)" = "PONG" ] &&
+       ! valkey-cli -p "$1" FLINTINFO 2>/dev/null | tr -d '\r' | grep -qx 'loading:1'; then
+      return 0
+    fi
     sleep 0.1
   done
   return 1
