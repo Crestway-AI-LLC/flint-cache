@@ -172,7 +172,7 @@ _gate_prune_runs 20
 # discarded writes throughout. A drill outside the gate rots, and rots
 # silently.
 CORE="${FLINT_CORE_ORDER:-restart repl failover proxy slot_migrate slot_map rebalance_execute
-      bloom ns_escape coproc_cred coproc_channel family_route family_route_cp coproc_forward coproc_budget coproc_exempt coproc_vec coproc_vec_tls coproc_vec_rebuild
+      bloom ns_escape coproc_cred coproc_channel coproc_family family_route family_route_cp coproc_forward coproc_budget coproc_exempt coproc_vec coproc_vec_tls coproc_vec_rebuild
       tenant_quota token_rotation cert_reload_fleet controlplane_ha
       decommission config_file federation_plumbing disk_pressure disk_selffill ctl_error
       client_compat proxy_registry reseed lag_cap widowed_grace controller
@@ -187,7 +187,7 @@ CORE="${FLINT_CORE_ORDER:-restart repl failover proxy slot_migrate slot_map reba
       proxy_cache proxy_tls replica_reads replica_stale_fence rw_isolation
       scan slot_cutover slot_cutover_recovery slot_moved snapshot_restore
       tenant tenant_rebalance tenant_remove token_hash
-      write_deadline fullsync_rate edge_reroute rewind_rejoin wal_headroom roll_shed}"
+      write_deadline fullsync_rate edge_reroute rewind_rejoin wal_headroom roll_shed proxy_chain}"
 CHAOS="chaos proxy_chaos chaos_unreadable hotkey_chaos"
 
 # DELIBERATELY OUT, with the reason. An absence with no reason beside it is
@@ -207,15 +207,6 @@ CHAOS="chaos proxy_chaos chaos_unreadable hotkey_chaos"
 #   stop_sweep    FAILS in setup: "fleet B did not start". It declares eight
 #                 ports across two fleets (6317-6321, 7820, 7879, 7889), so a
 #                 collision is the first thing to check. Fix before adding.
-#   coproc_family UNVERIFIED. It has not run since ADR-0010's deploy path
-#                 landed — not in CORE, not in CHAOS, and until now not here
-#                 either, so nothing ran it and nothing said why. Whether it
-#                 passes is unknown. Run it before moving it to CORE.
-#   proxy_chain   UNVERIFIED, same history. It also reserves 6460-6467, and
-#                 loaded_promote and loading_visible were both moved off that
-#                 block to avoid colliding with it — the suite is paying a
-#                 port-allocation tax to a drill nothing executes. Settle it:
-#                 run it and register it, or delete it and free the ports.
 
 # THE LIST ABOVE IS NOW LOAD-BEARING, so it is a variable and not only prose.
 # coproc_family and proxy_chain sat in tools/ registered nowhere for weeks:
@@ -225,7 +216,7 @@ CHAOS="chaos proxy_chaos chaos_unreadable hotkey_chaos"
 # because nothing checked that it was complete. A convention that depends on
 # being remembered will be forgotten; assert_every_drill_accounted_for is what
 # turns it into a check.
-EXCLUDED="backup_s3 fullsync_cap stop_sweep coproc_family proxy_chain"
+EXCLUDED="backup_s3 fullsync_cap stop_sweep"
 
 # FLINT_GATE_STRICT=1 turns a SKIPPED drill into a FAILED one.
 #

@@ -231,4 +231,19 @@ registered drills as unlisted, one per line of CORE.
 
 - `542da86`'s derived row count — the constant is correct and will not stay so.
 - `ingest_saturation` and `replica_starvation` — real coverage main lacks.
-- `coproc_family` and `proxy_chain` — run them, then register or delete.
+- ~~`coproc_family` and `proxy_chain` — run them, then register or delete.~~
+  **CLOSED 2026-08-24: both PASS, both now in CORE.** Neither was broken; each
+  had simply never been run. `coproc_family` passes end to end (flintctl spawns
+  the declared co-processor, the proxy routes it over mesh mTLS, vectors persist
+  into the tenant namespace, `stop` reaps it). `proxy_chain` passes 16 chains x
+  25000 hops with the oracle clean.
+
+  One thing to carry forward about `proxy_chain`: **its fault injection armed
+  by a thin margin** — 1 of 6 kills landed mid-walk, the other five skipped
+  because the walkers had already finished. That is not a silent hole; the
+  binary asserts `overlapped > 0` and fails with an instruction to raise
+  `--elements` or `--chains`. Note the direction, because it is the opposite of
+  the usual one: the 16-vCPU gate box is the WORST case for arming, since a
+  fast walk outruns the kill schedule. A contended CI runner walks slower and
+  should land more. If this drill ever fails to arm, the machine got faster or
+  quieter, and the fix is the one the message names — not a timeout.
