@@ -82,25 +82,33 @@ jobs:
       # any job count and P=6 is already inside twice it. Splitting that drill
       # is worth more than raising this number.
       #
-      # BACK TO 1, and the three green runs above are why this line reads 1
-      # rather than 6. They were measured on a tree that did not yet contain
-      # the eleven concurrency commits (-LOADING as a retry, fleet_kill
-      # waiting for death, PONG no longer meaning ready). On the tree WITH
-      # them, the same P=6 gate fails:
+      # FOUR, which is nproc on this runner and exactly 1.00 drills/core.
+      # Measured on the tree that actually exists, after the eleven
+      # concurrency commits landed:
       #
-      #   reseed   P=1 PASS (4.2s)   P=6 FAIL (4.0s)   <- parallelism-only
-      #   chaos    P=1 FAIL          P=6 FAIL          <- tree-level, also red on main
+      #   P  drills/core  result                        wall
+      #   1  0.25         109/0 green                   32m59s
+      #   3  0.75         1 fail (reseed, since fixed)  ~16m
+      #   4  1.00         110/0 GREEN                   13m24s   2.46x
+      #   6  1.50         1 fail, a DIFFERENT one each run       2.65x
       #
-      # reseed is the blocker: same sha, same everything, only the job count
-      # differs, so it is a genuine parallel-only failure and P=6 would ship a
-      # gate that goes red for reasons unrelated to the change under test —
-      # exactly what gates.sh's own opt-in note warns about.
+      # 1.00 drills/core is the boundary and the reason for the shape. At 4
+      # nothing is oversubscribed, so the startup races #176 introduced never
+      # get wide enough to lose. At 6 they do, intermittently — three runs
+      # produced three different single failures (reseed / disk_pressure +
+      # disk_selffill / tenant_rebalance), which is precisely the "gate goes
+      # red for reasons unrelated to the change under test" that gates.sh's
+      # own opt-in note exists to prevent. 2.65x is not worth a flaky gate
+      # when 2.46x is not.
       #
-      # Nothing else here is reverted. auto, core_order, the millisecond
-      # clock, the drills/core ratio and both attribution assertions all stand
-      # on their own and are what make the next attempt cheap: fix reseed
-      # under contention, dispatch gate_jobs=6, and flip this one number.
-      FLINT_GATE_JOBS: ${{ inputs.gate_jobs || '1' }}
+      # A LITERAL, not `auto`, though auto also resolves to 4 here. auto is
+      # right on this runner and on a developer M2 (4 P-cores) and would give
+      # 16 on a 16-vCPU box — a ratio nobody has measured. The number is a
+      # measurement; the table above is its provenance. Re-measure before
+      # raising it.
+      #
+      # gate_jobs=1 on a manual dispatch is the rollback, no file edit needed.
+      FLINT_GATE_JOBS: ${{ inputs.gate_jobs || '4' }}
       # Empty on push/PR, so the full CORE list runs. gates.sh reads
       # FLINT_CORE_ORDER with the full list as its default, and an empty
       # string is falsy there, so this is inert unless a dispatch sets it.
