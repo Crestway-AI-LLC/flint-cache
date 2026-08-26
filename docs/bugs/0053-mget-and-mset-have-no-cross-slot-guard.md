@@ -70,14 +70,35 @@ are not in the list, and nothing else asserts their cross-slot behaviour.
 
 ## Honest status of this report: READ, NOT RUN
 
-I have not reproduced it. A unit test cannot: `MemKv` owns every slot, so both
-keys resolve locally and `MGET` returns both values. That is very likely why
-the gap survived — the cheap test is structurally incapable of showing it.
+I have not reproduced the wrong answer. A unit test cannot produce it: `MemKv`
+owns every slot, so both keys resolve locally and `MGET` returns both values.
+That is very likely why the gap survived — the cheap test is structurally
+incapable of showing the SYMPTOM.
 
-Reproducing it needs a node owning a strict subset of slots, i.e. a two-pair
-fleet, `MGET k_on_pair0 k_on_pair1` through the proxy, asserting the second is
-NOT a nil. With a capability assert that the two keys really do land on
-different pairs, or the test proves nothing.
+**But the FIX is cheaply testable, and an earlier draft of this section got
+that wrong.** It claimed a two-pair fleet was needed. It is not, because the
+refusal is a pure function of the KEYS — do they hash to one slot — and owes
+nothing to which node owns what. That is exactly how
+`a_cross_slot_set_op_is_refused_rather_than_answered_wrongly` tests the set
+ops today, against `MemKv`, with no fleet at all.
+
+So the property splits in two, and each half is cheap:
+
+- **The refusal** — `MGET alpha beta` returns `CROSSSLOT` naming both keys.
+  Unit test, `MemKv`, identical in shape to the set-op test, with the same
+  capability assert that `alpha` and `beta` still hash apart.
+- **The positive control** — `MGET {s}alpha {s}beta` is ANSWERED, and answered
+  correctly, so the refusal discriminates between slots rather than failing
+  every multi-key call.
+
+Conflating the two is what made the earlier scoping expensive: proving the bug
+needs a fleet, proving the fix does not. Only the first is blocked, and the
+first is not what has to land.
+
+Credit where due: the split came from the S3-accelerator session, which hit the
+same `MemKv`-owns-every-slot wall from the client side and split its own
+assertion the same way — key shape on one side of the wire, routing on the
+other, neither half needing two pairs.
 
 ## The fix
 
@@ -88,3 +109,24 @@ colocate under a hash tag — and that advice is exactly right here.
 Until then, any consumer issuing `MGET` across a multi-pair fleet must colocate
 its keys under one hash tag (`{obj}chunk:0`, `{obj}chunk:1`, ...) so a single
 slot owns the whole batch.
+
+## What the wrong answer actually costs, per consumer
+
+Severity depends on what the caller does with a nil, and the first consumer to
+hit this is a useful worked example rather than the general case.
+
+For a **content-addressed cache** (the S3 accelerator), a phantom nil reads as
+a chunk MISS, the origin is authoritative, and each value is sealed to its own
+etag and index — so a wrong-node answer cannot become wrong bytes, guarded
+twice over. What degrades is EFFECTIVENESS: `MGET` misses chunks living on
+other pairs, `MSET` writes fills onto nodes that do not own the slots, and a
+later run routing from a different first key cannot find them. Net is a cache
+that silently stops working, plus unreachable garbage on wrong nodes.
+
+For a consumer WITHOUT content addressing and an authoritative origin — the
+general case, and what a Redis-compatible cache must assume — a phantom nil is
+indistinguishable from a real absence, and that is a correctness bug. `MSET`
+is worse in both readings, because it writes.
+
+The narrow reading does not lower the severity of the defect; it describes one
+consumer that happens to be defended against it by its own design.
