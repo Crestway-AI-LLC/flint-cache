@@ -39,6 +39,18 @@ trap cleanup EXIT
 
 cargo build --release -q -p flint-server --features flint-server/rocks \
   || { echo "FAIL: build"; exit 1; }
+cargo build --release -q -p flint-chaos || { echo "FAIL: build flint-chaos"; exit 1; }
+
+# The chaos harness must REFUSE a fleet whose namespaces may evict: its ledger
+# oracle asserts no acked write is lost, and eviction deletes acked writes on
+# purpose (ADR-0013, amended). Driven through a one-line inventory because the
+# guard only applies to an ATTACHED fleet -- in local mode the harness spawns
+# its own clean nodes and there is nothing to refuse.
+chaos_says() { # chaos_says <port>  -> prints "REFUSED" or "PROCEEDED"
+  printf 'pair 127.0.0.1:%s\ntls off\n' "$1" > "$D/inv"
+  out=$(./target/release/flint-chaos --inventory "$D/inv" --iterations 0 2>&1)
+  if printf '%s' "$out" | grep -q 'REFUSING TO RUN.*evictable'; then echo REFUSED; else echo PROCEEDED; fi
+}
 fleet_warm ./target/release/flint-server
 
 # The whole `evict:` field, or empty when the feature is off.
@@ -81,6 +93,12 @@ if [ -n "${FIELD// /}" ]; then
   exit 1
 fi
 echo "   evict: empty after 50 writes and a read — correct"
+# POSITIVE CONTROL for the chaos guard: an undeclared fleet must NOT be
+# refused. Without this, the refusal below is also what a guard that refuses
+# everything would produce.
+V=$(chaos_says 6492)
+[ "$V" = "PROCEEDED" ] || { echo "FAIL: chaos refused a fleet with NOTHING declared evictable ($V)"; exit 1; }
+echo "   chaos proceeds against an undeclared fleet"
 fleet_kill server; sleep 0.5
 
 echo "== 2/3. DECLARED 'cache' — the hooks feed it, and only for it"
@@ -132,5 +150,19 @@ if [ "$K_AFTER" -ne "$K_CACHE" ]; then
   exit 1
 fi
 echo "   policy_keys=$K_AFTER after 60 more writes to an undeclared namespace — unchanged"
+
+# THE CHAOS GUARD. The ledger oracle cannot mean anything here: it asserts no
+# acked write is lost, and this namespace is licensed to delete them. Running
+# anyway yields either a phantom loss report or a real loss waved through as
+# licensed -- the second being worse, since the oracle is what would otherwise
+# have caught it.
+V=$(chaos_says 6492)
+[ "$V" = "REFUSED" ] || {
+  echo "FAIL: chaos PROCEEDED against a fleet declaring an evictable namespace."
+  echo "      Its ledger oracle would then be asserting durability over data the"
+  echo "      node is licensed to delete."
+  exit 1
+}
+echo "   chaos refuses a fleet declaring an evictable namespace"
 
 echo "PASS: evictable-ns hooks are connected, scoped, and absent by default"

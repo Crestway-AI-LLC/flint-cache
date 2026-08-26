@@ -187,12 +187,18 @@ _gate_prune_runs 20
 # assertion is, and no amount of waiting fixes it, unlike reseed's timing race.
 #
 # So they run ALONE, before the parallel batch. Costs ~30s of the ~12 minutes.
-CORE_EXCLUSIVE="${FLINT_CORE_EXCLUSIVE:-disk_pressure disk_selffill}"
+# evictable_pressure joins them for the same reason and one more. It asserts on
+# free space (its own mounted image, but the image is a file on the runner's
+# disk, and hdiutil/mkfs are heavy enough to move the number for anyone else
+# reading it). And its subject is a TRIGGER that fires on a threshold: a drill
+# whose whole premise is "the disk got full enough" cannot share a machine with
+# five other drills writing to it.
+CORE_EXCLUSIVE="${FLINT_CORE_EXCLUSIVE:-disk_pressure disk_selffill evictable_pressure}"
 
 CORE="${FLINT_CORE_ORDER:-restart repl failover proxy slot_migrate slot_map rebalance_execute
       bloom ns_escape coproc_cred coproc_channel coproc_family family_route family_route_cp coproc_forward coproc_budget coproc_exempt coproc_vec coproc_vec_tls coproc_vec_rebuild
       tenant_quota token_rotation cert_reload_fleet controlplane_ha
-      decommission config_file federation_plumbing disk_pressure disk_selffill ingest_saturation ctl_error
+      decommission config_file federation_plumbing disk_pressure disk_selffill evictable_pressure ingest_saturation ctl_error
       client_compat proxy_registry reseed lag_cap widowed_grace replica_starvation managed_slow_sync controller
       promote_notice fleet_guard ctl_cpha upgrade anti_affinity attached_chaos
       async_flag async_writes txn_failure backup restore_ns backup_schedule

@@ -132,6 +132,11 @@ const RECLAIM_START_PCT_OF_FLOOR: u64 = 150;
 /// [`REOPEN_MARGIN`] exists to prevent.
 const RECLAIM_TARGET_PCT_OF_FLOOR: u64 = 200;
 
+/// The most of a device reclaim will ever try to free. Caps the target so a
+/// high `min_free_pct` cannot ask for more free space than the disk has; see
+/// the clamp in [`reclaim_action`].
+const CEILING_PCT_OF_TOTAL: u64 = 80;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReclaimAction {
     /// Nothing to do: either there is headroom, or there is no signal.
@@ -168,7 +173,34 @@ pub fn reclaim_action(
         return ReclaimAction::Idle;
     }
     let start = floor.saturating_mul(RECLAIM_START_PCT_OF_FLOOR) / 100;
-    let target = floor.saturating_mul(RECLAIM_TARGET_PCT_OF_FLOOR) / 100;
+    // THE TARGET MUST BE REACHABLE, and at a high `min_free_pct` it is not.
+    //
+    // The target is 200% of the shed floor, so any floor above half the device
+    // puts it beyond the disk's total capacity — `min_free_pct = 50` on a
+    // 512 GB disk asks for 512 GB free. Reclaim would then never be satisfied,
+    // never disengage, and go on evicting a namespace down to empty. That is
+    // unbounded data loss produced by a setting that reads as merely
+    // conservative, which is the worst way for it to arrive.
+    //
+    // Clamped to CEILING_PCT_OF_TOTAL of the device, and ONLY the target is
+    // clamped. Pulling the start mark down with it was the first attempt and it
+    // broke the other invariant immediately: on `min_free_bytes = total` the
+    // clamped start fell BELOW the shed floor, opening a band where writes shed
+    // while reclaim sat idle — the exact thing D7 requirement 4 forbids, caught
+    // by the ordering property test rather than by review.
+    //
+    // Leaving the start at 150% of the floor keeps that ordering true by
+    // construction, while the clamped target stays reachable. On a
+    // configuration demanding more free space than the device has, the node
+    // therefore reclaims toward the most it could ever free and stops, instead
+    // of chasing a level that cannot exist.
+    let ceiling = u.total_bytes.saturating_mul(CEILING_PCT_OF_TOTAL) / 100;
+    let target = floor
+        .saturating_mul(RECLAIM_TARGET_PCT_OF_FLOOR)
+        .checked_div(100)
+        .unwrap_or(0)
+        .min(ceiling);
+
     let engage = if currently {
         u.free_bytes < target
     } else {
@@ -607,6 +639,48 @@ mod tests {
             "positive control: shed_seen={shed_seen} reclaim_seen={reclaim_seen} — the \
              sweep never reached either state, so nothing above was actually checked"
         );
+    }
+
+    /// RECLAIM MUST BE SATISFIABLE. For every configuration there has to be a
+    /// free level at which a run in progress stops — otherwise the node evicts
+    /// a namespace down to empty and calls it capacity management.
+    ///
+    /// This failed before the clamp. The target is 200% of the shed floor, so
+    /// any `min_free_pct` at or above 50 asks for more free space than the
+    /// device has, and `reclaim_action(.., currently = true)` never returned
+    /// Idle at any level. Unbounded data loss from a setting that reads as
+    /// merely conservative.
+    ///
+    /// Swept rather than sampled, because the boundary is exactly where a
+    /// hand-picked example would not have been.
+    #[test]
+    fn every_configuration_has_a_level_where_reclaim_stops() {
+        for total_gb in [1u64, 8, 64, 512] {
+            let total = total_gb * GB;
+            for pct in [0u64, 5, 10, 25, 40, 50, 60, 75, 90, 100] {
+                for min_gb in [0u64, 1, 2, 8] {
+                    let t = Thresholds {
+                        min_free_pct: pct,
+                        min_free_bytes: min_gb * GB,
+                    };
+                    // Free space cannot exceed the device, so the search only
+                    // covers levels that can actually occur.
+                    let stops = (0..=100u64).any(|step| {
+                        let u = flint_storage::disk::Usage {
+                            free_bytes: total * step / 100,
+                            total_bytes: total,
+                        };
+                        reclaim_action(Some(u), t, true) == ReclaimAction::Idle
+                    });
+                    assert!(
+                        stops,
+                        "reclaim never disengages at ANY free level: total={total_gb}GB \
+                         min_free_pct={pct} min_free_bytes={min_gb}GB — this evicts the \
+                         namespace to empty"
+                    );
+                }
+            }
+        }
     }
 
     /// Hysteresis: a run in progress continues past the line it started at,
