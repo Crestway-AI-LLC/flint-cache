@@ -1,13 +1,93 @@
-# BUG-0050: six hours of archived WAL, ten seconds of reachable tail
+# BUG-0050: a replication cursor resting INSIDE a multi-key batch can never advance
 
-Status: OPEN, found 2026-08-26 · Severity: HIGH on a live fleet — **18 WALGAP
-re-seeds** on the playground pair (10 on :7001, 8 on :7002), each one costing
-single-copy exposure for the length of a re-seed.
+*(filename says "six hours of archived WAL and ten seconds of reachable tail" —
+that was the first framing, refuted the same day. Kept so links survive.)*
 
-**The title is kept for the trail but the framing below it was CORRECTED the
-same day** — see "CORRECTION". The retention depth is not the variable: the
-replica that failed was ONE SEQUENCE behind latest, which no retention setting
-can help. This is a WAL-roll boundary condition.
+Status: OPEN, mechanism CONFIRMED and reproduced deterministically
+2026-08-26 · Severity: HIGH on a live fleet — **18 WALGAP re-seeds** on the
+playground pair (10 on :7001, 8 on :7002), each costing single-copy exposure
+for the length of a re-seed. Not a retention defect. Retention has been raised
+twice for this and it recurred both times.
+
+## The mechanism, in one experiment
+
+`flint-storage/src/repl.rs`, test `bug_0050_is_an_archived_cursor_reachable`.
+Same WAL, same instant, two cursors one apart:
+
+    an 8-key write consumed 8 sequences (1401 -> 1409), producing batches [1402..=1409]
+      cursor at batch START-1 (1401) -> SERVED 1 batch
+      cursor at INTERIOR      (1402) -> REFUSED: WalGap("sequence 1403 is no longer
+                                                        in the WAL (latest is 1409)")
+
+**RocksDB advances the sequence per KEY but iterates per BATCH.** An 8-key
+write consumes 1402..1409 and begins exactly one batch, at 1402. Sequences
+1403..1409 are therefore numbers that no batch starts at. Asking
+`get_updates_since(1402)` skips the batch that begins at 1402 — it is
+"already delivered" for that request — so the iterator yields nothing, `out`
+is empty, and `repl.rs:178` concludes the WAL has been recycled:
+
+> We know there are newer sequences (checked above), so producing no batch at
+> all means the WAL cannot reach back to `last_applied`
+
+**That inference is the bug.** An empty result has a second cause, and this is
+it. The data is present, one live segment away, and the replica is told to
+full-sync.
+
+## Why a cursor lands there at all
+
+Applying a batch records `last_seq`, which is always a batch END — safe. The
+playground's cursor did not come from applying a batch. From the node log,
+seconds before the failure:
+
+    adopted the master's translated cursor 125747825: tailing its sequence space now
+    adopted the master's role epoch (0,53): this copy is on its timeline now
+    FATAL: WALGAP ... sequence 131869493 is no longer in the WAL (latest is 131869494)
+
+A TRANSLATED cursor is computed, not observed, so nothing constrains it to a
+batch boundary. Land it on an interior sequence and the link is dead on
+arrival — which is exactly the "one sequence short" signature, at any depth,
+immune to retention, and rare enough to look random.
+
+## What this explains that the retention framing never could
+
+  - **One sequence short, always.** An interior sequence is by definition
+    inside a batch that starts just below it.
+  - **Immune to retention.** Raised 1 h -> 6 h after BUG-0012, where a replica
+    also died "one sequence short of the boundary" (`rocks.rs:256` still says
+    so). Recurred at 6 h. A third raise would be the third wrong fix.
+  - **Rare and unpredictable.** It needs a cursor to land interior, which
+    needs a translation or adoption, not ordinary tailing.
+  - **735 archived segments spanning 6 h sitting unused** while the master
+    reported the tail unreachable.
+
+## Refuted along the way, kept so nobody re-runs them
+
+  - *The tail path does not read the archive.* **False** — probe A serves a
+    cursor 800 sequences back from 5 archived segments.
+  - *A checkpoint truncates reachability.* **False** — probe B serves a
+    pre-checkpoint cursor after checkpointing.
+  - *It is a WAL-roll boundary.* **False** — probe C serves a cursor at
+    latest-1 across a roll.
+
+## Fix options — NOT taken here, because this is replication correctness
+
+1. **Make the empty case honest.** `raw_first` is already captured for the
+   other gap shape. If the iterator handed back a batch at all, the WAL
+   reaches back and an empty `out` means "nothing new", not "recycled". This
+   is the smallest change and it stops the false re-seed — but it leaves the
+   cursor stuck at an interior sequence, making no progress, which is the
+   frozen-replica failure the comment at `:170` was written to prevent. Not
+   sufficient alone.
+2. **Snap adopted cursors to a batch boundary.** Fixes the cause rather than
+   the symptom: a cursor that is always a batch END can never be interior.
+   Needs the translation path to know batch boundaries, which it may not.
+3. **Serve from the containing batch.** On an interior cursor, re-request from
+   below and clamp the ops — the clamp already exists
+   (`first_seq.max(last_applied + 1)`). Most robust, most invasive.
+
+(1)+(2) together look right: (2) removes the cause, (1) stops a false re-seed
+if one ever lands interior again. But this is the write path a fleet's
+durability rests on, and the choice should be deliberate.
 
 ## What was measured
 
@@ -39,69 +119,6 @@ Both were raised deliberately — "was 1 h", "was 1 GiB".
 
 So the retention setting is not the problem. **The tail path is not reading
 what retention is keeping.**
-
-## CORRECTION 2026-08-26: the first framing was wrong
-
-This file originally said the tail path was not reading the archive that
-retention keeps, and proposed the local test that would settle it. **That test
-was run and it REFUTES the hypothesis.** Both probes are in
-`flint-storage/src/repl.rs` (`bug_0050_is_an_archived_cursor_reachable`):
-
-    probe A (no checkpoint):  5 archived segments, cursor 800 back -> SERVED 800 batches
-    probe B (after checkpoint at seq 1000):  pre-checkpoint cursor -> SERVED 1000 batches
-
-So `get_updates_since` DOES serve from archived segments, and taking a
-checkpoint does NOT move the reachable floor. Neither mechanism reproduces.
-
-**And re-reading the evidence with that ruled out, the "6 hours vs 10 seconds"
-framing is the wrong reading of it.** The first failure was:
-
-    FATAL: WALGAP ... sequence 131869493 is no longer in the WAL
-           (latest is 131869494)
-
-The replica needed **131869493** while the master's latest was **131869494**.
-It was ONE SEQUENCE BEHIND. This is not a replica that fell out of a retention
-window; it is a cursor at the very tail being declared unreachable. The
-retention depth is a red herring — no retention setting, however large, helps
-a cursor that is one behind latest.
-
-The second message, from the restart, is consistent with a WAL ROLL at exactly
-that boundary:
-
-    oldest retained batch starts at 131869495, past the 131869493 needed
-    (latest is 131869852)
-
-Oldest reachable is 131869495 — one past where the replica died. The segment
-holding 131869493 existed (735 archived segments, 6 h, 142 MB were on disk)
-and was not offered.
-
-## What is actually established
-
-  - A replica ONE SEQUENCE behind latest was refused with WALGAP, on a live
-    fleet, 18 times across two seats.
-  - The failure sits at a WAL roll boundary: the oldest reachable batch
-    afterwards is exactly one past the failed cursor.
-  - Archived segments ARE reachable in the general case (probe A), and
-    checkpoints do NOT truncate reachability (probe B). So the general
-    mechanisms are sound and this is a BOUNDARY condition.
-  - Retention depth is not the variable. It was raised once already after
-    BUG-0012 — where a replica also died "one sequence short of the boundary"
-    (`rocks.rs:256`) — and the same failure has recurred at 6 h that occurred
-    at 1 h. **Raising it a third time would be the third wrong fix.**
-
-## What would find it
-
-The local probes exercise a quiet master. The playground's differs in ways
-worth reproducing one at a time:
-
-  1. **Roll the WAL while a tail is mid-poll**, with the cursor at latest-1.
-     That is the exact geometry of the failure and neither probe covers it.
-  2. **Sequence-space translation.** The node log shows "adopted the master's
-     translated cursor 125747825: tailing its sequence space now" shortly
-     before the failure. A cursor translated between spaces landing one off at
-     a roll boundary would produce precisely this, and nothing local tests a
-     translated cursor against a rolling WAL.
-  3. Only then, if both are clean, look again at retention.
 
 ## Why this is worth more than the alarm it caused
 

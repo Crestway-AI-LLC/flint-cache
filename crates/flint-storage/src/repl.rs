@@ -449,6 +449,81 @@ mod tests {
              pre-checkpoint cursor {early} -> {out_b} | just-before-checkpoint cursor -> {out_c}"
         );
 
+        // PROBE C. THE ACTUAL GEOMETRY OF THE FAILURE, which neither A nor B
+        // reproduces: the cursor is at latest-1 — essentially caught up — and
+        // the WAL rolls underneath it. On the playground that returned
+        // "sequence N is no longer in the WAL (latest is N+1)", which is the
+        // one shape no retention depth can explain.
+        for i in 0..200u32 {
+            s.set(1, format!("e{i}").as_bytes(), b"v", SetOptions::default())
+                .expect("set");
+        }
+        let tail_cursor = master.db().latest_sequence_number() - 1;
+        master.flush(); // roll: the segment holding tail_cursor leaves the live WAL
+        let out_d = match master.updates_since(tail_cursor) {
+            Ok(b) => format!("SERVED {} batch(es)", b.len()),
+            Err(e) => format!("REFUSED: {e:?}"),
+        };
+        // And again with a write after the roll, so latest moves past the roll
+        // point exactly as it does on a live master.
+        s.set(1, b"post-roll", b"v", SetOptions::default())
+            .expect("set");
+        let out_e = match master.updates_since(tail_cursor) {
+            Ok(b) => format!("SERVED {} batch(es)", b.len()),
+            Err(e) => format!("REFUSED: {e:?}"),
+        };
+        eprintln!(
+            "BUG-0050 probe C (cursor at latest-1 = {tail_cursor}, then roll): \
+             immediately -> {out_d} | after one more write -> {out_e}"
+        );
+
+        // PROBE D. DOES A SEQUENCE EXIST THAT BEGINS NO BATCH?
+        //
+        // The admission check refuses when `raw_first > last_applied + 1`. On
+        // the playground last_applied was 131869492 and the first offered
+        // batch began at >= 131869494 — so nothing began at 131869493. RocksDB
+        // advances the sequence PER KEY, so a multi-key write consumes several
+        // sequences while beginning exactly one batch. Every interior sequence
+        // of such a batch is a number no batch starts at.
+        //
+        // If a cursor can come to rest on one of those, the check reports a
+        // gap over data that is present — which fits every fact: one sequence
+        // short, at any depth, unaffected by retention, and rare.
+        let multi: Vec<(Vec<u8>, Option<Vec<u8>>)> = (0..8u32)
+            .map(|i| (format!("Mmulti{i}").into_bytes(), Some(b"v".to_vec())))
+            .collect();
+        let before_multi = master.db().latest_sequence_number();
+        master.apply_writes(&multi).expect("multi-key write");
+        let after_multi = master.db().latest_sequence_number();
+        let consumed = after_multi - before_multi;
+
+        let batches = master
+            .updates_since(before_multi)
+            .expect("tail after multi");
+        let spans: Vec<String> = batches
+            .iter()
+            .map(|b| format!("{}..={}", b.first_seq, b.last_seq))
+            .collect();
+        // An INTERIOR sequence of the multi-key batch: no batch starts here.
+        let interior = before_multi + 1;
+        let out_f = match master.updates_since(interior) {
+            Ok(b) => format!("SERVED {} batch(es)", b.len()),
+            Err(e) => format!("REFUSED: {e:?}"),
+        };
+        // THE CONTRAST that makes it airtight: the same WAL, the same instant,
+        // asked from the sequence just BEFORE the batch begins.
+        let out_g = match master.updates_since(before_multi) {
+            Ok(b) => format!("SERVED {} batch(es)", b.len()),
+            Err(e) => format!("REFUSED: {e:?}"),
+        };
+        eprintln!(
+            "BUG-0050 probe D: an 8-key write consumed {consumed} sequence(s) \
+             ({before_multi} -> {after_multi}) and produced batches [{}]",
+            spans.join(", ")
+        );
+        eprintln!("                  cursor at batch START-1 ({before_multi}) -> {out_g}");
+        eprintln!("                  cursor at INTERIOR      ({interior}) -> {out_f}");
+
         // ARMED. If nothing was archived, or the cursor never left the live
         // WAL, the probe answered an easier question than the one asked and
         // its result means nothing either way.
