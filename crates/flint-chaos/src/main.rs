@@ -1180,10 +1180,35 @@ fn main() {
         );
     }
     if deepest_loss_ms == 0 {
-        println!(
-            "  NOTE: loss depth 0 means replication kept up throughout — the RPO bound was \
-             not exercised by this run (try --stall-replica-ms)"
-        );
+        // WHAT DEPTH 0 MEANS DEPENDS ON WHETHER LAG WAS FORCED.
+        //
+        // This printed one line regardless, advising --stall-replica-ms even
+        // to a run that had just passed it. Worse than noise: under a stall,
+        // depth 0 is the CORRECT outcome when shedding works, because the
+        // master refuses writes rather than acking ones it cannot replicate
+        // — so the line called a run deficient for demonstrating the thing it
+        // set out to demonstrate. Seen on lag_cap, which passes
+        // --stall-replica-ms 200 (BUG-0049) and shed 70 writes on the run
+        // that printed it.
+        if stall_replica_ms == 0 {
+            println!(
+                "  NOTE: loss depth 0 means replication kept up throughout — the RPO bound was \
+                 not exercised by this run (try --stall-replica-ms)"
+            );
+        } else if throttled_total > 0 {
+            println!(
+                "  NOTE: loss depth 0 under a {stall_replica_ms}ms replica stall, with \
+                 {throttled_total} write(s) shed: the master refused writes it could not \
+                 replicate rather than acking them. That is the bound holding, not an \
+                 unexercised path."
+            );
+        } else {
+            println!(
+                "  NOTE: loss depth 0 under a {stall_replica_ms}ms replica stall AND nothing \
+                 shed — the stall produced neither loss nor throttling, so neither mechanism \
+                 was exercised. Check the stall actually reached the replica."
+            );
+        }
     }
     if throttled_total == 0 {
         println!(
