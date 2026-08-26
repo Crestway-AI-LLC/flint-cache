@@ -136,6 +136,35 @@ public final class Suite {
     return cond.getAsBoolean();
   }
 
+  /** Does a TIER answer on the tier port -- not merely a listener?
+   *
+   *  `tierListening` below proves a socket accepted, which a stale process on
+   *  a recycled port also does, and which a server still loading a dataset
+   *  does while refusing every command with -LOADING. The protocol is the
+   *  discrimination: +PONG comes only from something speaking RESP and ready
+   *  to serve. Inline command, so no client library is needed in a static
+   *  helper that runs before the connection exists and again after it closes.
+   *
+   *  The asymmetry is the point and is worth not smoothing over: liveness
+   *  needs the PROTOCOL, death needs the SOCKET. A failed PING is a bad death
+   *  signal -- it fails for a hung server, a full backlog, or a dropped packet,
+   *  all of which leave the process alive -- so killTier still waits on
+   *  connect-refused. Same port, opposite questions, different right answer. */
+  static boolean tierAnswering() {
+    try (java.net.Socket sk = new java.net.Socket()) {
+      sk.connect(new java.net.InetSocketAddress("127.0.0.1", tierPort()), 200);
+      sk.setSoTimeout(200);
+      sk.getOutputStream().write("PING\r\n".getBytes(java.nio.charset.StandardCharsets.US_ASCII));
+      sk.getOutputStream().flush();
+      byte[] buf = new byte[7];
+      int n = sk.getInputStream().read(buf);
+      return n >= 5 && new String(buf, 0, n, java.nio.charset.StandardCharsets.US_ASCII)
+          .startsWith("+PONG");
+    } catch (IOException e) {
+      return false;
+    }
+  }
+
   /** Is anything accepting connections on the tier port? */
   static boolean tierListening() {
     try (java.net.Socket sk = new java.net.Socket()) {
@@ -153,8 +182,8 @@ public final class Suite {
     // `--daemonize yes` EXITS 0 before the server listens, so waitFor() proves
     // nothing at all. This used to be `sleep(700)`, which is the same
     // non-signal with a longer fuse: fine idle, wrong under load.
-    if (!awaitTrue(Suite::tierListening, 15_000))
-      throw new IllegalStateException("tier never came up on port " + tierPort());
+    if (!awaitTrue(Suite::tierAnswering, 15_000))
+      throw new IllegalStateException("tier never answered PING on port " + tierPort());
   }
 
   /** Kill the tier and return only once the port refuses.
