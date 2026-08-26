@@ -425,7 +425,7 @@ if [ -x "$PYENV/bin/python" ]; then
   "$TIER_CLI" -p "$TIER_PORT" flushall >/dev/null 2>&1
   ( cd python && run_bounded "$PYENV/bin/python" suite.py \
       http://127.0.0.1:9401 redis://127.0.0.1:$TIER_PORT ) >/tmp/gate_python.log 2>&1
-  verdict "python suite (31 checks)" $?
+  verdict "python suite (35 checks)" $?
   stop_origin
 
   # The budget must bound the COMMAND, not each socket read of its reply.

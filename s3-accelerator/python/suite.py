@@ -201,8 +201,10 @@ def main():
     check(len([k for k in rc.scan_iter(match=b"c1/*")]) > 0,
           "negative control -- UNDER the cap the same object IS cached")
 
-    # D19 -- the block size defaults to our CHUNK, because fsspec's own
-    # default drags an order of magnitude more than a selective read asked for
+    # D19 -- the block size is 256 KiB, a measured point on a trade between
+    # read amplification and warm-path tier cost. NOT our CHUNK, which this
+    # comment used to say and which the measurement rejects: 64 KiB is worse
+    # than 256 KiB on both tier axes for sequential work.
     K19 = "s3://bucket/data/000005.bin"
     size19 = fs().info(K19)["size"]
 
@@ -227,18 +229,74 @@ def main():
           f"the block size default is the chosen {BLOCK_BYTES // 1024} KiB")
     check(tuned < wide,
           f"our default block pulls LESS than fsspec's ({tuned} < {wide} bytes)")
-    # Bound DERIVED, not tuned: fsspec fetches a block per miss and reads one
-    # ahead, so a 64 KiB read against a 256 KiB block cannot exceed
-    # 2 x block / read = 8x. Measured 5.0x. A bound computed from the
-    # constants stays correct when the constants change; one copied from a
-    # measurement has to be rediscovered every time they do.
-    bound = 2 * BLOCK_BYTES / (64 * 1024)
+    # Bound DERIVED, not tuned, and now derived from the RIGHT mechanism. It
+    # read 2 x block / read = 8x, on the belief that fsspec fetches a block per
+    # miss and one ahead. It does not: s3fs defaults to ReadAheadCache, which
+    # fetches the REQUEST plus one block, so the ceiling is (read + block) /
+    # read = 5.0x -- which is exactly what a 64 KiB read against a 256 KiB
+    # block measures, to the byte. The old bound was correct but slack by 60%,
+    # and slack in a derived bound is room for a regression to hide in.
+    read19 = 64 * 1024
+    bound = (read19 + BLOCK_BYTES) / read19
     check(tuned <= asked * bound,
-          f"a selective read drags <= {bound:.0f}x what it asked for ({tuned/asked:.1f}x)")
+          f"a selective read drags <= {bound:.1f}x what it asked for ({tuned/asked:.1f}x)")
     # Without this the two checks above would both pass against a client that
     # had simply stopped reading anything.
     check(wide > asked * 5,
           f"negative control -- fsspec's own 5 MiB default drags {wide/asked:.1f}x")
+
+    # ---- the axis that was MISSING, and is why this default was first set
+    # wrong: tier bytes on the WARM path. Every check above counts the S3 side
+    # of the cache -- the side the product sells, and the side we had tooling
+    # for. A block small enough to look free there is paid for here, because a
+    # fetch that straddles the chunk grid costs a whole extra chunk off the
+    # tier. Instrumented now, so the next change to BLOCK_BYTES cannot be
+    # measured on one side only.
+    def warm_tier_cost(fsys, n=16, sz=64 * 1024):
+        """(cold origin bytes, warm tier bytes, warm tier trips, warm origin
+        gets) for the same selective read run twice."""
+        step = size19 // n
+
+        def sweep():
+            with fsys.open(K19, "rb") as h:
+                for i in range(n):
+                    h.seek(i * step); h.read(sz)
+
+        rc.flushall(); stats(ep, "/__reset")
+        sweep()
+        cold = stats(ep)["bytes_served"]
+        stats(ep, "/__reset"); rc.config_resetstat()
+        sweep()
+        i = rc.info("all")
+        trips = sum(v["calls"] for k, v in i.items()
+                    if k.startswith("cmdstat_") and k[len("cmdstat_"):] in ("mget", "set"))
+        return cold, i["total_net_output_bytes"], trips, stats(ep)["gets"]
+
+    # A FRESH filesystem for the warm pass: fsspec caches instances, and a
+    # cached one serves the second sweep out of its own buffer, which measures
+    # nothing.
+    cold_b, warm_b, warm_trips, warm_gets = warm_tier_cost(fs())
+    check(warm_gets == 0,
+          f"control -- the warm sweep reached the origin {warm_gets} times, so what "
+          "follows is the TIER's cost")
+    check(warm_trips > 0, f"control -- and it cost {warm_trips} tier round trips")
+    # D17's premise, on the byte axis: the cache changes where bytes come from,
+    # it does not reduce them. Within the D14 seal and RESP framing.
+    check(abs(warm_b - cold_b) <= 0.01 * cold_b,
+          f"a warm read moves the SAME bytes as the cold one ({warm_b} off the tier "
+          f"vs {cold_b} off the origin, +{warm_b - cold_b} of seal and framing)")
+    # No separate ceiling check on the tier side: it would have to model the
+    # 4-byte seal and RESP framing to be exact, and the equality above already
+    # pins the tier to an origin figure that IS checked against the ceiling.
+    #
+    # Without a control, everything above passes against any block size at all
+    # -- which is exactly how a 64 KiB default once looked free. The control is
+    # derived rather than tuned: a wrong block blows the ceiling ours meets.
+    w_cold, w_warm, _, _ = warm_tier_cost(flint_accel.FlintS3FileSystem(
+        skip_instance_cache=True, default_block_size=5 * 1024 * 1024, **so))
+    check(w_warm > asked * bound,
+          f"negative control -- a 5 MiB block costs the TIER {w_warm/asked:.1f}x, "
+          f"past the {bound:.1f}x ceiling ours meets, so this axis can fail")
 
     # how much does fsspec's block cache pull for a small read?
     rc.flushall(); stats(ep, "/__reset")
