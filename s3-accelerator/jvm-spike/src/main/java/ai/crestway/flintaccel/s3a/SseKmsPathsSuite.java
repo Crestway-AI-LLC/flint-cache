@@ -48,7 +48,7 @@ public final class SseKmsPathsSuite {
   static StatefulRedisConnection<byte[], byte[]> conn;
   static String tierUri;
 
-  static long keys() { return conn.sync().keys("c1/*".getBytes()).size(); }
+  static long keys() { return conn.sync().keys("c2/*".getBytes()).size(); }
   static void flush() { conn.sync().flushall(); }
 
   static Configuration base(String ep) {

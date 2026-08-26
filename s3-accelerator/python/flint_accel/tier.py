@@ -309,10 +309,30 @@ class FlintTier:
         return sealed[self.SEAL:]
 
     def _ck(self, etag, idx):
+        # THE BRACES ARE A HASH TAG, and they are load-bearing on a multi-pair
+        # fleet. Flint routes a multi-key command by its FIRST key alone
+        # (flint-proxy route_key) and neither MGET nor MSET carries the
+        # CROSSSLOT guard that SINTER/SUNION/SDIFF do. So a chunk whose slot the
+        # receiving node does not own answers nil IN ITS CORRECT POSITION, and a
+        # fill writes it to a node that does not own it.
+        #
+        # `{etag}` makes every chunk of one object hash to one slot
+        # (flint-slot::hash_tag, Redis-compatible), so a run is always
+        # single-slot and both commands are correct on any topology.
+        #
+        # WHAT THIS COSTS: one object now lives entirely on one pair, so a very
+        # hot object no longer spreads across the fleet. Accepted -- load still
+        # spreads across objects, and a 512 MiB object is at most ~8k chunks on
+        # one pair.
+        #
+        # The accelerator was never AT RISK of wrong bytes here: a phantom nil
+        # reads as a miss and the origin is authoritative, and D14's seal binds
+        # every value to its own etag and index. What was at risk was the cache
+        # silently not working.
         # Versioned prefix: a value-format change without a key change gives a
         # mixed fleet where new clients reject every value old clients wrote --
         # 100% miss and a stampede onto the origin.
-        return f"c1/{self._norm(etag)}/{idx}".encode()
+        return f"c2/{{{self._norm(etag)}}}/{idx}".encode()
 
     def _mk(self, bucket, key):
         """Byte-identical to the JVM client's metadata key.

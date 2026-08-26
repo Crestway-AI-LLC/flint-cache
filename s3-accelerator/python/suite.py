@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sys
 import threading
 import urllib.request
@@ -188,7 +189,7 @@ def main():
     with small.open(BIG, "rb") as h:
         h.seek(0); over = h.read(len(payload))
     check(over == payload, "an oversize object still READS correctly")
-    check(len([k for k in rc.scan_iter(match=b"c1/*")]) == 0,
+    check(len([k for k in rc.scan_iter(match=b"c2/*")]) == 0,
           "and wrote NO chunks to the tier")
     check(small.counters["oversize_bypassed"] > 0,
           f"counted, not silent ({small.counters['oversize_bypassed']} bypassed)"
@@ -198,7 +199,7 @@ def main():
     rc.flushall()
     with fs().open(BIG, "rb") as h:
         h.seek(0); h.read(len(payload))
-    check(len([k for k in rc.scan_iter(match=b"c1/*")]) > 0,
+    check(len([k for k in rc.scan_iter(match=b"c2/*")]) > 0,
           "negative control -- UNDER the cap the same object IS cached")
 
     # D19 -- the block size is 256 KiB, a measured point on a trade between
@@ -337,6 +338,35 @@ def main():
     flint_accel.install()
     check(fsspec.get_filesystem_class("s3").__name__ == "FlintS3FileSystem",
           "install() re-registers s3:// with no path changes")
+
+    # Every chunk of one object must share ONE hash tag, because Flint routes a
+    # multi-key command by its first key alone and neither MGET nor MSET carries
+    # a CROSSSLOT guard. Without colocation a chunk on another pair answers nil
+    # in its correct position -- a miss, so never wrong bytes, but a cache that
+    # silently stops working the moment a second pair exists.
+    #
+    # A ONE-PAIR TIER CANNOT SHOW THIS. valkey has no slots and the playground
+    # is a single pair, so both the suite and production would stay green while
+    # the property was broken. What is asserted here is therefore the KEY SHAPE,
+    # which is the part that lives on this side of the wire; Flint's own
+    # flint-slot tests own the other half.
+    rc.flushall()
+    with fs().open(K19, "rb") as h:
+        h.seek(0); h.read(300_000)
+    tags = {re.search(rb"\{(.*?)\}", k).group(1)
+            for k in rc.scan_iter(match=b"c2/*")}
+    check(len(tags) == 1,
+          f"every chunk of one object shares one hash tag ({len(tags)} distinct)")
+    # Negative control: the tag must actually DISCRIMINATE. A key shape that
+    # gave every object the same tag would pass the check above and put the
+    # entire cache on one pair.
+    with fs().open(BIG, "rb") as h:
+        h.seek(0); h.read(4096)
+    tags2 = {re.search(rb"\{(.*?)\}", k).group(1)
+             for k in rc.scan_iter(match=b"c2/*")}
+    check(len(tags2) > 1,
+          f"negative control -- a DIFFERENT object gets a different tag ({len(tags2)} distinct)")
+
     flint_accel.uninstall()
     check(fsspec.get_filesystem_class("s3").__name__ == "S3FileSystem",
           "uninstall() puts back what was there")
