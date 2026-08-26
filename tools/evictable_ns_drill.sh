@@ -102,6 +102,20 @@ if [ "$K_CACHE" -lt 1 ]; then
 fi
 echo "   policy_keys=$K_CACHE after 60 declared-namespace writes"
 
+# THE READ HOOK, which is the difference between S3-FIFO and plain FIFO. Without
+# an access signal nothing is ever promoted out of `small`, and the scan
+# resistance the policy was chosen for is gone — silently, because every other
+# counter here moves on writes alone. `policy_keys` above would look identical.
+A=$(evict_num accesses)
+if [ -z "$A" ] || [ "$A" -lt 1 ]; then
+  echo "FAIL: accesses=${A:-<missing>} after 20 GETs in the declared namespace."
+  echo "      The read hook is not firing, so nothing is ever promoted out of"
+  echo "      small and the policy degrades to FIFO — which no unit test and no"
+  echo "      write-side counter would show."
+  exit 1
+fi
+echo "   accesses=$A after 20 declared-namespace reads (dropped=$(evict_num accesses_dropped))"
+
 # ISOLATION: same node, undeclared namespace.
 write_some other o 60 0
 K_AFTER=$(evict_num policy_keys)

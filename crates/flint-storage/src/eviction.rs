@@ -56,6 +56,19 @@ pub struct EvictionMetrics {
     /// contention.
     pub policy_keys: u64,
     pub policy_bytes: u64,
+    /// Read hits recorded, and read hits DROPPED because the policy was busy.
+    ///
+    /// The distinction between S3-FIFO and plain FIFO is entirely the access
+    /// signal: without it nothing is ever promoted out of `small`, and the
+    /// scan resistance the policy was chosen for is gone. Nothing else here
+    /// moves on a read, so an unwired read hook is invisible without this.
+    ///
+    /// `accesses_dropped` against `accesses` is the contention signal, and the
+    /// number that would justify sharding the policy lock. It is a ratio worth
+    /// watching rather than an error: dropping an access costs a little hit
+    /// rate by design, and blocking a GET to avoid it would cost more.
+    pub accesses: u64,
+    pub accesses_dropped: u64,
 }
 
 #[derive(Default)]
@@ -105,6 +118,8 @@ pub struct EvictionState {
     reclaim_cycles: AtomicU64,
     bytes_requested: AtomicU64,
     marks_at_last_pass: AtomicU64,
+    accesses: AtomicU64,
+    accesses_dropped: AtomicU64,
 }
 
 /// Minimum gap between FORCED compaction passes on one namespace.
@@ -306,10 +321,16 @@ impl EvictionState {
         if !self.is_evictable_ns(ns) {
             return;
         }
-        if let Ok(mut g) = self.policies.try_lock()
-            && let Some(p) = g.get_mut(ns)
-        {
-            p.on_access(key);
+        match self.policies.try_lock() {
+            Ok(mut g) => {
+                if let Some(p) = g.get_mut(ns) {
+                    p.on_access(key);
+                }
+                self.accesses.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(_) => {
+                self.accesses_dropped.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 
@@ -462,6 +483,8 @@ impl EvictionState {
             marks_at_last_pass: self.marks_at_last_pass.load(Ordering::Relaxed),
             policy_keys: keys,
             policy_bytes: bytes,
+            accesses: self.accesses.load(Ordering::Relaxed),
+            accesses_dropped: self.accesses_dropped.load(Ordering::Relaxed),
         }
     }
 

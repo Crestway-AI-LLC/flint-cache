@@ -884,7 +884,8 @@ fn eviction_metrics_line(rocks: &Option<RocksHandle>) -> String {
     format!(
         "marked_total={} marked_now={} dropped={} refused={} overflow={} \
 forced_passes={} skipped_cooldown={} skipped_small={} marks_at_last_pass={} \
-reclaim_cycles={} bytes_requested={} policy_keys={} policy_bytes={}",
+reclaim_cycles={} bytes_requested={} policy_keys={} policy_bytes={} \
+accesses={} accesses_dropped={}",
         m.marked_total,
         m.marked_now,
         m.dropped,
@@ -898,6 +899,8 @@ reclaim_cycles={} bytes_requested={} policy_keys={} policy_bytes={}",
         m.bytes_requested,
         m.policy_keys,
         m.policy_bytes,
+        m.accesses,
+        m.accesses_dropped,
     )
 }
 
