@@ -829,6 +829,43 @@ fn evictable_ns_joined() -> String {
     EVICTABLE_NS.read().map(|g| g.join(",")).unwrap_or_default()
 }
 
+/// Capacity for each declared-evictable namespace, as `ns=bytes` pairs.
+///
+/// Empty when nothing is evictable — the default, and the overwhelmingly
+/// common case — so a durable deployment sees an empty field rather than a
+/// number implying a policy it has not opted into.
+///
+/// Uses `ns_capacity_bytes`, not `ns_bytes`, because this is the figure an
+/// operator reads while deciding whether a namespace is about to fill, and
+/// `ns_bytes` omits exactly the writes that are filling it (ADR-0023 D7.2).
+///
+/// A namespace whose figure could not be taken renders `ns=?`, never `ns=0`.
+/// Zero is a legitimate reading — an empty namespace — so printing it for "the
+/// engine did not answer" would make this field report maximum headroom at the
+/// one moment it knows nothing, during the incident it exists to explain. Same
+/// contract, and the same reason, as BUG-0022.
+/// Rocks-only: without an engine there is no capacity to report, and the
+/// non-rocks `flintinfo` emits no evictable fields at all.
+#[cfg(feature = "rocks")]
+fn evictable_ns_bytes_joined(rocks: &Option<RocksHandle>) -> String {
+    let Ok(names) = EVICTABLE_NS.read() else {
+        return String::new();
+    };
+    names
+        .iter()
+        .map(|ns| {
+            match rocks
+                .as_ref()
+                .and_then(|kv| kv.ns_capacity_bytes(ns.as_bytes()))
+            {
+                Some(b) => format!("{ns}={b}"),
+                None => format!("{ns}=?"),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 fn internal_connect(addr: &str) -> std::io::Result<flint_tls::Stream> {
     flint_tls::connect_reloadable(addr, INTERNAL_CLIENT.get().unwrap_or(&None))
 }
@@ -3852,7 +3889,7 @@ fn flintinfo(
     let write_stall = rocks.as_ref().and_then(|kv| kv.write_stall());
     let compaction = rocks.as_ref().and_then(|kv| kv.compaction_pressure());
     let info = format!(
-        "role:{}\r\nloading:0\r\nrole_epoch:{role_epoch}\r\nbuild:{build}\r\nsst_bytes:{sst}\r\nlatest_seq:{latest}\r\nlast_applied:{last_applied}\r\nacked_seq:{}\r\nseq_lag:{seq_lag}\r\nwal_headroom_seq:{whs}\r\nwal_min_acked_seq:{wma}\r\nwal_headroom_shed_seq:{whl}\r\nlive_replicas:{}\r\nlag_ms:{}\r\nlag_ms_max:{lmx}\r\nlag_max_gap:{lmg}\r\nlag_soft_ms:{soft}\r\nlag_hard_ms:{hard}\r\nmin_replicas_to_write:{minr}\r\nwidowed_grace_ms:{wgm}\r\nwidowed_shed:{wsh}\r\nfullsync_active:{fsa}\r\nfullsync_max:{fsm}\r\nasync_write_queue:{aqd}\r\nwrite_deadline_ms:{wdm}\r\nwrite_inflight:{wif}\r\nwrite_service_us:{wsu}\r\nwrite_wait_est_ms:{wwe}\r\nwrites_shed_deadline:{wsd}\r\nwrites_shed_lag:{wsl}\r\nwrites_shed_quorum:{wsq}\r\nwrites_shed_widowed:{wswd}\r\nwrites_shed_headroom:{wshr}\r\nwrites_delayed_soft:{wdsf}\r\nwal_fsync_ms:{wfm}\r\nwal_fsync_total:{wft}\r\ncert_days_remaining:{cdr}\r\nactive_conns:{ac}\r\nmax_conns:{mc}\r\nconns_shed_total:{cs}\r\nwrite_stopped:{wst}\r\ndelayed_write_rate:{dwr}\r\nwrite_stall_readable:{wsr}\r\nl0_files:{l0f}\r\npending_compaction_bytes:{pcb}\r\ncompaction_readable:{cr}\r\ndisk_free_bytes:{dfb}\r\ndisk_total_bytes:{dtb}\r\ndisk_free_pct:{dfp}\r\ndisk_verdict:{dv}\r\ndisk_unknown_samples:{dus}\r\nevictable_ns:{ens}\r\nevictable_ns_agree:{ensa}\r\ngc_swept_expired:{gse}\r\ngc_swept_orphans:{gso}\r\nuptime_ms:{upms}\r\n",
+        "role:{}\r\nloading:0\r\nrole_epoch:{role_epoch}\r\nbuild:{build}\r\nsst_bytes:{sst}\r\nlatest_seq:{latest}\r\nlast_applied:{last_applied}\r\nacked_seq:{}\r\nseq_lag:{seq_lag}\r\nwal_headroom_seq:{whs}\r\nwal_min_acked_seq:{wma}\r\nwal_headroom_shed_seq:{whl}\r\nlive_replicas:{}\r\nlag_ms:{}\r\nlag_ms_max:{lmx}\r\nlag_max_gap:{lmg}\r\nlag_soft_ms:{soft}\r\nlag_hard_ms:{hard}\r\nmin_replicas_to_write:{minr}\r\nwidowed_grace_ms:{wgm}\r\nwidowed_shed:{wsh}\r\nfullsync_active:{fsa}\r\nfullsync_max:{fsm}\r\nasync_write_queue:{aqd}\r\nwrite_deadline_ms:{wdm}\r\nwrite_inflight:{wif}\r\nwrite_service_us:{wsu}\r\nwrite_wait_est_ms:{wwe}\r\nwrites_shed_deadline:{wsd}\r\nwrites_shed_lag:{wsl}\r\nwrites_shed_quorum:{wsq}\r\nwrites_shed_widowed:{wswd}\r\nwrites_shed_headroom:{wshr}\r\nwrites_delayed_soft:{wdsf}\r\nwal_fsync_ms:{wfm}\r\nwal_fsync_total:{wft}\r\ncert_days_remaining:{cdr}\r\nactive_conns:{ac}\r\nmax_conns:{mc}\r\nconns_shed_total:{cs}\r\nwrite_stopped:{wst}\r\ndelayed_write_rate:{dwr}\r\nwrite_stall_readable:{wsr}\r\nl0_files:{l0f}\r\npending_compaction_bytes:{pcb}\r\ncompaction_readable:{cr}\r\ndisk_free_bytes:{dfb}\r\ndisk_total_bytes:{dtb}\r\ndisk_free_pct:{dfp}\r\ndisk_verdict:{dv}\r\ndisk_unknown_samples:{dus}\r\nevictable_ns:{ens}\r\nevictable_ns_agree:{ensa}\r\nevictable_ns_bytes:{ensb}\r\ngc_swept_expired:{gse}\r\ngc_swept_orphans:{gso}\r\nuptime_ms:{upms}\r\n",
         if read_only { "replica" } else { "master" },
         hub.effective_acked(now)
             .map_or_else(|| "none".into(), |a| a.to_string()),
@@ -3866,6 +3903,7 @@ fn flintinfo(
         // nobody can read cannot be compared. -1 means not yet known, which
         // is deliberately distinct from 0 (a real mismatch).
         ens = evictable_ns_joined(),
+        ensb = evictable_ns_bytes_joined(rocks),
         ensa = EVICTABLE_AGREE.load(Ordering::Relaxed),
         // ADR-0022. Exported because the shed threshold is expressed in
         // SEQUENCES while RocksDB budgets BYTES: an operator can only pick a
@@ -5403,6 +5441,44 @@ mod evictable_ns_config {
     #[cfg(feature = "rocks")]
     use super::find_info_field;
     use super::parse_evictable_ns;
+
+    /// An unanswerable capacity must render `?`, never `0`.
+    ///
+    /// Zero is a LEGITIMATE reading here — an empty evictable namespace — so
+    /// the two cannot share a rendering. If they did, the field an operator
+    /// consults while a cache fills would report maximum headroom in exactly
+    /// the case where nothing is known, which is the reassuring direction and
+    /// therefore the dangerous one. `rocks: None` is that case, and it is also
+    /// the state a read-only or not-yet-opened seat is in.
+    ///
+    /// The empty-list case is asserted too, so that a durable deployment which
+    /// declared nothing sees an empty field rather than a figure implying a
+    /// policy it never opted into.
+    #[test]
+    #[cfg(feature = "rocks")]
+    fn an_unanswerable_capacity_is_not_zero() {
+        use super::{EVICTABLE_NS, evictable_ns_bytes_joined};
+
+        // Nothing declared: the default, and the common case.
+        assert_eq!(evictable_ns_bytes_joined(&None), "");
+
+        if let Ok(mut g) = EVICTABLE_NS.write() {
+            *g = vec!["cache".to_string(), "scratch".to_string()];
+        }
+        // No engine to ask. Not "0 bytes used" — "not known".
+        let out = evictable_ns_bytes_joined(&None);
+        assert_eq!(
+            out, "cache=?,scratch=?",
+            "unknown must not render as a size"
+        );
+        assert!(
+            !out.contains("=0"),
+            "an unanswered capacity rendered as zero: {out}"
+        );
+        if let Ok(mut g) = EVICTABLE_NS.write() {
+            g.clear();
+        }
+    }
 
     /// Two seats given the same namespaces in a different order must compare
     /// EQUAL, or the pair-agreement check reports a mismatch that is not one —
