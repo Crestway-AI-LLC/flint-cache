@@ -76,3 +76,15 @@ here** — that is the distinction from the re-run-to-green habit. Record the
 occurrence so it is not lost under a green label.
 
 Occurrences: run 32917921084 (main @ 21e6747, 2026-08-26).
+
+**The re-run passed, and that is data rather than relief.** Run 32918818215
+(main @ b3a5ef1) went green with no change to the drill, the harness, or the
+server — the only commit between them adds this file. Two runs, same code,
+opposite results, is the definition of the precondition being outside the
+run's control, and it is the clearest confirmation of the diagnosis above that
+we are going to get without forcing the lag.
+
+It also bounds the severity: the mechanism is not broken, because when the
+condition IS met the drill observes the shed and passes. What is unproven on
+any given run is whether the condition was met at all — which the drill,
+correctly, refuses to paper over.
