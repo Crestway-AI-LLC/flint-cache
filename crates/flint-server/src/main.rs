@@ -884,7 +884,7 @@ fn eviction_metrics_line(rocks: &Option<RocksHandle>) -> String {
     format!(
         "marked_total={} marked_now={} dropped={} refused={} overflow={} \
 forced_passes={} skipped_cooldown={} skipped_small={} marks_at_last_pass={} \
-reclaim_cycles={} bytes_requested={}",
+reclaim_cycles={} bytes_requested={} policy_keys={} policy_bytes={}",
         m.marked_total,
         m.marked_now,
         m.dropped,
@@ -896,6 +896,8 @@ reclaim_cycles={} bytes_requested={}",
         m.marks_at_last_pass,
         m.reclaim_cycles,
         m.bytes_requested,
+        m.policy_keys,
+        m.policy_bytes,
     )
 }
 
@@ -1809,6 +1811,12 @@ fn main() -> std::io::Result<()> {
             "disk guard: min-free {}% or {} bytes, sampling {} every {:?} OR SOONER",
             thresholds.min_free_pct, thresholds.min_free_bytes, dir, every
         );
+        // The guard thread reclaims as well as sheds, so it needs the engine:
+        // reclaim marks keys and forces the compaction that drops them. Cloned
+        // in rather than reached for, because this thread outlives the setup
+        // scope it is spawned from.
+        #[cfg(feature = "rocks")]
+        let ev_rocks = rocks.clone();
         std::thread::spawn(move || {
             let path = std::path::PathBuf::from(&dir);
             let mut last = diskguard::Verdict::Ok;
@@ -1870,6 +1878,48 @@ fn main() -> std::io::Result<()> {
                     );
                     RECLAIM_TARGET_FREE.store(target, Ordering::Relaxed);
                     RECLAIM_ACTIVE.store(now_reclaiming, Ordering::Relaxed);
+                }
+                // ACT. Every sample while engaged, not only on the transition:
+                // one pass rarely clears the deficit, and waiting for the next
+                // edge would mean waiting for a state change that reclaiming is
+                // supposed to cause.
+                // THE CAPACITY HINT IS SET ON EVERY SAMPLE, not only while
+                // reclaiming, and the difference is the whole feature.
+                //
+                // `note_write` skips admission while the hint is zero, so
+                // setting it inside the reclaim branch meant the policy learned
+                // nothing until pressure arrived — and a policy with no history
+                // at the moment it is first asked for cold keys has none to
+                // give. It would evict blind, or more precisely not at all.
+                // The drill caught this at policy_keys=0; every unit test in
+                // the crate passed, because each one sets the hint itself.
+                #[cfg(feature = "rocks")]
+                if let (Some(kv), Some(u)) = (ev_rocks.as_ref(), usage) {
+                    kv.eviction().set_capacity_hint(u.total_bytes);
+                }
+                #[cfg(feature = "rocks")]
+                if let diskguard::ReclaimAction::ReclaimToFreeBytes(target) = action
+                    && let Some(kv) = ev_rocks.as_ref()
+                {
+                    let ev = kv.eviction();
+                    if let Some(u) = usage {
+                        let deficit = target.saturating_sub(u.free_bytes);
+                        if deficit > 0 {
+                            ev.reclaim(deficit);
+                        }
+                    }
+                    // Force the pass only where the floors allow it. They are
+                    // what stops this loop -- which runs every couple of
+                    // seconds -- from turning into a compaction per sample,
+                    // and a compact_ns costs the same whatever it reclaims.
+                    let now_ms = flint_storage::strings::system_clock();
+                    let namespaces: Vec<String> =
+                        EVICTABLE_NS.read().map(|g| g.clone()).unwrap_or_default();
+                    for ns in namespaces {
+                        if ev.should_force_pass(ns.as_bytes(), now_ms) {
+                            kv.compact_ns(ns.as_bytes());
+                        }
+                    }
                 }
                 last = v;
                 slept = match usage {
@@ -2912,6 +2962,42 @@ fn admit_write_path(
     for cmd in work.cmds {
         if let Some(k) = commands::command_key(cmd) {
             heat::record_key(k);
+        }
+    }
+    // Feed the eviction policy from the SAME point, and for the same reason
+    // heat is counted here: this is user traffic that reached a slot this node
+    // owns. Doing it in the storage layer instead would also catch replication
+    // apply and GC scans, and a GC scan registering as access is precisely the
+    // pollution S3-FIFO was chosen to avoid — a policy that treats a sweep as
+    // interest is the LRU failure wearing a different name.
+    //
+    // The evictable check comes FIRST and is one relaxed load. Everything
+    // costly — building the envelope key, which allocates — happens only for a
+    // namespace someone declared. A durable deployment pays the load and
+    // nothing else.
+    #[cfg(feature = "rocks")]
+    if let Some(kv) = rocks.as_ref() {
+        let ev = kv.eviction();
+        if ev.evictable_count() > 0 {
+            for cmd in work.cmds {
+                if let Some(k) = commands::command_key(cmd) {
+                    let ekey = flint_storage::encoding::envelope(
+                        flint_storage::encoding::Cf::Metadata,
+                        conn_ns,
+                        flint_slot::slot_for_key(k),
+                        k,
+                    );
+                    if work.write {
+                        // Approximate: the argument bytes past the key. The
+                        // policy's accounting only orders candidates, while the
+                        // decision to reclaim comes from the disk.
+                        let approx: u64 = cmd.iter().skip(2).map(|a| a.len() as u64).sum();
+                        ev.note_write(&ekey, approx);
+                    } else {
+                        ev.note_read(&ekey);
+                    }
+                }
+            }
         }
     }
     // Lag-cap backpressure: the write path enforces the RPO bound. The

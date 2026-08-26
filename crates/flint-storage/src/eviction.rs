@@ -45,6 +45,17 @@ pub struct EvictionMetrics {
     pub reclaim_cycles: u64,
     pub bytes_requested: u64,
     pub marks_at_last_pass: u64,
+    /// Keys and bytes the POLICY currently tracks, summed across namespaces.
+    ///
+    /// The direct evidence that the request-path hooks are feeding it — every
+    /// other counter here moves only once reclaim runs, so without these a
+    /// silently disconnected hook is indistinguishable from a node under no
+    /// pressure. Also the useful tuning comparison: policy bytes against
+    /// `ns_bytes` says how much of the namespace the policy actually knows
+    /// about, and a large gap means admissions are being dropped under
+    /// contention.
+    pub policy_keys: u64,
+    pub policy_bytes: u64,
 }
 
 #[derive(Default)]
@@ -428,6 +439,15 @@ impl EvictionState {
     /// `mark_overflow` against `marked_total` says whether MAX_MARKS is the
     /// constraint, i.e. whether reclaim is having to batch within a cycle.
     pub fn metrics(&self) -> EvictionMetrics {
+        // try_lock: reading counters must never block the request path, and a
+        // momentarily unavailable policy reports zero rather than stalling
+        // FLINTINFO. Both figures are advisory by nature.
+        let (keys, bytes) = match self.policies.try_lock() {
+            Ok(g) => g.values().fold((0u64, 0u64), |(k, b), p| {
+                (k + p.resident_keys() as u64, b + p.resident_bytes())
+            }),
+            Err(_) => (0, 0),
+        };
         EvictionMetrics {
             marked_total: self.marked_total.load(Ordering::Relaxed),
             marked_now: self.marked() as u64,
@@ -440,6 +460,8 @@ impl EvictionState {
             reclaim_cycles: self.reclaim_cycles.load(Ordering::Relaxed),
             bytes_requested: self.bytes_requested.load(Ordering::Relaxed),
             marks_at_last_pass: self.marks_at_last_pass.load(Ordering::Relaxed),
+            policy_keys: keys,
+            policy_bytes: bytes,
         }
     }
 
