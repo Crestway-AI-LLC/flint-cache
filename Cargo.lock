@@ -640,6 +640,7 @@ dependencies = [
  "flint-slot",
  "flint-storage",
  "flint-tls",
+ "libc",
  "serde_json",
 ]
 
