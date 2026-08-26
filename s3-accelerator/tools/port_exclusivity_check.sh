@@ -27,7 +27,7 @@ ck() { if [ "$1" = 0 ]; then PASS=$((PASS+1)); printf "[ok] %s\n" "$2";
 # Every port this harness binds. Adding one without adding it here is the
 # failure the first check below exists to catch.
 DECLARED="$(printf '%s\n' 9000 9301 9302 9303 9304 9305 9306 9307 9308 9309 \
-                          9310 9311 9318 9319 9398 9399 9400 9401 9407 9530 \
+                          9310 9311 9318 9319 9397 9398 9399 9400 9401 9407 9530 \
                           9531 9810 | sort -un)"
 
 # 6379 is Redis's standard port and the documented default for the CUSTOMER's

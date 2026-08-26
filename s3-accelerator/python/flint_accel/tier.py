@@ -18,6 +18,8 @@ from __future__ import annotations
 import threading
 import time
 import zlib
+import threading
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as _FutureTimeout
 
 CHUNK = 64 * 1024
 #: What fsspec's block cache fetches per miss. NOT the chunk size, and not
@@ -58,7 +60,23 @@ BLOCK_BYTES = 256 * 1024
 #: THIS NUMBER IS AN ARGUMENT, NOT A FINDING. The real crossover wants
 #: measuring on a cluster; tracked, blocked on M0.
 MAX_OBJECT_BYTES = 512 * 1024 * 1024
-TIER_BUDGET_S = 0.05          # any tier call slower than this is a miss
+#: Any tier CALL slower than this is a miss -- the whole command, not each
+#: socket read of its reply.
+#:
+#: That distinction is the guarantee. This value also reaches redis-py as
+#: socket_timeout, which CPython applies per recv(): it bounds the gap between
+#: instalments of a reply, not the reply. A tier that answers promptly and then
+#: dribbles never has a single gap long enough to trip it, so an 8 MiB warm read
+#: through a 1 MB/s tier was served FROM the tier in 9.9 s with no counter
+#: moving -- 6.8x slower than the same read with no cache at all. The JVM path
+#: bounds the whole command (orTimeout) and degraded correctly on the identical
+#: read, so "never slower than no cache" was true on one client and false on the
+#: other. A guarantee is only as strong as its weakest client.
+#:
+#: socket_timeout is KEPT as well, and is not redundant: it is what makes a
+#: stalled read terminate at all, so the worker below can never outlive the
+#: process.
+TIER_BUDGET_S = 0.05
 META_TTL_S = 60
 
 
@@ -104,17 +122,55 @@ class FlintTier:
         self._lock = threading.Lock()
 
     # ---------------------------------------------------------------- tier
+    #: One pool for every tier call in the process. Shared rather than
+    #: per-instance because fsspec hands out many filesystems and a pool each
+    #: would be thousands of threads. When it saturates, submit() queues and the
+    #: caller's own budget still expires -- which degrades to the origin, the
+    #: correct answer for a tier too slow to keep up.
+    _POOL = None
+    _POOL_LOCK = threading.Lock()
+
+    @classmethod
+    def _pool(cls):
+        if cls._POOL is None:
+            with cls._POOL_LOCK:
+                if cls._POOL is None:
+                    cls._POOL = ThreadPoolExecutor(
+                        max_workers=32, thread_name_prefix="flint-tier")
+        return cls._POOL
+
     def _guard(self, fn, *a, **kw):
-        """Any tier failure is a miss, never an error.
+        """Any tier failure is a miss, never an error, and any tier call slower
+        than the budget is a failure.
 
         S3 is authoritative and always reachable, so every tier interaction is
         an OPTIMISATION and has to be written as one. The JVM version learned
         this the hard way: a dead tier made the client HANG rather than fail,
-        because the driver queued commands while disconnected. The timeout is
-        the backstop for slow-rather-than-broken; the except is for the rest.
+        because the driver queued commands while disconnected.
+
+        The call runs on a worker so the BUDGET BOUNDS THE COMMAND. redis-py's
+        socket_timeout cannot: CPython applies it per recv(), so it bounds the
+        gap between instalments of a reply rather than the reply, and a tier
+        that answers promptly and then dribbles slips straight through it. This
+        mirrors the JVM's orTimeout(), including its limitation -- neither can
+        cancel the I/O already in flight, so the worker is abandoned rather than
+        killed. It always finishes, because socket_timeout still bounds each of
+        its reads, and the connection returns to the pool intact.
         """
+        pool = type(self)._pool()
         try:
-            return fn(*a, **kw)
+            fut = pool.submit(fn, *a, **kw)
+        except RuntimeError:                     # interpreter shutting down
+            return None
+        try:
+            return fut.result(timeout=self.budget_s)
+        except _FutureTimeout:
+            # Budget exceeded, not an error: the tier is up and answering, just
+            # too slowly to be worth waiting for. Counted as degraded, which is
+            # what the JVM calls the same condition, so one number means one
+            # thing across both clients.
+            self.c.degraded += 1
+            return None
         except Exception:
             self.c.tier_failures += 1
             return None
