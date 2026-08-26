@@ -174,6 +174,35 @@ impl RocksKv {
         // the same condition as the explicit gap below, so it gets the same
         // answer: the replica must full-sync.
         if out.is_empty() {
+            // AN EMPTY ITERATOR HAS TWO CAUSES AND THIS USED TO ASSUME ONE.
+            //
+            // `get_updates_since(seq)` yields only batches whose first_seq is
+            // GREATER than seq — measured, not assumed: against a single batch
+            // spanning 2..=9, cursor 1 yields it and cursors 2, 3, 8 and 9
+            // yield nothing. So a cursor resting anywhere INSIDE a batch's
+            // span, rather than on its end, gets an empty iterator while the
+            // data sits in the live WAL one segment away.
+            //
+            // Reading that as "the WAL was recycled" sent a healthy replica to
+            // a full re-seed 18 times on the playground (BUG-0050), always
+            // "one sequence short", at any depth, and unaffected by the two
+            // retention raises that were tried as fixes.
+            //
+            // So ASK, rather than infer. The scan is the same full-WAL walk
+            // `own_seq_for_upstream` already accepts as "bounded by retention
+            // and paid once", and here it is paid only on a path that was
+            // previously an unconditional re-seed — strictly cheaper than
+            // what it replaces.
+            if let Some(covering) = self.batch_covering(last_applied)? {
+                // The WAL DOES reach back. Serve the covering batch clamped to
+                // the cursor: its remaining ops may be empty, and that is the
+                // point — the batch still ships so the cursor ADVANCES to a
+                // real batch end and the link unfreezes. Returning Ok(vec![])
+                // here instead would fix the false re-seed and leave the
+                // replica pinned at an interior sequence forever, which is the
+                // frozen-cursor failure the comment above exists to prevent.
+                return Ok(vec![covering]);
+            }
             return Err(ReplError::WalGap(format!(
                 "sequence {} is no longer in the WAL (latest is {})",
                 last_applied + 1,
@@ -322,12 +351,100 @@ impl RocksKv {
         )))
     }
 
+    /// The retained batch whose span COVERS `cursor`, clamped to it, or None
+    /// if no retained batch does.
+    ///
+    /// Only ever called on the empty-iterator path, where the alternative was
+    /// an unconditional full re-seed. A hit means the cursor is interior to a
+    /// batch rather than past the end of the WAL — the data is present and the
+    /// replica must not be re-seeded. A miss means the WAL genuinely cannot
+    /// reach back, and the caller raises WalGap exactly as before.
+    ///
+    /// Returns the batch with `first_seq` clamped to `cursor + 1` and only the
+    /// ops above the cursor, so applying it is idempotent with whatever the
+    /// replica already has and leaves it on a real batch end.
+    fn batch_covering(&self, cursor: u64) -> Result<Option<ReplBatch>, ReplError> {
+        let iter = self
+            .db()
+            .get_updates_since(0)
+            .map_err(|e| ReplError::WalGap(e.to_string()))?;
+        for item in iter {
+            let (first_seq, batch) = item.map_err(|e| ReplError::Storage(e.to_string()))?;
+            if first_seq > cursor {
+                // Batches are handed out in order; past the cursor means no
+                // earlier batch can cover it.
+                break;
+            }
+            let mut collector = OpCollector {
+                seq: first_seq - 1,
+                floor: cursor,
+                ops: Vec::new(),
+            };
+            batch.iterate(&mut collector);
+            if collector.seq > cursor {
+                return Ok(Some(ReplBatch {
+                    first_seq: first_seq.max(cursor + 1),
+                    last_seq: collector.seq,
+                    ops: collector.ops,
+                }));
+            }
+        }
+        Ok(None)
+    }
+
     /// Set the replica cursor directly (after a checkpoint full sync, the
     /// copied DB's own latest sequence IS the master cursor).
+    ///
+    /// SNAPPED TO A BATCH END, because an interior cursor is a link that
+    /// cannot advance (BUG-0050). `get_updates_since(seq)` yields only batches
+    /// whose first_seq exceeds `seq`, so a cursor resting inside a batch's
+    /// span is offered nothing and reads as a recycled WAL. A cursor obtained
+    /// by APPLYING a batch is always that batch's end and is safe; the four
+    /// call sites here set one from elsewhere — a checkpoint's own latest, a
+    /// translated cursor adopted from a master — and nothing about those
+    /// guarantees a boundary.
+    ///
+    /// This is the cause-side half of the fix. `updates_since` also RECOVERS
+    /// from an interior cursor now, so neither half is load-bearing alone:
+    /// this one stops them being written, that one survives any that already
+    /// exist on disk or arrive from an older peer.
+    ///
+    /// Snapping FORWARD to the batch end, never backward. The ops between the
+    /// requested seq and the batch end were all part of one atomic write, so a
+    /// replica that has the batch has all of them; advancing the cursor skips
+    /// nothing. Retreating would replay ops the replica already holds, which
+    /// is safe for puts and wrong for a delete followed by a put of the same
+    /// key.
     pub fn set_last_applied(&self, seq: u64) -> Result<(), ReplError> {
+        let snapped = self.snap_to_batch_end(seq).unwrap_or(seq);
         self.db()
-            .put(REPL_STATE_KEY, seq.to_be_bytes())
+            .put(REPL_STATE_KEY, snapped.to_be_bytes())
             .map_err(|e| ReplError::Storage(e.to_string()))
+    }
+
+    /// The end of the retained batch containing `seq`, or None when no
+    /// retained batch covers it (already a boundary, or past the WAL's reach).
+    /// Best-effort: a None leaves the caller's value untouched, because a
+    /// cursor this cannot classify is exactly the case `updates_since` now
+    /// handles on the read side.
+    fn snap_to_batch_end(&self, seq: u64) -> Option<u64> {
+        let iter = self.db().get_updates_since(0).ok()?;
+        for item in iter {
+            let (first_seq, batch) = item.ok()?;
+            if first_seq > seq {
+                break;
+            }
+            let mut find = OpCollector {
+                seq: first_seq - 1,
+                floor: u64::MAX, // count only; collect nothing
+                ops: Vec::new(),
+            };
+            batch.iterate(&mut find);
+            if find.seq > seq {
+                return Some(find.seq);
+            }
+        }
+        None
     }
 
     /// Replica cursor, surviving restarts. 0 = nothing applied.
@@ -952,5 +1069,226 @@ mod tests {
             )),
             "ops at or before the mapped position must not replay"
         );
+    }
+}
+
+#[cfg(test)]
+mod bug_0050_iterator_shape {
+    use super::*;
+    use crate::strings::{SetOptions, StringStore, system_clock};
+
+    /// BUG-0050, cause side: writing an interior cursor must SNAP it forward
+    /// to the batch end, so a link can never be pinned at a position
+    /// `get_updates_since` will not serve.
+    #[test]
+    fn setting_an_interior_cursor_snaps_it_to_the_batch_end() {
+        let d = std::env::temp_dir().join(format!("flint-b50-snap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let kv = RocksKv::open(&d).expect("open");
+        let s = StringStore::new(&kv, b"ns", system_clock);
+        s.set(1, b"seed", b"v", SetOptions::default()).expect("set");
+
+        let before = kv.db().latest_sequence_number();
+        let ops: Vec<(Vec<u8>, Option<Vec<u8>>)> = (0..8u32)
+            .map(|i| (format!("Msnap{i}").into_bytes(), Some(b"v".to_vec())))
+            .collect();
+        kv.apply_writes(&ops).expect("multi");
+        let end = kv.db().latest_sequence_number();
+        assert!(
+            end - before >= 3,
+            "fixture batch too short to have an interior"
+        );
+
+        let interior = before + 1;
+        kv.set_last_applied(interior).expect("set");
+        assert_eq!(
+            kv.last_applied(),
+            end,
+            "an interior cursor must be stored as the batch end, not as given"
+        );
+
+        // A cursor already ON a boundary must be left exactly as it is —
+        // snapping must not move a correct value.
+        kv.set_last_applied(before).expect("set");
+        assert_eq!(
+            kv.last_applied(),
+            before,
+            "a boundary cursor was moved; snapping must be a no-op there"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// BUG-0050 REGRESSION: a cursor interior to a batch must be SERVED.
+    #[test]
+    fn an_interior_cursor_is_served_not_refused() {
+        let d = std::env::temp_dir().join(format!("flint-b50-reg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let kv = RocksKv::open(&d).expect("open");
+        let s = StringStore::new(&kv, b"ns", system_clock);
+        s.set(1, b"seed", b"v", SetOptions::default()).expect("set");
+
+        let before = kv.db().latest_sequence_number();
+        let ops: Vec<(Vec<u8>, Option<Vec<u8>>)> = (0..8u32)
+            .map(|i| (format!("Mreg{i}").into_bytes(), Some(b"v".to_vec())))
+            .collect();
+        kv.apply_writes(&ops).expect("multi");
+        let after = kv.db().latest_sequence_number();
+
+        // CONTROL FIRST. If the batch did not span several sequences there is
+        // no interior position and this test proves nothing.
+        assert!(
+            after - before >= 3,
+            "the fixture batch spans {} sequence(s); an interior cursor needs \
+             several, so this test would pass without exercising anything",
+            after - before
+        );
+
+        let interior = before + 1;
+        let served = kv
+            .updates_since(interior)
+            .unwrap_or_else(|e| panic!("interior cursor {interior} refused: {e:?} — BUG-0050"));
+        assert!(!served.is_empty(), "served nothing for an interior cursor");
+        // And it must leave the replica on a REAL batch end, or the link is
+        // merely frozen instead of re-seeding.
+        assert_eq!(
+            served.last().expect("batch").last_seq,
+            after,
+            "an interior cursor must be advanced to the batch end, or it stays interior forever"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// AND THE PROTECTION MUST SURVIVE. A cursor the WAL genuinely cannot
+    /// reach back to still has to raise WalGap — that is the condition the
+    /// empty-iterator check exists for, and the fix above must not swallow it.
+    #[test]
+    fn a_genuinely_recycled_wal_still_raises_walgap() {
+        let d = std::env::temp_dir().join(format!("flint-b50-recyc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        // Retention OFF: no archive, so flushed segments are deleted rather
+        // than kept — which is what "recycled" means here.
+        let kv = RocksKv::open_with_retention(&d, 0, 0).expect("open");
+        let s = StringStore::new(&kv, b"ns", system_clock);
+        for i in 0..50u32 {
+            s.set(1, format!("old{i}").as_bytes(), b"v", SetOptions::default())
+                .expect("set");
+        }
+        let stale = kv.db().latest_sequence_number();
+        for round in 0..6 {
+            kv.flush();
+            for i in 0..50u32 {
+                s.set(
+                    1,
+                    format!("n{round}-{i}").as_bytes(),
+                    b"v",
+                    SetOptions::default(),
+                )
+                .expect("set");
+            }
+        }
+        kv.flush();
+
+        // CONTROL: the scan must actually be unable to reach `stale`, or this
+        // asserts nothing. If retention kept everything, skip rather than pass
+        // — a test that cannot fail is worse than one that does not run.
+        let reachable = kv
+            .db()
+            .get_updates_since(0)
+            .expect("iter")
+            .filter_map(|i| i.ok())
+            .map(|(f, _)| f)
+            .next();
+        if reachable.is_some_and(|f| f <= stale) {
+            eprintln!(
+                "  SKIP: the WAL still reaches back to {stale} (oldest {reachable:?}); \
+                 this environment does not recycle, so the protection is untested here"
+            );
+            let _ = std::fs::remove_dir_all(&d);
+            return;
+        }
+        let err = kv
+            .updates_since(stale)
+            .expect_err("a cursor the WAL cannot reach must still be a gap");
+        assert!(
+            matches!(err, ReplError::WalGap(_)),
+            "expected WalGap for an unreachable cursor, got {err:?}"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// DOES THE COLLECTOR'S SEQUENCE ACCOUNTING MATCH ROCKSDB'S?
+    ///
+    /// OpCollector implements only put/delete. If a batch carries ops it does
+    /// not see — a non-default column family, a range delete — its `seq`
+    /// undercounts, and the `last_seq` a replica records is SHORT of the real
+    /// batch end. That is a cursor landing interior by construction, which is
+    /// BUG-0050's precondition. Compares what the collector reports against
+    /// what the DB's own sequence did.
+    #[test]
+    fn collector_sequence_matches_the_dbs_own_advance() {
+        let d = std::env::temp_dir().join(format!("flint-b50-acct-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let kv = RocksKv::open(&d).expect("open");
+        let s = StringStore::new(&kv, b"ns", system_clock);
+        s.set(1, b"seed", b"v", SetOptions::default()).expect("set");
+
+        for (label, n) in [("1-key", 1usize), ("8-key", 8), ("64-key", 64)] {
+            let before = kv.db().latest_sequence_number();
+            let ops: Vec<(Vec<u8>, Option<Vec<u8>>)> = (0..n)
+                .map(|i| (format!("M{label}{i}").into_bytes(), Some(b"v".to_vec())))
+                .collect();
+            kv.apply_writes(&ops).expect("write");
+            let after = kv.db().latest_sequence_number();
+            let reported = kv
+                .updates_since(before)
+                .expect("tail")
+                .last()
+                .map(|b| b.last_seq)
+                .unwrap_or(0);
+            eprintln!(
+                "  {label}: db {before} -> {after} (advance {}), collector last_seq {reported}{}",
+                after - before,
+                if reported == after {
+                    "  MATCH"
+                } else {
+                    "  *** SHORT ***"
+                }
+            );
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// What does the iterator actually HAND BACK for an interior cursor?
+    /// The fix for BUG-0050 differs completely depending on the answer, so
+    /// this is measured rather than reasoned about.
+    #[test]
+    fn what_the_iterator_yields_for_an_interior_cursor() {
+        let d = std::env::temp_dir().join(format!("flint-b50-shape-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let kv = RocksKv::open(&d).expect("open");
+        let s = StringStore::new(&kv, b"ns", system_clock);
+        s.set(1, b"seed", b"v", SetOptions::default()).expect("set");
+
+        let before = kv.db().latest_sequence_number();
+        let ops: Vec<(Vec<u8>, Option<Vec<u8>>)> = (0..8u32)
+            .map(|i| (format!("Mk{i}").into_bytes(), Some(b"v".to_vec())))
+            .collect();
+        kv.apply_writes(&ops).expect("multi");
+        let after = kv.db().latest_sequence_number();
+
+        for cursor in [before, before + 1, before + 2, after - 1, after] {
+            let it = kv.db().get_updates_since(cursor).expect("iter");
+            let spans: Vec<String> = it
+                .filter_map(|i| i.ok())
+                .map(|(first, b)| format!("first={first} count={}", b.len()))
+                .collect();
+            eprintln!(
+                "  cursor {cursor}: iterator yielded {} item(s) [{}]",
+                spans.len(),
+                spans.join("; ")
+            );
+        }
+        eprintln!("  (batch occupies {}..={})", before + 1, after);
+        let _ = std::fs::remove_dir_all(&d);
     }
 }
