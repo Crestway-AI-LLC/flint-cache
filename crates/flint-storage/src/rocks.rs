@@ -27,6 +27,9 @@ pub struct RocksKv {
     path: std::path::PathBuf,
     /// Completed WAL fsyncs (the bounded-cadence durability tick).
     wal_fsyncs: std::sync::atomic::AtomicU64,
+    /// Capacity-eviction state (ADR-0023 D7). Shared with the compaction
+    /// filter, which is the only thing that acts on it.
+    eviction: std::sync::Arc<crate::eviction::EvictionState>,
 }
 
 /// LSM shape knobs, unset by default so stock RocksDB behaviour is unchanged.
@@ -341,6 +344,9 @@ impl RocksKv {
             db: DB::open_for_read_only(&opts, path, false)?,
             path: path.to_path_buf(),
             wal_fsyncs: std::sync::atomic::AtomicU64::new(0),
+            // No compaction filter is installed on a read-only open, so
+            // nothing here can act. Present so the type is one type.
+            eviction: std::sync::Arc::new(crate::eviction::EvictionState::default()),
         })
     }
 
@@ -420,9 +426,21 @@ impl RocksKv {
         // Expired metadata rows are dropped organically as compaction
         // rewrites them (subkey orphans are reclaimed by gc::sweep until
         // the filter gains a metadata-lookup handle).
-        opts.set_compaction_filter("flint-meta-expiry", |_level, key, value| {
+        let eviction = std::sync::Arc::new(crate::eviction::EvictionState::default());
+        let ev_filter = std::sync::Arc::clone(&eviction);
+        opts.set_compaction_filter("flint-meta-expiry", move |_level, key, value| {
             use crate::encoding::{Cf, MetaHeader};
             use rocksdb::compaction_filter::Decision;
+            // Capacity eviction (ADR-0023 D7.3), before the expiry check
+            // because it is the cheaper question: on a durable deployment
+            // nothing is ever marked and this is one relaxed atomic load.
+            //
+            // `should_drop` re-derives the namespace from the key and refuses
+            // any row whose namespace was not declared evictable, so a policy
+            // bug cannot reach a durable namespace through here.
+            if ev_filter.should_drop(key) {
+                return Decision::Remove;
+            }
             if key.first() == Some(&(Cf::Metadata as u8))
                 && MetaHeader::decode(value)
                     .is_some_and(|h| h.is_expired(crate::strings::system_clock()))
@@ -464,7 +482,14 @@ impl RocksKv {
             db: DB::open(&opts, path)?,
             path: path.to_path_buf(),
             wal_fsyncs: std::sync::atomic::AtomicU64::new(0),
+            eviction,
         })
+    }
+
+    /// Capacity-eviction state for this DB (ADR-0023 D7). Marking is a
+    /// request; the compaction filter's guard decides.
+    pub fn eviction(&self) -> &std::sync::Arc<crate::eviction::EvictionState> {
+        &self.eviction
     }
 
     /// The data directory this DB was opened from.
@@ -1105,6 +1130,76 @@ mod gc_integration {
         let remaining = kv.scan_prefix(&[Cf::Metadata as u8]);
         assert_eq!(remaining.len(), 1);
         assert_eq!(s.get(1, b"live"), Ok(Some(b"v".to_vec())));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod eviction_filter {
+    use super::*;
+    use crate::encoding::Cf;
+    use crate::strings::{SetOptions, StringStore};
+
+    /// End to end, through a real compaction: the guard in
+    /// `EvictionState::should_drop` is unit-tested, but that proves the
+    /// FUNCTION refuses. This proves the compaction filter actually consults
+    /// it — the two are different claims, and only this one is about the code
+    /// path that deletes data.
+    ///
+    /// The policy here is deliberately WRONG: it marks every row it can see,
+    /// including one in a namespace nobody declared evictable. That is the
+    /// failure the guard exists for, and it is the failure a durable store
+    /// must survive.
+    #[test]
+    fn compaction_drops_marked_rows_only_in_declared_namespaces() {
+        let dir = std::env::temp_dir().join(format!("flint-evfilter-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let kv = RocksKv::open(&dir).expect("open");
+        kv.eviction().set_evictable(["cache"]);
+
+        let cache = StringStore::new(&kv, b"cache", crate::strings::system_clock);
+        let durable = StringStore::new(&kv, b"durable", crate::strings::system_clock);
+        cache
+            .set(1, b"k", b"v", SetOptions::default())
+            .expect("set");
+        durable
+            .set(1, b"k", b"v", SetOptions::default())
+            .expect("set");
+
+        // A policy with a bug in it: mark EVERYTHING, both namespaces.
+        let rows = kv.scan_prefix(&[Cf::Metadata as u8]);
+        assert_eq!(rows.len(), 2, "expected one metadata row per namespace");
+        for (k, _) in &rows {
+            kv.eviction().mark(k);
+        }
+        assert_eq!(kv.eviction().marked(), 2);
+
+        kv.flush();
+        kv.compact_all();
+
+        // POSITIVE CONTROL: eviction actually happened. Without it, "the
+        // durable row survived" would also be true of a filter that does
+        // nothing at all — which is the most likely way for this test to pass
+        // while the feature is broken.
+        assert_eq!(
+            cache.get(1, b"k"),
+            Ok(None),
+            "the evictable row was not reclaimed, so this test proves nothing \
+             about the row that was"
+        );
+
+        // THE GUARD, through the real path.
+        assert_eq!(
+            durable.get(1, b"k"),
+            Ok(Some(b"v".to_vec())),
+            "a marked row in a namespace that never opted in was DELETED"
+        );
+        assert!(
+            kv.eviction().refused() >= 1,
+            "the refusal was not counted: refused={}",
+            kv.eviction().refused()
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

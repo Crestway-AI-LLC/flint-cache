@@ -844,6 +844,26 @@ fn evictable_ns_joined() -> String {
 /// engine did not answer" would make this field report maximum headroom at the
 /// one moment it knows nothing, during the incident it exists to explain. Same
 /// contract, and the same reason, as BUG-0022.
+/// Push the declared-evictable set into the ENGINE, where the compaction
+/// filter's guard reads it.
+///
+/// There are deliberately two copies. `EVICTABLE_NS` is the seat's record of
+/// what the operator declared — it answers FLINTINFO and the pair-agreement
+/// check. The engine's copy is what actually authorises a delete. Two copies
+/// can disagree, and only one direction is dangerous: the engine lagging a
+/// REVOCATION would leave a namespace evictable after an operator turned it
+/// off. So every site that writes `EVICTABLE_NS` calls this, and so does open.
+///
+/// Pushed rather than read lazily from the filter, because the filter runs per
+/// key on a compaction thread and must not reach for this lock on a tier whose
+/// compaction headroom is BUG-0013's subject.
+#[cfg(feature = "rocks")]
+fn sync_evictable_to_engine(ev: &flint_storage::eviction::EvictionState) {
+    if let Ok(g) = EVICTABLE_NS.read() {
+        ev.set_evictable(g.iter());
+    }
+}
+
 /// Rocks-only: without an engine there is no capacity to report, and the
 /// non-rocks `flintinfo` emits no evictable fields at all.
 #[cfg(feature = "rocks")]
@@ -1339,6 +1359,10 @@ fn main() -> std::io::Result<()> {
             }
             let kv = RocksKv::open_with_retention(std::path::Path::new(&dir), wal_ttl, wal_mb)
                 .map_err(|e| std::io::Error::other(format!("rocksdb open: {e}")))?;
+            // The flag is parsed before the engine exists, so the engine
+            // starts with an empty set and would honour no declaration at all
+            // until the first FLINTCONFIG. Seed it here.
+            sync_evictable_to_engine(kv.eviction());
             if fresh && replica_of.is_some() {
                 // The checkpoint copies the SOURCE's system rows — including
                 // its replication cursor, which is the source's OLD upstream
@@ -3239,6 +3263,14 @@ fn execute(
                 match EVICTABLE_NS.write() {
                     Ok(mut g) => *g = parsed,
                     Err(_) => return Value::Error("ERR evictable-ns lock poisoned".into()),
+                }
+                // The engine authorises the deletes, so it has to hear about
+                // this before the next compaction — above all when the change
+                // is a revocation. Rocks-only: the mem engine has no
+                // compaction filter, so there is nothing that could act on it.
+                #[cfg(feature = "rocks")]
+                if let Some(kv) = rocks.as_ref() {
+                    sync_evictable_to_engine(kv.eviction());
                 }
                 // The pair may now disagree; say "unknown" until the next
                 // check rather than leaving a stale verdict that reads as

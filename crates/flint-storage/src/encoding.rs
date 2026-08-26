@@ -901,6 +901,25 @@ mod order_tests {
     }
 }
 
+/// The namespace an envelope row belongs to, for ANY of the three CFs.
+///
+/// `parse_subkey_envelope` decodes a whole row and covers only S and Z. This
+/// answers the single question the eviction guard asks — whose row is this —
+/// for M as well, and decodes nothing else.
+///
+/// `None` for anything that is not a namespaced envelope row: an unknown CF
+/// tag, or a key truncated before the namespace ends. The eviction guard reads
+/// `None` as NOT evictable, so a key it cannot attribute is never dropped
+/// (ADR-0023 D7).
+pub fn ns_of_envelope(k: &[u8]) -> Option<&[u8]> {
+    let cf = *k.first()?;
+    if cf != Cf::Metadata as u8 && cf != Cf::Subkey as u8 && cf != Cf::ZScore as u8 {
+        return None;
+    }
+    let ns_len = *k.get(1)? as usize;
+    k.get(2..2 + ns_len)
+}
+
 /// Parse a subkey/zscore row key back into (ns, slot, user_key, version).
 /// Returns None on malformed keys (wrong tag, truncated).
 pub fn parse_subkey_envelope(k: &[u8]) -> Option<(&[u8], u16, &[u8], u64)> {

@@ -33,6 +33,7 @@ pub mod strings;
 pub mod watch;
 pub mod zsets;
 
+pub mod eviction;
 #[cfg(feature = "rocksdb")]
 pub mod repl;
 #[cfg(feature = "rocksdb")]
