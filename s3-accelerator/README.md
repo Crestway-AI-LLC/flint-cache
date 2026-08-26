@@ -132,7 +132,7 @@ assumed to be zero.
 | cache SSE-KMS | `fs.s3a.flint.cache.sse-kms` | `flint.cache.sse-kms` | `cache_sse_kms` | `false` |
 | declare immutable | `fs.s3a.flint.immutable` | `flint.immutable` | — | `false` (**`true`** on the Iceberg path) |
 | max cached object | `fs.s3a.flint.max.object.bytes` | `flint.max.object.bytes` | `max_object_bytes` | 512 MiB |
-| read block size | — (AAL fetches the exact range) | — | `default_block_size` | **256 KiB** (not fsspec's 5 MiB, not our chunk) |
+| read block size | — (AAL fetches the exact range) | — | `default_block_size` | **256 KiB** = 4 chunks (not fsspec's 5 MiB, not our chunk) |
 | immutable TTL | `fs.s3a.flint.meta.ttl.immutable.seconds` | `flint.meta.ttl.immutable.seconds` | — | 86400 s |
 
 **Immutability is a declaration the engine can make and the cache cannot
@@ -152,6 +152,38 @@ It is a long TTL, not an infinite one. If you declare immutability and are
 wrong — delete a path and write different bytes there out-of-band — a day
 bounds the damage where "never revalidate" would not. Writes made *through*
 this library invalidate regardless.
+
+**The chunk grid costs 1.25x tier memory to be a power of two, and pays it on
+purpose.** A chunk is stored as `CHUNK + 4` bytes of identity seal, which lands
+one byte past the tier allocator's 64 KiB size class, so the tier takes the next
+class and charges 1.2522x the bytes you cached.
+
+A grid 128 bytes smaller escapes that — measured, 19.5% less tier memory on a
+full-object read — and was implemented and then withdrawn. Application read
+offsets are themselves powers of two, so a grid that is not one stops dividing
+them, and every selective read straddles an extra chunk. On the same 16 x 64 KiB
+pattern that costs **+19.8% origin bytes** — measured — while the memory saving
+on that pattern nets out to a few percent rather than the 19.5%.
+
+The tension is structural rather than a tuning miss: the grid must divide the
+application's alignment to avoid the extra chunk, every value that divides a
+power of two is a power of two, and every power of two plus the seal crosses a
+size class. Which cost dominates is a function of read size — the extra chunk is
+20% of a five-chunk fetch and 0.3% of a thousand-chunk one — so it is a workload
+question, and it is open.
+
+**The block size must be a whole number of chunks.** fsspec anchors blocks at
+multiples of the block size, so a block nests inside the grid only if the chunk
+divides it; otherwise every block straddles one more chunk than it needs, on the
+origin side as well as the tier, because a miss is fetched on chunk boundaries.
+The Python default is written as `4 * CHUNK` and asserted at import, rather than
+as a round number that happens to be one today.
+
+Both clients must agree on the grid, and it is spelled once per language for
+that reason. Chunks live under a versioned prefix (`c1/`) so that a future
+change to it retires the old entries instead of mixing two grids in one
+keyspace — an index is an offset divided by the grid, so a disagreement would
+be a correctness bug rather than a miss.
 
 Any tier failure — down, slow, or lying — degrades to a plain S3 read inside
 the budget. The tier is an optimisation and is written as one.

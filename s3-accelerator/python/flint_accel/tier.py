@@ -21,7 +21,30 @@ import zlib
 
 import redis as redis_lib
 
-CHUNK = 64 * 1024
+#: The chunk grid. A power of two, and it costs 1.25x tier memory to be one.
+#:
+#: A chunk is stored as CHUNK + 4 bytes of D14 seal. At 65,536 that is 65,540,
+#: which lands one byte past jemalloc's 64 KiB size class, so the tier takes
+#: the 80 KiB class and charges 1.2522x the bytes cached (ADR-0023 D17.2).
+#:
+#: 65,408 -- 64 KiB minus 128 -- was implemented to escape that, MEASURED, and
+#: WITHDRAWN. It does cut tier memory 19.5% on a full-object read. But
+#: application read offsets are themselves powers of two (this suite's are
+#: 4 MiB apart; Parquet row groups and page boundaries are no different), so a
+#: grid that is not a power of two no longer divides them, and every selective
+#: read straddles an extra chunk. Measured on the suite's 16 x 64 KiB pattern:
+#: origin bytes went 5.00x -> 5.99x of what was asked, +19.8%, to buy a ~4%
+#: memory saving on that same pattern. The suite's derived ceiling caught it.
+#:
+#: The tension is structural, not a tuning miss. The grid must divide the
+#: application's alignment to avoid the extra chunk; every value that divides a
+#: power of two IS a power of two; and every power of two plus the seal and the
+#: tier's ~53 B per-value header crosses a size class. So the 1.25x is the price
+#: of alignment, and the crossover between the two costs is a function of read
+#: size -- the +1 chunk is 20% of a 5-chunk fetch and 0.3% of a 1024-chunk one.
+#: That is D4's unsettled question and it wants M2's sweep, not a constant
+#: chosen here.
+CHUNK = 65536
 #: What fsspec's block cache fetches per miss. NOT the chunk size, and not
 #: fsspec's own 5 MiB either.
 #:
@@ -66,7 +89,22 @@ CHUNK = 64 * 1024
 #: -- Parquet footers, Iceberg manifests, column projection -- sit far above 6%,
 #: so 256 KiB is the measured choice and not merely the middle one. tier_RTT and
 #: tier_BW are the two numbers M0 owes this formula.
-BLOCK_BYTES = 256 * 1024
+#:
+#: Written as 4 CHUNKs rather than as 256 KiB, which is the same number today
+#: and would not have been under the 65,408 grid. fsspec anchors blocks at
+#: multiples of the block size, so a block starts on a chunk boundary only if
+#: CHUNK divides BLOCK_BYTES; at 262,144 over that grid every block straddled a
+#: FIFTH chunk. Spelling the dependency is what keeps the two constants from
+#: drifting apart silently the next time either moves.
+BLOCK_BYTES = 4 * CHUNK
+#: Not decoration. The two constants above are chosen independently -- one
+#: against the tier's allocator, one against the origin's RTT -- and nothing
+#: else in the module notices when a later edit to either breaks the nesting.
+#: The symptom is a silent 25% read amplification, not an error.
+assert BLOCK_BYTES % CHUNK == 0, (
+    f"BLOCK_BYTES ({BLOCK_BYTES}) must be a whole multiple of CHUNK ({CHUNK}): "
+    "fsspec aligns blocks to multiples of the block size, so a block that is "
+    "not a whole number of chunks straddles an extra chunk on every read")
 #: How much of a fill goes in one round trip. Bounded by BYTES because the
 #: budget bounds a command: B bytes needs B/budget of bandwidth to land inside
 #: it, so an unbounded batch would degrade on a tier that reads fine.

@@ -275,7 +275,23 @@ start_svcs() { # port, extra-args
   PIDS+=($!)
   wait_http "http://127.0.0.1:$1/__stats" || exit 2
 }
-stop_origin() { for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null; done; PIDS=(); sleep 1; }
+# Stop the fixtures and return when they are actually GONE.
+#
+# This was `kill; sleep 1`. The sleep was a guess at how long a python process
+# takes to die, and the next stage begins with a bind to the same port -- so on
+# a loaded box the guess expiring early is a bind failure in a stage that has
+# nothing to do with the fixture. `wait` is the signal: the shell already knows
+# when its own child exits.
+#
+# It also silences the `Terminated: 15` lines that trailed the PASS output.
+# Those were bash reporting a job it reaped asynchronously; reaping it here
+# deliberately is what makes them stop, and a clean gate now looks clean.
+stop_origin() {
+  local p
+  for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null; done
+  for p in "${PIDS[@]:-}"; do wait "$p" 2>/dev/null; done
+  PIDS=()
+}
 
 
 run_suite() { # label, mainclass, port, classpath, extra-origin-args

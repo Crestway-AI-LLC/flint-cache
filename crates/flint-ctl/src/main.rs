@@ -31,6 +31,15 @@
 //!   lag-soft-ms 500       node  HOT   soft lag cap (delays writes)
 //!   lag-hard-ms 1000      node  HOT   hard lag cap (sheds; RPO bound)
 //!   min-replicas 1        node  HOT   min-replicas-to-write gate
+//!   node-env K=V          node  BOOT  extra env for every flint-server seat,
+//!                                     repeatable. For engine tuning that has
+//!                                     no CLI flag — FLINT_BG_JOBS,
+//!                                     FLINT_LEVEL_BASE_MB,
+//!                                     FLINT_WRITE_BUFFER_MB — which
+//!                                     flint-storage reads from the
+//!                                     environment and which is otherwise
+//!                                     unreachable on a managed fleet, since
+//!                                     flintctl owns the command line.
 //!   widowed-grace-ms N    node  HOT   max time accepting writes with NO
 //!                                     replica (default 10000 on a pair;
 //!                                     0 off). The only bound on the
@@ -143,6 +152,19 @@ struct Inventory {
     lag_soft_ms: Option<u64>,  // node: replication soft lag cap (delay)
     lag_hard_ms: Option<u64>,  // node: replication hard lag cap (RPO shed)
     min_replicas: Option<u32>, // node: min-replicas-to-write safety gate
+    /// node: extra environment for every flint-server seat, as `node-env K=V`
+    /// (repeatable). This exists for ENGINE TUNING that has no CLI flag —
+    /// `FLINT_BG_JOBS`, `FLINT_LEVEL_BASE_MB`, `FLINT_WRITE_BUFFER_MB` are read
+    /// from the environment by flint-storage and are otherwise unreachable on a
+    /// managed fleet, because flintctl spawns the seats and the operator never
+    /// touches the command line.
+    ///
+    /// The plumbing already existed and only the operator-facing half was
+    /// missing: `spawn_env` takes env pairs and the ssh path forwards them as
+    /// `host-spawn --env K=V`, so a value set here reaches a REMOTE seat as
+    /// well as a local one. Without this, a compaction question can be asked on
+    /// a laptop and not on the fleet it is actually about.
+    node_env: Vec<(String, String)>,
     /// node: how long a seat may keep accepting writes with NO live replica
     /// before it sheds. Absent = flintctl's own default for pair members
     /// (DEFAULT_WIDOWED_GRACE_MS); explicit 0 turns it off.
@@ -282,6 +304,17 @@ fn parse_inventory(path: &str) -> Inventory {
             "lag-soft-ms" => inv.lag_soft_ms = val.parse().ok(),
             "lag-hard-ms" => inv.lag_hard_ms = val.parse().ok(),
             "min-replicas" => inv.min_replicas = val.parse().ok(),
+            // Repeatable, and SPLIT ONCE: a value may contain '=' even though
+            // none of today's do, and splitting on the last would silently
+            // mangle it rather than fail.
+            "node-env" => {
+                if let Some((k, v)) = val.split_once('=') {
+                    let (k, v) = (k.trim(), v.trim());
+                    if !k.is_empty() {
+                        inv.node_env.push((k.to_string(), v.to_string()));
+                    }
+                }
+            }
             "widowed-grace-ms" => inv.widowed_grace_ms = val.parse().ok(),
             "max-conns" => inv.max_conns = val.parse().ok(),
             "async-queue-cap" => inv.async_queue_cap = val.parse().ok(),
@@ -1352,6 +1385,41 @@ fn local_spawn_env(
 
 fn spawn(inv: &Inventory, r: &Runner, name: &str, bin: &str, args: &[String]) {
     spawn_env(inv, r, name, bin, args, &[]);
+}
+
+/// Spawn a NODE seat. EVERY `flint-server` in the fleet goes through here.
+///
+/// `node-env` is the fleet's declared engine tuning, and it was reaching
+/// exactly one of the four places a node is started: bootstrap. The other
+/// three are `add-replica`, `swap-node` and `roll-node` -- and `roll-node` is
+/// the path `upgrade` walks, so the tuning would have applied when the
+/// operator set it and then silently vanished on the next version bump. That
+/// is worse than not shipping the knob: the fleet slows down days later with
+/// no config change to blame, and the one thing that did change (the build)
+/// is the wrong suspect.
+///
+/// So the invariant is structural rather than remembered. Routing, seat name
+/// and binary live here too, because all four sites derived them from the
+/// address in the same way and a fifth caller would have had to get four
+/// things right instead of calling one function.
+///
+/// `extra` is applied AFTER the inventory's env, and both transports are
+/// last-wins (`Command::env` locally, repeated `--env` through `host-spawn`),
+/// so a caller's per-roll variable beats an inventory line. That direction is
+/// deliberate: `upgrade` passes FLINT_BUILD_VERSION here and then asserts the
+/// seat reports it, so an inventory line that could override it would make
+/// that assertion prove nothing.
+fn spawn_node(inv: &Inventory, addr: &str, args: &[String], extra: &[(String, String)]) {
+    let mut envs = inv.node_env.clone();
+    envs.extend(extra.iter().cloned());
+    spawn_env(
+        inv,
+        &runner_for(inv, addr),
+        &format!("node-{}", port_of(addr)),
+        "flint-server",
+        args,
+        &envs,
+    );
 }
 
 // wipe_node (the orchestrator-side wrapper) is gone: every rejoin path now
@@ -2526,13 +2594,7 @@ fn start_pair_nodes(inv: &Inventory, pair: &[String], gi: usize) {
         args.extend(["--rewind-snaps".into(), format!("{d}/snaps/g{gi}")]);
         args.extend(internal_args(inv));
         args.extend(node_tuning_args(inv, pair.len() > 1));
-        spawn(
-            inv,
-            &runner_for(inv, addr),
-            &format!("node-{port}"),
-            "flint-server",
-            &args,
-        );
+        spawn_node(inv, addr, &args, &[]);
         // The master must be up before its replicas dial in.
         if i == 0 && live_master.is_none() {
             std::thread::sleep(Duration::from_millis(700));
@@ -4423,13 +4485,7 @@ fn add_replica(inv: &Inventory, inventory_path: &str, pair_ref: &str, new: &str)
     args.extend(internal_args(inv));
     // Spawned with --replica-of: a pair member by construction.
     args.extend(node_tuning_args(inv, true));
-    spawn(
-        inv,
-        &runner_for(inv, new),
-        &format!("node-{port}"),
-        "flint-server",
-        &args,
-    );
+    spawn_node(inv, new, &args, &[]);
     assert!(
         wait_pong(new, &tls, node_ready_budget(inv)),
         "new replica up"
@@ -4521,13 +4577,7 @@ fn swap_node(inv: &Inventory, inventory_path: &str, bad: &str, new: &str) {
     args.extend(internal_args(inv));
     // Spawned with --replica-of: a pair member by construction.
     args.extend(node_tuning_args(inv, true));
-    spawn(
-        inv,
-        &runner_for(inv, new),
-        &format!("node-{port}"),
-        "flint-server",
-        &args,
-    );
+    spawn_node(inv, new, &args, &[]);
     assert!(
         wait_pong(new, &tls, node_ready_budget(inv)),
         "replacement up"
@@ -4814,14 +4864,7 @@ fn roll_node(
     args.extend(internal_args(inv));
     // Spawned with --replica-of: a pair member by construction.
     args.extend(node_tuning_args(inv, true));
-    spawn_env(
-        inv,
-        &runner_for(inv, addr),
-        &format!("node-{port}"),
-        "flint-server",
-        &args,
-        envs,
-    );
+    spawn_node(inv, addr, &args, envs);
     if !wait_pong(addr, &tls, node_ready_budget(inv)) {
         return Err(format!("{addr} did not come back after the binary swap"));
     }
@@ -6265,6 +6308,100 @@ fn main() {
 #[cfg(test)]
 mod cpfence_probe_tests {
     use super::*;
+
+    /// node-env is engine tuning with no CLI flag, so the ONLY thing standing
+    /// between an operator and an unreachable knob is this parse. A key that is
+    /// silently dropped looks exactly like a key that had no effect, and the
+    /// fleet it is set on is the one nobody can attach a debugger to.
+    #[test]
+    fn node_env_parses_repeats_and_ignores_a_line_with_no_equals() {
+        let dir = std::env::temp_dir().join(format!("flint-nodeenv-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("tmpdir");
+        let path = dir.join("inv.flint");
+        std::fs::write(
+            &path,
+            "statedir /tmp/flint-nodeenv-test\n\
+             cp 127.0.0.1:7500\n\
+             pair 127.0.0.1:7001,127.0.0.1:7002\n\
+             node-env FLINT_BG_JOBS=6\n\
+             node-env FLINT_LEVEL_BASE_MB=256\n\
+             node-env malformed_no_equals\n",
+        )
+        .expect("write inventory");
+
+        let inv = parse_inventory(path.to_str().expect("utf8 path"));
+        std::fs::remove_dir_all(&dir).ok();
+
+        // Both well-formed lines survive, in order, and the malformed one is
+        // dropped rather than stored as a key with an empty value — which would
+        // reach the seat as `--env malformed_no_equals=` and be worse than
+        // absent.
+        assert_eq!(
+            inv.node_env,
+            vec![
+                ("FLINT_BG_JOBS".to_string(), "6".to_string()),
+                ("FLINT_LEVEL_BASE_MB".to_string(), "256".to_string()),
+            ],
+            "node-env did not round-trip"
+        );
+    }
+
+    /// The invariant [`spawn_node`] exists to hold: nothing else starts a node.
+    ///
+    /// The parse test above proves the flag is READ. It passed while the value
+    /// reached exactly one of the four places a `flint-server` is started, so
+    /// it would have gone on passing while `upgrade` dropped the tuning off
+    /// every seat it rolled. A round-trip test of a parser cannot see that;
+    /// the defect is in who calls whom.
+    ///
+    /// Checked against the source because the alternative is a live fleet, and
+    /// the thing being asserted is structural. Note the assertion is an
+    /// EQUALITY against the full list of spawn sites, not "no bad ones found":
+    /// a matcher that quietly stopped matching -- a rename, a rustfmt change
+    /// that moves the binary onto the call line -- would report an empty list,
+    /// and "found no offenders" and "found nothing at all" are the same
+    /// output. Requiring `spawn_node` to be present makes the matcher prove it
+    /// still works before it is allowed to certify anything.
+    #[test]
+    fn only_spawn_node_starts_a_node_seat() {
+        let src = include_str!("main.rs");
+        let lines: Vec<&str> = src.lines().collect();
+        let mut current_fn = "<top level>";
+        let mut spawn_sites: Vec<&str> = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            if let Some(rest) = line
+                .strip_prefix("fn ")
+                .or_else(|| line.strip_prefix("pub fn "))
+            {
+                current_fn = rest.split(['(', '<']).next().unwrap_or(rest);
+            }
+            if line.trim() != "\"flint-server\"," {
+                continue;
+            }
+            // Which call is this literal an argument to? `stop_seat` and
+            // `seat_alive` name the same binary and are not spawns.
+            let opener = lines[i.saturating_sub(10)..i].iter().rev().find_map(|l| {
+                let l = l.trim_end();
+                if l.ends_with("spawn_env(") || l.ends_with("spawn(") {
+                    Some("spawn")
+                } else if l.ends_with("stop_seat(") || l.ends_with("seat_alive(") {
+                    Some("stop")
+                } else {
+                    None
+                }
+            });
+            if opener == Some("spawn") {
+                spawn_sites.push(current_fn);
+            }
+        }
+        assert_eq!(
+            spawn_sites,
+            vec!["spawn_node"],
+            "every flint-server spawn must go through spawn_node, or node-env \
+             silently stops applying on that path (an empty list here means the \
+             matcher broke, not that the code is clean)"
+        );
+    }
 
     /// The reply that stopped the playground's rc.51 -> rc.52 roll halfway,
     /// with the pair demoted and drained (BUG-0018).

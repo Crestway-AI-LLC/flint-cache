@@ -109,6 +109,24 @@ public final class FlintObjectClient implements ObjectClient {
    *  THIS NUMBER IS AN ARGUMENT, NOT A FINDING -- the crossover wants measuring
    *  on a cluster. Tracked, blocked on M0. */
   public static final long DEFAULT_MAX_OBJECT_BYTES = 512L * 1024 * 1024;
+
+  /** The chunk grid, and the ONE place it is spelled.
+   *
+   *  It costs 1.25x tier memory to be a power of two -- CHUNK + SEAL is one
+   *  byte past jemalloc's 64 KiB class -- and 65,408 was implemented to escape
+   *  that and then withdrawn: application read offsets are powers of two, so a
+   *  grid that is not one stops dividing them and every selective read drags an
+   *  extra chunk. Measured, +19.8% origin bytes for a ~4% memory saving. See
+   *  ADR-0023 D20 and the python client's flint_accel.tier.CHUNK, which carries
+   *  the same finding.
+   *
+   *  MUST equal that constant: the two clients share one keyspace and an index
+   *  is an offset divided by this number, so a disagreement is a correctness
+   *  bug, not a miss. It lived as a literal in fifteen places before it had a
+   *  name -- including the production S3A path -- so moving "the default" moved
+   *  one of them, and the cross-language drill was the only check that could
+   *  see the other fourteen. */
+  public static final int DEFAULT_CHUNK_BYTES = 65536;
   public final long maxObjectBytes;
   private final Map<String, Boolean> oversizeSeen = new ConcurrentHashMap<>();
   private final boolean immutable;

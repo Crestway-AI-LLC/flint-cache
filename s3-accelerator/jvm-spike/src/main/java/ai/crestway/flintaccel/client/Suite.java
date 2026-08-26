@@ -120,18 +120,96 @@ public final class Suite {
     return tail.isEmpty() ? 9399 : Integer.parseInt(tail);
   }
 
+  /** Poll a condition to a deadline. Returns false if it never became true.
+   *
+   *  Every fixed sleep this replaces was waiting for a state change that
+   *  announces itself. A duration is only ever a GUESS at how long the change
+   *  takes, and the guess is calibrated on an idle machine -- which is the one
+   *  machine where waiting was never needed. */
+  static boolean awaitTrue(java.util.function.BooleanSupplier cond, long budgetMs)
+      throws Exception {
+    long deadline = System.nanoTime() + budgetMs * 1_000_000L;
+    while (System.nanoTime() < deadline) {
+      if (cond.getAsBoolean()) return true;
+      Thread.sleep(2);
+    }
+    return cond.getAsBoolean();
+  }
+
+  /** Does a TIER answer on the tier port -- not merely a listener?
+   *
+   *  `tierListening` below proves a socket accepted, which a stale process on
+   *  a recycled port also does, and which a server still loading a dataset
+   *  does while refusing every command with -LOADING. The protocol is the
+   *  discrimination: +PONG comes only from something speaking RESP and ready
+   *  to serve. Inline command, so no client library is needed in a static
+   *  helper that runs before the connection exists and again after it closes.
+   *
+   *  The asymmetry is the point and is worth not smoothing over: liveness
+   *  needs the PROTOCOL, death needs the SOCKET. A failed PING is a bad death
+   *  signal -- it fails for a hung server, a full backlog, or a dropped packet,
+   *  all of which leave the process alive -- so killTier still waits on
+   *  connect-refused. Same port, opposite questions, different right answer. */
+  static boolean tierAnswering() {
+    try (java.net.Socket sk = new java.net.Socket()) {
+      sk.connect(new java.net.InetSocketAddress("127.0.0.1", tierPort()), 200);
+      sk.setSoTimeout(200);
+      sk.getOutputStream().write("PING\r\n".getBytes(java.nio.charset.StandardCharsets.US_ASCII));
+      sk.getOutputStream().flush();
+      byte[] buf = new byte[7];
+      int n = sk.getInputStream().read(buf);
+      return n >= 5 && new String(buf, 0, n, java.nio.charset.StandardCharsets.US_ASCII)
+          .startsWith("+PONG");
+    } catch (IOException e) {
+      return false;
+    }
+  }
+
+  /** Is anything accepting connections on the tier port? */
+  static boolean tierListening() {
+    try (java.net.Socket sk = new java.net.Socket()) {
+      sk.connect(new java.net.InetSocketAddress("127.0.0.1", tierPort()), 200);
+      return true;
+    } catch (IOException e) {
+      return false;
+    }
+  }
+
   static void startTier() throws Exception {
     runTier("FLINT_TIER_SERVER", new String[] {"valkey-server", "redis-server"},
         "--port", String.valueOf(tierPort()), "--save", "", "--appendonly", "no",
         "--daemonize", "yes").waitFor();
-    Thread.sleep(700);
+    // `--daemonize yes` EXITS 0 before the server listens, so waitFor() proves
+    // nothing at all. This used to be `sleep(700)`, which is the same
+    // non-signal with a longer fuse: fine idle, wrong under load.
+    if (!awaitTrue(Suite::tierAnswering, 15_000))
+      throw new IllegalStateException("tier never answered PING on port " + tierPort());
   }
 
-  static void killTier() throws Exception {
-    runTier("FLINT_TIER_CLI", new String[] {"valkey-cli", "redis-cli"},
-        "-p", String.valueOf(tierPort()), "shutdown", "nosave").waitFor();
-    Thread.sleep(600);
+  /** Kill the tier and return only once the port refuses.
+   *
+   *  It used to fork a valkey-cli and then sleep 600ms. Both are load-sensitive
+   *  and neither is the signal -- and the fork sat inside a WALL-CLOCK
+   *  ASSERTION further down, where a JVM ProcessBuilder under load is the most
+   *  expensive thing in the window and has nothing to do with the property
+   *  being measured. Shutting down over a connection we already hold costs
+   *  microseconds and cannot be starved by the scheduler. */
+  static void killTier(StatefulRedisConnection<byte[], byte[]> live) throws Exception {
+    if (live != null) {
+      // async, not sync: SHUTDOWN gets no reply because the server dies
+      // answering it, and a sync call would sit on the command timeout inside
+      // the one window this whole rewrite exists to keep clean.
+      try { live.async().shutdown(false); }
+      catch (RuntimeException expected) { /* the server dies mid-command */ }
+    } else {
+      runTier("FLINT_TIER_CLI", new String[] {"valkey-cli", "redis-cli"},
+          "-p", String.valueOf(tierPort()), "shutdown", "nosave").waitFor();
+    }
+    if (!awaitTrue(() -> !tierListening(), 15_000))
+      throw new IllegalStateException("tier still listening after shutdown");
   }
+
+  static void killTier() throws Exception { killTier(null); }
 
   public static void main(String[] args) throws Exception {
     endpoint = args.length > 0 ? args[0] : "http://127.0.0.1:9000";
@@ -151,7 +229,7 @@ public final class Suite {
     conn.sync().flushall();
 
     try (var sdk = new S3SdkObjectClient(s3, false)) {
-      var c = new FlintObjectClient(sdk, conn.async(), 64 * 1024, 50, 2, false, s3, false);
+      var c = new FlintObjectClient(sdk, conn.async(), FlintObjectClient.DEFAULT_CHUNK_BYTES, 50, 2, false, s3, false);
 
       // 1. cold + warm, bytes verified
       String k = "data/000001.bin";
@@ -251,7 +329,15 @@ public final class Suite {
       byte[] during = read(c, k4, 100_000, 8192);
       int gDur = genOf(k4, 100_000, during);
       check(gDur == 0, "within the metadata TTL the read is stale (gen " + gDur + "), per contract");
-      Thread.sleep(c.metaTtlSec * 1000 + 800);
+      // Wait for the metadata entry to be GONE, not for a duration we believe
+      // covers its TTL. The `+ 800` was a fudge on top of a guess, and neither
+      // number describes anything: what the next read depends on is the key's
+      // absence, which the tier will tell us about if asked. Not tautological
+      // -- the assertion below is about what the read RETURNS once the cached
+      // metadata is gone, which is a different claim from "it is gone".
+      if (!awaitTrue(() -> conn.sync().keys(("m1/*" + k4).getBytes(java.nio.charset.StandardCharsets.UTF_8)).isEmpty(),
+                     c.metaTtlSec * 1000 + 10_000))
+        throw new IllegalStateException("metadata for " + k4 + " never expired");
       byte[] after = read(c, k4, 100_000, 8192);
       int gAft = genOf(k4, 100_000, after);
       check(gAft == 1, "after the TTL the read is the new object (gen " + gAft + ")");
@@ -262,7 +348,7 @@ public final class Suite {
       stat("/__reset");
       conn.sync().flushall();
       String k6 = "data/000006.bin";
-      var bypassing = new FlintObjectClient(sdk, conn.async(), 64 * 1024, 50, 2, true, s3, false);
+      var bypassing = new FlintObjectClient(sdk, conn.async(), FlintObjectClient.DEFAULT_CHUNK_BYTES, 50, 2, true, s3, false);
       byte[] enc = read(bypassing, k6, 300_000, 8192);
       check(genOf(k6, 300_000, enc) == 0, "bypassing client still returns correct bytes");
       long keysAfterBypass = conn.sync().dbsize();
@@ -289,7 +375,7 @@ public final class Suite {
       stat("/__reset");
       conn.sync().flushall();
       String k7 = "data/000007.bin";
-      var capped = new FlintObjectClient(sdk, conn.async(), 64 * 1024, 50, 2,
+      var capped = new FlintObjectClient(sdk, conn.async(), FlintObjectClient.DEFAULT_CHUNK_BYTES, 50, 2,
           false, s3, false, false, 86_400, 1024 * 1024);
       byte[] big = read(capped, k7, 300_000, 8192);
       check(genOf(k7, 300_000, big) == 0, "an oversize object still READS correctly");
@@ -334,18 +420,62 @@ public final class Suite {
           }
         }));
       }
+      // Warm the METADATA and leave chunk 6 COLD. Without this the eight
+      // readers each do their own HEAD first, which staggers them by however
+      // long the origin takes, and whether anyone is still joined when the
+      // tier dies becomes a coin flip -- runs of this suite reported 0 joined
+      // and 1 joined on the same code. With metadata cached they race straight
+      // to one chunk key: one leads, seven join, every time.
+      read(c, k5, 0, 4096);
+      final long claim0 = c.claimed.get(), join0 = c.joined.get();
+
       ready2.await();
-      long t0 = System.nanoTime();
       go2.countDown();
-      Thread.sleep(30);
-      killTier();
+      // WAIT FOR THE SIGNAL, not for a duration. `sleep(30)` was a guess at how
+      // long eight threads take to reach one chunk key, and a guess calibrated
+      // on an idle machine is wrong on the machine where it matters.
+      boolean armed = awaitTrue(() -> c.joined.get() > join0, 2_000);
+      check(armed, String.format(
+          "armed: readers are JOINED to an in-flight fetch when the tier dies (%d joined, %d claimed)",
+          c.joined.get() - join0, c.claimed.get() - claim0));
+      // Kill over the connection we already hold: microseconds, and nothing
+      // the scheduler can starve. The clock starts AFTER it, because the
+      // property is the readers' unwind -- the old window also contained a
+      // 30 ms sleep, a JVM fork/exec of a CLI, and a 600 ms sleep, and under
+      // load the fork was the largest term in a number reported as "readers
+      // finish promptly".
+      killTier(conn);
+      long t0 = System.nanoTime();
       boolean survived = true;
       for (var f : fs2) survived &= f.get(90, TimeUnit.SECONDS);
       double ms = (System.nanoTime() - t0) / 1e6;
       pool2.shutdown();
       check(survived, "readers joined in-flight SURVIVE the tier dying under them");
-      check(ms < 30_000, String.format("and they finish promptly, not eventually (%.0f ms)", ms));
-      check(c.tierFailures.get() > 0, "armed-check: tier failures were observed");
+      // NOT `degraded > 0`. I asserted that and it failed, correctly: the
+      // leader's origin fetch completes and serves all fourteen joiners from
+      // its own result, so nobody needs to fall back. Degradation is the
+      // LEADER's failure path, and asserting it here demanded a fallback the
+      // scenario does not call for.
+      //
+      // Worth recording that the racy version DID see `degraded 8`, because
+      // with no joiners the readers were mid-tier-read when it died. Making
+      // this deterministic on the joined path gave that up -- but only here:
+      // SickTierSuite drives a client at a deliberately sick tier and asserts
+      // the degradation path against a measured no-tier baseline, which is a
+      // better home for it than a race that happened to land there.
+      //
+      // What IS load-immune, and what makes the clock below mean something:
+      // the armed check above proves readers were joined, tierFailures proves
+      // the tier really died under them, and `survived` proves every one came
+      // back with correct bytes.
+      check(c.tierFailures.get() > 0, "armed-check: the tier really did fail under them");
+      // The clock is now a BACKSTOP behind that counter rather than the only
+      // guard, and it is expressed as a multiple of the configured budget --
+      // the joiner's own deadline is budget x 40, so budget x 600 leaves an
+      // order of magnitude and still catches a hang.
+      long bound = c.tierBudgetMs * 600;
+      check(ms < bound, String.format(
+          "and they finish promptly, not eventually (%.0f ms, bound %d = budget x 600)", ms, bound));
 
       System.out.println("\ncounters: " + c.counters());
       System.out.println("bypass:   " + bypassing.counters());

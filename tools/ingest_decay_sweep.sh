@@ -129,6 +129,43 @@ if [ "${DECAY_ANY_HOST:-0}" != "1" ] && [ "$SEAT_CPUS" -gt 4 ]; then
   exit 2
 fi
 
+# THE SHAPE ASSERT, and a REFUSAL for the same reason as the host one above.
+#
+# What this sweep measures is the cost of a DEEPENING LSM, so the dataset has
+# to be big enough relative to the level base to force levels to exist at all.
+#
+# On 2026-08-25 a run at a 64 MB base over 800 MB of data printed the best
+# numbers this script has ever produced -- throughput doubled, write
+# amplification down a third, stalls from 8.7% to 0.6%, decay 51% -> 20% -- and
+# it measured nothing. 95 MB per interval against a 64 MB level base and a
+# 32 MB write buffer never leaves L0, and there is no curve to flatten when the
+# structure has one level. Every column was a memtable benchmark wearing a
+# compaction benchmark's labels.
+#
+# THE POST-HOC GUARD BELOW DID NOT CATCH IT, and could not. It asserts the
+# baseline decayed at least 15%; this decayed 20% and cleared the bar. "The
+# curve is shallow" and "there is no curve" are indistinguishable from the
+# decay figure alone -- so the question has to be asked of the SHAPE, not of
+# the result, and asked BEFORE an instance is spent rather than after.
+#
+# 50x is about 1.7 levels at RocksDB's default fanout of 10: the floor at which
+# depth is something that happened rather than a rounding artefact. For
+# calibration, every finding this file currently rests on was taken at 100x
+# (800 MB over an 8 MB base); the run it would have refused is 12.5x.
+BASE_MB="${DECAY_LEVEL_BASE_MB:-8}"
+[ "$BASE_MB" -ge 1 ] 2>/dev/null || {
+  echo "REFUSED: DECAY_LEVEL_BASE_MB=$BASE_MB is not a positive number of MB."; exit 2; }
+LOGICAL_MB=$(( KEYS * VSIZE / 1000000 ))
+if [ "$LOGICAL_MB" -lt $(( BASE_MB * 50 )) ]; then
+  echo "REFUSED: ${LOGICAL_MB}MB of data over a ${BASE_MB}MB level base is only"
+  echo "  $(( LOGICAL_MB / BASE_MB ))x, and this sweep needs at least 50x for the LSM to have the"
+  echo "  depth it exists to measure. Below that the run stays in L0 and every"
+  echo "  column describes a memtable, not compaction — while still looking"
+  echo "  like a large and very clean win."
+  echo "  Raise DECAY_KEYS to $(( BASE_MB * 50 * 1000000 / VSIZE )) or more, or lower DECAY_LEVEL_BASE_MB."
+  exit 2
+fi
+
 # DOES THE ARITHMETIC EVALUATE? Asked here, in the first second, and runnable
 # anywhere with DECAY_SELFTEST=1 — including the laptop, which cannot run the
 # sweep itself.
