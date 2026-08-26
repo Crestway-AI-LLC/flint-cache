@@ -179,7 +179,7 @@ print(FlintTier._seal_of('\"abc123\"', 7, b'flint-interop-vector'))" 2>/dev/null
 # --- 2. wide writer, narrow reader: must cost NOTHING ------------------------
 "$TIER_CLI" -p "$TIER_PORT" flushall >/dev/null
 pyread
-PK=$("$TIER_CLI" -p "$TIER_PORT" --scan --pattern 'c1/*' | wc -l | tr -d ' ')
+PK=$("$TIER_CLI" -p "$TIER_PORT" --scan --pattern 'c2/*' | wc -l | tr -d ' ')
 [ "$PK" -gt 0 ]; ck $? "armed: the Python client populated the tier ($PK chunks)"
 # Metadata is the OTHER half of the shared keyspace, and nothing here asserted
 # it. That is how the two clients came to write `m/bucket/key` and
@@ -203,7 +203,7 @@ ck $? "and the bytes the JVM got are correct, not merely cheap"
 # --- 3. narrow writer, wide reader: must REUSE, cannot be free ---------------
 "$TIER_CLI" -p "$TIER_PORT" flushall >/dev/null
 jread
-JK=$("$TIER_CLI" -p "$TIER_PORT" --scan --pattern 'c1/*' | wc -l | tr -d ' ')
+JK=$("$TIER_CLI" -p "$TIER_PORT" --scan --pattern 'c2/*' | wc -l | tr -d ' ')
 [ "$JK" -gt 0 ]; ck $? "armed: the JVM client populated the tier ($JK chunks)"
 JM=$("$TIER_CLI" -p "$TIER_PORT" --scan --pattern 'm1/*' | sort)
 JMK=$(printf '%s\n' "$JM" | grep -c . || true)

@@ -101,8 +101,12 @@ ETSP=$(curl -sI "http://127.0.0.1:$SP/bucket/data/000001.bin" | tr -d '\r' | gre
 
 # --- 2. multipart: bytes correct AND the suffix survives into the key -------
 "$TIER_CLI" -p "$TIER_PORT" flushall >/dev/null; probe "$MP"
-T=$(nkeys 'c1/*'); S=$(nkeys 'c1/*-4/*')
+T=$(nkeys 'c2/*'); S=$(nkeys 'c2/*-4}/*')
 [ "$T" -gt 0 ]; ck $? "armed: the multipart read populated the tier ($T chunks)"
+# The pattern ends `-4}` not `-4/`: the etag now sits inside a hash tag, so the
+# multipart suffix is the last thing before the closing brace rather than before
+# the slash. Colocating an object's chunks in one slot is what makes MGET safe
+# on a multi-pair fleet, and it moved this key shape.
 [ "$S" -eq "$T" ]; ck $? "EVERY key carries the -N suffix ($S of $T) -- the ETag is not being mangled"
 python3 - "$ROOT" <<'PY'
 import hashlib, sys
@@ -116,7 +120,7 @@ ck $? "and the bytes are correct under a multipart ETag"
 # --- 3. the control. Without it, "0 suffixed keys" would be satisfied by a
 #        run that cached nothing at all -- which is how a dead origin looks.
 "$TIER_CLI" -p "$TIER_PORT" flushall >/dev/null; probe "$SP"
-T2=$(nkeys 'c1/*'); S2=$(nkeys 'c1/*-4/*')
+T2=$(nkeys 'c2/*'); S2=$(nkeys 'c2/*-4/*')
 [ "$T2" -gt 0 ]; ck $? "armed: the single-part read populated the tier ($T2 chunks)"
 [ "$S2" -eq 0 ]; ck $? "control: NO key carries a suffix under single-part ETags ($S2)"
 

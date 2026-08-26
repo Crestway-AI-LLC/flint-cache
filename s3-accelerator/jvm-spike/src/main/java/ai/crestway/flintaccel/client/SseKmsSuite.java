@@ -92,7 +92,7 @@ public final class SseKmsSuite {
           false, plainS3, false);
       byte[] got = Suite.read(c, KEY, 0, LEN);
       check(Suite.genOf(KEY, 0, got) == 0, "control: a PLAIN object reads correctly");
-      long keys = conn.sync().keys("c1/*".getBytes()).size();
+      long keys = conn.sync().keys("c2/*".getBytes()).size();
       check(keys > 0,
           "control: and the same client DOES cache it (" + keys + " chunks) -- so check 1 "
           + "measured the KMS rule, not a broken cache");
@@ -107,7 +107,7 @@ public final class SseKmsSuite {
           false, kmsS3, true);
       byte[] got = Suite.read(c, KEY, 0, LEN);
       check(Suite.genOf(KEY, 0, got) == 0, "opt-in: the KMS object reads correctly");
-      long keys = conn.sync().keys("c1/*".getBytes()).size();
+      long keys = conn.sync().keys("c2/*".getBytes()).size();
       check(keys > 0, "OPT-IN WORKS: flint.cache.sse-kms=true caches the KMS object ("
           + keys + " chunks)");
       check(c.kmsBypassed.get() == 0, "armed: and nothing was bypassed once opted in");

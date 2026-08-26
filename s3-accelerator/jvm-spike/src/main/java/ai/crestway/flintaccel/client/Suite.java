@@ -384,7 +384,7 @@ public final class Suite {
       // is a SECURITY rule and the length and etag of bytes we must not see
       // are themselves something we must not store. Asserting dbsize()==0
       // here conflated the two policies and failed on the metadata entry.
-      long chunksAfterCap = conn.sync().keys("c1/*".getBytes(java.nio.charset.StandardCharsets.UTF_8)).size();
+      long chunksAfterCap = conn.sync().keys("c2/*".getBytes(java.nio.charset.StandardCharsets.UTF_8)).size();
       check(chunksAfterCap == 0,
           "D17: above the cap the tier got NO CHUNKS (" + chunksAfterCap + ")");
       check(conn.sync().keys("m1/*".getBytes(java.nio.charset.StandardCharsets.UTF_8)).size() > 0,

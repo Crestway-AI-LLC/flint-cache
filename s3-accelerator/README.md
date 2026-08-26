@@ -180,7 +180,7 @@ The Python default is written as `4 * CHUNK` and asserted at import, rather than
 as a round number that happens to be one today.
 
 Both clients must agree on the grid, and it is spelled once per language for
-that reason. Chunks live under a versioned prefix (`c1/`) so that a future
+that reason. Chunks live under a versioned prefix (`c2/`) so that a future
 change to it retires the old entries instead of mixing two grids in one
 keyspace — an index is an offset divided by the grid, so a disagreement would
 be a correctness bug rather than a miss.

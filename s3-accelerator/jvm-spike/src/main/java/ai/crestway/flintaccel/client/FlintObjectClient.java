@@ -402,7 +402,17 @@ public final class FlintObjectClient implements ObjectClient {
    * compatible. Separate keyspaces let both formats coexist while old entries
    * age out under eviction.
    */
-  private byte[] chunkKey(String etag, long id) { return utf8("c1/" + norm(etag) + "/" + id); }
+  /** The braces are a HASH TAG and they are load-bearing on a multi-pair fleet.
+   *
+   *  Flint routes a multi-key command by its FIRST key alone (flint-proxy
+   *  route_key) and neither MGET nor MSET carries the CROSSSLOT guard that
+   *  SINTER/SUNION/SDIFF do, so a chunk whose slot the receiving node does not
+   *  own answers nil IN ITS CORRECT POSITION and a fill writes it to a node
+   *  that does not own it. `{etag}` puts every chunk of one object in one slot
+   *  (flint-slot::hash_tag), so a run is single-slot on any topology.
+   *
+   *  MUST match the python client's _ck, which carries the same reasoning. */
+  private byte[] chunkKey(String etag, long id) { return utf8("c2/{" + norm(etag) + "}/" + id); }
   /**
    * Versioned like the chunk prefix, and for the same reason: the value now
    * carries a third field and a mixed fleet must not read one format as the

@@ -71,7 +71,7 @@ def main():
     f2 = fs_for(plain_ep, tier)
     got2 = read(f2, KEY, 0, LEN)
     check(got2 == expect(KEY, 0, LEN), "control: a PLAIN object reads correctly")
-    n2 = len(rc.keys("c1/*"))
+    n2 = len(rc.keys("c2/*"))
     check(n2 > 0,
           f"control: and the same client DOES cache it ({n2} chunks) -- so check 1 "
           "measured the KMS rule, not a broken cache")
@@ -82,7 +82,7 @@ def main():
     f3 = fs_for(kms_ep, tier, cache_kms=True)
     got3 = read(f3, KEY, 0, LEN)
     check(got3 == expect(KEY, 0, LEN), "opt-in: the KMS object reads correctly")
-    n3 = len(rc.keys("c1/*"))
+    n3 = len(rc.keys("c2/*"))
     check(n3 > 0, f"OPT-IN WORKS: cache_sse_kms=True caches the KMS object ({n3} chunks)")
     check(f3.counters["kms_bypassed"] == 0, "armed: and nothing was bypassed once opted in")
 
@@ -90,8 +90,8 @@ def main():
     # The whole point of a shared tier is that the JVM client can read what
     # this one wrote. A Python-only bypass rule that used a different key
     # prefix would pass every check above and still be useless.
-    sample = rc.keys("c1/*")[0].decode()
-    check(sample.startswith("c1/") and sample.count("/") == 2,
+    sample = rc.keys("c2/*")[0].decode()
+    check(sample.startswith("c2/") and sample.count("/") == 2,
           f"opt-in wrote the SHARED key shape the JVM client reads ({sample})")
 
     print("SSE-KMS PYTHON SUITE PASSED" if OK[0] else "SSE-KMS PYTHON SUITE FAILED")

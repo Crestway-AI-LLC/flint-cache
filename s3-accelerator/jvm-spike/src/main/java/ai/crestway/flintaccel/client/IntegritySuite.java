@@ -64,7 +64,7 @@ public final class IntegritySuite {
 
   static List<byte[]> chunkKeys(RedisCommands<byte[], byte[]> t) {
     List<byte[]> out = new ArrayList<>();
-    for (byte[] k : t.keys("c1/*".getBytes())) out.add(k);
+    for (byte[] k : t.keys("c2/*".getBytes())) out.add(k);
     out.sort(Comparator.comparingLong(a -> {
       String s = new String(a);
       return Long.parseLong(s.substring(s.lastIndexOf('/') + 1));

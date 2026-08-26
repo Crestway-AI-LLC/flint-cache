@@ -189,7 +189,7 @@ public final class IcebergSuite {
     check(viaRevived.length > 0,
         "AN EXECUTOR-SIDE COPY READS (" + viaRevived.length + " bytes) -- the lazy "
         + "tier rebuild works");
-    long revivedChunks = conn.sync().keys("c1/*".getBytes()).size();
+    long revivedChunks = conn.sync().keys("c2/*".getBytes()).size();
     check(revivedChunks > 0,
         "armed: and it went through OUR tier (" + revivedChunks + " chunks) rather than "
         + "silently falling back to plain S3");
@@ -285,7 +285,7 @@ public final class IcebergSuite {
       check(cold == ROWS, "cold read returned all " + ROWS + " rows, every payload verified");
       check(coldGets > 0, "negative control: the cold read DID reach the origin ("
           + coldGets + " GETs)");
-      long chunks = conn.sync().keys("c1/*".getBytes()).size();
+      long chunks = conn.sync().keys("c2/*".getBytes()).size();
       check(chunks > 0, "armed: the read populated the tier (" + chunks + " chunks)");
 
         // ---------------------------------------------------------------- 4
