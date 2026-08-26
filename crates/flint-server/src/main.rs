@@ -107,6 +107,48 @@ const ACCEPTED_FLAGS: &[&str] = &[
 /// (they are all read through `arg()`, which returns the token after the
 /// name), and no value this binary takes begins with `--`: they are ports,
 /// paths, addresses, byte counts and engine names.
+/// Leave NOW, without running anyone's static destructors.
+///
+/// `std::process::exit` skips Rust destructors but still runs libc `atexit` /
+/// `__cxa_atexit` handlers, and RocksDB is C++ with statics registered there:
+/// caches, env singletons, its background thread pool. Called from a thread
+/// that is not the only one running, that teardown races every other live
+/// thread — the serving path, the disk sampler, RocksDB's own compaction
+/// threads — and one of them touching a freed static is a SIGSEGV.
+///
+/// That is BUG-0048: the replication tailer diagnosed an unclosable WAL gap,
+/// wrote the re-seed marker, logged FATAL, and then segfaulted on the way out.
+/// Correct in every respect except the exit code, which is the one thing a
+/// supervisor reads. `expected exit 3, got 139`.
+///
+/// `_exit` bypasses the handlers entirely. Nothing here needs tidying: the
+/// marker is already on disk and the DB is about to be resynced from a
+/// checkpoint. Flush by hand first, because `_exit` will not — stderr is
+/// unbuffered in Rust but stdout is block-buffered when it is a pipe, which
+/// is exactly how it is captured in a drill and in systemd.
+///
+/// USE THIS ONLY FROM A PATH THAT MAY RUN WHILE THE DB IS OPEN. The five
+/// startup exits (argument and engine validation) run on the main thread
+/// before any store exists, and should keep `std::process::exit` — it flushes
+/// properly and there is no teardown to race.
+/// Gated with `rocks` because that is where the hazard lives, not to silence a
+/// lint: the teardown being raced is RocksDB's C++ statics, and a `mem` build
+/// has none, no `mod replica`, and no background compaction threads. If a
+/// non-rocks path ever needs to leave from a live thread, widen this — and the
+/// test below will already be failing, because the count will have moved.
+#[cfg(feature = "rocks")]
+fn hard_exit(code: i32) -> ! {
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+    #[cfg(unix)]
+    unsafe {
+        libc::_exit(code)
+    }
+    #[cfg(not(unix))]
+    std::process::exit(code)
+}
+
 fn reject_unknown_flags() {
     for a in std::env::args().skip(1) {
         if a.starts_with("--") && !ACCEPTED_FLAGS.contains(&a.as_str()) {
@@ -4530,7 +4572,12 @@ mod replica {
                     // WAL, because the next boot's rewind decision keys off it
                     // (retrying a fence-refused snapshot loops forever).
                     super::mark_needs_reseed(kv.path(), &format!("cannot resume this tail: {why}"));
-                    std::process::exit(3);
+                    // hard_exit, not process::exit: this is the tailer THREAD,
+                    // the DB is open, and the sampler and RocksDB's compaction
+                    // threads are still running. See BUG-0048 — the old call
+                    // ran C++ static teardown underneath them and turned a
+                    // deliberate exit 3 into a segfault under load.
+                    super::hard_exit(3);
                 }
                 eprintln!("replication link lost ({e}); reconnecting in 1s");
             }
@@ -5222,6 +5269,68 @@ mod serve_tests {
 #[cfg(test)]
 mod accepted_flags {
     use super::ACCEPTED_FLAGS;
+
+    /// BUG-0048. `std::process::exit` runs libc `atexit` handlers, and RocksDB
+    /// is C++ with statics registered there. Called from a thread that is not
+    /// the only one running, that teardown races the serving path, the disk
+    /// sampler and RocksDB's own compaction threads, and the process
+    /// segfaults on the way out — which is how a deliberate `exit 3` from the
+    /// replication tailer was reported as 139 under CI load.
+    ///
+    /// Six call sites were audited when this was fixed. Five are argument and
+    /// engine validation on the main thread, before any store exists: no
+    /// teardown to race, and `process::exit` flushes properly, so they stay.
+    /// The sixth is inside `hard_exit` itself, as the non-unix fallback.
+    ///
+    /// The count is asserted so a SEVENTH forces a decision instead of
+    /// inheriting the bug: startup path, raise the number and say why in the
+    /// commit; anything that can run while the DB is open, call `hard_exit`.
+    #[test]
+    fn plain_process_exit_stays_out_of_the_running_paths() {
+        // PRODUCTION TEXT ONLY, and the needle is assembled rather than
+        // written. The first draft of this counted 9 against an expected 6:
+        // the scan was matching its own assertion messages, which quote the
+        // very string they are about. A source-reading test is inside the
+        // source it reads, and that is not a detail it can afford to forget.
+        let src = include_str!("main.rs");
+        let prod = src
+            .split("\n#[cfg(test)]")
+            .next()
+            .expect("source is non-empty");
+        let needle = concat!("std::process::", "exit(");
+        let exits = prod.matches(needle).count();
+        assert_eq!(
+            exits, 6,
+            "the number of `std::process::exit(` call sites changed. If the new \
+             one runs on the main thread before the store is opened it is fine \
+             — raise this count. If it can run while the DB is open, it must be \
+             `hard_exit`, or it will race RocksDB's static teardown (BUG-0048)."
+        );
+
+        // STRUCTURAL, not just numeric: the tailer is the path that was
+        // actually bitten, and it runs on its own thread for the whole life
+        // of a replica. A plain exit anywhere inside it is the bug verbatim,
+        // whatever the total count happens to be.
+        let replica = prod
+            .split_once("\nmod replica {")
+            .expect("the replica module moved or was renamed; this check is now blind")
+            .1;
+        assert!(
+            !replica.contains(needle),
+            "a plain process::exit is back inside `mod replica` — that is the \
+             tailer thread, the DB is open, and this is BUG-0048 exactly. Use \
+             hard_exit."
+        );
+
+        // CONTROL. Both assertions above pass trivially against an empty or
+        // unrecognised source, which is the same output as success. Anchor on
+        // something that must be present.
+        assert!(
+            replica.contains("hard_exit("),
+            "the replica module no longer calls hard_exit at all — either the \
+             WALGAP exit path is gone, or this scan is reading the wrong text"
+        );
+    }
 
     /// ACCEPTED_FLAGS is written by hand; `arg()` call sites are added by
     /// hand; nothing connects them. A flag added to the code and forgotten
