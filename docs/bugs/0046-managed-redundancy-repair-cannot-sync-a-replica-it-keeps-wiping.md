@@ -1,6 +1,7 @@
 # BUG-0046: managed redundancy repair wipes the replica it is waiting for
 
-Status: OPEN, found 2026-08-24 · Severity: HIGH — on a managed pair
+Status: FIXED 2026-08-24 by `aabb652` (#176); CONFIRMED and covered by a
+regression drill 2026-08-26 · Severity was HIGH — on a managed pair
 (`--manage-slots`), a replica whose full sync takes longer than ~20 seconds can
 never come up. The controller wipes and restarts the transfer every ~20 s
 forever, making no progress. At fleet dataset sizes this is not a risk, it is
@@ -83,3 +84,54 @@ A fixed 20 s cooldown, a fixed 2000 ms disk-guard sample (BUG-0044), fixed
 300/150/500 ms roll sleeps (the canary flake), a fixed 15 s node-ready budget.
 Every one is a duration chosen on a machine where the thing it waits for is
 instant, and every one fails on the machine where it is not.
+
+
+## 2026-08-26 — confirmed fixed, and now covered
+
+**Fact 4 is what went away.** `aabb652` (#176) moved the listener bind ahead of
+the transfer: `flint-server/src/main.rs:1064` binds, `accept_while_loading` at
+:1085 serves during the sync, and `serve_loading` answers FLINTINFO with
+`role:loading\r\nloading:1`. The controller's `observe()` marks any node that
+answers FLINTINFO `reachable`, and the repair branch resets `slot_miss` and
+`continue`s on exactly that. The seat is no longer indistinguishable from a
+corpse, so the ~20.3 s cycle cannot arm.
+
+The controller says so itself, at `flint-controller/src/main.rs:229`: *"ALIVE,
+and deliberately counted as reachable: that is the whole point of #176, and it
+is what stops this controller respawning a seat that is busy syncing."*
+
+**Why it needed a drill anyway, which is the part worth keeping.** Both halves
+were already covered and neither covered this. `loading_visible` proves the
+SERVER answers while syncing and has zero controller involvement.
+`controller_managed` proves the CONTROLLER manages a pair, and its syncs finish
+in well under a second, so it never reaches the state in question. The defect
+lived precisely in the gap between two passing drills, which is why nothing
+caught it and why fixing it changed no test result.
+
+`tools/managed_slow_sync_drill.sh` closes that gap. This file claimed the
+defect was "unreachable in a drill"; it is reachable — cap the master's serve
+rate through FLINTCONFIG and ~24 MB outlasts the cooldown without a fleet.
+
+    still loading 24s in — past the 20 s cooldown, so the loop could arm
+    controller respawned it 1 time(s) — it waited instead of wiping
+    converged to 1500 keys
+
+**The drill refuses to pass vacuously**, which matters more here than usual: if
+the replacement stops loading inside 20 s the condition never existed, and a
+green result would say nothing about the controller. It fails in that case and
+says which of the three setup failures happened.
+
+Two defects in the drill itself, both found by running it rather than reading
+it, and both worth recording because they produced *confident wrong answers*:
+
+- The first version killed the replica with `valkey-cli SHUTDOWN NOSAVE`.
+  **flint-server does not implement SHUTDOWN**, so that was an error swallowed
+  by `|| true` — a no-op that reads as a kill. The drill then reported "the
+  replacement never reported loading:1", which was perfectly true and meant
+  nothing: the replica had never gone down. It now kills by pid, matched on an
+  end-anchored port.
+- The same `SHUTDOWN` call was in `gates.sh`'s conformance teardown, written
+  the same day. Masked there — it waits 5 s for a death that cannot happen,
+  then SIGKILLs — so it cost 10 s a run and killed ungracefully what it meant
+  to close cleanly. The kind of seat is now passed by the caller rather than
+  inferred from a port literal.
