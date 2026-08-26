@@ -75,6 +75,36 @@ get the page before the first shed error reaches a client.
 - **Server-side eviction, even opt-in, for now.** Acked writes stay
   durable; anything else breaks the chaos ledger oracle, the published
   RPO, and replication symmetry between pairs with different disks.
+
+  **AMENDED 2026-08-26 — this one was revisited and built.** The condition
+  this section set for revisiting was "a concrete design-partner workload",
+  and the S3 accelerator is it: a cache of re-derivable chunks whose working
+  set exceeds its disk, for which refusing admissions at the watermark freezes
+  the resident set at whatever loaded first. Opt-in server-side eviction ships
+  as a declared-per-namespace class; **never-evict remains the DEFAULT and the
+  product position**, and a namespace nobody declared behaves exactly as this
+  ADR describes.
+
+  Of the three objections, one is answered and two are not, and saying which
+  is the point of amending rather than deleting:
+
+  - *Replication symmetry between pairs with different disks* — OPEN. Two
+    members of a pair evicting independently no longer hold the same data.
+    Guarded at the edges today (members of a pair must agree on the declared
+    set, checked at start and at every reload, and visible as
+    `evictable_ns_agree`), which prevents divergent POLICY but not divergent
+    DECISIONS.
+  - *The chaos ledger oracle* — NOT ANSWERED, and the objection was correct.
+    The oracle asserts no acked write is lost; eviction deletes acked writes,
+    so it cannot be run against an evictable namespace and mean anything. No
+    chaos drill declares one today, which makes this UNTESTED rather than
+    solved. A chaos run over an evictable namespace needs an oracle that knows
+    which losses were licensed, and that does not exist.
+  - *The published RPO* — unchanged for durable namespaces, and undefined for
+    evictable ones. The published figure is about durability of acked writes,
+    which an evictable namespace is explicitly opting out of.
+
+  See ADR-0023 for the bulk path this per-key evictor does not cover.
 - **Read-recency (true LRU) tracking.** Every read becomes a write on the
   LSM — the worst possible trade under disk pressure, which is the only
   time the data would matter.
