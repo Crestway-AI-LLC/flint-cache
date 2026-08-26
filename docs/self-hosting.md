@@ -211,7 +211,18 @@ proxy 10.0.1.21:7379
 controller on
 capacity 1717986918400       # ~1.6 TB per-node fill budget
 min-replicas 1               # close the widowed-master write hole
+node-env FLINT_BG_JOBS=6     # engine tuning with no CLI flag; repeatable
 ```
+
+`node-env` reaches every `flint-server` seat, remote ones included. It exists
+because the RocksDB knobs `flint-storage` reads from the environment —
+`FLINT_BG_JOBS`, `FLINT_LEVEL_BASE_MB`, `FLINT_WRITE_BUFFER_MB` — have no
+command-line flag, and on a managed fleet `flintctl` owns the command line, so
+there was no way to set them at all. **Measure before you set one:** raising
+`FLINT_BG_JOBS` was measured to make ingest *slower* on a 2-vCPU seat (9.1%,
+with write amplification up 32%), because compaction threads take the cores the
+write path needs. It is a function of core count and LSM size, not a
+free improvement. See `docs/bugs/0013`.
 
 Don't hand-edit an inventory to *grow* a running cluster and re-bootstrap —
 add capacity live with `flintctl expand 10.0.2.14:7001,10.0.2.15:7001`

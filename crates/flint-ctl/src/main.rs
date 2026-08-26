@@ -31,6 +31,15 @@
 //!   lag-soft-ms 500       node  HOT   soft lag cap (delays writes)
 //!   lag-hard-ms 1000      node  HOT   hard lag cap (sheds; RPO bound)
 //!   min-replicas 1        node  HOT   min-replicas-to-write gate
+//!   node-env K=V          node  BOOT  extra env for every flint-server seat,
+//!                                     repeatable. For engine tuning that has
+//!                                     no CLI flag — FLINT_BG_JOBS,
+//!                                     FLINT_LEVEL_BASE_MB,
+//!                                     FLINT_WRITE_BUFFER_MB — which
+//!                                     flint-storage reads from the
+//!                                     environment and which is otherwise
+//!                                     unreachable on a managed fleet, since
+//!                                     flintctl owns the command line.
 //!   widowed-grace-ms N    node  HOT   max time accepting writes with NO
 //!                                     replica (default 10000 on a pair;
 //!                                     0 off). The only bound on the
@@ -143,6 +152,19 @@ struct Inventory {
     lag_soft_ms: Option<u64>,  // node: replication soft lag cap (delay)
     lag_hard_ms: Option<u64>,  // node: replication hard lag cap (RPO shed)
     min_replicas: Option<u32>, // node: min-replicas-to-write safety gate
+    /// node: extra environment for every flint-server seat, as `node-env K=V`
+    /// (repeatable). This exists for ENGINE TUNING that has no CLI flag —
+    /// `FLINT_BG_JOBS`, `FLINT_LEVEL_BASE_MB`, `FLINT_WRITE_BUFFER_MB` are read
+    /// from the environment by flint-storage and are otherwise unreachable on a
+    /// managed fleet, because flintctl spawns the seats and the operator never
+    /// touches the command line.
+    ///
+    /// The plumbing already existed and only the operator-facing half was
+    /// missing: `spawn_env` takes env pairs and the ssh path forwards them as
+    /// `host-spawn --env K=V`, so a value set here reaches a REMOTE seat as
+    /// well as a local one. Without this, a compaction question can be asked on
+    /// a laptop and not on the fleet it is actually about.
+    node_env: Vec<(String, String)>,
     /// node: how long a seat may keep accepting writes with NO live replica
     /// before it sheds. Absent = flintctl's own default for pair members
     /// (DEFAULT_WIDOWED_GRACE_MS); explicit 0 turns it off.
@@ -282,6 +304,17 @@ fn parse_inventory(path: &str) -> Inventory {
             "lag-soft-ms" => inv.lag_soft_ms = val.parse().ok(),
             "lag-hard-ms" => inv.lag_hard_ms = val.parse().ok(),
             "min-replicas" => inv.min_replicas = val.parse().ok(),
+            // Repeatable, and SPLIT ONCE: a value may contain '=' even though
+            // none of today's do, and splitting on the last would silently
+            // mangle it rather than fail.
+            "node-env" => {
+                if let Some((k, v)) = val.split_once('=') {
+                    let (k, v) = (k.trim(), v.trim());
+                    if !k.is_empty() {
+                        inv.node_env.push((k.to_string(), v.to_string()));
+                    }
+                }
+            }
             "widowed-grace-ms" => inv.widowed_grace_ms = val.parse().ok(),
             "max-conns" => inv.max_conns = val.parse().ok(),
             "async-queue-cap" => inv.async_queue_cap = val.parse().ok(),
@@ -2526,12 +2559,16 @@ fn start_pair_nodes(inv: &Inventory, pair: &[String], gi: usize) {
         args.extend(["--rewind-snaps".into(), format!("{d}/snaps/g{gi}")]);
         args.extend(internal_args(inv));
         args.extend(node_tuning_args(inv, pair.len() > 1));
-        spawn(
+        // spawn_env, not spawn: node-env carries engine tuning that has no CLI
+        // flag. Empty by default, so a fleet that sets nothing behaves exactly
+        // as before.
+        spawn_env(
             inv,
             &runner_for(inv, addr),
             &format!("node-{port}"),
             "flint-server",
             &args,
+            &inv.node_env,
         );
         // The master must be up before its replicas dial in.
         if i == 0 && live_master.is_none() {
@@ -6265,6 +6302,43 @@ fn main() {
 #[cfg(test)]
 mod cpfence_probe_tests {
     use super::*;
+
+    /// node-env is engine tuning with no CLI flag, so the ONLY thing standing
+    /// between an operator and an unreachable knob is this parse. A key that is
+    /// silently dropped looks exactly like a key that had no effect, and the
+    /// fleet it is set on is the one nobody can attach a debugger to.
+    #[test]
+    fn node_env_parses_repeats_and_ignores_a_line_with_no_equals() {
+        let dir = std::env::temp_dir().join(format!("flint-nodeenv-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("tmpdir");
+        let path = dir.join("inv.flint");
+        std::fs::write(
+            &path,
+            "statedir /tmp/flint-nodeenv-test\n\
+             cp 127.0.0.1:7500\n\
+             pair 127.0.0.1:7001,127.0.0.1:7002\n\
+             node-env FLINT_BG_JOBS=6\n\
+             node-env FLINT_LEVEL_BASE_MB=256\n\
+             node-env malformed_no_equals\n",
+        )
+        .expect("write inventory");
+
+        let inv = parse_inventory(path.to_str().expect("utf8 path"));
+        std::fs::remove_dir_all(&dir).ok();
+
+        // Both well-formed lines survive, in order, and the malformed one is
+        // dropped rather than stored as a key with an empty value — which would
+        // reach the seat as `--env malformed_no_equals=` and be worse than
+        // absent.
+        assert_eq!(
+            inv.node_env,
+            vec![
+                ("FLINT_BG_JOBS".to_string(), "6".to_string()),
+                ("FLINT_LEVEL_BASE_MB".to_string(), "256".to_string()),
+            ],
+            "node-env did not round-trip"
+        );
+    }
 
     /// The reply that stopped the playground's rc.51 -> rc.52 roll halfway,
     /// with the pair demoted and drained (BUG-0018).
