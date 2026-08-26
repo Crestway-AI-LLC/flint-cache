@@ -496,3 +496,84 @@ different regimes, and only one of them recorded which.
 
 So what remains is the measurement itself: a large LSM on a box with cores to
 spare, one sweep of the job count, with the shape recorded beside every column.
+
+## 2026-08-26 — measured. Both knobs, together, and the first attempt measured nothing
+
+The measurement this file has been asking for since 2026-08-17. Seat pinned to
+2 cores on an i4i.2xlarge, 6.4 GB logical (640 k x 10 kB), 8 intervals, shape
+recorded beside every column.
+
+| level base | bg_jobs | mean MB/s | last MB/s | decay | W-Amp | stall |
+|---|---|---|---|---|---|---|
+| 8 MB  | default (2) | 82.4 | 72.3 | 59% | 61.4 | 58.3% |
+| 8 MB  | 4 | 108.4 | 92.3 | 49% | 70.6 | 31.1% |
+| 64 MB | default (2) | 145.5 | 83.7 | 76% | 38.3 | 38.3% |
+| **64 MB** | **4** | **224.3** | **176.0** | 50% | 43.4 | **2.0%** |
+
+**2.7x the mean ingest rate, stalls from 58% to 2%, at LOWER write
+amplification than the baseline (43.4 vs 61.4).** Physical bytes are ~12.3 GB
+in all four runs, so this is not throughput bought with disk.
+
+**Both knobs are needed and they interact.** The hypothesis at the top of this
+file names `max_background_jobs = 2` as the binding default, and that is
+confirmed — but it is not the whole answer. Raising jobs alone (8 MB row 2)
+reaches 108 MB/s and makes W-Amp WORSE. Raising the level base alone (64 MB
+row 1) reaches 145 MB/s and still stalls 38% of the time. Only together do
+stalls collapse. The file's own note that `write_buffer_size` was untested was
+the more important half.
+
+### The error bar, and which columns can carry a conclusion
+
+Measured rather than assumed, by running `default` against an explicit `2` —
+the same engine by two routes, since `rocks.rs` only calls
+`set_max_background_jobs` when `FLINT_BG_JOBS` is set, so unset falls through
+to RocksDB's own default of 2. **Noise floor: 8.1%.** Every gap claimed above
+is 4x that or more; the 2.7x headline is about 20x it.
+
+Two runs of the IDENTICAL config, taken 20 minutes apart, also give the
+cross-run spread per column — and it is not uniform:
+
+| metric | run 1 | run 2 | spread |
+|---|---|---|---|
+| mean | 82.4 | 81.8 | **0.7%** |
+| last | 72.3 | 60.4 | **16%** |
+| decay | 59% | 67% | **8 points** |
+
+**Compare means. `last` and `decay` are single-interval quantities and are the
+noisy ones** — which inverts the intuition that the end of the curve is the
+honest part. It also means the decay column, which gives this file its shape,
+is the least reliable number in it: an 8-point run-to-run spread makes any
+decay comparison under ~16 points unusable on its own.
+
+### The first attempt produced a large, clean, entirely fake win
+
+Run first at the sweep's default 800 MB, the 64 MB shape reported throughput
+doubled, W-Amp down a third, stalls 8.7% -> 0.6% and decay 51% -> 20%. All of
+it was an artefact: 95 MB per interval against a 64 MB level base and a 32 MB
+write buffer never leaves L0, so there was no deepening LSM and nothing to
+decay. At the real size the same shape decays WORSE (76% vs 59%), which is the
+opposite sign.
+
+The existing guard could not catch it — it asserts the baseline decayed at
+least 15%, and this decayed 20%. "The curve is shallow" and "there is no curve"
+are indistinguishable from the decay figure alone. `ingest_decay_sweep.sh` now
+refuses any shape where the dataset is under 50x the level base, as a preflight
+before an instance is spent. Full write-up in the ops field notes, section 1.
+
+### What this does NOT establish
+
+- **Production is ~96 GB, not 6.4 GB.** 15x more data on the same 2-core seat
+  means more depth than measured here. The direction should hold; the magnitude
+  is unverified, and W-Amp in particular grows with how much compaction
+  actually ran (it is ~5 at 800 MB and ~61 at 6.4 GB on the same 8 MB base).
+- **This is not a defaults decision.** A 32 MB write buffer is a per-engine
+  memory commitment, and this measured one seat size at one dataset size. What
+  the numbers license is a proposal, not a merge.
+- The refill half of this bug is untouched by any of it.
+
+### Next
+
+Propose defaults with the memory cost priced, and re-measure at a production
+LSM size before changing anything shipped. Note the delivery channel is
+`flintctl node-env`, which reached bootstrap and nothing else until 2026-08-26
+— it would have dropped exactly these variables on the first `upgrade`.
