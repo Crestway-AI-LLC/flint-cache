@@ -1,10 +1,28 @@
 # BUG-0048: `process::exit` from the tailer thread races RocksDB's static teardown
 
-Status: OPEN, found 2026-08-25 · Severity: MEDIUM — the diagnosis and the
-re-seed marker are both CORRECT and already written when it happens, so no
-state is lost and the next start does the right thing. What is lost is the
-exit code: operators and supervisors see a segfault where the design promises
-a deliberate `exit 3`. Intermittent, load-dependent, CI-only so far.
+Status: FIXED 2026-08-26, `b899cf7`. Found 2026-08-25 · Severity was MEDIUM —
+the diagnosis and the re-seed marker are both CORRECT and already written when
+it happens, so no state is lost and the next start does the right thing. What
+was lost is the exit code: operators and supervisors saw a segfault where the
+design promises a deliberate `exit 3`.
+
+`hard_exit()` flushes stdout and stderr by hand, then `_exit()`, so the C++
+handlers never run. `libc` became a direct dependency; it was already in the
+tree transitively via flint-storage, so nothing changed in the build.
+
+The audit below is done and its result is asserted, not trusted: five of the
+six sites are argument and engine validation on the main thread before any
+store exists and keep `process::exit`, which flushes properly and has no
+teardown to race. A source invariant pins the production count and refuses any
+plain `process::exit` inside `mod replica`, so a seventh site forces a
+decision rather than inheriting this.
+
+**On the strength of the evidence, since it matters here.** reseed passes 3/3
+idle and 4/4 with every core loaded — but it also passed 3/3 BEFORE the fix.
+The race is intermittent and has only ever been observed on the contended CI
+runner, so a local green is not evidence the fix works. The argument is
+mechanical: the handlers that did the damage no longer run. If 139 is ever
+seen again on this path, this file is wrong and the cause is elsewhere.
 
 ## What was seen
 
