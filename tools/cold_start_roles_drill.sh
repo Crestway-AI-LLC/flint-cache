@@ -54,6 +54,13 @@ EOF
 
 CTL="./target/release/flintctl -f $INV"
 role_of() { valkey-cli -p "${1##*:}" FLINTINFO 2>/dev/null | tr -d '\r' | sed -n 's/^role://p'; }
+# A ROLE IS DECIDED, NOT MERELY PRESENT. Since #176 a node binds and answers
+# FLINTINFO from INSIDE its load, and `role:` reads `loading` there --
+# non-empty, and not master or replica. Any wait whose test is "role_of is
+# non-empty" is therefore satisfied by the state it exists to wait past, and
+# breaks out on the first tick. That is how this drill reported
+# `roles loading/loading` and reddened main.
+role_decided() { case "$(role_of "$1")" in master|replica) return 0 ;; *) return 1 ;; esac; }
 replicas_of() { valkey-cli -p "${1##*:}" FLINTINFO 2>/dev/null | tr -d '\r' | sed -n 's/^live_replicas://p'; }
 
 echo "== bootstrap: pair[0] is master, replication live"
@@ -124,7 +131,7 @@ for p in 7403 7404; do
     --data-dir "$STATE/node-$p" --journal 127.0.0.1:7406 >/dev/null 2>&1 &
 done
 for _ in $(seq 1 60); do
-  [ -n "$(role_of "$A")" ] && [ -n "$(role_of "$B")" ] && break; sleep 0.5
+  role_decided "$A" && role_decided "$B" && break; sleep 0.5
 done
 [ "$(role_of "$A")" = "replica" ] && [ "$(role_of "$B")" = "master" ] || {
   echo "FAIL: hand-spawn did not reproduce the detached shape (roles $(role_of "$A")/$(role_of "$B"))"
@@ -147,7 +154,13 @@ rm -f $FLINT_DRILL_ROOT/flint-coldrole.verify
 
 echo "== now the real cold start"
 $CTL start > $FLINT_DRILL_ROOT/flint-coldrole.out 2>&1
+# The sleep gives `start` a moment to get going; it is NOT the readiness
+# check, and on a loaded runner it never was. Same trap one form over: a
+# duration that used to be enough is not an answer from the thing being
+# waited on, and a role read during the load window reads `loading` and fails
+# an assertion about lineage that has nothing to do with timing.
 sleep 3
+for _ in $(seq 1 80); do role_decided "$A" && role_decided "$B" && break; sleep 0.5; done
 
 echo "== the fleet must replicate, and must say why it had to intervene"
 # The substantive property is asserted FIRST, deliberately. Checking the
