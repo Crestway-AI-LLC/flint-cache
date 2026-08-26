@@ -174,10 +174,27 @@ public final class Suite {
     }
   }
 
+  static boolean flintEngine() {
+    return "flint".equals(System.getenv("FLINT_TIER_ENGINE"));
+  }
+
   static void startTier() throws Exception {
-    runTier("FLINT_TIER_SERVER", new String[] {"valkey-server", "redis-server"},
-        "--port", String.valueOf(tierPort()), "--save", "", "--appendonly", "no",
-        "--daemonize", "yes").waitFor();
+    if (flintEngine()) {
+      // Flint has no --daemonize, so this process stays in the FOREGROUND and
+      // waitFor() would block until the suite's timeout -- which is exactly
+      // how the first Flint run hung after passing every check, and how it
+      // leaked a tier the gate did not know it had started. Spawn and let the
+      // PING below be the readiness proof, which is what it was for anyway.
+      runTier("FLINT_TIER_SERVER", new String[] {"flint-server"},
+          "--port", String.valueOf(tierPort()), "--engine", "rocks",
+          "--data-dir", System.getenv("FLINT_TIER_DATA") != null
+              ? System.getenv("FLINT_TIER_DATA")
+              : "/tmp/gate_flint_data_" + tierPort());
+    } else {
+      runTier("FLINT_TIER_SERVER", new String[] {"valkey-server", "redis-server"},
+          "--port", String.valueOf(tierPort()), "--save", "", "--appendonly", "no",
+          "--daemonize", "yes").waitFor();
+    }
     // `--daemonize yes` EXITS 0 before the server listens, so waitFor() proves
     // nothing at all. This used to be `sleep(700)`, which is the same
     // non-signal with a longer fuse: fine idle, wrong under load.
@@ -203,6 +220,35 @@ public final class Suite {
     } else {
       runTier("FLINT_TIER_CLI", new String[] {"valkey-cli", "redis-cli"},
           "-p", String.valueOf(tierPort()), "shutdown", "nosave").waitFor();
+    }
+    // ESCALATE TO THE OS IF THE PROTOCOL CANNOT DO IT. Flint implements no
+    // SHUTDOWN, so against the tier this product is actually for the command
+    // above is a no-op and the wait below would simply time out. The gate
+    // exports the pid it started; killing it is the same intent by another
+    // route, and the wait-for-refuse stays the proof either way.
+    // Escalate IMMEDIATELY when the protocol has no SHUTDOWN, rather than
+    // polling for three seconds first. Flint never closes on that command, so
+    // the poll always ran to its budget -- and because the caller starts its
+    // clock after this returns, the readers finished during the wait and the
+    // "finish promptly" check measured 0 ms. A vacuous pass, reintroduced by
+    // the very escalation meant to make the kill work.
+    // ASK WHO HOLDS THE PORT NOW, rather than trusting a pid handed in at
+    // startup. The gate exports the pid it spawned, but this suite kills the
+    // tier and restarts it, so from the second kill onward that pid names a
+    // process that is already dead -- the escalation "succeeded" against a
+    // corpse while the live tier kept listening, and every run leaked one.
+    // The port is the identity that stays true.
+    if (flintEngine()) {
+      try {
+        Process q = new ProcessBuilder("lsof", "-nP", "-iTCP:" + tierPort(),
+            "-sTCP:LISTEN", "-t").redirectErrorStream(true).start();
+        String pid = new String(q.getInputStream().readAllBytes(),
+            java.nio.charset.StandardCharsets.UTF_8).trim().split("\\s+")[0];
+        q.waitFor();
+        if (!pid.isEmpty()) {
+          new ProcessBuilder("kill", "-9", pid).start().waitFor();
+        }
+      } catch (Exception ignored) { }
     }
     if (!awaitTrue(() -> !tierListening(), 15_000))
       throw new IllegalStateException("tier still listening after shutdown");
@@ -334,7 +380,7 @@ public final class Suite {
       // absence, which the tier will tell us about if asked. Not tautological
       // -- the assertion below is about what the read RETURNS once the cached
       // metadata is gone, which is a different claim from "it is gone".
-      if (!awaitTrue(() -> conn.sync().keys(("m1/*" + k4).getBytes(java.nio.charset.StandardCharsets.UTF_8)).isEmpty(),
+      if (!awaitTrue(() -> ai.crestway.flintaccel.TierScan.keys(conn, "m1/*" + k4).isEmpty(),
                      c.metaTtlSec * 1000 + 10_000))
         throw new IllegalStateException("metadata for " + k4 + " never expired");
       byte[] after = read(c, k4, 100_000, 8192);
@@ -384,10 +430,10 @@ public final class Suite {
       // is a SECURITY rule and the length and etag of bytes we must not see
       // are themselves something we must not store. Asserting dbsize()==0
       // here conflated the two policies and failed on the metadata entry.
-      long chunksAfterCap = conn.sync().keys("c2/*".getBytes(java.nio.charset.StandardCharsets.UTF_8)).size();
+      long chunksAfterCap = ai.crestway.flintaccel.TierScan.count(conn, "c2/*");
       check(chunksAfterCap == 0,
           "D17: above the cap the tier got NO CHUNKS (" + chunksAfterCap + ")");
-      check(conn.sync().keys("m1/*".getBytes(java.nio.charset.StandardCharsets.UTF_8)).size() > 0,
+      check(ai.crestway.flintaccel.TierScan.count(conn, "m1/*") > 0,
           "and its METADATA is still cached -- a capacity cap, not a security bypass");
       check(capped.oversizeBypassed.get() > 0,
           "armed-check: counted as oversize (" + capped.oversizeBypassed.get()
