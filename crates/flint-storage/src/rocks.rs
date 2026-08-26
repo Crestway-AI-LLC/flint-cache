@@ -27,6 +27,9 @@ pub struct RocksKv {
     path: std::path::PathBuf,
     /// Completed WAL fsyncs (the bounded-cadence durability tick).
     wal_fsyncs: std::sync::atomic::AtomicU64,
+    /// Capacity-eviction state (ADR-0023 D7). Shared with the compaction
+    /// filter, which is the only thing that acts on it.
+    eviction: std::sync::Arc<crate::eviction::EvictionState>,
 }
 
 /// LSM shape knobs, unset by default so stock RocksDB behaviour is unchanged.
@@ -163,6 +166,40 @@ impl RocksKv {
             .map(|(s, e)| rocksdb::Range::new(s, e))
             .collect();
         self.db.get_approximate_sizes(&ranges).iter().sum()
+    }
+
+    /// Resident bytes for one namespace, CORRECTED FOR UNFLUSHED WRITES — the
+    /// capacity-eviction trigger input (ADR-0023 D7.2).
+    ///
+    /// `ns_bytes` is the right honesty level for a billing sweep and the WRONG
+    /// one for this: it tracks compacted SST bytes, so the bytes it misses are
+    /// precisely the recent ones. During a heavy admission burst — the case
+    /// where a cache is filling fastest and most needs to reclaim — the signal
+    /// reads LOWEST. It is late exactly when it matters.
+    ///
+    /// The correction is one property read. `rocksdb.cur-size-all-mem-tables`
+    /// is DB-WIDE, not per-namespace, so on a node hosting several namespaces
+    /// this OVER-counts. That asymmetry is deliberate and is the whole reason
+    /// the crude term is acceptable: over-counting fires the trigger EARLY, and
+    /// for a cache of re-derivable data evicting slightly sooner than necessary
+    /// costs a little hit rate, while arriving late costs `-QUOTA` and a
+    /// resident set frozen at whatever loaded first.
+    ///
+    /// `None` MEANS "I COULD NOT ANSWER", on the same contract as
+    /// [`write_stall`] and for a sharper reason here. Folding an unanswerable
+    /// property into `0` would silently return `ns_bytes` alone — the
+    /// undercount this function exists to remove — and it would do it in the
+    /// reassuring direction, reporting a namespace as having room while it
+    /// fills. A caller driving eviction must treat `None` as "assume pressure",
+    /// never as "no pressure"; see BUG-0022 for the same mistake made once
+    /// already, and docs/bugs/0013 for what a late signal costs.
+    pub fn ns_capacity_bytes(&self, ns: &[u8]) -> Option<u64> {
+        let memtables = self
+            .db
+            .property_int_value("rocksdb.cur-size-all-mem-tables")
+            .ok()
+            .flatten()?;
+        Some(self.ns_bytes(ns).saturating_add(memtables))
     }
 
     /// Compact one namespace's ranges so tombstones (deleted rows) actually
@@ -307,6 +344,9 @@ impl RocksKv {
             db: DB::open_for_read_only(&opts, path, false)?,
             path: path.to_path_buf(),
             wal_fsyncs: std::sync::atomic::AtomicU64::new(0),
+            // No compaction filter is installed on a read-only open, so
+            // nothing here can act. Present so the type is one type.
+            eviction: std::sync::Arc::new(crate::eviction::EvictionState::default()),
         })
     }
 
@@ -386,9 +426,21 @@ impl RocksKv {
         // Expired metadata rows are dropped organically as compaction
         // rewrites them (subkey orphans are reclaimed by gc::sweep until
         // the filter gains a metadata-lookup handle).
-        opts.set_compaction_filter("flint-meta-expiry", |_level, key, value| {
+        let eviction = std::sync::Arc::new(crate::eviction::EvictionState::default());
+        let ev_filter = std::sync::Arc::clone(&eviction);
+        opts.set_compaction_filter("flint-meta-expiry", move |_level, key, value| {
             use crate::encoding::{Cf, MetaHeader};
             use rocksdb::compaction_filter::Decision;
+            // Capacity eviction (ADR-0023 D7.3), before the expiry check
+            // because it is the cheaper question: on a durable deployment
+            // nothing is ever marked and this is one relaxed atomic load.
+            //
+            // `should_drop` re-derives the namespace from the key and refuses
+            // any row whose namespace was not declared evictable, so a policy
+            // bug cannot reach a durable namespace through here.
+            if ev_filter.should_drop(key) {
+                return Decision::Remove;
+            }
             if key.first() == Some(&(Cf::Metadata as u8))
                 && MetaHeader::decode(value)
                     .is_some_and(|h| h.is_expired(crate::strings::system_clock()))
@@ -430,7 +482,14 @@ impl RocksKv {
             db: DB::open(&opts, path)?,
             path: path.to_path_buf(),
             wal_fsyncs: std::sync::atomic::AtomicU64::new(0),
+            eviction,
         })
+    }
+
+    /// Capacity-eviction state for this DB (ADR-0023 D7). Marking is a
+    /// request; the compaction filter's guard decides.
+    pub fn eviction(&self) -> &std::sync::Arc<crate::eviction::EvictionState> {
+        &self.eviction
     }
 
     /// The data directory this DB was opened from.
@@ -1071,6 +1130,138 @@ mod gc_integration {
         let remaining = kv.scan_prefix(&[Cf::Metadata as u8]);
         assert_eq!(remaining.len(), 1);
         assert_eq!(s.get(1, b"live"), Ok(Some(b"v".to_vec())));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod eviction_filter {
+    use super::*;
+    use crate::encoding::Cf;
+    use crate::strings::{SetOptions, StringStore};
+
+    /// End to end, through a real compaction: the guard in
+    /// `EvictionState::should_drop` is unit-tested, but that proves the
+    /// FUNCTION refuses. This proves the compaction filter actually consults
+    /// it — the two are different claims, and only this one is about the code
+    /// path that deletes data.
+    ///
+    /// The policy here is deliberately WRONG: it marks every row it can see,
+    /// including one in a namespace nobody declared evictable. That is the
+    /// failure the guard exists for, and it is the failure a durable store
+    /// must survive.
+    #[test]
+    fn compaction_drops_marked_rows_only_in_declared_namespaces() {
+        let dir = std::env::temp_dir().join(format!("flint-evfilter-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let kv = RocksKv::open(&dir).expect("open");
+        kv.eviction().set_evictable(["cache"]);
+
+        let cache = StringStore::new(&kv, b"cache", crate::strings::system_clock);
+        let durable = StringStore::new(&kv, b"durable", crate::strings::system_clock);
+        cache
+            .set(1, b"k", b"v", SetOptions::default())
+            .expect("set");
+        durable
+            .set(1, b"k", b"v", SetOptions::default())
+            .expect("set");
+
+        // A policy with a bug in it: mark EVERYTHING, both namespaces.
+        let rows = kv.scan_prefix(&[Cf::Metadata as u8]);
+        assert_eq!(rows.len(), 2, "expected one metadata row per namespace");
+        for (k, _) in &rows {
+            kv.eviction().mark(k);
+        }
+        assert_eq!(kv.eviction().marked(), 2);
+
+        kv.flush();
+        kv.compact_all();
+
+        // POSITIVE CONTROL: eviction actually happened. Without it, "the
+        // durable row survived" would also be true of a filter that does
+        // nothing at all — which is the most likely way for this test to pass
+        // while the feature is broken.
+        assert_eq!(
+            cache.get(1, b"k"),
+            Ok(None),
+            "the evictable row was not reclaimed, so this test proves nothing \
+             about the row that was"
+        );
+
+        // THE GUARD, through the real path.
+        assert_eq!(
+            durable.get(1, b"k"),
+            Ok(Some(b"v".to_vec())),
+            "a marked row in a namespace that never opted in was DELETED"
+        );
+        assert!(
+            kv.eviction().refused() >= 1,
+            "the refusal was not counted: refused={}",
+            kv.eviction().refused()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod ns_capacity {
+    use super::*;
+    use crate::strings::{SetOptions, StringStore};
+
+    /// The window `ns_capacity_bytes` exists to close (ADR-0023 D7.2).
+    ///
+    /// Asserting only "capacity >= ns_bytes" would pass on a database where
+    /// both are zero, or where the writes flushed and the two agree — that is,
+    /// it would pass most reliably in the cases the function is not for. So the
+    /// test first proves there IS an undercount, and only then that the
+    /// correction removes it.
+    #[test]
+    fn capacity_counts_unflushed_bytes_that_ns_bytes_misses() {
+        let dir = std::env::temp_dir().join(format!("flint-nscap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let kv = RocksKv::open(&dir).expect("open");
+
+        let ns = b"alpha";
+        let s = StringStore::new(&kv, ns, crate::strings::system_clock);
+        // 1 MiB in 4 KiB values. Large enough to dwarf SST-estimator
+        // granularity, far below RocksDB's 64 MB default write buffer, so it
+        // stays in the memtable and no flush happens behind the test's back.
+        let val = vec![b'x'; 4096];
+        for i in 0..256u32 {
+            s.set(1, format!("k{i}").as_bytes(), &val, SetOptions::default())
+                .expect("set");
+        }
+
+        let sst = kv.ns_bytes(ns);
+        let corrected = kv
+            .ns_capacity_bytes(ns)
+            .expect("engine answered the property");
+
+        // POSITIVE CONTROL, on the defect rather than the fix: there is
+        // something here to correct. If the writes had flushed or never
+        // landed, the comparison below would hold vacuously.
+        assert!(
+            corrected > sst,
+            "nothing to correct: ns_bytes={sst}, capacity={corrected} — the \
+             writes must still be unflushed for this test to mean anything"
+        );
+        // And by the right ORDER, not merely by a byte.
+        assert!(
+            corrected >= 1 << 20,
+            "capacity={corrected} is below the 1 MiB just written, so the \
+             memtable term is not reaching the trigger"
+        );
+
+        // The other half of the contract: this corrects a WINDOW, not a
+        // permanent offset. Once flushed, the SST figure catches up on its own.
+        kv.flush();
+        let after = kv.ns_bytes(ns);
+        assert!(
+            after > sst,
+            "ns_bytes did not catch up after flush: {sst} -> {after}"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

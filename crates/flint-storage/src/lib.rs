@@ -33,10 +33,12 @@ pub mod strings;
 pub mod watch;
 pub mod zsets;
 
+pub mod eviction;
 #[cfg(feature = "rocksdb")]
 pub mod repl;
 #[cfg(feature = "rocksdb")]
 pub mod rocks;
+pub mod s3fifo;
 
 use std::collections::BTreeMap;
 use std::ops::Bound;

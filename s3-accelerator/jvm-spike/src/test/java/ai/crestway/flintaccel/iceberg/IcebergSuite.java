@@ -60,8 +60,7 @@ public final class IcebergSuite {
   static int gets() throws Exception {
     String b = HTTP.send(HttpRequest.newBuilder(URI.create(endpoint + "/__stats")).build(),
         HttpResponse.BodyHandlers.ofString()).body();
-    int i = b.indexOf("\"gets\":");
-    return Integer.parseInt(b.substring(i + 7, b.indexOf(',', i)).trim());
+    return ai.crestway.flintaccel.OriginStats.parse(b, "gets");
   }
 
   public static void main(String[] args) throws Exception {
