@@ -82,7 +82,7 @@ cleanup() {
   local mine
   mine="$(printf '%s|' "${ORIGIN_PORTS[@]:-}" | sed 's/|$//')"
   [ -n "$mine" ] || mine="$TIER_PORT"
-  local pat="counting_s3\.py[^|]*--port ($mine)|slow_tier\.py[^|]*--listen ($SLOW_PORT)|(valkey|redis)-server[^|]*--port ($SLOW_PORT|$TIER_PORT)|(valkey|redis)-server[^|]*:($SLOW_PORT|$TIER_PORT)"
+  local pat="counting_s3\.py[^|]*--port ($mine)|slow_tier\.py[^|]*--listen ($SLOW_PORT)|narrow_tier\.py[^|]*--listen 9397|(valkey|redis)-server[^|]*--port ($SLOW_PORT|$TIER_PORT)|(valkey|redis)-server[^|]*:($SLOW_PORT|$TIER_PORT)"
   local leaked
   leaked=$(ps -ax -o command= | grep -E "$pat" | grep -v grep || true)
   left=$(printf "%s" "$leaked" | grep -c . || true)
@@ -221,13 +221,11 @@ verdict "port exclusivity vs the sibling harness (3 checks)" $?
 run_bounded python3 tools/slow_tier.py --self-test >/tmp/gate_slowtier.log 2>&1
 verdict "slow-tier proxy self-test (4 checks)" $?
 
-# narrow_tier is the OTHER half of "slow". slow_tier makes the tier late to
-# START; this one makes it answer at once and then dribble, which is what a
-# loaded tier looks like and which no instrument here could previously produce.
-# Same treatment: it self-tests, including a transparency control, because an
-# instrument that quietly throttles nothing makes a broken client look healthy.
-run_bounded python3 "$ROOT/tools/narrow_tier.py" --self-test >/tmp/gate_narrow_selftest.log 2>&1
-verdict "narrow-tier proxy self-test (2 checks)" $?
+# Its companion: slow_tier makes the FIRST byte late, narrow_tier makes every
+# byte late by a little. The two are different failures and the two clients do
+# not agree about the second one -- see ADR-0023 D17.
+run_bounded python3 "$ROOT/tools/narrow_tier.py" --self-test >/tmp/gate_narrowtier.log 2>&1
+verdict "narrow-tier proxy self-test (4 checks)" $?
 
 bash tools/shim_guard_test.sh >/tmp/gate_shim.log 2>&1
 verdict "shim guard (5 classpath states)" $?
@@ -425,25 +423,7 @@ if [ -x "$PYENV/bin/python" ]; then
   "$TIER_CLI" -p "$TIER_PORT" flushall >/dev/null 2>&1
   ( cd python && run_bounded "$PYENV/bin/python" suite.py \
       http://127.0.0.1:9401 redis://127.0.0.1:$TIER_PORT ) >/tmp/gate_python.log 2>&1
-  verdict "python suite (31 checks)" $?
-  stop_origin
-
-  # The budget must bound the COMMAND, not each socket read of its reply.
-  # redis-py takes it as socket_timeout, which CPython applies per recv(), so a
-  # tier that answers promptly and then dribbles slipped through: an 8 MiB warm
-  # read served FROM a 1 MB/s tier in 9.9 s with no counter moving, 6.8x slower
-  # than no cache. The JVM bounds the whole command and degraded correctly on
-  # the identical read, so the guarantee held on one client and not the other.
-  start_svcs 9401 ""
-  python3 tools/narrow_tier.py --listen 9397 --upstream "$TIER_PORT" --rate-bps 1048576 \
-      >/tmp/gate_narrow.log 2>&1 &
-  PIDS+=($!)
-  wait_tcp 9397 || exit 2
-  "$TIER_CLI" -p "$TIER_PORT" flushall >/dev/null 2>&1
-  ( cd python && run_bounded "$PYENV/bin/python" narrow_tier_check.py \
-      http://127.0.0.1:9401 "redis://127.0.0.1:$TIER_PORT" redis://127.0.0.1:9397 \
-    ) >/tmp/gate_narrow_check.log 2>&1
-  verdict "budget bounds the COMMAND, not the recv (8 checks)" $?
+  verdict "python suite (35 checks)" $?
   stop_origin
 
   # fsspec's own abstract suite, against MOTO rather than counting_s3.
@@ -500,6 +480,30 @@ if [ -x "$PYENV/bin/python" ]; then
       http://127.0.0.1:9318 http://127.0.0.1:9319 redis://127.0.0.1:$TIER_PORT \
     ) >/tmp/gate_ssekms_py.log 2>&1
   verdict "SSE-KMS on the python path (11 checks)" $?
+  stop_origin
+
+  # The python counterpart of SickTierSuite, and NOT a duplicate of it: the two
+  # clients did not mean the same thing by the 50 ms budget. redis-py applies
+  # socket_timeout per recv(), so a tier that answered promptly and then
+  # delivered slowly was invisible to the python client -- an 8 MiB read over
+  # an 8-second tier reported no failure at all, where the JVM degraded. Both
+  # shapes of "slow" are asserted, which needs both proxies: slow_tier is late
+  # to the FIRST byte, narrow_tier is slow to FINISH.
+  start_svcs 9319
+  python3 tools/slow_tier.py --listen "$SLOW_PORT" --upstream "$TIER_PORT" --delay-ms 200 \
+      >/tmp/gate_proxy_py.log 2>&1 &
+  PIDS+=($!)
+  python3 "$ROOT/tools/narrow_tier.py" --listen 9397 --upstream "$TIER_PORT" --kbps 40000 \
+      >/tmp/gate_narrow_py.log 2>&1 &
+  PIDS+=($!)
+  wait_tcp "$SLOW_PORT" || exit 2
+  wait_tcp 9397 || exit 2
+  "$TIER_CLI" -p "$TIER_PORT" flushall >/dev/null 2>&1
+  ( cd python && run_bounded "$PYENV/bin/python" budget_suite.py \
+      http://127.0.0.1:9319 redis://127.0.0.1:$TIER_PORT \
+      redis://127.0.0.1:9397 redis://127.0.0.1:$SLOW_PORT \
+    ) >/tmp/gate_budget_py.log 2>&1
+  verdict "tier budget bounds the COMMAND, python (11 checks)" $?
   stop_origin
 else
   SKIP=$((SKIP+1))

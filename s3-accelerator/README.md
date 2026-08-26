@@ -156,6 +156,15 @@ this library invalidate regardless.
 Any tier failure — down, slow, or lying — degrades to a plain S3 read inside
 the budget. The tier is an optimisation and is written as one.
 
+The budget bounds a whole tier **command**, not one network read of it, so a
+tier that answers promptly and then delivers slowly is caught as well as one
+that is slow to answer. The consequence worth sizing before you tune it down:
+a warm read whose reply is R bytes needs `R / budget` of tier bandwidth or it
+degrades to the origin. A large sequential read fetches up to ~8 MiB per tier
+round trip, so it wants roughly 1.3 Gbit/s of effective tier throughput to stay
+cached at the 50 ms default. Below that the tier genuinely is slower than S3
+for those reads, and degrading is the correct answer rather than a regression.
+
 ---
 
 ## Is it working?
