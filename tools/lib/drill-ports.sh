@@ -87,9 +87,31 @@ drill_declared_ports() {
 # So the allocator RESERVES these and asserts nothing about them.
 repo_bound_ports() {
   local root="${1:-.}"
-  grep -rhoE '(--port|--listen|-p)[[:space:]]+[0-9]{4,5}|127\.0\.0\.1:[0-9]{4,5}|localhost:[0-9]{4,5}' \
-    "$root/s3-accelerator" 2>/dev/null \
-    | grep -oE '[0-9]{4,5}$' | sort -un
+  # COMMENTS STRIPPED FIRST, and that is not hygiene. The first version of this
+  # reserved 6391 on the strength of a COMMENT in the accelerator's own port
+  # check -- prose quoting `-p 6391:6379` while explaining this exact trap. The
+  # port was never bound by anything. Worse, I then wrote a control that
+  # "proved" the allocator now avoids 6391 and reported it as a save; it was
+  # demonstrating a false positive.
+  #
+  # AND NO SPELLING ANTICIPATION. The first version matched only flagged or
+  # host-prefixed forms (--port N, 127.0.0.1:N), and missed seven live ports
+  # spelled as bare positional arguments -- `run_suite "..." <class> 9301
+  # "$CP"` and `PORT=9407`. Guessing the next spelling is the losing half of
+  # this game, so this takes every integer on a non-comment line instead.
+  #
+  # OVER-RESERVING IS FREE, UNDER-RESERVING IS NOT: an allocator that skips a
+  # port costs one slot out of thousands; one that hands out a bound port costs
+  # a collision in two suites that cannot see each other. So the filter is a
+  # RANGE rather than a pattern, bounded to what this allocator could ever
+  # suggest anyway -- 6300..9999, matching next-free-ports.sh's own BASE..MAX.
+  # A literal outside that window cannot be handed out, so it does not matter
+  # whether it was a port at all.
+  grep -rhv '^[[:space:]]*#' "$root/s3-accelerator" \
+    --include='*.sh' --include='*.py' --include='*.java' --include='*.xml' 2>/dev/null \
+    | grep -oE '\b[0-9]{4,5}\b' \
+    | awk '$1 >= 6300 && $1 <= 9999' \
+    | sort -un
 }
 
 DRILL_DEAD_PORTS="6999 7999 7788 7789"
