@@ -45,7 +45,7 @@ public final class CrossLangProbe {
       // the entry expired before anyone looked and the drill reported "the JVM
       // writes no metadata". It measured this constant, not the product.
       long metaTtl = args.length > 5 ? Long.parseLong(args[5]) : 300;
-      var c = new FlintObjectClient(sdk, cn.async(), 64 * 1024, 50, metaTtl, false, s3, false);
+      var c = new FlintObjectClient(sdk, cn.async(), FlintObjectClient.DEFAULT_CHUNK_BYTES, 50, metaTtl, false, s3, false);
       try (var f = new S3SeekableInputStreamFactory(c, S3SeekableInputStreamConfiguration.DEFAULT);
            var in = f.createStream(S3URI.of(bucket, key))) {
         byte[] b = new byte[len];

@@ -47,7 +47,7 @@ public final class ShapeProbe {
 
     long asked = 0;
     try (var sdk = new S3SdkObjectClient(s3, false)) {
-      var c = new FlintObjectClient(sdk, cn.async(), 64 * 1024, 50, 300, false, s3, false);
+      var c = new FlintObjectClient(sdk, cn.async(), FlintObjectClient.DEFAULT_CHUNK_BYTES, 50, 300, false, s3, false);
       try (var f = new S3SeekableInputStreamFactory(c, S3SeekableInputStreamConfiguration.DEFAULT);
            var in = f.createStream(S3URI.of(bucket, key))) {
         if ("full".equals(mode)) {

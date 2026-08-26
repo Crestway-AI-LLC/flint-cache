@@ -70,7 +70,7 @@ public final class SseKmsSuite {
     // Default: KMS object, cacheKms=false. Nothing may reach the tier.
     conn.sync().flushall();
     try (var sdkc = new S3SdkObjectClient(kmsS3, false)) {
-      var c = new FlintObjectClient(sdkc, conn.async(), 64 * 1024, 50, 2,
+      var c = new FlintObjectClient(sdkc, conn.async(), FlintObjectClient.DEFAULT_CHUNK_BYTES, 50, 2,
           false, kmsS3, false);
       byte[] got = Suite.read(c, KEY, 0, LEN);
       check(Suite.genOf(KEY, 0, got) == 0, "KMS object still reads CORRECTLY (bypass is not a failure)");
@@ -88,7 +88,7 @@ public final class SseKmsSuite {
     // non-KMS object from a non-KMS origin.
     conn.sync().flushall();
     try (var sdkc = new S3SdkObjectClient(plainS3, false)) {
-      var c = new FlintObjectClient(sdkc, conn.async(), 64 * 1024, 50, 2,
+      var c = new FlintObjectClient(sdkc, conn.async(), FlintObjectClient.DEFAULT_CHUNK_BYTES, 50, 2,
           false, plainS3, false);
       byte[] got = Suite.read(c, KEY, 0, LEN);
       check(Suite.genOf(KEY, 0, got) == 0, "control: a PLAIN object reads correctly");
@@ -103,7 +103,7 @@ public final class SseKmsSuite {
     // Opt-in. The customer has decided; the same KMS object must now cache.
     conn.sync().flushall();
     try (var sdkc = new S3SdkObjectClient(kmsS3, false)) {
-      var c = new FlintObjectClient(sdkc, conn.async(), 64 * 1024, 50, 2,
+      var c = new FlintObjectClient(sdkc, conn.async(), FlintObjectClient.DEFAULT_CHUNK_BYTES, 50, 2,
           false, kmsS3, true);
       byte[] got = Suite.read(c, KEY, 0, LEN);
       check(Suite.genOf(KEY, 0, got) == 0, "opt-in: the KMS object reads correctly");
@@ -124,7 +124,7 @@ public final class SseKmsSuite {
     // without an SDK client, the client cannot check, and says so.
     conn.sync().flushall();
     try (var sdkc = new S3SdkObjectClient(kmsS3, false)) {
-      var c = new FlintObjectClient(sdkc, conn.async(), 64 * 1024, 50, 2);
+      var c = new FlintObjectClient(sdkc, conn.async(), FlintObjectClient.DEFAULT_CHUNK_BYTES, 50, 2);
       Suite.read(c, KEY, 0, LEN);
       check(c.kmsUndetectable.get() > 0,
           "no SDK client: the client reports it COULD NOT check (" + c.kmsUndetectable.get()

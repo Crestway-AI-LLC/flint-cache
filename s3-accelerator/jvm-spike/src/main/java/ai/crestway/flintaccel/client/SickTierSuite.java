@@ -87,12 +87,12 @@ public final class SickTierSuite {
          var o3 = new S3SdkObjectClient(s3, false)) {
 
       // Reference 1: no tier at all. This is what the customer has today.
-      var none = new FlintObjectClient(o1, hc.async(), 64 * 1024, 50, 2, true);
+      var none = new FlintObjectClient(o1, hc.async(), FlintObjectClient.DEFAULT_CHUNK_BYTES, 50, 2, true);
       double noTier = medianMs(none, KEY, ROUNDS);
 
       // Reference 2: a healthy tier, warm. This is what we are selling.
       hc.sync().flushall();
-      var good = new FlintObjectClient(o2, hc.async(), 64 * 1024, 50, 2);
+      var good = new FlintObjectClient(o2, hc.async(), FlintObjectClient.DEFAULT_CHUNK_BYTES, 50, 2);
       medianMs(good, KEY, 3);                       // warm it
       double warm = medianMs(good, KEY, ROUNDS);
       check(warm < noTier,
@@ -100,7 +100,7 @@ public final class SickTierSuite {
               warm, noTier));
 
       // The subject: a tier that answers, slowly.
-      var bad = new FlintObjectClient(o3, sc.async(), 64 * 1024, 50, 2);
+      var bad = new FlintObjectClient(o3, sc.async(), FlintObjectClient.DEFAULT_CHUNK_BYTES, 50, 2);
       long failBefore = bad.tierFailures.get();
       double sickMs = medianMs(bad, KEY, ROUNDS);
       check(bad.tierFailures.get() > failBefore,

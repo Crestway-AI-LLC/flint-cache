@@ -46,7 +46,7 @@ public final class IntegritySuite {
 
   static boolean ok = true;
   static final String BUCKET = "bucket";
-  static final int CHUNK = 64 * 1024;
+  static final int CHUNK = FlintObjectClient.DEFAULT_CHUNK_BYTES;
 
   static void check(boolean c, String label) {
     ok &= c;

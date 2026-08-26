@@ -122,7 +122,7 @@ public final class FlintStreamFactory extends AbstractObjectInputStreamFactory {
     super.bind(p);
     Configuration conf = INIT_CONF != null ? INIT_CONF : new Configuration(false);
     String uri = conf.get(TIER_URI, "redis://127.0.0.1:6379");
-    int chunk = conf.getInt(CHUNK_BYTES, 64 * 1024);
+    int chunk = conf.getInt(CHUNK_BYTES, FlintObjectClient.DEFAULT_CHUNK_BYTES);
     long budget = conf.getLong(TIER_BUDGET, 50);
     long ttl = conf.getLong(META_TTL, 60);
 

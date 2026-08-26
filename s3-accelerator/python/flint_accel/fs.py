@@ -130,8 +130,18 @@ class FlintS3FileSystem(S3FileSystem):
         # 4 KiB reads costs 964 tier round trips at 64 KiB against 253 at
         # 256 KiB, and moves 1.88x the bytes asked against 1.23x.
         #
+        # It must also be a whole number of CHUNKs, which is a fifth axis the
+        # four above cannot see. fsspec anchors blocks at multiples of the block
+        # size, so a block that is not a whole number of chunks starts mid-chunk
+        # and drags an extra one -- off the origin as well as the tier, because
+        # a miss is fetched on chunk boundaries. It holds trivially while both
+        # are powers of two, which is exactly why it needs asserting: tier.py
+        # does it at import, so a grid change cannot break it quietly.
+        #
         # setdefault, so an explicit argument still wins and so does anything
-        # install() was handed.
+        # install() was handed. An override that breaks the nesting costs 25%
+        # amplification silently; that is a documented consequence of tuning it,
+        # not a bug to defend against here.
         kw.setdefault("default_block_size", BLOCK_BYTES)
 
         super().__init__(*args, **kw)

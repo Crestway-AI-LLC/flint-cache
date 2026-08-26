@@ -50,7 +50,7 @@ public final class ImmutableSuite {
     p.put("s3.secret-access-key", "i");
     p.put("s3.region", "us-east-1");
     p.put("client.region", "us-east-1");
-    p.put("flint.meta.ttl.seconds", "1");          // mutable: expires fast
+    p.put("flint.meta.ttl.seconds", String.valueOf(MUTABLE_TTL_SEC));  // mutable: expires fast
     p.put("flint.meta.ttl.immutable.seconds", "3600");
     if (immutable) p.put("flint.immutable", "true");
     return TierSupport.build(TierSupport.from(p));
@@ -68,10 +68,20 @@ public final class ImmutableSuite {
     }
   }
 
+  static final long MUTABLE_TTL_SEC = 1;
+
   /** HEADs charged to the origin by one read taken after the mutable TTL. */
   static int headsAcrossExpiredRead(TierSupport t, String key) throws Exception {
     read(t, key, 100_000);          // populate metadata
-    Thread.sleep(2_000);            // outlive the 1s mutable TTL
+    // A SLEEP IS CORRECT HERE, and it is the only one left in these suites.
+    // What both arms wait for is real time passing the MUTABLE ttl -- and the
+    // immutable arm's entry is supposed to survive it, so there is no event to
+    // wait for. Polling for the key's absence turned that non-event into a
+    // hard failure: the immutable entry carries a 3600s ttl and correctly
+    // never went away. You cannot signal a thing that is defined by not
+    // happening. What is fixed is the magic number: the wait now derives from
+    // the configured ttl instead of a 2,000 that described neither arm.
+    Thread.sleep(MUTABLE_TTL_SEC * 1000L + 500);
     int before = heads();
     read(t, key, 100_000);
     return heads() - before;

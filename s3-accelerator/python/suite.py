@@ -14,7 +14,7 @@ import redis as redis_lib
 
 sys.path.insert(0, ".")
 import flint_accel
-from flint_accel.tier import BLOCK_BYTES
+from flint_accel.tier import BLOCK_BYTES, CHUNK
 
 OK = [True]
 
@@ -226,7 +226,7 @@ def main():
     # regression would move -- and an exact check cannot drift the way a
     # threshold tuned to whatever was measured that day does.
     check(fs().default_block_size == BLOCK_BYTES,
-          f"the block size default is the chosen {BLOCK_BYTES // 1024} KiB")
+          f"the block size default is the chosen {BLOCK_BYTES} B ({BLOCK_BYTES // CHUNK} chunks)")
     check(tuned < wide,
           f"our default block pulls LESS than fsspec's ({tuned} < {wide} bytes)")
     # Bound DERIVED, not tuned, and now derived from the RIGHT mechanism. It
