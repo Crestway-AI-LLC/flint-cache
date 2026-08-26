@@ -4401,7 +4401,11 @@ mod route_tests {
         );
         // A re-probe that finds no master clears the slot — the failover case.
         t.rediscover_after_failure("a:1");
-        assert_eq!(master0(&t), None, "precondition: the probe cleared the slot");
+        assert_eq!(
+            master0(&t),
+            None,
+            "precondition: the probe cleared the slot"
+        );
         assert!(
             !t.still_master("a:1"),
             "routing has moved off a:1, so a retry has somewhere else to go and \
