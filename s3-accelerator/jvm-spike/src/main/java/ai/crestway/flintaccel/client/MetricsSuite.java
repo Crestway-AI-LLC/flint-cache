@@ -125,7 +125,7 @@ public final class MetricsSuite {
     // not. In a deployment where one tier is shared across two DIFFERENT S3
     // endpoints holding overlapping bucket/key names, it is not an artefact --
     // recorded as an open item rather than papered over here.
-    java.util.List<byte[]> before = t.conn.sync().keys("*".getBytes());
+    java.util.List<byte[]> before = ai.crestway.flintaccel.TierScan.keys(t.conn, "*");
     t.conn.sync().flushall();
     check(!before.isEmpty(), "armed: the plain run had populated the tier ("
         + before.size() + " keys) before it was cleared for the KMS run");

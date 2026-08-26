@@ -46,6 +46,18 @@ cleanup() {
   # abnormal exit left a tier holding the port indefinitely and the NEXT run
   # adopted it.
   [ -n "${TIER_PID:-}" ] && kill "$TIER_PID" 2>/dev/null
+  # AND WHOEVER HOLDS THE PORT NOW, which is not always that pid. The client
+  # suite kills the tier mid-run and restarts one to leave the box as it found
+  # it, so the tier alive at teardown is a process this script never spawned
+  # and whose pid it never knew. Killing only TIER_PID leaked one flint-server
+  # per run -- found by counting processes after a PASSING gate, not by
+  # anything the gate said. The port is the identity that survives a restart;
+  # the pid is only the identity of the first one.
+  if [ -n "${TIER_PORT:-}" ]; then
+    for _p in $(lsof -nP -iTCP:"$TIER_PORT" -sTCP:LISTEN -t 2>/dev/null); do
+      [ "$_p" != "${TIER_PID:-}" ] && kill "$_p" 2>/dev/null
+    done
+  fi
   # Prove it, rather than assume the kills landed -- and proving it means
   # WAITING for them to land. `kill` returns once the signal is queued, not
   # once the process is gone, so scanning straight afterwards samples the
@@ -126,14 +138,42 @@ except OSError:
 finally:
     s.close()
 FREE
-"$TIER_SERVER" --port "$TIER_PORT" --save '' --appendonly no \
-    >/tmp/gate_tier.log 2>&1 & TIER_PID=$!
+# ENGINE. `resp` (default) starts valkey/redis; `flint` starts a real
+# flint-server, which is the tier this product is actually for. The two need
+# different flags and prove ownership differently, and until this existed the
+# whole gate ran against a stand-in -- invisible, because valkey answers the
+# same protocol and passes every assertion identically. What it hid was
+# everything the suite does not test: Flint has no INFO and no KEYS, and its
+# per-value storage overhead is 1.004x where valkey's is 1.250x.
+TIER_ENGINE="${FLINT_TIER_ENGINE:-resp}"
+if [ "$TIER_ENGINE" = flint ]; then
+  TIER_DATA="${FLINT_TIER_DATA:-/tmp/gate_flint_data_$TIER_PORT}"
+  rm -rf "$TIER_DATA"
+  "$TIER_SERVER" --port "$TIER_PORT" --engine rocks --data-dir "$TIER_DATA" \
+      >/tmp/gate_tier.log 2>&1 & TIER_PID=$!
+else
+  "$TIER_SERVER" --port "$TIER_PORT" --save '' --appendonly no \
+      >/tmp/gate_tier.log 2>&1 & TIER_PID=$!
+fi
 for _ in $(seq 1 40); do "$TIER_CLI" -p "$TIER_PORT" ping >/dev/null 2>&1 && break; sleep 0.2; done
 "$TIER_CLI" -p "$TIER_PORT" ping >/dev/null 2>&1 \
     || { echo "tier never answered on $TIER_PORT (see /tmp/gate_tier.log)" >&2; exit 2; }
+# OWNERSHIP. The point is never to flushall a tier we did not start -- this
+# gate destroys the keyspace at every stage. INFO is the direct proof and Flint
+# does not implement it, so fall back to asking the OS who holds the port
+# rather than skipping the check: an ownership check that silently turns off on
+# one engine is worse than none, because the flushall still happens.
 TIER_OWNED=$("$TIER_CLI" -p "$TIER_PORT" info server 2>/dev/null | tr -d '\r' | awk -F: '/^process_id:/{print $2}')
+if [ -z "$TIER_OWNED" ]; then
+  TIER_OWNED=$(lsof -nP -iTCP:"$TIER_PORT" -sTCP:LISTEN -t 2>/dev/null | head -1)
+  [ -n "$TIER_OWNED" ] \
+      || { echo "cannot establish who owns the tier on $TIER_PORT -- refusing to flushall it." >&2; exit 2; }
+fi
 [ "$TIER_OWNED" = "$TIER_PID" ] \
     || { echo "tier on $TIER_PORT has pid $TIER_OWNED, we started $TIER_PID -- not ours." >&2; exit 2; }
+# The suites need the pid to kill a tier whose protocol has no SHUTDOWN.
+export FLINT_TIER_PID="$TIER_PID"
+export FLINT_TIER_ENGINE FLINT_TIER_DATA="${TIER_DATA:-}"
 
 # ---------------------------------------------------------------- fixtures
 # A gate that can hang forever is worse than one that fails: the first run of

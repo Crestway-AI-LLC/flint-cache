@@ -47,6 +47,18 @@ def read(f, key, off, n):
         return h.read(n)
 
 
+def _keys(rc, pattern):
+    """SCAN, not KEYS.
+
+    KEYS is not implemented by Flint -- which is the tier this suite is
+    ultimately for -- and the substitution was invisible because the gate has
+    only ever run against valkey, where both exist. SCAN is also the correct
+    choice against a real Redis for the usual reason, so this is a portability
+    fix that costs nothing.
+    """
+    return list(rc.scan_iter(match=pattern))
+
+
 def main():
     kms_ep = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:9530"
     plain_ep = sys.argv[2] if len(sys.argv) > 2 else "http://127.0.0.1:9531"
@@ -59,7 +71,7 @@ def main():
     f = fs_for(kms_ep, tier)
     got = read(f, KEY, 0, LEN)
     check(got == expect(KEY, 0, LEN), "KMS object still reads CORRECTLY (bypass is not a failure)")
-    n = len(rc.keys("*"))
+    n = len(_keys(rc, "*"))
     check(n == 0, f"and NOTHING reached the tier -- no chunks, no metadata ({n} keys)")
     c = f.counters
     check(c["kms_bypassed"] > 0,
@@ -71,7 +83,7 @@ def main():
     f2 = fs_for(plain_ep, tier)
     got2 = read(f2, KEY, 0, LEN)
     check(got2 == expect(KEY, 0, LEN), "control: a PLAIN object reads correctly")
-    n2 = len(rc.keys("c2/*"))
+    n2 = len(_keys(rc, "c2/*"))
     check(n2 > 0,
           f"control: and the same client DOES cache it ({n2} chunks) -- so check 1 "
           "measured the KMS rule, not a broken cache")
@@ -82,7 +94,7 @@ def main():
     f3 = fs_for(kms_ep, tier, cache_kms=True)
     got3 = read(f3, KEY, 0, LEN)
     check(got3 == expect(KEY, 0, LEN), "opt-in: the KMS object reads correctly")
-    n3 = len(rc.keys("c2/*"))
+    n3 = len(_keys(rc, "c2/*"))
     check(n3 > 0, f"OPT-IN WORKS: cache_sse_kms=True caches the KMS object ({n3} chunks)")
     check(f3.counters["kms_bypassed"] == 0, "armed: and nothing was bypassed once opted in")
 
@@ -90,7 +102,7 @@ def main():
     # The whole point of a shared tier is that the JVM client can read what
     # this one wrote. A Python-only bypass rule that used a different key
     # prefix would pass every check above and still be useless.
-    sample = rc.keys("c2/*")[0].decode()
+    sample = _keys(rc, "c2/*")[0].decode()
     check(sample.startswith("c2/") and sample.count("/") == 2,
           f"opt-in wrote the SHARED key shape the JVM client reads ({sample})")
 

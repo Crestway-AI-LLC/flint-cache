@@ -202,7 +202,14 @@ class Counters:
                  # `wanted`; the difference is the grid's bill, and it is a
                  # counter rather than an argument because that is the standard
                  # every other claim here is held to (D8).
-                 "range_bytes_wanted", "chunk_bytes_moved")
+                 "range_bytes_wanted", "chunk_bytes_moved",
+                 # Tier round trips, counted CLIENT-SIDE. The suite used to get
+                 # these from the server's INFO commandstats, which Flint does
+                 # not implement -- and which was measuring the wrong thing
+                 # anyway: the claim under test is that THIS CLIENT batches its
+                 # fills, so the client is where it should be counted. Portable
+                 # across any tier, and direct rather than inferred.
+                 "tier_ops", "tier_reads", "tier_writes")
 
     def __init__(self):
         for s in self.__slots__:
@@ -270,6 +277,16 @@ class FlintTier:
         broken tier still lands in `tier_failures` via the clause below; what
         this clause removes is a slow tier being reported as a broken one.
         """
+        # Bucketed by operation, because the two checks that consume this want
+        # different halves: "does the fill batch" is about writes, "what does a
+        # warm read cost" is about reads. A single total would let a read-heavy
+        # phase mask a write regression and vice versa.
+        self.c.tier_ops += 1
+        _op = getattr(fn, "__name__", "")
+        if _op in ("get", "mget"):
+            self.c.tier_reads += 1
+        elif _op in ("set", "setex", "mset", "delete"):
+            self.c.tier_writes += 1
         try:
             return fn(*a, **kw)
         except redis_lib.TimeoutError:

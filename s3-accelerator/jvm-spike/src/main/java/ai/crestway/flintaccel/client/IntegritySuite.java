@@ -64,7 +64,8 @@ public final class IntegritySuite {
 
   static List<byte[]> chunkKeys(RedisCommands<byte[], byte[]> t) {
     List<byte[]> out = new ArrayList<>();
-    for (byte[] k : t.keys("c2/*".getBytes())) out.add(k);
+    // SCAN, not KEYS -- Flint implements no KEYS. See TierScan.
+    for (byte[] k : ai.crestway.flintaccel.TierScan.keys(t, "c2/*")) out.add(k);
     out.sort(Comparator.comparingLong(a -> {
       String s = new String(a);
       return Long.parseLong(s.substring(s.lastIndexOf('/') + 1));

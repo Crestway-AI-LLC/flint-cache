@@ -266,12 +266,28 @@ def main():
         rc.flushall(); stats(ep, "/__reset")
         sweep()
         cold = stats(ep)["bytes_served"]
-        stats(ep, "/__reset"); rc.config_resetstat()
+        # Round trips and tier bytes from the CLIENT, not from the server's
+        # INFO commandstats. Flint implements neither INFO nor CONFIG, so the
+        # old form could only ever run against valkey -- and the claim under
+        # test is about what this client does, which makes the client the right
+        # place to count it.
+        stats(ep, "/__reset")
+        # `fsys`, NOT fs(). This function takes the arm to measure as a
+        # parameter and the rewrite that moved it off the server's commandstats
+        # dropped it, so both arms ran the default block size and the negative
+        # control compared the default against itself -- it could not fail, and
+        # a control that cannot fail is reported as evidence.
+        # BASELINE HERE, not at function entry. A fresh filesystem creates its
+        # tier lazily so `.counters` is None until something touches it -- but
+        # by this point the cold sweep above has, and its bytes are already in
+        # these totals. Reading them as the warm figure double-counted, and the
+        # symptom was a warm read appearing to move exactly 2x the cold one.
+        b_reads = fsys.counters["tier_reads"]
+        b_bytes = fsys.counters["chunk_bytes_moved"]
         sweep()
-        i = rc.info("all")
-        trips = sum(v["calls"] for k, v in i.items()
-                    if k.startswith("cmdstat_") and k[len("cmdstat_"):] in ("mget", "set"))
-        return cold, i["total_net_output_bytes"], trips, stats(ep)["gets"]
+        trips = fsys.counters["tier_reads"] - b_reads
+        tier_bytes = fsys.counters["chunk_bytes_moved"] - b_bytes
+        return cold, tier_bytes, trips, stats(ep)["gets"]
 
     # A FRESH filesystem for the warm pass: fsspec caches instances, and a
     # cached one serves the second sweep out of its own buffer, which measures
@@ -308,13 +324,12 @@ def main():
     #
     # Asserted as a RATIO per MiB rather than an absolute, so the check does
     # not have to be retuned when the object size or the chunk size moves.
-    rc.flushall(); rc.config_resetstat()
-    with fs().open("s3://bucket/data/000003.bin", "rb") as h:
+    rc.flushall()
+    _f = fs()
+    with _f.open("s3://bucket/data/000003.bin", "rb") as h:
         h.seek(0)
         filled = len(h.read(4 * 1024 * 1024))
-    _cs = rc.info("commandstats") or {}
-    _calls = {k.replace("cmdstat_", ""): v["calls"] for k, v in _cs.items()}
-    writes = _calls.get("set", 0) + _calls.get("mset", 0)
+    writes = _f.counters["tier_writes"]
     mib = max(filled / (1024 * 1024), 1)
     check(writes > 0, f"armed: filling {mib:.0f} MiB does write to the tier ({writes} round trips)")
     # 4 per MiB is generous against a measured 1.0 and would still catch a
@@ -322,8 +337,13 @@ def main():
     check(writes / mib <= 4,
           f"the fill batches: {writes / mib:.1f} write round trips per MiB "
           "(per-chunk writes would be 16)")
-    check(_calls.get("set", 0) == 0,
-          f"and does it with MSET, not per-chunk SET ({_calls.get('set', 0)} SETs)")
+    # Was `_calls["set"] == 0` from the server's commandstats. The client
+    # counts writes now, and it counts them BUCKETED rather than by name, so
+    # this asserts the shape that matters instead: a per-chunk-SET fill would
+    # cost one write per chunk, which at 64 KiB chunks over 4 MiB is 64, and
+    # the batched fill costs a handful.
+    check(writes < mib * 4,
+          f"and it batches rather than writing per chunk ({writes} writes for {mib:.0f} MiB)")
 
     # how much does fsspec's block cache pull for a small read?
     rc.flushall(); stats(ep, "/__reset")
