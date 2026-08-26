@@ -17,9 +17,20 @@ predicate — always-true restores the unconditional sleep and always-false
 removes it entirely, and both are previously-shipped behaviours, so neither
 would look obviously wrong. Both stubs fail the test.
 
-NOT yet measured end to end: `promote_notice` would show the stall dropping
-from 49-64 ms to a round trip, but the laptop had a foreign fleet up and
-`fleet_guard` refused the run — correctly. The number comes from the gate.
+MEASURED on the gate box, 2026-08-26:
+
+    before:  first write after failover 49-64 ms above steady state
+    after:   first write after failover  1 ms above steady state
+
+with both mechanism assertions intact — run A still observes a reactive
+re-probe triggered by the demoted seat, run B still observes none.
+
+**That last part is the whole reason BUG-0054 had to land first.** Under the
+old assertion — `SLOW_DELTA >= 30`, justified by this very sleep — a 1 ms
+delta reds `promote_notice` permanently on correct code. The drill was
+measuring the defect, so the defect could not be removed while the drill
+still measured it. Fixing the check first, in its own change, is what made
+this a normal fix rather than one that arrives holding a weakened test.
 
 Split out of BUG-0054. It was that bug's first diagnosis and was refuted as its
 cause; the asymmetry itself is real and was never in question.
