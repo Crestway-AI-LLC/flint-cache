@@ -1904,11 +1904,22 @@ fn corpus() -> Vec<Case> {
         Case {
             family: "strings",
             name: "mset mget with missing and wrongtype",
+            // COLOCATED UNDER A HASH TAG, exactly as the set-op cases above
+            // are, and for the same reason. Flint refuses cross-slot
+            // multi-key requests (BUG-0053); the oracle is a STANDALONE
+            // valkey, which has no slots and answers them happily. Bare
+            // m1/m2/m3/nosuch land in four different slots (6916, 11111,
+            // 15174, 14872), so this case would compare Flint's deliberate
+            // CROSSSLOT refusal against the oracle's answer and report a
+            // divergence that is the documented design.
+            //
+            // What the case is FOR — a miss and a wrongtype both yielding
+            // nil, in position — is untouched by colocating the keys.
             steps: vec![
-                s(&[b"MSET", b"m1", b"a", b"m2", b"b"], Expect::Ok),
-                s(&[b"RPUSH", b"m3", b"x"], Expect::Int(1)),
+                s(&[b"MSET", b"{m}1", b"a", b"{m}2", b"b"], Expect::Ok),
+                s(&[b"RPUSH", b"{m}3", b"x"], Expect::Int(1)),
                 s(
-                    &[b"MGET", b"m1", b"nosuch", b"m2", b"m3"],
+                    &[b"MGET", b"{m}1", b"{m}nosuch", b"{m}2", b"{m}3"],
                     Expect::Arr(vec![
                         Expect::Str(b"a"),
                         Expect::Nil,

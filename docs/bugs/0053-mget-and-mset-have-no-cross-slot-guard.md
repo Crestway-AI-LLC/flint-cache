@@ -1,6 +1,11 @@
 # BUG-0053: MGET and MSET have no cross-slot guard, and answer wrongly instead
 
-Status: OPEN, found 2026-08-26 · Severity: MEDIUM, rising to HIGH for any fleet
+Status: FIXED 2026-08-26, pending gate — MGET and MSET now call the same
+`crossslot` helper the set ops use. Conformance stays 105/105: the corpus case
+was colocated under a hash tag exactly as the set-op cases already are, because
+the oracle is a STANDALONE valkey with no slots. Bare `m1`/`m2`/`m3`/`nosuch`
+land in slots 6916/11111/15174/14872, so the case would otherwise have compared
+a deliberate refusal against the oracle's answer. · Severity: MEDIUM, rising to HIGH for any fleet
 with more than one pair — the wrong answer is silent, well-formed, and
 positionally plausible.
 
@@ -130,3 +135,16 @@ is worse in both readings, because it writes.
 
 The narrow reading does not lower the severity of the defect; it describes one
 consumer that happens to be defended against it by its own design.
+
+
+## Open question this fix does NOT answer: DEL, EXISTS, UNLINK
+
+Those are multi-key too and would carry the same hazard — a key on another pair
+silently absent from the count. I have not established whether they are
+guarded. A quick grep suggested "no", but it matched `has_oversized_key`'s
+classification list rather than a dispatch arm, which is the same mistake this
+bug's own reporter made reading `NO_KEY` and concluding INFO was proxy-only.
+
+So it is recorded as unknown rather than answered. Settling it needs the same
+treatment MGET got: find the dispatch arm, and probe a live server with keys
+confirmed to hash apart.
