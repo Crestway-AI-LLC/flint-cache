@@ -855,6 +855,50 @@ fn evictable_ns_joined() -> String {
 /// engine did not answer" would make this field report maximum headroom at the
 /// one moment it knows nothing, during the incident it exists to explain. Same
 /// contract, and the same reason, as BUG-0022.
+/// The eviction counters, as one FLINTINFO line.
+///
+/// Exported for TUNING THE BATCHING FLOORS, which is the whole reason they
+/// exist. The number to read first is `marks_at_last_pass` against
+/// `forced_passes`: a forced `compact_ns` rewrites the surviving rows, so it
+/// costs the same whether it reclaims a thousand keys or a million, and a low
+/// marks-per-pass means the node is paying a full-namespace rewrite for a
+/// fraction of the benefit.
+///
+/// The two skip counters say which floor is binding, and they want opposite
+/// responses: cooldown-dominated means pressure outruns the interval,
+/// small-dominated means marks arrive too slowly to be worth forcing and
+/// ordinary compaction is probably already draining them.
+///
+/// Empty when nothing is declared evictable, so a durable deployment reads no
+/// counters for a feature it has not turned on.
+#[cfg(feature = "rocks")]
+fn eviction_metrics_line(rocks: &Option<RocksHandle>) -> String {
+    let Some(kv) = rocks.as_ref() else {
+        return String::new();
+    };
+    let ev = kv.eviction();
+    if ev.evictable_count() == 0 {
+        return String::new();
+    }
+    let m = ev.metrics();
+    format!(
+        "marked_total={} marked_now={} dropped={} refused={} overflow={} \
+forced_passes={} skipped_cooldown={} skipped_small={} marks_at_last_pass={} \
+reclaim_cycles={} bytes_requested={}",
+        m.marked_total,
+        m.marked_now,
+        m.dropped,
+        m.refused,
+        m.mark_overflow,
+        m.forced_passes,
+        m.forced_skipped_cooldown,
+        m.forced_skipped_small,
+        m.marks_at_last_pass,
+        m.reclaim_cycles,
+        m.bytes_requested,
+    )
+}
+
 /// Push the declared-evictable set into the ENGINE, where the compaction
 /// filter's guard reads it.
 ///
@@ -3958,7 +4002,7 @@ fn flintinfo(
     let write_stall = rocks.as_ref().and_then(|kv| kv.write_stall());
     let compaction = rocks.as_ref().and_then(|kv| kv.compaction_pressure());
     let info = format!(
-        "role:{}\r\nloading:0\r\nrole_epoch:{role_epoch}\r\nbuild:{build}\r\nsst_bytes:{sst}\r\nlatest_seq:{latest}\r\nlast_applied:{last_applied}\r\nacked_seq:{}\r\nseq_lag:{seq_lag}\r\nwal_headroom_seq:{whs}\r\nwal_min_acked_seq:{wma}\r\nwal_headroom_shed_seq:{whl}\r\nlive_replicas:{}\r\nlag_ms:{}\r\nlag_ms_max:{lmx}\r\nlag_max_gap:{lmg}\r\nlag_soft_ms:{soft}\r\nlag_hard_ms:{hard}\r\nmin_replicas_to_write:{minr}\r\nwidowed_grace_ms:{wgm}\r\nwidowed_shed:{wsh}\r\nfullsync_active:{fsa}\r\nfullsync_max:{fsm}\r\nasync_write_queue:{aqd}\r\nwrite_deadline_ms:{wdm}\r\nwrite_inflight:{wif}\r\nwrite_service_us:{wsu}\r\nwrite_wait_est_ms:{wwe}\r\nwrites_shed_deadline:{wsd}\r\nwrites_shed_lag:{wsl}\r\nwrites_shed_quorum:{wsq}\r\nwrites_shed_widowed:{wswd}\r\nwrites_shed_headroom:{wshr}\r\nwrites_delayed_soft:{wdsf}\r\nwal_fsync_ms:{wfm}\r\nwal_fsync_total:{wft}\r\ncert_days_remaining:{cdr}\r\nactive_conns:{ac}\r\nmax_conns:{mc}\r\nconns_shed_total:{cs}\r\nwrite_stopped:{wst}\r\ndelayed_write_rate:{dwr}\r\nwrite_stall_readable:{wsr}\r\nl0_files:{l0f}\r\npending_compaction_bytes:{pcb}\r\ncompaction_readable:{cr}\r\ndisk_free_bytes:{dfb}\r\ndisk_total_bytes:{dtb}\r\ndisk_free_pct:{dfp}\r\ndisk_verdict:{dv}\r\ndisk_unknown_samples:{dus}\r\nevictable_ns:{ens}\r\nevictable_ns_agree:{ensa}\r\nevictable_ns_bytes:{ensb}\r\nreclaim_active:{rca}\r\nreclaim_target_free_bytes:{rctf}\r\ngc_swept_expired:{gse}\r\ngc_swept_orphans:{gso}\r\nuptime_ms:{upms}\r\n",
+        "role:{}\r\nloading:0\r\nrole_epoch:{role_epoch}\r\nbuild:{build}\r\nsst_bytes:{sst}\r\nlatest_seq:{latest}\r\nlast_applied:{last_applied}\r\nacked_seq:{}\r\nseq_lag:{seq_lag}\r\nwal_headroom_seq:{whs}\r\nwal_min_acked_seq:{wma}\r\nwal_headroom_shed_seq:{whl}\r\nlive_replicas:{}\r\nlag_ms:{}\r\nlag_ms_max:{lmx}\r\nlag_max_gap:{lmg}\r\nlag_soft_ms:{soft}\r\nlag_hard_ms:{hard}\r\nmin_replicas_to_write:{minr}\r\nwidowed_grace_ms:{wgm}\r\nwidowed_shed:{wsh}\r\nfullsync_active:{fsa}\r\nfullsync_max:{fsm}\r\nasync_write_queue:{aqd}\r\nwrite_deadline_ms:{wdm}\r\nwrite_inflight:{wif}\r\nwrite_service_us:{wsu}\r\nwrite_wait_est_ms:{wwe}\r\nwrites_shed_deadline:{wsd}\r\nwrites_shed_lag:{wsl}\r\nwrites_shed_quorum:{wsq}\r\nwrites_shed_widowed:{wswd}\r\nwrites_shed_headroom:{wshr}\r\nwrites_delayed_soft:{wdsf}\r\nwal_fsync_ms:{wfm}\r\nwal_fsync_total:{wft}\r\ncert_days_remaining:{cdr}\r\nactive_conns:{ac}\r\nmax_conns:{mc}\r\nconns_shed_total:{cs}\r\nwrite_stopped:{wst}\r\ndelayed_write_rate:{dwr}\r\nwrite_stall_readable:{wsr}\r\nl0_files:{l0f}\r\npending_compaction_bytes:{pcb}\r\ncompaction_readable:{cr}\r\ndisk_free_bytes:{dfb}\r\ndisk_total_bytes:{dtb}\r\ndisk_free_pct:{dfp}\r\ndisk_verdict:{dv}\r\ndisk_unknown_samples:{dus}\r\nevictable_ns:{ens}\r\nevictable_ns_agree:{ensa}\r\nevictable_ns_bytes:{ensb}\r\nreclaim_active:{rca}\r\nreclaim_target_free_bytes:{rctf}\r\nevict:{evm}\r\ngc_swept_expired:{gse}\r\ngc_swept_orphans:{gso}\r\nuptime_ms:{upms}\r\n",
         if read_only { "replica" } else { "master" },
         hub.effective_acked(now)
             .map_or_else(|| "none".into(), |a| a.to_string()),
@@ -3975,6 +4019,7 @@ fn flintinfo(
         ensb = evictable_ns_bytes_joined(rocks),
         rca = RECLAIM_ACTIVE.load(Ordering::Relaxed) as u8,
         rctf = RECLAIM_TARGET_FREE.load(Ordering::Relaxed),
+        evm = eviction_metrics_line(rocks),
         ensa = EVICTABLE_AGREE.load(Ordering::Relaxed),
         // ADR-0022. Exported because the shed threshold is expressed in
         // SEQUENCES while RocksDB budgets BYTES: an operator can only pick a
