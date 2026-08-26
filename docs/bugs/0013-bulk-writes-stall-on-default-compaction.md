@@ -464,7 +464,7 @@ big box with a large LSM, two jobs cannot keep up. The knob is a function of
 cores and LSM size, and **neither measurement licenses a fleet-wide default on
 its own.**
 
-### The instrument is not in main
+### ~~The instrument is not in main~~ — LANDED 2026-08-26
 
 `FLINT_BG_JOBS`, added by flint `66e02f1` as the opt-in knob for exactly this
 question, is on `origin/phase1-drills` and **was never merged**. The ops
@@ -479,3 +479,20 @@ It is: land `66e02f1`, then sweep the knob in THIS regime — a large LSM on a
 box with cores to spare — and only then argue about a default. Sizing write
 buffers and adding a rate limiter are also untested; the 2026-08-17 work swept
 background jobs alone.
+
+**2026-08-26 — the first half is done.** `FLINT_BG_JOBS` is on main
+(`flint-storage/src/rocks.rs`), landed by BUG-0044's cherry-pick of the
+stranded branch, and `tools/ingest_decay_sweep.sh` came with it. The section
+above saying the instrument is absent is kept for the record and is no longer
+true.
+
+The sweep still could not express this regime, because it hardcoded
+`FLINT_LEVEL_BASE_MB=8` — the 2026-08-17 shape — so running it answered the
+question that already had an answer. `DECAY_LEVEL_BASE_MB` and
+`DECAY_WRITE_BUFFER_MB` now override it, defaulted to the old values so prior
+numbers stay comparable, and **the shape is printed with the results**: two
+sweeps of this file have already appeared to disagree when they were measuring
+different regimes, and only one of them recorded which.
+
+So what remains is the measurement itself: a large LSM on a box with cores to
+spare, one sweep of the job count, with the shape recorded beside every column.
