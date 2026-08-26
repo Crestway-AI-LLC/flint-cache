@@ -79,3 +79,106 @@ jobs:
             tail -60 "$f"
             echo "::endgroup::"
           done
+
+  # THE SAME GATE, AGAINST FLINT. The job above runs it against a Redis-protocol
+  # server, which is what the look-aside library supports for a customer's own
+  # tier -- but the product's tier is Flint, and until 2026-08-26 nothing had
+  # ever run these suites against it. The first attempt failed 8 of 28 stages:
+  # Flint implements no KEYS, no INFO, no CONFIG and no SHUTDOWN, and its
+  # per-value storage overhead is 1.004x where valkey's is 1.250x. None of that
+  # was visible from a green gate, because a Redis-protocol stand-in passes
+  # every assertion the suites make.
+  #
+  # A RELEASED, SIGNED BINARY rather than a build from this tree: RocksDB takes
+  # minutes to compile, and a customer runs a release rather than HEAD, so the
+  # release is also the more honest target. The signature is verified before
+  # anything is executed.
+  gate-flint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      AWS_EC2_METADATA_DISABLED: 'true'
+    defaults:
+      run:
+        working-directory: s3-accelerator
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # redis-tools only: the gate needs a CLI to talk RESP, and the SERVER it
+      # starts is Flint. Installing redis-server here would be worse than
+      # useless -- gate.sh resolves whichever server is present, so a stray one
+      # on PATH is exactly how this job would quietly stop testing Flint.
+      - name: redis CLI and minisign
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq redis-tools minisign
+
+      - name: fetch and VERIFY the latest Flint release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 1 --json tagName -q '.[0].tagName')
+          echo "release $TAG"
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" -D /tmp/flintrel \
+            -p '*-linux-x86_64.tar.gz' -p '*-linux-x86_64.tar.gz.minisig' -p 'minisign.pub'
+          cd /tmp/flintrel
+          TARBALL=$(ls *-linux-x86_64.tar.gz)
+          # Verify BEFORE extracting. An unverified binary that is about to be
+          # executed is not made safer by checking it afterwards.
+          minisign -Vm "$TARBALL" -p minisign.pub
+          tar xzf "$TARBALL"
+          test -x ./flint-server
+          ./flint-server --build-version || true
+
+      - name: python env
+        run: |
+          python -m venv python/.venv
+          python/.venv/bin/pip install -q --upgrade pip
+          python/.venv/bin/pip install -q -r python/requirements-dev.txt
+
+      # A POSITIVE CONTROL ON THE ENGINE ITSELF. Without it this job would pass
+      # just as happily against a Redis that happened to be installed, which is
+      # the exact substitution it exists to prevent. Flint implements no INFO,
+      # so a server that answers INFO is not Flint.
+      - name: prove the tier really is Flint
+        run: |
+          set -euo pipefail
+          /tmp/flintrel/flint-server --port 6799 --engine rocks --data-dir /tmp/flintprobe &
+          for _ in $(seq 1 40); do redis-cli -p 6799 ping >/dev/null 2>&1 && break; sleep 0.25; done
+          redis-cli -p 6799 ping
+          if redis-cli -p 6799 info server 2>&1 | grep -qi 'redis_version\|process_id'; then
+            echo "FAIL: the server on 6799 answers INFO -- that is not Flint"; exit 1
+          fi
+          echo "confirmed: no INFO, so this is Flint and not a RESP stand-in"
+          redis-cli -p 6799 shutdown nosave 2>/dev/null || true
+          pkill -f 'flint-server --port 6799' 2>/dev/null || true
+
+      - name: gate (Flint engine)
+        env:
+          FLINT_TIER_ENGINE: flint
+          TIER_SERVER: /tmp/flintrel/flint-server
+        run: bash tools/gate.sh
+
+      # Same reason as the job above: a gate that fails with no evidence costs
+      # another full run to diagnose, and the per-stage logs are where the
+      # failure actually is. Omitting this here would be worse, not better --
+      # a Flint failure is the LESS familiar of the two and needs its detail
+      # more.
+      - name: stage logs
+        if: failure()
+        run: |
+          for f in /tmp/gate_*.log; do
+            [ -f "$f" ] || continue
+            echo "::group::$(basename "$f")"
+            tail -60 "$f"
+            echo "::endgroup::"
+          done
