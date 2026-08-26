@@ -926,9 +926,11 @@ fleet_signal() {
   local pid args hit=1
   for pid in $(_fleet_ours "$want"); do
     args="$(ps -o args= -p "$pid" 2>/dev/null)"
-    # Remember THIS seat's port, so the release wait below covers exactly the
-    # seats killed and not the whole declared block.
-    _killed_pids="$_killed_pids $pid"
+    # NO _killed_pids APPEND HERE (BUG-0051). This function SIGSTOPs and
+    # SIGCONTs; it kills nothing and has no wait-for-death block to feed. The
+    # append lived here and not in fleet_kill, which is the whole defect: it
+    # also recorded pids it then `continue`d past without signalling, and it
+    # was not declared local, so it leaked into whatever called this.
     case "$args" in
       *flint-*) ;;
       *) continue ;;
@@ -994,6 +996,14 @@ fleet_kill() {
       *) continue ;;               # exited, or the pid now belongs elsewhere
     esac
     kill -9 "$pid" 2>/dev/null
+    # RECORD IT (BUG-0051). The wait below iterates this list, and nothing
+    # ever appended to it: the sole append in the tree was in fleet_signal,
+    # a different function. So the whole wait was unreachable and every
+    # caller was back on the fixed `sleep` the comment below says stopped
+    # being safe once #176 made a node bind within milliseconds of exec.
+    # Appended AFTER the allowlist accepts the pid, so the list holds
+    # exactly the seats this call signalled.
+    _killed_pids="$_killed_pids $pid"
   done
   # AND DO NOT RETURN UNTIL THE PORTS ARE ACTUALLY FREE.
   #
