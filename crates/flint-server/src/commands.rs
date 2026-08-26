@@ -361,7 +361,7 @@ impl<'a> Dispatcher<'a> {
                 // route_key derives one slot from args[1] and ships the
                 // whole command there.
                 let keys: Vec<Vec<u8>> = args[1..].chunks(2).map(|c| c[0].clone()).collect();
-                if let Some(e) = Self::crossslot(&keys[0], &keys[1..].to_vec()) {
+                if let Some(e) = Self::crossslot(&keys[0], &keys[1..]) {
                     return e;
                 }
                 for chunk in args[1..].chunks(2) {
@@ -386,7 +386,7 @@ impl<'a> Dispatcher<'a> {
                 // That is the same "plausible-looking answer that is
                 // silently incorrect" the set ops refuse, and MGET reached
                 // neither this helper nor the inline copy.
-                if let Some(e) = Self::crossslot(&args[1], &args[2..].to_vec()) {
+                if let Some(e) = Self::crossslot(&args[1], &args[2..]) {
                     return e;
                 }
                 // Redis MGET yields nil (not an error) for wrong-type keys.
