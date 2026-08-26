@@ -44,11 +44,11 @@ start_replica 6972 r2
 $PX --port 6313 --control-plane 127.0.0.1:7640 --advertise 127.0.0.1:6313 2>/dev/null &
 # Gate on BOTH replicas being live before any test relies on them.
 for i in $(seq 1 50); do
-  [ "$(valkey-cli -p 6312 PING 2>/dev/null)" = "PONG" ] && [ "$(valkey-cli -p 6972 PING 2>/dev/null)" = "PONG" ] && break
+  fleet_ready 6312 && fleet_ready 6972 && break
   sleep 0.2
 done
-[ "$(valkey-cli -p 6312 PING 2>/dev/null)" = "PONG" ] || { echo "FAIL: replica 6312 never came up"; exit 1; }
-[ "$(valkey-cli -p 6972 PING 2>/dev/null)" = "PONG" ] || { echo "FAIL: replica 6972 never came up"; exit 1; }
+fleet_ready 6312 || { echo "FAIL: replica 6312 never became READY"; exit 1; }
+fleet_ready 6972 || { echo "FAIL: replica 6972 never became READY"; exit 1; }
 sleep 1
 a() { valkey-cli -p 6313 -a tok-acme --no-auth-warning "$@"; }
 [ "$(a SET rk masterval)" = "OK" ] || { echo "FAIL: seed"; exit 1; }
@@ -70,7 +70,7 @@ echo "  replicas dead -> reads fell back to the master, none failed"
 # Bring the replicas back and reconverge for the master-down phase.
 start_replica 6312 r1b; start_replica 6972 r2b
 for i in $(seq 1 50); do
-  [ "$(valkey-cli -p 6312 PING 2>/dev/null)" = "PONG" ] && [ "$(valkey-cli -p 6972 PING 2>/dev/null)" = "PONG" ] \
+  fleet_ready 6312 && fleet_ready 6972 \
     && { L=$(valkey-cli -p 6311 FLINTINFO | tr '\r' '\n' | grep '^live_replicas:' | cut -d: -f2); [ "$L" -ge 2 ] 2>/dev/null && break; }
   sleep 0.2
 done
