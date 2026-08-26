@@ -768,6 +768,25 @@ impl Topology {
         self.rediscover_for(addr);
     }
 
+    /// True when routing STILL names `addr` as a master — the re-probe found
+    /// nothing new, so an immediate retry would hit the same refusal.
+    ///
+    /// This is the discriminator the two `-READONLY` handlers were missing.
+    /// One slept 50ms unconditionally and one never slept, so the cost of a
+    /// controlled failover depended on which of them serviced the write
+    /// (BUG-0055). Backing off is right when there is nothing else to try and
+    /// wrong when rediscovery has already found the new master, and that is a
+    /// question about the routing table rather than about which call path we
+    /// are on.
+    fn still_master(&self, addr: &str) -> bool {
+        self.clusters.iter().any(|view| {
+            view.routing
+                .read()
+                .map(|r| r.masters.iter().flatten().any(|m| m == addr))
+                .unwrap_or(false)
+        })
+    }
+
     fn rediscover_for(&self, addr: &str) {
         // A dead address could belong to any member cluster: walk them all
         // (one, today).
@@ -1428,6 +1447,13 @@ async fn forward_collect(
             // path: rediscover this pair's master, then retry there.
             topo.rediscover_after_failure(&addr);
             backends.drop_conn(&addr);
+            // The same rule as forward's handler, so one condition has one
+            // retry discipline (BUG-0055). This path never slept; that was
+            // right whenever rediscovery moved routing and wrong when it did
+            // not, and nothing here distinguished the two.
+            if topo.still_master(&addr) {
+                std::thread::sleep(Duration::from_millis(50));
+            }
             forward(topo, backends, ns, args, raw, false).await
         }
         Ok(reply) => reply,
@@ -1536,7 +1562,15 @@ async fn forward(
                 }
                 topo.rediscover_after_failure(&addr);
                 backends.drop_conn(&addr);
-                std::thread::sleep(Duration::from_millis(50));
+                // BACK OFF ONLY WHEN THE RE-PROBE FOUND NOTHING (BUG-0055).
+                // This slept unconditionally, 50ms AFTER rediscovery had
+                // already found the new master — pure added latency on every
+                // controlled failover, and measurably the whole of it: the
+                // first write after a demote/promote cost 49-64ms above
+                // steady state, of which 50 was this.
+                if topo.still_master(&addr) {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
             }
             Ok(reply) => return reply,
             Err(_) => {
@@ -4347,6 +4381,34 @@ mod route_tests {
             ),
             other => panic!("expected COPROCUNAVAIL on a normal connection, got {other:?}"),
         }
+    }
+
+    /// The discriminator BUG-0055 turns on: back off only when the re-probe
+    /// left routing pointing at the address that just refused us.
+    ///
+    /// Both directions asserted, because a predicate that always returned
+    /// `true` would restore the unconditional sleep and one that always
+    /// returned `false` would remove it entirely — and each of those is a
+    /// previously-shipped behaviour, so neither would look obviously wrong.
+    #[test]
+    fn still_master_is_true_only_while_routing_names_the_refusing_seat() {
+        let t = two_pair_topo();
+        seed_master0(&t);
+        assert!(
+            t.still_master("a:1"),
+            "routing names a:1 as master, so there is nothing new to retry against \
+             and the caller must back off"
+        );
+        // A re-probe that finds no master clears the slot — the failover case.
+        t.rediscover_after_failure("a:1");
+        assert_eq!(master0(&t), None, "precondition: the probe cleared the slot");
+        assert!(
+            !t.still_master("a:1"),
+            "routing has moved off a:1, so a retry has somewhere else to go and \
+             sleeping would only add latency"
+        );
+        // An address that was never a master anywhere.
+        assert!(!t.still_master("z:9"), "an unknown address is not a master");
     }
 
     #[test]

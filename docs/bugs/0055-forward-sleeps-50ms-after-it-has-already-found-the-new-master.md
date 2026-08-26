@@ -1,7 +1,25 @@
 # BUG-0055: `forward` sleeps 50 ms after it has already found the new master
 
-Status: OPEN, found 2026-08-26 · Severity: LOW — 50 ms added to the first write
-after every controlled failover, on one of two code paths.
+Status: FIXED 2026-08-26, pending gate. Both handlers now share one rule:
+back off only when the re-probe left routing pointing at the seat that just
+refused. · Severity: LOW — 50 ms added to the first write after every
+controlled failover, on one of two code paths.
+
+The fix is not "delete the sleep". A backoff earns its place when rediscovery
+found nothing and an immediate retry would spin against the same refusal until
+`RETRY_BUDGET`. What was wrong is that neither handler asked which case it was
+in: one always slept, the other never did. `Topology::still_master` is that
+question, and it is about the routing table rather than about which call path
+happens to be running.
+
+Unit-tested both directions, with a positive control against each degenerate
+predicate — always-true restores the unconditional sleep and always-false
+removes it entirely, and both are previously-shipped behaviours, so neither
+would look obviously wrong. Both stubs fail the test.
+
+NOT yet measured end to end: `promote_notice` would show the stall dropping
+from 49-64 ms to a round trip, but the laptop had a foreign fleet up and
+`fleet_guard` refused the run — correctly. The number comes from the gate.
 
 Split out of BUG-0054. It was that bug's first diagnosis and was refuted as its
 cause; the asymmetry itself is real and was never in question.
