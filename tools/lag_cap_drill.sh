@@ -67,8 +67,27 @@ cargo build --release -q -p flint-chaos -p flint-server -p flint-controller \
 # 5ms hard / 4ms soft: low enough that an ordinary write burst outruns
 # replication, high enough that the pair still makes progress.
 echo "== chaos with the lag cap at 5ms, so the shed path is reachable"
+# FORCE THE LAG, DO NOT HOPE FOR IT (BUG-0049).
+#
+# This used to rely on an ordinary write burst outrunning replication. That is
+# an ambient property of the machine, not something the run controls, so on a
+# box where replication kept up nothing was shed and the drill correctly
+# reported the mechanism unproven -- failing for a reason unrelated to the
+# change under test. One red main, 5 passes either side of it.
+#
+# --stall-replica-ms SIGSTOPs the replica so lag is produced rather than
+# awaited. It was rejected at first on the grounds that a stall belongs to the
+# bounded-loss regime this drill's header defers to #121, and that reasoning
+# was wrong: a stall creates LAG, and if the shed mechanism works the master
+# refuses writes rather than acking them, so no acked loss appears. Shedding
+# is precisely what the stall should produce here. If it produced loss instead,
+# that would be the mechanism failing -- which this drill would then be right
+# to report.
+#
+# 200ms against a 5ms cap: two orders of margin, and far under the 2s liveness
+# window, so the pair still looks failover-worthy to the controller.
 OUT=$(./target/release/flint-chaos --port-base 6362 --iterations 4 --keys 150 --mode master \
-  --driver controller --lag-hard-ms 5 --rpo-margin-ms 50 2>&1)
+  --driver controller --lag-hard-ms 5 --rpo-margin-ms 50 --stall-replica-ms 200 2>&1)
 echo "$OUT" | tail -8 | sed 's/^/  /'
 
 echo "$OUT" | grep -q "^PASS:" || { echo "FAIL: chaos oracle did not pass under a tight cap"; exit 1; }
