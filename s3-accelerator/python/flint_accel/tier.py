@@ -18,64 +18,130 @@ from __future__ import annotations
 import threading
 import time
 import zlib
-import threading
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as _FutureTimeout
+
+import redis as redis_lib
 
 CHUNK = 64 * 1024
 #: What fsspec's block cache fetches per miss. NOT the chunk size, and not
-#: fsspec's own 5 MiB either -- a chosen point on a trade that has no free one.
+#: fsspec's own 5 MiB either.
 #:
-#: MEASURED, 64 MiB object, counts exact. The two axes pull against each other:
+#: MEASURED on all FOUR axes, 64 MiB object, ReadAheadCache (what s3fs actually
+#: defaults to), counts exact. The earlier table carried one axis per side --
+#: origin bytes cold, tier round trips warm -- which is the shape of the trade
+#: only if those are the only axes. They are not:
 #:
-#:   block     sparse read pulls   small-sequential tier round trips
-#:   5 MiB     31x what was asked   3
-#:   1 MiB     17x                  9
-#:   256 KiB   5.0x                33
-#:   64 KiB    2.0x               122
+#:   selective, 32 x 64 KiB reads (2 MiB asked)
+#:     block    origin bytes   tier trips   TIER BYTES
+#:     5 MiB      27.3x            11         27.3x
+#:     1 MiB      17.0x            32         17.0x
+#:     256 KiB     5.0x            32          5.0x
+#:     64 KiB      2.0x            32          2.0x
 #:
-#: 256 KiB takes most of the amplification win while keeping small-sequential
-#: reads inside ~10x rather than 40x. Large sequential reads are indifferent at
-#: every value: identical bytes, 8 tier round trips, because contiguous chunk
-#: runs coalesce into one origin range GET however fsspec slices the request.
+#:   small-sequential, 64 MiB walked in 4 KiB reads
+#:     block    origin bytes   tier trips   TIER BYTES
+#:     5 MiB       1.00x           13          1.01x
+#:     1 MiB       1.00x           64          1.06x
+#:     256 KiB     1.00x          253          1.23x
+#:     64 KiB      1.00x          964          1.88x
+#:
+#:   large sequential: 8 trips and 1.00x at EVERY value, on both axes.
+#:
+#: The fourth axis is the one that had never been counted, and it does not
+#: behave like the other three. A small block amplifies tier BYTES on the warm
+#: path -- 64 KiB moves 1.88x what was asked, against 1.00x from the origin on
+#: the identical cold read -- because every fetch straddles the chunk grid and
+#: costs one chunk of spill. So 64 KiB is not the cheap end of a trade; it is
+#: worse than 256 KiB on BOTH tier axes for sequential work and better only on
+#: bytes for selective work.
+#:
+#: The trade that survives is 256 KiB against 1 MiB, and it has a break-even.
+#: Per MiB asked, 256 KiB costs +2.95 tier round trips and +0.18 MB on
+#: small-sequential, and saves 12.59 MB on selective. With f the fraction of
+#: bytes read selectively, 256 KiB wins when
+#:
+#:     f x 12.59 MB / tier_BW  >  (1 - f) x (2.95 x tier_RTT + 0.18 MB / tier_BW)
+#:
+#: which at 0.2 ms RTT is f > 6% at 1 GB/s and f > 33% at 10 GB/s per
+#: connection. 64 KiB would need f > 48%. The analytics reads this cache is for
+#: -- Parquet footers, Iceberg manifests, column projection -- sit far above 6%,
+#: so 256 KiB is the measured choice and not merely the middle one. tier_RTT and
+#: tier_BW are the two numbers M0 owes this formula.
 BLOCK_BYTES = 256 * 1024
 #: Objects larger than this are read straight from the origin and never
 #: chunk-cached.
 #:
-#: 512 MiB (Jeff, 2026-08-25). The reasoning that sets it is PAYOFF, not
-#: keyspace. Measured: a warm read moves the SAME bytes as a cold one -- the
-#: cache does not reduce data transferred, it changes where the data comes
-#: from. So for a large object read sequentially the entire benefit is
-#: bytes x (1/S3_throughput - 1/tier_throughput), which is near zero against
-#: parallel range GETs on a fast NIC and NEGATIVE when the tier is slower.
-#: Past some size a client is better off going straight to S3.
+#: 512 MiB, and it is the number we are USING rather than a number anything
+#: determined -- nothing here distinguishes it from its neighbours. What the
+#: measurement below did was retire a wrong reason, correct a second by 165x,
+#: and show that a cap denominated in object bytes cannot have a best value at
+#: all, because object bytes is not what the tier spends.
 #:
-#: 512 MiB sits above the data files this cache is actually for -- Parquet and
-#: Iceberg land at 128-512 MB -- so the analytics working set still caches
-#: while objects whose only payoff is a throughput differential do not.
+#: The premise holds. A warm read moves the same bytes as a cold one, measured
+#: to within 0.02% on every pattern and every block size: 5,244,131 B off the
+#: tier against 5,242,880 B off the origin for the identical selective read,
+#: the difference being the D14 seal and RESP framing.
 #:
-#: The keyspace argument still holds underneath: an object of size S occupies
-#: S/CHUNK keys, and at ~100 B of per-key overhead a 1 TB object would cost
-#: ~1.7 GB of overhead before a single byte of its data is stored.
+#: What does NOT follow is a threshold. time_saved = bytes x (1/S3 - 1/tier) is
+#: linear in bytes with a sign that does not depend on bytes, so it says either
+#: every size pays or no size pays -- it cannot produce a size at which caching
+#: stops being worth it. Measured, both sides scale linearly and neither
+#: parallelism is a function of object size: a 64 MiB sequential read costs 8
+#: origin GETs and 8 tier round trips whatever its size, at peak origin
+#: concurrency 1 on this path (3 on the JVM's, where AAL prefetches). So the
+#: payoff argument sets whether to cache sequential reads AT ALL -- tier_BW
+#: against 1x a connection here, 3x on the JVM -- and never sets a cap.
 #:
-#: THIS NUMBER IS AN ARGUMENT, NOT A FINDING. The real crossover wants
-#: measuring on a cluster; tracked, blocked on M0.
+#: Two costs ARE size-dependent, and they are what the cap actually defends:
+#:
+#:   FILL. _fill writes one chunk per SET, synchronously, so a cold read of an
+#:   object of size S costs S/CHUNK blocking tier round trips before it
+#:   returns: 1,024 measured for 64 MiB, 8,192 for an object at this cap. The
+#:   JVM has no equivalent -- Lettuce pipelines the same writes -- so this is a
+#:   Python-path cost, and pipelining the SETs would remove most of the reason
+#:   for a cap on this path at all.
+#:
+#:   OCCUPANCY. A cached object costs 1.2522x its own bytes of tier memory,
+#:   measured at fleet scale on jemalloc 5.3.0: a 64 KiB chunk plus its 4-byte
+#:   seal needs 82,008 B, because 65,540 B lands one byte past the allocator's
+#:   64 KiB size class and takes the 80 KiB one. Not the ~100 B/key this
+#:   comment used to claim -- 16,468 B/key, 165x more -- and it is the CHUNK
+#:   size that lands badly, not the seal, which is free. See ADR-0023 D17.
+#:
+#: Neither derives a value. Fill cost gives a band (~320-640 MiB across
+#: plausible tier RTTs, not a point) and occupancy gives a number only once
+#: someone fixes a policy for what share of a node one object may take. At 512
+#: MiB those read as ~8k blocking fills on the cold read and 641 MiB of tier for
+#: one object -- defensible, not derived. The one justification that ever
+#: pointed at THIS number is workload fit: 128-512 MB Parquet and Iceberg files.
+#:
+#: The cap rations the wrong quantity, and that is now measured rather than
+#: suspected. What the tier spends is CHUNKS TOUCHED, not object bytes: a
+#: Parquet-shaped read -- footer plus two column chunks -- touches 26 chunks and
+#: occupies 2.03 MiB on an 8 MiB object and on a 64 MiB object alike, while a
+#: full read of the same 64 MiB object occupies 80 MiB. An occupancy bound would
+#: admit the first and still refuse the second, which is what D18's admission
+#: class is shaped like and what this cap is a crude stand-in for.
 MAX_OBJECT_BYTES = 512 * 1024 * 1024
-#: Any tier CALL slower than this is a miss -- the whole command, not each
-#: socket read of its reply.
+#: Any tier COMMAND slower than this is a miss -- and that is now what the code
+#: does, which it did not used to be.
 #:
-#: That distinction is the guarantee. This value also reaches redis-py as
-#: socket_timeout, which CPython applies per recv(): it bounds the gap between
-#: instalments of a reply, not the reply. A tier that answers promptly and then
-#: dribbles never has a single gap long enough to trip it, so an 8 MiB warm read
-#: through a 1 MB/s tier was served FROM the tier in 9.9 s with no counter
-#: moving -- 6.8x slower than the same read with no cache at all. The JVM path
-#: bounds the whole command (orTimeout) and degraded correctly on the identical
-#: read, so "never slower than no cache" was true on one client and false on the
-#: other. A guarantee is only as strong as its weakest client.
+#: Reached as redis-py's socket_timeout, this bounded each recv() rather than
+#: the command, and redis-py reads a large reply in many recvs. Measured: an
+#: 8 MiB warm read through a tier throttled to 1 MB/s -- about 8 seconds -- was
+#: served from the tier with tier_failures=0 and degraded=0, because no single
+#: recv ever waited 50 ms. The JVM degraded on the identical read, its budget
+#: being orTimeout() over the whole command, so D12.9's "never slower than no
+#: cache" held on one path only. conn.bounded_client closes that: the same read
+#: now degrades on both, and tools/narrow_tier.py + budget_suite.py hold it
+#: there.
 #:
-#: socket_timeout is KEPT as well, and is not redundant: it is what makes a
-#: stalled read terminate at all, so the worker below can never outlive the
-#: process.
+#: The operational consequence is worth knowing before tuning this. Bounding
+#: the command means a warm read whose reply is R bytes needs R/budget of tier
+#: bandwidth or it degrades to the origin. Large sequential reads fetch up to
+#: ~8 MiB per mget (measured), so they need ~1.3 Gbit/s of effective tier
+#: throughput to stay cached at 50 ms. That is the guarantee working -- below
+#: that the tier really is slower than S3 for those reads (D17) -- but it means
+#: this number and the read size set a bandwidth floor together, not alone.
 TIER_BUDGET_S = 0.05
 META_TTL_S = 60
 
@@ -122,63 +188,41 @@ class FlintTier:
         self._lock = threading.Lock()
 
     # ---------------------------------------------------------------- tier
-    #: One pool for every tier call in the process. Shared rather than
-    #: per-instance because fsspec hands out many filesystems and a pool each
-    #: would be thousands of threads. When it saturates, submit() queues and the
-    #: caller's own budget still expires -- which degrades to the origin, the
-    #: correct answer for a tier too slow to keep up.
-    _POOL = None
-    _POOL_LOCK = threading.Lock()
-
-    @classmethod
-    def _pool(cls):
-        if cls._POOL is None:
-            with cls._POOL_LOCK:
-                if cls._POOL is None:
-                    cls._POOL = ThreadPoolExecutor(
-                        max_workers=32, thread_name_prefix="flint-tier")
-        return cls._POOL
-
     def _guard(self, fn, *a, **kw):
         """Any tier failure is a miss, never an error, and any tier call slower
-        than the budget is a failure.
+        than the budget is a miss too.
 
         S3 is authoritative and always reachable, so every tier interaction is
         an OPTIMISATION and has to be written as one. The JVM version learned
         this the hard way: a dead tier made the client HANG rather than fail,
         because the driver queued commands while disconnected.
 
-        The call runs on a worker so the BUDGET BOUNDS THE COMMAND. redis-py's
-        socket_timeout cannot: CPython applies it per recv(), so it bounds the
-        gap between instalments of a reply rather than the reply, and a tier
-        that answers promptly and then dribbles slips straight through it. This
-        mirrors the JVM's orTimeout(), including its limitation -- neither can
-        cancel the I/O already in flight, so the worker is abandoned rather than
-        killed. It always finishes, because socket_timeout still bounds each of
-        its reads, and the connection returns to the pool intact.
+        The BUDGET BOUNDS THE COMMAND, and it is conn.DeadlineSocket that makes
+        that true -- redis-py's socket_timeout alone cannot, since CPython
+        applies it per recv() and a tier that answers promptly then dribbles
+        never has a single gap long enough to trip it. The call itself stays
+        synchronous: bounding the actual I/O stops the doomed transfer, where
+        abandoning the call on a worker would leave it pulling the whole reply
+        and go on loading a tier that is slow BECAUSE it is loaded.
+
+        Slow and broken are counted APART, and this used to conflate them: a
+        tier that was merely too slow incremented `tier_failures`, which is the
+        same mistake the oversize counter exists to avoid -- "not cached
+        because too large" and "not cached because something broke" must not
+        look alike, and neither must "too slow" and "broke".
+
+        A timeout increments nothing HERE on purpose. The two counters sit at
+        different levels: `tier_failures` is per CALL, `degraded` is per READ,
+        and one degraded read may contain several failed calls. The read path
+        already counts `degraded` whenever the tier did not answer -- which is
+        where the JVM counts it too, on the passthrough -- so counting a
+        timeout here as well would count one event twice at two levels. A
+        broken tier still lands in `tier_failures` via the clause below; what
+        this clause removes is a slow tier being reported as a broken one.
         """
-        pool = type(self)._pool()
         try:
-            fut = pool.submit(fn, *a, **kw)
-        except RuntimeError:                     # interpreter shutting down
-            return None
-        try:
-            return fut.result(timeout=self.budget_s)
-        except _FutureTimeout:
-            # Budget exceeded, not an error: the tier is up and answering, just
-            # too slowly to be worth waiting for.
-            #
-            # COUNTS NOTHING HERE, deliberately. tier_failures is per CALL and
-            # degraded is per READ, and the read path already increments
-            # degraded when this returns None -- the same place the JVM counts
-            # it, on the passthrough. Counting the timeout here as well records
-            # ONE event at two levels: the first version of this returned
-            # "degraded=2" for a single timed-out mget and read as two.
-            #
-            # It is the composition that was wrong, not either half. Separating
-            # slow from broken is right; doing it in the guard put the
-            # distinction one level above where the existing counter already
-            # made it. Returning None IS the signal.
+            return fn(*a, **kw)
+        except redis_lib.TimeoutError:
             return None
         except Exception:
             self.c.tier_failures += 1

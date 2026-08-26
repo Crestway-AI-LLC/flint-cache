@@ -1,9 +1,23 @@
 # BUG-0044: the disk guard samples on a fixed clock, so a fast writer outruns it
 
-Status: OPEN, found 2026-08-24 · Severity: medium-high — the guard exists to
-stop a seat filling its volume, and at NVMe write rates the volume can cross
-the whole remaining headroom between two samples. A FIX ALREADY EXISTS, on an
-unmerged branch (see below), which is the unusual part of this report.
+Status: FIXED 2026-08-24, `f4aaad6` + `de92e2f`; the audit it grew into CLOSED
+2026-08-25 · Severity was medium-high — the guard exists to stop a seat filling
+its volume, and at NVMe write rates the volume can cross the whole remaining
+headroom between two samples.
+
+The disk guard now sizes its interval against headroom with a 50 ms floor
+(`MIN_SAMPLE`, `shed_floor_bytes` in `flint-server/src/diskguard.rs`), and
+`disk_selffill` runs in CORE to hold it there.
+
+**This report outgrew its own title, and the larger finding is the one to
+read.** The fix existed on an unmerged branch, which turned the question from
+"how do we fix this" into "what else is stranded there" — nineteen commits, ten
+of them never landed. Auditing those against main's CODE rather than its commit
+subjects is what the rest of this file records, and the ratio is the argument
+for having done it: **one in ten was missing in the way its subject line
+implied.** Two were confirmed live and became BUG-0045 and BUG-0046, one was
+already fixed by a different route, one was superseded, one did not apply, and
+the rest were coverage gaps rather than defects. All ten are now resolved.
 
 ## The defect
 
@@ -262,7 +276,11 @@ registered drills as unlisted, one per line of CORE.
   goes through `SCAN`), and the box was contended by a sibling project's
   stress run — `fleet_guard` refused, correctly. Same treatment applies to
   `coproc_vec_tls_drill.sh`, which hardcodes 8 in the same shape.
-- `ingest_saturation` and `replica_starvation` — real coverage main lacks.
+- ~~`ingest_saturation` and `replica_starvation` — real coverage main lacks.~~
+  **CLOSED 2026-08-25.** Both landed and are in CORE. Each reproduces on a
+  laptop, in seconds, a failure that previously cost a fleet run to observe:
+  the write-amplification meter that read ~4x high, and the master reporting
+  `seq_lag: none` while the backpressure meant to prevent it did not fire.
 - ~~`coproc_family` and `proxy_chain` — run them, then register or delete.~~
   **CLOSED 2026-08-24: both PASS, both now in CORE.** Neither was broken; each
   had simply never been run. `coproc_family` passes end to end (flintctl spawns

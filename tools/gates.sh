@@ -193,7 +193,7 @@ CORE="${FLINT_CORE_ORDER:-restart repl failover proxy slot_migrate slot_map reba
       bloom ns_escape coproc_cred coproc_channel coproc_family family_route family_route_cp coproc_forward coproc_budget coproc_exempt coproc_vec coproc_vec_tls coproc_vec_rebuild
       tenant_quota token_rotation cert_reload_fleet controlplane_ha
       decommission config_file federation_plumbing disk_pressure disk_selffill ingest_saturation ctl_error
-      client_compat proxy_registry reseed lag_cap widowed_grace replica_starvation controller
+      client_compat proxy_registry reseed lag_cap widowed_grace replica_starvation managed_slow_sync controller
       promote_notice fleet_guard ctl_cpha upgrade anti_affinity attached_chaos
       async_flag async_writes txn_failure backup restore_ns backup_schedule
       backup_seat gc_sweep keystat start_guard seat_log cold_start_roles
@@ -1549,22 +1549,34 @@ if want conformance; then
   #
   # So speak to the port ONLY while our own pid still holds it. If our pid is
   # gone, whatever is answering there belongs to somebody else.
-  conf_stop() {   # conf_stop <port> <pidfile>
+  conf_stop() {   # conf_stop <port> <pidfile> <valkey|flint>
+    #
+    # The KIND is passed, not inferred from the port. Inferring it means a
+    # literal port number in a case arm, which stops matching the day the
+    # block moves — and it moved once already today, 6397-6399 to 6388-6390.
+    # A caller that knows what it started says so.
     local _p _t
     _p=$(cat "$2" 2>/dev/null)
     case "$_p" in ''|*[!0-9]*) return 0 ;; esac
     kill -0 "$_p" 2>/dev/null || return 0
-    # Graceful first: rocks wants a clean close, and SHUTDOWN gives it one.
-    valkey-cli -p "$1" SHUTDOWN NOSAVE >/dev/null 2>&1
+    # SHUTDOWN only reaches the VALKEY oracle: flint-server does not implement
+    # it, so sending it there is an error swallowed by the redirect — a no-op
+    # that reads as a graceful close and then costs the full 5 s wait below
+    # before the SIGKILL that actually does the work. TERM is what flint-server
+    # answers to, and it closes rocks cleanly.
+    case "$3" in
+      valkey) valkey-cli -p "$1" SHUTDOWN NOSAVE >/dev/null 2>&1 ;;
+      *)      kill -TERM "$_p" 2>/dev/null ;;
+    esac
     _t=$(( $(date +%s) + 5 ))
     while kill -0 "$_p" 2>/dev/null; do
       [ "$(date +%s)" -ge "$_t" ] && { kill -9 "$_p" 2>/dev/null; break; }
       sleep 0.05
     done
   }
-  conf_stop 6390 "$CDIR/oracle.pid"
-  conf_stop 6389 "$CDIR/mem.pid"
-  conf_stop 6388 "$CDIR/rocks.pid"
+  conf_stop 6390 "$CDIR/oracle.pid" valkey
+  conf_stop 6389 "$CDIR/mem.pid" flint
+  conf_stop 6388 "$CDIR/rocks.pid" flint
   # Belt and braces: SHUTDOWN is a request, and a wedged process would
   # otherwise be inherited by the drills as a foreign fleet. Scoped to this
   # block's own fleet, which fleet_init declared at the top.
