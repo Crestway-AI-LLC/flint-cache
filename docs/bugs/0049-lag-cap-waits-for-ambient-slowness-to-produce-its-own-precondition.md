@@ -1,6 +1,10 @@
 # BUG-0049: `lag_cap` waits for ambient slowness to produce its own precondition
 
-Status: OPEN, found 2026-08-26 · Severity: LOW as a product matter, MEDIUM as a
+Status: FIXED 2026-08-26 in `fcc0028` — `--stall-replica-ms 200` added to the
+drill's flint-chaos invocation, so the lag is forced rather than awaited.
+Verified on the gate box (16 vCPU Linux): `PASS lag_cap (15.6s)`, shedding 70
+writes at the 5 ms cap where the old form shed 0 and correctly refused to pass.
+· Severity was: LOW as a product matter, MEDIUM as a
 gate matter — nothing is wrong with the product, and the drill is behaving
 honestly. But it reds main at random, and a gate that fails for reasons
 unrelated to the change under test is the thing this repo has spent the week

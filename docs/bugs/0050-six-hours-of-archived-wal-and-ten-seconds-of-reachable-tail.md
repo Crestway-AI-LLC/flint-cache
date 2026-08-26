@@ -3,7 +3,14 @@
 *(filename says "six hours of archived WAL and ten seconds of reachable tail" —
 that was the first framing, refuted the same day. Kept so links survive.)*
 
-Status: OPEN, mechanism CONFIRMED and reproduced deterministically
+Status: FIXED 2026-08-26 in `fcc0028`. Both halves landed: the read side serves
+an archived-but-covering batch instead of raising `WalGap`, and the cause side
+snaps an interior cursor forward to its batch end. Six tests in
+`repl::bug_0050_iterator_shape` and `repl::tests`, all confirmed to execute
+under `--features rocksdb` (155 storage tests, 0 failed), plus `PASS repl`,
+`PASS reseed` and `PASS chaos` on the gate box.
+
+Was: OPEN, mechanism CONFIRMED and reproduced deterministically
 2026-08-26 · Severity: HIGH on a live fleet — **18 WALGAP re-seeds** on the
 playground pair (10 on :7001, 8 on :7002), each costing single-copy exposure
 for the length of a re-seed. Not a retention defect. Retention has been raised
