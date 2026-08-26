@@ -1511,7 +1511,7 @@ if want conformance; then
       >"$LOGS/conf-rocks.log" 2>&1 & echo $! >"$CDIR/rocks.pid" )
   for p in 6390 6389 6388; do
     for _ in $(seq 1 100); do
-      [ "$(valkey-cli -p $p PING 2>/dev/null)" = "PONG" ] && break
+      fleet_ready "$p" && break
       sleep 0.1
     done
   done

@@ -453,6 +453,28 @@ fleet_wait_alive() {
   done
 }
 
+# READY, AS A PREDICATE. Returns 0/1 and prints nothing, so a caller can keep
+# its own loop, its own budget and its own failure message — which is why the
+# drills that needed this were each spelling readiness by hand instead.
+#
+# PONG stopped meaning ready at #176: a node binds and answers PING from inside
+# its load, deliberately, so a client can tell "starting" from "absent". Four
+# drills reddened main one at a time on four different spellings of the same
+# mistake — PONG alone, a bind, a non-empty field, a fixed sleep — and each was
+# fixed where it was seen rather than where it lives.
+#
+# SAFE AGAINST A NON-FLINT SERVER, which is what makes one predicate enough.
+# FLINTINFO to valkey, or to anything that does not implement it, errors and
+# prints nothing; nothing contains no `loading:1`, so the answer is "ready" —
+# correct, because a server with no loading state is ready as soon as it
+# answers. Callers therefore do not have to know whether the port belongs to a
+# node, a control plane, a proxy or the conformance oracle.
+fleet_ready() {
+  local port="$1"; shift
+  [ "$(valkey-cli -p "$port" "$@" PING 2>/dev/null)" = "PONG" ] &&
+    ! valkey-cli -p "$port" "$@" FLINTINFO 2>/dev/null | tr -d '\r' | grep -qx 'loading:1'
+}
+
 fleet_wait_ping() {
   # PONG ALONE STOPPED MEANING READY, SO THIS CHECKS BOTH.
   #
@@ -476,9 +498,9 @@ fleet_wait_ping() {
   local port="$1"; shift
   local deadline=$(( $(date +%s) + 30 ))
   while :; do
-    if [ "$(valkey-cli -p "$port" "$@" PING 2>/dev/null)" = "PONG" ] &&
-       ! valkey-cli -p "$port" "$@" FLINTINFO 2>/dev/null | tr -d '\r' |
-         grep -qx 'loading:1'; then
+    # ONE DEFINITION OF READY, shared with fleet_ready above. Two copies of a
+    # predicate is how the drills drifted apart in the first place.
+    if fleet_ready "$port" "$@"; then
       return 0
     fi
     if [ "$(date +%s)" -ge "$deadline" ]; then

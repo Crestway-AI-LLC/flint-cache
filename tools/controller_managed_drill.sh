@@ -40,10 +40,10 @@ echo "== start the managed controller (it bootstraps the pair itself)"
   --poll-ms 150 --confirm 3 2>$FLINT_DRILL_ROOT/flint-mng.log &
 # Wait for the controller to bootstrap master + replica.
 for i in $(seq 1 60); do
-  [ "$(valkey-cli -p $P1 PING 2>/dev/null)" = "PONG" ] && [ "$(valkey-cli -p $P2 PING 2>/dev/null)" = "PONG" ] && break
+  fleet_ready $P1 && fleet_ready $P2 && break
   sleep 0.2
 done
-[ "$(valkey-cli -p $P1 PING 2>/dev/null)" = "PONG" ] || { echo "FAIL: controller never bootstrapped"; cat $FLINT_DRILL_ROOT/flint-mng.log; exit 1; }
+fleet_ready $P1 || { echo "FAIL: controller never bootstrapped a READY master"; cat $FLINT_DRILL_ROOT/flint-mng.log; exit 1; }
 echo "pair bootstrapped by the controller"
 
 master_port() {

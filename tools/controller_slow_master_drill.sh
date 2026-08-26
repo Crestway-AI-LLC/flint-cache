@@ -43,10 +43,10 @@ echo "== start managed controller (--slow-promote-ms 2000)"
   --poll-ms 150 --confirm 3 --slow-promote-ms 2000 --max-stale-ms 8000 \
   2>$FLINT_DRILL_ROOT/flint-slow.log &
 for i in $(seq 1 60); do
-  [ "$(valkey-cli -p $P1 PING 2>/dev/null)" = "PONG" ] && [ "$(valkey-cli -p $P2 PING 2>/dev/null)" = "PONG" ] && break
+  fleet_ready $P1 && fleet_ready $P2 && break
   sleep 0.2
 done
-[ "$(valkey-cli -p $P1 PING 2>/dev/null)" = "PONG" ] || { echo "FAIL: controller never bootstrapped"; cat $FLINT_DRILL_ROOT/flint-slow.log; exit 1; }
+fleet_ready $P1 || { echo "FAIL: controller never bootstrapped a READY master"; cat $FLINT_DRILL_ROOT/flint-slow.log; exit 1; }
 
 master_port() {
   for p in $P1 $P2; do
