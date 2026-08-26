@@ -449,7 +449,36 @@ for J in $JOBS; do
 
   sleep "$SETTLE"
   LOG="$DIR/LOG"
-  WAMP=$(awk '/^ Sum/{w=$17} END{print w+0}' "$LOG" 2>/dev/null)
+  # W-AMP IS FOUND BY NAME, NOT BY POSITION, and the reason is a correction.
+  #
+  # This read $17 for months. It is not W-Amp. RocksDB prints the Size column
+  # as a value and a unit separated by a SPACE -- "5.25 GB" -- so awk sees two
+  # fields where the header has one name, and every column after Size is offset
+  # by one. $17 is CompMergeCPU(sec); the real W-Amp is $13.
+  #
+  # Every amplification figure this script has ever produced was therefore
+  # compaction merge CPU seconds. They looked right, which is why it survived:
+  # 5.0 at 800 MB, 61 at 6.4 GB -- plausible amplifications, and equally
+  # plausible CPU times. It took a 96 GB run reporting 1822 to make it
+  # impossible: that would be 175 TB written in 45 minutes, about 65 GB/s.
+  # A number is not validated by being unsurprising.
+  #
+  # So the column is now located from the HEADER on every read. That survives
+  # a RocksDB version adding, removing or reordering columns, which a fixed
+  # index cannot -- and this file has no way to notice when it stops being
+  # right, because the wrong column also holds a believable number.
+  WAMP=$(awk '
+    /^Level .*W-Amp/ {
+      # The header names one column per token, but the Sum ROW splits Size into
+      # value+unit, so every field at or past Size shifts right by one.
+      for (i = 1; i <= NF; i++) {
+        if ($i == "W-Amp") wcol = i + 1
+        }
+      next
+    }
+    /^ *Sum/ && wcol { w = $wcol }
+    END { print w + 0 }
+  ' "$LOG" 2>/dev/null)
   STALLPCT=$(grep -E '^Cumulative stall:' "$LOG" 2>/dev/null | tail -1 \
              | sed -n 's/.*, \([0-9.]*\) percent.*/\1/p')
   PHYS=$(du -sk "$DIR" | awk '{print $1 / 1024}')

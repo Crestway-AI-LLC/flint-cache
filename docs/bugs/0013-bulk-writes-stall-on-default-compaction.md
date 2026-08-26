@@ -445,17 +445,23 @@ swept on 2026-08-17 and the result inverts the intuition.** On an i4i.2xlarge
 with the seat pinned to two cores, five sweeps of ~760 MB of incompressible
 10 KB values into an 8 MB level base:
 
-| jobs | mean MB/s (n=5) | W-Amp |
+| jobs | mean MB/s (n=5) | CompMergeCPU(s) |
 |---|---|---|
 | default | 221.9 | 3.85 |
 | 2 (explicit) | 215.1 | 3.83 |
 | 4 | 198.1 | 5.26 |
 | 6 | 199.1 | 4.90 |
 
-Pooled: **218.5 -> 198.6 MB/s, -9.1%**, against a 3.1% error bar. Write
-amplification is the cleaner signal — **3.84 -> 5.08, +32%, with no overlap.**
-More parallel compaction does more total rewriting and bills it to the cores
-the write path needs.
+Pooled: **218.5 -> 198.6 MB/s, -9.1%**, against a 3.1% error bar. Compaction
+CPU is the cleaner signal — **3.84 s -> 5.08 s, +32%, with no overlap.** More
+parallel compaction spends more CPU merging and bills it to the cores the write
+path needs.
+
+**That second column was labelled W-Amp until 2026-08-26**; see the correction
+below. It is compaction merge CPU, which happens to support the same
+conclusion — the mechanism here was always contention for cores, and CPU
+seconds are if anything the more direct evidence for it than amplification
+would have been. The conclusion is unchanged; the label was wrong.
 
 **Both results stand and they do not conflict.** That sweep was a 2-core seat
 with an 8 MB level base; this bug is a 16-vCPU box building a 60 GB LSM. On a
@@ -497,27 +503,72 @@ different regimes, and only one of them recorded which.
 So what remains is the measurement itself: a large LSM on a box with cores to
 spare, one sweep of the job count, with the shape recorded beside every column.
 
+## 2026-08-26 (later) — CORRECTION: every "W-Amp" in this file is compaction CPU
+
+**`ingest_decay_sweep.sh` was reading the wrong column, and had been for
+months.** It took field 17 of RocksDB's `Sum` row. RocksDB prints the Size
+column as a value and a unit separated by a SPACE — `5.25 GB` — so awk sees two
+fields where the header has one name, and every column at or past Size is
+offset by one. Field 17 is **`CompMergeCPU(sec)`**. The real W-Amp is field 13.
+
+So every amplification figure in this file, and in the 2026-08-17 sweep it
+cites, is **compaction merge CPU seconds**. The tables above are relabelled;
+the numbers themselves are unchanged and still real, they simply measure
+something else.
+
+**Why it survived.** The values looked right. 5.0 at 800 MB and 61 at 6.4 GB
+are plausible write amplifications AND plausible CPU times, and the two scale
+together because both grow with how much compaction ran. It even survived a
+deliberate check: 4.99 here against 5.08 from an independent run a week
+earlier was cited as evidence the extraction was sound. It was sound — stable,
+repeatable, and measuring a quantity nobody had asked for.
+
+Worse, the wrong number got an explanation. This file said W-Amp "grows with
+how much compaction actually ran", which is a true sentence about CompMergeCPU
+and a strange one about amplification. **A misread number that gets
+rationalised is harder to find than one that looks absurd**, because the
+rationalisation removes the surprise that would have exposed it.
+
+What exposed it was a 96 GB run reporting **1822**. As amplification that is
+175 TB written in 45 minutes, about 65 GB/s — impossible on the hardware, and
+therefore impossible to explain away. The instrument only became falsifiable
+at a scale where its error stopped being plausible.
+
+**Fixed by locating the column from the HEADER on every read**, not by index,
+so a RocksDB version that adds or reorders columns cannot silently repeat this.
+Controlled against the real `Sum` row: the new extractor returns 9.1 where the
+old one returned 59.60.
+
+**What this does and does not change.** Mean, first, last, decay, stall and
+phys were never affected — they come from the drill's own timing and from
+`ns_bytes`, not from that table — so the 2.7x throughput finding and the
+stall collapse stand. What is now unmeasured is true write amplification at
+every scale, including the claim that the winning configuration achieved its
+throughput at *lower amplification*. That claim is withdrawn pending a re-run;
+what the data supports is lower compaction CPU, which is related and not the
+same.
+
 ## 2026-08-26 — measured. Both knobs, together, and the first attempt measured nothing
 
 The measurement this file has been asking for since 2026-08-17. Seat pinned to
 2 cores on an i4i.2xlarge, 6.4 GB logical (640 k x 10 kB), 8 intervals, shape
 recorded beside every column.
 
-| level base | bg_jobs | mean MB/s | last MB/s | decay | W-Amp | stall |
+| level base | bg_jobs | mean MB/s | last MB/s | decay | CompMergeCPU(s) | stall |
 |---|---|---|---|---|---|---|
 | 8 MB  | default (2) | 82.4 | 72.3 | 59% | 61.4 | 58.3% |
 | 8 MB  | 4 | 108.4 | 92.3 | 49% | 70.6 | 31.1% |
 | 64 MB | default (2) | 145.5 | 83.7 | 76% | 38.3 | 38.3% |
 | **64 MB** | **4** | **224.3** | **176.0** | 50% | 43.4 | **2.0%** |
 
-**2.7x the mean ingest rate, stalls from 58% to 2%, at LOWER write
-amplification than the baseline (43.4 vs 61.4).** Physical bytes are ~12.3 GB
+**2.7x the mean ingest rate, stalls from 58% to 2%, at LOWER compaction CPU
+than the baseline (43.4 s vs 61.4 s).** Physical bytes are ~12.3 GB
 in all four runs, so this is not throughput bought with disk.
 
 **Both knobs are needed and they interact.** The hypothesis at the top of this
 file names `max_background_jobs = 2` as the binding default, and that is
 confirmed — but it is not the whole answer. Raising jobs alone (8 MB row 2)
-reaches 108 MB/s and makes W-Amp WORSE. Raising the level base alone (64 MB
+reaches 108 MB/s and makes compaction CPU WORSE. Raising the level base alone (64 MB
 row 1) reaches 145 MB/s and still stalls 38% of the time. Only together do
 stalls collapse. The file's own note that `write_buffer_size` was untested was
 the more important half.
@@ -564,8 +615,7 @@ before an instance is spent. Full write-up in the ops field notes, section 1.
 
 - **Production is ~96 GB, not 6.4 GB.** 15x more data on the same 2-core seat
   means more depth than measured here. The direction should hold; the magnitude
-  is unverified, and W-Amp in particular grows with how much compaction
-  actually ran (it is ~5 at 800 MB and ~61 at 6.4 GB on the same 8 MB base).
+  is unverified.
 - **This is not a defaults decision.** A 32 MB write buffer is a per-engine
   memory commitment, and this measured one seat size at one dataset size. What
   the numbers license is a proposal, not a merge.
