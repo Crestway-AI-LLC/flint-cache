@@ -38,6 +38,7 @@ pub mod eviction;
 pub mod repl;
 #[cfg(feature = "rocksdb")]
 pub mod rocks;
+pub mod s3fifo;
 
 use std::collections::BTreeMap;
 use std::ops::Bound;
