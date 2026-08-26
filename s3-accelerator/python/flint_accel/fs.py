@@ -21,9 +21,9 @@ own credentials exactly as ADR-0023 D1 requires.
 from __future__ import annotations
 
 import fsspec
-import redis as redis_lib
 from s3fs import S3FileSystem, S3File
 
+from .conn import bounded_client
 from .tier import (FlintTier, CHUNK, TIER_BUDGET_S, META_TTL_S,
                    MAX_OBJECT_BYTES, BLOCK_BYTES)
 
@@ -119,16 +119,16 @@ class FlintS3FileSystem(S3FileSystem):
                 kw.setdefault(k, v)
 
         # fsspec's block cache decides how much s3fs drags from the origin to
-        # serve a read, and this default is a TRADE, not a tuning win. Smaller
-        # blocks cut read amplification and raise warm-path tier round trips;
-        # the two move monotonically against each other, so there is no free
-        # point. BLOCK_BYTES carries the measured table and the chosen value.
+        # serve a read, and this default is a TRADE. Smaller blocks cut read
+        # amplification and raise warm-path tier round trips AND warm-path tier
+        # bytes -- four axes, measured, in BLOCK_BYTES.
         #
         # It was briefly set to the chunk size on the strength of the
         # amplification number alone -- 31x down to 2.0x -- which looked free
         # because every axis instrumented at the time lived on the S3 side of
-        # the cache. The cost was on the tier side, unmeasured: 8 MiB walked in
-        # 4 KiB reads went from 3 round trips to 122.
+        # the cache. The cost was on the tier side, unmeasured: 64 MiB walked in
+        # 4 KiB reads costs 964 tier round trips at 64 KiB against 253 at
+        # 256 KiB, and moves 1.88x the bytes asked against 1.23x.
         #
         # setdefault, so an explicit argument still wins and so does anything
         # install() was handed.
@@ -155,9 +155,11 @@ class FlintS3FileSystem(S3FileSystem):
 
     def _flint_tier(self, origin):
         if self._redis is None:
-            self._redis = redis_lib.Redis.from_url(
-                self._tier_uri, socket_timeout=self._budget,
-                socket_connect_timeout=self._budget)
+            # NOT Redis.from_url(socket_timeout=...): that budget is applied
+            # per recv(), so a large reply gets a fresh one per instalment and
+            # the command is unbounded. bounded_client bounds the command, the
+            # way the JVM's orTimeout does. See conn.py.
+            self._redis = bounded_client(self._tier_uri, self._budget)
         if self._tier_obj is None:
             self._tier_obj = FlintTier(self._redis, origin, chunk=self._chunk,
                                        budget_s=self._budget,

@@ -18,8 +18,8 @@ from __future__ import annotations
 import threading
 import time
 import zlib
-import threading
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as _FutureTimeout
+
+import redis as redis_lib
 
 CHUNK = 64 * 1024
 #: What fsspec's block cache fetches per miss. NOT the chunk size, and not
@@ -188,54 +188,41 @@ class FlintTier:
         self._lock = threading.Lock()
 
     # ---------------------------------------------------------------- tier
-    #: One pool for every tier call in the process. Shared rather than
-    #: per-instance because fsspec hands out many filesystems and a pool each
-    #: would be thousands of threads. When it saturates, submit() queues and the
-    #: caller's own budget still expires -- which degrades to the origin, the
-    #: correct answer for a tier too slow to keep up.
-    _POOL = None
-    _POOL_LOCK = threading.Lock()
-
-    @classmethod
-    def _pool(cls):
-        if cls._POOL is None:
-            with cls._POOL_LOCK:
-                if cls._POOL is None:
-                    cls._POOL = ThreadPoolExecutor(
-                        max_workers=32, thread_name_prefix="flint-tier")
-        return cls._POOL
-
     def _guard(self, fn, *a, **kw):
         """Any tier failure is a miss, never an error, and any tier call slower
-        than the budget is a failure.
+        than the budget is a miss too.
 
         S3 is authoritative and always reachable, so every tier interaction is
         an OPTIMISATION and has to be written as one. The JVM version learned
         this the hard way: a dead tier made the client HANG rather than fail,
         because the driver queued commands while disconnected.
 
-        The call runs on a worker so the BUDGET BOUNDS THE COMMAND. redis-py's
-        socket_timeout cannot: CPython applies it per recv(), so it bounds the
-        gap between instalments of a reply rather than the reply, and a tier
-        that answers promptly and then dribbles slips straight through it. This
-        mirrors the JVM's orTimeout(), including its limitation -- neither can
-        cancel the I/O already in flight, so the worker is abandoned rather than
-        killed. It always finishes, because socket_timeout still bounds each of
-        its reads, and the connection returns to the pool intact.
+        The BUDGET BOUNDS THE COMMAND, and it is conn.DeadlineSocket that makes
+        that true -- redis-py's socket_timeout alone cannot, since CPython
+        applies it per recv() and a tier that answers promptly then dribbles
+        never has a single gap long enough to trip it. The call itself stays
+        synchronous: bounding the actual I/O stops the doomed transfer, where
+        abandoning the call on a worker would leave it pulling the whole reply
+        and go on loading a tier that is slow BECAUSE it is loaded.
+
+        Slow and broken are counted APART, and this used to conflate them: a
+        tier that was merely too slow incremented `tier_failures`, which is the
+        same mistake the oversize counter exists to avoid -- "not cached
+        because too large" and "not cached because something broke" must not
+        look alike, and neither must "too slow" and "broke".
+
+        A timeout increments nothing HERE on purpose. The two counters sit at
+        different levels: `tier_failures` is per CALL, `degraded` is per READ,
+        and one degraded read may contain several failed calls. The read path
+        already counts `degraded` whenever the tier did not answer -- which is
+        where the JVM counts it too, on the passthrough -- so counting a
+        timeout here as well would count one event twice at two levels. A
+        broken tier still lands in `tier_failures` via the clause below; what
+        this clause removes is a slow tier being reported as a broken one.
         """
-        pool = type(self)._pool()
         try:
-            fut = pool.submit(fn, *a, **kw)
-        except RuntimeError:                     # interpreter shutting down
-            return None
-        try:
-            return fut.result(timeout=self.budget_s)
-        except _FutureTimeout:
-            # Budget exceeded, not an error: the tier is up and answering, just
-            # too slowly to be worth waiting for. Counted as degraded, which is
-            # what the JVM calls the same condition, so one number means one
-            # thing across both clients.
-            self.c.degraded += 1
+            return fn(*a, **kw)
+        except redis_lib.TimeoutError:
             return None
         except Exception:
             self.c.tier_failures += 1
