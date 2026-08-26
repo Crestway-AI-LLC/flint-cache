@@ -402,3 +402,42 @@ the write; ours says why.
   serve are covered by first-class commands instead; if you need one of
   these, open an issue describing the workload — patterns with broad
   demand get first-class implementations.
+
+## Introspection and admin commands are absent
+
+`INFO`, `CONFIG` and `SHUTDOWN` are not implemented, by any component. They
+answer `ERR unknown command`, the same as `KEYS`:
+
+    PING             -> PONG
+    INFO             -> ERR unknown command 'INFO'
+    INFO server      -> ERR unknown command 'INFO SERVER'
+    CONFIG RESETSTAT -> ERR unknown command 'CONFIG RESETSTAT'
+    SHUTDOWN NOSAVE  -> ERR unknown command 'SHUTDOWN NOSAVE'
+
+Use **`FLINTINFO`** where you would reach for `INFO`. It is a flat
+`field:value` list covering what a client or an operator actually needs from a
+seat — `role`, `loading`, `role_epoch`, `build`, `sst_bytes`, `latest_seq`,
+`last_applied`, `acked_seq`, `seq_lag`, and the WAL-headroom fields ADR-0022's
+shedding is driven by. In particular `loading:1` is how you tell a seat that
+has BOUND from a seat that is READY: a node answers `PING` with `PONG` while
+still loading, so `PONG` alone is not readiness.
+
+There is no substitute for `CONFIG` or `SHUTDOWN`. Stop a seat with a signal,
+or through `flintctl`, which is the supported path.
+
+### The trap: `NO_KEY` is a routing table, not a dispatch table
+
+Both `flint-server` and `flint-proxy` carry a `NO_KEY` list that includes
+`INFO`, `COMMAND`, `CLUSTER`, `SELECT`, `HELLO` and others. **It answers one
+question only: can a routing slot be derived from argument 1.** It says nothing
+about whether any component implements the command.
+
+Reading `INFO` in the proxy's `NO_KEY` list and concluding the proxy handles it
+is a natural inference and a wrong one. A keyless command is *forwarded* — to
+pair 0's master — which then returns the same `ERR unknown command`. So these
+commands fail identically through the proxy as against a bare seat.
+
+If you are deciding whether Flint implements something, the list to consult is
+**Supported** above, or simply send it to a server and read the reply. Someone
+reached the opposite conclusion from `NO_KEY` while holding an open connection
+to a seat that would have answered the question in one round trip.
