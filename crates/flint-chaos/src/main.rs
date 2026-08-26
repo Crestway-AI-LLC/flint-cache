@@ -242,6 +242,14 @@ fn main() {
         }
     };
     println!("  pairs under test: {}", targets.len());
+    // Before a single write: this oracle cannot mean anything against a
+    // namespace that is allowed to evict. See Target::refuse_if_evictable.
+    for t in &targets {
+        if let Err(e) = t.refuse_if_evictable() {
+            eprintln!("{e}");
+            std::process::exit(2);
+        }
+    }
     // The workload runs on its own thread and does not stop for kills —
     // that is the entire point (#118 item 1): with the writer parked at the
     // moment a master dies, the unreplicated suffix is empty and the RPO

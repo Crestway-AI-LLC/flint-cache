@@ -456,6 +456,64 @@ impl Target {
         }
     }
 
+    /// REFUSE to run against a fleet where a namespace may evict.
+    ///
+    /// ADR-0013 rejected server-side eviction partly because it "breaks the
+    /// chaos ledger oracle", and that objection was exactly right. The oracle
+    /// asserts no acked write is lost; eviction deletes acked writes on
+    /// purpose. Run against an evictable namespace it can only produce one of
+    /// two useless answers: a phantom data-loss report, or — far worse — a
+    /// REAL loss waved through as licensed. The second is worse because the
+    /// oracle is the thing that would otherwise have caught it.
+    ///
+    /// Every chaos run today is safe because no drill declares one. That was an
+    /// UNWRITTEN assumption, which is the kind that survives until someone adds
+    /// a flag for an unrelated reason. It is checked now, at run time, against
+    /// what the SEAT actually reports — so it holds however the namespace was
+    /// declared: `--evictable-ns`, FLINTCONFIG at runtime, or an inventory
+    /// line. A grep over drill scripts would have caught only the first.
+    ///
+    /// Refusal rather than a warning, on the same reasoning as the disk
+    /// guard's host asserts: a warning in a log is how a number from the wrong
+    /// configuration ends up in a durability claim.
+    pub fn refuse_if_evictable(&self) -> Result<(), String> {
+        let tls = self.tls();
+        let endpoints = self.endpoints();
+        let mut answered = 0usize;
+        for addr in &endpoints {
+            let Ok(mut c) = Client::connect_addr(addr, &tls) else {
+                continue;
+            };
+            let Ok(Value::Bulk(Some(raw))) = c.call(&[b"FLINTINFO"]) else {
+                continue;
+            };
+            answered += 1;
+            for line in String::from_utf8_lossy(&raw).lines() {
+                if let Some(v) = line.strip_prefix("evictable_ns:")
+                    && !v.trim().is_empty()
+                {
+                    return Err(format!(
+                        "REFUSING TO RUN: {addr} declares evictable namespaces ({}).\n                           The ledger oracle asserts that no acked write is lost, and eviction\n                           deletes acked writes deliberately, so against an evictable namespace\n                           it reports either a data loss that did not happen or -- worse -- waves\n                           through one that did.\n                           Chaos and eviction need an oracle that knows which losses were\n                           licensed. There is not one yet (ADR-0013, amended).",
+                        v.trim()
+                    ));
+                }
+            }
+        }
+        // ABSENCE IS NOT SUCCESS, applied to this check itself. Every seat
+        // failing to answer would otherwise return Ok and read as "no evictable
+        // namespaces here", when what happened is that nothing was inspected.
+        // A single unreachable seat is left to the fleet's own readiness checks,
+        // which report it far better than this can; ALL of them unreachable
+        // means this guard verified nothing and must not pretend otherwise.
+        if answered == 0 && !endpoints.is_empty() {
+            return Err(format!(
+                "REFUSING TO RUN: not one of {} seats answered FLINTINFO, so whether any\n                   namespace is evictable is UNKNOWN. This check cannot clear a fleet it\n                   could not reach.",
+                endpoints.len()
+            ));
+        }
+        Ok(())
+    }
+
     /// The mesh client config an attached fleet's writer needs; None locally.
     pub fn tls(&self) -> Option<std::sync::Arc<flint_tls::ClientConfig>> {
         match self {
