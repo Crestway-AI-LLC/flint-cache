@@ -1,8 +1,14 @@
-# BUG-0054: two -READONLY handlers disagree on whether to sleep, and a negative control is pinned to the slower one
+# BUG-0054: promote_notice's negative control subtracts two spawn-dominated samples
 
-Status: OPEN, found 2026-08-26 · Severity: LOW as a product matter, MEDIUM as a
-gate matter — it reds main on a timing margin of 2 ms, and the drill it reds is
-correct to fail.
+Status: FIXED 2026-08-26 — both wall-clock assertions replaced with mechanism
+assertions, each verified by a positive control. · Severity: LOW as a product
+matter, MEDIUM as a gate matter: it red main on a machine rather than on a
+regression.
+
+*(filename says "two readonly handlers disagree on whether to sleep" — that was
+the first diagnosis, refuted the same day by measurement. Kept so links
+survive. The retraction is below, because how a wrong diagnosis was killed is
+the useful part.)*
 
 ## The red
 
@@ -23,67 +29,91 @@ could not establish that run A is slow, which is the discipline that makes the
 rest of the suite worth reading. The defect is that the condition it needs is
 not one the run controls.
 
-## Why 28 and not 50
+## The first diagnosis, and how it died
 
-`do_failover` demotes then promotes, so the old master stays UP and answers
-`-READONLY` — deliberately, because that is the case with no connection error.
-The proxy has **two** handlers for that reply, and they disagree:
+I proposed that the proxy's two `-READONLY` handlers explain it:
+`forward_collect` (`main.rs:1426`) rediscovers and retries immediately, while
+`forward` (`:1526`) rediscovers, sleeps 50 ms, then loops. Whichever serviced
+the write would decide the number, giving a bimodal 28-or-50 rather than drift.
 
-    forward_collect (main.rs:1389), handler at :1426
-        topo.rediscover_after_failure(&addr);
-        backends.drop_conn(&addr);
-        forward(...).await          // retries IMMEDIATELY, no sleep
+**That asymmetry is real in the source and is NOT the cause here.** Six local
+runs of the unmodified drill:
 
-    forward (main.rs:1441), handler at :1526
-        topo.rediscover_after_failure(&addr);
-        backends.drop_conn(&addr);
-        std::thread::sleep(Duration::from_millis(50));   // then loops
+    delta: 54, 62, 49, 57, 56, 54 ms      base: 37-39 ms
 
-Whichever handler services the write decides the measurement. Through
-`forward`, the cost is a probe plus 50 ms and the control passes. Through
-`forward_collect`, it is a probe plus one round trip — 28 ms on this runner —
-and the control fails. The 30 ms floor is justified in the drill's own comment
-by "the 50ms retry sleep", a sleep that one of the two paths never executes.
+Tightly clustered around 55, every one on the sleeping path. No bimodality.
 
-Corroboration that it is the path and not the machine: `promote_notice` passed
-twice today on a 16-vCPU c7i.4xlarge (8.1s, 8.0s) against the same code, and
-failed on the 4-vCPU GitHub runner at `load 4.50` with four drills in flight.
-That is consistent with contention changing which path wins a race, and it is
-NOT the same claim as "the box was busy so the number drifted" — the two
-outcomes are 28 and ~50, not a continuum.
+Second hypothesis, also mine, also dead: that a slow box gives the proxy time
+to learn the promotion independently before the measured write. Inserting a
+pause between the failover and the write refutes it — nothing tells the control
+plane in run A, so the proxy stays stale however long you wait:
 
-## The sleep is probably the wrong half to keep
+    pause:  0s    0.25s  0.5s   1s    2s
+    delta:  55    61     64     61    55  ms
 
-`forward`'s branch sleeps 50 ms **after** rediscovering. If rediscovery found
-the new master, there is nothing to wait for; the sleep is pure added latency
-on every controlled failover, and `forward_collect` demonstrates that retrying
-immediately works. A backoff makes sense when the retry would hammer an
-unchanged routing table — but the rediscovery is what makes that not the case.
+## What it actually is
 
-So the likely correct resolution inverts the drill's assumption: make both
-handlers retry immediately, and the reactive path gets FASTER, not slower.
-Which means `promote_notice`'s negative control is currently pinned to a
-defect. Fix the proxy and the drill reds on every run.
+Arithmetic, once the numbers are laid side by side:
 
-## What must land, and in what order
+    local:  base 37   slow 91-99   delta 49-64      (passes)
+    CI:     base 62   slow 90      delta 28         (fails)
 
-1. **The drill must stop depending on an ambient race.** Same shape as
-   BUG-0049: force the condition instead of hoping for it. The honest form is
-   to assert the MECHANISM rather than a wall-clock delta — that the reactive
-   path performed a rediscovery and the hinted path did not — because that is
-   the thing run B is really about, and it does not move with the runner.
-   Lowering the 30 ms floor would be the wrong fix; it weakens a check to match
-   a measurement rather than making the measurement mean something.
-2. **Then reconcile the two handlers.** One condition, one retry discipline.
-   Whichever is chosen, it must be chosen deliberately and the drill must not
-   silently encode the answer.
+A 50 ms sleep cannot fit inside a 28 ms delta, so on CI the sleep DID fire and
+the subtraction hid it. `base` is a median of three `valkey-cli` spawns; `slow`
+is one more, independent. Spawn is the dominant term in both — measured here at
+34-40 ms, spread 6 ms, against a 50 ms signal, which is why an unloaded box
+never trips the floor. On the 4-vCPU runner spawn nearly doubles to ~62 ms and
+its spread grows with it, so `slow`'s own spawn drawing 40 ms against a
+baseline that drew 62 ms erases 22 ms of a 50 ms signal.
 
-Doing 2 before 1 turns an intermittent red into a permanent one.
+**The delta is a difference of two independent draws from a noisy distribution,
+and the noise scales with load while the signal does not.** That is the whole
+defect. It is a measurement-design flaw, not a product one, which is why the
+red carried no information about the commit that triggered it.
 
-## Not yet established
+Two tempting fixes are both wrong. Lowering the floor weakens a check to fit a
+measurement. An absolute floor on `slow` does not discriminate either — on a
+slow box, spawn alone clears it with no sleep at all.
 
-Which handler serviced the failing run — that would need the drill's own log
-from the uploaded artifact, or a counter. The two-handler asymmetry is read
-from the source and is certain; that it is the cause of THIS red is the leading
-explanation and not yet proven. A cheap discriminator: log which handler fired,
-and re-run under load.
+## The fix
+
+Both wall-clock assertions are gone; both sides now assert the mechanism.
+
+The proxy logs every re-probe and names its trigger:
+
+    [1787769502536] pair 0 master 127.0.0.1:6910 -> 127.0.0.1:6911 (re-probe triggered by 127.0.0.1:6910)
+
+- **Run A** must contain a re-probe triggered by the DEMOTED seat. Nothing told
+  the control plane, so the only way the proxy can learn is the hard way.
+- **Run B** must contain NO such line. Told by the CP, the proxy must not have
+  had to discover it by bouncing a write off `-READONLY`.
+
+B's old `FAST_DELTA < 20` had A's problem mirrored — same subtraction, same
+noise — and is implied by B's new assertion, since no reactive re-probe means
+no retry sleep. Both deltas are still printed: the numbers are the evidence the
+feature is worth having, they just no longer gate the run.
+
+## Verified by positive control, both sides
+
+A check that cannot fail is not a check, so each assertion was run against a
+world where its mechanism is absent:
+
+| scenario | expected | result |
+|---|---|---|
+| unmodified drill | passes | PASS, both mechanisms observed |
+| run A, CP told *before* the measured write | A fails | failed on A's assertion |
+| run B, notice pushed *after* the measured write | B fails | failed on B's assertion |
+
+The first attempt at the second control simply deleted the notice, and it
+failed on the pre-existing "hint must be in the snapshot" check without ever
+reaching the new assertion — a shadowed control, which proves nothing. Pushing
+the notice late instead keeps the hint present and moves only the timing.
+
+## Still open, and deliberately not fixed here
+
+The two-handler asymmetry is real even though it did not cause this. `forward`
+sleeps 50 ms *after* rediscovery has already found the new master, which is
+pure added latency on every controlled failover, and `forward_collect`
+demonstrates that retrying immediately works. Worth its own bug and its own
+decision; it is not a drill matter, and now that this drill asserts the
+mechanism rather than the stall, fixing it will no longer red the gate.

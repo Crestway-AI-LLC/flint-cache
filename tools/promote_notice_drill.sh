@@ -116,13 +116,33 @@ SLOW=$(first_write_ms a)
 echo "  first write after failover: ${SLOW}ms"
 SLOW_DELTA=$(( SLOW - BASE ))
 echo "  that is ${SLOW_DELTA}ms above steady state"
-# The proxy must have had to discover it the hard way: the retry loop sleeps
-# 50ms, so the stall cannot be small. If it is, the ruler is broken (or the
-# proxy learned some other way) and run B proves nothing by comparison.
-[ "$SLOW_DELTA" -ge 30 ] \
-  || { echo "FAIL: expected the reactive path to cost >=30ms above baseline (the 50ms
-      retry sleep), got ${SLOW_DELTA}ms. The comparison in B is meaningless if
-      the no-notice path is already fast."; exit 1; }
+# MECHANISM, NOT WALL CLOCK (BUG-0054).
+#
+# This asserted SLOW_DELTA >= 30, justified by the proxy's 50ms retry sleep.
+# The delta is a difference of two INDEPENDENT valkey-cli spawns, and spawn is
+# the dominant term -- ~37ms on a developer box, 62ms on the 4-vCPU gate
+# runner. Unloaded its spread is ~6ms against a 50ms signal and the floor
+# never trips; loaded, the spread reaches the size of the signal and the
+# control fails on a machine rather than on a regression. It red main at
+# d7781ed reporting 28ms, while six unloaded runs of that same code measured
+# 49-64ms and a 2s pause before the write changed nothing.
+#
+# Two tempting fixes are both wrong. Lowering the floor weakens a check to fit
+# a measurement. An absolute floor on SLOW does not discriminate either, since
+# spawn alone can clear it on a slow box.
+#
+# The reactive path leaves a deterministic trace instead: the proxy logs every
+# re-probe and names what triggered it. In run A that MUST be the demoted
+# seat, because nothing has told the control plane. No clock, no subtraction,
+# nothing that moves with the runner.
+grep -q "re-probe triggered by $M" "$D/px.log" || {
+  echo "FAIL: the proxy never re-probed off the demoted master $M, so it did not
+      discover the promotion the hard way and run B has nothing to compare
+      against. Re-probe lines seen:"
+  grep -E 're-probe triggered by' "$D/px.log" 2>/dev/null | tail -5 | sed 's/^/        /'
+  exit 1
+}
+echo "  reactive re-probe observed, triggered by the demoted $M"
 # The promotion hint is the 7th CPSNAPSHOT frame element (index 6), so line 7
 # of the piped output — NOT `tail -1`. c29bc22 appended an 8th element (the
 # co-processor families table, ADR-0010 D1), always emitted and empty here, so
@@ -156,12 +176,25 @@ esac
 
 FAST_DELTA=$(( FAST - BASE_B ))
 echo "  that is ${FAST_DELTA}ms above steady state"
-# Having been told, the proxy re-probed BEFORE this write, so it should cost
-# about what any other write costs. Allow 20ms of slack for scheduling; the
-# separation being measured is ~50ms, so this is nowhere near a coin flip.
-[ "$FAST_DELTA" -lt 20 ] \
-  || { echo "FAIL: with the notice the first write should cost about steady state,
-      got ${FAST_DELTA}ms above it — the proxy did not act on the hint"; exit 1; }
+# THE MIRROR OF RUN A, and the actual proof the notice did the work: having
+# been told, the proxy must NOT have had to discover this reactively. A
+# re-probe triggered by the DEMOTED seat means a write bounced -READONLY
+# first, i.e. the hint did not arrive before the write.
+#
+# This replaces `FAST_DELTA < 20`, which had run A's problem in the other
+# direction: same two-independent-spawns subtraction, same noise, and on a
+# loaded runner the spread alone can exceed 20ms. It is also implied by this
+# assertion -- no reactive re-probe means no 50ms retry sleep -- so nothing is
+# lost. Both deltas are still printed, because the numbers are the evidence
+# the feature is worth having even when they are not what gates the run.
+if grep -q "re-probe triggered by $M" "$D/px.log"; then
+  echo "FAIL: the proxy re-probed off the demoted master $M even though the CP
+      told it — the notice did not arrive before the write, so the hint is
+      not doing the work this drill claims for it. Re-probe lines seen:"
+  grep -E 're-probe triggered by' "$D/px.log" 2>/dev/null | tail -5 | sed 's/^/        /'
+  exit 1
+fi
+echo "  no reactive re-probe off $M — the proxy acted on the notice, not on a bounce"
 
 echo
 echo "  no notice: +${SLOW_DELTA}ms over baseline    with notice: +${FAST_DELTA}ms"
