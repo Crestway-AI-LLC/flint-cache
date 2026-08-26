@@ -199,6 +199,34 @@ for those reads, and degrading is the correct answer rather than a regression.
 
 ---
 
+## What the tier must implement
+
+The client speaks **six commands**, and nothing else:
+
+    GET   SET   SETEX   MGET   MSET   DEL
+
+`SET` is used with `NX` and `PX`. That is the whole surface — any
+Redis-protocol server providing those six can be the tier, which is what makes
+"point it at the Valkay or Redis you already run" true rather than aspirational.
+
+**Flint provides all six**, and the gate runs against Flint and against a
+Redis-protocol server on every push, in both engine modes.
+
+**What Flint does NOT provide, and why it does not matter here:** `INFO`,
+`KEYS`, `CONFIG` and `SHUTDOWN` are unimplemented. The client never issues
+them; only test harnesses did, and they now use `SCAN` and client-side counters
+instead. If you are writing your own tooling against a Flint tier, do not
+assume those exist.
+
+**One inference to avoid**, because this README's author drew it and was wrong.
+`flint-proxy`'s `route_key` carries a `NO_KEY` list containing `INFO`, and it
+is tempting to read that as "the proxy handles INFO itself". It does not.
+`NO_KEY` answers only *can a routing slot be derived from argument 1*; a
+keyless command is FORWARDED to pair 0's master, which returns the same
+`unknown command` error. `INFO` therefore fails identically through the proxy
+and against a bare seat. (Established by the Flint core session by probing,
+after this author inferred otherwise from the list.)
+
 ## Is it working?
 
 Every counter is exposed over **JMX** under `ai.crestway.flintaccel:type=Cache,*`.
