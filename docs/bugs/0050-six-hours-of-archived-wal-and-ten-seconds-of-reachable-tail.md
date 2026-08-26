@@ -1,10 +1,13 @@
 # BUG-0050: six hours of archived WAL, ten seconds of reachable tail
 
-Status: OPEN, found 2026-08-26 · Severity: HIGH on a live fleet — every
-reconnect that takes longer than the reachable window costs a re-seed, and the
-window measured on the playground is ~10 seconds against a configured 6 hours.
-Measured, not modelled: **18 WALGAP re-seeds** on the playground pair (10 on
-:7001, 8 on :7002).
+Status: OPEN, found 2026-08-26 · Severity: HIGH on a live fleet — **18 WALGAP
+re-seeds** on the playground pair (10 on :7001, 8 on :7002), each one costing
+single-copy exposure for the length of a re-seed.
+
+**The title is kept for the trail but the framing below it was CORRECTED the
+same day** — see "CORRECTION". The retention depth is not the variable: the
+replica that failed was ONE SEQUENCE behind latest, which no retention setting
+can help. This is a WAL-roll boundary condition.
 
 ## What was measured
 
@@ -37,24 +40,68 @@ Both were raised deliberately — "was 1 h", "was 1 GiB".
 So the retention setting is not the problem. **The tail path is not reading
 what retention is keeping.**
 
-## The gap between the two numbers
+## CORRECTION 2026-08-26: the first framing was wrong
 
-`Repl::updates_since_budgeted` calls `get_updates_since` and the admission
-check at `flint-storage/src/repl.rs:207` reports `raw_first`, the first batch
-that iterator yields. On this fleet that first batch tracked the LIVE segment,
-not the archive — one live segment was present and 735 archived ones were not
-being offered.
+This file originally said the tail path was not reading the archive that
+retention keeps, and proposed the local test that would settle it. **That test
+was run and it REFUTES the hypothesis.** Both probes are in
+`flint-storage/src/repl.rs` (`bug_0050_is_an_archived_cursor_reachable`):
 
-Stated as measurement and hypothesis separately, because only the first is
-established:
+    probe A (no checkpoint):  5 archived segments, cursor 800 back -> SERVED 800 batches
+    probe B (after checkpoint at seq 1000):  pre-checkpoint cursor -> SERVED 1000 batches
 
-- **Measured:** reachable span ≈ 10 s while `archive/` holds 6 h. Repeatable —
-  18 occurrences across two seats.
-- **Hypothesised:** the transaction-log iterator is not picking up archived
-  segments here, so effective replication retention is "since the last WAL
-  roll" rather than the configured TTL. Whether that is a RocksDB option we do
-  not set, an archive path it does not scan, or a roll that resets the
-  iterator's floor, is NOT established and is the first thing to check.
+So `get_updates_since` DOES serve from archived segments, and taking a
+checkpoint does NOT move the reachable floor. Neither mechanism reproduces.
+
+**And re-reading the evidence with that ruled out, the "6 hours vs 10 seconds"
+framing is the wrong reading of it.** The first failure was:
+
+    FATAL: WALGAP ... sequence 131869493 is no longer in the WAL
+           (latest is 131869494)
+
+The replica needed **131869493** while the master's latest was **131869494**.
+It was ONE SEQUENCE BEHIND. This is not a replica that fell out of a retention
+window; it is a cursor at the very tail being declared unreachable. The
+retention depth is a red herring — no retention setting, however large, helps
+a cursor that is one behind latest.
+
+The second message, from the restart, is consistent with a WAL ROLL at exactly
+that boundary:
+
+    oldest retained batch starts at 131869495, past the 131869493 needed
+    (latest is 131869852)
+
+Oldest reachable is 131869495 — one past where the replica died. The segment
+holding 131869493 existed (735 archived segments, 6 h, 142 MB were on disk)
+and was not offered.
+
+## What is actually established
+
+  - A replica ONE SEQUENCE behind latest was refused with WALGAP, on a live
+    fleet, 18 times across two seats.
+  - The failure sits at a WAL roll boundary: the oldest reachable batch
+    afterwards is exactly one past the failed cursor.
+  - Archived segments ARE reachable in the general case (probe A), and
+    checkpoints do NOT truncate reachability (probe B). So the general
+    mechanisms are sound and this is a BOUNDARY condition.
+  - Retention depth is not the variable. It was raised once already after
+    BUG-0012 — where a replica also died "one sequence short of the boundary"
+    (`rocks.rs:256`) — and the same failure has recurred at 6 h that occurred
+    at 1 h. **Raising it a third time would be the third wrong fix.**
+
+## What would find it
+
+The local probes exercise a quiet master. The playground's differs in ways
+worth reproducing one at a time:
+
+  1. **Roll the WAL while a tail is mid-poll**, with the cursor at latest-1.
+     That is the exact geometry of the failure and neither probe covers it.
+  2. **Sequence-space translation.** The node log shows "adopted the master's
+     translated cursor 125747825: tailing its sequence space now" shortly
+     before the failure. A cursor translated between spaces landing one off at
+     a roll boundary would produce precisely this, and nothing local tests a
+     translated cursor against a rolling WAL.
+  3. Only then, if both are clean, look again at retention.
 
 ## Why this is worth more than the alarm it caused
 

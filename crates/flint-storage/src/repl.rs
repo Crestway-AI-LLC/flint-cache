@@ -367,6 +367,99 @@ mod tests {
         }
     }
 
+    /// BUG-0050 PROBE. Is a cursor that has fallen out of the LIVE WAL, but
+    /// is still inside the ARCHIVED window that `wal_ttl_seconds` retains,
+    /// reachable by the tail path?
+    ///
+    /// Measured on the playground 2026-08-26: the master held 735 archived
+    /// segments spanning 6 h 1 m, and the admission check reported a
+    /// reachable span of ~357 sequences — about ten seconds at that fleet's
+    /// write rate. Six hours kept, ten seconds served. This asks the question
+    /// locally, where nothing else is moving.
+    ///
+    /// It is deliberately not an assertion about which answer is CORRECT: it
+    /// prints and asserts only that the probe actually exercised the path
+    /// (segments were archived, and the cursor really did leave the live
+    /// WAL). What the tail does with such a cursor is the finding.
+    #[test]
+    fn bug_0050_is_an_archived_cursor_reachable() {
+        let md = TempDir::new("archivereach");
+        let master = RocksKv::open(&md.0).expect("open");
+        let s = StringStore::new(&master, b"ns", system_clock);
+
+        for i in 0..200u32 {
+            s.set(1, format!("a{i}").as_bytes(), b"v", SetOptions::default())
+                .expect("set");
+        }
+        let early = master.db().latest_sequence_number();
+
+        // Flush so the memtable leaves and the segment holding `early` can be
+        // archived rather than needed for recovery.
+        for round in 0..4 {
+            master.flush();
+            for i in 0..200u32 {
+                s.set(
+                    1,
+                    format!("b{round}-{i}").as_bytes(),
+                    b"v",
+                    SetOptions::default(),
+                )
+                .expect("set");
+            }
+        }
+        master.flush();
+
+        let archived = std::fs::read_dir(md.0.join("archive"))
+            .map(|d| d.filter_map(Result::ok).count())
+            .unwrap_or(0);
+        let latest = master.db().latest_sequence_number();
+
+        let outcome = match master.updates_since(early) {
+            Ok(b) => format!("SERVED {} batch(es)", b.len()),
+            Err(e) => format!("REFUSED: {e:?}"),
+        };
+        eprintln!(
+            "BUG-0050 probe A (no checkpoint): archived={archived} early={early} latest={latest} -> {outcome}"
+        );
+
+        // PROBE B. The playground refused a cursor at snapshot_seq - 1 while
+        // its oldest reachable batch sat at snapshot_seq + 1, and it takes a
+        // checkpoint every ~30 s. So: does taking one move the floor?
+        let ckpt = TempDir::new("ckpt");
+        std::fs::create_dir_all(&ckpt.0).expect("parent");
+        let mid = master.db().latest_sequence_number();
+        master
+            .checkpoint_to(&ckpt.0.join("snap"))
+            .expect("checkpoint");
+        for i in 0..200u32 {
+            s.set(1, format!("d{i}").as_bytes(), b"v", SetOptions::default())
+                .expect("set");
+        }
+        let after = master.db().latest_sequence_number();
+        let out_b = match master.updates_since(early) {
+            Ok(b) => format!("SERVED {} batch(es)", b.len()),
+            Err(e) => format!("REFUSED: {e:?}"),
+        };
+        let out_c = match master.updates_since(mid.saturating_sub(1)) {
+            Ok(b) => format!("SERVED {} batch(es)", b.len()),
+            Err(e) => format!("REFUSED: {e:?}"),
+        };
+        eprintln!(
+            "BUG-0050 probe B (after checkpoint at {mid}, latest {after}): \
+             pre-checkpoint cursor {early} -> {out_b} | just-before-checkpoint cursor -> {out_c}"
+        );
+
+        // ARMED. If nothing was archived, or the cursor never left the live
+        // WAL, the probe answered an easier question than the one asked and
+        // its result means nothing either way.
+        assert!(
+            archived > 0,
+            "nothing was archived, so this never exercised the archive path — \
+             the probe is inconclusive, not reassuring"
+        );
+        assert!(latest > early, "the cursor did not fall behind at all");
+    }
+
     fn scan_all(kv: &RocksKv) -> Vec<(Vec<u8>, Vec<u8>)> {
         // User rows only (skip the repl marker).
         let mut rows = kv.scan_prefix(b"M");
