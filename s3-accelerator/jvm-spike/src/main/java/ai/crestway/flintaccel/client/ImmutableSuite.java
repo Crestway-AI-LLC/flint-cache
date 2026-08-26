@@ -37,8 +37,7 @@ public final class ImmutableSuite {
   static int heads() throws Exception {
     String b = HTTP.send(HttpRequest.newBuilder(URI.create(endpoint + "/__stats")).build(),
         HttpResponse.BodyHandlers.ofString()).body();
-    int i = b.indexOf("\"heads\":");
-    return Integer.parseInt(b.substring(i + 8, b.indexOf(',', i)).trim());
+    return ai.crestway.flintaccel.OriginStats.parse(b, "heads");
   }
 
   static TierSupport build(String tier, boolean immutable) {

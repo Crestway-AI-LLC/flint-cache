@@ -132,8 +132,7 @@ public final class EconomicSpike {
         HttpRequest.newBuilder(URI.create(endpoint + "/__stats")).build(),
         HttpResponse.BodyHandlers.ofString());
     String b = r.body();
-    int i = b.indexOf("\"gets\":");
-    return Integer.parseInt(b.substring(i + 7, b.indexOf(',', i)).trim());
+    return OriginStats.parse(b, "gets");
   }
 
   static void reset() throws Exception {

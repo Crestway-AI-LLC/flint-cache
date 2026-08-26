@@ -166,8 +166,7 @@ public final class MutationSpike {
         URI.create(endpoint + "/__mutate?key=" + key)).build(),
         HttpResponse.BodyHandlers.ofString());
     String b = r.body();
-    int i = b.indexOf("\"generation\":");
-    return Integer.parseInt(b.substring(i + 13, b.indexOf(',', i)).trim());
+    return OriginStats.parse(b, "generation");
   }
 
   /** Which generation, if any, does this buffer consistently belong to? -1 = TORN. */

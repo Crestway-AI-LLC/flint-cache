@@ -50,8 +50,7 @@ public final class S3aSuite {
         java.net.http.HttpRequest.newBuilder(URI.create(endpoint + "/__stats")).build(),
         java.net.http.HttpResponse.BodyHandlers.ofString());
     String b = r.body();
-    int i = b.indexOf("\"gets\":");
-    return Integer.parseInt(b.substring(i + 7, b.indexOf(',', i)).trim());
+    return ai.crestway.flintaccel.OriginStats.parse(b, "gets");
   }
 
   public static void main(String[] args) throws Exception {

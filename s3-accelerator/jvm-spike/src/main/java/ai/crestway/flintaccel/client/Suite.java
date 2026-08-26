@@ -70,8 +70,7 @@ public final class Suite {
 
   static int gets() throws Exception {
     String b = stat("/__stats");
-    int i = b.indexOf("\"gets\":");
-    return Integer.parseInt(b.substring(i + 7, b.indexOf(',', i)).trim());
+    return ai.crestway.flintaccel.OriginStats.parse(b, "gets");
   }
 
   /**

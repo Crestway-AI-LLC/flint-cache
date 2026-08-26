@@ -34,8 +34,7 @@ public final class AdoptionSuite {
     var r = java.net.http.HttpClient.newHttpClient().send(
         java.net.http.HttpRequest.newBuilder(URI.create(ep + "/__stats")).build(),
         java.net.http.HttpResponse.BodyHandlers.ofString());
-    String b = r.body(); int i = b.indexOf("\"gets\":");
-    return Integer.parseInt(b.substring(i + 7, b.indexOf(',', i)).trim());
+    return ai.crestway.flintaccel.OriginStats.parse(r.body(), "gets");
   }
 
   public static void main(String[] a) throws Exception {
@@ -59,12 +58,21 @@ public final class AdoptionSuite {
           "fs.s3a.impl gave us OURS (" + fs.getClass().getSimpleName() + ")");
 
       // DOOR 1
+      int cold0 = gets(ep);
       try (FSDataInputStream in = fs.open(new Path("s3a://bucket/" + key))) {
         byte[] b = new byte[4096]; in.readFully(300_000, b, 0, 4096);
         check(Arrays.equals(b, expect(key, 300_000, 4096)), "door 1: open() reads correctly");
       }
       // DOOR 2 -- openFile(), which routes to openFileWithOptions
       int before = gets(ep);
+      // ARM THE INSTRUMENT. The saving asserted at the end of this block is
+      // `gets(ep) == before`, which is exactly as true of a cache that works as
+      // it is of a counter that never moves -- and this suite had no check that
+      // it moves. Every other suite pairs its saving with a cold read proving
+      // the origin IS reached; this one asserted the saving alone.
+      check(before > cold0,
+          "armed: the COLD read reached the origin (" + (before - cold0)
+          + " GETs), so the counter below is live and not merely quiet");
       try (FSDataInputStream in = fs.openFile(new Path("s3a://bucket/" + key))
               .build().get()) {
         check(in.getWrappedStream() instanceof FlintS3AFileSystem.AalStream,
