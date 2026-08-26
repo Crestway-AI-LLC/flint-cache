@@ -469,6 +469,26 @@ fleet_wait_alive() {
 # correct, because a server with no loading state is ready as soon as it
 # answers. Callers therefore do not have to know whether the port belongs to a
 # node, a control plane, a proxy or the conformance oracle.
+# LIVENESS ONLY. NEVER INVERT THIS FOR A DEATH CHECK.
+#
+# `fleet_ready` answers "is it up and serving". Its negation does NOT answer
+# "is it gone": a failed PING is also what you get from a hung server, a
+# saturated backlog, or a dropped packet, and none of those mean the process
+# exited. Death is a SOCKET question — connect-refused — and asking it at the
+# protocol level makes a slow server look like a dead one.
+#
+# So the discriminator for converting a wait is two-dimensional, not one:
+# WHAT is on the other end (a node has a loading state, a proxy does not) and
+# WHICH DIRECTION is being asked (liveness needs the protocol, death needs the
+# socket). The same line can be correct for one direction and wrong for the
+# other, so a sweep keyed on component alone flags the right lines with the
+# wrong verdict half the time. Credit to the accelerator session, which hit
+# this converting a fixture wait and correctly did NOT convert its
+# corresponding kill check.
+#
+# In this tree the live example is cold_start_roles_drill.sh's
+# `! valkey-cli -p "$p" PING ... || "still serving after stop"`. That is a
+# death check and must stay socket-shaped. It is deliberately not converted.
 fleet_ready() {
   local port="$1"; shift
   [ "$(valkey-cli -p "$port" "$@" PING 2>/dev/null)" = "PONG" ] &&
