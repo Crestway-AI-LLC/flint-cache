@@ -59,9 +59,26 @@ def main():
     check(c_narrow["degraded"] > 0,
           f"THE BUDGET BOUNDS THE COMMAND: degraded={c_narrow['degraded']} "
           "-- a tier too slow to finish is a miss, not a wait")
+    check(c_narrow["tier_failures"] == 0,
+          f"and a SLOW tier is not counted as a broken one "
+          f"(tier_failures={c_narrow['tier_failures']}) -- the two are different "
+          "operator problems and must not share a counter")
     check(c_narrow["origin_gets"] > 0,
           f"and the read went to the ORIGIN instead ({c_narrow['origin_gets']} GETs) "
           "-- 'never slower than no cache' holds on this path too")
+
+    # The control the assertion above needs to mean anything. "tier_failures
+    # == 0 while slow" is satisfied just as well by a counter that can no
+    # longer move at all, and nothing above would notice. So: a tier that is
+    # BROKEN rather than slow must still reach it. A refused connection is the
+    # cleanest broken there is.
+    import socket as _s
+    _p = _s.socket(); _p.bind(("127.0.0.1", 0)); _dead = _p.getsockname()[1]; _p.close()
+    n_dead, c_dead = read(f"redis://127.0.0.1:{_dead}")
+    check(n_dead == N, f"a DEAD tier still returns correct bytes ({n_dead})")
+    check(c_dead["tier_failures"] > 0,
+          f"armed: a BROKEN tier does reach tier_failures ({c_dead['tier_failures']}) "
+          "-- without this, 'slow is not broken' would pass against a dead counter")
     return 0 if OK[0] else 1
 
 

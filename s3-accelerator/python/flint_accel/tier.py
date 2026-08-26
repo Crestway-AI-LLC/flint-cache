@@ -166,10 +166,19 @@ class FlintTier:
             return fut.result(timeout=self.budget_s)
         except _FutureTimeout:
             # Budget exceeded, not an error: the tier is up and answering, just
-            # too slowly to be worth waiting for. Counted as degraded, which is
-            # what the JVM calls the same condition, so one number means one
-            # thing across both clients.
-            self.c.degraded += 1
+            # too slowly to be worth waiting for.
+            #
+            # COUNTS NOTHING HERE, deliberately. tier_failures is per CALL and
+            # degraded is per READ, and the read path already increments
+            # degraded when this returns None -- the same place the JVM counts
+            # it, on the passthrough. Counting the timeout here as well records
+            # ONE event at two levels: the first version of this returned
+            # "degraded=2" for a single timed-out mget and read as two.
+            #
+            # It is the composition that was wrong, not either half. Separating
+            # slow from broken is right; doing it in the guard put the
+            # distinction one level above where the existing counter already
+            # made it. Returning None IS the signal.
             return None
         except Exception:
             self.c.tier_failures += 1

@@ -443,7 +443,7 @@ if [ -x "$PYENV/bin/python" ]; then
   ( cd python && run_bounded "$PYENV/bin/python" narrow_tier_check.py \
       http://127.0.0.1:9401 "redis://127.0.0.1:$TIER_PORT" redis://127.0.0.1:9397 \
     ) >/tmp/gate_narrow_check.log 2>&1
-  verdict "budget bounds the COMMAND, not the recv (5 checks)" $?
+  verdict "budget bounds the COMMAND, not the recv (8 checks)" $?
   stop_origin
 
   # fsspec's own abstract suite, against MOTO rather than counting_s3.
