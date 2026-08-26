@@ -104,9 +104,25 @@ case "$(vexec VEC.GET docs a)" in *"1,0,0"*) : ;; *) echo "FAIL: VEC.GET over mT
 # channel. 8 = 1 config + 3 vectors + 1 set-name index + 3 id-index buckets;
 # the last two are #194's durable index (see coproc_vec_drill for the full
 # breakdown).
-[ "$($A DBSIZE 2>&1 | tr -d '\r')" = "8" ] \
-  || { echo "FAIL: expected 8 durable keys (1 config + 3 vectors + 1 set-name index + 3 id-index buckets), got $($A DBSIZE)"
-       $A SCAN 0 COUNT 200 2>/dev/null | sed 's/^/    key| /'; exit 1; }
+# COUNTED BY KIND, for the reasons written out at the same check in
+# coproc_vec_drill.sh: a single total cannot say which part of the layout
+# moved, and re-deriving it means reimplementing the bucket hash in the drill.
+# One set here, so: 1 set-name index, 1 config, 3 rows, and an 'i' count
+# bounded by the ids rather than predicted from them.
+VKEYS=$($A --no-raw SCAN 0 COUNT 500 2>/dev/null)
+vkind() { printf '%s\n' "$VKEYS" | grep -cF "\\x00vec\\x00$1\\x00" || true; }
+N_S=$(vkind s); N_C=$(vkind c); N_V=$(vkind v); N_I=$(vkind i)
+N_TOT=$($A DBSIZE 2>&1 | tr -d '\r')
+vfail() { echo "FAIL: durable layout — $1"
+          echo "      counted: s=$N_S c=$N_C v=$N_V i=$N_I  dbsize=$N_TOT"
+          $A --no-raw SCAN 0 COUNT 500 2>/dev/null | sed 's/^/    key| /'; exit 1; }
+[ "$N_S" = 1 ] || vfail "expected 1 set-name index ('s'), got $N_S"
+[ "$N_C" = 1 ] || vfail "expected 1 config ('c'), got $N_C"
+[ "$N_V" = 3 ] || vfail "expected 3 vector rows ('v'), got $N_V"
+[ "$N_I" -ge 1 ] && [ "$N_I" -le 3 ] \
+  || vfail "id-index buckets ('i') = $N_I, outside 1..3"
+[ "$N_TOT" = "$(( N_S + N_C + N_V + N_I ))" ] \
+  || vfail "dbsize $N_TOT != s+c+v+i = $(( N_S + N_C + N_V + N_I )) — a key of an unexpected kind exists"
 echo "  VEC.SEARCH -> $S  (mutual handshake completed, or this would be COPROCUNAVAIL)"
 
 echo "== NEGATIVE: a PLAINTEXT dialer to the co-processor's FLINTFAM port is refused"

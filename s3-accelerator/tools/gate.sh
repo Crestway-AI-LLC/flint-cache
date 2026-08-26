@@ -221,6 +221,14 @@ verdict "port exclusivity vs the sibling harness (3 checks)" $?
 run_bounded python3 tools/slow_tier.py --self-test >/tmp/gate_slowtier.log 2>&1
 verdict "slow-tier proxy self-test (4 checks)" $?
 
+# narrow_tier is the OTHER half of "slow". slow_tier makes the tier late to
+# START; this one makes it answer at once and then dribble, which is what a
+# loaded tier looks like and which no instrument here could previously produce.
+# Same treatment: it self-tests, including a transparency control, because an
+# instrument that quietly throttles nothing makes a broken client look healthy.
+run_bounded python3 "$ROOT/tools/narrow_tier.py" --self-test >/tmp/gate_narrow_selftest.log 2>&1
+verdict "narrow-tier proxy self-test (2 checks)" $?
+
 bash tools/shim_guard_test.sh >/tmp/gate_shim.log 2>&1
 verdict "shim guard (5 classpath states)" $?
 
@@ -418,6 +426,24 @@ if [ -x "$PYENV/bin/python" ]; then
   ( cd python && run_bounded "$PYENV/bin/python" suite.py \
       http://127.0.0.1:9401 redis://127.0.0.1:$TIER_PORT ) >/tmp/gate_python.log 2>&1
   verdict "python suite (31 checks)" $?
+  stop_origin
+
+  # The budget must bound the COMMAND, not each socket read of its reply.
+  # redis-py takes it as socket_timeout, which CPython applies per recv(), so a
+  # tier that answers promptly and then dribbles slipped through: an 8 MiB warm
+  # read served FROM a 1 MB/s tier in 9.9 s with no counter moving, 6.8x slower
+  # than no cache. The JVM bounds the whole command and degraded correctly on
+  # the identical read, so the guarantee held on one client and not the other.
+  start_svcs 9401 ""
+  python3 tools/narrow_tier.py --listen 9397 --upstream "$TIER_PORT" --rate-bps 1048576 \
+      >/tmp/gate_narrow.log 2>&1 &
+  PIDS+=($!)
+  wait_tcp 9397 || exit 2
+  "$TIER_CLI" -p "$TIER_PORT" flushall >/dev/null 2>&1
+  ( cd python && run_bounded "$PYENV/bin/python" narrow_tier_check.py \
+      http://127.0.0.1:9401 "redis://127.0.0.1:$TIER_PORT" redis://127.0.0.1:9397 \
+    ) >/tmp/gate_narrow_check.log 2>&1
+  verdict "budget bounds the COMMAND, not the recv (5 checks)" $?
   stop_origin
 
   # fsspec's own abstract suite, against MOTO rather than counting_s3.
