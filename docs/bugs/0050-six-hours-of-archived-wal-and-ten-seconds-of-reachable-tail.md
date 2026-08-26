@@ -158,3 +158,54 @@ instead of a full re-seed").
 3. A drill that reconnects a replica after N seconds and asserts no WALGAP
    for N well inside the configured TTL. There is no such drill today, which
    is why 18 occurrences on a live fleet were invisible to a green suite.
+
+
+## Field evidence, 2026-08-26 — this was 4 of the playground's 10 forced re-seeds
+
+Every `FATAL: WALGAP` in `node-7001.log` on the playground, classified by cause
+and dated from the preceding `flintctl start` banner:
+
+| when | cause |
+|---|---|
+| 08-08 04:42 | archive segment deleted (BUG-0012) |
+| 08-11 21:07 | **interior cursor (this bug)** |
+| 08-11 23:27 | archive segment deleted |
+| 08-12 07:28 | **interior cursor** |
+| 08-13 11:01 | archive segment deleted |
+| 08-14 14:54 | **interior cursor** |
+| 08-16 06:58 | archive segment deleted |
+| 08-16 15:09 | archive segment deleted |
+| 08-20 01:51 | archive segment deleted |
+| 08-24 16:29 | **interior cursor** |
+
+Two causes, and only two. The signature separates them cleanly: this bug reads
+`sequence N is no longer in the WAL (latest is N+1)` — the cursor one short of
+the tail, resting inside a batch — while BUG-0012 reads `IO error: No such
+file or directory: ... /archive/NNNNNN.log`, a segment RocksDB retention
+removed without consulting the replica.
+
+**BUG-0012's fix is confirmed working in production.** It was gated 2026-08-21
+and there has not been an archive-deletion WALGAP since 08-20 01:51 — six days,
+against a prior rate of roughly one every two days.
+
+**Every forced re-seed after that date was this bug.** The 08-24 entry is the
+one that killed the link and left the seat marked for re-seed, producing the
+`attach_172_31_64_94_7002` incident at 03:03 on 08-26 — the incident whose
+`escalate` verdict held `FlintOps-playground-IncidentOverdue` on for thirteen
+hours (OPS-0045).
+
+## The prediction this makes, and how to falsify it
+
+If these really are the only two causes, then with BUG-0012 gated and this
+fixed in `fcc0028`, node-7001 should stop needing forced re-seeds — and the
+recurring `attach_*` incidents behind the standing alarm should stop with them.
+
+That is a claim about the future, so it is worth stating in a form that can be
+wrong: **a `FATAL: WALGAP` of either signature on the playground after
+2026-08-26 falsifies it.** The interior-cursor form would mean the fix is
+incomplete; the archive form would mean BUG-0012's shedding stopped holding at
+a load it had not previously seen. Either is worth knowing quickly, and the
+cheap check is one grep of `node-7001.log`.
+
+Not claimed: that this fixes the attach incidents *generally*. A replica can
+die for reasons that never touch the WAL, and nothing here observed one.
