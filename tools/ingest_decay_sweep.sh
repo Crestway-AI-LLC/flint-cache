@@ -300,10 +300,33 @@ for J in $JOBS; do
   # shrinking the structure rather than growing the dataset. Held FIXED across
   # the sweep — the only thing that varies is the job count, or the columns
   # are not comparable.
-  export FLINT_LEVEL_BASE_MB=8 FLINT_WRITE_BUFFER_MB=4 FLINT_STATS_DUMP_SEC=5
+  #
+  # OVERRIDABLE, because the SHAPE decides which question this answers, and 8 MB
+  # answers one that is already answered. The 2026-08-17 sweep ran a 2-core seat
+  # against an 8 MB base and found MORE background jobs made things WORSE: 9.1%
+  # slower, write amplification 3.84 -> 5.08 with no overlap. BUG-0013 is the
+  # opposite regime — a 16-vCPU box building a 60 GB LSM, where the claim is
+  # that two jobs cannot keep up. Both can be true; the knob is a function of
+  # cores AND LSM size, and neither measurement licenses a default on its own.
+  # Left hardcoded, this script can only ever re-measure the small-seat answer.
+  #
+  # The defaults ARE the 2026-08-17 values, so every existing invocation is
+  # unchanged and old runs stay comparable with new ones taken without the
+  # override. "FIXED across the sweep" still holds: these are read once, above
+  # the loop over job counts, never varied inside it.
+  export FLINT_LEVEL_BASE_MB="${DECAY_LEVEL_BASE_MB:-8}"
+  export FLINT_WRITE_BUFFER_MB="${DECAY_WRITE_BUFFER_MB:-4}"
+  export FLINT_STATS_DUMP_SEC=5
 
   echo
-  echo "== FLINT_BG_JOBS=$LABEL  ($KEYS x ${VSIZE}B, $INTERVALS intervals, seat on $SEAT_CPUS core(s))"
+  # THE SHAPE IS PART OF THE RESULT, not context. Since the level base became
+  # overridable, "jobs=4, 198 MB/s" is unattributable on its own: the same
+  # number means opposite things at an 8 MB base on 2 cores and a 512 MB base on
+  # 16. A reading whose regime is not written beside it cannot be compared with
+  # the next one, and this file's whole history is two sweeps that disagreed
+  # because their shapes did.
+  echo "== FLINT_BG_JOBS=$LABEL  ($KEYS x ${VSIZE}B, $INTERVALS intervals, seat on $SEAT_CPUS core(s),"
+  echo "   level-base ${FLINT_LEVEL_BASE_MB}MB, write-buffer ${FLINT_WRITE_BUFFER_MB}MB)"
   "${RUN[@]+"${RUN[@]}"}" "$BIN" --port "$PORT" --engine rocks --data-dir "$DIR" >"$DIR/out" 2>&1 &
   # Ready, not merely listening: since #176 a node binds before it can serve,
   # and a first interval that started against a node still coming up would be
@@ -404,7 +427,9 @@ for J in $JOBS; do
 done
 
 echo
-echo "== summary"
+echo "== summary  (level-base ${FLINT_LEVEL_BASE_MB}MB, write-buffer ${FLINT_WRITE_BUFFER_MB}MB,"
+echo "            seat on $SEAT_CPUS core(s)${PIN:+, pinned to $PIN})"
+echo "   These columns are comparable ONLY with runs of the same shape."
 cat "$SUMMARY"
 echo
 echo "  per-interval rows: $TSV"
