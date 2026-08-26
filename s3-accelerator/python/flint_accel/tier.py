@@ -194,7 +194,15 @@ class Counters:
     __slots__ = ("chunk_hits", "chunk_misses", "meta_hits", "meta_misses",
                  "origin_gets", "origin_bytes", "tier_failures", "degraded",
                  "claimed", "joined", "bypassed", "integrity_failures",
-                 "kms_bypassed", "kms_undetectable", "oversize_bypassed")
+                 "kms_bypassed", "kms_undetectable", "oversize_bypassed",
+                 # ADR-0026: what the chunk grid costs on the wire. `wanted` is
+                 # the byte range the caller asked this tier for; `moved` is
+                 # what the grid made us fetch after rounding both ends out to
+                 # chunk boundaries. A range-capable protocol would move
+                 # `wanted`; the difference is the grid's bill, and it is a
+                 # counter rather than an argument because that is the standard
+                 # every other claim here is held to (D8).
+                 "range_bytes_wanted", "chunk_bytes_moved")
 
     def __init__(self):
         for s in self.__slots__:
@@ -496,6 +504,11 @@ class FlintTier:
 
         first, last = start // self.chunk, end // self.chunk
         idxs = list(range(first, last + 1))
+        # Counted BEFORE any hit/miss split: the question is what the grid
+        # forces onto the wire, which is the same whether the chunks are in the
+        # tier or have to be filled from the origin.
+        self.c.range_bytes_wanted += end - start + 1
+        self.c.chunk_bytes_moved += min((last + 1) * self.chunk, size) - first * self.chunk
         keys = [self._ck(etag, i) for i in idxs]
 
         vals = self._guard(self.r.mget, keys)
