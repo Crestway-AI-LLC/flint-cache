@@ -67,6 +67,10 @@ CHUNK = 64 * 1024
 #: so 256 KiB is the measured choice and not merely the middle one. tier_RTT and
 #: tier_BW are the two numbers M0 owes this formula.
 BLOCK_BYTES = 256 * 1024
+#: How much of a fill goes in one round trip. Bounded by BYTES because the
+#: budget bounds a command: B bytes needs B/budget of bandwidth to land inside
+#: it, so an unbounded batch would degrade on a tier that reads fine.
+FILL_BATCH_BYTES = 1024 * 1024
 #: Objects larger than this are read straight from the origin and never
 #: chunk-cached.
 #:
@@ -492,12 +496,32 @@ class FlintTier:
             self.c.origin_gets += 1
             blob = self.origin.get(bucket, key, lo, hi)
             self.c.origin_bytes += len(blob)
+            # One round trip per BATCH, not per chunk. MEASURED before: 16 SET
+            # round trips per MiB filled -- one per 64 KiB -- against a single
+            # MGET to read the same run back. At the D17 cap that is 8,192
+            # sequential round trips for one object, and the JVM pipelines the
+            # identical writes through lettuce's async API.
+            #
+            # Batched by BYTES rather than by count, because the budget now
+            # bounds a command (D12.9) and a command of B bytes needs B/budget
+            # of bandwidth to finish inside it. 1 MiB at a 50 ms budget asks
+            # ~160 Mbit/s. That is 8x below what reads already require -- an
+            # 8 MiB mget wants ~1.3 Gbit/s at the same budget -- so this cannot
+            # make the cache degrade on any tier that was serving reads.
+            batch, batch_bytes = {}, 0
             for n, i in enumerate(run):
                 piece = blob[n * self.chunk:(n + 1) * self.chunk]
-                if piece:
-                    have[i] = piece
-                    self._guard(self.r.set, self._ck(etag, i),
-                                self._seal(etag, i, piece))
+                if not piece:
+                    continue
+                have[i] = piece
+                sealed = self._seal(etag, i, piece)
+                batch[self._ck(etag, i)] = sealed
+                batch_bytes += len(sealed)
+                if batch_bytes >= FILL_BATCH_BYTES:
+                    self._guard(self.r.mset, batch)
+                    batch, batch_bytes = {}, 0
+            if batch:
+                self._guard(self.r.mset, batch)
         finally:
             if leader:
                 with self._lock:

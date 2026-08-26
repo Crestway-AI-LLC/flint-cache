@@ -298,6 +298,32 @@ def main():
           f"negative control -- a 5 MiB block costs the TIER {w_warm/asked:.1f}x, "
           f"past the {bound:.1f}x ceiling ours meets, so this axis can fail")
 
+    # The fill costs one round trip per BATCH, not one per chunk
+    #
+    # MEASURED before batching: 16 SET round trips per MiB filled -- one per
+    # 64 KiB chunk -- against a single MGET to read the same run back. At the
+    # D17 cap that is 8,192 sequential round trips for one object, while the
+    # JVM pipelines the identical writes.
+    #
+    # Asserted as a RATIO per MiB rather than an absolute, so the check does
+    # not have to be retuned when the object size or the chunk size moves.
+    rc.flushall(); rc.config_resetstat()
+    with fs().open("s3://bucket/data/000003.bin", "rb") as h:
+        h.seek(0)
+        filled = len(h.read(4 * 1024 * 1024))
+    _cs = rc.info("commandstats") or {}
+    _calls = {k.replace("cmdstat_", ""): v["calls"] for k, v in _cs.items()}
+    writes = _calls.get("set", 0) + _calls.get("mset", 0)
+    mib = max(filled / (1024 * 1024), 1)
+    check(writes > 0, f"armed: filling {mib:.0f} MiB does write to the tier ({writes} round trips)")
+    # 4 per MiB is generous against a measured 1.0 and would still catch a
+    # regression to per-chunk writes, which is 16.
+    check(writes / mib <= 4,
+          f"the fill batches: {writes / mib:.1f} write round trips per MiB "
+          "(per-chunk writes would be 16)")
+    check(_calls.get("set", 0) == 0,
+          f"and does it with MSET, not per-chunk SET ({_calls.get('set', 0)} SETs)")
+
     # how much does fsspec's block cache pull for a small read?
     rc.flushall(); stats(ep, "/__reset")
     with fs().open("s3://bucket/data/000006.bin", "rb") as fh:
