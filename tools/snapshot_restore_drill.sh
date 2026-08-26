@@ -38,12 +38,36 @@ FLINT_SERVER_BIN=$B $CTL --manage-slots "6870:$D/n0,6871:$D/n1" \
   --snapshot-root "$D/snaps" --snapshot-interval-ms 1500 \
   --journal 127.0.0.1:7590 2>"$D/ctl.log" &
 # Bootstrap is confirm-gated now (3 x 200ms) + spawn + sync.
+#
+# READY IS PONG *AND* NOT LOADING. #176 makes a node bind and answer PING from
+# inside its load, deliberately, so a client can tell "starting" from
+# "absent" — which means PONG stopped being the same event as "serving". This
+# loop waited on PONG alone and the first write below came back
+# `-LOADING Flint is loading the dataset in memory`, failing an assertion
+# about snapshots that had nothing to do with snapshots.
+#
+# Fourth spelling of this in the suite, after PONG-alone (disk_pressure), a
+# bind (disk_selffill) and a non-empty field (cold_start_roles). The two later
+# waits in this drill are already correct because they test for a DECIDED
+# value — role:master, live_replicas:1 — rather than for an answer arriving.
+ready_6870() {
+  [ "$(valkey-cli -p 6870 PING 2>/dev/null)" = "PONG" ] &&
+    ! valkey-cli -p 6870 FLINTINFO 2>/dev/null | tr -d '\r' | grep -qx 'loading:1'
+}
 UP=0
 for i in $(seq 1 50); do
-  [ "$(valkey-cli -p 6870 PING 2>/dev/null)" = "PONG" ] && { UP=1; break; }
+  ready_6870 && { UP=1; break; }
   sleep 0.3
 done
-[ "$UP" = "1" ] || { echo "FAIL: managed pair never bootstrapped"; tail -5 "$D/ctl.log"; exit 1; }
+[ "$UP" = "1" ] || {
+  # Say WHICH of the two it was. "never bootstrapped" reads as "nothing
+  # started", and a node that is up and still loading is a different problem
+  # with a different fix — that ambiguity cost three investigations on
+  # disk_pressure before its diagnosis block was split the same way.
+  echo "FAIL: managed pair never became ready"
+  echo "      PING    -> $(valkey-cli -p 6870 PING 2>/dev/null || echo '<no answer>')"
+  echo "      loading -> $(valkey-cli -p 6870 FLINTINFO 2>/dev/null | tr -d '\r' | sed -n 's/^loading://p')"
+  tail -5 "$D/ctl.log"; exit 1; }
 echo "  pair bootstrapped (confirm-gated)"
 
 echo "== write data, then wait for a snapshot that INCLUDES it"
