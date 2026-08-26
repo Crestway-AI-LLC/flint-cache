@@ -538,6 +538,17 @@ static FULLSYNC_ACTIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::Atom
 // Disk headroom for the data directory. A node-wide condition (it is the
 // host's filesystem, not any tenant's), so it lives beside the other
 // process statics rather than threading through every call.
+/// Whether capacity reclaim is currently engaged, and the free-bytes target it
+/// is working toward (0 when idle).
+///
+/// REPORTED BEFORE IT IS ACTED ON, deliberately. This is a feature whose whole
+/// job is to delete data, so the shipping order is: decide, publish the
+/// decision, let an operator watch it decide on real traffic, and only then let
+/// it act. An eviction trigger that starts life invisible is one whose first
+/// observable behaviour is missing data.
+static RECLAIM_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static RECLAIM_TARGET_FREE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 static DISK: std::sync::LazyLock<diskguard::DiskGuard> =
     std::sync::LazyLock::new(diskguard::DiskGuard::default);
 
@@ -1790,6 +1801,32 @@ fn main() -> std::io::Result<()> {
                     );
                 }
                 DISK.apply(usage, v);
+                // Capacity reclaim (ADR-0023 D7 req 2/4). Decided on the same
+                // sample as the shed verdict, and by construction engages
+                // above it, so an evictable namespace evicts rather than ever
+                // reaching -QUOTA. It does not act yet: nothing marks keys
+                // until the policy is fed from the request path.
+                let was_reclaiming = RECLAIM_ACTIVE.load(Ordering::Relaxed);
+                let action = diskguard::reclaim_action(usage, thresholds, was_reclaiming);
+                let now_reclaiming = action != diskguard::ReclaimAction::Idle;
+                if now_reclaiming != was_reclaiming {
+                    let target = match action {
+                        diskguard::ReclaimAction::ReclaimToFreeBytes(b) => b,
+                        diskguard::ReclaimAction::Idle => 0,
+                    };
+                    eprintln!(
+                        "capacity reclaim: {} (free {} of {} bytes, target {target})",
+                        if now_reclaiming {
+                            "ENGAGED"
+                        } else {
+                            "released"
+                        },
+                        usage.map(|u| u.free_bytes).unwrap_or(0),
+                        usage.map(|u| u.total_bytes).unwrap_or(0),
+                    );
+                    RECLAIM_TARGET_FREE.store(target, Ordering::Relaxed);
+                    RECLAIM_ACTIVE.store(now_reclaiming, Ordering::Relaxed);
+                }
                 last = v;
                 slept = match usage {
                     Some(u) => diskguard::pace(prev_free, u, thresholds, slept, every),
@@ -3921,7 +3958,7 @@ fn flintinfo(
     let write_stall = rocks.as_ref().and_then(|kv| kv.write_stall());
     let compaction = rocks.as_ref().and_then(|kv| kv.compaction_pressure());
     let info = format!(
-        "role:{}\r\nloading:0\r\nrole_epoch:{role_epoch}\r\nbuild:{build}\r\nsst_bytes:{sst}\r\nlatest_seq:{latest}\r\nlast_applied:{last_applied}\r\nacked_seq:{}\r\nseq_lag:{seq_lag}\r\nwal_headroom_seq:{whs}\r\nwal_min_acked_seq:{wma}\r\nwal_headroom_shed_seq:{whl}\r\nlive_replicas:{}\r\nlag_ms:{}\r\nlag_ms_max:{lmx}\r\nlag_max_gap:{lmg}\r\nlag_soft_ms:{soft}\r\nlag_hard_ms:{hard}\r\nmin_replicas_to_write:{minr}\r\nwidowed_grace_ms:{wgm}\r\nwidowed_shed:{wsh}\r\nfullsync_active:{fsa}\r\nfullsync_max:{fsm}\r\nasync_write_queue:{aqd}\r\nwrite_deadline_ms:{wdm}\r\nwrite_inflight:{wif}\r\nwrite_service_us:{wsu}\r\nwrite_wait_est_ms:{wwe}\r\nwrites_shed_deadline:{wsd}\r\nwrites_shed_lag:{wsl}\r\nwrites_shed_quorum:{wsq}\r\nwrites_shed_widowed:{wswd}\r\nwrites_shed_headroom:{wshr}\r\nwrites_delayed_soft:{wdsf}\r\nwal_fsync_ms:{wfm}\r\nwal_fsync_total:{wft}\r\ncert_days_remaining:{cdr}\r\nactive_conns:{ac}\r\nmax_conns:{mc}\r\nconns_shed_total:{cs}\r\nwrite_stopped:{wst}\r\ndelayed_write_rate:{dwr}\r\nwrite_stall_readable:{wsr}\r\nl0_files:{l0f}\r\npending_compaction_bytes:{pcb}\r\ncompaction_readable:{cr}\r\ndisk_free_bytes:{dfb}\r\ndisk_total_bytes:{dtb}\r\ndisk_free_pct:{dfp}\r\ndisk_verdict:{dv}\r\ndisk_unknown_samples:{dus}\r\nevictable_ns:{ens}\r\nevictable_ns_agree:{ensa}\r\nevictable_ns_bytes:{ensb}\r\ngc_swept_expired:{gse}\r\ngc_swept_orphans:{gso}\r\nuptime_ms:{upms}\r\n",
+        "role:{}\r\nloading:0\r\nrole_epoch:{role_epoch}\r\nbuild:{build}\r\nsst_bytes:{sst}\r\nlatest_seq:{latest}\r\nlast_applied:{last_applied}\r\nacked_seq:{}\r\nseq_lag:{seq_lag}\r\nwal_headroom_seq:{whs}\r\nwal_min_acked_seq:{wma}\r\nwal_headroom_shed_seq:{whl}\r\nlive_replicas:{}\r\nlag_ms:{}\r\nlag_ms_max:{lmx}\r\nlag_max_gap:{lmg}\r\nlag_soft_ms:{soft}\r\nlag_hard_ms:{hard}\r\nmin_replicas_to_write:{minr}\r\nwidowed_grace_ms:{wgm}\r\nwidowed_shed:{wsh}\r\nfullsync_active:{fsa}\r\nfullsync_max:{fsm}\r\nasync_write_queue:{aqd}\r\nwrite_deadline_ms:{wdm}\r\nwrite_inflight:{wif}\r\nwrite_service_us:{wsu}\r\nwrite_wait_est_ms:{wwe}\r\nwrites_shed_deadline:{wsd}\r\nwrites_shed_lag:{wsl}\r\nwrites_shed_quorum:{wsq}\r\nwrites_shed_widowed:{wswd}\r\nwrites_shed_headroom:{wshr}\r\nwrites_delayed_soft:{wdsf}\r\nwal_fsync_ms:{wfm}\r\nwal_fsync_total:{wft}\r\ncert_days_remaining:{cdr}\r\nactive_conns:{ac}\r\nmax_conns:{mc}\r\nconns_shed_total:{cs}\r\nwrite_stopped:{wst}\r\ndelayed_write_rate:{dwr}\r\nwrite_stall_readable:{wsr}\r\nl0_files:{l0f}\r\npending_compaction_bytes:{pcb}\r\ncompaction_readable:{cr}\r\ndisk_free_bytes:{dfb}\r\ndisk_total_bytes:{dtb}\r\ndisk_free_pct:{dfp}\r\ndisk_verdict:{dv}\r\ndisk_unknown_samples:{dus}\r\nevictable_ns:{ens}\r\nevictable_ns_agree:{ensa}\r\nevictable_ns_bytes:{ensb}\r\nreclaim_active:{rca}\r\nreclaim_target_free_bytes:{rctf}\r\ngc_swept_expired:{gse}\r\ngc_swept_orphans:{gso}\r\nuptime_ms:{upms}\r\n",
         if read_only { "replica" } else { "master" },
         hub.effective_acked(now)
             .map_or_else(|| "none".into(), |a| a.to_string()),
@@ -3936,6 +3973,8 @@ fn flintinfo(
         // is deliberately distinct from 0 (a real mismatch).
         ens = evictable_ns_joined(),
         ensb = evictable_ns_bytes_joined(rocks),
+        rca = RECLAIM_ACTIVE.load(Ordering::Relaxed) as u8,
+        rctf = RECLAIM_TARGET_FREE.load(Ordering::Relaxed),
         ensa = EVICTABLE_AGREE.load(Ordering::Relaxed),
         // ADR-0022. Exported because the shed threshold is expressed in
         // SEQUENCES while RocksDB budgets BYTES: an operator can only pick a

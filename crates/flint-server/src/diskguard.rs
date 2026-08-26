@@ -113,6 +113,74 @@ pub fn verdict(
     }
 }
 
+/// Where capacity reclaim engages, as a percentage OF THE SHED FLOOR.
+///
+/// ADR-0023 D7 requirement 4: reclaim must run above the shed threshold, so an
+/// evictable namespace under pressure evicts rather than ever reaching
+/// `-QUOTA`, while a non-evictable namespace behaves exactly as it does today.
+///
+/// Expressing these relative to [`shed_floor_bytes`] rather than as their own
+/// independent thresholds is what makes that ordering ARITHMETIC instead of a
+/// pair of numbers somebody has to keep consistent. Two free-standing knobs can
+/// be configured into the wrong order and the failure would be silent — an
+/// evictable namespace shedding writes while sitting on reclaimable data. 150%
+/// of a floor cannot be below it.
+const RECLAIM_START_PCT_OF_FLOOR: u64 = 150;
+/// Reclaim down to here, not merely back to the start line. The gap is the
+/// hysteresis: without it a node parked at the mark reclaims a few keys every
+/// sample forever, which is the eviction equivalent of the write flapping
+/// [`REOPEN_MARGIN`] exists to prevent.
+const RECLAIM_TARGET_PCT_OF_FLOOR: u64 = 200;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReclaimAction {
+    /// Nothing to do: either there is headroom, or there is no signal.
+    Idle,
+    /// Reclaim from evictable namespaces until at least this many bytes are
+    /// free.
+    ReclaimToFreeBytes(u64),
+}
+
+/// Should capacity reclaim be running, and down to what?
+///
+/// `currently` carries the hysteresis: idle engages at the start mark, and a
+/// run in progress continues to the (higher) target rather than stopping the
+/// moment it crosses back over the line.
+///
+/// **No signal means Idle, and that is the fail-safe direction here even
+/// though it is the opposite of [`verdict`]'s.** `verdict` answers Ok when it
+/// cannot measure, because a monitoring gap must not shed writes and turn
+/// itself into an outage. This answers Idle for the same reason read the other
+/// way round: the action it authorises is DELETION, so an unmeasurable disk
+/// must not license reclaiming anything. Both refuse to act on a blind sample;
+/// they differ only in which action was the dangerous one.
+pub fn reclaim_action(
+    usage: Option<flint_storage::disk::Usage>,
+    t: Thresholds,
+    currently: bool,
+) -> ReclaimAction {
+    let Some(u) = usage else {
+        return ReclaimAction::Idle;
+    };
+    let floor = shed_floor_bytes(u, t);
+    if floor == 0 {
+        // No shed line configured at all, so there is nothing to stay above.
+        return ReclaimAction::Idle;
+    }
+    let start = floor.saturating_mul(RECLAIM_START_PCT_OF_FLOOR) / 100;
+    let target = floor.saturating_mul(RECLAIM_TARGET_PCT_OF_FLOOR) / 100;
+    let engage = if currently {
+        u.free_bytes < target
+    } else {
+        u.free_bytes < start
+    };
+    if engage {
+        ReclaimAction::ReclaimToFreeBytes(target)
+    } else {
+        ReclaimAction::Idle
+    }
+}
+
 /// Never sample slower than the configured cadence; never faster than this.
 /// A `statvfs` is microseconds, so the floor exists to bound the syscall rate
 /// under a pathological drain, not because the call is expensive.
@@ -485,5 +553,106 @@ mod tests {
         let now = raw(50 * GB, 100 * GB);
         let next = pace(Some(60 * GB), now, t, Duration::from_millis(100), every);
         assert_eq!(next, every);
+    }
+
+    /// ADR-0023 D7 requirement 4, as a PROPERTY rather than three examples:
+    /// wherever writes would be shed, reclaim was already engaged. An
+    /// evictable namespace must evict rather than ever reach `-QUOTA`, and the
+    /// way that fails is not dramatically — it is one threshold combination,
+    /// somewhere in the configuration space, where the two cross over.
+    ///
+    /// Swept across disk sizes, both thresholds, and every free level from
+    /// empty to full. The positive control matters as much as the assertion:
+    /// if no combination ever shed, the loop body would never run and this
+    /// would pass while checking nothing.
+    #[test]
+    fn reclaim_always_engages_before_writes_are_shed() {
+        let mut shed_seen = 0u32;
+        let mut reclaim_seen = 0u32;
+        for total_gb in [1u64, 8, 64, 512] {
+            let total = total_gb * GB;
+            for pct in [0u64, 5, 10, 25] {
+                for min_gb in [0u64, 1, 2, 8] {
+                    let t = Thresholds {
+                        min_free_pct: pct,
+                        min_free_bytes: min_gb * GB,
+                    };
+                    for step in 0..=100u64 {
+                        let u = flint_storage::disk::Usage {
+                            free_bytes: total * step / 100,
+                            total_bytes: total,
+                        };
+                        let sheds = verdict(Some(u), t, Verdict::Ok) == Verdict::Shed;
+                        let reclaims = reclaim_action(Some(u), t, false) != ReclaimAction::Idle;
+                        if reclaims {
+                            reclaim_seen += 1;
+                        }
+                        if sheds {
+                            shed_seen += 1;
+                            assert!(
+                                reclaims,
+                                "writes shed while reclaim was idle: total={total_gb}GB \
+                                 free={}% min_free_pct={pct} min_free_bytes={min_gb}GB — an \
+                                 evictable namespace would reach -QUOTA sitting on \
+                                 reclaimable data",
+                                step
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            shed_seen > 0 && reclaim_seen > 0,
+            "positive control: shed_seen={shed_seen} reclaim_seen={reclaim_seen} — the \
+             sweep never reached either state, so nothing above was actually checked"
+        );
+    }
+
+    /// Hysteresis: a run in progress continues past the line it started at,
+    /// so a node parked at the mark does not reclaim a few keys every sample
+    /// forever. Same reason `REOPEN_MARGIN` exists for writes.
+    #[test]
+    fn a_reclaim_in_progress_runs_past_the_line_that_started_it() {
+        let t = Thresholds {
+            min_free_pct: 10,
+            min_free_bytes: 0,
+        };
+        let total = 100 * GB;
+        let floor = 10 * GB;
+        // Just above the start mark (150% of floor = 15 GB): idle stays idle.
+        let above = flint_storage::disk::Usage {
+            free_bytes: floor * 160 / 100,
+            total_bytes: total,
+        };
+        assert_eq!(reclaim_action(Some(above), t, false), ReclaimAction::Idle);
+        // ... but a run already going keeps going, because the target is 200%.
+        assert_ne!(
+            reclaim_action(Some(above), t, true),
+            ReclaimAction::Idle,
+            "reclaim stopped at the start mark instead of its target, which \
+             re-engages on the next sample"
+        );
+        // Past the target, a run in progress finally stops.
+        let clear = flint_storage::disk::Usage {
+            free_bytes: floor * 210 / 100,
+            total_bytes: total,
+        };
+        assert_eq!(reclaim_action(Some(clear), t, true), ReclaimAction::Idle);
+    }
+
+    /// An unmeasurable disk authorises no deletion. Note this is the OPPOSITE
+    /// answer to `verdict`, which returns Ok when blind so a monitoring gap
+    /// cannot shed writes — both refuse to act, and the dangerous action is
+    /// simply different in each case.
+    #[test]
+    fn a_blind_sample_reclaims_nothing() {
+        let t = Thresholds::default();
+        assert_eq!(reclaim_action(None, t, false), ReclaimAction::Idle);
+        assert_eq!(
+            reclaim_action(None, t, true),
+            ReclaimAction::Idle,
+            "a reclaim in progress kept deleting after the disk signal was lost"
+        );
     }
 }
