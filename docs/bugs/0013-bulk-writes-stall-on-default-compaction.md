@@ -513,7 +513,7 @@ that disagreed because their shapes did. So: the same 2x2, 15x the data, on a
 | level base | bg_jobs | mean MB/s | first | last | decay | stall | phys | W-Amp |
 |---|---|---|---|---|---|---|---|---|
 | 8 MB | default (2) | 34.2 | 68.5 | 22.9 | 67% | 83.7% | 136 GB | 16.0 |
-| 8 MB | 4 | 65.9 | 97.2 | 47.5 | 51% | 49.0% | 157 GB | pending |
+| 8 MB | 4 | 65.9 | 97.2 | 47.5 | 51% | 49.0% | 157 GB | 14.2 |
 | 64 MB | default | 45.2 | 126.1 | 26.8 | 79% | 80.9% | 104 GB | 11.3 |
 | **64 MB** | **4** | **89.2** | 179.7 | **60.0** | 67% | **43.4%** | 185 GB | **10.2** |
 
@@ -547,8 +547,16 @@ earlier figure in this file was compaction CPU). Sampled from the engine's own
 stats before each configuration wiped its data directory:
 
 - 8 MB base, default: **16.0**
+- 8 MB base, jobs=4: **14.2**
 - 64 MB base, default: **11.3**
 - 64 MB base, jobs=4: **10.2**
+
+**Both knobs lower amplification, and they compose.** More background jobs
+reduces it at either base (16.0 -> 14.2, and 11.3 -> 10.2) and a bigger level
+base reduces it at either job count (16.0 -> 11.3, and 14.2 -> 10.2). So the
+recommendation is clean in both dimensions rather than trading one against the
+other, which was the open question when the 8 MB/jobs=4 figure was still
+missing.
 
 So the winning configuration runs 2.6x faster at **36% lower write
 amplification** than the baseline. That is the claim withdrawn earlier the same
@@ -559,6 +567,18 @@ It also resolves the footprint result rather than contradicting it: the winner
 writes LESS in total (10.2 vs 16.0) while leaving MORE resident (185 GB vs
 136 GB). Less rewriting, more deferred merging. Only the correct metric
 separates those.
+
+### Reproducibility, across three runs of the same configuration
+
+8 MB/default was run three times over five hours, as PROD-A, as the noise
+floor's baseline, and again for the amplification figure above:
+
+    mean  34.2 / 34.1 / 34.7      spread 1.7%
+    stall 83.7 / 83.8 / 83.5      spread 0.4 points
+    phys  139548 / 139641 / 136357 MB
+
+and 8 MB/jobs=4 twice: 65.9 and 67.0, 1.7%. Comfortably inside the claims made
+from it, and worth stating because a single sweep is a single sweep.
 
 ### A correction to the 6.4 GB guidance about which columns to trust
 
