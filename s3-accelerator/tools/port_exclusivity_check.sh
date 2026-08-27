@@ -26,9 +26,14 @@ ck() { if [ "$1" = 0 ]; then PASS=$((PASS+1)); printf "[ok] %s\n" "$2";
 # ---- the declaration -------------------------------------------------------
 # Every port this harness binds. Adding one without adding it here is the
 # failure the first check below exists to catch.
+# 9312-9314 were bound by this harness and NOT declared here, and check 1 did
+# not see them: it scans for host:port literals, and run_suite takes its port as
+# a bare argument. 9314 surfaced only because the stage that uses it also passes
+# a "http://127.0.0.1:9314" string. So check 1 covers the ports that happen to
+# be written one way, which is worth knowing about a check whose job is coverage.
 DECLARED="$(printf '%s\n' 9000 9301 9302 9303 9304 9305 9306 9307 9308 9309 \
-                          9310 9311 9318 9319 9397 9398 9399 9400 9401 9407 9530 \
-                          9531 9810 | sort -un)"
+                          9310 9311 9312 9313 9314 9318 9319 9397 9398 9399 \
+                          9400 9401 9407 9530 9531 9810 | sort -un)"
 
 # 6379 is Redis's standard port and the documented default for the CUSTOMER's
 # own endpoint. This harness never binds it -- every suite is passed an explicit

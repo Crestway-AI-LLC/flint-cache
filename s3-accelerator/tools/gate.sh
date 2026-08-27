@@ -400,6 +400,23 @@ run_suite "connection sharing (8 checks)" ai.crestway.flintaccel.client.TierShar
 # ADR-0023 D17.5: the cap is on the PART, not the object. The suite issues the
 # SAME request under two caps, because "a big request was not cached" is also
 # true of a cache that is simply broken.
+# BUG-0066/BUG-0067: every config key path 1 DECLARES must be one somebody has
+# shown to do something. Reflection finds the keys, so adding a constant without
+# classifying it fails here rather than being silently untested -- which is the
+# defect itself. Needs the SLOW proxy: a budget is not observable without one.
+python3 tools/slow_tier.py --listen "$SLOW_PORT" --upstream "$TIER_PORT" --delay-ms 200 \
+    >/tmp/gate_creach_proxy.log 2>&1 &
+PIDS+=($!)
+wait_tcp "$SLOW_PORT" || exit 2
+start_svcs 9314
+"$TIER_CLI" -p "$TIER_PORT" flushall >/dev/null 2>&1
+run_bounded java $GUARD_JAVA_OPTS -cp "$ROOT/jvm-spike/target/classes:$CP" \
+    ai.crestway.flintaccel.s3a.ConfigReachSuite \
+    "http://127.0.0.1:9314" "redis://127.0.0.1:$TIER_PORT" "redis://127.0.0.1:$SLOW_PORT" \
+    >/tmp/gate_config_reach.log 2>&1
+verdict "every declared path-1 key does something (28 checks)" $?
+stop_origin
+
 run_suite "part cap admission, read and write sides (13 checks)" ai.crestway.flintaccel.client.PartCapSuite 9313 "$ROOT/jvm-spike/target/classes:$CP"
 
 # The tier is the one dependency every other suite trusts implicitly. This one

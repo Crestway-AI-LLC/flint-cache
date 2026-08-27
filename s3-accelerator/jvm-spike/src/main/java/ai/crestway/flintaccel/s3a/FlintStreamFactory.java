@@ -19,6 +19,7 @@ import org.apache.hadoop.fs.s3a.impl.streams.StreamFactoryRequirements;
 import io.lettuce.core.ClientOptions;
 import io.lettuce.core.RedisClient;
 import io.lettuce.core.api.StatefulRedisConnection;
+import io.lettuce.core.api.async.RedisAsyncCommands;
 import io.lettuce.core.codec.ByteArrayCodec;
 
 import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
@@ -33,6 +34,7 @@ import software.amazon.s3.analyticsaccelerator.S3SdkObjectClient;
 import software.amazon.s3.analyticsaccelerator.util.S3URI;
 
 import ai.crestway.flintaccel.client.FlintObjectClient;
+import ai.crestway.flintaccel.client.LazyTierCommands;
 
 /**
  * The S3A entry point: `fs.s3a.input.stream.type=custom` plus
@@ -76,6 +78,7 @@ public final class FlintStreamFactory extends AbstractObjectInputStreamFactory {
   public static final String MAX_PART     = "fs.s3a.flint.max.part.bytes";
   public static final String IMMUTABLE    = "fs.s3a.flint.immutable";
   public static final String META_TTL_IMM = "fs.s3a.flint.meta.ttl.immutable.seconds";
+  public static final String RECONNECT_MS = "fs.s3a.flint.tier.reconnect.ms";
   /** Refuse to start on a shim collision. Default true: a customer's working
    *  job is worth more than our cache. */
   public static final String SHIM_FAIL_FAST = "fs.s3a.flint.shim.failfast";
@@ -83,6 +86,8 @@ public final class FlintStreamFactory extends AbstractObjectInputStreamFactory {
   private S3AsyncClient s3;
   private RedisClient redis;
   private StatefulRedisConnection<byte[], byte[]> conn;
+  /** Non-null only when the tier was down at bind time. */
+  public LazyTierCommands lazy;
   private S3SeekableInputStreamFactory aalCaching;
   private S3SeekableInputStreamFactory aalBypass;
   private FlintObjectClient cachingClient;
@@ -110,13 +115,32 @@ public final class FlintStreamFactory extends AbstractObjectInputStreamFactory {
       case COLLISION, WRONG_SHAPE -> {
         LOG.error("flint-accel: {}", SHIM.detail);
         for (String l : SHIM.locations) LOG.error("flint-accel:   found at {}", l);
-        if (conf.getBoolean(SHIM_FAIL_FAST, true)) {
-          throw new IllegalStateException("flint-accel: " + SHIM.detail
-              + " Set " + SHIM_FAIL_FAST + "=false to proceed anyway.");
-        }
+        String msg = failFastMessage(SHIM.state, SHIM.detail,
+            conf.getBoolean(SHIM_FAIL_FAST, true));
+        if (msg != null) throw new IllegalStateException(msg);
       }
     }
     super.serviceInit(conf);
+  }
+
+  /**
+   * The fail-fast decision, extracted so it is reachable without a real
+   * classpath collision.
+   *
+   * <p>Inline, this branch could only be entered by a JVM that genuinely had
+   * two copies of the shim, so the one setting that steers it was untestable
+   * and shared the shape of BUG-0066 — a key that is read, but whose being
+   * read nothing demonstrates. Returns the message to throw, or null to
+   * proceed.
+   *
+   * @return null when the run should continue
+   */
+  static String failFastMessage(ShimGuard.State state, String detail, boolean failFast) {
+    boolean broken = state == ShimGuard.State.COLLISION
+        || state == ShimGuard.State.WRONG_SHAPE;
+    if (!broken || !failFast) return null;
+    return "flint-accel: " + detail + " Set " + SHIM_FAIL_FAST
+        + "=false to proceed anyway.";
   }
 
   @Override
@@ -133,7 +157,30 @@ public final class FlintStreamFactory extends AbstractObjectInputStreamFactory {
     redis.setOptions(ClientOptions.builder()
         .disconnectedBehavior(ClientOptions.DisconnectedBehavior.REJECT_COMMANDS)
         .cancelCommandsOnReconnectFailure(true).autoReconnect(true).build());
-    conn = redis.connect(new ByteArrayCodec());
+    // A TIER THAT IS ALREADY DOWN MUST NOT FAIL THE JOB (D12.9, BUG-0058).
+    //
+    // This connected eagerly, so a tier that was down when the job started
+    // threw out of FileSystem.get and killed the job outright -- on the path
+    // the preflight script recommends FIRST. BUG-0058 fixed exactly this, but
+    // its fix landed in TierSupport, which paths 2 and 3 build through and this
+    // one does not; TierDownSuite builds through TierSupport too, so the gate
+    // that exists for this property never looked here.
+    //
+    // Same fallback TierSupport uses: dial once, and on refusal fall back to a
+    // proxy that redials at a rate limit and rejects commands until it
+    // succeeds. Every rejected command degrades to the origin, which is a slow
+    // read rather than a dead job.
+    long reconnectMs = conf.getLong(RECONNECT_MS, 5_000);
+    RedisAsyncCommands<byte[], byte[]> tierCmds;
+    try {
+      conn = redis.connect(new ByteArrayCodec());
+      tierCmds = conn.async();
+    } catch (RuntimeException down) {
+      LOG.warn("flint-accel: tier {} is not answering at startup ({}); reads "
+          + "will go to S3 until it does", uri, down.toString());
+      lazy = LazyTierCommands.install(redis, reconnectMs);
+      tierCmds = lazy.commands();
+    }
 
     // We build our OWN S3AsyncClient rather than reusing S3A's sync client.
     //
@@ -172,7 +219,7 @@ public final class FlintStreamFactory extends AbstractObjectInputStreamFactory {
     long maxPart = conf.getLong(MAX_PART, FlintObjectClient.DEFAULT_MAX_PART_BYTES);
     boolean immutable = conf.getBoolean(IMMUTABLE, false);
     long immTtl = conf.getLong(META_TTL_IMM, 86_400);
-    cachingClient = new FlintObjectClient(origin, conn.async(), chunk, budget, ttl,
+    cachingClient = new FlintObjectClient(origin, tierCmds, chunk, budget, ttl,
         false, s3, cacheKms, immutable, immTtl, maxObj, maxPart);
     aalCaching = new S3SeekableInputStreamFactory(
         cachingClient, S3SeekableInputStreamConfiguration.DEFAULT);
@@ -182,7 +229,7 @@ public final class FlintStreamFactory extends AbstractObjectInputStreamFactory {
     // is needed -- which would turn a privacy control into an outage.
     aalBypass = new S3SeekableInputStreamFactory(
         new FlintObjectClient(new S3SdkObjectClient(s3, false),
-            conn.async(), chunk, budget, ttl, true, s3, cacheKms,
+            tierCmds, chunk, budget, ttl, true, s3, cacheKms,
             immutable, immTtl, maxObj, maxPart),
         S3SeekableInputStreamConfiguration.DEFAULT);
   }
@@ -245,6 +292,9 @@ public final class FlintStreamFactory extends AbstractObjectInputStreamFactory {
     if (aalCaching != null) aalCaching.close();
     if (aalBypass != null) aalBypass.close();
     if (conn != null) conn.close();
+    // The lazy proxy may have connected after bind returned, so its connection
+    // is a separate thing to close and is null until it succeeds.
+    if (lazy != null && lazy.connection() != null) lazy.connection().close();
     if (redis != null) redis.shutdown();
     if (s3 != null) s3.close();
     super.serviceStop();

@@ -135,6 +135,7 @@ assumed to be zero.
 | max cached object | `fs.s3a.flint.max.object.bytes` | `flint.max.object.bytes` | `max_object_bytes` | **off** (deprecated) |
 | read block size | — (AAL fetches the exact range) | — | `default_block_size` | **256 KiB** = 4 chunks (not fsspec's 5 MiB, not our chunk) |
 | immutable TTL | `fs.s3a.flint.meta.ttl.immutable.seconds` | `flint.meta.ttl.immutable.seconds` | — | 86400 s |
+| tier reconnect | `fs.s3a.flint.tier.reconnect.ms` | `flint.tier.reconnect.ms` | — | 5000 ms |
 
 **The cap is on the PART, not the object.** A single request larger than
 65 MiB is read straight from S3 and never cached; the object it belongs to is
