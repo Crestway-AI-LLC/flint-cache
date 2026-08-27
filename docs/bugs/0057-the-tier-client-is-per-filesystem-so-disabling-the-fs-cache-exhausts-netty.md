@@ -1,4 +1,4 @@
-# BUG-0057: the tier client is per-FileSystem, so disabling the FS cache exhausts Netty (FIXED)
+# BUG-0057: the tier client is per-FileSystem, so disabling the FS cache exhausts Netty (FIXED — connections only, and the reason matters)
 
 Found 2026-08-26 by the Spark TPC-DS end-to-end harness
 (`flint-cache:packaging/aws/spark-e2e/`), on a c6i.4xlarge running Spark 4.0.4
@@ -74,18 +74,35 @@ at all. The secret is hashed into the key rather than stored in it.
 **Sharing only those was not enough, and measuring said so.** It took the
 Lettuce threads from 24 to 2 and left the total at +26 for twelve clients,
 still linear — AAL starts a scheduled executor behind each
-`S3SeekableInputStreamFactory`, and there are two per mount. So `TierSupport`
-itself is pooled, keyed by a signature over every configuration value that
-affects a read. Identically configured mounts share one stack; differently
-configured ones do not.
+`S3SeekableInputStreamFactory`, and there are two per mount.
 
-**The signature has a guard, because an allowlist that silently misses a key is
-the shape this file already carried once** (`TierSupport` enumerated four config
-keys with `default -> null`, so a fifth resolved to null and its opt-in could
-not be turned on). `create()` wraps the config accessor in a recorder and
-throws if it reads any key not in `CONFIG_KEYS`. A key added to the code and
-forgotten in the list now fails loudly instead of quietly merging two mounts
-that differ by it.
+**So I pooled the whole `TierSupport` by a configuration signature, got +4 for
+twelve, and it was wrong.** The gate caught it: the Iceberg suite read `0
+chunks` where it expects 16, and the Hadoop contract suite failed
+`testSeekBigFile` with `EOF End of file reached before reading fully`.
+
+Both have one cause. Two mounts sharing a `TierSupport` share its AAL
+`S3SeekableInputStreamFactory`, and that factory holds an in-memory object
+cache. A second reader was therefore served out of AAL's memory rather than the
+tier — `gate.sh` already warns about this in a comment, that reading twice
+through one AAL factory "measures AAL's memory rather than our tier" — and,
+worse, a cached object LENGTH outlived the mount that fetched it. **That is
+D12.29 exactly: a stale length is worse than a stale value, because it presents
+as truncation rather than staleness.** An EOF in the middle of a file is the
+shape of it.
+
+**The sharing therefore stops at the connection**, which is the resource that
+actually ran out. Thread growth for twelve mounts:
+
+| | 1 mount | 12 mounts |
+|---|---|---|
+| before | +4 | **+48** (exactly linear) |
+| connections pooled — **shipped** | +4 | **+26** |
+| whole `TierSupport` pooled — **rejected** | +4 | +4, and two suites fail |
+
+The middle row is the smaller win and the one that does not buy a resource
+bound with a correctness bug. The event loop groups named in the original stack
+trace are shared; AAL's per-factory executors are not, and cannot be.
 
 ## Verification
 
@@ -93,29 +110,21 @@ that differ by it.
 
 Measured thread growth, twelve clients:
 
-| | 1 client | 12 clients |
-|---|---|---|
-| before | +4 | **+48** (exactly linear) |
-| connections pooled only | +4 | +26 (still linear) |
-| pooled `TierSupport` | +4 | **+4** (flat) |
+**Positive control:** the suite fails against pre-fix code, measured at +48 for
+twelve where the assertion requires growth well under per-instance.
 
-**Positive control:** the suite fails against pre-fix code — recorded above as
-+48 for twelve, where the assertion requires under half of per-instance growth.
+The suite asserts the connection counters directly (`redisCreated=1,
+redisReused=11`, `s3Created=1`) and not only thread counts, since a thread
+assertion alone would pass for any change that happened to allocate less. It
+also asserts the constraint that killed full pooling, so it stays killed: each
+mount keeps its own `TierSupport` **and its own AAL factory**. And it requires
+the pool to be empty after everything closes — a pool that never drains is the
+same leak with extra steps.
 
-The suite asserts the pool counters directly (`created=1, reused=11`) and not
-only thread counts, since a thread assertion alone would pass for any change
-that happened to allocate less. It also requires that a mount setting
-`flint.immutable` gets its **own** instance: that flag stops the revalidation
-HEADs, so merging it with a mount that did not set it would buy the saving with
-a correctness bug. And it requires the pool to be empty after everything closes
-— a pool that never drains is the same leak with extra steps.
-
-**Regression: 108 checks, 0 failures** — client 25, S3A 9, adoption 10, SSE-C 5,
-integrity 21, tier-down-at-build 10, mid-job-kill 4, sharing 8, plus
-`ImmutableSuite` 3 and `MetricsSuite` 13. The last two matter most here: both
-build several `TierSupport`s in one JVM, and `MetricsSuite`'s "a second client
-gets its OWN bean, not a silent overwrite" is an independent check that
-differently configured clients did not get merged.
+**Regression: the full gate.** This is the part I got wrong the first time by
+running suites individually instead of the gate — 108 individual checks passed
+while the two suites that catch shared-cache staleness were never run. The gate
+runs them; run it.
 
 **One thing this does not do:** it does not make an unclosed `TierSupport` free.
 It makes the *second* one free. A caller that builds mounts with genuinely

@@ -38,6 +38,18 @@ GUARD_SCRATCH="${TMPDIR:-/tmp}"
 GUARD_DISK_BEFORE=$(guard_free_disk_gb "$GUARD_SCRATCH")
 guard_check "the gate" "$ROOT/jvm-spike" "$GUARD_SCRATCH" || exit 3
 GUARD_JAVA_OPTS="$(guard_java_opts)"
+
+# Move the previous run's logs aside. They are named after the suite AND its
+# check count, so a suite that gains a check leaves its old log behind forever
+# under the old name -- and anyone grepping /tmp/gate_*.log for failures finds
+# a stale one and diagnoses a bug that was fixed a day ago. That happened while
+# writing this line: a "23 checks" log from the day before showed [FAIL] beside
+# a clean current run. Kept rather than deleted, because comparing against the
+# previous run is the first thing you want when something goes red.
+if ls /tmp/gate_*.log >/dev/null 2>&1; then
+  rm -rf /tmp/gate_prev && mkdir -p /tmp/gate_prev
+  mv /tmp/gate_*.log /tmp/gate_prev/ 2>/dev/null || true
+fi
 # Bound the BUILD too. A maven that swaps takes the machine down just as
 # thoroughly as a suite that does, and it runs before any suite could report it.
 export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx${GUARD_JVM_MAX_HEAP}"

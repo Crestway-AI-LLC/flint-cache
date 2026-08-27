@@ -59,7 +59,7 @@ public final class TierSupport {
   public LazyTierCommands lazy;
 
   /** Pool keys, so close() releases exactly what build() took a reference on. */
-  String tierKey, s3Key, sig;
+  String tierKey, s3Key;
 
   private TierSupport(RedisClient r, StatefulRedisConnection<byte[], byte[]> c,
                       S3AsyncClient s3, FlintObjectClient cl,
@@ -70,79 +70,30 @@ public final class TierSupport {
 
   /** `get` reads a config key; `def` supplies fallbacks. Works for Hadoop
    *  Configuration and for Iceberg's property Map alike. */
-  /** Every key {@link #create} consults. The signature is built from these, so
-   *  a key missing here would let two DIFFERENTLY configured mounts share one
-   *  instance -- silently, which is the same shape as the allowlist-by-case-
-   *  label bug this file already carried once. {@link #create} records every
-   *  key it actually reads and throws if one is not listed, so the list cannot
-   *  drift away from the code without saying so. */
-  private static final String[] CONFIG_KEYS = {
-    "flint.tier.uri", "flint.chunk.bytes", "flint.tier.budget.ms",
-    "flint.meta.ttl.seconds", "flint.tier.reconnect.ms", "flint.cache.sse-kms",
-    "flint.immutable", "flint.meta.ttl.immutable.seconds",
-    "flint.max.object.bytes", "s3.endpoint", "s3.region",
-    "s3.path-style-access", "s3.access-key-id", "s3.secret-access-key",
-  };
-
-  private static final class Ref { final TierSupport v; int n; Ref(TierSupport t) { v = t; } }
-  private static final Map<String, Ref> POOL = new HashMap<>();
-
-  /** Observable so a test can prove reuse rather than infer it from threads. */
-  public static final java.util.concurrent.atomic.AtomicLong created =
-      new java.util.concurrent.atomic.AtomicLong();
-  public static final java.util.concurrent.atomic.AtomicLong reused =
-      new java.util.concurrent.atomic.AtomicLong();
-
   /**
-   * BUG-0057. Under {@code fs.s3a.impl.disable.cache=true} Hadoop builds a
-   * FileSystem per {@code get()} and Spark never closes the ones it opens for
-   * {@code read.parquet}, so this ran per read rather than per bucket. Measured
-   * before pooling: <b>+4 threads per instance, +48 for twelve</b>, until the
-   * JVM could not create another Netty event loop group.
+   * BUG-0057, in the scope that is actually safe. The CONNECTIONS are pooled
+   * and reference-counted in {@link TierConnections}; everything downstream of
+   * them is built fresh per mount.
    *
-   * <p>Identically configured mounts now share one instance, reference-counted;
-   * differently configured ones do not, because the settings below change what
-   * a read DOES and quietly merging two of them would be a correctness bug
-   * rather than a saving.
+   * <p><b>An earlier version pooled this whole object by a configuration
+   * signature, and it was wrong.</b> Two mounts then shared one AAL
+   * {@code S3SeekableInputStreamFactory}, which carries its own in-memory
+   * object cache -- so a second reader was served out of AAL's memory instead
+   * of the tier (the Iceberg suite measured 0 chunks where it expects 16), and,
+   * worse, a cached object LENGTH outlived the mount that fetched it: the
+   * Hadoop contract suite's {@code testSeekBigFile} failed with
+   * "EOF End of file reached before reading fully". That is D12.29 exactly --
+   * a stale length is worse than a stale value, because it presents as
+   * truncation rather than staleness.
+   *
+   * <p>So the sharing stops at the connection. It is the smaller win -- thread
+   * growth for twelve mounts falls from +48 to +26 rather than to +4 -- and it
+   * is the one that does not trade a resource bound for a correctness bug. The
+   * event loop groups that BUG-0057 actually ran out of are shared; AAL's
+   * per-factory scheduled executors are not, and cannot be.
    */
-  public static synchronized TierSupport build(Function<String, String> get) {
-    String sig = signature(get);
-    Ref r = POOL.get(sig);
-    if (r == null) {
-      r = new Ref(create(get, sig));
-      POOL.put(sig, r);
-      created.incrementAndGet();
-    } else {
-      reused.incrementAndGet();
-    }
-    r.n++;
-    return r.v;
-  }
-
-  private static String signature(Function<String, String> get) {
-    StringBuilder b = new StringBuilder();
-    for (String k : CONFIG_KEYS) {
-      String v = get.apply(k);
-      b.append(k).append('=').append(v == null ? "" : v).append('\n');
-    }
-    return b.toString();
-  }
-
-  private static TierSupport create(Function<String, String> outer, String sig) {
-    java.util.Set<String> seen = new java.util.HashSet<>();
-    Function<String, String> get = k -> { seen.add(k); return outer.apply(k); };
-    TierSupport t = build0(get);
-    java.util.Set<String> known = new java.util.HashSet<>(java.util.Arrays.asList(CONFIG_KEYS));
-    seen.removeAll(known);
-    if (!seen.isEmpty()) {
-      throw new IllegalStateException(
-          "TierSupport.create read configuration keys that are not in "
-          + "CONFIG_KEYS: " + seen + ". They would not be part of the pool key, "
-          + "so two mounts differing only in those would silently share one "
-          + "instance. Add them to CONFIG_KEYS.");
-    }
-    t.sig = sig;
-    return t;
+  public static TierSupport build(Function<String, String> get) {
+    return build0(get);
   }
 
   private static TierSupport build0(Function<String, String> get) {
@@ -199,14 +150,13 @@ public final class TierSupport {
     // AAL starts a scheduled executor behind each -- so every mount paid for two
     // where one will do. `false` means it does not own the underlying
     // S3AsyncClient, which is now pooled and must outlive both.
-    S3SdkObjectClient origin = new S3SdkObjectClient(s3, false);
     FlintObjectClient cl =
-        new FlintObjectClient(origin, async,
+        new FlintObjectClient(new S3SdkObjectClient(s3, false), async,
             chunk, budget, ttl, false, s3, cacheKms, immutable, immTtl, maxObj);
     TierSupport t = new TierSupport(redis, conn, s3, cl,
         new S3SeekableInputStreamFactory(cl, cfg),
         new S3SeekableInputStreamFactory(
-            new FlintObjectClient(origin, async,
+            new FlintObjectClient(new S3SdkObjectClient(s3, false), async,
                 chunk, budget, ttl, true, s3, cacheKms, immutable, immTtl, maxObj), cfg));
     t.lazy = tier.lazy;
     t.tierKey = uri;
@@ -255,13 +205,6 @@ public final class TierSupport {
    * take the tier away from the mounts still reading through it.
    */
   public void close() {
-    synchronized (TierSupport.class) {
-      Ref r = sig == null ? null : POOL.get(sig);
-      if (r != null) {
-        if (--r.n > 0) return;
-        POOL.remove(sig);
-      }
-    }
     if (metrics != null) metrics.unregister();
     try { caching.close(); } catch (Exception ignored) { }
     try { bypass.close(); } catch (Exception ignored) { }

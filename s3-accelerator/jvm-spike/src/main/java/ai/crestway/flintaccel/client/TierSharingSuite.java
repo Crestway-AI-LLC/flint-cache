@@ -83,47 +83,44 @@ public final class TierSharingSuite {
     for (int i = 1; i < N; i++) held.add(build(endpoint, tier));
     Thread.sleep(500);
     int afterAll = threads() - base;
+    int perInstanceWouldBe = afterOne * N;
 
-    System.out.printf("     threads: base %d, +%d after 1 client, +%d after %d%n",
+    System.out.printf("     threads: base %d, +%d after 1 mount, +%d after %d%n",
         base, afterOne, afterAll, N);
     System.out.println("     pools: " + byPool());
-    // Per-instance allocation would put afterAll near N * afterOne. Sharing
-    // puts it near afterOne. The midpoint is a wide, unambiguous gap; anything
-    // in it means only part of the stack is shared and the rest still scales.
-    int perInstanceWouldBe = afterOne * N;
-    check(afterAll < perInstanceWouldBe / 2,
-          "thread growth is SUBLINEAR in client count: +" + afterAll + " for " + N
-          + " clients, where per-instance allocation would be about +"
-          + perInstanceWouldBe);
 
-    check(afterOne == 0 || afterAll <= afterOne * 2,
-          "the " + N + "th client costs about what the 1st did: +" + afterOne
-          + " -> +" + afterAll);
+    // The claim is connection sharing; threads are the evidence for it.
+    // Asserting only on threads would pass for any change that happened to
+    // allocate less for an unrelated reason.
+    check(TierConnections.redisCreated.get() == 1
+          && TierConnections.redisReused.get() == N - 1,
+          "one tier connection for " + N + " mounts: created="
+          + TierConnections.redisCreated.get() + " reused="
+          + TierConnections.redisReused.get());
+    check(TierConnections.s3Created.get() == 1,
+          "and one S3 client for " + N + " mounts: s3Created="
+          + TierConnections.s3Created.get());
 
-    // Thread counts are evidence; the pool counters are the claim. Asserting
-    // only on threads would pass for any change that happened to allocate less.
-    check(TierSupport.created.get() == 1 && TierSupport.reused.get() == N - 1,
-          "identical mounts share ONE instance: created=" + TierSupport.created.get()
-          + " reused=" + TierSupport.reused.get() + " for " + N + " builds");
-    check(TierConnections.redisCreated.get() == 1,
-          "and one tier connection underneath: redisCreated="
-          + TierConnections.redisCreated.get());
+    // NOT FLAT, DELIBERATELY. Flat needs the whole TierSupport pooled, which
+    // shares AAL's object cache -- see the class comment. This bound is what
+    // sharing the connections buys, and the connections are the resource
+    // BUG-0057 actually ran out of.
+    check(afterAll < perInstanceWouldBe * 3 / 4,
+          "thread growth is well below per-instance: +" + afterAll + " for " + N
+          + ", against about +" + perInstanceWouldBe + " with nothing shared");
 
-    // The saving must not be bought with a correctness bug. flint.immutable
-    // changes what a read DOES -- it stops the revalidation HEADs -- so a mount
-    // that sets it must not be handed the instance built for one that did not.
-    long before = TierSupport.created.get();
-    TierSupport diff = build(endpoint, tier, true);
-    check(TierSupport.created.get() == before + 1,
-          "a DIFFERENTLY configured mount gets its own instance, not the pooled one");
-    check(diff != held.get(0), "and it is a different object");
-    diff.close();
+    // The constraint that killed full pooling, asserted so it stays killed.
+    TierSupport a = held.get(0), b = held.get(1);
+    check(a != b, "each mount keeps its OWN TierSupport");
+    check(a.caching != b.caching,
+          "and its own AAL factory -- the object that must not be shared, "
+          + "because a stale cached length reads as truncation");
 
     for (TierSupport t : held) t.close();
     Thread.sleep(700);
     int afterClose = threads() - base;
     check(afterClose <= afterOne,
-          "closing every client releases the shared stack: +" + afterClose
+          "closing every mount releases the shared connections: +" + afterClose
           + " threads remain");
     check(TierConnections.pooled() == 0,
           "and the connection pool is empty afterwards: " + TierConnections.pooled()
