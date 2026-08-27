@@ -740,6 +740,40 @@ fn wait_pong(addr: &str, tls: &Option<Arc<flint_tls::ClientConfig>>, budget: Dur
     false
 }
 
+/// The message `restart-node` gives up with.
+///
+/// A pure function so both branches can be asserted. It used to be one string
+/// -- "{addr} never reconverged behind {master}" -- and that was the whole of
+/// what a failed soak reported. It reads as "the replica is up and behind",
+/// which is one of two very different states, and on 2026-08-27 it was the
+/// other: the seat had EXITED on a purged WAL (BUG-0062). The cause was in that
+/// seat's log on another host, and nothing in the failure said to look there.
+///
+/// `replica_last_applied` is `None` when the replica did not answer at all.
+/// That is the whole discrimination: alive-and-behind vs gone.
+fn reconverge_failure(
+    addr: &str,
+    master: &str,
+    replica_last_applied: Option<&str>,
+    seq_lag: &str,
+    lag_ms: &str,
+) -> String {
+    match replica_last_applied {
+        Some(la) => format!(
+            "{addr} never reconverged behind {master} within 60s (replica is UP at \
+             last_applied={la}; master reports seq_lag={seq_lag} lag_ms={lag_ms}) \
+             -- it is falling behind, not dead"
+        ),
+        None => format!(
+            "{addr} never reconverged behind {master} within 60s and IS NOT ANSWERING \
+             -- it exited rather than fell behind, so the cause is in that seat's own \
+             log, not in its lag (master last reported seq_lag={seq_lag} \
+             lag_ms={lag_ms}). A purged WAL and a failed rewind both land here, and \
+             both name themselves there."
+        ),
+    }
+}
+
 fn info_field(
     addr: &str,
     tls: &Option<Arc<flint_tls::ClientConfig>>,
@@ -4889,7 +4923,29 @@ fn roll_node(
             return Ok(());
         }
         if Instant::now() > deadline {
-            return Err(format!("{addr} never reconverged behind {master}"));
+            // NAME THE CAUSE, not just the symptom. This message used to be the
+            // whole of what a failed soak reported, and "never reconverged"
+            // reads as "the replica is up and behind" -- one of two very
+            // different states. On 2026-08-27 it was the other one: the seat had
+            // EXITED on a purged WAL (BUG-0062), and the real cause sat in a
+            // seat log on another host that nobody opens without a reason to.
+            // The reason belongs here.
+            //
+            // Everything above polls the MASTER's view of its replica and never
+            // asks the replica anything, so the one question that separates the
+            // two states -- is it still there? -- was never put. Asked once, at
+            // the deadline, where its cost is nothing.
+            let lag = info_field(master, &tls, "seq_lag:").unwrap_or_else(|| "?".into());
+            let lag_ms = info_field(master, &tls, "lag_ms:").unwrap_or_else(|| "?".into());
+            // The replica is asked ONCE, here. See `reconverge_failure`.
+            let alive = info_field(addr, &tls, "last_applied:");
+            return Err(reconverge_failure(
+                addr,
+                master,
+                alive.as_deref(),
+                &lag,
+                &lag_ms,
+            ));
         }
         std::thread::sleep(Duration::from_millis(300));
     }
@@ -6803,5 +6859,58 @@ mod ops_0027_tests {
             "an event at 150 must be skipped when since_ms is 200; if this \
              fails the at_ms parse is broken and the window tests prove nothing"
         );
+    }
+}
+
+/// BUG-0062's observability half. The old failure text was a single string for
+/// two different states, so a soak reported "never reconverged" for a seat that
+/// had exited — and the investigation went to lag numbers, which were fine,
+/// before anyone opened the seat log where the answer was.
+#[cfg(test)]
+mod reconverge_message_tests {
+    use super::reconverge_failure;
+
+    /// The distinction the old message could not make.
+    #[test]
+    fn a_dead_replica_and_a_lagging_one_do_not_read_alike() {
+        let dead = reconverge_failure("10.0.0.1:7001", "10.0.0.2:7002", None, "12", "900");
+        let slow = reconverge_failure("10.0.0.1:7001", "10.0.0.2:7002", Some("41"), "12", "900");
+        assert_ne!(dead, slow);
+        assert!(dead.contains("IS NOT ANSWERING"), "{dead}");
+        assert!(slow.contains("falling behind, not dead"), "{slow}");
+    }
+
+    /// A dead seat must send the reader to the log that names the cause, since
+    /// that is the step nobody took.
+    #[test]
+    fn the_dead_branch_points_at_the_seats_own_log() {
+        let m = reconverge_failure("a:1", "b:2", None, "5", "700");
+        assert!(m.contains("that seat's own log"), "{m}");
+        assert!(
+            m.contains("purged WAL"),
+            "the two known causes should be named so the reader knows what to grep: {m}"
+        );
+    }
+
+    /// The lagging branch must carry the MAGNITUDE. "Behind" is not actionable;
+    /// "behind by 12 sequences" and "behind by 900ms" are.
+    #[test]
+    fn the_live_branch_carries_the_numbers() {
+        let m = reconverge_failure("a:1", "b:2", Some("41"), "12", "900");
+        for needle in ["last_applied=41", "seq_lag=12", "lag_ms=900"] {
+            assert!(m.contains(needle), "missing {needle} in: {m}");
+        }
+    }
+
+    /// Both branches must still name the pair, which is what makes the message
+    /// greppable in a multi-pair fleet's log.
+    #[test]
+    fn both_branches_name_the_addresses() {
+        for m in [
+            reconverge_failure("a:1", "b:2", None, "?", "?"),
+            reconverge_failure("a:1", "b:2", Some("9"), "?", "?"),
+        ] {
+            assert!(m.contains("a:1") && m.contains("b:2"), "{m}");
+        }
     }
 }
