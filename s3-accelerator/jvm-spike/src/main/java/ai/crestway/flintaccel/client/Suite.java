@@ -26,7 +26,11 @@ import software.amazon.s3.analyticsaccelerator.util.S3URI;
 public final class Suite {
 
   static final HttpClient HTTP = HttpClient.newHttpClient();
-  static String endpoint, redisUrl;
+  static String endpoint;
+  /** Public so suites outside this package can drive the same tier the gate
+   *  owns. ResilienceSpike hardcoded 9399 while dialling whatever it was given,
+   *  which is the exact split this field exists to prevent. */
+  public static String redisUrl;
   static final String BUCKET = "bucket";
   static boolean ok = true;
   static S3SeekableInputStreamConfiguration CFG = S3SeekableInputStreamConfiguration.DEFAULT;
@@ -112,7 +116,7 @@ public final class Suite {
    * daemonized server on 9399 behind it. One hardcode, three wrong outcomes:
    * a false failure, a neighbour's process killed, and a leak.
    */
-  static int tierPort() {
+  public static int tierPort() {
     int i = redisUrl.lastIndexOf(':');
     if (i < 0) return 9399;
     String tail = redisUrl.substring(i + 1).replaceAll("[^0-9].*$", "");
@@ -149,7 +153,7 @@ public final class Suite {
    *  signal -- it fails for a hung server, a full backlog, or a dropped packet,
    *  all of which leave the process alive -- so killTier still waits on
    *  connect-refused. Same port, opposite questions, different right answer. */
-  static boolean tierAnswering() {
+  public static boolean tierAnswering() {
     try (java.net.Socket sk = new java.net.Socket()) {
       sk.connect(new java.net.InetSocketAddress("127.0.0.1", tierPort()), 200);
       sk.setSoTimeout(200);
@@ -165,7 +169,7 @@ public final class Suite {
   }
 
   /** Is anything accepting connections on the tier port? */
-  static boolean tierListening() {
+  public static boolean tierListening() {
     try (java.net.Socket sk = new java.net.Socket()) {
       sk.connect(new java.net.InetSocketAddress("127.0.0.1", tierPort()), 200);
       return true;
@@ -178,7 +182,7 @@ public final class Suite {
     return "flint".equals(System.getenv("FLINT_TIER_ENGINE"));
   }
 
-  static void startTier() throws Exception {
+  public static void startTier() throws Exception {
     if (flintEngine()) {
       // Flint has no --daemonize, so this process stays in the FOREGROUND and
       // waitFor() would block until the suite's timeout -- which is exactly
@@ -210,7 +214,7 @@ public final class Suite {
    *  expensive thing in the window and has nothing to do with the property
    *  being measured. Shutting down over a connection we already hold costs
    *  microseconds and cannot be starved by the scheduler. */
-  static void killTier(StatefulRedisConnection<byte[], byte[]> live) throws Exception {
+  public static void killTier(StatefulRedisConnection<byte[], byte[]> live) throws Exception {
     if (live != null) {
       // async, not sync: SHUTDOWN gets no reply because the server dies
       // answering it, and a sync call would sit on the command timeout inside
@@ -254,7 +258,7 @@ public final class Suite {
       throw new IllegalStateException("tier still listening after shutdown");
   }
 
-  static void killTier() throws Exception { killTier(null); }
+  public static void killTier() throws Exception { killTier(null); }
 
   public static void main(String[] args) throws Exception {
     endpoint = args.length > 0 ? args[0] : "http://127.0.0.1:9000";

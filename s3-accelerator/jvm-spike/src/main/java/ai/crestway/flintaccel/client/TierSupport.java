@@ -8,6 +8,7 @@ import java.util.function.Function;
 import io.lettuce.core.ClientOptions;
 import io.lettuce.core.RedisClient;
 import io.lettuce.core.api.StatefulRedisConnection;
+import io.lettuce.core.api.async.RedisAsyncCommands;
 import io.lettuce.core.codec.ByteArrayCodec;
 
 import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
@@ -32,6 +33,12 @@ import software.amazon.s3.analyticsaccelerator.S3SeekableInputStreamFactory;
 public final class TierSupport {
 
   public final RedisClient redis;
+  /**
+   * NULL when the tier was unreachable at build time (BUG-0058). Production
+   * paths go through {@link #caching}, {@link #bypass} and {@link #client} and
+   * never touch this; the suites that do read it run against a live tier. Ask
+   * {@link #liveConnection()} when you need the connection whatever the state.
+   */
   public final StatefulRedisConnection<byte[], byte[]> conn;
   public final S3AsyncClient s3;
   public final FlintObjectClient client;
@@ -47,6 +54,10 @@ public final class TierSupport {
    * which is a reason to have no metrics and never a reason to fail a read.
    */
   public FlintCacheMetrics metrics;
+
+  /** Non-null only when the tier was down at build time. Package-visible for
+   *  the resilience suite, which asserts the retry is rate-limited. */
+  public LazyTierCommands lazy;
 
   private TierSupport(RedisClient r, StatefulRedisConnection<byte[], byte[]> c,
                       S3AsyncClient s3, FlintObjectClient cl,
@@ -72,7 +83,33 @@ public final class TierSupport {
     redis.setOptions(ClientOptions.builder()
         .disconnectedBehavior(ClientOptions.DisconnectedBehavior.REJECT_COMMANDS)
         .cancelCommandsOnReconnectFailure(true).autoReconnect(true).build());
-    StatefulRedisConnection<byte[], byte[]> conn = redis.connect(new ByteArrayCodec());
+
+    // BUG-0058: a tier that is ALREADY down must not stop the client being
+    // built. `connect()` performs the initial connect and throws when the
+    // endpoint refuses; that exception used to escape all the way out of
+    // FlintS3AFileSystem.initialize, leaving Hadoop with no FileSystem to
+    // return, and a Spark job whose tier was down at submission time failed
+    // outright rather than reading from S3. ADR-0023 D12.9 calls the opposite
+    // of that the property that decides deployability, and its protections all
+    // sit on the read path -- they cover a tier that dies after a working
+    // connection exists, not one that was never reachable.
+    //
+    // On failure we hand FlintObjectClient a handle of the same type whose
+    // every call throws until the tier answers. That is a RuntimeException
+    // arriving where `guard` already catches one inline and degrades to origin,
+    // so the outage takes the path that was already tested rather than a new one.
+    long retryMs = num(get.apply("flint.tier.reconnect.ms"), 5_000);
+    StatefulRedisConnection<byte[], byte[]> conn;
+    RedisAsyncCommands<byte[], byte[]> async;
+    LazyTierCommands lazy = null;
+    try {
+      conn = redis.connect(new ByteArrayCodec());
+      async = conn.async();
+    } catch (RuntimeException down) {
+      lazy = LazyTierCommands.install(redis, retryMs);
+      async = lazy.commands();
+      conn = null;
+    }
 
     S3AsyncClient s3 = asyncClient(get);
     // ADR-0023 D13.3: SSE-KMS bypasses the cache unless the customer turns it
@@ -96,13 +133,14 @@ public final class TierSupport {
         FlintObjectClient.DEFAULT_MAX_OBJECT_BYTES);
     var cfg = S3SeekableInputStreamConfiguration.DEFAULT;
     FlintObjectClient cl =
-        new FlintObjectClient(new S3SdkObjectClient(s3, false), conn.async(),
+        new FlintObjectClient(new S3SdkObjectClient(s3, false), async,
             chunk, budget, ttl, false, s3, cacheKms, immutable, immTtl, maxObj);
     TierSupport t = new TierSupport(redis, conn, s3, cl,
         new S3SeekableInputStreamFactory(cl, cfg),
         new S3SeekableInputStreamFactory(
-            new FlintObjectClient(new S3SdkObjectClient(s3, false), conn.async(),
+            new FlintObjectClient(new S3SdkObjectClient(s3, false), async,
                 chunk, budget, ttl, true, s3, cacheKms, immutable, immTtl, maxObj), cfg));
+    t.lazy = lazy;
     t.metrics = FlintCacheMetrics.register(cl, uri);
     return t;
   }
@@ -136,11 +174,21 @@ public final class TierSupport {
     catch (NumberFormatException e) { return d; }
   }
 
+  /** The live connection whichever way it was obtained, or null if never up. */
+  public StatefulRedisConnection<byte[], byte[]> liveConnection() {
+    return conn != null ? conn : (lazy != null ? lazy.connection() : null);
+  }
+
   public void close() {
     if (metrics != null) metrics.unregister();
     try { caching.close(); } catch (Exception ignored) { }
     try { bypass.close(); } catch (Exception ignored) { }
-    try { conn.close(); } catch (Exception ignored) { }
+    // conn is null when the tier was never reachable; the lazy handle may have
+    // connected since, and that connection is the one that needs closing.
+    try { if (conn != null) conn.close(); } catch (Exception ignored) { }
+    try {
+      if (lazy != null && lazy.connection() != null) lazy.connection().close();
+    } catch (Exception ignored) { }
     try { redis.shutdown(); } catch (Exception ignored) { }
     try { s3.close(); } catch (Exception ignored) { }
   }
