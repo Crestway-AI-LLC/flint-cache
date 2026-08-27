@@ -693,3 +693,61 @@ That exhausts loopback as an avenue. The remaining candidates are all
 environmental — a real network RTT between seats, disk under a real working
 set, fleet size — and the playground is where they exist. `slo.md`'s no-stall
 row stays as written until measured there.
+
+## 2026-08-27 — the production sighting REPRODUCED, on Linux, with a timeline
+
+The previous section closed with: *"That exhausts loopback as an avenue. The
+remaining candidates are all environmental ... and the playground is where
+they exist."* The playground was rolled to v0.1.0-rc.65 tonight, and it shed.
+
+Measured from the ops box's Prometheus, node `172.31.64.94:7002` (the seat
+promoted in the masters-last phase):
+
+    17:40Z   writes_shed_lag = 0     lag_ms_max = 0
+    17:57Z   writes_shed_lag = 110   lag_ms_max = 5735
+
+**Both counters move from zero to their final value inside ONE minute**, and
+that minute is the promotion. At 60-second resolution there is no ramp: it is
+a single event, not accumulation under load. Nothing further has shed in the
+4.5 hours since.
+
+This is the second production sighting and the first with a known timeline —
+the rc.59 one was noticed after the fact. Key properties, against what the
+loopback work established:
+
+| | loopback macOS | loopback Linux | playground (here) |
+|---|---|---|---|
+| sheds? | yes, 3,316 | **no**, at any reachable rate | **yes, 110** |
+| rate | 33,379/s | 39,466/s clean | ordinary soak, nowhere near 30k/s |
+| peak lag | — | — | **5,735 ms** vs a 1,000 ms hard cap |
+
+So the shed is real on Linux at ordinary rates, and the loopback negatives
+were not wrong — they were measuring the wrong variable. The playground's
+shed is not a throughput phenomenon at all: it is a **promotion** phenomenon.
+`lag_ms_max` reaching 5.7 s says the new master's replica was ~5.7 s behind at
+the moment writes resumed, which is the catch-up window after a
+demote-and-drain, not back-pressure from write volume.
+
+That reframes "the caps are mis-POSITIONED, not mis-shaped" (above) usefully:
+the soft cap at 500 ms and hard at 1,000 ms are being applied during a window
+where a multi-second gap is EXPECTED and transient. The question this raises,
+and it is a design question rather than a bug: should the lag caps apply
+unchanged across a controlled promotion, or should a promotion carry a grace
+in which the pair is known to be catching up? `widowed_grace_ms` is the
+existing precedent for a bounded grace around a known-transient state.
+
+### What this does and does not settle
+
+- **Settles:** the production shed reproduces on Linux at ordinary load, and
+  it is bound to promotion, not to rate. `slo.md`'s no-stall row has a dated,
+  measured counter-example on the real fleet.
+- **Does not settle:** whether 110 acked writes were LOST or merely refused.
+  `-THROTTLED` is a refusal the client can retry, which is the designed
+  behaviour; this measurement counts sheds, not losses. That distinction is
+  BUG-0014's territory and should not be conflated here.
+- **Does not settle:** whether the rc.59 sighting (210 shed) had the same
+  cause. Same shape, no timeline for it.
+
+Reproducing this on demand is now cheap: it happens on every fleet roll, and
+`roll-fleet.sh --probe` already runs a verify at the end. A shed-counter delta
+across the roll would turn every future roll into a measurement.
