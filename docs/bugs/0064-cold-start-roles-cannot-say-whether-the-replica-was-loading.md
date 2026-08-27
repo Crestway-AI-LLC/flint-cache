@@ -83,7 +83,7 @@ Nine of the last sixty, and nobody is triaging them:
 
 | drill | failures |
 |---|---|
-| `promote_notice` | 4 (all predate BUG-0054's fix, which replaced its wall-clock assertions) |
+| `promote_notice` | 4 (all predate `afbed3d`, the BUG-0054/0055 drill fix — see below) |
 | `cold_start_roles` | 2 (this bug) |
 | `upgrade` | 1 |
 | `slot_cutover_recovery` + `snapshot_restore` | 1 |
@@ -93,3 +93,22 @@ BUG-0014 recorded why these go unread: a run that is re-run green reports as
 `success`, and the failure survives only as `attempt=1`. **These nine were not
 re-run — they were simply never opened.** That is a second way for a firing to
 go unexamined, and it needs no re-run to happen.
+
+## Measured 2026-08-27: the promote_notice fix held
+
+Four of the nine red runs were `promote_notice`. Anchored on `afbed3d` — the
+commit that actually changed the drill ("assert the mechanism, not a
+difference of two spawns"), not the bug's headline SHA, which a first pass got
+wrong — the split is:
+
+| | runs | promote_notice failures |
+|---|---|---|
+| pre-fix | 24 | 4 (~17%) |
+| post-fix (contain `afbed3d`) | 36 | **0** |
+
+At the pre-fix rate, 36 clean runs has probability ~(0.83)^36 ≈ 0.1%. That is
+evidence the wall-clock replacement worked, not proof — but it means four of
+the nine unread failures are already explained and need no further triage.
+Remaining unexplained: the two `cold_start_roles` firings this bug is about,
+one `upgrade`, one `slot_cutover_recovery`+`snapshot_restore`, and one run
+with no `GATES FAILED` line at all.
