@@ -1,6 +1,8 @@
 # BUG-0052: the re-probe debounce is shorter than the probe it debounces
 
-Status: OPEN, found 2026-08-26 · Severity: MEDIUM — the coalescing that
+Status: FIXED 2026-08-26. The gate is now single-flight per address, with the
+250 ms window demoted to the quiet period AFTER a probe rather than a bound on
+how often one may start. · Severity: MEDIUM — the coalescing that
 `flint-proxy` added to stop a routing-table herd works only while the probe is
 fast, and the probe is slow in exactly the situation that produces the herd.
 
@@ -86,3 +88,38 @@ A test that fails without the fix, which means a probe whose duration the test
 controls — a seam over `discover_master`, or a pair member backed by a listener
 that accepts and then stays silent past the window. Asserting "one probe" while
 the fake probe returns instantly is how the current test came to prove nothing.
+
+
+## The fix
+
+`rediscover_gate` held `HashMap<String, Instant>` — which can only say "a probe
+STARTED at t". It now holds a two-state value:
+
+    enum ProbeState { InFlight, Idle(Instant) }
+
+`InFlight` returns immediately for every other caller, however long the probe
+takes; `Idle(t)` applies the 250 ms quiet period the constant was always sized
+for. The claim is released by a `Drop` guard rather than by careful code,
+because a probe that panics or returns early would otherwise wedge that address
+forever — permanently and silently, which is worse than the flap being fixed.
+
+The carve-out survives: `apply_promote_hint` still calls `rediscover_for`
+directly and is not gated. Coalesce the symptom, never the signal.
+
+## Measured, with a test that controls probe duration
+
+The bug doc said the fix needed one, because the existing
+`simultaneous_request_failures_cause_one_reprobe` fires 32 failures that each
+resolve in microseconds and so never overlap a probe at all.
+
+`a_second_caller_during_a_slow_probe_is_absorbed` binds a listener that accepts
+and never answers, so `discover_master` blocks on its 800 ms read timeout. A
+second caller arrives at 300 ms — deliberately PAST the 250 ms window and
+INSIDE the probe, which is precisely the case the old gate got wrong:
+
+    without single-flight : second caller took 801ms — it started its own probe
+    with single-flight    : second caller returned in <100ms
+
+It carries a capability assert too: if the first probe finishes in under 250 ms
+the listener is not holding the connection open, the callers never overlapped,
+and the test fails saying so rather than passing on nothing.
