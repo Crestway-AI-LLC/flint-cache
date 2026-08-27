@@ -120,3 +120,12 @@ Every one of those exited non-zero. A control checked by exit status would have
 been recorded as working five times over. **A control that fails is not a
 control that worked** — the only thing that separated them was reading which
 message came back.
+
+## Landed 2026-08-27, behind BUG-0061
+
+Held back deliberately: making `fleet_kill` wait for the deaths it signalled
+opens a window the drills had been winning only by returning too fast, so
+landing this first would have turned an intermittent leak into a reliable one
+across 46 teardown blocks. BUG-0061 reordered them; this landed on top of it in
+the same gate run — **131 steps, 0 FAIL**, with `PASS kill_release` proving the
+drill runs and `PASS kill_order` proving the teardown order it depends on.

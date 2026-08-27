@@ -1,6 +1,6 @@
 # BUG-0061: thirty drills kill the supervised seat before its supervisor
 
-Status: OPEN, found 2026-08-27 · Severity: MEDIUM as a gate matter — it is a
+Status: FIXED 2026-08-27, landed with BUG-0051 and gate-verified. · Severity: MEDIUM as a gate matter — it is a
 latent race in 30 drills that currently loses only because a teardown bug
 happens to make it too fast to lose.
 
@@ -71,3 +71,29 @@ belongs with the reorder.
    `tools/kill_release_drill.sh` and is blocked only by this.
 
 Doing 2 first turns an intermittent leak into a reliable one across 30 drills.
+
+## Fixed 2026-08-27 — and it was 46 teardown blocks, not 30
+
+The count in the title is low. The list above was derived from `cleanup()`
+functions only; the **pre-flight** kill blocks most drills run before
+`fleet_init` have exactly the same shape and the same race. Reordering by
+block rather than by function found 46 files.
+
+The reorder moves `fleet_kill controller` to the head of each kill block,
+preserving the original line grouping and any trailing `sleep`. Verified as a
+**permutation**: for all 48 modified files the multiset of seats killed is
+byte-identical to before, so nothing was dropped or duplicated — the risk with
+a mechanical edit at this scale is not a wrong order, it is a lost kill.
+
+`tools/kill_order_drill.sh` asserts the order at the source level and is
+registered at the HEAD of `CORE`, because a wrong teardown order should fail
+before 45 minutes of fleet bring-ups rather than after. It is block-aware on
+purpose: a whole-file scan pairs one block's `server` with the NEXT block's
+`controller` and reports 32 races that cannot happen — that was the first
+version, and it was wrong. It also refuses to pass on zero files, since a glob
+matching nothing is the one way this check fails open.
+
+Gate: **131 steps, 0 FAIL** — 129 plus exactly the two drills this change and
+BUG-0051 add, with `PASS kill_order` and `PASS kill_release` in the log. The
+arithmetic mattered: an earlier run reported 129 twice and had silently gated
+a different checkout entirely (OPS-0063 in the ops repo).
