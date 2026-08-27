@@ -20,6 +20,7 @@ lost. Format and rationale: [0001](0001-record-architecture-decisions.md).
 | [0021](0021-proxy-async-worker-model.md) | Give the proxy bounded worker threads and async IO, so backend connections have few owners (proposed) |
 | [0022](0022-wal-retention-bounded-by-replica-progress.md) | WAL retention bounded by replica progress: back-pressure before a replica meets a deleted segment |
 | [0023](0023-slot-aligned-bulk-eviction.md) | Slot-aligned bulk eviction: drop whole SSTs by slot range, when rewriting the namespace is the wrong price (proposed) |
+| [0024](0024-boot-decision-counters-that-outlive-the-process.md) | Boot-decision counters that outlive the process: make a rejoin LOOP visible without an evidence bundle (proposed) |
 | [ADR-0022](0022-wal-retention-bounded-by-replica-progress.md) | WAL retention follows the slowest live replica; the master sheds instead of letting it die |
 
 ## Why the numbering has a gap
