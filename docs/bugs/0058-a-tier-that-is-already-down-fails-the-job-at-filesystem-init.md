@@ -1,4 +1,4 @@
-# BUG-0058: a tier that is already down fails the job at FileSystem init (OPEN)
+# BUG-0058: a tier that is already down fails the job at FileSystem init (FIXED)
 
 Found 2026-08-26 by a deliberate control in the Spark TPC-DS end-to-end run
 (`flint-cache:packaging/aws/spark-e2e/`): stop `flint-server`, run the cached
@@ -54,29 +54,59 @@ handling and this run says nothing about it. The gap is initialization only.
 
 ## Fix
 
-Connect lazily, or tolerate a failed initial connect. `initialize()` should
-build the client without requiring the endpoint to answer, and the first read
-that needs the tier should degrade to origin when it cannot get a connection —
-the same fall-through D12.9 already specifies, just also reachable from a
-cold start.
+`TierSupport.build` no longer lets the initial connect failure escape. On
+failure it installs `LazyTierCommands`, a proxy over `RedisAsyncCommands` whose
+every call throws `RedisConnectionException` until the tier answers, and which
+retries the connect at most once per `flint.tier.reconnect.ms` (default 5 s).
 
-The subtlety worth stating so the fix does not swap one failure for another:
-a lazily-connecting client must not reintroduce the five-minute hang D12.9
-records. `REJECT_COMMANDS` has to be set on the client from the outset, so a
-never-connected client fails fast in exactly the way a disconnected one does.
+**The fix deliberately adds no new degradation path.** A `RuntimeException` from
+a tier call is already what `FlintObjectClient.guard` catches inline — its
+comment reads "already-dead connection throws inline" — and degrades to origin
+on. So the outage is routed into the fall-through that was already tested,
+rather than into a second one written for this case.
 
-## Verification the fix needs
+The interface is proxied rather than reimplemented because
+`RedisAsyncCommands` has several hundred methods and all of them must fail
+identically; an enumerated subset works until the first call to a method nobody
+listed, which is how `TierSupport`'s allowlist-by-case-label was a bug once
+already. `Object`'s own methods are answered locally — `toString()` on a tier
+handle is something a logger does, and a log line is not a reason to open a
+socket.
 
-- Start the tier, populate it, stop it, submit a job: every query must complete
-  with origin reads. **Positive control:** the same test against today's code
-  must fail at `initialize`, otherwise it is not exercising this path.
-- Timings in that state should sit near an unaccelerated run — near, not equal,
-  since each read now also pays a failed connection attempt. If they sit far
-  above, the fall-through is retrying rather than degrading, which is the hang
-  in a slower disguise.
-- The tier never comes up at all for the life of the job, and the job still
-  finishes. This is the deployment case: a customer whose Flint is down should
-  see a slow job, not a failed one.
+Rate-limiting matters as much as the retry. A connect attempt per read against
+a dead endpoint is a TCP handshake per read, which is slower than having no
+cache at all. `FlintObjectClient`'s circuit breaker already skips tier calls
+once failures accumulate, so this is the second line rather than the first, but
+the two cover different windows: the breaker half-opens periodically, and that
+is exactly when a dead endpoint would be dialled.
+
+## Verification
+
+`client.TierDownSuite`, 10 checks, now run by the gate as "tier down at build".
+It kills the tier, builds against it, and requires all of:
+
+- `TierSupport.build` survives — **the check that fails before the fix**
+- the read returns the object, and origin GETs moved, so it came from S3
+- `tierFailures > 0`, so the client actually TRIED. Without this, "reads work"
+  is equally true of a client that gave up at build time and never intended to
+  try again
+- reconnects are rate-limited — attempts held at 2 across 6 further reads
+- and it RECOVERS: after `startTier()` the lazy handle connects and the bytes
+  are still correct. This is what separates a lazy connect from simply
+  disabling the cache on first failure
+
+**Positive control, run:** with the fix reverted to rethrow, the suite fails at
+the second check with the production symptom —
+`RedisConnectionException: Unable to connect to 127.0.0.1:9399`. With the fix,
+10/10.
+
+**Regression:** client suite 25, S3A properties 9, adoption paths 10, SSE-C
+bypass 5 — all pass unchanged, 0 failures. `TierSupport` is on every adoption
+path, so this was the risk the change carried.
+
+**Not covered, still:** the mid-job kill D12.9 was written for. `ResilienceSpike`
+exercises that and **the gate does not run it** — which is how this gap survived
+to reach a real Spark job. Gating it is separate work.
 
 ## Related
 

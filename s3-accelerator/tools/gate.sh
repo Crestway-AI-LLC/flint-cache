@@ -353,6 +353,12 @@ run_suite "client suite (24 checks)"   ai.crestway.flintaccel.client.Suite   930
 run_suite "S3A properties (9 checks)"  ai.crestway.flintaccel.s3a.S3aSuite   9302 "$ROOT/jvm-spike/target/classes:$CP" "--delay-ms 150"
 run_suite "adoption paths (9 checks)"  ai.crestway.flintaccel.s3a.AdoptionSuite 9303 "$ROOT/jvm-spike/target/classes:$CP"
 run_suite "SSE-C bypass (5 checks)"    ai.crestway.flintaccel.s3a.SseCSuite  9304 "$ROOT/jvm-spike/target/classes:$CP"
+# BUG-0058. This suite KILLS AND RESTARTS THE TIER, which the ownership re-take
+# above is already written for. Gated rather than left as a spike: ADR-0023
+# D12.9 calls this the property that decides deployability, and it had a spike
+# (ResilienceSpike) that the gate never ran, which is how a tier down at
+# submission time reached a real Spark job and failed it outright.
+run_suite "tier down at build (10 checks)" ai.crestway.flintaccel.client.TierDownSuite 9306 "$ROOT/jvm-spike/target/classes:$CP"
 
 # The tier is the one dependency every other suite trusts implicitly. This one
 # corrupts it on purpose: absent, truncated, wrong-bytes, and right-bytes-wrong-
