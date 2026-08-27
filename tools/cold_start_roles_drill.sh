@@ -62,6 +62,8 @@ role_of() { valkey-cli -p "${1##*:}" FLINTINFO 2>/dev/null | tr -d '\r' | sed -n
 # `roles loading/loading` and reddened main.
 role_decided() { case "$(role_of "$1")" in master|replica) return 0 ;; *) return 1 ;; esac; }
 replicas_of() { valkey-cli -p "${1##*:}" FLINTINFO 2>/dev/null | tr -d '\r' | sed -n 's/^live_replicas://p'; }
+loading_of() { valkey-cli -p "${1##*:}" FLINTINFO 2>/dev/null | tr -d '\r' | sed -n 's/^loading://p'; }
+seqlag_of() { valkey-cli -p "${1##*:}" FLINTINFO 2>/dev/null | tr -d '\r' | sed -n 's/^seq_lag://p'; }
 
 echo "== bootstrap: pair[0] is master, replication live"
 $CTL bootstrap >/dev/null 2>&1
@@ -173,6 +175,27 @@ for _ in $(seq 1 80); do [ "$(replicas_of "$MASTER")" = "1" ] && break; sleep 0.
 [ "$(replicas_of "$MASTER")" = "1" ] || {
   echo "FAIL: live_replicas $(replicas_of "$MASTER") after cold start — the pair is storing one copy"
   echo "      and nothing errored, which is exactly the failure this drill exists for"
+  # WHICH failure is it? BUG-0064. A replica still INSIDE its load counts as an
+  # ABSENT one in the master's live_replicas, so "the replica never attached"
+  # and "40s was not enough on a slow runner" produce the identical line above.
+  # This drill already knows the distinction — `role_decided` exists because
+  # since #176 a node answers FLINTINFO from inside its load — but this
+  # assertion never used it, and the two readings have been indistinguishable
+  # in CI for as long as it has been failing there (2 of 60 runs).
+  #
+  # Printed rather than judged, deliberately: the assertion is unchanged, so a
+  # genuine replication failure still fails. What changes is that the NEXT
+  # firing says which one it was, instead of costing another read of the same
+  # ambiguous line. Same shape as BUG-0014's instrument fix.
+  echo "      == BUG-0064 DIAGNOSTIC =="
+  echo "      waited 40s (80 x 0.5s) for live_replicas to reach 1"
+  for n in "$A" "$B"; do
+    echo "      seat $n: role=$(role_of "$n") loading=$(loading_of "$n") live_replicas=$(replicas_of "$n") seq_lag=$(seqlag_of "$n")"
+  done
+  echo "      READ IT THUS: loading=1 on the replica means the budget expired mid-load"
+  echo "      (a timing fault, widen the wait); loading=0 with live_replicas=0 on the"
+  echo "      master means it finished loading and did NOT attach, which is the"
+  echo "      single-copy fleet of BUG-0008 and is a product regression."
   cat $FLINT_DRILL_ROOT/flint-coldrole.out; exit 1
 }
 [ "$(role_of "$A")" = "replica" ] || { echo "FAIL: $A did not come back as a replica"; exit 1; }
