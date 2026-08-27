@@ -365,6 +365,11 @@ run_suite "tier down at build (10 checks)" ai.crestway.flintaccel.client.TierDow
 # gained a generation field. It also kills the tier and now restarts it, which
 # start_svcs requires: it refuses to continue when the tier does not answer.
 run_suite "tier killed mid-job (4 checks)" ai.crestway.flintaccel.ResilienceSpike 9307 "$ROOT/jvm-spike/target/classes:$CP"
+# BUG-0057: identically configured mounts must share one stack. Under
+# fs.s3a.impl.disable.cache=true Hadoop builds a FileSystem per get() and Spark
+# never closes them, so this ran per READ -- measured at +4 threads each, +48
+# for twelve, until the JVM could not create another Netty event loop group.
+run_suite "connection sharing (8 checks)" ai.crestway.flintaccel.client.TierSharingSuite 9312 "$ROOT/jvm-spike/target/classes:$CP"
 
 # The tier is the one dependency every other suite trusts implicitly. This one
 # corrupts it on purpose: absent, truncated, wrong-bytes, and right-bytes-wrong-

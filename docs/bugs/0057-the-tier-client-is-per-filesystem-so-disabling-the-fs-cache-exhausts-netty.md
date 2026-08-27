@@ -1,4 +1,4 @@
-# BUG-0057: the tier client is per-FileSystem, so disabling the FS cache exhausts Netty (OPEN)
+# BUG-0057: the tier client is per-FileSystem, so disabling the FS cache exhausts Netty (FIXED)
 
 Found 2026-08-26 by the Spark TPC-DS end-to-end harness
 (`flint-cache:packaging/aws/spark-e2e/`), on a c6i.4xlarge running Spark 4.0.4
@@ -63,29 +63,66 @@ its own limit later in the same configuration. Neither changes the fix.
 
 ## Fix
 
-Share the tier client across FileSystem instances instead of building one per
-instance — a small reference-counted registry keyed by the resolved tier URI
-plus whatever else distinguishes a connection (credentials, TLS), with
-`close()` dropping a reference and the last one out shutting the client down.
-That makes the accelerator's footprint a function of how many distinct tiers
-are configured rather than how many times Hadoop happened to construct a
-FileSystem.
+Two layers, both reference-counted, in `TierConnections` and `TierSupport`.
 
-Not fixed here. This was found by a harness, not by a customer, and the change
-touches the lifecycle of a shared client — it wants its own change with its own
-test, not a drive-by in a benchmarking commit.
+**The connection objects are pooled.** `RedisClient` keyed by tier URI,
+`S3AsyncClient` keyed by endpoint, region, path-style and credentials — the
+credentials are in the key because an `S3AsyncClient` carries its provider, and
+handing one tenant's client to another tenant's mount is worse than not caching
+at all. The secret is hashed into the key rather than stored in it.
 
-## Verification the fix needs
+**Sharing only those was not enough, and measuring said so.** It took the
+Lettuce threads from 24 to 2 and left the total at +26 for twelve clients,
+still linear — AAL starts a scheduled executor behind each
+`S3SeekableInputStreamFactory`, and there are two per mount. So `TierSupport`
+itself is pooled, keyed by a signature over every configuration value that
+affects a read. Identically configured mounts share one stack; differently
+configured ones do not.
 
-- A test that calls `FileSystem.get` for the same `s3a://` URI N times with
-  `fs.s3a.impl.disable.cache=true` and asserts the JVM's thread count is flat
-  in N. **Positive control:** the same test against today's code must fail —
-  otherwise it is asserting something the setting does not exercise.
-- A test that two *different* tier URIs still get two clients, so the sharing
-  key is the tier and not a global.
-- The end of the reference count: after the last `close()`, the client is shut
-  down and a subsequent `get` builds a new one rather than handing back a dead
-  connection.
+**The signature has a guard, because an allowlist that silently misses a key is
+the shape this file already carried once** (`TierSupport` enumerated four config
+keys with `default -> null`, so a fifth resolved to null and its opt-in could
+not be turned on). `create()` wraps the config accessor in a recorder and
+throws if it reads any key not in `CONFIG_KEYS`. A key added to the code and
+forgotten in the list now fails loudly instead of quietly merging two mounts
+that differ by it.
+
+## Verification
+
+`client.TierSharingSuite`, 8 checks, gated as "connection sharing".
+
+Measured thread growth, twelve clients:
+
+| | 1 client | 12 clients |
+|---|---|---|
+| before | +4 | **+48** (exactly linear) |
+| connections pooled only | +4 | +26 (still linear) |
+| pooled `TierSupport` | +4 | **+4** (flat) |
+
+**Positive control:** the suite fails against pre-fix code — recorded above as
++48 for twelve, where the assertion requires under half of per-instance growth.
+
+The suite asserts the pool counters directly (`created=1, reused=11`) and not
+only thread counts, since a thread assertion alone would pass for any change
+that happened to allocate less. It also requires that a mount setting
+`flint.immutable` gets its **own** instance: that flag stops the revalidation
+HEADs, so merging it with a mount that did not set it would buy the saving with
+a correctness bug. And it requires the pool to be empty after everything closes
+— a pool that never drains is the same leak with extra steps.
+
+**Regression: 108 checks, 0 failures** — client 25, S3A 9, adoption 10, SSE-C 5,
+integrity 21, tier-down-at-build 10, mid-job-kill 4, sharing 8, plus
+`ImmutableSuite` 3 and `MetricsSuite` 13. The last two matter most here: both
+build several `TierSupport`s in one JVM, and `MetricsSuite`'s "a second client
+gets its OWN bean, not a silent overwrite" is an independent check that
+differently configured clients did not get merged.
+
+**One thing this does not do:** it does not make an unclosed `TierSupport` free.
+It makes the *second* one free. A caller that builds mounts with genuinely
+different configurations in a loop and never closes them still grows, and
+nothing here bounds that. Under the reported condition —
+`fs.s3a.impl.disable.cache=true` with one configuration, which is what Spark
+does — growth is now flat.
 
 ## Related
 
