@@ -12,6 +12,15 @@ REFUSING TO RUN: another Flint-family project has a fleet up on this box
 There was no run to finish and no parent to finish it. The advice was for
 something that could never happen.
 
+**It happened twice in the same hour.** The second time was worse, because it
+followed a REAL run: a flint-kv suite started mid-gate, correctly refused 107
+drills while it was genuinely contending (load 58), finished — and left another
+`flint-kv-server` at ppid 1, 0.0% CPU. So the guard went from a correct refusal
+straight into a permanent one with no event in between, and the only signal
+distinguishing them is a ppid this branch never reads. Twice in an hour is a
+frequency, not an anecdote: this project's sibling suite leaves an orphan behind
+as a matter of course.
+
 ## The same lesson, learned on one branch and not the other
 
 `fleet_guard` has two refusal branches, and the FOREIGN one already knows this:
