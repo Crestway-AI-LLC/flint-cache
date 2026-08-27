@@ -112,3 +112,19 @@ the nine unread failures are already explained and need no further triage.
 Remaining unexplained: the two `cold_start_roles` firings this bug is about,
 one `upgrade`, one `slot_cutover_recovery`+`snapshot_restore`, and one run
 with no `GATES FAILED` line at all.
+
+## All nine triaged, 2026-08-27 — the backlog is now zero
+
+| runs | drill | verdict |
+|---|---|---|
+| 4 | `promote_notice` | pre-fix; fix measured effective (0/36 since) |
+| 2 | `cold_start_roles` | this bug; diagnostic now in the drill |
+| 1 | `upgrade` | `THROTTLED no live replica` on the post-upgrade round trip — the replica was still catching up after the roll and the quorum gate throttled the verify write. The readiness family again (#176, OPS-0045, this bug), one sample; file on recurrence |
+| 1 | `slot_cutover_recovery` + `snapshot_restore` | dest seat `Connection refused` mid-recovery, TWO drills red in one run — smells environmental (loaded runner / cross-drill), one sample; file on recurrence |
+| 1 | — | **cancelled** at 15 min, both jobs — superseded by a later push, not a failure at all |
+
+So the honest restatement of "red ~15% and none triaged": **8 real failures in
+59 completed runs (~14%)**, of which four are already fixed, two carry this
+bug's diagnostic, and two are single-sample observations recorded here to be
+filed if they recur. The number that was alarming was partly an artifact of
+nobody looking — which was the point of writing it down.
