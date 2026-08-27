@@ -9,7 +9,7 @@ cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
 fleet_init $FLINT_DRILL_ROOT/flint-mng- 6324 6325
 fleet_guard
-fleet_kill server; fleet_kill controller; sleep 0.4
+fleet_kill controller; fleet_kill server; sleep 0.4
 D1=$FLINT_DRILL_ROOT/flint-mng-1; D2=$FLINT_DRILL_ROOT/flint-mng-2
 rm -rf "$D1" "$D2" "$D1.log" "$D2.log"
 P1=6324; P2=6325

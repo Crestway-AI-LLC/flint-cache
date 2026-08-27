@@ -68,7 +68,7 @@ STALL_S="${FLINT_STALL_S:-10}"
 # the wait below stops arming the gate and the drill quietly tests nothing.
 MAX_STALE_MS=5000
 
-fleet_kill server; fleet_kill proxy; fleet_kill controlplane; fleet_kill controller
+fleet_kill controller; fleet_kill server; fleet_kill proxy; fleet_kill controlplane
 sleep 0.4
 cleanup() {
   # SCOPED: a box-wide SIGCONT resumes a sibling drill's deliberately
@@ -76,7 +76,7 @@ cleanup() {
   _cont=$(fleet_pids controlplane 2>/dev/null | tr '\n' ' ')
   [ -n "$_cont" ] && kill -CONT $_cont 2>/dev/null
   $CTL -f "$INV" stop >/dev/null 2>&1
-  fleet_kill server; fleet_kill proxy; fleet_kill controlplane; fleet_kill controller
+  fleet_kill controller; fleet_kill server; fleet_kill proxy; fleet_kill controlplane
   rm -rf "$D"
 }
 trap cleanup EXIT

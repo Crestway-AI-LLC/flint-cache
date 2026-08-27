@@ -23,13 +23,13 @@ fleet_init $FLINT_DRILL_ROOT/flint-pxreg 7351 7352 7691 7733 9999
 fleet_guard
 D=$FLINT_DRILL_ROOT/flint-pxreg; INV=$D/cluster.flint
 CTL=./target/release/flintctl
-fleet_kill server; fleet_kill proxy
-fleet_kill controlplane; fleet_kill controller
+fleet_kill controller; fleet_kill server
+fleet_kill proxy; fleet_kill controlplane
 sleep 0.4
 cleanup() {
   $CTL -f "$INV" stop 2>/dev/null
-  fleet_kill server; fleet_kill proxy
-  fleet_kill controlplane; fleet_kill controller
+  fleet_kill controller; fleet_kill server
+  fleet_kill proxy; fleet_kill controlplane
   rm -rf "$D"
 }
 trap cleanup EXIT

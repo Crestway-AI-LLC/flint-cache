@@ -74,14 +74,14 @@ NPAIRS="${FLINT_CHURN_PAIRS:-2}"
 case "$NPAIRS" in 1|2|3|4) ;; *) echo "FAIL: FLINT_CHURN_PAIRS must be 1-4 (ports are declared for 4)"; exit 2 ;; esac
 PROXY=7388
 
-fleet_kill server; fleet_kill proxy; fleet_kill controlplane; fleet_kill controller
+fleet_kill controller; fleet_kill server; fleet_kill proxy; fleet_kill controlplane
 sleep 0.4
 WPIDS=()
 stop_writers() { local p; for p in ${WPIDS[@]+"${WPIDS[@]}"}; do kill -CONT "$p" 2>/dev/null; kill -TERM "$p" 2>/dev/null; done; WPIDS=(); }
 cleanup() {
   stop_writers
   $CTL -f "$INV" stop >/dev/null 2>&1
-  fleet_kill server; fleet_kill proxy; fleet_kill controlplane; fleet_kill controller
+  fleet_kill controller; fleet_kill server; fleet_kill proxy; fleet_kill controlplane
   rm -rf "$D"
 }
 trap cleanup EXIT

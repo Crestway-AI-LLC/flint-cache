@@ -40,13 +40,13 @@ INV=$D/cluster.flint
 TAG=edge-roll-9
 rm -rf "$D" "$STATE"; mkdir -p "$D"
 
-fleet_kill server; fleet_kill proxy
-fleet_kill controlplane; fleet_kill controller
+fleet_kill controller; fleet_kill server
+fleet_kill proxy; fleet_kill controlplane
 sleep 0.4
 cleanup() {
   ./target/release/flintctl -f "$INV" stop >/dev/null 2>&1
-  fleet_kill server; fleet_kill proxy
-  fleet_kill controlplane; fleet_kill controller
+  fleet_kill controller; fleet_kill server
+  fleet_kill proxy; fleet_kill controlplane
   [ -n "${KEEP:-}" ] || rm -rf "$D" "$STATE"
 }
 trap cleanup EXIT

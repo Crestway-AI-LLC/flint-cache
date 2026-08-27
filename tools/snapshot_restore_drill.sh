@@ -21,10 +21,10 @@ B=./target/release/flint-server
 CP=./target/release/flint-controlplane
 CTL=./target/release/flint-controller
 D=$FLINT_DRILL_ROOT/flint-snap; rm -rf "$D"; mkdir -p "$D"
-fleet_kill server; fleet_kill controller
+fleet_kill controller; fleet_kill server
 fleet_kill controlplane; sleep 0.4
 cleanup() {
-  fleet_kill server; fleet_kill controller
+  fleet_kill controller; fleet_kill server
   fleet_kill controlplane; rm -rf "$D"
 }
 trap cleanup EXIT

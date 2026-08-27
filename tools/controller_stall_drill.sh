@@ -36,7 +36,7 @@ D=$FLINT_DRILL_ROOT/flint-stall; INV=$D/cluster.flint
 CTL=./target/release/flintctl
 LEASE="${FLINT_LEASE_TTL_MS:-3000}"
 STALL_S="${FLINT_STALL_S:-10}"
-fleet_kill server; fleet_kill proxy; fleet_kill controlplane; fleet_kill controller
+fleet_kill controller; fleet_kill server; fleet_kill proxy; fleet_kill controlplane
 sleep 0.4
 cleanup() {
   # CONT first: a still-STOPPED process cannot be asked to stop cleanly.
@@ -48,7 +48,7 @@ cleanup() {
   _cont=$(fleet_pids controller controlplane 2>/dev/null | tr '\n' ' ')
   [ -n "$_cont" ] && kill -CONT $_cont 2>/dev/null
   $CTL -f "$INV" stop >/dev/null 2>&1
-  fleet_kill server; fleet_kill proxy; fleet_kill controlplane; fleet_kill controller
+  fleet_kill controller; fleet_kill server; fleet_kill proxy; fleet_kill controlplane
   rm -rf "$D"
 }
 trap cleanup EXIT

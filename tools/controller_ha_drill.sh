@@ -10,7 +10,7 @@ cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
 fleet_init $FLINT_DRILL_ROOT/flint-ha- 6450 6451 6452
 fleet_guard
-fleet_kill server; fleet_kill controller; sleep 0.4
+fleet_kill controller; fleet_kill server; sleep 0.4
 D1=$(mktemp -d $FLINT_DRILL_ROOT/flint-ha-1.XXXXXX); D2=$(mktemp -d $FLINT_DRILL_ROOT/flint-ha-2.XXXXXX)
 D3=$(mktemp -d $FLINT_DRILL_ROOT/flint-ha-3.XXXXXX)
 B=./target/release/flint-server
@@ -19,8 +19,8 @@ cleanup() {
   # fleet_kill, not "--port 645": that is a substring match, and it stopped
   # being self-contained the moment disk_selffill declared 6458. Scoped to the
   # ports this drill gave fleet_init (6450-6452).
-  fleet_kill server
   fleet_kill controller
+  fleet_kill server
   rm -rf "$D1" "$D2" "$D3"
 }
 trap cleanup EXIT

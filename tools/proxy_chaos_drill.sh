@@ -12,9 +12,9 @@ set -euo pipefail
 . "$(dirname "$0")/lib/fleet.sh"
 fleet_init $FLINT_DRILL_ROOT/flint-proxychaos 6338 6339 6340 6341 6342 6343 6344 6345
 fleet_guard
+fleet_kill controller
 fleet_kill server
 fleet_kill proxy
-fleet_kill controller
 sleep 0.5
 cargo build --release -q -p flint-server --features rocks
 cargo build --release -q -p flint-proxy -p flint-controller -p flint-chaos
@@ -23,9 +23,9 @@ ITERS="${ITERS:-12}"
 for seed in $SEEDS; do
   echo "== proxy-chaos seed=$seed iters=$ITERS"
   ./target/release/proxy_chaos --port-base 6338 --iterations "$ITERS" --keys 300 --seed "$seed"
+  fleet_kill controller
   fleet_kill server
   fleet_kill proxy
-  fleet_kill controller
   sleep 0.3
 done
 echo "ALL SEEDS PASSED"

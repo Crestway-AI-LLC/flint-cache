@@ -20,14 +20,14 @@ STATE=$FLINT_DRILL_ROOT/flint-decom-state
 INV=$FLINT_DRILL_ROOT/flint-decom.flint
 RUN=$FLINT_DRILL_ROOT/flint-decom-run
 ACKFILE=$FLINT_DRILL_ROOT/flint-decom-ack
-fleet_kill server; fleet_kill proxy
-fleet_kill controlplane; fleet_kill controller
+fleet_kill controller; fleet_kill server
+fleet_kill proxy; fleet_kill controlplane
 sleep 0.4
 cleanup() {
   rm -f "$RUN"
   ./target/release/flintctl -f "$INV" stop 2>/dev/null
-  fleet_kill server; fleet_kill proxy
-  fleet_kill controlplane; fleet_kill controller
+  fleet_kill controller; fleet_kill server
+  fleet_kill proxy; fleet_kill controlplane
   rm -rf "$STATE" "$INV" "$ACKFILE"
 }
 trap cleanup EXIT

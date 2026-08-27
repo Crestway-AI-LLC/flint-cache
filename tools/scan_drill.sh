@@ -14,13 +14,13 @@ cd "$(dirname "$0")/.."
 fleet_init $FLINT_DRILL_ROOT/flint-scan-state 7301 7302 7303 7304 7679 7720
 fleet_guard
 STATE=$FLINT_DRILL_ROOT/flint-scan-state; INV=$FLINT_DRILL_ROOT/flint-scan.flint
-fleet_kill server; fleet_kill proxy
-fleet_kill controlplane; fleet_kill controller
+fleet_kill controller; fleet_kill server
+fleet_kill proxy; fleet_kill controlplane
 sleep 0.4
 cleanup() {
   ./target/release/flintctl -f "$INV" stop 2>/dev/null
-  fleet_kill server; fleet_kill proxy
-  fleet_kill controlplane; fleet_kill controller
+  fleet_kill controller; fleet_kill server
+  fleet_kill proxy; fleet_kill controlplane
   rm -rf "$STATE" "$INV"
 }
 trap cleanup EXIT

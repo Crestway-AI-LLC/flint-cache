@@ -38,13 +38,13 @@ TAG=build-1234
 
 cleanup() {
   $CTL -f "$D/cluster.flint" stop >/dev/null 2>&1
-  fleet_kill server; fleet_kill proxy
-  fleet_kill controlplane; fleet_kill controller
+  fleet_kill controller; fleet_kill server
+  fleet_kill proxy; fleet_kill controlplane
   [ -n "${KEEP:-}" ] || rm -rf "$D"
 }
 trap cleanup EXIT
-fleet_kill server; fleet_kill proxy
-fleet_kill controlplane; fleet_kill controller
+fleet_kill controller; fleet_kill server
+fleet_kill proxy; fleet_kill controlplane
 sleep 0.4
 
 cargo build --release -q -p flint-server --features rocks || { echo "FAIL: build"; exit 1; }

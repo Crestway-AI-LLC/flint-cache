@@ -51,13 +51,13 @@ CASE="$D/case.flint"     # rewritten per assertion.
 cleanup() {
   # Always the pristine file: see harness rule 1 in the header.
   $CTL -f "$LIVE" stop >/dev/null 2>&1
-  fleet_kill server; fleet_kill proxy
-  fleet_kill controlplane; fleet_kill controller
+  fleet_kill controller; fleet_kill server
+  fleet_kill proxy; fleet_kill controlplane
   [ -n "${KEEP:-}" ] || rm -rf "$D"
 }
 trap cleanup EXIT
-fleet_kill server; fleet_kill proxy
-fleet_kill controlplane; fleet_kill controller
+fleet_kill controller; fleet_kill server
+fleet_kill proxy; fleet_kill controlplane
 
 # WAIT for the ports, do not sleep at them. A fixed pause after a kill races
 # the kernel releasing the socket: back-to-back runs of this drill failed

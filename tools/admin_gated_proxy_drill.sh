@@ -41,13 +41,13 @@ B=127.0.0.1:7442
 PROXY=127.0.0.1:7443
 CP=127.0.0.1:7444
 TAG=admingate-1
-fleet_kill server; fleet_kill proxy
-fleet_kill controlplane; fleet_kill controller
+fleet_kill controller; fleet_kill server
+fleet_kill proxy; fleet_kill controlplane
 sleep 0.4
 cleanup() {
   ./target/release/flintctl -f "$INV" stop >/dev/null 2>&1
-  fleet_kill server; fleet_kill proxy
-  fleet_kill controlplane; fleet_kill controller
+  fleet_kill controller; fleet_kill server
+  fleet_kill proxy; fleet_kill controlplane
   rm -rf "$STATE"
 }
 trap cleanup EXIT

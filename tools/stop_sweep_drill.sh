@@ -21,13 +21,13 @@ fleet_guard
 A=$FLINT_DRILL_ROOT/flint-sweep-a; B=$FLINT_DRILL_ROOT/flint-sweep-b
 INVA=$FLINT_DRILL_ROOT/flint-sweep-a.flint; INVB=$FLINT_DRILL_ROOT/flint-sweep-b.flint
 CTL=./target/release/flintctl
-fleet_kill server; fleet_kill proxy
-fleet_kill controlplane; fleet_kill controller
+fleet_kill controller; fleet_kill server
+fleet_kill proxy; fleet_kill controlplane
 sleep 0.4
 cleanup() {
   $CTL -f "$INVA" stop >/dev/null 2>&1; $CTL -f "$INVB" stop >/dev/null 2>&1
-  fleet_kill server; fleet_kill proxy
-  fleet_kill controlplane; fleet_kill controller
+  fleet_kill controller; fleet_kill server
+  fleet_kill proxy; fleet_kill controlplane
   kill "${TAIL_PID:-0}" 2>/dev/null
   rm -rf "$A" "$B" "$INVA" "$INVB"
 }

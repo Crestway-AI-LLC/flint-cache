@@ -21,11 +21,11 @@ CP=./target/release/flint-controlplane
 PX=./target/release/flint-proxy
 CTL=./target/release/flint-controller
 D=$FLINT_DRILL_ROOT/flint-ctls; rm -rf "$D"; mkdir -p "$D"
-fleet_kill server; fleet_kill proxy
-fleet_kill controlplane; fleet_kill controller; sleep 0.4
+fleet_kill controller; fleet_kill server
+fleet_kill proxy; fleet_kill controlplane; sleep 0.4
 cleanup() {
-  fleet_kill server; fleet_kill proxy
-  fleet_kill controlplane; fleet_kill controller
+  fleet_kill controller; fleet_kill server
+  fleet_kill proxy; fleet_kill controlplane
   rm -rf "$D"
 }
 trap cleanup EXIT

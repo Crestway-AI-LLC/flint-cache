@@ -36,7 +36,7 @@ fleet_init $FLINT_DRILL_ROOT/flint-reroute 6398 6399 6400 6401
 fleet_guard
 B=./target/release/flint-server
 D=$FLINT_DRILL_ROOT/flint-reroute; rm -rf "$D"; mkdir -p "$D"
-fleet_kill server; fleet_kill proxy; fleet_kill controller; fleet_kill controlplane
+fleet_kill controller; fleet_kill server; fleet_kill proxy; fleet_kill controlplane
 sleep 0.3
 cleanup() { fleet_kill server; fleet_kill proxy; fleet_kill controller; fleet_kill controlplane; rm -rf "$D"; }
 trap cleanup EXIT

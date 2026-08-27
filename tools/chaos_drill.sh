@@ -23,5 +23,5 @@ echo "== chain traversal (200k elements) under failover"
 fleet_kill server
 echo "== chain traversal (200k) with the CONTROLLER driving failovers"
 ./target/release/chain --port-base 6330 --elements 200000 --kills 8 --seed 13 --driver controller
-fleet_kill server; fleet_kill controller
+fleet_kill controller; fleet_kill server
 echo "ALL SEEDS PASSED"

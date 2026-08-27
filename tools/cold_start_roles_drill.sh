@@ -27,13 +27,13 @@ STATE=$FLINT_DRILL_ROOT/flint-coldrole-state
 INV=$FLINT_DRILL_ROOT/flint-coldrole.flint
 A=127.0.0.1:7403   # inventory pair[0]
 B=127.0.0.1:7404   # inventory pair[1] — the one we promote
-fleet_kill server; fleet_kill proxy
-fleet_kill controlplane; fleet_kill controller
+fleet_kill controller; fleet_kill server
+fleet_kill proxy; fleet_kill controlplane
 sleep 0.4
 cleanup() {
   ./target/release/flintctl -f "$INV" stop 2>/dev/null
-  fleet_kill server; fleet_kill proxy
-  fleet_kill controlplane; fleet_kill controller
+  fleet_kill controller; fleet_kill server
+  fleet_kill proxy; fleet_kill controlplane
   rm -rf "$STATE" "$INV"
 }
 trap cleanup EXIT

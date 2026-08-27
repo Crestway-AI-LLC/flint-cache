@@ -10,7 +10,7 @@ cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
 fleet_init $FLINT_DRILL_ROOT/flint-mp- 6500 6501 6510 6511 6520
 fleet_guard
-fleet_kill server; fleet_kill controller; sleep 0.4
+fleet_kill controller; fleet_kill server; sleep 0.4
 # Three pairs on fixed ports; roles float within each pair.
 declare -a A=(6500 6501) B=(6510 6511) C=(6520 6521)
 DIRS=()
@@ -19,8 +19,8 @@ cleanup() {
   # fleet_kill, not a truncated pkill pattern: "--port 65" is a substring
   # match that reaches ports this drill does not own.
   # Scoped to the ports this drill declared to fleet_init.
-  fleet_kill server
   fleet_kill controller
+  fleet_kill server
   for p in 6500 6501 6510 6511 6520 6521; do rm -rf "$FLINT_DRILL_ROOT/flint-mp-$p"; done
 }
 trap cleanup EXIT

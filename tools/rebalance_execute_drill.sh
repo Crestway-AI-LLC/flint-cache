@@ -10,7 +10,7 @@ cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
 fleet_init $FLINT_DRILL_ROOT/flint-rb- 6600 6601 6602
 fleet_guard
-fleet_kill server; fleet_kill controller; sleep 0.4
+fleet_kill controller; fleet_kill server; sleep 0.4
 B=./target/release/flint-server
 P0=6600; P1=6601; P2=6602
 DIRS=""

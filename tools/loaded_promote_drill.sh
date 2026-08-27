@@ -59,8 +59,8 @@ PROMOTE_BUDGET_S="${LOADPROMOTE_BUDGET_S:-25}"
 fail() { echo "FAIL: $*"; exit 1; }
 cleanup() {
   [ -n "${FEEDER:-}" ] && kill "$FEEDER" 2>/dev/null
-  fleet_kill server
   fleet_kill controller
+  fleet_kill server
   rm -rf "$MDIR" "$RDIR"
 }
 trap cleanup EXIT

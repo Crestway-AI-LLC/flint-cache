@@ -15,12 +15,12 @@ fleet_guard
 CTL=./target/release/flintctl
 B=./target/release/flint-server
 D=$FLINT_DRILL_ROOT/flint-certrot; rm -rf "$D"; mkdir -p "$D"
-fleet_kill server; fleet_kill proxy
-fleet_kill controlplane; fleet_kill controller; sleep 0.4
+fleet_kill controller; fleet_kill server
+fleet_kill proxy; fleet_kill controlplane; sleep 0.4
 cleanup() {
   $CTL -f "$D/cluster.flint" stop >/dev/null 2>&1
-  fleet_kill server; fleet_kill proxy
-  fleet_kill controlplane; fleet_kill controller
+  fleet_kill controller; fleet_kill server
+  fleet_kill proxy; fleet_kill controlplane
   rm -rf "$D"
 }
 trap cleanup EXIT

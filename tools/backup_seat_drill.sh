@@ -22,13 +22,13 @@ fleet_guard
 STATE=$FLINT_DRILL_ROOT/flint-bkseat
 INV=$FLINT_DRILL_ROOT/flint-bkseat.flint
 CTL=./target/release/flintctl
-fleet_kill server; fleet_kill proxy; fleet_kill controlplane
-fleet_kill controller; fleet_kill backup
+fleet_kill controller; fleet_kill server; fleet_kill proxy
+fleet_kill controlplane; fleet_kill backup
 sleep 0.4
 cleanup() {
   $CTL -f "$INV" stop 2>/dev/null
-  fleet_kill server; fleet_kill proxy; fleet_kill controlplane
-  fleet_kill controller; fleet_kill backup
+  fleet_kill controller; fleet_kill server; fleet_kill proxy
+  fleet_kill controlplane; fleet_kill backup
   rm -rf "$STATE" "$INV" $FLINT_DRILL_ROOT/flint-bkseat-sets
 }
 trap cleanup EXIT

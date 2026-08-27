@@ -30,13 +30,13 @@ A=127.0.0.1:7421
 B=127.0.0.1:7422
 PROXY=127.0.0.1:7423
 CP=127.0.0.1:7424
-fleet_kill server; fleet_kill proxy
-fleet_kill controlplane; fleet_kill controller
+fleet_kill controller; fleet_kill server
+fleet_kill proxy; fleet_kill controlplane
 sleep 0.4
 cleanup() {
   ./target/release/flintctl -f "$INV" stop 2>/dev/null
-  fleet_kill server; fleet_kill proxy
-  fleet_kill controlplane; fleet_kill controller
+  fleet_kill controller; fleet_kill server
+  fleet_kill proxy; fleet_kill controlplane
   rm -rf "$STATE" "$INV"
 }
 trap cleanup EXIT

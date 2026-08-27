@@ -20,9 +20,9 @@ set -euo pipefail
 . "$(dirname "$0")/lib/fleet.sh"
 fleet_init $FLINT_DRILL_ROOT/flint-proxychain 6460 6461 6462 6463 6464 6465 6466 6467
 fleet_guard
+fleet_kill controller
 fleet_kill server
 fleet_kill proxy
-fleet_kill controller
 sleep 0.5
 
 cargo build --release -q -p flint-server --features rocks

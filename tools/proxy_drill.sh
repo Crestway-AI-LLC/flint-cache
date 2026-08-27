@@ -11,15 +11,15 @@ cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
 fleet_init $FLINT_DRILL_ROOT/flint-px- 6630 6631 6640 6641 6666
 fleet_guard
-fleet_kill server; fleet_kill controller; fleet_kill proxy; sleep 0.4
+fleet_kill controller; fleet_kill server; fleet_kill proxy; sleep 0.4
 B=./target/release/flint-server
 # Two pairs: (6630 master, 6631 replica) and (6640 master, 6641 replica).
 cleanup() {
   # fleet_kill, not a truncated pkill pattern: "--port 66" is a substring
   # match that reaches ports this drill does not own.
   # Scoped to the ports this drill declared to fleet_init.
-  fleet_kill server
   fleet_kill controller
+  fleet_kill server
   fleet_kill proxy
   rm -rf $FLINT_DRILL_ROOT/flint-px-*
 }

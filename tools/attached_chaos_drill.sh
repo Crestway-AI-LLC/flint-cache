@@ -27,13 +27,13 @@ fleet_guard
 D=$FLINT_DRILL_ROOT/flint-attached; INV=$D/cluster.flint
 CTL=./target/release/flintctl
 ITER="${1:-6}"
-fleet_kill server; fleet_kill proxy
-fleet_kill controlplane; fleet_kill controller
+fleet_kill controller; fleet_kill server
+fleet_kill proxy; fleet_kill controlplane
 sleep 0.4
 cleanup() {
   $CTL -f "$INV" stop >/dev/null 2>&1
-  fleet_kill server; fleet_kill proxy
-  fleet_kill controlplane; fleet_kill controller
+  fleet_kill controller; fleet_kill server
+  fleet_kill proxy; fleet_kill controlplane
   rm -rf "$D"
 }
 trap cleanup EXIT
