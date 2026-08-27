@@ -1316,6 +1316,65 @@ assert_spawning_drills_declare_ports() {
 # so tested different code than shipped. Hence the positive control below,
 # against a SYNTHETIC list with a name at the end of a line: a real drill name
 # would pass for the wrong reason the day someone reorders CORE.
+# BUG-0056. The gate runs ~130 shell scripts, its own libraries and itself,
+# and asserted that none of them PARSE. A syntax error in a rarely-taken branch
+# surfaces as a confusing runtime failure at the end of a long gate, on a box
+# about to terminate.
+#
+# The same class cost real money in the ops repo the same day: gate-box/run.sh
+# generated a remote script that failed to parse, so nothing ran — including
+# the line that records the exit status — and the caller rendered the missing
+# status as "the run may still be going". The most alarming outcome produced
+# the most reassuring message (ops field-notes §3).
+#
+# Runs FIRST in the check stage: it is under a second, and a script that does
+# not parse can break the asserts that follow it.
+assert_scripts_parse() {
+  local f n=0 bad="" probe
+
+  # POSITIVE CONTROL, and it is not ceremony: this check's entire validator is
+  # one external command. If `bash -n` were a no-op here — wrong interpreter,
+  # a shell that does not implement -n, a PATH surprise — it would certify all
+  # ~130 files silently. So prove it can reject something first.
+  probe=$(mktemp "${TMPDIR:-/tmp}/gateparse.XXXXXX") || {
+    echo "GATES FAILED: cannot create a temp file for the parse control"; exit 1; }
+  printf 'if true; then
+' > "$probe"          # unterminated `if`
+  if bash -n "$probe" 2>/dev/null; then
+    rm -f "$probe"
+    echo "GATES FAILED: bash -n ACCEPTED a file with an unterminated 'if'."
+    echo "      The parse check cannot fail, so it would certify anything."
+    exit 1
+  fi
+  rm -f "$probe"
+
+  for f in tools/*.sh tools/lib/*.sh tools/gates.sh; do
+    [ -f "$f" ] || continue
+    n=$((n + 1))
+    bash -n "$f" 2>/dev/null || bad="$bad $f"
+  done
+
+  # A glob that stops matching reports "checked nothing, found nothing wrong",
+  # which is indistinguishable from a pass. Same trap the drill-registration
+  # assert guards, stated the same way.
+  [ "$n" -gt 0 ] || {
+    echo "GATES FAILED: the parse check matched NO files. A directory rename or"
+    echo "      a cd that did not happen certifies the whole tree by examining"
+    echo "      none of it. Refusing to report a verdict."
+    exit 1
+  }
+
+  if [ -n "$bad" ]; then
+    echo "GATES FAILED: these shell scripts do not parse:"
+    for f in $bad; do
+      echo "      $f"
+      bash -n "$f" 2>&1 | head -2 | sed 's/^/        /'
+    done
+    exit 1
+  fi
+  echo "  $n shell scripts parse"
+}
+
 assert_every_drill_accounted_for() {
   local flat name f missing="" orphan=""
   # Nothing to say about a tree with no drills in it; see _have_drill_files.
@@ -1449,6 +1508,7 @@ if want check; then
   echo "== gates: fmt, clippy, tests (both feature configs)"
   assert_no_default_ports
   assert_no_port_overlap
+  assert_scripts_parse
   assert_no_scope_overlap
   assert_server_flags_are_read
   assert_spawning_drills_declare_ports

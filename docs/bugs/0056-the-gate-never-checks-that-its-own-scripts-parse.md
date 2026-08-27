@@ -1,6 +1,6 @@
 # BUG-0056: the release gate runs ~130 drill scripts and checks that none of them parse (OPEN)
 
-Status: OPEN, found 2026-08-26 · Severity: low, but the failure it permits is
+Status: FIXED 2026-08-27 · Severity: low, but the failure it permits is
 expensive to diagnose.
 
 ## Symptom
@@ -52,3 +52,37 @@ Open question worth deciding rather than defaulting: `tools/lib/*.sh` are
 sourced rather than executed, and `bash -n` on a sourced fragment is still
 meaningful, but a file that is only ever sourced into a specific context may
 legitimately not stand alone.
+
+## Fixed 2026-08-27
+
+`assert_scripts_parse` runs `bash -n` over `tools/*.sh`, `tools/lib/*.sh` and
+`gates.sh` itself, **first** in the check stage — 137 files, well under a
+second, ahead of `fmt` and every other assert, since a script that does not
+parse can break the asserts that follow it.
+
+Two guards, both of which the write-up above asked for:
+
+**The empty-glob guard.** `n == 0` fails rather than certifying. A directory
+rename or a `cd` that did not happen would otherwise report "checked nothing,
+found nothing wrong", which is indistinguishable from a pass — the same trap
+`assert_every_drill_accounted_for` names, stated the same way.
+
+**A positive control on the validator itself**, which the write-up did not ask
+for and which turned out to be the more interesting half. This check's entire
+verdict rests on one external command. If `bash -n` were a no-op here — a
+shell without `-n`, a PATH surprise — it would silently certify all 137 files.
+So it first feeds `bash -n` a file containing an unterminated `if` and refuses
+to report a verdict if that is *accepted*. A check whose validator is never
+itself tested is the shape of every bug in field-notes §1.
+
+Three controls run against the finished check: a real syntax error is caught
+and the offending file and line named; an empty match refuses to certify; a
+clean tree still passes, so it is not a check that always fails.
+
+## Immediate relevance
+
+The same day, a mechanical reorder touched **46** drill scripts at once for
+BUG-0061. `bash -n` over all of them was run by hand, because the gate could
+not do it. That is precisely the edit class this stage exists for: a large
+sed-shaped change where one bad substitution is invisible until the affected
+drill happens to run.
