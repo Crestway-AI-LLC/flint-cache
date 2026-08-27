@@ -503,6 +503,92 @@ different regimes, and only one of them recorded which.
 So what remains is the measurement itself: a large LSM on a box with cores to
 spare, one sweep of the job count, with the shape recorded beside every column.
 
+## 2026-08-26 — MEASURED AT PRODUCTION SCALE: 96 GB, and the ratio holds
+
+The 6.4 GB result came with an explicit caveat that production is ~96 GB and
+that a small-dataset finding can invert — this file's own history is two sweeps
+that disagreed because their shapes did. So: the same 2x2, 15x the data, on a
+2-core pinned seat.
+
+| level base | bg_jobs | mean MB/s | first | last | decay | stall | phys | W-Amp |
+|---|---|---|---|---|---|---|---|---|
+| 8 MB | default (2) | 34.2 | 68.5 | 22.9 | 67% | 83.7% | 136 GB | 16.0 |
+| 8 MB | 4 | 65.9 | 97.2 | 47.5 | 51% | 49.0% | 157 GB | pending |
+| 64 MB | default | 45.2 | 126.1 | 26.8 | 79% | 80.9% | 104 GB | 11.3 |
+| **64 MB** | **4** | **89.2** | 179.7 | **60.0** | 67% | **43.4%** | 185 GB | **10.2** |
+
+**Error bar 0.6%**, measured the same way as before — `default` against an
+explicit `2`, which is the same engine by two routes. Every gap above is two
+orders of magnitude clear of it.
+
+**The recommendation survives the scale-up.** Best against baseline is **2.6x**
+at 96 GB and was 2.7x at 6.4 GB. Both knobs are still required together, and
+`bg_jobs`'s own contribution GREW with depth: +93% at the 8 MB base here
+against +32% at 6.4 GB, which is the direction this file predicted and the
+opposite of what the 800 MB run showed.
+
+### Three things the small run understated, and they matter for a default
+
+- **Absolute throughput is far lower.** 89.2 MB/s where 6.4 GB read 224.3. The
+  tuning lifts the ceiling by the same ratio; the ceiling is much lower.
+- **Stalling does not go away.** 2.0% at 6.4 GB, **43.4%** at 96 GB in the best
+  configuration. "Fixed" was the wrong word for what the small run showed;
+  "less bad" is the right one. The seat still spends nearly half its time
+  waiting on compaction.
+- **The fastest configuration has the LARGEST footprint** — 185 GB resident for
+  96 GB logical, against 104 GB for 64 MB/default. On a 436 GB i4i.large that
+  is ~80 GB of extra resident bytes bought with the throughput, and it is a
+  real cost to price rather than an accounting artefact.
+
+### What true amplification says, now that it is measured
+
+The W-Amp column here is the CORRECTED metric (see the correction below; every
+earlier figure in this file was compaction CPU). Sampled from the engine's own
+stats before each configuration wiped its data directory:
+
+- 8 MB base, default: **16.0**
+- 64 MB base, default: **11.3**
+- 64 MB base, jobs=4: **10.2**
+
+So the winning configuration runs 2.6x faster at **36% lower write
+amplification** than the baseline. That is the claim withdrawn earlier the same
+day for resting on a broken metric. It was true; it was not knowable from the
+evidence then offered for it.
+
+It also resolves the footprint result rather than contradicting it: the winner
+writes LESS in total (10.2 vs 16.0) while leaving MORE resident (185 GB vs
+136 GB). Less rewriting, more deferred merging. Only the correct metric
+separates those.
+
+### A correction to the 6.4 GB guidance about which columns to trust
+
+That run found `last` varying 16% between identical configurations and
+concluded: compare means, `last` and `decay` are the noisy ones. **At 96 GB
+that is wrong.** Two runs of the identical configuration, two hours apart:
+
+| | run 1 | run 2 | spread |
+|---|---|---|---|
+| mean | 34.2 | 34.1 | 0.3% |
+| last | 22.9 | 23.0 | **0.4%** |
+| decay | 67% | 67% | 0 |
+| stall | 83.7% | 83.8% | 0.1% |
+| phys | 139548 MB | 139641 MB | 0.07% |
+
+The noisiness was a small-dataset artefact. `last` is one interval's rate, and
+at 6.4 GB an interval is ~4 seconds of sample; at 96 GB it is ~300. The rule to
+keep is not "distrust `last`" but **"an interval too short to average anything
+carries one sample's variance"** — which is the same lesson as the 0.25-second
+intervals that invalidated the first attempt, arriving from the other side.
+
+### What this still does not license
+
+- **A defaults change.** A 32 MB write buffer is a per-engine memory
+  commitment nobody has priced, and 185 GB resident on a 436 GB seat is a
+  capacity decision, not a tuning one. What the numbers support is a proposal.
+- **Anything about the refill half of this bug**, which remains untouched.
+- **Anything about a fleet.** One seat, one namespace, no replication, no
+  concurrent read load.
+
 ## 2026-08-26 (later) — CORRECTION: every "W-Amp" in this file is compaction CPU
 
 **`ingest_decay_sweep.sh` was reading the wrong column, and had been for
