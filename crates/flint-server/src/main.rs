@@ -340,25 +340,87 @@ fn quarantine_unresumable(snaps_dir: &str, cursor: u64) -> usize {
 /// consumed the marker, and the tailer's WALGAP escalation EXITS a process
 /// that, in a fleet, nothing restarts (soak run 34 cycle 6).
 #[cfg(feature = "rocks")]
+/// What a probe reply MEANS, which is not the same as whether it succeeded.
+///
+/// A master answering `-WALGAP` or a fence refusal has made a DECISION about
+/// this copy, and repeating the question gets the same answer. A socket that
+/// returned EAGAIN has decided nothing; the master never spoke. Collapsing
+/// both into one `Err` is what cost soak 2026-08-27 cycle 3 ninety-five
+/// seconds: the rewind had already selected a valid snapshot (seq 177753
+/// under a fence of 203474), the probe hit `Resource temporarily unavailable
+/// (os error 11)`, the caller read that as a refusal, deleted a good copy and
+/// full re-seeded 93 files with the new master's write gates shut.
+#[derive(Debug, PartialEq)]
+enum ProbeVerdict {
+    /// The master accepted the cursor.
+    Resumable,
+    /// The master answered, and said no. A verdict; do not retry it.
+    Refused(String),
+    /// The master did not answer. Says nothing about the copy.
+    Transport(String),
+}
+
+/// Classify a probe reply. Split out from the I/O so the distinction that
+/// matters can be asserted without a socket.
+#[cfg(feature = "rocks")]
+fn classify_probe(reply: std::io::Result<Value>) -> ProbeVerdict {
+    match reply {
+        Ok(Value::Simple(s)) if s.starts_with("FLINTSYNC-OK") => ProbeVerdict::Resumable,
+        // The master spoke. Whatever it said, asking again will not change it.
+        Ok(Value::Error(e)) => ProbeVerdict::Refused(e),
+        // A reply we cannot parse is a protocol problem, not a hiccup. Treated
+        // as a refusal deliberately: retrying a malformed exchange is how a
+        // boot spins instead of falling back to the path that works.
+        Ok(other) => ProbeVerdict::Refused(format!("unexpected reply {other:?}")),
+        Err(e) => ProbeVerdict::Transport(e.to_string()),
+    }
+}
+
+/// Ask `target` whether a copy at (`cursor`, `epoch`) can resume tailing its
+/// lineage, RETRYING when the transport fails.
+///
+/// The retry is not politeness. Discarding a fence-vouched snapshot because a
+/// socket blocked converts a bounded tail into a full re-seed, and on a
+/// freshly promoted master with `--min-replicas-to-write 1` that re-seed is a
+/// write outage for its whole duration. A refusal still returns immediately:
+/// the master has decided, and the fallback is correct.
+#[cfg(feature = "rocks")]
 fn probe_resume(
     target: &str,
     cursor: u64,
     epoch: flint_storage::manifest::Epoch,
 ) -> Result<(), String> {
-    match internal_call_once(
-        target,
-        &[
-            b"FLINTSYNC",
-            cursor.to_string().as_bytes(),
-            epoch.generation.to_string().as_bytes(),
-            epoch.counter.to_string().as_bytes(),
-        ],
-    ) {
-        Ok(Value::Simple(s)) if s.starts_with("FLINTSYNC-OK") => Ok(()),
-        Ok(Value::Error(e)) => Err(e),
-        Ok(other) => Err(format!("unexpected reply {other:?}")),
-        Err(e) => Err(e.to_string()),
+    const ATTEMPTS: u32 = 5;
+    let mut last = String::new();
+    for attempt in 1..=ATTEMPTS {
+        let verdict = classify_probe(internal_call_once(
+            target,
+            &[
+                b"FLINTSYNC",
+                cursor.to_string().as_bytes(),
+                epoch.generation.to_string().as_bytes(),
+                epoch.counter.to_string().as_bytes(),
+            ],
+        ));
+        match verdict {
+            ProbeVerdict::Resumable => return Ok(()),
+            ProbeVerdict::Refused(e) => return Err(format!("refused: {e}")),
+            ProbeVerdict::Transport(e) => {
+                last = e;
+                if attempt < ATTEMPTS {
+                    eprintln!(
+                        "rewind: probe attempt {attempt}/{ATTEMPTS} to {target} did not \
+                         complete ({last}) — the master has not answered, so this says \
+                         nothing about the copy; retrying"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(200 * attempt as u64));
+                }
+            }
+        }
     }
+    Err(format!(
+        "unreachable: {ATTEMPTS} probe attempts did not complete ({last})"
+    ))
 }
 
 /// The rewind rejoin (#187): instead of discarding a superseded copy and
@@ -526,8 +588,13 @@ fn try_rewind(data_dir: &std::path::Path, snaps_dir: &str, target: &str) -> bool
         match probe_resume(target, restored_cursor, epoch) {
             Ok(()) => {}
             Err(e) => {
+                // Says WHICH it was. This line used to read "refused" for
+                // every failure, including a socket that never reached the
+                // master — and that wording sent the 95s investigation at the
+                // fence logic rather than at the transport.
                 eprintln!(
-                    "rewind: {target} refused the restored copy at attach ({e}); full re-seed"
+                    "rewind: cannot resume from the restored copy against {target} ({e}); \
+                     full re-seed"
                 );
                 let _ = std::fs::remove_dir_all(data_dir);
                 return false;
@@ -6028,5 +6095,81 @@ mod quarantine_tests {
             quarantine_unresumable(d.to_str().expect("test setup"), 1),
             0
         );
+    }
+}
+
+/// The distinction that cost soak 2026-08-27 cycle 3 ninety-five seconds: a
+/// master's refusal and a socket's failure arrived as the same `Err`, so a
+/// fence-vouched snapshot was discarded over `EAGAIN` and the rejoin became a
+/// 93-file full re-seed while the promoted master shed every write.
+#[cfg(all(test, feature = "rocks"))]
+mod probe_verdict_tests {
+    use super::{ProbeVerdict, classify_probe};
+    use flint_resp::Value;
+    use std::io::{Error, ErrorKind};
+
+    #[test]
+    fn an_ok_handshake_is_resumable() {
+        assert_eq!(
+            classify_probe(Ok(Value::Simple("FLINTSYNC-OK 42 e0.7".into()))),
+            ProbeVerdict::Resumable
+        );
+    }
+
+    /// The master spoke. Asking again gets the same answer, so this must not
+    /// be retried — retrying a WALGAP is the livelock BUG-0062 filed.
+    #[test]
+    fn a_master_error_is_a_verdict_not_a_hiccup() {
+        for msg in [
+            "WALGAP cursor 207196 is no longer reachable from this WAL: full sync required",
+            "cursor 999 is past the promotion fence 500 for epoch (0,7)",
+        ] {
+            assert_eq!(
+                classify_probe(Ok(Value::Error(msg.into()))),
+                ProbeVerdict::Refused(msg.into()),
+                "a master's answer must classify as Refused: {msg}"
+            );
+        }
+    }
+
+    /// THE REGRESSION. EAGAIN is the exact errno the soak hit ("Resource
+    /// temporarily unavailable (os error 11)"). The master never answered, so
+    /// this says nothing about the copy and must not read as a refusal.
+    #[test]
+    fn eagain_is_transport_not_refusal() {
+        let v = classify_probe(Err(Error::from_raw_os_error(11)));
+        assert!(
+            matches!(v, ProbeVerdict::Transport(_)),
+            "EAGAIN must be Transport, got {v:?} — classifying it as Refused discards a \
+             fence-vouched snapshot and turns a bounded tail into a full re-seed"
+        );
+    }
+
+    /// Every transport failure, not just the one that happened to bite.
+    #[test]
+    fn the_usual_transport_failures_are_all_retryable() {
+        for kind in [
+            ErrorKind::WouldBlock,
+            ErrorKind::TimedOut,
+            ErrorKind::ConnectionRefused,
+            ErrorKind::ConnectionReset,
+            ErrorKind::BrokenPipe,
+        ] {
+            let v = classify_probe(Err(Error::new(kind, "x")));
+            assert!(
+                matches!(v, ProbeVerdict::Transport(_)),
+                "{kind:?} must be Transport, got {v:?}"
+            );
+        }
+    }
+
+    /// A reply we cannot parse is a protocol fault, and retrying it spins.
+    /// Deliberately a refusal so the boot falls back to the path that works.
+    #[test]
+    fn an_unparseable_reply_is_refused_so_the_boot_falls_back() {
+        assert!(matches!(
+            classify_probe(Ok(Value::Integer(7))),
+            ProbeVerdict::Refused(_)
+        ));
     }
 }

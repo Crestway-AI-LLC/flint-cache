@@ -258,11 +258,45 @@ _fleet_sibling | grep -q 'flint-kvorphan-server' \
   || { echo "FAIL: the orphan is not visible to _fleet_sibling at all"; reap_orphans; exit 1; }
 _fleet_sibling_named_live | grep -q 'flint-kvorphan-server' \
   && { echo "FAIL: an orphan counted as a LIVE named sibling — ppid is not being read"; reap_orphans; exit 1; }
-OUT=$(FLINT_SIBLING_WINDOW=1 fleet_guard 2>&1); RC=$?
-[ "$RC" = 0 ] \
-  || { echo "FAIL: the guard REFUSED over an idle orphan (exit $RC). That is the bug:"; \
-       echo "$OUT" | sed 's/^/    /'; reap_orphans; exit 1; }
-echo "  proceeded past an idle orphan without a human killing it"
+# THIS ARM NEEDS THE ORPHAN TO BE THE ONLY THING IN THE WAY, and cannot make
+# that true. Inside a full gate run the previous drills' seats are still
+# exiting, so `foreign` is legitimately non-empty, the settle path is skipped
+# for THAT reason, and fleet_guard refuses correctly for something this arm is
+# not about. Worse, the sibling refusal PRINTS anyway whenever a sibling
+# exists, so the output cannot tell "the orphan blocked me" from "foreign
+# blocked me and the sibling message printed too".
+#
+# Asserting exit 0 assumed a pristine box: true standalone, false in the suite.
+# That is how this arm passed locally and failed on its first CI run -- the
+# non-hermetic-drill hazard, introduced by the same session that had just
+# named it. So: same idiom as case A -- skip, and SAY the precondition did not
+# hold, rather than report a verdict about something never tested.
+# WAIT FIRST, because skipping is cheap and a case that always skips is a case
+# that never runs. The foreign seats here are the previous drills' own, on
+# their way out; the gate runs back to back, so a few seconds is usually the
+# whole difference between exercising this and reporting n/a forever.
+H_FOREIGN=$(_fleet_foreign)
+if [ -n "$H_FOREIGN" ]; then
+  for _ in $(seq 1 20); do
+    sleep 1
+    H_FOREIGN=$(_fleet_foreign)
+    [ -z "$H_FOREIGN" ] && break
+  done
+  [ -z "$H_FOREIGN" ] && echo "  (waited for the previous drills' seats to exit)"
+fi
+if [ -n "$H_FOREIGN" ]; then
+  echo "  n/a — foreign seats are on the box, so an orphan is not the only"
+  echo "        blocker and this case did not run:"
+  printf '%s\n' "$H_FOREIGN" | head -4 | cut -c1-90 | sed 's/^/      foreign: /'
+  H_SKIPPED=1
+else
+  OUT=$(FLINT_SIBLING_WINDOW=1 fleet_guard 2>&1); RC=$?
+  [ "$RC" = 0 ] \
+    || { echo "FAIL: the guard REFUSED over an idle orphan on an otherwise clear box"; \
+         echo "      (exit $RC). That is the bug:"; \
+         echo "$OUT" | sed 's/^/    /'; reap_orphans; exit 1; }
+  echo "  proceeded past an idle orphan without a human killing it"
+fi
 reap_orphans; sleep 0.5
 
 echo "== I) NEGATIVE CONTROL: a LIVE sibling fleet must still refuse on sight"
@@ -272,11 +306,21 @@ echo "== I) NEGATIVE CONTROL: a LIVE sibling fleet must still refuse on sight"
 spawn_as flint-kv-server
 sleep 1
 OUT=$(FLINT_SIBLING_WINDOW=1 fleet_guard 2>&1); RC=$?
+# Exit 1 alone proves nothing here either: foreign leftovers produce it too, so
+# this arm would pass with the sibling logic deleted. It must see the SIBLING
+# refusal naming this fleet.
 [ "$RC" = 1 ] \
-  || { echo "FAIL: a live (parented) sibling fleet no longer refuses — D was"; \
+  || { echo "FAIL: a live (parented) sibling fleet no longer refuses — H was"; \
        echo "      implemented as 'idle is fine' and collapsed the contract (exit $RC)"; \
        echo "$OUT" | sed 's/^/    /'; exit 1; }
-echo "  a quiet but PARENTED sibling fleet still refuses — orphanhood, not idleness"
+echo "$OUT" | grep -q "another Flint-family project" \
+  || { echo "FAIL: refused, but not for the sibling reason — this arm would pass"; \
+       echo "      with the sibling logic removed, so it is asserting nothing:"; \
+       echo "$OUT" | sed 's/^/    /'; exit 1; }
+echo "$OUT" | grep -q "flint-kv-server" \
+  || { echo "FAIL: the sibling refusal did not name the fleet it refused over"; \
+       echo "$OUT" | sed 's/^/    /'; exit 1; }
+echo "  a quiet but PARENTED sibling fleet still refuses, by name — orphanhood, not idleness"
 cleanup; PIDS=""; sleep 0.5
 
 echo "PASS: fleet_guard sees sibling projects' fleets, refuses without claiming ownership, proceeds past an ORPHANED one while still refusing a parented one, does not misread our own binaries, honours FORCE, disowns prefix scopes, and tells a live peer drill from a foreign fleet"
@@ -288,5 +332,8 @@ echo "PASS: fleet_guard sees sibling projects' fleets, refuses without claiming 
 # you meant to capture — the last statement owns the status, so say so.
 if [ "${A_SKIPPED:-0}" = "1" ]; then
   echo "NOTE: case A (quiet box) was NOT exercised on this run — see above"
+fi
+if [ "${H_SKIPPED:-0}" = "1" ]; then
+  echo "NOTE: case H (idle orphan) was NOT exercised on this run — see above"
 fi
 exit 0
