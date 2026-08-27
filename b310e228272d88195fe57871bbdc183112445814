@@ -1,0 +1,2 @@
+Filed as BUG-0057; pushed as BUG-0058, following the same renumbering as its
+predecessor in this pair. The file is docs/bugs/0058-a-tier-that-is-already-down-fails-the-job-at-filesystem-init.md.
