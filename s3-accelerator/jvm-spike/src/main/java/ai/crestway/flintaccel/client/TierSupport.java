@@ -18,6 +18,7 @@ import software.amazon.awssdk.services.s3.S3AsyncClient;
 
 import software.amazon.s3.analyticsaccelerator.S3SdkObjectClient;
 import software.amazon.s3.analyticsaccelerator.S3SeekableInputStreamConfiguration;
+import software.amazon.s3.analyticsaccelerator.io.physical.PhysicalIOConfiguration;
 import software.amazon.s3.analyticsaccelerator.S3SeekableInputStreamFactory;
 
 /**
@@ -144,12 +145,33 @@ public final class TierSupport {
     // much as the bytes.
     long maxObj = num(get.apply("flint.max.object.bytes"),
         FlintObjectClient.DEFAULT_MAX_OBJECT_BYTES);
-    var cfg = S3SeekableInputStreamConfiguration.DEFAULT;
-    // ONE origin client, not two. The caching and bypass paths were each
-    // building `new S3SdkObjectClient(s3, false)` from identical arguments, and
-    // AAL starts a scheduled executor behind each -- so every mount paid for two
-    // where one will do. `false` means it does not own the underlying
-    // S3AsyncClient, which is now pooled and must outlive both.
+    // AAL's origin request size, exposed as a knob (ADR-0023 D17.4). AAL
+    // defaults to 8 MiB for blockSize, partSize and maxRangeSize alike, and
+    // that number is what decides the payoff on a sequential read: the cache
+    // saves first-byte latency per REQUEST, so speedup is
+    // 1 + (TTFB x BW)/(req x C) and the object's size does not enter it.
+    //
+    // Default 0 = leave AAL alone. A knob that silently changes behaviour for
+    // everyone in order to make an experiment convenient is not a knob.
+    long aalReq = num(get.apply("flint.aal.request.bytes"), 0);
+    S3SeekableInputStreamConfiguration cfg;
+    if (aalReq <= 0) {
+      cfg = S3SeekableInputStreamConfiguration.DEFAULT;
+    } else {
+      // Through AAL's own ConnectorConfiguration, because its builder is
+      // package-private -- fromConfiguration is the supported public seam and
+      // is what S3A itself uses. All three sizes move together: leaving
+      // maxRangeSize at 8 MiB while shrinking partSize would let AAL merge the
+      // smaller parts straight back into 8 MiB requests, and the knob would
+      // read as having no effect rather than as not having been applied.
+      java.util.Map<String, String> m = new HashMap<>();
+      m.put("physicalio.blocksizebytes", String.valueOf(aalReq));
+      m.put("physicalio.partsizebytes", String.valueOf(aalReq));
+      m.put("physicalio.maxrangesizebytes", String.valueOf(aalReq));
+      cfg = S3SeekableInputStreamConfiguration.fromConfiguration(
+          new software.amazon.s3.analyticsaccelerator.common.ConnectorConfiguration(m));
+    }
+
     FlintObjectClient cl =
         new FlintObjectClient(new S3SdkObjectClient(s3, false), async,
             chunk, budget, ttl, false, s3, cacheKms, immutable, immTtl, maxObj);
