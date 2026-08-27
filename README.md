@@ -101,7 +101,8 @@ to a build? [Releases](https://github.com/Crestway-AI-LLC/flint-cache/releases/l
 1. **No eviction, no miss storms.** Nothing is ever dropped because RAM ran
    low, so a hot key can't be evicted into a thundering herd against your
    backend. The failure mode of a full Flint is a refused *write* with a
-   clear error — never a silently missing read.
+   clear error — never a silently missing read. (A namespace you explicitly
+   declare evictable opts out of this; see the disk-fills section.)
 2. **No warm-up.** A restarted node serves its working set immediately from
    disk; failover hands traffic to a replica that has the data; a fresh
    replica seeds from a checkpoint. "The cache is cold, watch the database"
@@ -231,7 +232,7 @@ If your data lives *only* in Flint and losing the last second of it would
 matter, run a database as well. Every number above is measured by a drill in
 this repository with the command to reproduce it: **[docs/slo.md](docs/slo.md)**.
 
-## What happens when the disk fills — there is no eviction
+## What happens when the disk fills — nothing is evicted unless you asked
 
 Flint never evicts an unexpired key. Coming from Redis you might expect a
 `maxmemory-policy`; there deliberately isn't one — an eviction policy is a
@@ -255,6 +256,27 @@ Instead, pressure is handled by refusal, in layers:
   nothing already written is lost.
 - **Space returns** through TTL expiry (a compaction filter reclaims
   expired rows as compaction rewrites them) and on-demand `FLINTCOMPACT`.
+
+**The one exception, and it is opt-in per namespace.** A cache of data you can
+regenerate — chunks of an object store, a derived index — has the opposite
+problem: refusing admissions at the watermark freezes its resident set at
+whatever happened to load first, so the hit rate stops improving exactly when
+the cache starts mattering. For that case a namespace can be DECLARED
+evictable, with `--evictable-ns <names>` on the seat. Then, and only then, that
+namespace's cold keys are reclaimed under capacity pressure instead of the node
+refusing writes.
+
+Everything above still describes a namespace nobody declared, which is every
+namespace by default. There is no global setting that turns this on, the
+declaration is per namespace and revocable, and a seat shows what it holds in
+`FLINTINFO` as `evictable_ns`. Members of a pair must agree, which is checked
+at start and at every reload — a node evicting while its peer fills to `-QUOTA`
+is divergent policy, and it would be silent.
+
+The trade is stated plainly because it is a real one: a declared namespace is
+opting OUT of the durability promise this page is otherwise about. Acked writes
+in it can be deleted to make room. `docs/self-hosting.md` has the operational
+detail.
 
 The operational consequence: size for the working set and use TTLs. A
 cache that is full of unexpired data does not silently shed someone

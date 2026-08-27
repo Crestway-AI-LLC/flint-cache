@@ -197,6 +197,19 @@ round trip, so it wants roughly 1.3 Gbit/s of effective tier throughput to stay
 cached at the 50 ms default. Below that the tier genuinely is slower than S3
 for those reads, and degrading is the correct answer rather than a regression.
 
+**Run the client in the same region as its tier.** The 50 ms default assumes
+they are close, and it is not a soft assumption: measured 2026-08-26 from a
+laptop to a tier in `us-east-1`, PING round trip was **80 ms** and an `MGET` of
+five 64 KiB chunks was **102 ms** — so *every* read exceeded the budget, every
+read degraded to S3, and the cache did nothing at all. It failed the way it is
+designed to, quietly and correctly, and the counters said so (`degraded` rising,
+`chunk_hits` flat) — but nothing in the configuration would have hinted at it.
+
+If your reads are degrading and you cannot see why, measure the round trip to
+the tier first. Raising `tier.budget.ms` past your RTT will make the cache work
+again, at the cost of a slow tier no longer degrading promptly — which is a
+real trade, not a fix.
+
 ---
 
 ## What the tier must implement
