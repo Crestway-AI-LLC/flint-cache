@@ -493,6 +493,69 @@ Known gap: this gates client writes. A **replica** applying its master's
 WAL keeps writing regardless, so a replica can still fill. Size replicas
 with the same headroom as their master.
 
+## 3c. Evictable namespaces — opting a namespace OUT of durability
+
+Everything in 3b describes a node that refuses writes rather than lose any.
+That is the default and it is what you want for data a client believed was
+stored. It is the wrong behaviour for a cache of data you can regenerate: a
+node that refuses admissions at the watermark freezes its resident set at
+whatever loaded first, so its hit rate stops improving exactly when the cache
+starts to matter.
+
+For that case a namespace can be DECLARED evictable. **Nothing is evictable by
+default, there is no global switch, and the declaration is per namespace.**
+
+    flint-server --evictable-ns cache,thumbnails      # at start
+    FLINTCONFIG SET evictable-ns cache,thumbnails     # or reload, live
+
+**What you are agreeing to.** Acked writes in that namespace can be deleted to
+make room. Not expired, not refused — deleted, by a background thread, without
+an error to any client. Declare only namespaces whose contents you can
+regenerate from somewhere else.
+
+**Both members of a pair must agree.** Checked at start and at every reload,
+and reported as `evictable_ns_agree`. One node evicting while its peer fills to
+`-QUOTA` is divergent policy rather than divergent decisions, and it would be
+silent.
+
+**How it behaves under pressure.** Reclaim engages ABOVE the shed line, so an
+evictable namespace evicts rather than ever reaching `-QUOTA`; a namespace you
+did not declare is untouched and behaves exactly as 3b describes. Cold keys are
+chosen by an S3-FIFO policy — deliberately not LRU, because a full-dataset scan
+under LRU evicts every object just before it is reused and drives the hit rate
+to roughly zero. Reclamation happens through the compaction filter, so it costs
+no extra writes: rows are dropped as compaction rewrites them anyway.
+
+**What to watch.** `FLINTINFO` carries an `evict:` line, empty unless something
+is declared:
+
+| field | meaning |
+|---|---|
+| `policy_keys`, `policy_bytes` | what the policy is tracking. Zero while traffic flows means the hooks are not feeding it |
+| `dropped` | rows the compaction filter actually removed |
+| `refused` | marks the guard REFUSED. **Nonzero is a bug**, not tuning: something asked to evict outside a declared namespace |
+| `forced_passes`, `marks_at_last_pass` | the ratio to watch — see below |
+| `skipped_cooldown`, `skipped_small` | which batching floor is binding |
+| `overflow` | marks dropped for want of room; reclaim is batching within a cycle |
+| `accesses`, `accesses_dropped` | read signal, and how much of it is lost to lock contention |
+
+**The number that matters is marks per forced pass.** Forcing a compaction pass
+rewrites the namespace's surviving rows, so it costs the same whether it
+reclaims a thousand keys or a million. A low `marks_at_last_pass` against a
+climbing `forced_passes` means the node is paying a full-namespace rewrite for
+a fraction of the benefit. Two floors exist to prevent that — a minimum batch
+and a per-namespace cooldown — and the two `skipped_` counters say which one is
+binding. Cooldown-dominated means pressure is outrunning the interval;
+small-dominated means marks arrive too slowly to be worth forcing, and ordinary
+compaction is probably already draining them.
+
+**A caveat worth knowing before you declare anything.** The chaos suite's
+durability oracle asserts that no acked write is lost, which an evictable
+namespace is licensed to do. The harness therefore REFUSES to run against a
+fleet declaring one, and eviction is consequently not covered by the durability
+testing that covers everything else here. That is a known gap, recorded in
+ADR-0013.
+
 ## 4. Managing users (tenants)
 
 A tenant is a namespace + a token + a proxy subset + quotas. All via

@@ -104,6 +104,38 @@ get the page before the first shed error reaches a client.
     evictable ones. The published figure is about durability of acked writes,
     which an evictable namespace is explicitly opting out of.
 
+  **The oracle question has an answer, and it is not "track which keys were
+  evicted".** Recording every evicted key would defeat the memory bound the
+  evictor is built around. It is also unnecessary, because the oracle makes
+  FOUR assertions and eviction can only reach one of them:
+
+  | assertion | reachable by eviction? |
+  |---|---|
+  | corruption — the value's CRC fails to parse | **no**: a row is present and correct, or absent |
+  | time travel — a seq above the last one written | **no** |
+  | cross-key bleed — the value names another key | **no** |
+  | loss — an acked seq is below the durability floor | **yes**, and only this one |
+
+  An evicted key reads as ABSENT. A key re-written after eviction carries a
+  HIGHER seq, never a lower one. So eviction manifests as absence and nothing
+  else, and the fix is not to learn which keys were licensed but which
+  PROPERTY is — which is static, per namespace, and known before the run.
+
+  So: for a namespace declared evictable, relax the PRESENCE check and keep
+  corruption, time-travel and bleed fully enforced. The oracle keeps three of
+  its four teeth against exactly the workload that most needs them.
+
+  And absence is still bounded rather than free. The seat already counts rows
+  the compaction filter dropped (`evict:` line, `dropped`), so the harness can
+  assert **missing acked keys <= dropped**. That ties every absence to a
+  licensed deletion without recording a single key: more absences than
+  deletions is a loss the evictor cannot account for, which is precisely the
+  bug the oracle exists to catch.
+
+  Not implemented. `Target::refuse_if_evictable` currently refuses outright,
+  which is the honest state until the above exists — a relaxed oracle that has
+  not been built is not a weaker guarantee, it is no guarantee.
+
   See ADR-0023 for the bulk path this per-key evictor does not cover.
 - **Read-recency (true LRU) tracking.** Every read becomes a write on the
   LSM — the worst possible trade under disk pressure, which is the only

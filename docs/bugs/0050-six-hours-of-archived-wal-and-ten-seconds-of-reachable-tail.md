@@ -209,3 +209,41 @@ cheap check is one grep of `node-7001.log`.
 
 Not claimed: that this fixes the attach incidents *generally*. A replica can
 die for reasons that never touch the WAL, and nothing here observed one.
+
+## 2026-08-26 — the regression test for this is FLAKY under load (open)
+
+`repl::bug_0050_iterator_shape::a_genuinely_recycled_wal_still_raises_walgap`
+fails intermittently. Observed once during a full-workspace run on a laptop at
+load average 24-61, from concurrent sessions:
+
+    panicked at crates/flint-storage/src/repl.rs:1197:14:
+    iter: Error { message: "IO error: No such file or directory: while stat a
+    file for size: /var/folders/.../flint-b50-recyc-66333/000018.log" }
+
+    test result: FAILED. 158 passed; 1 failed
+
+Run alone it passes 5/5. The re-run of the full suite was green at 498. So this
+appears only when the workspace suite runs tests concurrently AND the machine
+is busy.
+
+**Ruled out: a temp-directory collision.** Every test in that module uses a
+distinct prefix (`flint-b50-snap-`, `-reg-`, `-recyc-`, `-acct-`, `-shape-`)
+plus the pid, so two of them cannot share a path. That was the first guess and
+it is wrong.
+
+**Likely cause.** The test opens with `RocksKv::open_with_retention(&d, 0, 0)`
+— retention OFF, so flushed segments are DELETED rather than archived, which is
+exactly the "recycled" condition it wants to create. It then asserts
+`updates_since` raises `WalGap`. But if the segment is removed between the
+iterator being constructed and being read, RocksDB surfaces an IO error
+instead, and under load that window widens.
+
+**The trap in fixing it.** Accepting the IO error as equivalent to `WalGap`
+would make the test pass and would weaken it: those are different observations,
+and the test exists to prove the empty-iterator fix does not SWALLOW a genuine
+`WalGap`. Whichever of the two the test actually needs should be decided
+deliberately, and the deletion made deterministic rather than raced if the
+answer is `WalGap`.
+
+A flaky test "fixed" by a re-run is the failure mode here, so the fix needs a
+control that fails without it.

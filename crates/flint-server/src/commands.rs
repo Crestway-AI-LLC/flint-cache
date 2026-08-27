@@ -353,6 +353,17 @@ impl<'a> Dispatcher<'a> {
                 if args.len() < 3 || !(args.len() - 1).is_multiple_of(2) {
                     return arity_err("mset");
                 }
+                // CROSSSLOT, for the same reason the set ops refuse it
+                // (BUG-0053). MSET is the worse half: a key this node does
+                // not own is WRITTEN here anyway, so the value lands on a
+                // node that will never be asked for it and the caller is
+                // told OK. Nothing upstream catches this — flint-proxy's
+                // route_key derives one slot from args[1] and ships the
+                // whole command there.
+                let keys: Vec<Vec<u8>> = args[1..].chunks(2).map(|c| c[0].clone()).collect();
+                if let Some(e) = Self::crossslot(&keys[0], &keys[1..]) {
+                    return e;
+                }
                 for chunk in args[1..].chunks(2) {
                     if let Err(e) = self.strings.set(
                         slot_for_key(&chunk[0]),
@@ -368,6 +379,15 @@ impl<'a> Dispatcher<'a> {
             b"MGET" => {
                 if args.len() < 2 {
                     return arity_err("mget");
+                }
+                // CROSSSLOT (BUG-0053). Without this a key belonging to
+                // another pair reads as a MISS — nil in its correct slot,
+                // indistinguishable from a key that genuinely is not there.
+                // That is the same "plausible-looking answer that is
+                // silently incorrect" the set ops refuse, and MGET reached
+                // neither this helper nor the inline copy.
+                if let Some(e) = Self::crossslot(&args[1], &args[2..]) {
+                    return e;
                 }
                 // Redis MGET yields nil (not an error) for wrong-type keys.
                 Value::Array(Some(
@@ -3727,6 +3747,86 @@ mod tests {
     /// slots, so it answers cross-slot set operations happily. The refusal
     /// is a deliberate divergence from standalone semantics toward cluster
     /// semantics, so it has to be asserted here.
+    /// BUG-0053: MGET and MSET reached neither cross-slot guard, so a key on
+    /// another pair came back as a nil IN ITS CORRECT POSITION — a miss the
+    /// caller cannot distinguish from absence — and MSET wrote the value onto
+    /// a node that does not own the slot.
+    ///
+    /// The proxy cannot catch this: `route_key` derives one slot from args[1]
+    /// and ships the whole command there, which is a documented v0 deferral.
+    /// So this refusal is the only enforcement, exactly as it is for the set
+    /// ops.
+    #[test]
+    fn cross_slot_mget_and_mset_are_refused_rather_than_answered_wrongly() {
+        // Capability assert, same reason as the set-op test above: if these
+        // keys stop hashing apart this test becomes a tautology, and it must
+        // fail here naming why rather than pass vacuously.
+        assert_ne!(
+            slot_for_key(b"alpha"),
+            slot_for_key(b"beta"),
+            "stale corpus: these keys no longer land in different slots, \
+             so this test would pass without exercising the refusal"
+        );
+
+        let s = MemKv::new();
+        call(&s, &[b"SET", b"alpha", b"1"]);
+        call(&s, &[b"SET", b"beta", b"2"]);
+
+        for cmd in [
+            &[&b"MGET"[..], b"alpha", b"beta"][..],
+            &[&b"MSET"[..], b"alpha", b"1", b"beta", b"2"][..],
+        ] {
+            let name = String::from_utf8_lossy(cmd[0]).into_owned();
+            match call(&s, cmd) {
+                Value::Error(e) => {
+                    assert!(
+                        e.starts_with("CROSSSLOT"),
+                        "{name}: the refusal must carry the CROSSSLOT code clients \
+                         key off, got {e}"
+                    );
+                    assert!(
+                        e.contains("alpha") && e.contains("beta"),
+                        "{name}: the error must name BOTH keys, or the caller \
+                         cannot tell which pair collided: {e}"
+                    );
+                }
+                other => panic!(
+                    "{name}: answered a cross-slot request instead of refusing it, \
+                     which is the silent-wrong-answer this guard exists to stop: {other:?}"
+                ),
+            }
+        }
+    }
+
+    /// The other half, and the one that makes the refusal a discriminator
+    /// rather than a blanket ban on multi-key calls: colocated keys must
+    /// still be ANSWERED, and answered correctly.
+    #[test]
+    fn same_slot_mget_and_mset_are_answered_normally() {
+        assert_eq!(
+            slot_for_key(b"{s}alpha"),
+            slot_for_key(b"{s}beta"),
+            "hash tags no longer colocate, so this control proves nothing"
+        );
+
+        let s = MemKv::new();
+        match call(&s, &[b"MSET", b"{s}alpha", b"1", b"{s}beta", b"2"]) {
+            Value::Simple(ok) => assert_eq!(ok, "OK", "colocated MSET must succeed"),
+            other => panic!("colocated MSET was refused: {other:?}"),
+        }
+        match call(&s, &[b"MGET", b"{s}alpha", b"{s}missing", b"{s}beta"]) {
+            Value::Array(Some(v)) => {
+                assert_eq!(v.len(), 3, "MGET must answer one element per key");
+                assert_eq!(v[0], Value::Bulk(Some(b"1".to_vec())));
+                // The nil stays IN ITS SLOT — the property the S3 accelerator
+                // chunk-indexes against, confirmed here rather than assumed.
+                assert_eq!(v[1], Value::Bulk(None), "a miss must not compact the reply");
+                assert_eq!(v[2], Value::Bulk(Some(b"2".to_vec())));
+            }
+            other => panic!("colocated MGET was refused: {other:?}"),
+        }
+    }
+
     #[test]
     fn a_cross_slot_set_op_is_refused_rather_than_answered_wrongly() {
         // Capability assert: this corpus tests what it claims only if the

@@ -80,13 +80,21 @@ echo "  SET k1 v2 via proxy -> immediate GET sees v2"
 echo "== read-your-own-writes holds for EVERY key of a multi-key write (MSET)"
 # Regression for the review-found bug: only MSET's FIRST key was invalidated,
 # so a cached later key kept serving its old value through the same proxy.
-$A MSET ma old-a mb old-b >/dev/null
-$A GET ma >/dev/null; $A GET mb >/dev/null       # cache both
-$A MSET ma new-a mb new-b >/dev/null             # rewrite both via THIS proxy
-VA=$($A GET ma); VB=$($A GET mb)
+#
+# COLOCATED UNDER A HASH TAG (BUG-0053). Bare `ma`/`mb` land in slots 497 and
+# 12690, and MSET now refuses cross-slot rather than writing a key onto a node
+# that does not own it. That refusal made this step fail with an empty GET,
+# which reads as "the cache was not invalidated" and is really "the write
+# never happened". What the step is FOR — every key of a multi-key write being
+# dropped from the cache, not just the first — needs two keys in ONE write,
+# not two keys in two slots, so the tag costs the assertion nothing.
+$A MSET '{m}a' old-a '{m}b' old-b >/dev/null
+$A GET '{m}a' >/dev/null; $A GET '{m}b' >/dev/null   # cache both
+$A MSET '{m}a' new-a '{m}b' new-b >/dev/null         # rewrite both via THIS proxy
+VA=$($A GET '{m}a'); VB=$($A GET '{m}b')
 [ "$VA" = "new-a" ] || { echo "FAIL: MSET did not invalidate first key (got $VA)"; exit 1; }
 [ "$VB" = "new-b" ] || { echo "FAIL: MSET did not invalidate later key (got $VB)"; exit 1; }
-echo "  MSET ma mb -> immediate GETs see new-a/new-b (all written keys dropped)"
+echo "  MSET {m}a {m}b -> immediate GETs see new-a/new-b (all written keys dropped)"
 
 echo "== staleness bound, edge 1: a write BEHIND the proxy is invisible within TTL"
 $A GET k1 >/dev/null  # re-fill cache with v2
