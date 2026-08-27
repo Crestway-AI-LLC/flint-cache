@@ -124,9 +124,7 @@ reassurance — the same shape as `MAX_QUERY_BUF`'s "a legitimate connection can
 never accumulate this much", which is also true per connection and false at
 2048 of them.
 
-### Severity, stated honestly
-
-Not yet measured, and the audit should not guess. What is established is
+### Severity, MEASURED 2026-08-27 (this section's earlier text said "not yet measured") What is established is
 reachability and the absence of a bound; what is NOT established is the size a
 real tenant reaches, or whether the RESP encoder's own buffering fails first
 and more gracefully. A 10M-member set at ~20 bytes per member is ~200 MB
@@ -152,3 +150,46 @@ Refusing is the behaviour this product already has everywhere else. A
 **Remaining candidates unaudited:** pipeline depth and accumulated replies,
 the async write queue against value size, per-namespace state scaling with
 namespace count.
+
+## The measurement, and the two harnesses that measured nothing
+
+`flint-server --engine mem`, one hash of 2000 fields x 100 KB = ~200 MB, one
+`HGETALL`, RSS sampled at 50 ms:
+
+    RSS loaded                 226 MB
+    peak RSS during HGETALL    639 MB
+    delta                    + 412 MB     (~2x the collection)
+    reply on the wire          181 MB
+
+**~2x the collection, transient, per in-flight command**, on a node that
+permits `MAX_CONNS` 2048 of them. Sixteen concurrent clients each doing this
+to a 200 MB collection is 6.5 GB of transient allocation on a 16 GiB seat,
+none of it refused, none of it accounted anywhere. That is the aggregate this
+bug is named for, with a number on it.
+
+The 2x is not a surprise once measured — it is `scan_prefix`'s `Vec` plus the
+`.map(...).collect()`, both live, and then the encoded reply on top.
+`OUT_FLUSH_THRESHOLD` does not help: it flushes BETWEEN replies in a pipeline,
+and a single reply is appended whole before the check.
+
+### Two earlier harnesses reported no problem, and both were broken
+
+Recorded because a wrong negative here would have closed the candidate:
+
+1. **50k-100k fields x 32 B**, sampled at 100 ms: delta 0 MB. The collection
+   was ~4 MB and the operation finished inside one sampling interval. Reading
+   "0 MB" as "no problem" would have been reading the sampler, not the server.
+2. **2000 fields x 100 KB via `valkey-cli --pipe`**: RSS 6 MB after a
+   nominally 200 MB load. `--pipe` silently landed NOTHING — `HLEN` 0 — while a
+   single `HSET` of the same 100 KB value succeeded. The load failed, not the
+   server, and the giveaway was RSS 6 MB where 200 MB was expected.
+
+Both produced a clean-looking result from a harness that never exercised the
+thing. The working harness speaks RESP over a socket directly; `--pipe` is not
+usable for large values.
+
+### What this does not establish
+
+That any tenant does this. The measurement shows the cost is real and
+unbounded, not that it has been paid. `MAX_CONNS` 2048 is the multiplier that
+makes it a node-level question rather than a slow query.
