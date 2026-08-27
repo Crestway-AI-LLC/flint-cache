@@ -71,9 +71,21 @@ Two further defects were latent in it, invisible while it was never run:
 
 ## Verification
 
-4/4 pass, and the tier answers PING afterwards. The full accelerator set is
-green with the change: client 25, S3A 9, adoption 10, SSE-C 5, integrity 21,
-tier-down-at-build 10, mid-job-kill 4 — 84 checks, 0 failures.
+4/4 pass, and the tier answers PING afterwards.
+
+**Verified on BOTH engines, which is the whole point of this bug.** The full
+gate is green at 31 suites / 0 failures under valkey *and* under
+`FLINT_TIER_ENGINE=flint` with a locally built `flint-server --engine rocks`:
+
+- valkey — `GATE PASSED`, 31 passed, 0 failed
+- Flint — `GATE PASSED`, 31 passed, 0 failed
+
+Under Flint the kill has to work without a `SHUTDOWN` command, and it does:
+`Suite.killTier` sends the no-op, then discovers the listener by **port** via
+`lsof` and signals it. The suite's own output confirms the tier really went
+away rather than the checks passing against a live one — "4 tier failures
+observed, 4 degraded to origin". That is the exact condition this bug was filed
+about, now exercised rather than argued.
 
 **The positive control here is the history, not a construction:** the corrected
 expectation turns a FAILED spike green without touching a line of product code,
