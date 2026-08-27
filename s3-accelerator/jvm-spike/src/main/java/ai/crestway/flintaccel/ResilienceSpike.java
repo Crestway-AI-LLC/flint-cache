@@ -10,6 +10,8 @@ import java.util.Arrays;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicInteger;
 
+import ai.crestway.flintaccel.client.Suite;
+
 import io.lettuce.core.ClientOptions;
 import io.lettuce.core.RedisClient;
 import io.lettuce.core.api.StatefulRedisConnection;
@@ -174,13 +176,27 @@ public final class ResilienceSpike {
     @Override public void close() throws IOException { origin.close(); }
   }
 
+  /** The fixture's content scheme: md5("{key}:{gen}:{block}"), 16 bytes a block.
+   *
+   *  The GENERATION was missing here and this method computed
+   *  md5("{key}:{block}"), so every byte it expected was wrong and both
+   *  content checks in this spike failed -- against correct data. `gen` was
+   *  added to counting_s3.py so an object could be MUTATED, without which the
+   *  staleness contract is untestable; this expectation was never updated to
+   *  match. Nothing caught it because the gate never ran this spike, which is
+   *  the same reason BUG-0058 reached a real Spark job.
+   *
+   *  Generation 0: this spike never mutates the object. A test that did would
+   *  have to thread the current gen through. */
+  static final int GEN = 0;
+
   static byte[] expected(String key, long start, int len) throws Exception {
     MessageDigest md = MessageDigest.getInstance("MD5");
     byte[] out = new byte[len];
     for (int i = 0; i < len; i++) {
       long abs = start + i, block = abs / 16;
       md.reset();
-      out[i] = md.digest((key + ":" + block).getBytes("UTF-8"))[(int) (abs % 16)];
+      out[i] = md.digest((key + ":" + GEN + ":" + block).getBytes("UTF-8"))[(int) (abs % 16)];
     }
     return out;
   }
@@ -204,6 +220,7 @@ public final class ResilienceSpike {
     String redis = args.length > 1 ? args[1] : "redis://127.0.0.1:9399";
     String bucket = "bucket", key = "data/000006.bin";
     boolean ok = true;
+    Suite.redisUrl = redis;              // so tierPort() matches what we dial
 
     RedisClient rc = RedisClient.create(redis);
     // Reject rather than queue while disconnected, so a dead tier produces a
@@ -239,10 +256,20 @@ public final class ResilienceSpike {
           + "(%d tier hits)%n", (cold && warm) ? "ok" : "FAIL", c.tierHits.get());
 
       // Phase 2: KILL the tier, then keep reading.
+      //
+      // Through Suite's helper rather than a valkey-cli of our own. The old
+      // line shelled `valkey-cli -p 9399 shutdown` while this spike dialled
+      // whatever `redis` argument it was handed -- so on any other port it
+      // killed nothing, and every check below would have passed against a tier
+      // that was never down. It also assumed valkey: Flint implements no
+      // SHUTDOWN at all, so under FLINT_TIER_ENGINE=flint the kill was a no-op
+      // and "reads survive a dead tier" was measured against a healthy one.
+      // Suite.killTier shuts down over the connection we already hold and
+      // escalates to a signal on the pid holding the port, and it returns only
+      // once the port REFUSES -- a socket check, because a failed PING is true
+      // of a hung server that is still very much alive.
       System.out.println("     -- killing the tier --");
-      new ProcessBuilder("valkey-cli", "-p", "9399", "shutdown", "nosave")
-          .redirectErrorStream(true).start().waitFor();
-      Thread.sleep(600);
+      Suite.killTier(conn);
 
       int failuresBefore = c.tierFailures.get();
       boolean survived = true;
@@ -271,6 +298,16 @@ public final class ResilienceSpike {
 
     try { conn.close(); } catch (Exception ignored) {}
     rc.shutdown();
+
+    // Leave the box as we found it. gate.sh's start_svcs REFUSES TO CONTINUE
+    // when the tier does not answer, so a suite that kills the tier and walks
+    // away takes the rest of the gate down with it -- reported against
+    // whichever suite happened to run next.
+    Suite.startTier();
+    if (!Suite.tierAnswering()) {
+      System.out.println("[FAIL] the tier was not restored for the next suite");
+      ok = false;
+    }
     System.out.println("\nRESILIENCE SPIKE " + (ok ? "PASSED" : "FAILED"));
     System.exit(ok ? 0 : 1);
   }

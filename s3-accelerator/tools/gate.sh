@@ -359,6 +359,12 @@ run_suite "SSE-C bypass (5 checks)"    ai.crestway.flintaccel.s3a.SseCSuite  930
 # (ResilienceSpike) that the gate never ran, which is how a tier down at
 # submission time reached a real Spark job and failed it outright.
 run_suite "tier down at build (10 checks)" ai.crestway.flintaccel.client.TierDownSuite 9306 "$ROOT/jvm-spike/target/classes:$CP"
+# The other half of D12.9: a tier killed MID-JOB. This spike existed all along
+# and the gate never ran it, so nobody saw that it had been FAILING -- its
+# content expectation still computed md5("{key}:{block}") after the fixture
+# gained a generation field. It also kills the tier and now restarts it, which
+# start_svcs requires: it refuses to continue when the tier does not answer.
+run_suite "tier killed mid-job (4 checks)" ai.crestway.flintaccel.ResilienceSpike 9307 "$ROOT/jvm-spike/target/classes:$CP"
 
 # The tier is the one dependency every other suite trusts implicitly. This one
 # corrupts it on purpose: absent, truncated, wrong-bytes, and right-bytes-wrong-
