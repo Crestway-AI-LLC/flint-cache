@@ -112,16 +112,43 @@ fails four — the scope decision is defended, not just the feature. The two
 that stay green in both are the pure name-property and the missing-directory
 case, neither of which depends on scope.
 
-**NOT YET EXERCISED IN PRODUCTION, and the distinction matters.** The 60-minute
-soak of 2026-08-27 passed all five kill cycles with zero `quarantine:` lines,
-zero WALGAP and zero reconvergence failures — the race was simply not lost that
-run. A green soak therefore says the failure did not recur; it does not say the
-quarantine works. That claim rests on the unit tests above until a real
-`WalPurged` fires and the run continues past it.
+**DEMONSTRATED 2026-08-27 by `tools/walgap_quarantine_drill.sh`**, which forces
+the condition instead of waiting for the race. The 60-minute soak had passed
+all five cycles without once entering this path — zero WALGAP, zero quarantine
+— so a green soak said only that the failure did not recur. Hoping an hour of
+cloud time trips a TOCTOU window is not a test, so the drill reaches
+`WalPurged` through the front door: rewind A onto its own snapshot while the
+span is retained, `SIGSTOP` it, churn B until its 1 MB/1 s archive has recycled
+past A's cursor, then resume.
 
-Nor can the race's absence be credited to this fix: the fix does not prevent
-the race, only stop it livelocking. That soak also ran a HEAD data plane where
-the failing one ran rc.64, so something else may have moved. Unknown, and
+It proves its own precondition on the wire before drawing any conclusion —
+after each churn round it sends the same `FLINTSYNC` admission the tailer gets,
+and proceeds only once B answers `WALGAP` for A's exact cursor:
+
+```
+round 2: cursor 1256 is now UNREACHABLE (oldest retained batch starts at 3192,
+         past the 1257 needed (latest is 3925)): full sync required
+quarantine: snap-…-seq302-e0.1 (seq 302 <= unresumable cursor 1470) is no longer
+            a rewind candidate; kept as unresumable-snap-…-seq302-e0.1
+snaps-a now: LATEST unresumable-snap-…-seq302-e0.1
+PASS
+```
+
+so the span is provably gone, A provably asked for it, the quarantine fired,
+the snapshot was renamed rather than deleted, no `snap-` candidate survived,
+and the restart re-seeded and converged including new-timeline data.
+
+The first version of the drill wrote a fixed 4000 keys and recycled nothing:
+retention alone archives nothing, because a segment is only archived once its
+memtable has been FLUSHED. `FLINT_WRITE_BUFFER_MB=1` is the load-bearing half.
+That run reported "neither WALGAP nor quarantine" and was correctly read as a
+SETUP failure rather than evidence about this fix — which is why the drill now
+distinguishes the two in its failure text.
+
+Still true, and not weakened by the demonstration: **the fix does not stop the
+race.** Losing it now terminates instead of livelocking. And the soak's silence
+still cannot be credited to this fix — that run used a HEAD data plane where
+the failing one used rc.64, so something else may have moved. Unknown, and
 recorded as unknown.
 
 ## The shape
