@@ -145,6 +145,12 @@ public final class TierSupport {
     // much as the bytes.
     long maxObj = num(get.apply("flint.max.object.bytes"),
         FlintObjectClient.DEFAULT_MAX_OBJECT_BYTES);
+    // D17.5: the cap that decides the payoff is on the PART, not the object.
+    // flint.max.object.bytes is kept and still works -- it is deprecated, not
+    // deleted, because it is configurable and may already be set in the field,
+    // and a knob that silently stops working is worse than one that is kept.
+    long maxPart = num(get.apply("flint.max.part.bytes"),
+        FlintObjectClient.DEFAULT_MAX_PART_BYTES);
     // AAL's origin request size, exposed as a knob (ADR-0023 D17.4). AAL
     // defaults to 8 MiB for blockSize, partSize and maxRangeSize alike, and
     // that number is what decides the payoff on a sequential read: the cache
@@ -174,12 +180,12 @@ public final class TierSupport {
 
     FlintObjectClient cl =
         new FlintObjectClient(new S3SdkObjectClient(s3, false), async,
-            chunk, budget, ttl, false, s3, cacheKms, immutable, immTtl, maxObj);
+            chunk, budget, ttl, false, s3, cacheKms, immutable, immTtl, maxObj, maxPart);
     TierSupport t = new TierSupport(redis, conn, s3, cl,
         new S3SeekableInputStreamFactory(cl, cfg),
         new S3SeekableInputStreamFactory(
             new FlintObjectClient(new S3SdkObjectClient(s3, false), async,
-                chunk, budget, ttl, true, s3, cacheKms, immutable, immTtl, maxObj), cfg));
+                chunk, budget, ttl, true, s3, cacheKms, immutable, immTtl, maxObj, maxPart), cfg));
     t.lazy = tier.lazy;
     t.tierKey = uri;
     t.s3Key = s3key;

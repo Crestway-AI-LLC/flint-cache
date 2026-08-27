@@ -110,6 +110,21 @@ public final class FlintObjectClient implements ObjectClient {
    *  on a cluster. Tracked, blocked on M0. */
   public static final long DEFAULT_MAX_OBJECT_BYTES = 512L * 1024 * 1024;
 
+  /**
+   * ADR-0023 D17.5. The cap that decides the payoff belongs on the PART a
+   * reader asks for, not on the object it belongs to: the part is what sets
+   * how many first-byte latencies a read pays. 30 ms saved against an 8 MiB
+   * transfer is most of it; the same 30 ms against 900 MiB is a rounding error.
+   *
+   * <p>65 MiB, and the value is deliberately loose. Real part sizes cluster at
+   * 1-8 MiB when a reader chunks and at 883-2048 MiB when it streams a whole
+   * object, so anything from ~10 MB to ~500 MB separates them identically.
+   * The threshold sits in an empty gap of more than 100x, which is what makes
+   * it robust -- unlike the object cap, whose 512 MiB sat inside the real
+   * distribution of object sizes.
+   */
+  public static final long DEFAULT_MAX_PART_BYTES = 65L * 1024 * 1024;
+
   /** The chunk grid, and the ONE place it is spelled.
    *
    *  It costs 1.25x tier memory to be a power of two -- CHUNK + SEAL is one
@@ -128,6 +143,7 @@ public final class FlintObjectClient implements ObjectClient {
    *  see the other fourteen. */
   public static final int DEFAULT_CHUNK_BYTES = 65536;
   public final long maxObjectBytes;
+  public final long maxPartBytes;
   private final Map<String, Boolean> oversizeSeen = new ConcurrentHashMap<>();
   private final boolean immutable;
 
@@ -156,6 +172,10 @@ public final class FlintObjectClient implements ObjectClient {
   public final AtomicLong breakerOpens = new AtomicLong();
   public final AtomicLong breakerSkips = new AtomicLong();
   public final AtomicLong oversizeBypassed = new AtomicLong();
+  /** Requests read through because the PART was too large to be worth caching
+   *  (D17.5). Separate from oversizeBypassed: one says the object was refused,
+   *  the other says this read was, and an operator needs to tell them apart. */
+  public final AtomicLong oversizePartBypassed = new AtomicLong();
 
   /**
    * A breaker, because a SICK tier is worse than no tier.
@@ -285,7 +305,17 @@ public final class FlintObjectClient implements ObjectClient {
                            boolean bypass, S3AsyncClient raw, boolean cacheKms,
                            boolean immutable, long metaTtlImmutableSec,
                            long maxObjectBytes) {
+    this(origin, tier, chunkBytes, tierBudgetMs, metaTtlSec, bypass, raw, cacheKms,
+        immutable, metaTtlImmutableSec, maxObjectBytes, DEFAULT_MAX_PART_BYTES);
+  }
+
+  public FlintObjectClient(ObjectClient origin, RedisAsyncCommands<byte[], byte[]> tier,
+                           int chunkBytes, long tierBudgetMs, long metaTtlSec,
+                           boolean bypass, S3AsyncClient raw, boolean cacheKms,
+                           boolean immutable, long metaTtlImmutableSec,
+                           long maxObjectBytes, long maxPartBytes) {
     this.maxObjectBytes = maxObjectBytes;
+    this.maxPartBytes = maxPartBytes;
     this.immutable = immutable;
     this.metaTtlImmutableSec = metaTtlImmutableSec;
     this.bypass = bypass;
@@ -563,6 +593,16 @@ public final class FlintObjectClient implements ObjectClient {
       oversizeBypassed.incrementAndGet();
       return passthrough(r, ctx);
     }
+    // D17.5: admission on the PART, which is the unit that decides the payoff.
+    // A request large enough that a saved round trip is a rounding error buys
+    // nothing and would spend its own bytes of tier to do it. Read through and
+    // cache NOTHING -- writing the chunks anyway is the cost without the
+    // benefit, which is the exact trade this gate exists to refuse.
+    if (maxPartBytes > 0
+        && r.getRange().getEnd() - r.getRange().getStart() + 1 > maxPartBytes) {
+      oversizePartBypassed.incrementAndGet();
+      return passthrough(r, ctx);
+    }
     final long start = r.getRange().getStart(), end = r.getRange().getEnd();
     final long first = start / chunkBytes, last = end / chunkBytes;
     final int n = (int) (last - first + 1);
@@ -775,10 +815,11 @@ public final class FlintObjectClient implements ObjectClient {
 
   public String counters() {
     return String.format(
-        "chunk %d/%d  meta %d/%d  origin %dG/%dB  sf %dc/%dj  tierFail %d  degraded %d  bypassed %d  oversize %d",
+        "chunk %d/%d  meta %d/%d  origin %dG/%dB  sf %dc/%dj  tierFail %d  degraded %d  bypassed %d  oversize %d  oversizePart %d",
         chunkHits.get(), chunkHits.get() + chunkMisses.get(),
         metaHits.get(), metaHits.get() + metaMisses.get(),
         originGets.get(), originBytes.get(), claimed.get(), joined.get(),
-        tierFailures.get(), degraded.get(), bypassed.get(), oversizeBypassed.get());
+        tierFailures.get(), degraded.get(), bypassed.get(), oversizeBypassed.get(),
+        oversizePartBypassed.get());
   }
 }

@@ -164,6 +164,14 @@ FILL_BATCH_BYTES = 1024 * 1024
 #: admit the first and still refuse the second, which is what D18's admission
 #: class is shaped like and what this cap is a crude stand-in for.
 MAX_OBJECT_BYTES = 512 * 1024 * 1024
+# ADR-0023 D17.5. The cap that decides the payoff is on the PART a reader asks
+# for, not the object it belongs to: the part sets how many first-byte
+# latencies a read pays. 65 MiB, deliberately loose -- real part sizes cluster
+# at 1-8 MiB when a reader chunks and at 883-2048 MiB when it streams a whole
+# object, so anything from ~10 MB to ~500 MB separates them identically.
+# MUST MATCH the JVM client's DEFAULT_MAX_PART_BYTES: the two share one cache,
+# and a gap here would let one of them store what the other refuses.
+MAX_PART_BYTES = 65 * 1024 * 1024
 #: Any tier COMMAND slower than this is a miss -- and that is now what the code
 #: does, which it did not used to be.
 #:
@@ -195,6 +203,7 @@ class Counters:
                  "origin_gets", "origin_bytes", "tier_failures", "degraded",
                  "claimed", "joined", "bypassed", "integrity_failures",
                  "kms_bypassed", "kms_undetectable", "oversize_bypassed",
+                 "oversize_part_bypassed",
                  # ADR-0026: what the chunk grid costs on the wire. `wanted` is
                  # the byte range the caller asked this tier for; `moved` is
                  # what the grid made us fetch after rounding both ends out to
@@ -228,7 +237,8 @@ class FlintTier:
 
     def __init__(self, redis_client, origin, chunk=CHUNK,
                  budget_s=TIER_BUDGET_S, meta_ttl_s=META_TTL_S, bypass=False,
-                 cache_kms=False, max_object_bytes=MAX_OBJECT_BYTES):
+                 cache_kms=False, max_object_bytes=MAX_OBJECT_BYTES,
+                 max_part_bytes=MAX_PART_BYTES):
         self.r = redis_client
         self.origin = origin
         self.chunk = chunk
@@ -239,6 +249,7 @@ class FlintTier:
         # KMS plaintext is the version of this that ends a security review.
         self.cache_kms = cache_kms
         self.max_object_bytes = max_object_bytes
+        self.max_part_bytes = max_part_bytes
         self._kms = {}
         self.c = Counters()
         self._inflight = {}
@@ -504,6 +515,15 @@ class FlintTier:
         # quietly turns into "cache nothing".
         if size is not None and size > self.max_object_bytes:
             self.c.oversize_bypassed += 1
+            self.c.origin_gets += 1
+            return self.origin.get(bucket, key, start, start + length - 1)
+
+        # D17.5: admission on the PART. Unlike the object cap above this needs
+        # no size from the caller -- the request's own length is always known,
+        # so there is no unknown to fall back on and no way for it to turn
+        # quietly into "cache nothing".
+        if self.max_part_bytes > 0 and length > self.max_part_bytes:
+            self.c.oversize_part_bypassed += 1
             self.c.origin_gets += 1
             return self.origin.get(bucket, key, start, start + length - 1)
 

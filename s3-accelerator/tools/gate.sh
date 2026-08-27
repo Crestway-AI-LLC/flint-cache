@@ -397,6 +397,10 @@ run_suite "tier killed mid-job (4 checks)" ai.crestway.flintaccel.ResilienceSpik
 # never closes them, so this ran per READ -- measured at +4 threads each, +48
 # for twelve, until the JVM could not create another Netty event loop group.
 run_suite "connection sharing (8 checks)" ai.crestway.flintaccel.client.TierSharingSuite 9312 "$ROOT/jvm-spike/target/classes:$CP"
+# ADR-0023 D17.5: the cap is on the PART, not the object. The suite issues the
+# SAME request under two caps, because "a big request was not cached" is also
+# true of a cache that is simply broken.
+run_suite "part cap admission (7 checks)" ai.crestway.flintaccel.client.PartCapSuite 9313 "$ROOT/jvm-spike/target/classes:$CP"
 
 # The tier is the one dependency every other suite trusts implicitly. This one
 # corrupts it on purpose: absent, truncated, wrong-bytes, and right-bytes-wrong-
