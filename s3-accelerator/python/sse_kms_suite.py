@@ -44,7 +44,12 @@ def fs_for(endpoint, tier, cache_kms=False):
 def read(f, key, off, n):
     with f.open(f"s3://bucket/{key}", "rb") as h:
         h.seek(off)
-        return h.read(n)
+        out = h.read(n)
+    # D17.5.1: the fill lands off the read path. Every caller here reads and
+    # then counts what is in the tier, so the fill has to settle first or a
+    # negative control ("without KMS the tier IS populated") races it.
+    f.drain(timeout=30)
+    return out
 
 
 def _keys(rc, pattern):

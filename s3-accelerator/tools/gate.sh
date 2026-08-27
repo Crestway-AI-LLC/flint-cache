@@ -400,7 +400,7 @@ run_suite "connection sharing (8 checks)" ai.crestway.flintaccel.client.TierShar
 # ADR-0023 D17.5: the cap is on the PART, not the object. The suite issues the
 # SAME request under two caps, because "a big request was not cached" is also
 # true of a cache that is simply broken.
-run_suite "part cap admission (7 checks)" ai.crestway.flintaccel.client.PartCapSuite 9313 "$ROOT/jvm-spike/target/classes:$CP"
+run_suite "part cap admission, read and write sides (13 checks)" ai.crestway.flintaccel.client.PartCapSuite 9313 "$ROOT/jvm-spike/target/classes:$CP"
 
 # The tier is the one dependency every other suite trusts implicitly. This one
 # corrupts it on purpose: absent, truncated, wrong-bytes, and right-bytes-wrong-
@@ -527,7 +527,7 @@ if [ -x "$PYENV/bin/python" ]; then
   "$TIER_CLI" -p "$TIER_PORT" flushall >/dev/null 2>&1
   ( cd python && run_bounded "$PYENV/bin/python" suite.py \
       http://127.0.0.1:9401 redis://127.0.0.1:$TIER_PORT ) >/tmp/gate_python.log 2>&1
-  verdict "python suite (38 checks)" $?
+  verdict "python suite (45 checks)" $?
   stop_origin
 
   # fsspec's own abstract suite, against MOTO rather than counting_s3.

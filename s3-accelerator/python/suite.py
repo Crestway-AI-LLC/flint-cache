@@ -42,7 +42,7 @@ def main():
     ep = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:9000"
     tier = sys.argv[2] if len(sys.argv) > 2 else "redis://127.0.0.1:9399"
     key = "data/000002.bin"
-    rc = redis_lib.Redis.from_url(tier)
+    raw_rc = redis_lib.Redis.from_url(tier)
 
     so = dict(
         anon=False, key="p", secret="p",
@@ -50,11 +50,54 @@ def main():
         tier_uri=tier,
     )
 
+    made = []
+
+    def new_fs(**extra):
+        f = flint_accel.FlintS3FileSystem(skip_instance_cache=True, **extra, **so)
+        made.append(f)          # so settle() can find it; see _Settled below
+        return f
+
     def fs():
         # a fresh instance each time: fsspec caches instances, and a cached one
         # would serve the second read from ITS buffer rather than from the
         # tier -- the same trap AAL's in-process cache set on the JVM side.
-        return flint_accel.FlintS3FileSystem(skip_instance_cache=True, **so)
+        return new_fs()
+
+    def settle():
+        for f in made:
+            f.drain(timeout=30)
+
+    class _Settled:
+        """Every tier OBSERVATION waits for the asynchronous fill first.
+
+        D17.5.1 took the fill off the read path, so tier content became true
+        EVENTUALLY rather than on return. Barriers written by hand at each of
+        the twenty-odd assertion sites would work until the next test that
+        scans the tier forgets one, and the result is a flake rather than an
+        error -- which is how this suite spent a run reporting "0 distinct hash
+        tags" for a client that was filling correctly.
+
+        So the barrier lives on the observation, not on the assertion. flushall
+        settles too: a fill landing after a flush writes into the NEXT test's
+        keyspace, which is the same bug wearing a different hat.
+        """
+
+        _BARRIER = ("flushall", "dbsize", "scan_iter", "keys")
+
+        def __init__(self, rc, settle):
+            self._rc, self._settle = rc, settle
+
+        def __getattr__(self, name):
+            attr = getattr(self._rc, name)
+            if name not in self._BARRIER:
+                return attr
+
+            def barriered(*a, **k):
+                self._settle()
+                return attr(*a, **k)
+            return barriered
+
+    rc = _Settled(raw_rc, settle)
 
     def read(f, off, n):
         with f.open(f"s3://bucket/{key}", "rb") as fh:
@@ -119,11 +162,8 @@ def main():
 
     # D13 -- SSE-C bypasses the tier entirely
     rc.flushall()
-    enc = flint_accel.FlintS3FileSystem(
-        skip_instance_cache=True,
-        s3_additional_kwargs={"SSECustomerAlgorithm": "AES256",
-                              "SSECustomerKey": "0" * 32},
-        **so)
+    enc = new_fs(s3_additional_kwargs={"SSECustomerAlgorithm": "AES256",
+                                   "SSECustomerKey": "0" * 32})
     try:
         read(enc, 300_000, 4096)
     except Exception:
@@ -184,8 +224,7 @@ def main():
     payload = b"O" * 200_000
     fs().pipe_file(BIG, payload)
 
-    small = flint_accel.FlintS3FileSystem(skip_instance_cache=True,
-                                          max_object_bytes=100_000, **so)
+    small = new_fs(max_object_bytes=100_000)
     with small.open(BIG, "rb") as h:
         h.seek(0); over = h.read(len(payload))
     check(over == payload, "an oversize object still READS correctly")
@@ -201,6 +240,51 @@ def main():
         h.seek(0); h.read(len(payload))
     check(len([k for k in rc.scan_iter(match=b"c2/*")]) > 0,
           "negative control -- UNDER the cap the same object IS cached")
+
+    # D17.5, write side -- the cap is enforced where parts ENTER the tier
+    #
+    # The read path refuses an oversize REQUEST, so for any request comfortably
+    # under the cap this guard never fires. It fires at the BOUNDARY, and that
+    # is the whole reason it exists: a run is grid-ALIGNED, so a request of
+    # exactly the cap starting mid-chunk becomes a run LARGER than the cap.
+    # Checking the request alone would publish it -- the cap would be one the
+    # write path inherited rather than one it enforced.
+    rc.flushall(); stats(ep, "/__reset")
+    # The cap is TWO blocks: fsspec reads ahead, so one h.read() of a block
+    # asks the tier for two. Sized so the aligned read lands exactly ON the cap
+    # and the mid-chunk one spills one chunk past it -- the boundary is the
+    # only place a request-side check and a part-side check disagree.
+    PK, BLK = "s3://bucket/data/000007.bin", 4 * CHUNK
+    CAP = 2 * BLK
+    edge = new_fs(default_block_size=BLK, max_part_bytes=CAP)
+    with edge.open(PK, "rb") as h:
+        h.seek(CHUNK // 2)                  # mid-chunk: 8 asked, 9 spanned
+        edge_got = h.read(BLK)
+    check(edge_got == expect("data/000007.bin", CHUNK // 2, BLK),
+          "a part over the cap still READS correctly")
+    check(len([k for k in rc.scan_iter(match=b"c2/*")]) == 0,
+          f"and NO part over the cap entered the tier "
+          f"({len([k for k in rc.scan_iter(match=b'c2/*')])} chunks)")
+    check(edge.counters["oversize_part_bypassed"] > 0,
+          f"counted, not silent ({edge.counters['oversize_part_bypassed']} bypassed)")
+    # Armed: it was the WRITE guard, not the request gate. The request is
+    # exactly ON the cap, so the read path admits it and the chunks are looked
+    # up -- a miss only exists because the fill path ran. Without this the
+    # check above passes on the request gate and says nothing about writes.
+    check(edge.counters["chunk_misses"] > 0,
+          f"armed: the request was ADMITTED and the fill path ran "
+          f"({edge.counters['chunk_misses']} chunk misses), so it is the write"
+          " guard that refused and not the request gate")
+    # The control is the alignment, not the size: same cap, same byte count,
+    # same object -- only the offset differs. Without it a client that had
+    # simply stopped caching would pass all three checks above.
+    rc.flushall()
+    aligned = new_fs(default_block_size=BLK, max_part_bytes=CAP)
+    with aligned.open(PK, "rb") as h:
+        h.seek(0); h.read(BLK)
+    check(len([k for k in rc.scan_iter(match=b"c2/*")]) > 0,
+          f"negative control -- the same {CAP} B, grid-ALIGNED, is cached "
+          f"({len([k for k in rc.scan_iter(match=b'c2/*')])} chunks)")
 
     # D19 -- the block size is 256 KiB, a measured point on a trade between
     # read amplification and warm-path tier cost. NOT our CHUNK, which this
@@ -220,8 +304,7 @@ def main():
         return stats(ep)["bytes_served"], n * sz
 
     tuned, asked = sparse_cost(fs())
-    wide, _ = sparse_cost(flint_accel.FlintS3FileSystem(
-        skip_instance_cache=True, default_block_size=5 * 1024 * 1024, **so))
+    wide, _ = sparse_cost(new_fs(default_block_size=5 * 1024 * 1024))
     # Pin the DECISION, not a ratio. 256 KiB is a chosen point on a trade with
     # no free point (ADR-0023 D19), so the value itself is the thing a
     # regression would move -- and an exact check cannot drift the way a
@@ -309,8 +392,7 @@ def main():
     # Without a control, everything above passes against any block size at all
     # -- which is exactly how a 64 KiB default once looked free. The control is
     # derived rather than tuned: a wrong block blows the ceiling ours meets.
-    w_cold, w_warm, _, _ = warm_tier_cost(flint_accel.FlintS3FileSystem(
-        skip_instance_cache=True, default_block_size=5 * 1024 * 1024, **so))
+    w_cold, w_warm, _, _ = warm_tier_cost(new_fs(default_block_size=5 * 1024 * 1024))
     check(w_warm > asked * bound,
           f"negative control -- a 5 MiB block costs the TIER {w_warm/asked:.1f}x, "
           f"past the {bound:.1f}x ceiling ours meets, so this axis can fail")

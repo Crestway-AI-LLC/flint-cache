@@ -15,6 +15,7 @@ that is worth rediscovering in a second language.
 
 from __future__ import annotations
 
+import concurrent.futures
 import threading
 import time
 import zlib
@@ -163,7 +164,13 @@ FILL_BATCH_BYTES = 1024 * 1024
 #: full read of the same 64 MiB object occupies 80 MiB. An occupancy bound would
 #: admit the first and still refuse the second, which is what D18's admission
 #: class is shaped like and what this cap is a crude stand-in for.
-MAX_OBJECT_BYTES = 512 * 1024 * 1024
+# RETIRED by D17.5.1: 0 means no object-size cap. It was 512 MiB. D17.4
+# measured away every justification for it, D17.5 moved the cap to the PART,
+# and it had to GO rather than be superseded because it is checked first and
+# silently defeated its replacement -- a 1 GiB shard refused whole before the
+# part gate saw one 256 KiB request, measured as tier keys 0 -> 1 on a run that
+# should have written 16,385. Still honoured when set explicitly.
+MAX_OBJECT_BYTES = 0
 # ADR-0023 D17.5. The cap that decides the payoff is on the PART a reader asks
 # for, not the object it belongs to: the part sets how many first-byte
 # latencies a read pays. 65 MiB, deliberately loose -- real part sizes cluster
@@ -172,6 +179,20 @@ MAX_OBJECT_BYTES = 512 * 1024 * 1024
 # MUST MATCH the JVM client's DEFAULT_MAX_PART_BYTES: the two share one cache,
 # and a gap here would let one of them store what the other refuses.
 MAX_PART_BYTES = 65 * 1024 * 1024
+
+# D17.5.1. The tier write is an optimisation for FUTURE reads and does not
+# belong on the latency path of the current one. Measured before this: a 1 GiB
+# shard cost 23% MORE with the cache than without it on the populating pass --
+# ~1,024 blocking MSETs on the critical path of a read whose bytes were already
+# in hand. The JVM path has never had this because lettuce pipelines the same
+# writes asynchronously.
+FILL_ASYNC = True
+FILL_WORKERS = 4
+# Outstanding fills allowed before we stop queueing. When it is reached the
+# write happens INLINE rather than being dropped: that is backpressure, and it
+# keeps D5's single-flight honest. Dropping would leave followers to miss and
+# refetch from origin, which is the one thing single-flight exists to prevent.
+FILL_MAX_INFLIGHT = 16
 #: Any tier COMMAND slower than this is a miss -- and that is now what the code
 #: does, which it did not used to be.
 #:
@@ -203,7 +224,7 @@ class Counters:
                  "origin_gets", "origin_bytes", "tier_failures", "degraded",
                  "claimed", "joined", "bypassed", "integrity_failures",
                  "kms_bypassed", "kms_undetectable", "oversize_bypassed",
-                 "oversize_part_bypassed",
+                 "oversize_part_bypassed", "fill_async", "fill_inline",
                  # ADR-0026: what the chunk grid costs on the wire. `wanted` is
                  # the byte range the caller asked this tier for; `moved` is
                  # what the grid made us fetch after rounding both ends out to
@@ -250,9 +271,15 @@ class FlintTier:
         self.cache_kms = cache_kms
         self.max_object_bytes = max_object_bytes
         self.max_part_bytes = max_part_bytes
+        self._fill_pool = None
+        self._fill_slots = threading.Semaphore(FILL_MAX_INFLIGHT)
+        if FILL_ASYNC:
+            self._fill_pool = concurrent.futures.ThreadPoolExecutor(
+                max_workers=FILL_WORKERS, thread_name_prefix="flint-fill")
         self._kms = {}
         self.c = Counters()
         self._inflight = {}
+        self._fill_futs = set()
         self._lock = threading.Lock()
 
     # ---------------------------------------------------------------- tier
@@ -513,7 +540,8 @@ class FlintTier:
         # size is None when the caller could not tell us; we cache in that
         # case rather than guess, because refusing on an unknown is how a cap
         # quietly turns into "cache nothing".
-        if size is not None and size > self.max_object_bytes:
+        if (self.max_object_bytes > 0
+                and size is not None and size > self.max_object_bytes):
             self.c.oversize_bypassed += 1
             self.c.origin_gets += 1
             return self.origin.get(bucket, key, start, start + length - 1)
@@ -579,6 +607,28 @@ class FlintTier:
         test stayed green.
         """
         lo, hi = run[0] * self.chunk, min((run[-1] + 1) * self.chunk, size) - 1
+
+        # D17.5, write side. The read path already refuses an oversize REQUEST,
+        # and every run is derived from a request, so the cap holds
+        # transitively today. Transitively is not enforced: a caller reaching
+        # the fill path by another route would publish a part the read path
+        # would have refused, and nothing would say so. The rule is "no part
+        # over the cap enters the tier", so it is checked where parts enter.
+        #
+        # No claim is taken, matching the read path's passthrough. A claim
+        # whose fill will never land makes followers wait the full budget and
+        # then refetch anyway -- strictly worse than each fetching at once.
+        if self.max_part_bytes > 0 and hi - lo + 1 > self.max_part_bytes:
+            self.c.oversize_part_bypassed += 1
+            self.c.origin_gets += 1
+            blob = self.origin.get(bucket, key, lo, hi)
+            self.c.origin_bytes += len(blob)
+            for n, i in enumerate(run):
+                piece = blob[n * self.chunk:(n + 1) * self.chunk]
+                if piece:
+                    have[i] = piece
+            return
+
         # D5: claim the run, or wait for whoever holds it.
         token = (self._norm(etag), run[0], run[-1])
         with self._lock:
@@ -616,25 +666,121 @@ class FlintTier:
             # ~160 Mbit/s. That is 8x below what reads already require -- an
             # 8 MiB mget wants ~1.3 Gbit/s at the same budget -- so this cannot
             # make the cache degrade on any tier that was serving reads.
-            batch, batch_bytes = {}, 0
+            batches, batch, batch_bytes = [], {}, 0
             for n, i in enumerate(run):
                 piece = blob[n * self.chunk:(n + 1) * self.chunk]
                 if not piece:
                     continue
-                have[i] = piece
+                have[i] = piece          # the CALLER's bytes are ready here
                 sealed = self._seal(etag, i, piece)
                 batch[self._ck(etag, i)] = sealed
                 batch_bytes += len(sealed)
                 if batch_bytes >= FILL_BATCH_BYTES:
-                    self._guard(self.r.mset, batch)
+                    batches.append(batch)
                     batch, batch_bytes = {}, 0
             if batch:
-                self._guard(self.r.mset, batch)
+                batches.append(batch)
+            # D17.5.1: hand the writes off and return. `have` is already
+            # populated, so the read owes the tier nothing.
+            handed_off = leader and self._hand_off(batches, token, ev)
         finally:
-            if leader:
+            # Only when the writes were NOT handed off -- otherwise the worker
+            # owns the event, and setting it here would release followers
+            # before the chunks they are waiting for exist.
+            if leader and not handed_off:
                 with self._lock:
                     self._inflight.pop(token, None)
                 ev.set()
+
+    def drain(self, timeout=None):
+        """Block until the fills already handed off have landed in the tier.
+
+        The fill is asynchronous on purpose (D17.5.1): a cold read must not pay
+        to populate the cache. The cost of that is that "the tier holds these
+        bytes" becomes true EVENTUALLY rather than on return, so anything that
+        ASSERTS tier state -- a test, a flush, a snapshot, a shutdown -- needs
+        a barrier. A sleep is not a barrier; it is a guess that passes on a
+        quiet machine and fails on a loaded one.
+
+        Returns the number of fills still outstanding: 0 means drained.
+        """
+        with self._lock:
+            futs = list(self._fill_futs)
+        if not futs:
+            return 0
+        _, not_done = concurrent.futures.wait(futs, timeout=timeout)
+        return len(not_done)
+
+    def close(self):
+        """Drain outstanding fills, then stop accepting more.
+
+        wait=True on purpose. A queued fill holds a single-flight event that
+        followers are blocked on, so abandoning it strands them for the full
+        wait budget -- and the writes are cheap and nearly done by definition,
+        since the pool is bounded.
+        """
+        pool, self._fill_pool = self._fill_pool, None
+        if pool is not None:
+            pool.shutdown(wait=True)
+
+    def _hand_off(self, batches, token, ev):
+        """Write the run to the tier off the read path. True if a worker took it.
+
+        THE LEADER RETURNS EARLY; FOLLOWERS DO NOT. D5 releases followers when
+        the leader has filled, and they then read the run back with one mget.
+        If the event were set before the writes landed they would miss and each
+        refetch from origin -- which is the exact duplication single-flight
+        exists to prevent, arriving at the moment the tier is slowest. So the
+        worker sets the event when the writes are done, and only the leader's
+        own latency is spared.
+
+        On saturation the write happens INLINE rather than being dropped. That
+        is backpressure: it bounds how much can be in flight, and it keeps
+        single-flight honest under exactly the load that would otherwise break
+        it. A dropped write would be cheaper and would quietly undo D5.
+        """
+        if not batches:
+            return False
+        if not self._fill_pool or not self._fill_slots.acquire(blocking=False):
+            # INLINE, not dropped. An earlier draft of this method returned
+            # False here without writing anything, which would have turned
+            # saturation into "silently stop caching" -- the failure mode that
+            # looks exactly like a working cache with a poor hit rate.
+            for b in batches:
+                self._guard(self.r.mset, b)
+            self.c.fill_inline += 1
+            return False
+
+        def work():
+            try:
+                for b in batches:
+                    self._guard(self.r.mset, b)
+                self.c.fill_async += 1
+            finally:
+                self._fill_slots.release()
+                with self._lock:
+                    self._inflight.pop(token, None)
+                ev.set()
+
+        try:
+            fut = self._fill_pool.submit(work)
+            # Registered before the done-callback, so a fill that finishes
+            # between the two is still discarded rather than left in the set
+            # forever -- add_done_callback fires inline on a done future.
+            with self._lock:
+                self._fill_futs.add(fut)
+            fut.add_done_callback(self._fill_done)
+        except RuntimeError:          # pool shut down under us
+            self._fill_slots.release()
+            for b in batches:         # same rule: refused is not dropped
+                self._guard(self.r.mset, b)
+            self.c.fill_inline += 1
+            return False
+        return True
+
+    def _fill_done(self, fut):
+        with self._lock:
+            self._fill_futs.discard(fut)
 
     def _assemble(self, have, start, end):
         out = bytearray()

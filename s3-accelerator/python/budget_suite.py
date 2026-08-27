@@ -143,6 +143,11 @@ def main():
         with fs.open(key, "rb") as fh:
             fh.seek(0)
             got = len(fh.read(nbytes))
+        # D17.5.1: the fill lands off the read path, so a read that returns has
+        # not necessarily populated the tier yet. Every caller here reads and
+        # then asks who served it, so the fill has to have settled first --
+        # otherwise the warm control races the cold read that armed it.
+        fs.drain(timeout=30)
         return got, stats()["gets"], dict(fs.counters)
 
     N = 1024 * 1024

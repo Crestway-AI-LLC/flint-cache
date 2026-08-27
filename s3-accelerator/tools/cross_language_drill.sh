@@ -162,6 +162,7 @@ f = flint_accel.FlintS3FileSystem(skip_instance_cache=True, **so)
 with f.open("s3://bucket/" + sys.argv[3], "rb") as h:
     h.seek(0)
     b = h.read(int(sys.argv[4]))
+f.drain(timeout=30)          # D17.5.1: the fill lands off the read path
 open("/tmp/xlang_py_bytes", "wb").write(b)
 print(json.dumps(dict(f.counters)))
 PY

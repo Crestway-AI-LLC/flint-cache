@@ -88,27 +88,25 @@ public final class FlintObjectClient implements ObjectClient {
    * rewrites by another process.
    */
   public final long metaTtlImmutableSec;
-  /** Objects above this are read from the origin and never chunk-cached.
+  /**
+   * RETIRED by D17.5.1: 0 means no object-size cap.
    *
-   *  512 MiB (Jeff, 2026-08-25), and the reasoning is PAYOFF rather than
-   *  keyspace. Measured: a warm read moves the SAME bytes as a cold one -- the
-   *  cache does not reduce data transferred, it changes where it comes from.
-   *  So for a large object read sequentially the whole benefit is
-   *  bytes x (1/S3_throughput - 1/tier_throughput): near zero against parallel
-   *  range GETs on a fast NIC, and NEGATIVE when the tier is slower. Past some
-   *  size the client is better off going to S3 directly.
+   * <p>It was 512 MiB. D17.4 measured every justification for it away — the
+   * keyspace argument is a fixed fraction of bytes at any size, and the payoff
+   * argument cannot produce a threshold — and D17.5 moved the cap to the PART,
+   * which is the unit that actually decides the payoff.
    *
-   *  512 MiB sits above the data files this cache is for -- Parquet and
-   *  Iceberg land at 128-512 MB -- so the analytics working set still caches
-   *  while objects whose only payoff is a throughput differential do not.
+   * <p>It had to go rather than merely be superseded, because it is checked
+   * FIRST and silently defeated its replacement: a 1 GiB shard was refused
+   * whole before the part gate saw a single 256 KiB request, so the mechanism
+   * was inert for exactly the workload it was built for. Measured as
+   * {@code tier keys 0 -> 1} on a run that should have written 16,385.
    *
-   *  The keyspace argument still holds underneath: an object of size S occupies
-   *  S/chunkBytes keys, so a 1 TB object would cost ~1.7 GB of per-key overhead
-   *  before a byte of its data is stored.
-   *
-   *  THIS NUMBER IS AN ARGUMENT, NOT A FINDING -- the crossover wants measuring
-   *  on a cluster. Tracked, blocked on M0. */
-  public static final long DEFAULT_MAX_OBJECT_BYTES = 512L * 1024 * 1024;
+   * <p>The knob still works when set explicitly — it may be configured in the
+   * field, and a setting that silently stops being honoured is worse than one
+   * that is kept.
+   */
+  public static final long DEFAULT_MAX_OBJECT_BYTES = 0L;
 
   /**
    * ADR-0023 D17.5. The cap that decides the payoff belongs on the PART a
@@ -501,7 +499,8 @@ public final class FlintObjectClient implements ObjectClient {
               metaHits.incrementAndGet();
               kmsSeen.put(String.valueOf(r.getS3Uri()), "1".equals(s.substring(b2 + 1)));
               long cachedLen = Long.parseLong(s.substring(0, b1));
-              oversizeSeen.put(String.valueOf(r.getS3Uri()), cachedLen > maxObjectBytes);
+              oversizeSeen.put(String.valueOf(r.getS3Uri()),
+                  maxObjectBytes > 0 && cachedLen > maxObjectBytes);
               return CompletableFuture.completedFuture(ObjectMetadata.builder()
                   .contentLength(cachedLen)
                   .etag(s.substring(b1 + 1, b2)).build());
@@ -533,7 +532,8 @@ public final class FlintObjectClient implements ObjectClient {
           boolean kms = resp.serverSideEncryption() == ServerSideEncryption.AWS_KMS;
           kmsSeen.put(String.valueOf(r.getS3Uri()), kms);
           oversizeSeen.put(String.valueOf(r.getS3Uri()),
-              resp.contentLength() != null && resp.contentLength() > maxObjectBytes);
+              maxObjectBytes > 0 && resp.contentLength() != null
+                  && resp.contentLength() > maxObjectBytes);
           ObjectMetadata m = ObjectMetadata.builder()
               .contentLength(resp.contentLength()).etag(resp.eTag()).build();
           if (kms && !cacheKms) {
@@ -669,6 +669,18 @@ public final class FlintObjectClient implements ObjectClient {
   private void fetchRun(GetRequest r, StreamContext ctx, String etag, long first, int[] run) {
     long lo = (first + run[0]) * (long) chunkBytes;
     long hi = (first + run[1]) * (long) chunkBytes + chunkBytes - 1;
+    // D17.5, write side. The read path already refuses an oversize REQUEST,
+    // and every run is derived from a request, so the cap holds transitively
+    // today. Transitively is not enforced: a future caller that reaches the
+    // fill path by another route would publish a part the read path would
+    // have refused, and nothing would say so. The rule is "no part over the
+    // cap enters the tier", so it is checked where parts enter the tier.
+    //
+    // The run is still FETCHED and the claims still completed -- the caller
+    // gets its bytes and joined readers are released. Only the publish is
+    // skipped, which is exactly the trade the cap encodes.
+    final boolean publish = !(maxPartBytes > 0 && hi - lo + 1 > maxPartBytes);
+    if (!publish) oversizePartBypassed.incrementAndGet();
     GetRequest sub = GetRequest.builder()
         .s3Uri(r.getS3Uri()).etag(etag).referrer(r.getReferrer())
         .range(new Range(lo, hi)).build();
@@ -687,27 +699,30 @@ public final class FlintObjectClient implements ObjectClient {
             : Arrays.copyOfRange(all, off, Math.min(off + chunkBytes, all.length));
         final String ik = norm(etag) + "/" + (first + i);
 
-        // Publish to the tier BEFORE releasing the claim.
+        // Complete the READER now; drop the CLAIM when the write lands.
         //
-        // The claim used to be dropped the instant the SET was ISSUED, and the
-        // SET is asynchronous -- so a reader arriving in the gap found no
-        // chunk in the tier and no claim to join, and fetched the same bytes
-        // again. Every such reader is a duplicate origin request, and the
-        // window widens exactly when it hurts: on a loaded machine. Locally
-        // 24 concurrent readers cost 1-2 GETs and on a shared CI runner the
-        // same test cost 6, which is how the race was found at all.
+        // These used to be one action, and both orderings were wrong. Dropping
+        // the claim when the SET was ISSUED left a reader arriving in the gap
+        // with no chunk in the tier and no claim to join, so it fetched the
+        // same bytes again -- a duplicate origin request, in a window that
+        // widens exactly when it hurts. Locally 24 concurrent readers cost 1-2
+        // GETs and on a shared CI runner the same test cost 6, which is how
+        // the race was found at all. Holding both until the write landed fixed
+        // that and charged the READ for the tier write, which is the cost
+        // D17.5.1 exists to remove.
         //
-        // Holding the claim until the write lands means late readers JOIN
-        // instead of duplicating. Bounded by the tier budget and completed
-        // either way, because a slow tier must not strand readers who are
-        // waiting on us -- that would trade duplicate fetches for a hang.
-        Runnable release = () -> {
-          CompletableFuture<byte[]> slot = inflight.remove(ik);
-          if (slot != null) slot.complete(piece);
-        };
+        // Split, neither happens. The caller gets its bytes as soon as they
+        // exist; the claim stands until the chunk is really in the tier, so a
+        // late reader still JOINS -- and joins a future that is ALREADY
+        // complete, so it is served from memory without touching the tier at
+        // all. The claim is bounded by the tier budget and released either
+        // way, because a slow tier must not strand readers waiting on us.
+        CompletableFuture<byte[]> slot = inflight.get(ik);
+        if (slot != null) slot.complete(piece);
+        Runnable release = () -> inflight.remove(ik);
         CompletableFuture<?> written = null;
         try {
-          if (piece.length > 0 && tierUsable()) {
+          if (publish && piece.length > 0 && tierUsable()) {
             written = tier.set(chunkKey(etag, first + i), seal(etag, first + i, piece))
                 .toCompletableFuture()
                 .orTimeout(tierBudgetMs, TimeUnit.MILLISECONDS);

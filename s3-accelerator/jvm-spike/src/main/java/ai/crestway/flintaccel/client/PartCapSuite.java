@@ -5,6 +5,7 @@ import java.util.*;
 
 import software.amazon.s3.analyticsaccelerator.S3SeekableInputStreamConfiguration;
 import software.amazon.s3.analyticsaccelerator.S3SeekableInputStreamFactory;
+import software.amazon.s3.analyticsaccelerator.request.*;
 import software.amazon.s3.analyticsaccelerator.util.S3URI;
 
 /**
@@ -74,6 +75,16 @@ public final class PartCapSuite {
     return ai.crestway.flintaccel.TierScan.keys(t.liveConnection(), "c2/*").size();
   }
 
+  /** One ranged read through the client, fully drained. */
+  static byte[] drain(TierSupport t, S3URI uri, String etag, long lo, long hi)
+      throws Exception {
+    ObjectContent oc = t.client.getObject(GetRequest.builder()
+        .s3Uri(uri).etag(etag).referrer(new Referrer("bytes=" + lo + "-" + hi,
+            ReadMode.SYNC))
+        .range(new Range(lo, hi)).build()).join();
+    try (var in = oc.getStream()) { return in.readAllBytes(); }
+  }
+
   public static void main(String[] args) throws Exception {
     endpoint = args.length > 0 ? args[0] : "http://127.0.0.1:9000";
     String tier = args.length > 1 ? args[1] : "redis://127.0.0.1:9399";
@@ -117,6 +128,59 @@ public final class PartCapSuite {
     check(afterA != afterB,
           "the cap is the only difference between the two arms, and it decided "
           + "the outcome");
+
+    // ---- arm C: the cap is enforced where parts ENTER the tier, not only
+    // where requests are admitted.
+    //
+    // A fill run is grid-ALIGNED, so a request of exactly the cap that starts
+    // mid-chunk becomes a run LARGER than the cap. The request gate admits it
+    // -- correctly, it is not over the cap -- and only a check at the write
+    // boundary stops the oversize part. Driven through the client rather than
+    // through AAL because AAL issues block-aligned requests and so cannot
+    // produce this shape; the boundary being tested is the client's, and this
+    // is where it lives.
+    TierSupport c = build(tier, 1 * MiB, 2 * MiB);
+    c.liveConnection().sync().flushall();
+    S3URI uri = S3URI.of("bucket", KEY);
+    String etag = c.client.headObject(HeadRequest.builder().s3Uri(uri).build())
+        .join().getEtag();
+
+    // 64 KiB is the chunk grid (D4). Half a chunk in, a request of exactly the
+    // cap spans one chunk more than the cap holds.
+    final long HALF = 32 * 1024;
+    byte[] unaligned = drain(c, uri, etag, HALF, HALF + 1 * MiB - 1);
+    int afterC = chunkKeys(c);
+    long missesC = c.client.chunkMisses.get();
+    check(unaligned.length == (int) MiB,
+          "a part over the cap still READS correctly, " + unaligned.length + " bytes");
+    check(afterC == 0, "and NO part over the cap entered the tier: "
+          + afterC + " chunk keys");
+    check(c.client.oversizePartBypassed.get() > 0,
+          "counted, not silent: oversizePartBypassed="
+          + c.client.oversizePartBypassed.get());
+    // Armed. The request is exactly ON the cap, so the request gate admitted it
+    // and the chunks were looked up; a miss exists only because the fill path
+    // ran. Without this the checks above pass on the request gate and say
+    // nothing about writes.
+    check(missesC > 0, "armed: the request was ADMITTED and the fill path ran ("
+          + missesC + " chunk misses), so it is the WRITE guard that refused");
+
+    // The control is the alignment, not the size: same cap, same byte count,
+    // same object, different offset.
+    c.liveConnection().sync().flushall();
+    byte[] aligned = drain(c, uri, etag, 0, 1 * MiB - 1);
+    int afterD = chunkKeys(c);
+    // Oracle without a second client: the two ranges OVERLAP by 1 MiB - 32 KiB,
+    // one served past the cap and one from the tier, so disagreeing bytes mean
+    // the guard changed what is RETURNED and not only what is stored.
+    check(Arrays.equals(Arrays.copyOfRange(aligned, (int) HALF, aligned.length),
+                        Arrays.copyOf(unaligned, aligned.length - (int) HALF)),
+          "the two arms agree on the bytes they share, so the guard changed "
+          + "what is STORED and not what is returned");
+    check(afterD > 0, "POSITIVE CONTROL: the same " + MiB
+          + " B, grid-ALIGNED, IS cached, " + afterD + " chunk keys");
+    c.close();
+
     System.exit(ok ? 0 : 1);
   }
 }

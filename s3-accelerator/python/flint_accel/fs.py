@@ -155,6 +155,7 @@ class FlintS3FileSystem(S3FileSystem):
         self._budget = opts["tier_budget_s"]
         self._meta_ttl = opts["meta_ttl_s"]
         self._max_object = opts["max_object_bytes"]
+        self._max_part = opts["max_part_bytes"]
         self._redis = None
         self._tier_obj = None
         # D13: SSE-C means the tier never sees the bytes. s3fs carries the
@@ -181,7 +182,8 @@ class FlintS3FileSystem(S3FileSystem):
                                        meta_ttl_s=self._meta_ttl,
                                        bypass=self._sse_c,
                                        cache_kms=self._cache_kms,
-                                       max_object_bytes=self._max_object)
+                                       max_object_bytes=self._max_object,
+                                       max_part_bytes=self._max_part)
         else:
             self._tier_obj.origin = origin      # per-file origin, shared cache
         return self._tier_obj
@@ -326,6 +328,10 @@ class FlintS3FileSystem(S3FileSystem):
         kw.pop("autocommit", None)
         return FlintS3File(self, path, mode=mode,
                            block_size=block_size or self.default_block_size, **kw)
+
+    def drain(self, timeout=None):
+        """Barrier for the asynchronous fill. See FlintTier.drain."""
+        return self._tier_obj.drain(timeout) if self._tier_obj else 0
 
     @property
     def counters(self):
