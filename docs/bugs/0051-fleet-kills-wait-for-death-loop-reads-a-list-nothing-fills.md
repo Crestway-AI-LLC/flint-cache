@@ -1,6 +1,7 @@
 # BUG-0051: `fleet_kill`'s wait-for-death loop reads a list that nothing fills
 
-Status: OPEN, found 2026-08-26 · Severity: MEDIUM — the product is fine. This
+Status: FIXED 2026-08-26. The append is in `fleet_kill`, the stray one is
+gone from `fleet_signal`, and `tools/kill_release_drill.sh` holds it there. · Severity: MEDIUM — the product is fine. This
 is the teardown half of #176, it is twenty-five lines of comment explaining a
 race and the code that answers it, and it has never executed once.
 
@@ -83,3 +84,39 @@ never ran", so the fix needs a check that fails without it: kill a seat and
 respawn on the same port immediately, asserting the bind succeeds — with the
 release **observed**, not slept past. Landing the append alone would replace
 dead code with unwitnessed code, which is the same defect one step later.
+
+
+## The drill, and the six attempts its control took
+
+The bug doc said the fix must not land without a check that fails against the
+unfixed code, because "code that never ran" replaced by "code nothing
+witnesses" is the same defect one step later. That check now exists and is
+verified both ways:
+
+    unfixed fleet_kill : FAIL: fleet_kill returned while pid 2507 was still alive
+    fixed              : PASS — pid gone on return, replacement bound 6955
+
+It asserts the POSTCONDITION with no sleep in between — when `fleet_kill`
+returns, the pid is gone — then respawns on the same port immediately and
+requires the replacement to bind and to be a DIFFERENT pid. That second half is
+the consequence the race actually produces: the replacement takes EADDRINUSE,
+exits, and surfaces later as "nothing listening" nowhere near the cause.
+
+The postcondition discriminates only because a real seat takes time to die,
+which was measured before the drill was written: a `flint-server` with rocks
+open is still present for 29-83 poll iterations after `kill -9`, five runs of
+five. Had that been consistently zero the assertion would have passed either
+way.
+
+**Six attempts at the control, and the first five failed for reasons that had
+nothing to do with the assertion:** a copied `/bin/sleep` that lost its
+signature and died before the kill path ran; a port already declared by
+`backup_schedule`; `FLINT_CORE_ORDER` narrowing CORE so gates.sh refused
+because every other drill became unclassified; the same again; and
+`fleet_wait_listen 127.0.0.1 $P 30` when the function takes ports only, which
+produced `nothing listening on 127.0.0.1:127.0.0.1`.
+
+Every one of those exited non-zero. A control checked by exit status would have
+been recorded as working five times over. **A control that fails is not a
+control that worked** — the only thing that separated them was reading which
+message came back.
