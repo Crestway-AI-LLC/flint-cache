@@ -783,8 +783,15 @@ fn main() {
                 // and with --min-replicas 1: breach at ~1.7s every time. The
                 // bound the product enforces is on the VOLUME of at-risk
                 // writes (about one cap-window's worth), not on their age.
-                // Until the claim and the mechanism are reconciled the
-                // assertion stays as-is, because it is the published promise.
+                // RECONCILED 2026-08-27, on the doc side: docs/failover.md
+                // now says outright "it bounds VOLUME, not age" and spells out
+                // that no mechanism here can reach back and protect a write
+                // already acked. This comment used to say the two were still
+                // unreconciled and the assertion stood on the published
+                // promise; that sent a reader looking for a conflict that no
+                // longer exists. The assertion stays because the VOLUME bound
+                // is still worth asserting, not because an age bound is
+                // promised anywhere.
                 for &(seq, sent_us, at) in acked_at {
                     // The writer may have re-acked this key AFTER the kill;
                     // those acks belong to the new master and say nothing
