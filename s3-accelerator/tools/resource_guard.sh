@@ -25,6 +25,10 @@ GUARD_MIN_DISK_GB=${GUARD_MIN_DISK_GB:-12}
 GUARD_MIN_MEM_GB=${GUARD_MIN_MEM_GB:-2}
 GUARD_JVM_MAX_HEAP=${GUARD_JVM_MAX_HEAP:-2g}
 GUARD_MIN_FDS=${GUARD_MIN_FDS:-4096}
+# Set 0 where the run starts no JVM, so the summary does not claim a heap cap
+# that is not in force. A status line that reports something untrue is worse
+# than a missing one: it is read, believed, and never checked.
+GUARD_REPORT_HEAP=${GUARD_REPORT_HEAP:-1}
 
 guard_free_disk_gb() { # path
   df -Pk "${1:-.}" 2>/dev/null | awk 'NR==2 {printf "%d", $4/1048576}'
@@ -50,16 +54,35 @@ guard_free_mem_gb() {
 }
 
 # Refuse early, name the resource, and say what to do about it.
-guard_check() { # label, path-to-check
-  local label="${1:-run}" path="${2:-.}" bad=0
-  local disk mem fds
-  disk=$(guard_free_disk_gb "$path")
+#
+# TAKES EVERY PATH THE RUN WRITES TO, and judges the tightest. Checking one path
+# -- or worse, `.` -- is a guard pointed away from the hazard: build output and
+# scratch are commonly on different volumes here (the cargo target/ dirs in this
+# repo are symlinks to an external SSD), so a single check can refuse on a full
+# source disk nothing touches while the volume actually being filled runs out.
+# flint/tools/gates.sh learned this first; the reasoning is its, and this is the
+# same rule applied to a gate that had no disk check at all.
+guard_check() { # label, path [path...]
+  local label="${1:-run}"; shift
+  [ $# -gt 0 ] || set -- .
+  local bad=0 mem fds worst="" worst_gb=""
+
+  for path in "$@"; do
+    [ -e "$path" ] || continue
+    local d; d=$(guard_free_disk_gb "$path")
+    [ -n "$d" ] || continue
+    if [ -z "$worst_gb" ] || [ "$d" -lt "$worst_gb" ] 2>/dev/null; then
+      worst_gb=$d; worst=$path
+    fi
+  done
+  local disk="${worst_gb:-}"
   mem=$(guard_free_mem_gb)
   fds=$(ulimit -n 2>/dev/null || echo 0)
   [ "$fds" = "unlimited" ] && fds=$GUARD_MIN_FDS
 
   if [ -n "$disk" ] && [ "$disk" -lt "$GUARD_MIN_DISK_GB" ] 2>/dev/null; then
-    echo "REFUSING $label: ${disk} GB free on $(cd "$path" 2>/dev/null && pwd || echo "$path"), floor is ${GUARD_MIN_DISK_GB} GB." >&2
+    echo "REFUSING $label: ${disk} GB free on the volume holding $worst, floor is ${GUARD_MIN_DISK_GB} GB." >&2
+    df -h "$worst" 2>/dev/null | sed 's/^/  /' >&2
     echo "  A build that fills the disk does not fail politely. Clear target/ dirs" >&2
     echo "  (cargo clean, mvn clean) or raise GUARD_MIN_DISK_GB if you mean it." >&2
     bad=1
@@ -85,7 +108,9 @@ guard_check() { # label, path-to-check
       || echo "  Could not raise it; connection-heavy suites may fail spuriously." >&2
   fi
   [ "$bad" = 0 ] || return 3
-  echo "   limits ok: ${disk} GB disk, ${mem} GB memory, $(ulimit -n) fds, JVM heap capped at $GUARD_JVM_MAX_HEAP"
+  local heapnote=""
+  [ "$GUARD_REPORT_HEAP" = 1 ] && heapnote=", JVM heap capped at $GUARD_JVM_MAX_HEAP"
+  echo "   limits ok: ${disk} GB disk (tightest of $#: $worst), ${mem} GB memory, $(ulimit -n) fds${heapnote}"
 }
 
 # What every JVM the gate starts should carry. A suite that leaks now dies as

@@ -31,8 +31,12 @@ ROOT=$PWD
 # run can go wrong -- disk, memory, heap -- arrived as an OOM kill or a corrupt
 # target dir rather than as a refusal that names the cause. See tools/resource_guard.sh.
 . "$(dirname "$0")/resource_guard.sh"
-GUARD_DISK_BEFORE=$(guard_free_disk_gb "$ROOT")
-guard_check "the gate" "$ROOT" || exit 3
+# Both volumes this gate writes to: maven output and the scratch root the
+# suites, tier data and logs land in. They are the same filesystem in a plain
+# checkout and different the moment either is moved.
+GUARD_SCRATCH="${TMPDIR:-/tmp}"
+GUARD_DISK_BEFORE=$(guard_free_disk_gb "$GUARD_SCRATCH")
+guard_check "the gate" "$ROOT/jvm-spike" "$GUARD_SCRATCH" || exit 3
 GUARD_JAVA_OPTS="$(guard_java_opts)"
 # Bound the BUILD too. A maven that swaps takes the machine down just as
 # thoroughly as a suite that does, and it runs before any suite could report it.
@@ -614,6 +618,6 @@ printf "\n"
 for f in "${FAILED[@]:-}"; do [ -n "$f" ] && printf "   failed: %s  (see /tmp/gate_*.log)\n" "$f"; done
 # A run that leaves the volume near full makes the NEXT run fail for reasons
 # that have nothing to do with it, so say so while the cause is still attached.
-guard_report_after "the gate" "$ROOT" "$GUARD_DISK_BEFORE"
+guard_report_after "the gate" "$GUARD_SCRATCH" "$GUARD_DISK_BEFORE"
 [ $FAIL -eq 0 ] && echo "   GATE PASSED" || echo "   GATE FAILED"
 exit $FAIL
