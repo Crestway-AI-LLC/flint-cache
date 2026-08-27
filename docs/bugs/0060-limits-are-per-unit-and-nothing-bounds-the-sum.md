@@ -270,3 +270,51 @@ not a smaller entry cap, but a byte budget the queue draws against — the
 being triggered by the wrong quantity.
 
 **Remaining unaudited:** per-namespace state scaling with namespace count.
+
+## Audit pass 4 — candidate 4 (per-namespace state): a DIFFERENT risk class
+
+Per-namespace state exists: `eviction.rs:95` holds
+`policies: Mutex<HashMap<Vec<u8>, S3Fifo>>`, one admission policy per
+namespace, and `:112` a `last_forced_ms` map beside it. Nothing caps the
+number of namespaces — grepped for `MAX_NS`, `MAX_TENANTS`,
+`MAX_NAMESPACE`: none exists.
+
+**But the multiplier is operator-controlled, not client-controlled**, and that
+is the distinction the audit's two questions do not by themselves draw:
+
+- Namespaces are provisioned through the control plane (`flintctl tenant add`
+  / `CPTENANT*`), not created by data-plane clients.
+- Policies are tied to the evictable DECLARATION and cleared when it changes
+  (`:207`) — a namespace that stops being evictable stops accumulating state,
+  and a re-declared one starts clean.
+- Eviction is opt-in, so the default fleet holds none of this at all.
+
+So the growth is real and it tracks operator actions. That is a capacity
+question, not a hostile-input question, and it does not belong in the same
+bucket as candidate 1 where an ordinary tenant command reaches an unbounded
+allocation.
+
+**Refinement this suggests for the audit's method.** The two questions ("what
+grows / what bounds it") need a third: **who controls the multiplier?** A
+per-unit bound times an OPERATOR-controlled count is a sizing guide. A
+per-unit bound times a CLIENT-controlled count is the defect this bug is
+about. `MAX_QUERY_BUF` x `MAX_CONNS` and `HGETALL` x cardinality are both the
+second kind; per-namespace policy state is the first.
+
+Adjacent, and worth naming as the known-good it is: `SCAN_CURSOR_CAP = 1024`
+with a 120s TTL and oldest-eviction bounds the scan-cursor table as an
+AGGREGATE, not per connection. That is the pattern candidates 1 and 3 lack,
+already written in this codebase, three files away.
+
+## Audit status after pass 4
+
+| candidate | verdict |
+|---|---|
+| collection commands (`HGETALL`/`SMEMBERS`/`ZRANGE`) | **DEFECT, measured** — +412 MB for a 200 MB collection, client-controlled |
+| pipeline depth and accumulated replies | **clean, measured** — +2 MB for 300 MB in flight |
+| async write queue vs value size | **defect shape, NOT measured** — bounds entries not bytes; needs a rocks build |
+| per-namespace state | **different class** — operator-controlled multiplier |
+
+The audit's original question was "where is a limit missing that would let a
+node crash rather than refuse". One answer with a number, one cleared, one
+pending a feature build, one reclassified.
