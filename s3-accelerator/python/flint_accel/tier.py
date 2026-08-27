@@ -110,66 +110,23 @@ assert BLOCK_BYTES % CHUNK == 0, (
 #: budget bounds a command: B bytes needs B/budget of bandwidth to land inside
 #: it, so an unbounded batch would degrade on a tier that reads fine.
 FILL_BATCH_BYTES = 1024 * 1024
-#: Objects larger than this are read straight from the origin and never
-#: chunk-cached.
-#:
-#: 512 MiB, and it is the number we are USING rather than a number anything
-#: determined -- nothing here distinguishes it from its neighbours. What the
-#: measurement below did was retire a wrong reason, correct a second by 165x,
-#: and show that a cap denominated in object bytes cannot have a best value at
-#: all, because object bytes is not what the tier spends.
-#:
-#: The premise holds. A warm read moves the same bytes as a cold one, measured
-#: to within 0.02% on every pattern and every block size: 5,244,131 B off the
-#: tier against 5,242,880 B off the origin for the identical selective read,
-#: the difference being the D14 seal and RESP framing.
-#:
-#: What does NOT follow is a threshold. time_saved = bytes x (1/S3 - 1/tier) is
-#: linear in bytes with a sign that does not depend on bytes, so it says either
-#: every size pays or no size pays -- it cannot produce a size at which caching
-#: stops being worth it. Measured, both sides scale linearly and neither
-#: parallelism is a function of object size: a 64 MiB sequential read costs 8
-#: origin GETs and 8 tier round trips whatever its size, at peak origin
-#: concurrency 1 on this path (3 on the JVM's, where AAL prefetches). So the
-#: payoff argument sets whether to cache sequential reads AT ALL -- tier_BW
-#: against 1x a connection here, 3x on the JVM -- and never sets a cap.
-#:
-#: Two costs ARE size-dependent, and they are what the cap actually defends:
-#:
-#:   FILL. _fill writes one chunk per SET, synchronously, so a cold read of an
-#:   object of size S costs S/CHUNK blocking tier round trips before it
-#:   returns: 1,024 measured for 64 MiB, 8,192 for an object at this cap. The
-#:   JVM has no equivalent -- Lettuce pipelines the same writes -- so this is a
-#:   Python-path cost, and pipelining the SETs would remove most of the reason
-#:   for a cap on this path at all.
-#:
-#:   OCCUPANCY. A cached object costs 1.2522x its own bytes of tier memory,
-#:   measured at fleet scale on jemalloc 5.3.0: a 64 KiB chunk plus its 4-byte
-#:   seal needs 82,008 B, because 65,540 B lands one byte past the allocator's
-#:   64 KiB size class and takes the 80 KiB one. Not the ~100 B/key this
-#:   comment used to claim -- 16,468 B/key, 165x more -- and it is the CHUNK
-#:   size that lands badly, not the seal, which is free. See ADR-0023 D17.
-#:
-#: Neither derives a value. Fill cost gives a band (~320-640 MiB across
-#: plausible tier RTTs, not a point) and occupancy gives a number only once
-#: someone fixes a policy for what share of a node one object may take. At 512
-#: MiB those read as ~8k blocking fills on the cold read and 641 MiB of tier for
-#: one object -- defensible, not derived. The one justification that ever
-#: pointed at THIS number is workload fit: 128-512 MB Parquet and Iceberg files.
-#:
-#: The cap rations the wrong quantity, and that is now measured rather than
-#: suspected. What the tier spends is CHUNKS TOUCHED, not object bytes: a
-#: Parquet-shaped read -- footer plus two column chunks -- touches 26 chunks and
-#: occupies 2.03 MiB on an 8 MiB object and on a 64 MiB object alike, while a
-#: full read of the same 64 MiB object occupies 80 MiB. An occupancy bound would
-#: admit the first and still refuse the second, which is what D18's admission
-#: class is shaped like and what this cap is a crude stand-in for.
-# RETIRED by D17.5.1: 0 means no object-size cap. It was 512 MiB. D17.4
-# measured away every justification for it, D17.5 moved the cap to the PART,
-# and it had to GO rather than be superseded because it is checked first and
-# silently defeated its replacement -- a 1 GiB shard refused whole before the
-# part gate saw one 256 KiB request, measured as tier keys 0 -> 1 on a run that
-# should have written 16,385. Still honoured when set explicitly.
+# RETIRED by D17.5.1: 0 means no object-size cap, and this comment is
+# deliberately short because the reasoning that used to live here described the
+# cap as live. It was 512 MiB.
+#
+# The measurements that retired it are ADR-0023 D17.2-D17.4 and are not
+# repeated here: the payoff argument is linear in bytes with a sign that does
+# not depend on bytes, so it cannot produce a size at which caching stops being
+# worth it; the keyspace argument is a fixed fraction of bytes at any size
+# (1.2522x, measured, not the ~100 B/key this file once claimed); and what the
+# tier actually spends is CHUNKS TOUCHED, which an object-size cap does not
+# measure.
+#
+# It had to GO rather than be superseded: it is checked first and silently
+# defeated its replacement -- a 1 GiB shard refused whole before the part gate
+# saw one 256 KiB request, measured as tier keys 0 -> 1 on a run that should
+# have written 16,385. Still honoured when set explicitly, because it may
+# already be set in the field.
 MAX_OBJECT_BYTES = 0
 # ADR-0023 D17.5. The cap that decides the payoff is on the PART a reader asks
 # for, not the object it belongs to: the part sets how many first-byte

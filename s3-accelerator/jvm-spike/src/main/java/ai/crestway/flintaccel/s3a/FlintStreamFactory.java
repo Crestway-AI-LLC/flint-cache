@@ -73,6 +73,9 @@ public final class FlintStreamFactory extends AbstractObjectInputStreamFactory {
   public static final String META_TTL      = "fs.s3a.flint.meta.ttl.seconds";
   public static final String CACHE_SSE_KMS = "fs.s3a.flint.cache.sse-kms";
   public static final String MAX_OBJECT   = "fs.s3a.flint.max.object.bytes";
+  public static final String MAX_PART     = "fs.s3a.flint.max.part.bytes";
+  public static final String IMMUTABLE    = "fs.s3a.flint.immutable";
+  public static final String META_TTL_IMM = "fs.s3a.flint.meta.ttl.immutable.seconds";
   /** Refuse to start on a shim collision. Default true: a customer's working
    *  job is worth more than our cache. */
   public static final String SHIM_FAIL_FAST = "fs.s3a.flint.shim.failfast";
@@ -149,8 +152,28 @@ public final class FlintStreamFactory extends AbstractObjectInputStreamFactory {
     // recommends first. The default-safe behaviour was implemented on two of
     // three paths and absent from the one most customers will use.
     boolean cacheKms = conf.getBoolean(CACHE_SSE_KMS, false);
+    // READ EVERY KEY THIS CLASS DECLARES.
+    //
+    // MAX_OBJECT was declared here and never read: the constant existed, the
+    // README documented the setting for this path, and the client was built
+    // from the short constructor that takes the defaults -- so setting it did
+    // nothing and nothing said so. max.part.bytes, immutable and the immutable
+    // TTL had no constant at all while the README listed them for paths 1
+    // and 2.
+    //
+    // This is the SAME defect FlintS3AFileSystem already carries a comment
+    // about: an enumerated key list fails closed, which is right, but it does
+    // so silently and one key at a time, and nothing fails when a key is
+    // forgotten. Path 2 fixed it by mapping flint.* -> fs.s3a.flint.* by RULE.
+    // Path 1 cannot use that rule -- it builds the client directly rather than
+    // through TierSupport -- so the enumeration stays and the gate now asserts
+    // that a value set here reaches the client. See BUG-0066.
+    long maxObj = conf.getLong(MAX_OBJECT, FlintObjectClient.DEFAULT_MAX_OBJECT_BYTES);
+    long maxPart = conf.getLong(MAX_PART, FlintObjectClient.DEFAULT_MAX_PART_BYTES);
+    boolean immutable = conf.getBoolean(IMMUTABLE, false);
+    long immTtl = conf.getLong(META_TTL_IMM, 86_400);
     cachingClient = new FlintObjectClient(origin, conn.async(), chunk, budget, ttl,
-        false, s3, cacheKms);
+        false, s3, cacheKms, immutable, immTtl, maxObj, maxPart);
     aalCaching = new S3SeekableInputStreamFactory(
         cachingClient, S3SeekableInputStreamConfiguration.DEFAULT);
 
@@ -159,7 +182,8 @@ public final class FlintStreamFactory extends AbstractObjectInputStreamFactory {
     // is needed -- which would turn a privacy control into an outage.
     aalBypass = new S3SeekableInputStreamFactory(
         new FlintObjectClient(new S3SdkObjectClient(s3, false),
-            conn.async(), chunk, budget, ttl, true, s3, cacheKms),
+            conn.async(), chunk, budget, ttl, true, s3, cacheKms,
+            immutable, immTtl, maxObj, maxPart),
         S3SeekableInputStreamConfiguration.DEFAULT);
   }
 

@@ -377,7 +377,7 @@ step "suites (classes)"
 # enough for readers to actually collide, and these are the values each suite
 # was developed and validated against.
 run_suite "client suite (24 checks)"   ai.crestway.flintaccel.client.Suite   9301 "$ROOT/jvm-spike/target/classes:$CP" "--delay-ms 120"
-run_suite "S3A properties (9 checks)"  ai.crestway.flintaccel.s3a.S3aSuite   9302 "$ROOT/jvm-spike/target/classes:$CP" "--delay-ms 150"
+run_suite "S3A properties (12 checks)"  ai.crestway.flintaccel.s3a.S3aSuite   9302 "$ROOT/jvm-spike/target/classes:$CP" "--delay-ms 150"
 run_suite "adoption paths (9 checks)"  ai.crestway.flintaccel.s3a.AdoptionSuite 9303 "$ROOT/jvm-spike/target/classes:$CP"
 run_suite "SSE-C bypass (5 checks)"    ai.crestway.flintaccel.s3a.SseCSuite  9304 "$ROOT/jvm-spike/target/classes:$CP"
 # BUG-0058. This suite KILLS AND RESTARTS THE TIER, which the ownership re-take

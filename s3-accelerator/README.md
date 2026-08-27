@@ -131,9 +131,23 @@ assumed to be zero.
 | metadata TTL | `fs.s3a.flint.meta.ttl.seconds` | `flint.meta.ttl.seconds` | `meta_ttl_s` | 60 s |
 | cache SSE-KMS | `fs.s3a.flint.cache.sse-kms` | `flint.cache.sse-kms` | `cache_sse_kms` | `false` |
 | declare immutable | `fs.s3a.flint.immutable` | `flint.immutable` | — | `false` (**`true`** on the Iceberg path) |
-| max cached object | `fs.s3a.flint.max.object.bytes` | `flint.max.object.bytes` | `max_object_bytes` | 512 MiB |
+| max cached **part** | `fs.s3a.flint.max.part.bytes` | `flint.max.part.bytes` | `max_part_bytes` | **65 MiB** |
+| max cached object | `fs.s3a.flint.max.object.bytes` | `flint.max.object.bytes` | `max_object_bytes` | **off** (deprecated) |
 | read block size | — (AAL fetches the exact range) | — | `default_block_size` | **256 KiB** = 4 chunks (not fsspec's 5 MiB, not our chunk) |
 | immutable TTL | `fs.s3a.flint.meta.ttl.immutable.seconds` | `flint.meta.ttl.immutable.seconds` | — | 86400 s |
+
+**The cap is on the PART, not the object.** A single request larger than
+65 MiB is read straight from S3 and never cached; the object it belongs to is
+irrelevant. What a cache saves on a read is the 25-45 ms of time-to-first-byte,
+so what decides the payoff is how big each *request* is — 30 ms against an
+8 MiB part is most of it, and against a 900 MiB one it is a rounding error.
+
+`max.object.bytes` used to be 512 MiB and is now **off by default**. It was
+wrong in a way worth stating: readers chunk large objects into small parts, so
+a 1 GiB shard read in 256 KiB pieces is the case this cache helps *most* — and
+an object-size cap refused it outright, before the part gate saw a single
+request. The setting is kept and still works when set explicitly, because it
+may already be configured in the field.
 
 **Immutability is a declaration the engine can make and the cache cannot
 infer.** Metadata normally revalidates on a 60 s TTL, because an object at a

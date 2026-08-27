@@ -148,6 +148,55 @@ public final class S3aSuite {
       check(used < N, N + " concurrent cold readers cost " + used + " origin GETs");
     }
 
+    // 4. BUG-0066: a setting this path DECLARES must actually reach the client.
+    //
+    // fs.s3a.flint.max.object.bytes was declared as a constant here, documented
+    // in the README for this path, and never read -- the client was built from
+    // the short constructor that takes the defaults. Three more keys had no
+    // constant at all while the README listed them. Nothing failed, because an
+    // ignored setting behaves exactly like a setting left at its default.
+    //
+    // Asserted by EFFECT rather than by introspection: a 1-byte part cap must
+    // stop this path caching, and the same path with the cap left alone must
+    // still cache. A check that read the field back would pass on a client that
+    // stored the value and ignored it.
+    Configuration capped = new Configuration(conf);
+    capped.setLong(FlintStreamFactory.MAX_PART, 1);
+    capped.set("fs.s3a.impl.disable.cache", "true");   // else FileSystem.get reuses the one above
+    String capKey = "data/000004.bin";
+    io.lettuce.core.RedisClient rcli = io.lettuce.core.RedisClient.create(tier);
+    try (var rc = rcli.connect(new io.lettuce.core.codec.ByteArrayCodec())) {
+      rc.sync().flushall();
+      try (FileSystem fs3 = FileSystem.get(URI.create("s3a://bucket/"), capped);
+           FSDataInputStream in = fs3.open(new Path("s3a://bucket/" + capKey))) {
+        byte[] b = new byte[4096];
+        in.readFully(300_000, b, 0, 4096);
+        check(Arrays.equals(b, expect(capKey, 300_000, 4096)),
+            "a 1-byte part cap on path 1 still READS correctly");
+      }
+      int cappedKeys = ai.crestway.flintaccel.TierScan.keys(rc, "c2/*").size();
+      check(cappedKeys == 0,
+          "fs.s3a.flint.max.part.bytes REACHES the client on path 1: nothing "
+              + "cached under a 1-byte cap (" + cappedKeys + " chunk keys)");
+
+      // The control is the whole check. Without it this passes on a path that
+      // caches nothing for any reason -- which is what the bug looked like.
+      rc.sync().flushall();
+      Configuration uncapped = new Configuration(conf);
+      uncapped.set("fs.s3a.impl.disable.cache", "true");
+      try (FileSystem fs4 = FileSystem.get(URI.create("s3a://bucket/"), uncapped);
+           FSDataInputStream in = fs4.open(new Path("s3a://bucket/" + capKey))) {
+        byte[] b = new byte[4096];
+        in.readFully(300_000, b, 0, 4096);
+      }
+      int normalKeys = ai.crestway.flintaccel.TierScan.keys(rc, "c2/*").size();
+      check(normalKeys > 0,
+          "POSITIVE CONTROL: the same read WITHOUT the cap does cache ("
+              + normalKeys + " chunk keys), so the cap is what decided it");
+    } finally {
+      rcli.shutdown();
+    }
+
     System.out.println("\nS3A SUITE " + (ok ? "PASSED" : "FAILED"));
     System.exit(ok ? 0 : 1);
   }
