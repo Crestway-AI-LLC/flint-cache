@@ -1,4 +1,4 @@
-# BUG-0060: thirty drills kill the supervised seat before its supervisor
+# BUG-0061: thirty drills kill the supervised seat before its supervisor
 
 Status: OPEN, found 2026-08-27 · Severity: MEDIUM as a gate matter — it is a
 latent race in 30 drills that currently loses only because a teardown bug
