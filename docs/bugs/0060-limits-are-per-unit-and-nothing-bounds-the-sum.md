@@ -233,3 +233,40 @@ cannot use it, because they hand the encoder a finished `Vec`. A streaming
 
 **Remaining unaudited:** the async write queue against value size, and
 per-namespace state scaling with namespace count.
+
+## Audit pass 3, 2026-08-27 — candidate 3 (async write queue): the shape is there, NOT measured
+
+**The bound is entries, not bytes.** `write_queue.rs:56`:
+
+    /// Default bounded queue depth. Full -> the writer gets -THROTTLED (the
+    /// existing back-off contract), never an unbounded backlog.
+    pub const DEFAULT_QUEUE_CAP: usize = 4096;
+
+and each entry owns its payload — `args: Vec<Vec<u8>>` at `:116`, the full
+value bytes, not a reference. So the queue's resident cost is
+`4096 x value size`, and nothing counts the bytes.
+
+The comment is the same sentence this audit keeps finding: *"never an
+unbounded backlog"* is true of the COUNT and says nothing about the SUM. At an
+ordinary 1 MB value that is ~4 GB resident on a 16 GiB seat, held by a
+mechanism whose stated purpose is to bound itself. `MAX_BULK_LEN` is 512 MiB,
+so the arithmetic ceiling is far worse, though no real client writes that.
+
+**Not measured, and the reason matters.** `--async-writes requires
+--engine rocks`, and the checked-in release binary is built without the rocks
+feature, so the path cannot be exercised without a feature build. The
+measurement that would settle it: `--engine rocks --async-writes all`, submit
+~1500 x 1 MB values faster than the consumer drains, sample RSS, and confirm
+whether peak tracks `min(inflight, 4096) x value size`.
+
+Filed at this depth deliberately. The two measured results above cost several
+harness attempts each, two of which silently measured nothing; asserting a
+number here from arithmetic alone would be exactly the per-unit reasoning the
+bug is about, one level up.
+
+**If it measures as predicted**, the fix is the same shape as candidate 1's:
+not a smaller entry cap, but a byte budget the queue draws against — the
+`-THROTTLED` contract already exists and is the right refusal, it is simply
+being triggered by the wrong quantity.
+
+**Remaining unaudited:** per-namespace state scaling with namespace count.
