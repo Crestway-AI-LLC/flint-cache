@@ -26,6 +26,17 @@ export FLINT_TIER_SERVER="$TIER_SERVER" FLINT_TIER_CLI="$TIER_CLI"
 
 cd "$(dirname "$0")/.."
 ROOT=$PWD
+
+# Resource floors. The gate bounded TIME and nothing else, so every other way a
+# run can go wrong -- disk, memory, heap -- arrived as an OOM kill or a corrupt
+# target dir rather than as a refusal that names the cause. See tools/resource_guard.sh.
+. "$(dirname "$0")/resource_guard.sh"
+GUARD_DISK_BEFORE=$(guard_free_disk_gb "$ROOT")
+guard_check "the gate" "$ROOT" || exit 3
+GUARD_JAVA_OPTS="$(guard_java_opts)"
+# Bound the BUILD too. A maven that swaps takes the machine down just as
+# thoroughly as a suite that does, and it runs before any suite could report it.
+export MAVEN_OPTS="${MAVEN_OPTS:-} -Xmx${GUARD_JVM_MAX_HEAP}"
 export JAVA_HOME="${JAVA_HOME:-/opt/homebrew/opt/openjdk@21}"
 export PATH="$JAVA_HOME/bin:$PATH"
 QUICK=${1:-}
@@ -338,7 +349,7 @@ run_suite() { # label, mainclass, port, classpath, extra-origin-args
   start_svcs "$3" "${5:-}"
   "$TIER_CLI" -p "$TIER_PORT" flushall >/dev/null 2>&1
   local log="/tmp/gate_$(echo "$1" | tr ' /()' '____').log"
-  run_bounded java -cp "$4" "$2" "http://127.0.0.1:$3" redis://127.0.0.1:$TIER_PORT >"$log" 2>&1
+  run_bounded java $GUARD_JAVA_OPTS -cp "$4" "$2" "http://127.0.0.1:$3" redis://127.0.0.1:$TIER_PORT >"$log" 2>&1
   local rc=$?
   [ $rc -eq 124 ] && printf "   \033[31mHUNG\033[0m  %s (>${SUITE_TIMEOUT}s)\n" "$1"
   verdict "$1" $rc
@@ -400,7 +411,7 @@ python3 tools/counting_s3.py --port 9309 --objects 4 --object-bytes 1048576 \
 PIDS+=($!)
 wait_http "http://127.0.0.1:9309/__stats" || exit 2
 "$TIER_CLI" -p "$TIER_PORT" flushall >/dev/null 2>&1
-run_bounded java -cp "$ROOT/jvm-spike/target/classes:$CP" \
+run_bounded java $GUARD_JAVA_OPTS -cp "$ROOT/jvm-spike/target/classes:$CP" \
     ai.crestway.flintaccel.client.SseKmsSuite \
     http://127.0.0.1:9308 http://127.0.0.1:9309 redis://127.0.0.1:$TIER_PORT \
     >/tmp/gate_ssekms.log 2>&1
@@ -411,7 +422,7 @@ verdict "SSE-KMS bypass + opt-in (12 checks)" $?
 # built its client through the older constructor and could not detect KMS at
 # all, while fs.s3a.impl mapped config through a switch that dropped the opt-in
 # key. A check on any single path passes while the others are wrong.
-run_bounded java -cp "$ROOT/jvm-spike/target/classes:$CP" \
+run_bounded java $GUARD_JAVA_OPTS -cp "$ROOT/jvm-spike/target/classes:$CP" \
     ai.crestway.flintaccel.s3a.SseKmsPathsSuite \
     http://127.0.0.1:9308 redis://127.0.0.1:$TIER_PORT >/tmp/gate_kmspaths.log 2>&1
 verdict "SSE-KMS on all 3 adoption paths (7 checks)" $?
@@ -427,7 +438,7 @@ python3 tools/counting_s3.py --port 9311 --objects 4 --object-bytes 1048576 \
 PIDS+=($!)
 wait_http "http://127.0.0.1:9311/__stats" || exit 2
 "$TIER_CLI" -p "$TIER_PORT" flushall >/dev/null 2>&1
-run_bounded java -cp "$ROOT/jvm-spike/target/classes:$CP" \
+run_bounded java $GUARD_JAVA_OPTS -cp "$ROOT/jvm-spike/target/classes:$CP" \
     ai.crestway.flintaccel.client.MetricsSuite \
     http://127.0.0.1:9311 http://127.0.0.1:9308 redis://127.0.0.1:$TIER_PORT \
     >/tmp/gate_metrics.log 2>&1
@@ -437,7 +448,7 @@ verdict "JMX metrics, read via MBeanServer (13 checks)" $?
 # origin HEAD count across a read taken AFTER the mutable TTL expires --
 # correct bytes or a hit counter would look identical whether or not the
 # declaration did anything.
-run_bounded java -cp "$ROOT/jvm-spike/target/classes:$CP" \
+run_bounded java $GUARD_JAVA_OPTS -cp "$ROOT/jvm-spike/target/classes:$CP" \
     ai.crestway.flintaccel.client.ImmutableSuite \
     http://127.0.0.1:9311 redis://127.0.0.1:$TIER_PORT >/tmp/gate_immutable.log 2>&1
 verdict "immutability declaration skips revalidation (3 checks)" $?
@@ -454,7 +465,7 @@ python3 tools/slow_tier.py --listen "$SLOW_PORT" --upstream "$TIER_PORT" --delay
 PIDS+=($!)
 wait_tcp "$SLOW_PORT" || exit 2
 "$TIER_CLI" -p "$TIER_PORT" flushall >/dev/null 2>&1
-run_bounded java -cp "$ROOT/jvm-spike/target/classes:$CP" \
+run_bounded java $GUARD_JAVA_OPTS -cp "$ROOT/jvm-spike/target/classes:$CP" \
     ai.crestway.flintaccel.client.SickTierSuite \
     http://127.0.0.1:9310 redis://127.0.0.1:$TIER_PORT redis://127.0.0.1:$SLOW_PORT \
     >/tmp/gate_sicktier.log 2>&1
@@ -472,7 +483,7 @@ step "iceberg io-impl, end to end (real tables, avro + parquet)"
 start_svcs 9306
 "$TIER_CLI" -p "$TIER_PORT" flushall >/dev/null 2>&1
 ( cd jvm-spike && run_bounded mvn -q test-compile ) >/tmp/gate_ice_build.log 2>&1
-run_bounded java -cp "$ROOT/jvm-spike/target/classes:$ROOT/jvm-spike/target/test-classes:$CP_TEST" \
+run_bounded java $GUARD_JAVA_OPTS -cp "$ROOT/jvm-spike/target/classes:$ROOT/jvm-spike/target/test-classes:$CP_TEST" \
     ai.crestway.flintaccel.iceberg.IcebergSuite \
     http://127.0.0.1:9306 redis://127.0.0.1:$TIER_PORT >/tmp/gate_iceberg.log 2>&1
 verdict "iceberg table read via io-impl, avro + parquet (20 checks)" $?
@@ -601,5 +612,8 @@ printf "   %d passed, %d failed" "$PASS" "$FAIL"
 [ $SKIP -gt 0 ] && printf ", %d skipped" "$SKIP"
 printf "\n"
 for f in "${FAILED[@]:-}"; do [ -n "$f" ] && printf "   failed: %s  (see /tmp/gate_*.log)\n" "$f"; done
+# A run that leaves the volume near full makes the NEXT run fail for reasons
+# that have nothing to do with it, so say so while the cause is still attached.
+guard_report_after "the gate" "$ROOT" "$GUARD_DISK_BEFORE"
 [ $FAIL -eq 0 ] && echo "   GATE PASSED" || echo "   GATE FAILED"
 exit $FAIL
