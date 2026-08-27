@@ -1032,6 +1032,16 @@ enum LeaseRenewal {
     Unreachable,
 }
 
+/// The journal cause for a lease-superseded self-fence. NAMES THE SUCCESSOR
+/// (BUG-0065): the 2026-08-27 canary abort was undiagnosable because this row
+/// carried a fixed string while stderr — per-seat, dead with the box — had the
+/// one fact that mattered. Whether the CP named this pair's own stale record
+/// or the other pair's fresh promotion is answerable from the successor and
+/// from nothing else the gate prints.
+fn superseded_cause(successor: &str) -> String {
+    format!("lease superseded by {successor}: promotion on record at the CP")
+}
+
 /// One CPLEASE round trip (ADR-0018). A fresh dial per renewal, at ttl/3
 /// cadence — the reconnect cost is noise, and a persistent connection would
 /// need its own liveness machinery to avoid renewing into a dead socket.
@@ -2202,10 +2212,18 @@ fn main() -> std::io::Result<()> {
                         eprintln!(
                             "lease superseded by {successor}: a promotion is on record — self-fenced to read-only"
                         );
+                        // NAME THE SUCCESSOR IN THE JOURNAL, not only on stderr
+                        // (BUG-0065). The 2026-08-27 canary abort printed this
+                        // row with the fixed string below and nothing else, and
+                        // the whole question — did the CP name this pair's own
+                        // stale record, or the OTHER pair's fresh promotion? —
+                        // was answerable from the successor and from nothing
+                        // else in the artifact. stderr is per-seat and dies
+                        // with the box; the journal is what the gate prints.
                         journal_event(
                             flint_journal::EventKind::SelfFenced,
                             None,
-                            "lease superseded: promotion on record at the CP",
+                            &superseded_cause(&successor),
                         );
                     }
                     LeaseRenewal::Unreachable => {
@@ -5296,6 +5314,30 @@ mod replica {
 /// mixed commands classifies. Every one of them fails if the aggregate is
 /// taken from the FIRST command instead of all of them — which is the shape
 /// the bug had.
+#[cfg(test)]
+mod superseded_cause_tests {
+    use super::superseded_cause;
+
+    /// BUG-0065's instrument: the journal row must NAME the successor. The
+    /// 2026-08-27 canary abort carried a fixed string here, and the one fact
+    /// that discriminates a stale own-pair record from a cross-pair promotion
+    /// lived only on stderr, which dies with the box. A cause that mentions
+    /// supersession without saying BY WHOM is the regression this pins.
+    #[test]
+    fn the_fence_row_names_who_superseded_it() {
+        let c = superseded_cause("127.0.0.1:6923");
+        assert!(
+            c.contains("127.0.0.1:6923"),
+            "the successor is missing from the journal cause: {c}"
+        );
+        // and it stays greppable by responders reading old incidents
+        assert!(
+            c.contains("lease superseded"),
+            "lost the family prefix: {c}"
+        );
+    }
+}
+
 #[cfg(test)]
 mod admission_tests {
     use super::*;
