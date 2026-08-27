@@ -193,3 +193,43 @@ usable for large values.
 That any tenant does this. The measurement shows the cost is real and
 unbounded, not that it has been paid. `MAX_CONNS` 2048 is the multiplier that
 makes it a node-level question rather than a slow query.
+
+## Audit pass 2, 2026-08-27 — candidate 2 (pipeline depth) is CLEAN, measured
+
+Recorded as a negative because an audit that reports only findings cannot be
+trusted about what it cleared.
+
+**Question:** `MAX_ARRAY_LEN` bounds one array; what bounds the number of
+commands in flight on one connection and their accumulated replies?
+
+**Answer, from the serve loop:** commands are decoded and executed ONE at a
+time, and `OUT_FLUSH_THRESHOLD` is checked after each reply is appended. So
+accumulated replies are bounded at ~1 MiB plus one reply, per connection —
+not by pipeline depth.
+
+**Measured**, against a deliberately hostile reader (300 pipelined `GET`s of
+1 MB values, sent in one burst, replies drained in 64 KB reads with sleeps to
+force server-side buffering):
+
+    RSS loaded                303 MB
+    peak RSS during drain     305 MB
+    delta                     + 2 MB      for 300 MB of replies in flight
+    reply bytes read          286 MB
+
+Two megabytes. The flush works, and the slow-reader case — the one that would
+expose it — does not accumulate.
+
+**What this contrast buys.** Candidate 1 measured +412 MB for a single
+`HGETALL`; candidate 2 measures +2 MB for 300 MB of pipelined replies through
+the same encoder on the same node. The defect is therefore isolated precisely:
+it is not the reply path, not pipelining, and not the encoder. It is the
+single materialised collection, where a reply is built whole before the
+threshold is ever consulted.
+
+That also narrows the fix. `OUT_FLUSH_THRESHOLD`'s incremental-flush pattern
+already exists and already works; the collection commands are the ones that
+cannot use it, because they hand the encoder a finished `Vec`. A streaming
+`HGETALL` would fall into the same bounded path everything else already uses.
+
+**Remaining unaudited:** the async write queue against value size, and
+per-namespace state scaling with namespace count.
