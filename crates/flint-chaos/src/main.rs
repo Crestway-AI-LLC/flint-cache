@@ -128,6 +128,13 @@ fn main() {
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(42),
     );
+    // OPS-0058. Every key this RUN writes carries this prefix, so a cluster
+    // that hosts more than one run cannot hand our final walk someone else's
+    // value at one of our key names. Derived from the seed, so `--seed N`
+    // replays the keyspace as well as the sequence, and printed in the banner
+    // so the operator can find this run's keys on the box afterwards. It goes
+    // OUTSIDE the hash tag -- see Shared::run_nonce.
+    let run_nonce = format!("r{seed:x}-");
     // The server's own default (repl_hub::DEFAULT_LAG_HARD_MS). Writes acked
     // longer ago than this MUST have replicated, because past it the master
     // sheds instead of acking — so losing one is a breach of the published
@@ -201,7 +208,7 @@ fn main() {
     // a backlog that already exists on the box.
     sweep_stale_dirs();
     println!(
-        "chaos-kv: {iterations} kills, {key_count} keys, mode={mode}, driver={}, min_replicas={min_replicas}, seed={seed} (replay with --seed {seed})",
+        "chaos-kv: {iterations} kills, {key_count} keys, mode={mode}, driver={}, min_replicas={min_replicas}, seed={seed} (replay with --seed {seed}); keyspace {run_nonce}key*",
         if !inventory.is_empty() {
             // An attached fleet HAS a controller; promotion was never ours
             // to make, so saying "harness" here would misreport what was
@@ -303,7 +310,9 @@ fn main() {
                 String::new()
             };
             std::sync::Arc::new(
-                Shared::new(t.endpoints(), t.tls(), key_count).with_edge(edge.clone(), tag),
+                Shared::new(t.endpoints(), t.tls(), key_count)
+                    .with_edge(edge.clone(), tag)
+                    .with_run_nonce(run_nonce.clone()),
             )
         })
         .collect();

@@ -161,6 +161,29 @@ pub struct Shared {
     /// Every key this writer touches carries this hash tag, pinning it to one
     /// pair even though the proxy does the routing. Empty in direct mode.
     pub tag: String,
+    /// A per-RUN prefix on every key, so one run's keys cannot collide with
+    /// another's on a cluster both use.
+    ///
+    /// OPS-0058. The soak runs a fresh flint-chaos per cycle against the SAME
+    /// cluster with no flush, and each process restarts `seq` at zero. With
+    /// ~800 writes a cycle over the same key names, successive cycles' seq
+    /// ranges overlap almost entirely, so a value left by cycle 3 is
+    /// byte-indistinguishable from one cycle 4 could have written: same key,
+    /// same owner stamp, a seq in the same range. The final walk then reads a
+    /// previous cycle's value at a key this cycle's ledger owns and calls it
+    /// `PHANTOM ... never written`.
+    ///
+    /// That made the strongest assertion in the harness unattributable — it
+    /// could not separate its own residue from a genuinely lost write, which
+    /// is the one thing it exists to detect. A distinct keyspace per run
+    /// removes the residue, so a surviving PHANTOM means what it says.
+    ///
+    /// IT MUST STAY OUTSIDE THE BRACES. Only the text inside `{}` picks the
+    /// slot (`cluster::pair_tag` searches for a tag whose CRC16 lands in the
+    /// pair's range), so a nonce placed inside would rehash the key onto an
+    /// arbitrary pair and the verdict after a kill would judge the wrong
+    /// nodes. `key_nonce_does_not_change_the_hash_tag` holds that.
+    pub run_nonce: String,
 }
 
 #[derive(Clone)]
@@ -205,6 +228,7 @@ impl Shared {
             key_count,
             edge: None,
             tag: String::new(),
+            run_nonce: String::new(),
         }
     }
 
@@ -214,11 +238,19 @@ impl Shared {
         self
     }
 
+    /// See `run_nonce`. Derived from the run seed by the caller, so `--seed N`
+    /// replays the same keyspace as well as the same sequence.
+    pub fn with_run_nonce(mut self, nonce: String) -> Self {
+        self.run_nonce = nonce;
+        self
+    }
+
     fn key(&self, n: u64) -> String {
         if self.tag.is_empty() {
-            format!("key{n}")
+            format!("{}key{n}", self.run_nonce)
         } else {
-            format!("{{{}}}key{n}", self.tag)
+            // Nonce AFTER the closing brace on purpose — see `run_nonce`.
+            format!("{{{}}}{}key{n}", self.tag, self.run_nonce)
         }
     }
 
@@ -465,6 +497,126 @@ mod clock_resolution {
             "now_us()/1000 = {} but now_ms() = {ms} (drift {drift}ms): the two \
              clocks are not reading the same wall clock in compatible units",
             us / 1_000
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cluster::pair_tag;
+
+    fn shared(tag: &str, nonce: &str) -> Shared {
+        Shared::new(Vec::new(), None, 8)
+            .with_edge(None, tag.to_string())
+            .with_run_nonce(nonce.to_string())
+    }
+
+    /// THE property the nonce's placement rests on. Only the text inside `{}`
+    /// selects a slot, so prefixing outside the braces must leave routing
+    /// identical — otherwise a run's keys scatter off their pair and the
+    /// verdict after a kill judges the wrong nodes.
+    ///
+    /// Asserted with `flint_slot::slot_for_key`, the function the proxy
+    /// actually routes with, rather than a re-derivation of the hash-tag rule
+    /// here: a test that reimplements the rule can be wrong in the same way as
+    /// the code and agree with it.
+    #[test]
+    fn key_nonce_does_not_change_the_hash_tag() {
+        for tag in ["p0x0", "p1x3", "p2x17"] {
+            let plain = shared(tag, "");
+            let noncy = shared(tag, "rdeadbeef-");
+            for n in [0u64, 1, 37, 299] {
+                let a = plain.key(n);
+                let b = noncy.key(n);
+                assert_ne!(a, b, "the nonce must actually change the key name");
+                assert_eq!(
+                    flint_slot::slot_for_key(a.as_bytes()),
+                    flint_slot::slot_for_key(b.as_bytes()),
+                    "nonce moved {a} -> {b} to a different slot"
+                );
+                assert_eq!(
+                    flint_slot::hash_tag(b.as_bytes()),
+                    tag.as_bytes(),
+                    "the hash tag of {b} is no longer the pair tag"
+                );
+            }
+        }
+    }
+
+    /// The negative control for the test above: prove it can fail. A nonce
+    /// placed INSIDE the braces is the mistake being guarded against, and it
+    /// must show up as a different slot — otherwise the assertion above passes
+    /// for a reason unrelated to placement.
+    #[test]
+    fn a_nonce_inside_the_braces_would_move_the_slot() {
+        let outside = format!("{{{}}}{}key37", "p0x0", "rdeadbeef-");
+        let inside = format!("{{{}{}}}key37", "p0x0", "rdeadbeef-");
+        assert_ne!(
+            flint_slot::slot_for_key(outside.as_bytes()),
+            flint_slot::slot_for_key(inside.as_bytes()),
+            "if these matched, the placement test could not detect the bug it exists for"
+        );
+    }
+
+    /// A tagged key must still land in its own pair's slot range, which is the
+    /// reason `pair_tag` searches for a tag at all.
+    #[test]
+    fn key_nonce_keeps_each_pair_in_its_own_slot_range() {
+        let pair_count = 3;
+        for i in 0..pair_count {
+            let tag = pair_tag(i, pair_count);
+            let lo = (i * 16384 / pair_count) as u16;
+            let hi = ((i + 1) * 16384 / pair_count - 1) as u16;
+            let sh = shared(&tag, "r1234abcd-");
+            for n in [0u64, 5, 299] {
+                let slot = flint_slot::slot_for_key(sh.key(n).as_bytes());
+                assert!(
+                    slot >= lo && slot <= hi,
+                    "pair {i}: key {} landed in slot {slot}, outside {lo}..={hi}",
+                    sh.key(n)
+                );
+            }
+        }
+    }
+
+    /// OPS-0058 itself: two runs sharing a cluster must not share key names,
+    /// or one run's residue is indistinguishable from the other's write.
+    #[test]
+    fn different_runs_get_disjoint_keyspaces() {
+        let a = shared("p0x0", "r1111-");
+        let b = shared("p0x0", "r2222-");
+        let ka: std::collections::HashSet<String> = (0..300).map(|n| a.key(n)).collect();
+        let kb: std::collections::HashSet<String> = (0..300).map(|n| b.key(n)).collect();
+        assert_eq!(ka.len(), 300, "keys within a run must stay distinct");
+        assert!(
+            ka.is_disjoint(&kb),
+            "two runs shared {} key name(s)",
+            ka.intersection(&kb).count()
+        );
+    }
+
+    /// `--seed N` must replay the keyspace, not just the write sequence.
+    #[test]
+    fn the_same_nonce_reproduces_the_same_keyspace() {
+        let a = shared("p0x0", "rcafe-");
+        let b = shared("p0x0", "rcafe-");
+        for n in [0u64, 42, 299] {
+            assert_eq!(a.key(n), b.key(n));
+        }
+    }
+
+    /// Direct mode has no tag, and must still be namespaced — the local chaos
+    /// drills reuse one data dir across runs for the same reason the soak
+    /// reuses one cluster.
+    #[test]
+    fn direct_mode_also_carries_the_nonce() {
+        let sh = shared("", "rfeed-");
+        assert_eq!(sh.key(7), "rfeed-key7");
+        assert_eq!(
+            shared("", "").key(7),
+            "key7",
+            "empty nonce stays backward-compatible"
         );
     }
 }
