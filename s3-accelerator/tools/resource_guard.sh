@@ -67,12 +67,23 @@ guard_check() { # label, path [path...]
   [ $# -gt 0 ] || set -- .
   local bad=0 mem fds worst="" worst_gb=""
 
-  for path in "$@"; do
-    [ -e "$path" ] || continue
-    local d; d=$(guard_free_disk_gb "$path")
+  # NOT `path` as the loop variable. In zsh `path` is a special array tied to
+  # `PATH`, so assigning it destroys command lookup for the rest of the shell --
+  # sourcing this file from an interactive zsh and calling guard_check produced
+  # `command not found: awk` from inside guard_free_disk_gb, and left the shell
+  # unable to find anything afterwards. The gate scripts run under bash, where
+  # the name is harmless, which is exactly why this would have sat here.
+  # `d` declared ONCE, outside the loop. Re-running `local d` on each iteration
+  # makes zsh's typeset ECHO the variable -- the loop printed "d=53" into the
+  # gate's output, which is the kind of stray line someone later spends time
+  # tracing to a real component.
+  local vol d
+  for vol in "$@"; do
+    [ -e "$vol" ] || continue
+    d=$(guard_free_disk_gb "$vol")
     [ -n "$d" ] || continue
     if [ -z "$worst_gb" ] || [ "$d" -lt "$worst_gb" ] 2>/dev/null; then
-      worst_gb=$d; worst=$path
+      worst_gb=$d; worst=$vol
     fi
   done
   local disk="${worst_gb:-}"
