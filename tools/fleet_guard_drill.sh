@@ -227,7 +227,59 @@ OUT=$(FLINT_DRILL_PARALLEL=1 fleet_guard 2>&1); RC=$?
 echo "  peer tolerated only while its lock is live; foreign otherwise"
 cleanup; PIDS=""; sleep 0.5
 
-echo "PASS: fleet_guard sees sibling projects' fleets, refuses without claiming ownership, does not misread our own binaries, honours FORCE, disowns prefix scopes, and tells a live peer drill from a foreign fleet"
+# BUG-0063. The contract arm B asserts -- a sibling FLEET refuses on sight,
+# busy or not -- rests on a presumption: that a named binary is a fleet SOMEONE
+# IS RUNNING. An orphan is where that is false, and it is not hypothetical: the
+# flint-kv suite left one behind twice in one hour on 2026-08-27, each time
+# blocking every drill on this box until a human killed it by hand.
+#
+# So ORPHANHOOD is the discriminator, not idleness. Arms H and I pin both
+# halves, because a fix that only widened the permissive side would silently
+# undo arm B -- which is exactly what the comment above _fleet_sibling_named
+# warns measuring contention for named binaries would do.
+orphan_as() {  # a named process reparented to init: the intermediate shell exits
+  bash -c "( exec -a $1 sleep 60 & )"
+}
+reap_orphans() { pkill -f '^flint-kvorphan-' 2>/dev/null; true; }
+
+echo "== H) an ORPHANED sibling fleet at rest must NOT block the box"
+reap_orphans
+orphan_as flint-kvorphan-server
+sleep 1
+OPID=$(pgrep -f '^flint-kvorphan-server' | head -1)
+[ -n "$OPID" ] \
+  || { echo "FAIL: could not spawn the fake orphan — this arm would pass vacuously"; exit 1; }
+OPPID=$(ps -o ppid= -p "$OPID" | tr -d ' ')
+[ "$OPPID" = "1" ] \
+  || { echo "FAIL: the fake orphan has parent $OPPID, not 1 — it is not an orphan,"; \
+       echo "      so this arm is not testing what it claims"; reap_orphans; exit 1; }
+# It must still be SEEN as a sibling; the fix is about the verdict, not the sight.
+_fleet_sibling | grep -q 'flint-kvorphan-server' \
+  || { echo "FAIL: the orphan is not visible to _fleet_sibling at all"; reap_orphans; exit 1; }
+_fleet_sibling_named_live | grep -q 'flint-kvorphan-server' \
+  && { echo "FAIL: an orphan counted as a LIVE named sibling — ppid is not being read"; reap_orphans; exit 1; }
+OUT=$(FLINT_SIBLING_WINDOW=1 fleet_guard 2>&1); RC=$?
+[ "$RC" = 0 ] \
+  || { echo "FAIL: the guard REFUSED over an idle orphan (exit $RC). That is the bug:"; \
+       echo "$OUT" | sed 's/^/    /'; reap_orphans; exit 1; }
+echo "  proceeded past an idle orphan without a human killing it"
+reap_orphans; sleep 0.5
+
+echo "== I) NEGATIVE CONTROL: a LIVE sibling fleet must still refuse on sight"
+# If D were implemented as "idle siblings are fine", this arm fails: a sleeping
+# fake fleet is idle too, and was never the question. Arm B covers the busy
+# case; this one pins that D did not weaken it for a QUIET live fleet.
+spawn_as flint-kv-server
+sleep 1
+OUT=$(FLINT_SIBLING_WINDOW=1 fleet_guard 2>&1); RC=$?
+[ "$RC" = 1 ] \
+  || { echo "FAIL: a live (parented) sibling fleet no longer refuses — D was"; \
+       echo "      implemented as 'idle is fine' and collapsed the contract (exit $RC)"; \
+       echo "$OUT" | sed 's/^/    /'; exit 1; }
+echo "  a quiet but PARENTED sibling fleet still refuses — orphanhood, not idleness"
+cleanup; PIDS=""; sleep 0.5
+
+echo "PASS: fleet_guard sees sibling projects' fleets, refuses without claiming ownership, proceeds past an ORPHANED one while still refusing a parented one, does not misread our own binaries, honours FORCE, disowns prefix scopes, and tells a live peer drill from a foreign fleet"
 
 # `[ test ] && echo` as the LAST command makes the script's exit status the
 # TEST's: when case A did run, the test is false, the echo is skipped, and the

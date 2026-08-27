@@ -1,4 +1,4 @@
-# BUG-0063: the sibling guard cannot see an orphan, so it tells you to wait forever (OPEN)
+# BUG-0063: the sibling guard cannot see an orphan, so it tells you to wait forever (FIXED)
 
 **Found** 2026-08-27, blocking `tools/walgap_quarantine_drill.sh`. A
 `flint-kv-server` sat at **ppid 1, 0.0% CPU, for 44 minutes** and every drill
@@ -56,6 +56,50 @@ So the fix has to widen `_fleet_sibling` to carry ppid, and that changes a
 format three other call sites consume (`cut -c1-90` at the refusal, `awk
 '{print $1}'` in `_fleet_sibling_sample`, and the settle loop). Not a one-line
 change, which is why this is filed rather than patched under an unrelated task.
+
+## The fix
+
+`_fleet_sibling` and `_fleet_sibling_named` now emit `pid ppid argv`, matching
+`_fleet_foreign` — so the ppid the foreign branch has always read is finally
+available here. Consumers take the pid from `$1`, which is unchanged.
+
+The verdict then turns on ONE new predicate, `_fleet_sibling_named_live`
+(named siblings with `ppid != 1`), used in place of `_fleet_sibling_named` in
+the settle condition. Concretely:
+
+| sibling | before | after |
+|---|---|---|
+| named, live parent | refuse on sight | **refuse on sight** (unchanged) |
+| named, orphaned, idle | refuse forever | proceed |
+| named, orphaned, busy | refuse forever | refuse, and say it must be REMOVED |
+| unnamed (test binary) | activity-settle | activity-settle (unchanged) |
+
+**Orphanhood is the discriminator, not idleness**, and that distinction is the
+whole fix. "A sibling project's fleet refuses on sight" is the right contract —
+a sleeping fake fleet is still a fleet — and making idleness the test would
+have destroyed it, which is precisely what the comment above
+`_fleet_sibling_named` warns about and what `fleet_guard_drill` has asserted
+since it was written. An orphan is not a quiet fleet; it is a fleet with nobody
+running it, which is the one case where the presumption behind the contract is
+false.
+
+An orphan that IS burning CPU still refuses — waiting cannot clear it either,
+so the message now says it has to be removed from its own project rather than
+waited for.
+
+## The controls
+
+`fleet_guard_drill` arms H and I, and they pin opposite failure directions:
+
+- **H** — an orphaned, idle named fleet must not block. It asserts the fake
+  orphan really has `ppid 1` first, so the arm cannot pass vacuously against a
+  process that never orphaned.
+- **I** — a QUIET but parented sibling fleet must still refuse. This is the arm
+  that fails if H is ever re-implemented as "idle is fine".
+
+Mutation-checked in both directions, and the two mutations fail different arms:
+reverting the fix fails H; dropping the condition entirely fails **B**, the
+original fleet-contract arm, with `guard did NOT refuse with a sibling fleet up`.
 
 ## The narrower cause, and the better fix
 

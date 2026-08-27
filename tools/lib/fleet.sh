@@ -201,9 +201,12 @@ fleet_init() {
 # that drill has asserted since it was written, into "is it busy right now".
 # A sleeping fake fleet is not busy right now and never was the question.
 _fleet_sibling_named() {
-  ps -eo pid=,args= 2>/dev/null | awk '
+  # Emits "pid ppid argv", matching _fleet_foreign. The PPID is here for the
+  # same reason it is there: it separates a fleet somebody is DRIVING from a
+  # corpse nobody is. See _fleet_sibling_named_live.
+  ps -eo pid=,ppid=,args= 2>/dev/null | awk '
     {
-      n = split($2, parts, "/")
+      n = split($3, parts, "/")
       exe = parts[n]
       if (exe ~ /^flint-(server|proxy|controlplane|controller|agent|console|ops|register|exporter|meter|chaos|bench|conformance|balance)$/) next
       if (exe !~ /^flint-[a-z0-9]+-[a-z0-9-]+$/) next
@@ -211,10 +214,33 @@ _fleet_sibling_named() {
     }'
 }
 
+# Named sibling FLEETS that somebody is actually driving (ppid != 1).
+#
+# BUG-0063. "A sibling project's fleet refuses on sight" is the contract, and
+# it is the right one -- a sleeping fake fleet is still a fleet, which is what
+# fleet_guard_drill asserts and what measuring contention for named binaries
+# would have destroyed. But the contract rests on a presumption: that a named
+# binary is a fleet SOMEONE IS RUNNING. An orphan is the case where that
+# presumption is false, and it is not rare -- the flint-kv suite left one
+# behind twice in one hour on 2026-08-27, each time blocking every drill on
+# the box until a human killed it by hand.
+#
+# So orphanhood, NOT idleness, is the discriminator. A named sibling with a
+# live parent still refuses on sight, unmeasured, exactly as before. One at
+# ppid 1 falls through to the same activity check its own test binaries get,
+# which proceeds only if it is genuinely not contending and still refuses if
+# it is. The guard exists to prevent CONTENTION; a corpse at 0.0% CPU
+# contends for nothing, and waiting for it is waiting for nobody.
+_fleet_sibling_named_live() {
+  _fleet_sibling_named | awk '$2 != 1'
+}
+
 _fleet_sibling() {
-  ps -eo pid=,args= 2>/dev/null | awk '
+  # Emits "pid ppid argv" -- see _fleet_sibling_named. Consumers take the pid
+  # from $1, which is unchanged.
+  ps -eo pid=,ppid=,args= 2>/dev/null | awk '
     {
-      n = split($2, parts, "/")
+      n = split($3, parts, "/")
       exe = parts[n]
       if (exe ~ /^flint-(server|proxy|controlplane|controller|agent|console|ops|register|exporter|meter|chaos|bench|conformance|balance)$/) next
       sib = 0
@@ -836,7 +862,7 @@ fleet_guard() {
   # build/test artifacts are resolved by measurement and waiting, because
   # presence of a cargo binary is not contention. `foreign` is different
   # again -- those are OUR binaries, which fleet_kill would signal.
-  if [ -n "$sibling" ] && [ -z "$foreign" ] && [ -z "$(_fleet_sibling_named)" ]; then
+  if [ -n "$sibling" ] && [ -z "$foreign" ] && [ -z "$(_fleet_sibling_named_live)" ]; then
     _fleet_sibling_settle && return 0
   fi
   # A SEAT ON ITS WAY OUT IS NOT A FLEET. The gate runs drills back to back,
@@ -888,8 +914,26 @@ fleet_guard() {
     echo "$sibling" | cut -c1-120 | sed 's/^/    /'
     echo "  These are NOT ours and this suite will not touch them. Two fleets"
     echo "  sharing a box contend for CPU and disk, and the result shows up as"
-    echo "  a flaky drill rather than as the collision it is. Wait for that run"
-    echo "  to finish, or stop it from ITS project."
+    echo "  a flaky drill rather than as the collision it is."
+    # BUG-0063: say whether WAITING can help, the same question the foreign
+    # branch answers. Advising "wait for that run to finish" when there is no
+    # run and no parent is advice for something that cannot happen, and it
+    # cost two hand-kills in one hour before this line existed.
+    local _sorph _slive
+    _sorph=$(printf '%s\n' "$sibling" | awk '$2 == 1' | wc -l | tr -d ' ')
+    _slive=$(printf '%s\n' "$sibling" | awk '$2 != 1 && NF' | wc -l | tr -d ' ')
+    if [ "$_slive" = "0" ]; then
+      echo "  ALL $_sorph ARE ORPHANS (ppid 1) and they are CONTENDING -- no run"
+      echo "  is driving them, so waiting cannot clear this. They have to be"
+      echo "  removed from THAT project. (An idle orphan would not have stopped"
+      echo "  this run; these are burning CPU.)"
+    elif [ "$_sorph" != "0" ]; then
+      echo "  $_sorph of $((_sorph + _slive)) are ORPHANS (ppid 1) and will never clear"
+      echo "  on their own; only the other $_slive can finish. Wait for those, then"
+      echo "  remove the rest from their project."
+    else
+      echo "  Wait for that run to finish, or stop it from ITS project."
+    fi
   fi
   echo "  Re-run with FLINT_DRILL_FORCE=1 if this box really is yours alone."
   exit 1
