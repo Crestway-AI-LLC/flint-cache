@@ -164,6 +164,11 @@ if [ "$HIGHER" != "0" ]; then
   R168=$(grep -h -c 'self-fenced, recovering it (#168)' $HA_LOGS 2>/dev/null | awk '{s+=$1} END {print s+0}')
   R171=$(grep -h -c 'recovering it (#171)' $HA_LOGS 2>/dev/null | awk '{s+=$1} END {print s+0}')
   echo "        recovery paths taken: #168 self-fenced=$R168 | #171 remembered-lineage=$R171"
+  # EVIDENCE: is the gate's keep-on-PASS marker. This branch runs on a bounded
+  # transient, which PASSES — and a passing run's logs die with the gate box,
+  # so this line has plausibly printed on fast boxes all week into files
+  # nobody kept (BUG-0042's whole cost is firing rarely and saying nothing).
+  echo "EVIDENCE: BUG-0042 higher-epoch re-promotion: HIGHER=$HIGHER fenced=$FENCED | #168=$R168 #171=$R171 -> candidate 1 $([ "$R168" -gt 0 ] || [ "$R171" -gt 0 ] && echo SUPPORTED || echo 'not supported (look at candidate 2)')"
   if [ "$R168" -gt 0 ] || [ "$R171" -gt 0 ]; then
     echo "        -> BUG-0042 candidate 1 SUPPORTED: a recovery path re-promoted the"
     echo "           survivor. Those paths fire on 'no master-claimer + holds top epoch',"

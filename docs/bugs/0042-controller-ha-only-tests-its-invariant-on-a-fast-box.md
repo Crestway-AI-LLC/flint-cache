@@ -317,3 +317,21 @@ correct both ways.
 number is the drill saying it never created its own precondition. Today that
 outcome is indistinguishable from success, and it has been for as long as the
 drill has run on ordinary hardware.
+
+## 2026-08-27 — the discriminator's output was dying with the box
+
+The 08-22 instrument was right and its evidence was being destroyed. The
+bounded transient is a PASS, and a passing run's logs die with the gate box —
+`run.sh` pulls logs only on FAILURE (the gate-verdict lesson, already on
+record). Every 16-vCPU gate run since 08-22 — dozens this week — ran this
+drill on exactly the hardware the race wants, and any `candidate 1 SUPPORTED`
+line printed into a file nobody kept.
+
+Fixed generically: `gates.sh` now surfaces any drill line marked `EVIDENCE:`
+into the console stream even on PASS (capped at 4 — a chatty drill must not
+turn the summary into a log), and this drill emits one whenever `HIGHER != 0`,
+carrying HIGHER, fenced count, and the #168/#171 split. Controls: an evidence
+line surfaces on a pass, silence when there is none, and the cap holds.
+
+From the next gate run onward, a firing reaches the operator's retained
+console log instead of a terminated box's /tmp.

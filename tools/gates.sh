@@ -879,6 +879,16 @@ step_report() {  # step_report <name> <log> <exit-code> <elapsed-seconds>
       return
     fi
     printf 'PASS  %-22s (%ss)\n' "$name" "$secs"
+    # EVIDENCE SURVIVES A PASS. A drill may observe something worth keeping on
+    # a run that still passes — controller_ha's bounded transient prints which
+    # recovery path re-promoted the survivor, which is the exact line BUG-0042
+    # has been waiting on since 08-22. But a passing run's logs die with the
+    # gate box (the run.sh wrapper pulls logs only on FAILURE), so that
+    # discriminator has plausibly printed on 16-vCPU runs all week into files
+    # nobody kept. Any line a drill marks `EVIDENCE:` is surfaced here, into
+    # the console stream the operator actually retains. Capped so a chatty
+    # drill cannot turn the summary into a log.
+    grep -m4 '^EVIDENCE:' "$log" 2>/dev/null | sed 's/^/        /'
   else
     printf 'FAIL  %-22s (%ss)  %s\n' "$name" "$secs" "$log"
     # The drill's OWN verdict first, then the looser patterns.
