@@ -1,4 +1,4 @@
-# BUG-0062: the probe clears a stale snapshot, then the attach races the WAL (OPEN)
+# BUG-0062: the probe clears a stale snapshot, then the attach races the WAL (FIXED)
 
 **Found** 2026-08-27, soak cycle 2, on an rc.64 data plane with live ingestion
 (4 feeders) and a killed-then-restarted replica. The harness reported
@@ -65,6 +65,64 @@ race. That is the livelock `main.rs:4405` warns about — "a livelock that no
 supervisor can break" — reached by a path the fence-refusal wording does not
 cover. `flintctl` then gives up at its deadline and the pair is left running
 unprotected.
+
+## The fix: quarantine, and what it does NOT do
+
+On `WalPurged` the tailer now disqualifies every local snapshot at or below
+the unresumable cursor before it writes the marker and exits, by renaming
+`snap-…` to `unresumable-snap-…`. `parse_rewind_candidate` only accepts names
+beginning `snap-`, so a renamed snapshot stops being a candidate while its
+bytes stay on disk for forensics.
+
+**Be clear about the scope: this does not stop the race.** The probe and the
+attach are still two reads of a moving boundary, and a replica can still lose
+that race. What changes is what losing costs. Before: lose, mark, exit,
+re-pick the same snapshot, lose identically, forever — a livelock ending in
+`flintctl` giving up and the pair sitting at `live_replicas 0`. After: lose
+once, and the next boot has no candidate to lose with, so it takes the full
+re-seed that was always the correct answer. The recovery becomes terminating;
+the race is still there.
+
+**Why `seq <= cursor` and not only the snapshot that failed.** A master's WAL
+only advances, so a span already recycled never returns: a snapshot at the
+unresumable cursor is unresumable permanently, and an older one needs an even
+earlier batch, so it is unresumable too. Quarantining just the loser would
+leave the next boot to pick the next-older, fail identically, and repeat — one
+boot per snapshot, each burning a reconvergence deadline. This run held three
+(seq 130042, 196517, 207196), so three deadlines to reach a re-seed available
+at once.
+
+**Renaming, not deleting**, which retires the objection this file opened with.
+The worry was that quarantine "discards work that is usually still good". It
+does not discard anything — the bytes remain — and the work in question is not
+good for this purpose: a snapshot whose catch-up span the master has recycled
+can never again be resumed from, by the same monotonicity that makes the rule
+sound. What it can still be is evidence.
+
+Deliberately NOT a second string to match on. The boot's existing guard is
+`why.contains("promotion fence")`, and this failure got through precisely
+because the purged-WAL marker does not contain that phrase. Adding
+`|| why.contains("WALGAP")` would have fixed this instance by the same
+mechanism that produced it. Changing the candidate set is a fact on disk; a
+message match is a fact about wording.
+
+Six tests, mutation-checked two ways: making the quarantine a no-op fails
+four, and quarantining only the exact failing snapshot (`seq == cursor`) also
+fails four — the scope decision is defended, not just the feature. The two
+that stay green in both are the pure name-property and the missing-directory
+case, neither of which depends on scope.
+
+**NOT YET EXERCISED IN PRODUCTION, and the distinction matters.** The 60-minute
+soak of 2026-08-27 passed all five kill cycles with zero `quarantine:` lines,
+zero WALGAP and zero reconvergence failures — the race was simply not lost that
+run. A green soak therefore says the failure did not recur; it does not say the
+quarantine works. That claim rests on the unit tests above until a real
+`WalPurged` fires and the run continues past it.
+
+Nor can the race's absence be credited to this fix: the fix does not prevent
+the race, only stop it livelocking. That soak also ran a HEAD data plane where
+the failing one ran rc.64, so something else may have moved. Unknown, and
+recorded as unknown.
 
 ## The shape
 

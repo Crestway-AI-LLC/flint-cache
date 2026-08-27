@@ -255,6 +255,82 @@ fn parse_rewind_candidate(name: &str) -> Option<(u64, flint_storage::manifest::E
     ))
 }
 
+/// Renamed onto a snapshot that can never again be resumed from. It survives
+/// on disk for forensics but stops being a rewind candidate, because
+/// `parse_rewind_candidate` only accepts names starting `snap-`.
+///
+/// Gated with `rocks` because `parse_rewind_candidate` is: the whole rewind
+/// path only exists there, and an ungated helper that calls a gated one fails
+/// the no-rocks build.
+#[cfg(feature = "rocks")]
+const UNRESUMABLE_PREFIX: &str = "unresumable-";
+
+/// Disqualify every local snapshot that a purged WAL has put permanently out
+/// of reach (BUG-0062).
+///
+/// WHY THIS EXISTS AT ALL. On `WalPurged` the tailer marks the copy for
+/// re-seed and exits, and the next boot is supposed to full-sync. It did not:
+/// the marker's text is what the boot keys off (`why.contains("promotion
+/// fence")`), the purged-WAL marker does not say that, so the boot took the
+/// rewind path again, re-picked the SAME snapshot, re-ran the same probe and
+/// lost the same race. Soak 2026-08-27 cycle 2 shows
+/// `snap-…-seq207196-e0.7` rewound to twice, fatal both times. A retry that
+/// re-derives its inputs is not a retry — so the fix removes the candidate
+/// rather than adding a second string to match on, which is the check that
+/// let this through in the first place.
+///
+/// WHY `seq <= cursor` AND NOT JUST THE ONE THAT FAILED. A master's WAL only
+/// advances, so a span it has already recycled never comes back: a snapshot
+/// at `cursor` is unresumable *permanently*, not just now. And an OLDER
+/// snapshot needs an even earlier batch, so it is unresumable too, by the
+/// same retention bound. Quarantining only the snapshot that just failed
+/// would leave the next boot to pick the next-older one, fail identically,
+/// and repeat — converging only after one boot per snapshot, each burning a
+/// reconvergence deadline. This run held three (seq 130042, 196517, 207196),
+/// which is three deadlines to reach a re-seed it could have taken at once.
+///
+/// Renaming, not deleting: the bytes are usually still a perfectly good
+/// snapshot of a past state, and they are evidence when someone asks why a
+/// node re-seeded. What they can no longer be is a candidate.
+///
+/// Returns how many were quarantined.
+#[cfg(feature = "rocks")]
+fn quarantine_unresumable(snaps_dir: &str, cursor: u64) -> usize {
+    let Ok(entries) = std::fs::read_dir(std::path::Path::new(snaps_dir)) else {
+        eprintln!("quarantine: no snapshot dir at {snaps_dir}; nothing to disqualify");
+        return 0;
+    };
+    let mut n = 0;
+    for e in entries.flatten() {
+        let name = e.file_name();
+        // Already-quarantined names fail this parse, so a repeat run is a
+        // no-op rather than `unresumable-unresumable-…`.
+        let Some(name) = name.to_str() else { continue };
+        let Some((seq, _epoch)) = parse_rewind_candidate(name) else {
+            continue;
+        };
+        if seq > cursor {
+            continue;
+        }
+        let to = e
+            .path()
+            .with_file_name(format!("{UNRESUMABLE_PREFIX}{name}"));
+        match std::fs::rename(e.path(), &to) {
+            Ok(()) => {
+                n += 1;
+                eprintln!(
+                    "quarantine: {name} (seq {seq} <= unresumable cursor {cursor}) is no \
+                     longer a rewind candidate; kept as {UNRESUMABLE_PREFIX}{name}"
+                );
+            }
+            // Best effort by design: failing to rename must not stop the
+            // re-seed, which is the actual recovery. It costs another boot.
+            Err(err) => eprintln!("quarantine: renaming {name}: {err}"),
+        }
+    }
+    n
+}
+
 /// Ask `target` whether a copy at (`cursor`, `epoch`) can resume tailing its
 /// lineage — the exact FLINTSYNC handshake the tailer would send, dropped
 /// after the first reply. The master runs its full admission logic (fence
@@ -4814,6 +4890,24 @@ mod replica {
                     // the promotion fence must read differently from a purged
                     // WAL, because the next boot's rewind decision keys off it
                     // (retrying a fence-refused snapshot loops forever).
+                    // BUG-0062. Disqualify the snapshots this cursor can
+                    // never reach again, BEFORE the marker is written and this
+                    // process leaves — the next boot reads that directory to
+                    // decide, and if the losing snapshot is still a candidate
+                    // it picks the same one and fails identically. The marker
+                    // alone was not enough: the boot's guard is
+                    // `why.contains("promotion fence")`, and a purged WAL does
+                    // not say that, so the rewind path was taken again.
+                    // Deliberately not a second string to match on — matching
+                    // on the message is what let this recur.
+                    if let Some(snaps) = arg("--rewind-snaps") {
+                        let cursor = kv.last_applied();
+                        let n = quarantine_unresumable(&snaps, cursor);
+                        eprintln!(
+                            "quarantine: {n} snapshot(s) at or below seq {cursor} disqualified; \
+                             the next start has no rewind candidate to lose this race with"
+                        );
+                    }
                     super::mark_needs_reseed(kv.path(), &format!("cannot resume this tail: {why}"));
                     // hard_exit, not process::exit: this is the tailer THREAD,
                     // the DB is open, and the sampler and RocksDB's compaction
@@ -5739,5 +5833,158 @@ mod evictable_ns_config {
         );
         // `shed_lag` is a suffix of a real field and must NOT resolve.
         assert_eq!(find_info_field(info, "shed_lag"), None);
+    }
+}
+
+/// BUG-0062. The boot picks a rewind candidate by reading a directory, so the
+/// only thing that can stop it re-picking a snapshot it just died on is that
+/// snapshot no longer being in the directory's candidate set. These hold that,
+/// and the count assertions are what distinguish "one boot to a re-seed" from
+/// "one boot per snapshot", which is the difference that mattered in the soak.
+#[cfg(all(test, feature = "rocks"))]
+mod quarantine_tests {
+    use super::*;
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let d =
+            std::env::temp_dir().join(format!("flint-quarantine-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).expect("scratch dir");
+        d
+    }
+
+    fn touch_snap(dir: &std::path::Path, ms: u64, seq: u64, generation: u64, ctr: u64) -> String {
+        let n = format!("snap-{ms}-seq{seq}-e{generation}.{ctr}");
+        // Snapshots are directories on a real node; rename must handle that.
+        std::fs::create_dir_all(dir.join(&n)).expect("snap dir");
+        n
+    }
+
+    fn candidates(dir: &std::path::Path) -> Vec<u64> {
+        let mut v: Vec<u64> = std::fs::read_dir(dir)
+            .expect("read scratch")
+            .flatten()
+            .filter_map(|e| parse_rewind_candidate(e.file_name().to_str()?).map(|(s, _)| s))
+            .collect();
+        v.sort_unstable();
+        v
+    }
+
+    /// The soak's own directory: three snapshots, the newest at the cursor the
+    /// master could no longer reach. All three must leave the candidate set in
+    /// ONE pass — quarantining only the one that failed would leave 196517 for
+    /// the next boot to fail on, then 130042, three deadlines to reach the
+    /// re-seed that was available immediately.
+    #[test]
+    fn every_snapshot_the_cursor_cannot_reach_stops_being_a_candidate() {
+        let d = scratch("soak-shape");
+        touch_snap(&d, 1787809837104, 130042, 0, 4);
+        touch_snap(&d, 1787809867201, 196517, 0, 6);
+        touch_snap(&d, 1787809927380, 207196, 0, 7);
+        assert_eq!(
+            candidates(&d),
+            vec![130042, 196517, 207196],
+            "control: all three are candidates before the quarantine"
+        );
+
+        let n = quarantine_unresumable(d.to_str().expect("test setup"), 207196);
+
+        assert_eq!(n, 3, "all three are at or below the unresumable cursor");
+        assert!(
+            candidates(&d).is_empty(),
+            "the next boot must find NO rewind candidate, got {:?}",
+            candidates(&d)
+        );
+        // Renamed, not deleted: still three directories on disk.
+        assert_eq!(std::fs::read_dir(&d).expect("scratch readable").count(), 3);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A snapshot the master can still reach is untouched — the quarantine is
+    /// bounded by the cursor, not a blanket wipe of the snapshot dir.
+    #[test]
+    fn a_snapshot_above_the_cursor_survives() {
+        let d = scratch("above");
+        touch_snap(&d, 1, 100, 0, 1);
+        touch_snap(&d, 2, 300, 0, 1);
+        let n = quarantine_unresumable(d.to_str().expect("test setup"), 200);
+        assert_eq!(n, 1);
+        assert_eq!(
+            candidates(&d),
+            vec![300],
+            "the reachable snapshot is still a candidate"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A second pass must be a no-op, not `unresumable-unresumable-…`: the
+    /// tailer can hit this path again before the boot re-seeds.
+    #[test]
+    fn quarantine_is_idempotent() {
+        let d = scratch("idempotent");
+        touch_snap(&d, 1, 100, 0, 1);
+        assert_eq!(
+            quarantine_unresumable(d.to_str().expect("test setup"), 200),
+            1
+        );
+        assert_eq!(
+            quarantine_unresumable(d.to_str().expect("test setup"), 200),
+            0,
+            "nothing left that parses as a candidate, so nothing to rename"
+        );
+        let names: Vec<String> = std::fs::read_dir(&d)
+            .expect("test setup")
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names.len(), 1);
+        assert!(
+            !names[0].starts_with("unresumable-unresumable-"),
+            "double-prefixed: {}",
+            names[0]
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The property the rename relies on, asserted directly rather than
+    /// inferred: the prefix is what disqualifies the name.
+    #[test]
+    fn a_quarantined_name_does_not_parse_as_a_candidate() {
+        let good = "snap-123-seq456-e0.7";
+        assert!(parse_rewind_candidate(good).is_some(), "control");
+        assert!(
+            parse_rewind_candidate(&format!("{UNRESUMABLE_PREFIX}{good}")).is_none(),
+            "the prefix must remove it from the candidate set"
+        );
+    }
+
+    /// Anything that is not an epoch-labeled snapshot is left alone — the
+    /// snapshot dir is not exclusively ours to rewrite.
+    #[test]
+    fn unrelated_entries_are_untouched() {
+        let d = scratch("unrelated");
+        std::fs::create_dir_all(d.join("in-progress")).expect("test setup");
+        std::fs::write(d.join("README"), b"x").expect("test setup");
+        touch_snap(&d, 1, 50, 0, 1);
+        assert_eq!(
+            quarantine_unresumable(d.to_str().expect("test setup"), 100),
+            1
+        );
+        assert!(d.join("in-progress").exists(), "unrelated dir renamed");
+        assert!(d.join("README").exists(), "unrelated file renamed");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A missing snapshot dir is a normal state (a node that never took one),
+    /// and must not panic on the path that is already handling a failure.
+    #[test]
+    fn a_missing_snapshot_dir_is_not_fatal() {
+        let d =
+            std::env::temp_dir().join(format!("flint-quarantine-{}-absent", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        assert_eq!(
+            quarantine_unresumable(d.to_str().expect("test setup"), 1),
+            0
+        );
     }
 }
