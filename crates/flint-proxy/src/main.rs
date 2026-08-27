@@ -369,7 +369,10 @@ struct Topology {
     /// address -> when a rediscovery for it last STARTED. Collapses the herd
     /// of callers a single pooled-connection death produces into one re-probe
     /// (see `rediscover_for`).
-    rediscover_gate: Mutex<HashMap<String, Instant>>,
+    /// Per-address single-flight + quiet-period state. Was
+    /// `HashMap<String, Instant>`, a leading-edge debounce that bounded probe
+    /// STARTS and not probes IN FLIGHT (BUG-0052).
+    rediscover_gate: Mutex<HashMap<String, ProbeState>>,
     /// Level-0: slot range -> cluster index (ADR-0007). A non-federated
     /// proxy holds the single-interval default (everything -> cluster 0),
     /// so today this resolves to 0 unconditionally.
@@ -753,18 +756,40 @@ impl Topology {
     /// and suppressing it would delay real failover. Coalesce the symptom,
     /// never the signal.
     fn rediscover_after_failure(&self, addr: &str) {
+        // CLAIM THE PROBE, OR RETURN (BUG-0052).
         {
             let mut gate = match self.rediscover_gate.lock() {
                 Ok(g) => g,
                 Err(_) => return,
             };
-            if let Some(started) = gate.get(addr)
-                && started.elapsed() < REDISCOVER_DEBOUNCE
-            {
-                return;
+            match gate.get(addr) {
+                // Someone is probing this address. Duration is irrelevant:
+                // there is nothing a second concurrent probe can learn that
+                // the first will not, and two of them race their writes.
+                Some(ProbeState::InFlight) => return,
+                // Probed recently enough that re-probing is noise.
+                Some(ProbeState::Idle(done)) if done.elapsed() < REDISCOVER_DEBOUNCE => {
+                    return;
+                }
+                _ => {}
             }
-            gate.insert(addr.to_string(), Instant::now());
+            gate.insert(addr.to_string(), ProbeState::InFlight);
         }
+
+        // The claim MUST be released on every exit path, or one panicking or
+        // early-returning probe wedges this address forever — a failure worse
+        // than the flap being fixed, because it is permanent and silent. A
+        // guard, so the compiler owns that rather than a reviewer.
+        struct Release<'a>(&'a Mutex<HashMap<String, ProbeState>>, &'a str);
+        impl Drop for Release<'_> {
+            fn drop(&mut self) {
+                if let Ok(mut g) = self.0.lock() {
+                    g.insert(self.1.to_string(), ProbeState::Idle(Instant::now()));
+                }
+            }
+        }
+        let _release = Release(&self.rediscover_gate, addr);
+
         self.rediscover_for(addr);
     }
 
@@ -2887,6 +2912,28 @@ const MAX_PREFETCH: usize = 64;
 /// only one.
 const REDISCOVER_DEBOUNCE: Duration = Duration::from_millis(250);
 
+/// What the re-probe gate knows about one address.
+///
+/// A bare `Instant` could only express "a probe STARTED at t", and the gate
+/// stamped it before releasing the lock and probing. So the window bounded how
+/// often a probe may BEGIN, not how many may be running — and
+/// `discover_master`'s read timeout is 800 ms PER NODE across both pair
+/// members, up to 6.4x this window. A caller arriving at 260 ms found the
+/// window expired and started a SECOND concurrent probe, each racing a write
+/// into `routing.masters`: the `addr -> none -> addr` flap this gate exists to
+/// prevent, at reduced rate rather than removed (BUG-0052).
+///
+/// Two states instead, so "someone is probing right now" is representable:
+#[derive(Debug, Clone, Copy)]
+enum ProbeState {
+    /// A probe is running. Every other caller for this address returns
+    /// immediately, however long it takes — that is the single-flight half.
+    InFlight,
+    /// No probe running; the last one finished at this instant. The quiet
+    /// period the 250 ms constant was always sized for.
+    Idle(Instant),
+}
+
 /// May this command be put on the wire before the ones ahead of it have been
 /// answered?
 ///
@@ -4413,6 +4460,88 @@ mod route_tests {
         );
         // An address that was never a master anywhere.
         assert!(!t.still_master("z:9"), "an unknown address is not a master");
+    }
+
+    /// BUG-0052: while a probe is IN FLIGHT, every other caller for that
+    /// address must be absorbed — however long the probe takes.
+    ///
+    /// The old gate stored only "a probe started at t" and compared against a
+    /// 250 ms window, while `discover_master`'s read timeout is 800 ms PER
+    /// NODE. So a caller arriving after 250 ms of an 800 ms probe found the
+    /// window expired and started a second concurrent probe, each racing a
+    /// write into `routing.masters`.
+    ///
+    /// The existing `simultaneous_request_failures_cause_one_reprobe` cannot
+    /// see this: its address resolves to nothing, so every probe finishes in
+    /// microseconds and no caller ever arrives during one. This test CONTROLS
+    /// the duration — a listener that accepts and never answers, so the probe
+    /// blocks on the read timeout — and has a second caller arrive at 300 ms,
+    /// deliberately PAST the debounce window and INSIDE the probe.
+    #[test]
+    fn a_second_caller_during_a_slow_probe_is_absorbed() {
+        use std::net::TcpListener;
+        use std::sync::mpsc;
+
+        // Accept and stay silent. `discover_master` connects, sends
+        // FLINTINFO, and waits out its 800ms read timeout.
+        let lp = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = format!(
+            "127.0.0.1:{}",
+            lp.local_addr().expect("listener addr").port()
+        );
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            while let Ok((c, _)) = lp.accept() {
+                held.push(c); // hold it open; never write
+            }
+        });
+
+        let t = Arc::new(topo(vec![vec![addr.clone()]], vec![Some(addr.clone())]));
+
+        // Caller one, in flight for ~800ms.
+        let (tx, rx) = mpsc::channel();
+        let t1 = Arc::clone(&t);
+        let a1 = addr.clone();
+        let h = std::thread::spawn(move || {
+            let start = Instant::now();
+            t1.rediscover_after_failure(&a1);
+            let _ = tx.send(start.elapsed());
+        });
+
+        // Caller two arrives PAST the 250ms window and INSIDE the probe. This
+        // is the case the old gate got wrong: it would find the window
+        // expired and launch a concurrent probe, taking ~800ms itself.
+        std::thread::sleep(Duration::from_millis(300));
+        let start = Instant::now();
+        t.rediscover_after_failure(&addr);
+        let second = start.elapsed();
+
+        let first = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("first probe finished");
+        h.join().expect("probe thread");
+
+        // Capability assert: if the probe was not actually slow, the second
+        // caller never overlapped it and this proves nothing.
+        assert!(
+            first >= Duration::from_millis(250),
+            "the probe finished in {first:?}, so the second caller did not arrive \
+             during it and this test exercised nothing — the silent listener is \
+             not holding the connection open"
+        );
+        assert!(
+            second < Duration::from_millis(100),
+            "a caller arriving during an in-flight probe took {second:?}: it \
+             started its own concurrent probe instead of being absorbed (BUG-0052)"
+        );
+
+        // And the quiet period still applies once the probe is done.
+        let start = Instant::now();
+        t.rediscover_after_failure(&addr);
+        assert!(
+            start.elapsed() < Duration::from_millis(100),
+            "the post-probe debounce did not absorb an immediate retry"
+        );
     }
 
     #[test]
