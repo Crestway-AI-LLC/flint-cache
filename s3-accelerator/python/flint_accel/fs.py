@@ -25,7 +25,7 @@ from s3fs import S3FileSystem, S3File
 
 from .conn import bounded_client
 from .tier import (FlintTier, CHUNK, TIER_BUDGET_S, META_TTL_S,
-                   MAX_OBJECT_BYTES, BLOCK_BYTES)
+                   MAX_OBJECT_BYTES, MAX_PART_BYTES, BLOCK_BYTES)
 
 
 class _OriginAdapter:
@@ -86,6 +86,11 @@ class FlintS3FileSystem(S3FileSystem):
         "meta_ttl_s": META_TTL_S,
         "cache_sse_kms": False,
         "max_object_bytes": MAX_OBJECT_BYTES,
+        # D17.5. Listed here or it is silently dropped: this map is an
+        # enumeration, and a key missing from it does not fail -- it just never
+        # reaches the client, which is how flint.cache.sse-kms was unusable for
+        # a while. The JVM side takes it as flint.max.part.bytes.
+        "max_part_bytes": MAX_PART_BYTES,
     }
 
     #: Set by install(**defaults). Read HERE -- it previously was not.
