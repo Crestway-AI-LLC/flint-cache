@@ -88,3 +88,67 @@ draw against, or a per-unit limit derived from the node's memory and the
 connection count rather than chosen as a constant. The disk guard is the
 existing model for this: it reads the actual device and refuses early, rather
 than trusting that each writer is individually reasonable.
+
+## Audit pass 1, 2026-08-27 — candidate 1 resolved: the collection commands
+
+`scan_prefix` returns a fully materialised `Vec<(Vec<u8>, Vec<u8>)>`, and the
+question was where a USER command reaches it against a USER-sized prefix.
+Answer: three of them, all ordinary tenant verbs, none capped.
+
+| command | path | what it materialises |
+|---|---|---|
+| `HGETALL` | `hashes.rs:228` | every (field, value) pair in the hash |
+| `SMEMBERS` | `sets.rs:172` | every member of the set |
+| `ZRANGE` (and friends) | `zsets.rs:301`, `:602` via `all_ordered` | every (member, score) in the zset |
+
+Each does it **twice**: `scan_prefix` builds one `Vec`, `.map(...).collect()`
+builds a second, both live simultaneously. Then the reply is serialised on top.
+Peak is roughly 2x the collection plus the encoded reply, per in-flight
+command, with `MAX_CONNS` 2048 of them permitted concurrently.
+
+**Nothing caps collection cardinality.** Grepped for `MAX_MEMBERS`,
+`MAX_FIELDS`, `MAX_CARDINALITY` and the lowercase forms across the workspace:
+no such limit exists. A tenant may build a hash of arbitrary size with ordinary
+`HSET` calls and then ask for all of it.
+
+### The comment that is the bug in miniature
+
+`zsets.rs:300`, immediately above the call:
+
+    /// zset lives in ONE key, so this is bounded by the zset's cardinality.
+
+That is true, and it is exactly the reasoning this audit exists to reject.
+"Bounded by cardinality" is not a bound when cardinality is what the user
+chooses. It is the per-unit sentence from the inventory table written as
+reassurance — the same shape as `MAX_QUERY_BUF`'s "a legitimate connection can
+never accumulate this much", which is also true per connection and false at
+2048 of them.
+
+### Severity, stated honestly
+
+Not yet measured, and the audit should not guess. What is established is
+reachability and the absence of a bound; what is NOT established is the size a
+real tenant reaches, or whether the RESP encoder's own buffering fails first
+and more gracefully. A 10M-member set at ~20 bytes per member is ~200 MB
+materialised twice on a 16 GiB seat — survivable once, not at concurrency.
+
+### Why this is not "add MAX_MEMBERS"
+
+Per the fix section above: another per-unit constant is the same mistake one
+layer down. The two shapes worth considering, neither chosen here:
+
+- **Stream the reply** rather than materialising — the collection commands are
+  the natural cursor candidates, and `SSCAN`/`HSCAN`/`ZSCAN` already exist as
+  the cursor-shaped answer. The gap may be that nothing REFUSES the
+  materialising form when it would be large, not that the cursor form is
+  missing.
+- **A node-level budget** the per-unit limits draw against, as the disk guard
+  does with the real device.
+
+Refusing is the behaviour this product already has everywhere else. A
+`-TOOLARGE` on `HGETALL` against a collection past a derived threshold, naming
+`HSCAN`, would match `-QUOTA` and `-THROTTLED` exactly.
+
+**Remaining candidates unaudited:** pipeline depth and accumulated replies,
+the async write queue against value size, per-namespace state scaling with
+namespace count.
