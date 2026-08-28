@@ -312,9 +312,101 @@ already written in this codebase, three files away.
 |---|---|
 | collection commands (`HGETALL`/`SMEMBERS`/`ZRANGE`) | **DEFECT, measured** — +412 MB for a 200 MB collection, client-controlled |
 | pipeline depth and accumulated replies | **clean, measured** — +2 MB for 300 MB in flight |
-| async write queue vs value size | **defect shape, NOT measured** — bounds entries not bytes; needs a rocks build |
+| async write queue vs value size | **MEASURED, mechanism corrected** — bounded by concurrent CONNECTIONS, not queue slots; `max-conns` (2048) binds before the 4096 cap. See pass 5 |
 | per-namespace state | **different class** — operator-controlled multiplier |
 
 The audit's original question was "where is a limit missing that would let a
 node crash rather than refuse". One answer with a number, one cleared, one
 pending a feature build, one reclassified.
+
+## Audit pass 5, 2026-08-27 — candidate 3 MEASURED: the mechanism was wrong, the shape survives
+
+Pass 3 filed this as "defect shape, NOT measured" and predicted RSS would
+track `min(inflight, 4096) x value size`. Built the rocks binary and measured
+it. **The prediction is not what happens, and the reason corrects the audit.**
+
+### What the queue actually is
+
+`main.rs:3819` and the ADR-0005 D4 comment at `:2036` are explicit: a queued
+write **blocks the connection on the consumer's ack-after-apply**. This is a
+GROUP COMMIT, not a fire-and-forget buffer — it trades "~2-3x write latency
+for far fewer engine writes". Nothing is acked early.
+
+So the queue can only ever hold as many entries as there are connections
+currently blocked in it. **One client cannot fill it, however hard it
+pipelines.** Measured, holding value size and volume constant and varying only
+the number of concurrent connections:
+
+| concurrent writers | peak `async_write_queue` |
+|---|---|
+| 1 | 0 |
+| 4 | 1 |
+| 16 | 9 |
+| 48 | 29 |
+
+Linear in connections at roughly 0.6x, and nowhere near the 4096 cap. A single
+connection pipelining 4000 x 1 MB never moved the depth above 0.
+
+Two controls confirm the path was genuinely exercised rather than skipped:
+the startup notice `async-writes ENABLED (opt-in write queue): all (cap 4096)`
+was asserted, not assumed — `flint-server` IGNORES unrecognised arguments
+(docs/bugs/0034), so a mistyped flag would have measured the synchronous path
+and reported "no defect" with total confidence. And async ran consistently
+SLOWER than the synchronous baseline (242 vs 332 MB/s with a stalled consumer,
+538 vs 563 MB/s without), which is the documented latency trade appearing
+exactly where the design says it should.
+
+Deliberately slowing the consumer did not change the answer.
+`FLINT_BG_JOBS=1` with an 8 MB memtable produced a real stall
+(`write_stall_readable=1`, 63 MB pending compaction, throughput halved) and
+peak depth went from 6 to 7. A backlog needs blocked *connections*, and
+starving the consumer does not create them.
+
+### The shape survives, one level down
+
+`min(inflight, 4096) x value size` was the right form with the wrong variable.
+The correct statement is:
+
+    resident queue bytes = min(concurrent writing connections, 4096) x value size
+
+which is still a per-unit limit multiplied by an unbounded count — this bug's
+whole thesis — except the count is **connections**, not queue slots. And that
+puts the binding constraint somewhere the audit never looked:
+
+| | value | binds? |
+|---|---|---|
+| `DEFAULT_QUEUE_CAP` | 4096 entries | only if connections exceed it |
+| `MAX_CONNS` compiled default (`main.rs:586`) | **2048** | **yes, at the default** |
+| `max-conns` as documented in the flintctl inventory header | 10000 | then the queue cap binds |
+
+So **at the compiled default the queue cap is unreachable**: 2048 connections
+cap out first, for a 2 GB ceiling at 1 MB values rather than the 4 GB pass 3
+predicted. But an operator who sets `max-conns 10000` — the value the
+inventory documentation itself shows — moves the binding limit to the queue
+cap and restores the 4 GB ceiling. Neither number is written next to the
+other, and the interaction is documented nowhere.
+
+That is a better example of this bug than the one originally filed: not one
+limit failing to bound a sum, but **two limits whose product is the real
+bound, tuned independently, in different files, by different people.**
+
+### What this does and does not establish
+
+- **Establishes:** the queue is group-commit with ack-after-apply; depth is
+  bounded by concurrent blocked connections and measured linear in them; a
+  single client cannot fill it; and with default `max-conns` the queue's own
+  cap never binds.
+- **Does not establish:** the ceiling itself. Reaching it needs a 2048- or
+  4096-connection fan-out each with a large write in flight, which was not
+  run. The extrapolation from 48 connections is arithmetic, and arithmetic
+  standing in for a measurement is what pass 3 got wrong.
+- **Unchanged:** the fix shape. A byte budget the queue draws against still
+  works, and `-THROTTLED` is still the right refusal. What changes is that it
+  should be sized against `max-conns`, not chosen independently of it.
+
+### Status
+
+Candidate 3 is **measured, and downgraded**: real, but it needs a connection
+fan-out rather than one aggressive client, and the default `max-conns` holds
+the ceiling to half what was predicted. Candidate 1 (the collection read at
++412 MB) remains the more urgent of the two.
