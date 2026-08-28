@@ -1,7 +1,14 @@
-# BUG-0065: a freshly promoted master self-fenced when the OTHER pair promoted
+# BUG-0065: a freshly promoted master self-fenced against its own pair's stale lease
 
-Status: OPEN — one occurrence, cause unknown, and the next one is now
-diagnosable, which was the blocking gap · Severity: high if real — a healthy
+*Filed as "…when the OTHER pair promoted". That title was hypothesis (b), which
+the second occurrence eliminated; renamed 2026-08-28. The original wording is
+kept here rather than erased, because it records that the cross-pair framing
+came from a single sample where pair 1 happened to promote 79ms earlier —
+coincidence read as mechanism.*
+
+Status: OPEN — cause NARROWED to (a) by a second occurrence on 2026-08-28;
+the instrument added on the first firing worked and the (a)/(b) question is
+settled. What is unfixed is the cache-update path itself · Severity: high if real — a healthy
 new master going read-only mid-roll is a availability fault on the exact path
 a roll exercises · Found 2026-08-27 triaging the one red ops-CI run since
 08-22 (run `33112175958`, `canary`, ops @ `7902cb2`, core @ `60cb7e4`).
@@ -77,3 +84,65 @@ Nothing parses the old cause text (grepped both repos), so the change is safe.
 2. `CPJOURNALREAD` around the abort for the fence ordering.
 3. Do not re-run to make it green; pull the artifact (`gh run download <id>
    -n fleet-gate-logs`). BUG-0014 already paid for this lesson.
+
+
+## Second occurrence, 2026-08-28 — the instrument paid, and it is (a)
+
+ops CI run `33148455433`, `canary`, ops @ `82ddfcc`, core @ `cd1e3c8`. Artifact
+pulled rather than re-run-to-green, per the note below. The row this file was
+written to obtain:
+
+```json
+{"at_ms":1787899168878,"actor":"node:127.0.0.1:6920","kind":"SelfFenced",
+ "subject":"127.0.0.1:6920",
+ "cause":"lease superseded by 127.0.0.1:6921: promotion on record at the CP"}
+```
+
+**Successor is `127.0.0.1:6921`** — pair 0's own other member, and the very node
+the roll had just demoted:
+
+```
+pair 0: 127.0.0.1:6921 demoted + drained; 127.0.0.1:6920 promoted at (0,5)
+```
+
+By the decision rule this file already set out, `6921` means **(a): a stale
+own-pair record**. The CP told a freshly promoted master it was superseded by
+the member it had just replaced.
+
+A second, independent line agrees, and it is stronger than the first because it
+does not depend on reading the successor correctly: **pair 1 never fenced at
+all in this run.** Zero `pair 1: ... demoted` lines in the whole drill — the
+abort came after pair 0's roll and before pair 1's. Hypothesis (b) needs
+`6920`'s renewal to match an entry updated by pair 1's fence, and there was no
+pair 1 fence to update one. (b) had no prerequisite in this run.
+
+So the answer to *"why did the CP say it"* is now scoped to one path: pair 0's
+own fence updating the durable state without the `shared.leases.entries` cache
+following, so a containment-keyed read still finds the pre-promotion member.
+The equality-keyed-write / containment-keyed-read asymmetry this file flagged
+is the place to look; the duplicate-entry theory is not.
+
+### Not caused by the core commit it landed on
+
+Worth stating because the CI error line prints the core commit and reads like
+an attribution. `cd1e3c8` is ADR-0025's reply streaming. It is not implicated:
+`canary` passed on the gate box (91s) and locally on that same code (168,244
+acked writes, 0 missing), the fenced path never touches reply encoding, and
+this failure has a documented prior occurrence on a different core commit
+(`60cb7e4`). The first-pass reasoning "15 consecutive green CI runs, so this is
+new" was wrong for a familiar reason: the 15-run window did not reach back to
+the first firing, so it was a search space too small to contain the event.
+
+### One process note against this file's own instruction
+
+Step 3 above says do not re-run. I did start one re-run, as a
+deterministic-vs-intermittent signal, **after** pulling the artifact — and the
+verdict above rests on the artifact and the prior report, not on the re-run's
+outcome. Recording it because a rule worth writing down is worth noting when
+you bend it.
+
+### Rate
+
+Two firings, 2026-08-27 and 2026-08-28, both in ops CI, both `canary`, both on
+node `6920`. Never once on the gate box or locally. That the SAME node fences
+in both is itself a datum — it is the pair whose master rolls FIRST.
