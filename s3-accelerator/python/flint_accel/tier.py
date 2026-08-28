@@ -299,7 +299,11 @@ class FlintTier:
             # full. A full never-evict tier is a deliberate configuration, so
             # reporting it as breakage would send an operator looking for a
             # broken tier that is working exactly as they configured it.
-            if str(e).startswith("QUOTA"):
+            # The CODE, not a prefix: a RESP error is `-<CODE> <text>` and
+            # only the code is a category (flint-proxy's classify() takes the
+            # first token for the same reason). A prefix test would also match
+            # a future QUOTAEXCEEDED and file it as "full".
+            if str(e).split(" ", 1)[0] == "QUOTA":
                 self.c.tier_full += 1
                 return None
             self.c.tier_failures += 1

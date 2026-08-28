@@ -70,8 +70,11 @@ public interface FlintCacheMXBean {
    *  Deliberately not getTierFailures(): Flint sheds writes with -QUOTA while
    *  still serving reads, so this is a healthy tier in a configuration someone
    *  chose. Steady and non-zero with getTierFailures() at zero is the exact
-   *  signature of a full never-evict tier -- add capacity, or enable eviction.
-   *  It does not open the breaker. */
+   *  signature of a tier that is out of room rather than unwell. TWO causes
+   *  share the code and the remedies differ: the tenant is over its configured
+   *  cap, or the host is low on disk. The client cannot separate them and does
+   *  not try -- its own behaviour is identical -- so read this as "go and look
+   *  at the tier". It does not open the breaker. */
   long getTierFull();
 
   /** Objects whose encryption could not be determined, and were cached anyway.

@@ -18,15 +18,36 @@ tier must implement"), and answers anything else with an error, so a client that
 quietly grows a seventh fails here rather than in a customer's cluster.
 """
 import argparse
+import itertools
 import socket
 import socketserver
 import sys
 import threading
 
-QUOTA = (b"-QUOTA storage quota exceeded; writes rejected until usage drops "
-         b"(reads still served)\r\n")
+# BOTH real -QUOTA replies, copied from the server, alternated per write so a
+# single run exercises each. They come from different places and mean different
+# things to an OPERATOR -- the first is the tenant's configured cap
+# (flint-proxy), the second is the host running out of disk
+# (flint-server/diskguard.rs, DISK_FULL_ERROR) -- but they are the same thing to
+# a CLIENT: refused, still serving reads, do not call it breakage. Testing only
+# the one the client author happened to think of is how a fixture ends up
+# encoding its author's assumption instead of the server's behaviour.
+QUOTAS = [
+    b"-QUOTA storage quota exceeded; writes rejected until usage drops "
+    b"(reads still served)\r\n",
+    b"-QUOTA server is low on disk space; writes rejected until space is "
+    b"reclaimed (reads still served, and DEL/UNLINK/EXPIRE/FLUSHALL still work)"
+    b"\r\n",
+]
 NIL = b"$-1\r\n"
 WRITES = {b"SET", b"SETEX", b"PSETEX", b"MSET", b"DEL"}
+
+
+_QCOUNT = itertools.count()
+
+
+def _next_quota():
+    return next(_QCOUNT) % len(QUOTAS)
 
 
 def _read_cmd(f):
@@ -64,7 +85,8 @@ class _H(socketserver.StreamRequestHandler):
                 n = len(cmd) - 1
                 self.wfile.write(b"*%d\r\n" % n + NIL * n)
             elif op in WRITES:
-                self.wfile.write(QUOTA)      # the whole point
+                # the whole point; alternating so both real replies are covered
+                self.wfile.write(QUOTAS[_next_quota()])
             elif op == b"QUIT":
                 self.wfile.write(b"+OK\r\n")
                 return
@@ -124,6 +146,16 @@ def self_test():
     check(r.startswith(b"-QUOTA"), "refuses SET with -QUOTA (%r)" % r[:24])
     check(send(b"MSET", b"a", b"1", b"b", b"2").startswith(b"-QUOTA"),
           "refuses MSET with -QUOTA -- the fill path's write")
+    # Both real replies, and both must carry QUOTA as the CODE TOKEN, since that
+    # is what the clients key on -- not a prefix of the human text.
+    seen = set()
+    for _ in range(6):
+        r = send(b"SET", b"k", b"v")
+        seen.add(r.split(b";")[0])
+        check(r.split(b" ")[0] == b"-QUOTA",
+              "the code token is exactly QUOTA (%r)" % r.split(b" ")[0])
+    check(len(seen) == 2,
+          "both real replies are exercised, not just one (%d distinct)" % len(seen))
     check(send(b"FLUSHALL").startswith(b"-ERR"),
           "refuses a command outside the six, rather than answering +OK")
     # Armed: if the handler answered +OK to everything, the two checks above

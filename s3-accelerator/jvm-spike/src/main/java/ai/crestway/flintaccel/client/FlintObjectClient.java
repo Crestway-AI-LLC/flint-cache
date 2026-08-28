@@ -508,7 +508,14 @@ public final class FlintObjectClient implements ObjectClient {
   private static boolean isFull(Throwable t) {
     for (Throwable c = t; c != null && c != c.getCause(); c = c.getCause()) {
       String m = c.getMessage();
-      if (m != null && m.startsWith("QUOTA")) return true;
+      if (m == null) continue;
+      // The CODE, not a prefix. A RESP error is `-<CODE> <human text>` and only
+      // the code is a category -- flint-proxy's own classify() takes the first
+      // token for exactly this reason, and notes that the text is where the
+      // unbounded cardinality lives. startsWith("QUOTA") would also match a
+      // future code like QUOTAEXCEEDED and quietly file it as "full".
+      int sp = m.indexOf(' ');
+      if ("QUOTA".equals(sp < 0 ? m : m.substring(0, sp))) return true;
     }
     return false;
   }

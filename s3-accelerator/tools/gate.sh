@@ -300,7 +300,7 @@ verdict "narrow-tier proxy self-test (4 checks)" $?
 # answered +OK to everything would make the counter split it exists to prove
 # pass for the wrong reason.
 run_bounded python3 "$ROOT/tools/quota_tier.py" --self-test >/tmp/gate_quotatier.log 2>&1
-verdict "quota-tier fixture self-test (6 checks)" $?
+verdict "quota-tier fixture self-test (13 checks)" $?
 
 bash tools/shim_guard_test.sh >/tmp/gate_shim.log 2>&1
 verdict "shim guard + failfast end to end (8 checks)" $?

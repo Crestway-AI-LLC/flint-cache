@@ -286,8 +286,15 @@ does — that is a healthy tier in a configuration someone chose, not a fault. S
 the client counts it as **`TierFull`** and deliberately not as `TierFailures`,
 and it does **not** open the circuit breaker: opening it would throw away a read
 cache that is still working perfectly. A steady `TierFull` with `TierFailures`
-at zero is the signature of a full never-evict tier — add capacity, or turn
-eviction on. (`tier_full` in the Python client.)
+at zero is the signature of a tier that is out of room rather than unwell.
+
+**Two causes, one counter, different remedies.** `-QUOTA` is the code for both
+"this tenant is over its configured cap" and "this host is low on disk", and the
+client cannot tell them apart — nor should it, since its behaviour is the same
+either way. But yours is not: the first wants capacity or eviction, the second
+wants space reclaimed on the box, and only the tier's own metrics and the error
+text say which you have. Read `TierFull` as *go and look at the tier*, not as
+*the tenant is over quota*. (`tier_full` in the Python client.)
 
 ## Is it working?
 
