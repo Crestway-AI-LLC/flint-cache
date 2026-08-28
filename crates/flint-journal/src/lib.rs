@@ -171,13 +171,26 @@ pub fn emit_detached(target: String, tls: Option<Arc<flint_tls::ClientConfig>>, 
 /// would still loop on a short write, but a short write on a few hundred bytes
 /// to a regular file does not happen in practice, and the alternative — two
 /// writes every time — is broken by construction rather than by bad luck.
-/// How much history the LIVE journal plus its rotations keep. Ninety days,
-/// chosen by the operator on 2026-08-27: long enough that a quarter's
-/// incidents stay reconstructable on the box.
+/// A BACKSTOP, not the retention policy. Deliberately twice the policy window.
 ///
-/// Measured basis: the playground writes 6,610 rows/day = 1.2 MB/day, so 90
-/// days is ~110 MB across the live file and its rotations.
-pub const RETENTION_MS: u64 = 90 * 24 * 60 * 60 * 1000;
+/// The policy is ninety days, chosen by the operator on 2026-08-27 — long
+/// enough that a quarter's incidents stay reconstructable on the box. (At the
+/// playground's measured 6,610 rows/day = 1.2 MB/day, that is ~110 MB.) But
+/// the pruner that ENFORCES ninety days is `tools/agent/flint-archive.sh` in
+/// the ops repo, because it is the only one that can keep the promise that
+/// matters: it uploads in the same pass, so nothing is deleted locally that
+/// was not shipped first.
+///
+/// This pruner cannot make that promise — it runs inside the control plane
+/// and knows nothing about S3 — so at an equal window it would race the
+/// archive and could delete a segment that was never shipped. Sitting at
+/// twice the window means the archive always gets there first on any box
+/// running it, while a fleet with no archiver is still bounded instead of
+/// growing forever.
+///
+/// If you shorten either window, check this one still sits outside the
+/// archive's `FLINT_ARCHIVE_RETAIN_DAYS`.
+pub const RETENTION_MS: u64 = 180 * 24 * 60 * 60 * 1000;
 
 /// Rotate the live file once it passes this. Bounds the READ cost as much as
 /// the disk: `tail` and `tail_kinds` both `read_to_string` the whole file to
