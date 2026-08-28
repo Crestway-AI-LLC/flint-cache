@@ -751,3 +751,38 @@ existing precedent for a bounded grace around a known-transient state.
 Reproducing this on demand is now cheap: it happens on every fleet roll, and
 `roll-fleet.sh --probe` already runs a verify at the end. A shed-counter delta
 across the roll would turn every future roll into a measurement.
+
+### Decision, 2026-08-27: collect before designing
+
+The obvious next move is to give promotion a grace window, the way
+`widowed_grace_ms` already bounds the other known-transient state. **Not yet,
+and deliberately.**
+
+A grace means suppressing a safety cap during a window. That cap is what
+bounds RPO — the hard cap at 1,000 ms is the promise that a replica is never
+more than a second behind before writes are refused. A grace sized from one
+sample is a durability guarantee weakened by guesswork, and the failure mode
+is invisible: nothing breaks, the shed stops, and the RPO envelope quietly
+becomes whatever the grace happens to be.
+
+What is actually known is one roll on one fleet: 110 shed, 5,735 ms peak,
+`writes_delayed_soft` **0**. That last figure is the interesting one and the
+reason a second sample matters — the soft cap at 500 ms never fired at all.
+Lag did not climb through the soft band into the hard one; it arrived past
+both. If that holds across rolls it says the gap appears whole at promotion
+rather than building, which is a different mechanism from the one a grace
+window assumes, and would point at the demote-and-drain sequence rather than
+at the cap thresholds.
+
+Collecting is now free: `tools/shed-window.sh` runs at the end of every
+`roll-fleet.sh`, so Monday's roll is sample 2 and Wednesday's is sample 3 with
+no extra work. Revisit once there are three, and design against the shape
+rather than the point.
+
+What to look for across them:
+
+- does `writes_delayed_soft` stay at 0? (mechanism: sudden vs. accumulating)
+- does peak lag cluster near 5.7 s, or scale with something — dataset size,
+  seat count, how long the demoted master was down?
+- does the shed land on the promoted seat every time, or on whichever seat
+  happens to be behind?
