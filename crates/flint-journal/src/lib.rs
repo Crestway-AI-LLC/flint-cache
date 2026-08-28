@@ -97,6 +97,24 @@ pub enum EventKind {
     /// The guard cleared (with hysteresis) and writes resumed.
     /// detail carries "free <bytes> of <bytes>".
     DiskResumed,
+    /// Tier-1 (OPS-ADR-0029): a tier READ something from the catalog of
+    /// evidence it is armed for. `subject` is the evidence key
+    /// (`<verb>:<what>`); `detail` says what came back.
+    ///
+    /// One row per lookup, and that is the point rather than an accident.
+    /// OPS-0057 established that the constraint on debugging was never
+    /// capability but the RECORD: nine pages reached the pager and could not
+    /// be attributed afterwards, from a position with more access than any
+    /// tier will ever have, because the send path wrote nothing down. An
+    /// investigating tier that leaves no trail rebuilds exactly that, one
+    /// level up — a conclusion nobody can check, drawn from reads nobody can
+    /// see.
+    ///
+    /// It will be among the noisiest kinds here. That is affordable because
+    /// `CPJOURNALREAD` filters by kind SERVER-side (ADR-0018 item 1), so a
+    /// reader asking for decisions never pays for these; and because the
+    /// journal now rotates, so volume costs disk rather than horizon.
+    EvidenceGathered,
     /// The rotation loop retired a drained previous token (ADR-0006 D3):
     /// its auth count stayed flat across the tenant's subset for a full
     /// drain window. detail carries the drained digest (non-secret).
@@ -1015,6 +1033,63 @@ mod segment_read_failure_tests {
             segments(&p).iter().any(|(ms, _)| *ms == 1000),
             "the unreadable segment must still be ENUMERATED — if it were \
              invisible to segments() the read would look complete"
+        );
+        std::fs::remove_dir_all(&d).ok();
+    }
+}
+
+#[cfg(test)]
+mod evidence_kind_tests {
+    use super::*;
+
+    /// The wire name is what `CPJOURNALREAD ... KINDS` matches on, so it has
+    /// to survive the round trip. Asserted rather than assumed from the serde
+    /// derive: this is the string an operator types and a filter compares.
+    #[test]
+    fn evidence_gathered_round_trips_on_the_wire() {
+        assert_eq!(
+            parse_kind("EvidenceGathered"),
+            Some(EventKind::EvidenceGathered)
+        );
+        let wire = serde_json::to_string(&EventKind::EvidenceGathered).expect("encode");
+        assert_eq!(wire, "\"EvidenceGathered\"");
+    }
+
+    /// It must be FILTERABLE, because that is the whole reason a noisy kind
+    /// is affordable: a reader asking for decisions must not pay for these.
+    /// If this kind were ever unfilterable it would shrink every guard's
+    /// horizon, which is the 2026-08-17 failure `tail_kinds` documents.
+    #[test]
+    fn a_decision_read_does_not_pay_for_evidence_rows() {
+        let d = std::env::temp_dir().join(format!("flint-jrn-ev-{}", std::process::id()));
+        std::fs::create_dir_all(&d).expect("tmpdir");
+        let p = d.join("j").to_str().expect("utf8").to_string();
+        let mut body = String::new();
+        for i in 0..50 {
+            body.push_str(&format!(
+                r#"{{"at_ms":{i},"actor":"agent:tier1","kind":"EvidenceGathered","subject":"readjournal:x"}}"#
+            ));
+            body.push('\n');
+        }
+        body.push_str(
+            r#"{"at_ms":99,"actor":"agent:tier2","kind":"ActionExecuted","subject":"attach:a"}"#,
+        );
+        body.push('\n');
+        std::fs::write(&p, body).expect("fixture");
+
+        let acted = tail_kinds(&p, 10, &[EventKind::ActionExecuted]);
+        assert_eq!(
+            acted.len(),
+            1,
+            "evidence noise reached a decision read: {acted:?}"
+        );
+        assert!(acted[0].contains("ActionExecuted"));
+
+        let ev = tail_kinds(&p, 100, &[EventKind::EvidenceGathered]);
+        assert_eq!(
+            ev.len(),
+            50,
+            "the evidence trail must be readable on its own"
         );
         std::fs::remove_dir_all(&d).ok();
     }
