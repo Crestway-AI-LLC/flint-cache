@@ -167,12 +167,21 @@ impl<'a> SetStore<'a> {
             return Ok(Vec::new());
         };
         let prefix = subkey_prefix(&self.ns, slot, key, meta.version);
-        Ok(self
-            .kv
-            .scan_prefix(&prefix)
-            .into_iter()
-            .map(|(k, _)| k[prefix.len()..].to_vec())
-            .collect())
+        // `for_each_prefix`, not `scan_prefix`: for a SET the members are the
+        // KEYS, so the materializing scan copies the whole collection once to
+        // build its Vec and the suffix map copies it a second time. Streaming
+        // the visit removes the first copy outright — the one case where that
+        // map was a real copy rather than a move (ADR-0025; hashes move their
+        // values, which is why the same edit there measured identical).
+        //
+        // This does NOT make the reply O(1): the returned Vec still owns every
+        // member. Bounding that is the streaming-reply half of the ADR.
+        let mut out = Vec::new();
+        self.kv.for_each_prefix(&prefix, &mut |k, _| {
+            out.push(k[prefix.len()..].to_vec());
+            true
+        });
+        Ok(out)
     }
 
     pub fn scard(&self, slot: u16, key: &[u8]) -> Result<u64, StoreError> {

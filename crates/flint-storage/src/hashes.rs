@@ -223,12 +223,18 @@ impl<'a> HashStore<'a> {
             return Ok(Vec::new());
         };
         let prefix = subkey_prefix(&self.ns, slot, key, meta.version);
-        Ok(self
-            .kv
-            .scan_prefix(&prefix)
-            .into_iter()
-            .map(|(k, v)| (k[prefix.len()..].to_vec(), v))
-            .collect())
+        // Smaller win than the SET case, and worth being precise about: the
+        // VALUE is copied exactly once either way (`scan_prefix` owns it out
+        // of the iterator, and the old map then MOVED it). What streaming the
+        // visit removes here is the full-key copies and one whole Vec, not a
+        // dataset-sized allocation. The dataset-sized one that remains is the
+        // returned `Pairs` itself, which only a streaming reply can bound.
+        let mut out = Pairs::new();
+        self.kv.for_each_prefix(&prefix, &mut |k, v| {
+            out.push((k[prefix.len()..].to_vec(), v.to_vec()));
+            true
+        });
+        Ok(out)
     }
 }
 

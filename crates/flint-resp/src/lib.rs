@@ -418,6 +418,51 @@ pub fn encode_proto(value: &Value, proto: Proto, out: &mut Vec<u8>) {
     }
 }
 
+/// Encode `value` into `out`, draining `out` through `sink` whenever it grows
+/// past `threshold`.
+///
+/// Byte-for-byte identical to [`encode_proto`]; the only thing that changes is
+/// WHEN those bytes leave the buffer. For a collection reply that is the
+/// difference between the out-buffer holding the whole dataset and holding one
+/// flush window: `HGETALL` on a 205 MB hash cost +557 MB of peak RSS because
+/// the collection existed twice, once as the reply value and once serialized
+/// into this buffer (ADR-0025).
+///
+/// The bound this gives is `threshold + the largest single element`, not
+/// `threshold` — a drain happens BETWEEN elements, and one 512 MB bulk still
+/// lands in the buffer whole. Saying otherwise would overstate it: this caps
+/// the number of elements resident, not the size of one.
+///
+/// It also does not bound the reply VALUE, which the caller has already
+/// materialized before calling this. Removing that second copy needs the store
+/// and the encoder fused, which is a larger change than this one.
+pub fn encode_proto_flushing(
+    value: &Value,
+    proto: Proto,
+    out: &mut Vec<u8>,
+    threshold: usize,
+    sink: &mut dyn FnMut(&mut Vec<u8>) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    match value {
+        // Recurses, so a nested array drains too. Everything else is a single
+        // value with nothing to interleave, and goes out through the ordinary
+        // encoder unchanged.
+        Value::Array(Some(items)) => {
+            out.push(b'*');
+            out.extend_from_slice(items.len().to_string().as_bytes());
+            out.extend_from_slice(b"\r\n");
+            for item in items {
+                encode_proto_flushing(item, proto, out, threshold, sink)?;
+                if out.len() >= threshold {
+                    sink(out)?;
+                }
+            }
+        }
+        _ => encode_proto(value, proto, out),
+    }
+    Ok(())
+}
+
 /// Decode one frame from the front of `input`.
 pub fn decode(input: &[u8]) -> Result<Decoded, ProtocolError> {
     decode_at(input, 0)
@@ -936,5 +981,151 @@ mod tests {
         }
         buf.extend_from_slice(b":1\r\n");
         assert_eq!(decode(&buf), Err(ProtocolError::TooDeep));
+    }
+}
+
+#[cfg(test)]
+mod flushing_encoder_tests {
+    use super::*;
+
+    /// Drain into one contiguous transcript, exactly as a socket would see it.
+    fn transcript(v: &Value, proto: Proto, threshold: usize) -> (Vec<u8>, usize, usize) {
+        let mut wire = Vec::new();
+        let mut flushes = 0usize;
+        let mut peak = 0usize;
+        let mut out = Vec::new();
+        {
+            let mut sink = |o: &mut Vec<u8>| -> std::io::Result<()> {
+                flushes += 1;
+                wire.extend_from_slice(o);
+                o.clear();
+                Ok(())
+            };
+            // peak is sampled by the caller below via the returned buffer, so
+            // track it inside the loop instead: encode one element at a time.
+            encode_proto_flushing(v, proto, &mut out, threshold, &mut sink)
+                .expect("sink never fails");
+        }
+        peak = peak.max(out.len());
+        wire.extend_from_slice(&out);
+        (wire, flushes, peak)
+    }
+
+    fn big_array(n: usize, elem: usize) -> Value {
+        Value::Array(Some(
+            (0..n)
+                .map(|i| Value::Bulk(Some(vec![b'a' + (i % 26) as u8; elem])))
+                .collect(),
+        ))
+    }
+
+    /// THE delivery control. A streaming encoder that truncates or reorders
+    /// produces a wonderful memory number and a broken client, so the bytes
+    /// must be indistinguishable from the non-streaming encoder's.
+    #[test]
+    fn the_wire_bytes_are_identical_to_the_non_streaming_encoder() {
+        for proto in [Proto::Resp2, Proto::Resp3] {
+            let v = big_array(500, 4096);
+            let mut want = Vec::new();
+            encode_proto(&v, proto, &mut want);
+            let (got, flushes, _) = transcript(&v, proto, 64 * 1024);
+            assert_eq!(got, want, "streamed bytes differ from encode_proto");
+            assert!(flushes > 0, "nothing was flushed; the test proves nothing");
+        }
+    }
+
+    /// The array header must state the true element count. This is the failure
+    /// the ADR names explicitly: a header that disagrees with the body hangs
+    /// or desyncs the client rather than erroring.
+    #[test]
+    fn the_header_count_matches_the_elements_delivered() {
+        let (wire, _, _) = transcript(&big_array(300, 1024), Proto::Resp2, 8 * 1024);
+        let header_end = wire
+            .windows(2)
+            .position(|w| w == b"\r\n")
+            .expect("array header has a CRLF");
+        let n: usize = std::str::from_utf8(&wire[1..header_end])
+            .expect("header is ascii")
+            .parse()
+            .expect("header is a count");
+        assert_eq!(n, 300, "header count");
+        assert_eq!(wire[0], b'*');
+        // Count delivered bulks by decoding the whole transcript back.
+        match decode(&wire).expect("transcript is a decodable frame") {
+            Decoded::Complete(Value::Array(Some(items)), used) => {
+                assert_eq!(items.len(), 300, "delivered element count");
+                assert_eq!(used, wire.len(), "trailing bytes after the array");
+            }
+            other => panic!("transcript did not decode to a complete array: {other:?}"),
+        }
+    }
+
+    /// The point of the change: the buffer stops growing with the collection.
+    #[test]
+    fn the_buffer_does_not_grow_with_the_collection() {
+        let threshold = 16 * 1024;
+        let mut peaks = Vec::new();
+        for n in [50usize, 500, 5000] {
+            let v = big_array(n, 1024);
+            let mut out = Vec::new();
+            let mut peak = 0usize;
+            let mut sink = |o: &mut Vec<u8>| -> std::io::Result<()> {
+                o.clear();
+                Ok(())
+            };
+            // Encode element-wise so the peak is observed, mirroring what the
+            // connection sees between drains.
+            if let Value::Array(Some(items)) = &v {
+                out.push(b'*');
+                out.extend_from_slice(items.len().to_string().as_bytes());
+                out.extend_from_slice(b"\r\n");
+                for item in items {
+                    encode_proto_flushing(item, Proto::Resp2, &mut out, threshold, &mut sink)
+                        .expect("sink never fails");
+                    peak = peak.max(out.len());
+                    if out.len() >= threshold {
+                        sink(&mut out).expect("sink never fails");
+                    }
+                }
+            }
+            peaks.push(peak);
+        }
+        // 100x the elements must not mean 100x the buffer. Bound is
+        // threshold + one element, so assert against that rather than a
+        // fixed number that would drift with the fixture.
+        let bound = threshold + 1024 + 64;
+        for (i, p) in peaks.iter().enumerate() {
+            assert!(
+                *p <= bound,
+                "peak {p} exceeds threshold+element bound {bound} at case {i}"
+            );
+        }
+        assert!(
+            peaks[2] <= peaks[0] * 2,
+            "buffer scaled with the collection: {peaks:?}"
+        );
+    }
+
+    /// A reply below the threshold must behave exactly as before — no flush,
+    /// so nothing about small replies changes.
+    #[test]
+    fn a_small_reply_never_flushes() {
+        let (wire, flushes, _) = transcript(&big_array(3, 16), Proto::Resp2, 1024 * 1024);
+        assert_eq!(flushes, 0, "a small reply should not reach the sink");
+        let mut want = Vec::new();
+        encode_proto(&big_array(3, 16), Proto::Resp2, &mut want);
+        assert_eq!(wire, want);
+    }
+
+    /// Nested arrays drain too, rather than silently buffering whole.
+    #[test]
+    fn nested_arrays_also_drain() {
+        let inner = big_array(200, 1024);
+        let v = Value::Array(Some(vec![inner.clone(), inner]));
+        let mut want = Vec::new();
+        encode_proto(&v, Proto::Resp2, &mut want);
+        let (got, flushes, _) = transcript(&v, Proto::Resp2, 8 * 1024);
+        assert_eq!(got, want);
+        assert!(flushes > 1, "nested elements did not drain: {flushes}");
     }
 }

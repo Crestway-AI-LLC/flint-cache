@@ -24,7 +24,7 @@ use std::net::TcpListener;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use flint_resp::{Decoded, Value, decode, encode, encode_proto};
+use flint_resp::{Decoded, Value, decode, encode, encode_proto, encode_proto_flushing};
 use flint_storage::{Kv, MemKv};
 
 use crate::commands::Dispatcher;
@@ -2689,7 +2689,23 @@ fn serve(
                     watch,
                     &args,
                 );
-                encode_proto(&reply, conn_proto, &mut out);
+                // Drain BETWEEN elements instead of only after the whole reply.
+                // Serializing a collection into this buffer whole is the second of
+                // the two dataset-sized copies behind the +557 MB HGETALL
+                // (ADR-0025) -- the threshold already existed here, and nothing
+                // gave a reply any way to reach it mid-encode. Small replies are
+                // untouched: below the threshold the sink is never called.
+                encode_proto_flushing(
+                    &reply,
+                    conn_proto,
+                    &mut out,
+                    OUT_FLUSH_THRESHOLD,
+                    &mut |o| {
+                        stream.write_all(o)?;
+                        o.clear();
+                        Ok(())
+                    },
+                )?;
                 if out.len() >= OUT_FLUSH_THRESHOLD {
                     stream.write_all(&out)?;
                     out.clear();
@@ -2755,7 +2771,23 @@ fn serve(
                         watch,
                         &args,
                     );
-                    encode_proto(&reply, conn_proto, &mut out);
+                    // Drain BETWEEN elements instead of only after the whole reply.
+                    // Serializing a collection into this buffer whole is the second of
+                    // the two dataset-sized copies behind the +557 MB HGETALL
+                    // (ADR-0025) -- the threshold already existed here, and nothing
+                    // gave a reply any way to reach it mid-encode. Small replies are
+                    // untouched: below the threshold the sink is never called.
+                    encode_proto_flushing(
+                        &reply,
+                        conn_proto,
+                        &mut out,
+                        OUT_FLUSH_THRESHOLD,
+                        &mut |o| {
+                            stream.write_all(o)?;
+                            o.clear();
+                            Ok(())
+                        },
+                    )?;
                     if out.len() >= OUT_FLUSH_THRESHOLD {
                         stream.write_all(&out)?;
                         out.clear();
