@@ -372,6 +372,13 @@ retraction and ADR-0032 for what supporting it would take.
   hardware shape, single-box Spark rather than a cluster. **Quote the range,
   not a run** — every single-run figure we published was later found to be the
   top of one.
+- **One tier serves 64 concurrent readers** at 8.0 ms p99 per read, against
+  0.29 ms at a single reader, with throughput flat near 9,000 reads/s from four
+  readers on (ADR-0023 D17.6). Still an order of magnitude inside the 25-45 ms
+  of S3 TTFB the cache removes, so the tier is not what gives out at that
+  fan-out. **Sixty-four readers from ONE machine — not 64 machines, and not a
+  cluster benchmark.** Reproduce it: `mvn -Pbench package` then `FanoutBench`,
+  or `packaging/aws/spark-e2e/measure_fanout.sh` on a pair of boxes.
 - **`hadoop-aws` 3.4.3 / 3.5.0 need the shim jar** — their audit path
   references an AAL class no published AAL ships. `preflight.sh` detects this
   and says so.
