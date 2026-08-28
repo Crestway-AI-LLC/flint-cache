@@ -55,7 +55,7 @@ defect is that we choose to hold all of it.
     fn for_each_prefix(&self, prefix: &[u8], f: &mut dyn FnMut(&[u8], &[u8]) -> bool);
 
 with a **default implementation that delegates to `scan_prefix`**. That is the
-load-bearing part of the design: the trait has 6 implementors and
+load-bearing part of the design: the trait has 5 production implementors (plus a test double) and
 `scan_prefix` has 25 production call sites, and none of them has to change.
 `RocksKv` overrides it with the native iterator it already uses elsewhere
 (`rocks.rs:581`), and everything else inherits today's behaviour until it is
@@ -207,9 +207,9 @@ BUG-0060 pass 3.
 
 ### Two further corrections, from the session that took the implementation
 
-**The implementor count was 4 and is 6.** Five production —
-`MemKv`, `RocksKv`, `ReadOnlyKv`, `BatchingKv`, `WatchedKv` — plus a
-`NoMaterializeKv` test double. The miscount has a dull cause worth naming
+**The implementor count was 4 and is 5 in production** — `MemKv`, `RocksKv`,
+`ReadOnlyKv`, `BatchingKv`, `WatchedKv` — plus a `NoMaterializeKv` test
+double, which is 6 if you count it and should not be counted as one. The miscount has a dull cause worth naming
 because it will recur: the grep behind it was scoped to
 `crates/flint-storage/src/*.rs`, and the test double lives in
 `flint-server/src/commands.rs:3539`. A count taken from one crate was reported
@@ -219,9 +219,8 @@ as a count of the trait.
 section says 1 MiB per connection times 2048 connections is 2 GiB of reply
 buffers, and calls the aggregate bound a separate open decision. Redis has a
 shape for exactly this — `client-output-buffer-limit`, per-class soft and hard
-thresholds that disconnect a client whose reply buffer runs away. (Raised by
-the "Cache technology vs Redis" session, which is comparing the two directly;
-worth confirming against the specific Redis version before it is quoted.)
+thresholds that disconnect a client whose reply buffer runs away. (Worth confirming against
+the specific Redis version before it is quoted.)
 
 So the aggregate bound is **not an open design question, it is an unimplemented
 known shape**, and until it exists this is a place where the comparison
@@ -229,3 +228,38 @@ favours Redis. That is a stronger reason to do it than "unbounded is
 untidy", and it means the eventual design has a reference to argue with rather
 than a blank page. It stays out of THIS ADR's scope, but it should stop being
 described as undecided.
+
+## What the implementation actually achieved, 2026-08-28
+
+Corrected against `cd1e3c8`, which implemented this. **Two claims above are
+overstated and are withdrawn here.**
+
+**"~1 MiB per connection" is not the bound.** Drains happen BETWEEN elements,
+so a single oversized bulk still lands in the buffer whole. The honest bound is
+**`OUT_FLUSH_THRESHOLD` plus the largest single element**.
+
+**And it is not "down to a window".** The reply `Value` still owns every
+member, so the resident cost goes from roughly two dataset-sized copies to
+roughly **one copy plus a flush window** — not to a window. Removing the last
+copy needs the store and the encoder fused, which is a larger change than this
+ADR scoped and is not done.
+
+So the accurate summary of the change is: **one of the two dataset-sized
+allocations is gone; the other remains.** That is a real improvement and it is
+half of what the "Decision" section above implies. Recorded here rather than
+edited into that section, because the gap between what an ADR predicts and
+what its implementation achieves is worth being able to see.
+
+**A note on the verification, which departed from this ADR's suggestion and
+was right to.** This ADR asked for an RSS-shaped drill. The implementation
+declined, on this ADR's own rule: the predicted effect is one dataset-sized
+copy (~205 MB on the fixture) against a measured run-to-run peak-RSS spread of
+248 MB, so peak RSS cannot resolve it — and a drill asserting "peak RSS does
+not scale with N" would fail anyway while the reply `Value` still holds the
+collection. It asserts deterministically instead: the streamed transcript is
+byte-identical to `encode_proto` in both protocols, the array header matches
+the elements that decode back out, the buffer's peak stays under
+threshold-plus-element while the collection grows 100x, and a flush is
+asserted to have occurred so the tests cannot pass with the streaming deleted.
+
+That is the better instrument, and the ADR's suggestion was the worse one.

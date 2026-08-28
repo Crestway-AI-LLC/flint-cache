@@ -301,9 +301,35 @@ fn tail_across(path: &str, n: usize, keep: &dyn Fn(&str) -> bool) -> Vec<String>
     files.push(std::path::PathBuf::from(path));
 
     let mut out: Vec<String> = Vec::new();
+    let live = std::path::Path::new(path);
     for f in files.iter().rev() {
-        let Ok(raw) = std::fs::read_to_string(f) else {
-            continue;
+        let raw = match std::fs::read_to_string(f) {
+            Ok(r) => r,
+            Err(e) => {
+                // A SEGMENT that fails to read is not the same as one that is
+                // not there. `segments()` just enumerated it, so the file
+                // existed a moment ago; skipping it silently hands a caller
+                // FEWER rows and no indication, and the caller most likely to
+                // be hurt is tier2's budget counter, for which "cannot count"
+                // and "counted fewer" are the difference between refusing to
+                // act and acting freely. That collapse is OPS-0037, and a
+                // rotation-shortened horizon is the exact failure `tail_kinds`
+                // documents from 2026-08-17.
+                //
+                // Still `continue` rather than returning an error: this function has
+                // no error channel and losing the readable segments too would
+                // be worse. But it must not be quiet about it.
+                if f.as_path() != live {
+                    eprintln!(
+                        "journal: segment {} unreadable ({e}) — this read is SHORT by \
+                         whatever it held; a horizon computed from it is not trustworthy",
+                        f.display()
+                    );
+                }
+                // The live path legitimately does not exist between a
+                // rotation and the next append; that case stays silent.
+                continue;
+            }
         };
         let mut kept: Vec<String> = raw
             .lines()
@@ -932,5 +958,43 @@ mod retention_tests {
             both.iter().any(|l| l.contains("trigger")) && both.iter().any(|l| l.contains("post")),
             "reads must span the rotation boundary: {both:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod segment_read_failure_tests {
+    use super::*;
+
+    /// An unreadable SEGMENT must not pass as a shorter history.
+    ///
+    /// The caller most likely to be hurt is tier2's budget counter, where
+    /// "cannot count" and "counted fewer" are the difference between refusing
+    /// to act and acting freely — the OPS-0037 collapse, and the same
+    /// shortened horizon `tail_kinds` documents from 2026-08-17. The read
+    /// still returns what it can, but it must say it is short.
+    #[test]
+    fn an_unreadable_segment_is_reported_not_swallowed() {
+        let d = std::env::temp_dir().join(format!("flint-jrn-unread-{}", std::process::id()));
+        std::fs::create_dir_all(&d).expect("tmpdir");
+        let p = d.join("j").to_str().expect("utf8 path").to_string();
+        std::fs::write(&p, "{\"at_ms\":1,\"kind\":\"Detected\"}\n").expect("live");
+
+        // A segment that exists (so `segments()` lists it) but cannot be read:
+        // a DIRECTORY at the segment path is the portable way to make
+        // read_to_string fail without depending on running as non-root.
+        std::fs::create_dir_all(format!("{p}.1000")).expect("segment dir");
+
+        let got = tail(&p, 10);
+        assert_eq!(
+            got.len(),
+            1,
+            "the readable rows must still come back: {got:?}"
+        );
+        assert!(
+            segments(&p).iter().any(|(ms, _)| *ms == 1000),
+            "the unreadable segment must still be ENUMERATED — if it were \
+             invisible to segments() the read would look complete"
+        );
+        std::fs::remove_dir_all(&d).ok();
     }
 }
