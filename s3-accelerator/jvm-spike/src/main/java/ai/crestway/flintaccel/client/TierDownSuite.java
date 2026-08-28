@@ -5,6 +5,11 @@ import java.net.URI;
 import java.net.http.*;
 import java.util.*;
 
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.FSDataInputStream;
+import org.apache.hadoop.fs.FileSystem;
+import org.apache.hadoop.fs.Path;
+
 import software.amazon.s3.analyticsaccelerator.S3SeekableInputStreamConfiguration;
 import software.amazon.s3.analyticsaccelerator.S3SeekableInputStreamFactory;
 import software.amazon.s3.analyticsaccelerator.util.S3URI;
@@ -135,6 +140,67 @@ public final class TierDownSuite {
     check(Arrays.equals(after, got), "and the bytes are still correct after recovery");
 
     t.close();
+
+    // ---- the same property, entered through S3A PATH 1 (BUG-0067).
+    //
+    // Everything above builds through TierSupport, which is where BUG-0058's
+    // fix landed -- so this suite followed the fix around and never tested the
+    // path that was missed. Path 1 builds its client DIRECTLY, and its
+    // bind-time behaviour was broken for exactly as long as this suite was
+    // green.
+    //
+    // Bind-time on path 1 is covered by ConfigReachSuite's dead-tier probe.
+    // What was untested ANYWHERE is a tier that dies MID-JOB on this path:
+    // ResilienceSpike looks like it covers that and does not, because it
+    // defines its own ResilientObjectClient rather than using the product's --
+    // so "tier killed mid-job" proves a stand-in degrades correctly, not that
+    // FlintObjectClient does.
+    Configuration c = new Configuration();
+    c.set("fs.s3a.endpoint", endpoint);
+    c.set("fs.s3a.endpoint.region", "us-east-1");
+    c.setBoolean("fs.s3a.path.style.access", true);
+    c.set("fs.s3a.access.key", "s"); c.set("fs.s3a.secret.key", "s");
+    c.setInt("fs.s3a.bucket.probe", 0);
+    c.set("fs.s3a.change.detection.mode", "none");
+    c.set("fs.s3a.input.stream.type", "custom");
+    c.set("fs.s3a.input.stream.custom.factory",
+        ai.crestway.flintaccel.s3a.FlintStreamFactory.class.getName());
+    c.set(ai.crestway.flintaccel.s3a.FlintStreamFactory.TIER_URI, tier);
+    c.set("fs.s3a.impl.disable.cache", "true");
+
+    try (FileSystem fs = FileSystem.get(URI.create("s3a://bucket/"), c)) {
+      byte[] b1 = new byte[LEN];
+      try (FSDataInputStream in = fs.open(new Path("s3a://bucket/" + KEY))) {
+        in.readFully(0, b1, 0, LEN);
+      }
+      check(b1.length == LEN,
+          "path 1: a read with a HEALTHY tier returns the object");
+      // Armed. Without this the survival check below is satisfied by a path
+      // that was never using the tier in the first place.
+      check(Suite.tierAnswering(),
+          "  armed: the tier was up and answering for that read");
+
+      int beforeKill = gets();
+      Suite.killTier();
+      check(!Suite.tierListening(),
+          "precondition: the tier is DOWN, mid-job, with the filesystem open");
+
+      byte[] b2 = new byte[LEN];
+      try (FSDataInputStream in = fs.open(new Path("s3a://bucket/" + KEY))) {
+        in.readFully(LEN, b2, 0, LEN);       // a DIFFERENT range: must be fetched
+      }
+      check(b2.length == LEN,
+          "path 1: a read SURVIVES the tier dying mid-job, " + b2.length + " bytes");
+      check(gets() > beforeKill,
+          "  and it came from the ORIGIN (origin GETs moved), so it degraded "
+              + "rather than being served from something stale");
+    } catch (Exception e) {
+      check(false, "path 1: a read SURVIVES the tier dying mid-job -- threw " + e);
+    }
+
+    Suite.startTier();            // leave the box as this suite found it
+    check(Suite.tierAnswering(), "the tier is back for the stages after this one");
+
     System.exit(ok ? 0 : 1);
   }
 }

@@ -68,3 +68,32 @@ or it is testing the helper rather than the product.**
 `TierDownSuite` still only covers paths 2 and 3. Path 1's tier-down behaviour is
 covered by the single probe above, which is bind-time only — a tier that dies
 *mid-job* on path 1 is still untested.
+
+## A separable finding from the same hunt: one gate stage measures a stand-in
+
+`ResilienceSpike` is gated as **"tier killed mid-job (4 checks)"**. It does not
+use `FlintObjectClient`. It defines its own `ResilientObjectClient implements
+ObjectClient` inside the spike file and wires AAL over that.
+
+So the stage proves *a spike-local reimplementation* of the degradation logic
+survives a tier being killed. It says nothing about whether the product's client
+does. It reads, in the gate's output, exactly like coverage of the product.
+
+This is the same root as the bug above, one turn further: not "the suite entered
+through the door the fix went through", but "the suite built its own door". It is
+how the mid-job property could look covered on every path while being covered on
+none of them.
+
+**Now genuinely covered:** `TierDownSuite` gains a path-1 arm that opens a real
+`FileSystem` through `fs.s3a.input.stream.type=custom`, reads with the tier up
+(armed: the tier answered), kills the tier with the filesystem still open, and
+requires the next read to return correct bytes *and* to have reached the origin —
+the second half being what separates degrading from serving something stale. It
+passes, so the mid-job half of D12.9 was correct on path 1 all along; it was
+simply never asserted there.
+
+**Still open, separably:** whether `ResilienceSpike` should keep its own client
+at all. A spike that predates the product and is now gated as a product test is
+worth either pointing at `FlintObjectClient` or renaming so its four checks stop
+reading as coverage they do not provide.
+

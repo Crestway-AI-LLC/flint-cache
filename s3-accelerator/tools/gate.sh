@@ -385,7 +385,7 @@ run_suite "SSE-C bypass (5 checks)"    ai.crestway.flintaccel.s3a.SseCSuite  930
 # D12.9 calls this the property that decides deployability, and it had a spike
 # (ResilienceSpike) that the gate never ran, which is how a tier down at
 # submission time reached a real Spark job and failed it outright.
-run_suite "tier down at build (10 checks)" ai.crestway.flintaccel.client.TierDownSuite 9306 "$ROOT/jvm-spike/target/classes:$CP"
+run_suite "tier down at build + mid-job on path 1 (16 checks)" ai.crestway.flintaccel.client.TierDownSuite 9306 "$ROOT/jvm-spike/target/classes:$CP"
 # The other half of D12.9: a tier killed MID-JOB. This spike existed all along
 # and the gate never ran it, so nobody saw that it had been FAILING -- its
 # content expectation still computed md5("{key}:{block}") after the fixture
