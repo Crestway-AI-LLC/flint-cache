@@ -1,6 +1,6 @@
 # ADR-0025 — stream collection reads instead of materialising them
 
-**Status:** proposed, 2026-08-27. Comes out of BUG-0060 candidate 1, which is
+**Status:** ACCEPTED 2026-08-27. **Step 1 below was wrong and is corrected at the bottom — read that first.** Comes out of BUG-0060 candidate 1, which is
 measured and has now survived two attempts to fix it locally.
 
 ## The problem, with a number
@@ -130,3 +130,77 @@ touches 25 call sites plus 4 implementors in one commit, most of them nowhere
 near this bug. The additive method reaches the same end state incrementally,
 and leaves `scan_prefix` available for the callers where materialising is
 genuinely what is wanted.
+
+---
+
+## Correction, 2026-08-27 — step 1 already exists, and that sharpens the job
+
+Found on the first hour of implementation. **`Kv::for_each_prefix` is not
+something to add: it is already a REQUIRED method on the trait**
+(`flint-storage/src/lib.rs:128`, no default body), implemented by all five
+implementors — `MemKv`, `RocksKv` (`rocks.rs:577`), the batch wrapper, the
+watch wrapper — with existing tests for ordered streaming, early stop, and
+survival across reentrant deletes. There is a streaming `count_prefix` beside
+it.
+
+In fact the relationship runs the other way from what this ADR assumed:
+**`scan_prefix` is the DEFAULT implemented in terms of `for_each_prefix`**, and
+its doc comment already says what to use when:
+
+> Materializes the whole range — use only where the range is bounded by a
+> single value's size (one hash/set/zset, one slot's manifest rows). CF-wide
+> ranges (DBSIZE, GC) go through `for_each_prefix` / `count_prefix`; at fleet
+> scale a materialized scan OOMs the process.
+
+So the streaming primitive, the trait design, and the "don't materialise
+CF-wide ranges" rule were all in place before this ADR was written. What
+BUG-0060 candidate 1 actually found is that **the carve-out is wrong**: "one
+hash/set/zset" is treated as inherently bounded, and it is not — the measured
+case is a single 205 MB hash.
+
+### What that changes
+
+The plan drops from three steps to one, and the one that remains is the hard
+one:
+
+- ~~Add an additive `for_each_prefix`~~ — exists, nothing to do.
+- ~~Override it in `RocksKv`~~ — exists (`rocks.rs:577`).
+- **The reply path is the entire job.**
+
+And it is worth being exact about why switching the commands to
+`for_each_prefix` on its own buys nothing measurable. `Hashes::hgetall`
+returns `Pairs`, so a streaming scan would fill the same 205 MB `Vec` by a
+different route. The measurement in pass 7 already showed this from the other
+side: the store-side copy people assume is there is mostly a MOVE, and editing
+it changed peak RSS by zero.
+
+The two allocations that are real are the materialised collection and the
+encoded reply, and **both are only removable by letting the command write into
+the connection's out-buffer as it goes.** Commands today return a `Value`,
+`encode_proto` serialises the whole of it into `out`, and only then does
+`main.rs:2581` consider flushing. Nothing in that path lets a command emit an
+array header, stream elements, and flush between them.
+
+### The revised design
+
+One dispatch change, then the commands follow:
+
+    enum Reply { Value(Value), Streamed }
+
+A command that returns `Streamed` has already written its own bytes and
+flushed as needed; everything else is untouched and keeps returning
+`Value`. The collection commands get a writer handle carrying `&mut out` plus
+the flush the serve loop already performs at `OUT_FLUSH_THRESHOLD`.
+
+`SMEMBERS` first, as before — single-valued elements, simplest encoding.
+
+### Why the ADR is left standing rather than rewritten
+
+Its decision — stream rather than cap — is unchanged and still right, and the
+"what this does not fix" section is unchanged: 1 MiB per connection is not an
+aggregate bound. Only the mechanism section was wrong, and deleting the error
+would hide that this ADR proposed building something the codebase already had.
+The lesson is worth more than the tidiness: **the ADR asserted a missing
+primitive without grepping for it**, which is the same failure as asserting a
+measurement from arithmetic — and this file already criticises that in
+BUG-0060 pass 3.
