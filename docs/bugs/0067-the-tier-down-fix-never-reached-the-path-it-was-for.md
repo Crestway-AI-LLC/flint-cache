@@ -109,3 +109,33 @@ did not. Its one contribution not asserted anywhere else was prose — why
 resilience needs both `REJECT_COMMANDS` and a hard timeout — and that has moved
 to ADR-0023 D12.9, where the mechanism it explains is already described.
 
+## The two stated limits are now closed, 2026-08-27
+
+Both were written down as unproven rather than quietly left, and both turned out
+to be reachable:
+
+**`SHIM_FAIL_FAST`, end to end.** It steers a branch only a JVM carrying two
+copies of the shim can enter, so it looked unprobeable in-process — and "the
+decision function respects its argument" is a weaker claim than "serviceInit
+passes the setting to it". `shim_guard_test.sh` already builds the collision, so
+the real factory now runs under it: `failfast=true` REFUSES, `failfast=false` on
+the *same* classpath PROCEEDS, and a healthy classpath still starts. The third
+is the control — without it the pair passes on a build that always refuses.
+
+**`RECONNECT_MS`, on path 1.** Counted, not timed: the rate limit is a duration,
+but an elapsed-time assertion is a flake on a loaded box. What is asserted is
+CONNECT ATTEMPTS across a fixed number of reads against a dead tier, which the
+rate limit is the only thing bounding — a 1 ms budget must attempt more than a
+10 minute one. Reached through a new `FlintStreamFactory.LAST_BOUND`, because
+S3A hands back a FileSystem and the handle that counts attempts lives on the
+factory behind it.
+
+**The first cut of that probe was too thin to keep.** At six reads it measured
+2 attempts against 1: directionally right and one sample away from a coin flip.
+Twenty reads gives 3-4 against a floor of 1, stable across runs. A check whose
+margin is one event is a check that will eventually lie in whichever direction
+is least convenient.
+
+Both keys move from `STRUCTURAL_ONLY` to `PROBED`/`ELSEWHERE` in the registry,
+so nothing in that suite now claims coverage it does not have.
+

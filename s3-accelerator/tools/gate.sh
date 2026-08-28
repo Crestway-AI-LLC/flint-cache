@@ -295,7 +295,7 @@ run_bounded python3 "$ROOT/tools/narrow_tier.py" --self-test >/tmp/gate_narrowti
 verdict "narrow-tier proxy self-test (4 checks)" $?
 
 bash tools/shim_guard_test.sh >/tmp/gate_shim.log 2>&1
-verdict "shim guard (5 classpath states)" $?
+verdict "shim guard + failfast end to end (8 checks)" $?
 
 # ---------------------------------------------------------------- build
 step "build"
@@ -419,7 +419,7 @@ run_bounded java $GUARD_JAVA_OPTS -cp "$ROOT/jvm-spike/target/classes:$CP" \
     ai.crestway.flintaccel.s3a.ConfigReachSuite \
     "http://127.0.0.1:9314" "redis://127.0.0.1:$TIER_PORT" "redis://127.0.0.1:$SLOW_PORT" \
     >/tmp/gate_config_reach.log 2>&1
-verdict "every declared path-1 key does something (28 checks)" $?
+verdict "every declared path-1 key does something (30 checks)" $?
 stop_origin
 
 run_suite "part cap admission, read and write sides (13 checks)" ai.crestway.flintaccel.client.PartCapSuite 9313 "$ROOT/jvm-spike/target/classes:$CP"

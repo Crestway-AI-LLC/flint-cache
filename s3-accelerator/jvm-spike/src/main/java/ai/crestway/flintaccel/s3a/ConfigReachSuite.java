@@ -72,6 +72,27 @@ public final class ConfigReachSuite {
    * shorter than the operation that observes it cannot be observed.
    */
   static final long SHORT_TTL_S = 3;
+
+  /**
+   * Reads per arm of the reconnect probe.
+   *
+   * <p>Twenty, not six. At six the two arms measured 2 attempts against 1 --
+   * directionally right and one sample from being a coin flip. The gap has to
+   * be wide enough that the check is about the rate limit rather than about
+   * scheduling.
+   */
+  static final int RETRY_READS = 20;
+
+  /**
+   * A tier URI that must never answer.
+   *
+   * <p>One constant, and the port is DECLARED in the exclusivity check even
+   * though nothing binds it: if a sibling harness ever bound 9498, the
+   * dead-tier probes here would connect to something and pass for the wrong
+   * reason. A port that must stay closed needs the same declaration as one that
+   * gets bound -- more, because the failure is a silent green.
+   */
+  static final String DEAD_TIER = "redis://127.0.0.1:9498";
   static final long PAST_TTL_MS = SHORT_TTL_S * 1000 + 1500;
   static String endpoint, tier, slowTier;
 
@@ -114,20 +135,19 @@ public final class ConfigReachSuite {
         "a 1-byte part cap must stop this path caching"));
     REGISTRY.put("MAX_OBJECT", new Cover(How.PROBED,
         "a 1-byte object cap must stop this path caching"));
-    REGISTRY.put("RECONNECT_MS", new Cover(How.STRUCTURAL_ONLY,
-        "the FALLBACK it feeds is probed here -- the dead-tier arm proves path 1 "
-        + "survives a tier that is down at bind. The retry RATE it sets is "
-        + "asserted only by TierDownSuite, which builds through TierSupport, so "
-        + "on THIS path the rate itself is unproven; a timing probe for it would "
-        + "be a flake, not a check"));
+    REGISTRY.put("RECONNECT_MS", new Cover(How.PROBED,
+        "a dead tier must not cost a reconnect per read: the attempt count is "
+        + "bounded across many reads, and a tiny budget must attempt MORE than "
+        + "a huge one"));
     REGISTRY.put("CACHE_SSE_KMS", new Cover(How.ELSEWHERE,
         "SseKmsPathsSuite sets it on THIS path (gated as 'SSE-KMS on all 3 "
         + "adoption paths') and asserts the tier is populated only when it is on"));
-    REGISTRY.put("SHIM_FAIL_FAST", new Cover(How.STRUCTURAL_ONLY,
-        "only steers a run whose CLASSPATH has two copies of the shim, which "
-        + "cannot be built in-process. The DECISION it feeds is probed below "
-        + "via failFastMessage; what stays unproven end to end is that "
-        + "serviceInit reads it from the Configuration"));
+    REGISTRY.put("SHIM_FAIL_FAST", new Cover(How.ELSEWHERE,
+        "shim_guard_test.sh drives the REAL factory under a genuinely colliding "
+        + "classpath -- refuses at true, proceeds at false on the same "
+        + "classpath, and a healthy classpath still starts -- so it is proven "
+        + "read from the Configuration and not merely declared. The decision "
+        + "function is also probed below"));
   }
 
   // ---------------------------------------------------------------- helpers
@@ -320,7 +340,7 @@ public final class ConfigReachSuite {
     // ---- TIER_URI: a tier that is not there must not break reads, and must
     // not cache. The control is that the SAME read against the real tier does.
     Configuration dead = base();
-    dead.set(FlintStreamFactory.TIER_URI, "redis://127.0.0.1:1");
+    dead.set(FlintStreamFactory.TIER_URI, DEAD_TIER);
     flush();
     byte[] got = read(dead, K, 500_000, 4096);
     check(Arrays.equals(got, expect(K, 500_000, 4096)),
@@ -328,6 +348,32 @@ public final class ConfigReachSuite {
     check(chunkKeys() == 0,
         "  and cached nothing in the REAL tier (" + chunkKeys() + " keys), so it "
             + "was the given URI that was used and not the default");
+
+    // ---- RECONNECT_MS: a dead tier must not cost a TCP handshake per read.
+    //
+    // Counted, not timed. The rate limit is a duration, but asserting on
+    // elapsed time would be a flake on a loaded box -- so what is checked is
+    // the number of CONNECT ATTEMPTS across a fixed number of reads, which the
+    // rate limit is the only thing bounding. A huge budget must attempt fewer
+    // times than a tiny one over the same reads; without that comparison the
+    // check passes on a client that never retries at all.
+    Configuration slowRetry = base();
+    slowRetry.set(FlintStreamFactory.TIER_URI, DEAD_TIER);
+    slowRetry.setLong(FlintStreamFactory.RECONNECT_MS, 600_000);
+    long slowAttempts = attemptsOver(slowRetry, K, RETRY_READS);
+
+    Configuration fastRetry = base();
+    fastRetry.set(FlintStreamFactory.TIER_URI, DEAD_TIER);
+    fastRetry.setLong(FlintStreamFactory.RECONNECT_MS, 1);
+    long fastAttempts = attemptsOver(fastRetry, K, RETRY_READS);
+
+    check(slowAttempts >= 1,
+        "  armed: the dead-tier path DID try to connect (" + slowAttempts
+            + " attempts), so a low count is a rate limit and not a no-op");
+    check(fastAttempts > slowAttempts,
+        "RECONNECT_MS reaches the client: " + RETRY_READS + " reads against a dead tier cost "
+            + fastAttempts + " connect attempts at a 1 ms retry budget and only "
+            + slowAttempts + " at a 10 min one");
 
     // ---- TIER_BUDGET: a budget under the tier's latency must degrade.
     // Needs the slow proxy: nothing else makes a budget observable.
@@ -402,6 +448,29 @@ public final class ConfigReachSuite {
               ShimGuard.State.SINGLE, "one copy", true) == null,
         "  control -- a healthy classpath does not throw with it on, so the "
             + "flag is not simply always throwing");
+  }
+
+  /**
+   * Connect attempts the lazy fallback made across {@code reads} reads against
+   * a tier that is not there.
+   *
+   * <p>Reaches the factory through {@code LAST_BOUND}: S3A hands back a
+   * FileSystem, and the handle that counts the attempts lives on the factory
+   * behind it.
+   */
+  static long attemptsOver(Configuration c, String key, int reads) throws Exception {
+    FlintStreamFactory.LAST_BOUND = null;
+    try (FileSystem fs = FileSystem.get(URI.create("s3a://bucket/"), c)) {
+      for (int i = 0; i < reads; i++) {
+        try (FSDataInputStream in = fs.open(new Path("s3a://bucket/" + key))) {
+          byte[] b = new byte[4096];
+          in.readFully(200_000 + i * 4096L, b, 0, 4096);
+        }
+      }
+      FlintStreamFactory f = FlintStreamFactory.LAST_BOUND;
+      if (f == null || f.lazy == null) return -1;      // never fell back: a FAIL
+      return f.lazy.connectAttempts.get();
+    }
   }
 
   /**

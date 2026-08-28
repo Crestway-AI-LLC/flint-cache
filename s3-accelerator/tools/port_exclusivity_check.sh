@@ -31,9 +31,15 @@ ck() { if [ "$1" = 0 ]; then PASS=$((PASS+1)); printf "[ok] %s\n" "$2";
 # a bare argument. 9314 surfaced only because the stage that uses it also passes
 # a "http://127.0.0.1:9314" string. So check 1 covers the ports that happen to
 # be written one way, which is worth knowing about a check whose job is coverage.
+# 9498 is declared even though nothing BINDS it: it is the port the config-reach
+# suite points a client at to prove a dead tier degrades. A deliberately-closed
+# port is MORE dangerous undeclared than a bound one -- if the sibling harness
+# ever bound it, the dead-tier probe would connect to something and pass for the
+# wrong reason, which is a silent false green rather than a clash. Declaring it
+# is what puts it through check 3.
 DECLARED="$(printf '%s\n' 9000 9301 9302 9303 9304 9305 9306 9307 9308 9309 \
                           9310 9311 9312 9313 9314 9318 9319 9397 9398 9399 \
-                          9400 9401 9407 9530 9531 9810 | sort -un)"
+                          9400 9401 9407 9498 9530 9531 9810 | sort -un)"
 
 # 6379 is Redis's standard port and the documented default for the CUSTOMER's
 # own endpoint. This harness never binds it -- every suite is passed an explicit

@@ -37,10 +37,41 @@ ck() { if [ "$1" = 0 ]; then PASS=$((PASS+1)); printf "[ok] %s\n" "$2";
        else FAIL=$((FAIL+1)); printf "[FAIL] %s\n" "$2"; fi; }
 # See cross_language_drill.sh: `kill ${VAR:-0}` becomes `kill 0` when unset,
 # which signals the whole process group including the calling shell.
+# BUG-0068: RELEASE the port, do not merely ask for it back.
+#
+# This cleanup used to `kill` and return, so the drill exited while its tier was
+# still shutting down and still holding the port. The next user of it -- this
+# drill on the next gate run, or the cross-language drill later in the same one
+# -- then refused to start, CORRECTLY, against a port that was about to be free.
+# The refusal is not the bug and must not be softened; a cleanup that returns
+# before the thing it asked for has happened is (BUG-0061's shape).
+#
+# TERM, wait, then KILL, then wait again: a tier that ignores the polite signal
+# must not leak either, and the port going quiet is the proof rather than the
+# pid going away -- a dying process can hold a listening socket briefly after
+# it stops being schedulable.
+_port_free() {   # port -> 0 when NOTHING is listening
+  ! (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null
+}
+_release_port() {  # port, budget-ms
+  local p="$1" budget="${2:-8000}" waited=0
+  while [ "$waited" -lt "$budget" ]; do
+    _port_free "$p" && return 0
+    sleep 0.1; waited=$((waited + 100))
+  done
+  return 1
+}
+
 cleanup() {
   [ -n "${A:-}" ] && kill "$A" 2>/dev/null
   [ -n "${B:-}" ] && kill "$B" 2>/dev/null
   [ -n "${TIER_PID:-}" ] && kill "$TIER_PID" 2>/dev/null
+  # and WAIT for the port, escalating if the polite signal is ignored.
+  if [ -n "${TIER_PID:-}" ] && ! _release_port "$TIER_PORT" 4000; then
+    kill -9 "$TIER_PID" 2>/dev/null
+    _release_port "$TIER_PORT" 4000 \
+      || echo "WARN: port $TIER_PORT still held after SIGKILL" >&2
+  fi
   return 0
 }
 trap cleanup EXIT

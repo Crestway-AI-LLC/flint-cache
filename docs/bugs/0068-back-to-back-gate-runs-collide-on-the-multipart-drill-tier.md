@@ -1,4 +1,4 @@
-# BUG-0068 — back-to-back gate runs collide on the multipart drill's tier (OPEN, undiagnosed)
+# BUG-0068 — back-to-back gate runs collide on the multipart drill's tier
 
 **Component:** `s3-accelerator`, `tools/gate.sh` + `tools/multipart_etag_drill.sh`
 **Observed:** 2026-08-27, once. **Cause not established** — this file is
@@ -100,4 +100,38 @@ defect in the code under test, look at what else is running on the box. Two
 different stages failed two different ways in one afternoon on a machine that
 was quietly a core short, and both looked like product regressions. `uptime`
 and a CPU sort cost seconds; the first of these cost considerably more.
+
+## Diagnosed and fixed, 2026-08-27
+
+**Both drills that own port 9400 released it by not waiting.** Their EXIT traps
+did `kill "$TIER_PID"` and returned — SIGTERM sent, nothing waited for. So the
+drill exited while its tier was still shutting down and still holding the port,
+and the next user of 9400 refused to start against a port that was about to be
+free.
+
+The refusal was never the bug and has not been softened: a drill that adopts a
+tier it did not start is the failure mode the refusal exists to prevent. **The
+cleanup was the bug**, and it is BUG-0061's shape exactly — a cleanup that
+returns before the thing it asked for has happened. The earlier version of this
+file guessed that, under "if it recurs"; it did not need to recur.
+
+**The fix, in both drills:** TERM, wait for the port to go quiet, escalate to
+KILL, wait again, and warn if it is still held. **The port going quiet is the
+proof, not the pid going away** — a dying process can hold a listening socket
+briefly after it stops being schedulable, which is precisely the window that
+produced this.
+
+**Armed** with a standalone test before shipping: the helper observes a real
+release in 23 ms, and — the half that matters — **times out on a port that stays
+held**. Without that negative control a helper that always returned success
+would have looked like a fix.
+
+**Verified** by running the two engine arms back to back, the sequence that
+produced the original failure, with 9400 sampled between them: free, both arms
+green.
+
+**What is not claimed.** The pegged core recorded above made this window easier
+to lose, and both are now gone, so this run does not separate the two causes.
+The cleanup defect is real and was fixed on its own evidence — reading the code
+— rather than on the run passing.
 

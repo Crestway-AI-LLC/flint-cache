@@ -52,6 +52,10 @@ public final class Constants {
 JAVA
 
 # our shim, packaged alone as it would actually ship
+RC=0
+ck2() { if [ "$1" = 0 ]; then printf "[ok] %s\n" "$2";
+        else RC=1; printf "[FAIL] %s\n" "$2"; fi; }
+
 mkdir -p "$W/ours"
 cp -r target/classes/software "$W/ours/"
 (cd "$W/ours" && jar cf "$W/ours.jar" .)
@@ -91,4 +95,55 @@ public class G {
 }
 JAVA
 javac -cp "target/classes:$CP" -d "$W/g" "$W/G.java"
-java -cp "$W/g:$W/tc:$CP" G "$W/ours.jar" "$W/vendor.jar" "$W/bad.jar"
+java -cp "$W/g:$W/tc:$CP" G "$W/ours.jar" "$W/vendor.jar" "$W/bad.jar" || RC=1
+
+# ---- fs.s3a.flint.shim.failfast, end to end -------------------------------
+#
+# BUG-0066's family: the flag was READ, but nothing demonstrated it was read
+# FROM THE CONFIGURATION. It steers a branch only a JVM with two copies of the
+# shim can enter, so it could not be probed in-process -- and "the decision
+# function respects its argument" is not the same claim as "serviceInit passes
+# the setting to it".
+#
+# This harness already builds the collision, so put the real factory under it:
+# with both shim jars on the APP classpath, FlintStreamFactory's own loader
+# sees two copies, and serviceInit takes the branch for real.
+cat > "$W/F.java" <<'JAVA'
+import org.apache.hadoop.conf.Configuration;
+import ai.crestway.flintaccel.s3a.FlintStreamFactory;
+public class F {
+  public static void main(String[] a) {
+    boolean failFast = Boolean.parseBoolean(a[0]);
+    Configuration c = new Configuration();
+    c.setBoolean(FlintStreamFactory.SHIM_FAIL_FAST, failFast);
+    try {
+      new FlintStreamFactory().init(c);
+      System.out.println("PROCEEDED");
+    } catch (Throwable t) {
+      String m = String.valueOf(t.getMessage());
+      // Only OUR refusal counts. Anything else is a broken fixture reported as
+      // a pass, which is the shape this whole file exists to refuse.
+      System.out.println(m.contains("flint-accel") ? "REFUSED" : "OTHER: " + t);
+    }
+  }
+}
+JAVA
+javac -cp "target/classes:$CP" -d "$W/g" "$W/F.java"
+COLLIDE="$W/g:$W/tc:$W/ours.jar:$W/vendor.jar:$CP"
+SINGLE="$W/g:$W/tc:$W/ours.jar:$CP"
+
+OUT=$(java -cp "$COLLIDE" F true 2>/dev/null | tail -1)
+[ "$OUT" = "REFUSED" ]
+ck2 $? "shim.failfast=true on a COLLIDING classpath refuses to start ($OUT)"
+
+OUT=$(java -cp "$COLLIDE" F false 2>/dev/null | tail -1)
+[ "$OUT" = "PROCEEDED" ]
+ck2 $? "shim.failfast=false on the SAME classpath proceeds ($OUT) -- so the "\
+"setting is read from the Configuration, not merely declared"
+
+# Without this the pair above passes on a build that always refuses.
+OUT=$(java -cp "$SINGLE" F true 2>/dev/null | tail -1)
+[ "$OUT" = "PROCEEDED" ]
+ck2 $? "control -- failfast=true on a HEALTHY classpath still starts ($OUT)"
+
+exit ${RC:-0}

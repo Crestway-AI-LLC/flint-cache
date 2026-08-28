@@ -68,6 +68,17 @@ public final class FlintStreamFactory extends AbstractObjectInputStreamFactory {
   public static volatile boolean CONSTRUCTED = false;
   public static volatile Configuration INIT_CONF = null;
 
+  /**
+   * The most recently BOUND factory, so a suite can inspect what a
+   * Configuration actually produced.
+   *
+   * <p>Same purpose as {@code CONSTRUCTED} and {@code INIT_CONF} above: S3A
+   * builds this class and hands back a FileSystem, so a test that only holds
+   * the FileSystem cannot see whether a setting reached the client. BUG-0066
+   * is what happens when nothing can see that.
+   */
+  public static volatile FlintStreamFactory LAST_BOUND = null;
+
   /** Config keys, all under our own prefix so S3A never has to know them. */
   public static final String TIER_URI      = "fs.s3a.flint.tier.uri";
   public static final String CHUNK_BYTES   = "fs.s3a.flint.chunk.bytes";
@@ -198,6 +209,7 @@ public final class FlintStreamFactory extends AbstractObjectInputStreamFactory {
     // is what this path did until now, on the very route the preflight script
     // recommends first. The default-safe behaviour was implemented on two of
     // three paths and absent from the one most customers will use.
+    LAST_BOUND = this;
     boolean cacheKms = conf.getBoolean(CACHE_SSE_KMS, false);
     // READ EVERY KEY THIS CLASS DECLARES.
     //
