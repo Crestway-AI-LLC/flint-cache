@@ -45,6 +45,27 @@ pub enum EventKind {
     /// A fresh node seeded itself from the latest snapshot after whole-pair
     /// loss and asserted mastership in a bumped generation.
     SpareRestored,
+    /// A master began REFUSING writes because live replicas fell below
+    /// `--min-replicas-to-write`. This is the client-visible write outage
+    /// STARTING, and it is not the same instant as `Promoted`: a freshly
+    /// promoted master has no replicas yet, so the gate shuts as a
+    /// consequence of the promotion rather than at it.
+    WriteQuorumLost,
+    /// The same master admitted a write again — the outage ENDING. Paired
+    /// with `WriteQuorumLost` these bracket the whole refusal window on the
+    /// node that did the refusing, which is the only place it is exactly
+    /// observable; everything else measures it through a client.
+    WriteQuorumRestored,
+    /// A replica began rejoining (process up, catch-up not yet chosen).
+    /// Bounds restart latency, which nothing else in the journal did — the
+    /// window between `Promoted` and `Supervised` was previously silent, so
+    /// a 9.9 s recovery could not be split into boot, decision and catch-up.
+    RejoinStarted,
+    /// A replica chose HOW to catch up. `cause` carries which path and from
+    /// where: rewound-and-tail, full re-seed, or warm rejoin. The expensive
+    /// branch is a full re-seed, and knowing which one ran is the difference
+    /// between tuning the probe and tuning the transfer.
+    RejoinDecided,
     /// A controller observed a pair converged for the first time in its
     /// process lifetime: the degraded-window gate is open and auto-failover
     /// is ARMED for that pair. Tooling that (re)starts controllers waits

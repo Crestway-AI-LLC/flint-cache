@@ -66,6 +66,12 @@ pub struct ReplHub {
     /// Shed writes once the master is this many sequences ahead of its
     /// SLOWEST live replica (ADR-0022). 0 disables the gate.
     wal_headroom_shed_seq: AtomicU64,
+    /// Latch for the write-quorum gate's LAST observed state, so a
+    /// transition can be journaled once instead of on every refused write.
+    /// `true` = currently refusing. Starts `false`: a master that never had
+    /// a replica should announce losing quorum the first time it matters,
+    /// not stay silent because it was always below.
+    quorum_below: std::sync::atomic::AtomicBool,
     next_id: AtomicU64,
     /// Newest ack timestamp from ANY replica, ever, this process-life.
     /// Deliberately separate from `replicas`, which drops an entry on
@@ -103,6 +109,7 @@ impl ReplHub {
             min_replicas_to_write: AtomicU32::new(min_replicas_to_write),
             widowed_grace_ms: AtomicU64::new(DEFAULT_WIDOWED_GRACE_MS),
             wal_headroom_shed_seq: AtomicU64::new(DEFAULT_WAL_HEADROOM_SHED_SEQ),
+            quorum_below: std::sync::atomic::AtomicBool::new(false),
             next_id: AtomicU64::new(1),
             last_ack_ms: AtomicU64::new(0),
             widow_since_ms: AtomicU64::new(0),
@@ -233,6 +240,22 @@ impl ReplHub {
     /// "converged": a respawned replica lifts the gate as soon as it starts
     /// acking, so the unavailability window after losing a replica is
     /// detect + respawn + first ack, not a full resync.
+    /// Report the gate's current state and return `Some(now_below)` ONLY when
+    /// it changed, so the caller journals a transition rather than a stream.
+    ///
+    /// This exists because the write outage is exactly observable here and
+    /// nowhere else. `Promoted` is not its start (a promoted master shuts the
+    /// gate as a consequence, moments later) and `Supervised` is not its end
+    /// (that is a controller OBSERVING convergence, on its own poll cadence).
+    /// Bracketing it on the node that does the refusing is what makes an RTO
+    /// number attributable instead of inferred from a client's stall.
+    pub fn note_quorum_transition(&self, below: bool) -> Option<bool> {
+        let prev = self
+            .quorum_below
+            .swap(below, std::sync::atomic::Ordering::Relaxed);
+        (prev != below).then_some(below)
+    }
+
     pub fn below_write_quorum(&self, now_ms: u64) -> bool {
         let min = self.min_replicas_to_write();
         min > 0 && (self.live_replica_count(now_ms) as u32) < min
@@ -749,5 +772,56 @@ mod cap_tests {
         let b = two.register_replica();
         two.record_ack(b, 5, 1_002);
         assert!(!two.below_write_quorum(1_003));
+    }
+}
+
+#[cfg(test)]
+mod quorum_transition_tests {
+    use super::ReplHub;
+
+    fn hub(min: u32) -> ReplHub {
+        ReplHub::new(0, 0, min)
+    }
+
+    /// Edges only. Inside one outage the gate is consulted on every write —
+    /// thousands of times — and journaling each would bury the two instants
+    /// that actually bound it.
+    #[test]
+    fn only_the_change_is_reported() {
+        let h = hub(1);
+        assert_eq!(h.note_quorum_transition(true), Some(true), "first loss");
+        assert_eq!(h.note_quorum_transition(true), None, "still below");
+        assert_eq!(h.note_quorum_transition(true), None, "still below");
+        assert_eq!(h.note_quorum_transition(false), Some(false), "restored");
+        assert_eq!(h.note_quorum_transition(false), None, "still fine");
+        assert_eq!(h.note_quorum_transition(true), Some(true), "lost again");
+    }
+
+    /// A healthy master must not announce a RESTORE it never lost. The latch
+    /// starts "not below", so the steady state emits nothing — otherwise every
+    /// node would journal a recovery on its first write and the timeline would
+    /// show an outage that never happened.
+    #[test]
+    fn a_healthy_master_says_nothing() {
+        let h = hub(1);
+        for _ in 0..100 {
+            assert_eq!(
+                h.note_quorum_transition(false),
+                None,
+                "a master that never lost quorum must stay silent"
+            );
+        }
+    }
+
+    /// The latch is state, not a predicate: it must not be confused with
+    /// `below_write_quorum`, which is recomputed per write. Asking twice with
+    /// the same answer is not an event even though the underlying condition
+    /// is continuously true.
+    #[test]
+    fn the_latch_is_not_the_condition() {
+        let h = hub(2);
+        assert_eq!(h.note_quorum_transition(true), Some(true));
+        // The condition is still true here; the EVENT is not.
+        assert_eq!(h.note_quorum_transition(true), None);
     }
 }

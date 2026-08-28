@@ -605,9 +605,23 @@ fn try_rewind(data_dir: &std::path::Path, snaps_dir: &str, target: &str) -> bool
              instead of a full re-seed",
             path.display()
         );
+        // The journal, not only stderr. Seat logs are per-host, untimestamped
+        // and discarded on a passing run; this row is what lets the window
+        // between promotion and writes-resuming be split into boot, decision
+        // and catch-up instead of being one silent 9.9 s.
+        journal_event(
+            flint_journal::EventKind::RejoinDecided,
+            Some(epoch.to_string()),
+            &format!("rewound to seq {seq} (fence {bound}): tailing incrementally"),
+        );
         return true;
     }
     eprintln!("rewind: no snapshot at or before the fence; full re-seed");
+    journal_event(
+        flint_journal::EventKind::RejoinDecided,
+        None,
+        "no snapshot at or before the fence: full re-seed",
+    );
     false
 }
 
@@ -1183,8 +1197,23 @@ static SELF_ADDR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 /// hot-reload's new leaf is reflected.
 static CERT_PATH: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
 
+/// Set once, the first time an event is dropped for want of a journal target.
+/// A no-op instrument is the failure mode every diagnostic in this tree has
+/// been bitten by: it reports nothing and reads as nothing happening. Emitting
+/// to stderr once (not per event) makes the drop visible without turning a
+/// misconfigured node into a log flood.
+static JOURNAL_DROP_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 fn journal_event(kind: flint_journal::EventKind, epoch: Option<String>, cause: &str) {
     let Some(Some(target)) = JOURNAL_TARGET.get().cloned() else {
+        if !JOURNAL_DROP_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            eprintln!(
+                "journal: no --journal target yet; dropping {kind:?} and any \
+                 further events until one is set. Timeline gaps downstream are \
+                 THIS, not an absence of the events."
+            );
+        }
         return;
     };
     let me = SELF_ADDR.get().cloned().unwrap_or_default();
@@ -1381,6 +1410,17 @@ fn main() -> std::io::Result<()> {
             // narrow — silently turning ordinary restarts into full syncs
             // would be a far worse bug than the one this fixes.
             let dir_path = std::path::Path::new(&dir).to_path_buf();
+            // The start of the rejoin, and the only marker that separates BOOT
+            // from the catch-up that follows it. Without it the window between
+            // a promotion and writes resuming is one number; with it, restart
+            // latency, the rewind decision and the tail are three.
+            if replica_of.is_some() {
+                journal_event(
+                    flint_journal::EventKind::RejoinStarted,
+                    None,
+                    "replica process up; choosing a catch-up path",
+                );
+            }
             let reseed = dir_path.join(NEEDS_RESEED).exists();
             let mut rewound = false;
             if reseed {
@@ -1421,6 +1461,11 @@ fn main() -> std::io::Result<()> {
                                         "marked copy verified against the lineage held by \
                                          {target}: warm rejoin at seq {cursor} (epoch {})",
                                         claim.epoch
+                                    );
+                                    journal_event(
+                                        flint_journal::EventKind::RejoinDecided,
+                                        Some(format!("{:?}", claim.epoch)),
+                                        &format!("warm rejoin at seq {cursor}"),
                                     );
                                     warm = true;
                                 }
@@ -3202,7 +3247,29 @@ fn admit_write_path(
     // are most at risk (isolated master, dead pair peer).
     if work.write && !ro {
         let now = flint_storage::strings::system_clock();
-        if hub.below_write_quorum(now) {
+        let below = hub.below_write_quorum(now);
+        // EDGES ONLY. A refused write happens thousands of times inside one
+        // outage; the two instants that BOUND it happen once each, and they are
+        // what an RTO number decomposes into. Emitted here rather than at
+        // `Promoted` or `Supervised` because neither of those is the outage: the
+        // gate shuts as a CONSEQUENCE of a promotion, moments after it, and
+        // `Supervised` is a controller OBSERVING convergence on its own poll
+        // cadence, well after writes resumed. Between those two the journal was
+        // silent, which is why a 9.9 s recovery could not be attributed.
+        if let Some(now_below) = hub.note_quorum_transition(below) {
+            let live = hub.live_replica_count(now);
+            let min = hub.min_replicas_to_write();
+            journal_event(
+                if now_below {
+                    flint_journal::EventKind::WriteQuorumLost
+                } else {
+                    flint_journal::EventKind::WriteQuorumRestored
+                },
+                None,
+                &format!("live replicas {live}, min-replicas-to-write {min}"),
+            );
+        }
+        if below {
             WRITES_SHED_QUORUM.fetch_add(1, Ordering::Relaxed);
             return Some(Value::Error(
                 "THROTTLED live replicas below min-replicas-to-write, retry with backoff".into(),
