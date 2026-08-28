@@ -196,7 +196,14 @@ class Counters:
                  # anyway: the claim under test is that THIS CLIENT batches its
                  # fills, so the client is where it should be counted. Portable
                  # across any tier, and direct rather than inferred.
-                 "tier_ops", "tier_reads", "tier_writes")
+                 "tier_ops", "tier_reads", "tier_writes",
+                 # The tier said "I am FULL", not "I am broken". Flint sheds
+                 # writes with -QUOTA and KEEPS SERVING READS, so folding that
+                 # into tier_failures conflates a healthy full tier with a sick
+                 # one -- the same conflation oversize_bypassed exists to
+                 # prevent, and the one _guard's docstring already forbids for
+                 # slow-vs-broken.
+                 "tier_full")
 
     def __init__(self):
         for s in self.__slots__:
@@ -285,6 +292,17 @@ class FlintTier:
         try:
             return fn(*a, **kw)
         except redis_lib.TimeoutError:
+            return None
+        except redis_lib.ResponseError as e:
+            # -QUOTA is an ANSWER, not a fault: the server is alive, reachable
+            # and still serving reads, and it is telling us the namespace is
+            # full. A full never-evict tier is a deliberate configuration, so
+            # reporting it as breakage would send an operator looking for a
+            # broken tier that is working exactly as they configured it.
+            if str(e).startswith("QUOTA"):
+                self.c.tier_full += 1
+                return None
+            self.c.tier_failures += 1
             return None
         except Exception:
             self.c.tier_failures += 1

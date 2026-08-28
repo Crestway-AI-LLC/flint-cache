@@ -174,6 +174,14 @@ public final class FlintObjectClient implements ObjectClient {
    *  (D17.5). Separate from oversizeBypassed: one says the object was refused,
    *  the other says this read was, and an operator needs to tell them apart. */
   public final AtomicLong oversizePartBypassed = new AtomicLong();
+  /** Tier calls the server REFUSED because the namespace is full (-QUOTA).
+   *  Deliberately not tierFailures: Flint sheds writes with -QUOTA while
+   *  continuing to serve reads, so a full never-evict tier is a healthy tier
+   *  in a configuration someone chose. Counting it as breakage sends an
+   *  operator hunting a fault that is not there, and hides the one signal that
+   *  would tell them to add capacity or enable eviction. Same reasoning as
+   *  oversizeBypassed, applied to a refusal that arrives from the server. */
+  public final AtomicLong tierFull = new AtomicLong();
 
   /**
    * A breaker, because a SICK tier is worse than no tier.
@@ -458,16 +466,51 @@ public final class FlintObjectClient implements ObjectClient {
     try {
       f = op.get();
     } catch (RuntimeException e) {      // already-dead connection throws inline
-      tierFailures.incrementAndGet();
-      tierFailed();
+      if (!countTierError(e)) tierFailed();
       return CompletableFuture.completedFuture(null);
     }
     return f.orTimeout(tierBudgetMs, TimeUnit.MILLISECONDS)
         .handle((v, err) -> {
-          if (err != null) { tierFailures.incrementAndGet(); tierFailed(); return null; }
+          if (err != null) {
+            // A -QUOTA reply PROVES the tier is alive and answering, so it must
+            // not trip the breaker: opening the breaker on a full tier would
+            // abandon a read cache that is still serving perfectly. It does not
+            // reset the breaker either -- it is an answer, not a success.
+            if (!countTierError(err)) tierFailed();
+            return null;
+          }
           tierWorked();
           return v;
         });
+  }
+
+  /**
+   * Count a tier error, telling "full" apart from "broken".
+   *
+   * <p>Returns true when the tier REFUSED rather than failed, which the caller
+   * must not treat as evidence the tier is sick. It lives here, at the single
+   * point where an error becomes a number, rather than at any one of the five
+   * call sites -- the first version of this change classified inside
+   * {@code guarded()} alone, which wraps only the two READ calls, and -QUOTA
+   * arrives exclusively on a write. The rule has to sit where the next error
+   * site will be written, not where the last one was fixed.
+   */
+  private boolean countTierError(Throwable e) {
+    if (isFull(e)) { tierFull.incrementAndGet(); return true; }
+    tierFailures.incrementAndGet();
+    return false;
+  }
+
+  /** Whether a tier error is the server saying "full" rather than failing.
+   *  Walks the cause chain: the async path hands us a CompletionException
+   *  whose own message is the wrapped class name followed by the error, so
+   *  only the cause itself starts with the marker. */
+  private static boolean isFull(Throwable t) {
+    for (Throwable c = t; c != null && c != c.getCause(); c = c.getCause()) {
+      String m = c.getMessage();
+      if (m != null && m.startsWith("QUOTA")) return true;
+    }
+    return false;
   }
 
   /** Fills must respect the breaker too, or a sick tier still gets written to. */
@@ -546,7 +589,7 @@ public final class FlintObjectClient implements ObjectClient {
           try {
             tier.setex(metaKey(r.getS3Uri()), ttlFor(),
                 utf8(m.getContentLength() + "|" + m.getEtag() + "|" + (kms ? "1" : "0")));
-          } catch (RuntimeException e) { tierFailures.incrementAndGet(); }
+          } catch (RuntimeException e) { countTierError(e); }
           return m;
         })
         .exceptionallyCompose(e -> {
@@ -728,13 +771,13 @@ public final class FlintObjectClient implements ObjectClient {
                 .orTimeout(tierBudgetMs, TimeUnit.MILLISECONDS);
           }
         } catch (RuntimeException e) {
-          tierFailures.incrementAndGet();
+          countTierError(e);
         }
         if (written == null) {
           release.run();
         } else {
           written.whenComplete((v, e) -> {
-            if (e != null) tierFailures.incrementAndGet();
+            if (e != null) countTierError(e);
             release.run();
           });
         }
@@ -822,7 +865,7 @@ public final class FlintObjectClient implements ObjectClient {
     try {
       tier.del(metaKey(s3Uri));
     } catch (RuntimeException e) {
-      tierFailures.incrementAndGet();
+      countTierError(e);
     }
   }
 

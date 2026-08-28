@@ -280,12 +280,14 @@ is tested against a tier that loses everything mid-read and against one that
 loses half of an object's chunks; both refill byte-identically with zero
 integrity failures. Set whatever `maxmemory-policy` the workload wants.
 
-**One thing the client cannot see, stated plainly.** A tier that refuses a write
-because it is *full* is indistinguishable, from here, from a tier that is
-*broken*: both become "no cache" and the read goes to the origin. A full
-never-evict tier therefore degrades silently and correctly, but it does not
-announce itself, and no client counter will tell you which of the two you have.
-Watch the tier's own memory metrics for that.
+**Telling "full" apart from "broken".** A tier that refuses a write because the
+namespace is full answers `-QUOTA`, and Flint keeps serving *reads* while it
+does — that is a healthy tier in a configuration someone chose, not a fault. So
+the client counts it as **`TierFull`** and deliberately not as `TierFailures`,
+and it does **not** open the circuit breaker: opening it would throw away a read
+cache that is still working perfectly. A steady `TierFull` with `TierFailures`
+at zero is the signature of a full never-evict tier — add capacity, or turn
+eviction on. (`tier_full` in the Python client.)
 
 ## Is it working?
 

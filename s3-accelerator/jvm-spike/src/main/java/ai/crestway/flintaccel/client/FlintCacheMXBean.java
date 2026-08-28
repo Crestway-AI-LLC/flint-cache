@@ -60,6 +60,20 @@ public interface FlintCacheMXBean {
    *  and those must be distinguishable from a cache that is merely missing. */
   long getOversizeBypassed();
 
+  /** Reads that skipped the cache because the PART exceeded
+   *  flint.max.part.bytes (D17.5). Distinct from getOversizeBypassed(): one
+   *  says the OBJECT was refused, this says this READ was, and an operator
+   *  tuning the cap needs to tell them apart. */
+  long getOversizePartBypassed();
+
+  /** Tier calls the server refused because the namespace is FULL (-QUOTA).
+   *  Deliberately not getTierFailures(): Flint sheds writes with -QUOTA while
+   *  still serving reads, so this is a healthy tier in a configuration someone
+   *  chose. Steady and non-zero with getTierFailures() at zero is the exact
+   *  signature of a full never-evict tier -- add capacity, or enable eviction.
+   *  It does not open the breaker. */
+  long getTierFull();
+
   /** Objects whose encryption could not be determined, and were cached anyway.
    *  The exact size of the hole in the SSE-KMS guarantee. */
   long getSseKmsUndetectable();
@@ -78,6 +92,18 @@ public interface FlintCacheMXBean {
 
   /** Reads that fell back to S3 because the tier was unusable. */
   long getDegradedReads();
+
+  /** Metadata lookups that missed and cost a HEAD. Pairs with
+   *  getMetadataHits(); without it a metadata hit rate cannot be computed. */
+  long getMetadataMisses();
+
+  /** Reads that deliberately skipped the cache entirely (bypass mode, SSE-C).
+   *  Not a miss and not a failure -- work the cache was never asked to do. */
+  long getBypassed();
+
+  /** Reads that took the single-flight claim and did the fetch. The partner of
+   *  getSingleFlightJoins(): claims plus joins is the population D5 divides. */
+  long getSingleFlightClaims();
 
   /** Cached chunks rejected because they were not what they claimed to be
    *  (D14). Non-zero means the tier is corrupting or misplacing data. */

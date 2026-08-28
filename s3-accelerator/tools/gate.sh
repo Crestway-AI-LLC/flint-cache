@@ -294,6 +294,14 @@ verdict "slow-tier proxy self-test (4 checks)" $?
 run_bounded python3 "$ROOT/tools/narrow_tier.py" --self-test >/tmp/gate_narrowtier.log 2>&1
 verdict "narrow-tier proxy self-test (4 checks)" $?
 
+# The third fixture tier, and the only one that is HEALTHY while refusing: a
+# full never-evict namespace answers -QUOTA on writes and serves reads. Its
+# self-test carries the same arming control as the other two -- a stub that
+# answered +OK to everything would make the counter split it exists to prove
+# pass for the wrong reason.
+run_bounded python3 "$ROOT/tools/quota_tier.py" --self-test >/tmp/gate_quotatier.log 2>&1
+verdict "quota-tier fixture self-test (6 checks)" $?
+
 bash tools/shim_guard_test.sh >/tmp/gate_shim.log 2>&1
 verdict "shim guard + failfast end to end (8 checks)" $?
 
@@ -411,6 +419,22 @@ run_suite "connection sharing (8 checks)" ai.crestway.flintaccel.client.TierShar
 # gate ever evicted anything. The correctness argument existed and had never
 # been executed.
 run_suite "reads survive eviction (11 checks)" ai.crestway.flintaccel.client.EvictionSuite 9315 "$ROOT/jvm-spike/target/classes:$CP"
+# A tier that is FULL rather than broken. The fixture must be RUNNING for this
+# one -- it is the subject, not a proxy in front of the harness tier -- so it is
+# started here and stopped straight after rather than left up for later stages.
+python3 "$ROOT/tools/quota_tier.py" --listen 9316 >/tmp/gate_quotatier_srv.log 2>&1 &
+QUOTA_PID=$!
+for _ in $(seq 1 50); do
+  python3 - <<'UP' && break
+import socket,sys
+s=socket.socket()
+s.settimeout(0.2)
+sys.exit(0 if s.connect_ex(("127.0.0.1",9316))==0 else 1)
+UP
+  sleep 0.1
+done
+run_suite "a full tier is not a broken one (11 checks)" ai.crestway.flintaccel.client.TierFullSuite 9317 "$ROOT/jvm-spike/target/classes:$CP"
+kill "$QUOTA_PID" 2>/dev/null; wait "$QUOTA_PID" 2>/dev/null
 
 # BUG-0066/BUG-0067: every config key path 1 DECLARES must be one somebody has
 # shown to do something. Reflection finds the keys, so adding a constant without
@@ -556,7 +580,7 @@ if [ -x "$PYENV/bin/python" ]; then
   "$TIER_CLI" -p "$TIER_PORT" flushall >/dev/null 2>&1
   ( cd python && run_bounded "$PYENV/bin/python" suite.py \
       http://127.0.0.1:9401 redis://127.0.0.1:$TIER_PORT ) >/tmp/gate_python.log 2>&1
-  verdict "python suite (45 checks)" $?
+  verdict "python suite (51 checks)" $?
   stop_origin
 
   # fsspec's own abstract suite, against MOTO rather than counting_s3.

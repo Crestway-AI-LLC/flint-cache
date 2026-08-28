@@ -67,12 +67,17 @@ public final class FlintCacheMetrics implements FlintCacheMXBean {
   @Override public long getSingleFlightJoins()  { return c.joined.get(); }
   @Override public long getSseKmsBypassed()     { return c.kmsBypassed.get(); }
   @Override public long getOversizeBypassed()   { return c.oversizeBypassed.get(); }
+  @Override public long getOversizePartBypassed() { return c.oversizePartBypassed.get(); }
+  @Override public long getTierFull()           { return c.tierFull.get(); }
   @Override public long getSseKmsUndetectable() { return c.kmsUndetectable.get(); }
   @Override public boolean isBreakerOpen()      { return c.isBreakerOpen(); }
   @Override public long getBreakerOpens()       { return c.breakerOpens.get(); }
   @Override public long getBreakerSkips()       { return c.breakerSkips.get(); }
   @Override public long getTierFailures()       { return c.tierFailures.get(); }
   @Override public long getDegradedReads()      { return c.degraded.get(); }
+  @Override public long getMetadataMisses()     { return c.metaMisses.get(); }
+  @Override public long getBypassed()           { return c.bypassed.get(); }
+  @Override public long getSingleFlightClaims() { return c.claimed.get(); }
   @Override public long getIntegrityFailures()  { return c.integrityFailures.get(); }
 
   @Override

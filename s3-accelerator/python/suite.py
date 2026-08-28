@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
+import os
 import re
 import sys
 import threading
@@ -499,6 +501,57 @@ def main():
           "negative control: install() with no defaults CLEARS the previous ones "
           f"({cleared._tier_uri}) -- settings must not outlive the call")
     flint_accel.uninstall()   # leave the process as we found it
+
+    # -- a FULL tier is not a BROKEN tier ------------------------------------
+    #
+    # A never-evict tier that has filled up -- which is the DEFAULT
+    # configuration -- keeps serving reads and answers -QUOTA on writes. Every
+    # other tier in this suite is healthy, so that state had never been
+    # exercised once; and folding it into tier_failures would send an operator
+    # hunting a fault in a tier doing exactly what they configured it to do.
+    _spec = importlib.util.spec_from_file_location(
+        "quota_tier",
+        os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                     "tools", "quota_tier.py"))
+    _qt = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(_qt)
+    _qt.serve(9316)
+
+    def _read_through(uri):
+        # NOT new_fs(tier_uri=...): `so` already carries tier_uri, and new_fs
+        # merges its kwargs with it, so an override collides rather than
+        # overriding. Build from a copy instead, and register with `made` so
+        # settle() still sees this instance.
+        opts = dict(so)
+        opts["tier_uri"] = uri
+        f = flint_accel.FlintS3FileSystem(skip_instance_cache=True, **opts)
+        made.append(f)
+        with f.open(f"s3://bucket/{key}", "rb") as fh:
+            fh.seek(2048)
+            got = fh.read(8192)
+        f.drain(timeout=30)
+        return got, f.counters
+
+    want = expect(key, 2048, 8192)
+    full_bytes, full_c = _read_through("redis://127.0.0.1:9316")
+    check(full_bytes == want,
+          "a FULL tier still serves correct bytes -- the read falls through to S3")
+    check(full_c["tier_full"] > 0,
+          f"the refusal is COUNTED as full (tier_full={full_c['tier_full']})")
+    check(full_c["tier_failures"] == 0,
+          "and NOT as breakage -- a full tier must not read as a broken one "
+          f"(tier_failures={full_c['tier_failures']})")
+
+    # Control. Without it, a tier_full that is always non-zero and a
+    # tier_failures that is always zero would pass every check above.
+    dead_bytes, dead_c = _read_through("redis://127.0.0.1:9498")
+    check(dead_bytes == want, "a DEAD tier also serves correct bytes")
+    check(dead_c["tier_failures"] > 0,
+          f"control: a dead tier DOES register as broken "
+          f"(tier_failures={dead_c['tier_failures']})")
+    check(dead_c["tier_full"] == 0,
+          f"control: and does NOT register as full (tier_full={dead_c['tier_full']}) "
+          "-- the two counters really do discriminate")
 
     print("\nPYTHON SUITE " + ("PASSED" if OK[0] else "FAILED"))
     return 0 if OK[0] else 1

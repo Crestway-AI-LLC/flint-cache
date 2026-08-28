@@ -2,6 +2,9 @@
 package ai.crestway.flintaccel.client;
 
 import java.lang.management.ManagementFactory;
+import java.lang.reflect.Field;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.LinkedHashSet;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Set;
@@ -142,6 +145,68 @@ public final class MetricsSuite {
     check(ksum.contains("flint.cache.sse-kms=true"),
         "and the summary names the OPT-IN, so the reader has the next step and "
         + "not merely a diagnosis");
+
+    // -- COMPLETENESS: every counter the client keeps must be on the bean ----
+    //
+    // Spot-checking attributes cannot catch the failure that actually happened
+    // here: FIVE counters -- metaMisses, bypassed, claimed, oversizePartBypassed
+    // and (until it was added) tierFull -- existed on the client and were
+    // exposed nowhere, while the README told operators every counter is on JMX.
+    // Nothing failed, because nothing was looking at the population. So this
+    // reflects over the counters and requires each to be REACHABLE as an
+    // attribute; a new counter with no mapping FAILS rather than being silently
+    // invisible. Same registry discipline as ConfigReachSuite: unclassified is
+    // a failure, not a default.
+    Map<String, String> EXPOSED_AS = new HashMap<>();
+    EXPOSED_AS.put("chunkHits", "ChunkHits");
+    EXPOSED_AS.put("chunkMisses", "ChunkMisses");
+    EXPOSED_AS.put("metaHits", "MetadataHits");
+    EXPOSED_AS.put("metaMisses", "MetadataMisses");
+    EXPOSED_AS.put("originGets", "OriginGets");
+    EXPOSED_AS.put("originBytes", "OriginBytes");
+    EXPOSED_AS.put("tierFailures", "TierFailures");
+    EXPOSED_AS.put("tierFull", "TierFull");
+    EXPOSED_AS.put("degraded", "DegradedReads");
+    EXPOSED_AS.put("bypassed", "Bypassed");
+    EXPOSED_AS.put("claimed", "SingleFlightClaims");
+    EXPOSED_AS.put("joined", "SingleFlightJoins");
+    EXPOSED_AS.put("integrityFailures", "IntegrityFailures");
+    EXPOSED_AS.put("kmsBypassed", "SseKmsBypassed");
+    EXPOSED_AS.put("kmsUndetectable", "SseKmsUndetectable");
+    EXPOSED_AS.put("breakerOpens", "BreakerOpens");
+    EXPOSED_AS.put("breakerSkips", "BreakerSkips");
+    EXPOSED_AS.put("oversizeBypassed", "OversizeBypassed");
+    EXPOSED_AS.put("oversizePartBypassed", "OversizePartBypassed");
+
+    Set<String> counters = new LinkedHashSet<>();
+    for (Field f : FlintObjectClient.class.getFields()) {
+      if (f.getType() == AtomicLong.class) counters.add(f.getName());
+    }
+    check(counters.size() >= 19,
+        "reflection actually found the counters (" + counters.size() + ") -- a "
+        + "registry that reads zero fields passes vacuously");
+
+    StringBuilder unreachable = new StringBuilder();
+    for (String c : counters) {
+      String a = EXPOSED_AS.get(c);
+      if (a == null) { unreachable.append("\n         ").append(c)
+          .append(" -> NOT CLASSIFIED (add it to the bean, or to this map)"); continue; }
+      try {
+        attr(n, a);                      // throws if the attribute is absent
+      } catch (Exception e) {
+        unreachable.append("\n         ").append(c).append(" -> ").append(a)
+                   .append(" is not an attribute on the bean");
+      }
+    }
+    check(unreachable.length() == 0,
+        "every one of the " + counters.size() + " counters is readable over JMX"
+        + unreachable);
+
+    // ...and the check can fail: a name that is not on the bean must be caught.
+    boolean caughtAbsent = false;
+    try { attr(n, "NoSuchAttributeXyz"); } catch (Exception e) { caughtAbsent = true; }
+    check(caughtAbsent,
+        "armed: reading an absent attribute throws, so the loop above can fail");
 
     // -- teardown actually deregisters ---------------------------------------
     t.close();
