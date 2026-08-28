@@ -410,9 +410,17 @@ retraction and ADR-0032 for what supporting it would take.
   EC2 gives **1.9-2.3x warm** across four runs and **1.26-1.47x** on a cold JVM;
   an LLM-shaped sweep of one 1 GiB shard gives **5-7x** from the second epoch.
   Absolute times moved 24% between runs while the ratios held. One dataset, one
-  hardware shape, single-box Spark rather than a cluster. **Quote the range,
-  not a run** — every single-run figure we published was later found to be the
-  top of one.
+  hardware shape. **Quote the range, not a run** — every single-run figure we
+  published was later found to be the top of one.
+- **The first real cluster run agrees with the single-box range.** A two-worker
+  standalone cluster — driver on its own box, executors on two more — gives
+  **1.92x** over five queries, per-query **1.16–2.72x**, with the cached arm
+  growing the tier 259 → 20,440 keys and no plain arm adding one. That is a
+  single run, so it is a data point and not a range; what makes it worth stating
+  is *where* it lands. Every earlier Spark number was taken under `local[*]`,
+  where the driver and the executor are one JVM and the config-shipping path
+  never runs. Crossing that boundary for the first time moved the figure to the
+  bottom of the existing range rather than off it.
 - **One tier serves 64 concurrent readers** at 8.0 ms p99 per read, against
   0.29 ms at a single reader, with throughput flat near 9,000 reads/s from four
   readers on (ADR-0023 D17.6). Still an order of magnitude inside the 25-45 ms
