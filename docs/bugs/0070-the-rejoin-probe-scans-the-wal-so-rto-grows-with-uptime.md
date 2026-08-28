@@ -62,10 +62,25 @@ cheapness with failover slowness.
 The question is not how to make the scan faster. It is why a resumability check
 touches the WAL at all.
 
-**The master already publishes the answer.** FLINTINFO carries
-`wal_min_acked_seq` and `wal_headroom_seq` — the retained range's bounds, held
-as counters, no scan. "Is `cursor` inside the retained range" is a comparison
-against those. O(1), and independent of uptime.
+**Corrected 2026-08-28, before implementing: the fields I named are not WAL
+bounds.** `wal_min_acked_seq` is `hub.min_acked_live(now)` — the minimum acked
+sequence across LIVE REPLICAS — and `wal_headroom_seq` is likewise
+replica-derived. Neither describes what the WAL still retains, and the master
+does not publish its floor at all today. I proposed that fix from the fields'
+NAMES without reading what feeds them, which is the same error as reading a
+metric's label for its meaning.
+
+**What survives, and is better.** The cost is asymmetric in a way the fix can
+exploit: `get_updates_since(seq)` walks WAL files to find the one holding `seq`,
+so a HIGH cursor skips nearly every file while `get_updates_since(0)` matches
+the first file immediately. **The floor is cheap to obtain; only the high cursor
+is expensive.** So the master can answer a resumability question with two cheap
+values — the floor (first batch of a scan from 0) and `latest_sequence_number()`
+(already O(1), already used) — and the check becomes `floor <= cursor <=
+latest`, with no positioning at the cursor at all.
+
+That asymmetry is reasoned from the API's contract, not measured. The fix's own
+prediction below is the test.
 
 Three things make that safe rather than a shortcut:
 

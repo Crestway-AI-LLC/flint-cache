@@ -106,6 +106,31 @@ impl RocksKv {
         self.updates_since_budgeted(last_applied, usize::MAX)
     }
 
+    /// The retained WAL's bounds, as `(floor, latest)` — the cheap way to ask
+    /// whether a cursor is still resumable, without positioning at it.
+    ///
+    /// BUG-0070: `updates_since_budgeted(cursor, 1)` was being used as a
+    /// resumability PREDICATE by the rejoin probe, and its cost is not the byte
+    /// budget — it is `get_updates_since(cursor)` walking WAL files to find the
+    /// one holding `cursor`. Measured across one soak: 35 ms at cursor 149,795
+    /// rising to 4,985 ms at 10,329,665, roughly 500 ms per million sequences,
+    /// which made failover time a function of the master's UPTIME.
+    ///
+    /// The asymmetry this exploits: a scan from 0 matches the FIRST WAL file
+    /// immediately, so obtaining the floor is cheap while positioning at a high
+    /// cursor is not. `latest_sequence_number` is already O(1). So both bounds
+    /// are cheap and only the thing in between was expensive.
+    ///
+    /// Returns `None` when the WAL holds nothing to iterate — the caller must
+    /// treat that as "cannot say", not as "not resumable", because an empty
+    /// iterator is also what a freshly-opened or fully-caught-up master gives.
+    pub fn wal_bounds(&self) -> Option<(u64, u64)> {
+        let latest = self.db().latest_sequence_number();
+        let mut iter = self.db().get_updates_since(0).ok()?;
+        let (first_seq, _) = iter.next()?.ok()?;
+        Some((first_seq, latest))
+    }
+
     /// Like `updates_since`, but stops after the first batch that brings
     /// the accumulated op payload (key + value bytes) to `max_bytes`.
     /// Batches are never split, so the result is always applied/shipped
