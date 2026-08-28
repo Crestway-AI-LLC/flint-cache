@@ -30,6 +30,12 @@ would be a problem, you want a database as well.
 runs measure lower and are not the number to quote; crossing a network is the
 honest case.
 
+**That measurement is at `--min-replicas-to-write=0`, the default**, and the
+number does not survive raising it. Say the setting whenever the figure is
+quoted: the durability knob and the availability figure are the same tradeoff
+seen from two sides, and reporting one without the other reads as a promise
+that holds in a configuration where it does not.
+
 RTO here means what a *client* experiences — from the kill to the first write
 the client gets acknowledged — not the time for an internal probe to notice.
 Through the proxy edge a client typically sees no error at all, only one slow
@@ -39,6 +45,36 @@ write, because the proxy chases the promotion and retries underneath.
 packaging/aws/chaos-cluster/run.sh --hosts 5 --tag <tag>   # fleet repo, real hosts
 tools/controller_drill.sh                                  # locally, budget asserted
 ```
+
+### At `min-replicas-to-write >= 1`, RTO stops being a promotion time
+
+The section below separates failover from the recovery window on the grounds
+that *"failover ends when writes are served again"*. With the min-replicas gate
+on, those two stop being separable: a freshly promoted master has **zero** live
+replicas until the dead seat rejoins, and the gate refuses every write until
+then (`-THROTTLED live replicas below min-replicas-to-write`). The
+client-visible outage therefore runs to the end of the *rejoin*, which is the
+recovery window's work, not the promotion's.
+
+Measured on the same harness and the same 5-host shape, one flag apart:
+
+| `--min-replicas-to-write` | worst client write outage |
+|---|---|
+| `0` (default) | 694 ms |
+| `1` | 5,062 / 8,159 / 5,580 / 10,123 ms |
+
+Read that spread as "how long a rejoin takes" rather than as noise around a
+mean — it is the probe, any retry, the rewind, and tailing the WAL written
+since the snapshot. Clients are **refused**, not held: in the 10,123 ms case
+the worst single write waited 520 ms, so the gap is a refusal loop and a client
+without retry sees errors rather than one slow write.
+
+Two caveats on the right-hand column, because it is thinner evidence than the
+left. It is 4 kill cycles of one 60-minute soak on one fleet, not the 7
+promotions the headline rests on; and the last of the four **breached** the 10 s
+budget, which ended the run. **Whether the 10 s budget is intended to hold at
+`min-replicas >= 1` is an open question, not a settled promise** — nothing here
+should be read as having answered it. Tracked as OPS-0070 in the fleet repo.
 
 ## The recovery window — a SEPARATE promise from RTO
 
