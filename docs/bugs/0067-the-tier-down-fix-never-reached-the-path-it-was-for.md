@@ -92,8 +92,20 @@ the second half being what separates degrading from serving something stale. It
 passes, so the mid-job half of D12.9 was correct on path 1 all along; it was
 simply never asserted there.
 
-**Still open, separably:** whether `ResilienceSpike` should keep its own client
-at all. A spike that predates the product and is now gated as a product test is
-worth either pointing at `FlintObjectClient` or renaming so its four checks stop
-reading as coverage they do not provide.
+**Resolved:** `ResilienceSpike` is retired rather than rewired. Pointing it at
+`FlintObjectClient` would have produced a third copy of coverage that already
+exists — each of its four assertions has a stronger counterpart in the client
+suite, verified line by line before deleting:
+
+| ResilienceSpike, on its own client | client suite, on `FlintObjectClient` |
+|---|---|
+| healthy tier: cold and warm both correct | cold verifies against the oracle; warm is served from the tier |
+| TIER DOWN: reads still succeed and verify | readers joined in-flight SURVIVE the tier dying under them |
+| and they degrade FAST, not merely eventually | and they finish promptly, not eventually (bound = budget x 600) |
+| armed: the failures were actually OBSERVED | armed: the tier really did fail under them (`tierFailures > 0`) |
+
+The client suite also covers the joined-in-flight interaction, which the spike
+did not. Its one contribution not asserted anywhere else was prose — why
+resilience needs both `REJECT_COMMANDS` and a hard timeout — and that has moved
+to ADR-0023 D12.9, where the mechanism it explains is already described.
 

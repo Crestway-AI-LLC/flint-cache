@@ -386,12 +386,17 @@ run_suite "SSE-C bypass (5 checks)"    ai.crestway.flintaccel.s3a.SseCSuite  930
 # (ResilienceSpike) that the gate never ran, which is how a tier down at
 # submission time reached a real Spark job and failed it outright.
 run_suite "tier down at build + mid-job on path 1 (16 checks)" ai.crestway.flintaccel.client.TierDownSuite 9306 "$ROOT/jvm-spike/target/classes:$CP"
-# The other half of D12.9: a tier killed MID-JOB. This spike existed all along
-# and the gate never ran it, so nobody saw that it had been FAILING -- its
-# content expectation still computed md5("{key}:{block}") after the fixture
-# gained a generation field. It also kills the tier and now restarts it, which
-# start_svcs requires: it refuses to continue when the tier does not answer.
-run_suite "tier killed mid-job (4 checks)" ai.crestway.flintaccel.ResilienceSpike 9307 "$ROOT/jvm-spike/target/classes:$CP"
+# ResilienceSpike RETIRED here (BUG-0067). It was gated as "tier killed mid-job
+# (4 checks)" and did not use FlintObjectClient: it defined its own
+# ResilientObjectClient inside the spike file, so the stage proved a
+# reimplementation of the degradation logic survived a dead tier and said
+# nothing about the product. All four of its assertions have a stronger
+# counterpart in the client suite, against the real client -- reads correct
+# cold and warm, readers SURVIVE the tier dying, they finish promptly rather
+# than eventually, and tierFailures moved so the failure was observed -- and
+# that suite also covers the joined-in-flight interaction the spike did not.
+# A stage that reports coverage it does not have costs a slot AND the
+# confidence; that is how the mid-job gap on path 1 stayed invisible.
 # BUG-0057: identically configured mounts must share one stack. Under
 # fs.s3a.impl.disable.cache=true Hadoop builds a FileSystem per get() and Spark
 # never closes them, so this ran per READ -- measured at +4 threads each, +48

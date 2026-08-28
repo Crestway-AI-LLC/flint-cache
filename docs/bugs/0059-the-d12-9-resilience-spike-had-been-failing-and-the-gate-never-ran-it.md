@@ -99,3 +99,18 @@ been wrong, no change to `expected()` could have fixed it.
 - `flint-cache:docs/adr/0023-*.md` D12.9.
 - The family: a check that cannot fail is worth less than no check, because its
   silence reads as a pass. Here the check could fail, did fail, and was not read.
+
+## Resolution, 2026-08-27: the spike is gone
+
+`ResilienceSpike` has been deleted and its gate stage removed (BUG-0067).
+
+This write-up is kept because the finding stands and generalises: a suite the
+gate never ran had been failing, and the reason nobody saw it was that nothing
+ran it. What BUG-0067 added is the sharper version — once it WAS gated, it still
+proved nothing about the product, because it tested a client it had defined
+itself. **Running an untested suite is necessary and not sufficient; the suite
+also has to be pointed at the thing being shipped.**
+
+The property it was meant to defend is covered against the real client by the
+client suite, and on S3A path 1 by `TierDownSuite`.
+

@@ -150,11 +150,12 @@ public final class TierDownSuite {
     // green.
     //
     // Bind-time on path 1 is covered by ConfigReachSuite's dead-tier probe.
-    // What was untested ANYWHERE is a tier that dies MID-JOB on this path:
-    // ResilienceSpike looks like it covers that and does not, because it
-    // defines its own ResilientObjectClient rather than using the product's --
-    // so "tier killed mid-job" proves a stand-in degrades correctly, not that
-    // FlintObjectClient does.
+    // This is the MID-JOB half, and it was untested anywhere on this path. A
+    // spike named for the property looked like it covered it and did not: it
+    // defined its own ObjectClient rather than using the product's, so it
+    // proved a reimplementation degraded correctly. It has been deleted
+    // (BUG-0067); the client suite covers the same property against the real
+    // client, and this arm covers it through path 1.
     Configuration c = new Configuration();
     c.set("fs.s3a.endpoint", endpoint);
     c.set("fs.s3a.endpoint.region", "us-east-1");

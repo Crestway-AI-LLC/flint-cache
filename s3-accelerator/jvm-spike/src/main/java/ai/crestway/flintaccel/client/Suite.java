@@ -28,8 +28,11 @@ public final class Suite {
   static final HttpClient HTTP = HttpClient.newHttpClient();
   static String endpoint;
   /** Public so suites outside this package can drive the same tier the gate
-   *  owns. ResilienceSpike hardcoded 9399 while dialling whatever it was given,
-   *  which is the exact split this field exists to prevent. */
+   *  owns. A now-deleted spike hardcoded 9399 while dialling whatever port it
+   *  was given, so on any other port it killed nothing and every "reads survive
+   *  a dead tier" check passed against a tier that was never down. That split
+   *  between the port a suite KILLS and the port it USES is what this field
+   *  exists to prevent. */
   public static String redisUrl;
   static final String BUCKET = "bucket";
   static boolean ok = true;
