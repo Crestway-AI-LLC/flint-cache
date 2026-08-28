@@ -396,17 +396,40 @@ fn parse_wal_range(reply: &str) -> Option<(u64, u64)> {
 /// point of the change: what used to require the master to walk its WAL is a
 /// comparison.
 ///
-/// Both bounds are inclusive. `cursor > latest` is refused as well as
-/// `cursor < floor`: a cursor ahead of the master's tip is not resumable
-/// either, and treating it as resumable would hand the tailer a position the
-/// master can never reach.
+/// Only the FLOOR refuses. A cursor at or beyond `latest` is Resumable,
+/// because that is what the handshake this replaces answers.
+///
+/// I had this refusing `cursor > latest` on the reasoning that handing a tailer
+/// an unreachable position is a hang rather than an error. That reasoning is
+/// arguable; changing the verdict inside a PERFORMANCE fix is not.
+/// `updates_since_budgeted` opens with `if latest_sequence_number() <=
+/// last_applied { return Ok(Vec::new()) }` — an empty Ok, not a `WalGap` — and
+/// the handshake refuses only on `WalGap`, so an ahead-of-tip cursor has always
+/// been answered `FLINTSYNC-OK`. This path must say the same thing or the fix
+/// smuggles a semantic change under a latency change, which is the hardest kind
+/// to find later.
+///
+/// A replica whose cursor is AHEAD of its master is still alarming — it holds
+/// writes the master does not — so it is said out loud below rather than
+/// resolved here. Making it *behave* differently is a separate decision with
+/// its own justification, not a side effect of making the probe cheap.
 #[cfg(feature = "rocks")]
 fn wal_range_verdict(cursor: u64, floor: u64, latest: u64) -> ProbeVerdict {
-    if cursor >= floor && cursor <= latest {
+    if cursor > latest {
+        // Loud, because the two ways out of here are both lossy in ways nothing
+        // else distinguishes: resume and diverge silently, or re-seed and
+        // discard. Neither is chosen here; the operator gets told it happened.
+        eprintln!(
+            "rewind: cursor {cursor} is AHEAD of the master's tip {latest} — this replica \
+             holds writes the master does not. Resuming (the handshake's answer); the \
+             extra writes are not replicated and will not be"
+        );
+    }
+    if cursor >= floor {
         ProbeVerdict::Resumable
     } else {
         ProbeVerdict::Refused(format!(
-            "cursor {cursor} is outside the master's retained WAL [{floor}, {latest}]"
+            "cursor {cursor} is below the master's retained WAL floor {floor} (tip {latest})"
         ))
     }
 }
@@ -415,7 +438,24 @@ fn wal_range_verdict(cursor: u64, floor: u64, latest: u64) -> ProbeVerdict {
 ///
 /// `None` means this master cannot answer cheaply — an older build that does
 /// not know the verb, or a WAL with nothing to bound — and the caller falls
-/// back to the full FLINTSYNC handshake. That fallback is the pre-BUG-0070
+/// back to the full FLINTSYNC handshake.
+///
+/// TWO PROPERTIES WORTH KNOWING BEFORE DEBUGGING THIS AT 3AM.
+///
+/// **The answer is a claim about a moment, not a contemporaneous one.** The
+/// handshake's OK came from actually positioning; bounds are read and then
+/// acted on. If the floor rotates between the probe and the stream, a
+/// `Resumable` verdict is stale and FLINTSYNC then fails — most likely exactly
+/// when the master is busy enough to rotate quickly. That degrades to the
+/// re-seed which is already the fallback, so it is safe; it is written down
+/// because "the probe said resumable and the sync then failed" is otherwise a
+/// baffling pair of lines.
+///
+/// **A malformed reply falls BACK here, while `classify_probe` treats one as
+/// `Refused` on purpose** ("retrying a malformed exchange is how a boot
+/// spins"). The rules differ deliberately: there, a malformed answer is the
+/// master's final word; here, it only means the cheap path is unavailable, and
+/// the expensive path is still to come and will decide. Do not align them. That fallback is the pre-BUG-0070
 /// behaviour, so a mixed-version pair is never worse off than before, which
 /// matters because the canary drill exercises exactly that one-version step.
 #[cfg(feature = "rocks")]
@@ -6467,23 +6507,28 @@ mod wal_range_probe_tests {
         }
     }
 
-    /// A cursor past the master's tip is not resumable either. Without this the
-    /// tailer would be handed a position the master can never reach, which is a
-    /// hang rather than an error.
+    /// A cursor past the master's tip RESUMES, because that is what the
+    /// handshake answers: `updates_since_budgeted` returns an empty Ok rather
+    /// than a WalGap when `latest <= cursor`, and only WalGap refuses. This
+    /// test pins the MATCH — an earlier draft refused here, which would have
+    /// changed a verdict inside a latency fix.
     #[test]
-    fn a_cursor_ahead_of_the_tip_is_refused() {
-        assert!(matches!(
-            wal_range_verdict(901, 100, 900),
-            ProbeVerdict::Refused(_)
-        ));
+    fn a_cursor_ahead_of_the_tip_matches_the_handshake_and_resumes() {
+        assert_eq!(wal_range_verdict(901, 100, 900), ProbeVerdict::Resumable);
+        assert_eq!(
+            wal_range_verdict(u64::MAX, 100, 900),
+            ProbeVerdict::Resumable
+        );
     }
 
     /// An empty-ish range still decides rather than panicking.
     #[test]
     fn a_degenerate_range_still_decides() {
         assert_eq!(wal_range_verdict(5, 5, 5), ProbeVerdict::Resumable);
+        // 6 is ahead of the tip, not below the floor — resumable, per above.
+        assert_eq!(wal_range_verdict(6, 5, 5), ProbeVerdict::Resumable);
         assert!(matches!(
-            wal_range_verdict(6, 5, 5),
+            wal_range_verdict(4, 5, 5),
             ProbeVerdict::Refused(_)
         ));
     }
