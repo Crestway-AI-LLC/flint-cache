@@ -405,6 +405,13 @@ run_suite "connection sharing (8 checks)" ai.crestway.flintaccel.client.TierShar
 # ADR-0023 D17.5: the cap is on the PART, not the object. The suite issues the
 # SAME request under two caps, because "a big request was not cached" is also
 # true of a cache that is simply broken.
+# D18 moved capacity policy to the Flint Cache side: the tier evicts and this
+# client is not told. That makes eviction something we TOLERATE, which is a
+# property and therefore needs a test -- and until this suite nothing in either
+# gate ever evicted anything. The correctness argument existed and had never
+# been executed.
+run_suite "reads survive eviction (11 checks)" ai.crestway.flintaccel.client.EvictionSuite 9315 "$ROOT/jvm-spike/target/classes:$CP"
+
 # BUG-0066/BUG-0067: every config key path 1 DECLARES must be one somebody has
 # shown to do something. Reflection finds the keys, so adding a constant without
 # classifying it fails here rather than being silently untested -- which is the

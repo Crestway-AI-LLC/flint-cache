@@ -39,7 +39,7 @@ ck() { if [ "$1" = 0 ]; then PASS=$((PASS+1)); printf "[ok] %s\n" "$2";
 # is what puts it through check 3.
 DECLARED="$(printf '%s\n' 9000 9301 9302 9303 9304 9305 9306 9307 9308 9309 \
                           9310 9311 9312 9313 9314 9318 9319 9397 9398 9399 \
-                          9400 9401 9407 9498 9530 9531 9810 | sort -un)"
+                          9315 9400 9401 9407 9498 9530 9531 9810 | sort -un)"
 
 # 6379 is Redis's standard port and the documented default for the CUSTOMER's
 # own endpoint. This harness never binds it -- every suite is passed an explicit
