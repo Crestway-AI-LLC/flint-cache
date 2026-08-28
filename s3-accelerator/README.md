@@ -337,15 +337,41 @@ And several that only exist because correctness suites cannot see them:
 
 ---
 
+## Which engines, and how we know
+
+Every row here is a claim about **someone else's extension point**, so every row
+carries a date. A seam does not break when it is withdrawn — it stops existing
+in a release we do not run, and nothing in our gate can see that. Re-verify
+before quoting.
+
+| engine | how it gets in | verified against | when |
+|---|---|---|---|
+| Spark | S3A, path 1 or 2 | Spark 4.0.4 / Hadoop 3.4.1, TPC-DS sf=50 on EC2 | 2026-08-28 |
+| Iceberg | `io-impl`, path 3 | `iceberg-core` 1.9.0, gated end to end on real tables | 2026-08-28 |
+| Hadoop, anything on `s3a://` | S3A, path 1 or 2 | `hadoop-aws` 3.4.3, 45 contract tests we did not write | 2026-08-28 |
+| PyTorch, pandas, Ray | fsspec registry | gated python + 90-test fsspec abstract suite | 2026-08-28 |
+| **Trino** | **nothing — no seam it will accept** | Trino 481 removed S3A; its Iceberg connector never used `FileIO` | 2026-08-28 |
+
+**Trino is not supported and this file used to imply it was.** Hadoop S3A was
+deprecated in Trino 470 and removed in **Trino 481 (11 May 2026)**; its Iceberg
+connector uses Trino's own file system layer rather than Iceberg's `FileIO`, so
+that route never applied either. File systems are bound inside the Trino server
+and its plugin SPI has no extension point for one. See ADR-0023 D11.4 for the
+retraction and ADR-0032 for what supporting it would take.
+
 ## Known limits
 
-- **Spark and Trino are not in the test loop.** The Iceberg suite drives
-  Iceberg's own planner and readers; Spark's split planning and vectorised
-  reader are not exercised, though both funnel through the same
-  `InputFile.newStream()` seam.
-- **No AWS-scale measurement yet.** Every number here is from a local counting
-  fixture. Throughput and GPU-utilisation claims are unmeasured until a real
-  workload runs on real hardware.
+- **Spark is measured but not gated.** TPC-DS at sf=50 runs on EC2 by hand
+  (`packaging/aws/spark-e2e/`), not in the gate — it needs AWS and a budget. The
+  gate exercises Spark's seam, not Spark. Trino is not supported at all; see
+  the table above.
+- **Real-hardware numbers are a range, and a small sample.** Spark TPC-DS on
+  EC2 gives **1.9-2.3x warm** across four runs and **1.26-1.47x** on a cold JVM;
+  an LLM-shaped sweep of one 1 GiB shard gives **5-7x** from the second epoch.
+  Absolute times moved 24% between runs while the ratios held. One dataset, one
+  hardware shape, single-box Spark rather than a cluster. **Quote the range,
+  not a run** — every single-run figure we published was later found to be the
+  top of one.
 - **`hadoop-aws` 3.4.3 / 3.5.0 need the shim jar** — their audit path
   references an AAL class no published AAL ships. `preflight.sh` detects this
   and says so.
