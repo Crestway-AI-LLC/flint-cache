@@ -1084,6 +1084,18 @@ fn call_retrying(
     Err(last.unwrap_or_else(|| std::io::Error::other("no attempt made")))
 }
 
+/// The largest control reply this path will buffer before giving up.
+///
+/// Every verb that reaches here — FLINTSLOTFREEZE, FLINTSLOTMOVED,
+/// FLINTSLOTABORT, FLINTMIGRATIONS — replies with STATUS, not data; the
+/// largest is a list of in-flight migrations. 8 MiB is orders of magnitude
+/// more than any of them needs and still ~2000x below a seat's RAM, which is
+/// the side to err on: this exists to stop a malfunctioning peer exhausting
+/// us, not to police reply size. If it ever fires on a legitimate reply, the
+/// reply grew a data-sized component and THAT is the bug.
+#[cfg(feature = "rocks")]
+const MAX_CTL_REPLY_BYTES: usize = 8 * 1024 * 1024;
+
 /// As `call_once`, with the read budget named by the caller.
 ///
 /// The budget is a parameter because the two cutover calls are not the same
@@ -1113,6 +1125,37 @@ fn call_once_with(
         match decode(&buf) {
             Ok(Decoded::Complete(v, _)) => return Ok(v),
             Ok(Decoded::NeedMore) => {
+                // BUG-0060 pass 6. `set_read_timeout` above is a PER-READ
+                // timeout, and this loop has no other bound: a peer that
+                // sends *some* bytes inside every timeout window keeps it
+                // alive indefinitely while `buf` grows, and the timeout never
+                // fires because it measures whether one read stalled, not
+                // whether the call has taken too long. The drain loop 500
+                // lines above gets this right with a cumulative deadline.
+                //
+                // The decoder's own caps do not save us: MAX_BULK_LEN is
+                // 512 MiB and MAX_ARRAY_LEN is 1,048,576, so a legal reply is
+                // bounded only by their PRODUCT, and the whole thing must be
+                // buffered before `decode` returns Complete. One million
+                // elements at 1 KB each is 1 GB resident, from a reply that
+                // breaks no rule.
+                //
+                // A byte cap rather than a cumulative deadline, deliberately.
+                // The budget is sized by the caller for a long SILENT wait --
+                // FLINTSLOTMOVED does not answer until the source has purged
+                // the slot -- so turning it into a deadline would start
+                // failing legitimate slow migrations. Capping bytes bounds
+                // the memory AND the loop (a trickling peer now hits this)
+                // while leaving the timing contract exactly as it was.
+                if buf.len() > MAX_CTL_REPLY_BYTES {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "control reply exceeded {MAX_CTL_REPLY_BYTES} bytes without \
+                             completing; peer {addr} is trickling or malfunctioning"
+                        ),
+                    ));
+                }
                 let n = s.read(&mut chunk)?;
                 if n == 0 {
                     return Err(std::io::Error::new(
@@ -1240,5 +1283,72 @@ mod source_phase_tests {
                 SourcePhase::Unreachable(e) => write!(f, "Unreachable({e})"),
             }
         }
+    }
+}
+
+#[cfg(all(test, feature = "rocks"))]
+mod ctl_reply_cap_tests {
+    use super::*;
+    use std::io::Write;
+    use std::net::TcpListener;
+
+    /// A peer that trickles forever must be refused, not buffered forever.
+    ///
+    /// This is the failure `set_read_timeout` cannot see: it bounds how long
+    /// ONE read may stall, and a peer that sends a few bytes inside every
+    /// window never stalls a read while `buf` grows without limit. The test
+    /// therefore has to trickle rather than go silent — going silent is the
+    /// case that already worked, and asserting on it would pass with the cap
+    /// deleted.
+    #[test]
+    fn trickling_peer_is_refused_rather_than_buffered() {
+        let l = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = l.local_addr().expect("listener addr").to_string();
+
+        std::thread::spawn(move || {
+            let (mut s, _) = match l.accept() {
+                Ok(v) => v,
+                Err(_) => return,
+            };
+            let mut sink = [0u8; 4096];
+            let _ = std::io::Read::read(&mut s, &mut sink);
+            // A legal, never-completing reply: an array header promising far
+            // more elements than ever arrive, then an endless dribble of
+            // well-formed bulks. decode() returns NeedMore forever.
+            if s.write_all(b"*1000000\r\n").is_err() {
+                return;
+            }
+            // 64 KiB of well-formed bulks per write rather than ten bytes.
+            // The property under test is "sends something inside every
+            // timeout window while never completing", which chunk size does
+            // not change. (It barely helps the runtime -- the cost is the
+            // quadratic re-decode noted above, not the write count -- but it
+            // keeps the peer from being the bottleneck.)
+            let blob: Vec<u8> = b"$4\r\nabcd\r\n".repeat(6553);
+            loop {
+                if s.write_all(&blob).is_err() {
+                    return;
+                }
+            }
+        });
+
+        // Budget generously: the point is that the cap fires on BYTES, and a
+        // short budget would let the read timeout claim the win instead and
+        // the test would pass with the cap removed.
+        let r = call_once_with(
+            &addr,
+            &[b"FLINTMIGRATIONS"],
+            std::time::Duration::from_secs(30),
+        );
+        let e = r.expect_err("a never-completing reply must be refused");
+        assert_eq!(
+            e.kind(),
+            std::io::ErrorKind::InvalidData,
+            "expected the byte cap, got: {e}"
+        );
+        assert!(
+            e.to_string().contains("exceeded"),
+            "error should name the cap it hit: {e}"
+        );
     }
 }

@@ -477,6 +477,14 @@ case, not the exotic one: a seat that is swapping, mid-compaction, or
 half-dead trickles bytes, and trickling is exactly what defeats a per-read
 timeout.
 
+**A secondary observation, now bounded.** `decode(&buf)` is called on every
+iteration and re-parses the buffer from the start, so filling the buffer is
+quadratic in its size. Before the cap that was unbounded in CPU as well as in
+memory; with an 8 MiB cap the worst case is bounded but still noticeable — the
+regression test that fills the cap takes ~16 s, and that time is the
+re-parsing, not the I/O. Not worth restructuring the decode loop for a control
+path, but worth knowing before anyone reuses this helper for anything larger.
+
 **The fix is already written 500 lines above it.** `call_once_with` should
 take the same cumulative deadline the drain loop uses, and additionally refuse
 once `buf` exceeds a byte budget rather than trusting the decoder's per-unit
@@ -497,6 +505,6 @@ clean.
 |---|---|
 | request path | **1 defect** (collection commands, +412 MB measured, client-controlled) |
 | replication path | **clean** on this pattern — all materialisations are test-only |
-| admin / background | **1 defect** — `call_once_with` has no cumulative deadline and no byte budget |
+| admin / background | **1 defect, FIXED** — `call_once_with` buffered a peer's reply with no byte budget; capped at 8 MiB with a mutation-verified regression test |
 | internal mechanisms | async write queue measured; bounded by connections, `max-conns` binds first |
 | operator-controlled | per-namespace state, different risk class |
