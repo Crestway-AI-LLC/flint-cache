@@ -55,7 +55,7 @@ defect is that we choose to hold all of it.
     fn for_each_prefix(&self, prefix: &[u8], f: &mut dyn FnMut(&[u8], &[u8]) -> bool);
 
 with a **default implementation that delegates to `scan_prefix`**. That is the
-load-bearing part of the design: the trait has 4 implementors and
+load-bearing part of the design: the trait has 6 implementors and
 `scan_prefix` has 25 production call sites, and none of them has to change.
 `RocksKv` overrides it with the native iterator it already uses elsewhere
 (`rocks.rs:581`), and everything else inherits today's behaviour until it is
@@ -204,3 +204,28 @@ The lesson is worth more than the tidiness: **the ADR asserted a missing
 primitive without grepping for it**, which is the same failure as asserting a
 measurement from arithmetic — and this file already criticises that in
 BUG-0060 pass 3.
+
+### Two further corrections, from the session that took the implementation
+
+**The implementor count was 4 and is 6.** Five production —
+`MemKv`, `RocksKv`, `ReadOnlyKv`, `BatchingKv`, `WatchedKv` — plus a
+`NoMaterializeKv` test double. The miscount has a dull cause worth naming
+because it will recur: the grep behind it was scoped to
+`crates/flint-storage/src/*.rs`, and the test double lives in
+`flint-server/src/commands.rs:3539`. A count taken from one crate was reported
+as a count of the trait.
+
+**And a fact that changes the standing of "what this does not fix".** That
+section says 1 MiB per connection times 2048 connections is 2 GiB of reply
+buffers, and calls the aggregate bound a separate open decision. Redis has a
+shape for exactly this — `client-output-buffer-limit`, per-class soft and hard
+thresholds that disconnect a client whose reply buffer runs away. (Raised by
+the "Cache technology vs Redis" session, which is comparing the two directly;
+worth confirming against the specific Redis version before it is quoted.)
+
+So the aggregate bound is **not an open design question, it is an unimplemented
+known shape**, and until it exists this is a place where the comparison
+favours Redis. That is a stronger reason to do it than "unbounded is
+untidy", and it means the eventual design has a reference to argue with rather
+than a blank page. It stays out of THIS ADR's scope, but it should stop being
+described as undecided.
