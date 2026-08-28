@@ -6,7 +6,9 @@ kept here rather than erased, because it records that the cross-pair framing
 came from a single sample where pair 1 happened to promote 79ms earlier —
 coincidence read as mechanism.*
 
-Status: OPEN — cause NARROWED to (a) by a second occurrence on 2026-08-28;
+Status: FIXED in code, UNCONFIRMED against a live recurrence — cause narrowed
+to (a) by the second occurrence on 2026-08-28 and the path that makes (a)
+possible is now closed;
 the instrument added on the first firing worked and the (a)/(b) question is
 settled. What is unfixed is the cache-update path itself · Severity: high if real — a healthy
 new master going read-only mid-roll is a availability fault on the exact path
@@ -146,3 +148,49 @@ you bend it.
 Two firings, 2026-08-27 and 2026-08-28, both in ops CI, both `canary`, both on
 node `6920`. Never once on the gate box or locally. That the SAME node fences
 in both is itself a datum — it is the pair whose master rolls FIRST.
+
+
+## Fixed — one key, and the duplicate that let two keys disagree
+
+The fence commits BEFORE the promotion and `controlled_failover` fails hard if
+`CPFENCE` does not commit (`flint-ctl/src/main.rs:5011`), so the record for
+`6920` existed. The renewal still read `6921`. That leaves one way for a
+committed fence to be invisible to a renewal: **the two sides were not looking
+at the same row.**
+
+- `CPLEASE` found "the first row whose members CONTAIN the caller".
+- `CPFENCE` updated "the row whose member vector EQUALS this pair".
+
+Those agree only while there is exactly one row per pair — and `CPADDPAIR`
+deduped with `!st.pairs.contains(&pair)`, vector equality, so `CPADDPAIR a,b`
+and `CPADDPAIR b,a` registered as **two** pairs to the dedupe and **one** pair
+to every containment check. Two rows, and the fence writes one while the
+renewal reads the other.
+
+Two changes:
+
+1. **One key.** `lease_row_index(rows, addr)` is now the only way a lease row
+   is resolved, used by the renewal read and by both of the fence's writes
+   (durable and mirror). They cannot land on different rows whatever the table
+   holds; a duplicate becomes merely stale instead of contradictory.
+2. **The root.** `CPADDPAIR` sorts the member vector before the dedupe, so
+   `a,b` and `b,a` are one pair and the existing `contains` check does what it
+   already read as doing.
+
+Five tests. The behavioural ones are weak by construction — the duplicate test
+drives both sides through the same function, so it cannot fail while that stays
+true, which is the point and also why it proves little alone. The one that
+holds this shut is structural: `no_site_resolves_a_lease_row_by_member_vector_equality`
+scans the production half of the source and fails if any site resolves a lease
+row by member-vector comparison. Mutation-confirmed — reverting the fence to
+`m == &members` fails it, and the unmutated tree passes. (It also caught itself
+on the first run: scanning the WHOLE file matched the test's own pattern
+literals, so it now scans only up to `#[cfg(test)]`.)
+
+**Why UNCONFIRMED.** The artifact never contained the CP's `leases.entries`,
+so duplicate rows were never directly observed — step 1's follow-up ("dump
+shared.leases.entries and count rows containing 6920") was not runnable after
+the fact. What is established is that the fence committed, the renewal
+disagreed, and this asymmetry is the only remaining path between those two
+facts. If canary aborts on `SelfFenced` again with this in place, the mechanism
+is something else and this file should reopen rather than be trusted.

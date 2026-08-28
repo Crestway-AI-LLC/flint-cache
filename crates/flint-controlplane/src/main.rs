@@ -198,7 +198,15 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
             // unranged; an EXPANSION pair should pass "-" so joining adds
             // capacity without re-routing unmigrated slots.
             let range = text(2).as_deref().and_then(state::parse_range);
-            let pair: Vec<String> = nodes.split(',').map(String::from).collect();
+            // SORTED, because the dedupe below is vector EQUALITY and the
+            // lease lookups are membership CONTAINMENT. Unsorted, `CPADDPAIR
+            // a,b` and `CPADDPAIR b,a` are two pairs to the equality check and
+            // one pair to every containment check -- which is how a lease row
+            // written by one key can be read through another (BUG-0065).
+            // Canonicalising here makes the existing `contains` dedupe do what
+            // it already reads as doing.
+            let mut pair: Vec<String> = nodes.split(',').map(String::from).collect();
+            pair.sort();
             let Ok(mut st) = shared.state.lock() else {
                 return err("state lock");
             };
@@ -1091,9 +1099,8 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
                 let Ok(mut lf) = shared.leases.lock() else {
                     return err("lease lock");
                 };
-                if let Some((_, master, _)) = lf.entries.iter().find(|(m, _, _)| m.contains(&addr))
-                {
-                    let master = master.clone();
+                if let Some(i) = lease_row_index(&lf.entries, &addr) {
+                    let master = lf.entries[i].1.clone();
                     lf.renewals_total += 1;
                     let us = t0.elapsed().as_micros().min(u128::from(u32::MAX)) as u32;
                     lf.record_latency(us);
@@ -1145,11 +1152,18 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
             let Some(members) = st.pairs.iter().find(|p| p.contains(&addr)).cloned() else {
                 return err("NOPAIR address is not a member of any registered pair");
             };
-            let g = match st.leases.iter_mut().find(|(m, _, _)| m == &members) {
-                Some(rec) => {
-                    rec.1 = addr.clone();
-                    rec.2 += 1;
-                    rec.2
+            // CONTAINMENT, matching what CPLEASE reads by. This was member
+            // EQUALITY while the renewal path finds "the first entry whose
+            // members contain the caller" -- so with two rows for one pair the
+            // fence updated one and the renewal read the other, and a freshly
+            // promoted master was told it had been superseded by the peer it
+            // had just replaced (BUG-0065). Symmetric keys mean the write and
+            // the read cannot land on different rows, whatever is in the table.
+            let g = match lease_row_index(&st.leases, &addr) {
+                Some(i) => {
+                    st.leases[i].1 = addr.clone();
+                    st.leases[i].2 += 1;
+                    st.leases[i].2
                 }
                 None => {
                     st.leases.push((members.clone(), addr.clone(), 1));
@@ -1164,10 +1178,13 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
             st.version += 1;
             drop(st);
             if let Ok(mut lf) = shared.leases.lock() {
-                match lf.entries.iter_mut().find(|(m, _, _)| m == &members) {
-                    Some(rec) => {
-                        rec.1 = addr.clone();
-                        rec.2 = g;
+                // Same containment key as the durable row above and as the
+                // renewal read below it -- all three must agree or the mirror
+                // drifts from the record it mirrors.
+                match lease_row_index(&lf.entries, &addr) {
+                    Some(i) => {
+                        lf.entries[i].1 = addr.clone();
+                        lf.entries[i].2 = g;
                     }
                     None => lf.entries.push((members, addr.clone(), g)),
                 }
@@ -1483,6 +1500,26 @@ fn build_version() -> String {
     flint_build::version(env!("CARGO_PKG_VERSION"))
 }
 
+/// The ONE key that resolves a pair's lease row, used by the renewal read and
+/// by both of the fence's writes.
+///
+/// It exists as a function because it did not, and the three sites drifted:
+/// the renewal found "the first row whose members contain the caller" while
+/// the fence updated "the row whose member vector EQUALS this pair". With two
+/// rows for one pair — which `CPADDPAIR`'s equality dedupe allowed, since
+/// `a,b` and `b,a` were two pairs to it and one to every containment check —
+/// the fence wrote one row and the renewal read the other. A freshly promoted
+/// master was then told it had been superseded by the peer it had just
+/// replaced, and fenced itself read-only mid-roll (BUG-0065).
+///
+/// Returning an INDEX rather than a reference is deliberate: the fence needs a
+/// mutable borrow of the same row it just located, and an index survives the
+/// borrow ending.
+fn lease_row_index(rows: &[(Vec<String>, String, u64)], addr: &str) -> Option<usize> {
+    rows.iter()
+        .position(|(m, _, _)| m.iter().any(|x| x == addr))
+}
+
 fn main() -> std::io::Result<()> {
     // Before --raft dispatch: asking a binary what it is must not depend on
     // which mode it would have started in.
@@ -1762,5 +1799,121 @@ mod cpjournalread_filter_tests {
         // And the documented default when n is absent.
         let dflt = body(&call(&sh, &["CPJOURNALREAD"]));
         assert_eq!(dflt.lines().count(), 50);
+    }
+}
+
+#[cfg(test)]
+mod lease_row_key_tests {
+    use super::lease_row_index;
+
+    fn row(members: &[&str], master: &str, generation: u64) -> (Vec<String>, String, u64) {
+        (
+            members.iter().map(|s| (*s).to_string()).collect(),
+            master.to_string(),
+            generation,
+        )
+    }
+
+    /// Membership, not vector identity — the renewal never knows which order
+    /// the pair happened to be registered in.
+    #[test]
+    fn the_key_is_membership_not_member_order() {
+        let rows = vec![row(&["b:2", "a:1"], "b:2", 3)];
+        assert_eq!(lease_row_index(&rows, "a:1"), Some(0));
+        assert_eq!(lease_row_index(&rows, "b:2"), Some(0));
+        assert_eq!(lease_row_index(&rows, "c:3"), None);
+    }
+
+    /// BUG-0065. Two rows for ONE pair, which CPADDPAIR's equality dedupe used
+    /// to allow: the fence wrote the row matching the member vector and the
+    /// renewal read the FIRST row containing the caller. When those differed,
+    /// a freshly promoted master was told its own demoted peer had superseded
+    /// it. One key means both sides land on the same row by construction --
+    /// the duplicate becomes stale rather than contradictory.
+    #[test]
+    fn a_duplicate_row_cannot_split_the_fence_from_the_renewal() {
+        // Row 0 is the stale ordering still naming the OLD master; row 1 is
+        // the one an equality-keyed fence would have picked.
+        let mut rows = vec![
+            row(&["a:1", "b:2"], "b:2", 3),
+            row(&["b:2", "a:1"], "b:2", 3),
+        ];
+
+        // The fence promotes a:1 and resolves its row through the one key.
+        let fenced = lease_row_index(&rows, "a:1").expect("fence finds a row");
+        rows[fenced].1 = "a:1".to_string();
+        rows[fenced].2 += 1;
+
+        // The renewal from a:1 resolves through the SAME key, so it must see
+        // the write that just happened -- not the other row.
+        let renewed = lease_row_index(&rows, "a:1").expect("renewal finds a row");
+        assert_eq!(renewed, fenced, "fence and renewal split across rows");
+        assert_eq!(
+            rows[renewed].1, "a:1",
+            "the renewing master reads itself as master; anything else is a false SUPERSEDED"
+        );
+    }
+
+    /// The demoted peer must still be told it lost, or a fence stops fencing.
+    /// This is the assertion that would fail if the key were widened into
+    /// "always answer OK".
+    #[test]
+    fn the_demoted_peer_still_reads_as_superseded() {
+        let rows = vec![row(&["a:1", "b:2"], "a:1", 4)];
+        let i = lease_row_index(&rows, "b:2").expect("row");
+        assert_ne!(
+            rows[i].1, "b:2",
+            "b:2 was demoted and must not read itself as master"
+        );
+        assert_eq!(rows[i].1, "a:1");
+    }
+
+    /// The test above uses one function on both sides, so it cannot fail while
+    /// that stays true -- which is exactly the point, and exactly why it proves
+    /// nothing on its own. What actually holds BUG-0065 shut is STRUCTURAL:
+    /// every site that resolves a lease row goes through `lease_row_index`. An
+    /// inline member-vector comparison anywhere is the defect returning, so
+    /// assert against the source rather than against behaviour a unit test
+    /// cannot reach from here.
+    #[test]
+    fn no_site_resolves_a_lease_row_by_member_vector_equality() {
+        // Only the PRODUCTION half: this test names the forbidden patterns as
+        // string literals, so scanning the whole file matches itself and fails
+        // for its own text. Found exactly that way on the first run.
+        let whole = include_str!("main.rs");
+        let src = whole.split("#[cfg(test)]").next().unwrap_or(whole);
+        for pat in [
+            "st.leases.iter_mut().find(",
+            "lf.entries.iter_mut().find(",
+            "lf.entries.iter().find(",
+            "m == &members",
+        ] {
+            assert!(
+                !src.contains(pat),
+                "a lease row is being resolved by `{pat}` instead of lease_row_index(); \
+                 that asymmetry between the fence's write key and the renewal's read key \
+                 IS BUG-0065"
+            );
+        }
+        // And the one key is actually used by all three sites.
+        assert!(
+            src.matches("lease_row_index(").count() >= 4,
+            "expected the renewal read, both fence writes and the definition to \
+             reference lease_row_index; found {}",
+            src.matches("lease_row_index(").count()
+        );
+    }
+
+    /// The root fix: sorting at registration makes `a,b` and `b,a` one vector,
+    /// so CPADDPAIR's `contains` dedupe rejects the second and no duplicate is
+    /// ever created. Without the sort these compare unequal and both are kept.
+    #[test]
+    fn canonicalising_registration_collapses_reordered_pairs() {
+        let mut ab: Vec<String> = "a:1,b:2".split(',').map(String::from).collect();
+        let mut ba: Vec<String> = "b:2,a:1".split(',').map(String::from).collect();
+        assert_ne!(ab, ba, "unsorted, these are two different pairs");
+        ab.sort();
+        ba.sort();
+        assert_eq!(ab, ba, "sorted, CPADDPAIR's contains-dedupe sees one pair");
     }
 }
