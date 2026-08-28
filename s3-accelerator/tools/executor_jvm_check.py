@@ -31,9 +31,9 @@ worse than a recipe that says what it needs.
     printf '%s:%s' jvm-spike/target/*hadoop-shim.jar "$(cat /tmp/prov2.txt)" \
         > /tmp/cp.txt                                                    # (7)
     valkey-server --port 9399 --save '' &
-    python3 tools/counting_s3.py --port 9452 --objects 4 --object-bytes 8388608 &
+    python3 tools/counting_s3.py --port 9301 --objects 4 --object-bytes 8388608 &
     PROV_CP=/tmp/cp.txt /tmp/sv/bin/python tools/executor_jvm_check.py \
-        redis://127.0.0.1:9399 http://127.0.0.1:9452 \
+        redis://127.0.0.1:9399 http://127.0.0.1:9301 \
         jvm-spike/target/flint-accel-seam-spike-*.jar
 
 EVERY FAILURE ON THE WAY WAS ENVIRONMENT, NOT PRODUCT, and the next person hits
