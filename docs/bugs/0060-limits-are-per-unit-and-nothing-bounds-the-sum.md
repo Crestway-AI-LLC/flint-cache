@@ -410,3 +410,93 @@ Candidate 3 is **measured, and downgraded**: real, but it needs a connection
 fan-out rather than one aggressive client, and the default `max-conns` holds
 the ceiling to half what was predicted. Candidate 1 (the collection read at
 +412 MB) remains the more urgent of the two.
+
+## Audit pass 6, 2026-08-27 — the three paths the audit never actually swept
+
+Passes 1-5 worked the list under "Candidates worth checking first" and the
+status table then read as though the audit were done. It was not. The method
+this bug sets out for itself is broader than that list:
+
+> For each of **the request path, the replication path, the admin/introspection
+> commands, and the background tasks**, ask two questions...
+
+Passes 1-5 covered the request path (candidates 1 and 2), one internal
+mechanism (candidate 3) and one operator-controlled multiplier (candidate 4).
+**The replication path, the admin/introspection commands and the background
+tasks were never examined**, and the summary line "one answer with a number,
+one cleared, one pending, one reclassified" reads as completion over three
+unswept areas. Swept now.
+
+### Replication path — clean, on this pattern
+
+`repl.rs` holds eleven full materialisations, more than any other file, and
+all of them are inside `#[cfg(test)] mod tests` (from line 461). `scan_all` at
+`:655` is a test helper asserting master/replica parity. Nothing in the
+production replication path materialises a dataset-sized collection.
+
+### Admin / background — a DEFECT: an unbounded read buffer with no cumulative deadline
+
+`migrate.rs` contains two loops that read a peer's reply into a growing
+`Vec`. They are 500 lines apart and only one of them is bounded.
+
+**Bounded (`:~560`, the drain loop).** Checks a real cumulative deadline every
+iteration and rolls the migration back when it passes:
+
+    if std::time::Instant::now() > deadline { rollback(); return ... }
+
+**Unbounded (`call_once_with`, `:1095`).** The budget it is given is applied
+as `s.set_read_timeout(Some(budget))` — a **per-read** timeout, not a
+deadline. Each individual `read()` must return within the budget; nothing
+bounds how many reads there are, or how large `buf` becomes:
+
+    let mut buf = Vec::new();
+    loop {
+        match decode(&buf) {
+            Ok(Decoded::Complete(v, _)) => return Ok(v),
+            Ok(Decoded::NeedMore) => { let n = s.read(&mut chunk)?; ... 
+                                       buf.extend_from_slice(&chunk[..n]); }
+
+A peer that sends *some* bytes inside every timeout window keeps this loop
+alive indefinitely. The read timeout never fires, because it is measuring the
+wrong thing: it asks "did this read stall", not "has this call taken too
+long".
+
+**And the caps that exist are, once again, per-unit.** `decode` does enforce
+limits — `MAX_BULK_LEN` 512 MiB at `resp/lib.rs:457`, `MAX_ARRAY_LEN` 1,048,576
+at `:483` — so this is not literally unbounded. It is bounded by their
+PRODUCT, which is the shape this whole bug is about: a reply of one million
+elements is legal, and `buf` must hold all of it before `decode` returns
+Complete. At a modest 1 KB per element that is 1 GB of resident buffer from a
+single legal reply, on a seat that is also serving.
+
+**Reachability, stated honestly.** The peer is another Flint seat reached
+through `internal_connect` (mutual TLS, internal SNI), not a client. So this
+needs a malfunctioning or compromised *node*, not a hostile tenant, and it is
+strictly less urgent than candidate 1. But "malfunctioning" is the ordinary
+case, not the exotic one: a seat that is swapping, mid-compaction, or
+half-dead trickles bytes, and trickling is exactly what defeats a per-read
+timeout.
+
+**The fix is already written 500 lines above it.** `call_once_with` should
+take the same cumulative deadline the drain loop uses, and additionally refuse
+once `buf` exceeds a byte budget rather than trusting the decoder's per-unit
+caps to add up to something survivable.
+
+### What pass 6 did NOT cover
+
+This swept for two specific shapes — full-collection materialisation
+(`scan_prefix`/`collect`) and unbounded accumulation in a read loop. It is not
+a command-by-command audit of the admin surface. `manifest.rs` (5 hits) and
+`lib.rs` (10) were not read; both are storage-internal rather than request-
+reachable, which is a reason to rank them lower, not a reason to call them
+clean.
+
+### Status after pass 6
+
+| area | verdict |
+|---|---|
+| request path | **1 defect** (collection commands, +412 MB measured, client-controlled) |
+| replication path | **clean** on this pattern — all materialisations are test-only |
+| admin / background | **1 defect** — `call_once_with` has no cumulative deadline and no byte budget |
+| internal mechanisms | async write queue measured; bounded by connections, `max-conns` binds first |
+| operator-controlled | per-namespace state, different risk class |
