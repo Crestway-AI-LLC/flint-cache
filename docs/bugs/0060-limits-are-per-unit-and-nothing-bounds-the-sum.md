@@ -508,3 +508,88 @@ clean.
 | admin / background | **1 defect, FIXED** — `call_once_with` buffered a peer's reply with no byte budget; capped at 8 MiB with a mutation-verified regression test |
 | internal mechanisms | async write queue measured; bounded by connections, `max-conns` binds first |
 | operator-controlled | per-namespace state, different risk class |
+
+## Audit pass 7, 2026-08-27 — candidate 1: two micro-fixes tried, both reverted
+
+Went after the measured defect and got nowhere useful, which is worth
+recording because both dead ends were the kind that look like wins.
+
+### The baseline, re-measured
+
+A 2000-field hash of 100 KB values (205 MB), one `HGETALL`, RSS sampled every
+10 ms: **peak +557 MB**. Higher than pass 1's +412 MB, and the difference is
+the sampling interval, not the code — a finer sampler catches a peak a coarser
+one steps over. Worth noting for anyone comparing the two numbers.
+
+### Attempt 1: drop the redundant copy in `hgetall` — a NO-OP, and the code says why
+
+`hgetall` does `scan_prefix(..).into_iter().map(|(k, v)| (k[prefix.len()..]
+.to_vec(), v)).collect()`, which reads like two full copies of the hash.
+Replacing it with an in-place `drain` measured **+557 MB — identical**.
+
+The reason is in the expression: `k` is copied, `v` is **moved**. For a hash of
+100 KB values and 2-byte field names, the "second copy" was a few kilobytes of
+field names. The 205 MB was never duplicated there at all. Reverted.
+
+### Attempt 2: the same fix for `SMEMBERS`, where members ARE the keys — indistinguishable from noise
+
+`smembers` maps `|(k, _)| k[prefix.len()..].to_vec()`, and here the copied `k`
+IS the payload, so the same edit should genuinely halve a copy. First
+measurement agreed: **+415 MB unfixed vs +315 MB fixed**, a 100 MB saving on a
+205 MB set.
+
+Then a third and fourth run:
+
+| | peak delta |
+|---|---|
+| unfixed | +415 MB, +167 MB, +400 MB |
+| fixed | +315 MB, +253 MB |
+
+**An unfixed run came in lower than both fixed runs.** The spread on the
+unfixed arm alone is 248 MB, larger than the effect being claimed. Reverted:
+the saving is not demonstrated, and landing it on the strength of one pairing
+would have been precisely the arithmetic-dressed-as-measurement this bug
+already caught once in pass 3.
+
+### The methodological finding, which is the durable part
+
+**Peak-RSS sampling of a single operation cannot resolve an effect smaller
+than the dataset on this workload.** Run-to-run variance comes from RocksDB's
+memtable and compaction state at the moment of the read, block cache
+occupancy, and allocator behaviour — none of which the harness controls. It
+was adequate for pass 1 (+412 MB against a ~0 baseline is far outside the
+noise) and for pass 5 (a queue that peaks at 7 entries is not a measurement
+problem). It is not adequate for "did this change save half a copy".
+
+Anything targeting a sub-dataset improvement here needs a different
+instrument: allocator-level accounting, or medians over many runs with the
+spread reported, not two runs and a subtraction.
+
+### Where the peak actually comes from — derived from the code, NOT measured
+
+Stated as a hypothesis with its status attached, since pass 7 is a lesson in
+not skipping that step. For `HGETALL` on a 205 MB hash:
+
+| stage | dataset-sized? |
+|---|---|
+| `scan_prefix` → `Vec<(Vec<u8>, Vec<u8>)>` | **yes**, one copy |
+| `.map(..).collect()` in `hgetall` | no — values are moved |
+| `Value::Map(..)` in `commands.rs` | no — the `Vec<u8>`s are moved into `Value::Bulk` |
+| `encode()` into the connection's out-buffer | **yes**, one copy |
+
+Two live dataset-sized allocations ≈ 410 MB, against a measured 557 MB with
+RocksDB's own read path making up the rest. Consistent, and consistent is not
+confirmed.
+
+**If that hypothesis holds, neither remaining copy is removable by a local
+edit** — one is the store materialising the collection, the other is the
+encoder serialising it — which is the same conclusion this bug reached at the
+top: *"this is an audit rather than a fix; the defect is not in any one
+limit."* The answer is to stop materialising, i.e. stream the scan into the
+encoder. `RocksKv` already has native iterators (`rocks.rs:581`), and the
+`Kv` trait could take an additive `for_each_prefix` with a default that
+delegates to `scan_prefix`, so the 25 existing call sites keep working while
+the three collection commands move over one at a time.
+
+That is a design change, not a patch, and belongs in an ADR rather than in
+this file.
