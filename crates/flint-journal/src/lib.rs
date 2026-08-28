@@ -171,6 +171,77 @@ pub fn emit_detached(target: String, tls: Option<Arc<flint_tls::ClientConfig>>, 
 /// would still loop on a short write, but a short write on a few hundred bytes
 /// to a regular file does not happen in practice, and the alternative — two
 /// writes every time — is broken by construction rather than by bad luck.
+/// How much history the LIVE journal plus its rotations keep. Ninety days,
+/// chosen by the operator on 2026-08-27: long enough that a quarter's
+/// incidents stay reconstructable on the box.
+///
+/// Measured basis: the playground writes 6,610 rows/day = 1.2 MB/day, so 90
+/// days is ~110 MB across the live file and its rotations.
+pub const RETENTION_MS: u64 = 90 * 24 * 60 * 60 * 1000;
+
+/// Rotate the live file once it passes this. Bounds the READ cost as much as
+/// the disk: `tail` and `tail_kinds` both `read_to_string` the whole file to
+/// return the last n lines, so before rotation existed, asking for 30 rows
+/// allocated the entire 41 MB journal. Rotation caps that at this number.
+pub const ROTATE_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Serialises rotation between the control plane's two writer paths
+/// (`main.rs` and `ha.rs`). Appends themselves need no lock — they are
+/// O_APPEND — but two threads deciding to rotate at once would have the
+/// second rename the FRESH file away.
+static ROTATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Rotated segments, oldest first, as (rotation_ms, path).
+///
+/// The suffix is the rotation TIME, so a segment holds rows strictly older
+/// than its own name. Pruning on that name therefore keeps at least
+/// `RETENTION_MS`, never less — the conservative direction, since the cost of
+/// keeping too much is disk and the cost of keeping too little is an incident
+/// nobody can reconstruct.
+fn segments(path: &str) -> Vec<(u64, std::path::PathBuf)> {
+    let p = std::path::Path::new(path);
+    let (Some(dir), Some(base)) = (p.parent(), p.file_name().and_then(|s| s.to_str())) else {
+        return Vec::new();
+    };
+    let prefix = format!("{base}.");
+    let mut out: Vec<(u64, std::path::PathBuf)> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_str()?.to_string();
+            let ms: u64 = name.strip_prefix(&prefix)?.parse().ok()?;
+            Some((ms, e.path()))
+        })
+        .collect();
+    out.sort_by_key(|(ms, _)| *ms);
+    out
+}
+
+/// Rotate the live file aside and drop segments past the retention window.
+///
+/// Renaming is safe against a concurrent append: `append_line` opens the path
+/// on every call, so a writer that already has the fd finishes into the
+/// renamed inode — its row lands in the rotated segment rather than being
+/// lost — and the next writer creates a fresh live file.
+fn rotate_and_prune(path: &str) {
+    let _g = match ROTATE_LOCK.lock() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
+    let now = now_ms();
+    // Re-check under the lock: the thread that lost the race must not rotate
+    // the empty file its winner just created.
+    if std::fs::metadata(path).map(|m| m.len()).unwrap_or(0) >= ROTATE_BYTES {
+        let _ = std::fs::rename(path, format!("{path}.{now}"));
+    }
+    for (ms, seg) in segments(path) {
+        if now.saturating_sub(ms) > RETENTION_MS {
+            let _ = std::fs::remove_file(seg);
+        }
+    }
+}
+
 pub fn append_line(path: &str, json_line: &str) -> std::io::Result<()> {
     let mut f = std::fs::OpenOptions::new()
         .create(true)
@@ -180,20 +251,63 @@ pub fn append_line(path: &str, json_line: &str) -> std::io::Result<()> {
     let mut buf = Vec::with_capacity(line.len() + 1);
     buf.extend_from_slice(line.as_bytes());
     buf.push(b'\n');
-    f.write_all(&buf)
+    let r = f.write_all(&buf);
+    // Rotation is checked AFTER the write and never fails the append: a
+    // journal that refuses to record because housekeeping failed is worse
+    // than a large one. `metadata` on the open handle costs a stat, not a
+    // read.
+    if r.is_ok() && f.metadata().map(|m| m.len()).unwrap_or(0) >= ROTATE_BYTES {
+        rotate_and_prune(path);
+    }
+    r
 }
 
 /// Control-plane side: the last `n` journal lines, oldest first.
 pub fn tail(path: &str, n: usize) -> Vec<String> {
-    let Ok(raw) = std::fs::read_to_string(path) else {
+    tail_across(path, n, &|_| true)
+}
+
+/// The last `n` lines matching `keep`, oldest first, ACROSS the live file and
+/// its rotated segments.
+///
+/// Spanning segments is a correctness requirement, not a convenience. A read
+/// that stopped at the live file would report a short history the moment a
+/// rotation happened, and `tail_kinds` is what tier2 counts `ActionExecuted`
+/// against inside its budget window. A budget counter that silently cannot
+/// reach back over its window is the 2026-08-17 failure documented on
+/// `tail_kinds` — the agent had the fix and the authority and paged instead.
+/// Rotation without this would have rebuilt that bug on a timer.
+///
+/// Newest segment first, stopping as soon as `n` are in hand, so the common
+/// case reads only the live file and rotation costs nothing on a normal read.
+fn tail_across(path: &str, n: usize, keep: &dyn Fn(&str) -> bool) -> Vec<String> {
+    if n == 0 {
         return Vec::new();
-    };
-    let lines: Vec<&str> = raw.lines().collect();
-    lines
-        .iter()
-        .skip(lines.len().saturating_sub(n))
-        .map(|s| s.to_string())
-        .collect()
+    }
+    let mut files: Vec<std::path::PathBuf> = segments(path).into_iter().map(|(_, p)| p).collect();
+    files.push(std::path::PathBuf::from(path));
+
+    let mut out: Vec<String> = Vec::new();
+    for f in files.iter().rev() {
+        let Ok(raw) = std::fs::read_to_string(f) else {
+            continue;
+        };
+        let mut kept: Vec<String> = raw
+            .lines()
+            .filter(|l| keep(l))
+            .map(|s| s.to_string())
+            .collect();
+        let need = n - out.len();
+        if kept.len() > need {
+            kept = kept.split_off(kept.len() - need);
+        }
+        kept.extend(out);
+        out = kept;
+        if out.len() >= n {
+            break;
+        }
+    }
+    out
 }
 
 /// Parse a wire kind name into its variant.
@@ -277,9 +391,6 @@ pub fn tail_kinds(path: &str, n: usize, kinds: &[EventKind]) -> Vec<String> {
     if kinds.is_empty() {
         return tail(path, n);
     }
-    let Ok(raw) = std::fs::read_to_string(path) else {
-        return Vec::new();
-    };
     /// Only the discriminant is needed to decide whether to keep a line, and
     /// the rest of the event can be malformed without making the kind
     /// unreadable. serde ignores the other fields.
@@ -287,28 +398,14 @@ pub fn tail_kinds(path: &str, n: usize, kinds: &[EventKind]) -> Vec<String> {
     struct KindOnly {
         kind: EventKind,
     }
-    // Scan from the END and stop at n matches: with a flood of one kind the
-    // matching lines are sparse, and reading forward would parse the whole
-    // file to throw most of it away.
-    let mut out: Vec<String> = Vec::with_capacity(n.min(1024));
-    for line in raw.lines().rev() {
-        if out.len() >= n {
-            break;
-        }
-        if line.trim().is_empty() {
-            continue;
-        }
-        // A torn line is skipped, not fatal. The journal has multiple
-        // writers and an interleaved write must not truncate the history a
-        // guard reads — the same rule page-watch follows.
-        if let Ok(k) = serde_json::from_str::<KindOnly>(line)
-            && kinds.contains(&k.kind)
-        {
-            out.push(line.to_string());
-        }
-    }
-    out.reverse(); // oldest first, matching `tail`
-    out
+    // Across segments, for the reason on `tail_across`: this function is what
+    // tier2's budget window is counted from, and a rotation must not shorten
+    // the reach of that count.
+    tail_across(path, n, &|line: &str| {
+        serde_json::from_str::<KindOnly>(line)
+            .map(|k| kinds.contains(&k.kind))
+            .unwrap_or(false)
+    })
 }
 
 #[cfg(test)]
@@ -668,5 +765,159 @@ mod tail_kinds_tests {
         assert_eq!(parse_kind("ActionExecuted "), None);
         assert_eq!(parse_kind(""), None);
         assert_eq!(parse_kind("Bogus"), None);
+    }
+}
+
+#[cfg(test)]
+mod retention_tests {
+    use super::*;
+
+    fn tmpdir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "flint-jrn-{tag}-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        std::fs::create_dir_all(&d).expect("tmpdir");
+        d
+    }
+
+    fn row(kind: &str, subject: &str) -> String {
+        format!(r#"{{"at_ms":1,"actor":"t","kind":"{kind}","subject":"{subject}"}}"#)
+    }
+
+    /// A rotation must not shorten what a reader can see. This is the whole
+    /// reason `tail_across` exists: `tail_kinds` is what tier2 counts its
+    /// budget window from, and a count that silently cannot reach back over
+    /// its window is the 2026-08-17 failure rebuilt on a timer.
+    #[test]
+    fn reads_span_rotated_segments() {
+        let d = tmpdir("span");
+        let p = d.join("j").to_str().expect("utf8 temp path").to_string();
+        // Two older segments plus the live file.
+        std::fs::write(
+            format!("{p}.1000"),
+            format!("{}\n{}\n", row("Detected", "a"), row("Promoted", "b")),
+        )
+        .expect("write fixture");
+        std::fs::write(format!("{p}.2000"), format!("{}\n", row("Promoted", "c")))
+            .expect("write fixture");
+        std::fs::write(&p, format!("{}\n", row("Detected", "d"))).expect("write fixture");
+
+        let all = tail(&p, 10);
+        assert_eq!(all.len(), 4, "tail must see segments + live, got {all:?}");
+        assert!(all[0].contains("\"a\""), "oldest first: {all:?}");
+        assert!(all[3].contains("\"d\""), "live file last: {all:?}");
+
+        // And the filtered read, which is the one with a safety guard on it.
+        let promoted = tail_kinds(&p, 10, &[EventKind::Promoted]);
+        assert_eq!(
+            promoted.len(),
+            2,
+            "kind filter must span segments: {promoted:?}"
+        );
+    }
+
+    /// The common case must not pay for rotation: enough matches in the live
+    /// file means older segments are never opened.
+    #[test]
+    fn stops_at_the_live_file_when_it_already_has_enough() {
+        let d = tmpdir("stop");
+        let p = d.join("j").to_str().expect("utf8 temp path").to_string();
+        std::fs::write(format!("{p}.1000"), format!("{}\n", row("Detected", "old")))
+            .expect("write fixture");
+        std::fs::write(
+            &p,
+            format!("{}\n{}\n", row("Detected", "x"), row("Detected", "y")),
+        )
+        .expect("write fixture");
+        let two = tail(&p, 2);
+        assert_eq!(two.len(), 2);
+        assert!(
+            !two.iter().any(|l| l.contains("old")),
+            "reached back needlessly: {two:?}"
+        );
+    }
+
+    /// Pruning drops what is past the window and keeps what is not. The
+    /// suffix is the ROTATION time, so a segment holds rows older than its
+    /// name — pruning on the name therefore keeps at least the window, never
+    /// less, which is the direction to err in.
+    #[test]
+    fn prune_drops_only_expired_segments() {
+        let d = tmpdir("prune");
+        let p = d.join("j").to_str().expect("utf8 temp path").to_string();
+        std::fs::write(&p, "").expect("write fixture");
+        let now = now_ms();
+        let expired = now - RETENTION_MS - 60_000;
+        let fresh = now - 60_000;
+        std::fs::write(format!("{p}.{expired}"), "x\n").expect("write fixture");
+        std::fs::write(format!("{p}.{fresh}"), "y\n").expect("write fixture");
+
+        rotate_and_prune(&p);
+
+        assert!(
+            !std::path::Path::new(&format!("{p}.{expired}")).exists(),
+            "expired segment kept"
+        );
+        assert!(
+            std::path::Path::new(&format!("{p}.{fresh}")).exists(),
+            "in-window segment DELETED"
+        );
+    }
+
+    /// The size trigger actually fires, and the live file is left usable.
+    #[test]
+    fn crossing_the_threshold_rotates() {
+        let d = tmpdir("rot");
+        let p = d.join("j").to_str().expect("utf8 temp path").to_string();
+        {
+            // Bulk-write past the threshold in one go; driving it through
+            // append_line would be tens of thousands of file opens.
+            let mut f = std::fs::File::create(&p).expect("create fixture");
+            let chunk = vec![b'x'; 1 << 20];
+            for _ in 0..(ROTATE_BYTES / (1 << 20)) + 1 {
+                f.write_all(&chunk).expect("bulk write");
+            }
+            f.write_all(b"\n").expect("bulk write");
+        }
+        append_line(&p, &row("Detected", "trigger")).expect("append");
+
+        let segs = segments(&p);
+        assert_eq!(
+            segs.len(),
+            1,
+            "expected exactly one rotated segment, got {segs:?}"
+        );
+
+        // After the rename the live path does not exist again until the next
+        // append -- `append_line` opens with create(true). That is fine, and
+        // the first version of this test wrongly asserted otherwise. What
+        // must hold is that the journal keeps WORKING across the boundary:
+        // the rotated row is still readable, and the next append lands in a
+        // fresh live file rather than growing the segment.
+        let after = tail(&p, 5);
+        assert!(
+            after.iter().any(|l| l.contains("trigger")),
+            "the row that triggered rotation became unreadable: {after:?}"
+        );
+        append_line(&p, &row("Detected", "post")).expect("append");
+        let live = std::fs::metadata(&p)
+            .map(|m| m.len())
+            .expect("live file recreated");
+        assert!(
+            live < ROTATE_BYTES,
+            "next append did not start a fresh file: {live} bytes"
+        );
+        assert_eq!(
+            segments(&p).len(),
+            1,
+            "a second rotation fired on a small file"
+        );
+        let both = tail(&p, 5);
+        assert!(
+            both.iter().any(|l| l.contains("trigger")) && both.iter().any(|l| l.contains("post")),
+            "reads must span the rotation boundary: {both:?}"
+        );
     }
 }
