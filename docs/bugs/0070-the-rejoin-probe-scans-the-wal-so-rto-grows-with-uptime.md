@@ -16,8 +16,19 @@ is from the fleet journal, not inferred:
 | 5,694 ms | 827 ms | 2,779 ms | 3 | 209 | **2,354** | 213 | 2,832,158 |
 | 7,200 ms | 900 ms | 4,652 ms | 3 | 269 | **4,077** | 303 | 7,774,768 |
 | 7,950 ms | 851 ms | 5,468 ms | 2 | 208 | **4,985** | 273 | 10,329,665 |
+| 7,472 ms | 794 ms | 5,081 ms | 2 | 189 | **4,686** | 204 | 15,186,665 |
 
-**Only `probe` grows.** `fence` is flat at 2-3 ms across all four. `restore` and
+**Refined by the fifth point: probe PLATEAUS, it does not grow without bound.**
+4,985 ms at cursor 10.3M, then 4,686 ms at 15.2M. The scan is over the RETAINED
+WAL, and retention is capped (`--wal-ttl-seconds`, `--wal-size-limit-mb`), so
+the cost rises until retention saturates and then holds at whatever that window
+costs to walk — about 4.7-5.0 s on this fleet. "Grows with uptime" was the right
+direction and the wrong asymptote; the honest statement is that RTO is
+proportional to the RETENTION WINDOW, reached after enough uptime to fill it.
+That is worse than it sounds, not better: it means the penalty is a permanent
+property of a tuned fleet rather than something a restart clears.
+
+**Only `probe` moves at all.** `fence` is flat at 2-3 ms across all four. `restore` and
 the unaccounted remainder flatten after the first (small-dataset) cycle.
 `restart` is a constant to three digits. Probe tracks the cursor at roughly
 **500 ms per million sequences**, and by cycle 4 is 91% of the decision window
