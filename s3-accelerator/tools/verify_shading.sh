@@ -13,7 +13,15 @@ cd "$(dirname "$0")/../jvm-spike"
 # Select by EXCLUSION, not by sort order. An earlier version took the first
 # match and silently graded the hadoop-shim jar as if it were the main one --
 # every count was wrong in a way that still produced a plausible verdict.
-MAIN=$(ls target/*.jar 2>/dev/null | grep -v original | grep -v hadoop-shim | head -1)
+# NAME the product jar. This used to be `ls target/*.jar | head -1`, which picks
+# by ALPHABETICAL ORDER: the moment a second artifact existed whose name sorted
+# earlier (flint-accel-bench.jar, from the -Pbench profile), this verified the
+# BENCH jar and reported the product as un-relocated, hadoop-bundled and
+# shim-contaminated. Every check failed, and every one of them was true of the
+# jar it happened to grab. A verifier that chooses its own subject by glob order
+# will eventually verify the wrong thing and be completely convincing about it.
+MAIN=$(ls target/flint-accel-seam-spike-*.jar 2>/dev/null \
+       | grep -v original | grep -v hadoop-shim | head -1)
 SHIM=$(ls target/*hadoop-shim.jar 2>/dev/null | head -1)
 [ -f "$MAIN" ] || { echo "no shaded jar; run: mvn package"; exit 2; }
 

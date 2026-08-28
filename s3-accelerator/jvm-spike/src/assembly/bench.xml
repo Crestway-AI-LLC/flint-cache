@@ -1,0 +1,57 @@
+<assembly xmlns="http://maven.apache.org/ASSEMBLY/2.1.0">
+  <id>bench</id>
+  <formats><format>jar</format></formats>
+  <includeBaseDirectory>false</includeBaseDirectory>
+  <dependencySets>
+    <dependencySet>
+      <outputDirectory>/</outputDirectory>
+      <unpack>true</unpack>
+      <!--
+        scope=test is the WIDEST assembly scope: compile + runtime + provided.
+        The AWS SDK is PROVIDED here, which is right for a library whose host
+        supplies it and wrong for a benchmark landing on a bare box.
+      -->
+      <scope>test</scope>
+      <excludes>
+        <!--
+          bundle is the AWS SDK's fat artifact and is 654 MB on its own - it
+          arrives through hadoop-aws, which this benchmark does not use. The
+          MODULAR sdk jars are also on the classpath (s3 is 3 MB) and are what
+          the client actually needs. Excluding it took the artifact from 718 MB
+          to something that can be copied to a machine.
+        -->
+        <exclude>software.amazon.awssdk:bundle</exclude>
+        <exclude>org.apache.hadoop:*</exclude>
+        <exclude>org.apache.iceberg:*</exclude>
+        <exclude>org.apache.parquet:*</exclude>
+        <exclude>org.apache.avro:*</exclude>
+        <exclude>org.bouncycastle:*</exclude>
+        <!--
+          dnsjava registers an alternative java.net.spi.InetAddressResolverProvider
+          through META-INF/services. Unpacked into a fat jar it fails to load and
+          the JVM turns that into ServiceConfigurationError on the FIRST hostname
+          resolution - so this jar worked perfectly against a 127.0.0.1 fixture,
+          where nothing is ever resolved, and died the moment it reached real S3.
+          The bench does not need an alternative resolver; dropping the artifact
+          drops the class and its registration together.
+        -->
+        <exclude>dnsjava:dnsjava</exclude>
+        <exclude>junit:*</exclude>
+      </excludes>
+      <unpackOptions>
+        <excludes>
+          <exclude>META-INF/*.SF</exclude>
+          <exclude>META-INF/*.DSA</exclude>
+          <exclude>META-INF/*.RSA</exclude>
+          <exclude>module-info.class</exclude>
+        </excludes>
+      </unpackOptions>
+    </dependencySet>
+  </dependencySets>
+  <fileSets>
+    <fileSet>
+      <directory>${project.build.outputDirectory}</directory>
+      <outputDirectory>/</outputDirectory>
+    </fileSet>
+  </fileSets>
+</assembly>

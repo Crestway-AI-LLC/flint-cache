@@ -48,7 +48,7 @@ import software.amazon.s3.analyticsaccelerator.util.S3URI;
  *
  * <pre>java -cp jvm-spike/target/classes:$(cat /tmp/gate_cp.txt) \
  *   ai.crestway.flintaccel.client.FanoutBench \
- *   http://127.0.0.1:9452 redis://127.0.0.1:9399 bucket data/000001.bin 2097152 6</pre>
+ *   http://127.0.0.1:9301 redis://127.0.0.1:9399 bucket data/000001.bin 2097152 6</pre>
  *
  * <p>On a box, {@code packaging/aws/spark-e2e/measure_fanout.sh}, which needs an
  * ordinary E2E run to have populated ivy first. <b>This is unfinished:</b> there

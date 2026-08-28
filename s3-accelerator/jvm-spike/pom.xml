@@ -245,4 +245,45 @@
       </plugin>
     </plugins>
   </build>
+
+  <!--
+    OFF BY DEFAULT. Builds ONE self-contained jar for the benchmarks, so a bench
+    can be copied to a bare box and run.
+
+    The product jar deliberately does not bundle the AWS SDK: it is a library
+    and its host supplies one. Correct for shipping, useless for a benchmark —
+    and the way that surfaced was a paid EC2 run dying on NoClassDefFoundError,
+    because the local test used the full Maven classpath and never exercised the
+    artifact that actually ships. See ADR-0028.
+
+    Only with -Pbench, so ordinary builds and the gate are untouched.
+  -->
+  <profiles>
+    <profile>
+      <id>bench</id>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-assembly-plugin</artifactId>
+            <version>3.7.1</version>
+            <executions>
+              <execution>
+                <id>bench-jar</id>
+                <phase>package</phase>
+                <goals><goal>single</goal></goals>
+                <configuration>
+                  <finalName>flint-accel-bench</finalName>
+                  <appendAssemblyId>false</appendAssemblyId>
+                  <descriptors>
+                    <descriptor>src/assembly/bench.xml</descriptor>
+                  </descriptors>
+                </configuration>
+              </execution>
+            </executions>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+  </profiles>
 </project>
