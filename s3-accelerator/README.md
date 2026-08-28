@@ -255,6 +255,38 @@ keyless command is FORWARDED to pair 0's master, which returns the same
 and against a bare seat. (Established by the Flint core session by probing,
 after this author inferred otherwise from the list.)
 
+### What the client stores, and what an operator may drop
+
+Two key namespaces, and **every key in both is safe to delete at any time** —
+one key, a prefix, or the entire tier, including while reads are in flight.
+
+| Key | Written with | TTL | Holds |
+|---|---|---|---|
+| `c2/{<etag>}/<n>` | `SET` / `MSET` | none | chunk *n* of the object with that ETag |
+| `m1/s3://<bucket>/<key>` | `SETEX` | `fs.s3a.flint.meta.ttl.seconds` | `length\|etag\|kms` — the cached HEAD |
+
+**Why dropping is always safe.** Chunk keys are content-addressed: the ETag is
+*in the key*, so a chunk can only ever be read back for the object version it
+came from, and a dropped chunk costs one range GET. Metadata is a cached HEAD,
+re-derived the same way. Nothing here exists only in the tier — the origin is
+authoritative for all of it, which is what "look-aside" means in practice.
+
+**The braces are load-bearing.** `{<etag>}` is a Redis Cluster hash tag: it puts
+every chunk of one object in a single slot, so an `MGET` over a run never spans
+slots. Do not rewrite these keys to something tidier.
+
+**So eviction is the operator's policy, not the client's business.** The client
+is tested against a tier that loses everything mid-read and against one that
+loses half of an object's chunks; both refill byte-identically with zero
+integrity failures. Set whatever `maxmemory-policy` the workload wants.
+
+**One thing the client cannot see, stated plainly.** A tier that refuses a write
+because it is *full* is indistinguishable, from here, from a tier that is
+*broken*: both become "no cache" and the read goes to the origin. A full
+never-evict tier therefore degrades silently and correctly, but it does not
+announce itself, and no client counter will tell you which of the two you have.
+Watch the tier's own memory metrics for that.
+
 ## Is it working?
 
 Every counter is exposed over **JMX** under `ai.crestway.flintaccel:type=Cache,*`.
