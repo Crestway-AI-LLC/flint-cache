@@ -1,0 +1,99 @@
+# BUG-0070: the rejoin probe scans the WAL, so failover time grows with a master's uptime (OPEN)
+
+**Found** 2026-08-28, decomposing a `min-replicas=1` failover with the sub-phase
+instrumentation added the same day. Severity: high — it makes RTO a function of
+how long a master has been up, which is the one variable an operator does not
+associate with failover.
+
+## Measured
+
+One 60-minute soak, 5 hosts, `min-replicas=1`, one kill per cycle. Every column
+is from the fleet journal, not inferred:
+
+| total | restart | decision window | fence | restore | probe | unacct | cursor |
+|---|---|---|---|---|---|---|---|
+| 1,050 ms | 876 ms | 120 ms | 2 | 25 | **35** | 58 | 149,795 |
+| 5,694 ms | 827 ms | 2,779 ms | 3 | 209 | **2,354** | 213 | 2,832,158 |
+| 7,200 ms | 900 ms | 4,652 ms | 3 | 269 | **4,077** | 303 | 7,774,768 |
+| 7,950 ms | 851 ms | 5,468 ms | 2 | 208 | **4,985** | 273 | 10,329,665 |
+
+**Only `probe` grows.** `fence` is flat at 2-3 ms across all four. `restore` and
+the unaccounted remainder flatten after the first (small-dataset) cycle.
+`restart` is a constant to three digits. Probe tracks the cursor at roughly
+**500 ms per million sequences**, and by cycle 4 is 91% of the decision window
+and 63% of the whole outage.
+
+Note what is NOT correlated: the fence gap. It was 8,988 sequences on the run's
+worst outage and shrank across the earlier soak's cycles while decision time
+doubled. The cost is not proportional to how far behind the replica is.
+
+## Mechanism
+
+    replica restarts
+      -> probe_resume(cursor)                       "can I resume from here?"
+      -> FLINTSYNC <cursor> <gen> <counter>          the REAL tailer handshake
+      -> master: updates_since_budgeted(cursor, 1)
+      -> RocksDB get_updates_since(cursor)           walks WAL files to position
+
+`updates_since_budgeted` takes a 1-byte budget, and the comment above it is
+careful about that: "a budget of 1 byte materializes at most one batch". That
+bounds what comes BACK. It says nothing about what it costs to FIND the cursor,
+and that is the whole expense: RocksDB positions by walking WAL files.
+
+So a yes/no question is answered by a scan whose length is the retained WAL.
+
+## Why "expected" is the wrong frame
+
+That WAL grows is expected. That FAILOVER TIME grows with it is not, and the
+two are only connected by this implementation choice.
+
+The perverse part: the cost rises the more caught-up the replica is. Position
+is reached by walking from the WAL's floor, so a cursor near the tip skips
+nearly the whole file set, while a badly-lagged replica's cursor is found
+sooner. The healthiest replica pays the most.
+
+And it puts two goods in opposition that need not be. WAL retention is what
+makes a rejoin cheap — tail the difference instead of re-seeding the dataset —
+but retention is exactly what makes the probe slow. Today you buy rejoin
+cheapness with failover slowness.
+
+## Prevention, not mitigation
+
+The question is not how to make the scan faster. It is why a resumability check
+touches the WAL at all.
+
+**The master already publishes the answer.** FLINTINFO carries
+`wal_min_acked_seq` and `wal_headroom_seq` — the retained range's bounds, held
+as counters, no scan. "Is `cursor` inside the retained range" is a comparison
+against those. O(1), and independent of uptime.
+
+Three things make that safe rather than a shortcut:
+
+1. **The real sync re-checks.** `try_rewind`'s own comment already says so:
+   "The master re-checks the same fence at FLINTSYNC, so a stale answer here
+   downgrades to a re-seed rather than a divergent copy." An optimistic probe
+   that is occasionally wrong lands in the fallback that exists today.
+2. **A bounds check cannot be optimistic in the dangerous direction.** The
+   retained floor is monotonically increasing, so a cursor that compares as
+   in-range may have been recycled a moment later — which the re-check catches
+   — while a cursor that compares as out-of-range genuinely is.
+3. **It removes the reason the probe exists in its current form.** The probe was
+   added so a transient `EAGAIN` would not be read as a master's refusal
+   (`e54fe7d`, which cut a 95 s outage to single digits). That fix needed a
+   verdict, not a stream. Reusing the full tailer handshake to obtain a verdict
+   is what dragged the WAL in.
+
+Alternatives considered and rejected as mitigation rather than prevention:
+shorter WAL retention (buys RTO by making rejoins re-seed — trades the same two
+goods, just the other way); snapshotting more often (does not help, since the
+scan is from the floor); caching the position on the master (keeps the scan,
+adds invalidation).
+
+## Not yet done
+
+Nothing is changed. The measurement stands on four points from one soak with a
+mechanism identified in source; a fifth cycle was still running when this was
+filed. What would confirm it beyond doubt is the fix itself: if the probe
+becomes a bounds check, `probe` should collapse to single-digit milliseconds and
+stop tracking the cursor, and total outage should fall to roughly
+restart + restore + unaccounted, or about 1.3 s at these sizes.
