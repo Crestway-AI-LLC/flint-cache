@@ -123,3 +123,58 @@ filed. What would confirm it beyond doubt is the fix itself: if the probe
 becomes a bounds check, `probe` should collapse to single-digit milliseconds and
 stop tracking the cursor, and total outage should fall to roughly
 restart + restore + unaccounted, or about 1.3 s at these sizes.
+
+## How it actually landed, and where the plan above was wrong
+
+Two corrections, both found by building it.
+
+**The upper bound is not a bound.** The section above prescribes
+`floor <= cursor <= latest`. The second half is wrong: when `cursor > latest`,
+`updates_since_budgeted` returns an **empty `Ok`**, not a `WalGap` — a replica
+that is level with or ahead of the master is not a retention failure, and
+refusing it there would invent a re-seed the old code never performed. So the
+check answers `Some(true)` for `latest <= cursor` and only ever refuses on the
+FLOOR. Caught in review by the peer session before it shipped.
+
+Ahead-of-tip is a real state, not a curiosity: a demoted master rejoins holding
+writes the survivor never acked. It must re-seed — but that verdict belongs to
+the **promotion fence**, which already runs earlier in the same handler, not to
+a retention check that cannot see lineage.
+
+**A separate command was the wrong shape.** The first implementation added a
+`FLINTWALRANGE` command so the probe could ask for bounds without a handshake.
+`tools/failover_bystander_drill.sh` failed it immediately:
+`FATAL: WALGAP cursor 2 is past the promotion fence 0`. The new command
+answered the retention question **while skipping the fence check** that the
+FLINTSYNC handler performs first, so a superseded copy could be told it was
+resumable. That implementation was reverted in full.
+
+What shipped instead keeps `FLINTSYNC` as the probe — fence check, ordering and
+all — and makes only its retention step cheap, replacing the
+`updates_since_budgeted(cursor, 1)` positioning call with
+`RocksKv::cursor_within_wal_bounds`. When that cannot answer from the WAL's
+bounds (an empty WAL yields no floor) it returns `None` and the handler falls
+through to the original positioning call, so the expensive path remains as the
+fallback rather than the default.
+
+The general lesson: *"make the probe cheap"* was treated as licence to replace
+the probe rather than to make one step of it cheaper. The fence was invisible in
+the cost profile precisely because it is cheap — 2–3 ms — which is what made it
+easy to design past.
+
+**Guarded by a differential test.** `cursor_within_wal_bounds` is deliberately a
+second implementation of a question the positioning call already answers, so
+`bounds_check_agrees_with_the_positioning_call` sweeps a spread of cursors
+across a staged retention gap and asserts the two agree on every one. It also
+asserts it actually reached both verdicts — the first two versions of that test
+passed while never once producing `Some(false)`, because deleting archived
+segments under an open DB does not move the floor, and an empty WAL answers
+`None`.
+
+## What this does NOT fix
+
+Measured in the verification soak, 2026-08-28, cycle 3: a rejoin that needs a
+**full re-seed** cost **94.2 s** of write blackout at `min-replicas-to-write=1`
+(`full sync: received 103 files`, ~8.2 M sequences). The probe's WAL scan is a
+~5 s term; the re-seed is a ~90 s one. Cheapening the probe does not touch it.
+Filed separately as BUG-0071.

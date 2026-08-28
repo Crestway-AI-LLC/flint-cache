@@ -106,29 +106,39 @@ impl RocksKv {
         self.updates_since_budgeted(last_applied, usize::MAX)
     }
 
-    /// The retained WAL's bounds, as `(floor, latest)` — the cheap way to ask
-    /// whether a cursor is still resumable, without positioning at it.
+    /// Is `last_applied` still reachable, answered from the WAL's BOUNDS
+    /// instead of by positioning at it?
     ///
-    /// BUG-0070: `updates_since_budgeted(cursor, 1)` was being used as a
-    /// resumability PREDICATE by the rejoin probe, and its cost is not the byte
-    /// budget — it is `get_updates_since(cursor)` walking WAL files to find the
-    /// one holding `cursor`. Measured across one soak: 35 ms at cursor 149,795
-    /// rising to 4,985 ms at 10,329,665, roughly 500 ms per million sequences,
-    /// which made failover time a function of the master's UPTIME.
+    /// BUG-0070: `updates_since_budgeted(cursor, 1)` was serving as FLINTSYNC's
+    /// reachability test, and its cost is `get_updates_since(cursor)` walking
+    /// WAL files to FIND the cursor — 35 ms at cursor 149,795 rising to
+    /// 4,985 ms at 10,329,665 across one soak, 88% of a failover's decision
+    /// window. The asymmetry that makes this cheap: a scan from 0 matches the
+    /// FIRST WAL file immediately, so the floor costs nothing to learn.
     ///
-    /// The asymmetry this exploits: a scan from 0 matches the FIRST WAL file
-    /// immediately, so obtaining the floor is cheap while positioning at a high
-    /// cursor is not. `latest_sequence_number` is already O(1). So both bounds
-    /// are cheap and only the thing in between was expensive.
+    /// `None` = cannot say cheaply (no WAL entries to bound); the caller must
+    /// fall through to the real check rather than guess.
     ///
-    /// Returns `None` when the WAL holds nothing to iterate — the caller must
-    /// treat that as "cannot say", not as "not resumable", because an empty
-    /// iterator is also what a freshly-opened or fully-caught-up master gives.
-    pub fn wal_bounds(&self) -> Option<(u64, u64)> {
+    /// This IS a second implementation of a question `updates_since_budgeted`
+    /// already answers, which that function's own comment warns against. The
+    /// warning is right and the reason to accept it here is narrow: this
+    /// answers only for the PROBE, which drops the connection before any
+    /// streaming, while the stream itself still positions for real. A
+    /// disagreement therefore costs one re-seed — the fallback that already
+    /// exists — and never a divergent copy.
+    pub fn cursor_within_wal_bounds(&self, last_applied: u64) -> Option<bool> {
         let latest = self.db().latest_sequence_number();
+        if latest <= last_applied {
+            // A caught-up (or ahead) replica: `updates_since_budgeted` returns
+            // an empty Ok here, so reachability is not in question.
+            return Some(true);
+        }
         let mut iter = self.db().get_updates_since(0).ok()?;
-        let (first_seq, _) = iter.next()?.ok()?;
-        Some((first_seq, latest))
+        let (floor, _) = iter.next()?.ok()?;
+        // The stream must serve `last_applied + 1` onwards, so the boundary is
+        // `floor - 1`, not `floor`. Off by one here would re-seed a replica
+        // sitting exactly on the oldest retained batch.
+        Some(last_applied + 1 >= floor)
     }
 
     /// Like `updates_since`, but stops after the first batch that brings
@@ -507,6 +517,139 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    /// The bounds check is a SECOND implementation of the question
+    /// `updates_since_budgeted` answers by positioning. Two implementations
+    /// drift, so this pins them together: over a spread of cursors that
+    /// includes a real retention gap, every verdict must agree with what the
+    /// positioning call actually does. If this fails, the cheap check is
+    /// lying to the probe and a replica is being re-seeded (or resumed) on a
+    /// verdict the stream will contradict.
+    #[test]
+    fn bounds_check_agrees_with_the_positioning_call() {
+        let md = TempDir::new("boundsagree");
+        let (early, latest_before) = {
+            let master = RocksKv::open(&md.0).expect("open");
+            let s = StringStore::new(&master, b"ns", system_clock);
+            for i in 0..200u32 {
+                s.set(1, format!("a{i}").as_bytes(), b"v", SetOptions::default())
+                    .expect("set");
+            }
+            let early = master.db().latest_sequence_number();
+            for round in 0..4 {
+                master.flush();
+                for i in 0..200u32 {
+                    s.set(
+                        1,
+                        format!("b{round}-{i}").as_bytes(),
+                        b"v",
+                        SetOptions::default(),
+                    )
+                    .expect("set");
+                }
+            }
+            master.flush();
+            (early, master.db().latest_sequence_number())
+        };
+
+        // POSITIVE CONTROL: stage a real gap by deleting the archived
+        // segments with the DB CLOSED. Deleting them while it is open leaves
+        // RocksDB serving from its own handles, so the floor does not move and
+        // the `Some(false)` branch is never reached — a green test proving
+        // nothing. Both the delete and the resulting gap are asserted.
+        let arch = md.0.join("archive");
+        let mut deleted = 0usize;
+        if let Ok(d) = std::fs::read_dir(&arch) {
+            for e in d.filter_map(Result::ok) {
+                if std::fs::remove_file(e.path()).is_ok() {
+                    deleted += 1;
+                }
+            }
+        }
+        assert!(
+            deleted > 0,
+            "fixture staged no archived WAL to delete: the out-of-bounds branch is unreachable"
+        );
+
+        let master = RocksKv::open(&md.0).expect("reopen");
+        // The master moves on: a fresh WAL whose oldest batch sits well above
+        // the old cursors. Without this the WAL is EMPTY, the check correctly
+        // answers "cannot say" (None), and no `Some(false)` is ever produced —
+        // the earlier version of this test failed on exactly that.
+        {
+            let s2 = StringStore::new(&master, b"ns", system_clock);
+            for i in 0..100u32 {
+                s2.set(1, format!("c{i}").as_bytes(), b"v", SetOptions::default())
+                    .expect("set");
+            }
+        }
+        let latest = master.db().latest_sequence_number();
+        let mut saw_false = false;
+        let mut saw_true = false;
+        for cursor in [0, 1, early / 2, early, early + 1, latest, latest + 5] {
+            let cheap = master.cursor_within_wal_bounds(cursor);
+            let real = master.updates_since_budgeted(cursor, 1);
+            let real_ok = !matches!(real, Err(ReplError::WalGap(_)));
+            // A `None` ("cannot say") is always safe and asserts nothing:
+            // the handler falls through to the positioning call, so no
+            // verdict is claimed on this cursor.
+            if let Some(v) = cheap {
+                assert_eq!(
+                    v, real_ok,
+                    "cursor {cursor}: bounds check said {v}, positioning said {real_ok} ({real:?})"
+                );
+                saw_false |= !v;
+                saw_true |= v;
+            }
+        }
+        assert!(
+            saw_false && saw_true,
+            "the sweep never exercised both verdicts (false={saw_false} true={saw_true}); \
+             early={early} latest_before={latest_before} latest={latest} deleted={deleted}"
+        );
+    }
+
+    /// A caught-up or ahead-of-tip replica must be answered WITHOUT walking
+    /// the WAL — that is the whole point of the check. `updates_since_budgeted`
+    /// returns an empty Ok here, not a gap, so `true` is the matching answer.
+    /// Ahead-of-tip is a real case: a demoted master rejoins holding writes
+    /// the survivor never saw. It is refused by the promotion fence upstream,
+    /// not here.
+    #[test]
+    fn a_caught_up_or_ahead_cursor_needs_no_scan() {
+        let md = TempDir::new("boundsahead");
+        let master = RocksKv::open(&md.0).expect("open");
+        let s = StringStore::new(&master, b"ns", system_clock);
+        for i in 0..50u32 {
+            s.set(1, format!("k{i}").as_bytes(), b"v", SetOptions::default())
+                .expect("set");
+        }
+        let latest = master.db().latest_sequence_number();
+        assert_eq!(master.cursor_within_wal_bounds(latest), Some(true));
+        assert_eq!(master.cursor_within_wal_bounds(latest + 1_000), Some(true));
+    }
+
+    /// The boundary is `floor - 1`, not `floor`: the stream must serve
+    /// `last_applied + 1` onwards, so a replica sitting exactly on the oldest
+    /// retained batch is resumable. Off by one here re-seeds it needlessly.
+    #[test]
+    fn the_oldest_retained_batch_is_still_resumable() {
+        let md = TempDir::new("boundsfloor");
+        let master = RocksKv::open(&md.0).expect("open");
+        let s = StringStore::new(&master, b"ns", system_clock);
+        for i in 0..100u32 {
+            s.set(1, format!("k{i}").as_bytes(), b"v", SetOptions::default())
+                .expect("set");
+        }
+        let mut iter = master.db().get_updates_since(0).expect("iter");
+        let (floor, _) = iter.next().expect("a batch").expect("ok");
+        drop(iter);
+        assert_eq!(
+            master.cursor_within_wal_bounds(floor.saturating_sub(1)),
+            Some(true),
+            "a cursor one before the floor asks for the floor itself, which is retained"
+        );
     }
 
     /// BUG-0050 PROBE. Is a cursor that has fallen out of the LIVE WAL, but

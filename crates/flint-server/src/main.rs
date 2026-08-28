@@ -384,94 +384,6 @@ fn classify_probe(reply: std::io::Result<Value>) -> ProbeVerdict {
 /// freshly promoted master with `--min-replicas-to-write 1` that re-seed is a
 /// write outage for its whole duration. A refusal still returns immediately:
 /// the master has decided, and the fallback is correct.
-/// `WALRANGE <floor> <latest>` -> the two bounds.
-#[cfg(feature = "rocks")]
-fn parse_wal_range(reply: &str) -> Option<(u64, u64)> {
-    let rest = reply.strip_prefix("WALRANGE ")?;
-    let (floor, latest) = rest.trim().split_once(' ')?;
-    Some((floor.trim().parse().ok()?, latest.trim().parse().ok()?))
-}
-
-/// The whole decision, as a pure function of three numbers — which is the
-/// point of the change: what used to require the master to walk its WAL is a
-/// comparison.
-///
-/// Only the FLOOR refuses. A cursor at or beyond `latest` is Resumable,
-/// because that is what the handshake this replaces answers.
-///
-/// I had this refusing `cursor > latest` on the reasoning that handing a tailer
-/// an unreachable position is a hang rather than an error. That reasoning is
-/// arguable; changing the verdict inside a PERFORMANCE fix is not.
-/// `updates_since_budgeted` opens with `if latest_sequence_number() <=
-/// last_applied { return Ok(Vec::new()) }` — an empty Ok, not a `WalGap` — and
-/// the handshake refuses only on `WalGap`, so an ahead-of-tip cursor has always
-/// been answered `FLINTSYNC-OK`. This path must say the same thing or the fix
-/// smuggles a semantic change under a latency change, which is the hardest kind
-/// to find later.
-///
-/// A replica whose cursor is AHEAD of its master is still alarming — it holds
-/// writes the master does not — so it is said out loud below rather than
-/// resolved here. Making it *behave* differently is a separate decision with
-/// its own justification, not a side effect of making the probe cheap.
-#[cfg(feature = "rocks")]
-fn wal_range_verdict(cursor: u64, floor: u64, latest: u64) -> ProbeVerdict {
-    if cursor > latest {
-        // Loud, because the two ways out of here are both lossy in ways nothing
-        // else distinguishes: resume and diverge silently, or re-seed and
-        // discard. Neither is chosen here; the operator gets told it happened.
-        eprintln!(
-            "rewind: cursor {cursor} is AHEAD of the master's tip {latest} — this replica \
-             holds writes the master does not. Resuming (the handshake's answer); the \
-             extra writes are not replicated and will not be"
-        );
-    }
-    if cursor >= floor {
-        ProbeVerdict::Resumable
-    } else {
-        ProbeVerdict::Refused(format!(
-            "cursor {cursor} is below the master's retained WAL floor {floor} (tip {latest})"
-        ))
-    }
-}
-
-/// Ask the master for its retained WAL bounds and decide locally.
-///
-/// `None` means this master cannot answer cheaply — an older build that does
-/// not know the verb, or a WAL with nothing to bound — and the caller falls
-/// back to the full FLINTSYNC handshake.
-///
-/// TWO PROPERTIES WORTH KNOWING BEFORE DEBUGGING THIS AT 3AM.
-///
-/// **The answer is a claim about a moment, not a contemporaneous one.** The
-/// handshake's OK came from actually positioning; bounds are read and then
-/// acted on. If the floor rotates between the probe and the stream, a
-/// `Resumable` verdict is stale and FLINTSYNC then fails — most likely exactly
-/// when the master is busy enough to rotate quickly. That degrades to the
-/// re-seed which is already the fallback, so it is safe; it is written down
-/// because "the probe said resumable and the sync then failed" is otherwise a
-/// baffling pair of lines.
-///
-/// **A malformed reply falls BACK here, while `classify_probe` treats one as
-/// `Refused` on purpose** ("retrying a malformed exchange is how a boot
-/// spins"). The rules differ deliberately: there, a malformed answer is the
-/// master's final word; here, it only means the cheap path is unavailable, and
-/// the expensive path is still to come and will decide. Do not align them. That fallback is the pre-BUG-0070
-/// behaviour, so a mixed-version pair is never worse off than before, which
-/// matters because the canary drill exercises exactly that one-version step.
-#[cfg(feature = "rocks")]
-fn probe_via_wal_range(target: &str, cursor: u64) -> Option<ProbeVerdict> {
-    match internal_call_once(target, &[b"FLINTWALRANGE"]) {
-        Ok(Value::Simple(reply)) => {
-            let (floor, latest) = parse_wal_range(&reply)?;
-            Some(wal_range_verdict(cursor, floor, latest))
-        }
-        // An error reply is an OLD MASTER or an unbounded WAL, not a refusal.
-        // Reading it as one would turn a version skew into a full re-seed.
-        Ok(_) => None,
-        Err(e) => Some(ProbeVerdict::Transport(e.to_string())),
-    }
-}
-
 #[cfg(feature = "rocks")]
 fn probe_resume(
     target: &str,
@@ -481,22 +393,15 @@ fn probe_resume(
     const ATTEMPTS: u32 = 5;
     let mut last = String::new();
     for attempt in 1..=ATTEMPTS {
-        // CHEAP FIRST. The handshake below makes the master position at
-        // `cursor`, which is a WAL walk whose length is the retention window --
-        // 88% of a failover's decision phase, growing with the master's uptime
-        // (BUG-0070). Bounds answer the same question with two O(1) values, and
-        // the handshake stays as the fallback for a master that cannot.
-        let verdict = probe_via_wal_range(target, cursor).unwrap_or_else(|| {
-            classify_probe(internal_call_once(
-                target,
-                &[
-                    b"FLINTSYNC",
-                    cursor.to_string().as_bytes(),
-                    epoch.generation.to_string().as_bytes(),
-                    epoch.counter.to_string().as_bytes(),
-                ],
-            ))
-        });
+        let verdict = classify_probe(internal_call_once(
+            target,
+            &[
+                b"FLINTSYNC",
+                cursor.to_string().as_bytes(),
+                epoch.generation.to_string().as_bytes(),
+                epoch.counter.to_string().as_bytes(),
+            ],
+        ));
         match verdict {
             ProbeVerdict::Resumable => return Ok(()),
             ProbeVerdict::Refused(e) => return Err(format!("refused: {e}")),
@@ -3960,25 +3865,6 @@ fn execute(
     {
         return flintfence(rocks, args);
     }
-    // FLINTWALRANGE: the retained WAL's `<floor> <latest>`, so a rejoining
-    // replica can decide resumability with a COMPARISON instead of making this
-    // master position at its cursor.
-    //
-    // BUG-0070: the rejoin probe used the real FLINTSYNC handshake as a
-    // predicate, and FLINTSYNC gates its verdict on
-    // `updates_since_budgeted(cursor, 1)` -> `get_updates_since(cursor)`, which
-    // walks WAL files to FIND the cursor. Measured across one soak: 35 ms at
-    // cursor 149,795 rising to 4,985 ms at 10,329,665 — 88% of the failover's
-    // decision window, and growing with the master's uptime rather than with
-    // anything about the replica. Both bounds are cheap (a scan from 0 hits the
-    // first WAL file immediately; `latest_sequence_number` is already O(1)), so
-    // only the positioning in between ever cost anything.
-    if args
-        .first()
-        .is_some_and(|n| n.eq_ignore_ascii_case(b"FLINTWALRANGE"))
-    {
-        return flintwalrange(rocks);
-    }
     // FLINTNSRESTORE <ns> <k> <v> [<k> <v> ...]: apply pre-enveloped rows
     // for namespace <ns> as ONE engine batch — the write half of the
     // namespace-scoped restore (ADR-0011 D5). The CALLER routes: placement
@@ -4353,36 +4239,6 @@ fn flintpromote(
 /// vouch, re-seed. An epoch at or above this node's own claim is bounded by
 /// the node's latest sequence — the asker's copy claims to already be on
 /// this timeline.
-/// `FLINTWALRANGE` -> `WALRANGE <floor> <latest>`, or an error when the WAL has
-/// nothing to iterate.
-///
-/// Deliberately NOT folded into FLINTSYNC. FLINTSYNC's job is to become a
-/// stream, and every attempt to also use it as a cheap predicate is what
-/// BUG-0070 is about; a separate verb keeps the expensive path expensive on
-/// purpose and the cheap question cheap.
-///
-/// An empty WAL answers with an ERROR rather than a range, because "I cannot
-/// say" and "your cursor is gone" must not share a reply. The caller falls back
-/// to the full handshake on an error, which is the pre-BUG-0070 behaviour and
-/// therefore never worse.
-#[cfg(feature = "rocks")]
-fn flintwalrange(rocks: &Option<RocksHandle>) -> Value {
-    let Some(kv) = rocks else {
-        return Value::Error("ERR FLINTWALRANGE requires the rocks engine".into());
-    };
-    match kv.wal_bounds() {
-        Some((floor, latest)) => Value::Simple(format!("WALRANGE {floor} {latest}")),
-        None => Value::Error("ERR WALRANGE unavailable: the WAL has no entries to bound".into()),
-    }
-}
-
-/// Same shape as `flintfence`'s non-rocks twin: the verb must still PARSE and
-/// answer on a mem-engine build, or the dispatch above does not compile.
-#[cfg(not(feature = "rocks"))]
-fn flintwalrange(_rocks: &Option<RocksHandle>) -> Value {
-    Value::Error("ERR FLINTWALRANGE requires the rocks engine".into())
-}
-
 #[cfg(feature = "rocks")]
 fn flintfence(rocks: &Option<RocksHandle>, args: &[Vec<u8>]) -> Value {
     use flint_storage::manifest::{self, Epoch, FenceBound};
@@ -4862,15 +4718,45 @@ fn flintsync(
     // it: a budget of 1 byte materializes at most one batch (batches are
     // never split), and `updates_since_budgeted` returns an empty Ok for a
     // caught-up replica, so a healthy cursor never false-refuses.
-    if let Err(ReplError::WalGap(why)) = kv.updates_since_budgeted(cursor, 1) {
-        let mut out = Vec::new();
-        encode(
-            &Value::Error(format!(
+    // BOUNDS, not positioning. The line below used to be
+    // `updates_since_budgeted(cursor, 1)`, whose 1-byte budget bounds what
+    // comes BACK and not what it costs to FIND the cursor: `get_updates_since`
+    // walks WAL files, measured at 35 ms rising to 4,985 ms as a soak's cursor
+    // moved 149,795 -> 10,329,665, i.e. 88% of a failover's decision window and
+    // a function of the MASTER'S UPTIME (BUG-0070).
+    //
+    // The comment above still holds and is why only THIS test changed: the
+    // promotion-fence check above is untouched, the OK below is unchanged, and
+    // the STREAM further down still calls updates_since_budgeted for real. Only
+    // the probe's reachability question is answered cheaply, and the probe
+    // drops the connection before any streaming happens.
+    //
+    // `None` means the WAL cannot bound the question, so fall through to the
+    // real check rather than guessing.
+    let refusal = match kv.cursor_within_wal_bounds(cursor) {
+        // Cheap and decisive, both ways. This REPLACES the positioning call
+        // rather than preceding it — a pre-check would leave the expensive path
+        // running for every resumable cursor, which is the common case and the
+        // whole cost.
+        Some(true) => None,
+        Some(false) => Some(format!(
+            "WALGAP cursor {cursor} is below this WAL's retained floor: \
+             full sync required"
+        )),
+        // Cannot say cheaply (no WAL entries to bound). Fall through to the
+        // real question rather than guess — the case is rare and correctness
+        // here is worth a scan.
+        None => match kv.updates_since_budgeted(cursor, 1) {
+            Err(ReplError::WalGap(why)) => Some(format!(
                 "WALGAP cursor {cursor} is no longer reachable from this WAL ({why}): \
                  full sync required"
             )),
-            &mut out,
-        );
+            _ => None,
+        },
+    };
+    if let Some(why) = refusal {
+        let mut out = Vec::new();
+        encode(&Value::Error(why), &mut out);
         return stream.write_all(&out);
     }
     let mut out = Vec::new();
@@ -6409,6 +6295,9 @@ mod probe_verdict_tests {
     fn a_master_error_is_a_verdict_not_a_hiccup() {
         for msg in [
             "WALGAP cursor 207196 is no longer reachable from this WAL: full sync required",
+            // The retention refusal the bounds check emits (BUG-0070). Its
+            // wording differs, and the client must not treat that as a hiccup.
+            "WALGAP cursor 207196 is below this WAL's retained floor: full sync required",
             "cursor 999 is past the promotion fence 500 for epoch (0,7)",
         ] {
             assert_eq!(
@@ -6456,79 +6345,6 @@ mod probe_verdict_tests {
     fn an_unparseable_reply_is_refused_so_the_boot_falls_back() {
         assert!(matches!(
             classify_probe(Ok(Value::Integer(7))),
-            ProbeVerdict::Refused(_)
-        ));
-    }
-}
-
-#[cfg(all(test, feature = "rocks"))]
-mod wal_range_probe_tests {
-    use super::{ProbeVerdict, parse_wal_range, wal_range_verdict};
-
-    #[test]
-    fn the_reply_parses_and_a_malformed_one_does_not() {
-        assert_eq!(parse_wal_range("WALRANGE 100 900"), Some((100, 900)));
-        assert_eq!(parse_wal_range("WALRANGE  100   900 "), Some((100, 900)));
-        // Anything else must be None so the caller FALLS BACK to the handshake
-        // rather than inventing bounds. An old master's error reply, a truncated
-        // line and a different verb all land here.
-        for bad in [
-            "WALRANGE 100",
-            "WALRANGE a b",
-            "FLINTSYNC-OK 100 e0.1",
-            "WALRANGE",
-            "",
-        ] {
-            assert_eq!(parse_wal_range(bad), None, "{bad:?} must not parse");
-        }
-    }
-
-    #[test]
-    fn a_cursor_inside_the_retained_range_is_resumable() {
-        assert_eq!(wal_range_verdict(500, 100, 900), ProbeVerdict::Resumable);
-        // Inclusive at both ends: the floor is retained, and a caught-up
-        // replica sitting exactly at the tip must not be told to re-seed.
-        assert_eq!(wal_range_verdict(100, 100, 900), ProbeVerdict::Resumable);
-        assert_eq!(wal_range_verdict(900, 100, 900), ProbeVerdict::Resumable);
-    }
-
-    /// The WALGAP case this replaces: the cursor has been recycled out.
-    #[test]
-    fn a_recycled_cursor_is_refused() {
-        match wal_range_verdict(99, 100, 900) {
-            ProbeVerdict::Refused(why) => {
-                assert!(why.contains("99"), "{why}");
-                assert!(
-                    why.contains("100"),
-                    "the refusal must name the bounds: {why}"
-                );
-            }
-            other => panic!("expected a refusal, got {other:?}"),
-        }
-    }
-
-    /// A cursor past the master's tip RESUMES, because that is what the
-    /// handshake answers: `updates_since_budgeted` returns an empty Ok rather
-    /// than a WalGap when `latest <= cursor`, and only WalGap refuses. This
-    /// test pins the MATCH — an earlier draft refused here, which would have
-    /// changed a verdict inside a latency fix.
-    #[test]
-    fn a_cursor_ahead_of_the_tip_matches_the_handshake_and_resumes() {
-        assert_eq!(wal_range_verdict(901, 100, 900), ProbeVerdict::Resumable);
-        assert_eq!(
-            wal_range_verdict(u64::MAX, 100, 900),
-            ProbeVerdict::Resumable
-        );
-    }
-
-    /// An empty-ish range still decides rather than panicking.
-    #[test]
-    fn a_degenerate_range_still_decides() {
-        assert_eq!(wal_range_verdict(5, 5, 5), ProbeVerdict::Resumable);
-        // 6 is ahead of the tip, not below the floor — resumable, per above.
-        assert_eq!(wal_range_verdict(6, 5, 5), ProbeVerdict::Resumable);
-        assert!(matches!(
-            wal_range_verdict(4, 5, 5),
             ProbeVerdict::Refused(_)
         ));
     }
