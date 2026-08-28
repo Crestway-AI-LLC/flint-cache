@@ -110,10 +110,27 @@ pub enum EventKind {
     /// level up — a conclusion nobody can check, drawn from reads nobody can
     /// see.
     ///
-    /// It will be among the noisiest kinds here. That is affordable because
-    /// `CPJOURNALREAD` filters by kind SERVER-side (ADR-0018 item 1), so a
-    /// reader asking for decisions never pays for these; and because the
-    /// journal now rotates, so volume costs disk rather than horizon.
+    /// It will be among the noisiest kinds here. That is affordable for
+    /// VOLUME: `CPJOURNALREAD` filters by kind SERVER-side (ADR-0018 item 1),
+    /// so a reader asking for decisions never pays for these, and the journal
+    /// rotates, so quantity costs disk rather than horizon.
+    ///
+    /// **Volume is not the only property a new kind can break, and the other
+    /// one has already bitten.** `tools/fleet_journal_drill.sh` asserts that a
+    /// HEALTHY pair's journal holds the supervision arming and NOTHING ELSE.
+    /// Against that invariant one unexpected row is exactly as fatal as ten
+    /// thousand, and server-side filtering does not help because the drill
+    /// reads unfiltered. A `RejoinStarted` kind added the same day fired on
+    /// every replica start and put ops main red, appearing at an unrelated
+    /// ops commit because ops CI builds against core main — so the failure
+    /// surfaces one repo away from its cause.
+    ///
+    /// The rule that follows, and it is stronger than "do not emit during
+    /// drills": **gate an event on the condition it NAMES.** A row that can
+    /// fire when nothing of that name happened is a misnomer before it is an
+    /// invariant violation. `EvidenceGathered` satisfies this — it can only
+    /// be emitted by an actual Tier-1 lookup, which requires both a caller
+    /// and `--evidence` arming, and a healthy fleet has neither.
     EvidenceGathered,
     /// The rotation loop retired a drained previous token (ADR-0006 D3):
     /// its auth count stayed flat across the tenant's subset for a full
