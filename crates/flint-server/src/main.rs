@@ -1414,11 +1414,19 @@ fn main() -> std::io::Result<()> {
             // from the catch-up that follows it. Without it the window between
             // a promotion and writes resuming is one number; with it, restart
             // latency, the rewind decision and the tail are three.
-            if replica_of.is_some() {
+            //
+            // ONLY when there is prior state to reconcile. A replica booting
+            // with no data directory has never joined, so it cannot REjoin --
+            // the event was a misnomer there, and emitting it broke the
+            // fleet_journal drill's invariant that a HEALTHY pair's journal
+            // holds only the supervision arming and no transitions. That
+            // invariant is worth more than the event: a journal that speaks
+            // during ordinary startup teaches operators to ignore it.
+            if replica_of.is_some() && dir_path.exists() {
                 journal_event(
                     flint_journal::EventKind::RejoinStarted,
                     None,
-                    "replica process up; choosing a catch-up path",
+                    "replica process up with existing state; choosing a catch-up path",
                 );
             }
             let reseed = dir_path.join(NEEDS_RESEED).exists();
