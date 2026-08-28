@@ -439,6 +439,19 @@ fn probe_resume(
 #[cfg(feature = "rocks")]
 fn try_rewind(data_dir: &std::path::Path, snaps_dir: &str, target: &str) -> bool {
     use flint_storage::manifest::Epoch;
+    // SUB-PHASE TIMING. The decision window -- process up until a catch-up path
+    // is chosen -- measured at 7.6 s of a 10.9 s budget-breaching outage, 70%
+    // of it, on a fence gap of only 8,988 sequences. So the cost is not
+    // replaying data, and the window contains four candidates: enumerating
+    // snapshots, asking the master to vouch for each distinct epoch
+    // (FLINTFENCE, one NETWORK round trip per epoch, to a master that is
+    // simultaneously refusing writes), restoring the chosen copy, and probing
+    // that the restore can actually resume. Carried in the RejoinDecided row's
+    // cause rather than as new event kinds -- four more kinds is what just
+    // broke fleet_journal's "a healthy pair's journal is quiet" invariant.
+    let t_start = std::time::Instant::now();
+    let mut t_fence_done: Option<std::time::Instant> = None;
+    let mut t_restore_done: Option<std::time::Instant> = None;
     let snaps = std::path::Path::new(snaps_dir);
     let Ok(entries) = std::fs::read_dir(snaps) else {
         eprintln!("rewind: no snapshot dir at {snaps_dir}; full re-seed");
@@ -453,6 +466,10 @@ fn try_rewind(data_dir: &std::path::Path, snaps_dir: &str, target: &str) -> bool
         })
         .collect();
     candidates.sort_by_key(|c| std::cmp::Reverse(c.0));
+    // Declared here, not above: the two early returns between the entry and
+    // this point (no snapshot dir, no epoch-labeled snapshots) leave without
+    // reading it, and a pre-initialised value would be dead.
+    let t_enum = std::time::Instant::now();
     if candidates.is_empty() {
         eprintln!("rewind: no epoch-labeled snapshots in {snaps_dir}; full re-seed");
         return false;
@@ -489,6 +506,10 @@ fn try_rewind(data_dir: &std::path::Path, snaps_dir: &str, target: &str) -> bool
             );
             continue;
         }
+        // First candidate to clear the fence: every FLINTFENCE round trip for
+        // this rejoin has now happened, including those for candidates that
+        // were rejected as past the fence.
+        t_fence_done.get_or_insert_with(std::time::Instant::now);
         // Build beside, then swap: a crash mid-restore must leave either the
         // old dir (marker intact -> retried next boot) or the finished copy,
         // never a half-restored dir that opens.
@@ -585,6 +606,7 @@ fn try_rewind(data_dir: &std::path::Path, snaps_dir: &str, target: &str) -> bool
         // the master had long recycled, and the seat died on the attach's
         // WALGAP where a probe here would have chosen the re-seed while it
         // was still cheap to choose.
+        t_restore_done.get_or_insert_with(std::time::Instant::now);
         match probe_resume(target, restored_cursor, epoch) {
             Ok(()) => {}
             Err(e) => {
@@ -609,10 +631,24 @@ fn try_rewind(data_dir: &std::path::Path, snaps_dir: &str, target: &str) -> bool
         // and discarded on a passing run; this row is what lets the window
         // between promotion and writes-resuming be split into boot, decision
         // and catch-up instead of being one silent 9.9 s.
+        // The breakdown, in the row that already exists. A phase that did not
+        // run reports 0 rather than being omitted, so a reader never has to
+        // guess whether a missing term was fast or skipped.
+        let ms = |a: std::time::Instant, b: std::time::Instant| b.duration_since(a).as_millis();
+        let now = std::time::Instant::now();
+        let fd = t_fence_done.unwrap_or(now);
+        let rd = t_restore_done.unwrap_or(fd);
         journal_event(
             flint_journal::EventKind::RejoinDecided,
             Some(epoch.to_string()),
-            &format!("rewound to seq {seq} (fence {bound}): tailing incrementally"),
+            &format!(
+                "rewound to seq {seq} (fence {bound}): tailing incrementally \
+                 [enumerate={}ms fence={}ms restore={}ms probe={}ms]",
+                ms(t_start, t_enum),
+                ms(t_enum, fd),
+                ms(fd, rd),
+                ms(rd, now),
+            ),
         );
         return true;
     }
