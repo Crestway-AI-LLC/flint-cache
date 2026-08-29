@@ -23,6 +23,59 @@ use crate::rocks::RocksKv;
 /// Lives outside the user envelope space (user rows start with 'M'/'S'/'Z').
 pub const REPL_STATE_KEY: &[u8] = b"\x00flint\x00last_applied";
 
+/// Sparse index over the UPSTREAM -> OWN sequence mapping (BUG-0070).
+///
+/// `own_seq_for_upstream` used to walk the WAL from sequence 0, iterating
+/// every batch and every op, to find the batch whose cursor row reaches a
+/// requested upstream position. Measured at ~0.48 us per retained sequence:
+/// 77 ms at 200 k, 1,157 ms at 2.4 M, and 6,902 ms on a fleet whose cursor
+/// had reached 15.0 M -- 63% of a 10,969 ms failover blackout, and a cost
+/// that grows with the master's UPTIME rather than with anything the
+/// operator can see.
+///
+/// Entries are HINTS ONLY: a lookup picks the newest entry at or before the
+/// requested position and starts the ordinary walk there. The walk is
+/// unchanged and still reads the real cursor rows, so a stale, missing or
+/// too-early entry costs time and never correctness -- and a walk that finds
+/// nothing retries from 0. Nothing here is load-bearing for a result.
+///
+/// The `\x00flint\x00` prefix keeps these rows OUT of the replication stream
+/// (see `SYSTEM_PREFIX`), which is required rather than tidy: own-sequence
+/// numbers are node-local, so an entry copied to another node would name a
+/// position that means something different there.
+const REPL_UPIDX_PREFIX: &[u8] = b"\x00flint\x00upidx\x00";
+
+/// One index entry per this many upstream sequences.
+///
+/// Chosen by measurement, not by feel. The lookup has two costs: the walk
+/// after the hint (which the stride bounds) and RocksDB's own seek to the
+/// starting position (which it does not). At a 100 k stride the walk was
+/// ~134 ms of a 394 ms lookup at 3.6 M sequences; the rest is seek, and no
+/// stride removes it. 10 k trades a 10x bigger index -- still only ~16 bytes
+/// per 10 k sequences, ~24 KB at the 15 M cursor that produced the 6.9 s
+/// failover -- for a walk small enough to disappear next to the seek.
+const REPL_UPIDX_STRIDE: u64 = 10_000;
+
+/// Key for an upstream position. Big-endian so lexicographic order over the
+/// keyspace IS numeric order, which is what makes the reverse seek below find
+/// the newest entry at or before a position.
+fn upidx_key(upstream_seq: u64) -> Vec<u8> {
+    let mut k = REPL_UPIDX_PREFIX.to_vec();
+    k.extend_from_slice(&upstream_seq.to_be_bytes());
+    k
+}
+
+/// Result of one bounded walk in [`RocksKv::own_seq_for_upstream`].
+enum ScanOutcome {
+    /// The first batch whose cursor row reaches the requested position.
+    Found(u64),
+    /// The walk began past the answer, so a match here would not be the
+    /// FIRST match. Caller must restart from the beginning.
+    StartedTooLate,
+    /// Ran off the end without a match.
+    Exhausted,
+}
+
 /// One logical WAL operation (default column family only — the v0 engine
 /// keeps its whole keyspace there by design).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -104,41 +157,6 @@ impl RocksKv {
     /// that know the tail is small.
     pub fn updates_since(&self, last_applied: u64) -> Result<Vec<ReplBatch>, ReplError> {
         self.updates_since_budgeted(last_applied, usize::MAX)
-    }
-
-    /// Is `last_applied` still reachable, answered from the WAL's BOUNDS
-    /// instead of by positioning at it?
-    ///
-    /// BUG-0070: `updates_since_budgeted(cursor, 1)` was serving as FLINTSYNC's
-    /// reachability test, and its cost is `get_updates_since(cursor)` walking
-    /// WAL files to FIND the cursor — 35 ms at cursor 149,795 rising to
-    /// 4,985 ms at 10,329,665 across one soak, 88% of a failover's decision
-    /// window. The asymmetry that makes this cheap: a scan from 0 matches the
-    /// FIRST WAL file immediately, so the floor costs nothing to learn.
-    ///
-    /// `None` = cannot say cheaply (no WAL entries to bound); the caller must
-    /// fall through to the real check rather than guess.
-    ///
-    /// This IS a second implementation of a question `updates_since_budgeted`
-    /// already answers, which that function's own comment warns against. The
-    /// warning is right and the reason to accept it here is narrow: this
-    /// answers only for the PROBE, which drops the connection before any
-    /// streaming, while the stream itself still positions for real. A
-    /// disagreement therefore costs one re-seed — the fallback that already
-    /// exists — and never a divergent copy.
-    pub fn cursor_within_wal_bounds(&self, last_applied: u64) -> Option<bool> {
-        let latest = self.db().latest_sequence_number();
-        if latest <= last_applied {
-            // A caught-up (or ahead) replica: `updates_since_budgeted` returns
-            // an empty Ok here, so reachability is not in question.
-            return Some(true);
-        }
-        let mut iter = self.db().get_updates_since(0).ok()?;
-        let (floor, _) = iter.next()?.ok()?;
-        // The stream must serve `last_applied + 1` onwards, so the boundary is
-        // `floor - 1`, not `floor`. Off by one here would re-seed a replica
-        // sitting exactly on the oldest retained batch.
-        Some(last_applied + 1 >= floor)
     }
 
     /// Like `updates_since`, but stops after the first batch that brings
@@ -304,7 +322,21 @@ impl RocksKv {
         wb.put(REPL_STATE_KEY, batch.last_seq.to_be_bytes());
         self.db()
             .write(wb)
-            .map_err(|e| ReplError::Storage(e.to_string()))
+            .map_err(|e| ReplError::Storage(e.to_string()))?;
+        // Index AFTER the commit, because the value being recorded is the own
+        // sequence the batch just landed at -- which does not exist until it
+        // has. A separate put costs one more sequence; the walk counts ops
+        // generically, so that is invisible to it.
+        //
+        // Best-effort on purpose: a failed index write leaves a gap that the
+        // next stride fills, and a lookup that lands before its target simply
+        // walks further. Failing the APPLY over a hint would trade a durable
+        // write path for a performance aid.
+        if batch.last_seq / REPL_UPIDX_STRIDE != cursor / REPL_UPIDX_STRIDE {
+            let own = self.db().latest_sequence_number();
+            let _ = self.db().put(upidx_key(batch.last_seq), own.to_be_bytes());
+        }
+        Ok(())
     }
 
     /// The engine's newest sequence number (master-side lag reference).
@@ -364,26 +396,88 @@ impl RocksKv {
                 self.seq += 1;
             }
         }
-        let iter = self
-            .db()
-            .get_updates_since(0)
-            .map_err(|e| ReplError::WalGap(e.to_string()))?;
-        for item in iter {
-            let (first_seq, batch) = item.map_err(|e| ReplError::Storage(e.to_string()))?;
-            let mut find = CursorFind {
-                seq: first_seq - 1,
-                reached: None,
-            };
-            batch.iterate(&mut find);
-            if let Some(reached) = find.reached
-                && reached >= upstream_seq
-            {
-                return Ok(find.seq);
+        // The walk, startable from an arbitrary own sequence.
+        //
+        // `verify_start` is what makes an untrusted hint safe. `get_updates_since`
+        // SKIPS the batch at its starting position (this module's header), so a
+        // hint landing ON the answer's batch steps over it and the scan happily
+        // returns the NEXT qualifying batch -- a LATER position, from which a
+        // replica would resume past data it never applied. A failed scan was
+        // never the danger; a successful wrong one was.
+        //
+        // So: the first cursor-bearing batch we see must still be BELOW the
+        // target. Cursor rows are monotone, so that proves we started early
+        // enough that no earlier batch could qualify, which is exactly the
+        // claim "the first match found is THE first match". If it does not
+        // hold we started too late and say so, and the caller walks from 0.
+        let scan = |from: u64, verify_start: bool| -> Result<ScanOutcome, ReplError> {
+            let iter = self
+                .db()
+                .get_updates_since(from)
+                .map_err(|e| ReplError::WalGap(e.to_string()))?;
+            let mut checked = !verify_start;
+            for item in iter {
+                let (first_seq, batch) = item.map_err(|e| ReplError::Storage(e.to_string()))?;
+                let mut find = CursorFind {
+                    seq: first_seq - 1,
+                    reached: None,
+                };
+                batch.iterate(&mut find);
+                let Some(reached) = find.reached else {
+                    continue; // no cursor row: says nothing either way
+                };
+                if !checked {
+                    checked = true;
+                    if reached >= upstream_seq {
+                        return Ok(ScanOutcome::StartedTooLate);
+                    }
+                }
+                if reached >= upstream_seq {
+                    return Ok(ScanOutcome::Found(find.seq));
+                }
             }
+            Ok(ScanOutcome::Exhausted)
+        };
+
+        // BUG-0070: start at the newest index entry STRICTLY BELOW the target
+        // rather than at sequence 0, bounding the walk to about one stride.
+        // Strictly below, because an entry landing exactly on the target names
+        // the batch the iterator will skip.
+        let hint = self.upidx_hint(upstream_seq);
+        if hint > 0
+            && let ScanOutcome::Found(found) = scan(hint, true)?
+        {
+            return Ok(found);
         }
-        Err(ReplError::WalGap(format!(
-            "no apply batch reaching upstream seq {upstream_seq} is retained in this WAL"
-        )))
+        match scan(0, false)? {
+            ScanOutcome::Found(found) => Ok(found),
+            _ => Err(ReplError::WalGap(format!(
+                "no apply batch reaching upstream seq {upstream_seq} is retained in this WAL"
+            ))),
+        }
+    }
+
+    /// Newest indexed OWN sequence for an upstream position STRICTLY BELOW
+    /// `upstream_seq`, or 0 when the index has nothing to offer (an un-indexed
+    /// span, a fleet older than the index, a node that was never a replica).
+    /// Zero means "walk from the beginning" -- the behaviour before the index.
+    fn upidx_hint(&self, upstream_seq: u64) -> u64 {
+        let Some(below) = upstream_seq.checked_sub(1) else {
+            return 0;
+        };
+        let key = upidx_key(below);
+        let mut it = self.db().iterator(rocksdb::IteratorMode::From(
+            &key,
+            rocksdb::Direction::Reverse,
+        ));
+        match it.next() {
+            // Reverse-from lands on the greatest key <= `key`, and big-endian
+            // encoding makes that the greatest upstream position <= it.
+            Some(Ok((k, v))) if k.starts_with(REPL_UPIDX_PREFIX) && v.len() == 8 => {
+                u64::from_be_bytes(v.as_ref().try_into().unwrap_or([0u8; 8]))
+            }
+            _ => 0,
+        }
     }
 
     /// The retained batch whose span COVERS `cursor`, clamped to it, or None
@@ -519,136 +613,409 @@ mod tests {
         }
     }
 
-    /// The bounds check is a SECOND implementation of the question
-    /// `updates_since_budgeted` answers by positioning. Two implementations
-    /// drift, so this pins them together: over a spread of cursors that
-    /// includes a real retention gap, every verdict must agree with what the
-    /// positioning call actually does. If this fails, the cheap check is
-    /// lying to the probe and a replica is being re-seeded (or resumed) on a
-    /// verdict the stream will contradict.
+    /// The index is a HINT. This pins the property everything else rests on:
+    /// whatever the hint says -- right, stale, absent, or actively wrong --
+    /// the answer must be the one the plain walk gives. Adversarial rather
+    /// than happy-path on purpose: a hint that merely works when correct is
+    /// not the claim being made.
     #[test]
-    fn bounds_check_agrees_with_the_positioning_call() {
-        let md = TempDir::new("boundsagree");
-        let (early, latest_before) = {
-            let master = RocksKv::open(&md.0).expect("open");
-            let s = StringStore::new(&master, b"ns", system_clock);
-            for i in 0..200u32 {
-                s.set(1, format!("a{i}").as_bytes(), b"v", SetOptions::default())
-                    .expect("set");
-            }
-            let early = master.db().latest_sequence_number();
-            for round in 0..4 {
-                master.flush();
-                for i in 0..200u32 {
-                    s.set(
+    fn a_hint_never_changes_the_answer() {
+        let d = TempDir::new("upidxhint");
+        let kv = RocksKv::open(&d.0).expect("open");
+        // A handful of applied batches, so real cursor rows exist to be found.
+        let mut upstream = 0u64;
+        for b in 0..8u64 {
+            let ops: Vec<ReplOp> = (0..5u32)
+                .map(|i| ReplOp::Put {
+                    key: format!("k{b}-{i}").into_bytes(),
+                    value: b"v".to_vec(),
+                })
+                .collect();
+            let batch = ReplBatch {
+                first_seq: upstream + 1,
+                last_seq: upstream + ops.len() as u64,
+                ops,
+            };
+            upstream = batch.last_seq;
+            kv.apply_batch(&batch).expect("apply");
+        }
+        let target = 20u64;
+        // Truth, with an empty index (no entry was written: the stride is far
+        // above anything this fixture reaches, which the assert below pins).
+        assert_eq!(kv.upidx_hint(target), 0, "fixture unexpectedly indexed");
+        let truth = kv.own_seq_for_upstream(target).expect("baseline");
+
+        // Now poison the index in every direction that matters.
+        let latest = kv.db().latest_sequence_number();
+        for (label, at, own) in [
+            ("far too early", 1u64, 1u64),
+            ("one before the target", target - 1, 2),
+            ("exactly the target", target, truth),
+            ("past the answer", target, latest),
+            ("beyond the WAL entirely", target, latest + 10_000),
+        ] {
+            kv.db()
+                .put(upidx_key(at), own.to_be_bytes())
+                .expect("plant");
+            assert_eq!(
+                kv.own_seq_for_upstream(target).expect("with hint"),
+                truth,
+                "hint '{label}' (upstream {at} -> own {own}) changed the answer"
+            );
+        }
+    }
+
+    /// POSITIVE CONTROL on the writer: crossing a stride must actually record
+    /// an entry. Without this the hint test above passes vacuously forever on
+    /// an index nothing ever writes -- which is precisely how the retention
+    /// "fix" this replaced went unnoticed.
+    ///
+    /// The stride is crossed by moving the UPSTREAM cursor, not by writing
+    /// 100 k rows: the boundary is a property of the upstream sequence, so a
+    /// six-op batch landing across it exercises the same branch in
+    /// milliseconds.
+    #[test]
+    fn crossing_a_stride_records_an_index_entry() {
+        let d = TempDir::new("upidxwrite");
+        let kv = RocksKv::open(&d.0).expect("open");
+        kv.set_last_applied(REPL_UPIDX_STRIDE - 1).expect("seed");
+        assert_eq!(
+            kv.upidx_hint(REPL_UPIDX_STRIDE + 5),
+            0,
+            "nothing should be indexed before the crossing"
+        );
+        let ops: Vec<ReplOp> = (0..6u32)
+            .map(|i| ReplOp::Put {
+                key: format!("s{i}").into_bytes(),
+                value: b"v".to_vec(),
+            })
+            .collect();
+        let batch = ReplBatch {
+            first_seq: REPL_UPIDX_STRIDE,
+            last_seq: REPL_UPIDX_STRIDE + 5,
+            ops,
+        };
+        kv.apply_batch(&batch).expect("apply");
+        // Queried from ABOVE the entry: `upidx_hint` selects strictly below
+        // its argument, because an entry landing exactly on the target names
+        // the batch `get_updates_since` will skip.
+        let hint = kv.upidx_hint(REPL_UPIDX_STRIDE + 100);
+        assert!(hint > 0, "crossing a stride recorded no index entry");
+        assert_eq!(
+            kv.upidx_hint(REPL_UPIDX_STRIDE + 5),
+            0,
+            "an entry AT the target must not be offered as a hint"
+        );
+        // And it must point at a real position in THIS node's space.
+        assert!(
+            hint <= kv.db().latest_sequence_number(),
+            "index entry {hint} is past the latest sequence"
+        );
+    }
+
+    /// Index rows must never reach another node: own-sequence numbers are
+    /// node-local, so a copied entry names a position that means something
+    /// else there. That exclusion is the `SYSTEM_PREFIX` filter the streaming
+    /// path already applies and `system_rows_do_not_replicate_but_advance_the_cursor`
+    /// already proves; what is asserted here is that these keys are INSIDE it.
+    #[test]
+    fn index_rows_sit_under_the_non_replicating_prefix() {
+        assert!(
+            upidx_key(0).starts_with(SYSTEM_PREFIX),
+            "index keys must carry the system prefix or they will replicate"
+        );
+        assert!(upidx_key(u64::MAX).starts_with(SYSTEM_PREFIX));
+        // Big-endian ordering is what makes the reverse seek mean "newest at
+        // or before". A little-endian key would still look fine in isolation.
+        assert!(upidx_key(1) < upidx_key(2));
+        assert!(upidx_key(255) < upidx_key(256));
+        assert!(upidx_key(u64::MAX - 1) < upidx_key(u64::MAX));
+    }
+
+    /// BUG-0070 COST PROBE. The shipped fix assumed an asymmetry it never
+    /// measured: that `get_updates_since(0)` matches the first WAL file
+    /// immediately while a HIGH cursor walks to position, so a bounds check
+    /// would be cheap where positioning was not. The fleet says otherwise --
+    /// probe cost still scaled with WAL size after the fix (3,073 ms at cursor
+    /// 2.95 M, against 2,354 ms at 2.8 M before it).
+    ///
+    /// This asks the question locally, where nothing else is moving, and
+    /// separates the two candidate costs:
+    ///   * CONSTRUCT  -- building the iterator (enumerating/opening WAL files)
+    ///   * FIRST      -- advancing to the first batch (seeking to a position)
+    ///
+    /// If construct dominates and is equal for both start positions, the
+    /// asymmetry does not exist and no bounds check phrased in terms of this
+    /// API can be cheap. (It did, and it does not -- see the correction in
+    /// docs/bugs/0070. The cost is the WALK, which is neither of these, and
+    /// the third arm below is what finally measured it.)
+    ///
+    /// Prints, asserts nothing about the answer. It DOES assert the fixture
+    /// reached a production-like shape (many WAL files), because a single-file
+    /// WAL would answer a different question cheaply and look like good news.
+    #[test]
+    #[ignore = "measurement: writes millions of sequences; run with --release --ignored"]
+    fn bug_0070_probe_wal_scan_cost_by_start_position() {
+        use std::time::Instant;
+        let d = TempDir::new("walcost");
+        // Long TTL / big cap: nothing must be pruned mid-run, so the only
+        // variable is how much WAL is retained.
+        let kv = RocksKv::open_with_retention(&d.0, 24 * 3600, 64 * 1024).expect("open");
+        let st = StringStore::new(&kv, b"ns", system_clock);
+
+        let count_wal = || {
+            let live = std::fs::read_dir(&d.0)
+                .map(|r| {
+                    r.filter_map(Result::ok)
+                        .filter(|e| e.file_name().to_string_lossy().ends_with(".log"))
+                        .count()
+                })
+                .unwrap_or(0);
+            let arch = std::fs::read_dir(d.0.join("archive"))
+                .map(|r| r.filter_map(Result::ok).count())
+                .unwrap_or(0);
+            (live, arch)
+        };
+
+        eprintln!(
+            "{:>10} {:>8} {:>7} {:>12} {:>12} {:>12} {:>12} {:>12}",
+            "seqs", "wal", "arch", "cons(0)ms", "first(0)ms", "cons(hi)ms", "first(hi)ms", "WALKms"
+        );
+        // VALUE SIZE MATTERS and defaulted wrong the first time: at 1 byte a
+        // 3 M-sequence WAL is 60 small files, while the fleet writes 1 KiB and
+        // retains gigabytes. WAL retention is a TTL/SIZE budget, so the file
+        // count and bytes -- not the sequence count -- are what a scan meets.
+        let vsize: usize = std::env::var("FLINT_PROBE_VALUE_BYTES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1);
+        let val = vec![b'x'; vsize];
+        let targets: Vec<u64> = std::env::var("FLINT_PROBE_TARGETS")
+            .ok()
+            .map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect())
+            .unwrap_or_else(|| vec![100_000, 500_000, 1_000_000, 2_000_000, 3_000_000]);
+        eprintln!("  value_bytes={vsize}");
+        let mut written = 0u64;
+        for target in targets {
+            while written < target {
+                for _ in 0..1_000 {
+                    st.set(
                         1,
-                        format!("b{round}-{i}").as_bytes(),
-                        b"v",
+                        format!("k{written}").as_bytes(),
+                        &val,
                         SetOptions::default(),
                     )
                     .expect("set");
+                    written += 1;
+                }
+                // Flush periodically so the WAL becomes MANY files, which is
+                // the production shape. One giant live file would make the
+                // enumeration hypothesis untestable.
+                if written.is_multiple_of(50_000) {
+                    kv.flush();
                 }
             }
-            master.flush();
-            (early, master.db().latest_sequence_number())
-        };
+            let latest = kv.db().latest_sequence_number();
+            let hi = latest.saturating_sub(1);
 
-        // POSITIVE CONTROL: stage a real gap by deleting the archived
-        // segments with the DB CLOSED. Deleting them while it is open leaves
-        // RocksDB serving from its own handles, so the floor does not move and
-        // the `Some(false)` branch is never reached — a green test proving
-        // nothing. Both the delete and the resulting gap are asserted.
-        let arch = md.0.join("archive");
-        let mut deleted = 0usize;
-        if let Ok(d) = std::fs::read_dir(&arch) {
-            for e in d.filter_map(Result::ok) {
-                if std::fs::remove_file(e.path()).is_ok() {
-                    deleted += 1;
-                }
-            }
+            let t = Instant::now();
+            let mut it0 = kv.db().get_updates_since(0).expect("iter0");
+            let c0 = t.elapsed();
+            let t = Instant::now();
+            let _ = it0.next();
+            let f0 = t.elapsed();
+            drop(it0);
+
+            let t = Instant::now();
+            let mut ith = kv.db().get_updates_since(hi).expect("iterhi");
+            let ch = t.elapsed();
+            let t = Instant::now();
+            let _ = ith.next();
+            let fh = t.elapsed();
+            drop(ith);
+
+            // The WALK, not the construct: this is what the FLINTSYNC handler
+            // actually pays on the rewind path, and what arms 1-2 could not see.
+            let t = Instant::now();
+            let _ = kv.own_seq_for_upstream(hi);
+            let walk = t.elapsed().as_secs_f64() * 1000.0;
+
+            let (live, arch) = count_wal();
+            eprintln!(
+                "{:>10} {:>8} {:>7} {:>12.1} {:>12.1} {:>12.1} {:>12.1} {:>12.1}",
+                latest,
+                live,
+                arch,
+                c0.as_secs_f64() * 1000.0,
+                f0.as_secs_f64() * 1000.0,
+                ch.as_secs_f64() * 1000.0,
+                fh.as_secs_f64() * 1000.0,
+                walk
+            );
         }
-        assert!(
-            deleted > 0,
-            "fixture staged no archived WAL to delete: the out-of-bounds branch is unreachable"
-        );
-
-        let master = RocksKv::open(&md.0).expect("reopen");
-        // The master moves on: a fresh WAL whose oldest batch sits well above
-        // the old cursors. Without this the WAL is EMPTY, the check correctly
-        // answers "cannot say" (None), and no `Some(false)` is ever produced —
-        // the earlier version of this test failed on exactly that.
+        // THIRD ARM, and the one that matters: `own_seq_for_upstream` does not
+        // stop at the first batch -- it ITERATES every batch and every op from
+        // sequence 0 until it finds the cursor row. Construction being cheap
+        // (arms 1-2) says nothing about that walk, which is the mistake this
+        // probe was written to correct.
+        //
+        // This fixture is a standalone master with no REPL_STATE_KEY rows, so
+        // the lookup MISSES and walks the whole WAL. That is the right shape:
+        // on the fleet the translated cursor sits near the tip (15,037,880 of
+        // ~15.1 M), so the real scan is nearly the full walk too.
         {
-            let s2 = StringStore::new(&master, b"ns", system_clock);
-            for i in 0..100u32 {
-                s2.set(1, format!("c{i}").as_bytes(), b"v", SetOptions::default())
-                    .expect("set");
-            }
+            let latest = kv.db().latest_sequence_number();
+            let t = Instant::now();
+            let r = kv.own_seq_for_upstream(latest.saturating_sub(1));
+            let ms = t.elapsed().as_secs_f64() * 1000.0;
+            eprintln!(
+                "own_seq_for_upstream(latest-1) over {latest} seqs: {ms:.1}ms  (result: {})",
+                match &r {
+                    Ok(v) => format!("Ok({v})"),
+                    Err(e) => format!("{e:?}"),
+                }
+            );
         }
-        let latest = master.db().latest_sequence_number();
-        let mut saw_false = false;
-        let mut saw_true = false;
-        for cursor in [0, 1, early / 2, early, early + 1, latest, latest + 5] {
-            let cheap = master.cursor_within_wal_bounds(cursor);
-            let real = master.updates_since_budgeted(cursor, 1);
-            let real_ok = !matches!(real, Err(ReplError::WalGap(_)));
-            // A `None` ("cannot say") is always safe and asserts nothing:
-            // the handler falls through to the positioning call, so no
-            // verdict is claimed on this cursor.
-            if let Some(v) = cheap {
-                assert_eq!(
-                    v, real_ok,
-                    "cursor {cursor}: bounds check said {v}, positioning said {real_ok} ({real:?})"
-                );
-                saw_false |= !v;
-                saw_true |= v;
+
+        // SECOND ARM: the same two calls while a writer hammers the DB. The
+        // first arm measured an IDLE database; the fleet's master is ingesting
+        // continuously and refusing writes at the moment the probe runs, and
+        // that difference is the only one the first arm cannot see.
+        {
+            use std::sync::Arc;
+            use std::sync::atomic::{AtomicBool, Ordering};
+            let stop = Arc::new(AtomicBool::new(false));
+            let kv2 = Arc::new(kv);
+            let w_stop = stop.clone();
+            let w_kv = kv2.clone();
+            let writer = std::thread::spawn(move || {
+                let ws = StringStore::new(&*w_kv, b"ns", system_clock);
+                let mut i = 10_000_000u64;
+                while !w_stop.load(Ordering::Relaxed) {
+                    for _ in 0..200 {
+                        let _ = ws.set(1, format!("h{i}").as_bytes(), b"v", SetOptions::default());
+                        i += 1;
+                    }
+                }
+                i
+            });
+            // Let the writer get going so the measurement lands under load.
+            for _ in 0..40 {
+                std::thread::yield_now();
             }
+            let mut worst0 = 0.0f64;
+            let mut worsth = 0.0f64;
+            for _ in 0..20 {
+                let latest = kv2.db().latest_sequence_number();
+                let hi = latest.saturating_sub(1);
+                let t = Instant::now();
+                let mut it0 = kv2.db().get_updates_since(0).expect("iter0");
+                let _ = it0.next();
+                let e0 = t.elapsed().as_secs_f64() * 1000.0;
+                drop(it0);
+                let t = Instant::now();
+                let mut ith = kv2.db().get_updates_since(hi).expect("iterhi");
+                let _ = ith.next();
+                let eh = t.elapsed().as_secs_f64() * 1000.0;
+                drop(ith);
+                worst0 = worst0.max(e0);
+                worsth = worsth.max(eh);
+            }
+            stop.store(true, Ordering::Relaxed);
+            let ended = writer.join().expect("writer");
+            eprintln!(
+                "UNDER LOAD (writer active, {} writes issued): worst from(0)={worst0:.1}ms  worst from(hi)={worsth:.1}ms",
+                ended - 10_000_000
+            );
+            let (l2, a2) = count_wal();
+            eprintln!("  wal files after load arm: live={l2} archive={a2}");
         }
+
+        // FOURTH ARM -- the fix, measured the same way the bug was. A
+        // replica-shaped DB (real apply batches, so real cursor rows and real
+        // index entries), translated near the tip, with the index present and
+        // then with it deleted. The answers must be IDENTICAL: this is the
+        // differential check at realistic scale, not just in the unit tests.
+        {
+            let d2 = TempDir::new("upidxbench");
+            let kv2 = RocksKv::open(&d2.0).expect("open2");
+            let mut upstream = 0u64;
+            let goal: u64 = std::env::var("FLINT_PROBE_APPLY_SEQS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(2_400_000);
+            while upstream < goal {
+                // Same value size as the arms above: the walk's cost is
+                // dominated by WAL BYTES read, not by op count, so a fixture
+                // with tiny values understates the gain by ~40x.
+                let ops: Vec<ReplOp> = (0..1_000u32)
+                    .map(|i| ReplOp::Put {
+                        key: format!("a{upstream}-{i}").into_bytes(),
+                        value: val.clone(),
+                    })
+                    .collect();
+                let b = ReplBatch {
+                    first_seq: upstream + 1,
+                    last_seq: upstream + ops.len() as u64,
+                    ops,
+                };
+                upstream = b.last_seq;
+                kv2.apply_batch(&b).expect("apply");
+            }
+            let target = upstream.saturating_sub(5_000);
+
+            let t = Instant::now();
+            let with_idx = kv2.own_seq_for_upstream(target);
+            let ms_with = t.elapsed().as_secs_f64() * 1000.0;
+
+            // Strip the index and ask again: this is the pre-fix path.
+            let mut keys = Vec::new();
+            let it = kv2.db().iterator(rocksdb::IteratorMode::From(
+                REPL_UPIDX_PREFIX,
+                rocksdb::Direction::Forward,
+            ));
+            for row in it.flatten() {
+                if !row.0.starts_with(REPL_UPIDX_PREFIX) {
+                    break;
+                }
+                keys.push(row.0.to_vec());
+            }
+            let planted = keys.len();
+            for k in keys {
+                kv2.db().delete(k).expect("del");
+            }
+            assert!(
+                planted > 0,
+                "no index entries were written: this arm would compare the \
+                 full walk against itself and report a speedup of 1x"
+            );
+
+            let t = Instant::now();
+            let without = kv2.own_seq_for_upstream(target);
+            let ms_without = t.elapsed().as_secs_f64() * 1000.0;
+
+            assert_eq!(
+                format!("{with_idx:?}"),
+                format!("{without:?}"),
+                "the index CHANGED the answer at {upstream} sequences"
+            );
+            eprintln!(
+                "own_seq_for_upstream near tip of {upstream} upstream seqs \
+                 ({planted} index entries): indexed={ms_with:.1}ms  \
+                 unindexed={ms_without:.1}ms  speedup={:.1}x",
+                if ms_with > 0.0 {
+                    ms_without / ms_with
+                } else {
+                    0.0
+                }
+            );
+        }
+
+        let (live, arch) = count_wal();
         assert!(
-            saw_false && saw_true,
-            "the sweep never exercised both verdicts (false={saw_false} true={saw_true}); \
-             early={early} latest_before={latest_before} latest={latest} deleted={deleted}"
-        );
-    }
-
-    /// A caught-up or ahead-of-tip replica must be answered WITHOUT walking
-    /// the WAL — that is the whole point of the check. `updates_since_budgeted`
-    /// returns an empty Ok here, not a gap, so `true` is the matching answer.
-    /// Ahead-of-tip is a real case: a demoted master rejoins holding writes
-    /// the survivor never saw. It is refused by the promotion fence upstream,
-    /// not here.
-    #[test]
-    fn a_caught_up_or_ahead_cursor_needs_no_scan() {
-        let md = TempDir::new("boundsahead");
-        let master = RocksKv::open(&md.0).expect("open");
-        let s = StringStore::new(&master, b"ns", system_clock);
-        for i in 0..50u32 {
-            s.set(1, format!("k{i}").as_bytes(), b"v", SetOptions::default())
-                .expect("set");
-        }
-        let latest = master.db().latest_sequence_number();
-        assert_eq!(master.cursor_within_wal_bounds(latest), Some(true));
-        assert_eq!(master.cursor_within_wal_bounds(latest + 1_000), Some(true));
-    }
-
-    /// The boundary is `floor - 1`, not `floor`: the stream must serve
-    /// `last_applied + 1` onwards, so a replica sitting exactly on the oldest
-    /// retained batch is resumable. Off by one here re-seeds it needlessly.
-    #[test]
-    fn the_oldest_retained_batch_is_still_resumable() {
-        let md = TempDir::new("boundsfloor");
-        let master = RocksKv::open(&md.0).expect("open");
-        let s = StringStore::new(&master, b"ns", system_clock);
-        for i in 0..100u32 {
-            s.set(1, format!("k{i}").as_bytes(), b"v", SetOptions::default())
-                .expect("set");
-        }
-        let mut iter = master.db().get_updates_since(0).expect("iter");
-        let (floor, _) = iter.next().expect("a batch").expect("ok");
-        drop(iter);
-        assert_eq!(
-            master.cursor_within_wal_bounds(floor.saturating_sub(1)),
-            Some(true),
-            "a cursor one before the floor asks for the floor itself, which is retained"
+            live + arch >= 8,
+            "fixture never produced a multi-file WAL (live={live} archive={arch}): \
+             this run measured a shape production does not have"
         );
     }
 
