@@ -3542,7 +3542,11 @@ fn verify(inv: &Inventory, args: &[String]) {
     // not the default because divergent eviction policy is the one shape
     // nothing else surfaces at deploy time.
     let allow_mismatch = args.iter().any(|a| a == "--allow-evictable-mismatch");
-    let problems = verify_checks(inv, probe.as_deref(), true, allow_mismatch);
+    // BUG-0074: refusing writes rather than running single-copy is a real
+    // posture, just an expensive one, so it has an escape hatch like the
+    // eviction guard's.
+    let allow_blocking = args.iter().any(|a| a == "--allow-blocking-min-replicas");
+    let problems = verify_checks(inv, probe.as_deref(), true, allow_mismatch, allow_blocking);
     println!();
     if problems.is_empty() {
         println!(
@@ -3572,7 +3576,7 @@ fn verify_after(inv: &Inventory, op: &str) {
     // members one at a time, and a refusal here would fail the very roll that
     // is converging them. The roll-grace window below is what makes that safe
     // rather than permissive -- a member older than the window is not mid-roll.
-    let problems = verify_checks(inv, None, false, true);
+    let problems = verify_checks(inv, None, false, true, true);
     if problems.is_empty() {
         println!("verify: {op} left the cluster consistent");
         return;
@@ -3594,6 +3598,7 @@ fn verify_checks(
     probe: Option<&str>,
     loud: bool,
     allow_evictable_mismatch: bool,
+    allow_blocking_min_replicas: bool,
 ) -> Vec<String> {
     let tls = tls_client(inv);
     let mut problems: Vec<String> = Vec::new();
@@ -3627,6 +3632,58 @@ fn verify_checks(
 
     head("== pairs: one master each, coherent epochs, one build");
     let mut builds: BTreeSet<String> = BTreeSet::new();
+    // BUG-0074: MIN-REPLICAS THAT CANNOT SURVIVE A FAILOVER.
+    //
+    // After a failover the survivors are `members - 1`, and one of them IS the
+    // new master, so live replicas = `members - 2`. A gate above that number
+    // does not shed writes occasionally -- it sheds EVERY write after EVERY
+    // failover, until the dead seat rejoins. On a two-member pair
+    // min-replicas=1 therefore means a guaranteed write outage per failover,
+    // lasting a rewind at best and a full re-seed at worst (BUG-0071 measured
+    // 94.2 s of one).
+    //
+    // That is a real posture -- "never accept a write that is not on two
+    // copies" -- and the server deliberately honours whatever value it is
+    // given. What was missing is anyone saying so at DEPLOY, while the fleet
+    // is still being shaped: the number is chosen once and its consequence
+    // arrives at the worst possible moment, months later.
+    //
+    // Read from the LIVE seat rather than the inventory: the value is
+    // hot-reloadable through FLINTCONFIG, so the inventory is what was asked
+    // for and FLINTINFO is what is true.
+    for (i, pair) in inv.pairs.iter().enumerate() {
+        if pair.len() < 2 {
+            continue;
+        }
+        let survivable = pair.len().saturating_sub(2);
+        for addr in pair {
+            let Some(mr) = info_field(addr, &tls, "min_replicas_to_write:")
+                .and_then(|v| v.parse::<usize>().ok())
+            else {
+                continue; // down or too old to report: a different problem, reported elsewhere
+            };
+            if mr <= survivable {
+                continue;
+            }
+            let detail = format!(
+                "pair {i}: {addr} has min-replicas-to-write {mr}, but a {}-member pair leaves \
+                 {survivable} live replica(s) after a failover — so EVERY failover sheds every \
+                 write until the dead seat rejoins. Set min-replicas-to-write {survivable} or \
+                 lower, add a member, or bound the exposure with widowed-grace-ms instead",
+                pair.len()
+            );
+            if allow_blocking_min_replicas {
+                if loud {
+                    println!(
+                        "  --   min-replicas {detail} (ALLOWED by --allow-blocking-min-replicas)"
+                    );
+                }
+            } else {
+                note(false, "min-replicas survivability", detail);
+            }
+        }
+    }
+
     // BUG-0069: EVICTION POLICY AGREEMENT. `evictable_ns_agree` already exists
     // on the node and FLINTINFO already reports it, but a detector is not a
     // guard -- it tells an operator afterwards, and until this there was no
