@@ -266,3 +266,32 @@ correctness and nothing proved EFFECT. Then the first local measurement missed
 the real cost too — it timed iterator construction and the first item, which is
 neither of the things the code executes. Measuring the part you have a
 hypothesis about is not measuring.
+
+
+## Measured on a fleet, 2026-08-28
+
+The correction above says the fix is "a large improvement and NOT a constant
+one", on the strength of a local fixture. **The fleet says it is flat**, and the
+fleet is the claim that matters:
+
+| cursor | before | after |
+|---|---|---|
+| ~82 K / 285 K | 1 ms | 9 ms |
+| 2.95 M / 3.05 M | 3,073 ms | 65 ms |
+| 8.26 M / 8.05 M | 4,199 ms | 18 ms |
+| 10.37 M / 10.73 M | 3,225 ms | 103 ms |
+| 15.04 M / 15.70 M | **6,902 ms** | **61 ms** |
+
+Bounded between 9 and 103 ms across two orders of magnitude of WAL depth, with
+no relationship to cursor position -- 8.05 M produced 18 ms while 3.05 M
+produced 65 ms. Client stalls followed: 1,435 / 1,880 / 1,691 / 1,975 / 1,764 ms
+across five kill cycles, against 1,493 / 6,921 / 6,570 / 10,969 ms on the build
+before, whose fourth cycle breached the 10 s budget.
+
+**Why the local extrapolation was pessimistic, which is worth keeping.** The
+same local fixture predicted the BROKEN path almost exactly (~7.2 s against
+6,902 ms measured at 15 M) and over-predicted growth on the FIXED one. Its batch
+shape -- 1,000 ops of 1 KiB, so 1 MB batches -- does not match the fleet's, and
+the post-hint walk is sensitive to that in a way the full walk was not. A
+fixture calibrated against one code path is not thereby calibrated against the
+path that replaces it.

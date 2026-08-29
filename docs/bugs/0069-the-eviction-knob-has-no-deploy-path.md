@@ -1,4 +1,4 @@
-# BUG-0069 — eviction is per-tenant policy with only a per-seat switch (OPEN)
+# BUG-0069 — eviction is per-tenant policy with only a per-seat switch (FIXED 2026-08-28)
 
 **Found** 2026-08-28, answering whether eviction could be rolled out to the
 playground. The evictor is finished; the way to turn it on is not.
@@ -64,3 +64,50 @@ fleet with one seat converted. Worth deciding before building, not after.
   one it can only report phantom loss or wave real loss through as licensed. A
   playground that doubles as a chaos or verification target must not mark the
   namespaces it tests.
+
+
+## FIXED 2026-08-28
+
+All four items landed, plus the guard the bug argued for.
+
+1. `evictable-ns` is an inventory key, threaded into every spawned seat.
+2. `reload` pushes it to a running fleet alongside the other hot node knobs --
+   turning a namespace evictable is a decision made on a live fleet, and the
+   alternative was a per-seat FLINTCONFIG to every member with correctness
+   resting on remembering them all.
+3. `verify` REFUSES a pair whose members disagree, naming the pair and both
+   seats, and `evictable_ns` joins `PAIR_KNOBS` so drift AFTER deploy is
+   reported too.
+
+## The open question, answered
+
+**Refuse, with an explicit override.** Decided by Jeff 2026-08-28.
+
+The refusal is the default because divergent eviction policy is the one shape
+nothing else surfaces at deploy time. Two things keep it from causing the
+failure it prevents:
+
+- A member inside the roll window is HELD BACK rather than refused, exactly as
+  `PAIR_KNOBS` drift is. `roll` converges the two sides one at a time and
+  passes through a legitimate disagreement on the way; refusing there would
+  fail the very roll that fixes it and strand a half-converted fleet. An
+  operation's own `verify_after` tolerates it for the same reason.
+- `--allow-evictable-mismatch` carries a deliberate half-applied rollout, and
+  SAYS so in the output rather than passing silently -- an operator who forgets
+  the flag is set must still be able to see that a mismatch is being carried.
+
+The roll-grace half turned out to matter more than the flag: it handles the
+"an operator may be moving through this state deliberately" case structurally,
+where the flag handles it by permission.
+
+## Held by
+
+`tools/evictable_agree_drill.sh` (gate step `evictable_agree`), with a positive
+control that the inventory key actually reached BOTH seats -- without it every
+assertion compares two defaults and keeps passing against a fleet where the key
+does nothing. Mutation-checked both ways, failing DIFFERENT arms: disarming the
+refusal fails the REFUSED arm, removing the roll-grace hold fails the HELD BACK
+arm.
+
+Gate: 133 steps, 0 failures. The step count rising from 132 is itself the
+control that the new drill was registered rather than silently absent.
