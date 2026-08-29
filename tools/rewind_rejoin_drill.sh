@@ -295,4 +295,75 @@ grep -q "full sync: received" "$D/d-a2.log" && {
   echo "FAIL: arm D — a full checkpoint was transferred despite a valid candidate"; exit 1; }
 echo "  past-the-fence snapshot refused, the older one cleared it, rewound without a transfer"
 
-echo "PASS: rewind rejoin drill — ex-master rejoined from its own snapshot (no full transfer), adopted the new epoch, converged; a past-the-fence snapshot was refused client- and server-side and fell back to a re-seed that dropped the abandoned branch; and a genuinely SUPERSEDED ex-master, holding writes the survivor never received, still rewinds when a candidate on the correct side of the branch point survives (arm D, BUG-0071)"
+# --- arms E/F: a quarantine must not outlive the reason for it (BUG-0071) ---
+# quarantine_unresumable disqualifies EVERY snapshot at or below a cursor when a
+# tail hits a WAL gap. That breadth is deliberate -- narrowing it costs N failed
+# boots instead of one to reach the re-seed. What was wrong is that it was also
+# PERMANENT: the premise is "this master's WAL cannot reach these sequences",
+# a fact about one master at one moment, and a promotion invalidates it. A
+# snapshot removed for a purge stayed removed for the later fence that needed
+# it, which is a 94.2 s full re-seed at min-replicas-to-write=1.
+#
+# The name now records the cursor, and a lower fence may reconsider it. Both
+# directions are asserted: re-admitting unconditionally would reopen BUG-0062's
+# livelock, so the arm that keeps it OUT matters as much as the one that lets
+# it in.
+diverged_rejoin() {   # $1 = tag, $2 = quarantine prefix ("" = leave as a live candidate)
+  local tag=$1 qpfx=$2
+  fleet_kill server; sleep 0.4
+  rm -rf "$D/$tag-a" "$D/$tag-b" "$D/snaps-$tag"
+  $B --port 6405 --engine rocks --data-dir "$D/$tag-a" >"$D/$tag-a1.log" 2>&1 &
+  fleet_wait_ready 6405
+  $B --port 6406 --engine rocks --data-dir "$D/$tag-b" --replica-of 127.0.0.1:6405 >"$D/$tag-b1.log" 2>&1 &
+  fleet_wait_ready 6406
+  for i in $(seq 1 200); do valkey-cli -p 6405 SET "$tag-pre:$i" "v$i" >/dev/null; done
+  local tip; tip=$(valkey-cli -p 6405 FLINTINFO | tr '\r' '\n' | sed -n 's/^latest_seq://p')
+  wait_seq 6406 "$tip" || { echo "FAIL: $tag — B never caught up"; exit 1; }
+  valkey-cli -p 6405 FLINTSNAPSHOT "$D/snaps-$tag" >/dev/null    # the candidate
+  kill -9 "$(pgrep -f "flint-server --port 6406" | head -1)" 2>/dev/null; sleep 0.4
+  for i in $(seq 1 200); do valkey-cli -p 6405 SET "$tag-div:$i" "x$i" >/dev/null; done
+  valkey-cli -p 6405 FLINTSNAPSHOT "$D/snaps-$tag" >/dev/null    # past the fence
+  # Quarantine the GOOD candidate (the one at or below the coming fence).
+  if [ -n "$qpfx" ]; then
+    local f
+    for f in "$D/snaps-$tag"/snap-*-seq"$tip"-*; do
+      [ -e "$f" ] || continue
+      mv "$f" "$(dirname "$f")/$qpfx$(basename "$f")"
+    done
+  fi
+  kill -9 "$(pgrep -f "flint-server --port 6405" | head -1)" 2>/dev/null; sleep 0.4
+  $B --port 6406 --engine rocks --data-dir "$D/$tag-b" >"$D/$tag-b2.log" 2>&1 &
+  fleet_wait_ready 6406
+  valkey-cli -p 6406 FLINTPROMOTE 0 2 | grep -q "OK promoted" || { echo "FAIL: $tag promote"; exit 1; }
+  echo "drill: superseded copy rejoining" > "$D/$tag-a/NEEDS_RESEED"
+  $B --port 6405 --engine rocks --data-dir "$D/$tag-a" --replica-of 127.0.0.1:6406 \
+     --rewind-snaps "$D/snaps-$tag" >"$D/$tag-a2.log" 2>&1 &
+  fleet_wait_ready 6405
+}
+
+echo "== arm E: a snapshot quarantined ABOVE the coming fence is reconsidered"
+# c999999 models a purge that disqualified everything up to 999999; the
+# promotion below fences far lower, so the premise no longer holds.
+diverged_rejoin qe "unresumable-c999999-"
+grep -q "rewound to" "$D/qe-a2.log" || {
+  echo "FAIL: arm E — a quarantined snapshot was not reconsidered under a LOWER fence."
+  echo "      This is BUG-0071: the re-seed holds the write gate shut for the whole"
+  echo "      transfer at min-replicas-to-write=1 (94.2 s measured)."
+  sed 's/^/    /' "$D/qe-a2.log"; exit 1; }
+grep -q "full sync: received" "$D/qe-a2.log" && { echo "FAIL: arm E transferred a checkpoint anyway"; exit 1; }
+echo "  reconsidered under a lower fence, rewound without a transfer"
+
+echo "== arm F: quarantined AT or BELOW the fence stays out (BUG-0062 stays closed)"
+# c1 is below any fence here, so the disqualifying condition still covers it.
+# Re-admitting this one is what would loop: restore, refuse, restore, refuse.
+diverged_rejoin qf "unresumable-c1-"
+grep -q "rewound to" "$D/qf-a2.log" && {
+  echo "FAIL: arm F — a snapshot still covered by its quarantine was re-admitted."
+  echo "      Unconditional re-admission reopens BUG-0062's livelock."
+  sed 's/^/    /' "$D/qf-a2.log"; exit 1; }
+grep -q "full sync: received" "$D/qf-a2.log" || {
+  echo "FAIL: arm F — neither rewound nor re-seeded; the arm proved nothing"
+  sed 's/^/    /' "$D/qf-a2.log"; exit 1; }
+echo "  stayed quarantined, re-seeded as before"
+
+echo "PASS: rewind rejoin drill — ex-master rejoined from its own snapshot (no full transfer), adopted the new epoch, converged; a past-the-fence snapshot was refused client- and server-side and fell back to a re-seed that dropped the abandoned branch; and a genuinely SUPERSEDED ex-master, holding writes the survivor never received, still rewinds when a candidate on the correct side of the branch point survives (arm D); and a quarantine no longer outlives its reason -- reconsidered under a LOWER fence, still refused under one it covers (arms E/F, BUG-0071)"

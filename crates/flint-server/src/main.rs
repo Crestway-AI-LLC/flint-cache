@@ -237,6 +237,21 @@ fn internal_call_once(target: &str, args: &[&[u8]]) -> std::io::Result<Value> {
     }
 }
 
+/// A quarantined snapshot's coordinates plus the cursor it was disqualified
+/// against: `unresumable-c<cursor>-snap-<ms>-seq<n>-e<g>.<c>`.
+///
+/// Names written before BUG-0071 carry no cursor and return `None` here, so
+/// they stay quarantined exactly as they are — an upgrade re-admits nothing
+/// retroactively.
+#[cfg(feature = "rocks")]
+fn parse_quarantined_candidate(name: &str) -> Option<(u64, u64, flint_storage::manifest::Epoch)> {
+    let rest = name.strip_prefix(UNRESUMABLE_PREFIX)?;
+    let (cur, snap) = rest.strip_prefix('c')?.split_once('-')?;
+    let cursor: u64 = cur.parse().ok()?;
+    let (seq, epoch) = parse_rewind_candidate(snap)?;
+    Some((cursor, seq, epoch))
+}
+
 /// A rewind candidate parsed from a snapshot id:
 /// `snap-<ms>-seq<N>-e<gen>.<counter>` (the epoch label FLINTSNAPSHOT adds
 /// on masters). Unlabeled ids are not candidates — see the label's comment.
@@ -312,9 +327,16 @@ fn quarantine_unresumable(snaps_dir: &str, cursor: u64) -> usize {
         if seq > cursor {
             continue;
         }
+        // BUG-0071: record WHAT this was disqualified against. The premise --
+        // "this master's WAL can no longer reach these sequences" -- is a fact
+        // about one master at one moment, and a promotion invalidates it.
+        // Without the cursor in the name there is nothing a later decision can
+        // reconsider, so a snapshot removed for a purge stays removed for every
+        // future fence, including the one that needed it: a 94.2 s full re-seed
+        // at min-replicas-to-write=1.
         let to = e
             .path()
-            .with_file_name(format!("{UNRESUMABLE_PREFIX}{name}"));
+            .with_file_name(format!("{UNRESUMABLE_PREFIX}c{cursor}-{name}"));
         match std::fs::rename(e.path(), &to) {
             Ok(()) => {
                 n += 1;
@@ -457,12 +479,20 @@ fn try_rewind(data_dir: &std::path::Path, snaps_dir: &str, target: &str) -> bool
         eprintln!("rewind: no snapshot dir at {snaps_dir}; full re-seed");
         return false;
     };
-    let mut candidates: Vec<(u64, Epoch, std::path::PathBuf)> = entries
+    // The third element is the cursor a quarantined snapshot was disqualified
+    // against, or None for an ordinary candidate. Quarantined ones are carried
+    // here rather than filtered out so the fence can RECONSIDER them; the
+    // condition that permits it is applied below, not here.
+    let mut candidates: Vec<(u64, Epoch, Option<u64>, std::path::PathBuf)> = entries
         .flatten()
         .filter_map(|e| {
             let name = e.file_name();
-            let (seq, epoch) = parse_rewind_candidate(name.to_str()?)?;
-            Some((seq, epoch, e.path()))
+            let name = name.to_str()?;
+            if let Some((cursor, seq, epoch)) = parse_quarantined_candidate(name) {
+                return Some((seq, epoch, Some(cursor), e.path()));
+            }
+            let (seq, epoch) = parse_rewind_candidate(name)?;
+            Some((seq, epoch, None, e.path()))
         })
         .collect();
     candidates.sort_by_key(|c| std::cmp::Reverse(c.0));
@@ -477,7 +507,7 @@ fn try_rewind(data_dir: &std::path::Path, snaps_dir: &str, target: &str) -> bool
     // One fence query per distinct epoch; the master's answer is the highest
     // seq it vouches for from that epoch's timeline (nil = it cannot).
     let mut bounds: std::collections::BTreeMap<Epoch, Option<u64>> = Default::default();
-    for (seq, epoch, path) in candidates {
+    for (seq, epoch, quarantined_at, path) in candidates {
         let bound = *bounds.entry(epoch).or_insert_with(|| {
             match internal_call_once(
                 target,
@@ -499,6 +529,26 @@ fn try_rewind(data_dir: &std::path::Path, snaps_dir: &str, target: &str) -> bool
             }
         });
         let Some(bound) = bound else { continue };
+        // BUG-0071. Reconsider a quarantined snapshot only when the fence now
+        // sits BELOW the cursor it was disqualified against: we are asking to
+        // resume at a LOWER position than the one that failed, and against a
+        // different lineage, since a fence row exists only because a promotion
+        // recorded one.
+        //
+        // This terminates. If a re-admitted candidate is refused, the
+        // re-quarantine runs at the restored copy's own cursor -- at or below
+        // this snapshot's seq -- so trying it again would need `bound < seq`
+        // while USING it needs `seq <= bound`. It cannot be tried twice against
+        // one fence.
+        //
+        // The pure purge case is untouched: with no promotion there is no fence
+        // row, promo_fence_bound answers Unfenced, and the candidate is skipped
+        // above. The one-boot path to a re-seed still holds.
+        if let Some(at) = quarantined_at
+            && bound >= at
+        {
+            continue;
+        }
         if seq > bound {
             eprintln!(
                 "rewind: snapshot {} is past the fence ({seq} > {bound}); trying older",
@@ -6181,6 +6231,58 @@ mod quarantine_tests {
 
     /// A second pass must be a no-op, not `unresumable-unresumable-…`: the
     /// tailer can hit this path again before the boot re-seeds.
+    /// BUG-0071. The quarantined NAME is now a contract between two
+    /// functions: `quarantine_unresumable` writes the cursor it disqualified
+    /// against, and `try_rewind` reads it to decide whether a later, lower
+    /// fence may reconsider the snapshot. A round trip pins both halves —
+    /// asserting the parser against a hand-written string would pass while the
+    /// writer drifted.
+    #[test]
+    fn a_quarantined_name_round_trips_its_cursor() {
+        let d = std::env::temp_dir().join(format!("flint-q-rt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).expect("scratch");
+        std::fs::write(d.join("snap-111-seq500-e0.7"), b"x").expect("write");
+        assert_eq!(
+            quarantine_unresumable(d.to_str().expect("utf8"), 900),
+            1,
+            "fixture: the snapshot must actually be quarantined"
+        );
+        let name = std::fs::read_dir(&d)
+            .expect("read")
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .find(|n| n.starts_with(UNRESUMABLE_PREFIX))
+            .expect("a quarantined name");
+        let (cursor, seq, epoch) =
+            parse_quarantined_candidate(&name).expect("the writer's own name must parse");
+        assert_eq!(cursor, 900, "the disqualifying cursor was lost: {name}");
+        assert_eq!(seq, 500, "the snapshot's own seq was lost: {name}");
+        assert_eq!(epoch.generation, 0);
+        assert_eq!(epoch.counter, 7);
+        // And it must NOT read as an ordinary candidate, or the fence would
+        // reconsider it unconditionally.
+        assert!(
+            parse_rewind_candidate(&name).is_none(),
+            "a quarantined name still parses as a live candidate: {name}"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Names written before BUG-0071 carry no cursor. They must stay
+    /// quarantined rather than being re-admitted on an upgrade, because
+    /// nothing records what they were disqualified against.
+    #[test]
+    fn a_pre_cursor_quarantined_name_is_not_reconsidered() {
+        assert!(
+            parse_quarantined_candidate("unresumable-snap-111-seq500-e0.7").is_none(),
+            "a legacy quarantined name was re-admitted; nothing says what it failed against"
+        );
+        // Nor may a malformed cursor be read as one.
+        assert!(parse_quarantined_candidate("unresumable-cxx-snap-111-seq500-e0.7").is_none());
+        assert!(parse_quarantined_candidate("unresumable-c-snap-111-seq500-e0.7").is_none());
+    }
+
     #[test]
     fn quarantine_is_idempotent() {
         let d = scratch("idempotent");

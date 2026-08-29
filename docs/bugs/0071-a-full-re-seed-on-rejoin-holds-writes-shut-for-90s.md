@@ -466,3 +466,65 @@ wrong is how the last three mechanisms went wrong. The instrument now exists to
 answer it rather than argue it: experiments 2 and 3, plus a new arm asserting a
 same-lineage retry does NOT re-admit — which is requirement 3, and the one a
 careless re-admission rule would break.
+
+## FIXED 2026-08-29 — the quarantine now records what it was for
+
+`quarantine_unresumable` writes the disqualifying cursor into the name
+(`unresumable-c<cursor>-snap-…`), and `try_rewind` reconsiders such a snapshot
+when the current fence sits **below** that cursor.
+
+The rule in one line: *we are asking to resume at a LOWER position than the one
+that failed, and against a different lineage — a fence row exists only because
+a promotion recorded one.*
+
+### Why it terminates, and why the purge path is untouched
+
+Requirement 3 (BUG-0062's livelock stays closed) and requirement 4 (the purge
+case still reaches a re-seed in about one boot) are the two a careless
+re-admission would break.
+
+**Termination.** If a re-admitted candidate is refused, the re-quarantine runs
+at the restored copy's own cursor — at or below that snapshot's `seq`. Trying it
+again would need `bound < seq`, while USING it needs `seq <= bound`. It cannot
+be tried twice against one fence.
+
+**The purge path.** With no promotion there is no fence row, `promo_fence_bound`
+answers `Unfenced`, and the candidate is skipped before the re-admission test is
+reached. The breadth that buys a one-boot re-seed is unchanged.
+
+**No retroactive re-admission.** Names written before this carry no cursor and
+do not parse, so an upgrade re-admits nothing.
+
+### Measured, four ways
+
+| quarantine | fence | result |
+|---|---|---|
+| at cursor 500 | 302 | **rewинds** — reconsidered |
+| at cursor 100 | 302 | re-seeds — still covered |
+| legacy name, no cursor | 302 | re-seeds — nothing to reconsider |
+| none | 302 | rewinds — unchanged |
+
+### Held by
+
+`rewind_rejoin_drill.sh` arms E and F, built on the arm D divergence: E asserts
+a snapshot quarantined ABOVE the coming fence is reconsidered and rewinds with
+no transfer; F asserts one still covered by its quarantine stays out and
+re-seeds. Both directions matter — unconditional re-admission reopens the
+livelock, and that is what F exists to catch.
+
+Mutation-checked, failing DIFFERENT arms: dropping the `bound >= at` gate fails
+F ("a snapshot still covered by its quarantine was re-admitted"); restoring the
+pre-fix behaviour of never returning quarantined names fails E ("not
+reconsidered under a LOWER fence").
+
+Unit-level, the name is now a contract between the writer and the reader, so
+`a_quarantined_name_round_trips_its_cursor` quarantines through the SHIPPING
+function and parses the name it actually wrote — asserting the parser against a
+hand-written string would pass while the writer drifted.
+
+### What remains open
+
+This removes the cause of the observed 94.2 s outage. It does not answer whether
+a re-seeding replica should hold the write path shut at all — the Flint KV
+session's accept-but-don't-count design, recorded above, is the input for that
+and it is a separate change.
