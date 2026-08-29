@@ -141,3 +141,56 @@ this. What the measurement did establish is that a healthy steady-state rejoin
 tails incrementally — 28 for 28 once a fleet has snapshots — which means the
 exposure is narrow and real rather than routine, and that a fix should be judged
 on the tail it removes, not on a frequency nobody has measured.
+
+## Input from the Flint KV session, 2026-08-29 — and what it changes here
+
+Flint KV solved the "what counts as live during a rebuild" question first, so it
+was asked directly. Three answers, one of which changes what to build.
+
+**The design holds.** Accept-but-don't-count has not been argued against there;
+the two tests that pin it still stand
+(`a_rebuilding_replica_takes_writes_but_does_not_acknowledge_them`,
+`an_accepting_rebuilding_replica_is_counted_apart_from_a_real_one`). So
+direction 3 above is not a guess — it is a shipped position elsewhere in the
+same codebase family.
+
+**But the counting rule is the easy half.** Their warning, quoted because it is
+the part worth acting on: *"What decides whether the cluster converges is the
+repair job's cadence, and an adaptive backoff built on 'asking when there is
+nothing to do is waste' is exactly wrong for that job: the cost of asking is one
+status call per replica, and the cost of asking late is a log sitting one
+replica short, so the next disk to fail takes it below quorum."* Their
+`ReplicaRepairJob` runs almost flat against every other job's backoff — 200 ms
+after work, 500 ms after idle, a 2 s ceiling — because *"backing off to ten
+seconds meant a wipe every few seconds outran repair and the cluster degraded
+until it could not start a node."* They asked what our re-seed path backs off
+to before we change what counts as live.
+
+**Checked, and we are in the clear on that axis.** The replica tailer reconnects
+on a FLAT one second — `flint-server/src/main.rs:5149`, *"replication link lost
+({e}); reconnecting in 1s"* followed by `sleep(Duration::from_secs(1))`. No
+escalation, no idle-based widening. The only escalating backoff on this path is
+`probe_resume`'s `200 ms x attempt`, bounded at five attempts, and it has never
+fired in any measured soak (zero `probe attempt` lines across every run).
+
+So for us the cadence is already the shape their experience says it must be, and
+the counting rule really is the substantive change rather than half of one. That
+removes the risk they flagged; it does not remove the work.
+
+### A second-order finding worth carrying
+
+The question we sent about a cold or idle tree pinning their release point found
+a live bug — not the mechanism we guessed, but next to it. A tree that never
+writes holds nothing; a tree that wrote once and went idle WOULD pin the log,
+and that case was already known and mitigated by a periodic flush job. The
+mitigation was **disabled**: the job iterated a map holding followed shards
+beside owned ones, called a helper that refuses writes on a follower, and let
+`?` end the whole pass at the first one — so every tree ordered behind it never
+reached its clock trigger. Their file is `core/docs/bugs/0011-*`.
+
+The transferable part is not about trees. **A mitigation that exists but never
+runs reads exactly like a mitigation that works** — from the code, from the
+design doc, and from any test that asserts it is wired rather than that it
+fires. Worth holding against our own periodic paths: the snapshot timer this bug
+depends on is one of them, and "three snapshots were taken during the outage"
+was evidence it ran only because the outage happened to record them.
