@@ -178,3 +178,91 @@ Measured in the verification soak, 2026-08-28, cycle 3: a rejoin that needs a
 (`full sync: received 103 files`, ~8.2 M sequences). The probe's WAL scan is a
 ~5 s term; the re-seed is a ~90 s one. Cheapening the probe does not touch it.
 Filed separately as BUG-0071.
+
+## CORRECTION 2026-08-28: the mechanism above is wrong
+
+Everything above blames `updates_since_budgeted` → `get_updates_since` walking
+WAL files to position at the cursor. **That is not where the time goes**, and
+the "fix" built on it (`cursor_within_wal_bounds`) was measured on a fleet to
+change failover time by nothing. It has been reverted.
+
+### What the measurement said
+
+Local, release, 1 KiB values — the two calls the theory accused:
+
+| sequences | archived WAL files | `get_updates_since(0)` | `get_updates_since(cursor)` |
+|---|---|---|---|
+| 200 K | 4 | 0.2 ms | 11.5 ms |
+| 1.2 M | 24 | 2.8 ms | 11.0 ms |
+| 2.4 M | 48 | 10.5 ms | 11.9 ms |
+
+Milliseconds, and flat. Idle or under a concurrent writer, 1-byte or 1 KiB
+values, the answer did not change. Seek position was never the cost.
+
+### Where it actually goes
+
+`RocksKv::own_seq_for_upstream`, which translates the replica's UPSTREAM cursor
+into this node's own sequence space. It calls `get_updates_since(0)` and then
+**iterates every batch and every operation** from sequence 0 until it finds the
+batch whose cursor row reaches the requested position. It runs in the FLINTSYNC
+handler on the REWIND path — the path every soak cycle takes — and it runs
+BEFORE the retention check that was optimised.
+
+| sequences | walk |
+|---|---|
+| 200 K | 62 ms |
+| 600 K | 235 ms |
+| 1.2 M | 531 ms |
+| 2.4 M | 1,157 ms |
+
+Linear, ~0.48 µs per retained sequence. Extrapolated to the fleet's 15.04 M
+cursor: **~7.2 s predicted against 6,902 ms measured** — 63% of a 10,969 ms
+failover blackout.
+
+### The line that pointed at it
+
+In the same rejoin, against the same master, at the same instant:
+`fence=2ms probe=6902ms`. Both are round trips to that master. Connection setup,
+TLS handshake and master-side saturation would cost FLINTFENCE exactly what they
+cost FLINTSYNC, so the difference had to be inside the FLINTSYNC handler — which
+is what made a WAL-scan story unnecessary and a code read sufficient.
+
+### What shipped
+
+A sparse index over the upstream→own mapping (`\x00flint\x00upidx\x00`, one
+entry per 10 k upstream sequences), used as a HINT for a start position. The
+walk is unchanged and still reads the real cursor rows.
+
+Measured at 3.6 M sequences: **201.9 ms indexed against 2,689 ms unindexed**,
+same answer. It is a large improvement and NOT a constant one: the residual is
+RocksDB's own seek to the starting position, which no stride removes. Making
+translation genuinely O(1) means not touching the WAL at all — an exact
+per-batch mapping read as a point lookup — which is a bigger change and is not
+what this is.
+
+### Why the hint cannot corrupt a replica
+
+`get_updates_since` SKIPS the batch at its starting position (see
+`flint-storage::repl`'s header). A hint landing exactly on the answer's batch
+therefore steps over it, and the scan returns the NEXT qualifying batch — a
+LATER position, from which a replica would resume past data it never applied.
+A failed lookup was never the danger; a **successful wrong one** was, and a
+plain "fall back if nothing is found" guard does not catch it.
+
+So the hinted walk verifies its own start: the first cursor-bearing batch it
+sees must still be BELOW the target. Cursor rows are monotone, so that proves
+no earlier batch could qualify — which is exactly the claim "the first match
+found is THE first match". If it does not hold, the walk restarts from 0.
+`a_hint_never_changes_the_answer` plants hints that are too early, one before
+the target, exactly on it, past the answer, and beyond the WAL entirely, and
+asserts the answer is identical every time. It caught the bug above.
+
+### The lesson, which is the same one twice
+
+The Prevention section above said of its own asymmetry: *"reasoned from the
+API's contract, not measured. The fix's own prediction below is the test."* The
+prediction failed and the fix shipped anyway, because the gate proves
+correctness and nothing proved EFFECT. Then the first local measurement missed
+the real cost too — it timed iterator construction and the first item, which is
+neither of the things the code executes. Measuring the part you have a
+hypothesis about is not measuring.

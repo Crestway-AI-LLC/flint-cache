@@ -4718,45 +4718,15 @@ fn flintsync(
     // it: a budget of 1 byte materializes at most one batch (batches are
     // never split), and `updates_since_budgeted` returns an empty Ok for a
     // caught-up replica, so a healthy cursor never false-refuses.
-    // BOUNDS, not positioning. The line below used to be
-    // `updates_since_budgeted(cursor, 1)`, whose 1-byte budget bounds what
-    // comes BACK and not what it costs to FIND the cursor: `get_updates_since`
-    // walks WAL files, measured at 35 ms rising to 4,985 ms as a soak's cursor
-    // moved 149,795 -> 10,329,665, i.e. 88% of a failover's decision window and
-    // a function of the MASTER'S UPTIME (BUG-0070).
-    //
-    // The comment above still holds and is why only THIS test changed: the
-    // promotion-fence check above is untouched, the OK below is unchanged, and
-    // the STREAM further down still calls updates_since_budgeted for real. Only
-    // the probe's reachability question is answered cheaply, and the probe
-    // drops the connection before any streaming happens.
-    //
-    // `None` means the WAL cannot bound the question, so fall through to the
-    // real check rather than guessing.
-    let refusal = match kv.cursor_within_wal_bounds(cursor) {
-        // Cheap and decisive, both ways. This REPLACES the positioning call
-        // rather than preceding it — a pre-check would leave the expensive path
-        // running for every resumable cursor, which is the common case and the
-        // whole cost.
-        Some(true) => None,
-        Some(false) => Some(format!(
-            "WALGAP cursor {cursor} is below this WAL's retained floor: \
-             full sync required"
-        )),
-        // Cannot say cheaply (no WAL entries to bound). Fall through to the
-        // real question rather than guess — the case is rare and correctness
-        // here is worth a scan.
-        None => match kv.updates_since_budgeted(cursor, 1) {
-            Err(ReplError::WalGap(why)) => Some(format!(
+    if let Err(ReplError::WalGap(why)) = kv.updates_since_budgeted(cursor, 1) {
+        let mut out = Vec::new();
+        encode(
+            &Value::Error(format!(
                 "WALGAP cursor {cursor} is no longer reachable from this WAL ({why}): \
                  full sync required"
             )),
-            _ => None,
-        },
-    };
-    if let Some(why) = refusal {
-        let mut out = Vec::new();
-        encode(&Value::Error(why), &mut out);
+            &mut out,
+        );
         return stream.write_all(&out);
     }
     let mut out = Vec::new();
@@ -6295,9 +6265,6 @@ mod probe_verdict_tests {
     fn a_master_error_is_a_verdict_not_a_hiccup() {
         for msg in [
             "WALGAP cursor 207196 is no longer reachable from this WAL: full sync required",
-            // The retention refusal the bounds check emits (BUG-0070). Its
-            // wording differs, and the client must not treat that as a hiccup.
-            "WALGAP cursor 207196 is below this WAL's retained floor: full sync required",
             "cursor 999 is past the promotion fence 500 for epoch (0,7)",
         ] {
             assert_eq!(
