@@ -194,3 +194,71 @@ design doc, and from any test that asserts it is wired rather than that it
 fires. Worth holding against our own periodic paths: the snapshot timer this bug
 depends on is one of them, and "three snapshots were taken during the outage"
 was evidence it ran only because the outage happened to record them.
+
+## Narrowed 2026-08-29: the fence accepted what the tip refused
+
+Re-reading the evidence bundle rather than the summary turns "the rewind path
+ran and failed" into something specific. Every `rewind:` line in
+`/tmp/flint-scale-evidence-20260828-143346`:
+
+```
+rewind: no snapshot dir at /var/lib/flint/snaps/g0; full re-seed          (x5)
+rewind: cannot resume from the restored copy against …:7002
+        (refused: cursor 8191139 is outside the master's retained WAL
+         [3065673, 8175258]); full re-seed                                (x1)
+```
+
+**There is no `snapshot N is past the fence; trying older` line for the failing
+case.** So the candidate was not rejected by the fence — it passed, was
+restored, and was then refused by the master for sitting past its tip
+(8,191,139 against 8,175,258). Two checks that exist to answer the same
+question disagreed, and the cheaper one said yes.
+
+The five "no snapshot dir" lines are a different condition entirely — the cold
+start, before any snapshot exists — which is also every re-seed in the collected
+boot-decision set. They are not this.
+
+### What has been excluded
+
+- **Not a name/content mismatch.** The snapshot filename records
+  `kv.latest_seq()` (`main.rs:4893`) and `try_rewind` probes with
+  `kv.latest_seq()` of the restored copy (`main.rs:574`). Same quantity, so a
+  candidate cannot pass the fence under one number and probe under another.
+- **Not naive cross-space comparison.** `FenceBound`'s own documentation states
+  the hazard and the rule: *"each promotion switches to the promoted node's own
+  sequence space, so seqs from different fence rows are not comparable numbers;
+  only the row whose epoch immediately supersedes `since` is in the asker's
+  space."* The design already accounts for it.
+- **Not a wedged snapshot timer.** That was a real defect on this path and is
+  now BUG-0073, but it produces "no snapshot dir" / stale candidates, not a
+  candidate that passes the fence and fails the tip.
+
+### The open question, stated so it can be tested
+
+Why did `promo_fence_bound` return a bound at or above 8,191,139 for the
+ex-master's epoch, when the survivor's tip was 8,175,258 and the ex-master held
+15,881 sequences the survivor never received?
+
+Either the bound was `Bound(n)` with `n >= 8,191,139` — in which case the fence
+row for the superseding epoch does not name the branch point in the asker's
+space, despite the rule above — or it was `Unfenced` and `try_rewind` treats
+that arm more permissively than the FLINTSYNC handler does, which refuses it.
+Those are distinguishable and neither is established.
+
+### The experiment
+
+Same shape as the flush bug the Flint KV session found: construct the condition
+and observe, rather than reason about it.
+
+Extend `tools/rewind_rejoin_drill.sh` with an arm that makes the two sequence
+spaces genuinely diverge — let a master accept writes its replica never
+receives, promote the replica, then restart the ex-master with `--rewind-snaps`
+pointing at snapshots it took while it was master — and assert that the fence
+REJECTS its own snapshot rather than accepting a copy the master will then
+refuse. Log `promo_fence_bound`'s arm and value at the decision, because the
+distinguishing evidence is which arm was taken and no current line reports it.
+
+**Deliberately not fixed yet.** Three plausible fixes follow from three
+different answers, and today has twice produced a shipped fix built on a
+mechanism that turned out to be wrong — one of them gated 133/133 green while
+moving the number it targeted by nothing. The instrument comes first.
