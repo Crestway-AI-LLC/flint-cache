@@ -129,7 +129,7 @@ path where a cycle "already earned its verdict". So a cycle that FAILS never
 reaches the always-run collection — and a 94.2 s re-seed is exactly a cycle that
 fails. The evidence is not lost (capture_evidence pulls journals and seat logs
 on failure), but it lands in a bundle rather than the aggregate, so any count
-over the always-run files omits failures **silently**. Filed as OPS-0081.
+over the always-run files omits failures **silently**. Filed as OPS-0082.
 
 The one observation of this bug's actual case — soak 2026-08-28 cycle 3 — is
 visible only in `/tmp/flint-scale-evidence-20260828-143346`, and is absent from
