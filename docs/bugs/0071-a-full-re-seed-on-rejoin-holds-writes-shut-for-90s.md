@@ -99,3 +99,45 @@ established: this soak's other cycles tailed incrementally
 (`tailing incrementally instead of a full re-seed`, epochs 0.5 / 0.7 / 0.8), so
 the distribution is bimodal and its shape is unmeasured. Cycle 3 is one sample.
 That number decides whether the published RTO should quote the re-seed case.
+
+## The ratio, measured 2026-08-29 — and why it is still not the answer
+
+The Open section above says the incremental/re-seed split "decides whether the
+published RTO should quote the re-seed case". Across seven soaks the always-run
+boot-decision collection holds **33 rejoin decisions**:
+
+| path | count | share |
+|---|---|---|
+| rewound and tailed incrementally | 28 | 85% |
+| full re-seed | 5 | 15% |
+
+**Do not publish that 15%.** Two things make it the wrong number:
+
+**1. All five re-seeds are a different case than this bug.** Every one gives the
+same reason — `rewind: no snapshot dir at /var/lib/flint/snaps/g0` — and all
+five come from one early soak. That is the COLD START: a fleet whose first
+rejoin happens before any snapshot exists, so there is nothing to rewind to.
+It is bounded by the snapshot cadence and disappears once a fleet has run for
+one interval. This bug is about a SUPERSEDED copy, where snapshots exist and
+every one of them is on the wrong side of the branch point. That case appears
+**zero** times in the collected set.
+
+**2. The collection cannot see the cycles that matter.** In
+`scale-cluster/run.sh` every failure branch ends in `die`, and
+`collect_boot_decisions` / `collect_rejoin_events` are called after them, on the
+path where a cycle "already earned its verdict". So a cycle that FAILS never
+reaches the always-run collection — and a 94.2 s re-seed is exactly a cycle that
+fails. The evidence is not lost (capture_evidence pulls journals and seat logs
+on failure), but it lands in a bundle rather than the aggregate, so any count
+over the always-run files omits failures **silently**. Filed as OPS-0081.
+
+The one observation of this bug's actual case — soak 2026-08-28 cycle 3 — is
+visible only in `/tmp/flint-scale-evidence-20260828-143346`, and is absent from
+that same soak's boot-decisions file, which records cycles 1 and 2 and stops.
+
+So the honest state is unchanged from when this was filed: **n=1 for the
+superseded-copy re-seed**, and the 85/15 split above describes cold starts, not
+this. What the measurement did establish is that a healthy steady-state rejoin
+tails incrementally — 28 for 28 once a fleet has snapshots — which means the
+exposure is narrow and real rather than routine, and that a fix should be judged
+on the tail it removes, not on a frequency nobody has measured.
