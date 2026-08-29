@@ -34,14 +34,14 @@ set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
 
-fleet_init "$FLINT_DRILL_ROOT/flint-evictagree-state" 7431 7432 7433 7434
+fleet_init "$FLINT_DRILL_ROOT/flint-evictagree-state" 7415 7416 7417 7418
 fleet_guard
 STATE=$FLINT_DRILL_ROOT/flint-evictagree-state
 INV=$FLINT_DRILL_ROOT/flint-evictagree.flint
-A=127.0.0.1:7431
-B=127.0.0.1:7432
-PROXY=127.0.0.1:7433
-CP=127.0.0.1:7434
+A=127.0.0.1:7415
+B=127.0.0.1:7416
+PROXY=127.0.0.1:7417
+CP=127.0.0.1:7418
 fleet_kill controller; fleet_kill server
 fleet_kill proxy; fleet_kill controlplane
 sleep 0.4
@@ -72,14 +72,14 @@ CTL="./target/release/flintctl -f $INV"
 echo "== bootstrap: the inventory declares evictable-ns cache"
 $CTL bootstrap >/dev/null 2>&1
 for _ in $(seq 1 60); do
-  [ "$(valkey-cli -p 7431 FLINTINFO 2>/dev/null | tr -d '\r' | sed -n 's/^live_replicas://p')" = "1" ] && break
+  [ "$(valkey-cli -p 7415 FLINTINFO 2>/dev/null | tr -d '\r' | sed -n 's/^live_replicas://p')" = "1" ] && break
   sleep 0.5
 done
-[ "$(valkey-cli -p 7431 FLINTINFO 2>/dev/null | tr -d '\r' | sed -n 's/^live_replicas://p')" = "1" ] \
+[ "$(valkey-cli -p 7415 FLINTINFO 2>/dev/null | tr -d '\r' | sed -n 's/^live_replicas://p')" = "1" ] \
   || { echo "FAIL: no replication after bootstrap — nothing downstream means anything"; exit 1; }
 
 # POSITIVE CONTROL on the inventory key itself.
-for p in 7431 7432; do
+for p in 7415 7416; do
   V=$(valkey-cli -p $p FLINTINFO 2>/dev/null | tr -d '\r' | sed -n 's/^evictable_ns://p')
   [ "$V" = "cache" ] || {
     echo "FAIL: port $p reports evictable_ns='$V', expected 'cache' — the inventory"
@@ -98,10 +98,10 @@ FLINT_ROLL_GRACE_MS=0 $CTL verify >"$STATE/v-clean.txt" 2>&1 || {
 echo "  verify OK"
 
 echo "== now make them DISAGREE (FLINTCONFIG on one member)"
-valkey-cli -p 7432 FLINTCONFIG evictable-ns other >/dev/null 2>&1
-GOT=$(valkey-cli -p 7432 FLINTINFO 2>/dev/null | tr -d '\r' | sed -n 's/^evictable_ns://p')
-[ "$GOT" = "other" ] || { echo "FAIL: could not create the mismatch — 7432 reports '$GOT'"; exit 1; }
-echo "  7431=cache  7432=other"
+valkey-cli -p 7416 FLINTCONFIG evictable-ns other >/dev/null 2>&1
+GOT=$(valkey-cli -p 7416 FLINTINFO 2>/dev/null | tr -d '\r' | sed -n 's/^evictable_ns://p')
+[ "$GOT" = "other" ] || { echo "FAIL: could not create the mismatch — 7416 reports '$GOT'"; exit 1; }
+echo "  7415=cache  7416=other"
 
 echo "== REFUSED once the grace window has passed, naming the pair and both seats"
 if FLINT_ROLL_GRACE_MS=0 $CTL verify >"$STATE/v-drift.txt" 2>&1; then
@@ -110,7 +110,7 @@ if FLINT_ROLL_GRACE_MS=0 $CTL verify >"$STATE/v-drift.txt" 2>&1; then
 fi
 grep -q "evictable-ns agreement" "$STATE/v-drift.txt" \
   || { echo "FAIL: the refusal does not name the check:"; tail -5 "$STATE/v-drift.txt"; exit 1; }
-for want in "pair 0" "127.0.0.1:7431" "127.0.0.1:7432"; do
+for want in "pair 0" "127.0.0.1:7415" "127.0.0.1:7416"; do
   grep -q "$want" "$STATE/v-drift.txt" \
     || { echo "FAIL: the refusal does not name '$want' — an operator cannot act on it"; exit 1; }
 done
@@ -142,7 +142,7 @@ grep -q "ALLOWED by --allow-evictable-mismatch" "$STATE/v-allow.txt" || {
 echo "  allowed, and said so"
 
 echo "== and the override does not blanket-disable verify"
-valkey-cli -p 7432 FLINTCONFIG evictable-ns cache >/dev/null 2>&1
+valkey-cli -p 7416 FLINTCONFIG evictable-ns cache >/dev/null 2>&1
 FLINT_ROLL_GRACE_MS=0 $CTL verify --allow-evictable-mismatch >/dev/null 2>&1 \
   || { echo "FAIL: a matched pair was refused even WITH the override"; exit 1; }
 echo "  a re-converged pair still verifies clean"
