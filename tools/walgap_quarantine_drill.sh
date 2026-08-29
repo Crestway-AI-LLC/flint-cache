@@ -159,10 +159,25 @@ grep -q "FATAL:.*never resume" "$D/a2.log" || {
 echo "  $(grep -c 'quarantine:' "$D/a2.log") quarantine line(s):"
 grep "quarantine:" "$D/a2.log" | head -3 | sed 's/^/    /'
 
-echo "== the snapshot is disqualified, not deleted"
-[ "$(snaps_matching unresumable-snap-)" -ge 1 ] || {
-  echo "FAIL: nothing renamed to unresumable-snap-*; ls:"; ls "$D/snaps-a" | sed 's/^/    /'; exit 1
+echo "== the snapshot is disqualified, not deleted, and records WHAT it was for"
+# BUG-0071 changed this name: it now carries the cursor the snapshot was
+# disqualified against (`unresumable-c<cursor>-snap-…`), because a later, LOWER
+# promotion fence may legitimately reconsider it. Without the cursor there is
+# nothing to reconsider, and a snapshot removed for a purge stayed removed for
+# the fence that needed it -- a 94.2 s full re-seed at min-replicas-to-write=1.
+[ "$(snaps_matching unresumable-c)" -ge 1 ] || {
+  echo "FAIL: nothing renamed to unresumable-c<cursor>-snap-*; ls:"; ls "$D/snaps-a" | sed 's/^/    /'; exit 1
 }
+# The cursor in the name must be the one the quarantine reported, or a later
+# fence compares against a number that means nothing.
+Q_CURSOR=$(grep -oE "at or below seq [0-9]+" "$D/a2.log" | head -1 | grep -oE "[0-9]+")
+[ -n "$Q_CURSOR" ] || { echo "FAIL: the quarantine did not report the cursor it used"; exit 1; }
+ls "$D/snaps-a" | grep -q "^unresumable-c${Q_CURSOR}-snap-" || {
+  echo "FAIL: the name does not carry the cursor the quarantine reported ($Q_CURSOR)."
+  echo "      A later fence would then compare against a number that means nothing."
+  ls "$D/snaps-a" | sed 's/^/    /'; exit 1
+}
+echo "  disqualified against cursor $Q_CURSOR, recorded in the name"
 [ "$(snaps_matching snap-)" -eq 0 ] || {
   echo "FAIL: a snap- candidate survived, so the next boot can still pick one:"
   ls "$D/snaps-a" | sed 's/^/    /'; exit 1

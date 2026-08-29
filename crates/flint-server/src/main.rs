@@ -342,7 +342,8 @@ fn quarantine_unresumable(snaps_dir: &str, cursor: u64) -> usize {
                 n += 1;
                 eprintln!(
                     "quarantine: {name} (seq {seq} <= unresumable cursor {cursor}) is no \
-                     longer a rewind candidate; kept as {UNRESUMABLE_PREFIX}{name}"
+                     longer a rewind candidate; kept as \
+                     {UNRESUMABLE_PREFIX}c{cursor}-{name}"
                 );
             }
             // Best effort by design: failing to rename must not stop the

@@ -190,3 +190,22 @@ that change touches only the chaos harness's key names, and `flint-ctl` and
 the data plane were byte-identical to rc.64 here (14 commits in
 `v0.1.0-rc.64..HEAD`, **0** of them touching `crates/flint-ctl/`, and the data
 plane came from the published bundle).
+
+
+## Superseded in one detail by BUG-0071, 2026-08-29
+
+The quarantined name described above is now
+`unresumable-c<cursor>-snap-…`, not `unresumable-snap-…`. The behaviour this
+file documents is unchanged — every snapshot at or below the unresumable cursor
+still leaves the candidate set in one pass, for the reasons argued here — but
+the name records WHICH cursor it was disqualified against.
+
+Why: the disqualification is permanent, and its premise ("this master's WAL can
+no longer reach these sequences") is a fact about one master at one moment. A
+later promotion fences at a LOWER position and may legitimately need a snapshot
+this quarantine removed; without the cursor there is nothing to reconsider. That
+cost a 94.2 s full re-seed at `min-replicas-to-write=1` (BUG-0071).
+
+The livelock this file closed stays closed: a snapshot is reconsidered only when
+the current fence is BELOW the cursor it was disqualified against, which cannot
+be true twice for the same snapshot against one fence.
