@@ -74,13 +74,13 @@ pub enum EventKind {
     /// The metering loop flipped a tenant's storage-quota verdict (M5).
     /// detail carries "on <used>/<cap>" or "off <used>/<cap>".
     QuotaVerdict,
-    /// Tier-1: the agent EXECUTED an allowlisted catalog action (M5).
+    /// Tier 2: the agent EXECUTED an allowlisted catalog action (M5).
     /// detail carries the exact command run.
     ActionExecuted,
-    /// Tier-1: the executed action's declared success signals verified
+    /// Tier 2: the executed action's declared success signals verified
     /// healthy — the incident is closed by the agent.
     ActionVerified,
-    /// Tier-1 escalation: the agent needed to act but could not (budget
+    /// Tier 2 escalation: the agent needed to act but could not (budget
     /// exhausted, dead-man tripped, verify timeout) — a human is paged.
     PageHuman,
     /// The agent's consolidation cron swept the CP slot-ownership table

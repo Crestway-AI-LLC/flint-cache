@@ -2336,8 +2336,44 @@ fn push_bins(inv: &Inventory, tarball: &str) {
 /// each component's hot-reload watcher pick up the new leaf, no restart. The
 /// CA is untouched, so old and new leaves both verify during the roll.
 fn resign_leaves(d: &str, sh: &dyn Fn(&str), edge_sans: &[String]) {
+    // THE KEY THIS NEEDS, CHECKED BEFORE ANYTHING IS TOUCHED.
+    //
+    // `rotate_certs` guards on ca.crt, which is the wrong file: signing needs
+    // ca.key, and there are real boxes that hold one and not the other. Both
+    // Flint ops boxes carry ca.crt + int.crt + int.key so the agent can dial
+    // the mesh, and deliberately no ca.key — they are observers, not the
+    // certificate authority.
+    //
+    // Run there before this guard existed, `rotate-certs` did the worst
+    // available thing. Step one below overwrites int.key and succeeds; step
+    // two needs ca.key and fails; the assert in `sh` panics. What is left is a
+    // fresh private key beside the OLD certificate, which the hot-reload
+    // watcher picks up within ~2s — so the box loses its mesh identity and
+    // cannot dial the fleet to say so. Reproduced with openssl directly before
+    // this was written: step 1 exit 0, step 2 exit 1, modulus mismatch.
+    assert!(
+        std::path::Path::new(&format!("{d}/ca.key")).exists(),
+        "no CA private key at {d}/ca.key — this box holds the CA certificate \
+         but cannot sign with it, so it is not where certs get rotated. \
+         Rotating from here would replace the leaf KEY and then fail to \
+         re-sign the leaf CERT, leaving a mismatched pair the watcher reloads."
+    );
+
+    // STAGED, then moved into place. The guard above closes the cause we know
+    // about; staging closes the ones we do not — a full disk, an openssl that
+    // is not there, a bad SAN in edge_sans — all of which used to leave a
+    // half-rotated directory because every step wrote its final filename.
+    //
+    // The residual window is two renames rather than several seconds of
+    // openssl, and renames within a directory are atomic per file. A watcher
+    // that polls between the key and the cert still sees a mismatched pair;
+    // it is microseconds instead of seconds, and the next poll is correct.
+    // Closing that fully needs the components to load a single bundle, which
+    // is a format change and not this fix.
+    let stage = format!("{d}/.rotate");
+    sh(&format!("rm -rf {stage} && mkdir -p {stage}"));
     sh(&format!(
-        "openssl req -newkey rsa:2048 -nodes -keyout {d}/int.key -out {d}/int.csr \
+        "openssl req -newkey rsa:2048 -nodes -keyout {stage}/int.key -out {stage}/int.csr \
          -subj /CN=flint-internal 2>/dev/null"
     ));
     // -CAserial is EXPLICIT, not left to -CAcreateserial's default. The default
@@ -2348,20 +2384,20 @@ fn resign_leaves(d: &str, sh: &dyn Fn(&str), edge_sans: &[String]) {
     // real deployment it lands in whatever directory the operator happened to
     // be standing in. Naming the path removes the implementation difference.
     sh(&format!(
-        "printf 'subjectAltName=DNS:flint-internal\\nextendedKeyUsage=serverAuth,clientAuth\\nbasicConstraints=CA:FALSE' > {d}/ext.cnf && \
-         openssl x509 -req -in {d}/int.csr -CA {d}/ca.crt -CAkey {d}/ca.key \
+        "printf 'subjectAltName=DNS:flint-internal\\nextendedKeyUsage=serverAuth,clientAuth\\nbasicConstraints=CA:FALSE' > {stage}/ext.cnf && \
+         openssl x509 -req -in {stage}/int.csr -CA {d}/ca.crt -CAkey {d}/ca.key \
          -CAcreateserial -CAserial {d}/ca.srl \
-         -out {d}/int.crt -days 365 -extfile {d}/ext.cnf 2>/dev/null"
+         -out {stage}/int.crt -days 365 -extfile {stage}/ext.cnf 2>/dev/null"
     ));
     sh(&format!(
-        "openssl req -newkey rsa:2048 -nodes -keyout {d}/edge.key -out {d}/edge.csr \
+        "openssl req -newkey rsa:2048 -nodes -keyout {stage}/edge.key -out {stage}/edge.csr \
          -subj /CN=flint-edge 2>/dev/null"
     ));
     sh(&format!(
-        "printf 'subjectAltName={sans}\nextendedKeyUsage=serverAuth\nbasicConstraints=CA:FALSE' > {d}/edge-ext.cnf && \
-         openssl x509 -req -in {d}/edge.csr -CA {d}/ca.crt -CAkey {d}/ca.key \
+        "printf 'subjectAltName={sans}\nextendedKeyUsage=serverAuth\nbasicConstraints=CA:FALSE' > {stage}/edge-ext.cnf && \
+         openssl x509 -req -in {stage}/edge.csr -CA {d}/ca.crt -CAkey {d}/ca.key \
          -CAcreateserial -CAserial {d}/ca.srl \
-         -out {d}/edge.crt -days 365 -extfile {d}/edge-ext.cnf 2>/dev/null",
+         -out {stage}/edge.crt -days 365 -extfile {stage}/edge-ext.cnf 2>/dev/null",
         sans = edge_san_list(edge_sans),
     ));
     // The co-processor leaf (ADR-0010 step 1). SAN flint-internal like the mesh
@@ -2373,14 +2409,14 @@ fn resign_leaves(d: &str, sh: &dyn Fn(&str), edge_sans: &[String]) {
     // it is minted now because "a certificate and a test" is the whole of step
     // 1, and the mint is where the security property is either created or lost.
     sh(&format!(
-        "openssl req -newkey rsa:2048 -nodes -keyout {d}/coproc.key -out {d}/coproc.csr \
+        "openssl req -newkey rsa:2048 -nodes -keyout {stage}/coproc.key -out {stage}/coproc.csr \
          -subj /CN=flint-coproc 2>/dev/null"
     ));
     sh(&format!(
-        "printf 'subjectAltName=DNS:flint-internal\\nextendedKeyUsage=serverAuth\\nbasicConstraints=CA:FALSE' > {d}/coproc-ext.cnf && \
-         openssl x509 -req -in {d}/coproc.csr -CA {d}/ca.crt -CAkey {d}/ca.key \
+        "printf 'subjectAltName=DNS:flint-internal\\nextendedKeyUsage=serverAuth\\nbasicConstraints=CA:FALSE' > {stage}/coproc-ext.cnf && \
+         openssl x509 -req -in {stage}/coproc.csr -CA {d}/ca.crt -CAkey {d}/ca.key \
          -CAcreateserial -CAserial {d}/ca.srl \
-         -out {d}/coproc.crt -days 365 -extfile {d}/coproc-ext.cnf 2>/dev/null"
+         -out {stage}/coproc.crt -days 365 -extfile {stage}/coproc-ext.cnf 2>/dev/null"
     ));
 
     // Assert the EKU the mint PRODUCED, not the recipe it was asked to run
@@ -2389,7 +2425,7 @@ fn resign_leaves(d: &str, sh: &dyn Fn(&str), edge_sans: &[String]) {
     // correctly and every server-side handshake would still pass, silently
     // keeping the clientAuth that must never be here. Fail the mint instead —
     // on bootstrap AND on every rotate-certs, since both route through here.
-    let coproc = flint_tls::cert_eku(&format!("{d}/coproc.crt"))
+    let coproc = flint_tls::cert_eku(&format!("{stage}/coproc.crt"))
         .expect("co-processor leaf unreadable/unparseable immediately after minting it");
     assert!(
         coproc.server_auth && !coproc.client_auth,
@@ -2402,7 +2438,7 @@ fn resign_leaves(d: &str, sh: &dyn Fn(&str), edge_sans: &[String]) {
     );
     // The mirror: the mesh leaf must KEEP clientAuth, or every internal dial
     // stops working. Same helper, opposite verdict — the pair is the point.
-    let mesh = flint_tls::cert_eku(&format!("{d}/int.crt"))
+    let mesh = flint_tls::cert_eku(&format!("{stage}/int.crt"))
         .expect("mesh leaf unreadable/unparseable immediately after minting it");
     assert!(
         mesh.server_auth && mesh.client_auth,
@@ -2411,6 +2447,19 @@ fn resign_leaves(d: &str, sh: &dyn Fn(&str), edge_sans: &[String]) {
         mesh.server_auth,
         mesh.client_auth
     );
+
+    // EVERY CHECK HAS PASSED; only now do these become the fleet's identity.
+    //
+    // The EKU asserts above used to run against the LIVE files, so a
+    // wrong-EKU mint panicked with the bad certificate already in place and
+    // already reloading. They read the staged copies now, which turns the same
+    // assert from a post-mortem into a gate.
+    for leaf in ["int", "edge", "coproc"] {
+        sh(&format!(
+            "mv {stage}/{leaf}.key {d}/{leaf}.key && mv {stage}/{leaf}.crt {d}/{leaf}.crt"
+        ));
+    }
+    sh(&format!("rm -rf {stage}"));
 }
 
 /// The edge cert's SAN list: loopback always, plus every `edge-san` entry —
@@ -2439,6 +2488,16 @@ fn rotate_certs(inv: &Inventory) {
     assert!(
         std::path::Path::new(&format!("{d}/ca.crt")).exists(),
         "no CA at {d}/ca.crt — is this a `tls on` cluster?"
+    );
+    // And the key, which is the one signing actually needs. Checked here as
+    // well as in resign_leaves so this message names the COMMAND the operator
+    // ran while the other names the step. An ops box holds ca.crt and no
+    // ca.key on purpose.
+    assert!(
+        std::path::Path::new(&format!("{d}/ca.key")).exists(),
+        "no CA private key at {d}/ca.key — this box can verify the fleet's certs \
+         but cannot sign new ones. Rotate from the box that bootstrapped the \
+         cluster; rotating here would break this box's own mesh identity."
     );
     let sh = |cmd: &str| {
         let ok = Command::new("sh")

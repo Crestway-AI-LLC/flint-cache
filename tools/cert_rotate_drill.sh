@@ -105,4 +105,65 @@ V=$(valkey-cli -p 6303 -a tok-acme --no-auth-warning GET ledger)
 [ "$V" = "$ACKED" ] || { echo "FAIL: ledger $V != acked $ACKED"; exit 1; }
 echo "  writer: $ACKED acked, 0 errors across the reload; ledger reconciles"
 
+# --- BUG-0072: rotating where the CA key is not ------------------------------
+# Hermetic and fleet-free: it only needs a statedir. An observer box carries
+# ca.crt so it can VERIFY the mesh and deliberately no ca.key, and before this
+# guard `rotate-certs` there replaced the leaf key, failed to re-sign the leaf
+# cert, and left a mismatched pair the hot-reload watcher picked up within ~2s.
+# The command's own precondition checked ca.crt, which is not the file signing
+# needs.
+echo "== rotating on a box that holds ca.crt and no ca.key"
+R="$D/nokey"; mkdir -p "$R/state/certs"
+cat > "$R/c.flint" <<EOF
+disposable on
+statedir $R/state
+bins ./target/release
+tls on
+cp 127.0.0.1:6302
+pair 127.0.0.1:6300,127.0.0.1:6301
+EOF
+( cd "$R/state/certs" && openssl req -x509 -newkey rsa:2048 -nodes -keyout ca.key \
+    -out ca.crt -days 3650 -subj /CN=flint-ca 2>/dev/null )
+$CTL -f "$R/c.flint" rotate-certs >/dev/null 2>&1 \
+  || { echo "FAIL: rotate-certs failed even WITH a CA key"; exit 1; }
+pairmatch() {  # $1 = leaf name
+  a=$(openssl rsa -in "$R/state/certs/$1.key" -noout -modulus 2>/dev/null)
+  b=$(openssl x509 -in "$R/state/certs/$1.crt" -noout -modulus 2>/dev/null)
+  [ -n "$a" ] && [ "$a" = "$b" ]
+}
+for L in int edge coproc; do
+  pairmatch "$L" || { echo "FAIL: $L key/cert do not match after a normal rotate"; exit 1; }
+done
+[ ! -d "$R/state/certs/.rotate" ] || { echo "FAIL: staging dir left behind"; exit 1; }
+echo "  with a CA key: all three leaves rotate to matching pairs, no staging left"
+
+cp "$R/state/certs/int.key" "$R/int.key.before"
+cp "$R/state/certs/int.crt" "$R/int.crt.before"
+mv "$R/state/certs/ca.key" "$R/ca.key.parked"
+RC=0; $CTL -f "$R/c.flint" rotate-certs >/dev/null 2>"$R/err" || RC=$?
+[ "$RC" != 0 ] || { echo "FAIL: rotate-certs SUCCEEDED with no CA key"; exit 1; }
+# The GUARD's own words, not just the string "ca.key" -- openssl's failure
+# echoes the whole command line, which contains `-CAkey .../ca.key`, so a grep
+# for the filename passes with the guard removed entirely. Measured: with both
+# guards disabled the run still exits non-zero and still prints "ca.key".
+grep -q "no CA private key" "$R/err" \
+  || { echo "FAIL: the refusal is openssl's, not the guard's — no clear reason given"; head -3 "$R/err"; exit 1; }
+# The property that matters is not the exit code, it is that nothing moved.
+cmp -s "$R/state/certs/int.key" "$R/int.key.before" \
+  || { echo "FAIL: the leaf KEY was replaced before the refusal"; exit 1; }
+cmp -s "$R/state/certs/int.crt" "$R/int.crt.before" \
+  || { echo "FAIL: the leaf CERT was rewritten before the refusal"; exit 1; }
+for L in int edge coproc; do
+  pairmatch "$L" || { echo "FAIL: $L pair broken by a refused rotate"; exit 1; }
+done
+echo "  without one: exit $RC, the guard names the reason, and every leaf pair still matches"
+
+# The two halves fix different things and are asserted separately on purpose.
+# STAGING is what prevents the damage: with the guards disabled the leaf key
+# survives anyway, because nothing writes a final filename until every step has
+# passed. The GUARD is what makes the refusal legible -- without it the operator
+# gets `cert step failed: printf ... openssl x509 -req ...` and has to work out
+# that a missing CA key is the cause. Deleting either one leaves a real defect,
+# so a drill that only checked the exit code would cover neither.
+
 echo "PASS: mesh cert hot-reload — rotate-certs re-signs the leaf, servers reload within a poll, new dials verify, live traffic loses nothing"
