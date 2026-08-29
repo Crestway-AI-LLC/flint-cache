@@ -262,3 +262,73 @@ distinguishing evidence is which arm was taken and no current line reports it.
 different answers, and today has twice produced a shipped fix built on a
 mechanism that turned out to be wrong — one of them gated 133/133 green while
 moving the number it targeted by nothing. The instrument comes first.
+
+## CORRECTION 2026-08-29: this bug's one observation is from the reverted build
+
+The section "Two things this is NOT" says: *"NOT an artifact of the reverted
+`FLINTWALRANGE` build this soak was running. That build refused on retention
+wording; the shipped code refuses the same cursor at the promotion fence
+instead. Both end in a full re-seed."*
+
+**That is wrong.** It assumed the shipped code's fence would refuse a cursor
+that `try_rewind`'s fence had just accepted. Following the actual code says it
+would not, and the two fences are the same query.
+
+### Why the fence accepts it
+
+The ordinary promotion records `record_promo_fence(kv, epoch, kv.last_applied())`
+(`main.rs:4179`) — the **upstream** cursor, i.e. a number in the OLD master's
+sequence space, which is what `FenceBound`'s rule requires ("only the row whose
+epoch immediately supersedes `since` is in the asker's space"). So when
+`try_rewind` compares its snapshot's seq (8,191,139, the ex-master's own space)
+against that bound, it is comparing like with like, and the candidate passes
+**correctly** — the survivor really had received those sequences.
+
+The `Unfenced` arm is also excluded: `try_rewind` maps it to `None` and
+`continue`, skipping the candidate. It is not permissive.
+
+### What the shipped handler then does, and the reverted one did not
+
+Shipped order in `flintsync`: promotion fence (4658) → **`own_seq_for_upstream`
+translation** (4681) → retention (4721). The translation exists precisely because
+the cursor arriving is in the upstream space while the WAL is in this node's.
+A candidate that clears the fence is translated and then checked for retention
+as a LOCAL sequence.
+
+`FLINTWALRANGE` answered the retention question without that path — which is the
+same defect that made `failover_bystander` fail it and got it reverted. So it
+compared an upstream-space cursor against the master's local WAL range and
+refused it. The observed message is its wording, and no shipped message matches:
+the shipped refusals are "is past the promotion fence", "is no longer reachable
+from this WAL", "cannot map upstream cursor … into this WAL", and "promotion
+fence history … is incomplete".
+
+So the 94.2 s re-seed was produced by code that is no longer in the tree.
+
+### What this changes
+
+**Severity on current code is unknown, not established.** On the shipped path
+this cursor plausibly RESUMES: same fence, then a translation that maps it below
+the master's tip, then a retention check it passes. The remaining way to reach a
+re-seed here is the translation itself failing — "cannot map upstream cursor"
+when the mapping is no longer retained — which is a different cause, a different
+message, and one the BUG-0070 sparse index now makes cheap to evaluate rather
+than a full WAL walk.
+
+The other five re-seeds in the evidence are "no snapshot dir": the cold start.
+Real, bounded by snapshot cadence, and not this.
+
+**So this bug currently rests on zero observations against shipping code.** It
+stays open because a 94 s write outage is worth proving absent rather than
+assumed absent, and because the "does a re-seeding replica hold the write path
+shut" question is real regardless of how often the re-seed is reached.
+
+### The correction I keep having to make
+
+This is the third mechanism error today, and all three have the same shape: I
+stated what the code would do without running it. The first shipped a fix that
+gated 133/133 green and moved its target number by nothing. The second measured
+the wrong call exhaustively. This one defended a claim about the shipped path
+while the only evidence came from a build that had been reverted hours earlier.
+The experiment below must therefore run on current code, and its first job is to
+establish whether this bug reproduces at all.
