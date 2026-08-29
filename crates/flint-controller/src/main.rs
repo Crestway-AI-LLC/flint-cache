@@ -542,6 +542,22 @@ struct Config {
     id: String,
 }
 
+/// Clears a pair's `snapshot_inflight` flag on drop, INCLUDING on unwind.
+///
+/// The flag exists so at most one snapshot is in flight per pair. Clearing it
+/// with a trailing statement made "at most one" mean "at most one, ever" the
+/// first time the thread panicked, because the scheduler only starts a snapshot
+/// when it can swap the flag from false. A pair that stops snapshotting stops
+/// producing rewind candidates, and a rejoin with no candidate past the branch
+/// point takes the full re-seed (BUG-0071).
+struct SnapshotInflightGuard(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for SnapshotInflightGuard {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// One replica set the controller drives, with its own failover state. The
 /// controller ticks each pair independently every sweep; a group is just N
 /// pairs. Decision-only pairs have empty `slots` (external node lifecycle);
@@ -770,6 +786,24 @@ impl Pair {
                 let label = self.label.clone();
                 let inflight = std::sync::Arc::clone(&self.snapshot_inflight);
                 std::thread::spawn(move || {
+                    // BUG-0073. The reset must survive an UNWIND, so it is a
+                    // guard rather than a trailing statement.
+                    //
+                    // It used to be the last line of this closure. A panic
+                    // anywhere above it -- in call_slow's parse, in
+                    // journal_event's I/O, in a poisoned lock -- skipped it,
+                    // and `snapshot_inflight` stayed true forever. The
+                    // scheduler's `swap(true)` then sees true on every tick and
+                    // this pair NEVER SNAPSHOTS AGAIN, silently: no snapshots
+                    // looks exactly like an interval that has not elapsed.
+                    //
+                    // The cost is not a missing metric. try_rewind needs a
+                    // snapshot at or after the branch point; without one the
+                    // next failover takes the full re-seed, which is BUG-0071's
+                    // 94.2 s write blackout at min-replicas-to-write=1. One
+                    // panic converts every later failover for that pair into
+                    // the worst case.
+                    let _reset = SnapshotInflightGuard(inflight);
                     match call_slow(
                         &addr,
                         &[b"FLINTSNAPSHOT", dir.as_bytes()],
@@ -786,7 +820,6 @@ impl Pair {
                             eprintln!("[{id}][{label}] snapshot on {addr} failed: {other:?}")
                         }
                     }
-                    inflight.store(false, std::sync::atomic::Ordering::SeqCst);
                 });
             }
             // Any other reachable master-claimer is a zombie: fence it.
@@ -1721,6 +1754,83 @@ fn fence(id: &str, zombie: &str, epoch: u32) {
 
 #[cfg(test)]
 mod tests {
+    /// BUG-0073. The flag must be clear after the thread UNWINDS, not merely
+    /// after it returns.
+    ///
+    /// Shown to fail before it was believed: with the reset as a trailing
+    /// statement (the shape this replaced) the flag stays set, the scheduler's
+    /// `swap(true)` never succeeds again, and the pair stops snapshotting for
+    /// the life of the process -- which turns its next failover into
+    /// BUG-0071's full re-seed.
+    #[test]
+    fn a_panicking_snapshot_thread_still_clears_the_inflight_flag() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let flag = Arc::new(AtomicBool::new(false));
+        // The scheduler starts a snapshot by swapping false -> true, so model
+        // that rather than asserting on a flag nothing ever set.
+        assert!(
+            !flag.swap(true, Ordering::SeqCst),
+            "fixture: the flag must start clear or the test proves nothing"
+        );
+        let f = Arc::clone(&flag);
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {})); // the panic is the fixture, not noise
+        let h = std::thread::spawn(move || {
+            let _reset = super::SnapshotInflightGuard(f);
+            panic!("call_slow blew up mid-snapshot");
+        });
+        let joined = h.join();
+        std::panic::set_hook(prev);
+        assert!(
+            joined.is_err(),
+            "the fixture did not actually panic, so the unwind path was never taken"
+        );
+        assert!(
+            !flag.load(Ordering::SeqCst),
+            "a panicking snapshot thread left inflight set: this pair never snapshots again"
+        );
+    }
+
+    /// The ordinary path clears it too -- the control for the test above, which
+    /// would pass just as well against a guard that cleared the flag eagerly
+    /// and did nothing useful.
+    #[test]
+    fn a_normal_snapshot_thread_clears_the_inflight_flag() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let flag = Arc::new(AtomicBool::new(false));
+        assert!(!flag.swap(true, Ordering::SeqCst));
+        let f = Arc::clone(&flag);
+        std::thread::spawn(move || {
+            let _reset = super::SnapshotInflightGuard(f);
+        })
+        .join()
+        .expect("no panic here");
+        assert!(
+            !flag.load(Ordering::SeqCst),
+            "the ordinary path left inflight set"
+        );
+    }
+
+    /// And it must be held for the WHOLE body: a guard dropped early re-arms
+    /// the scheduler while a snapshot is still running, which is the
+    /// concurrent-snapshot storm the flag exists to prevent.
+    #[test]
+    fn the_guard_is_not_clear_until_it_drops() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let flag = Arc::new(AtomicBool::new(true));
+        {
+            let _reset = super::SnapshotInflightGuard(Arc::clone(&flag));
+            assert!(
+                flag.load(Ordering::SeqCst),
+                "the flag cleared while the guard was still alive"
+            );
+        }
+        assert!(!flag.load(Ordering::SeqCst), "the flag survived the guard");
+    }
+
     use super::*;
 
     /// A node as `observe` would report it.
