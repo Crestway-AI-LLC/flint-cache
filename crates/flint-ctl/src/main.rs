@@ -31,6 +31,10 @@
 //!   lag-soft-ms 500       node  HOT   soft lag cap (delays writes)
 //!   lag-hard-ms 1000      node  HOT   hard lag cap (sheds; RPO bound)
 //!   min-replicas 1        node  HOT   min-replicas-to-write gate
+//!   evictable-ns ns1,ns2  node  HOT   namespaces the evictor may reclaim from.
+//!                                     Per-TENANT policy that was previously only a
+//!                                     per-SEAT flag; verify refuses a pair whose
+//!                                     members disagree (BUG-0069).
 //!   node-env K=V          node  BOOT  extra env for every flint-server seat,
 //!                                     repeatable. For engine tuning that has
 //!                                     no CLI flag — FLINT_BG_JOBS,
@@ -152,6 +156,16 @@ struct Inventory {
     lag_soft_ms: Option<u64>,  // node: replication soft lag cap (delay)
     lag_hard_ms: Option<u64>,  // node: replication hard lag cap (RPO shed)
     min_replicas: Option<u32>, // node: min-replicas-to-write safety gate
+    /// node: namespaces the evictor may reclaim from (`--evictable-ns`).
+    ///
+    /// The VALUE is a namespace list, so this is per-TENANT policy; before
+    /// BUG-0069 the only ways to set it were per SEAT (a start flag or a live
+    /// FLINTCONFIG), and nothing composed the two. A pair whose members hold
+    /// different lists is divergent POLICY -- one side reclaims while the
+    /// other fills to -QUOTA -- which `flint-server`'s own comment calls
+    /// strictly worse than divergent decisions. Absent = no namespace is
+    /// evictable, which stays the default (never-evict is opt-in to leave).
+    evictable_ns: Option<String>,
     /// node: extra environment for every flint-server seat, as `node-env K=V`
     /// (repeatable). This exists for ENGINE TUNING that has no CLI flag —
     /// `FLINT_BG_JOBS`, `FLINT_LEVEL_BASE_MB`, `FLINT_WRITE_BUFFER_MB` are read
@@ -304,6 +318,7 @@ fn parse_inventory(path: &str) -> Inventory {
             "lag-soft-ms" => inv.lag_soft_ms = val.parse().ok(),
             "lag-hard-ms" => inv.lag_hard_ms = val.parse().ok(),
             "min-replicas" => inv.min_replicas = val.parse().ok(),
+            "evictable-ns" => inv.evictable_ns = Some(val.to_string()),
             // Repeatable, and SPLIT ONCE: a value may contain '=' even though
             // none of today's do, and splitting on the last would silently
             // mangle it rather than fail.
@@ -1982,7 +1997,7 @@ fn internal_args(inv: &Inventory) -> Vec<String> {
 /// convergence, `status` shows the truth.
 fn reload(inv: &Inventory) {
     let tls = tls_client(inv);
-    let node_kv: [(&str, Option<String>); 6] = [
+    let node_kv: [(&str, Option<String>); 7] = [
         ("wal-fsync-ms", inv.wal_fsync_ms.map(|v| v.to_string())),
         ("lag-soft-ms", inv.lag_soft_ms.map(|v| v.to_string())),
         ("lag-hard-ms", inv.lag_hard_ms.map(|v| v.to_string())),
@@ -1990,6 +2005,11 @@ fn reload(inv: &Inventory) {
             "min-replicas-to-write",
             inv.min_replicas.map(|v| v.to_string()),
         ),
+        // Hot-reloadable for the same reason the lag caps are: turning a
+        // namespace evictable is a policy decision an operator makes on a
+        // running fleet, and the alternative is a per-seat FLINTCONFIG to
+        // every member with correctness resting on remembering them all.
+        ("evictable-ns", inv.evictable_ns.clone()),
         // Reload pushes only what the inventory SAYS. flintctl's
         // pair-member default is applied at spawn, not here: a reload
         // that silently re-imposed it would overwrite a value an
@@ -2072,6 +2092,9 @@ fn node_tuning_args(inv: &Inventory, replicated: bool) -> Vec<String> {
     }
     if let Some(v) = inv.min_replicas {
         push("--min-replicas-to-write", v.to_string());
+    }
+    if let Some(v) = &inv.evictable_ns {
+        push("--evictable-ns", v.clone());
     }
     // The widowed grace, ON BY DEFAULT for a seat that has a peer.
     //
@@ -3514,7 +3537,12 @@ fn verify(inv: &Inventory, args: &[String]) {
         .position(|a| a == "--probe")
         .and_then(|i| args.get(i + 1))
         .cloned();
-    let problems = verify_checks(inv, probe.as_deref(), true);
+    // BUG-0069: a deliberate half-applied rollout is a state an operator may
+    // be moving THROUGH, so the refusal has an escape hatch. It is a flag and
+    // not the default because divergent eviction policy is the one shape
+    // nothing else surfaces at deploy time.
+    let allow_mismatch = args.iter().any(|a| a == "--allow-evictable-mismatch");
+    let problems = verify_checks(inv, probe.as_deref(), true, allow_mismatch);
     println!();
     if problems.is_empty() {
         println!(
@@ -3540,7 +3568,11 @@ fn verify(inv: &Inventory, args: &[String]) {
 /// failover and slot moves end here, and a cluster that does not reconcile
 /// makes the command that produced it fail.
 fn verify_after(inv: &Inventory, op: &str) {
-    let problems = verify_checks(inv, None, false);
+    // An operation's own follow-up verify tolerates the mismatch: `roll` walks
+    // members one at a time, and a refusal here would fail the very roll that
+    // is converging them. The roll-grace window below is what makes that safe
+    // rather than permissive -- a member older than the window is not mid-roll.
+    let problems = verify_checks(inv, None, false, true);
     if problems.is_empty() {
         println!("verify: {op} left the cluster consistent");
         return;
@@ -3557,7 +3589,12 @@ fn verify_after(inv: &Inventory, op: &str) {
 
 /// The checks themselves. Returns the problems found; prints per-check
 /// lines only when `loud`, so the post-step form stays quiet on success.
-fn verify_checks(inv: &Inventory, probe: Option<&str>, loud: bool) -> Vec<String> {
+fn verify_checks(
+    inv: &Inventory,
+    probe: Option<&str>,
+    loud: bool,
+    allow_evictable_mismatch: bool,
+) -> Vec<String> {
     let tls = tls_client(inv);
     let mut problems: Vec<String> = Vec::new();
     let mut note = |ok: bool, label: &str, detail: String| {
@@ -3590,6 +3627,78 @@ fn verify_checks(inv: &Inventory, probe: Option<&str>, loud: bool) -> Vec<String
 
     head("== pairs: one master each, coherent epochs, one build");
     let mut builds: BTreeSet<String> = BTreeSet::new();
+    // BUG-0069: EVICTION POLICY AGREEMENT. `evictable_ns_agree` already exists
+    // on the node and FLINTINFO already reports it, but a detector is not a
+    // guard -- it tells an operator afterwards, and until this there was no
+    // deploy step for it to refuse at. The value is a namespace list (per
+    // TENANT) while the switch was per SEAT, so nothing composed them.
+    //
+    // Held back for a member inside the roll window, exactly as PAIR_KNOBS
+    // drift is: `roll` converges the two sides one at a time and passes
+    // through a legitimate disagreement on its way. Refusing there would
+    // strand a fleet with one seat converted, which is the failure this
+    // check would otherwise cause rather than prevent.
+    for (i, pair) in inv.pairs.iter().enumerate() {
+        if pair.len() < 2 {
+            continue;
+        }
+        let seen: Vec<(String, Option<String>, Option<u64>)> = pair
+            .iter()
+            .map(|addr| {
+                (
+                    addr.clone(),
+                    info_field(addr, &tls, "evictable_ns:"),
+                    info_field(addr, &tls, "uptime_ms:").and_then(|v| v.parse::<u64>().ok()),
+                )
+            })
+            .collect();
+        // Only compare members that ANSWERED. A seat that is down is a
+        // different problem, already reported above, and treating its silence
+        // as an empty list would invent a mismatch.
+        let answered: Vec<&(String, Option<String>, Option<u64>)> =
+            seen.iter().filter(|(_, v, _)| v.is_some()).collect();
+        if answered.len() < 2 {
+            continue;
+        }
+        let base = answered[0].1.as_deref().unwrap_or("");
+        let Some(other) = answered[1..]
+            .iter()
+            .find(|(_, v, _)| v.as_deref().unwrap_or("") != base)
+        else {
+            continue;
+        };
+        // uptime unknown counts as YOUNG: a build that does not report it
+        // cannot be told mid-roll from settled, and guessing "settled" turns
+        // an unreadable fleet into a failed deploy.
+        let young = answered
+            .iter()
+            .any(|(_, _, up)| up.is_none_or(|u| u < roll_grace_ms()));
+        let detail = format!(
+            "pair {i}: {}={} {}={} -- divergent eviction POLICY: one side \
+             reclaims while the other fills to -QUOTA",
+            answered[0].0,
+            if base.is_empty() { "(none)" } else { base },
+            other.0,
+            match other.1.as_deref() {
+                Some("") | None => "(none)",
+                Some(v) => v,
+            }
+        );
+        if young {
+            if loud {
+                println!(
+                    "  --   evictable-ns {detail} (held back: a member is inside the roll window)"
+                );
+            }
+        } else if allow_evictable_mismatch {
+            if loud {
+                println!("  --   evictable-ns {detail} (ALLOWED by --allow-evictable-mismatch)");
+            }
+        } else {
+            note(false, "evictable-ns agreement", detail);
+        }
+    }
+
     for (i, pair) in inv.pairs.iter().enumerate() {
         let mut masters = Vec::new();
         let mut down = Vec::new();
@@ -4111,6 +4220,11 @@ fn status(inv: &Inventory) {
 /// definition, and listing them here would produce drift on every healthy
 /// pair — a red that means nothing is a red nobody reads.
 const PAIR_KNOBS: &[&str] = &[
+    // Divergent eviction policy across a pair is the BUG-0069 condition:
+    // one side reclaims while the other fills to -QUOTA. It belongs here
+    // and not only in verify, so a fleet that drifts AFTER deploy is
+    // reported rather than only refused at the gate.
+    "evictable_ns:",
     "lag_soft_ms:",
     "lag_hard_ms:",
     "min_replicas_to_write:",
