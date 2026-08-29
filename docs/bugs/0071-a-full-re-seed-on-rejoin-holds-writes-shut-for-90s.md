@@ -418,3 +418,51 @@ fails.
 `try_rewind` now also logs the ACCEPTED candidate and the bound it cleared.
 Before this, only rejections named a bound — which is why the production
 evidence could not distinguish "accepted" from "never asked".
+
+## Fix options, and why the obvious one is wrong
+
+Reading the quarantine's call path to design the fix turned up the constraint
+that rules out the first idea, so it is recorded before anything is built.
+
+### Why it disqualifies EVERYTHING at or below the cursor
+
+The narrow fix — quarantine only the candidate that was actually restored and
+refused — is enough to break BUG-0062's livelock, which was "the next boot picks
+the same losing snapshot and fails identically". It is not enough for what the
+breadth is actually buying.
+
+The failure path is: restore → probe refused → quarantine → `mark_needs_reseed`
+→ `hard_exit(3)`. The next boot reads the marker, and because the refusal is a
+purged WAL rather than a promotion fence, it takes the rewind path AGAIN. With
+only the tried candidate removed it picks the next-older one, fails identically,
+and exits. **N candidates means N failed boots before the re-seed.** Disqualifying
+the whole range reaches the re-seed in ONE extra boot.
+
+So the breadth is not carelessness; it is recovery time for the WAL-purge case.
+A fix that narrows it trades this bug's 94.2 s for a slower purge recovery, which
+is not obviously a better trade and is certainly not a free one.
+
+### What the fix has to satisfy
+
+1. Experiment 3 must flip: a quarantined-then-promoted node rewinds.
+2. Experiment 2 must keep passing: an ordinary superseded rejoin still rewinds.
+3. BUG-0062's livelock must stay closed: no infinite retry of a losing snapshot.
+4. The purge case must still reach a re-seed in about one boot, not N.
+
+(4) is the one the narrow fix fails, and it was invisible until the call path
+was read end to end.
+
+### The shape that can satisfy all four
+
+Keep the breadth, make it CONDITIONAL rather than permanent: record what the
+snapshots were disqualified AGAINST, and let a later decision re-admit them when
+that condition no longer applies. The quarantine's premise is "this master's WAL
+can no longer reach these sequences" — a fact about one master at one moment,
+which a promotion invalidates by definition.
+
+Not built yet. The discriminator has to be something available where the
+quarantine happens and meaningful where enumeration happens, and getting that
+wrong is how the last three mechanisms went wrong. The instrument now exists to
+answer it rather than argue it: experiments 2 and 3, plus a new arm asserting a
+same-lineage retry does NOT re-admit — which is requirement 3, and the one a
+careless re-admission rule would break.
