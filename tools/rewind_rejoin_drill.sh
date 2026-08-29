@@ -234,4 +234,65 @@ wait_seq 6406 "$ATIP" || { echo "FAIL: re-seeded B never converged"; exit 1; }
 [ "$(valkey-cli -p 6406 GET fence:probe)" = "yes" ] || { echo "FAIL: B missing the new timeline"; exit 1; }
 echo "  B refused its orphaned snapshot, re-seeded, and the dead branch stayed dead"
 
-echo "PASS: rewind rejoin drill — ex-master rejoined from its own snapshot (no full transfer), adopted the new epoch, converged; a past-the-fence snapshot was refused client- and server-side and fell back to a re-seed that dropped the abandoned branch"
+# --- arm D: a genuinely SUPERSEDED ex-master, with a valid candidate ---------
+# Arms A and C have B catch up to A before the kill, so neither builds the
+# condition BUG-0071 is about: an ex-master holding writes the survivor NEVER
+# received. That is the case whose failure costs 94.2 s at
+# min-replicas-to-write=1, and until now nothing exercised it.
+#
+# This arm is the WORKING half: divergence plus a snapshot on the correct side
+# of the branch point must still rewind. The broken half -- the same setup with
+# that snapshot quarantined -- is BUG-0071 and is not asserted here because it
+# currently re-seeds by design.
+echo "== arm D: an ex-master holding writes B never saw still rewinds, given a candidate"
+fleet_kill server; sleep 0.4
+rm -rf "$D/d-a" "$D/d-b" "$D/snaps-d"
+$B --port 6405 --engine rocks --data-dir "$D/d-a" >"$D/d-a1.log" 2>&1 &
+fleet_wait_ready 6405
+$B --port 6406 --engine rocks --data-dir "$D/d-b" --replica-of 127.0.0.1:6405 >"$D/d-b1.log" 2>&1 &
+fleet_wait_ready 6406
+for i in $(seq 1 200); do valkey-cli -p 6405 SET "d-pre:$i" "v$i" >/dev/null; done
+D_TIP=$(valkey-cli -p 6405 FLINTINFO | tr '\r' '\n' | sed -n 's/^latest_seq://p')
+wait_seq 6406 "$D_TIP" || { echo "FAIL: arm D — B never caught up before diverging"; exit 1; }
+# The candidate: taken while the two are still in step, so its seq is at or
+# below what B will carry into the promotion fence.
+valkey-cli -p 6405 FLINTSNAPSHOT "$D/snaps-d" >/dev/null
+
+# DIVERGE. B stops receiving; A keeps accepting. This is the whole point of the
+# arm, so it is asserted rather than assumed.
+kill -9 "$(pgrep -f "flint-server --port 6406" | head -1)" 2>/dev/null
+sleep 0.4
+for i in $(seq 1 200); do valkey-cli -p 6405 SET "d-div:$i" "x$i" >/dev/null; done
+valkey-cli -p 6405 FLINTSNAPSHOT "$D/snaps-d" >/dev/null   # a candidate PAST the fence
+A_DIV=$(valkey-cli -p 6405 FLINTINFO | tr '\r' '\n' | sed -n 's/^latest_seq://p')
+[ "${A_DIV:-0}" -gt "${D_TIP:-0}" ] || {
+  echo "FAIL: arm D staged no divergence (A $A_DIV vs sync point $D_TIP) — the arm would pass vacuously"; exit 1; }
+echo "  A advanced to $A_DIV past the $D_TIP B last saw"
+
+kill -9 "$(pgrep -f "flint-server --port 6405" | head -1)" 2>/dev/null
+sleep 0.4
+$B --port 6406 --engine rocks --data-dir "$D/d-b" >"$D/d-b2.log" 2>&1 &
+fleet_wait_ready 6406
+valkey-cli -p 6406 FLINTPROMOTE 0 2 | grep -q "OK promoted" || { echo "FAIL: arm D promote"; exit 1; }
+echo "drill: superseded copy rejoining" > "$D/d-a/NEEDS_RESEED"
+$B --port 6405 --engine rocks --data-dir "$D/d-a" --replica-of 127.0.0.1:6406 \
+   --rewind-snaps "$D/snaps-d" >"$D/d-a2.log" 2>&1 &
+fleet_wait_ready 6405
+
+grep -q "is past the fence" "$D/d-a2.log" || {
+  echo "FAIL: arm D — the post-divergence snapshot was NOT refused by the fence."
+  echo "      It carries writes the new master never had; accepting it is time travel."
+  sed 's/^/    /' "$D/d-a2.log"; exit 1; }
+grep -q "clears the fence" "$D/d-a2.log" || {
+  echo "FAIL: arm D — no candidate cleared the fence, so nothing reports WHICH was chosen."
+  sed 's/^/    /' "$D/d-a2.log"; exit 1; }
+grep -q "rewound to" "$D/d-a2.log" || {
+  echo "FAIL: arm D — a superseded ex-master with a valid candidate did not rewind."
+  echo "      This is BUG-0071's 94.2 s path: the full re-seed holds the write"
+  echo "      gate shut for the whole transfer at min-replicas-to-write=1."
+  sed 's/^/    /' "$D/d-a2.log"; exit 1; }
+grep -q "full sync: received" "$D/d-a2.log" && {
+  echo "FAIL: arm D — a full checkpoint was transferred despite a valid candidate"; exit 1; }
+echo "  past-the-fence snapshot refused, the older one cleared it, rewound without a transfer"
+
+echo "PASS: rewind rejoin drill — ex-master rejoined from its own snapshot (no full transfer), adopted the new epoch, converged; a past-the-fence snapshot was refused client- and server-side and fell back to a re-seed that dropped the abandoned branch; and a genuinely SUPERSEDED ex-master, holding writes the survivor never received, still rewinds when a candidate on the correct side of the branch point survives (arm D, BUG-0071)"

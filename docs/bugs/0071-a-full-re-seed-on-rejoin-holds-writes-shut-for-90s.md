@@ -332,3 +332,89 @@ the wrong call exhaustively. This one defended a claim about the shipped path
 while the only evidence came from a build that had been reverted hours earlier.
 The experiment below must therefore run on current code, and its first job is to
 establish whether this bug reproduces at all.
+
+## CAUSE FOUND 2026-08-29, by experiment on current code
+
+Three runs against `main`, each building the condition rather than reasoning
+about it. The harness is in the session scratchpad; arm D of
+`rewind_rejoin_drill.sh` is the part worth keeping.
+
+**1. It reproduces.** A master that accepts 400 writes its replica never
+receives, then dies; the survivor is promoted; the ex-master rejoins marked,
+with `--rewind-snaps`:
+
+```
+rewind: snapshot …-seq702-e0.1 is past the fence (702 > 302); trying older
+rewind: no snapshot at or before the fence; full re-seed
+full sync: received 7 files
+```
+
+**2. The mechanism is not broken.** Same run with one snapshot taken BEFORE the
+divergence:
+
+```
+rewind: snapshot …-seq702-e0.1 is past the fence (702 > 302); trying older
+rewind: candidate …-seq302-e0.1 clears the fence for epoch (0,1) (302 <= 302)
+rewound to …-seq302-e0.1: tailing incrementally instead of a full re-seed
+```
+and on the master: `rewind attach: upstream cursor 302 (epoch (0,1)) maps to
+local seq 604`. Fence, fallback-to-older, translation and resume all work.
+
+So the fence is correct, the translation is correct, and the earlier
+fence/tip-disagreement hypothesis was an artifact of the reverted build. **The
+whole cause is whether a candidate at or below the branch point still exists.**
+
+**3. What removes it: `quarantine_unresumable`.** When a tailer hits a WAL gap
+it cannot resume, it renames EVERY snapshot with `seq <= last_applied` so the
+name no longer parses as a candidate (`main.rs:5143`, BUG-0062's livelock fix —
+without it the next boot picks the same losing snapshot and fails identically).
+
+Re-running experiment 2 with exactly that rename applied:
+
+```
+   quarantined: snap-…-seq302-e0.1
+rewind: snapshot …-seq702-e0.1 is past the fence (702 > 302); trying older
+rewind: no snapshot at or before the fence; full re-seed
+```
+
+### The chain, stated once
+
+1. A tailer hits an unresumable WAL gap at cursor C → every snapshot `<= C` is
+   permanently disqualified.
+2. Later, a promotion records a fence at or below C (the survivor's
+   `last_applied`, in the ex-master's space).
+3. `try_rewind` sees only snapshots ABOVE the fence, refuses each correctly, and
+   runs out of candidates.
+4. Full re-seed. At `min-replicas-to-write=1` the transfer IS the write outage:
+   94.2 s.
+
+### Why the quarantine is too wide
+
+It is scoped to one cursor and unbounded in time. The condition that justified
+it — *this* master's WAL no longer reaching seq S — is a fact about one master's
+retention at one moment. After a promotion the tail is served by a DIFFERENT
+node with a different WAL, and a snapshot disqualified for the old master may be
+exactly the candidate the new fence needs. The rename keeps the bytes
+(`unresumable-` prefix) but discards the only thing that would let a later
+decision reconsider them: which cursor they failed for, and against whom.
+
+**Not proposing the fix in this file yet.** The obvious shape — record the
+failing cursor in the quarantined name so a later, lower fence can re-admit it —
+is one line of reasoning away from being wrong in the way three things were
+wrong today. It now has an instrument: experiment 3 fails, experiment 2 passes,
+and a fix has to flip the first without breaking the second or reopening
+BUG-0062's livelock.
+
+### Kept
+
+`rewind_rejoin_drill.sh` arm D: a genuinely superseded ex-master, with a valid
+candidate, must still rewind. Arms A and C both let the replica catch up before
+the kill, so nothing exercised divergence until now. It asserts the divergence
+was staged (or it would pass vacuously), that the post-divergence snapshot is
+REFUSED, that some candidate is reported as clearing the fence, and that no full
+transfer happens. Mutation-checked by making the fence never reject: the arm
+fails.
+
+`try_rewind` now also logs the ACCEPTED candidate and the bound it cleared.
+Before this, only rejections named a bound — which is why the production
+evidence could not distinguish "accepted" from "never asked".

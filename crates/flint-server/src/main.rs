@@ -506,6 +506,16 @@ fn try_rewind(data_dir: &std::path::Path, snaps_dir: &str, target: &str) -> bool
             );
             continue;
         }
+        // BUG-0071. The REJECTED path has always named its bound; the accepted
+        // one named nothing, so a rejoin that cleared the fence and was then
+        // refused downstream left no record of what it cleared. That is the
+        // evidence the 2026-08-28 94.2 s re-seed turned out to need and not
+        // have — the absence of a "past the fence" line was all that
+        // distinguished "accepted" from "never asked".
+        eprintln!(
+            "rewind: candidate {} clears the fence for epoch {epoch} ({seq} <= {bound})",
+            path.display()
+        );
         // First candidate to clear the fence: every FLINTFENCE round trip for
         // this rejoin has now happened, including those for candidates that
         // were rejected as past the fence.
