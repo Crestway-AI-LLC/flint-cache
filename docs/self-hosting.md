@@ -389,6 +389,56 @@ for i in $(seq 1 20); do
 done
 ```
 
+**A reboot is not the only way a seat goes away.** The unit above covers the
+box restarting. It does not cover a seat exiting while the box stays up — and
+one design decision makes that a case you must plan for.
+
+When a replica's copy can no longer be continued (its cursor sits past the
+point where a promotion branched the timeline, so it holds writes the
+surviving lineage never had), it writes a `NEEDS_RESEED` marker and **exits**.
+That is deliberate: the alternative is re-seeding in place, which would tear
+the database handle out from under readers being served right now. The next
+start discards the copy and full-syncs, unattended. But *something has to run
+the next start*.
+
+Nothing in Flint does. A pair in that state keeps serving from one copy and
+looks healthy to a client, and `flintctl status` shows the seat simply DOWN.
+We ran a box that way for five days before noticing.
+
+So run `start` on a timer as well as at boot. It skips seats that are already
+serving, so on a healthy fleet it does nothing:
+
+```
+# /etc/systemd/system/flint-supervise.service
+[Unit]
+Description=Restart any Flint seat that stopped serving
+[Service]
+Type=oneshot
+# KillMode=process, or this unit kills the seats it just started: a oneshot's
+# cgroup is torn down when ExecStart returns, and the seats are in it.
+KillMode=process
+ExecStart=/opt/flint/bin/flintctl -f /opt/flint/cluster.flint start
+```
+
+```
+# /etc/systemd/system/flint-supervise.timer
+[Unit]
+Description=Check every minute that every Flint seat is still serving
+[Timer]
+OnActiveSec=30s
+OnUnitActiveSec=1min
+[Install]
+WantedBy=timers.target
+```
+
+`systemctl enable --now flint-supervise.timer`. On a multi-host fleet run this
+on the machine that holds the inventory — `start` reaches the other hosts the
+same way `bootstrap` did.
+
+Pair it with an alert on `flintctl verify`, which reports a pair serving from
+one copy as `SINGLE-COPY`. A restarter with nothing watching it will happily
+restart a seat that exits again every minute, and you want to know that.
+
 **Verify it for real.** A reboot path that has never been rebooted is a
 guess. Reboot the box, then check `systemctl status flint`, `flintctl -f
 /opt/flint/cluster.flint status` for the expected roles, and read a key you

@@ -1,4 +1,4 @@
-# BUG-0077 — a seat that exits for a re-seed is never restarted on a fleet (OPEN)
+# BUG-0077 — a seat that exits for a re-seed is never restarted on a fleet (FIXED 2026-08-30)
 
 **Found** 2026-08-30 by the three-member fleet chaos re-run that confirmed
 BUG-0076's fix. The fix worked and immediately exposed the next link.
@@ -53,7 +53,61 @@ is live and converged, and a permanently stranded member can never satisfy it.
 Five accepted master kills means survivors were re-attaching and the pair was
 returning to full strength between kills.
 
-## Fix options
+## The supervisor already exists, and this is the second time it was needed
+
+Filed as "nothing restarts it". That was wrong in an instructive way:
+`packaging/aws/supervise.sh` and `flint-supervise.timer` exist for EXACTLY
+this, and their header records the first occurrence —
+
+> The gap this closes: a seat can exit CORRECTLY and never come back. On
+> 2026-08-01 the playground's replica hit a WAL gap, marked itself for
+> re-seed and exited — the designed behaviour — and nothing ran the next
+> start. **It sat single-copy for five days.** `flint-first-boot.service`
+> covers a REBOOT; nothing covered a seat dying under a box that stays up.
+
+So the mechanism was built, after a five-day outage, and this run reproduced
+the same outage anyway. The reason is the chain that installs it:
+
+- `flint-ami.pkr.hcl` enables `flint-nvme`, `flint-first-boot`, `prometheus`
+  and `grafana-server`. **It does not enable `flint-supervise.timer`.**
+- `first-boot.sh` is what installs the unit files AND enables the timer.
+- `chaos-cluster/up.sh` **disables `flint-first-boot`** — correctly, or six
+  hosts would each bootstrap their own single-host cluster (the trap that
+  planning for the multi-host work called out by name).
+
+Avoiding six single-host clusters therefore also removes the supervisor,
+because both hang off the same unit. Nothing says so anywhere, and the fleet
+that most needs supervision — the one built to have its seats killed — is the
+only topology that silently has none.
+
+And it is not only the harness. `docs/self-hosting.md` documented surviving a
+REBOOT and never mentioned this case at all, so an operator following it got
+the five-day failure mode with no warning.
+
+## Fixed
+
+**The chaos fleet** now runs `flintctl start` once, from the orchestrator,
+between the kills and the post-chaos verify — which is what
+`flint-supervise.timer` does every minute on a supervised box. `start` skips
+seats already serving, so it is a no-op on a healthy fleet. Deliberately NOT
+in the kill loop: a supervisor racing chaos would restart seats the run
+intends to be dead and quietly change the fault model.
+
+**The docs** now say it. `self-hosting.md` §2b gains the distinction its own
+reboot unit does not cover — a seat exiting while the box stays up — with the
+unit, the timer, the `KillMode=process` trap that cost a day on the
+playground, and the advice to alert on `verify`'s SINGLE-COPY rather than
+trust a restarter nothing watches.
+
+## What is deliberately NOT changed
+
+Enabling `flint-supervise.timer` on every AMI host. On a multi-host fleet each
+seat host has no inventory — it lives on the orchestrator — so a per-host
+timer would log "no inventory" every minute and supervise nothing. The unit is
+right; where it runs is the part that does not generalise from one box to a
+fleet.
+
+## Fix options considered
 
 1. **The controller restarts a seat that exited.** It already supervises the
    pair and already knows the member is unreachable while its socket is dead.
@@ -69,14 +123,16 @@ returning to full strength between kills.
    a good reason (the DB handle is shared with the serving path); nothing has
    changed that.
 
-Option 3 is the honest one: the behaviour is not a bug in the seat, it is a
-missing supervisor that the seat's own comment already assumes exists.
+Option 3 was the honest one and is what shipped, in the narrow form above: the
+behaviour is not a bug in the seat, it is a supervisor that exists, is enabled
+by a unit this fleet must disable for an unrelated reason, and was never
+written down for anyone self-hosting.
 
 ## Not covered
 
-- Whether the playground and any real deployment have the supervisor this
-  assumes. If they do, this is a chaos-fleet gap; if they do not, every
-  fence-refused rejoin anywhere needs a human.
+- Whether the playground's timer is actually running TODAY. The unit is
+  enabled by a first-boot that ran months ago; nothing re-asserts it, and
+  `smoke-ami.sh` checks it on a fresh image rather than on the live box.
 - How often a re-pointed replica is genuinely past the fence. Once in this
   run, out of five promotions — but the run is far too small to call that a
   rate, and it depends on how far a replica lags at the moment of promotion.
