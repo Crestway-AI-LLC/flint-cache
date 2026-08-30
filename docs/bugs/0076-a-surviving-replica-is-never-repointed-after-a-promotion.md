@@ -1,4 +1,4 @@
-# BUG-0076 — a surviving replica is never re-pointed, so a three-member pair loses a copy at every failover (OPEN)
+# BUG-0076 — a surviving replica is never re-pointed, so a three-member pair loses a copy at every failover (FIXED 2026-08-29)
 
 **Found** 2026-08-29 by running the three-member chaos test — the validation
 gap named at the end of BUG-0075, and the reason that recommendation was held
@@ -110,11 +110,60 @@ already claims. Until it lands, **three members must not be recommended for
 `min-replicas-to-write=1`** — not because it is unsafe, but because it does not
 deliver the availability it is being chosen for.
 
+## Fixed
+
+Option 1. The controller, having promoted a survivor, now tells every OTHER
+member of the pair where the role went, with a new `FLINTFOLLOW <host:port>`.
+The replica's tail address moved out of the start-time flag into a process
+static the command can swap; the tailer re-reads it at the top of every
+reconnect and drops an in-flight stream on the same 300 ms granularity the
+stop flag already had.
+
+**It moves an address, never a decision.** Whether a re-pointed copy may
+resume from its cursor is still the new master's `FLINTSYNC` attach guard's
+call — the one that refuses anything past the promotion fence with `-WALGAP`
+and sends it to a re-seed (BUG-0075). That is what makes this safe without
+new lineage logic: re-pointing cannot widen what a replica may apply, it only
+lets it ask. The seat does check the target answers as a master at an epoch
+at or above its own, so a controller that lost a promotion race cannot attach
+a replica to its fenced candidate.
+
+**Re-pointing is not free, and the first cut of this fix broke a working
+pair.** An attach re-runs the promotion-fence check, and that check is about
+where a lineage branched, not about whether the link is healthy. A same-node
+re-promotion records the promoting node's stale `last_applied` — often 0 — so
+a replica that has been streaming happily since before that promotion is past
+the fence for its own epoch. Sending it `FLINTFOLLOW` therefore dropped a good
+stream, failed the re-attach with `-WALGAP`, and sent the seat down the FATAL
+mark-for-re-seed-and-exit path. A two-member pair that recovered correctly
+before the fix became single-copy after it.
+
+`failover_bystander` caught it, on exactly the topology this change was not
+about. So `FLINTFOLLOW` to the address a replica is ALREADY following is now a
+no-op: the bug is a replica pointed at the WRONG address, and one pointed at
+the right address needs nothing done to it. Worth stating generally — an
+idempotent-looking command is not idempotent when executing it has side
+effects the caller cannot see.
+
+Held by `tools/three_member_repoint_drill.sh`, whose assertion is the bug's
+exact signature and is deliberately made BEFORE the dead seat is restarted:
+kill the master of a three-member pair and the promoted node must report
+`live_replicas 1` with nobody restarted. Unfixed it reports 0 forever.
+Restarting first would have hidden the bug, because that restart carries its
+own re-point — which is the entire reason two-member pairs never showed this.
+
+The drill also caught the fix's own bug, which is why it is written this way:
+the seat's epoch check read `epoch:` from `FLINTINFO`, which emits
+`role_epoch:`. Every target parsed as (0,0), every re-point was refused as
+"behind this node", and the feature was inert. A check that can never pass
+looks exactly like one that always does.
+
 ## Not covered
 
-- Whether a re-pointed replica can rejoin incrementally or must always
-  re-seed. It holds a copy of the superseded lineage, so it is the same
-  question BUG-0075 answered for ex-masters, and the same fence must decide it.
+- Whether a re-pointed replica rejoins incrementally or re-seeds is decided
+  by the attach guard, not by this change, and the local drill's pair is too
+  small a dataset for the difference to be visible. Which path a real
+  re-point takes under load is unmeasured.
 - Pairs larger than three. Nothing here is specific to the third member; an
   Nth member has the same problem N-2 times over.
 - Whether the controller should re-point on every promotion or only when it

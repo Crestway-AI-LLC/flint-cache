@@ -1110,6 +1110,43 @@ impl Pair {
                 // must never be remembered as a holder at the new epoch.
                 self.last_insync = vec![(survivor.addr.clone(), next)];
                 self.no_master_streak = 0;
+                // TELL THE OTHER MEMBERS WHERE THE ROLE WENT (BUG-0076).
+                //
+                // Nothing else does. A replica reads --replica-of once, at
+                // startup, so on a pair of three the survivor that was neither
+                // killed nor promoted goes on dialling the DEAD master
+                // forever: every member up, right roles, right epochs, and the
+                // pair quietly running single-copy. On a two-member pair this
+                // was invisible, because the only other member is the one
+                // `restart-node` brings back with a freshly computed master --
+                // the re-point was a side effect of a restart that every
+                // survivor happened to get.
+                //
+                // Best-effort and unordered: this moves an ADDRESS, not a
+                // decision. Whether that copy may resume from its cursor is
+                // still the new master's FLINTSYNC attach guard's call, which
+                // refuses anything past the promotion fence and sends it to a
+                // re-seed. A member that is down or refuses is no worse off
+                // than before this existed -- it is exactly where BUG-0076
+                // left every one of them -- so a failure here is logged and
+                // never allowed to fail the promotion that already succeeded.
+                for other in states.iter().filter(|n| n.addr != survivor.addr) {
+                    match call(&other.addr, &[b"FLINTFOLLOW", survivor.addr.as_bytes()]) {
+                        Ok(Value::Simple(_)) => eprintln!(
+                            "[{}][{}] re-pointed {} at {}",
+                            cfg.id, self.label, other.addr, survivor.addr
+                        ),
+                        Ok(v) => eprintln!(
+                            "[{}][{}] {} declined to follow {}: {v:?}",
+                            cfg.id, self.label, other.addr, survivor.addr
+                        ),
+                        Err(e) => eprintln!(
+                            "[{}][{}] {} unreachable to re-point ({e}); it re-points when \
+                             flintctl restarts it",
+                            cfg.id, self.label, other.addr
+                        ),
+                    }
+                }
             }
             // -FENCED here means another controller already promoted at this
             // or a higher epoch: the desired outcome exists, so it's fine.

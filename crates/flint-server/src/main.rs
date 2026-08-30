@@ -778,6 +778,29 @@ static LOADING: AtomicBool = AtomicBool::new(true);
 /// as well as the code still recognises it.
 const LOADING_ERR: &str = "LOADING Flint is loading the dataset in memory";
 
+/// Where this replica tails from, and a pending request to change it.
+///
+/// BUG-0076: a replica learned its master exactly ONCE, from `--replica-of`
+/// at startup, so when a promotion moved the role the survivor that was
+/// neither killed nor promoted went on dialling a dead address forever. On a
+/// two-member pair that never showed, because the only other member is the
+/// one `restart-node` brings back with a freshly computed master.
+///
+/// A process static for the same reason `INTERNAL_CLIENT` is one: the command
+/// handler and the tailer thread are six call frames apart, and the value is
+/// per-process by nature. Widening every signature between them would say
+/// less about the design than this comment does.
+#[cfg_attr(not(feature = "rocks"), allow(dead_code))]
+struct ReplicaLink {
+    /// The address the tailer dials. Read at the top of every reconnect.
+    target: std::sync::Mutex<String>,
+    /// Set by FLINTFOLLOW so an in-flight tail drops promptly, exactly the way
+    /// the stop flag does; cleared by the tailer when it re-reads the target.
+    repoint: AtomicBool,
+}
+#[cfg_attr(not(feature = "rocks"), allow(dead_code))]
+static REPLICA_LINK: std::sync::OnceLock<Arc<ReplicaLink>> = std::sync::OnceLock::new();
+
 /// Decrements the live-connection counter on any exit (incl. panic).
 struct ConnGuard;
 impl Drop for ConnGuard {
@@ -1897,7 +1920,12 @@ fn main() -> std::io::Result<()> {
         let stop = Arc::clone(&tailer_stop);
         // Cloned BEFORE the move: `target` goes into the replication closure.
         let agree_target = target.clone();
-        std::thread::spawn(move || replica::run(&target, &kv, &stop));
+        let link = Arc::new(ReplicaLink {
+            target: std::sync::Mutex::new(target.clone()),
+            repoint: AtomicBool::new(false),
+        });
+        let _ = REPLICA_LINK.set(Arc::clone(&link));
+        std::thread::spawn(move || replica::run(&link, &kv, &stop));
 
         // ADR-0023 D7.1 pair-agreement. Per-seat config lets the two members
         // of a pair disagree silently, and a pair where one side reclaims
@@ -3917,6 +3945,12 @@ fn execute(
     {
         return flintdemote(read_only, rocks, args);
     }
+    if args
+        .first()
+        .is_some_and(|n| n.eq_ignore_ascii_case(b"FLINTFOLLOW"))
+    {
+        return flintfollow(read_only, rocks, args);
+    }
     // FLINTFENCE <generation> <counter>: the highest sequence a copy from
     // that role epoch may resume from — the earliest recorded branch point
     // after it (#187). A rejoining ex-master asks this to pick which local
@@ -4303,6 +4337,122 @@ fn flintpromote(
     _args: &[Vec<u8>],
 ) -> Value {
     Value::Error("ERR FLINTPROMOTE requires a build with --features rocks".into())
+}
+
+/// FLINTFOLLOW <host:port>: re-point this replica's tail at a new master.
+///
+/// BUG-0076. Sent by the controller to every OTHER member of a pair right
+/// after it promotes one, because nothing else ever tells them: a replica
+/// reads `--replica-of` once at startup, and the survivor that was neither
+/// killed nor promoted would otherwise dial the dead master forever.
+///
+/// This moves an ADDRESS, never a decision about lineage. Whether this copy
+/// may resume from its cursor is still decided by the new master's FLINTSYNC
+/// attach guard, which refuses a cursor past the promotion fence with -WALGAP
+/// and sends this replica to a re-seed (BUG-0075). Re-pointing therefore
+/// cannot widen what a replica is allowed to apply — it only lets it ask.
+///
+/// What IS checked here is the target: it must answer as a master at an epoch
+/// at or above this node's own. A controller that lost a promotion race can
+/// still send this, and following its fenced candidate would attach this
+/// replica to a superseded branch.
+#[cfg(feature = "rocks")]
+fn flintfollow(
+    read_only: &Arc<AtomicBool>,
+    rocks: &Option<RocksHandle>,
+    args: &[Vec<u8>],
+) -> Value {
+    use flint_storage::manifest::{self, Epoch};
+    if !read_only.load(Ordering::Relaxed) {
+        return Value::Error("ERR FLINTFOLLOW: this node is master, not a replica".into());
+    }
+    let Some(addr) = args.get(1).and_then(|raw| std::str::from_utf8(raw).ok()) else {
+        return Value::Error("ERR usage: FLINTFOLLOW <host:port>".into());
+    };
+    let Some(link) = REPLICA_LINK.get() else {
+        return Value::Error("ERR FLINTFOLLOW: this node has no replication link".into());
+    };
+    let mine = rocks
+        .as_ref()
+        .and_then(|kv| manifest::read_role(kv.as_ref()))
+        .map(|c| c.epoch)
+        .unwrap_or(Epoch::ZERO);
+    // Ask the target what it is, rather than trusting the caller.
+    let info = match internal_call_once(addr, &[b"FLINTINFO"]) {
+        Ok(Value::Bulk(Some(raw))) => String::from_utf8_lossy(&raw).into_owned(),
+        Ok(_) => return Value::Error(format!("ERR FLINTFOLLOW: {addr} gave no FLINTINFO")),
+        Err(e) => return Value::Error(format!("ERR FLINTFOLLOW: {addr} unreachable: {e}")),
+    };
+    let field = |k: &str| {
+        info.lines()
+            .find_map(|l| l.strip_prefix(k).map(|v| v.trim().to_string()))
+    };
+    if field("role:").as_deref() != Some("master") {
+        return Value::Error(format!("ERR FLINTFOLLOW: {addr} is not a master"));
+    }
+    // role_epoch, which is what FLINTINFO actually calls it. Reading `epoch:`
+    // here silently parsed every target as (0,0) and refused every re-point as
+    // "behind this node" — a check that cannot pass is the same shape as one
+    // that always does, and only the drill told the difference.
+    let theirs = field("role_epoch:")
+        .and_then(|e| {
+            let inner = e.trim_start_matches('(').trim_end_matches(')').to_string();
+            let (g, c) = inner.split_once(',')?;
+            Some(Epoch {
+                generation: g.trim().parse().ok()?,
+                counter: c.trim().parse().ok()?,
+            })
+        })
+        .unwrap_or(Epoch::ZERO);
+    if theirs < mine {
+        return Value::Error(format!(
+            "ERR FLINTFOLLOW: {addr} claims {theirs}, behind this node's {mine} — refusing to \
+             follow a superseded lineage"
+        ));
+    }
+    // ALREADY FOLLOWING IT: say so and touch nothing.
+    //
+    // Re-pointing is not free. It drops the stream and re-attaches, and an
+    // attach re-runs the promotion-fence check -- which a healthy replica can
+    // FAIL, because the fence is about where a lineage branched and not about
+    // whether this link is working. A same-node re-promotion records the
+    // promoting node's stale last_applied (often 0), so a replica quietly
+    // streaming since before that promotion is past the fence for its epoch
+    // and gets -WALGAP, marks itself for re-seed, and exits.
+    //
+    // That is exactly what this did to the two-member `failover_bystander`
+    // pair: the controller re-pointed a replica at the master it was ALREADY
+    // streaming from, and a working pair became single-copy. The bug being
+    // fixed here is a replica pointed at the WRONG address; a replica pointed
+    // at the right one needs nothing done to it.
+    let unchanged = match link.target.lock() {
+        Ok(mut t) => {
+            let same = *t == addr;
+            if !same {
+                *t = addr.to_string();
+            }
+            same
+        }
+        Err(p) => {
+            let mut t = p.into_inner();
+            let same = *t == addr;
+            if !same {
+                *t = addr.to_string();
+            }
+            same
+        }
+    };
+    if unchanged {
+        return Value::Simple(format!("OK already following {addr}"));
+    }
+    link.repoint.store(true, Ordering::Relaxed);
+    eprintln!("FLINTFOLLOW: re-pointing replication at {addr} (epoch {theirs})");
+    Value::Simple(format!("OK following {addr}"))
+}
+
+#[cfg(not(feature = "rocks"))]
+fn flintfollow(_ro: &Arc<AtomicBool>, _rocks: &Option<RocksHandle>, _args: &[Vec<u8>]) -> Value {
+    Value::Error("ERR FLINTFOLLOW requires a build with --features rocks".into())
 }
 
 /// FLINTFENCE <generation> <counter>: answer with the branch-point bound for
@@ -5160,13 +5310,31 @@ mod replica {
         }
     }
 
-    pub fn run(target: &str, kv: &Arc<RocksKv>, stop: &Arc<AtomicBool>) {
+    pub fn run(link: &Arc<super::ReplicaLink>, kv: &Arc<RocksKv>, stop: &Arc<AtomicBool>) {
         loop {
             if stop.load(Ordering::Relaxed) {
                 eprintln!("tailer stopped (promoted)");
                 return;
             }
-            if let Err(e) = tail_once(target, kv, stop)
+            // The address, every time round: FLINTFOLLOW may have moved it
+            // while the last attempt was in flight. A stranded replica is
+            // already in a tight retry loop against a refused address, so a
+            // swap lands on the very next attempt.
+            let target: &str = &link
+                .target
+                .lock()
+                .map_or_else(|p| p.into_inner().clone(), |t| t.clone());
+            // A re-point is not a failure: clear it and dial the new address
+            // without the error backoff or the WalPurged remedy below, which
+            // are about a link that broke, not one that moved.
+            if link.repoint.swap(false, Ordering::Relaxed) {
+                eprintln!("tailer now following {target}");
+                if let Err(e) = tail_once(target, kv, stop, link) {
+                    eprintln!("tail from {target} ended: {e}");
+                }
+                continue;
+            }
+            if let Err(e) = tail_once(target, kv, stop, link)
                 && !stop.load(Ordering::Relaxed)
             {
                 // Retrying a purged span cannot work: the next request asks
@@ -5312,7 +5480,12 @@ mod replica {
         }
     }
 
-    fn tail_once(target: &str, kv: &Arc<RocksKv>, stop: &Arc<AtomicBool>) -> Result<(), TailError> {
+    fn tail_once(
+        target: &str,
+        kv: &Arc<RocksKv>,
+        stop: &Arc<AtomicBool>,
+        link: &Arc<super::ReplicaLink>,
+    ) -> Result<(), TailError> {
         let mut stream = internal_connect(target)?;
         // Short read timeout so the stop flag is honored promptly.
         stream.set_read_timeout(Some(std::time::Duration::from_millis(300)))?;
@@ -5514,6 +5687,12 @@ mod replica {
                         last_ack_sent = std::time::Instant::now();
                     }
                     if stop.load(Ordering::Relaxed) {
+                        return Ok(());
+                    }
+                    // Same 300ms granularity the stop flag gets: a promotion
+                    // that re-points this replica should not wait out a quiet
+                    // stream from a master that is no longer ours.
+                    if link.repoint.load(Ordering::Relaxed) {
                         return Ok(());
                     }
                     match stream.read(&mut chunk) {
