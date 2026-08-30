@@ -1,0 +1,60 @@
+# Copyright (c) 2026 Crestway AI LLC. All rights reserved.
+# A durable Flint pair on a laptop, in one command:
+#
+#     docker compose -f packaging/docker/docker-compose.yml up
+#
+# WHAT THIS IS: a master and a replica, each on its own durable volume, with
+# replication actually running — enough to develop against, to see a failover
+# by hand (`docker compose stop flint-a`), and to watch data survive a restart.
+#
+# WHAT THIS IS NOT, and the difference matters:
+#
+#   * NO TLS. The internal mesh runs mutual TLS in every real deployment;
+#     here the seats talk plaintext, because handing out a compose file that
+#     mints a CA would teach the wrong setup. Do not expose these ports.
+#   * NO CONTROLLER, so nothing promotes the replica automatically. That is
+#     deliberate: automatic failover needs a control plane and a controller,
+#     and a pair that fails over with no fencing is a worse lesson than one
+#     that does not fail over at all.
+#   * NO AUTH. There is no tenant, no token, no proxy edge.
+#
+# For anything beyond local development, read docs/self-hosting.md. This file
+# exists so the first ten minutes are easy, not so the next ten years are.
+services:
+  flint-a:
+    build:
+      context: ../..
+      dockerfile: packaging/docker/Dockerfile
+    image: flint:local
+    command: ["--port", "7001", "--bind", "0.0.0.0", "--engine", "rocks",
+              "--data-dir", "/var/lib/flint"]
+    ports: ["7001:7001"]
+    volumes: ["flint-a-data:/var/lib/flint"]
+    # The seat exits on purpose when its copy cannot be continued and must be
+    # re-seeded; something has to run the next start. On a real host that is a
+    # systemd timer (docs/self-hosting.md §2b); here it is the restart policy.
+    restart: unless-stopped
+    # NO HEALTHCHECK, deliberately.
+    #
+    # The check worth having is "does this seat answer PING", because a seat
+    # that is running but still -LOADING is not yet serving. That needs a
+    # RESP client, and the runtime image carries none: flintctl speaks to a
+    # fleet through an inventory, not to a socket. A healthcheck that ran
+    # `flintctl --version` instead would pass on a seat that is not serving
+    # at all, which is worse than no check — it would report healthy for
+    # exactly the state you wanted warning of.
+    #
+    # From the host, where you do have a client:  redis-cli -p 7001 PING
+
+  flint-b:
+    image: flint:local
+    depends_on: [flint-a]
+    command: ["--port", "7002", "--bind", "0.0.0.0", "--engine", "rocks",
+              "--data-dir", "/var/lib/flint", "--replica-of", "flint-a:7001"]
+    ports: ["7002:7002"]
+    volumes: ["flint-b-data:/var/lib/flint"]
+    restart: unless-stopped
+
+volumes:
+  flint-a-data:
+  flint-b-data:

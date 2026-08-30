@@ -1,0 +1,22 @@
+# Copyright (c) 2026 Crestway AI LLC. All rights reserved.
+# The build context is the whole repo, and two entries here are not tidiness:
+# `target` is a SYMLINK to a build directory on an external volume that has
+# reached 68 GB, and `.git` carries every version of everything. Sending
+# either to the daemon turns a two-minute context upload into a stall nobody
+# diagnoses, and neither is readable by the build.
+target
+.git
+.github
+.claude
+
+# Test and CI machinery: none of it is compiled into the image, and drills
+# pull in fixtures that dwarf the source.
+tools
+docs
+packaging/aws
+
+# Local scratch that must never reach a distributed artifact.
+*.log
+*.pem
+*.key
+.DS_Store

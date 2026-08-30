@@ -10,6 +10,44 @@ The one tool you drive is **`flintctl`**: one inventory file describes the
 cluster, and `flintctl` makes it so. See its module header for the full
 verb and inventory reference; this guide is the operator's version of it.
 
+## Quick start (container)
+
+The shortest path to a durable Flint you can write to. No Rust toolchain, no
+AMI, no certificates.
+
+```sh
+docker build -f packaging/docker/Dockerfile -t flint:local .
+docker run -d --name flint -p 7001:7001 -v flint-data:/var/lib/flint flint:local
+redis-cli -p 7001 SET hello world
+docker restart flint && redis-cli -p 7001 GET hello   # still there
+```
+
+That last line is the point of the product, so it is worth doing rather than
+reading: the value survives because the write was on disk before it was
+acknowledged, not because the process stayed up.
+
+A pair, with replication actually running:
+
+```sh
+docker compose -f packaging/docker/docker-compose.yml up
+```
+
+**What the container is for, and what it is not.** It is a distribution
+artifact for evaluation and local development. It is not how the managed
+fleet runs and should not be how yours runs at scale, for two concrete
+reasons:
+
+- **Storage.** Flint's numbers assume a local NVMe instance store, which the
+  AMI finds by device model and mounts at `/var/lib/flint`. A container gets
+  whatever the host hands it, and a durable store on network-backed storage
+  is a different product with the same commands.
+- **Supervision, failover and TLS.** The compose file runs plaintext with no
+  control plane and no controller, so nothing promotes a replica. Read §2b
+  before running this anywhere that matters.
+
+The image is licensed under the Elastic License 2.0, same as the source; a
+copy ships at `/LICENSE` inside it.
+
 ## Quick start (single box)
 
 Build prerequisites (Rust 1.85+, a C++ toolchain and libclang for RocksDB,
