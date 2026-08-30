@@ -393,15 +393,20 @@ pub fn scan_all_migrations(kv: &dyn Kv) -> Vec<MigrationRecord> {
 /// re-seed, and the widowed master shed writes for the whole transfer).
 ///
 /// System rows, so they never ride the replication stream — but checkpoints
-/// copy them, so every full sync or rewind hands the seeded node the
-/// seeder's accumulated history. That propagation is what makes the bound
-/// below sound for two-member pairs: the promotion that supersedes a dying
-/// master is always executed on the surviving peer, so by induction the
-/// CURRENT master's local rows cover every promotion at which the timeline
-/// actually diverged. (Same-node demote/re-promote cycles can be absent
-/// from a tailing replica's copy, but no other master accepted writes in
-/// between, so nothing diverged at those epochs.) A pair with more than two
-/// members breaks the induction — revisit before that exists.
+/// copy them, so a full sync or rewind hands the seeded node the seeder's
+/// accumulated history. An INCREMENTAL rejoin does not, which is why the
+/// row cannot be trusted merely for sitting above the asker's epoch: on a
+/// pair with a third member, a node can be promoted having never witnessed
+/// the promotion before it, and its own row is denominated in the sequence
+/// space of the master it was tailing, not the asker's (BUG-0075 — measured
+/// as an ex-master rewinding onto a bound from a dead peer's space and
+/// serving writes the surviving branch never had).
+///
+/// So each row records WHICH lineage its seq is in, and a bound is returned
+/// only to an asker from that exact lineage. Two-member pairs are unchanged:
+/// the surviving peer tailed the dying master, so the row it writes names
+/// that master's epoch and every legitimate rejoin still matches. A gap in
+/// the chain now costs a re-seed instead of divergence.
 pub const PROMO_FENCE_KEY_PREFIX: &[u8] = b"\x00flint\x00promofence\x00";
 
 fn promo_fence_key(epoch: Epoch) -> Vec<u8> {
@@ -414,18 +419,20 @@ fn promo_fence_key(epoch: Epoch) -> Vec<u8> {
 /// `epoch`. Written by the promoting node BEFORE it opens for writes;
 /// idempotent, last-write-wins (a re-recorded fence for the same epoch can
 /// only come from the same promotion replayed).
-pub fn record_promo_fence(kv: &dyn Kv, epoch: Epoch, seq: u64) {
-    kv.put(&promo_fence_key(epoch), &seq.to_be_bytes());
+pub fn record_promo_fence(kv: &dyn Kv, epoch: Epoch, supersedes: Epoch, seq: u64) {
+    let mut value = seq.to_be_bytes().to_vec();
+    value.extend_from_slice(&supersedes.encode());
+    kv.put(&promo_fence_key(epoch), &value);
 }
 
 /// The answer to "may a copy from epoch `since` resume from seq S?".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FenceBound {
-    /// Safe iff S <= this seq: the FIRST recorded branch point after
-    /// `since`. First by EPOCH, not a min over seqs — each promotion
-    /// switches to the promoted node's own sequence space, so seqs from
-    /// different fence rows are not comparable numbers; only the row whose
-    /// epoch immediately supersedes `since` is in the asker's space.
+    /// Safe iff S <= this seq: the branch point at which `since`'s lineage
+    /// was superseded, in `since`'s own sequence space. Selected by the
+    /// lineage the row NAMES, never by position alone — each promotion
+    /// switches to the promoted node's sequence space, so seqs from rows
+    /// naming different lineages are not comparable numbers.
     Bound(u64),
     /// No promotion recorded after `since` on this node. The caller decides:
     /// for a node whose own claim epoch is <= `since` this means "never
@@ -440,7 +447,7 @@ pub enum FenceBound {
 /// sequence space. See PROMO_FENCE_KEY_PREFIX for why local rows suffice on
 /// the current master of a two-member pair.
 pub fn promo_fence_bound(kv: &dyn Kv, since: Epoch) -> FenceBound {
-    let mut first: Option<(Epoch, u64)> = None;
+    let mut bound: Option<u64> = None;
     for (k, v) in kv.scan_prefix(PROMO_FENCE_KEY_PREFIX) {
         let Some(epoch) = Epoch::decode(&k[PROMO_FENCE_KEY_PREFIX.len()..]) else {
             continue;
@@ -448,14 +455,28 @@ pub fn promo_fence_bound(kv: &dyn Kv, since: Epoch) -> FenceBound {
         if epoch <= since {
             continue;
         }
-        let Some(seq) = v.try_into().ok().map(u64::from_be_bytes) else {
+        // Rows written before BUG-0075 name no lineage, so nothing here can
+        // establish which space their seq is in. Skipping them costs one
+        // re-seed per promotion that straddles the upgrade; trusting them
+        // costs the divergence they were written before anyone knew about.
+        let (Some(seq), Some(supersedes)) = (
+            v.get(..8)
+                .and_then(|raw| raw.try_into().ok())
+                .map(u64::from_be_bytes),
+            v.get(8..16).and_then(Epoch::decode),
+        ) else {
             continue;
         };
-        if first.is_none_or(|(e, _)| epoch < e) {
-            first = Some((epoch, seq));
+        // The row's seq is in `supersedes`'s space. Any other row is a
+        // number about someone else's timeline.
+        if supersedes != since {
+            continue;
         }
+        // Rows naming the same lineage ARE comparable, so the earliest
+        // branch point is the safe one to hand out.
+        bound = Some(bound.map_or(seq, |b: u64| b.min(seq)));
     }
-    first.map_or(FenceBound::Unfenced, |(_, seq)| FenceBound::Bound(seq))
+    bound.map_or(FenceBound::Unfenced, FenceBound::Bound)
 }
 
 #[cfg(test)]
@@ -464,31 +485,59 @@ mod tests {
     use crate::MemKv;
 
     #[test]
-    fn promo_fence_bound_is_the_first_epoch_above_not_a_seq_min() {
+    fn promo_fence_bound_answers_only_the_lineage_the_row_names() {
         let kv = MemKv::new();
         let e = |g, c| Epoch {
             generation: g,
             counter: c,
         };
         assert_eq!(promo_fence_bound(&kv, e(0, 1)), FenceBound::Unfenced);
-        record_promo_fence(&kv, e(0, 2), 100);
-        record_promo_fence(&kv, e(0, 4), 900);
+        // A chain each of whose promotions witnessed the one before it.
+        record_promo_fence(&kv, e(0, 2), e(0, 1), 100);
+        record_promo_fence(&kv, e(0, 4), e(0, 2), 900);
         // A LATER promotion with a numerically SMALLER seq: legal, because
         // every promotion switches to the promoted node's own sequence
-        // space. Only the first-epoch-above row is in the asker's space; a
-        // min over seqs would wrongly select this one.
-        record_promo_fence(&kv, e(1, 1), 50);
-        // From (0,1): the first branch after it is (0,2) at 100.
+        // space, so a bare min over seqs would wrongly select this one.
+        record_promo_fence(&kv, e(1, 1), e(0, 4), 50);
         assert_eq!(promo_fence_bound(&kv, e(0, 1)), FenceBound::Bound(100));
-        // From (0,2): its own fence does not bind it; the next is (0,4) —
-        // NOT the numerically smaller (1,1) row.
         assert_eq!(promo_fence_bound(&kv, e(0, 2)), FenceBound::Bound(900));
-        // From (0,3): epochs strictly above, even without an exact row.
-        assert_eq!(promo_fence_bound(&kv, e(0, 3)), FenceBound::Bound(900));
-        // From (0,4): the (1,1) row is what supersedes it.
         assert_eq!(promo_fence_bound(&kv, e(0, 4)), FenceBound::Bound(50));
         // From (1,1): nothing recorded after it.
         assert_eq!(promo_fence_bound(&kv, e(1, 1)), FenceBound::Unfenced);
+        // From (0,3): rows sit above it, but none NAMES it. Position alone
+        // used to be enough here and it returned 900 — a number in (0,2)'s
+        // space, handed to a copy from (0,3).
+        assert_eq!(promo_fence_bound(&kv, e(0, 3)), FenceBound::Unfenced);
+    }
+
+    #[test]
+    fn bug_0075_a_row_that_skipped_a_promotion_vouches_for_nobody() {
+        // The three-member gap, in miniature: C is promoted having tailed B
+        // incrementally, so it never received B's row for (0,2) and holds
+        // only its own — whose seq is a position in B's stream. A copy from
+        // A's epoch (0,1) must not be measured against it.
+        let kv = MemKv::new();
+        let e = |g, c| Epoch {
+            generation: g,
+            counter: c,
+        };
+        record_promo_fence(&kv, e(0, 3), e(0, 2), 5406);
+        assert_eq!(promo_fence_bound(&kv, e(0, 1)), FenceBound::Unfenced);
+        // B, whose lineage the row does name, is still served: closing this
+        // must not cost the two-member rejoin its incremental path.
+        assert_eq!(promo_fence_bound(&kv, e(0, 2)), FenceBound::Bound(5406));
+    }
+
+    #[test]
+    fn bug_0075_a_pre_upgrade_row_cannot_be_checked_so_it_does_not_vouch() {
+        let kv = MemKv::new();
+        let e = |g, c| Epoch {
+            generation: g,
+            counter: c,
+        };
+        // The old encoding: seq alone, no lineage.
+        kv.put(&promo_fence_key(e(0, 2)), &100u64.to_be_bytes());
+        assert_eq!(promo_fence_bound(&kv, e(0, 1)), FenceBound::Unfenced);
     }
 
     #[test]

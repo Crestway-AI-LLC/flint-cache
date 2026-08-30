@@ -1809,7 +1809,10 @@ fn main() -> std::io::Result<()> {
                 };
                 // The restore is a branch point like any promotion: nodes of
                 // the dead generation must not resume past the snapshot.
-                manifest::record_promo_fence(&kv, bumped, kv.latest_seq());
+                // The seq is this node's latest, which came from the
+                // restored snapshot -- so it is a position in the OLD
+                // lineage's space, and `old` is the epoch that names it.
+                manifest::record_promo_fence(&kv, bumped, old, kv.latest_seq());
                 manifest::force_role(
                     &kv,
                     RoleClaim {
@@ -4237,7 +4240,15 @@ fn flintpromote(
     // comparison cross-space and accidentally permissive (soak run 30). A
     // same-node demote/re-promote records a stale last_applied — harmlessly
     // conservative: rejoins it cannot vouch for fall back to a full sync.
-    manifest::record_promo_fence(kv.as_ref(), epoch, kv.last_applied());
+    //
+    // The lineage recorded alongside it is this node's role epoch as it
+    // stands BEFORE the flip -- the stream last_applied counts in. Without
+    // it a later promotion that never saw this one answers in the wrong
+    // node's space (BUG-0075).
+    let superseded = manifest::read_role(kv.as_ref())
+        .map(|c| c.epoch)
+        .unwrap_or(Epoch::ZERO);
+    manifest::record_promo_fence(kv.as_ref(), epoch, superseded, kv.last_applied());
     match manifest::set_role(
         kv.as_ref(),
         RoleClaim {

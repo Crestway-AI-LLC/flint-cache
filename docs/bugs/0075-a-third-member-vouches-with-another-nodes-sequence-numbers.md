@@ -1,4 +1,4 @@
-# BUG-0075 — a third member vouches for a lineage it never witnessed, in another node's sequence space (OPEN)
+# BUG-0075 — a third member vouches for a lineage it never witnessed, in another node's sequence space (FIXED 2026-08-29)
 
 **Found** 2026-08-29, deliberately, while answering a design question rather
 than chasing a failure: Jeff proposed recommending three members per pair so
@@ -114,6 +114,46 @@ Option 1 is the one to take first: it closes the divergence with a local
 change, and option 2 becomes a later optimisation that removes its extra
 re-seeds rather than a prerequisite.
 
+## Two guards, one premise
+
+The rewind decision is not the only check on this path: the master's
+`FLINTSYNC` attach independently refuses a cursor past the fence, and it is
+fail-closed — `Unfenced` there means `-WALGAP`, which the replica escalates to
+the re-seed. It did not save us, because it calls the same
+`promo_fence_bound` and was handed the same wrong number: `262 <= 5406`
+satisfies both. Two checks in different layers, reading as defence in depth,
+sharing a single premise and therefore failing together.
+
+That is also why one change closes both, and why the fix belongs in
+`promo_fence_bound` rather than at either call site.
+
+## Fixed
+
+Option 1. Each fence row now carries the epoch it supersedes alongside the
+seq, and `promo_fence_bound` returns a bound only to an asker from that exact
+lineage — the code checks the invariant its own comment already asserted.
+Rows naming the same lineage are comparable, so the earliest is returned.
+
+Two-member pairs keep the fast path: the surviving peer tailed the dying
+master, so the row it writes names that master's epoch and a legitimate rejoin
+still matches. That is asserted by a POSITIVE control, not inferred — a
+two-member rejoin whose snapshot sits below the fence must still print
+`rewound to ... tailing incrementally`, because a fix that merely refused
+everything would pass every other check here:
+
+```
+ARM 2, snapshot late   262 > 202  -> full re-seed                     (unchanged)
+ARM 2, snapshot early  202 <= 202 -> rewound, tailing incrementally   (positive control)
+ARM 3                  cannot vouch for epoch (0,1) -> full re-seed   (was: DIVERGED)
+```
+
+Rows written by earlier binaries name no lineage and are skipped: a promotion
+that straddles the upgrade costs one re-seed, once. Held by
+`bug_0075_a_row_that_skipped_a_promotion_vouches_for_nobody` and
+`bug_0075_a_pre_upgrade_row_cannot_be_checked_so_it_does_not_vouch`, plus the
+rewritten `promo_fence_bound_answers_only_the_lineage_the_row_names`, whose
+`(0,3)` case is the unit-level shape of the same gap.
+
 ## Not covered
 
 - Whether an epoch gap can also be produced on a **two**-member pair by a
@@ -124,8 +164,11 @@ re-seeds rather than a prerequisite.
 - The controller's role. This repro promotes by hand; whether the controller's
   ordering makes the gap more or less likely on a real fleet is unmeasured.
 - Three-member behaviour under `min-replicas-to-write=1`, which is the
-  configuration that motivated the question. Until this is fixed, three
-  members should not be recommended for it.
+  configuration that motivated the question. This removes the fence
+  objection to it; it does not survey what else assumes two members. The
+  controller's choice among two eligible replicas and the `members - 2`
+  arithmetic of BUG-0074 are both untested at three, so the recommendation
+  needs its own verification before it ships.
 
 ## Repro
 
