@@ -220,11 +220,21 @@ impl Attached {
     }
 
     fn wait_replica(&self, budget: Duration, need_converged: bool) -> bool {
+        // EVERY replica, not "a replica". On a three-member pair
+        // `live_replicas != 0` is satisfied while the second member is dead,
+        // lagging or re-seeding -- so the precondition would silently weaken
+        // exactly where the extra member is supposed to be buying something,
+        // and a kill taken on it would test a two-member pair wearing a
+        // third member's name.
+        let want = self.members.len().saturating_sub(1) as u64;
         let start = Instant::now();
         while start.elapsed() < budget {
             let m = self.master();
             let info = self.info(&m);
-            let live = info.get("live_replicas").is_some_and(|v| v.trim() != "0");
+            let live = info
+                .get("live_replicas")
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .is_some_and(|n| n >= want);
             let converged = !need_converged || self.replica_holds_the_lineage(&m, &info);
             if live && converged {
                 return true;
@@ -273,9 +283,14 @@ impl Attached {
         if !lag_zero || !no_reseed {
             return false;
         }
-        let Some(replica) = self.members.iter().find(|m| m.as_str() != master) else {
+        let replicas: Vec<&String> = self
+            .members
+            .iter()
+            .filter(|m| m.as_str() != master)
+            .collect();
+        if replicas.is_empty() {
             return false;
-        };
+        }
         // Asked of the replica itself, and it must be `last_applied`.
         //
         // The first cut of this asked the replica for `acked_seq` and never
@@ -292,10 +307,12 @@ impl Attached {
         // across nodes either. `last_applied` is the one field that means
         // "how far into the MASTER's stream this member has got", which is
         // the lineage question.
-        self.info(replica)
-            .get("last_applied")
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .is_some_and(|applied| applied > 0)
+        replicas.into_iter().all(|replica| {
+            self.info(replica)
+                .get("last_applied")
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .is_some_and(|applied| applied > 0)
+        })
     }
 
     fn info(&self, addr: &str) -> std::collections::HashMap<String, String> {
@@ -323,26 +340,48 @@ impl Attached {
         } else {
             self.replica_kills.set(self.replica_kills.get() + 1);
         }
-        let survivor = self.members.iter().find(|m| *m != addr).cloned();
+        // WHICHEVER survivor the controller picks, not a pre-chosen one.
+        // With two members those are the same node; with three they are a
+        // coin flip -- the controller promotes the highest epoch, ties by
+        // lowest address -- and waiting on the loser turns a correct
+        // failover into a 30s harness timeout on roughly half of all master
+        // kills. That red would read as a product failure.
+        let survivors: Vec<String> = self
+            .members
+            .iter()
+            .filter(|m| *m != addr)
+            .cloned()
+            .collect();
         self.ctl(&["kill-node", addr])?;
-        if was_master && let Some(s) = survivor {
+        if was_master && !survivors.is_empty() {
             let deadline = Instant::now() + Duration::from_secs(30);
             while Instant::now() < deadline {
-                if self.role_of(&s).as_deref() == Some("master") {
+                if survivors
+                    .iter()
+                    .any(|s| self.role_of(s).as_deref() == Some("master"))
+                {
                     return Ok(());
                 }
                 std::thread::sleep(Duration::from_millis(200));
             }
             return Err(format!(
-                "controller did not promote {s} within 30s (#171){}",
-                self.failure_context(addr, &s)
+                "controller promoted none of {survivors:?} within 30s (#171){}",
+                self.failure_context(addr, &survivors.join(", "))
             ));
         }
         Ok(())
     }
 
-    /// Bring a killed seat back. Always wiped and re-seeded from the CURRENT
-    /// master, which after a failover is its old peer.
+    /// Bring a killed seat back, as a replica of the CURRENT master — which
+    /// after a failover is one of its old peers.
+    ///
+    /// NOT a wipe, though it was one when this comment was first written.
+    /// `restart-node` now writes the NEEDS_RESEED marker instead (#187/#190),
+    /// so the seat rewinds to a local snapshot the master vouches for and
+    /// tails incrementally, and only full-syncs when no candidate clears the
+    /// fence. That matters to what chaos can find: the wipe took the same
+    /// path every time, while the marker exercises the FLINTFENCE exchange —
+    /// which is where BUG-0075 lived.
     pub fn restart(&self, addr: &str) -> Result<(), String> {
         self.ctl(&["restart-node", addr]).map(|_| ())
     }
