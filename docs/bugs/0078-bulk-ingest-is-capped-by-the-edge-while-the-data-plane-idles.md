@@ -61,12 +61,61 @@ throughput through it depends on the client never waiting.
   no lag, no stalls, no errors. Only a comparison against the direct path
   shows it.
 
+## Measured further, 2026-08-30: two candidate causes DISPROVEN
+
+An A/B on a dedicated 5-host fleet, same client, same fleet, swapping only
+the proxy binary. Control first, which the earlier session skipped: direct to
+the master on THIS fleet is **5,020 writes/s per connection**, against ~1,120
+through the edge — a 4.5x gap, reproducible to three significant figures.
+
+**Not the `MAX_PREFETCH = 64` cliff.** The hypothesis was that a client
+pipelining 256 got 64 staged and 192 serial round trips. A build that
+restages the next window instead measured 1,050-1,094 writes/s against
+1,097-1,140 for the unmodified proxy: identical within noise, and the
+modified one marginally *slower*. The change was reverted rather than shipped:
+it adds a branch to the hot path for no measured benefit.
+
+**Not the client read buffer.** `serve_client` reads 16 KB where every other
+read path in the proxy uses 64 KB, which with 1 KB values is ~15 commands.
+Raising it to 256 KB measured 1,113-1,121 writes/s. Also identical.
+
+**What instrumentation actually showed.** Counting commands per pass inside
+`prefetch_run`:
+
+```
+PREFETCH-DIAG pass=0    cmds=8  staged=8
+PREFETCH-DIAG pass=200  cmds=3  staged=3
+```
+
+**Three to eight commands per pass**, with `staged == cmds` every time. The
+staging works perfectly; there is nothing to stage. A 256 KB read buffer
+changes nothing because the socket never yields 256 KB — client and proxy
+fall into lock-step, and each pass pays a backend round trip amortised over
+about five commands. Neither cap was ever reached, which is why neither
+mattered.
+
+**It is per-connection latency, not a capacity ceiling.** Throughput scales
+linearly with connections:
+
+| connections | aggregate | per connection |
+|---|---|---|
+| 1 | 1,114 writes/s | 1,114 |
+| 4 | 4,515 writes/s | 1,129 |
+| 8 | 9,239 writes/s | 1,155 |
+
+Per-connection throughput is a constant; the proxy (at 0.08 cores) is nowhere
+near a global limit. So the workaround is concurrency, and the fix — whenever
+it is written — is about how a pass ends up holding five commands, not about
+how many it is allowed to hold.
+
 ## Not covered
 
-- **Where the latency actually goes inside the proxy.** Candidates: a
-  per-connection request/response loop that does not pipeline to the backend,
-  a flush per command, or Nagle interacting with small replies. Not yet
-  measured, and the fix depends entirely on which.
+- **Why a pass holds only 3-8 commands.** Two candidates remain: the proxy
+  replies and immediately re-reads, so a client that waits for its batch
+  cannot get ahead of it; or the socket is drained faster than the sender
+  refills it, making read sizes track the lock-step rather than the client's
+  pipeline depth. Distinguishing them needs a client that never waits
+  (`valkey-cli --pipe` is one) measured against one that does, per pass.
 - **Whether reads share it.** Everything here is writes.
 - **The right remedy.** Options range from pipelining backend-side, to
   documenting direct-to-master bulk load, to a dedicated import path. Picking
