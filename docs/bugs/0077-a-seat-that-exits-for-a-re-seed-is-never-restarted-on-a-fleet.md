@@ -110,13 +110,31 @@ unit, the timer, the `KillMode=process` trap that cost a day on the
 playground, and the advice to alert on `verify`'s SINGLE-COPY rather than
 trust a restarter nothing watches.
 
-## What is deliberately NOT changed
+## Then the root cause was fixed too (2026-08-30, same day)
 
-Enabling `flint-supervise.timer` on every AMI host. On a multi-host fleet each
-seat host has no inventory — it lives on the orchestrator — so a per-host
-timer would log "no inventory" every minute and supervise nothing. The unit is
-right; where it runs is the part that does not generalise from one box to a
-fleet.
+This write-up first said enabling `flint-supervise.timer` on every AMI host
+was deliberately NOT done, because a seat host of a multi-host fleet has no
+inventory — it lives on the orchestrator — so the timer would log "no
+inventory" every minute and supervise nothing.
+
+That objection was real and it was cheap to remove, so it was: a missing
+inventory is now a clean exit rather than a failure, on the grounds that a
+unit which marks itself failed once a minute forever trains everyone to
+ignore it, which is how a REAL supervise failure would then be missed. With
+that, the timer can be armed everywhere and simply act where there is
+something to act on.
+
+So the image now installs and enables it, instead of `first-boot.sh` being
+the only thing that does. The two are no longer coupled, which was the actual
+defect: avoiding the six-single-host-clusters trap should never have been the
+same act as removing the supervisor.
+
+`chaos-cluster/up.sh` asserts it per host, in the one topology where the
+property is observable. It warns rather than fails until the pinned AMI
+carries the change — and it earned its place within minutes of being written,
+reporting `flint-supervise.timer is 'missing'` on all five hosts of the next
+fleet. Not disabled: **missing**, because `first-boot.sh` is also what
+installs the unit files, so a fleet that never runs it never had them.
 
 ## Fix options considered
 
