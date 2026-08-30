@@ -47,11 +47,22 @@ zero time-travel, zero cross-key). This is availability, not durability.
 
 ## Evidence the fix underneath it works
 
-The same run took **5 master kills, against 1 before the fix**. That is not a
-sampling difference: the harness declines a master kill unless every replica
-is live and converged, and a permanently stranded member can never satisfy it.
-Five accepted master kills means survivors were re-attaching and the pair was
-returning to full strength between kills.
+The same run took **5 master kills, against 1 before the fix** — and that
+comparison is weaker than it first looked, so it is recorded here with its
+caveat rather than as a headline.
+
+A later run WITH the fix also produced only 1 master kill. The count is not a
+clean signal, because the harness's master-kill precondition wanted every
+replica live at that instant and short-circuited WITHOUT printing when it did
+not get them; both replicas are rarely up together right after a
+kill-and-restart cycle. So a low count could mean a stranded member, or
+nothing but timing. That precondition is now back to its documented contract
+(one live replica) and a downgrade prints.
+
+The decisive evidence for the re-point is not the count. It is
+`three_member_repoint_drill.sh`, which asserts `live_replicas 1` before the
+dead seat is restarted, and the controller's own line in this run's log:
+`[ctl][g0] re-pointed 172.31.76.13:7002 at 172.31.71.103:7001`.
 
 ## The supervisor already exists, and this is the second time it was needed
 

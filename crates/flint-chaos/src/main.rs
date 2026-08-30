@@ -439,7 +439,19 @@ fn main() {
         //
         // Not silent: the skip prints, and run.sh separately asserts at least
         // one master was killed, so a run that skipped every one cannot pass.
-        let kill_master = want_master && cluster.wait_replica_live(Duration::from_secs(8)) && {
+        // NO SILENT DOWNGRADE. A master kill that becomes a replica kill
+        // because no live replica appeared used to leave no trace at all --
+        // the SKIPPED line below covers only the CONVERGED check, and this
+        // one short-circuits before it. A run that reports "1 master kill"
+        // out of 16 should say what happened to the other 15.
+        let have_live = cluster.wait_replica_live(Duration::from_secs(8));
+        if want_master && !have_live {
+            println!(
+                "iter {iteration}: pair {pair_idx}: master kill DOWNGRADED — no live replica \
+                 within 8s, so there is nothing to fail over to; killing a replica instead"
+            );
+        }
+        let kill_master = want_master && have_live && {
             // Quiesce EVERYONE, not just ourselves — see Quiesce. Resumed
             // together with our own writer, so the kill still lands with
             // writes in flight from every source.

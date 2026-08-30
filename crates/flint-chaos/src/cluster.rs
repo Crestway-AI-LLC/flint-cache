@@ -220,13 +220,27 @@ impl Attached {
     }
 
     fn wait_replica(&self, budget: Duration, need_converged: bool) -> bool {
-        // EVERY replica, not "a replica". On a three-member pair
-        // `live_replicas != 0` is satisfied while the second member is dead,
-        // lagging or re-seeding -- so the precondition would silently weaken
-        // exactly where the extra member is supposed to be buying something,
-        // and a kill taken on it would test a two-member pair wearing a
-        // third member's name.
-        let want = self.members.len().saturating_sub(1) as u64;
+        // How many live replicas this gate wants, and the two gates want
+        // different numbers.
+        //
+        // CONVERGED (wait_healthy) means every replica: on a three-member
+        // pair `live_replicas != 0` holds while the second member is dead,
+        // lagging or re-seeding, so a "healthy" claim built on it would
+        // describe a two-member pair wearing a third member's name.
+        //
+        // LIVE (wait_replica_live) means one, which is its whole contract --
+        // the master kill it guards needs SOMETHING to fail over to, and
+        // deliberately says nothing about lag. Demanding every replica here
+        // instead cost most of a run's master kills: both replicas are
+        // rarely up at the same instant just after a kill-and-restart cycle,
+        // and the caller short-circuits without printing, so the run reported
+        // "1 master kill" out of 16 with no line saying why the other 15
+        // turned into replica kills.
+        let want = if need_converged {
+            self.members.len().saturating_sub(1) as u64
+        } else {
+            1
+        };
         let start = Instant::now();
         while start.elapsed() < budget {
             let m = self.master();
