@@ -34,6 +34,36 @@ pub const DEFAULT_LAG_SOFT_MS: u64 = 500;
 /// disables the gate entirely.
 pub const DEFAULT_WAL_HEADROOM_SHED_SEQ: u64 = 4_000_000;
 
+/// Bytes per sequence to assume when converting the archive's BYTE budget
+/// into this gate's SEQUENCE threshold.
+///
+/// The old default assumed ~1 KB, reasoning that one sequence carries one
+/// value. It does not: a sequence is a WAL BATCH, and a pipelining client
+/// puts several writes in each. Measured under a bulk load of 1 KB values at
+/// pipeline depth 256: **4,327 bytes per sequence**. The assumption was off
+/// by a factor of four, which put the gate at 4,000,000 sequences (~17 GB)
+/// against an 8 GiB archive — so deletion happened at HALF the distance
+/// where shedding began, and the gate reported full headroom
+/// (`writes_shed_headroom: 0`) while the replica was cut off (BUG-0079).
+///
+/// 16 KiB is deliberately pessimistic — four times what was measured. Being
+/// wrong high costs early backpressure, which is a degradation an operator
+/// sees; being wrong low costs a dead replica, a widowed master, and a write
+/// path that shuts. Those are not symmetric, and the constant should not
+/// pretend they are.
+const ASSUMED_BYTES_PER_SEQ: u64 = 16 * 1024;
+
+/// Shed threshold for an archive of `wal_size_limit_mb`.
+///
+/// Half the budget, so a replica meets backpressure well before it meets a
+/// deleted segment — the intent the old constant described and, at the value
+/// size it assumed, achieved. Derived rather than fixed so the relationship
+/// survives a change to either term.
+pub fn headroom_shed_seq_for_budget(wal_size_limit_mb: u64) -> u64 {
+    let budget_bytes = wal_size_limit_mb.saturating_mul(1024 * 1024);
+    (budget_bytes / 2) / ASSUMED_BYTES_PER_SEQ
+}
+
 pub const DEFAULT_LAG_HARD_MS: u64 = 1_000;
 /// Default widowed grace: 0 = disabled, so a standalone node and every
 /// existing deployment keep their current behaviour. flintctl turns it on

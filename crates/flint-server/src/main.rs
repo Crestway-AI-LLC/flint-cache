@@ -801,6 +801,20 @@ struct ReplicaLink {
 #[cfg_attr(not(feature = "rocks"), allow(dead_code))]
 static REPLICA_LINK: std::sync::OnceLock<Arc<ReplicaLink>> = std::sync::OnceLock::new();
 
+/// The WAL archive budget this node opened with, in MB.
+///
+/// Written where the engine is opened and read where the shed gate is
+/// configured, because the two are hundreds of lines apart and MUST agree:
+/// the gate exists to stop a replica reaching a segment this budget has
+/// already deleted, and a gate calibrated against a different number than
+/// the one RocksDB prunes on is the whole of BUG-0079.
+/// The literal mirrors `flint_storage::rocks::DEFAULT_WAL_SIZE_LIMIT_MB`
+/// rather than naming it: that module only exists under the `rocks` feature,
+/// and a static initialiser cannot be feature-gated where this one is read.
+/// It is only ever a placeholder — the value is overwritten where the engine
+/// opens, which is the only build that has an archive at all.
+static WAL_BUDGET_MB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(8_192);
+
 /// Decrements the live-connection counter on any exit (incl. panic).
 struct ConnGuard;
 impl Drop for ConnGuard {
@@ -1729,12 +1743,29 @@ fn main() -> std::io::Result<()> {
             let wal_ttl = arg("--wal-ttl-seconds")
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(flint_storage::rocks::DEFAULT_WAL_TTL_SECONDS);
+            // DERIVED FROM THE VOLUME, not a constant (BUG-0079). 8 GiB is
+            // forty-one seconds of WAL at 200 MB/s, so the byte term pruned
+            // the archive out from under a live replica long before the TTL
+            // was relevant, and the shed gate — calibrated in sequences —
+            // never fired. min(256 GiB, a quarter of the volume).
             let wal_mb = arg("--wal-size-limit-mb")
                 .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(flint_storage::rocks::DEFAULT_WAL_SIZE_LIMIT_MB);
-            if wal_ttl != flint_storage::rocks::DEFAULT_WAL_TTL_SECONDS
-                || wal_mb != flint_storage::rocks::DEFAULT_WAL_SIZE_LIMIT_MB
-            {
+                .unwrap_or_else(|| {
+                    let total = flint_storage::disk::sample(std::path::Path::new(&dir))
+                        .map(|u| u.total_bytes)
+                        .unwrap_or(0);
+                    let mb = flint_storage::rocks::wal_size_limit_mb_for_volume(total);
+                    WAL_BUDGET_MB.store(mb, Ordering::Relaxed);
+                    mb
+                });
+            WAL_BUDGET_MB.store(wal_mb, Ordering::Relaxed);
+            // Compare against what this node WOULD have chosen, not against
+            // the bare constant: the size budget is derived from the volume
+            // now, so a stock node differs from DEFAULT_WAL_SIZE_LIMIT_MB and
+            // would report itself overridden on every boot. A warning that
+            // fires when nothing is wrong is a warning nobody reads.
+            let derived_mb = WAL_BUDGET_MB.load(Ordering::Relaxed);
+            if wal_ttl != flint_storage::rocks::DEFAULT_WAL_TTL_SECONDS || wal_mb != derived_mb {
                 eprintln!(
                     "WAL retention OVERRIDDEN: ttl={wal_ttl}s size={wal_mb}MB \
                      (defaults {}s / {}MB) — a replica that falls outside this \
@@ -2077,9 +2108,22 @@ fn main() -> std::io::Result<()> {
     // it meets a WAL segment that has already been recycled. 0 disables.
     // Sequences are a proxy for retained bytes; retune from `wal_headroom_seq`
     // in INFO if values are much bigger or smaller than ~1 KB.
-    if let Some(v) = arg("--wal-headroom-seq").and_then(|v| v.parse::<u64>().ok()) {
-        hub.set_wal_headroom_shed_seq(v);
-        eprintln!("wal headroom shed threshold: {v} sequences");
+    // Default DERIVED from the archive budget rather than fixed, so the gate
+    // and the thing it guards cannot drift apart again (BUG-0079).
+    match arg("--wal-headroom-seq").and_then(|v| v.parse::<u64>().ok()) {
+        Some(v) => {
+            hub.set_wal_headroom_shed_seq(v);
+            eprintln!("wal headroom shed threshold: {v} sequences (operator override)");
+        }
+        None => {
+            let budget_mb = WAL_BUDGET_MB.load(Ordering::Relaxed);
+            let v = repl_hub::headroom_shed_seq_for_budget(budget_mb);
+            hub.set_wal_headroom_shed_seq(v);
+            eprintln!(
+                "wal headroom shed threshold: {v} sequences (half of a {budget_mb} MB \
+                 archive at an assumed 16 KiB/sequence)"
+            );
+        }
     }
     // --lease-ttl-ms (ADR-0018): how long this node may serve as master
     // without a successful CPLEASE renewal before self-fencing. 0 = lease

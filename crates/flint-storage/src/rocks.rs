@@ -290,11 +290,49 @@ fn table_options() -> BlockBasedOptions {
 /// replica to tail. Generous on purpose — the point is that ADR-0022's shed
 /// gate, not this window, is what a lagging replica hits first. A window
 /// this size makes shedding rare; the shedding is what makes the window safe.
-pub const DEFAULT_WAL_TTL_SECONDS: u64 = 21_600; // 6 h, was 1 h
+/// 12 h, was 6 h. A segment should survive an overnight incident: the point
+/// of the window is that a replica which fell out of it needs a full re-seed,
+/// and at 163 GB that is minutes of single-copy exposure.
+///
+/// This is a CEILING, not a promise. At 200 MB/s twelve hours of WAL is
+/// 8.6 TB, which is larger than the volume it would live on, so the size
+/// budget below binds first at any real ingest rate. What matters is which
+/// term gives way: the size budget is now derived from the volume and the
+/// shed gate from the size budget, so a master that outruns its replica
+/// meets backpressure rather than deleting the segment out from under it
+/// (BUG-0079).
+pub const DEFAULT_WAL_TTL_SECONDS: u64 = 43_200; // 12 h, was 6 h, was 1 h
 /// Companion byte budget. RocksDB applies whichever bound trips first, so
 /// raising only the TTL would have left the 1 GiB limit doing the pruning —
 /// which is the term that actually fired in the incident.
 pub const DEFAULT_WAL_SIZE_LIMIT_MB: u64 = 8_192; // 8 GiB, was 1 GiB
+
+/// The archive budget for a volume of `total_bytes`, in MB.
+///
+/// A CONSTANT CANNOT BE RIGHT HERE, which is what BUG-0079 cost. 8 GiB is
+/// forty-one seconds of WAL at 200 MB/s, so on any ingest-heavy fleet the
+/// byte term prunes long before the 12 h TTL and does it without consulting
+/// a replica. The same constant is also absurdly large on a 20 GB dev box.
+///
+/// Two bounds, and the smaller wins.
+///
+/// **256 GiB** is the budget: large enough that a replica has hours rather
+/// than seconds to be interrupted and come back (at 200 MB/s it is ~22
+/// minutes; at a more typical 20 MB/s, ~3.6 hours), and small enough to name
+/// in a sizing conversation. A flat number is deliberate — it is predictable
+/// across hardware, which a percentage is not.
+///
+/// **A quarter of the volume** caps it on anything small. 256 GiB on a 20 GB
+/// dev box would mean the archive never prunes and the disk guard starts
+/// rejecting writes instead, which trades a survivable re-seed for an
+/// unsurvivable full disk. A quarter leaves three quarters for data, which is
+/// the right side to err on.
+pub fn wal_size_limit_mb_for_volume(total_bytes: u64) -> u64 {
+    const BUDGET_MB: u64 = 256 * 1024; // 256 GiB
+    const FLOOR_MB: u64 = 1024; //   1 GiB
+    let quarter_mb = (total_bytes / 4) / (1024 * 1024);
+    quarter_mb.clamp(FLOOR_MB, BUDGET_MB)
+}
 
 /// Cap the RocksDB info LOG.
 ///
