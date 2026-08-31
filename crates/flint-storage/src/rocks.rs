@@ -475,10 +475,34 @@ impl RocksKv {
         // `rocksdb:high`, l0_files pinned at its slowdown trigger of 20, and
         // 15 of 16 cores idle. Raising jobs alone does not split that job.
         //
-        // NOT a default here. The measurement that justifies a value has to
-        // come from a CPU-CONSTRAINED host: on a box with idle cores this
-        // knob only ever looks free, and a 2-vCPU seat is where compaction
-        // threads start contending with the serve path.
+        // NOT a default, and now that is MEASURED rather than deferred.
+        //
+        // A derivation `(vcpus / 4).clamp(1, 4)` was proposed and tested on
+        // 2026-08-30: 16 vCPU, one pair, 24 write + 24 read connections,
+        // 1 KB values, six A/B pairs with the ORDER BALANCED (three runs
+        // with the default first, three with subcompactions first) because
+        // an append-only workload deepens the LSM under the measurement and
+        // whichever arm runs last is penalised.
+        //
+        //   write throughput   60,630 -> 66,543 seq/s   +9.8%   better 6/6
+        //   read p99              349 ->    370 us      +6.1%   better 1/6
+        //   read p99.9            580 ->    720 us     +24.1%   better 1/6
+        //
+        // So it is a TRADE, not a win: ~10% more write throughput for ~24%
+        // worse read tail. The penalty was LARGER (+27.8% p99.9) in the half
+        // of the runs whose ordering favoured subcompactions, so it is not an
+        // artefact of the drift. A read-serving seat should not pay it, which
+        // is why the default stays at RocksDB's 1.
+        //
+        // Worth setting for a DEPLOYMENT SHAPE, not a core count: a pair
+        // whose master takes a bulk fill and serves no reads. That is a
+        // property no `available_parallelism()` derivation can observe, which
+        // is the real reason this is an env knob and not a default.
+        //
+        // Unlike max_background_jobs, this adds NO pool threads -- verified
+        // by counting `rocksdb:low` in /proc/<pid>/task/*/comm, which stayed
+        // at 1 across all twelve runs. The subcompaction threads are spawned
+        // by the compaction job and live only for its duration.
         if let Some(n) = env_u64("FLINT_SUBCOMPACTIONS") {
             opts.set_max_subcompactions(n as u32);
         }
