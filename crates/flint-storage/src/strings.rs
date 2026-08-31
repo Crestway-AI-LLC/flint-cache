@@ -171,7 +171,25 @@ impl<'a> StringStore<'a> {
         if value.len() as u64 > self.max_value_bytes {
             return Err(StoreError::ValueTooLarge);
         }
-        let existing = self.read_live_header(slot, key);
+        // Read the old header ONLY when something actually consumes it: NX/XX
+        // need to know whether the key exists, KEEPTTL needs its expiry.
+        // A plain `SET k v` consumed neither, so every unconditional SET paid
+        // a point lookup — bloom probe, index block, data block — and then
+        // dropped the answer. It showed up as ~3.7% of samples in a
+        // WRITE-ONLY profile (2026-08-30), which is also why the write path
+        // looked like it was doing reads.
+        //
+        // The skipped call also lazily deletes an EXPIRED row, and dropping
+        // that is safe here and only here: it deletes meta_key(slot, key) and
+        // the put below writes that same key, so the overwrite subsumes the
+        // delete. Orphaned subkeys of a displaced complex type are the GC
+        // sweeper's job either way — SET never cleaned those up.
+        let needs_existing = opts.nx || opts.xx || matches!(opts.expiry, SetExpiry::Keep);
+        let existing = if needs_existing {
+            self.read_live_header(slot, key)
+        } else {
+            None
+        };
         if (opts.nx && existing.is_some()) || (opts.xx && existing.is_none()) {
             return Ok(SetOutcome::Unchanged);
         }
@@ -383,6 +401,76 @@ mod tests {
                 $static_name.load(Ordering::Relaxed)
             }
         };
+    }
+
+    /// A plain SET no longer reads the old header (it consumed nothing), so
+    /// the two behaviours that read WAS incidentally providing are pinned
+    /// here: an unconditional overwrite of an EXPIRED row must still land,
+    /// and it must not inherit the dead row's expiry.
+    #[test]
+    fn plain_set_over_an_expired_row_lands_and_does_not_inherit_its_expiry() {
+        test_clock!(NOW, now, 1_000_000);
+        let kv = MemKv::new();
+        let s = StringStore::new(&kv, b"t", now);
+        s.set(
+            1,
+            b"k",
+            b"old",
+            SetOptions {
+                expiry: SetExpiry::AtMs(1_000_500),
+                ..Default::default()
+            },
+        )
+        .expect("seed");
+        NOW.store(1_001_000, Ordering::Relaxed); // the row is now expired
+        assert_eq!(s.get(1, b"k"), Ok(None), "expired row must read as absent");
+        // The overwrite subsumes the lazy delete the old read used to do.
+        assert_eq!(
+            s.set(1, b"k", b"new", SetOptions::default()),
+            Ok(SetOutcome::Done)
+        );
+        assert_eq!(s.get(1, b"k"), Ok(Some(b"new".to_vec())));
+        NOW.store(9_999_999, Ordering::Relaxed);
+        assert_eq!(
+            s.get(1, b"k"),
+            Ok(Some(b"new".to_vec())),
+            "a plain SET clears expiry; it must not inherit the dead row's"
+        );
+    }
+
+    /// KEEPTTL still reads, because it is one of the two callers that needs to.
+    #[test]
+    fn keepttl_still_preserves_expiry_after_the_read_was_made_conditional() {
+        test_clock!(NOW, now, 1_000_000);
+        let kv = MemKv::new();
+        let s = StringStore::new(&kv, b"t", now);
+        s.set(
+            1,
+            b"k",
+            b"a",
+            SetOptions {
+                expiry: SetExpiry::AtMs(1_005_000),
+                ..Default::default()
+            },
+        )
+        .expect("seed");
+        s.set(
+            1,
+            b"k",
+            b"b",
+            SetOptions {
+                expiry: SetExpiry::Keep,
+                ..Default::default()
+            },
+        )
+        .expect("keepttl");
+        assert_eq!(s.get(1, b"k"), Ok(Some(b"b".to_vec())));
+        NOW.store(1_006_000, Ordering::Relaxed);
+        assert_eq!(
+            s.get(1, b"k"),
+            Ok(None),
+            "KEEPTTL must have kept the expiry"
+        );
     }
 
     #[test]
