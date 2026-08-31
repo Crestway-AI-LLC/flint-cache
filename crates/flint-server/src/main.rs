@@ -6405,6 +6405,9 @@ mod serve_tests {
     #[cfg(feature = "rocks")]
     #[test]
     fn a_pipeline_of_only_pure_sets_is_committed_on_drain() {
+        // Serialised against write_lock's tests: these run real servers over
+        // the same process-global locks (see write_lock::test_serial).
+        let _serial = crate::write_lock::test_serial();
         let (addr, _dir) = spawn_rocks_server();
         let mut s = connect(addr);
         let n = 50;
@@ -6447,6 +6450,9 @@ mod serve_tests {
     #[test]
     #[ignore]
     fn bench_pipelined_pure_writes() {
+        // Serialised against write_lock's tests: these run real servers over
+        // the same process-global locks (see write_lock::test_serial).
+        let _serial = crate::write_lock::test_serial();
         let conns: usize = std::env::var("BENCH_CONNS")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -6504,6 +6510,9 @@ mod serve_tests {
     #[cfg(feature = "rocks")]
     #[test]
     fn a_transaction_is_not_batched_and_still_reads_its_own_writes() {
+        // Serialised against write_lock's tests: these run real servers over
+        // the same process-global locks (see write_lock::test_serial).
+        let _serial = crate::write_lock::test_serial();
         let (addr, _dir) = spawn_rocks_server();
         let mut s = connect(addr);
         let mut p = Vec::new();
@@ -6561,6 +6570,9 @@ mod serve_tests {
     #[cfg(feature = "rocks")]
     #[test]
     fn a_batch_does_not_deadlock_against_a_pending_lock_all() {
+        // Serialised against write_lock's tests: these run real servers over
+        // the same process-global locks (see write_lock::test_serial).
+        let _serial = crate::write_lock::test_serial();
         let (addr, _dir) = spawn_rocks_server();
         let mut s = connect(addr);
         let n = 120;
@@ -6616,6 +6628,9 @@ mod serve_tests {
     #[cfg(feature = "rocks")]
     #[test]
     fn a_read_in_the_same_pipeline_sees_the_writes_before_it() {
+        // Serialised against write_lock's tests: these run real servers over
+        // the same process-global locks (see write_lock::test_serial).
+        let _serial = crate::write_lock::test_serial();
         let (addr, _dir) = spawn_rocks_server();
         let mut s = connect(addr);
         let mut pipeline = Vec::new();

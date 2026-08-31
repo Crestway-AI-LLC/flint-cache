@@ -31,6 +31,23 @@ use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 const STRIPES: usize = 128;
 
 static GLOBAL: RwLock<()> = RwLock::new(());
+/// Serialises every TEST that drives the locks above -- not just this
+/// module's. `serve`'s rocks-backed tests run real servers that take these
+/// same statics, and a `TEST_LOCK` covering only this module let them
+/// interleave: green on a laptop, wedged on the 16-vCPU gate box, which is
+/// the "passes locally, hangs where it matters" shape this repo keeps
+/// meeting. Anything that asserts on lock behaviour, or that serves traffic
+/// while another test does, takes `write_lock::tests::serial()` first.
+#[cfg(test)]
+static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Take this before touching the locks above, from ANY test module.
+/// Poisoning is absorbed: a panicking test fails on its own assert rather
+/// than cascading into every later test failing to acquire this.
+#[cfg(test)]
+pub(crate) fn test_serial() -> std::sync::MutexGuard<'static, ()> {
+    TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
 // RwLock, not Mutex (ADR-0027). A read-modify-write needs to exclude every
 // other writer of its key, but a PURE write -- one that reads nothing -- has
 // no stale read for a concurrent writer to invalidate, so pure writes only
@@ -175,9 +192,8 @@ mod tests {
     ///
     /// Poisoning is absorbed: a panicking test must fail on its own assert,
     /// not cascade into every later test failing to acquire this.
-    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     fn serial() -> std::sync::MutexGuard<'static, ()> {
-        TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+        super::test_serial()
     }
 
     /// The exact shape of the bug: concurrent read-modify-write on one
