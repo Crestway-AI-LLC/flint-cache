@@ -21,6 +21,8 @@ lost. Format and rationale: [0001](0001-record-architecture-decisions.md).
 | [0022](0022-wal-retention-bounded-by-replica-progress.md) | WAL retention bounded by replica progress: back-pressure before a replica meets a deleted segment |
 | [0023](0023-slot-aligned-bulk-eviction.md) | Slot-aligned bulk eviction: drop whole SSTs by slot range, when rewriting the namespace is the wrong price (proposed) |
 | [0024](0024-boot-decision-counters-that-outlive-the-process.md) | Boot-decision counters that outlive the process: make a rejoin LOOP visible without an evidence bundle (proposed) |
+| [0025](0025-stream-collection-reads-instead-of-materialising-them.md) | Stream collection reads instead of materialising them |
+| [0026](0026-admission-control-on-write-stall.md) | Admission control keyed on the master's own write stall, not on replica lag (proposed) |
 | [ADR-0022](0022-wal-retention-bounded-by-replica-progress.md) | WAL retention follows the slowest live replica; the master sheds instead of letting it die |
 
 ## Why the numbering has a gap
