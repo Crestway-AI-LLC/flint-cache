@@ -1,4 +1,4 @@
-# BUG-0078 — bulk ingest is capped by the edge while the data plane idles (OPEN)
+# BUG-0078 — bulk ingest is capped by the edge while the data plane idles (FIXED 2026-08-31)
 
 **Found** 2026-08-30, measured on a loaded 5-host fleet during a 2 TB ingest
 run (`i4i.4xlarge`, 1 pair, 1 KB values, load driven through the proxy edge).
@@ -120,3 +120,76 @@ how many it is allowed to hold.
 - **The right remedy.** Options range from pipelining backend-side, to
   documenting direct-to-master bulk load, to a dedicated import path. Picking
   one needs the paragraph above answered first.
+
+
+## Resolved 2026-08-31: it was never the edge
+
+**The node never set `TCP_NODELAY` on an accepted socket.** The node reads
+16 KiB at a time and answers each read, so a client whose pipeline is larger
+gets a small reply written while its own send is still in flight — the case
+Nagle holds — and the peer then waits out its delayed-ACK timer. Every round
+trip past the threshold costs ~50 ms.
+
+The proxy looked guilty because it issues ~16 KiB per backend hop, which put
+it exactly in the collapsed regime. **The `5,030 writes/s` direct baseline
+this bug was measured against was paying the same stall**, amortised over a
+256-command batch instead of a 16-command one, which is why the ratio looked
+like a proxy problem rather than a node one.
+
+### The measurement that found it
+
+Direct to the node, no proxy, waiting for replies, one connection:
+
+| depth | 1 KiB values | round trips/s | per round trip |
+|---|---|---|---|
+| 1 | 35,264/s | 35,264 | 28 us |
+| 4 | 91,267/s | 22,817 | 44 us |
+| 12 | 137,597/s | 11,466 | 87 us |
+| **16** | **323/s** | **20** | **50 ms** |
+| 64 | 1,289/s | 20 | 50 ms |
+| 512 | 10,231/s | 20 | 50 ms |
+
+A flat 50 ms at every depth from 16 to 512 — the rate is exactly linear in
+depth because each round trip costs the timer regardless of what it carries.
+
+**The cliff tracks BYTES, not commands.** At 32 B values it moves to depth
+256; both land at ~16 KiB, the node's read size. That is what ruled out every
+application-level explanation.
+
+### After `set_nodelay(true)`, same box
+
+| path | before | after |
+|---|---|---|
+| direct to node, depth 256 | 5,081/s | **472,978/s** |
+| through the proxy, waiting client | 1,266/s | **79,762/s** |
+| through the proxy, never-waiting | 1,038/s | **200,265/s** |
+| proxy backend time per pass | 11,805 us | **150 us** |
+
+### What this retires
+
+The two candidates this bug was left on are both **disproven**, and neither
+was close:
+
+- *"The client cannot get ahead."* A never-waiting client was **slower**
+  (1,038/s against 1,266/s) and dropped acks. The `valkey-cli --pipe` hint
+  that pointed here did not reproduce.
+- *"A pass holds only 3-8 commands."* It holds 15, capped at 16, in every
+  window of every arm — the 16 KiB read buffer at 1 KiB values. Pass SIZE was
+  never the variable. Instrumenting pass DURATION is what broke it open:
+  99.6% of a pass was the backend hop (11,805 us of 11,858 us), and the
+  client read was 42 us.
+
+ADR-0020 (multiplex the backend hop) and ADR-0021 remain proposed on their
+own merits, but neither is BUG-0078's fix and neither would have found it.
+
+### Numbers elsewhere that this invalidates
+
+Any throughput measured against a Flint node with a pipeline over ~16 KiB
+was bounded by this timer, not by Flint. **Re-measure before quoting**, in
+particular ADR-0027's fleet A/B (which read the ~80,000 seq/s ceiling as
+write-path bound) and the 2 TB ingest projection this bug opened with.
+
+Guarded by `tools/pipeline_nodelay_drill.sh`, two-armed: the shipped server
+must round-trip a 32x1 KiB pipeline inside 10 ms, and the same server with
+`FLINT_NAGLE_TEST=1` must take longer than 20 ms, so the check is known to be
+able to fail. Measured 0.3 ms against 50.4 ms.

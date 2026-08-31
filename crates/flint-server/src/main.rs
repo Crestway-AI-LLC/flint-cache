@@ -2605,6 +2605,32 @@ fn main() -> std::io::Result<()> {
     eprintln!("flint-server serving on {bind}:{port}");
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
+        // Nagle OFF, or a pipelining client pays a delayed ACK per round trip.
+        //
+        // The node reads 16 KiB at a time and answers each read, so a client
+        // whose pipeline is larger gets a small reply written while its own
+        // send is still in flight -- precisely the case Nagle holds, and the
+        // peer then waits out its delayed-ACK timer. Measured on loopback,
+        // direct to the node, waiting for replies, 1 KiB values:
+        //
+        //   depth 12 -> 137,597 writes/s        depth 16 ->    323 writes/s
+        //
+        // and past the cliff the rate is exactly LINEAR in depth -- 20 round
+        // trips a second at every depth from 16 to 512, a flat ~50ms each.
+        // The cliff tracks BYTES, not commands: at 32 B values it moves to
+        // depth 256, which is the same ~16 KiB. With this line, depth 256
+        // goes 5,106 -> 317,940 writes/s on one connection.
+        //
+        // This is what BUG-0078 was. The proxy looked like the culprit only
+        // because it issues ~16 KiB per backend hop, which put it exactly in
+        // the collapsed regime; the "direct" baseline it was measured against
+        // was paying the same stall, amortised over a larger batch.
+        //
+        // FLINT_NAGLE_TEST exists so the drill can ARM its positive control.
+        // Nothing else may set it: it re-creates a 60x throughput defect.
+        if std::env::var_os("FLINT_NAGLE_TEST").is_none() {
+            let _ = stream.set_nodelay(true);
+        }
         // B1: shed over the connection cap (drop = reset; the peer backs
         // off). Reserve the slot before spawning so the count is accurate.
         if ACTIVE_CONNS.fetch_add(1, Ordering::Relaxed) >= MAX_CONNS.load(Ordering::Relaxed) {
