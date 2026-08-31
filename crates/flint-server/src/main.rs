@@ -2892,6 +2892,19 @@ struct PendingBatch<'a> {
     /// level down.
     _stripes: Vec<std::sync::RwLockReadGuard<'static, ()>>,
     held: std::collections::HashSet<usize>,
+    /// One `WriteInFlight` per staged write, held until the batch COMMITS.
+    ///
+    /// `execute` only STAGES a batched write, so a guard scoped to that call
+    /// stops the clock before the commit it exists to measure -- and the
+    /// deadline gate is exactly `inflight x service`. Measured on a
+    /// c7i.4xlarge, same binary and same load: a plain (batched) SET reported
+    /// `write_service_us:7` against 11-15 for `SET .. EX`, which is not
+    /// batchable and so keeps its commit inside the window -- while wall
+    /// clock for both was 0.32s. Identical real cost, half the measured cost.
+    /// The missing half was the commit, and it made the gate under-read: on
+    /// this box the write_deadline drill could no longer arm its positive
+    /// control at any rung, having armed at 128 threads before ADR-0027.
+    _inflight: Vec<WriteInFlight>,
     replies: Vec<Value>,
 }
 
@@ -2911,6 +2924,7 @@ impl<'a> PendingBatch<'a> {
             _global: write_lock::lock_global_shared(),
             _stripes: Vec::new(),
             held: std::collections::HashSet::new(),
+            _inflight: Vec::new(),
             replies: Vec::new(),
         }
     }
@@ -2985,6 +2999,7 @@ fn commit_pending(
         _global,
         _stripes,
         held: _,
+        _inflight,
         replies,
     } = b;
     let ops = kv.into_ops();
@@ -3024,6 +3039,10 @@ fn commit_pending(
     // had not yet written.
     drop(_stripes);
     drop(_global);
+    // AFTER the commit, for the same reason: each staged write was in flight
+    // from its arrival to here, and its service time is what the next
+    // arrival is judged against.
+    drop(_inflight);
     out
 }
 
@@ -3226,6 +3245,10 @@ fn serve(
                         if let Some(k) = commands::command_key(&args) {
                             b.hold_stripe(&conn_ns, k);
                         }
+                        // Enter here, not in `execute`: the write is in
+                        // flight until the batch commits, not until it is
+                        // staged.
+                        b._inflight.push(WriteInFlight::enter());
                         let reply = execute(
                             store,
                             read_only,
@@ -4490,7 +4513,10 @@ fn execute(
     // Counted from here to the end of the call, so a write that blocks on the
     // async queue's consumer or on a contended stripe is measured as the slow
     // write it is — those waits are exactly what the deadline is about.
-    let _inflight = (is_write && !ro).then(WriteInFlight::enter);
+    // `batch_kv.is_some()` means this call only stages; the batch holds the
+    // guard across its commit instead, so entering here would double-count
+    // the write and still stop the clock too early.
+    let _inflight = (is_write && !ro && batch_kv.is_none()).then(WriteInFlight::enter);
     // ADR-0005 D4: for an opted-in namespace, route a batchable string/counter
     // write through the async queue — the connection blocks on the consumer's
     // ack-after-apply (one group-committed engine WriteBatch per drained
