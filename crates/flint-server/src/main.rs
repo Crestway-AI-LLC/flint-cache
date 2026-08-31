@@ -3683,6 +3683,23 @@ fn apply_inline(store: &dyn Kv, ops: &[(Vec<u8>, Option<Vec<u8>>)]) {
     }
 }
 
+/// A write that reads NOTHING, and may therefore take its stripe in shared
+/// mode (ADR-0027).
+///
+/// Deliberately the narrowest possible test: `SET key value`, exactly three
+/// tokens. Every option that would make SET read its old header -- NX, XX,
+/// KEEPTTL, GET, and the EX/PX/EXAT/PXAT family, which `SetExpiry::Keep`
+/// reaches -- adds at least one token, so a three-token SET cannot carry any
+/// of them. Widening this by NAME rather than by arity is how a lost update
+/// gets in: `write_queue::is_batchable` looks like the right predicate and is
+/// not, because it admits INCR, DECR, APPEND and SETNX.
+///
+/// SET's own read became conditional in d3ef6d7; this predicate must stay in
+/// step with the condition there (`opts.nx || opts.xx || expiry == Keep`).
+fn is_pure_write(upper_name: &[u8], args: &[Vec<u8>]) -> bool {
+    upper_name == b"SET" && args.len() == 3
+}
+
 #[allow(clippy::too_many_arguments)]
 fn execute(
     store: &dyn Kv,
@@ -4222,6 +4239,11 @@ fn execute(
         let multi = (name == b"MSET" && args.len() > 3)
             || ((name == b"DEL" || name == b"UNLINK") && args.len() > 2);
         match (multi, commands::command_key(args)) {
+            // ADR-0027: a PURE write reads nothing, so it excludes the
+            // read-modify-write writers of its key but not other pure writes.
+            (false, Some(k)) if is_pure_write(&name, args) => {
+                Some(write_lock::lock_key_pure(conn_ns, k))
+            }
             (false, Some(k)) => Some(write_lock::lock_key(conn_ns, k)),
             _ => Some(write_lock::lock_all()),
         }
@@ -6686,5 +6708,56 @@ mod probe_verdict_tests {
             classify_probe(Ok(Value::Integer(7))),
             ProbeVerdict::Refused(_)
         ));
+    }
+}
+
+#[cfg(test)]
+mod pure_write_predicate {
+    use super::is_pure_write;
+
+    fn args(parts: &[&str]) -> Vec<Vec<u8>> {
+        parts.iter().map(|p| p.as_bytes().to_vec()).collect()
+    }
+
+    /// The predicate decides whether a write may take its stripe SHARED, so
+    /// admitting anything that reads its old value is a lost update, not a
+    /// slow path (ADR-0027). Every option that makes SET read adds a token,
+    /// which is why the test is arity and not a name list.
+    #[test]
+    fn only_a_bare_three_token_set_is_pure() {
+        assert!(is_pure_write(b"SET", &args(&["SET", "k", "v"])));
+
+        for cmd in [
+            vec!["SET", "k", "v", "NX"],
+            vec!["SET", "k", "v", "XX"],
+            vec!["SET", "k", "v", "GET"],
+            vec!["SET", "k", "v", "KEEPTTL"],
+            vec!["SET", "k", "v", "EX", "10"],
+            vec!["SET", "k", "v", "PX", "10000"],
+            vec!["SET", "k", "v", "EXAT", "99999"],
+        ] {
+            assert!(
+                !is_pure_write(b"SET", &args(&cmd)),
+                "SET with options reads its old header: {cmd:?}"
+            );
+        }
+
+        // The read-modify-write commands, which is exactly the set
+        // `write_queue::is_batchable` would have let through.
+        for cmd in [
+            vec!["INCR", "k"],
+            vec!["DECR", "k"],
+            vec!["INCRBY", "k", "5"],
+            vec!["APPEND", "k", "v"],
+            vec!["SETNX", "k", "v"],
+            vec!["SETEX", "k", "10", "v"],
+            vec!["LPUSH", "k", "v"],
+        ] {
+            let name = cmd[0].as_bytes().to_ascii_uppercase();
+            assert!(
+                !is_pure_write(&name, &args(&cmd)),
+                "read-modify-write must take the stripe exclusively: {cmd:?}"
+            );
+        }
     }
 }
