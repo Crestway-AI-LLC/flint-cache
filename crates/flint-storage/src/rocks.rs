@@ -439,6 +439,27 @@ impl RocksKv {
         if let Some(secs) = env_u64("FLINT_STATS_DUMP_SEC") {
             opts.set_stats_dump_period_sec(secs as u32);
         }
+        // PROFILING ONLY, opt-in, and off by every default. RocksDB's ticker
+        // and histogram machinery answers "where does a write's time go" --
+        // db.write.micros against write.wal.time.micros,
+        // write.memtable.time.micros and db.mutex.wait.micros -- which is the
+        // one question a rate cannot answer and which no DB PROPERTY exposes.
+        //
+        // Deliberately NOT on in production. The tickers cost a measurable
+        // slice of the very path they measure, and the whole point of the
+        // stall pair above is that it reads live WITHOUT this. Turning it on
+        // to profile changes the thing being profiled, so read the shape
+        // (which stage dominates) rather than the absolute microseconds.
+        //
+        // Pair it with FLINT_STATS_DUMP_SEC, which is what actually drives the
+        // dump into the info LOG; enabling this alone records but never prints.
+        if env_u64("FLINT_ROCKS_STATS").is_some_and(|v| v != 0) {
+            opts.enable_statistics();
+            eprintln!(
+                "rocksdb statistics ENABLED (FLINT_ROCKS_STATS) — profiling only, \
+                 this instrument perturbs the path it measures"
+            );
+        }
         // Compaction parallelism. UNSET HERE BY DEFAULT, which means every
         // shipped seat runs on RocksDB's own default of 2 background jobs.
         //
