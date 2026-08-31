@@ -268,3 +268,46 @@ understates the shared-lock half. **A fleet A/B is still owed.**
 
 Still server-side. BUG-0078 has the edge at 690 writes/s per connection against
 5,030 direct, so a proxied client does not see any of this.
+
+### What it broke: the write deadline's own clock
+
+Staging a write is not serving it, and the admission gate did not know the
+difference.
+
+The deadline (#186) refuses on arrival when `inflight x service` already
+exceeds it, and both terms come from the `WriteInFlight` guard `execute` holds
+for the length of its call. Under batching that call only STAGES the write:
+the commit happens later, in `commit_pending`, outside the guard. So the clock
+stopped before the work it was meant to measure, and a staged write stopped
+counting as in flight while it waited for the flush. Both terms under-read,
+and the gate under-fired.
+
+Same binary, same box, same 128x100 load, differing only in whether the write
+is batchable:
+
+| write | batched | wall clock | `write_service_us` |
+|---|---|---|---|
+| plain `SET` | yes | 0.32s | **7** |
+| `SET .. EX` | no | 0.33s | 15 |
+| plain `SET` | yes | 0.32s | **7** |
+| `SET .. EX` | no | 0.34s | 11 |
+
+Identical real cost, half the measured cost. The missing half is the commit.
+
+**It was caught by a positive control, not by a failing assertion.** The
+`write_deadline` drill went red saying it could not ARM — 256 concurrent 4 KiB
+writes all served inside 1ms — which reads like a fast box and was not. On one
+box, clean `main` armed at 128 threads while this branch could not arm through
+256; with the guard corrected it arms at 128 again. Nothing asserted a wrong
+value anywhere; the shed simply stopped being reachable, and only a control
+that has to be MADE to fire could notice that.
+
+The first remedy tried was the wrong one, and is worth recording as such:
+raising the ladder to 256 threads x 256 KiB moved `write_service_us` to 49 and
+still shed nothing, because the term that was wrong was never the load. A
+drill that had been "recalibrated" that way would have gone green over a
+weakened gate.
+
+The guard now lives in `PendingBatch` and drops after `commit_ops`, beside the
+stripe guards and for the same reason: the write is in flight until it
+commits.
