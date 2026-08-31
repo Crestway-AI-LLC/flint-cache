@@ -2976,6 +2976,7 @@ fn batch_eligible(
 fn commit_pending(
     store: &dyn Kv,
     rocks: &Option<RocksHandle>,
+    watch: &Arc<flint_storage::watch::WatchTable>,
     batch: Option<PendingBatch<'_>>,
 ) -> Vec<Value> {
     let Some(b) = batch else { return Vec::new() };
@@ -2989,6 +2990,27 @@ fn commit_pending(
     let ops = kv.into_ops();
     if ops.is_empty() {
         return replies;
+    }
+    // BUMP THE WATCH TABLE FOR EVERY KEY IN THE RUN.
+    //
+    // `WatchedKv` bumps on put/delete, which is how a write records itself
+    // against a WATCH -- but a batched write never reaches it: it buffers in
+    // BatchingKv, and `commit_ops` then calls `RocksKv::apply_writes`
+    // DIRECTLY, under the wrapper. Without this the change is invisible to a
+    // watcher and EXEC commits when it must abort.
+    //
+    // Found by proxy_conformance, and only through the proxy: on one
+    // connection WATCH leaves `txn.watches` non-empty so `batch_eligible`
+    // refuses, while the proxy puts the write on a different backend
+    // connection whose watches are empty. The corpus case is explicit that
+    // "WATCH tracks the key, not the author".
+    //
+    // Bumped BEFORE the commit deliberately. A spurious bump can only abort a
+    // transaction that might have committed, which WATCH permits -- it is
+    // optimistic. A MISSED bump commits one that must abort, which it does
+    // not.
+    for (k, _) in &ops {
+        watch.bump(k);
     }
     let n = replies.len();
     let out = match commit_ops(store, rocks, &ops) {
@@ -3047,7 +3069,7 @@ fn serve(
         // handed off or closed.
         macro_rules! flush_pending {
             () => {
-                for r in commit_pending(store, &rocks, pending_batch.take()) {
+                for r in commit_pending(store, &rocks, watch, pending_batch.take()) {
                     encode_proto_flushing(
                         &r,
                         conn_proto,
