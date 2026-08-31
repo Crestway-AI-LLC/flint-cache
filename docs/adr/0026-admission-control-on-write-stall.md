@@ -97,3 +97,70 @@ throughput.
   with an otherwise-idle replica. A smaller replica, or one serving reads,
   could make ADR-0022's gate bind first after all — which would make this ADR
   a complement rather than a correction.
+
+## Amendment, 2026-08-30 (same day) — tuning does part of this job, without rejecting anything
+
+A connection sweep and a compaction-parallelism A/B on one fleet changed the
+shape of the argument above, and one number in it.
+
+**The operating point is a knee the system will not find on its own.**
+Throughput scales linearly with connections to ~12, peaks at ~24–48
+(~80–88k seq/s, ~84–93 MB/s at 1,054 B/write), and then goes *backwards* —
+46,318 seq/s at 384 connections. A client that offers more load past the knee
+gets less work done. That is an argument for admission control that does not
+depend on any of the reasoning below it: nothing in the write path steers
+toward the maximum, and the client cannot see it.
+
+**But compaction parallelism removes the collapse, without shedding a write.**
+The shipped engine runs one `rocksdb:low` thread (RocksDB's default
+`max_background_jobs: 2`, `max_subcompactions: 1`). With
+`FLINT_BG_JOBS=8 FLINT_SUBCOMPACTIONS=4`:
+
+| conns | 1 thread | 6 threads | ratio |
+|---|---|---|---|
+| 24 | 77,234 | 76,263 | 0.99 |
+| 96 | 78,233 | 79,062 | 1.01 |
+| 192 | 37,303 / 23,569 | 75,760 | **2.0–3.2×** |
+| 384 | 20,079 | 61,607 | **3.1×** |
+
+Nothing at the operating point; 2–3× past it. The ceiling is unmoved — so
+this is not speed, it is overload behaviour. The mechanism is in a counter,
+not a rate: at 384 connections the shipped config shed **44,554,807** writes
+on the 2-second deadline, the tuned one **347,048**. With a single compaction
+thread, overload writes queue behind a stalled engine until they time out.
+
+### What this changes
+
+**The admission gate is a backstop, not the primary defence.** Against L0
+collapse, config gets most of it for free and rejects nothing, which is
+strictly better than shedding. The gate's remaining job is the region config
+cannot reach — where **replica lag** binds. That limit was invisible until
+compaction stopped being the constraint, and then appeared immediately:
+`writes_shed_lag` at 13,520,819 (C=192) and 38,201,926 (C=384).
+
+So the ordering is: tune compaction for ingest-class hardware first, then let
+ADR-0022's lag cap do what it was designed for, and reserve a stall-keyed gate
+for what neither covers. That is a narrower mandate than this ADR opened with.
+
+### A correction to the evidence above
+
+The Context section leans on window A — a mis-set gate shedding 125,000
+writes/s while delivering 71% more durable throughput than the "correct"
+setting. That comparison stands, but the reason is now clearer and less
+flattering to it: both windows ran at 60 connections, **past the knee**.
+Window A's shedding held the system near its peak by accident; window B's
+did not, and sat in the degraded region. The finding is real and the
+mechanism is admission control, but it was never evidence that 62% shed is a
+good target — it is evidence that *something* has to hold the system at its
+knee.
+
+### Still not established
+
+- **What caps ~80k seq/s.** Not compaction (6 threads move it 1%), not
+  connection count, not replication below C=192. Unmeasured: the fsync path
+  (`wal_fsync_ms` 500), device write bandwidth, WAL append serialization.
+- **Whether these knobs should ship as defaults.** Every number here comes
+  from a 16-vCPU box with 15 idle cores — the case `rocks.rs` warns makes this
+  knob look free while saying nothing about a 2-vCPU seat, where compaction
+  threads contend with the serve path. `FLINT_SUBCOMPACTIONS` exists so the
+  question can be asked on constrained hardware; it does not answer it.
