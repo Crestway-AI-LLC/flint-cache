@@ -197,3 +197,74 @@ writes/s per connection against 5,030 direct — **7.3x worse, at 0.08 of a
 core** — because the edge punishes round-trips. Everything here was measured
 with the proxy deliberately out of the path. Raising the server's ceiling is
 worth doing and does not, on its own, make a proxied client faster.
+
+## Amendment, 2026-08-31 — implemented, and one argument above is wrong
+
+### The deadlock-freedom argument was incomplete, and the gap was real
+
+This ADR said:
+
+> It is deadlock-free without ordering gymnastics: batches take only shared
+> locks so they never block each other, and an RMW holds nothing while waiting
+> for its single stripe, so no cycle can form.
+
+True for DISTINCT readers. It misses a reader **re-entering** a lock it already
+holds. The first implementation took `GLOBAL.read()` once per key, so a batch
+holding it from its first key asked for it again on its second -- and with a
+`lock_all()` pending, the writer-preferring `RwLock` blocked that second
+acquisition against a writer waiting for the batch to finish. The batch could
+not finish; finishing is what releases the guard.
+
+It wedged the test suite for 25 minutes, and it would have reached a fleet as
+an unexplained stall: every `MSET`, `FLUSHALL` and multi-key `DEL` takes
+`lock_all()`, and the failure produces no error, no shed counter and nothing in
+`FLINTINFO` -- just connections that stop.
+
+The risk section named writer preference as the main hazard and asked for a
+test. It got one, twice: the suite deadlocked before the test existed, and then
+the same property produced the product bug. **A hazard listed in an ADR is not
+a hazard mitigated.**
+
+Corrected design, which is what shipped:
+
+- **one `GLOBAL.read()` per BATCH**, taken at construction, never per key;
+- **each stripe at most once**, tracked in a `held` set -- re-entering one
+  stripe reproduces the same deadlock a level down;
+- **`serve` owns the locking**, so `execute` takes no guard for a batched
+  write. That removed the guard-sink machinery this ADR originally implied.
+
+A regression test pins it: a 120-key batch against a thread continuously
+holding `lock_all()`, with a bounded wait, because the bug was an INDEFINITE
+block and any finite budget separates that from slow. Verified in both
+directions -- reintroducing the per-key acquisition makes it fail with its own
+message.
+
+### Measured
+
+The "Unquantified" note above is settled for the server path. Eight concurrent
+connections, depth-256 pipelines, through a real server on loopback:
+
+| value size | `origin/main` | with batching | ratio |
+|---|---|---|---|
+| 32 B | 96,479 / 92,954 | 298,370 / 338,087 | **~3.4x** |
+| **1 KB** | 83,871 / 82,752 | 198,640 / 169,931 | **~2.2x** |
+
+Quote the 1 KB row: value size changes the RATIO, not just the rate, because
+the smaller the value the larger a share per-write overhead is.
+
+The number worth keeping is the control. **Un-batched, the laptop tops out at
+~83,000 sets/s and the 5-host fleet topped out at ~80,000 seq/s** -- loopback
+plaintext against mTLS across a real network, same wall. That is independent
+evidence the ceiling is write-path bound rather than network bound, which is
+what the profile claimed and what makes a local measurement admissible here at
+all.
+
+Biases, in both directions: loopback strips TLS and the network from the
+denominator, so a fleet will show less; and 8 connections cannot contend 128
+stripes the way a fleet does, so this mostly measures the batching and
+understates the shared-lock half. **A fleet A/B is still owed.**
+
+### Scope, unchanged
+
+Still server-side. BUG-0078 has the edge at 690 writes/s per connection against
+5,030 direct, so a proxied client does not see any of this.

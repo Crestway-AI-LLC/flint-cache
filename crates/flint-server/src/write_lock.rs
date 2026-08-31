@@ -104,6 +104,49 @@ pub fn lock_key_pure(ns: &[u8], key: &[u8]) -> WriteGuard {
     WriteGuard::Shared(g, s)
 }
 
+/// The GLOBAL half of a batch's exclusion, taken ONCE for the whole run.
+///
+/// A deferred batch must not acquire `GLOBAL.read()` per key. `RwLock` here is
+/// writer-preferring: once a `lock_all()` is pending, a NEW reader blocks even
+/// though readers already hold it. A batch holding `GLOBAL.read()` from its
+/// first key and asking for it again on its second therefore blocks against a
+/// writer that is itself waiting for the batch to finish -- and the batch
+/// cannot finish, because finishing is what releases the guard. That deadlock
+/// is not hypothetical: it wedged the test suite for 25 minutes on
+/// 2026-08-31, and it is the risk ADR-0027 named before the code existed.
+///
+/// So: one `GLOBAL.read()` for the batch, and per-key stripe guards under it
+/// via [`lock_stripe_pure`].
+pub fn lock_global_shared() -> RwLockReadGuard<'static, ()> {
+    GLOBAL.read().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The per-key half, for a caller that already holds [`lock_global_shared`].
+///
+/// Same soundness argument as [`lock_key_pure`] -- valid only for a write that
+/// reads nothing -- and the same warning about the predicate. Re-entering one
+/// STRIPE is safe in a way re-entering GLOBAL is not: a batch takes each
+/// stripe at most once, because it collapses duplicate keys before locking.
+pub fn lock_stripe_pure(ns: &[u8], key: &[u8]) -> RwLockReadGuard<'static, ()> {
+    let mut buf = Vec::with_capacity(ns.len() + 1 + key.len());
+    buf.extend_from_slice(ns);
+    buf.push(b'|');
+    buf.extend_from_slice(key);
+    STRIPE[stripe_of(&buf)]
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+/// Which stripe a key falls in — so a caller batching many keys can collapse
+/// duplicates and take each stripe exactly once.
+pub fn stripe_for(ns: &[u8], key: &[u8]) -> usize {
+    let mut buf = Vec::with_capacity(ns.len() + 1 + key.len());
+    buf.extend_from_slice(ns);
+    buf.push(b'|');
+    buf.extend_from_slice(key);
+    stripe_of(&buf)
+}
+
 /// Exclude EVERY writer (multi-key/keyless writes; queue batches).
 pub fn lock_all() -> WriteGuard {
     WriteGuard::All(GLOBAL.write().unwrap_or_else(|e| e.into_inner()))

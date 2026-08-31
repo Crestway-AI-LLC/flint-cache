@@ -2862,6 +2862,149 @@ const MAX_INLINE_LEN: usize = 64 * 1024;
 /// against large values can demand an arbitrarily large reply buffer.
 const OUT_FLUSH_THRESHOLD: usize = 1024 * 1024;
 
+/// A run of consecutive PURE writes from one connection's pipeline, held
+/// until something forces it out (ADR-0027 part 2).
+///
+/// Each command still dispatches individually against `kv`, so it computes
+/// its own exact reply -- `BatchingKv` overlays reads and scans, so nothing
+/// observes a half-applied run. What is deferred is only the ENGINE write:
+/// the whole run commits as one `WriteBatch`, which is one grouped WAL append
+/// and one write-group join instead of N of each. N of each is the measured
+/// ceiling (~80k seq/s, `WriteThread::AwaitState` the top profile symbol).
+///
+/// The guards are held for the batch's whole life, not per command. They are
+/// SHARED stripe guards, so two connections batching at once do not exclude
+/// each other -- that is the entire point of part 1, and the reason this can
+/// exist at all where the async queue's `lock_all()` per batch could not.
+///
+/// Replies are held rather than written. Nothing may reach the client before
+/// the commit that makes it true, so a failed commit rewrites them as errors
+/// instead of having to un-send a `+OK`.
+struct PendingBatch<'a> {
+    kv: flint_storage::batch::BatchingKv<'a>,
+    /// ONE `GLOBAL.read()` for the whole run. Never per key: `RwLock` is
+    /// writer-preferring, so a batch that re-acquired it would block against
+    /// a `lock_all()` that is itself waiting for the batch to finish. See
+    /// `write_lock::lock_global_shared`.
+    _global: std::sync::RwLockReadGuard<'static, ()>,
+    /// Stripe guards, each taken AT MOST ONCE -- `held` is what makes that
+    /// true, and re-entering one stripe would reproduce the same deadlock a
+    /// level down.
+    _stripes: Vec<std::sync::RwLockReadGuard<'static, ()>>,
+    held: std::collections::HashSet<usize>,
+    replies: Vec<Value>,
+}
+
+/// How many pure writes may accumulate before the batch is forced out.
+///
+/// Not a tuning knob so much as a bound on two things: the stripe guards held
+/// at once (an RMW writer of any of those keys waits behind the whole batch),
+/// and the size of one WAL sequence. At 1 KB values a 256-key batch makes a
+/// sequence ~256 KB, against a WAL headroom guard denominated in SEQUENCES
+/// that assumes ~16 KiB each -- see the note in `commit_pending`.
+const MAX_PURE_BATCH: usize = 256;
+
+impl<'a> PendingBatch<'a> {
+    fn new(store: &'a dyn Kv) -> Self {
+        Self {
+            kv: flint_storage::batch::BatchingKv::new(store),
+            _global: write_lock::lock_global_shared(),
+            _stripes: Vec::new(),
+            held: std::collections::HashSet::new(),
+            replies: Vec::new(),
+        }
+    }
+
+    /// Take this key's stripe if the batch does not already hold it.
+    fn hold_stripe(&mut self, ns: &[u8], key: &[u8]) {
+        let idx = write_lock::stripe_for(ns, key);
+        if self.held.insert(idx) {
+            self._stripes.push(write_lock::lock_stripe_pure(ns, key));
+        }
+    }
+}
+
+/// May this command join a deferred pure-write batch?
+///
+/// Everything here is a REFUSAL to batch, and each one falls through to the
+/// unchanged single-command path. Deferring a write is only safe when nothing
+/// else can observe the gap between its reply and its commit:
+///
+/// - a PURE write, by `is_pure_write` -- anything that reads its own key must
+///   hold the stripe exclusively and cannot share a batch;
+/// - a master. On a replica the write path is suppressed entirely;
+/// - no MULTI open, and no WATCH armed. A transaction is already a batch with
+///   its own atomicity, and a watch is a promise about when a change becomes
+///   visible -- neither should have a second deferral layered under it;
+/// - not routed to the async write queue. That is a different batching path
+///   with a different lock discipline (`lock_all()` per batch); the two must
+///   never interleave;
+/// - a rocks engine, because the whole benefit is `apply_writes` collapsing
+///   the run into one WAL append. The mem engine would be correct and
+///   pointless.
+#[allow(clippy::too_many_arguments)]
+fn batch_eligible(
+    upper_name: &[u8],
+    args: &[Vec<u8>],
+    ro: bool,
+    txn: &TxnState,
+    rocks: &Option<RocksHandle>,
+    write_queue: Option<&Arc<write_queue::WriteQueue>>,
+    conn_async: bool,
+    conn_ns: &[u8],
+) -> bool {
+    if ro || rocks.is_none() || !is_pure_write(upper_name, args) {
+        return false;
+    }
+    if txn.open.is_some() || !txn.watches.is_empty() {
+        return false;
+    }
+    if let Some(q) = write_queue
+        && (conn_async || q.wants(conn_ns))
+    {
+        return false;
+    }
+    true
+}
+
+/// Commit a pending batch and return its replies, in order.
+///
+/// On failure every reply becomes an error: the run committed as one
+/// `WriteBatch`, so it landed entirely or not at all, and saying `+OK` to any
+/// of it would be a lie. This is only expressible because the replies were
+/// never written -- see `PendingBatch`.
+fn commit_pending(
+    store: &dyn Kv,
+    rocks: &Option<RocksHandle>,
+    batch: Option<PendingBatch<'_>>,
+) -> Vec<Value> {
+    let Some(b) = batch else { return Vec::new() };
+    let PendingBatch {
+        kv,
+        _global,
+        _stripes,
+        held: _,
+        replies,
+    } = b;
+    let ops = kv.into_ops();
+    if ops.is_empty() {
+        return replies;
+    }
+    let n = replies.len();
+    let out = match commit_ops(store, rocks, &ops) {
+        Ok(()) => replies,
+        Err(e) => (0..n)
+            .map(|_| Value::Error(format!("ERR batch commit failed: {e}")))
+            .collect(),
+    };
+    // The guards drop HERE, after the commit -- they are what kept an RMW
+    // writer of these keys out while the batch was computing against values it
+    // had not yet written.
+    drop(_stripes);
+    drop(_global);
+    out
+}
+
 #[allow(clippy::too_many_arguments)]
 fn serve(
     mut stream: flint_tls::Stream,
@@ -2894,6 +3037,31 @@ fn serve(
     loop {
         let mut consumed = 0;
         out.clear();
+        // ADR-0027 part 2: a run of consecutive pure writes accumulates here
+        // and commits as ONE WriteBatch. Scoped to a single read's worth of
+        // pipeline, which is the unit a client actually sends.
+        let mut pending_batch: Option<PendingBatch> = None;
+        // Commit whatever has accumulated and write its replies. Nothing may
+        // reach the client before the commit that makes it true, so this runs
+        // BEFORE any other reply is encoded and before the connection is
+        // handed off or closed.
+        macro_rules! flush_pending {
+            () => {
+                for r in commit_pending(store, &rocks, pending_batch.take()) {
+                    encode_proto_flushing(
+                        &r,
+                        conn_proto,
+                        &mut out,
+                        OUT_FLUSH_THRESHOLD,
+                        &mut |o| {
+                            stream.write_all(o)?;
+                            o.clear();
+                            Ok(())
+                        },
+                    )?;
+                }
+            };
+        }
         loop {
             let pending = &buf[consumed..];
             let Some(&first) = pending.first() else { break };
@@ -2938,6 +3106,7 @@ fn serve(
                     &mut conn_txn,
                     watch,
                     &args,
+                    None,
                 );
                 // Drain BETWEEN elements instead of only after the whole reply.
                 // Serializing a collection into this buffer whole is the second of
@@ -2984,6 +3153,9 @@ fn serve(
                         .first()
                         .is_some_and(|n| n.eq_ignore_ascii_case(b"FLINTSYNC"))
                     {
+                        // A hijack never returns to this loop, so a buffered
+                        // batch would be lost with it.
+                        flush_pending!();
                         buf.drain(..consumed);
                         stream.write_all(&out)?;
                         return flintsync(stream, rocks, hub, &args);
@@ -2992,6 +3164,9 @@ fn serve(
                         .first()
                         .is_some_and(|n| n.eq_ignore_ascii_case(b"FLINTFULLSYNC"))
                     {
+                        // A hijack never returns to this loop, so a buffered
+                        // batch would be lost with it.
+                        flush_pending!();
                         buf.drain(..consumed);
                         stream.write_all(&out)?;
                         return flintfullsync(stream, rocks);
@@ -3000,10 +3175,81 @@ fn serve(
                         .first()
                         .is_some_and(|n| n.eq_ignore_ascii_case(b"FLINTMIGRATEOUT"))
                     {
+                        // A hijack never returns to this loop, so a buffered
+                        // batch would be lost with it.
+                        flush_pending!();
                         buf.drain(..consumed);
                         stream.write_all(&out)?;
                         return migrate::flintmigrateout(stream, rocks, &args);
                     }
+                    let upper = args
+                        .first()
+                        .map(|n| n.to_ascii_uppercase())
+                        .unwrap_or_default();
+                    if batch_eligible(
+                        &upper,
+                        &args,
+                        read_only.load(Ordering::Relaxed),
+                        &conn_txn,
+                        &rocks,
+                        write_queue,
+                        conn_async,
+                        &conn_ns,
+                    ) {
+                        let b = pending_batch.get_or_insert_with(|| PendingBatch::new(store));
+                        // The batch owns its locking: GLOBAL once at
+                        // construction, this key's stripe now if it is not
+                        // already held. `execute` therefore takes no guard of
+                        // its own for a batched write.
+                        if let Some(k) = commands::command_key(&args) {
+                            b.hold_stripe(&conn_ns, k);
+                        }
+                        let reply = execute(
+                            store,
+                            read_only,
+                            tailer_stop,
+                            lease_deadline,
+                            &rocks,
+                            hub,
+                            migration_active,
+                            limits,
+                            write_queue,
+                            &mut conn_ns,
+                            &mut conn_async,
+                            &mut conn_proto,
+                            &mut conn_txn,
+                            watch,
+                            &args,
+                            Some(&b.kv),
+                        );
+                        // A refusal -- shed by the lag cap, the deadline, a
+                        // lost lease -- is NOT a batched write. It wrote
+                        // nothing, so it is answered now rather than held.
+                        if matches!(reply, Value::Error(_)) {
+                            flush_pending!();
+                            encode_proto_flushing(
+                                &reply,
+                                conn_proto,
+                                &mut out,
+                                OUT_FLUSH_THRESHOLD,
+                                &mut |o| {
+                                    stream.write_all(o)?;
+                                    o.clear();
+                                    Ok(())
+                                },
+                            )?;
+                        } else {
+                            b.replies.push(reply);
+                            if b.replies.len() >= MAX_PURE_BATCH {
+                                flush_pending!();
+                            }
+                        }
+                        continue;
+                    }
+                    // Anything else observes the store, so the batch lands
+                    // first: a GET later in the same pipeline must read what
+                    // the SETs before it wrote.
+                    flush_pending!();
                     let reply = execute(
                         store,
                         read_only,
@@ -3020,6 +3266,7 @@ fn serve(
                         &mut conn_txn,
                         watch,
                         &args,
+                        None,
                     );
                     // Drain BETWEEN elements instead of only after the whole reply.
                     // Serializing a collection into this buffer whole is the second of
@@ -3051,6 +3298,11 @@ fn serve(
                 }
             }
         }
+        // The pipeline is drained. THIS is the commit that matters: a run of
+        // pure writes ending the pipeline has no following command to force
+        // it out, and its replies have not been written. Both happen here,
+        // before anything reaches the client.
+        flush_pending!();
         if consumed > 0 {
             buf.drain(..consumed);
             if !out.is_empty() {
@@ -3700,6 +3952,13 @@ fn is_pure_write(upper_name: &[u8], args: &[Vec<u8>]) -> bool {
     upper_name == b"SET" && args.len() == 3
 }
 
+/// `batch_kv` / `guard_sink`: ADR-0027 part 2. When a caller is accumulating a
+/// deferred pure-write batch, it passes the batch's `BatchingKv` as the engine
+/// and a sink for the stripe guard. Everything else here -- health, the
+/// admission gates, the in-flight accounting -- runs UNCHANGED, which is the
+/// point of threading the batch through this function instead of around it: a
+/// batched write must still be shed by the lag cap and the deadline, or the
+/// batch would be a hole in the back-pressure this whole path exists for.
 #[allow(clippy::too_many_arguments)]
 fn execute(
     store: &dyn Kv,
@@ -3717,6 +3976,7 @@ fn execute(
     conn_txn: &mut TxnState,
     watch: &Arc<flint_storage::watch::WatchTable>,
     args: &[Vec<u8>],
+    batch_kv: Option<&dyn Kv>,
 ) -> Value {
     // HELLO: protocol negotiation, answered here rather than in the
     // command table because it MUTATES this connection's dialect.
@@ -4231,7 +4491,7 @@ fn execute(
     // lock. Acquired AFTER the queue branch (a queued submit blocks on the
     // consumer, which itself takes the global lock — holding a stripe
     // across that wait would deadlock).
-    let _write_guard = if is_write && !ro {
+    let write_guard = if is_write && !ro && batch_kv.is_none() {
         let name = args
             .first()
             .map(|n| n.to_ascii_uppercase())
@@ -4250,6 +4510,12 @@ fn execute(
     } else {
         None
     };
+    // A BATCHED write takes no guard here: the batch holds GLOBAL once for
+    // its whole run and this key's stripe already (see `PendingBatch`).
+    // Acquiring GLOBAL.read() again per key is the deadlock this design was
+    // corrected for -- writer-preferring RwLock blocks the second acquisition
+    // behind a lock_all() that is waiting on the batch itself.
+    let _write_guard = write_guard;
     // On a replica, wrap the store so lazy-expiry deletes buried in read
     // paths become no-ops: a replica must not write to its own store (that
     // would diverge it from the master); the master's replicated DELETE and
@@ -4266,8 +4532,18 @@ fn execute(
         )
         .dispatch(args)
     } else {
-        Dispatcher::with_limits(store, flint_storage::strings::system_clock, limits, conn_ns)
-            .dispatch(args)
+        // The batch's BatchingKv when one is accumulating, the real store
+        // otherwise. BatchingKv overlays reads and scans, so this command
+        // still computes its exact reply against everything the run has
+        // written so far.
+        let engine: &dyn Kv = batch_kv.unwrap_or(store);
+        Dispatcher::with_limits(
+            engine,
+            flint_storage::strings::system_clock,
+            limits,
+            conn_ns,
+        )
+        .dispatch(args)
     }
 }
 
@@ -6052,6 +6328,319 @@ mod serve_tests {
     /// A pipeline whose replies overflow OUT_FLUSH_THRESHOLD must flush
     /// incrementally and stay correct — every reply arrives, in order, and
     /// the connection remains usable.
+    /// A rocks-backed server, because ADR-0027's batching is rocks-only:
+    /// `spawn_server` uses MemKv with `rocks: None`, so every test through it
+    /// takes the unbatched path and proves nothing about this.
+    #[cfg(feature = "rocks")]
+    fn spawn_rocks_server() -> (std::net::SocketAddr, std::path::PathBuf) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        // A monotonic counter, NOT the thread id: ids are reused once a
+        // thread exits, so two servers could name the same directory and the
+        // second's remove_dir_all would wipe the first's data out from under
+        // it -- which is exactly how this test failed in the full run while
+        // passing alone.
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "flint-batch-test-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let kv = Arc::new(flint_storage::rocks::RocksKv::open(&dir).expect("open rocks"));
+        let out = dir.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { continue };
+                let kv = Arc::clone(&kv);
+                std::thread::spawn(move || {
+                    let store: &dyn Kv = &*kv;
+                    let _ = serve(
+                        flint_tls::Stream::Plain(stream),
+                        store,
+                        &Arc::new(AtomicBool::new(false)),
+                        &Arc::new(AtomicBool::new(false)),
+                        &Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                        Some(Arc::clone(&kv)),
+                        &Arc::new(ReplHub::default()),
+                        &Arc::new(AtomicBool::new(false)),
+                        commands::Limits::default(),
+                        None,
+                        &Arc::new(flint_storage::watch::WatchTable::new()),
+                    );
+                });
+            }
+        });
+        (addr, out)
+    }
+
+    #[cfg(feature = "rocks")]
+    fn set_frame(k: &str, v: &str, into: &mut Vec<u8>) {
+        encode(
+            &Value::Array(Some(vec![
+                Value::Bulk(Some(b"SET".to_vec())),
+                Value::Bulk(Some(k.as_bytes().to_vec())),
+                Value::Bulk(Some(v.as_bytes().to_vec())),
+            ])),
+            into,
+        );
+    }
+
+    #[cfg(feature = "rocks")]
+    fn get_frame(k: &str, into: &mut Vec<u8>) {
+        encode(
+            &Value::Array(Some(vec![
+                Value::Bulk(Some(b"GET".to_vec())),
+                Value::Bulk(Some(k.as_bytes().to_vec())),
+            ])),
+            into,
+        );
+    }
+
+    /// A pipeline that is NOTHING BUT pure writes has no following command to
+    /// force the batch out, so it commits only on the drain. If that commit
+    /// were missing the replies would still say OK and the data would not be
+    /// there -- silent loss, which is why this reads back on a SECOND
+    /// connection rather than trusting the first.
+    #[cfg(feature = "rocks")]
+    #[test]
+    fn a_pipeline_of_only_pure_sets_is_committed_on_drain() {
+        let (addr, _dir) = spawn_rocks_server();
+        let mut s = connect(addr);
+        let n = 50;
+        let mut pipeline = Vec::new();
+        for i in 0..n {
+            set_frame(&format!("k{i}"), &format!("v{i}"), &mut pipeline);
+        }
+        s.write_all(&pipeline).expect("send");
+        let frames = read_frames(&mut s, n);
+        for f in &frames {
+            assert_eq!(f, &Value::Simple("OK".into()), "every batched SET acks OK");
+        }
+        drop(s);
+
+        let mut s2 = connect(addr);
+        let mut reads = Vec::new();
+        for i in 0..n {
+            get_frame(&format!("k{i}"), &mut reads);
+        }
+        s2.write_all(&reads).expect("send reads");
+        let got = read_frames(&mut s2, n);
+        for (i, f) in got.iter().enumerate() {
+            assert_eq!(
+                f,
+                &Value::Bulk(Some(format!("v{i}").into_bytes())),
+                "k{i} was acked but did not land"
+            );
+        }
+    }
+
+    /// Throughput of pipelined pure writes through a real connection.
+    ///
+    /// NOT a gate test -- `#[ignore]`d, and run by hand against two commits to
+    /// A/B them. Loopback and plaintext on purpose: this measures the engine
+    /// writes ADR-0027 removes, not the round trips it does not touch, so the
+    /// absent network is a simplification rather than a distortion. It will
+    /// UNDERSTATE the lock half, because a laptop cannot hold enough
+    /// concurrent connections to contend 128 stripes the way a fleet does.
+    #[cfg(feature = "rocks")]
+    #[test]
+    #[ignore]
+    fn bench_pipelined_pure_writes() {
+        let conns: usize = std::env::var("BENCH_CONNS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8);
+        let per: usize = std::env::var("BENCH_N")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(20_000);
+        let (addr, _dir) = spawn_rocks_server();
+        let start = std::time::Instant::now();
+        let workers: Vec<_> = (0..conns)
+            .map(|c| {
+                std::thread::spawn(move || {
+                    let mut s = connect(addr);
+                    let depth = 256;
+                    let mut sent = 0;
+                    while sent < per {
+                        let batch = depth.min(per - sent);
+                        let mut pipeline = Vec::new();
+                        // Value size matters to the RATIO, not just the rate:
+                        // the smaller the value, the larger a share per-write
+                        // overhead is, and the more batching appears to win.
+                        // 1 KB is the fleet workload; default to it.
+                        let vs: usize = std::env::var("BENCH_VAL")
+                            .ok()
+                            .and_then(|v| v.parse().ok())
+                            .unwrap_or(1024);
+                        let val = "x".repeat(vs);
+                        for i in 0..batch {
+                            set_frame(&format!("c{c}:{:012}", sent + i), &val, &mut pipeline);
+                        }
+                        s.write_all(&pipeline).expect("send");
+                        let f = read_frames(&mut s, batch);
+                        assert_eq!(f.len(), batch);
+                        sent += batch;
+                    }
+                })
+            })
+            .collect();
+        for w in workers {
+            w.join().expect("worker");
+        }
+        let el = start.elapsed().as_secs_f64();
+        let total = conns * per;
+        println!(
+            "PIPELINED_SET conns={conns} total={total} in {el:.3}s = {:.0} sets/s",
+            total as f64 / el
+        );
+    }
+
+    /// The refusals in `batch_eligible` are correctness boundaries, so they
+    /// are asserted rather than assumed. A transaction is already a batch with
+    /// its own atomicity; layering a second deferral under it would let EXEC
+    /// report success for writes still sitting in a buffer.
+    #[cfg(feature = "rocks")]
+    #[test]
+    fn a_transaction_is_not_batched_and_still_reads_its_own_writes() {
+        let (addr, _dir) = spawn_rocks_server();
+        let mut s = connect(addr);
+        let mut p = Vec::new();
+        encode(
+            &Value::Array(Some(vec![Value::Bulk(Some(b"MULTI".to_vec()))])),
+            &mut p,
+        );
+        // Same-slot, per ADR-0012: a transaction spans one slot, so the
+        // keys are colocated with a hash tag.
+        set_frame("{tx}t1", "a", &mut p);
+        set_frame("{tx}t2", "b", &mut p);
+        encode(
+            &Value::Array(Some(vec![Value::Bulk(Some(b"EXEC".to_vec()))])),
+            &mut p,
+        );
+        s.write_all(&p).expect("send");
+        let f = read_frames(&mut s, 4);
+        assert_eq!(f[0], Value::Simple("OK".into()), "MULTI");
+        assert_eq!(
+            f[1],
+            Value::Simple("QUEUED".into()),
+            "SET queues, not batches"
+        );
+        assert_eq!(f[2], Value::Simple("QUEUED".into()));
+        assert!(
+            matches!(f[3], Value::Array(Some(_))),
+            "EXEC returns the queued replies, got {:?}",
+            f[3]
+        );
+        // And the transaction's writes are durable to a separate connection.
+        let mut s2 = connect(addr);
+        let mut r = Vec::new();
+        get_frame("{tx}t1", &mut r);
+        get_frame("{tx}t2", &mut r);
+        s2.write_all(&r).expect("send");
+        let g = read_frames(&mut s2, 2);
+        assert_eq!(g[0], Value::Bulk(Some(b"a".to_vec())));
+        assert_eq!(g[1], Value::Bulk(Some(b"b".to_vec())));
+    }
+
+    /// REGRESSION, and the sharpest test here. A batch used to take
+    /// `GLOBAL.read()` once PER KEY. `RwLock` is writer-preferring, so with a
+    /// `lock_all()` pending, the batch's second key blocked acquiring a lock
+    /// the batch already held -- against a writer waiting for the batch to
+    /// finish, which it could not, because finishing is what releases it.
+    ///
+    /// It wedged the suite for 25 minutes and would have reached a fleet as an
+    /// unexplained stall, since every MSET, FLUSHALL and multi-key DEL takes
+    /// `lock_all()`. The batch now takes GLOBAL once and each stripe at most
+    /// once.
+    ///
+    /// Many keys on purpose: with 128 stripes, a handful might all miss the
+    /// one a single `lock_all()` contends, and the bug needs the batch to
+    /// re-enter GLOBAL at all.
+    #[cfg(feature = "rocks")]
+    #[test]
+    fn a_batch_does_not_deadlock_against_a_pending_lock_all() {
+        let (addr, _dir) = spawn_rocks_server();
+        let mut s = connect(addr);
+        let n = 120;
+        let mut pipeline = Vec::new();
+        for i in 0..n {
+            set_frame(&format!("dk{i}"), &format!("v{i}"), &mut pipeline);
+        }
+
+        // A writer contending GLOBAL for the whole time the batch is running.
+        let stop = Arc::new(AtomicBool::new(false));
+        let churn = {
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let _all = write_lock::lock_all();
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            })
+        };
+
+        let done = Arc::new(AtomicBool::new(false));
+        let d2 = Arc::clone(&done);
+        let worker = std::thread::spawn(move || {
+            s.write_all(&pipeline).expect("send");
+            let frames = read_frames(&mut s, n);
+            d2.store(true, Ordering::SeqCst);
+            frames
+        });
+
+        // Generous, but bounded: the bug was an INDEFINITE block, so any
+        // finite budget separates it from merely slow.
+        for _ in 0..100 {
+            if done.load(Ordering::SeqCst) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        stop.store(true, Ordering::Relaxed);
+        assert!(
+            done.load(Ordering::SeqCst),
+            "batch deadlocked against a pending lock_all"
+        );
+        let frames = worker.join().expect("worker");
+        churn.join().expect("churn");
+        assert_eq!(frames.len(), n);
+        for f in &frames {
+            assert_eq!(f, &Value::Simple("OK".into()));
+        }
+    }
+
+    /// A read later in the SAME pipeline must see the writes before it. The
+    /// batch is forced out by any non-pure command for exactly this reason.
+    #[cfg(feature = "rocks")]
+    #[test]
+    fn a_read_in_the_same_pipeline_sees_the_writes_before_it() {
+        let (addr, _dir) = spawn_rocks_server();
+        let mut s = connect(addr);
+        let mut pipeline = Vec::new();
+        set_frame("a", "1", &mut pipeline);
+        set_frame("b", "2", &mut pipeline);
+        get_frame("a", &mut pipeline);
+        set_frame("c", "3", &mut pipeline);
+        get_frame("c", &mut pipeline);
+        s.write_all(&pipeline).expect("send");
+        let f = read_frames(&mut s, 5);
+        assert_eq!(f[0], Value::Simple("OK".into()));
+        assert_eq!(f[1], Value::Simple("OK".into()));
+        assert_eq!(
+            f[2],
+            Value::Bulk(Some(b"1".to_vec())),
+            "GET must see the SET earlier in its own pipeline"
+        );
+        assert_eq!(f[3], Value::Simple("OK".into()));
+        assert_eq!(
+            f[4],
+            Value::Bulk(Some(b"3".to_vec())),
+            "and a SET immediately before it"
+        );
+    }
+
     #[test]
     fn pipelined_replies_flush_incrementally_and_stay_correct() {
         let mut s = connect(spawn_server());
