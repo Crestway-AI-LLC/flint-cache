@@ -134,7 +134,24 @@ pub fn lock_key_pure(ns: &[u8], key: &[u8]) -> WriteGuard {
 ///
 /// So: one `GLOBAL.read()` for the batch, and per-key stripe guards under it
 /// via [`lock_stripe_pure`].
+#[cfg(test)]
+static GLOBAL_ACQUIRES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many times GLOBAL has been taken in shared mode. Test-only, and it
+/// exists so the "once per BATCH, never once per key" invariant can be
+/// asserted directly instead of inferred from timing -- a timing test cannot
+/// tell a deadlock from a writer-preferring lock legitimately starving
+/// readers, which is how the first version of that test came to pass with the
+/// bug reintroduced.
+#[cfg(test)]
+#[cfg_attr(not(feature = "rocks"), allow(dead_code))]
+pub(crate) fn global_acquires() -> u64 {
+    GLOBAL_ACQUIRES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub fn lock_global_shared() -> RwLockReadGuard<'static, ()> {
+    #[cfg(test)]
+    GLOBAL_ACQUIRES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     GLOBAL.read().unwrap_or_else(|e| e.into_inner())
 }
 

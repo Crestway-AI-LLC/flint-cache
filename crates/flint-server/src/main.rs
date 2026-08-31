@@ -6557,70 +6557,45 @@ mod serve_tests {
     /// `GLOBAL.read()` once PER KEY. `RwLock` is writer-preferring, so with a
     /// `lock_all()` pending, the batch's second key blocked acquiring a lock
     /// the batch already held -- against a writer waiting for the batch to
-    /// finish, which it could not, because finishing is what releases it.
+    /// finish, which it could not, because finishing is what releases it. It
+    /// wedged the suite for 25 minutes and would have reached a fleet as an
+    /// unexplained stall: every MSET, FLUSHALL and multi-key DEL takes
+    /// `lock_all()`, and the failure emits no error and no counter.
     ///
-    /// It wedged the suite for 25 minutes and would have reached a fleet as an
-    /// unexplained stall, since every MSET, FLUSHALL and multi-key DEL takes
-    /// `lock_all()`. The batch now takes GLOBAL once and each stripe at most
-    /// once.
-    ///
-    /// Many keys on purpose: with 128 stripes, a handful might all miss the
-    /// one a single `lock_all()` contends, and the bug needs the batch to
-    /// re-enter GLOBAL at all.
+    /// Asserted on the INVARIANT, not on timing. The first version of this
+    /// test raced a thread holding `lock_all()` and checked the batch finished
+    /// inside a budget; it failed on a 16-vCPU gate box while passing on a
+    /// laptop, because a writer-preferring lock starving readers looks exactly
+    /// like a deadlock from the outside. Loosening the contention then made it
+    /// pass WITH the bug reintroduced -- stable and useless. Counting the
+    /// acquisitions cannot go either way: a batch takes GLOBAL once, so 120
+    /// keys in one pipeline must not produce 120 acquisitions.
     #[cfg(feature = "rocks")]
     #[test]
-    fn a_batch_does_not_deadlock_against_a_pending_lock_all() {
-        // Serialised against write_lock's tests: these run real servers over
-        // the same process-global locks (see write_lock::test_serial).
+    fn a_batch_takes_the_global_lock_once_not_once_per_key() {
         let _serial = crate::write_lock::test_serial();
         let (addr, _dir) = spawn_rocks_server();
         let mut s = connect(addr);
         let n = 120;
         let mut pipeline = Vec::new();
         for i in 0..n {
-            set_frame(&format!("dk{i}"), &format!("v{i}"), &mut pipeline);
+            set_frame(&format!("gk{i}"), &format!("v{i}"), &mut pipeline);
         }
-
-        // A writer contending GLOBAL for the whole time the batch is running.
-        let stop = Arc::new(AtomicBool::new(false));
-        let churn = {
-            let stop = Arc::clone(&stop);
-            std::thread::spawn(move || {
-                while !stop.load(Ordering::Relaxed) {
-                    let _all = write_lock::lock_all();
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                }
-            })
-        };
-
-        let done = Arc::new(AtomicBool::new(false));
-        let d2 = Arc::clone(&done);
-        let worker = std::thread::spawn(move || {
-            s.write_all(&pipeline).expect("send");
-            let frames = read_frames(&mut s, n);
-            d2.store(true, Ordering::SeqCst);
-            frames
-        });
-
-        // Generous, but bounded: the bug was an INDEFINITE block, so any
-        // finite budget separates it from merely slow.
-        for _ in 0..100 {
-            if done.load(Ordering::SeqCst) {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-        stop.store(true, Ordering::Relaxed);
-        assert!(
-            done.load(Ordering::SeqCst),
-            "batch deadlocked against a pending lock_all"
-        );
-        let frames = worker.join().expect("worker");
-        churn.join().expect("churn");
+        let before = crate::write_lock::global_acquires();
+        s.write_all(&pipeline).expect("send");
+        let frames = read_frames(&mut s, n);
+        let taken = crate::write_lock::global_acquires() - before;
         assert_eq!(frames.len(), n);
         for f in &frames {
             assert_eq!(f, &Value::Simple("OK".into()));
         }
+        // A pipeline may arrive in more than one read, so more than one batch
+        // is legitimate -- but nowhere near one per key.
+        assert!(
+            taken < (n as u64) / 4,
+            "{n} pure writes took GLOBAL {taken} times; a batch must take it \
+             once, not once per key"
+        );
     }
 
     /// A read later in the SAME pipeline must see the writes before it. The
