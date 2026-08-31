@@ -1748,30 +1748,55 @@ fn main() -> std::io::Result<()> {
             // the archive out from under a live replica long before the TTL
             // was relevant, and the shed gate — calibrated in sequences —
             // never fired. min(256 GiB, a quarter of the volume).
+            // Create the data directory BEFORE measuring it. The engine makes
+            // it anyway a few lines down; doing it here is what makes the
+            // measurement answer for the volume the data will actually live
+            // on. Skipping this was a boot-time RACE, not a constant error:
+            // on a 5-host fleet the master sampled `dir` in the same second
+            // the state directory was being created on the freshly formatted
+            // NVMe, read None, mapped it onto 0 bytes and clamped a 3.5 TB
+            // seat to the 1 GiB FLOOR — while its replica, starting 1.1 s
+            // later, measured the same disk correctly and took 256 GiB. One
+            // silent log line was the only difference (BUG-0079).
+            //
+            // Walking up to an ancestor is NOT sufficient on its own: with
+            // the instance store not yet mounted, the nearest ancestor is the
+            // small root volume, which lands on the same floor just as
+            // quietly. `sample_nearest` stays below as the fallback for when
+            // the create itself fails.
+            if let Err(e) = std::fs::create_dir_all(&dir) {
+                eprintln!("WAL budget: could not create {dir} before sizing the archive: {e}");
+            }
+            let derived_mb = match flint_storage::disk::sample_nearest(std::path::Path::new(&dir)) {
+                Some(u) => flint_storage::rocks::wal_size_limit_mb_for_volume(u.total_bytes),
+                None => {
+                    // "Unknown" is not "small". disk.rs is explicit that a
+                    // failed syscall is not evidence about disk space, and a
+                    // budget is the one place where believing it costs a
+                    // replica its archive.
+                    eprintln!(
+                        "WAL budget: no filesystem under {dir} could be measured; \
+                         using {} MB rather than assuming a small volume",
+                        flint_storage::rocks::DEFAULT_WAL_SIZE_LIMIT_MB
+                    );
+                    flint_storage::rocks::DEFAULT_WAL_SIZE_LIMIT_MB
+                }
+            };
             let wal_mb = arg("--wal-size-limit-mb")
                 .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or_else(|| {
-                    let total = flint_storage::disk::sample(std::path::Path::new(&dir))
-                        .map(|u| u.total_bytes)
-                        .unwrap_or(0);
-                    let mb = flint_storage::rocks::wal_size_limit_mb_for_volume(total);
-                    WAL_BUDGET_MB.store(mb, Ordering::Relaxed);
-                    mb
-                });
+                .unwrap_or(derived_mb);
             WAL_BUDGET_MB.store(wal_mb, Ordering::Relaxed);
             // Compare against what this node WOULD have chosen, not against
             // the bare constant: the size budget is derived from the volume
             // now, so a stock node differs from DEFAULT_WAL_SIZE_LIMIT_MB and
             // would report itself overridden on every boot. A warning that
             // fires when nothing is wrong is a warning nobody reads.
-            let derived_mb = WAL_BUDGET_MB.load(Ordering::Relaxed);
             if wal_ttl != flint_storage::rocks::DEFAULT_WAL_TTL_SECONDS || wal_mb != derived_mb {
                 eprintln!(
                     "WAL retention OVERRIDDEN: ttl={wal_ttl}s size={wal_mb}MB \
-                     (defaults {}s / {}MB) — a replica that falls outside this \
-                     window needs a full re-seed",
-                    flint_storage::rocks::DEFAULT_WAL_TTL_SECONDS,
-                    flint_storage::rocks::DEFAULT_WAL_SIZE_LIMIT_MB
+                     (this node would have chosen {}s / {derived_mb}MB) — a \
+                     replica that falls outside this window needs a full re-seed",
+                    flint_storage::rocks::DEFAULT_WAL_TTL_SECONDS
                 );
             }
             let kv = RocksKv::open_with_retention(std::path::Path::new(&dir), wal_ttl, wal_mb)

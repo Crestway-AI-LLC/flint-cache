@@ -83,9 +83,49 @@ pub fn sample(_path: &Path) -> Option<Usage> {
     None
 }
 
+/// Sample the filesystem holding `path`, or the nearest ancestor that exists.
+///
+/// `statvfs` answers only for a path that is already there. A seat derives
+/// its WAL budget from the data directory BEFORE the engine has created it,
+/// so [`sample`] returns `None` and a caller that maps that onto zero sizes
+/// the archive for a zero-byte volume — the smallest one allowed — on a
+/// perfectly healthy disk (BUG-0079). Walking up answers the question that
+/// was actually being asked: which filesystem will this directory land on.
+///
+/// Still `None` only when nothing up to the root can be interrogated, which
+/// callers must treat as "unknown" per [`sample`], never as "small".
+pub fn sample_nearest(path: &Path) -> Option<Usage> {
+    let mut cur = Some(path);
+    while let Some(p) = cur {
+        if let Some(u) = sample(p) {
+            return Some(u);
+        }
+        cur = p.parent();
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bug_0079_a_directory_that_does_not_exist_yet_still_names_a_volume() {
+        // The seat sizes its WAL archive before the engine creates the data
+        // directory. Sampling the missing path answers None; the volume it
+        // WILL live on is what the budget has to come from.
+        let missing = std::env::temp_dir().join("flint-nonexistent-9f3a/node-7001");
+        assert!(!missing.exists(), "test needs a path that is really absent");
+        assert!(
+            sample(&missing).is_none(),
+            "statvfs should refuse a path that is not there"
+        );
+        let u = sample_nearest(&missing).expect("an ancestor of a temp path exists");
+        assert!(
+            u.total_bytes > 0,
+            "walking up must reach a real filesystem, got {u:?}"
+        );
+    }
 
     #[test]
     fn samples_a_real_filesystem() {

@@ -120,3 +120,72 @@ here.
   BUG-0077's fix armed the replica would have restarted and re-seeded within a
   minute; at 163 GB that re-seed is minutes of transfer during which the pair
   is single-copy, and whether the fill survives that is unmeasured.
+
+## Update 2026-08-30 — the fix was silently inert on half the fleet
+
+Deriving the budget from the volume (the fix for (1) and (3) above) landed and
+was verified green, and then a measurement fleet showed it doing nothing on
+the node that mattered. Two seats, same AMI, same binary, same 3.5 TB NVMe,
+one pair:
+
+| | `wal_headroom_shed_seq` | implied archive |
+|---|---|---|
+| master `172.31.77.205:7001` | 32,768 | **1 GiB** — the FLOOR |
+| replica `172.31.69.191:7002` | 8,388,608 | 256 GiB — as intended |
+
+Each seat says which it chose, in one line nothing reads:
+
+```
+wal headroom shed threshold: 32768 sequences (half of a 1024 MB archive ...)
+wal headroom shed threshold: 8388608 sequences (half of a 262144 MB archive ...)
+```
+
+**It is a boot race, not a constant error.** The budget is derived from
+`disk::sample(data_dir)` before the engine has created that directory, so
+`statvfs` answers `ENOENT` and the `unwrap_or(0)` behind it turns "I could not
+measure" into "a zero-byte volume", which clamps to the smallest archive
+allowed. Whether a seat wins the race is decided in under a second:
+
+| | statedir created | seat started | outcome |
+|---|---|---|---|
+| master | 23:08:54.617 | 23:08:54 | lost — 1 GiB |
+| replica | 23:08:55.758 | 23:08:55 | won — 256 GiB |
+
+So a pair can come up with a 256× under-provisioned archive on one member, on
+a healthy disk, differently on each boot. This is exactly the starvation
+BUG-0079 was filed to remove, reintroduced by its own fix.
+
+`disk.rs` already states the rule that was broken, and has a test asserting
+it (`a_path_that_does_not_exist_is_unknown_not_full`): *"Callers must treat
+that as 'unknown', never as 'full' — a syscall failing is not evidence about
+disk space."* A budget is the one caller where believing a failed measurement
+costs a replica its archive.
+
+### What was changed
+
+1. **Create the data directory before measuring it.** The engine creates it
+   moments later regardless; doing it first is what makes the measurement
+   answer for the volume the data will actually live on, and removes the race
+   rather than narrowing it.
+2. **`disk::sample_nearest`** walks to the first ancestor that exists, as a
+   fallback for when the create itself fails. Explicitly *not* sufficient
+   alone — with the instance store not yet mounted the nearest ancestor is the
+   small root volume, which lands on the same floor just as quietly.
+3. **An unmeasurable volume falls back to `DEFAULT_WAL_SIZE_LIMIT_MB` and
+   says so**, instead of silently becoming the floor.
+4. The override warning could never fire for `--wal-size-limit-mb`: it
+   compared the chosen value against a `derived_mb` re-read *after* the chosen
+   value had been stored, so the two were equal by construction. It now
+   compares against what the node would have chosen on its own.
+
+### Still open
+
+- **Why the value is only ever logged.** Nothing surfaces the chosen budget
+  where an operator or a drill would see a floor-clamped seat; `FLINTINFO`
+  exposes `wal_headroom_shed_seq`, from which the budget is inferable, and no
+  check asserts the two members of a pair agree. That is how this survived a
+  green gate.
+- **A seat that starts before its instance store is mounted** has a worse
+  problem than its WAL budget — it would put data on the root volume. The
+  create-then-measure fix makes the budget consistent with wherever the data
+  lands; it does not make the mount ordering correct.
