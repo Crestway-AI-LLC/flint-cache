@@ -461,6 +461,27 @@ impl RocksKv {
         if let Some(n) = env_u64("FLINT_BG_JOBS") {
             opts.set_max_background_jobs(n as i32);
         }
+        // Sub-compaction parallelism, same opt-in discipline as FLINT_BG_JOBS
+        // above and for the same reason -- but it is a DIFFERENT axis, and the
+        // two are easy to conflate. `max_background_jobs` bounds how many
+        // compactions run at once; `max_subcompactions` bounds how many
+        // threads ONE compaction may split itself across. RocksDB defaults the
+        // latter to 1, so the L0->L1 job -- the one that gates ingest, because
+        // L0 files overlap in key range and cannot be compacted independently
+        // -- is single-threaded no matter how high the job count goes.
+        //
+        // Measured on a 5-host i4i.4xlarge fleet on 2026-08-30, shipped
+        // config: the process held exactly ONE `rocksdb:low` thread and one
+        // `rocksdb:high`, l0_files pinned at its slowdown trigger of 20, and
+        // 15 of 16 cores idle. Raising jobs alone does not split that job.
+        //
+        // NOT a default here. The measurement that justifies a value has to
+        // come from a CPU-CONSTRAINED host: on a box with idle cores this
+        // knob only ever looks free, and a 2-vCPU seat is where compaction
+        // threads start contending with the serve path.
+        if let Some(n) = env_u64("FLINT_SUBCOMPACTIONS") {
+            opts.set_max_subcompactions(n as u32);
+        }
         // Expired metadata rows are dropped organically as compaction
         // rewrites them (subkey orphans are reclaimed by gc::sweep until
         // the filter gains a metadata-lookup handle).

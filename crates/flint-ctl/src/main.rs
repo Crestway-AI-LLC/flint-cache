@@ -38,6 +38,7 @@
 //!   node-env K=V          node  BOOT  extra env for every flint-server seat,
 //!                                     repeatable. For engine tuning that has
 //!                                     no CLI flag — FLINT_BG_JOBS,
+//!                                     FLINT_SUBCOMPACTIONS,
 //!                                     FLINT_LEVEL_BASE_MB,
 //!                                     FLINT_WRITE_BUFFER_MB — which
 //!                                     flint-storage reads from the
@@ -168,10 +169,10 @@ struct Inventory {
     evictable_ns: Option<String>,
     /// node: extra environment for every flint-server seat, as `node-env K=V`
     /// (repeatable). This exists for ENGINE TUNING that has no CLI flag —
-    /// `FLINT_BG_JOBS`, `FLINT_LEVEL_BASE_MB`, `FLINT_WRITE_BUFFER_MB` are read
-    /// from the environment by flint-storage and are otherwise unreachable on a
-    /// managed fleet, because flintctl spawns the seats and the operator never
-    /// touches the command line.
+    /// `FLINT_BG_JOBS`, `FLINT_SUBCOMPACTIONS`, `FLINT_LEVEL_BASE_MB` and
+    /// `FLINT_WRITE_BUFFER_MB` are read from the environment by flint-storage
+    /// and are otherwise unreachable on a managed fleet, because flintctl
+    /// spawns the seats and the operator never touches the command line.
     ///
     /// The plumbing already existed and only the operator-facing half was
     /// missing: `spawn_env` takes env pairs and the ssh path forwards them as
