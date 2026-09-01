@@ -3983,6 +3983,19 @@ fn commit_ops(
     rocks: &Option<RocksHandle>,
     ops: &[(Vec<u8>, Option<Vec<u8>>)],
 ) -> Result<(), String> {
+    // FLINT_BATCH_COMMIT_FAIL exists so the failure path can be ARMED.
+    //
+    // Only `apply_writes` can fail here, and forcing a real RocksDB write
+    // error means a full disk or a closed handle -- neither of which a drill
+    // can create without becoming a test of something else. So the path that
+    // rewrites a whole batch's replies as errors shipped reasoned rather than
+    // verified, which is the state every defect found this week was in.
+    //
+    // Nothing outside the drill may set it: it discards writes the client was
+    // about to be told about.
+    if std::env::var_os("FLINT_BATCH_COMMIT_FAIL").is_some() {
+        return Err("injected commit failure (FLINT_BATCH_COMMIT_FAIL)".into());
+    }
     match rocks {
         Some(r) => r.apply_writes(ops).map_err(|e| e.to_string()),
         None => {
