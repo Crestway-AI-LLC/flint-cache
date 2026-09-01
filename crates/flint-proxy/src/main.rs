@@ -3541,11 +3541,34 @@ fn watch_control_plane(
     topo: &Arc<Topology>,
     last_version: &mut u64,
 ) -> std::io::Result<()> {
-    // Same internal-mesh client credentials as the backend hop: the control
-    // plane is part of the mesh, so one --internal-* triple covers both.
-    let mut stream = flint_tls::connect_reloadable(cp, &topo.backend_tls)?;
-    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+    // BUG-0081. SAY WHICH CALL FAILED.
+    //
+    // connect, write and read all reached the caller as an undifferentiated
+    // io::Error, so the log line named a seat and a message and not a PHASE.
+    // That is why the filed diagnosis -- "EAGAIN on a watch socket is a read
+    // timeout, the CP had nothing to push" -- went unchallenged: it is a
+    // plausible reading of the message, and nothing in the output could
+    // contradict it.
+    //
+    // The timings do. The rotation loop sleeps 1s per attempt, an attempt
+    // that reaches the read and finds an idle CP costs the 30s set below, and
+    // the CP sends nothing while idle -- so an idle seat logs every ~31s, not
+    // once a second as observed. The error therefore arose BEFORE the read,
+    // which no amount of staring at the message could establish and a phase
+    // label states outright.
+    //
+    // ADR-0028: the verdict must name what it examined.
+    let phase = |p: &'static str| {
+        move |e: std::io::Error| std::io::Error::new(e.kind(), format!("{p}: {e}"))
+    };
+    let mut stream =
+        flint_tls::connect_reloadable(cp, &topo.backend_tls).map_err(phase("connect"))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .map_err(phase("set_read_timeout"))?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .map_err(phase("set_write_timeout"))?;
     let mut out = Vec::new();
     encode(
         &Value::Array(Some(vec![
@@ -3555,7 +3578,7 @@ fn watch_control_plane(
         ])),
         &mut out,
     );
-    stream.write_all(&out)?;
+    stream.write_all(&out).map_err(phase("write CPWATCH"))?;
     let mut buf: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 64 * 1024];
     loop {
@@ -3619,11 +3642,13 @@ fn watch_control_plane(
                         ])),
                         &mut out,
                     );
-                    stream.write_all(&out)?;
+                    stream.write_all(&out).map_err(phase("write ACK"))?;
                 }
             }
             Ok(Decoded::NeedMore) => {
-                let n = stream.read(&mut chunk)?;
+                // The idle case lands here after 30s. Labelled so a future reader
+                // does not have to re-derive which call it was.
+                let n = stream.read(&mut chunk).map_err(phase("read"))?;
                 if n == 0 {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::UnexpectedEof,
