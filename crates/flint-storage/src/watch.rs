@@ -85,10 +85,28 @@ impl WatchTable {
 
 /// A store that reports every mutation to a `WatchTable`.
 ///
-/// Wrapping at the `Kv` layer rather than at the command layer is what
-/// makes the coverage total: the GC sweeper's deletes, a read path's lazy
-/// expiry, a transaction's commit and the async queue's commit all reach
-/// the store through here, and none of them passes the command layer.
+/// Wrapping at the `Kv` layer rather than at the command layer catches what
+/// the command layer cannot: the GC sweeper's deletes, a read path's lazy
+/// expiry, and a transaction's commit all reach the store through here and
+/// none of them passes the command layer.
+///
+/// IT IS NOT TOTAL, and this comment used to say it was. Two paths commit
+/// UNDERNEATH the wrapper, straight to `RocksKv::apply_writes`, and so are
+/// invisible to it:
+///
+///   - the async write queue (`write_queue.rs`)
+///   - ADR-0027's batched pure writes (`commit_pending`)
+///
+/// Both bump this table explicitly at commit, and must keep doing so: a
+/// missed bump means a watcher never sees the change and `EXEC` commits when
+/// it must abort, which is a silent wrong answer rather than an error. That
+/// is BUG-0080, and the sentence claiming total coverage is exactly why it
+/// went unnoticed for as long as it did — a comment asserting a property
+/// nothing checks is worth less than no comment.
+///
+/// So: any NEW path that writes under this wrapper owes the table a bump.
+/// `write_queue`'s is pinned by `a_queued_write_bumps_the_watch_table`, which
+/// fails if the bump is removed.
 pub struct WatchedKv {
     under: Arc<dyn Kv>,
     table: Arc<WatchTable>,

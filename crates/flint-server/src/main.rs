@@ -2389,6 +2389,7 @@ fn main() -> std::io::Result<()> {
                         rk,
                         flint_storage::strings::system_clock,
                         limits,
+                        Arc::clone(&watch),
                     ))
                 }
                 (Some(_), None) => {

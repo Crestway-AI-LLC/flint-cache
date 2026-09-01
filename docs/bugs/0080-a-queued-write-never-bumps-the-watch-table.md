@@ -1,4 +1,4 @@
-# BUG-0080 — a queued write never bumps the watch table, so EXEC commits when it must abort (OPEN)
+# BUG-0080 — a queued write never bumps the watch table, so EXEC commits when it must abort (FIXED 2026-09-01)
 
 **Found** 2026-08-31, while fixing the same defect in ADR-0027's batching path.
 Not introduced by that work: this one is in the async write queue (ADR-0005
@@ -70,3 +70,34 @@ must abort, which nothing permits.
 assertion is exactly why this went unnoticed. Either the claim comes out or a
 test pins it — a comment that says "everything reaches the store through here"
 is worth nothing without something that fails when a path stops doing so.
+
+
+## Fixed 2026-09-01
+
+`WriteQueue::start` and its consumer now take the `WatchTable`, and the
+consumer bumps every key in the batch immediately BEFORE `apply_writes`, as
+`commit_pending` does for ADR-0027. The ordering is the one this file argued
+for: a spurious bump can only abort a transaction that might have committed,
+which WATCH permits; a missed one commits a transaction that must abort.
+
+Pinned by `a_queued_write_bumps_the_watch_table`, and pinned as a POSITIVE
+CONTROL rather than an assertion that happens to hold: with the bump removed
+it fails on the same line, with it restored it passes.
+
+Two details cost a first attempt, both worth keeping:
+
+- **The table is STRIPED and keyed by the STORAGE key.** A test that checks
+  `version(b"watched:key")` reads a different stripe from the namespaced key
+  the queue actually writes, and reports no change however well the bump
+  works. The test asks the engine which key it holds rather than
+  reconstructing the encoding, so a change to the encoding cannot quietly
+  turn it green.
+- **The consumer takes `write_lock::lock_all()`**, so the test drives the
+  global write locks and has to hold `test_serial()`.
+
+`watch.rs`'s claim that coverage is total has been corrected rather than left
+standing. It named the async queue as one of the paths that "reach the store
+through here", which was the opposite of true, and that sentence is the
+reason this went unnoticed. It now names both paths that commit underneath
+the wrapper — the queue and ADR-0027's batch — and says they owe the table an
+explicit bump.

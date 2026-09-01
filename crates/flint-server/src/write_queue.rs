@@ -152,6 +152,7 @@ impl WriteQueue {
     /// Spawn the consumer and return the handle. `store` is the real store
     /// (dispatched through the BatchingKv); `rocks` commits the batch.
     #[cfg(feature = "rocks")]
+    #[allow(clippy::too_many_arguments)]
     pub fn start(
         scope: AsyncScope,
         cap: usize,
@@ -159,6 +160,7 @@ impl WriteQueue {
         rocks: Arc<RocksKv>,
         clock: flint_storage::strings::Clock,
         limits: Limits,
+        watch: Arc<flint_storage::watch::WatchTable>,
     ) -> Arc<Self> {
         let hard_cap = cap.max(1);
         let (tx, rx) = sync_channel::<WriteJob>(hard_cap);
@@ -170,7 +172,7 @@ impl WriteQueue {
             hard_cap,
             soft_cap: AtomicUsize::new(hard_cap),
         });
-        std::thread::spawn(move || consumer(rx, store, rocks, clock, limits, depth));
+        std::thread::spawn(move || consumer(rx, store, rocks, clock, limits, depth, watch));
         q
     }
 
@@ -277,6 +279,7 @@ impl WriteQueue {
 }
 
 #[cfg(feature = "rocks")]
+#[allow(clippy::too_many_arguments)]
 fn consumer(
     rx: Receiver<WriteJob>,
     store: Arc<dyn Kv>,
@@ -284,6 +287,7 @@ fn consumer(
     clock: flint_storage::strings::Clock,
     limits: Limits,
     depth: Arc<AtomicUsize>,
+    watch: Arc<flint_storage::watch::WatchTable>,
 ) {
     while let Ok(first) = rx.recv() {
         // Drain up to BATCH_MAX already-queued jobs (non-blocking) so one
@@ -312,9 +316,30 @@ fn consumer(
                 Dispatcher::with_limits(&batching, clock, limits, &job.ns).dispatch(&job.args);
             pending.push((reply, job.reply));
         }
+        // BUMP THE WATCH TABLE FOR EVERY KEY IN THE BATCH (BUG-0080).
+        //
+        // `WatchedKv` bumps on put/delete, which is how a write records itself
+        // against a WATCH -- but a queued write never reaches it: it buffers
+        // in BatchingKv and commits through `RocksKv::apply_writes` DIRECTLY,
+        // underneath the wrapper. Without this a watcher cannot see the
+        // change and EXEC commits when it must abort: a silent wrong answer,
+        // not an error.
+        //
+        // Whether a write is deferred depends on the CONNECTION's opt-in
+        // scope; WATCH is a promise about a KEY, held by whoever is watching
+        // it. Those two do not line up, which is the whole defect.
+        //
+        // BEFORE the commit, deliberately, and the directions are not
+        // symmetric: a spurious bump can only abort a transaction that might
+        // have committed, which WATCH permits -- it is optimistic. A MISSED
+        // bump commits one that must abort, which nothing permits.
+        let ops = batching.into_ops();
+        for (k, _) in &ops {
+            watch.bump(k);
+        }
         // Commit the whole batch as ONE engine write, THEN release the acks —
         // durability is amortized across the batch, never weakened.
-        if let Err(e) = rocks.apply_writes(&batching.into_ops()) {
+        if let Err(e) = rocks.apply_writes(&ops) {
             let msg = Value::Error(format!("ERR batch write failed: {e}"));
             for (_, tx) in pending {
                 let _ = tx.send(msg.clone());
@@ -324,6 +349,99 @@ fn consumer(
         for (reply, tx) in pending {
             let _ = tx.send(reply);
         }
+    }
+}
+
+#[cfg(all(test, feature = "rocks"))]
+mod watch_tests {
+    use super::*;
+
+    /// BUG-0080: a write committed by the QUEUE must record itself against a
+    /// WATCH, or `EXEC` commits when it must abort.
+    ///
+    /// The queue commits through `RocksKv::apply_writes` directly, underneath
+    /// the `WatchedKv` wrapper that normally does the bumping, so the wrapper
+    /// never sees a queued write. This asserts the version MOVED, which is
+    /// the observable a watcher checks, and it fails on the code as it stood
+    /// before the fix -- the version simply never changed.
+    ///
+    /// Asserted on the version rather than through a whole MULTI/EXEC because
+    /// the version is the thing WATCH is built on; a transaction test would
+    /// pass or fail for a longer list of reasons.
+    #[test]
+    fn a_queued_write_bumps_the_watch_table() {
+        // The consumer takes `write_lock::lock_all()` for each batch, so this
+        // test drives the global write locks and must not run beside another
+        // that does. That is what test_serial exists for.
+        let _serial = crate::write_lock::test_serial();
+        // A monotonic counter, not the thread id: ids are reused once a
+        // thread exits, and two tests naming one directory is how a rocks
+        // test passes alone and fails in the full run.
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "flint-q-watch-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let rocks = Arc::new(flint_storage::rocks::RocksKv::open(&dir).expect("open rocks"));
+        let watch = Arc::new(flint_storage::watch::WatchTable::new());
+        // The store is the WATCHED wrapper, exactly as the server builds it:
+        // if the queue happened to write through here the bump would come for
+        // free, and the test would prove nothing. It does not -- the queue
+        // commits to `rocks` underneath -- which is the defect.
+        let store: Arc<dyn Kv> = Arc::new(flint_storage::watch::WatchedKv::new(
+            rocks.clone(),
+            Arc::clone(&watch),
+        ));
+
+        let q = WriteQueue::start(
+            AsyncScope::All,
+            64,
+            store,
+            Arc::clone(&rocks),
+            flint_storage::strings::system_clock,
+            Limits::default(),
+            Arc::clone(&watch),
+        );
+
+        let key = b"watched:key".to_vec();
+        let reply = q.submit(
+            b"ns".to_vec(),
+            vec![b"SET".to_vec(), key.clone(), b"v".to_vec()],
+        );
+        assert!(
+            matches!(reply, Value::Simple(ref s) if s == "OK"),
+            "the queued write did not commit: {reply:?}"
+        );
+
+        // The table is STRIPED and keyed by the STORAGE key, which is the
+        // namespaced form and not the one submitted -- checking
+        // `version(b"watched:key")` reads a different stripe and reports no
+        // change however well the bump works. So ask the engine which key it
+        // actually holds rather than reconstructing the encoding here, where
+        // a change to it would quietly turn this test green.
+        let mut stored: Option<Vec<u8>> = None;
+        rocks.for_each_prefix(b"", &mut |k, _| {
+            if k.windows(key.len()).any(|w| w == &key[..]) {
+                stored = Some(k.to_vec());
+                false
+            } else {
+                true
+            }
+        });
+        let stored = stored.expect("the queued write never reached the engine");
+
+        // Nothing else in this test can bump: the queue commits UNDER the
+        // WatchedKv wrapper, so a non-zero version here is the fix and only
+        // the fix. Before it, this stripe stayed at 0.
+        assert_ne!(
+            watch.version(&stored),
+            0,
+            "a queued write left its watch stripe at 0: a watcher cannot see \
+             the change, so EXEC commits when it must abort (BUG-0080)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
