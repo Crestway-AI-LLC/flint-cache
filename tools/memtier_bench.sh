@@ -11,6 +11,8 @@
 #   B  mixed 1:10     SET:GET=1:10, gaussian keys over the loaded range
 #   C  pipelined GET  scenario A with --pipeline=16 (throughput shape)
 #   D  SET only       100% SET — the PUT number, isolated
+#   E  pipelined SET  scenario D with --pipeline=16 — the row where batching
+#                     (ADR-0027) is visible at all; D's depth of 1 hides it
 # Each runs 30s after a data load. Values 1024B RANDOM (incompressible —
 # constant values compress ~15:1 in the engine and fake residency).
 #
@@ -100,6 +102,12 @@ scenarios(){
   # write a cache actually serves. Writing fresh keys instead would measure
   # the fill path (and grow the dataset mid-run, moving the read rows).
   run "D-set-only"     --ratio=1:0 --key-pattern=G:G
+  # E exists because D cannot show what ADR-0027 did. Batching commits a RUN
+  # of consecutive pure writes as one engine WriteBatch, and at pipeline=1
+  # a run holds one command -- so D measures the write path with the feature
+  # switched off by the client, not off by configuration. Measured off-box
+  # against a pre-ADR-0027 build on one fleet: 3.0x here, 1.00x at D's depth.
+  run "E-set-pipe16"   --ratio=1:0 --key-pattern=G:G --pipeline=16
 }
 
 echo
