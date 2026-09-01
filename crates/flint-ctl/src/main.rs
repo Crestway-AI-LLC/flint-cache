@@ -808,18 +808,46 @@ fn info_field(
 /// `info_field` because that one asks FLINTINFO, which only data nodes
 /// serve — asking a CP for it is how "the CP has no build" reads as "the
 /// CP is down".
+/// BUG-0083. Turn a PROXYSTATS/CPINFO reply into one of THREE answers, so a
+/// caller can tell "the seat named no such field" from "the seat refused" from
+/// "I could not read it".
+///
+/// Pulled out as its own function so the classification is testable without a
+/// live seat. The bug it fixes existed because a `let ... else { return None }`
+/// asserted a distinction it did not make, and nothing could check the claim.
+fn field_from_reply(reply: &Value, field: &str) -> Result<Option<String>, String> {
+    match reply {
+        Value::Bulk(Some(raw)) => Ok(String::from_utf8_lossy(raw)
+            .split(['\r', '\n'])
+            .find(|l| l.starts_with(field))
+            .map(|l| l.trim_start_matches(field).trim().to_string())),
+        // The seat ANSWERED and refused, which is a different fact from not
+        // answering at all. `-NOAUTH` lands here.
+        Value::Error(e) => Err(format!("the seat answered: {e}")),
+        other => Err(format!("unexpected reply: {other:?}")),
+    }
+}
+
 fn cpinfo_field(
     addr: &str,
     tls: &Option<Arc<flint_tls::ClientConfig>>,
     field: &str,
-) -> Option<String> {
-    let Ok(Value::Bulk(Some(raw))) = call(addr, tls, &["CPINFO"]) else {
-        return None;
-    };
-    String::from_utf8_lossy(&raw)
-        .split(['\r', '\n'])
-        .find(|l| l.starts_with(field))
-        .map(|l| l.trim_start_matches(field).trim().to_string())
+) -> Result<Option<String>, String> {
+    // BUG-0083, second instance. Identical shape to `proxystats_field`, and
+    // it feeds the same fatal `assert_build` for the CP seat. The compiler
+    // found it: changing the proxy read's type made this call site refuse to
+    // build, and wrapping it in `Ok(..)` to silence that would have asserted
+    // "the read succeeded and named nothing" about a read that may have
+    // failed.
+    //
+    // `cpinfo_controllers` three functions below already states the rule this
+    // one broke -- "None when the CP could not be reached at all, which is
+    // different from an empty list" -- so the distinction was known here and
+    // simply not made.
+    match call(addr, tls, &["CPINFO"]) {
+        Ok(v) => field_from_reply(&v, field),
+        Err(e) => Err(format!("could not read CPINFO: {e}")),
+    }
 }
 
 /// The `controller:` rows a CP is repeating back. `None` when the CP could
@@ -897,7 +925,7 @@ fn journal_head(
 /// `call_seq_on(.., edge)` already dials the client port with the edge SNI,
 /// and `edge_tls_client` is None on a plaintext fleet, so ONE path now
 /// serves both rather than a branch that opts out of asking.
-fn proxystats_field(inv: &Inventory, i: usize, field: &str) -> Option<String> {
+fn proxystats_field(inv: &Inventory, i: usize, field: &str) -> Result<Option<String>, String> {
     let tls = edge_tls_client(inv);
     // PRESENT THE ADMIN TOKEN when the inventory has one. PROXYSTATS is an
     // operator surface: once the CP has pushed the admin digest (ADR-0006
@@ -917,19 +945,36 @@ fn proxystats_field(inv: &Inventory, i: usize, field: &str) -> Option<String> {
         None => vec![vec!["PROXYSTATS"]],
     };
     let seq: Vec<&[&str]> = cmds.iter().map(|c| c.as_slice()).collect();
-    let Ok(Value::Bulk(Some(raw))) = call_seq_on(
+    // BUG-0083: DISTINGUISH "the proxy says no build" FROM "I could not ask".
+    //
+    // This was `let Ok(Value::Bulk(Some(raw))) = ... else { return None }`, so
+    // a connect refused mid-restart, an unfinished TLS handshake, a read
+    // timeout, an error reply such as -NOAUTH, and a proxy genuinely naming no
+    // build all became the same `None`. `roll_edge` treats None as FATAL after
+    // it has already rolled every seat, so one missed read turned a finished
+    // roll into "came up but would not report a build".
+    //
+    // When that fired on the gate the failure tail carried no timeout, no
+    // connection error and no -NOAUTH: the log could not name the cause
+    // because the class was discarded before anything could log it. That is
+    // the defect demonstrating itself, and it means no run -- including the
+    // next one -- can say which transient it hit.
+    //
+    // So the first fix is to make the failure SAYABLE. Retrying is not done
+    // here on purpose: which transient fires is still unknown, and choosing a
+    // remedy before the evidence exists is how the three prior instances
+    // (rc.29, #102, rc.47) each removed one way to fail while leaving the
+    // single attempt in place.
+    match call_seq_on(
         &proxy_dial(inv, i),
         &tls,
         &seq,
         Duration::from_millis(1500),
         inv.client_tls,
-    ) else {
-        return None;
-    };
-    String::from_utf8_lossy(&raw)
-        .split(['\r', '\n'])
-        .find(|l| l.starts_with(field))
-        .map(|l| l.trim_start_matches(field).trim().to_string())
+    ) {
+        Ok(v) => field_from_reply(&v, field),
+        Err(e) => Err(format!("could not read PROXYSTATS: {e}")),
+    }
 }
 
 // ---------- process runner (local; pidfiles for stop/status) ----------
@@ -4202,9 +4247,11 @@ fn status(inv: &Inventory) {
     let mut controller_rows: Vec<String> = Vec::new();
     for seat in &inv.cp {
         let ok = matches!(call(seat, &tls, &["PING"]), Ok(Value::Simple(s)) if s == "PONG");
-        let build = cpinfo_field(seat, &tls, "build:")
-            .map(|b| flint_build::display(&b, env!("CARGO_PKG_VERSION")).to_string())
-            .unwrap_or_else(|| "-".into());
+        let build = match cpinfo_field(seat, &tls, "build:") {
+            Ok(Some(b)) => flint_build::display(&b, env!("CARGO_PKG_VERSION")).to_string(),
+            Ok(None) => "-".into(),
+            Err(e) => format!("<unreadable: {e}>"),
+        };
         println!(
             "cp        {seat}  {:<6} build {build}",
             if ok { "up" } else { "DOWN" }
@@ -4237,9 +4284,14 @@ fn status(inv: &Inventory) {
         // The proxy's client port is plaintext (frontend TLS is separate
         // from the internal mesh): probe it without the mesh cert.
         let up = proxy_up(inv, i);
-        let build = proxystats_field(inv, i, "build:")
-            .map(|b| flint_build::display(&b, env!("CARGO_PKG_VERSION")).to_string())
-            .unwrap_or_else(|| "-".into());
+        // BUG-0083: "-" now means the proxy answered and named no build.
+        // A failure to ASK says so instead, rather than hiding behind the
+        // same dash.
+        let build = match proxystats_field(inv, i, "build:") {
+            Ok(Some(b)) => flint_build::display(&b, env!("CARGO_PKG_VERSION")).to_string(),
+            Ok(None) => "-".into(),
+            Err(e) => format!("<unreadable: {e}>"),
+        };
         println!(
             "proxy     {proxy}  {:<6} build {build}",
             if up { "up" } else { "DOWN" }
@@ -4345,11 +4397,19 @@ fn status_json(inv: &Inventory) {
     for (i, seat) in inv.cp.iter().enumerate() {
         let up = matches!(call(seat, &tls, &["PING"]), Ok(Value::Simple(s)) if s == "PONG");
         let build = cpinfo_field(seat, &tls, "build:");
+        let build_err = match &build {
+            Err(e) => format!(", \"build_error\": {}", json_str(e)),
+            Ok(_) => String::new(),
+        };
         out.push_str(&format!(
-            "    {{\"addr\": {}, \"up\": {}, \"build\": {}}}{}\n",
+            "    {{\"addr\": {}, \"up\": {}, \"build\": {}{build_err}}}{}\n",
             json_str(seat),
             up,
-            build.map(|b| json_str(&b)).unwrap_or("null".into()),
+            build
+                .ok()
+                .flatten()
+                .map(|b| json_str(&b))
+                .unwrap_or("null".into()),
             if i + 1 < inv.cp.len() { "," } else { "" }
         ));
         if let Some(rows) = cpinfo_controllers(seat, &tls) {
@@ -4487,12 +4547,24 @@ fn status_json(inv: &Inventory) {
 
     out.push_str("  \"proxies\": [\n");
     for (i, proxy) in inv.proxies.iter().enumerate() {
+        // BUG-0083: `build: null` means the proxy named no build. A read
+        // that failed carries `build_error` instead, so a consumer can tell
+        // the two apart -- ADR-0014's status surface is parsed by things
+        // that cannot ask a follow-up question.
         let build = proxystats_field(inv, i, "build:");
+        let build_err = match &build {
+            Err(e) => format!(", \"build_error\": {}", json_str(e)),
+            Ok(_) => String::new(),
+        };
         out.push_str(&format!(
-            "    {{\"addr\": {}, \"up\": {}, \"build\": {}}}{}\n",
+            "    {{\"addr\": {}, \"up\": {}, \"build\": {}{build_err}}}{}\n",
             json_str(proxy),
             proxy_up(inv, i),
-            build.map(|b| json_str(&b)).unwrap_or("null".into()),
+            build
+                .ok()
+                .flatten()
+                .map(|b| json_str(&b))
+                .unwrap_or("null".into()),
             if i + 1 < inv.proxies.len() { "," } else { "" }
         ));
     }
@@ -5775,8 +5847,25 @@ fn roll_edge(inv: &Inventory, envs: &[(String, String)], expect_build: &Option<S
     // Skipped without --version-tag, exactly like the node assertion: there
     // is nothing to compare against, and inventing an expectation would
     // make a source build unrollable.
-    let assert_build = |seat: &str, got: Option<String>| {
+    // BUG-0083: three outcomes, not two. A read that FAILED is now its own
+    // case and says which failure it was, instead of arriving as the same
+    // `None` a proxy sends when it genuinely names no build. The abort still
+    // happens -- a roll that cannot be verified must not report success --
+    // but it can now be diagnosed from the log it leaves, which is exactly
+    // what the failing gate run could not do.
+    let assert_build = |seat: &str, got: Result<Option<String>, String>| {
         let Some(want) = expect_build else { return };
+        let got = match got {
+            Ok(got) => got,
+            Err(e) => die_on(
+                seat,
+                format!(
+                    "could not be asked for its build: {e}. This is a FAILED READ, \
+                     not a proxy reporting no build -- retry the roll, and if it \
+                     persists the cause is now named (BUG-0083)"
+                ),
+            ),
+        };
         match got {
             Some(got) if &got == want => eprintln!("  {seat} reports {got}"),
             Some(got) => die_on(
@@ -7142,6 +7231,78 @@ mod reconverge_message_tests {
             reconverge_failure("a:1", "b:2", Some("9"), "?", "?"),
         ] {
             assert!(m.contains("a:1") && m.contains("b:2"), "{m}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod build_read_tests {
+    use super::field_from_reply;
+    use flint_resp::Value;
+
+    fn bulk(s: &str) -> Value {
+        Value::Bulk(Some(s.as_bytes().to_vec()))
+    }
+
+    /// The happy path, and the only one the old code got right.
+    #[test]
+    fn a_named_field_is_returned() {
+        let r = bulk("role:proxy\r\nbuild:v0.1.0-rc.67\r\n");
+        assert_eq!(
+            field_from_reply(&r, "build:")
+                .expect("a well-formed bulk reply is not a read failure")
+                .as_deref(),
+            Some("v0.1.0-rc.67")
+        );
+    }
+
+    /// BUG-0083's core distinction. The seat ANSWERED and has no such field:
+    /// that is `Ok(None)`, a fact about the seat. Every case below is `Err`,
+    /// a fact about the READ. The old code returned `None` for all four.
+    #[test]
+    fn answered_without_the_field_is_not_the_same_as_a_failed_read() {
+        let answered = bulk("role:proxy\r\nuptime_ms:12\r\n");
+        assert_eq!(field_from_reply(&answered, "build:"), Ok(None));
+
+        // -NOAUTH: the seat replied, and refused.
+        let refused = Value::Error("NOAUTH admin token required for this command".into());
+        let e = field_from_reply(&refused, "build:")
+            .expect_err("an error reply must not be reported as a seat naming no build");
+        assert!(
+            e.contains("NOAUTH"),
+            "the refusal must survive into the message: {e}"
+        );
+
+        // A reply of an unexpected shape is also not "no build".
+        for odd in [Value::Integer(1), Value::Bulk(None), Value::Array(None)] {
+            assert!(
+                field_from_reply(&odd, "build:").is_err(),
+                "{odd:?} must not be reported as a seat naming no build"
+            );
+        }
+    }
+
+    /// The property the fix exists for, stated as one assertion: no failure
+    /// may be indistinguishable from `Ok(None)`. This is the test that fails
+    /// against the pre-BUG-0083 code, where every arm collapsed to `None`.
+    #[test]
+    fn no_failure_is_reported_as_a_seat_naming_no_field() {
+        let answered_no_field = field_from_reply(&bulk("role:proxy\r\n"), "build:");
+        assert_eq!(answered_no_field, Ok(None));
+
+        let failures = [
+            Value::Error("NOAUTH admin token required".into()),
+            Value::Integer(0),
+            Value::Bulk(None),
+        ];
+        for f in &failures {
+            assert_ne!(
+                field_from_reply(f, "build:"),
+                answered_no_field,
+                "{f:?} is indistinguishable from a seat that named no build -- \
+                 this is exactly BUG-0083, where roll_edge aborted a completed \
+                 roll and the log could not say why"
+            );
         }
     }
 }
