@@ -22,22 +22,34 @@ fast enough that you stop thinking about it.
 
 ## Our numbers
 
-**Current build, measured off-box (2026-08-17).** Client on a *separate*
+**Current build, measured off-box (2026-09-01).** Client on a *separate*
 machine from the server, so every number includes a real network hop: two
 `i4i.2xlarge` in one AZ, 20 M × 1 KB incompressible values, 32 connections,
-`memtier_benchmark`. End to end — client → TLS → token auth → proxy → storage
-engine and back. The wire alone measured **95 µs p50**, so roughly a third of
-each read is the network.
+`memtier_benchmark`. End to end — client → token auth → proxy → storage engine
+and back. The wire alone measured **93 µs p50**, so roughly a third of each
+read is the network.
 
 | scenario | throughput | p50 | p99 | p99.9 |
 |---|---|---|---|---|
-| GETs, hot slice | 96,116/s | **0.32 ms** | **0.61 ms** | 0.98 ms |
-| Mixed 1:10 write:read | 96,480/s | 0.32 ms | 0.61 ms | 0.99 ms |
-| GETs, pipelined ×16 (512 in flight) | 228,484/s | 2.24 ms | 2.86 ms | 4.26 ms |
-| SETs (WAL before ack) | 87,449/s | 0.35 ms | 0.71 ms | 4.58 ms |
+| GETs, hot slice | 90,775/s | **0.34 ms** | **0.63 ms** | 0.95 ms |
+| Mixed 1:10 write:read | 90,730/s | 0.34 ms | 0.62 ms | 0.91 ms |
+| GETs, pipelined ×16 (512 in flight) | 280,411/s | 1.74 ms | 3.57 ms | 5.86 ms |
+| SETs (WAL before ack) | 69,340/s | 0.41 ms | 3.47 ms | 6.62 ms |
+| SETs, pipelined ×16 (512 in flight) | 151,056/s | 2.10 ms | 42.75 ms | 52.48 ms |
 
 Every row is the *worse* of two independent runs. This dataset fits the box's
 61 GB of RAM, so it measures the request path, not the beyond-RAM case.
+
+**Against the 2026-08-17 measurement, only the pipelined rows moved.** GETs,
+Mixed and SETs are within this rig's run-to-run spread — the two SET runs
+behind that row differed by 11% between themselves, which is wider than the
+gap to the older figure, so it is not read as a change. Pipelined GETs are up
+**23%** here and 4% on the beyond-RAM fleet below.
+
+The pipelined SET row is new, and it is new for a reason: at pipeline 1 a
+batched write run holds one command, so the row above it cannot show what
+batching does. An A/B against a pre-batching build on one fleet
+measured **3.0×** at depth 16 and **1.00×** at depth 1.
 
 **The pipelined row is measured differently from the rest.** It runs 16
 requests deep on each of the 32 connections — **512 in flight, not 32** — so
@@ -47,32 +59,69 @@ beside it. Most clients do not pipeline by default — `redis-benchmark` and
 `memtier_benchmark` both ship with it off — so the hot-slice row is the one an
 ordinary application sees.
 
-**The beyond-RAM case (2026-08-18, same build, same fleet shape).** The
+**The beyond-RAM case (2026-09-01, same build, same fleet shape).** The
 dataset that does not fit: 100 M × 1 KB keys measuring **121 GB on NVMe
 against 61 GB of RAM**, so a real share of every read has to reach the disk.
-Same client machine, same 32 connections, same 4 proxy workers, wire 94.5 µs
-against the 95.1 µs above — the two tables differ in dataset size and almost
-nothing else.
+Same client machine, same 32 connections, same 4 proxy workers — the two
+tables differ in dataset size and almost nothing else.
+
+**No wire decomposition for these rows.** The RTT probe failed to build on
+this fleet, so there is no split of read latency into network and server
+here; the 93 µs above was measured on the other fleet, not this one.
 
 | scenario | throughput | p50 | p99 | p99.9 |
 |---|---|---|---|---|
-| GETs, hot slice | 78,827/s | **0.39 ms** | **0.94 ms** | 1.67 ms |
-| Mixed 1:10 write:read | 75,406/s | 0.41 ms | 0.98 ms | 1.79 ms |
-| GETs, pipelined ×16 (512 in flight) | 181,035/s | 2.78 ms | 6.18 ms | 8.19 ms |
-| SETs (WAL before ack) | 81,844/s | 0.38 ms | 0.77 ms | 1.25 ms |
+| GETs, hot slice | 71,925/s | **0.40 ms** | **0.98 ms** | 1.82 ms |
+| Mixed 1:10 write:read | 72,160/s | 0.42 ms | 0.90 ms | 1.72 ms |
+| GETs, pipelined ×16 (512 in flight) | 188,752/s | 2.70 ms | 5.57 ms | 8.64 ms |
+| SETs (WAL before ack) | 73,625/s | 0.42 ms | 0.78 ms | 1.20 ms |
+| SETs, pipelined ×16 (512 in flight) | 227,734/s | 2.22 ms | 3.34 ms | 4.45 ms |
 
-**Leaving RAM costs about 72 µs at GET p50 and 24 µs at SET.** Reads pay,
+Worse of two runs, as above.
+
+**Past RAM, pipelined writes overtake pipelined reads** — 227,734/s against
+188,752/s. That is the same asymmetry the paragraph below describes, at
+sixteen deep: a write goes to the WAL and the memtable and never reads the
+data set, so the size of the data set barely reaches it, while a read past
+memory must sometimes go to NVMe.
+
+**Leaving RAM costs about 56 µs at GET p50 and 16 µs at SET.** Reads pay,
 because past memory a share of them must reach NVMe. Writes barely notice — a
 write goes to the WAL and the memtable and never reads the data set, so its
 size hardly reaches it. The medium is only in the read path, and a result
 that slowed both equally would have meant something else was wrong.
 
-One run, said plainly rather than averaged in: a second was still loading when
-the test fleet's lifetime expired. Every write went through the full
-persistent path, WAL before the ack, fsync on a bounded cadence. Reads are
+Every write went through the full persistent path, WAL before the ack, fsync on a bounded cadence. Reads are
 hit-dominated — the corpus is loaded with full key coverage, so these are not
 flattered by cheap misses. The harness is in this repo:
 `tools/memtier_bench.sh`.
+
+### Bulk loading
+
+Every row above is `memtier_benchmark`, which keeps a sliding window
+continuously full. A bulk loader does not: it writes a batch and then blocks
+for the replies before composing the next one. That pause used to be
+expensive — the node did not set `TCP_NODELAY` on accepted sockets, so a reply
+written while the loader's own send was still in flight sat waiting on the
+peer's delayed-ACK timer, about 50 ms per round trip once a request passed the
+16 KiB the node reads at a time. It never showed up in the table above,
+because a client that never stops sending never creates the pause.
+
+Measured with a batch-and-wait client through the same proxy edge, 1 KB
+values, on the 20 GB fleet:
+
+| connections | batch | writes/s |
+|---|---|---|
+| 1 | 16 | 48,490 |
+| 1 | 64 | 70,759 |
+| 8 | 16 | 117,584 |
+| 8 | 64 | 156,524 |
+
+The same measurement on the same path before the fix read **690 writes/s per
+connection**. It is a separate table from the ones above on purpose: it is a
+different load generator, and two tools in one table with only one of them
+named is how a number gets quoted against a row it was never comparable to.
+
 
 ## Scale is a property of the architecture
 
