@@ -181,3 +181,59 @@ also "re-seeds" — endlessly.
   snapshot machinery exists (`--rewind-snaps`) and may be a better re-seed
   source than a live checkpoint, but it changes what a re-seed *is* and
   deserves its own decision.
+
+## Amendment 2026-08-31: the sequence threshold is derived from an unchecked assumption
+
+The shed threshold is a byte budget converted into a SEQUENCE count:
+
+```
+threshold_seq = (wal_size_limit_mb * 1MiB / 2) / ASSUMED_BYTES_PER_SEQ   // 16 KiB
+```
+
+`ASSUMED_BYTES_PER_SEQ` had never been measured. It has now been, directly:
+**bytes per sequence is exactly the size of one write**, because RocksDB
+numbers sequences per key. At depth 64, batchable `SET`:
+
+| value size | bytes per sequence | vs the assumed 16 KiB |
+|---|---|---|
+| 32 B | 32 | 0.002x |
+| 1 KiB | 1024 | 0.06x |
+| 16 KiB | 16384 | **1.00x** |
+
+The constant is exactly right at 16 KiB values and wrong by the ratio at any
+other size. Because the conversion DIVIDES by it, an over-large value yields a
+threshold that is too small and the gate fires **early** — 16x early at the
+~1 KiB values the call site tells operators to expect, 512x early at 32 B. At
+the shipped 8 GiB archive that is backpressure at ~256 MiB of gap rather than
+the intended ~4 GiB.
+
+**Why nothing caught it.** Early is the conservative direction: a replica meets
+backpressure sooner than intended, never later, so no replica ever died of it
+and no drill could fail. `wal_headroom_drill.sh` arms its positive control by
+TIGHTENING the threshold, which proves the gate is wired and says nothing about
+whether the default corresponds to the bytes it claims. That is the same shape
+as the write deadline in ADR-0027: a control that proves the mechanism while
+the calibration is silently wrong.
+
+**And a hazard that turned out not to exist.** This was expected to be an
+ADR-0027 problem — a batched 256-key run was believed to make one ~256 KB
+sequence, which would have made the gate fire 16x LATE, the dangerous
+direction. It does not. Measured batchable `SET` against non-batchable
+`SET .. EX` at depths 1 through 256: 1024 bytes per sequence in every arm.
+Batching does not move this denominator at all, and the comment on
+`MAX_PURE_BATCH` that said it did has been corrected.
+
+### Proposed: derive it from observed writes
+
+Track bytes-per-sequence as the node actually experiences it and compute the
+threshold from that, rather than from a constant chosen for a value size
+nobody verified. This is the fix BUG-0079 argued for in general terms and did
+not implement.
+
+**Not done here, deliberately.** Correcting it moves a safety gate's firing
+point LATER — toward the hazard this ADR exists to prevent — so it needs its
+own evidence and its own drill, one that asserts the gate fires at the
+intended number of BYTES rather than at some number of sequences. BUG-0078's
+fix raises the urgency: a master can now outrun a replica far faster than when
+this threshold was chosen, so a gate that is already 16x tight will fire more
+often. `--wal-headroom-seq` overrides it in the meantime.

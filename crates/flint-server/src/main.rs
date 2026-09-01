@@ -2146,7 +2146,9 @@ fn main() -> std::io::Result<()> {
             hub.set_wal_headroom_shed_seq(v);
             eprintln!(
                 "wal headroom shed threshold: {v} sequences (half of a {budget_mb} MB \
-                 archive at an assumed 16 KiB/sequence)"
+                 archive at an assumed 16 KiB/sequence; one sequence is ONE \
+                 write, so at smaller values this gate fires earlier than the \
+                 budget implies — override with --wal-headroom-seq)"
             );
         }
     }
@@ -2936,11 +2938,18 @@ struct PendingBatch<'a> {
 
 /// How many pure writes may accumulate before the batch is forced out.
 ///
-/// Not a tuning knob so much as a bound on two things: the stripe guards held
-/// at once (an RMW writer of any of those keys waits behind the whole batch),
-/// and the size of one WAL sequence. At 1 KB values a 256-key batch makes a
-/// sequence ~256 KB, against a WAL headroom guard denominated in SEQUENCES
-/// that assumes ~16 KiB each -- see the note in `commit_pending`.
+/// A bound on the stripe guards held at once: an RMW writer of any of those
+/// keys waits behind the whole batch.
+///
+/// It is NOT a bound on the size of a WAL sequence, though this comment used
+/// to say so. RocksDB numbers sequences PER KEY, so a 256-key WriteBatch
+/// advances `latest_seq` by 256, not by one, and bytes-per-sequence is the
+/// size of a single write whether or not it was batched. Measured directly,
+/// batchable `SET` against non-batchable `SET .. EX` at depths 1 to 256:
+/// 1024 bytes per sequence in every arm at 1 KiB values, and across value
+/// sizes it is exactly the value size (32 -> 32, 1024 -> 1024, 16384 ->
+/// 16384). Batching does not move the WAL headroom guard's denominator, and
+/// the hazard this comment claimed does not exist.
 const MAX_PURE_BATCH: usize = 256;
 
 impl<'a> PendingBatch<'a> {

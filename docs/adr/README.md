@@ -18,7 +18,7 @@ lost. Format and rationale: [0001](0001-record-architecture-decisions.md).
 | [0019](0019-rewind-rejoin-promotion-fences.md) | Rewind rejoin: promotion fences make failover RTO independent of dataset size |
 | [0020](0020-proxy-backend-multiplexing.md) | Multiplex the proxy's backend hop: decouple send from receive so a pipeline survives it (proposed) |
 | [0021](0021-proxy-async-worker-model.md) | Give the proxy bounded worker threads and async IO, so backend connections have few owners (proposed) |
-| [0022](0022-wal-retention-bounded-by-replica-progress.md) | WAL retention bounded by replica progress: back-pressure before a replica meets a deleted segment |
+| [0022](0022-wal-retention-bounded-by-replica-progress.md) | WAL retention bounded by replica progress: back-pressure before a replica meets a deleted segment (amended — one sequence is ONE write, measured, so the shed threshold fires ~16x early at 1 KiB values; deriving it from observed writes is proposed) |
 | [0023](0023-slot-aligned-bulk-eviction.md) | Slot-aligned bulk eviction: drop whole SSTs by slot range, when rewriting the namespace is the wrong price (proposed) |
 | [0024](0024-boot-decision-counters-that-outlive-the-process.md) | Boot-decision counters that outlive the process: make a rejoin LOOP visible without an evidence bundle (proposed) |
 | [0025](0025-stream-collection-reads-instead-of-materialising-them.md) | Stream collection reads instead of materialising them |

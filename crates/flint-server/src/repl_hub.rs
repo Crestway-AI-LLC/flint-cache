@@ -51,6 +51,24 @@ pub const DEFAULT_WAL_HEADROOM_SHED_SEQ: u64 = 4_000_000;
 /// sees; being wrong low costs a dead replica, a widowed master, and a write
 /// path that shuts. Those are not symmetric, and the constant should not
 /// pretend they are.
+/// Bytes per WAL sequence, ASSUMED. Measured 2026-08-31: bytes-per-sequence is
+/// exactly the size of one write, because RocksDB numbers sequences per key.
+/// At depth 64, batchable `SET`, values of 32 / 1024 / 16384 bytes gave 32 /
+/// 1024 / 16384 bytes per sequence — so this constant is right at 16 KiB
+/// values and wrong by the ratio at anything else.
+///
+/// Since `headroom_shed_seq_for_budget` DIVIDES by it, a value larger than
+/// reality makes the threshold too small and the gate fires EARLY: 16x early
+/// at the ~1 KiB values the call site says to expect, 512x early at 32 B.
+/// That is the conservative direction — a replica meets backpressure sooner
+/// than intended, never later — which is why nothing has caught it. It is
+/// still wrong, and BUG-0078's fix makes it likelier to bite, because a
+/// master can now outrun a replica far faster than when this was chosen.
+///
+/// Left as-is deliberately: correcting it moves a SAFETY gate's firing point
+/// later, which needs its own evidence rather than a drive-by edit. Deriving
+/// it from observed writes is proposed in ADR-0022; `--wal-headroom-seq`
+/// overrides it today.
 const ASSUMED_BYTES_PER_SEQ: u64 = 16 * 1024;
 
 /// Shed threshold for an archive of `wal_size_limit_mb`.
@@ -59,6 +77,10 @@ const ASSUMED_BYTES_PER_SEQ: u64 = 16 * 1024;
 /// deleted segment — the intent the old constant described and, at the value
 /// size it assumed, achieved. Derived rather than fixed so the relationship
 /// survives a change to either term.
+///
+/// "At the value size it assumed" is load-bearing and was never checked: see
+/// `ASSUMED_BYTES_PER_SEQ`. Below 16 KiB values this returns a threshold
+/// smaller than the intent, in proportion.
 pub fn headroom_shed_seq_for_budget(wal_size_limit_mb: u64) -> u64 {
     let budget_bytes = wal_size_limit_mb.saturating_mul(1024 * 1024);
     (budget_bytes / 2) / ASSUMED_BYTES_PER_SEQ
