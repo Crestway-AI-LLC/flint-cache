@@ -23,7 +23,7 @@ lost. Format and rationale: [0001](0001-record-architecture-decisions.md).
 | [0024](0024-boot-decision-counters-that-outlive-the-process.md) | Boot-decision counters that outlive the process: make a rejoin LOOP visible without an evidence bundle (proposed) |
 | [0025](0025-stream-collection-reads-instead-of-materialising-them.md) | Stream collection reads instead of materialising them |
 | [0026](0026-admission-control-on-write-stall.md) | Admission control keyed on the master's own write stall, not on replica lag (proposed; amended — compaction tuning removes the collapse without shedding, so the gate is a backstop for where replica lag binds) |
-| [0027](0027-shared-stripe-locks-for-pure-writes.md) | Shared-mode stripe locks for pure writes, so a pipeline can commit as one batch (implemented; ~2.2x on 1 KB pipelined writes, its deadlock-freedom argument corrected, and the write deadline's clock repaired after batching moved the commit outside it) |
+| [0027](0027-shared-stripe-locks-for-pure-writes.md) | Shared-mode stripe locks for pure writes, so a pipeline can commit as one batch (implemented; its deadlock-freedom argument corrected, the write deadline's clock repaired after batching moved the commit outside it, and its ~2.2x demoted to a measurement OWED -- BUG-0078 showed both arms were measured through a ~50ms TCP stall) |
 | [ADR-0022](0022-wal-retention-bounded-by-replica-progress.md) | WAL retention follows the slowest live replica; the master sheds instead of letting it die |
 
 ## Why the numbering has a gap

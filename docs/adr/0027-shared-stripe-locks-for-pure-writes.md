@@ -311,3 +311,35 @@ weakened gate.
 The guard now lives in `PendingBatch` and drops after `commit_ops`, beside the
 stripe guards and for the same reason: the write is in flight until it
 commits.
+
+### Correction 2026-08-31: the control above was measuring a TCP timer
+
+The "Measured" section leans on a coincidence — the laptop topping out at
+~83,000 sets/s and the 5-host fleet at ~80,000 seq/s, "loopback plaintext
+against mTLS across a real network, same wall" — and reads it as independent
+evidence that the ceiling is write-path bound.
+
+**Read it the other way.** Two environments that share no hardware, no
+transport and no network hitting the same number is the signature of a
+limiter that belongs to neither. BUG-0078 found it: the node never set
+`TCP_NODELAY`, so any pipeline over ~16 KiB paid a delayed ACK per round
+trip — a flat ~50 ms, identical on a laptop and on a fleet, because a timer
+does not care what it is running on. These measurements used depth-256
+pipelines of 1 KiB values, which is squarely past that threshold.
+
+With the one-line fix, one connection direct to a node goes from 5,081 to
+472,978 writes/s at that depth. So the ceiling those numbers describe was the
+timer, and the ratios in the table above compare two arms that were both
+sitting on it.
+
+**What survives.** The batching ratios are still meaningful as ratios: both
+arms paid the same stall, so the comparison is not meaningless — but it was
+taken in a regime where per-round-trip latency dominated, and the honest
+position is that **the magnitude is unverified at the real ceiling**. The
+"~2.2x on 1 KB pipelined writes" in the index should be treated as a
+measurement owed, not a result. The fleet A/B this ADR already says is owed
+is now owed for a second reason.
+
+The deadlock-freedom argument, the lock protocol and the correctness
+reasoning are untouched by this: it is only the performance claim that was
+measured through a stall.
