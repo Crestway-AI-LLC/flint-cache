@@ -5206,9 +5206,40 @@ fn roll_node(
         return Err(format!("{addr} did not come back after the binary swap"));
     }
     if let Some(want) = expect_build {
-        let got = info_field(addr, &tls, "build:").unwrap_or_default();
-        if &got != want {
-            return Err(format!("{addr} reports build {got:?}, expected {want:?}"));
+        // BUG-0083, node half. This was
+        //
+        //     let got = info_field(addr, &tls, "build:").unwrap_or_default();
+        //     if &got != want { return Err(format!("{addr} reports build {got:?} ...")) }
+        //
+        // and `unwrap_or_default()` turned a FAILED READ into `""`, so the
+        // roll aborted saying `reports build "", expected "v0.1.0-rc.67"`.
+        // That is not merely undifferentiated like the proxy half was -- it
+        // is FALSE. The node reported nothing; the sentence quotes it saying
+        // the empty string, and sends the reader hunting a build-stamping
+        // defect on a node that was never successfully asked.
+        //
+        // Three outcomes, same as `proxystats_field`, through the same tested
+        // classifier.
+        let got = match call(addr, &tls, &["FLINTINFO"]) {
+            Ok(v) => field_from_reply(&v, "build:"),
+            Err(e) => Err(format!("could not read FLINTINFO: {e}")),
+        };
+        match got {
+            Ok(Some(g)) if &g == want => {}
+            Ok(Some(g)) => {
+                return Err(format!("{addr} reports build {g:?}, expected {want:?}"));
+            }
+            Ok(None) => {
+                return Err(format!(
+                    "{addr} answered FLINTINFO but named no build, expected {want:?}"
+                ));
+            }
+            Err(e) => {
+                return Err(format!(
+                    "{addr} could not be asked for its build: {e}. This is a FAILED \
+                     READ, not a node reporting the wrong build (BUG-0083)"
+                ));
+            }
         }
     }
     // Converged again (warm restart: the tail resumes from its own data).
