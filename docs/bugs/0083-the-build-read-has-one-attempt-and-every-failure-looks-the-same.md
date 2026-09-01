@@ -163,8 +163,55 @@ that was built to be unable to say.
 This is ADR-0028's property one level down: the reading states a verdict
 (`None`) in a form nothing can refute.
 
+## The audit of the other readers — done 2026-09-01, and it found a worse one
+
+The question "does any OTHER caller collapse a failed read into a fact about
+the seat" is answered. Fourteen sites share the `let Ok(Value::Bulk(Some(..)))
+= call(..) else` shape, but the shape alone is not the bug: it becomes one only
+where a caller turns the resulting `None` into a DECISION.
+
+**The controller does not have it, and shows what right looks like.**
+`flint-controller/src/main.rs:457` falls through to `PING` and `socket_open`
+to separate "down" from "up but hiccuping", with the reason stated:
+
+> The promote decision needs this to avoid flapping a starved-but-listening
+> master to death.
+
+So the distinction is made where a wrong answer is most expensive, and was
+omitted where the consequence looked cosmetic — a build string. That build
+string aborts releases.
+
+**`roll_node` has it, and in a worse form** (`flint-ctl/src/main.rs:5209`):
+
+```rust
+let got = info_field(addr, &tls, "build:").unwrap_or_default();
+if &got != want {
+    return Err(format!("{addr} reports build {got:?}, expected {want:?}"));
+}
+```
+
+`unwrap_or_default()` turns a failed read into `""`, and the message then reads
+
+    <addr> reports build "", expected "v0.1.0-rc.67"
+
+which is not merely undifferentiated, it is FALSE. The node reported nothing;
+the sentence says it reported the empty string. A reader trusting that message
+would go looking for a build-stamping defect on a node that was never asked
+successfully. The proxy version at least said something true and unhelpful.
+
+This is the NODE half of the same roll, so both tiers of `flintctl upgrade`
+carry the defect, and `4273` is the same `unwrap_or_default()` pattern in the
+status path.
+
+**Not fixed in this pass.** `info_field` is used widely across flintctl and
+changing its type touches far more call sites than the two readers already
+converted; it is the next batch, not a rider on this one. Recorded here so the
+finding is not lost between gates.
+
 ## Still not established
 
-- Whether any OTHER caller of `proxystats_field` treats `None` as fatal.
+- ~~Whether any OTHER caller treats a failed read as a fact about the seat.~~
+  ANSWERED above: `roll_node` does, via `unwrap_or_default()`, and fabricates a
+  quotation while doing it.
 - Which transient actually fired. Recorded as UNKNOWN rather than guessed,
   which is the whole point of (1).
