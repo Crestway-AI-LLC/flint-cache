@@ -601,6 +601,47 @@ fleet_wait_ready() {
 # assertion after a silently failed bootstrap tests a cluster that was never
 # built. Success is a reply starting with OK (CPADDTENANT says "OK tenant
 # ..."); anything else — ERR, an empty reply, connection refused — is fatal.
+# fleet_wait_replicated <master_port> [valkey-cli opts ...] — block until every
+# live replica has ACKED everything the master has, or FAIL the drill.
+#
+# A write is acked when it is durable ON THE MASTER; the replica catches up
+# afterwards. So "I wrote it, then I killed the master and promoted the
+# replica" does NOT imply the promoted replica has it — that gap is the
+# failover RPO, and it is a property of the system, not a bug in it.
+#
+# A drill that kills a master straight after writing is therefore racing
+# replication, and the race is invisible while writes are slow. BUG-0078's
+# TCP_NODELAY fix made a pipelined corpus land ~60x faster, which turned that
+# latent race into a ~60% failure: measured on one box, same binary,
+# backup_drill went 8/8 green with the stall left in (FLINT_NAGLE_TEST=1) and
+# 3/8 with it removed. Nothing about the product changed; the drill had been
+# relying on the master being slow.
+#
+# Waits on the master's own `seq_lag`, which is latest_seq minus the slowest
+# live replica's ack, and requires a replica to actually BE there: with no
+# live replica there is nothing to catch up and a lag of 0 would mean the
+# opposite of what the caller is asking.
+fleet_wait_replicated() {
+  local port="$1"; shift
+  local deadline=$(( $(date +%s) + 30 ))
+  local lag live
+  while :; do
+    local info; info=$(valkey-cli -p "$port" "$@" FLINTINFO 2>/dev/null | tr -d '\r')
+    live=$(printf '%s\n' "$info" | grep '^live_replicas:' | cut -d: -f2)
+    lag=$(printf '%s\n' "$info" | grep '^seq_lag:' | cut -d: -f2)
+    if [ "${live:-0}" -ge 1 ] 2>/dev/null && [ "${lag:-1}" = "0" ]; then
+      return 0
+    fi
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      echo "FAIL: 127.0.0.1:$port still has seq_lag=${lag:-?} across ${live:-0}"
+      echo "      live replica(s) after 30s. Whatever this drill does next"
+      echo "      assumes the replica holds what the master was just sent."
+      exit 1
+    fi
+    sleep 0.2
+  done
+}
+
 fleet_cp() {
   local port="$1"; shift
   local r

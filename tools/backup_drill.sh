@@ -62,6 +62,14 @@ for p in 6950 6952; do
     | valkey-cli -p $p --pipe 2>&1 | tail -1
 done
 
+# The corpus was acked by the MASTER; the replica about to be promoted has it
+# only once replication catches up. Killing 6950 before then backs up a 6951
+# that is missing the tail of the corpus, which surfaces at step 9 as a key
+# that "did not survive the restore" -- a product-shaped failure with a
+# drill-shaped cause. See fleet_wait_replicated.
+fleet_wait_replicated 6950
+fleet_wait_replicated 6952
+
 echo
 echo "== fail pair 0 over BEFORE backing up, so 'the master' is not 'the first member'"
 # 6951 becomes the master of pair 0. A backup that reads position rather than
