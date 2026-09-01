@@ -42,11 +42,68 @@ dead" and "this seat has nothing to say yet".
   this never touches — the last-applied table keeps serving throughout, by
   design.
 
+## AMENDED 2026-09-01 — the mechanism above does not fit the cadence
+
+Both open questions below are answered, and answering the first invalidates
+part of the diagnosis rather than confirming it.
+
+**The read timeout is DELIBERATE.** `watch_control_plane`
+(`crates/flint-proxy/src/main.rs:3547`) sets it itself:
+
+```rust
+stream.set_read_timeout(Some(Duration::from_secs(30)))?;
+```
+
+Nothing in `flint-tls` sets the socket non-blocking, so this is a blocking
+read bounded at 30 s. By this file's own reasoning that makes the fix "treat
+`WouldBlock`/`TimedOut` as keep-waiting and do not rotate".
+
+**But that mechanism cannot produce the symptom.** The observed line repeated
+ONCE A SECOND. Walk the timings:
+
+- the rotation loop sleeps `Duration::from_millis(1000)` after each attempt
+  (`main.rs:3909`), so one second is the loop's floor, not its period
+- an attempt that reaches the read and finds an idle CP costs **30 s**
+- the control plane sends NOTHING while idle: `watch`
+  (`flint-controlplane/src/main.rs:1289`) pushes only when the version
+  advances past what the proxy ACKed, waiting on a condvar in 500 ms slices
+  with no keepalive on the wire
+
+So an idle CP yields one log line every ~31 s. To log once a second,
+`watch_control_plane` must return in ≈0 s — which means the error arises
+**before any read**, in `connect_reloadable` or `write_all`.
+
+`EAGAIN` on `connect()` has a well-known cause that fits where this was found:
+ephemeral port exhaustion. It surfaced in the tail of an `elasticache-bench
+--regime a` run, which is exactly the workload that leaves a large TIME_WAIT
+population. **Unverified** — recorded as the leading hypothesis, not a
+finding, because nothing here has been reproduced.
+
+**What this changes.** There are TWO defects, not one:
+
+1. Rotating on a benign idle timeout — real, still worth fixing, and it costs
+   a needless re-subscribe every ~31 s on an idle fleet rather than the
+   once-a-second churn described above.
+2. Whatever actually produced the observed EAGAIN, which the evidence places
+   before the read and which the proposed fix would NOT have addressed.
+
+The original writeup asserted (2) was an instance of (1). It reasoned from the
+error's meaning on a watch socket without checking the timings, and the
+timings refuse it. Same shape as BUG-0083's neighbours: a reading of a failure
+that named a cause nothing had checked.
+
+**Before fixing either, make the error say where it came from.** `connect`,
+`write` and `read` all reach `eprintln!("control-plane watch ({cp}): {e}")` as
+the same undifferentiated `io::Error`, which is why this cost a code read to
+establish and is still unresolved. That is ADR-0028's obligation and BUG-0083's
+fix, in a third place.
+
 ## Not yet established
 
-- Whether `watch_control_plane`'s socket sets a read timeout deliberately (in
-  which case the fix is to treat `WouldBlock`/`TimedOut` as "keep waiting" and
-  not rotate) or inherits one (in which case the timeout is the bug).
+- ~~Whether the socket sets a read timeout deliberately or inherits one.~~
+  ANSWERED above: deliberate, 30 s.
+- Which call actually produced the observed `EAGAIN`. The evidence places it
+  before the read; the port-exhaustion hypothesis is unverified.
 - Whether the three-seat case actually churns as predicted. It is an inference
   from the same loop, and the loop was read rather than run — worth a drill
   that counts CPWATCH subscriptions on an idle fleet before believing it.
