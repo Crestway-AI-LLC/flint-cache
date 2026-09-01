@@ -82,8 +82,71 @@ const ASSUMED_BYTES_PER_SEQ: u64 = 16 * 1024;
 /// `ASSUMED_BYTES_PER_SEQ`. Below 16 KiB values this returns a threshold
 /// smaller than the intent, in proportion.
 pub fn headroom_shed_seq_for_budget(wal_size_limit_mb: u64) -> u64 {
+    headroom_shed_seq_for(wal_size_limit_mb, 0)
+}
+
+/// The same threshold, from OBSERVED bytes per sequence.
+///
+/// `observed` of 0 means nothing has been written yet, and falls back to the
+/// assumption so a node's very first writes are judged by the old rule rather
+/// than by a division by zero.
+///
+/// A floor of one sequence, because the arithmetic can reach zero: at a 1 MB
+/// archive and 1 MiB records the intended half-budget is smaller than one
+/// record, and a threshold of 0 DISABLES the gate (0 is the documented
+/// "off" value) — turning a very tight budget into no backpressure at all,
+/// which is the opposite of what a tight budget asks for.
+pub fn headroom_shed_seq_for(wal_size_limit_mb: u64, observed_bytes_per_seq: u64) -> u64 {
     let budget_bytes = wal_size_limit_mb.saturating_mul(1024 * 1024);
-    (budget_bytes / 2) / ASSUMED_BYTES_PER_SEQ
+    let per_seq = if observed_bytes_per_seq == 0 {
+        ASSUMED_BYTES_PER_SEQ
+    } else {
+        observed_bytes_per_seq
+    };
+    ((budget_bytes / 2) / per_seq).max(1)
+}
+
+#[cfg(test)]
+mod headroom_tests {
+    use super::*;
+
+    /// The threshold exists to fire at roughly HALF THE ARCHIVE IN BYTES.
+    /// Expressed in sequences, that means it has to move with the size of a
+    /// record — which is the whole defect: a fixed 16 KiB made the gate fire
+    /// 16x early at 1 KiB values and 512x early at 32 B.
+    #[test]
+    fn the_threshold_tracks_the_byte_budget_across_record_sizes() {
+        let budget_mb = 8_192; // the shipped default: 8 GiB
+        let half = (budget_mb * 1024 * 1024) / 2;
+        for per_seq in [32u64, 1024, 16 * 1024, 256 * 1024] {
+            let seqs = headroom_shed_seq_for(budget_mb, per_seq);
+            let bytes_at_shed = seqs.saturating_mul(per_seq);
+            // Within one record of half the budget, in both directions.
+            assert!(
+                bytes_at_shed.abs_diff(half) <= per_seq,
+                "at {per_seq} B/seq the gate fires at {bytes_at_shed} B, not \
+                 the intended {half} B ({seqs} sequences)"
+            );
+        }
+    }
+
+    /// Unobserved must behave exactly as the old constant did, or a node's
+    /// first writes are judged by a rule nobody chose.
+    #[test]
+    fn no_observation_falls_back_to_the_assumption() {
+        assert_eq!(
+            headroom_shed_seq_for(8_192, 0),
+            headroom_shed_seq_for_budget(8_192)
+        );
+    }
+
+    /// 0 is the documented "gate disabled" value, so the arithmetic must
+    /// never produce it: a tight budget with large records would otherwise
+    /// turn backpressure OFF exactly where it is needed most.
+    #[test]
+    fn a_tiny_budget_never_disables_the_gate() {
+        assert!(headroom_shed_seq_for(1, 4 * 1024 * 1024) >= 1);
+    }
 }
 
 pub const DEFAULT_LAG_HARD_MS: u64 = 1_000;

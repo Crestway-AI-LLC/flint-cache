@@ -813,6 +813,10 @@ static REPLICA_LINK: std::sync::OnceLock<Arc<ReplicaLink>> = std::sync::OnceLock
 /// and a static initialiser cannot be feature-gated where this one is read.
 /// It is only ever a placeholder — the value is overwritten where the engine
 /// opens, which is the only build that has an archive at all.
+/// True when the headroom threshold was DERIVED rather than pinned with
+/// --wal-headroom-seq. Only then may the sampler re-derive it: an operator who
+/// names a number has overridden the policy, not asked for a starting point.
+static HEADROOM_AUTO: AtomicBool = AtomicBool::new(false);
 static WAL_BUDGET_MB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(8_192);
 
 /// Decrements the live-connection counter on any exit (incl. panic).
@@ -2144,11 +2148,12 @@ fn main() -> std::io::Result<()> {
             let budget_mb = WAL_BUDGET_MB.load(Ordering::Relaxed);
             let v = repl_hub::headroom_shed_seq_for_budget(budget_mb);
             hub.set_wal_headroom_shed_seq(v);
+            HEADROOM_AUTO.store(true, Ordering::Relaxed);
             eprintln!(
                 "wal headroom shed threshold: {v} sequences (half of a {budget_mb} MB \
-                 archive at an assumed 16 KiB/sequence; one sequence is ONE \
-                 write, so at smaller values this gate fires earlier than the \
-                 budget implies — override with --wal-headroom-seq)"
+                 archive; starts from an assumed 16 KiB/sequence and re-derives \
+                 from OBSERVED bytes/sequence once writes arrive — override \
+                 with --wal-headroom-seq to pin it)"
             );
         }
     }
@@ -2408,6 +2413,38 @@ fn main() -> std::io::Result<()> {
             None
         }
     };
+
+    // RE-DERIVE THE HEADROOM THRESHOLD FROM WHAT IS ACTUALLY BEING WRITTEN.
+    //
+    // The threshold is a byte budget expressed in SEQUENCES, and one sequence
+    // is one write, so the conversion depends on record size -- which is a
+    // property of the workload and cannot be known at startup. Started from
+    // the 16 KiB assumption, it is wrong by the ratio at every other size:
+    // ~16x tight at the 1 KiB the call site tells operators to expect.
+    //
+    // Only when the threshold was DERIVED. `--wal-headroom-seq` and
+    // `FLINTCONFIG wal-headroom-seq` both clear HEADROOM_AUTO, because an
+    // operator who names a number has overridden the policy.
+    #[cfg(feature = "rocks")]
+    if let Some(rk) = rocks.clone() {
+        let hub_re = Arc::clone(&hub);
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(30));
+                if !HEADROOM_AUTO.load(Ordering::Relaxed) {
+                    continue;
+                }
+                let observed = rk.bytes_per_seq();
+                if observed == 0 {
+                    continue; // nothing written yet: keep the assumption
+                }
+                let budget_mb = WAL_BUDGET_MB.load(Ordering::Relaxed);
+                hub_re.set_wal_headroom_shed_seq(repl_hub::headroom_shed_seq_for(
+                    budget_mb, observed,
+                ));
+            }
+        });
+    }
 
     // Fast-path guard for per-slot ownership: only consult ownership (an
     // extra manifest read) when at least one migration override exists.
@@ -3978,6 +4015,15 @@ fn exec_transaction(
 /// has no batch primitive, so there the transaction's atomicity rests on
 /// `lock_all()` alone; mem is the dev/test engine and rocks is what ships,
 /// and D6 already declines to promise readers a serial history either way.
+/// Observed bytes per WAL sequence; 0 when nothing has been written yet.
+///
+/// Rocks-only, like its single caller: the mem build's FLINTINFO emits a
+/// deliberately minimal surface and has never carried the replication fields.
+#[cfg(feature = "rocks")]
+fn wal_bytes_per_seq(rocks: &Option<RocksHandle>) -> u64 {
+    rocks.as_ref().map_or(0, |r| r.bytes_per_seq())
+}
+
 #[cfg(feature = "rocks")]
 fn commit_ops(
     store: &dyn Kv,
@@ -4306,7 +4352,13 @@ fn execute(
             // Live-tunable on purpose: the right value depends on value size
             // and on how far replicas actually fall behind under this
             // workload, and neither is knowable before the fleet runs.
-            b"wal-headroom-seq" => hub.set_wal_headroom_shed_seq(parse!()),
+            b"wal-headroom-seq" => {
+                // An operator naming a number has overridden the policy, not
+                // offered a starting point, so the re-derivation stands down
+                // for the life of the process.
+                HEADROOM_AUTO.store(false, Ordering::Relaxed);
+                hub.set_wal_headroom_shed_seq(parse!())
+            }
             b"min-replicas-to-write" => hub.set_min_replicas_to_write(parse!()),
             b"widowed-grace-ms" => hub.set_widowed_grace_ms(parse!()),
             b"max-conns" => MAX_CONNS.store(std::cmp::max(1, parse!()), Ordering::Relaxed),
@@ -5081,7 +5133,7 @@ fn flintinfo(
     let write_stall = rocks.as_ref().and_then(|kv| kv.write_stall());
     let compaction = rocks.as_ref().and_then(|kv| kv.compaction_pressure());
     let info = format!(
-        "role:{}\r\nloading:0\r\nrole_epoch:{role_epoch}\r\nbuild:{build}\r\nsst_bytes:{sst}\r\nlatest_seq:{latest}\r\nlast_applied:{last_applied}\r\nacked_seq:{}\r\nseq_lag:{seq_lag}\r\nwal_headroom_seq:{whs}\r\nwal_min_acked_seq:{wma}\r\nwal_headroom_shed_seq:{whl}\r\nlive_replicas:{}\r\nlag_ms:{}\r\nlag_ms_max:{lmx}\r\nlag_max_gap:{lmg}\r\nlag_soft_ms:{soft}\r\nlag_hard_ms:{hard}\r\nmin_replicas_to_write:{minr}\r\nwidowed_grace_ms:{wgm}\r\nwidowed_shed:{wsh}\r\nfullsync_active:{fsa}\r\nfullsync_max:{fsm}\r\nasync_write_queue:{aqd}\r\nwrite_deadline_ms:{wdm}\r\nwrite_inflight:{wif}\r\nwrite_service_us:{wsu}\r\nwrite_wait_est_ms:{wwe}\r\nwrites_shed_deadline:{wsd}\r\nwrites_shed_lag:{wsl}\r\nwrites_shed_quorum:{wsq}\r\nwrites_shed_widowed:{wswd}\r\nwrites_shed_headroom:{wshr}\r\nwrites_delayed_soft:{wdsf}\r\nwal_fsync_ms:{wfm}\r\nwal_fsync_total:{wft}\r\ncert_days_remaining:{cdr}\r\nactive_conns:{ac}\r\nmax_conns:{mc}\r\nconns_shed_total:{cs}\r\nwrite_stopped:{wst}\r\ndelayed_write_rate:{dwr}\r\nwrite_stall_readable:{wsr}\r\nl0_files:{l0f}\r\npending_compaction_bytes:{pcb}\r\ncompaction_readable:{cr}\r\ndisk_free_bytes:{dfb}\r\ndisk_total_bytes:{dtb}\r\ndisk_free_pct:{dfp}\r\ndisk_verdict:{dv}\r\ndisk_unknown_samples:{dus}\r\nevictable_ns:{ens}\r\nevictable_ns_agree:{ensa}\r\nevictable_ns_bytes:{ensb}\r\nreclaim_active:{rca}\r\nreclaim_target_free_bytes:{rctf}\r\nevict:{evm}\r\ngc_swept_expired:{gse}\r\ngc_swept_orphans:{gso}\r\nuptime_ms:{upms}\r\n",
+        "role:{}\r\nloading:0\r\nrole_epoch:{role_epoch}\r\nbuild:{build}\r\nsst_bytes:{sst}\r\nlatest_seq:{latest}\r\nlast_applied:{last_applied}\r\nacked_seq:{}\r\nseq_lag:{seq_lag}\r\nwal_headroom_seq:{whs}\r\nwal_min_acked_seq:{wma}\r\nwal_headroom_shed_seq:{whl}\r\nwal_bytes_per_seq:{wbps}\r\nlive_replicas:{}\r\nlag_ms:{}\r\nlag_ms_max:{lmx}\r\nlag_max_gap:{lmg}\r\nlag_soft_ms:{soft}\r\nlag_hard_ms:{hard}\r\nmin_replicas_to_write:{minr}\r\nwidowed_grace_ms:{wgm}\r\nwidowed_shed:{wsh}\r\nfullsync_active:{fsa}\r\nfullsync_max:{fsm}\r\nasync_write_queue:{aqd}\r\nwrite_deadline_ms:{wdm}\r\nwrite_inflight:{wif}\r\nwrite_service_us:{wsu}\r\nwrite_wait_est_ms:{wwe}\r\nwrites_shed_deadline:{wsd}\r\nwrites_shed_lag:{wsl}\r\nwrites_shed_quorum:{wsq}\r\nwrites_shed_widowed:{wswd}\r\nwrites_shed_headroom:{wshr}\r\nwrites_delayed_soft:{wdsf}\r\nwal_fsync_ms:{wfm}\r\nwal_fsync_total:{wft}\r\ncert_days_remaining:{cdr}\r\nactive_conns:{ac}\r\nmax_conns:{mc}\r\nconns_shed_total:{cs}\r\nwrite_stopped:{wst}\r\ndelayed_write_rate:{dwr}\r\nwrite_stall_readable:{wsr}\r\nl0_files:{l0f}\r\npending_compaction_bytes:{pcb}\r\ncompaction_readable:{cr}\r\ndisk_free_bytes:{dfb}\r\ndisk_total_bytes:{dtb}\r\ndisk_free_pct:{dfp}\r\ndisk_verdict:{dv}\r\ndisk_unknown_samples:{dus}\r\nevictable_ns:{ens}\r\nevictable_ns_agree:{ensa}\r\nevictable_ns_bytes:{ensb}\r\nreclaim_active:{rca}\r\nreclaim_target_free_bytes:{rctf}\r\nevict:{evm}\r\ngc_swept_expired:{gse}\r\ngc_swept_orphans:{gso}\r\nuptime_ms:{upms}\r\n",
         if read_only { "replica" } else { "master" },
         hub.effective_acked(now)
             .map_or_else(|| "none".into(), |a| a.to_string()),
@@ -5114,6 +5166,12 @@ fn flintinfo(
             .map(|v| v.to_string())
             .unwrap_or_else(|| "-1".into()),
         whl = hub.wal_headroom_shed_seq(),
+        // OBSERVED bytes per WAL sequence. The headroom threshold is a byte
+        // budget expressed in sequences, and one sequence is one write, so
+        // this is the conversion factor -- published because the call site
+        // tells operators to retune from it, and until now the number it
+        // depended on was assumed rather than shown. 0 = nothing written yet.
+        wbps = wal_bytes_per_seq(rocks),
         minr = hub.min_replicas_to_write(),
         wgm = hub.widowed_grace_ms(),
         // Whether the grace is CURRENTLY shedding, not just configured.

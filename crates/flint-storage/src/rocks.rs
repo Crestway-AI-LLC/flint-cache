@@ -30,6 +30,21 @@ pub struct RocksKv {
     /// Capacity-eviction state (ADR-0023 D7). Shared with the compaction
     /// filter, which is the only thing that acts on it.
     eviction: std::sync::Arc<crate::eviction::EvictionState>,
+    /// OBSERVED bytes per WAL sequence, as an EWMA.
+    ///
+    /// RocksDB numbers sequences per KEY, so one sequence is one record and
+    /// this is the mean size of a write. ADR-0022's headroom guard converts an
+    /// archive budget in BYTES into a threshold in SEQUENCES, and did it with
+    /// a fixed 16 KiB that had never been measured: right at 16 KiB values and
+    /// wrong by the ratio at every other size, which made the gate fire ~16x
+    /// early at the ~1 KiB its own call site says to expect.
+    ///
+    /// Measured here rather than assumed because every write that advances a
+    /// sequence passes through this type -- `put`, `delete` and `apply_writes`
+    /// are the three, and batched, queued and transaction commits all land in
+    /// the last. That is the choke point the watch table did NOT have, which
+    /// is what made BUG-0080 possible; here it genuinely is one.
+    bytes_per_seq: std::sync::atomic::AtomicU64,
 }
 
 /// LSM shape knobs, unset by default so stock RocksDB behaviour is unchanged.
@@ -68,9 +83,36 @@ impl RocksKv {
     /// group commit). The async write queue (ADR-0005 D4) uses this to
     /// collapse many connections' writes into one engine write. `None` value
     /// = delete. Replication picks the batch up from the WAL as usual.
+    /// Fold one record's size into the bytes-per-sequence EWMA.
+    ///
+    /// 1/8 weight, the same damping the write-service estimate uses: recent
+    /// enough to follow a workload that changes value size, damped enough
+    /// that one outlier does not move a shed threshold.
+    fn observe_record(&self, bytes: u64) {
+        use std::sync::atomic::Ordering;
+        let prev = self.bytes_per_seq.load(Ordering::Relaxed);
+        let next = if prev == 0 {
+            bytes
+        } else {
+            prev - prev / 8 + bytes / 8
+        };
+        self.bytes_per_seq.store(next.max(1), Ordering::Relaxed);
+    }
+
+    /// Observed mean bytes per WAL sequence; 0 until something has been
+    /// written, which callers must read as "no observation yet" rather than
+    /// as zero-sized writes.
+    pub fn bytes_per_seq(&self) -> u64 {
+        self.bytes_per_seq
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub fn apply_writes(&self, ops: &[(Vec<u8>, Option<Vec<u8>>)]) -> Result<(), rocksdb::Error> {
         if ops.is_empty() {
             return Ok(());
+        }
+        for (k, v) in ops {
+            self.observe_record((k.len() + v.as_ref().map_or(0, |x| x.len())) as u64);
         }
         let mut wb = rocksdb::WriteBatch::default();
         for (k, v) in ops {
@@ -385,6 +427,7 @@ impl RocksKv {
             // No compaction filter is installed on a read-only open, so
             // nothing here can act. Present so the type is one type.
             eviction: std::sync::Arc::new(crate::eviction::EvictionState::default()),
+            bytes_per_seq: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -587,6 +630,7 @@ impl RocksKv {
             path: path.to_path_buf(),
             wal_fsyncs: std::sync::atomic::AtomicU64::new(0),
             eviction,
+            bytes_per_seq: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -667,6 +711,7 @@ impl Kv for RocksKv {
     }
 
     fn put(&self, key: &[u8], value: &[u8]) {
+        self.observe_record((key.len() + value.len()) as u64);
         let _ = self.db.put(key, value);
     }
 
@@ -674,6 +719,7 @@ impl Kv for RocksKv {
         // Existence only — `get` here allocated and copied the whole value
         // just to throw it away.
         let existed = self.db.get_pinned(key).ok().flatten().is_some();
+        self.observe_record(key.len() as u64);
         let _ = self.db.delete(key);
         existed
     }

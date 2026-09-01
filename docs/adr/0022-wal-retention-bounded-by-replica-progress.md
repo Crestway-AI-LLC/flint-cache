@@ -223,17 +223,38 @@ direction. It does not. Measured batchable `SET` against non-batchable
 Batching does not move this denominator at all, and the comment on
 `MAX_PURE_BATCH` that said it did has been corrected.
 
-### Proposed: derive it from observed writes
+### Implemented 2026-09-01: derived from observed writes
 
-Track bytes-per-sequence as the node actually experiences it and compute the
-threshold from that, rather than from a constant chosen for a value size
-nobody verified. This is the fix BUG-0079 argued for in general terms and did
-not implement.
+`RocksKv` now counts bytes per record on all three of its write paths — `put`,
+`delete` and `apply_writes`, the last of which carries every batched, queued
+and transaction commit — and keeps a 1/8-weight EWMA. That is genuinely a
+choke point: every write that advances a sequence passes through it. (The
+watch table's wrapper is NOT one, which is what made BUG-0080 possible, so the
+distinction is worth stating rather than assuming.)
 
-**Not done here, deliberately.** Correcting it moves a safety gate's firing
-point LATER — toward the hazard this ADR exists to prevent — so it needs its
-own evidence and its own drill, one that asserts the gate fires at the
-intended number of BYTES rather than at some number of sequences. BUG-0078's
-fix raises the urgency: a master can now outrun a replica far faster than when
-this threshold was chosen, so a gate that is already 16x tight will fire more
-often. `--wal-headroom-seq` overrides it in the meantime.
+`headroom_shed_seq_for(budget_mb, observed)` converts the byte budget with
+that number instead of the constant, and a background thread re-derives the
+threshold every 30s. Two guards on it:
+
+- **An operator's number wins.** `--wal-headroom-seq` and `FLINTCONFIG
+  wal-headroom-seq` both stand the re-derivation down for the life of the
+  process. Naming a number overrides the policy; it is not a starting point.
+- **The result is floored at one sequence.** The arithmetic can otherwise
+  reach zero — a small archive with large records — and 0 is the documented
+  value for *gate disabled*, so a very tight budget would have produced no
+  backpressure at all, the exact opposite of what it asks for.
+
+Unobserved falls back to the old assumption, so a node's first writes are
+judged by the rule that shipped rather than by a division by zero.
+
+**How it is held.** The conversion arithmetic is unit-tested across 32 B to
+256 KiB records: the gate must fire within one record of half the budget at
+every size. What only a running node can show is that the observation is
+real, so `wal_headroom_drill.sh` asserts `wal_bytes_per_seq` MOVES with the
+workload — measured 96 at 64 B records and 8,224 at 8 KiB. A fixed constant
+fails that comparison by construction, which is what makes it a control
+rather than a restatement.
+
+`wal_bytes_per_seq` is published in FLINTINFO, because the call site has
+always told operators to retune from this and the number it depended on was
+never shown.

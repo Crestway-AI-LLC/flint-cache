@@ -135,4 +135,42 @@ if grep -q 'WALGAP' "$D/r.log" 2>/dev/null; then
 fi
 echo "  no WALGAP in the replica log"
 
-echo "PASS: WAL headroom — ships on, quiet at the default, arms at $RUNG, recovers, no WAL gap"
+echo "== 6. the threshold's CONVERSION FACTOR is observed, not assumed"
+# The threshold is a byte budget expressed in SEQUENCES, and RocksDB numbers
+# sequences per KEY -- so one sequence is one write and the conversion is the
+# size of a record. It shipped as a fixed 16 KiB that had never been measured:
+# right at 16 KiB values, and wrong by the ratio everywhere else, which made
+# the gate fire ~16x early at the ~1 KiB its own call site tells operators to
+# expect.
+#
+# `headroom_shed_seq_for` is unit-tested to convert correctly. What only a
+# running node can show is that the OBSERVATION is real, so this asserts
+# `wal_bytes_per_seq` tracks the record size actually being written.
+#
+# A fixed constant passes nothing here: it would report the same number for
+# both sizes, which is exactly what the comparison rejects.
+sizes_ok=1
+val_small=$(head -c 64 /dev/zero | tr '\0' 'a')
+val_large=$(head -c 8192 /dev/zero | tr '\0' 'b')
+for i in $(seq 1 200); do valkey-cli -p 6490 SET "bps:small:$i" "$val_small" >/dev/null; done
+OBS_SMALL=$(info 6490 wal_bytes_per_seq)
+for i in $(seq 1 200); do valkey-cli -p 6490 SET "bps:large:$i" "$val_large" >/dev/null; done
+OBS_LARGE=$(info 6490 wal_bytes_per_seq)
+echo "  64 B records -> wal_bytes_per_seq=$OBS_SMALL | 8 KiB records -> $OBS_LARGE"
+
+[ "${OBS_SMALL:-0}" -gt 0 ] || {
+  echo "FAIL: wal_bytes_per_seq is 0 after 200 writes. Nothing is observing the"
+  echo "      record size, so the threshold is still the old assumption under a"
+  echo "      new name."
+  exit 1; }
+# 4x is a wide margin on a 128x change in record size: this is asserting that
+# the number MOVES with the workload, not that it equals any particular value.
+awk -v a="$OBS_SMALL" -v b="$OBS_LARGE" 'BEGIN { exit !(b > a * 4) }' || {
+  echo "FAIL: 64 B and 8 KiB records both report ~the same bytes/sequence"
+  echo "      ($OBS_SMALL vs $OBS_LARGE). The conversion factor is not tracking"
+  echo "      what is being written, which is the defect this replaced: a fixed"
+  echo "      number is right at one value size and wrong at every other."
+  exit 1; }
+echo "  the conversion factor tracks the workload"
+
+echo "PASS: WAL headroom — ships on, quiet at the default, arms at $RUNG, recovers, no WAL gap, and its bytes/sequence is observed ($OBS_SMALL -> $OBS_LARGE) rather than assumed"
