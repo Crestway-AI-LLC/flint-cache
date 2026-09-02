@@ -15,8 +15,21 @@ B=./target/release/flint-server
 P0=6600; P1=6601; P2=6602
 DIRS=""
 cleanup() {
-  pkill -9 -f "flint-server --port 660" 2>/dev/null
+  # WAS `pkill -9 -f "flint-server --port 660"`, a TRUNCATED port: it matched
+  # this drill's 6600-6602 and, as a substring, everything from 6603 to 6609 as
+  # well. Harmless while drills run one at a time and a remote SIGKILL the
+  # moment they do not -- and it blocked 6603-6607 for any future drill, which
+  # is how it surfaced: the gate refused cp_watch_idle moving there.
+  # fleet_kill is scoped to this drill's own fleet_init ports.
+  #
+  # CONTROLLER FIRST (BUG-0061): it respawns dead nodes, so killing the seats
+  # first just gives it something to put back. The ORIGINAL had this ordering
+  # too -- pkill on the servers, then fleet_kill controller -- and kill_order
+  # could not see it, because a raw pkill is not a fleet_kill. Replacing the
+  # ad-hoc kill with the scoped helper is what made a pre-existing defect
+  # legible; the gate then failed on it within the same run.
   fleet_kill controller
+  fleet_kill server
   rm -rf $FLINT_DRILL_ROOT/flint-rb-*
 }
 trap cleanup EXIT

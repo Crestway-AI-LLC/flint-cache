@@ -8,7 +8,12 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init $FLINT_DRILL_ROOT/flint-mp- 6500 6501 6510 6511 6520
+# 6521 was USED and not DECLARED. Pair C is (6520 6521) and --manage-pairs
+# below names both, so the seat is real; only the declaration was short.
+# assert_no_port_overlap reads fleet_init lines and nothing else, so an
+# undeclared port is invisible to it -- cp_watch_idle_drill declared 6521
+# for months and the check could not see the collision (BUG-0086).
+fleet_init $FLINT_DRILL_ROOT/flint-mp- 6500 6501 6510 6511 6520 6521
 fleet_guard
 fleet_kill controller; fleet_kill server; sleep 0.4
 # Three pairs on fixed ports; roles float within each pair.

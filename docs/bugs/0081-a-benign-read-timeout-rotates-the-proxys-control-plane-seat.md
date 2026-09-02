@@ -1,4 +1,4 @@
-# BUG-0081 — a benign read timeout rotates the proxy's control-plane seat (defect 1 FIXED 2026-09-02; defect 2 OPEN)
+# BUG-0081 — a benign read timeout rotates the proxy's control-plane seat (defect 1 FIXED 2026-09-02; defect 2 OPEN, narrowed 2026-09-02)
 
 **Found** 2026-09-01, in the tail of an `elasticache-bench --regime a` run. The
 benchmark produced every number correctly and then **exited 1**, on this,
@@ -134,9 +134,18 @@ fix, in a third place.
   ANSWERED above: deliberate, 30 s.
 - Which call actually produced the observed `EAGAIN`. The evidence places it
   before the read; the port-exhaustion hypothesis is unverified.
-- Whether the three-seat case actually churns as predicted. It is an inference
-  from the same loop, and the loop was read rather than run — worth a drill
-  that counts CPWATCH subscriptions on an idle fleet before believing it.
+- ~~Whether the three-seat case actually churns as predicted.~~ **RUN, not
+  inferred, 2026-09-02.** `cp_watch_idle_drill.sh` now stands up THREE control
+  plane seats and leaves the fleet idle past the 30 s read timeout. It asserts
+  zero rotations, and — the part this item actually asked for — that the count
+  of applied filtered snapshots does not grow across the window, since a fresh
+  snapshot per rotation is the cost the prediction was about. One seat
+  exercises the same trigger; only three exercise the WALK.
+
+  Two things follow. The current code does not churn at three seats, measured.
+  And the prediction about the *pre-fix* code is now untestable without a seam,
+  so it stays a prediction: what is guarded is that it cannot start happening,
+  not that it once would have.
 
 ## Not the cause of anything measured
 
