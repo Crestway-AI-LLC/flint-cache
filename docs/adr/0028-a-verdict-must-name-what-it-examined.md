@@ -67,6 +67,42 @@ the failure its author already had in mind.
 
 ### 3. A matcher declares its match count and its match kind
 
+**Measured 2026-09-02, so this stops being an abstraction.** Across 127 drills
+there are **57 NEGATIVE-assertion sites** — places where the ABSENCE of a match
+means PASS.
+
+The distinction matters more than the count, and getting it wrong is the same
+error this ADR is about. `grep -q X || fail` is safe: a matcher that finds
+nothing FAILS, which is the correct direction. The hazard is the inverse,
+`grep -q X && fail`, where a pattern that has drifted — a changed message, a
+moved path, a renamed literal — finds nothing and passes **without having
+looked**. (My first measurement counted the safe form. Corrected before it was
+written down.)
+
+The highest-risk instances are security assertions. From `token_hash_drill`:
+
+```sh
+grep -q "super-secret-token" "$D/cp" && { echo "FAIL: plaintext token in the CP state file"; exit 1; }
+echo "$W" | grep -qi "PONG" && { echo "FAIL: wrong token authenticated"; exit 1; }
+```
+
+Each certifies that something bad is absent. Each certifies it equally well
+against a file that does not exist, a literal that was renamed, and a redaction
+that genuinely works.
+
+**The fix is not to rewrite 57 sites.** It is to pair each negative assertion
+with a positive control proving the matcher CAN match — the same shape
+`unit_exec_bit_drill` already uses when it refuses if fewer than four units
+resolve, and `roll_exec_bit_drill` when it requires a clean rev to still roll.
+For the token case that means asserting the literal appears where it SHOULD
+before asserting it is absent where it should not.
+
+Sequenced after obligation 1 and deliberately not started during a release
+window: these are gate drills, and changing them moves `main` under whoever is
+cutting (OPS-0044).
+
+
+
 Zero matches must fail. An implausible count must fail. Name comparisons are
 exact, never substring — (5) is a substring, and so is every future one.
 
