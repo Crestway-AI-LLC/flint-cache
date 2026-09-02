@@ -28,7 +28,7 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init $FLINT_DRILL_ROOT/flint-reattach 7471 7472 7473 7474
+fleet_init $FLINT_DRILL_ROOT/flint-reattach 7435 7436 7437 7438
 fleet_guard
 D=$FLINT_DRILL_ROOT/flint-reattach; INV=$D/cluster.flint; STATE=$D/state
 CTL=./target/release/flintctl
@@ -51,9 +51,9 @@ disposable on
 statedir $STATE
 bins ./target/release
 tls on
-cp 127.0.0.1:7474
-pair 127.0.0.1:7471,127.0.0.1:7472
-proxy 127.0.0.1:7473
+cp 127.0.0.1:7438
+pair 127.0.0.1:7435,127.0.0.1:7436
+proxy 127.0.0.1:7437
 controller on
 min-replicas 1
 poll-ms ${FLINT_POLL_MS:-150}
@@ -76,7 +76,7 @@ M=$(master_of)
 [ -n "$M" ] || { echo "FAIL: no master after bootstrap"; exit 1; }
 for _ in $(seq 1 60); do [ "$(live_of "$M")" = 1 ] && break; sleep 0.5; done
 [ "$(live_of "$M")" = 1 ] || { echo "FAIL: replica never streamed; fixture is not a healthy pair"; exit 1; }
-case "$M" in *7471) R=127.0.0.1:7472; RPORT=7472 ;; *) R=127.0.0.1:7471; RPORT=7471 ;; esac
+case "$M" in *7435) R=127.0.0.1:7436; RPORT=7436 ;; *) R=127.0.0.1:7435; RPORT=7435 ;; esac
 echo "  fixture: master $M, streaming replica $R"
 
 echo "== a streaming replica is re-attached, and NOT reseeded"
