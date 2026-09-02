@@ -68,8 +68,23 @@ the real assertion.
 
 ## What it is worth
 
-The bug is trivial. What it cost to find is the point: a half-size gate box ran
-the suite for 1991s against 1955s on the full-size box — **1.8% slower for half
-the vCPU** — and the single defect it turned up was in a *unit test*, not in any
-of the 21 fleet drills, which was the opposite of what was predicted. Box size
-is a cheap axis of variation, and it is not currently varied by anything.
+The bug is trivial. What it cost to find is the point: the single defect the
+size change turned up was in a *unit test*, not in any of the 21 fleet drills,
+which was the opposite of what was predicted. Box size is a cheap axis of
+variation, and nothing varied it.
+
+**Corrected 2026-09-02.** This section first said the half-size box "ran the
+suite for 1991s against 1955s — 1.8% slower for half the vCPU", and drew that
+as a finding. It is not one. A second run of the *full-size* box, at this
+commit, totalled 1987s — four seconds from the small box — against a 16-vCPU
+run-to-run spread of 32s. The claimed effect was smaller than the reference box
+varies by on its own, and both baselines were already on disk when the
+percentage was published.
+
+The number that does hold came later, from a quarter-size box: 2346s against
+1987s, **+18.1%**, decomposing as build 1.64x and drills 1.06x. `cp_watch_idle`
+is 41.6s on both 16 and 4 vCPU, because it sleeps for 40 of them. The full
+measurement and the decision that followed it live in the ops repo as OPS-0107;
+what belongs here is only that the box which found this bug was chosen for a
+reason that turned out to be unsupported, and the bug it found is real either
+way.
