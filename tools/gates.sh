@@ -1861,9 +1861,28 @@ if want chaos; then
   LEAKCHECK=
 fi
 
+# ADR-0028: A VERDICT MUST NAME WHAT IT EXAMINED.
+#
+# "GATES PASSED — 137 steps" is a claim with no subject. It is true of whatever
+# tree happened to be here, and a log pasted into a message, a PR or a release
+# note carries no way to tell which that was. On 2026-09-01 a gate was started
+# against a worktree days stale while main sat clean; the run was caught only
+# because run.sh prints the tree on line 1, and the person reading knew which
+# path was correct. That is a detector working where an invariant did not.
+#
+# The gate cannot read this itself: it executes on a box against an rsync'd
+# copy with no .git (the log directory is literally suffixed `-nogit`). So the
+# subject is DECLARED by the caller, which is the one that resolved it.
+#
+# UNDECLARED is printed, not omitted. A verdict with no subject should look
+# incomplete rather than clean -- if the line silently degraded to the old text
+# nobody would ever notice the declaration had stopped arriving.
+GATE_SUBJECT="${FLINT_GATE_SUBJECT:-UNDECLARED (caller passed no FLINT_GATE_SUBJECT)}"
+
 echo
 if [ -n "$FAILED" ]; then
   echo "GATES FAILED:$FAILED"
+  echo "  subject: $GATE_SUBJECT"
   echo "  logs: $LOGS"
   # DUMP THE FAILING LOGS INLINE (docs/bugs/0021).
   #
@@ -1892,4 +1911,5 @@ if [ "$RAN_STEPS" -eq 0 ]; then
   echo "  unknown-stage bug this guard exists to keep closed. Fix gates.sh."
   exit 2
 fi
-echo "GATES PASSED — $RAN_STEPS steps, logs kept in $LOGS (also $LOGS_ROOT/latest)"
+echo "GATES PASSED — $RAN_STEPS steps, subject: $GATE_SUBJECT"
+echo "  logs kept in $LOGS (also $LOGS_ROOT/latest)"
