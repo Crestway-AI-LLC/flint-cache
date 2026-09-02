@@ -1726,13 +1726,30 @@ mod bug_0050_iterator_shape {
         // CONTROL: the scan must actually be unable to reach `stale`, or this
         // asserts nothing. If retention kept everything, skip rather than pass
         // — a test that cannot fail is worse than one that does not run.
-        let reachable = kv
-            .db()
-            .get_updates_since(0)
-            .expect("iter")
-            .filter_map(|i| i.ok())
-            .map(|(f, _)| f)
-            .next();
+        // A missing-segment Err here is NOT a broken test -- it is the
+        // condition under test.
+        // Retention is off, so the segments behind sequence 0 are deleted, and
+        // RocksDB reports that by failing to open one:
+        //
+        //   IO error: No such file or directory: .../archive/000018.log
+        //
+        // That is stronger evidence the scan cannot reach `stale` than an
+        // iterator which opens and yields a newer floor. `.expect("iter")`
+        // turned it into a panic, so the control failed on the very state it
+        // exists to establish.
+        //
+        // BUG-0085. Found on an 8-vCPU/16 GiB gate box, where recycling comes
+        // sooner; the 16-vCPU box usually leaves the segment openable long
+        // enough. The test was never stable, only lucky in the size of box it
+        // habitually ran on.
+        let reachable = match kv.db().get_updates_since(0) {
+            Ok(it) => it.filter_map(|i| i.ok()).map(|(f, _)| f).next(),
+            // A MISSING segment is the recycling this test needs. Any other
+            // error is a broken database, and collapsing the two would let a
+            // real fault masquerade as the condition under test.
+            Err(e) if e.to_string().contains("No such file or directory") => None,
+            Err(e) => panic!("the WAL scan failed for a reason that is not recycling: {e}"),
+        };
         if reachable.is_some_and(|f| f <= stale) {
             eprintln!(
                 "  SKIP: the WAL still reaches back to {stale} (oldest {reachable:?}); \
