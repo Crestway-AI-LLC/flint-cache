@@ -1310,6 +1310,12 @@ mod ctl_reply_cap_tests {
                 Ok(v) => v,
                 Err(_) => return,
             };
+            // A WRITE TIMEOUT, so this thread cannot park forever on a full
+            // socket buffer once the client stops reading (BUG-0084). Without
+            // it the writer blocks at zero CPU and the whole test looks slow
+            // rather than stuck -- which is exactly how it read on the rc.67
+            // release box: healthy instance, 0.24% CPU, forty minutes.
+            let _ = s.set_write_timeout(Some(std::time::Duration::from_secs(5)));
             let mut sink = [0u8; 4096];
             let _ = std::io::Read::read(&mut s, &mut sink);
             // A legal, never-completing reply: an array header promising far
@@ -1335,11 +1341,36 @@ mod ctl_reply_cap_tests {
         // Budget generously: the point is that the cap fires on BYTES, and a
         // short budget would let the read timeout claim the win instead and
         // the test would pass with the cap removed.
-        let r = call_once_with(
-            &addr,
-            &[b"FLINTMIGRATIONS"],
-            std::time::Duration::from_secs(30),
-        );
+        // A TOTAL DEADLINE (BUG-0084). The 30s above is a READ timeout and the
+        // cap under test is a BYTE cap -- "a byte cap rather than a cumulative
+        // deadline, deliberately", as the code says. Right for the product,
+        // and it leaves this test with nothing bounding its total runtime: a
+        // peer that trickles inside every read window never trips the read
+        // timeout. On 2026-09-02 that hung a release build for forty minutes
+        // and would have died with its own 90-minute box.
+        //
+        // The deadline is generous -- the cap is 8 MiB and the observed local
+        // runtime is under a second -- because the point is to convert an
+        // indefinite hang into a NAMED failure, not to police performance.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let call_addr = addr.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(call_once_with(
+                &call_addr,
+                &[b"FLINTMIGRATIONS"],
+                std::time::Duration::from_secs(30),
+            ));
+        });
+        let r = match rx.recv_timeout(std::time::Duration::from_secs(120)) {
+            Ok(v) => v,
+            Err(_) => panic!(
+                "call_once_with never returned: 120s with no result from a peer \
+                 that trickles well-formed bulks forever. The byte cap \
+                 ({MAX_CTL_REPLY_BYTES} bytes) should have refused this long \
+                 before now, so either the cap stopped firing or the read loop \
+                 is blocked (BUG-0084)."
+            ),
+        };
         let e = r.expect_err("a never-completing reply must be refused");
         assert_eq!(
             e.kind(),

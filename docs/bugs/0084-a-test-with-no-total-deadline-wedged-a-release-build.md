@@ -1,6 +1,6 @@
 # BUG-0084: a test with no total deadline wedged a release build
 
-Status: OPEN
+Status: FIXED 2026-09-02
 Severity: medium (intermittent, but it stops a release cut dead)
 
 ## What happened
@@ -26,10 +26,30 @@ byte-identical to v0.1.0-rc.66, `MAX_CTL_REPLY_BYTES` is the same 8 MiB, and
 the test has been in since 49a137b5 (BUG-0060, 2026-08-27) — rc.66 built with
 it.
 
-**Intermittent.** Run three times locally on the release profile: 30s (with the
-compile), then 0s, then 0s. So it is a race, not a deterministic hang, which is
-the worst shape for a release step — it passes every time you check it and
-stops the one cut you needed.
+**Intermittent** — but the first evidence I gave for that was worthless, and
+the correction is worth more than the conclusion.
+
+> **CORRECTED.** I originally wrote "three local runs gave 30s, 0s, 0s".
+> **Those runs never executed the test.** Two mistakes compounded:
+> `cargo test … trickling_peer_is_refused_rather_than_buffered -- --exact`
+> requires the FULL module path, so the filter matched nothing; and this whole
+> region is behind `#[cfg(feature = "rocks")]`, so without `--features rocks`
+> the test is not in the binary at all — 102 tests instead of 130. **Cargo
+> exits 0 when a filter matches nothing**, so five "PASSED in 0s" runs were
+> five runs of nothing, and the 0s should have told me: a test that opens
+> sockets and moves 8 MiB does not finish instantly.
+
+Re-measured properly, with the full path and `--features rocks`, and a hard
+kill at 150s so a hang could not masquerade as patience:
+
+    original   24s PASS   18s PASS   18s PASS
+    with fix   25s PASS   18s PASS   18s PASS
+
+So the conclusion survives — it does not hang deterministically — and the real
+figure is **~18 seconds per run**, not zero. The quadratic re-decode is genuine
+and substantial; on a box running 130 tests in parallel it stretches. But the
+release box sat at **0.24% CPU**, so what happened there was still a block, not
+that stretch.
 
 ## The shape
 
@@ -51,9 +71,27 @@ bounds its total runtime. `write_all` has no write timeout either, so a peer
 thread blocked on a full socket buffer waits forever at zero CPU, which is
 precisely what was observed.
 
-## Fix shape
+## Fix, 2026-09-02
 
-Not attempted here — rc.67's bytes are frozen and this is pre-existing.
+Two changes, and neither tries to make the test faster — the point is that an
+indefinite hang becomes a NAMED failure.
+
+**A total deadline the test cannot exceed.** The call now runs on a worker
+thread behind `recv_timeout(120s)`; on expiry the test panics with a message
+saying it waited 120s for a peer that trickles forever, naming the byte cap
+that should have refused it long before. 120s against a measured 18s is
+deliberate slack: this polices hangs, not performance.
+
+**A write timeout on the peer.** `set_write_timeout(5s)` on the writer socket,
+so the thread cannot park forever on a full socket buffer once the client stops
+reading. That is the shape that produces a block at zero CPU.
+
+Verified: 3/3 pass with the fix at the same 18s, so it costs nothing. The
+deadline path itself was exercised by shortening it to 1ms — which is also how
+I discovered the filter had been matching nothing, because the "control" kept
+reporting success.
+
+## Fix shape, as originally written
 
 1. **Give the test a total deadline it cannot exceed**, and fail with a message
    naming what it was waiting on. A test that can hang forever is a test that
