@@ -85,6 +85,31 @@ V=$(valkey-cli -p 7991 -a legacy-plaintext-tok --no-auth-warning PING 2>&1 | hea
 echo "$V" | grep -qi "PONG" || { echo "FAIL: legacy tenant cannot auth after migration: $V"; exit 1; }
 # Any commit rewrites the file; force one and check the plaintext is gone.
 valkey-cli -p 6322 CPTENANTQUOTA legacy 0 0 >/dev/null
+sha256hex() {
+  if command -v sha256sum >/dev/null 2>&1; then printf '%s' "$1" | sha256sum | cut -d' ' -f1
+  elif command -v shasum   >/dev/null 2>&1; then printf '%s' "$1" | shasum -a 256 | cut -d' ' -f1
+  else python3 -c 'import hashlib,sys;print(hashlib.sha256(sys.argv[1].encode()).hexdigest())' "$1"
+  fi
+}
+
+# PAIRED POSITIVE CONTROL (ADR-0028 obligation 3).
+#
+# The absence check below certifies that the plaintext token did not survive the
+# rewrite. It certifies that EQUALLY WELL against a cp-old that is empty,
+# missing, or truncated -- a matcher that finds nothing agrees with everything.
+#
+# The first half of this drill already does this correctly: every plaintext
+# absence check is paired with a digest PRESENCE check on the same file, so the
+# file is proven readable and greppable before its silence is trusted. This one
+# was not paired, and it is the security assertion of the two -- "plaintext
+# survived the rewrite" is the thing a reader would most want to be true.
+LEGACY_DIG=$(sha256hex 'legacy-plaintext-tok')
+[ ${#LEGACY_DIG} -eq 64 ] || { echo "FAIL: could not compute a sha256 digest here (got '${LEGACY_DIG}')"; exit 1; }
+grep -q "$LEGACY_DIG" "$D/cp-old" || {
+  echo "FAIL: the rewritten state file carries no digest for the legacy tenant."
+  echo "      The plaintext-absence check below would then pass against a file"
+  echo "      it never successfully read (ADR-0028 obligation 3)."
+  exit 1; }
 grep -q "legacy-plaintext-tok" "$D/cp-old" && { echo "FAIL: plaintext survived the rewrite"; exit 1; }
 echo "  plaintext-era token hashed on load; auth works; rewrite holds digest only"
 
@@ -98,12 +123,6 @@ C=$(valkey-cli -p 7991 PROXYAUTHCOUNT legacy-plaintext-tok)
 # digest-keyed counter were broken. The plaintext assertion three lines above
 # passed, which is the tell: the server was fine and the drill could not
 # compute the key it was asking about.
-sha256hex() {
-  if command -v sha256sum >/dev/null 2>&1; then printf '%s' "$1" | sha256sum | cut -d' ' -f1
-  elif command -v shasum   >/dev/null 2>&1; then printf '%s' "$1" | shasum -a 256 | cut -d' ' -f1
-  else python3 -c 'import hashlib,sys;print(hashlib.sha256(sys.argv[1].encode()).hexdigest())' "$1"
-  fi
-}
 LDIG=$(sha256hex 'legacy-plaintext-tok')
 [ ${#LDIG} -eq 64 ] || { echo "FAIL: could not compute a sha256 digest here (got '${LDIG}')"; exit 1; }
 C2=$(valkey-cli -p 7991 PROXYAUTHCOUNT "$LDIG")

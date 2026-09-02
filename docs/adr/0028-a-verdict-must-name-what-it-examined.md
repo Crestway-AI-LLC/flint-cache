@@ -79,16 +79,34 @@ moved path, a renamed literal — finds nothing and passes **without having
 looked**. (My first measurement counted the safe form. Corrected before it was
 written down.)
 
-The highest-risk instances are security assertions. From `token_hash_drill`:
+**AMENDED after reading them: most are already paired, and 57 quoted as a
+defect count would have libelled work that was done correctly.**
+`token_hash_drill` follows every plaintext-absence check with a digest
+PRESENCE check on the same file:
 
 ```sh
-grep -q "super-secret-token" "$D/cp" && { echo "FAIL: plaintext token in the CP state file"; exit 1; }
-echo "$W" | grep -qi "PONG" && { echo "FAIL: wrong token authenticated"; exit 1; }
+grep -q "super-secret-token" "$D/cp" && FAIL   # the plaintext must be absent
+grep -q "$DIGEST"            "$D/cp" || FAIL   # the digest must be present
 ```
 
-Each certifies that something bad is absent. Each certifies it equally well
-against a file that does not exist, a literal that was renamed, and a redaction
-that genuinely works.
+The second is what makes the first mean anything: it proves the file exists, is
+readable and is greppable before the silence of the first is trusted. It also
+catches literal drift, because `DIGEST` derives from the same literal — change
+the token at the creation site alone and the digest check fails.
+
+So 57 is the POPULATION, not the defect count. The useful number is how many
+lack such a pair, and that cannot be grepped; it has to be read.
+
+The first drill audited had exactly one, and it was the security assertion:
+
+```sh
+grep -q "legacy-plaintext-tok" "$D/cp-old" && FAIL   # nothing proved cp-old was read
+```
+
+certifying "the plaintext did not survive the rewrite" equally well against an
+empty or truncated file. Now paired with the legacy tenant's digest, and
+verified by mutation rather than by inspection: emptying `cp-old` makes it fail,
+where before it passed.
 
 **The fix is not to rewrite 57 sites.** It is to pair each negative assertion
 with a positive control proving the matcher CAN match — the same shape
