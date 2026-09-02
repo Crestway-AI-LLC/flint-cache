@@ -2841,7 +2841,7 @@ fn reconcile_cold_start(
     );
     for addr in pair.iter().filter(|a| **a != master) {
         eprintln!("  re-seeding {addr} as a replica of {master}");
-        if let Err(e) = roll_node(inv, addr, &master, &[], &None, true) {
+        if let Err(e) = roll_node(inv, addr, &master, &[], &None, Rejoin::Reseed) {
             die(&format!("re-seeding {addr} onto {master}: {e}"));
         }
     }
@@ -5146,6 +5146,28 @@ fn scan_journal<'a>(
     Ok(())
 }
 
+/// What `roll_node` does when the seat is NOT an observed live replica.
+///
+/// This was a `wipe: bool`, and the bool could not express the third case.
+/// `false` did not mean "do not reseed" — it meant "reseed unless the seat
+/// happens to look like a replica", and the fallback was silent. Fine for
+/// `upgrade`, which wants a best effort. Disqualifying for anything that has
+/// to PROMISE the seat's data survives, because the observation and the
+/// action are separated by a kill and the controller can promote the seat in
+/// between (ADR-0035 D1).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Rejoin {
+    /// Always mark for reseed. A dead seat or an ex-master: the lineage is
+    /// unknown, and the marker is the only honest contract.
+    Reseed,
+    /// Warm when the seat IS an observed live replica, reseed-marker when it
+    /// is not. What an upgrade wants: roll everything, best effort each.
+    WarmIfReplica,
+    /// Warm or NOTHING. Refuses instead of falling back, so a caller that
+    /// needs the data kept cannot be handed a reseed it did not ask for.
+    WarmOnly,
+}
+
 /// Roll one node to the new build: kill, respawn on the SAME data dir (an
 /// upgrade is a binary swap + warm restart, never a resync) as a replica of
 /// `master`, then wait for the build stamp and full convergence.
@@ -5155,7 +5177,7 @@ fn roll_node(
     master: &str,
     envs: &[(String, String)],
     expect_build: &Option<String>,
-    wipe: bool,
+    rejoin: Rejoin,
 ) -> Result<(), String> {
     let tls = tls_client(inv);
     let d = &inv.statedir;
@@ -5166,7 +5188,31 @@ fn roll_node(
     // Anything else — dead seat, unknown lineage, (ex-)master — resyncs
     // fresh. (Checking after the respawn is a race against the controller
     // fencing a returning zombie; checking BEFORE the kill is not.)
-    let wipe = wipe || info_field(addr, &tls, "role:").as_deref() != Some("replica");
+    let observed_replica = info_field(addr, &tls, "role:").as_deref() == Some("replica");
+    let wipe = match rejoin {
+        Rejoin::Reseed => true,
+        Rejoin::WarmIfReplica => !observed_replica,
+        // BEFORE `stop_seat`, and that ordering is the whole guarantee: a
+        // refusal after the kill would leave the seat DOWN, turning a
+        // conservative "I will not do this" into an outage. The existing
+        // code already computed the decision here for its own reason (a
+        // post-respawn check races the controller fencing a zombie), which
+        // is what makes the refusal free.
+        Rejoin::WarmOnly => {
+            if !observed_replica {
+                let saw = info_field(addr, &tls, "role:");
+                return Err(format!(
+                    "{addr} does not report role:replica (reads {}), so a warm re-attach \
+                     cannot promise its data survives — REFUSING rather than marking it \
+                     for reseed. Nothing was stopped; the seat is still running. If this \
+                     seat should be reseeded onto {master}, that is `restart-node` and it \
+                     is a different decision (ADR-0035 D1, D4)",
+                    saw.as_deref().unwrap_or("nothing")
+                ));
+            }
+            false
+        }
+    };
     stop_seat(
         inv,
         &runner_for(inv, addr),
@@ -5500,7 +5546,7 @@ fn failover(inv: &Inventory, node: &str) {
     eprintln!("  {node} demoted + drained; {new_master} promoted at (0,{promoted})");
     // The ex-master rejoins as a fresh replica of the NEW master — no build
     // change (empty envs), wipe = the demote contract.
-    if let Err(e) = roll_node(inv, node, &new_master, &[], &None, true) {
+    if let Err(e) = roll_node(inv, node, &new_master, &[], &None, Rejoin::Reseed) {
         panic!("ex-master {node} failed to rejoin as a replica: {e}");
     }
     eprintln!("== failover complete: {new_master} is master; {node} rejoined as replica");
@@ -5775,7 +5821,14 @@ fn upgrade(inv: &Inventory, version_tag: Option<String>, soak_ms: u64, nodes_onl
         replicas.len() - 1
     );
     let t0 = now_ms();
-    if let Err(e) = roll_node(inv, &canary, &canary_master, &envs, &expect, false) {
+    if let Err(e) = roll_node(
+        inv,
+        &canary,
+        &canary_master,
+        &envs,
+        &expect,
+        Rejoin::WarmIfReplica,
+    ) {
         panic!("CANARY FAILED (fleet untouched beyond the canary): {e}");
     }
     eprintln!("  canary {canary} on new build, reconverged; soaking {soak_ms}ms");
@@ -5802,7 +5855,7 @@ fn upgrade(inv: &Inventory, version_tag: Option<String>, soak_ms: u64, nodes_onl
             .find(|a| info_field(a, &tls, "role:").as_deref() == Some("master"))
             .cloned()
             .unwrap_or_else(|| m.clone());
-        if let Err(e) = roll_node(inv, r, &m_now, &envs, &expect, false) {
+        if let Err(e) = roll_node(inv, r, &m_now, &envs, &expect, Rejoin::WarmIfReplica) {
             // Same outcome as a failed journal check below — the roll
             // stopped part-way — so it reports the same way. Panicking here
             // gave the one MORE likely failure the worse exit code.
@@ -5831,7 +5884,7 @@ fn upgrade(inv: &Inventory, version_tag: Option<String>, soak_ms: u64, nodes_onl
         eprintln!(
             "  pair {i}: {old_master} demoted + drained; {new_master} promoted at (0,{promoted})"
         );
-        if let Err(e) = roll_node(inv, old_master, &new_master, &envs, &expect, true) {
+        if let Err(e) = roll_node(inv, old_master, &new_master, &envs, &expect, Rejoin::Reseed) {
             eprintln!("== UPGRADE ABORTED after pair {i} failover, respawning {old_master}: {e}");
             std::process::exit(3);
         }
@@ -6289,6 +6342,7 @@ const MUTATING: &[&str] = &[
     "push-bins",
     "kill-node",
     "restart-node",
+    "reattach-node",
     "expand",
     "swap-node",
     "add-replica",
@@ -6464,9 +6518,38 @@ fn main() {
                      itself is meaningless; fail it over first"
                 ));
             }
-            match roll_node(&inv, addr, &master, &[], &None, true) {
+            match roll_node(&inv, addr, &master, &[], &None, Rejoin::Reseed) {
                 Ok(()) => println!("restarted {addr} as a replica of {master}"),
                 Err(e) => die(&format!("restart-node {addr}: {e}")),
+            }
+        }
+        // The repair for a DETACHED PAIR: every member up, epochs agreeing,
+        // and no replica streaming. `restart-node` is the wrong verb for it —
+        // it marks the seat for reseed unconditionally, which is right for a
+        // dead seat whose lineage is unknown and wrong for a member that is
+        // sitting there holding good data and merely not tailing.
+        //
+        // The distinction is not cosmetic. A marked rejoin rewinds to a
+        // snapshot the master vouches for, or full-syncs when none exists, so
+        // an unreplicated suffix is discarded either way. A warm re-attach
+        // keeps the data dir and resumes the tail, which is sound precisely
+        // because a replica's history is a prefix of the master's.
+        //
+        // REFUSES rather than falling back (ADR-0035 D1). A caller that
+        // needed the data kept must not be handed a reseed instead.
+        "reattach-node" => {
+            let addr = rest.first().expect("usage: reattach-node <addr>");
+            let tls = tls_client(&inv);
+            let master = pair_master(&inv, &tls, addr);
+            if &master == addr {
+                die(&format!(
+                    "{addr} is currently MASTER of its pair — re-attaching it to itself is \
+                     meaningless; fail it over first"
+                ));
+            }
+            match roll_node(&inv, addr, &master, &[], &None, Rejoin::WarmOnly) {
+                Ok(()) => println!("re-attached {addr} to master {master} (data dir kept)"),
+                Err(e) => die(&format!("reattach-node {addr}: {e}")),
             }
         }
         "push-bins" => {
