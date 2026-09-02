@@ -1,4 +1,4 @@
-# BUG-0079 — the WAL shed guard fires at twice the distance the archive keeps (OPEN)
+# BUG-0079 — the WAL shed guard fires at twice the distance the archive keeps (budget FIXED and now OBSERVABLE 2026-09-02; mount ordering still open)
 
 **Found** 2026-08-30 by a 2 TB ingest run, and reproduced exactly by a second
 one. Both stalled at the same place: **163–165 GB**, ~15 minutes into a
@@ -178,13 +178,76 @@ costs a replica its archive.
    value had been stored, so the two were equal by construction. It now
    compares against what the node would have chosen on its own.
 
+### Update 2026-09-02 — the budget is now visible, and a check can see a floor
+
+The item below is closed. `FLINTINFO` gained two fields:
+
+- `wal_archive_mb` — the budget actually in force
+- `wal_archive_src` — **how it was chosen**: `measured`, `override`,
+  `unmeasured`, or `none`
+
+The second field is what makes the first checkable. `1024` is the correct
+answer on a 4 GB dev box and a 256x under-provisioning on an NVMe, and an
+operator who pinned it is not a defect at all — so the number alone can carry
+no assertion. Provenance separates the three.
+
+**The invariant, and why one process is enough.** When the source is
+`measured`, the budget must be the one the volume implies:
+
+    wal_archive_mb == clamp((disk_total_bytes / 4) / MiB, 1024, 262144)
+
+`disk_total_bytes` is already in `FLINTINFO`, sampled by the disk guard from
+**the same `dir`** the budget was derived from. In the failure those two
+disagree, on one seat, with no fleet required: the bad measurement happens once
+at boot, while the guard goes on sampling that directory successfully for the
+life of the process. `wal_archive_mb` remembers the failure and
+`disk_total_bytes` reports the success, so the seat's own INFO contradicts
+itself and anything reading it can say so. That also answers the "no check
+asserts the two members of a pair agree" half more cheaply than a pair
+comparison would: each member is now answerable on its own, and a fleet check
+comparing them is a one-line read of a field that exists.
+
+`tools/wal_budget_drill.sh` asserts it, and is in CORE.
+
+**Both fields are rocks-only**, because `flintinfo` itself is
+`#[cfg(feature = "rocks")]` and the mem engine has no WAL archive to describe.
+The drill's mem seat therefore checks `wal_archive_src:none` against a build
+that HAS the fields — a mem-engine seat in a rocks binary — which is the case
+an operator can actually meet. Worth stating because the first version of this
+change left the static and its constants ungated: they compiled, the rocks
+config was green, and `clippy (mem)` failed on the gate box with `static
+WAL_BUDGET_SRC is never used`. Local verification had run one feature config;
+the rule is both, and the gate is where that got enforced.
+
+**Verified by mutation, both directions:**
+
+| mutation | result |
+|---|---|
+| the derived sample's value replaced by `0` — the boot race exactly, a failed measurement believed | FAILS: `disk_total_bytes=999995129856 -> expected 238417 MB, seat reports 1024 MB`, and names 1024 as the FLOOR |
+| both fields deleted from `FLINTINFO` | FAILS at the capability assert — `absent is not clean` — rather than comparing two empty strings and reporting PASS |
+
+The second row is the one that had to exist. `field()` prints an empty string
+both when a value is empty and when the key is absent, so without a
+presence check first, deleting the fields turns every later comparison into
+empty-vs-empty and the drill goes green against a build that surfaces nothing.
+
+Three controls sit alongside: a pinned seat must report `override` and is
+**not** held to the volume (the drill refuses if the pin happens to equal the
+derived value, since the control would then prove nothing); a mem seat must
+report `none` rather than the compiled default dressed up as a derivation; and
+the volume comparison refuses to run until `disk_total_bytes` is positive —
+against a total of `0` the expected budget IS the floor, so a floor-clamped
+seat would match and the check would agree with the defect it exists to catch.
+
 ### Still open
 
-- **Why the value is only ever logged.** Nothing surfaces the chosen budget
-  where an operator or a drill would see a floor-clamped seat; `FLINTINFO`
-  exposes `wal_headroom_shed_seq`, from which the budget is inferable, and no
-  check asserts the two members of a pair agree. That is how this survived a
-  green gate.
+- **A seat that starts before its instance store is mounted** has a worse
+  problem than its WAL budget — it would put data on the root volume. The
+  create-then-measure fix makes the budget consistent with wherever the data
+  lands; it does not make the mount ordering correct. The new invariant does
+  not catch this either, and cannot: a seat on the root volume derives a
+  budget that is *correct for the volume it is on*, and INFO agrees with
+  itself. What is wrong there is the volume, not the arithmetic.
 - **A seat that starts before its instance store is mounted** has a worse
   problem than its WAL budget — it would put data on the root volume. The
   create-then-measure fix makes the budget consistent with wherever the data

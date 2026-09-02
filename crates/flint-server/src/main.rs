@@ -818,6 +818,57 @@ static REPLICA_LINK: std::sync::OnceLock<Arc<ReplicaLink>> = std::sync::OnceLock
 /// names a number has overridden the policy, not asked for a starting point.
 static HEADROOM_AUTO: AtomicBool = AtomicBool::new(false);
 static WAL_BUDGET_MB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(8_192);
+/// HOW the archive budget above was chosen — BUG-0079's remaining half.
+///
+/// The budget was only ever announced in one boot log line that nothing reads.
+/// That is how a 3.5 TB seat came up clamped to the 1 GiB FLOOR, on a healthy
+/// disk, differently on each boot, and passed a green gate: the number was
+/// correct-looking in isolation and wrong only against the volume it was
+/// supposed to describe.
+///
+/// The value alone cannot say that. 1024 MB is the right answer on a 4 GB dev
+/// box and a 256x under-provisioning on an NVMe, and an operator who pinned it
+/// is not a defect at all. So the PROVENANCE ships beside the number, and the
+/// two together state a checkable invariant: a seat that says `measured` must
+/// have a budget consistent with the volume it is currently sampling.
+/// ROCKS-ONLY, because its only reader is: `flintinfo` is itself
+/// `#[cfg(feature = "rocks")]`, and the mem engine has no WAL archive to
+/// describe. Gating matches the reader rather than silencing the lint,
+/// which would leave a mem build carrying a budget nothing can report.
+#[cfg(feature = "rocks")]
+static WAL_BUDGET_SRC: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+/// No archive budget was derived at all — the mem engine, which has no WAL
+/// archive. Distinct from every other value here: reporting the 8192 default
+/// as though it had been chosen would be a fabricated measurement.
+#[cfg(feature = "rocks")]
+const WAL_SRC_NONE: u8 = 0;
+/// Derived from a volume this node successfully measured.
+#[cfg(feature = "rocks")]
+const WAL_SRC_MEASURED: u8 = 1;
+/// Pinned by `--wal-size-limit-mb`. Never a defect, and the reason the
+/// invariant is conditional rather than absolute.
+#[cfg(feature = "rocks")]
+const WAL_SRC_OVERRIDE: u8 = 2;
+/// No filesystem could be measured, so the compiled default was used. Says "I
+/// could not look" rather than letting a failed syscall pass for a small disk.
+#[cfg(feature = "rocks")]
+const WAL_SRC_UNMEASURED: u8 = 3;
+
+#[cfg(feature = "rocks")]
+fn wal_budget_src_str() -> &'static str {
+    match WAL_BUDGET_SRC.load(Ordering::Relaxed) {
+        WAL_SRC_MEASURED => "measured",
+        WAL_SRC_OVERRIDE => "override",
+        WAL_SRC_UNMEASURED => "unmeasured",
+        WAL_SRC_NONE => "none",
+        // A u8 holds values this set does not, and nothing stores them. If one
+        // ever appears, say so rather than folding it into `none` -- an
+        // unrecognised state reported as "no archive" is the collapse of an
+        // unknown into a fact, which is the defect this whole field exists to
+        // undo.
+        _ => "unknown",
+    }
+}
 
 /// Decrements the live-connection counter on any exit (incl. panic).
 struct ConnGuard;
@@ -1771,9 +1822,11 @@ fn main() -> std::io::Result<()> {
             if let Err(e) = std::fs::create_dir_all(&dir) {
                 eprintln!("WAL budget: could not create {dir} before sizing the archive: {e}");
             }
+            let mut measured = true;
             let derived_mb = match flint_storage::disk::sample_nearest(std::path::Path::new(&dir)) {
                 Some(u) => flint_storage::rocks::wal_size_limit_mb_for_volume(u.total_bytes),
                 None => {
+                    measured = false;
                     // "Unknown" is not "small". disk.rs is explicit that a
                     // failed syscall is not evidence about disk space, and a
                     // budget is the one place where believing it costs a
@@ -1786,10 +1839,23 @@ fn main() -> std::io::Result<()> {
                     flint_storage::rocks::DEFAULT_WAL_SIZE_LIMIT_MB
                 }
             };
-            let wal_mb = arg("--wal-size-limit-mb")
-                .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(derived_mb);
+            let pinned = arg("--wal-size-limit-mb").and_then(|v| v.parse::<u64>().ok());
+            let wal_mb = pinned.unwrap_or(derived_mb);
             WAL_BUDGET_MB.store(wal_mb, Ordering::Relaxed);
+            // Record WHY, not just what. Order matters: an operator pin wins
+            // over how the derivation went, because a pinned budget is not
+            // answerable to the volume and the invariant must not be asserted
+            // against it.
+            WAL_BUDGET_SRC.store(
+                if pinned.is_some() {
+                    WAL_SRC_OVERRIDE
+                } else if measured {
+                    WAL_SRC_MEASURED
+                } else {
+                    WAL_SRC_UNMEASURED
+                },
+                Ordering::Relaxed,
+            );
             // Compare against what this node WOULD have chosen, not against
             // the bare constant: the size budget is derived from the volume
             // now, so a stock node differs from DEFAULT_WAL_SIZE_LIMIT_MB and
@@ -5133,7 +5199,7 @@ fn flintinfo(
     let write_stall = rocks.as_ref().and_then(|kv| kv.write_stall());
     let compaction = rocks.as_ref().and_then(|kv| kv.compaction_pressure());
     let info = format!(
-        "role:{}\r\nloading:0\r\nrole_epoch:{role_epoch}\r\nbuild:{build}\r\nsst_bytes:{sst}\r\nlatest_seq:{latest}\r\nlast_applied:{last_applied}\r\nacked_seq:{}\r\nseq_lag:{seq_lag}\r\nwal_headroom_seq:{whs}\r\nwal_min_acked_seq:{wma}\r\nwal_headroom_shed_seq:{whl}\r\nwal_bytes_per_seq:{wbps}\r\nlive_replicas:{}\r\nlag_ms:{}\r\nlag_ms_max:{lmx}\r\nlag_max_gap:{lmg}\r\nlag_soft_ms:{soft}\r\nlag_hard_ms:{hard}\r\nmin_replicas_to_write:{minr}\r\nwidowed_grace_ms:{wgm}\r\nwidowed_shed:{wsh}\r\nfullsync_active:{fsa}\r\nfullsync_max:{fsm}\r\nasync_write_queue:{aqd}\r\nwrite_deadline_ms:{wdm}\r\nwrite_inflight:{wif}\r\nwrite_service_us:{wsu}\r\nwrite_wait_est_ms:{wwe}\r\nwrites_shed_deadline:{wsd}\r\nwrites_shed_lag:{wsl}\r\nwrites_shed_quorum:{wsq}\r\nwrites_shed_widowed:{wswd}\r\nwrites_shed_headroom:{wshr}\r\nwrites_delayed_soft:{wdsf}\r\nwal_fsync_ms:{wfm}\r\nwal_fsync_total:{wft}\r\ncert_days_remaining:{cdr}\r\nactive_conns:{ac}\r\nmax_conns:{mc}\r\nconns_shed_total:{cs}\r\nwrite_stopped:{wst}\r\ndelayed_write_rate:{dwr}\r\nwrite_stall_readable:{wsr}\r\nl0_files:{l0f}\r\npending_compaction_bytes:{pcb}\r\ncompaction_readable:{cr}\r\ndisk_free_bytes:{dfb}\r\ndisk_total_bytes:{dtb}\r\ndisk_free_pct:{dfp}\r\ndisk_verdict:{dv}\r\ndisk_unknown_samples:{dus}\r\nevictable_ns:{ens}\r\nevictable_ns_agree:{ensa}\r\nevictable_ns_bytes:{ensb}\r\nreclaim_active:{rca}\r\nreclaim_target_free_bytes:{rctf}\r\nevict:{evm}\r\ngc_swept_expired:{gse}\r\ngc_swept_orphans:{gso}\r\nuptime_ms:{upms}\r\n",
+        "role:{}\r\nloading:0\r\nrole_epoch:{role_epoch}\r\nbuild:{build}\r\nsst_bytes:{sst}\r\nlatest_seq:{latest}\r\nlast_applied:{last_applied}\r\nacked_seq:{}\r\nseq_lag:{seq_lag}\r\nwal_headroom_seq:{whs}\r\nwal_min_acked_seq:{wma}\r\nwal_headroom_shed_seq:{whl}\r\nwal_bytes_per_seq:{wbps}\r\nwal_archive_mb:{wamb}\r\nwal_archive_src:{wasrc}\r\nlive_replicas:{}\r\nlag_ms:{}\r\nlag_ms_max:{lmx}\r\nlag_max_gap:{lmg}\r\nlag_soft_ms:{soft}\r\nlag_hard_ms:{hard}\r\nmin_replicas_to_write:{minr}\r\nwidowed_grace_ms:{wgm}\r\nwidowed_shed:{wsh}\r\nfullsync_active:{fsa}\r\nfullsync_max:{fsm}\r\nasync_write_queue:{aqd}\r\nwrite_deadline_ms:{wdm}\r\nwrite_inflight:{wif}\r\nwrite_service_us:{wsu}\r\nwrite_wait_est_ms:{wwe}\r\nwrites_shed_deadline:{wsd}\r\nwrites_shed_lag:{wsl}\r\nwrites_shed_quorum:{wsq}\r\nwrites_shed_widowed:{wswd}\r\nwrites_shed_headroom:{wshr}\r\nwrites_delayed_soft:{wdsf}\r\nwal_fsync_ms:{wfm}\r\nwal_fsync_total:{wft}\r\ncert_days_remaining:{cdr}\r\nactive_conns:{ac}\r\nmax_conns:{mc}\r\nconns_shed_total:{cs}\r\nwrite_stopped:{wst}\r\ndelayed_write_rate:{dwr}\r\nwrite_stall_readable:{wsr}\r\nl0_files:{l0f}\r\npending_compaction_bytes:{pcb}\r\ncompaction_readable:{cr}\r\ndisk_free_bytes:{dfb}\r\ndisk_total_bytes:{dtb}\r\ndisk_free_pct:{dfp}\r\ndisk_verdict:{dv}\r\ndisk_unknown_samples:{dus}\r\nevictable_ns:{ens}\r\nevictable_ns_agree:{ensa}\r\nevictable_ns_bytes:{ensb}\r\nreclaim_active:{rca}\r\nreclaim_target_free_bytes:{rctf}\r\nevict:{evm}\r\ngc_swept_expired:{gse}\r\ngc_swept_orphans:{gso}\r\nuptime_ms:{upms}\r\n",
         if read_only { "replica" } else { "master" },
         hub.effective_acked(now)
             .map_or_else(|| "none".into(), |a| a.to_string()),
@@ -5142,6 +5208,17 @@ fn flintinfo(
             .map_or_else(|| "none".into(), |l| l.to_string()),
         soft = hub.lag_soft_ms(),
         hard = hub.lag_hard_ms(),
+        // BUG-0079. The archive budget and HOW it was chosen, so a
+        // floor-clamped seat is visible to a check instead of to one boot log
+        // line. Paired with disk_total_bytes below, these state an invariant a
+        // drill can assert: when the source is `measured`, the budget must be
+        // the one this volume implies. The boot race that produced a 1 GiB
+        // archive on a 3.5 TB NVMe violates exactly that -- the failed sample
+        // happened once, at boot, while the disk guard goes on sampling the
+        // same directory successfully forever after, so the seat's own INFO
+        // contradicts itself and anything reading it can say so.
+        wamb = WAL_BUDGET_MB.load(Ordering::Relaxed),
+        wasrc = wal_budget_src_str(),
         // ADR-0023 D7.1. Reported even while nothing evicts, because the
         // operator-visible question is "does this pair agree", and a value
         // nobody can read cannot be compared. -1 means not yet known, which
