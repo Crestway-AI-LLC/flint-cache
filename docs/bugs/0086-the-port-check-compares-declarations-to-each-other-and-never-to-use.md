@@ -1,6 +1,6 @@
 # BUG-0086: the port check compares declarations to each other, and never to use
 
-Status: the collision it missed is FIXED; the check gap is OPEN
+Status: the collision it missed is FIXED; the check gap is CLOSED 2026-09-02
 Severity: low today (the gate runs drills sequentially), and it is a check that
 cannot see the thing it exists to prevent
 
@@ -121,6 +121,69 @@ is the whole of it.
 That is a rule about two flags rather than a general property, and it would
 have caught this bug. Whether it generalises past the flags that exist today is
 unproven, and claiming otherwise is what the first version of this section did.
+
+## BUILT 2026-09-02
+
+`assert_no_duplicate_drill_ports` already carried the "every port used in code
+must be declared" half; it scanned `--port N`, `-p N` and `127.0.0.1:N`. Two
+binding forms it could not see are now scanned with it — one check, one
+question, one failure message, rather than the second check this file warns
+about.
+
+**The supervising flags.** `--manage-pairs` / `--manage-slots` take `PORT:DIR`
+specs. `build_pairs` turns them into `Pair::managed`, and a managed pair is
+supervised: `spawn_slot` runs `flint-server --port <port>` and respawns it. So
+those ports are bound by the drill's own process tree. `--pairs` and `--nodes`
+take the same shape and build `Pair::decision`, which only dials seats someone
+else runs — they stay unscanned, which is precisely why `fleet_guard`'s
+fake-peer `7788`/`7789` do not trip this. The bind/connect distinction the
+section above proposed survived contact with the source, and it is a property
+of the flag rather than of the spelling.
+
+**The chaos base.** `--port-base N` claims `N .. N+SPAN-1` — master, replica,
+proxy, and the replacement-replica pool. Only `N` is written in the drill, so
+before this a drill declaring just its base read as fully declared while
+binding seven more. `SPAN` is READ from `crates/flint-chaos/src/cluster.rs`,
+never restated: that file calls it "a contract with the drills, so it lives
+here rather than being spelled out in seven shell scripts", and copying the 8
+into the gate would make the gate the eighth place to keep in sync — this
+file's own defect, one dimension over.
+
+**No exclusion list was needed**, which was the objection that kept this
+unbuilt. Not because the false positives were argued away but because none of
+them appear in a binding argument: the freeze destinations and the unreachable
+CP are `127.0.0.1:PORT` operands, the fake peer's are in `--pairs`, and two
+were comments. `DRILL_DEAD_PORTS` already existed in `tools/lib/drill-ports.sh`
+for an independent reason — the allocator must never hand those out — so
+nothing new had to be declared to make the check quiet.
+
+### Verified by mutation, five ways
+
+A check that passes on a clean tree has demonstrated nothing, which is the
+whole subject of this file. Each mutation was confirmed to have changed bytes
+before its result was read:
+
+| mutation | result |
+|---|---|
+| 6521 removed from `controller_multipair`'s `fleet_init` — **this bug, exactly** | FAILS, naming 6521 |
+| 6500 removed — the FIRST token of the spec | FAILS, naming 6500 |
+| 6870 removed — first token, other drill | FAILS, naming 6870 |
+| `chaos_drill` declares `6330 6331 6332` instead of the full block | FAILS, naming 6333-6337 |
+| `SPAN` renamed to `PORT_SPAN` in the crate | FAILS, saying it cannot read the constant |
+
+The first-token cases are in the table because the first version of the scan
+dropped every one of them and still reported the tree clean. It used BSD
+`sed`'s `\?`, which is a GNU extension: the substitution silently did nothing,
+the extraction returned the flag name instead of the ports, and the comparison
+passed. On the Linux gate box the same line would have worked — a check that
+behaves differently on the machine where it matters is the rc.15 bug class, and
+it appeared here while building the check meant to prevent its cousin. The
+shipped version does the work in `grep -oE` and `seq`, which agree on both.
+
+The last row is the tri-state one. If the constant cannot be read, the two
+available ways to be silent are both wrong: defaulting to 8 keeps asserting
+against a number the source may have changed, and skipping the expansion passes
+every chaos drill without examining it. It fails instead.
 
 ## The shape
 

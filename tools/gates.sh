@@ -470,8 +470,27 @@ assert_no_duplicate_drill_ports() {
     echo "      without having examined anything."
     exit 1
   }
-  local bad d decl used u map f
+  local bad d decl used u map f b CHAOS_SPAN
   map=$(drill_declared_ports)
+  # How many ports one --port-base claims. Read from the crate that defines the
+  # contract; see the block-expansion comment below for why it is not copied.
+  #
+  # TRI-STATE, NOT A DEFAULT. If the constant cannot be read the honest answer
+  # is "I could not look", and the two wrong ways to say that are both
+  # available here: falling back to 8 would silently keep asserting against a
+  # number the source may have changed, and skipping the expansion would report
+  # every chaos drill as fully declared while it binds seven undeclared ports.
+  # A gate that cannot read its own input fails.
+  CHAOS_SPAN=$(sed -n 's/^pub const SPAN: u16 = \([0-9][0-9]*\);.*/\1/p' \
+    crates/flint-chaos/src/cluster.rs 2>/dev/null | head -1)
+  if [ -z "$CHAOS_SPAN" ]; then
+    echo "GATES FAILED: cannot read SPAN from crates/flint-chaos/src/cluster.rs."
+    echo "      --port-base claims SPAN ports and only the base is written in the"
+    echo "      drill, so without this number the block expansion below would"
+    echo "      pass every chaos drill without having checked it. If the constant"
+    echo "      was renamed or moved, update this reader in the same commit."
+    exit 1
+  fi
   bad=$(printf '%s\n' "$map" | sort -n \
     | awk '{c[$1]=c[$1]" "$2} END {for (p in c) {n=split(c[p],a," "); if (n>1) print "    port "p" declared by"c[p]}}')
   if [ -n "$bad" ]; then
@@ -517,6 +536,43 @@ assert_no_duplicate_drill_ports() {
     used=$(grep -v '^[[:space:]]*#' "$f" \
       | grep -oE '(--port|-p)[[:space:]]+[0-9]{4,5}|127\.0\.0\.1:[0-9]{4,5}' \
       | grep -oE '[0-9]{4,5}$' | sort -u)
+    # AND THE PORTS NAMED IN ARGUMENTS THAT BIND, which the two forms above
+    # cannot see. BUG-0086: controller_multipair spelled 6521 as `6521:$DIR`
+    # inside --manage-pairs and nowhere else, so it was used, undeclared, and
+    # invisible to every check in this file.
+    #
+    # WHY THESE TWO FLAG FAMILIES AND NOT A WIDER SCAN. A port literal is not
+    # evidence of ownership -- the same bug measured six drills naming a port
+    # they correctly do not declare (a freeze destination, a CP that must be
+    # unreachable, a simulated peer's argv, two comments). What separates them
+    # is not the spelling but the ARGUMENT: --manage-pairs/--manage-slots are
+    # supervising flags. flint-controller parses their PORT:DIR specs into
+    # Pair::managed (crates/flint-controller/src/main.rs), which spawns a
+    # flint-server on each port and respawns it -- so those ports are bound by
+    # this drill's own process tree, which is exactly what a declaration
+    # claims. --pairs and --nodes take the same shape and build Pair::decision,
+    # which only DIALS seats someone else runs; they stay unscanned, and that
+    # is why fleet_guard's fake-peer 7788/7789 do not trip this.
+    used="$used
+$(grep -v '^[[:space:]]*#' "$f" \
+      | grep -oE '\-\-manage-(pairs|slots)[[:space:]=]+"?[0-9][^"]*' \
+      | tr ';,' '\n\n' | grep -oE '^[0-9]{4,5}:|[[:space:]="]+[0-9]{4,5}:' \
+      | grep -oE '[0-9]{4,5}')"
+    # A CHAOS BASE CLAIMS A BLOCK, NOT A PORT. --port-base N binds N+0 master,
+    # N+1 replica, N+2 proxy and N+FIRST_POOL upward for replacement replicas.
+    # Only N appears in the file, so a drill that declared just its base would
+    # read as fully declared while binding seven more.
+    #
+    # SPAN IS READ FROM THE CRATE, never restated here. cluster.rs calls it "a
+    # contract with the drills, so it lives here rather than being spelled out
+    # in seven shell scripts" -- copying the 8 into the gate would make this
+    # file the eighth place to keep in sync, which is the shape of defect
+    # BUG-0086 is about.
+    for b in $(grep -v '^[[:space:]]*#' "$f" | grep -oE '\-\-port-base[[:space:]=]+[0-9]{4,5}' | grep -oE '[0-9]{4,5}$'); do
+      used="$used
+$(seq "$b" $((b + CHAOS_SPAN - 1)))"
+    done
+    used=$(printf '%s\n' "$used" | grep -E '^[0-9]+$' | sort -u)
     for u in $used; do
       drill_is_dead_port "$u" && continue
       printf '%s\n' "$u" | grep -qE "^($decl)$" || bad="$bad
