@@ -90,6 +90,62 @@ throughput.
   A proportional controller holding `l0_files` just under the slowdown
   trigger is the obvious shape, but the gain and the measurement interval are
   unmeasured, and an oscillating admission gate would be worse than none.
+
+  **AMENDED 2026-09-02: ask this of the LAG CAP first, because that is the
+  gate that binds.** This ADR's own amendment demoted the stall gate to a
+  backstop "for where replica lag binds". A duration-bounded soak has now
+  measured which gate that is. One pair on `i4i.large`, 4 feeders at 48 MB/s
+  aggregate against the ~22 MB/s a 2-vCPU seat sustains:
+
+  | counter | after one cycle |
+  |---|---|
+  | `writes_shed_lag` | **134,091** |
+  | `writes_shed_deadline` | 0 |
+  | `writes_shed_headroom` | 0 |
+  | `writes_delayed_soft` | **443** |
+
+  So the control law that governs real back-pressure today is the lag cap's,
+  and it is not a controller at all. It is bang-bang with a constant:
+
+      lag <  soft (500ms)   -> nothing
+      soft <= lag < hard    -> sleep(2ms) per write, counted
+      lag >= hard (1000ms)  -> shed -THROTTLED
+
+  **The soft band did about 0.3% of the work** — 443 delays against 134,091
+  rejections, roughly 300:1. Whatever the soft band is for, at this overload it
+  is not what stopped the writes.
+
+  Two candidate causes, and they call for different fixes, so the next
+  measurement should separate them rather than assume one:
+
+  1. **The band is too narrow in TIME.** With ~48 MB/s offered against ~22 MB/s
+     applied, the backlog grows at roughly 1.2 seconds of lag per second, so
+     the 500ms between soft and hard is crossed in well under a second. A band
+     the controller barely occupies cannot damp anything. *(Arithmetic from
+     measured rates, not itself measured — shown so it can be checked.)*
+  2. **The action is too weak, and concurrency-blind.** A fixed 2ms sleep per
+     write is a constant, not a function of error. It does not scale with how
+     far past `soft` the lag is, nor with how many writers are in flight, so
+     its damping effect falls as connection count rises — the opposite of what
+     is wanted, since more writers is what produces the overload.
+
+  The proportional shape proposed above for `l0_files` applies at least as well
+  here, with the same two unknowns — gain and measurement interval — and the
+  same hazard, that an oscillating gate is worse than none. The difference is
+  that here there is now a measured operating point to design against instead
+  of an accidental 62%.
+
+  **Also settled by the same run:** back-pressure comes from offered RATE, not
+  from failure events. 12 cross-host kills over 130,152 writes shed **4**;
+  sustained ingestion above replication capacity shed **134,091**. Four orders
+  of magnitude apart. A control law tuned on kill-driven shedding would be
+  tuned on the wrong signal entirely.
+
+  Caveat, because it bounds what may be designed on this: the 300:1 ratio is
+  **one cycle**, not a replicated measurement. The primary claim it sits beside
+  — that lag binds and the other gates do not — is categorical and survives a
+  single sample; a RATIO is a quantity and does not. Replicate before choosing
+  a gain.
 - **Whether the same limit belongs on the replica.** It applies the same
   writes with the same engine, so it can stall too; it just never did here,
   because the master stalled first and gave it slack.
