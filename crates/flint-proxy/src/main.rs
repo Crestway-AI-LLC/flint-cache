@@ -3544,6 +3544,31 @@ fn log_ms() -> u64 {
 /// trade is made -- and it is a trade, not a measurement.
 const MAX_IDLE_READS: u32 = 10;
 
+/// Label a control-plane dial failure with its phase, and say what EAGAIN
+/// means here.
+///
+/// A FREE FUNCTION SO IT CAN BE TESTED. As a closure inside
+/// `watch_control_plane` the wording was unreachable from any test, and the
+/// claim it makes -- that this errno points at port exhaustion -- is exactly
+/// the kind of claim that should not rest on having read it once.
+fn connect_err(e: std::io::Error) -> std::io::Error {
+    // The errno survives only until the error is rebuilt, so ask first.
+    // EAGAIN and EWOULDBLOCK both arrive as WouldBlock.
+    let starved = e.kind() == std::io::ErrorKind::WouldBlock;
+    let labelled = std::io::Error::new(e.kind(), format!("connect: {e}"));
+    if !starved {
+        return labelled;
+    }
+    std::io::Error::new(
+        labelled.kind(),
+        format!(
+            "{labelled} (EAGAIN before any read: the ephemeral port range may be \
+             exhausted, or the routing cache full -- check TIME_WAIT volume with \
+             `ss -s` on this host)"
+        ),
+    )
+}
+
 fn watch_control_plane(
     cp: &str,
     advertise: &str,
@@ -3570,8 +3595,23 @@ fn watch_control_plane(
     let phase = |p: &'static str| {
         move |e: std::io::Error| std::io::Error::new(e.kind(), format!("{p}: {e}"))
     };
-    let mut stream =
-        flint_tls::connect_reloadable(cp, &topo.backend_tls).map_err(phase("connect"))?;
+    // AND WHAT EAGAIN MEANS HERE, because reading it as a timeout is what sent
+    // the first diagnosis of this bug down the wrong path.
+    //
+    // flint_tls::connect dials through TcpStream::connect_timeout, which sets
+    // the socket non-blocking, calls connect(2) and returns anything that is
+    // not EINPROGRESS. connect(2) documents EAGAIN for a TCP socket with no
+    // bound address when the whole ephemeral range is in use -- that is the
+    // errno for port exhaustion, where EADDRNOTAVAIL is the intuitive guess
+    // and the wrong one. It fails in ~0s, so the rotation loop's 1s sleep
+    // becomes the entire period: once a second, which is the cadence this bug
+    // was actually reported at, and which an idle read (30s) cannot produce.
+    //
+    // BOTH DOCUMENTED CAUSES ARE NAMED rather than chosen between: a full
+    // routing cache returns the same errno, and nothing at this call site can
+    // tell them apart. Suggesting the wrong one with confidence is the failure
+    // mode this whole bug is a record of.
+    let mut stream = flint_tls::connect_reloadable(cp, &topo.backend_tls).map_err(connect_err)?;
     stream
         .set_read_timeout(Some(Duration::from_secs(30)))
         .map_err(phase("set_read_timeout"))?;
@@ -4805,6 +4845,59 @@ mod route_tests {
             moved.get(&(b"acme".to_vec(), 200)).map(String::as_str),
             Some("c:1"),
             "disagreeing (newer) bridge must survive the push"
+        );
+    }
+}
+
+#[cfg(test)]
+mod connect_err_tests {
+    use super::connect_err;
+    use std::io::{Error, ErrorKind};
+
+    // BUG-0081. The hint must name the phase AND fire only on the errno it
+    // is about. A hint that appended itself to every dial failure would be
+    // the same defect this bug records -- a message that reads like a
+    // diagnosis and is not one.
+    #[test]
+    fn eagain_is_labelled_and_explained() {
+        let out = connect_err(Error::new(
+            ErrorKind::WouldBlock,
+            "Resource temporarily unavailable",
+        ))
+        .to_string();
+        assert!(out.starts_with("connect: "), "phase must lead: {out}");
+        assert!(
+            out.contains("ephemeral port range"),
+            "EAGAIN must be explained: {out}"
+        );
+        // Both documented causes, so the reader is not pointed at one.
+        assert!(
+            out.contains("routing cache"),
+            "the other cause must be named: {out}"
+        );
+    }
+
+    // THE NEGATIVE CONTROL. A refused connection is the ordinary case and
+    // must carry the phase and nothing else; without this the assertion
+    // above passes for a function that appends the hint unconditionally.
+    #[test]
+    fn other_errors_get_the_phase_and_no_hint() {
+        let out = connect_err(Error::new(
+            ErrorKind::ConnectionRefused,
+            "Connection refused",
+        ))
+        .to_string();
+        assert_eq!(out, "connect: Connection refused");
+        assert!(!out.contains("ephemeral"), "hint must not fire here: {out}");
+    }
+
+    // The kind survives, because the caller rotates on any Err and a future
+    // reader classifying by kind must still see the original.
+    #[test]
+    fn the_error_kind_is_preserved() {
+        assert_eq!(
+            connect_err(Error::new(ErrorKind::WouldBlock, "x")).kind(),
+            ErrorKind::WouldBlock
         );
     }
 }

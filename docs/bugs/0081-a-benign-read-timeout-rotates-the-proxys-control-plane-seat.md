@@ -1,4 +1,4 @@
-# BUG-0081 — a benign read timeout rotates the proxy's control-plane seat (defect 1 FIXED 2026-09-02; defect 2 OPEN, narrowed 2026-09-02)
+# BUG-0081 — a benign read timeout rotates the proxy's control-plane seat (defect 1 FIXED 2026-09-02; defect 2 NARROWED to one call 2026-09-02, still unreproduced)
 
 **Found** 2026-09-01, in the tail of an `elasticache-bench --regime a` run. The
 benchmark produced every number correctly and then **exited 1**, on this,
@@ -132,8 +132,37 @@ fix, in a third place.
 
 - ~~Whether the socket sets a read timeout deliberately or inherits one.~~
   ANSWERED above: deliberate, 30 s.
-- Which call actually produced the observed `EAGAIN`. The evidence places it
-  before the read; the port-exhaustion hypothesis is unverified.
+- ~~Which call actually produced the observed `EAGAIN`.~~ **NARROWED to one
+  call 2026-09-02, by reading the dial path rather than the message.**
+
+  `watch_control_plane` → `flint_tls::connect_reloadable` → `flint_tls::connect`
+  → `TcpStream::connect_timeout` (`crates/flint-tls/src/lib.rs:614`). That is
+  the only call before the read that can fail, and the timeout is not
+  incidental: `connect_timeout` sets the socket non-blocking, calls `connect(2)`
+  and returns anything that is not `EINPROGRESS`.
+
+  **`connect(2)` documents `EAGAIN` for a TCP socket with no bound address when
+  the whole ephemeral port range is in use.** That is the errno for port
+  exhaustion — `EADDRNOTAVAIL` is the intuitive guess and the wrong one — so the
+  hypothesis this file recorded as unverified is the one Linux's own
+  documentation points at, and it now has a named call site instead of a
+  location ("before the read"). It also closes the cadence argument from the
+  other end: a `connect` that fails this way returns in ~0 s, so the rotation
+  loop's `sleep(1000ms)` is the entire period. Once a second, as observed.
+
+  **Still not a reproduction, and the difference matters.** A second documented
+  cause — insufficient routing-cache entries — produces the same errno, and
+  nothing at that call site can separate them. What changed is that the next
+  occurrence identifies itself: the phase label prints `connect: …`, and the
+  message now names both causes and points at `ss -s`. Neither was true when
+  this was filed, which is why it cost a code read to get even this far.
+
+  `connect_err` is a free function rather than a closure so the wording has
+  controls: EAGAIN gets the phase and both causes, a refused connection gets
+  the phase and nothing else, and the `ErrorKind` survives the rewrap. The
+  negative control was confirmed to fail when the hint is made unconditional —
+  without it, the positive test passes for a function that appends the hint to
+  everything, which would be this bug's own defect reintroduced as its fix.
 - ~~Whether the three-seat case actually churns as predicted.~~ **RUN, not
   inferred, 2026-09-02.** `cp_watch_idle_drill.sh` now stands up THREE control
   plane seats and leaves the fleet idle past the 30 s read timeout. It asserts
