@@ -1361,10 +1361,22 @@ mod ctl_reply_cap_tests {
                 std::time::Duration::from_secs(30),
             ));
         });
-        let r = match rx.recv_timeout(std::time::Duration::from_secs(120)) {
+        // 300s, not 120, and the first number was measured on the WRONG
+        // MACHINE. 18s on a 16-vCPU laptop; on a GitHub runner with 2-4, the
+        // last GREEN ci run before this fix warned at 60s and finished ok
+        // about 120s in -- against work quadratic in the 8 MiB cap, so the gap
+        // scales worse than the core count. A 120s bound therefore sat exactly
+        // on CI's normal duration and failed it on the first push.
+        //
+        // 300s is ~2.5x the measured CI time. It keeps a real hang bounded to
+        // five minutes rather than the forty this bug is named for, without
+        // failing a slow runner that is still making progress. If this ever
+        // trips, the message below is the thing to believe: it means the read
+        // loop stopped progressing, not that the box was busy.
+        let r = match rx.recv_timeout(std::time::Duration::from_secs(300)) {
             Ok(v) => v,
             Err(_) => panic!(
-                "call_once_with never returned: 120s with no result from a peer \
+                "call_once_with never returned: 300s with no result from a peer \
                  that trickles well-formed bulks forever. The byte cap \
                  ({MAX_CTL_REPLY_BYTES} bytes) should have refused this long \
                  before now, so either the cap stopped firing or the read loop \

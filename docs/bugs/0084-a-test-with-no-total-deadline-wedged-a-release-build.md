@@ -77,10 +77,16 @@ Two changes, and neither tries to make the test faster — the point is that an
 indefinite hang becomes a NAMED failure.
 
 **A total deadline the test cannot exceed.** The call now runs on a worker
-thread behind `recv_timeout(120s)`; on expiry the test panics with a message
-saying it waited 120s for a peer that trickles forever, naming the byte cap
-that should have refused it long before. 120s against a measured 18s is
-deliberate slack: this polices hangs, not performance.
+thread behind `recv_timeout(300s)`; on expiry the test panics with a message
+naming the byte cap that should have refused the peer long before.
+
+> **The first bound was 120s and it reddened main**, which is worth keeping
+> because it is the same mistake twice in one bug: *measuring on the wrong
+> machine*. 18s on a 16-vCPU laptop is not the number that matters. Pulled the
+> last GREEN ci run and read the actual timestamps — warned at 60s, finished
+> **ok at ~120s** — so the bound sat exactly on CI's normal duration. 300s is
+> ~2.5x that. A real hang is now bounded to five minutes instead of forty, and
+> a slow runner still making progress is not failed for it.
 
 **A write timeout on the peer.** `set_write_timeout(5s)` on the writer socket,
 so the thread cannot park forever on a full socket buffer once the client stops
