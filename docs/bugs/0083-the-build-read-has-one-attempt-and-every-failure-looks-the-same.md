@@ -1,4 +1,4 @@
-# BUG-0083 — the build read has one attempt, and every way it can fail looks identical (OPEN)
+# BUG-0083 — the build read has one attempt, and every way it can fail looks identical (FIXED 2026-09-01)
 
 **Found** 2026-09-01, looking for the cause of an intermittent
 `admin_gated_proxy` failure on the public gate at 69c190b. Found in the code,
@@ -207,6 +207,44 @@ status path.
 changing its type touches far more call sites than the two readers already
 converted; it is the next batch, not a rider on this one. Recorded here so the
 finding is not lost between gates.
+
+## Fixed 2026-09-01, all three tiers
+
+`proxystats_field` (proxy), `cpinfo_field` (control plane) and `roll_node`'s
+build assertion (pair nodes) now route through one classifier,
+`field_from_reply`, which answers three ways instead of two:
+
+- `Ok(Some(v))` — the seat named the field
+- `Ok(None)` — the seat ANSWERED and has no such field
+- `Err(why)` — the read failed, and here is which failure
+
+`roll_edge` and `roll_node` still abort on a failed read, because a roll that
+cannot be verified must not report success. What changed is that the abort now
+names the cause, so the next occurrence produces evidence instead of the empty
+tail that started this.
+
+**Retry is deliberately NOT implemented.** Which transient fires is still
+unknown, and picking a remedy before the evidence exists is how rc.29, #102 and
+rc.47 each removed one way to fail while leaving the single attempt in place.
+The next red says which, and the remedy follows it.
+
+Gate: GATES PASSED, 137 steps, 0 failures, twice — once for the proxy/CP half
+and once for the node half. `upgrade`, `build_stamp`, `edge_roll`, `cpha_roll`
+and `admin_gated_proxy` all green on both.
+
+## Owed, and stated rather than omitted
+
+**No drill asserts the end-to-end behaviour.** `field_from_reply` has three
+unit tests, two of which fail against the pre-fix collapsing code with the
+mutation verified applied first. But nothing exercises "a roll meeting a failed
+read aborts with a message that names the cause", because forcing a real read
+failure mid-roll needs a fault-injection seam of the kind
+`FLINT_BATCH_COMMIT_FAIL` provides for the commit path.
+
+Saying so plainly: the classification is pinned, the CONSEQUENCE is not. By
+this repo's own standard — and by ADR-0028, which this bug is the worked
+example for — an untested claim about behaviour is exactly the sort of thing
+that survives because nobody checks it.
 
 ## Still not established
 
