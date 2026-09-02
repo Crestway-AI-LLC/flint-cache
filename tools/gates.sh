@@ -1026,6 +1026,91 @@ fi
 #
 # Kept here rather than in fleet.sh because it is a property of the SET of
 # drills, which no single drill can check about itself.
+# THE BUG INDEX AND THE BUG FILES MUST AGREE, AND EVERY NUMBER IS ONE BUG.
+#
+# Ported from flint-cache-ops on 2026-09-02, where the same three defects were
+# found, plus two this repo taught on the way in:
+#
+#   1. The table header carried TWO columns while 46 rows carried THREE. GFM
+#      drops cells past the header count, so the detail column -- the part
+#      worth reading -- rendered for nobody. 47 ragged rows.
+#   2. NUMBER 0034 NAMED TWO FILES. One was indexed; the other had no title at
+#      all, because it was never a standalone document -- both its commits are
+#      titled BUG-0034 and it was a section of the same write-up. A duplicate
+#      number is worse than a missing row: two documents answer to one
+#      citation and a reader has no way to know they did not get the other.
+#   3. A file with NO `# BUG-NNNN` heading is unciteable and, as 0034 showed,
+#      invisible to a check that only asks whether the index mentions it.
+#
+# It fails when it cannot look, not only when it finds a gap: an unreadable
+# README, or a bugs directory with no files, means this did not run. A matcher
+# that finds nothing agrees with everything.
+assert_bug_index_agrees() {
+  local idx=docs/bugs/README.md missing="" untitled="" dups b n h files=0
+  if [ ! -s "$idx" ]; then
+    echo "FAIL  $idx is missing or empty -- the bug index could not be read"
+    echo "        This check did not run. That is not the same as passing."
+    FAILED="$FAILED bug-index-unreadable"
+    return
+  fi
+  for f in docs/bugs/[0-9][0-9][0-9][0-9]-*.md; do
+    [ -e "$f" ] || continue
+    files=$((files + 1))
+    b=$(basename "$f"); n=${b%%-*}
+    # Both key forms are legitimate here: early rows are keyed by filename,
+    # later ones by number. Ask the question the index is FOR -- is this file
+    # reachable -- not how it is spelled.
+    grep -qE "^\| (BUG-$n|\`$b\`) \|" "$idx" || missing="$missing $n"
+    h=$(head -1 "$f")
+    case "$h" in
+      "# BUG-$n"*) ;;
+      *) untitled="$untitled $b" ;;
+    esac
+  done
+  if [ "$files" -eq 0 ]; then
+    echo "FAIL  no docs/bugs/NNNN-*.md files found -- this check examined nothing"
+    echo "        Either the series moved or the glob is wrong; both are bugs in"
+    echo "        this check, and neither is a green index."
+    FAILED="$FAILED bug-index-examined-nothing"
+    return
+  fi
+  dups=$(ls docs/bugs/[0-9][0-9][0-9][0-9]-*.md 2>/dev/null | xargs -n1 basename \
+         | cut -c1-4 | sort | uniq -d | tr '\n' ' ')
+  [ -n "$dups" ] && {
+    echo "FAIL  bug number(s) naming more than one file: $dups"
+    echo "        One citation, two documents, and no way for a reader to know"
+    echo "        they did not get the other. Merge them or renumber."
+    FAILED="$FAILED bug-number-dup"; }
+  [ -n "$untitled" ] && {
+    echo "FAIL  bug file(s) whose first line is not '# BUG-<its own number>':$untitled"
+    echo "        An untitled write-up is uncitable, and invisible to a check"
+    echo "        that only asks whether the index mentions it."
+    FAILED="$FAILED bug-title"; }
+  local ragged want
+  ragged=$(awk -F'|' '
+      !w && /^\| (Bug|File) \| / { w = NF-2; next }
+      !w { next }
+      /^\|[- ]*\|$/ { next }
+      /^\| / { line=$0; gsub(/\\\|/,"",line); if (split(line,a,"|")-2 != w) printf " %d", NR }' "$idx")
+  want=$(awk -F'|' '/^\| (Bug|File) \| /{print NF-2; exit}' "$idx")
+  [ -n "$ragged" ] && {
+    echo "FAIL  index row(s) whose cell count differs from the $want-column header:$ragged"
+    echo "        GFM drops cells past the header, so those rows lose their"
+    echo "        detail silently. Escape a literal pipe as \\| ."
+    FAILED="$FAILED bug-index-ragged"; }
+  local orphan
+  orphan=$(grep -oE '^\| BUG-[0-9]{4} \|' "$idx" | grep -oE '[0-9]{4}' | sort -u \
+           | while read -r q; do ls docs/bugs/"$q"-*.md >/dev/null 2>&1 || printf ' %s' "$q"; done)
+  [ -n "$orphan" ] && {
+    echo "FAIL  index row(s) naming a bug file that does not exist:$orphan"
+    FAILED="$FAILED bug-index-orphan"; }
+  [ -z "$missing" ] && return 0
+  echo "FAIL  bug file(s) with no row in $idx:$missing"
+  echo "        The index is how a number is read without opening the file."
+  echo "        Add the row in the SAME commit as the write-up."
+  FAILED="$FAILED unindexed-bugs"
+}
+
 assert_no_default_ports() {
   local hits
   hits=$(grep -nE '^fleet_init .*[^0-9](7001|7002|7379|7500)([^0-9]|$)' \
@@ -1518,6 +1603,7 @@ assert_lease_ttl_single_source() {
 if want check; then
   echo "== gates: fmt, clippy, tests (both feature configs)"
   assert_no_default_ports
+  assert_bug_index_agrees
   assert_no_port_overlap
   assert_scripts_parse
   assert_no_scope_overlap
