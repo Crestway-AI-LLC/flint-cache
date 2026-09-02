@@ -86,6 +86,18 @@ echo "== HOT RELOAD: change values in the config, 'flintctl reload', NO restart"
 # Capture the master's pid so we can prove it never restarted.
 PID_BEFORE=$(cat "$STATE/pids/node-7211.pid")
 sed -i.bak 's/wal-fsync-ms 250/wal-fsync-ms 1000/; s/lag-hard-ms 2000/lag-hard-ms 3000/; s/max-conns 4096/max-conns 8192/' "$INV"
+# ADR-0028 obligation 2: DECLARE THE BYTES THAT CHANGED, not the text predicted
+# to change. The three checks below assert the server reports 1000/3000/8192 --
+# which is the right assertion and passes just as well if the inventory ALREADY
+# said those values and the sed matched nothing. A default moving to any one of
+# them turns this stage into a reload of an unchanged file that certifies hot
+# reload works. `sed -i.bak` has already written the pre-mutation copy; nothing
+# was reading it.
+cmp -s "$INV" "$INV.bak" && {
+  echo "FAIL: the config edit changed nothing — $INV is byte-identical to its"
+  echo "      pre-edit copy, so the reload below would prove nothing. Either a"
+  echo "      pattern drifted or the inventory already carried these values."
+  exit 1; }
 ./target/release/flintctl -f "$INV" reload 2>&1 | sed 's/^/  /'
 check wal_fsync_ms 1000
 check lag_hard_ms 3000
