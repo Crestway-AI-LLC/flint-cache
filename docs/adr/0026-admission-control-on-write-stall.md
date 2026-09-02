@@ -215,8 +215,55 @@ knee.
 - **What caps ~80k seq/s.** Not compaction (6 threads move it 1%), not
   connection count, not replication below C=192. Unmeasured: the fsync path
   (`wal_fsync_ms` 500), device write bandwidth, WAL append serialization.
-- **Whether these knobs should ship as defaults.** Every number here comes
-  from a 16-vCPU box with 15 idle cores — the case `rocks.rs` warns makes this
-  knob look free while saying nothing about a 2-vCPU seat, where compaction
-  threads contend with the serve path. `FLINT_SUBCOMPACTIONS` exists so the
-  question can be asked on constrained hardware; it does not answer it.
+
+### ANSWERED 2026-09-02 — should these knobs ship as defaults? No.
+
+The second open question was whether numbers from a 16-vCPU box with 15 idle
+cores say anything about a constrained seat. Measured on `i4i.large` (2 vCPU),
+order-balanced, both arms verified from RocksDB's own LOG with 43 compactions
+confirmed so the mechanism actually ran: **`FLINT_SUBCOMPACTIONS=4` is worth
++1.71%**, against within-arm spreads of 0.72% and 0.45% — where the same knob
+is worth +9.8% on 16 vCPU and +14–43% at the batched rate. An order of
+magnitude smaller.
+
+`self-hosting.md` already carried the companion result for the other knob, and
+it points the same way harder: `FLINT_BG_JOBS` raised on a 2-vCPU seat made
+ingest **9.1% slower, with write amplification up 32%**, because compaction
+threads take the cores the write path needs.
+
+So the default stays 1, and `rocks.rs`'s warning is now measured rather than
+warned about: fifteen idle cores make a compaction knob look free while saying
+nothing about a seat where compaction contends with the serve path.
+
+### The first question is LOCAL, not a fleet question
+
+Worth stating because it changes what it costs to answer. Everything the fleet
+run established points away from the fleet:
+
+- the replica ended exactly level, peak lag ~85,000 sequences against a gate of
+  8,388,608 — three orders of magnitude of slack, and in 58 intervals it
+  *drained* backlog at up to 4.2x the master's rate. Replication is not the cap;
+- the master sat **92% idle** at the stall. Not CPU;
+- six compaction threads move the number by 1%. Not compaction parallelism.
+
+What remains — the fsync path, device write bandwidth, WAL append
+serialisation — are all properties of ONE machine. So the experiment is one
+`i4i.4xlarge` driven to the knee, not five hosts, and three readings
+discriminate the three candidates:
+
+1. **Write amplification**, from the engine's own counters (WAL bytes, flush
+   write bytes, compaction write bytes). At the knee the logical rate is
+   84–93 MB/s at 1,054 B/write; multiply by the measured amplification to get
+   what the device is actually being asked for.
+2. **The device ceiling**, measured on the same box with `fio` rather than
+   quoted from a spec sheet, and compared against (1).
+3. **`wal_fsync_ms`**, currently 500. If the fsync path is the cap, moving it
+   moves the ceiling; if it does not, that candidate is eliminated for the cost
+   of one arm.
+
+**And a process note that cost this write-up something.** The 2026-08-30 run
+recorded rates but not the engine's byte counters, and its boxes are long gone,
+so the amplification cannot be recovered from anything on disk — the question
+has to be re-run to be answered at all. A run that establishes a rate should
+keep the counters that would explain it, because the explaining question is
+always asked later and always by someone who cannot go back.
