@@ -1,4 +1,4 @@
-# BUG-0081 — a benign read timeout rotates the proxy's control-plane seat (OPEN)
+# BUG-0081 — a benign read timeout rotates the proxy's control-plane seat (defect 1 FIXED 2026-09-02; defect 2 OPEN)
 
 **Found** 2026-09-01, in the tail of an `elasticache-bench --regime a` run. The
 benchmark produced every number correctly and then **exited 1**, on this,
@@ -41,6 +41,36 @@ dead" and "this seat has nothing to say yet".
 - It is invisible in the drills because they assert on the DATA path, which
   this never touches — the last-applied table keeps serving throughout, by
   design.
+
+## Defect 1 FIXED 2026-09-02
+
+An idle read no longer rotates. `watch_control_plane` keeps waiting on the SAME
+connection when the read returns `WouldBlock`/`TimedOut`, so a quiet fleet stops
+paying a fresh CPWATCH and filtered snapshot every ~31s for nothing.
+
+**Bounded at `MAX_IDLE_READS` = 10 (~5 minutes), and that bound is a trade, not
+a measurement.** A silently partitioned seat times out forever and would
+otherwise never be abandoned. The two states are indistinguishable on this
+socket because CPWATCH has no keepalive — so the constant is where the trade
+gets made, and **the real fix is a keepalive**, which is a protocol change and
+is not smuggled in here.
+
+`tools/cp_watch_idle_drill.sh` asserts the consequence rather than the
+classification: a healthy fleet idle for 40s — longer than one 30s timeout —
+must produce zero rotations, with the proxy still subscribed and still serving.
+Both of those extra checks matter, because "no rotations" is trivially true of
+a proxy that never subscribed or has died.
+
+Verified by mutation before being trusted: with `MAX_IDLE_READS` forced to 1
+(the old behaviour) the drill fails at exactly one rotation in 40s, and the
+failure line reads `read: silent for 1 consecutive reads (~30s)` — the phase
+label from the other half of this bug doing its job. The mutation was confirmed
+to have changed bytes before the result was believed.
+
+The drill's FIRST version could not have failed at all: `grep -c` prints 0 and
+exits 1 with no matches, so `|| echo 0` produced `0\n0` and the comparison
+errored instead of comparing. It reported PASS. Fixed and recorded here because
+a control that cannot fail is the thing this whole bug is about.
 
 ## AMENDED 2026-09-01 — the mechanism above does not fit the cadence
 

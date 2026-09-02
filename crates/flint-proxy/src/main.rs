@@ -3535,6 +3535,15 @@ fn log_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// How many consecutive 30s idle reads to tolerate before concluding the
+/// control-plane seat is gone rather than quiet (BUG-0081).
+///
+/// Ten is ~5 minutes. An idle fleet must never rotate; a silently partitioned
+/// seat must eventually be abandoned. With no keepalive on CPWATCH those two
+/// states are indistinguishable on the wire, so this constant is where the
+/// trade is made -- and it is a trade, not a measurement.
+const MAX_IDLE_READS: u32 = 10;
+
 fn watch_control_plane(
     cp: &str,
     advertise: &str,
@@ -3581,6 +3590,9 @@ fn watch_control_plane(
     stream.write_all(&out).map_err(phase("write CPWATCH"))?;
     let mut buf: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 64 * 1024];
+    // Consecutive reads that returned nothing because the CP had nothing to
+    // push. Reset by any successful read; see the NeedMore arm below.
+    let mut idle_reads: u32 = 0;
     loop {
         match decode(&buf) {
             Ok(Decoded::Complete(frame, used)) => {
@@ -3646,9 +3658,57 @@ fn watch_control_plane(
                 }
             }
             Ok(Decoded::NeedMore) => {
-                // The idle case lands here after 30s. Labelled so a future reader
-                // does not have to re-derive which call it was.
-                let n = stream.read(&mut chunk).map_err(phase("read"))?;
+                // BUG-0081, first defect: AN IDLE CONTROL PLANE IS NOT A DEAD ONE.
+                //
+                // The read timeout above is 30s and deliberate, and the control
+                // plane sends NOTHING while idle -- its `watch` pushes only when
+                // the version advances past what this proxy has ACKed, waiting on
+                // a condvar in 500ms slices with no keepalive on the wire. So on a
+                // quiet fleet this read times out every 30s, and propagating that
+                // rotated the seat: a fresh CPWATCH and a fresh filtered snapshot
+                // every ~31s, forever, for nothing.
+                //
+                // The rotation exists for a real failure -- a proxy pinned to a
+                // killed seat, reconnecting to a corpse while quorum stayed
+                // healthy -- and that reasoning is sound. "This seat has nothing
+                // to say yet" is not that failure.
+                //
+                // So keep waiting on the SAME connection. A seat that actually
+                // dies gives EOF (handled below) or a hard error (handled here).
+                //
+                // BOUNDED, because a silently partitioned seat times out forever
+                // and would otherwise never be rotated away from. This trades
+                // detection latency for not churning, and the trade is only
+                // necessary because silence and death look identical on this
+                // socket. The real fix is a keepalive on CPWATCH, which is a
+                // protocol change and is recorded in the bug rather than smuggled
+                // in here.
+                let n = match stream.read(&mut chunk) {
+                    Ok(n) => {
+                        idle_reads = 0;
+                        n
+                    }
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) =>
+                    {
+                        idle_reads += 1;
+                        if idle_reads >= MAX_IDLE_READS {
+                            return Err(phase("read")(std::io::Error::new(
+                                e.kind(),
+                                format!(
+                                    "silent for {idle_reads} consecutive reads (~{}s); \
+                                     treating the seat as gone",
+                                    idle_reads * 30
+                                ),
+                            )));
+                        }
+                        continue;
+                    }
+                    Err(e) => return Err(phase("read")(e)),
+                };
                 if n == 0 {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::UnexpectedEof,
