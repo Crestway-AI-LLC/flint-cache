@@ -232,9 +232,28 @@ Gate: GATES PASSED, 137 steps, 0 failures, twice — once for the proxy/CP half
 and once for the node half. `upgrade`, `build_stamp`, `edge_roll`, `cpha_roll`
 and `admin_gated_proxy` all green on both.
 
-## Owed, and stated rather than omitted
+## Owed — CLOSED 2026-09-02
 
-**No drill asserts the end-to-end behaviour.** `field_from_reply` has three
+`tools/build_read_failure_drill.sh`, in the gate. `FLINT_BUILD_READ_FAIL` arms
+the read failure the same way `FLINT_BATCH_COMMIT_FAIL` arms a commit failure,
+and the drill asserts the CONSEQUENCE rather than the classification:
+
+- **arm A, negative control:** no seam, `upgrade --version-tag` completes.
+- **arm B, positive control:** seam set, `upgrade` refuses, the abort says the
+  READ failed, the injected reason survives into the message, and it does NOT
+  say `reports build ""` — the fabricated quotation this bug removed.
+
+Both controls earned their place on the first two runs. Arm A caught that the
+inventory declared a single-member pair, so `upgrade` refused with "need at
+least one replica" — arm B would have "passed" against a fleet that could
+never have rolled. Then arm B exited 0 with the seam armed, because
+`assert_build` is skipped without `--version-tag`: the seam was real and the
+assertion was never reached, so the drill would have reported a pass having
+exercised none of the path.
+
+### The original entry, kept
+
+**No drill asserted the end-to-end behaviour.** `field_from_reply` has three
 unit tests, two of which fail against the pre-fix collapsing code with the
 mutation verified applied first. But nothing exercises "a roll meeting a failed
 read aborts with a message that names the cause", because forcing a real read

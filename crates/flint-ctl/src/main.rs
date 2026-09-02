@@ -816,6 +816,22 @@ fn info_field(
 /// live seat. The bug it fixes existed because a `let ... else { return None }`
 /// asserted a distinction it did not make, and nothing could check the claim.
 fn field_from_reply(reply: &Value, field: &str) -> Result<Option<String>, String> {
+    // FLINT_BUILD_READ_FAIL exists so the ABORT path can be armed, the same
+    // reason FLINT_BATCH_COMMIT_FAIL does in flint-server.
+    //
+    // BUG-0083 shipped with its classification unit-tested and its CONSEQUENCE
+    // untested: nothing asserted that a roll meeting a failed read aborts with
+    // a message naming the cause. Forcing a real read failure mid-roll means a
+    // refused connect or a stalled TLS handshake against a seat that is
+    // otherwise healthy, which a drill cannot produce without becoming a test
+    // of something else -- so the abort path stayed reasoned rather than
+    // verified, which is the state the bug itself was in.
+    //
+    // Nothing outside the drill may set it: it makes a healthy fleet refuse to
+    // roll.
+    if std::env::var_os("FLINT_BUILD_READ_FAIL").is_some() {
+        return Err("injected read failure (FLINT_BUILD_READ_FAIL)".into());
+    }
     match reply {
         Value::Bulk(Some(raw)) => Ok(String::from_utf8_lossy(raw)
             .split(['\r', '\n'])
