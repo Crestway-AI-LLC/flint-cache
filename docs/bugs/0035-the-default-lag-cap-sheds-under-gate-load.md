@@ -1,4 +1,4 @@
-# BUG-0035: the default lag cap sheds under gate load, and two drills misreport it (drills FIXED; the shed OPEN — 9 samples recovered 2026-09-03, cause of the transition unidentified)
+# BUG-0035: the default lag cap sheds under gate load, and two drills misreport it (drills FIXED; the shed OPEN — samples 2 and 3 are CLEAN promoted rolls, 2026-09-03; the cause of the transition is unidentified)
 
 Status: OPEN 2026-08-20 · Severity: medium — one half is a documented claim
 with a counter-example, the other is a drill that reports a verdict for
@@ -844,14 +844,48 @@ states.
 **3. Does the shed land on the promoted seat every time?** Both seats shed, in
 different lifetimes. It is not one seat's property.
 
-### What this does NOT establish, and it is the important part
+### Which lifetimes are SAMPLES — resolved the same day
 
-**The recent zeroes are not yet evidence that the shed stopped.** This file's
-own finding is that the shed is a PROMOTION phenomenon, so a lifetime that
-contained no promotion shedding zero says nothing at all. 7001 ran 106.9 hours
-clean, but nothing here shows it was promoted during them. Counting quiet
-lifetimes as clean samples would repeat this file's oldest mistake — five
-negative reproductions that were measuring the wrong variable.
+The paragraph that stood here said the recent zeroes proved nothing, because a
+lifetime containing no promotion sheds zero for trivial reasons and nothing
+showed these had one. That gap is closed, and retroactively: the agent already
+exports **`flint_node_is_master`**, so a 0 → 1 transition inside a lifetime IS
+the promotion. No change to the roll was needed and every past roll in
+retention is readable.
+
+`tools/shed-history.sh --job flint-watch-phase1` now prints the column:
+
+| seat | window (UTC) | hours | promoted? | shed | peak lag ms | `delayed_soft` |
+|---|---|---|---|---|---|---|
+| 7001 | 08-20 22:01 → 08-21 23:06 | 25.1 | YES | 128 | 6,150 | 0 |
+| 7001 | 08-21 23:11 → 08-24 16:26 | 65.2 | YES | 90 | 5,152 | 0 |
+| 7001 | 08-24 16:31 → 08-27 17:51 | 73.3 | YES | **191** | 6,551 | 15 |
+| 7001 | 08-27 17:56 → 09-01 04:51 | 106.9 | **YES** | **0** | **2** | 0 |
+| 7002 | 08-20 22:01 → 08-21 05:06 | 7.1 | no* | 210 | 8,619 | 0 |
+| 7002 | 08-21 05:11 → 08-23 15:16 | 58.1 | YES | 87 | 5,001 | 0 |
+| 7002 | 08-23 15:21 → 08-27 02:41 | 83.3 | YES | 106 | 5,572 | 0 |
+| 7002 | 08-27 02:46 → 08-31 23:41 | 116.9 | YES | **112** | 7,221 | 9 |
+| 7002 | 08-31 23:46 → 09-01 04:51 | 5.1 | **YES** | **0** | **29** | 0 |
+
+**Eight of nine held a promotion, and both zeroes are among them.** So they are
+not quiet lifetimes — they are promoted seats that shed nothing. **Samples 2
+and 3 exist and are clean**, and the 2026-08-27 decision's precondition is met.
+
+\* The single `no` is the first row of the series and should not be read as a
+finding: `is_master` was already 1 when the window opens, so a promotion just
+before it falls outside. A first row cannot show a transition it straddles.
+
+**The transition sits between 08-27 and 08-31.** The last shedding promotion is
+7002's lifetime ending 08-31 23:41 (112 shed, 7,221 ms peak — this is the
+window containing the rc.65 sighting's 110). Every promoted lifetime since has
+shed zero with peak lag 2–29 ms, and the current one adds 61.8 h more at 71 ms.
+
+**The cause of that transition is still unidentified**, and two attributions
+were tried and are wrong: BUG-0038's shipper fix ships in **rc.58**, so it ran
+throughout the shedding period; and BUG-0078's `TCP_NODELAY` lands *after*
+rc.65, while the first clean promoted lifetime begins at the rc.65 roll. Both
+recorded so neither is tried a third time. What changed is a diff to find, not
+a measurement to take.
 
 **And the cause of the transition is unidentified.** Two attributions were
 tried and both are wrong: BUG-0038's shipper fix is in **rc.58**, so it was
