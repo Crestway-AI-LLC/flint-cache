@@ -1,6 +1,7 @@
 # BUG-0087 — `upgrade` re-rolls seats already on the target, and fails over healthy pairs to do it
 
-**Status:** OPEN.
+**Status:** FIXED 2026-09-03 for the pair phases; `roll_edge` deliberately
+not covered (below).
 **Area:** `crates/flint-ctl`, `fn upgrade`.
 **Severity:** medium. Nothing is corrupted; the cost is an unnecessary write
 interruption per pair, taken at exactly the moment an operator is recovering
@@ -54,6 +55,33 @@ discovered:
   inventory or from what the last roll believed. `FLINTINFO build:` is the
   only source that survives a driver dying, and BUG-0083 is the reminder that
   a failed READ of it must not be treated as a mismatch.
+
+## Fixed 2026-09-03, in three phases of four
+
+`already_on(addr, tls, target)` reads the live `FLINTINFO build:` stamp, and
+the canary, the replica loop and the **per-pair master failover** all skip a
+seat that already holds the target. A failed read answers `false`, so the
+seat rolls — an unnecessary roll is wasteful, and a skipped seat that was
+actually behind leaves the fleet split, which is the state the command exists
+to leave behind.
+
+The canary's ROLL is skipped and its **soak is not**. The canary does two
+jobs: prove the build starts, and then watch the fleet for a window. A canary
+already holding the target has proved the first and nothing about the second.
+
+**`roll_edge` is NOT covered**, and that is a scope decision rather than an
+oversight. It is not a loop — the proxy, control plane, controller and agent
+each have their own stop/spawn path and a per-seat build assertion — so the
+skip would be four separate edits into delicate code, and none of those seats
+costs a failover. The expensive part of this bug is the pairs, and that is
+what the fix addresses. Re-running an upgrade still restarts up to four edge
+processes needlessly.
+
+Asserted as a DIFFERENTIAL in `upgrade_drill`: the first run's log must
+contain the failover line, and the second run's must not — because "the
+second run said skipped" is equally what a run that did nothing at all would
+say. It also checks the fleet is still whole afterwards, since idempotent
+must not mean inert.
 
 ## Found by
 

@@ -5686,6 +5686,35 @@ fn cp_lacks_cpfence(reply: &std::io::Result<Value>) -> bool {
     matches!(reply, Ok(Value::Error(e)) if e.contains("unknown control-plane command"))
 }
 
+/// Is this seat ALREADY on the target build?
+///
+/// BUG-0087. `upgrade` rolled every seat unconditionally — right for a fresh
+/// roll, wrong for a PARTIALLY rolled fleet, which is exactly when someone
+/// re-runs it. A roll that died half-way is the case an operator meets at
+/// 02:00, and re-running to move two straggling seats cost a failover, and a
+/// write interruption, on every pair in the fleet.
+///
+/// Skipping what is already there makes the command IDEMPOTENT, which is the
+/// property recovery actually wants: run it again and it does only what is
+/// left.
+///
+/// **A FAILED READ IS NOT A MATCH** (BUG-0083). Unreadable answers `false`,
+/// so the seat is rolled. That is the conservative direction here and the
+/// direction is worth stating: an unnecessary roll is wasteful, while a
+/// skipped seat that was actually behind leaves the fleet SPLIT — the exact
+/// state this command exists to leave behind.
+///
+/// No `--version-tag` is never a match either. There is nothing to compare
+/// against, so every seat rolls, which is the behaviour that shipped.
+fn already_on(
+    addr: &str,
+    tls: &Option<Arc<flint_tls::ClientConfig>>,
+    target: &Option<String>,
+) -> bool {
+    let Some(want) = target else { return false };
+    matches!(info_field(addr, tls, "build:"), Some(got) if &got == want)
+}
+
 /// The record a roll leaves in the FLEET JOURNAL (ADR-0036).
 ///
 /// A roll that stops half-way leaves the fleet running two builds, and until
@@ -5940,23 +5969,34 @@ fn upgrade(inv: &Inventory, version_tag: Option<String>, soak_ms: u64, nodes_onl
         replicas.len() - 1
     );
     let t0 = now_ms();
-    if let Some(r) = &roll {
-        r.attempting(&canary);
+    // THE SOAK STAYS EVEN WHEN THE ROLL IS SKIPPED. The canary's job is two
+    // things: prove the build starts, and then watch the fleet for a window.
+    // A canary already holding the target has proved the first — the build IS
+    // running there — and has proved nothing about the second, so the soak is
+    // not the part to skip. Recording `attempting`/`converged` for a seat
+    // this roll never touched would be a lie the agent then reads.
+    if already_on(&canary, &tls, &expect) {
+        eprintln!("  canary {canary} already on the target build — not re-rolled (BUG-0087)");
+    } else {
+        if let Some(r) = &roll {
+            r.attempting(&canary);
+        }
+        if let Err(e) = roll_node(
+            inv,
+            &canary,
+            &canary_master,
+            &envs,
+            &expect,
+            Rejoin::WarmIfReplica,
+        ) {
+            panic!("CANARY FAILED (fleet untouched beyond the canary): {e}");
+        }
+        if let Some(r) = &roll {
+            r.converged(&canary);
+        }
+        eprintln!("  canary {canary} on new build, reconverged");
     }
-    if let Err(e) = roll_node(
-        inv,
-        &canary,
-        &canary_master,
-        &envs,
-        &expect,
-        Rejoin::WarmIfReplica,
-    ) {
-        panic!("CANARY FAILED (fleet untouched beyond the canary): {e}");
-    }
-    if let Some(r) = &roll {
-        r.converged(&canary);
-    }
-    eprintln!("  canary {canary} on new build, reconverged; soaking {soak_ms}ms");
+    eprintln!("  soaking {soak_ms}ms");
     std::thread::sleep(Duration::from_millis(soak_ms));
     if let Err(e) = journal_clean(inv, t0, REPLICA_PHASE_DISALLOWED, None) {
         eprintln!("== UPGRADE ABORTED at canary soak: {e}");
@@ -5970,6 +6010,10 @@ fn upgrade(inv: &Inventory, version_tag: Option<String>, soak_ms: u64, nodes_onl
     eprintln!("  soak clean: no unexpected transitions in the fleet journal");
 
     for (r, m) in replicas.iter().skip(1) {
+        if already_on(r, &tls, &expect) {
+            eprintln!("  replica {r} already on the target build — skipped");
+            continue;
+        }
         let t = now_ms();
         // Re-resolve the pair's CURRENT master: roles may have moved since
         // upgrade start (that is exactly what the gate aborts on — but a
@@ -6014,8 +6058,22 @@ fn upgrade(inv: &Inventory, version_tag: Option<String>, soak_ms: u64, nodes_onl
 
     eprintln!("== masters last (fenced controlled failover per pair)");
     for (i, pair) in inv.pairs.iter().enumerate() {
-        let t = now_ms();
+        // THE EXPENSIVE SKIP, and the reason BUG-0087 is worth fixing rather
+        // than noting. A master cannot be warm-restarted onto a new build —
+        // its replica has to be promoted first — so every pair in this loop
+        // costs a fenced failover and a real write interruption. A pair whose
+        // master already holds the target needs none of it, and re-running
+        // the command used to buy one per pair regardless.
+        //
+        // The saving is per-pair rather than global for the same reason: a
+        // pair whose master IS behind still pays, and a roll that died before
+        // this phase legitimately fails over everything.
         let old_master = &masters[i];
+        if already_on(old_master, &tls, &expect) {
+            eprintln!("  pair {i}: master {old_master} already on the target — no failover");
+            continue;
+        }
+        let t = now_ms();
         let new_master = pair
             .iter()
             .find(|a| *a != old_master)

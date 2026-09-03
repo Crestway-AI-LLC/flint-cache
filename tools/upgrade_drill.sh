@@ -91,6 +91,36 @@ echo "== upgrade --version-tag $TAG (an operator's own build number, not a relea
 $CTL -f "$D/cluster.flint" upgrade --version-tag "$TAG" --soak-ms 1500 >"$D/upgrade.log" 2>&1 \
   || { echo "FAIL: upgrade exited non-zero"; tail -15 "$D/upgrade.log"; exit 1; }
 
+echo "== running it AGAIN does only what is left (BUG-0087)"
+# `upgrade` used to roll every seat unconditionally and fail over EVERY pair,
+# with no build comparison anywhere in it. Right for a fresh roll; wrong for
+# a partially rolled fleet, which is exactly when someone re-runs the command
+# -- and a roll that died half-way is the case an operator meets at 02:00.
+#
+# A DIFFERENTIAL, because "the second run said skipped" is also what a run
+# that did nothing at all would say. The first run's log is the control: it
+# must contain the failover line that the second must not.
+grep -q "old master rolled" "$D/upgrade.log" || {
+  echo "FAIL: the FIRST run logged no master failover, so the assertion below"
+  echo "      cannot tell a skipped failover from one that never happens here."
+  tail -20 "$D/upgrade.log" | sed 's/^/  | /'; exit 1; }
+echo "  control: the first run did fail over ($(grep -c 'old master rolled' "$D/upgrade.log") pair(s))"
+
+$CTL -f "$D/cluster.flint" upgrade --version-tag "$TAG" --soak-ms 1500 >"$D/upgrade2.log" 2>&1 \
+  || { echo "FAIL: the second upgrade exited non-zero -- re-running must be safe"; tail -15 "$D/upgrade2.log"; exit 1; }
+grep -q "already on the target" "$D/upgrade2.log" || {
+  echo "FAIL: the second run re-rolled seats that already held $TAG."
+  tail -20 "$D/upgrade2.log" | sed 's/^/  | /'; exit 1; }
+! grep -q "old master rolled" "$D/upgrade2.log" || {
+  echo "FAIL: the second run FAILED OVER a pair whose master already held $TAG."
+  echo "      Each failover is a real write interruption, and this is the cost"
+  echo "      BUG-0087 is about."
+  tail -20 "$D/upgrade2.log" | sed 's/^/  | /'; exit 1; }
+# And the fleet is still whole afterwards -- idempotent must not mean inert.
+[ "$($CTL -f "$D/cluster.flint" status 2>/dev/null | grep -c "build $TAG")" -ge 4 ] || {
+  echo "FAIL: after the second run a seat is no longer on $TAG"; exit 1; }
+echo "  second run: skipped what was current, failed over nothing, fleet still whole"
+
 echo "== the roll left a RECORD in the fleet journal"
 # ADR-0036. A roll that stops half-way leaves the fleet on two builds, and
 # nothing used to record what the roll was FOR -- so an agent could see the
