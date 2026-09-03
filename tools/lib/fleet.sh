@@ -741,14 +741,43 @@ fleet_warm() {
 # acting on it would have produced a second corrupt gate behind a teardown
 # that looked verified. Filter on the INVARIANT -- ppid 1 plus a name you
 # recognise -- which does not move when the cohort does.
+# AVAILABLE MEMORY, because load average cannot see the failure that matters.
+#
+# A drill seat SIGKILLed in the middle of a run, with peer drills live, is what
+# an OOM kill looks like -- and OOM is a memory event, so the load figure beside
+# it can be entirely unremarkable while it happens. That is not hypothetical
+# here: load was measured across five failing and four passing gate runs and
+# does not separate them at all (docs/bugs/0064), so the axis worth recording is
+# the one nothing records.
+#
+# BUG-0060 is the reason to suspect it: every resource limit in this product is
+# per-unit and nothing bounds the aggregate. A gate running FLINT_GATE_JOBS
+# drills at once, each with several RocksDB seats, is precisely where an
+# unbounded aggregate would be reached first.
+#
+# UNREADABLE is a third state, not zero. macOS has no /proc/meminfo and this
+# says so rather than inventing a number from vm_stat -- the gate runs on Linux,
+# which is where the question lives, and a fabricated local figure would be
+# compared against real ones later.
+fleet_mem_note() {
+  if [ -r /proc/meminfo ]; then
+    awk '/^MemAvailable:/ { a = $2 } /^MemTotal:/ { t = $2 }
+         END { if (a && t) printf "mem %.1f of %.1f GiB free", a/1048576, t/1048576
+               else printf "mem UNREADABLE (meminfo lacked the fields)" }' /proc/meminfo
+  else
+    printf 'mem UNREADABLE (no /proc/meminfo)'
+  fi
+}
+
 fleet_env_note() {
-  local where="${1:-}" sib load
+  local where="${1:-}" sib load mem
   load="$(uptime | sed 's/.*averages*: //')"
+  mem="$(fleet_mem_note)"
   sib="$(_fleet_sibling | cut -c1-90 | tr '\n' ';' | sed 's/;$//')"
   if [ -n "$sib" ]; then
-    echo "  env${where:+ [$where]}: load $load | SIBLING BUILD/TEST ON THIS BOX: $sib"
+    echo "  env${where:+ [$where]}: load $load | $mem | SIBLING BUILD/TEST ON THIS BOX: $sib"
   else
-    echo "  env${where:+ [$where]}: load $load | no sibling processes"
+    echo "  env${where:+ [$where]}: load $load | $mem | no sibling processes"
   fi
 }
 

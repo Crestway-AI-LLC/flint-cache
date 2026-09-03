@@ -425,3 +425,36 @@ Four drills, one shape: `cold_start_roles`, `stop_sweep`, `decommission`,
 `roll_shed`. In every case the instrument existed or was one line away, and the
 verdict was reported as a fact about the product.
 
+### `pipeline_nodelay` is a different class, and it points at memory
+
+Unlike the four above, this drill's failure IS diagnosable — the log carries the
+client traceback already:
+
+    ConnectionResetError: [Errno 104] Connection reset by peer
+    FAIL: arm A client
+    line 27: 166405 Killed   $B --port 6407 --engine rocks --data-dir "$D/a"
+
+**Its server was SIGKILLed in the middle of the run**, with 4 peer drills live.
+`Killed` is signal 9, and `fleet_kill` is the only thing here that sends it — but
+that path was checked and is properly scoped, boundary-tested on the path and
+digit-anchored on the port, so a peer drill killing this seat is not the
+explanation.
+
+**The candidate is the OOM killer**, and it fits three things at once: it sends
+SIGKILL; it is a MEMORY event, so the load figure printed beside it can be
+unremarkable — which matches load having failed to separate five failing runs
+from four passing ones above; and BUG-0060 established that every resource limit
+in this product is per-unit with nothing bounding the aggregate. A gate running
+`FLINT_GATE_JOBS: 4` drills at once, each with several RocksDB seats, is exactly
+where an unbounded aggregate would be reached first.
+
+**This is a hypothesis and the instrument is the response, not an argument.**
+`fleet_env_note` now prints available memory beside the load on every guarded
+drill, so each gate run records it — UNREADABLE on macOS rather than a
+fabricated figure from `vm_stat`, since the gate runs on Linux and a local
+invention would later be compared against real numbers.
+
+Nothing is claimed until those accumulate. What can be said now is that the one
+axis on which these failures could plausibly differ is the one nothing was
+recording, which is the same position BUG-0088 was in this morning.
+
