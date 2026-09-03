@@ -182,3 +182,47 @@ cores" and a better one for something episodic on the runner. Not decisive at
 n=3, and the terms above are what would settle it: the next refusal will say
 whether the spike was queue depth or service time.
 
+## 2026-09-03, n=7 — CORRECTION: it is a tail, not a spike
+
+The section above read three peaks (124, 495, 557 ms) and concluded the 2017 ms
+refusals were "roughly 4x the highest passing peak yet seen... not a
+distribution drifting up until it touches a threshold; an episodic spike well
+outside the observed range." **That is withdrawn.** It was stated at n=3 with
+the caveat that three samples bound a centre and not a tail, and four more
+samples are what the caveat predicted.
+
+| commit | result | peak (ms) |
+|---|---|---|
+| 3fd00e4 | pass | 124 |
+| b7b74a9 | pass | 324 |
+| 07d7aea | pass | 495 |
+| b439cf0 | pass | 557 |
+| d13169c | failed elsewhere | 763 |
+| bbed94c | pass | 840 |
+| 4aa5c56 | pass | **1322** |
+
+Seven consecutive gate runs, median **557 ms**, max **1322 ms**, a **10.7x
+spread** — and the maximum on a PASSING run is **66% of the 2000 ms deadline**.
+
+Against that, the refusals at 2017 and 2033 ms are **1.5x the observed passing
+maximum**, not 4x. That is the tail of a wide, heavy-looking distribution
+reaching a threshold, which is the reading the first three samples ruled out and
+should not have.
+
+**What it means for the deadline.** 2000 ms was chosen where the comment beside
+it predicts "sub-millisecond at any sane concurrency". On this runner the
+routine maximum is already two thirds of the way to it, so the margin is not the
+three orders of magnitude the comment implies but a factor of about 1.5. That is
+a fact about the default, not only about the drill.
+
+**And for BUG-0064:** a wide continuous distribution whose tail crosses a
+threshold is a better fit for runner variability than for a discrete episodic
+event, and it is what "steady contention" would look like once the distribution
+is visible rather than inferred. It does not by itself separate contention from
+a slow runner — that still needs the P=1 comparison, which is now a comparison
+of distributions and no longer needs ~20 runs to be worth taking.
+
+The instrument is doing what it was built for: four days of argument at n=0, a
+wrong conclusion at n=3, a correction at n=7, all from runs that were happening
+anyway.
+
