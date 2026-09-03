@@ -170,10 +170,17 @@ loses in under four seconds.
 
 ### So the finding is one thing, not eleven
 
-**These are not eleven flaky drills. They are one parallel gate that
-occasionally starves whichever drill is bootstrapping.** Which drill loses is
-close to arbitrary — that is why the failures scatter and why no single drill
-looks broken enough to chase.
+**These are not eleven flaky drills. They are one parallel gate, and which
+drill loses is close to arbitrary** — that is why the failures scatter and why
+no single drill looks broken enough to chase.
+
+**Not "starvation", and the first draft of this line said so wrongly.**
+`gate.yml` records the runner as **4 vCPU** and sets `FLINT_GATE_JOBS: 4`, so
+the gate runs at **one drill per core** — deliberately conservative; the file
+notes P=6 would be 1.5 drills/core. And `backup_seat`'s own guard line reads
+`load 2.47` against those four cores, roughly 62% busy. That is not a starved
+box. Whatever the interference is, raw CPU exhaustion is not established and
+the word was reached for because it sounded like an explanation.
 
 Two consequences worth stating plainly:
 
@@ -198,6 +205,18 @@ at, or it is plain resource starvation on the runner. Those need different
 fixes and this does not distinguish them.
 
 The cheap next measurement is `FLINT_GATE_JOBS=1` on a few runs: if the red
-rate collapses, it is contention and the question becomes which dimension; if
-it does not, the runner is simply too small and no amount of overlap-checking
-will help.
+rate collapses it is contention and the question becomes which dimension; if it
+does not, the parallelism is exonerated and the cause is somewhere nobody has
+looked.
+
+**And the workflow already has the controls for it**, which is worth knowing
+before anyone builds a harness: `workflow_dispatch` takes `gate_jobs` (the
+description says *"Set 1 here for the serial gate; that is also the rollback"*)
+and `core_order`, for *"a TARGETED experiment instead of a 12-minute full
+gate"* — added because *"contention hypotheses have to be tested on the machine
+that has the contention"*. The experiment this file wants is a dispatch with
+two inputs, not a new tool.
+
+A caveat on reading the result: at ~14%, telling P=1 from P=4 needs enough runs
+to separate the rates. Three green serial runs would be weak evidence — at 14%
+the chance of three clean runs by luck alone is about 64%.
