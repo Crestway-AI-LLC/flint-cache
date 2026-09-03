@@ -52,7 +52,14 @@ EOF
 
 CTL=./target/release/flintctl
 echo "== bootstrap"
-$CTL -f "$INV" bootstrap >/dev/null 2>&1 || { echo "FAIL: bootstrap"; exit 1; }
+$CTL -f "$INV" bootstrap >"$STATE-boot.log" 2>&1 || {
+  # The reason bootstrap failed is in ITS OWN output, and this line
+  # used to send that to /dev/null and then report a bare failure --
+  # so the largest cluster of gate reds ("FAIL: bootstrap") could not
+  # be diagnosed from the artifact at all. Two drills that captured it
+  # showed the actual cause immediately: a replica still `loading`
+  # when verify ran (BUG-0064).
+  echo "FAIL: bootstrap"; tail -25 "$STATE-boot.log"; exit 1; }
 
 REPLICA=$($CTL -f "$INV" status 2>/dev/null | awk '$4=="replica"{print $3; exit}')
 [ -n "$REPLICA" ] || { echo "FAIL: no replica after bootstrap"; exit 1; }

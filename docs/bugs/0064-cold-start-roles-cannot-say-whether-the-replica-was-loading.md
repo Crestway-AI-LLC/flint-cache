@@ -292,3 +292,71 @@ instrument accumulate a few dozen P=4 peaks from ordinary gate runs, which costs
 nothing because those runs happen anyway, then dispatch a handful at P=1 and
 compare the distributions rather than the verdicts.
 
+## 2026-09-03, later still — this bug's shape is in 23 drills, and fixing the instrument diagnosed an excluded drill in one run
+
+Reading the actual FAIL line out of every failing drill across the six red runs,
+rather than counting drill names:
+
+| failure | count |
+|---|---|
+| `FAIL: bootstrap` (bare, no reason) | 3 |
+| replica still `loading` when verify ran -> `SINGLE-COPY` | 2 of those 3, once captured |
+| `FAIL connect ... Error 111` | 1 |
+| `FAIL: with the replica stalled 1500ms behind a 50ms cap, the master shed` | 2 |
+| `FAIL: master unchanged`, `FAIL: arm A client` | 2 |
+
+**Seat bring-up is the largest cluster, and it was the least diagnosable.** Two
+drills that captured `bootstrap`'s output named the cause on sight — a replica
+still `loading` when `verify` ran, which is this bug's subject firing outside
+`cold_start_roles`. A third printed `FAIL: bootstrap` and nothing else.
+
+### Why: 23 drills sent the reason to /dev/null
+
+- **9 drills** ran `bootstrap >/dev/null 2>&1 || { echo "FAIL: bootstrap"; exit 1; }`.
+  The reason existed and was discarded one character before it could be printed.
+- **14 drills** were worse: `bootstrap >/dev/null 2>&1` with **no exit check at
+  all**, under `set -u` rather than `set -e`. A refused or failed bootstrap did
+  not stop them. They ran on into their assertions and reported whichever
+  tripped first — `cold_start_roles` announcing **"FAIL: no replication after
+  bootstrap"**, a product claim, for what may simply have been "bootstrap failed
+  and the reason went to /dev/null".
+
+That last line is this bug's thesis verbatim, and this file was named after the
+one drill it was noticed in. It is in 23.
+
+All 23 now capture and report, and `assert_bootstrap_failures_say_why` in
+`tools/gates.sh` keeps them that way — tri-state (zero drills scanned is a
+FAILURE, not a pass) and mutation-tested by reintroducing a single discard.
+
+### The change paid for itself on its first run
+
+`stop_sweep` has sat in the gate's `EXCLUDED` list with this note: *"FAILS in
+setup: 'fleet B did not start'. It declares eight ports across two fleets, so a
+collision is the first thing to check."*
+
+**It was not a collision.** With the output captured, one run said so:
+
+    flintctl: refusing `bootstrap`: this flintctl reports build "0.0.1", which
+    is not a release, and the inventory does not declare `disposable on`.
+
+`$INVA` declares `disposable on`; `$INVB` never did. flintctl refused to
+bootstrap fleet B, the refusal went to `/dev/null`, the exit status was ignored,
+and the only symptom anyone ever saw was a later assertion counting fleet B's
+processes and finding none. A one-line inventory omission, recorded as a
+suspected port collision for as long as that note has existed.
+
+Fixed. Both fleets now start (`A=5 procs, B=5 procs`) and the drill reaches its
+real test, where it fails differently and honestly: **"FAIL: second start did
+not re-record pids"** — a claim about `start` over a live fleet, not about
+setup. It stays EXCLUDED on that, and the note now records the true symptom so
+the next person does not start from the port theory again.
+
+### What this says about the 14% red gate
+
+It does not explain all of it, and it is not the parallelism theory either. What
+it does is remove the largest source of *undiagnosable* reds: the next
+`FAIL: bootstrap` in any of these 23 drills will arrive with the reason attached.
+That is worth more than another hypothesis, because every hypothesis this file
+has entertained failed for want of evidence that was being discarded at the
+moment it was produced.
+

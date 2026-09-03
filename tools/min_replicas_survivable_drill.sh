@@ -66,7 +66,13 @@ EOF
 CTL="./target/release/flintctl -f $INV"
 
 echo "== bootstrap a TWO-member pair at the default min-replicas 0"
-$CTL bootstrap >/dev/null 2>&1
+$CTL bootstrap >"$STATE-boot.log" 2>&1 || {
+  # Capture it and STOP. This discarded bootstrap's output and
+  # ignored its exit status, so a failed bootstrap ran on into the
+  # assertions below and was reported as whichever one broke first
+  # -- a product fault asserted for what was really "bootstrap
+  # failed and nobody looked" (BUG-0064).
+  echo "FAIL: bootstrap"; tail -25 "$STATE-boot.log"; exit 1; }
 for _ in $(seq 1 60); do
   [ "$(valkey-cli -p 7425 FLINTINFO 2>/dev/null | tr -d '\r' | sed -n 's/^live_replicas://p')" = "1" ] && break
   sleep 0.5
@@ -124,7 +130,13 @@ cp $CP
 pair $A,$B,127.0.0.1:7427
 EOF
 CTL3="./target/release/flintctl -f $INV3"
-$CTL3 bootstrap >/dev/null 2>&1
+$CTL3 bootstrap >"$STATE-boot.log" 2>&1 || {
+  # Capture it and STOP. This discarded bootstrap's output and
+  # ignored its exit status, so a failed bootstrap ran on into the
+  # assertions below and was reported as whichever one broke first
+  # -- a product fault asserted for what was really "bootstrap
+  # failed and nobody looked" (BUG-0064).
+  echo "FAIL: bootstrap"; tail -25 "$STATE-boot.log"; exit 1; }
 for _ in $(seq 1 60); do
   [ "$(valkey-cli -p 7425 FLINTINFO 2>/dev/null | tr -d '\r' | sed -n 's/^live_replicas://p')" = "2" ] && break
   sleep 0.5

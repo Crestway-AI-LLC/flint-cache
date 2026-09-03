@@ -43,7 +43,13 @@ A="valkey-cli -p 7679 -a tok-acme --no-auth-warning"
 B="valkey-cli -p 7679 -a tok-beta --no-auth-warning"
 
 echo "== bootstrap 2 pairs (slot space split) + two tenants + 500 keys"
-./target/release/flintctl -f "$INV" bootstrap >/dev/null 2>&1
+./target/release/flintctl -f "$INV" bootstrap >"$STATE-boot.log" 2>&1 || {
+  # Capture it and STOP. This discarded bootstrap's output and
+  # ignored its exit status, so a failed bootstrap ran on into the
+  # assertions below and was reported as whichever one broke first
+  # -- a product fault asserted for what was really "bootstrap
+  # failed and nobody looked" (BUG-0064).
+  echo "FAIL: bootstrap"; tail -25 "$STATE-boot.log"; exit 1; }
 ./target/release/flintctl -f "$INV" tenant add acme tok-acme acme 1 >/dev/null 2>&1
 ./target/release/flintctl -f "$INV" tenant add beta tok-beta beta 1 >/dev/null 2>&1
 awk 'BEGIN{for(i=0;i<500;i++){k=sprintf("key:%04d",i);printf "*3\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$2\r\nvv\r\n",length(k),k}}' \

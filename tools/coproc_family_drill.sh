@@ -86,7 +86,14 @@ EOF
 CTL="./target/release/flintctl -f $INV"
 
 echo "== bootstrap a fleet whose inventory DECLARES a co-processor"
-$CTL bootstrap >/dev/null 2>&1 || { echo "FAIL: bootstrap"; $CTL status; exit 1; }
+$CTL bootstrap >"$STATE-boot.log" 2>&1 || {
+  # The reason bootstrap failed is in ITS OWN output, and this line
+  # used to send that to /dev/null and then report a bare failure --
+  # so the largest cluster of gate reds ("FAIL: bootstrap") could not
+  # be diagnosed from the artifact at all. Two drills that captured it
+  # showed the actual cause immediately: a replica still `loading`
+  # when verify ran (BUG-0064).
+  echo "FAIL: bootstrap"; tail -25 "$STATE-boot.log"; $CTL status; exit 1; }
 $CTL tenant add vt tok-vt vt 1 >/dev/null 2>&1
 
 echo "== 1. flintctl spawned the family's binary, and it is listening"

@@ -66,7 +66,13 @@ loading_of() { valkey-cli -p "${1##*:}" FLINTINFO 2>/dev/null | tr -d '\r' | sed
 seqlag_of() { valkey-cli -p "${1##*:}" FLINTINFO 2>/dev/null | tr -d '\r' | sed -n 's/^seq_lag://p'; }
 
 echo "== bootstrap: pair[0] is master, replication live"
-$CTL bootstrap >/dev/null 2>&1
+$CTL bootstrap >"$STATE-boot.log" 2>&1 || {
+  # Capture it and STOP. This discarded bootstrap's output and
+  # ignored its exit status, so a failed bootstrap ran on into the
+  # assertions below and was reported as whichever one broke first
+  # -- a product fault asserted for what was really "bootstrap
+  # failed and nobody looked" (BUG-0064).
+  echo "FAIL: bootstrap"; tail -25 "$STATE-boot.log"; exit 1; }
 for _ in $(seq 1 60); do [ "$(replicas_of "$A")" = "1" ] && break; sleep 0.5; done
 [ "$(role_of "$A")" = "master" ] || { echo "FAIL: $A is not master after bootstrap"; exit 1; }
 [ "$(replicas_of "$A")" = "1" ] || { echo "FAIL: no replication after bootstrap"; exit 1; }

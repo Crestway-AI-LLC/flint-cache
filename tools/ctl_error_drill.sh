@@ -72,7 +72,13 @@ fails_cleanly() {
 }
 
 echo "== bootstrap + the tenant that will collide"
-$CTL -f "$INV" bootstrap >/dev/null 2>&1
+$CTL -f "$INV" bootstrap >"$STATE-boot.log" 2>&1 || {
+  # Capture it and STOP. This discarded bootstrap's output and
+  # ignored its exit status, so a failed bootstrap ran on into the
+  # assertions below and was reported as whichever one broke first
+  # -- a product fault asserted for what was really "bootstrap
+  # failed and nobody looked" (BUG-0064).
+  echo "FAIL: bootstrap"; tail -25 "$STATE-boot.log"; exit 1; }
 R=$($CTL -f "$INV" tenant add acme tok-acme acme 1 2>&1) || { echo "FAIL: first add: $R"; exit 1; }
 echo "  tenant acme added ($R)"
 

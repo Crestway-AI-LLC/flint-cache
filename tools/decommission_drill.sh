@@ -53,7 +53,13 @@ nodes_live() { status | grep -cE 'master|replica'; }
 A="valkey-cli -p 7223 -a tok-acme --no-auth-warning"
 
 echo "== bootstrap a master+replica pair behind a proxy + controller"
-./target/release/flintctl -f "$INV" bootstrap >/dev/null 2>&1
+./target/release/flintctl -f "$INV" bootstrap >"$STATE-boot.log" 2>&1 || {
+  # Capture it and STOP. This discarded bootstrap's output and
+  # ignored its exit status, so a failed bootstrap ran on into the
+  # assertions below and was reported as whichever one broke first
+  # -- a product fault asserted for what was really "bootstrap
+  # failed and nobody looked" (BUG-0064).
+  echo "FAIL: bootstrap"; tail -25 "$STATE-boot.log"; exit 1; }
 ./target/release/flintctl -f "$INV" tenant add acme tok-acme acme 1 >/dev/null 2>&1
 
 echo "== seed 5000 keys through the proxy"

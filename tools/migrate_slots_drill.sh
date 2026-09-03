@@ -46,7 +46,13 @@ EOF
 A="valkey-cli -p 7235 -a tok-acme --no-auth-warning"
 
 echo "== bootstrap one pair (owns all 16384 slots)"
-./target/release/flintctl -f "$INV" bootstrap >/dev/null 2>&1
+./target/release/flintctl -f "$INV" bootstrap >"$STATE-boot.log" 2>&1 || {
+  # Capture it and STOP. This discarded bootstrap's output and
+  # ignored its exit status, so a failed bootstrap ran on into the
+  # assertions below and was reported as whichever one broke first
+  # -- a product fault asserted for what was really "bootstrap
+  # failed and nobody looked" (BUG-0064).
+  echo "FAIL: bootstrap"; tail -25 "$STATE-boot.log"; exit 1; }
 ./target/release/flintctl -f "$INV" tenant add acme tok-acme acme 1 >/dev/null 2>&1
 
 # {mig2} hashes to slot 8450. Seed 2000 keys all in that slot.

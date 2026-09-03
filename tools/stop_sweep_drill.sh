@@ -48,6 +48,7 @@ proxy 127.0.0.1:7879
 controller on
 EOF
 cat > "$INVB" <<EOF
+disposable on
 statedir $B
 bins ./target/release
 tls on
@@ -58,8 +59,14 @@ controller on
 EOF
 
 echo "== fleet A and fleet B (separate statedirs) both up"
-$CTL -f "$INVA" bootstrap >/dev/null 2>&1
-$CTL -f "$INVB" bootstrap >/dev/null 2>&1
+# Captured and checked, per fleet. These discarded both bootstraps' output
+# and ignored both exit statuses, so a fleet that failed to come up was
+# reported as whichever later assertion tripped -- and with TWO fleets the
+# message could not even say which one was missing (BUG-0064).
+$CTL -f "$INVA" bootstrap >"$A-boot.log" 2>&1 || {
+  echo "FAIL: bootstrap fleet A"; tail -25 "$A-boot.log"; exit 1; }
+$CTL -f "$INVB" bootstrap >"$B-boot.log" 2>&1 || {
+  echo "FAIL: bootstrap fleet B"; tail -25 "$B-boot.log"; exit 1; }
 count_a() { ps -eo args | grep -c "[f]lint-.*$A" ; }
 count_b() { ps -eo args | grep -c "[f]lint-.*$B" ; }
 [ "$(count_a)" -ge 4 ] || { echo "FAIL: fleet A did not start"; exit 1; }

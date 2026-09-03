@@ -229,9 +229,21 @@ CHAOS="chaos proxy_chaos chaos_unreadable hotkey_chaos"
 #                 reliably create the condition it asserts on. Same family as
 #                 the RPO/THROTTLED work — pressure, not scale. Fix before
 #                 adding.
-#   stop_sweep    FAILS in setup: "fleet B did not start". It declares eight
-#                 ports across two fleets (6317-6321, 7820, 7879, 7889), so a
-#                 collision is the first thing to check. Fix before adding.
+#   stop_sweep    STILL EXCLUDED, but the setup failure above is FIXED and the
+#                 reason recorded here was wrong. It read: 'FAILS in setup:
+#                 "fleet B did not start". It declares eight ports across two
+#                 fleets, so a collision is the first thing to check.' It was
+#                 not a collision. `$INVB` simply omitted `disposable on`, so
+#                 flintctl REFUSED to bootstrap fleet B -- and the drill sent
+#                 that refusal to /dev/null and ignored the exit status, so the
+#                 only symptom anyone ever saw was the later assertion "fleet B
+#                 did not start". One line of inventory, mis-diagnosed as a port
+#                 problem for as long as this note has existed (BUG-0064).
+#                 Both fleets now start (A=5 procs, B=5 procs) and the drill
+#                 reaches its real test, where it fails differently:
+#                 "FAIL: second start did not re-record pids". That is the
+#                 symptom to work from now; it is a claim about `start` over a
+#                 live fleet, not about setup.
 
 # THE LIST ABOVE IS NOW LOAD-BEARING, so it is a variable and not only prose.
 # coproc_family and proxy_chain sat in tools/ registered nowhere for weeks:
@@ -1675,6 +1687,41 @@ assert_lease_ttl_single_source() {
 # existed when it was written. A seat type added later inherits the original
 # bug silently, which is the same shape as the mitigation that 8 drills of 111
 # remembered to call.
+# A bootstrap that fails must say WHY (docs/bugs/0064).
+#
+# Twenty-three drills sent `flintctl bootstrap` to /dev/null. Nine then
+# reported a bare "FAIL: bootstrap"; the other fourteen did not check the exit
+# status at all, so a failed bootstrap ran on into the assertions below it and
+# surfaced as whichever one tripped first -- `cold_start_roles` announcing
+# "no replication after bootstrap", a product claim, for what was really
+# "bootstrap failed and the reason went to /dev/null".
+#
+# It is the largest cluster of gate reds and it was the least diagnosable: two
+# drills that DID capture the output named the cause on sight (a replica still
+# `loading` when verify ran). The output exists; only the redirect was hiding
+# it.
+assert_bootstrap_failures_say_why() {
+  local drills bad n
+  drills=$(ls tools/*_drill.sh 2>/dev/null | wc -l | tr -d " ")
+  # TRI-STATE: zero drills means this scan examined nothing, which is not the
+  # same as finding nothing wrong.
+  if [ "${drills:-0}" -eq 0 ]; then
+    echo "FAIL  no tools/*_drill.sh found -- this check examined nothing"
+    FAILED="$FAILED bootstrap-detail-unreadable"
+    return 0
+  fi
+  bad=$(grep -n "bootstrap >/dev/null" tools/*_drill.sh 2>/dev/null)
+  [ -z "$bad" ] && return 0
+  n=$(printf "%s\n" "$bad" | grep -c .)
+  echo "FAIL  $n drill line(s) discard bootstrap output, so a failure cannot say why:"
+  printf "%s\n" "$bad" | sed "s/^/        /"
+  echo "        Capture it and report it, as the other drills do:"
+  echo "          \$CTL -f \"\$INV\" bootstrap >\"\$D-boot.log\" 2>&1 || {"
+  echo "            echo \"FAIL: bootstrap\"; tail -25 \"\$D-boot.log\"; exit 1; }"
+  echo "        A bare failure here is the gate's least diagnosable red."
+  FAILED="$FAILED bootstrap-detail"
+}
+
 assert_warm_covers_fleet_binaries() {
   local declared warmed missing b nd nw
   # `index()` rather than a /\];/ range: an escaped bracket is a regex escape
@@ -1726,6 +1773,7 @@ if want check; then
   assert_recovery_stays_off_until_it_observes
   assert_lease_ttl_single_source
   assert_warm_covers_fleet_binaries
+  assert_bootstrap_failures_say_why
   report_toolchain_vs_pin
   step "fmt" fmt cargo fmt --all --check
   step "clippy (mem)" clippy-mem \

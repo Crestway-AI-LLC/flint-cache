@@ -36,7 +36,14 @@ pair 127.0.0.1:6300,127.0.0.1:6301
 proxy 127.0.0.1:6303
 controller on
 EOF
-$CTL -f "$D/cluster.flint" bootstrap >/dev/null 2>&1 || { echo "FAIL: bootstrap"; exit 1; }
+$CTL -f "$D/cluster.flint" bootstrap >"$D-boot.log" 2>&1 || {
+  # The reason bootstrap failed is in ITS OWN output, and this line
+  # used to send that to /dev/null and then report a bare failure --
+  # so the largest cluster of gate reds ("FAIL: bootstrap") could not
+  # be diagnosed from the artifact at all. Two drills that captured it
+  # showed the actual cause immediately: a replica still `loading`
+  # when verify ran (BUG-0064).
+  echo "FAIL: bootstrap"; tail -25 "$D-boot.log"; exit 1; }
 $CTL -f "$D/cluster.flint" tenant add acme tok-acme acme 1 >/dev/null 2>&1
 C="$D/state/certs"
 ninfo() { valkey-cli -p "$1" --tls --cacert "$C/ca.crt" --cert "$C/int.crt" --key "$C/int.key" FLINTINFO 2>/dev/null; }
