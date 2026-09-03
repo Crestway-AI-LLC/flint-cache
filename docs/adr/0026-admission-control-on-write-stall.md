@@ -216,6 +216,20 @@ knee.
   connection count, not replication below C=192. Unmeasured: the fsync path
   (`wal_fsync_ms` 500), device write bandwidth, WAL append serialization.
 
+  **Two of those three are now measured and eliminated** — see the 2026-09-03
+  run at the bottom of this file. The fsync path moves throughput 0.55% across
+  500 / 50 / 0 ms, and the write path asks the device for ~7% of what fio gets
+  out of it. **WAL append serialization is the only one still unmeasured**, and
+  the run added a number that reframes even that: one seat did 138k ops/s where
+  the fleet's knee was ~80k.
+
+  Left in place rather than rewritten, because the list is the record of what
+  was open on 2026-08-30 and the value of these blocks is being able to see
+  what a question looked like before it was answered. But a reader scanning
+  headings would otherwise take "Unmeasured: the fsync path, device write
+  bandwidth" at face value, which is the same staleness two bug headers carried
+  until today.
+
 ### ANSWERED 2026-09-02 — should these knobs ship as defaults? No.
 
 The second open question was whether numbers from a 16-vCPU box with 15 idle
