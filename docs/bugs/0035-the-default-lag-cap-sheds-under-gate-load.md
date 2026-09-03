@@ -1,4 +1,4 @@
-# BUG-0035: the default lag cap sheds under gate load, and two drills misreport it (drills FIXED; the shed OPEN — samples 2 and 3 are CLEAN promoted rolls, 2026-09-03; the cause of the transition is unidentified)
+# BUG-0035: the default lag cap sheds under gate load, and two drills misreport it (drills FIXED; the production shed CAUSE FOUND 2026-09-03 — BUG-0078's missing TCP_NODELAY, gone since rc.66)
 
 Status: OPEN 2026-08-20 · Severity: medium — one half is a documented claim
 with a counter-example, the other is a drill that reports a verdict for
