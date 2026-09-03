@@ -128,3 +128,76 @@ So the honest restatement of "red ~15% and none triaged": **8 real failures in
 bug's diagnostic, and two are single-sample observations recorded here to be
 filed if they recur. The number that was alarming was partly an artifact of
 nobody looking — which was the point of writing it down.
+
+## 2026-09-03 — the backlog re-formed, and it is the parallel gate, not eleven bugs
+
+The section above closed with "the backlog is now zero" on 2026-08-27. Six gate
+failures have landed since and none had been opened. Over the last 120 runs the
+rate is **17 failures / 120 ≈ 14%**, unchanged from the number that section
+called alarming — so the triage was a one-off, not a habit.
+
+Triaged, all six:
+
+| run | when (UTC) | failed | commit under test |
+|---|---|---|---|
+| `33722919171` | 09-03 06:22 | `backup_seat` | **docs only** (an ADR write-up) |
+| `33702745608` | 09-03 01:12 | `restart`, `roll_shed` | a bug file + one Rust change |
+| `33700917180` | 09-03 00:46 | `failover`, `roll_shed` | **docs only** (two bug headers) |
+| `33667073809` | 09-02 18:25 | `failover` | docs only |
+| `33660742234` | 09-02 17:23 | `tenant_quota`, `client_compat`, `proxy_registry` | a bug file + a test |
+| `33658796083` | 09-02 17:04 | `decommission`, `ctl_cpha`, `pipeline_nodelay` | a drill fix |
+
+**Eleven distinct drills across six runs**, with only `failover` and
+`roll_shed` appearing twice. Nothing is failing consistently.
+
+**Three of the six are commits that changed no code at all** — bug-file text
+and an ADR. A docs-only commit cannot break `backup_seat`'s bootstrap or
+`failover`. That is not an inference about probability; it is the whole
+diagnosis.
+
+**And the signature is in the log.** `backup_seat`, which failed bootstrap in
+3.7 s:
+
+    env [guard]: load 2.47, 2.11, 0.98 | no sibling processes
+    (3 seat(s) belong to 4 live peer drill(s) in this suite -- not foreign)
+    (FLINT_DRILL_FORCE=1: proceeding despite 2 other flint process(es))
+    == bootstrap: the inventory's backup keys must bring the seat up
+    FAIL: bootstrap
+
+Four peer drills live, two other flint processes, `FLINT_DRILL_FORCE=1`
+overriding the guard that would otherwise have refused, and a bootstrap that
+loses in under four seconds.
+
+### So the finding is one thing, not eleven
+
+**These are not eleven flaky drills. They are one parallel gate that
+occasionally starves whichever drill is bootstrapping.** Which drill loses is
+close to arbitrary — that is why the failures scatter and why no single drill
+looks broken enough to chase.
+
+Two consequences worth stating plainly:
+
+- **Triaging drill-by-drill is the wrong unit of work**, and this file spent an
+  evening doing it on 2026-08-27. The nine it triaged then were the same
+  phenomenon; the four `promote_notice` firings really were a drill bug and
+  really were fixed, which is exactly what made the rest look like more of the
+  same rather than a different thing.
+- **A ~14% red gate trains people to re-run**, which BUG-0014 already recorded
+  as how a real firing goes unread. Every one of these six was a candidate for
+  that, and none of them were re-run — they were simply never opened, for the
+  second time in a week.
+
+### Not established
+
+Whether the contention is CPU, ports, or something the existing overlap checks
+do not cover. This project has assert_no_port_overlap, assert_no_scope_overlap,
+assert_no_used_path_overlap, the kill-pattern check and the binding-argument
+check — all built because parallel drills interfere — and the gate is still red
+at 14%. So either the remaining interference is a dimension none of them look
+at, or it is plain resource starvation on the runner. Those need different
+fixes and this does not distinguish them.
+
+The cheap next measurement is `FLINT_GATE_JOBS=1` on a few runs: if the red
+rate collapses, it is contention and the question becomes which dimension; if
+it does not, the runner is simply too small and no amount of overlap-checking
+will help.
