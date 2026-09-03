@@ -719,17 +719,83 @@ before an instance is spent. Full write-up in the ops field notes, section 1.
 
 ### What this does NOT establish
 
-- **Production is ~96 GB, not 6.4 GB.** 15x more data on the same 2-core seat
+- ~~**Production is ~96 GB, not 6.4 GB.** 15x more data on the same 2-core seat
   means more depth than measured here. The direction should hold; the magnitude
-  is unverified.
+  is unverified.~~ **DISCHARGED** — the 96 GB run is in this file, in the
+  section *above* this one. Left struck rather than deleted because the caveat
+  was correct when written and the ordering is what made it look open: the
+  production-scale measurement sits ~100 lines earlier than the "Next" that
+  asks for it, so a reader who starts at the end of the file concludes it is
+  still owed. It was, for a week.
 - **This is not a defaults decision.** A 32 MB write buffer is a per-engine
   memory commitment, and this measured one seat size at one dataset size. What
   the numbers license is a proposal, not a merge.
 - The refill half of this bug is untouched by any of it.
 
+## 2026-09-03 — the proposal, priced, and it is NOT a fleet-wide default
+
+The "Next" below asks for defaults with the memory cost priced. Here it is, and
+the honest form is not a default at all.
+
+### Why not a default
+
+This file's own two sweeps settle it, and they point opposite ways on the same
+hardware:
+
+| seat | dataset | level base | `bg_jobs` 4 vs default |
+|---|---|---|---|
+| 2 cores | **~760 MB** | 8 MB | **−9.1%**, compaction CPU +32% |
+| 2 cores | **96 GB** | 8 MB | **+93%** |
+
+Same core count, opposite sign, and the variable is LSM depth. A fleet-wide
+default has to be wrong in one of those regimes, and the shallow one is not
+exotic — it is every seat for the first hours of its life, every small tenant,
+and every drill.
+
+`write-path-next` item 4b reached the same conclusion from the other side
+("what binds depends on how full the LSM is") and, on 2026-09-03, added a third
+axis: with a replica attached the binding constraint is the replica's apply
+rate, which **neither of these knobs touches**. A default tuned on solo ingest
+would not move a pair's ceiling at all.
+
+### What the numbers do license
+
+**A documented pairing, applied per seat by an operator who knows their
+regime**, `FLINT_LEVEL_BASE_MB=64` **with** `FLINT_BG_JOBS=4` — never one
+alone. At 96 GB on a 2-core seat, against the 8 MB / default baseline:
+
+| | baseline | proposed | change |
+|---|---|---|---|
+| mean ingest | 34.2 MB/s | **89.2 MB/s** | **2.6x** |
+| stall fraction | 83.7% | **43.4%** | still stalling nearly half the time |
+| write amplification | 16.0 | **10.2** | −36% |
+| resident bytes (96 GB logical) | 136 GB | **185 GB** | **+49 GB, +36%** |
+
+**The price is the last row and it is not small.** 185 GB resident for 96 GB
+logical on a 436 GB `i4i.large` is ~42% of the volume, against ~31% at the
+baseline — and the WAL archive budget is derived from volume size (BUG-0079),
+so the footprint and the retention window come out of the same disk. Plus a
+32 MB write buffer per engine, which is a memory commitment that scales with
+seat count, not with data.
+
+"Fixed" remains the wrong word: **43.4% stall** is the best measured
+configuration at production scale. The seat still spends nearly half its time
+waiting on compaction; the tuning moves the ceiling, it does not remove the
+constraint.
+
+### Where the crossover is, and that it is not measured
+
+The two sweeps bracket it between ~760 MB and 6.4 GB at an 8 MB level base —
+roughly two orders of magnitude of LSM depth, which is too wide to guide an
+operator. Nothing here locates it. That is the measurement that would turn this
+proposal into a rule ("apply above N x level base"), and it is one sweep at
+three intermediate sizes on the seat that already exists.
+
 ### Next
 
-Propose defaults with the memory cost priced, and re-measure at a production
-LSM size before changing anything shipped. Note the delivery channel is
+~~Propose defaults with the memory cost priced, and re-measure at a production
+LSM size before changing anything shipped.~~ Both done — the 96 GB re-measure
+above, the pricing here. What remains is the crossover point, and the refill
+half of this bug, which none of this touches. Note the delivery channel is
 `flintctl node-env`, which reached bootstrap and nothing else until 2026-08-26
 — it would have dropped exactly these variables on the first `upgrade`.
