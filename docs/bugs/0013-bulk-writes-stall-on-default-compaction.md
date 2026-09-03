@@ -799,3 +799,68 @@ above, the pricing here. What remains is the crossover point, and the refill
 half of this bug, which none of this touches. Note the delivery channel is
 `flintctl node-env`, which reached bootstrap and nothing else until 2026-08-26
 — it would have dropped exactly these variables on the first `upgrade`.
+
+## 2026-09-03 — the crossover is bracketed to 3.7-6.4 GB, and stall crosses first
+
+The proposal above could not tell an operator *when* to tune, because the two
+sweeps that disagree sat 8.4x apart in LSM size. Three intermediate points, one
+box, one build, one uninterrupted run — i4i.2xlarge with the seat pinned to CPUs
+0,1, 8 MB level base, 4 MB write buffer, ~100 MB per interval, which is the
+2026-08-17 shape.
+
+| logical | default | bg_jobs=4 | change | stall default -> 4 | W-Amp default -> 4 |
+|---|---|---|---|---|---|
+| 1.3 GB | 186.0 MB/s | 137.2 MB/s | **-26.2%** | 19.2% -> 26.7% | 7.1 -> 8.4 |
+| 2.2 GB | 175.3 MB/s | 135.9 MB/s | **-22.5%** | 24.1% -> 28.8% | 7.5 -> 8.8 |
+| 3.7 GB | 118.5 MB/s | 115.2 MB/s | **-2.8%** | 47.0% -> **43.7%** | 8.3 -> 9.9 |
+
+Placed against what this file already had — -9.1% at 0.76 GB, +32% at 6.4 GB,
++93% at 96 GB — **the sign changes between 3.7 and 6.4 GB.** The window an
+operator has to guess inside is now 1.7x rather than 8.4x.
+
+### Stall crosses over BEFORE throughput does, and that is the mechanism
+
+The throughput column says only "worse, worse, nearly even". The stall column
+says what is happening underneath: `bg_jobs=4` makes stalling **worse** at
+1.3 GB and 2.2 GB and **better** at 3.7 GB. So extra compaction parallelism
+begins relieving write stalls somewhere between 2.2 and 3.7 GB, while it is
+still losing on balance, and the throughput sign flips later — only once the
+relief outweighs the cores the compaction threads take.
+
+That is the same mechanism this file has argued from the start, now visible as
+two crossings rather than one: **contention cost is paid immediately, stall
+relief arrives with depth, and the knob is worth setting only after the second
+overtakes the first.** It also explains why a small-seat sweep cannot be
+extrapolated in either direction — the two effects move oppositely with size.
+
+Write amplification is consistently HIGHER with `bg_jobs=4` at every size here
+(7.1 -> 8.4, 7.5 -> 8.8, 8.3 -> 9.9). Note that is the opposite of the 96 GB
+result, where the best configuration cut it 16.0 -> 10.2 — but that one paired
+the knob with a 64 MB level base. At an 8 MB base, more jobs means more merging,
+which is the 2026-08-17 finding in its original form.
+
+### What this does NOT establish, stated rather than buried
+
+- **n=1 per configuration.** The 0.76 GB figure it is placed beside was n=5
+  pooled against a 3.1% error bar. The -26.2% and -22.5% are far outside any
+  plausible noise and their sign is safe; **-2.8% at 3.7 GB is not
+  distinguishable from zero**, so 3.7 GB may itself be at or past the crossover
+  rather than below it.
+- **The bracket splices two runs.** Every row in the table above is internally
+  comparable — same box, same build, same hour. The +32% at 6.4 GB that closes
+  the bracket is from a different run on a different date and build. The
+  cleanest reading of today's data alone is "negative at 1.3, 2.2 and 3.7 GB and
+  shrinking toward zero", and the crossover location inherits whatever drift
+  sits between the two runs.
+- **The non-monotonicity is not claimed as a shape.** -9.1% at 0.76 GB against
+  -26.2% at 1.3 GB would put the worst harm in the middle rather than at the
+  smallest LSM, which is interesting and would matter — but those two numbers
+  also come from different runs weeks apart, so cross-run variance is at least
+  as good an explanation. It needs 0.76 GB re-run inside one series to mean
+  anything.
+
+**The one leg that would fix both splices** is a 6.4 GB run appended to this
+series on one box: it anchors today's numbers to the known +32% point and turns
+the bracket into a single-run result. That is ~15 minutes on the baked AMI and
+is the obvious next step, not a new experiment.
+
