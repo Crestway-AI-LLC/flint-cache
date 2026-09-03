@@ -382,3 +382,72 @@ The harness now samples `l0_files`, `write_stall_readable` and
 drains and every leg reads quiet — and refuses to let the rates be compared to
 a knee unless at least one leg actually stalled. That makes the re-run answer
 the question this one raised.
+
+### RE-RUN 2026-09-03 — at the knee this time, and the answer is no
+
+Same two boxes, build `319b250`, load pipelined at depth 32 rather than depth 1.
+**Every leg stalled** (`write_stall_readable=1`, `l0_files` peaking 12–20), so
+these are knee numbers and comparable in kind to the fleet's.
+
+| leg | `wal-fsync-ms` | client ops/s | engine seq/s | logical MB/s | fsync/s | peak l0 | stalled |
+|---|---|---|---|---|---|---|---|
+| 1 | 500 | 495,033 | 495,035 | 506.9 | 2.01 | 18 | **1** |
+| 2 | 50 | 467,475 | 467,462 | 478.7 | 17.35 | 20 | **1** |
+| 3 | 0 | 467,886 | 467,873 | 479.1 | 0.00 | 20 | **1** |
+| 4 | 500 | 466,226 | 466,214 | 477.4 | 2.02 | 12 | **1** |
+
+**Depth was the whole of the previous run's shortfall.** 138,904 → 495,033
+ops/s on identical hardware, purely from pipelining. The first run was
+round-trip-bound and never reached the engine at all, exactly as write-path-
+next item 1 found for the un-pipelined path.
+
+**The fsync null survives at the knee, and now has a scale to be judged
+against.** Legs 2–4 span 466,226–467,886 — **0.35%** — across 50 ms, no fsync,
+and 500 ms. Leg 1 sits 6% above leg 4 *at the same setting*, which is the
+order effect: leg 1 met a shallower tree. So the tree-depth drift is 6% and the
+knob's effect is under 0.35%, an order of magnitude smaller. Order-balancing
+was not a formality here; forward-only would have read leg 1's 495k as a
+500 ms advantage.
+
+**The proxy is not in the way at this depth.** Client ops/s and engine
+`latest_seq` agree to within 20 ops in every leg, so nothing between the loader
+and the engine is dropping or throttling, and the client's count can be
+trusted. Worth checking rather than assuming: item 1 measured the proxied and
+direct paths differing ~6x, and the fleet's knee was taken driving the master
+directly.
+
+**Device: 23%.** 506.9 MB/s logical × 1.05 measured amplification = 530.4 MB/s
+against fio's 2,335.3 MB/s on the same mount. Higher than the first run's 7%
+because the rate more than tripled, and still not the constraint.
+
+**`writes_delayed_soft` was 0 in every leg, and that is not a null.** The fleet
+run had it at 4,300–4,700/s during its stall. It is the soft *replication-lag*
+band, and this seat has no replica, so there is nothing for it to measure.
+**The two runs' `delayed_soft` columns are not comparable** — which also means
+the fleet's soft-delay pressure cannot be reproduced without a replica.
+
+### What this settles
+
+**~80k seq/s is not a ceiling of the write path on this hardware.** A single
+i4i.4xlarge seat, driven into a genuine L0 write stall, sustained **~467–495k
+seq/s** — five to six times the fleet's knee, while stalling. So whatever binds
+at ~80k binds around five times earlier than the machine does, and it is not
+the fsync path (0.35%), not device bandwidth (23%), and not the WAL append path
+that both of those would have had to pass through.
+
+**What differs between the two, and therefore what to look at next:** this seat
+had **no replica**. The fleet's pair had one, and `writes_delayed_soft` — the
+one counter that fired heavily there and is structurally silent here — is keyed
+on replication lag. ADR-0022's lag cap and its soft band are the remaining
+structural difference, and write-path-next item 9 independently found
+`writes_shed_lag` to be "the gate that binds, and it binds alone" at a
+different operating point.
+
+That is a hypothesis, not a measurement: the two runs also differ in hardware
+and payload. The experiment that would settle it is this same harness with a
+replica attached, which is one more box and the same half hour.
+
+**A caveat on the counters.** RocksDB's cumulative dump runs every 30 s
+(`FLINT_STATS_DUMP_SEC=30`), so the amplification terms are read from a
+snapshot up to 30 s behind the end of the run. Every term is equally stale, so
+the ratio holds; the absolute byte totals are a slight under-count.
