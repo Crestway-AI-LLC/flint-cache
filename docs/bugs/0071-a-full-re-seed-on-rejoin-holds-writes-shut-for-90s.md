@@ -1,4 +1,4 @@
-# BUG-0071: a full re-seed on rejoin holds writes shut for ~90 s at min-replicas=1 (OPEN)
+# BUG-0071: a full re-seed on rejoin holds writes shut for ~90 s at min-replicas=1 (the observed 94.2 s cause FIXED 2026-08-29; what stays OPEN is a design question, below)
 
 **Found** 2026-08-28, in the soak run to verify BUG-0070's probe fix. Severity:
 high — it is a 9x overrun of the published 10 s RTO budget, and unlike BUG-0070

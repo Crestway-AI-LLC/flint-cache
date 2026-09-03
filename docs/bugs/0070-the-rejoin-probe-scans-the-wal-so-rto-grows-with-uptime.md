@@ -1,4 +1,4 @@
-# BUG-0070: the rejoin probe scans the WAL, so failover time grows with a master's uptime (OPEN)
+# BUG-0070: the rejoin probe scans the WAL, so failover time grows with a master's uptime (FIXED and fleet-measured 2026-08-28; the remaining term is BUG-0071)
 
 **Found** 2026-08-28, decomposing a `min-replicas=1` failover with the sub-phase
 instrumentation added the same day. Severity: high — it makes RTO a function of
