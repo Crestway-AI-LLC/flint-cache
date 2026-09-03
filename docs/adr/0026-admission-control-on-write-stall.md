@@ -515,6 +515,61 @@ same mistake the stall counters had before they were moved inside the leg. The
 shed counters are cumulative and unaffected, but the lag column is currently
 worthless and should be sampled during the load.
 
+### LAG ARM 2026-09-03 — the cap reports the limit, it does not impose it
+
+`lag-hard-ms` walked 1000 → 8000 → 250 → 1000, order-balanced, soft held at
+half of hard so the band's shape stayed constant. Both values read back from
+the engine each leg, because BUG-0043's pair refuses out-of-order writes rather
+than clamping and four legs at one setting would look like four arms.
+
+| `lag-hard-ms` | offered/s | **committed/s** | replica applied/s | shed/s | peak lag ms |
+|---|---|---|---|---|---|
+| 1000 | 123,430 | **100,616** | 100,616 | 22,801 | 1,367 |
+| 8000 | 110,394 | **98,606** | 98,606 | 11,839 | **16,202** |
+| 250 | 127,200 | **99,646** | 99,646 | 27,566 | **497** |
+| 1000 | 129,952 | **106,862** | 106,862 | 23,123 | 1,946 |
+
+**Committed throughput does not track the threshold.** Across a **32x** range it
+spans 98,606–106,862 — 8.4%, non-monotonic, with the *tightest* arm (250 ms)
+beating the *loosest* (8000 ms). Loosening the cap eightfold buys no
+throughput at all.
+
+**What the threshold does control is the lag, which is to say the RPO.** 250 ms
+holds peak lag to 497 ms; 8000 ms lets it reach **16.2 seconds**. The shed count
+moves inversely, 27,566/s down to 11,839/s, and the offered rate falls with it —
+the accounting identity closes again in all four legs, worst residual 51 out of
+~120,000 (**0.04%**).
+
+**So the answer is the first reading: ~100k is a real limit and the cap is
+reporting it, not setting it.** The question this arm existed to settle —
+whether the pair ceiling was a hardware fact or a default someone picked — comes
+out as fact.
+
+**The operational consequence is the useful part.** Tightening `lag-hard-ms`
+from 1000 to 250 cost **1%** of throughput (100,616 → 99,646, inside the 8.4%
+run-to-run spread) and cut peak replication lag from ~1.4 s to ~0.5 s. The lag
+cap is close to free, and the shipped 1000 ms is not buying throughput that a
+tighter setting would give up. Loosening it is strictly a worse trade: 16
+seconds of exposure for nothing.
+
+**Two limits on what this establishes, stated because the numbers invite more
+than they carry.**
+
+- **The replica's `applied/s` equalling the master's `committed/s` exactly, to
+  the digit, is partly definitional.** Both are deltas across the leg
+  boundaries, and the replica ends each leg level — so the equality says it
+  caught up by the end, not that it was saturated throughout. Peak lag of
+  0.5–16 s says it fell behind *during* each leg. The pacing conclusion rests
+  on the threshold sweep, not on this equality.
+- **The cap was never fully removed.** Even at 8000 ms it still shed 11,839/s
+  and lag overshot to 16.2 s, so no arm here measures an uncapped pair. What is
+  established is that the cap's *position* does not set the rate across a 32x
+  range — not that the rate would be unchanged with no cap at all.
+
+Device: 6% of fio's 2,336 MB/s. `wal-fsync-ms` was held at its default
+throughout and verified at ~2.1/s every leg, so the fsync knob is not moving
+underneath this.
+
 **A caveat on the counters.** RocksDB's cumulative dump runs every 30 s
 (`FLINT_STATS_DUMP_SEC=30`), so the amplification terms are read from a
 snapshot up to 30 s behind the end of the run. Every term is equally stale, so
