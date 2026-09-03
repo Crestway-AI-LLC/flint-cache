@@ -220,3 +220,75 @@ two inputs, not a new tool.
 A caveat on reading the result: at ~14%, telling P=1 from P=4 needs enough runs
 to separate the rates. Three green serial runs would be weak evidence — at 14%
 the chance of three clean runs by luck alone is about 64%.
+
+## 2026-09-03, later — two contention proxies measured, neither separates, and the planned experiment is now ambiguous
+
+The section above leaves "CPU, ports, or something else" open and proposes a
+`gate_jobs=1` dispatch. Before spending ~20 gate runs on a binary outcome, two
+proxies that cost nothing were read out of artifacts already on disk — five
+failing runs against four passing ones.
+
+**Proxy 1: runner load.** Every guarded drill prints `load` at its own start,
+so a run yields ~119 samples.
+
+| | median load | max load |
+|---|---|---|
+| failing runs | 2.48 – 2.84 | 4.12 – 5.66 |
+| passing runs | 2.58 – 2.67 | 4.32 – 4.59 |
+
+Fully overlapping, and one **failing** run peaked at 4.12 — lower than every
+passing run. Per-drill is no better: `backup_seat` failed at load 2.47, inside
+the passing range of 1.75 – 2.57.
+
+**Proxy 2: concurrent flint processes the guard could not attribute.** CI sets
+`FLINT_DRILL_FORCE: "1"` (`gate.yml:155`), so the guard reports and proceeds
+rather than refusing — necessary for a parallel gate, and it means every run
+logs how many processes it went ahead despite.
+
+| | drills forced | max unattributed processes |
+|---|---|---|
+| failing runs | 22 – 26 | 4 – 10 |
+| passing runs | 23 – 27 | 4 – 10 |
+
+Identical ranges. Both proxies rule out a LARGE effect on n=9; neither rules out
+a small one.
+
+### The consequence: "not the commit" was read as "the parallelism"
+
+The section above establishes something real — three failing commits changed no
+code, so the COMMIT is not the cause, and eleven drills across six runs means no
+single drill is broken. Both are sound. **Neither shows that parallelism is the
+cause.** They eliminate per-commit regressions and per-drill bugs and leave
+"environmental", and parallelism is one candidate in that class, not the class
+itself. The write-up moves from the first to the second in one sentence, and the
+two proxies above are the first evidence bearing on it — both negative.
+
+**A competing candidate, with support that landed today.** BUG-0088: `failover`
+failed twice by projecting a write wait of **2017 ms and 2033 ms against a
+2000 ms deadline** — margins of 0.85% and 1.65%. That is a timing threshold
+being missed by about one percent, which a slower-than-usual shared runner
+produces without any help from Flint's own parallelism. The same drill on an
+unloaded laptop peaks at 18–29 ms against that deadline, so the CI figure is
+roughly two orders of magnitude out.
+
+**Which makes the proposed experiment ambiguous as designed.** `gate_jobs=1`
+lowers contention AND lowers timing pressure at once. If the red rate collapses,
+that result cannot distinguish "parallel drills interfere" from "the runner is
+slow and fewer things were racing the clock" — and those need different fixes,
+which is exactly the distinction this file said it could not make.
+
+### A cheaper and sharper version of the same experiment
+
+BUG-0088's `write_wait_peak_ms` landed today and every gate run now records a
+continuous margin instead of a pass/fail bit. That changes the arithmetic: the
+three-green-runs problem (64% likely by luck at 14%) exists only because the
+outcome is binary. Comparing peak distributions between P=1 and P=4 needs far
+fewer runs than comparing failure rates, and it answers the sharper question —
+whether serial running moves the timing margin at all, which is what separates
+the two hypotheses.
+
+So the recommendation is unchanged in shape and cheaper in cost: let the
+instrument accumulate a few dozen P=4 peaks from ordinary gate runs, which costs
+nothing because those runs happen anyway, then dispatch a handful at P=1 and
+compare the distributions rather than the verdicts.
+
