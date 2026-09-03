@@ -880,12 +880,46 @@ before it falls outside. A first row cannot show a transition it straddles.
 window containing the rc.65 sighting's 110). Every promoted lifetime since has
 shed zero with peak lag 2–29 ms, and the current one adds 61.8 h more at 71 ms.
 
-**The cause of that transition is still unidentified**, and two attributions
-were tried and are wrong: BUG-0038's shipper fix ships in **rc.58**, so it ran
-throughout the shedding period; and BUG-0078's `TCP_NODELAY` lands *after*
-rc.65, while the first clean promoted lifetime begins at the rc.65 roll. Both
-recorded so neither is tried a third time. What changed is a diff to find, not
-a measurement to take.
+**The cause of that transition is still unidentified**, and three attributions
+have now been tried and failed:
+
+1. **BUG-0038's shipper fix** ships in **rc.58**, so it ran throughout the
+   shedding period.
+2. **BUG-0078's `TCP_NODELAY`** lands *after* rc.65, while the first clean
+   promoted lifetime begins at the rc.65 roll.
+3. **Something in rc.65 itself.** `flint_node_build_info` gives the exact
+   release per window — both seats walked rc.57 → rc.67 together — and the
+   shedding stops at the rc.64 → rc.65 boundary. But rc.65 is 23 commits and
+   **only one touches the replication path at all** (`c8623a21`, BUG-0062's
+   snapshot quarantine on rejoin), which has no mechanism by which it would cut
+   promotion lag from ~6 s to ~2 ms. The rest are drills, the accelerator, and
+   BUG-0013 measurements.
+
+So the correlation with the rc.65 roll is clean and the mechanism is absent.
+Recorded so none of the three is tried a fourth time.
+
+### Two pieces of context that bound how these numbers should be read
+
+**The playground is a SMALL fleet.** `flint_node_sst_bytes` stays between 0.2
+and 0.9 MB across the whole fourteen days. This is under a megabyte of stored
+data, not a loaded system — so the absolute shed counts are not production
+figures. What makes the comparison still valid is that the volume is the same
+in the shedding and the clean lifetimes: the difference between them is not
+load. There is no exported write-rate metric, so "comparable load" is inferred
+from comparable data volume rather than measured, and that is the weakest joint
+in this analysis.
+
+**And a discrepancy that makes per-lifetime release attribution unsafe.**
+`build_info` puts 7002 on rc.65 from 08-27 18:24, but its shed counter shows no
+reset until 08-31 23:41 — and a restart onto a new release must reset a
+per-process counter. One of those two readings is wrong. The counter series was
+checked for holes (a restart inside a gap would be invisible, and
+`shed-history.sh` now splits on gaps and marks the row); there are none at this
+resolution. Until that is reconciled, which release a given lifetime ran is not
+a safe inference, and the release attribution above rests on 7001 alone.
+
+*(An earlier draft of this section claimed the series HAD a gap on 08-27. That
+was a broken filter in an ad-hoc query, not a property of the data. Retracted.)*
 
 **And the cause of the transition is unidentified.** Two attributions were
 tried and both are wrong: BUG-0038's shipper fix is in **rc.58**, so it was
