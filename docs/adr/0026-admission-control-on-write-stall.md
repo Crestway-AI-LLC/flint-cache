@@ -267,3 +267,81 @@ so the amplification cannot be recovered from anything on disk — the question
 has to be re-run to be answered at all. A run that establishes a rate should
 keep the counters that would explain it, because the explaining question is
 always asked later and always by someone who cannot go back.
+
+### RUN 2026-09-03 — the fsync path is eliminated; the device is not close
+
+One `i4i.4xlarge` seat, one `c7i.4xlarge` loader, build `d565ebf`, 1024-byte
+values, four order-balanced 120 s legs.
+`packaging/aws/writepath-cap/run.sh` in the ops repo.
+
+**Reading 3 first, because it is the decisive one.**
+
+| leg | `wal-fsync-ms` | write ops/s | logical MB/s | fsync/s | expected/s |
+|---|---|---|---|---|---|
+| 1 | 500 | 138,137 | 141.5 | 1.98 | 2.00 |
+| 2 | 50 | 138,580 | 141.9 | 19.34 | 20.00 |
+| 3 | **0** | 138,469 | 141.8 | **0.00** | 0 |
+| 4 | 500 | 138,904 | 142.2 | 1.98 | 2.00 |
+
+**Total spread 0.55%**, across a tenfold change in cadence and then no fsync at
+all. **The fsync path is not the cap.**
+
+The null is not vacuous, and that is the whole reason the arms are built this
+way. Each one was verified twice before its number was taken: `FLINTCONFIG` was
+read back so the value is the engine's rather than ours, and `wal_fsync_total`
+had to climb at a rate that TRACKS the cadence — 1.98/s at 500 ms, 19.34/s at
+50 ms, exactly zero at 0. A knob that was accepted and ignored would produce
+these same four identical throughputs and would mean nothing.
+
+The arms also needed no restart. `WAL_FSYNC_MS` is an atomic the fsync tick
+re-reads every iteration, so all four legs ran against one continuously-growing
+LSM and no arm can be attributed to a restart or a re-warmed cache.
+
+**Readings 1 and 2: the device is at single-digit percent.**
+
+| | MB/s |
+|---|---|
+| fio, 1 MiB sequential, qd32, same mount, before Flint wrote anything | **2,334** |
+| fio, 4 KiB with `fdatasync` every write | 34.2 |
+| best logical write rate observed | 142.2 |
+| × 1.18 measured amplification = asked of the device | **~167** |
+
+**About 7% of what fio got out of the same device.** Device write bandwidth is
+not the constraint, and it is not marginal — it is more than an order of
+magnitude away.
+
+The 34.2 MB/s figure is worth keeping beside it: a WAL that synced on every
+write could not reach even the 84–93 MB/s this ADR is about, let alone 142.
+The bounded cadence is what makes the observed rate reachable at all, and
+leg 3 shows that removing the remaining 2/s buys nothing.
+
+**Amplification, and a correction to how it was first computed.** Measured
+1.18x — WAL 66.82 GB (1.00x, the WAL is uncompressed and tracks ingest
+exactly) plus 11.71 GB of flush and compaction, over 66.82 GB ingested. The
+first version of the instrument reported **2.18x**, having added a flush term
+equal to `ingest` on the reasoning that the memtable reaches L0 once. Wrong
+twice: the memtable DEDUPES — 39M writes over a 20M key space, finishing at
+338.92 MB on disk — and the Sum row's `Write(GB)` already contains the L0
+flush output, so the term was double-counted as well as invented. It inflated
+the answer in the direction that made the conclusion look weaker, which is
+exactly why it would have survived unexamined.
+
+**Two caveats, stated because they bound what this establishes.**
+
+- The payload is memtier's default, which compresses heavily. Flush and
+  compaction bytes here are compressed while the WAL is not, so 1.18x is a
+  LOWER bound on amplification for real data, and the device share is a lower
+  bound too. That is the safe direction for "the device is not the cap" and
+  the wrong direction for quoting 1.18x as an amplification figure.
+- RocksDB's own Sum-row W-Amp reads **10.1** against this 1.18x, and the gap is
+  expected rather than a fault: its denominator is bytes entering L0, ours is
+  bytes the client sent, and those differ by exactly the dedup factor. Both are
+  printed by the harness so the gap is visible instead of one being quoted.
+
+**What is left, and one number that reframes it.** WAL append serialisation is
+the only surviving candidate; nothing here eliminates it. But this seat
+sustained **138k ops/s at 142 MB/s** where the fleet's knee was ~80k seq/s at
+84–93 MB/s — roughly 1.7x more on one box with no replica, no lag cap and a
+different payload. So the ~80k figure is not a property of the write path on
+this hardware, and the next question is what the fleet has that this does not,
+rather than what the machine cannot do.
