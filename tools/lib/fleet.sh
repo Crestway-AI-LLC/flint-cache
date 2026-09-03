@@ -306,6 +306,19 @@ _fleet_foreign() {
     # of string, a slash, or a space. Same family as every other unanchored
     # match in docs/field-notes.md.
     function owns(hay, sc,   p, nxt, rest) {
+      # AN EMPTY SCOPE OWNS NOTHING, said here rather than assumed upstream.
+      # With sc == "", index() returns 1 every iteration and rest never
+      # shortens, so this loop either spins FOREVER or -- because
+      # `ps -eo pid=,args=` right-aligns the pid, so every line begins with a
+      # space -- takes the nxt == " " branch and returns 1 for EVERY flint
+      # process on the box. That would turn `fleet_kill server` into a blanket
+      # sweep across every drill sharing the machine.
+      #
+      # NOT reachable today: fleet_init refuses an empty scope, and all 131
+      # drills plus the 5 benches that source this call it before their first
+      # kill or guard (checked). A guard on the invariant, not a fix for a live
+      # fault -- the cost of being wrong here is seats belonging to others.
+      if (sc == "") return 0
       rest = hay
       while ((p = index(rest, sc)) > 0) {
         nxt = substr(rest, p + length(sc), 1)
@@ -336,6 +349,15 @@ _fleet_foreign() {
 # components (space separated, e.g. "controlplane proxy").
 _fleet_ours() {
   local want="${1:-}"
+  # Refuse loudly rather than quietly matching nothing. owns() returns 0 for an
+  # empty scope now, which is the safe direction, but a fleet_kill that
+  # silently kills nothing is its own wrong answer: the caller believes the
+  # seats are gone. fleet_init makes this state impossible; if it ever becomes
+  # possible, say so rather than proceed.
+  if [ -z "${FLEET_SCOPE:-}" ] && [ -z "${FLEET_PORTS:-}" ]; then
+    echo "_fleet_ours: no FLEET_SCOPE and no FLEET_PORTS -- call fleet_init first." >&2
+    return 0
+  fi
   local re='^flint-(server|proxy|controlplane|controller|agent|console|ops|register|exporter|meter|backup)$'
   if [ -n "$want" ]; then
     re="^flint-($(printf '%s' "$want" | tr ' ' '|'))$"
@@ -358,6 +380,19 @@ _fleet_ours() {
     # of string, a slash, or a space. Same family as every other unanchored
     # match in docs/field-notes.md.
     function owns(hay, sc,   p, nxt, rest) {
+      # AN EMPTY SCOPE OWNS NOTHING, said here rather than assumed upstream.
+      # With sc == "", index() returns 1 every iteration and rest never
+      # shortens, so this loop either spins FOREVER or -- because
+      # `ps -eo pid=,args=` right-aligns the pid, so every line begins with a
+      # space -- takes the nxt == " " branch and returns 1 for EVERY flint
+      # process on the box. That would turn `fleet_kill server` into a blanket
+      # sweep across every drill sharing the machine.
+      #
+      # NOT reachable today: fleet_init refuses an empty scope, and all 131
+      # drills plus the 5 benches that source this call it before their first
+      # kill or guard (checked). A guard on the invariant, not a fix for a live
+      # fault -- the cost of being wrong here is seats belonging to others.
+      if (sc == "") return 0
       rest = hay
       while ((p = index(rest, sc)) > 0) {
         nxt = substr(rest, p + length(sc), 1)
