@@ -1,6 +1,6 @@
 # BUG-0011: `proxy_conformance_drill` bootstrap panics — the CP seat starts but never PONGs (OPEN)
 
-Status: OPEN · a first-exec cost is CONFIRMED and mitigated 2026-08-23, but the multi-second stall is observed (n=2) and NOT reproduced · found 2026-08-16 · Severity: medium (blocks the `drills` gate
+Status: OPEN · first-exec validation is CONFIRMED, MEASURED AS SERIALIZED (~195 ms/binary, linear in burst size) and mitigated · the multi-second stall is now observed n=3 and still NOT reproducible on demand · found 2026-08-16 · Severity: medium (blocks the `drills` gate
 stage; `check` is unaffected)
 
 ## Symptom
@@ -300,3 +300,113 @@ Run this drill **alone**. During the 2026-08-16 investigation, five unrelated
 drills were invalidated because a manual reproduction was left running while a
 suite executed, and `fleet_guard` correctly refused them — the refusal message
 names the offending pids and is the diagnosis, not noise.
+
+## 2026-09-03 — validation is SERIALIZED, and that is the missing arithmetic
+
+Everything measured before this ran one exec at a time and found ~200 ms, which
+cannot blow a 10 s budget. That is why the cause stayed a "fit" rather than a
+mechanism. The file's own word for the failure was **burst**, and a burst was
+never measured.
+
+**Method.** K fresh copies of `flint-controlplane` (new inode each, so
+validation is cold), page cache pre-warmed with a full read so this measures
+validation and not disk I/O, all K launched at once. Then the SAME K copies run
+again — identical binaries, identical concurrency, identical load, differing
+only in whether validation has already happened. That second run is the control,
+and it is the whole experiment: a loaded box makes everything slower, so "cold
+K=32 is slow" means nothing without it.
+
+| K | cold wall | cold worst single | warm wall | cold ms/binary |
+|---|---|---|---|---|
+| 1 | 199 ms | 199 ms | 4 ms | 199 |
+| 2 | 398 ms | 397 ms | 5 ms | 199 |
+| 4 | 773 ms | 770 ms | 7 ms | 193 |
+| 8 | 1 551 ms | 1 544 ms | 12 ms | 194 |
+| 16 | 3 079 ms | 3 067 ms | 21 ms | 192 |
+| 32 | 6 257 ms | 6 226 ms | 39 ms | 196 |
+
+**Cold wall is linear in K at a constant ~195 ms per binary. Warm is not.**
+Validation does not parallelise: K cold seats starting together cost K x 195 ms
+of wall time and the last one waits for all of them. Warm execs at K=32 finish
+in 39 ms, so the box was not merely busy.
+
+**Run in reverse (K=32 first, K=1 last) and the line is the same** — 196, 192,
+194, 193, 199, 199 ms per binary. So the linearity is not an artefact of a
+daemon warming up over the sweep, which was the obvious alternative.
+
+This is the arithmetic the file was missing. A gate stage running 4 drills at
+once, each bringing up 4 seats, is 16 cold execs: **~3.1 s inside a 10 s
+budget, spent before any of our code runs.** Nothing rare is required.
+
+**What it does not establish.** No historical failing run was instrumented, so
+this is still a fit to the recorded signature rather than a measurement of the
+failures themselves — but it is now a fit with a size, a slope and a control,
+instead of an inference from a single-exec microbenchmark. 3.1 s of a 10 s
+budget is not on its own a blowout; it is the fixed cost that anything else has
+to be added to.
+
+**Measured under load 2.2-2.6** with a sibling gate box driver running locally.
+That is a confound for absolute numbers and not for the comparison, because the
+warm arm was measured in the same breath at the same load.
+
+### The 23 s/43 s stall reproduced, a third time, still not on demand
+
+The first cold exec of the burst session took **27 623 ms** — against 199 ms for
+the same operation minutes earlier and minutes later, and 6 ms warm immediately
+after. That is a third sighting of the outlier this file records as
+"observed, n=2, not reproduced", and it does not make it reproducible: 44 further
+cold execs across two sweeps never exceeded 6.2 s.
+
+What the three sightings now share is position: **each was the first cold exec of
+a fresh measurement session.** The earlier pair were the first two events of
+their session; a 360 ms first trial in the volume experiment below was 1.8x every
+later first-exec in the same run. That is a lead about session-level state — a
+daemon that idles out, most plausibly — and it is not yet a cause.
+
+### The volume hypothesis, tested and REFUTED
+
+These worktrees build to an external APFS volume mounted `noowners` while the
+boot disk is a different device, and a recorded observation elsewhere holds that
+Gatekeeper stalls external builds. That predicts the trigger is *where the binary
+lives*, which would explain non-determinism that does not track load.
+
+It is wrong. Twelve trials per arm, arms interleaved in randomised order,
+identical source bytes, page cache pre-warmed:
+
+| arm | n | first-exec p50 | repeat p50 |
+|---|---|---|---|
+| external (`/Volumes/FlintDev`, noowners) | 12 | 197.5 ms | 4.2 ms |
+| internal (boot disk) | 12 | 196.1 ms | 4.2 ms |
+
+**1.01x. There is no volume effect.** The positive control fired — the
+first-exec penalty appeared at 47x in both arms — so this is a real null and not
+an experiment that failed to observe anything. Recorded so it is not re-tested.
+
+Incidentally the penalty is larger than this file has been quoting: **196 ms
+against 4.2 ms, ~47x**, not ~10x. The earlier ~25 ms repeat figure was timed
+through a shell; this times the exec directly. The direction and the mitigation
+are unchanged, the ratio is bigger.
+
+### The mitigation covered four of the seven binaries flintctl spawns
+
+`FLEET_BINARIES` in `crates/flint-ctl/src/main.rs` is the canonical list of what
+`flintctl` starts and has seven entries. `fleet_init` warmed four:
+`flint-server`, `flint-proxy`, `flint-controlplane`, `flint-controller`.
+Unwarmed: `flint-agent`, `flint-backup`, `flint-vec`.
+
+That was not a decision. It is the four that existed when the warm was written,
+and it is this file's own lesson recurring one level up — the mitigation moved
+from "each drill must remember to call it" to "whoever adds a seat type must
+remember to list it." The seats currently inside 10-15 s `wait_pong` budgets are
+all in the warmed four, so **no live failure is claimed here**; `flint-vec` is
+fleet-deployable, so the gap is one budget away from mattering.
+
+Fixed by naming all seven — `fleet_warm` skips absent files, so a workspace that
+does not build them all pays nothing — and by
+`assert_warm_covers_fleet_binaries` in `tools/gates.sh`, which fails the build
+when the two lists drift. It is tri-state: if either list reads as zero names,
+that is a FAILURE, because a matcher that finds nothing agrees with everything.
+Mutation-tested four ways — a dropped binary, the const renamed, `fleet_init`
+renamed, and the warm call deleted — because a check that cannot fail proves
+nothing.
+

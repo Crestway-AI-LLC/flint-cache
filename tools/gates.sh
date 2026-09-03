@@ -1663,6 +1663,57 @@ assert_lease_ttl_single_source() {
   FAILED="$FAILED lease-ttl-copy"
 }
 
+# The loader warm must cover every binary flintctl can spawn (docs/bugs/0011).
+#
+# WHY A CHECK AND NOT JUST A LONGER LIST. macOS validates a freshly built
+# binary's code signature on first exec, and that validation is SERIALIZED
+# system-wide: measured at ~195 ms per binary, strictly additive, so K cold
+# seats starting at once cost K x 195 ms and the last one waits for all of
+# them. At K=32 the worst single exec was 5.7 s against a 10 s seat budget.
+# `fleet_init` pays that once, outside any budget -- but only for the binaries
+# it names, and it named four of seven for no reason other than that those four
+# existed when it was written. A seat type added later inherits the original
+# bug silently, which is the same shape as the mitigation that 8 drills of 111
+# remembered to call.
+assert_warm_covers_fleet_binaries() {
+  local declared warmed missing b nd nw
+  # `index()` rather than a /\];/ range: an escaped bracket is a regex escape
+  # gawk warns about and BSD awk does not, and a warning per gate run is how
+  # the duplicate-port check came to print 254 lines of noise (BUG-0086).
+  declared=$(awk '/const FLEET_BINARIES/{f=1}
+                  f{print; if (index($0, "];") == 1) exit}' \
+    crates/flint-ctl/src/main.rs 2>/dev/null \
+    | grep -oE '"flint-[a-z]+"' | tr -d '"' | sort -u)
+  warmed=$(awk '/^fleet_init\(\)/,/^}/' tools/lib/fleet.sh 2>/dev/null \
+    | grep -v '^[[:space:]]*#' | sed -n '/fleet_warm/,$p' \
+    | grep -oE 'flint-[a-z]+' | sort -u)
+  nd=$(printf '%s' "$declared" | grep -c . ); nw=$(printf '%s' "$warmed" | grep -c . )
+  # TRI-STATE. An empty read is "could not look", never "nothing is missing" --
+  # either file could be renamed or restructured and both greps would then
+  # agree with everything. Zero on either side is a FAILURE, not a pass.
+  if [ "$nd" -eq 0 ] || [ "$nw" -eq 0 ]; then
+    echo "FAIL  could not read the two lists this check compares:"
+    echo "        FLEET_BINARIES  (crates/flint-ctl/src/main.rs): $nd name(s)"
+    echo "        fleet_warm      (tools/lib/fleet.sh):           $nw name(s)"
+    echo "        A zero here means the check examined nothing, which is not"
+    echo "        the same as finding nothing wrong (docs/bugs/0011)."
+    FAILED="$FAILED warm-list-unreadable"
+    return 0
+  fi
+  missing=""
+  for b in $declared; do
+    printf '%s\n' "$warmed" | grep -qx "$b" || missing="$missing $b"
+  done
+  [ -z "$missing" ] && return 0
+  echo "FAIL  fleet_init warms only part of what flintctl spawns, missing:$missing"
+  echo "        FLEET_BINARIES (crates/flint-ctl/src/main.rs) is the list of"
+  echo "        binaries flintctl starts. Any of them can be a seat inside a"
+  echo "        10-15 s startup budget, and an unwarmed one pays serialized"
+  echo "        code-signature validation there instead of in fleet_init."
+  echo "        Add it to the fleet_warm call; fleet_warm skips absent files."
+  FAILED="$FAILED warm-list-incomplete"
+}
+
 if want check; then
   echo "== gates: fmt, clippy, tests (both feature configs)"
   assert_no_default_ports
@@ -1674,6 +1725,7 @@ if want check; then
   assert_spawning_drills_declare_ports
   assert_recovery_stays_off_until_it_observes
   assert_lease_ttl_single_source
+  assert_warm_covers_fleet_binaries
   report_toolchain_vs_pin
   step "fmt" fmt cargo fmt --all --check
   step "clippy (mem)" clippy-mem \

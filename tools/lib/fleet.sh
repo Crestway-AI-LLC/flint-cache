@@ -161,8 +161,18 @@ fleet_init() {
   # seat is spawned. After the first drill it costs ~25 ms per binary, and the
   # first drill pays the real stall OUTSIDE any startup budget, which is the
   # whole point.
+  #
+  # THE LIST IS `FLEET_BINARIES`, NOT A SUBSET OF IT. This warmed four of the
+  # seven binaries flintctl can spawn, which was not a decision -- it was the
+  # four that existed when the warm was written. `fleet_warm` skips anything
+  # not present (`[ -x ]`), so naming all seven costs nothing on a workspace
+  # that does not build them all and cannot go stale the next time a seat type
+  # is added. `assert_warm_covers_fleet_binaries` in tools/gates.sh fails the
+  # build if this drifts from the const again.
   fleet_warm ./target/release/flint-server ./target/release/flint-proxy \
-             ./target/release/flint-controlplane ./target/release/flint-controller
+             ./target/release/flint-controlplane ./target/release/flint-controller \
+             ./target/release/flint-agent ./target/release/flint-backup \
+             ./target/release/flint-vec
 }
 
 # Fleet processes belonging to ANOTHER Flint-family project, as "pid argv"
