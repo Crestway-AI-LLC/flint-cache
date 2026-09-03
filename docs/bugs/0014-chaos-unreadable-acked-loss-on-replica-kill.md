@@ -624,3 +624,32 @@ the drill's pass-filter, so the log states which it is. That is the same
 distinction — examined-and-found-nothing versus never-examined — that the rest of
 this file turns on.
 
+### The positive argument now exists in code, and it needed no firing
+
+`the_archived_firing_is_reclassified_once_the_clock_can_resolve_it`
+(`crates/flint-chaos/src/oracle.rs`) replays the 2026-08-21 stamps under both
+rules. It writes the pre-fix reading out explicitly — truncate to milliseconds,
+`sent >= dead` is the new master's — and asserts that across the **full 999 µs**
+of the millisecond the artifact recorded, that rule condemns every send while
+`classify_send` correctly hands each one to the dying master.
+
+Mutation-tested the only way that means anything: restoring millisecond
+truncation inside `classify_send` fails it, with the assertion naming why.
+
+**What that establishes.** A misclassification window up to 999 µs wide existed,
+and the one firing whose evidence survives sat inside it by construction — its
+two stamps were the same millisecond. Together with the rate going from 4-in-57
+to 0-in-~90, the case that these firings were instrument artifacts is now
+circumstantial-but-assembled rather than a hypothesis.
+
+**What it still does not establish**, and this is the part that keeps the bug
+open: it cannot show that the archived write's send actually preceded the death,
+because that is precisely what the recorded resolution destroyed. It proves the
+window existed and that this firing fell in it, not that this write was
+misclassified.
+
+So closing this is now a JUDGEMENT rather than a wait — the evidence is
+assembled and no further firing will improve it. That call belongs to whoever
+owns the durability claim, and it should be made explicitly rather than by the
+bug quietly ageing out.
+

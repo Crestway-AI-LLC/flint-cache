@@ -174,6 +174,62 @@ mod boundary_tests {
         assert_ne!(verdict, Served::MaybeOldMaster, "the opposite bias");
     }
 
+    /// BUG-0014 replayed from the only firing whose evidence survives.
+    ///
+    /// The 2026-08-21 artifact recorded `sent = dead = 1787276126708` — equal
+    /// MILLISECONDS. Equal milliseconds say only that both instants fell inside
+    /// the same millisecond; they say nothing whatever about their order. The
+    /// pre-fix code compared those truncated values, so every pair like it took
+    /// the "not before the death" branch, was attributed to the new master, and
+    /// was scored as a lost acked write.
+    ///
+    /// This is the positive argument the bug file asks for, and the reason it
+    /// matters is that it needs no further firing: the drill has not fired in
+    /// ~90 gate runs since the clock was widened, and waiting for another is a
+    /// plan measured in months against artifacts that expire in 14 days. Here
+    /// the recorded stamps are decided under both rules directly.
+    ///
+    /// The window is up to 999 µs wide and EVERY microsecond of it was a write
+    /// the old rule called a durability regression and the new one correctly
+    /// hands to the dying master.
+    #[test]
+    fn the_archived_firing_is_reclassified_once_the_clock_can_resolve_it() {
+        // The pre-fix reading, spelled out rather than described so that this
+        // test fails if the fix is ever reverted to it: truncate both stamps to
+        // milliseconds, and `sent >= dead` is the new master's — the `>=` this
+        // bug is named for.
+        fn pre_fix_called_it_a_loss(sent_us: u64, dead_us: u64) -> bool {
+            sent_us / 1_000 >= dead_us / 1_000
+        }
+        const ARCHIVED_MS: u64 = 1_787_276_126_708;
+        // Put the death at the end of that millisecond so the whole of it is
+        // available as "sent before the death" — the case at issue.
+        let dead_us = ARCHIVED_MS * 1_000 + 999;
+        let mut reclassified = 0u64;
+        for offset in 1..=999u64 {
+            let sent_us = dead_us - offset;
+            assert_eq!(
+                sent_us / 1_000,
+                dead_us / 1_000,
+                "both stamps must truncate to the recorded millisecond"
+            );
+            assert!(
+                pre_fix_called_it_a_loss(sent_us, dead_us),
+                "the rule that produced the firing must still condemn this send"
+            );
+            assert_eq!(
+                classify_send(sent_us, dead_us),
+                Served::MaybeOldMaster,
+                "a send provably before the death belongs to the dying master"
+            );
+            reclassified += 1;
+        }
+        assert_eq!(
+            reclassified, 999,
+            "the full width of the window millisecond truncation hid"
+        );
+    }
+
     /// Ordering must come from the stamps alone. A classifier that read the
     /// magnitudes rather than their relation would pass the three cases above
     /// while breaking on any other epoch.
