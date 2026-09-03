@@ -447,6 +447,74 @@ That is a hypothesis, not a measurement: the two runs also differ in hardware
 and payload. The experiment that would settle it is this same harness with a
 replica attached, which is one more box and the same half hour.
 
+### REPLICA RUN 2026-09-03 — it is the lag cap, and the account closes exactly
+
+Same harness, same seat type, one `i4i.4xlarge` replica attached as the pair's
+second member (flintctl's remote runner, first use of `ssh-user`/`ssh-key`/
+`ssh-sudo` anywhere in packaging). Both members ran the same source build.
+`live_replicas=1` was asserted before any leg.
+
+| leg | `wal-fsync-ms` | client ops/s | engine seq/s | peak l0 | stalled | `writes_shed_lag` | `delayed_soft` |
+|---|---|---|---|---|---|---|---|
+| 1 | 500 | 213,754 | **105,192** | 8 | 1 | 13,025,416 | 208,098 |
+| 2 | 50 | 204,699 | **102,456** | 3 | 1 | 12,267,827 | 208,925 |
+| 3 | 0 | 203,150 | **102,730** | 4 | 1 | 12,049,591 | 208,093 |
+| 4 | 500 | 198,635 | **102,274** | 9 | 1 | 11,572,256 | 204,630 |
+
+**Attaching one replica took the committed rate from ~470k to ~102k seq/s — a
+4.6x collapse on identical hardware.** And ~102–105k is the same
+neighbourhood as the fleet's ~80–88k knee, where the solo seat's ~470k was
+five times away from it.
+
+**The account closes to 0.03%.** In the solo run client ops/s and engine
+`latest_seq` agreed to within 20 ops; here they diverge by half, and the
+divergence is exactly the shedding:
+
+| leg | engine committed/s | `writes_shed_lag`/s | sum | client offered/s | delta |
+|---|---|---|---|---|---|
+| 1 | 105,192 | 108,545 | 213,737 | 213,754 | −17 |
+| 2 | 102,456 | 102,232 | 204,688 | 204,699 | −11 |
+| 3 | 102,730 | 100,413 | 203,143 | 203,150 | −7 |
+| 4 | 102,274 | 96,435 | 198,709 | 198,635 | +74 |
+
+Roughly **half of every offered write is refused by the lag cap**, and the
+three counters account for each other with nothing left over. That is what
+makes this a measurement rather than a coincidence of magnitudes.
+
+**This does not contradict the five-host run above; it completes it.** That run
+eliminated the WAL-headroom gate — peak lag ~85,000 against a gate of
+8,388,608, "correct and inert" — and it was right. `writes_shed_lag` is a
+different gate, keyed on `lag_hard_ms` (1,000 ms), and it is the one that
+binds. write-path-next item 9 found the same thing independently at a
+completely different operating point: *"`writes_shed_lag` is the gate that
+binds, and it binds alone."* Here the headroom gate was 2,147,483,648 and again
+never fired.
+
+**The fsync null holds a third time, now with replication in the path.** Legs
+2–4 span 102,274–102,730, **0.45%**, across 50 ms / no fsync / 500 ms. Leg 1
+sits 2.8% above leg 4 at the same setting — tree depth again. Device: 11% of
+fio's 2,336 MB/s.
+
+### So what caps the write path
+
+Not the machine. A solo seat stalls at ~470k seq/s; the same seat in a pair
+commits ~102k and refuses the rest. **The ceiling is the rate the replica can
+apply, enforced by the lag cap** — and that is a property of the topology and
+of `lag_hard_ms`, not of the fsync path, the device, or WAL append.
+
+**What this run does NOT separate**, and it is the obvious next arm: whether
+~102k is the replica's genuine apply ceiling or simply where a 1,000 ms
+`lag_hard_ms` chooses to shed. Both fit this data identically. Varying
+`lag_hard_ms` on the same harness distinguishes them — if the committed rate
+tracks the threshold, the cap is the tuning; if it does not move, the replica
+really is saturated.
+
+**And one instrument fault to fix before that arm.** `lag_ms` read 0 in every
+leg because it is sampled after the leg, when the replica has caught up — the
+same mistake the stall counters had before they were moved inside the leg. The
+shed counters are cumulative and unaffected, but the lag column is currently
+worthless and should be sampled during the load.
+
 **A caveat on the counters.** RocksDB's cumulative dump runs every 30 s
 (`FLINT_STATS_DUMP_SEC=30`), so the amplification terms are read from a
 snapshot up to 30 s behind the end of the run. Every term is equally stale, so
