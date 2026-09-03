@@ -5686,6 +5686,102 @@ fn cp_lacks_cpfence(reply: &std::io::Result<Value>) -> bool {
     matches!(reply, Ok(Value::Error(e)) if e.contains("unknown control-plane command"))
 }
 
+/// The record a roll leaves in the FLEET JOURNAL (ADR-0036).
+///
+/// A roll that stops half-way leaves the fleet running two builds, and until
+/// these events existed nothing recorded what the roll was FOR. An agent
+/// could see the split and could not tell whether the stragglers had never
+/// been offered the new build or had been offered it and refused — opposite
+/// responses, identical fleet.
+///
+/// Written to the journal rather than to a file because the writer is HERE,
+/// on the fleet host, and the reader is an agent on an ops box. The control
+/// plane is the one thing both already have.
+///
+/// Best-effort by construction: `flint_journal::emit` swallows its errors, so
+/// a journal that cannot be reached slows nothing and aborts no roll.
+struct Roll {
+    id: String,
+    cp: String,
+    tls: Option<Arc<flint_tls::ClientConfig>>,
+}
+
+impl Roll {
+    fn new(inv: &Inventory, target: &str) -> Self {
+        Self {
+            id: format!("{}-{target}", now_ms()),
+            cp: inv.cp[0].clone(),
+            tls: tls_client(inv),
+        }
+    }
+
+    fn say(&self, kind: flint_journal::EventKind, cause: Option<&str>, detail: String) {
+        flint_journal::emit(
+            &self.cp,
+            &self.tls,
+            &flint_journal::Event {
+                at_ms: now_ms(),
+                actor: "flintctl:upgrade".into(),
+                kind,
+                subject: self.id.clone(),
+                epoch: None,
+                cause: cause.map(str::to_string),
+                detail: Some(detail),
+            },
+        );
+    }
+
+    fn started(&self, planned: &[String]) {
+        self.say(
+            flint_journal::EventKind::RollStarted,
+            None,
+            planned.join(","),
+        );
+    }
+
+    /// BEFORE the seat is touched. A driver that dies in the next
+    /// millisecond must leave a record saying it tried, for the same reason
+    /// the agent's intent log is write-ahead — and `attempted` is the field
+    /// the whole safety decision turns on.
+    fn attempting(&self, seat: &str) {
+        self.say(
+            flint_journal::EventKind::RollSeat,
+            Some("attempted"),
+            seat.to_string(),
+        );
+    }
+
+    fn converged(&self, seat: &str) {
+        self.say(
+            flint_journal::EventKind::RollSeat,
+            Some("converged"),
+            seat.to_string(),
+        );
+    }
+
+    fn finished(&self, state: &str) {
+        self.say(
+            flint_journal::EventKind::RollFinished,
+            None,
+            state.to_string(),
+        );
+    }
+}
+
+/// Abort a roll: SAY SO in the journal, then exit.
+///
+/// Every abort path goes through here, and that is a safety property rather
+/// than tidiness. A roll that exits without a `RollFinished` is
+/// indistinguishable from one whose driver was killed, and the agent may
+/// finish the latter. The canary-soak abort is the case that proves it: it
+/// leaves the canary on the NEW build and every other seat untouched — which
+/// is exactly the shape `roll::can_finish` calls safe — so an abort that said
+/// nothing would hand the whole fleet to a build the soak had just rejected.
+fn roll_abort(roll: &Roll, code: i32) -> ! {
+    roll.finished("aborted");
+    std::process::exit(code)
+}
+
 fn upgrade(inv: &Inventory, version_tag: Option<String>, soak_ms: u64, nodes_only: bool) {
     let tls = tls_client(inv);
     // Kept for binaries built before the tag was compiled in: release builds
@@ -5701,6 +5797,17 @@ fn upgrade(inv: &Inventory, version_tag: Option<String>, soak_ms: u64, nodes_onl
         .map(|t| ("FLINT_BUILD_VERSION".to_string(), t.clone()))
         .collect();
     let expect = version_tag.clone();
+
+    // ADR-0036. The record starts before anything is touched, so a driver
+    // killed one second in still leaves a fleet that can say what it was for.
+    // No version tag means no target to record; the roll is a binary swap to
+    // whatever is staged, and inventing a target here would be a guess the
+    // agent would then act on.
+    let roll = version_tag.as_deref().map(|t| Roll::new(inv, t));
+    if let Some(r) = &roll {
+        let planned: Vec<String> = inv.pairs.iter().flatten().cloned().collect();
+        r.started(&planned);
+    }
 
     // PRECONDITION: the CP must already speak the verbs the MASTER phase
     // needs, because the phase that rolls the CP runs after it.
@@ -5758,7 +5865,11 @@ fn upgrade(inv: &Inventory, version_tag: Option<String>, soak_ms: u64, nodes_onl
                     Some(port_of(&seat)),
                 ) {
                     eprintln!("== UPGRADE ABORTED rolling {name} (pairs untouched): {e}");
-                    std::process::exit(3);
+                    if let Some(r) = &roll {
+                        roll_abort(r, 3)
+                    } else {
+                        std::process::exit(3)
+                    };
                 }
                 spawn_env(
                     inv,
@@ -5770,7 +5881,11 @@ fn upgrade(inv: &Inventory, version_tag: Option<String>, soak_ms: u64, nodes_onl
                 );
                 if !wait_pong(&seat, &tls, Duration::from_secs(15)) {
                     eprintln!("== UPGRADE ABORTED: {name} did not answer after the binary swap");
-                    std::process::exit(3);
+                    if let Some(r) = &roll {
+                        roll_abort(r, 3)
+                    } else {
+                        std::process::exit(3)
+                    };
                 }
                 eprintln!("  {name} rolled");
             }
@@ -5789,7 +5904,11 @@ fn upgrade(inv: &Inventory, version_tag: Option<String>, soak_ms: u64, nodes_onl
                     "   The staged bundle predates CPFENCE, so the master phase can never \
                      succeed. Stage a newer release. The pairs have not been touched."
                 );
-                std::process::exit(4);
+                if let Some(r) = &roll {
+                    roll_abort(r, 4)
+                } else {
+                    std::process::exit(4)
+                };
             }
             eprintln!("  control plane speaks CPFENCE; continuing with the pairs");
         }
@@ -5821,6 +5940,9 @@ fn upgrade(inv: &Inventory, version_tag: Option<String>, soak_ms: u64, nodes_onl
         replicas.len() - 1
     );
     let t0 = now_ms();
+    if let Some(r) = &roll {
+        r.attempting(&canary);
+    }
     if let Err(e) = roll_node(
         inv,
         &canary,
@@ -5831,12 +5953,19 @@ fn upgrade(inv: &Inventory, version_tag: Option<String>, soak_ms: u64, nodes_onl
     ) {
         panic!("CANARY FAILED (fleet untouched beyond the canary): {e}");
     }
+    if let Some(r) = &roll {
+        r.converged(&canary);
+    }
     eprintln!("  canary {canary} on new build, reconverged; soaking {soak_ms}ms");
     std::thread::sleep(Duration::from_millis(soak_ms));
     if let Err(e) = journal_clean(inv, t0, REPLICA_PHASE_DISALLOWED, None) {
         eprintln!("== UPGRADE ABORTED at canary soak: {e}");
         eprintln!("   canary stays on the new build (roll forward after diagnosis)");
-        std::process::exit(3);
+        if let Some(r) = &roll {
+            roll_abort(r, 3)
+        } else {
+            std::process::exit(3)
+        };
     }
     eprintln!("  soak clean: no unexpected transitions in the fleet journal");
 
@@ -5855,16 +5984,30 @@ fn upgrade(inv: &Inventory, version_tag: Option<String>, soak_ms: u64, nodes_onl
             .find(|a| info_field(a, &tls, "role:").as_deref() == Some("master"))
             .cloned()
             .unwrap_or_else(|| m.clone());
+        if let Some(rl) = &roll {
+            rl.attempting(r);
+        }
         if let Err(e) = roll_node(inv, r, &m_now, &envs, &expect, Rejoin::WarmIfReplica) {
             // Same outcome as a failed journal check below — the roll
             // stopped part-way — so it reports the same way. Panicking here
             // gave the one MORE likely failure the worse exit code.
             eprintln!("== UPGRADE ABORTED at {r}: {e}");
-            std::process::exit(3);
+            if let Some(r) = &roll {
+                roll_abort(r, 3)
+            } else {
+                std::process::exit(3)
+            };
         }
         if let Err(e) = journal_clean(inv, t, REPLICA_PHASE_DISALLOWED, None) {
             eprintln!("== UPGRADE ABORTED after {r}: {e}");
-            std::process::exit(3);
+            if let Some(r) = &roll {
+                roll_abort(r, 3)
+            } else {
+                std::process::exit(3)
+            };
+        }
+        if let Some(rl) = &roll {
+            rl.converged(r);
         }
         eprintln!("  replica {r} rolled");
     }
@@ -5884,10 +6027,23 @@ fn upgrade(inv: &Inventory, version_tag: Option<String>, soak_ms: u64, nodes_onl
         eprintln!(
             "  pair {i}: {old_master} demoted + drained; {new_master} promoted at (0,{promoted})"
         );
+        if let Some(rl) = &roll {
+            rl.attempting(old_master);
+        }
         if let Err(e) = roll_node(inv, old_master, &new_master, &envs, &expect, Rejoin::Reseed) {
             eprintln!("== UPGRADE ABORTED after pair {i} failover, respawning {old_master}: {e}");
-            std::process::exit(3);
+            if let Some(r) = &roll {
+                roll_abort(r, 3)
+            } else {
+                std::process::exit(3)
+            };
         }
+        // CONVERGED is recorded after the phase check below, not after
+        // `roll_node` returns: a seat that came back and then tripped the
+        // journal gate has not converged, and recording it as though it had
+        // would tell the agent a seat is done that the roll itself refused.
+        // `attempted` is already on the record either way, which is what the
+        // safety decision reads.
         // `g{i}` is the controller's label for this pair, and the index is
         // the same one: controller_args builds --pairs from inv.pairs in
         // order, and the controller splits that spec and enumerates it into
@@ -5900,11 +6056,27 @@ fn upgrade(inv: &Inventory, version_tag: Option<String>, soak_ms: u64, nodes_onl
         };
         if let Err(e) = journal_clean(inv, t, MASTER_PHASE_DISALLOWED, Some(&expected)) {
             eprintln!("== UPGRADE ABORTED after pair {i} master roll: {e}");
-            std::process::exit(3);
+            if let Some(r) = &roll {
+                roll_abort(r, 3)
+            } else {
+                std::process::exit(3)
+            };
+        }
+        if let Some(rl) = &roll {
+            rl.converged(old_master);
         }
         eprintln!("  pair {i}: old master rolled, tailing the new one warm");
     }
     if nodes_only {
+        // TERMINAL, and it must be. `--nodes-only` leaves the edge on the old
+        // binary DELIBERATELY, which is a fleet running two builds — the exact
+        // shape the half-rolled detector fires on. Returning without a
+        // terminal state would leave the record reading `in-flight` forever
+        // over a split the operator chose, and ADR-0036's whole decision turns
+        // on `in-flight` meaning a roll that stopped before it meant to.
+        if let Some(r) = &roll {
+            r.finished("completed: nodes only, edge left on the old build by request");
+        }
         eprintln!(
             "== upgrade complete (DATA PLANE ONLY, --nodes-only): the proxy, control plane, \
              controller and agent are STILL RUNNING THE OLD BINARY"
@@ -5913,6 +6085,9 @@ fn upgrade(inv: &Inventory, version_tag: Option<String>, soak_ms: u64, nodes_onl
         return;
     }
     roll_edge(inv, &envs, &expect);
+    if let Some(r) = &roll {
+        r.finished("completed");
+    }
     eprintln!("== upgrade complete (whole fleet)");
     status(inv);
 }

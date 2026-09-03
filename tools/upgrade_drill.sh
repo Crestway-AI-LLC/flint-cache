@@ -91,6 +91,41 @@ echo "== upgrade --version-tag $TAG (an operator's own build number, not a relea
 $CTL -f "$D/cluster.flint" upgrade --version-tag "$TAG" --soak-ms 1500 >"$D/upgrade.log" 2>&1 \
   || { echo "FAIL: upgrade exited non-zero"; tail -15 "$D/upgrade.log"; exit 1; }
 
+echo "== the roll left a RECORD in the fleet journal"
+# ADR-0036. A roll that stops half-way leaves the fleet on two builds, and
+# nothing used to record what the roll was FOR -- so an agent could see the
+# split and could not tell whether the stragglers had never been offered the
+# new build or had refused it. Opposite responses, identical fleet.
+#
+# Asserted on `status --json`, which carries the journal HEAD. That is the
+# tail of the roll, so RollStarted has usually scrolled off; what must be
+# there is the terminal state and at least one per-seat event, because those
+# are the two the agent's decision reads.
+$CTL -f "$D/cluster.flint" status --json >"$D/status.json" 2>/dev/null || true
+python3 - "$D/status.json" <<'PYROLL'
+import json, sys
+try:
+    doc = json.load(open(sys.argv[1]))
+except Exception as e:
+    print(f"FAIL: could not read status --json: {e}"); sys.exit(1)
+head = json.dumps(doc.get("journal") or doc)
+if "RollFinished" not in head:
+    print("FAIL: the roll wrote no RollFinished to the fleet journal.")
+    print("      Without a terminal state an aborted roll is indistinguishable")
+    print("      from an abandoned one, and the agent may finish the latter.")
+    print("      journal head:", head[:400]); sys.exit(1)
+if "RollSeat" not in head:
+    print("FAIL: no per-seat RollSeat event. `attempted` is the field the whole")
+    print("      safety decision turns on and nothing recorded it.")
+    print("      journal head:", head[:400]); sys.exit(1)
+if "attempted" not in head and "converged" not in head:
+    print("FAIL: RollSeat events carry no cause, so attempted and converged")
+    print("      cannot be told apart -- which is the entire discriminator.")
+    sys.exit(1)
+print("  RollFinished and per-seat RollSeat events are in the journal")
+PYROLL
+[ $? -eq 0 ] || exit 1
+
 echo "== EVERY seat reports the build that was asked for, not just the pair"
 # This counted a flat `grep -c "build $TAG"` against 2, because the pair
 # nodes were the only seats that carried a stamp. ADR-0014 D1 gave the

@@ -13,6 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 flint-build = { path = "../flint-build" }
+flint-journal = { path = "../flint-journal" }
 flint-resp = { path = "../flint-resp" }
 # The slot hash + default owner, so `verify --probe` can cover EVERY pair
 # instead of whichever one its single key happened to hash to (#170). Same

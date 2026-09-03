@@ -66,6 +66,29 @@ pub enum EventKind {
     /// branch is a full re-seed, and knowing which one ran is the difference
     /// between tuning the probe and tuning the transfer.
     RejoinDecided,
+    /// A fleet roll began. `subject` is the roll id (`<started_ms>-<target>`)
+    /// and is the join key for every event below; `detail` carries the
+    /// planned seats, comma-separated.
+    ///
+    /// ADR-0036. A roll that stops half-way leaves the fleet running two
+    /// builds, and until these events existed nothing recorded what the roll
+    /// was FOR — so an agent could see the split and could not tell whether
+    /// the stragglers had never been offered the new build or had refused
+    /// it. Those need opposite responses and look identical in the fleet.
+    RollStarted,
+    /// One seat's progress within a roll. `cause` is `attempted` (written
+    /// BEFORE the seat is touched, so a driver that dies leaves a record
+    /// saying it tried) or `converged`; `detail` is the seat address.
+    ///
+    /// `attempted` is the whole safety property: a seat here that is not on
+    /// the target REFUSED the build, and re-rolling would offer the same
+    /// build to every seat behind it.
+    RollSeat,
+    /// A roll reached a terminal state. `detail` is `completed` or
+    /// `aborted: <reason>`. Its ABSENCE beside a `RollStarted` is the
+    /// abandoned case, and saying that out loud is most of what ADR-0036
+    /// buys.
+    RollFinished,
     /// A controller observed a pair converged for the first time in its
     /// process lifetime: the degraded-window gate is open and auto-failover
     /// is ARMED for that pair. Tooling that (re)starts controllers waits
