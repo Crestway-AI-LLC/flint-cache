@@ -938,3 +938,88 @@ What is still needed before designing a grace is a shed sample from a roll
 whose promotion is *identified* — not a lifetime that happened to be quiet.
 `roll-fleet.sh` knows which seat it promotes and when; recording that alongside
 the counter turns each roll into a sample that can be read honestly.
+
+## 2026-09-03, CAUSE FOUND — it is BUG-0078's missing `TCP_NODELAY`, and two of my own tables above were mis-segmented
+
+**Everything in the two sections above that segments lifetimes by counter reset
+alone is wrong, and the corrections change the answer.**
+
+### The segmentation fault
+
+A restart is visible as a counter DECREASE only if the counter was non-zero
+when it happened. A seat that restarts while its shed counter reads 0 goes
+**0 → 0**, and reset-only detection merges the two lifetimes silently. That is
+not hypothetical: it collapsed 21 lifetimes into 9 and produced both wrong
+conclusions above.
+
+`flint_node_build_info` fixes it. The agent parses it from the seat's own
+`FLINTINFO build:`, so it describes the RUNNING process, and a build label
+change is a restart that is visible whatever the counter is doing.
+`shed-history.sh` now splits on build change as well as on decrease and gap.
+
+### What the corrected segmentation shows
+
+One row per seat per release. **Every release from rc.59 to rc.65 shed, on
+exactly ONE seat, and it alternates:**
+
+| release | 7001 | 7002 | peak lag ms |
+|---|---|---|---|
+| rc.59 | 0 | **210** | 8,619 |
+| rc.60 | **128** | 0 | 6,150 |
+| rc.61 | 0 | **87** | 5,001 |
+| rc.62 | **90** | 0 | 5,152 |
+| rc.63 | 0 | **106** | 5,572 |
+| rc.64 | **191** | 0 | 6,551 |
+| rc.65 | 0 | **112** | 7,221 |
+| **rc.66** | **0** | **0** | 67 |
+| **rc.67** | **0** | **0** | 71 |
+
+The alternation is the tell. Exactly one seat sheds per roll and it is a
+different seat each time — which is what a roll that promotes the other member
+each release looks like. Seven consecutive rolls, 87–210 shed each, peak lag
+always 5–8.6 s against a 1,000 ms cap.
+
+**And it stops dead at rc.66.** rc.66 and rc.67 shed zero on both seats across
+full 35.0 h and 27.1 h windows, peak lag 67 and 71 ms.
+
+### The cause
+
+**`28290c4` — BUG-0078's `TCP_NODELAY` on accepted sockets — first ships in
+rc.66.**
+
+The mechanism fits the magnitude exactly. That bug found the node never set
+`TCP_NODELAY` on an accepted socket, so a peer pipelining past the 16 KiB read
+size waits out its delayed-ACK timer: *"a flat ~50 ms per round trip at every
+depth from 16 to 512"*. Replication is such a peer. Fifty milliseconds a
+round-trip accumulates into the multi-second catch-up this file has been
+measuring since August, the promotion window blows straight through a 1,000 ms
+hard cap, and the master sheds. Remove the stall and lag collapses to tens of
+milliseconds — which is exactly what rc.66 shows.
+
+### Withdrawn, from the two sections above
+
+- **"Nine process lifetimes"** — 21, correctly segmented. The nine merged
+  across restarts that were invisible to reset detection.
+- **"Eight of nine held a promotion, and both zeroes are among them, so samples
+  2 and 3 are clean"** — withdrawn entirely. Under correct segmentation the
+  `is_master` detector finds ONE transition, because a seat that restarts and
+  comes up master shows no 0 → 1 *inside* its lifetime; the transition sits on
+  the boundary. The detector under-counts and should not be read as a promotion
+  census. The alternating shed pattern is the better evidence that these are
+  promotion events.
+- **"The transition sits between 08-27 and 08-31 and TCP_NODELAY is ruled out
+  because it lands after rc.65"** — the ruling-out was an artifact of the bad
+  segmentation. rc.65 still shed 112. The transition is at **rc.66**, which is
+  precisely where that fix lands.
+
+### What is still not established
+
+One fleet, two clean releases, ~62 h of zero. The mechanism is plausible and
+the timing is exact, but this is a correlation with a good story rather than a
+controlled experiment — no arm ran rc.66 with the fix reverted. The playground
+also holds under a megabyte of SST throughout, so none of these are
+production-scale figures; what makes the comparison sound is that the volume is
+the same across every row.
+
+`slo.md`'s no-stall row now has a *dated end* to its counter-example, not just
+a dated counter-example.
