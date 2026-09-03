@@ -545,12 +545,38 @@ reporting it, not setting it.** The question this arm existed to settle —
 whether the pair ceiling was a hardware fact or a default someone picked — comes
 out as fact.
 
-**The operational consequence is the useful part.** Tightening `lag-hard-ms`
-from 1000 to 250 cost **1%** of throughput (100,616 → 99,646, inside the 8.4%
-run-to-run spread) and cut peak replication lag from ~1.4 s to ~0.5 s. The lag
-cap is close to free, and the shipped 1000 ms is not buying throughput that a
-tighter setting would give up. Loosening it is strictly a worse trade: 16
-seconds of exposure for nothing.
+**The operational consequence — and a correction to it, which changes the
+sign.** Tightening `lag-hard-ms` from 1000 to 250 cost **1%** of throughput
+(100,616 → 99,646, inside the 8.4% run-to-run spread) and cut peak replication
+lag from ~1.4 s to ~0.5 s. On that basis this section originally recommended
+250 as the default, and the change was written.
+
+**It was withdrawn, on a premise the measurement did not contain.** The
+recommendation reasoned that a shorter lag window is worth ~1% of throughput
+because it tightens the RPO. That is only true if replication is a durability
+mechanism. **It is not the design intent: log shipping here exists to keep the
+replica WARM for a fast failover, not to bound data loss** (Jeff, 2026-09-03).
+
+Read against that intent the same numbers say something close to the opposite.
+The cap's cost is not the 1% of throughput — it is the **shed fraction**, which
+ran at ~18% of offered writes at 1000 ms and ~22% at 250 ms. Those are
+`-THROTTLED` refusals returned to clients. If the replica is a warm standby
+rather than a durability guarantee, then tightening the cap spends more
+client-visible refusals to hold a cache closer, and the trade points the other
+way from the one this section proposed.
+
+**So no default changes here.** What the sweep establishes stands unchanged and
+is worth keeping: the cap reports the pair's limit rather than setting it, and
+its position does not move throughput across a 32x range. What does NOT follow
+from it is a recommendation about where to put the cap, because that depends on
+what the replica is for — and this experiment measured the mechanism, not the
+intent.
+
+The question it leaves is a better one than the one it set out to answer: **why
+is a warm-standby mechanism refusing roughly a fifth of offered writes at all?**
+That is a question about whether the lag cap should gate the write path in a
+topology where the replica carries no durability promise, and it is a design
+question rather than a measurement.
 
 **Two limits on what this establishes, stated because the numbers invite more
 than they carry.**
