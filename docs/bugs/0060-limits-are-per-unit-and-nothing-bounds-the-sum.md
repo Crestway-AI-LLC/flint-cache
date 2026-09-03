@@ -593,3 +593,72 @@ the three collection commands move over one at a time.
 
 That is a design change, not a patch, and belongs in an ADR rather than in
 this file.
+
+## 2026-09-03 — pass 7's next step was already decided and two-thirds built; zsets was the third
+
+Pass 7 ended: *"the answer is to stop materialising... the `Kv` trait could take
+an additive `for_each_prefix` with a default that delegates to `scan_prefix`...
+That is a design change, not a patch, and belongs in an ADR rather than in this
+file."* Three things about that are now wrong, and the last one is a live gap.
+
+**1. `for_each_prefix` already exists, and the delegation runs the other way.**
+It is a required method on the `Kv` trait (`flint-storage/src/lib.rs:128`) with
+a native streaming implementation on `RocksKv` (`rocks.rs:749` — *"nothing is
+materialized beyond one row at a time"*). `scan_prefix` is the one with the
+default body, and it is built **on top of** `for_each_prefix` by collecting.
+Implementing pass 7's sentence literally would have inverted a working design.
+
+**2. The ADR it asks for is ADR-0025**, `stream-collection-reads-instead-of-
+materialising-them`, and it predates the request rather than following it. It
+names the same three commands in scope: *"Three commands reach it — `HGETALL`,
+`SMEMBERS`, `ZRANGE`"*.
+
+**3. `ZRANGE` was in that scope and was never converted.** `cd1e3c83`
+implemented ADR-0025 and moved `hashes.rs` and `sets.rs` to `for_each_prefix`.
+`zsets.rs` kept `scan_prefix` at both sites — `all_ordered` and the
+rank/score-range reader. A decision that named three commands shipped for two,
+and nothing recorded the difference, which is why pass 7 later re-derived the
+whole design from scratch as though none of it existed.
+
+### Fixed: both zset sites now stream
+
+Same edit, and for the same reason as `SMEMBERS` rather than `HGETALL`: a zset's
+member lives in the KEY, after the 8-byte score, so `scan_prefix` copies the
+entire collection to build its `Vec` and the suffix map copies it again. Hashes
+measured identical under this edit only because they MOVE their values; sets and
+zsets do not.
+
+No sorting is needed and none was added: the key is
+`prefix || score(8B big-endian) || member`, so ascending key order already IS
+ascending score order — which the function's own doc comment had said all along.
+
+The doc comment above it is also corrected. It read *"a zset lives in ONE key,
+so this is bounded by the zset's cardinality"* — the sentence this file quotes as
+"the bug in miniature" — and now says why one key is not a bound.
+
+**Verification:** clippy clean and tests green in BOTH feature configurations
+(512 mem, 582 rocks, zero failures).
+
+### What is NOT claimed, given pass 7's own standard
+
+**The memory saving is not measured.** Pass 7 reverted two changes precisely
+because their savings were not demonstrated, and it would be inconsistent to
+land this one on a number it does not have. It is not inconsistent to land it on
+the argument ADR-0025 already accepted: the same edit to `SMEMBERS` was reverted
+in pass 7 for want of a measurement and then landed hours later in `cd1e3c83` on
+the ADR's reasoning. This completes that decision rather than re-opening the
+question.
+
+What the change provably removes is one dataset-sized allocation — the
+`Vec<(Vec<u8>, Vec<u8>)>` holding every key — which is a fact about the types,
+not an estimate. Pass 7's methodological finding stands untouched: resolving
+what that is worth in RSS still needs an instrument nobody has built, and no
+such harness is committed to this repo.
+
+### What remains of this bug, unchanged
+
+Streaming the SCAN is half of ADR-0025. The returned `Vec` still owns every
+member, so the reply is still O(collection) per in-flight command with
+`max-conns` of them permitted — and that is this bug's actual title. The
+aggregate is still bounded by nothing.
+

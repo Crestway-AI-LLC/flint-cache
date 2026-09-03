@@ -289,24 +289,40 @@ impl<'a> ZSetStore<'a> {
     /// ZRANGE by rank (inclusive, negatives from end): (member, score) in
     /// (score, member) order.
     /// All (member, score) in ascending (score, member) order — the ZScore
-    /// CF is already ordered that way, so this is a single prefix scan. A
-    /// zset lives in ONE key, so this is bounded by the zset's cardinality.
+    /// CF is already ordered that way, so this is a single prefix scan.
+    ///
+    /// **Bounded by the zset's cardinality, which is bounded by nothing.**
+    /// This comment used to end "a zset lives in ONE key, so this is bounded
+    /// by the zset's cardinality" and stop there, which is true and is the
+    /// reasoning BUG-0060 exists to reject: a tenant builds an arbitrarily
+    /// large zset with ordinary ZADDs and then asks for all of it, on any of
+    /// `max-conns` connections at once. One key is not a bound.
     fn all_ordered(&self, slot: u16, key: &[u8]) -> Result<Vec<(Vec<u8>, f64)>, StoreError> {
         let Some(meta) = self.read_meta(slot, key)? else {
             return Ok(Vec::new());
         };
         let prefix = zscore_prefix(&self.ns, slot, key, meta.version);
-        Ok(self
-            .kv
-            .scan_prefix(&prefix)
-            .into_iter()
-            .map(|(k, _)| {
-                let rest = &k[prefix.len()..];
-                let score =
-                    decode_score(u64::from_be_bytes(rest[..8].try_into().unwrap_or([0; 8])));
-                (rest[8..].to_vec(), score)
-            })
-            .collect())
+        // `for_each_prefix`, not `scan_prefix` — the SMEMBERS case exactly.
+        // A zset's member lives in the KEY, after the 8-byte score, so the
+        // materializing scan copies the whole collection to build its Vec and
+        // the suffix map copies it a second time. Streaming removes the first
+        // copy outright; hashes measured identical under the same edit only
+        // because they MOVE their values (ADR-0025).
+        //
+        // Scan order is already score order: the key is
+        // `prefix || score(8B big-endian) || member`, so ascending key order
+        // IS ascending score order and nothing needs sorting afterwards.
+        //
+        // This does NOT make the reply O(1) — the returned Vec still owns
+        // every member. That is the streaming-reply half of the ADR.
+        let mut out = Vec::new();
+        self.kv.for_each_prefix(&prefix, &mut |k, _| {
+            let rest = &k[prefix.len()..];
+            let score = decode_score(u64::from_be_bytes(rest[..8].try_into().unwrap_or([0; 8])));
+            out.push((rest[8..].to_vec(), score));
+            true
+        });
+        Ok(out)
     }
 
     /// ZRANGEBYSCORE / ZREVRANGEBYSCORE: members whose score is in
@@ -597,17 +613,14 @@ impl<'a> ZSetStore<'a> {
             return Ok(Vec::new());
         };
         let prefix = zscore_prefix(&self.ns, slot, key, meta.version);
-        let all: Vec<(Vec<u8>, f64)> = self
-            .kv
-            .scan_prefix(&prefix)
-            .into_iter()
-            .map(|(k, _)| {
-                let rest = &k[prefix.len()..];
-                let score =
-                    decode_score(u64::from_be_bytes(rest[..8].try_into().unwrap_or([0; 8])));
-                (rest[8..].to_vec(), score)
-            })
-            .collect();
+        // Streamed rather than materialized, for the reason in `all_ordered`.
+        let mut all: Vec<(Vec<u8>, f64)> = Vec::new();
+        self.kv.for_each_prefix(&prefix, &mut |k, _| {
+            let rest = &k[prefix.len()..];
+            let score = decode_score(u64::from_be_bytes(rest[..8].try_into().unwrap_or([0; 8])));
+            all.push((rest[8..].to_vec(), score));
+            true
+        });
         let len = all.len() as i64;
         let norm = |i: i64| if i < 0 { len + i } else { i };
         let from = norm(start).max(0);

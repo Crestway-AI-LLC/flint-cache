@@ -263,3 +263,30 @@ threshold-plus-element while the collection grows 100x, and a flush is
 asserted to have occurred so the tests cannot pass with the streaming deleted.
 
 That is the better instrument, and the ADR's suggestion was the worse one.
+
+## 2026-09-03 — the scan half shipped for two of the three commands named above
+
+This ADR's scope sentence is *"Three commands reach it — `HGETALL`, `SMEMBERS`,
+`ZRANGE`"*. `cd1e3c83` implemented it and moved `hashes.rs` and `sets.rs` onto
+`for_each_prefix`. **`zsets.rs` was not touched**, and kept the materialising
+`scan_prefix` at both of its sites.
+
+Nothing recorded the shortfall, and the cost of that was not the missing edit.
+BUG-0060's pass 7, later the same day, re-derived this entire design from
+first principles — proposing that the `Kv` trait "could take an additive
+`for_each_prefix` with a default that delegates to `scan_prefix`" (the
+delegation actually runs the other way, and has since before this ADR) and
+concluding that the result "belongs in an ADR rather than in this file". It
+belonged in this one, which already existed, was already ACCEPTED, and was
+already two-thirds built.
+
+**An ADR that does not say which of its parts shipped is an ADR that will be
+written again.** Fixed 2026-09-03: both zset sites now stream, for the
+`SMEMBERS` reason rather than the `HGETALL` one — a zset's member lives in the
+key after the 8-byte score, so the materialising scan really does copy the
+collection twice, where hashes move their values and measured identical.
+
+The scan half of this ADR is now complete across all three commands. The reply
+half is unchanged and remains the real bound: the returned `Vec` still owns
+every member.
+
