@@ -129,3 +129,56 @@ there are enough, the question the default was always supposed to be checked
 against — where p99 actually sits — is answerable from the gate log alone, with
 no new harness and no spend.
 
+## 2026-09-03, later — the first CI peaks, and the failure is a SPIKE not a drift
+
+The instrument reached CI and reports on every run. First three, read from
+`gate-logs-drills` artifacts:
+
+| run | commit | peak |
+|---|---|---|
+| `33804748860` | `b439cf0` | 557 ms |
+| `33806219239` | `3fd00e4` | 124 ms |
+| `33806874986` | `07d7aea` | 495 ms |
+
+Against the 2000 ms deadline, and against **18-29 ms** on an unloaded laptop.
+So `ubuntu-latest` at `FLINT_GATE_JOBS: 4` runs this drill 20-30x closer to the
+line than a quiet machine, and varies 4.5x between consecutive runs.
+
+**The shape of the failure changes with this.** The two refusals were 2017 ms
+and 2033 ms — roughly **4x the highest passing peak yet seen**. That is not a
+distribution drifting up until it touches a threshold; it is an episodic spike
+well outside the observed range. The comparison is legitimate across the
+instrument boundary because both numbers are the same quantity: the refusal
+message prints `est_ms`, and the peak is the high-water mark of `est_ms`.
+
+**Stated with its sample size:** n=3 passing peaks. Three samples bound the
+centre of a distribution, not its tail, so "4x beyond anything seen" is
+suggestive and not yet a claim about how often a 2000 ms excursion happens.
+More samples accrue from ordinary gate runs at no cost, which is the point of
+having made it continuous.
+
+### The refusal now names which term spiked
+
+`est_ms` is `inflight x service_us`, and the factors fail for opposite reasons:
+high inflight is more offered load than the node can take; high service time is
+the node itself having got slow — compaction, a stalled disk, a descheduled
+runner. The product cannot distinguish them and they need different responses,
+so the message now carries both:
+
+    THROTTLED write would wait ~2017ms (inflight 12 x service 168000us),
+    past --write-deadline-ms 2000, retry with backoff
+
+Nothing matched on the old text but its own definition, and the `THROTTLED`
+prefix and `--write-deadline-ms` anchor are unchanged, so a client
+prefix-matching the error class is unaffected.
+
+### What this says about BUG-0064
+
+That file's working theory is steady contention from the parallel gate. **Steady
+contention predicts the whole distribution shifting toward the line**, and what
+is measured is a tight-ish band at 124-557 ms with excursions to 2017 ms. A
+spike four times beyond the band is a poor fit for "four drills share four
+cores" and a better one for something episodic on the runner. Not decisive at
+n=3, and the terms above are what would settle it: the next refusal will say
+whether the spike was queue depth or service time.
+

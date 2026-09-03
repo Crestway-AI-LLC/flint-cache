@@ -4016,8 +4016,21 @@ fn admit_write_path(
             }
             if est_ms > deadline_ms {
                 WRITES_SHED_DEADLINE.fetch_add(1, Ordering::Relaxed);
+                // NAME THE TERMS, not just their product (BUG-0088).
+                //
+                // `est_ms` is `inflight x service_us`, and the two factors fail
+                // for opposite reasons: a high inflight is more offered load
+                // than the node can take, a high service time is the node
+                // itself having got slow (compaction, a stalled disk, a
+                // descheduled runner). The product cannot tell them apart, and
+                // they need different responses. Measured CI peaks sit at
+                // 124-557 ms while the refusals landed at 2017-2033 ms -- a
+                // 4x jump past the observed maximum, which is a spike in ONE of
+                // these and the message did not say which.
+                let inflight = WRITE_INFLIGHT.load(Ordering::Relaxed);
+                let service_us = WRITE_SERVICE_US.load(Ordering::Relaxed);
                 return Some(Value::Error(format!(
-                    "THROTTLED write would wait ~{est_ms}ms, past --write-deadline-ms {deadline_ms}, retry with backoff"
+                    "THROTTLED write would wait ~{est_ms}ms (inflight {inflight} x service {service_us}us), past --write-deadline-ms {deadline_ms}, retry with backoff"
                 )));
             }
         }
