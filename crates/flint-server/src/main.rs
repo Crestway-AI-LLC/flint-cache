@@ -953,6 +953,28 @@ static WRITE_SERVICE_US: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomi
 /// by FLINTINFO so the shed is observable rather than inferred — the lag cap
 /// shipped unexercised for months precisely because nothing counted it (#121).
 static WRITES_SHED_DEADLINE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// HIGH-WATER MARK of the projected write wait, in ms (BUG-0088).
+///
+/// `write_wait_est_ms` is the estimate RIGHT NOW, which once a load stops is
+/// ~0 — so a run that came within one millisecond of refusing a write and a
+/// run that never passed 10 ms report an identical INFO afterwards. The shed
+/// COUNTER has the mirror-image problem: it moves only once the deadline has
+/// already been crossed, so every sample it gives is above the line by
+/// construction and the distribution below it is invisible. Two gate failures
+/// at 2017 ms and 2033 ms against a 2000 ms deadline could therefore say
+/// nothing about whether passing runs sit at 200 ms or at 1999 ms, which are
+/// very different bugs.
+///
+/// Recorded whenever the estimate is non-zero. `estimated_write_wait_ms` is
+/// `inflight x service_us / 1000`, so an idle or lightly loaded path yields 0
+/// by integer division and takes no atomic write at all — the common case
+/// costs one compare. Everything with anything to see is kept at full
+/// resolution, which matters because the first draft floored this at HALF the
+/// deadline and a healthy run then reported a flat 0: no gradient, so no trend,
+/// so no distribution to compare a future outlier against. That defeats the
+/// purpose. A zero here means "no write ever projected a measurable wait" — a
+/// measurement, not an absence.
+static WRITE_WAIT_PEAK_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Writes refused by each REPLICATION gate. The note above applies with more
 /// force here: these gates have counted nothing since they shipped, so
 /// BUG-0035 had to reconstruct "20328 of 50500" from a drill's client-side
@@ -3987,6 +4009,11 @@ fn admit_write_path(
         let deadline_ms = WRITE_DEADLINE_MS.load(Ordering::Relaxed);
         if deadline_ms > 0 {
             let est_ms = estimated_write_wait_ms();
+            // The high-water mark, kept before the refusal test so that a run
+            // which never refuses still reports how close it came.
+            if est_ms > 0 {
+                WRITE_WAIT_PEAK_MS.fetch_max(est_ms, Ordering::Relaxed);
+            }
             if est_ms > deadline_ms {
                 WRITES_SHED_DEADLINE.fetch_add(1, Ordering::Relaxed);
                 return Some(Value::Error(format!(
@@ -5199,7 +5226,7 @@ fn flintinfo(
     let write_stall = rocks.as_ref().and_then(|kv| kv.write_stall());
     let compaction = rocks.as_ref().and_then(|kv| kv.compaction_pressure());
     let info = format!(
-        "role:{}\r\nloading:0\r\nrole_epoch:{role_epoch}\r\nbuild:{build}\r\nsst_bytes:{sst}\r\nlatest_seq:{latest}\r\nlast_applied:{last_applied}\r\nacked_seq:{}\r\nseq_lag:{seq_lag}\r\nwal_headroom_seq:{whs}\r\nwal_min_acked_seq:{wma}\r\nwal_headroom_shed_seq:{whl}\r\nwal_bytes_per_seq:{wbps}\r\nwal_archive_mb:{wamb}\r\nwal_archive_src:{wasrc}\r\nlive_replicas:{}\r\nlag_ms:{}\r\nlag_ms_max:{lmx}\r\nlag_max_gap:{lmg}\r\nlag_soft_ms:{soft}\r\nlag_hard_ms:{hard}\r\nmin_replicas_to_write:{minr}\r\nwidowed_grace_ms:{wgm}\r\nwidowed_shed:{wsh}\r\nfullsync_active:{fsa}\r\nfullsync_max:{fsm}\r\nasync_write_queue:{aqd}\r\nwrite_deadline_ms:{wdm}\r\nwrite_inflight:{wif}\r\nwrite_service_us:{wsu}\r\nwrite_wait_est_ms:{wwe}\r\nwrites_shed_deadline:{wsd}\r\nwrites_shed_lag:{wsl}\r\nwrites_shed_quorum:{wsq}\r\nwrites_shed_widowed:{wswd}\r\nwrites_shed_headroom:{wshr}\r\nwrites_delayed_soft:{wdsf}\r\nwal_fsync_ms:{wfm}\r\nwal_fsync_total:{wft}\r\ncert_days_remaining:{cdr}\r\nactive_conns:{ac}\r\nmax_conns:{mc}\r\nconns_shed_total:{cs}\r\nwrite_stopped:{wst}\r\ndelayed_write_rate:{dwr}\r\nwrite_stall_readable:{wsr}\r\nl0_files:{l0f}\r\npending_compaction_bytes:{pcb}\r\ncompaction_readable:{cr}\r\ndisk_free_bytes:{dfb}\r\ndisk_total_bytes:{dtb}\r\ndisk_free_pct:{dfp}\r\ndisk_verdict:{dv}\r\ndisk_unknown_samples:{dus}\r\nevictable_ns:{ens}\r\nevictable_ns_agree:{ensa}\r\nevictable_ns_bytes:{ensb}\r\nreclaim_active:{rca}\r\nreclaim_target_free_bytes:{rctf}\r\nevict:{evm}\r\ngc_swept_expired:{gse}\r\ngc_swept_orphans:{gso}\r\nuptime_ms:{upms}\r\n",
+        "role:{}\r\nloading:0\r\nrole_epoch:{role_epoch}\r\nbuild:{build}\r\nsst_bytes:{sst}\r\nlatest_seq:{latest}\r\nlast_applied:{last_applied}\r\nacked_seq:{}\r\nseq_lag:{seq_lag}\r\nwal_headroom_seq:{whs}\r\nwal_min_acked_seq:{wma}\r\nwal_headroom_shed_seq:{whl}\r\nwal_bytes_per_seq:{wbps}\r\nwal_archive_mb:{wamb}\r\nwal_archive_src:{wasrc}\r\nlive_replicas:{}\r\nlag_ms:{}\r\nlag_ms_max:{lmx}\r\nlag_max_gap:{lmg}\r\nlag_soft_ms:{soft}\r\nlag_hard_ms:{hard}\r\nmin_replicas_to_write:{minr}\r\nwidowed_grace_ms:{wgm}\r\nwidowed_shed:{wsh}\r\nfullsync_active:{fsa}\r\nfullsync_max:{fsm}\r\nasync_write_queue:{aqd}\r\nwrite_deadline_ms:{wdm}\r\nwrite_inflight:{wif}\r\nwrite_service_us:{wsu}\r\nwrite_wait_est_ms:{wwe}\r\nwrite_wait_peak_ms:{wwp}\r\nwrites_shed_deadline:{wsd}\r\nwrites_shed_lag:{wsl}\r\nwrites_shed_quorum:{wsq}\r\nwrites_shed_widowed:{wswd}\r\nwrites_shed_headroom:{wshr}\r\nwrites_delayed_soft:{wdsf}\r\nwal_fsync_ms:{wfm}\r\nwal_fsync_total:{wft}\r\ncert_days_remaining:{cdr}\r\nactive_conns:{ac}\r\nmax_conns:{mc}\r\nconns_shed_total:{cs}\r\nwrite_stopped:{wst}\r\ndelayed_write_rate:{dwr}\r\nwrite_stall_readable:{wsr}\r\nl0_files:{l0f}\r\npending_compaction_bytes:{pcb}\r\ncompaction_readable:{cr}\r\ndisk_free_bytes:{dfb}\r\ndisk_total_bytes:{dtb}\r\ndisk_free_pct:{dfp}\r\ndisk_verdict:{dv}\r\ndisk_unknown_samples:{dus}\r\nevictable_ns:{ens}\r\nevictable_ns_agree:{ensa}\r\nevictable_ns_bytes:{ensb}\r\nreclaim_active:{rca}\r\nreclaim_target_free_bytes:{rctf}\r\nevict:{evm}\r\ngc_swept_expired:{gse}\r\ngc_swept_orphans:{gso}\r\nuptime_ms:{upms}\r\n",
         if read_only { "replica" } else { "master" },
         hub.effective_acked(now)
             .map_or_else(|| "none".into(), |a| a.to_string()),
@@ -5269,6 +5296,7 @@ fn flintinfo(
         wif = WRITE_INFLIGHT.load(Ordering::Relaxed),
         wsu = WRITE_SERVICE_US.load(Ordering::Relaxed),
         wwe = estimated_write_wait_ms(),
+        wwp = WRITE_WAIT_PEAK_MS.load(Ordering::Relaxed),
         wsd = WRITES_SHED_DEADLINE.load(Ordering::Relaxed),
         wsl = WRITES_SHED_LAG.load(Ordering::Relaxed),
         wsq = WRITES_SHED_QUORUM.load(Ordering::Relaxed),

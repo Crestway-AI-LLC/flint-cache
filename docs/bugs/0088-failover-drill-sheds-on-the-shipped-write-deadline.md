@@ -93,3 +93,39 @@ something in the write path regressed in early September.
 **Do not raise the deadline to make it green.** The threshold is the product's
 promise to a client; moving it because a test crosses it converts a measurement
 into a silence.
+
+## 2026-09-03, same day — the instrument landed, and the first numbers are in
+
+`write_wait_peak_ms` is now a high-water mark in `FLINTINFO`, beside the
+instantaneous `write_wait_est_ms` it completes, and `failover_drill.sh` prints
+it against the deadline on **every** run:
+
+    == write-wait peak 29ms of 2000ms deadline (0 = no write projected a measurable wait)
+
+**The first draft of this was wrong and running it is what showed that.** It
+floored the recording at HALF the deadline, reasoning that the ordinary write
+path should gain no atomic and only the approach to a refusal mattered. Run
+locally it reported a flat **0** — technically true, useless in practice: no
+gradient means no trend, so a future 2017 ms outlier would have had nothing to
+be compared against, which is the entire purpose. The floor is now `est_ms > 0`,
+which keeps the same property (the estimate is `inflight x service_us / 1000`,
+so a quiet path yields 0 by integer division and takes no atomic) while
+recording everything with anything to see.
+
+**A first data point, and it is a wide gap.** This laptop peaks at **18-29 ms**
+against the 2000 ms deadline across runs. CI reached **2017 ms**. Whatever
+`ubuntu-latest` at `FLINT_GATE_JOBS: 4` is doing to this drill, it is roughly
+two orders of magnitude away from an unloaded machine, which makes "the drill's
+load is unrepresentative" much less likely than "four drills on a shared runner
+contend hard enough to matter" — and that is now a measurable claim rather than
+a guess.
+
+The drill FAILS rather than reporting a comfortable zero if the field cannot be
+read; mutation-tested by renaming the field, which produces the refusal and not
+a `0`. Same rule as everywhere else here: cannot look is not absent.
+
+**What to do with it:** the next several gate runs each contribute a peak. Once
+there are enough, the question the default was always supposed to be checked
+against — where p99 actually sits — is answerable from the gate log alone, with
+no new harness and no spend.
+

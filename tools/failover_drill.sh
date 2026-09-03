@@ -55,6 +55,29 @@ awk -v n="$KEYS" 'BEGIN {
   }
 }' | valkey-cli -p "$MPORT" --pipe | tail -1
 
+# BUG-0088: say how close that load came to the write deadline, on a PASS as
+# well as on a failure. The `errors:` line above reports only whether a write
+# was REFUSED, and the server's own estimate is logged only once it has already
+# been exceeded -- so every sample that exists is above the line by
+# construction. Two gate runs failed here at 2017ms and 2033ms against a 2000ms
+# deadline, and nothing in any green run could say whether a passing load sits
+# at 200ms or at 1999ms. Those are very different bugs. One line turns every
+# future gate run into a point on that distribution.
+INFO=$(valkey-cli -p "$MPORT" FLINTINFO 2>/dev/null | tr -d '\r')
+PEAK=$(printf '%s\n' "$INFO" | sed -n 's/^write_wait_peak_ms://p')
+DLINE=$(printf '%s\n' "$INFO" | sed -n 's/^write_deadline_ms://p')
+# CAPABILITY ASSERT. An absent field must not read as a comfortable zero: that
+# is the same "cannot look is not absent" this suite fails builds over, and a
+# drill that silently stopped reporting the margin would look exactly like a
+# drill reporting a wide one.
+if [ -z "$PEAK" ] || [ -z "$DLINE" ]; then
+  echo "FAIL: FLINTINFO carries no write_wait_peak_ms/write_deadline_ms."
+  echo "      The margin this drill exists to surface cannot be read, which is"
+  echo "      not the same as the margin being wide (docs/bugs/0088)."
+  exit 1
+fi
+echo "== write-wait peak ${PEAK}ms of ${DLINE}ms deadline (0 = no write projected a measurable wait)"
+
 echo "== waiting for replica catch-up"
 LAST="key:$(printf '%07d' $((KEYS - 1)))"
 CAUGHT=0
