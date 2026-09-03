@@ -1,6 +1,6 @@
 # BUG-0014: chaos_unreadable fails an acked write on a REPLICA kill (OPEN)
 
-Status: OPEN, instrument FIXED 2026-08-22 · hypothesis (a) ELIMINATED 2026-08-22 by the first firing of the probe; (b) still unresolved, but the probe can now state which it is · First fired 2026-08-11, not 2026-08-18 · Severity: high if real
+Status: OPEN, instrument FIXED 2026-08-22 · hypothesis (a) ELIMINATED 2026-08-22 · the drill has NOT fired in ~90+ gate runs since the fix, against a historical 7%, so the evidence now leans toward the oracle rather than the durability claim — but see 2026-09-03: absence is not the argument for closing it · First fired 2026-08-11, not 2026-08-18 · Severity: high if real
 — the oracle is asserting the durability claim, so either the claim broke or
 the oracle is crying wolf, and both are worth an hour
 
@@ -551,3 +551,76 @@ repeat the error this entry exists to record.
   these firings were unrecoverable
 - BUG-0007 — resolved, same assertion text, different drill; eliminated by date
 - BUG-0011 — the other open drill defect, and the run-it-alone rule
+
+## 2026-09-03 — the firing stopped, measured rather than waited for
+
+This file's plan was "the next firing is the next piece of evidence, and it
+arrives roughly once every 14 gate runs". That plan has quietly expired, and
+nobody would have noticed by waiting, because **what a stopped failure looks
+like is indistinguishable from a failure you have not waited long enough for.**
+So it was read backwards instead.
+
+**Method, including this file's own blind spot.** Every `gate` run on `main`
+from 2026-08-28 to 2026-09-03 — 100 runs — was scored, and re-run attempts were
+enumerated rather than trusting the top-level conclusion, because this file
+records that a re-run makes a firing invisible to `gh run list`. Ten runs were
+red. None was this drill:
+
+    failover x3 · roll_shed x2 · controller_multipair · migrate_slots
+    decommission+ctl_cpha+pipeline_nodelay · tenant_quota+client_compat+proxy_registry
+    backup_seat · restart · tenant_rebalance
+
+One run (`33564635611`) reports `success` with a failed first attempt — the
+exact masking pattern. Its attempt-1 artifact was pulled: it failed on
+`upgrade` against an admin-gated fleet, not here.
+
+**Zero firings.** Against the historical 4-in-57, the chance of seeing none
+across even the ~90 runs where the drill demonstrably ran is about 0.1%. The
+rate has changed; this is not a quiet stretch.
+
+### The half of the 2026-08-22 fix that mattered was the RESOLUTION, not the third state
+
+`ambiguous_at_boundary` was sampled across five runs spanning the window
+(2026-08-28 through 2026-09-03): **zero ties in every one.** So the third state
+is not what stopped the failures — it almost never triggers, which is exactly
+what one would expect once equality has to hold to the microsecond.
+
+That points at the other half. Under millisecond truncation, a write sent up to
+a full millisecond BEFORE the death lands on the same integer as `dead_ms`, and
+the strict `sent < dead_ms` test then reads it as the NEW master's write — a
+real loss. Microsecond stamps put those writes back on the correct side of the
+boundary, where they are the old master's and excluded. The tie state catches
+the residue, and the residue is empty.
+
+**This file already contains one confirmed instance of that misclassification:**
+the fifth firing's entire verdict rested on a single entry with
+`sent == dead_ms == 1787276126708`. It was a truncation collision, and it was
+scored as a durability regression. One of the five firings is therefore known to
+have been an instrument artifact; the other four cannot be re-examined, as their
+artifacts have long expired.
+
+### What this does NOT license, and it is the same warning as before
+
+**Not closure.** This file exists partly to record that closing on the absence of
+a firing is the error to avoid, and 0-in-100 is still an absence. A genuine loss
+would still fail the drill, so what has been measured is that the oracle stopped
+producing verdicts — not that the durability claim was ever unsound, and not
+that it is sound now.
+
+**What it does change is the strategy.** "Wait for the next firing, about 14 runs
+away" was reasonable at 7%. At under 1% it is a plan to wait months while the
+window in which anything can be learned closes, since artifacts expire in 14
+days. If this bug is to reach a verdict it now needs a POSITIVE argument rather
+than a longer wait — replaying the archived fifth firing's stamps through both
+the old and the new `classify_send` would show directly whether the change flips
+that verdict, and it needs no firing at all.
+
+### One instrument gap this scan exposed
+
+`ambiguous_at_boundary` printed only when non-zero, so a run with no ties and a
+build carrying no such instrumentation left identical logs, and interpreting the
+absence meant reading the source. The count now prints unconditionally and is in
+the drill's pass-filter, so the log states which it is. That is the same
+distinction — examined-and-found-nothing versus never-examined — that the rest of
+this file turns on.
+

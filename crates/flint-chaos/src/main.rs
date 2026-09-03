@@ -1207,6 +1207,15 @@ fn main() {
              accepting), not the AGE of a write already acked while replication was healthy."
         );
     }
+    // ALWAYS PRINT THE COUNT, INCLUDING ZERO.
+    //
+    // The NOTE below fires only when there are ties, so a run with none and a
+    // run whose classification never executed printed exactly the same thing:
+    // nothing. Reading 100 gate runs backwards to see whether this bug still
+    // fires, the absence of this line had to be interpreted by opening the
+    // source -- and "absent" versus "zero" is the distinction this whole file
+    // exists to keep. One unconditional line makes the log say which it is.
+    println!("  boundary ties (send == death stamp): {ambiguous_at_boundary}");
     if ambiguous_at_boundary > 0 {
         println!(
             "  NOTE: {ambiguous_at_boundary} acked write(s) carried a send stamp equal to the \

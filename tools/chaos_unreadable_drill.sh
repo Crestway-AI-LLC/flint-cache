@@ -81,7 +81,12 @@ if [ "$RC" -ne 0 ]; then
   echo "  -- chaos run FAILED (rc=$RC); full output follows, unfiltered --"
   sed 's/^/  | /' "$D/out.log"
 else
-  sed 's/^/  | /' "$D/out.log" | grep -E "iter |unreadable|PASS|FAIL|panick" || true
+  # `boundary ties` is in the PASS filter deliberately. It is the one line that
+  # says the send-vs-death classification RAN and found nothing, and without it
+  # a clean run and a build with no such instrumentation leave identical logs --
+  # which is what made a backward scan of 100 gate runs read the source to
+  # interpret an absence (BUG-0014).
+  sed 's/^/  | /' "$D/out.log" | grep -E "iter |unreadable|PASS|FAIL|panick|boundary ties" || true
 fi
 
 # 1. POSITIVE CONTROL ON THE TEST ITSELF: the scenario has to have happened.
