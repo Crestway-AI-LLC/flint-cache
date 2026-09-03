@@ -1,4 +1,4 @@
-# BUG-0035: the default lag cap sheds under gate load, and two drills misreport it (drills FIXED; the shed itself OPEN)
+# BUG-0035: the default lag cap sheds under gate load, and two drills misreport it (drills FIXED; the shed OPEN — 9 samples recovered 2026-09-03, cause of the transition unidentified)
 
 Status: OPEN 2026-08-20 · Severity: medium — one half is a documented claim
 with a counter-example, the other is a drill that reports a verdict for
@@ -786,3 +786,87 @@ What to look for across them:
   seat count, how long the demoted master was down?
 - does the shed land on the promoted seat every time, or on whichever seat
   happens to be behind?
+
+
+## 2026-09-03 — samples 2 and 3 recovered, and the collection plan was never collecting
+
+The 2026-08-27 decision was to collect three samples before designing a
+promotion grace, on the grounds that `tools/shed-window.sh` runs at the end of
+every `roll-fleet.sh` so "Monday's roll is sample 2 and Wednesday's is sample 3
+with no extra work."
+
+**No sample 2 or 3 was ever recorded.** `shed-window.sh` prints to stdout and
+`roll-fleet.sh` does not capture its output — no tee, no log file, nothing
+appended anywhere. rc.66 and rc.67 both rolled since. The samples existed for
+as long as somebody's terminal scrollback did.
+
+**They were not lost, because Prometheus had them all along.** The reader
+queries `flint_node_writes_shed_lag` and friends on the ops box, and those
+series carry eleven days of history. Every counter reset in them is a process
+restart, so each inter-reset span is exactly one process lifetime — which is
+precisely the sample this file wanted, without needing anyone to have captured
+anything.
+
+Nine lifetimes, `job="flint-watch-phase1"`, both seats:
+
+| seat | window (UTC) | hours | shed | peak lag ms | `delayed_soft` |
+|---|---|---|---|---|---|
+| 7001 | 08-20 22:02 → 08-21 23:07 | 25.1 | 128 | 6,150 | 0 |
+| 7001 | 08-21 23:12 → 08-24 16:27 | 65.2 | 90 | 5,152 | 0 |
+| 7001 | 08-24 16:32 → 08-27 17:52 | 73.3 | **191** | 6,551 | **15** |
+| 7001 | 08-27 17:57 → 09-01 04:52 | 106.9 | **0** | **2** | 0 |
+| 7002 | 08-20 22:02 → 08-21 05:07 | 7.1 | 210 | 8,619 | 0 |
+| 7002 | 08-21 05:12 → 08-23 15:12 | 58.0 | 87 | 5,001 | 0 |
+| 7002 | 08-23 15:17 → 08-27 02:37 | 83.3 | 106 | 5,572 | 0 |
+| 7002 | 08-27 02:42 → 08-31 23:37 | 116.9 | **112** | 7,221 | **9** |
+| 7002 | 08-31 23:42 → 09-01 04:52 | 5.2 | **0** | **29** | 0 |
+
+and the current lifetime, `job="flint-playground"`, 09-01 04:52 → 09-03 18:42
+(61.8 h): **shed 0**, peak lag 71 / 67 ms, `delayed_soft` 0.
+
+### The three questions this file asked, answered
+
+**1. Does `writes_delayed_soft` stay at 0?** **No.** It reached 15 on 7001 and
+9 on 7002. The rc.65 sighting's zero was one sample, and the inference drawn
+from it — that "the gap appears whole at promotion rather than building" — does
+not survive nine. Sometimes lag climbs through the soft band first. Whatever a
+grace window is designed against, it is not a mechanism that always arrives
+whole.
+
+**2. Does peak lag cluster near 5.7 s?** **Yes, and more sharply than the
+question assumed — it is BIMODAL.** Every shedding lifetime peaked between
+5,001 and 8,619 ms. Every non-shedding lifetime peaked between 2 and 71 ms.
+There is nothing in between: no lifetime peaked at 200 ms, or 1 s, or 3 s. The
+original 5,735 ms sits mid-cluster. A quantity that is either ~5–9 s or under
+0.1 s, with no middle, is not a threshold being grazed — it is two different
+states.
+
+**3. Does the shed land on the promoted seat every time?** Both seats shed, in
+different lifetimes. It is not one seat's property.
+
+### What this does NOT establish, and it is the important part
+
+**The recent zeroes are not yet evidence that the shed stopped.** This file's
+own finding is that the shed is a PROMOTION phenomenon, so a lifetime that
+contained no promotion shedding zero says nothing at all. 7001 ran 106.9 hours
+clean, but nothing here shows it was promoted during them. Counting quiet
+lifetimes as clean samples would repeat this file's oldest mistake — five
+negative reproductions that were measuring the wrong variable.
+
+**And the cause of the transition is unidentified.** Two attributions were
+tried and both are wrong: BUG-0038's shipper fix is in **rc.58**, so it was
+already running throughout the shedding period; and BUG-0078's `TCP_NODELAY`
+fix lands *after* rc.65, while 7001's first clean lifetime begins at the rc.65
+roll. Recorded so neither is tried a third time.
+
+### What to change, so this is not re-derived a fourth time
+
+The samples were sitting in Prometheus for a week while this file said they
+had to be collected going forward. **The collection plan should read history,
+not capture stdout** — a query over `flint_node_writes_shed_lag` reconstructs
+every past roll, and does not depend on anyone having kept a terminal open.
+
+What is still needed before designing a grace is a shed sample from a roll
+whose promotion is *identified* — not a lifetime that happened to be quiet.
+`roll-fleet.sh` knows which seat it promotes and when; recording that alongside
+the counter turns each roll into a sample that can be read honestly.
