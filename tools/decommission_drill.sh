@@ -93,9 +93,30 @@ M0=$(master); echo "== initial master: $M0"
 
 echo "== FAILOVER the master ($M0) — graceful handoff"
 ./target/release/flintctl -f "$INV" failover "$M0" 2>&1 | grep -E 'demoted|complete' | sed 's/^/  /'
-sleep 1
-M1=$(master); echo "== new master: $M1"
-[ -n "$M1" ] && [ "$M1" != "$M0" ] || { echo "FAIL: master unchanged ($M0 -> $M1)"; exit 1; }
+# POLL, DO NOT SLEEP-THEN-PEEK. A demoted master RESTARTS, and on the way back
+# it boots as MASTER FROM ITS DURABLE ROLE before the demotion is applied --
+# flint-server says exactly that in its own log. `master()` takes the FIRST
+# status line matching /master/ and the ex-master is listed first, so a single
+# read one second after the handoff can legitimately catch the old node calling
+# itself master and report "master unchanged" -- a claim about the product for
+# what is a read taken too early. Seen on the gate 2026-09-02 and 2026-09-03,
+# both times with the failover line directly above it announcing the correct
+# promotion (BUG-0064's shape: a verdict the drill could not distinguish from a
+# timing one).
+M1=""
+for _ in $(seq 1 60); do
+  M1=$(master)
+  [ -n "$M1" ] && [ "$M1" != "$M0" ] && break
+  sleep 0.5
+done
+echo "== new master: $M1"
+# Three outcomes, not two: no master at all is a different fault from a master
+# that never moved, and both are different from "we did not wait long enough".
+[ -n "$M1" ] || { echo "FAIL: no master in status 30s after failover of $M0"; exit 1; }
+[ "$M1" != "$M0" ] || {
+  echo "FAIL: master still $M0 30s after failover -- not a settling transient"
+  ./target/release/flintctl -f "$INV" status | sed 's/^/    /'
+  exit 1; }
 [ "$(nodes_live)" -eq 2 ] || { echo "FAIL: pair lost a node after failover"; exit 1; }
 echo "  ex-master rejoined as replica; both nodes live"
 

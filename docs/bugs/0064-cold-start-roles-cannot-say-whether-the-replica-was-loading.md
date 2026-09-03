@@ -360,3 +360,34 @@ That is worth more than another hypothesis, because every hypothesis this file
 has entertained failed for want of evidence that was being discarded at the
 moment it was produced.
 
+### A third instance, found the same way: `decommission`
+
+`decommission` failed on the gate 2026-09-02 and again 2026-09-03 with
+`FAIL: master unchanged (127.0.0.1:7221 -> 127.0.0.1:7221)`. Its own log
+contradicts it two lines earlier:
+
+    127.0.0.1:7221 demoted + drained; 127.0.0.1:7222 promoted at (0,3)
+    == failover complete: 127.0.0.1:7222 is master; 127.0.0.1:7221 rejoined as replica
+    == new master: 127.0.0.1:7221
+    FAIL: master unchanged (127.0.0.1:7221 -> 127.0.0.1:7221)
+
+The handoff worked. The read after it did not. The drill did `sleep 1` and then
+took ONE sample, through `master() { status | awk '/master/{print $3; exit}'; }`
+— first matching line wins, and the ex-master is listed first. A demoted master
+RESTARTS and boots as **master from its durable role** before the demotion is
+applied, which `flint-server` announces in its own log, so one second later the
+old node can still legitimately be calling itself master.
+
+So the message asserts a product fault — the failover did not move the master —
+for a read taken during a documented transient. This file's thesis for the third
+time, in a third drill.
+
+Replaced with a bounded poll (30s) for a master that differs, and three
+outcomes instead of two: no master at all, a master that genuinely never moved
+(which now dumps `status`), and success. Passes locally, twice.
+
+**Not claimed:** that the race is reproduced on demand. It is inferred from the
+log's own contradiction plus the documented durable-role boot. What is certain
+is that a single sample one second after a restart cannot distinguish the two,
+which is enough to fix regardless of how often it bites.
+
