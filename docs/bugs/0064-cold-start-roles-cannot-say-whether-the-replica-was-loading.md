@@ -391,3 +391,37 @@ log's own contradiction plus the documented durable-role boot. What is certain
 is that a single sample one second after a restart cannot distinguish the two,
 which is enough to fix regardless of how often it bites.
 
+### A fourth, and this one had already built the instrument it did not use
+
+`roll_shed` failed twice on the gate with:
+
+    FAIL: with the replica stalled 1500ms behind a 50ms cap, the master shed
+          NOTHING by the lag cause.
+
+Unlike the others this drill is careful — that IS a positive control failing to
+arm, and it says so ("that is not a pass — it means control 2 above proves
+nothing"). It names two causes: `writes_shed_lag` is not wired, or the stall
+never reached the master's view of lag.
+
+**There is a third, and it is the likely one on a contended runner: no write was
+ever offered.** A gate cannot refuse what nobody sent, so a zero has a reading
+that is not about the product at all — and the writer only has a 1.5 s window in
+which to be scheduled.
+
+The drill had already solved this and not connected it. `writer_stop` computes
+`DELIVERED`, and its own header explains why it was written: *"any burst could
+not be separated from this client cannot push hard enough to make it, because
+nobody knew what the client actually delivered."* Control 3 never read it.
+
+Now it does. A passing run reports the denominator that was missing —
+**300 delivered, 250 shed by lag** — and a failing one splits in two:
+`DELIVERED == 0` reports a harness/machine result that says nothing about the
+gate (and warns that control 2's zero rests on it), while writes offered and
+none shed keeps the original product-facing message, now carrying the count.
+Both branches mutation-tested; still a FAILURE either way, because a control
+that cannot arm is not a pass.
+
+Four drills, one shape: `cold_start_roles`, `stop_sweep`, `decommission`,
+`roll_shed`. In every case the instrument existed or was one line away, and the
+verdict was reported as a fact about the product.
+

@@ -352,6 +352,7 @@ POST_SOFT=$(delayed_soft $MASTER)
 D_LAG=$(( POST_LAG - PRE_LAG )); D_WID=$(( POST_WID - PRE_WID ))
 D_SOFT=$(( POST_SOFT - PRE_SOFT ))
 echo "  writes_shed_lag ${PRE_LAG} -> ${POST_LAG} (+$D_LAG) | writes_delayed_soft +$D_SOFT | writes_shed_widowed +$D_WID"
+echo "  client delivered ${DELIVERED:-0} write(s) during the stall (~${RATE_OBS:-n/a}/s)"
 # Reported, not asserted. The soft gate is a flat 2ms step across the whole
 # soft..hard band, so how many writes land in it depends on how fast the band
 # is crossed — a real property, but not one with a threshold worth failing on
@@ -370,10 +371,31 @@ else
   echo "        graded response is doing something, not merely present"
 fi
 if [ "$D_LAG" -le 0 ]; then
+  # THE THIRD CAUSE, which this branch used to omit. A gate cannot refuse a
+  # write nobody offered, so `shed nothing` has a reading that is not about the
+  # product at all -- and it is the likely one on a contended CI runner, where
+  # the writer may barely be scheduled inside a 1.5s window. `writer_stop`
+  # already computes DELIVERED for exactly this distinction (see its own header:
+  # "any burst could not be separated from this client cannot push hard enough
+  # to make it"); this control simply never read it.
+  #
+  # Still a FAILURE either way -- a control that cannot arm is not a pass -- but
+  # it must not be reported as a product fault when the harness is what fell
+  # short.
+  if [ "${DELIVERED:-0}" -eq 0 ]; then
+    echo "FAIL: control 3 never armed -- the client delivered ZERO writes during the"
+    echo "      ${STALL_MS}ms stall, so no write was ever offered for the lag gate to refuse."
+    echo "      This says NOTHING about writes_shed_lag: it is a harness or machine"
+    echo "      result, not a product one. Most likely the writer was not scheduled"
+    echo "      inside the window (a loaded box), or the proxy on :$PROXY refused it."
+    echo "      Do not read control 2's zero as meaningful either; it rests on this."
+    exit 1
+  fi
   echo "FAIL: with the replica stalled ${STALL_MS}ms behind a ${TIGHT}ms cap, the master shed"
-  echo "      NOTHING by the lag cause. That is not a pass — it means control 2 above proves"
-  echo "      nothing, because the counter it reads never moves. Either writes_shed_lag is not"
-  echo "      wired to the write path, or the stall never reached the master's view of lag."
+  echo "      NOTHING by the lag cause, having been offered ${DELIVERED} write(s) (~${RATE_OBS:-n/a}/s)."
+  echo "      That is not a pass — it means control 2 above proves nothing, because the"
+  echo "      counter it reads never moves. Either writes_shed_lag is not wired to the"
+  echo "      write path, or the stall never reached the master's view of lag."
   [ "$D_WID" -gt 0 ] && echo "      NOTE: writes_shed_widowed moved by $D_WID — the stall outran widowed_grace_ms=$WG"
   echo "      and armed the WRONG gate. Shorten the stall or raise the grace."
   exit 1
