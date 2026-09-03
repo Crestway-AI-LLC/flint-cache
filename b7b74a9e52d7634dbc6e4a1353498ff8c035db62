@@ -1,0 +1,8 @@
+CORRECTION to this message: two identifiers were eaten by shell expansion before the commit was written. The sentence should read:
+
+  It was never a collision: $INVB omitted 'disposable on', so flintctl
+  REFUSED the bootstrap, and the refusal went to /dev/null.
+
+Cause: the message was passed with -m inside DOUBLE quotes in zsh, so the backticks around 'disposable on' ran as command substitution (zsh reported: command not found: disposable) and $INVB expanded to nothing. Use a single-quoted heredoc or -F for any message containing backticks or a dollar sign.
+
+The full and correct explanation is in docs/bugs/0064 and in the EXCLUDED note in tools/gates.sh, both of which are intact.
