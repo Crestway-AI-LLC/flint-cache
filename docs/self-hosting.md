@@ -249,7 +249,9 @@ proxy 10.0.1.21:7379
 controller on
 capacity 1717986918400       # ~1.6 TB per-node fill budget
 min-replicas 1               # close the widowed-master write hole
-node-env FLINT_BG_JOBS=6     # engine tuning with no CLI flag; repeatable
+node-env FLINT_LEVEL_BASE_MB=64   # engine tuning, no CLI flag; repeatable
+node-env FLINT_BG_JOBS=4          # a PAIR -- measured, but NOT a default:
+                                  # costs +36% disk, price it first (below)
 ```
 
 `node-env` reaches every `flint-server` seat, remote ones included. It exists
@@ -260,7 +262,31 @@ there was no way to set them at all. **Measure before you set one:** raising
 `FLINT_BG_JOBS` was measured to make ingest *slower* on a 2-vCPU seat (9.1%,
 with write amplification up 32%), because compaction threads take the cores the
 write path needs. It is a function of core count and LSM size, not a
-free improvement. See `docs/bugs/0013`.
+free improvement.
+
+**And never raise it alone.** The same knob on the *same* 2-core seat is
+**+93%** once the LSM is deep (96 GB against ~760 MB) — opposite signs from LSM depth,
+not from hardware, so a result from a small seat does not transfer to a full
+one. What was measured to help is the **pairing** `FLINT_LEVEL_BASE_MB=64` with
+`FLINT_BG_JOBS=4`: at 96 GB that is 34.2 → 89.2 MB/s (2.6x) with write
+amplification 16.0 → 10.2. `FLINT_BG_JOBS` alone on a shallow LSM is the case
+that measured *worse*.
+
+If the disk is your constraint rather than the clock, raise
+`FLINT_LEVEL_BASE_MB=64` **alone**: 45.2 MB/s at **104 GB** resident, which is
+1.3x the baseline throughput while using **32 GB less** disk than leaving it
+untuned. It is the only configuration measured that improves both at once.
+
+**Price it before you set it.** That pairing costs **+36% resident bytes** —
+185 GB to hold 96 GB logical, against 136 GB untuned. On a 436 GB `i4i.large`
+that is ~42% of the volume rather than ~31%, and the WAL archive budget is
+derived from volume size, so footprint and retention window are drawn from the
+same disk. It also commits 32 MB of write buffer per engine, which scales with
+seats per host, not with hosts. Even paired, the seat still stalls **43.4%** of
+the time at that size: this moves the ceiling, it does not remove it.
+
+Full derivation, both sweeps, and the untested range between them in
+`docs/bugs/0013`.
 
 Don't hand-edit an inventory to *grow* a running cluster and re-bootstrap —
 add capacity live with `flintctl expand 10.0.2.14:7001,10.0.2.15:7001`
