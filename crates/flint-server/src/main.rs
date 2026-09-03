@@ -5540,11 +5540,20 @@ fn flintsync(
     // never split), and `updates_since_budgeted` returns an empty Ok for a
     // caught-up replica, so a healthy cursor never false-refuses.
     if let Err(ReplError::WalGap(why)) = kv.updates_since_budgeted(cursor, 1) {
+        // BUG-0082, and this is the refusal a REJOIN meets first. `why` already
+        // names the oldest retained batch -- as a SEQUENCE, which is precisely
+        // the quantity that cannot discriminate: the same gap is unremarkable
+        // at one write rate and impossible at another, and the rate is not in
+        // the message. The archive's AGE can, and only this side can read it.
+        let held = match kv.archive_span() {
+            Some(s) => s.describe(),
+            None => "archive state could not be read on this node".to_string(),
+        };
         let mut out = Vec::new();
         encode(
             &Value::Error(format!(
                 "WALGAP cursor {cursor} is no longer reachable from this WAL ({why}): \
-                 full sync required"
+                 full sync required ({held})"
             )),
             &mut out,
         );
@@ -5663,9 +5672,32 @@ fn flintsync(
                     }
                 }
                 Err(ReplError::WalGap(e)) => {
+                    // BUG-0082. SAY WHAT THIS ARCHIVE ACTUALLY HOLDS.
+                    //
+                    // This refusal names the missing segment and nothing else,
+                    // and the replica prints it verbatim as its FATAL. Two
+                    // unrelated faults end there: retention too short for a
+                    // correct cursor, or a correct archive asked for a cursor
+                    // far older than the outage that produced it — which makes
+                    // the fence rewind's translation the fault. The playground
+                    // hit the second sixteen times in three weeks with a 278 MB
+                    // archive holding a full twelve hours, i.e. nowhere near
+                    // its budget.
+                    //
+                    // Distance in sequences cannot separate them: the same gap
+                    // is plausible at one write rate and absurd at another, and
+                    // the rate is not in the message. AGE can, and only this
+                    // side knows it — the archive is the master's, so the
+                    // replica cannot stat it however carefully it logs.
+                    let held = match kv.archive_span() {
+                        Some(s) => s.describe(),
+                        // Not "empty": the refusal must not assert a retention
+                        // fact it failed to read.
+                        None => "archive state could not be read on the master".to_string(),
+                    };
                     out.clear();
                     encode(
-                        &Value::Error(format!("WALGAP full sync required: {e}")),
+                        &Value::Error(format!("WALGAP full sync required: {e} ({held})")),
                         &mut out,
                     );
                     stream.write_all(&out)?;

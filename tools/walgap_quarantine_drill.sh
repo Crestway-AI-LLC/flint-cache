@@ -135,6 +135,28 @@ done
   echo "      FLINT_WRITE_BUFFER_MB / --wal-size-limit-mb on B."
   exit 1
 }
+# BUG-0082. THE REFUSAL MUST DESCRIBE THE ARCHIVE IT REFUSED FROM, and this is
+# the one place in the suite that produces a real WALGAP, so it is the only
+# place the wiring can be asserted rather than unit-tested in isolation.
+#
+# Why it matters here specifically: the archive is the MASTER's, and the
+# replica that prints this string as its FATAL cannot stat it. If the age is
+# not carried in the message it is not recoverable anywhere -- and without it,
+# short retention and a cursor older than the outage produce the identical
+# FATAL, which is how BUG-0082 went sixteen repairs without being diagnosed.
+case "$PROBE" in
+  *"archive holds"* | *"archive state could not be read"*) ;;
+  *)
+    echo "FAIL: the WALGAP refusal does not say what the archive held:"
+    echo "      $PROBE"
+    echo "      BUG-0082 needs the segment count and ages in this string. The"
+    echo "      unit tests for archive_span can all pass with this call site"
+    echo "      never wired up, which is exactly what this line is for."
+    exit 1
+    ;;
+esac
+echo "  the refusal describes the archive it refused from"
+
 kill -CONT "$APID" || { echo "FAIL: could not resume A"; exit 1; }
 echo "  A stalled at seq $CURSOR; B recycled past it"
 

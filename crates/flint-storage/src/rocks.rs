@@ -645,6 +645,28 @@ impl RocksKv {
         &self.path
     }
 
+    /// What this node's WAL archive actually holds, in WALL-CLOCK AGE.
+    ///
+    /// BUG-0082. A master refuses a rejoin with `WALGAP full sync required`
+    /// when the replica asks for a segment the archive no longer has, and that
+    /// message names the missing file and nothing else. Two very different
+    /// faults produce it, and the message cannot tell them apart:
+    ///
+    /// - the cursor is fine and RETENTION is too short, or
+    /// - retention is fine and the adopted cursor is far OLDER than the
+    ///   outage that produced it, which makes the fence rewind's translation
+    ///   the fault.
+    ///
+    /// **Distance in sequences cannot separate them.** Under TTL pruning a gap
+    /// of a few hundred thousand sequences reads as entirely plausible at one
+    /// write rate and absurd at another, and the rate is not in the message.
+    /// Age is the discriminator: if a seconds-long outage ends up asking for a
+    /// segment below an archive that still holds twelve hours, the cursor is
+    /// hours old and nothing about retention needs changing.
+    pub fn archive_span(&self) -> Option<ArchiveSpan> {
+        archive_span_at(&self.path.join("archive"))
+    }
+
     /// Fsync the WAL — one group commit covering everything appended since
     /// the last call. Ordinary writes go to the WAL unsynced (OS page cache:
     /// zero acked loss across process crash/restart, proven by the chaos
@@ -791,6 +813,68 @@ impl Kv for RocksKv {
             let _ = self.db.write(batch);
         }
     }
+}
+
+/// What a WAL archive directory holds: how many segments, and how old the
+/// oldest and newest are. Ages are seconds, from file mtime.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArchiveSpan {
+    pub segments: usize,
+    /// None when there are no segments at all — distinct from an age of 0.
+    pub oldest_age_s: Option<u64>,
+    pub newest_age_s: Option<u64>,
+}
+
+impl ArchiveSpan {
+    /// One line for an error a human will read in a log, once, under pressure.
+    pub fn describe(&self) -> String {
+        match (self.segments, self.oldest_age_s, self.newest_age_s) {
+            (0, _, _) => "archive holds NO segments".to_string(),
+            (n, Some(old), Some(new)) => {
+                format!("archive holds {n} segment(s), newest {new}s old, oldest {old}s old")
+            }
+            // Segments counted but no mtime readable on any of them. Say that
+            // rather than printing a span built from nothing.
+            (n, _, _) => format!("archive holds {n} segment(s), none with a readable mtime"),
+        }
+    }
+}
+
+/// `None` means THE DIRECTORY COULD NOT BE READ — which is not the same fact
+/// as an empty archive, and collapsing the two here would put "there is
+/// nothing retained" into a refusal that has no idea. An archive that exists
+/// and is empty returns `Some` with `segments: 0`.
+pub fn archive_span_at(dir: &Path) -> Option<ArchiveSpan> {
+    let rd = std::fs::read_dir(dir).ok()?;
+    let now = std::time::SystemTime::now();
+    let mut segments = 0usize;
+    let mut oldest: Option<u64> = None;
+    let mut newest: Option<u64> = None;
+    for entry in rd.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("log") {
+            continue;
+        }
+        segments += 1;
+        // A segment whose mtime will not read still COUNTS: it is retained.
+        // Only the age is unknown, and dropping the whole entry would
+        // under-report what the archive holds.
+        let Ok(age) = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .and_then(|t| now.duration_since(t).map_err(std::io::Error::other))
+        else {
+            continue;
+        };
+        let secs = age.as_secs();
+        oldest = Some(oldest.map_or(secs, |o: u64| o.max(secs)));
+        newest = Some(newest.map_or(secs, |n: u64| n.min(secs)));
+    }
+    Some(ArchiveSpan {
+        segments,
+        oldest_age_s: oldest,
+        newest_age_s: newest,
+    })
 }
 
 #[cfg(test)]
@@ -1613,5 +1697,120 @@ mod alloc_count {
         );
         drop(kv);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod archive_span_tests {
+    use super::{ArchiveSpan, archive_span_at};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    // Same idiom as `mod audit` above rather than a new dependency: that
+    // helper is private to its module, and one more dev-dependency to make
+    // four small tests read marginally nicer is a poor trade.
+    struct Dir(std::path::PathBuf);
+    impl Dir {
+        fn new(tag: &str) -> Self {
+            static N: AtomicU64 = AtomicU64::new(0);
+            let p = std::env::temp_dir().join(format!(
+                "flint-archive-span-{}-{}-{}",
+                tag,
+                std::process::id(),
+                N.fetch_add(1, Ordering::Relaxed)
+            ));
+            let _ = std::fs::remove_dir_all(&p);
+            std::fs::create_dir_all(&p).expect("create the scratch archive dir");
+            Self(p)
+        }
+        fn seg(&self, name: &str) {
+            std::fs::write(self.0.join(name), b"x").expect("write a scratch segment");
+        }
+    }
+    impl Drop for Dir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    // BUG-0082's whole point: a refusal must not assert a retention fact it
+    // failed to read. An unreadable directory is None, and None is what stops
+    // the message saying "archive holds NO segments" about an archive it never
+    // managed to open.
+    #[test]
+    fn a_missing_directory_is_unknown_not_empty() {
+        let d = Dir::new("missing");
+        assert_eq!(archive_span_at(&d.0.join("nope")), None);
+    }
+
+    // The other side of that distinction, which is what makes it one: a
+    // directory that IS readable and holds nothing answers, and answers zero.
+    #[test]
+    fn an_empty_directory_answers_zero() {
+        let d = Dir::new("empty");
+        assert_eq!(
+            archive_span_at(&d.0),
+            Some(ArchiveSpan {
+                segments: 0,
+                oldest_age_s: None,
+                newest_age_s: None
+            })
+        );
+    }
+
+    #[test]
+    fn segments_are_counted_and_aged() {
+        let d = Dir::new("aged");
+        d.seg("000001.log");
+        d.seg("000002.log");
+        let got = archive_span_at(&d.0).expect("a readable directory must answer");
+        assert_eq!(got.segments, 2);
+        // Just written, so both ages are small. The ORDERING is the invariant
+        // and holds at any clock resolution; the bound is a sanity check that
+        // mtimes were read at all rather than defaulted.
+        let (old, new) = (
+            got.oldest_age_s.expect("two segments were written"),
+            got.newest_age_s.expect("two segments were written"),
+        );
+        assert!(
+            old >= new,
+            "oldest must not be younger than newest: {got:?}"
+        );
+        assert!(old < 60, "ages: {got:?}");
+    }
+
+    // RocksDB writes more than segments into this directory. Counting
+    // everything would inflate what the archive is claimed to hold, inside a
+    // message whose only job is to be believed.
+    #[test]
+    fn non_log_files_are_not_segments() {
+        let d = Dir::new("mixed");
+        d.seg("000001.log");
+        d.seg("LOCK");
+        d.seg("OPTIONS-000007");
+        assert_eq!(
+            archive_span_at(&d.0)
+                .expect("a readable directory must answer")
+                .segments,
+            1
+        );
+    }
+
+    #[test]
+    fn describe_says_no_segments_rather_than_a_span_over_nothing() {
+        let empty = ArchiveSpan {
+            segments: 0,
+            oldest_age_s: None,
+            newest_age_s: None,
+        };
+        assert_eq!(empty.describe(), "archive holds NO segments");
+        let held = ArchiveSpan {
+            segments: 3,
+            oldest_age_s: Some(43_200),
+            newest_age_s: Some(4),
+        };
+        assert_eq!(
+            held.describe(),
+            "archive holds 3 segment(s), newest 4s old, oldest 43200s old"
+        );
     }
 }

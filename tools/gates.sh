@@ -536,6 +536,13 @@ assert_no_duplicate_drill_ports() {
     used=$(grep -v '^[[:space:]]*#' "$f" \
       | grep -oE '(--port|-p)[[:space:]]+[0-9]{4,5}|127\.0\.0\.1:[0-9]{4,5}' \
       | grep -oE '[0-9]{4,5}$' | sort -u)
+    # `[-]-` AND NOT `\-\-`: a pattern starting with a literal dash looks like
+    # an option to grep, and escaping the dash is the obvious fix. GNU grep
+    # 3.8+ then warns `stray \ before -` once per invocation -- this loop runs
+    # twice per drill, so it put 254 warning lines into every gate run, a
+    # quarter of the output, reading as breakage in a passing gate. A bracket
+    # expression stops the dash being read as an option without an escape, and
+    # matches identically on both greps here.
     # AND THE PORTS NAMED IN ARGUMENTS THAT BIND, which the two forms above
     # cannot see. BUG-0086: controller_multipair spelled 6521 as `6521:$DIR`
     # inside --manage-pairs and nowhere else, so it was used, undeclared, and
@@ -555,7 +562,7 @@ assert_no_duplicate_drill_ports() {
     # is why fleet_guard's fake-peer 7788/7789 do not trip this.
     used="$used
 $(grep -v '^[[:space:]]*#' "$f" \
-      | grep -oE '\-\-manage-(pairs|slots)[[:space:]=]+"?[0-9][^"]*' \
+      | grep -oE '[-]-manage-(pairs|slots)[[:space:]=]+"?[0-9][^"]*' \
       | tr ';,' '\n\n' | grep -oE '^[0-9]{4,5}:|[[:space:]="]+[0-9]{4,5}:' \
       | grep -oE '[0-9]{4,5}')"
     # A CHAOS BASE CLAIMS A BLOCK, NOT A PORT. --port-base N binds N+0 master,
@@ -568,7 +575,7 @@ $(grep -v '^[[:space:]]*#' "$f" \
     # in seven shell scripts" -- copying the 8 into the gate would make this
     # file the eighth place to keep in sync, which is the shape of defect
     # BUG-0086 is about.
-    for b in $(grep -v '^[[:space:]]*#' "$f" | grep -oE '\-\-port-base[[:space:]=]+[0-9]{4,5}' | grep -oE '[0-9]{4,5}$'); do
+    for b in $(grep -v '^[[:space:]]*#' "$f" | grep -oE '[-]-port-base[[:space:]=]+[0-9]{4,5}' | grep -oE '[0-9]{4,5}$'); do
       used="$used
 $(seq "$b" $((b + CHAOS_SPAN - 1)))"
     done

@@ -1,4 +1,4 @@
-# BUG-0082 — the rejoin adopts a cursor the archive can no longer serve (OPEN)
+# BUG-0082 — the rejoin adopts a cursor the archive can no longer serve (OPEN; the refusal now names the archive's AGE, 2026-09-02)
 
 **Found** 2026-09-01 on the playground, by reading the operations agent's own
 repair history rather than by a load run. The agent has executed **16
@@ -116,6 +116,88 @@ retention change is needed.
 
 That is a two-line change at the FATAL site and it decides which half of the
 system is at fault, so it is worth doing before anything is fixed.
+
+### DONE 2026-09-02 — and the site was not the one this section named
+
+The refusal now carries what the archive actually holds:
+
+    WALGAP full sync required: <io error> (archive holds 47 segment(s),
+      newest 3s old, oldest 43201s old)
+
+**The FATAL site could not answer this, and that is the part worth recording.**
+The FATAL prints on the REPLICA; the missing segment is on the MASTER
+(`/var/lib/flint/node-7002/archive/140130.log` in the transcript above is the
+master's path). A replica cannot stat an archive it does not own, however
+carefully it logs — so the age has to be attached where the refusal is
+produced, in `flintsync`'s `ReplError::WalGap` arm, and it then rides to the
+replica inside the error string the FATAL already prints verbatim. Two lines,
+in the other process.
+
+`RocksKv::archive_span()` walks `<data-dir>/archive` and reports segment count
+with the oldest and newest mtimes as ages. **A directory that cannot be read
+returns `None`, not an empty span**, and the refusal then says "archive state
+could not be read on the master" rather than "archive holds NO segments" — a
+refusal must not assert a retention fact it failed to look up, which is the
+same rule `disk.rs` states for a failed `statvfs` and BUG-0079 broke.
+
+**How to read the result when this next recurs.** The archive is the master's
+and the outage is knowable from the logs:
+
+| oldest retained segment | reading |
+|---|---|
+| hours old, and the cursor is below it | the cursor is hours old after a seconds-long outage → **translation**, and no retention change would help |
+| seconds old | the archive really did prune inside the outage → **retention** |
+
+That is the discrimination this section asked for, and it is now in the one
+line an operator already sees.
+
+Five unit tests, including both halves of the unknown/empty distinction: a
+missing directory is `None`, a readable empty one is `Some(segments: 0)`.
+Non-`.log` files are excluded, since `LOCK` and `OPTIONS-*` live in that
+directory too and counting them would inflate a number whose only job is to be
+believed.
+
+### There are TWO refusals, and the unit tests could not have told me
+
+The first version wired the age into `flintsync`'s `ReplError::WalGap` arm —
+the one whose text appears in the transcript at the top of this file — and the
+five unit tests passed. An assertion added to `walgap_quarantine_drill.sh`,
+the one drill in the suite that provokes a real WALGAP, failed immediately:
+
+    WALGAP cursor 1256 is no longer reachable from this WAL
+      (oldest retained batch starts at 1728, past the 1257 needed ...):
+      full sync required
+
+A different message, from a different site. `flintsync` refuses on **retention
+admission** before it streams anything (`updates_since_budgeted(cursor, 1)`),
+and that is the refusal a REJOIN meets first; the arm I had edited is reached
+only once streaming is under way. Both are real, both end at a replica, and
+only one was carrying the age.
+
+**And the admission refusal was the more important of the two**, because it
+already reports the oldest retained batch AS A SEQUENCE — the exact quantity
+this file argues cannot discriminate. It looked informative and was not.
+
+Both sites now carry the span. The lesson is the cheap one: unit tests on
+`archive_span` prove the function works and say nothing about whether anything
+calls it, and the wiring assertion cost one line in a drill that already
+produced the condition.
+
+### The discrimination, demonstrated
+
+`walgap_quarantine` runs its master with `--wal-ttl-seconds 1
+--wal-size-limit-mb 1`, so it IS the short-retention arm, and the refusal now
+says so in the same breath as the refusal:
+
+    full sync required (archive holds 2 segment(s), newest 1s old, oldest 1s old)
+
+A one-second-old archive is retention, unambiguously. The playground's is
+twelve hours, and a cursor below it after a seconds-long outage is the other
+arm. Same message, and now they read differently.
+
+**Not a fix, and not a reproduction.** It decides which half to fix on the next
+occurrence — roughly twice a week on the playground — without waiting to build
+the deterministic reproducer this file still wants.
 
 ## Why it has been invisible
 
