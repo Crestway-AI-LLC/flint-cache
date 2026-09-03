@@ -219,9 +219,9 @@ knee.
   **Two of those three are now measured and eliminated** — see the 2026-09-03
   run at the bottom of this file. The fsync path moves throughput 0.55% across
   500 / 50 / 0 ms, and the write path asks the device for ~7% of what fio gets
-  out of it. **WAL append serialization is the only one still unmeasured**, and
-  the run added a number that reframes even that: one seat did 138k ops/s where
-  the fleet's knee was ~80k.
+  out of it. **WAL append serialization is the only one still unmeasured.**
+  That run did not sample the L0 stall counters, so whether its seat reached a
+  knee at all is also still open — see the limitation recorded with it.
 
   Left in place rather than rewritten, because the list is the record of what
   was open on 2026-08-30 and the value of these blocks is being able to see
@@ -352,10 +352,33 @@ exactly why it would have survived unexamined.
   bytes the client sent, and those differ by exactly the dedup factor. Both are
   printed by the harness so the gap is visible instead of one being quoted.
 
-**What is left, and one number that reframes it.** WAL append serialisation is
-the only surviving candidate; nothing here eliminates it. But this seat
-sustained **138k ops/s at 142 MB/s** where the fleet's knee was ~80k seq/s at
-84–93 MB/s — roughly 1.7x more on one box with no replica, no lag cap and a
-different payload. So the ~80k figure is not a property of the write path on
-this hardware, and the next question is what the fleet has that this does not,
-rather than what the machine cannot do.
+**What is left.** WAL append serialisation is the only surviving candidate;
+nothing here eliminates it.
+
+**And a limitation of this run that has to be stated before its headline number
+is used.** This seat sustained 138k ops/s at 142 MB/s where the fleet's knee
+was ~80–88k seq/s at 84–93 MB/s. The units DO line up — 80,000 × 1,054 B =
+84.3 MB/s, so that figure is one sequence per ~1 KB write, unbatched, exactly
+like memtier's 138,904 × 1,024 B = 142.2 MB/s. (Worth saying because elsewhere
+in this project a seq/s comparison IS invalid: batching packs ~15 keys into a
+sequence, and write-path-next item 3 had to count keys for that reason.)
+
+**But comparable units are not a comparable quantity.** This ADR's own finding
+is that what degrades is RocksDB's L0 write stall — `l0_files` sawtoothing
+8 → 21 with `writes_delayed_soft` at 4,300–4,700/s, goodput falling from the
+knee to ~44k seq/s. **The run above never sampled any of that.** It measured
+throughput and fsync and nothing else, so it cannot say whether 138k was a
+higher knee or simply a rate below this seat's knee — an unstalled ceiling and
+a knee are different quantities, and only one of them is what ~80k is.
+
+So the honest claim is narrower than "the fleet's number is not a property of
+this hardware": **on this seat, at this offered load, neither the fsync path
+nor device bandwidth was the limit.** Whether the seat was at its knee is
+unmeasured, and until it is, 138k against 80k is not a ratio anyone should
+quote.
+
+The harness now samples `l0_files`, `write_stall_readable` and
+`writes_delayed_soft` DURING each leg — after the load stops the sawtooth
+drains and every leg reads quiet — and refuses to let the rates be compared to
+a knee unless at least one leg actually stalled. That makes the re-run answer
+the question this one raised.
