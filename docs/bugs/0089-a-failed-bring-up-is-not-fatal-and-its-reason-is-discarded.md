@@ -134,6 +134,19 @@ gate is what hid the prefix case. Worth recording because the two diagnoses
 read as contradictory ("it is a directory one level up" against "it is not a
 directory") and are both true, of different drills.
 
+### Proven on a real failure, not a fixture
+
+Everything above was verified against planted logs. The chain end to end —
+spawn writes to the scope, the wait fails, the helper finds and prints it —
+was finally exercised by squatting one of `bloom_drill`'s declared ports and
+running it:
+
+    FAIL: no PONG from 127.0.0.1:6402 after 30s
+      --- .../flint-bloom-server.log (last 15 lines) ---
+      Error: Os { code: 48, kind: AddrInUse, message: "Address already in use" }
+
+Before this, that failure was the first line alone and the reader guessed.
+
 ### Two counts, 54 and 77, and both are right
 
 A concurrent re-count arrived at **54 spawns across 30 drills**; this pass
