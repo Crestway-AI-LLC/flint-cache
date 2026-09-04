@@ -1091,11 +1091,33 @@ static LAG_MAX_GAP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 /// retry-with-backoff and the chaos ledger already treats it as never-acked,
 /// so refusing is the one failure this system is built to absorb.
 ///
-/// 2000 ms is a first calibration: orders of magnitude above normal service
-/// (sub-millisecond at any sane concurrency), far below any client's timeout,
-/// and well under the 8931 ms a client actually waited on soak run 24 while a
-/// re-seed had the write path. Wants revisiting against a measured p99 curve
-/// and against the headroom policy that should set it.
+/// 2000 ms was a first calibration, justified as "orders of magnitude above
+/// normal service (sub-millisecond at any sane concurrency)". **That margin has
+/// now been measured and it is not orders of magnitude.** The curve this
+/// comment asked for exists (docs/bugs/0088, docs/bugs/0064):
+///
+/// | where | peak projected wait, of this 2000 ms |
+/// |---|---|
+/// | unloaded laptop | 20-72 ms |
+/// | CI, serial (n=4) | 48-79 ms |
+/// | CI, four drills at once | **90-1574 ms** |
+/// | CI, at refusal | 2002, 2009, 2017, 2033 ms |
+///
+/// On a 4 vCPU runner at one drill per core the peak routinely reaches **79%
+/// of this deadline** and has crossed it four times. What moves is not queue
+/// depth -- `inflight` is 256 in both arms, identically -- but per-write
+/// service time, ~11x, while the engine reports itself healthy throughout. So
+/// the headroom is a factor of about 1.5 on a contended box, not the three
+/// orders of magnitude this comment used to imply.
+///
+/// The VALUE is deliberately unchanged. Raising it to stop a drill going red
+/// would convert a measurement into a silence, and lowering it would refuse
+/// writes a client can still use. What the number should be is a policy
+/// question -- it is the promise made to a client -- and it now has data
+/// underneath it instead of an estimate.
+///
+/// The 8931 ms a client waited on soak run 24, while a re-seed held the write
+/// path, remains the other end of the range and is unaffected by any of this.
 static WRITE_DEADLINE_MS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(DEFAULT_WRITE_DEADLINE_MS);
 const DEFAULT_WRITE_DEADLINE_MS: u64 = 2_000;
