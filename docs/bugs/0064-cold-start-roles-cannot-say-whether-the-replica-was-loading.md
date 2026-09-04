@@ -857,3 +857,39 @@ never exercised the wait at all.
 
 Offered, not applied: these four drills are this repo's, and the shape may or
 may not fit them.
+
+### Audited for more of the same, and there are none
+
+The rc.68 release gate died on `decommission` asserting `verify` green one
+attempt after restarting a downed member — waiting on liveness, asserting
+streaming. Since that is the fifth instance of this family, the obvious question
+is how many more exist.
+
+**Method.** Every `verify` call in every drill, checked for a topology-changing
+`flintctl` command (`start`, `restart`, `expand`, `add-replica`, `swap-node`,
+`roll-node`, `decommission-node`, `upgrade`, `promote`) within the ten lines
+above it, and for a bounded retry within six lines around it. 18 drills call
+`verify`; most without a retry, which is correct — a `verify` that fails from a
+settled cluster SHOULD fail, and adding retries everywhere would mask exactly
+the failures these drills exist to catch.
+
+**Result: two hits, both false positives, both in `decommission` itself.** The
+topology command near them is the negative control at line 203 — a
+`decommission-node` that must be REFUSED — so nothing changed, and by that point
+the cluster has already settled through the retry added at line 161.
+
+**No further instances.** The race that reddened the release was the only one of
+its shape.
+
+### Why no gate check for it
+
+The scan cannot distinguish a topology command that RAN from one asserted to be
+refused, which is precisely the two false positives above. Shipping it would
+need an exclusion list, and BUG-0086 already recorded what that costs: "a list
+saying these are fine is a second declaration to keep in sync with use." The
+same reasoning that stopped a port check shipping there stops this one here.
+
+What is checkable, and already checked, is the narrower thing: a drill that
+waits on `nodes_live` and then asserts `verify`. That pattern appears in exactly
+one drill and it is now fixed.
+
