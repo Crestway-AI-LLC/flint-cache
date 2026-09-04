@@ -458,15 +458,28 @@ _fleet_ours() {
 # environment instead of a bug in the harness.
 fleet_why_not_up() {
   local d="${FLEET_SCOPE:-}" f n=0
+  # BOTH LEVELS. `flintctl` writes seat logs to `<statedir>/logs/<name>.log`
+  # (crates/flint-ctl/src/main.rs:1438), and for the 11 drills whose
+  # FLEET_SCOPE *is* the inventory statedir that is one directory below the
+  # top-level glob this used to do alone. Scanning only the top level found
+  # nothing and then announced the reason was discarded -- while flintctl's
+  # log sat in `logs/`. "Cannot look" reported as "absent", inside the
+  # function written to stop exactly that.
   if [ -n "$d" ] && [ -d "$d" ]; then
-    for f in "$d"/*.log; do
+    for f in "$d"/*.log "$d"/logs/*.log; do
       [ -f "$f" ] && [ -s "$f" ] || continue
       n=$((n + 1))
       echo "  --- $f (last 15 lines) ---"
       tail -n 15 "$f" | sed 's/^/  /'
     done
   fi
-  [ "$n" = 0 ] && echo "  (no captured output to read -- this drill's spawn sent stderr to /dev/null, so the reason is gone, not absent)"
+  # AND DO NOT ASSERT THE CAUSE. This said the spawn "sent stderr to
+  # /dev/null", which is one explanation among several -- the scope may not be
+  # a directory at all, the seat may have died before writing, or the logs may
+  # live somewhere this does not know about (29 drills set FLEET_SCOPE to
+  # something other than their statedir). Name where it looked and let the
+  # reader draw the conclusion.
+  [ "$n" = 0 ] && echo "  (nothing readable in ${d:-<no FLEET_SCOPE>} or its logs/ -- the reason may have been discarded at the spawn, or written somewhere this did not look)"
   return 0
 }
 
