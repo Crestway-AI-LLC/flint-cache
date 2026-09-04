@@ -226,3 +226,31 @@ The instrument is doing what it was built for: four days of argument at n=0, a
 wrong conclusion at n=3, a correction at n=7, all from runs that were happening
 anyway.
 
+## 2026-09-04 — a second drill, and it is the same term
+
+`restart` refused a write on a **docs-only** commit (`36435a8`, one bug file,
+36 insertions), so nothing in the change could have caused it:
+
+    THROTTLED write would wait ~2011ms (inflight 30 x service 67038us)
+
+**Queue depth 30** — an eighth of `failover`'s 256 — and **67 ms per write**,
+seven to twenty times the worst `failover` service figure. The deadline is
+crossed here almost entirely by service time, with a queue so shallow it could
+not plausibly be blamed.
+
+That matters for two reasons.
+
+**It generalises the finding beyond one drill.** The `inflight` constant of 256
+in `failover` is that drill's pipeline depth, so a sceptical reading of the
+matched-arm result is that the whole effect is an artefact of one workload.
+`restart` has a different shape, a different depth, and lands on the same term.
+
+**And it came for free.** The terms live in the SERVER's refusal message, not in
+`failover_drill.sh`, so every drill that crosses the deadline reports them
+without being instrumented. The drill-side peak line covers `failover`; the
+refusal covers all of them.
+
+**Still not a distribution.** Two drills, three refusal samples between them.
+What it rules out is "this is a `failover` artefact"; what it does not do is
+bound how often 67 ms writes happen.
+
