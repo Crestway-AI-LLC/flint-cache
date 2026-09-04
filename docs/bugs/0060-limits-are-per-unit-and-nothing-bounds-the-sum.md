@@ -702,3 +702,59 @@ hardware, and the point is that the guard was backwards rather than absent.
 collection read is O(collection) per in-flight command with `max-conns` of them
 permitted. That is this bug's title and it is a design change, not a field.
 
+## 2026-09-04 — CORRECTION: collections ARE capped, and the grep that missed it
+
+Pass 1 states: *"Nothing caps collection cardinality. Grepped for
+`MAX_MEMBERS`, `MAX_FIELDS`, `MAX_CARDINALITY` and the lowercase forms across
+the workspace: no such limit exists. A tenant may build a hash of arbitrary size
+with ordinary `HSET` calls and then ask for all of it."*
+
+**The conclusion is wrong and the grep is why.** The cap exists, is enforced, and
+is measured in BYTES rather than elements, so none of those three names could
+find it: `DEFAULT_MAX_VALUE_BYTES`, **512 MB**, configurable by
+`--max-value-bytes` and applied by **all five** collection types — hashes, sets,
+zsets, lists and bloom.
+
+Worse for the original reading, its rationale is already written down at
+`flint-storage/src/lib.rs:50` and is this bug's own argument:
+
+> On a beyond-RAM engine the cap matters more than in Valkey: a collection can
+> exceed physical memory, at which point any read-all command (HGETALL,
+> SMEMBERS, LRANGE 0 -1) is an OOM, so writes past the cap are rejected instead.
+
+So "a tenant may build a hash of arbitrary size" is false at the default: the
+write is refused with `ValueTooLarge` once the collection would pass 512 MB.
+Searching for the name a limit *would* have, rather than for the quantity it
+bounds, is what cost this — the same shape as BUG-0086's port scan.
+
+### What survives, and it is this bug's actual title
+
+The **aggregate** is still unbounded, and the numbers to size it are now all in
+the tree:
+
+| quantity | value | source |
+|---|---|---|
+| per-collection cap | **512 MB** | `DEFAULT_MAX_VALUE_BYTES` |
+| peak RSS per in-flight read | **2.72x** the collection | this file, pass 7: 205 MB hash -> +557 MB |
+| so one max-size read costs | **~1.4 GB** | 512 MB x 2.72 |
+| concurrent reads permitted | **2048** | `max-conns` |
+
+**Five concurrent max-size collection reads is ~7 GB.** That is the defect, and
+it is a much narrower and more defensible statement than "nothing caps
+collections": each unit is bounded, nothing bounds their sum, and the sum
+reaches physical memory at single-digit concurrency.
+
+### What that changes about the fix
+
+A cardinality cap must NOT be built — it would duplicate `max_value_bytes` under
+a second name, which is precisely the "second declaration to keep in sync"
+BUG-0086 warns about.
+
+What is missing is admission against a node-level budget, and the two pieces it
+needs now both exist: **`ComplexMeta` already carries `bytes`**, so a
+collection's size is known from one cheap metadata read *before* anything is
+materialised, and **`mem_total_bytes`/`mem_avail_bytes` are now in FLINTINFO**
+(2026-09-04), so the budget can be a fraction of real memory rather than a
+constant. The decision to make is the policy — what fraction, and whether an
+over-budget read is refused or queued — not the mechanism.
+
