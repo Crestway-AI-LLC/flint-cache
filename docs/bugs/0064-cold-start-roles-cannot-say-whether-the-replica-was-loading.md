@@ -766,3 +766,45 @@ being 3293 rather than some other large number — only on it being an order of
 magnitude above 298 with inflight unchanged, which all three P=4 samples agree
 on.
 
+### The during-load sampler was added, measured, and removed
+
+It was added to close the caveat above — a backpressure maximum taken across the
+load window cannot have drained by the time it is read. It does not work, for a
+reason the arithmetic gives directly.
+
+**It yields one sample.** At 256 in flight and ~6ms service the seat sustains
+~41 000 writes/s, so a 20 000-key load lasts about **half a second**. A 200ms
+poller sees one or two ticks of it. The 200ms interval had been chosen against
+an assumed multi-second load; the load is not multi-second.
+
+**And tightening it costs the metric under study.** Each sample is a FLINTINFO,
+which queries RocksDB properties. The two runs carrying the sampler report
+service **6353us and 6149us**; the three without it report **3282, 3293 and
+4362us**. On the PEAK there is no visible effect at all — the sampler runs are
+412ms and 1574ms, the lowest and the highest of the five — so this is n=2 and
+not a demonstrated bias. But it is a plausible bias in the exact number the
+investigation turns on, bought for one sample.
+
+Removed. **The after-load caveat therefore stands**, and closing it needs
+in-process sampling on the server rather than an external poller: at half a
+second of wall clock there is no external polling rate that is both frequent
+enough to characterise the window and cheap enough not to enter the result.
+
+### What running the gate serially would actually cost
+
+Since the finding points at the runner, the obvious response is to lower
+`FLINT_GATE_JOBS`. Measured, rather than assumed:
+
+| | wall clock |
+|---|---|
+| P=4 push gates (n=5) | 11m32s, 11m41s, 11m46s, 11m48s, 12m22s — median **11m46s** |
+| P=1 dispatches (n=4) | 32m36s, 33m02s, 33m31s, 33m36s — median **33m17s** |
+
+**2.8x slower**, about 21 minutes added per gate. That is the price of the
+serial arm, and it is not obviously worth paying for a ~14% flake rate on a
+suite whose failures are now largely diagnosable. An intermediate P (2 or 3) is
+untested and would cost two more dispatch batches to characterise.
+
+This is a decision about how much gate latency the project will spend to buy
+determinism, which is not a decision this file should make on its own.
+

@@ -52,27 +52,6 @@ sleep 0.6
 # diagnostic must never abort the run it is diagnosing.
 FS0=$(valkey-cli -p "$MPORT" FLINTINFO 2>/dev/null | tr -d '\r' | sed -n 's/^wal_fsync_total://p' || true)
 
-# SAMPLE THE ENGINE DURING THE LOAD, NOT AFTER IT.
-#
-# The backpressure read below happens once the load is over, and debt can drain
-# in between -- so a quiet reading there was only ever suggestive, which was
-# recorded in docs/bugs/0064 before the first result rather than after it. A
-# poller running THROUGH the load closes that: a maximum taken across the whole
-# window cannot have drained by the time it is read.
-#
-# 200ms, not tighter. Each sample is a FLINTINFO, which queries RocksDB
-# properties, so polling the seat under measurement perturbs the thing being
-# measured. At ~10 samples against 20000 writes that is negligible; at 10ms it
-# would not be, and the observer would become part of the result.
-BPF="$MDIR.bp"; : > "$BPF"; BPSTOP="$MDIR.bpstop"; rm -f "$BPSTOP"
-( while [ ! -f "$BPSTOP" ]; do
-    valkey-cli -p "$MPORT" FLINTINFO 2>/dev/null | tr -d '\r' \
-      | sed -n -e 's/^write_stopped:/S /p' -e 's/^delayed_write_rate:/R /p' \
-               -e 's/^l0_files:/L /p' -e 's/^pending_compaction_bytes:/P /p' >> "$BPF" 2>/dev/null || true
-    sleep 0.2
-  done ) &
-BP_PID=$!
-
 echo "== loading $KEYS keys"
 awk -v n="$KEYS" 'BEGIN {
   for (i = 0; i < n; i++) {
@@ -80,18 +59,6 @@ awk -v n="$KEYS" 'BEGIN {
     printf "*3\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n", length(k), k, length(v), v
   }
 }' | valkey-cli -p "$MPORT" --pipe | tail -1
-
-touch "$BPSTOP"; wait "$BP_PID" 2>/dev/null || true
-# Maxima across the load window. The SAMPLE COUNT is printed because zero
-# samples and zero backpressure are different facts, and only one of them is a
-# measurement.
-bpmax() { awk -v k="$1" '$1 == k && $2 + 0 > m { m = $2 + 0 } END { print m + 0 }' "$BPF" 2>/dev/null; }
-BPN=$(grep -c '^S ' "$BPF" 2>/dev/null || echo 0)
-if [ "${BPN:-0}" -gt 0 ]; then
-  echo "== engine backpressure DURING the load ($BPN samples, max): write_stopped=$(bpmax S) delayed_write_rate=$(bpmax R) l0_files=$(bpmax L) pending_compaction_bytes=$(bpmax P)"
-else
-  echo "== engine backpressure DURING the load: UNSAMPLED (0 samples) -- not the same as quiet"
-fi
 
 # BUG-0088: say how close that load came to the write deadline, on a PASS as
 # well as on a failure. The `errors:` line above reports only whether a write
