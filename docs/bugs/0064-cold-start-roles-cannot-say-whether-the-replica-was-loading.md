@@ -705,3 +705,64 @@ conclusive and a QUIET one is only suggestive — the fork is not symmetric and 
 quiet P=4 result will need the reading moved next to the peak before it can
 carry the second conclusion.
 
+## 2026-09-03 — MATCHED ARMS at one commit: the engine is not the bottleneck
+
+Four `gate_jobs=1` dispatches at `afb4eb1`, against that same commit's own P=4
+push run. Same code, same workflow, same runner class — the earlier comparison
+spanned commits and this one does not.
+
+| | P=1 (n=4) | P=4 (n=1, same commit) |
+|---|---|---|
+| peak | 65, 88, 73, 79 ms | **843 ms** |
+| **inflight** | **256, 256, 256, 256** | **256** |
+| service_us | 255, 346, 287, 309 | **3293** |
+| write_stopped | 0, 0, 0, 0 | 0 |
+| delayed_write_rate | 0, 0, 0, 0 | 0 |
+| l0_files | 1, 1, 1, 1 | 1 |
+| pending_compaction_bytes | 0, 0, 0, 0 | 0 |
+| fsyncs during load | 0, 0, 0, 0 | 0 |
+
+**Inflight is identical — 256 in every run of both arms.** Not "similar":
+identical. Queue depth is definitively not the mechanism, which retires the
+whole class of admission-side and offered-load explanations.
+
+**Per-write service time is ~11x higher** (median 298us serial against 3293us),
+and it is the only column that moves.
+
+**Every engine-visible signal is byte-identical between the arms.** RocksDB is
+not stopping writes, not delaying them, holds one L0 file, carries no compaction
+debt, and syncs nothing. It reports itself perfectly healthy in both arms while
+taking eleven times longer per write in one of them.
+
+Corroborated by the two refusals from the previous commit, which sampled the
+same fields at the moment of failure rather than at a peak: inflight 244 and
+218 — inside the serial range — with service 8206us and 9216us.
+
+### So the time is going where the engine cannot see it
+
+Not queueing, not admission, not compaction, not fsync, not memory (13.8+ GiB
+free throughout). What remains is beneath or beside Flint: the OS descheduling
+the process, or contention below the filesystem, on a 4 vCPU shared runner
+asked to run four seat-heavy drills at once.
+
+**That makes the gate's flakiness a property of the runner shape rather than a
+Flint defect** — which is worth stating plainly because three investigations
+have now looked for a Flint defect and this file spent an evening triaging
+drills one at a time on that assumption.
+
+### The caveat that was registered in advance, honoured
+
+The backpressure figures above are read AFTER the load, and debt can drain in
+between — recorded in this file before the first result, not after. So a quiet
+reading is strong here and not yet conclusive, on that axis alone. The
+during-load sampler landed in `59a1c58`, *after* these runs, and takes a maximum
+across the whole load window; the next P=4 run carries it, and a quiet maximum
+there closes the last gap.
+
+**Also thin:** the matched P=4 arm is a single run. The P=1 arm is four. The
+peak distribution has n=9 on the P=4 side but the TERMS have n=1 at this commit
+plus the two refusal samples above. Nothing here rests on the P=4 service figure
+being 3293 rather than some other large number — only on it being an order of
+magnitude above 298 with inflight unchanged, which all three P=4 samples agree
+on.
+
