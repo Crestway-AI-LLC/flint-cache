@@ -597,3 +597,51 @@ data. Three tests cover it, including that a larger peak with minimal terms
 still beats a smaller peak with maximal ones, which is the property the layout
 exists for.
 
+### The prediction held: service time moved, queue depth did not
+
+First CI run carrying the terms (`9620d72`, P=4). Both refusals:
+
+    THROTTLED write would wait ~2002ms (inflight 244 x service 8206us)
+    THROTTLED write would wait ~2009ms (inflight 218 x service 9216us)
+
+Laptop, serial, two runs: `inflight 256 x service 97us` and
+`inflight 65 x service 885us`.
+
+**Inflight did not inflate.** 218 and 244 sit inside the serial range of 65-256
+— if anything lower than the higher serial sample. **Service time did**:
+8206 and 9216us against a serial 97-885us.
+
+Stated with the right precision: the multiple depends on which serial sample you
+compare against, so it is "an order of magnitude or more per write", not a
+figure to two significant digits — n=2 on the serial side. The qualitative
+result is what matters and it is unambiguous: **the term that moves under
+parallelism is per-write service time, not queue depth.**
+
+So the seat is **starved, not over-offered**. Four drills do not make the client
+push harder; they make each write take far longer to serve. That excludes
+queueing and admission-side explanations and points at disk or scheduler
+contention. It does not yet separate those two.
+
+**Gap worth naming:** the four P=1 runs predate the terms instrument, so there
+is no serial CI sample — only a laptop one, on different hardware. A P=1
+dispatch now would produce the matched arm and is four runs.
+
+### The instrument aborted the run it was diagnosing, and that was my defect
+
+The peak line never printed on that run: the log stops after
+`errors: 2, replies: 20000`, with no FAIL and no diagnosis.
+
+`failover_drill.sh` runs under `set -euo pipefail`, and the added line was
+`INFO=$(valkey-cli ... | tr -d '\r')`. The master was refusing writes and had
+just lost its replication link, so FLINTINFO returned non-zero, `pipefail`
+carried it through the substitution, and `set -e` exited the script mid-run —
+**silently**. A diagnostic that can abort the run it is diagnosing is worse than
+no diagnostic, and it is precisely the class this file has spent the day
+removing. The two other drills edited today (`decommission`, `roll_shed`) use
+`set -u` only and were checked rather than assumed.
+
+Fixed with `|| true` and three outcomes, since two of them are different faults:
+the seat not answering is transient and now reports UNREADABLE and **continues**
+to the real assertions, while INFO answering *without* the fields is the build
+having lost the instrument and still fails. Both branches mutation-tested.
+

@@ -63,7 +63,16 @@ awk -v n="$KEYS" 'BEGIN {
 # deadline, and nothing in any green run could say whether a passing load sits
 # at 200ms or at 1999ms. Those are very different bugs. One line turns every
 # future gate run into a point on that distribution.
-INFO=$(valkey-cli -p "$MPORT" FLINTINFO 2>/dev/null | tr -d '\r')
+# `|| true` IS LOad-BEARING under `set -euo pipefail`.
+#
+# Without it this line killed the drill SILENTLY. On 2026-09-03 the master was
+# refusing writes and had just lost its replication link; FLINTINFO returned
+# non-zero, pipefail propagated it through the substitution, and `set -e` exited
+# the script mid-run -- no FAIL line, no diagnosis, the log simply stopping after
+# `errors: 2, replies: 20000`. A diagnostic line that can abort the run it is
+# diagnosing is worse than no diagnostic at all, and it is the exact class of
+# defect this drill was edited to remove.
+INFO=$(valkey-cli -p "$MPORT" FLINTINFO 2>/dev/null | tr -d '\r' || true)
 PEAK=$(printf '%s\n' "$INFO" | sed -n 's/^write_wait_peak_ms://p')
 DLINE=$(printf '%s\n' "$INFO" | sed -n 's/^write_deadline_ms://p')
 # The two TERMS at the moment of the peak, not just their product. est_ms is
@@ -77,13 +86,27 @@ PKS=$(printf '%s\n' "$INFO" | sed -n 's/^write_wait_peak_service_us://p')
 # is the same "cannot look is not absent" this suite fails builds over, and a
 # drill that silently stopped reporting the margin would look exactly like a
 # drill reporting a wide one.
-if [ -z "$PEAK" ] || [ -z "$DLINE" ]; then
-  echo "FAIL: FLINTINFO carries no write_wait_peak_ms/write_deadline_ms."
-  echo "      The margin this drill exists to surface cannot be read, which is"
-  echo "      not the same as the margin being wide (docs/bugs/0088)."
+# THREE OUTCOMES, because two of them are not the same fault.
+#
+#   * the seat did not answer at all  -> transient, and this line is a
+#     DIAGNOSTIC, not an assertion about the product. Say so and carry on; the
+#     drill's real assertions are below and will catch anything that matters.
+#     Failing here would mask them with a symptom of the same trouble.
+#   * it answered but the fields are gone -> the build lost the instrument.
+#     That IS a regression and must stop the run, or the margin silently
+#     stops being reported and every later run reads as clean.
+#   * it answered with the fields -> report them.
+if [ -z "$INFO" ]; then
+  echo "== write-wait peak UNREADABLE: the master did not answer FLINTINFO"
+  echo "   (a diagnostic, not an assertion -- continuing to the real checks)"
+elif [ -z "$PEAK" ] || [ -z "$DLINE" ]; then
+  echo "FAIL: FLINTINFO answered but carries no write_wait_peak_ms/write_deadline_ms."
+  echo "      The build has lost the instrument, which is not the same as the"
+  echo "      margin being wide (docs/bugs/0088)."
   exit 1
+else
+  echo "== write-wait peak ${PEAK}ms of ${DLINE}ms deadline (inflight ${PKI:-UNREADABLE} x service ${PKS:-UNREADABLE}us; 0 = no write projected a measurable wait)"
 fi
-echo "== write-wait peak ${PEAK}ms of ${DLINE}ms deadline (inflight ${PKI:-UNREADABLE} x service ${PKS:-UNREADABLE}us; 0 = no write projected a measurable wait)"
 
 echo "== waiting for replica catch-up"
 LAST="key:$(printf '%07d' $((KEYS - 1)))"
