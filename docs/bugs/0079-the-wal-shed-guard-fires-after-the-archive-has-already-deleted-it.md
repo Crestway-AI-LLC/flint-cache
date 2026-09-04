@@ -252,3 +252,46 @@ seat would match and the check would agree with the defect it exists to catch.
   problem than its WAL budget — it would put data on the root volume. The
   create-then-measure fix makes the budget consistent with wherever the data
   lands; it does not make the mount ordering correct.
+
+## 2026-09-04 — what the archive holds, expressed in TIME
+
+This file records the two terms and which one prunes. It does not say what they
+are worth, and the answer is short enough to matter.
+
+**One figure here is stale.** The table above gives `DEFAULT_WAL_TTL_SECONDS` as
+6 h; `rocks.rs:346` now reads **43 200 s (12 h)**, with the comment
+`// 12 h, was 6 h, was 1 h`. The byte limit is unchanged at 8 GiB.
+
+**The TTL binds only below 0.20 MB/s.** Above that trickle the byte limit is the
+only term that ever fires, so the 12 h is not a retention window in any
+practical sense — it is the floor for an idle seat.
+
+What the 8 GiB is worth, against write rates measured elsewhere in this tree:
+
+| logical write rate | source | archive holds |
+|---|---|---|
+| 38.3 MB/s | run-4 fleet, ~2.3 GB/min through one edge | **3m 44s** |
+| 34.2 MB/s | BUG-0013, 96 GB seat, untuned | 4m 11s |
+| 89.2 MB/s | BUG-0013, 96 GB seat, tuned pairing | 1m 36s |
+| 142.2 MB/s | ADR-0026, measured logical rate | **1m 00s** |
+
+**Optimistic in the safe direction.** These divide the byte budget by the
+LOGICAL rate; a WAL record carries key, value and framing, so actual archive
+bytes are at least the logical bytes and the true window is at most what is
+shown.
+
+### Why this is worth stating plainly
+
+A reader who sees `DEFAULT_WAL_TTL_SECONDS = 12 h` will size replica-absence
+tolerance in hours. Under load it is **about a minute**. That is not an argument
+that the default is wrong — a replica absent for a minute at 142 MB/s has missed
+8 GB and a full sync may well be the right answer — but it is the number nobody
+had, and both this bug and BUG-0082 are cases of a rejoining cursor the archive
+could not serve.
+
+It also settles a roadmap question. The Phase 1 gate condition "the lag cap
+provably holds the WAL window" links a bound in MILLISECONDS to a window in
+BYTES; the table above is the exchange rate between them, and it is
+rate-dependent, so no fixed lag cap implies archive sufficiency at every
+throughput.
+
