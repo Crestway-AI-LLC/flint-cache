@@ -735,11 +735,11 @@ the tree:
 | quantity | value | source |
 |---|---|---|
 | per-collection cap | **512 MiB** | `DEFAULT_MAX_VALUE_BYTES` = `512 * 1024 * 1024` |
-| peak RSS per in-flight read | **3.19x** the collection | measured 2026-09-04 (later); see the settlement section |
-| so one max-size read costs | **~1.7 GB** | 512 MiB x 3.19, and measured directly at the cap |
+| peak RSS per in-flight read | **3.03x** the collection | measured at the cap on Linux x86_64, 2026-09-04; 3.19x on macOS |
+| so one max-size read costs | **~1.6 GB** | measured directly at the cap, not extrapolated |
 | concurrent reads permitted | **2048** | `max-conns` |
 
-**Five concurrent max-size collection reads is ~8.5 GB.** That is the defect, and
+**Five concurrent max-size collection reads is ~8.1 GB.** That is the defect, and
 it is a much narrower and more defensible statement than "nothing caps
 collections": each unit is bounded, nothing bounds their sum, and the sum
 reaches physical memory at single-digit concurrency.
@@ -916,16 +916,80 @@ margin covers the instrument, not just the variance. One max-size read is then
 budgeted at ~1.9 GB.
 
 Corrections this run forces on the rest of this file: the summary table's 2.72x
-becomes 3.19x, five concurrent max-size reads is **~8.5 GB** rather than ~7 GB,
+becomes 3.03x on the platform that ships, five concurrent max-size reads is
+**~8.1 GB** rather than ~7 GB,
 and my note to Jeff that the unresolved discrepancy was "costing 23% of the
 admission budget to conservatism" had the sign backwards — 2.72x was not
 conservative, it was optimistic by 16%, and the 2.21x alternative by 45%.
 
-### What is still not measured
+### Measured on Linux, which is what ships — and it reads LOWER
 
-The cap x small-field corner was measured on a machine already under memory
-pressure, so 3.179 is a floor with less headroom above it than the other
-figures. On a quiet machine it may read higher. Nothing here was measured on
-Linux, where there is no compressor and RSS should be faithful; the numbers are
-expected to be equal or higher there, and that is the check worth running before
-the multiplier is written into code.
+Run on the gate box (c7i.4xlarge, AL2023 x86_64, nothing else on it) with
+`tools/collection_read_peak.py`, the harness this investigation produced.
+**Zero swap-out on all 21 trials**, so unlike every macOS figure above these are
+measurements rather than floors — the instrument had nothing to hide behind.
+
+| shape | macOS (16 KiB pages) | Linux x86_64 (4 KiB pages) |
+|---|---|---|
+| 500 x 100 KB | 2.191 | 1.957 |
+| 1000 x 100 KB | 2.586 | 2.346 |
+| 2000 x 100 KB | 2.958 | 2.648 |
+| 4000 x 100 KB | 3.135 | 2.844 |
+| 5368 x 100 KB (at the cap) | 3.162 | 2.857 |
+| 53,644 x 10 KB (at the cap) | 3.179 | 2.890 |
+| 532,610 x 1 KB (at the cap) | 3.146 | **3.025** |
+
+**The shape reproduces and the magnitude does not.** k climbs with collection
+size and again with field count, and saturates — on both platforms, with the
+same ordering. But every Linux figure is 5-10% below its macOS counterpart, and
+**that is the opposite of what this file predicted.** The prediction was that
+Linux would read equal or higher, on the reasoning that macOS numbers are floors.
+The reasoning was sound and the conclusion still wrong, because it assumed the
+only difference was the instrument. The likelier cause is the page size: macOS
+rounds every allocation up to 16 KiB pages against Linux's 4 KiB, so the same
+allocations waste more, and the per-field overhead that drives the count term is
+larger there. A platform difference in the *quantity*, not in the measurement.
+
+Two caveats that both point the same way and neither changes the answer:
+
+- **The Linux run batched its writes** (variadic `HSET`, ~1 MB of arguments per
+  call) because 532,610 single-field writes through `valkey-cli` is hours, not
+  minutes. Batching measured ~4% LOW against unbatched on macOS at 500 fields
+  (2.11 vs 2.19), presumably a different SST layout under the read. So the Linux
+  figures are, if anything, slightly under.
+- The macOS cap x small-field corner ran under compression and stays a floor.
+
+### What to use for the policy
+
+**3.5x against `ComplexMeta.bytes`, unchanged by the Linux run.** It clears the
+Linux maximum of 3.025 by 16%, clears the macOS maximum of 3.189 by 10%, and
+both platforms' curves are approached from below. Production is Linux x86_64, so
+3.025 is the figure that governs and 3.5x is a real margin over it rather than a
+rounding. One max-size read is then budgeted at ~1.9 GB.
+
+### The remaining design gap: a sample does not bound a sum
+
+Worth stating before the policy is built, because it is this bug's actual title.
+Admission that samples `mem_avail_bytes` per read is nearly right — a read that
+has already allocated is visible in the next sample — but reads admitted
+CONCURRENTLY inside one sampling window all see the same headroom and all pass.
+At `max-conns` = 2048 that race is not theoretical.
+
+Bounding the sum needs an in-flight RESERVATION, not just a sample: add the
+estimate on admission, subtract it when the reply has been written, refuse when
+`in_flight + estimate` exceeds the budget. Note the release point is after the
+reply is ENCODED, not after the collection is materialised — the reply buffer is
+the second dataset-sized copy and is a live part of the peak this file measures.
+That places the reservation in the server, around the whole command, with the
+store exposing the collection's size cheaply; it does not fit inside
+`hgetall`/`smembers`/`all_ordered`, which cannot see the reply's lifetime.
+
+### Still to decide, and both are Jeff's
+
+1. **The budget fraction** of `mem_avail_bytes`. ~25% was proposed and is not
+   ratified.
+2. **Refuse or queue** an over-budget read.
+
+Precedent argues the mechanism should ship opt-in with refusal OFF by default,
+the way eviction did on 2026-08-26 — a new refusal path that changes behaviour
+for existing workloads is not something to switch on by inference.
