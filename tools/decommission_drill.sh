@@ -156,9 +156,31 @@ grep -q 'SINGLE-COPY' $FLINT_DRILL_ROOT/decom-sc.log \
   || { echo "FAIL: verify went red for some other reason"; cat $FLINT_DRILL_ROOT/decom-sc.log; exit 1; }
 echo "  red: '$(grep -o 'SINGLE-COPY.*' $FLINT_DRILL_ROOT/decom-sc.log | head -1)'"
 ./target/release/flintctl -f "$INV" start >/dev/null 2>&1
-for i in $(seq 1 40); do [ "$(nodes_live)" -eq 2 ] && break; sleep 0.5; done
-./target/release/flintctl -f "$INV" verify >$FLINT_DRILL_ROOT/decom-sc2.log 2>&1 \
-  || { echo "FAIL: verify still red after the member came back"; cat $FLINT_DRILL_ROOT/decom-sc2.log; exit 1; }
+# WAIT FOR WHAT VERIFY ASSERTS, NOT FOR A PROXY OF IT.
+#
+# This waited on `nodes_live -eq 2` and then asserted `verify` green in one
+# attempt. Those are different conditions: nodes_live counts seats REPORTING
+# master|replica, and a seat that is up but still `loading` counts there while
+# verify correctly calls the pair SINGLE-COPY -- "every member up, but 0 of 1
+# streaming". Liveness is reached first, so the assertion could run in the
+# window between the member returning and its replication resuming.
+#
+# It reddened the v0.1.0-rc.68 RELEASE gate. The lines predate this drill's
+# other fixes by three weeks; the race was always there and needed a slow
+# enough runner to be seen.
+#
+# Retrying `verify` itself is the right wait because verify IS the assertion --
+# no separate readiness signal to drift out of agreement with it. Still
+# bounded, and still a failure if the pair never recovers.
+VOK=0
+for _ in $(seq 1 60); do
+  if ./target/release/flintctl -f "$INV" verify >$FLINT_DRILL_ROOT/decom-sc2.log 2>&1; then
+    VOK=1; break
+  fi
+  sleep 0.5
+done
+[ "$VOK" = 1 ] \
+  || { echo "FAIL: verify still red 30s after the member came back"; cat $FLINT_DRILL_ROOT/decom-sc2.log; exit 1; }
 echo "  green again once the member is back — the check discriminates"
 
 echo "== GUARD: decommission the LIVE MASTER ($M1) must be refused"
