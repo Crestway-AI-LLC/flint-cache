@@ -106,6 +106,34 @@ BUG-0014 recorded why these go unread: a run that is re-run green reports as
 re-run — they were simply never opened.** That is a second way for a firing to
 go unexamined, and it needs no re-run to happen.
 
+### Re-measured 2026-09-04, while gating rc.69: 15% -> 9.1%
+
+Last 60 runs of `gate.yml` on `main`: 50 success, 5 failure, 5 still running.
+**5 of 55 completed, 9.1%**, against the 9 of 60 above.
+
+| run | drill | date |
+|---|---|---|
+| `33899834240` | `restart` | 2026-09-04 |
+| `33829746490` | `failover` | 2026-09-04 |
+| `33811064219` | `decommission` | 2026-09-03 |
+| `33800799780` | `failover` | 2026-09-03 |
+| `33794379802` | `tenant_rebalance` | 2026-09-03 |
+
+The two families that dominated the old table are **absent from this window**:
+`promote_notice` (4 of the old 9, and `afbed3d` is why) and `cold_start_roles`
+(2 of the old 9 — this bug, and the reason its diagnostic half stays open is
+that it has not fired again to be read). `decommission` is fixed since, by
+`f9c194d`.
+
+**`failover` is now the largest single source, and it has no file of its own.**
+Two firings in two days. Recorded rather than filed, because a bug file for a
+flake nobody has opened would repeat the mistake this section is about — but if
+it fires a third time it has earned one.
+
+The rate is worth carrying for a second reason: at 9% a release-branch gate is
+a one-in-eleven coin flip on something unrelated to what is being released, and
+rc.68 lost that flip.
+
 ## Measured 2026-08-27: the promote_notice fix held
 
 Four of the nine red runs were `promote_notice`. Anchored on `afbed3d` — the
