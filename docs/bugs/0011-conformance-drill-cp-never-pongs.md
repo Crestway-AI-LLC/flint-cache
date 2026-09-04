@@ -410,3 +410,49 @@ Mutation-tested four ways — a dropped binary, the const renamed, `fleet_init`
 renamed, and the warm call deleted — because a check that cannot fail proves
 nothing.
 
+## 2026-09-04 — the mitigation is proven directly, which the clean rate could not do
+
+The open question here has been "does the warm move the local clean rate off
+6-of-20", and three attempts failed at it: twelve `fleet_guard` refusals, a
+bash-3.2 `declare -A` aliasing bug that gave both arms one counter, and a
+control arm that never failed so there was nothing for the mitigation to
+prevent. **All three failed the same way** — they were statistical tests of a
+rare event, and the event would not come.
+
+**The mitigation's claim is not statistical.** It is that after `fleet_init`
+warms a binary, the exec a seat then performs is a REPEAT rather than a first.
+That is directly testable and deterministic.
+
+Eight interleaved trials, each on a fresh copy so validation starts cold in both
+arms, page cache warmed either way, timing the exec a seat would pay for:
+
+| arm | n | median | max |
+|---|---|---|---|
+| unwarmed | 8 | **241.0 ms** | **1087.9 ms** |
+| warmed | 8 | **11.0 ms** | 11.7 ms |
+
+**Every warmed exec beat every unwarmed one.** A 22x reduction at the median,
+and the unwarmed arm reaches **1.09 s for a single exec** — with seven binaries
+warmed per `fleet_init` and a 10 s seat budget, that is how the budget was being
+consumed.
+
+So the mitigation does what its header claims, on the platform where the cost
+exists. That is a stronger statement than a clean rate: it identifies the
+mechanism as removed rather than observing that a symptom got rarer.
+
+**What this does NOT establish.** It does not measure the clean rate, and does
+not show 6-of-20 becoming 20-of-20 — a drill can fail for reasons that have
+nothing to do with loader validation, and several today did. The claim is
+narrow: the first-exec cost is no longer paid inside a seat's startup budget.
+
+**And it cannot become a gate check.** The validation is macOS's; Linux has no
+dyld and no AMFI, so on the machine the gate runs this measurement is vacuous —
+both arms would read the same. A check that cannot fail is the thing this
+repository fails builds over, so none is added. The measurement is recorded here
+instead, reproducible with `python3` and a copy of any built binary.
+
+**Suggested status change, left as a call rather than taken:** the clean-rate
+question is superseded, not answered. If that is accepted this becomes MITIGATED
+with the mechanism measured, rather than OPEN pending a rate nobody has been
+able to collect in three attempts.
+
