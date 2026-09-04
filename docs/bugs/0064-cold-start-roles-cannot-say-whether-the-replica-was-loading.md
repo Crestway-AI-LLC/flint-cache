@@ -146,6 +146,7 @@ Triaged, all six:
 | `33667073809` | 09-02 18:25 | `failover` | docs only |
 | `33660742234` | 09-02 17:23 | `tenant_quota`, `client_compat`, `proxy_registry` | a bug file + a test |
 | `33658796083` | 09-02 17:04 | `decommission`, `ctl_cpha`, `pipeline_nodelay` | a drill fix |
+| `33888567605` | 09-04 15:17 | `decommission` | **the v0.1.0-rc.68 RELEASE gate** — and the same sha was green on `main` hours earlier |
 
 **Eleven distinct drills across six runs**, with only `failover` and
 `roll_shed` appearing twice. Nothing is failing consistently.
@@ -808,3 +809,51 @@ untested and would cost two more dispatch batches to characterise.
 This is a decision about how much gate latency the project will spend to buy
 determinism, which is not a decision this file should make on its own.
 
+
+## 2026-09-04 — it stopped a release, and the ops repo has the same shape
+
+`decommission` failed the **release gate** for `v0.1.0-rc.68`
+(run `33888567605`), on `ce04511` — a sha whose gate was **green on `main`**
+a few hours earlier. Same bytes, opposite verdicts, which is this bug's
+thesis stated by the release process instead of by a drill.
+
+    FAIL  decommission (6.4s)
+          FAIL: verify still red after the member came back
+          FAIL pair 0 replicating  SINGLE-COPY: every member up, but 0 of 1
+               streaming from 127.0.0.1:7221 — one disk holds the only copy
+
+`release.sh` then refused to build: *"public gate is 'failure' at ce04511 —
+rc.53 was tagged on a red-gate commit. Do not repeat it."* The cut is
+**stopped pending this bug** (Jeff, 2026-09-04) rather than re-run to green,
+because the script keys on the LATEST run at that sha, so retrying would flip
+the verdict by mechanism rather than by evidence.
+
+### The same signature, measured in the ops repo the night before
+
+Worth having because it puts numbers on the load dependence this bug
+suspects. `flint-cache-ops`' `saas_fulfillment` produced the identical line
+once its `flintctl bootstrap` output stopped being discarded (OPS-0117):
+
+    pair 0    127.0.0.1:7103  loading epoch  build unstamped
+
+| where | load | result |
+|---|---|---|
+| laptop, a peer's suite also running | 2.9–3.6 | **2 failures in 8** |
+| idle gate box (c7i.xlarge) | 0.36 | **0 failures in 12** |
+
+So the race opens under contention and shuts when the box is quiet, which
+matches "the runner is 4 vCPU at one drill per core" exactly.
+
+### What the ops side did about it, if the pattern is useful here
+
+`fleet_bootstrap` in the ops repo distinguishes *not yet* from *broken*,
+which is the distinction this bug says the drills cannot make. A failure whose
+log shows `loading` is re-verified on a bounded budget and **says that it
+waited**; every other failure stays immediately fatal with its reason.
+Retrying until it passes would recreate the defect in a new form — waiting for
+a convergence condition that is named in the log does not. Its positive
+control had to be built separately, because twelve clean runs on an idle box
+never exercised the wait at all.
+
+Offered, not applied: these four drills are this repo's, and the shape may or
+may not fit them.
