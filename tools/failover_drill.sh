@@ -66,6 +66,13 @@ awk -v n="$KEYS" 'BEGIN {
 INFO=$(valkey-cli -p "$MPORT" FLINTINFO 2>/dev/null | tr -d '\r')
 PEAK=$(printf '%s\n' "$INFO" | sed -n 's/^write_wait_peak_ms://p')
 DLINE=$(printf '%s\n' "$INFO" | sed -n 's/^write_deadline_ms://p')
+# The two TERMS at the moment of the peak, not just their product. est_ms is
+# inflight x service_us, and they fail for opposite reasons -- more offered load
+# than the seat can take, versus the seat itself having got slow. Four-way
+# parallelism was measured to raise this peak 8.6x without touching memory
+# (docs/bugs/0064), so which term moves is what names the resource.
+PKI=$(printf '%s\n' "$INFO" | sed -n 's/^write_wait_peak_inflight://p')
+PKS=$(printf '%s\n' "$INFO" | sed -n 's/^write_wait_peak_service_us://p')
 # CAPABILITY ASSERT. An absent field must not read as a comfortable zero: that
 # is the same "cannot look is not absent" this suite fails builds over, and a
 # drill that silently stopped reporting the margin would look exactly like a
@@ -76,7 +83,7 @@ if [ -z "$PEAK" ] || [ -z "$DLINE" ]; then
   echo "      not the same as the margin being wide (docs/bugs/0088)."
   exit 1
 fi
-echo "== write-wait peak ${PEAK}ms of ${DLINE}ms deadline (0 = no write projected a measurable wait)"
+echo "== write-wait peak ${PEAK}ms of ${DLINE}ms deadline (inflight ${PKI:-UNREADABLE} x service ${PKS:-UNREADABLE}us; 0 = no write projected a measurable wait)"
 
 echo "== waiting for replica catch-up"
 LAST="key:$(printf '%07d' $((KEYS - 1)))"

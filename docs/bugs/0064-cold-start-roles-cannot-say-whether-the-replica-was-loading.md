@@ -560,3 +560,40 @@ a write-wait margin is still unknown.
 yet about the bootstrap cluster, which was diagnosable-in-principle and is only
 now being reported properly.
 
+### Which resource: the terms are now recorded, with a prediction
+
+Parallelism is established as the dominant term; the resource is not. `est_ms`
+is `inflight x service_us`, so the peak now carries BOTH factors rather than
+their product, and the next gate runs will say which one four-way parallelism
+inflates:
+
+- **inflight** rising means more offered load than the seat can take -- the
+  client and proxy pushing harder, a queueing effect.
+- **service_us** rising means the seat itself got slower per write -- disk,
+  lock, or CPU steal.
+
+They imply different fixes and the product cannot distinguish them.
+
+**Baseline, this laptop, serial:** `peak 24ms (inflight 256 x service 97us)`,
+and 256 x 97us = 24.8ms, so the packing is arithmetically coherent.
+
+**Prediction, recorded before the CI data:** inflight is bounded by the client's
+pipeline depth and by `max-conns`, so reaching the observed P=4 peak of 1322 ms
+by queue depth alone would need an inflight around 13 600 — implausible. If
+inflight instead stays near 256, **service_us must be doing the work: ~5 200us
+per write against 97us here, a ~53x slowdown per write.** That would mean the
+seat is being starved rather than over-offered, and would point at disk or
+scheduler contention between parallel drills rather than at load arriving faster.
+
+If the next runs instead show inflight climbing with service_us flat, this
+prediction is wrong and the effect is queueing — which would be the more
+comfortable answer and is not the one the arithmetic favours.
+
+**Implementation note.** One packed atomic, `est_ms:16 | inflight:16 |
+service_us:32`, so `fetch_max` orders by the peak and the surviving value
+carries its OWN terms. Three separate atomics would let a later write's inflight
+land beside an earlier write's peak — a torn reading indistinguishable from
+data. Three tests cover it, including that a larger peak with minimal terms
+still beats a smaller peak with maximal ones, which is the property the layout
+exists for.
+

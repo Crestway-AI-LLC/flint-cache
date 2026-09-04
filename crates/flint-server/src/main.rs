@@ -975,6 +975,85 @@ static WRITES_SHED_DEADLINE: std::sync::atomic::AtomicU64 = std::sync::atomic::A
 /// purpose. A zero here means "no write ever projected a measurable wait" — a
 /// measurement, not an absence.
 static WRITE_WAIT_PEAK_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The peak, PACKED WITH THE TWO TERMS THAT PRODUCED IT.
+///
+/// `est_ms` is `inflight x service_us / 1000`, and the factors fail for
+/// opposite reasons: a high inflight is more offered load than the seat can
+/// take, a high service time is the seat itself having got slow. The product
+/// cannot tell them apart, and 2026-09-03 measured that four-way parallelism
+/// raises this peak 8.6x (median 65ms serial against 557ms at four drills)
+/// without touching memory -- so the resource being contended is still unknown
+/// and these two numbers are what would name it.
+///
+/// ONE atomic, not three, and the layout is the reason: `fetch_max` on a u64
+/// orders by the high bits first, so putting `est_ms` there makes the winner
+/// carry its OWN terms. Three separate atomics would let a later write's
+/// inflight land beside an earlier write's peak -- a torn reading that looks
+/// like data.
+///
+/// Layout: `est_ms:16 | inflight:16 | service_us:32`, each saturating. est_ms
+/// is bounded by a deadline in the low thousands and inflight by max-conns, so
+/// saturation is unreachable in practice and is there so it cannot corrupt the
+/// ordering if it ever is.
+static WRITE_WAIT_PEAK_PACKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn pack_write_wait_peak(est_ms: u64, inflight: u64, service_us: u64) -> u64 {
+    (est_ms.min(0xFFFF) << 48) | (inflight.min(0xFFFF) << 32) | service_us.min(0xFFFF_FFFF)
+}
+/// -> (est_ms, inflight, service_us)
+///
+/// Gated on its only reader, the FLINTINFO block, rather than silenced with an
+/// allow: a mem build has no such block, so an ungated version is dead code
+/// there and `-D warnings` reds the gate. Same shape as BUG-0079.
+#[cfg(feature = "rocks")]
+fn unpack_write_wait_peak(v: u64) -> (u64, u64, u64) {
+    ((v >> 48) & 0xFFFF, (v >> 32) & 0xFFFF, v & 0xFFFF_FFFF)
+}
+
+#[cfg(all(test, feature = "rocks"))]
+mod write_wait_peak_packing_tests {
+    use super::{pack_write_wait_peak, unpack_write_wait_peak};
+
+    #[test]
+    fn the_terms_survive_a_round_trip() {
+        let v = pack_write_wait_peak(1322, 37, 35_729);
+        assert_eq!(unpack_write_wait_peak(v), (1322, 37, 35_729));
+    }
+
+    /// THE PROPERTY THE LAYOUT EXISTS FOR. `fetch_max` on the packed u64 must
+    /// order by `est_ms` alone, so the surviving value carries the terms of the
+    /// peak that won rather than a mixture of two writes. Three separate
+    /// atomics would have no such guarantee, and the torn reading would look
+    /// exactly like data.
+    #[test]
+    fn a_larger_peak_wins_regardless_of_its_terms() {
+        // Smaller peak, but maximal terms -- it must still lose.
+        let small_big_terms = pack_write_wait_peak(100, 0xFFFF, 0xFFFF_FFFF);
+        let large_tiny_terms = pack_write_wait_peak(101, 0, 0);
+        assert!(
+            large_tiny_terms > small_big_terms,
+            "est_ms must dominate the ordering, else fetch_max keeps the wrong terms"
+        );
+        assert_eq!(
+            unpack_write_wait_peak(large_tiny_terms.max(small_big_terms)).0,
+            101
+        );
+    }
+
+    #[test]
+    fn saturation_cannot_corrupt_the_ordering() {
+        // An est_ms past the field width saturates rather than wrapping into
+        // the inflight bits, which would make a huge peak compare as a tiny one.
+        let huge = pack_write_wait_peak(1_000_000, 5, 5);
+        let ordinary = pack_write_wait_peak(2_000, 5, 5);
+        assert!(
+            huge > ordinary,
+            "a saturating peak must still compare as large"
+        );
+        assert_eq!(unpack_write_wait_peak(huge).0, 0xFFFF);
+    }
+}
 /// Writes refused by each REPLICATION gate. The note above applies with more
 /// force here: these gates have counted nothing since they shipped, so
 /// BUG-0035 had to reconstruct "20328 of 50500" from a drill's client-side
@@ -4013,6 +4092,14 @@ fn admit_write_path(
             // which never refuses still reports how close it came.
             if est_ms > 0 {
                 WRITE_WAIT_PEAK_MS.fetch_max(est_ms, Ordering::Relaxed);
+                WRITE_WAIT_PEAK_PACKED.fetch_max(
+                    pack_write_wait_peak(
+                        est_ms,
+                        WRITE_INFLIGHT.load(Ordering::Relaxed),
+                        WRITE_SERVICE_US.load(Ordering::Relaxed),
+                    ),
+                    Ordering::Relaxed,
+                );
             }
             if est_ms > deadline_ms {
                 WRITES_SHED_DEADLINE.fetch_add(1, Ordering::Relaxed);
@@ -5239,7 +5326,7 @@ fn flintinfo(
     let write_stall = rocks.as_ref().and_then(|kv| kv.write_stall());
     let compaction = rocks.as_ref().and_then(|kv| kv.compaction_pressure());
     let info = format!(
-        "role:{}\r\nloading:0\r\nrole_epoch:{role_epoch}\r\nbuild:{build}\r\nsst_bytes:{sst}\r\nlatest_seq:{latest}\r\nlast_applied:{last_applied}\r\nacked_seq:{}\r\nseq_lag:{seq_lag}\r\nwal_headroom_seq:{whs}\r\nwal_min_acked_seq:{wma}\r\nwal_headroom_shed_seq:{whl}\r\nwal_bytes_per_seq:{wbps}\r\nwal_archive_mb:{wamb}\r\nwal_archive_src:{wasrc}\r\nlive_replicas:{}\r\nlag_ms:{}\r\nlag_ms_max:{lmx}\r\nlag_max_gap:{lmg}\r\nlag_soft_ms:{soft}\r\nlag_hard_ms:{hard}\r\nmin_replicas_to_write:{minr}\r\nwidowed_grace_ms:{wgm}\r\nwidowed_shed:{wsh}\r\nfullsync_active:{fsa}\r\nfullsync_max:{fsm}\r\nasync_write_queue:{aqd}\r\nwrite_deadline_ms:{wdm}\r\nwrite_inflight:{wif}\r\nwrite_service_us:{wsu}\r\nwrite_wait_est_ms:{wwe}\r\nwrite_wait_peak_ms:{wwp}\r\nwrites_shed_deadline:{wsd}\r\nwrites_shed_lag:{wsl}\r\nwrites_shed_quorum:{wsq}\r\nwrites_shed_widowed:{wswd}\r\nwrites_shed_headroom:{wshr}\r\nwrites_delayed_soft:{wdsf}\r\nwal_fsync_ms:{wfm}\r\nwal_fsync_total:{wft}\r\ncert_days_remaining:{cdr}\r\nactive_conns:{ac}\r\nmax_conns:{mc}\r\nconns_shed_total:{cs}\r\nwrite_stopped:{wst}\r\ndelayed_write_rate:{dwr}\r\nwrite_stall_readable:{wsr}\r\nl0_files:{l0f}\r\npending_compaction_bytes:{pcb}\r\ncompaction_readable:{cr}\r\ndisk_free_bytes:{dfb}\r\ndisk_total_bytes:{dtb}\r\ndisk_free_pct:{dfp}\r\ndisk_verdict:{dv}\r\ndisk_unknown_samples:{dus}\r\nevictable_ns:{ens}\r\nevictable_ns_agree:{ensa}\r\nevictable_ns_bytes:{ensb}\r\nreclaim_active:{rca}\r\nreclaim_target_free_bytes:{rctf}\r\nevict:{evm}\r\ngc_swept_expired:{gse}\r\ngc_swept_orphans:{gso}\r\nuptime_ms:{upms}\r\n",
+        "role:{}\r\nloading:0\r\nrole_epoch:{role_epoch}\r\nbuild:{build}\r\nsst_bytes:{sst}\r\nlatest_seq:{latest}\r\nlast_applied:{last_applied}\r\nacked_seq:{}\r\nseq_lag:{seq_lag}\r\nwal_headroom_seq:{whs}\r\nwal_min_acked_seq:{wma}\r\nwal_headroom_shed_seq:{whl}\r\nwal_bytes_per_seq:{wbps}\r\nwal_archive_mb:{wamb}\r\nwal_archive_src:{wasrc}\r\nlive_replicas:{}\r\nlag_ms:{}\r\nlag_ms_max:{lmx}\r\nlag_max_gap:{lmg}\r\nlag_soft_ms:{soft}\r\nlag_hard_ms:{hard}\r\nmin_replicas_to_write:{minr}\r\nwidowed_grace_ms:{wgm}\r\nwidowed_shed:{wsh}\r\nfullsync_active:{fsa}\r\nfullsync_max:{fsm}\r\nasync_write_queue:{aqd}\r\nwrite_deadline_ms:{wdm}\r\nwrite_inflight:{wif}\r\nwrite_service_us:{wsu}\r\nwrite_wait_est_ms:{wwe}\r\nwrite_wait_peak_ms:{wwp}\r\nwrite_wait_peak_inflight:{wwpi}\r\nwrite_wait_peak_service_us:{wwps}\r\nwrites_shed_deadline:{wsd}\r\nwrites_shed_lag:{wsl}\r\nwrites_shed_quorum:{wsq}\r\nwrites_shed_widowed:{wswd}\r\nwrites_shed_headroom:{wshr}\r\nwrites_delayed_soft:{wdsf}\r\nwal_fsync_ms:{wfm}\r\nwal_fsync_total:{wft}\r\ncert_days_remaining:{cdr}\r\nactive_conns:{ac}\r\nmax_conns:{mc}\r\nconns_shed_total:{cs}\r\nwrite_stopped:{wst}\r\ndelayed_write_rate:{dwr}\r\nwrite_stall_readable:{wsr}\r\nl0_files:{l0f}\r\npending_compaction_bytes:{pcb}\r\ncompaction_readable:{cr}\r\ndisk_free_bytes:{dfb}\r\ndisk_total_bytes:{dtb}\r\ndisk_free_pct:{dfp}\r\ndisk_verdict:{dv}\r\ndisk_unknown_samples:{dus}\r\nevictable_ns:{ens}\r\nevictable_ns_agree:{ensa}\r\nevictable_ns_bytes:{ensb}\r\nreclaim_active:{rca}\r\nreclaim_target_free_bytes:{rctf}\r\nevict:{evm}\r\ngc_swept_expired:{gse}\r\ngc_swept_orphans:{gso}\r\nuptime_ms:{upms}\r\n",
         if read_only { "replica" } else { "master" },
         hub.effective_acked(now)
             .map_or_else(|| "none".into(), |a| a.to_string()),
@@ -5310,6 +5397,8 @@ fn flintinfo(
         wsu = WRITE_SERVICE_US.load(Ordering::Relaxed),
         wwe = estimated_write_wait_ms(),
         wwp = WRITE_WAIT_PEAK_MS.load(Ordering::Relaxed),
+        wwpi = unpack_write_wait_peak(WRITE_WAIT_PEAK_PACKED.load(Ordering::Relaxed)).1,
+        wwps = unpack_write_wait_peak(WRITE_WAIT_PEAK_PACKED.load(Ordering::Relaxed)).2,
         wsd = WRITES_SHED_DEADLINE.load(Ordering::Relaxed),
         wsl = WRITES_SHED_LAG.load(Ordering::Relaxed),
         wsq = WRITES_SHED_QUORUM.load(Ordering::Relaxed),
