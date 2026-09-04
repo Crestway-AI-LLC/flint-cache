@@ -254,3 +254,45 @@ refusal covers all of them.
 What it rules out is "this is a `failover` artefact"; what it does not do is
 bound how often 67 ms writes happen.
 
+## 2026-09-04 — P=2 measured, and it restores the margin without removing the mechanism
+
+Four dispatches at `gate_jobs=2`, commit `93c05e2`, against the arms already on
+record.
+
+| P | `failover` peak | median wall clock | green |
+|---|---|---|---|
+| 1 | 48, 61, 69, 71 ms | 33m17s | 4/4 |
+| **2** | **41, 53, 60, 74 ms** | **18m45s** | **3/4** |
+| 4 | 90 - 1574 ms | 11m46s | ~9% red over 33 runs |
+
+**On the metric, P=2 is P=1.** The peaks are indistinguishable (41-74 against
+48-71), and the service terms match too — 161-292 us against 255-346. Two drills
+at once do not contend enough to move it; four do, by an order of magnitude. So
+the effect is not linear in parallelism, and P=2 buys the whole margin
+improvement for **1.6x** wall clock rather than P=1's 2.8x.
+
+**And yet one of the four went red**, on `restart`:
+
+    THROTTLED write would wait ~2004ms (inflight 44 x service 45551us)
+
+A deadline crossing, at P=2, in a drill whose peak nobody was watching.
+
+### The trap, stated because I walked into it
+
+I predicted P=2 would "remove the crossings at ~1.5x cost", and measured
+`failover`'s peak because `failover` is the drill I instrumented. `failover`'s
+margin was restored and the gate went red anyway — on `restart`, whose service
+time reached **45 551 us**, five times worse than anything `failover` recorded
+at P=4.
+
+**A continuous metric on one drill does not predict the gate's colour.** The
+drill I could see got better; the gate is the max over 129 drills, and the
+binding one moved. That is the same shape as optimising a proxy — the earlier
+lesson was that a null on a proxy licenses nothing; this is its twin, that an
+improvement in a proxy licenses nothing either.
+
+What survives is narrower and still useful: **at P=2 the write-wait margin is
+restored to serial levels at 57% of serial's added cost**, and crossings become
+rarer rather than impossible. Whether that is worth 7 minutes a push is the
+decision; it is no longer a choice between 2.8x and nothing.
+
