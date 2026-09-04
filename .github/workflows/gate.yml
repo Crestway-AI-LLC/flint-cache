@@ -139,8 +139,39 @@ jobs:
       # measurement; the table above is its provenance. Re-measure before
       # raising it.
       #
-      # gate_jobs=1 on a manual dispatch is the rollback, no file edit needed.
-      FLINT_GATE_JOBS: ${{ inputs.gate_jobs || '4' }}
+      # ---------------------------------------------------------------
+      # LOWERED TO TWO, 2026-09-04. The table above is kept because it is
+      # provenance, but its verdict no longer holds: it chose 4 on
+      # "110/0 GREEN", and at 4 this gate has since been red 5 of 25 runs
+      # and then 3 of 33. The reason was not visible in 2026-08 because
+      # nothing measured it.
+      #
+      # What measures it now is the write-wait margin -- how close the
+      # worst projected write came to --write-deadline-ms (docs/bugs/0088).
+      # Four dispatches per arm, one commit, matched:
+      #
+      #   P  drills/core  write-wait peak    wall     green
+      #   1  0.25         48-71 ms           33m17s   4/4
+      #   2  0.50         41-74 ms           18m45s   3/4
+      #   4  1.00         90-1574 ms         11m46s   ~9% red over 33
+      #
+      # THE EFFECT IS NOT LINEAR IN P. Two drills at once do not contend
+      # enough to move the margin -- P=2 is indistinguishable from serial,
+      # on the peak (41-74 vs 48-71) and on the per-write service time that
+      # drives it (161-292us vs 255-346us). Four do, by an order of
+      # magnitude. So the whole margin improvement is available at 1.6x
+      # wall clock instead of serial's 2.8x, and 4 was buying speed with
+      # the one quantity nobody was watching.
+      #
+      # WHAT THIS DOES NOT BUY IS A GREEN GATE, and the honest record is
+      # that one of the four P=2 runs still crossed the deadline -- on
+      # `restart`, at inflight 44 x service 45551us. Crossings become rare
+      # rather than impossible. Anyone re-measuring should watch the max
+      # across drills rather than one drill's peak: failover's margin was
+      # restored in that very run and the gate went red anyway.
+      #
+      # gate_jobs=1 or 4 on a manual dispatch is the rollback, no file edit.
+      FLINT_GATE_JOBS: ${{ inputs.gate_jobs || '2' }}
       # Empty on push/PR, so the full CORE list runs. gates.sh reads
       # FLINT_CORE_ORDER with the full list as its default, and an empty
       # string is falsy there, so this is inert unless a dispatch sets it.
