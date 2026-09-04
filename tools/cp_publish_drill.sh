@@ -26,7 +26,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-$B --port 6890 --engine rocks --data-dir "$D/n" 2>/dev/null &
+$B --port 6890 --engine rocks --data-dir "$D/n" 2>"${FLEET_SCOPE}server.log" &
 fleet_wait_listen 6890
 sleep 0.6
 $CP --port 7595 --state "$D/cp" 2>"$D/cp.log" &
@@ -35,8 +35,8 @@ sleep 0.5
 fleet_cp 7595 CPADDPROXY 127.0.0.1:7821
 fleet_cp 7595 CPADDPROXY 127.0.0.1:7822
 fleet_cp 7595 CPADDPAIR 127.0.0.1:6890
-$PX --port 7821 --control-plane 127.0.0.1:7595 --advertise 127.0.0.1:7821 2>/dev/null &
-$PX --port 7822 --control-plane 127.0.0.1:7595 --advertise 127.0.0.1:7822 2>/dev/null &
+$PX --port 7821 --control-plane 127.0.0.1:7595 --advertise 127.0.0.1:7821 2>"${FLEET_SCOPE}proxy.log" &
+$PX --port 7822 --control-plane 127.0.0.1:7595 --advertise 127.0.0.1:7822 2>"${FLEET_SCOPE}proxy2.log" &
 fleet_wait_listen 7821 7822
 sleep 1.5
 

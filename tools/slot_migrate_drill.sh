@@ -49,8 +49,8 @@ cleanup() {
 }
 trap cleanup EXIT
 
-$B --port $SPORT --engine rocks --data-dir "$SDIR" 2>/dev/null &
-$B --port $DPORT --engine rocks --data-dir "$DDIR" 2>/dev/null &
+$B --port $SPORT --engine rocks --data-dir "$SDIR" 2>"${FLEET_SCOPE}server.log" &
+$B --port $DPORT --engine rocks --data-dir "$DDIR" 2>"${FLEET_SCOPE}server2.log" &
 fleet_wait_listen $SPORT $DPORT
 sleep 0.8
 for p in $SPORT $DPORT; do

@@ -89,7 +89,7 @@ COPROC_PID=$!
 sleep 0.5
 
 echo "== cluster: CP + master + CP-driven proxy; nsX throttled to 2 ops/s; VEC.=coproc"
-$CP --port 6674 --state "$D/cp" 2>/dev/null &
+$CP --port 6674 --state "$D/cp" 2>"${FLEET_SCOPE}cp.log" &
 fleet_wait_ping 6674
 fleet_cp 6674 CPADDPROXY 127.0.0.1:6673
 fleet_cp 6674 CPADDPAIR 127.0.0.1:6672
@@ -99,7 +99,7 @@ fleet_cp 6674 CPADDTENANT tenX tokX nsX 1          # subset 1 -> the proxy sees 
 # into "exemption broke" when the real cause was a rejected bootstrap command.
 fleet_cp 6674 CPTENANTQUOTA tenX 2 0
 fleet_cp 6674 CPFAMILY VEC. 127.0.0.1:6675
-$B --port 6672 --engine rocks --data-dir "$D/m" 2>/dev/null &
+$B --port 6672 --engine rocks --data-dir "$D/m" 2>"${FLEET_SCOPE}server.log" &
 fleet_wait_listen 6672
 # --edge-advertise is what a co-processor dials back on for the channel; it is
 # a proxy-local fact even in CP mode (the CP supplies pairs/tenants/families).

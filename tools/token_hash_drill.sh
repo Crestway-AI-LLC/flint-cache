@@ -27,15 +27,15 @@ cleanup() {
 trap cleanup EXIT
 
 echo "== cluster; tenant added with plaintext token 'super-secret-token'"
-$CP --port 6322 --state "$D/cp" 2>/dev/null &
+$CP --port 6322 --state "$D/cp" 2>"${FLEET_SCOPE}cp.log" &
 fleet_wait_ping 6322
 fleet_cp 6322 CPADDPROXY 127.0.0.1:7991
 fleet_cp 6322 CPADDPAIR 127.0.0.1:7031
 fleet_cp 6322 CPADDTENANT acme super-secret-token acme 1
-$B --port 7031 --engine rocks --data-dir "$D/m" 2>/dev/null &
+$B --port 7031 --engine rocks --data-dir "$D/m" 2>"${FLEET_SCOPE}server.log" &
 fleet_wait_listen 7031
 sleep 0.7
-$PX --port 7991 --control-plane 127.0.0.1:6322 --advertise 127.0.0.1:7991 2>/dev/null &
+$PX --port 7991 --control-plane 127.0.0.1:6322 --advertise 127.0.0.1:7991 2>"${FLEET_SCOPE}proxy.log" &
 fleet_wait_listen 7991
 sleep 1.2
 
@@ -60,7 +60,7 @@ echo "  plaintext AUTHs; wrong token and the RAW DIGEST both rejected"
 
 echo "== CP restart from the digest-only file preserves auth"
 fleet_kill controlplane; sleep 0.3
-$CP --port 6322 --state "$D/cp" 2>/dev/null &
+$CP --port 6322 --state "$D/cp" 2>"${FLEET_SCOPE}cp2.log" &
 sleep 1.5   # proxy re-subscribes and gets a fresh push
 V=$(valkey-cli -p 7991 -a super-secret-token --no-auth-warning GET k)
 [ "$V" = "sealed" ] || { echo "FAIL: auth broken after CP restart: $V"; exit 1; }
@@ -78,7 +78,7 @@ proxy 127.0.0.1:7991
 pair 127.0.0.1:7031 0-16383
 tenant legacy legacy-plaintext-tok legacy 127.0.0.1:7991 - 0 0 0 0 0
 EOF
-$CP --port 6322 --state "$D/cp-old" 2>/dev/null &
+$CP --port 6322 --state "$D/cp-old" 2>"${FLEET_SCOPE}cp3.log" &
 fleet_wait_listen 6322
 sleep 1.5
 V=$(valkey-cli -p 7991 -a legacy-plaintext-tok --no-auth-warning PING 2>&1 | head -1)

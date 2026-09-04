@@ -25,10 +25,10 @@ cleanup() {
 }
 trap cleanup EXIT
 
-$B --port $MPORT --engine rocks --data-dir "$MDIR" 2>/dev/null &
+$B --port $MPORT --engine rocks --data-dir "$MDIR" 2>"${FLEET_SCOPE}server.log" &
 fleet_wait_listen $MPORT
 sleep 0.5
-$B --port $RPORT --engine rocks --data-dir "$RDIR" --replica-of 127.0.0.1:$MPORT 2>/dev/null &
+$B --port $RPORT --engine rocks --data-dir "$RDIR" --replica-of 127.0.0.1:$MPORT 2>"${FLEET_SCOPE}server2.log" &
 fleet_wait_listen $RPORT
 sleep 0.9
 
@@ -105,7 +105,7 @@ echo "== data intact on the new master"
 echo "$(grep -oE 'PROMOTED .* at \(0,[0-9]+\)' $FLINT_DRILL_ROOT/flint-ctl.log | head -1)"
 
 echo "== bring the OLD master back; controller must fence it"
-$B --port $MPORT --engine rocks --data-dir "$MDIR" 2>/dev/null &
+$B --port $MPORT --engine rocks --data-dir "$MDIR" 2>"${FLEET_SCOPE}server3.log" &
 fleet_wait_listen $MPORT
 sleep 2.0
 FENCED=0

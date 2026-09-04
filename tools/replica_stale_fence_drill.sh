@@ -28,18 +28,18 @@ cleanup() {
 trap cleanup EXIT
 
 echo "== master + replica; acme opts into replica reads; stale bound 1.5s"
-$CP --port 6314 --state "$D/cp" 2>/dev/null &
+$CP --port 6314 --state "$D/cp" 2>"${FLEET_SCOPE}cp.log" &
 fleet_wait_ping 6314
 fleet_cp 6314 CPADDPROXY 127.0.0.1:7999
 fleet_cp 6314 CPADDPAIR 127.0.0.1:7081,127.0.0.1:7082
 fleet_cp 6314 CPADDTENANT acme tok-acme acme 1
 valkey-cli -p 6314 CPTENANTREADS acme on >/dev/null
-$B --port 7081 --engine rocks --data-dir "$D/m" 2>/dev/null &
+$B --port 7081 --engine rocks --data-dir "$D/m" 2>"${FLEET_SCOPE}server.log" &
 fleet_wait_listen 7081
 sleep 0.7
 $B --port 7082 --engine rocks --data-dir "$D/r" --replica-of 127.0.0.1:7081 \
    --replica-read-stale-ms 1500 2>/dev/null &
-$PX --port 7999 --control-plane 127.0.0.1:6314 --advertise 127.0.0.1:7999 2>/dev/null &
+$PX --port 7999 --control-plane 127.0.0.1:6314 --advertise 127.0.0.1:7999 2>"${FLEET_SCOPE}proxy.log" &
 fleet_wait_listen 7082 7999
 sleep 1.5
 
@@ -81,7 +81,7 @@ echo "$PR" | grep -q "hello" && { echo "FAIL: proxy served stale replica data"; 
 echo "  proxy did NOT serve stale data (returned: $(echo "$PR" | head -c 50))"
 
 echo "== recovery: restart the master; the replica re-syncs and serves again"
-$B --port 7081 --engine rocks --data-dir "$D/m" 2>/dev/null &
+$B --port 7081 --engine rocks --data-dir "$D/m" 2>"${FLEET_SCOPE}server2.log" &
 sleep 3   # reconnect (1s retry) + keepalive re-establishes contact
 V=$(RREAD)
 [ "$V" = "hello" ] || { echo "FAIL: replica did not recover after re-contact (got '$V')"; exit 1; }

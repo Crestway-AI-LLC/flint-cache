@@ -35,7 +35,7 @@ rm -f "$STATE"
 echo "== data plane: two single-master pairs"
 for p in 6730 6740; do
   d="$FLINT_DRILL_ROOT/flint-cpd-$p"; rm -rf "$d"
-  $B --port $p --engine rocks --data-dir "$d" 2>/dev/null &
+  $B --port $p --engine rocks --data-dir "$d" 2>"${FLEET_SCOPE}server.log" &
 done
 sleep 0.8
 

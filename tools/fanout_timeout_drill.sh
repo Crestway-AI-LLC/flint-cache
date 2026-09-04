@@ -45,12 +45,12 @@ cleanup() {
 trap cleanup EXIT
 
 echo "== cluster: CP + master + proxy (tenant acme)"
-$CP --port 7181 --state "$D/cp" 2>/dev/null &
+$CP --port 7181 --state "$D/cp" 2>"${FLEET_SCOPE}cp.log" &
 fleet_wait_ping 7181
 fleet_cp 7181 CPADDPROXY 127.0.0.1:7183
 fleet_cp 7181 CPADDPAIR 127.0.0.1:7182
 fleet_cp 7181 CPADDTENANT acme tok-acme acme 1
-$B --port 7182 --engine rocks --data-dir "$D/m" 2>/dev/null &
+$B --port 7182 --engine rocks --data-dir "$D/m" 2>"${FLEET_SCOPE}server.log" &
 fleet_wait_listen 7182
 sleep 0.7
 

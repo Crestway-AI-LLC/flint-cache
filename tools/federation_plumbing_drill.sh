@@ -26,13 +26,13 @@ cleanup() {
 trap cleanup EXIT
 
 echo "== single-cluster fleet with one tenant"
-$CP --port 6305 --state "$D/cp" 2>/dev/null &
+$CP --port 6305 --state "$D/cp" 2>"${FLEET_SCOPE}cp.log" &
 fleet_wait_ping 6305
 fleet_cp 6305 CPADDPROXY 127.0.0.1:7997
 fleet_cp 6305 CPADDPAIR 127.0.0.1:7091
 fleet_cp 6305 CPADDTENANT acme tok-acme acme 1
-$B --port 7091 --engine rocks --data-dir "$D/m" 2>/dev/null &
-$PX --port 7997 --control-plane 127.0.0.1:6305 --advertise 127.0.0.1:7997 2>/dev/null &
+$B --port 7091 --engine rocks --data-dir "$D/m" 2>"${FLEET_SCOPE}server.log" &
+$PX --port 7997 --control-plane 127.0.0.1:6305 --advertise 127.0.0.1:7997 2>"${FLEET_SCOPE}proxy.log" &
 fleet_wait_listen 7091 7997
 sleep 1.5
 A="valkey-cli -p 7997 -a tok-acme --no-auth-warning"

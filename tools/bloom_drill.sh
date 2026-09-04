@@ -103,7 +103,7 @@ add_items() {
 
 echo "== bloom drill: $N items into a filter reserved for $CAPACITY at ${ERROR}"
 
-$B --port $MPORT --engine rocks --data-dir "$MDIR" 2>/dev/null &
+$B --port $MPORT --engine rocks --data-dir "$MDIR" 2>"${FLEET_SCOPE}server.log" &
 fleet_wait_listen $MPORT
 fleet_wait_ping $MPORT
 
@@ -129,7 +129,7 @@ assert_filter_intact $MPORT "built"
 echo "== phase 1: kill -9 and warm restart"
 fleet_signal_port $MPORT 9
 sleep 0.3
-$B --port $MPORT --engine rocks --data-dir "$MDIR" 2>/dev/null &
+$B --port $MPORT --engine rocks --data-dir "$MDIR" 2>"${FLEET_SCOPE}server2.log" &
 fleet_wait_listen $MPORT
 fleet_wait_ping $MPORT
 [ "$(valkey-cli -p $MPORT BF.INFO "$KEY" FILTERS | tr -d '\r')" = "$LINKS" ] \
@@ -137,7 +137,7 @@ fleet_wait_ping $MPORT
 assert_filter_intact $MPORT "warm restart"
 
 echo "== phase 2: full sync to a FRESH replica (empty data dir)"
-$B --port $RPORT --engine rocks --data-dir "$RDIR" --replica-of "127.0.0.1:$MPORT" 2>/dev/null &
+$B --port $RPORT --engine rocks --data-dir "$RDIR" --replica-of "127.0.0.1:$MPORT" 2>"${FLEET_SCOPE}server3.log" &
 fleet_wait_listen $RPORT
 fleet_wait_ping $RPORT
 for _ in $(seq 1 200); do
@@ -160,7 +160,7 @@ def crc16(d):
 print(crc16(b"bloomer") % 16384)
 PY
 )
-$B --port $DPORT --engine rocks --data-dir "$DDIR" 2>/dev/null &
+$B --port $DPORT --engine rocks --data-dir "$DDIR" 2>"${FLEET_SCOPE}server4.log" &
 fleet_wait_listen $DPORT
 fleet_wait_ping $DPORT
 echo "  filter lives in slot $SLOT; pulling it to :$DPORT"

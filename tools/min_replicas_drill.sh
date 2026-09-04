@@ -28,7 +28,7 @@ cleanup() {
 trap cleanup EXIT
 
 echo "== master with min-replicas-to-write=1, plus one replica"
-$B --port $MPORT --engine rocks --data-dir "$MDIR" --min-replicas-to-write 1 2>/dev/null &
+$B --port $MPORT --engine rocks --data-dir "$MDIR" --min-replicas-to-write 1 2>"${FLEET_SCOPE}server.log" &
 fleet_wait_listen $MPORT
 sleep 0.5
 
@@ -37,7 +37,7 @@ OUT=$(valkey-cli -p $MPORT SET early bad 2>&1 || true)
 echo "$OUT" | grep -q "THROTTLED" || { echo "FAIL: writes allowed with no replica ever: $OUT"; exit 1; }
 echo "throttled as expected"
 
-$B --port $R1PORT --engine rocks --data-dir "$R1DIR" --replica-of 127.0.0.1:$MPORT 2>/dev/null &
+$B --port $R1PORT --engine rocks --data-dir "$R1DIR" --replica-of 127.0.0.1:$MPORT 2>"${FLEET_SCOPE}server2.log" &
 OPEN=0
 for i in $(seq 1 40); do
   [ "$(valkey-cli -p $MPORT SET k1 v1 2>&1)" = "OK" ] && { OPEN=1; break; }
@@ -61,7 +61,7 @@ echo "== reads stay available while writes are shed (degraded, not down)"
 [ "$(valkey-cli -p $MPORT GET k1)" = "v1" ] || { echo "FAIL: reads broken while gated"; exit 1; }
 
 echo "== attach a replacement replica: writes resume on first ack (no full-resync wait)"
-$B --port $R2PORT --engine rocks --data-dir "$R2DIR" --replica-of 127.0.0.1:$MPORT 2>/dev/null &
+$B --port $R2PORT --engine rocks --data-dir "$R2DIR" --replica-of 127.0.0.1:$MPORT 2>"${FLEET_SCOPE}server3.log" &
 RESUMED=0
 for i in $(seq 1 60); do
   [ "$(valkey-cli -p $MPORT SET recovered ok 2>&1)" = "OK" ] && { RESUMED=1; break; }

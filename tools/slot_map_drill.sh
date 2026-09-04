@@ -24,15 +24,15 @@ cleanup() {
 trap cleanup EXIT
 
 echo "== fleet: CP, two pairs, proxy, one tenant"
-$CP --port 7840 --state "$D/cp" 2>/dev/null &
+$CP --port 7840 --state "$D/cp" 2>"${FLEET_SCOPE}cp.log" &
 fleet_wait_ping 7840
 fleet_cp 7840 CPADDPROXY 127.0.0.1:7995
 fleet_cp 7840 CPADDPAIR 127.0.0.1:7101
 fleet_cp 7840 CPADDPAIR 127.0.0.1:7102
 fleet_cp 7840 CPADDTENANT acme tok-acme acme 1
-$B --port 7101 --engine rocks --data-dir "$D/a" 2>/dev/null &
-$B --port 7102 --engine rocks --data-dir "$D/b" 2>/dev/null &
-$PX --port 7995 --control-plane 127.0.0.1:7840 --advertise 127.0.0.1:7995 2>/dev/null &
+$B --port 7101 --engine rocks --data-dir "$D/a" 2>"${FLEET_SCOPE}server.log" &
+$B --port 7102 --engine rocks --data-dir "$D/b" 2>"${FLEET_SCOPE}server2.log" &
+$PX --port 7995 --control-plane 127.0.0.1:7840 --advertise 127.0.0.1:7995 2>"${FLEET_SCOPE}proxy.log" &
 fleet_wait_listen 7101 7102 7995
 sleep 1.5
 A="valkey-cli -p 7995 -a tok-acme --no-auth-warning"
@@ -61,14 +61,14 @@ echo "  committed: CPSLOTS row + CPINFO slot_exceptions:1"
 
 echo "== the truth survives a CP restart (durable, not session state)"
 pkill -9 -f "flint-controlplane --port 7840"; sleep 0.3
-$CP --port 7840 --state "$D/cp" 2>/dev/null &
+$CP --port 7840 --state "$D/cp" 2>"${FLEET_SCOPE}cp2.log" &
 fleet_wait_ping 7840
 valkey-cli -p 7840 CPSLOTS | grep -q "acme $SLOT" || { echo "FAIL: exception lost across CP restart"; exit 1; }
 echo "  CP restarted; exception row intact"
 
 echo "== COLD proxy: correct routing from the first snapshot, zero -MOVED"
 pkill -9 -f "flint-proxy --port 7995"; sleep 0.3
-$PX --port 7995 --control-plane 127.0.0.1:7840 --advertise 127.0.0.1:7995 2>/dev/null &
+$PX --port 7995 --control-plane 127.0.0.1:7840 --advertise 127.0.0.1:7995 2>"${FLEET_SCOPE}proxy2.log" &
 fleet_wait_listen 7995
 sleep 1.5
 OK=1

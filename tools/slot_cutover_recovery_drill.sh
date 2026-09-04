@@ -29,8 +29,8 @@ run_once() {
   pkill -9 -f "flint-server --port 658" 2>/dev/null; fleet_kill controller; sleep 0.4
   local SDIR DDIR
   SDIR=$(mktemp -d $FLINT_DRILL_ROOT/flint-rec-s.XXXXXX); DDIR=$(mktemp -d $FLINT_DRILL_ROOT/flint-rec-d.XXXXXX)
-  $B --port $SPORT --engine rocks --data-dir "$SDIR" 2>/dev/null &
-  $B --port $DPORT --engine rocks --data-dir "$DDIR" 2>/dev/null &
+  $B --port $SPORT --engine rocks --data-dir "$SDIR" 2>"${FLEET_SCOPE}server.log" &
+  $B --port $DPORT --engine rocks --data-dir "$DDIR" 2>"${FLEET_SCOPE}server2.log" &
   fleet_wait_listen $SPORT $DPORT
   sleep 0.8
 
@@ -47,8 +47,8 @@ run_once() {
   sleep 0.5
 
   # Restart both nodes on the same data dirs (the redeploy).
-  $B --port $SPORT --engine rocks --data-dir "$SDIR" 2>/dev/null &
-  $B --port $DPORT --engine rocks --data-dir "$DDIR" 2>/dev/null &
+  $B --port $SPORT --engine rocks --data-dir "$SDIR" 2>"${FLEET_SCOPE}server3.log" &
+  $B --port $DPORT --engine rocks --data-dir "$DDIR" 2>"${FLEET_SCOPE}server4.log" &
   fleet_wait_listen $SPORT $DPORT
   sleep 0.9
 
@@ -105,8 +105,8 @@ test_half_done_flip() {
   pkill -9 -f "flint-server --port 658" 2>/dev/null; fleet_kill controller; sleep 0.4
   local SDIR DDIR
   SDIR=$(mktemp -d $FLINT_DRILL_ROOT/flint-rec-s.XXXXXX); DDIR=$(mktemp -d $FLINT_DRILL_ROOT/flint-rec-d.XXXXXX)
-  $B --port $SPORT --engine rocks --data-dir "$SDIR" 2>/dev/null &
-  $B --port $DPORT --engine rocks --data-dir "$DDIR" 2>/dev/null &
+  $B --port $SPORT --engine rocks --data-dir "$SDIR" 2>"${FLEET_SCOPE}server5.log" &
+  $B --port $DPORT --engine rocks --data-dir "$DDIR" 2>"${FLEET_SCOPE}server6.log" &
   fleet_wait_listen $SPORT $DPORT
   sleep 0.8
   awk 'BEGIN{for(i=0;i<2000;i++){k=sprintf("{mover}:key%06d",i);printf "*3\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$5\r\nvalue\r\n",length(k),k}}' \

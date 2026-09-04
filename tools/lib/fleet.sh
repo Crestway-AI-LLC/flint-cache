@@ -85,6 +85,13 @@ fleet_init() {
   FLEET_SCOPE="$1"; shift
   FLEET_PORTS="$(printf '%s' "$*" | tr ' ' '|')"
   [ -n "$FLEET_SCOPE" ] || { echo "fleet_init: empty scope"; exit 1; }
+  # LAST RUN'S LOGS ARE NOT THIS RUN'S EVIDENCE. The bring-up spawns write
+  # ${FLEET_SCOPE}<name>.log and nothing else removes them, so a re-run would
+  # find the PREVIOUS failure's output sitting there and fleet_why_not_up
+  # would print it as the reason for today's -- a stale cause read as a fresh
+  # one, which is worse than having none. Cleared here rather than in a trap,
+  # because the drills install their own EXIT traps and the last one wins.
+  rm -f "${FLEET_SCOPE}"*.log 2>/dev/null || true
   # ONE drill per scope at a time. Two drills declaring the same scope and
   # port block pass each other's fleet_guard — shared scope and ports read as
   # "ours" by construction — and the second one's opening fleet_kill sweep
@@ -458,15 +465,24 @@ _fleet_ours() {
 # environment instead of a bug in the harness.
 fleet_why_not_up() {
   local d="${FLEET_SCOPE:-}" f n=0
-  # BOTH LEVELS. `flintctl` writes seat logs to `<statedir>/logs/<name>.log`
-  # (crates/flint-ctl/src/main.rs:1438), and for the 11 drills whose
-  # FLEET_SCOPE *is* the inventory statedir that is one directory below the
-  # top-level glob this used to do alone. Scanning only the top level found
-  # nothing and then announced the reason was discarded -- while flintctl's
-  # log sat in `logs/`. "Cannot look" reported as "absent", inside the
-  # function written to stop exactly that.
-  if [ -n "$d" ] && [ -d "$d" ]; then
-    for f in "$d"/*.log "$d"/logs/*.log; do
+  # THREE PLACES, because two sessions each found a different half of this.
+  #
+  #   "$d"*.log       the scope is a PREFIX, not a directory. `fleet_init` is
+  #                   called with `$FLINT_DRILL_ROOT/flint-bloom-` and the
+  #                   lock beside it is `${FLEET_SCOPE}.lock`, a sibling FILE,
+  #                   so a `[ -d "$d" ]` guard is false and finds nothing.
+  #   "$d"/*.log      the scope IS a directory for some drills.
+  #   "$d"/logs/*.log `flintctl` writes seat logs to `<statedir>/logs/<name>.log`
+  #                   (crates/flint-ctl/src/main.rs:1438), one level below the
+  #                   top-level glob, for the 11 drills whose scope is the
+  #                   inventory statedir.
+  #
+  # Each version alone reported "nothing found" for the cases the other
+  # covered -- "cannot look" rendered as "absent", inside the function written
+  # to stop exactly that. No `[ -d ]` gate: an unmatched glob is skipped by
+  # the `-f` test below, and gating on it is what hid the prefix case.
+  if [ -n "$d" ]; then
+    for f in "$d"*.log "$d"/*.log "$d"/logs/*.log; do
       [ -f "$f" ] && [ -s "$f" ] || continue
       n=$((n + 1))
       echo "  --- $f (last 15 lines) ---"
@@ -475,13 +491,13 @@ fleet_why_not_up() {
   fi
   # AND DO NOT ASSERT THE CAUSE. This said the spawn "sent stderr to
   # /dev/null", which is one explanation among several -- the scope may not be
-  # a directory at all, the seat may have died before writing, or the logs may
-  # live somewhere this does not know about (29 drills set FLEET_SCOPE to
-  # something other than their statedir). Name where it looked and let the
+  # a directory, the seat may have died before writing, or the logs may live
+  # somewhere this does not know about. Name where it looked and let the
   # reader draw the conclusion.
-  [ "$n" = 0 ] && echo "  (nothing readable in ${d:-<no FLEET_SCOPE>} or its logs/ -- the reason may have been discarded at the spawn, or written somewhere this did not look)"
+  [ "$n" = 0 ] && echo "  (nothing readable at ${d:-<no FLEET_SCOPE>}*.log, in it, or in its logs/ -- the reason may have been discarded at the spawn, or written somewhere this did not look)"
   return 0
 }
+
 
 fleet_wait_listen() {
   local port deadline

@@ -36,7 +36,7 @@ trap cleanup EXIT
 
 for p in $P0 $P1 $P2; do
   d="$FLINT_DRILL_ROOT/flint-rb-$p"; rm -rf "$d"
-  $B --port $p --engine rocks --data-dir "$d" 2>/dev/null &
+  $B --port $p --engine rocks --data-dir "$d" 2>"${FLEET_SCOPE}server.log" &
 done
 sleep 0.8
 for p in $P0 $P1 $P2; do [ "$(valkey-cli -p $p PING)" = "PONG" ] || { echo "FAIL: :$p down"; exit 1; }; done

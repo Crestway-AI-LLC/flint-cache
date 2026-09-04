@@ -28,7 +28,7 @@ cleanup() {
 trap cleanup EXIT
 
 echo "== cluster: CP + master + proxy; acme consents to the cache, globex does not"
-$CP --port 7660 --state "$D/cp" 2>/dev/null &
+$CP --port 7660 --state "$D/cp" 2>"${FLEET_SCOPE}cp.log" &
 fleet_wait_ping 7660
 fleet_cp 7660 CPADDPROXY 127.0.0.1:7881
 # Both pair members registered so the proxy can chase a failover to 6971
@@ -37,7 +37,7 @@ fleet_cp 7660 CPADDPAIR 127.0.0.1:6970,127.0.0.1:6971
 fleet_cp 7660 CPADDTENANT acme tok-acme acme 1
 fleet_cp 7660 CPADDTENANT globex tok-glx globex 1
 valkey-cli -p 7660 CPTENANTCACHE acme on >/dev/null || { echo "FAIL: CPTENANTCACHE"; exit 1; }
-$B --port 6970 --engine rocks --data-dir "$D/m" 2>/dev/null &
+$B --port 6970 --engine rocks --data-dir "$D/m" 2>"${FLEET_SCOPE}server.log" &
 fleet_wait_listen 6970
 sleep 0.7
 $PX --port 7881 --control-plane 127.0.0.1:7660 --advertise 127.0.0.1:7881 2>"$D/px.log" &
@@ -130,7 +130,7 @@ echo "== FAILOVER: invalidation keeps working through a promoted master (coverag
 # Attach a replica, kill the master, promote — the proxy chases the new
 # master; a write through the proxy must invalidate and the next GET must
 # come from the NEW master (fresh), not the cache (stale).
-$B --port 6971 --engine rocks --data-dir "$D/r" --replica-of 127.0.0.1:6970 2>/dev/null &
+$B --port 6971 --engine rocks --data-dir "$D/r" --replica-of 127.0.0.1:6970 2>"${FLEET_SCOPE}server2.log" &
 fleet_wait_listen 6971
 sleep 1.2
 $A SET f1 before >/dev/null; $A GET f1 >/dev/null   # cache 'before'

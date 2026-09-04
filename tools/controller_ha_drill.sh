@@ -28,10 +28,10 @@ trap cleanup EXIT
 # Pair = P1 (master) + P2 (replica). P3 is a pre-started SPARE the harness
 # uses as the replacement after a promotion (the controller decides; node
 # lifecycle is external, matching the real split).
-$B --port $P1 --engine rocks --data-dir "$D1" 2>/dev/null &
+$B --port $P1 --engine rocks --data-dir "$D1" 2>"${FLEET_SCOPE}server.log" &
 fleet_wait_listen $P1
 sleep 0.5
-$B --port $P2 --engine rocks --data-dir "$D2" --replica-of 127.0.0.1:$P1 2>/dev/null &
+$B --port $P2 --engine rocks --data-dir "$D2" --replica-of 127.0.0.1:$P1 2>"${FLEET_SCOPE}server2.log" &
 fleet_wait_listen $P2
 sleep 0.9
 
@@ -206,7 +206,7 @@ echo "  data intact on promoted master :$P2"
 
 echo "== kill 2 of 3 controllers; 1 survivor must still handle the next event"
 # The new master is :P2. Attach a fresh replica (:P3) so the pair is healthy.
-$B --port $P3 --engine rocks --data-dir "$D3" --replica-of 127.0.0.1:$P2 2>/dev/null &
+$B --port $P3 --engine rocks --data-dir "$D3" --replica-of 127.0.0.1:$P2 2>"${FLEET_SCOPE}server3.log" &
 # Point the survivor controller at the new pair; kill the other two.
 pkill -9 -f "flint-controller --nodes 127.0.0.1:$P1,127.0.0.1:$P2 --id A"
 pkill -9 -f "flint-controller --nodes 127.0.0.1:$P1,127.0.0.1:$P2 --id B"

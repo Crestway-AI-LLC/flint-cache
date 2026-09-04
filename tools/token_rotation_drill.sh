@@ -25,7 +25,7 @@ cleanup() {
 trap cleanup EXIT
 rm -f "$STATE"
 
-$B --port 6750 --engine rocks --data-dir $FLINT_DRILL_ROOT/flint-rot-data 2>/dev/null &
+$B --port 6750 --engine rocks --data-dir $FLINT_DRILL_ROOT/flint-rot-data 2>"${FLEET_SCOPE}server.log" &
 fleet_wait_listen 6750
 sleep 0.6
 $CP --port 7550 --state "$STATE" 2>$FLINT_DRILL_ROOT/flint-rot-cp.log &

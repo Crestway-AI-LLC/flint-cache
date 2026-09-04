@@ -29,7 +29,7 @@ cleanup() {
 trap cleanup EXIT
 
 echo "== cluster: CP + master + TWO proxies; acme quota 400 ops/s (subset 2), globex unlimited"
-$CP --port 7690 --state "$D/cp" 2>/dev/null &
+$CP --port 7690 --state "$D/cp" 2>"${FLEET_SCOPE}cp.log" &
 fleet_wait_ping 7690
 fleet_cp 7690 CPADDPROXY 127.0.0.1:7911
 fleet_cp 7690 CPADDPROXY 127.0.0.1:7912
@@ -38,7 +38,7 @@ fleet_cp 7690 CPADDPAIR 127.0.0.1:6985
 fleet_cp 7690 CPADDTENANT acme tok-acme acme 2
 fleet_cp 7690 CPADDTENANT globex tok-glx globex 1
 valkey-cli -p 7690 CPTENANTQUOTA acme 400 0 >/dev/null || { echo "FAIL: CPTENANTQUOTA"; exit 1; }
-$B --port 6985 --engine rocks --data-dir "$D/m" 2>/dev/null &
+$B --port 6985 --engine rocks --data-dir "$D/m" 2>"${FLEET_SCOPE}server.log" &
 fleet_wait_listen 6985
 sleep 0.7
 $PX --port 7911 --control-plane 127.0.0.1:7690 --advertise 127.0.0.1:7911 2>"$D/px1.log" &

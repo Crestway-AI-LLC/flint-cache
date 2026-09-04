@@ -30,18 +30,18 @@ cleanup() {
 }
 trap cleanup EXIT
 
-$CP --port 7640 --state "$D/cp" 2>/dev/null &
+$CP --port 7640 --state "$D/cp" 2>"${FLEET_SCOPE}cp.log" &
 fleet_wait_ping 7640
 fleet_cp 7640 CPADDPROXY 127.0.0.1:6313
 fleet_cp 7640 CPADDPAIR 127.0.0.1:6311,127.0.0.1:6312,127.0.0.1:6972
 fleet_cp 7640 CPADDTENANT acme tok-acme acme 1
 start_replica() { $B --port "$1" --engine rocks --data-dir "$D/$2" --replica-of 127.0.0.1:6311 2>/dev/null & }
-$B --port 6311 --engine rocks --data-dir "$D/m" 2>/dev/null &
+$B --port 6311 --engine rocks --data-dir "$D/m" 2>"${FLEET_SCOPE}server.log" &
 fleet_wait_listen 6311
 sleep 0.7
 start_replica 6312 r1
 start_replica 6972 r2
-$PX --port 6313 --control-plane 127.0.0.1:7640 --advertise 127.0.0.1:6313 2>/dev/null &
+$PX --port 6313 --control-plane 127.0.0.1:7640 --advertise 127.0.0.1:6313 2>"${FLEET_SCOPE}proxy.log" &
 # Gate on BOTH replicas being live before any test relies on them.
 for i in $(seq 1 50); do
   fleet_ready 6312 && fleet_ready 6972 && break

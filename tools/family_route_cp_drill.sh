@@ -40,12 +40,12 @@ cargo build --release -q -p flint-server -p flint-controlplane -p flint-proxy --
 DEAD="127.0.0.1:1"
 
 echo "== cluster: CP + master + one CP-driven proxy (NO --families flag)"
-$CP --port 6683 --state "$D/cp" 2>/dev/null &
+$CP --port 6683 --state "$D/cp" 2>"${FLEET_SCOPE}cp.log" &
 fleet_wait_ping 6683
 fleet_cp 6683 CPADDPROXY 127.0.0.1:6699
 fleet_cp 6683 CPADDPAIR 127.0.0.1:6698
 fleet_cp 6683 CPADDTENANT t1 tok1 ns1 1
-$B --port 6698 --engine rocks --data-dir "$D/m" 2>/dev/null &
+$B --port 6698 --engine rocks --data-dir "$D/m" 2>"${FLEET_SCOPE}server.log" &
 fleet_wait_listen 6698
 # --edge-advertise is REQUIRED for this drill to test what it claims: without a
 # callback address family_command short-circuits to -COPROCUNAVAIL at the

@@ -20,7 +20,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-$B --port 6650 --engine rocks --data-dir "$D" 2>/dev/null &
+$B --port 6650 --engine rocks --data-dir "$D" 2>"${FLEET_SCOPE}server.log" &
 fleet_wait_listen 6650
 sleep 0.6
 ./target/release/flint-proxy --port 6667 --pairs "127.0.0.1:6650" \

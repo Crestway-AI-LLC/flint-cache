@@ -56,9 +56,9 @@ for spec in "6710:" "6711:127.0.0.1:6710" "6720:" "6721:127.0.0.1:6720"; do
   p=${spec%%:*}; m=${spec#*:}
   d="$FLINT_DRILL_ROOT/flint-m3-$p"; rm -rf "$d"
   if [ -n "$m" ]; then
-    $B --port $p --engine rocks --data-dir "$d" --replica-of "$m" 2>/dev/null &
+    $B --port $p --engine rocks --data-dir "$d" --replica-of "$m" 2>"${FLEET_SCOPE}server.log" &
   else
-    $B --port $p --engine rocks --data-dir "$d" 2>/dev/null &
+    $B --port $p --engine rocks --data-dir "$d" 2>"${FLEET_SCOPE}server2.log" &
   fi
   sleep 0.4
 done

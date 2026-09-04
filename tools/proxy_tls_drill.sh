@@ -20,7 +20,7 @@ cleanup() { fleet_kill server; fleet_kill proxy; rm -rf "$D"; }
 trap cleanup EXIT
 
 # One backend; the proxy runs open-mode (no tenants) with a single static pair.
-$B --port 6310 --engine rocks --data-dir "$D/data" 2>/dev/null &
+$B --port 6310 --engine rocks --data-dir "$D/data" 2>"${FLEET_SCOPE}server.log" &
 fleet_wait_listen 6310
 sleep 0.6
 

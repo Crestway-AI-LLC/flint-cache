@@ -39,9 +39,9 @@ for p in $DERIVED $PINNED; do
   d="$FLINT_DRILL_ROOT/flint-walb-$p"; rm -rf "$d"
   extra=""
   [ "$p" = "$PINNED" ] && extra="--wal-size-limit-mb 4096"
-  $B --port $p --engine rocks --data-dir "$d" --disk-sample-ms 200 $extra 2>/dev/null &
+  $B --port $p --engine rocks --data-dir "$d" --disk-sample-ms 200 $extra 2>"${FLEET_SCOPE}server.log" &
 done
-$B --port $MEM --engine mem --disk-sample-ms 200 2>/dev/null &
+$B --port $MEM --engine mem --disk-sample-ms 200 2>"${FLEET_SCOPE}server2.log" &
 sleep 1.0
 for p in $DERIVED $PINNED $MEM; do
   [ "$(valkey-cli -p $p PING 2>/dev/null)" = "PONG" ] || { echo "FAIL: :$p never answered PING"; exit 1; }

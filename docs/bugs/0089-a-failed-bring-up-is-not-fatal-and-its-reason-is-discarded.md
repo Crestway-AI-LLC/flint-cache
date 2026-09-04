@@ -1,7 +1,8 @@
 # BUG-0089 — a failed bring-up is not fatal, and its reason is discarded
 
-**Status:** library half FIXED 2026-09-03; **77 spawns across 31 drills still
-discard their stderr** — see "What is left".
+**Status:** FIXED 2026-09-04. Library half 2026-09-03; all 77 spawns
+converted the next day, once the scope turned out to make per-drill paths
+unnecessary.
 **Area:** `tools/lib/fleet.sh` and the drills that stand up a cluster.
 
 ## The asymmetry
@@ -83,35 +84,81 @@ and leaves the conclusion to the reader.
 It makes the reader correct first, so that converting them can be checked
 against something that works.
 
-## 2026-09-04 — the remaining scope, re-counted, and it is smaller than 77
+## 2026-09-04 — all 77, and two defects found doing it
 
-Measured before starting, not as part of a sweep. Counting only lines that
-BACKGROUND a seat binary (`... &`), excluding `pkill`/`fleet_signal` cleanup
-lines that mention a port and a binary and so match a looser pattern:
+### `FLEET_SCOPE` is a prefix, and the helper assumed a directory
 
-**54 spawns across 30 drills** send stderr to `/dev/null`. Concentrated rather
-than uniform — `slot_cutover_recovery` has 6, `bloom` 4, `controller`,
-`controller_ha` and `min_replicas` 3 each — so a third of the work is in five
-files.
+The library half shipped with `fleet_why_not_up` testing
+`[ -d "$FLEET_SCOPE" ]`. In this repo the scope is a **prefix** —
+`fleet_init $FLINT_DRILL_ROOT/flint-bloom-` — and the lock beside it is
+`${FLEET_SCOPE}.lock`, a sibling file. So the test was never true, the helper
+found nothing every time, and it then printed *"this drill's spawn sent
+stderr to /dev/null"*.
 
-**And spawns with NO redirect are not part of the problem.** There are 8 of
-those (5 in `failover`, 2 in `restart`, 1 in `repl`), and their stderr is
-INHERITED by the drill, so it reaches the drill log and the gate artifact
-already. `failover`'s CI log carries `flint-server listening on ...` inline,
-which is that inheritance visible. They need no change, and converting them
-would move output from a place that works to a place that also works.
+**It asserted a cause it had not established, inside the function written to
+stop exactly that.** It globs both forms now, and when it finds nothing it
+says what it looked for rather than why it failed — "the spawn discarded it"
+and "this drill logs somewhere else" are indistinguishable from there.
 
-### The enabler, if the 54 are taken
+### The conversion needed no per-drill paths after all
 
-The reason given for deferring was that "the convention varies per drill --
-MDIR, RDIR, mktemp -d ...". That is true of the DATA dirs and need not be true
-of the log path. `fleet_init` sets `FLEET_SCOPE` in every drill and does not
-create it; a helper that creates it on demand and returns
-`$FLEET_SCOPE/<name>.log` would make every conversion the same one-line edit,
-and `fleet_why_not_up` already reads exactly that location (both levels, since
-2026-09-04).
+The reason given for deferring it was that the scratch-directory convention
+varies — `MDIR`, `RDIR`, `D1`, `SDIR`, `STATE`, and six drills with none.
+That was true and irrelevant: every drill that spawns a seat has already
+called `fleet_init`, so **every one has `$FLEET_SCOPE`**. All 77 now write
+`${FLEET_SCOPE}<name>.log`, which is also exactly where the helper looks.
 
-Not built here, because this is filed work with an owner and a helper nobody
-calls is dead code. Recorded so that whoever takes it does not re-derive it, and
-so the count is 54 rather than 77.
+31 drills, 77 spawns, zero remaining.
 
+### Last run's logs are not this run's evidence
+
+Nothing removed those logs, so a re-run would find the previous failure's
+output still sitting there and report it as the cause of today's — a stale
+cause read as a fresh one, which is worse than having none. `fleet_init`
+clears `${FLEET_SCOPE}*.log` at the start of every run. Not in a trap: the
+drills install their own `EXIT` traps and the last one installed wins.
+
+Verified by planting a stale log, running the drill, and confirming it was
+gone.
+### Both halves were found independently, and each missed the other's
+
+Two sessions fixed `fleet_why_not_up` the same afternoon without knowing.
+One found that `flintctl` writes to `<statedir>/logs/` and the glob looked one
+level too high; the other found that for most drills `FLEET_SCOPE` is a
+**prefix**, so the `[ -d "$d" ]` guard is false and the scan never runs at
+all. Each fix left the other's case reporting "nothing found".
+
+Resolved as the union — `"$d"*.log`, `"$d"/*.log`, `"$d"/logs/*.log`, and no
+`[ -d ]` gate, since an unmatched glob is skipped by the `-f` test and the
+gate is what hid the prefix case. Worth recording because the two diagnoses
+read as contradictory ("it is a directory one level up" against "it is not a
+directory") and are both true, of different drills.
+
+### Two counts, 54 and 77, and both are right
+
+A concurrent re-count arrived at **54 spawns across 30 drills**; this pass
+converted 77 across 31. Neither is wrong — they scope the word "spawn"
+differently. Of the 77 lines changed:
+
+| what is backgrounded | count |
+|---|---|
+| a seat binary (`$B`) | 54 |
+| a control plane (`$CP`) | 14 |
+| a proxy (`$PX`) | 9 |
+
+The 54 is exactly the seat-binary subset. The other 23 are control planes and
+proxies, which are bring-up too and fail just as opaquely — a proxy that never
+binds discards its reason the same way a node does — so they went in the same
+pass. Recorded because two numbers for one job, left standing side by side,
+reads as a disagreement about the WORK when it is only a disagreement about
+the noun.
+
+### The 8 spawns with no redirect stay as they are
+
+Also from that re-count, and it holds: 5 in `failover`, 2 in `restart`, 1 in
+`repl` background a seat with **no** redirect at all, so their stderr is
+INHERITED by the drill and already reaches the drill log and the gate
+artifact — `failover`'s CI log carries `flint-server listening on ...` inline,
+which is that inheritance visible. Converting them would move output from a
+place that works to a place that also works. Left alone deliberately, and said
+so here, so that a later sweep counting `2>` redirects does not "finish" them.
