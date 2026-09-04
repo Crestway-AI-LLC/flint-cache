@@ -124,6 +124,25 @@ else
   # that the cadence defaults to 0 (the static does; the running seat reports
   # 500ms); then a cadence alone, worded as though a non-zero cadence put fsync
   # inside every write. Both numbers, and the caveat, or neither.
+  # ROCKSDB'S OWN BACKPRESSURE, which separates two of the remaining candidates
+  # at no cost -- these fields are already in FLINTINFO and INFO is already read.
+  #
+  # Per-write service time inflates ~10x under four-way parallelism while queue
+  # depth stays flat (docs/bugs/0064). If that is COMPACTION DEBT, the engine
+  # says so itself: write_stopped, a non-zero delayed_write_rate, growing
+  # l0_files or pending_compaction_bytes are RocksDB throttling the write path
+  # deliberately. If instead all of these are quiet while service time is still
+  # 10x, the engine believes it is healthy and the time is going somewhere it
+  # cannot see -- the OS descheduling it, or contention below the filesystem.
+  #
+  # Instantaneous at INFO time rather than at the peak, so a quiet reading here
+  # is weaker evidence than a loud one: debt can drain between the peak and this
+  # read. A loud reading is conclusive, a quiet one is suggestive.
+  WST=$(printf '%s\n' "$INFO" | sed -n 's/^write_stopped://p')
+  DWR=$(printf '%s\n' "$INFO" | sed -n 's/^delayed_write_rate://p')
+  L0F=$(printf '%s\n' "$INFO" | sed -n 's/^l0_files://p')
+  PCB=$(printf '%s\n' "$INFO" | sed -n 's/^pending_compaction_bytes://p')
+  echo "== engine backpressure at read: write_stopped=${WST:-?} delayed_write_rate=${DWR:-?} l0_files=${L0F:-?} pending_compaction_bytes=${PCB:-?}"
   FSMS=$(printf '%s\n' "$INFO" | sed -n 's/^wal_fsync_ms://p')
   FS1=$(printf '%s\n' "$INFO" | sed -n 's/^wal_fsync_total://p')
   if [ -n "${FS0:-}" ] && [ -n "${FS1:-}" ]; then

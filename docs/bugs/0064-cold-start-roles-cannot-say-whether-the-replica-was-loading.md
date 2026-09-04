@@ -676,3 +676,32 @@ internal locking are all consistent with what is now measured. Separating them
 needs either a serial CI arm carrying these fields (four dispatches) or a
 per-write breakdown the seat does not currently expose.
 
+### The next fork is free: RocksDB already says whether it is throttling
+
+`FLINTINFO` carries the engine's own backpressure signals and the drill already
+reads INFO, so this needed no server change:
+
+    == engine backpressure at read: write_stopped=0 delayed_write_rate=0 l0_files=1 pending_compaction_bytes=0
+
+**Serial baseline: the engine is entirely quiet** at 179us service time. Nothing
+stopped, nothing delayed, one L0 file, no compaction debt.
+
+That makes the P=4 comparison a clean fork, with both branches meaningful:
+
+- **Loud** — `write_stopped`, a non-zero `delayed_write_rate`, or growing
+  `l0_files`/`pending_compaction_bytes` — means RocksDB is throttling the write
+  path deliberately, and the ~10x service inflation is compaction debt from four
+  drills sharing one disk. That is a capacity problem with known knobs, and it
+  connects directly to BUG-0013.
+- **Quiet** — all of them near zero while service time is still ~8000us — means
+  the engine believes it is healthy and the time is going somewhere it cannot
+  see: the OS descheduling the process, or contention below the filesystem. That
+  is not a Flint tuning problem at all, and would make the gate's flakiness an
+  artefact of running four seat-heavy drills on a 4-vCPU shared runner.
+
+**Asymmetry worth stating in advance:** the reading is instantaneous at INFO
+time, not at the peak, so debt can drain in between. A LOUD reading is therefore
+conclusive and a QUIET one is only suggestive — the fork is not symmetric and a
+quiet P=4 result will need the reading moved next to the peak before it can
+carry the second conclusion.
+
