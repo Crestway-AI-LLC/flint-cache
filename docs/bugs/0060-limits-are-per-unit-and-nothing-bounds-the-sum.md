@@ -758,3 +758,44 @@ materialised, and **`mem_total_bytes`/`mem_avail_bytes` are now in FLINTINFO**
 constant. The decision to make is the policy — what fraction, and whether an
 over-budget read is refused or queued — not the mechanism.
 
+## 2026-09-04 — the admission design rests on a predictor, and the predictor holds
+
+The approved fix refuses a collection read that would push the node past a
+memory budget. That requires knowing the cost BEFORE serving it, and the only
+thing knowable beforehand is `ComplexMeta.bytes` — one cheap metadata read. So
+the whole design rests on `peak = k x bytes` with **k stable enough to admit
+against**. If k moved with size, admission from metadata could not bound
+anything and the fix would need a different shape.
+
+Measured before building the policy rather than after. Hashes of 100 KB values,
+`HGETALL` each, RSS sampled every 5 ms:
+
+| fields | logical | peak delta | ratio |
+|---|---|---|---|
+| 500 | 50.0 MB | 104.7 MB | **2.09** |
+| 1000 | 100.0 MB | 209.1 MB | **2.09** |
+| 2000 | 200.0 MB | 441.8 MB | **2.21** |
+
+**Spread 6% across a 4x size range.** The predictor holds, so the design is
+sound: `mem_avail_bytes` (added 2026-09-04) gives the budget, `ComplexMeta.bytes`
+gives the size, and **2.2x** is the multiplier to admit against — with headroom,
+since the top of the observed range is the honest figure to use.
+
+### A discrepancy worth stating rather than smoothing
+
+Pass 7 measured **2.72x** (a 205 MB hash peaking at +557 MB). This run gives
+2.21x for the same shape. Candidates, none verified: the sampling interval
+differs (10 ms there, 5 ms here — though a finer sampler should catch a HIGHER
+peak, not a lower one, so this points the wrong way); or the collection read path
+changed between the two, since `hashes.rs` moved to `for_each_prefix` under
+ADR-0025 and this file's own pass 7 predates that landing.
+
+**Not claimed:** that the streaming conversion cut the ratio. It would be a
+tidy story and I have not tested it — it needs the same measurement against the
+pre-conversion commit, which is one `git checkout` and a rebuild. Recorded so
+the number in this file is not quietly two different numbers.
+
+**For the policy, use 2.72x.** The higher of two measurements of the same
+quantity is the safe input to an admission bound, and the difference between
+them is unexplained.
+
