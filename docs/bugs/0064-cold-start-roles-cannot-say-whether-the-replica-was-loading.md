@@ -494,3 +494,69 @@ looking *more* variable than a single-commit sample would, so a P=1 arm that
 merely looks tighter proves nothing; only its LOCATION relative to the baseline
 range counts.
 
+## 2026-09-03 — RESULT: parallelism is the dominant term, and the OOM hypothesis is dead
+
+Four dispatches at `gate_jobs=1`, all green, all at commit `6771559`.
+
+| arm | n | peaks (ms) | median | min | max |
+|---|---|---|---|---|---|
+| **P=1** | 4 | 48, 61, 69, 71 | **65** | 48 | **71** |
+| **P=4** | 9 | 90, 124, 324, 495, 557, 763, 840, 955, 1322 | **557** | **90** | 1322 |
+
+**The pre-registered condition is met:** every P=1 peak falls below the P=4
+minimum, so parallel contention is the dominant term in the write-wait margin.
+Medians differ **8.6x**.
+
+**Two corrections to how that was set up, both against my own case.**
+
+*The baseline was stale.* The prediction was written against n=7 with a minimum
+of 124 ms. Two further P=4 runs had already landed (`51e4f68` at 955 ms,
+`6771559` at 90 ms) and are included above. The P=4 minimum is therefore **90,
+not 124**, and the gap to the P=1 maximum of 71 is **1.27x**, not 1.7x. The
+condition still passes, on a much narrower margin than the original framing
+would have suggested. Recorded because the threshold was fixed in advance
+precisely so it could not be adjusted afterwards — and the honest report is that
+the baseline moved underneath it, not that the margin was comfortable.
+
+*The separation is carried by the TAIL, not the floor.* A P=4 run can be as
+quiet as 90 ms — `6771559` was — so the two arms are adjacent at the low end.
+What P=1 never produces is the upper half: 495 to 1322 ms, **8x to 19x** the P=1
+maximum. Since the tail is what crosses the 2000 ms deadline, that is the part
+that matters, but "P=1 is uniformly faster" would overstate it. P=4 is
+*sometimes* as fast; it is sometimes fifteen times slower.
+
+### The OOM hypothesis is refuted, by the instrument added for it
+
+Lowest free memory recorded in each arm, on a 15.6 GiB runner:
+
+| arm | lowest free |
+|---|---|
+| P=4 | 13.8 - 13.9 GiB |
+| P=1 | 14.1 - 14.3 GiB |
+
+The gate uses **under 1.8 GiB** at four-way parallelism and never approaches
+pressure. The `pipeline_nodelay` server that was SIGKILLed mid-run was not
+OOM-killed, and BUG-0060's unbounded aggregate is not what this gate is hitting.
+That question is closed with a number a day after it was raised, which is what
+the instrument was for.
+
+### What this settles, and what it does not
+
+**Settled:** the parallel gate, not the runner, is the dominant source of write-
+wait pressure. The earlier reading here — that load and unattributed-process
+counts failed to separate failing from passing runs, therefore the runner rather
+than parallelism — was measuring the wrong quantity. Load does not separate
+them; the write-wait margin separates them cleanly. A null on a proxy said
+nothing about the thing the proxy stood for.
+
+**Not settled:** which resource. Not memory, now measured. CPU remains open —
+`FLINT_GATE_JOBS: 4` on 4 vCPU is one drill per core, and the file already
+records a clean run at load 8.04, so raw exhaustion is not it either. Ports,
+disk and lock contention are untested. The mechanism by which four drills triple
+a write-wait margin is still unknown.
+
+**Also not settled: whether this explains the 14% red rate.** It explains the
+`failover` refusals, whose margin is now measured on both arms. It says nothing
+yet about the bootstrap cluster, which was diagnosable-in-principle and is only
+now being reported properly.
+
