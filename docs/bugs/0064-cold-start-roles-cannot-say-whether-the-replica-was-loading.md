@@ -458,3 +458,39 @@ Nothing is claimed until those accumulate. What can be said now is that the one
 axis on which these failures could plausibly differ is the one nothing was
 recording, which is the same position BUG-0088 was in this morning.
 
+## 2026-09-03 — the P=1 experiment, DESIGN AND PREDICTION RECORDED BEFORE THE RESULT
+
+This file has wanted a `gate_jobs=1` comparison since 2026-08-27 and never took
+it, because at a 14% failure rate telling P=1 from P=4 needed ~20 runs to
+separate the rates. **BUG-0088's `write_wait_peak_ms` removes that cost**: the
+outcome is now a continuous margin rather than a pass/fail bit, so
+distributions can be compared instead of rates.
+
+**Baseline, and it was free.** Seven P=4 peaks from ordinary pushes:
+124, 324, 495, 557, 763, 840, 1322 ms — median **557**, min **124**, max
+**1322**.
+
+**Arms.** Four `workflow_dispatch` runs at `gate_jobs=1`, full CORE list, all at
+commit `6771559`. Runs `33822293332`, `33822297593`, `33822301564`,
+`33822305667`. No matched P=4 arm is needed because the baseline above is the
+same workflow on the same runner class.
+
+**Recorded before looking, because this file has twice reached a conclusion the
+evidence did not carry:**
+
+- If **all four** P=1 peaks fall below the P=4 minimum (124 ms), parallel
+  contention is the dominant term and the 14% red rate has a mechanism.
+- If the P=1 **median lands inside the P=4 middle range** (~324-840 ms),
+  parallelism is exonerated as the dominant term and the cause is the runner
+  itself — which is what the 10.7x spread and the load/memory nulls already
+  suggest.
+- **Anything between those is inconclusive at n=4** and must be reported as
+  such rather than argued into one of the two.
+
+**Known confound, stated now:** the seven baseline peaks come from seven
+different commits, all on `main` within a few hours and none touching the write
+path, while the four dispatches are one commit. That biases toward the baseline
+looking *more* variable than a single-commit sample would, so a P=1 arm that
+merely looks tighter proves nothing; only its LOCATION relative to the baseline
+range counts.
+
