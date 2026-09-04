@@ -443,6 +443,33 @@ _fleet_ours() {
 #
 # Waits that are not readiness — "let the controller observe convergence" —
 # are a different thing and must stay sleeps.
+# WHY DID IT NOT COME UP?
+#
+# "nothing listening on 127.0.0.1:6440 after 30s" is a symptom. The process
+# said why -- a rejected flag, a port already held, a missing engine feature,
+# an unwritable data dir -- and 77 spawns across 31 drills here send that to
+# /dev/null. This prints whatever the scope directory does hold, and SAYS SO
+# when it holds nothing, so the reader learns the reason was discarded rather
+# than that there was none.
+#
+# The ops repo hit this as OPS-0117: a standing note there read "local
+# flint-server lacks rocks -- drills fail at bring-up looking like a product
+# bug", which was this exact defect written down as a fact about the
+# environment instead of a bug in the harness.
+fleet_why_not_up() {
+  local d="${FLEET_SCOPE:-}" f n=0
+  if [ -n "$d" ] && [ -d "$d" ]; then
+    for f in "$d"/*.log; do
+      [ -f "$f" ] && [ -s "$f" ] || continue
+      n=$((n + 1))
+      echo "  --- $f (last 15 lines) ---"
+      tail -n 15 "$f" | sed 's/^/  /'
+    done
+  fi
+  [ "$n" = 0 ] && echo "  (no captured output to read -- this drill's spawn sent stderr to /dev/null, so the reason is gone, not absent)"
+  return 0
+}
+
 fleet_wait_listen() {
   local port deadline
   for port in "$@"; do
@@ -451,7 +478,15 @@ fleet_wait_listen() {
       if (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then break; fi
       if [ "$(date +%s)" -ge "$deadline" ]; then
         echo "FAIL: nothing listening on 127.0.0.1:$port after 30s"
-        return 1
+        fleet_why_not_up
+        # EXIT, like fleet_wait_ping does. This RETURNED, and the drills run
+        # under `set -u` rather than `set -e`, so 131 of the bring-up waits
+        # here ignore the result and run on into their assertions -- reporting
+        # whichever one trips first, a claim about the PRODUCT, for what was
+        # really a seat that never started. Two functions in one file, one
+        # returning and one exiting, reads as two contracts rather than one
+        # oversight. Same defect as the ops repo's OPS-0117.
+        exit 1
       fi
       sleep 0.05
     done
@@ -518,6 +553,7 @@ fleet_wait_alive() {
     [ "$(valkey-cli -p "$port" "$@" PING 2>/dev/null)" = "PONG" ] && return 0
     if [ "$(date +%s)" -ge "$deadline" ]; then
       echo "FAIL: no PONG from 127.0.0.1:$port after 30s"
+      fleet_why_not_up
       exit 1
     fi
     sleep 0.2
@@ -603,6 +639,9 @@ fleet_wait_ping() {
       else
         echo "FAIL: no PONG from 127.0.0.1:$port after 30s"
       fi
+      # Useful in BOTH branches: a node stuck in `loading` has a log saying
+      # how far its sync got, which is the next question either way.
+      fleet_why_not_up
       exit 1
     fi
     sleep 0.2
