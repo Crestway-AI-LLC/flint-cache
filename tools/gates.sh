@@ -212,7 +212,7 @@ CORE="${FLINT_CORE_ORDER:-kill_order restart repl kill_release failover proxy sl
       scan slot_cutover slot_cutover_recovery slot_moved snapshot_restore
       tenant tenant_rebalance tenant_remove token_hash
       write_deadline fullsync_rate edge_reroute rewind_rejoin wal_headroom wal_budget evictable_ns evictable_agree min_replicas_survivable roll_shed proxy_chain
-      walgap_quarantine three_member_repoint pipeline_nodelay batch_commit_failure build_read_failure cp_watch_idle reattach_node}"
+      walgap_quarantine three_member_repoint pipeline_nodelay batch_commit_failure build_read_failure cp_watch_idle reattach_node induced_ratchet}"
 CHAOS="chaos proxy_chaos chaos_unreadable hotkey_chaos"
 
 # DELIBERATELY OUT, with the reason. An absence with no reason beside it is
@@ -1120,6 +1120,73 @@ fi
 # It fails when it cannot look, not only when it finds a gap: an unreadable
 # README, or a bugs directory with no files, means this did not run. A matcher
 # that finds nothing agrees with everything.
+assert_induced_controls_have_not_regressed() {
+  # ADR-0028 OBLIGATION 4, GIVEN A MECHANISM (OPS-0122).
+  #
+  # Obligation 4 -- a failure message must not name a cause the check has not
+  # established -- was ACCEPTED 2026-09-04 with seven instances, and OPS-0121
+  # was found the same day, live on both production boxes. Obligation 1 got
+  # `FLINT_GATE_SUBJECT` and stopped recurring; obligation 4 got words.
+  #
+  # WHAT ACTUALLY CATCHES THIS CLASS is an induced-failure control: break the
+  # thing on purpose and assert the message names what you broke. Every
+  # instance fixed well this week has one -- BUG-0089 squatted a port,
+  # BUG-0090 shrank a timeout to 1ms, OPS-0121 mutates the fixture's reason.
+  #
+  # SO THIS IS A RATCHET, NOT A RULE. It counts drills carrying such a control
+  # and fails only when the count DROPS. That is deliberate:
+  #
+  #   - No exclusion list. BUG-0086 already recorded what those cost -- "a list
+  #     saying these are fine is a second declaration to keep in sync with use"
+  #     -- and a bare count has nothing to keep in sync.
+  #   - It cannot redden a gate that is green today, including a peer session's.
+  #     The only way to fail is to REMOVE a control, which is the thing worth
+  #     refusing.
+  #   - The matcher is deliberately loose. A loose matcher inflates the count,
+  #     and an inflated FLOOR is the conservative error: it protects more than
+  #     it should rather than less. A tight one would quietly permit deletions.
+  local floor_file=tools/induced-control-floor.txt
+  local n floor
+  n=$(grep -lEi "positive control|induced|mutation control|deliberately break|squat" \
+        tools/*_drill.sh 2>/dev/null | wc -l | tr -d ' ')
+  local total
+  total=$(ls tools/*_drill.sh 2>/dev/null | wc -l | tr -d ' ')
+
+  # A MATCHER THAT FINDS NOTHING AGREES WITH EVERYTHING. If the glob missed
+  # the corpus, this check did not run, and that is not a pass.
+  if [ "$total" = 0 ]; then
+    echo "FAIL  no tools/*_drill.sh found -- this check examined nothing."
+    echo "        Either the drills moved or the glob is wrong; both are bugs"
+    echo "        in this check, and neither is a green ratchet."
+    FAILED="$FAILED induced-control-examined-nothing"
+    return
+  fi
+  if [ ! -s "$floor_file" ]; then
+    echo "FAIL  $floor_file is missing or empty -- the ratchet has no floor,"
+    echo "        so it cannot tell a regression from a first run."
+    FAILED="$FAILED induced-control-no-floor"
+    return
+  fi
+  floor=$(tr -dc '0-9' < "$floor_file")
+
+  if [ "$n" -lt "$floor" ]; then
+    echo "FAIL  induced-failure controls dropped: $n of $total drills, floor $floor"
+    echo "        A control was removed. These are what catch ADR-0028"
+    echo "        obligation 4 -- a failure message naming a cause nobody"
+    echo "        established -- and they are the only thing that ever has."
+    echo "        Restore it, or lower $floor_file in the SAME commit and say"
+    echo "        in the message which control went and why."
+    FAILED="$FAILED induced-control-regressed"
+    return
+  fi
+  if [ "$n" -gt "$floor" ]; then
+    echo "NOTE  induced-failure controls: $n of $total drills (floor $floor)."
+    echo "        The floor can be raised to $n -- do it in a commit, not here."
+    echo "        This is a NOTE, not a failure: raising the bar must not redden"
+    echo "        a gate for someone who merely added a drill."
+  fi
+}
+
 assert_bug_index_agrees() {
   local idx=docs/bugs/README.md missing="" untitled="" dups b n h files=0
   if [ ! -s "$idx" ]; then
@@ -1764,6 +1831,7 @@ assert_warm_covers_fleet_binaries() {
 if want check; then
   echo "== gates: fmt, clippy, tests (both feature configs)"
   assert_no_default_ports
+  assert_induced_controls_have_not_regressed
   assert_bug_index_agrees
   assert_no_port_overlap
   assert_scripts_parse

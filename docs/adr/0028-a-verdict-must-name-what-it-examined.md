@@ -298,3 +298,47 @@ which". The evidence for paying it is that a wrong attribution here cost a
 release gate, an evening of drill-by-drill triage, and — twice — a hypothesis
 recorded in the tree that was never true.
 
+## 2026-09-04, later the same day — obligation 4 gets a mechanism
+
+**OPS-0121 was found hours after this ADR was accepted**, live on both ops
+boxes: the daily report explained an empty shadow lane with "the expected state
+until a widowed master occurs (~1 per 36h)" while 1112 widowed masters sat in
+the spool. The real reason was that 1400 of 1489 findings arrived past a
+freshness ceiling.
+
+So the obligation, written down and accepted, did not survive its own
+acceptance day. That is not an argument against it — it is the evidence that
+obligation 1 is the only one that stopped recurring, and the only one with a
+thing that refuses (`FLINT_GATE_SUBJECT`).
+
+**A helper is not the mechanism either.** Instance #6 in the table above is
+`fleet_why_not_up` — written to stop cannot-look being reported as absent, and
+it reported cannot-look as absent. A remedy that reproduces the defect rules
+out "route everything through one function" as the whole answer.
+
+What has actually caught this class, every time, is an **induced-failure
+control**: break the thing on purpose and assert the message names what you
+broke. #6 was proved by squatting a declared port. BUG-0090 was proved by
+shrinking a 5 s write timeout to 1 ms and reproducing the failure
+byte-identically. OPS-0121's drill mutates the fixture's skip reason and
+requires the rendered output to follow it, because a second hardcoded sentence
+would pass a weaker check.
+
+**The mechanism is therefore a ratchet on those controls, not a rule about
+messages.** `assert_induced_controls_have_not_regressed` counts drills carrying
+one and fails only when the count DROPS — 42 of 132 here, 40 of 84 in the ops
+repo, floors in `tools/induced-control-floor.txt`. It has no exclusion list, so
+it does not incur BUG-0086's cost; it cannot redden a gate that is green today,
+including another session's, because `n > floor` is a NOTE rather than a
+failure; and its matcher is loose on purpose, since an inflated floor protects
+more than it should while a tight one would quietly permit deletions.
+
+**What it does not do**, stated so nobody reads more into it: it does not stop
+the next such message from being written. It stops the control that would catch
+one from being deleted, and it makes the population countable. The stronger
+form — refusing any new explainer that ships without a control — was considered
+and declined the same day: recognising an "explainer" needs a list, and a list
+is the thing BUG-0086 warns about.
+
+Filed as OPS-0122 in the ops repo, with the drill that pins all five ratchet
+behaviours.
