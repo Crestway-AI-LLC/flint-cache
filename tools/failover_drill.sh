@@ -47,6 +47,11 @@ sleep 0.4
 fleet_wait_listen "$RPORT"
 sleep 0.6
 
+# WAL fsync counter BEFORE the load, to pair with the cadence and the service
+# time after it. `|| true` because this drill is set -euo pipefail and a
+# diagnostic must never abort the run it is diagnosing.
+FS0=$(valkey-cli -p "$MPORT" FLINTINFO 2>/dev/null | tr -d '\r' | sed -n 's/^wal_fsync_total://p' || true)
+
 echo "== loading $KEYS keys"
 awk -v n="$KEYS" 'BEGIN {
   for (i = 0; i < n; i++) {
@@ -106,6 +111,26 @@ elif [ -z "$PEAK" ] || [ -z "$DLINE" ]; then
   exit 1
 else
   echo "== write-wait peak ${PEAK}ms of ${DLINE}ms deadline (inflight ${PKI:-UNREADABLE} x service ${PKS:-UNREADABLE}us; 0 = no write projected a measurable wait)"
+  # CADENCE AND COUNT TOGETHER, because neither alone can be read.
+  #
+  # The fsync here is PERIODIC, not per-write: WAL_FSYNC_MS is a timer, so a
+  # write only pays for one if it lands on a tick. That makes a per-write
+  # service inflation an unlikely thing for fsync to cause directly, and it
+  # makes a zero COUNT ambiguous -- a fast load can span no tick at all and
+  # report 0 while the mechanism is perfectly live.
+  #
+  # Recorded because two wrong readings were nearly shipped from this spot in
+  # one sitting: first a count alone, called structurally zero on the belief
+  # that the cadence defaults to 0 (the static does; the running seat reports
+  # 500ms); then a cadence alone, worded as though a non-zero cadence put fsync
+  # inside every write. Both numbers, and the caveat, or neither.
+  FSMS=$(printf '%s\n' "$INFO" | sed -n 's/^wal_fsync_ms://p')
+  FS1=$(printf '%s\n' "$INFO" | sed -n 's/^wal_fsync_total://p')
+  if [ -n "${FS0:-}" ] && [ -n "${FS1:-}" ]; then
+    echo "== wal fsync: cadence ${FSMS:-UNREADABLE}ms (periodic, not per-write), $((FS1 - FS0)) fsync(s) during the load of $KEYS writes"
+  else
+    echo "== wal fsync: cadence ${FSMS:-UNREADABLE}ms, count UNREADABLE (pre=${FS0:-?} post=${FS1:-?})"
+  fi
 fi
 
 echo "== waiting for replica catch-up"

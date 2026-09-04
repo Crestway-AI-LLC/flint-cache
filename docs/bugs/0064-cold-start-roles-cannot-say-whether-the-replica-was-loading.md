@@ -645,3 +645,34 @@ the seat not answering is transient and now reports UNREADABLE and **continues**
 to the real assertions, while INFO answering *without* the fields is the build
 having lost the instrument and still fails. Both branches mutation-tested.
 
+### Narrowing the resource: fsync is periodic, so it is a poor candidate
+
+The service-time result needs the WAL fsync excluded or implicated, so the drill
+now reports both the cadence and the count during the load:
+
+    == wal fsync: cadence 500ms (periodic, not per-write), 0 fsync(s) during the load of 20000 writes
+
+**The fsync here is on a timer, not on the write.** A write pays for one only if
+it lands on a tick, which makes a uniform per-write service inflation an
+unlikely thing for it to cause directly. It does not eliminate the disk — the
+same device serves compaction and the memtable flush — but it does mean the
+mechanism is not "each write now waits for a durable sync".
+
+**Two wrong readings were nearly shipped from this one spot in a single
+sitting**, and both are worth recording because each looked finished:
+
+1. A **count alone**, dismissed as structurally zero on the grounds that
+   `WAL_FSYNC_MS` defaults to 0. The static does default to 0; the running seat
+   reports **500ms**. The number was real and the reasoning about it was not.
+2. Then a **cadence alone**, worded as "fsync IS part of the service time
+   above" — which reads as per-write and is false for a timer.
+
+The first would have deleted a live measurement; the second would have
+misattributed the service inflation to durability. Both numbers, with the
+periodic caveat, or neither.
+
+**Still open:** disk contention from compaction, CPU scheduling, and RocksDB
+internal locking are all consistent with what is now measured. Separating them
+needs either a serial CI arm carrying these fields (four dispatches) or a
+per-write breakdown the seat does not currently expose.
+
