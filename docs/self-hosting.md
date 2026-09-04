@@ -508,6 +508,39 @@ guess. Reboot the box, then check `systemctl status flint`, `flintctl -f
 /opt/flint/cluster.flint status` for the expected roles, and read a key you
 wrote before the reboot.
 
+### How long a replica may be away before it re-syncs from scratch
+
+A replica that returns within the master's WAL archive resumes from where it
+left off. Past that it discards its copy and takes a **full sync** — correct,
+but it re-reads the whole dataset over the network and loads the master while it
+does.
+
+The archive is bounded by **two terms, and only one of them is doing any work**:
+a 12-hour TTL and an 8 GiB byte budget, whichever trips first. **The TTL binds
+only below 0.20 MB/s.** Above that trickle the byte budget is the only term that
+ever prunes, so the window is `8 GiB / your write rate` — and that is a duration
+in minutes, not hours:
+
+| your write rate | archive holds |
+|---|---|
+| 5 MB/s | ~29 min |
+| 20 MB/s | ~7 min |
+| 40 MB/s | ~3.5 min |
+| 100 MB/s | ~1.5 min |
+
+**Do not read the 12-hour TTL as your maintenance window.** A busy node's real
+tolerance is single-digit minutes, and a rolling reboot that takes four minutes
+per replica at 40 MB/s is already at the edge.
+
+Two things follow. Take replicas down **one at a time and briefly**, and prefer
+`flintctl roll-node`, which sequences it. And if your maintenance genuinely
+needs longer, raise the budget deliberately — the archive shares the data
+volume, so buying more window costs capacity you were using for data, and the
+node's own `wal_archive_mb` in `FLINTINFO` tells you what it currently has.
+
+A full sync is not data loss and nothing is at risk here; the cost is time and
+load at the moment you are least likely to want either.
+
 ## 3. Monitoring & Grafana
 
 The open stack exposes its state through two RESP admin commands — this is
