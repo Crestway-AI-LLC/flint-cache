@@ -220,3 +220,49 @@ test. Name the sandbox origins to match the configured values instead.
 Obligation 1 first: one file, one caller pair, and it closes the case that
 reached a release script. 2 and 3 are cheap and can follow. None of this blocks
 rc.67.
+
+## 2026-09-04 — the same defect in the FAILURE direction, seven times in one day
+
+The observation above is five checks that PASSED about the wrong subject. A day
+of drill work produced seven that FAILED naming the wrong cause — a verdict
+asserting a fault in the PRODUCT for a condition in the harness or the clock.
+
+**Provenance, since this ADR is about that:** all seven are mine, each reproduced
+locally and each with the commit that fixed it. No second-hand accounts in this
+table.
+
+| # | the verdict it printed | what was actually true | fix |
+|---|---|---|---|
+| 1 | "no replication after bootstrap" | `flintctl bootstrap` had failed and its output went to `/dev/null`; 23 drills, 14 of which did not even check the exit status | `b7b74a9` |
+| 2 | "fleet B did not start", recorded in the gate's own exclusion list as a suspected PORT COLLISION | the inventory omitted `disposable on`, so bootstrap was REFUSED — the refusal discarded | `b7b74a9` |
+| 3 | "master unchanged (7221 -> 7221)" | read one second after a failover, while the demoted master was legitimately booting as MASTER from its durable role | `bbed94c` |
+| 4 | "the master shed NOTHING by the lag cause" | a positive control that never armed, because no write was offered inside the stall window | `4aa5c56` |
+| 5 | "verify still red after the member came back" — **this one reddened the v0.1.0-rc.68 release gate** | waited on liveness (`nodes_live`), asserted streaming | `f9c194d` |
+| 6 | "the reason is gone, not absent" | the log was one directory below where the reader globbed — inside the function written to stop cannot-look-being-reported-as-absent | `9e6af65` |
+| 7 | *(nothing at all — a silent exit mid-run)* | a diagnostic under `set -euo pipefail` whose own `FLINTINFO` call failed, aborting the run it was diagnosing | `6fed4d0` |
+
+**Not one was a product fault.** Every one was read as one until someone opened
+the log.
+
+### What this adds to the decision
+
+The three obligations above govern what a check DECLARES ABOUT ITS SUBJECT. Six
+of these seven satisfied all three and still misled, because the defect was in
+the FAILURE MESSAGE: it named a cause the check had not established. #3 could
+not distinguish a stale read from a stalled failover; #4 could not distinguish
+an unarmed control from a silent gate; #5 could not distinguish "not yet
+streaming" from "not streaming".
+
+**Proposed as a fourth obligation, for weighing rather than assumed:**
+
+> **4. A failure names only what it observed.** Where a verdict cannot separate
+> two causes, it says so and prints what it saw, rather than choosing the more
+> serious one. Where it CAN separate them, the separation is an assertion the
+> message makes explicitly.
+
+The cost is the same objection the ADR already answers about the other three:
+more words per failure, and a message that sometimes ends in "I cannot tell
+which". The evidence for paying it is that a wrong attribution here cost a
+release gate, an evening of drill-by-drill triage, and — twice — a hypothesis
+recorded in the tree that was never true.
+
