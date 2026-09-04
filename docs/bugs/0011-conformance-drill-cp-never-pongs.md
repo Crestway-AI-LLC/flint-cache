@@ -1,6 +1,6 @@
-# BUG-0011: `proxy_conformance_drill` bootstrap panics — the CP seat starts but never PONGs (OPEN)
+# BUG-0011: `proxy_conformance_drill` bootstrap panics — the CP seat starts but never PONGs (MITIGATED)
 
-Status: OPEN · first-exec validation is CONFIRMED, MEASURED AS SERIALIZED (~195 ms/binary, linear in burst size) and mitigated · the multi-second stall is now observed n=3 and still NOT reproducible on demand · found 2026-08-16 · Severity: medium (blocks the `drills` gate
+Status: **MITIGATED 2026-09-04.** The mechanism is measured and the warm is proven to remove it (241 ms unwarmed against 11 ms warmed, every warmed exec beating every unwarmed one). The clean-rate question is SUPERSEDED, not answered: three attempts could not collect it, and a rate would have been weaker evidence than the direct test. Reopen if a bring-up fails with the `_dyld_start` signature on a warmed binary. Prior status: OPEN · first-exec validation is CONFIRMED, MEASURED AS SERIALIZED (~195 ms/binary, linear in burst size) and mitigated · the multi-second stall is now observed n=3 and still NOT reproducible on demand · found 2026-08-16 · Severity: medium (blocks the `drills` gate
 stage; `check` is unaffected)
 
 ## Symptom

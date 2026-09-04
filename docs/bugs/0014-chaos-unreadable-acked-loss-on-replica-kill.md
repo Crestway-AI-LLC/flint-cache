@@ -1,6 +1,6 @@
-# BUG-0014: chaos_unreadable fails an acked write on a REPLICA kill (OPEN)
+# BUG-0014: chaos_unreadable fails an acked write on a REPLICA kill (CLOSED — instrument artifact)
 
-Status: OPEN, instrument FIXED 2026-08-22 · hypothesis (a) ELIMINATED 2026-08-22 · the drill has NOT fired in ~90+ gate runs since the fix, against a historical 7%, so the evidence now leans toward the oracle rather than the durability claim — but see 2026-09-03: absence is not the argument for closing it · First fired 2026-08-11, not 2026-08-18 · Severity: high if real
+Status: **CLOSED 2026-09-04 as an instrument artifact**, on Jeff's call. The misclassification window is proven in code — `the_archived_firing_is_reclassified_once_the_clock_can_resolve_it` shows the pre-fix rule condemning every send across the full 999 µs of the recorded millisecond — the one examinable firing sat inside it by construction, and the rate went from 4-in-57 to 0-in-~90 once the clock could resolve it. NOT proven, and stated rather than buried: that the archived write's send actually preceded the death, which the old resolution destroyed. The replay test is the regression guard; reopen on any firing whose entries are all `NewMaster` at microsecond resolution. Prior status: OPEN, instrument FIXED 2026-08-22 · hypothesis (a) ELIMINATED 2026-08-22 · the drill has NOT fired in ~90+ gate runs since the fix, against a historical 7%, so the evidence now leans toward the oracle rather than the durability claim — but see 2026-09-03: absence is not the argument for closing it · First fired 2026-08-11, not 2026-08-18 · Severity: high if real
 — the oracle is asserting the durability claim, so either the claim broke or
 the oracle is crying wolf, and both are worth an hour
 
