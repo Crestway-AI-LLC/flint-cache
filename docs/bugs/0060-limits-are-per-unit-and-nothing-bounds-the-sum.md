@@ -734,12 +734,12 @@ the tree:
 
 | quantity | value | source |
 |---|---|---|
-| per-collection cap | **512 MB** | `DEFAULT_MAX_VALUE_BYTES` |
-| peak RSS per in-flight read | **2.72x** the collection | this file, pass 7: 205 MB hash -> +557 MB |
-| so one max-size read costs | **~1.4 GB** | 512 MB x 2.72 |
+| per-collection cap | **512 MiB** | `DEFAULT_MAX_VALUE_BYTES` = `512 * 1024 * 1024` |
+| peak RSS per in-flight read | **3.19x** the collection | measured 2026-09-04 (later); see the settlement section |
+| so one max-size read costs | **~1.7 GB** | 512 MiB x 3.19, and measured directly at the cap |
 | concurrent reads permitted | **2048** | `max-conns` |
 
-**Five concurrent max-size collection reads is ~7 GB.** That is the defect, and
+**Five concurrent max-size collection reads is ~8.5 GB.** That is the defect, and
 it is a much narrower and more defensible statement than "nothing caps
 collections": each unit is bounded, nothing bounds their sum, and the sum
 reaches physical memory at single-digit concurrency.
@@ -758,7 +758,15 @@ materialised, and **`mem_total_bytes`/`mem_avail_bytes` are now in FLINTINFO**
 constant. The decision to make is the policy — what fraction, and whether an
 over-budget read is refused or queued — not the mechanism.
 
-## 2026-09-04 — the admission design rests on a predictor, and the predictor holds
+## 2026-09-04 — the admission design rests on a predictor
+
+> **Superseded the same day.** The measurement below ran every size in ONE
+> server process, so each size after the first was measured against a base
+> already inflated by the previous read. Its numbers are low and its central
+> claim — that the ratio is flat — is an artifact of that contamination.
+> The section after it has the corrected measurement. Kept because the
+> reasoning about *why* the design needs a predictor is still right, and
+> because the shape of the mistake is worth having on the record.
 
 The approved fix refuses a collection read that would push the node past a
 memory budget. That requires knowing the cost BEFORE serving it, and the only
@@ -776,26 +784,148 @@ Measured before building the policy rather than after. Hashes of 100 KB values,
 | 1000 | 100.0 MB | 209.1 MB | **2.09** |
 | 2000 | 200.0 MB | 441.8 MB | **2.21** |
 
-**Spread 6% across a 4x size range.** The predictor holds, so the design is
-sound: `mem_avail_bytes` (added 2026-09-04) gives the budget, `ComplexMeta.bytes`
-gives the size, and **2.2x** is the multiplier to admit against — with headroom,
-since the top of the observed range is the honest figure to use.
+**Spread 6% across a 4x size range** — and that apparent stability is the
+artifact. Measured cleanly the ratio climbs 2.19 -> 3.19 over the same range;
+the warm-base bias grows with size, which is precisely the direction that
+flattens a climbing curve. `mem_avail_bytes` and `ComplexMeta.bytes` are still
+the right two inputs. **2.2x is not** the multiplier to admit against.
 
 ### A discrepancy worth stating rather than smoothing
 
 Pass 7 measured **2.72x** (a 205 MB hash peaking at +557 MB). This run gives
-2.21x for the same shape. Candidates, none verified: the sampling interval
-differs (10 ms there, 5 ms here — though a finer sampler should catch a HIGHER
-peak, not a lower one, so this points the wrong way); or the collection read path
-changed between the two, since `hashes.rs` moved to `for_each_prefix` under
-ADR-0025 and this file's own pass 7 predates that landing.
+2.21x for the same shape. Both are wrong, in the same direction, for reasons
+settled below.
 
-**Not claimed:** that the streaming conversion cut the ratio. It would be a
-tidy story and I have not tested it — it needs the same measurement against the
-pre-conversion commit, which is one `git checkout` and a rebuild. Recorded so
-the number in this file is not quietly two different numbers.
+## 2026-09-04 (later) — the discrepancy settled: both numbers were LOW
 
-**For the policy, use 2.72x.** The higher of two measurements of the same
-quantity is the safe input to an admission bound, and the difference between
-them is unexplained.
+Jeff asked for this to be settled rather than carried. It cost one worktree, one
+rebuild and about an hour of measurement, and it changed a design input by 45%.
 
+### 1. The read path is innocent
+
+Built `flint-server` at `0382637` — the commit *before* `cd1e3c83` converted
+`hashes.rs` from `scan_prefix` to `for_each_prefix` under ADR-0025 — and ran the
+identical measurement against both binaries, back to back on one machine.
+
+| binary | 2000-field fresh read, 3 reps |
+|---|---|
+| `0382637`, pre-conversion | +564.6 / +564.1 / +564.4 MiB |
+| `7d344e7`, current | +563.7 / +563.6 / +564.3 MiB |
+
+Six runs, a 1 MiB spread, no separation between the binaries. The streaming
+conversion did **not** cut the ratio, and `cd1e3c83`'s own comment said so in
+advance: the value is copied exactly once either way, and what streaming removed
+here was the full-key copies and one outer `Vec` — 2000 x ~48 bytes, not 100 MB.
+The tidy story was checkable and it was false.
+
+### 2. What actually differed was the harness
+
+Pass 7 read ONE 2000-field hash in a fresh server. The 09-04 run swept
+500 -> 1000 -> 2000 in ONE process. Peak is recorded as a delta over base, RSS
+does not fall back, so by the time the sweep reached 2000 the allocator and the
+RocksDB read path were already warm — inflating `base`, shrinking `delta`. Run
+both shapes against both binaries:
+
+| shape | pre-conversion | current |
+|---|---|---|
+| fresh (2000 only) | 2.96 / 2.96 / 2.96 | 2.96 / 2.96 / 2.96 |
+| sweep (500,1000,2000) | 2.50 / 2.60 / 3.02 | 2.50 / 2.77 / 2.51 |
+
+The binary moves nothing. The harness moves everything — and note the sweep is
+not merely biased, it is *unstable*, because how much the prior read left behind
+varies run to run. Pass 7's arithmetic already contained the clue: it budgeted
+two dataset-sized allocations at ~410 MB against a measured 557 MB and assigned
+the rest to "RocksDB's own read path". That remainder is exactly what a warm
+sweep has already paid for.
+
+### 3. Two more errors, both understating the number
+
+- **Wrong denominator.** Pass 7 divided by 205 MB. `ComplexMeta.bytes` — the
+  quantity admission will actually divide by — is `field.len() + value.len()`
+  summed, so 2000 x (6 + 100000) = 200,012,000 B. Confirmed by positive control
+  rather than by reading the code: the same accumulator drives `ValueTooLarge`,
+  so with a 1000-byte cap and 50 B fields + 50 B values, field names being
+  counted predicts refusal at entry 11 and values-only predicts entry 21. It
+  refused at 11.
+- **Mixed units.** `ps -o rss=` reports KiB. Both harnesses divided by 1024 to
+  get MiB and then divided by a denominator computed in decimal MB, understating
+  every ratio by 4.9%.
+
+Corrected, on the right denominator and in consistent units:
+
+| number | as published | corrected |
+|---|---|---|
+| pass 7 (+557 MiB) | 2.72x | **2.92x** |
+| 09-04 sweep (+441.8 MiB) | 2.21x | 2.32x, and contaminated |
+| 2000-field fresh, either binary | — | **2.96x** |
+
+### 4. The predictor is not flat — and this is the finding that matters
+
+The design's premise was `peak = k x bytes` with k stable. Measured with each
+size in its OWN fresh server, 3 reps each, reproducible to +/-0.001:
+
+| collection | fields | k |
+|---|---|---|
+| 50 MB | 500 | 2.191 |
+| 100 MB | 1000 | 2.586 |
+| 200 MB | 2000 | 2.958 |
+| 400 MB | 4000 | 3.135 |
+| 512 MiB (the cap) | 5368 | 3.148 |
+
+**k climbs 43% and then saturates near 3.15.** It is not a constant. The design
+still works, because k is *increasing*: for any collection at or below the cap,
+`peak = k(b) x b <= k(cap) x b`, so k measured at the cap bounds every smaller
+read. A mid-range sample does not.
+
+k also moves with field COUNT at equal bytes, so "at the cap" has to mean the
+worst corner, not just the largest byte count:
+
+| ~200 MB as | fields | k |
+|---|---|---|
+| 100 KB values | 2,000 | 2.934 |
+| 10 KB values | 20,000 | **3.189** |
+| 1 KB values | 200,000 | 3.165 |
+
+| at the 512 MiB cap as | fields | k |
+|---|---|---|
+| 100 KB values | 5,368 | 3.148 |
+| 10 KB values | 53,644 | **3.179** |
+| 1 KB values | 532,610 | 3.146 |
+
+Both dimensions saturate near 3.19. **Maximum observed anywhere: 3.189.**
+
+### 5. The instrument has a failure mode, and it hides the peak
+
+Two trials of the same shape disagreed by 40% (3.175 vs 2.462). The cause was
+not the server: macOS was compressing, 5.56 GiB held by the compressor against
+6.02 GiB free. Compressed pages leave the resident set, so `ps` RSS *under*-
+reports demand under pressure. The harness now samples the compressor around
+each read and flags a trial that ran under it; the 1 KB-at-cap trials make the
+correlation plain — compressor delta +0.37 / +0.26 / +0.02 GiB gave ratios
+2.279 / 2.466 / **3.146**, the least-compressed trial reading highest.
+
+This is why the tables above report the **max** across trials, not the median:
+an RSS peak is a *lower bound* on true demand, compression only loosens it, so
+the largest trial is the best estimate and every figure here is a floor.
+
+### What to use for the policy
+
+**3.5x**, against `ComplexMeta.bytes`. Maximum measured is 3.189, every
+measurement is a lower bound, and the curve is approached from below — so the
+margin covers the instrument, not just the variance. One max-size read is then
+budgeted at ~1.9 GB.
+
+Corrections this run forces on the rest of this file: the summary table's 2.72x
+becomes 3.19x, five concurrent max-size reads is **~8.5 GB** rather than ~7 GB,
+and my note to Jeff that the unresolved discrepancy was "costing 23% of the
+admission budget to conservatism" had the sign backwards — 2.72x was not
+conservative, it was optimistic by 16%, and the 2.21x alternative by 45%.
+
+### What is still not measured
+
+The cap x small-field corner was measured on a machine already under memory
+pressure, so 3.179 is a floor with less headroom above it than the other
+figures. On a quiet machine it may read higher. Nothing here was measured on
+Linux, where there is no compressor and RSS should be faithful; the numbers are
+expected to be equal or higher there, and that is the check worth running before
+the multiplier is written into code.
