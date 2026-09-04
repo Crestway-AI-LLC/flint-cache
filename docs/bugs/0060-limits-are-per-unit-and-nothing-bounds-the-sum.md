@@ -662,3 +662,43 @@ member, so the reply is still O(collection) per in-flight command with
 `max-conns` of them permitted — and that is this bug's actual title. The
 aggregate is still bounded by nothing.
 
+## 2026-09-04 — the seat can now read its own memory, which both candidate fixes need
+
+This file's "What a fix looks like" offers two shapes: *a node-level budget that
+the per-unit limits draw against*, or *a per-unit limit derived from the node's
+memory and the connection count rather than chosen as a constant* — and names
+the disk guard as the model, because "it reads the actual device and refuses
+early".
+
+**Neither was buildable.** The seat reads its disk and has never read its
+memory, so a limit "derived from the node's memory" had no number to derive
+from and a budget had nothing to draw against.
+
+`flint-storage/src/mem.rs` now samples `/proc/meminfo`, and `FLINTINFO` carries
+`mem_avail_bytes`, `mem_total_bytes`, `mem_avail_pct` and `mem_src`.
+
+**It sets no policy and sheds nothing**, deliberately. `disk.rs` earned that
+separation the hard way — its own comment records that an unreadable total must
+read as *100% free* so a failed measurement can never shed writes by itself —
+and the same convention is followed here. What this buys is that the budget can
+be argued from a number rather than a guess; what it does not do is decide the
+budget.
+
+`mem_src` is the tri-state: `proc` or `unreadable`. Without it a zero would be
+indistinguishable from a machine with no memory free, and those are opposite
+facts. macOS reports `unreadable` rather than a figure reconstructed from
+`vm_stat`, on the same reasoning as the drill guard line: the fleet is Linux,
+and a locally invented number would be compared against real ones later and
+believed.
+
+**A defect its own test caught before it shipped.** `avail_pct` was
+`avail.saturating_mul(100) / total`. Saturating clamps the NUMERATOR and then
+divides, so on a machine with more than `u64::MAX/100` bytes the ratio becomes
+**1 instead of 100** — a wrong answer wearing an overflow guard. The property
+test failed on its first run; the arithmetic is 128-bit now. Unreachable on real
+hardware, and the point is that the guard was backwards rather than absent.
+
+**Still open, and unchanged:** the reply `Vec` owns every member, so a
+collection read is O(collection) per in-flight command with `max-conns` of them
+permitted. That is this bug's title and it is a design change, not a field.
+

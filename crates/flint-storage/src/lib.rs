@@ -27,6 +27,7 @@ pub mod json;
 pub mod keyspace;
 pub mod lists;
 pub mod manifest;
+pub mod mem;
 pub mod migration;
 pub mod sets;
 pub mod strings;
