@@ -1,6 +1,8 @@
 # ADR-0028 — A verdict must name what it examined, and the naming must be refutable
 
-**Status:** proposed, 2026-09-01.
+**Status:** **ACCEPTED 2026-09-04** (proposed 2026-09-01). The fourth
+obligation was added on acceptance, on the evidence in the 2026-09-04
+section below.
 
 ## The observation
 
@@ -43,7 +45,7 @@ reproduces itself inside its own remedy is not a run of carelessness.
 **A check must state what it examined in a form something else can refute, and
 the verdict must depend on that statement.**
 
-Three obligations follow, in the order they are worth implementing:
+Four obligations follow, in the order they are worth implementing:
 
 ### 1. The gate declares its subject, and refuses a mismatch
 
@@ -153,6 +155,34 @@ grepped for matched nothing because my pattern guessed at phrasings I had not
 read. An ADR about naming what you examined does not get to publish a count it
 did not check.)*
 
+### 4. A failure names only what it observed
+
+The first three govern what a check declares about its SUBJECT. This one governs
+what it declares about a CAUSE, and it exists because six of the seven failures
+in the 2026-09-04 section satisfied all three and still misled.
+
+**Where a verdict cannot separate two causes, it says so and prints what it saw,
+rather than choosing the more serious one.** Where it CAN separate them, the
+separation is an assertion the message makes out loud, so that it can be wrong
+in public.
+
+Three shapes recur, and each has a fix that costs a line:
+
+* **A product claim for a harness condition.** "no replication after bootstrap"
+  when `bootstrap` itself had failed unseen. The fix is to check the step before
+  asserting about its effect, and to print the step's own output when it fails.
+* **A verdict from a control that never armed.** "the master shed NOTHING" reads
+  as a broken gate; the client had offered no writes. A control reports whether
+  it armed BEFORE it reports what it found, and an unarmed control is a failure
+  of the harness, not of the product.
+* **An assertion stronger than the wait that guards it.** "verify still red"
+  after waiting on liveness and asserting streaming. Wait for the condition you
+  are about to assert, not for a proxy that is reached earlier.
+
+The obligation is on the MESSAGE, not on the check: a check that genuinely
+cannot tell two causes apart satisfies this by saying which two, and is more
+useful than one that guesses correctly most of the time.
+
 ## The worked example: BUG-0083
 
 Filed the same night, and it is this ADR in miniature at the level of a single
@@ -221,6 +251,12 @@ Obligation 1 first: one file, one caller pair, and it closes the case that
 reached a release script. 2 and 3 are cheap and can follow. None of this blocks
 rc.67.
 
+**4 is already largely paid.** It was written from seven fixes that landed
+before it was proposed, so the obligation describes work done rather than work
+scheduled — the drills named in the table below now satisfy it. What remains is
+that new failures are written to it, which is a review habit rather than a
+task.
+
 ## 2026-09-04 — the same defect in the FAILURE direction, seven times in one day
 
 The observation above is five checks that PASSED about the wrong subject. A day
@@ -253,12 +289,8 @@ not distinguish a stale read from a stalled failover; #4 could not distinguish
 an unarmed control from a silent gate; #5 could not distinguish "not yet
 streaming" from "not streaming".
 
-**Proposed as a fourth obligation, for weighing rather than assumed:**
-
-> **4. A failure names only what it observed.** Where a verdict cannot separate
-> two causes, it says so and prints what it saw, rather than choosing the more
-> serious one. Where it CAN separate them, the separation is an assertion the
-> message makes explicitly.
+**This became obligation 4**, accepted 2026-09-04 and written up in the decision
+section above rather than left here as an appendix.
 
 The cost is the same objection the ADR already answers about the other three:
 more words per failure, and a message that sometimes ends in "I cannot tell
