@@ -83,3 +83,35 @@ and leaves the conclusion to the reader.
 It makes the reader correct first, so that converting them can be checked
 against something that works.
 
+## 2026-09-04 — the remaining scope, re-counted, and it is smaller than 77
+
+Measured before starting, not as part of a sweep. Counting only lines that
+BACKGROUND a seat binary (`... &`), excluding `pkill`/`fleet_signal` cleanup
+lines that mention a port and a binary and so match a looser pattern:
+
+**54 spawns across 30 drills** send stderr to `/dev/null`. Concentrated rather
+than uniform — `slot_cutover_recovery` has 6, `bloom` 4, `controller`,
+`controller_ha` and `min_replicas` 3 each — so a third of the work is in five
+files.
+
+**And spawns with NO redirect are not part of the problem.** There are 8 of
+those (5 in `failover`, 2 in `restart`, 1 in `repl`), and their stderr is
+INHERITED by the drill, so it reaches the drill log and the gate artifact
+already. `failover`'s CI log carries `flint-server listening on ...` inline,
+which is that inheritance visible. They need no change, and converting them
+would move output from a place that works to a place that also works.
+
+### The enabler, if the 54 are taken
+
+The reason given for deferring was that "the convention varies per drill --
+MDIR, RDIR, mktemp -d ...". That is true of the DATA dirs and need not be true
+of the log path. `fleet_init` sets `FLEET_SCOPE` in every drill and does not
+create it; a helper that creates it on demand and returns
+`$FLEET_SCOPE/<name>.log` would make every conversion the same one-line edit,
+and `fleet_why_not_up` already reads exactly that location (both levels, since
+2026-09-04).
+
+Not built here, because this is filed work with an owner and a helper nobody
+calls is dead code. Recorded so that whoever takes it does not re-derive it, and
+so the count is 54 rather than 77.
+
