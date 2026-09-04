@@ -1,6 +1,18 @@
 # BUG-0064: `cold_start_roles` cannot say whether the replica was loading or absent
 
-Status: OPEN, found 2026-08-27 while confirming BUG-0014 had not fired ·
+Status: **OPEN in its original half; the release-blocking half is FIXED
+2026-09-04.** Found 2026-08-27 while confirming BUG-0014 had not fired.
+
+- FIXED: the verify-after-topology race that reddened the **rc.68 release
+  gate** in `decommission` (`f9c194d` waits for what `verify` asserts rather
+  than a proxy of it), and `36435a8` audited all 18 drills that call `verify`
+  for the same shape and found no further instances.
+- STILL OPEN: the finding this bug was filed for, which no commit can close.
+  `cold_start_roles` still cannot say WHICH of the two faults it saw. The
+  assertion is deliberately unchanged; only the next firing, now instrumented,
+  will say. Closing this on the strength of the `decommission` fix would be
+  recording an answer that was never obtained.
+
 Severity: unknown, and that is the finding — the drill's failure text asserts
 a **product** fault ("the pair is storing one copy") for a condition it cannot
 distinguish from a **timing** one.
