@@ -67,6 +67,7 @@ const ACCEPTED_FLAGS: &[&str] = &[
     "--disk-sample-ms",
     "--engine",
     "--evictable-ns",
+    "--collection-read-budget-pct",
     "--fullsync-rate-bytes",
     "--internal-ca",
     "--internal-cert",
@@ -2390,6 +2391,33 @@ fn main() -> std::io::Result<()> {
             }
         );
     }
+
+    // BUG-0060: an opt-in bound on the SUM of concurrent collection reads.
+    // Each unit is already capped by --max-value-bytes; nothing caps their
+    // total, and five concurrent max-size reads is ~8.1 GB. 0 disables, and
+    // is the default: a new refusal path is not switched on for existing
+    // workloads by inference, the way eviction shipped opt-in.
+    let read_budget_pct: u8 = arg("--collection-read-budget-pct")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(flint_storage::admission::DEFAULT_COLLECTION_READ_BUDGET_PCT);
+    // Set BEFORE any connection is served, so no read can race the default in.
+    let _ = READ_ADMISSION.set(flint_storage::admission::ReadAdmission::new(
+        read_budget_pct,
+    ));
+    if read_budget_pct > 0 {
+        let tenths = flint_storage::admission::READ_PEAK_MULTIPLIER_TENTHS;
+        eprintln!(
+            "collection-read-budget-pct: {read_budget_pct} (a read is estimated at {}.{}x its ComplexMeta.bytes)",
+            tenths / 10,
+            tenths % 10,
+        );
+        if flint_storage::mem::sample().is_none() {
+            eprintln!(
+                "collection-read-budget-pct: node memory is UNREADABLE here, so reads will be \
+                 admitted without a budget and counted in collection_read_unmeasured"
+            );
+        }
+    }
     // Disk headroom sampler. Only meaningful when data actually lands on a
     // filesystem, so the mem engine has nothing to guard and starts no
     // thread. Thresholds: --disk-min-free-pct (default 10) and
@@ -3393,24 +3421,36 @@ fn serve(
                 if args.is_empty() {
                     continue;
                 }
-                let reply = execute(
-                    store,
-                    read_only,
-                    tailer_stop,
-                    lease_deadline,
-                    &rocks,
-                    hub,
-                    migration_active,
-                    limits,
-                    write_queue,
-                    &mut conn_ns,
-                    &mut conn_async,
-                    &mut conn_proto,
-                    &mut conn_txn,
-                    watch,
-                    &args,
-                    None,
-                );
+                // BUG-0060: bound the SUM of concurrent collection reads.
+                // `_adm` is dropped at the END of this block -- after the reply
+                // has been encoded -- because the materialised reply owns the
+                // collection until then, and releasing at `execute`'s return
+                // would admit a second read against memory not yet given back.
+                let (_adm, refused) = match admit_collection_read(store, limits, &conn_ns, &args) {
+                    Ok(guard) => (guard, None),
+                    Err(refusal) => (None, Some(refusal)),
+                };
+                let reply = match refused {
+                    Some(r) => r,
+                    None => execute(
+                        store,
+                        read_only,
+                        tailer_stop,
+                        lease_deadline,
+                        &rocks,
+                        hub,
+                        migration_active,
+                        limits,
+                        write_queue,
+                        &mut conn_ns,
+                        &mut conn_async,
+                        &mut conn_proto,
+                        &mut conn_txn,
+                        watch,
+                        &args,
+                        None,
+                    ),
+                };
                 // Drain BETWEEN elements instead of only after the whole reply.
                 // Serializing a collection into this buffer whole is the second of
                 // the two dataset-sized copies behind the +557 MB HGETALL
@@ -3557,24 +3597,37 @@ fn serve(
                     // first: a GET later in the same pipeline must read what
                     // the SETs before it wrote.
                     flush_pending!();
-                    let reply = execute(
-                        store,
-                        read_only,
-                        tailer_stop,
-                        lease_deadline,
-                        &rocks,
-                        hub,
-                        migration_active,
-                        limits,
-                        write_queue,
-                        &mut conn_ns,
-                        &mut conn_async,
-                        &mut conn_proto,
-                        &mut conn_txn,
-                        watch,
-                        &args,
-                        None,
-                    );
+                    // BUG-0060: bound the SUM of concurrent collection reads.
+                    // `_adm` is dropped at the END of this block -- after the reply
+                    // has been encoded -- because the materialised reply owns the
+                    // collection until then, and releasing at `execute`'s return
+                    // would admit a second read against memory not yet given back.
+                    let (_adm, refused) =
+                        match admit_collection_read(store, limits, &conn_ns, &args) {
+                            Ok(guard) => (guard, None),
+                            Err(refusal) => (None, Some(refusal)),
+                        };
+                    let reply = match refused {
+                        Some(r) => r,
+                        None => execute(
+                            store,
+                            read_only,
+                            tailer_stop,
+                            lease_deadline,
+                            &rocks,
+                            hub,
+                            migration_active,
+                            limits,
+                            write_queue,
+                            &mut conn_ns,
+                            &mut conn_async,
+                            &mut conn_proto,
+                            &mut conn_txn,
+                            watch,
+                            &args,
+                            None,
+                        ),
+                    };
                     // Drain BETWEEN elements instead of only after the whole reply.
                     // Serializing a collection into this buffer whole is the second of
                     // the two dataset-sized copies behind the +557 MB HGETALL
@@ -4305,6 +4358,76 @@ fn apply_inline(store: &dyn Kv, ops: &[(Vec<u8>, Option<Vec<u8>>)]) {
 /// step with the condition there (`opts.nx || opts.xx || expiry == Keep`).
 fn is_pure_write(upper_name: &[u8], args: &[Vec<u8>]) -> bool {
     upper_name == b"SET" && args.len() == 3
+}
+
+/// BUG-0060's node-level bound on the SUM of concurrent collection reads.
+/// Built once from `--collection-read-budget-pct`; 0 (the default) disables it
+/// and every call below becomes a branch that does nothing.
+static READ_ADMISSION: std::sync::OnceLock<flint_storage::admission::ReadAdmission> =
+    std::sync::OnceLock::new();
+
+fn read_admission() -> &'static flint_storage::admission::ReadAdmission {
+    READ_ADMISSION.get_or_init(|| {
+        flint_storage::admission::ReadAdmission::new(
+            flint_storage::admission::DEFAULT_COLLECTION_READ_BUDGET_PCT,
+        )
+    })
+}
+
+/// Holds a reservation for as long as the reply owns the collection. Dropped
+/// AFTER encoding, not when `execute` returns: `encode_proto_flushing` drains
+/// the out-buffer incrementally, but the materialised reply still owns every
+/// byte until it goes out of scope, and releasing early would let a second
+/// read be admitted against memory the first has not given back.
+struct AdmissionGuard(u64);
+
+impl Drop for AdmissionGuard {
+    fn drop(&mut self) {
+        read_admission().release(self.0);
+    }
+}
+
+/// Decide whether this command may run. `Ok(None)` is the ordinary answer:
+/// admission is off, or this is not a whole-collection read.
+fn admit_collection_read(
+    store: &dyn Kv,
+    limits: commands::Limits,
+    conn_ns: &[u8],
+    args: &[Vec<u8>],
+) -> Result<Option<AdmissionGuard>, Value> {
+    use flint_storage::admission::Admit;
+    let adm = read_admission();
+    if !adm.enabled() {
+        return Ok(None);
+    }
+    let Some(name) = args.first() else {
+        return Ok(None);
+    };
+    let name_upper = name.to_ascii_uppercase();
+    let dispatcher = commands::Dispatcher::with_limits(
+        store,
+        flint_storage::strings::system_clock,
+        limits,
+        conn_ns,
+    );
+    let Some(bytes) = dispatcher.collection_read_bytes(&name_upper, args) else {
+        return Ok(None);
+    };
+    let decision = adm.admit(bytes);
+    match decision {
+        Admit::Disabled => Ok(None),
+        Admit::Admitted { est } | Admit::AdmittedUnmeasured { est } => {
+            Ok(Some(AdmissionGuard(est)))
+        }
+        // The message is built in `flint-storage` beside the arithmetic it
+        // describes, so the terms it quotes cannot drift from the terms that
+        // produced them, and so it can be asserted in a unit test.
+        Admit::Refused { .. } => Err(Value::Error(
+            decision
+                .refusal(bytes, adm.pct())
+                .unwrap_or_else(|| "THROTTLED collection read".into()),
+        )),
+    }
 }
 
 /// `batch_kv` / `guard_sink`: ADR-0027 part 2. When a caller is accumulating a
@@ -5349,7 +5472,7 @@ fn flintinfo(
     let compaction = rocks.as_ref().and_then(|kv| kv.compaction_pressure());
     let mem_sample = flint_storage::mem::sample();
     let info = format!(
-        "role:{}\r\nloading:0\r\nrole_epoch:{role_epoch}\r\nbuild:{build}\r\nsst_bytes:{sst}\r\nlatest_seq:{latest}\r\nlast_applied:{last_applied}\r\nacked_seq:{}\r\nseq_lag:{seq_lag}\r\nwal_headroom_seq:{whs}\r\nwal_min_acked_seq:{wma}\r\nwal_headroom_shed_seq:{whl}\r\nwal_bytes_per_seq:{wbps}\r\nwal_archive_mb:{wamb}\r\nwal_archive_src:{wasrc}\r\nlive_replicas:{}\r\nlag_ms:{}\r\nlag_ms_max:{lmx}\r\nlag_max_gap:{lmg}\r\nlag_soft_ms:{soft}\r\nlag_hard_ms:{hard}\r\nmin_replicas_to_write:{minr}\r\nwidowed_grace_ms:{wgm}\r\nwidowed_shed:{wsh}\r\nfullsync_active:{fsa}\r\nfullsync_max:{fsm}\r\nasync_write_queue:{aqd}\r\nwrite_deadline_ms:{wdm}\r\nwrite_inflight:{wif}\r\nwrite_service_us:{wsu}\r\nwrite_wait_est_ms:{wwe}\r\nwrite_wait_peak_ms:{wwp}\r\nwrite_wait_peak_inflight:{wwpi}\r\nwrite_wait_peak_service_us:{wwps}\r\nwrites_shed_deadline:{wsd}\r\nwrites_shed_lag:{wsl}\r\nwrites_shed_quorum:{wsq}\r\nwrites_shed_widowed:{wswd}\r\nwrites_shed_headroom:{wshr}\r\nwrites_delayed_soft:{wdsf}\r\nwal_fsync_ms:{wfm}\r\nwal_fsync_total:{wft}\r\ncert_days_remaining:{cdr}\r\nactive_conns:{ac}\r\nmax_conns:{mc}\r\nconns_shed_total:{cs}\r\nwrite_stopped:{wst}\r\ndelayed_write_rate:{dwr}\r\nwrite_stall_readable:{wsr}\r\nl0_files:{l0f}\r\npending_compaction_bytes:{pcb}\r\ncompaction_readable:{cr}\r\ndisk_free_bytes:{dfb}\r\ndisk_total_bytes:{dtb}\r\ndisk_free_pct:{dfp}\r\ndisk_verdict:{dv}\r\ndisk_unknown_samples:{dus}\r\nmem_avail_bytes:{mab}\r\nmem_total_bytes:{mtb}\r\nmem_avail_pct:{map}\r\nmem_src:{msrc}\r\nevictable_ns:{ens}\r\nevictable_ns_agree:{ensa}\r\nevictable_ns_bytes:{ensb}\r\nreclaim_active:{rca}\r\nreclaim_target_free_bytes:{rctf}\r\nevict:{evm}\r\ngc_swept_expired:{gse}\r\ngc_swept_orphans:{gso}\r\nuptime_ms:{upms}\r\n",
+        "role:{}\r\nloading:0\r\nrole_epoch:{role_epoch}\r\nbuild:{build}\r\nsst_bytes:{sst}\r\nlatest_seq:{latest}\r\nlast_applied:{last_applied}\r\nacked_seq:{}\r\nseq_lag:{seq_lag}\r\nwal_headroom_seq:{whs}\r\nwal_min_acked_seq:{wma}\r\nwal_headroom_shed_seq:{whl}\r\nwal_bytes_per_seq:{wbps}\r\nwal_archive_mb:{wamb}\r\nwal_archive_src:{wasrc}\r\nlive_replicas:{}\r\nlag_ms:{}\r\nlag_ms_max:{lmx}\r\nlag_max_gap:{lmg}\r\nlag_soft_ms:{soft}\r\nlag_hard_ms:{hard}\r\nmin_replicas_to_write:{minr}\r\nwidowed_grace_ms:{wgm}\r\nwidowed_shed:{wsh}\r\nfullsync_active:{fsa}\r\nfullsync_max:{fsm}\r\nasync_write_queue:{aqd}\r\nwrite_deadline_ms:{wdm}\r\nwrite_inflight:{wif}\r\nwrite_service_us:{wsu}\r\nwrite_wait_est_ms:{wwe}\r\nwrite_wait_peak_ms:{wwp}\r\nwrite_wait_peak_inflight:{wwpi}\r\nwrite_wait_peak_service_us:{wwps}\r\nwrites_shed_deadline:{wsd}\r\nwrites_shed_lag:{wsl}\r\nwrites_shed_quorum:{wsq}\r\nwrites_shed_widowed:{wswd}\r\nwrites_shed_headroom:{wshr}\r\nwrites_delayed_soft:{wdsf}\r\nwal_fsync_ms:{wfm}\r\nwal_fsync_total:{wft}\r\ncert_days_remaining:{cdr}\r\nactive_conns:{ac}\r\nmax_conns:{mc}\r\nconns_shed_total:{cs}\r\nwrite_stopped:{wst}\r\ndelayed_write_rate:{dwr}\r\nwrite_stall_readable:{wsr}\r\nl0_files:{l0f}\r\npending_compaction_bytes:{pcb}\r\ncompaction_readable:{cr}\r\ndisk_free_bytes:{dfb}\r\ndisk_total_bytes:{dtb}\r\ndisk_free_pct:{dfp}\r\ndisk_verdict:{dv}\r\ndisk_unknown_samples:{dus}\r\nmem_avail_bytes:{mab}\r\nmem_total_bytes:{mtb}\r\nmem_avail_pct:{map}\r\nmem_src:{msrc}\r\nevictable_ns:{ens}\r\nevictable_ns_agree:{ensa}\r\nevictable_ns_bytes:{ensb}\r\nreclaim_active:{rca}\r\nreclaim_target_free_bytes:{rctf}\r\nevict:{evm}\r\ncollection_read_budget_pct:{crbp}\r\ncollection_read_in_flight_bytes:{crif}\r\ncollection_read_refused:{crr}\r\ncollection_read_unmeasured:{cru}\r\ngc_swept_expired:{gse}\r\ngc_swept_orphans:{gso}\r\nuptime_ms:{upms}\r\n",
         if read_only { "replica" } else { "master" },
         hub.effective_acked(now)
             .map_or_else(|| "none".into(), |a| a.to_string()),
@@ -5484,6 +5607,15 @@ fn flintinfo(
         } else {
             "unreadable"
         },
+        // BUG-0060 admission. `collection_read_unmeasured` is the one to
+        // watch: it counts reads admitted while node memory could not be
+        // read, which means the bound was NOT in force for them. A budget
+        // that cannot be looked up must not be reported as a budget that
+        // passed -- the same rule `mem_src` states one field up.
+        crbp = read_admission().pct(),
+        crif = read_admission().in_flight_bytes(),
+        crr = read_admission().refused_total(),
+        cru = read_admission().unmeasured_total(),
         gse = GC_EXPIRED_TOTAL.load(Ordering::Relaxed),
         upms = heat::process_uptime_ms(),
         gso = GC_ORPHANS_TOTAL.load(Ordering::Relaxed),

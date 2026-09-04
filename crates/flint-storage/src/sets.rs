@@ -162,6 +162,15 @@ impl<'a> SetStore<'a> {
             .collect()
     }
 
+    /// The collection's accounted size (`ComplexMeta.bytes`), from ONE cheap
+    /// metadata read and without materialising anything. This is the quantity
+    /// BUG-0060's admission divides by, so it must stay the SAME number the
+    /// `max-value-bytes` accounting maintains -- `field.len() + value.len()`
+    /// summed, not the payload alone. `None` when the key does not exist.
+    pub fn stored_bytes(&self, slot: u16, key: &[u8]) -> Result<Option<u64>, StoreError> {
+        Ok(self.read_meta(slot, key)?.map(|m| m.bytes))
+    }
+
     pub fn smembers(&self, slot: u16, key: &[u8]) -> Result<Vec<Vec<u8>>, StoreError> {
         let Some(meta) = self.read_meta(slot, key)? else {
             return Ok(Vec::new());

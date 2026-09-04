@@ -17,6 +17,7 @@
 //! arrives with the storage spike; `TypeStore` arrives with the encoding
 //! layer.
 
+pub mod admission;
 pub mod batch;
 pub mod bloom;
 pub mod disk;

@@ -229,6 +229,40 @@ impl<'a> Dispatcher<'a> {
         }
     }
 
+    /// The collection this command will materialise, in bytes, from ONE
+    /// metadata read -- the input to BUG-0060's admission. `None` means "not a
+    /// whole-collection read", which is the answer for most commands and for a
+    /// key that does not exist.
+    ///
+    /// Membership is decided by whether the command materialises the WHOLE
+    /// collection, not by whether it looks like a range:
+    ///
+    /// - `ZRANGE` and friends are IN even though they take bounds, because
+    ///   `ZSetStore::zrange` builds the entire ordered set and then slices it.
+    ///   A narrow range costs the whole zset today.
+    /// - `LRANGE` is OUT for the opposite reason: `ListStore::lrange` reads
+    ///   only the ranks asked for, so its cost tracks the slice. Admitting it
+    ///   against the whole list would refuse `LRANGE key 0 0` on a large one.
+    ///
+    /// The multiplier this feeds was measured on HASHES. Sets and zsets store
+    /// their members as keys with empty values, so their per-item overhead
+    /// differs and k may too; it has not been measured for them. Applying the
+    /// hash figure is an approximation, and named as one.
+    pub fn collection_read_bytes(&self, name_upper: &[u8], args: &[Vec<u8>]) -> Option<u64> {
+        let key = args.get(1)?;
+        let slot = slot_for_key(key);
+        let bytes = match name_upper {
+            b"HGETALL" | b"HKEYS" | b"HVALS" => self.hashes.stored_bytes(slot, key),
+            b"SMEMBERS" => self.sets.stored_bytes(slot, key),
+            b"ZRANGE" | b"ZREVRANGE" | b"ZRANGEBYSCORE" | b"ZREVRANGEBYSCORE" | b"ZRANGEBYLEX"
+            | b"ZREVRANGEBYLEX" => self.zsets.stored_bytes(slot, key),
+            _ => return None,
+        };
+        // A metadata read that ERRORS (wrong type, say) is not a collection
+        // read this can size, and the command's own error path will say so.
+        bytes.ok().flatten()
+    }
+
     pub fn dispatch(&self, args: &[Vec<u8>]) -> Value {
         let Some(name) = args.first() else {
             return err("ERR empty command");

@@ -984,12 +984,78 @@ That places the reservation in the server, around the whole command, with the
 store exposing the collection's size cheaply; it does not fit inside
 `hgetall`/`smembers`/`all_ordered`, which cannot see the reply's lifetime.
 
-### Still to decide, and both are Jeff's
+## 2026-09-04 — the mechanism is BUILT, opt-in and off by default
 
-1. **The budget fraction** of `mem_avail_bytes`. ~25% was proposed and is not
-   ratified.
-2. **Refuse or queue** an over-budget read.
+Jeff's call: ship the mechanism opt-in with refusal off, the way eviction did on
+2026-08-26. That settles the second decision (refuse, not queue) and defers the
+first (the fraction) to whoever turns it on, which is where it belongs — the
+right percentage is a property of a deployment, not of the code.
 
-Precedent argues the mechanism should ship opt-in with refusal OFF by default,
-the way eviction did on 2026-08-26 — a new refusal path that changes behaviour
-for existing workloads is not something to switch on by inference.
+`--collection-read-budget-pct`, default **0 = disabled**. Nothing changes for an
+existing workload until an operator sets it.
+
+### What it does
+
+`flint-storage/src/admission.rs`. A read is costed BEFORE anything is
+materialised, from the metadata read that already knows the collection's size,
+and refused if it would not fit alongside what is already in flight:
+
+    THROTTLED collection read needs ~1879048192 bytes (536870912 x 3.5 peak),
+      in-flight 0, past --collection-read-budget-pct 25 of 2147483648 available
+      (536870912), retry with backoff
+
+**The reservation, not the sample, is what bounds the sum.** A per-read check
+against `mem_avail_bytes` alone lets every read admitted inside one sampling
+window see the same headroom and pass. So admission keeps its own exact count
+of what it has admitted and not released, and the guard is dropped only after
+the reply has been ENCODED — the materialised reply owns the collection until
+then, and releasing at the store's return would admit a second read against
+memory the first has not given back.
+
+### Three decisions that would otherwise read as bugs
+
+- **An unreadable budget ADMITS, and is counted.** `mem::sample()` is `None` on
+  macOS and on any unreadable `/proc/meminfo`. Refusing everything would take a
+  node down over a missing file; admitting silently would let this claim a check
+  it never made. So it admits and increments `collection_read_unmeasured`, which
+  is in FLINTINFO. That field moving means the bound is NOT in force. Same rule
+  BUG-0079 broke, applied to an admission rather than a refusal.
+- **The budget double-counts our own in-flight reads**, because `mem_avail`
+  already reflects them. That makes admission progressively stricter as load
+  rises, which is the conservative direction and what a stampede valve wants.
+- **`LRANGE` is deliberately NOT admitted.** `ListStore::lrange` reads only the
+  ranks asked for, so its cost tracks the slice; costing it against the whole
+  list would refuse `LRANGE key 0 0` on a large one. `ZRANGE` IS admitted
+  despite taking bounds, because `ZSetStore::zrange` builds the entire ordered
+  set before slicing. Membership follows what a command materialises, not what
+  its signature suggests. **A list read is therefore still unbounded** — the
+  narrower remaining case, and stated rather than left implied.
+
+### How it is tested, and the part that needed care
+
+The unit tests use a seam (a fixed available-memory figure) so the arithmetic
+can be proven on a host with no `/proc/meminfo` — without it every local test
+would take the `AdmittedUnmeasured` path and a broken bound would still pass.
+Both mutations were run: disabling the refusal fails
+`a_read_past_the_budget_is_refused_and_reserves_nothing` and
+`the_sum_is_what_is_bounded_not_the_individual_read`; making `release` a no-op
+fails the latter and the unmeasured test.
+
+The seam leaves the WIRING untested, so `tools/collection_admission_drill.sh`
+runs the real path: the same read with admission off (must SUCCEED) and with a
+1% budget (must be REFUSED). The control is the point — a refusal alone proves
+only that something went wrong, since a broken build refuses too. It also
+asserts a one-field hash still passes, so a bound that refuses EVERYTHING cannot
+masquerade as a working one. On macOS it prints `SKIP:` and exits 0, which
+`FLINT_GATE_STRICT=1` promotes to a failure; the gate sets STRICT and runs on
+Linux, so it must never reach that line.
+
+### Still open
+
+- **The multiplier was measured on hashes only.** Sets and zsets store members
+  as keys with empty values, so their per-item overhead differs and k may too.
+  `tools/collection_read_peak.py` builds hashes; extending it is the next step
+  if the approximation is ever load-bearing.
+- **Lists are unbounded**, per the `LRANGE` note above.
+- **The fraction to recommend.** 25% is a starting point in `docs/self-hosting.md`
+  and not a measured recommendation.

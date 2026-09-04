@@ -703,6 +703,74 @@ fleet declaring one, and eviction is consequently not covered by the durability
 testing that covers everything else here. That is a known gap, recorded in
 ADR-0013.
 
+## 3d. Collection-read admission — bounding the SUM of big reads
+
+`--max-value-bytes` (512 MiB by default) caps any **one** collection.
+Nothing caps how many are being read at once, and a collection read costs
+several times the collection while it is in flight. **Five concurrent
+max-size reads is ~8.1 GB**, on a node that will accept `--max-conns`
+(2048) of them.
+
+Off by default. Turn it on with a percentage of available memory:
+
+| flag | default | meaning |
+|---|---|---|
+| `--collection-read-budget-pct` | `0` (off) | share of available node memory that in-flight collection reads may hold |
+
+When it is on, each `HGETALL`/`HKEYS`/`HVALS`/`SMEMBERS`/`ZRANGE`-family
+command is costed **before** anything is materialised, from the one cheap
+metadata read that already knows the collection's size, and refused with
+`-THROTTLED` if it would not fit alongside what is already in flight:
+
+    THROTTLED collection read needs ~1879048192 bytes (536870912 x 3.5 peak),
+      in-flight 0, past --collection-read-budget-pct 25 of 2147483648 available
+      (536870912), retry with backoff
+
+The reservation is held until the reply has been **written**, not merely
+built, because the materialised reply owns the collection until then.
+
+**Where 3.5x comes from.** Measured, not estimated, with
+`tools/collection_read_peak.py` on Linux x86_64: a read's peak is not a
+fixed multiple of the collection — it CLIMBS with size (1.96x at 50 MB,
+3.03x at the 512 MiB cap) and again as the items get smaller, then
+saturates. Because it climbs, the figure at the cap bounds every smaller
+read and a mid-range sample does not. 3.5 clears the measured maximum by
+16%. Re-run that tool if the read path changes.
+
+**Picking a percentage.** The budget counts your in-flight reads against
+available memory, which already reflects them, so it tightens as load
+rises — deliberately. Start at `25` and watch `collection_read_refused`:
+refusals are the valve working, but a steadily climbing count means
+tenants are asking for collections this node is too small to serve
+concurrently, and the fix is bigger nodes or smaller collections.
+
+Watch in `FLINTINFO`:
+
+| field | meaning |
+|---|---|
+| `collection_read_budget_pct` | what is configured; `0` means off |
+| `collection_read_in_flight_bytes` | currently reserved |
+| `collection_read_refused` | reads refused since start |
+| `collection_read_unmeasured` | **reads admitted with NO budget checked** |
+
+`collection_read_unmeasured` counting up is the one that matters: it means
+node memory could not be read, so the reads were let through rather than
+the node being taken down over a missing `/proc/meminfo`. The bound is not
+in force while that number is moving. It is always the case on macOS,
+which has no `/proc/meminfo` — a development-host condition, not a
+production one.
+
+Two known gaps, both stated rather than hidden:
+
+- **The multiplier was measured on hashes.** Sets and zsets store members
+  as keys with empty values, so their per-item overhead differs and their
+  multiplier may too. It has not been measured for them.
+- **`LRANGE` is deliberately NOT admitted.** It reads only the ranks asked
+  for, so its cost tracks the slice rather than the list, and costing it
+  against the whole list would refuse `LRANGE key 0 0` on a large one. A
+  list read is therefore still unbounded; `ZRANGE` is admitted because it
+  builds the whole zset before slicing, however narrow the range.
+
 ## 4. Managing users (tenants)
 
 A tenant is a namespace + a token + a proxy subset + quotas. All via
