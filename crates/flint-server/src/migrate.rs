@@ -1300,8 +1300,7 @@ mod ctl_reply_cap_tests {
     /// therefore has to trickle rather than go silent — going silent is the
     /// case that already worked, and asserting on it would pass with the cap
     /// deleted.
-    #[test]
-    fn trickling_peer_is_refused_rather_than_buffered() {
+    fn assert_cap_refuses_trickling_peer(write_timeout: std::time::Duration) {
         let l = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
         let addr = l.local_addr().expect("listener addr").to_string();
 
@@ -1315,7 +1314,7 @@ mod ctl_reply_cap_tests {
             // it the writer blocks at zero CPU and the whole test looks slow
             // rather than stuck -- which is exactly how it read on the rc.67
             // release box: healthy instance, 0.24% CPU, forty minutes.
-            let _ = s.set_write_timeout(Some(std::time::Duration::from_secs(5)));
+            let _ = s.set_write_timeout(Some(write_timeout));
             let mut sink = [0u8; 4096];
             let _ = std::io::Read::read(&mut s, &mut sink);
             // A legal, never-completing reply: an array header promising far
@@ -1331,9 +1330,43 @@ mod ctl_reply_cap_tests {
             // quadratic re-decode noted above, not the write count -- but it
             // keeps the peer from being the bottleneck.)
             let blob: Vec<u8> = b"$4\r\nabcd\r\n".repeat(6553);
-            loop {
-                if s.write_all(&blob).is_err() {
-                    return;
+            // A WRITE TIMEOUT MEANS THE READER IS SLOW, WHICH IS THE
+            // CONDITION THIS TEST EXISTS TO SURVIVE -- not a reason to hang
+            // up. `write_all(..).is_err() -> return` treated the two as one:
+            // it closed the socket, the client then read EOF instead of the
+            // cap, and the assertion reported a PRODUCT fault for what was
+            // really CPU contention -- "expected the byte cap, got: closed",
+            // `UnexpectedEof` where `InvalidData` belongs. Seen once on
+            // 2026-09-04 across two back-to-back gate runs on one machine,
+            // and reproduced deterministically by shrinking this timeout to
+            // 1ms. Same shape as BUG-0064: a failure text asserting the
+            // product for a condition it cannot tell from a timing one.
+            //
+            // So retry on a timeout, FROM THE OFFSET ALREADY WRITTEN --
+            // `write` rather than `write_all`, because a partial write
+            // followed by a whole-blob retry would splice a truncated bulk
+            // into the stream and `decode()` would then fail for a third,
+            // unrelated reason. A real error (the client refusing once the
+            // cap fires) still ends the thread; only the timeout retries.
+            //
+            // The deadline is what keeps BUG-0084's forty-minute park
+            // impossible now that a timeout no longer exits: bounded spin,
+            // ~60 five-second waits, not an indefinite one.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+            'trickle: loop {
+                let mut off = 0usize;
+                while off < blob.len() {
+                    if std::time::Instant::now() >= deadline {
+                        return;
+                    }
+                    match std::io::Write::write(&mut s, &blob[off..]) {
+                        Ok(0) => break 'trickle,
+                        Ok(n) => off += n,
+                        Err(e)
+                            if e.kind() == std::io::ErrorKind::WouldBlock
+                                || e.kind() == std::io::ErrorKind::TimedOut => {}
+                        Err(_) => break 'trickle,
+                    }
                 }
             }
         });
@@ -1393,5 +1426,30 @@ mod ctl_reply_cap_tests {
             e.to_string().contains("exceeded"),
             "error should name the cap it hit: {e}"
         );
+    }
+
+    /// A peer that trickles forever must be refused, not buffered forever.
+    #[test]
+    fn trickling_peer_is_refused_rather_than_buffered() {
+        assert_cap_refuses_trickling_peer(std::time::Duration::from_secs(5));
+    }
+
+    /// THE SAME ASSERTION WITH A READER THE PEER CANNOT KEEP UP WITH.
+    ///
+    /// This is the standing check for the flake above, and it is the
+    /// positive control that found it: at a 1ms write timeout the peer's
+    /// writes time out on essentially every call, which is the loaded-runner
+    /// condition made deterministic. Against the old
+    /// `write_all(..).is_err() -> return` it fails every single run with
+    /// `expected the byte cap, got: closed` — byte-identical to the one real
+    /// gate failure on 2026-09-04 — and against the retry loop it passes.
+    ///
+    /// So it is not a duplicate of its sibling: the sibling asserts the cap
+    /// fires, this one asserts THE HARNESS CANNOT COUNTERFEIT THE CAP'S
+    /// ABSENCE. Deleting the retry and keeping only the sibling would go
+    /// green ~95% of runs and red on release day, which is what happened.
+    #[test]
+    fn a_slow_reader_does_not_look_like_a_missing_cap() {
+        assert_cap_refuses_trickling_peer(std::time::Duration::from_millis(1));
     }
 }
