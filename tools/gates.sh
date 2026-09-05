@@ -2221,7 +2221,7 @@ msrv_at_the_declaration() {
 assert_msrv_is_stated_once() {
   local out
   out=$(python3 - <<'MSRVPY'
-import glob, os, re, subprocess, sys
+import os, re, sys
 try:
     decl = re.search(
         r'^rust-version\s*=\s*"([0-9.]+)"',
@@ -2231,8 +2231,21 @@ except OSError:
 if not decl:
     print("NODECL"); sys.exit(0)
 want = decl.group(1)
-files = subprocess.run(["git", "ls-files"], capture_output=True,
-                       text=True).stdout.split()
+# WALKED, NOT `git ls-files`. The gate box rsyncs the working tree WITHOUT
+# .git -- only the ops tree is re-inited there, for roll_lease's fixture -- so
+# asking git returned zero files and this check read nothing. Caught by its own
+# floor rather than by passing quietly, which is the only reason it is a note
+# here and not a check that certified the tree for a week.
+SKIP_DIRS = {".git", "target", "node_modules", ".venv", "__pycache__", "dist"}
+files = []
+for root, dirs, names in os.walk("."):
+    dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+    for n in names:
+        # `.git` is a FILE in a worktree (it holds a gitdir: line), so the
+        # directory filter above does not catch it there.
+        if n in SKIP_DIRS:
+            continue
+        files.append(os.path.join(root, n)[2:])
 pat = re.compile(
     r"(?:Rust|rustc|rust-version|MSRV)[^0-9\n]{0,24}([0-9]+\.[0-9]+)(?:\.[0-9]+)?")
 bad = []
@@ -2242,9 +2255,16 @@ for f in files:
     if f.startswith("docs/bugs/"):
         continue
     try:
-        lines = open(f, encoding="utf-8", errors="replace").read().split("\n")
-    except (OSError, IsADirectoryError, UnicodeDecodeError):
+        if os.path.getsize(f) > 1 << 20:
+            continue
+        raw = open(f, "rb").read()
+    except (OSError, IsADirectoryError):
         continue
+    # The standard binary test, and it has to be here now that the file list
+    # comes from the filesystem rather than from git's index.
+    if b"\0" in raw[:4096]:
+        continue
+    lines = raw.decode("utf-8", "replace").split("\n")
     scanned += 1
     for i, line in enumerate(lines, 1):
         if "msrv-history" in line:
@@ -2253,7 +2273,7 @@ for f in files:
             if m.group(1) != want:
                 bad.append((f, i, m.group(0).strip()[:56]))
 # A file list that comes back empty certifies the tree by reading none of it.
-if scanned < 20:
+if scanned < 100:
     print("NOFILES %d" % scanned); sys.exit(0)
 print("WANT %s %d" % (want, scanned))
 for f, i, hit in bad:
