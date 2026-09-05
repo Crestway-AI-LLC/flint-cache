@@ -1023,13 +1023,18 @@ memory the first has not given back.
 - **The budget double-counts our own in-flight reads**, because `mem_avail`
   already reflects them. That makes admission progressively stricter as load
   rises, which is the conservative direction and what a stampede valve wants.
-- **`LRANGE` is deliberately NOT admitted.** `ListStore::lrange` reads only the
-  ranks asked for, so its cost tracks the slice; costing it against the whole
-  list would refuse `LRANGE key 0 0` on a large one. `ZRANGE` IS admitted
-  despite taking bounds, because `ZSetStore::zrange` builds the entire ordered
-  set before slicing. Membership follows what a command materialises, not what
-  its signature suggests. **A list read is therefore still unbounded** — the
-  narrower remaining case, and stated rather than left implied.
+- **`LRANGE` is admitted on the requested slice** (2026-09-05). It was left out
+  at first because `ListStore::lrange` reads only the ranks asked for, so
+  costing it against the whole list would refuse `LRANGE key 0 0` on a large
+  one — and leaving it out was itself the hole, since `LRANGE key 0 -1` is
+  exactly the unbounded read this bug is about. `ListStore::range_bytes`
+  normalises the bounds the way `lrange` does and estimates elements-in-range x
+  mean element size; a test asserts it agrees with what `lrange` actually
+  returns across ten bound pairs including negatives, clamping and inversion,
+  because an estimate for a different range than the one served is worse than
+  none. `ZRANGE` IS charged the whole zset despite taking bounds, because
+  `ZSetStore::zrange` builds the entire ordered set before slicing. Membership
+  follows what a command materialises, not what its signature suggests.
 
 ### How it is tested, and the part that needed care
 
@@ -1056,6 +1061,8 @@ Linux, so it must never reach that line.
   as keys with empty values, so their per-item overhead differs and k may too.
   `tools/collection_read_peak.py` builds hashes; extending it is the next step
   if the approximation is ever load-bearing.
-- **Lists are unbounded**, per the `LRANGE` note above.
+- **Skew in a list** makes the mean element size an approximation. Bounded by
+  how far the requested elements sit from average, and the alternative — reading
+  the range to size it — is the work being admitted.
 - **The fraction to recommend.** 25% is a starting point in `docs/self-hosting.md`
   and not a measured recommendation.

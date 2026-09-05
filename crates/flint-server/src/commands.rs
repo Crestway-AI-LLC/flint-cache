@@ -240,9 +240,13 @@ impl<'a> Dispatcher<'a> {
     /// - `ZRANGE` and friends are IN even though they take bounds, because
     ///   `ZSetStore::zrange` builds the entire ordered set and then slices it.
     ///   A narrow range costs the whole zset today.
-    /// - `LRANGE` is OUT for the opposite reason: `ListStore::lrange` reads
-    ///   only the ranks asked for, so its cost tracks the slice. Admitting it
-    ///   against the whole list would refuse `LRANGE key 0 0` on a large one.
+    /// - `LRANGE` is IN, but costed against the REQUESTED SLICE rather than the
+    ///   key: `ListStore::lrange` reads only the ranks asked for, so charging
+    ///   it the whole list would refuse `LRANGE key 0 0` on a large one. It was
+    ///   left out entirely at first for that reason, and that left
+    ///   `LRANGE key 0 -1` unbounded — the exact read this bug is about.
+    ///   `range_bytes` normalises the bounds the way `lrange` does and
+    ///   estimates from the mean element size.
     ///
     /// The multiplier this feeds was measured on HASHES. Sets and zsets store
     /// their members as keys with empty values, so their per-item overhead
@@ -256,6 +260,16 @@ impl<'a> Dispatcher<'a> {
             b"SMEMBERS" => self.sets.stored_bytes(slot, key),
             b"ZRANGE" | b"ZREVRANGE" | b"ZRANGEBYSCORE" | b"ZREVRANGEBYSCORE" | b"ZRANGEBYLEX"
             | b"ZREVRANGEBYLEX" => self.zsets.stored_bytes(slot, key),
+            // Costed on the slice, not the key. Bounds that do not parse are
+            // NOT admitted as zero: the command's own error answers that, and
+            // sizing a request that will never run would bound nothing.
+            b"LRANGE" => {
+                let (Ok(start), Ok(stop)) = (parse_i64(args.get(2)?), parse_i64(args.get(3)?))
+                else {
+                    return None;
+                };
+                self.lists.range_bytes(slot, key, start, stop)
+            }
             _ => return None,
         };
         // A metadata read that ERRORS (wrong type, say) is not a collection

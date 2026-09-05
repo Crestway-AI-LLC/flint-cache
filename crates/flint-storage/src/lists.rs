@@ -378,6 +378,49 @@ impl<'a> ListStore<'a> {
     }
 
     /// LRANGE with Redis index semantics (inclusive, negatives from end).
+    /// Bytes an `LRANGE start stop` would materialise, from ONE metadata read.
+    ///
+    /// Lists are the one collection whose read cost tracks the REQUEST rather
+    /// than the key: `lrange` fetches only the ranks asked for, so costing it
+    /// against the whole list would refuse `LRANGE key 0 0` on a large one.
+    /// That is why BUG-0060's admission left lists out at first, and why
+    /// leaving them out was itself a hole -- `LRANGE key 0 -1` is exactly the
+    /// unbounded read that bug exists for.
+    ///
+    /// The estimate is `elements in range x mean element size`, the mean being
+    /// `bytes / size` from the same metadata. A list of uniform elements is
+    /// exact; a skewed one is not, and the error is bounded by how far the
+    /// requested slice's elements sit from the mean. Admission wants an
+    /// estimate of the right ORDER, and the alternative -- reading the range to
+    /// find out how big it is -- is the work being admitted.
+    ///
+    /// Bounds are normalised exactly as `lrange` does, because an estimate for
+    /// a different range than the one served would be worse than none.
+    pub fn range_bytes(
+        &self,
+        slot: u16,
+        key: &[u8],
+        start: i64,
+        stop: i64,
+    ) -> Result<Option<u64>, StoreError> {
+        let Some(meta) = self.read_meta(slot, key)? else {
+            return Ok(None);
+        };
+        let len = meta.tail - meta.head;
+        if len <= 0 || meta.base.size == 0 {
+            return Ok(Some(0));
+        }
+        let norm = |i: i64| if i < 0 { len + i } else { i };
+        let from = norm(start).max(0);
+        let to = norm(stop).min(len - 1);
+        if from > to {
+            return Ok(Some(0));
+        }
+        let wanted = u64::try_from(to - from + 1).unwrap_or(0);
+        let mean = meta.base.bytes / u64::from(meta.base.size);
+        Ok(Some(wanted.saturating_mul(mean)))
+    }
+
     pub fn lrange(
         &self,
         slot: u16,
@@ -420,6 +463,82 @@ mod tests {
 
     fn vs(v: &[&[u8]]) -> Vec<Vec<u8>> {
         v.iter().map(|m| m.to_vec()).collect()
+    }
+
+    #[test]
+    fn range_bytes_matches_what_lrange_actually_returns() {
+        // The estimate has to agree with the read it is admitting, INCLUDING
+        // the bound normalisation -- an estimate for a different range than the
+        // one served is worse than no estimate. Uniform elements, so the mean
+        // is exact and any disagreement is the normalisation.
+        let kv = MemKv::new();
+        let l = ListStore::new(&kv, b"t", now);
+        let elems: Vec<Vec<u8>> = (0..10).map(|_| vec![b'x'; 100]).collect();
+        assert_eq!(l.push(1, b"l", &elems, false), Ok(10));
+
+        for (start, stop) in [
+            (0, -1), // the whole list: the unbounded read this exists for
+            (0, 0),  // one element: must NOT be charged the whole list
+            (0, 4),
+            (5, 9),
+            (-3, -1), // negative bounds
+            (-1, -1),
+            (3, 3),
+            (0, 100), // stop past the end, clamped
+            (7, 2),   // inverted: empty
+            (20, 30), // wholly past the end: empty
+        ] {
+            let served: u64 = l
+                .lrange(1, b"l", start, stop)
+                .expect("lrange")
+                .iter()
+                .map(|v| v.len() as u64)
+                .sum();
+            let estimated = l.range_bytes(1, b"l", start, stop).expect("range_bytes");
+            assert_eq!(
+                estimated,
+                Some(served),
+                "range_bytes disagreed with lrange for ({start}, {stop})"
+            );
+        }
+    }
+
+    #[test]
+    fn range_bytes_charges_one_element_not_the_list() {
+        // The reason lists were left out of admission at first, and the reason
+        // leaving them out was itself a hole: LRANGE key 0 0 must be cheap and
+        // LRANGE key 0 -1 must not.
+        let kv = MemKv::new();
+        let l = ListStore::new(&kv, b"t", now);
+        let elems: Vec<Vec<u8>> = (0..100).map(|_| vec![b'x'; 1000]).collect();
+        assert_eq!(l.push(1, b"l", &elems, false), Ok(100));
+
+        let one = l
+            .range_bytes(1, b"l", 0, 0)
+            .expect("range_bytes")
+            .expect("the list exists");
+        let all = l
+            .range_bytes(1, b"l", 0, -1)
+            .expect("range_bytes")
+            .expect("the list exists");
+        assert_eq!(one, 1_000);
+        assert_eq!(all, 100_000);
+        assert!(
+            all / one >= 99,
+            "the whole-list read must cost ~100x the single-element one, got {all} vs {one}"
+        );
+    }
+
+    #[test]
+    fn range_bytes_on_a_missing_key_is_none_not_zero() {
+        // "No such list" and "a list whose slice is empty" are different facts.
+        // Admission may treat both as free; a caller that cannot tell them
+        // apart cannot report which it saw.
+        let kv = MemKv::new();
+        let l = ListStore::new(&kv, b"t", now);
+        assert_eq!(l.range_bytes(1, b"absent", 0, -1), Ok(None));
+        assert_eq!(l.push(1, b"l", &vs(&[b"a"]), false), Ok(1));
+        assert_eq!(l.range_bytes(1, b"l", 5, 9), Ok(Some(0)));
     }
 
     #[test]

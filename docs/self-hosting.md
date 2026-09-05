@@ -827,11 +827,15 @@ Two known gaps, both stated rather than hidden:
 - **The multiplier was measured on hashes.** Sets and zsets store members
   as keys with empty values, so their per-item overhead differs and their
   multiplier may too. It has not been measured for them.
-- **`LRANGE` is deliberately NOT admitted.** It reads only the ranks asked
-  for, so its cost tracks the slice rather than the list, and costing it
-  against the whole list would refuse `LRANGE key 0 0` on a large one. A
-  list read is therefore still unbounded; `ZRANGE` is admitted because it
-  builds the whole zset before slicing, however narrow the range.
+- **`LRANGE` is admitted on the REQUESTED SLICE**, not the key. It reads only
+  the ranks asked for, so charging it the whole list would refuse
+  `LRANGE key 0 0` on a large one; the estimate is the elements in range times
+  the mean element size, with the bounds normalised exactly as the read
+  normalises them. `ZRANGE` by contrast is charged the whole zset however
+  narrow the range, because it builds the whole ordered set before slicing.
+  A skewed list makes the mean an approximation — bounded by how far the
+  requested elements sit from average, and the alternative is reading the
+  range to find out how big it is, which is the work being admitted.
 
 ## 4. Managing users (tenants)
 
