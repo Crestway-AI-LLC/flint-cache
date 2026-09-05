@@ -13,11 +13,16 @@
 # answer. `tools/gates.sh` before tagging; the checklist stays as the
 # explanation of why each step exists.
 #
-# Usage: tools/gates.sh [stage ...]     (default: all)
+# Usage: tools/gates.sh [stage ...]     (default: every stage but msrv)
 #   check        fmt + clippy + tests, both feature configs
 #   conformance  the compatibility oracle vs valkey, flint mem, flint rocks
 #   drills       the core drills (the CORE list below is the count)
 #   chaos        the two randomized chaos drills
+#   msrv         does the workspace build at the rust-version Cargo.toml
+#                declares? OPT-IN: valid as an argument, NOT in the default
+#                set, because it installs a second toolchain and downloads a
+#                separate dependency build. Run it when the declaration or the
+#                dependency set changes.
 #
 # Logs land in $FLINT_GATE_LOGS (default $FLINT_DRILL_ROOT/flint-gates), one
 # DIRECTORY PER RUN — <utc-stamp>-<short-sha>[-dirty]/<step>.log — kept whether
@@ -58,7 +63,15 @@ set -u
 # Parsed BEFORE the `cd` (so $0 still resolves against the caller's directory)
 # and before the log directory is cleared — `--help` should not delete the
 # previous run's logs on its way to printing a usage block.
-ALL_STAGES="check conformance drills chaos"
+DEFAULT_STAGES="check conformance drills chaos"
+# Valid as an argument, absent from the default run. `msrv` is here because it
+# costs a toolchain download and a second dependency build for a question that
+# only changes when the declaration or the dependency set does -- and because
+# CI already runs it per push (.github/workflows/msrv.yml). This is the local
+# and gate-box way to ask the same question, chiefly for the feature config
+# that workflow does not cover.
+OPT_IN_STAGES="msrv"
+ALL_STAGES="$DEFAULT_STAGES $OPT_IN_STAGES"
 want() { case " ${STAGES} " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
 
 # The header comment IS the usage text, printed out of the file itself. One
@@ -87,7 +100,7 @@ for arg in "$@"; do
       exit 2 ;;
   esac
 done
-STAGES="${*:-$ALL_STAGES}"
+STAGES="${*:-$DEFAULT_STAGES}"
 
 cd "$(dirname "$0")/.."
 
@@ -2089,6 +2102,78 @@ assert_recovery_stays_off_until_it_observes() {
 # go stale in silence. A drill deliberately testing a TTL passes a VARIABLE
 # (`lease-ttl-ms $LEASE`) — the number is then that drill's own subject rather
 # than a duplicate of the product default, and this check leaves it alone.
+# BUG-0039's remaining half, as a stage rather than only a CI job.
+#
+# `rust-version` in Cargo.toml is a claim about what a self-hoster needs, and
+# it was FALSE for five months: 1.85 was declared while hdrhistogram, time and
+# validit all required 1.88, so cargo refused at RESOLUTION and our own code
+# was never compiled. `.github/workflows/msrv.yml` closed that on 2026-08-20
+# and corrected the declaration to 1.88.
+#
+# WHAT THAT WORKFLOW DOES NOT COVER is the feature config a self-hoster
+# actually builds. It runs `cargo check --workspace --all-targets` with default
+# features; the durable engine is behind `rocks`, and a rocks-only path using a
+# newer API would pass CI and fail the person the declaration is FOR.
+#
+# THE DECLARATION IS READ, NEVER RESTATED. A version written here would be a
+# second claim that drifts from the first, which is the bug this exists to
+# close -- so raising or lowering `rust-version` changes what is verified,
+# automatically and in one place.
+msrv_declared() {
+  sed -n 's/^rust-version[[:space:]]*=[[:space:]]*"\([0-9.]*\)".*/\1/p' Cargo.toml | head -1
+}
+
+# Runs INSIDE step(), so its stdout is the log step_report scans -- which is
+# how the `SKIP:` below reaches FLINT_GATE_STRICT.
+msrv_at_the_declaration() {
+  local v got reported
+  v=$(msrv_declared)
+  if [ -z "$v" ]; then
+    echo "Cargo.toml declares no rust-version, so there is no claim to verify."
+    echo "That is not a pass: the declaration is what a self-hoster reads."
+    return 1
+  fi
+  echo "Cargo.toml declares rust-version = $v"
+  if ! command -v rustup >/dev/null 2>&1; then
+    echo "SKIP: rustup is not installed, so the declared toolchain ($v) cannot be"
+    echo "  selected -- rust-toolchain.toml pins this directory to a different one"
+    echo "  and only rustup can override that. A distro or Homebrew rustc can"
+    echo "  build the tree, but it cannot answer THIS question, and answering it"
+    echo "  with the wrong compiler is worse than not answering it."
+    echo "  Exits 0 as a SKIP; FLINT_GATE_STRICT=1 turns that into a FAIL, and"
+    echo "  the gate box has rustup, so it never reaches this line."
+    return 0
+  fi
+  rustup toolchain install "$v" --profile minimal >/dev/null 2>&1 || true
+
+  # THE CONTROL, and it is not decoration. rust-toolchain.toml pins this
+  # directory, RUSTUP_TOOLCHAIN is the one override that outranks it, and a
+  # silently ineffective override would run both checks below on the PINNED
+  # compiler and pass -- certifying a claim about 1.88 by compiling with 1.98.
+  got=$(RUSTUP_TOOLCHAIN="$v" rustc --version 2>&1) || {
+    echo "could not run rustc under RUSTUP_TOOLCHAIN=$v: $got"
+    return 1
+  }
+  reported=${got#rustc }
+  reported=${reported%% *}
+  case "$reported" in
+    "$v" | "$v".*) echo "compiling with: $got" ;;
+    *)
+      echo "asked for $v and got $reported ($got)."
+      echo "The override did not take, so anything below would be a claim about"
+      echo "$v proven by compiling with $reported. Refusing to report on it."
+      return 1
+      ;;
+  esac
+
+  echo "== cargo check --workspace --all-targets (default features)"
+  RUSTUP_TOOLCHAIN="$v" cargo check --workspace --all-targets || return 1
+  echo "== cargo check --workspace --all-targets --features rocks"
+  RUSTUP_TOOLCHAIN="$v" cargo check --workspace --all-targets \
+    --features flint-server/rocks,flint-backup/rocks || return 1
+  echo "the workspace builds at $v in both feature configs"
+}
+
 report_toolchain_vs_pin() {
   # NOT a pass/fail check - a third state, said out loud.
   #
@@ -2214,6 +2299,11 @@ assert_warm_covers_fleet_binaries() {
   echo "        Add it to the fleet_warm call; fleet_warm skips absent files."
   FAILED="$FAILED warm-list-incomplete"
 }
+
+if want msrv; then
+  echo "== msrv: the workspace at the rust-version Cargo.toml declares"
+  step "msrv (declared)" msrv msrv_at_the_declaration
+fi
 
 if want check; then
   echo "== gates: fmt, clippy, tests (both feature configs)"
