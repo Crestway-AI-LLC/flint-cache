@@ -167,3 +167,80 @@ getting slower to converge until the day it stops.
 
 The middle row matters as much as the first: without it, a change that always
 claimed to have waited would pass the other two.
+
+## 2026-09-05, later — the fix was a SECOND copy of a rule fleet.sh already had
+
+Triaging the rest of the failure population found two more `failover` runs with
+the same signature — `~2002ms (inflight 244 x service 8206us)`, 2 errors of
+20,000, and `~2033ms`, 1 error of 20,000. `244 x 8.206ms = 2002ms`: the
+estimator sitting exactly on its own line again.
+
+So this was never restart-only. Classifying every drill that loads through
+`valkey-cli --pipe`: **26 use it, and exactly 3 are exposed** — the ones with
+`pipefail` and no guard on the pipe's exit status: `restart`, `failover`,
+`repl`.
+
+**And `repl` was already fixed, years of lessons ago.** Its comment says it
+outright:
+
+> Loaded through `fleet_load_resp`, which replays whatever the master sheds.
+> The previous form piped once under `set -euo pipefail`; `valkey-cli --pipe`
+> exits non-zero when it counts errors, so a single `-THROTTLED` aborted the
+> run HERE.
+
+`fleet_load_resp` has been in `tools/lib/fleet.sh` since BUG-0035, doing this
+job for the lag cap. A write-deadline shed emits the same `-THROTTLED`, so the
+helper covered this case the whole time. **The first fix above open-coded it
+into `restart_drill.sh` instead** — a second implementation of one rule, in a
+suite whose recurring cost is exactly that.
+
+### What was done about it
+
+The open-coded version was not simply deleted: it had three things the helper
+lacked, and those were folded IN, so there is now one implementation strictly
+better than either.
+
+| moved into `fleet_load_resp` | why |
+|---|---|
+| an expected reply count | a short load is not a clean one, and `\|\| true` hides the loader's exit code |
+| the positive rule that every error line is a shed | an unrecognised line must fail rather than pass |
+| an optional shed ceiling | a rate that stops being small is a finding |
+
+**The ceiling had to become per-caller, and that is the interesting part.**
+`repl_drill` drives the lag cap deliberately and has seen 20,328 sheds of
+50,500 — 40% is the condition under test there, not a fault. A single global
+ceiling would have broken the one drill that already had this right. So
+`expected_replies` and `max_shed` default to unchecked; `restart` and
+`failover` pass 0.05%, `repl` and `controller` pass neither.
+
+`restart_drill` and `failover_drill` now call the helper and carry none of the
+rules themselves.
+
+### Controls, re-run against the consolidated helper
+
+| control | result |
+|---|---|
+| `restart` with `--write-deadline-ms 1` | `668 writes shed of 101000, past the 50 this drill tolerates` |
+| `failover` with `--write-deadline-ms 1` | `130 writes shed of 20000, past the 11` |
+| **`repl` with `--write-deadline-ms 1`** | **349 of 50500 shed, noted, drill PASSES** — the ceiling is per-caller and did not break the drill whose subject is shedding |
+| load against a port with nothing listening | `delivered nothing at all — this is NOT shedding; it is a dead or unreachable seat` |
+| a non-shed line injected into the loader output | `1 line(s) that are neither a THROTTLED shed nor a loader notice` |
+
+The third row is the one that would have been missed by testing only the
+drills that were failing.
+
+## The whole failure population, now accounted for
+
+Eight gate failures in 98 completed runs on `main` (8.2%), every one explained:
+
+| drill | runs | cause |
+|---|---|---|
+| `restart` | 3 | write-deadline shed read as a loss (this bug) |
+| `failover` | 2 | the same |
+| `backup_seat` | 1 | `verify_after` racing convergence (this bug, second defect) |
+| `ctl_error` | 1 (later) | the same |
+| `decommission` | 1 | BUG-0064, fixed 2026-09-04 |
+| `tenant_rebalance` | 1 | BUG-0094, fixed |
+
+Two live defects behind five sixths of a red rate that BUG-0064 recorded as
+"nobody is triaging them — they were simply never opened".

@@ -76,69 +76,24 @@ echo "== loading $KEYS strings + 1000 hashes via valkey-cli --pipe"
       printf "*6\r\n$4\r\nHSET\r\n$%d\r\n%s\r\n$2\r\nf1\r\n$%d\r\n%s\r\n$2\r\nf2\r\n$%d\r\n%s\r\n", length(k), k, length(v1), v1, length(v2), v2
     }
   }'
-} | valkey-cli -p "$PORT" --pipe > "$DIR/load.out" 2>&1 || true
-tail -1 "$DIR/load.out"
+} > "$DIR/load.resp"
 
-# A SHED IS A REFUSAL, NOT A LOSS -- and `--pipe` cannot tell the difference.
+# THROUGH fleet_load_resp, NOT a second copy of its rules.
 #
-# Three gate runs on 2026-09-04 failed here with one error in 101,000:
+# The first fix for BUG-0096 open-coded the shed tolerance here -- and
+# fleet.sh had carried `fleet_load_resp` since BUG-0035, doing the same job
+# for the lag cap, with `repl_drill`'s own comment describing this exact
+# failure ("a single -THROTTLED aborted the run HERE"). Two implementations of
+# one rule is the thing this suite keeps paying for, so the useful parts of
+# the open-coded version were folded INTO the helper (a reply-count check, a
+# shed ceiling, and the positive rule that every error line is a shed) and
+# this call site now has none of them.
 #
-#   THROTTLED write would wait ~2011ms (inflight 65 x service 30942us),
-#     past --write-deadline-ms 2000, retry with backoff
-#
-# and the other two read 44 x 45551us and 30 x 67038us. The PRODUCT of those
-# pairs is pinned at ~2000ms every time while the factors move by 2x, which is
-# the deadline estimator crossing its own line on a slow shared runner -- not a
-# regression. `--write-deadline-ms` has not changed behaviour since #186.
-#
-# The server told the client to RETRY. `valkey-cli --pipe` is a bulk loader and
-# does not, so one refused write out of 101,000 killed a drill whose subject is
-# whether data survives kill -9. That is BUG-0035's shape in a different
-# subsystem: a working shed reddening a drill that is not testing it.
-#
-# Tolerated, BOUNDED, and COUNTED -- never silently. The two keys this drill
-# verifies are both proven written before the kill (below), so a refusal
-# elsewhere cannot turn into a false PASS; and a shed that stops being rare
-# stops being tolerated, because a rate is the only thing separating a slow
-# runner from a real fault.
-LOAD_ERRS=$(sed -n 's/.*errors: \([0-9][0-9]*\).*/\1/p' "$DIR/load.out" | tail -1)
-LOAD_REPLIES=$(sed -n 's/.*replies: \([0-9][0-9]*\).*/\1/p' "$DIR/load.out" | tail -1)
-# COULD NOT MEASURE IS NOT MEASURED NOTHING. `|| true` above swallows the exit
-# code, so without this a load that never connected would read as zero errors.
-[ -n "${LOAD_REPLIES:-}" ] \
-  || { echo "FAIL: the loader printed no reply count -- it did not run, and this"
-       echo "      is not the same as loading cleanly:"; cat "$DIR/load.out"; exit 1; }
-[ "$LOAD_REPLIES" -eq "$(( KEYS + 1000 ))" ] \
-  || { echo "FAIL: loader replied $LOAD_REPLIES times, expected $(( KEYS + 1000 ))"; exit 1; }
-if [ "${LOAD_ERRS:-0}" -gt 0 ]; then
-  # EVERY error line must be a retryable shed, checked as a POSITIVE rule:
-  # subtract the loader's own known notices and the sheds, and require nothing
-  # to be left. Enumerating error forms instead (`^-?ERR|WRONGTYPE|...`) was
-  # tried and was wrong twice over -- it cannot know every error the server can
-  # emit, and case-insensitively `^-?ERR` matched the loader's own summary line
-  # `errors: 222, replies: 20000`, so the check reported the count as an error
-  # in its own right. Found by the control below, not by reading it.
-  #
-  # An unrecognised line therefore FAILS rather than passing, which is the
-  # direction this has to fail in.
-  NON_SHED=$(grep -vE '^(errors:|Last reply received|All data transferred)' "$DIR/load.out" \
-             | grep -vi THROTTLED | grep -c . || true)
-  [ "${NON_SHED:-0}" -eq 0 ] \
-    || { echo "FAIL: the load produced $NON_SHED line(s) that are neither a THROTTLED shed"
-         echo "      nor a loader notice -- a shed is retryable and those may not be:"
-         cat "$DIR/load.out"; exit 1; }
-  grep -qi THROTTLED "$DIR/load.out" \
-    || { echo "FAIL: $LOAD_ERRS load error(s) and none of them a THROTTLED shed:"; cat "$DIR/load.out"; exit 1; }
-  # 0.05% of the load. One in 101,000 is a slow runner; hundreds is the
-  # estimator firing systematically, and that is a finding rather than weather.
-  SHED_CEIL=$(( (KEYS + 1000) / 2000 ))
-  [ "$LOAD_ERRS" -le "$SHED_CEIL" ] \
-    || { echo "FAIL: $LOAD_ERRS writes shed of $(( KEYS + 1000 )), past the $SHED_CEIL this drill"
-         echo "      tolerates. At that rate the write-deadline estimator is not reacting to a"
-         echo "      slow box; look at --write-deadline-ms and write_service_us, not at durability."
-         exit 1; }
-  echo "== tolerated $LOAD_ERRS retryable shed(s) of $(( KEYS + 1000 )) writes (ceiling $SHED_CEIL): $(grep -oiE 'THROTTLED[^)]*\)' "$DIR/load.out" | head -1)"
-fi
+# The ceiling is 0.05% of the load: one shed in 101,000 is a slow runner,
+# hundreds is the deadline estimator firing systematically.
+fleet_load_resp "$PORT" "cat $DIR/load.resp" "$(( KEYS + 1000 ))" "$(( (KEYS + 1000) / 2000 ))" \
+  || exit 1
+rm -f "$DIR/load.resp"
 
 # DERIVE the sampled key from KEYS; do not hardcode an index. This was
 # key:0042000, which is never written when KEYS <= 42000 — so

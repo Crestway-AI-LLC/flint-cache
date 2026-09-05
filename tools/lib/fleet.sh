@@ -1359,30 +1359,74 @@ cli_int() {
 # "nothing was written" and "everything was refused" must not look alike.
 # $1 = port, $2 = name of a function writing the RESP stream to stdout.
 fleet_load_resp() {
-  local port="$1" gen="$2" errs replies out
+  # fleet_load_resp <port> <gen> [expected_replies] [max_shed]
+  #
+  # ONE implementation of "a -THROTTLED is a refusal, not a loss". Both the
+  # lag cap (BUG-0035) and the write deadline (BUG-0096) shed with the same
+  # error, and `valkey-cli --pipe` exits non-zero when it counts ANY error, so
+  # under the caller's `set -e`/`pipefail` a single shed aborts the drill.
+  #
+  # `expected_replies` and `max_shed` are OPTIONAL and default to unchecked,
+  # because the two kinds of caller want opposite things. repl_drill drives the
+  # lag cap deliberately and has seen 20,328 sheds of 50,500 -- 40% is the
+  # condition under test there, not a fault. restart_drill and failover_drill
+  # are durability drills where a shed is weather, and a rate that stops being
+  # small is a finding; they pass a ceiling.
+  local port="$1" gen="$2" want_replies="${3:-}" max_shed="${4:-}"
+  local errs replies out summary nonshed
   # The load phase is where the shed happens, and it can be minutes after
   # fleet_guard ran. Record here too, so a -THROTTLED count and the box that
   # produced it sit on adjacent lines.
   fleet_env_note load
+  out="$(mktemp "${FLINT_DRILL_ROOT:-/tmp}/flint-load.XXXXXX")"
   # `|| true`: --pipe exits non-zero when it counts errors, and under the
   # caller's `set -e`/`pipefail` that alone would abort the drill here.
-  out=$( { $gen | valkey-cli -p "$port" --pipe 2>&1 | tail -1; } || true )
-  errs=$(printf '%s' "$out" | sed -n 's/.*errors: \([0-9][0-9]*\).*/\1/p')
-  replies=$(printf '%s' "$out" | sed -n 's/.*replies: \([0-9][0-9]*\).*/\1/p')
+  { $gen | valkey-cli -p "$port" --pipe > "$out" 2>&1; } || true
+  summary=$(tail -1 "$out")
+  errs=$(sed -n 's/.*errors: \([0-9][0-9]*\).*/\1/p' "$out" | tail -1)
+  replies=$(sed -n 's/.*replies: \([0-9][0-9]*\).*/\1/p' "$out" | tail -1)
   [ -n "$errs" ] || errs=0
   [ -n "$replies" ] || replies=0
-  echo "  load: $out"
+  echo "  load: $summary"
   if [ "$replies" = "0" ]; then
     echo "FAIL: the load delivered nothing at all — the node did not answer."
     echo "      This is NOT shedding; it is a dead or unreachable seat."
-    return 1
+    rm -f "$out"; return 1
+  fi
+  if [ -n "$want_replies" ] && [ "$replies" != "$want_replies" ]; then
+    echo "FAIL: the load replied $replies times, expected $want_replies —"
+    echo "      a short load is not a clean one."
+    rm -f "$out"; return 1
   fi
   if [ "$errs" != "0" ]; then
-    echo "  note: $errs of $replies writes shed -THROTTLED (replica lag past"
-    echo "        the cap). Shed writes were NEVER ACKED, so nothing is lost."
-    echo "        Keys this drill asserts on are repaired below; see BUG-0035"
-    echo "        for why the cap is reachable here at all."
+    # EVERY error line must be a shed, as a POSITIVE rule: subtract the
+    # loader's own notices and the sheds, and require nothing to be left.
+    # Enumerating error forms instead cannot know every error the server can
+    # emit -- and case-insensitively `^-?ERR` matches the loader's own summary
+    # `errors: 222, replies: 20000`, so that version reported the count as an
+    # error in its own right (BUG-0096, caught by a control).
+    nonshed=$(grep -vE '^(errors:|Last reply received|All data transferred)' "$out" \
+              | grep -vi THROTTLED | grep -c . || true)
+    if [ "${nonshed:-0}" -ne 0 ]; then
+      echo "FAIL: the load produced $nonshed line(s) that are neither a THROTTLED"
+      echo "      shed nor a loader notice — a shed is retryable and those may not be:"
+      cat "$out"
+      rm -f "$out"; return 1
+    fi
+    if [ -n "$max_shed" ] && [ "$errs" -gt "$max_shed" ]; then
+      echo "FAIL: $errs writes shed of $replies, past the $max_shed this drill"
+      echo "      tolerates. At that rate the shed is not reacting to a slow box;"
+      echo "      look at the cap that fired and at write_service_us, not at"
+      echo "      durability."
+      cat "$out"
+      rm -f "$out"; return 1
+    fi
+    echo "  note: $errs of $replies writes shed -THROTTLED. Shed writes were"
+    echo "        NEVER ACKED, so nothing is lost. Keys a drill asserts on must"
+    echo "        be proven written before they are relied on; see BUG-0035 and"
+    echo "        BUG-0096 for the two caps that reach this."
   fi
+  rm -f "$out"
   return 0
 }
 

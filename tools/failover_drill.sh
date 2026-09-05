@@ -53,12 +53,29 @@ sleep 0.6
 FS0=$(valkey-cli -p "$MPORT" FLINTINFO 2>/dev/null | tr -d '\r' | sed -n 's/^wal_fsync_total://p' || true)
 
 echo "== loading $KEYS keys"
+# THROUGH fleet_load_resp. Piping straight into `--pipe` under this drill's
+# `set -euo pipefail` made a single -THROTTLED abort the run: --pipe exits
+# non-zero when it counts ANY error. Two gate runs died here on 2026-09-04 with
+# 1 and 2 errors of 20,000 --
+#
+#   THROTTLED write would wait ~2002ms (inflight 244 x service 8206us),
+#     past --write-deadline-ms 2000, retry with backoff
+#
+# -- which is the write deadline reacting to a slow runner (244 x 8.206ms is
+# 2002ms, the estimator sitting exactly on its own line), not a failover fault.
+# A shed write is REFUSED, never acked, so it cannot affect what this drill
+# asserts about the keys that were.
+#
+# The ceiling is 0.05% of the load, the same rule restart_drill uses.
+LOAD_GEN=$(mktemp "${FLINT_DRILL_ROOT:-/tmp}/flint-fo-load.XXXXXX")
 awk -v n="$KEYS" 'BEGIN {
   for (i = 0; i < n; i++) {
     k = sprintf("key:%07d", i); v = sprintf("value-%07d", i)
     printf "*3\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n", length(k), k, length(v), v
   }
-}' | valkey-cli -p "$MPORT" --pipe | tail -1
+}' > "$LOAD_GEN"
+fleet_load_resp "$MPORT" "cat $LOAD_GEN" "$KEYS" "$(( KEYS / 2000 + 1 ))" || exit 1
+rm -f "$LOAD_GEN"
 
 # BUG-0088: say how close that load came to the write deadline, on a PASS as
 # well as on a failure. The `errors:` line above reports only whether a write
