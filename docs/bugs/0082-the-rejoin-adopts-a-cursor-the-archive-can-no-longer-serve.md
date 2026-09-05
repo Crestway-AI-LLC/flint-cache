@@ -199,6 +199,50 @@ arm. Same message, and now they read differently.
 occurrence — roughly twice a week on the playground — without waiting to build
 the deterministic reproducer this file still wants.
 
+### 2026-09-05 — the diagnostic is DEPLOYED, so the next occurrence is readable
+
+Checked, because "it decides on the next occurrence" is only true once the
+thing doing the deciding is running on the fleet that produces them:
+
+| fact | how it was established |
+|---|---|
+| `3120a3a` (this diagnostic, 2026-09-02) is in **v0.1.0-rc.69** and in no earlier tag | `git merge-base --is-ancestor` against rc.65/66/67/69 |
+| the playground fleet was rolled to **rc.69 on 2026-09-04** | `docs/playground-runbook.md`, the rollback section, checked on the box after that roll |
+
+So every occurrence from 2026-09-04 onward carries the span, and every one
+before it does not. At roughly twice a week, the deciding evidence should
+appear within days of that date rather than needing to be waited for
+indefinitely.
+
+**Where it will be.** Seats log to `{statedir}/logs/{name}.log`
+(`flint-ctl/src/main.rs:1438`) and the playground's statedir is
+`/var/lib/flint`, so:
+
+    grep -h "archive holds" /var/lib/flint/logs/node-*.log
+
+Read the result with the table above: an **oldest segment hours old with the
+cursor below it** settles translation and no retention change would help; an
+**oldest segment seconds old** settles retention.
+
+**Nothing here has read a playground log.** This section establishes only that
+the instrument is in place and where to point it — the discrimination itself is
+still unmade.
+
+### And the third reason it is invisible is untouched by any of this
+
+The list below says the agent repairs this silently — 16 completed
+`AttachReplica` repairs, 15 reporting "success signals read healthy" — so the
+underlying fault never surfaced as an incident anybody read. **That is exactly
+as true of the new line as of the old one.** The span now exists in a seat log
+on a box, twice a week, and nothing routes it anywhere a human looks; the
+repair still closes cleanly and the case still reads as handled.
+
+So the realistic failure mode is no longer "we lack the evidence" but "the
+evidence accumulates unread", which is a worse place to be, because it looks
+like progress. Whoever picks this up should either read the log on purpose
+(the grep above) or make the refusal reach the report — the second being the
+only version that survives nobody remembering.
+
 ## Why it has been invisible
 
 Three things hide it, and all three were true on the playground today:
