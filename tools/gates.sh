@@ -1217,7 +1217,10 @@ CLOSED = ("FIXED", "RESOLVED", "CLOSED", "SHIPPED", "RETRACTED", "SUBSUMED",
           "WONTFIX")
 bad = []
 n = 0
+compared = 0
+total = 0
 for f in sorted(glob.glob("docs/bugs/[0-9][0-9][0-9][0-9]-*.md")):
+    total += 1
     head = open(f, encoding="utf-8", errors="replace").read()
     h1 = head.split("\n", 1)[0]
     m = re.search(r"\(([^)]*)\)\s*$", h1)
@@ -1239,6 +1242,7 @@ for f in sorted(glob.glob("docs/bugs/[0-9][0-9][0-9][0-9]-*.md")):
     title_open = "OPEN" in re.split(r"[^A-Z]+", marker) and not any(
         c in marker for c in CLOSED)
     title_closed = any(marker.split()[0].startswith(c) for c in CLOSED) if marker.split() else False
+    compared += 1
     if title_open and first.startswith(CLOSED):
         bad.append((f, marker, st))
     elif title_closed and first == "OPEN":
@@ -1247,6 +1251,11 @@ for f in sorted(glob.glob("docs/bugs/[0-9][0-9][0-9][0-9]-*.md")):
 if n == 0:
     print("NOFILES")
     sys.exit(0)
+# And a file with no marker, or no Status line, is skipped -- correctly, since
+# it has only one copy of the fact -- but a check that abstains silently reads
+# exactly like one that examined everything. Say how many it actually held
+# against each other.
+print("COVERAGE %d %d" % (compared, total))
 for f, marker, st in bad:
     print("%s\t(%s)\t%s" % (os.path.basename(f), marker, st[:60]))
 BTPY
@@ -1258,6 +1267,9 @@ BTPY
     FAILED="$FAILED bug-titles-examined-nothing"
     return
   fi
+  local tcov
+  tcov=$(printf '%s\n' "$out" | sed -n 's/^COVERAGE //p')
+  out=$(printf '%s\n' "$out" | grep -v '^COVERAGE ' || true)
   if [ -n "$out" ]; then
     echo "FAIL  these write-ups contradict their own Status line in the title"
     echo "        the index renders:"
@@ -1268,7 +1280,10 @@ BTPY
     FAILED="$FAILED bug-titles-contradict-status"
     return
   fi
-  echo "  every bug title agrees with its own Status line"
+  # shellcheck disable=SC2086
+  set -- $tcov
+  echo "  every bug title agrees with its own Status line \
+($1 of $2 write-ups compared; the rest carry no title marker or no Status line)"
 }
 
 assert_bug_index_markers_agree_with_status() {
@@ -1324,15 +1339,19 @@ for line in idx.split("\n"):
 
 bad = []
 marked = 0
+compared = 0
+total = 0
 for f in sorted(glob.glob("docs/bugs/[0-9][0-9][0-9][0-9]-*.md")):
+    total += 1
     row = marker_of.get(os.path.basename(f)[:4])
     if not row:
         continue
     marked += 1
     head = open(f, encoding="utf-8", errors="replace").read()
     sm = re.search(r"^\*{0,2}Status:?\*{0,2}\s*:?\s*(.{0,40})", head, re.M)
-    if not sm:
+    if not sm or not sm.group(1).strip():
         continue
+    compared += 1
     # chr(96) rather than the character: this heredoc sits inside a $( ), where
     # bash looks for a matching backtick even in a QUOTED heredoc.
     st = re.sub("[*_" + chr(96) + "]", "", sm.group(1)).strip().upper()
@@ -1349,6 +1368,11 @@ for f in sorted(glob.glob("docs/bugs/[0-9][0-9][0-9][0-9]-*.md")):
 if marked == 0:
     print("NOMARKERS")
     sys.exit(0)
+# SAY HOW MUCH WAS COMPARED. A row with no marker, or a write-up with no
+# Status line, is skipped -- correctly, since there is no second copy to
+# disagree with -- but a check that abstains silently reads exactly like one
+# that examined everything.
+print("COVERAGE %d %d %d" % (compared, marked, total))
 for f, row, st in bad:
     print("%s\t(%s)\t%s" % (f, row[:70], st[:60]))
 BIMPY
@@ -1360,6 +1384,9 @@ BIMPY
     FAILED="$FAILED bug-index-markers-examined-nothing"
     return
   fi
+  local cov
+  cov=$(printf '%s\n' "$out" | sed -n 's/^COVERAGE //p')
+  out=$(printf '%s\n' "$out" | grep -v '^COVERAGE ' || true)
   if [ -n "$out" ]; then
     echo "FAIL  index row(s) whose marker contradicts the write-up's Status:"
     printf '%s\n' "$out" | while IFS="$(printf '\t')" read -r f marker st; do
@@ -1371,7 +1398,11 @@ BIMPY
     FAILED="$FAILED bug-index-markers-contradict-status"
     return
   fi
-  echo "  every bug index row agrees with its write-up's Status line"
+  # shellcheck disable=SC2086
+  set -- $cov
+  echo "  every bug index row agrees with its write-up's Status line \
+($1 of $3 write-ups compared: $(($3 - $2)) have no index marker, \
+$(($2 - $1)) no Status line)"
 }
 
 assert_bug_index_agrees() {
