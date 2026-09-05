@@ -8,10 +8,14 @@
 # encoding, and the FLINTINFO fields. This drill exercises the whole path
 # through a real server and a real client.
 #
-# THE CONTROL MATTERS MORE THAN THE ASSERTION. The same read is issued twice:
-# once with admission OFF, where it must SUCCEED, and once with a budget it
-# cannot fit, where it must be REFUSED. Without the first, a refusal proves
-# only that something went wrong -- a broken build refuses too.
+# THE CONTROL MATTERS MORE THAN THE ASSERTION. The same read is issued three
+# times: with admission OFF, where it must SUCCEED; with a budget it cannot
+# fit, where it must be REFUSED; and with that same budget in `observe` mode,
+# where it must SUCCEED AGAIN while `collection_read_would_refuse` still
+# moves. Without the first, a refusal proves only that something went wrong --
+# a broken build refuses too. Without the last pair held together, observing
+# could be either half-broken and still look right: refusing anyway, or
+# quietly not deciding at all.
 #
 # On a host whose memory cannot be read (macOS has no /proc/meminfo) admission
 # admits everything by design, so this drill CANNOT test it. It then prints a
@@ -36,6 +40,7 @@ LOG="$FLINT_DRILL_ROOT/flint-colladmit.log"
 VSIZE=100000
 
 cargo build --release -q -p flint-server --features rocks || fail "build"
+
 
 start_node() {   # $1 = extra args (may be empty)
   rm -rf "$D"
@@ -64,6 +69,48 @@ build_hash() {   # $1 = fields
   [ -n "$args" ] && cli HSET h $args >/dev/null
   return 0
 }
+
+# A configuration that silently measures nothing must be refused at boot, not
+# served. These two run on every host -- they do not need readable memory, so
+# they sit ABOVE the macOS skip below rather than behind it.
+expect_config_refusal() {   # $1 = extra args, $2 = what is being refused
+  local pid i rc
+  rm -rf "$D"
+  # shellcheck disable=SC2086
+  ./target/release/flint-server --port "$PORT" --engine rocks --data-dir "$D" \
+    $1 >"$LOG" 2>&1 &
+  pid=$!
+  for ((i = 0; i < 100; i++)); do
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.1
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -9 "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    fail "$2: the node STARTED and served. This configuration reports 0 whatever
+  the workload does, which is indistinguishable from a budget nobody crossed."
+  fi
+  set +e; wait "$pid"; rc=$?; set -e
+  [ "$rc" = "2" ] || fail "$2: expected exit 2, got $rc -- see $LOG"
+}
+
+echo "== startup: configurations that would measure nothing are refused"
+expect_config_refusal "--collection-read-mode observe" "observe with no budget"
+grep -q "no budget to observe against" "$LOG" \
+  || fail "the refusal does not say WHY: $(head -c 200 "$LOG")"
+expect_config_refusal "--collection-read-budget-pct 25 --collection-read-mode obserev" \
+  "a misspelt mode"
+grep -q "expected \`enforce\` or \`observe\`" "$LOG" \
+  || fail "the refusal does not name the accepted set: $(head -c 200 "$LOG")"
+# CONTROL. Both checks above pass just as well against a binary that refuses
+# EVERY configuration, which would also break every other arm of this drill in
+# a way that looks like a product bug. Prove a good pairing starts.
+start_node "--collection-read-budget-pct 25 --collection-read-mode observe"
+[ "$(info_field collection_read_mode)" = "observe" ] \
+  || fail "a valid --collection-read-mode observe did not start in observe mode"
+fleet_kill server
+sleep 0.3
+echo "   refused both, and started the valid pairing"
 
 echo "== control: admission OFF, the read must succeed"
 start_node ""
@@ -141,6 +188,36 @@ case "$SMALL" in
   *THROTTLED*) fail "a 1-field hash was refused: the bound is refusing everything" ;;
 esac
 echo "   a small read still passes, so the bound discriminates by size"
+
+fleet_kill server
+sleep 0.3
+
+# The mode that makes the bound adoptable: the SAME read, the SAME budget, and
+# it must be ADMITTED while the counter still moves. Both halves matter. A
+# build that ignored the mode fails the first; a build that stopped computing
+# the decision fails the second, and would be the more dangerous of the two --
+# it reports a quiet 0 and reads as "your workload is nowhere near the budget".
+echo "== observe: the same read must be ADMITTED, and counted"
+start_node "--collection-read-budget-pct 1 --collection-read-mode observe"
+MODE=$(info_field collection_read_mode)
+[ "$MODE" = "observe" ] || fail "mode flag not applied: collection_read_mode=$MODE"
+build_hash "$FIELDS"
+
+OUT=$(cli HGETALL h 2>&1 | head -c 200 || true)
+case "$OUT" in
+  *THROTTLED*) fail "observe mode REFUSED a read -- it must only count: $OUT" ;;
+  "") fail "the observed read returned nothing; it must succeed exactly as the control did" ;;
+esac
+GOT=$(cli HLEN h)
+[ "$GOT" = "$FIELDS" ] || fail "observed read returned $GOT of $FIELDS fields"
+
+WOULD=$(info_field collection_read_would_refuse)
+[ "${WOULD:-0}" -ge 1 ] \
+  || fail "collection_read_would_refuse=$WOULD after a read the SAME budget refused
+  one arm ago -- the decision is not being computed, so observing measures nothing"
+REF=$(info_field collection_read_refused)
+[ "${REF:-x}" = "0" ] || fail "observe mode recorded $REF refusals; it must refuse nothing"
+echo "   admitted, would_refuse=$WOULD refused=$REF"
 
 fleet_kill server
 rm -rf "$D"

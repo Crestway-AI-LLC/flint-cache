@@ -7,9 +7,17 @@ the sum reaches physical memory at single-digit concurrency.
 **The mechanism is BUILT and OFF** (2026-09-04/05,
 `--collection-read-budget-pct`, default 0). Every whole-collection read is now
 costed and bounded when an operator turns it on — hashes, sets, zsets, and
-lists on their requested slice. What keeps this OPEN is the policy, not the
-code: the budget fraction is undecided, and the multiplier was measured on
-hashes alone.
+lists on their requested slice. The multiplier is measured across all three
+collection types, the fraction is ratified at 25%, and
+`--collection-read-mode observe` now lets an operator find out what a budget
+would cost before it costs them anything.
+
+**What keeps this OPEN is that the default is still 0**, so the defect this
+file is named for is live in every shipped configuration: on a default node,
+nothing bounds the sum. Closing it means changing
+`DEFAULT_COLLECTION_READ_BUDGET_PCT`, which is a fleet-wide behaviour change
+and a decision rather than an inference — every prerequisite for making it is
+now in place, and none of them is what is missing.
 
 ## The question this exists to answer
 
@@ -1076,22 +1084,68 @@ it.** The only way to learn the impact on a real workload today is to enable
 enforcement in production and watch what breaks, which is the one experiment
 nobody runs willingly on a read path.
 
-**Proposal: an observe-only mode.** `--collection-read-observe-only` alongside
+**Observe mode — BUILT 2026-09-05.** `--collection-read-mode observe` alongside
 the existing percentage: admission computes the decision exactly as it does
-now, increments a `collection_read_would_refuse` counter, and then **admits
-anyway**. An operator sets the fraction, watches the counter for a week against
-real traffic, and enables enforcement knowing the number rather than guessing
-it.
+now, increments `collection_read_would_refuse`, and then **admits anyway**. An
+operator sets the fraction, watches the counter against real traffic for as
+long as their peak takes to come round, and enables enforcement knowing the
+number rather than guessing it. Nothing is ever refused in this mode.
 
-Small: the decision already exists as an `Admit` value with its terms attached,
-so this is one flag, one counter, and one branch that drops the refusal on the
-floor. Strictly less invasive than what already shipped — it cannot refuse
-anything.
+Three things the build settled that the proposal had not.
 
-Worth stating why it is proposed rather than built: it is a new user-facing
-flag, and the opt-in-and-off shape of this feature was a decision rather than
-an inference. Recorded here so the reason the bound stays off is a decision
-somebody made, not a step nobody got to.
+**The flag is a mode, not a switch.** The proposal said
+`--collection-read-observe-only`, a bare boolean. flint-server cannot take one:
+`reject_unknown_flags` refuses any `--` token that is not in `ACCEPTED_FLAGS`,
+and it is sound only because *every* accepted flag takes a value and no value
+this binary reads begins with `--`. A bare flag breaks that invariant for
+BUG-0034's benefit and gains nothing, so the knob became
+`--collection-read-mode enforce|observe`. An unparseable value is a startup
+refusal rather than a fallback to `enforce`, which would hand an operator who
+asked to observe a node that refuses.
+
+**The count is an UPPER bound on what enforcement would refuse, and the
+direction is known.** Enforcing refuses the read, which sheds it, which leaves
+less in flight for the next one; observing admits it, which leaves more. The
+two worlds diverge at the first crossing and no amount of counting closes the
+gap — the refused read never runs, so its successor's world is a
+counterfactual. What the counter measures exactly is *how often real
+concurrent demand crossed the budget*. That is the honest question and the one
+an operator sizing the fraction is actually asking, but it is not a prediction
+and the docs do not call it one.
+
+That settled a design question too: **observing RESERVES**, for every read.
+Skipping the reservation would simulate enforcement's `in_flight` trajectory
+while the memory was really being spent, which would make
+`collection_read_in_flight_bytes` — a gauge, read live off a running node — a
+fiction for exactly as long as observation was switched on.
+
+**`observe` with no budget is refused at startup.** It would report `0`
+whatever the workload did, and `0` is also what a workload comfortably inside
+its budget reports. That is this file's own recurring rule — never let "I did
+not look" render as "nothing was wrong" — arriving in a third place, after
+`collection_read_unmeasured` and `mem_src`.
+
+### The near-miss that came with it
+
+The validation was first written where it belonged by topic: beside the rest of
+the admission setup, a few lines above `READ_ADMISSION.set`. That position is
+past `TcpListener::bind` and past the `let store` that opens RocksDB, so both
+new `std::process::exit(2)` calls would have run libc `atexit` handlers with
+the DB open and its compaction threads live — **BUG-0048 verbatim**, introduced
+by the change that also had to raise BUG-0048's own guard from 6 to 8.
+
+The guard is what caught it: raising the count is not a formality, it is a
+prompt to re-answer "which category is this one in", and the honest answer was
+"neither". The fix was to move the whole flag-reading block ahead of the bind
+and the store open, where argument validation belongs anyway — a bad
+configuration now costs no port and no DB.
+
+Worth recording that the guard's own doc comment claims all five original
+startup exits sit "before any store exists", and that claim was audited rather
+than trusted while checking this. It holds: two are inside the `match
+engine.as_str()` that *builds* the store, and the two `--async-writes` ones
+fire only on the branch where `rocks` is `None`, so no RocksDB is ever open at
+any of them.
 
 ### Still open
 

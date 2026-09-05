@@ -25,6 +25,30 @@
 //! the macOS maximum of 3.189 by 10%, and every measurement is a lower bound
 //! because an RSS peak understates demand whenever the host is reclaiming.
 //!
+//! # Observing the bound before enforcing it
+//!
+//! `Mode::Observe` runs the identical arithmetic and then admits anyway,
+//! counting what it would have refused in `collection_read_would_refuse`. It
+//! exists because the bound ships OFF, and the only other way to learn what a
+//! budget would cost a real workload is to enforce it on that workload and
+//! watch what breaks.
+//!
+//! **The count is an UPPER bound on what enforcement would refuse, and the
+//! direction is known.** Under enforcement a refusal sheds the read, so
+//! `in_flight` stays lower and the NEXT read is likelier to fit; observing
+//! admits it, so `in_flight` carries it and the next read is likelier to trip.
+//! The two trajectories diverge after the first crossing and no amount of
+//! counting closes that gap -- the refused read never runs, so its successor's
+//! world is a counterfactual. What this measures exactly is: how often real
+//! concurrent demand crossed the budget. That is the honest question, and it
+//! is the one an operator sizing `--collection-read-budget-pct` is asking.
+//!
+//! Observing therefore reserves for every read, like enforcement does for
+//! every admitted read. Skipping the reservation would simulate enforcement's
+//! `in_flight` while the memory was really being spent, which would make
+//! `collection_read_in_flight_bytes` -- a gauge, read live -- a fiction for
+//! exactly as long as observation was switched on.
+//!
 //! # Two deliberate choices that would otherwise look like bugs
 //!
 //! **An unreadable budget ADMITS**, and says so. `mem::sample()` returns `None`
@@ -70,6 +94,37 @@ fn unpack(v: u64) -> (u32, u32) {
     ((v >> 32) as u32, v as u32)
 }
 
+/// What crossing the budget does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Mode {
+    /// Refuse the read. The default when a budget is set.
+    #[default]
+    Enforce,
+    /// Admit it anyway and count it. See the module docs for why the count is
+    /// an upper bound on what enforcement would have refused.
+    Observe,
+}
+
+impl Mode {
+    /// `None` for anything else, so a typo is a startup refusal rather than a
+    /// silent fallback to enforcing -- the direction that would surprise an
+    /// operator who asked to observe and got refusals.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "enforce" => Some(Self::Enforce),
+            "observe" => Some(Self::Observe),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Enforce => "enforce",
+            Self::Observe => "observe",
+        }
+    }
+}
+
 /// What admission decided, and everything needed to explain it to the client.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Admit {
@@ -80,6 +135,15 @@ pub enum Admit {
     /// Admitted WITHOUT a budget, because node memory could not be read.
     /// Distinct from `Admitted` so the count is visible rather than silent.
     AdmittedUnmeasured { est: u64 },
+    /// Over budget, but `Mode::Observe` is set, so it was admitted and
+    /// counted. Carries the same terms `Refused` would have, because it is
+    /// the same comparison -- what differs is only what was done about it.
+    WouldRefuse {
+        est: u64,
+        in_flight: u64,
+        budget: u64,
+        avail: u64,
+    },
     /// Refused. Carries its own terms, so the message names what it saw
     /// rather than only its verdict.
     Refused {
@@ -94,7 +158,9 @@ impl Admit {
     /// The client-facing refusal, naming every term it saw rather than only
     /// its verdict -- the shape the write-deadline refusal established, and
     /// what makes a THROTTLED reply diagnosable without server logs.
-    /// `None` for any outcome that admitted.
+    /// `None` for any outcome that admitted -- INCLUDING `WouldRefuse`, which
+    /// crossed the budget and was let through anyway. A message there would
+    /// be a refusal the client never received.
     pub fn refusal(&self, bytes: u64, pct: u8) -> Option<String> {
         let Admit::Refused {
             est,
@@ -119,10 +185,12 @@ impl Admit {
 #[derive(Debug)]
 pub struct ReadAdmission {
     pct: u8,
+    mode: Mode,
     in_flight: AtomicU64,
     sample: AtomicU64,
     started: Instant,
     refused: AtomicU64,
+    would_refuse: AtomicU64,
     unmeasured: AtomicU64,
     /// Test seam: a fixed figure standing in for node memory, so the refusal
     /// arithmetic can be PROVEN on a host whose real memory is unreadable.
@@ -133,13 +201,18 @@ pub struct ReadAdmission {
 }
 
 impl ReadAdmission {
-    pub fn new(pct: u8) -> Self {
+    /// `mode` is a parameter rather than a default so that no construction
+    /// site can quietly inherit one: an admission built as enforcing when the
+    /// operator asked to observe refuses reads they expected to be admitted.
+    pub fn new(pct: u8, mode: Mode) -> Self {
         Self {
             pct: pct.min(100),
+            mode,
             in_flight: AtomicU64::new(0),
             sample: AtomicU64::new(0),
             started: Instant::now(),
             refused: AtomicU64::new(0),
+            would_refuse: AtomicU64::new(0),
             unmeasured: AtomicU64::new(0),
             avail_override: None,
         }
@@ -147,10 +220,10 @@ impl ReadAdmission {
 
     /// A `ReadAdmission` that believes the node has exactly `avail` bytes
     /// free. Tests only -- see `avail_override`.
-    pub fn with_fixed_avail(pct: u8, avail: u64) -> Self {
+    pub fn with_fixed_avail(pct: u8, mode: Mode, avail: u64) -> Self {
         Self {
             avail_override: Some(avail),
-            ..Self::new(pct)
+            ..Self::new(pct, mode)
         }
     }
 
@@ -162,12 +235,24 @@ impl ReadAdmission {
         self.pct
     }
 
+    pub fn mode(&self) -> Mode {
+        self.mode
+    }
+
     pub fn in_flight_bytes(&self) -> u64 {
         self.in_flight.load(Ordering::Relaxed)
     }
 
     pub fn refused_total(&self) -> u64 {
         self.refused.load(Ordering::Relaxed)
+    }
+
+    /// Reads that crossed the budget while observing, and were admitted
+    /// anyway. An UPPER bound on what enforcement would have refused -- see
+    /// the module docs for why the gap cannot be closed by counting harder.
+    /// Stays 0 while enforcing, where the same reads land in `refused_total`.
+    pub fn would_refuse_total(&self) -> u64 {
+        self.would_refuse.load(Ordering::Relaxed)
     }
 
     /// Reads admitted while node memory was unreadable -- admitted WITHOUT a
@@ -223,6 +308,20 @@ impl ReadAdmission {
             u64::try_from(u128::from(avail) * u128::from(self.pct) / 100).unwrap_or(u64::MAX);
         let in_flight = self.in_flight.load(Ordering::Acquire);
         if in_flight.saturating_add(est) > budget {
+            // ONE comparison, two outcomes. Observing and enforcing must not
+            // be able to disagree about whether the budget was crossed, or
+            // the count an operator sizes the budget from would describe a
+            // policy other than the one they are about to switch on.
+            if self.mode == Mode::Observe {
+                self.would_refuse.fetch_add(1, Ordering::Relaxed);
+                self.in_flight.fetch_add(est, Ordering::AcqRel);
+                return Admit::WouldRefuse {
+                    est,
+                    in_flight,
+                    budget,
+                    avail,
+                };
+            }
             self.refused.fetch_add(1, Ordering::Relaxed);
             return Admit::Refused {
                 est,
@@ -260,7 +359,7 @@ mod tests {
 
     #[test]
     fn disabled_by_default_admits_without_reserving() {
-        let a = ReadAdmission::new(DEFAULT_COLLECTION_READ_BUDGET_PCT);
+        let a = ReadAdmission::new(DEFAULT_COLLECTION_READ_BUDGET_PCT, Mode::Enforce);
         assert!(!a.enabled());
         assert_eq!(a.admit(512 * 1024 * 1024), Admit::Disabled);
         assert_eq!(a.in_flight_bytes(), 0, "disabled must not reserve");
@@ -287,7 +386,7 @@ mod tests {
         // Wrapping here would leave in_flight near u64::MAX and refuse every
         // read for the life of the process -- a far worse failure than the
         // double release that caused it.
-        let a = ReadAdmission::new(50);
+        let a = ReadAdmission::new(50, Mode::Enforce);
         a.release(1_000_000);
         assert_eq!(a.in_flight_bytes(), 0);
     }
@@ -303,7 +402,7 @@ mod tests {
     fn a_read_past_the_budget_is_refused_and_reserves_nothing() {
         // 1 GiB free, 25% budget = 268435456. A 512 MiB collection estimates
         // at 1.8 GB, which does not fit.
-        let a = ReadAdmission::with_fixed_avail(25, 1024 * 1024 * 1024);
+        let a = ReadAdmission::with_fixed_avail(25, Mode::Enforce, 1024 * 1024 * 1024);
         let bytes = 512 * 1024 * 1024;
         let d = a.admit(bytes);
         assert!(
@@ -335,7 +434,7 @@ mod tests {
     fn the_sum_is_what_is_bounded_not_the_individual_read() {
         // This is the bug's title. Each read fits on its own; the third is
         // refused because the two before it are still in flight.
-        let a = ReadAdmission::with_fixed_avail(100, 1_000_000_000);
+        let a = ReadAdmission::with_fixed_avail(100, Mode::Enforce, 1_000_000_000);
         let bytes = 100_000_000; // est 350 MB each
         let mut held = Vec::new();
         for i in 0..2 {
@@ -368,7 +467,7 @@ mod tests {
         // unreadable /proc/meminfo on Linux. Either way the read is admitted
         // -- a missing file must not take the node down -- and the fact that
         // no budget was checked has to be visible.
-        let a = ReadAdmission::new(25);
+        let a = ReadAdmission::new(25, Mode::Enforce);
         match a.admit(1024) {
             Admit::AdmittedUnmeasured { est } => {
                 assert_eq!(est, 3584);
@@ -384,6 +483,152 @@ mod tests {
                 assert_eq!(a.in_flight_bytes(), 0);
             }
             other => panic!("a 1 KiB read must not be refused: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn observing_admits_what_enforcing_refuses_and_counts_it() {
+        // The whole point of the mode: identical inputs, identical verdict,
+        // opposite action.
+        let bytes = 512 * 1024 * 1024;
+        let avail = 1024 * 1024 * 1024;
+        let enforcing = ReadAdmission::with_fixed_avail(25, Mode::Enforce, avail);
+        let observing = ReadAdmission::with_fixed_avail(25, Mode::Observe, avail);
+
+        let refused = enforcing.admit(bytes);
+        let observed = observing.admit(bytes);
+        assert!(
+            matches!(refused, Admit::Refused { .. }),
+            "enforcing must refuse: {refused:?}"
+        );
+        assert!(
+            matches!(observed, Admit::WouldRefuse { .. }),
+            "observing must admit and count: {observed:?}"
+        );
+
+        let terms = |a: &Admit| match a {
+            Admit::Refused {
+                est,
+                in_flight,
+                budget,
+                avail,
+            }
+            | Admit::WouldRefuse {
+                est,
+                in_flight,
+                budget,
+                avail,
+            } => Some((*est, *in_flight, *budget, *avail)),
+            _ => None,
+        };
+        assert_eq!(
+            terms(&refused),
+            terms(&observed),
+            "the two verdicts must quote the same terms -- only what is done \
+             about them differs"
+        );
+
+        assert_eq!(observing.would_refuse_total(), 1);
+        assert_eq!(
+            observing.refused_total(),
+            0,
+            "observing must not report refusals it did not make"
+        );
+        assert_eq!(enforcing.would_refuse_total(), 0);
+        assert_eq!(enforcing.refused_total(), 1);
+
+        assert_eq!(
+            observing.in_flight_bytes(),
+            ReadAdmission::estimate(bytes),
+            "observing RESERVES: the read runs, and a gauge read live must not \
+             describe memory that is really being spent as free"
+        );
+        assert_eq!(
+            enforcing.in_flight_bytes(),
+            0,
+            "a refused read reserves nothing"
+        );
+
+        assert!(
+            observed.refusal(bytes, 25).is_none(),
+            "nothing was refused, so there is no refusal to send the client"
+        );
+        assert!(refused.refusal(bytes, 25).is_some());
+    }
+
+    #[test]
+    fn both_modes_cross_the_budget_at_exactly_the_same_point() {
+        // A count taken from a different predicate than the one enforcement
+        // will use is worse than no count: it sizes the budget against a
+        // policy that is never going to run.
+        let bytes = 100_000_000u64;
+        let est = ReadAdmission::estimate(bytes);
+        for avail in [est, est - 1] {
+            let crossed_e = matches!(
+                ReadAdmission::with_fixed_avail(100, Mode::Enforce, avail).admit(bytes),
+                Admit::Refused { .. }
+            );
+            let crossed_o = matches!(
+                ReadAdmission::with_fixed_avail(100, Mode::Observe, avail).admit(bytes),
+                Admit::WouldRefuse { .. }
+            );
+            assert_eq!(
+                crossed_e, crossed_o,
+                "the modes disagree about a {est}-byte read against {avail} available"
+            );
+        }
+        // CONTROL. The loop agrees just as happily if BOTH answers are the
+        // same on every iteration, which would prove nothing about a
+        // boundary. Assert it actually straddles one.
+        assert!(
+            matches!(
+                ReadAdmission::with_fixed_avail(100, Mode::Enforce, est).admit(bytes),
+                Admit::Admitted { .. }
+            ),
+            "a read exactly at budget must fit, or the loop above only saw refusals"
+        );
+        assert!(
+            matches!(
+                ReadAdmission::with_fixed_avail(100, Mode::Enforce, est - 1).admit(bytes),
+                Admit::Refused { .. }
+            ),
+            "a read one byte past budget must not fit"
+        );
+    }
+
+    #[test]
+    fn observing_a_disabled_admission_measures_nothing() {
+        // The trap this mode invites. `--collection-read-mode observe` with no
+        // budget counts nothing and reads 0, which is indistinguishable from
+        // "your workload never crossed the budget" -- the reassuring reading,
+        // and therefore the dangerous one. flint-server refuses that pairing
+        // at startup; this records why there is something to refuse.
+        let a = ReadAdmission::with_fixed_avail(0, Mode::Observe, 1024 * 1024 * 1024);
+        assert!(!a.enabled());
+        assert_eq!(a.admit(512 * 1024 * 1024), Admit::Disabled);
+        assert_eq!(
+            a.would_refuse_total(),
+            0,
+            "a 0 budget is not a budget that was met"
+        );
+    }
+
+    #[test]
+    fn an_unknown_mode_does_not_fall_back_to_enforcing() {
+        assert_eq!(Mode::parse("enforce"), Some(Mode::Enforce));
+        assert_eq!(Mode::parse("observe"), Some(Mode::Observe));
+        for typo in ["Observe", "observe-only", "off", "1", "", "true"] {
+            assert_eq!(
+                Mode::parse(typo),
+                None,
+                "`{typo}` must be a startup refusal, not a silent enforce -- an \
+                 operator who asked to observe would get refusals instead"
+            );
+        }
+        // The rendering FLINTINFO publishes has to parse back, or an operator
+        // cannot feed a node's reported mode to the next node.
+        for m in [Mode::Enforce, Mode::Observe] {
+            assert_eq!(Mode::parse(m.as_str()), Some(m));
         }
     }
 }

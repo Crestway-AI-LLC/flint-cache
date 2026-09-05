@@ -178,8 +178,10 @@ stricter — an LSM needs headroom to compact), the node refuses
 space-growing writes early, keeps serving reads and the delete path, and
 reopens by itself once space returns. So the plan is: provision for the
 full working set, use TTLs so space returns on its own, and alert on
-`disk_free_pct` / `disk_verdict` in `FLINTINFO` (the exporter surfaces
-both) well before the guard fires. The guard's flips are also fleet
+`disk_free_pct` in `FLINTINFO` well before the guard fires. (`disk_verdict`
+renders `ok`/`shed`, and `flint-exporter` emits only NUMERIC fields, so it is
+readable over `FLINTINFO` but is not a Prometheus series — alert on
+`flint_disk_free_pct`, not on a metric that will never appear.) The guard's flips are also fleet
 journal events (`DiskShed`/`DiskResumed`), so tooling can trigger on the
 edge instead of polling; if you run your own space-reclaim daemon, rank
 candidates with `FLINTKEYSIZE`/`FLINTKEYSTAMP` (see command-support.md)
@@ -610,11 +612,13 @@ mode a dashboard of healthy-looking gauges hides:
 |---|---|---|
 | `disk_unknown_samples` | climbing | the disk guard cannot read the filesystem, so it will NOT shed — the node is flying blind rather than healthy (3b) |
 | `collection_read_unmeasured` | climbing, if you set `--collection-read-budget-pct` | node memory could not be read, so reads were admitted with no budget checked. The bound is not in force while this moves (3d) |
+| `collection_read_mode` | it still reads `observe` past the sizing window you planned | the budget is configured and is NOT being enforced. `collection_read_refused` sits at `0` because nothing is being refused, not because nothing is over budget (3d). A string, so `FLINTINFO` only — the Prometheus form of this alert is `flint_collection_read_would_refuse` rising while `flint_collection_read_refused` stays flat |
 
-Both are zero on a healthy node and neither has a threshold to tune: any
-sustained increase is the thing itself. They exist because "I could not look"
-and "there is nothing wrong" produce identical-looking dashboards, and the
-second is the one you would act on.
+All three are quiet on a healthy node and none has a threshold to tune: for
+the two counters, any sustained increase is the thing itself; for the mode, a
+value you have stopped intending. They exist because "I could not look" and
+"I looked and did nothing" and "there is nothing wrong" produce
+identical-looking dashboards, and only the last is good news.
 
 ## 3b. Disk headroom
 
@@ -791,6 +795,7 @@ Off by default. Turn it on with a percentage of available memory:
 | flag | default | meaning |
 |---|---|---|
 | `--collection-read-budget-pct` | `0` (off) | share of available node memory that in-flight collection reads may hold |
+| `--collection-read-mode` | `enforce` | `enforce` refuses over-budget reads; `observe` admits them and counts them |
 
 When it is on, each `HGETALL`/`HKEYS`/`HVALS`/`SMEMBERS`/`ZRANGE`-family
 command is costed **before** anything is materialised, from the one cheap
@@ -822,13 +827,38 @@ refusals are the valve working, but a steadily climbing count means
 tenants are asking for collections this node is too small to serve
 concurrently, and the fix is bigger nodes or smaller collections.
 
+**Finding out what a budget would cost you, before it costs you anything.**
+The bound ships off, and switching it straight on means learning its impact
+on a real workload by refusing real reads. `--collection-read-mode observe`
+is the way round that: it runs the identical arithmetic against the same
+`--collection-read-budget-pct`, admits the read anyway, and counts it in
+`collection_read_would_refuse`. Nothing is ever refused. Run it against real
+traffic for as long as your peak takes to come round — a week covers most
+weekly shapes — then turn enforcement on knowing the number:
+
+    flint-server … --collection-read-budget-pct 25 --collection-read-mode observe
+
+`observe` without a budget is **refused at startup**, because it would report
+`0` no matter what the workload did, and that is the same reading as a
+workload comfortably inside its budget.
+
+**The count is an upper bound, and the direction is known.** Enforcing refuses
+the read, which sheds it, which leaves less in flight for the next one;
+observing admits it, which leaves more. After the first crossing the two
+worlds differ, so `collection_read_would_refuse` counts at least as many
+crossings as enforcement would refuse, and usually more. It is not a
+prediction. What it measures exactly is **how often real concurrent demand
+crossed the budget**, which is the question worth asking when sizing one.
+
 Watch in `FLINTINFO`:
 
 | field | meaning |
 |---|---|
 | `collection_read_budget_pct` | what is configured; `0` means off |
+| `collection_read_mode` | `enforce` or `observe` |
 | `collection_read_in_flight_bytes` | currently reserved |
-| `collection_read_refused` | reads refused since start |
+| `collection_read_refused` | reads refused since start; always `0` while observing |
+| `collection_read_would_refuse` | crossings counted while observing; always `0` while enforcing |
 | `collection_read_unmeasured` | **reads admitted with NO budget checked** |
 
 `collection_read_unmeasured` counting up is the one that matters: it means
