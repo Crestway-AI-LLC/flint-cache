@@ -180,8 +180,10 @@ reopens by itself once space returns. So the plan is: provision for the
 full working set, use TTLs so space returns on its own, and alert on
 `disk_free_pct` in `FLINTINFO` well before the guard fires. (`disk_verdict`
 renders `ok`/`shed`, and `flint-exporter` emits only NUMERIC fields, so it is
-readable over `FLINTINFO` but is not a Prometheus series — alert on
-`flint_disk_free_pct`, not on a metric that will never appear.) The guard's flips are also fleet
+readable over `FLINTINFO` but is never a Prometheus series — alert on
+`flint_disk_free_pct` instead, and pair it with `flint_disk_unknown_samples`,
+because `disk_free_pct` ITSELF renders `none` when the filesystem cannot be
+read, and its series therefore goes absent in exactly that case. BUG-0095.) The guard's flips are also fleet
 journal events (`DiskShed`/`DiskResumed`), so tooling can trigger on the
 edge instead of polling; if you run your own space-reclaim daemon, rank
 candidates with `FLINTKEYSIZE`/`FLINTKEYSTAMP` (see command-support.md)
@@ -864,7 +866,10 @@ Watch in `FLINTINFO`:
 `collection_read_unmeasured` counting up is the one that matters: it means
 node memory could not be read, so the reads were let through rather than
 the node being taken down over a missing `/proc/meminfo`. The bound is not
-in force while that number is moving. It is always the case on macOS,
+in force while that number is moving — and neither is the observation, so
+`collection_read_would_refuse` stays at `0` for those reads rather than
+counting them. A sizing run on a node whose memory is unreadable measures
+nothing, which is why the server says so at startup. It is always the case on macOS,
 which has no `/proc/meminfo` — a development-host condition, not a
 production one.
 
