@@ -76,6 +76,29 @@ for i in $(seq 301 600); do valkey-cli -p 6405 SET "pre:$i" "v$i" >/dev/null; do
 TIP=$(valkey-cli -p 6405 FLINTINFO | tr '\r' '\n' | sed -n 's/^latest_seq://p')
 wait_seq 6406 "$TIP" || { echo "FAIL: B never caught up to A before the kill"; exit 1; }
 
+
+# THE SEAT LOGS EXACTLY ONE REJOIN DECISION. Wait for whichever it reaches
+# before asserting WHICH.
+#
+# `fleet_wait_ready` returns when the LOCAL load finishes -- `loading:1` gone.
+# The rewind-versus-reseed choice is a REPLICATION event, made after the seat
+# has contacted its master, so it can be logged after readiness. Every arm
+# below greps the log on the line after `fleet_wait_ready` and was racing it.
+#
+# Arm E lost that race on the gate box on 2026-09-04 and failed with
+# "a quarantined snapshot was not reconsidered under a LOWER fence" -- a
+# PRODUCT claim for an unwritten log. Arm F would have PASSED for the same
+# gap, because it asserts a marker is ABSENT and an empty log satisfies that.
+# The visible failure and the invisible pass are the same defect.
+REJOIN_DECIDED='warm rejoin at seq\|rewound to\|full sync: received'
+wait_rejoin() {  # <logfile>
+  fleet_wait_log "$1" "$REJOIN_DECIDED" 30 && return 0
+  echo "FAIL: no rejoin decision in $(basename "$1") after 30s — the seat neither"
+  echo "      warm-rejoined, rewound nor re-seeded, so every assertion below"
+  echo "      would be reading an unwritten log rather than a choice."
+  sed 's/^/    /' "$1"; exit 1
+}
+
 echo "== arm A: kill A, promote B, rejoin A marked — it must REWIND, not re-seed"
 kill -9 "$(pgrep -f "flint-server --port 6405" | head -1)" 2>/dev/null
 sleep 0.3
@@ -97,6 +120,7 @@ $B --port 6405 --engine rocks --data-dir "$D/a" --replica-of 127.0.0.1:6406 \
    --rewind-snaps "$D/snaps-a" >"$D/a2.log" 2>&1 &
 fleet_wait_ready 6405
 
+wait_rejoin "$D/a2.log"
 grep -q "rewound to" "$D/a2.log" || {
   echo "FAIL: rejoin did not rewind. Boot log:"; sed 's/^/    /' "$D/a2.log"; exit 1
 }
@@ -168,6 +192,7 @@ echo "drill: superseded copy rejoining" > "$D/a/NEEDS_RESEED"
 $B --port 6405 --engine rocks --data-dir "$D/a" --replica-of 127.0.0.1:6406 \
    --rewind-snaps "$D/snaps-a" >"$D/awarm.log" 2>&1 &
 fleet_wait_ready 6405
+wait_rejoin "$D/awarm.log"
 grep -q "warm rejoin at seq" "$D/awarm.log" || {
   echo "FAIL: marked replica did not rejoin warm. Boot log:"
   sed 's/^/    /' "$D/awarm.log"; exit 1
@@ -221,6 +246,7 @@ grep -q "past the fence" "$D/b2.log" || {
   echo "FAIL: B's post-fence snapshot was not refused. Boot log:"
   sed 's/^/    /' "$D/b2.log"; exit 1
 }
+wait_rejoin "$D/b2.log"
 grep -q "full sync: received" "$D/b2.log" || {
   echo "FAIL: refusal without the re-seed fallback — B is stranded"; exit 1
 }
@@ -286,6 +312,7 @@ grep -q "is past the fence" "$D/d-a2.log" || {
 grep -q "clears the fence" "$D/d-a2.log" || {
   echo "FAIL: arm D — no candidate cleared the fence, so nothing reports WHICH was chosen."
   sed 's/^/    /' "$D/d-a2.log"; exit 1; }
+wait_rejoin "$D/d-a2.log"
 grep -q "rewound to" "$D/d-a2.log" || {
   echo "FAIL: arm D — a superseded ex-master with a valid candidate did not rewind."
   echo "      This is BUG-0071's 94.2 s path: the full re-seed holds the write"
@@ -345,6 +372,7 @@ echo "== arm E: a snapshot quarantined ABOVE the coming fence is reconsidered"
 # c999999 models a purge that disqualified everything up to 999999; the
 # promotion below fences far lower, so the premise no longer holds.
 diverged_rejoin qe "unresumable-c999999-"
+wait_rejoin "$D/qe-a2.log"
 grep -q "rewound to" "$D/qe-a2.log" || {
   echo "FAIL: arm E — a quarantined snapshot was not reconsidered under a LOWER fence."
   echo "      This is BUG-0071: the re-seed holds the write gate shut for the whole"
@@ -357,6 +385,7 @@ echo "== arm F: quarantined AT or BELOW the fence stays out (BUG-0062 stays clos
 # c1 is below any fence here, so the disqualifying condition still covers it.
 # Re-admitting this one is what would loop: restore, refuse, restore, refuse.
 diverged_rejoin qf "unresumable-c1-"
+wait_rejoin "$D/qf-a2.log"
 grep -q "rewound to" "$D/qf-a2.log" && {
   echo "FAIL: arm F — a snapshot still covered by its quarantine was re-admitted."
   echo "      Unconditional re-admission reopens BUG-0062's livelock."
