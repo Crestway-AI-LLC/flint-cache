@@ -243,6 +243,39 @@ like progress. Whoever picks this up should either read the log on purpose
 (the grep above) or make the refusal reach the report — the second being the
 only version that survives nobody remembering.
 
+#### What "reach the report" would take, and the subtlety that shapes it
+
+Traced rather than guessed, because the obvious design does not work.
+
+The operations agent builds its whole world from `FLINTINFO` and other
+protocol calls (`flint-agent/src/world.rs`) — **it never reads a seat log, and
+could not**: it dials addresses, and the log is a file on a box. So the conduit
+has to be a `FLINTINFO` field, which the agent already parses and the report
+already renders.
+
+The reason string is already persisted. `mark_needs_reseed(dir, why)` writes
+`cannot resume this tail: {why}` into the `NEEDS_RESEED` marker, and `{why}` is
+the same text that carries the archive span. Nothing needs capturing that is
+not already on disk.
+
+**The subtlety is lifetime, and it runs the wrong way.** Two things conspire:
+
+- the seat **exits** immediately after writing the marker (`hard_exit(3)`, at
+  `main.rs:6435`), so at the moment the evidence is produced there is no
+  process left to answer `FLINTINFO`;
+- the next start full-syncs and calls `clear_needs_reseed`, which **deletes the
+  marker** — "this copy is authoritative again".
+
+So recovery erases the evidence, and the only window in which a live seat holds
+it is between start-up and the clear. A field reporting the *current* marker
+would be empty every time anyone looked.
+
+The shape that works is *last* reseed reason, not *current*: read the marker
+before clearing it, keep the string and its timestamp in memory, and expose
+them as a `FLINTINFO` field that outlives the recovery which destroyed the
+file. Small, and additive — but it IS a product surface, so it is left as a
+design here rather than added in passing.
+
 ## Why it has been invisible
 
 Three things hide it, and all three were true on the playground today:
