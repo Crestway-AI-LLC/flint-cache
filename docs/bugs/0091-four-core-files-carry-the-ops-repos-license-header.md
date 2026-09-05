@@ -47,3 +47,27 @@ step comparing the two counts (`SPDX-License-Identifier` against
 `All rights reserved` under `tools/` and `crates/`) would refuse the next paste,
 and unlike most gate steps it cannot be flaky. Worth adding **with** the fix
 rather than instead of it: the count is only meaningful once it is correct.
+
+## One of the four was mine, and it is fixed (2026-09-04)
+
+`tools/induced_ratchet_drill.sh` was written **hours after this bug was filed**,
+by pasting the header from the ops repo — the exact mistake described above,
+made again by someone who had not read this file. It is now
+`SPDX-License-Identifier: Elastic-2.0` like the other 203.
+
+That one needed no decision from Jeff. The reasoning this file gives for
+deferring is that rewriting the header *grants rights the current text
+withholds*, and that is a real question for code whose reservation might have
+been deliberate. For a file authored today, whose header was a copy-paste from
+a sibling repo and every one of whose neighbours grants Elastic-2.0, the intent
+is not in doubt.
+
+**Three remain**, and for those the deferral above stands unchanged:
+`kill_order_drill.sh`, `kill_release_drill.sh`,
+`min_replicas_survivable_drill.sh`. They predate this bug, so whether their
+reservation was deliberate is exactly the open question, and it is Jeff's.
+
+The header check this file recommends is still not added, deliberately: a count
+comparing SPDX against "All rights reserved" would fail on those three, so it
+is worth adding **with** the decision and not before. 203 SPDX to 3 reserved,
+as of this edit.

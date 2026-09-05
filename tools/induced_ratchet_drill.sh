@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Copyright (c) 2026 Crestway AI LLC. All rights reserved.
+# SPDX-License-Identifier: Elastic-2.0
 #
 # OPS-0122 — the induced-control ratchet must refuse a REMOVAL, tolerate an
 # addition, and refuse to run on nothing.
