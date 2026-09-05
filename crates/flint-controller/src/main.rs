@@ -385,6 +385,19 @@ fn should_promote(
 /// That is not a bug in this function. It is where the two facts that have to
 /// agree stop agreeing, and naming it is what BUG-0042 needs before anyone
 /// decides whether to guard it.
+/// A reachable node claiming master at or above `top` — the reason to abandon
+/// a promotion that was decided from an older read (BUG-0042).
+///
+/// `>= top` rather than "any master": a master claiming a LOWER epoch has been
+/// superseded, and promoting past it is the correct action, not a race. Only a
+/// claim at or above the epoch the proposal was going to be built on means the
+/// decision was made against a pair that has since acquired one.
+fn master_holds_top_epoch(states: &[Node], top: u32) -> Option<&Node> {
+    states
+        .iter()
+        .find(|n| n.reachable && n.role == "master" && n.epoch >= top)
+}
+
 fn top_epoch(states: &[Node]) -> u32 {
     states.iter().map(|n| n.epoch).max().unwrap_or(0)
 }
@@ -1075,6 +1088,51 @@ impl Pair {
             self.no_master_streak = 0;
             return;
         };
+
+        // RE-READ BEFORE ACTING, BECAUSE THE DECISION WAS MADE ON AN OLDER ONE
+        // (BUG-0042).
+        //
+        // `states` came from the top of this tick, and `tick` polls the pair
+        // SEQUENTIALLY -- one network round-trip per node -- so the two
+        // members were not even read at the same instant. Between that poll
+        // and here sit `confirm` ticks of patience, a journal write and,
+        // shortly, a CPFENCE with up to three attempts and a leader hop. A
+        // peer controller can win the whole promotion inside that window, and
+        // nothing above would notice: "there is no master" is answered from
+        // the old read, and no predicate over those bytes can see a master
+        // that appeared after they were taken.
+        //
+        // So ask again. This is deliberately BEFORE the CPFENCE: that record
+        // durably names the survivor as its pair's master-of-record and the
+        // real master's next renewal trips over it, so abandoning after it
+        // would fence a healthy master to avoid a redundant promotion.
+        //
+        // It NARROWS the window rather than closing it -- a promotion landing
+        // between this read and the FLINTPROMOTE still gets through, which is
+        // the bounded transient ADR-0004 permits. Closing it entirely would
+        // mean promoting at the epoch the proposal was VALIDATED against, a
+        // much larger change.
+        //
+        // Silent on #168 and #171: both recover a node that reads
+        // `role:replica` at the top epoch -- self-fenced, alive -- and a
+        // re-read still shows `replica`. This refuses only a pair that has
+        // acquired a master-CLAIMER since the decision was taken.
+        let recheck: Vec<Node> = self.nodes.iter().map(|a| observe(a)).collect();
+        if let Some(m) = master_holds_top_epoch(&recheck, max_epoch) {
+            eprintln!(
+                "[{}][{}] abandoning the promotion of {}: {} claims master at epoch {} on a re-read, so the decision was taken against a pair that has since acquired one",
+                cfg.id, self.label, survivor.addr, m.addr, m.epoch
+            );
+            journal_event(
+                &cfg.id,
+                flint_journal::EventKind::Detected,
+                &self.label,
+                None,
+                "a master appeared between the decision and the promotion: abandoned, not fenced",
+            );
+            self.no_master_streak = 0;
+            return;
+        }
 
         let next = max_epoch + 1;
         // THE FENCING RECORD, BEFORE THE PROMOTION (ADR-0018). CPFENCE
@@ -2119,6 +2177,69 @@ mod tests {
             top_epoch(&clean),
             installed,
             "and both members agree on the epoch once the poll does not straddle"
+        );
+    }
+
+    /// BUG-0042's guard: the re-read abandons only when the pair has actually
+    /// acquired a master-claimer, and is silent on the two recoveries that
+    /// depend on promoting a node which reads `replica`.
+    #[test]
+    fn the_re_read_abandons_on_a_new_master_and_not_on_a_self_fenced_one() {
+        let top = 2;
+
+        // A peer controller won the promotion while this one was deciding.
+        let acquired = vec![
+            Node {
+                role: "master".into(),
+                ..node("a:1", top, 1, Some(0))
+            },
+            node("b:2", top, 0, None),
+        ];
+        assert_eq!(
+            master_holds_top_epoch(&acquired, top).map(|n| n.addr.as_str()),
+            Some("a:1"),
+            "a master at the epoch the proposal was to be built on must stop it"
+        );
+
+        // #168/#171: nobody CLAIMS master, because the holder self-fenced when
+        // its lease lapsed. Same epoch, same liveness -- and this is the state
+        // the product depends on being able to recover, so the guard must not
+        // see it.
+        let self_fenced = vec![node("a:1", top, 1, Some(0)), node("b:2", top, 0, None)];
+        assert!(
+            master_holds_top_epoch(&self_fenced, top).is_none(),
+            "a self-fenced holder reads `replica`; refusing here would turn a \
+             few seconds of controller unavailability into a write outage"
+        );
+
+        // A SUPERSEDED master is not a reason to stop. It claims master at an
+        // epoch a successor has already passed, and promoting past it is the
+        // correct action -- which is why the test is `>= top` rather than
+        // "any master".
+        let stale = vec![
+            Node {
+                role: "master".into(),
+                ..node("a:1", top - 1, 1, Some(0))
+            },
+            node("b:2", top, 0, None),
+        ];
+        assert!(
+            master_holds_top_epoch(&stale, top).is_none(),
+            "an ex-master below the top epoch must not block its own replacement"
+        );
+
+        // And an UNREACHABLE master claims nothing this controller can act on.
+        let gone = vec![
+            Node {
+                role: "master".into(),
+                reachable: false,
+                ..node("a:1", top, 1, Some(0))
+            },
+            node("b:2", top, 0, None),
+        ];
+        assert!(
+            master_holds_top_epoch(&gone, top).is_none(),
+            "an unreachable node's last known role is not a live claim"
         );
     }
 

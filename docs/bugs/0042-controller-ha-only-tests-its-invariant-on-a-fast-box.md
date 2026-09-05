@@ -123,7 +123,7 @@ The mechanism. Candidates, in order of cheapness to test:
    promotion is being counted. Cheapest to rule out first, and it would make
    this a drill bug rather than a product one.
 
-## 2026-09-05 — the mechanism is LOCATED, not inferred, and the proposed guard would not have fired
+## 2026-09-05 — a staleness window is located and now guarded; the MECHANISM of the 08-22 firing still is not
 
 Candidate 2 was called "the answer, and it is not a bug in the fence — it is
 the fence's definition." That is true and it is not specific enough to act on.
@@ -146,10 +146,37 @@ claimed master, and the other member as it is AFTER, epoch already advanced.
 | what epoch do we propose? | `top_epoch(&states) + 1` | the FRESH half — the winner's own new epoch, plus one |
 
 `FLINTPROMOTE` refuses only `next <= current`, so a proposal built on the
-winner's own new epoch is strictly above it and is accepted. The second real
-promotion is not the fence failing; it is **two facts that have to agree being
-read at different times, with the arithmetic taking the freshest of one and the
-stalest of the other.**
+winner's own new epoch is strictly above it and is accepted: **two facts that
+have to agree, read at different times, with the arithmetic taking the freshest
+of one and the stalest of the other.**
+
+### CORRECTION, same day: this is a real window and it is NOT the recorded firing
+
+The paragraphs above were first written claiming the mechanism was now
+*located*. That was an overreach, and the arithmetic in this very file refutes
+it.
+
+The survivor is `states.iter().filter(promotable).max_by_key(|n| (n.epoch,
+Reverse(addr)))`. In the straddled poll described above the winner reads epoch
+1 (stale) and the other member reads 2 — because a replica DOES adopt its
+master's role epoch (`flint-server/src/main.rs`, `force_role(Replica, adopted)`
+when `mine < adopted`). So the highest epoch belongs to the OTHER MEMBER, and
+this path would promote **the follower**, not the winner.
+
+The recorded firing was a second promotion of the **same** node: candidate 3's
+examination establishes that `PROMOTED :P2 at (0,3)` in phase 1 is P2 again.
+A straddled poll does not produce that.
+
+The obvious next guess — #168, a promoted master self-fencing and so reading
+`replica` at the top epoch — does not survive reading the promotion path
+either: `FLINTPROMOTE` sets `lease_deadline` to 0, deliberately, so a
+freshly promoted node is *unmanaged* until the next `FLINTLEASE` and cannot
+self-fence out from under itself.
+
+**So "What is NOT established: the mechanism" still stands**, and this file now
+has one fewer candidate rather than one more. What IS established is that the
+sequential poll opens a genuine staleness window on the promote path, which is
+worth closing whether or not it is what fired on 2026-08-22.
 
 `top_epoch` was split out of `tick` for this, and
 `a_straddled_poll_proposes_an_epoch_the_fence_cannot_refuse` pins the state and
@@ -188,18 +215,35 @@ defect — the states are old — and:
   with up to three attempts and a leader hop, then the promotion itself. The
   added latency is in the noise against the failover budget.
 
-### Why it is not built here
+### BUILT 2026-09-05, on Jeff's call
 
-It changes failover behaviour on a data-safety path, in a product whose
-promotion story is the thing ADR-0004 is *about*. The re-promotion it removes
-is data-safe today (same node, higher epoch, self-limiting) and costs an epoch
-bump, a redundant manifest write, and a fencing interval for every proxy parked
-on the old epoch. Removing it is a judgement about which of those is worse, and
-that is a decision rather than an inference.
+`master_holds_top_epoch(&recheck, max_epoch)`, placed after survivor selection
+and **before the CPFENCE**. That position is the load-bearing part: CPFENCE
+durably names the survivor as its pair's master-of-record and the real master's
+next renewal trips over it, so abandoning *after* it would fence a healthy
+master in order to avoid a redundant promotion — strictly worse than the thing
+being fixed.
 
-Recorded so the choice is one somebody made, with the mechanism now precise
-enough that the guard can be written against a named line instead of a
-hypothesis.
+`>= max_epoch` rather than "any master", for the reason the guard exists at
+all: a master claiming a LOWER epoch has been superseded, and promoting past it
+is the correct action rather than a race.
+
+Four cases are tested, and three of them are the ones it must NOT fire on:
+
+| state | fires? | why |
+|---|---|---|
+| a peer promoted while we decided | yes | the decision was taken against a pair that has since acquired a master |
+| #168/#171 self-fenced holder | no | it reads `replica`; refusing turns controller unavailability into a write outage |
+| superseded ex-master below the top epoch | no | it must not block its own replacement |
+| unreachable node whose last role was master | no | a stale reading is not a live claim |
+
+**What it does not do.** It does not close the window — a promotion landing
+between the re-read and the `FLINTPROMOTE` still gets through, which is the
+bounded transient ADR-0004 permits — and it is **not** established to prevent
+the 2026-08-22 firing, whose mechanism remains unknown. It removes a real
+staleness hazard on the promote path. If `controller_ha` records another
+higher-epoch promotion after this, that is informative: it rules the whole
+staleness family out.
 
 ## Second 16-vCPU observation, 2026-08-22: the race engaged and the invariant held
 
