@@ -370,6 +370,25 @@ fn should_promote(
 /// successor has already superseded) and its replica must be exactly caught
 /// up (`seq_lag == 0`, not merely draining), so "in sync" is observed, not
 /// assumed.
+/// The highest epoch anywhere in one poll's states — the number a promotion
+/// is derived from (`top_epoch(..) + 1`) and the number a fence is issued at.
+///
+/// Split out of `tick` so BUG-0042's mechanism can be stated as a test rather
+/// than as prose. `tick` polls the pair SEQUENTIALLY —
+/// `self.nodes.iter().map(observe)` — one network round-trip per node, so the
+/// states in a single vector are read at different instants. A poll that
+/// straddles another controller's promotion therefore mixes a STALE role (the
+/// winner had not yet claimed master when it was read) with a FRESH epoch (the
+/// other member's had already advanced), and the promotion epoch comes from
+/// the fresh half while "is there a master?" is answered from the stale one.
+///
+/// That is not a bug in this function. It is where the two facts that have to
+/// agree stop agreeing, and naming it is what BUG-0042 needs before anyone
+/// decides whether to guard it.
+fn top_epoch(states: &[Node]) -> u32 {
+    states.iter().map(|n| n.epoch).max().unwrap_or(0)
+}
+
 fn insync_lineage_holder(states: &[Node]) -> Option<&Node> {
     let top = states
         .iter()
@@ -755,7 +774,7 @@ impl Pair {
             .iter()
             .filter(|n| n.reachable && n.role == "master")
             .collect();
-        let max_epoch = states.iter().map(|n| n.epoch).max().unwrap_or(0);
+        let max_epoch = top_epoch(&states);
 
         // Legitimate master = reachable master with the highest epoch; ties
         // broken by LOWEST address so every controller in the HA set picks
@@ -2034,6 +2053,72 @@ mod tests {
         assert_eq!(
             remembered_lineage_holder(&states, &remembered).map(|n| n.addr.as_str()),
             Some("b:2")
+        );
+    }
+
+    /// BUG-0042: a poll that straddles another controller's promotion proposes
+    /// an epoch the fence cannot refuse, and does so by construction.
+    ///
+    /// `tick` reads the pair with `self.nodes.iter().map(observe)` — one
+    /// network round-trip per node, sequentially. A promotion landing between
+    /// those two reads leaves this controller holding a MIXED view: the winner
+    /// as it was BEFORE it claimed master, and the other member as it is AFTER,
+    /// with its epoch already advanced.
+    ///
+    /// Both halves then feed the same decision. "Is there a master?" is
+    /// answered from the stale role and says no; the promotion epoch is
+    /// `top_epoch + 1` and comes from the FRESH epoch. `FLINTPROMOTE` refuses
+    /// only `next <= current`, so a proposal built on the winner's own new
+    /// epoch is strictly above it and is accepted — a second real promotion of
+    /// the same survivor, which is what the 16-vCPU run recorded as
+    /// `promotions at higher epoch: 1`.
+    ///
+    /// This test asserts the state and the arithmetic, NOT that the behaviour
+    /// is wrong. Whether a controller with a stale role view should propose at
+    /// all is the open design question, and #168/#171 deliberately re-promote
+    /// a master that is alive and self-fenced — so a blanket refusal would
+    /// break the recovery this product depends on. When a guard is chosen,
+    /// this is the shape it has to refuse.
+    #[test]
+    fn a_straddled_poll_proposes_an_epoch_the_fence_cannot_refuse() {
+        // Winner read BEFORE it claimed master: still `replica`, epoch 1.
+        // Other member read AFTER: also `replica`, and already at epoch 2.
+        let installed = 2; // what the winning controller actually promoted at
+        let straddled = vec![node("a:1", 1, 0, None), node("b:2", installed, 0, None)];
+        assert!(
+            !straddled.iter().any(|n| n.role == "master"),
+            "the premise of the bug: this controller sees no master-claimer, \
+             which is what sends it down the promote path at all"
+        );
+
+        let next = top_epoch(&straddled) + 1;
+        assert!(
+            next > installed,
+            "a proposal of {next} against an installed {installed} passes \
+             `next <= current`, so the fence cannot refuse it"
+        );
+
+        // CONTROL. The assertion above holds for any state whose top epoch is
+        // the installed one, including a poll that did NOT straddle -- so on
+        // its own it says nothing about staleness. An UNstraddled poll sees the
+        // winner claiming master and never reaches the promote path, which is
+        // the difference the bug is about.
+        let clean = vec![
+            Node {
+                role: "master".into(),
+                ..node("a:1", installed, 1, Some(0))
+            },
+            node("b:2", installed, 0, None),
+        ];
+        assert!(
+            clean.iter().any(|n| n.reachable && n.role == "master"),
+            "an unstraddled poll has a master-claimer, and `tick` returns \
+             before the promote path -- the epoch arithmetic is never reached"
+        );
+        assert_eq!(
+            top_epoch(&clean),
+            installed,
+            "and both members agree on the epoch once the poll does not straddle"
         );
     }
 

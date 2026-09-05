@@ -123,6 +123,84 @@ The mechanism. Candidates, in order of cheapness to test:
    promotion is being counted. Cheapest to rule out first, and it would make
    this a drill bug rather than a product one.
 
+## 2026-09-05 — the mechanism is LOCATED, not inferred, and the proposed guard would not have fired
+
+Candidate 2 was called "the answer, and it is not a bug in the fence — it is
+the fence's definition." That is true and it is not specific enough to act on.
+Here is where the inconsistency actually enters.
+
+**`tick` polls the pair SEQUENTIALLY.** One line, `flint-controller/src/main.rs`:
+
+    let states: Vec<Node> = self.nodes.iter().map(|a| observe(a)).collect();
+
+`observe` is a network round-trip. So the two `Node`s in a single `states`
+vector are read at DIFFERENT INSTANTS, and a promotion landing between them
+leaves this controller holding a mixed view: the winner as it was BEFORE it
+claimed master, and the other member as it is AFTER, epoch already advanced.
+
+**Both halves then feed the same decision, and it takes the worst of each.**
+
+| question | answered from | in a straddled poll |
+|---|---|---|
+| is there a master? | `n.reachable && n.role == "master"` over `states` | the STALE half — no |
+| what epoch do we propose? | `top_epoch(&states) + 1` | the FRESH half — the winner's own new epoch, plus one |
+
+`FLINTPROMOTE` refuses only `next <= current`, so a proposal built on the
+winner's own new epoch is strictly above it and is accepted. The second real
+promotion is not the fence failing; it is **two facts that have to agree being
+read at different times, with the arithmetic taking the freshest of one and the
+stalest of the other.**
+
+`top_epoch` was split out of `tick` for this, and
+`a_straddled_poll_proposes_an_epoch_the_fence_cannot_refuse` pins the state and
+the arithmetic. It asserts what happens, NOT that it is wrong — with a control
+that an UNstraddled poll has a master-claimer and never reaches the promote
+path at all, which is the whole difference.
+
+### The guard this file proposed would not have fired
+
+> A cheap guard — do not promote a survivor that already claims master at the
+> top epoch — would remove it.
+
+**It would not.** In a straddled poll, no node claims master IN THIS
+CONTROLLER'S VIEW; that is precisely why it is on the promote path. A guard
+that inspects the same stale states sees nothing to refuse. The staleness has
+to be addressed by reading again, not by reasoning harder about the same read.
+
+### What would fire, and what it costs
+
+**A confirmation re-read of the pair immediately before `FLINTPROMOTE`**: if a
+master now claims the top epoch, abandon the promotion. It targets the actual
+defect — the states are old — and:
+
+- **It narrows the window rather than closing it.** A promotion landing between
+  the re-read and the FLINTPROMOTE still gets through. That is the bounded
+  transient ADR-0004 already permits, and closing it entirely needs the epoch a
+  proposal is built on to be the one it was VALIDATED against, which is a
+  different and much larger change.
+- **It does not break #168 or #171.** Both re-promote a node that is
+  `role:replica` at the top epoch — self-fenced, alive, with a caught-up or
+  remembered lineage. A re-read still shows `replica`, so the guard is silent
+  on exactly the recoveries this product depends on. That is the distinction
+  this file called "the actual work", and it falls out of the guard rather than
+  needing to be encoded.
+- **It costs one round-trip on a path that already does several** — CPFENCE
+  with up to three attempts and a leader hop, then the promotion itself. The
+  added latency is in the noise against the failover budget.
+
+### Why it is not built here
+
+It changes failover behaviour on a data-safety path, in a product whose
+promotion story is the thing ADR-0004 is *about*. The re-promotion it removes
+is data-safe today (same node, higher epoch, self-limiting) and costs an epoch
+bump, a redundant manifest write, and a fencing interval for every proxy parked
+on the old epoch. Removing it is a judgement about which of those is worse, and
+that is a decision rather than an inference.
+
+Recorded so the choice is one somebody made, with the mechanism now precise
+enough that the guard can be written against a named line instead of a
+hypothesis.
+
 ## Second 16-vCPU observation, 2026-08-22: the race engaged and the invariant held
 
 Gate run `20260822T163154Z` on the c7i.4xlarge gate box, the same class of
