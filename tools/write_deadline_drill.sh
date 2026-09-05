@@ -63,7 +63,12 @@ cat >"$D/drive.py" <<'PY'
 import socket, sys, threading, os
 PORT, THREADS, PER = int(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3])
 TAG = sys.argv[4]
-VAL = os.urandom(2048).hex()          # 4 KiB: a realistic write, not a no-op
+# Value size is a LADDER RUNG now, not a constant. Since BUG-0088 the projected
+# wait is inflight x MARGINAL cost, so concurrency alone cannot arm a deadline
+# on a fast box -- only a genuinely slower commit can. Default keeps the
+# original 4 KiB so the existing rungs behave exactly as before.
+VBYTES = int(sys.argv[5]) if len(sys.argv) > 5 else 4096
+VAL = os.urandom(max(1, VBYTES // 2)).hex()
 ok, throttled, other = [], [], []
 lock = threading.Lock()
 
@@ -122,21 +127,33 @@ NOW=$(valkey-cli -p 6392 FLINTCONFIG | tr '\r' '\n' | grep '^write-deadline-ms:'
 echo "  deadline hot-set to ${NOW}ms without a restart"
 
 # THE LOAD IS RAMPED, because a fixed one is a guess about the machine.
-# The shed fires when in-flight x service-time exceeds the deadline. A write
-# services in ~30us here, so arming a 1ms deadline needs >30 writes genuinely
-# in flight — and a fixed 32-thread load sits one or two ABOVE that threshold
-# on an 8-core box and BELOW it on a 2-vCPU CI runner, where the client cannot
-# hold 32 sends outstanding at once. That is exactly how this drill failed on
-# main at 53d2380: ok=3200 throttled=0, write_inflight 0, write_service_us 33,
-# write_wait_est_ms 0. The server met the deadline; the drill had simply not
-# created the condition, and said so in words that read like a product defect.
-# See docs/bugs/0030. So: escalate until the control actually arms.
-B_THR=0; RUNG=0; BOUT=""
-for T in 32 64 128 256; do
-  BOUT=$(python3 "$D/drive.py" 6392 $T 100 arm-b-$T)
-  echo "  threads=$T -> $BOUT"
+# A fixed 32-thread load sits above the arming threshold on an 8-core box and
+# below it on a 2-vCPU CI runner. That is how this drill failed on main at
+# 53d2380: ok=3200 throttled=0, write_inflight 0, write_wait_est_ms 0 -- the
+# server met the deadline and the drill had simply not created the condition,
+# in words that read like a product defect. See docs/bugs/0030.
+#
+# THE RUNGS NOW ESCALATE VALUE SIZE AS WELL AS THREADS, and that is BUG-0088.
+# This ladder used to reason "the shed fires when in-flight x SERVICE TIME
+# exceeds the deadline, so arming 1ms needs >30 writes in flight" -- which
+# worked only because the projection charged one batch commit once per member.
+# Corrected, the projection is inflight x MARGINAL cost and lands back on the
+# commit that actually happened, so on a fast box 256 concurrent 4 KiB writes
+# serving in 15us project 0ms and no amount of concurrency will arm a 1ms
+# deadline. Only a genuinely slower commit will. The thread rungs are kept
+# first and unchanged, so a machine where they still arm behaves exactly as
+# before; the size rungs are the escalation for one where they cannot.
+#
+# `per` shrinks as the value grows so the biggest rung moves ~512 MB, not
+# 12 GB.
+B_THR=0; RUNG=0; RUNG_V=0; RUNG_PER=0; BOUT=""
+for SPEC in "32 4096 100" "64 4096 100" "128 4096 100" "256 4096 100" \
+            "64 65536 50" "64 524288 20" "64 2097152 8"; do
+  set -- $SPEC; T=$1; V=$2; PER=$3
+  BOUT=$(python3 "$D/drive.py" 6392 "$T" "$PER" "arm-b-$T-$V" "$V")
+  echo "  threads=$T value=${V}B -> $BOUT"
   B_THR=$(echo "$BOUT" | sed -n 's/.*throttled=\([0-9]*\).*/\1/p')
-  if [ "${B_THR:-0}" -gt 0 ]; then RUNG=$T; break; fi
+  if [ "${B_THR:-0}" -gt 0 ]; then RUNG=$T; RUNG_V=$V; RUNG_PER=$PER; break; fi
 done
 B_OK=$(echo "$BOUT" | sed -n 's/^ok=\([0-9]*\).*/\1/p')
 B_OTHER=$(echo "$BOUT" | sed -n 's/.*other=\([0-9]*\).*/\1/p')
@@ -145,17 +162,19 @@ B_ABSENT=$(echo "$BOUT" | sed -n 's/.*accepted-but-absent=\([0-9]*\).*/\1/p')
 
 [ "$B_OTHER" = "0" ] || { echo "FAIL: a refusal came back as something other than -THROTTLED"; exit 1; }
 [ "${RUNG:-0}" -gt 0 ] || {
-  echo "FAIL: the positive control COULD NOT BE ARMED on this machine — 256"
-  echo "      concurrent 4 KiB writes were all served inside 1ms. This is a"
+  echo "FAIL: the positive control COULD NOT BE ARMED on this machine — not"
+  echo "      even 64 concurrent 2 MiB writes projected past 1ms. This is a"
   echo "      failure to create the condition, NOT evidence about the shed:"
   echo "      nothing here says the deadline is unwired. Distinguish the two"
   echo "      before filing anything against the write path."
   valkey-cli -p 6392 FLINTINFO | tr '\r' '\n' | grep -E '^write_(inflight|service_us|wait_est_ms):' | sed 's/^/        /'
-  echo "      If write_wait_est_ms is 0 at 256 threads the ladder is too short"
-  echo "      for this box; raise it rather than concluding the gate is off."
+  echo "      If write_wait_est_ms is 0 at the top rung the ladder is too short"
+  echo "      for this box; add a LARGER VALUE rung rather than more threads."
+  echo "      Since BUG-0088 the projection is inflight x marginal cost, so"
+  echo "      concurrency alone cannot arm it — only a slower commit can."
   exit 1
 }
-echo "  armed at $RUNG threads: refused $B_THR write(s) with -THROTTLED, accepted $B_OK"
+echo "  armed at $RUNG threads x ${RUNG_V}B: refused $B_THR write(s) with -THROTTLED, accepted $B_OK"
 
 # Assertion 3. A shed that still wrote would make -THROTTLED a lie and would
 # silently corrupt every RPO number the chaos oracle has ever reported.
@@ -173,16 +192,16 @@ echo "  writes_shed_deadline: $SHED_B"
 # the shipped default restores the single-variable comparison: same load, two
 # deadlines, opposite outcomes. Without this, a drill that ramps until
 # something sheds would eventually shed on load alone and call it a pass.
-echo "== arm C (isolating control): the SAME $RUNG-thread load at the ${DEFAULT}ms default"
+echo "== arm C (isolating control): the SAME $RUNG-thread ${RUNG_V}B load at the ${DEFAULT}ms default"
 valkey-cli -p 6392 FLINTCONFIG write-deadline-ms "$DEFAULT" >/dev/null
 SHED_BEFORE_C=$(valkey-cli -p 6392 FLINTINFO | tr '\r' '\n' | grep '^writes_shed_deadline:' | cut -d: -f2)
-COUT=$(python3 "$D/drive.py" 6392 "$RUNG" 100 arm-c)
+COUT=$(python3 "$D/drive.py" 6392 "$RUNG" "$RUNG_PER" arm-c "$RUNG_V")
 echo "  $COUT"
 C_THR=$(echo "$COUT" | sed -n 's/.*throttled=\([0-9]*\).*/\1/p')
 C_OTHER=$(echo "$COUT" | sed -n 's/.*other=\([0-9]*\).*/\1/p')
 [ "$C_OTHER" = "0" ] || { echo "FAIL: unexpected replies at the default deadline under the armed load"; exit 1; }
 [ "${C_THR:-1}" = "0" ] || {
-  echo "FAIL: the same $RUNG-thread load shed $C_THR write(s) at the ${DEFAULT}ms"
+  echo "FAIL: the same $RUNG-thread ${RUNG_V}B load shed $C_THR write(s) at the ${DEFAULT}ms"
   echo "      default too, so arm B did not isolate the deadline — the LOAD is"
   echo "      shedding, and the positive control proves nothing about the knob."
   exit 1
@@ -197,4 +216,4 @@ valkey-cli -p 6392 SET wdl:after ok >/dev/null
 [ "$(valkey-cli -p 6392 GET wdl:after)" = "ok" ] || { echo "FAIL: node did not recover once the deadline was restored"; exit 1; }
 echo "  deadline restored to ${DEFAULT}ms, writes accepted again"
 
-echo "PASS: write deadline drill — ordinary load at the ${DEFAULT}ms default shed 0, a 1ms deadline refused $B_THR write(s) with -THROTTLED at $RUNG threads (same load at the default shed 0), every refusal was a real refusal (0 refused-but-present, 0 accepted-but-absent), and the knob moved hot"
+echo "PASS: write deadline drill — ordinary load at the ${DEFAULT}ms default shed 0, a 1ms deadline refused $B_THR write(s) with -THROTTLED at $RUNG threads x ${RUNG_V}B (same load at the default shed 0), every refusal was a real refusal (0 refused-but-present, 0 accepted-but-absent), and the knob moved hot"
