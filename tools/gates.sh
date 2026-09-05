@@ -1602,6 +1602,60 @@ assert_spawning_drills_declare_ports() {
 #
 # Runs FIRST in the check stage: it is under a second, and a script that does
 # not parse can break the asserts that follow it.
+# Emit one line per heredoc SHELL payload found in the given files:
+#   <extracted-file>\t<source-file>\t<line the heredoc opens on>
+# Used by assert_scripts_parse; see the reasoning there.
+_gate_heredoc_payloads() {
+  local out_dir="$1"; shift
+  python3 - "$out_dir" "$@" <<'HDPY'
+import os, re, sys
+outdir, files = sys.argv[1], sys.argv[2:]
+OPEN = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
+FEEDS_SHELL = re.compile(r"\b(?:ba)?sh\s+-s\b|>\s*[^\s|;&<>]*\.sh\b")
+SHEBANG = re.compile(r"^#!.*\b(bash|sh|zsh)\b")
+n = 0
+seen = set()
+for path in files:
+    # The caller lists tools/gates.sh explicitly as well as via tools/*.sh, on
+    # purpose -- a glob that stops matching must not silently drop it. Dedupe
+    # here so the defensive listing does not double the reported count.
+    real = os.path.realpath(path)
+    if real in seen:
+        continue
+    seen.add(real)
+    try:
+        lines = open(path, encoding="utf-8", errors="replace").read().split("\n")
+    except OSError:
+        continue
+    i = 0
+    while i < len(lines):
+        m = OPEN.search(lines[i])
+        if m:
+            delim = m.group(2)
+            body, j = [], i + 1
+            while j < len(lines) and lines[j].strip() != delim:
+                body.append(lines[j]); j += 1
+            if j < len(lines):
+                first = next((b for b in body if b.strip()), "")
+                if FEEDS_SHELL.search(lines[i]) or SHEBANG.match(first.strip()):
+                    n += 1
+                    text = "\n".join(body) + "\n"
+                    # An UNQUOTED delimiter means the shell resolves these four
+                    # escapes before the payload runs, so the raw text is not
+                    # the text that executes. $VAR is deliberately left alone:
+                    # it parses as a word either way.
+                    if not m.group(1):
+                        text = re.sub(r"\\([$`\\])", r"\1", text)
+                        text = text.replace("\\\n", "")
+                    out = os.path.join(outdir, "hd%d.sh" % n)
+                    with open(out, "w") as f:
+                        f.write(text)
+                    print("%s\t%s\t%d" % (out, path, i + 1))
+                i = j
+        i += 1
+HDPY
+}
+
 assert_scripts_parse() {
   local f n=0 bad="" probe
 
@@ -1646,6 +1700,86 @@ assert_scripts_parse() {
     exit 1
   fi
   echo "  $n shell scripts parse"
+
+  # AND THE PAYLOADS THE LOOP ABOVE CANNOT SEE.
+  #
+  # `bash -n` does not parse heredoc bodies -- they are data to the enclosing
+  # script, and a file whose heredoc payload is malformed passes cleanly.
+  # Verified rather than assumed: a script containing `bash -s <<'"'"'R'"'"'` with an
+  # unterminated `if` inside is ACCEPTED by `bash -n`, and the same payload
+  # written to its own file is rejected.
+  #
+  # That is not a corner. It is exactly the incident this whole check was
+  # written for: ops `packaging/aws/gate-box/run.sh` generated a REMOTE script
+  # that failed to parse, so nothing ran -- including the line that records the
+  # exit status -- and the caller rendered the silence as "the run may still be
+  # going". The file-level pass would have certified that script.
+  #
+  # SHELL BY USE, never by a list. A payload is treated as shell when the line
+  # opening it feeds one (`bash -s`, or a redirect into a path ending .sh) or
+  # when the payload declares itself with a shebang. A list of "heredocs that
+  # are shell" would be a second declaration to keep in sync with the first
+  # (BUG-0086).
+  #
+  # UNQUOTED HEREDOCS ARE TEMPLATES. With `<<EOF` the shell resolves \$ \` \\
+  # and backslash-newline before the payload runs, so the raw text is not the
+  # text that executes -- parsing it raw reports syntax errors that do not
+  # exist. Those four escapes are emulated and nothing else; `$VAR` is left
+  # alone because it parses as a word either way. Found by doing it: two of
+  # ops's 55 payloads failed this way before the escapes were handled,
+  # and shipping that would have taught everyone to ignore the check.
+  local hd_dir hd_n=0 hd_bad="" hd_out hd_src hd_ln
+  hd_dir=$(mktemp -d "${TMPDIR:-/tmp}/gatehd.XXXXXX") || {
+    echo "GATES FAILED: cannot create a temp dir for the heredoc parse check"; exit 1; }
+
+  # POSITIVE CONTROL FOR THE EXTRACTOR, not just for bash -n. An extractor
+  # that finds NOTHING certifies every payload in the tree by examining none
+  # of them, and reports it as a pass. So plant one that must be found AND
+  # rejected before believing a clean sweep of the real ones.
+  mkdir -p "$hd_dir/probe"
+  # A single quote needs no escaping inside double quotes; the `'"'"'` idiom
+  # is for the other direction and here it produced the delimiter `"R"`, which
+  # never matched the closing R -- so the extractor found nothing and the
+  # control reported the tree uncheckable. Caught by the control failing.
+  printf '%s\n' "ssh host bash -s <<'R'" "if true; then" "R" > "$hd_dir/probe/p.sh"
+  if ! bash -n "$hd_dir/probe/p.sh" 2>/dev/null; then
+    rm -rf "$hd_dir"
+    echo "GATES FAILED: bash -n REJECTED a file whose only fault is inside a"
+    echo "      heredoc. The blind spot this check exists for is not present,"
+    echo "      so the check is testing something other than what it claims."
+    exit 1
+  fi
+  local hd_probe_caught=no
+  _gate_heredoc_payloads "$hd_dir/probe" "$hd_dir/probe/p.sh" > "$hd_dir/probe.tsv"
+  while IFS="$(printf '\t')" read -r hd_out hd_src hd_ln; do
+    [ -n "$hd_out" ] || continue
+    bash -n "$hd_out" 2>/dev/null || hd_probe_caught=yes
+  done < "$hd_dir/probe.tsv"
+  if [ "$hd_probe_caught" != yes ]; then
+    rm -rf "$hd_dir"
+    echo "GATES FAILED: the planted broken heredoc payload was not caught."
+    echo "      Either the extractor found nothing or the parse accepted it;"
+    echo "      both certify the tree by examining none of it."
+    exit 1
+  fi
+
+  _gate_heredoc_payloads "$hd_dir" \
+      $(ls tools/*.sh tools/lib/*.sh tools/gates.sh 2>/dev/null) \
+      $(find packaging -name '*.sh' 2>/dev/null) > "$hd_dir/list.tsv"
+  while IFS="$(printf '\t')" read -r hd_out hd_src hd_ln; do
+    [ -n "$hd_out" ] || continue
+    hd_n=$((hd_n + 1))
+    bash -n "$hd_out" 2>/dev/null || hd_bad="$hd_bad $hd_src:$hd_ln"
+  done < "$hd_dir/list.tsv"
+
+  if [ -n "$hd_bad" ]; then
+    echo "GATES FAILED: these heredoc shell payloads do not parse:"
+    for f in $hd_bad; do echo "      $f"; done
+    rm -rf "$hd_dir"
+    exit 1
+  fi
+  rm -rf "$hd_dir"
+  echo "  $hd_n heredoc shell payloads parse"
 }
 
 assert_every_drill_accounted_for() {

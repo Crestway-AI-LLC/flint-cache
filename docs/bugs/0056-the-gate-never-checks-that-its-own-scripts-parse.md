@@ -1,6 +1,7 @@
-# BUG-0056: the release gate runs ~130 drill scripts and checks that none of them parse (OPEN)
+# BUG-0056: the release gate runs ~130 drill scripts and checks that none of them parse (FIXED; the fix could not see the class that motivated it — EXTENDED 2026-09-05)
 
-Status: FIXED 2026-08-27 · Severity: low, but the failure it permits is
+Status: FIXED 2026-08-27, EXTENDED 2026-09-05 (the title said OPEN for nine days
+after the fix landed) · Severity: low, but the failure it permits is
 expensive to diagnose.
 
 ## Symptom
@@ -86,3 +87,69 @@ BUG-0061. `bash -n` over all of them was run by hand, because the gate could
 not do it. That is precisely the edit class this stage exists for: a large
 sed-shaped change where one bad substitution is invisible until the affected
 drill happens to run.
+
+## 2026-09-05 — the check could not see the incident it was written for
+
+The stage above parses files. **`bash -n` does not parse heredoc bodies** —
+they are data to the enclosing script — so a file whose heredoc payload is
+malformed passes cleanly. Verified rather than reasoned:
+
+    $ printf '%s\n' "ssh host bash -s <<'R'" "if true; then" "R" > hd.sh
+    $ bash -n hd.sh            # ACCEPTED
+    $ sed -n '2p' hd.sh > payload.sh && bash -n payload.sh
+    payload.sh: line 2: syntax error: unexpected end of file
+
+That is not a corner case here. It is **exactly the incident quoted at the top
+of this file**: ops `packaging/aws/gate-box/run.sh` generated a REMOTE script
+that failed to parse, so nothing ran — including the line that records the exit
+status — and the caller rendered the silence as "the run may still be going".
+The stage as built would have certified that script.
+
+### What the extension does
+
+`_gate_heredoc_payloads` extracts every heredoc whose payload is shell, writes
+each to its own file, and parses it. Three decisions worth keeping:
+
+- **Shell by USE, never by a list.** A payload counts as shell when the line
+  opening it feeds one (`bash -s`, or a redirect into a path ending `.sh`) or
+  when the payload declares itself with a shebang. A list of "heredocs that are
+  shell" would be a second declaration to keep in sync with the first
+  (BUG-0086).
+- **Unquoted heredocs are TEMPLATES.** With `<<EOF` the shell resolves `\$`,
+  `` \` ``, `\\` and backslash-newline before the payload runs, so the raw
+  text is not the text that executes. Exactly those four escapes are emulated
+  and nothing else; `$VAR` is left alone because it parses as a word either
+  way. **Found by doing it**: two of the ops repo's 55 payloads reported
+  syntax errors that did not exist until this was handled —
+  `VERIFY_OUT=\$(cat …)` parses as an assignment followed by a subshell. A
+  check with two false failures on day one teaches everyone to ignore it.
+- **The extractor gets its own positive control.** An extractor that finds
+  NOTHING certifies every payload in the tree by examining none of them, and
+  reports a pass. So a broken payload is planted and must be both found and
+  rejected before a clean sweep of the real ones is believed. That control
+  earned its place immediately: the first version wrote its probe with the
+  `'"'"'` idiom *inside double quotes*, where a single quote needs no escaping
+  at all, producing the delimiter `"R"` — which never matched the closing `R`,
+  so the extractor found nothing. The control caught it; a bare sweep would
+  have reported a green tree.
+
+### The control that shows the gap
+
+With the `worker.sh` payload inside `gates.sh` deliberately broken:
+
+    $ bash -n tools/gates.sh          # passes — the file check is blind
+    GATES FAILED: these heredoc shell payloads do not parse:
+          tools/gates.sh:846
+
+Two mutations run: the payload broken (caught, with its source line), and the
+extractor neutered so it matches nothing (caught by the planted control, not by
+silence).
+
+### Where the coverage actually matters, and what is left
+
+Core has **one** heredoc shell payload and no `packaging/*.sh`. The ops repo has
+**55**, across `upgrade-ops-box.sh`, `deploy-phase1.sh`, `roll-fleet.sh` and
+`gate-box/run.sh` itself — which is where the incident happened, and which is a
+different repository from the one this bug was filed and fixed in. That half is
+tracked as ops OPS-0130; the fix landing only here is the "fixed where found,
+not where it lives" shape the ops repo has now hit four times.
