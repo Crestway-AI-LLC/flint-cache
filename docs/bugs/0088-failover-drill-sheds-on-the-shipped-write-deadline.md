@@ -1,7 +1,9 @@
 # BUG-0088: `failover` fails when one write in 20 000 projects past the SHIPPED write deadline (FIXED 2026-09-05 — the projection charged one batch commit once per member)
 
-Status: OPEN 2026-09-03 · Severity: medium — the drill is intermittent, but the
-threshold it crosses is the product default, not a test setting
+Status: **FIXED 2026-09-05** (found 2026-09-03) · Severity: medium — the drill
+was intermittent, but the threshold it crossed is the product default, not a
+test setting. The threshold turned out to be innocent: the projection that
+measured against it was wrong. Nothing about the 2000 ms default changed.
 
 ## Symptom
 

@@ -1,7 +1,15 @@
 # BUG-0060: every resource limit is per-unit, and nothing bounds the aggregate (OPEN)
 
-Status: OPEN, opened 2026-08-27 as an audit · Severity: unknown until the audit
-runs, which is the point.
+Status: **OPEN** (opened 2026-08-27 as an audit) · Severity: medium — the audit
+ran and the defect is real: each unit is bounded, nothing bounds their sum, and
+the sum reaches physical memory at single-digit concurrency.
+
+**The mechanism is BUILT and OFF** (2026-09-04/05,
+`--collection-read-budget-pct`, default 0). Every whole-collection read is now
+costed and bounded when an operator turns it on — hashes, sets, zsets, and
+lists on their requested slice. What keeps this OPEN is the policy, not the
+code: the budget fraction is undecided, and the multiplier was measured on
+hashes alone.
 
 ## The question this exists to answer
 
