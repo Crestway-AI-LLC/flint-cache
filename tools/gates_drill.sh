@@ -152,8 +152,39 @@ case "$E" in *"unrecognised stage: $POISON"*) ;;
 echo "  conformance drills chaos accepted (.github/workflows/gate.yml)"
 
 echo "== the validated set and the dispatched set are the same set"
-DECLARED=$(sed -n 's/^ALL_STAGES="\(.*\)"$/\1/p' tools/gates.sh | tr ' ' '\n' | sort -u)
+# RESOLVE THE VALUE, DO NOT READ THE TEXT.
+#
+# This was `sed -n 's/^ALL_STAGES="\(.*\)"$/\1/p'`, which worked only while
+# that line held the stage names literally. `4bcba0c` split them into
+# DEFAULT_STAGES + OPT_IN_STAGES and left `ALL_STAGES="$DEFAULT_STAGES
+# $OPT_IN_STAGES"`, so the sed dutifully reported the two VARIABLE NAMES as the
+# declared stages and this check failed on a correct refactor:
+#
+#     FAIL: ALL_STAGES and the want() calls disagree:
+#       < $DEFAULT_STAGES
+#       < $OPT_IN_STAGES
+#       > chaos / check / conformance / drills …
+#
+# Evaluating the assignments instead follows any shape the declaration takes.
+# It matches every simple `NAME="..."` above `want()` rather than naming the
+# three that exist today: a list of component variables would be one more thing
+# to keep in sync with the file it is reading, which is this bug again.
+DECLARED=$( {
+  eval "$(sed -n '1,/^want()/p' tools/gates.sh | grep -E '^[A-Z][A-Z0-9_]*="[^"]*"$')"
+  printf '%s\n' $ALL_STAGES
+} | sort -u )
+# A CALL, NOT THE WORD. `want [a-z_]+` matches any occurrence, and gates.sh
+# gained `local want scanned rest` in 4bcba0c -- a variable DECLARATION whose
+# second name is `scanned`. This check duly reported `scanned` as a stage that
+# is dispatched but not declared, which is a real defect when it is true and
+# was not here.
+#
+# Every genuine call sits at a command position: `if want msrv; then`, or
+# `if want conformance || want drills || want chaos; then`. Requiring that
+# position excludes the declaration without naming it, which a `grep -v local`
+# would not -- the next collision would be some other keyword.
 DISPATCHED=$(grep -v '^[[:space:]]*#' tools/gates.sh \
+  | grep -oE '(^|[;&|] *|if )want [a-z_]+' \
   | grep -oE 'want [a-z_]+' | awk '{print $2}' | sort -u)
 # Both greps must find something. Two empty sets compare equal, which would
 # make this check pass on a gates.sh it could not read at all.
@@ -181,7 +212,12 @@ forge() {  # forge <dir> <forced-STAGES> <stub-step: yes|no>
   local dir=$1 stages=$2 stub=$3
   rm -rf "$dir"; mkdir -p "$dir/tools"
   awk -v stages="$stages" -v stub="$stub" '
-    $0 == "STAGES=\"${*:-$ALL_STAGES}\"" { print "STAGES=\"" stages "\""; forced=1; next }
+    # MATCH THE FORM, NOT ONE VARIABLE NAME. This compared against the exact
+    # literal `STAGES="${*:-$ALL_STAGES}"`, and 4bcba0c changed the default to
+    # $DEFAULT_STAGES so msrv could be opt-in. The equality then never held,
+    # the copy was never forced, and the drill correctly refused to assert
+    # against an untouched script -- a red gate for a correct refactor.
+    $0 ~ /^STAGES="\$\{\*:-\$[A-Z_]+\}"$/ { print "STAGES=\"" stages "\""; forced=1; next }
     $0 == "if want check; then" && stub == "yes" && !stubbed {
       print "step() { RAN_STEPS=$((RAN_STEPS + 1)); echo \"STEP $1\"; }"
       stubbed = 1
@@ -194,7 +230,7 @@ forge() {  # forge <dir> <forced-STAGES> <stub-step: yes|no>
   # the defect this whole drill is about.
   case $? in
     0) ;;
-    3) echo "FAIL: no 'STAGES=\"\${*:-\$ALL_STAGES}\"' line in tools/gates.sh, so"
+    3) echo "FAIL: no 'STAGES=\"\${*:-\$<VAR>}\"' line in tools/gates.sh, so"
        echo "      the dispatch could not be forced and the backstop below would"
        echo "      have been asserted against an untouched script."; exit 1;;
     4) echo "FAIL: no 'if want check; then' line to stub step() ahead of"; exit 1;;
