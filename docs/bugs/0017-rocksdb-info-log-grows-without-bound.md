@@ -1,8 +1,10 @@
-# BUG-0017: the RocksDB info LOG grows without bound (FIXED and now tested)
+# BUG-0017: the RocksDB info LOG grows without bound (FIXED)
 
-Status: **FIXED and now tested** 2026-08-22 · found 2026-08-18 on the playground · Severity: **medium** — an
-unbounded disk consumer that scales with replication churn rather than with
-stored data. **Scope corrected 2026-08-18** — see "Three claims withdrawn".
+Status: **FIXED, tested, and CLOSED 2026-09-05** · found 2026-08-18 on the
+playground · Severity: **medium** — an unbounded disk consumer that scales with
+replication churn rather than with stored data. **Scope corrected 2026-08-18**
+— see "Three claims withdrawn"; the last stated gap was checked by mutation on
+2026-09-05 and did not exist — see the closing section.
 
 ## Symptom
 
@@ -115,6 +117,11 @@ more than one because that outage ran nine hours before anyone looked.
 `bound_info_log_with`, not the call sites. Deleting `bound_info_log(&mut opts)`
 from `open_with_retention` would leave both green.
 
+> **Withdrawn 2026-09-05.** That paragraph is wrong, and the way it is wrong is
+> this bug's own recurring mistake — a claim about consumers made without
+> reading them. See the closing section: the deletion it describes fails a test
+> that already existed when the paragraph was written.
+
 ## Fix
 
 - Pin `max_log_file_size` and `keep_log_file_num` in `open_with_retention`, and
@@ -145,6 +152,55 @@ Confirmed on the playground and cleared by moving the rotated logs to
 `/var/lib/flint/diag/` and gzipping: **883 MB reclaimed from the data dirs, kept
 as 88 MB compressed** (they are the only record of the livelock week). Data dirs
 went 918 MB → 43 MB and 9.3 MB.
+
+## Closing 2026-09-05 — the last gap was checked, and it was not there
+
+The bug's remaining scope was one sentence: *"the tests drive
+`bound_info_log_with`, not the call sites. Deleting `bound_info_log(&mut opts)`
+from `open_with_retention` would leave both green."* It was checked by making
+the deletion rather than by reading, once per call site.
+
+**`open_with_retention` is covered.** Deleting the line fails
+`info_log_is_pruned_across_reopens`:
+
+    info LOG is not pruned: 9 files after 9 opens (bound 5)
+
+That test goes through `RocksKv::open`, which is `open_with_retention` with the
+default retention, and it was added in `0f065b8` — **the same commit as the
+fix, on 2026-08-18**. The "not covered" paragraph was written on 2026-08-22,
+four days later, in the same file, about a sibling test twenty lines away. It
+is the mistake BUG-0016 was retracted for and this bug was filed an hour later
+to avoid: asserting a blast radius without reading the consumers. Three weeks
+of "known gap" that a one-line deletion would have closed on day one.
+
+**`open_read_only` is uncovered, and cannot be covered, because the bound is
+inert there.** Deleting the line leaves all 188 flint-storage tests green — so
+on the evidence of the suite alone it looks exactly like the gap above. It is
+not, and the difference is measurable:
+
+| probe | with the bound | without it |
+|---|---|---|
+| 9 read-only opens of a fresh DB | 1 `LOG`, no `LOG.old` | 1 `LOG`, no `LOG.old` |
+| 1 read-only open over 10 staged rotated logs | 10 files | 10 files |
+
+A read-only open neither rotates the info LOG nor prunes existing ones. There
+is no behaviour at that call site to assert, so a test written against it would
+pass whether or not the bound is set — the vacuous assert this file already
+records three attempts at. The line stays: it is free, it is correct, and it is
+right if RocksDB changes. `a_read_only_open_neither_rotates_nor_prunes_the_info_log`
+pins the assumption that makes it inert, and says in its failure message that
+failing is the good case.
+
+**One real defect fell out of the check.** `info_log_is_pruned_across_reopens`
+asserted `logs.len() <= DEFAULT_KEEP_LOG_FILE_NUM + 1`, commented "live LOG plus
+at most KEEP retained" — implying a ceiling of 6 x 64 MiB = 384 MB, twenty lines
+from `the_ceiling_is_the_one_the_incident_justified`, which asserts
+`DEFAULT_MAX_LOG_FILE_SIZE * DEFAULT_KEEP_LOG_FILE_NUM` = 320 MB. The two could
+not both be right. Measured at 1/5/6/9/20 opens, the file counts are 1/5/5/5/5:
+`keep_log_file_num` bounds ALL info logs including the live one, exactly as
+`rotated_logs_are_pruned_to_the_keep_limit` had worked out and documented at
+length. The ceiling test was right, the assertion has been tightened to
+equality, and the two tests now agree about what the bound means.
 
 ## Related
 

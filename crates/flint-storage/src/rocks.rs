@@ -1332,15 +1332,94 @@ mod audit {
             logs.iter().any(|n| n.starts_with("LOG.old.")),
             "expected at least one rotated LOG after {opens} opens, got {logs:?}"
         );
-        // The bound itself: live LOG plus at most KEEP retained.
-        assert!(
-            logs.len() <= DEFAULT_KEEP_LOG_FILE_NUM + 1,
+        // The bound itself. `keep_log_file_num` bounds ALL info logs INCLUDING
+        // the live one, so the total is `keep`, not `keep + 1` -- measured at
+        // 1/5/6/9/20 opens, which give 1/5/5/5/5 files. This assertion said
+        // `<= keep + 1` and called it "live LOG plus at most KEEP retained",
+        // which implied a 6 x 64 MiB = 384 MB ceiling next to
+        // `the_ceiling_is_the_one_the_incident_justified`, which asserts
+        // 5 x 64 MiB = 320 MB. One of the two had to be wrong; the ceiling
+        // test is right.
+        //
+        // Equality rather than `<=` also carries the other half: nine opens
+        // with no pruning leave nine files, so seeing exactly `keep` proves
+        // pruning ran; seeing fewer would mean the opens did not rotate and
+        // this test exercised nothing.
+        assert_eq!(
+            logs.len(),
+            DEFAULT_KEEP_LOG_FILE_NUM,
             "info LOG is not pruned: {} files after {} opens (bound {}): {:?}",
             logs.len(),
             opens,
-            DEFAULT_KEEP_LOG_FILE_NUM + 1,
+            DEFAULT_KEEP_LOG_FILE_NUM,
             logs
         );
+    }
+
+    /// BUG-0017's other call site, and why it has no assertion of its own.
+    ///
+    /// `open_read_only` sets the same bound. Deleting it leaves all 188
+    /// flint-storage tests green -- so it looks exactly like the untested
+    /// call site the bug file said BOTH sites were. It is not, and the reason
+    /// is measurable: **a read-only open neither rotates the info LOG nor
+    /// prunes existing ones.** Nine read-only opens on a fresh DB leave one
+    /// `LOG` and no `LOG.old`; ten rotated logs staged by unbounded raw opens
+    /// survive a read-only open unchanged, with `keep_log_file_num` set and
+    /// without it, identically.
+    ///
+    /// So there is no behaviour there to assert. The line stays because it is
+    /// free and correct, not because it does anything today -- and this test
+    /// pins the assumption that makes it inert.
+    ///
+    /// IF THIS FAILS because a read-only open now prunes, that is the good
+    /// case: the bound at that call site has become observable. Write the
+    /// real assertion the way `info_log_is_pruned_across_reopens` does it,
+    /// and delete this.
+    #[test]
+    fn a_read_only_open_neither_rotates_nor_prunes_the_info_log() {
+        let dir = TempDir::new("infolog-ro");
+        // Stage more rotated logs than `keep` allows, with UNBOUNDED raw
+        // opens so the staging itself cannot be what prunes them.
+        let staged = DEFAULT_KEEP_LOG_FILE_NUM + 5;
+        for _ in 0..staged {
+            let mut o = Options::default();
+            o.create_if_missing(true);
+            drop(DB::open(&o, &dir.0).expect("raw open"));
+        }
+        let before = info_logs(&dir.0);
+        assert_eq!(
+            before.len(),
+            staged,
+            "the staging must leave more than keep={DEFAULT_KEEP_LOG_FILE_NUM} \
+             logs, or the read-only open below has nothing to prune and this \
+             test cannot tell pruning from an empty directory: {before:?}"
+        );
+
+        drop(RocksKv::open_read_only(&dir.0).expect("read-only open"));
+
+        let after = info_logs(&dir.0);
+        assert_eq!(
+            after.len(),
+            before.len(),
+            "a read-only open pruned info logs ({} -> {}). That is a CHANGE in \
+             RocksDB behaviour and a welcome one: `bound_info_log` in \
+             `open_read_only` is now observable, so replace this test with a \
+             real assertion on the bound.",
+            before.len(),
+            after.len()
+        );
+    }
+
+    /// Every info log in `dir` -- the live `LOG` and each `LOG.old.<micros>`.
+    fn info_logs(dir: &std::path::Path) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(dir)
+            .expect("read dir")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("LOG"))
+            .collect();
+        v.sort();
+        v
     }
 }
 
@@ -1549,10 +1628,18 @@ mod info_log_bounds {
     ///
     /// WHAT THIS DOES NOT COVER, stated rather than implied: it exercises the
     /// bounding function, not the call SITES. Deleting `bound_info_log(&mut
-    /// opts)` from `open_with_retention` would leave this test green. The
-    /// constant assertion below is the partial guard against the other silent
-    /// regression — someone widening the ceiling without revisiting the
-    /// incident that set it.
+    /// opts)` from `open_with_retention` would leave THIS test green — but not
+    /// the suite. `info_log_is_pruned_across_reopens` goes through
+    /// `RocksKv::open`, and the same deletion fails it with nine info logs
+    /// against a bound of five; that was checked by making the deletion, not
+    /// by reading. This comment claimed the call sites were uncovered for two
+    /// weeks while one of them was, which is the same mistake as asserting a
+    /// blast radius without reading the consumers — the mistake BUG-0016 was
+    /// retracted for, and this bug filed an hour later to avoid.
+    ///
+    /// The constant assertion below is the partial guard against the other
+    /// silent regression — someone widening the ceiling without revisiting
+    /// the incident that set it.
     #[test]
     fn rotated_logs_are_pruned_to_the_keep_limit() {
         let dir = std::env::temp_dir().join(format!(
