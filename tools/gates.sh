@@ -1271,6 +1271,109 @@ BTPY
   echo "  every bug title agrees with its own Status line"
 }
 
+assert_bug_index_markers_agree_with_status() {
+  # THE ROW IS WHAT A READER ACTS ON, and it is a SECOND copy of the state.
+  # `assert_bug_titles_agree_with_status` holds each write-up's H1 against its
+  # own Status line. It cannot see docs/bugs/README.md, where every row carries
+  # its own marker -- so a row could say (OPEN) over a file that says FIXED and
+  # nothing noticed.
+  #
+  # EIGHT of seventy marked rows had drifted when this was written: 0014, 0049,
+  # 0051, 0052, 0053, 0056, 0061, 0065, every one saying OPEN over a Status
+  # beginning FIXED or CLOSED, the oldest by ten days. The cost is not
+  # hypothetical -- the session that added this check had already listed
+  # BUG-0014 to Jeff as open work, having read it off this index the same
+  # morning. That is the whole failure mode: the index exists so a number can
+  # be read without opening the file, and a wrong row is worse than no row.
+  #
+  # 0056 is the one worth noticing. Its own Status records that its TITLE said
+  # OPEN for nine days after the fix landed -- and the sweep that fixed the
+  # title left this row saying OPEN too. A check aimed at one copy of a fact
+  # does not reach the others.
+  #
+  # SAME NARROW RULE as the title check, deliberately: only the unambiguous
+  # contradiction, in both directions. Markers here are richer than in a title
+  # ("FIXED in code, UNCONFIRMED against a live recurrence" is a legitimate
+  # row) and a check that fired on those would be switched off within a week.
+  local out
+  out=$(python3 - <<'BIMPY'
+import glob, os, re, sys
+CLOSED = ("FIXED", "RESOLVED", "CLOSED", "SHIPPED", "RETRACTED", "SUBSUMED",
+          "WONTFIX")
+try:
+    idx = open("docs/bugs/README.md", encoding="utf-8", errors="replace").read()
+except OSError:
+    print("NOINDEX")
+    sys.exit(0)
+
+# The marker is the LAST parenthesised group in the row whose first word is a
+# state word. Rows put it at the end of the title cell OR the evidence cell --
+# both conventions are in use -- and both cells carry ordinary parentheses of
+# their own, so position alone cannot find it and neither can vocabulary alone.
+marker_of = {}
+for line in idx.split("\n"):
+    m = re.match(r"\| (?:BUG-)?.?(\d{4})", line)
+    if not m:
+        continue
+    found = None
+    for g in re.findall(r"\(([^)]*)\)", line):
+        w = g.upper().split()
+        if w and (w[0] == "OPEN" or any(w[0].startswith(c) for c in CLOSED)):
+            found = g.upper()
+    marker_of[m.group(1)] = found
+
+bad = []
+marked = 0
+for f in sorted(glob.glob("docs/bugs/[0-9][0-9][0-9][0-9]-*.md")):
+    row = marker_of.get(os.path.basename(f)[:4])
+    if not row:
+        continue
+    marked += 1
+    head = open(f, encoding="utf-8", errors="replace").read()
+    sm = re.search(r"^\*{0,2}Status:?\*{0,2}\s*:?\s*(.{0,40})", head, re.M)
+    if not sm:
+        continue
+    # chr(96) rather than the character: this heredoc sits inside a $( ), where
+    # bash looks for a matching backtick even in a QUOTED heredoc.
+    st = re.sub("[*_" + chr(96) + "]", "", sm.group(1)).strip().upper()
+    first = re.split(r"[\s,;.:·]+", st)[0] if st else ""
+    words = row.split()
+    if not words:
+        continue
+    if words[0] == "OPEN" and first.startswith(CLOSED):
+        bad.append((os.path.basename(f), row, st))
+    elif any(words[0].startswith(c) for c in CLOSED) and first == "OPEN":
+        bad.append((os.path.basename(f), row, st))
+
+# A scan that finds no markers certifies the index by reading none of it.
+if marked == 0:
+    print("NOMARKERS")
+    sys.exit(0)
+for f, row, st in bad:
+    print("%s\t(%s)\t%s" % (f, row[:70], st[:60]))
+BIMPY
+) || { echo "FAIL  the index-marker check could not run"; FAILED="$FAILED bug-index-markers-unrunnable"; return; }
+
+  if [ "$out" = NOINDEX ] || [ "$out" = NOMARKERS ]; then
+    echo "FAIL  the index-marker check found no marked rows -- it certified"
+    echo "        docs/bugs/README.md by reading none of it"
+    FAILED="$FAILED bug-index-markers-examined-nothing"
+    return
+  fi
+  if [ -n "$out" ]; then
+    echo "FAIL  index row(s) whose marker contradicts the write-up's Status:"
+    printf '%s\n' "$out" | while IFS="$(printf '\t')" read -r f marker st; do
+      echo "        $f"
+      echo "          index $marker  vs  Status: $st"
+    done
+    echo "        The row is what a reader acts on without opening the file."
+    echo "        Update it in the SAME commit that changes the Status."
+    FAILED="$FAILED bug-index-markers-contradict-status"
+    return
+  fi
+  echo "  every bug index row agrees with its write-up's Status line"
+}
+
 assert_bug_index_agrees() {
   local idx=docs/bugs/README.md missing="" untitled="" dups b n h files=0
   if [ ! -s "$idx" ]; then
@@ -2087,6 +2190,7 @@ if want check; then
   assert_induced_controls_have_not_regressed
   assert_bug_index_agrees
   assert_bug_titles_agree_with_status
+  assert_bug_index_markers_agree_with_status
   assert_no_port_overlap
   assert_scripts_parse
   assert_no_scope_overlap
