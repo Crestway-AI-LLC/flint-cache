@@ -915,6 +915,51 @@ close enough to the noise floor that the recommendation should stay where it is
   This leg fixed the upper splice, not that one; -9.1% at 0.76 GB against
   -26.2% at 1.3 GB would put the worst harm in the middle, and re-running
   0.76 GB inside this series is the only thing that would settle it.
+
+## 2026-09-05 (later) — n=2 at the anchor, and 0.76 GB re-measured
+
+Two more points on one box, same shape as everything above.
+
+| logical | default | bg_jobs=4 | change | stall default -> 4 | W-Amp |
+|---|---|---|---|---|---|
+| 0.76 GB (re-measured) | 264.7 MB/s | 234.5 MB/s | **-11.4%** | 6.3% -> 6.0% | 5.7 -> 6.6 |
+| 6.4 GB (2nd sample) | 98.2 MB/s | 105.0 MB/s | **+6.9%** | 62.4% -> 58.5% | 9.4 -> 10.1 |
+
+**The n=1 caveat at the anchor is closed.** 6.4 GB now reads +7.2% and +6.9%
+across two independent runs, with the underlying rates agreeing to a tenth of a
+MB/s (98.1/98.2 default, 105.2/105.0 at jobs=4). The +7% is real and the
+spliced +32% is refuted twice rather than once — this is the reproducibility
+the older figure never had.
+
+**0.76 GB reproduces its own older number**: -11.4% today against -9.1% then.
+Two measurements weeks apart agreeing within ~2 points is a useful check on the
+harness, and it is the strongest evidence in this file that cross-run drift is
+usually small — which makes the +32% outlier more interesting, not less.
+
+### The non-monotonicity: better supported, still not in one series
+
+The full picture, ordered by size:
+
+    0.76 GB  -11.4% (today) / -9.1% (older)
+    1.3  GB  -26.2%
+    2.2  GB  -22.5%
+    3.7  GB   -2.8%
+    6.4  GB   +7.2% / +6.9%
+
+**The worst harm really does sit in the middle, not at the smallest LSM.** Two
+independent 0.76 GB measurements bracket it low, and 1.3/2.2 are in-series with
+each other at -26.2/-22.5, so the dip is not one stray number.
+
+What is still missing is 0.76 and 1.3 GB *in the same run*: today's 0.76 is
+today's, and 1.3 is from 2026-09-03. Given that the two 0.76 measurements agree
+across a fortnight, drift is an unlikely explanation for a 15-point gap — but
+"unlikely" is not "measured", and this file has already had one cross-run
+figure turn out to be wrong by 4.4x.
+
+**Not worth another run at present.** The recommendation does not turn on it:
+below the crossover the knob harms, and whether it harms most at 0.76 or 1.3 GB
+changes no advice anyone would act on. Recorded as the last open splice rather
+than closed, so nobody re-derives it from the table above and calls it settled.
 - **Nothing here is a fleet-wide default.** The proposal's reasoning is
   unchanged.
 

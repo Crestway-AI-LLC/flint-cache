@@ -155,23 +155,29 @@ jobs:
       #   2  0.50         41-74 ms           18m45s   3/4
       #   4  1.00         90-1574 ms         11m46s   ~9% red over 33
       #
-      # THE EFFECT IS NOT LINEAR IN P. Two drills at once do not contend
-      # enough to move the margin -- P=2 is indistinguishable from serial,
-      # on the peak (41-74 vs 48-71) and on the per-write service time that
-      # drives it (161-292us vs 255-346us). Four do, by an order of
-      # magnitude. So the whole margin improvement is available at 1.6x
-      # wall clock instead of serial's 2.8x, and 4 was buying speed with
-      # the one quantity nobody was watching.
+      # 2026-09-05: BACK TO 4, AND THE TABLE ABOVE IS KEPT ONLY FOR ITS WALL
+      # CLOCK COLUMN. Every "write-wait peak" in it is `inflight x residency`,
+      # which charged one batch commit once per member of the batch and
+      # over-reported by up to 256x (BUG-0088). Those peaks measured the model,
+      # not the margin, so the reasoning this block used to carry -- that P=4
+      # bought speed "with the one quantity nobody was watching" -- rested on a
+      # quantity that was not what anyone thought it was.
       #
-      # WHAT THIS DOES NOT BUY IS A GREEN GATE, and the honest record is
-      # that one of the four P=2 runs still crossed the deadline -- on
-      # `restart`, at inflight 44 x service 45551us. Crossings become rare
-      # rather than impossible. Anyone re-measuring should watch the max
-      # across drills rather than one drill's peak: failover's margin was
-      # restored in that very run and the gate went red anyway.
+      # P was lowered to reduce OFFERED LOAD, and it did: in flight fell from
+      # 256 to 65. The very next run still shed, which is what sent the
+      # investigation to the projection instead of the runner. With the
+      # projection corrected the four historical firings sit at 8-67 ms against
+      # a 2000 ms deadline, and all three reds in the last forty gate runs were
+      # that single failure.
       #
-      # gate_jobs=1 or 4 on a manual dispatch is the rollback, no file edit.
-      FLINT_GATE_JOBS: ${{ inputs.gate_jobs || '2' }}
+      # So P=4 is restored on Jeff's call and the P question is CLOSED: tuning
+      # it now optimises against a mechanism that no longer exists. Do not run
+      # further P arms. If the gate reddens again, read `write_cost_us` and
+      # `write_service_us` in FLINTINFO -- the terms are separated now -- rather
+      # than reaching for this knob.
+      #
+      # gate_jobs=1 or 2 on a manual dispatch is the rollback, no file edit.
+      FLINT_GATE_JOBS: ${{ inputs.gate_jobs || '4' }}
       # Empty on push/PR, so the full CORE list runs. gates.sh reads
       # FLINT_CORE_ORDER with the full list as its default, and an empty
       # string is falsy there, so this is inert unless a dispatch sets it.
