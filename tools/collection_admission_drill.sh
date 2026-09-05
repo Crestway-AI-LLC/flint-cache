@@ -9,7 +9,8 @@
 # through a real server and a real client.
 #
 # THE CONTROL MATTERS MORE THAN THE ASSERTION. The same read is issued three
-# times: with admission OFF, where it must SUCCEED; with a budget it cannot
+# times: with admission explicitly OFF (`--collection-read-budget-pct 0` -- the
+# bound is ON by default since 2026-09-05), where it must SUCCEED; with a budget it cannot
 # fit, where it must be REFUSED; and with that same budget in `observe` mode,
 # where it must SUCCEED AGAIN while `collection_read_would_refuse` still
 # moves. Without the first, a refusal proves only that something went wrong --
@@ -95,7 +96,11 @@ expect_config_refusal() {   # $1 = extra args, $2 = what is being refused
 }
 
 echo "== startup: configurations that would measure nothing are refused"
-expect_config_refusal "--collection-read-mode observe" "observe with no budget"
+# An EXPLICIT 0 now, since the default arms the bound: the pairing being
+# refused is "observe, against a budget the operator deliberately turned off",
+# which still measures nothing and still reports 0 whatever the workload does.
+expect_config_refusal "--collection-read-budget-pct 0 --collection-read-mode observe" \
+  "observe with no budget"
 grep -q "no budget to observe against" "$LOG" \
   || fail "the refusal does not say WHY: $(head -c 200 "$LOG")"
 expect_config_refusal "--collection-read-budget-pct 25 --collection-read-mode obserev" \
@@ -112,10 +117,29 @@ fleet_kill server
 sleep 0.3
 echo "   refused both, and started the valid pairing"
 
-echo "== control: admission OFF, the read must succeed"
+# THE SHIPPED DEFAULT, checked through the whole wiring rather than as a
+# constant. `the_default_is_the_ratified_fraction_and_zero_still_turns_it_off`
+# asserts the number in flint-storage; this asserts that a node started with no
+# flags at all actually arms the bound, which is a different claim -- the value
+# has to survive arg parsing, the OnceLock, and FLINTINFO to get here.
+echo "== a node with no flags ships the bound ARMED at the ratified fraction"
 start_node ""
+PCT_DEFAULT=$(info_field collection_read_budget_pct)
+[ "$PCT_DEFAULT" = "25" ] \
+  || fail "a default node reports collection_read_budget_pct=$PCT_DEFAULT, expected 25.
+  The bound shipped at 0 for a week while observe mode existed to price it; if
+  this reads 0 again, the audit BUG-0060 exists for is off in every deployment."
+MODE_DEFAULT=$(info_field collection_read_mode)
+[ "$MODE_DEFAULT" = "enforce" ] \
+  || fail "a default node is in mode '$MODE_DEFAULT'; the bound must ENFORCE unless asked not to"
+echo "   default: pct=$PCT_DEFAULT mode=$MODE_DEFAULT"
+fleet_kill server
+sleep 0.3
+
+echo "== control: admission OFF, the read must succeed"
+start_node "--collection-read-budget-pct 0"
 PCT_OFF=$(info_field collection_read_budget_pct)
-[ "$PCT_OFF" = "0" ] || fail "expected admission off by default, got pct=$PCT_OFF"
+[ "$PCT_OFF" = "0" ] || fail "expected admission off at an explicit 0, got pct=$PCT_OFF"
 
 MEM_SRC=$(info_field mem_src)
 AVAIL=$(info_field mem_avail_bytes)

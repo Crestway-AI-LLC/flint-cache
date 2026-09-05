@@ -1,8 +1,9 @@
-# BUG-0060: every resource limit is per-unit, and nothing bounds the aggregate (OPEN)
+# BUG-0060: every resource limit is per-unit, and nothing bounds the aggregate (FIXED)
 
-Status: **OPEN** (opened 2026-08-27 as an audit) · Severity: medium — the audit
-ran and the defect is real: each unit is bounded, nothing bounds their sum, and
-the sum reaches physical memory at single-digit concurrency.
+Status: **FIXED 2026-09-05** (opened 2026-08-27 as an audit) · Severity: medium
+— the audit ran and the defect was real: each unit is bounded, nothing bounded
+their sum, and the sum reaches physical memory at single-digit concurrency.
+The bound is now ON by default at the ratified 25%, on Jeff's call.
 
 **The mechanism is BUILT and OFF** (2026-09-04/05,
 `--collection-read-budget-pct`, default 0). Every whole-collection read is now
@@ -12,12 +13,21 @@ collection types, the fraction is ratified at 25%, and
 `--collection-read-mode observe` now lets an operator find out what a budget
 would cost before it costs them anything.
 
-**What keeps this OPEN is that the default is still 0**, so the defect this
-file is named for is live in every shipped configuration: on a default node,
-nothing bounds the sum. Closing it means changing
-`DEFAULT_COLLECTION_READ_BUDGET_PCT`, which is a fleet-wide behaviour change
-and a decision rather than an inference — every prerequisite for making it is
-now in place, and none of them is what is missing.
+**CLOSED 2026-09-05 by changing the default to 25.** It shipped at 0 for a
+week, deliberately: a new refusal path is not switched on for existing
+workloads by inference, and until `--collection-read-mode observe` existed
+nobody could say what a budget would cost a real workload without refusing
+real reads. With the multiplier measured across all three collection types, 25
+ratified, the counters exported and observe mode available to price it, what
+remained was that **the defect this file is named for was live in every
+shipped configuration precisely because the guard was off**.
+
+`0` still turns it off, so an operator who wants the previous behaviour asks
+for it. The drill now checks the shipped default end-to-end — a node started
+with no flags at all must report `collection_read_budget_pct: 25` and
+`collection_read_mode: enforce` — which is a different claim from the constant
+assertion in `flint-storage`: the value has to survive argument parsing, the
+`OnceLock` and FLINTINFO to get there.
 
 ## The question this exists to answer
 
@@ -1173,11 +1183,11 @@ any of them.
   how far the requested elements sit from average, and the alternative — reading
   the range to size it — is the work being admitted.
 - ~~The fraction to recommend.~~ **RATIFIED 2026-09-05: 25%.** Jeff's call, and
-  it is the documented value in `docs/self-hosting.md` rather than a new
-  default: `--collection-read-budget-pct` still ships at **0**, because
-  opt-in-with-refusal-off was a separate decision and this one did not revisit
-  it. Turning it on fleet-wide is a one-line change to
-  `DEFAULT_COLLECTION_READ_BUDGET_PCT` when that is wanted.
+  it was the documented value in `docs/self-hosting.md` before it was the
+  default: `--collection-read-budget-pct` shipped at **0** at that point,
+  because opt-in-with-refusal-off was a separate decision which that one did
+  not revisit. **It became the default on 2026-09-05**, the one-line change to
+  `DEFAULT_COLLECTION_READ_BUDGET_PCT` this paragraph anticipated.
 
   25% is a policy choice rather than a measurement, and what it means is worth
   stating in one line: with a 3.5x multiplier, a node admits concurrent

@@ -807,11 +807,15 @@ several times the collection while it is in flight. **Five concurrent
 max-size reads is ~8.1 GB**, on a node that will accept `--max-conns`
 (2048) of them.
 
-Off by default. Turn it on with a percentage of available memory:
+**On by default at 25%**, since 2026-09-05. It shipped off for a week while
+`--collection-read-mode observe` existed to price it; leaving it off meant the
+defect it exists for — nothing caps the SUM, and five concurrent max-size reads
+is ~8.1 GB — was live in every deployment precisely because the guard was.
+`0` turns it off, and an operator who wants the old behaviour asks for it:
 
 | flag | default | meaning |
 |---|---|---|
-| `--collection-read-budget-pct` | `0` (off) | share of available node memory that in-flight collection reads may hold |
+| `--collection-read-budget-pct` | `25` | share of available node memory that in-flight collection reads may hold; `0` disables |
 | `--collection-read-mode` | `enforce` | `enforce` refuses over-budget reads; `observe` admits them and counts them |
 
 When it is on, each `HGETALL`/`HKEYS`/`HVALS`/`SMEMBERS`/`ZRANGE`-family
@@ -834,8 +838,8 @@ saturates. Because it climbs, the figure at the cap bounds every smaller
 read and a mid-range sample does not. 3.5 clears the measured maximum by
 16%. Re-run that tool if the read path changes.
 
-**Picking a percentage. Use `25`** — the ratified value, and the one the rest
-of this section assumes. The budget counts your in-flight reads against
+**Picking a percentage. `25` is the default** — the ratified value, and the one
+the rest of this section assumes. The budget counts your in-flight reads against
 available memory, which already reflects them, so it tightens as load rises —
 deliberately. With the 3.5x multiplier, 25 admits roughly one max-size (512 MiB)
 read per 7.0 GiB of memory the node can currently see. Set it and watch

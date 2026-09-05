@@ -73,9 +73,21 @@ use crate::mem;
 /// See the module docs for how 3.5 was chosen and measured.
 pub const READ_PEAK_MULTIPLIER_TENTHS: u64 = 35;
 
-/// Opt-in. 0 disables admission entirely, and is the default: a new refusal
-/// path does not get switched on for existing workloads by inference.
-pub const DEFAULT_COLLECTION_READ_BUDGET_PCT: u8 = 0;
+/// ON by default, at the ratified fraction. 0 still disables admission
+/// entirely, and an operator who wants the old behaviour asks for it.
+///
+/// It shipped at 0 first, deliberately: a new refusal path is not switched on
+/// for existing workloads by inference, and nobody could say what a budget
+/// would cost a real workload until `--collection-read-mode observe` existed
+/// to answer that without refusing anything. With the multiplier measured
+/// across all three collection types, 25 ratified, and the counters exported,
+/// what remained was that the defect this bound exists for -- nothing caps the
+/// SUM, and five concurrent max-size reads is ~8.1 GB -- was live in every
+/// shipped configuration precisely because the guard was off.
+///
+/// 25 admits roughly one max-size (512 MiB) read per 7.0 GiB of memory the
+/// node can currently see. See the module docs for the multiplier.
+pub const DEFAULT_COLLECTION_READ_BUDGET_PCT: u8 = 25;
 
 /// How long a memory sample is reused. The fast-moving term -- what THIS node
 /// has admitted -- is counted exactly, so staleness only lags memory pressure
@@ -358,11 +370,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn disabled_by_default_admits_without_reserving() {
-        let a = ReadAdmission::new(DEFAULT_COLLECTION_READ_BUDGET_PCT, Mode::Enforce);
-        assert!(!a.enabled());
-        assert_eq!(a.admit(512 * 1024 * 1024), Admit::Disabled);
-        assert_eq!(a.in_flight_bytes(), 0, "disabled must not reserve");
+    fn the_default_is_the_ratified_fraction_and_zero_still_turns_it_off() {
+        // The bound is ON by default now. It shipped at 0 for a week while
+        // observe mode existed to price it; the audit this exists for is only
+        // answered once the guard is actually in force.
+        assert_eq!(DEFAULT_COLLECTION_READ_BUDGET_PCT, 25);
+        assert!(ReadAdmission::new(DEFAULT_COLLECTION_READ_BUDGET_PCT, Mode::Enforce).enabled());
+
+        // 0 remains the off switch, and off must still reserve nothing --
+        // an operator who wants the old behaviour has to be able to have it.
+        let off = ReadAdmission::new(0, Mode::Enforce);
+        assert!(!off.enabled());
+        assert_eq!(off.admit(512 * 1024 * 1024), Admit::Disabled);
+        assert_eq!(off.in_flight_bytes(), 0, "disabled must not reserve");
     }
 
     #[test]
