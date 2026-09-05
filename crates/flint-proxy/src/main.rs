@@ -1896,7 +1896,10 @@ fn auth_step(
                 .cert_path
                 .as_deref()
                 .and_then(flint_tls::cert_days_remaining)
-                .map_or_else(|| "none".into(), |d| d.to_string()),
+                // BUG-0095: a number, not the word `none` -- the exporter
+                // drops non-numerics, so `flint_proxy_cert_days_remaining`
+                // used to vanish exactly when there was no readable cert.
+                .unwrap_or(flint_tls::CERT_DAYS_UNKNOWN),
         );
         return AuthStep::Reply(Value::Bulk(Some(info.into_bytes())));
     }

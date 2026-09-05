@@ -15,7 +15,7 @@
 # alive-but-read-only and therefore still has a replica attached. It cannot fire
 # when the lineage holder has LOST its replica: FLINTINFO renders seq_lag as the
 # string "none" whenever no live replica is attached, so such a node reports
-# `live_replicas 0, seq_lag none` and satisfies nothing. The controller then
+# `live_replicas 0` with seq_lag unknown, and satisfies nothing. The controller then
 # pages every tick, forever:
 #
 #   [ctl][g3] no master and pair not converged within 5s — REFUSING
@@ -205,7 +205,7 @@ done
 if [ -z "$HEAL" ]; then
   echo "FAIL: 45s after the CP resumed only $(masters)/2 pairs have a master."
   echo "      This is #171: the pair whose master self-fenced with NO replica cannot"
-  echo "      satisfy insync_lineage_holder (live_replicas 0, seq_lag none), so the"
+  echo "      satisfy insync_lineage_holder (live_replicas 0, seq_lag unknown), so the"
   echo "      degraded-window gate refuses it forever — while the node is alive and"
   echo "      holds the pair's whole dataset at the top epoch."
   pairs

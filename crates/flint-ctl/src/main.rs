@@ -767,6 +767,22 @@ fn wait_pong(addr: &str, tls: &Option<Arc<flint_tls::ClientConfig>>, budget: Dur
 ///
 /// `replica_last_applied` is `None` when the replica did not answer at all.
 /// That is the whole discrimination: alive-and-behind vs gone.
+/// A FLINTINFO number rendered for a HUMAN to read.
+///
+/// BUG-0095 changed the unknown state of several numeric fields from the word
+/// `none` to `-1`, so they survive `flint-exporter`'s numeric filter and stay
+/// plottable in the state they exist to report. That is right for a dashboard
+/// and wrong for a table a person is reading: `seq_lag -1` looks like a
+/// quantity and invites "minus one what". The sentinel is a wire convention;
+/// this turns it back into the word at the last possible moment.
+///
+/// Only for fields whose real range excludes -1 -- `seq_lag`, `acked_seq`,
+/// `lag_ms`, `disk_free_pct`. NOT `cert_days_remaining`, where -1 is a real
+/// reading.
+fn human_unknown(v: &str) -> &str {
+    if v == "-1" { "none" } else { v }
+}
+
 fn reconverge_failure(
     addr: &str,
     master: &str,
@@ -774,6 +790,8 @@ fn reconverge_failure(
     seq_lag: &str,
     lag_ms: &str,
 ) -> String {
+    let seq_lag = human_unknown(seq_lag);
+    let lag_ms = human_unknown(lag_ms);
     match replica_last_applied {
         Some(la) => format!(
             "{addr} never reconverged behind {master} within 60s (replica is UP at \
@@ -4331,6 +4349,7 @@ fn status(inv: &Inventory) {
             match info_field(addr, &tls, "role:") {
                 Some(role) => {
                     let lag = info_field(addr, &tls, "seq_lag:").unwrap_or_default();
+                    let lag = human_unknown(&lag).to_string();
                     let live = info_field(addr, &tls, "live_replicas:").unwrap_or_default();
                     let epoch = info_field(addr, &tls, "role_epoch:").unwrap_or_default();
                     let reported = info_field(addr, &tls, "build:").unwrap_or_default();
@@ -7598,6 +7617,26 @@ mod ops_0027_tests {
 /// before anyone opened the seat log where the answer was.
 #[cfg(test)]
 mod reconverge_message_tests {
+    use super::human_unknown;
+
+    /// BUG-0095. The sentinel is a WIRE convention, and this is where it stops
+    /// being one. A person reading `flintctl status` sees a table, and
+    /// `seq_lag -1` in a table reads as a quantity.
+    #[test]
+    fn the_wire_sentinel_becomes_a_word_for_a_person() {
+        assert_eq!(human_unknown("-1"), "none");
+        // Everything else passes through untouched -- including values that
+        // merely CONTAIN the sentinel's characters, and the zero that must
+        // never be confused with it.
+        for v in ["0", "1", "-10", "-1.0", "12", "", "none", "-11"] {
+            assert_eq!(
+                human_unknown(v),
+                v,
+                "only the exact sentinel is translated; `{v}` is a reading"
+            );
+        }
+    }
+
     use super::reconverge_failure;
 
     /// The distinction the old message could not make.

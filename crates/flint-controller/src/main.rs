@@ -235,8 +235,9 @@ struct Node {
     live_replicas: u32,
     seq_lag: Option<u64>,
     /// Age of the oldest unacked write, and the soft cap it is measured
-    /// against. Both `None` when no replica is live (FLINTINFO renders
-    /// "none"). See [`Node::converged`] for why the pair is carried.
+    /// against. Both `None` when no replica is live (FLINTINFO renders `-1`
+    /// since BUG-0095, the word "none" before it — either way not a `u64`).
+    /// See [`Node::converged`] for why the pair is carried.
     lag_ms: Option<u64>,
     lag_soft_ms: Option<u64>,
 }
@@ -387,8 +388,10 @@ fn insync_lineage_holder(states: &[Node]) -> Option<&Node> {
 /// full lineage", and to answer yes it needs a live replica: `live_replicas >=
 /// 1 && seq_lag == Some(0)`. That question is UNANSWERABLE for a pair whose
 /// master died or self-fenced and whose partner has not re-attached — FLINTINFO
-/// renders `seq_lag` as the string "none" whenever no live replica is attached,
-/// so BOTH members report `live_replicas 0, seq_lag none` and nothing can
+/// renders `seq_lag` as the unknown sentinel whenever no live replica is
+/// attached (`-1` since BUG-0095, the string "none" before it),
+/// so BOTH members report `live_replicas 0` with an unknown `seq_lag` and
+/// nothing can
 /// satisfy it. The gate then refuses a pair that is sitting there intact, on
 /// every tick, forever. Measured on the 5 TB scale run: two pairs of four
 /// permanently write-dead with every node alive and holding its data.
@@ -465,10 +468,18 @@ fn observe(addr: &str) -> Node {
     };
     node.reachable = true;
     node.socket_alive = true;
-    for line in String::from_utf8_lossy(&raw)
-        .split(['\r', '\n'])
-        .filter(|l| !l.is_empty())
-    {
+    apply_flintinfo(&mut node, &String::from_utf8_lossy(&raw));
+    node
+}
+
+/// Fold a FLINTINFO body into a [`Node`].
+///
+/// Split out of [`observe`] so it can be driven without a socket: what a
+/// controller decides about a pair is a pure function of these lines, and the
+/// one property that matters most -- an UNKNOWN lag must never read as a
+/// converged one -- is otherwise only observable through a live fleet.
+fn apply_flintinfo(node: &mut Node, body: &str) {
+    for line in body.split(['\r', '\n']).filter(|l| !l.is_empty()) {
         let Some((k, v)) = line.split_once(':') else {
             continue;
         };
@@ -479,8 +490,14 @@ fn observe(addr: &str) -> Node {
             // keep reading exactly as it did before.
             "loading" => node.loading = v == "1",
             "live_replicas" => node.live_replicas = v.parse().unwrap_or(0),
-            // All three render the literal "none" with no live replica, so
-            // `parse().ok()` is the whole "unknown" handling.
+            // UNKNOWN IS A PARSE FAILURE, DELIBERATELY. All three render
+            // `-1` with no live replica (BUG-0095 -- the word "none" before
+            // it), and every one of them is a `u64` here, so an unsigned
+            // parse rejects the sentinel and `parse().ok()` remains the whole
+            // "unknown" handling. That is load-bearing rather than lucky:
+            // widening any of these to a signed type would silently turn "no
+            // replica" into a lag of minus one, which `converged` would then
+            // read as better than caught up.
             "seq_lag" => node.seq_lag = v.parse().ok(),
             "lag_ms" => node.lag_ms = v.parse().ok(),
             "lag_soft_ms" => node.lag_soft_ms = v.parse().ok(),
@@ -495,7 +512,6 @@ fn observe(addr: &str) -> Node {
             _ => {}
         }
     }
-    node
 }
 
 /// Read-only knobs shared by every pair this controller drives.
@@ -1901,6 +1917,51 @@ mod tests {
         }
     }
 
+    /// BUG-0095. A master with no live replica renders `seq_lag:-1` and
+    /// `lag_ms:-1` since the sentinel change, and the word "none" before it.
+    /// Both must fold to `None` -- an UNKNOWN lag, never a small one.
+    ///
+    /// The hazard is specific and one type-change away: `Node::seq_lag` and
+    /// `lag_ms` are `u64`, so the unsigned parse is what rejects `-1`. Widen
+    /// either to a signed type and "no replica" becomes a lag of minus one,
+    /// which `converged` reads as BETTER than caught up, and the controller
+    /// promotes a member holding nothing.
+    #[test]
+    fn the_unknown_sentinel_does_not_parse_as_a_lag() {
+        let body = "role:master\r\nloading:0\r\nrole_epoch:(0,3)\r\n\
+                    live_replicas:0\r\nacked_seq:-1\r\nseq_lag:-1\r\n\
+                    lag_ms:-1\r\nlag_soft_ms:500\r\n";
+        let mut n = node("a:1", 0, 9, Some(9));
+        apply_flintinfo(&mut n, body);
+
+        assert_eq!(n.seq_lag, None, "-1 must read as unknown, not as a lag");
+        assert_eq!(n.lag_ms, None, "-1 must read as unknown, not as a lag");
+        assert_eq!(n.live_replicas, 0);
+        assert_eq!(n.epoch, 3, "the rest of the body must still be read");
+        assert!(
+            !n.converged(),
+            "a member with no live replica is not converged; an unknown lag \
+             read as a small one is how a controller promotes a member that \
+             holds nothing"
+        );
+
+        // CONTROL. Every assertion above passes just as well if
+        // `apply_flintinfo` silently did nothing -- the fields start as the
+        // defaults it would leave. Feed a body that IS converged and require
+        // the opposite answer.
+        let mut ok = node("a:1", 0, 0, None);
+        apply_flintinfo(
+            &mut ok,
+            "role:master\r\nlive_replicas:1\r\nseq_lag:0\r\nlag_ms:4\r\nlag_soft_ms:500\r\n",
+        );
+        assert_eq!(ok.seq_lag, Some(0));
+        assert!(
+            ok.converged(),
+            "a caught-up master must still read as converged, or the check \
+             above is just observing a function that never runs"
+        );
+    }
+
     /// #191: the measured fleet state. A master under a continuous writer
     /// sampled seq_lag 82-151 over ten consecutive seconds and never 0, so an
     /// equality gate never fires and everything downstream of "converged"
@@ -1988,7 +2049,7 @@ mod tests {
     }
 
     /// #171: the lineage holder is alive but replica-less, so it reports
-    /// live_replicas 0 / seq_lag none and cannot prove anything about itself.
+    /// live_replicas 0 / seq_lag unknown and cannot prove anything about itself.
     /// The controller watched it hold the lineage; that observation is what
     /// makes promoting it safe.
     #[test]

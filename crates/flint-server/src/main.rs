@@ -4467,6 +4467,33 @@ fn is_pure_write(upper_name: &[u8], args: &[Vec<u8>]) -> bool {
     upper_name == b"SET" && args.len() == 3
 }
 
+/// What a NUMERIC FLINTINFO field renders when its value cannot be known --
+/// BUG-0095.
+///
+/// These fields used to render the word `none`. That is right for a human
+/// reading FLINTINFO and wrong for everything downstream: `flint-exporter`
+/// emits only values that parse as a number, so the series went ABSENT in
+/// exactly the state the field exists to report, and an absent series is "no
+/// data", which most alerting treats as not-firing. The rule that produced
+/// `none` -- never let "I could not look" render as "nothing was wrong" --
+/// was losing its effect one layer out.
+///
+/// `-1` rather than `0`, because zero is a legitimate reading for every field
+/// that uses this and must not read as healthy. It is outside the range of
+/// all of them (`acked_seq`, `seq_lag` and `lag_ms` are unsigned;
+/// `disk_free_pct` is 0-100), so it cannot be mistaken for one -- and it is
+/// the convention `wal_headroom_seq` and `wal_min_acked_seq` already use, so
+/// the same file no longer answers the same question two ways.
+///
+/// NOT for `cert_days_remaining`, whose real range INCLUDES -1: see
+/// `flint_tls::CERT_DAYS_UNKNOWN`.
+///
+/// `rocks`-gated because every field that uses it is: a `mem` build's
+/// FLINTINFO is the three-line stub, which reports no quantity that can be
+/// unknown.
+#[cfg(feature = "rocks")]
+const UNKNOWN_NUMERIC: &str = "-1";
+
 /// BUG-0060's node-level bound on the SUM of concurrent collection reads.
 /// Built once from `--collection-read-budget-pct`; 0 (the default) disables it
 /// and every call below becomes a branch that does nothing.
@@ -5571,10 +5598,11 @@ fn flintinfo(
     // replica still trails. Unlike time-lag (age of the oldest un-acked
     // write, which the RPO cap uses), this stays large while a replica
     // drains a backlog even after writes stop — so it is the correct
-    // promotion-READINESS signal. "none" when no live replica.
+    // promotion-READINESS signal. `UNKNOWN_NUMERIC` when no live replica —
+    // which is not zero, and must not be read as a pair that is caught up.
     let seq_lag = match hub.effective_acked(now) {
         Some(acked) => latest.saturating_sub(acked).to_string(),
-        None => "none".into(),
+        None => UNKNOWN_NUMERIC.into(),
     };
     let (disk_free, disk_total, disk_unknown) = DISK.snapshot();
     // Read the stall pair ONCE. Two reads could straddle a change, and would
@@ -5588,10 +5616,10 @@ fn flintinfo(
         "role:{}\r\nloading:0\r\nrole_epoch:{role_epoch}\r\nbuild:{build}\r\nsst_bytes:{sst}\r\nlatest_seq:{latest}\r\nlast_applied:{last_applied}\r\nacked_seq:{}\r\nseq_lag:{seq_lag}\r\nwal_headroom_seq:{whs}\r\nwal_min_acked_seq:{wma}\r\nwal_headroom_shed_seq:{whl}\r\nwal_bytes_per_seq:{wbps}\r\nwal_archive_mb:{wamb}\r\nwal_archive_src:{wasrc}\r\nlive_replicas:{}\r\nlag_ms:{}\r\nlag_ms_max:{lmx}\r\nlag_max_gap:{lmg}\r\nlag_soft_ms:{soft}\r\nlag_hard_ms:{hard}\r\nmin_replicas_to_write:{minr}\r\nwidowed_grace_ms:{wgm}\r\nwidowed_shed:{wsh}\r\nfullsync_active:{fsa}\r\nfullsync_max:{fsm}\r\nasync_write_queue:{aqd}\r\nwrite_deadline_ms:{wdm}\r\nwrite_inflight:{wif}\r\nwrite_service_us:{wsu}\r\nwrite_cost_us:{wcu}\r\nwrite_wait_est_ms:{wwe}\r\nwrite_wait_peak_ms:{wwp}\r\nwrite_wait_peak_inflight:{wwpi}\r\nwrite_wait_peak_cost_us:{wwps}\r\nwrites_shed_deadline:{wsd}\r\nwrites_shed_lag:{wsl}\r\nwrites_shed_quorum:{wsq}\r\nwrites_shed_widowed:{wswd}\r\nwrites_shed_headroom:{wshr}\r\nwrites_delayed_soft:{wdsf}\r\nwal_fsync_ms:{wfm}\r\nwal_fsync_total:{wft}\r\ncert_days_remaining:{cdr}\r\nactive_conns:{ac}\r\nmax_conns:{mc}\r\nconns_shed_total:{cs}\r\nwrite_stopped:{wst}\r\ndelayed_write_rate:{dwr}\r\nwrite_stall_readable:{wsr}\r\nl0_files:{l0f}\r\npending_compaction_bytes:{pcb}\r\ncompaction_readable:{cr}\r\ndisk_free_bytes:{dfb}\r\ndisk_total_bytes:{dtb}\r\ndisk_free_pct:{dfp}\r\ndisk_verdict:{dv}\r\ndisk_unknown_samples:{dus}\r\nmem_avail_bytes:{mab}\r\nmem_total_bytes:{mtb}\r\nmem_avail_pct:{map}\r\nmem_src:{msrc}\r\nevictable_ns:{ens}\r\nevictable_ns_agree:{ensa}\r\nevictable_ns_bytes:{ensb}\r\nreclaim_active:{rca}\r\nreclaim_target_free_bytes:{rctf}\r\nevict:{evm}\r\ncollection_read_budget_pct:{crbp}\r\ncollection_read_in_flight_bytes:{crif}\r\ncollection_read_mode:{crm}\r\ncollection_read_refused:{crr}\r\ncollection_read_would_refuse:{crwr}\r\ncollection_read_unmeasured:{cru}\r\ngc_swept_expired:{gse}\r\ngc_swept_orphans:{gso}\r\nuptime_ms:{upms}\r\n",
         if read_only { "replica" } else { "master" },
         hub.effective_acked(now)
-            .map_or_else(|| "none".into(), |a| a.to_string()),
+            .map_or_else(|| UNKNOWN_NUMERIC.into(), |a| a.to_string()),
         hub.live_replica_count(now),
         hub.lag_ms(now)
-            .map_or_else(|| "none".into(), |l| l.to_string()),
+            .map_or_else(|| UNKNOWN_NUMERIC.into(), |l| l.to_string()),
         soft = hub.lag_soft_ms(),
         hard = hub.lag_hard_ms(),
         // BUG-0079. The archive budget and HOW it was chosen, so a
@@ -5672,11 +5700,13 @@ fn flintinfo(
         lmg = LAG_MAX_GAP.load(Ordering::Relaxed),
         wfm = WAL_FSYNC_MS.load(Ordering::Relaxed),
         wft = rocks.as_ref().map(|kv| kv.wal_fsync_total()).unwrap_or(0),
+        // NOT `UNKNOWN_NUMERIC`: this field is signed and genuinely negative
+        // once a certificate has expired, so `-1` is a real reading.
         cdr = CERT_PATH
             .get()
             .and_then(|p| p.as_deref())
             .and_then(flint_tls::cert_days_remaining)
-            .map_or_else(|| "none".into(), |d| d.to_string()),
+            .unwrap_or(flint_tls::CERT_DAYS_UNKNOWN),
         ac = ACTIVE_CONNS.load(Ordering::Relaxed),
         mc = MAX_CONNS.load(Ordering::Relaxed),
         cs = CONNS_SHED.load(Ordering::Relaxed),
@@ -5700,10 +5730,14 @@ fn flintinfo(
         cr = u8::from(compaction.is_some()),
         dfb = disk_free,
         dtb = disk_total,
+        // `checked_div` is None when disk_total is 0, which is what the guard
+        // reports when it cannot read the filesystem at all -- the state
+        // `disk_unknown_samples` counts, and the one an operator most needs
+        // to see. Rendering it as a number keeps it in the metrics.
         dfp = disk_free
             .saturating_mul(100)
             .checked_div(disk_total)
-            .map_or_else(|| "none".into(), |p| p.to_string()),
+            .map_or_else(|| UNKNOWN_NUMERIC.into(), |p| p.to_string()),
         dv = match DISK.current() {
             diskguard::Verdict::Ok => "ok",
             diskguard::Verdict::Shed => "shed",

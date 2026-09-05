@@ -145,6 +145,30 @@ PS=$(valkey-cli -p 7413 PROXYSTATS 2>/dev/null | tr -d '\r')
 echo "$PS" | grep -q "^build:$WANT$" || { echo "FAIL: PROXYSTATS build: is not $WANT"; echo "$PS" | head -3; exit 1; }
 echo "  build:$WANT"
 
+# BUG-0095, and it lives HERE rather than in flintinfo_numeric_drill.sh
+# because it needs a proxy and a control plane standing up and this drill
+# already has both. Same defect, two more surfaces: `cert_days_remaining` used
+# to render the word `none` when no certificate was readable, and
+# flint-exporter emits only values that parse as a number -- so the series was
+# present while a cert was readable and ABSENT when it was not, which is the
+# state the field exists to report.
+echo "== PROXYSTATS and CPINFO render cert_days_remaining as a NUMBER"
+cdr_is_numeric() {   # $1 = surface name, $2 = body
+  local cdr
+  cdr=$(sed -n 's/^cert_days_remaining://p' <<< "$2")
+  [ -n "$cdr" ] || { echo "FAIL: $1 has no cert_days_remaining: line"; exit 1; }
+  case "$cdr" in
+    -[0-9]*|[0-9]*) ;;
+    *) echo "FAIL: $1 cert_days_remaining=[$cdr] is not a number, so it is not"
+       echo "      a Prometheus series at all -- flint-exporter emits only"
+       echo "      values that parse. Render flint_tls::CERT_DAYS_UNKNOWN"
+       echo "      instead of a word (BUG-0095)."; exit 1 ;;
+  esac
+  echo "  $1 cert_days_remaining:$cdr"
+}
+cdr_is_numeric PROXYSTATS "$PS"
+cdr_is_numeric CPINFO "$CPI"
+
 echo "== the controller registers itself (it has no listener to ask)"
 FOUND=""
 for _ in $(seq 1 40); do

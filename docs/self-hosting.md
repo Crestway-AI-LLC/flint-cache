@@ -181,9 +181,9 @@ full working set, use TTLs so space returns on its own, and alert on
 `disk_free_pct` in `FLINTINFO` well before the guard fires. (`disk_verdict`
 renders `ok`/`shed`, and `flint-exporter` emits only NUMERIC fields, so it is
 readable over `FLINTINFO` but is never a Prometheus series — alert on
-`flint_disk_free_pct` instead, and pair it with `flint_disk_unknown_samples`,
-because `disk_free_pct` ITSELF renders `none` when the filesystem cannot be
-read, and its series therefore goes absent in exactly that case. BUG-0095.) The guard's flips are also fleet
+`flint_disk_free_pct` instead. It reads **`-1`** when the filesystem cannot be
+read at all, which is a state to alert on rather than a percentage; a `< 10`
+alert catches it, and `disk_unknown_samples` says how often it has happened.) The guard's flips are also fleet
 journal events (`DiskShed`/`DiskResumed`), so tooling can trigger on the
 edge instead of polling; if you run your own space-reclaim daemon, rank
 candidates with `FLINTKEYSIZE`/`FLINTKEYSTAMP` (see command-support.md)
@@ -583,6 +583,21 @@ flint-exporter --port 9100 \
 It emits `flint_up{instance,role}` / `flint_proxy_up{instance}` plus every
 numeric `FLINTINFO`/`PROXYSTATS` field as a gauge
 (`flint_lag_ms`, `flint_wal_fsync_ms`, `flint_proxy_cache_hits_total`, …).
+
+**Numeric is the whole filter, so a field that cannot be known still renders a
+number** (BUG-0095): `acked_seq`, `seq_lag` and `lag_ms` read **`-1`** when no
+replica is live, and `cert_days_remaining` reads **`-99999`** when no
+certificate is readable — a different sentinel because that field is genuinely
+negative once a certificate has expired. `-1` rather than `0` because zero is a
+real reading for every one of them, and a number rather than a word because a
+field that renders a word is not a series at all: it goes *absent*, and absent
+is "no data", which most alerting treats as not-firing. So write the obvious
+alert (`flint_lag_ms > 5000`, `flint_cert_days_remaining < 14`) and the unknown
+states trip it. The string-valued fields — `role`, `build`, `role_epoch`,
+`wal_archive_src`, `disk_verdict`, `mem_src`, `evictable_ns`,
+`evictable_ns_bytes`, `evict`, `collection_read_mode` — are `FLINTINFO`-only by
+nature; none of them is a quantity. `flintctl status` still prints the word
+`none` where it prints a sentinel's field, because a table is read by a person.
 Point Prometheus at it, and Grafana at Prometheus:
 
 ```yaml

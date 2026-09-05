@@ -1,10 +1,11 @@
-# BUG-0095: a field that reads `none` vanishes from Prometheus exactly when it matters (OPEN)
+# BUG-0095: a field that reads `none` vanishes from Prometheus exactly when it matters (FIXED)
 
-Status: **OPEN** (found 2026-09-05) · Severity: **medium** — no data is lost and
-no node misbehaves, but five monitored signals go absent from the metrics
-pipeline in precisely the state an operator built the alert for, and an absent
-series renders as "no data", which most alert configurations treat as
-not-firing.
+Status: **FIXED 2026-09-05** (found the same day) · Severity: **medium** — no
+data was lost and no node misbehaved, but five monitored signals went absent
+from the metrics pipeline in precisely the state an operator built the alert
+for, and an absent series renders as "no data", which most alert
+configurations treat as not-firing. Jeff's call on the fix: candidate 1, the
+sentinel.
 
 ## Symptom
 
@@ -79,10 +80,65 @@ the metrics pipeline.
 (1) is the recommendation: it is the answer this codebase already chose once,
 it needs no new concept, and (3) is worth doing regardless of which is picked.
 
-## Why this is filed rather than fixed
+## ~~Why this is filed rather than fixed~~ — decided, and fixed
 
-Which of the three is right is a decision about the FLINTINFO contract, not an
-inference from the defect. Recorded so the choice is one somebody made.
+Candidate 1. `-1` for the four unsigned fields, matching `wal_headroom_seq`,
+plus candidate 3's documentation regardless.
+
+**`cert_days_remaining` could not take `-1`, and that is the one place the
+decision could not be applied literally.** Its real range INCLUDES -1: it is
+`Option<i64>` and the function's own doc says "Negative once expired", so `-1`
+means *expired between one and two days ago*. Using it would have replaced a
+silence with a false statement, which is a worse version of the defect rather
+than a fix for it. That field renders `flint_tls::CERT_DAYS_UNKNOWN`
+(`-99999` — 273 years, outside any certificate) and keeps the property that
+matters: an alert written the obvious way, `< 14`, still fires on it.
+
+**The proxy and the control plane render `cert_days_remaining` too**, in
+`PROXYSTATS`, `CPINFO` and the HA `CPINFO` — three more copies of the same
+`none`, found while walking consumers rather than named in the original
+report. All four now share the one constant.
+
+**The blast radius held, and it is now load-bearing rather than lucky.** Every
+consumer parses these into `Option<u64>` via `parse().ok()` —
+`flint-controller`, `flint-chaos`, `flint-ctl` — so `-1` fails an unsigned
+parse and still reads as unknown, exactly as `none` did. That is one type
+change away from silently becoming a lag of minus one, which
+`Node::converged` would read as BETTER than caught up, so
+`the_unknown_sentinel_does_not_parse_as_a_lag` pins it: the parse loop was
+split out of `observe` into `apply_flintinfo` for the purpose, and the test
+carries a positive control that a caught-up body still reads as converged.
+
+**One readability regression, fixed rather than accepted.** `flintctl status`
+prints `seq_lag` in a table a person reads, and `seq_lag -1` looks like a
+quantity. `human_unknown` turns the sentinel back into the word at the last
+moment — the sentinel is a wire convention, and the CLI is not the wire.
+
+## The guard
+
+`tools/flintinfo_numeric_drill.sh`. **A node in its DEFAULT state is the worst
+case**, which is why it costs one seat and no fleet: standalone, no replica,
+no TLS. That single configuration exercises four of the five, and it is the
+configuration all four were already broken in — the defect was reachable by
+starting a node and looking.
+
+It asserts three things, and the second is what makes it more than a
+spell-check:
+
+1. Every field is a number, unless its key is in a declared `STRINGS` list.
+2. **Every key in `STRINGS` is present.** A check of the form "numeric unless
+   exempt" is only as good as its exemptions, and a stale one silently
+   re-permits the whole class.
+3. The unknown states render the SENTINEL, not a healthy-looking zero — plus a
+   positive control that `disk_free_pct`, whose unknown state is not reachable
+   on this host, carries a real 0-100 reading, so a build that rendered `-1`
+   everywhere fails.
+
+Verified by mutation, twice. Reverting `lag_ms` to `"none"` fails check 1
+naming the field. Reverting it to `"0"` — numeric, and therefore invisible to
+check 1 — fails check 3, which is why check 3 exists. The proxy and control
+plane are covered from `build_stamp_drill.sh`, which already stands both seats
+up.
 
 ## How it was found
 

@@ -23,7 +23,10 @@ quickstart and wrong for anything else. Turn it on.
 
 `cert_days_remaining` is exported by `flint-exporter` and surfaced in the info
 commands, so expiry is a metric you can alert on rather than an outage you
-discover.
+discover. It counts down, goes negative once expired, and reads `-99999` when
+there is no readable certificate at all — a number rather than a word, so that
+last state trips the same `< 14` alert as the first two instead of dropping out
+of Prometheus (BUG-0095).
 
 ## Credentials at rest
 

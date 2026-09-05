@@ -733,11 +733,42 @@ pub fn connect_reloadable(
     connect(addr, &snap)
 }
 
+/// What `cert_days_remaining` RENDERS on a status surface when there is no
+/// readable certificate — BUG-0095.
+///
+/// Every component used to print the word `none` there. That is right for a
+/// human reading FLINTINFO and wrong for everything downstream:
+/// `flint-exporter` emits only values that parse as a number, so
+/// `flint_cert_days_remaining` went ABSENT in the state it exists to report,
+/// and an absent series is "no data", which most alerting treats as
+/// not-firing.
+///
+/// NOT `-1`, which is the sentinel the unsigned fields use. This one is
+/// SIGNED and genuinely negative once expired, so `-1` is a real reading —
+/// "expired between one and two days ago" — and using it would replace a
+/// silence with a false statement. `-99999` is 273 years, outside any real
+/// certificate, and still far below every "renew now" threshold, so an alert
+/// written as `< 14` fires on it exactly as it should.
+pub const CERT_DAYS_UNKNOWN: i64 = -99_999;
+
+/// Enforced at COMPILE time, not in a test: the one way to get this wrong is
+/// to edit the constant to something a real certificate can reach, and a
+/// build that cannot happen beats a test that has to be run.
+const _: () = assert!(
+    CERT_DAYS_UNKNOWN < -36_500,
+    "CERT_DAYS_UNKNOWN must be further from zero than any certificate can \
+     expire by. A sentinel within a century of zero collides with a real \
+     reading -- `-1` in particular means `expired yesterday`."
+);
+
 /// Days until the leaf certificate at `path` expires — the cert-hygiene
 /// signal (ADR-0006 D4 pairs with this: the metric tells you WHEN to
 /// `flintctl rotate-certs`). Negative once expired; None if the file is
 /// unreadable or unparseable. Each component computes this for its OWN leaf
 /// and reports it through the introspection command it already answers.
+///
+/// Status surfaces render the `None` as [`CERT_DAYS_UNKNOWN`], never as a
+/// word: see that constant for why it is not `-1`.
 pub fn cert_days_remaining(path: &str) -> Option<i64> {
     let pem = std::fs::read(path).ok()?;
     // First certificate in the file is the leaf.
@@ -785,6 +816,34 @@ fn cert_eku_from_pem(pem: &[u8]) -> Option<CertEku> {
         server_auth: ext.value.server_auth,
         client_auth: ext.value.client_auth,
     })
+}
+
+#[cfg(test)]
+mod cert_days_unknown {
+    use super::CERT_DAYS_UNKNOWN;
+
+    /// BUG-0095. The whole point of this constant is that it cannot be
+    /// mistaken for a reading, and the mistake it exists to avoid is using
+    /// `-1` — which the unsigned FLINTINFO fields DO use, because none of
+    /// them can be negative. This one can: a certificate that expired
+    /// yesterday reports `-1` legitimately.
+    ///
+    /// The distance from zero is asserted at compile time beside the constant.
+    /// This is the other half: that being far from zero has not made it
+    /// USELESS to the alert it exists to trip.
+    #[test]
+    fn the_sentinel_still_fires_an_ordinary_renewal_alert() {
+        // An alert written the obvious way, rather than one written specially
+        // for the sentinel -- needing a special one is the failure this fix
+        // exists to avoid.
+        for renew_threshold in [7i64, 14, 30, 90] {
+            assert!(
+                CERT_DAYS_UNKNOWN < renew_threshold,
+                "an unreadable certificate must trip a `< {renew_threshold}` \
+                 alert -- being loud is the whole reason this is a number"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

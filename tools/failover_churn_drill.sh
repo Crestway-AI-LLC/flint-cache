@@ -252,7 +252,7 @@ for i in $(seq 1 "$ITERS"); do
   # ORDER MATTERS AND IS COPIED, NOT CHOSEN. Attached::kill waits for the
   # promotion INSIDE kill(), and flint-chaos only restarts the dead seat once
   # that returns — so the window under test has the killed seat still DOWN and
-  # the survivor alone, reporting live_replicas 0 and seq_lag none. Restarting
+  # the survivor alone, reporting live_replicas 0 and seq_lag unknown. Restarting
   # first is not merely different: restart-node refuses to re-attach a node as
   # a replica of itself while its pair has no new master.
   $CTL -f "$INV" kill-node "$M" >/dev/null 2>&1 \

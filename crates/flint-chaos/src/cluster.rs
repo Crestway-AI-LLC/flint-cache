@@ -278,8 +278,10 @@ impl Attached {
     /// controller was right and the harness was wrong.
     ///
     /// The controller's predicate is replica-side, so this one has to be too.
-    /// A member reporting `acked_seq:none` holds nothing, however the master
-    /// scores its lag, and `fullsync_active` on the master says a re-seed is
+    /// A member reporting no acked sequence at all holds nothing, however the
+    /// master scores its lag (`acked_seq:-1` since BUG-0095, `none` before
+    /// it -- either way not a `u64`, so the parse below rejects it), and
+    /// `fullsync_active` on the master says a re-seed is
     /// in flight even when the ack counter has started moving.
     fn replica_holds_the_lineage(
         &self,
@@ -312,7 +314,7 @@ impl Attached {
         // a live pair, both sides answer:
         //
         //   master   role:master  latest_seq:5   last_applied:0  acked_seq:5     seq_lag:0
-        //   replica  role:replica latest_seq:10  last_applied:5  acked_seq:none  seq_lag:none
+        //   replica  role:replica latest_seq:10  last_applied:5  acked_seq:-1    seq_lag:-1
         //
         // `acked_seq`, `seq_lag` and `live_replicas` are MASTER-side metrics —
         // a replica reports none/0 for them however healthy it is — so that

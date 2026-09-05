@@ -1042,7 +1042,10 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
             let cdr = arg("--internal-cert")
                 .as_deref()
                 .and_then(flint_tls::cert_days_remaining)
-                .map_or_else(|| "none".into(), |d: i64| d.to_string());
+                // BUG-0095: a number, not the word `none`. The exporter emits
+                // only values that parse, so this series used to be present
+                // while a certificate was readable and absent when it was not.
+                .unwrap_or(flint_tls::CERT_DAYS_UNKNOWN);
             // `version:` was NEVER a software version — it is the registry
             // generation counter that drives CPWATCH, sitting in an
             // operator-visible response right next to cert_days_remaining
