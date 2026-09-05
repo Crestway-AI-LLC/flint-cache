@@ -1063,6 +1063,36 @@ masquerade as a working one. On macOS it prints `SKIP:` and exits 0, which
 `FLINT_GATE_STRICT=1` promotes to a failure; the gate sets STRICT and runs on
 Linux, so it must never reach that line.
 
+### The adoption gap, and a proposal for it (2026-09-05)
+
+The mechanism is built, the multiplier is measured across all three collection
+types, the fraction is ratified at 25%, and the metrics are exported. It is
+still **off**, and the defect this file is named for is therefore still live in
+every shipped configuration — nothing bounds the sum on a default node.
+
+What stands between here and an operator turning it on is not confidence in the
+bound. It is that **nobody can find out what it would refuse without refusing
+it.** The only way to learn the impact on a real workload today is to enable
+enforcement in production and watch what breaks, which is the one experiment
+nobody runs willingly on a read path.
+
+**Proposal: an observe-only mode.** `--collection-read-observe-only` alongside
+the existing percentage: admission computes the decision exactly as it does
+now, increments a `collection_read_would_refuse` counter, and then **admits
+anyway**. An operator sets the fraction, watches the counter for a week against
+real traffic, and enables enforcement knowing the number rather than guessing
+it.
+
+Small: the decision already exists as an `Admit` value with its terms attached,
+so this is one flag, one counter, and one branch that drops the refusal on the
+floor. Strictly less invasive than what already shipped — it cannot refuse
+anything.
+
+Worth stating why it is proposed rather than built: it is a new user-facing
+flag, and the opt-in-and-off shape of this feature was a decision rather than
+an inference. Recorded here so the reason the bound stays off is a decision
+somebody made, not a step nobody got to.
+
 ### Still open
 
 - ~~The multiplier was measured on hashes only.~~ **CLOSED 2026-09-05: measured

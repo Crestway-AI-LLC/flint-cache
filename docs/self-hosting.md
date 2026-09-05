@@ -603,6 +603,19 @@ Alert on: `seq_lag` climbing without draining, `live_replicas` dropping
 below your `min-replicas`, `cert_days_remaining` under ~14, and sustained
 `write_stopped`.
 
+**And on two fields that report a check NOT HAPPENING**, which is the failure
+mode a dashboard of healthy-looking gauges hides:
+
+| field | alert when | what it means |
+|---|---|---|
+| `disk_unknown_samples` | climbing | the disk guard cannot read the filesystem, so it will NOT shed — the node is flying blind rather than healthy (3b) |
+| `collection_read_unmeasured` | climbing, if you set `--collection-read-budget-pct` | node memory could not be read, so reads were admitted with no budget checked. The bound is not in force while this moves (3d) |
+
+Both are zero on a healthy node and neither has a threshold to tune: any
+sustained increase is the thing itself. They exist because "I could not look"
+and "there is nothing wrong" produce identical-looking dashboards, and the
+second is the one you would act on.
+
 ## 3b. Disk headroom
 
 Per-tenant quotas bound each namespace. **Nothing bounds the host**, and
