@@ -296,3 +296,52 @@ restored to serial levels at 57% of serial's added cost**, and crossings become
 rarer rather than impossible. Whether that is worth 7 minutes a push is the
 decision; it is no longer a choice between 2.8x and nothing.
 
+## 2026-09-04 — two more firings, a second drill, and the factors finally split
+
+The packed peak was added so that `est_ms`'s two terms could name the resource
+being contended, with the note that *"the resource being contended is still
+unknown and these two numbers are what would name it."* Four firings now carry
+them, and they name two different things.
+
+| run | drill | inflight | service | est | errors / replies |
+|---|---|---|---|---|---|
+| `33829746490` | `failover` | **244** | 8 206 µs | 2002 ms | 2 / 20 000 |
+| `33829746490` | `failover` | **218** | 9 216 µs | 2009 ms | 2 / 20 000 |
+| `33930982465` | `restart` | 65 | **30 942 µs** | 2011 ms | 1 / 101 000 |
+| `33899834240` | `restart` | 30 | **67 038 µs** | 2011 ms | 1 / 101 000 |
+
+### Two regimes, not one
+
+`failover` crosses on **depth**: ~230 writes in flight against a service time of
+8–9 ms, which is a healthy seat being offered more than it can take.
+
+`restart` crosses on **slowness**: 30–65 in flight against 31–67 ms per write,
+four to eight times the service time `failover` sees. That is not offered load;
+that is the seat itself having got slow.
+
+The product is the same to within 9 ms in all four — because 2 000 ms is where
+the refusal happens, so every recorded sample is pinned just above it by
+construction. **What varies eightfold is which factor got it there.**
+
+That matters for the fix. A single number cannot be right for both: raising the
+deadline buys `failover` headroom it does not need (its writes are fast, there
+are simply many) and papers over `restart`'s seat being an order of magnitude
+slower than the other drill's. And `restart` is the more alarming of the two —
+101 000 replies at 67 ms of service each is a throughput the drill is not
+supposed to be able to provoke.
+
+### This is not a `failover` bug
+
+Filed as one, and it is not. **Two drills, two regimes, one shipped default.**
+The title should be read as being about `DEFAULT_WRITE_DEADLINE_MS`, which is
+what every deployment runs unless an operator overrides it, and the drills are
+just where it shows.
+
+### Still not established
+
+Which resource `restart` is contending for. The 2026-09-03 measurement found
+four-way parallelism raises the peak 8.6x without touching memory; these two
+rows say that at least one of the paths gets there through service time rather
+than depth, which narrows it and does not close it. The p99 curve the code
+comment asks for still does not exist, and it is the thing that would let the
+default be chosen from data instead of argument.
