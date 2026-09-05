@@ -1,11 +1,11 @@
-# BUG-0093 — the WAL archive's size budget is only enforced every 10 minutes, and the TTL is what sets that
+# BUG-0093 — the WAL archive's size budget is only enforced every 10 minutes, and the TTL is what sets that (ACCOMMODATED 2026-09-05: volumes are sized for the overshoot)
 
 **Found** 2026-09-04 while building a drill for the roadmap's replacement Phase 1
 gate condition ("a replica absent for T seconds rejoins without a full sync").
 The drill's positive control would not fire: writing 16x the archive budget past
 an absent replica still let it rejoin incrementally.
 
-Status: OPEN · Severity: medium — nothing is lost or corrupted, and the bound
+Status: ACCOMMODATED 2026-09-05 (sizing rule adopted; the RocksDB behaviour is unchanged and unchangeable from here) · Severity: medium — nothing is lost or corrupted, and the bound
 does hold on a long enough horizon. What is wrong is that a budget documented as
 continuous is evaluated on a timer, and the disk-headroom reasoning built on it
 assumes the former.
@@ -86,12 +86,42 @@ minutes.
   for ten minutes of ingest it is invisible. The defect is that nobody sized
   that headroom knowing the budget was sampled rather than enforced.
 
-## What to do about it
+## What to do about it — DECIDED 2026-09-05: size the volume
 
-Not obvious, and deliberately not decided here. `WAL_ttl_seconds` cannot be
-lowered to tighten the cadence without also shortening the time window it
-exists to provide — one knob, two effects. The options are to size the volume
-for `budget + 600 s x peak ingest` and say so, to give the disk guard a term
-for archive growth specifically, or to accept it and document the overshoot.
-The first is the cheapest and is a documentation change to `docs/self-hosting.md`
-plus the constant's own comment, which currently tells a reader the opposite.
+Jeff's call: size the volume for `budget + 600 s x peak ingest` and document it.
+The alternatives were a disk-guard term for archive growth specifically, or
+accepting the overshoot silently. Lowering `WAL_ttl_seconds` to tighten the
+cadence was never available — the same knob sets the retention window, so
+buying a tighter bound would have cost the thing the bound protects.
+
+**The number: 112 GiB**, at the 200 MB/s reference `rocks.rs` already reasons
+with. That is `600 s x 200 MB/s`, and it clears the highest rate ever measured
+here (142.2 MB/s, ADR-0026, one seat at 138k ops/s = 80 GiB) by 40%. Deployments
+that have measured their own rate should use it; the term scales linearly and
+all but vanishes on a quiet fleet — the playground's soak, at about 1 MB/s,
+needs 0.6 GiB.
+
+The budget is `clamp(volume / 4, 1 GiB, 256 GiB)`, so the rule resolves to:
+
+| volume | reserve |
+|---|---|
+| under 1 TiB | `volume >= 1.34 x (data + 600s x rate)` |
+| 1 TiB or more | `volume >= data + 256 GiB + 600s x rate` |
+
+Worked: a 931 GiB disk at 200 MB/s reserves ~345 GiB (233 GiB budget + 112 GiB
+overshoot) and leaves ~587 GiB for data. At 1 MB/s the same disk reserves 233
+GiB and change.
+
+**Operators should measure rather than take 200 MB/s.** The rates above are
+*logical*; what fills the archive is WAL bytes. `latest_seq` sampled twice N
+seconds apart, times `wal_bytes_per_seq`, gives the right number directly and
+already includes per-record overhead — which is where a logical rate understates
+most, on small values.
+
+Written up in `docs/self-hosting.md` 3b, and the three retention comments in
+`rocks.rs` that asserted continuous enforcement are corrected.
+
+**The failure mode if under-reserved is a shed, not a loss.** The archive grows
+into the disk guard's threshold and ordinary writes return `-QUOTA` until a
+purge reclaims. That is the designed behaviour; what makes it worth sizing for
+is that it is a write outage on a node that looked like it had headroom.

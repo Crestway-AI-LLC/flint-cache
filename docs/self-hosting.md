@@ -640,6 +640,59 @@ Known gap: this gates client writes. A **replica** applying its master's
 WAL keeps writing regardless, so a replica can still fill. Size replicas
 with the same headroom as their master.
 
+### Reserve for the WAL archive separately — it is a sampled ceiling
+
+The thresholds above protect the volume once it is nearly full. Sizing it in
+the first place needs one term that is easy to miss.
+
+Each node keeps an archive of WAL segments so a replica that was briefly away
+can resume without a full re-sync. Its budget is derived from the volume —
+**a quarter of it, floored at 1 GiB and capped at 256 GiB** — and reported as
+`wal_archive_mb` in `FLINTINFO`.
+
+**That budget is enforced on a timer, not continuously.** RocksDB throttles the
+purge pass to `min(600s, wal-ttl-seconds / 2)`, and at the shipped 12 h TTL that
+is once every ten minutes. Between passes nothing is deleted, so the archive on
+disk reaches:
+
+    peak archive  =  budget  +  600s x peak WAL write rate
+
+Size the volume for that peak, not for the budget:
+
+| your peak WAL write rate | add for the 600 s window |
+|---|---|
+| 1 MB/s (a quiet fleet) | 0.6 GiB |
+| 38 MB/s | 21 GiB |
+| 89 MB/s | 50 GiB |
+| 142 MB/s (highest measured here) | 80 GiB |
+| **200 MB/s (use this if you have not measured)** | **112 GiB** |
+
+So a volume must hold `data + budget + 600s x rate`. Since the budget is a
+quarter of the volume until it caps at 256 GiB, that resolves to:
+
+- **volume under 1 TiB:** `volume >= 1.34 x (data + 600s x rate)`
+- **volume 1 TiB or larger:** `volume >= data + 256 GiB + 600s x rate`
+
+A 931 GiB disk at 200 MB/s therefore reserves ~345 GiB — 233 GiB of budget plus
+112 GiB of overshoot — leaving ~587 GiB for data. On a quiet fleet the second
+term all but vanishes: the same disk at 1 MB/s reserves 233 GiB and change.
+
+**Measure your own rate rather than taking 200 MB/s.** The figures above are
+*logical* write rates; what fills the archive is WAL bytes. Read both from
+`FLINTINFO`: sample `latest_seq` twice, `N` seconds apart, and multiply the
+difference by `wal_bytes_per_seq`. That is the number this formula wants, and
+it already includes per-record overhead, which matters most for small values.
+
+**If you under-reserve, the node sheds — it does not corrupt.** The archive
+grows into the disk-guard threshold above and ordinary writes start coming back
+`-QUOTA` until a purge pass reclaims the space. That is the designed failure,
+but it is a write outage on a node that looks like it had headroom, which is
+why the term belongs in the sizing rather than in the incident.
+
+Lowering `--wal-ttl-seconds` tightens the purge cadence, and that is a trap
+worth naming: it also shortens the retention window the TTL exists to provide,
+because the same knob sets both. Size the volume instead.
+
 ## 3c. Evictable namespaces — opting a namespace OUT of durability
 
 Everything in 3b describes a node that refuses writes rather than lose any.

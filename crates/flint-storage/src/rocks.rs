@@ -343,10 +343,23 @@ fn table_options() -> BlockBasedOptions {
 /// shed gate from the size budget, so a master that outruns its replica
 /// meets backpressure rather than deleting the segment out from under it
 /// (BUG-0079).
+///
+/// THIS VALUE ALSO SETS HOW OFTEN EITHER BOUND IS APPLIED, which is not
+/// obvious and cost a day (BUG-0093). RocksDB throttles the purge pass to
+/// `min(kDefaultIntervalToDeleteObsoleteWAL = 600s, ttl/2)`, so at 12 h the
+/// archive is examined once every ten minutes and grows unbounded between
+/// passes. Lowering this to tighten that cadence would also shorten the
+/// window it exists to provide -- one knob, two effects -- which is why the
+/// answer was to size the volume for the overshoot instead. See
+/// `docs/self-hosting.md` 3b.
 pub const DEFAULT_WAL_TTL_SECONDS: u64 = 43_200; // 12 h, was 6 h, was 1 h
-/// Companion byte budget. RocksDB applies whichever bound trips first, so
-/// raising only the TTL would have left the 1 GiB limit doing the pruning —
-/// which is the term that actually fired in the incident.
+/// Companion byte budget. RocksDB applies whichever bound trips first WHEN A
+/// PURGE PASS RUNS, and the pass is throttled by the TTL above (BUG-0093) --
+/// so this is a ceiling sampled every 600 s, not one the archive is held at.
+/// Raising only the TTL would still have left the 1 GiB limit doing the
+/// pruning, which is the term that actually fired in the incident; what the
+/// original wording missed is that between passes NEITHER term prunes, and
+/// the archive can reach `this + 600s x ingest` before anything is deleted.
 pub const DEFAULT_WAL_SIZE_LIMIT_MB: u64 = 8_192; // 8 GiB, was 1 GiB
 
 /// The archive budget for a volume of `total_bytes`, in MB.
@@ -355,6 +368,11 @@ pub const DEFAULT_WAL_SIZE_LIMIT_MB: u64 = 8_192; // 8 GiB, was 1 GiB
 /// forty-one seconds of WAL at 200 MB/s, so on any ingest-heavy fleet the
 /// byte term prunes long before the 12 h TTL and does it without consulting
 /// a replica. The same constant is also absurdly large on a 20 GB dev box.
+///
+/// What this returns is the budget, NOT the peak size on disk. The archive is
+/// pruned back to it every 600 s and grows freely in between, so a volume must
+/// hold `this + 600s x peak ingest` -- 112 GiB of headroom at 200 MB/s
+/// (BUG-0093, and `docs/self-hosting.md` 3b for the sizing rule).
 ///
 /// Two bounds, and the smaller wins.
 ///
