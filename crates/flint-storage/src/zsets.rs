@@ -229,8 +229,14 @@ impl<'a> ZSetStore<'a> {
     /// The collection's accounted size (`ComplexMeta.bytes`), from ONE cheap
     /// metadata read and without materialising anything. This is the quantity
     /// BUG-0060's admission divides by, so it must stay the SAME number the
-    /// `max-value-bytes` accounting maintains -- `field.len() + value.len()`
-    /// summed, not the payload alone. `None` when the key does not exist.
+    /// `max-value-bytes` accounting maintains.
+    ///
+    /// For a ZSET that is `member_cost` summed -- each member's length PLUS 8
+    /// for its score -- not `field.len() + value.len()`, which is the HASH
+    /// accounting and was copied into this comment by hand. The eight bytes
+    /// matter at scale: a zset of a million short members carries 8 MB of
+    /// score that a member-lengths-only reading would not see. `None` when the
+    /// key does not exist.
     pub fn stored_bytes(&self, slot: u16, key: &[u8]) -> Result<Option<u64>, StoreError> {
         Ok(self.read_meta(slot, key)?.map(|m| m.bytes))
     }
@@ -648,6 +654,31 @@ mod tests {
 
     fn now() -> u64 {
         1_000_000
+    }
+
+    #[test]
+    fn stored_bytes_counts_the_score_with_each_member() {
+        // Pins the DENOMINATOR, and specifically the eight bytes of score.
+        // Reading a zset's size as members-only would understate it by 8 per
+        // member -- 8 MB on a million short members -- and admission divides
+        // by this number, so the bound would be that much too generous.
+        let kv = MemKv::new();
+        let zs = ZSetStore::new(&kv, b"t", now);
+        let pairs: Vec<(f64, Vec<u8>)> = (0..40)
+            .map(|i| (i as f64, vec![b'm'; 25]))
+            .enumerate()
+            .map(|(n, (sc, mut m))| {
+                m[0] = b'a' + (n % 26) as u8;
+                m[1] = b'a' + (n / 26) as u8;
+                (sc, m)
+            })
+            .collect();
+        assert_eq!(zs.zadd(1, b"z", &pairs), Ok(40));
+        assert_eq!(
+            zs.stored_bytes(1, b"z"),
+            Ok(Some(40 * (25 + 8))),
+            "a zset's accounted size is member_cost summed: length PLUS 8 for the score"
+        );
     }
 
     #[test]

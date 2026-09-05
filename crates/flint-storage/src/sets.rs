@@ -165,8 +165,16 @@ impl<'a> SetStore<'a> {
     /// The collection's accounted size (`ComplexMeta.bytes`), from ONE cheap
     /// metadata read and without materialising anything. This is the quantity
     /// BUG-0060's admission divides by, so it must stay the SAME number the
-    /// `max-value-bytes` accounting maintains -- `field.len() + value.len()`
-    /// summed, not the payload alone. `None` when the key does not exist.
+    /// `max-value-bytes` accounting maintains.
+    ///
+    /// For a SET that is the members' lengths summed, and nothing else: a set
+    /// stores its members AS KEYS with empty values, so there is no value half
+    /// to count. (An earlier version of this comment said
+    /// `field.len() + value.len()`, which is the HASH accounting, copied here
+    /// by hand. The number was never wrong; the description of it was, and a
+    /// wrong description of the denominator is how BUG-0060's multiplier came
+    /// to be understated in the first place.) `None` when the key does not
+    /// exist.
     pub fn stored_bytes(&self, slot: u16, key: &[u8]) -> Result<Option<u64>, StoreError> {
         Ok(self.read_meta(slot, key)?.map(|m| m.bytes))
     }
@@ -303,6 +311,33 @@ mod tests {
 
     fn now() -> u64 {
         1_000_000
+    }
+
+    #[test]
+    fn stored_bytes_is_members_only_and_admission_divides_by_it() {
+        // Pins the DENOMINATOR. BUG-0060's multiplier is a ratio, so a wrong
+        // denominator is a wrong bound even with a perfectly measured peak --
+        // which is how 2.72x and 2.21x were both wrong for that bug. A set
+        // stores members as keys with empty values, so there is no value half.
+        let kv = MemKv::new();
+        let st = SetStore::new(&kv, b"t", now);
+        // Distinct members: a set DEDUPLICATES, so a repeating pattern here
+        // would silently store fewer than it looks like and the assertion
+        // below would be measuring a smaller set than intended.
+        let members: Vec<Vec<u8>> = (0..50u8)
+            .map(|i| {
+                let mut m = vec![b'x'; 100];
+                m[0] = b'a' + i / 26;
+                m[1] = b'a' + i % 26;
+                m
+            })
+            .collect();
+        assert_eq!(st.sadd(1, b"s", &members), Ok(50));
+        assert_eq!(
+            st.stored_bytes(1, b"s"),
+            Ok(Some(50 * 100)),
+            "a set's accounted size is its members' lengths summed, nothing else"
+        );
     }
 
     fn ms(v: &[&[u8]]) -> Vec<Vec<u8>> {
