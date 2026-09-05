@@ -1516,6 +1516,41 @@ assert_gate_is_executable() {
   FAILED="$FAILED gate-not-executable"
 }
 
+assert_license_headers_are_this_repos() {
+  # This repo is Elastic-2.0 and says so per file. The SIBLING ops repo is
+  # private and reserves everything; its header is the "Copyright ... All
+  # rights re-served" line spelled out in NEEDLE below. Pasting a file or a
+  # header across the two is easy and silent: four files carried the ops form
+  # here (BUG-0091), one of them added by the same session that found it.
+  #
+  # THE NEEDLE IS ASSEMBLED, NOT WRITTEN. Spelled literally, this function
+  # matches ITSELF and the check fails on gates.sh forever -- which is exactly
+  # what happened on the first run of it. Same trap as
+  # plain_process_exit_stays_out_of_the_running_paths, which says it best: a
+  # source-reading test is inside the source it reads, and that is not a detail
+  # it can afford to forget.
+  #
+  # The cost is not cosmetic. A reader who takes per-file headers at face value
+  # is told those files grant nothing, in a public tree whose whole premise is
+  # that they do.
+  #
+  # ASK GIT, not the filesystem, for the same reason assert_gate_is_executable
+  # does: the tracked bytes are what gets published, and a forged tree with no
+  # index answers nothing, which is the right answer there.
+  local bad needle
+  needle="All rights re""served"
+  bad=$(git grep -l -F "$needle" -- tools crates 2>/dev/null || true)
+  [ -z "$bad" ] && return 0
+  echo "FAIL  these tracked files carry the OPS repo's license header:"
+  printf '        %s\n' $bad
+  echo "        This repo declares Elastic-2.0 per file. Replace the line with"
+  echo "          # SPDX-License-Identifier: Elastic-2.0"
+  echo "        If a file genuinely must reserve rights (vendored code, say),"
+  echo "        exclude it here WITH the reason -- an unexplained exception is"
+  echo "        indistinguishable from the paste this check exists to catch."
+  FAILED="$FAILED license-header"
+}
+
 assert_spawning_drills_declare_ports() {
   local bad="" f
   for f in tools/*_drill.sh tools/gates.sh; do
@@ -2165,6 +2200,7 @@ if want drills; then
   assert_every_drill_accounted_for
   assert_declared_scopes_cover_data_dirs
   assert_gate_is_executable
+  assert_license_headers_are_this_repos
   assert_no_used_path_overlap
   LEAKCHECK=1
   run_core_drills

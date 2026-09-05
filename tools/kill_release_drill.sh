@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Copyright (c) 2026 Crestway AI LLC. All rights reserved.
+# SPDX-License-Identifier: Elastic-2.0
 #
 # BUG-0051 — when fleet_kill returns, the seats it killed must be GONE.
 #

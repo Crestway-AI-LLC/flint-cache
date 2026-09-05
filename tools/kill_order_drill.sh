@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Copyright (c) 2026 Crestway AI LLC. All rights reserved.
+# SPDX-License-Identifier: Elastic-2.0
 #
 # BUG-0061 — no cleanup may kill a supervised seat before its supervisor.
 #

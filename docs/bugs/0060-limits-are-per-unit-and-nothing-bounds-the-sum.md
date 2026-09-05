@@ -1088,5 +1088,15 @@ Linux, so it must never reach that line.
 - **Skew in a list** makes the mean element size an approximation. Bounded by
   how far the requested elements sit from average, and the alternative — reading
   the range to size it — is the work being admitted.
-- **The fraction to recommend.** 25% is a starting point in `docs/self-hosting.md`
-  and not a measured recommendation.
+- ~~The fraction to recommend.~~ **RATIFIED 2026-09-05: 25%.** Jeff's call, and
+  it is the documented value in `docs/self-hosting.md` rather than a new
+  default: `--collection-read-budget-pct` still ships at **0**, because
+  opt-in-with-refusal-off was a separate decision and this one did not revisit
+  it. Turning it on fleet-wide is a one-line change to
+  `DEFAULT_COLLECTION_READ_BUDGET_PCT` when that is wanted.
+
+  25% is a policy choice rather than a measurement, and what it means is worth
+  stating in one line: with a 3.5x multiplier, a node admits concurrent
+  collection reads until their estimated peak reaches a quarter of the memory
+  it can currently see. At the 512 MiB cap that is roughly one max-size read
+  per 7.0 GiB of available memory.

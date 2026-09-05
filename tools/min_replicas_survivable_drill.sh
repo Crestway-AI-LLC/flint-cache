@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Copyright (c) 2026 Crestway AI LLC. All rights reserved.
+# SPDX-License-Identifier: Elastic-2.0
 # BUG-0074 — a min-replicas-to-write that cannot survive a failover.
 #
 # After a failover the survivors are `members - 1`, and one of them IS the new

@@ -1,11 +1,12 @@
-# BUG-0091 — four core files carry the ops repo's license header, and it grants nothing
+# BUG-0091 — four core files carry the ops repo's license header, and it grants nothing (FIXED 2026-09-05)
 
 **Found** 2026-09-04 while adding `tools/collection_read_peak.py`, by making the
 same mistake and catching it in review: I copied the header form from
 `packaging/aws/gate-box/run.sh`, which lives in the **ops** repo.
 
-Status: OPEN · Severity: low, but legal-adjacent rather than technical — nothing
-misbehaves, and the repo says two different things about the same code.
+Status: **FIXED 2026-09-05** · Severity: low, but legal-adjacent rather than
+technical — nothing misbehaved, and the repo said two different things about
+the same code.
 
 ## What is wrong
 
@@ -71,3 +72,32 @@ The header check this file recommends is still not added, deliberately: a count
 comparing SPDX against "All rights reserved" would fail on those three, so it
 is worth adding **with** the decision and not before. 203 SPDX to 3 reserved,
 as of this edit.
+
+
+## FIXED 2026-09-05
+
+All four now declare `# SPDX-License-Identifier: Elastic-2.0`, and the counts
+are 228 against 0. One (`induced_ratchet_drill.sh`) was fixed on 2026-09-04 by
+the session that wrote it; the remaining three — `kill_release_drill.sh`,
+`min_replicas_survivable_drill.sh`, `kill_order_drill.sh` — on Jeff's
+instruction, which is what this file was waiting for. Elastic-2.0 is a grant,
+so the change hands out rights the previous text withheld, and that was not a
+call to make by inference.
+
+### The check, and the trap it walked into first
+
+`assert_license_headers_are_this_repos` in `tools/gates.sh` refuses any tracked
+file under `tools/` or `crates/` carrying the ops repo's form. It asks `git
+grep` rather than the filesystem, for the reason `assert_gate_is_executable`
+gives: the tracked bytes are what gets published.
+
+**Its first run failed on `gates.sh` itself.** The check quoted the string it
+searches for, so it matched its own source. That is the identical trap
+`plain_process_exit_stays_out_of_the_running_paths` documents two thousand
+lines away in the same file — *"the scan was matching its own assertion
+messages, which quote the very string they are about"* — and the identical
+remedy applies: the needle is assembled from fragments rather than written.
+
+Verified both ways, because a header check that cannot fire is worse than none:
+it passes on the clean tree, and it fires on a planted file carrying the ops
+header.

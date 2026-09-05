@@ -799,9 +799,12 @@ saturates. Because it climbs, the figure at the cap bounds every smaller
 read and a mid-range sample does not. 3.5 clears the measured maximum by
 16%. Re-run that tool if the read path changes.
 
-**Picking a percentage.** The budget counts your in-flight reads against
-available memory, which already reflects them, so it tightens as load
-rises — deliberately. Start at `25` and watch `collection_read_refused`:
+**Picking a percentage. Use `25`** — the ratified value, and the one the rest
+of this section assumes. The budget counts your in-flight reads against
+available memory, which already reflects them, so it tightens as load rises —
+deliberately. With the 3.5x multiplier, 25 admits roughly one max-size (512 MiB)
+read per 7.0 GiB of memory the node can currently see. Set it and watch
+`collection_read_refused`:
 refusals are the valve working, but a steadily climbing count means
 tenants are asking for collections this node is too small to serve
 concurrently, and the fix is bigger nodes or smaller collections.
