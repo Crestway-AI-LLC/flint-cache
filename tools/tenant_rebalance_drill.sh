@@ -74,13 +74,52 @@ echo "== controller with --rebalance-execute ((ns,slot) units)"
   --id TRX --poll-ms 200 --rebalance-deadband 0.2 --rebalance-execute --max-slots-per-cycle 3 \
   2>$FLINT_DRILL_ROOT/flint-tr-ctl.log &
 
-BALANCED=0
+CTL=$FLINT_DRILL_ROOT/flint-tr-ctl.log
+
+# WAIT FOR THE MOVES TO FINISH, NOT FOR THE PLAN TO BE ANNOUNCED (BUG-0094).
+#
+# "rebalance EXECUTE" is printed by execute_move BEFORE the first unit moves,
+# and the units are then migrated SERIALLY. Balance arrives before the plan
+# does: three alpha units of 3000 leave fills g0=10000 g1=6000 after TWO of
+# them, and 10000*100 <= 8000*125 holds EXACTLY, so the old predicate could
+# break out with the third migration still running. DBSIZE counts residency
+# and the proxy SUMS the masters, so the conservation assert below then read
+# a slot resident on both nodes and reported alpha=15000.
+#
+# The sound signal is the controller's per-unit line: MIGRATEIN-OK is logged
+# only after the SOURCE has replied, and the source does not reply until it
+# has purged the slot. The nodes' own FLINTMIGRATIONS is checked as well, but
+# is NOT sufficient alone -- the destination clears Importing before the flip
+# (migrate.rs "Step 5: flip dest-first") and the source's Moved is hidden from
+# the bare form, so for the length of the source's purge BOTH nodes look
+# quiescent while both still hold the rows.
+units_announced() { grep -oE 'units \[[^]]*\]' "$CTL" 2>/dev/null | grep -o '("' | wc -l | tr -d ' '; }
+units_resolved()  { local n; n=$(grep -c 'MIGRATEIN-OK' "$CTL" 2>/dev/null | tr -d ' '); echo "${n:-0}"; }
+moves_failed()    { grep 'move failed' "$CTL" 2>/dev/null; }
+inflight_rows()   { for p in $P0 $P1; do valkey-cli -p $p FLINTMIGRATIONS | grep -E 'importing|migrating'; done; }
+aborted_rows()    { for p in $P0 $P1; do valkey-cli -p $p FLINTMIGRATIONS | grep 'aborted'; done; }
+
+BALANCED=0; SAW_WORK=0
 for i in $(seq 1 90); do
+  # An abandoned move is a finding, not something to wait out: the counts
+  # below can never settle after one, and 90s of silence would report it as
+  # "did not converge" -- a cause the check never established.
+  FAILED=$(moves_failed)
+  if [ -n "$FAILED" ]; then
+    echo "FAIL: the controller abandoned a move:"; echo "$FAILED" | sed 's/^/    /'; exit 1
+  fi
+  AB=$(aborted_rows)
+  if [ -n "$AB" ]; then
+    echo "FAIL: a destination abandoned an import:"; echo "$AB" | sed 's/^/    /'; exit 1
+  fi
   N0=$(valkey-cli -p $P0 FLINTSLOTSTATS | awk '{s+=$2} END{print s+0}')
   N1=$(valkey-cli -p $P1 FLINTSLOTSTATS | awk '{s+=$2} END{print s+0}')
   MAX=$N0; [ "$N1" -gt "$MAX" ] && MAX=$N1
   MEAN=$(( (N0+N1) / 2 ))
-  if [ "$MEAN" -gt 0 ] && [ $((MAX*100)) -le $((MEAN*125)) ] && grep -q "rebalance EXECUTE" $FLINT_DRILL_ROOT/flint-tr-ctl.log; then
+  A=$(units_announced); R=$(units_resolved); IF=$(inflight_rows)
+  if [ "$A" -gt "$R" ] || [ -n "$IF" ]; then SAW_WORK=$((SAW_WORK+1)); fi
+  if [ "$MEAN" -gt 0 ] && [ $((MAX*100)) -le $((MEAN*125)) ] \
+     && [ "$A" -gt 0 ] && [ "$A" = "$R" ] && [ -z "$IF" ]; then
     BALANCED=1; break
   fi
   sleep 1
@@ -89,7 +128,19 @@ N0=$(valkey-cli -p $P0 FLINTSLOTSTATS | awk '{s+=$2} END{print s+0}')
 N1=$(valkey-cli -p $P1 FLINTSLOTSTATS | awk '{s+=$2} END{print s+0}')
 echo "  node fills after: g0=$N0 g1=$N1 (moves: $(grep -c 'MIGRATEIN-OK' $FLINT_DRILL_ROOT/flint-tr-ctl.log))"
 grep -oE "units \[[^]]*\]" $FLINT_DRILL_ROOT/flint-tr-ctl.log | head -3 | sed 's/^/  /'
-[ "$BALANCED" = "1" ] || { echo "FAIL: did not converge"; tail -12 $FLINT_DRILL_ROOT/flint-tr-ctl.log; exit 1; }
+# Says what was observed and nothing more: whether the plan finished is a
+# different failure from whether the fills converged, and they read alike.
+if [ "$BALANCED" != "1" ]; then
+  A=$(units_announced); R=$(units_resolved); IF=$(inflight_rows)
+  echo "FAIL: did not settle in 90s — fills g0=$N0 g1=$N1, units announced=$A resolved=$R"
+  if [ -n "$IF" ]; then echo "  still in flight:"; echo "$IF" | sed 's/^/    /'; fi
+  tail -12 "$CTL"; exit 1
+fi
+# Load-bearing or not, on THIS host: 0 means every move completed inside one
+# poll and the wait proved nothing here, which is not the same as the wait
+# being unnecessary. Under the gate's parallelism it is where the 15000 came
+# from.
+echo "  settle: units announced=$(units_announced) resolved=$(units_resolved); polls that saw work in flight: $SAW_WORK"
 
 echo "== per-tenant conservation via proxy fan-out"
 DA=$(valkey-cli -p 6668 -a tokA --no-auth-warning DBSIZE)

@@ -123,6 +123,13 @@ echo "  fills after: g0=$N0 g1=$N1 g2=$N2 (executes: $(grep -c "rebalance EXECUT
 [ "$BALANCED" = "1" ] || {
   MOVES=$(grep -c "MIGRATEIN-OK" $FLINT_DRILL_ROOT/flint-rbx.log)
   EXECS=$(grep -c "rebalance EXECUTE" $FLINT_DRILL_ROOT/flint-rbx.log)
+  # UNITS, not executes (BUG-0094). One "rebalance EXECUTE" announces up to
+  # --max-slots-per-cycle units and this drill runs 2, so MOVES<EXECS is only
+  # true while the in-flight unit is the FIRST of the first cycle: one unit
+  # done and its sibling still copying gives MOVES=1 EXECS=1, and the guard
+  # below falls straight through to the accusation it exists to prevent.
+  # Every unit appears once in the plan line as ("ns", slot).
+  ANN=$(grep -oE "units \[[^]]*\]" $FLINT_DRILL_ROOT/flint-rbx.log | grep -o '("' | wc -l | tr -d ' ')
   if [ $((N0+N1+N2)) -ne "$TOTAL" ]; then
     # An INFLATED sum with a migration still running is the mid-move window,
     # not invented data: a slot copies to the destination and only then drops
@@ -130,15 +137,15 @@ echo "  fills after: g0=$N0 g1=$N1 g2=$N2 (executes: $(grep -c "rebalance EXECUT
     # accuses the product of the one thing this drill exists to disprove,
     # when what actually happened is that a loaded box did not finish inside
     # 120s. Distinguish, and only cry duplication when nothing is in flight.
-    if [ $((N0+N1+N2)) -gt "$TOTAL" ] && [ "$EXECS" -gt 0 ] && [ "$MOVES" -lt "$EXECS" ]; then
+    if [ $((N0+N1+N2)) -gt "$TOTAL" ] && [ "$ANN" -gt 0 ] && [ "$MOVES" -lt "$ANN" ]; then
       echo "FAIL: did not settle within 120s — a slot move was STILL IN FLIGHT"
-      echo "      ($EXECS execute(s), $MOVES completed; sum $TOTAL -> $((N0+N1+N2)) is the"
+      echo "      ($EXECS execute(s), $ANN unit(s) planned, $MOVES completed; sum $TOTAL -> $((N0+N1+N2)) is the"
       echo "      mid-move double count, not duplicated rows). On a loaded box this is a"
       echo "      timeout; re-run on a quiet one before reading it as a product fault."
     else
       echo "FAIL: keys not conserved after 120s: $TOTAL -> $((N0+N1+N2))"
       echo "      a migration that never completed its cutover, or duplicated rows"
-      echo "      ($EXECS execute(s), $MOVES completed)"
+      echo "      ($EXECS execute(s), $ANN unit(s) planned, $MOVES completed)"
     fi
   else
     echo "FAIL: did not converge to balance"
