@@ -3638,12 +3638,59 @@ fn verify_after(inv: &Inventory, op: &str) {
     // members one at a time, and a refusal here would fail the very roll that
     // is converging them. The roll-grace window below is what makes that safe
     // rather than permissive -- a member older than the window is not mid-roll.
-    let problems = verify_checks(inv, None, false, true, true);
+    //
+    // AND IT RETRIES, because a one-shot check of a CONVERGENCE property, run
+    // the instant the operation that starts convergence returns, is a race by
+    // construction (BUG-0096).
+    //
+    // `launch` waits for PONG, and PONG means ALIVE, not SERVING: since #176 a
+    // node binds and answers from INSIDE its load, so a replica can be
+    // answering while `role:` still reads `loading`. `verify` correctly calls
+    // that pair SINGLE-COPY -- "every member up, but 0 of 1 streaming" -- so
+    // `flintctl bootstrap` could exit 1 on a healthy cluster that simply had
+    // not finished loading yet. Observed on a gate run whose only change was
+    // Markdown:
+    //
+    //     pair 0  127.0.0.1:7702  loading  epoch    (blank)
+    //     verify: bootstrap left the cluster INCONSISTENT
+    //
+    // This is BUG-0064's conflation and f9c194d's race, one level down.
+    // f9c194d fixed it in `decommission_drill.sh` and 36435a8 audited "all 18
+    // drills that call verify" -- but bootstrap calls verify HERE, inside
+    // flintctl, where no drill-level audit could reach it. Every operator's
+    // first command carried it.
+    //
+    // RETRYING VERIFY IS THE RIGHT WAIT, in that fix's own words, "because
+    // verify IS the assertion -- no separate readiness signal to drift out of
+    // agreement with it". Bounded, and still a failure if it never converges;
+    // success returns on the first clean pass, so a converged cluster pays
+    // nothing.
+    const CONVERGE_SECS: u64 = 30;
+    let deadline = Instant::now() + Duration::from_secs(CONVERGE_SECS);
+    let mut problems = verify_checks(inv, None, false, true, true);
+    let mut waited = false;
+    while !problems.is_empty() && Instant::now() < deadline {
+        waited = true;
+        std::thread::sleep(Duration::from_millis(500));
+        problems = verify_checks(inv, None, false, true, true);
+    }
     if problems.is_empty() {
-        println!("verify: {op} left the cluster consistent");
+        if waited {
+            // SAY THAT IT WAITED. A convergence that took time is not the same
+            // event as one that was already done, and collapsing them hides a
+            // cluster that is getting slower to converge until the day it
+            // stops.
+            println!("verify: {op} left the cluster consistent (after waiting for it to converge)");
+        } else {
+            println!("verify: {op} left the cluster consistent");
+        }
         return;
     }
-    eprintln!("verify: {op} left the cluster INCONSISTENT:");
+    if waited {
+        eprintln!("verify: {op} still INCONSISTENT after {CONVERGE_SECS}s of waiting to converge:");
+    } else {
+        eprintln!("verify: {op} left the cluster INCONSISTENT:");
+    }
     for p in &problems {
         eprintln!("  - {p}");
     }

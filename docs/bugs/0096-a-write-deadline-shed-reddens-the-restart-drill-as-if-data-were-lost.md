@@ -1,4 +1,4 @@
-# BUG-0096: a write-deadline shed reddens the restart drill as if data were lost (FIXED)
+# BUG-0096: a write-deadline shed reddens the restart drill as if data were lost (FIXED); and `verify_after` raced the convergence it asserts (FIXED)
 
 Status: **FIXED 2026-09-05** · found by triaging the gate failures BUG-0064
 records as going unread · Severity: medium — it cost three gate runs in one
@@ -117,3 +117,53 @@ triaging them — they were simply never opened". Opening them: 8 failures in 98
 completed runs (8.2%), of which `restart` x3 were this, `decommission` was
 BUG-0064 (predating its 2026-09-04 fix), `tenant_rebalance` was BUG-0094, and
 `failover` x2 and `backup_seat` remain unexamined.
+
+## Second defect, found by triaging the same population: `verify_after` races
+
+Gate run `33977289678` failed on a commit whose only change was Markdown, so
+the cause was not the commit:
+
+    pair 0  127.0.0.1:7701  master   epoch (0,1)   live_replicas 0
+    pair 0  127.0.0.1:7702  loading  epoch         (blank)
+    verify: bootstrap left the cluster INCONSISTENT:
+      - pair 0 replicating: SINGLE-COPY: every member up, but 0 of 1 streaming
+
+**The replica was still loading when bootstrap's own verify ran.** `launch`
+waits for PONG, and since #176 PONG means ALIVE, not SERVING — a node binds and
+answers from inside its load. `verify` then correctly calls the pair
+single-copy, and `flintctl bootstrap` exits 1 on a healthy cluster.
+
+That is BUG-0064's conflation and `f9c194d`'s race one level down. `f9c194d`
+fixed it in `decommission_drill.sh`, and `36435a8` audited **"all 18 drills
+that call `verify`"** — but `bootstrap` calls `verify_after` at
+`flint-ctl/src/main.rs:6716`, *inside flintctl*, where a drill-level audit
+could not reach. So did `expand`, `swap-node`, `add-replica`, `migrate-slots`,
+`failover` and `decommission-node`: seven one-shot checks of a CONVERGENCE
+property, each run the instant the operation that starts convergence returns.
+
+**It is not only a CI flake.** `bootstrap` is the first command an operator
+runs, and on a slow enough machine it fails on a cluster that is fine.
+
+### The fix
+
+`verify_after` now retries for 30 s, in that fix's own words — "retrying
+`verify` itself is the right wait because verify IS the assertion, no separate
+readiness signal to drift out of agreement with it". Success returns on the
+first clean pass, so a converged cluster pays nothing, and a cluster that never
+converges still fails.
+
+**It says when it waited.** "left the cluster consistent (after waiting for it
+to converge)" rather than the bare line, because a convergence that took time
+is not the same event as one already done, and collapsing them hides a cluster
+getting slower to converge until the day it stops.
+
+### Controls
+
+| injected | result |
+|---|---|
+| 3 transient problems | `left the cluster consistent (after waiting for it to converge)`, exit 0 |
+| none | `left the cluster consistent`, no wait claimed |
+| a problem that never clears | `still INCONSISTENT after 30s of waiting to converge`, exit 1, in 35 s wall clock |
+
+The middle row matters as much as the first: without it, a change that always
+claimed to have waited would pass the other two.
