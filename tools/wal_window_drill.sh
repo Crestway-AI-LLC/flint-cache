@@ -14,12 +14,12 @@
 # WHICH TERM THIS EXERCISES, and why it is the TTL. Retention has two bounds
 # and RocksDB applies whichever trips first -- but the size term can only trip
 # when a purge pass RUNS, and that pass is throttled to
-# `min(600s, ttl/2)` (BUG-0092). So the two knobs cannot be separated in a
+# `min(600s, ttl/2)` (BUG-0093). So the two knobs cannot be separated in a
 # drill: a TTL short enough to give fast purge passes also ages files out by
 # time, and a TTL long enough for the byte term to bind pushes the pass cadence
 # to ten minutes. This drill therefore pins a short TTL and proves the TIME
 # window directly. A size-bound window cannot be observed in under 600s, which
-# is BUG-0092's subject rather than this drill's.
+# is BUG-0093's subject rather than this drill's.
 #
 # THE TWO ARMS, and neither means anything alone:
 #   INSIDE  -- absent well under the TTL: must rejoin incrementally.
@@ -28,7 +28,7 @@
 #              archive is never pruned, on one where the replica never checks,
 #              and on one where the drill's writes never reached the disk.
 #              It is not hypothetical: the first version of this drill could
-#              not make OUTSIDE fire, and that is how BUG-0092 was found.
+#              not make OUTSIDE fire, and that is how BUG-0093 was found.
 #
 # FLINT_WRITE_BUFFER_MB=1 is load-bearing, not tidiness: a segment is only
 # ARCHIVED once its memtable has flushed, so at the default buffer a short run
@@ -146,7 +146,7 @@ for _ in $(seq 1 100); do
 done
 if ! reseeded r3.log; then
   fail "a replica absent ${OUTSIDE_S}s of a ${TTL_S}s window rejoined WITHOUT a full
-  sync. Either retention is not pruning (BUG-0092: the size term is only
+  sync. Either retention is not pruning (BUG-0093: the size term is only
   evaluated every 600s, so check the TTL is what is pinned here), or the load
   never reached the disk (see FLINT_WRITE_BUFFER_MB in this file's header).
   ARM 1 is not evidence of anything until this arm can fail."
@@ -157,6 +157,6 @@ echo
 echo "WINDOW: with --wal-ttl-seconds ${TTL_S}, a replica absent ${INSIDE_S}s rejoined from"
 echo "  the archive and one absent ${OUTSIDE_S}s did not. The window is the TTL here"
 echo "  because the byte budget was pinned out of the way; at the shipped defaults"
-echo "  it is min(TTL, budget/rate) -- and per BUG-0092 the byte term is only"
+echo "  it is min(TTL, budget/rate) -- and per BUG-0093 the byte term is only"
 echo "  evaluated every 600s, so the archive is unbounded between passes."
 echo "PASSED"
