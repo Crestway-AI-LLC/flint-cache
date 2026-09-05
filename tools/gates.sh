@@ -1323,6 +1323,21 @@ assert_bug_index_markers_agree_with_status() {
   # contradiction, in both directions. Markers here are richer than in a title
   # ("FIXED in code, UNCONFIRMED against a live recurrence" is a legitimate
   # row) and a check that fired on those would be switched off within a week.
+  #
+  # A THIRD RULE, ADDED 2026-09-05: a row with NO marker over a CLOSED Status.
+  # The first version skipped those as "no second copy to disagree with", and
+  # that was the gap -- an absent marker is not an absent claim. Everything
+  # that scans this index classifies by substring (`undeployed.sh` does; so
+  # does anyone grepping it), so a row with no state word reads as OPEN, and
+  # over a Status of FIXED it misinforms exactly as loudly as a row that spells
+  # OPEN out. FIFTEEN rows were in that state, three fixed within the previous
+  # four days -- and BUG-0050 had already been reported to Jeff as open work an
+  # hour before, read straight off this index by the session that then added
+  # this rule.
+  #
+  # ONE DIRECTION ONLY. An unmarked row over an OPEN Status is honest: absence
+  # reads as open and open is what it is. Requiring a word there would be
+  # churn, and churn is how a check earns its way to being switched off.
   local out
   out=$(python3 - <<'BIMPY'
 import glob, os, re, sys
@@ -1351,19 +1366,41 @@ for line in idx.split("\n"):
     marker_of[m.group(1)] = found
 
 bad = []
+unmarked_closed = []
 marked = 0
 compared = 0
 total = 0
 for f in sorted(glob.glob("docs/bugs/[0-9][0-9][0-9][0-9]-*.md")):
     total += 1
-    row = marker_of.get(os.path.basename(f)[:4])
-    if not row:
-        continue
-    marked += 1
+    key = os.path.basename(f)[:4]
+    if key not in marker_of:
+        continue                    # no row at all: nothing to hold it against
+    row = marker_of[key]
     head = open(f, encoding="utf-8", errors="replace").read()
     sm = re.search(r"^\*{0,2}Status:?\*{0,2}\s*:?\s*(.{0,40})", head, re.M)
     if not sm or not sm.group(1).strip():
         continue
+    # AN ABSENT MARKER IS NOT AN ABSENT CLAIM, and skipping it here was the
+    # gap. A row with no state word reads as OPEN to everything that scans this
+    # index -- `undeployed.sh` classifies by substring, and so does anyone
+    # grepping it -- so over a Status of FIXED the row says the opposite of the
+    # truth just as loudly as a row that spells OPEN out. FIFTEEN were in that
+    # state when this was added, three of them fixed within the previous four
+    # days, and one of them (0050) had already been reported to Jeff as open
+    # work an hour earlier in the same session that added this.
+    #
+    # ONLY IN THAT DIRECTION. An unmarked row over an OPEN Status is honest --
+    # absence reads as open, and open is what it is -- so it stays unmarked
+    # rather than being made to carry a word it does not need.
+    if not row:
+        if any(re.split(r"[\s,;.:\u00b7]+", re.sub("[*_" + chr(96) + "]", "",
+                        sm.group(1)).strip().upper())[0].startswith(c)
+               for c in CLOSED):
+            unmarked_closed.append((os.path.basename(f),
+                                    re.sub("[*_" + chr(96) + "]", "",
+                                           sm.group(1)).strip()))
+        continue
+    marked += 1
     compared += 1
     # chr(96) rather than the character: this heredoc sits inside a $( ), where
     # bash looks for a matching backtick even in a QUOTED heredoc.
@@ -1388,6 +1425,8 @@ if marked == 0:
 print("COVERAGE %d %d %d" % (compared, marked, total))
 for f, row, st in bad:
     print("%s\t(%s)\t%s" % (f, row[:70], st[:60]))
+for f, st in unmarked_closed:
+    print("%s\t(no marker on the row)\t%s" % (f, st[:60]))
 BIMPY
 ) || { echo "FAIL  the index-marker check could not run"; FAILED="$FAILED bug-index-markers-unrunnable"; return; }
 
@@ -1401,13 +1440,18 @@ BIMPY
   cov=$(printf '%s\n' "$out" | sed -n 's/^COVERAGE //p')
   out=$(printf '%s\n' "$out" | grep -v '^COVERAGE ' || true)
   if [ -n "$out" ]; then
-    echo "FAIL  index row(s) whose marker contradicts the write-up's Status:"
+    # TWO SHAPES, NAMED APART. One row contradicts its write-up and another
+    # says nothing over a write-up that is closed; calling both "contradicts"
+    # would name a cause the check has not established for the second
+    # (ADR-0028). The per-row line carries which.
+    echo "FAIL  index row(s) that disagree with the write-up's Status:"
     printf '%s\n' "$out" | while IFS="$(printf '\t')" read -r f marker st; do
       echo "        $f"
       echo "          index $marker  vs  Status: $st"
     done
-    echo "        The row is what a reader acts on without opening the file."
-    echo "        Update it in the SAME commit that changes the Status."
+    echo "        The row is what a reader acts on without opening the file,"
+    echo "        and an ABSENT marker reads as OPEN to everything that scans"
+    echo "        this index. Update it in the SAME commit that changes Status."
     FAILED="$FAILED bug-index-markers-contradict-status"
     return
   fi
