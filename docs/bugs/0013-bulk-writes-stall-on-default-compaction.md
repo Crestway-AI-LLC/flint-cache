@@ -791,7 +791,7 @@ operator. Nothing here locates it. That is the measurement that would turn this
 proposal into a rule ("apply above N x level base"), and it is one sweep at
 three intermediate sizes on the seat that already exists.
 
-### Next
+### Next (superseded 2026-09-05 by the anchor leg below)
 
 ~~Propose defaults with the memory cost priced, and re-measure at a production
 LSM size before changing anything shipped.~~ Both done — the 96 GB re-measure
@@ -863,4 +863,58 @@ which is the 2026-08-17 finding in its original form.
 series on one box: it anchors today's numbers to the known +32% point and turns
 the bracket into a single-run result. That is ~15 minutes on the baked AMI and
 is the obvious next step, not a new experiment.
+
+## 2026-09-05 — the anchor leg: the bracket holds, the +32% does not
+
+Ran exactly that. Same shape as the three rows above — i4i.2xlarge, seat pinned
+to CPUs 0,1, 8 MB level base, 4 MB write buffer, 8 intervals — with
+`DECAY_KEYS=640000` for 6.4 GB logical.
+
+| logical | default | bg_jobs=4 | change | stall default -> 4 | W-Amp default -> 4 |
+|---|---|---|---|---|---|
+| 1.3 GB | 186.0 MB/s | 137.2 MB/s | -26.2% | 19.2% -> 26.7% | 7.1 -> 8.4 |
+| 2.2 GB | 175.3 MB/s | 135.9 MB/s | -22.5% | 24.1% -> 28.8% | 7.5 -> 8.8 |
+| 3.7 GB | 118.5 MB/s | 115.2 MB/s | -2.8% | 47.0% -> **43.7%** | 8.3 -> 9.9 |
+| **6.4 GB** | **98.1 MB/s** | **105.2 MB/s** | **+7.2%** | 60.6% -> **57.9%** | 9.5 -> 10.2 |
+
+### What it settles
+
+**The crossover is now a single-run result.** The throughput change runs
+-26.2, -22.5, -2.8, +7.2 across one box, one build, one uninterrupted series:
+monotonic, and the sign flips between 3.7 and 6.4 GB. The bracket no longer
+inherits drift from a splice, which is what this leg was for.
+
+**The two-crossing mechanism holds.** Stall goes 19.2->26.7 (worse), 24.1->28.8
+(worse), 47.0->43.7 (better), 60.6->57.9 (better), so stall relief begins
+between 2.2 and 3.7 GB while throughput does not turn until after 3.7. Contention
+is paid immediately, relief arrives with depth, and the knob is worth setting
+only once the second overtakes the first. Write amplification stays higher with
+`bg_jobs=4` at every size (7.1->8.4, 7.5->8.8, 8.3->9.9, 9.5->10.2), which is
+the 8 MB level base doing what the 2026-08-17 finding said it does.
+
+### What it REFUTES, and this is the part worth having run it for
+
+**+32% at 6.4 GB is not reproduced. In-series it is +7.2%** — a 4.4x
+difference on the number the whole bracket was anchored to. The section above
+worried that "the crossover location inherits whatever drift sits between the
+two runs"; it did, and the drift was in the magnitude rather than the sign.
+
+So the honest reading of the knob's value at the crossing is now **single
+digits, not a third**. That matters for the proposal this file carries: a +32%
+would justify recommending the knob to anyone past ~6 GB, and +7.2% at n=1 is
+close enough to the noise floor that the recommendation should stay where it is
+— tune only well past the crossover, where the 96 GB result (+93%) lives.
+
+### Still not established
+
+- **n=1 per configuration**, unchanged. -26.2% and -22.5% remain far outside
+  plausible noise and their sign is safe; **+7.2% at 6.4 GB is one sample** and
+  is not separable from noise on its own. What it does establish is the SIGN,
+  in-series, which is what the bracket needed.
+- **The 0.76 GB non-monotonicity is still cross-run** and still unexplained.
+  This leg fixed the upper splice, not that one; -9.1% at 0.76 GB against
+  -26.2% at 1.3 GB would put the worst harm in the middle, and re-running
+  0.76 GB inside this series is the only thing that would settle it.
+- **Nothing here is a fleet-wide default.** The proposal's reasoning is
+  unchanged.
 
