@@ -950,6 +950,28 @@ const DEFAULT_FULLSYNC_RATE_BYTES: u64 = 64 * 1024 * 1024;
 /// the client waits AND the node is busy not serving anyone else.
 static WRITE_INFLIGHT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static WRITE_SERVICE_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Per-write MARGINAL cost, which is what a projection may multiply by.
+///
+/// `WRITE_SERVICE_US` above is RESIDENCY: `WriteInFlight` is entered when a
+/// write is staged into a batch and dropped when that batch COMMITS, so every
+/// write in a batch records the whole commit. They commit together, so
+/// multiplying residency by the number in flight charges the same wall clock
+/// once per write -- for a full 256-write batch, 256 times over.
+///
+/// That is BUG-0088. A batch of 65 committing in 31ms reported
+/// `65 x 30942us = 2011ms` against a 2000ms deadline, for work that took 31ms,
+/// and shed one write in 101000. The deadline was never the problem: raising
+/// it would have moved a wrong number past a threshold instead of correcting
+/// it.
+///
+/// Little's Law is the correction. With L in flight and residency W, the
+/// throughput is L/W, so the wait a new write can expect is `L / (L/W)` = W,
+/// not `L x W`. Dividing each residency sample by the number that shared it
+/// gives the marginal cost, and `inflight x cost` then lands back on W when
+/// the queue is stable and grows only when inflight outruns throughput --
+/// which is the thing a deadline should shed on.
+static WRITE_COST_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Writes refused because their estimated wait exceeded the deadline. Exposed
 /// by FLINTINFO so the shed is observable rather than inferred — the lag cap
 /// shipped unexercised for months precisely because nothing counted it (#121).
@@ -979,13 +1001,19 @@ static WRITE_WAIT_PEAK_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::Ato
 
 /// The peak, PACKED WITH THE TWO TERMS THAT PRODUCED IT.
 ///
-/// `est_ms` is `inflight x service_us / 1000`, and the factors fail for
-/// opposite reasons: a high inflight is more offered load than the seat can
-/// take, a high service time is the seat itself having got slow. The product
-/// cannot tell them apart, and 2026-09-03 measured that four-way parallelism
-/// raises this peak 8.6x (median 65ms serial against 557ms at four drills)
-/// without touching memory -- so the resource being contended is still unknown
-/// and these two numbers are what would name it.
+/// `est_ms` is `inflight x cost_us / 1000`, and the factors fail for opposite
+/// reasons: a high inflight is more offered load than the seat can take, a
+/// high cost is the seat itself having got slow.
+///
+/// TWO CORRECTIONS FROM BUG-0088, both of which this comment previously got
+/// wrong. The third term was RESIDENCY, and multiplying it by inflight charged
+/// one batch commit once per member -- 256 times over at a full batch. It is
+/// now the marginal cost (see `WRITE_COST_US`). And `inflight` was read here as
+/// offered load, which is why "four-way parallelism raises this peak 8.6x"
+/// looked like a contention finding: inflight is batch OCCUPANCY, capped at
+/// `MAX_PURE_BATCH` = 256, so the 256 observed at P=4 was a full batch rather
+/// than a measure of load. The contention was real -- it is in the cost term --
+/// but inflight was never the evidence for it.
 ///
 /// ONE atomic, not three, and the layout is the reason: `fetch_max` on a u64
 /// orders by the high bits first, so putting `est_ms` there makes the winner
@@ -999,8 +1027,8 @@ static WRITE_WAIT_PEAK_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::Ato
 /// ordering if it ever is.
 static WRITE_WAIT_PEAK_PACKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-fn pack_write_wait_peak(est_ms: u64, inflight: u64, service_us: u64) -> u64 {
-    (est_ms.min(0xFFFF) << 48) | (inflight.min(0xFFFF) << 32) | service_us.min(0xFFFF_FFFF)
+fn pack_write_wait_peak(est_ms: u64, inflight: u64, cost_us: u64) -> u64 {
+    (est_ms.min(0xFFFF) << 48) | (inflight.min(0xFFFF) << 32) | cost_us.min(0xFFFF_FFFF)
 }
 /// -> (est_ms, inflight, service_us)
 ///
@@ -1015,7 +1043,6 @@ fn unpack_write_wait_peak(v: u64) -> (u64, u64, u64) {
 #[cfg(all(test, feature = "rocks"))]
 mod write_wait_peak_packing_tests {
     use super::{pack_write_wait_peak, unpack_write_wait_peak};
-
     #[test]
     fn the_terms_survive_a_round_trip() {
         let v = pack_write_wait_peak(1322, 37, 35_729);
@@ -1093,23 +1120,28 @@ static LAG_MAX_GAP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 /// so refusing is the one failure this system is built to absorb.
 ///
 /// 2000 ms was a first calibration, justified as "orders of magnitude above
-/// normal service (sub-millisecond at any sane concurrency)". **That margin has
-/// now been measured and it is not orders of magnitude.** The curve this
-/// comment asked for exists (docs/bugs/0088, docs/bugs/0064):
+/// normal service (sub-millisecond at any sane concurrency)".
 ///
-/// | where | peak projected wait, of this 2000 ms |
-/// |---|---|
-/// | unloaded laptop | 20-72 ms |
-/// | CI, serial (n=4) | 48-79 ms |
-/// | CI, four drills at once | **90-1574 ms** |
-/// | CI, at refusal | 2002, 2009, 2017, 2033 ms |
+/// **A margin table used to stand here, and it has been WITHDRAWN.** It read
+/// 90-1574 ms under CI contention against 20-72 ms on an idle laptop, and
+/// concluded the headroom was a factor of about 1.5 rather than orders of
+/// magnitude. Every figure in it was `inflight x residency`, which charges one
+/// batch commit once per member of the batch -- up to 256 times over. The
+/// numbers were the model's, not the system's, and they are not evidence about
+/// this deadline. See BUG-0088 and `WRITE_COST_US`.
 ///
-/// On a 4 vCPU runner at one drill per core the peak routinely reaches **79%
-/// of this deadline** and has crossed it four times. What moves is not queue
-/// depth -- `inflight` is 256 in both arms, identically -- but per-write
-/// service time, ~11x, while the engine reports itself healthy throughout. So
-/// the headroom is a factor of about 1.5 on a contended box, not the three
-/// orders of magnitude this comment used to imply.
+/// The table's own strongest clue was there and misread: "`inflight` is 256 in
+/// both arms, identically". 256 is `MAX_PURE_BATCH`. A quantity that is pinned
+/// to a constant in both arms of an A/B is not measuring the thing being
+/// varied, and that should have been read as a full batch rather than as
+/// steady queue depth.
+///
+/// What survives is the other half, and it is still worth knowing: per-write
+/// service under four-way CI contention ran about 11x an idle laptop's while
+/// every engine backpressure signal stayed flat. That contention is real. What
+/// does not follow is that it brought writes near this deadline -- under the
+/// corrected projection the same runs sit far below it, which is why the four
+/// historical refusals were a modelling artifact and not a capacity signal.
 ///
 /// The VALUE is deliberately unchanged. Raising it to stop a drill going red
 /// would convert a measurement into a silence, and lowering it would refuse
@@ -1137,17 +1169,35 @@ impl WriteInFlight {
 
 impl Drop for WriteInFlight {
     fn drop(&mut self) {
-        WRITE_INFLIGHT.fetch_sub(1, Ordering::Relaxed);
+        // fetch_sub returns the count INCLUDING this write, which is exactly
+        // the number that shared the residency about to be measured: a batch
+        // enters together and commits together.
+        let shared = WRITE_INFLIGHT.fetch_sub(1, Ordering::Relaxed).max(1);
         let us = self.0.elapsed().as_micros() as u64;
         // 1/8-weight EWMA: recent enough to notice a stall within a handful of
         // writes, damped enough that one slow write does not shed the next.
-        let prev = WRITE_SERVICE_US.load(Ordering::Relaxed);
-        let next = if prev == 0 {
-            us
-        } else {
-            prev - prev / 8 + us / 8
+        let ewma = |prev: u64, sample: u64| {
+            if prev == 0 {
+                sample
+            } else {
+                prev - prev / 8 + sample / 8
+            }
         };
-        WRITE_SERVICE_US.store(next, Ordering::Relaxed);
+        // Residency, kept for diagnosis: it is what an operator sees a write
+        // take, and it is the honest input to "is this seat slow".
+        WRITE_SERVICE_US.store(
+            ewma(WRITE_SERVICE_US.load(Ordering::Relaxed), us),
+            Ordering::Relaxed,
+        );
+        // Marginal cost, which is what the projection multiplies. See
+        // WRITE_COST_US: charging a batch's commit once per member is BUG-0088.
+        WRITE_COST_US.store(
+            ewma(
+                WRITE_COST_US.load(Ordering::Relaxed),
+                marginal_cost_us(us, shared),
+            ),
+            Ordering::Relaxed,
+        );
     }
 }
 
@@ -1155,10 +1205,24 @@ impl Drop for WriteInFlight {
 /// FLINTINFO can report the same number the gate decides on — a gauge that
 /// disagrees with the gate is worse than no gauge.
 fn estimated_write_wait_ms() -> u64 {
-    WRITE_INFLIGHT
-        .load(Ordering::Relaxed)
-        .saturating_mul(WRITE_SERVICE_US.load(Ordering::Relaxed))
-        / 1_000
+    projected_wait_ms(
+        WRITE_INFLIGHT.load(Ordering::Relaxed),
+        WRITE_COST_US.load(Ordering::Relaxed),
+    )
+}
+
+/// What one write cost, given a residency that `shared` writes paid together.
+/// A batch enters and commits as a unit, so its commit time is shared by every
+/// member; charging each member the whole commit is BUG-0088.
+fn marginal_cost_us(residency_us: u64, shared: u64) -> u64 {
+    residency_us / shared.max(1)
+}
+
+/// The wait a write arriving now can expect: inflight x MARGINAL cost, never
+/// x residency. Residency already contains the wait behind the rest of the
+/// batch, so multiplying it by the batch size counts that wait once per member.
+fn projected_wait_ms(inflight: u64, cost_us: u64) -> u64 {
+    inflight.saturating_mul(cost_us) / 1_000
 }
 
 /// Sweep cadence for the GC pass that reclaims expired metadata and
@@ -4171,7 +4235,7 @@ fn admit_write_path(
                     pack_write_wait_peak(
                         est_ms,
                         WRITE_INFLIGHT.load(Ordering::Relaxed),
-                        WRITE_SERVICE_US.load(Ordering::Relaxed),
+                        WRITE_COST_US.load(Ordering::Relaxed),
                     ),
                     Ordering::Relaxed,
                 );
@@ -4190,9 +4254,10 @@ fn admit_write_path(
                 // 4x jump past the observed maximum, which is a spike in ONE of
                 // these and the message did not say which.
                 let inflight = WRITE_INFLIGHT.load(Ordering::Relaxed);
+                let cost_us = WRITE_COST_US.load(Ordering::Relaxed);
                 let service_us = WRITE_SERVICE_US.load(Ordering::Relaxed);
                 return Some(Value::Error(format!(
-                    "THROTTLED write would wait ~{est_ms}ms (inflight {inflight} x service {service_us}us), past --write-deadline-ms {deadline_ms}, retry with backoff"
+                    "THROTTLED write would wait ~{est_ms}ms (inflight {inflight} x cost {cost_us}us; residency {service_us}us), past --write-deadline-ms {deadline_ms}, retry with backoff"
                 )));
             }
         }
@@ -5472,7 +5537,7 @@ fn flintinfo(
     let compaction = rocks.as_ref().and_then(|kv| kv.compaction_pressure());
     let mem_sample = flint_storage::mem::sample();
     let info = format!(
-        "role:{}\r\nloading:0\r\nrole_epoch:{role_epoch}\r\nbuild:{build}\r\nsst_bytes:{sst}\r\nlatest_seq:{latest}\r\nlast_applied:{last_applied}\r\nacked_seq:{}\r\nseq_lag:{seq_lag}\r\nwal_headroom_seq:{whs}\r\nwal_min_acked_seq:{wma}\r\nwal_headroom_shed_seq:{whl}\r\nwal_bytes_per_seq:{wbps}\r\nwal_archive_mb:{wamb}\r\nwal_archive_src:{wasrc}\r\nlive_replicas:{}\r\nlag_ms:{}\r\nlag_ms_max:{lmx}\r\nlag_max_gap:{lmg}\r\nlag_soft_ms:{soft}\r\nlag_hard_ms:{hard}\r\nmin_replicas_to_write:{minr}\r\nwidowed_grace_ms:{wgm}\r\nwidowed_shed:{wsh}\r\nfullsync_active:{fsa}\r\nfullsync_max:{fsm}\r\nasync_write_queue:{aqd}\r\nwrite_deadline_ms:{wdm}\r\nwrite_inflight:{wif}\r\nwrite_service_us:{wsu}\r\nwrite_wait_est_ms:{wwe}\r\nwrite_wait_peak_ms:{wwp}\r\nwrite_wait_peak_inflight:{wwpi}\r\nwrite_wait_peak_service_us:{wwps}\r\nwrites_shed_deadline:{wsd}\r\nwrites_shed_lag:{wsl}\r\nwrites_shed_quorum:{wsq}\r\nwrites_shed_widowed:{wswd}\r\nwrites_shed_headroom:{wshr}\r\nwrites_delayed_soft:{wdsf}\r\nwal_fsync_ms:{wfm}\r\nwal_fsync_total:{wft}\r\ncert_days_remaining:{cdr}\r\nactive_conns:{ac}\r\nmax_conns:{mc}\r\nconns_shed_total:{cs}\r\nwrite_stopped:{wst}\r\ndelayed_write_rate:{dwr}\r\nwrite_stall_readable:{wsr}\r\nl0_files:{l0f}\r\npending_compaction_bytes:{pcb}\r\ncompaction_readable:{cr}\r\ndisk_free_bytes:{dfb}\r\ndisk_total_bytes:{dtb}\r\ndisk_free_pct:{dfp}\r\ndisk_verdict:{dv}\r\ndisk_unknown_samples:{dus}\r\nmem_avail_bytes:{mab}\r\nmem_total_bytes:{mtb}\r\nmem_avail_pct:{map}\r\nmem_src:{msrc}\r\nevictable_ns:{ens}\r\nevictable_ns_agree:{ensa}\r\nevictable_ns_bytes:{ensb}\r\nreclaim_active:{rca}\r\nreclaim_target_free_bytes:{rctf}\r\nevict:{evm}\r\ncollection_read_budget_pct:{crbp}\r\ncollection_read_in_flight_bytes:{crif}\r\ncollection_read_refused:{crr}\r\ncollection_read_unmeasured:{cru}\r\ngc_swept_expired:{gse}\r\ngc_swept_orphans:{gso}\r\nuptime_ms:{upms}\r\n",
+        "role:{}\r\nloading:0\r\nrole_epoch:{role_epoch}\r\nbuild:{build}\r\nsst_bytes:{sst}\r\nlatest_seq:{latest}\r\nlast_applied:{last_applied}\r\nacked_seq:{}\r\nseq_lag:{seq_lag}\r\nwal_headroom_seq:{whs}\r\nwal_min_acked_seq:{wma}\r\nwal_headroom_shed_seq:{whl}\r\nwal_bytes_per_seq:{wbps}\r\nwal_archive_mb:{wamb}\r\nwal_archive_src:{wasrc}\r\nlive_replicas:{}\r\nlag_ms:{}\r\nlag_ms_max:{lmx}\r\nlag_max_gap:{lmg}\r\nlag_soft_ms:{soft}\r\nlag_hard_ms:{hard}\r\nmin_replicas_to_write:{minr}\r\nwidowed_grace_ms:{wgm}\r\nwidowed_shed:{wsh}\r\nfullsync_active:{fsa}\r\nfullsync_max:{fsm}\r\nasync_write_queue:{aqd}\r\nwrite_deadline_ms:{wdm}\r\nwrite_inflight:{wif}\r\nwrite_service_us:{wsu}\r\nwrite_cost_us:{wcu}\r\nwrite_wait_est_ms:{wwe}\r\nwrite_wait_peak_ms:{wwp}\r\nwrite_wait_peak_inflight:{wwpi}\r\nwrite_wait_peak_cost_us:{wwps}\r\nwrites_shed_deadline:{wsd}\r\nwrites_shed_lag:{wsl}\r\nwrites_shed_quorum:{wsq}\r\nwrites_shed_widowed:{wswd}\r\nwrites_shed_headroom:{wshr}\r\nwrites_delayed_soft:{wdsf}\r\nwal_fsync_ms:{wfm}\r\nwal_fsync_total:{wft}\r\ncert_days_remaining:{cdr}\r\nactive_conns:{ac}\r\nmax_conns:{mc}\r\nconns_shed_total:{cs}\r\nwrite_stopped:{wst}\r\ndelayed_write_rate:{dwr}\r\nwrite_stall_readable:{wsr}\r\nl0_files:{l0f}\r\npending_compaction_bytes:{pcb}\r\ncompaction_readable:{cr}\r\ndisk_free_bytes:{dfb}\r\ndisk_total_bytes:{dtb}\r\ndisk_free_pct:{dfp}\r\ndisk_verdict:{dv}\r\ndisk_unknown_samples:{dus}\r\nmem_avail_bytes:{mab}\r\nmem_total_bytes:{mtb}\r\nmem_avail_pct:{map}\r\nmem_src:{msrc}\r\nevictable_ns:{ens}\r\nevictable_ns_agree:{ensa}\r\nevictable_ns_bytes:{ensb}\r\nreclaim_active:{rca}\r\nreclaim_target_free_bytes:{rctf}\r\nevict:{evm}\r\ncollection_read_budget_pct:{crbp}\r\ncollection_read_in_flight_bytes:{crif}\r\ncollection_read_refused:{crr}\r\ncollection_read_unmeasured:{cru}\r\ngc_swept_expired:{gse}\r\ngc_swept_orphans:{gso}\r\nuptime_ms:{upms}\r\n",
         if read_only { "replica" } else { "master" },
         hub.effective_acked(now)
             .map_or_else(|| "none".into(), |a| a.to_string()),
@@ -5541,6 +5606,10 @@ fn flintinfo(
         wdm = WRITE_DEADLINE_MS.load(Ordering::Relaxed),
         wif = WRITE_INFLIGHT.load(Ordering::Relaxed),
         wsu = WRITE_SERVICE_US.load(Ordering::Relaxed),
+        // Residency above, marginal cost here. The projection multiplies the
+        // SECOND one; reporting only the first is what let BUG-0088 read as a
+        // slow seat rather than a wrong model.
+        wcu = WRITE_COST_US.load(Ordering::Relaxed),
         wwe = estimated_write_wait_ms(),
         wwp = WRITE_WAIT_PEAK_MS.load(Ordering::Relaxed),
         wwpi = unpack_write_wait_peak(WRITE_WAIT_PEAK_PACKED.load(Ordering::Relaxed)).1,
@@ -6706,6 +6775,74 @@ mod replica {
 /// mixed commands classifies. Every one of them fails if the aggregate is
 /// taken from the FIRST command instead of all of them — which is the shape
 /// the bug had.
+/// The write-deadline projection (BUG-0088). Ungated, unlike the packing
+/// tests, because this arithmetic runs in every build and a test that executes
+/// in only one feature config is absent from the other.
+///
+/// IT LIVES DOWN HERE, away from the code it covers, for a reason worth
+/// knowing before moving it back: `plain_process_exit_stays_out_of_the_running_paths`
+/// reads this file and treats everything before the FIRST `#[cfg(test)]` as
+/// production text. A bare `#[cfg(test)]` up beside `projected_wait_ms` cuts
+/// that scan off at line ~1046 and the exit-site count silently collapses.
+/// The packing module up there only escapes because it is written
+/// `#[cfg(all(test, feature = "rocks"))]`, which does not match the needle --
+/// an accident, not a design.
+#[cfg(test)]
+mod write_projection_tests {
+    use super::{marginal_cost_us, projected_wait_ms};
+
+    #[test]
+    fn a_batch_commit_is_not_charged_once_per_member() {
+        // The gate run that failed on 2026-09-04: 65 writes in flight, each
+        // reporting 30942us of RESIDENCY, against a 2000ms deadline. They were
+        // one batch and committed together, so the wall clock spent was 31ms
+        // and not 2011ms.
+        let residency_us = 30_942;
+        let inflight = 65;
+        assert_eq!(
+            projected_wait_ms(inflight, residency_us),
+            2011,
+            "the OLD model, kept so the regression is legible"
+        );
+        let cost = marginal_cost_us(residency_us, inflight);
+        assert_eq!(
+            projected_wait_ms(inflight, cost),
+            30,
+            "the corrected model lands back on the commit that actually happened"
+        );
+    }
+
+    #[test]
+    fn a_genuinely_slow_seat_still_sheds() {
+        // The positive control. If the correction only ever made the number
+        // smaller it would have disarmed the deadline rather than fixed it.
+        // One write, alone, taking 2.5s: nothing is shared, so cost IS
+        // residency and the projection must still cross a 2000ms deadline.
+        let cost = marginal_cost_us(2_500_000, 1);
+        assert_eq!(cost, 2_500_000);
+        assert!(
+            projected_wait_ms(1, cost) > 2_000,
+            "a real stall must still shed"
+        );
+
+        // And a genuine pile-up: 500 in flight against commits of 10 sharing
+        // 100ms. Throughput is 100/s, so the queue really is 5s deep.
+        let piled = marginal_cost_us(100_000, 10);
+        assert!(
+            projected_wait_ms(500, piled) > 2_000,
+            "a queue that outruns throughput must still shed"
+        );
+    }
+
+    #[test]
+    fn sharing_cannot_divide_by_zero_or_wrap() {
+        // `shared` comes from a fetch_sub return and is floored at 1, but the
+        // arithmetic must not depend on the caller for that.
+        assert_eq!(marginal_cost_us(1_000, 0), 1_000);
+        assert_eq!(projected_wait_ms(u64::MAX, u64::MAX), u64::MAX / 1_000);
+    }
+}
+
 #[cfg(test)]
 mod superseded_cause_tests {
     use super::superseded_cause;

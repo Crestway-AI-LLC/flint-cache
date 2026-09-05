@@ -1,4 +1,4 @@
-# BUG-0088: `failover` fails when one write in 20 000 projects past the SHIPPED write deadline (OPEN)
+# BUG-0088: `failover` fails when one write in 20 000 projects past the SHIPPED write deadline (FIXED 2026-09-05 — the projection charged one batch commit once per member)
 
 Status: OPEN 2026-09-03 · Severity: medium — the drill is intermittent, but the
 threshold it crosses is the product default, not a test setting
@@ -345,3 +345,114 @@ rows say that at least one of the paths gets there through service time rather
 than depth, which narrows it and does not close it. The p99 curve the code
 comment asks for still does not exist, and it is the thing that would let the
 default be chosen from data instead of argument.
+
+### 2026-09-05 — the four rows above, recomputed
+
+The table is the best evidence in this file and it survives; the reading of it
+does not. `est` in that table is `inflight x residency`, so every figure is
+over-counted by the batch size. Recomputed as `inflight x (residency / inflight)`
+— which is just the residency — the same four firings project:
+
+| run | drill | inflight | residency | est AS RECORDED | est CORRECTED |
+|---|---|---|---|---|---|
+| `33829746490` | `failover` | 244 | 8 206 µs | 2002 ms | **8 ms** |
+| `33829746490` | `failover` | 218 | 9 216 µs | 2009 ms | **9 ms** |
+| `33930982465` | `restart` | 65 | 30 942 µs | 2011 ms | **31 ms** |
+| `33899834240` | `restart` | 30 | 67 038 µs | 2011 ms | **67 ms** |
+
+**None of the four was within an order of magnitude of the 2000 ms deadline.**
+The section above notes that "the product is the same to within 9 ms in all
+four — because 2000 ms is where the refusal happens, so every recorded sample
+is pinned just above it by construction". That is exactly right, and it is the
+tell: a quantity that is pinned by construction in every sample is not
+measuring the system.
+
+**"Two regimes" dissolves, but only half of it.** The `failover` rows were read
+as crossing on DEPTH — ~230 writes in flight — and depth is the half that does
+not survive: `inflight` is batch occupancy capped at `MAX_PURE_BATCH` = 256, so
+244 and 218 are nearly-full batches rather than a queue. The `restart` rows were
+read as crossing on SLOWNESS, and that half stands: 31–67 ms against `failover`'s
+8–9 ms is a real eightfold difference in how long a commit takes, and it is
+still unexplained.
+
+So the open question this file ends on is unchanged and now better posed: not
+"which of two regimes", but **why a commit on the `restart` path takes eight
+times what it takes on the `failover` path**. That is a throughput question, and
+`write_cost_us` is the gauge for it.
+
+
+## 2026-09-05 — FIXED, and the deadline was never the problem
+
+A fifth crossing, this time on `restart` at the newly shipped
+`FLINT_GATE_JOBS: 2`:
+
+    THROTTLED write would wait ~2011ms (inflight 65 x service 30942us),
+      past --write-deadline-ms 2000
+    errors: 1, replies: 101000
+
+P=2 was the last hope for making this go away by configuration, and it did what
+it was meant to — offered load fell from 256 in flight to 65 — **and the write
+was still refused.** That is what made the model worth re-reading instead of the
+runner.
+
+### The defect
+
+`WriteInFlight` is entered when a write is STAGED INTO A BATCH and dropped when
+that batch COMMITS (`main.rs`, and the call site's own comment says so: *"the
+write is in flight until the batch commits, not until it is staged"*). So the
+duration each write records is its RESIDENCY, and every write in a batch
+records the same commit.
+
+`est_ms = inflight x service_us` then multiplies that shared commit by the
+number sharing it. A batch of 65 committing in 31 ms is charged
+`65 x 30942us = 2011ms` for 31 ms of wall clock — and at a full batch it would
+be charged 256 times over.
+
+**`inflight` was never queue depth.** It is batch occupancy, capped at
+`MAX_PURE_BATCH = 256`, which is exactly the 256 this file recorded as
+"identical in both arms" at P=4 and read as steady offered load. A quantity
+pinned to a constant in both arms of an A/B is not measuring what is being
+varied.
+
+### The fix: Little's Law
+
+With L in flight and residency W, throughput is L/W, so a new write's expected
+wait is `L / (L/W)` = **W**, not `L x W`. Each residency sample is now divided
+by the number that shared it, giving a marginal cost, and the projection
+multiplies that instead:
+
+| | model | this run's numbers |
+|---|---|---|
+| before | `inflight x residency` | 65 x 30942us = **2011 ms** |
+| after | `inflight x (residency / shared)` | 65 x 476us = **30 ms** |
+
+30 ms is the commit that actually happened. Both gauges are now in FLINTINFO —
+`write_service_us` is the residency an operator sees, `write_cost_us` is what
+the projection multiplies — and the refusal names both, so a future crossing
+says which one moved.
+
+**The deadline's VALUE is unchanged at 2000 ms.** Raising it was rejected in
+this file as converting a measurement into a silence, and that was right: the
+measurement was simply wrong. Nothing about the promise made to a client
+changes.
+
+### Why this does not disarm the deadline
+
+The correction only removes double-counting, so a genuinely slow seat still
+sheds, and that is asserted rather than assumed
+(`write_projection_tests::a_genuinely_slow_seat_still_sheds`): one write alone
+taking 2.5 s shares nothing, so its cost IS its residency and it still crosses
+2000 ms; and 500 in flight against commits of 10 sharing 100 ms still projects
+5 s. Mutation-tested — restoring the old `inflight x residency` fails
+`a_batch_commit_is_not_charged_once_per_member` and leaves the slow-seat control
+passing, which is the discrimination that matters.
+
+### What this retracts
+
+- The margin table in `WRITE_DEADLINE_MS`'s doc comment ("90-1574 ms under
+  contention", "79% of this deadline", "headroom is a factor of about 1.5").
+  Every figure was the old model's. Withdrawn there and here.
+- **Not retracted:** per-write service under four-way CI contention really did
+  run ~11x an idle laptop's with every engine backpressure signal flat. The
+  contention is real. What does not follow is that it brought writes near this
+  deadline.
