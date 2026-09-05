@@ -2289,12 +2289,15 @@ MSRVPY
       echo "FAIL  the msrv-consistency check read almost nothing ($out)"
       FAILED="$FAILED msrv-stated-once-examined-nothing"; return ;;
   esac
-  local want scanned rest
-  want=$(printf '%s\n' "$out" | sed -n 's/^WANT \([^ ]*\) .*/\1/p')
+  # NOT `want`: gates.sh has a dispatch helper of that name, and a local
+  # shadowing it reads as a call. BUG-0097 taught the drill's scanner to
+  # ignore a declaration, so this is naming rather than a constraint.
+  local declared scanned rest
+  declared=$(printf '%s\n' "$out" | sed -n 's/^WANT \([^ ]*\) .*/\1/p')
   scanned=$(printf '%s\n' "$out" | sed -n 's/^WANT [^ ]* \(.*\)/\1/p')
   rest=$(printf '%s\n' "$out" | grep -v '^WANT ' || true)
   if [ -n "$rest" ]; then
-    echo "FAIL  Rust version(s) that disagree with Cargo.toml's rust-version = $want:"
+    echo "FAIL  Rust version(s) that disagree with Cargo.toml's rust-version = $declared:"
     printf '%s\n' "$rest" | while IFS="$(printf '\t')" read -r where hit; do
       echo "        $where  $hit"
     done
@@ -2307,7 +2310,7 @@ MSRVPY
     FAILED="$FAILED msrv-stated-once"
     return
   fi
-  echo "  every Rust version claim agrees with rust-version = $want ($scanned files read)"
+  echo "  every Rust version claim agrees with rust-version = $declared ($scanned files read)"
 }
 
 report_toolchain_vs_pin() {

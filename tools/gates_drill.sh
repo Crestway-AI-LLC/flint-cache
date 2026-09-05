@@ -101,11 +101,11 @@ for h in --help -h; do
   case "$O" in *"Usage: tools/gates.sh"*) ;;
     *) echo "FAIL: $h printed no usage block:"
        echo "$O" | sed 's/^/        /'; exit 1;; esac
-  for s in check conformance drills chaos; do
+  for s in check conformance drills chaos msrv; do
     case "$O" in *"$s"*) ;;
       *) echo "FAIL: $h does not name the $s stage"; exit 1;; esac
   done
-  echo "  $h: usage naming all four stages, exit 0"
+  echo "  $h: usage naming all five stages, exit 0"
 done
 
 echo "== an unrecognised stage refuses, and says which argument it was"
@@ -135,7 +135,7 @@ echo "== every documented stage still validates"
 # from inside the gate without running the gate. A stage dropped from the
 # validated set, or renamed on one side only, would be named in the refusal
 # instead of the poison.
-for s in check conformance drills chaos; do
+for s in check conformance drills chaos msrv; do
   gate 2 "$s" "$POISON"
   case "$E" in *"unrecognised stage: $POISON"*) ;;
     *) echo "FAIL: gates.sh no longer accepts the documented stage '$s':"
@@ -197,6 +197,40 @@ DISPATCHED=$(grep -v '^[[:space:]]*#' tools/gates.sh \
   echo "      ask for, or one that is accepted and then runs nothing."
   exit 1; }
 echo "  $(echo "$DECLARED" | tr '\n' ' ')"
+
+echo "== an opt-in stage is accepted by name and absent from a plain run"
+# THE PROPERTY THE SPLIT CREATED, and nothing checked it. `msrv` installs a
+# second toolchain to answer a question that only changes when the declaration
+# or the dependency set does, so it is valid as an argument and not in the
+# default run. Two ways to lose that, and both look like a working gate: put an
+# opt-in stage in DEFAULT_STAGES, or point the no-argument dispatch back at the
+# full set. Either runs, in a plain `tools/gates.sh`, a stage documented as one
+# you have to ask for.
+#
+# Naming the two component variables is unavoidable here -- the claim IS about
+# their relationship -- so the union is checked against DECLARED first. If a
+# refactor renames or drops one, that comparison fails loudly instead of this
+# block quietly asserting over two empty strings.
+eval "$(sed -n '1,/^want()/p' tools/gates.sh | grep -E '^[A-Z][A-Z0-9_]*="[^"]*"$')"
+UNION=$(printf '%s %s\n' "${DEFAULT_STAGES:-}" "${OPT_IN_STAGES:-}" \
+  | tr ' ' '\n' | grep -v '^$' | sort -u)
+[ "$UNION" = "$DECLARED" ] || {
+  echo "FAIL: DEFAULT_STAGES + OPT_IN_STAGES no longer compose the declared set:"
+  diff <(echo "$UNION") <(echo "$DECLARED") | sed 's/^/        /'
+  echo "      The two checks below are about those variables, so they would be"
+  echo "      asserting over the wrong thing -- or over nothing."
+  exit 1; }
+for s in ${OPT_IN_STAGES:-}; do
+  case " ${DEFAULT_STAGES:-} " in *" $s "*)
+    echo "FAIL: '$s' is in DEFAULT_STAGES and OPT_IN_STAGES, so a plain"
+    echo "      'tools/gates.sh' runs a stage documented as opt-in."
+    exit 1;; esac
+done
+grep -q '^STAGES="\${\*:-\$DEFAULT_STAGES}"$' tools/gates.sh || {
+  echo "FAIL: the no-argument dispatch does not default to \$DEFAULT_STAGES, so"
+  echo "      every opt-in stage runs in a plain 'tools/gates.sh'."
+  exit 1; }
+echo "  opt-in (${OPT_IN_STAGES:-none}) accepted by name, and outside the default set"
 
 # ---- states the command line can no longer reach ----
 #
