@@ -129,6 +129,21 @@ stop[0]=True; t.join()
 print(f"  globex: {solo:.0f} ops/s alone -> {beside:.0f} ops/s beside a pinned neighbor "
       f"({beside/solo*100:.0f}%), p99 {solo_p99:.2f} -> {beside_p99:.2f}ms")
 assert beside >= solo*0.5, f"unquotad tenant lost {100-beside/solo*100:.0f}% of its throughput to a quotad neighbor"
+# LATENCY IS MEASURED AND REPORTED, AND DELIBERATELY NOT ASSERTED ON.
+# Measured 2026-09-05, and the numbers say latency is the wrong channel.
+# A tenant fully governed by the bucket was probed alongside this: 3s of
+# synchronous SETs at 200/s of share returned n=128222, served=606,
+# shed=127616 — and its p99 was 0.04ms, LOWER than the unquotad tenant's
+# 0.10ms, because a -THROTTLED reply is cheaper to produce than a served one.
+#
+# The limiter SHEDS, it never QUEUES. So if isolation broke and globex fell
+# under acme's bucket, globex's p99 would go DOWN, not up, while its replies
+# turned into errors. A latency ceiling here would be an assertion that cannot
+# fail for the reason it would name.
+#
+# What actually detects that failure is already above: `measure` asserts no
+# reply contains THROTTLED, and the ratio asserts the throughput survived.
+# Those are the isolation checks; the p99 print is diagnostic context.
 PY
 [ $? -eq 0 ] || exit 1
 
