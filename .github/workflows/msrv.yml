@@ -2,8 +2,8 @@ name: msrv
 
 # Does the workspace actually build at the version Cargo.toml claims?
 #
-# `rust-version = "1.85"` has been declared since the workspace existed and
-# NOTHING verifies it. devcontainer.yml only asserts the toolchain is at least
+# `rust-version = "1.85"` HAD been declared since the workspace existed and  msrv-history
+# nothing verified it. devcontainer.yml only asserts the toolchain is at least
 # 1.85, which is the opposite check — it confirms the developer is new enough,
 # not that the code is old enough. So the claim cannot fail, and a claim that
 # cannot fail is not a claim. It already had a consequence: clippy's suggested

@@ -362,7 +362,9 @@ those from the
 [Releases page](https://github.com/Crestway-AI-LLC/flint-cache/releases/latest)
 and skip this section entirely ([docs/self-hosting.md](docs/self-hosting.md)).
 
-- **Rust 1.85 or newer** (edition 2024). `rustup` recommended; several distro
+- **Rust 1.88 or newer** — the `rust-version` in `Cargo.toml`, which is what
+  the dependency set needs rather than what the edition does. `rustup`
+  recommended; several distro
   toolchains are older and will refuse to build.
 - **A C++ toolchain and libclang** — RocksDB is compiled from source by the
   `rocksdb` crate. Debian/Ubuntu: `build-essential clang libclang-dev`.

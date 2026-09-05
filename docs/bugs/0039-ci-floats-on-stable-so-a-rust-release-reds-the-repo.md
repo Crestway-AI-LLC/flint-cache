@@ -1,7 +1,10 @@
-# BUG-0039 — CI floats on `@stable`, so a Rust release reds the repo on its own
+# BUG-0039 — CI floats on `@stable`, so a Rust release reds the repo on its own (FIXED)
 
-**Status:** occurrence fixed (`6ff8ca8`, `096aa63`, `c9487f3`); toolchain now
-PINNED and the rocks gap CLOSED (`3f2d701`). The MSRV half remains OPEN.
+**Status:** FIXED. Occurrence fixed (`6ff8ca8`, `096aa63`, `c9487f3`);
+toolchain PINNED and the rocks gap closed (`3f2d701`); **the MSRV half was
+closed the same night by `907f5f35`** and this line said otherwise for two
+weeks — see "The MSRV half, closed 2026-08-20 and unrecorded until 2026-09-05"
+below.
 
 ## Symptom
 
@@ -139,14 +142,68 @@ cache, so the gap bought nothing.
   gap here, it makes it stable and visible instead of moving and silent.
 - **check-rocks runs on push** (`3f2d701`).
 
-## Still open
+## The MSRV half, closed 2026-08-20 and unrecorded until 2026-09-05
 
-The **MSRV**. `Cargo.toml` declares `rust-version = "1.85"` and nothing builds
-at it — `devcontainer.yml` only asserts the toolchain is *at least* 1.85. The
-claim cannot fail, which is why clippy's `as_chunks::<2>()` suggestion was not
-adopted: it postdates 1.85 and nothing would have caught the violation.
+The section below is what this file said for two weeks. It was already false
+when it was written: `907f5f35`, timestamped 23:59 the same night, added
+`.github/workflows/msrv.yml` and corrected the declaration.
 
-Not fixed on 2026-08-20 because adding a blocking job for an unverified claim,
-immediately after a release, risks leaving `main` red overnight on something
-nobody has checked. That is a scheduling judgement, not a technical one, and
-the job is a few lines whenever someone wants to find out.
+> **Still open — the MSRV.** `Cargo.toml` declares `rust-version = "1.85"` and
+> nothing builds at it — `devcontainer.yml` only asserts the toolchain is *at
+> least* 1.85. The claim cannot fail, which is why clippy's `as_chunks::<2>()`
+> suggestion was not adopted: it postdates 1.85 and nothing would have caught
+> the violation.
+>
+> Not fixed on 2026-08-20 because adding a blocking job for an unverified
+> claim, immediately after a release, risks leaving `main` red overnight on
+> something nobody has checked.
+
+**What actually happened, and the scheduling judgement was honoured exactly.**
+The workflow was **dispatch-only until the answer was known**. Its first run
+said the declaration was false — `hdrhistogram`, `time` and `validit` all
+require 1.88, and cargo refuses at RESOLUTION, so our own code had never been
+compiled at the version published as the minimum. A second run at 1.88 passed.
+*Then* it became blocking and `rust-version` was corrected to 1.88. Adding it
+to the blocking path first would have reddened `main` on a claim nobody had
+checked, which is the thing the paragraph above was worried about.
+
+It tests the declaration rather than a number: the version comes from
+`Cargo.toml` unless a dispatch input overrides it, so raising or lowering the
+declaration changes what is verified.
+
+### The gap that was left, and is now closed
+
+`msrv.yml` runs `cargo check --workspace --all-targets` with **default
+features**. The durable engine is behind `rocks`, so a rocks-only path using a
+newer API would pass CI and fail the self-hoster the declaration exists for.
+
+`tools/gates.sh msrv` (2026-09-05) covers both configs. Opt-in — valid as an
+argument, absent from the default run — because it installs a second toolchain
+to answer a question that only changes when the declaration or the dependency
+set does. Measured on the gate box:
+
+    EVIDENCE: msrv rustc = rustc 1.88.0 (6b00bc388 2025-06-23) (declared 1.88)
+    EVIDENCE: msrv default features OK at 1.88 (149s)
+    EVIDENCE: msrv rocks features OK at 1.88 (2s)
+
+**So the declaration is true in both configs.** Two things about that output
+are worth keeping.
+
+The **2s** is not a leg that failed to run, and the timing is printed so the
+question gets asked. `flint-bench` depends on `rocksdb` unconditionally, so
+`librocksdb-sys` is in the DEFAULT graph and its C++ is compiled by the first
+leg; the second is the incremental re-check of the feature-gated code, which
+is the part that can use a newer API. Confirmed with `cargo tree -i
+librocksdb-sys` in both configs rather than assumed.
+
+The **EVIDENCE: prefix** was added on the second attempt. The first run passed
+in 148s and left nothing behind but the word `PASS`: `run.sh` pulls logs only
+on FAILURE, so which compiler answered — the one thing the stage exists to
+establish — terminated with the instance. A stage whose entire product is its
+finding cannot put that finding where a green run discards it.
+
+The stage also refuses to report at all unless the compiler that answers is the
+one asked for. `rust-toolchain.toml` pins this directory to 1.98 and
+`RUSTUP_TOOLCHAIN` is the one override that outranks it, so a silently
+ineffective override would have certified a claim about 1.88 by compiling with
+1.98 — a green run proving nothing, which is this file's own subject.

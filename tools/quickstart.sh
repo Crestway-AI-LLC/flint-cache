@@ -47,13 +47,24 @@ BINS="${FLINT_BINS:-$REPO/target/release}"
 
 preflight() {
   if [ -z "${FLINT_BINS:-}" ]; then
+    # THE FLOOR IS READ, NOT RESTATED. A number written here is a second
+    # declaration that drifts from Cargo.toml's, which is BUG-0039 exactly:
+    # this check said 85 for two weeks after the declaration became 1.88, so
+    # it would have waved a 1.86 toolchain through into a cargo resolution
+    # error naming three dependencies and not the cause.
+    local msrv fmaj fmin v maj min
+    msrv=$(sed -n 's/^rust-version[[:space:]]*=[[:space:]]*"\([0-9.]*\)".*/\1/p' \
+      "$REPO/Cargo.toml" 2>/dev/null | head -1)
+    msrv=${msrv:-1.88}
+    fmaj=${msrv%%.*}; fmin=${msrv#*.}; fmin=${fmin%%.*}
     command -v cargo >/dev/null 2>&1 \
-      || die "no cargo on PATH. Install Rust 1.85 or newer (https://rustup.rs), or point FLINT_BINS at prebuilt binaries."
-    local v maj min
+      || die "no cargo on PATH. Install Rust $msrv or newer (https://rustup.rs), or point FLINT_BINS at prebuilt binaries."
     v=$(rustc --version 2>/dev/null | awk '{print $2}')
     maj=${v%%.*}; min=${v#*.}; min=${min%%.*}
-    if [ "${maj:-0}" -le 1 ] && [ "${min:-0}" -lt 85 ]; then
-      die "Rust $v is too old — this workspace is edition 2024, which needs 1.85 or newer.
+    if [ "${maj:-0}" -lt "$fmaj" ] \
+      || { [ "${maj:-0}" -eq "$fmaj" ] && [ "${min:-0}" -lt "$fmin" ]; }; then
+      die "Rust $v is too old — this workspace needs $msrv or newer (edition 2024
+      needs 1.85; the dependency set needs $msrv, and cargo refuses at resolution).
       rustup update stable    (or install from https://rustup.rs)"
     fi
     # RocksDB is compiled from source, so a C++ compiler is genuinely required.

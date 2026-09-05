@@ -29,17 +29,23 @@ jobs:
 
       # Building is not the claim. The claim is "you can run tools/gates.sh in
       # here", and that needs three things the Dockerfile argues for at length.
-      - name: The toolchain is present and new enough for edition 2024
+      - name: The toolchain is present and new enough to build the workspace
         run: |
-          docker run --rm flint-dev bash -eux -c '
+          # THE FLOOR IS READ, NOT RESTATED. This step said 85 for two weeks
+          # after Cargo.toml's declaration became 1.88 — a second copy of a
+          # fact drifting from the first, which is BUG-0039. Computed on the
+          # runner, which has the checkout, and passed in.
+          MSRV=$(sed -n 's/^rust-version[[:space:]]*=[[:space:]]*"\([0-9.]*\)".*/\1/p' Cargo.toml | head -1)
+          [ -n "$MSRV" ] || { echo "::error::Cargo.toml has no rust-version to check against"; exit 1; }
+          echo "Cargo.toml declares rust-version = $MSRV"
+          docker run --rm -e MSRV="$MSRV" flint-dev bash -eux -c '
             rustc --version
             cargo --version
             clang --version | head -1
-            # Cargo.toml declares rust-version 1.85; anything older cannot
-            # build this workspace at all.
             v=$(rustc --version | awk "{print \$2}")
             maj=${v%%.*}; min=${v#*.}; min=${min%%.*}
-            [ "$maj" -gt 1 ] || [ "$min" -ge 85 ]
+            fmaj=${MSRV%%.*}; fmin=${MSRV#*.}; fmin=${fmin%%.*}
+            [ "$maj" -gt "$fmaj" ] || { [ "$maj" -eq "$fmaj" ] && [ "$min" -ge "$fmin" ]; }
           '
 
       - name: The conformance oracle is Valkey, and it speaks TLS

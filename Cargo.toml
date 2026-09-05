@@ -46,11 +46,20 @@ default-members = [
 [workspace.package]
 version = "0.0.1"
 edition = "2024"
-# Edition 2024 needs 1.85. Stated so that a distro toolchain fails with
-# "requires rustc 1.85 or newer" instead of an opaque edition error — the
-# first thing a self-hoster on RHEL or Debian stable would have hit.
-# CI and development run stable (1.96 at time of writing); anything between
-# 1.85 and that is permitted by cargo but not exercised by us.
+# Stated so that a distro toolchain fails with "requires rustc N or newer"
+# instead of an opaque edition error — the first thing a self-hoster on RHEL or
+# Debian stable would have hit.
+#
+# The number is 1.88 because that is what the DEPENDENCIES need, not the
+# edition: edition 2024 needs 1.85, and 1.85 was declared here for five months
+# while hdrhistogram, time and validit all required 1.88. cargo refuses at
+# RESOLUTION, so our own code had never once been compiled at the version
+# published as the minimum (BUG-0039).
+#
+# It is now checked rather than decorative, in two places that both READ this
+# line rather than restating it: `.github/workflows/msrv.yml` on every push,
+# and `tools/gates.sh msrv`, which adds the `rocks` feature config the workflow
+# does not build. Raise or lower this and both follow.
 rust-version = "1.88"
 license = "Elastic-2.0"
 repository = "https://github.com/Crestway-AI-LLC/flint-cache"

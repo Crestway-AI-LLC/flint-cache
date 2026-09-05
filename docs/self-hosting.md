@@ -50,7 +50,7 @@ copy ships at `/LICENSE` inside it.
 
 ## Quick start (single box)
 
-Build prerequisites (Rust 1.85+, a C++ toolchain and libclang for RocksDB,
+Build prerequisites (Rust 1.88+, a C++ toolchain and libclang for RocksDB,
 `valkey-cli`) are listed in the [README](../README.md#prerequisites).
 
 ```sh

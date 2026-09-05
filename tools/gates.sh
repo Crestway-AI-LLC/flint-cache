@@ -2183,14 +2183,111 @@ msrv_at_the_declaration() {
   echo "== cargo check --workspace --all-targets --features rocks"
   t0=$(date +%s)
   # A wrong feature spec is a cargo ERROR here, not a silent skip, so reaching
-  # the line below means these features were really applied. The elapsed time
-  # is printed anyway: this leg compiles librocksdb-sys, and a suspiciously
-  # short one is the first thing to look at if this ever passes too easily.
+  # the line below means these features were really applied.
+  #
+  # THIS LEG IS FAST, AND THAT IS EXPECTED. It reads ~2s against ~150s for the
+  # first, which looks exactly like a leg that did not run -- the reason the
+  # elapsed time is printed at all. `flint-bench` depends on `rocksdb`
+  # UNCONDITIONALLY, so `librocksdb-sys` is already in the default graph and
+  # its C++ is compiled by the leg above; this one is the incremental re-check
+  # of the code the `rocks` feature gates, which is the part that can use a
+  # newer API. Checked with `cargo tree -i librocksdb-sys` in both configs.
+  # If it ever reads ~0s AND the first leg does too, neither ran.
   RUSTUP_TOOLCHAIN="$v" cargo check --workspace --all-targets \
     --features flint-server/rocks,flint-backup/rocks || return 1
   t1=$(date +%s)
   echo "EVIDENCE: msrv rocks features OK at $v ($((t1 - t0))s)"
   echo "the workspace builds at $v in both feature configs"
+}
+
+# The MSRV is stated in more than one place, and only one of them is true.
+#
+# BUG-0039 corrected `rust-version` from 1.85 to 1.88 on 2026-08-20 after  msrv-history
+# measuring that three dependencies refuse below 1.88. FIVE other places kept
+# saying 1.85 for two weeks: README.md, docs/self-hosting.md, the quickstart's  msrv-history
+# own version gate, the devcontainer workflow's, and msrv.yml's header. Two of
+# those are CHECKS -- they would have waved a 1.86 toolchain through into a
+# cargo resolution error naming three crates and not the cause, which is the
+# confusing failure the declaration exists to prevent.
+#
+# The two checks now READ the declaration. Prose has to write a number, so this
+# holds the numbers together.
+#
+# THE OPT-OUT IS ON THE LINE, not in a list here. A file whose subject is the
+# history of this number legitimately quotes the old one; `msrv-history` on
+# that line says so where a reader of the line can see it. A list of exempt
+# FILES would be a second declaration to keep in sync with use, which is
+# BUG-0086's finding and this check's own subject one level up.
+assert_msrv_is_stated_once() {
+  local out
+  out=$(python3 - <<'MSRVPY'
+import glob, os, re, subprocess, sys
+try:
+    decl = re.search(
+        r'^rust-version\s*=\s*"([0-9.]+)"',
+        open("Cargo.toml", encoding="utf-8", errors="replace").read(), re.M)
+except OSError:
+    print("NOCARGO"); sys.exit(0)
+if not decl:
+    print("NODECL"); sys.exit(0)
+want = decl.group(1)
+files = subprocess.run(["git", "ls-files"], capture_output=True,
+                       text=True).stdout.split()
+pat = re.compile(
+    r"(?:Rust|rustc|rust-version|MSRV)[^0-9\n]{0,24}([0-9]+\.[0-9]+)(?:\.[0-9]+)?")
+bad = []
+scanned = 0
+for f in files:
+    # Write-ups quote the versions they are about; that is what they are for.
+    if f.startswith("docs/bugs/"):
+        continue
+    try:
+        lines = open(f, encoding="utf-8", errors="replace").read().split("\n")
+    except (OSError, IsADirectoryError, UnicodeDecodeError):
+        continue
+    scanned += 1
+    for i, line in enumerate(lines, 1):
+        if "msrv-history" in line:
+            continue
+        for m in pat.finditer(line):
+            if m.group(1) != want:
+                bad.append((f, i, m.group(0).strip()[:56]))
+# A file list that comes back empty certifies the tree by reading none of it.
+if scanned < 20:
+    print("NOFILES %d" % scanned); sys.exit(0)
+print("WANT %s %d" % (want, scanned))
+for f, i, hit in bad:
+    print("%s:%d\t%s" % (f, i, hit))
+MSRVPY
+) || { echo "FAIL  the msrv-consistency check could not run"; FAILED="$FAILED msrv-stated-once-unrunnable"; return; }
+
+  case "$out" in
+    NOCARGO*|NODECL*)
+      echo "FAIL  no rust-version to check the tree against ($out)"
+      FAILED="$FAILED msrv-undeclared"; return ;;
+    NOFILES*)
+      echo "FAIL  the msrv-consistency check read almost nothing ($out)"
+      FAILED="$FAILED msrv-stated-once-examined-nothing"; return ;;
+  esac
+  local want scanned rest
+  want=$(printf '%s\n' "$out" | sed -n 's/^WANT \([^ ]*\) .*/\1/p')
+  scanned=$(printf '%s\n' "$out" | sed -n 's/^WANT [^ ]* \(.*\)/\1/p')
+  rest=$(printf '%s\n' "$out" | grep -v '^WANT ' || true)
+  if [ -n "$rest" ]; then
+    echo "FAIL  Rust version(s) that disagree with Cargo.toml's rust-version = $want:"
+    printf '%s\n' "$rest" | while IFS="$(printf '\t')" read -r where hit; do
+      echo "        $where  $hit"
+    done
+    echo "        Two of these used to be CHECKS, and a stale one lets a"
+    echo "        too-old toolchain through into an error that names three"
+    echo "        dependencies instead of the cause (BUG-0039). Read the"
+    echo "        declaration where you can; where prose must write a number,"
+    echo "        write this one. A line that quotes an OLD version on purpose"
+    echo "        says so with \`msrv-history\` on the line itself."
+    FAILED="$FAILED msrv-stated-once"
+    return
+  fi
+  echo "  every Rust version claim agrees with rust-version = $want ($scanned files read)"
 }
 
 report_toolchain_vs_pin() {
@@ -2331,6 +2428,7 @@ if want check; then
   assert_bug_index_agrees
   assert_bug_titles_agree_with_status
   assert_bug_index_markers_agree_with_status
+  assert_msrv_is_stated_once
   assert_no_port_overlap
   assert_scripts_parse
   assert_no_scope_overlap
