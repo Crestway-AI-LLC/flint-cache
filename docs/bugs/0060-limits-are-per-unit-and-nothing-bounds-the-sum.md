@@ -970,7 +970,7 @@ Two caveats that both point the same way and neither changes the answer:
 ### What to use for the policy
 
 **3.5x against `ComplexMeta.bytes`, unchanged by the Linux run.** It clears the
-Linux maximum of 3.025 by 16%, clears the macOS maximum of 3.189 by 10%, and
+Linux maximum of 3.065 — now measured across hashes, sets and zsets — by 14%, clears the macOS maximum of 3.189 by 10%, and
 both platforms' curves are approached from below. Production is Linux x86_64, so
 3.025 is the figure that governs and 3.5x is a real margin over it rather than a
 rounding. One max-size read is then budgeted at ~1.9 GB.
@@ -1065,10 +1065,26 @@ Linux, so it must never reach that line.
 
 ### Still open
 
-- **The multiplier was measured on hashes only.** Sets and zsets store members
-  as keys with empty values, so their per-item overhead differs and k may too.
-  `tools/collection_read_peak.py` builds hashes; extending it is the next step
-  if the approximation is ever load-bearing.
+- ~~The multiplier was measured on hashes only.~~ **CLOSED 2026-09-05: measured
+  for all three types, and they agree.** Linux x86_64, zero swap across 27
+  trials, each type divided by its OWN denominator (hash: field+value; set:
+  members, which are keys with empty values; zset: member+8 for the score):
+
+  | shape | set | zset | hash |
+  |---|---|---|---|
+  | 32,500 x 4 KiB (~133 MB) | 2.544 | 2.619 | 2.540 |
+  | 130,000 x 4 KiB (~534 MB, at the cap) | 2.908 | 2.905 | 2.925 |
+  | 500,000 x 1 KiB (~504 MB) | 2.993 | 2.964 | **3.065** |
+
+  Within ~3% at every matched shape, and **the hash is the highest at the worst
+  shape**, so the hash-derived multiplier was the conservative one of the three
+  rather than a risk. k is driven by bytes and item count, not by type.
+
+  Worth recording that the local smoke run pointed the other way — a set at
+  ~4 MB read 3.16 on macOS against a hash needing 200 MB to reach 2.96, which
+  looked like a large type difference. It was a small-collection artifact on a
+  host with 16 KiB pages. One suggestive number on the development host is not
+  a finding; the same measurement on the platform that ships is.
 - **Skew in a list** makes the mean element size an approximation. Bounded by
   how far the requested elements sit from average, and the alternative — reading
   the range to size it — is the work being admitted.

@@ -824,9 +824,10 @@ production one.
 
 Two known gaps, both stated rather than hidden:
 
-- **The multiplier was measured on hashes.** Sets and zsets store members
-  as keys with empty values, so their per-item overhead differs and their
-  multiplier may too. It has not been measured for them.
+- **The multiplier is measured across hashes, sets and zsets** and they agree
+  within ~3% at matched size and item count — the hash, which 3.5 was derived
+  from, is the highest of the three at the worst shape. What drives k is bytes
+  and item count, not the collection type.
 - **`LRANGE` is admitted on the REQUESTED SLICE**, not the key. It reads only
   the ranks asked for, so charging it the whole list would refuse
   `LRANGE key 0 0` on a large one; the estimate is the elements in range times
