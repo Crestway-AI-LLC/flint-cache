@@ -94,23 +94,28 @@ accepting the overshoot silently. Lowering `WAL_ttl_seconds` to tighten the
 cadence was never available — the same knob sets the retention window, so
 buying a tighter bound would have cost the thing the bound protects.
 
-**The number: 112 GiB**, at the 200 MB/s reference `rocks.rs` already reasons
-with. That is `600 s x 200 MB/s`, and it clears the highest rate ever measured
-here (142.2 MB/s, ADR-0026, one seat at 138k ops/s = 80 GiB) by 40%. Deployments
-that have measured their own rate should use it; the term scales linearly and
-all but vanishes on a quiet fleet — the playground's soak, at about 1 MB/s,
-needs 0.6 GiB.
+**The number: 120 GB**, at the 200 MB/s reference `rocks.rs` already reasons
+with. `600 s x 200 MB/s` is exactly 120 000 MB, so the figure is stated in
+decimal GB and needs no conversion — the same quantity is 112 GiB, and both
+appear in earlier drafts of this file. **They are one number, not a revision.**
+Given how much a MiB/MB mix-up cost in BUG-0060 the same week, the unit is
+pinned to the one the rate is quoted in.
+
+It clears the highest rate ever measured here (142.2 MB/s, ADR-0026, one seat
+at 138k ops/s = 85 GB) by 40%. Deployments that have measured their own rate
+should use it; the term scales linearly and all but vanishes on a quiet fleet —
+the playground's soak, at about 1 MB/s, needs 0.6 GB.
 
 The budget is `clamp(volume / 4, 1 GiB, 256 GiB)`, so the rule resolves to:
 
 | volume | reserve |
 |---|---|
-| under 1 TiB | `volume >= 1.34 x (data + 600s x rate)` |
-| 1 TiB or more | `volume >= data + 256 GiB + 600s x rate` |
+| under 1 TiB | `volume >= 1.34 x (data + 600s x rate)` (any unit, used consistently) |
+| 1 TiB or more | `volume >= data + 275 GB + 600s x rate` (275 GB = the 256 GiB cap) |
 
-Worked: a 931 GiB disk at 200 MB/s reserves ~345 GiB (233 GiB budget + 112 GiB
-overshoot) and leaves ~587 GiB for data. At 1 MB/s the same disk reserves 233
-GiB and change.
+Worked: a 1 TB disk (931 GiB) at 200 MB/s reserves **~370 GB** — 250 GB of
+budget plus 120 GB of overshoot — leaving ~630 GB for data. At 1 MB/s the same
+disk reserves 250 GB and change.
 
 **Operators should measure rather than take 200 MB/s.** The rates above are
 *logical*; what fills the archive is WAL bytes. `latest_seq` sampled twice N

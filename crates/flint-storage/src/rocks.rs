@@ -371,7 +371,8 @@ pub const DEFAULT_WAL_SIZE_LIMIT_MB: u64 = 8_192; // 8 GiB, was 1 GiB
 ///
 /// What this returns is the budget, NOT the peak size on disk. The archive is
 /// pruned back to it every 600 s and grows freely in between, so a volume must
-/// hold `this + 600s x peak ingest` -- 112 GiB of headroom at 200 MB/s
+/// hold `this + 600s x peak ingest` -- 120 GB of headroom at 200 MB/s, which
+/// is exactly 600 x 200 MB and needs no unit conversion
 /// (BUG-0093, and `docs/self-hosting.md` 3b for the sizing rule).
 ///
 /// Two bounds, and the smaller wins.

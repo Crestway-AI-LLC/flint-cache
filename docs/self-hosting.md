@@ -661,21 +661,30 @@ Size the volume for that peak, not for the budget:
 
 | your peak WAL write rate | add for the 600 s window |
 |---|---|
-| 1 MB/s (a quiet fleet) | 0.6 GiB |
-| 38 MB/s | 21 GiB |
-| 89 MB/s | 50 GiB |
-| 142 MB/s (highest measured here) | 80 GiB |
-| **200 MB/s (use this if you have not measured)** | **112 GiB** |
+| 1 MB/s (a quiet fleet) | 0.6 GB |
+| 38 MB/s | 23 GB |
+| 89 MB/s | 53 GB |
+| 142 MB/s (highest measured here) | 85 GB |
+| **200 MB/s (use this if you have not measured)** | **120 GB** |
+
+Decimal GB, deliberately: the rate is quoted in decimal MB/s, so
+`600 s x 200 MB/s` is exactly 120 000 MB = **120 GB** with no conversion. The
+same figure is 112 GiB — if you see both, they are one number, not a revision.
 
 So a volume must hold `data + budget + 600s x rate`. Since the budget is a
 quarter of the volume until it caps at 256 GiB, that resolves to:
 
-- **volume under 1 TiB:** `volume >= 1.34 x (data + 600s x rate)`
-- **volume 1 TiB or larger:** `volume >= data + 256 GiB + 600s x rate`
+- **volume under 1 TiB:** `volume >= 1.34 x (data + 600s x rate)` — any unit,
+  as long as both sides use the same one
+- **volume 1 TiB or larger:** `volume >= data + 275 GB + 600s x rate`, the
+  275 GB being the 256 GiB budget cap. At 200 MB/s: `data + 395 GB`.
 
-A 931 GiB disk at 200 MB/s therefore reserves ~345 GiB — 233 GiB of budget plus
-112 GiB of overshoot — leaving ~587 GiB for data. On a quiet fleet the second
-term all but vanishes: the same disk at 1 MB/s reserves 233 GiB and change.
+A 1 TB disk (931 GiB) at 200 MB/s therefore reserves **~370 GB** — 250 GB of
+budget plus 120 GB of overshoot — leaving ~630 GB for data. On a quiet fleet the
+second term all but vanishes: the same disk at 1 MB/s reserves 250 GB and
+change. Note the budget itself is binary (a quarter of the volume, capped at
+256 GiB = 275 GB), which is why both units appear; the overshoot term is the
+decimal one.
 
 **Measure your own rate rather than taking 200 MB/s.** The figures above are
 *logical* write rates; what fills the archive is WAL bytes. Read both from
