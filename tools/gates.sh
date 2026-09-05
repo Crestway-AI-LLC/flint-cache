@@ -2166,11 +2166,30 @@ msrv_at_the_declaration() {
       ;;
   esac
 
+  # EVIDENCE: lines survive a PASS. step_report lifts them into the console
+  # stream, and this stage's whole product is its finding -- run.sh pulls the
+  # log only on FAILURE, so on a green run the answer would otherwise die with
+  # the box. The first attempt at this stage passed on the gate box and left
+  # nothing behind but the word PASS.
+  echo "EVIDENCE: msrv rustc = $got (declared $v)"
+
+  local t0 t1
   echo "== cargo check --workspace --all-targets (default features)"
+  t0=$(date +%s)
   RUSTUP_TOOLCHAIN="$v" cargo check --workspace --all-targets || return 1
+  t1=$(date +%s)
+  echo "EVIDENCE: msrv default features OK at $v ($((t1 - t0))s)"
+
   echo "== cargo check --workspace --all-targets --features rocks"
+  t0=$(date +%s)
+  # A wrong feature spec is a cargo ERROR here, not a silent skip, so reaching
+  # the line below means these features were really applied. The elapsed time
+  # is printed anyway: this leg compiles librocksdb-sys, and a suspiciously
+  # short one is the first thing to look at if this ever passes too easily.
   RUSTUP_TOOLCHAIN="$v" cargo check --workspace --all-targets \
     --features flint-server/rocks,flint-backup/rocks || return 1
+  t1=$(date +%s)
+  echo "EVIDENCE: msrv rocks features OK at $v ($((t1 - t0))s)"
   echo "the workspace builds at $v in both feature configs"
 }
 
