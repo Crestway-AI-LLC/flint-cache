@@ -1,4 +1,4 @@
-# BUG-0033: the WAL retention window cannot be bounded (OPEN)
+# BUG-0033: the WAL retention window cannot be bounded (FIXED)
 
 Status: **FIXED** 2026-08-22 · found 2026-08-19 while building release acceptance · Severity:
 medium — this is not a fault in the running product, it is the reason the

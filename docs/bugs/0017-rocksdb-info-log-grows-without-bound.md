@@ -1,4 +1,4 @@
-# BUG-0017: the RocksDB info LOG grows without bound (OPEN)
+# BUG-0017: the RocksDB info LOG grows without bound (FIXED and now tested)
 
 Status: **FIXED and now tested** 2026-08-22 · found 2026-08-18 on the playground · Severity: **medium** — an
 unbounded disk consumer that scales with replication churn rather than with

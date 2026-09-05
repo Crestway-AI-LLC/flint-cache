@@ -1187,6 +1187,90 @@ assert_induced_controls_have_not_regressed() {
   fi
 }
 
+assert_bug_titles_agree_with_status() {
+  # A WRITE-UP'S TITLE IS WHAT THE INDEX SHOWS. docs/bugs/README.md renders the
+  # H1's trailing marker, so a title that still says (OPEN) over a Status of
+  # FIXED tells every reader of the index the opposite of the truth -- and it
+  # is the cheapest possible drift, because closing a bug means editing the
+  # Status line and the title is three words to the left.
+  #
+  # Found by sweeping: FOUR files had drifted -- 0012 and 0017 for fifteen
+  # days, 0033 for fourteen, 0056 for nine. Each said (OPEN) above a Status
+  # beginning FIXED. Nobody was misled into re-fixing one only because nobody
+  # went looking; the index is the surface where that would happen.
+  #
+  # DELIBERATELY NARROW. The vocabulary in these files is rich and earned --
+  # MITIGATED, SUBSUMED, RETRACTED, HALF SHIPPED, PARTIALLY CLOSED, GUARDED,
+  # DECIDED AND APPLIED -- and a check that demanded the title restate the
+  # Status exactly would fail on prose that is doing its job. So only the one
+  # unambiguous contradiction is caught, in both directions:
+  #
+  #   title says OPEN (and nothing else)  over a Status that begins closed
+  #   title says closed                   over a Status that begins OPEN
+  #
+  # Anything subtler is left alone on purpose. A check that fires on judgement
+  # calls gets switched off, and then it catches nothing at all.
+  local out
+  out=$(python3 - <<'BTPY'
+import glob, os, re, sys
+CLOSED = ("FIXED", "RESOLVED", "CLOSED", "SHIPPED", "RETRACTED", "SUBSUMED",
+          "WONTFIX")
+bad = []
+n = 0
+for f in sorted(glob.glob("docs/bugs/[0-9][0-9][0-9][0-9]-*.md")):
+    head = open(f, encoding="utf-8", errors="replace").read()
+    h1 = head.split("\n", 1)[0]
+    m = re.search(r"\(([^)]*)\)\s*$", h1)
+    if not m:
+        continue
+    n += 1
+    marker = m.group(1).upper()
+    sm = re.search(r"^\*{0,2}Status:?\*{0,2}\s*:?\s*(.{0,40})", head, re.M)
+    if not sm:
+        continue
+    # The FIRST state word only: "MITIGATED ...; the gap is OPEN" is a
+    # consistent Status, not a closed one, and must not read as either.
+    # chr(96) rather than the character itself: this heredoc sits inside a
+    # $( ), and bash goes looking for a matching backtick even in a QUOTED
+    # heredoc there -- "unexpected EOF while looking for matching" on a line
+    # that is Python, not shell.
+    st = re.sub("[*_" + chr(96) + "]", "", sm.group(1)).strip().upper()
+    first = re.split(r"[\s,;.·]+", st)[0] if st else ""
+    title_open = "OPEN" in re.split(r"[^A-Z]+", marker) and not any(
+        c in marker for c in CLOSED)
+    title_closed = any(marker.split()[0].startswith(c) for c in CLOSED) if marker.split() else False
+    if title_open and first.startswith(CLOSED):
+        bad.append((f, marker, st))
+    elif title_closed and first == "OPEN":
+        bad.append((f, marker, st))
+# A glob that stops matching certifies every file by reading none of them.
+if n == 0:
+    print("NOFILES")
+    sys.exit(0)
+for f, marker, st in bad:
+    print("%s\t(%s)\t%s" % (os.path.basename(f), marker, st[:60]))
+BTPY
+) || { echo "FAIL  the bug-title check could not run"; FAILED="$FAILED bug-titles-unrunnable"; return; }
+
+  if [ "$out" = NOFILES ]; then
+    echo "FAIL  the bug-title check matched NO write-ups -- it certified the"
+    echo "        whole directory by reading none of it"
+    FAILED="$FAILED bug-titles-examined-nothing"
+    return
+  fi
+  if [ -n "$out" ]; then
+    echo "FAIL  these write-ups contradict their own Status line in the title"
+    echo "        the index renders:"
+    printf '%s\n' "$out" | while IFS="$(printf '\t')" read -r f marker st; do
+      echo "        $f"
+      echo "          title $marker  vs  Status: $st"
+    done
+    FAILED="$FAILED bug-titles-contradict-status"
+    return
+  fi
+  echo "  every bug title agrees with its own Status line"
+}
+
 assert_bug_index_agrees() {
   local idx=docs/bugs/README.md missing="" untitled="" dups b n h files=0
   if [ ! -s "$idx" ]; then
@@ -2002,6 +2086,7 @@ if want check; then
   assert_no_default_ports
   assert_induced_controls_have_not_regressed
   assert_bug_index_agrees
+  assert_bug_titles_agree_with_status
   assert_no_port_overlap
   assert_scripts_parse
   assert_no_scope_overlap

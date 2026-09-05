@@ -1,4 +1,4 @@
-# BUG-0012: a lagging replica can never catch up — WAL retention ignores replica progress (OPEN)
+# BUG-0012: a lagging replica can never catch up — WAL retention ignores replica progress (FIXED and now GATED)
 
 Status: **FIXED and now GATED** 2026-08-21 · found 2026-08-18 · Severity: high — a pair silently degrades to
 one copy on one disk, and the seat churns full syncs until someone notices
