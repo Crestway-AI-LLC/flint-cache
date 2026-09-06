@@ -81,6 +81,45 @@ to the data plane's hot path to compensate for a proxy-side queueing choice.
 difference between a change to one struct and a change to the write path, and
 it is the kind of thing that has been wrong before in this tree.
 
+## Two qualifications found while designing the measurement
+
+Both of these were missing from the first version of this ADR, and both were
+found by asking *how would I observe this* rather than by re-reading it.
+
+### The harm needs the reader and the writer on the SAME worker
+
+Connections are assigned to workers **round-robin and pinned for life**
+(ADR-0021), and backend connections are per worker. So two clients only share
+a backend FIFO if they landed on the same worker — with `W` workers, clients
+`i` and `i+W`.
+
+This is not a detail, it is the difference between a drill that measures the
+mechanism and one that measures luck. **A two-client drill on an 8-worker
+proxy would almost certainly show nothing and would "retire" this ADR for the
+wrong reason.** The measurement below therefore runs `--workers 1`, where
+sharing is guaranteed and assertable, and reports the mechanism at its worst.
+
+The production magnitude is then a second question — the client-to-worker
+ratio — and at `max-conns 1024` against ~8 workers, sharing is the norm
+rather than the exception. But that is an inference, and this ADR does not
+rest on it.
+
+### Replica reads ALREADY separate the lanes, for tenants that opt in
+
+`D7` routes a read to a replica when the tenant has opted in (`tenant-reads`)
+and the command is a read; **writes stay on the master**. Those are different
+addresses, so different `Key`s, so different connections — a tenant using
+replica reads has lane separation today, obtained a different way.
+
+That narrows the population this ADR is about: **tenants NOT using replica
+reads, which is the default.** And it is a genuine partial alternative that
+the first version of this ADR failed to list.
+
+It is not a substitute, for a reason worth stating: replica reads trade
+CONSISTENCY for the separation — a read may be behind by the replication lag
+— while lane separation trades neither. A tenant that cannot take stale reads
+has no way to get out of the shared FIFO today.
+
 ## Decision
 
 ### 1. Lane joins the connection key
@@ -124,7 +163,12 @@ One drill, and it is cheap because both halves already exist:
 1. Drive a namespace into an L0 write stall — `ingest_saturation` already
    produces the condition ADR-0026 characterised.
 2. Concurrently, a **read-only client on the same namespace** samples GET
-   latency through the proxy.
+   latency through the proxy. **`--workers 1`**, so the reader and the writer
+   provably share one backend connection — assertable, because `PROXYSTATS`
+   reports `pool_lanes`, and it must read 1.
+
+   The tenant must NOT have replica reads on, or the read goes to a different
+   address and the drill measures nothing.
 3. Report read p50/p99/p99.9 during the stall against the same client's
    pre-stall baseline.
 
@@ -156,6 +200,13 @@ batch. Shrinking batches would cost write throughput and leave the stall.
 
 **Split in the client.** We cannot control users' clients — the same argument
 ADR-0005 D6 used when the near-cache moved into the proxy.
+
+**Tell everyone to turn on replica reads.** It does separate the lanes (see
+above), and for a tenant that can take a stale read it is strictly cheaper
+than this ADR — no new sockets, no barrier, no code. It is rejected as *the*
+answer rather than as *an* answer: it makes consistency the price of read
+isolation, and the tenants most exposed to a write stall are not obviously
+the ones most able to pay it.
 
 **Do nothing, and lean on admission control.** ADR-0026's shed keeps the
 *write* path from collapsing and says nothing about reads queued behind it. It
