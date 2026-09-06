@@ -2493,7 +2493,8 @@ fn mint_certs(inv: &Inventory) {
          -subj /CN=flint-internal-ca -addext basicConstraints=critical,CA:TRUE 2>/dev/null"
     ));
     resign_leaves(&d, &sh, &inv.edge_sans);
-    eprintln!("  minted internal CA + component cert + edge cert");
+    harden_key_modes(&d);
+    eprintln!("  minted internal CA + component cert + edge cert (keys 0600)");
 }
 
 /// Copy the minted certs to every OTHER machine in the fleet.
@@ -2614,6 +2615,45 @@ fn push_bins(inv: &Inventory, tarball: &str) {
 /// `rotate-certs` (ADR-0006 D4): overwriting int.crt/int.key in place makes
 /// each component's hot-reload watcher pick up the new leaf, no restart. The
 /// CA is untouched, so old and new leaves both verify during the roll.
+/// 0600 on every private key in the certs dir, 0700 on the dir itself.
+///
+/// docs/security.md promises `certs/int.key` is "mode 0600, inside a
+/// root-only statedir". Nothing set it. `cert_manifest` DECLARES the mode and
+/// only `push_certs` applies it, and push_certs skips every non-remote
+/// runner -- so the mode reached the copies on other hosts and never the
+/// originals here. On a single-host deployment, which is what the AMI's
+/// first-boot and the quickstart both produce, it reached nothing at all, and
+/// every key was left at the umask: `-rw-r--r--`.
+///
+/// `ca.key` is the one that matters most and was never covered even on a
+/// fleet, because it is deliberately not in the manifest -- the CA key stays
+/// on the orchestrator and is pushed nowhere. Anyone who can read it can mint
+/// a leaf the entire mesh trusts, since internal dials verify a fixed name
+/// rather than a per-host identity.
+///
+/// A failure here is fatal rather than a warning. The alternative is writing
+/// a world-readable CA key and printing the line that says we minted one,
+/// which is the shape of every defect in docs/bugs that took longest to find.
+fn harden_key_modes(d: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    let entries = match std::fs::read_dir(d) {
+        Ok(e) => e,
+        Err(e) => die(&format!("reading {d} to secure its keys: {e}")),
+    };
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if p.extension().and_then(|s| s.to_str()) != Some("key") {
+            continue;
+        }
+        if let Err(e) = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)) {
+            die(&format!("securing {}: {e}", p.display()));
+        }
+    }
+    if let Err(e) = std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o700)) {
+        die(&format!("securing {d}: {e}"));
+    }
+}
+
 fn resign_leaves(d: &str, sh: &dyn Fn(&str), edge_sans: &[String]) {
     // THE KEY THIS NEEDS, CHECKED BEFORE ANYTHING IS TOUCHED.
     //
@@ -2739,6 +2779,9 @@ fn resign_leaves(d: &str, sh: &dyn Fn(&str), edge_sans: &[String]) {
         ));
     }
     sh(&format!("rm -rf {stage}"));
+    // Both callers land here: mint_certs (ca.key is already on disk by now)
+    // and rotate_certs, which rewrites int.key under live traffic.
+    harden_key_modes(d);
 }
 
 /// The edge cert's SAN list: loopback always, plus every `edge-san` entry —
@@ -7905,6 +7948,58 @@ mod reconverge_message_tests {
         ] {
             assert!(m.contains("a:1") && m.contains("b:2"), "{m}");
         }
+    }
+}
+
+#[cfg(test)]
+mod key_mode_tests {
+    use super::harden_key_modes;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn mode(p: &std::path::Path) -> u32 {
+        std::fs::metadata(p).expect("stat").permissions().mode() & 0o777
+    }
+
+    /// The defect was a private key at the umask -- `-rw-r--r--` -- while
+    /// docs/security.md said 0600. So the assertion is on the MODE BITS,
+    /// starting from a file deliberately created world-readable: a test that
+    /// only checked "0600 after" would pass against a umask that happened to
+    /// be 077 on the machine running it, and prove nothing on the machines
+    /// where it matters.
+    #[test]
+    fn every_private_key_ends_at_0600_and_certs_stay_readable() {
+        let d = std::env::temp_dir().join(format!("flint-keymode-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).expect("temp dir");
+        for (name, m) in [
+            ("ca.key", 0o644),
+            ("int.key", 0o644),
+            ("edge.key", 0o600),
+            ("ca.crt", 0o644),
+        ] {
+            let f = d.join(name);
+            std::fs::write(&f, b"x").expect("write");
+            std::fs::set_permissions(&f, std::fs::Permissions::from_mode(m)).expect("chmod");
+        }
+        assert_eq!(mode(&d.join("ca.key")), 0o644, "precondition: starts open");
+
+        harden_key_modes(d.to_str().expect("utf-8 temp path"));
+
+        // ca.key is the one that was never covered even on a fleet: it is
+        // deliberately absent from cert_manifest, so push_certs never carried
+        // a mode to it, on any deployment shape.
+        assert_eq!(mode(&d.join("ca.key")), 0o600);
+        assert_eq!(mode(&d.join("int.key")), 0o600);
+        assert_eq!(
+            mode(&d.join("edge.key")),
+            0o600,
+            "already-tight stays tight"
+        );
+        // Certificates are public by nature and several readers expect them.
+        assert_eq!(mode(&d.join("ca.crt")), 0o644, "certs must NOT be clamped");
+        assert_eq!(mode(&d), 0o700, "the directory itself, not just the files");
+
+        std::fs::remove_dir_all(&d).expect("cleanup");
     }
 }
 

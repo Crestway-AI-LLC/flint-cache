@@ -33,12 +33,27 @@ of Prometheus (BUG-0095).
 | Secret | How it is stored |
 |---|---|
 | Tenant tokens | **SHA-256 digests only.** The control plane never holds a plaintext token; authentication compares digests. |
-| Mesh private key | `certs/int.key`, mode **0600**, inside a root-only statedir. `ca.crt` and `int.crt` are 0644 — they are public by nature. |
+| Mesh private key | `certs/int.key`, mode **0600**, inside a statedir the certs directory keeps at **0700**. `ca.crt` and `int.crt` are 0644 — they are public by nature. |
+| CA private key | `certs/ca.key`, mode **0600**, and it never leaves the orchestrator: it is not in the cert manifest and is pushed to no host. Anyone who can read it can mint a leaf the whole mesh trusts, because internal dials verify a fixed name rather than a per-host identity. |
 | Admin token | Held by the control plane, rotatable in place (`rotate-admin`) with a dual-version window so rotation is not an outage. |
 | Release signing key | **Never on a build host.** It exists as a CI secret and an offline backup; `*.key` is gitignored repo-wide. See [release-signing.md](release-signing.md). |
 
 Tenants rotate their own tokens through a dual-version window, so a rotation
 does not require coordinating a restart with the application team.
+
+> **This page claimed 0600 before anything set it (BUG-0109, fixed
+> 2026-09-06).** The mode was declared in `cert_manifest` and applied only by
+> `push_certs`, which skips non-remote runners — so it reached the copies on
+> other hosts and never the originals, and on a single-host deployment, which
+> is what the AMI's first boot and the quickstart both produce, it reached
+> nothing. Keys were left at the umask, `-rw-r--r--`. `ca.key` was never
+> covered on any deployment shape, because it is deliberately pushed nowhere.
+> Minting and `rotate-certs` now both set the modes, and
+> `cert_reload_fleet_drill.sh` asserts them on both paths — it fails if a key
+> is not 0600 *and* if a certificate is not 0644, so a blanket `chmod -R 600`
+> does not satisfy it either. If you bootstrapped a fleet before this, check
+> `ls -l <statedir>/certs` and tighten it in place; the files are valid, only
+> their modes were wrong.
 
 ## Data at rest — read this one carefully
 

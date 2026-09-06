@@ -95,6 +95,36 @@ CP1=$(mesh_serial 7795); N1=$(mesh_serial 7061); E1=$(edge_serial 7998)
 PIDS1=$(pids)
 echo "  baseline: cp=$CP1 node=$N1 edge=$E1"
 
+# BUG-0109: a private key at the umask, while docs/security.md promised 0600.
+# Asserted HERE because this drill owns both paths that write one: bootstrap
+# above minted them, and rotate-certs below rewrites int/edge in place. A
+# rotation that re-widened a key would be invisible everywhere else.
+assert_key_modes () {
+  local when="$1" bad=0 m f
+  for f in "$D"/state/certs/*.key; do
+    [ -e "$f" ] || continue
+    m=$(stat -f '%OLp' "$f" 2>/dev/null || stat -c '%a' "$f")
+    [ "$m" = "600" ] || { echo "  $(basename "$f") is $m, want 600"; bad=1; }
+  done
+  # The certificates must NOT be clamped: several readers expect them public,
+  # and a check that only looked at keys would pass a chmod -R 600.
+  for f in "$D"/state/certs/*.crt; do
+    [ -e "$f" ] || continue
+    m=$(stat -f '%OLp' "$f" 2>/dev/null || stat -c '%a' "$f")
+    [ "$m" = "644" ] || { echo "  $(basename "$f") is $m, want 644"; bad=1; }
+  done
+  if [ "$bad" != 0 ]; then
+    echo "FAIL: key modes wrong $when. docs/security.md states 0600, and the"
+    echo "      CA key is the one that matters: anyone who can read it mints a"
+    echo "      leaf the whole mesh trusts, because internal dials verify a"
+    echo "      FIXED name rather than a per-host identity."
+    exit 1
+  fi
+  echo "  private keys 0600, certificates 644 $when"
+}
+echo "== private key modes after bootstrap"
+assert_key_modes "after bootstrap"
+
 echo "== live edge writer spans the rotation window"
 ( ACKED=0; ERRS=0
   END=$((SECONDS+8))
@@ -110,6 +140,9 @@ sleep 1
 echo "== rotate-certs (re-signs mesh + edge leaves in place)"
 $CTL -f "$D/cluster.flint" rotate-certs >/dev/null 2>&1 || { echo "FAIL: rotate-certs"; exit 1; }
 sleep 3.5   # > the 2s reload poll on every component
+
+echo "== private key modes survive the rotation"
+assert_key_modes "after rotate-certs"
 
 echo "== every listener presents the NEW serial, same pids"
 CP2=$(mesh_serial 7795); N2=$(mesh_serial 7061); E2=$(edge_serial 7998)
