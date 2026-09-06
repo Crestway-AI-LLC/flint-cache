@@ -1,4 +1,4 @@
-# BUG-0066 — a declared config key that nothing reads
+# BUG-0066 — a declared config key that nothing reads (FIXED 2026-08-27 for the key that has a test; the CLASS is detected, not prevented — see the last section)
 
 **Component:** `s3-accelerator`, S3A adoption path 1 (`FlintStreamFactory`)
 **Found:** 2026-08-27, while correcting a stale number on the website.

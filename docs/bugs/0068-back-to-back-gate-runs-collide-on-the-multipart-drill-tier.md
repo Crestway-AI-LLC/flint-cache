@@ -1,4 +1,4 @@
-# BUG-0068 — back-to-back gate runs collide on the multipart drill's tier
+# BUG-0068 — back-to-back gate runs collide on the multipart drill's tier (FIXED 2026-08-27 — the cleanup returned before the port was free)
 
 **Component:** `s3-accelerator`, `tools/gate.sh` + `tools/multipart_etag_drill.sh`
 **Observed:** 2026-08-27, once. **Cause not established** — this file is

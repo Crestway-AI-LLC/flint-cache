@@ -1,4 +1,4 @@
-# BUG-0067 — the tier-down fix never reached the path it was written for
+# BUG-0067 — the tier-down fix never reached the path it was written for (FIXED 2026-08-27, and both stated limits closed the same day)
 
 **Component:** `s3-accelerator`, S3A adoption path 1 (`FlintStreamFactory`)
 **Found:** 2026-08-27, by the suite built for BUG-0066, on its first run.
