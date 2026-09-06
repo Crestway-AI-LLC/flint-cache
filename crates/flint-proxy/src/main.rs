@@ -64,7 +64,40 @@ use flint_slot::slot_for_key;
 /// Total retry budget for one client command across MOVED chases, TRYAGAIN
 /// waits, and failover rediscovery — the proxy's answer to "latency spike,
 /// not errors" during topology changes.
-const RETRY_BUDGET: Duration = Duration::from_secs(5);
+///
+/// **TEN SECONDS, RAISED FROM FIVE 2026-09-05 (Jeff), because five was the
+/// same size as the thing it had to outlast** (BUG-0041). The masterless
+/// window on this fleet measures 4.3–4.6 s from the agent's recommendation to
+/// a verified promotion, and detection happens before that — call it ~5.4 s.
+/// A budget of 5 s does not cover it, so a write already in flight when a
+/// master died spent the whole budget and returned
+/// `-ERR no reachable master for this slot` at +5.02 s. Three occurrences,
+/// each `after 0 acked`: always the first write, the only one that spans the
+/// whole outage.
+///
+/// The margin was never positive. Which side of the line a run landed on was
+/// noise, which is why it read as a flake for three weeks.
+///
+/// WHY THIS SIDE OF THE TRADE. Shortening the window instead means cutting
+/// Tier 2's re-confirm streak (6 probes x 300 ms), which exists to stop a
+/// promotion firing on a blip; and doing nothing means relaxing the drill's
+/// `ERRS == 0`, which is the only place this behaviour is visible. Both spend
+/// a safety property. This spends the time a client waits before being told
+/// the truth about a genuinely dead cluster — and nobody has a 5-versus-10
+/// second expectation of that.
+///
+/// It helps READS as well as writes, which is not obvious. A replica
+/// self-fences stale reads at `--replica-read-stale-ms` (3 s default), so a
+/// read arriving between 3 s and the promotion falls back to a master that
+/// does not exist yet and used to exhaust the budget too. At 10 s it waits
+/// and then succeeds.
+///
+/// NOT a licence to raise it again. Above the client's own timeout this stops
+/// buying anything: the client gives up first and sees a socket timeout
+/// instead of an error string, which is strictly less diagnostic. 10 s sits
+/// under the timeouts the harnesses use (15 s) and above the window it has to
+/// cover; a future change should move the WINDOW, not this.
+const RETRY_BUDGET: Duration = Duration::from_secs(10);
 /// Backend I/O timeout for KEYED traffic. Generous: a frozen-slot drain or a
 /// slow disk read must not be misread as a dead node. Deliberately short all
 /// the same — a client waiting on GET wants to fail over, not to wait.
@@ -4662,6 +4695,117 @@ mod route_tests {
     /// the duration — a listener that accepts and never answers, so the probe
     /// blocks on the read timeout — and has a second caller arrive at 300 ms,
     /// deliberately PAST the debounce window and INSIDE the probe.
+    /// BUG-0041. A masterless window LONGER THAN THE OLD BUDGET is absorbed.
+    ///
+    /// This is the only automated exercise of `RETRY_BUDGET`'s new value. The
+    /// old 5 s was the same size as the window it had to outlast (measured
+    /// 4.3-4.6 s recommendation-to-promotion, plus detection), so a write in
+    /// flight at a master's death spent the whole budget and returned
+    /// `-ERR no reachable master for this slot`. At 10 s it waits and then
+    /// succeeds.
+    ///
+    /// **IT COSTS SIX SECONDS, on a suite that otherwise runs in under one.**
+    /// Stated rather than hidden, because the next person to see it will want
+    /// to delete it. The property is a WALL-CLOCK deadline and there is no
+    /// honest way to test it without spending wall clock: a shorter outage
+    /// passes at either budget and proves nothing, and asserting the constant
+    /// equals 10 is a change-detector that would not have caught the original
+    /// bug either. Six seconds is the cheapest number that fails at 5 and
+    /// passes at 10.
+    #[test]
+    fn a_masterless_window_longer_than_the_old_budget_is_absorbed() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        const OUTAGE: Duration = Duration::from_secs(6);
+
+        let lp = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = format!(
+            "127.0.0.1:{}",
+            lp.local_addr().expect("listener addr").port()
+        );
+        // A pair with no master until `OUTAGE` has passed: FLINTINFO answers
+        // `role:replica`, so `discover_master` finds nothing and the retry
+        // loop takes the no-target branch — which is the branch that emitted
+        // the real error. Then it becomes a master and serves the write.
+        let promoted = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&promoted);
+        std::thread::spawn(move || {
+            while let Ok(mut c) = lp.accept().map(|(c, _)| c) {
+                let flag = Arc::clone(&flag);
+                std::thread::spawn(move || {
+                    let mut buf = [0u8; 4096];
+                    while let Ok(n) = c.read(&mut buf) {
+                        if n == 0 {
+                            return;
+                        }
+                        let req = String::from_utf8_lossy(&buf[..n]).to_uppercase();
+                        let reply: Vec<u8> = if req.contains("HELLO") {
+                            b"%0\r\n".to_vec()
+                        } else if req.contains("FLINTNS") {
+                            b"+OK\r\n".to_vec()
+                        } else if req.contains("FLINTINFO") {
+                            if flag.load(Ordering::SeqCst) {
+                                b"$11\r\nrole:master\r\n".to_vec()
+                            } else {
+                                b"$12\r\nrole:replica\r\n".to_vec()
+                            }
+                        } else {
+                            b":1\r\n".to_vec()
+                        };
+                        if c.write_all(&reply).is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+
+        // No master in the routing table: the loop must discover one.
+        let t = Arc::new(topo(vec![vec![addr.clone()]], vec![None]));
+        let flip = Arc::clone(&promoted);
+        std::thread::spawn(move || {
+            std::thread::sleep(OUTAGE);
+            flip.store(true, Ordering::SeqCst);
+        });
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let local = tokio::task::LocalSet::new();
+        let started = Instant::now();
+        let reply = rt.block_on(local.run_until(async {
+            let mut backends = Backends::new(b"t".to_vec(), None, false, FANOUT_TIMEOUT_DEFAULT);
+            let args = vec![b"INCR".to_vec(), b"k".to_vec()];
+            let mut raw = Vec::new();
+            encode(
+                &Value::Array(Some(
+                    args.iter().map(|a| Value::Bulk(Some(a.clone()))).collect(),
+                )),
+                &mut raw,
+            );
+            forward(&t, &mut backends, b"t", &args, &raw, false).await
+        }));
+        let took = started.elapsed();
+
+        // CAPABILITY: the outage must actually have spanned the old budget, or
+        // this passes without exercising the change.
+        assert!(
+            took >= Duration::from_secs(5),
+            "the call returned in {took:?}, inside the OLD 5s budget — the \
+             fixture did not create a window this change is about"
+        );
+        match reply {
+            Value::Integer(1) => {}
+            Value::Error(e) => {
+                panic!("a {OUTAGE:?} masterless window was not absorbed after {took:?}: {e:?}")
+            }
+            other => panic!("expected the retried :1, got {other:?}"),
+        }
+    }
+
     /// BUG-0041's investigation ruled this OUT as that bug's cause and found
     /// it on the way: the proxy forwards `-LOADING` to the client.
     ///

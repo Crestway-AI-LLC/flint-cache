@@ -4,8 +4,9 @@
 refuted 2026-09-05. Nothing escaped: the budget was SPENT, to the millisecond.
 Filename kept so links survive.)*
 
-**Status:** CAUSE CONFIRMED 2026-09-05 — the retry budget is exhausted, not
-escaped. The fix is a constant nobody should change alone; see *The decision
+**Status:** FIXED 2026-09-05 — `RETRY_BUDGET` raised 5 s -> 10 s (Jeff's call,
+option 1 of the three below). The cause was confirmed the same day: the retry
+budget is exhausted, not escaped. The fix is a constant nobody should change alone; see *The decision
 this leaves* at the foot. The instrumentation added 2026-08-22 is what answered
 it, on the first two occurrences that carried it.
 
@@ -259,3 +260,56 @@ something different:
 
 Whichever moves, the margin should be MEASURED every run rather than discovered
 once in 320 — see the drill change landing beside this.
+
+## Fixed 2026-09-05 — the budget, raised to 10 s
+
+Jeff took option 1. `RETRY_BUDGET` was five seconds, the same size as the
+window it had to outlast; it is ten now.
+
+**Why this side of the trade, in one line each.** Shortening the window means
+cutting Tier 2's re-confirm streak (6 probes x 300 ms), which exists to stop a
+promotion firing on a blip. Doing nothing means relaxing the drill's
+`ERRS == 0`, the only place this behaviour is visible. Both spend a safety
+property. Raising the budget spends the time a client waits before being told
+the truth about a genuinely dead cluster — and nobody holds a 5-versus-10
+second expectation of that.
+
+**It helps READS too, which was not obvious until asked.** A replica
+self-fences stale reads at `--replica-read-stale-ms` (3 s default), so a read
+arriving between 3 s and the promotion falls back to a master that does not
+exist yet and used to exhaust the budget exactly like a write. At 10 s it waits
+and then succeeds. Note the shape: the fence is SHORTER than the window it has
+to survive. Widening it is a separate decision about the staleness bound a
+tenant was promised, and was deliberately not bundled here.
+
+**Where it stops helping.** Above the client's own timeout this buys nothing —
+the client gives up first and sees a socket timeout instead of an error string,
+which is strictly less diagnostic. 10 s sits under the harnesses' 15 s and
+above the window it must cover. A future change should move the WINDOW.
+
+### The test, and what it cost
+
+`a_masterless_window_longer_than_the_old_budget_is_absorbed`: a fake backend
+answers `role:replica` for six seconds — so `discover_master` finds nothing and
+the loop takes the no-target branch, the one that emitted the real error — then
+becomes a master. **It costs six seconds on a suite that otherwise runs in
+under one, and that is stated in the test rather than hidden**, because the
+next reader will want to delete it. The property is a wall-clock deadline;
+a shorter outage passes at either budget and proves nothing, and asserting the
+constant equals 10 is a change-detector that would not have caught the original
+bug either.
+
+Reverting the constant to 5 reproduces the production failure verbatim:
+
+    a 6s masterless window was not absorbed after 5.017703666s:
+      "ERR no reachable master for this slot"
+
+Same string and the same ~5.02 s as the 08-25 and 08-29 occurrences. A bug that
+sat at "cause unknown" for three weeks is now reproducible in six seconds
+without a fleet.
+
+**Not claimed: that the drill's 1-in-320 is gone.** The margin is now ~4.6 s
+instead of ~-0.4 s, so the failure should not recur — but the only proof is the
+ops gate running `tier2_promote` and not seeing it, and `docs/adr/0012` and the
+ops drill's own margin report were updated to the new number so the next reader
+is not measuring against a constant that moved.

@@ -72,7 +72,9 @@ everything. Flint can give all-or-nothing *application* of a transaction
 and exclusion against other *writers*, but a concurrent reader performing a
 multi-part read can still observe a partial view.
 
-**3. The proxy retries transparently.** `RETRY_BUDGET` is five seconds
+**3. The proxy retries transparently.** `RETRY_BUDGET` is ten seconds
+(five until 2026-09-05; BUG-0041 raised it, because five was the same size as
+the masterless window it had to outlast)
 spanning MOVED chases, TRYAGAIN waits and failover rediscovery, and
 recovery drops and re-dials backend connections (`drop_conn`,
 `rediscover_for`). A re-dial mid-transaction silently discards the queued
