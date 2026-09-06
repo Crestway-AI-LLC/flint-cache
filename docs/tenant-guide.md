@@ -115,17 +115,27 @@ absorbed by the proxy).
 | error | meaning | what to do |
 |---|---|---|
 | `-THROTTLED ...` | back-pressure: your ops/s quota, a loss-protection guard, or admission control | retry with backoff — the condition is transient |
-| `-QUOTA ...` | your storage cap is exceeded; **writes** are rejected | reads still work, and **deletes always work** — free space (DEL/UNLINK/FLUSHALL/EXPIRE) and the verdict clears itself within a sweep |
+| `-QUOTA ...` | your storage cap is exceeded; **writes** are rejected | reads still work, and **deletes always work** — free space (`DEL`, `UNLINK`, `FLUSHALL`, `EXPIRE`, `PEXPIRE`, `EXPIREAT`, `PEXPIREAT`) and the verdict clears itself within a sweep |
 | `-QUOTA server is low on disk space ...` | the **server**, not your cap, is short of room | same contract: reads served, deletes work, and it clears itself once space returns. Your usage may be well under quota — this one is ours to fix, and it pages us |
 | `-WRONGPASS` / `-NOAUTH` | bad or missing token | check the token; re-AUTH |
 
-Two invariants worth knowing:
+Two invariants worth knowing. **Both are about the storage cap**, which is
+the one that can leave you stuck; the ops/s limit is a separate thing and is
+described after them:
 
-- **You can always read your data out.** No quota state ever blocks a
-  read.
-- **The self-clear path is never blocked.** Space-reducing commands are
-  exempt from the storage shed precisely so a full tenant can cure the
-  condition that gated it.
+- **The storage cap never blocks a read.** Being over it rejects writes and
+  serves reads, so you can always get your data out of a full namespace.
+- **The self-clear path is never shed.** The space-reducing commands above
+  are exempt from the storage shed precisely so a full tenant can cure the
+  condition that gated them.
+
+**The ops/s quota is not one of those two, and it does pace reads.** It is a
+token bucket over every command you send — `GET` included, and the
+space-reducing commands included — and when it is empty the answer is
+`-THROTTLED ops/s quota exceeded, retry with backoff`. That is a rate, not a
+lockout: the tokens refill, so a read that is throttled now succeeds shortly
+after, which is why the row above says retry rather than escalate. Size your
+read-path backoff for it rather than assuming reads are ungated.
 
 ## Quotas
 
