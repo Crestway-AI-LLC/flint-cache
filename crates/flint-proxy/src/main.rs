@@ -78,6 +78,14 @@ use flint_slot::slot_for_key;
 /// The margin was never positive. Which side of the line a run landed on was
 /// noise, which is why it read as a flake for three weeks.
 ///
+/// **AND TEN IS NOT AN ARBITRARY NUMBER: it is the RTO budget.** `docs/slo.md`
+/// states "Budget: 10 s" for failover. This proxy exists to absorb a failover
+/// so a client sees a latency spike rather than an error — and it was giving
+/// up at HALF the time the product allows that failover to take. Matching the
+/// two makes the contract self-consistent: the proxy now retries for exactly
+/// as long as a failover is permitted to run. Raising it further would promise
+/// more patience than the SLO asks for; leaving it lower promised less.
+///
 /// WHY THIS SIDE OF THE TRADE. Shortening the window instead means cutting
 /// Tier 2's re-confirm streak (6 probes x 300 ms), which exists to stop a
 /// promotion firing on a blip; and doing nothing means relaxing the drill's

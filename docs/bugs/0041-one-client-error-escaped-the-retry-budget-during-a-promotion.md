@@ -266,6 +266,19 @@ once in 320 — see the drill change landing beside this.
 Jeff took option 1. `RETRY_BUDGET` was five seconds, the same size as the
 window it had to outlast; it is ten now.
 
+**Ten is not an arbitrary number — it is the RTO budget, and that is the
+cleanest statement of the whole defect.** `docs/slo.md`: *"Failover time (RTO)
+— Budget: 10 s."* The proxy exists to absorb a failover so a client sees a
+latency spike rather than an error, and it was giving up at **half** the time
+the product allows that failover to take. The two numbers are now the same, so
+the contract is self-consistent: the proxy retries for exactly as long as a
+failover is permitted to run. Raising it further would promise more patience
+than the SLO asks for; leaving it at five promised less.
+
+This is a better argument than the one first written here ("nobody holds a
+5-versus-10 second expectation"), and it was found afterwards, by reading
+slo.md for what the change would affect rather than for what it would justify.
+
 **Why this side of the trade, in one line each.** Shortening the window means
 cutting Tier 2's re-confirm streak (6 probes x 300 ms), which exists to stop a
 promotion firing on a blip. Doing nothing means relaxing the drill's
