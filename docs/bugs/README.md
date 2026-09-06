@@ -5,6 +5,31 @@ symptom, the wrong conclusion that was drawn first, the root cause, and the
 check that now holds it. They are kept because the misdiagnosis is usually
 the expensive part, and a fix without it teaches nothing.
 
+## How a number is allocated, and why collisions are tolerated
+
+**Take the next free number on `origin/main` and push as soon as your gate is
+green.** There is no allocator and there is deliberately not going to be one.
+
+Two sessions filing on the same afternoon will sometimes take the same number.
+That happened **six times on 2026-09-06** — 0107, 0111, 0112, 0113, 0116, and
+one more the same evening — and every one cost a rename: the file, the H1, the
+index row, any inbound links, and the commit message. The gate catches it
+(`bug number(s) naming more than one file`) or the rebase does, so a collision
+is never published.
+
+**Reviewed and kept, 2026-09-06.** Allocate optimistically, detect on merge.
+The alternatives are worse in the ways that matter: a shared allocator is a
+new thing two repositories must agree on and that can be down when you are
+trying to write a file, and reserved per-session ranges leave gaps that make
+the series harder to read for everyone who was not there. A rename is
+mechanical and takes a minute; neither alternative is.
+
+**Most of the exposure is self-inflicted and now closed.** Every one of those
+six collisions happened while a branch sat un-pushed through a 20-plus-minute
+gate run. The window that matters is between the gate going green and the
+push, and it is entirely within one session's control. Batch the work, gate
+once, then push before starting the next thing.
+
 ## About the `#NNN` references in comments
 
 Code and commit messages across this repo cite bugs as `#118`, `#133`,
