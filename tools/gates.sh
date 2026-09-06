@@ -2750,6 +2750,119 @@ RETRYPY
   echo "  every write command is classified in retry-safety.md ($count writes)"
 }
 
+assert_guides_only_name_documented_commands() {
+  # docs/command-support.md tells readers, in its own words, that it is the
+  # list to consult when deciding whether Flint implements something. On
+  # 2026-09-06 four operating guides told operators and tenants to run
+  # commands it did not mention -- FLINTNSBYTES, FLINTCONFIG, PROXYSTATS,
+  # PROXYLATENCY, PROXYHOTKEYS -- and the matrix went further than silence on
+  # one of them: it said "there is no substitute for CONFIG" while
+  # FLINTCONFIG hot-sets ten tunables and two other pages said so. An
+  # operator who believed the matrix would take a RESTART to change a value
+  # that needs none (BUG-0108).
+  #
+  # Every docs/*.md is classified below, and the check fails if one is in
+  # neither list. That is the difference between this and an exclusion list:
+  # a new document cannot be quietly uncovered, it has to be called a guide
+  # or called internals by someone.
+  local out
+  out=$(python3 - <<'GUIDESPY'
+import glob, os, re, sys
+
+# Docs written for someone who will RUN what they read.
+GUIDES = {
+    "README.md", "release-checklist.md", "release-signing.md",
+    "retry-safety.md", "security.md", "self-hosting.md", "slo.md",
+    "space-reclaim.md", "tenant-guide.md",
+}
+# Docs that describe MECHANISM. They name control-plane verbs -- CPLEASE,
+# FLINTDEMOTE, FLINTSLOTSTATS -- to explain how the system works, not to tell
+# anyone to send them, and a client command matrix is right not to list them.
+INTERNALS = {"architecture.md", "capacity-model.md", "failover.md"}
+MATRIX = "command-support.md"
+
+present = {os.path.basename(f) for f in glob.glob("docs/*.md")}
+if not present:
+    print("NODOCS")
+    sys.exit(0)
+unclassified = sorted(present - GUIDES - INTERNALS - {MATRIX})
+if unclassified:
+    print("UNCLASSIFIED " + " ".join(unclassified))
+    sys.exit(0)
+missing_files = sorted((GUIDES | INTERNALS) - present)
+if missing_files:
+    print("GONE " + " ".join(missing_files))
+    sys.exit(0)
+
+# Positive rule for "this token is a command": the server or the proxy
+# matches on it. Nothing else distinguishes SCAN the command from SCAN the
+# English word, and a doc-only heuristic invents findings.
+src = ""
+for f in sorted(glob.glob("crates/flint-server/src/*.rs")) + sorted(
+    glob.glob("crates/flint-proxy/src/*.rs")
+):
+    src += open(f, encoding="utf-8", errors="replace").read()
+dispatched = set(re.findall(r'b"([A-Z][A-Z0-9.]{1,})"', src))
+try:
+    matrix = open("docs/" + MATRIX, encoding="utf-8", errors="replace").read()
+except OSError:
+    print("NOMATRIX")
+    sys.exit(0)
+if not dispatched or not matrix:
+    print("EMPTY %d %d" % (len(dispatched), len(matrix)))
+    sys.exit(0)
+
+rows = []
+for name in sorted(GUIDES):
+    text = open("docs/" + name, encoding="utf-8", errors="replace").read()
+    named = set(re.findall(chr(96) + r"([A-Z][A-Z0-9.]{1,})", text))
+    for c in sorted((named & dispatched) - {m for m in named if m in matrix}):
+        rows.append("%s\t%s" % (name, c))
+print("COUNT %d %d" % (len(GUIDES), len(dispatched)))
+for r in rows:
+    print(r)
+GUIDESPY
+  )
+  case "$out" in
+    NODOCS|NOMATRIX)
+      echo "FAIL  docs/ or the command matrix could not be read, so nothing was"
+      echo "        compared. This is not a pass."
+      FAILED="$FAILED guides-commands-unreadable"; return ;;
+    UNCLASSIFIED*)
+      echo "FAIL  docs/*.md not classified as a guide or as internals:"
+      printf '        %s\n' "${out#UNCLASSIFIED }"
+      echo "        Add it to GUIDES if a reader is meant to RUN what it names,"
+      echo "        or to INTERNALS if it describes mechanism. The lists exist"
+      echo "        so a new page cannot be silently uncovered."
+      FAILED="$FAILED guides-commands-unclassified"; return ;;
+    GONE*)
+      echo "FAIL  classified but missing from docs/: ${out#GONE }"
+      echo "        A renamed page drops out of this check without saying so,"
+      echo "        so the rename has to update the list."
+      FAILED="$FAILED guides-commands-stale-list"; return ;;
+    EMPTY*)
+      echo "FAIL  one side came back empty ($out); nothing was compared."
+      FAILED="$FAILED guides-commands-examined-nothing"; return ;;
+  esac
+  local counts rows
+  counts=$(printf '%s\n' "$out" | sed -n 's/^COUNT \(.*\)/\1/p')
+  rows=$(printf '%s\n' "$out" | grep -v '^COUNT ' || true)
+  if [ -n "$rows" ]; then
+    echo "FAIL  a guide names a command docs/command-support.md does not:"
+    printf '%s\n' "$rows" | while IFS="$(printf '\t')" read -r where cmd; do
+      echo "        $where  $cmd"
+    done
+    echo "        That page says it is the list to consult when deciding"
+    echo "        whether Flint implements something, so a command a guide"
+    echo "        tells you to run and the matrix omits makes one of the two"
+    echo "        wrong. Add it to the matrix -- the operator-command table is"
+    echo "        there for the ones outside the Redis-compatible surface."
+    FAILED="$FAILED guides-commands"
+    return
+  fi
+  echo "  every command the guides name is in the matrix (${counts% *} guides, ${counts#* } dispatched tokens)"
+}
+
 assert_lease_ttl_single_source() {
   local bad
   bad=$(grep -rn 'lease-ttl-ms[[:space:]][[:space:]]*[0-9]' tools/ 2>/dev/null \
@@ -2872,6 +2985,7 @@ if want check; then
   assert_lease_ttl_single_source
   assert_every_dispatched_command_is_gated
   assert_every_write_command_is_retry_classified
+  assert_guides_only_name_documented_commands
   assert_warm_covers_fleet_binaries
   assert_bootstrap_failures_say_why
   report_toolchain_vs_pin

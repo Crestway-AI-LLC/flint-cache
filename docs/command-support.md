@@ -468,8 +468,46 @@ In particular `loading:1` is how you tell a seat that
 has BOUND from a seat that is READY: a node answers `PING` with `PONG` while
 still loading, so `PONG` alone is not readiness.
 
-There is no substitute for `CONFIG` or `SHUTDOWN`. Stop a seat with a signal,
-or through `flintctl`, which is the supported path.
+Use **`FLINTCONFIG`** where you would reach for `CONFIG`. With no arguments
+it dumps the live tunables; with `<key> <value>` it hot-reloads one with no
+restart — `wal-fsync-ms`, `lag-soft-ms`, `lag-hard-ms`, `wal-headroom-seq`,
+`min-replicas-to-write`, `max-conns`, `migrate-rate-bytes`,
+`fullsync-rate-bytes`, `write-deadline-ms`, `gc-sweep-ms` among them. The
+values are read live on the hot paths, so a change lands on the next
+write, tick or accept. This page said "there is no substitute for `CONFIG`"
+until 2026-09-06, which was wrong in the expensive direction: an operator who
+believed it would take a RESTART to change a value that is hot-settable.
+
+There is no substitute for `SHUTDOWN`. Stop a seat with a signal, or through
+`flintctl`, which is the supported path.
+
+### Operator and per-tenant commands
+
+These are served, documented in the operating guides, and not part of the
+Redis-compatible surface above — so they are listed here rather than under
+**Supported**, and `tools/gates.sh` checks that anything the guides tell you
+to run appears on this page.
+
+| Command | Where | What |
+|---|---|---|
+| `FLINTINFO` | seat | the `field:value` health block described above |
+| `FLINTCONFIG` | seat | dump or hot-set a runtime tunable |
+| `FLINTKEYSIZE` / `FLINTKEYSTAMP` | seat | the GC ranking primitives (above) |
+| `FLINTNSBYTES <ns>` | seat | stored bytes for one namespace — per-tenant attribution when deciding *whose* data to trim (space-reclaim.md) |
+| `PROXYSTATS` | proxy | connections, command/read/write totals, cert expiry |
+| `PROXYLATENCY` | proxy | per-lane read/write latency |
+| `PROXYHOTKEYS` | proxy | the tenant's hot keys |
+
+> `PROXYLATENCY` and `PROXYHOTKEYS` answer **per-tenant** and are the two a
+> tenant can run for themselves (tenant-guide.md). The `FLINT*` commands are
+> seat-local: the proxy refuses the whole prefix, because it is the tenant
+> boundary. Reach a seat directly to use them.
+>
+> Every other `FLINT*` verb the server matches on — `FLINTPROMOTE`,
+> `FLINTFENCE`, `FLINTLEASE`, `FLINTSYNC` and the rest — is control-plane
+> machinery that `flintctl` and the controller drive. They are described in
+> architecture.md and failover.md as MECHANISM, not as things to run, and
+> they are deliberately not listed here.
 
 ### The trap: `NO_KEY` is a routing table, not a dispatch table
 
