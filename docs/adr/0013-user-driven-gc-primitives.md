@@ -136,6 +136,45 @@ get the page before the first shed error reaches a client.
   which is the honest state until the above exists — a relaxed oracle that has
   not been built is not a weaker guarantee, it is no guarantee.
 
+  **Amended 2026-09-05: the relaxation above is aimed at the wrong
+  assertion.** The design says "relax the PRESENCE check and keep corruption,
+  time-travel and bleed fully enforced", and bounds absence with
+  `missing <= dropped`. Read against `flint-chaos` as it stands, that
+  describes relaxing something that is already relaxed:
+
+  | signal | where | does it fail a run? |
+  |---|---|---|
+  | torn value, cross-key, phantom, time travel | final walk, `main.rs` | **yes** — `panic!` / `assert!` |
+  | absence, final walk | `missing` counter, `main.rs` | **no** — incremented and printed, never asserted |
+  | acked keys lost across MASTER kills | `acked_lost_total` | **no** — printed; this is the async contract |
+  | acked key absent after a REPLICA kill | `main.rs`, "REPLICA kill lost acked key" | **YES**, and this is the one |
+
+  So the three teeth the design wants to keep are already the three that bite,
+  and the presence check it wants to relax already reports rather than judges.
+  What would actually fire against an evictable namespace is the **replica-kill
+  zero-loss panic** — a replica kill must lose nothing, and an evicted key
+  reads as absent there exactly as a lost one does.
+
+  That moves the work rather than shrinking it, and changes the shape of the
+  bound. `missing <= dropped` is a whole-run comparison and fits the final
+  walk, which is not where the assertion is. The replica-kill check asks about
+  SPECIFIC keys at a SPECIFIC moment, so the licensed form there is a running
+  one — an absence is licensed only if the seat's `dropped` has moved far
+  enough to account for it — and a running comparison against a counter that
+  is itself moving is a materially harder thing to get right than a total at
+  the end.
+
+  **Which matters because of the failure mode this ADR already names.** A
+  relaxation that is too generous here does not report a phantom loss; it
+  waves through a real one, and the oracle is the only thing that would have
+  caught it. Getting the accounting wrong at the end of a run is a wrong
+  number in a summary. Getting it wrong per-key, per-kill, is a green run over
+  a durability bug.
+
+  Nothing here changes the decision to refuse today. It changes what building
+  the licensed oracle involves, and it is recorded because the design above
+  reads as a smaller job than it is.
+
   See ADR-0023 for the bulk path this per-key evictor does not cover.
 - **Read-recency (true LRU) tracking.** Every read becomes a write on the
   LSM — the worst possible trade under disk pressure, which is the only
