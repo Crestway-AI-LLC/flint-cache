@@ -17,7 +17,9 @@ before the other two happened and was never revisited; found by classifying all
 ## The claim being violated
 
 `docs/slo.md`: *"Zero acked-write loss and zero client-visible errors"* through
-failover. `tier2_promote_drill.sh` states it as the design's contract: *"the
+failover. **(Misattributed — see the CORRECTION below. That sentence is the
+managed-plane repo's slo.md reporting a measured run; this repo's slo.md says
+"typically sees no error at all".)** `tier2_promote_drill.sh` states it as the design's contract: *"the
 proxy's retry budget absorbs the promotion window, so the outage is a latency
 spike, not failures."*
 
@@ -179,9 +181,56 @@ stronger and needs no rate at all:
 > masterless window exceeds 5 s, and the measured window is 4.3–4.6 s before
 > detection is counted.
 
-`docs/slo.md`'s *"zero client-visible errors"* through failover is therefore
-false for a write in flight at the moment of failure, and 0.3 % is how often
-this particular harness happens to have one.
+### CORRECTION 2026-09-05 — no SLO says "zero", and this file has misquoted one
+
+The paragraph above originally ended: *"`docs/slo.md`'s 'zero client-visible
+errors' through failover is therefore false for a write in flight at the moment
+of failure."* **That is wrong, and it was wrong when this file was opened.**
+
+The quote at the head of this bug — *"Zero acked-write loss and zero
+client-visible errors"* — is attributed to `docs/slo.md`. Inside THIS
+repository that path is a different document, and what it actually says is:
+
+> *"Through the proxy edge a client **typically** sees no error at all, only
+> one slow write, because the proxy chases the promotion and retries
+> underneath."*
+
+Typically. Not zero. One error in ~1,400 writes does not contradict it.
+
+The quoted sentence is real, but it lives in the MANAGED-PLANE repo's
+`docs/slo.md` — and there it is **a report of two measured runs**, 30 kills per
+setting on 7 EC2 hosts, not a standing promise:
+
+> *"Zero acked-write loss and zero client-visible errors in both."*
+
+A measurement that came out zero is not a guarantee of zero. The other
+occurrence in that file is the same shape — "633 ms worst stall in
+`hotkey_chaos_drill.sh`, zero client-visible errors" — a named drill's result.
+
+**Same defect as [BUG-0101](0101-nine-adr-numbers-name-two-different-decisions.md),
+one document over**: two repositories, one relative path `docs/slo.md`,
+different content, and a citation that resolves to the wrong one inside the
+repository where it sits.
+
+### What survives, and it is the part that matters
+
+Nothing about the mechanism changes. The masterless window and the retry budget
+are the same size by construction; a write in flight when a master dies errors
+whenever the window is the longer of the two; it happened three times.
+
+What changes is the FRAMING, and it changes what the fix is worth:
+
+- **No published claim is false.** The drill's `ERRS == 0` is stricter than
+  anything either slo.md states, and that is a legitimate thing for a drill to
+  be — but this file argued the assert must not be relaxed *because it is a
+  product claim*, and that argument does not hold as written.
+- The honest case for keeping the assert is different and still good: a write
+  in flight at master loss erroring is a real behaviour a customer can hit, the
+  drill is the only place it is visible, and "typically" is a word that stops
+  being true if the margin drifts further negative.
+- The decision at the foot is unchanged in substance. It is no longer
+  "restore a broken promise"; it is "decide what to promise", which is a
+  weaker urgency and an honest one.
 
 ### Not the LOADING gap
 
