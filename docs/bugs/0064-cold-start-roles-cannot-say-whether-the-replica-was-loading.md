@@ -956,3 +956,45 @@ A caveat on what that rules out: this is about drills binding the same LISTEN
 port. It says nothing about ephemeral-port pressure from many short-lived
 client connections, which is a different resource and is not covered by either
 check.
+
+## 2026-09-06 — the instrumentation has still never fired, and here is how long
+
+The open half of this bug waits on `cold_start_roles` failing once more, this
+time instrumented, so its two candidate faults can finally be told apart. That
+has not happened.
+
+Measured today over the last **80 `gate` runs on `main`**:
+
+| | |
+|---|---|
+| `cold_start_roles` failures | **0** |
+| total gate failures in that window | 8 |
+| what those 8 were | 4 the cert-mode check's own portability bug (BUG-0109, same day); 2 `restart` on 09-04, both **before** BUG-0096's fix landed on 09-05; 1 `gates` self-check mid-edit; 1 `ctl_error` bring-up |
+
+Against the 2-in-60 recorded above, that is **0 in 80**.
+
+**The zero is absence of failures, not absence of runs**, and that distinction
+had to be checked rather than assumed: a drill quietly dropped from the set
+would produce the same number. `tools/cold_start_roles_drill.sh` is still on
+disk, still referenced twice in `gates.sh`, and the most recent green run
+records `PASS  cold_start_roles  (13.8s)`.
+
+What this does and does not license:
+
+- It does **not** close the bug. Nothing here answers which fault the drill
+  saw; the instrumentation added for that has never run. Closing on a quiet
+  window would record an answer that was never obtained, which is the same
+  error the status line at the top already refuses.
+- It does bound the rate. Whatever the condition is, it has not recurred in
+  ten days of `main`, so it is rarer than 2-in-60 suggested — or something
+  between 08-27 and now removed it incidentally. Those two cannot be
+  distinguished from here either.
+
+**How to repeat this**, since the useful part is that it takes one command:
+
+    gh run list --workflow=gate --limit 80 --json databaseId,conclusion,headSha \
+      --jq '.[] | select(.conclusion=="failure") | "\(.databaseId) \(.headSha[0:8])"'
+
+then `gh run view <id> --log-failed | grep -E "FAIL |GATES FAILED"` on each.
+Eight IDs is a few minutes. The failures this bug was filed about went unread
+for weeks because nobody had written that down.
