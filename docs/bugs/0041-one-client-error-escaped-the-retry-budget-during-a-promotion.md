@@ -153,6 +153,21 @@ So this is not a rare coincidence of two unrelated timings. **The masterless
 window and the retry budget are the same size by construction**, and which side
 of the line a run lands on is noise.
 
+### The tightest proof needs no journal at all
+
+Both figures above come from the agent's journal, which is a second source. The
+writer's own error line is sufficient on its own:
+
+- the first write is issued at the kill, and it errored at `+5.026s`;
+- that error is only reachable from `now > deadline`, so the pair was still
+  masterless at kill + 5.026 s;
+- therefore **the masterless window exceeded 5,026 ms**, against a 5,000 ms
+  budget, on that run — from two numbers the drill already prints.
+
+Which is why the drill now measures and reports the margin on EVERY run, pass
+or fail, rather than leaving it to be reconstructed from an artifact seven days
+later that was four days from expiry.
+
 ### What the rate does and does not say
 
 3 failures in ~960 gate runs that reached the drills (988 runs; 25 failed before
