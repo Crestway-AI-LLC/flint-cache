@@ -1,13 +1,51 @@
-# BUG-0109 — every private key was written at the umask while security.md promised 0600 (FIXED 2026-09-06)
+# BUG-0109 — Flint left private-key modes to whichever `openssl` minted them (FIXED 2026-09-06)
+
+*Filed as "every private key was written at the umask while security.md
+promised 0600". That title was refuted the same day by reading the fleet:
+the deployed hosts were always 0600 and the exposure was LibreSSL-only.
+The filename keeps the original slug, as BUG-0041 does.*
 
 **Status: FIXED 2026-09-06**, and held by `cert_reload_fleet_drill.sh` plus a
 unit test on the mode helper. Found 2026-09-06 by auditing `docs/security.md`
 for claims nothing checks, the third doc in the run that produced BUG-0103,
-BUG-0107 and BUG-0108 · Severity: **high** — a world-readable CA private key
-on every deployment shape, with the security posture page telling operators
-it was 0600.
+BUG-0107 and BUG-0108 · Severity: **low in practice, corrected 2026-09-06
+after checking the fleet** — see "What this was NOT" below. The mode was
+inherited from whichever TLS toolchain minted the key rather than set by
+Flint, so it was right on Linux and wrong on macOS, and no deployed box was
+ever exposed.
 
-## Symptom
+## What this was NOT, stated first because the first version of this file got it wrong
+
+**No deployed fleet was ever exposed, and no operator action is needed.** The
+three live boxes — playground, `flint-ops`, `flint-ops-b` — all carry
+`-rw-------` keys and always have.
+
+This write-up initially claimed a world-readable CA key "on every deployment
+shape" and rated the bug high. That was wrong, and wrong in the direction
+that costs someone an unnecessary production change. It was written from the
+modes on a developer laptop plus a correct reading of the code path, without
+checking a single real host — the exact failure the repository's own field
+notes call out, one layer up: the code was right about what it does not do,
+and I did not measure where it mattered.
+
+What decides the mode is the TLS toolchain, not Flint:
+
+| host | toolchain | key mode from `openssl req -newkey -keyout` |
+|---|---|---|
+| Amazon Linux (every deployed box) | OpenSSL 3.x | `-rw-------` |
+| this laptop | LibreSSL 3.3.6 | `-rw-r--r--` |
+
+`ca.crt` is 0644 on those same hosts, so it is not a restrictive root umask
+doing it: Linux OpenSSL explicitly restricts a generated private key and
+LibreSSL leaves it to the umask.
+
+So the real defect is narrower and still worth fixing: **Flint left a
+security property to whichever `openssl` happened to be installed**, and
+`docs/security.md` stated it as a fact Flint enforced. On macOS — every
+developer machine, and any host with LibreSSL — the keys minted by a drill or
+a local bootstrap were world-readable.
+
+## Symptom (on a LibreSSL host)
 
     $ ls -l <statedir>/certs
     -rw-r--r--  ca.crt
@@ -94,7 +132,16 @@ three more, followed by the drill's FAIL.
 
 ## Operator note
 
-Fleets bootstrapped before this keep the old modes — the fix runs at mint and
-rotation, not at startup. `ls -l <statedir>/certs` and tighten in place, or
-run `rotate-certs`, which now hardens as it re-signs. The files themselves
-are valid; only their modes were wrong.
+**Nothing to do.** Every deployed box was already 0600, because its OpenSSL
+restricts generated keys. Confirmed by reading all three rather than assuming
+either way.
+
+A host whose `openssl` is LibreSSL and which was bootstrapped before this
+would keep 0644, since the fix runs at mint and rotation rather than at
+startup. To check one:
+
+    sudo ls -l <statedir>/certs/*.key
+
+and if any is not `-rw-------`, `sudo chmod 600 <statedir>/certs/*.key` or run
+`rotate-certs`, which now hardens as it re-signs. The files are valid either
+way; only the modes would be wrong.

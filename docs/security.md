@@ -46,14 +46,16 @@ does not require coordinating a restart with the application team.
 > `push_certs`, which skips non-remote runners — so it reached the copies on
 > other hosts and never the originals, and on a single-host deployment, which
 > is what the AMI's first boot and the quickstart both produce, it reached
-> nothing. Keys were left at the umask, `-rw-r--r--`. `ca.key` was never
-> covered on any deployment shape, because it is deliberately pushed nowhere.
-> Minting and `rotate-certs` now both set the modes, and
-> `cert_reload_fleet_drill.sh` asserts them on both paths — it fails if a key
-> is not 0600 *and* if a certificate is not 0644, so a blanket `chmod -R 600`
-> does not satisfy it either. If you bootstrapped a fleet before this, check
-> `ls -l <statedir>/certs` and tighten it in place; the files are valid, only
-> their modes were wrong.
+> nothing. What actually set the mode was whichever `openssl` minted the key:
+> the OpenSSL on every deployed box restricts a generated private key to 0600,
+> while LibreSSL — the system `openssl` on macOS — leaves it at the umask,
+> `-rw-r--r--`. So **no deployed fleet was exposed and there is nothing to
+> do**; developer machines and any LibreSSL host were. The defect worth fixing
+> is that a security property was left to whichever toolchain was installed
+> while this page stated it as one Flint enforced. Minting and `rotate-certs`
+> now both set the modes, and `cert_reload_fleet_drill.sh` asserts them on
+> both paths — it fails if a key is not 0600 *and* if a certificate is not
+> 0644, so a blanket `chmod -R 600` does not satisfy it either.
 
 ## Data at rest — read this one carefully
 
