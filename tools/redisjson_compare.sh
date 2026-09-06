@@ -63,7 +63,12 @@ $CLI -p "$PORT" JSON.SET __probe '$' '{}' >/dev/null 2>&1 || {
   echo "FAIL: module loaded but JSON.SET is unknown"; exit 1; }
 $CLI -p "$PORT" FLUSHALL >/dev/null
 
-OUT=$(./target/release/flint-conformance --target "127.0.0.1:$PORT" 2>&1)
+# --foreign: this target is a real Redis, so it serves the JSON module
+# (which is the point) and none of the FLINT* admin surface. Without it
+# those cases fail here and drag the printed overall down while the
+# divergence count -- which greps for [json] only -- stays correct, so
+# the run would look broken and pass.
+OUT=$(./target/release/flint-conformance --target "127.0.0.1:$PORT" --foreign 2>&1)
 echo "$OUT" | grep -E '^  json |^overall'
 
 FAILS=$(echo "$OUT" | grep '^  \[json\]')

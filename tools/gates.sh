@@ -2553,6 +2553,113 @@ report_toolchain_vs_pin() {
   echo "        docs/bugs/0039-ci-floats-on-stable-so-a-rust-release-reds-the-repo.md"
 }
 
+assert_every_dispatched_command_is_gated() {
+  # docs/command-support.md opens by telling customers that every supported
+  # command is gated by the conformance oracle. Nothing checked that sentence,
+  # and on 2026-09-05 it was false for six commands -- PEXPIREAT and
+  # PEXPIRETIME among them, which differ from their gated second-granularity
+  # twins by ONE argument: the unit multiplier. Both were swapped to 1000 as
+  # an experiment and the full corpus passed 105/105, as did all 105
+  # flint-server unit tests. A 1000x error in an expiry deadline was invisible
+  # to everything this repo runs.
+  #
+  # What this check establishes is narrow and worth stating exactly: a command
+  # the dispatcher answers is named by no corpus step. It does NOT establish
+  # that the command is untested -- a drill may well cover it -- and the
+  # failure text says so, because a check that overstates gets muted.
+  local out
+  out=$(python3 - <<'CMDGATEPY'
+import re, sys
+
+DISPATCH = "crates/flint-server/src/commands.rs"
+CORPUS = "crates/flint-conformance/src/main.rs"
+try:
+    src = open(DISPATCH, encoding="utf-8", errors="replace").read().splitlines()
+    corpus_raw = open(CORPUS, encoding="utf-8", errors="replace").read()
+except OSError:
+    print("NOFILE")
+    sys.exit(0)
+
+# Anchor on the dispatcher's match SUBJECT, which is what separates a command
+# arm from an option arm: options are matched against args[i], commands
+# against the verb. Anchoring on indentation alone read `b"COUNT"` -- a SCAN
+# option -- as a command the first time this was written.
+anchor = None
+for i, line in enumerate(src):
+    if line.strip() == "match name_upper.as_slice() {":
+        anchor = i
+        break
+if anchor is None:
+    print("NOANCHOR")
+    sys.exit(0)
+
+indent = (len(src[anchor]) - len(src[anchor].lstrip())) + 4
+arm = re.compile(r'^ {%d}(\| )?b"' % indent)
+cont = re.compile(r"^ {%d}\| " % indent)
+dispatched, buf = set(), []
+for line in src[anchor + 1 :]:
+    if arm.match(line) or (buf and cont.match(line)):
+        buf.append(line)
+        if "=>" in line:
+            dispatched.update(re.findall(r'b"([A-Z][A-Z0-9.]*)"', " ".join(buf)))
+            buf = []
+    else:
+        buf = []
+
+# Newline-blind: rustfmt wraps a long step across lines, so a per-line regex
+# under-reports and would invent gaps that are not there.
+exercised = set(
+    re.findall(
+        r'\bsd?\(\s*&\[\s*b"([A-Z][A-Z0-9.]*)"',
+        corpus_raw.replace("\n", " "),
+    )
+)
+
+if not dispatched or not exercised:
+    print("EMPTY %d %d" % (len(dispatched), len(exercised)))
+    sys.exit(0)
+print("COUNT %d %d" % (len(dispatched), len(exercised)))
+for name in sorted(dispatched - exercised):
+    print(name)
+CMDGATEPY
+  )
+  case "$out" in
+    NOFILE)
+      echo "FAIL  could not read the dispatcher or the corpus, so nothing was"
+      echo "        compared. This is not a pass."
+      FAILED="$FAILED command-gating-unreadable"; return ;;
+    NOANCHOR)
+      echo "FAIL  the dispatcher's \`match name_upper.as_slice()\` is gone, so"
+      echo "        this check read no commands at all. If the dispatch was"
+      echo "        restructured, re-aim the anchor -- do not delete the check,"
+      echo "        which is the only thing holding up the promise made in the"
+      echo "        first sentence of docs/command-support.md."
+      FAILED="$FAILED command-gating-anchor-missing"; return ;;
+    EMPTY*)
+      echo "FAIL  one side of the comparison came back empty ($out), so the"
+      echo "        agreement below would have been between two nothings."
+      FAILED="$FAILED command-gating-examined-nothing"; return ;;
+  esac
+  local counts ungated
+  counts=$(printf '%s\n' "$out" | sed -n 's/^COUNT \(.*\)/\1/p')
+  ungated=$(printf '%s\n' "$out" | grep -v '^COUNT ' || true)
+  if [ -n "$ungated" ]; then
+    echo "FAIL  dispatched by flint-server, named by no conformance case:"
+    printf '%s\n' "$ungated" | while read -r c; do echo "        $c"; done
+    echo "        docs/command-support.md opens by promising these are gated"
+    echo "        by the oracle, so either write the case or change what the"
+    echo "        matrix claims. A command with no case can be wrong in a way"
+    echo "        no run here disagrees with: PEXPIREAT and PEXPIRETIME were"
+    echo "        both silently off by 1000x against a green corpus."
+    echo "        A command with no ORACLE -- ours diverges on purpose, or"
+    echo "        Valkey has no counterpart -- still gets a case; put it in a"
+    echo "        family \`flint_only\` names, which is what that list is for."
+    FAILED="$FAILED command-gating"
+    return
+  fi
+  echo "  every dispatched command has a conformance case (${counts% *} dispatched, ${counts#* } exercised)"
+}
+
 assert_lease_ttl_single_source() {
   local bad
   bad=$(grep -rn 'lease-ttl-ms[[:space:]][[:space:]]*[0-9]' tools/ 2>/dev/null \
@@ -2673,6 +2780,7 @@ if want check; then
   assert_spawning_drills_declare_ports
   assert_recovery_stays_off_until_it_observes
   assert_lease_ttl_single_source
+  assert_every_dispatched_command_is_gated
   assert_warm_covers_fleet_binaries
   assert_bootstrap_failures_say_why
   report_toolchain_vs_pin

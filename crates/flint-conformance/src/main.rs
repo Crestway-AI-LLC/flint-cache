@@ -63,6 +63,14 @@ enum Expect {
     UnorderedPairs(Vec<(&'static [u8], &'static [u8])>),
     /// Array of bulk strings compared as an unordered set (SMEMBERS).
     UnorderedStrs(Vec<&'static [u8]>),
+    /// Any array reply, contents unexamined. For a command whose SHAPE is
+    /// agreed and whose contents legitimately differ between servers.
+    AnyArray,
+    /// Bulk reply that CONTAINS these bytes. For replies whose contract is a
+    /// shape rather than a value -- FLINTINFO is a `field:value` blob whose
+    /// numbers differ per host and per second, but whose FIELDS are the
+    /// promise. Asserting a whole reply there would be a test of the clock.
+    StrContains(&'static [u8]),
 }
 
 struct Case {
@@ -112,6 +120,21 @@ fn cmd(parts: &[&[u8]]) -> Vec<Vec<u8>> {
 /// say "matches RedisJSON" rather than "matches the contract we wrote".
 fn flint_only(family: &str) -> bool {
     matches!(family, "json" | "bloom")
+}
+
+/// Families only a Flint SEAT can answer, which is a different question from
+/// whether an oracle exists. `FLINT*` is the admin surface: the proxy refuses
+/// the whole prefix by design (`ERR admin commands are not available through
+/// the proxy` -- it is the tenant boundary), and no foreign server has the
+/// commands at all. So these cases are skipped, and SAID to be skipped,
+/// whenever the target is not a seat: under `--reference`, under `--foreign`,
+/// and whenever the run authenticates as a tenant, which means a proxy.
+///
+/// Skipping is the honest answer rather than a widening: a run through the
+/// edge genuinely cannot observe a seat's admin surface, and a case that
+/// reported PASS there would be reporting on a reply it never made.
+fn seat_only(family: &str) -> bool {
+    matches!(family, "flint")
 }
 
 fn corpus() -> Vec<Case> {
@@ -481,6 +504,18 @@ fn corpus() -> Vec<Case> {
                     &[b"HMGET", b"nosuch", b"a", b"b"],
                     Expect::Arr(vec![Expect::Nil, Expect::Nil]),
                 ),
+                // HKEYS and HVALS were in this case's NAME and in none of its
+                // steps, so a coverage audit read from case names -- which is
+                // what the run summary prints -- counted two commands that
+                // nothing exercised. Hash iteration order is unspecified, so
+                // both are compared as sets, exactly as HGETALL is above.
+                s(&[b"HKEYS", b"h3"], Expect::UnorderedStrs(vec![b"x", b"y"])),
+                s(
+                    &[b"HVALS", b"h3"],
+                    Expect::UnorderedStrs(vec![b"10", b"20"]),
+                ),
+                s(&[b"HKEYS", b"nosuch"], Expect::UnorderedStrs(vec![])),
+                s(&[b"HVALS", b"nosuch"], Expect::UnorderedStrs(vec![])),
             ],
         },
         Case {
@@ -2030,6 +2065,139 @@ fn corpus() -> Vec<Case> {
                 s(&[b"EXPIRETIME", b"ea_missing"], Expect::Int(-2)),
             ],
         },
+        // The server answers these and, until 2026-09-05, no corpus case did.
+        // They are why `docs/command-support.md` could open by saying "every
+        // supported command is gated" while six were not; the gate check that
+        // now enforces that sentence is what keeps this list honest.
+        Case {
+            family: "connection",
+            name: "flushall empties the keyspace",
+            steps: vec![
+                // Every case already FLUSHALLs in the harness preamble, so
+                // the +OK was well covered and the EFFECT was not covered at
+                // all -- a FLUSHALL that returned OK and deleted nothing
+                // would have passed the whole corpus, while silently making
+                // every other case depend on the case before it.
+                s(&[b"SET", b"fa1", b"v"], Expect::Ok),
+                s(&[b"SADD", b"fa2", b"m"], Expect::Int(1)),
+                s(&[b"FLUSHALL"], Expect::Ok),
+                s(&[b"GET", b"fa1"], Expect::Nil),
+                s(&[b"EXISTS", b"fa2"], Expect::Int(0)),
+                s(&[b"DBSIZE"], Expect::Int(0)),
+            ],
+        },
+        Case {
+            family: "flint",
+            name: "flintinfo reports the fields operators read",
+            steps: vec![
+                // Numbers here are per-host and per-second; the FIELDS are
+                // the contract. `loading` in particular is the documented way
+                // to tell a seat that has BOUND from one that is READY, and
+                // PING cannot answer that -- a loading seat still says PONG.
+                s(&[b"FLINTINFO"], Expect::StrContains(b"role:")),
+                s(&[b"FLINTINFO"], Expect::StrContains(b"loading:")),
+                // The three fields BOTH engines owe. The rocks build adds
+                // some eighty more; asserting one of those here would make
+                // this case a test of which engine it happened to reach.
+                // `live_replicas` is asserted by NAME on purpose: the mem
+                // build spelled it `live_replica` with a 0/1 until
+                // 2026-09-05, which is the spelling no consumer reads.
+                s(&[b"FLINTINFO"], Expect::StrContains(b"live_replicas:")),
+            ],
+        },
+        Case {
+            family: "flint",
+            name: "flintkeysize measures payload, not encoding",
+            steps: vec![
+                s(&[b"SET", b"fks1", b"hello"], Expect::Ok),
+                s(&[b"FLINTKEYSIZE", b"fks1"], Expect::Int(5)),
+                // A collection reports CUMULATIVE MEMBER BYTES: two 1-byte
+                // members are 2, not the row overhead and not the count.
+                s(&[b"SADD", b"fks2", b"a", b"b"], Expect::Int(2)),
+                s(&[b"FLINTKEYSIZE", b"fks2"], Expect::Int(2)),
+                // Missing is nil, not 0 -- a cleanup daemon ranking by size
+                // must be able to tell "empty" from "gone".
+                s(&[b"FLINTKEYSIZE", b"fks_missing"], Expect::Nil),
+            ],
+        },
+        Case {
+            family: "flint",
+            name: "flintkeystamp distinguishes written from created",
+            steps: vec![
+                // Real unix-ms instants, asserted as a range because the
+                // alternative is asserting the clock. The lower bound is
+                // 2023-11; a stamp below it is a unit error, not a slow test.
+                s(&[b"SADD", b"fkt1", b"m"], Expect::Int(1)),
+                s(
+                    &[b"FLINTKEYSTAMP", b"fkt1"],
+                    Expect::Arr(vec![
+                        Expect::IntRange(1_700_000_000_000, 4_000_000_000_000),
+                        Expect::IntRange(1_700_000_000_000, 4_000_000_000_000),
+                    ]),
+                ),
+                // A payload-in-metadata type has no separate creation row, so
+                // `created_ms` is 0 -- "not tracked", stated as a value rather
+                // than guessed at by the caller.
+                s(&[b"SET", b"fkt2", b"v"], Expect::Ok),
+                s(
+                    &[b"FLINTKEYSTAMP", b"fkt2"],
+                    Expect::Arr(vec![
+                        Expect::IntRange(1_700_000_000_000, 4_000_000_000_000),
+                        Expect::Int(0),
+                    ]),
+                ),
+            ],
+        },
+        Case {
+            family: "connection",
+            name: "command answers an array",
+            steps: vec![
+                // Asserted as a SHAPE, which is the part every server agrees
+                // on: Valkey returns its whole command table, Flint returns
+                // an empty array on purpose. Both are arrays, and the
+                // regression worth catching is COMMAND becoming an error or
+                // an unknown command -- which is what a client's capability
+                // probe would hit. That Flint's array is EMPTY is a
+                // divergence a client should know about, so it is written
+                // down in docs/command-support.md rather than pinned here,
+                // where pinning it would cost this case its oracle.
+                s(&[b"COMMAND"], Expect::AnyArray),
+            ],
+        },
+        Case {
+            family: "keyspace",
+            name: "pexpireat and pexpiretime are milliseconds",
+            steps: vec![
+                // THE UNIT IS THE ENTIRE CONTENT OF THESE TWO COMMANDS. Both
+                // share an implementation with their second-granularity twins
+                // and differ from them by one argument: the multiplier
+                // (`cmd_expire_at(args, "pexpireat", 1)` against 1000). So
+                // every assertion below CROSSES the units -- a millisecond
+                // instant read back in seconds, then the reverse. A
+                // PEXPIREAT/PEXPIRETIME round trip would not do: it passes
+                // unchanged with BOTH multipliers swapped, because the second
+                // conversion undoes the first. That mutation used to survive
+                // the whole corpus and all 105 server unit tests.
+                s(&[b"SET", b"pea1", b"v"], Expect::Ok),
+                s(&[b"PEXPIREAT", b"pea1", b"9999999999000"], Expect::Int(1)),
+                s(&[b"EXPIRETIME", b"pea1"], Expect::Int(9999999999)),
+                // The other direction: written in seconds, read in ms.
+                s(&[b"SET", b"pea2", b"v"], Expect::Ok),
+                s(&[b"EXPIREAT", b"pea2", b"9999999999"], Expect::Int(1)),
+                s(&[b"PEXPIRETIME", b"pea2"], Expect::Int(9999999999000)),
+                // A past instant deletes, as EXPIREAT does. 1 ms after the
+                // epoch is past; 1 SECOND after it is also past, so this step
+                // alone cannot tell the units apart -- it is here for the
+                // delete, not the unit.
+                s(&[b"SET", b"pea3", b"v"], Expect::Ok),
+                s(&[b"PEXPIREAT", b"pea3", b"1"], Expect::Int(1)),
+                s(&[b"GET", b"pea3"], Expect::Nil),
+                // Sentinels: a live key with no expiry, and a missing key.
+                s(&[b"SET", b"pea4", b"v"], Expect::Ok),
+                s(&[b"PEXPIRETIME", b"pea4"], Expect::Int(-1)),
+                s(&[b"PEXPIRETIME", b"pea_missing"], Expect::Int(-2)),
+            ],
+        },
         Case {
             family: "keyspace",
             name: "unlink removes like del",
@@ -2716,13 +2884,17 @@ fn corpus() -> Vec<Case> {
         },
         Case {
             family: "bloom",
-            name: "DIVERGENCE D7.2: BF.SCANDUMP is refused, not served",
+            name: "DIVERGENCE D7.2: BF.SCANDUMP/BF.LOADCHUNK are refused, not served",
             steps: vec![
                 s(&[b"BF.ADD", b"i", b"x"], Expect::Int(1)),
                 // RedisBloom serves these. Our block layout differs, so a
                 // dump would be a blob that looks portable and is accepted
                 // by nothing.
                 s(&[b"BF.SCANDUMP", b"i", b"0"], Expect::AnyError),
+                // The doc promises BOTH halves are refused, and only this one
+                // was checked -- an import path could have been served while
+                // the export path was refused, which is the worse direction.
+                s(&[b"BF.LOADCHUNK", b"i", b"1", b"zz"], Expect::AnyError),
             ],
         },
         Case {
@@ -3095,6 +3267,11 @@ fn matches(expect: &Expect, got: &Value, proto: Proto) -> bool {
         Expect::Str(s) => *got == Value::Bulk(Some(s.to_vec())),
         Expect::Bytes(b) => *got == Value::Bulk(Some(b.clone())),
         Expect::AnyError => matches!(got, Value::Error(_)),
+        Expect::AnyArray => matches!(got, Value::Array(Some(_))),
+        Expect::StrContains(s) => matches!(
+            got,
+            Value::Bulk(Some(b)) if b.windows(s.len()).any(|w| w == *s)
+        ),
         Expect::Arr(items) => match got {
             Value::Array(Some(vals)) if vals.len() == items.len() => {
                 items.iter().zip(vals).all(|(e, v)| matches(e, v, proto))
@@ -3159,6 +3336,9 @@ fn main() -> ExitCode {
     // than reported as failures — a red line there would say nothing about
     // either implementation.
     let reference = std::env::args().any(|a| a == "--reference");
+    // "the target is not a Flint seat", for a target that is not the
+    // reference either -- a real Redis with a module loaded.
+    let foreign = std::env::args().any(|a| a == "--foreign");
 
     // --proto 3 runs the whole corpus over RESP3, folding each reply back
     // to its RESP2 shape before matching (see `Client::normalize`).
@@ -3254,10 +3434,21 @@ fn main() -> ExitCode {
     let mut per_family: BTreeMap<&str, (u32, u32)> = BTreeMap::new();
     let mut failures: Vec<String> = Vec::new();
     let mut skipped = 0u32;
+    let mut skipped_seat = 0u32;
+
+    // A proxy run authenticates as a tenant; a seat has no tenant auth. That
+    // is the signal, and `--foreign` is the explicit form for a target that
+    // is neither (the RedisJSON/RedisBloom compare scripts, which DO want the
+    // json and bloom families to run and cannot serve `FLINT*`).
+    let not_a_seat = reference || foreign || endpoint.auth.is_some();
 
     for case in corpus() {
         if reference && flint_only(case.family) {
             skipped += 1;
+            continue;
+        }
+        if not_a_seat && seat_only(case.family) {
+            skipped_seat += 1;
             continue;
         }
         let entry = per_family.entry(case.family).or_insert((0, 0));
@@ -3299,6 +3490,12 @@ fn main() -> ExitCode {
     );
     if skipped > 0 {
         println!("  ({skipped} flint-only case(s) skipped: no reference oracle)");
+    }
+    if skipped_seat > 0 {
+        println!(
+            "  ({skipped_seat} seat-only case(s) skipped: the FLINT* admin surface \
+             is not served to this target)"
+        );
     }
     if failures.is_empty() {
         ExitCode::SUCCESS

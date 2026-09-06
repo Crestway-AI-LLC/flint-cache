@@ -6,6 +6,21 @@ counterpart in the reference implementation, the same case also runs
 against a real Valkey — so a green run proves two independent things: the
 case encodes real Redis behavior, and Flint matches it.
 
+That sentence is enforced, not asserted. `tools/gates.sh` reads the server's
+dispatch table and the corpus and refuses a build where a command the
+dispatcher answers is named by no case. There is no exemption list: a
+command whose reply has no oracle — because Valkey has none, or because
+Flint diverges on purpose — still gets a case, and is simply skipped by the
+`--reference` run. Until 2026-09-05 the sentence was unchecked and six
+commands were not gated; `PEXPIREAT` and `PEXPIRETIME` could both be off by
+a factor of 1000 with the whole corpus green.
+
+The one thing a case can be excused from is a target that cannot serve it.
+The `FLINT*` admin commands are refused by the proxy on purpose — it is the
+tenant boundary — so a run through the edge, or against a foreign server,
+skips them and SAYS how many it skipped. A skip that went unmentioned would
+be the same failure as an ungated command, one step later.
+
 **One exception, stated plainly: the JSON family has no reference in that
 run.** Stock Redis/Valkey have no JSON type — it is the separate RedisJSON
 module — so `flint-conformance --reference` skips those cases rather than
@@ -21,8 +36,27 @@ on-demand rather than in CI, because it needs a module you have to compile.
 ## Supported
 
 **Connection / server**: PING, ECHO, AUTH (at the proxy), COMMAND,
-SELECT (index 0 only), HELLO, QUIT (minimal, compatibility-shaped), DBSIZE,
+SELECT (index 0 only), HELLO, QUIT (at the proxy — see below), DBSIZE,
 FLUSHALL (both scoped to the tenant namespace).
+
+> **QUIT is answered by the proxy, and by a seat that is still LOADING. A
+> READY seat answers `ERR unknown command 'QUIT'`.** Clients connect through
+> the proxy, so the client path is the working one — but the seat's
+> behaviour is backwards from any expectation: the command works while the
+> node is coming up and stops working once it is serving. Serving it on the
+> ready path means replying and then closing a connection that may have a
+> write batch in flight, so it is a change to the write path rather than a
+> one-line addition. Tracked in docs/bugs/0106.
+
+> **`COMMAND` returns an EMPTY array.** It is answered rather than refused,
+> so a client that probes with it gets a well-formed reply — and a client
+> that uses it for capability discovery will conclude Flint implements
+> nothing. Nothing here is derived from that reply: this matrix is the list,
+> and sending a command to a server is the other way to find out. The
+> conformance case asserts the shape (`COMMAND` returns an array, which is
+> the regression worth catching), not the emptiness, because the shape is
+> what a real Redis agrees with and therefore the only part an oracle can
+> check.
 
 > A namespace is one logical database, so `SELECT 0` succeeds and any other
 > index is refused. Tenancy replaces numbered databases here: isolation is
@@ -126,8 +160,15 @@ GET, GETDEL, GETEX (EX, PX, EXAT, PXAT, PERSIST), GETSET, MSET, MGET,
 APPEND, STRLEN, GETRANGE, SETRANGE, INCR, DECR, INCRBY, DECRBY,
 INCRBYFLOAT.
 
-**Hashes**: HSET, HSETNX, HGET, HMGET, HGETALL, HDEL, HLEN, HEXISTS,
-HINCRBY, HSTRLEN, HSCAN (MATCH, COUNT, NOVALUES).
+**Hashes**: HSET, HSETNX, HGET, HMGET, HGETALL, HKEYS, HVALS, HDEL, HLEN,
+HEXISTS, HINCRBY, HSTRLEN, HSCAN (MATCH, COUNT, NOVALUES).
+
+> HKEYS and HVALS were implemented and served from the first release and
+> were missing from this list until 2026-09-05, so the matrix under-reported
+> for months. Read them as the whole-collection reads they are: both
+> materialise every field of the hash, and both are counted by the
+> collection-read admission ADR-0022 describes. HSCAN is the cursored
+> alternative when the hash is large.
 
 **Sets**: SADD, SREM, SISMEMBER, SMISMEMBER, SMEMBERS, SCARD, SPOP,
 SRANDMEMBER, SSCAN (MATCH, COUNT), SINTER, SUNION, SDIFF,
@@ -418,7 +459,12 @@ Use **`FLINTINFO`** where you would reach for `INFO`. It is a flat
 `field:value` list covering what a client or an operator actually needs from a
 seat — `role`, `loading`, `role_epoch`, `build`, `sst_bytes`, `latest_seq`,
 `last_applied`, `acked_seq`, `seq_lag`, and the WAL-headroom fields ADR-0022's
-shedding is driven by. In particular `loading:1` is how you tell a seat that
+shedding is driven by. **That field set is the rocks build's**, which is the
+one you run: a mem-only build reports `role`, `loading` and `live_replicas`
+and nothing else, because the rest describe a durable engine it does not
+have. Parse by field name and tolerate absence; do not parse by position.
+
+In particular `loading:1` is how you tell a seat that
 has BOUND from a seat that is READY: a node answers `PING` with `PONG` while
 still loading, so `PONG` alone is not readiness.
 

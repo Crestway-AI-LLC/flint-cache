@@ -123,7 +123,9 @@ esac
 echo "oracle: RedisBloom (bf) v$BF_VER at $HOST:$PORT"
 $CLI -h "$HOST" -p "$PORT" FLUSHALL >/dev/null
 
-OUT=$(./target/release/flint-conformance --target "$HOST:$PORT" 2>&1)
+# --foreign: a real Redis with the Bloom module. Serves BF.*, serves no
+# FLINT* admin command; see the same note in redisjson_compare.sh.
+OUT=$(./target/release/flint-conformance --target "$HOST:$PORT" --foreign 2>&1)
 echo "$OUT" | grep -E '^  bloom |^overall'
 
 FAILS=$(echo "$OUT" | grep '^  \[bloom\]')

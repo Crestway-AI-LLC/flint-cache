@@ -496,6 +496,11 @@ impl ReplHub {
     }
 
     /// Used by tests and (soon) the trio's health view.
+    ///
+    /// NOT for FLINTINFO. The mem renderer published this boolean as
+    /// `live_replica` while the rocks renderer published a COUNT as
+    /// `live_replicas`, and every consumer reads the plural -- BUG-0104. A
+    /// health view is free to want a bool; the wire is not.
     #[allow(dead_code)]
     pub fn has_live_replica(&self, now_ms: u64) -> bool {
         self.effective_acked(now_ms).is_some()

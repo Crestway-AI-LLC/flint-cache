@@ -5889,10 +5889,19 @@ fn flintinfo(
     _async_queue_depth: Option<usize>,
 ) -> Value {
     let now = flint_storage::strings::system_clock();
+    // `live_replicas`, plural, holding a COUNT -- the same field name and the
+    // same units the rocks build emits. This said `live_replica` with a 0/1
+    // for as long as the mem build has existed, and nothing anywhere read
+    // that name: the controller parses `live_replicas` (and defaults a field
+    // it cannot find to 0), so a controller fronting mem seats would have
+    // found no promotable node, forever, while every seat was healthy. It
+    // was never reachable in production, where the engine is rocks -- but it
+    // was one dev cluster away, and the failure would have presented as the
+    // controller being broken.
     let info = format!(
-        "role:{}\r\nloading:0\r\nlive_replica:{}\r\n",
+        "role:{}\r\nloading:0\r\nlive_replicas:{}\r\n",
         if read_only { "replica" } else { "master" },
-        hub.has_live_replica(now) as u8,
+        hub.live_replica_count(now),
     );
     Value::Bulk(Some(info.into_bytes()))
 }
