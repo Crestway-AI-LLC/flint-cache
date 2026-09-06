@@ -27,7 +27,7 @@ pub struct RocksKv {
     path: std::path::PathBuf,
     /// Completed WAL fsyncs (the bounded-cadence durability tick).
     wal_fsyncs: std::sync::atomic::AtomicU64,
-    /// Capacity-eviction state (ADR-0023 D7). Shared with the compaction
+    /// Capacity-eviction state (OPS-ADR-0023 D7). Shared with the compaction
     /// filter, which is the only thing that acts on it.
     eviction: std::sync::Arc<crate::eviction::EvictionState>,
     /// OBSERVED bytes per WAL sequence, as an EWMA.
@@ -211,7 +211,7 @@ impl RocksKv {
     }
 
     /// Resident bytes for one namespace, CORRECTED FOR UNFLUSHED WRITES — the
-    /// capacity-eviction trigger input (ADR-0023 D7.2).
+    /// capacity-eviction trigger input (OPS-ADR-0023 D7.2).
     ///
     /// `ns_bytes` is the right honesty level for a billing sweep and the WRONG
     /// one for this: it tracks compacted SST bytes, so the bytes it misses are
@@ -597,7 +597,7 @@ impl RocksKv {
         opts.set_compaction_filter("flint-meta-expiry", move |_level, key, value| {
             use crate::encoding::{Cf, MetaHeader};
             use rocksdb::compaction_filter::Decision;
-            // Capacity eviction (ADR-0023 D7.3), before the expiry check
+            // Capacity eviction (OPS-ADR-0023 D7.3), before the expiry check
             // because it is the cheaper question: on a durable deployment
             // nothing is ever marked and this is one relaxed atomic load.
             //
@@ -653,7 +653,7 @@ impl RocksKv {
         })
     }
 
-    /// Capacity-eviction state for this DB (ADR-0023 D7). Marking is a
+    /// Capacity-eviction state for this DB (OPS-ADR-0023 D7). Marking is a
     /// request; the compaction filter's guard decides.
     pub fn eviction(&self) -> &std::sync::Arc<crate::eviction::EvictionState> {
         &self.eviction
@@ -1541,7 +1541,7 @@ mod ns_capacity {
     use super::*;
     use crate::strings::{SetOptions, StringStore};
 
-    /// The window `ns_capacity_bytes` exists to close (ADR-0023 D7.2).
+    /// The window `ns_capacity_bytes` exists to close (OPS-ADR-0023 D7.2).
     ///
     /// Asserting only "capacity >= ns_bytes" would pass on a database where
     /// both are zero, or where the writes flushed and the two agree — that is,

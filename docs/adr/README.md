@@ -43,13 +43,69 @@ consoles, marketplace fulfilment — is operated by Crestway AI LLC and lives
 in a private repository, and the ADRs numbered 0005+ mostly decide things in
 that plane.
 
-They are numbered in one sequence on purpose. A decision does not become a
-different decision because of which repository it lands in, and renumbering
-per repository would make the two halves impossible to discuss together.
-The citations are kept as-is rather than stripped: a comment saying *why*
-the classifier must be one shared table is worth more than a comment that
-has had its provenance filed off, even when you cannot open the reference.
+**Each repository numbers its own ADRs.** This one uses `ADR-<n>`; the managed
+plane uses `OPS-ADR-<n>`; `flint-kv` is a third product with its own. A
+citation that crosses a boundary carries the prefix — `OPS-ADR-0023` — and a
+bare `ADR-<n>` means one of ours.
 
-Where an ADR in that range decides something visible from here, the code
-comment at the call site states the decision itself, so nothing you need in
-order to read this repository depends on a document you cannot see.
+This paragraph used to say the opposite: that the two halves shared one
+sequence on purpose, and that numbering per repository "would make the two
+halves impossible to discuss together". **They never shared one.** The
+managed plane starts at 0005 because the first four were written before the
+split, and both sequences then advanced independently — so nine numbers name
+two different documents each. The rule described an intention nothing
+enforced, and no allocator ever existed to enforce it.
+
+The remedy is a prefix rather than a renumber, decided in the managed plane's
+own ADR-0030 on 2026-08-27, for three reasons worth repeating here:
+
+- **This tree already solved the identical problem with a prefix.** Bug
+  numbers are `BUG-0057` here and `OPS-0057` there, and nobody has ever been
+  confused by them. Solving the same problem a second way means a reader has
+  to learn two conventions and remember which artefact uses which.
+- **A prefix is self-describing; a range is a lookup.** `OPS-ADR-0032` says
+  where it lives. A number allocated out of a reserved range says so only to
+  someone who already knows the convention.
+- **It survives a third repository**, which turned out not to be
+  hypothetical.
+
+**Adoption is incremental, by design.** Existing citations are corrected as
+files are touched rather than in a sweep: renaming nothing means no commit
+message, field note or bug file is invalidated, and those cannot be rewritten.
+So a bare `ADR-<n>` in older comments here may still mean a managed-plane
+decision — treat it as provenance, not as a lookup, exactly as this repository
+already treats the `#118`-style tracker ids in its comments.
+
+The citations are kept rather than stripped: a comment saying *why* the
+classifier must be one shared table is worth more than a comment that has had
+its provenance filed off, even when you cannot open the reference.
+
+**And the call site is what you actually need.** Where a managed-plane ADR
+decides something visible from here, the code comment at the call site states
+the decision itself, so nothing you need in order to read this repository
+depends on a document you cannot see. That is the load-bearing rule; the
+numbering only decides whether a reader can tell they are being pointed
+somewhere they cannot go.
+
+### The nine numbers that name two decisions
+
+Recorded so a bare citation of one can be recognised, not to be memorised:
+
+| number | this repository | the managed plane |
+|---|---|---|
+| 0016 | bloom-filter-type | agent-learning |
+| 0018 | cp-held-leases | earning-unattended-action |
+| 0019 | rewind-rejoin-promotion-fences | a-site-operations-journal-in-git |
+| 0023 | slot-aligned-bulk-eviction | s3-accelerator-look-aside-library |
+| 0024 | boot-decision-counters-that-outlive-the-process | distributing-secrets-the-fleet-consumes |
+| 0025 | stream-collection-reads-instead-of-materialising-them | verify-the-recommendation-not-the-execution |
+| 0026 | admission-control-on-write-stall | a-second-protocol-for-the-object-cache |
+| 0027 | shared-stripe-locks-for-pure-writes | arming-is-a-declaration-not-a-hand-edit |
+| 0028 | a-verdict-must-name-what-it-examined | the-shipping-path-is-unexercised-until-you-ship |
+
+Eight of those are latent: each repository's code cites its own. **0023 is
+not**, and its citations here are qualified for that reason — `flint-storage`
+cites `OPS-ADR-0023 D7` sixteen times, and this repository's ADR-0023 is a
+different document that is *also about eviction* and has no D-numbered
+decisions at all. A reader who followed the bare number landed somewhere
+plausible and wrong, which is worse than landing nowhere (BUG-0101).

@@ -910,7 +910,7 @@ mod order_tests {
 /// `None` for anything that is not a namespaced envelope row: an unknown CF
 /// tag, or a key truncated before the namespace ends. The eviction guard reads
 /// `None` as NOT evictable, so a key it cannot attribute is never dropped
-/// (ADR-0023 D7).
+/// (OPS-ADR-0023 D7).
 pub fn ns_of_envelope(k: &[u8]) -> Option<&[u8]> {
     let cf = *k.first()?;
     if cf != Cf::Metadata as u8 && cf != Cf::Subkey as u8 && cf != Cf::ZScore as u8 {

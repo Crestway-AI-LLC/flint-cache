@@ -1337,7 +1337,7 @@ fn build_version() -> String {
 // Callers are all rocks-gated dial sites (replication/migration/cutover);
 // the mem-only build still parses --internal-* for its listener.
 #[cfg_attr(not(feature = "rocks"), allow(dead_code))]
-/// Namespaces whose contents this seat is permitted to RECLAIM (ADR-0023 D7.1).
+/// Namespaces whose contents this seat is permitted to RECLAIM (OPS-ADR-0023 D7.1).
 ///
 /// Empty by default and inert today: nothing evicts yet. It exists so the
 /// decision has a home before the policy that reads it, because the shape of
@@ -1437,7 +1437,7 @@ fn evictable_ns_joined() -> String {
 ///
 /// Uses `ns_capacity_bytes`, not `ns_bytes`, because this is the figure an
 /// operator reads while deciding whether a namespace is about to fill, and
-/// `ns_bytes` omits exactly the writes that are filling it (ADR-0023 D7.2).
+/// `ns_bytes` omits exactly the writes that are filling it (OPS-ADR-0023 D7.2).
 ///
 /// A namespace whose figure could not be taken renders `ns=?`, never `ns=0`.
 /// Zero is a legitimate reading — an empty namespace — so printing it for "the
@@ -2371,7 +2371,7 @@ fn main() -> std::io::Result<()> {
         let _ = REPLICA_LINK.set(Arc::clone(&link));
         std::thread::spawn(move || replica::run(&link, &kv, &stop));
 
-        // ADR-0023 D7.1 pair-agreement. Per-seat config lets the two members
+        // OPS-ADR-0023 D7.1 pair-agreement. Per-seat config lets the two members
         // of a pair disagree silently, and a pair where one side reclaims
         // while the other fills to -QUOTA is divergent POLICY — worse than
         // divergent decisions, and invisible without something that compares.
@@ -2651,7 +2651,7 @@ fn main() -> std::io::Result<()> {
                     );
                 }
                 DISK.apply(usage, v);
-                // Capacity reclaim (ADR-0023 D7 req 2/4). Decided on the same
+                // Capacity reclaim (OPS-ADR-0023 D7 req 2/4). Decided on the same
                 // sample as the shed verdict, and by construction engages
                 // above it, so an evictable namespace evicts rather than ever
                 // reaching -QUOTA. It does not act yet: nothing marks keys
@@ -4845,7 +4845,7 @@ fn execute(
             // threshold down then tests one value five times while reporting
             // five, which is how a positive control goes green having never
             // armed. Same choice WriteQueue::set_soft_cap already made.
-            // ADR-0023 D7.1: hot-reloadable, because the whole point of a
+            // OPS-ADR-0023 D7.1: hot-reloadable, because the whole point of a
             // seat-side channel is that the decision can be changed without a
             // restart. Set-and-read-back: the value stored is the CANONICAL
             // one (sorted, deduped), so an operator comparing two seats
@@ -5695,7 +5695,7 @@ fn flintinfo(
         // contradicts itself and anything reading it can say so.
         wamb = WAL_BUDGET_MB.load(Ordering::Relaxed),
         wasrc = wal_budget_src_str(),
-        // ADR-0023 D7.1. Reported even while nothing evicts, because the
+        // OPS-ADR-0023 D7.1. Reported even while nothing evicts, because the
         // operator-visible question is "does this pair agree", and a value
         // nobody can read cannot be compared. -1 means not yet known, which
         // is deliberately distinct from 0 (a real mismatch).

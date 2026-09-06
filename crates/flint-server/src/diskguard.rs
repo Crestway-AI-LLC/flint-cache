@@ -115,7 +115,7 @@ pub fn verdict(
 
 /// Where capacity reclaim engages, as a percentage OF THE SHED FLOOR.
 ///
-/// ADR-0023 D7 requirement 4: reclaim must run above the shed threshold, so an
+/// OPS-ADR-0023 D7 requirement 4: reclaim must run above the shed threshold, so an
 /// evictable namespace under pressure evicts rather than ever reaching
 /// `-QUOTA`, while a non-evictable namespace behaves exactly as it does today.
 ///
@@ -587,7 +587,7 @@ mod tests {
         assert_eq!(next, every);
     }
 
-    /// ADR-0023 D7 requirement 4, as a PROPERTY rather than three examples:
+    /// OPS-ADR-0023 D7 requirement 4, as a PROPERTY rather than three examples:
     /// wherever writes would be shed, reclaim was already engaged. An
     /// evictable namespace must evict rather than ever reach `-QUOTA`, and the
     /// way that fails is not dramatically — it is one threshold combination,

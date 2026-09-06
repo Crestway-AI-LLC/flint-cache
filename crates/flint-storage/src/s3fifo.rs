@@ -1,4 +1,4 @@
-//! S3-FIFO admission and eviction (ADR-0023 D7, requirement 3).
+//! S3-FIFO admission and eviction (OPS-ADR-0023 D7, requirement 3).
 //!
 //! **Why not LRU.** The accelerator's normal workload is a training job walking
 //! a dataset larger than the cache, epoch after epoch. Under LRU a cyclic scan

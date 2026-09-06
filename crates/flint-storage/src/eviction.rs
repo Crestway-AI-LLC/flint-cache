@@ -1,4 +1,4 @@
-//! Capacity-eviction state for one DB (ADR-0023 D7).
+//! Capacity-eviction state for one DB (OPS-ADR-0023 D7).
 //!
 //! Flint's position is that it never silently drops what a user put there, and
 //! D7.3's mechanism sits uncomfortably close to the opposite: the compaction
