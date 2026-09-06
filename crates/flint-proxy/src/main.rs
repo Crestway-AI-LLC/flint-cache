@@ -1467,6 +1467,18 @@ async fn forward_collect(
         Ok(Value::Error(e)) if e.starts_with("TRYAGAIN") => {
             forward(topo, backends, ns, args, raw, false).await
         }
+        Ok(Value::Error(e)) if e.starts_with("LOADING") => {
+            // Same reply, same absorption, on the staged path. Split from
+            // READONLY's arm rather than folded into it because the recovery
+            // differs by one line -- a loading node keeps its connection.
+            // `forward` owns the deadline, so there is none to test here.
+            let _ = e;
+            topo.rediscover_after_failure(&addr);
+            if topo.still_master(&addr) {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            forward(topo, backends, ns, args, raw, false).await
+        }
         Ok(Value::Error(e)) if e.starts_with("READONLY") => {
             // A demoted-in-place ex-master. Same recovery as the ordinary
             // path: rediscover this pair's master, then retry there.
@@ -1571,6 +1583,41 @@ async fn forward(
                 if use_replica {
                     use_replica = false;
                 } else {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+            Ok(Value::Error(e)) if e.starts_with("LOADING") => {
+                // THE NODE IS UP AND NOT YET READY, which is the one reply
+                // whose entire meaning is "retry me". `flint-server` emits it
+                // while its dataset loads and justifies the spelling on
+                // exactly that ground -- its own comment says "-LOADING is a
+                // documented reply every mainstream client library already
+                // retries rather than treating as a hard failure".
+                //
+                // Flint's clients do not talk to the node. They talk to this
+                // proxy, which absorbed MOVED, TRYAGAIN and READONLY and
+                // forwarded this one verbatim, because the match arms
+                // enumerate codes and nobody added the fourth.
+                //
+                // Reachable on the ordinary failover path: a restarted or
+                // re-seeded ex-master answers LOADING for as long as it takes
+                // to load, and `discover_master` can route here in that
+                // window.
+                if Instant::now() > deadline {
+                    return Value::Error(e);
+                }
+                // Rediscover, because a loading node is ALSO a stale-routing
+                // signal -- the promoted replica may be serving already --
+                // and back off only when the re-probe still points here, the
+                // rule BUG-0055 established for READONLY.
+                //
+                // The connection is NOT dropped, unlike READONLY's arm: that
+                // one drops because a demoted node's session may be
+                // re-pointed, whereas a loading node's socket is healthy and
+                // only its dataset is not. Reconnecting would add a dial to
+                // every retry for nothing.
+                topo.rediscover_after_failure(&addr);
+                if topo.still_master(&addr) {
                     std::thread::sleep(Duration::from_millis(50));
                 }
             }
@@ -2533,11 +2580,21 @@ async fn call_pinned(backends: &mut Backends, addr: &str, frame: &[u8]) -> Resul
         Ok(Value::Error(e))
             if e.starts_with("MOVED ")
                 || e.starts_with("TRYAGAIN")
-                || e.starts_with("READONLY") =>
+                || e.starts_with("READONLY")
+                || e.starts_with("LOADING") =>
         {
             // Each of these means "this is no longer the right node, go
             // again". Outside a transaction the proxy absorbs them; here
             // going again is precisely what it must not do.
+            //
+            // LOADING belongs here for a slightly different reason and the
+            // same outcome. It does not mean the wrong node, it means NOT
+            // YET -- but a node that is not queueing cannot hold a
+            // transaction, and passing the reply through as an ordinary one
+            // would let the client see it for a command that should have
+            // said QUEUED, then EXEC a transaction missing that command.
+            // Reachable on the first keyed command, which is what opens the
+            // deferred MULTI.
             Err(format!("backend no longer owns this transaction ({e})"))
         }
         Ok(v) => Ok(v),
@@ -4605,6 +4662,127 @@ mod route_tests {
     /// the duration — a listener that accepts and never answers, so the probe
     /// blocks on the read timeout — and has a second caller arrive at 300 ms,
     /// deliberately PAST the debounce window and INSIDE the probe.
+    /// BUG-0041's investigation ruled this OUT as that bug's cause and found
+    /// it on the way: the proxy forwards `-LOADING` to the client.
+    ///
+    /// `flint-server` answers data commands with `-LOADING Flint is loading
+    /// the dataset in memory` until its dataset is up, and justifies the
+    /// spelling on the grounds that "every mainstream client library already
+    /// retries" it. Flint's clients do not reach the node -- they reach this
+    /// proxy, whose stated job is absorbing exactly these within the retry
+    /// budget. It absorbed MOVED, TRYAGAIN and READONLY and forwarded the one
+    /// whose entire meaning is "not yet", because the arms enumerate codes.
+    ///
+    /// The fake backend answers `-LOADING` to the first command and `:1` to
+    /// the second, which is a restarted node finishing its load. A client must
+    /// see `:1`.
+    #[test]
+    fn a_loading_backend_is_retried_and_never_reaches_the_client() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let lp = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = format!(
+            "127.0.0.1:{}",
+            lp.local_addr().expect("listener addr").port()
+        );
+        // Count COMMANDS, not connections: the proxy pools, so the retry may
+        // well arrive on the same socket, and counting dials would measure
+        // the pool rather than the retry.
+        let seen = Arc::new(AtomicUsize::new(0));
+        let seen_bg = Arc::clone(&seen);
+        std::thread::spawn(move || {
+            while let Ok(mut c) = lp.accept().map(|(c, _)| c) {
+                let seen = Arc::clone(&seen_bg);
+                std::thread::spawn(move || {
+                    let mut buf = [0u8; 4096];
+                    while let Ok(n) = c.read(&mut buf) {
+                        if n == 0 {
+                            return;
+                        }
+                        // THREE KINDS OF TRAFFIC ARRIVE HERE and only one of
+                        // them is the client's. `discover_master` probes with
+                        // FLINTINFO, and the connection pool opens every
+                        // socket with a RESP3 `HELLO 3` -- the first cut of
+                        // this fake answered `-LOADING` to the HANDSHAKE, so
+                        // the pool never got a usable connection, every
+                        // attempt failed as a dead backend, and the LOADING
+                        // path was never reached. The capability assert
+                        // passed anyway, because a failed handshake still
+                        // counts as a command seen. Discriminate by name.
+                        let req = String::from_utf8_lossy(&buf[..n]).to_uppercase();
+                        let reply: Vec<u8> = if req.contains("HELLO") {
+                            // `dial` requires a RESP3 MAP here and rejects
+                            // anything else as "backend refused RESP3".
+                            b"%0\r\n".to_vec()
+                        } else if req.contains("FLINTNS") {
+                            // ...and a SIMPLE string for the namespace bind,
+                            // which is the tenant boundary, not a formality.
+                            b"+OK\r\n".to_vec()
+                        } else if req.contains("FLINTINFO") {
+                            // The length must match: `discover_master`
+                            // decodes a Bulk and splits it on CRLF looking
+                            // for exactly `role:master`. A wrong length makes
+                            // the probe fail, routing goes to none, and the
+                            // retry loop then spends its whole budget with
+                            // nowhere to go -- which the capability assert
+                            // below caught when this said $12 for 11 bytes.
+                            b"$11\r\nrole:master\r\n".to_vec()
+                        } else if seen.fetch_add(1, Ordering::SeqCst) == 0 {
+                            b"-LOADING Flint is loading the dataset in memory\r\n".to_vec()
+                        } else {
+                            b":1\r\n".to_vec()
+                        };
+                        if c.write_all(&reply).is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+
+        let t = Arc::new(topo(vec![vec![addr.clone()]], vec![Some(addr.clone())]));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        // A LocalSet, because the async write path spawns non-Send tasks --
+        // the same shape the real proxy runs under. Without it the first
+        // `spawn_local` panics, which is a truthful signal that a bare
+        // block_on is not the runtime this code lives in.
+        let local = tokio::task::LocalSet::new();
+        let reply = rt.block_on(local.run_until(async {
+            let mut backends = Backends::new(b"t".to_vec(), None, false, FANOUT_TIMEOUT_DEFAULT);
+            let args = vec![b"INCR".to_vec(), b"k".to_vec()];
+            let mut raw = Vec::new();
+            encode(
+                &Value::Array(Some(
+                    args.iter().map(|a| Value::Bulk(Some(a.clone()))).collect(),
+                )),
+                &mut raw,
+            );
+            forward(&t, &mut backends, b"t", &args, &raw, false).await
+        }));
+
+        // CAPABILITY ASSERT FIRST. If the backend was asked only once, the
+        // proxy never retried and a passing equality below would be proving
+        // that the fake never got to say LOADING at all.
+        assert!(
+            seen.load(Ordering::SeqCst) >= 2,
+            "the backend saw {} data command(s): the proxy did not retry, so \
+             this test never exercised the LOADING path",
+            seen.load(Ordering::SeqCst)
+        );
+        match reply {
+            Value::Integer(1) => {}
+            Value::Error(e) if e.starts_with("LOADING") => {
+                panic!("the client was shown -LOADING verbatim: {e:?}")
+            }
+            other => panic!("expected the retried :1, got {other:?}"),
+        }
+    }
+
     #[test]
     fn a_second_caller_during_a_slow_probe_is_absorbed() {
         use std::net::TcpListener;
