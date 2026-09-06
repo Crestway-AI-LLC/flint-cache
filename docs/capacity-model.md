@@ -26,8 +26,8 @@ defaults are derived from.
 | Replication push ceiling | 4 MB per drain cycle (~GB/s-class link, self-pacing) | REPL_TAIL_BUDGET_BYTES + chain drill |
 | Proxy admission cap | 1,024 concurrent conns (default, tunable) | --max-conns |
 | Slot space | 16,384 slots, range-partitioned per pair | flint-slot / range map |
-| Controller probe cost | ~1–2 ms per healthy node; **800 ms timeout per dark node** | controller `call` timeouts |
-| Controller cadence | poll 200 ms × confirm 3 ⇒ detection ≈ 0.6 s | controller defaults |
+| Controller probe cost | ~1–2 ms per healthy node; **3 s for an unreachable host, 800 ms for one that listens and hangs** | `TcpStream::connect_timeout` 3 s; `call` read/write timeouts 800 ms. A REFUSED connection (host up, process dead) returns at once and costs neither |
+| Controller cadence | poll **100 ms** × confirm 3 ⇒ detection ≈ **0.3 s** | controller defaults (`--poll-ms` 100, halved from 200 on 2026-08-02) |
 | Tenant cap (v0 scope) | ~50 GB per tenant | roadmap scope discipline |
 
 ## Question 1 — groups per cluster
@@ -47,31 +47,49 @@ The architecture was built so most components DON'T bound group count:
 Two constraints actually bind:
 
 **(a) Supervision sweep vs. detection SLO — the sharp one.** A controller
-probes every node of every supervised pair each tick. Healthy probes cost
-~1–2 ms; a DARK node costs the full 800 ms timeout. Detection latency is
-`confirm × max(poll, sweep_time)`, so the sweep must stay under the poll
-interval **under failure**, not just in the happy path:
+sleeps for `poll`, then walks every pair in turn and every node of each pair
+in turn — both loops sequential. So the period is **`poll + sweep`**, not
+`max(poll, sweep)`: every millisecond of probing adds to the interval rather
+than hiding inside it, and
 
-    sweep ≈ healthy_nodes × 2 ms + dark_nodes × 800 ms
+    detection ≈ confirm × (poll + sweep)
+    sweep     ≈ healthy_nodes × 2 ms
+              + hung_nodes × 800 ms
+              + unreachable_nodes × 3 s
 
-With poll = 200 ms, a single controller absorbs ~64 pairs (128 nodes,
-~256 ms healthy sweep — already at budget) and exactly ZERO margin for a
-correlated failure: one dark AZ-worth of nodes multiplies the sweep by
-seconds and detection stalls exactly when it matters. Controllers are
-stateless and arbitrate via epoch fencing (proven in the concurrent-
-controller drill), so the answer is sharding, not bigger controllers:
+At the defaults (poll 100, confirm 3) a healthy fleet detects in
+`3 × (100 ms + sweep)`, so the sweep budget is what buys detection latency:
 
-> **Rule: ≤ 32 pairs per controller shard** (≈70 ms healthy sweep, so even
-> 8 simultaneous dark nodes keep detection inside 3× poll). Run one shard
-> per ~32 pairs; shards are just controllers with disjoint `--pairs` lists.
+| pairs per shard | nodes | healthy sweep @2 ms | detection |
+|---|---|---|---|
+| 16 | 32 | 64 ms | ~490 ms |
+| 24 | 48 | 96 ms | ~590 ms |
+| 32 | 64 | 128 ms | ~680 ms |
+| 64 | 128 | 256 ms | ~1.07 s |
+
+And there is **no margin at all for a correlated failure**. Eight
+simultaneously unreachable nodes add 24 s of connect timeouts to a single
+sweep; eight that listen and hang add 6.4 s. Detection then runs to tens of
+seconds — one dark AZ stalls supervision exactly when it matters. This is a
+property of the sequential sweep, not of the shard size, and no pair count
+makes it go away.
+
+Controllers are stateless and arbitrate via epoch fencing (proven in the
+concurrent-controller drill), so the answer is sharding, not bigger
+controllers:
+
+> **Rule: ≤ 24 pairs per controller shard** — 48 nodes, ~96 ms healthy
+> sweep, detection ~590 ms, which keeps the healthy case comfortably inside
+> a second. Run one shard per ~24 pairs; shards are just controllers with
+> disjoint `--pairs` lists.
 
 **(b) Slot granularity — the smooth ceiling.** Ranges partition 16,384
 slots. Rebalancing granularity degrades as slots-per-pair shrinks; below
 ~64 slots/pair the planner cannot spread heat smoothly (one hot slot is
 >1.5% of the pair). That caps a cluster at **256 pairs** outright.
 
-**v1 recommendation:** size a cluster at **up to 64 pairs (128 data
-nodes) across 2 controller shards**, hard ceiling 256 pairs. Beyond that,
+**v1 recommendation:** size a cluster at **up to 48 pairs (96 data nodes)
+across 2 controller shards**, hard ceiling 256 pairs. Beyond that,
 run another cluster: the marginal cost of a second cluster (one more CP
 quorum + proxy subset) is small, and blast radius, upgrade batches, and
 capacity math all stay human-sized. Revisit when a real fleet measures
