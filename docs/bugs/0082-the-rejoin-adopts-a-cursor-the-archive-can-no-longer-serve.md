@@ -361,3 +361,50 @@ in the tests rather than the code:
 (`world::info_field`), so surfacing this in the report is an ops-repo change
 and lands after this one. Until it does, the field is readable by hand —
 `FLINTINFO` on a seat now answers "why did you reseed", which it never could.
+
+## "So read it" — read, 2026-09-05: there has been nothing to read
+
+`5d222d3` left the instruction to go and read the deployed diagnostic. Done,
+from the archived fleet journal (`playground/fleet/cp-state.journal`, 14,584
+rows) rather than from a box.
+
+**The diagnostic has had nothing to discriminate, because the failure has not
+recurred.** Since the journal's first row on 2026-09-01:
+
+| | count |
+|---|---|
+| `RejoinStarted` | 7 |
+| of those, reaching `RejoinDecided` (the warm path) | 5 |
+| `AttachReplica` repairs | **0** |
+
+The two rejoins with no `RejoinDecided` were PROMOTED mid-rejoin (09-02 15:55
+and 09-04 21:12, each a demote/promote pair inside a roll), so they stopped
+being rejoins rather than failing as ones. **Every rejoin that completed as a
+rejoin decided warm.** None took the rewind that this bug is about.
+
+**That is a positive control, and it is why the zero means something.** A quiet
+fleet would show zero attaches for the boring reason. This one demoted,
+promoted, rolled all four seats to rc.69, and rejoined seven times in five
+days; the operation the bug lives in happened repeatedly and did not produce
+it.
+
+### What this does NOT establish, and a hypothesis the dates refute
+
+The reported rate was 16 repairs in three weeks (~0.76/day), so five quiet days
+is unlikely under it — but the journal spans six days, so **there is no
+before/after inside one series**, and everything before 09-01 is a different
+source read a different way.
+
+The tempting explanation was ADR-0035's warm-rejoin probe: verify the copy
+before discarding it, which avoids precisely the rewind that adopts an
+unservable cursor, and whose own comment describes this failure ("rewound one
+15 minutes into the past and the catch-up span was already gone from the
+master's WAL"). **It does not fit.** That probe landed in `f9782c4` on
+**2026-08-16**, inside the three-week window that produced the 16 repairs. It
+cannot on its own explain a quiet period that began afterwards.
+
+So: no cause is claimed. The measurement is that the symptom has stopped for
+five days across seven rejoins, and that the instrument added on 09-02 has not
+yet had an occurrence to speak about. **Left OPEN for that reason** — a
+diagnostic that has never fired has not been shown to work, and a bug whose
+symptom is absent is not a bug that has been explained.
