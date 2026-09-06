@@ -1678,7 +1678,31 @@ fn kill_pidfile(inv: &Inventory, r: &Runner, name: &str) {
             inv.statedir.clone(),
             name.to_string(),
         ];
-        let _ = r.output(&argv);
+        // NOT `let _ =`. This discarded both the Err and the status, so a kill
+        // that never reached the host was indistinguishable from one that
+        // worked — and every caller goes on to treat the seat as dead
+        // (BUG-0102).
+        match r.output(&argv) {
+            Ok(out) if !out.status.success() => eprintln!(
+                "  [{}] host-kill-pidfile {name} exited {} ({}) — the seat may \
+                 STILL BE RUNNING",
+                r.label(),
+                out.status
+                    .code()
+                    .map_or("by signal".into(), |c| c.to_string()),
+                String::from_utf8_lossy(&out.stderr)
+                    .trim()
+                    .lines()
+                    .next_back()
+                    .unwrap_or("no stderr")
+            ),
+            Ok(_) => {}
+            Err(e) => eprintln!(
+                "  [{}] could not run host-kill-pidfile {name}: {e} — the seat \
+                 may STILL BE RUNNING",
+                r.label()
+            ),
+        }
         return;
     }
     local_kill_pidfile(&inv.statedir, name);
@@ -1714,17 +1738,72 @@ fn pids_matching(bin: &str, ident: &str) -> Vec<u32> {
 /// the seat's host and parsed here, so there is one parser and two
 /// transports — no new host-* verb for an old remote flintctl to lack.
 fn seat_alive(r: &Runner, bin: &str, ident: &str) -> bool {
+    // ASSUME ALIVE when the host could not be asked -- that is what the `true`
+    // is. Every caller reads false as "spawn one", and the comments at those
+    // sites say what that costs: "the duplicate gets a lost port race and a
+    // clobbered pidfile -- after which every stop aims at a corpse". Leaving a
+    // seat alone that may not exist costs a `start` that did nothing.
+    seat_probe(r, bin, ident).unwrap_or(true)
+}
+
+/// The same probe, THREE-VALUED: `None` means the host could not be asked.
+///
+/// Split out for `bootstrap`'s post-PING diagnosis, whose entire job is to say
+/// WHICH of two causes it saw — "the process is running and something is
+/// holding it" against "nothing is running". A boolean forces a third cause to
+/// be reported as one of the two, and it picked the more confident one: with a
+/// host that does not resolve, it asserted "its PROCESS IS RUNNING" about a
+/// machine that does not exist (BUG-0102).
+fn seat_probe(r: &Runner, bin: &str, ident: &str) -> Option<bool> {
     if r.is_remote() {
-        let Ok(out) = r.output(&["ps".to_string(), "-eo".into(), "pid=,args=".into()]) else {
-            return false;
+        // A HOST WE COULD NOT ASK IS NOT A HOST WITH NO SEAT, and false is the
+        // dangerous answer here. Every caller reads it as "spawn one", and the
+        // two comments at those call sites already say what that costs: "the
+        // duplicate gets a lost port race and a clobbered pidfile — after
+        // which every stop aims at a corpse".
+        //
+        // `output()` returns Err only when the ssh BINARY cannot be spawned;
+        // an ssh that never reached the host returns Ok with a non-zero status
+        // and empty stdout, which parsed to "no pids" and therefore to "dead"
+        // (BUG-0102, the same shape as BUG-0100 one function over). Neither
+        // the Err nor the status was checked.
+        //
+        // So: on any transport failure, say so and answer TRUE. Leaving a seat
+        // alone that may not exist costs a `start` that did nothing; spawning
+        // beside one that does costs the pair.
+        let unreachable = |why: String| -> Option<bool> {
+            eprintln!(
+                "  [{}] could not ask whether {ident} is running: {why}",
+                r.label()
+            );
+            None
+        };
+        let out = match r.output(&["ps".to_string(), "-eo".into(), "pid=,args=".into()]) {
+            Ok(o) if !o.status.success() => {
+                return unreachable(format!(
+                    "exit {} ({})",
+                    o.status
+                        .code()
+                        .map_or("by signal".into(), |c| c.to_string()),
+                    String::from_utf8_lossy(&o.stderr)
+                        .trim()
+                        .lines()
+                        .next_back()
+                        .unwrap_or("no stderr")
+                ));
+            }
+            Ok(o) => o,
+            Err(e) => return unreachable(e.to_string()),
         };
         // No self-pid to exclude: OUR pid numbers a process on the
         // orchestrator, and the listing is another machine's. Passing it
         // would let a remote seat that happens to hold the same number be
         // read as dead, and `start` would spawn a duplicate beside it.
-        return !pids_in_ps(&String::from_utf8_lossy(&out.stdout), bin, ident, None).is_empty();
+        return Some(
+            !pids_in_ps(&String::from_utf8_lossy(&out.stdout), bin, ident, None).is_empty(),
+        );
     }
-    !pids_matching(bin, ident).is_empty()
+    Some(!pids_matching(bin, ident).is_empty())
 }
 
 fn pids_in_ps(ps: &str, bin: &str, ident: &str, exclude: Option<u32>) -> Vec<u32> {
@@ -3356,8 +3435,25 @@ fn launch(inv: &Inventory, register: bool) {
                 .collect();
             let mut argv = vec!["mkdir".to_string(), "-p".to_string()];
             argv.extend(dirs);
-            if let Err(e) = r.output(&argv) {
-                die(&format!("preparing statedir on {}: {e}", r.label()));
+            // The STATUS too: a mkdir refused for permissions, or an ssh that
+            // never landed, both return Ok here and were accepted. The failure
+            // then surfaced further down as a spawn that could not write its
+            // pidfile, which names the wrong step (BUG-0102).
+            match r.output(&argv) {
+                Ok(out) if !out.status.success() => die(&format!(
+                    "preparing statedir on {}: exit {} ({})",
+                    r.label(),
+                    out.status
+                        .code()
+                        .map_or("by signal".into(), |c| c.to_string()),
+                    String::from_utf8_lossy(&out.stderr)
+                        .trim()
+                        .lines()
+                        .next_back()
+                        .unwrap_or("no stderr")
+                )),
+                Ok(_) => {}
+                Err(e) => die(&format!("preparing statedir on {}: {e}", r.label())),
             }
         }
     }
@@ -3431,7 +3527,7 @@ fn launch(inv: &Inventory, register: bool) {
             continue;
         }
         let name = cp_seat_name(inv, i);
-        let alive = seat_alive(
+        let alive = seat_probe(
             &runner_for(inv, seat),
             "flint-controlplane",
             &format!("{d}/cp-state"),
@@ -3449,14 +3545,20 @@ fn launch(inv: &Inventory, register: bool) {
                     .join("\n      ")
             })
             .unwrap_or_else(|e| format!("<{log} unreadable: {e}>"));
-        if alive {
-            panic!(
+        match alive {
+            Some(true) => panic!(
                 "control plane seat {seat} ({name}) did not answer PING in 10s,                  but its PROCESS IS RUNNING — it started and something is                  holding it. Not a slow start: 10s is ~370x the measured                  23-27ms spawn-to-PONG.\n  last of {log}:\n      {tail}"
-            );
+            ),
+            Some(false) => panic!(
+                "control plane seat {seat} ({name}) did not answer PING in 10s and              NO PROCESS IS RUNNING — it exited or never execed, and this wait              was counting to ten against nothing.\n  last of {log}:\n      {tail}"
+            ),
+            // THE THIRD CAUSE. Naming either of the two above here would be a
+            // guess with a fact's grammar, and the guess this code made was
+            // the confident one.
+            None => panic!(
+                "control plane seat {seat} ({name}) did not answer PING in 10s, and              WHETHER ANYTHING IS RUNNING THERE IS UNKNOWN — the host could not              be asked (see the line above). The seat may be wedged or may never              have started; this wait cannot tell, and neither can the log below              if the machine is unreachable.\n  last of {log}:\n      {tail}"
+            ),
         }
-        panic!(
-            "control plane seat {seat} ({name}) did not answer PING in 10s and              NO PROCESS IS RUNNING — it exited or never execed, and this wait              was counting to ten against nothing.\n  last of {log}:\n      {tail}"
-        );
     }
     // A Raft group that answers PING has not necessarily ELECTED: prove a
     // leader exists before registering anything, or the registration calls

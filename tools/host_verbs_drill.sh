@@ -138,9 +138,16 @@ echo "   host-nonesuch -> non-zero"
 # fleet prints. `stop`'s own remote arm, three lines up, does report its
 # failures -- the same call in the same loop, one arm reporting and one silent.
 #
-# 192.0.2.1 is TEST-NET-1 (RFC 5737), guaranteed unroutable, so this needs no
-# fixture host and cannot accidentally reach one. Every seat is placed there,
-# so nothing local is stopped either.
+# `nosuchhost.invalid` is RFC 2606's reserved TLD: guaranteed never to resolve,
+# so this needs no fixture host and cannot accidentally reach one. Every seat is
+# placed there, so nothing local is stopped either.
+#
+# WAS nosuchhost.invalid (TEST-NET-1), which is equally safe and cost TWENTY SECONDS a
+# run -- two ssh calls each paying the 10 s ConnectTimeout. A name that does not
+# resolve fails in milliseconds, and the code under test cannot tell the two
+# apart: both are ssh exit 255 with a line on stderr, which is exactly what the
+# arms below read. Trading a connect timeout for a resolve failure buys the
+# whole drill back.
 echo "== stop names a host it could not sweep, instead of counting it as clean"
 R=$S/remote; mkdir -p "$R/bin"
 cat > "$R/inv" <<INV
@@ -150,11 +157,11 @@ bins $R/bin
 tls off
 ssh-user nobody
 ssh-key $R/no-such-key
-cp 192.0.2.1:7500
-pair 192.0.2.1:7001,192.0.2.1:7002
+cp nosuchhost.invalid:7500
+pair nosuchhost.invalid:7001,nosuchhost.invalid:7002
 INV
 OUT=$("$CTL" -f "$R/inv" stop 2>&1 || true)
-printf '%s\n' "$OUT" | grep -q "192.0.2.1" || fail "stop said nothing about the
+printf '%s\n' "$OUT" | grep -q "nosuchhost.invalid" || fail "stop said nothing about the
   unreachable host. Its output was:
 $OUT"
 printf '%s\n' "$OUT" | grep -qi "UNKNOWN, not zero" || fail "stop mentioned the
@@ -175,7 +182,29 @@ printf '%s\n' "$OUT" | grep -q "STILL BE RUNNING" || fail "stop reported the
   failed host-stop-all without saying what it means for the seats there.
   Its output was:
 $OUT"
-printf '%s\n' "$OUT" | grep "192.0.2.1" | sed 's/^ */   /'
+printf '%s\n' "$OUT" | grep "nosuchhost.invalid" | sed 's/^ */   /'
+
+# ---------------------------------------------------------------------------
+# THE SAME DEFECT, ONE FUNCTION OVER (BUG-0102). `start` prepares each host's
+# statedir with a remote `mkdir -p` and checked only the Err -- which, as
+# above, means "the ssh binary is missing" and never fires. A mkdir refused for
+# permissions, or an ssh that never landed, was accepted, and the run went on
+# to fail further down at a spawn that could not write its pidfile: a message
+# naming the wrong step, on a host the operator had no reason to suspect.
+echo "== start refuses when it cannot prepare a host's statedir"
+OUT=$("$CTL" -f "$R/inv" start 2>&1 || true)
+printf '%s\n' "$OUT" | grep -q "preparing statedir" || fail "start did not name the
+  statedir step. It must fail THERE rather than at whatever breaks next.
+  Its output was:
+$OUT"
+printf '%s\n' "$OUT" | grep -q "nosuchhost.invalid" || fail "start did not name the
+  host whose statedir it could not prepare. Its output was:
+$OUT"
+printf '%s\n' "$OUT" | grep -q "exit 255" || fail "start reported the failure
+  without the ssh exit status, which is what says the connection failed rather
+  than the command. Its output was:
+$OUT"
+echo "   $(printf '%s\n' "$OUT" | grep -m1 "preparing statedir" | sed 's/^ *//')"
 
 rm -rf "$S"
 echo "PASSED"
