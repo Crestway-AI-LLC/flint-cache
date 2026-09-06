@@ -99,19 +99,34 @@ echo "  baseline: cp=$CP1 node=$N1 edge=$E1"
 # Asserted HERE because this drill owns both paths that write one: bootstrap
 # above minted them, and rotate-certs below rewrites int/edge in place. A
 # rotation that re-widened a key would be invisible everywhere else.
+# `stat -f` is the FORMAT flag on macOS and means "filesystem status" on
+# GNU/Linux, where it SUCCEEDS and prints something else entirely -- so a
+# `stat -f ... || stat -c ...` fallback never reaches the fallback on Linux
+# and compares garbage. It reddened four commits before anyone read the text,
+# which said `600, want 600`. GNU first, BSD second, and refuse to compare a
+# mode that could not be read at all.
+file_mode () {
+  stat -c '%a' "$1" 2>/dev/null || stat -f '%OLp' "$1" 2>/dev/null
+}
+
 assert_key_modes () {
   local when="$1" bad=0 m f
-  for f in "$D"/state/certs/*.key; do
+  for f in "$D"/state/certs/*.key "$D"/state/certs/*.crt; do
     [ -e "$f" ] || continue
-    m=$(stat -f '%OLp' "$f" 2>/dev/null || stat -c '%a' "$f")
-    [ "$m" = "600" ] || { echo "  $(basename "$f") is $m, want 600"; bad=1; }
-  done
-  # The certificates must NOT be clamped: several readers expect them public,
-  # and a check that only looked at keys would pass a chmod -R 600.
-  for f in "$D"/state/certs/*.crt; do
-    [ -e "$f" ] || continue
-    m=$(stat -f '%OLp' "$f" 2>/dev/null || stat -c '%a' "$f")
-    [ "$m" = "644" ] || { echo "  $(basename "$f") is $m, want 644"; bad=1; }
+    m=$(file_mode "$f")
+    case "$m" in
+      [0-7][0-7][0-7]|[0-7][0-7][0-7][0-7]) ;;
+      *)
+        echo "  could not read a mode for $(basename "$f") (got '$m')"
+        echo "  This is not a pass: neither stat form worked on this host."
+        exit 1 ;;
+    esac
+    # The certificates must NOT be clamped -- several readers expect them
+    # public, and a check that only looked at keys would pass a chmod -R 600.
+    case "$f" in
+      *.key) [ "$m" = "600" ] || { echo "  $(basename "$f") is $m, want 600"; bad=1; } ;;
+      *)     [ "$m" = "644" ] || { echo "  $(basename "$f") is $m, want 644"; bad=1; } ;;
+    esac
   done
   if [ "$bad" != 0 ]; then
     echo "FAIL: key modes wrong $when. docs/security.md states 0600, and the"

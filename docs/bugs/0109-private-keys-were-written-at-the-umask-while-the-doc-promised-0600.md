@@ -130,6 +130,28 @@ find.
 Confirmed by removing the fix and re-running: `ca.key is 644, want 600`, and
 three more, followed by the drill's FAIL.
 
+### The check's own portability bug, which reddened CI for four commits
+
+The first version of the drill assertion read the mode with
+
+    stat -f '%OLp' "$f" 2>/dev/null || stat -c '%a' "$f"
+
+`-f` is the FORMAT flag on macOS and means **filesystem status** on GNU/Linux,
+where it SUCCEEDS — so on the CI runner the fallback was never reached and the
+comparison ran against a line of filesystem information. The failure text read
+
+    600, want 600
+
+which is the tell: a check reporting that a value does not equal itself is not
+looking at the value it names. Four commits were red before it was read,
+including a peer's.
+
+Fixed by putting GNU first and BSD second, and by refusing to compare a mode
+that matched neither form rather than treating an empty string as a
+mismatch — "could not measure" is its own outcome (OPS-0037). Both branches
+were then exercised against a stub `stat` emulating each platform, because
+the bug was in the half this laptop cannot run.
+
 ## Operator note
 
 **Nothing to do.** Every deployed box was already 0600, because its OpenSSL
