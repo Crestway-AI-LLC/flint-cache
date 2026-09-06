@@ -105,6 +105,11 @@ echo "  baseline: cp=$CP1 node=$N1 edge=$E1"
 # and compares garbage. It reddened four commits before anyone read the text,
 # which said `600, want 600`. GNU first, BSD second, and refuse to compare a
 # mode that could not be read at all.
+#
+# The ORDER is not a preference and only one of the two is sound: BSD stat
+# REJECTS `-c` outright, while GNU stat `-f` does not reject `%OLp` -- it
+# reinterprets it as a filename. A fallback chain only works when the wrong
+# tool errors rather than succeeding with a different meaning.
 file_mode () {
   stat -c '%a' "$1" 2>/dev/null || stat -f '%OLp' "$1" 2>/dev/null
 }
@@ -123,19 +128,30 @@ assert_key_modes () {
     esac
     # The certificates must NOT be clamped -- several readers expect them
     # public, and a check that only looked at keys would pass a chmod -R 600.
+    #
+    # Which is why the cert arm asserts a PROPERTY and not a literal. They are
+    # deliberately untouched by `harden_key_modes` (it clamps only `*.key`, and
+    # its unit test asserts "certs must NOT be clamped"), so their exact mode is
+    # the UMASK's: 644 where umask is 022, 664 where it is 002. Asserting 644
+    # asserted the machine the drill last ran on, and failed on a box whose
+    # fleet was correct (BUG-0114). The property a clamp would break is that a
+    # certificate stays readable beyond its owner, or every dialer verifying
+    # against it stops: 600 fails, 644 and 664 both pass.
     case "$f" in
       *.key) [ "$m" = "600" ] || { echo "  $(basename "$f") is $m, want 600"; bad=1; } ;;
-      *)     [ "$m" = "644" ] || { echo "  $(basename "$f") is $m, want 644"; bad=1; } ;;
+      *)     [ $(( 0$m & 0044 )) -ne 0 ] \
+               || { echo "  $(basename "$f") is $m -- clamped private; dialers cannot read it"; bad=1; } ;;
     esac
   done
   if [ "$bad" != 0 ]; then
-    echo "FAIL: key modes wrong $when. docs/security.md states 0600, and the"
-    echo "      CA key is the one that matters: anyone who can read it mints a"
-    echo "      leaf the whole mesh trusts, because internal dials verify a"
-    echo "      FIXED name rather than a per-host identity."
+    echo "FAIL: certificate directory modes wrong $when. docs/security.md states"
+    echo "      0600 for keys, and the CA key is the one that matters: anyone who"
+    echo "      can read it mints a leaf the whole mesh trusts, because internal"
+    echo "      dials verify a FIXED name rather than a per-host identity. The"
+    echo "      certs are checked for the opposite property -- still readable."
     exit 1
   fi
-  echo "  private keys 0600, certificates 644 $when"
+  echo "  private keys 0600, certificates readable (not clamped) $when"
 }
 echo "== private key modes after bootstrap"
 assert_key_modes "after bootstrap"
