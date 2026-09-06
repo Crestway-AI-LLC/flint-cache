@@ -2880,6 +2880,98 @@ GUIDESPY
   echo "  every command the guides name is in the matrix (${counts% *} guides, ${counts#* } dispatched tokens)"
 }
 
+assert_docs_only_cite_drills_that_run() {
+  # docs/architecture.md ends with "Every claim above has a runnable proof in
+  # `tools/`" and then names nine drills. docs/slo.md and the README name more.
+  # A drill that is renamed, or dropped from a registry, turns those sentences
+  # false without touching them -- and the reader who checks is exactly the
+  # sceptical one the section is written for.
+  #
+  # Two conditions, because either alone is satisfiable while the claim is
+  # false: the file must EXIST, and it must be in a list the gate runs. A
+  # drill nobody runs is not a proof of anything.
+  local out
+  out=$(python3 - <<'CITEPY'
+import glob, os, re, sys
+
+try:
+    gates = open("tools/gates.sh", encoding="utf-8", errors="replace").read()
+except OSError:
+    print("NOGATES")
+    sys.exit(0)
+
+# The registries the gate iterates. Named individually rather than scraped,
+# so a new list has to be added here on purpose -- the same reason the guide
+# classification is explicit.
+# CORE wraps its list in `${FLINT_CORE_ORDER:-...}` and spans several lines,
+# so take everything between the quotes and strip the expansion syntax rather
+# than trying to match around it. A regex that stopped at the first `}` read
+# the list as empty and reported every citation in the tree as unregistered --
+# including three this same session had just confirmed by hand.
+registered = set()
+for var in ("CORE", "CHAOS"):
+    m = re.search(r'^%s="(.*?)"' % var, gates, re.M | re.S)
+    if not m:
+        continue
+    body = m.group(1).replace("${FLINT_CORE_ORDER:-", " ").replace("}", " ")
+    registered.update(w for w in body.split() if w and "$" not in w)
+if not registered:
+    print("NOREGISTRY")
+    sys.exit(0)
+
+cited = {}
+for doc in sorted(glob.glob("docs/*.md")) + ["README.md"]:
+    try:
+        text = open(doc, encoding="utf-8", errors="replace").read()
+    except OSError:
+        continue
+    for name in re.findall(chr(96) + r"([a-z0-9_]+)_drill\.sh" + chr(96), text):
+        cited.setdefault(name, set()).add(os.path.basename(doc))
+
+if not cited:
+    print("NOCITES")
+    sys.exit(0)
+print("COUNT %d" % len(cited))
+for name, where in sorted(cited.items()):
+    why = []
+    if not os.path.exists("tools/%s_drill.sh" % name):
+        why.append("no such file")
+    elif name not in registered:
+        why.append("not in CORE or CHAOS, so the gate never runs it")
+    if why:
+        print("%s\t%s\t%s" % (name, ",".join(sorted(where)), "; ".join(why)))
+CITEPY
+  )
+  case "$out" in
+    NOGATES|NOREGISTRY)
+      echo "FAIL  could not read the drill registries, so no citation was"
+      echo "        checked. This is not a pass."
+      FAILED="$FAILED doc-drill-cites-unreadable"; return ;;
+    NOCITES)
+      echo "FAIL  no drill citation found in any doc. architecture.md names"
+      echo "        nine; finding none means the scan broke, not that the"
+      echo "        docs stopped citing proofs."
+      FAILED="$FAILED doc-drill-cites-examined-nothing"; return ;;
+  esac
+  local count rows
+  count=$(printf '%s\n' "$out" | sed -n 's/^COUNT \(.*\)/\1/p')
+  rows=$(printf '%s\n' "$out" | grep -v '^COUNT ' || true)
+  if [ -n "$rows" ]; then
+    echo "FAIL  a doc cites a drill the gate does not run:"
+    printf '%s\n' "$rows" | while IFS="$(printf '\t')" read -r name where why; do
+      echo "        ${name}_drill.sh  (cited by $where)  -- $why"
+    done
+    echo "        architecture.md offers these as the PROOF of the claims"
+    echo "        above them. A named drill that does not exist, or that no"
+    echo "        stage runs, makes that sentence false for the one reader"
+    echo "        who goes and checks. Re-aim the citation or re-register the"
+    echo "        drill; do not delete the sentence."
+    FAILED="$FAILED doc-drill-cites"
+    return
+  fi
+  echo "  every drill cited by a doc exists and is registered ($count cited)"
+}
+
 assert_lease_ttl_single_source() {
   local bad
   bad=$(grep -rn 'lease-ttl-ms[[:space:]][[:space:]]*[0-9]' tools/ 2>/dev/null \
@@ -3003,6 +3095,7 @@ if want check; then
   assert_every_dispatched_command_is_gated
   assert_every_write_command_is_retry_classified
   assert_guides_only_name_documented_commands
+  assert_docs_only_cite_drills_that_run
   assert_warm_covers_fleet_binaries
   assert_bootstrap_failures_say_why
   report_toolchain_vs_pin
