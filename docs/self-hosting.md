@@ -65,7 +65,7 @@ tls on
 client-tls on
 cp 127.0.0.1:7500
 pair 127.0.0.1:7001,127.0.0.1:7002
-proxy 0.0.0.0:7379
+proxy 127.0.0.1:7379
 controller on
 EOF
 
@@ -239,6 +239,23 @@ flintctl: inventory places a seat on 10.0.1.10, which is not this machine,
 name a machine.** A proxy binds a wildcard (`proxy 0.0.0.0:7379`), so nothing
 in the address says where it runs; `proxy-host` supplies that, one line per
 `proxy` line, in the same order. `controller on` has no address at all.
+
+**A wildcard `proxy` line without one of them does not work**, and the failure
+is not a placement error — it is a certificate one. With no `proxy-host`,
+`flintctl` dials the bind address verbatim, so it connects to `0.0.0.0:7379`
+and validates the edge certificate against the name `0.0.0.0`. The edge cert
+carries `IP:127.0.0.1, DNS:localhost`, so the handshake fails and `bootstrap`
+dies at
+
+```
+proxy 0.0.0.0:7379 (dialled at 0.0.0.0:7379) never answered PROXYSTATS within 10s
+```
+
+which reads as a dead proxy. The proxy is fine; its log shows
+`received fatal alert: BadCertificate` — the client rejected the server.
+Either bind loopback (`proxy 127.0.0.1:7379`, what a single box wants) or keep
+the wildcard and add `proxy-host`. Both are verified; the wildcard alone is
+`BUG-0107`.
 
 **`ssh-sudo on` for a packaged install**, and the reason is worth stating: on a
 packaged host `bins` and `statedir` are root-owned and the internal mesh key

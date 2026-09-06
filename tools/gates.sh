@@ -2387,6 +2387,20 @@ for f in FILES:
                 h = v.split(" ")[0]
                 if ipv4.match(h) and not h.startswith("127."):
                     remote.add(h)
+        # RULE 2, BUG-0107: a wildcard BIND is not an address of any machine,
+        # and with no proxy-host the dial target is the bind address verbatim.
+        # flintctl then validates the edge cert against the name "0.0.0.0",
+        # which is not among its SANs, and bootstrap dies claiming the proxy
+        # never answered. Checked on EVERY inventory block, not only the
+        # multi-host ones -- the single-box case is precisely the one that can
+        # omit proxy-host and reach it.
+        wild = [l for l in live
+                if l.split(" ")[0] == "proxy"
+                and l.partition(" ")[2].strip().rsplit(":", 1)[0].strip()
+                in ("0.0.0.0", "[::]", "::")]
+        if wild and not ({"proxy-host", "proxy-advertise"} & set(keys)):
+            bad.append("%s\t%s (wildcard proxy, no proxy-host)"
+                       % (f, wild[0].strip()))
         if not remote:
             continue
         multi += 1
@@ -2419,10 +2433,13 @@ DOCINV
   if [ -n "$out" ]; then
     echo "FAIL  documented inventor(ies) that flintctl would REFUSE:"
     printf '%s\n' "$out" | while IFS="$(printf '\t')" read -r f hosts; do
-      echo "        $f — places seats on $hosts but declares no \`ssh-user\`"
+      echo "        $f — $hosts"
     done
-    echo "        Copied verbatim these print \"inventory places a seat on"
-    echo "        <host>, which is not this machine, but declares no ssh-user\"."
+    echo "        Copied verbatim, an inventory missing \`ssh-user\` prints"
+    echo "        \"places a seat on <host>, which is not this machine\"; one"
+    echo "        with a wildcard proxy and no \`proxy-host\` dies at bootstrap"
+    echo "        with \"proxy 0.0.0.0:P never answered PROXYSTATS\" — which is"
+    echo "        a certificate rejection, not a dead proxy (BUG-0107)."
     echo "        See the Placement section of docs/self-hosting.md."
     FAILED="$FAILED doc-inventories-refuse"
     return
