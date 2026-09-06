@@ -25,6 +25,7 @@ lost. Format and rationale: [0001](0001-record-architecture-decisions.md).
 | [0026](0026-admission-control-on-write-stall.md) | Admission control keyed on the master's own write stall, not on replica lag (proposed; amended — compaction tuning removes the collapse without shedding, so the gate is a backstop for where replica lag binds) |
 | [0027](0027-shared-stripe-locks-for-pure-writes.md) | Shared-mode stripe locks for pure writes, so a pipeline can commit as one batch (implemented; its deadlock-freedom argument corrected, the write deadline's clock repaired after batching moved the commit outside it, and its ~2.2x demoted to a measurement OWED -- BUG-0078 showed both arms were measured through a ~50ms TCP stall) |
 | [0028](0028-a-verdict-must-name-what-it-examined.md) | A verdict must name what it examined, and the naming must be refutable: five checks passed in one day about subjects nobody had asked about, and every one was caught by something that PRINTED what it looked at rather than by the check's own result. **ACCEPTED 2026-09-04** with a fourth obligation added on acceptance -- a failure names only what it OBSERVED, and where it cannot separate two causes it says so rather than choosing the more serious one -- on the evidence of seven verdicts in one day that named a product fault for a harness or timing condition, one of which reddened the v0.1.0-rc.68 release gate |
+| [0029](0029-separate-the-read-lane-from-the-write-lane.md) | Separate the read lane from the write lane at the proxy's connection key: a backend connection is a strict FIFO because "position is the whole correspondence" (ADR-0021), so a slow write blocks every read queued behind it -- and ADR-0026 measured what a slow write is, an L0 stall that pins all 60 connections in flight with the master 92% idle. ADR-0021 removed head-of-line blocking behind STRANGERS' requests and could not touch blocking behind your own. Lane joins the connection key rather than opening a second pool, and read-your-own-writes is held by a barrier -- a client with a write in flight reads on the WRITE lane until it acks -- because splitting naively lets a GET overtake the SET in front of it. **PROPOSED 2026-09-06**, and gated on the one number nobody has: no drill measures read latency while writes stall, so the harm is certain in KIND and unmeasured in MAGNITUDE. If read p99 during a stall is within noise of baseline the ADR is withdrawn, which is a real possibility because the near-cache may serve the reads that would otherwise queue |
 | [ADR-0022](0022-wal-retention-bounded-by-replica-progress.md) | WAL retention follows the slowest live replica; the master sheds instead of letting it die |
 
 ## Why the numbering has a gap
@@ -52,7 +53,7 @@ This paragraph used to say the opposite: that the two halves shared one
 sequence on purpose, and that numbering per repository "would make the two
 halves impossible to discuss together". **They never shared one.** The
 managed plane starts at 0005 because the first four were written before the
-split, and both sequences then advanced independently — so nine numbers name
+split, and both sequences then advanced independently — so ten numbers name
 two different documents each. The rule described an intention nothing
 enforced, and no allocator ever existed to enforce it.
 
@@ -87,7 +88,7 @@ depends on a document you cannot see. That is the load-bearing rule; the
 numbering only decides whether a reader can tell they are being pointed
 somewhere they cannot go.
 
-### The nine numbers that name two decisions
+### The ten numbers that name two decisions
 
 Recorded so a bare citation of one can be recognised, not to be memorised:
 
@@ -102,8 +103,9 @@ Recorded so a bare citation of one can be recognised, not to be memorised:
 | 0026 | admission-control-on-write-stall | a-second-protocol-for-the-object-cache |
 | 0027 | shared-stripe-locks-for-pure-writes | arming-is-a-declaration-not-a-hand-edit |
 | 0028 | a-verdict-must-name-what-it-examined | the-shipping-path-is-unexercised-until-you-ship |
+| 0029 | separate-the-read-lane-from-the-write-lane | what-the-acting-agent-may-investigate |
 
-Eight of those are latent: each repository's code cites its own. **0023 is
+Nine of those are latent: each repository's code cites its own. **0023 is
 not**, and its citations here are qualified for that reason — `flint-storage`
 cites `OPS-ADR-0023 D7` sixteen times, and this repository's ADR-0023 is a
 different document that is *also about eviction* and has no D-numbered
