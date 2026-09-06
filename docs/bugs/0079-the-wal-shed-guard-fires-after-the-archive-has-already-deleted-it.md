@@ -1,4 +1,4 @@
-# BUG-0079 — the WAL shed guard fires at twice the distance the archive keeps (budget FIXED and now OBSERVABLE 2026-09-02; mount ordering still open)
+# BUG-0079 — the WAL shed guard fires at twice the distance the archive keeps (budget FIXED and OBSERVABLE 2026-09-02; the residue is a silent mount no-op, NOT the ordering — re-aimed 2026-09-05)
 
 **Found** 2026-08-30 by a 2 TB ingest run, and reproduced exactly by a second
 one. Both stalled at the same place: **163–165 GB**, ~15 minutes into a
@@ -239,19 +239,44 @@ the volume comparison refuses to run until `disk_total_bytes` is positive —
 against a total of `0` the expected budget IS the floor, so a floor-clamped
 seat would match and the check would agree with the defect it exists to catch.
 
-### Still open
+### Still open — re-aimed 2026-09-05, and it was not the ordering
 
-- **A seat that starts before its instance store is mounted** has a worse
-  problem than its WAL budget — it would put data on the root volume. The
-  create-then-measure fix makes the budget consistent with wherever the data
-  lands; it does not make the mount ordering correct. The new invariant does
-  not catch this either, and cannot: a seat on the root volume derives a
-  budget that is *correct for the volume it is on*, and INFO agrees with
-  itself. What is wrong there is the volume, not the arithmetic.
-- **A seat that starts before its instance store is mounted** has a worse
-  problem than its WAL budget — it would put data on the root volume. The
-  create-then-measure fix makes the budget consistent with wherever the data
-  lands; it does not make the mount ordering correct.
+This section said, twice in the same list, that *"a seat that starts before its
+instance store is mounted"* would put data on the root volume. The duplicate
+was a paste; the claim itself was checked against the fleet repo today and it
+is the wrong exposure.
+
+**The ordering has been enforced since 2026-07-21.** `flint-nvme.service`
+carries `Before=flint-first-boot.service`, and first-boot carries
+`After=… flint-nvme.service` **and** `Requires=flint-nvme.service`. A seat
+started by the boot path therefore cannot run before the mount unit has, and
+the wiring predates this bug by five weeks. Stating it as an open gap was a
+claim about the tree that nobody had made against the tree.
+
+**What actually remains is a silent no-op, not a race.** `nvme-mount.sh`
+identifies the instance store by MODEL and, finding none, `exit 0`s. So
+"mounted the store" and "found no store and did nothing" are the SAME success:
+the unit goes active, `Requires=` is satisfied, first-boot proceeds, and
+`/var/lib/flint` is on the root EBS volume with nothing saying so. One
+character in an instance type decides it — `c5d` has a store, `c5` does not.
+
+The budget invariant cannot catch that, for the reason the first bullet gave
+and which is still right: a seat on the root volume derives a budget that is
+*correct for the volume it is on*, and INFO agrees with itself. **What is
+wrong there is the volume, not the arithmetic.**
+
+**Partly covered already, and only on one path.** `chaos-cluster/up.sh`
+asserts the mount after boot on every host — `findmnt -no SOURCE
+/var/lib/flint`, then `lsblk -dno MODEL` on it, requiring "Instance Storage" —
+added when the default type moved off i4i to a cost-chosen `c5d`. So chaos
+fleets are held. Fleets brought up by any other path are not, and the seat
+still cannot answer the question about itself.
+
+The residue, stated so it is not re-derived a third time:
+
+- `nvme-mount.sh`'s two outcomes are indistinguishable after the fact: it
+  writes nothing, so `journalctl -u flint-nvme` cannot say which branch ran.
+- No path other than `chaos-cluster/up.sh` checks the mount at bring-up.
 
 ## 2026-09-04 — what the archive holds, expressed in TIME
 
