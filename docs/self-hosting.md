@@ -255,7 +255,7 @@ which reads as a dead proxy. The proxy is fine; its log shows
 `received fatal alert: BadCertificate` — the client rejected the server.
 Either bind loopback (`proxy 127.0.0.1:7379`, what a single box wants) or keep
 the wildcard and add `proxy-host`. Both are verified; the wildcard alone is
-`BUG-0107`.
+`BUG-0110`.
 
 **`ssh-sudo on` for a packaged install**, and the reason is worth stating: on a
 packaged host `bins` and `statedir` are root-owned and the internal mesh key

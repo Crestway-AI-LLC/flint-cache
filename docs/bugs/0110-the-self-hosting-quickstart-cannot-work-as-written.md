@@ -1,4 +1,4 @@
-# BUG-0107 — the self-hosting quickstart cannot work as written (FIXED 2026-09-05)
+# BUG-0110 — the self-hosting quickstart cannot work as written (FIXED 2026-09-05)
 
 **Status: FIXED 2026-09-05.** Found the same day by running the quickstart
 instead of reading it · Severity: medium-high — it is the first thing a new
