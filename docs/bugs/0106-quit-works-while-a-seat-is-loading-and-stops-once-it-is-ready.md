@@ -1,6 +1,6 @@
-# BUG-0106 — `QUIT` works while a seat is LOADING and stops once it is READY (OPEN)
+# BUG-0106 — `QUIT` works while a seat is LOADING and stops once it is READY (WONTFIX 2026-09-06)
 
-**Status: OPEN.** Found 2026-09-05 while writing conformance cases for the
+**Status: WONTFIX 2026-09-06.** Found 2026-09-05 while writing conformance cases for the
 commands `docs/command-support.md` claimed were gated and were not (BUG-0103)
 · Severity: low — the client path goes through the proxy, which answers
 `QUIT` correctly. What is wrong is a seat's direct behaviour, and the
@@ -48,3 +48,19 @@ answered and where it is not, and points here. No conformance case asserts
 the current seat behaviour on purpose: a case that pins `ERR unknown command`
 would make the defect the contract, and the next person to fix this would
 have to delete a passing test to do it.
+
+## Decision, 2026-09-06 (Jeff's call): not fixing
+
+The client path already works. Clients reach seats through the proxy, and the
+proxy answers `QUIT` with `+OK`; what is wrong is a seat's behaviour on a
+direct connection, which is an operator and tooling path where a client
+library's clean-shutdown `QUIT` is not in play.
+
+Against that, the fix has to run inside `serve`'s write-batching loop and
+close a connection that may have a batch in flight. Get the flush wrong and
+writes a client believed were in flight are gone. **That is trading a
+durability risk for a compatibility nicety**, and the trade does not clear.
+
+Reopen this if a seat ever becomes a supported client endpoint, or if the
+serve loop gains a natural quiesce point for other reasons — at that point
+the fix is small and the risk is somebody else's already-paid cost.

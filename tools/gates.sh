@@ -2660,6 +2660,96 @@ CMDGATEPY
   echo "  every dispatched command has a conformance case (${counts% *} dispatched, ${counts#* } exercised)"
 }
 
+assert_every_write_command_is_retry_classified() {
+  # docs/retry-safety.md tells clients which commands survive a blind retry.
+  # It is a correctness contract -- the LPOP row is the difference between a
+  # retry and silent data loss -- and on 2026-09-06 it classified 25 of the 62
+  # commands the server calls writes. The 37 it omitted included SPOP,
+  # ZPOPMIN, ZPOPMAX, LTRIM, ZREMRANGEBYRANK and counted LREM, every one of
+  # which destroys an extra element on retry: the exact hazard the page names
+  # for LPOP, in commands a reader would find absent and assume were fine.
+  #
+  # What this establishes is PRESENCE, not correctness. A command filed in the
+  # wrong table still passes; nothing but review catches that. It stops the
+  # page falling behind the server, which is how it got 37 behind.
+  local out
+  out=$(python3 - <<'RETRYPY'
+import re, sys
+
+CLASSIFIER = "crates/flint-commands/src/lib.rs"
+DOC = "docs/retry-safety.md"
+try:
+    src = open(CLASSIFIER, encoding="utf-8", errors="replace").read()
+    doc = open(DOC, encoding="utf-8", errors="replace").read()
+except OSError:
+    print("NOFILE")
+    sys.exit(0)
+
+# The authority on "is this a write" is the function both planes already
+# share, not a list kept here -- a second list would be the thing that drifts.
+marker = "pub fn is_write_command"
+if marker not in src:
+    print("NOANCHOR")
+    sys.exit(0)
+body = src.split(marker, 1)[1]
+end = body.find("\n}\n")
+if end == -1:
+    print("NOANCHOR")
+    sys.exit(0)
+writes = set(re.findall(r'b"([A-Z][A-Z0-9.]*)"', body[:end]))
+
+# Any backticked mention in the doc counts: the tables name some commands
+# inside a longer form -- SET ... NX, LREM key 0 m -- and demanding a bare
+# token would fail on the rows that are most carefully written.
+#
+# chr(96) rather than the character: bash tokenises a backtick as old-style
+# command substitution while scanning the $( ) around this heredoc, even
+# though the delimiter is quoted, and the file stops parsing.
+named = set(re.findall(chr(96) + r"([A-Z][A-Z0-9.]*)", doc))
+
+if not writes or not named:
+    print("EMPTY %d %d" % (len(writes), len(named)))
+    sys.exit(0)
+print("COUNT %d" % len(writes))
+for name in sorted(writes - named):
+    print(name)
+RETRYPY
+  )
+  case "$out" in
+    NOFILE)
+      echo "FAIL  could not read the write classifier or retry-safety.md, so"
+      echo "        nothing was compared. This is not a pass."
+      FAILED="$FAILED retry-classified-unreadable"; return ;;
+    NOANCHOR)
+      echo "FAIL  flint_commands::is_write_command is gone or reshaped, so this"
+      echo "        check read no commands at all. Re-aim it at whatever now"
+      echo "        decides that a command is a write -- do not delete it: it"
+      echo "        is what keeps docs/retry-safety.md from falling behind."
+      FAILED="$FAILED retry-classified-anchor-missing"; return ;;
+    EMPTY*)
+      echo "FAIL  one side came back empty ($out); the agreement below would"
+      echo "        have been between two nothings."
+      FAILED="$FAILED retry-classified-examined-nothing"; return ;;
+  esac
+  local count unclassified
+  count=$(printf '%s\n' "$out" | sed -n 's/^COUNT \(.*\)/\1/p')
+  unclassified=$(printf '%s\n' "$out" | grep -v '^COUNT ' || true)
+  if [ -n "$unclassified" ]; then
+    echo "FAIL  writes with no row in docs/retry-safety.md:"
+    printf '%s\n' "$unclassified" | while read -r c; do echo "        $c"; done
+    echo "        That page is what a client reads to decide whether re-sending"
+    echo "        a command after an ambiguous failure is safe. A write missing"
+    echo "        from it reads as 'not listed, so presumably fine' -- which is"
+    echo "        how SPOP sat unlisted beside LPOP while sharing its hazard."
+    echo "        Decide which table it belongs in. The rule is in the page:"
+    echo "        naming WHAT to change is safe, naming WHERE / HOW MANY /"
+    echo "        HOW MUCH is not."
+    FAILED="$FAILED retry-classified"
+    return
+  fi
+  echo "  every write command is classified in retry-safety.md ($count writes)"
+}
+
 assert_lease_ttl_single_source() {
   local bad
   bad=$(grep -rn 'lease-ttl-ms[[:space:]][[:space:]]*[0-9]' tools/ 2>/dev/null \
@@ -2781,6 +2871,7 @@ if want check; then
   assert_recovery_stays_off_until_it_observes
   assert_lease_ttl_single_source
   assert_every_dispatched_command_is_gated
+  assert_every_write_command_is_retry_classified
   assert_warm_covers_fleet_binaries
   assert_bootstrap_failures_say_why
   report_toolchain_vs_pin

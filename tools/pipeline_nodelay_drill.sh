@@ -16,7 +16,27 @@
 #   B (positive control): the same server with FLINT_NAGLE_TEST=1, which skips
 #     set_nodelay. The stall MUST reappear. If it does not, this drill cannot
 #     see the defect it exists to catch and says so rather than passing.
+#
+# LINUX ONLY, and the skip is the decision rather than a workaround (BUG-0105).
+# On darwin the positive control cannot be armed: with TCP_NODELAY skipped, a
+# 32-deep 1 KiB pipeline still round-trips in ~0.3ms, nowhere near the 20ms
+# that says the stall is present. The kernel simply does not produce the
+# condition. Arm A would then be measuring nothing, and the drill correctly
+# refused to call that a pass -- which made a local `gates.sh drills` run
+# permanently one-red, and a gate that is always one-red is a gate people
+# learn to read past.
+#
+# So it runs where a core gate runs: the Linux gate box, and CI. A local run
+# says SKIP rather than FAIL, and FLINT_GATE_STRICT=1 still turns that into a
+# failure for anyone who wants the stricter reading.
 set -u
+if [ "$(uname)" != "Linux" ]; then
+  echo "SKIP: pipeline_nodelay is Linux-only — on $(uname) the positive control"
+  echo "      cannot be armed (a 32-deep pipeline round-trips in ~0.3ms with"
+  echo "      Nagle left on), so arm A would prove nothing. It runs on the"
+  echo "      gate box, which is where a core gate runs. docs/bugs/0105."
+  exit 0
+fi
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
 fleet_init $FLINT_DRILL_ROOT/flint-nodelay 6407 6408

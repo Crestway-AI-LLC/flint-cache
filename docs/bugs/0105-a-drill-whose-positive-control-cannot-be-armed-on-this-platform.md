@@ -1,6 +1,7 @@
-# BUG-0105 — `pipeline_nodelay`'s positive control cannot be armed on macOS, so the drill is a permanent local red (OPEN)
+# BUG-0105 — `pipeline_nodelay`'s positive control cannot be armed on macOS, so the drill is a permanent local red (FIXED 2026-09-06)
 
-**Status: OPEN.** Found 2026-09-05 while establishing which of six drill
+**Status: FIXED 2026-09-06** — the drill is now Linux-only and says SKIP
+elsewhere. Found 2026-09-05 while establishing which of six drill
 failures in a local `gates.sh drills` run belonged to an unrelated change ·
 Severity: low for the product, higher for the gate: a check that can never
 pass on the machine people run it on is training to ignore reds.
@@ -51,5 +52,17 @@ Three options, none free:
 - **Declare it Linux-only** and run it solely on the gate box, which is
   already the documented default for a core gate.
 
-Not chosen here because it is a decision about what the local gate is FOR,
-which is a wider question than the change that surfaced it.
+**Chosen 2026-09-06 (Jeff's call): the third.** The drill now exits 0 with a
+`SKIP:` line on any non-Linux host and runs where a core gate already runs —
+the Linux gate box, and CI. Three things made it the right one:
+
+- It costs no coverage anywhere it currently has any. The seam is exercised
+  on every gate-box run, which is the run that gates a release.
+- The second option is speculative work against a kernel's coalescing
+  behaviour, with no guarantee a load exists that stalls on darwin.
+- The skip is not silent, and it is not permanent cover: `SKIP:` is the
+  form `gates.sh` already recognises, and `FLINT_GATE_STRICT=1` turns it
+  back into a failure for anyone who wants the stricter reading.
+
+What this buys is the thing the write-up was actually about: a local drills
+run can now go green, so the next red in that list means something.
