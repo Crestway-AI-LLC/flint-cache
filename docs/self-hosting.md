@@ -212,6 +212,48 @@ admin-token <tok>           # gate the PROXY*/operator surface
 edge-san <ip-or-dns>        # extra SANs on the edge cert (real client addrs)
 ```
 
+**Placement — required as soon as any seat is on another machine:**
+
+```
+ssh-user ec2-user           # the login user flintctl reaches other hosts as
+ssh-key /path/to/id         # optional: an identity file, if not your default
+ssh-sudo on                 # run the remote half under sudo (packaged installs)
+proxy-host 10.0.3.10        # positional with `proxy` lines — see below
+controller-host 10.0.1.10   # likewise, for `controller on`
+```
+
+`flintctl` decides local from remote per seat, by trying to bind the address:
+one that this machine owns is spawned directly, anything else over SSH. **Omit
+all of these and a fleet behaves exactly as it did before they existed** — a
+single-host inventory never touches SSH.
+
+Get it wrong and it refuses rather than quietly running a smaller cluster:
+
+```
+flintctl: inventory places a seat on 10.0.1.10, which is not this machine,
+  but declares no `ssh-user` — flintctl cannot start or stop a process it has
+  no way to reach
+```
+
+**`proxy-host` and `controller-host` exist because those two addresses do not
+name a machine.** A proxy binds a wildcard (`proxy 0.0.0.0:7379`), so nothing
+in the address says where it runs; `proxy-host` supplies that, one line per
+`proxy` line, in the same order. `controller on` has no address at all.
+
+**`ssh-sudo on` for a packaged install**, and the reason is worth stating: on a
+packaged host `bins` and `statedir` are root-owned and the internal mesh key
+(`certs/int.key`) is root-only by design, so the login user can neither unpack
+a bundle over the staged binaries nor read the key the seats need. Without it
+the first symptom is `tar: ./flint-server: Cannot open: File exists`, which
+names the symptom and not the cause.
+
+**What is exercised, and what is not.** The remote path was driven end to end
+across two hosts on 2026-09-05 — `bootstrap`, `push-bins`, `stop`, `start`,
+orphan `sweep`, and an `upgrade` rolling a seat that lives on the other
+machine, with a fenced failover promoting the remote member. What has *not*
+happened is anybody running a multi-machine self-hosted fleet in anger, so
+treat the operational edges as less worn than the single-host path.
+
 **The `pair` line — one line per pair.** The comma separates the *members
 of a single pair*, not pairs from each other: the **first member is the
 master**, the rest are replicas (`pair m,r1,r2` is a master with two
