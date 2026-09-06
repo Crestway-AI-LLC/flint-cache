@@ -243,6 +243,55 @@ struct Inventory {
     backup_host: Option<String>,
 }
 
+/// Every `FLINT_*` name a seat process actually reads, harvested from
+/// `flint-storage` and `flint-server`.
+///
+/// Kept here rather than exported from those crates on purpose: flintctl does
+/// not link them, and a compile-time coupling would be worse than a list with
+/// a test holding it against the source (see `node_env_names_match_the_seat`).
+const SEAT_ENV_NAMES: &[&str] = &[
+    "FLINT_BATCH_COMMIT_FAIL",
+    "FLINT_BG_JOBS",
+    "FLINT_BLOCK_CACHE_MB",
+    "FLINT_LEVEL_BASE_MB",
+    "FLINT_NAGLE_TEST",
+    "FLINT_PROBE_APPLY_SEQS",
+    "FLINT_PROBE_TARGETS",
+    "FLINT_PROBE_VALUE_BYTES",
+    "FLINT_ROCKS_STATS",
+    "FLINT_STATS_DUMP_SEC",
+    "FLINT_SUBCOMPACTIONS",
+    "FLINT_WRITE_BUFFER_MB",
+];
+
+/// Say when a `node-env FLINT_*` name is one no seat reads.
+///
+/// `node-env` is a deliberate escape hatch — "extra environment for every
+/// flint-server seat" — and it accepts anything, which is right: an operator
+/// may want `RUST_LOG` or something a future build reads. What is not right is
+/// that a TYPO is indistinguishable from a setting. `FLINT_BG_JOB=4` is
+/// accepted, forwarded to every seat, read by nothing, and reported nowhere;
+/// the operator has changed a compaction knob in their head and not on the
+/// fleet, and the only symptom is that the tuning they came to apply does not
+/// happen.
+///
+/// A WARNING, NOT A REFUSAL, and the asymmetry is the point. Refusing would
+/// break the escape hatch the flag exists to be, and this list is a snapshot
+/// of another crate's behaviour — being wrong about it must cost a spurious
+/// line, never a rejected command.
+///
+/// Narrow to the `FLINT_` prefix: a non-Flint name is plainly deliberate, and
+/// warning about `RUST_LOG` would train the operator to ignore the line.
+fn warn_unknown_node_env(key: &str) {
+    if key.starts_with("FLINT_") && !SEAT_ENV_NAMES.contains(&key) {
+        eprintln!(
+            "flintctl: WARNING node-env {key} is not a name any seat reads, so it will \
+             be set and ignored. Known: {}",
+            SEAT_ENV_NAMES.join(", ")
+        );
+    }
+}
+
 fn parse_inventory(path: &str) -> Inventory {
     let raw =
         std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read inventory {path}: {e}"));
@@ -327,6 +376,7 @@ fn parse_inventory(path: &str) -> Inventory {
                 if let Some((k, v)) = val.split_once('=') {
                     let (k, v) = (k.trim(), v.trim());
                     if !k.is_empty() {
+                        warn_unknown_node_env(k);
                         inv.node_env.push((k.to_string(), v.to_string()));
                     }
                 }
@@ -7681,6 +7731,85 @@ mod reconverge_message_tests {
         ] {
             assert!(m.contains("a:1") && m.contains("b:2"), "{m}");
         }
+    }
+}
+
+#[cfg(test)]
+mod node_env_tests {
+    use super::SEAT_ENV_NAMES;
+
+    /// THE LIST IS A SNAPSHOT OF ANOTHER CRATE, so something has to notice
+    /// when that crate moves. flintctl does not link `flint-storage` or
+    /// `flint-server` -- it spawns them -- so this reads their SOURCE.
+    ///
+    /// A source scan is a weak instrument and it is used deliberately: the
+    /// alternative is a stale list that warns about a real knob (training the
+    /// operator to ignore the warning) or stays quiet about a typo (the
+    /// failure this exists to catch). Both are silent; a failing test is not.
+    #[test]
+    fn node_env_names_match_the_seat() {
+        use std::collections::BTreeSet;
+        let mut found: BTreeSet<String> = BTreeSet::new();
+        for rel in ["../flint-storage/src", "../flint-server/src"] {
+            // CARGO_MANIFEST_DIR is the CRATE root, not its src. The first
+            // version joined "src" first and resolved to
+            // crates/flint-ctl/flint-storage/src, which does not exist -- the
+            // scan read nothing and the capability assert below caught it on
+            // the first run, which is the only reason it is not still wrong.
+            let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(rel);
+            let dir = dir.canonicalize().unwrap_or(dir);
+            let mut stack = vec![dir];
+            while let Some(d) = stack.pop() {
+                let Ok(rd) = std::fs::read_dir(&d) else {
+                    continue;
+                };
+                for e in rd.flatten() {
+                    let p = e.path();
+                    if p.is_dir() {
+                        stack.push(p);
+                        continue;
+                    }
+                    if p.extension().is_none_or(|x| x != "rs") {
+                        continue;
+                    }
+                    let Ok(src) = std::fs::read_to_string(&p) else {
+                        continue;
+                    };
+                    let mut rest = src.as_str();
+                    while let Some(i) = rest.find("\"FLINT_") {
+                        rest = &rest[i + 1..];
+                        if let Some(end) = rest.find('"') {
+                            let name = &rest[..end];
+                            if name
+                                .chars()
+                                .all(|c| c.is_ascii_uppercase() || c == '_' || c.is_ascii_digit())
+                            {
+                                found.insert(name.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // CAPABILITY: a scan that finds nothing would certify any list.
+        assert!(
+            found.len() >= 8,
+            "the source scan found only {found:?} -- it is reading the wrong \
+             directories, and would certify any list"
+        );
+        let listed: BTreeSet<String> = SEAT_ENV_NAMES.iter().map(|s| s.to_string()).collect();
+        let missing: Vec<&String> = found.difference(&listed).collect();
+        let extra: Vec<&String> = listed.difference(&found).collect();
+        assert!(
+            missing.is_empty(),
+            "a seat reads these and SEAT_ENV_NAMES does not list them, so \
+             flintctl would warn about a real knob: {missing:?}"
+        );
+        assert!(
+            extra.is_empty(),
+            "SEAT_ENV_NAMES lists these and no seat reads them, so a typo of \
+             one would pass unwarned: {extra:?}"
+        );
     }
 }
 
