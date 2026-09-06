@@ -272,6 +272,14 @@ statedir /var/lib/flint
 bins /opt/flint/bin
 tls on
 client-tls on
+
+# Placement: every seat below is on another machine, so flintctl needs a way
+# to reach them. Without these two lines this whole example REFUSES — see
+# "Placement" above. ssh-sudo because /opt/flint/bin and /var/lib/flint are
+# root-owned on a packaged host.
+ssh-user flint
+ssh-sudo on
+
 cp 10.0.1.10:7500           # 3 cp lines -> Raft HA control plane
 cp 10.0.1.11:7500
 cp 10.0.1.12:7500

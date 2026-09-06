@@ -2308,6 +2308,129 @@ msrv_at_the_declaration() {
 # that line says so where a reader of the line can see it. A list of exempt
 # FILES would be a second declaration to keep in sync with use, which is
 # BUG-0086's finding and this check's own subject one level up.
+assert_doc_inventories_are_runnable() {
+  # A DOCUMENTED INVENTORY THAT REFUSES IS WORSE THAN AN UNDOCUMENTED ONE.
+  #
+  # docs/self-hosting.md's two-pair example places every seat on 10.0.x.x and,
+  # until 2026-09-05, declared no `ssh-user`. Copied verbatim it does not start
+  # a cluster; it prints
+  #
+  #   inventory places a seat on 10.0.1.10, which is not this machine, but
+  #   declares no `ssh-user` -- flintctl cannot start or stop a process it has
+  #   no way to reach
+  #
+  # The refusal is correct and is not the defect. The defect is that the guide
+  # taught a shape the tool rejects, so the first thing a self-hoster following
+  # it gets is a refusal the guide never mentions. Found by running the example
+  # rather than reading it.
+  #
+  # STATIC ON PURPOSE. Running these would spawn seats for any example using
+  # 127.0.0.1, so this parses instead: a block is an inventory if it has a
+  # `statedir` or `pair` line, a host is REMOTE if it is a dotted quad that is
+  # not loopback (so `HOST:P` placeholders and 127.0.0.1 examples are skipped,
+  # which is why the rule is "looks like an address" rather than "is not
+  # local"), and a block with any remote host must declare `ssh-user`.
+  local out
+  out=$(python3 - <<'DOCINV'
+import glob, re, sys
+FILES = ["README.md"] + sorted(glob.glob("docs/**/*.md", recursive=True))
+ADDR_KEYS = ("cp", "pair", "proxy", "agent")
+HOST_KEYS = ("proxy-host", "controller-host", "zone")
+ipv4 = re.compile(r"^\d{1,3}(\.\d{1,3}){3}$")
+
+
+def fenced(text):
+    # chr(96)*3, NOT the literal fence: this heredoc sits inside a $( ), where
+    # bash hunts a matching backtick even in a QUOTED heredoc. Three of them
+    # here took the whole file out with "unexpected EOF while looking for
+    # matching backtick" -- the same trap this file already documents twice,
+    # walked into a third time.
+    FENCE = chr(96) * 3
+    out, cur, inb = [], [], False
+    for ln in text.split("\n"):
+        if ln.strip().startswith(FENCE):
+            if inb:
+                out.append(cur)
+                cur = []
+            inb = not inb
+            continue
+        if inb:
+            cur.append(ln)
+    return out
+
+
+examined = multi = 0
+bad = []
+for f in FILES:
+    try:
+        t = open(f, encoding="utf-8", errors="replace").read()
+    except OSError:
+        continue
+    for b in fenced(t):
+        live = [l.split("#")[0].strip() for l in b]
+        keys = [l.split(" ")[0] for l in live if l]
+        if not ({"statedir", "pair"} & set(keys)):
+            continue
+        examined += 1
+        remote = set()
+        for l in live:
+            if not l:
+                continue
+            k, _, v = l.partition(" ")
+            v = v.strip()
+            if k in ADDR_KEYS:
+                for a in v.split(","):
+                    h = a.rsplit(":", 1)[0].strip()
+                    if ipv4.match(h) and not h.startswith("127.") and h != "0.0.0.0":
+                        remote.add(h)
+            elif k in HOST_KEYS:
+                h = v.split(" ")[0]
+                if ipv4.match(h) and not h.startswith("127."):
+                    remote.add(h)
+        if not remote:
+            continue
+        multi += 1
+        if "ssh-user" not in keys:
+            bad.append("%s\t%s" % (f, " ".join(sorted(remote)[:3])))
+print("COVERAGE %d %d" % (examined, multi))
+for b in bad:
+    print(b)
+DOCINV
+) || { echo "FAIL  the doc-inventory check could not run"; FAILED="$FAILED doc-inventories-unrunnable"; return; }
+
+  local cov
+  cov=$(printf '%s\n' "$out" | sed -n 's/^COVERAGE //p')
+  out=$(printf '%s\n' "$out" | grep -v '^COVERAGE ' || true)
+  # shellcheck disable=SC2086
+  set -- $cov
+  # ZERO MULTI-HOST BLOCKS IS A FINDING, not a pass. This guards ONE example
+  # today (1 of 6 inventory blocks), so it is one edit away from certifying the
+  # directory by examining nothing -- and the edit that would do it is somebody
+  # simplifying the multi-host example away, which is exactly when a reader
+  # loses the only worked deployment across machines.
+  if [ "${2:-0}" -eq 0 ]; then
+    echo "FAIL  no multi-host inventory example found in README.md or docs/."
+    echo "        This check exists because the one there was not runnable, and"
+    echo "        with none left it passes by reading nothing. If the example"
+    echo "        was deliberately removed, remove this check in the same commit."
+    FAILED="$FAILED doc-inventories-examined-nothing"
+    return
+  fi
+  if [ -n "$out" ]; then
+    echo "FAIL  documented inventor(ies) that flintctl would REFUSE:"
+    printf '%s\n' "$out" | while IFS="$(printf '\t')" read -r f hosts; do
+      echo "        $f — places seats on $hosts but declares no \`ssh-user\`"
+    done
+    echo "        Copied verbatim these print \"inventory places a seat on"
+    echo "        <host>, which is not this machine, but declares no ssh-user\"."
+    echo "        See the Placement section of docs/self-hosting.md."
+    FAILED="$FAILED doc-inventories-refuse"
+    return
+  fi
+  echo "  every documented multi-host inventory declares its placement keys \
+($2 of $1 inventory blocks place a seat off this machine)"
+}
+
 assert_msrv_is_stated_once() {
   local out
   out=$(python3 - <<'MSRVPY'
@@ -2542,6 +2665,7 @@ if want check; then
   assert_bug_titles_agree_with_status
   assert_bug_index_markers_agree_with_status
   assert_msrv_is_stated_once
+  assert_doc_inventories_are_runnable
   assert_no_port_overlap
   assert_scripts_parse
   assert_no_scope_overlap
