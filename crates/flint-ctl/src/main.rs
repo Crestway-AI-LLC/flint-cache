@@ -3208,7 +3208,6 @@ fn cp_seat_state(inv: &Inventory, i: usize) -> String {
 /// the security group), and each seat gets its own state dir so co-located
 /// drill seats cannot share one.
 fn cp_seat_args(inv: &Inventory, i: usize) -> Vec<String> {
-    let d = &inv.statedir;
     let seat = &inv.cp[i];
     let mut args = vec![
         "--port".to_string(),
@@ -3219,12 +3218,12 @@ fn cp_seat_args(inv: &Inventory, i: usize) -> Vec<String> {
         // and an unreachable process.
         "--bind".into(),
         host_of(seat).to_string(),
+        // cp_seat_state, not a second copy of its rule. This function and that
+        // one have to agree exactly -- the liveness probe matches the `--state`
+        // token spelled HERE -- and the way they stop agreeing is one of them
+        // being edited. Same argument as cp_seat_name, one field over.
         "--state".into(),
-        if inv.cp.len() == 1 {
-            format!("{d}/cp-state")
-        } else {
-            format!("{d}/cp-state-n{}", i + 1)
-        },
+        cp_seat_state(inv, i),
     ];
     if inv.cp.len() > 1 {
         let peers = inv
@@ -3573,10 +3572,17 @@ fn launch(inv: &Inventory, register: bool) {
         // A Raft seat replaying its log answers nothing until it is ready,
         // and spawning beside it gives the duplicate a lost port race and a
         // clobbered pidfile — after which every stop aims at a corpse.
+        // cp_seat_state, NOT the literal. `pids_in_ps` matches the ident as a
+        // whole TOKEN, and a three-seat CP runs with `--state
+        // <statedir>/cp-state-n1`, so `<statedir>/cp-state` matches none of
+        // them: the guard was inert on exactly the topology it was written
+        // for, and the duplicate it exists to prevent was one slow log replay
+        // away. One seat spells it `cp-state` and cp_seat_state returns that,
+        // so the single-node path is unchanged.
         if seat_alive(
             &runner_for(inv, seat),
             "flint-controlplane",
-            &format!("{d}/cp-state"),
+            &cp_seat_state(inv, i),
         ) {
             eprintln!("  {name} STARTING (process up, not answering yet) — left alone");
             continue;
@@ -3613,7 +3619,7 @@ fn launch(inv: &Inventory, register: bool) {
         let alive = seat_probe(
             &runner_for(inv, seat),
             "flint-controlplane",
-            &format!("{d}/cp-state"),
+            &cp_seat_state(inv, i),
         );
         let log = format!("{d}/logs/{name}.log");
         let tail = std::fs::read_to_string(&log)
@@ -7723,6 +7729,132 @@ mod proxy_liveness_tests {
         assert!(!is_noauth_error("timed out"));
         assert!(!is_noauth_error("WRONGPASS invalid token"));
         assert!(!is_noauth_error(""));
+    }
+}
+
+#[cfg(test)]
+mod cp_seat_liveness_tests {
+    use super::*;
+    use std::io::Write;
+
+    fn inv_from(body: &str, name: &str) -> Inventory {
+        let p = std::env::temp_dir().join(format!("flint-cpseat-{name}.flint"));
+        let mut f = std::fs::File::create(&p).expect("write inventory");
+        f.write_all(body.as_bytes()).expect("write inventory");
+        parse_inventory(p.to_str().expect("utf8 path"))
+    }
+
+    /// What a three-seat control plane actually looks like in `ps`. The
+    /// `--state` token is the one `cp_seat_args` spells, which is the whole
+    /// point: the probe and the spawn have to agree on it.
+    fn ps_for(inv: &Inventory) -> String {
+        inv.cp
+            .iter()
+            .enumerate()
+            .map(|(i, _)| {
+                format!(
+                    "  {} /opt/flint/bin/flint-controlplane --port 750{i} --bind 10.0.0.1 \
+                     --state {}",
+                    2000 + i,
+                    cp_seat_state(inv, i)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// THE REGRESSION. `launch` probed every CP seat with the LITERAL
+    /// `<statedir>/cp-state`, and `pids_in_ps` matches an ident as a whole
+    /// TOKEN. A three-seat CP runs with `--state <statedir>/cp-state-n1`, so
+    /// the literal matched NONE of them: the probe answered "no process" for
+    /// three live seats.
+    ///
+    /// That answer is the dangerous one. It is the guard that stops `launch`
+    /// spawning a duplicate beside a seat that is up but still replaying its
+    /// Raft log and therefore not yet answering PING — and the comment at that
+    /// call site says what a duplicate costs: "a lost port race and a
+    /// clobbered pidfile — after which every stop aims at a corpse".
+    ///
+    /// Inert on exactly the topology it was written for, and invisible on
+    /// every fleet to date because one seat spells the dir `cp-state` and
+    /// every inventory in packaging/ has one `cp` line.
+    #[test]
+    fn the_old_literal_ident_matches_no_seat_of_a_three_seat_cp() {
+        let inv = inv_from(
+            "statedir /var/lib/flint\nbins /opt/flint/bin\n\
+             cp 10.0.0.1:7500\ncp 10.0.0.2:7500\ncp 10.0.0.1:7501\n\
+             pair 10.0.0.1:7001,10.0.0.2:7002\n",
+            "three",
+        );
+        assert_eq!(inv.cp.len(), 3, "inventory should carry three cp seats");
+        let ps = ps_for(&inv);
+
+        let old = format!("{}/cp-state", inv.statedir);
+        assert!(
+            pids_in_ps(&ps, "flint-controlplane", &old, None).is_empty(),
+            "the literal must be shown NOT to match — that is the defect"
+        );
+
+        for i in 0..inv.cp.len() {
+            assert_eq!(
+                pids_in_ps(&ps, "flint-controlplane", &cp_seat_state(&inv, i), None).len(),
+                1,
+                "seat {} must be found by its own state dir",
+                i + 1
+            );
+        }
+    }
+
+    /// And the single-seat path is unchanged: there `cp_seat_state` IS the
+    /// literal, so a fix that broke it would have gone unnoticed by every
+    /// fleet we run.
+    #[test]
+    fn one_seat_still_matches_and_the_two_spellings_agree() {
+        let inv = inv_from(
+            "statedir /var/lib/flint\nbins /opt/flint/bin\n\
+             cp 10.0.0.1:7500\npair 10.0.0.1:7001,10.0.0.2:7002\n",
+            "one",
+        );
+        assert_eq!(cp_seat_state(&inv, 0), "/var/lib/flint/cp-state");
+        assert_eq!(
+            pids_in_ps(
+                &ps_for(&inv),
+                "flint-controlplane",
+                &cp_seat_state(&inv, 0),
+                None
+            )
+            .len(),
+            1
+        );
+    }
+
+    /// The probe reads the `--state` token that `cp_seat_args` writes. They
+    /// were two copies of one rule and this pins them to one.
+    #[test]
+    fn spawn_args_and_the_probe_spell_the_state_dir_identically() {
+        for body in [
+            "statedir /var/lib/flint\nbins /opt/flint/bin\ncp 10.0.0.1:7500\n\
+             pair 10.0.0.1:7001,10.0.0.2:7002\n",
+            "statedir /var/lib/flint\nbins /opt/flint/bin\n\
+             cp 10.0.0.1:7500\ncp 10.0.0.2:7500\ncp 10.0.0.1:7501\n\
+             pair 10.0.0.1:7001,10.0.0.2:7002\n",
+        ] {
+            let inv = inv_from(body, "agree");
+            for i in 0..inv.cp.len() {
+                let args = cp_seat_args(&inv, i);
+                let at = args
+                    .iter()
+                    .position(|a| a == "--state")
+                    .expect("--state is passed");
+                assert_eq!(
+                    args[at + 1],
+                    cp_seat_state(&inv, i),
+                    "cp {} of {}: spawn and probe must spell it the same",
+                    i + 1,
+                    inv.cp.len()
+                );
+            }
+        }
     }
 }
 
