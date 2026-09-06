@@ -1,7 +1,8 @@
-# BUG-0032: `flintctl start` asserts the inventory's FIRST pair member is a live master (FIXED in code; NO drill covers it)
+# BUG-0032: `flintctl start` asserts the inventory's FIRST pair member is a live master (FIXED)
 
-Status: FIXED 2026-08-19 in `flint-ctl`, and NOT covered by any drill — three
-constructions were attempted and all three failed, recorded below. Found
+Status: **FIXED 2026-08-19 in `flint-ctl`, and VERIFIED 2026-09-05** by
+`tools/start_first_member_down_drill.sh` — the fourth construction, built from
+what the three failures below ruled out. Found
 2026-08-19 on the playground · Severity: medium — after
 any failover, `start` panicked whenever the declared-first member was down,
 which converts "one seat needs restarting" into "the start path is dead"
@@ -117,14 +118,41 @@ port free — the crash-loop shape. Candidates not yet tried: a data directory
 the engine cannot open, or a pair whose roles AGREE so `start` takes no
 re-seed path and the AddrInUse guard is never reached.
 
-**Status: this fix remains behaviourally unverified.** It lints clean in both
-feature configs and the reasoning is in the commit, but no test has yet
-demonstrated it fixes anything, and three that looked like they had did not.
+~~**Status: this fix remains behaviourally unverified.**~~ **Verified
+2026-09-05.** The fourth construction is `tools/start_first_member_down_drill.sh`
+and it worked first time, because the three failures above had already ruled
+out everything else.
 
-## Verification the fix still needs — STILL OUTSTANDING
+**The sabotage is the production shape, not a proxy for it.** pair[0]'s data
+directory is replaced by a regular FILE, so the seat `start` spawns dies at
+engine open and its port is never bound — a seat that STARTS AND EXITS, which
+is what docs/bugs/0031 recorded on the playground. Construction 3's held port
+is a different condition and `start` refuses it earlier for its own correct
+reason.
 
-Unchanged, and stated here as an open gap rather than left implied by a
-"FIXED" in the title:
+**Construction 2's lesson is applied to this drill's own setup**: before
+`start` runs, the drill asserts pair[0] is silent AND bind-probes its port to
+prove it is free. A precondition that is set up and never checked is the bug
+under test, one level up.
+
+**And it discriminates, which is the whole difference from construction 1.**
+Narrowing the member scan back to the defect — `pair.iter().take(1)`, "only
+pair[0] counts" — turns ARM 1 red:
+
+    FAIL: start exited 1 with one member down
+
+So a pass means the fix is doing something, rather than that the situation was
+never adversarial. Construction 1 passed against the unfixed binary and
+therefore tested nothing; this one was watched failing against it.
+
+**ARM 2 is the positive control**: the same command with NEITHER member
+answering must still exit non-zero and name the pair. Without it, "exit 0 with
+one member down" is also what a `start` that checks nothing returns.
+
+## ~~Verification the fix still needs~~ — DONE 2026-09-05
+
+Both items below are now asserted by `start_first_member_down_drill.sh`. Kept
+as written, because what they asked for is exactly what was built:
 
 - a pair whose inventory-first member is down: `start` restarts it and exits
   0, with a positive control that the same command still fails when NEITHER
