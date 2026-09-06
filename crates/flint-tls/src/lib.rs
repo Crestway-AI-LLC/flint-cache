@@ -807,6 +807,48 @@ pub fn cert_eku(path: &str) -> Option<CertEku> {
 
 /// The file-free core of [`cert_eku`], split out so the EKU reader can be
 /// unit-tested against embedded fixtures without touching the filesystem.
+/// The names a leaf certificate is valid FOR, as strings a human can compare
+/// against what was dialled — `127.0.0.1`, `localhost`, `flint-internal`.
+///
+/// Exists for one diagnostic. When a TLS dial fails, the question an operator
+/// actually has is "is the name I connected to in this certificate?", and
+/// nothing could answer it: the handshake reports BadCertificate, which says
+/// the client refused the server and not why. Returns `None` only when the
+/// file cannot be read or parsed — a cert with NO SANs returns an empty list,
+/// because "it carries none" and "I could not look" are different answers and
+/// the caller phrases them differently.
+pub fn cert_sans(path: &str) -> Option<Vec<String>> {
+    cert_sans_from_pem(&std::fs::read(path).ok()?)
+}
+
+fn cert_sans_from_pem(pem: &[u8]) -> Option<Vec<String>> {
+    let (_, der) = x509_parser::pem::parse_x509_pem(pem).ok()?;
+    let cert = der.parse_x509().ok()?;
+    let mut out = Vec::new();
+    if let Ok(Some(san)) = cert.subject_alternative_name() {
+        for name in &san.value.general_names {
+            // Rendered, not Debug-formatted: this string goes in front of an
+            // operator beside the address they dialled, and `IPAddress([127,
+            // 0, 0, 1])` does not compare against `127.0.0.1` by eye.
+            match name {
+                x509_parser::extensions::GeneralName::DNSName(d) => out.push((*d).to_string()),
+                x509_parser::extensions::GeneralName::IPAddress(b) => match b.len() {
+                    4 => out.push(format!("{}.{}.{}.{}", b[0], b[1], b[2], b[3])),
+                    16 => out.push(
+                        b.chunks(2)
+                            .map(|c| format!("{:x}", u16::from_be_bytes([c[0], c[1]])))
+                            .collect::<Vec<_>>()
+                            .join(":"),
+                    ),
+                    _ => {}
+                },
+                _ => {}
+            }
+        }
+    }
+    Some(out)
+}
+
 fn cert_eku_from_pem(pem: &[u8]) -> Option<CertEku> {
     // First certificate in the file is the leaf.
     let (_, der) = x509_parser::pem::parse_x509_pem(pem).ok()?;

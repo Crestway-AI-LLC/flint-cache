@@ -103,3 +103,9 @@ not read. The message already prints the CA it validated against and mentions
 NAME is absent from the cert it just rejected. That is a code change in the
 failure path, filed separately rather than folded in here, because this bug is
 about a document and that one is about a diagnostic.
+
+**Filed and fixed the same day as
+[BUG-0115](0115-a-proxy-that-never-answered-was-a-certificate-name-nobody-could-check.md).**
+Stated here because "filed separately" sat in this committed write-up for
+several hours while no such file existed — a promise about the tree is a claim
+about the tree, and this one was false when it was written.

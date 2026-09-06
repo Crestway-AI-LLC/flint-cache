@@ -603,6 +603,46 @@ fn proxy_down_help(inv: &Inventory, proxy: &str, dial: &str) -> String {
             );
         }
     }
+    // THE NAME IS THE FOURTH CAUSE, and it was the one this message could not
+    // name. `flintctl` validates the edge chain against the name it DIALLED, so
+    // a certificate that does not carry that name is refused however good the
+    // trust bundle is — and the failure surfaces here as "never answered",
+    // which reads as a dead proxy. It is not: the proxy's own log says
+    // `received fatal alert: BadCertificate`, an alert it RECEIVED, i.e. one
+    // the client sent.
+    //
+    // BUG-0110 is the whole shape. `proxy 0.0.0.0:7379` with no `proxy-host`
+    // dials the bind address verbatim, the edge cert carries
+    // `IP:127.0.0.1, DNS:localhost`, and the documented quickstart could not
+    // work. The message listed a held port, a crashed proxy and `edge-trust`,
+    // and every one of them sent the reader somewhere else.
+    //
+    // Checked LAST and only on the dialled host, because it is the only cause
+    // here that can be answered from a file rather than guessed at.
+    if inv.client_tls {
+        let host = host_of(dial);
+        match flint_tls::cert_sans(&format!("{}/certs/edge.crt", inv.statedir)) {
+            Some(sans) if !sans.iter().any(|s| s == host) => {
+                m.push_str(&format!(
+                    "\n  AND THE NAME DOES NOT MATCH. The edge certificate carries [{}]\
+                     \n  and flintctl dialled `{host}`, so it is refused whatever the trust\
+                     \n  bundle says — the proxy's log will show BadCertificate, an alert it\
+                     \n  RECEIVED from this client. A wildcard `proxy` line needs a\
+                     \n  `proxy-host` (or `proxy-advertise`) naming the machine, or the bind\
+                     \n  address itself has to be a name the cert carries.",
+                    sans.join(", ")
+                ));
+            }
+            // No SANs at all is a different statement from "could not read the
+            // file", and neither is "the name matched" -- so say which.
+            Some(_) => {}
+            None => m.push_str(&format!(
+                "\n  (could not read {}/certs/edge.crt, so whether it carries `{host}` is\
+                 \n  unknown — that is a candidate cause this message could not check.)",
+                inv.statedir
+            )),
+        }
+    }
     m.push_str(
         "\n  other causes: the port is held by something else, or the proxy exited at\
          \n  startup — check logs/proxy-*.log under the statedir.",
