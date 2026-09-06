@@ -75,8 +75,49 @@ _cpu_busy_pct(){ # <snap_before> <snap_after>
     printf "%.0f%%", 100.0*(dt-di)/dt
   }'
 }
-echo "== load: $KEYS keys x 1KB random values"
-M -n allkeys --key-maximum="$KEYS" --key-pattern=P:P --ratio=1:0 -d 1024 --random-data -c "$CLIENTS" -t "$THREADS" >/dev/null 2>&1
+# LOAD ONCE, MEASURE MANY. A harness that repeats a leg calls this script once
+# per repeat, and the fill ran every time — so the second run paid for a corpus
+# that was already there, and paid MORE than the first, because it was
+# overwriting a populated LSM rather than filling an empty one. A regime
+# budgeted for two runs delivered one: the second was killed at 85 minutes of
+# re-fill by the fleet's TTL, taking the post-leg apportionment with it
+# (flint-cache-ops OPS-0002).
+#
+# The fill is idempotent over the same key range and the scenarios are
+# read-dominated and do not consume the data, so skipping it on the repeats
+# gives exactly the repeat the harness is asking for.
+#
+# SKIPPING IS PRINTED, never silent. "loaded, then measured" and "measured
+# against whatever was there" are different measurements, and a table that
+# cannot tell them apart is what this file's honesty rules exist to prevent.
+SKIP_LOAD="${MEMTIER_SKIP_LOAD:-0}"
+
+# A bounded, RECORDED settle after the fill. At 100 M keys the data directory
+# was observed at 145 GB settling to 121 GB with nothing writing at all, so a
+# scenario starting the instant the fill returns measures compaction debt
+# rather than steady state — and neither the operator nor the table can tell
+# afterwards.
+#
+# DEFAULT 0, deliberately. The comparability rule above ("every run before
+# 2026-08-19 remains directly comparable to a default run today") outranks a
+# better default: raising it silently would move every number without moving
+# any published caveat with it. The caller that meets the condition sets it,
+# and the value is PRINTED either way, so a published table can carry it.
+SETTLE_S="${MEMTIER_SETTLE_S:-0}"
+case "$SETTLE_S" in ''|*[!0-9]*) echo "MEMTIER_SETTLE_S must be whole seconds, got '$SETTLE_S'" >&2; exit 2;; esac
+
+if [ "$SKIP_LOAD" = 1 ]; then
+  echo "== load: SKIPPED (MEMTIER_SKIP_LOAD=1) — measuring the corpus already present"
+else
+  echo "== load: $KEYS keys x 1KB random values"
+  M -n allkeys --key-maximum="$KEYS" --key-pattern=P:P --ratio=1:0 -d 1024 --random-data -c "$CLIENTS" -t "$THREADS" >/dev/null 2>&1
+  if [ "$SETTLE_S" -gt 0 ]; then
+    echo "== settle: ${SETTLE_S}s after the fill, before the first scenario"
+    sleep "$SETTLE_S"
+  else
+    echo "== settle: 0s — scenarios start on a fill that may still be compacting (MEMTIER_SETTLE_S to wait)"
+  fi
+fi
 
 run(){ # <label> <extra memtier args...>
   local label="$1"; shift
