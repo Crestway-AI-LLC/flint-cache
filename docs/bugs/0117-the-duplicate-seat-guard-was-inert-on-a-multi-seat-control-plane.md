@@ -80,6 +80,22 @@ call site**: nothing here would fail if `launch` went back to passing a literal,
 because a unit test cannot easily observe `launch` deciding to spawn.
 
 That guard is a fleet-level one — a duplicate CP process is directly countable
-on the host — and it belongs to the cross-host control-plane exercise the
-roadmap now names as the remaining multi-node-CP work. Recorded here so the
-coverage is not read as wider than it is.
+on the host — and the cross-host control-plane exercise now counts them.
+
+**CORRECTED the same day, once that exercise existed: counting them is not the
+same as catching this.** `packaging/aws/cp-quorum/run.sh` (ops) kills a CP seat,
+runs `start`, and asserts the host still has exactly the seats it should. It
+passed — and it would have passed on the unfixed code too, because the seat it
+kills is **genuinely dead**, and there the broken probe and the fixed one give
+the same answer: absent, spawn, correct.
+
+The harm needs a seat that is **up but not answering** — a Raft seat replaying
+its log, which is the whole reason the probe exists beside the `PING`. Nothing
+in the harness opens that window, and nothing yet does.
+
+So the honest coverage is: the token semantics and the two spellings are pinned
+by unit tests, the ordinary restart path is guarded on a real two-host fleet,
+and **the defect's own condition has never been reproduced**. It was found by
+reading and fixed by construction. Recorded this way because the first version
+of this section pointed at an exercise as if it would close the gap, and it does
+not.
