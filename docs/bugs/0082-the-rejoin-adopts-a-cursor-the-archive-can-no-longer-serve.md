@@ -311,3 +311,53 @@ the shed gate fire **later** than it used to, ~16x later at 1 KiB records,
 because it now implements the documented half-the-budget intent instead of a
 16x-tight accident. Anyone reasoning about margins near this path should know
 the old incidental conservatism is gone.
+
+## The reason now outlives the recovery that destroys it (2026-09-05)
+
+Implements the design traced in `fcd9715`, which established that the conduit
+has to be a FLINTINFO field — the operations agent builds its world from
+protocol calls and never reads a seat log, because it dials addresses and the
+log is a file on a box it cannot see. Sixteen `AttachReplica` repairs were
+opaque for exactly that reason.
+
+**The lifetime runs the wrong way, and that is the whole design.** The reason is
+durable for precisely as long as it is useless: `mark_needs_reseed` writes it
+and the seat calls `hard_exit(3)` immediately, so nothing is alive to answer
+FLINTINFO; the next start reads it, wipes or clears, and full-syncs. A field
+reporting the CURRENT marker would be empty every single time anyone looked,
+because recovery is what deletes the answer. So `LAST_RESEED` holds the last
+reason in memory, past the recovery, and FLINTINFO renders
+`last_reseed_reason` and `last_reseed_at_ms`.
+
+**Captured at BOTH destroyers, and the second is the one that matters.**
+`clear_needs_reseed` is the obvious site; the wipe path is the one a "cannot
+resume this tail" reseed actually takes, and it calls `remove_dir_all` without
+ever reaching that function. Capturing only in the clear would have remembered
+every reason except the one this bug is about.
+
+**Absent, not a sentinel.** A seat that has never been told to reseed emits no
+line at all. OPS-0134 is what a well-meaning placeholder costs — `-99999` for
+"no certificate configured" reached the agent as a cert expiring 273 years ago
+and produced `RotateCerts` on a healthy fleet — and for a PROSE field the
+tempting placeholder is `none`, which is a string a reader can quote back as
+the reason. `last_reseed_at_ms` is omitted on its own when the marker's mtime
+was unreadable, so a consumer never sees a fabricated instant beside a real
+reason.
+
+Seven tests, four mutations checked. Two things the mutation run caught, both
+in the tests rather than the code:
+
+- `the_reason_survives_a_directory_wipe` calls the helper directly, so deleting
+  the production call site left it green. The wipe is unreachable from a unit
+  test, so the ordering is now asserted against the source — a weak
+  instrument, used deliberately and labelled, rather than a hole nobody
+  recorded.
+- `a_reason_cannot_inject_a_field` asserted `!contains("role:master")` and
+  failed against a WORKING guard: the CRLF is replaced with a space, so the
+  text correctly survives inside the reason. The property is line structure,
+  not substring.
+
+**Next, and deliberately not here:** the agent parses FLINTINFO by named field
+(`world::info_field`), so surfacing this in the report is an ops-repo change
+and lands after this one. Until it does, the field is readable by hand —
+`FLINTINFO` on a seat now answers "why did you reseed", which it never could.

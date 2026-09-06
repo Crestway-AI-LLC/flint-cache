@@ -197,11 +197,65 @@ fn mark_needs_reseed(dir: &std::path::Path, why: &str) {
     }
 }
 
+/// The last reason this process was told it could not continue its tail, and
+/// when the marker carrying that reason was written. `None` until one is seen.
+///
+/// **A MEMORY, BECAUSE RECOVERY DESTROYS THE EVIDENCE (BUG-0082).** The reason
+/// is durable for exactly as long as it is useless. `mark_needs_reseed` writes
+/// it and the seat exits immediately afterwards, so nothing is alive to be
+/// asked; the next start reads it, wipes the directory or clears the marker,
+/// and full-syncs. A field reporting the CURRENT marker would therefore be
+/// empty every single time anyone looked at it — the operator sees only the
+/// state AFTER the recovery that deleted the answer.
+///
+/// So this holds the LAST reason rather than the current one, in memory, past
+/// the recovery. It is what lets the operations agent say WHY a seat reseeded:
+/// the agent builds its world from FLINTINFO and other protocol calls and
+/// never reads a seat log — it dials addresses, and the log is a file on a box
+/// it cannot see. Sixteen `AttachReplica` repairs in three weeks were opaque
+/// for exactly that reason.
+#[cfg(feature = "rocks")]
+static LAST_RESEED: std::sync::Mutex<Option<(String, u64)>> = std::sync::Mutex::new(None);
+
+/// Read the marker into [`LAST_RESEED`] before something destroys it.
+///
+/// Called from both destroyers — `clear_needs_reseed` and the wipe path — and
+/// not from `mark_needs_reseed`: the marking process is about to exit, so a
+/// value recorded there would die with it. The reading process is the one with
+/// a future to report in.
+///
+/// The timestamp is the marker file's mtime, which is when
+/// `mark_needs_reseed` wrote it — the moment the decision was made, not the
+/// moment recovery noticed. An unreadable mtime yields `None` for the time
+/// rather than `0`: a zero here would read as 1970 and be rendered as a real
+/// instant, and "could not tell when" must not become an answer (OPS-0037).
+#[cfg(feature = "rocks")]
+fn remember_reseed_reason(dir: &std::path::Path) {
+    let marker = dir.join(NEEDS_RESEED);
+    let Ok(why) = std::fs::read_to_string(&marker) else {
+        return;
+    };
+    let why = why.trim().to_string();
+    if why.is_empty() {
+        return;
+    }
+    let at_ms = std::fs::metadata(&marker)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    if let Ok(mut slot) = LAST_RESEED.lock() {
+        *slot = Some((why, at_ms));
+    }
+}
+
 /// Drop the marker — this copy is authoritative again.
 #[cfg(feature = "rocks")]
 fn clear_needs_reseed(dir: &std::path::Path) {
     let marker = dir.join(NEEDS_RESEED);
     if marker.exists() {
+        remember_reseed_reason(dir);
         if let Err(e) = std::fs::remove_file(&marker) {
             eprintln!("could not remove {}: {e}", marker.display());
         } else {
@@ -1882,6 +1936,14 @@ fn main() -> std::io::Result<()> {
                         .unwrap_or_default()
                         .trim()
                         .to_string();
+                    // BEFORE the wipe below, not only in `clear_needs_reseed`
+                    // (BUG-0082). This path can `remove_dir_all(&dir_path)`,
+                    // which destroys the marker without that function ever
+                    // running — and it is the MAIN path, the one a "cannot
+                    // resume this tail" reseed takes. Capturing only in the
+                    // clear would have remembered every reason except the one
+                    // the bug is about.
+                    remember_reseed_reason(&dir_path);
                     // VERIFY the copy as-is before touching it. The marker
                     // means "this copy cannot be trusted BLINDLY", not "this
                     // copy is trash": flintctl marks every dead seat because
@@ -5613,7 +5675,7 @@ fn flintinfo(
     let compaction = rocks.as_ref().and_then(|kv| kv.compaction_pressure());
     let mem_sample = flint_storage::mem::sample();
     let info = format!(
-        "role:{}\r\nloading:0\r\nrole_epoch:{role_epoch}\r\nbuild:{build}\r\nsst_bytes:{sst}\r\nlatest_seq:{latest}\r\nlast_applied:{last_applied}\r\nacked_seq:{}\r\nseq_lag:{seq_lag}\r\nwal_headroom_seq:{whs}\r\nwal_min_acked_seq:{wma}\r\nwal_headroom_shed_seq:{whl}\r\nwal_bytes_per_seq:{wbps}\r\nwal_archive_mb:{wamb}\r\nwal_archive_src:{wasrc}\r\nlive_replicas:{}\r\nlag_ms:{}\r\nlag_ms_max:{lmx}\r\nlag_max_gap:{lmg}\r\nlag_soft_ms:{soft}\r\nlag_hard_ms:{hard}\r\nmin_replicas_to_write:{minr}\r\nwidowed_grace_ms:{wgm}\r\nwidowed_shed:{wsh}\r\nfullsync_active:{fsa}\r\nfullsync_max:{fsm}\r\nasync_write_queue:{aqd}\r\nwrite_deadline_ms:{wdm}\r\nwrite_inflight:{wif}\r\nwrite_service_us:{wsu}\r\nwrite_cost_us:{wcu}\r\nwrite_wait_est_ms:{wwe}\r\nwrite_wait_peak_ms:{wwp}\r\nwrite_wait_peak_inflight:{wwpi}\r\nwrite_wait_peak_cost_us:{wwps}\r\nwrites_shed_deadline:{wsd}\r\nwrites_shed_lag:{wsl}\r\nwrites_shed_quorum:{wsq}\r\nwrites_shed_widowed:{wswd}\r\nwrites_shed_headroom:{wshr}\r\nwrites_delayed_soft:{wdsf}\r\nwal_fsync_ms:{wfm}\r\nwal_fsync_total:{wft}\r\ncert_days_remaining:{cdr}\r\nactive_conns:{ac}\r\nmax_conns:{mc}\r\nconns_shed_total:{cs}\r\nwrite_stopped:{wst}\r\ndelayed_write_rate:{dwr}\r\nwrite_stall_readable:{wsr}\r\nl0_files:{l0f}\r\npending_compaction_bytes:{pcb}\r\ncompaction_readable:{cr}\r\ndisk_free_bytes:{dfb}\r\ndisk_total_bytes:{dtb}\r\ndisk_free_pct:{dfp}\r\ndisk_verdict:{dv}\r\ndisk_unknown_samples:{dus}\r\nmem_avail_bytes:{mab}\r\nmem_total_bytes:{mtb}\r\nmem_avail_pct:{map}\r\nmem_src:{msrc}\r\nevictable_ns:{ens}\r\nevictable_ns_agree:{ensa}\r\nevictable_ns_bytes:{ensb}\r\nreclaim_active:{rca}\r\nreclaim_target_free_bytes:{rctf}\r\nevict:{evm}\r\ncollection_read_budget_pct:{crbp}\r\ncollection_read_in_flight_bytes:{crif}\r\ncollection_read_mode:{crm}\r\ncollection_read_refused:{crr}\r\ncollection_read_would_refuse:{crwr}\r\ncollection_read_unmeasured:{cru}\r\ngc_swept_expired:{gse}\r\ngc_swept_orphans:{gso}\r\nuptime_ms:{upms}\r\n",
+        "role:{}\r\nloading:0\r\nrole_epoch:{role_epoch}\r\nbuild:{build}\r\nsst_bytes:{sst}\r\nlatest_seq:{latest}\r\nlast_applied:{last_applied}\r\nacked_seq:{}\r\nseq_lag:{seq_lag}\r\nwal_headroom_seq:{whs}\r\nwal_min_acked_seq:{wma}\r\nwal_headroom_shed_seq:{whl}\r\nwal_bytes_per_seq:{wbps}\r\nwal_archive_mb:{wamb}\r\nwal_archive_src:{wasrc}\r\nlive_replicas:{}\r\nlag_ms:{}\r\nlag_ms_max:{lmx}\r\nlag_max_gap:{lmg}\r\nlag_soft_ms:{soft}\r\nlag_hard_ms:{hard}\r\nmin_replicas_to_write:{minr}\r\nwidowed_grace_ms:{wgm}\r\nwidowed_shed:{wsh}\r\nfullsync_active:{fsa}\r\nfullsync_max:{fsm}\r\nasync_write_queue:{aqd}\r\nwrite_deadline_ms:{wdm}\r\nwrite_inflight:{wif}\r\nwrite_service_us:{wsu}\r\nwrite_cost_us:{wcu}\r\nwrite_wait_est_ms:{wwe}\r\nwrite_wait_peak_ms:{wwp}\r\nwrite_wait_peak_inflight:{wwpi}\r\nwrite_wait_peak_cost_us:{wwps}\r\nwrites_shed_deadline:{wsd}\r\nwrites_shed_lag:{wsl}\r\nwrites_shed_quorum:{wsq}\r\nwrites_shed_widowed:{wswd}\r\nwrites_shed_headroom:{wshr}\r\nwrites_delayed_soft:{wdsf}\r\nwal_fsync_ms:{wfm}\r\nwal_fsync_total:{wft}\r\ncert_days_remaining:{cdr}\r\nactive_conns:{ac}\r\nmax_conns:{mc}\r\nconns_shed_total:{cs}\r\nwrite_stopped:{wst}\r\ndelayed_write_rate:{dwr}\r\nwrite_stall_readable:{wsr}\r\nl0_files:{l0f}\r\npending_compaction_bytes:{pcb}\r\ncompaction_readable:{cr}\r\ndisk_free_bytes:{dfb}\r\ndisk_total_bytes:{dtb}\r\ndisk_free_pct:{dfp}\r\ndisk_verdict:{dv}\r\ndisk_unknown_samples:{dus}\r\nmem_avail_bytes:{mab}\r\nmem_total_bytes:{mtb}\r\nmem_avail_pct:{map}\r\nmem_src:{msrc}\r\nevictable_ns:{ens}\r\nevictable_ns_agree:{ensa}\r\nevictable_ns_bytes:{ensb}\r\nreclaim_active:{rca}\r\nreclaim_target_free_bytes:{rctf}\r\nevict:{evm}\r\ncollection_read_budget_pct:{crbp}\r\ncollection_read_in_flight_bytes:{crif}\r\ncollection_read_mode:{crm}\r\ncollection_read_refused:{crr}\r\ncollection_read_would_refuse:{crwr}\r\ncollection_read_unmeasured:{cru}\r\ngc_swept_expired:{gse}\r\ngc_swept_orphans:{gso}\r\nuptime_ms:{upms}\r\n{lrs}",
         if read_only { "replica" } else { "master" },
         hub.effective_acked(now)
             .map_or_else(|| UNKNOWN_NUMERIC.into(), |a| a.to_string()),
@@ -5778,8 +5840,45 @@ fn flintinfo(
         gse = GC_EXPIRED_TOTAL.load(Ordering::Relaxed),
         upms = heat::process_uptime_ms(),
         gso = GC_ORPHANS_TOTAL.load(Ordering::Relaxed),
+        // BUG-0082. TWO FIELDS OR NONE, and ABSENT when this process has not
+        // reseeded — not a sentinel.
+        //
+        // Absence is a true and useful statement here ("this copy has not been
+        // told to throw itself away"), while any placeholder would be a claim.
+        // OPS-0134 is what a well-meaning sentinel costs: `-99999` for "no
+        // certificate configured" reached the operations agent as a cert
+        // expiring 273 years ago and produced RotateCerts on a healthy fleet.
+        // A reason field is prose, so the tempting placeholder is "none" — and
+        // "none" is a string a reader can quote as the reason.
+        lrs = last_reseed_fields(),
     );
     Value::Bulk(Some(info.into_bytes()))
+}
+
+/// The two BUG-0082 fields, or an empty string when nothing has been recorded.
+///
+/// Rendered as a block rather than two `{}` slots so that "no reseed" produces
+/// no lines at all: a field present means it happened and this is why, and its
+/// absence carries no reading. `last_reseed_at_ms` is omitted on its own when
+/// the marker's mtime was unreadable, so a consumer never sees a fabricated
+/// instant beside a real reason.
+#[cfg(feature = "rocks")]
+fn last_reseed_fields() -> String {
+    let Ok(slot) = LAST_RESEED.lock() else {
+        return String::new();
+    };
+    let Some((why, at_ms)) = slot.as_ref() else {
+        return String::new();
+    };
+    // CRLF is the field separator, so a reason containing one would inject a
+    // field. `mark_needs_reseed`'s callers pass formatted prose today, which
+    // is why this is a guard rather than a theory about their contents.
+    let why = why.replace(['\r', '\n'], " ");
+    if *at_ms == 0 {
+        format!("last_reseed_reason:{why}\r\n")
+    } else {
+        format!("last_reseed_reason:{why}\r\nlast_reseed_at_ms:{at_ms}\r\n")
+    }
 }
 
 #[cfg(not(feature = "rocks"))]
@@ -6954,6 +7053,183 @@ mod superseded_cause_tests {
             c.contains("lease superseded"),
             "lost the family prefix: {c}"
         );
+    }
+}
+
+#[cfg(all(test, feature = "rocks"))]
+mod last_reseed_tests {
+    use super::*;
+
+    /// Each test owns a directory AND the global, which is process-wide. Run
+    /// serially by holding one lock: `cargo test` threads these, and two tests
+    /// racing on `LAST_RESEED` would pass or fail by scheduling.
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn fresh(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("flint-reseed-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).expect("mkdir");
+        d
+    }
+
+    fn reset() {
+        *LAST_RESEED.lock().expect("lock") = None;
+    }
+
+    /// THE WHOLE POINT (BUG-0082): the reason outlives the file. Recovery
+    /// deletes the marker, and a field reporting the CURRENT marker would be
+    /// empty every time anyone looked.
+    #[test]
+    fn the_reason_survives_the_clear_that_destroys_the_marker() {
+        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        reset();
+        let d = fresh("survives");
+        mark_needs_reseed(
+            &d,
+            "cannot resume this tail: archive holds 1788..1799, want 1750",
+        );
+        assert!(d.join(NEEDS_RESEED).exists());
+
+        clear_needs_reseed(&d);
+
+        assert!(!d.join(NEEDS_RESEED).exists(), "the marker must be gone");
+        let out = last_reseed_fields();
+        assert!(
+            out.contains("last_reseed_reason:cannot resume this tail: archive holds"),
+            "the reason did not survive: {out:?}"
+        );
+        assert!(out.contains("last_reseed_at_ms:"), "no timestamp: {out:?}");
+    }
+
+    /// The wipe path never calls `clear_needs_reseed` -- it removes the whole
+    /// directory -- and it is the path a "cannot resume this tail" reseed
+    /// actually takes. Capturing only in the clear would have remembered every
+    /// reason except the one this bug is about.
+    ///
+    /// THIS TESTS THE HELPER, NOT THE WIRING, and saying so is the point. The
+    /// production wipe sits deep inside the start sequence and cannot be
+    /// reached from here; deleting the call site leaves this test green, which
+    /// the mutation run showed. `the_wipe_path_captures_before_it_destroys`
+    /// below covers the wiring, by reading the source -- a weaker instrument,
+    /// used deliberately rather than left as a hole nobody wrote down.
+    #[test]
+    fn the_reason_survives_a_directory_wipe() {
+        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        reset();
+        let d = fresh("wiped");
+        mark_needs_reseed(&d, "cannot resume this tail: WALGAP");
+        remember_reseed_reason(&d);
+        std::fs::remove_dir_all(&d).expect("wipe");
+
+        assert!(
+            last_reseed_fields().contains("last_reseed_reason:cannot resume this tail: WALGAP"),
+            "a wipe lost the reason"
+        );
+    }
+
+    /// THE CALL SITE, not the helper. The mutation that deletes
+    /// `remember_reseed_reason(&dir_path)` from the wipe path kills no
+    /// behavioural test here, because the wipe is unreachable from a unit
+    /// test -- so the ordering is asserted against the source itself.
+    ///
+    /// A source grep is a weak instrument and this one is narrow on purpose:
+    /// it checks only that the capture precedes the `remove_dir_all` that
+    /// destroys the marker, which is the single property the call site exists
+    /// for. It does not try to prove the path runs.
+    #[test]
+    fn the_wipe_path_captures_before_it_destroys() {
+        let src = include_str!("main.rs");
+        let capture = src
+            .find("remember_reseed_reason(&dir_path);")
+            .expect("the wipe path no longer captures the reseed reason (BUG-0082)");
+        let wipe = src
+            .find("match std::fs::remove_dir_all(&dir_path)")
+            .expect("the wipe this capture guards has moved or been renamed");
+        assert!(
+            capture < wipe,
+            "the capture must come BEFORE the wipe: reading a marker that has \
+             already been deleted returns nothing, silently"
+        );
+    }
+
+    /// ABSENT, NOT A SENTINEL. A seat that has never been told to reseed emits
+    /// no line at all -- OPS-0134 is what a placeholder costs, where -99999
+    /// for "no certificate configured" reached the agent as a cert expiring
+    /// 273 years ago and produced RotateCerts on a healthy fleet. For a PROSE
+    /// field the tempting placeholder is "none", which is a string a reader
+    /// can quote back as the reason.
+    #[test]
+    fn a_seat_that_never_reseeded_emits_no_field() {
+        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        reset();
+        assert_eq!(last_reseed_fields(), "", "absence must be silence");
+    }
+
+    /// An empty or whitespace-only marker is not a reason. Recording it would
+    /// emit `last_reseed_reason:` with nothing after it, which reads as a
+    /// reseed whose cause is blank rather than as no reseed.
+    #[test]
+    fn an_empty_marker_records_nothing() {
+        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        reset();
+        let d = fresh("empty");
+        std::fs::write(d.join(NEEDS_RESEED), "   \n").expect("write");
+        remember_reseed_reason(&d);
+        assert_eq!(last_reseed_fields(), "");
+    }
+
+    /// CRLF IS THE FIELD SEPARATOR. A reason carrying one would inject a field
+    /// into FLINTINFO, and every consumer of that reply parses it by splitting
+    /// on the separator -- including the operations agent this exists to
+    /// inform.
+    #[test]
+    fn a_reason_cannot_inject_a_field() {
+        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        reset();
+        let d = fresh("inject");
+        mark_needs_reseed(&d, "boom\r\nrole:master\r\nx:1");
+        remember_reseed_reason(&d);
+        let out = last_reseed_fields();
+        // ON ITS OWN LINE is the property, not the substring. The guard turns
+        // the CRLF into a space, so "role:master" correctly SURVIVES as prose
+        // inside the reason -- it is the injected FIELD that must not exist.
+        // The first version of this asserted `!out.contains("role:master")`
+        // and failed against a working guard, which is a test asserting the
+        // wrong thing rather than a defect.
+        let lines: Vec<&str> = out.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(
+            lines.len(),
+            2,
+            "expected exactly the two fields, got {out:?}"
+        );
+        assert!(
+            lines[0].starts_with("last_reseed_reason:"),
+            "field one is not the reason: {out:?}"
+        );
+        assert!(
+            lines[1].starts_with("last_reseed_at_ms:"),
+            "field two is not the timestamp: {out:?}"
+        );
+        assert!(
+            lines[0].contains("role:master"),
+            "the injected text should survive INSIDE the reason: {out:?}"
+        );
+    }
+
+    /// The LAST reason, not the first: a seat reseeded twice reports why it
+    /// reseeded most recently.
+    #[test]
+    fn a_second_reseed_replaces_the_first() {
+        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        reset();
+        let d = fresh("twice");
+        mark_needs_reseed(&d, "first reason");
+        clear_needs_reseed(&d);
+        mark_needs_reseed(&d, "second reason");
+        clear_needs_reseed(&d);
+        let out = last_reseed_fields();
+        assert!(out.contains("second reason"), "{out:?}");
+        assert!(!out.contains("first reason"), "{out:?}");
     }
 }
 
