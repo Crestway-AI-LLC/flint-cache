@@ -933,3 +933,26 @@ What is checkable, and already checked, is the narrower thing: a drill that
 waits on `nodes_live` and then asserts `verify`. That pattern appears in exactly
 one drill and it is now fixed.
 
+## One of the three candidates is answered: NOT ports (2026-09-05)
+
+*"Ports, disk and lock contention are untested"* — ports are now tested, and
+ruled out.
+
+Two gate checks stand between concurrent drills and a shared port:
+`assert_no_duplicate_drill_ports`, which refuses two drills declaring the same
+one, and `assert_spawning_drills_declare_ports` (BUG-0086's fix, 2026-09-02),
+which refuses a drill that binds a port it did not declare. The second is what
+makes the first mean anything: before it, a declaration was compared only to
+other declarations and never to use.
+
+Measured against the current tree: **zero duplicate declared ports**.
+
+So two drills running concurrently cannot bind the same port, and the mechanism
+by which four drills triple a write-wait margin is not port contention. Disk
+and lock contention remain untested, and CPU remains open on the evidence
+already in this file.
+
+A caveat on what that rules out: this is about drills binding the same LISTEN
+port. It says nothing about ephemeral-port pressure from many short-lived
+client connections, which is a different resource and is not covered by either
+check.

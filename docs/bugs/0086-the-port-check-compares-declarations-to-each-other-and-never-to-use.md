@@ -1,8 +1,9 @@
 # BUG-0086: the port check compares declarations to each other, and never to use
 
 Status: the collision it missed is FIXED; the check gap is CLOSED 2026-09-02
-Severity: low today (the gate runs drills sequentially), and it is a check that
-cannot see the thing it exists to prevent
+Severity: low, and **the reason first given here was false** — see *The
+severity premise was wrong* at the foot. It is a check that cannot see the
+thing it exists to prevent
 
 ## What was found
 
@@ -198,3 +199,30 @@ looked at $2" — one level down again: it was read as covering ports, and it
 only ever looked at what the drills *said* about ports. Three of these landed in
 two days, and in every one the correct instinct had already been written down
 somewhere adjacent.
+
+## The severity premise was wrong (corrected 2026-09-05)
+
+This file's severity line read *"low today (the gate runs drills
+sequentially)"*. **The gate has run four drills at a time since 2026-08-24**,
+nine days before this was written: `.github/workflows/gate.yml` sets
+`FLINT_GATE_JOBS: ${{ inputs.gate_jobs || '4' }}`, and `git show` at the
+2026-09-02 commit confirms the 4 was already there. The premise was not stale,
+it was never true.
+
+**The conclusion survives, and it is worth being explicit about why, because
+the two are independent.** Low severity does not come from sequential
+execution — which would make a collision impossible rather than mild — it comes
+from the pair of checks that now exist:
+
+- `assert_no_duplicate_drill_ports` refuses two drills declaring the same port.
+  Measured 2026-09-05 against the current tree: **zero duplicates**.
+- `assert_spawning_drills_declare_ports`, this bug's own fix, refuses a drill
+  that BINDS a port it did not declare — which is the gap that let 6521 through.
+
+Together those make a collision between concurrent drills impossible, not
+unlikely. Sequential execution was never load-bearing and, had it been true, it
+would have hidden the very defect this bug found rather than mitigating it.
+
+Recorded rather than quietly edited because a reader who trusted the old line
+would draw a wrong general conclusion — that concurrency is not a concern in
+this suite — and act on it in the next drill they write.
