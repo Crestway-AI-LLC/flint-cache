@@ -963,3 +963,45 @@ than closed, so nobody re-derives it from the table above and calls it settled.
 - **Nothing here is a fleet-wide default.** The proposal's reasoning is
   unchanged.
 
+
+## 2026-09-06 — the recommendation shipped; one item of "Then" did not
+
+The pairing is now published to operators in `docs/self-hosting.md`, priced in
+disk (+36% resident), in write buffer (32 MB per engine), and in residual
+stall (43.4% even paired). That is most of what "Then" asked for:
+
+| "Then" asked | state |
+|---|---|
+| raise `max_background_jobs` toward core count | **answered, and refused as a default** — the two sweeps point opposite ways on the same hardware, so a fleet-wide value is wrong in one regime |
+| size the write buffers for the box | `FLINT_WRITE_BUFFER_MB` exists and is read |
+| make the knobs configurable per seat | **done** — env-read by `flint-storage`, reachable on a managed fleet via `node-env`, and held by the check BUG-0099 added |
+| consider a rate limiter | **not done.** `rocks.rs` sets no `set_ratelimiter`; nothing in this file measures one |
+| **re-measure read latency afterwards** | **not done** |
+
+The last row is the one that matters, because of how this file worded it:
+
+> Re-measure read latency afterwards, and **treat that as part of the fix, not
+> a follow-up.** Turning back-pressure down spends read latency to buy write
+> throughput; the beyond-RAM GET numbers … are what must not regress.
+
+Every subsequent measurement in this file is a write-path measurement —
+ingest MB/s, stall fraction, write amplification, resident bytes. Searching it
+for a read number returns the sentence above and nothing else. So the pairing
+went from measurement to published operator recommendation **without the check
+its own author said was part of the fix**.
+
+Nothing here says the pairing harms reads. It says nobody looked, and the
+direction is not obvious enough to reason out: a larger level base means fewer
+levels to search, while more background jobs means more IO competing with
+foreground reads. Those pull opposite ways and only a run settles it.
+
+**Action taken today:** the gap is now stated in `self-hosting.md` beside the
+price, where the operator making the decision will see it, rather than only
+here. That is the honest interim — a recommendation with a named unmeasured
+cost is usable; one with a hidden unmeasured cost is not.
+
+**Action NOT taken:** the measurement itself. It needs the 96 GB / 2-core
+regime the pairing is recommended for, which is an AWS run of some hours, and
+this file has already established that the small-LSM regime would answer a
+different question. Priced and deferred rather than approximated, in keeping
+with the rest of this file.

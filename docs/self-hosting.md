@@ -356,6 +356,16 @@ same disk. It also commits 32 MB of write buffer per engine, which scales with
 seats per host, not with hosts. Even paired, the seat still stalls **43.4%** of
 the time at that size: this moves the ceiling, it does not remove it.
 
+**One cost is named and NOT measured: read latency.** Every number above is a
+write-path number. The pairing changes the shape of the LSM, and the work that
+produced it said re-measuring beyond-RAM `GET` afterwards was "part of the fix,
+not a follow-up" — that measurement was never taken, on either side of the
+pairing. The direction is not obvious enough to guess at: a larger level base
+means fewer levels to search, more background jobs means more IO competing with
+reads, and nobody has run it. If your workload is read-sensitive, measure your
+own `GET` percentiles before and after rather than treating the write gain as
+free. Tracked in `docs/bugs/0013`.
+
 Full derivation, both sweeps, and the untested range between them in
 `docs/bugs/0013`.
 
