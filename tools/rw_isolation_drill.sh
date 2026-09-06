@@ -2,10 +2,25 @@
 # SPDX-License-Identifier: Elastic-2.0
 # ADR-0005 D1 drill: read/write path independence ACROSS clients, pinned.
 #
-# The architecture already guarantees this structurally (per-client backend
-# connections at the proxy, thread-per-connection at the server, LSM reads
-# that never wait behind writes) — this drill exists so a future refactor
-# (shared pools, async proxy) can never silently regress it.
+# THE STRUCTURAL ARGUMENT THIS ONCE RESTED ON IS GONE, and the drill was still
+# citing it: "per-client backend connections at the proxy". ADR-0020 replaced
+# those with a shared pool and ADR-0021 replaced that with per-WORKER
+# connections, so two clients share a backend FIFO whenever they land on the
+# same worker — connections are assigned round-robin and pinned for life.
+#
+# WHICH MEANS THIS DRILL WAS PASSING WITHOUT TESTING ITS OWN INVARIANT.
+# Measured 2026-09-06 on three client connections: `--workers 8` reports
+# `pool_lanes:2` (the clients are on different workers, on different backend
+# connections, and cannot queue behind each other at all), `--workers 1`
+# reports `pool_lanes:1`. At the default worker count a two-client drill is
+# a coin toss that mostly comes up "no sharing", and a green means nothing
+# about isolation.
+#
+# So it runs ONE WORKER and asserts `pool_lanes` is 1 before believing any
+# latency number: the reader and the writer provably share one FIFO, which is
+# the hard case and the only one worth pinning. RESP correlates by POSITION
+# (ADR-0021), so a shared connection is a strict queue — if a write can delay
+# a read anywhere, it is here.
 #   - client A pipelines a sustained large-value WRITE STORM at the node
 #   - client B concurrently samples GET latency on the same node
 #   - B's read latency must stay flat: reads are never queued behind
@@ -27,10 +42,14 @@ trap cleanup EXIT
 $B --port 6940 --engine rocks --data-dir "$D/m" 2>"${FLEET_SCOPE}server.log" &
 fleet_wait_listen 6940
 sleep 0.7
-$PX --port 6316 --pairs "127.0.0.1:6940" 2>"${FLEET_SCOPE}proxy.log" &
+# --workers 1: see the header. Both clients land on the one worker and share
+# its single backend connection, which is what makes the assertions below
+# statements about isolation rather than about round-robin.
+$PX --port 6316 --workers 1 --pairs "127.0.0.1:6940" 2>"${FLEET_SCOPE}proxy.log" &
 fleet_wait_listen 6316
 sleep 1.0
 cli_ok valkey-cli -p 6316 SET readkey readval
+
 
 python3 - <<'PY'
 import json, socket, statistics, threading, time, os, sys
@@ -99,6 +118,36 @@ def storm():
 t = threading.Thread(target=storm)
 t.start()
 time.sleep(0.5)  # storm warmed up
+
+# THE PRECONDITION, ASSERTED WHERE THE CONDITION CAN EXIST.
+#
+# A first version of this check ran in the shell before the python block and
+# was vacuous: at that point only one client had ever connected, so
+# pool_lanes was 1 whatever the worker count, and it passed at --workers 8 --
+# the exact configuration it was written to reject. A precondition asserted
+# before the thing it is about can exist is not a check.
+#
+# Here the reader and the storm are both connected and both have sent
+# traffic, so pool_lanes is the real answer: 1 means they share one backend
+# FIFO and every latency number below is about a queue; 2 means they are on
+# different workers and none of it is.
+probe = conn()
+probe.sendall(resp(["PROXYSTATS"]))
+raw = b""
+while b"pool_lanes:" not in raw:
+    raw += probe.recv(65536)
+probe.close()
+lanes = next(
+    (l.split(":", 1)[1] for l in raw.decode(errors="replace").split("\r\n")
+     if l.startswith("pool_lanes:")),
+    None,
+)
+assert lanes == "1", (
+    f"expected ONE backend connection while both clients are live, got {lanes!r}. "
+    "With more than one the reader and the writer are on different workers and "
+    "nothing below tests isolation on a shared FIFO."
+)
+print(f"shared backend FIFO confirmed while both clients are live: pool_lanes={lanes}")
 
 under = []
 sample_reads(600, under)

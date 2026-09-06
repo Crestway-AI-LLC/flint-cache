@@ -53,12 +53,34 @@ write stall, with nothing shedding:
 Seconds of back-pressure, not microseconds. Every read sharing a connection
 with one of those writes waits behind it.
 
-## What is not measured, first
+## What is measured, and what is not — corrected 2026-09-06
 
-**No drill measures read latency while writes stall.** `ingest_saturation`
-reads acked keys back for *correctness*; `write_deadline` issues a single GET
-after recovery. So the harm is **structurally certain in kind and entirely
-unmeasured in magnitude**, and this ADR does not pretend otherwise.
+**The first version of this ADR said "no drill measures read latency while
+writes stall". That was wrong, and it was wrong because I checked two drills I
+expected to be relevant instead of enumerating them.**
+`tools/rw_isolation_drill.sh` — an ADR-0005 D1 drill, in the gate — does
+exactly this shape: one client pipelines a write storm while another samples
+GET latency through the proxy, and it asserts the reader's p50 and p99 stay
+flat.
+
+**What it covers, now that it has been run deliberately:** reads do NOT
+degrade behind a foreign write storm, even when the reader and the writer
+provably share one backend connection. Measured, `--workers 1`, with
+`pool_lanes` asserted at 1 while both clients are live: baseline read p50
+0.098 ms / p99 0.217 ms; under a 27,488-write storm, p50 0.081 ms / p99
+0.295 ms.
+
+**What it does not cover, and this is the whole of what is left:** a storm is
+not a **stall**. It runs a default LSM on a small dataset, so RocksDB never
+enters L0 back-pressure and every write in the queue is sub-millisecond — a
+FIFO drains as fast as its slowest member, and none of these are slow.
+ADR-0026's regime, where a write takes seconds, is not reached.
+
+**So the harm is certain in kind, bounded to one regime by measurement, and
+unmeasured inside it.** That is a narrower and better-founded claim than the
+one this ADR opened with, and it changes what the gating drill has to do: not
+"measure reads under writes", which exists, but "measure reads under STALLED
+writes", which does not.
 
 There is a specific reason to expect it matters here rather than in general.
 Flint's segment is read-heavy — sessions, feature stores, embeddings,
@@ -161,7 +183,9 @@ The measurement below decides whether it ships on, opt-in, or not at all.
 One drill, and it is cheap because both halves already exist:
 
 1. Drive a namespace into an L0 write stall — `ingest_saturation` already
-   produces the condition ADR-0026 characterised.
+   produces the condition ADR-0026 characterised (shrunken LSM:
+   `FLINT_LEVEL_BASE_MB=8`, `FLINT_WRITE_BUFFER_MB=4`). The storm in
+   `rw_isolation` does not; that is the difference between the two.
 2. Concurrently, a **read-only client on the same namespace** samples GET
    latency through the proxy. **`--workers 1`**, so the reader and the writer
    provably share one backend connection — assertable, because `PROXYSTATS`
