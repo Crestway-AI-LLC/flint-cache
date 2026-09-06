@@ -37,11 +37,25 @@
 //! cache is keyed (ns, slot): migrations are per-namespace, so tenant A's
 //! -MOVED must never reroute tenant B, whose rows did not move.
 //!
-//! v0 scope, deliberately deferred: TLS, metering, cross-slot
-//! scatter-gather (multi-key commands route by FIRST key), hot-key
-//! absorption, RESP3, inline commands. FLINT* admin commands are REJECTED
-//! at the proxy: the data-plane admin surface is internal, and the proxy is
-//! the tenant boundary.
+//! Still deferred, and this list is now short: cross-slot scatter-gather
+//! (multi-key commands route by their FIRST key — see `key_of`) and hot-key
+//! ABSORPTION. The sketch that finds hot keys ships and is read by
+//! PROXYHOTKEYS, the exporter and the agent; what is absent is anything that
+//! changes routing because of one, and the sketch "never toggles behavior"
+//! by design.
+//!
+//! FOUR THINGS THIS LIST USED TO CLAIM WERE DEFERRED HAVE SHIPPED, corrected
+//! 2026-09-06 (BUG-0118). Client-facing TLS (`--tls-cert`/`--tls-key`, hot
+//! reloaded per connection), proxy-side metering (`commands_read_total` and
+//! `commands_write_total` in PROXYSTATS, which the agent's billing
+//! reconciles against), RESP3 (negotiated per connection with `HELLO`, and
+//! `docs/command-support.md` explains why it is not cosmetic), and inline
+//! non-RESP commands (bounded by `MAX_INLINE_LEN`, and `verify` asserts one
+//! is accepted). A reader of this header would have concluded the tenant
+//! boundary has no TLS.
+//!
+//! FLINT* admin commands are REJECTED at the proxy: the data-plane admin
+//! surface is internal, and the proxy is the tenant boundary.
 //!
 //! Usage: flint-proxy --port 7379 --pairs "m0,r0;m1,r1;..."
 //!                    [--tenants "tokenA=nsA,tokenB=nsB"]
