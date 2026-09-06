@@ -1,6 +1,14 @@
 # BUG-0035: the default lag cap sheds under gate load, and two drills misreport it (drills FIXED; the production shed CAUSE FOUND 2026-09-03 — BUG-0078's missing TCP_NODELAY, gone since rc.66)
 
-Status: OPEN 2026-08-20 · Severity: medium — one half is a documented claim
+Status: RESOLVED 2026-09-05 as far as measurement can resolve it — and this
+file CONTRADICTED ITSELF for twelve days about the reason. The header said
+"Still open: BUG-0038's fix" while the body three sections down said of that
+same fix "**DONE, and it was better than predicted**": 631 ms -> 115 ms,
+`writes_delayed_soft` to zero, ~885 ms of margin under the shipped caps. It was
+fixed 2026-08-20, four days BEFORE the re-scope that called it open. See *What
+was actually left, measured* at the foot.
+
+Was: OPEN 2026-08-20 · Severity: medium — one half is a documented claim
 with a counter-example, the other is a drill that reports a verdict for
 assertions it never reached
 
@@ -1023,3 +1031,42 @@ the same across every row.
 
 `slo.md`'s no-stall row now has a *dated end* to its counter-example, not just
 a dated counter-example.
+
+## What was actually left, measured (2026-09-05)
+
+Two things were listed as open. One had already been done, and the other has
+now been measured rather than explained.
+
+**BUG-0038's fix: DONE since 2026-08-20**, and this file already said so in
+*The design half, answered* — the header just never caught up. The whole
+argument of this bug was that the soft cap at 500 ms sat BELOW a 631 ms
+ordinary operating point, so healthy traffic lived inside the brake. The fix
+moved that point to 115 ms. The caps are no longer mis-positioned, which
+retires the design question this file existed to ask.
+
+**Gate 21's perturbation: NOT EXPLAINED, and NOT RECURRED in 427 runs.**
+
+Classified every `gate` failure on main in the retained history — 609 runs,
+2026-08-02 to 2026-09-06, of which 121 failed. `repl` appears in exactly one
+of them, on **2026-08-09**, which is eleven days before gate 21 and before the
+shipper fix. Since the fix landed on 2026-08-20 there have been **427 gate runs
+on main and zero `repl` failures.**
+
+**That is a rate, not a cause, and the distinction is the point.** Nothing here
+establishes what perturbed gate 21; it says the failure has not been seen again
+across 427 runs against caps that now carry 885 ms of margin instead of 370.
+Naming the shipper as the cause would be asserting something no check
+established (ADR-0028) — the honest statement is that the condition which made
+the caps mis-positioned is gone, and the symptom has not returned.
+
+Two caveats kept, because a clean number invites over-reading:
+
+- The sample is the **main** gate. Gate 21 ran on the `flintmigrations-all`
+  branch, and branch runs are not in this count.
+- `roll_shed_drill` (CORE, 2026-08-22) now covers the shape — a roll under load
+  that sheds by the lag cause — so a recurrence has somewhere to be caught
+  that it did not have in August.
+
+Left RESOLVED rather than FIXED: nothing was fixed here on 2026-09-05. The
+fix was BUG-0038's, in August; what happened today is that this file stopped
+disagreeing with itself and the residual got a number.
