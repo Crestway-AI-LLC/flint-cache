@@ -456,3 +456,20 @@ question is superseded, not answered. If that is accepted this becomes MITIGATED
 with the mechanism measured, rather than OPEN pending a rate nobody has been
 able to collect in three attempts.
 
+
+## 2026-09-06 — five bring-up failures checked against the reopen condition: not this
+
+A local `gates.sh drills` run produced six failures, five of them bring-up:
+`FAIL: bootstrap` in `decommission` and `edge_ca_trust`, and "nothing
+listening on <port> after 30s" in `widowed_grace`, `coproc_vec_rebuild` and
+`coproc_vec_tls`. That is exactly the shape this bug describes, so it was
+checked against the reopen condition above rather than assumed either way.
+
+**No `_dyld_start` signature in any of them** — `grep -rl _dyld_start` over
+the whole run directory returns nothing. All five pass when re-run serially.
+
+So they are the parallelism effect BUG-0064 measures (four-way `FLINT_GATE_JOBS`
+on a laptop), not first-exec validation returning. Recorded because the two
+look identical from the drill's output, and the next person to see five
+bring-up failures should not reopen this one without grepping for the
+signature first. It takes one command.

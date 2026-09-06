@@ -40,11 +40,16 @@ read is the network.
 Every row is the *worse* of two independent runs. This dataset fits the box's
 61 GB of RAM, so it measures the request path, not the beyond-RAM case.
 
-**Against the 2026-08-17 measurement, only the pipelined rows moved.** GETs,
-Mixed and SETs are within this rig's run-to-run spread — the two SET runs
-behind that row differed by 11% between themselves, which is wider than the
-gap to the older figure, so it is not read as a change. Pipelined GETs are up
-**23%** here and 4% on the beyond-RAM fleet below.
+**Against the 2026-08-17 measurement, only the pipelined rows moved.** GETs
+and Mixed sit 6% under the older figures, inside a rig whose two runs of the
+same scenario differed by 11% between themselves. **SETs are 21% under**, and
+that gap is wider than the spread, so it is not dismissed on spread — it is
+dismissed on a stronger measurement: a same-fleet A/B of this build against
+the pre-batching one, three repetitions each, found the unpipelined write path
+unchanged and reads within 1%. A cross-day comparison cannot separate a code
+change from a different afternoon; an A/B on one fleet in one sitting can, and
+that is what the reading rests on. Pipelined GETs are up **23%** here and 4%
+on the beyond-RAM fleet below.
 
 The pipelined SET row is new, and it is new for a reason: at pipeline 1 a
 batched write run holds one command, so the row above it cannot show what
