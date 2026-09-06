@@ -7,8 +7,26 @@ so you can decide what your platform has to supply.
 
 **The internal mesh is mutually authenticated TLS, everywhere.** Node↔node
 replication, migration and cutover; proxy↔backend; proxy↔control-plane; and
-the Raft RPCs between control-plane seats. There is no plaintext internal hop
-to turn off, and no "trusted network" assumption.
+the Raft RPCs between control-plane seats. No hop is exempt and there is no
+"trusted network" assumption: mTLS is not layered onto some hops and skipped
+on others.
+
+It is switched on by one inventory line, `tls on`, and **`flintctl bootstrap`
+refuses to build a fleet without it** unless the inventory also says
+`disposable on` — a cluster that exists for one run and is deleted after,
+which is what every drill in `tools/` declares. So the posture is not
+something you can leave off by forgetting a line.
+
+> This page previously said "there is no plaintext internal hop to turn off",
+> which was true of every fleet anyone had deployed and false of the code
+> (BUG-0111, fixed 2026-09-06). `tls` is a plain boolean defaulting to false,
+> and the function that assembles a seat's TLS arguments returns an EMPTY list
+> when it is off, so a hand-written inventory that omitted the line produced
+> exactly the thing this paragraph said could not be turned off. Production
+> was never affected — the inventory renderer has always emitted `tls on`
+> and says its security posture is not parameterized — but the guarantee
+> lived in a shell script rather than in the tool, and a guard you can step
+> around by invoking the tool directly is a convention, not a guard.
 
 Internal dials use a fixed `ServerName` (`flint-internal`) rather than the
 dialed address, so one leaf certificate serves the whole mesh and

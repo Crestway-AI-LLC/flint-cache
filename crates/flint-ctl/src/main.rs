@@ -6941,6 +6941,62 @@ const MUTATING: &[&str] = &[
 /// because a guard you can step around by invoking the tool directly is a
 /// convention, not a guard. Only possible because a binary can now say what
 /// it is: before the release tag was compiled in, every build looked alike.
+/// A real fleet does not get a plaintext mesh by leaving a line out.
+///
+/// `docs/security.md` says "the internal mesh is mutually authenticated TLS,
+/// everywhere... there is no plaintext internal hop to turn off". That was
+/// true of every fleet anyone had deployed and false of the code: `tls` is a
+/// plain bool defaulting to false, and `internal_args` returns an EMPTY
+/// argument list when it is off, so seats spawn with no CA, no cert and no
+/// key. Omitting one line from a hand-written inventory produced exactly the
+/// thing the page said could not be turned off (BUG-0111).
+///
+/// Scoped to `bootstrap` on purpose, for two reasons. It is where the posture
+/// is chosen and where the CA is minted, so it is the last moment the choice
+/// is still free. And gating every mutating verb would strand a fleet that
+/// predates this guard: `stop` is mutating too, and refusing to stop a
+/// plaintext cluster helps nobody.
+///
+/// `disposable on` is exempt because it means the same thing here as it does
+/// for `require_release_or_disposable` — a cluster that exists for one run
+/// and is deleted after. Every drill in tools/ declares it, so this guard
+/// costs them nothing.
+/// Split out as a PURE function so the four combinations can be asserted
+/// without a fleet, the same reason `cert_manifest` is one. The interesting
+/// case is the third: `disposable on` with no TLS must stay ALLOWED, because
+/// all 88 drill inventories are exactly that shape and a guard that broke
+/// them would be reverted rather than fixed.
+fn bootstrap_would_be_plaintext(inv: &Inventory, cmd: &str) -> bool {
+    cmd == "bootstrap" && !inv.tls && !inv.disposable
+}
+
+fn require_tls_unless_disposable(inv: &Inventory, cmd: &str) {
+    if !bootstrap_would_be_plaintext(inv, cmd) {
+        return;
+    }
+    die(concat!(
+        "refusing `bootstrap`: the inventory does not declare `tls on`, so ",
+        "every internal hop -- replication, migration, cutover, proxy to ",
+        "backend, proxy to control plane, and the Raft RPCs between ",
+        "control-plane seats -- would run in plaintext, and the mesh would ",
+        "authenticate nobody.\n",
+        "\n",
+        "Add to the inventory:\n",
+        "\n",
+        "      tls on\n",
+        "      client-tls on\n",
+        "\n",
+        "`tls on` mints an internal CA and gives every component the same ",
+        "leaf, so distribution is a file copy rather than a PKI exercise. ",
+        "`client-tls on` is the separate question of the tenant-facing edge, ",
+        "and is worth turning on at the same time for anything but a ",
+        "loopback trial.\n",
+        "\n",
+        "If this IS a loopback trial or a cluster you will delete, say so ",
+        "with `disposable on` and this guard steps aside.",
+    ));
+}
+
 fn require_release_or_disposable(inv: &Inventory, cmd: &str) {
     if !MUTATING.contains(&cmd) {
         return;
@@ -7042,6 +7098,7 @@ fn main() {
     let cmd = argv.get(cmd_at).map(|s| s.as_str()).unwrap_or("status");
     let rest: Vec<String> = argv.iter().skip(cmd_at + 1).cloned().collect();
     require_release_or_disposable(&inv, cmd);
+    require_tls_unless_disposable(&inv, cmd);
 
     match cmd {
         "bootstrap" => {
@@ -7947,6 +8004,54 @@ mod reconverge_message_tests {
             reconverge_failure("a:1", "b:2", Some("9"), "?", "?"),
         ] {
             assert!(m.contains("a:1") && m.contains("b:2"), "{m}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tls_guard_tests {
+    use super::{Inventory, bootstrap_would_be_plaintext};
+
+    fn inv(tls: bool, disposable: bool) -> Inventory {
+        Inventory {
+            tls,
+            disposable,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn only_a_real_fleet_without_tls_is_refused() {
+        // The defect: `tls` is a bool defaulting to false, so omitting one
+        // line from a hand-written inventory produced a plaintext mesh while
+        // docs/security.md said there was no plaintext hop to turn off.
+        assert!(bootstrap_would_be_plaintext(
+            &inv(false, false),
+            "bootstrap"
+        ));
+
+        // Every drill in tools/ is this shape -- 88 of them, all declaring
+        // `disposable on` and none declaring tls. A guard that caught these
+        // would be turned off rather than satisfied.
+        assert!(!bootstrap_would_be_plaintext(
+            &inv(false, true),
+            "bootstrap"
+        ));
+
+        assert!(!bootstrap_would_be_plaintext(
+            &inv(true, false),
+            "bootstrap"
+        ));
+        assert!(!bootstrap_would_be_plaintext(&inv(true, true), "bootstrap"));
+
+        // Scoped to bootstrap: gating every mutating verb would strand a
+        // fleet that predates the guard, because `stop` is mutating too and
+        // refusing to stop a plaintext cluster helps nobody.
+        for cmd in ["start", "stop", "upgrade", "roll-node", "status"] {
+            assert!(
+                !bootstrap_would_be_plaintext(&inv(false, false), cmd),
+                "{cmd} must not be gated"
+            );
         }
     }
 }
