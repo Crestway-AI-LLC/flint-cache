@@ -1349,84 +1349,129 @@ except OSError:
     print("NOINDEX")
     sys.exit(0)
 
-# The marker is the LAST parenthesised group in the row whose first word is a
-# state word. Rows put it at the end of the title cell OR the evidence cell --
-# both conventions are in use -- and both cells carry ordinary parentheses of
-# their own, so position alone cannot find it and neither can vocabulary alone.
+
+# The marker is the LAST parenthesised group whose first word is a state word.
+# Rows put it at the end of the title cell OR the evidence cell -- both
+# conventions are in use -- and both cells carry ordinary parentheses of their
+# own, so position alone cannot find it and neither can vocabulary alone.
+#
+# A FUNCTION because the same grammar now reads two things: an index row, and a
+# write-up's H1 for the files that carry their state there instead of on a
+# Status line. One grammar, so a marker legible in one place is legible in the
+# other.
+def state_marker(text):
+    found = None
+    for g in re.findall(r"\(([^)]*)\)", text):
+        w = g.upper().split()
+        if w and (w[0] == "OPEN" or any(w[0].startswith(c) for c in CLOSED)):
+            found = g.upper()
+    return found
+
+
 marker_of = {}
 for line in idx.split("\n"):
     m = re.match(r"\| (?:BUG-)?.?(\d{4})", line)
     if not m:
         continue
-    found = None
-    for g in re.findall(r"\(([^)]*)\)", line):
-        w = g.upper().split()
-        if w and (w[0] == "OPEN" or any(w[0].startswith(c) for c in CLOSED)):
-            found = g.upper()
-    marker_of[m.group(1)] = found
+    marker_of[m.group(1)] = state_marker(line)
 
 bad = []
 unmarked_closed = []
-marked = 0
 compared = 0
+via_title = 0
+no_row = 0
+no_row_marker = 0
+no_claim = 0
 total = 0
 for f in sorted(glob.glob("docs/bugs/[0-9][0-9][0-9][0-9]-*.md")):
     total += 1
     key = os.path.basename(f)[:4]
     if key not in marker_of:
-        continue                    # no row at all: nothing to hold it against
+        no_row += 1                 # no row at all: nothing to hold it against
+        continue
     row = marker_of[key]
     head = open(f, encoding="utf-8", errors="replace").read()
     sm = re.search(r"^\*{0,2}Status:?\*{0,2}\s*:?\s*(.{0,40})", head, re.M)
-    if not sm or not sm.group(1).strip():
-        continue
-    # AN ABSENT MARKER IS NOT AN ABSENT CLAIM, and skipping it here was the
-    # gap. A row with no state word reads as OPEN to everything that scans this
-    # index -- `undeployed.sh` classifies by substring, and so does anyone
-    # grepping it -- so over a Status of FIXED the row says the opposite of the
-    # truth just as loudly as a row that spells OPEN out. FIFTEEN were in that
-    # state when this was added, three of them fixed within the previous four
-    # days, and one of them (0050) had already been reported to Jeff as open
-    # work an hour earlier in the same session that added this.
+    # THE CLAIM IS NOT ALWAYS ON A `Status:` LINE. Twenty-one of the ninety-eight
+    # write-ups put it in the H1 instead -- "BUG-0074 ... (FIXED 2026-08-29)" --
+    # and carry no Status line at all. Those were skipped here AND by
+    # `assert_bug_titles_agree_with_status`, which needs a Status line to hold a
+    # title against. So for a fifth of this directory the title and the index
+    # row were two copies of the state with NOTHING comparing them: the same gap
+    # this check was added to close, one file convention over.
     #
-    # ONLY IN THAT DIRECTION. An unmarked row over an OPEN Status is honest --
+    # Two had drifted, and neither was reachable before the fallback:
+    #
+    #   0070 -- title "FIXED and fleet-measured 2026-08-28" against a row whose
+    #           last marker is "(OPEN -- nothing changed...)". That parenthetical
+    #           is about the FIRST fix, which was built on the wrong mechanism
+    #           and reverted; the same row then describes the sparse hint index
+    #           that actually fixed it. The row is right and its marker is stale.
+    #   0069 -- title "FIXED 2026-08-28" against a row whose FIXED is BOLD
+    #           rather than parenthesised, so it carries no marker and reads as
+    #           open.
+    #
+    # THE STATUS LINE STILL WINS where both exist: it is the maintained one, and
+    # a title marker is a summary of it. The fallback only reaches files with no
+    # Status line to prefer.
+    if sm and sm.group(1).strip():
+        # chr(96) rather than the character: this heredoc sits inside a $( ),
+        # where bash looks for a matching backtick even in a QUOTED heredoc.
+        claim = re.sub("[*_" + chr(96) + "]", "", sm.group(1)).strip()
+        src = "Status"
+    else:
+        tm = state_marker(head.split("\n", 1)[0])
+        if not tm:
+            no_claim += 1           # no state claim in the file at all
+            continue
+        claim = tm
+        src = "title"
+        via_title += 1
+    first = re.split(r"[\s,;.:·]+", claim.upper())[0]
+    # AN ABSENT MARKER IS NOT AN ABSENT CLAIM, and skipping it here was the
+    # gap. A row with no state word reads as OPEN to anyone scanning this index
+    # -- so over a claim of FIXED the row says the opposite of the truth just as
+    # loudly as a row that spells OPEN out. FIFTEEN were in that state when this
+    # was added, three of them fixed within the previous four days, and one
+    # (0050) had already been reported to Jeff as open work an hour earlier by
+    # the same session that added this rule.
+    #
+    # ONLY IN THAT DIRECTION. An unmarked row over an OPEN claim is honest --
     # absence reads as open, and open is what it is -- so it stays unmarked
     # rather than being made to carry a word it does not need.
     if not row:
-        if any(re.split(r"[\s,;.:\u00b7]+", re.sub("[*_" + chr(96) + "]", "",
-                        sm.group(1)).strip().upper())[0].startswith(c)
-               for c in CLOSED):
-            unmarked_closed.append((os.path.basename(f),
-                                    re.sub("[*_" + chr(96) + "]", "",
-                                           sm.group(1)).strip()))
+        if any(first.startswith(c) for c in CLOSED):
+            unmarked_closed.append((os.path.basename(f), src, claim))
+        else:
+            no_row_marker += 1
         continue
-    marked += 1
     compared += 1
-    # chr(96) rather than the character: this heredoc sits inside a $( ), where
-    # bash looks for a matching backtick even in a QUOTED heredoc.
-    st = re.sub("[*_" + chr(96) + "]", "", sm.group(1)).strip().upper()
-    first = re.split(r"[\s,;.:·]+", st)[0] if st else ""
+    st = claim.upper()
     words = row.split()
     if not words:
         continue
     if words[0] == "OPEN" and first.startswith(CLOSED):
-        bad.append((os.path.basename(f), row, st))
+        bad.append((os.path.basename(f), row, src, st))
     elif any(words[0].startswith(c) for c in CLOSED) and first == "OPEN":
-        bad.append((os.path.basename(f), row, st))
+        bad.append((os.path.basename(f), row, src, st))
 
 # A scan that finds no markers certifies the index by reading none of it.
-if marked == 0:
+if compared == 0:
     print("NOMARKERS")
     sys.exit(0)
-# SAY HOW MUCH WAS COMPARED. A row with no marker, or a write-up with no
-# Status line, is skipped -- correctly, since there is no second copy to
-# disagree with -- but a check that abstains silently reads exactly like one
-# that examined everything.
-print("COVERAGE %d %d %d" % (compared, marked, total))
-for f, row, st in bad:
-    print("%s\t(%s)\t%s" % (f, row[:70], st[:60]))
-for f, st in unmarked_closed:
-    print("%s\t(no marker on the row)\t%s" % (f, st[:60]))
+# SAY HOW MUCH WAS COMPARED, AND WHY THE REST WAS NOT. The earlier version
+# derived the breakdown in shell as `marked - compared`, which is identically
+# zero because those two counters were incremented on the same line -- so it
+# reported "0 no Status line" while twenty-one files had none, and folded every
+# other reason into "no index marker". A check that abstains silently reads
+# exactly like one that examined everything; a check that MISREPORTS what it
+# abstained on is worse, because the number looks like evidence.
+print("COVERAGE %d %d %d %d %d %d"
+      % (compared, total, via_title, no_row_marker, no_claim, no_row))
+for f, row, src, st in bad:
+    print("%s\t(%s)\t%s: %s" % (f, row[:70], src, st[:60]))
+for f, src, st in unmarked_closed:
+    print("%s\t(no marker on the row)\t%s: %s" % (f, src, st[:60]))
 BIMPY
 ) || { echo "FAIL  the index-marker check could not run"; FAILED="$FAILED bug-index-markers-unrunnable"; return; }
 
@@ -1444,22 +1489,23 @@ BIMPY
     # says nothing over a write-up that is closed; calling both "contradicts"
     # would name a cause the check has not established for the second
     # (ADR-0028). The per-row line carries which.
-    echo "FAIL  index row(s) that disagree with the write-up's Status:"
+    echo "FAIL  index row(s) that disagree with the write-up's own state:"
     printf '%s\n' "$out" | while IFS="$(printf '\t')" read -r f marker st; do
       echo "        $f"
-      echo "          index $marker  vs  Status: $st"
+      echo "          index $marker  vs  $st"
     done
     echo "        The row is what a reader acts on without opening the file,"
     echo "        and an ABSENT marker reads as OPEN to everything that scans"
-    echo "        this index. Update it in the SAME commit that changes Status."
+    echo "        this index. Update it in the SAME commit that changes state."
     FAILED="$FAILED bug-index-markers-contradict-status"
     return
   fi
   # shellcheck disable=SC2086
   set -- $cov
-  echo "  every bug index row agrees with its write-up's Status line \
-($1 of $3 write-ups compared: $(($3 - $2)) have no index marker, \
-$(($2 - $1)) no Status line)"
+  echo "  every bug index row agrees with its write-up's own state \
+($1 of $2 compared, $3 of those against the H1 because the file has no Status \
+line; skipped: $4 unmarked rows over an open write-up, $5 files that state \
+nothing, $6 with no index row)"
 }
 
 assert_bug_index_agrees() {
