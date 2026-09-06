@@ -408,3 +408,53 @@ five days across seven rejoins, and that the instrument added on 09-02 has not
 yet had an occurrence to speak about. **Left OPEN for that reason** — a
 diagnostic that has never fired has not been shown to work, and a bug whose
 symptom is absent is not a bug that has been explained.
+
+## 2026-09-06 — "nothing to read" was guaranteed, and the journal says more than the instrumentation could
+
+The section above records reading for the reseed reason on 2026-09-05 and
+finding nothing. That reading could not have found anything, and the reason
+is not that the condition stayed quiet.
+
+**The playground does not have the instrumentation.** It runs
+`v0.1.0-rc.69`, tagged `0cece54` on 2026-09-04. `last_reseed_reason` and
+`last_reseed_at_ms` landed in `088bc4e` on 2026-09-05, which is **not an
+ancestor of that tag**. A binary cannot emit a field whose code did not exist
+when it was built, so the absence said nothing either way. Confirmed against
+the box as well as against git: no `reseed` string in the exporter's metrics,
+and the deployed `flintctl` has no verb that would surface it.
+
+This is the same shape as the mistake that produced BUG-0109's wrong severity
+earlier the same day — a fact established about the SOURCE, reported as a
+fact about the FLEET. The fix ships whenever rc.70 is cut and deployed; until
+then this bug's instrumentation is not in service and should not be cited as
+evidence of anything.
+
+### What the fleet journal does say, which needed no new build
+
+`/var/lib/flint/cp-state.journal`, read today. 9 `RejoinStarted`, 7
+`RejoinDecided`, 2 `Promoted`, 2 `Demoted`, 0 `AttachReplica`. The last four
+rejoin decisions:
+
+| when (UTC) | epoch | path taken |
+|---|---|---|
+| 2026-09-04 21:12 | (0,62) | **rewind** — "rewound to seq 184548113 (fence 184548882): tailing incrementally" |
+| 2026-09-05 17:14 | (0,64) | warm rejoin at seq 189145310 |
+| 2026-09-06 07:15 | (0,64) | warm rejoin at seq 190890687 |
+| 2026-09-06 13:56 | (0,64) | warm rejoin at seq 191721781 |
+
+Read carefully, because the rewind is easy to misread as a recurrence. **It is
+not.** This bug's failure is rewind → adopt the master's translated cursor →
+`FATAL: WALGAP full sync required`. The 09-04 rewind ended in "tailing
+incrementally", which is the rewind SUCCEEDING. No fatal follows it in the
+journal, and the pair is `live_replicas 1` right now.
+
+So on the evidence available without the instrumentation: the failing path has
+not been observed since this bug was filed, the recent rejoins take the warm
+path ADR-0035 added, and the epoch has advanced 59 → 64 without the pair
+dropping to one copy and staying there.
+
+That is **not** grounds to close it. It is one fleet, the failure was always
+intermittent, and the mechanism described above is unchanged in the code. What
+it changes is the next step: the question is no longer "read the reseed
+reason", it is **get rc.70 onto the playground and then read it** — and until
+that happens, a quiet journal is the only evidence there is.
