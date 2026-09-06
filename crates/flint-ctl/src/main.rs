@@ -2036,15 +2036,62 @@ fn sweep_orphans(inv: &Inventory) -> usize {
                 "host-sweep".into(),
                 inv.statedir.clone(),
             ];
-            if let Ok(out) = r.output(&argv) {
-                let n: usize = String::from_utf8_lossy(&out.stdout)
-                    .trim()
-                    .parse()
-                    .unwrap_or(0);
-                if n > 0 {
-                    eprintln!("  swept {n} orphan(s) on {}", r.label());
+            // A HOST THAT COULD NOT BE ASKED IS NOT A HOST WITH NO ORPHANS,
+            // and this folded both into the same 0. There was no `else` at
+            // all, so an unreachable host, a missing remote flintctl or an
+            // ssh that timed out contributed nothing and said nothing — and
+            // `stop`'s only summary line is `if swept > 0`, so the whole
+            // command printed exactly what a clean fleet prints.
+            //
+            // `stop` gets this right three lines up: its remote arm matches on
+            // the result and prints "[host] stop failed: {e}". The asymmetry
+            // was the bug — the same call, in the same loop, one arm reporting
+            // and one silent.
+            //
+            // The unparseable case is the same failure wearing a success:
+            // `unwrap_or(0)` turned "host-sweep printed something unexpected"
+            // into "host-sweep found nothing". Both now say so.
+            match r.output(&argv) {
+                // `output()` returns Err only when the ssh BINARY cannot be
+                // spawned; an ssh that could not reach the host still returns
+                // Ok with a non-zero status and empty stdout. So the status is
+                // the check that actually fires for an unreachable host, and
+                // the original code looked at neither.
+                Ok(out) if !out.status.success() => eprintln!(
+                    "  [{}] host-sweep exited {} ({}) — orphans there are \
+                     UNKNOWN, not zero",
+                    r.label(),
+                    out.status
+                        .code()
+                        .map_or("by signal".into(), |c| c.to_string()),
+                    String::from_utf8_lossy(&out.stderr)
+                        .trim()
+                        .lines()
+                        .next_back()
+                        .unwrap_or("no stderr")
+                ),
+                Ok(out) => {
+                    let raw = String::from_utf8_lossy(&out.stdout);
+                    match raw.trim().parse::<usize>() {
+                        Ok(n) => {
+                            if n > 0 {
+                                eprintln!("  swept {n} orphan(s) on {}", r.label());
+                            }
+                            killed += n;
+                        }
+                        Err(_) => eprintln!(
+                            "  [{}] host-sweep did not return a count ({:?}) — \
+                             orphans there are UNKNOWN, not zero",
+                            r.label(),
+                            raw.trim().chars().take(60).collect::<String>()
+                        ),
+                    }
                 }
-                killed += n;
+                Err(e) => eprintln!(
+                    "  [{}] host-sweep failed: {e} — orphans there are \
+                     UNKNOWN, not zero",
+                    r.label()
+                ),
             }
         } else {
             killed += local_sweep_orphans(&inv.statedir);
@@ -6543,13 +6590,38 @@ fn stop(inv: &Inventory) {
                 "host-stop-all".into(),
                 inv.statedir.clone(),
             ];
+            // THE STATUS, NOT JUST THE Err. `output()` returns Err only when
+            // the ssh BINARY cannot be spawned; an ssh that never reached the
+            // host returns Ok with a non-zero status and no stdout. So this
+            // arm's error branch fires for the one failure that never happens
+            // in the field, and the common one — unreachable host, missing
+            // remote flintctl, sudo refused — printed nothing at all, because
+            // there were no stdout lines to loop over.
+            //
+            // "stop the fleet" reporting success while a remote seat keeps
+            // serving is the failure this whole function exists to prevent:
+            // its own opening comment says reading only the local directory
+            // "would leave remote seats running while reporting success".
             match r.output(&argv) {
+                Ok(out) if !out.status.success() => eprintln!(
+                    "  [{}] host-stop-all exited {} ({}) — seats there may \
+                     STILL BE RUNNING",
+                    r.label(),
+                    out.status
+                        .code()
+                        .map_or("by signal".into(), |c| c.to_string()),
+                    String::from_utf8_lossy(&out.stderr)
+                        .trim()
+                        .lines()
+                        .next_back()
+                        .unwrap_or("no stderr")
+                ),
                 Ok(out) => {
                     for line in String::from_utf8_lossy(&out.stdout).lines() {
                         eprintln!("  [{}] {line}", r.label());
                     }
                 }
-                Err(e) => eprintln!("  [{}] stop failed: {e}", r.label()),
+                Err(e) => eprintln!("  [{}] could not run stop: {e}", r.label()),
             }
         } else {
             local_stop_all(&inv.statedir);

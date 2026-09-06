@@ -126,5 +126,56 @@ if "$CTL" host-nonesuch "$S" >/dev/null 2>&1; then
 fi
 echo "   host-nonesuch -> non-zero"
 
+# ---------------------------------------------------------------------------
+# THE CALLER HALF, for the one thing it can be asked without a second machine:
+# what does `stop` say about a host it could not reach?
+#
+# `sweep_orphans` had no error arm at all. `if let Ok(out) = r.output(&argv)`,
+# an unparseable count `unwrap_or(0)`, and no status check -- and `output()`
+# returns Ok for an ssh that FAILED, since only a missing ssh binary is Err.
+# So an unreachable host contributed 0 swept and printed nothing, and `stop`'s
+# only summary is `if swept > 0`: the command printed exactly what a clean
+# fleet prints. `stop`'s own remote arm, three lines up, does report its
+# failures -- the same call in the same loop, one arm reporting and one silent.
+#
+# 192.0.2.1 is TEST-NET-1 (RFC 5737), guaranteed unroutable, so this needs no
+# fixture host and cannot accidentally reach one. Every seat is placed there,
+# so nothing local is stopped either.
+echo "== stop names a host it could not sweep, instead of counting it as clean"
+R=$S/remote; mkdir -p "$R/bin"
+cat > "$R/inv" <<INV
+disposable on
+statedir $R
+bins $R/bin
+tls off
+ssh-user nobody
+ssh-key $R/no-such-key
+cp 192.0.2.1:7500
+pair 192.0.2.1:7001,192.0.2.1:7002
+INV
+OUT=$("$CTL" -f "$R/inv" stop 2>&1 || true)
+printf '%s\n' "$OUT" | grep -q "192.0.2.1" || fail "stop said nothing about the
+  unreachable host. Its output was:
+$OUT"
+printf '%s\n' "$OUT" | grep -qi "UNKNOWN, not zero" || fail "stop mentioned the
+  host but not that its orphan count is unknown. 'swept 0' and 'could not ask'
+  must not read the same. Its output was:
+$OUT"
+# BOTH REMOTE ARMS, not just the sweep. `stop` runs host-stop-all first and
+# host-sweep second, and each had the same defect for the same reason -- Err
+# means "no ssh binary", so an ssh that failed took the Ok arm and printed its
+# (empty) stdout. Asserting only the sweep would leave the arm whose silence
+# means "a seat may still be serving" uncovered, which is the more expensive
+# half: this function's own opening comment says reading only the local
+# directory "would leave remote seats running while reporting success".
+printf '%s\n' "$OUT" | grep -q "host-stop-all exited" || fail "stop did not
+  report that host-stop-all failed on the unreachable host. Its output was:
+$OUT"
+printf '%s\n' "$OUT" | grep -q "STILL BE RUNNING" || fail "stop reported the
+  failed host-stop-all without saying what it means for the seats there.
+  Its output was:
+$OUT"
+printf '%s\n' "$OUT" | grep "192.0.2.1" | sed 's/^ */   /'
+
 rm -rf "$S"
 echo "PASSED"
