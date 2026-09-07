@@ -191,6 +191,27 @@ that we corrected the wording rather than keep the friendlier version.
 > because past the cap (`--lag-hard-ms`, default 1000) the master stops
 > accepting new writes and sheds them with `-THROTTLED`.
 
+**Enforced by the chaos harness since 2026-09-07.** Stating a bound and
+checking it are different things, and for a long time this one was only
+stated: the harness measured loss DEPTH (an age) and asserted nothing about
+volume, so the sentence above was a promise no run could fail. Each master
+kill now estimates the write rate over the healthy window between the pair's
+previous recovery and the kill — outages excluded by construction, since a
+window that included one would depress the rate and hand the next kill a
+budget tighter than the engine was ever asked to honour — and turns it into
+one cap-window's arrivals (`--lag-hard-ms` plus `--rpo-margin-ms`). A kill
+that loses more acked writes than that budget fails the run, and the summary
+prints the volume line every run including zero. A window too short or too
+idle to rate is reported as UNJUDGED rather than counted as a pass.
+
+Two units matter here and were confused before: the harness's long-standing
+"acked keys regressed" counts KEYS, and this bound is in WRITES — one key can
+lose several. Both are now reported. Note also that the depth figures in the
+table below are measured from the post-SIGKILL stamp; before BUG-0120 they
+were anchored to a stamp taken before the kill was dispatched, which on a
+multi-host fleet floored them to zero over exactly the interval where loss
+happens.
+
 What we do **not** promise is that a lost write will be younger than the cap.
 Once a write is acknowledged, no mechanism can retroactively protect it: if
 replication stalls immediately afterwards, that write's age grows for as long

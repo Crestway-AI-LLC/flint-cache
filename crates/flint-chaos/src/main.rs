@@ -382,6 +382,26 @@ fn main() {
     // write it acked, which is the more serious reading, and it was being
     // folded silently into a number the run then annotated as within the cap.
     let mut lost_unattributed: u64 = 0;
+    // THE BOUND THE PRODUCT ACTUALLY PROMISES, finally measured.
+    //
+    // docs/failover.md and slo.md both say the RPO bounds the VOLUME of
+    // at-risk writes, not their age: past the lag cap the master stops
+    // ACCEPTING, so at most one cap-window's worth of acked writes can ever be
+    // unreplicated. The age assertion that used to stand here was removed for
+    // being a promise nothing makes, and the comment recording that said the
+    // volume bound "SHOULD be asserted" and "needs the observed write rate".
+    // This is that. The M2 exit depends on it: "measured RPO <= 1 s worth of
+    // writes (a volume, not an age)".
+    //
+    // Per pair, the window is [previous recovery, this kill] — healthy
+    // operation only, so an outage cannot drag the rate down and tighten the
+    // budget it produces. Budget is rate x (lag_hard_ms + rpo_margin_ms): one
+    // cap-window's worth plus the same margin the cap check already uses.
+    let mut volume_breaches: u64 = 0;
+    let mut volume_unjudged: u64 = 0;
+    let mut lost_writes_total: u64 = 0;
+    // (window start ms, writer seq at that instant) per pair; filled once the
+    // writers are up, just before the kill loop.
     let mut post_death_surplus: u64 = 0;
 
     // BUG-0014: the ledger boundary from the PREVIOUS master kill, carried
@@ -396,6 +416,13 @@ fn main() {
     // nothing; it reddened public main on a docs-only commit on 2026-08-22.
     // Counted so the flip can stop once coverage is actually at risk.
     let mut master_kills: u32 = 0;
+
+    // One window per pair, opened at run start; each master kill closes the
+    // current one and the recovery opens the next.
+    let mut vol_window: Vec<(u64, u64)> = shareds
+        .iter()
+        .map(|sh| (now_ms(), sh.seq.load(Ordering::SeqCst)))
+        .collect();
 
     for iteration in 1..=iterations {
         // Let the writer run for a spell BETWEEN kills; it keeps writing
@@ -721,6 +748,7 @@ fn main() {
                 .expect("oracle connect");
             let mut lost_here = 0u64;
             let mut deepest_here = 0u64;
+            let mut lost_writes_here = 0u64;
             // Keys the survivor would not answer for, even after retries. Not
             // loss, not health — an absence of evidence, which is reported
             // rather than swallowed so nobody mistakes a quiet run for a
@@ -900,9 +928,18 @@ fn main() {
                     //
                     // The depth is still MEASURED and reported every run, so a
                     // real regression remains visible; what is gone is the
-                    // false verdict attached to it. The volume bound that
-                    // SHOULD be asserted needs the observed write rate and is
-                    // tracked separately.
+                    // false verdict attached to it.
+                    //
+                    // THE VOLUME BOUND IS NOW ASSERTED (2026-09-07). This
+                    // comment used to end "the volume bound that SHOULD be
+                    // asserted needs the observed write rate and is tracked
+                    // separately" — it has the rate now: per pair, over the
+                    // healthy window from the previous recovery to the kill,
+                    // and `rpo_volume_budget` turns it into one cap-window's
+                    // arrivals. A kill that loses more than that fails the run.
+                    // The age reading stays unasserted and that is still
+                    // right; what changed is that the bound the product DOES
+                    // promise is no longer merely reported.
                     if seq > got && at <= must_have_replicated_by {
                         beyond_cap += 1;
                     }
@@ -911,6 +948,11 @@ fn main() {
                         deepest_here = deepest_here.max(loss_depth_ms(dead_us, at));
                     }
                 }
+                // The exit says "worth of writes". `lost_here` counts KEYS,
+                // which is the wrong unit for a volume bound — one key can
+                // lose many acked writes. `measured_surplus` is the count of
+                // acked WRITES this loop actually judged and found missing.
+                lost_writes_here += measured_surplus;
                 if got < *last_acked {
                     lost_here += 1;
                     // No pre-death ack above the survivor's value means every
@@ -943,6 +985,44 @@ fn main() {
             }
             acked_lost_total += lost_here;
             deepest_loss_ms = deepest_loss_ms.max(deepest_here);
+            lost_writes_total += lost_writes_here;
+
+            // THE VOLUME BOUND, judged per kill.
+            //
+            // Rate over the healthy window that just ended: from this pair's
+            // previous recovery (or run start) to this kill. Outages are
+            // excluded by construction, because the window closes AT the kill
+            // and reopens after recovery — an outage would otherwise depress
+            // the rate and hand the next kill a budget tighter than the engine
+            // was ever asked to honour.
+            let (win_start_ms, win_start_seq) = vol_window[pair_idx];
+            let win_ms = kill_ms.saturating_sub(win_start_ms);
+            let win_writes = shared
+                .seq
+                .load(Ordering::SeqCst)
+                .saturating_sub(win_start_seq);
+            // A window too short or too idle to estimate a rate is NOT a pass.
+            // Counted and reported, the same discipline as the boundary ties:
+            // "no verdict" and "no breach" must not print the same way.
+            let vol_budget = rpo_volume_budget(win_writes, win_ms, lag_hard_ms + rpo_margin_ms);
+            if vol_budget.is_none() {
+                volume_unjudged += 1;
+            }
+            let vol_note = match vol_budget {
+                Some(b) if lost_writes_here > b => {
+                    volume_breaches += 1;
+                    format!(
+                        "; VOLUME BREACH: {lost_writes_here} acked write(s) lost against a budget of                          {b} ({win_writes} writes in {win_ms}ms => one {}ms window's worth)",
+                        lag_hard_ms + rpo_margin_ms
+                    )
+                }
+                Some(b) => format!(
+                    "; volume {lost_writes_here}/{b} acked write(s) ({win_writes} in {win_ms}ms)"
+                ),
+                None => format!(
+                    "; volume UNJUDGED ({win_writes} writes in {win_ms}ms is too little to rate)"
+                ),
+            };
             unverifiable_total += unverifiable;
             // The pair, always together. `{rto}` is the widest gap between
             // ACKS; `max_hold_ms` is the longest a single request went
@@ -951,13 +1031,20 @@ fn main() {
             // the deadline working, not a stall (#186). A window where the
             // node held on shows both large. Reporting only the first cannot
             // tell those apart, and for three runs it did not.
+            // Reopen this pair's window at the recovery, so the next kill's
+            // rate is measured over healthy operation only.
+            vol_window[pair_idx] = (
+                recovered_at_ms.max(kill_ms),
+                shared.seq.load(Ordering::SeqCst),
+            );
+
             let held = shared.max_hold_ms.load(Ordering::SeqCst);
             worst_hold_ms = worst_hold_ms.max(held);
             println!(
                 "iter {iteration}: pair {pair_idx}: killed MASTER (writes in flight); {} {rto}ms{} \
                  [kill_ms={kill_ms} dead_us={dead_us} recovered_at_ms={recovered_at_ms} \
                  max_hold_ms={held}]; acked keys \
-                 regressed: {lost_here} (deepest {deepest_here}ms before the death; cap {lag_hard_ms}ms){}",
+                 regressed: {lost_here} (deepest {deepest_here}ms before the death; cap {lag_hard_ms}ms){vol_note}{}",
                 if shared.edge.is_some() {
                     "client stall"
                 } else {
@@ -1197,7 +1284,12 @@ fn main() {
         (m + tm, r + tr)
     });
     println!("---");
-    println!("PASS: {iterations} kills ({mk} master, {rk} replica), {seq} writes");
+    // A volume breach is a FAILED run, and the first word has to say so. The
+    // summary still prints in full underneath — an operator needs the numbers
+    // more, not less, when the verdict went the wrong way — and the process
+    // exits non-zero at the end.
+    let verdict = if volume_breaches > 0 { "FAIL" } else { "PASS" };
+    println!("{verdict}: {iterations} kills ({mk} master, {rk} replica), {seq} writes");
     println!("  corruption: 0  time-travel: 0  cross-key: 0");
     println!(
         "  acked keys regressed across master kills: {acked_lost_total} (async contract; replica kills: zero)"
@@ -1346,6 +1438,56 @@ fn main() {
         );
     }
     println!("  final walk: {present} present, {missing} missing-or-regressed");
+    // THE VOLUME BOUND — the one the product actually promises, and the one
+    // the M2 exit names ("measured RPO <= 1 s worth of writes, a volume, not
+    // an age"). Always printed, including zero, so "no breach" and "never
+    // judged" cannot look alike.
+    println!(
+        "  RPO volume: {lost_writes_total} acked write(s) lost across master kills; \
+         {volume_breaches} kill(s) over budget, {volume_unjudged} unjudged"
+    );
+    if volume_unjudged > 0 {
+        println!(
+            "  NOTE: {volume_unjudged} kill(s) could not be judged — the healthy window before \
+             them was under 200ms or carried no writes, so no rate could be estimated. Those \
+             kills are NOT evidence the bound held."
+        );
+    }
+    if volume_breaches > 0 {
+        println!(
+            "  FAIL: {volume_breaches} kill(s) lost more acked writes than one \
+             {}ms window's worth at the rate observed just before them. That is the bound the \
+             product does promise — past the cap the master stops ACCEPTING, so the at-risk set \
+             cannot exceed one cap-window's arrivals. Each breaching kill printed its own rate, \
+             window and budget above.",
+            lag_hard_ms + rpo_margin_ms
+        );
+        std::process::exit(1);
+    }
+}
+
+/// How many acked writes may be lost in ONE failover, at the rate observed
+/// just before it.
+///
+/// The bound the product promises is a VOLUME, not an age (docs/failover.md,
+/// slo.md): past the lag cap the master stops ACCEPTING, so the set of acked
+/// but unreplicated writes cannot exceed one cap-window's arrivals. An already
+/// acked write can then age without limit behind a stalled replica — which is
+/// why the age assertion that used to live here was removed — but no NEW one
+/// joins it.
+///
+/// `None` means the window could not support an estimate: too short, or no
+/// writes in it. That is deliberately not a budget of zero and not a pass;
+/// callers must count it as unjudged and say so.
+///
+/// Integer arithmetic rounding UP, because a rate under one write per cap
+/// window would otherwise floor to a budget of 0 and turn a single ordinary
+/// loss into a breach.
+fn rpo_volume_budget(win_writes: u64, win_ms: u64, cap_ms: u64) -> Option<u64> {
+    if win_ms < 200 || win_writes == 0 {
+        return None;
+    }
+    Some(win_writes.saturating_mul(cap_ms).div_ceil(win_ms))
 }
 
 /// How long before the master's DEATH an acked write was acknowledged.
@@ -1520,5 +1662,47 @@ mod loss_depth_anchor {
     #[test]
     fn an_ack_after_the_death_floors_at_zero_rather_than_underflowing() {
         assert_eq!(loss_depth_ms(DEAD_US, DEAD_US / 1000 + 50), 0);
+    }
+}
+
+#[cfg(test)]
+mod rpo_volume {
+    use super::rpo_volume_budget;
+
+    const CAP: u64 = 1_500; // 1000ms hard cap + 500ms margin, the defaults
+
+    #[test]
+    fn budget_is_one_cap_window_at_the_observed_rate() {
+        // 1000 writes/s for 4s: a 1.5s window is worth 1500 writes.
+        assert_eq!(rpo_volume_budget(4_000, 4_000, CAP), Some(1_500));
+        // Double the rate, double the budget.
+        assert_eq!(rpo_volume_budget(8_000, 4_000, CAP), Some(3_000));
+    }
+
+    #[test]
+    fn a_slow_writer_still_gets_a_budget_of_at_least_one() {
+        // THE ROUNDING THAT MATTERS. One write in 10s is 0.15 writes per cap
+        // window; flooring gives 0, and a budget of 0 makes any single loss a
+        // breach — a harness that red-lights on the engine behaving normally,
+        // which is exactly why the previous assertion here was deleted.
+        assert_eq!(rpo_volume_budget(1, 10_000, CAP), Some(1));
+        assert_eq!(rpo_volume_budget(3, 10_000, CAP), Some(1));
+    }
+
+    #[test]
+    fn an_unusable_window_is_none_rather_than_zero() {
+        assert_eq!(rpo_volume_budget(500, 199, CAP), None, "window too short");
+        assert_eq!(rpo_volume_budget(0, 60_000, CAP), None, "no writes to rate");
+        // The boundary is judged, not skipped.
+        assert!(rpo_volume_budget(500, 200, CAP).is_some());
+    }
+
+    #[test]
+    fn a_breach_is_a_loss_above_one_windows_arrivals() {
+        // 10k writes in 5s = 2000/s, so a 1.5s window is worth 3000.
+        let b = rpo_volume_budget(10_000, 5_000, CAP).expect("rateable");
+        assert_eq!(b, 3_000);
+        assert!(3_000 <= b, "one window's worth is within the bound");
+        assert!(3_001 > b, "one more than a window's worth is a breach");
     }
 }
