@@ -497,9 +497,18 @@ to run appears on this page.
 | `PROXYSTATS` | proxy | connections, command/read/write totals, cert expiry |
 | `PROXYLATENCY` | proxy | per-lane read/write latency |
 | `PROXYHOTKEYS` | proxy | the tenant's hot keys |
+| `PROXYCACHE` | proxy | near-cache TTL — a tenant reads and sets **its own**; the fleet default, byte budget and ceiling are the operator's |
 
-> `PROXYLATENCY` and `PROXYHOTKEYS` answer **per-tenant** and are the two a
-> tenant can run for themselves (tenant-guide.md). The `FLINT*` commands are
+> `PROXYLATENCY`, `PROXYHOTKEYS` and `PROXYCACHE` answer **per-tenant** and
+> are the three a tenant can run for themselves (tenant-guide.md).
+> `PROXYCACHE` is the only one of them that CHANGES anything, and what it
+> changes is that tenant's own accepted staleness: `PROXYCACHE <ttl_ms>` on an
+> authed connection sets the namespace's TTL, clamped to the operator's
+> `--cache-ttl-max-ms` (60 s by default) and answering with the value actually
+> applied. `PROXYCACHE <ttl_ms> <max_bytes>` — the two-argument operator form
+> — still sets the fleet default and the shared budget, and an operator's
+> `ttl_ms 0` disables the cache for everyone regardless of any per-tenant
+> value. The `FLINT*` commands are
 > seat-local: the proxy refuses the whole prefix, because it is the tenant
 > boundary. Reach a seat directly to use them.
 >

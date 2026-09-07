@@ -74,10 +74,42 @@ impl Inner {
     }
 }
 
+/// The most a tenant may set its own near-cache TTL to, unless the operator
+/// says otherwise (`--cache-ttl-max-ms`).
+///
+/// 60 s rather than unbounded: the TTL is the tenant's accepted staleness AND
+/// its residency in a shared byte budget, so an unbounded value is a way to
+/// occupy the cache at everyone else's expense. A minute is far past any
+/// repeat-read window a cache is for, so the ceiling binds abuse rather than
+/// use.
+pub const DEFAULT_TTL_MAX_MS: u64 = 60_000;
+
 pub struct ProxyCache {
     inner: Mutex<Inner>,
     /// 0 = disabled. Runtime-settable (PROXYCACHE).
+    ///
+    /// The FLEET default and the operator's kill switch: 0 disables the cache
+    /// for everyone regardless of any per-namespace value, because an
+    /// operator has to be able to turn a shared component off without
+    /// negotiating with every tenant on it.
     ttl_ms: AtomicU64,
+    /// Per-namespace TTL overrides, set by the tenant itself
+    /// (`PROXYCACHE <ttl_ms>` on an authed connection).
+    ///
+    /// The TTL is the staleness the tenant accepts, so it is theirs to
+    /// choose: one workload repeats a key every few seconds and another every
+    /// few minutes, and an operator picking one number for both is picking it
+    /// wrong for at least one of them.
+    ///
+    /// BOUNDED BY `ttl_max_ms`, because it is a shared byte budget: a longer
+    /// TTL means a tenant's entries sit resident longer, so an unbounded value
+    /// is a way to occupy the cache. The ceiling is the operator's.
+    ns_ttl_ms: Mutex<std::collections::HashMap<Vec<u8>, u64>>,
+    /// The most any tenant may set for itself. Operator-owned
+    /// (`--cache-ttl-max-ms`); the tenant's own setting is clamped to it
+    /// rather than refused, so a tenant asking for more gets the most it may
+    /// have and is told what that is.
+    ttl_max_ms: AtomicU64,
     /// Byte budget for keys+values. Runtime-settable (PROXYCACHE).
     max_bytes: AtomicU64,
     hits: AtomicU64,
@@ -95,8 +127,19 @@ fn composite(ns: &[u8], key: &[u8]) -> Vec<u8> {
 }
 
 impl ProxyCache {
+    /// The default ceiling. Test-only: the live proxy calls `with_ceiling` so
+    /// `--cache-ttl-max-ms` reaches it, and a second constructor that silently
+    /// ignored the operator's ceiling is exactly the kind of thing that gets
+    /// called by accident.
+    #[cfg(test)]
     pub fn new(ttl_ms: u64, max_bytes: u64) -> Self {
+        Self::with_ceiling(ttl_ms, max_bytes, DEFAULT_TTL_MAX_MS)
+    }
+
+    pub fn with_ceiling(ttl_ms: u64, max_bytes: u64, ttl_max_ms: u64) -> Self {
         ProxyCache {
+            ns_ttl_ms: Mutex::new(std::collections::HashMap::new()),
+            ttl_max_ms: AtomicU64::new(ttl_max_ms),
             inner: Mutex::new(Inner::default()),
             ttl_ms: AtomicU64::new(ttl_ms),
             max_bytes: AtomicU64::new(max_bytes),
@@ -107,6 +150,48 @@ impl ProxyCache {
 
     pub fn enabled(&self) -> bool {
         self.ttl_ms.load(Ordering::Relaxed) > 0
+    }
+
+    /// The TTL that applies to `ns`: its own if it set one, else the fleet
+    /// default.
+    ///
+    /// A disabled cache stays disabled for everyone — the operator's 0 wins
+    /// over any per-namespace value, which is what makes it a kill switch
+    /// rather than a suggestion.
+    pub fn ttl_for(&self, ns: &[u8]) -> u64 {
+        let global = self.ttl_ms.load(Ordering::Relaxed);
+        if global == 0 {
+            return 0;
+        }
+        match self.ns_ttl_ms.lock() {
+            Ok(m) => m.get(ns).copied().unwrap_or(global),
+            // A poisoned lock must not silently hand back the fleet default:
+            // that would quietly widen or narrow a tenant's accepted
+            // staleness. The global is the honest fallback and is what they
+            // had before they set anything.
+            Err(_) => global,
+        }
+    }
+
+    pub fn ttl_max_ms(&self) -> u64 {
+        self.ttl_max_ms.load(Ordering::Relaxed)
+    }
+
+    /// A tenant sets its own TTL. Returns what was actually applied, which is
+    /// the request clamped to the operator's ceiling — the caller reports it,
+    /// so a tenant that asked for more learns the number rather than getting
+    /// a silent surprise. 0 turns the cache off for this namespace only.
+    pub fn set_ns_ttl(&self, ns: &[u8], want_ms: u64) -> u64 {
+        let applied = want_ms.min(self.ttl_max_ms.load(Ordering::Relaxed));
+        if let Ok(mut m) = self.ns_ttl_ms.lock() {
+            m.insert(ns.to_vec(), applied);
+        }
+        // Entries cached under the OLD ttl keep their own expiry, which is
+        // correct in both directions: shortening cannot retroactively unstale
+        // a reply already served, and lengthening must not extend an entry the
+        // tenant cached under a tighter promise. The new value governs what is
+        // cached from here.
+        applied
     }
 
     /// Runtime reconfiguration (PROXYCACHE <ttl_ms> <max_bytes>).
@@ -166,7 +251,7 @@ impl ProxyCache {
     /// Cache a GET's bulk reply. Values larger than the whole budget are
     /// skipped (they would evict everything and still not fit).
     pub fn put(&self, ns: &[u8], key: &[u8], val: &[u8]) {
-        let ttl = self.ttl_ms.load(Ordering::Relaxed);
+        let ttl = self.ttl_for(ns);
         if ttl == 0 {
             return;
         }
@@ -342,5 +427,56 @@ mod tests {
         // entries live, its oldest were self-evicted.
         assert!(c.get(b"acme", b"a:199").is_some());
         assert!(c.get(b"acme", b"a:0").is_none());
+    }
+
+    /// A tenant's own TTL governs its namespace and nobody else's.
+    #[test]
+    fn a_tenants_ttl_applies_only_to_its_namespace() {
+        let c = ProxyCache::new(5_000, 1 << 20);
+        assert_eq!(
+            c.ttl_for(b"acme"),
+            5_000,
+            "unset namespaces take the default"
+        );
+        assert_eq!(c.set_ns_ttl(b"acme", 30_000), 30_000);
+        assert_eq!(c.ttl_for(b"acme"), 30_000);
+        assert_eq!(c.ttl_for(b"globex"), 5_000, "a neighbour is untouched");
+    }
+
+    /// The ceiling CLAMPS rather than refuses, and the applied value is what
+    /// comes back -- so the caller can tell the tenant the number it actually
+    /// has instead of the one it asked for.
+    #[test]
+    fn a_tenant_cannot_exceed_the_operators_ceiling() {
+        let c = ProxyCache::with_ceiling(5_000, 1 << 20, 10_000);
+        assert_eq!(c.set_ns_ttl(b"acme", 999_999), 10_000);
+        assert_eq!(c.ttl_for(b"acme"), 10_000);
+    }
+
+    /// THE OPERATOR'S KILL SWITCH OUTRANKS EVERY TENANT. A shared component
+    /// has to be turn-off-able without negotiating with everyone on it.
+    #[test]
+    fn a_global_zero_disables_the_cache_for_a_tenant_that_set_its_own() {
+        let c = ProxyCache::new(5_000, 1 << 20);
+        c.set_ns_ttl(b"acme", 30_000);
+        assert_eq!(c.ttl_for(b"acme"), 30_000);
+        c.configure(0, 1 << 20);
+        assert_eq!(c.ttl_for(b"acme"), 0, "the operator's 0 wins");
+        c.put(b"acme", b"k", b"v");
+        assert!(
+            c.get(b"acme", b"k").is_none(),
+            "and nothing is cached under it"
+        );
+    }
+
+    /// A tenant may turn its own caching off without affecting the fleet.
+    #[test]
+    fn a_tenant_zero_is_its_own_and_not_the_fleets() {
+        let c = ProxyCache::new(5_000, 1 << 20);
+        assert_eq!(c.set_ns_ttl(b"acme", 0), 0);
+        c.put(b"acme", b"k", b"v");
+        assert!(c.get(b"acme", b"k").is_none(), "acme caches nothing");
+        c.put(b"globex", b"k", b"v");
+        assert!(c.get(b"globex", b"k").is_some(), "globex still does");
     }
 }

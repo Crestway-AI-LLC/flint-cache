@@ -157,12 +157,27 @@ window for performance:
 | opt-in | what it does | the window you accept |
 |---|---|---|
 | replica reads | your reads fan across the pair's replicas; writes stay on the master | replication lag, bounded by the cluster's lag cap |
-| proxy near-cache | repeated GETs answer from a short-TTL cache at the proxy | the cache TTL; a write through the *same* proxy invalidates immediately |
+| proxy near-cache | repeated GETs answer from a short-TTL cache at the proxy | the cache TTL, **5 s by default**; a write through the *same* proxy invalidates immediately |
 | async writes | writes group-commit in batches (specialist workloads) | cross-client read freshness = queue depth; your *own* reads are never stale |
 
 With replica reads **and** the near-cache, the windows add: worst-case
 staleness = cache TTL + replica lag. Both were your choice; the sum is
-the real bound. Your own writes through one proxy connection always read
+the real bound — and with the default TTL that sum starts at 5 s before
+any lag is added, so it is worth deciding rather than inheriting.
+
+**You can set it yourself, live, and it applies only to you.**
+`PROXYCACHE <ttl_ms>` on an authed connection sets your namespace's TTL and
+answers with the value actually applied:
+
+    PROXYCACHE 30000
+    ttl_ms:30000  requested_ms:30000  ttl_max_ms:60000
+
+Longer trades freshness for hit rate; `PROXYCACHE 0` turns your caching off
+without touching anyone else. The reply reports what was applied rather than
+what you asked, because your operator sets a ceiling (`ttl_max_ms` above) and
+a request over it is clamped rather than refused. `PROXYCACHE` with no
+argument reads your current value. Your operator can still disable the cache
+fleet-wide, which outranks anything set here. Your own writes through one proxy connection always read
 back fresh regardless of any opt-in.
 
 ## Seeing your numbers

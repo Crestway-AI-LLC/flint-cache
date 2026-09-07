@@ -44,8 +44,8 @@ $PX --port 7881 --control-plane 127.0.0.1:7660 --advertise 127.0.0.1:7881 2>"$D/
 fleet_wait_listen 7881
 sleep 1.5
 
-echo "== cache defaults ON (ttl 300 ms, 256 MB); operator retunes at RUNTIME: PROXYCACHE 1500 65536"
-valkey-cli -p 7881 PROXYCACHE | grep -q 'ttl_ms:300' || { echo "FAIL: default ttl not 300"; exit 1; }
+echo "== cache defaults ON (ttl 5000 ms, 256 MB); operator retunes at RUNTIME: PROXYCACHE 1500 65536"
+valkey-cli -p 7881 PROXYCACHE | grep -q 'ttl_ms:5000' || { echo "FAIL: default ttl not 5000"; exit 1; }
 valkey-cli -p 7881 PROXYCACHE | grep -q 'max_bytes:268435456' || { echo "FAIL: default budget not 256MB"; exit 1; }
 [ "$(valkey-cli -p 7881 PROXYCACHE 1500 65536)" = "OK" ] || { echo "FAIL: PROXYCACHE set"; exit 1; }
 valkey-cli -p 7881 PROXYCACHE | grep -q 'ttl_ms:1500' || { echo "FAIL: runtime ttl not applied"; exit 1; }

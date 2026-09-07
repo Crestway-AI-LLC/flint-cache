@@ -2099,6 +2099,54 @@ fn auth_step(
     // a real deploy). Which tenants it applies to is NOT set here — that is
     // the tenant's own CPTENANTCACHE consent.
     if name.as_deref() == Some(b"PROXYCACHE") {
+        // A TENANT MAY SET ITS OWN TTL, and only its own. Same scoping
+        // contract as PROXYLATENCY and PROXYHOTKEYS: an authed connection
+        // acts on its namespace, the unscoped form is the operator's.
+        //
+        // The TTL is the staleness THIS tenant accepts — tenant-guide.md
+        // states it in the row where they opt in — so one fleet-wide number
+        // is picked wrong for anyone whose repeat-read window differs. What
+        // stays the operator's: the fleet default, the byte budget, the
+        // ceiling, and the 0 that turns the cache off for everyone.
+        let scope = authed_ns.as_deref().filter(|_| !topo.open_mode);
+        if let (Some(ns), 2) = (scope, args.len()) {
+            let Some(want) = std::str::from_utf8(&args[1])
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+            else {
+                return AuthStep::Reply(Value::Error(
+                    "ERR PROXYCACHE <ttl_ms> (your namespace's cache TTL)".into(),
+                ));
+            };
+            let applied = topo.cache.set_ns_ttl(ns, want);
+            // Report what was APPLIED, not what was asked. A tenant over the
+            // ceiling learns the number it actually has rather than believing
+            // the one it sent.
+            return AuthStep::Reply(Value::Bulk(Some(
+                format!(
+                    "ttl_ms:{applied}
+requested_ms:{want}
+ttl_max_ms:{}
+",
+                    topo.cache.ttl_max_ms()
+                )
+                .into_bytes(),
+            )));
+        }
+        // A tenant reading its own effective TTL needs no admin token, for the
+        // same reason it may set it.
+        if let (Some(ns), 1) = (scope, args.len()) {
+            return AuthStep::Reply(Value::Bulk(Some(
+                format!(
+                    "ttl_ms:{}
+ttl_max_ms:{}
+",
+                    topo.cache.ttl_for(ns),
+                    topo.cache.ttl_max_ms()
+                )
+                .into_bytes(),
+            )));
+        }
         if admin_locked {
             return admin_denied();
         }
@@ -4127,13 +4175,29 @@ fn main() -> std::io::Result<()> {
         // fleet caches nothing. Both knobs stay runtime-settable via
         // PROXYCACHE (0 TTL disables and clears); the budget is bounded —
         // this is a hot-spot absorber, not a data tier.
-        cache: cache::ProxyCache::new(
+        // 5000 ms, raised from 300 on 2026-09-06 (Jeff). 300 was small enough
+        // that the cache could only absorb a burst inside one client's own
+        // think-time; a near-cache earns its keep over a window a workload
+        // actually repeats a key in, and for a session or catalogue read that
+        // is seconds, not a third of one.
+        //
+        // THIS IS A TENANT-VISIBLE CONTRACT, not a tuning constant: the TTL IS
+        // the staleness bound a tenant accepts when it opts in, and
+        // tenant-guide.md states it in the row where they choose. Raising it
+        // widens that bound 16x, which is why the number is here, in the
+        // guide, and in self-hosting.md's table rather than only in one of
+        // them. Still opt-in twice over -- per tenant and per request -- so an
+        // un-opted fleet is unaffected.
+        cache: cache::ProxyCache::with_ceiling(
             arg("--cache-ttl-ms")
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(300),
+                .unwrap_or(5000),
             arg("--cache-max-bytes")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(256 * 1024 * 1024),
+            arg("--cache-ttl-max-ms")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(cache::DEFAULT_TTL_MAX_MS),
         ),
         open_mode,
         backend_tls,

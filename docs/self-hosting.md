@@ -402,7 +402,7 @@ fanout-timeout-ms 60000  proxy restart  read budget for the O(KEYS) admin
                                   past that, `verify --probe` starts
                                   reporting a DBSIZE timeout on a fleet
                                   that is otherwise perfectly healthy.
-cache-ttl-ms 300      proxy HOT   near-cache TTL default (PROXYCACHE)
+cache-ttl-ms 5000     proxy HOT   near-cache TTL default (PROXYCACHE)
 cache-max-bytes N     proxy HOT   near-cache byte budget
 proxy-workers N       proxy restart  bounded worker threads (ADR-0021).
                                   Default is available_parallelism(), which
