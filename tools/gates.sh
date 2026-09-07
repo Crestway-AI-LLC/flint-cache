@@ -221,7 +221,7 @@ CORE="${FLINT_CORE_ORDER:-kill_order restart repl kill_release failover proxy sl
       cert_rotate control_tls controller_ha controller_managed controller_slow_master controller_stall
       controller_multipair controlplane cp_publish failover_bystander failover_churn gates internal_mtls json lease
       fanout_timeout loaded_promote loading_visible m3_exit migrate_slots min_replicas node_tls proxy_backpressure
-      proxy_cache proxy_tls replica_reads replica_stale_fence rw_isolation
+      proxy_cache proxy_tls read_under_stall replica_reads replica_stale_fence rw_isolation
       scan slot_cutover slot_cutover_recovery slot_moved snapshot_restore
       tenant tenant_rebalance tenant_remove token_hash
       write_deadline fullsync_rate edge_reroute rewind_rejoin wal_headroom wal_budget evictable_ns evictable_agree min_replicas_survivable roll_shed proxy_chain

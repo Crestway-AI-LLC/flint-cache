@@ -16,6 +16,13 @@
 # a coin toss that mostly comes up "no sharing", and a green means nothing
 # about isolation.
 #
+# THE REGIME THIS ONE DOES NOT REACH is a write STALL, and it is measured
+# next door: `read_under_stall_drill.sh` runs the same shape with a shrunken
+# LSM, and reads behind stalled writes hit tens to >100ms against a quiet max
+# of ~0.15ms. A storm is not a stall -- a FIFO drains as fast as its slowest
+# member, and every write here is sub-millisecond. Keep the two apart: this
+# one is fast and pins the healthy case.
+#
 # So it runs ONE WORKER and asserts `pool_lanes` is 1 before believing any
 # latency number: the reader and the writer provably share one FIFO, which is
 # the hard case and the only one worth pinning. RESP correlates by POSITION

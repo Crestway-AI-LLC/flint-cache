@@ -202,15 +202,76 @@ usually goes wrong: the drill must also show the stall actually happened
 flat read latency is indistinguishable from a stall that never occurred, and
 the drill would report a pass for the wrong reason.
 
+## THE MEASUREMENT, RUN 2026-09-06
+
+`tools/read_under_stall_drill.sh`. Same shape as `rw_isolation` — one client
+storms writes, another samples GETs through the proxy — with the two
+differences that matter: a **shrunken LSM** so RocksDB reaches back-pressure,
+and `--workers 1` with `pool_lanes` asserted at 1 so the reader and writer
+provably share one backend FIFO.
+
+| where | | quiet | under stalled writes |
+|---|---|---|---|
+| macOS, run 1 | p50 | 0.037 ms | 0.128 ms |
+| macOS, run 1 | p99 | 0.091 ms | 0.236 ms |
+| macOS, run 1 | **p99.9** | 0.120 ms | **104.290 ms** |
+| macOS, run 1 | **max** | 0.120 ms | **112.876 ms** |
+| macOS, run 2 | **max** | 0.161 ms | **150.062 ms** |
+| **Linux, gate box (c7i.xlarge)** | p50 | 0.045 ms | 0.062 ms |
+| **Linux, gate box** | p99 | 0.081 ms | **0.239 ms** |
+| **Linux, gate box** | **p99.9** | 0.919 ms | **364.780 ms** |
+| **Linux, gate box** | **max** | 0.919 ms | **555.385 ms** |
+
+**The Linux row is the one to read.** On the platform the fleet runs, p99 is
+0.239 ms — three times a sub-millisecond baseline, which any dashboard would
+call healthy — while **one read in 230 waited 555 milliseconds**. Thirteen
+reads out of 3,000 exceeded the quiet maximum, and the worst of them by a
+factor of 600.
+
+Rarer than on the laptop and far worse when it happens, which is the shape
+that survives averaging and kills a p99 SLO one request at a time.
+
+**The harm is real, it is a TAIL, and p50/p99 do not show it.** In every run
+the median and the 99th barely move — 2.5–3.0× on a sub-millisecond number —
+while the tail goes **three orders of magnitude** above the quiet maximum. The
+proportion of affected reads varies with how much of the sampling window
+overlapped the stall (0.43% on Linux, 9–58% on the laptop); the size of the
+excursion does not.
+
+**This is the same trap as the tenant-isolation exit clause**, which was
+reworded the same day for the same reason: a check on p50 or p99 would report
+that isolation holds, through the failure it exists to catch. Any threshold
+this drill ever grows has to be on the tail.
+
+**What the controls establish, so the number is not read for more than it is
+worth.** The stall reached was `write_stopped`, not `writes_delayed_soft`,
+which stayed at 0 — a hard stop rather than the soft delay ADR-0026
+characterised. One worker, a laptop, and a deliberately shrunken LSM. What is
+demonstrated is the MECHANISM: on a shared FIFO, a stalled write delays reads
+behind it by ~1000×. What is not demonstrated is the frequency in production,
+which depends on the client-to-worker ratio and on how often a fleet node
+stalls.
+
+**Recommendation, on this evidence: ACCEPT.** The status stays PROPOSED
+because that is not mine to change.
+
 ## What would retire this item
 
-**If read p99 during a stall is within noise of baseline, this ADR is
-withdrawn**, and the lane item is retired the way the batch-merge item was —
-by writing down that the premise did not survive contact.
+This section said: *"if read p99 during a stall is within noise of baseline,
+this ADR is withdrawn"*. **That test has now been run, and read p99 IS within
+noise — 0.091 ms to 0.236 ms.** Retiring the ADR on it would have been the
+wrong call, and the criterion was wrong rather than the answer: **p99 is not
+where this harm lives.** Kept here rather than edited away, because a
+withdrawal criterion that would have withdrawn a confirmed defect is worth
+seeing.
 
-That is a real possibility rather than a formality: the near-cache serves
-repeat reads without touching a backend at all, so a cache-friendly workload
-may never queue a read behind a stalled write in the first place.
+The criterion that survives: **the tail.** If reads behind a stalled write
+stay within an order of magnitude of the quiet maximum, there is nothing here.
+They are three orders of magnitude out.
+
+The near-cache remains a real mitigation for cache-friendly workloads — it
+serves repeat reads without touching a backend — but it is opt-in, TTL-bounded
+and does not help a miss, so it narrows the exposure rather than removing it.
 
 ## Alternatives rejected
 
