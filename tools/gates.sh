@@ -1611,6 +1611,47 @@ assert_no_default_ports() {
 # plane came to share 7690 with the chaos proxy unnoticed. The ports are a
 # --port-base now, each chaos drill has its own block, and every port any
 # drill binds is a port some drill declares.
+# THE MIRROR OF THE OPS GATE'S CHECK, ON THE SIDE THAT INTRODUCES THE PROBLEM.
+#
+# The private ops repo has asserted this for a while; this repo did not, and
+# the asymmetry has a cost: a drill added HERE can claim a port an ops drill
+# already uses, pass this gate cleanly, and be pushed — with the collision only
+# surfacing the next time someone happens to run an OPS gate. That happened on
+# 2026-09-07: cp_kill_datapath took 6987, which quota_metering_drill.sh had,
+# and it reached main before anything noticed.
+#
+# Running both suites on one machine, either can -9 the other's seats.
+#
+# SKIPS, LOUDLY, WITHOUT THE PRIVATE CHECKOUT. This repo is public and most
+# clones will not have a sibling ops tree, so absence cannot be a failure — but
+# it must not read as a pass either, because "no collisions" and "did not look"
+# are the distinction this whole file exists to keep.
+assert_no_cross_repo_ports() {
+  local ops="${FLINT_OPS:-../flint-cache}"
+  if [ ! -d "$ops/tools" ]; then
+    echo "  SKIP: no ops checkout at $ops — cross-repo port overlap NOT checked"
+    return 0
+  fi
+  local shared
+  shared=$(comm -12 \
+    <(grep -h '^fleet_init' tools/*_drill.sh 2>/dev/null \
+      | awk '{for (i=3; i<=NF; i++) print $i}' | sort -u) \
+    <(grep -h '^fleet_init' "$ops"/tools/*_drill.sh 2>/dev/null \
+      | awk '{for (i=3; i<=NF; i++) print $i}' | sort -u))
+  if [ -z "$shared" ]; then
+    echo "  no port is claimed by both this repo's drills and the ops repo's"
+    return 0
+  fi
+  echo "FAIL  this repo's drills claim port(s) an ops drill already uses:"
+  local p
+  for p in $shared; do
+    echo "        $p: $(grep -l "^fleet_init.*[^0-9]$p\([^0-9]\|\$\)" tools/*_drill.sh "$ops"/tools/*_drill.sh 2>/dev/null | tr '\n' ' ')"
+  done
+  echo "        Pick a port free in BOTH repos. Checking only this one is how"
+  echo "        6987 reached main (2026-09-07)."
+  FAILED="$FAILED cross-repo-ports"
+}
+
 assert_no_port_overlap() {
   local dupes p
   dupes=$(grep -h '^fleet_init' tools/*_drill.sh 2>/dev/null \
@@ -3086,6 +3127,7 @@ if want check; then
   assert_msrv_is_stated_once
   assert_doc_inventories_are_runnable
   assert_no_port_overlap
+  assert_no_cross_repo_ports
   assert_scripts_parse
   assert_no_scope_overlap
   assert_server_flags_are_read

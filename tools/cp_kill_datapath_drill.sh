@@ -35,7 +35,7 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init $FLINT_DRILL_ROOT/flint-cpkilldp 6987 7571 7572 7573 7581 7582 7583 7914
+fleet_init $FLINT_DRILL_ROOT/flint-cpkilldp 6992 7571 7572 7573 7581 7582 7583 7914
 fleet_guard
 B=./target/release/flint-server
 CP=./target/release/flint-controlplane
@@ -85,10 +85,10 @@ done
 echo "  leader elected: node $LEADER"
 
 cpw 7571 CPADDPROXY 127.0.0.1:7914 >/dev/null
-cpw 7571 CPADDPAIR 127.0.0.1:6987 >/dev/null
+cpw 7571 CPADDPAIR 127.0.0.1:6992 >/dev/null
 cpw 7571 CPADDTENANT acme tok-acme acme 1 >/dev/null
-$B --port 6987 --engine rocks --data-dir "$D/m" 2>"${FLEET_SCOPE}server.log" &
-fleet_wait_listen 6987
+$B --port 6992 --engine rocks --data-dir "$D/m" 2>"${FLEET_SCOPE}server.log" &
+fleet_wait_listen 6992
 sleep 0.7
 $PX --port 7914 --control-plane 127.0.0.1:7571 --advertise 127.0.0.1:7914 2>"$D/px.log" &
 fleet_wait_listen 7914
