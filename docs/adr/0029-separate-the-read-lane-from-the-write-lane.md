@@ -276,17 +276,24 @@ first write take the read lane, and from the first write onward the rest of
 the run stays on the write lane, in order, on one FIFO. `SET k v; GET k` in
 one pipeline cannot split.
 
-**The same drill that found the harm, re-run against the implementation:**
+**The same drill that found the harm, re-run against the implementation. Both
+rows are the gate box — the platform the fleet runs on:**
 
 | | before (one shared FIFO) | after (lanes split) |
 |---|---|---|
-| quiet max | 0.919 ms | 0.396 ms |
-| under stall, p99.9 | **364.780 ms** | **0.206 ms** |
-| under stall, max | **555.385 ms** | **0.319 ms** |
+| quiet max | 0.919 ms | 1.593 ms |
+| under stall, p99 | 0.239 ms | 0.057 ms |
+| under stall, **p99.9** | **364.780 ms** | **0.143 ms** |
+| under stall, **max** | **555.385 ms** | **0.470 ms** |
 | reads over the quiet max | 13 of 3,000 | **0 of 3,000** |
 
-The worst read under a stall is now **below the quiet maximum**, and there are
-no excursions at all.
+**The worst read under a stall went from 555 ms to 0.470 ms** — three orders of
+magnitude — and there are no excursions above the quiet maximum at all. On
+macOS the same comparison is 555.385 → 0.319 ms worst case, 13 of 3,000 → 0.
+
+Note the direction of the p99 row: under a stall it is now *lower* than the
+quiet baseline, because the reads are no longer sharing a connection with
+anything. The number that mattered was never p99 — it is the row below it.
 
 **Both drills' preconditions inverted, and that is the mechanism's own
 signature.** `rw_isolation` and `read_under_stall` each asserted
