@@ -278,6 +278,29 @@ The residue, stated so it is not re-derived a third time:
   writes nothing, so `journalctl -u flint-nvme` cannot say which branch ran.
 - No path other than `chaos-cluster/up.sh` checks the mount at bring-up.
 
+**BOTH CLOSED 2026-09-07** — re-read rather than remembered, and one of them
+had already been done by someone without this list being updated:
+
+- The generated `nvme-mount.sh` now says which branch ran. The no-store branch
+  prints that `/var/lib/flint` STAYS ON THE ROOT VOLUME, names it as correct on
+  a type without a store and a 256x under-provisioned archive on a type with
+  one, and dumps `lsblk -dno NAME,MODEL` so the reader can tell which case they
+  are in. The mount branch names the device. So the journal can now answer it.
+- `scale-cluster/run.sh` asserts the DEVICE, not just the space. Its capacity
+  check already caught an unmounted store when the target did not FIT, and the
+  worse failure has nothing to do with fitting: a run on the root EBS volume
+  measures EBS and publishes the figure as instance storage — a wrong number
+  rather than a failed run. It now reads `lsblk MODEL` per node and refuses
+  unless `FLINT_SCALE_ALLOW_ROOT_VOLUME=1` declares the intent.
+
+**And one claim here was checked and is NOT what it looked like.** A grep for
+"Instance Storage" makes `spark-e2e/run.sh` look like a third checker; it is
+not. It does its own mount to `/mnt/flint` and falls through to the root volume
+when no store is present — printing `no instance store, using root volume`, so
+it says which branch ran, but it proceeds either way. That is defensible for an
+accelerator E2E test and is not a mount CHECK. Recorded because the grep that
+suggests otherwise is the obvious one to run.
+
 ## 2026-09-04 — what the archive holds, expressed in TIME
 
 This file records the two terms and which one prunes. It does not say what they

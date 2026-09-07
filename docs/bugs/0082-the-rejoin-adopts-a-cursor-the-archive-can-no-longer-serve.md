@@ -409,6 +409,44 @@ yet had an occurrence to speak about. **Left OPEN for that reason** — a
 diagnostic that has never fired has not been shown to work, and a bug whose
 symptom is absent is not a bug that has been explained.
 
+## 2026-09-07 — the agent surfaces the reason now; the fleet still cannot report one
+
+The section above ends "the question is no longer 'read the reseed reason', it
+is get rc.70 onto the playground and then read it". That is still the blocking
+step and it is a release decision, not a code one.
+
+What was NOT blocked was the consumer, and it turned out to be half-built:
+`world.rs` in the managed agent has parsed `last_reseed_reason` and
+`last_reseed_at_ms` since the instrumentation landed, and **nothing read
+them** — every other mention in that crate is a test fixture setting `None`.
+So the reason was being captured and was still invisible, which is the exact
+opacity this bug is about, one layer further along.
+
+The agent now raises `Insight::RecentReseed { node, reason, age_hours }` per
+node with a `flint_insight{kind="recent_reseed"}` gauge; the report already
+lists non-zero insight gauges, so it surfaces with no report change. It is
+OBSERVABILITY ONLY — the planner skips it explicitly, because a reseed has
+already happened and a repair would act on a finished event.
+
+Two decisions worth stating, because both could have gone the easy way:
+
+- **Not filtered by role or pair health.** The failure here leaves a pair at
+  one copy, so by the time anyone looks the node reporting it is usually a
+  healthy replica again. Filtering on "something is wrong now" would hide
+  precisely the case this exists for.
+- **Three outcomes for the age, not two.** A reason with no readable timestamp
+  is raised with the age UNKNOWN, because the source omits
+  `last_reseed_at_ms` on its own rather than inventing an instant. A stamp in
+  the FUTURE is also unknown: subtracting the other way underflows into a vast
+  age that reads as ancient, clamping to zero reads as just-happened, and both
+  are inventions — OPS-0134 is what one costs.
+
+So the reading path is ready and the emitting path is not. Until rc.70 is
+deployed the gauge will sit at 0 on every fleet, and that 0 means the binary
+cannot emit the field — not that no seat has reseeded. Same trap as the
+2026-09-05 reading, one layer up, and stated here so it is not mistaken for
+evidence a second time.
+
 ## 2026-09-06 — "nothing to read" was guaranteed, and the journal says more than the instrumentation could
 
 The section above records reading for the reseed reason on 2026-09-05 and

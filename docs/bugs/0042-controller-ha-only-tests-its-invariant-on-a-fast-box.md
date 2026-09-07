@@ -457,3 +457,37 @@ line surfaces on a pass, silence when there is none, and the cap holds.
 
 From the next gate run onward, a firing reaches the operator's retained
 console log instead of a terminated box's /tmp.
+
+## 2026-09-07 — that instrument has been aimed at hardware the gate stopped using
+
+The paragraph above rests on "every 16-vCPU gate run since 08-22 — dozens this
+week — ran this drill on exactly the hardware the race wants". That was true
+when written. **It stopped being true five days later, and nothing connected
+the two.**
+
+`packaging/aws/gate-box/run.sh` defaults to `c7i.xlarge`, which is **4 vCPU**.
+OPS-0107 ("the gate box is sized for a bottleneck it does not have") decided
+and applied that on **2026-09-02** — a well-reasoned cost decision that had
+nothing to do with this bug and no reason to know about it.
+
+So since 09-02 every routine gate run has exercised this drill on hardware
+where, by this file's own measurement, **the race does not start**: four runs
+on an 8-core laptop were green, and 4 vCPU is further from the 16 that produced
+the firing. The `EVIDENCE:` surfacing added on 08-27 is real and works; it has
+simply had nothing to surface, and its silence has been reading as "no firing"
+rather than "no opportunity".
+
+**What this changes about the plan.** "Where to start" step 1 says to reproduce
+on a box with >= 16 vCPU via the gate box; that now needs
+`FLINT_GATE_TYPE=c7i.4xlarge` (or larger) EXPLICITLY, because the default no
+longer qualifies. And step 3 — make the race start deterministically rather
+than hoping for it — stops being the tidier option and becomes the only one
+that survives a hardware decision taken elsewhere. A drill whose precondition
+depends on the box it happens to land on will be disarmed again by the next
+cost review, and nobody will notice that time either.
+
+**Not a criticism of OPS-0107, and the direction matters.** The gate box should
+be sized for the gate. What is wrong is that a drill silently depended on a
+property of the hardware nobody had written down as a requirement — the same
+shape as a check that passes because it examined nothing.
+
