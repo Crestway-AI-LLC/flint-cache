@@ -998,3 +998,41 @@ What this does and does not license:
 then `gh run view <id> --log-failed | grep -E "FAIL |GATES FAILED"` on each.
 Eight IDs is a few minutes. The failures this bug was filed about went unread
 for weeks because nobody had written that down.
+
+## 2026-09-06 — 150 consecutive runs, zero failures: a bound, not an answer
+
+The previous section said the rate was bounded from below by ten quiet days of
+`main` and that a quiet window could not distinguish "rarer than 2-in-60" from
+"something removed it incidentally". The cheap half of that is now done
+directly: `cold_start_roles` run **150 times consecutively on the gate box**,
+same Linux host the historical failures came from.
+
+**150 pass, 0 fail.**
+
+What that is worth, stated carefully, because a negative result invites two
+wrong readings:
+
+- **It is not a fix.** Nothing was changed. The instrumentation added on 08-27
+  to distinguish "replica loading" from "replica absent" has *still never
+  fired*, so the original question — which of the two the failure text was
+  reporting — remains exactly as unanswered as it was. The status line stays
+  OPEN and this section does not touch it.
+- **It is not proof the condition is gone.** 150 clean runs against a
+  historical 2-in-60 is not a null result at any comfortable confidence: if the
+  rate were unchanged, ~5 failures would be expected, and seeing zero says the
+  rate has dropped, not that it is zero. Under the same 2-in-60 model the
+  observed run is about a 1-in-150 outcome, which is evidence for a change and
+  no evidence at all about the mechanism.
+- **What it does buy** is the one thing the ten-day window could not: those
+  days were quiet partly because `main` is quiet, and a rate measured against
+  incidental traffic confounds the bug's frequency with how often the drill
+  ran. 150 deliberate back-to-back runs remove that confound. The remaining
+  ambiguity is only about *what changed between 08-27 and now*, not about
+  whether the sample was large enough.
+
+**So the bug stays open on its original half and the reproduction attempt is
+recorded as spent.** The next move is not another repetition — 150 more buys
+proportionally less than the first 150 — it is to find what landed between
+08-27 and 09-06 that could plausibly have closed the window, and the honest
+note is that nobody has looked. Until then this is a bug with a bound and no
+mechanism, which is worth less than it looks and more than an empty file.

@@ -680,7 +680,24 @@ fn main() {
                 snapshot.len(),
                 excluded
             );
-            let must_have_replicated_by = kill_ms.saturating_sub(lag_hard_ms + rpo_margin_ms);
+            // BUG-0120: anchored to the DEATH, not to `kill_ms`. `kill_ms` is
+            // stamped before `kill_master_hot()`, and on `Target::Attached`
+            // that call makes a master-discovery round trip and then an SSH
+            // kill before stamping `dead_us` — measured at 711ms, 720ms and
+            // 3304ms on one 5-host soak. Every write acked inside that window
+            // was served by a master still alive, so against `kill_ms` its
+            // depth `saturating_sub`s to 0 and its age never reaches
+            // `must_have_replicated_by`. Both measures read clean over exactly
+            // the interval where the loss happens.
+            //
+            // `dead_us` is stamped just AFTER the SIGKILL returned, so death
+            // <= dead_us and the depth is an OVER-estimate. That is the right
+            // direction for a durability measure: it may call a loss deeper
+            // than it was, it cannot call a deep loss shallow. `beyond_cap` is
+            // counted rather than asserted, so a conservative over-count costs
+            // nothing.
+            let dead_ms = dead_us / 1000;
+            let must_have_replicated_by = dead_ms.saturating_sub(lag_hard_ms + rpo_margin_ms);
             // Read back the way the CLIENT would: through the edge when
             // that is the path under test, so a proxy that has not chased
             // the promotion shows up as the data loss it would be for a
@@ -690,6 +707,7 @@ fn main() {
                 .or_else(|| cluster.master_client().ok())
                 .expect("oracle connect");
             let mut lost_here = 0u64;
+            let mut deepest_here = 0u64;
             // Keys the survivor would not answer for, even after retries. Not
             // loss, not health — an absence of evidence, which is reported
             // rather than swallowed so nobody mistakes a quiet run for a
@@ -866,7 +884,7 @@ fn main() {
                         beyond_cap += 1;
                     }
                     if seq > got {
-                        deepest_loss_ms = deepest_loss_ms.max(kill_ms.saturating_sub(at));
+                        deepest_here = deepest_here.max(loss_depth_ms(dead_us, at));
                     }
                 }
                 if got < *last_acked {
@@ -894,6 +912,7 @@ fn main() {
                 }
             }
             acked_lost_total += lost_here;
+            deepest_loss_ms = deepest_loss_ms.max(deepest_here);
             unverifiable_total += unverifiable;
             // The pair, always together. `{rto}` is the widest gap between
             // ACKS; `max_hold_ms` is the longest a single request went
@@ -908,7 +927,7 @@ fn main() {
                 "iter {iteration}: pair {pair_idx}: killed MASTER (writes in flight); {} {rto}ms{} \
                  [kill_ms={kill_ms} dead_us={dead_us} recovered_at_ms={recovered_at_ms} \
                  max_hold_ms={held}]; acked keys \
-                 regressed: {lost_here} (all within the {lag_hard_ms}ms cap){}",
+                 regressed: {lost_here} (deepest {deepest_here}ms before the death; cap {lag_hard_ms}ms){}",
                 if shared.edge.is_some() {
                     "client stall"
                 } else {
@@ -1195,11 +1214,13 @@ fn main() {
          --write-deadline-ms is what bounds this, docs/slo.md"
     );
     println!(
-        "  deepest acked-write loss: {deepest_loss_ms}ms before the kill (cap {lag_hard_ms}ms + {rpo_margin_ms}ms margin; older-than-cap losses are COUNTED, not failed — the cap bounds volume, not age)"
+        "  deepest acked-write loss: {deepest_loss_ms}ms before the DEATH (post-SIGKILL stamp, BUG-0120 — not the pre-kill stamp in the iteration lines; cap {lag_hard_ms}ms + {rpo_margin_ms}ms margin; older-than-cap losses are COUNTED, not failed — the cap bounds volume, not age)"
     );
     // Say plainly when a run proved nothing about the bound. A zero here is
-    // not a pass — it means no acked write was ever at risk, so the RPO
-    // check had nothing to judge.
+    // not a pass on its own: with nothing regressed it means no acked write
+    // was ever at risk, so the RPO check had nothing to judge; with losses
+    // present it means they were all acked at or after the death (BUG-0120).
+    // The branches below distinguish the two rather than printing one line.
     if beyond_cap > 0 {
         println!(
             "  NOTE: {beyond_cap} lost acked write(s) were older than the {lag_hard_ms}ms cap. \
@@ -1235,10 +1256,25 @@ fn main() {
         // set out to demonstrate. Seen on lag_cap, which passes
         // --stall-replica-ms 200 (BUG-0049) and shed 70 writes on the run
         // that printed it.
-        if stall_replica_ms == 0 {
+        if acked_lost_total > 0 {
+            // BUG-0120: this branch used to be unreachable-in-practice noise
+            // and instead printed "replication kept up throughout" on a run
+            // that had just regressed 80 acked keys, because the depth was
+            // measured from a stamp taken BEFORE the kill was sent and every
+            // loss saturated to 0. With the anchor corrected, depth 0 next to
+            // a non-zero loss count is a real and specific statement — every
+            // lost write was acked at or after the death stamp — and it is
+            // not evidence that replication kept up.
             println!(
-                "  NOTE: loss depth 0 means replication kept up throughout — the RPO bound was \
-                 not exercised by this run (try --stall-replica-ms)"
+                "  NOTE: loss depth 0 with {acked_lost_total} acked key(s) regressed: every lost \
+                 write was acked at or after the death stamp, so none of them aged unreplicated \
+                 for a measurable interval. This says nothing about whether replication kept up \
+                 generally — it says the losses were writes in flight at the kill."
+            );
+        } else if stall_replica_ms == 0 {
+            println!(
+                "  NOTE: loss depth 0 and nothing regressed — replication kept up throughout, so \
+                 the RPO bound was not exercised by this run (try --stall-replica-ms)"
             );
         } else if throttled_total > 0 {
             println!(
@@ -1262,6 +1298,24 @@ fn main() {
         );
     }
     println!("  final walk: {present} present, {missing} missing-or-regressed");
+}
+
+/// How long before the master's DEATH an acked write was acknowledged.
+///
+/// BUG-0120: the anchor is the whole content of this function. It was
+/// `kill_ms`, stamped before `kill_master_hot()` is called; on
+/// `Target::Attached` that call makes a master-discovery round trip and then
+/// an SSH kill before stamping `dead_us`, so a write acked in between was
+/// served by a master still alive and `saturating_sub` floored its depth to 0.
+/// Measured windows of 711ms, 720ms and 3304ms on one 5-host soak, against a
+/// 1000ms cap — so the depth read 0 over exactly the interval where the loss
+/// happens.
+///
+/// `dead_us` is stamped just AFTER the SIGKILL returned, so death <= dead_us
+/// and this over-estimates. That is the safe direction: it can call a loss
+/// deeper than it was, it cannot call a deep loss shallow.
+fn loss_depth_ms(dead_us: u64, acked_ms: u64) -> u64 {
+    (dead_us / 1000).saturating_sub(acked_ms)
 }
 
 #[cfg(test)]
@@ -1372,5 +1426,51 @@ mod edge_hint_tests {
                 "ca={ca:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod loss_depth_anchor {
+    use super::loss_depth_ms;
+
+    // The real stamps from soak-20260907T043640Z iter 603, the kill that lost
+    // 24 acked keys. The harness stamped kill_ms 3304ms before the SSH kill
+    // landed. A write acked anywhere in that window was served by a live
+    // master and then lost.
+    const KILL_MS: u64 = 1_788_758_279_425;
+    const DEAD_US: u64 = 1_788_758_282_729_372;
+
+    #[test]
+    fn a_write_acked_between_the_stamp_and_the_death_has_a_depth() {
+        let acked = KILL_MS + 4; // just after the harness stamped, long before death
+        let depth = loss_depth_ms(DEAD_US, acked);
+        assert_eq!(depth, 3300, "depth must be measured from the death");
+        // THE CONTROL: this is what the old anchor returned for the same
+        // write, and why the run reported `deepest acked-write loss: 0ms`
+        // while regressing 80 keys. If loss_depth_ms is ever re-anchored to
+        // kill_ms the assert above fails, because this is what it would give.
+        assert_eq!(KILL_MS.saturating_sub(acked), 0);
+    }
+
+    #[test]
+    fn the_window_bound_settles_the_two_smaller_kills_and_not_the_third() {
+        // iters 610 and 645: windows of 720ms and 711ms, both inside the
+        // 1000ms cap, so every write lost there is within it on the strict
+        // age reading. iter 603's 3304ms window is not.
+        let cap = 1000u64;
+        for (dead_us, kill_ms, settled) in [
+            (1_788_758_310_658_495u64, 1_788_758_309_938u64, true),
+            (1_788_758_440_015_308, 1_788_758_439_304, true),
+            (DEAD_US, KILL_MS, false),
+        ] {
+            // Deepest a write acked at-or-after `kill_ms` can possibly be.
+            let worst = loss_depth_ms(dead_us, kill_ms);
+            assert_eq!(worst < cap, settled, "window {worst}ms against cap {cap}ms");
+        }
+    }
+
+    #[test]
+    fn an_ack_after_the_death_floors_at_zero_rather_than_underflowing() {
+        assert_eq!(loss_depth_ms(DEAD_US, DEAD_US / 1000 + 50), 0);
     }
 }
