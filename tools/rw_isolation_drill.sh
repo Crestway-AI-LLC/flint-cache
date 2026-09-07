@@ -134,10 +134,12 @@ time.sleep(0.5)  # storm warmed up
 # the exact configuration it was written to reject. A precondition asserted
 # before the thing it is about can exist is not a check.
 #
-# Here the reader and the storm are both connected and both have sent
-# traffic, so pool_lanes is the real answer: 1 means they share one backend
-# FIFO and every latency number below is about a queue; 2 means they are on
-# different workers and none of it is.
+# IT EXPECTED 1 UNTIL ADR-0029 AND NOW EXPECTS 2. Both numbers were right in
+# their world: before the lane split, one connection meant the reader really
+# was queued behind the writer, which is what made the latency below a
+# statement about a queue. After it, the reader is on the read lane and the
+# writer on the write lane -- on the SAME worker, so this is not round-robin
+# scattering them -- and 2 is what proves the separation is in effect.
 probe = conn()
 probe.sendall(resp(["PROXYSTATS"]))
 raw = b""
@@ -149,12 +151,14 @@ lanes = next(
      if l.startswith("pool_lanes:")),
     None,
 )
-assert lanes == "1", (
-    f"expected ONE backend connection while both clients are live, got {lanes!r}. "
-    "With more than one the reader and the writer are on different workers and "
-    "nothing below tests isolation on a shared FIFO."
+assert lanes == "2", (
+    f"expected TWO backend connections while both clients are live, got {lanes!r}. "
+    "One worker (--workers 1) and one namespace, so the only thing that can make "
+    "two is ADR-0029's read/write lane split. A 1 means the separation is not in "
+    "effect; a 3 or more means something else opened a connection and this is no "
+    "longer a two-party test."
 )
-print(f"shared backend FIFO confirmed while both clients are live: pool_lanes={lanes}")
+print(f"lanes separated while both clients are live: pool_lanes={lanes}")
 
 under = []
 sample_reads(600, under)

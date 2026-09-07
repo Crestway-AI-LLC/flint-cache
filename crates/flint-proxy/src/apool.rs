@@ -432,6 +432,7 @@ mod tests {
         run(async {
             let addr = handshake_backend().await;
             let key = Key {
+                lane: Lane::Write,
                 addr: addr.clone(),
                 ns: b"0".to_vec(),
                 async_writes: false,
@@ -484,14 +485,34 @@ mod tests {
     }
 }
 
+/// Which of a worker's two queues to a backend a command belongs on
+/// (ADR-0029).
+///
+/// RESP correlates by POSITION, so one connection is a strict FIFO and a slow
+/// command delays everything behind it whatever kind it is. Measured on the
+/// gate box: behind a stalled write, read p99 stayed flat at 0.239 ms while
+/// one read in 230 waited 555 ms. Two queues, so a stalled write cannot be in
+/// front of a read.
+///
+/// This is a DIMENSION ON AN EXISTING KEY, not a second pool: connections are
+/// already per worker per (address, namespace, async-writes) and dialled on
+/// demand, so a namespace that only ever reads never opens a write lane.
+#[derive(PartialEq, Eq, Hash, Clone, Copy, Debug)]
+pub(crate) enum Lane {
+    Read,
+    Write,
+}
+
 /// A backend connection's identity within one worker. Namespace and the
 /// async-writes flag are part of it because `FLINTNS` pins the connection at
-/// open: a connection is only ever reusable for the SAME pair.
+/// open: a connection is only ever reusable for the SAME pair. Lane is part
+/// of it for ADR-0029.
 #[derive(PartialEq, Eq, Hash, Clone)]
 pub(crate) struct Key {
     pub addr: String,
     pub ns: Vec<u8>,
     pub async_writes: bool,
+    pub lane: Lane,
 }
 
 thread_local! {

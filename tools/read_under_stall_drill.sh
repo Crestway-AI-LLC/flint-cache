@@ -166,6 +166,14 @@ while time.time() - t0 < BUDGET:
         break
 
 # ---- the precondition, where the condition can exist ----------------------
+# AFTER ADR-0029 THIS EXPECTS TWO, AND THE INVERSION IS THE POINT. Before the
+# lane split, one backend connection meant the reader was queued behind the
+# writer -- which is what this drill measured, and it found reads waiting
+# 555ms behind a stalled write. With the split there is no shared FIFO to
+# queue in: the reader is on the read lane, the writer on the write lane, both
+# on the one worker. So `pool_lanes == 2` is now the precondition that makes
+# the numbers below mean anything, and a 1 would mean the separation is not in
+# effect and the measurement is of the old world.
 probe = conn()
 probe.sendall(resp(["PROXYSTATS"]))
 raw = b""
@@ -192,11 +200,11 @@ print(f"  writes landed={wrote[0]}  peak writes_delayed_soft={peak['delayed']}  
       f"pool_lanes={lanes}")
 
 fail = []
-# CONTROL 1: one backend FIFO, or the reader never queued behind the writer
-# and every number above is about a queue that does not exist.
-if lanes != "1":
-    fail.append(f"pool_lanes={lanes!r}, want 1 — reader and writer were not "
-                "sharing a backend connection, so this measures nothing")
+# CONTROL 1: two lanes, or the separation under test is not in effect.
+if lanes != "2":
+    fail.append(f"pool_lanes={lanes!r}, want 2 — the reader and the writer are "
+                "not on separate lanes, so ADR-0029's separation is not in "
+                "effect and this measures the world before it")
 # CONTROL 2: the stall has to have HAPPENED. Without this a flat read latency
 # is indistinguishable from a storm that never reached back-pressure, and the
 # drill would report the reassuring answer for the wrong reason.
@@ -223,9 +231,10 @@ b99, u99 = pct(base, 99), pct(under, 99)
 ratio = (u99 / b99) if b99 > 0 else float("inf")
 print(f"  read p99 under a stall is {ratio:.1f}x the quiet baseline "
       f"({b99:.3f}ms -> {u99:.3f}ms)")
-print("MEASURED: controls hold (one shared FIFO, stall confirmed). The ratio "
-      "above is ADR-0029's gating number.")
+print("MEASURED: controls hold (lanes separated, stall confirmed). Before "
+      "ADR-0029 this ran on ONE shared FIFO and read p99.9 was 364.780ms "
+      "with a 555.385ms worst case; the tail is what the split removes.")
 PY
 [ $? -eq 0 ] || exit 1
-echo "PASS: read-under-stall measured on a shared backend FIFO, with both"
-echo "      controls armed — see the ratio above (ADR-0029)"
+echo "PASS: read-under-stall measured with the lanes separated and both"
+echo "      controls armed — see the tail above (ADR-0029)"

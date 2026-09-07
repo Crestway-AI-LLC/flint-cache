@@ -1,9 +1,13 @@
 # ADR-0029 — Separate the read lane from the write lane at the proxy's connection key
 
-**Status:** **PROPOSED 2026-09-06.** The mechanism is small and the correctness
-condition on it is not; the one number that should decide whether it ships by
-default has never been measured, and this ADR says which number and why it was
-not assumed.
+**Status:** **ACCEPTED 2026-09-06** (proposed the same day). Accepted on the
+measurement below rather than on the argument above: on the gate box, read
+**p99 stayed at 0.239 ms** — flat — while **one read in 230 waited 555 ms**
+behind a stalled write on a shared backend FIFO.
+
+The mechanism is small and the correctness condition on it is not, which is
+why the barrier in decision 2 is specified here rather than left to the
+implementation.
 
 ## Where this came from
 
@@ -254,6 +258,41 @@ stalls.
 
 **Recommendation, on this evidence: ACCEPT.** The status stays PROPOSED
 because that is not mine to change.
+
+## IMPLEMENTED 2026-09-06, and the tail is gone
+
+`Lane { Read, Write }` joined `apool::Key`; `Backends::key/call/lease` take
+one; `drop_conn` retires **both** (a demoted master is wrong for either, and
+retiring one would leave the other serving a stale route); `forward` picks the
+lane from the shared command classifier, with anything that is not a plain
+read going on the write lane — classifying an unknown verb as a read would put
+it in front of the reads it must not delay.
+
+**The barrier lives in exactly one place**, which is the part worth reviewing:
+`prefetch_run` is the only path where a client's write and its later read are
+in flight at once — everywhere else a reply is awaited before the next command
+is read. There the lane is **sticky once a write appears**: reads before the
+first write take the read lane, and from the first write onward the rest of
+the run stays on the write lane, in order, on one FIFO. `SET k v; GET k` in
+one pipeline cannot split.
+
+**The same drill that found the harm, re-run against the implementation:**
+
+| | before (one shared FIFO) | after (lanes split) |
+|---|---|---|
+| quiet max | 0.919 ms | 0.396 ms |
+| under stall, p99.9 | **364.780 ms** | **0.206 ms** |
+| under stall, max | **555.385 ms** | **0.319 ms** |
+| reads over the quiet max | 13 of 3,000 | **0 of 3,000** |
+
+The worst read under a stall is now **below the quiet maximum**, and there are
+no excursions at all.
+
+**Both drills' preconditions inverted, and that is the mechanism's own
+signature.** `rw_isolation` and `read_under_stall` each asserted
+`pool_lanes == 1` — one worker, one namespace, so a shared FIFO. They now
+assert `2`. Nothing else on that fleet can produce a second connection, so the
+number is the separation.
 
 ## What would retire this item
 

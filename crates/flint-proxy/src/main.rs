@@ -1306,20 +1306,26 @@ impl Backends {
     }
 
     /// A connection is only reusable for the SAME (address, namespace,
-    /// async-writes) triple, because `FLINTNS` pins it at open.
-    fn key(&self, addr: &str) -> apool::Key {
+    /// async-writes, lane) tuple: `FLINTNS` pins the first three at open, and
+    /// the lane is ADR-0029's separation.
+    fn key(&self, addr: &str, lane: apool::Lane) -> apool::Key {
         apool::Key {
             addr: addr.to_string(),
             ns: self.ns.clone(),
             async_writes: self.async_writes,
+            lane,
         }
     }
 
     /// Discard connections to `addr` (stale-routing recovery: the next call
     /// dials whatever the refreshed masters map says). Both the shared one and
     /// any private one, because a demoted master is wrong for either.
+    /// BOTH LANES. A demoted master is wrong for reads and for writes alike,
+    /// and retiring one would leave the other serving a stale route — which is
+    /// the failure this function exists to prevent, half-done.
     fn drop_conn(&mut self, addr: &str) {
-        apool::retire(&self.key(addr));
+        apool::retire(&self.key(addr, apool::Lane::Read));
+        apool::retire(&self.key(addr, apool::Lane::Write));
         if let Some(c) = self.private.remove(addr) {
             c.shutdown();
         }
@@ -1350,9 +1356,14 @@ impl Backends {
         }
     }
 
-    /// Keyed traffic: on this worker's shared connection.
-    async fn call(&mut self, addr: &str, frame: &[u8]) -> std::io::Result<Value> {
-        let key = self.key(addr);
+    /// Keyed traffic: on this worker's shared connection for `lane`.
+    async fn call(
+        &mut self,
+        addr: &str,
+        frame: &[u8],
+        lane: apool::Lane,
+    ) -> std::io::Result<Value> {
+        let key = self.key(addr, lane);
         let conn = apool::conn_for(&key, &self.tls).await?;
         let rx = conn.stage(frame)?;
         conn.flush().await?;
@@ -1363,8 +1374,12 @@ impl Backends {
     /// onto ONE connection. Picking a connection per COMMAND instead scatters
     /// a client's pipeline and destroys the batching (see ADR-0020's
     /// amendment, and the fleet run that measured batch depth 1.04).
-    async fn lease(&mut self, addr: &str) -> std::io::Result<Rc<apool::AsyncConn>> {
-        apool::conn_for(&self.key(addr), &self.tls).await
+    async fn lease(
+        &mut self,
+        addr: &str,
+        lane: apool::Lane,
+    ) -> std::io::Result<Rc<apool::AsyncConn>> {
+        apool::conn_for(&self.key(addr, lane), &self.tls).await
     }
 
     /// One command on a connection belonging to THIS client alone, with an
@@ -1378,7 +1393,12 @@ impl Backends {
         let conn = match self.private.get(addr) {
             Some(c) if !c.is_dead() => c.clone(),
             _ => {
-                let c = apool::dial_private(&self.key(addr), &self.tls).await?;
+                // A private connection is this client's alone and is never
+                // shared, so the lane cannot matter for queueing. Write is
+                // named rather than defaulted because a transaction may
+                // write, and a reader of this key should not have to work out
+                // which arbitrary value was chosen.
+                let c = apool::dial_private(&self.key(addr, apool::Lane::Write), &self.tls).await?;
                 self.private.insert(addr.to_string(), c.clone());
                 c
             }
@@ -1566,6 +1586,25 @@ async fn forward(
 ) -> Value {
     let slot = route_key(args).map(slot_for_key);
     let deadline = Instant::now() + RETRY_BUDGET;
+    // ADR-0029: which of this worker's two queues to the backend. A write, or
+    // anything that is not a plain read, goes on the write lane -- classifying
+    // an unknown verb as a read would put it in front of the reads it must not
+    // delay, and the classifier is the same one the server and the metering
+    // share.
+    //
+    // NO BARRIER IS NEEDED HERE. `forward` handles ONE command and awaits its
+    // reply before this client's next command is read, so a write is complete
+    // before a following read is issued and cannot be overtaken. The barrier
+    // that ADR-0029 specifies belongs in `prefetch_run`, which is the only
+    // place a client's write and its later read are in flight at once.
+    let lane = if args
+        .first()
+        .is_some_and(|n| flint_commands::is_read_command(n))
+    {
+        apool::Lane::Read
+    } else {
+        apool::Lane::Write
+    };
     // D7: prefer a replica for this read; cleared to fall back to the master
     // if a replica attempt errors, so a dead/lagging replica never fails a
     // read.
@@ -1607,7 +1646,7 @@ async fn forward(
         };
 
         match backends
-            .call(&addr, frame)
+            .call(&addr, frame, lane)
             .await
             .map(|v| repair_reply(args, v))
         {
@@ -3130,7 +3169,24 @@ async fn prefetch_run(
     // and scatter this run across every connection in the lane — which is
     // exactly what happened when the lane widened to 8, and it cost the
     // batching the pass exists to create.
-    let mut leases: HashMap<String, Rc<apool::AsyncConn>> = HashMap::new();
+    let mut leases: HashMap<(String, apool::Lane), Rc<apool::AsyncConn>> = HashMap::new();
+    // ADR-0029'S BARRIER, AND IT IS A CORRECTNESS CONDITION, NOT A TUNING
+    // KNOB. This pass is the one place a client's write and its later read are
+    // in flight at the same time -- everywhere else a reply is awaited before
+    // the next command is read. Splitting the run across two connections would
+    // let `GET k` overtake the `SET k v` in front of it and return the old
+    // value: read-your-own-writes, which every client assumes and nothing here
+    // would restore.
+    //
+    // So the lane is sticky once a write appears. Reads before the first write
+    // take the read lane and are genuinely isolated; from the first write
+    // onward the whole rest of the run stays on the write lane, in order, on
+    // one FIFO.
+    //
+    // The consequence is worth stating because it decides who benefits: a
+    // client that alternates SET/GET in one pipeline gets nothing from this,
+    // and a read-only pipeline -- the common cache shape -- gets all of it.
+    let mut saw_write = false;
     for (i, (args, raw)) in cmds.iter().enumerate() {
         if i >= MAX_PREFETCH {
             break;
@@ -3170,13 +3226,20 @@ async fn prefetch_run(
                 topo.fanout_timeout,
             )
         });
-        let lease = match leases.get(&addr) {
+        saw_write |= is_write;
+        let lane = if saw_write {
+            apool::Lane::Write
+        } else {
+            apool::Lane::Read
+        };
+        let lkey = (addr.clone(), lane);
+        let lease = match leases.get(&lkey) {
             Some(l) => l,
-            None => match b.lease(&addr).await {
+            None => match b.lease(&addr, lane).await {
                 // Dial failed: leave it to `forward`, which dials and retries
                 // with the full failover budget.
                 Err(_) => break,
-                Ok(l) => leases.entry(addr.clone()).or_insert(l),
+                Ok(l) => leases.entry(lkey).or_insert(l),
             },
         };
         match lease.stage(raw) {
