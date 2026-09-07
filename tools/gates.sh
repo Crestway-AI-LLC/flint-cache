@@ -210,7 +210,7 @@ CORE_EXCLUSIVE="${FLINT_CORE_EXCLUSIVE:-disk_pressure disk_selffill evictable_pr
 
 CORE="${FLINT_CORE_ORDER:-kill_order restart repl kill_release failover proxy slot_migrate slot_map rebalance_execute
       bloom ns_escape coproc_cred coproc_channel coproc_family family_route family_route_cp coproc_forward coproc_budget coproc_exempt coproc_vec coproc_vec_tls coproc_vec_rebuild
-      tenant_quota token_rotation cert_reload_fleet controlplane_ha
+      tenant_quota token_rotation cert_reload_fleet controlplane_ha cp_kill_datapath
       decommission config_file federation_plumbing disk_pressure disk_selffill evictable_pressure ingest_saturation ctl_error
       client_compat proxy_registry reseed lag_cap widowed_grace replica_starvation managed_slow_sync controller
       promote_notice fleet_guard ctl_cpha upgrade anti_affinity attached_chaos
