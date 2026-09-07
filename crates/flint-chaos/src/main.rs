@@ -370,6 +370,19 @@ fn main() {
     // finding resting on these has reported nothing; that is the whole point
     // of counting them apart.
     let mut ambiguous_at_boundary: u64 = 0;
+    // BUG-0120, second half: `lost_here` is decided by `got < last_acked`, and
+    // `last_acked` is the max seq over ALL acks — including ones SENT after the
+    // master was already dead, which `classify_send` returns as
+    // `Served::NewMaster` and the loop skips. So the loss COUNT and the loss
+    // DEPTH were computed over different populations, and a key whose whole
+    // surplus was post-death sends counted toward the regression total while
+    // contributing to no depth measure and appearing in no counter.
+    //
+    // That case is not the async tail. It is the new master failing to hold a
+    // write it acked, which is the more serious reading, and it was being
+    // folded silently into a number the run then annotated as within the cap.
+    let mut lost_unattributed: u64 = 0;
+    let mut post_death_surplus: u64 = 0;
 
     // BUG-0014: the ledger boundary from the PREVIOUS master kill, carried
     // across iterations. The replica-kill assertion needs it to say whether a
@@ -822,6 +835,10 @@ fn main() {
                 // longer exists. The assertion stays because the VOLUME bound
                 // is still worth asserting, not because an age bound is
                 // promised anywhere.
+                // Per KEY: did any ack this loop actually judged sit above the
+                // survivor's value? If not, the regression counted below is
+                // invisible to every depth measure (BUG-0120).
+                let mut measured_surplus = 0u64;
                 for &(seq, sent_us, at) in acked_at {
                     // The writer may have re-acked this key AFTER the kill;
                     // those acks belong to the new master and say nothing
@@ -832,6 +849,12 @@ fn main() {
                     // flight at the kill and acked afterwards — can.
                     let served = classify_send(sent_us, dead_us);
                     if served == Served::NewMaster {
+                        // Counted now (BUG-0120) rather than silently dropped:
+                        // this is the surplus that `lost_here` sees and the
+                        // depth measures cannot.
+                        if seq > got {
+                            post_death_surplus += 1;
+                        }
                         continue;
                     }
                     // THE BOUNDARY ITSELF IS NEITHER, AND SAYS SO.
@@ -884,11 +907,18 @@ fn main() {
                         beyond_cap += 1;
                     }
                     if seq > got {
+                        measured_surplus += 1;
                         deepest_here = deepest_here.max(loss_depth_ms(dead_us, at));
                     }
                 }
                 if got < *last_acked {
                     lost_here += 1;
+                    // No pre-death ack above the survivor's value means every
+                    // measure that judges this loss skipped it. Say so rather
+                    // than letting it inherit the reassurance the others earn.
+                    if measured_surplus == 0 {
+                        lost_unattributed += 1;
+                    }
                 }
                 // Retire what this failover lost, ALWAYS. Entries acked
                 // before the kill and above what the survivor holds are gone;
@@ -1243,6 +1273,24 @@ fn main() {
              death stamp, to the microsecond. Which master served them is not recorded, so they \
              were excluded from the loss measurements rather than attributed to either. This is \
              expected to be rare; if it is not, the clock is coarser than the race."
+        );
+    }
+    // ALWAYS PRINTED, INCLUDING ZERO — same reason as the boundary-tie count
+    // above. A run where no regression escaped the depth measures and a run
+    // whose accounting never executed must not look identical.
+    println!(
+        "  regressions no depth measure could judge: {lost_unattributed} \
+         (post-death surplus acks seen: {post_death_surplus})"
+    );
+    if lost_unattributed > 0 {
+        println!(
+            "  NOTE: {lost_unattributed} of the regressed key(s) had NO ack above the survivor's \
+             value that was sent before the death stamp. Every such ack was sent after the master \
+             was already dead, so `classify_send` returned NewMaster and both the depth and the \
+             cap check skipped it. The RPO numbers above say nothing about these keys, and this \
+             is not the async tail: a write acked after the old master died and then absent from \
+             the survivor is the NEW master failing to hold what it acknowledged. Judge it \
+             separately (BUG-0120)."
         );
     }
     if deepest_loss_ms == 0 {

@@ -1,7 +1,8 @@
 # BUG-0120 — the loss-depth measure was anchored to a stamp taken before the kill was sent
 
-Status: OPEN (instrument fixed; 56 of the 80 writes in question are settled by
-hand from the fixed reading, 24 are not — see "The verdict on the 80")
+Status: OPEN (instrument fixed, in two halves; of the 80 writes in question 56
+are settled by hand from the fixed reading and 24 are not, with an unmeasured
+residue — see "The verdict on the 80")
 Found: 2026-09-06, verifying the M2 failover soak's batch-3 result
 Component: `crates/flint-chaos/src/main.rs`
 
@@ -88,6 +89,15 @@ That makes the chain tight:
 not owe; 24 cannot be judged from what the run recorded.** At most 2 of the 80
 carry the ambiguity caveat, since only 2 entries run-wide were excluded.
 
+**QUALIFIED, and the qualification is the second defect below.** That verdict
+covers the losses attributable to the OLD master. `classify_send` has three
+outcomes, not two, and the third — a send stamped after the death,
+`Served::NewMaster` — is skipped by the loop and counted nowhere. So a key whose
+every surplus ack was sent post-death counts toward the 80 and contributes to no
+depth measure. Batch 3 does not record how many such keys there were, so the
+residue is unmeasured rather than zero, and the 56 is a floor on what is
+explained rather than a complete account.
+
 Two further facts belong with that verdict. The run's `final walk: 300 present, 0
 missing-or-regressed` — nothing was missing at the end. And loss tracks slow
 failover: the three lossy kills are the three worst RTOs in 401 (6002, 3568,
@@ -126,6 +136,41 @@ Three changes, all in the instrument; no product code is touched.
    nothing evaluated.
 3. **Name the anchor in the summary**, so the reported depth says which instant it
    is measured from and cannot be re-read as distance from the harness's stamp.
+
+## The second defect: the count and the depth judge different populations
+
+The loss COUNT is `if got < *last_acked`, and `last_acked` is the max seq over
+**every** ack recorded for the key. The loss DEPTH is computed inside a loop that
+first does:
+
+    let served = classify_send(sent_us, dead_us);
+    if served == Served::NewMaster { continue; }
+
+`classify_send` returns `MaybeOldMaster` below the death stamp, `Ambiguous` at
+it, `NewMaster` above it. Only the first is measured. The `Ambiguous` case is
+skipped AND counted, and reported every run — that was done deliberately for
+BUG-0014, and the reasoning is right. The `NewMaster` case was skipped and
+counted by nothing.
+
+So the two numbers are computed over different populations, and the difference is
+the most serious case rather than the most benign one. A write acked after the
+old master was already dead, and then absent from the survivor, is not the async
+tail: it is the NEW master failing to hold what it acknowledged. Today such a key
+lands in the regression total, inherits the reassurance the depth measures earn
+for everything else, and leaves no trace of its own.
+
+Fixed by counting both halves: `post_death_surplus` (acks above the survivor's
+value that were sent after the death) and `lost_unattributed` (keys that
+regressed with no pre-death ack above the survivor at all). Both print every run
+including zero — the same discipline the boundary-tie count already follows, and
+for the same reason: a run where nothing escaped and a run whose accounting never
+executed must not look identical. A non-zero `lost_unattributed` prints a note
+saying plainly that the RPO numbers say nothing about those keys.
+
+No test is added for the three-way split itself: `classify_send`'s outcomes are
+already pinned at the boundary in `oracle.rs`, including `Ambiguous` at equality
+and both extremes. What was missing was never the classification — it was the
+accounting downstream of it.
 
 ## Two more instances, found by sweeping for the shape
 
