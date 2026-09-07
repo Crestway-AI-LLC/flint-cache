@@ -108,6 +108,27 @@ echo "  shed $SHED write(s) — the cap was observed to bite"
 LOST=$(echo "$OUT" | sed -n 's/.*acked keys regressed across master kills: \([0-9]*\).*/\1/p')
 echo "$OUT" | grep -q "corruption: 0  time-travel: 0  cross-key: 0" \
   || { echo "FAIL: corruption/time-travel/cross-key under a shedding master"; exit 1; }
-echo "  no shed write was ever counted as acked (acked regressions: ${LOST:-0}, all within the cap)"
+# BUG-0120: this line used to read "no shed write was ever counted as acked
+# (... all within the cap)" and asserted NEITHER half. It printed the same
+# sentence whatever $LOST held, and `${LOST:-0}` meant a summary line that had
+# moved read as a clean zero — the vacuous-check shape this drill exists to
+# catch elsewhere. Two capability asserts and a measured statement instead.
+[ -n "$LOST" ] || {
+  echo "FAIL: could not read 'acked keys regressed across master kills' from the chaos summary."
+  echo "      The loss check here would be vacuous, and \${LOST:-0} would have printed a zero."
+  exit 1
+}
+DEPTH=$(echo "$OUT" | sed -n 's/.*deepest acked-write loss: \([0-9]*\)ms.*/\1/p')
+[ -n "$DEPTH" ] || {
+  echo "FAIL: could not read 'deepest acked-write loss' from the chaos summary."
+  exit 1
+}
+echo "  acked regressions: $LOST, deepest ${DEPTH}ms before the death"
+echo "      REPORTED, not asserted: the cap bounds the VOLUME at risk, not the age"
+echo "      of a write already acked (docs/failover.md). BUG-0120."
 
-echo "PASS: lag cap drill — at a 5ms cap the master shed $SHED write(s) with -THROTTLED, the ledger oracle still passed, and nothing shed was mistaken for data loss"
+# "nothing shed was mistaken for data loss" was the third unasserted claim on
+# this path (BUG-0120). What IS asserted is the oracle's own verdict --
+# corruption/time-travel/cross-key all zero -- so the PASS says that and
+# reports the loss counters rather than drawing a conclusion from them.
+echo "PASS: lag cap drill — at a 5ms cap the master shed $SHED write(s) with -THROTTLED, the ledger oracle passed clean (corruption/time-travel/cross-key all 0), with $LOST acked regression(s) at depth ${DEPTH}ms"

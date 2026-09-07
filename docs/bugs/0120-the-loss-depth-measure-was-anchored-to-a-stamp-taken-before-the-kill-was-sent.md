@@ -127,6 +127,34 @@ Three changes, all in the instrument; no product code is touched.
 3. **Name the anchor in the summary**, so the reported depth says which instant it
    is measured from and cannot be re-read as distance from the harness's stamp.
 
+## Two more instances, found by sweeping for the shape
+
+Grepping the repo for consumers of the changed strings turned up the same defect
+twice more, both fixed here:
+
+- **`tools/lag_cap_drill.sh`** printed `no shed write was ever counted as acked
+  (acked regressions: ${LOST:-0}, all within the cap)` and asserted neither
+  half. The sentence rendered identically whatever `$LOST` held; and the
+  `${LOST:-0}` default meant that if the summary line ever moved, the failed
+  `sed` would print a clean **zero** rather than admitting it read nothing —
+  the vacuous-check shape this drill exists to catch elsewhere. Its PASS line
+  made a third unasserted claim, "nothing shed was mistaken for data loss".
+  Replaced with two capability asserts (both counters must actually parse) and
+  a measured statement; the PASS now claims only the oracle verdict it really
+  checks.
+- **`crates/flint-chaos/src/cluster.rs`** carried the right instinct about the
+  wrong case. Its comment says every recorded run reported `deepest acked-write
+  loss: 0ms`, that this is not evidence of correctness, and that the cause is
+  loopback replication acking in ~0.2ms — "including a 7-host run over a real
+  network". That explains the LOCAL zeros. The multi-host run it cites as its
+  strongest case is exactly where the anchor bug applies instead: there the
+  harness did create the condition and the instrument could not see it.
+  Corrected in place rather than deleted, since the local reasoning still holds.
+
+The sweep is worth repeating whenever an output string changes: `grep` for the
+literal, and read every consumer for a claim next to the number rather than only
+for a parse that might break.
+
 ## What this does not settle
 
 **Iter 603's 24 keys stay open**, and the fix cannot be applied retroactively —

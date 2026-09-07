@@ -1136,6 +1136,15 @@ fn spawn_node(port: u16, dir: &str, replica_of: Option<u16>) -> Child {
 /// so the unreplicated suffix closes inside the measurement's resolution and
 /// lag never approaches the 1000ms cap.
 ///
+/// CORRECTED 2026-09-06 (BUG-0120): that explains the LOCAL zeros. On a
+/// multi-host run the zero had a second cause entirely — the depth was
+/// anchored to a stamp taken before the kill was dispatched, and on
+/// `Target::Attached` the dispatch is a discovery round trip plus an SSH hop
+/// (711-3304ms measured), so any write acked in that window saturated to 0
+/// however deep it truly was. So the sentence above was right about this
+/// drill and wrong about the 7-host run it cites as its strongest case: there
+/// the harness DID create the condition and the instrument could not see it.
+///
 /// Freezing the replica for a chosen interval produces exactly the regime the
 /// RPO claim describes: a master acking writes its replica has not taken yet.
 /// Under the liveness window (2s) a short freeze leaves the replica still
