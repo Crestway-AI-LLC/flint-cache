@@ -355,6 +355,22 @@ fn main() {
     let mut unverifiable_total = 0u64;
     let mut injected = 0u64;
     let mut rtos: Vec<u64> = Vec::new();
+    // THE TWO NUMBERS THE RTO WAS HIDING (BUG-0121).
+    //
+    // On the direct path the RTO is `first post-outage ack - kill_ms`, and
+    // `kill_ms` is stamped BEFORE the kill is dispatched. On a multi-host
+    // fleet that dispatch is a master-discovery round trip plus an SSH hop,
+    // so the reported figure is dispatch PLUS recovery with nothing
+    // separating them. Measured over 401 master kills: dispatch p50 712ms
+    // against a reported RTO p50 of 572ms -- the number was mostly SSH.
+    //
+    // `stalls` is the same quantity the EDGE path already reports as its RTO:
+    // the worst gap between consecutive ACKS, which needs no kill stamp at
+    // all and is what a client actually experienced. It has been computed on
+    // the direct path all along (the writer updates it whenever a kill is
+    // armed) and never surfaced.
+    let mut stalls: Vec<u64> = Vec::new();
+    let mut dispatches: Vec<u64> = Vec::new();
     // Worst single unanswered request across every master kill — the figure
     // the write deadline bounds, reported next to the ack-gap so the two are
     // never confused for each other (#186).
@@ -646,8 +662,12 @@ fn main() {
             } else {
                 "kill to first post-kill ack"
             };
+            let dispatch_ms = (dead_us / 1000).saturating_sub(kill_ms);
+            let stall_ms = shared.max_stall_ms.load(Ordering::SeqCst);
             if !harness_promoted {
                 rtos.push(rto);
+                stalls.push(stall_ms);
+                dispatches.push(dispatch_ms);
                 // The HOLD belongs in the breach message, not only in the
                 // summary. This assert fires before the per-iteration line
                 // prints, so on soak run 26 a 43850ms breach arrived with no
@@ -1043,7 +1063,7 @@ fn main() {
             println!(
                 "iter {iteration}: pair {pair_idx}: killed MASTER (writes in flight); {} {rto}ms{} \
                  [kill_ms={kill_ms} dead_us={dead_us} recovered_at_ms={recovered_at_ms} \
-                 max_hold_ms={held}]; acked keys \
+                 max_hold_ms={held} dispatch={dispatch_ms}ms client_stall={stall_ms}ms]; acked keys \
                  regressed: {lost_here} (deepest {deepest_here}ms before the death; cap {lag_hard_ms}ms){vol_note}{}",
                 if shared.edge.is_some() {
                     "client stall"
@@ -1324,6 +1344,42 @@ fn main() {
             "  {label} over {} promotion(s): p50 {p50}ms, worst {worst}ms (budget {rto_budget_ms}ms, docs/slo.md)",
             sorted.len()
         );
+        // WHAT THAT NUMBER IS MADE OF, on the direct path (BUG-0121). The
+        // edge path's figure is already the inter-ack gap, so these two would
+        // restate it; there they are printed for the dispatch alone.
+        let mut sd = dispatches.clone();
+        sd.sort_unstable();
+        let (dp50, dworst) = (sd[sd.len() / 2], *sd.last().expect("non-empty"));
+        let mut ss = stalls.clone();
+        ss.sort_unstable();
+        let (sp50, sworst) = (ss[ss.len() / 2], *ss.last().expect("non-empty"));
+        if edge.is_some() {
+            println!(
+                "  kill dispatch (stamp to SIGKILL returning): p50 {dp50}ms, worst {dworst}ms"
+            );
+        } else {
+            println!(
+                "  of which kill DISPATCH (kill_ms to the SIGKILL returning): p50 {dp50}ms, \
+                 worst {dworst}ms — the master is alive and serving for this, so it is in the \
+                 figure above and is not outage"
+            );
+            println!(
+                "  client-observed outage (worst gap between ACKS, no kill stamp): p50 {sp50}ms, \
+                 worst {sworst}ms — this is what a client experienced, and what the edge path \
+                 already reports as its RTO"
+            );
+            // NEITHER STAMP IS THE DEATH, and the run must say so rather than
+            // let a reader pick whichever suits. `kill_ms` precedes dispatch;
+            // `dead_us` is taken when the SIGKILL RETURNS, which is after the
+            // signal landed -- anchoring to it yields negative recovery times
+            // (measured: p50 -144ms over 401 kills). The death is inside the
+            // dispatch window and these stamps cannot resolve it further.
+            println!(
+                "  NOTE: the death is somewhere inside that dispatch window. kill_ms is before \
+                 it and dead_us is after it, so neither bounds the failover tightly; the \
+                 outage line above is the one that needs no death stamp."
+            );
+        }
     }
     // The figure above is a gap between ACKS, so it cannot separate "one write
     // was held for the whole window" from "writes were refused promptly for
