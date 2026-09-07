@@ -5166,11 +5166,8 @@ fn add_replica(inv: &Inventory, inventory_path: &str, pair_ref: &str, new: &str)
             .position(|p| p.iter().any(|a| a == pair_ref))
             .unwrap_or_else(|| panic!("{pair_ref} is not a pair index or a known member")),
     };
-    let master = inv.pairs[pair_idx]
-        .iter()
-        .find(|a| info_field(a, &tls, "role:").as_deref() == Some("master"))
-        .unwrap_or_else(|| panic!("pair {pair_idx} has no reachable master"))
-        .clone();
+    let master = master_of(&inv.pairs[pair_idx], &tls, &format!("pair {pair_idx}"))
+        .unwrap_or_else(|why| die(&why));
     eprintln!("== add-replica: {new} -> pair {pair_idx} (master {master})");
 
     let d = &inv.statedir;
@@ -5257,11 +5254,8 @@ fn swap_node(inv: &Inventory, inventory_path: &str, bad: &str, new: &str) {
     if info_field(bad, &tls, "role:").as_deref() == Some("master") {
         panic!("{bad} is currently a live MASTER; fail it over first, then swap");
     }
-    let master = inv.pairs[pair_idx]
-        .iter()
-        .find(|a| info_field(a, &tls, "role:").as_deref() == Some("master"))
-        .unwrap_or_else(|| panic!("pair {pair_idx} has no reachable master"))
-        .clone();
+    let master = master_of(&inv.pairs[pair_idx], &tls, &format!("pair {pair_idx}"))
+        .unwrap_or_else(|why| die(&why));
     eprintln!("== swap: {bad} -> {new} (pair {pair_idx}, master {master})");
 
     // Fresh replica on the replacement seat (spawn-a-fresh-node model).
@@ -5791,6 +5785,90 @@ fn controlled_failover(
 /// master out for maintenance or `decommission-node`.
 /// Resolve a pair reference (index or any member address) to its live
 /// master address.
+/// How long to wait for a pair to have a master before saying it has none.
+///
+/// 10 s, matching the budget the cold-start probe already used. A promotion is
+/// hundreds of milliseconds; this is ~20x that, so it covers a failover in
+/// flight without hiding a pair that is genuinely down.
+const MASTER_PROBE_ATTEMPTS: u32 = 40;
+const MASTER_PROBE_INTERVAL: Duration = Duration::from_millis(250);
+
+/// A pair's master, waited for rather than sampled once.
+///
+/// FOUND BY THE M2 SOAK AT KILL 449 (BUG-0119). Four call sites did a
+/// single-pass `find` over a pair's members and panicked if neither answered
+/// `role: master` at that instant:
+///
+///     restart 172.31.74.168:7001: panicked at flint-ctl/src/main.rs
+///     pair 0 has no reachable master
+///
+/// The status block taken moments later said `172.31.78.236:7002 master epoch
+/// (0,214)`. There WAS a master. It was mid-transition when the question was
+/// asked, and a promotion takes hundreds of milliseconds — so "no master right
+/// now" is a TRANSIENT, and a single probe is a coin toss weighted by how
+/// recently something failed over.
+///
+/// The cold-start path already knew this and gave the same probe a 40 x 250 ms
+/// budget before degrading. This is that budget, shared, so the four sites
+/// stop disagreeing with the fifth.
+///
+/// AND IT RETURNS Err RATHER THAN PANICKING. A panic in an operator tool
+/// prints a backtrace hint and no remedy; the error below names every member
+/// and what each one answered, which is the difference between "the pair is
+/// gone" and "you asked during a failover" (ADR-0028).
+fn master_of(
+    members: &[String],
+    tls: &Option<Arc<flint_tls::ClientConfig>>,
+    what: &str,
+) -> Result<String, String> {
+    let mut roles: Vec<Option<String>> = Vec::new();
+    for attempt in 0..MASTER_PROBE_ATTEMPTS {
+        roles = members
+            .iter()
+            .map(|a| info_field(a, tls, "role:"))
+            .collect();
+        if let Some((addr, _)) = members
+            .iter()
+            .zip(&roles)
+            .find(|(_, r)| r.as_deref() == Some("master"))
+        {
+            return Ok(addr.clone());
+        }
+        if attempt + 1 < MASTER_PROBE_ATTEMPTS {
+            std::thread::sleep(MASTER_PROBE_INTERVAL);
+        }
+    }
+    Err(no_master_message(members, &roles, what))
+}
+
+/// The refusal text, split from the probing so it can be tested without a
+/// fleet.
+///
+/// ADR-0028: a failure names only what it OBSERVED. The panic this replaces
+/// named a conclusion -- "no reachable master" -- and nothing it saw, so an
+/// operator could not tell a pair that is GONE from one they asked about
+/// during a failover. That is the difference between paging someone and
+/// running the command again.
+fn no_master_message(members: &[String], roles: &[Option<String>], what: &str) -> String {
+    let seen = members
+        .iter()
+        .zip(roles)
+        .map(|(a, r)| {
+            format!(
+                "\n      {a}  role: {}",
+                r.as_deref().unwrap_or("<unreadable>")
+            )
+        })
+        .collect::<String>();
+    format!(
+        "{what} has no reachable master after {}s. What each member answered:{seen}\n\
+         A promotion may be in flight -- the controller resolves that on its own, and\n\
+         `status` will show a master once it has. This is NOT the same as the pair\n\
+         being gone, and re-running is the right response to it.",
+        MASTER_PROBE_ATTEMPTS * MASTER_PROBE_INTERVAL.as_millis() as u32 / 1000
+    )
+}
+
 fn pair_master(
     inv: &Inventory,
     tls: &Option<Arc<flint_tls::ClientConfig>>,
@@ -5804,11 +5882,7 @@ fn pair_master(
             .position(|p| p.iter().any(|a| a == pair_ref))
             .unwrap_or_else(|| panic!("{pair_ref} is not a pair index or a known member")),
     };
-    inv.pairs[idx]
-        .iter()
-        .find(|a| info_field(a, tls, "role:").as_deref() == Some("master"))
-        .cloned()
-        .unwrap_or_else(|| panic!("pair {idx} has no reachable master"))
+    master_of(&inv.pairs[idx], tls, &format!("pair {idx}")).unwrap_or_else(|why| die(&why))
 }
 
 /// `flintctl migrate-slots <ns> <lo-hi> <src> <dest>`: move a contiguous
@@ -5942,10 +6016,8 @@ fn decommission_node(
     }
     // min-replicas guard: what live replica count remains, vs what the
     // master needs to accept writes?
-    let master = members
-        .iter()
-        .find(|a| info_field(a, &tls, "role:").as_deref() == Some("master"))
-        .unwrap_or_else(|| panic!("pair {pair_idx} has no reachable master"));
+    let master =
+        &master_of(&members, &tls, &format!("pair {pair_idx}")).unwrap_or_else(|why| die(&why));
     let min_repl: u32 = info_field(master, &tls, "min_replicas_to_write:")
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
@@ -8428,5 +8500,49 @@ mod build_read_tests {
                  roll and the log could not say why"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod no_master_message_tests {
+    use super::*;
+
+    /// FOUND BY THE M2 SOAK AT KILL 449. `restart-node` panicked with "pair 0
+    /// has no reachable master" while `status`, moments later, reported
+    /// `172.31.78.236:7002 master epoch (0,214)`. There WAS a master; it was
+    /// mid-transition when the question was asked.
+    ///
+    /// The panic named a CONCLUSION and nothing it observed, so it read as
+    /// "this pair is gone" when the truth was "you asked during a failover".
+    /// This pins the difference: every member appears, with what it answered.
+    #[test]
+    fn the_refusal_names_every_member_and_what_it_answered() {
+        let members = vec!["10.0.0.1:7001".to_string(), "10.0.0.2:7002".to_string()];
+        let roles = vec![None, Some("replica".to_string())];
+        let m = no_master_message(&members, &roles, "pair 0");
+
+        assert!(
+            m.contains("10.0.0.1:7001  role: <unreadable>"),
+            "a member we could not reach must say so, not vanish: {m}"
+        );
+        assert!(
+            m.contains("10.0.0.2:7002  role: replica"),
+            "a member that answered must show WHAT it answered: {m}"
+        );
+        // The remedy, because a refusal an operator cannot act on is a panic
+        // with better grammar.
+        assert!(m.contains("re-running is the right response"), "{m}");
+        assert!(m.contains("NOT the same as the pair"), "{m}");
+    }
+
+    /// The budget is in the text, so the reader knows how long it waited
+    /// rather than assuming it asked once -- which is what it used to do.
+    #[test]
+    fn the_refusal_states_how_long_it_waited() {
+        let m = no_master_message(&["a:1".to_string()], &[None], "pair 7");
+        assert!(
+            m.contains("pair 7 has no reachable master after 10s"),
+            "{m}"
+        );
     }
 }
