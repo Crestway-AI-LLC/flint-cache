@@ -37,6 +37,36 @@ use crate::oracle::{KeyLedger, value_for};
 /// Wall clock in ms. The RPO bound is a claim about TIME — "acked longer ago
 /// than the cap must have replicated" — so the ledger needs a real clock, not
 /// the monotonic one used for pacing.
+/// How long one endpoint gets to complete a TCP connect before the writer
+/// moves to the next (BUG-0122).
+///
+/// WHY THIS EXISTS. `connect_master` walks endpoints in order, and the harness
+/// restarts the seat it has just killed — so the FIRST endpoint it dials is
+/// frequently a process that is coming back up. For a narrow window that seat
+/// neither answers nor refuses: the SYN goes unanswered, and the dial used to
+/// pay flint-tls's `CONNECT_BACKSTOP` of 3 s in full. That is the entire
+/// content of every RTO breach in three soaks — 421 master kills produced one,
+/// at `max_connect_ms=3000`, with the promotion itself finished at +474 ms.
+///
+/// WHY 500 ms, and not a number chosen to make the exit pass. Over those 421
+/// kills the harness measured ~9,500 dials, of which 9,472 completed or were
+/// REFUSED in about a millisecond (a dead port answers RST at once). The worst
+/// legitimate dial in the entire run was **29 ms**. 500 ms is ~17x that, so it
+/// cannot plausibly cut short a dial that was going to succeed, and a full
+/// two-endpoint walk stays under 1 s.
+///
+/// 1500 ms — matching this client's read timeout, which is the symmetry
+/// `flint-proxy` uses — was considered and rejected for exactly that reason:
+/// two blackholed endpoints would cost 3 s again, which is the number this
+/// change exists to remove.
+///
+/// GIVING UP EARLY IS NOT A LOSS HERE. The endpoint that is not answering is
+/// the one that just died; the endpoint the writer needs is the other one. A
+/// shorter budget reaches the new master sooner, and `max_connect_ms` keeps
+/// reporting what the dial cost either way, so the cost stays visible rather
+/// than becoming invisible by being bounded.
+pub const DIAL_BUDGET: Duration = Duration::from_millis(500);
+
 pub fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -330,7 +360,7 @@ impl Shared {
         for ep in eps {
             // Timed around the dial whether it connects or not (BUG-0122).
             let t0 = Instant::now();
-            let dialled = Client::connect_addr(&ep, &self.tls);
+            let dialled = Client::connect_addr_within(&ep, &self.tls, DIAL_BUDGET);
             let took = t0.elapsed().as_millis() as u64;
             record_connect(self, took, dialled.is_err());
             let Ok(mut c) = dialled else {
@@ -575,6 +605,43 @@ mod tests {
         Shared::new(Vec::new(), None, 8)
             .with_edge(None, tag.to_string())
             .with_run_nonce(nonce.to_string())
+    }
+
+    /// The arithmetic DIAL_BUDGET was chosen by, asserted so that raising it
+    /// cannot silently undo the fix (BUG-0122).
+    ///
+    /// `connect_master` walks the endpoints in order, so the cost of a walk
+    /// where NOTHING answers is the budget times the endpoint count. The whole
+    /// point of the bound is that this stays clear of M2's 3 s exit budget —
+    /// and 1500 ms, the obvious "match the read timeout" choice, does not: two
+    /// endpoints puts it exactly back at 3 s, which is the number the change
+    /// exists to remove. That is a reasoning step in a doc comment, and this is
+    /// it as a check.
+    #[test]
+    fn a_walk_where_nothing_answers_stays_under_the_exit_budget() {
+        const EXIT_BUDGET: Duration = Duration::from_secs(3);
+        const ENDPOINTS: u32 = 2;
+
+        assert!(
+            DIAL_BUDGET < flint_tls::CONNECT_BACKSTOP,
+            "a per-caller budget that is not TIGHTER than the backstop is not a \
+             budget: {DIAL_BUDGET:?} vs {:?}",
+            flint_tls::CONNECT_BACKSTOP
+        );
+        assert!(
+            DIAL_BUDGET * ENDPOINTS < EXIT_BUDGET,
+            "{ENDPOINTS} endpoints at {DIAL_BUDGET:?} is {:?}, which reaches \
+             M2's {EXIT_BUDGET:?} exit budget on dials alone",
+            DIAL_BUDGET * ENDPOINTS
+        );
+        // The measured worst LEGITIMATE dial was 29ms over ~9500 dials. A
+        // budget near that would start cutting short dials that would have
+        // succeeded, which trades a measurement artefact for a worse one.
+        assert!(
+            DIAL_BUDGET >= Duration::from_millis(290),
+            "{DIAL_BUDGET:?} is under 10x the worst legitimate dial ever \
+             measured (29ms); at that point the budget itself distorts the run"
+        );
     }
 
     /// BUG-0122's instrument, and the two properties it exists for.

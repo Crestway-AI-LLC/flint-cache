@@ -1,10 +1,10 @@
 # BUG-0122 — the client stalled ~3.1 s after a promotion that finished in ~0.5 s
 
-Status: OPEN — cause ESTABLISHED 2026-09-08; what remains is a decision, not a
-fix · Severity: medium — still disqualifying for M2's exit, which requires
-RTO <= 3 s in EVERY run. The promotion path is exonerated and the stall is
-measured: the harness pays flint-tls's 3 s connect backstop dialling the seat
-it has just killed
+Status: FIXED 2026-09-08 — the harness's dial is bounded at 500 ms
+(`DIAL_BUDGET`); confirmation pending in the next soak · Severity: medium — it
+was disqualifying for M2's exit, which requires RTO <= 3 s in EVERY run. The
+promotion path was never implicated: the harness was paying flint-tls's 3 s
+connect backstop dialling the seat it had just killed
 Found: 2026-09-07, in the soak re-run on the corrected instruments
 Component: the DIRECT client discovery path (`flint-chaos` `connect_master` /
 `flint_tls::connect`) — originally filed against the promotion path, which the
@@ -293,7 +293,43 @@ Two remedies exist and they are not equivalent:
 2. **Judge the exit on the edge path**, where a real client lives: the proxy's
    address is fixed and outlives every failover, which is the point of it.
 
-Both would make the exit pass, and that is exactly why **neither is mine to
-take**. Changing what a measurement counts so that it clears its own budget
+Both would make the exit pass, and that is exactly why neither was mine to
+take. Changing what a measurement counts so that it clears its own budget
 needs to be a deliberate decision by the person who owns the milestone, not a
-tidy-up by the person who found the cause. Recorded here and raised; not done.
+tidy-up by the person who found the cause.
+
+**Jeff chose (1) on 2026-09-08: bound the harness's dial.**
+
+## The fix
+
+`connect_master` now dials through `Client::connect_addr_within` with
+`DIAL_BUDGET = 500 ms`, built on the `connect_within` that BUG-0123 added for
+the proxy. The default stays `CONNECT_BACKSTOP` for every caller that has no
+opinion.
+
+**500 ms is chosen from the measurements, not from the budget it has to
+clear.** Across 421 master kills the harness measured ~9,500 dials; 9,472
+completed or were refused in about a millisecond, and the worst legitimate
+dial in the entire run was **29 ms**. 500 ms is ~17x that, so it cannot
+plausibly cut short a dial that would have succeeded, and a full two-endpoint
+walk stays under 1 s.
+
+1500 ms — matching this client's own read timeout, which is the symmetry
+`flint-proxy` uses — was considered and rejected: two blackholed endpoints
+would cost 3 s again, which is the number the change exists to remove.
+
+**Giving up early costs nothing here.** The endpoint that is not answering is
+the one that just died; the endpoint the writer needs is the other one. And
+`max_connect_ms` still reports what the dial cost, so bounding it does not
+make it invisible — the failure mode this whole bug is a record of.
+
+### What this does and does not settle
+
+It removes the harness's own contribution to the measured RTO. It does **not**
+change anything about the product: no promotion got faster, and the three
+soaks already showed detect/fence/promote completing in ~0.5 s throughout.
+
+The honest way to read the next soak is therefore that it measures the same
+fleet with one artefact removed from the instrument — not that failover
+improved. **Confirmation is pending; this write-up should not be read as a
+passing exit until a run says so.**

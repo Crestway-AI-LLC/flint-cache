@@ -751,7 +751,21 @@ impl Client {
         addr: &str,
         tls: &Option<std::sync::Arc<flint_tls::ClientConfig>>,
     ) -> std::io::Result<Self> {
-        let stream = flint_tls::connect(addr, tls)?;
+        Self::connect_addr_within(addr, tls, flint_tls::CONNECT_BACKSTOP)
+    }
+
+    /// [`Client::connect_addr`] with the DIAL bounded by `budget` (BUG-0122).
+    ///
+    /// The default is flint-tls's backstop, which is a ceiling on a blackholed
+    /// peer rather than a latency budget. A caller that walks a list of
+    /// endpoints looking for one that answers wants the opposite: to give up
+    /// quickly and try the next, because the next is the one it needs.
+    pub fn connect_addr_within(
+        addr: &str,
+        tls: &Option<std::sync::Arc<flint_tls::ClientConfig>>,
+        budget: Duration,
+    ) -> std::io::Result<Self> {
+        let stream = flint_tls::connect_within(addr, tls, budget)?;
         stream.set_read_timeout(Some(Duration::from_millis(1500)))?;
         Ok(Self {
             stream,

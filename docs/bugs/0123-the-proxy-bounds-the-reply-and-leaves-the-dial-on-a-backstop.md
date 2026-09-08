@@ -1,8 +1,9 @@
 # BUG-0123 — the proxy bounds the reply and leaves the dial on a backstop
 
-Status: OPEN · Severity: medium — the discovery path's own stated bound is
-800 ms per node and its actual worst case is 3800 ms, on the client request
-path, during a failover
+Status: FIXED 2026-09-08 — the dial now takes the same budget as the reply
+(`connect_within`, `DISCOVER_BUDGET`) · Severity: medium — the discovery path's
+own stated bound was 800 ms per node and its actual worst case was 3800 ms, on
+the client request path, during a failover
 Found: 2026-09-08, following BUG-0122 into the path that actually carries
 customer traffic
 Component: `flint-proxy` master discovery (`discover_master`), and the
