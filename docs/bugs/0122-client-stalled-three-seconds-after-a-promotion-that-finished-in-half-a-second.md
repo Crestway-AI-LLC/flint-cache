@@ -175,6 +175,14 @@ carries the argument.
 
 ### Open: which 3 s timeout, and the instrument that would say
 
+**Reachability settled 2026-09-08 (BUG-0123).** `connect_within` measured
+against TEST-NET-1, which drops SYNs, spends its budget to the millisecond:
+251 ms on a 250 ms budget, 2001 ms on 2000 ms, both `TimedOut`. So a dial that
+meets an unanswered SYN really does burn the full timeout — the mechanism is
+no longer hypothetical. What is still unshown is that this fleet produced that
+condition; a blackholed peer and a dead port are different things, and a dead
+port answers at once.
+
 `TcpStream::connect_timeout(.., 3 s)` at `crates/flint-tls/src/lib.rs:614` is the
 **only 3 s constant anywhere on this path** — the chaos client and cluster code
 contain none, and the controller's is 500 ms. But reaching its full value

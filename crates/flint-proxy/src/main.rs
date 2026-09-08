@@ -1236,10 +1236,24 @@ fn discover_master(
     tls: &Option<Arc<flint_tls::ReloadableClientConfig>>,
 ) -> Option<String> {
     for addr in nodes {
-        let Ok(mut stream) = flint_tls::connect_reloadable(addr, tls) else {
+        // BUG-0123: the DIAL gets the same budget as the reply below it.
+        //
+        // This used to be `connect_reloadable`, which falls through to
+        // flint-tls's CONNECT_BACKSTOP — 3s, a ceiling on a blackholed peer
+        // rather than a latency budget. That made one node's worst case
+        // 3800ms against a stated 800ms, and this walks every member of the
+        // pair, on the client request path (`refresh_pair_master`, reached
+        // from the Err arm of a backend call — i.e. during a failover).
+        //
+        // Bounding the dial at the same 800ms restores the figure BUG-0052
+        // already documented for a two-member pair: 1600ms. A refused dial
+        // still costs microseconds; this only bounds the case where the SYN
+        // goes unanswered, which is the one nothing here could distinguish.
+        let Ok(mut stream) = flint_tls::connect_reloadable_within(addr, tls, DISCOVER_BUDGET)
+        else {
             continue;
         };
-        let _ = stream.set_read_timeout(Some(Duration::from_millis(800)));
+        let _ = stream.set_read_timeout(Some(DISCOVER_BUDGET));
         let mut out = Vec::new();
         encode(
             &Value::Array(Some(vec![Value::Bulk(Some(b"FLINTINFO".to_vec()))])),
@@ -3113,6 +3127,15 @@ const MAX_PREFETCH: usize = 64;
 /// plane pushes promotion hints anyway, so this is the slow path, not the
 /// only one.
 const REDISCOVER_DEBOUNCE: Duration = Duration::from_millis(250);
+
+/// What `discover_master` will spend on ONE node, for the dial and for the
+/// FLINTINFO reply alike (BUG-0123).
+///
+/// One constant for both phases on purpose. They were 3000ms and 800ms, and
+/// the mismatch was invisible because only the second was written down —
+/// naming a single budget makes the per-node cost readable from the code
+/// rather than derived from two files.
+const DISCOVER_BUDGET: Duration = Duration::from_millis(800);
 
 /// What the re-probe gate knows about one address.
 ///

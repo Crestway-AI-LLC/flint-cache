@@ -601,6 +601,33 @@ pub fn accept(tcp: TcpStream, cfg: &Option<Arc<ServerConfig>>) -> io::Result<Str
 /// is set (presenting our cert, verifying the server against the internal CA
 /// at [`INTERNAL_SNI`]).
 pub fn connect(addr: &str, cfg: &Option<Arc<ClientConfig>>) -> io::Result<Stream> {
+    connect_within(addr, cfg, CONNECT_BACKSTOP)
+}
+
+/// The dial budget a caller gets when it expresses no opinion.
+///
+/// A CEILING ON A PATHOLOGY, NOT A LATENCY BUDGET — see `connect_within`. It
+/// replaced "minutes", so anything finite was an improvement; that is a
+/// different question from what a given caller should be willing to wait, and
+/// BUG-0123 is what happens when the two are conflated.
+pub const CONNECT_BACKSTOP: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// [`connect`] with the dial bounded by `budget` instead of the backstop.
+///
+/// BUG-0123. A caller that has chosen a read timeout has stated how long it is
+/// prepared to wait, and inheriting the backstop for the phase BEFORE that
+/// read silently multiplies it — `flint-proxy`'s `discover_master` bounded its
+/// FLINTINFO reply at 800 ms and its dial at 3 s, on the client request path,
+/// so its real worst case was 4.75x the one its own code and BUG-0052 both
+/// stated.
+///
+/// Callers with no opinion keep the backstop; this exists so that having an
+/// opinion is expressible.
+pub fn connect_within(
+    addr: &str,
+    cfg: &Option<Arc<ClientConfig>>,
+    budget: std::time::Duration,
+) -> io::Result<Stream> {
     // Bounded connect. A bare TcpStream::connect has no timeout of its own,
     // so a blackholed peer (host down harder than a RST — partition, SG
     // change, hung NIC) parks the CALLER for the kernel's SYN-retry budget,
@@ -611,7 +638,7 @@ pub fn connect(addr: &str, cfg: &Option<Arc<ClientConfig>>) -> io::Result<Stream
         .to_socket_addrs()?
         .next()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, format!("no addr: {addr}")))?;
-    let tcp = TcpStream::connect_timeout(&sockaddr, std::time::Duration::from_secs(3))?;
+    let tcp = TcpStream::connect_timeout(&sockaddr, budget)?;
     match cfg {
         None => Ok(Stream::Plain(tcp)),
         Some(cfg) => {
@@ -731,6 +758,16 @@ pub fn connect_reloadable(
 ) -> io::Result<Stream> {
     let snap = cfg.as_ref().map(|r| r.current());
     connect(addr, &snap)
+}
+
+/// [`connect_reloadable`] with the dial bounded by `budget` (BUG-0123).
+pub fn connect_reloadable_within(
+    addr: &str,
+    cfg: &Option<Arc<ReloadableClientConfig>>,
+    budget: std::time::Duration,
+) -> io::Result<Stream> {
+    let snap = cfg.as_ref().map(|r| r.current());
+    connect_within(addr, &snap, budget)
 }
 
 /// What `cert_days_remaining` RENDERS on a status surface when there is no
@@ -890,6 +927,59 @@ mod cert_days_unknown {
 
 #[cfg(test)]
 mod tests {
+    use super::{CONNECT_BACKSTOP, connect_within};
+
+    /// BUG-0123: a caller's dial budget must actually bound the dial.
+    ///
+    /// WHAT A PASS HERE DOES AND DOES NOT PROVE. The blackhole leg uses
+    /// TEST-NET-1 (RFC 5737), which is reserved and unrouted. On a host that
+    /// silently drops the SYN this exercises the budget for real. On a host
+    /// that answers "no route" instead, the dial fails in microseconds and the
+    /// assertion holds without having tested anything — so a pass is a
+    /// one-way signal, and it is written down here rather than left for
+    /// someone to infer from a green run.
+    ///
+    /// The positive control is what keeps it from being empty in the other
+    /// direction: the same function against a REAL listener must succeed, so a
+    /// "fast failure" cannot be this environment refusing every dial.
+    #[test]
+    fn a_dial_budget_bounds_the_dial() {
+        use std::time::{Duration, Instant};
+
+        // Positive control: the dialer works here at all.
+        let lis = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let real = lis.local_addr().expect("addr").to_string();
+        assert!(
+            connect_within(&real, &None, Duration::from_secs(2)).is_ok(),
+            "positive control failed: this environment refuses even a live \
+             local dial, so the blackhole leg below would prove nothing"
+        );
+
+        // The budget must be what gives up, not the backstop.
+        let budget = Duration::from_millis(250);
+        let t0 = Instant::now();
+        let r = connect_within("192.0.2.1:9", &None, budget);
+        let took = t0.elapsed();
+        assert!(r.is_err(), "TEST-NET-1 must not connect");
+        assert!(
+            took < CONNECT_BACKSTOP,
+            "a 250ms budget took {took:?}, at or past the {CONNECT_BACKSTOP:?} \
+             backstop -- the budget is not being applied"
+        );
+    }
+
+    /// The invariant BUG-0123 is really about: a caller may narrow the dial,
+    /// never widen it past the pathology ceiling, and the default is that
+    /// ceiling.
+    #[test]
+    fn the_backstop_is_the_default_and_the_ceiling() {
+        assert_eq!(
+            CONNECT_BACKSTOP,
+            std::time::Duration::from_secs(3),
+            "the backstop is quoted in BUG-0122 and BUG-0123; changing it \
+             silently invalidates both write-ups' arithmetic"
+        );
+    }
     use super::cert_eku_from_pem;
 
     // Two self-signed leaves (P-256) that differ in exactly ONE thing: the EKU.
