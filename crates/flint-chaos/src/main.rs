@@ -1482,39 +1482,35 @@ fn main() {
         // set out to demonstrate. Seen on lag_cap, which passes
         // --stall-replica-ms 200 (BUG-0049) and shed 70 writes on the run
         // that printed it.
-        if acked_lost_total > 0 {
-            // BUG-0120: this branch used to be unreachable-in-practice noise
-            // and instead printed "replication kept up throughout" on a run
-            // that had just regressed 80 acked keys, because the depth was
-            // measured from a stamp taken BEFORE the kill was sent and every
-            // loss saturated to 0. With the anchor corrected, depth 0 next to
-            // a non-zero loss count is a real and specific statement — every
-            // lost write was acked at or after the death stamp — and it is
-            // not evidence that replication kept up.
-            println!(
+        match rpo_exercise(acked_lost_total, throttled_total, stall_replica_ms) {
+            RpoExercise::LossesExplained => println!(
                 "  NOTE: loss depth 0 with {acked_lost_total} acked key(s) regressed: every lost \
                  write was acked at or after the death stamp, so none of them aged unreplicated \
                  for a measurable interval. This says nothing about whether replication kept up \
                  generally — it says the losses were writes in flight at the kill."
-            );
-        } else if stall_replica_ms == 0 {
-            println!(
-                "  NOTE: loss depth 0 and nothing regressed — replication kept up throughout, so \
-                 the RPO bound was not exercised by this run (try --stall-replica-ms)"
-            );
-        } else if throttled_total > 0 {
-            println!(
-                "  NOTE: loss depth 0 under a {stall_replica_ms}ms replica stall, with \
-                 {throttled_total} write(s) shed: the master refused writes it could not \
-                 replicate rather than acking them. That is the bound holding, not an \
-                 unexercised path."
-            );
-        } else {
-            println!(
+            ),
+            RpoExercise::HeldUnderThrottle => {
+                let how = if stall_replica_ms > 0 {
+                    format!("under a {stall_replica_ms}ms replica stall")
+                } else {
+                    "under natural lag, with no --stall-replica-ms requested".to_string()
+                };
+                println!(
+                    "  NOTE: loss depth 0 {how}, with {throttled_total} write(s) shed: the master \
+                     refused writes it could not replicate rather than acking them. That is the \
+                     bound holding, not an unexercised path."
+                );
+            }
+            RpoExercise::NotExercised => println!(
+                "  NOTE: loss depth 0, nothing regressed AND nothing shed — replication kept up \
+                 throughout, so the RPO bound was not exercised by this run (try \
+                 --stall-replica-ms)"
+            ),
+            RpoExercise::StallDidNotBite => println!(
                 "  NOTE: loss depth 0 under a {stall_replica_ms}ms replica stall AND nothing \
                  shed — the stall produced neither loss nor throttling, so neither mechanism \
                  was exercised. Check the stall actually reached the replica."
-            );
+            ),
         }
     }
     if throttled_total == 0 {
@@ -1590,6 +1586,40 @@ fn rpo_volume_budget(win_writes: u64, win_ms: u64, cap_ms: u64) -> Option<u64> {
 /// `dead_us` is stamped just AFTER the SIGKILL returned, so death <= dead_us
 /// and this over-estimates. That is the safe direction: it can call a loss
 /// deeper than it was, it cannot call a deep loss shallow.
+/// Which statement a run has earned about the RPO bound (BUG-0120).
+///
+/// Extracted from the `println!` chain it used to be so the ORDER can be
+/// asserted. The order is the whole content of this function: it once tested
+/// `stall_replica_ms == 0` before `throttled > 0`, so a run that shed 690
+/// writes under natural lag was told the bound "was not exercised", and the
+/// ledger row derived from that line inherited the error.
+///
+/// Whether a stall was REQUESTED says nothing about whether the condition
+/// arose. Evidence first.
+#[derive(Debug, PartialEq, Eq)]
+enum RpoExercise {
+    /// Acked writes were lost; the depth measure explains them.
+    LossesExplained,
+    /// Nothing lost because the master shed instead of acking. The bound held.
+    HeldUnderThrottle,
+    /// Nothing lost, nothing shed, no stall asked for: untested.
+    NotExercised,
+    /// A stall was asked for and produced neither loss nor throttling.
+    StallDidNotBite,
+}
+
+fn rpo_exercise(acked_lost: u64, throttled: u64, stall_replica_ms: u64) -> RpoExercise {
+    if acked_lost > 0 {
+        RpoExercise::LossesExplained
+    } else if throttled > 0 {
+        RpoExercise::HeldUnderThrottle
+    } else if stall_replica_ms == 0 {
+        RpoExercise::NotExercised
+    } else {
+        RpoExercise::StallDidNotBite
+    }
+}
+
 fn loss_depth_ms(dead_us: u64, acked_ms: u64) -> u64 {
     (dead_us / 1000).saturating_sub(acked_ms)
 }
@@ -1790,5 +1820,45 @@ mod rpo_volume {
         assert_eq!(b, 3_000);
         assert!(3_000 <= b, "one window's worth is within the bound");
         assert!(3_001 > b, "one more than a window's worth is a breach");
+    }
+}
+
+#[cfg(test)]
+mod rpo_exercise_order {
+    use super::{RpoExercise, rpo_exercise};
+
+    /// THE regression. A run that shed writes under natural lag exercised the
+    /// bound, whether or not anyone asked for a stall.
+    /// soak-20260908T043150Z shed 690 with no --stall-replica-ms and was
+    /// reported as unexercised.
+    #[test]
+    fn throttling_without_a_requested_stall_still_counts() {
+        assert_eq!(
+            rpo_exercise(0, 690, 0),
+            RpoExercise::HeldUnderThrottle,
+            "690 shed writes is the lag gate firing; the absence of a flag does \
+             not un-fire it"
+        );
+    }
+
+    /// And the genuinely untested case must stay distinguishable from it --
+    /// otherwise the fix has only moved the conflation.
+    #[test]
+    fn nothing_shed_and_no_stall_is_untested() {
+        assert_eq!(rpo_exercise(0, 0, 0), RpoExercise::NotExercised);
+    }
+
+    /// Asking for a stall that never bit is its own outcome, not a pass.
+    #[test]
+    fn a_stall_that_did_not_bite_is_not_a_pass() {
+        assert_eq!(rpo_exercise(0, 0, 1800), RpoExercise::StallDidNotBite);
+    }
+
+    /// Losses dominate: they are the thing the bound is about.
+    #[test]
+    fn losses_take_precedence_over_everything() {
+        for (thr, stall) in [(0, 0), (690, 0), (0, 1800), (690, 1800)] {
+            assert_eq!(rpo_exercise(23, thr, stall), RpoExercise::LossesExplained);
+        }
     }
 }
