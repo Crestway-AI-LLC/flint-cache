@@ -120,7 +120,8 @@ fn call(
     args: &[&str],
     timeout: Duration,
 ) -> std::io::Result<Value> {
-    let mut s = flint_tls::connect(addr, tls)?;
+    // BUG-0125: the dial takes the caller's own stated budget.
+    let mut s = flint_tls::connect_within(addr, tls, timeout)?;
     s.set_read_timeout(Some(timeout))?;
     s.set_write_timeout(Some(Duration::from_millis(1500)))?;
     let mut out = Vec::new();
@@ -653,7 +654,8 @@ fn call_raw(
     args: &[Vec<u8>],
     timeout: Duration,
 ) -> std::io::Result<Value> {
-    let mut s = flint_tls::connect(addr, tls)?;
+    // BUG-0125: the dial takes the caller's own stated budget.
+    let mut s = flint_tls::connect_within(addr, tls, timeout)?;
     s.set_read_timeout(Some(timeout))?;
     s.set_write_timeout(Some(timeout))?;
     let mut out = Vec::new();

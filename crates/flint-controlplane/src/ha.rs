@@ -69,6 +69,14 @@ pub struct Conn {
     tls: Option<Arc<flint_tls::ReloadableClientConfig>>,
 }
 
+/// How long a Raft RPC may spend dialling a peer before giving up (BUG-0125).
+///
+/// Matches `flint_tls::aio`'s DIAL_TIMEOUT. A peer that REFUSES fails in
+/// microseconds and this never applies; it bounds only the peer that goes
+/// silent, which is the case an unbounded dial turns from a fast failure into
+/// a multi-minute park.
+const RAFT_DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// Dial `addr` (optionally through mutual TLS) and run one framed
 /// request/response exchange. The TLS config is snapshotted per dial, so a
 /// rotated leaf applies to the next RPC with no restart.
@@ -77,7 +85,24 @@ async fn exchange(
     tls: &Option<Arc<flint_tls::ReloadableClientConfig>>,
     body: &[u8],
 ) -> std::io::Result<Vec<u8>> {
-    let mut tcp = TcpStream::connect(addr).await?;
+    // BUG-0125: BOUND THE DIAL. This was a bare `TcpStream::connect().await`
+    // with no timeout, on the Raft RPC path — leader election and log
+    // replication between CP seats, which is the fencing authority under
+    // ADR-0018. A blackholed seat (host stalled, SG changed, NIC hung) does
+    // not refuse; it goes silent, and an unbounded dial then parks the RPC for
+    // the kernel's SYN-retry budget, minutes, rather than failing and letting
+    // Raft treat the peer as unreachable.
+    //
+    // `flint_tls::aio` already bounds its dial with exactly this pattern and
+    // the same constant; this path simply never got it.
+    let mut tcp = tokio::time::timeout(RAFT_DIAL_TIMEOUT, TcpStream::connect(addr))
+        .await
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("raft dial to {addr} exceeded {RAFT_DIAL_TIMEOUT:?}"),
+            )
+        })??;
     match tls.as_ref().map(|r| TlsConnector::from(r.current())) {
         None => {
             write_framed(&mut tcp, body).await?;

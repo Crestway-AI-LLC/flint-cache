@@ -54,10 +54,14 @@ fn scrape(
     // Nodes answer on the internal mesh (fixed SNI); a proxy's PROXYSTATS
     // is on its client-facing EDGE port (SNI = the addr host). A fully
     // plaintext dev fleet uses neither (tls = None).
+    // BUG-0125: dial on the same budget as the reply below it. A scrape
+    // that hangs past its own timeout is worse than a scrape that fails: the
+    // collector's window closes either way, and only one of them says so.
+    let dial = Duration::from_millis(1500);
     let mut s = if edge {
-        flint_tls::connect_edge(addr, tls).ok()?
+        flint_tls::connect_edge_within(addr, tls, dial).ok()?
     } else {
-        flint_tls::connect(addr, tls).ok()?
+        flint_tls::connect_within(addr, tls, dial).ok()?
     };
     s.set_read_timeout(Some(Duration::from_millis(1500))).ok()?;
     s.set_write_timeout(Some(Duration::from_millis(1500)))

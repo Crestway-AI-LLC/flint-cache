@@ -679,10 +679,13 @@ fn call_seq_on(
     read_timeout: Duration,
     edge: bool,
 ) -> std::io::Result<Value> {
+    // BUG-0125: the DIAL is bounded too, not just the reply. The caller's
+    // read_timeout is the budget it has stated for this call, so the dial
+    // takes the same one rather than inheriting the 3s backstop underneath it.
     let mut s = if edge {
-        flint_tls::connect_edge(addr, tls)?
+        flint_tls::connect_edge_within(addr, tls, read_timeout)?
     } else {
-        flint_tls::connect(addr, tls)?
+        flint_tls::connect_within(addr, tls, read_timeout)?
     };
     s.set_read_timeout(Some(read_timeout))?;
     s.set_write_timeout(Some(Duration::from_millis(1500)))?;
@@ -736,7 +739,8 @@ fn call_to(
     args: &[&str],
     read_timeout: Duration,
 ) -> std::io::Result<Value> {
-    let mut s = flint_tls::connect(addr, tls)?;
+    // BUG-0125: dial on the caller's own stated budget.
+    let mut s = flint_tls::connect_within(addr, tls, read_timeout)?;
     s.set_read_timeout(Some(read_timeout))?;
     s.set_write_timeout(Some(Duration::from_millis(1500)))?;
     let frame = Value::Array(Some(

@@ -1626,6 +1626,117 @@ assert_no_default_ports() {
 # clones will not have a sibling ops tree, so absence cannot be a failure — but
 # it must not read as a pass either, because "no collisions" and "did not look"
 # are the distinction this whole file exists to keep.
+# EVERY DIAL CARRIES A BUDGET (BUG-0125).
+#
+# Three bugs in two days were one defect wearing different clothes: a caller
+# states a reply budget with set_read_timeout, and the CONNECT in front of it
+# is bounded by something else entirely -- flint-tls's CONNECT_BACKSTOP (3s, a
+# ceiling on a blackholed peer) or, for connect_edge, nothing at all.
+#
+#   BUG-0122  the chaos client   3s dial vs single-digit-ms holds
+#   BUG-0123  proxy discover_master   3s dial vs an 800ms reply
+#   BUG-0124  controller observe()    3s dial x2 -> 19.8s worst detection
+#
+# Each was found by reading one function. The class is mechanical, so it is
+# checked mechanically: a dial with no budget, sitting directly above a
+# tighter reply timeout, is the shape. `_within` variants take a budget and
+# are exempt by construction.
+assert_dials_are_bounded() {
+  local out
+  out=$(python3 - <<'DIALPY'
+import re, glob, os, sys
+DIAL = re.compile(r'flint_tls::(connect|connect_reloadable|connect_edge)\s*\(')
+RT   = re.compile(r'set_(?:read|write)_timeout\(\s*Some\(\s*(?:std::time::)?Duration::from_(millis|secs)\((\d+)\)')
+BARE = re.compile(r'(?<!\w)TcpStream::connect\s*\(')
+# Coverage counts BOUNDED dials too -- DIAL deliberately does not match the
+# _within forms (the '_' defeats the `\s*\(`), which is what kept the
+# population shrinking as each site was fixed.
+ANYDIAL = re.compile(r'flint_tls::(?:aio::)?connect(?:_reloadable|_edge)?(?:_within)?\s*\(')
+BACKSTOP_MS = 3000
+bad, scanned, dials = [], 0, 0
+for path in sorted(glob.glob('crates/*/src/**/*.rs', recursive=True)):
+    if path.startswith('crates/flint-tls/'):
+        continue          # where the budgets are DEFINED
+    scanned += 1
+    lines = open(path, encoding='utf-8', errors='replace').read().split('\n')
+    # Test modules dial loopback, where a connect cannot hang -- and they sit
+    # at the bottom by convention, so the first #[cfg(test)] ends the region
+    # this check is about. Bounded by a real marker, not by a line-distance
+    # guess: the guess mis-skipped a live dial six lines under an unrelated
+    # attribute while I was writing this.
+    stop = next((n for n, x in enumerate(lines) if x.strip().startswith('#[cfg(test)]')), len(lines))
+    for i, l in enumerate(lines[:stop]):
+        code = l.split('//')[0] if not l.strip().startswith('//') else ''
+        if not code.strip():
+            continue          # a comment naming a dial is not a dial -- this
+                              # check flagged its own fix's explanation first
+        if ANYDIAL.search(code):
+            dials += 1     # coverage counts EVERY dial, bounded or not --
+                           # otherwise converting them all (the goal) empties
+                           # the population and trips the no-dials guard below
+        if '_within' in code:
+            continue
+        if BARE.search(code) and 'connect_timeout' not in code:
+            # The wrapper may sit on this line (tokio::time::timeout(D, connect))
+            # or on the one above it. Look at both; only the previous line was
+            # checked at first, and that flagged the very fix this check exists
+            # to bless.
+            wrapped = 'timeout(' in code or 'timeout(' in lines[max(0, i - 1)]
+            if not wrapped:
+                bad.append((path, i+1, 'bare TcpStream::connect with no timeout', code.strip()[:58]))
+            continue
+        l = code
+        if not DIAL.search(l):
+            continue
+        for j in range(i+1, min(i+8, stop)):
+            m = RT.search(lines[j])
+            if not m:
+                continue
+            ms = int(m.group(2)) * (1000 if m.group(1) == 'secs' else 1)
+            if ms < BACKSTOP_MS:
+                bad.append((path, i+1, f'reply bounded at {ms}ms, dial left on the {BACKSTOP_MS}ms backstop',
+                            l.strip()[:58]))
+            break
+# A matcher that finds no dials certifies the tree by reading none of it.
+# Counted across bounded AND unbounded dials, so this fires only when the
+# matcher has genuinely stopped matching -- not when every dial is correct.
+if dials == 0:
+    print("NODIALS")
+    sys.exit(0)
+print("COVERAGE %d %d" % (dials, scanned))
+for path, ln, why, src in bad:
+    print("%s:%d\t%s\t%s" % (path, ln, why, src))
+DIALPY
+) || { echo "FAIL  the dial-budget check could not run"; FAILED="$FAILED dial-budget-unrunnable"; return; }
+
+  if [ "$out" = NODIALS ]; then
+    echo "FAIL  the dial-budget check matched NO dials -- it certified every"
+    echo "        crate by reading none of them"
+    FAILED="$FAILED dial-budget-examined-nothing"
+    return
+  fi
+  local cov
+  cov=$(printf '%s\n' "$out" | sed -n 's/^COVERAGE //p')
+  out=$(printf '%s\n' "$out" | grep -v '^COVERAGE ' || true)
+  if [ -n "$out" ]; then
+    echo "FAIL  these dials are bounded by something other than their caller's"
+    echo "        own budget (BUG-0122/0123/0124 were each one of these):"
+    printf '%s\n' "$out" | while IFS="$(printf '\t')" read -r loc why src; do
+      echo "        $loc"
+      echo "          $why"
+      echo "          $src"
+    done
+    echo "        Use flint_tls::connect_within / connect_reloadable_within /"
+    echo "        connect_edge_within and pass the budget this call site has"
+    echo "        already chosen for its reply."
+    FAILED="$FAILED dial-without-budget"
+    return
+  fi
+  # shellcheck disable=SC2086
+  set -- $cov
+  echo "  every dial carries a budget ($1 dial(s) across $2 source file(s))"
+}
+
 assert_no_cross_repo_ports() {
   local ops="${FLINT_OPS:-../flint-cache}"
   if [ ! -d "$ops/tools" ]; then
@@ -3128,6 +3239,7 @@ if want check; then
   assert_doc_inventories_are_runnable
   assert_no_port_overlap
   assert_no_cross_repo_ports
+  assert_dials_are_bounded
   assert_scripts_parse
   assert_no_scope_overlap
   assert_server_flags_are_read

@@ -194,7 +194,11 @@ pub fn emit(target: &str, tls: &Option<Arc<flint_tls::ClientConfig>>, event: &Ev
         return;
     };
     let _ = (|| -> std::io::Result<()> {
-        let mut s = flint_tls::connect(target, tls)?;
+        // BUG-0125: the DIAL gets the same 400ms this function already
+        // chose for the reply. The module header promises "bounded timeouts";
+        // it bounded both timeouts it could see and left the dial on the 3s
+        // backstop, which is 7.5x the budget it advertises.
+        let mut s = flint_tls::connect_within(target, tls, Duration::from_millis(400))?;
         s.set_read_timeout(Some(Duration::from_millis(400)))?;
         s.set_write_timeout(Some(Duration::from_millis(400)))?;
         let frame = Value::Array(Some(vec![

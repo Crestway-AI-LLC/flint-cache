@@ -205,7 +205,30 @@ pub fn edge_client_config(ca: &str) -> io::Result<Arc<ClientConfig>> {
 /// Connect to an EDGE TLS listener: server name = the host part of `addr`
 /// (matching the edge cert's IP/DNS SANs), unlike the mesh's fixed SNI.
 pub fn connect_edge(addr: &str, cfg: &Option<Arc<ClientConfig>>) -> io::Result<Stream> {
-    let tcp = TcpStream::connect(addr)?;
+    connect_edge_within(addr, cfg, CONNECT_BACKSTOP)
+}
+
+/// [`connect_edge`] with the dial bounded by `budget`.
+///
+/// BUG-0125. This function used a BARE `TcpStream::connect`, which is the
+/// exact hazard [`connect`] documents two screens down and was fixed for: no
+/// timeout of its own, so a blackholed peer parks the caller for the kernel's
+/// SYN-retry budget — minutes, not seconds — regardless of any read timeout
+/// set after. `connect` says "every internal dialer comes through here"; the
+/// EDGE dialer did not, and nothing made that visible.
+///
+/// Every caller of it states a reply budget (1500 ms is the common one) and
+/// was silently accepting an unbounded dial in front of it.
+pub fn connect_edge_within(
+    addr: &str,
+    cfg: &Option<Arc<ClientConfig>>,
+    budget: std::time::Duration,
+) -> io::Result<Stream> {
+    let sockaddr = addr
+        .to_socket_addrs()?
+        .next()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, format!("no addr: {addr}")))?;
+    let tcp = TcpStream::connect_timeout(&sockaddr, budget)?;
     match cfg {
         None => Ok(Stream::Plain(tcp)),
         Some(cfg) => {

@@ -783,7 +783,8 @@ impl Client {
         addr: &str,
         tls: &Option<std::sync::Arc<flint_tls::ClientConfig>>,
     ) -> std::io::Result<Self> {
-        let stream = flint_tls::connect_edge(addr, tls)?;
+        // BUG-0125: the dial takes the same budget as the reply.
+        let stream = flint_tls::connect_edge_within(addr, tls, Duration::from_millis(1500))?;
         stream.set_read_timeout(Some(Duration::from_millis(1500)))?;
         Ok(Self {
             stream,
