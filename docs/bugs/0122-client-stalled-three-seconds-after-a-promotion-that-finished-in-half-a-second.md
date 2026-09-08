@@ -182,10 +182,27 @@ requires SYNs to go **unanswered**, not refused, and nothing measured so far
 shows that happening. The candidate fits the number and lacks a mechanism.
 
 The gap this whole bug is a record of is that **the harness cannot see its own
-connect phase**. `record_hold` starts at the send. The fix is one measure —
-record connect-start → connected alongside it, and report it in the per-iteration
-line next to `max_hold_ms` — after which a single soak says whether the 3 s is
-spent in connect or somewhere else, instead of another round of plausible stories.
+connect phase**. `record_hold` starts at the send.
+
+**That measure now exists** (`record_connect`, `crates/flint-chaos/src/writer.rs`).
+It times `Client::connect_addr` from entry to return **whether the dial succeeds
+or fails** — the failure path being the entire point, since a `connect_timeout`
+that expires returns `Err` after its full budget and the loop used to discard
+that with a bare `continue`. `max_connect_ms`, `max_connect_at_ms` and
+`connect_failures` reset per kill and print in the per-iteration line beside
+`max_hold_ms`, and the summary says outright when a dial lands near 3 s that
+SYNs went unanswered rather than refused.
+
+Two unit tests hold it to the two ways it could inherit the original blindness:
+a failed dial must be measured and counted, and a dial outside the kill window
+must be ignored — the latter asserted with a positive control, because checking
+only for the zero would pass against a function that records nothing at all.
+
+So the next soak answers this. Either a breach carries a ~3 s
+`max_connect_ms` with a failed dial, which names the cause outright, or it does
+not, which refutes the last candidate standing and sends this back to first
+principles with one more phase eliminated. **Both outcomes are progress; neither
+requires another plausible story.**
 
 ### What this means for M2
 

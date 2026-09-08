@@ -375,6 +375,9 @@ fn main() {
     // the write deadline bounds, reported next to the ack-gap so the two are
     // never confused for each other (#186).
     let mut worst_hold_ms: u64 = 0;
+    // BUG-0122: the dial phase, accumulated over the run.
+    let mut worst_connect_ms: u64 = 0;
+    let mut connect_failures_total: u64 = 0;
     let mut deepest_loss_ms: u64 = 0;
     // Acked writes lost that were older than the cap: the AGE reading of the
     // RPO, reported because it is interesting, not asserted because it is not
@@ -561,6 +564,9 @@ fn main() {
             shared.max_stall_at_ms.store(0, Ordering::SeqCst);
             shared.max_hold_ms.store(0, Ordering::SeqCst);
             shared.max_hold_at_ms.store(0, Ordering::SeqCst);
+            shared.max_connect_ms.store(0, Ordering::SeqCst);
+            shared.max_connect_at_ms.store(0, Ordering::SeqCst);
+            shared.connect_failures.store(0, Ordering::SeqCst);
             shared.acks_after_kill.store(0, Ordering::SeqCst);
             let kill_ms = now_ms();
             shared.kill_ms.store(kill_ms, Ordering::SeqCst);
@@ -1060,10 +1066,17 @@ fn main() {
 
             let held = shared.max_hold_ms.load(Ordering::SeqCst);
             worst_hold_ms = worst_hold_ms.max(held);
+            // BUG-0122: the dial is the third phase, and the only one the
+            // other two structurally cannot see.
+            let conn = shared.max_connect_ms.load(Ordering::SeqCst);
+            let conn_fail = shared.connect_failures.load(Ordering::SeqCst);
+            worst_connect_ms = worst_connect_ms.max(conn);
+            connect_failures_total += conn_fail;
             println!(
                 "iter {iteration}: pair {pair_idx}: killed MASTER (writes in flight); {} {rto}ms{} \
                  [kill_ms={kill_ms} dead_us={dead_us} recovered_at_ms={recovered_at_ms} \
-                 max_hold_ms={held} dispatch={dispatch_ms}ms client_stall={stall_ms}ms]; acked keys \
+                 max_hold_ms={held} max_connect_ms={conn} connect_failures={conn_fail} \
+                 dispatch={dispatch_ms}ms client_stall={stall_ms}ms]; acked keys \
                  regressed: {lost_here} (deepest {deepest_here}ms before the death; cap {lag_hard_ms}ms){vol_note}{}",
                 if shared.edge.is_some() {
                     "client stall"
@@ -1391,6 +1404,23 @@ fn main() {
         "  worst single write held: {worst_hold_ms}ms before any answer (ack or -THROTTLED); \
          --write-deadline-ms is what bounds this, docs/slo.md"
     );
+    // The third phase, and the reason BUG-0122 spent two runs unattributed.
+    // Neither number above can contain a dial: `worst_hold_ms` starts at the
+    // SEND, and a connect precedes it; the client stall is a gap between
+    // acks, which a dial that never connects cannot close. So a client whose
+    // entire outage is spent inside connect(2) reports small holds and an
+    // unattributable stall — which is what happened.
+    println!(
+        "  worst single DIAL: {worst_connect_ms}ms (connect_addr entered to returned, success or \
+         failure), with {connect_failures_total} failed dial(s) after a kill"
+    );
+    if worst_connect_ms >= 2_900 {
+        println!(
+            "  NOTE: a dial at or near 3s is the `connect_timeout` in flint-tls expiring, which \
+             means SYNs went UNANSWERED rather than refused — a dead port answers at once. Read \
+             this against the fleet journal before blaming the promotion path (BUG-0122)."
+        );
+    }
     println!(
         "  deepest acked-write loss: {deepest_loss_ms}ms before the DEATH (post-SIGKILL stamp, BUG-0120 — not the pre-kill stamp in the iteration lines; cap {lag_hard_ms}ms + {rpo_margin_ms}ms margin; older-than-cap losses are COUNTED, not failed — the cap bounds volume, not age)"
     );

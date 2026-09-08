@@ -27,7 +27,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use flint_resp::Value;
 
@@ -141,6 +141,32 @@ pub struct Shared {
     /// When the longest hold ended, for the same reason `max_stall_at_ms`
     /// exists: the magnitude alone cannot be placed against the journal.
     pub max_hold_at_ms: AtomicU64,
+    /// The longest a single DIAL took — `Client::connect_addr` entered to
+    /// returned — whether it connected or failed. Post-kill only, like the
+    /// two above.
+    ///
+    /// BUG-0122. This is the phase neither of the other two can see.
+    /// `record_hold` measures a request from SEND to ANSWER, and a connect
+    /// happens before any send; `max_stall_ms` is a gap between acks, and a
+    /// dial that never connects produces no ack to bound it. So a client
+    /// spending its entire outage inside `connect(2)` reports single-digit
+    /// holds and a stall it cannot attribute — which is exactly what three
+    /// kills in 433 did, at a suspiciously constant ~3.17 s against a
+    /// `connect_timeout` of 3 s.
+    ///
+    /// Timed around the call REGARDLESS OF OUTCOME, which is the whole point:
+    /// a dial that times out returns `Err`, and the loop below used to
+    /// discard that with a bare `continue`. The failure path is where the
+    /// time goes, so measuring only successful dials would reproduce the
+    /// original blindness in a new place.
+    pub max_connect_ms: AtomicU64,
+    /// When the longest dial ended, so it can be placed against the fleet
+    /// journal like the other two.
+    pub max_connect_at_ms: AtomicU64,
+    /// Dials that returned `Err` after the kill. A slow SUCCESS and a dial
+    /// that burned a timeout and gave up are different failures with
+    /// different fixes, and the magnitude alone does not separate them.
+    pub connect_failures: AtomicU64,
     /// Acks observed strictly after the kill instant — proof that service
     /// continued, and how the client path knows the window has closed.
     pub acks_after_kill: AtomicU64,
@@ -224,6 +250,9 @@ impl Shared {
             max_stall_at_ms: AtomicU64::new(0),
             max_hold_ms: AtomicU64::new(0),
             max_hold_at_ms: AtomicU64::new(0),
+            max_connect_ms: AtomicU64::new(0),
+            max_connect_at_ms: AtomicU64::new(0),
+            connect_failures: AtomicU64::new(0),
             acks_after_kill: AtomicU64::new(0),
             key_count,
             edge: None,
@@ -299,7 +328,12 @@ impl Shared {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         for ep in eps {
-            let Ok(mut c) = Client::connect_addr(&ep, &self.tls) else {
+            // Timed around the dial whether it connects or not (BUG-0122).
+            let t0 = Instant::now();
+            let dialled = Client::connect_addr(&ep, &self.tls);
+            let took = t0.elapsed().as_millis() as u64;
+            record_connect(self, took, dialled.is_err());
+            let Ok(mut c) = dialled else {
                 continue;
             };
             if let Ok(Value::Bulk(Some(raw))) = c.call(&[b"FLINTINFO"]) {
@@ -325,6 +359,37 @@ impl Shared {
 /// Fold one request's held time into `max_hold_ms`. Post-kill only, so it
 /// covers exactly the window `max_stall_ms` covers and the two can be read
 /// side by side.
+/// Fold one dial's duration into `max_connect_ms`. Post-kill only, so it can
+/// be read beside `max_hold_ms` and `max_stall_ms` over the same window.
+///
+/// `failed` is carried because the interesting case is the dial that does NOT
+/// connect: a `connect_timeout` that expires returns `Err` after its full
+/// budget, and counting only successes would leave the expensive path unseen
+/// for a second time.
+fn record_connect(shared: &Shared, took_ms: u64, failed: bool) {
+    if shared.kill_ms.load(Ordering::SeqCst) == 0 {
+        return;
+    }
+    if failed {
+        shared.connect_failures.fetch_add(1, Ordering::SeqCst);
+    }
+    let mut cur = shared.max_connect_ms.load(Ordering::SeqCst);
+    while took_ms > cur {
+        match shared.max_connect_ms.compare_exchange(
+            cur,
+            took_ms,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            Ok(_) => {
+                shared.max_connect_at_ms.store(now_ms(), Ordering::SeqCst);
+                break;
+            }
+            Err(actual) => cur = actual,
+        }
+    }
+}
+
 fn record_hold(shared: &Shared, sent: u64, answered: u64) {
     if shared.kill_ms.load(Ordering::SeqCst) == 0 {
         return;
@@ -510,6 +575,68 @@ mod tests {
         Shared::new(Vec::new(), None, 8)
             .with_edge(None, tag.to_string())
             .with_run_nonce(nonce.to_string())
+    }
+
+    /// BUG-0122's instrument, and the two properties it exists for.
+    ///
+    /// The bug was a phase nothing measured: `record_hold` starts at the SEND,
+    /// so a dial that blocks is invisible to it. A measure added to close that
+    /// gap is worth nothing if it inherits the same blindness, and there are
+    /// exactly two ways for it to do so — ignoring the failed dial (the one
+    /// that burns the timeout) and recording outside the kill window (which
+    /// would fold ordinary startup dials into the outage figure).
+    #[test]
+    fn a_failed_dial_is_measured_and_counted() {
+        let sh = shared("p0x0", "");
+        sh.kill_ms.store(now_ms(), Ordering::SeqCst);
+
+        // The case the original code discarded with a bare `continue`.
+        record_connect(&sh, 3_005, true);
+        assert_eq!(
+            sh.max_connect_ms.load(Ordering::SeqCst),
+            3_005,
+            "a dial that FAILED after 3s is the whole point of this measure"
+        );
+        assert_eq!(sh.connect_failures.load(Ordering::SeqCst), 1);
+        assert_ne!(
+            sh.max_connect_at_ms.load(Ordering::SeqCst),
+            0,
+            "without the instant the magnitude cannot be placed against the journal"
+        );
+
+        // Max, not last: a fast success afterwards must not erase it.
+        record_connect(&sh, 2, false);
+        assert_eq!(sh.max_connect_ms.load(Ordering::SeqCst), 3_005);
+        assert_eq!(
+            sh.connect_failures.load(Ordering::SeqCst),
+            1,
+            "a successful dial is not a failure"
+        );
+    }
+
+    /// The window gate, asserted with a POSITIVE control: the same call that
+    /// is ignored before the kill must register after it. Asserting only the
+    /// zero would pass just as happily against a function that records
+    /// nothing ever.
+    #[test]
+    fn dials_outside_the_kill_window_are_ignored() {
+        let sh = shared("p0x0", "");
+        assert_eq!(sh.kill_ms.load(Ordering::SeqCst), 0, "no kill armed yet");
+        record_connect(&sh, 9_999, true);
+        assert_eq!(
+            sh.max_connect_ms.load(Ordering::SeqCst),
+            0,
+            "a dial before any kill is startup cost, not outage"
+        );
+        assert_eq!(sh.connect_failures.load(Ordering::SeqCst), 0);
+
+        sh.kill_ms.store(now_ms(), Ordering::SeqCst);
+        record_connect(&sh, 9_999, true);
+        assert_eq!(
+            sh.max_connect_ms.load(Ordering::SeqCst),
+            9_999,
+            "positive control: the identical call must land once a kill is armed"
+        );
     }
 
     /// THE property the nonce's placement rests on. Only the text inside `{}`
