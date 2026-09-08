@@ -142,8 +142,32 @@ static INTERNAL_CLIENT: std::sync::OnceLock<
     Option<std::sync::Arc<flint_tls::ReloadableClientConfig>>,
 > = std::sync::OnceLock::new();
 
+/// How long any controller dial may take before it gives up (BUG-0124).
+///
+/// The controller's own probes bounded the REPLY and left the DIAL on
+/// flint-tls's `CONNECT_BACKSTOP` — 3 s, a ceiling on a blackholed peer rather
+/// than a latency budget. `observe()` dials up to three times against one node
+/// (FLINTINFO, then PING, then `socket_open`), so a node whose SYNs went
+/// unanswered cost a single observation **up to 6.5 s**.
+///
+/// That lands directly on RTO. Detection latency is the front half of failover,
+/// and it was hostage to a timeout chosen for a different purpose: measured in
+/// `soak-20260908T043150Z`, detection tracked the stalled host at r = 0.984
+/// over 391 kills, worst 3452 ms against a p50 of 567 ms.
+///
+/// 800 ms matches the read timeout `call` already sets, and it is deliberately
+/// LOOSER than the 500 ms this same file already gives `socket_open` to decide
+/// whether a node is socket-alive. A dial budget longer than the liveness
+/// threshold the controller judges by was the inconsistency; this cannot be too
+/// tight without `socket_open` having been too tight first.
+const CONNECT_BUDGET: Duration = Duration::from_millis(800);
+
 fn internal_connect(addr: &str) -> std::io::Result<flint_tls::Stream> {
-    flint_tls::connect_reloadable(addr, INTERNAL_CLIENT.get().unwrap_or(&None))
+    flint_tls::connect_reloadable_within(
+        addr,
+        INTERNAL_CLIENT.get().unwrap_or(&None),
+        CONNECT_BUDGET,
+    )
 }
 
 /// Fleet-journal target (--journal <cp-addr>). Best-effort, detached: the
@@ -1884,6 +1908,54 @@ fn fence(id: &str, zombie: &str, epoch: u32) {
 
 #[cfg(test)]
 mod tests {
+
+    /// BUG-0124: the dial budget has to keep WORST-CASE DETECTION inside the
+    /// exit budget, because detection latency is the front half of RTO.
+    ///
+    /// `observe()` dials a node up to three times when it does not answer —
+    /// FLINTINFO, then PING, then `socket_open` — so one observation of a node
+    /// whose SYNs go unanswered costs `2 * dial + 500 ms`, and the promote
+    /// decision needs `confirm` of them.
+    ///
+    /// This is the arithmetic that made the fix worth making at ANY exit
+    /// budget. On flint-tls's 3 s backstop the worst case is 19.8 s, which
+    /// overruns not just the old 3 s exit but the 10 s one that replaced it —
+    /// so a blackholed host could breach the budget no matter which number was
+    /// written down.
+    #[test]
+    fn worst_case_detection_stays_inside_the_exit_budget() {
+        const EXIT_BUDGET: Duration = Duration::from_secs(10);
+        const CONFIRM: u32 = 3; // the shipped --confirm
+        const POLL: Duration = Duration::from_millis(100); // the shipped --poll-ms
+        const SOCKET_OPEN_BUDGET: Duration = Duration::from_millis(500);
+
+        // FLINTINFO + PING + socket_open, all against a node that never answers.
+        let worst_observe = CONNECT_BUDGET * 2 + SOCKET_OPEN_BUDGET;
+        let worst_detect = (worst_observe + POLL) * CONFIRM;
+
+        assert!(
+            worst_detect < EXIT_BUDGET,
+            "worst-case detection {worst_detect:?} reaches the {EXIT_BUDGET:?} exit \
+             budget on dials alone"
+        );
+
+        // The regression this guards: inheriting the backstop puts it at 19.8s.
+        let unbounded = (flint_tls::CONNECT_BACKSTOP * 2 + SOCKET_OPEN_BUDGET + POLL) * CONFIRM;
+        assert!(
+            unbounded > EXIT_BUDGET,
+            "if the backstop no longer overruns the exit budget this test has \
+             stopped demonstrating why CONNECT_BUDGET exists"
+        );
+
+        // And it must stay looser than the liveness threshold this file already
+        // judges by, or socket_open was the thing that was too tight.
+        assert!(
+            CONNECT_BUDGET >= SOCKET_OPEN_BUDGET,
+            "a dial budget TIGHTER than socket_open's own {SOCKET_OPEN_BUDGET:?} \
+             would give up before the check that decides socket-liveness"
+        );
+    }
+
     /// BUG-0073. The flag must be clear after the thread UNWINDS, not merely
     /// after it returns.
     ///

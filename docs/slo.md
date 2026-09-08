@@ -53,8 +53,18 @@ That is a deliberate tradeoff, not a slow failover, and the 10 s budget above
 accommodates it with room. Quote it whenever the RTO figure is quoted, for the
 same reason `--min-replicas-to-write` is quoted: the number measured on a fleet
 where masters die cleanly is not the number a fleet sees when a host stalls.
-Measured in `soak-20260908T043150Z` — 391 kills, detection latency p50 567 ms,
-worst 3452 ms, tracking the kill dispatch at r = 0.984. See BUG-0124.
+
+**No measured run has taken that path.** Across 391 master kills in
+`soak-20260908T043150Z`, every `Detected` event carries `cause = "master
+unreachable, confirmed across required ticks"` — the refused path. The patience
+window is a real property of the controller and is stated here so the budget is
+read with it in view; it is not the explanation for any tail yet observed.
+
+**What that tail was:** the controller's own dials were unbounded. Detection
+latency p50 567 ms, worst 3452 ms, tracking the stalled host at r = 0.984 over
+those 391 kills — because `observe()` bounded its reply at 800 ms and left the
+dial on the 3 s backstop, putting worst-case detection at 19.8 s. Fixed in
+BUG-0124; worst case is now 6.6 s.
 
 ```sh
 packaging/aws/chaos-cluster/run.sh --hosts 5 --tag <tag>   # fleet repo, real hosts
