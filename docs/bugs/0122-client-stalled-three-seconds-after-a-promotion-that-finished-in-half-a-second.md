@@ -1,9 +1,10 @@
 # BUG-0122 — the client stalled ~3.1 s after a promotion that finished in ~0.5 s
 
-Status: OPEN · Severity: medium — still disqualifying for M2's exit, which
-requires RTO <= 3 s in EVERY run, but the promotion path is now exonerated by
-the journal: the stall is a client-side dial cost and its mechanism is not yet
-established
+Status: OPEN — cause ESTABLISHED 2026-09-08; what remains is a decision, not a
+fix · Severity: medium — still disqualifying for M2's exit, which requires
+RTO <= 3 s in EVERY run. The promotion path is exonerated and the stall is
+measured: the harness pays flint-tls's 3 s connect backstop dialling the seat
+it has just killed
 Found: 2026-09-07, in the soak re-run on the corrected instruments
 Component: the DIRECT client discovery path (`flint-chaos` `connect_master` /
 `flint_tls::connect`) — originally filed against the promotion path, which the
@@ -225,3 +226,74 @@ edge path is what M3's exit measured at ~472 ms client-observed.
 
 So M2's open question is not "why is promotion slow" but **"is the direct path
 the right thing to judge the exit on"** — a decision for Jeff, not a fix.
+
+## SETTLED 2026-09-08 — the instrument answered on its first run
+
+`soak-20260908T020420Z`, 800 kills / 421 promotions on rc.69, the first run
+carrying `record_connect`. One kill breached, and it carries the answer in the
+line itself:
+
+    iter 574: RTO 3469ms [max_hold_ms=4 max_connect_ms=3000
+                          connect_failures=19 dispatch=660ms client_stall=3221ms]
+
+**The dial took exactly 3000 ms** — the `connect_timeout` expiring — and
+`3221 = 3000 + 221`, where 221 ms is the run's ordinary recovery (median
+265 ms). The breach is one blown dial plus a normal failover.
+
+### Why this is conclusive rather than suggestive
+
+The dial distribution over 421 master kills is **bimodal with nothing in
+between**:
+
+| dial | count |
+|---|---|
+| 1 ms | 23 |
+| 2 ms | 4 |
+| 21 / 27 / 29 ms | 1 each |
+| **3000 ms** | **1** |
+
+9,473 dials failed after a kill across the run. **9,472 of them cost about a
+millisecond** — a dead port answers RST at once — and exactly one cost the full
+backstop. A latency problem produces a tail; this produces a cliff, and the
+single point at the cliff is the single breach.
+
+The journal agrees, as it did for the earlier breaches: `Detected` +467 ms,
+`PromoteIssued`/`Promoted` +474 ms. The fleet had a writable master ~3 s before
+the client found it.
+
+The seat prediction also came true, and is now barely needed: the victim
+dialled FIRST carries the only dial over 29 ms and the only breach (n=211);
+the other victim's worst dial is 29 ms (n=210), with medians 266 vs 264 ms.
+
+### What it was
+
+The harness restarts the killed seat immediately (`kill_master_hot` calls
+`a.restart`). `connect_master` then walks endpoints in order and dials that
+seat first. For a narrow window the restarting seat neither answers nor
+refuses — the SYN goes unanswered — and the dial pays flint-tls's
+`CONNECT_BACKSTOP` in full. BUG-0123 measured that behaviour directly against
+TEST-NET-1: a dropped SYN spends the budget to the millisecond.
+
+Note what this does NOT vindicate. The mechanism I drafted and refuted — "a
+restarting seat binds before it can serve, so the dial hangs" — was still
+wrong: #176 binds first on purpose and `serve_loading` answers. The window is
+narrower than that story and sits before the listener is up, not after. Being
+right about the phase did not make the story about the phase right.
+
+### What it means for M2, and the decision it leaves
+
+**The product's failover is not implicated by any breach in three runs.**
+Detection and promotion complete in ~0.5 s every time. What the direct path
+adds is the harness's own cost dialling a seat it just restarted.
+
+Two remedies exist and they are not equivalent:
+
+1. **Bound the harness's dial** — `connect_within` from BUG-0123 already
+   exists, so this is a one-line change to `connect_master`.
+2. **Judge the exit on the edge path**, where a real client lives: the proxy's
+   address is fixed and outlives every failover, which is the point of it.
+
+Both would make the exit pass, and that is exactly why **neither is mine to
+take**. Changing what a measurement counts so that it clears its own budget
+needs to be a deliberate decision by the person who owns the milestone, not a
+tidy-up by the person who found the cause. Recorded here and raised; not done.
