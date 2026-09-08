@@ -41,6 +41,21 @@ the client gets acknowledged — not the time for an internal probe to notice.
 Through the proxy edge a client typically sees no error at all, only one slow
 write, because the proxy chases the promotion and retries underneath.
 
+**A master that STALLS rather than dies is held on purpose, and the budget has
+to cover it.** The controller promotes away from a master that *refuses* the
+connection after `confirm` ticks — ~300 ms at the shipped `--poll-ms 100
+--confirm 3`. A master whose socket still accepts but whose process cannot
+answer (CPU starvation, a compaction burst, a stalled host) is ALIVE but slow,
+and promoting away from it just flaps, so it is held for `--slow-promote-ms`,
+**default 4000 ms**.
+
+That is a deliberate tradeoff, not a slow failover, and the 10 s budget above
+accommodates it with room. Quote it whenever the RTO figure is quoted, for the
+same reason `--min-replicas-to-write` is quoted: the number measured on a fleet
+where masters die cleanly is not the number a fleet sees when a host stalls.
+Measured in `soak-20260908T043150Z` — 391 kills, detection latency p50 567 ms,
+worst 3452 ms, tracking the kill dispatch at r = 0.984. See BUG-0124.
+
 ```sh
 packaging/aws/chaos-cluster/run.sh --hosts 5 --tag <tag>   # fleet repo, real hosts
 tools/controller_drill.sh                                  # locally, budget asserted
