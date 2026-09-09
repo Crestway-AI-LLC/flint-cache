@@ -646,3 +646,26 @@ failures — rests on measurements and stands. The FIX recommendations that
 followed it did not: "clear_needs_reseed is wrong" and then "the master needs a
 retention check" were both produced by reasoning from a caller's doc comment
 without reading the callee. The code answered both in about a minute.
+
+### The unit test attempted, and why it does not exist yet
+
+Written and run on 2026-09-09, then removed rather than left red. It opened a
+`RocksKv` with retention on, wrote 2,000 values, deleted the oldest archived
+WAL segment, and asked `updates_since_budgeted(1, 1)` which variant it got.
+
+**The walk succeeded.** The fixture's own guard refused to certify that as an
+answer — a walk that returns `Ok` after its oldest segment was deleted has not
+exercised the gap, and reporting the variant from it would have been a result
+about nothing.
+
+The reason is worth keeping, because it constrains the next attempt: the
+fixture FLUSHED. Flushing moves the memtable into SSTs, and `get_updates_since`
+served the walk without needing the deleted archive file at all. Reproducing
+the real condition needs WAL rotation WITHOUT a flush, so that early sequences
+live only in an archived segment and the walk must read the file that was
+removed.
+
+So the question — whether a missing segment reaches
+`ReplError::WalGap` or `ReplError::Storage`, and therefore whether the master's
+admission check can see it — remains open, with a narrower next step than
+before: build the fixture without flushing and force rotation by write volume.
