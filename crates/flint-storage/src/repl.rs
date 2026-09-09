@@ -1925,3 +1925,85 @@ mod walgap_variant {
         }
     }
 }
+
+#[cfg(test)]
+mod walgap_shortread {
+    use super::*;
+
+    struct TempDir(std::path::PathBuf);
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// BUG-0082's surviving lead. Deleting an INTERIOR archived segment made
+    /// neither walk return an error — which is either "no gap was created" or
+    /// "the walk returns what it can and says nothing". Those are very
+    /// different, and only the second would let a master answer FLINTSYNC-OK
+    /// having walked past a hole.
+    ///
+    /// The discriminator is COVERAGE, not the Result: does the returned span
+    /// reach the DB's latest sequence, or stop short of it?
+    /// **THIS TEST FAILS TODAY, AND THAT IS THE POINT.** It asserts the
+    /// behaviour BUG-0082 needs and today's code does not have: with an
+    /// interior archived segment missing, the walk returns `Ok` covering only
+    /// 62,124 of 260,000 sequences. Ignored so a known defect does not red the
+    /// gate, NOT because it is unimportant — run it with `--ignored` and it
+    /// fails on the spot. Delete the `#[ignore]` when the short read is fixed
+    /// and it becomes the regression test.
+    #[ignore = "BUG-0082: FAILS today — the walk short-reads past an interior hole"]
+    #[test]
+    fn an_interior_hole_does_not_silently_shorten_the_walk() {
+        let d =
+            TempDir(std::env::temp_dir().join(format!("flint-shortread-{}", std::process::id())));
+        let _ = std::fs::remove_dir_all(&d.0);
+        let kv = RocksKv::open_with_retention(&d.0, 3600, 4096).expect("open");
+        let val = vec![b'v'; 1024];
+        for i in 0..260_000u32 {
+            kv.db()
+                .put(format!("k{i:07}").as_bytes(), &val)
+                .expect("put");
+        }
+        kv.flush();
+
+        let latest = kv.db().latest_sequence_number();
+        let archive = d.0.join("archive");
+        let mut segs: Vec<_> = std::fs::read_dir(&archive)
+            .map(|r| r.filter_map(|e| e.ok()).map(|e| e.path()).collect())
+            .unwrap_or_default();
+        segs.sort();
+        assert!(
+            segs.len() >= 3,
+            "need >=3 archived segments; got {}",
+            segs.len()
+        );
+
+        // CONTROL: intact, the walk must reach `latest`. Without this, a walk
+        // that never reaches it for unrelated reasons would look like a short
+        // read caused by the deletion.
+        let before = kv
+            .updates_since_budgeted(1, usize::MAX)
+            .expect("intact walk");
+        let reach_before = before.last().map(|b| b.last_seq).unwrap_or(0);
+        assert_eq!(
+            reach_before, latest,
+            "control: an intact walk did not reach latest ({reach_before} vs {latest})"
+        );
+
+        std::fs::remove_file(&segs[1]).expect("remove an interior segment");
+        match kv.updates_since_budgeted(1, usize::MAX) {
+            Err(ReplError::WalGap(_)) => { /* honest refusal */ }
+            Ok(after) => {
+                let reach = after.last().map(|b| b.last_seq).unwrap_or(0);
+                assert_eq!(
+                    reach, latest,
+                    "SHORT READ: with an interior segment deleted the walk returned Ok \
+                     covering only up to {reach} of {latest} — a master answering from \
+                     this has walked past a hole and vouched for the span anyway"
+                );
+            }
+            Err(other) => panic!("unexpected variant: {other:?}"),
+        }
+    }
+}

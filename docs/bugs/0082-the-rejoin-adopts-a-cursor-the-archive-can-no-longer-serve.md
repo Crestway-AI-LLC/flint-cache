@@ -706,3 +706,55 @@ established — two fixtures failing to produce an error is not the same as
 proving none is produced — and the next step is to check whether
 `get_updates_since` yields a truncated iterator or an erroring one when an
 interior segment is absent.
+
+## 2026-09-09 — MECHANISM FOUND: the walk short-reads past an interior hole
+
+The lead in the previous section was right, and it is now measured. With an
+interior archived segment removed, `updates_since_budgeted` returns **`Ok`
+with a silently truncated span**:
+
+    control (intact)          walk reaches seq 260,000 of 260,000
+    interior segment deleted  walk returns Ok, reaching 62,124 of 260,000
+
+No error. No short-read signal. Just fewer batches than the span the caller
+asked for, and a success.
+
+**That closes the chain this bug has been missing since 2026-09-01:**
+
+1. the master's admission check calls `updates_since_budgeted(cursor, 1)`
+2. with a hole in the archive it returns **Ok** — short, but Ok
+3. the master answers `FLINTSYNC-OK`
+4. the replica clears `NEEDS_RESEED` and warm-rejoins **on that promise**
+5. the tailer streams into the hole, hits `FATAL`, exits
+6. the next start clears the marker again and repeats it
+
+It also explains the asymmetry that made the earlier fixtures look
+contradictory. Deleting the OLDEST segment fails `get_updates_since` at its
+starting point, which maps to `WalGap` and refuses honestly — that is the one
+refusal observed working on the playground. An interior hole never fails the
+start, so the iterator simply stops early and nothing reports it.
+
+**And it retires two hypotheses from earlier today**, both of mine: the
+`WalGap`/`Storage` variant split (refuted by test — a missing segment does
+reach the check as `WalGap`), and the probe's one-byte budget hiding the gap
+(the budget is irrelevant; an UNBOUNDED walk short-reads too).
+
+### The test
+
+`repl.rs::walgap_shortread::an_interior_hole_does_not_silently_shorten_the_walk`
+asserts the behaviour this needs and FAILS today, so it carries `#[ignore]`
+with that stated in its reason rather than being softened into a test of the
+broken behaviour. Run it with `--ignored` and it fails on the spot. Deleting
+the `#[ignore]` is what closes this bug.
+
+It has a control, because the assertion is about coverage and a walk that
+never reached `latest` for unrelated reasons would look identical: the intact
+walk must reach `latest` before anything is deleted.
+
+### What a fix has to decide
+
+Whether `updates_since_budgeted` should report a gap it walked past — the
+iterator knows it stopped early, and the caller cannot tell a short read from
+a caught-up replica — or whether the admission check should compare the span
+it got against the span it asked for. The first is the honest place; the
+second is a smaller change. Not chosen here.
