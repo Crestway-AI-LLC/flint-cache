@@ -251,6 +251,16 @@ fn main() {
     println!("  pairs under test: {}", targets.len());
     // Before a single write: this oracle cannot mean anything against a
     // namespace that is allowed to evict. See Target::refuse_if_evictable.
+    // BUG-0126: before a single write, also refuse a provocation this
+    // topology cannot perform. Placed beside refuse_if_evictable because it is
+    // the same kind of check -- an assertion that the run about to happen is
+    // capable of meaning what its output will claim.
+    for t in &targets {
+        if let Err(e) = t.refuse_if_stall_unsupported(stall_replica_ms) {
+            eprintln!("{e}");
+            std::process::exit(2);
+        }
+    }
     for t in &targets {
         if let Err(e) = t.refuse_if_evictable() {
             eprintln!("{e}");
