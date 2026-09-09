@@ -343,6 +343,19 @@ one. What was measured to help is the **pairing** `FLINT_LEVEL_BASE_MB=64` with
 amplification 16.0 → 10.2. `FLINT_BG_JOBS` alone on a shallow LSM is the case
 that measured *worse*.
 
+**What "untuned" means in every comparison on this page: an 8 MB level base,
+which is not a stock seat.** `flint-storage` sets `max_bytes_for_level_base`
+only when `FLINT_LEVEL_BASE_MB` is present, so an unset seat runs RocksDB's own
+default of **256 MB** — and nothing in the AMI, in first-boot, or in any
+inventory sets it. The 8 MB baseline behind 2.6x, 16.0 → 10.2, 136 GB and the
+1.3x below comes from the sweep rigs, where a dataset too small for a 256 MB
+base never leaves L0 and there is no LSM to measure.
+
+So on your seat the pairing **lowers** the level base, 256 → 64 MB, rather than
+raising it, and these ratios are evidence that the pairing works — not the size
+of the improvement to expect. The only stock-baseline run measured **+9.4%** on
+a bulk fill, at a value size that does not settle the comparison. BUG-0127.
+
 If the disk is your constraint rather than the clock, raise
 `FLINT_LEVEL_BASE_MB=64` **alone**: 45.2 MB/s at **104 GB** resident, which is
 1.3x the baseline throughput while using **32 GB less** disk than leaving it
@@ -356,15 +369,30 @@ same disk. It also commits 32 MB of write buffer per engine, which scales with
 seats per host, not with hosts. Even paired, the seat still stalls **43.4%** of
 the time at that size: this moves the ceiling, it does not remove it.
 
-**One cost is named and NOT measured: read latency.** Every number above is a
-write-path number. The pairing changes the shape of the LSM, and the work that
-produced it said re-measuring beyond-RAM `GET` afterwards was "part of the fix,
-not a follow-up" — that measurement was never taken, on either side of the
-pairing. The direction is not obvious enough to guess at: a larger level base
-means fewer levels to search, more background jobs means more IO competing with
-reads, and nobody has run it. If your workload is read-sensitive, measure your
-own `GET` percentiles before and after rather than treating the write gain as
-free. Tracked in `docs/bugs/0013`.
+**The read cost is now measured, and it is not a cost.** This paragraph named
+read latency as an unmeasured price of the pairing until 2026-09-08. It has
+since been run in the regime the pairing is recommended for — 96 GB on a 2-core
+seat, each arm building its own tree from empty, both held beyond RAM by 7x —
+against a stock seat:
+
+| beyond-RAM `GET` | stock | paired | change |
+|---|---|---|---|
+| p50 | 1.503 ms | **0.999 ms** | −33.5% |
+| p99 | 8.639 ms | **5.279 ms** | −38.9% |
+| p99.9 | 15.295 ms | **10.815 ms** | −29.3% |
+| throughput | 12,578 ops/s | **18,035 ops/s** | +43.4% |
+
+Reads got faster at every percentile, so the pairing does not spend read
+latency to buy write throughput. The reasoning this paragraph used to carry —
+a larger level base searches fewer levels, more background jobs compete with
+reads — was about a comparison you do not face, since the pairing lowers your
+level base. The likely reason reads improve is the one that stops the writes
+stalling: draining L0 leaves a read fewer files to search. That is an
+inference; L0 counts were not captured.
+
+If your workload is read-sensitive, measure your own `GET` percentiles anyway.
+What is gone is any reason to treat the write gain as carrying an unpriced read
+risk beside it. Tracked in `docs/bugs/0013`.
 
 Full derivation, both sweeps, and the untested range between them in
 `docs/bugs/0013`.

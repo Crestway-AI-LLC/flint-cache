@@ -1005,3 +1005,73 @@ regime the pairing is recommended for, which is an AWS run of some hours, and
 this file has already established that the small-LSM regime would answer a
 different question. Priced and deferred rather than approximated, in keeping
 with the rest of this file.
+
+## 2026-09-08 — the read measurement, taken at last, and it goes the other way
+
+The row above that said **not done** is done. Run in the regime this file
+specified — 96 GB on a 2-core seat (i4i.large), each arm building its own tree
+from empty, both held beyond RAM by 7x (117 GB resident against 16.5 GB) —
+`packaging/aws/readtail-pairing/run.sh` in the ops repo, run
+`readtail-20260908T225452Z`.
+
+**Beyond-RAM `GET`, default against paired:**
+
+| | default | paired | change |
+|---|---|---|---|
+| p50 | 1.503 ms | **0.999 ms** | −33.5% |
+| p99 | 8.639 ms | **5.279 ms** | −38.9% |
+| p99.9 | 15.295 ms | **10.815 ms** | −29.3% |
+| mean | 1.907 ms | **1.330 ms** | −30.3% |
+| throughput | 12,578 ops/s | **18,035 ops/s** | +43.4% |
+
+Zero misses on both arms, so these are reads that found their keys, not
+negative lookups resolved by a bloom filter.
+
+**The answer is that the pairing does not spend read latency to buy write
+throughput.** It buys both. That is the opposite of the concern this file was
+written around, and it means the recommendation in `self-hosting.md` was
+shipping with a named cost that does not exist.
+
+### The guess this file made was about a different comparison
+
+Every version of the "direction is not obvious" paragraph — here and in
+`self-hosting.md` — reasons from *"a larger level base means fewer levels to
+search, while more background jobs means more IO competing with reads"*.
+
+**The paired arm has a SMALLER level base than the arm it beat.** The
+comparison run is stock (`max_bytes_for_level_base` unset, so RocksDB's
+default 256 MB, `max_background_jobs` 2) against the pairing (64 MB, 4 jobs),
+both read off the engine's own LOG rather than assumed. So the first term
+points the wrong way and the second was supposed to hurt, and reads improved
+at every percentile regardless. Neither term dominates.
+
+The mechanism this file already documents fits better: at the defaults L0
+accumulates faster than two threads can drain it, and a read must search every
+L0 file. Draining L0 makes reads cheaper for the same reason it makes writes
+stop stalling. **That is an inference** — this run measured latency and
+throughput, not L0 file counts, and no LSM statistics were captured — so it is
+offered as consistent with the result, not as the demonstrated cause.
+
+### What this does NOT establish, stated rather than buried
+
+**It is not a re-measurement of the write-path ratios.** The baseline here is
+stock. Every write number this file publishes — 2.6x ingest, write-amp
+16.0 → 10.2, +36% resident — is measured against an **8 MB** level base, which
+is not stock and not what any deployment runs. Those two baselines are not the
+same experiment and their ratios must not be read side by side. This is now
+BUG-0127.
+
+**One run per arm; there is no spread here.** The fill phase corroborates
+independently, in a different phase with a different access pattern and before
+either measurement began: 21,705 → 23,753 ops/s, +9.4%. That is a much smaller
+gain than 2.6x, which is the observation BUG-0127 exists for — but this run
+used 1 KiB values where the 2.6x used 10 KB incompressible ones, so it does not
+separate "different baseline" from "different value size" and does not refute
+the 2.6x.
+
+**Read and write clients were symmetric** (4 threads x 6 connections each,
+running concurrently), which is why the two halves report near-identical
+throughput and percentiles within each arm: they split one seat's capacity.
+The number above is therefore a read latency under concurrent mixed load,
+which is the right shape for "does turning this on hurt reads", and is not an
+isolated read-path figure.
