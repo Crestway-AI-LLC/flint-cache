@@ -215,7 +215,7 @@ CORE="${FLINT_CORE_ORDER:-kill_order restart repl kill_release failover proxy sl
       client_compat proxy_registry reseed lag_cap widowed_grace replica_starvation managed_slow_sync controller
       promote_notice fleet_guard ctl_cpha upgrade anti_affinity attached_chaos
       async_flag async_writes txn_failure backup restore_ns backup_schedule
-      backup_seat gc_sweep keystat start_guard seat_log cold_start_roles
+      backup_seat gc_sweep bigkey_delete keystat start_guard seat_log cold_start_roles
       build_stamp config_drift tenant_status proxy_conformance edge_roll
       cpha_roll admin_gated_proxy edge_ca_trust chaos_edge_tls
       cert_rotate control_tls controller_ha controller_managed controller_slow_master controller_stall
