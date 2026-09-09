@@ -1,8 +1,21 @@
 # BUG-0127: the published pairing gain has a baseline nothing deploys
 
-**Status:** OPEN, found 2026-09-08 · Severity: medium. Not a wrong number —
-a true number about a configuration no deployment runs, published as the gain
-an operator should expect.
+**Status:** CLOSED 2026-09-09 — the defect is fixed and the residue is a
+measurement, which is a roadmap item rather than an open bug. Found
+2026-09-08 · Severity was medium.
+
+The defect this bug names is a published claim a reader would act on wrongly,
+and `self-hosting.md` no longer permits that reading: it states its baseline,
+says the pairing LOWERS the level base on a real seat, and gives the one
+stock-baseline datapoint. What is left — measuring the pairing's write gain
+against stock at 10 KB values — is work nobody has done, not a fault still in
+the tree, and an open bug list that carries "someone should measure this" stops
+being a list of things that are wrong. It cost this session twice today:
+BUG-0101 and BUG-0011 were both read as outstanding work and neither was.
+
+Carried to `docs/roadmap.md` in the ops repo, beside M1's deferred 100 GB
+warm-restart measurement, which is deferred for the same reason and reads
+better next to it than in a bug tracker.
 
 ## The claim, and where it is published
 
