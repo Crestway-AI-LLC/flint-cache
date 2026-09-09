@@ -582,3 +582,67 @@ correct in its own terms and merely mistimed, or whether the warm path should
 range-check its cursor against the master's retained span before adopting it.
 Those are different fixes in different places, and this section deliberately
 stops at the measurement rather than choosing between them.
+
+### The guard already exists, and the livelock is already documented
+
+Two corrections to the section above, both from reading the code rather than
+the logs.
+
+**The livelock is not a new finding.** `flint-server/src/main.rs:6100` describes
+it exactly, above the admission check that exists to prevent it:
+
+> an OK makes it CLEAR its own NEEDS_RESEED marker and warm rejoin — after
+> which the tailer discovers the gap, re-marks, and exits. The next start
+> repeats it: a livelock that no supervisor can break, where a plain refusal
+> here costs one re-seed and recovers.
+
+**And the check is built the right way** — it does not reimplement retention,
+it asks the stream's own question:
+
+```rust
+if let Err(ReplError::WalGap(why)) = kv.updates_since_budgeted(cursor, 1) {
+```
+
+> Ask the STREAM's own question rather than a second implementation of it: a
+> budget of 1 byte materializes at most one batch … so a healthy cursor never
+> false-refuses.
+
+So "add a retention check to the master" — which this session recommended
+first — is wrong. The check is there, it is well-built, and one of the four
+observed refusals is it working: `WALGAP cursor 184548882 is no longer
+reachable from this WAL … trying a rewind`.
+
+### What is actually unexplained, stated as the next question
+
+The probe and the stream make the SAME call with the SAME cursor moments
+apart, and disagree: the probe returns OK, the stream returns
+`ReplError::WalGap` naming a missing archive segment. That is the whole
+remaining question, and it is a narrow one.
+
+One concrete asymmetry to check first, in `flint-storage/src/repl.rs:167`:
+
+```rust
+let iter = self.db().get_updates_since(last_applied)
+    .map_err(|e| ReplError::WalGap(e.to_string()))?;   // cursor unreachable -> WalGap
+for item in iter {
+    let (first_seq, batch) = item.map_err(|e| ReplError::Storage(e.to_string()))?;  // -> Storage
+```
+
+The two failure points map to DIFFERENT variants, and the admission check
+matches only one of them. If a missing segment can surface at the second, the
+master falls through to `FLINTSYNC-OK` having never inspected the error.
+
+**Not asserted, because the evidence cuts both ways**: the replica's FATAL
+reads `WALGAP full sync required: IO error: … archive/157732.log`, and the
+streaming path only produces that string from an `Err(ReplError::WalGap(_))`
+arm — so in the streaming path the same IO error does arrive as `WalGap`. Two
+call sites, one error, and it is not yet established that they classify it
+alike. That is the measurement to take next, and it is a unit test rather than
+a fleet run.
+
+**Method note, since this file is partly about that.** The conclusion in the
+preceding section — that neither retention nor translation explains the
+failures — rests on measurements and stands. The FIX recommendations that
+followed it did not: "clear_needs_reseed is wrong" and then "the master needs a
+retention check" were both produced by reasoning from a caller's doc comment
+without reading the callee. The code answered both in about a minute.
