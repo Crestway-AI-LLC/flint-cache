@@ -595,52 +595,39 @@ impl Target {
     /// Freeze this pair's replica so the master's acks outrun replication.
     /// Returns false when the target cannot be frozen (attached fleets: the
     /// seat may be on another host, and reaching it would need the ssh path).
-    pub fn stall_replica(&self, on: bool) -> bool {
+    /// Freeze this pair's replica for `ms`, then resume it.
+    ///
+    /// BOUNDED BY CONSTRUCTION, and that replaced an on/off pair for a reason.
+    /// The old shape left the resume to the caller, so any early return
+    /// between the two calls stranded a stopped seat — one that still holds
+    /// its port and still appears in `ps`, so anything checking liveness by
+    /// looking rather than asking calls it healthy.
+    ///
+    /// On an attached fleet the freeze happens on the seat's own machine, via
+    /// `flintctl stall-node`, which sleeps there. A dropped ssh therefore
+    /// cannot leave a replica frozen.
+    pub fn stall_replica_for(&self, ms: u64) -> Result<(), String> {
         match self {
             Target::Local { cluster, .. } => {
-                signal_by_port(cluster.replica(), if on { "-STOP" } else { "-CONT" });
-                true
+                let port = cluster.replica();
+                signal_by_port(port, "-STOP");
+                std::thread::sleep(Duration::from_millis(ms));
+                signal_by_port(port, "-CONT");
+                Ok(())
             }
-            Target::Attached(_) => false,
+            Target::Attached(a) => {
+                let Some(replica) = a.replica() else {
+                    return Err("pair has no replica to stall".to_string());
+                };
+                // An old flintctl on the far side has no `stall-node` and
+                // exits non-zero, which arrives here as Err. That is the whole
+                // point: BUG-0126 was a stall a fleet could not perform and
+                // reported as performed.
+                a.ctl(&["stall-node", &replica, &ms.to_string()])
+                    .map(|_| ())
+                    .map_err(|e| format!("stall {replica} for {ms}ms: {e}"))
+            }
         }
-    }
-
-    /// Whether `stall_replica` can actually stop this pair's replica.
-    ///
-    /// It cannot on an attached fleet, and not merely because nobody wrote it:
-    /// `Attached` reaches seats through flintctl, and flintctl exposes no
-    /// signal primitive at all -- `host-kill-pidfile`, `host-stop-seat`,
-    /// `host-stop-all`, and nothing that sends SIGSTOP.
-    pub fn supports_stall(&self) -> bool {
-        matches!(self, Target::Local { .. })
-    }
-
-    /// BUG-0126. A stall that could not be honoured was skipped in silence --
-    /// `stall_replica_ms > 0 && cluster.stall_replica(true)` short-circuits --
-    /// and the run then described its result as having happened "under a
-    /// 1800ms replica stall", because that sentence is built from the FLAG and
-    /// not from the fleet. One full 800-kill batch was recorded that way.
-    ///
-    /// Refusing is deliberately harsher than warning. The failure was not
-    /// someone missing a warning; it was a run completing and writing a
-    /// plausible sentence into the ledger the milestone count is computed
-    /// from. A batch lost to a hard error costs an afternoon. A batch that
-    /// lies costs the credibility of every row beside it.
-    pub fn refuse_if_stall_unsupported(&self, stall_replica_ms: u64) -> Result<(), String> {
-        if stall_replica_ms == 0 || self.supports_stall() {
-            return Ok(());
-        }
-        let what = match self {
-            Target::Local { .. } => "a local cluster".to_string(),
-            // members(), NOT master(): master() polls the fleet for up to 20s
-            // and then PANICS if nothing answers, so building this refusal out
-            // of it would hang and then crash instead of printing the reason
-            // the run is being refused. The declared pair needs no network.
-            Target::Attached(a) => format!("the attached pair {:?}", a.members()),
-        };
-        Err(format!(
-            "REFUSING TO RUN: --stall-replica-ms {stall_replica_ms} was requested against {what},\n                           where a stall cannot be applied: seats are reached through flintctl,\n                           which has no signal primitive. The run would have stalled nothing and\n                           reported its result 'under a {stall_replica_ms}ms replica stall' regardless\n                           (BUG-0126).\n                           Drop the flag to measure the bound under natural lag -- the run says so\n                           when you do -- or use a local cluster, where the stall works."
-        ))
     }
 
     /// Kill the master WITHOUT any convergence pre-wait, for workloads that
@@ -2019,58 +2006,5 @@ mod client_tests {
             "message should count the refusals: {msg}"
         );
         let _ = server.join();
-    }
-}
-
-#[cfg(test)]
-mod stall_capability {
-    use super::{Attached, Target};
-
-    /// An inventory with `tls off`, so `open` is pure parsing and reaches no
-    /// network. The addresses are TEST-NET-1 and are never dialled: the whole
-    /// point of the check is that it decides before anything is dialled.
-    /// `tag` keeps each test on its own path. Both tests originally shared one
-    /// keyed on process::id(), which is the SAME for both, and cargo runs them
-    /// in parallel: the first run failed and the identical second run passed.
-    /// A test that clears on retry is worse than one that fails.
-    fn attached_pair(tag: &str) -> Target {
-        let dir =
-            std::env::temp_dir().join(format!("flint-stall-cap-{}-{tag}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("temp dir");
-        let inv = dir.join("cluster.flint");
-        std::fs::write(
-            &inv,
-            "tls off\nstatedir /nonexistent\npair 192.0.2.10:7001,192.0.2.11:7001\n",
-        )
-        .expect("write inventory");
-        Target::Attached(Attached::open(
-            inv.to_str().expect("temp path is valid utf-8"),
-            0,
-        ))
-    }
-
-    #[test]
-    fn a_stall_request_is_refused_when_it_cannot_be_honoured() {
-        let t = attached_pair("refused");
-        assert!(!t.supports_stall(), "an attached fleet cannot be stalled");
-        let err = t
-            .refuse_if_stall_unsupported(1800)
-            .expect_err("1800ms against an attached fleet must be refused");
-        // The message has to carry the number asked for, because the failure
-        // being prevented is a run that reports a stall it never applied.
-        assert!(err.contains("1800"), "refusal must name the request: {err}");
-        assert!(err.contains("BUG-0126"), "refusal must cite the bug: {err}");
-    }
-
-    /// The positive control, and the one that matters: asking for NO stall
-    /// must not be refused, or every soak run to date stops working. A check
-    /// that refuses everything would pass the assertion above on its own.
-    #[test]
-    fn no_stall_requested_is_not_an_error() {
-        assert!(
-            attached_pair("allowed")
-                .refuse_if_stall_unsupported(0)
-                .is_ok()
-        );
     }
 }

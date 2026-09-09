@@ -1,7 +1,8 @@
 # BUG-0126: the replica stall was a flag, not a stall, on the only fleet that runs it
 
-**Status:** FIXED (the false attribution). The provocation itself remains
-unimplemented on a real fleet — named at the bottom, not quietly left.
+**Status:** FIXED. The false attribution was fixed 2026-09-08 by refusing the
+run; the provocation itself was implemented 2026-09-09, so the refusal is gone
+and the stall works on a real fleet.
 
 ## Symptom
 
@@ -99,15 +100,43 @@ completed and wrote a plausible sentence into a ledger that the milestone
 count is computed from. A batch lost to a hard error costs an afternoon; a
 batch that lies costs the credibility of every row beside it.
 
-## Still missing, and not fixed here
+## Implemented 2026-09-09: the stall works on a real fleet
 
-There is no way to provoke replica lag on a real fleet. `Attached` reaches
-seats through `flintctl` (`self.ctl(&["kill-node", addr])`), and `flintctl`
-has no signal subcommand — `host-kill-pidfile`, `host-stop-seat`,
-`host-stop-all`, and nothing that sends `SIGSTOP`. Implementing it means a new
-`host-signal` primitive plus routing, which is a feature and is not smuggled
-in under a bug fix.
+The refusal was the right interim — refuse what you cannot do — but the thing
+worth having is the capability. `flintctl` gained `stall-node <addr> <ms>`,
+routed through the same `Runner` as `kill-node`, over a new
+`host-stall-seat <name> <bin> <ident> <ms>` primitive.
 
-Until then the RPO bound on a multi-host fleet is measured only when the
-replica happens to fall behind, which is the state BUG-0120 opened. The
-difference is that it now says so.
+**Narrower than the `host-signal` this section originally proposed, on
+purpose.** A verb that sends an arbitrary signal to an arbitrary process is a
+second way to kill anything, and `kill-node` already owns killing with the
+convergence waits that make it safe. This one can only pause.
+
+**And the duration is part of the primitive, which is the safety argument.**
+`SIGSTOP` outlives whoever sent it. An on/off pair leaves the resume to the
+caller, so any early return between the two strands a stopped seat — and a
+stopped seat is worse than a dead one, because it keeps its port and stays in
+`ps`, so everything that checks liveness by LOOKING rather than by ASKING
+reports it healthy. The sleep happens on the seat's own host, so a dropped ssh
+cannot strand it. What remains, stated rather than implied: killing that
+host's flintctl mid-sleep still would. That is one process on one host instead
+of a network hop, and the 60 s cap bounds how long the window can be open.
+
+`Target::stall_replica(on: bool)` became `stall_replica_for(ms)` for the same
+reason, and its failure now ends the run instead of being ignored — a
+provocation that did not happen must not be survivable in silence, which is
+the whole of this bug.
+
+### One operational condition, because it is a trap of the same shape
+
+The stall runs on the seat's OWN host, so that host's flintctl must have
+`host-stall-seat`. `--ctl-from-source` re-installs the source build **only on
+the orchestrator** (chaos-cluster/run.sh), leaving every other host on the
+release binary. So until a release carries the verb, `--stall-replica-ms`
+against a real fleet needs `--fleet-from-source`.
+
+It fails loudly when it cannot be honoured, which is the point. But note the
+shape: without `--fleet-from-source` it would work whenever the replica
+happened to sit on the orchestrator and fail otherwise — intermittent by
+topology, which is harder to read than a uniform failure. Hence saying so here
+and in the soak harness rather than leaving it to be discovered.

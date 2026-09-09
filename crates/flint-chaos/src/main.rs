@@ -251,16 +251,6 @@ fn main() {
     println!("  pairs under test: {}", targets.len());
     // Before a single write: this oracle cannot mean anything against a
     // namespace that is allowed to evict. See Target::refuse_if_evictable.
-    // BUG-0126: before a single write, also refuse a provocation this
-    // topology cannot perform. Placed beside refuse_if_evictable because it is
-    // the same kind of check -- an assertion that the run about to happen is
-    // capable of meaning what its output will claim.
-    for t in &targets {
-        if let Err(e) = t.refuse_if_stall_unsupported(stall_replica_ms) {
-            eprintln!("{e}");
-            std::process::exit(2);
-        }
-    }
     for t in &targets {
         if let Err(e) = t.refuse_if_evictable() {
             eprintln!("{e}");
@@ -554,14 +544,23 @@ fn main() {
             // writes that have not replicated when it dies. Kept under the
             // 2s liveness window so the pair still looks failover-worthy —
             // this is the bounded-loss regime, not the widowed one.
-            if stall_replica_ms > 0 && cluster.stall_replica(true) {
-                std::thread::sleep(Duration::from_millis(stall_replica_ms));
-                // Unfreeze BEFORE the kill, not after. The survivor has to be
-                // running to be promoted and to answer the oracle, but it is
-                // still carrying the whole backlog, so the master dies with
-                // acked writes the replica has not taken. Resuming afterwards
-                // instead meant sending FLINTPROMOTE to a stopped process.
-                cluster.stall_replica(false);
+            // The stall RESUMES before this returns, which is why the kill
+            // below is safe: the survivor has to be running to be promoted and
+            // to answer the oracle, but it is still carrying the whole backlog,
+            // so the master dies with acked writes the replica has not taken.
+            // Resuming after the kill instead meant sending FLINTPROMOTE to a
+            // stopped process.
+            //
+            // A failure here ENDS THE RUN. Until BUG-0126 this call could not
+            // be honoured on a real fleet and said nothing, and the run then
+            // reported its result "under a 1800ms replica stall" having
+            // stalled nothing. A provocation that did not happen must not be
+            // survivable in silence.
+            if stall_replica_ms > 0
+                && let Err(e) = cluster.stall_replica_for(stall_replica_ms)
+            {
+                eprintln!("FAIL: --stall-replica-ms {stall_replica_ms} could not be honoured: {e}");
+                std::process::exit(2);
             }
             // Arm the writer's RTO clock, then kill. The kill blocks through
             // the promotion, so any timestamp taken after it would include

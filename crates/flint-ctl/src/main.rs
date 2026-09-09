@@ -2018,6 +2018,110 @@ fn local_stop_seat(
     }
 }
 
+/// Send one signal to a fixed set of pids. Separated from `local_stall_seat`
+/// so the freeze and the resume can be exercised against a real process
+/// without going through pid discovery — the discovery is tested by its own
+/// refusals, and this is tested by whether a process actually stops.
+fn signal_pids(pids: &[u32], sig: &str) {
+    for pid in pids {
+        let _ = Command::new("kill").args([sig, &pid.to_string()]).status();
+    }
+}
+
+/// Freeze a seat's process for `ms`, then resume it — ON THE SEAT'S OWN HOST.
+///
+/// The duration is part of the primitive rather than left to the caller, and
+/// that is the entire safety argument. SIGSTOP outlives whoever sent it: an
+/// orchestrator that dies between the stop and the resume leaves a seat
+/// frozen, and a frozen seat is worse than a dead one — it still holds its
+/// port and still appears in `ps`, so everything that checks liveness by
+/// LOOKING rather than by ASKING reports it healthy. Sleeping here puts the
+/// resume on the machine that owns the process, so a dropped ssh cannot
+/// strand it.
+///
+/// What remains, stated rather than implied: killing THIS flintctl mid-sleep
+/// would still strand the seat. That window is one process on one host rather
+/// than a network hop, and the cap bounds how long it can be open.
+///
+/// Deliberately NOT a general `host-signal`. A verb that sends any signal to
+/// any process is a second way to kill anything, and `kill-node` already owns
+/// killing with the convergence waits that make it safe. This one can only
+/// pause, and only for a bounded time.
+fn local_stall_seat(name: &str, bin: &str, ident: &str, ms: u64) -> Result<(), String> {
+    const MAX_STALL_MS: u64 = 60_000;
+    if ms == 0 || ms > MAX_STALL_MS {
+        return Err(format!(
+            "host-stall-seat: {ms}ms is outside 1..={MAX_STALL_MS} — an unbounded freeze is the \
+             failure this verb exists to make impossible"
+        ));
+    }
+    // Same exact-token identification stop_seat trusts. The pidfile is not
+    // consulted: it is best-effort everywhere else in this file, and a stall
+    // that silently froze nothing is precisely the defect BUG-0126 was about.
+    let pids = pids_matching(bin, ident);
+    if pids.is_empty() {
+        return Err(format!(
+            "{name}: no {bin} process matching {ident} — refusing to report a stall that did \
+             not happen"
+        ));
+    }
+    signal_pids(&pids, "-STOP");
+    std::thread::sleep(Duration::from_millis(ms));
+    // Resume EXACTLY what was frozen, from the list captured before the stop.
+    // Re-deriving it here could resume a different set — or miss one, which is
+    // the stranded-seat case this whole design is built to avoid.
+    signal_pids(&pids, "-CONT");
+    Ok(())
+}
+
+/// `local_stall_seat` through a Runner: the freeze has to happen on the seat's
+/// machine, so a remote seat is stalled by asking that host's own flintctl.
+///
+/// An old remote flintctl has no `host-stall-seat` and exits non-zero, which
+/// surfaces here as an error rather than a silent success. That matters more
+/// than it looks: BUG-0126 was a stall request that a fleet could not honour
+/// and reported as honoured anyway.
+fn stall_seat(
+    inv: &Inventory,
+    r: &Runner,
+    name: &str,
+    bin: &str,
+    ident: &str,
+    ms: u64,
+) -> Result<(), String> {
+    if !r.is_remote() {
+        return local_stall_seat(name, bin, ident, ms);
+    }
+    let argv = vec![
+        format!("{}/flintctl", inv.bins),
+        "host-stall-seat".into(),
+        name.to_string(),
+        bin.to_string(),
+        ident.to_string(),
+        ms.to_string(),
+    ];
+    let out = r
+        .output(&argv)
+        .map_err(|e| format!("stall {name} on {}: {e}", r.label()))?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    Err(format!(
+        "{name} on {}: {}",
+        r.label(),
+        if err.is_empty() {
+            format!(
+                "no output, exit {} (255 = the ssh connection failed; a non-zero exit with no \
+                 message usually means this host's flintctl predates host-stall-seat)",
+                out.status.code().unwrap_or(-1)
+            )
+        } else {
+            err
+        }
+    ))
+}
+
 /// Push the widowed grace that a pair's CURRENT size implies to every member
 /// of it, live, after a topology change.
 ///
@@ -6972,6 +7076,18 @@ fn host_command(cmd: &str, a: &[String]) -> ! {
             local_kill_pidfile(&need(0, "statedir"), &need(1, "name"));
             std::process::exit(0)
         }
+        "host-stall-seat" => {
+            let ms: u64 = need(3, "ms")
+                .parse()
+                .unwrap_or_else(|_| die("host-stall-seat: ms"));
+            match local_stall_seat(&need(0, "name"), &need(1, "bin"), &need(2, "ident"), ms) {
+                Ok(()) => std::process::exit(0),
+                Err(e) => {
+                    eprintln!("{e}");
+                    std::process::exit(1)
+                }
+            }
+        }
         "host-stop-all" => {
             local_stop_all(&need(0, "statedir"));
             std::process::exit(0)
@@ -7029,6 +7145,7 @@ const MUTATING: &[&str] = &[
     "upgrade",
     "push-bins",
     "kill-node",
+    "stall-node",
     "restart-node",
     "reattach-node",
     "expand",
@@ -7161,7 +7278,8 @@ flintctl — drive a Flint cluster from one inventory file.
 
 Lifecycle    bootstrap  start  stop  status [--json]  verify [--probe <t>:<tok>]
 Topology     expand  add-replica  swap-node  decommission-node  migrate-slots
-Failure      failover <node>  kill-node <node>  restart-node <node>
+Failure      failover <node>  kill-node <node>  stall-node <node> <ms>
+             restart-node <node>
 Tenants      tenant add|remove  tenant-quota  tenant-reads  tenant-cache
              tenant-async  tenant-federate
 Edge         retire-proxy  proxy-cache
@@ -7251,6 +7369,32 @@ fn main() {
             ) {
                 Ok(()) => println!("killed {addr}"),
                 Err(e) => die(&format!("kill-node {addr}: {e}")),
+            }
+        }
+        // The bounded pause. Where `kill-node` is the abrupt loss of a seat,
+        // this is the seat that is still there and cannot answer — the
+        // alive-but-slow master the controller holds for --slow-promote-ms,
+        // and the lagging replica an RPO bound is only exercised against.
+        // Until this existed, that condition could be produced on a local
+        // cluster and NOWHERE on a real fleet (BUG-0126).
+        "stall-node" => {
+            let addr = rest.first().expect("usage: stall-node <addr> <ms>");
+            let ms: u64 = rest
+                .get(1)
+                .and_then(|m| m.parse().ok())
+                .unwrap_or_else(|| die("usage: stall-node <addr> <ms>"));
+            let port = port_of(addr);
+            let d = &inv.statedir;
+            match stall_seat(
+                &inv,
+                &runner_for(&inv, addr),
+                &format!("node-{port}"),
+                "flint-server",
+                &format!("{d}/node-{port}"),
+                ms,
+            ) {
+                Ok(()) => println!("stalled {addr} for {ms}ms, resumed"),
+                Err(e) => die(&format!("stall-node {addr}: {e}")),
             }
         }
         "restart-node" => {
@@ -8547,6 +8691,88 @@ mod no_master_message_tests {
         assert!(
             m.contains("pair 7 has no reachable master after 10s"),
             "{m}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod stall_seat_tests {
+    use super::{local_stall_seat, signal_pids};
+    use std::process::Command;
+    use std::time::{Duration, Instant};
+
+    /// A process's state letter from ps: `T` is stopped, anything else is not.
+    fn state_of(pid: u32) -> String {
+        let out = Command::new("ps")
+            .args(["-o", "state=", "-p", &pid.to_string()])
+            .output()
+            .expect("ps");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// Poll rather than sleep a fixed interval. Signal delivery is prompt but
+    /// not instantaneous, and a fixed sleep here would be exactly the kind of
+    /// timing-sensitive assertion that produces a drill nobody trusts.
+    fn wait_until(pid: u32, stopped: bool) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if state_of(pid).starts_with('T') == stopped {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        false
+    }
+
+    #[test]
+    fn a_stopped_process_is_really_stopped_and_really_resumes() {
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+        assert!(wait_until(pid, false), "the child should start out running");
+
+        signal_pids(&[pid], "-STOP");
+        assert!(
+            wait_until(pid, true),
+            "after -STOP the child should be in state T, was {:?}",
+            state_of(pid)
+        );
+
+        // The half that matters. A freeze nobody can undo is worse than a
+        // kill: the process keeps its port and stays in ps, so anything that
+        // checks liveness by looking calls it healthy.
+        signal_pids(&[pid], "-CONT");
+        assert!(
+            wait_until(pid, false),
+            "after -CONT the child should be running again, was {:?}",
+            state_of(pid)
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn an_unbounded_freeze_is_refused() {
+        // 0 and "longer than the cap" are the two shapes that would leave a
+        // seat stopped for as long as anyone forgot about it.
+        for ms in [0u64, 60_001, u64::MAX] {
+            let e = local_stall_seat("node-7001", "flint-server", "/nowhere/node-7001", ms)
+                .expect_err("an out-of-range stall must be refused");
+            assert!(e.contains("unbounded freeze"), "{e}");
+        }
+    }
+
+    #[test]
+    fn a_stall_that_found_no_process_is_an_error_not_a_success() {
+        // BUG-0126 in one assertion: the failure was reporting a stall that
+        // never happened. Silence here would reproduce it exactly.
+        let e = local_stall_seat("node-7001", "flint-server", "/nowhere/node-7001", 50)
+            .expect_err("stalling a seat that is not running must fail");
+        assert!(
+            e.contains("refusing to report a stall that did not happen"),
+            "{e}"
         );
     }
 }
