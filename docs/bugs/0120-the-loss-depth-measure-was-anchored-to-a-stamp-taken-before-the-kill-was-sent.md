@@ -1,8 +1,10 @@
-# BUG-0120 — the loss-depth measure was anchored to a stamp taken before the kill was sent
+# BUG-0120 — the loss-depth measure was anchored to a stamp taken before the kill was sent (FIXED 2026-09-09)
 
-Status: OPEN (instrument fixed, in two halves; of the 80 writes in question 56
-are settled by hand from the fixed reading and 24 are not, with an unmeasured
-residue — see "The verdict on the 80")
+Status: FIXED 2026-09-09. The instrument was repaired in two halves and is now
+VERIFIED by a run that provoked the bound on purpose. What cannot be recovered
+is recorded rather than counted as outstanding: 24 of the original 80 writes
+stay unsettled forever, because the log that would settle them kept aggregates
+(see "The verdict on the 80").
 Found: 2026-09-06, verifying the M2 failover soak's batch-3 result
 Component: `crates/flint-chaos/src/main.rs`
 
@@ -210,6 +212,42 @@ a bound tested only by accident was tested three times in 401 kills.
 
 The volume bound — the one the product actually promises — is still not asserted
 anywhere. It needs the observed write rate and is tracked separately.
+
+## Closed 2026-09-09 — both halves, and one of them can never close
+
+**The re-run happened, and it is the one this section asked for.**
+`soak-20260909T165644Z`: 800 kills, 403 master, fleet built from source at
+`1bb722a`, `--stall-replica-ms 1800`. It is the first run in the project's
+history to provoke the RPO bound deliberately rather than wait for the replica
+to fall behind — which needed `flintctl stall-node`, and that did not exist
+until BUG-0126 was fixed the same day.
+
+| | natural lag (3 runs) | this run |
+|---|---|---|
+| writes shed | 283 / 470 / 700 | **17,638** |
+| acked writes lost | 0 | **0** |
+| kills over budget | 0 | **0** |
+| **unjudged** | 0 | **0** |
+
+The shed count is 25–62x anything natural lag produced, so the provocation
+plainly reached the replication path rather than merely stopping a process.
+Three independent confirmations that the stall applied, since one would have
+been an absence argument: the shed count, ~1,800 ms of added wall time per
+master kill against a ~4,450 ms no-stall baseline, and a failure path that
+exits 2 rather than continuing quietly.
+
+**The volume bound is asserted now too**, which was the other loose end above.
+`flint-chaos` prints `RPO volume: N acked write(s) lost across master kills; M
+kill(s) over budget, K unjudged` on every run including zero — deliberately,
+"so 'no breach' and 'never judged' cannot look alike", which is this bug's own
+lesson turned into a line of output.
+
+**Iter 603's 24 keys stay unsettled, permanently.** That is not an outstanding
+task and it is not being quietly dropped: the run that produced them recorded
+aggregates rather than per-entry `at` values, so no later instrument can go
+back and judge them. What was owed was a demonstration that the FIXED
+instrument leaves no residue, and `0 unjudged` across 403 master kills with the
+bound deliberately loaded is that demonstration.
 
 ## Why nothing caught it
 
