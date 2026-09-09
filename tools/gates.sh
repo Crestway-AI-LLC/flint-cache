@@ -1373,7 +1373,23 @@ for line in idx.split("\n"):
     m = re.match(r"\| (?:BUG-)?.?(\d{4})", line)
     if not m:
         continue
-    marker_of[m.group(1)] = state_marker(line)
+    # THE TITLE CELL WINS WHERE IT CARRIES A MARKER, because that is the one a
+    # reader sees. Scanning the whole row takes the LAST state parenthetical,
+    # and the evidence cell legitimately contains prose about earlier states --
+    # so a stale marker in the title could be masked by a correct one further
+    # right, and the row would pass while telling a reader the opposite.
+    #
+    # BUG-0101 was exactly that: title cell "(OPEN)" over a Status of CLOSED,
+    # with "(CLOSED 2026-09-05 ...)" later in the evidence. The check read
+    # CLOSED, agreed with the file, and passed; a session scanning this index
+    # reported the bug to Jeff as open work on 2026-09-09.
+    #
+    # Falls back to the whole row when the title cell has none, which is the
+    # common convention -- 0064, 0070 and 0071 keep both markers in the
+    # evidence cell, and flagging those would be firing on prose.
+    cells = line.split("|")
+    title_cell = cells[2] if len(cells) > 2 else ""
+    marker_of[m.group(1)] = state_marker(title_cell) or state_marker(line)
 
 bad = []
 unmarked_closed = []
