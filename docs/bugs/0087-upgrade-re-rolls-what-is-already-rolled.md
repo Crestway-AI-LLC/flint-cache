@@ -26,7 +26,7 @@ command.
 
 A roll that dies half-way leaves the fleet on two builds. The obvious repair —
 the one an operator reaches for at 02:00, and the one
-[ADR-0036](../../../flint-cache-ops/docs/adr/0036-the-record-a-stalled-roll-leaves-behind.md)
+ADR-0036, *the record a stalled roll leaves behind*, in the private operator repo
 assumed when it said the action "is one `flintctl upgrade` away" — is to run
 the upgrade again. That claim is wrong and this is why: re-running it
 

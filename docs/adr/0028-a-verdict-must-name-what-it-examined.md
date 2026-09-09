@@ -15,7 +15,7 @@ pass was about something nobody had asked about:
 | 2 | a mutation control | a file the mutation missed by two spaces of indentation |
 | 3 | the write-path guard audit | a property none of the three bugs had |
 | 4 | the release gate | `/Volumes/FlintDev/wt/flint`, a worktree days stale, while `main` sat clean |
-| 5 | a repo-identity guard | `flint-cache-ops`, because it CONTAINS `flint-cache` |
+| 5 | a repo-identity guard | the private operator repo's name, because it CONTAINS this repo's |
 
 Provenance, since this ADR is about exactly that: (3) and (4) are mine and I
 have the logs. (1), (2) and (5) were reported to me by the session that hit

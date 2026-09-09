@@ -1116,7 +1116,7 @@ fi
 # drills, which no single drill can check about itself.
 # THE BUG INDEX AND THE BUG FILES MUST AGREE, AND EVERY NUMBER IS ONE BUG.
 #
-# Ported from flint-cache-ops on 2026-09-02, where the same three defects were
+# Ported from the private operator repo on 2026-09-02, where the same three defects were
 # found, plus two this repo taught on the way in:
 #
 #   1. The table header carried TWO columns while 46 rows carried THREE. GFM

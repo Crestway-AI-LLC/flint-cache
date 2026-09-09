@@ -60,7 +60,25 @@ HIST_PROBE=$(git log -p --all -- . "$SELF" 2>/dev/null | grep -cE "^\+" || true)
 echo "  history pipeline sees $HIST_PROBE added lines"
 
 echo "== no credentials, ever committed"
-HITS=$(git log -p --all -- . "$SELF" 2>/dev/null | grep -E "^\+.*$CREDS" | head -5 || true)
+# DECLARED BENIGN MATCHES, and each one must still match (see the file's
+# header). History cannot be edited, so a false positive here has no other
+# remedy than a recorded exception -- and the alternative, a check left
+# permanently red, is one nobody reads. rc.69 shipped past exactly that.
+BENIGN=tools/preflight-benign-history.txt
+RAW=$(git log -p --all -- . "$SELF" 2>/dev/null | grep -E "^\+.*$CREDS" || true)
+HITS="$RAW"
+if [ -r "$BENIGN" ]; then
+  while IFS="$(printf '\t')" read -r pat why; do
+    case "$pat" in ''|'#'*) continue ;; esac
+    [ -n "$why" ] || { fail "benign-history entry with no reason: $pat"; continue; }
+    # A dead entry is a place for a real match to hide.
+    printf '%s\n' "$RAW" | grep -qF -- "$pat" \
+      || fail "benign-history entry no longer matches anything, remove it: $pat"
+    HITS=$(printf '%s\n' "$HITS" | grep -vF -- "$pat" || true)
+  done < "$BENIGN"
+  echo "  $(grep -cvE '^\s*(#|$)' "$BENIGN") declared-benign history match(es), each still matching"
+fi
+HITS=$(printf '%s\n' "$HITS" | grep -vE '^\s*$' | head -5 || true)
 [ -z "$HITS" ] || { echo "$HITS" | sed 's/^/    /'; fail "credential-shaped strings in history"; }
 
 echo "== no AWS account id"

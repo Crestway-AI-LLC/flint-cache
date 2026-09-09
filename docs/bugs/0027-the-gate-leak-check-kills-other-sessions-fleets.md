@@ -128,7 +128,7 @@ The session whose fleet this destroyed wrote up the two chaos defects it exposed
 keyspace walk that fell back off the edge to the pair masters and still printed
 PASS. Both are fixed and pinned by `tools/chaos_edge_tls_drill.sh`; the anchor is
 `docs/field-notes.md`, "Chaos-tested, in a posture no customer runs", in the OPS
-repo (`Crestway-AI-LLC/flint-cache-ops`), with the reproduction. Not duplicated
+repo (the private operator lane), with the reproduction. Not duplicated
 here — a bug doc for a fixed-and-drilled defect would be a third copy.
 
 Worth reading beside this one. The walk defect is the same shape in the product:

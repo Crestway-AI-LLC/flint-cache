@@ -871,7 +871,7 @@ the verdict by mechanism rather than by evidence.
 ### The same signature, measured in the ops repo the night before
 
 Worth having because it puts numbers on the load dependence this bug
-suspects. `flint-cache-ops`' `saas_fulfillment` produced the identical line
+suspects. The operator lane's `saas_fulfillment` produced the identical line
 once its `flintctl bootstrap` output stopped being discarded (OPS-0117):
 
     pair 0    127.0.0.1:7103  loading epoch  build unstamped

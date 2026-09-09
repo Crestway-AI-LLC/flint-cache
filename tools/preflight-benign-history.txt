@@ -1,0 +1,20 @@
+# Credential-SHAPED strings already in git history that are demonstrably not
+# credentials. One per line: the exact substring, a tab, then why.
+#
+# WHY THIS FILE EXISTS. The credential scan reads `git log -p --all`, because a
+# secret added in one commit and removed in the next is in every clone forever.
+# The consequence is that a false positive can never be edited away either --
+# and an entry here is the only alternative to a check that stays red. A check
+# that is routinely red for a non-problem gets ignored, and then it is not a
+# check; on the one step of this project that cannot be undone, that is the
+# worst outcome available.
+#
+# THE BAR FOR ADDING A LINE. The string must be verifiably not a secret --
+# a documentation example, or a value too short or too obviously fake to be
+# one -- and the reason must say which. "It looks fine" is not a reason.
+# Anything genuinely leaked is not an entry here; it is a rotation.
+#
+# Every entry is asserted to STILL MATCH something in history. A line that has
+# stopped matching is dead, and a dead allowlist entry is a place for a real
+# match to hide.
+aws_secret_access_key="t"	an fsspec contract test's dummy value, s3-accelerator/python/test_fsspec_contract.py, committed 2026-08-24 in 220364f3. The value is the single character "t"; a real AWS secret key is 40 characters. Flagged because the pattern matches the ASSIGNMENT, which is the right thing for it to match.
