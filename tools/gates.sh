@@ -2634,7 +2634,8 @@ want = decl.group(1)
 # asking git returned zero files and this check read nothing. Caught by its own
 # floor rather than by passing quietly, which is the only reason it is a note
 # here and not a check that certified the tree for a week.
-SKIP_DIRS = {".git", "target", "node_modules", ".venv", "__pycache__", "dist"}
+SKIP_DIRS = {".git", "target", "node_modules", ".venv", "__pycache__", "dist",
+             ".claude"}
 files = []
 for root, dirs, names in os.walk("."):
     # A NESTED CHECKOUT IS NOT THIS TREE (2026-09-09). A git worktree marks
@@ -2648,6 +2649,15 @@ for root, dirs, names in os.walk("."):
     # git read nothing on the gate box, and a filesystem walk cannot honour an
     # exclude git is not there to apply. So the walk has to recognise a nested
     # checkout itself, which is one `.git` test per directory.
+    #
+    # AND THE `.git` TEST ALONE IS NOT ENOUGH ON THE GATE BOX, which is why
+    # `.claude` is in SKIP_DIRS above. The box's rsync runs
+    # `--exclude target --exclude .git`, and a bare rsync pattern matches a path
+    # COMPONENT at any depth -- so the nested worktree arrives with the very
+    # marker that identifies it stripped. The first version of this fix passed
+    # here and failed there for exactly that reason. `.claude` holds no tracked
+    # file in either repository; it is agent scratch, and nothing in it is this
+    # tree.
     dirs[:] = [d for d in dirs
                if d not in SKIP_DIRS
                and not os.path.exists(os.path.join(root, d, ".git"))]
