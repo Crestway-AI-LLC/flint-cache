@@ -2018,6 +2018,39 @@ fn local_stop_seat(
     }
 }
 
+/// Which of `pids` are NOT stopped, after waiting up to `budget` for them to be.
+///
+/// Polled rather than slept: signal delivery is prompt but not instantaneous,
+/// and a fixed sleep here is the timing-sensitive assertion that makes a check
+/// nobody trusts.
+fn wait_all_stopped(pids: &[u32], budget: Duration) -> Result<(), Vec<u32>> {
+    let deadline = Instant::now() + budget;
+    loop {
+        let laggards: Vec<u32> = pids
+            .iter()
+            .copied()
+            .filter(|pid| {
+                let Ok(out) = Command::new("ps")
+                    .args(["-o", "state=", "-p", &pid.to_string()])
+                    .output()
+                else {
+                    // Cannot ask: treat as not-proven-stopped rather than
+                    // assuming the good case.
+                    return true;
+                };
+                !String::from_utf8_lossy(&out.stdout).trim().starts_with('T')
+            })
+            .collect();
+        if laggards.is_empty() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(laggards);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// Send one signal to a fixed set of pids. Separated from `local_stall_seat`
 /// so the freeze and the resume can be exercised against a real process
 /// without going through pid discovery — the discovery is tested by its own
@@ -2066,6 +2099,20 @@ fn local_stall_seat(name: &str, bin: &str, ident: &str, ms: u64) -> Result<(), S
         ));
     }
     signal_pids(&pids, "-STOP");
+    // VERIFY THE FREEZE LANDED. `kill` failing was previously swallowed, so a
+    // signal that never arrived would sleep and return Ok -- success reported
+    // without being checked, which is the same defect this whole bug is about.
+    // Asking the process table is the difference between "we sent a signal"
+    // and "it stopped".
+    if let Err(not_stopped) = wait_all_stopped(&pids, Duration::from_millis(2000)) {
+        // Leave NOTHING frozen on the way out, including the ones that did
+        // stop before a later pid failed.
+        signal_pids(&pids, "-CONT");
+        return Err(format!(
+            "{name}: sent SIGSTOP to {pids:?} but {not_stopped:?} never entered state T — \
+             resumed everything and refusing to report a stall that did not happen"
+        ));
+    }
     std::thread::sleep(Duration::from_millis(ms));
     // Resume EXACTLY what was frozen, from the list captured before the stop.
     // Re-deriving it here could resume a different set — or miss one, which is
@@ -8762,6 +8809,28 @@ mod stall_seat_tests {
                 .expect_err("an out-of-range stall must be refused");
             assert!(e.contains("unbounded freeze"), "{e}");
         }
+    }
+
+    /// The positive control for the verification itself: a running process
+    /// that was never signalled must be reported as NOT stopped. Without this,
+    /// a `wait_all_stopped` that returned Ok unconditionally would pass every
+    /// other test in this module.
+    #[test]
+    fn the_stop_check_can_actually_fail() {
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+        let laggards = super::wait_all_stopped(&[pid], Duration::from_millis(200))
+            .expect_err("a running process must not be reported as stopped");
+        assert_eq!(laggards, vec![pid]);
+        // And it flips once the process really is stopped.
+        signal_pids(&[pid], "-STOP");
+        assert!(super::wait_all_stopped(&[pid], Duration::from_secs(5)).is_ok());
+        signal_pids(&[pid], "-CONT");
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
     #[test]
