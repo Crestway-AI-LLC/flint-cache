@@ -81,7 +81,7 @@ _cpu_busy_pct(){ # <snap_before> <snap_after>
 # overwriting a populated LSM rather than filling an empty one. A regime
 # budgeted for two runs delivered one: the second was killed at 85 minutes of
 # re-fill by the fleet's TTL, taking the post-leg apportionment with it
-# (flint-cache-ops OPS-0002).
+# (recorded as OPS-0002 in the operator lane's own notes).
 #
 # The fill is idempotent over the same key range and the scenarios are
 # read-dominated and do not consume the data, so skipping it on the repeats
