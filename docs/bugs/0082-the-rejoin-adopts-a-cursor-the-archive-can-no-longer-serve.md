@@ -496,3 +496,89 @@ intermittent, and the mechanism described above is unchanged in the code. What
 it changes is the next step: the question is no longer "read the reseed
 reason", it is **get rc.70 onto the playground and then read it** — and until
 that happens, a quiet journal is the only evidence there is.
+
+## 2026-09-09 — the instrument fired, and the answer is neither candidate
+
+The 2026-09-02 instrumentation has produced its data. rc.69 carries
+`archive_span` and the playground is running rc.69, so the "get rc.70 onto the
+playground" step above was already satisfied and nobody had looked.
+
+**Four refusals now name what the archive held**, and every one of them holds
+its FULL window:
+
+    archive holds 1439 segment(s), newest 0s old, oldest 43185s old
+    archive holds 1438 segment(s), newest 0s old, oldest 43195s old
+    archive holds 1454 segment(s), newest 0s old, oldest 43195s old
+    archive holds    8 segment(s), newest 2s old, oldest 41843s old
+
+43,185–43,195 s against a 43,200 s TTL. **The archive was not pruning early.**
+By the decision table above that settles the retention branch: it is not the
+cause.
+
+The table then says the answer must be translation. It is not, and the reason
+is that the table's translation branch assumes something this bug asserted
+without measuring — *"a seconds-long outage"*.
+
+### The outage is HOURS, and that changes the question
+
+A FATAL exits the process, so for any start preceded by one the node was down
+from that FATAL until the next start, and the gap between the two IS the
+outage. Measured on `node-7001`:
+
+| outage | warm rejoin |
+|---|---|
+| 6.7 h | clean |
+| 14.0 h | clean |
+| 14.0 h | **FATAL** |
+| 20.0 h | **FATAL** |
+
+Well inside the 12 h window succeeds, well outside fails, and ~14 h goes both
+ways — which is exactly the shape of a TTL over segment mtimes at its boundary,
+where whether one particular segment survives depends on the write rate and
+where the segment boundaries fell. No mis-translated cursor is needed to
+explain any of it: the cursor is old because the node was gone that long.
+
+### The failure is on the WARM path, which this file thought was the cure
+
+The section above reads recent rejoins taking "the warm path ADR-0035 added" as
+evidence the failing path had not recurred. Every failure here IS that path:
+
+    marked copy verified against the lineage held by …:7002: warm rejoin at seq …
+    replicating from …:7002 starting at seq …
+    FATAL: WALGAP full sync required: … (archive holds …)
+
+### And the FATAL's own remedy is discarded by the next start
+
+This is the part that makes it a loop rather than an incident. The FATAL says:
+
+> Marking for re-seed and exiting; the next start will full-sync from a checkpoint.
+
+The next start does not:
+
+    === flintctl start node-7001 at_ms=…
+    cleared NEEDS_RESEED: this node is the lineage now
+    marked copy verified …: warm rejoin at seq …
+
+**Every post-FATAL start in the log clears the marker and warm-rejoins at the
+same stale cursor.** So the recovery the FATAL promises never happens, and the
+pair returns to two copies only when a restart lands inside the window by luck.
+That is the "does not self-heal" in this bug's own severity line, mechanised.
+
+### A hypothesis of mine that the data refuted, kept because the error is instructive
+
+First reading was "outage exceeds the window", tested against the gaps between
+consecutive starts — and two clean starts had gaps of 14.0 h and 24.3 h, which
+looked like counterexamples and nearly retired a correct idea. The metric was
+wrong: a gap between STARTS is not an outage. Those two starts were not
+preceded by a FATAL, so the node ran through the interval and was merely
+restarted at the end of it, with a current cursor. The rule holds only where
+the previous start FATALed, which is the only case where the node provably died
+seconds in and the gap is genuinely down-time.
+
+### What is NOT established, and what the fix would have to decide
+
+Untraced: whether `cleared NEEDS_RESEED: this node is the lineage now` is
+correct in its own terms and merely mistimed, or whether the warm path should
+range-check its cursor against the master's retained span before adopting it.
+Those are different fixes in different places, and this section deliberately
+stops at the measurement rather than choosing between them.
