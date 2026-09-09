@@ -669,3 +669,40 @@ So the question — whether a missing segment reaches
 `ReplError::WalGap` or `ReplError::Storage`, and therefore whether the master's
 admission check can see it — remains open, with a narrower next step than
 before: build the fixture without flushing and force rotation by write volume.
+
+### 2026-09-09, second attempt: the fixture works, and it REFUTES the hypothesis
+
+`repl.rs` now carries `a_missing_archive_segment_reaches_the_admission_check`,
+built the way the first attempt's failure showed it had to be: enough volume to
+roll the write buffer so the earliest sequences leave the LIVE wal, then an
+explicit flush, because waiting for rotation on its own made the fixture racy —
+the same volume produced segments in one test and none in another running
+beside it.
+
+**With a negative control, because without one the result is worthless.** The
+walk from seq 1 must SUCCEED before anything is deleted; only then is the
+deletion the variable. A walk that fails for its own reasons would otherwise
+report a variant that looks like an answer and is about something else.
+
+**The result refutes the asymmetry proposed above.** A missing archive segment
+surfaces as `ReplError::WalGap`, which is exactly the variant the master's
+admission check matches. So the `WalGap`/`Storage` split at `repl.rs:167` is
+NOT the explanation, and the check is not blind to a missing segment.
+
+### What the failed second fixture suggests, unproven
+
+An attempt to show the probe's one-byte budget hiding a gap FURTHER ALONG did
+not reproduce, and its failure is worth recording. Deleting the newest archived
+segment changed nothing (its sequences are still in the live wal). Deleting the
+second-oldest, with a 260 MB corpus and several segments, ALSO produced no
+error from either walk — budgeted or unbounded.
+
+Only removing the OLDEST segment produced a failure. So on this evidence a hole
+in the middle of the archive does not raise an error at all: the walk appears to
+return what it can rather than reporting the gap. If that is real it is a
+finding in its own right and a better candidate than anything above, since a
+short read would let the master answer OK having walked past a hole. It is NOT
+established — two fixtures failing to produce an error is not the same as
+proving none is produced — and the next step is to check whether
+`get_updates_since` yields a truncated iterator or an erroring one when an
+interior segment is absent.

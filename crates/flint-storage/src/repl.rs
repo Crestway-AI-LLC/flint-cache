@@ -1844,3 +1844,84 @@ mod bug_0050_iterator_shape {
         let _ = std::fs::remove_dir_all(&d);
     }
 }
+
+#[cfg(test)]
+mod walgap_variant {
+    use super::*;
+
+    struct TempDir(std::path::PathBuf);
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// BUG-0082: which variant does a missing archive segment produce?
+    ///
+    /// The master's FLINTSYNC admission check matches only `ReplError::WalGap`.
+    /// If a missing segment can surface as `ReplError::Storage`, that check
+    /// falls through and the master answers OK for a cursor it cannot serve.
+    #[test]
+    fn a_missing_archive_segment_reaches_the_admission_check() {
+        let d =
+            TempDir(std::env::temp_dir().join(format!("flint-walgapvar-{}", std::process::id())));
+        let _ = std::fs::remove_dir_all(&d.0);
+        let kv = RocksKv::open_with_retention(&d.0, 3600, 4096).expect("open");
+
+        // Enough to roll the default 64 MB write buffer, so the earliest
+        // sequences leave the LIVE wal and exist only in the archive. The
+        // first attempt at this wrote 1 MB and flushed: the walk then read
+        // the live wal, never needed the deleted archive copy, and returned
+        // Ok -- a fixture that certified nothing.
+        let val = vec![b'v'; 1024];
+        for i in 0..90_000u32 {
+            kv.db()
+                .put(format!("k{i:07}").as_bytes(), &val)
+                .expect("put");
+        }
+
+        // Rotation is what moves a segment into the archive, and waiting for it
+        // to happen on its own made this fixture racy: the same volume produced
+        // segments in one test and none in another running beside it. Flushing
+        // forces it, so the fixture does not depend on when the memtable filled.
+        kv.flush();
+
+        let archive = d.0.join("archive");
+        let mut segs: Vec<_> = std::fs::read_dir(&archive)
+            .map(|r| r.filter_map(|e| e.ok()).map(|e| e.path()).collect())
+            .unwrap_or_default();
+        segs.sort();
+        assert!(
+            !segs.is_empty(),
+            "no archived segments: the write volume did not roll the wal, so nothing \
+             here exercises a missing segment"
+        );
+        // NEGATIVE CONTROL, and the result is worthless without it. A walk from
+        // seq 1 could fail for reasons that have nothing to do with the file
+        // this test deletes -- and then the variant it reports would be about
+        // an unrelated failure while looking like an answer.
+        match kv.updates_since_budgeted(1, 1) {
+            Ok(_) => { /* reachable BEFORE the deletion, so the deletion is the variable */ }
+            other => panic!(
+                "control failed: the walk from seq 1 did not succeed BEFORE anything was \
+                 deleted ({other:?}) — whatever this test measured after the deletion \
+                 would not be caused by it"
+            ),
+        }
+
+        std::fs::remove_file(&segs[0]).expect("remove the oldest archived segment");
+
+        match kv.updates_since_budgeted(1, 1) {
+            Err(ReplError::WalGap(_)) => { /* the admission check sees this */ }
+            Err(ReplError::Storage(e)) => panic!(
+                "SURFACED AS Storage ({e}) — the master's admission check matches only \
+                 WalGap, so it falls through and answers OK (BUG-0082)"
+            ),
+            Err(other) => panic!("unexpected variant: {other:?}"),
+            Ok(_) => panic!(
+                "walk succeeded with its oldest archived segment deleted — the sequences \
+                 were still served from elsewhere, so the fixture is not exercising the gap"
+            ),
+        }
+    }
+}
