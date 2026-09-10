@@ -5,7 +5,7 @@ Renumbered from 0041 on 2026-08-22: a peer filed a different BUG-0041
 c134191 and 8767399 say 0041 and are left as written — history is not
 rewritten to tidy a number.
 
-Status: drill half FIXED 2026-08-22; the product question OPEN · found 2026-08-22 · Severity: medium — the second promotion is of
+Status: drill half FIXED 2026-08-22; the product question OPEN, but the MECHANISM IS REPRODUCED 2026-09-10 (see the last section) · found 2026-08-22 · Severity: medium — the second promotion is of
 the SAME survivor at a higher epoch, so it is not split-brain and not acked-write
 loss; but it contradicts the invariant ADR-0004's whole argument rests on, and
 the check meant to hold that invariant has been passing without exercising it.
@@ -491,3 +491,96 @@ be sized for the gate. What is wrong is that a drill silently depended on a
 property of the hardware nobody had written down as a requirement — the same
 shape as a check that passes because it examined nothing.
 
+
+## 2026-09-10 — the shape is REPRODUCED, and it is inside one node's reply
+
+This file has said "What is NOT established: the mechanism" since 2026-08-22,
+and "answering it needs the failing shape reproduced, not another passing run".
+The shape is now reproducible on a laptop in ten milliseconds, by reading how
+`FLINTINFO` is composed rather than by racing anything.
+
+**The two role fields come from different sources.** In `flintinfo`:
+
+| field | source |
+|---|---|
+| `role:` | the runtime flag — `if read_only { "replica" } else { "master" }` |
+| `role_epoch:` | the durable manifest — `manifest::read_role(kv)` |
+
+**And `flintpromote` writes them in that order**, deliberately:
+
+```
+manifest::record_promo_fence(kv, epoch, superseded, kv.last_applied());
+manifest::set_role(kv, RoleClaim { role: Master, epoch }) -> Ok(()) => {
+    tailer_stop.store(true, ...);
+    read_only.store(false, ...);      // <-- the flag flips HERE
+```
+
+The ordering is right and must not be reversed: `flintdemote`'s comment states
+the reason — *"Durable role first, then flip runtime state: no window where a
+crash resurrects a writable master."*
+
+**So between those two lines a concurrent `FLINTINFO`, served on another
+connection, reports the winner as `role:replica` at the NEW epoch.**
+`flintinfo_can_report_replica_at_the_new_epoch` asserts exactly that, with a
+control that the two fields agree once the flag has flipped — so the
+disagreement is the window and not simply how the function always renders.
+
+### Why that is sufficient for the recorded firing, where the other candidates were not
+
+Feed that one reply to the controller:
+
+| step | value | consequence |
+|---|---|---|
+| `promotable()` | `reachable && !loading` — nothing about role | the winner is a candidate |
+| "is there a master?" | `n.role == "master"` over the states | **no** — the pair looks master-less |
+| survivor | `max_by_key(epoch)` over promotable | **the winner**, it holds the top epoch |
+| proposal | `top_epoch(&states) + 1` | one ABOVE the winner's own new epoch |
+| `FLINTPROMOTE` | refuses only `next <= current` | **accepted by construction** |
+
+That is `PROMOTED :P2 at (0,3)` — a second promotion of the **same** node at a
+higher epoch, which is what was recorded.
+
+**It survives the refutation that killed the straddled-poll candidate.** That
+one required the two NODES to be read at different instants, and the correction
+above showed it would promote the FOLLOWER, because a replica adopts its
+master's role epoch and so holds the higher one. This inconsistency is *inside
+one node's single reply*, so the winner itself carries the top epoch and the
+winner is what gets re-promoted. The distinguishing fact is which node ends up
+holding `top_epoch`, and only this candidate puts it on the winner.
+
+It also explains the fast-box asymmetry without appealing to luck: the window
+is the tail of one durable write, and three controllers polling concurrently
+sample it three times as often.
+
+### What this does NOT establish
+
+**That it is what fired on 2026-08-22.** No log from that run records `role:`
+and `role_epoch:` together at the instant of the poll, and none can be
+reconstructed. What is established is that the shape is *producible*, which is
+what this file has been missing — every earlier candidate was refuted by
+argument, and this one is not refutable that way because it is a test.
+
+### It also upgrades the 2026-09-05 guard, which was left unproven
+
+`master_holds_top_epoch(&recheck, max_epoch)` re-reads the pair immediately
+before `CPFENCE` and abandons if a master now claims the top epoch. Against
+*this* mechanism the re-read is a second round-trip later, by which time the
+flag has flipped and the winner reads `master` at `max_epoch` — so the guard
+fires and the promotion is abandoned. That file entry says the guard is "not
+established to prevent the 2026-08-22 firing"; against this mechanism it is,
+which is a reason to keep it rather than a reason to close this.
+
+### The fix, still not chosen, and now with a cheaper candidate
+
+1. **Compose both fields from one read.** Render `role:` from
+   `manifest::read_role` rather than from the runtime flag, so a single reply
+   cannot contradict itself. Removes the window at the source. It is a change
+   to a product surface that the controller, the agent, `verify` and several
+   drills all parse, and it needs a decision about what a node with no manifest
+   role reports — so it is not a patch to make in passing.
+2. **Leave it to the guard.** The re-read already covers this shape, and the
+   residue is the bounded transient ADR-0004 permits.
+
+(1) is the honest place and (2) is what is already deployed. Choosing between
+them is the design question this file has always ended on — but it is now a
+choice between two understood options rather than a search for a mechanism.

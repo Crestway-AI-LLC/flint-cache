@@ -8124,6 +8124,100 @@ mod accepted_flags {
 
 #[cfg(test)]
 #[cfg(feature = "rocks")]
+mod promote_window_tests {
+    use super::*;
+    use flint_storage::manifest::{self, Epoch, Role, RoleClaim};
+    use flint_storage::rocks::RocksKv;
+
+    struct TempDir(std::path::PathBuf);
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// BUG-0042. **The shape the file says is unreproduced, reproduced.**
+    ///
+    /// `FLINTINFO` composes its two role fields from DIFFERENT SOURCES:
+    ///
+    /// * `role:` from the runtime `read_only` flag
+    /// * `role_epoch:` from the durable manifest
+    ///
+    /// and `flintpromote` writes them in that order — `set_role` (durable, new
+    /// epoch) and only then `read_only.store(false)`. Between those two lines a
+    /// concurrent `FLINTINFO`, served on another connection, renders the winner
+    /// as **`role:replica` at the NEW epoch**.
+    ///
+    /// That is the exact input a second promotion of the SAME node needs. The
+    /// controller's `promotable()` is only `reachable && !loading`, so such a
+    /// node is a promotion candidate; it holds `top_epoch`, so survivor
+    /// selection picks it; the pair has no master in that view, so the promote
+    /// path is taken; and the proposal is `top_epoch + 1`, which
+    /// `FLINTPROMOTE` accepts by construction because it refuses only
+    /// `next <= current`. Result: `PROMOTED :P2 at (0,3)` — the recorded
+    /// 2026-08-22 firing.
+    ///
+    /// It also survives the refutation that killed the straddled-poll
+    /// candidate. That one needed the two NODES read at different instants and
+    /// would have promoted the follower, because a replica adopts its master's
+    /// epoch. This inconsistency is inside ONE node's single reply, so the
+    /// winner itself carries the top epoch and is the one re-promoted.
+    ///
+    /// **This does not prove it is what fired on 2026-08-22** — no log from
+    /// that run records both fields at the instant of the poll. It establishes
+    /// that the shape is producible, which is what that file has been missing.
+    #[test]
+    fn flintinfo_can_report_replica_at_the_new_epoch() {
+        let d =
+            TempDir(std::env::temp_dir().join(format!("flint-promowin-{}", std::process::id())));
+        let _ = std::fs::remove_dir_all(&d.0);
+        let kv = std::sync::Arc::new(RocksKv::open(&d.0).expect("open"));
+
+        // The durable half of a promotion has landed: role Master at (0,2).
+        manifest::force_role(
+            kv.as_ref(),
+            RoleClaim {
+                role: Role::Master,
+                epoch: Epoch {
+                    generation: 0,
+                    counter: 2,
+                },
+            },
+        );
+
+        // The runtime half has NOT: read_only is still true. This is the
+        // window, expressed as the argument it is.
+        let out = flintinfo(true, &Some(kv.clone()), &Arc::new(ReplHub::default()), None);
+        let text = match out {
+            Value::Bulk(Some(b)) => String::from_utf8_lossy(&b).to_string(),
+            other => panic!("FLINTINFO did not return a bulk reply: {other:?}"),
+        };
+
+        assert!(
+            text.contains("role:replica\r\n"),
+            "expected the runtime flag to still say replica; got:\n{text}"
+        );
+        assert!(
+            text.contains("role_epoch:(0,2)\r\n"),
+            "expected the durable manifest's NEW epoch; got:\n{text}"
+        );
+
+        // THE CONTROL. Once the flag flips, the two agree — so the disagreement
+        // above is the window and not simply how this function always renders.
+        let after = flintinfo(false, &Some(kv), &Arc::new(ReplHub::default()), None);
+        let after = match after {
+            Value::Bulk(Some(b)) => String::from_utf8_lossy(&b).to_string(),
+            other => panic!("FLINTINFO did not return a bulk reply: {other:?}"),
+        };
+        assert!(
+            after.contains("role:master\r\n") && after.contains("role_epoch:(0,2)\r\n"),
+            "control: after the flag flips the two fields must agree; got:\n{after}"
+        );
+    }
+}
+
+#[cfg(test)]
+#[cfg(feature = "rocks")]
 mod demote_cursor_tests {
     use super::*;
     use flint_storage::manifest::{self, Epoch, Role, RoleClaim};
