@@ -197,6 +197,52 @@ fn mark_needs_reseed(dir: &std::path::Path, why: &str) {
     }
 }
 
+/// The cursor at which a warm rejoin was admitted and then broke (BUG-0082).
+///
+/// The FLINTSYNC admission term the warm path relies on probes with a ONE-BYTE
+/// budget: it materializes a single batch, so it proves the span's START is
+/// servable and nothing further. A hole deeper in the master's archive is
+/// invisible to it — measured — and making it visible means walking to the
+/// hole, at 0.28 us/sequence, which is seconds at fleet cursor depths on the
+/// failover clock. BUG-0070 spent itself getting that probe down to 9-103 ms
+/// and this must not give it back.
+///
+/// So the replica keeps the fact the master cannot compute: **this exact
+/// cursor was tried and the tail broke.** One warm attempt is still made — it
+/// is right almost always, and it is what makes a rejoin cheap — but the
+/// second is refused, and the re-seed the FATAL promises finally happens.
+///
+/// Written beside `quarantine_unresumable`, which is the same idea for the
+/// REWIND path: tell the next start which candidate not to pick. The warm path
+/// was the one case with no such note, so it picked the same one forever.
+#[cfg(feature = "rocks")]
+const WARM_REJOIN_FAILED: &str = "WARM_REJOIN_FAILED";
+
+/// Record that the warm rejoin admitted at `cursor` did not survive its tail.
+#[cfg(feature = "rocks")]
+fn mark_warm_rejoin_failed(dir: &std::path::Path, cursor: u64) {
+    let f = dir.join(WARM_REJOIN_FAILED);
+    if let Err(e) = std::fs::write(&f, format!("{cursor}\n")) {
+        eprintln!("could not write {}: {e}", f.display());
+    }
+}
+
+/// The cursor a previous warm rejoin broke at, if one did.
+///
+/// **Compared for EQUALITY with the live cursor by the only caller**, which is
+/// what makes a stale file harmless: once the tail makes any progress the
+/// cursor moves and this stops matching, so nothing has to remember to delete
+/// it. An unparseable or absent file is `None` — no note, not "cursor 0",
+/// since 0 is a real cursor and would refuse a fresh copy's first warm rejoin.
+#[cfg(feature = "rocks")]
+fn warm_rejoin_failed_at(dir: &std::path::Path) -> Option<u64> {
+    std::fs::read_to_string(dir.join(WARM_REJOIN_FAILED))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
 /// The last reason this process was told it could not continue its tail, and
 /// when the marker carrying that reason was written. `None` until one is seen.
 ///
@@ -1969,24 +2015,44 @@ fn main() -> std::io::Result<()> {
                         {
                             let cursor = kv.last_applied();
                             drop(kv);
-                            match probe_resume(target, cursor, claim.epoch) {
-                                Ok(()) => {
-                                    clear_needs_reseed(&dir_path);
-                                    eprintln!(
-                                        "marked copy verified against the lineage held by \
+                            // BUG-0082. ONE warm attempt per cursor. The probe
+                            // below is about to say yes again — it said yes
+                            // last time and the tail broke anyway, because a
+                            // one-byte admission budget cannot see a hole
+                            // deeper in the master's archive. Trusting it a
+                            // second time at the SAME cursor is the livelock:
+                            // clear the marker, rejoin, FATAL, repeat, with
+                            // the pair at one copy throughout.
+                            //
+                            // Keyed on the cursor, NOT on the marker's text.
+                            // The comment at the FATAL site says why: matching
+                            // on the message is what let BUG-0062 recur.
+                            if warm_rejoin_failed_at(&dir_path) == Some(cursor) {
+                                eprintln!(
+                                    "warm rejoin already failed at seq {cursor} on this copy; \
+                                     not asking {target} to vouch for it again — taking the \
+                                     rewind or re-seed the last tail's FATAL called for"
+                                );
+                            } else {
+                                match probe_resume(target, cursor, claim.epoch) {
+                                    Ok(()) => {
+                                        clear_needs_reseed(&dir_path);
+                                        eprintln!(
+                                            "marked copy verified against the lineage held by \
                                          {target}: warm rejoin at seq {cursor} (epoch {})",
-                                        claim.epoch
-                                    );
-                                    journal_event(
-                                        flint_journal::EventKind::RejoinDecided,
-                                        Some(format!("{:?}", claim.epoch)),
-                                        &format!("warm rejoin at seq {cursor}"),
-                                    );
-                                    warm = true;
+                                            claim.epoch
+                                        );
+                                        journal_event(
+                                            flint_journal::EventKind::RejoinDecided,
+                                            Some(format!("{:?}", claim.epoch)),
+                                            &format!("warm rejoin at seq {cursor}"),
+                                        );
+                                        warm = true;
+                                    }
+                                    Err(e) => eprintln!(
+                                        "marked copy refused by {target} ({e}); trying a rewind"
+                                    ),
                                 }
-                                Err(e) => eprintln!(
-                                    "marked copy refused by {target} ({e}); trying a rewind"
-                                ),
                             }
                         }
                     }
@@ -6566,6 +6632,16 @@ mod replica {
                     // not say that, so the rewind path was taken again.
                     // Deliberately not a second string to match on — matching
                     // on the message is what let this recur.
+                    // BUG-0082. The same note for the WARM path, which had
+                    // none: the next start's probe will admit this cursor
+                    // again — its one-byte budget cannot see the hole this
+                    // tail just fell into — clear the marker on that promise
+                    // and rejoin at the identical cursor. Every post-FATAL
+                    // start in the playground log did exactly that, so the
+                    // re-seed the line above promises never happened and the
+                    // pair stayed at one copy. Written BEFORE the marker and
+                    // the exit, for the reason the quarantine below is.
+                    super::mark_warm_rejoin_failed(kv.path(), kv.last_applied());
                     if let Some(snaps) = arg("--rewind-snaps") {
                         let cursor = kv.last_applied();
                         let n = quarantine_unresumable(&snaps, cursor);
@@ -7990,6 +8066,116 @@ mod accepted_flags {
                 "{f} is passed by drills in tools/ but would be REFUSED"
             );
         }
+    }
+}
+
+#[cfg(test)]
+#[cfg(feature = "rocks")]
+mod warm_rejoin_guard_tests {
+    use super::*;
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("flint-warmguard-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).expect("scratch dir");
+        d
+    }
+
+    #[test]
+    fn a_recorded_cursor_reads_back() {
+        let d = scratch("roundtrip");
+        assert_eq!(warm_rejoin_failed_at(&d), None, "nothing recorded yet");
+        mark_warm_rejoin_failed(&d, 168_623_419);
+        assert_eq!(warm_rejoin_failed_at(&d), Some(168_623_419));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// ABSENT IS NOT ZERO, and zero is the dangerous default here: a fresh
+    /// replica's cursor legitimately IS 0 for its first warm rejoin, so a
+    /// helper answering `Some(0)` for "no note" would refuse the one rejoin
+    /// that has never been tried. OPS-0134 is what a well-meaning placeholder
+    /// costs elsewhere in this file.
+    #[test]
+    fn no_note_is_none_not_zero() {
+        let d = scratch("absent");
+        assert_eq!(warm_rejoin_failed_at(&d), None);
+        std::fs::write(d.join(WARM_REJOIN_FAILED), "not a number\n").expect("write");
+        assert_eq!(
+            warm_rejoin_failed_at(&d),
+            None,
+            "an unparseable note must read as no note, not as cursor 0"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A STALE NOTE MUST NOT REFUSE A LATER REJOIN. Nothing deletes this file
+    /// on the success path; what makes that safe is that the only caller
+    /// compares it for EQUALITY with the live cursor, so any progress at all
+    /// retires it. Asserting the property rather than trusting the comment.
+    #[test]
+    fn a_note_stops_matching_once_the_cursor_moves() {
+        let d = scratch("stale");
+        mark_warm_rejoin_failed(&d, 1000);
+        assert_eq!(
+            warm_rejoin_failed_at(&d),
+            Some(1000),
+            "matches at the cursor"
+        );
+        assert_ne!(
+            warm_rejoin_failed_at(&d),
+            Some(1001),
+            "a cursor that has advanced must no longer match"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// THE CALL SITES, not the helpers. Neither the tailer's FATAL arm nor
+    /// the marked-boot decision is reachable from a unit test, and this bug's
+    /// own history is the argument for checking anyway: five unit tests on
+    /// `archive_span` passed while nothing called it on the path that
+    /// mattered.
+    ///
+    /// A source grep is a weak instrument, used deliberately and narrowly. It
+    /// asserts only ORDER, which is the single property each site exists for.
+    #[test]
+    fn both_call_sites_are_ordered_correctly() {
+        // THE SEARCH MUST NOT SEE THIS MODULE. `include_str!` embeds the whole
+        // file, tests included, so the literals below match THEMSELVES: the
+        // first version of this test passed with both call sites deleted,
+        // which is precisely the instrument failure BUG-0082 is a catalogue
+        // of. Cut the file at this module and search only production code.
+        let full = include_str!("main.rs");
+        let src = &full[..full
+            .find("mod warm_rejoin_guard_tests")
+            .expect("this module must be findable, since the cut depends on it")];
+
+        // The tailer must record the cursor BEFORE it exits, or there is
+        // nothing for the next boot to read.
+        let record = src
+            .find("super::mark_warm_rejoin_failed(kv.path(), kv.last_applied());")
+            .expect("the tailer's FATAL arm no longer records the failed cursor (BUG-0082)");
+        let exit = src
+            .find("super::hard_exit(3);")
+            .expect("the exit this record guards has moved or been renamed");
+        assert!(
+            record < exit,
+            "the record must come BEFORE the exit: a process that has already \
+             left writes nothing"
+        );
+
+        // The boot must consult the note BEFORE asking the master, or it
+        // clears the marker on the same promise that already broke.
+        let consult = src
+            .find("if warm_rejoin_failed_at(&dir_path) == Some(cursor) {")
+            .expect("the marked-boot decision no longer consults the note (BUG-0082)");
+        let probe = src
+            .find("match probe_resume(target, cursor, claim.epoch)")
+            .expect("the probe this guard precedes has moved or been renamed");
+        assert!(
+            consult < probe,
+            "the guard must come BEFORE the probe, or the probe's yes is acted \
+             on before anything checks whether it was already wrong here"
+        );
     }
 }
 

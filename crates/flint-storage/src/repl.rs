@@ -169,7 +169,12 @@ impl RocksKv {
         last_applied: u64,
         max_bytes: usize,
     ) -> Result<Vec<ReplBatch>, ReplError> {
-        if self.db().latest_sequence_number() <= last_applied {
+        // CAPTURED ONCE, and the ordering is the safe direction. The iterator
+        // is built after this read, so it covers at least everything through
+        // `latest`; a write landing in between only makes the coverage check
+        // below more forgiving, never falser.
+        let latest = self.db().latest_sequence_number();
+        if latest <= last_applied {
             return Ok(Vec::new());
         }
         let iter = self
@@ -178,6 +183,10 @@ impl RocksKv {
             .map_err(|e| ReplError::WalGap(e.to_string()))?;
         let mut out = Vec::new();
         let mut bytes = 0usize;
+        // Which of the two ways the loop can end actually happened. A short
+        // span is legitimate under a budget and a defect without one, and
+        // only the loop knows which (BUG-0082).
+        let mut budget_stopped_us = false;
         // The RAW start of the first batch we are handed, before the clamp
         // below hides it. A gap has TWO shapes and the empty-iterator check
         // at the end only sees one of them (docs/bugs/0031).
@@ -213,6 +222,7 @@ impl RocksKv {
                 ops: collector.ops,
             });
             if bytes >= max_bytes {
+                budget_stopped_us = true;
                 break;
             }
         }
@@ -289,6 +299,41 @@ impl RocksKv {
                 "oldest retained batch starts at {first}, past the {} needed                  (latest is {})",
                 last_applied + 1,
                 self.db().latest_sequence_number()
+            )));
+        }
+        // THE THIRD SHAPE, AND THE ONE NEITHER CHECK ABOVE CAN SEE (BUG-0082).
+        // Both of them ask where the span STARTS. Neither says anything about
+        // a hole in the MIDDLE of it, and that is what an archived segment
+        // deleted from the interior produces: `get_updates_since` succeeds at
+        // its starting point, yields batches until it reaches the missing
+        // file, and then simply STOPS. No error, no signal — the iterator
+        // ends, `out` is non-empty and contiguous, and this returned `Ok`.
+        //
+        // Measured: with one interior segment removed from a 260,000-sequence
+        // archive, the walk returned Ok covering 62,124 of them.
+        //
+        // A caller cannot recover that from the result. A span ending short of
+        // `latest` looks identical whether the WAL ran out of data or ran out
+        // of file, and the master's FLINTSYNC admission term treats an `Ok`
+        // as "your copy is fine" — so it vouched for a span it never walked,
+        // the replica cleared NEEDS_RESEED on the strength of it, and the
+        // tailer then met the hole and exited. That is the livelock at
+        // `flint-server/src/main.rs`'s admission comment, reached by the one
+        // route that comment does not cover.
+        //
+        // Only reachable when the loop ran the iterator DRY. Stopping on the
+        // byte budget is the documented contract — the caller resumes from
+        // the last batch's `last_seq` — so a budgeted short span is not a gap
+        // and must not be reported as one.
+        if !budget_stopped_us
+            && let Some(reach) = out.last().map(|b| b.last_seq)
+            && reach < latest
+        {
+            return Err(ReplError::WalGap(format!(
+                "the WAL walk ended at {reach} without reaching {latest}: \
+                 {} sequence(s) after the cursor are unreachable, so this \
+                 span is short by more than the byte budget explains",
+                latest - reach
             )));
         }
         Ok(out)
@@ -1937,26 +1982,13 @@ mod walgap_shortread {
         }
     }
 
-    /// BUG-0082's surviving lead. Deleting an INTERIOR archived segment made
-    /// neither walk return an error — which is either "no gap was created" or
-    /// "the walk returns what it can and says nothing". Those are very
-    /// different, and only the second would let a master answer FLINTSYNC-OK
-    /// having walked past a hole.
-    ///
-    /// The discriminator is COVERAGE, not the Result: does the returned span
-    /// reach the DB's latest sequence, or stop short of it?
-    /// **THIS TEST FAILS TODAY, AND THAT IS THE POINT.** It asserts the
-    /// behaviour BUG-0082 needs and today's code does not have: with an
-    /// interior archived segment missing, the walk returns `Ok` covering only
-    /// 62,124 of 260,000 sequences. Ignored so a known defect does not red the
-    /// gate, NOT because it is unimportant — run it with `--ignored` and it
-    /// fails on the spot. Delete the `#[ignore]` when the short read is fixed
-    /// and it becomes the regression test.
-    #[ignore = "BUG-0082: FAILS today — the walk short-reads past an interior hole"]
-    #[test]
-    fn an_interior_hole_does_not_silently_shorten_the_walk() {
-        let d =
-            TempDir(std::env::temp_dir().join(format!("flint-shortread-{}", std::process::id())));
+    /// Builds a WAL whose earliest sequences live only in ARCHIVED segments,
+    /// and hands back the sorted segment paths. Volume first so the write
+    /// buffer rolls, then an explicit flush — waiting for rotation on its own
+    /// made the fixture racy, producing segments in one test and none in
+    /// another running beside it.
+    fn holed_fixture(tag: &str) -> (TempDir, RocksKv, u64, Vec<std::path::PathBuf>) {
+        let d = TempDir(std::env::temp_dir().join(format!("flint-{tag}-{}", std::process::id())));
         let _ = std::fs::remove_dir_all(&d.0);
         let kv = RocksKv::open_with_retention(&d.0, 3600, 4096).expect("open");
         let val = vec![b'v'; 1024];
@@ -1966,18 +1998,26 @@ mod walgap_shortread {
                 .expect("put");
         }
         kv.flush();
-
         let latest = kv.db().latest_sequence_number();
-        let archive = d.0.join("archive");
-        let mut segs: Vec<_> = std::fs::read_dir(&archive)
+        let mut segs: Vec<std::path::PathBuf> = std::fs::read_dir(d.0.join("archive"))
             .map(|r| r.filter_map(|e| e.ok()).map(|e| e.path()).collect())
             .unwrap_or_default();
         segs.sort();
         assert!(
             segs.len() >= 3,
-            "need >=3 archived segments; got {}",
+            "need >=3 archived segments to have an INTERIOR one; got {}",
             segs.len()
         );
+        (d, kv, latest, segs)
+    }
+
+    /// **This was the failing test that named the defect**, carried with an
+    /// `#[ignore]` from 2026-09-09 until the short read was fixed: with an
+    /// interior archived segment missing, the walk returned `Ok` covering
+    /// 62,124 of 260,000 sequences. It is the regression test now.
+    #[test]
+    fn an_interior_hole_does_not_silently_shorten_the_walk() {
+        let (_d, kv, latest, segs) = holed_fixture("shortread");
 
         // CONTROL: intact, the walk must reach `latest`. Without this, a walk
         // that never reaches it for unrelated reasons would look like a short
@@ -1992,18 +2032,74 @@ mod walgap_shortread {
         );
 
         std::fs::remove_file(&segs[1]).expect("remove an interior segment");
+        // BOTH non-refusing outcomes are failures, and they are DIFFERENT
+        // failures. Accepting `Ok(reach == latest)` as a pass is the trap this
+        // fixture exists to avoid: it is what a fixture that has stopped
+        // creating a hole looks like, and it would keep the test green while
+        // covering nothing.
         match kv.updates_since_budgeted(1, usize::MAX) {
-            Err(ReplError::WalGap(_)) => { /* honest refusal */ }
+            Err(ReplError::WalGap(_)) => { /* the short read is reported */ }
             Ok(after) => {
                 let reach = after.last().map(|b| b.last_seq).unwrap_or(0);
-                assert_eq!(
-                    reach, latest,
-                    "SHORT READ: with an interior segment deleted the walk returned Ok \
-                     covering only up to {reach} of {latest} — a master answering from \
-                     this has walked past a hole and vouched for the span anyway"
+                if reach < latest {
+                    panic!(
+                        "SHORT READ IS BACK: with an interior segment deleted the walk \
+                         returned Ok covering only up to {reach} of {latest} — a master \
+                         answering from this has walked past a hole and vouched for the \
+                         span anyway"
+                    );
+                }
+                panic!(
+                    "THE FIXTURE NO LONGER CREATES A HOLE: deleting an interior archived \
+                     segment left the walk reaching {latest} intact, so this test proves \
+                     nothing about the short read. Fix the fixture, do not relax this."
                 );
             }
             Err(other) => panic!("unexpected variant: {other:?}"),
         }
+    }
+
+    /// THE QUESTION THE MASTER ACTUALLY ASKS, AND WHAT IT CANNOT SEE.
+    ///
+    /// `flint-server`'s FLINTSYNC admission term calls
+    /// `updates_since_budgeted(cursor, 1)` and reads an `Ok` as "your copy is
+    /// fine". One byte materializes one batch and stops, so it proves the
+    /// span's START is servable and nothing else — a hole further along is
+    /// invisible to it. **This test asserts that limitation rather than
+    /// fixing it**, because the fix is not affordable there: the only way to
+    /// see the hole is to walk to it, measured at 0.28 us/sequence (linear,
+    /// 200 K to 1.2 M), which is ~4.2 s at the 15 M cursor depth BUG-0070
+    /// measured on the fleet — against the 9-103 ms that bug spent itself
+    /// getting the probe down to, on the failover clock.
+    ///
+    /// So the guard lives on the replica, which knows something the master
+    /// cannot: that it already tried this exact cursor and the tail broke.
+    /// See `docs/bugs/0082`.
+    #[test]
+    fn the_admission_probe_cannot_see_an_interior_hole() {
+        let (_d, kv, latest, segs) = holed_fixture("admitprobe");
+
+        // CONTROL: the probe admits an intact WAL, so the verdict below is
+        // about the deletion and not about the probe refusing everything.
+        kv.updates_since_budgeted(1, 1)
+            .expect("control: the probe refused an intact WAL");
+
+        std::fs::remove_file(&segs[1]).expect("remove an interior segment");
+
+        // The UNBOUNDED walk sees it — that is this bug's storage-side fix.
+        assert!(
+            kv.updates_since_budgeted(1, usize::MAX).is_err(),
+            "the unbounded walk must report the hole"
+        );
+
+        // The ONE-BYTE probe does not, and that is the standing limitation.
+        assert!(
+            kv.updates_since_budgeted(1, 1).is_ok(),
+            "the one-byte probe now refuses a holed span. That is BETTER than \
+             what this test records — but it means the replica-side guard in \
+             flint-server was justified by a limitation that no longer exists, \
+             and docs/bugs/0082 needs revisiting rather than this test relaxing. \
+             (WAL reaches {latest}.)"
+        );
     }
 }

@@ -1,12 +1,16 @@
-# BUG-0082 — the rejoin adopts a cursor the archive can no longer serve (OPEN; the refusal now names the archive's AGE, 2026-09-02)
+# BUG-0082 — the rejoin adopts a cursor the archive can no longer serve (FIXED 2026-09-10: the short read is reported, and the warm rejoin is tried once per cursor)
 
 **Found** 2026-09-01 on the playground, by reading the operations agent's own
 repair history rather than by a load run. The agent has executed **16
 `AttachReplica` repairs in three weeks**, every one of them a
 `flintctl restart-node`, and this is what it was repairing.
 
-Status: OPEN · Severity: medium-high — a pair drops to one copy on every
-rejoin that takes this path, and it does not self-heal
+Status: **FIXED 2026-09-10** · found 2026-09-01 · Severity: medium-high — a
+pair dropped to one copy on every rejoin that took this path, and it did not
+self-heal. Both halves are now closed: the silent short read that let a master
+vouch for a span it had walked past, and the livelock that discarded the
+FATAL's own remedy on every restart. **No fleet has run the fix yet** — see the
+2026-09-10 section for the one log line that will say it is working.
 
 ## What happens
 
@@ -758,3 +762,112 @@ iterator knows it stopped early, and the caller cannot tell a short read from
 a caught-up replica — or whether the admission check should compare the span
 it got against the span it asked for. The first is the honest place; the
 second is a smaller change. Not chosen here.
+
+## 2026-09-10 — FIXED, in two places, and neither is the one this file proposed
+
+The section above left the choice as "report the gap in `updates_since_budgeted`
+(the honest place) or compare the span in the admission check (the smaller
+change)". **The second option does not exist**, and finding out why is what
+decided the first.
+
+### Why the admission check cannot be the place, measured
+
+It probes with a ONE-BYTE budget. That materializes a single batch and stops,
+so "the span it got" is one batch every time — comparing it against "the span
+it asked for" is vacuous, and a budget large enough to reach the hole is the
+unbounded materialization the budget exists to prevent.
+
+The only way to see an interior hole is to walk to it. Timed on a fresh
+fixture, 200 K to 1.2 M sequences at 1 KiB values:
+
+| sequences | 1-byte probe | whole-span walk | per sequence |
+|---|---|---|---|
+| 200,000 | 0.2 ms | 56.3 ms | 0.281 us |
+| 600,000 | 0.3 ms | 166.7 ms | 0.278 us |
+| 1,200,000 | 0.3 ms | 329.8 ms | 0.275 us |
+
+Dead linear at **0.28 us/sequence**, which is **~4.2 s at the 15.04 M cursor
+depth BUG-0070 measured on the fleet** — against the 9–103 ms that bug spent
+itself getting this exact probe down to, on the failover clock, where the
+budget is 10 s and the fixed stalls are 1,435–1,975 ms.
+
+So a whole-span admission term would hand back most of BUG-0070's fix. It was
+built, measured, and **removed** rather than landed; the numbers above are what
+it was for. The 1-byte probe's flatness in the same table is independent
+confirmation of BUG-0070's own correction — positioning is cheap, walking is
+not.
+
+### Fix 1 — the short read is reported (`flint-storage/src/repl.rs`)
+
+`updates_since_budgeted` had two gap checks and both ask where the span
+STARTS: the empty-iterator case, and `raw_first` past the cursor. Neither can
+see a hole in the MIDDLE, which is what a deleted interior segment makes — the
+iterator succeeds at its start, yields batches until it reaches the missing
+file, and then simply stops.
+
+The third check is coverage: if the loop ran the iterator dry (as opposed to
+stopping on its byte budget, which is the documented contract) and the span
+ends short of the `latest` captured on entry, that is a gap and it now says so.
+`an_interior_hole_does_not_silently_shorten_the_walk` lost its `#[ignore]` and
+is the regression test.
+
+**It does not on its own close the livelock**, and that was worth measuring
+rather than assuming: `the_admission_probe_cannot_see_an_interior_hole` asserts
+that the 1-byte probe still returns `Ok` for a holed span after this fix. The
+unbounded walk sees the hole; the probe the master actually uses does not.
+
+### Fix 2 — one warm attempt per cursor (`flint-server/src/main.rs`)
+
+Which puts the remaining guard where the information is. The master cannot
+afford to know the span is whole; the replica already knows something better —
+**that it tried this exact cursor and the tail broke.**
+
+The tailer's FATAL arm now writes the cursor into `WARM_REJOIN_FAILED` before
+it exits, and a marked boot whose live cursor equals that value skips the warm
+probe and takes the rewind-or-re-seed the FATAL promised. So the loop this file
+documents —
+
+> Every post-FATAL start in the log clears the marker and warm-rejoins at the
+> same stale cursor.
+
+— costs one warm attempt and then ends, instead of repeating until a restart
+lands inside the retention window by luck.
+
+**This is the shape already beside it.** `quarantine_unresumable` disqualifies
+the snapshots a rewind must not pick again; the warm path was the one case with
+no such note, so it picked the same one forever. And it is keyed on the CURSOR,
+not on the marker's prose, for the reason stated at that same site: *"matching
+on the message is what let this recur"* (BUG-0062).
+
+A stale note needs no cleanup: the only comparison is equality with the live
+cursor, so any progress at all retires it. An absent or unparseable note reads
+as `None` and never as `0`, because 0 is a real cursor and a placeholder there
+would refuse a fresh copy's first rejoin (OPS-0134).
+
+### An instrument of mine that did not work, caught by mutating it
+
+The two call sites are unreachable from a unit test, so their ordering is
+asserted against the source — the weak instrument this repo already uses for
+the wipe path. **The first version passed with both call sites deleted.**
+`include_str!("main.rs")` embeds the whole file including the test module, so
+the literals matched THEMSELVES. It now cuts the file at its own module before
+searching, and three mutants — the record deleted, the guard disabled, and
+`None` softened to `Some(0)` — each fail it.
+
+That is the fourth instrument in this file's history to look like a check and
+not be one, and the only reason it is not the fifth in service is that
+mutating it is cheap.
+
+### What is NOT established
+
+**No fleet has run this.** Everything above is unit-tested and gated on a
+laptop and a gate box. The condition recurs on the playground roughly twice a
+week and the fix will be readable there in one line — a post-FATAL start
+should now say `warm rejoin already failed at seq N on this copy` and re-seed,
+where today it says `cleared NEEDS_RESEED` and rejoins at the same cursor.
+
+**The interior hole itself is untouched.** Nothing here stops the archive from
+developing one; the two fixes make it reported rather than silent, and
+recoverable rather than a livelock. Why a 14–20 h outage's cursor falls outside
+a 12 h TTL is answered — the node was gone that long — and that is a retention
+sizing question, not a defect.
