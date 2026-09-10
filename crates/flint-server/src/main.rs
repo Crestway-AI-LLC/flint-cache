@@ -5659,6 +5659,22 @@ fn flintdemote(
         generation,
         counter,
     };
+    // BUG-0082. READ BEFORE THE ROLE WRITE, and the ordering is the whole
+    // correctness of it. `set_role` persists a manifest row, which is a WRITE
+    // -- so reading `latest_seq()` after it returns the sequence of a SYSTEM
+    // row that never replicates, and no follower ever recorded that number as
+    // a cursor. Presenting it would push every demotion past the follower's
+    // tail into a full re-seed, which is the cost this fix exists to avoid.
+    //
+    // Read here and it is the last DATA batch's end -- exactly the number a
+    // follower's `apply_batch` wrote into its own REPL_STATE_KEY while it
+    // followed us, and therefore the one `own_seq_for_upstream` can map.
+    //
+    // A write landing between here and the `read_only` flip below leaves this
+    // slightly BEHIND, which is the safe direction: the new master serves the
+    // small delta. Ahead is the unsafe one, and this ordering cannot produce
+    // it.
+    let own_at_demote = kv.latest_seq();
     match manifest::set_role(
         kv.as_ref(),
         RoleClaim {
@@ -5681,6 +5697,43 @@ fn flintdemote(
                     "demoted to replica at role epoch {epoch}; the unreplicated suffix may have diverged"
                 ),
             );
+            // BUG-0082. THE CURSOR THIS COPY WILL PRESENT WHEN IT REJOINS.
+            //
+            // REPL_STATE_KEY advances only in `apply_batch`, so it has not
+            // moved since this node stopped being a replica: it still names
+            // the last UPSTREAM sequence a PREVIOUS life applied. Presenting
+            // that after a mastership asks the new master to serve a span
+            // that ended before this node's mastership began -- on the
+            // playground, a seconds-long outage asking for a segment twelve
+            // hours below the oldest retained one. It is refused, and refused
+            // identically on every restart, because nothing moves it.
+            //
+            // `latest_seq()` IS this copy's data position at this instant,
+            // and it is a BATCH END, which is what makes it translatable: a
+            // follower's apply batches recorded exactly these numbers while
+            // it followed us, so `own_seq_for_upstream` can map it. That
+            // constraint is not decorative -- `translating_an_interior_seq_
+            // moves_forward_past_it` pins why. The scan matches the first
+            // recorded cursor >= the one asked for, so a value that is NOT a
+            // batch end resolves FORWARD to a position this node never
+            // reached, and resuming there skips data silently.
+            //
+            // An UNREPLICATED tail makes this higher than anything the
+            // follower saw, and that refuses honestly (WalGap -> re-seed)
+            // rather than resolving forward. The safe direction.
+            //
+            // AFTER the marker, so a failure here leaves this copy marked for
+            // the re-seed that recovers it rather than trusting a stale number.
+            match kv.set_last_applied(own_at_demote) {
+                Ok(()) => eprintln!(
+                    "demote: replication cursor reset to this copy's own seq \
+                     {own_at_demote} (it named a position from a previous replica life)"
+                ),
+                Err(e) => eprintln!(
+                    "demote: could not reset the replication cursor ({e:?}); the \
+                     re-seed marker above is what recovers this copy"
+                ),
+            }
             eprintln!(
                 "demoted to replica at role epoch {epoch} (fenced; wipe + --replica-of to resync)"
             );
@@ -8066,6 +8119,157 @@ mod accepted_flags {
                 "{f} is passed by drills in tools/ but would be REFUSED"
             );
         }
+    }
+}
+
+#[cfg(test)]
+#[cfg(feature = "rocks")]
+mod demote_cursor_tests {
+    use super::*;
+    use flint_storage::manifest::{self, Epoch, Role, RoleClaim};
+    use flint_storage::rocks::RocksKv;
+    use flint_storage::strings::{SetOptions, StringStore, system_clock};
+
+    struct TempDir(std::path::PathBuf);
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// BUG-0082. A demoted ex-master must present its OWN data position, not
+    /// the upstream cursor its previous replica life left behind.
+    ///
+    /// The fixture is the shape the playground produced: a copy that was a
+    /// replica (so REPL_STATE_KEY names an upstream sequence), then served a
+    /// mastership (during which nothing moves that key, because it only
+    /// advances in `apply_batch`), then is demoted.
+    #[test]
+    fn demotion_resets_the_cursor_to_this_copys_own_position() {
+        let d = TempDir(
+            std::env::temp_dir().join(format!("flint-demote-cursor-{}", std::process::id())),
+        );
+        let _ = std::fs::remove_dir_all(&d.0);
+        let kv = std::sync::Arc::new(RocksKv::open(&d.0).expect("open"));
+
+        // A previous replica life: the cursor names an UPSTREAM sequence.
+        let stale = 4_242u64;
+        kv.set_last_applied(stale).expect("seed cursor");
+        manifest::force_role(
+            kv.as_ref(),
+            RoleClaim {
+                role: Role::Master,
+                epoch: Epoch {
+                    generation: 0,
+                    counter: 5,
+                },
+            },
+        );
+
+        // A mastership: this copy originates writes. Nothing moves the cursor.
+        let store = StringStore::new(kv.as_ref(), b"ns", system_clock);
+        for i in 0..500u32 {
+            store
+                .set(
+                    1,
+                    format!("own{i:05}").as_bytes(),
+                    b"v",
+                    SetOptions::default(),
+                )
+                .expect("put");
+        }
+        let before = kv.last_applied();
+        let own_at_demote = kv.latest_seq();
+
+        // THE CONTROL. Without it this test cannot tell a working reset from a
+        // fixture that never went stale in the first place -- and "the cursor
+        // froze" is the entire premise being fixed.
+        assert_eq!(
+            before, stale,
+            "the fixture did not reproduce the freeze: a mastership moved the cursor"
+        );
+        // The two numbers live in DIFFERENT SEQUENCE SPACES -- `stale` is the
+        // upstream's, `own_at_demote` is this copy's -- so they are compared
+        // for difference, never for order. Expecting one to exceed the other
+        // is the mistake this comment exists to stop being made again.
+        assert!(
+            own_at_demote > 400 && own_at_demote != stale,
+            "the fixture's mastership left nothing distinguishable \
+             (own {own_at_demote}, stale upstream {stale})"
+        );
+
+        let read_only = std::sync::Arc::new(AtomicBool::new(false));
+        let reply = flintdemote(
+            &read_only,
+            &Some(kv.clone()),
+            &[b"FLINTDEMOTE".to_vec(), b"0".to_vec(), b"6".to_vec()],
+        );
+        assert!(
+            matches!(reply, Value::Simple(ref m) if m.starts_with("OK demoted")),
+            "demote refused: {reply:?}"
+        );
+
+        assert_eq!(
+            kv.last_applied(),
+            own_at_demote,
+            "the cursor must name this copy's own position at demotion, not the \
+             upstream sequence a previous replica life left"
+        );
+        assert!(
+            read_only.load(Ordering::Relaxed),
+            "demote must flip read-only"
+        );
+    }
+
+    /// AND IT MUST BE A BATCH END, which is the constraint the whole design
+    /// rests on: `own_seq_for_upstream` matches the first recorded cursor at
+    /// or above the one asked for, so a value that is not a batch end
+    /// resolves FORWARD to a position this copy never reached. `latest_seq()` is a
+    /// batch end by construction and this pins that it is what gets stored --
+    /// `set_last_applied` snaps, and a snap that moved the value would break
+    /// the property silently.
+    #[test]
+    fn the_reset_cursor_is_the_position_it_claims() {
+        let d = TempDir(
+            std::env::temp_dir().join(format!("flint-demote-batchend-{}", std::process::id())),
+        );
+        let _ = std::fs::remove_dir_all(&d.0);
+        let kv = std::sync::Arc::new(RocksKv::open(&d.0).expect("open"));
+        kv.set_last_applied(7).expect("seed");
+        manifest::force_role(
+            kv.as_ref(),
+            RoleClaim {
+                role: Role::Master,
+                epoch: Epoch {
+                    generation: 0,
+                    counter: 1,
+                },
+            },
+        );
+        let store = StringStore::new(kv.as_ref(), b"ns", system_clock);
+        for i in 0..200u32 {
+            store
+                .set(
+                    1,
+                    format!("k{i:05}").as_bytes(),
+                    b"v",
+                    SetOptions::default(),
+                )
+                .expect("put");
+        }
+        let own = kv.latest_seq();
+        let read_only = std::sync::Arc::new(AtomicBool::new(false));
+        flintdemote(
+            &read_only,
+            &Some(kv.clone()),
+            &[b"FLINTDEMOTE".to_vec(), b"0".to_vec(), b"2".to_vec()],
+        );
+        assert_eq!(
+            kv.last_applied(),
+            own,
+            "the stored cursor moved off the position it was given; anything but \
+             an exact batch end can translate FORWARD past data this copy holds"
+        );
     }
 }
 

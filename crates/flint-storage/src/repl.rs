@@ -658,6 +658,81 @@ mod tests {
         }
     }
 
+    /// BUG-0082, THE CONSTRAINT ON THE FIX. Measured 2026-09-10.
+    ///
+    /// The fix direction is that a node presents "what I have durably
+    /// applied" — for an ex-master its OWN `latest_seq()` — and the receiving
+    /// master translates it with `own_seq_for_upstream`. That rests on a
+    /// follower's WAL recording its master's sequence numbers, which it does:
+    /// `apply_batch` writes the UPSTREAM batch's `last_seq` into
+    /// REPL_STATE_KEY, so every batch end a follower saw is translatable.
+    ///
+    /// **The trap is the values that are NOT batch ends.** The scan matches
+    /// the first recorded cursor `>= upstream_seq` (see `ScanOutcome::Found`),
+    /// so an INTERIOR number does not fail — it resolves FORWARD, to a
+    /// position the asking node never reached. A node resuming from that skips
+    /// data it never applied, silently. This module's own header names that as
+    /// the danger: "A failed scan was never the danger; a successful wrong one
+    /// was."
+    ///
+    /// So a fix may only ever present a value that is a real batch end (which
+    /// `set_last_applied` arranges via `snap_to_batch_end`) or one past the
+    /// follower's tail, which refuses honestly. This test pins both edges so
+    /// that constraint cannot be removed by accident.
+    #[test]
+    fn translating_an_interior_seq_moves_forward_past_it() {
+        let d = TempDir::new("b82interior");
+        let follower = RocksKv::open(&d.0).expect("open");
+
+        let mut a_seq = 0u64;
+        let mut boundaries = Vec::new();
+        for b in 0..8u64 {
+            let ops: Vec<ReplOp> = (0..5u32)
+                .map(|i| ReplOp::Put {
+                    key: format!("k{b}-{i}").into_bytes(),
+                    value: b"v".to_vec(),
+                })
+                .collect();
+            let batch = ReplBatch {
+                first_seq: a_seq + 1,
+                last_seq: a_seq + ops.len() as u64,
+                ops,
+            };
+            a_seq = batch.last_seq;
+            boundaries.push(a_seq);
+            follower.apply_batch(&batch).expect("apply");
+        }
+
+        // SAFE EDGE: a batch end the follower saw translates, which is what
+        // makes the whole design possible.
+        for end in &boundaries {
+            follower.own_seq_for_upstream(*end).unwrap_or_else(|e| {
+                panic!("a batch end the follower applied must translate: {e:?}")
+            });
+        }
+
+        // THE TRAP: interior values resolve to the NEXT batch end, not to
+        // themselves and not to an error.
+        let interior = boundaries[3] + 1;
+        let next_end = boundaries[4];
+        assert_eq!(
+            follower.own_seq_for_upstream(interior).expect("resolves"),
+            follower.own_seq_for_upstream(next_end).expect("resolves"),
+            "an interior upstream seq must be shown to resolve FORWARD to the next \
+             batch end — if this ever fails the way is open to presenting a raw \
+             latest_seq(), and BUG-0082's fix must be re-read before it is"
+        );
+
+        // SAFE EDGE: past the follower's tail refuses rather than inventing.
+        assert!(
+            matches!(
+                follower.own_seq_for_upstream(a_seq + 7),
+                Err(ReplError::WalGap(_))
+            ),
+            "a seq past the follower's tail must refuse, not resolve"
+        );
+    }
+
     /// The index is a HINT. This pins the property everything else rests on:
     /// whatever the hint says -- right, stale, absent, or actively wrong --
     /// the answer must be the one the plain walk gives. Adversarial rather

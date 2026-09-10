@@ -871,3 +871,258 @@ developing one; the two fixes make it reported rather than silent, and
 recoverable rather than a livelock. Why a 14–20 h outage's cursor falls outside
 a 12 h TTL is answered — the node was gone that long — and that is a retention
 sizing question, not a defect.
+
+## 2026-09-10, later — why the cursor is stale, and the demotion fix
+
+The 2026-09-09 section closed with "no cause is claimed" for the cursor
+itself. There is one now. **Credit where due: the mechanism was found by the
+session that owns the operations agent**, tracing why the agent had run
+`AttachReplica`; this section is that hypothesis checked against the source
+and turned into a fix.
+
+**Two more instances**, both pre-dating `ad05eae` reaching any box:
+2026-09-09 00:17 and 2026-09-10 08:51. The 09-09 one is the clean read:
+
+```
+FATAL WALGAP -> marked for re-seed, cursor ~184548882 (epoch 0,62)
+restart -> "replicating from seq 184548693 (epoch (0,62))"
+promoted to master at role epoch (0,64)          <- promoted MID-CATCH-UP
+demoted to replica at role epoch (0,66) (fenced)
+marked copy refused by 7001: WALGAP cursor 184548882 no longer reachable
+  (oldest retained batch starts at 205793783)
+FATAL: WALGAP full sync required ... (archive holds 1448 segment(s),
+  newest 0s old, oldest 43198s old)
+```
+
+**The 09-02 instrumentation decided it, which is the first time it has decided
+anything.** A seconds-long outage asking for a segment ~2,300 below an oldest
+retained one that is twelve hours old: by this file's own table that is the
+translation arm, and no retention change would help.
+
+### The mechanism, verified in source rather than inferred
+
+`REPL_STATE_KEY` has exactly **two** writers:
+
+| writer | what it stores |
+|---|---|
+| `apply_batch` (`flint-storage/src/repl.rs`) | the UPSTREAM batch's `last_seq` |
+| `set_last_applied` | whatever four re-initialisation sites pass it |
+
+No path runs from an ordinary client write to that key. **So a master never
+moves it** — a master originates rather than applies — and the cursor stays
+frozen at whatever a previous replica life left, for the entire mastership.
+Here that value was already stale before the mastership began, because the
+node was promoted mid-catch-up while ~21M behind.
+
+**And the promotion does not correct it, though it corrects its neighbour.**
+`FLINTPROMOTE` clears `NEEDS_RESEED` on the reasoning that a marker left by an
+earlier demotion "describes a position nobody follows any more". The cursor is
+a position left by an earlier demotion, by exactly that argument, and is left
+alone.
+
+This is **not** BUG-0062 recurring. That was a check-then-act race that missed
+by one batch; a race cannot produce a twelve-hour miss.
+
+### The fix, and why demotion is the site
+
+At demotion the node stops originating, so `latest_seq()` **is** its data
+position. Resetting the cursor there costs nothing on any hot path and leaves
+no staleness. Two alternatives were considered and are worse:
+
+- **Reset at promotion instead.** Shrinks the staleness to the length of the
+  mastership rather than removing it — it would have fixed the 09-09 instance,
+  whose mastership was short, and not a long healthy one. The difference is
+  invisible in the trace above, which is why it is written down.
+- **Advance it on the master's own commits.** The value wanted is already
+  `latest_seq()`, free on demand; storing it per commit buys nothing and puts
+  a write on the master's commit path.
+
+**Why an own-space number is translatable at all**, which is the premise the
+whole fix rests on and was measured rather than assumed: when A is master and
+B follows it, B's `apply_batch` writes **A's** sequence numbers into B's own
+`REPL_STATE_KEY` rows. So every batch end A ever served is a value B recorded,
+and `own_seq_for_upstream` can map it.
+
+### The constraint that nearly made this a silent data-loss bug
+
+`own_seq_for_upstream` matches the first recorded cursor **`>=`** the one it
+was asked for. A value that is *not* a batch end therefore does not fail — it
+resolves **FORWARD**, to a position the asking node never reached, and a node
+resuming there skips data it never applied. This module's header already names
+that danger: *"A failed scan was never the danger; a successful wrong one
+was."*
+
+`translating_an_interior_seq_moves_forward_past_it` pins both edges — a batch
+end translates, an interior value moves forward, past the tail refuses — so
+the constraint cannot be removed by accident.
+
+**It bit immediately.** The first version read `latest_seq()` after
+`manifest::set_role`, which persists a manifest row — a WRITE. The stored
+cursor came out one higher than the data position, naming a SYSTEM row that
+never replicates and that no follower ever recorded. That is past the
+follower's tail, so it refuses honestly rather than corrupting anything — but
+it would have turned **every** demotion into a full re-seed, which is the cost
+this fix exists to avoid. The read now happens before the role write, and
+`the_reset_cursor_is_the_position_it_claims` fails if it moves back.
+
+A write landing between that read and the `read_only` flip leaves the cursor
+slightly BEHIND, which is the safe direction: the new master serves the small
+delta. The ordering cannot produce "ahead".
+
+### What is NOT fixed, and what is not affected
+
+- **The crashed master takes a different path and needs nothing.** A master
+  that dies without demoting comes back with a durable role of Master, so the
+  warm probe skips it by construction — "ex-masters never pass this probe" —
+  and it reaches the rewind or the re-seed. It only presents a cursor after a
+  real `FLINTDEMOTE`, which now resets.
+- **The interior archive hole is untouched**, and so is the earlier fix for
+  it. `ad05eae` stops the LOOP and reports the short read; this makes the
+  cursor correct. Two faults, one trace, and neither subsumes the other.
+- **No fleet has run this.** Same standard as the rest of this file: a demote
+  should now log `demote: replication cursor reset to this copy's own seq N`,
+  and the rejoin that follows should be a warm one rather than a refusal.
+
+### Measured on the playground, and it settles "how bad"
+
+Contributed by the operations-agent session, read over the mesh with FLINTINFO
+on 2026-09-10 18:30 UTC. `node-7001`, master at role epoch (0,65), mastership
+begun 2026-09-09 00:16 UTC — **42.2 hours**:
+
+| | |
+|---|---|
+| `latest_seq` | 214,403,180 |
+| `last_applied` (the cursor) | 198,986,180 |
+| **gap** | **15,417,000** |
+
+**The cursor has not moved in 42 hours of healthy, uninterrupted mastership.**
+Its own log shows how it froze, in consecutive lines: attached at 191721781,
+tailed to 198986180, then `tailer stopped (promoted)`.
+
+**And the partner shows both sequence spaces in one pair.** `node-7002`,
+replica: `latest_seq` 219,587,733, `last_applied` 214,403,182. Its cursor
+tracks the MASTER's `latest_seq` — live and correct, in the master's space —
+while its own `latest_seq` has drifted 5.2M above it. That is the premise of
+this fix, on a live fleet: **a follower records its master's sequence
+numbers**, so an ex-master presenting its own `latest_seq` is a number the
+follower can map.
+
+**It also quantifies why promotion-reset is not the fix.** The archive holds
+43,185 s = 12.0 h; at the observed ~365,000 seq/h that covers ~4.4M sequences,
+and this master is 15.4M behind — about **3.5x past the whole window**. A
+`set_last_applied(latest_seq())` at promotion would have been correct for
+roughly 12 hours and unservable for the 30 hours since. The gap does not need
+a failover to open; it opens continuously at the write rate, and the archive
+window is the deadline.
+
+**A number in the first version of this measurement was wrong and the
+correction is worth keeping.** It read 100.0 hours of mastership, which was
+the process's `uptime_ms`; the node had started as a REPLICA and been promoted
+later, and consecutive lines in an untimestamped log were read as consecutive
+events. The controller log dates the promotion exactly. The conclusion is
+unaffected and sharper at 42 h than it was at 100 h.
+
+### Two earlier instances, same mechanism
+
+Also from the fleet log, at the failovers before these:
+
+```
+refused: WALGAP promotion fence history for epoch (0,59) is incomplete on this
+  node: cannot vouch for cursor 153926303
+refused: WALGAP promotion fence history for epoch (0,63) is incomplete on this
+  node: cannot vouch for cursor 173394423
+```
+
+Both are frozen values from an earlier mastership, presented at the next
+failover. Promotions recur at (0,55), (0,58), (0,62), (0,65).
+
+### What the fix is worth on this pair, concretely
+
+If `node-7001` is demoted today it presents 214,403,180 — its own position,
+and a number `node-7002` recorded as a cursor while following it — so the
+translation resolves and the catch-up is whatever 7002 wrote since. Without
+the fix it presents 198,986,180, which is 3.5x outside the archive, and the
+pair takes a **full re-seed**. That is the difference on a fleet that looks
+entirely healthy right now.
+
+### Three measured instances, and a SECOND shape that must not be merged with them
+
+From the fleet logs, contributed by the operations-agent session.
+
+**The frozen-cursor shape — three instances:**
+
+| cursor | oldest retained | latest | past the archive | behind latest |
+|---|---|---|---|---|
+| 139,999,711 | 166,476,751 | 168,134,731 | 26,477,040 | 28,135,020 |
+| 184,548,882 | 205,793,783 | 209,219,150 | 21,244,901 | 24,670,268 |
+| 198,986,180 | (12.0 h window) | 214,403,180 | ~3.5x the window | 15,417,000 |
+
+Tens of millions past the archive start in every case — nowhere near a
+boundary condition. The third is live as this is written.
+
+**A DIFFERENT FAULT, in the same logs, which reads identically at a glance:**
+
+| cursor | oldest retained | latest | past the archive | behind latest |
+|---|---|---|---|---|
+| 131,869,492 | 131,869,495 | 131,869,852 | **3** | 360 |
+| 112,567,452 | 112,567,455 | 112,567,815 | **3** | 363 |
+
+**Three, on both, on different nodes.** That is not a frozen cursor — a copy
+360 sequences behind is nearly caught up. It is the cursor's immediate
+SUCCESSOR being recycled while later batches survive: two sequences gone at
+exactly the position needed. It refuses through the second gap check in
+`updates_since_budgeted` ("oldest retained batch starts at N, past the N-2
+needed"), which is BUG-0031's shape working correctly.
+
+**Recording them separately is the point.** Merged into the table above they
+would read as five instances of one thing, and they are two instances of
+something else: a pair taking a full re-seed because the archive dropped two
+sequences out from under a replica that was 360 behind. Whether the shed gate
+should have prevented that is not this bug's question, and folding it in here
+would bury it.
+
+### The fence refusals — a guess of mine, RETRACTED
+
+This session suggested that three refusals at the promotion fence —
+epoch (0,59) cursor 153,926,303, (0,61) cursor 168,379,477, (0,63) cursor
+173,394,423 — were the same frozen-cursor mechanism firing at an earlier gate.
+
+**It is not supported, and one number argues against it.** 168,379,477 is
+ABOVE the `latest is 168,134,731` recorded in that node's own earlier refusal,
+so at that moment the presented cursor looks current rather than tens of
+millions stale. Left as an open question rather than claimed. The retraction
+is the ops session's, against my guess.
+
+### Why there is ONE live measurement and not fourteen
+
+The pair has turned over **28 times** (14 per node, almost perfectly
+alternating), and all but one promotion is followed by `tailer stopped
+(promoted)`.
+
+**Nothing ever sampled the cursor.** `flint_node_seq_lag`, `lag_ms`,
+`live_replicas` and `up` cannot see it, and there was no `last_applied` series
+at all — so the 27 other promotions cannot be measured by anyone, then or now.
+That gap is OPS-0210 in the ops repo, which now publishes
+`flint_node_last_applied` and `flint_node_latest_seq` for every role.
+
+What IS established for all 28 without a measurement is structural: `tailer
+stopped (promoted)` puts both writers of `REPL_STATE_KEY` out of reach, so the
+cursor cannot move for the remainder of that mastership.
+
+### The threshold question that metric raises, settled here
+
+**`latest_seq - last_applied` is not lag, and must never be alerted on — in
+EITHER role.** The two fields are in different sequence spaces by construction:
+`last_applied` is a position in the stream this node was following, and
+`latest_seq` is this node's own.
+
+The fleet proves it in the healthy direction. The replica in the pair above
+reads `last_applied` 214,403,182 against its own `latest_seq` 219,587,733 —
+**5,184,551 apart while perfectly caught up**, because its cursor correctly
+tracks its master's sequence while its own space has drifted. A threshold on
+that difference would page on a working replica.
+
+The comparison that IS sound is a replica's `last_applied` against its
+MASTER's `latest_seq`, which are both in the master's space — the quantity
+`flint_node_seq_lag` already reports. Publish the two new series for
+diagnosis; derive no alert from their difference.
