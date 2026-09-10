@@ -567,7 +567,17 @@ fn admin_token(inv: &Inventory) -> Result<Option<String>, String> {
             // The CP answered and holds none: this fleet is not gated.
             Ok(Value::Bulk(None)) | Ok(Value::Null) => Ok(None),
             Ok(Value::Error(e)) => Err(format!("CPADMINTOKEN refused: {e}")),
-            Ok(other) => Err(format!("CPADMINTOKEN answered unexpectedly: {other:?}")),
+            // THE REPLY IS NOT INTERPOLATED. On the success path this value
+            // IS the token, and an error string is the thing that gets pasted
+            // into a ticket. Reaching here needs a protocol desync, so the
+            // reply would be some other command's -- but "unreachable" is not
+            // a reason to write a secret into a format string. The CP's
+            // handler is the only producer and returns a bulk string or
+            // nothing, so naming the shape is enough to diagnose from.
+            Ok(_) => Err("CPADMINTOKEN answered with something other than a \
+                          bulk string; the reply is deliberately not logged, \
+                          because on the success path it is the token"
+                .into()),
             Err(e) => Err(format!("CPADMINTOKEN failed: {e}")),
         }
     };
