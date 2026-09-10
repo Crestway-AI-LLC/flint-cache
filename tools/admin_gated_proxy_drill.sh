@@ -131,4 +131,78 @@ echo "$ST" | grep -q "^proxy .*build $TAG" || {
   echo "$ST" | sed 's/^/  | /'; exit 1; }
 echo "  rolled, and the gated proxy still reports its build"
 
-echo "PASS: admin-gated proxy — a -NOAUTH refusal is read as a SERVING proxy, so bootstrap, status and the edge roll all complete on a fleet with an admin token"
+echo "== BUG-0128: the same gated fleet, with the inventory line REMOVED"
+# EVERYTHING ABOVE RUNS ON A CONFIGURATION THE LIVE FLEET DOES NOT HAVE.
+# The inventory here carries `admin-token`, so flintctl had one to present
+# and every path above authenticated. The playground's inventory carries no
+# such line and never will: the renderer deliberately does not write one
+# (ops OPS-0158), because putting a credential into a 0644 file rendered out
+# of the boot environment is a decision nobody has made. Its proxy was gated
+# on 2026-09-08 all the same, by `flintctl rotate-admin`, which puts the
+# token in the CP where ADR-0006 D4 says it lives.
+#
+# So the shipped binary presented nothing, PROXYSTATS came back -NOAUTH, and
+# `upgrade` -- which asks the proxy for its build as the LAST thing it does,
+# after rolling the controller, the CP, both pair seats and the proxy --
+# aborted. On a fleet that had in fact rolled. And the retry it advises
+# fails identically, so the roll could never be made to succeed.
+#
+# The fix is that flintctl asks the CP, exactly as the agent does. It holds
+# the mesh key already; CPADMINTOKEN's own handler says the surface exists
+# to hand the token to a mesh-authenticated caller.
+grep -q '^admin-token ' "$INV" || { echo "FAIL: setup -- no admin-token line to remove"; exit 1; }
+grep -v '^admin-token ' "$INV" > "$INV.notoken" && mv "$INV.notoken" "$INV"
+grep -q '^admin-token ' "$INV" && { echo "FAIL: setup -- the line is still there"; exit 1; }
+echo "  inventory now has no admin-token line"
+
+# POSITIVE CONTROL, same argument as the one above and it matters MORE here:
+# removing the line must not have ungated the proxy. It does not, because
+# the CP seeds from the flag ONLY when its state holds nothing
+# (`flint-controlplane/src/main.rs:1546`) and this CP committed the token on
+# first boot. Assert it rather than trust the comment -- an ungated proxy
+# would let every check below pass while testing nothing.
+R=$($CLI -p 7443 --no-auth-warning PROXYSTATS 2>&1 | tr -d '\r' | head -1)
+case "$R" in
+  *NOAUTH*) echo "  still gated with no inventory token: $R" ;;
+  *) echo "FAIL: the proxy stopped being gated when the inventory line went away."
+     echo "      Everything below would pass without exercising anything."
+     echo "      got: ${R:-<empty>}"
+     exit 1 ;;
+esac
+# And the CP still holds the token, which is what flintctl must now find.
+# Compared, not printed: a drill that echoes tokens teaches the habit.
+CPTOK=$($CLI -p 7444 --no-auth-warning CPADMINTOKEN 2>&1 | tr -d '\r' | head -1)
+[ "$CPTOK" = "seed-admin-token" ] || {
+  echo "FAIL: the CP does not hold the seeded token, so there is nothing to fetch"
+  echo "      CPADMINTOKEN returned ${#CPTOK} bytes, expected the seeded value"
+  exit 1; }
+echo "  the CP still holds it"
+
+echo "== status reads the gated proxy's build with no inventory token"
+# THE OBSERVABLE. On the shipped binary this row is
+#   proxy 127.0.0.1:7443 up build <unreadable: could not read PROXYSTATS: NOAUTH ...>
+# which is honest (BUG-0083 made it so) and useless.
+ST=$($CTL status 2>&1)
+echo "$ST" | grep -E "^proxy" | sed 's/^/  | /'
+echo "$ST" | grep -q "^proxy .*build $TAG" || {
+  echo "FAIL: the proxy's build is not readable without an inventory admin-token"
+  echo "$ST" | sed 's/^/  | /'
+  echo "      Expected flintctl to fetch the token from the CP (BUG-0128)."
+  exit 1; }
+echo "  build read, so the token came from the CP"
+
+echo "== and the roll completes, which is the failure this bug actually is"
+TAG2=admingate-2
+$CTL upgrade --version-tag "$TAG2" --soak-ms 1500 >"$STATE/upgrade2.log" 2>&1 || {
+  echo "FAIL: upgrade aborted on a gated fleet with no inventory admin-token"
+  tail -12 "$STATE/upgrade2.log" | sed 's/^/  | /'
+  echo "      This is BUG-0128: every seat has rolled and the roll reports failure."
+  exit 1; }
+ST=$($CTL status 2>&1)
+echo "$ST" | grep -E "^(proxy|cp)" | sed 's/^/  | /'
+echo "$ST" | grep -q "^proxy .*build $TAG2" || {
+  echo "FAIL: after the roll the proxy does not report build '$TAG2'"
+  echo "$ST" | sed 's/^/  | /'; exit 1; }
+echo "  rolled to $TAG2"
+
+echo "PASS: admin-gated proxy — a -NOAUTH refusal is read as a SERVING proxy, so bootstrap, status and the edge roll all complete on a fleet with an admin token; and with NO inventory token flintctl fetches it from the CP, so status and the roll complete there too (BUG-0128)"

@@ -482,6 +482,103 @@ fn call(
     call_to(addr, tls, args, Duration::from_millis(1500))
 }
 
+/// What [`admin_token`] remembers: the answer for one fleet, keyed by its CP
+/// addresses. The value is the function's own three-way result, so a cache hit
+/// and a fresh lookup are indistinguishable to the caller.
+type AdminTokenMemo = std::collections::HashMap<String, Result<Option<String>, String>>;
+
+/// The fleet admin token to present to a proxy: the inventory's if it has
+/// one, otherwise the CP's.
+///
+/// BUG-0128. The inventory is not where this lives. ADR-0006 D4 puts the
+/// token in the CP and pushes DIGESTS to the proxies, and the agent reads it
+/// back each sweep over the mTLS CP surface — `CPADMINTOKEN`'s own handler
+/// says so: *returned to the mesh-authenticated agent so it can present it to
+/// proxies*. `admin-token` in the inventory is an optional convenience, and
+/// the renderer deliberately never writes one (ops OPS-0158), because
+/// rendering a credential into a 0644 file out of the boot environment is a
+/// decision nobody has made.
+///
+/// So on the fleet this matters on, the inventory has no token and flintctl
+/// presented nothing. Every operator read of a proxy came back `-NOAUTH`, and
+/// `upgrade` — which asks the proxy for its build as the LAST thing it does —
+/// rolled the controller, the CP, every pair seat and the proxy itself, then
+/// aborted. The retry it advises fails the same way, forever. The playground
+/// was gated on 2026-09-08 and nothing rolled it after, so the first roll to
+/// try would have been the one that found this.
+///
+/// flintctl is entitled to the token by the same argument the agent is, and
+/// more strongly: it already holds `{statedir}/certs/int.key`, which is
+/// root-only and is the mesh identity the CP authenticates. A fleet that
+/// trusts flintctl to spawn its seats is not protected by withholding a
+/// token it can mint a replacement for with `rotate-admin`.
+///
+/// Three outcomes, kept apart on purpose (ADR-0028 O4):
+/// `Ok(Some)` a token to present, `Ok(None)` this fleet has none — present
+/// nothing, which is right for every drill fleet and every ungated
+/// deployment — and `Err` the CP could not be asked, which is NOT the same
+/// as "there is no token" and must not be reported as one.
+///
+/// SUCCESSES are memoised, per fleet; failures are not. `status` calls this
+/// once per proxy, so the memo saves a dial per seat. The cost of NOT caching
+/// a failure depends on the fleet: a single-seat CP returns on the first
+/// connection error (`call_cp` only rotates when `cp.len() > 1`, measured at
+/// 0 ms by the unit test below), while a Raft CP rotates through its seats
+/// with 350 ms between attempts and spends the full 24-attempt budget. That
+/// is the price, and it is worth paying: `upgrade` STOPS AND RESTARTS the
+/// control plane before it reaches the proxies, so a cached failure from the
+/// moment the CP was legitimately between processes would abort the roll at
+/// the last seat — the defect this function exists to remove, arriving by a
+/// different route.
+///
+/// Keyed on the CP addresses rather than held in a bare `OnceLock` because
+/// the unit tests share one process: a process-wide memo would hand one
+/// test's fleet the answer computed for another's, which is the kind of
+/// cross-talk that makes a test suite lie. Same idiom as `is_local_host`
+/// below.
+fn admin_token(inv: &Inventory) -> Result<Option<String>, String> {
+    // The inventory's own token needs no lookup and no memo.
+    if let Some(tok) = inv.admin_token.as_deref() {
+        return Ok(Some(tok.to_string()));
+    }
+    // `parse_inventory` refuses an inventory with no `cp` line, so there is
+    // always one to ask and `call_cp`'s `inv.cp[0]` is safe. Asserted rather
+    // than guarded: a guard here would be an unreachable branch claiming to
+    // support a fleet shape the parser rejects.
+    debug_assert!(!inv.cp.is_empty(), "parse_inventory guarantees a cp line");
+    static MEMO: std::sync::OnceLock<std::sync::Mutex<AdminTokenMemo>> = std::sync::OnceLock::new();
+    let memo = MEMO.get_or_init(Default::default);
+    let key = inv.cp.join(",");
+    if let Ok(m) = memo.lock()
+        && let Some(hit) = m.get(&key)
+    {
+        return hit.clone();
+    }
+    let got = {
+        let tls = tls_client(inv);
+        match call_cp(inv, &tls, &["CPADMINTOKEN"]) {
+            Ok(Value::Bulk(Some(raw))) => {
+                let tok = String::from_utf8_lossy(&raw).trim().to_string();
+                // An EMPTY bulk is not a token. Presenting one would
+                // send `AUTH ""` and be refused, which reads as "the
+                // token is wrong" rather than "there isn't one".
+                Ok((!tok.is_empty()).then_some(tok))
+            }
+            // The CP answered and holds none: this fleet is not gated.
+            Ok(Value::Bulk(None)) | Ok(Value::Null) => Ok(None),
+            Ok(Value::Error(e)) => Err(format!("CPADMINTOKEN refused: {e}")),
+            Ok(other) => Err(format!("CPADMINTOKEN answered unexpectedly: {other:?}")),
+            Err(e) => Err(format!("CPADMINTOKEN failed: {e}")),
+        }
+    };
+    if got.is_ok()
+        && let Ok(mut m) = memo.lock()
+    {
+        m.insert(key, got.clone());
+    }
+    got
+}
+
 /// Like `call` but with a caller-chosen read timeout — for slot migration,
 /// which streams a whole slot and can exceed the default.
 fn call_slow(
@@ -1055,20 +1152,31 @@ fn journal_head(
 /// serves both rather than a branch that opts out of asking.
 fn proxystats_field(inv: &Inventory, i: usize, field: &str) -> Result<Option<String>, String> {
     let tls = edge_tls_client(inv);
-    // PRESENT THE ADMIN TOKEN when the inventory has one. PROXYSTATS is an
-    // operator surface: once the CP has pushed the admin digest (ADR-0006
-    // D4) the proxy refuses it pre-auth, so an unauthenticated read returns
-    // -NOAUTH and this function returned None — "would not report a build".
+    // PRESENT THE ADMIN TOKEN. PROXYSTATS is an operator surface: once the CP
+    // has pushed the admin digest (ADR-0006 D4) the proxy refuses it pre-auth,
+    // so an unauthenticated read returns -NOAUTH and this function returned
+    // None — "would not report a build".
     //
     // `roll_edge` treats that as fatal, so `upgrade` aborted at the last
     // seat on every admin-token fleet, after rolling all of them. Same
     // shape as the proxy_up regression beside it and found the same way:
     // the drill for one uncovered the other.
     //
-    // The token is right there in the inventory that named the proxy, and
     // `verify` already dials this way — [AUTH, cmd] over one connection is
     // exactly what call_seq_on's sequence is for.
-    let cmds: Vec<Vec<&str>> = match inv.admin_token.as_deref() {
+    //
+    // BUG-0128: the token comes from `admin_token`, which falls back to the
+    // CP, and NOT from the inventory alone. It was the inventory alone, and
+    // the live playground's inventory has no `admin-token` line, so this
+    // presented nothing on the one fleet where the gate is actually engaged.
+    //
+    // A CP lookup that FAILED is carried, not swallowed. The read below is
+    // still attempted, because an ungated fleet answers it happily and every
+    // drill fleet is one; but if the proxy then refuses, the message must not
+    // stop at "-NOAUTH" and leave the operator to guess whether a token
+    // exists. ADR-0028 O4: a failure names only what it established.
+    let tok = admin_token(inv);
+    let cmds: Vec<Vec<&str>> = match tok.as_ref().ok().and_then(|t| t.as_deref()) {
         Some(tok) => vec![vec!["AUTH", tok], vec!["PROXYSTATS"]],
         None => vec![vec!["PROXYSTATS"]],
     };
@@ -1101,7 +1209,13 @@ fn proxystats_field(inv: &Inventory, i: usize, field: &str) -> Result<Option<Str
         inv.client_tls,
     ) {
         Ok(v) => field_from_reply(&v, field),
-        Err(e) => Err(format!("could not read PROXYSTATS: {e}")),
+        Err(e) => Err(match &tok {
+            Err(why) => format!(
+                "could not read PROXYSTATS: {e} -- and no admin token could be \
+                 presented, because {why}"
+            ),
+            Ok(_) => format!("could not read PROXYSTATS: {e}"),
+        }),
     }
 }
 
@@ -2491,8 +2605,11 @@ fn reload(inv: &Inventory) {
         let maxb = inv.cache_max_bytes.unwrap_or(256 * 1024 * 1024).to_string();
         for i in 0..inv.proxies.len() {
             let proxy = &proxy_dial(inv, i);
-            if let Some(tok) = &inv.admin_token {
-                let _ = call(proxy, &tls, &["AUTH", tok]);
+            // BUG-0128: the CP, not just the inventory. Unauthenticated
+            // here means PROXYCACHE is refused on any gated fleet and the
+            // near-cache silently keeps whatever settings it had.
+            if let Ok(Some(tok)) = admin_token(inv) {
+                let _ = call(proxy, &tls, &["AUTH", &tok]);
             }
             match call(proxy, &tls, &["PROXYCACHE", &ttl, &maxb]) {
                 Ok(Value::Simple(_)) => println!("  {proxy}: cache ttl={ttl}ms max={maxb}B"),
@@ -7658,14 +7775,23 @@ fn main() {
             let tls = tls_client(&inv);
             for i in 0..inv.proxies.len() {
                 let proxy = &proxy_dial(&inv, i);
-                if let Some(tok) = &inv.admin_token {
-                    match call(proxy, &tls, &["AUTH", tok]) {
+                // BUG-0128: the CP, not just the inventory. A failed
+                // LOOKUP is fatal here rather than silently unauthenticated,
+                // because this verb MUTATES the near-cache: sending
+                // PROXYCACHE with no token gets a refusal that reads like the
+                // command was wrong.
+                match admin_token(&inv) {
+                    Ok(Some(tok)) => match call(proxy, &tls, &["AUTH", &tok]) {
                         Ok(Value::Simple(_)) => {}
                         other => fail(
                             &format!("proxy-cache: admin auth to {proxy} failed"),
                             &other,
                         ),
-                    }
+                    },
+                    Ok(None) => {}
+                    Err(why) => die(&format!(
+                        "proxy-cache: no admin token could be presented, because {why}"
+                    )),
                 }
                 match call(proxy, &tls, &["PROXYCACHE", ttl, maxb]) {
                     Ok(Value::Simple(_)) => println!("{proxy}: cache ttl={ttl}ms max={maxb}B"),
@@ -8842,6 +8968,102 @@ mod stall_seat_tests {
         assert!(
             e.contains("refusing to report a stall that did not happen"),
             "{e}"
+        );
+    }
+}
+
+/// BUG-0128. Where the fleet admin token comes from when the inventory has
+/// none.
+///
+/// The network branch is the drill's job (`tools/admin_gated_proxy_drill.sh`
+/// stands up a gated fleet, strips the inventory line and rolls it). These
+/// pin the two decisions that are made BEFORE any dial, plus the one that
+/// matters most and is the easiest for a later refactor to erase: a CP that
+/// could not be asked is an ERROR, not "there is no token".
+#[cfg(test)]
+mod admin_token_tests {
+    use super::*;
+
+    fn inv_from(body: &str, tag: &str) -> Inventory {
+        let dir = std::env::temp_dir().join(format!("flint-admtok-{}-{tag}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("tmpdir");
+        let path = dir.join("inv.flint");
+        std::fs::write(&path, body).expect("write inventory");
+        parse_inventory(path.to_str().expect("utf8 path"))
+    }
+
+    /// The inventory's own token short-circuits, and the proof is that the CP
+    /// here is a port nothing listens on: a lookup would return `Err`, so
+    /// `Ok(Some(..))` can only mean it never dialled.
+    #[test]
+    fn an_inventory_token_is_used_without_asking_the_cp() {
+        let inv = inv_from(
+            "statedir /tmp/flint-admtok-a\n\
+             cp 127.0.0.1:1\n\
+             admin-token from-the-inventory\n\
+             pair 127.0.0.1:7001,127.0.0.1:7002\n",
+            "a",
+        );
+        assert_eq!(
+            admin_token(&inv),
+            Ok(Some("from-the-inventory".to_string())),
+            "the inventory's token must be used as-is"
+        );
+    }
+
+    /// A CP is always there to ask, so `admin_token` never has to invent an
+    /// answer for a fleet without one.
+    ///
+    /// Pinned because the function relies on it — `call_cp` indexes
+    /// `inv.cp[0]` — and because the alternative it replaced was a guard
+    /// returning `Ok(None)`, which would have told a caller "this fleet has
+    /// no admin token" about a fleet whose configuration cannot exist. If the
+    /// parser is ever relaxed to allow a proxy-only inventory, this fails and
+    /// `admin_token` needs the branch back.
+    #[test]
+    fn an_inventory_with_no_cp_line_is_refused_by_the_parser() {
+        let dir = std::env::temp_dir().join(format!("flint-admtok-{}-b", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("tmpdir");
+        let path = dir.join("inv.flint");
+        std::fs::write(
+            &path,
+            "statedir /tmp/flint-admtok-b\n\
+             pair 127.0.0.1:7001,127.0.0.1:7002\n",
+        )
+        .expect("write inventory");
+        let p = path.to_str().expect("utf8 path").to_string();
+        let got = std::panic::catch_unwind(move || parse_inventory(&p));
+        assert!(
+            got.is_err(),
+            "parse_inventory accepted an inventory with no cp line; \
+             admin_token's debug_assert and call_cp's cp[0] both rest on it"
+        );
+    }
+
+    /// A CP that cannot be reached must NOT come back as `Ok(None)`.
+    ///
+    /// ADR-0028 O4, and the whole reason this function returns three things.
+    /// `Ok(None)` means "this fleet has no admin token", and a caller acts on
+    /// it by presenting nothing — which is right for an ungated fleet and, on
+    /// a gated one, produces a `-NOAUTH` whose message would then blame the
+    /// proxy for a lookup that never happened. Collapsing these two is
+    /// exactly the shape of the bug this function was written for.
+    #[test]
+    fn a_control_plane_that_cannot_be_asked_is_an_error() {
+        // Port 1 refuses immediately, and a ONE-seat CP has nothing to
+        // rotate to, so `call_cp` returns on the first attempt: this test
+        // costs no wall-clock. That is also the measurement the doc comment
+        // on `admin_token` cites for the single-seat case.
+        let inv = inv_from(
+            "statedir /tmp/flint-admtok-c\n\
+             cp 127.0.0.1:1\n\
+             pair 127.0.0.1:7001,127.0.0.1:7002\n",
+            "c",
+        );
+        let got = admin_token(&inv);
+        assert!(
+            matches!(got, Err(ref e) if e.contains("CPADMINTOKEN")),
+            "an unreachable CP must be an error naming the command, got {got:?}"
         );
     }
 }
