@@ -19,7 +19,7 @@
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
-fleet_init $FLINT_DRILL_ROOT/flint-pxreg 7351 7352 7691 7733 9999
+fleet_init $FLINT_DRILL_ROOT/flint-pxreg 7351 7352 7691 7733 9998 9999
 fleet_guard
 D=$FLINT_DRILL_ROOT/flint-pxreg; INV=$D/cluster.flint
 CTL=./target/release/flintctl
@@ -117,6 +117,16 @@ echo "== the subset sentinels say what they did"
 OUT=$(cp_cmd CPSETSUBSET trap "-")
 echo "  '-' -> $OUT"
 case "$OUT" in *DRAINED*) ;; *) echo "FAIL: '-' did not warn that it serves nowhere"; exit 1;; esac
+
+# CPSUBSETS is the READ-BACK this pair of writes never had, and the reason it
+# exists is the arithmetic below: registered-minus-union is idle capacity.
+# Asserted here rather than only in a unit test, because a renderer that
+# nothing dispatches to is the failure mode this suite keeps finding.
+OUT=$(cp_cmd CPSUBSETS)
+echo "  CPSUBSETS after '-': $(echo "$OUT" | tr -d '\r' | tr '\n' ' ')"
+echo "$OUT" | tr -d '\r' | grep -qx "trap -" \
+  || { echo "FAIL: CPSUBSETS did not render the drained tenant as 'trap -'"; echo "$OUT"; exit 1; }
+
 OUT=$(cp_cmd CPSETSUBSET trap "*")
 echo "  '*' -> $OUT"
 case "$OUT" in *"1 proxy"*) ;; *) echo "FAIL: '*' did not place on every registered proxy"; exit 1;; esac
@@ -124,6 +134,28 @@ sleep 1
 R=$(valkey-cli -p 7691 -a tok-trap --no-auth-warning PING 2>&1)
 [ "$R" = "PONG" ] || { echo "FAIL: tenant not served after '*' placement: [$R]"; exit 1; }
 echo "  after '*' the same token serves: PONG"
+
+echo "== CPSUBSETS names the idle capacity that used to need an audit"
+# The whole point of the command (roadmap M4, proxy scale-out): a proxy in
+# the registry and in nobody's subset is invisible today.
+union() { cp_cmd CPSUBSETS | tr -d '\r' | awk 'NF>1 && $2!="-" {print $2}' | tr ',' '\n' | sort -u; }
+idle() { comm -23 <(cp_cmd CPPROXIES | tr ',' '\n' | sort -u) <(union); }
+N=$(idle | grep -c . || true)
+[ "$N" = "0" ] || { echo "FAIL: after '*' every registered proxy should be in a subset; idle: $(idle | tr '\n' ' ')"; exit 1; }
+echo "  after '*': 0 registered proxies are in nobody's subset"
+
+# POSITIVE CONTROL. Without one, "0 idle" above is what a broken union looks
+# like too -- an empty union subtracts nothing and every proxy reads as busy,
+# or a union of everything and every proxy reads as idle. Register a proxy no
+# tenant names and the count must move to exactly it.
+cp_cmd CPADDPROXY "127.0.0.1:9998" >/dev/null
+IDLE=$(idle | tr '\n' ' ')
+echo "  after registering an unused proxy, idle: $IDLE"
+case "$IDLE" in *9998*) ;; *) echo "FAIL: an unplaced proxy did not show as idle: [$IDLE]"; exit 1;; esac
+[ "$(idle | grep -c .)" = "1" ] || { echo "FAIL: exactly one proxy should be idle, got: [$IDLE]"; exit 1; }
+$CTL -f "$INV" retire-proxy "127.0.0.1:9998" >/dev/null 2>&1 || true
+[ "$(idle | grep -c . || true)" = "0" ] || { echo "FAIL: retiring the unused proxy did not clear the idle count"; exit 1; }
+echo "  retiring it clears the count again"
 
 echo "== and the cluster verifies clean again"
 $CTL -f "$INV" verify --probe trap:tok-trap >/dev/null 2>&1 \
@@ -154,4 +186,4 @@ $CTL -f "$INV" verify >/dev/null 2>&1 || { echo "FAIL: verify should pass with a
 echo "  a capacity that fits passes, headroom noted not failed"
 cp "$INV.bak" "$INV"
 
-echo "PASS: proxy registry — a stray registration is named by verify, retired by retire-proxy, cannot silently strand a tenant, the subset sentinels state their effect, and a declared capacity larger than the disk is refused"
+echo "PASS: proxy registry — a stray registration is named by verify, retired by retire-proxy, cannot silently strand a tenant, the subset sentinels state their effect, CPSUBSETS reads the placement back so a proxy in nobody's subset is countable, and a declared capacity larger than the disk is refused"

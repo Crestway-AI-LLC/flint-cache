@@ -199,6 +199,37 @@ pub fn parse_range(raw: &str) -> Option<(u16, u16)> {
 /// publication format (design.md §2.1) — pushing it to a DNS provider is an
 /// integration on top. Proxies share one standard port in production, so A
 /// records suffice; per-member ports would be SRV, deliberately out of v1.
+/// The tenant -> proxy-subset mapping, one tenant per line:
+/// `<tenant> <p1,p2,...>`. A tenant with an empty subset renders `-`, which
+/// is a real state (`CPSETSUBSET <name> -`) and must not read as an absent
+/// line.
+///
+/// **The read-back for `CPSETSUBSET`, which had none.** Subsets could be
+/// written, shuffled on tenant creation, and published per-proxy inside
+/// `CPSNAPSHOT` — but never listed. So "which proxies is this fleet actually
+/// using" was answerable only by an audit, and a registered proxy in nobody's
+/// subset was invisible capacity (roadmap M4, proxy scale-out).
+///
+/// **NO SECRETS, deliberately, and that is what makes this the right conduit
+/// rather than `CPSNAPSHOT`.** A snapshot's tenant field carries raw TOKENS,
+/// filtered to the subset precisely so a proxy never holds tokens it does not
+/// serve; an agent polling it once per proxy would aggregate every token in
+/// the fleet to answer a question about names. This renders names and
+/// addresses only — strictly less than `CPTENANTS` on the same operator
+/// surface already returns.
+pub fn subsets_spec<'a>(tenants: impl Iterator<Item = (&'a str, &'a Vec<String>)>) -> String {
+    let mut out = String::new();
+    for (name, subset) in tenants {
+        let members = if subset.is_empty() {
+            "-".to_string()
+        } else {
+            subset.join(",")
+        };
+        out.push_str(&format!("{name} {members}\r\n"));
+    }
+    out
+}
+
 pub fn dns_zone<'a>(
     suffix: &str,
     tenants: impl Iterator<Item = (&'a str, &'a Vec<String>)>,
@@ -462,6 +493,55 @@ impl State {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The read-back renders every tenant, and its whole point is that a
+    /// caller can subtract the union from `CPPROXIES`.
+    #[test]
+    fn subsets_spec_lists_every_tenant_and_its_members() {
+        let a = vec!["p1:7379".to_string(), "p2:7379".to_string()];
+        let b = vec!["p2:7379".to_string()];
+        let spec = subsets_spec([("alpha", &a), ("beta", &b)].into_iter());
+        assert_eq!(spec, "alpha p1:7379,p2:7379\r\nbeta p2:7379\r\n");
+
+        // The consumer's arithmetic, asserted here because it is the reason
+        // the command exists: p3 is registered and in nobody's subset.
+        let union: std::collections::BTreeSet<&str> = spec
+            .lines()
+            .filter_map(|l| l.split_once(' '))
+            .flat_map(|(_, m)| m.split(','))
+            .filter(|m| *m != "-")
+            .collect();
+        let fleet = ["p1:7379", "p2:7379", "p3:7379"];
+        let idle: Vec<&str> = fleet
+            .iter()
+            .copied()
+            .filter(|p| !union.contains(p))
+            .collect();
+        assert_eq!(idle, vec!["p3:7379"]);
+    }
+
+    /// AN EMPTY SUBSET IS A STATE, NOT AN ABSENCE. `CPSETSUBSET <name> -`
+    /// sets one, and a tenant rendered as a missing LINE would be
+    /// indistinguishable from a tenant that does not exist — while a tenant
+    /// rendered with an empty members field would split into a `""` member
+    /// that no proxy address can equal but that still occupies the union.
+    #[test]
+    fn an_empty_subset_renders_a_line_with_a_dash() {
+        let none: Vec<String> = Vec::new();
+        let spec = subsets_spec([("orphan", &none)].into_iter());
+        assert_eq!(spec, "orphan -\r\n");
+        assert_eq!(spec.lines().count(), 1, "the tenant must still appear");
+    }
+
+    /// NO TENANTS IS AN EMPTY STRING, and the caller has to be able to tell
+    /// that apart from a failed call. It cannot do that here — which is why
+    /// the agent side returns Option and treats a transport failure as "did
+    /// not ask", never as "nobody is using any proxy".
+    #[test]
+    fn no_tenants_renders_empty() {
+        let spec = subsets_spec(std::iter::empty());
+        assert_eq!(spec, "");
+    }
 
     /// A test directory that lives exactly as long as the binding holds it.
     ///

@@ -42,6 +42,8 @@
 //!                                           usage, flags, own endpoint,
 //!                                           service build (ADR-0014 D3)
 //!   CPSNAPSHOT <proxy-addr>                 one-shot filtered snapshot
+//!   CPSUBSETS                               list tenant -> proxy subset
+//!                                           (names and addresses; no tokens)
 //!
 //! v1 scope: single node, durable file state (the serialized form is the
 //! future Raft snapshot). openraft ×3 HA is the follow-on; so are deltas
@@ -985,6 +987,17 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
                 return err("state lock");
             };
             Value::Bulk(Some(st.proxies.join(",").into_bytes()))
+        }
+        // The read-back `CPSETSUBSET` never had. See `state::subsets_spec`
+        // for why this and not `CPSNAPSHOT`: that one carries tokens.
+        b"CPSUBSETS" => {
+            let Ok(st) = shared.state.lock() else {
+                return err("state lock");
+            };
+            let spec = crate::state::subsets_spec(
+                st.tenants.values().map(|t| (t.name.as_str(), &t.subset)),
+            );
+            Value::Bulk(Some(spec.into_bytes()))
         }
         // DNS subset publication: render the authoritative zone data for the
         // tenant->proxy-subset mapping. Each tenant resolves to ONLY its

@@ -1193,6 +1193,17 @@ async fn handle_admin(ha: &Ha, args: &[Vec<u8>]) -> Value {
             let reg = ha.store.registry().await;
             Value::Bulk(Some(reg.proxies.join(",").into_bytes()))
         }
+        // BOTH SURFACES, always. `CPINFO`'s registry_version alias is the
+        // standing reminder that this file and main.rs are two dispatches
+        // over one protocol: a command added to one only is a command that
+        // works until the fleet turns HA on.
+        b"CPSUBSETS" => {
+            let reg = ha.store.registry().await;
+            let spec = crate::state::subsets_spec(
+                reg.tenants.values().map(|t| (t.name.as_str(), &t.subset)),
+            );
+            Value::Bulk(Some(spec.into_bytes()))
+        }
         b"CPDNSZONE" => {
             let Some(suffix) = text(1) else {
                 return Value::Error("ERR CPDNSZONE <zone-suffix>".into());
