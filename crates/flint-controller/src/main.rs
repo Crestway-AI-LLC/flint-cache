@@ -242,6 +242,15 @@ fn call(addr: &str, args: &[&[u8]]) -> std::io::Result<Value> {
 struct Node {
     addr: String,
     reachable: bool,
+    /// What THIS poll saw, when it saw nothing good — the FLINTINFO error, the
+    /// PING outcome, the socket state. Empty on a healthy poll.
+    ///
+    /// OPS-0181. `observe` discarded the io::Error and kept only the booleans
+    /// derived from it, so a promotion could report that no master was
+    /// reachable and never what "unreachable" had meant: a refused connect, a
+    /// reset, and an 800 ms read timeout are three different faults with three
+    /// different causes, and all three arrived here as `reachable = false`.
+    why: String,
     /// The process still accepts TCP connections even if the app did not
     /// answer FLINTINFO/PING — i.e. ALIVE but slow, not dead. Only meaningful
     /// when `reachable` is false; true whenever `reachable` is true.
@@ -505,6 +514,7 @@ fn observe(addr: &str) -> Node {
         addr: addr.to_string(),
         reachable: false,
         socket_alive: false,
+        why: String::new(),
         role: String::new(),
         loading: false,
         epoch: 0,
@@ -513,14 +523,31 @@ fn observe(addr: &str) -> Node {
         lag_ms: None,
         lag_soft_ms: None,
     };
-    let Ok(Value::Bulk(Some(raw))) = call(addr, &[b"FLINTINFO"]) else {
-        // Distinguish "down" from "up but FLINTINFO hiccup" with a PING.
-        node.reachable = matches!(call(addr, &[b"PING"]), Ok(Value::Simple(s)) if s == "PONG");
-        // App unresponsive: is the process DEAD (connection refused) or ALIVE
-        // but slow (socket still accepts)? The promote decision needs this to
-        // avoid flapping a starved-but-listening master to death.
-        node.socket_alive = node.reachable || socket_open(addr);
-        return node;
+    // MATCH, NOT `let ... else`, so the reason survives (OPS-0181). The
+    // binding form discarded the io::Error, which is the one thing that says
+    // WHICH failure this was. The control flow is unchanged: anything that is
+    // not a non-null bulk reply takes the same path it always did.
+    let info = call(addr, &[b"FLINTINFO"]);
+    let raw = match info {
+        Ok(Value::Bulk(Some(raw))) => raw,
+        other => {
+            let cause = match &other {
+                Err(e) => e.to_string(),
+                Ok(v) => format!("unexpected reply {v:?}"),
+            };
+            // Distinguish "down" from "up but FLINTINFO hiccup" with a PING.
+            node.reachable = matches!(call(addr, &[b"PING"]), Ok(Value::Simple(s)) if s == "PONG");
+            // App unresponsive: is the process DEAD (connection refused) or ALIVE
+            // but slow (socket still accepts)? The promote decision needs this to
+            // avoid flapping a starved-but-listening master to death.
+            node.socket_alive = node.reachable || socket_open(addr);
+            node.why = format!(
+                "FLINTINFO {cause}; PING {}; socket {}",
+                if node.reachable { "ok" } else { "no" },
+                if node.socket_alive { "open" } else { "closed" }
+            );
+            return node;
+        }
     };
     node.reachable = true;
     node.socket_alive = true;
@@ -642,6 +669,22 @@ struct Pair {
     last_converged: Instant,
     converged_ever: bool,
     no_master_streak: u32,
+    /// What the ticks behind `no_master_streak` actually SAW, newest last.
+    ///
+    /// OPS-0181: a production failover whose trigger nothing recorded. The
+    /// controller promotes on `no_master_streak >= confirm` — three polls
+    /// about 300 ms apart — and logged only the outcome, `PROMOTED … at
+    /// (0,65)`. Nothing said which node was polled, what came back, or why,
+    /// and nothing else can stand in: the finest-grained view the ops lane
+    /// has is a Prometheus scrape tens of seconds wide, so a 300 ms event is
+    /// invisible to it by construction. The controller is the only possible
+    /// witness.
+    ///
+    /// Filled ONLY on the no-master path, so a healthy fleet allocates
+    /// nothing. Capped, because the alive-but-slow path holds for
+    /// `slow_promote` of wall-clock and would otherwise grow a string per
+    /// tick for minutes.
+    no_master_ticks: Vec<String>,
     /// When the pair first had no legit master but a node still ACCEPTING TCP
     /// (alive-but-slow). Wall-clock, not ticks: observe() blocks on an
     /// unresponsive node's probe timeouts, so the loop is observe-bound rather
@@ -683,6 +726,7 @@ impl Pair {
             last_converged: Instant::now(),
             converged_ever: false,
             no_master_streak: 0,
+            no_master_ticks: Vec::new(),
             slow_since: None,
             outage_announced: false,
             slot_miss: vec![0; n],
@@ -826,6 +870,7 @@ impl Pair {
             let legit_addr = legit.addr.clone();
             let legit_converged = legit.converged();
             self.no_master_streak = 0;
+            self.no_master_ticks.clear();
             self.slow_since = None;
             self.outage_announced = false;
             // Snapshot schedule (Tier-0, design.md §2.9): a periodic durable
@@ -992,6 +1037,33 @@ impl Pair {
         // just flaps (and on a uniformly-loaded fleet the target is equally slow).
         // Require far more confirmation for that case than for a dead process.
         self.no_master_streak += 1;
+        // RECORD THE TICK (OPS-0181). Every node's own account of this poll,
+        // so the promotion below can say what it was made of. `why` is empty
+        // for a node that answered, which is itself the finding when a pair
+        // has no master and every member replied.
+        {
+            const MAX_TICKS: usize = 12;
+            let seen = states
+                .iter()
+                .map(|n| {
+                    if n.why.is_empty() {
+                        format!("{} role:{:?} epoch:{}", n.addr, n.role, n.epoch)
+                    } else {
+                        format!("{} {}", n.addr, n.why)
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            self.no_master_ticks
+                .push(format!("t{}: {seen}", self.no_master_streak));
+            // Keep the FIRST tick and the most recent ones: the first is where
+            // the fault began, and dropping it to make room for the hundredth
+            // slow-path tick would discard the only one that says what started
+            // this.
+            if self.no_master_ticks.len() > MAX_TICKS {
+                self.no_master_ticks.remove(1);
+            }
+        }
         let slow = states.iter().any(|n| !n.reachable && n.socket_alive);
         if slow {
             self.slow_since.get_or_insert_with(Instant::now);
@@ -1195,6 +1267,26 @@ impl Pair {
                 self.no_master_streak = 0;
                 return;
             }
+        }
+        // WHAT THE STREAK WAS MADE OF, before the outcome (OPS-0181).
+        //
+        // Emitted here rather than beside the PROMOTED line so it survives a
+        // promotion that FAILS: "we decided to promote and could not" needs
+        // the evidence at least as much as a promotion that worked, and the
+        // arms below return early on several paths.
+        //
+        // Three strings on a path that only runs when a promotion is already
+        // happening. The RTO-critical work is the FLINTPROMOTE call under it.
+        if !self.no_master_ticks.is_empty() {
+            eprintln!(
+                "[{}][{}] no master for {}/{} ticks ({}) — promoting {}",
+                cfg.id,
+                self.label,
+                self.no_master_streak,
+                cfg.confirm,
+                self.no_master_ticks.join(" | "),
+                survivor.addr
+            );
         }
         match call(
             &survivor.addr,
@@ -2041,6 +2133,9 @@ mod tests {
             addr: addr.into(),
             reachable: true,
             socket_alive: true,
+            // Reachable, so nothing to explain: `why` carries a reason only
+            // for a poll that failed (OPS-0181).
+            why: String::new(),
             // Every node in this state reports role:replica — that IS the bug
             // signature (#168): FLINTINFO renders role from the read-only flag,
             // so a self-fenced master calls itself a replica.
@@ -2513,5 +2608,72 @@ mod tests {
             l.local_addr().expect("local addr").to_string()
         };
         assert!(!socket_open(&closed), "a closed port must read as dead");
+    }
+}
+
+#[cfg(test)]
+mod promote_evidence_tests {
+    use super::*;
+
+    /// OPS-0181: an unreachable node must say WHICH unreachable it was.
+    ///
+    /// The failover this comes from left `PROMOTED 172.31.64.94:7001 at
+    /// (0,65)` and nothing else. Three consecutive polls had failed and the
+    /// only surviving record of them was the count. A refused connect, a
+    /// reset mid-reply and an 800 ms read timeout are three different faults
+    /// with three different causes, and all three used to arrive as
+    /// `reachable = false`.
+    #[test]
+    fn an_unreachable_node_records_which_failure_it_was() {
+        // Port 1 refuses immediately on every platform this runs on, so the
+        // test costs no wall-clock and exercises the refused-connect arm
+        // rather than a timeout.
+        let n = observe("127.0.0.1:1");
+        assert!(!n.reachable, "port 1 must not be reachable");
+        assert!(
+            !n.why.is_empty(),
+            "an unreachable node must record why; this emptiness IS the bug"
+        );
+        assert!(
+            n.why.contains("FLINTINFO"),
+            "the reason must name the call that failed, got {:?}",
+            n.why
+        );
+        assert!(
+            n.why.contains("PING no") && n.why.contains("socket closed"),
+            "the reason must carry the PING and socket outcomes the promote \
+             decision is actually made on, got {:?}",
+            n.why
+        );
+    }
+
+    /// A node that ANSWERS records nothing, so the tick line stays readable
+    /// and an empty `why` keeps its meaning: this node was fine.
+    ///
+    /// The positive control for the test above — without it, a `why` that was
+    /// unconditionally populated would pass that assertion while destroying
+    /// the distinction the line depends on.
+    #[test]
+    fn a_healthy_poll_records_no_reason() {
+        let mut n = Node {
+            addr: "127.0.0.1:7001".into(),
+            reachable: true,
+            socket_alive: true,
+            why: String::new(),
+            role: String::new(),
+            loading: false,
+            epoch: 0,
+            live_replicas: 0,
+            seq_lag: None,
+            lag_ms: None,
+            lag_soft_ms: None,
+        };
+        apply_flintinfo(&mut n, "role:master\nrole_epoch:0,65\n");
+        assert_eq!(n.role, "master");
+        assert!(
+            n.why.is_empty(),
+            "a node that answered must leave `why` empty, or the promotion \
+             line cannot tell a silent node from a talkative one"
+        );
     }
 }

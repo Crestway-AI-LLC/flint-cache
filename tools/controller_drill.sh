@@ -104,6 +104,33 @@ echo "== data intact on the new master"
 [ "$(valkey-cli -p $RPORT GET ctl-probe)" = "ok" ] || { echo "FAIL: post-promotion write lost"; exit 1; }
 echo "$(grep -oE 'PROMOTED .* at \(0,[0-9]+\)' $FLINT_DRILL_ROOT/flint-ctl.log | head -1)"
 
+# OPS-0181: THE PROMOTION MUST SAY WHAT IT SAW, not only what it did.
+#
+# A production failover on 2026-09-09 left `PROMOTED 172.31.64.94:7001 at
+# (0,65)` and nothing else. The controller promotes on three consecutive
+# failed polls about 300 ms apart, and logged only the outcome -- so which
+# node was polled, what came back, and why were all unrecoverable. Nothing
+# else can stand in: the ops lane's finest view is a Prometheus scrape tens of
+# seconds wide, and a 300 ms event is invisible to it by construction.
+#
+# Asserted HERE because this is the drill that kills a master and gets a real
+# promotion out of a real controller. The unit tests cover what `observe`
+# records; only a live promotion covers whether it reaches the log.
+EV=$(grep -E 'no master for [0-9]+/[0-9]+ ticks' "$FLINT_DRILL_ROOT/flint-ctl.log" | head -1 || true)
+[ -n "$EV" ] || {
+  echo "FAIL: the controller promoted and did not record what the streak was made of."
+  echo "      Expected a line: [ctl][<pair>] no master for N/M ticks (...) - promoting <addr>"
+  echo "--- controller log:"; tail -20 "$FLINT_DRILL_ROOT/flint-ctl.log"; exit 1; }
+# POSITIVE CONTROL. The line existing is not the point -- it carrying a REASON
+# is. An evidence line that says "no master for 3/3 ticks ()" reproduces the
+# bug with extra characters, and a bare port number would pass a laxer check.
+echo "$EV" | grep -qE "$MPORT.*(FLINTINFO|PING|socket|role:)" || {
+  echo "FAIL: the evidence line names no observation for the killed master."
+  echo "      got: $EV"
+  echo "      A streak recorded without its reads is the defect, restated."
+  exit 1; }
+echo "  promotion evidence: $EV"
+
 echo "== bring the OLD master back; controller must fence it"
 $B --port $MPORT --engine rocks --data-dir "$MDIR" 2>"${FLEET_SCOPE}server3.log" &
 fleet_wait_listen $MPORT
