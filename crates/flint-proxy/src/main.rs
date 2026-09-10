@@ -453,6 +453,35 @@ struct Topology {
     stat_moved_learned: std::sync::atomic::AtomicU64,
     stat_auth_ok_total: std::sync::atomic::AtomicU64,
     stat_auth_fail_total: std::sync::atomic::AtomicU64,
+    /// Operator-surface calls REFUSED for want of the admin token.
+    ///
+    /// ops OPS-0163 gated this surface on a port open to `0.0.0.0/0`, and a
+    /// refusal moved nothing: `stat_auth_fail_total` counts TENANT auth and
+    /// stayed at zero across a real refusal, and nothing was logged. So there
+    /// was no way to tell whether anyone reached the surface during the
+    /// exposure window, and no way to tell if anyone is probing it now —
+    /// verifying the gate itself required a hand-run probe, because no
+    /// observable moved.
+    ///
+    /// SEPARATE from auth_fail on purpose. A tenant failing AUTH is a
+    /// credential problem for one tenant; an operator command refused pre-auth is
+    /// somebody reaching for the fleet's control surface. Summing them would
+    /// bury the second in the first, which on a public port is the one you
+    /// want to see.
+    stat_admin_denied_total: std::sync::atomic::AtomicU64,
+    /// When the last admin-refusal line was logged, and how many refusals
+    /// have been suppressed since. Throttled because this surface faces the
+    /// internet: one line per refusal is a log-flood primitive handed to
+    /// anyone who can open a socket. The COUNTER is the observable; the line
+    /// is forensics, and it carries the suppressed count so a throttled log
+    /// never reads as a quiet one.
+    /// `None` until the first refusal is logged, so THE FIRST ONE ALWAYS
+    /// PRINTS. Seeding this with `Instant::now()` at startup would have
+    /// swallowed every refusal in the proxy's first minute — which is the
+    /// minute after a roll, and the first probe is the one worth seeing.
+    /// (`Instant` has no portable "60 seconds ago", so the state is the
+    /// absence of a stamp rather than a backdated one.)
+    admin_denied_log: std::sync::Mutex<(Option<std::time::Instant>, u64)>,
     stat_commands_total: std::sync::atomic::AtomicU64,
     /// Read/write traffic split (shared classifier, ADR-0005 D1/D5): the
     /// per-plane view Grafana and hot-key analysis start from.
@@ -1908,7 +1937,34 @@ fn auth_step(
         .map(|d| !d.is_empty())
         .unwrap_or(false)
         && !*is_admin;
+    // IN THE FUNNEL, NOT AT THE CALL SITES (ops OPS-0163's open half).
+    //
+    // Eight arms below return this. Counting at each of them would be eight
+    // places to forget, and the ninth arm somebody adds next year would be
+    // silent — which is exactly how this surface came to be gated with no
+    // observable at all. Here it is structural: to refuse is to be counted.
     let admin_denied = || {
+        topo.stat_admin_denied_total.fetch_add(1, Ordering::Relaxed);
+        // Throttled to one line a minute, carrying what it suppressed. This
+        // port is open to the world, so an unthrottled line per refusal is a
+        // log-flood primitive for anyone with a socket; a silent throttle
+        // would be worse still, because "one line" and "one line and four
+        // thousand more" must not look the same.
+        if let Ok(mut g) = topo.admin_denied_log.lock() {
+            g.1 += 1;
+            let due =
+                g.0.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(60));
+            if due {
+                eprintln!(
+                    "flint-proxy: operator command REFUSED — no admin token \
+                     ({} refusal(s) since the last such line; {} total since \
+                     start)",
+                    g.1,
+                    topo.stat_admin_denied_total.load(Ordering::Relaxed),
+                );
+                *g = (Some(std::time::Instant::now()), 0);
+            }
+        }
         AuthStep::Reply(Value::Error(
             "NOAUTH admin token required for this command".into(),
         ))
@@ -2030,12 +2086,13 @@ fn auth_step(
         // all — so a half-completed edge roll looked exactly like a
         // finished one.
         let info = format!(
-            "build:{build}\r\nactive:{}\r\nconns_total:{}\r\nshed_total:{}\r\nauth_ok_total:{}\r\nauth_fail_total:{}\r\ncommands_total:{}\r\ncommands_read_total:{}\r\ncommands_write_total:{}\r\nhotkey_sample_rate:{}\r\ncache_ttl_ms:{cache_ttl}\r\ncache_max_bytes:{cache_max}\r\ncache_hits_total:{cache_hits}\r\ncache_misses_total:{cache_misses}\r\ncache_entries:{cache_entries}\r\ncache_bytes:{cache_bytes}\r\nmoved_learned_total:{moved_learned}\r\nquota_throttled_total:{quota_throttled}\r\nquota_write_shed_total:{quota_write_shed}\r\npool_lanes:{pool_lanes}\r\npool_batches_total:{pool_batches}\r\npool_commands_total:{pool_commands}\r\npool_batch_mean:{pool_batch_mean:.2}\r\npool_inflight_max:{pool_inflight_max}\r\npool_dial_failures_total:{pool_dials}\r\ncert_days_remaining:{cdr}\r\n",
+            "build:{build}\r\nactive:{}\r\nconns_total:{}\r\nshed_total:{}\r\nauth_ok_total:{}\r\nauth_fail_total:{}\r\nadmin_denied_total:{}\r\ncommands_total:{}\r\ncommands_read_total:{}\r\ncommands_write_total:{}\r\nhotkey_sample_rate:{}\r\ncache_ttl_ms:{cache_ttl}\r\ncache_max_bytes:{cache_max}\r\ncache_hits_total:{cache_hits}\r\ncache_misses_total:{cache_misses}\r\ncache_entries:{cache_entries}\r\ncache_bytes:{cache_bytes}\r\nmoved_learned_total:{moved_learned}\r\nquota_throttled_total:{quota_throttled}\r\nquota_write_shed_total:{quota_write_shed}\r\npool_lanes:{pool_lanes}\r\npool_batches_total:{pool_batches}\r\npool_commands_total:{pool_commands}\r\npool_batch_mean:{pool_batch_mean:.2}\r\npool_inflight_max:{pool_inflight_max}\r\npool_dial_failures_total:{pool_dials}\r\ncert_days_remaining:{cdr}\r\n",
             topo.stat_active.load(Ordering::Relaxed),
             load(&topo.stat_conns_total),
             load(&topo.stat_shed_total),
             load(&topo.stat_auth_ok_total),
             load(&topo.stat_auth_fail_total),
+            load(&topo.stat_admin_denied_total),
             load(&topo.stat_commands_total),
             load(&topo.stat_commands_read_total),
             load(&topo.stat_commands_write_total),
@@ -4184,6 +4241,8 @@ fn main() -> std::io::Result<()> {
         stat_moved_learned: std::sync::atomic::AtomicU64::new(0),
         stat_auth_ok_total: std::sync::atomic::AtomicU64::new(0),
         stat_auth_fail_total: std::sync::atomic::AtomicU64::new(0),
+        stat_admin_denied_total: std::sync::atomic::AtomicU64::new(0),
+        admin_denied_log: std::sync::Mutex::new((None, 0)),
         stat_commands_total: std::sync::atomic::AtomicU64::new(0),
         stat_commands_read_total: std::sync::atomic::AtomicU64::new(0),
         stat_commands_write_total: std::sync::atomic::AtomicU64::new(0),
@@ -4546,6 +4605,8 @@ mod route_tests {
             stat_moved_learned: std::sync::atomic::AtomicU64::new(0),
             stat_auth_ok_total: std::sync::atomic::AtomicU64::new(0),
             stat_auth_fail_total: std::sync::atomic::AtomicU64::new(0),
+            stat_admin_denied_total: std::sync::atomic::AtomicU64::new(0),
+            admin_denied_log: std::sync::Mutex::new((None, 0)),
             stat_commands_total: std::sync::atomic::AtomicU64::new(0),
             stat_commands_read_total: std::sync::atomic::AtomicU64::new(0),
             stat_commands_write_total: std::sync::atomic::AtomicU64::new(0),

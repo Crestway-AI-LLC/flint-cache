@@ -102,6 +102,49 @@ case "$R" in
      exit 1 ;;
 esac
 
+# ops OPS-0163's open half: A REFUSAL MUST MOVE AN OBSERVABLE.
+#
+# The gate above is real and, until now, entirely silent: a refusal
+# incremented no counter -- `auth_fail_total` counts TENANT auth and stayed at
+# zero across one -- and wrote no log line. So nobody could tell whether the
+# surface had been reached during the window it was open, or whether anyone is
+# probing it now. Verifying the gate itself needed a hand-run probe, because
+# no observable moved.
+#
+# Read AUTHED, because PROXYSTATS is itself on the gated surface. The refusals
+# counted here include the unauthenticated probe just above.
+adm() { $CLI -p 7443 --no-auth-warning -a seed-admin-token "$@" 2>/dev/null | tr -d '\r'; }
+denied_now() { adm PROXYSTATS | sed -n 's/^admin_denied_total:\([0-9][0-9]*\)$/\1/p' | head -1; }
+D0=$(denied_now)
+case "$D0" in
+  ''|*[!0-9]*)
+     echo "FAIL: PROXYSTATS carries no admin_denied_total field."
+     echo "      A gated surface whose refusals move nothing cannot be watched:"
+     echo "      that is OPS-0163's open half, and this is the check for it."
+     exit 1 ;;
+esac
+[ "$D0" -ge 1 ] || {
+  echo "FAIL: the refused probe above did not increment admin_denied_total (got $D0)"; exit 1; }
+echo "  admin_denied_total = $D0 after the refused probe"
+
+$CLI -p 7443 --no-auth-warning PROXYSTATS >/dev/null 2>&1 || true
+D1=$(denied_now)
+[ "${D1:-0}" -eq $((D0 + 1)) ] || {
+  echo "FAIL: a second refusal moved the counter from $D0 to ${D1:-<none>}, expected $((D0 + 1))"
+  exit 1; }
+echo "  and a second refusal moves it by exactly one"
+
+# POSITIVE CONTROL. Counting refusals is only useful if an ACCEPTED call does
+# not count -- a counter that ticks on every operator command would say
+# "somebody is probing" about the exporter doing its job every fifteen
+# seconds, and the alarm built on it would be worthless.
+D2=$(denied_now)
+[ "${D2:-0}" -eq "$D1" ] || {
+  echo "FAIL: an AUTHENTICATED PROXYSTATS incremented admin_denied_total ($D1 -> ${D2:-<none>})."
+  echo "      Then the counter measures traffic, not refusals."
+  exit 1; }
+echo "  an authenticated call does not move it (positive control)"
+
 echo "== status reports that proxy UP, not DOWN"
 # THE SECOND THING THAT BROKE, and the one an operator sees. A serving
 # proxy reported DOWN is worse than no report: it sends someone to restart
