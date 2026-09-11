@@ -12,6 +12,21 @@ cd "$(dirname "$0")/.."
 fleet_init $FLINT_DRILL_ROOT/flint-rec- 6580 6581
 fleet_guard
 B=./target/release/flint-server
+CTLBIN=./target/release/flint-controller
+# BUILD WHAT THIS DRILL RUNS. It used to build nothing and rely on whatever a
+# previous step left in target/. On the gate that is the `build` step and it is
+# always there; anywhere else flint-controller is simply absent, the recovery
+# controller never starts, and EVERY arm then fails with the product's failure
+# text -- "move not resolved after recovery", "recovery did not complete the
+# half-done flip" -- while the real cause sits in $FLINT_DRILL_ROOT/flint-rec.log
+# as `No such file or directory`. That cost a wrong conclusion in BUG-0132:
+# three arms were reported as product failures and were a missing binary.
+cargo build --release -q -p flint-server --features rocks -p flint-controller \
+  || { echo "FAIL: build"; exit 1; }
+for bin in "$B" "$CTLBIN"; do
+  [ -x "$bin" ] || { echo "FAIL: $bin is missing after a successful build --
+  every assertion below would fail naming the product instead"; exit 1; }
+done
 SPORT=6580; DPORT=6581
 SADDR="127.0.0.1:$SPORT"; DADDR="127.0.0.1:$DPORT"
 KEYS=150000
@@ -23,6 +38,16 @@ def c(d):
   for _ in range(8): x=((x<<1)^p)&0xffff if x&0x8000 else (x<<1)&0xffff
  return x
 print(c(b"mover")%16384)')
+
+# A FAILING RUN USED TO DELETE ITS OWN EVIDENCE. Both data directories were
+# rm -rf'd on every failure path, so the one artifact that distinguishes "the
+# keys are lost" from "the keys are stranded on the source, unreachable behind
+# a -MOVED" was destroyed by the failure that made the question interesting.
+# BUG-0132 is open on exactly that question and could not be answered from two
+# CI failures because of this line.
+keep_dirs() {
+  echo "  evidence KEPT (not deleted): source=$SDIR dest=$DDIR"
+}
 
 run_once() {
   local delay="$1"
@@ -56,11 +81,26 @@ run_once() {
   local SM DM PHASE
   SM=$(valkey-cli -p $SPORT FLINTMIGRATIONS 2>/dev/null)
   DM=$(valkey-cli -p $DPORT FLINTMIGRATIONS 2>/dev/null)
-  if [ -n "$SM" ] || [ -n "$DM" ]; then PHASE="INTERRUPTED mid-move"; else PHASE="completed pre-kill (recovery is a no-op)"; fi
+  # THREE STATES, NOT TWO. No records on either node means the cutover either
+  # COMPLETED (source is Moved to dest) or NEVER STARTED (source still owns and
+  # serves), and those are opposite facts that this line rendered identically
+  # -- then the verdict text asserted one of them. Ask source who owns the slot
+  # rather than inferring it from an absence (BUG-0132, ops OPS-0037).
+  local OWN
+  if [ -n "$SM" ] || [ -n "$DM" ]; then
+    PHASE="INTERRUPTED mid-move"
+  else
+    OWN=$(valkey-cli -p $SPORT GET "{mover}:key000000" 2>&1)
+    case "$OWN" in
+      *"MOVED $SLOT"*) PHASE="completed pre-kill (source already -MOVED; recovery is a no-op)" ;;
+      val-*)           PHASE="NEVER STARTED (source still owns and serves the slot)" ;;
+      *)               PHASE="no records, and source answers [$OWN] -- ownership indeterminate" ;;
+    esac
+  fi
   echo "  [delay $delay] after restart: source=[$SM] dest=[$DM] -> $PHASE"
 
   # Recovery controller: reconciles from the manifests, no other input.
-  ./target/release/flint-controller --recover-nodes "$SADDR,$DADDR" --id REC --poll-ms 200 2>>$FLINT_DRILL_ROOT/flint-rec.log &
+  "$CTLBIN" --recover-nodes "$SADDR,$DADDR" --id REC --poll-ms 200 2>>$FLINT_DRILL_ROOT/flint-rec.log &
   local CTL=$!
 
   # Wait until the move is fully resolved: dest owns (a write succeeds) AND
@@ -76,20 +116,39 @@ run_once() {
   kill -9 $CTL 2>/dev/null
   if [ "$RESOLVED" != "1" ]; then
     echo "  FAIL: move not resolved after recovery (dest write='$dw' source read='$sr')"
-    pkill -9 -f "flint-server --port 658" 2>/dev/null; rm -rf "$SDIR" "$DDIR"; return 1
+    pkill -9 -f "flint-server --port 658" 2>/dev/null; keep_dirs; return 1
   fi
 
   # No split ownership: the source must NOT serve writes for the slot.
   local sw
   sw=$(valkey-cli -p $SPORT SET "{mover}:key000001" x 2>&1)
-  echo "$sw" | grep -qE "MOVED $SLOT" || { echo "  FAIL: SPLIT OWNERSHIP — source still writable for slot: $sw"; pkill -9 -f "flint-server --port 658" 2>/dev/null; rm -rf "$SDIR" "$DDIR"; return 1; }
+  echo "$sw" | grep -qE "MOVED $SLOT" || { echo "  FAIL: SPLIT OWNERSHIP — source still writable for slot: $sw"; pkill -9 -f "flint-server --port 658" 2>/dev/null; keep_dirs; return 1; }
 
   # No data loss: every sampled key present on the owner (dest).
+  # WHERE the key is, not just that dest lacks it. "Lost" and "stranded behind
+  # a -MOVED on the source" are different faults with different fixes, and the
+  # check that only asks dest cannot tell them apart -- it reports the first
+  # while the second is what the evidence usually supports (BUG-0132).
   local miss=0 k
   for k in 000000 000001 075000 149999; do
     [ "$(valkey-cli -p $DPORT GET "{mover}:key$k")" = "val-$k" ] || { echo "  MISSING key$k on dest"; miss=$((miss+1)); }
   done
-  [ "$miss" = "0" ] || { echo "  FAIL: $miss keys lost after recovery"; pkill -9 -f "flint-server --port 658" 2>/dev/null; rm -rf "$SDIR" "$DDIR"; return 1; }
+  # WHERE THE BYTES ARE, when dest is missing them. "Lost" and "stranded on the
+  # source behind a -MOVED" are different faults with different fixes, and the
+  # dest-only check cannot tell them apart (BUG-0132).
+  #
+  # NOT a per-key GET on the source: by this point the source answers -MOVED
+  # for every key in the slot -- the split-ownership assertion above requires
+  # exactly that -- so a GET can never return a value and the branch reading it
+  # would be dead code that always reports "lost". DBSIZE answers through the
+  # redirect, because it counts what the node HOLDS rather than what it will
+  # serve for this slot.
+  if [ "$miss" != "0" ]; then
+    echo "  WHERE: source DBSIZE=$(valkey-cli -p $SPORT DBSIZE) dest DBSIZE=$(valkey-cli -p $DPORT DBSIZE) (seeded $KEYS to source)"
+    echo "        a source still holding ~$KEYS means the keys are STRANDED -- on disk,"
+    echo "        unreachable, because the source -MOVEDs the slot to a dest without them."
+  fi
+  [ "$miss" = "0" ] || { echo "  FAIL: $miss keys lost after recovery"; pkill -9 -f "flint-server --port 658" 2>/dev/null; keep_dirs; return 1; }
 
   echo "  [delay $delay] RESOLVED: dest owns all keys, source -MOVED, no split, no loss"
   pkill -9 -f "flint-server --port 658" 2>/dev/null; rm -rf "$SDIR" "$DDIR"
@@ -117,7 +176,7 @@ test_half_done_flip() {
   valkey-cli -p $SPORT FLINTSLOTFREEZE "$SLOT" "$DADDR" >/dev/null
   echo "  [half-done-flip] source frozen (Migrating), dest owns; source records=[$(valkey-cli -p $SPORT FLINTMIGRATIONS)]"
 
-  ./target/release/flint-controller --recover-nodes "$SADDR,$DADDR" --id REC2 --poll-ms 200 2>>$FLINT_DRILL_ROOT/flint-rec.log &
+  "$CTLBIN" --recover-nodes "$SADDR,$DADDR" --id REC2 --poll-ms 200 2>>$FLINT_DRILL_ROOT/flint-rec.log &
   local CTL=$! RESOLVED=0 i
   for i in $(seq 1 60); do
     if echo "$(valkey-cli -p $SPORT GET "{mover}:key000000" 2>&1)" | grep -qE "MOVED $SLOT $DADDR"; then RESOLVED=1; break; fi
