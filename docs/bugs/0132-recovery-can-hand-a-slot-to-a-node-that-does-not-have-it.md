@@ -26,6 +26,37 @@ The failing arm, from run 34564798603:
   FAIL: 3 keys lost after recovery
 ```
 
+## Is this reachable outside the drill? Yes, behind one flag
+
+`docs/roadmap.md` lists **"Slot migration (static placement; tenants capped
+~50 GB)"** under *explicitly out of v0 scope*, which reads like this path is
+dead. It is not — that line is about **tenant-facing placement**, and the same
+roadmap describes the traffic rebalancer two hundred lines earlier as doing
+*"cutover via epoch-fenced FLINTMIGRATEIN"*.
+
+The ops agent issues the real command against live masters
+(`crates/flint-agent/src/rebalance.rs`):
+
+```rust
+world::call_slow(&to_master, tls, &[b"FLINTMIGRATEIN", from_master.as_bytes(),
+                 slot_s.as_bytes(), to_master.as_bytes(), ns.as_bytes()], ...)
+```
+
+— and on success commits ownership to the control plane, so proxies route from
+the CP snapshot with the `-MOVED` bridge covering the gap. That is the same
+sequence the drill interrupts.
+
+**It is opt-in and off by default.** `Config::from_args` sets
+`enabled = std::env::args().any(|a| a == "--traffic-rebalance")`, so an agent
+started without that flag never plans a move.
+
+So the exposure is: **a fleet running the agent with `--traffic-rebalance`,
+taking a whole-cluster restart while a move is in flight.** The drill's kill is
+exactly a redeploy. Whether any fleet runs with that flag is a per-box
+`FLINT_ACT_ARGS` question and is not answerable from either repository —
+stated rather than assumed, and worth answering before this bug is prioritised
+either up or down.
+
 ## Why this is not "a flaky drill"
 
 **The failure lands AFTER the drill's `RESOLVED` check passed.** That check is
