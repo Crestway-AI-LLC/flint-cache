@@ -250,6 +250,56 @@ reasons were in the drill rather than the product:
   check performed on a sample too small to fail. Two sessions made it about
   the same file within an hour.
 
+## ONLY SLOW HARDWARE SEES IT, AND OUR DEFAULT GATE IS THE FAST BOX
+
+Three verdicts on the same drill, the same commit range:
+
+| where | shape | verdict | time |
+|---|---|---|---|
+| GitHub Actions runner | 2 vCPU | **FAIL** | 24.1s (`34548804753`) |
+| GitHub Actions runner | 2 vCPU | **FAIL** | 24.5s (`34564798603`) |
+| EC2 gate box, `c7i.xlarge` | 4 vCPU | PASS | 14.1s |
+| this Mac | — | PASS, all three delays | — |
+
+The failing runs take ~70% longer on a fraction of the cores. **That pattern is
+evidence about the mechanism, not just about flakiness:** a defect in
+`recover_migrations` — a wrong branch, a missing record — would fail the same
+way on any machine, because it is a decision rather than a race. A window
+between "the flip is committed" and "the transferred data is durable" is
+exactly what widens on slower storage and narrows to nothing on faster.
+
+So the hardware sensitivity is independent support for the ordering reading
+above, arrived at from a different direction than the `delay 0.5` analysis.
+
+**The operational consequence is larger than this bug.**
+`packaging/aws/gate-box/run.sh` is the documented default for a core gate, and
+it is the `c7i.xlarge`. It passes this while CI fails it twice. Every
+timing-sensitive durability defect of this shape is invisible to the check we
+actually gate on.
+
+That is not a new lesson, which is the uncomfortable part. `docs/field-notes.md`
+already carries *"The cheaper box created a condition the expensive one never
+did"*: the 5-host rc.52 chaos run on `c5d.large` surfaced
+`writes shed -THROTTLED (retried): 23`, a path `docs/slo.md` had recorded as
+never having fired in any run. We learned that slower hardware finds different
+bugs, wrote it down, and then standardised on the fast box.
+
+**Reproducing it therefore needs the slow box, not the gate box:**
+
+```
+FLINT_GATE_TYPE=c5d.large \
+FLINT_GATE_CMD='cargo build --release --workspace --features flint-server/rocks,flint-backup/rocks \
+  && for i in 1 2 3 4 5 6; do echo "== round $i"; tools/slot_cutover_recovery_drill.sh; echo "rc=$?"; done' \
+  packaging/aws/gate-box/run.sh
+```
+
+`c5d.large` is 2 vCPU, matching a runner's shape, and is the instance type that
+produced the field-notes entry above.
+
+*(This section from the ops session, which reached the same ordering conclusion
+from the same two `[delay N]` lines independently. Two derivations recorded as
+two rather than collapsed into one.)*
+
 ## What is NOT established
 
 - **Whether any byte was lost.** Still unanswered, but no longer

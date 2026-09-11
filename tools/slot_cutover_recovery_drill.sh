@@ -147,6 +147,17 @@ run_once() {
     echo "  WHERE: source DBSIZE=$(valkey-cli -p $SPORT DBSIZE) dest DBSIZE=$(valkey-cli -p $DPORT DBSIZE) (seeded $KEYS to source)"
     echo "        a source still holding ~$KEYS means the keys are STRANDED -- on disk,"
     echo "        unreachable, because the source -MOVEDs the slot to a dest without them."
+    # AND THE RECORDS, which is the state that decides which branch of
+    # recover_migrations would have run. DBSIZE says where the data is; this
+    # says what the durable manifests claimed about it. Without it the next
+    # failure still cannot tell an `importing`/`migrating`/`aborted` record
+    # that was EMPTY BY CONTRACT from one that was empty because it was lost --
+    # and the whole ordering question turns on that difference.
+    echo "  RECORDS AT FAILURE: source=[$(valkey-cli -p $SPORT FLINTMIGRATIONS 2>&1 | tr '\n' ' ')]"
+    echo "                      dest=[$(valkey-cli -p $DPORT FLINTMIGRATIONS 2>&1 | tr '\n' ' ')]"
+    echo "        Empty on both is the reading to distrust: it means 'no migration in"
+    echo "        flight' and 'the record was cleared before the data was durable' in"
+    echo "        exactly the same characters."
   fi
   [ "$miss" = "0" ] || { echo "  FAIL: $miss keys lost after recovery"; pkill -9 -f "flint-server --port 658" 2>/dev/null; keep_dirs; return 1; }
 
