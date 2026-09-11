@@ -696,9 +696,25 @@ certificate is readable — a different sentinel because that field is genuinely
 negative once a certificate has expired. `-1` rather than `0` because zero is a
 real reading for every one of them, and a number rather than a word because a
 field that renders a word is not a series at all: it goes *absent*, and absent
-is "no data", which most alerting treats as not-firing. So write the obvious
-alert (`flint_lag_ms > 5000`, `flint_cert_days_remaining < 14`) and the unknown
-states trip it. The string-valued fields — `role`, `build`, `role_epoch`,
+is "no data", which most alerting treats as not-firing.
+
+**Which direction that helps in depends on the alert.** A sentinel below the
+real range fires a FLOOR alert and is silent under a CEILING one, so this is
+not one rule for all five: `flint_cert_days_remaining < 14` and
+`flint_disk_free_pct < 10` trip on their sentinels exactly as they should,
+while `flint_lag_ms > 5000` does **not** trip on `-1` — it reads as the lowest
+lag the field can report. For the three lag fields, write the unknown state as
+its own expression beside the threshold one (`flint_seq_lag == -1`).
+
+**And a replica flies those three permanently.** `acked_seq`, `seq_lag` and
+`lag_ms` describe a seat's OWN outbound replicas, which a replica does not
+have — so a healthy, fully caught-up replica reports `-1` for all three for the
+whole life of the role. There, `-1` means *not applicable*, not *widowed*. Only
+`flint_up` carries a `role` label, so an unknown-state alert has to narrow
+itself: `flint_seq_lag == -1 and on(instance) flint_up{role="master"}`. Tracked
+as BUG-0131.
+
+The string-valued fields — `role`, `build`, `role_epoch`,
 `wal_archive_src`, `disk_verdict`, `mem_src`, `evictable_ns`,
 `evictable_ns_bytes`, `evict`, `collection_read_mode` — are `FLINTINFO`-only by
 nature; none of them is a quantity. `flintctl status` still prints the word
