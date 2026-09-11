@@ -158,10 +158,19 @@ rest is a decision.
 
 ## What is NOT established
 
-- **No alert is known to have broken.** Neither repo ships alert rules; the
-  guidance in `self-hosting.md` is prose. The claim here is that an operator
-  following that prose gets a lag alert that is silent in the unknown state,
-  not that one did.
+- **No alert is known to have broken, and the shipped ones are not exposed.**
+  The ops repo *does* ship alarms — six, created by
+  `packaging/aws/ops-box/alarms.sh` — but every one is in the `FlintOps`
+  CloudWatch namespace on agent-level metrics (`Pages`, `PrimaryHealthy`,
+  `OverdueIncidents`, `TriageUnjudged`, `WatchLaneHealthy`,
+  `OpsRosterMismatch`); none reads `seq_lag`, `lag_ms` or `acked_seq`. The
+  agent's own two consumers *do* act on the field and are conservative by
+  construction: `insight.rs` sorts an unknown lag LAST when choosing a
+  promotion candidate (`unwrap_or(u64::MAX)`), and `tier2.rs` gates on
+  `== 0`, which an unknown can never satisfy. So the exposure really is
+  operator-written PromQL alone — the claim here is that an operator
+  following `self-hosting.md`'s prose gets a lag alert silent in the unknown
+  state, not that one did.
 - **The replica reading is the ops session's observation plus this code path.**
   I did not stand up a pair to see `acked_seq` and `lag_ms` render `-1` on a
   replica; `seq_lag` is what was observed on the playground, and the other two
