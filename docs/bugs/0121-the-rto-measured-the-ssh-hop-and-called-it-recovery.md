@@ -1,7 +1,8 @@
-# BUG-0121 — the direct-path RTO measured the SSH hop and called it recovery
+# BUG-0121 — the direct-path RTO measured the SSH hop and called it recovery (reporting FIXED; the exit verdict it named was SUPERSEDED 2026-09-09)
 
-Status: **the reporting is FIXED; the M2 exit verdict it affects is OPEN** —
-see "What this does not settle"
+Status: **the reporting is FIXED. The M2 exit verdict it affects is no longer
+open — it was SUPERSEDED on 2026-09-09**, not answered; see "What this does not
+settle", and the note appended below it.
 Found: 2026-09-07, investigating the M2 soak's RTO tail
 Component: `crates/flint-chaos/src/main.rs`, `writer.rs`
 
@@ -87,3 +88,33 @@ number is made of.
 **Do not read the local figures as the fleet's.** Locally `kill_master_hot`
 signals a child process directly and dispatch is ~34 ms; the 712 ms p50 is a
 property of killing over SSH across hosts.
+
+## 2026-09-10 — the exit verdict this file held open was superseded, not answered
+
+The status line above said the M2 exit verdict was OPEN pending the one
+question below. That is no longer the state, and the distinction is worth
+keeping precise because it is not a resolution.
+
+`docs/roadmap.md` (ops) declares **`Exit: MET 2026-09-09, on the post-fix
+window`**, and says what that rests on: four batches whose data plane was the
+build under test, **1,611 promotions, no FAIL row among them**, with every
+clause checked on that window rather than inferred. The older rows are handled
+explicitly rather than quietly — one reclassified FAIL → ABORTED (BUG-0119's
+harness panic, no verdict line ever printed), one left FAIL in the ledger as
+history — and the declaration is made on the later evidence:
+
+> **The exit is declared on post-fix evidence rather than by re-arguing that
+> row** (Jeff's call, 2026-09-09), and the row stays FAIL in the ledger as
+> history, which is where it belongs. It is excluded from the declaration
+> rather than explained away.
+
+**So the question this file holds open is still open, and it no longer gates
+anything.** Whether batch 3 breached by product or by instrument cannot be
+recovered — the stall was measured and not printed, and the log holds only
+aggregates — and the exit no longer rests on it. Both halves matter: leaving
+the status as OPEN would report a milestone as blocked when it is not, and
+rewriting the question as answered would record a fact nobody obtained.
+
+The re-run named below would still settle it and is still worth one pass if
+that batch ever needs to be read on its own terms. It is no longer on the
+critical path for anything.
