@@ -26,7 +26,18 @@ name: gate
 # something else is checking.
 on:
   push:
-    branches: [main]
+    # `release/**` AND NOT ONLY main (ADR-0042, ops repo). A release branch
+    # matched neither trigger, so `release.sh --prepare` produced a branch with
+    # NO RUNS -- and an empty run list is exactly what "the run has not
+    # finished yet" looks like. The tag is frozen correctly, the branch is
+    # pushed correctly, and nothing anywhere says a gate was never asked for.
+    # Every cut therefore ended with a human remembering to dispatch this by
+    # hand, which is the failure mode this workflow was written to remove one
+    # level down.
+    #
+    # The cost is one extra run per release branch, on bytes that are about to
+    # ship. That is the cheapest gate-minute we buy.
+    branches: [main, 'release/**']
   pull_request:
   # Hand-runnable, because "did my CI change work" should not require
   # opening a pull request to find out.
