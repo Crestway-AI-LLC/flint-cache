@@ -1,10 +1,11 @@
 # BUG-0132: slot recovery can hand ownership to a node that does not have the data (OPEN)
 
-Status: **OPEN**, found 2026-09-10 · Severity: **high, pending confirmation of
-the mechanism** — no bytes are known destroyed, but after an interrupted slot
-cutover a client can be redirected to a node that returns nothing for keys it
-durably acked. The write is on disk and unreachable, which is
-indistinguishable from loss at the client.
+Status: **OPEN**, found 2026-09-10 · Severity: **medium — latent for the
+automated path, live for a deliberate one** (measured 2026-09-11, see
+"Is this reachable outside the drill?"). No bytes are known destroyed, but
+after an interrupted slot cutover a client can be redirected to a node that
+returns nothing for keys it durably acked. The write is on disk and
+unreachable, which is indistinguishable from loss at the client.
 
 **This is the bug keeping core `main` red**, and it is not BUG-0131's chaos
 break (fixed at `bbca61f`) nor the docs commits it was first attributed to.
@@ -50,12 +51,38 @@ sequence the drill interrupts.
 `enabled = std::env::args().any(|a| a == "--traffic-rebalance")`, so an agent
 started without that flag never plans a move.
 
-So the exposure is: **a fleet running the agent with `--traffic-rebalance`,
-taking a whole-cluster restart while a move is in flight.** The drill's kill is
-exactly a redeploy. Whether any fleet runs with that flag is a per-box
-`FLINT_ACT_ARGS` question and is not answerable from either repository —
-stated rather than assumed, and worth answering before this bug is prioritised
-either up or down.
+So the exposure is: **something initiating a cutover, and a whole-cluster
+restart while the move is in flight.** The drill's kill is exactly a redeploy.
+
+### ANSWERED 2026-09-11 — measured on both ops boxes, not inferred
+
+`--traffic-rebalance` is **absent on both**. The running agents carry 1022
+characters of arguments and the flag is in neither, no rebalance-related flag
+of any kind appears, nothing under `/etc/systemd/system/` or
+`/var/lib/flint-phase1/` mentions it, and both are armed to exactly:
+
+```
+FLINT_ACT_ARGS=--tier2 AttachReplica,PromoteReplica
+```
+
+**With a positive control on the check**, because the whole claim is an
+absence: the same `grep` against the same string finds `--control-plane`, so
+it was capable of a hit. Without that the result would be worth nothing — the
+lesson from this session's `\b` regex, applied to the check that answers this
+file.
+
+**So nothing on the current fleet initiates a slot cutover automatically.**
+The rebalancer is the only automated producer and it is off.
+
+**But an operator can still reach it by hand**: `flintctl migrate-slots` is a
+shipped verb, and `FLINTMIGRATEIN` is reachable from `flint-ctl`,
+`flint-controller` and the server directly. So the bug is **latent for the
+automated path and live for a deliberate one** — a human migrating slots, with
+a redeploy landing mid-move, hits exactly this.
+
+That is why the severity moved to medium rather than being closed: the
+trigger now requires an operator action rather than a background sweep, and
+the consequence if it fires is unchanged.
 
 ## Why this is not "a flaky drill"
 
@@ -308,9 +335,6 @@ two rather than collapsed into one.)*
 - **Whether this is new.** No bisect has been run. It failed on a
   documentation-only commit, so it predates today's changes, but how far back
   is unknown.
-- **Whether the local failures and the CI failure share a cause.** Different
-  arms, different platforms, same drill.
-
 - **Whether the CI failure reproduces anywhere else.** It does not reproduce
   on this Mac at any of the three delays. The drill is timing-sensitive by
   construction, so that is weak evidence about the Linux runner rather than
