@@ -90,6 +90,43 @@ fn info_field(port: u16, name: &str) -> Option<String> {
 /// six times: this fires while a promotion may still be settling, so six
 /// separate reads would be six different instants, and the resulting line
 /// could describe a state the node was never in.
+/// Which fields a `node_line` owes, given what the seat says it is (BUG-0131).
+///
+/// `acked_seq` and `seq_lag` describe a seat's OWN OUTBOUND replicas, and a
+/// seat that has none does not render them at all -- the server omits both
+/// when `read_only && live_replicas == 0`. Absent there is the CONTRACT, not
+/// a rename.
+///
+/// The self-check that calls this could not tell those apart: it required
+/// every field on both seats, so the moment BUG-0131 landed it panicked on
+/// every replica saying "a field was renamed" about a deliberate omission,
+/// and it reddened the chaos leg on main for five hours.
+///
+/// THE PREDICATE IS "NOT A REPLICATION SOURCE", NOT "IS A REPLICA". A demoted
+/// master with an attached replica is still a source and still owes both
+/// fields, which is why this reads both halves of the server's condition off
+/// the line instead of keying on the role alone. `live_replicas` is never
+/// omitted for exactly this purpose -- the server's own comment calls it
+/// "what makes the condition here readable from outside".
+fn missing_fields(line: &str) -> Vec<&'static str> {
+    let source = !(line.contains("role=replica") && line.contains("live_replicas=0"));
+    let mut owed = vec![
+        "role",
+        "epoch",
+        "latest_seq",
+        "last_applied",
+        "live_replicas",
+        "dbsize",
+    ];
+    if source {
+        owed.push("acked_seq");
+        owed.push("seq_lag");
+    }
+    owed.into_iter()
+        .filter(|f| line.contains(&format!("{f}=<absent>")))
+        .collect()
+}
+
 fn node_line(port: u16) -> String {
     let info = match Client::connect(port).and_then(|mut c| c.call(&[b"FLINTINFO"])) {
         Ok(Value::Bulk(Some(v))) => String::from_utf8_lossy(&v).into_owned(),
@@ -148,11 +185,16 @@ fn verify_probe(master: u16, replica: u16) {
     }
     for (label, port) in [("master", master), ("replica", replica)] {
         let line = node_line(port);
-        if line.contains("<absent>") || line.contains("unreadable") {
-            panic!(
-                "probe self-check: FLINTINFO on the {label} did not yield the expected fields — a field was renamed and the lost-link dump would print nothing usable: {line}"
-            );
+        if line.contains("unreadable") {
+            panic!("probe self-check: FLINTINFO on the {label} is {line}");
         }
+        let missing = missing_fields(&line);
+        assert!(
+            missing.is_empty(),
+            "probe self-check: FLINTINFO on the {label} is missing {} — a field \
+             was renamed and the lost-link dump would print nothing usable: {line}",
+            missing.join(", ")
+        );
     }
     eprintln!(
         "  [probe] self-check ok: ABSENT/PRESENT discriminated, FLINTINFO fields resolve on both members"
@@ -433,4 +475,46 @@ fn main() {
     println!("---");
     println!("PASS: walked {hops} links end-to-end through {mk} master + {rk} replica kills");
     println!("  every pointer correct, no lost link, no cycle, exactly one END at key{n:07}");
+}
+
+#[cfg(test)]
+mod self_check_tests {
+    use super::missing_fields;
+
+    /// The exact line that reddened main on 2026-09-11, from run 34557063534.
+    const REPLICA_AFTER_0131: &str = ":6331 role=replica epoch=(0,1) latest_seq=201224 \
+last_applied=200002 acked_seq=<absent> seq_lag=<absent> live_replicas=0 dbsize=200000";
+
+    #[test]
+    fn a_replica_owes_no_fields_about_replicas_it_does_not_have() {
+        assert!(
+            missing_fields(REPLICA_AFTER_0131).is_empty(),
+            "the contract line from BUG-0131 must not read as a rename"
+        );
+    }
+
+    /// The half that must not be lost: this check exists so a RENAMED field
+    /// cannot make the lost-link dump silently useless. Absent-because-renamed
+    /// still has to be caught, on the same seat that is allowed its omissions.
+    #[test]
+    fn a_replica_still_owes_everything_else() {
+        let renamed = REPLICA_AFTER_0131.replace("last_applied=200002", "last_applied=<absent>");
+        assert_eq!(missing_fields(&renamed), vec!["last_applied"]);
+    }
+
+    /// And a source owes the two. `live_replicas=1` is the discriminator, not
+    /// the role: keying on "is a replica" would excuse a demoted master that
+    /// still has an attached replica and still publishes them.
+    #[test]
+    fn a_seat_with_replicas_owes_the_fields_about_them() {
+        let src = ":6330 role=master epoch=(0,1) latest_seq=1 last_applied=1 \
+acked_seq=<absent> seq_lag=<absent> live_replicas=1 dbsize=1";
+        assert_eq!(missing_fields(src), vec!["acked_seq", "seq_lag"]);
+        let demoted = src.replace("role=master", "role=replica");
+        assert_eq!(
+            missing_fields(&demoted),
+            vec!["acked_seq", "seq_lag"],
+            "a read-only seat that still HAS a replica is a source and owes them"
+        );
+    }
 }
