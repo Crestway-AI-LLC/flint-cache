@@ -198,7 +198,26 @@ reasons were in the drill rather than the product:
   *completed pre-kill* (source already `-MOVED`) from *NEVER STARTED* (source
   still serves) from *indeterminate*. Those were rendered identically, and the
   verdict text then asserted one of them.
-- **Mode fixed**, 100644 → 100755, so it runs directly like its peers.
+- **Mode changed 100644 → 100755, and the claim that came with it was wrong.**
+  This file originally reported the `100644` mode as a defect — "it cannot be
+  executed directly, only via `bash`", "so it runs directly like its peers".
+  **Most of its peers do not.** Counted afterwards:
+
+  ```
+  106  tools/*_drill.sh at 100644
+   34  tools/*_drill.sh at 100755
+  ```
+
+  100644 is the norm here and 100755 is the exception, so there was no
+  convention to restore. I sampled ONE neighbouring drill, found 100755, and
+  generalised; the peer session sampled two and found a pair. Neither sample
+  supported the conclusion either of us drew from it. The change is harmless
+  and left in place — both modes run, since the gate invokes drills through
+  `bash` — but it is not a fix and nothing should cite it as one.
+
+  It is the same error as the `\b` regex in ops field-notes, one layer up: a
+  check performed on a sample too small to fail. Two sessions made it about
+  the same file within an hour.
 
 ## What is NOT established
 
