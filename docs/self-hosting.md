@@ -706,13 +706,17 @@ while `flint_lag_ms > 5000` does **not** trip on `-1` — it reads as the lowest
 lag the field can report. For the three lag fields, write the unknown state as
 its own expression beside the threshold one (`flint_seq_lag == -1`).
 
-**And a replica flies those three permanently.** `acked_seq`, `seq_lag` and
-`lag_ms` describe a seat's OWN outbound replicas, which a replica does not
-have — so a healthy, fully caught-up replica reports `-1` for all three for the
-whole life of the role. There, `-1` means *not applicable*, not *widowed*. Only
-`flint_up` carries a `role` label, so an unknown-state alert has to narrow
-itself: `flint_seq_lag == -1 and on(instance) flint_up{role="master"}`. Tracked
-as BUG-0131.
+**And a replica does not render those three at all.** `acked_seq`, `seq_lag`
+and `lag_ms` describe a seat's OWN outbound replicas, which a replica does not
+have — so a replica omits them and `flint_seq_lag`, `flint_acked_seq` and
+`flint_lag_ms` simply have no series for that instance. **Absence there means
+the question does not apply; `-1` means it applies and could not be answered**,
+which is a widowed master and the state the fields exist to report. So
+`flint_seq_lag == -1` is the unknown-state alert and it fires only on masters,
+with no `role` join needed — the per-field gauges carry `instance` alone, and
+only `flint_up` is labelled by role. A replica that *did* report `-1` for its
+whole life would page forever on a healthy seat; that was true of rc.70 and
+rc.71 and is fixed from rc.72 (BUG-0131).
 
 The string-valued fields — `role`, `build`, `role_epoch`,
 `wal_archive_src`, `disk_verdict`, `mem_src`, `evictable_ns`,

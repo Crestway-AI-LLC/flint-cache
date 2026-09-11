@@ -4622,6 +4622,71 @@ fn is_pure_write(upper_name: &[u8], args: &[Vec<u8>]) -> bool {
 #[cfg(feature = "rocks")]
 const UNKNOWN_NUMERIC: &str = "-1";
 
+/// The three FLINTINFO fields that describe this seat's OWN outbound replicas
+/// -- `acked_seq`, `seq_lag`, `lag_ms` -- as two spliceable fragments, or
+/// EMPTY on a replica (BUG-0131).
+///
+/// A replica has no outbound replicas: nothing ever calls `record_ack` on it,
+/// so `effective_acked` is `None` for the whole life of the role and the
+/// sentinel would report "widowed" forever about a seat that was never
+/// supposed to have a replica. ADR-0018's rule, the one OPS-0213 adopted:
+/// **absence means NOT APPLICABLE; a value means applicable.** A master keeps
+/// the sentinel, because a widowed master is precisely the state these fields
+/// exist to report -- `flintinfo_numeric_drill` pins that, and dropping the
+/// fields everywhere would reopen BUG-0095 rather than close BUG-0131.
+///
+/// TWO fragments because the fields are not adjacent in the template:
+/// `acked_seq`/`seq_lag` follow `last_applied`, `lag_ms` follows
+/// `live_replicas`. Each terminates itself with CRLF and is spliced before
+/// the next key, so an empty one leaves no blank line rather than a stray
+/// one.
+///
+/// THE CONDITION IS "not a replication source", NOT "is a replica", and the
+/// difference is a live one. `controlled_failover` DEMOTES the old master and
+/// then polls **that seat's** `seq_lag` until it reads 0, because only the
+/// demoted seat knows how far its replica has drained -- and it is read-only
+/// by then while its replica is still attached and still acking. Keying on
+/// the role alone made every rolling upgrade hang for 30s and panic
+/// (`replica never drained the demoted master's tail`). So a read-only seat
+/// that still HAS live replicas keeps reporting them.
+///
+/// A master is never omitted even with zero replicas, because that is the
+/// WIDOWED state the fields exist to report and BUG-0095 exists to keep
+/// visible. Only `read_only && no live replicas` -- a plain pair replica --
+/// is the "does not apply" case.
+///
+/// The presence of these fields can therefore change on one seat, at a
+/// demotion. That is a real transition and not a flapping series: a pair
+/// replica never acquires an outbound replica, and a master never loses the
+/// fields at all.
+///
+/// `live_replicas` is master-side too and deliberately NOT omitted: on a
+/// replica it renders a true `0` rather than a sentinel, so it states a fact
+/// instead of claiming an unknown -- and it is what makes the condition here
+/// readable from outside.
+#[cfg(feature = "rocks")]
+fn master_side_fields(
+    read_only: bool,
+    live_replicas: usize,
+    acked: Option<u64>,
+    latest: u64,
+    lag_ms: Option<u64>,
+) -> (String, String) {
+    if read_only && live_replicas == 0 {
+        return (String::new(), String::new());
+    }
+    let acked_s: String = acked.map_or_else(|| UNKNOWN_NUMERIC.into(), |a| a.to_string());
+    let seq_lag: String = acked.map_or_else(
+        || UNKNOWN_NUMERIC.into(),
+        |a| latest.saturating_sub(a).to_string(),
+    );
+    let lag_s: String = lag_ms.map_or_else(|| UNKNOWN_NUMERIC.into(), |l| l.to_string());
+    (
+        format!("acked_seq:{acked_s}\r\nseq_lag:{seq_lag}\r\n"),
+        format!("lag_ms:{lag_s}\r\n"),
+    )
+}
+
 /// BUG-0060's node-level bound on the SUM of concurrent collection reads.
 /// Built once from `--collection-read-budget-pct`; 0 (the default) disables it
 /// and every call below becomes a branch that does nothing.
@@ -5781,10 +5846,17 @@ fn flintinfo(
     // drains a backlog even after writes stop — so it is the correct
     // promotion-READINESS signal. `UNKNOWN_NUMERIC` when no live replica —
     // which is not zero, and must not be read as a pair that is caught up.
-    let seq_lag = match hub.effective_acked(now) {
-        Some(acked) => latest.saturating_sub(acked).to_string(),
-        None => UNKNOWN_NUMERIC.into(),
-    };
+    //
+    // BUG-0131 lifts all three out of the template so a REPLICA can omit them
+    // rather than fly a sentinel that means "widowed" on the role that can
+    // never have a replica. See `master_side_fields`.
+    let (msa, mlag) = master_side_fields(
+        read_only,
+        hub.live_replica_count(now),
+        hub.effective_acked(now),
+        latest,
+        hub.lag_ms(now),
+    );
     let (disk_free, disk_total, disk_unknown) = DISK.snapshot();
     // Read the stall pair ONCE. Two reads could straddle a change, and would
     // let write_stall_readable describe a different call than the values
@@ -5794,13 +5866,9 @@ fn flintinfo(
     let compaction = rocks.as_ref().and_then(|kv| kv.compaction_pressure());
     let mem_sample = flint_storage::mem::sample();
     let info = format!(
-        "role:{}\r\nloading:0\r\nrole_epoch:{role_epoch}\r\nbuild:{build}\r\nsst_bytes:{sst}\r\nlatest_seq:{latest}\r\nlast_applied:{last_applied}\r\nacked_seq:{}\r\nseq_lag:{seq_lag}\r\nwal_headroom_seq:{whs}\r\nwal_min_acked_seq:{wma}\r\nwal_headroom_shed_seq:{whl}\r\nwal_bytes_per_seq:{wbps}\r\nwal_archive_mb:{wamb}\r\nwal_archive_src:{wasrc}\r\nlive_replicas:{}\r\nlag_ms:{}\r\nlag_ms_max:{lmx}\r\nlag_max_gap:{lmg}\r\nlag_soft_ms:{soft}\r\nlag_hard_ms:{hard}\r\nmin_replicas_to_write:{minr}\r\nwidowed_grace_ms:{wgm}\r\nwidowed_shed:{wsh}\r\nfullsync_active:{fsa}\r\nfullsync_max:{fsm}\r\nasync_write_queue:{aqd}\r\nwrite_deadline_ms:{wdm}\r\nwrite_inflight:{wif}\r\nwrite_service_us:{wsu}\r\nwrite_cost_us:{wcu}\r\nwrite_wait_est_ms:{wwe}\r\nwrite_wait_peak_ms:{wwp}\r\nwrite_wait_peak_inflight:{wwpi}\r\nwrite_wait_peak_cost_us:{wwps}\r\nwrites_shed_deadline:{wsd}\r\nwrites_shed_lag:{wsl}\r\nwrites_shed_quorum:{wsq}\r\nwrites_shed_widowed:{wswd}\r\nwrites_shed_headroom:{wshr}\r\nwrites_delayed_soft:{wdsf}\r\nwal_fsync_ms:{wfm}\r\nwal_fsync_total:{wft}\r\ncert_days_remaining:{cdr}\r\nactive_conns:{ac}\r\nmax_conns:{mc}\r\nconns_shed_total:{cs}\r\nwrite_stopped:{wst}\r\ndelayed_write_rate:{dwr}\r\nwrite_stall_readable:{wsr}\r\nl0_files:{l0f}\r\npending_compaction_bytes:{pcb}\r\ncompaction_readable:{cr}\r\ndisk_free_bytes:{dfb}\r\ndisk_total_bytes:{dtb}\r\ndisk_free_pct:{dfp}\r\ndisk_verdict:{dv}\r\ndisk_unknown_samples:{dus}\r\nmem_avail_bytes:{mab}\r\nmem_total_bytes:{mtb}\r\nmem_avail_pct:{map}\r\nmem_src:{msrc}\r\nevictable_ns:{ens}\r\nevictable_ns_agree:{ensa}\r\nevictable_ns_bytes:{ensb}\r\nreclaim_active:{rca}\r\nreclaim_target_free_bytes:{rctf}\r\nevict:{evm}\r\ncollection_read_budget_pct:{crbp}\r\ncollection_read_in_flight_bytes:{crif}\r\ncollection_read_mode:{crm}\r\ncollection_read_refused:{crr}\r\ncollection_read_would_refuse:{crwr}\r\ncollection_read_unmeasured:{cru}\r\ngc_swept_expired:{gse}\r\ngc_swept_orphans:{gso}\r\nuptime_ms:{upms}\r\n{lrs}",
+        "role:{}\r\nloading:0\r\nrole_epoch:{role_epoch}\r\nbuild:{build}\r\nsst_bytes:{sst}\r\nlatest_seq:{latest}\r\nlast_applied:{last_applied}\r\n{msa}wal_headroom_seq:{whs}\r\nwal_min_acked_seq:{wma}\r\nwal_headroom_shed_seq:{whl}\r\nwal_bytes_per_seq:{wbps}\r\nwal_archive_mb:{wamb}\r\nwal_archive_src:{wasrc}\r\nlive_replicas:{}\r\n{mlag}lag_ms_max:{lmx}\r\nlag_max_gap:{lmg}\r\nlag_soft_ms:{soft}\r\nlag_hard_ms:{hard}\r\nmin_replicas_to_write:{minr}\r\nwidowed_grace_ms:{wgm}\r\nwidowed_shed:{wsh}\r\nfullsync_active:{fsa}\r\nfullsync_max:{fsm}\r\nasync_write_queue:{aqd}\r\nwrite_deadline_ms:{wdm}\r\nwrite_inflight:{wif}\r\nwrite_service_us:{wsu}\r\nwrite_cost_us:{wcu}\r\nwrite_wait_est_ms:{wwe}\r\nwrite_wait_peak_ms:{wwp}\r\nwrite_wait_peak_inflight:{wwpi}\r\nwrite_wait_peak_cost_us:{wwps}\r\nwrites_shed_deadline:{wsd}\r\nwrites_shed_lag:{wsl}\r\nwrites_shed_quorum:{wsq}\r\nwrites_shed_widowed:{wswd}\r\nwrites_shed_headroom:{wshr}\r\nwrites_delayed_soft:{wdsf}\r\nwal_fsync_ms:{wfm}\r\nwal_fsync_total:{wft}\r\ncert_days_remaining:{cdr}\r\nactive_conns:{ac}\r\nmax_conns:{mc}\r\nconns_shed_total:{cs}\r\nwrite_stopped:{wst}\r\ndelayed_write_rate:{dwr}\r\nwrite_stall_readable:{wsr}\r\nl0_files:{l0f}\r\npending_compaction_bytes:{pcb}\r\ncompaction_readable:{cr}\r\ndisk_free_bytes:{dfb}\r\ndisk_total_bytes:{dtb}\r\ndisk_free_pct:{dfp}\r\ndisk_verdict:{dv}\r\ndisk_unknown_samples:{dus}\r\nmem_avail_bytes:{mab}\r\nmem_total_bytes:{mtb}\r\nmem_avail_pct:{map}\r\nmem_src:{msrc}\r\nevictable_ns:{ens}\r\nevictable_ns_agree:{ensa}\r\nevictable_ns_bytes:{ensb}\r\nreclaim_active:{rca}\r\nreclaim_target_free_bytes:{rctf}\r\nevict:{evm}\r\ncollection_read_budget_pct:{crbp}\r\ncollection_read_in_flight_bytes:{crif}\r\ncollection_read_mode:{crm}\r\ncollection_read_refused:{crr}\r\ncollection_read_would_refuse:{crwr}\r\ncollection_read_unmeasured:{cru}\r\ngc_swept_expired:{gse}\r\ngc_swept_orphans:{gso}\r\nuptime_ms:{upms}\r\n{lrs}",
         if read_only { "replica" } else { "master" },
-        hub.effective_acked(now)
-            .map_or_else(|| UNKNOWN_NUMERIC.into(), |a| a.to_string()),
         hub.live_replica_count(now),
-        hub.lag_ms(now)
-            .map_or_else(|| UNKNOWN_NUMERIC.into(), |l| l.to_string()),
         soft = hub.lag_soft_ms(),
         hard = hub.lag_hard_ms(),
         // BUG-0079. The archive budget and HOW it was chosen, so a
@@ -8787,6 +8855,107 @@ mod quarantine_tests {
 /// master's refusal and a socket's failure arrived as the same `Err`, so a
 /// fence-vouched snapshot was discarded over `EAGAIN` and the rejoin became a
 /// 93-file full re-seed while the promoted master shed every write.
+/// BUG-0131. The role dimension of the unknown sentinel, which
+/// `flintinfo_numeric_drill` could not reach with one seat: a standalone node
+/// with no replica is a MASTER, so the sentinel was only ever pinned in the
+/// role where it means a fault.
+#[cfg(all(test, feature = "rocks"))]
+mod master_side_field_tests {
+    use super::master_side_fields;
+
+    /// A PLAIN pair replica -- read-only, nothing streaming from it -- renders
+    /// none of the three, so a consumer sees absence ("does not apply")
+    /// instead of the sentinel, which on a master means "applies and cannot
+    /// be known".
+    #[test]
+    fn a_plain_replica_omits_every_master_side_field() {
+        let (msa, mlag) = master_side_fields(true, 0, None, 900, None);
+        assert_eq!(msa, "", "acked_seq/seq_lag must not render on a replica");
+        assert_eq!(mlag, "", "lag_ms must not render on a replica");
+    }
+
+    /// AND THE CASE THAT MAKES THE CONDITION "not a replication source"
+    /// rather than "is a replica". `controlled_failover` demotes the old
+    /// master and then polls THAT SEAT's `seq_lag` until it reads 0 -- only
+    /// the demoted seat knows how far its replica has drained -- so for that
+    /// window it is read-only WITH a live replica still acking. Keyed on the
+    /// role alone this returned empty, the drain loop never saw `Some("0")`,
+    /// and every rolling upgrade panicked after 30s with "replica never
+    /// drained the demoted master's tail". Caught by `build_read_failure`.
+    #[test]
+    fn a_demoted_master_still_draining_keeps_reporting_its_replica() {
+        let (msa, mlag) = master_side_fields(true, 1, Some(900), 900, Some(0));
+        assert_eq!(
+            msa, "acked_seq:900\r\nseq_lag:0\r\n",
+            "the roll's drain wait reads seq_lag off the DEMOTED seat"
+        );
+        assert_eq!(mlag, "lag_ms:0\r\n");
+    }
+
+    /// And mid-drain, before the replica has acked anything at this epoch,
+    /// that same seat renders the SENTINEL rather than nothing: the question
+    /// applies -- something is streaming from it -- and the answer is not yet
+    /// known. Absence here would be the collapse this bug is about, pointing
+    /// the other way.
+    #[test]
+    fn a_read_only_source_with_no_ack_yet_renders_the_sentinel() {
+        let (msa, _) = master_side_fields(true, 1, None, 900, None);
+        assert_eq!(msa, "acked_seq:-1\r\nseq_lag:-1\r\n");
+    }
+
+    /// THE POSITIVE CONTROL, and the half that keeps BUG-0095 closed: a
+    /// WIDOWED MASTER still renders the sentinel, zero replicas and all. A
+    /// change that returned empty here would make the series vanish in the
+    /// one state it exists to report -- BUG-0095 reopened by the fix for
+    /// BUG-0131, which is worse than either bug alone.
+    #[test]
+    fn a_widowed_master_still_renders_the_sentinel() {
+        let (msa, mlag) = master_side_fields(false, 0, None, 900, None);
+        assert_eq!(msa, "acked_seq:-1\r\nseq_lag:-1\r\n");
+        assert_eq!(mlag, "lag_ms:-1\r\n");
+    }
+
+    /// A healthy master renders real numbers, and `seq_lag` is the DIFFERENCE
+    /// rather than the ack. A fragment that put the cursor where the lag
+    /// belongs would satisfy every absence assertion above.
+    #[test]
+    fn a_healthy_master_renders_the_difference_not_the_cursor() {
+        let (msa, mlag) = master_side_fields(false, 1, Some(880), 900, Some(4));
+        assert_eq!(msa, "acked_seq:880\r\nseq_lag:20\r\n");
+        assert_eq!(mlag, "lag_ms:4\r\n");
+    }
+
+    /// Zero is a LEGITIMATE reading and must not be confused with the
+    /// sentinel in either direction: a caught-up pair reports 0, not -1.
+    #[test]
+    fn a_caught_up_master_reports_zero_not_the_sentinel() {
+        let (msa, _) = master_side_fields(false, 1, Some(900), 900, Some(0));
+        assert_eq!(msa, "acked_seq:900\r\nseq_lag:0\r\n");
+    }
+
+    /// Each fragment terminates itself, so splicing an EMPTY one leaves no
+    /// blank line. Every parser here skips empty lines, so this would not
+    /// break a consumer -- it would just make the reply malformed, and the
+    /// property costs one assertion to hold.
+    #[test]
+    fn every_rendered_fragment_ends_with_exactly_one_crlf() {
+        for (msa, mlag) in [
+            master_side_fields(false, 1, Some(1), 2, Some(3)),
+            master_side_fields(false, 0, None, 2, None),
+            master_side_fields(true, 1, Some(1), 2, Some(3)),
+        ] {
+            assert!(
+                msa.ends_with("\r\n") && !msa.contains("\r\n\r\n"),
+                "{msa:?}"
+            );
+            assert!(
+                mlag.ends_with("\r\n") && !mlag.contains("\r\n\r\n"),
+                "{mlag:?}"
+            );
+        }
+    }
+}
+
 #[cfg(all(test, feature = "rocks"))]
 mod probe_verdict_tests {
     use super::{ProbeVerdict, classify_probe};

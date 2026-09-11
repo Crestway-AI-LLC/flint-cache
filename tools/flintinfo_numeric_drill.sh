@@ -26,8 +26,17 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
 
-fleet_init $FLINT_DRILL_ROOT/flint-infonum 6391
-PORT=6391
+# TWO ports: the standalone master below, and the replica BUG-0131's phase
+# attaches to it. Both must be declared here or the port-overlap preflight
+# cannot see the second one.
+#
+# 6428/6429 rather than the old 6391: the 63xx block is exhausted (6300-6387
+# and 6391-6399 are claimed, and gates.sh's own conformance stage takes
+# 6388-6390 inline), so there was no adjacent pair left. These two are free in
+# BOTH repos.
+fleet_init $FLINT_DRILL_ROOT/flint-infonum 6428 6429
+PORT=6428
+RPORT=6429
 fleet_guard
 fleet_kill server
 sleep 0.3
@@ -37,6 +46,17 @@ cli() { valkey-cli -p "$PORT" "$@"; }
 
 D="$FLINT_DRILL_ROOT/flint-infonum-data"
 LOG="$FLINT_DRILL_ROOT/flint-infonum.log"
+R="$FLINT_DRILL_ROOT/flint-infonum-replica"
+RLOG="$FLINT_DRILL_ROOT/flint-infonum-replica.log"
+
+# CLEAN UP ON THE FAILING PATH TOO. Every `fail` above exits immediately, so
+# without this a red run leaves its seats behind -- and the NEXT run is then
+# refused by fleet_guard ("this box already has Flint processes outside ...",
+# all orphans, ppid 1), which reads as a fresh environment problem rather than
+# as the previous failure's litter. Found while mutation-testing this file:
+# two of three mutants left a seat and blocked the next mutant.
+cleanup() { fleet_kill server; rm -rf "$D" "$R"; }
+trap cleanup EXIT
 
 # Fields that are STRINGS by nature, not numbers that went missing. Each is a
 # name, a verdict word, a list, or a pair -- none of them is a quantity, and
@@ -132,6 +152,124 @@ DUS=$(field disk_unknown_samples)
   during this run, so disk_free_pct=$DFP is not the control it is meant to be"
 echo "   control: disk_free_pct=$DFP% is a real reading (disk_unknown_samples=$DUS)"
 
-fleet_kill server
-rm -rf "$D"
+echo "== BUG-0131: a REPLICA omits the three master-side fields entirely"
+# THE ROLE DIMENSION, which the single seat above cannot reach.
+#
+# `acked_seq`, `seq_lag` and `lag_ms` describe this seat's OWN outbound
+# replicas. A master with none is WIDOWED -- applicable and unknown -- and
+# renders the sentinel, which is what the phase above pins. A replica has none
+# and never will, so the same sentinel reports a permanent fault about a
+# healthy seat. ADR-0018: absence means NOT APPLICABLE, a value means
+# applicable, and collapsing those is the defect.
+#
+# THIS COSTS A SECOND SEAT, and the economy argued at the top of this file --
+# "one seat and no fleet" -- is exactly what hid BUG-0131 for two releases.
+# Standalone-with-no-replica is a MASTER, so the sentinel was only ever pinned
+# in the role where it means a fault, and never in the role where it means the
+# question does not apply. The argument was right about BUG-0095 and wrong as
+# a permanent boundary for this file.
+rm -rf "$R"
+./target/release/flint-server --port "$RPORT" --engine rocks --data-dir "$R" \
+  --replica-of 127.0.0.1:"$PORT" >"$RLOG" 2>&1 &
+fleet_wait_listen "$RPORT"
+fleet_wait_ping "$RPORT"
+for _ in $(seq 1 60); do
+  fleet_ready "$RPORT" && break
+  sleep 0.2
+done
+fleet_ready "$RPORT" \
+  || fail "the replica at $RPORT never became READY, so nothing below can be
+  read as a statement about a replica's FLINTINFO. Its log: $RLOG"
+
+RINFO=$(valkey-cli -p "$RPORT" FLINTINFO | tr -d '\r')
+[ -n "$RINFO" ] || fail "the replica's FLINTINFO returned nothing"
+
+# POSITIVE CONTROLS FIRST, because "the key is absent" is the assertion that
+# passes most loudly on an empty body, a truncated reply, or a seat that is
+# not a replica at all. Prove this IS a replica's FLINTINFO before reading an
+# absence out of it.
+grep -q '^role:replica$' <<< "$RINFO" \
+  || fail "the seat at $RPORT does not report role:replica -- it reports
+  '$(sed -n 's/^role://p' <<< "$RINFO")'. An absent seq_lag on a MASTER would
+  be the opposite bug, so this check must not run against one."
+for k in latest_seq last_applied live_replicas uptime_ms disk_free_pct; do
+  grep -q "^$k:" <<< "$RINFO" \
+    || fail "the replica's FLINTINFO is missing $k as well, so the body is
+  truncated rather than selectively omitting the master-side fields"
+done
+
+for f in acked_seq seq_lag lag_ms; do
+  ! grep -q "^$f:" <<< "$RINFO" \
+    || fail "a replica still renders $f:$(sed -n "s/^$f://p" <<< "$RINFO").
+  This field describes a seat's OWN outbound replicas and a replica has none,
+  so a sentinel here reports a permanent widowed pair on a healthy seat --
+  and \`flint_seq_lag == -1\`, the only alert that catches the master case,
+  then fires on every replica in the fleet (BUG-0131)."
+done
+echo "   replica omits acked_seq/seq_lag/lag_ms; role/latest_seq/last_applied/live_replicas present"
+
+# THE OTHER HALF, and it is not optional: a build that dropped the three
+# fields UNCONDITIONALLY passes every assertion above. That build would
+# reopen BUG-0095 -- the series vanishing in the state it exists to report --
+# while closing BUG-0131, which is a strictly worse trade than either bug.
+for _ in $(seq 1 60); do
+  [ "$(cli FLINTINFO | tr -d '\r' | sed -n 's/^seq_lag://p')" = "0" ] && break
+  sleep 0.2
+done
+MINFO=$(cli FLINTINFO | tr -d '\r')
+mfield() { sed -n "s/^$1://p" <<< "$MINFO"; }
+for f in acked_seq seq_lag lag_ms; do
+  grep -q "^$f:" <<< "$MINFO" \
+    || fail "the MASTER omits $f with a live replica attached. The fix dropped
+  these fields everywhere instead of on the replica alone, which reopens
+  BUG-0095 in the state the fields exist for."
+done
+[ "$(mfield live_replicas)" = "1" ] \
+  || fail "the master reports live_replicas=$(mfield live_replicas), so the
+  replica is not attached and seq_lag below would be the WIDOWED reading --
+  which would let a build that never attaches anything pass this control"
+[ "$(mfield seq_lag)" = "0" ] \
+  || fail "the master reports seq_lag=$(mfield seq_lag) with a live, attached
+  replica; expected 0 once drained"
+case "$(mfield acked_seq)" in
+  ''|*[!0-9]*) fail "the master's acked_seq=[$(mfield acked_seq)] is not a
+  number with a live replica attached -- the sentinel is still being rendered
+  where a real reading exists" ;;
+esac
+echo "   control: master with a live replica renders acked_seq=$(mfield acked_seq) seq_lag=0 lag_ms=$(mfield lag_ms) live_replicas=1"
+
+# AND THE FOURTH STATE, which is the one the role alone gets wrong.
+#
+# `controlled_failover` DEMOTES the old master and then polls THAT SEAT's
+# seq_lag until it reads 0 -- only the demoted seat knows how far its replica
+# has drained. So for that window a seat is read_only WITH a live replica
+# still attached, and the field very much applies. A first cut of this fix
+# keyed the omission on the role alone; every rolling upgrade then hung for
+# 30s and panicked with "replica never drained the demoted master's tail",
+# which `build_read_failure` caught and this arm exists so it never has to
+# again.
+echo "== a DEMOTED master still reports the replica draining from it"
+EP=$(cli FLINTINFO | tr -d '\r' | sed -n 's/^role_epoch://p' | tr -d '()' | cut -d, -f2)
+cli FLINTDEMOTE 0 $((EP + 1)) >/dev/null
+for _ in $(seq 1 40); do
+  [ "$(cli FLINTINFO | tr -d '\r' | sed -n 's/^role://p')" = "replica" ] && break
+  sleep 0.2
+done
+DINFO=$(cli FLINTINFO | tr -d '\r')
+dfield() { sed -n "s/^$1://p" <<< "$DINFO"; }
+[ "$(dfield role)" = "replica" ] \
+  || fail "the seat did not become read-only after FLINTDEMOTE (role=$(dfield role)),
+  so what follows would just be re-testing a master"
+[ "$(dfield live_replicas)" = "1" ] \
+  || fail "the demoted seat reports live_replicas=$(dfield live_replicas); its
+  replica detached before this arm could read it, so the arm proves nothing --
+  it would pass identically against the role-keyed build this exists to catch"
+for f in acked_seq seq_lag lag_ms; do
+  grep -q "^$f:" <<< "$DINFO" \
+    || fail "a DEMOTED master with a live replica omits $f. The omission is
+  keyed on the role rather than on being a replication source, and the roll's
+  drain wait reads exactly this field off exactly this seat (BUG-0131)."
+done
+echo "   demoted seat: role=replica live_replicas=1, still renders acked_seq=$(dfield acked_seq) seq_lag=$(dfield seq_lag)"
+
 echo "PASSED"

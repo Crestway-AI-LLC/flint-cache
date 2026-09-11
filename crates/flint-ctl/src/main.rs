@@ -4918,8 +4918,21 @@ fn status(inv: &Inventory) {
         for addr in pair {
             match info_field(addr, &tls, "role:") {
                 Some(role) => {
-                    let lag = info_field(addr, &tls, "seq_lag:").unwrap_or_default();
-                    let lag = human_unknown(&lag).to_string();
+                    // THREE renderings, not two (BUG-0131). A number; `none`,
+                    // which is `human_unknown` turning the sentinel back for a
+                    // MASTER with no live replica; and `n/a` for a REPLICA,
+                    // which does not render the field at all because it has no
+                    // outbound replicas to be behind.
+                    //
+                    // `n/a` RATHER THAN BLANK, and that is not cosmetic: this
+                    // row is parsed POSITIONALLY -- `$10 seq_lag, $12
+                    // live_replicas` in both failover_bystander_drill and
+                    // failover_churn_drill -- and an empty value collapses
+                    // under awk's field splitting, shifting $10 onto
+                    // `live_replicas` and losing $12 entirely. A column that
+                    // disappears is not a narrower column.
+                    let lag_raw = info_field(addr, &tls, "seq_lag:");
+                    let lag = lag_raw.as_deref().map_or("n/a", human_unknown);
                     let live = info_field(addr, &tls, "live_replicas:").unwrap_or_default();
                     let epoch = info_field(addr, &tls, "role_epoch:").unwrap_or_default();
                     let reported = info_field(addr, &tls, "build:").unwrap_or_default();

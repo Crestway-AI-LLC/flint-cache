@@ -1,7 +1,7 @@
-# BUG-0131: the unknown-lag sentinel reads as healthier than healthy, and every replica flies it (OPEN)
+# BUG-0131: the unknown-lag sentinel reads as healthier than healthy, and every replica flies it (FIXED 2026-09-10)
 
-Status: **OPEN**, found 2026-09-10 · Severity: **medium** — no node misbehaves
-and no data is at risk. Two of the five signals BUG-0095 restored to the
+Status: **FIXED 2026-09-10** (found the same day) · Severity: **medium** — no
+node misbehaves and no data is at risk. Two of the five signals BUG-0095 restored to the
 metrics pipeline are restored in a form that reads *below every threshold an
 operator would set*, and `docs/self-hosting.md` states the opposite in so many
 words. Live since **rc.70**.
@@ -171,45 +171,165 @@ rest is a decision.
   operator-written PromQL alone — the claim here is that an operator
   following `self-hosting.md`'s prose gets a lag alert silent in the unknown
   state, not that one did.
-- **The replica reading is the ops session's observation plus this code path.**
-  I did not stand up a pair to see `acked_seq` and `lag_ms` render `-1` on a
-  replica; `seq_lag` is what was observed on the playground, and the other two
-  come from the same `ReplHub` in the same `map_or_else`. Standing up a pair
-  would settle it in one command and has not been done.
+- **The replica reading started as the ops session's observation plus this
+  code path** — `seq_lag` is what was seen on the playground, and the other two
+  come from the same `ReplHub` in the same `map_or_else`. **Since settled by
+  standing up a pair**: mutant 1 below, on a real replica, reports
+  `a replica still renders acked_seq:-1`, so all three were confirmed, not
+  inferred.
+- **No fleet has run the fix.** It is verified on a gate box and by mutation;
+  the playground is on rc.71, which does not carry it. rc.72 is the first
+  release that would, and that is a release-cut decision, not this file's.
 - **Nothing here is evidence about BUG-0082's demotion fix**, which is in the
   same binary and still unexercised on the fleet.
 
-## The decision, named rather than made
+## Fixed 2026-09-10 — candidate (1), Jeff's call
 
-This is a FLINTINFO wire-format question one release after the last one, while
-a roll is in flight. Recorded so it is picked deliberately:
+Three candidates were recorded rather than taken, because a FLINTINFO
+wire-format change one release after the last one, with a roll in flight, is
+not a decision to make in passing:
 
-1. **Omit the three master-side fields from a replica's FLINTINFO entirely.**
-   ADR-0018's rule applied at the source: absence = not applicable, `-1` =
-   applicable and unknown, and the two stop colliding. The controller tolerates
-   a missing field identically to an unparseable one (it folds into `None`
-   defaults, and its `loading` arm already documents that tolerance for rolling
-   upgrades), so the risk is low — but it is a second wire change in two
-   releases, and consumers outside these repos are not enumerable.
-2. **Put `role` on the exporter's per-field gauges.** No wire change, and
-   `flint_seq_lag{role="master"} == -1` becomes writable. But a label is part
-   of a series' identity — the exporter's own comment refuses this for `up` for
-   exactly that reason — so every one of these series would end and restart.
-3. **Document both halves and change no code.** Cheapest, and it is what this
-   commit does for the sentence that is actively wrong. It leaves an operator
-   who writes `== -1` paging on healthy replicas.
+1. **Omit the three master-side fields from a replica entirely.** ADR-0018 at
+   the source: absence = not applicable, `-1` = applicable and unknown.
+2. Put `role` on the exporter's per-field gauges. No wire change, but a label
+   is part of a series' identity, so every one of these series would end and
+   restart — which the exporter already refuses to do for `up`.
+3. Document both halves and change no code.
 
-(1) is the recommendation: it is the rule the repo already adopted twice
-(ADR-0018, OPS-0213) and the only candidate that fixes the collision rather
-than working around it. It is not taken here because a wire change mid-roll is
-not a call to make in passing.
+**(1) was chosen.** `master_side_fields` returns the three as two spliceable
+fragments, empty on a replica. Two fragments because the fields are not
+adjacent in the template — `acked_seq`/`seq_lag` follow `last_applied`,
+`lag_ms` follows `live_replicas` — and each terminates itself with CRLF so an
+empty one leaves no stray blank line.
 
-## Fixed in this commit
+**The condition is "not a replication source", not "is a replica"** —
+`read_only && live_replicas == 0`. The first cut keyed on the role alone, on
+the reasoning that a liveness window would make the fields' *presence* flap.
+**That was wrong, and the gate caught it**: see below.
 
-`docs/self-hosting.md` only, and only the part that is false: the sentence
-promising that the obvious alert trips on the unknown state now says which
-direction that holds in, and the replica's permanent sentinel is stated with
-the join needed to exclude it. No behaviour changes.
+**`live_replicas` is master-side too and deliberately NOT omitted.** On a
+replica it renders a true `0` rather than a sentinel, so it states a fact
+instead of claiming an unknown. Omitting it would also have broken the two
+drills below for no gain.
+
+### The CLI keeps its column, and that is not cosmetic
+
+`flintctl status` prints every pair member through one fixed-width row, and
+**two drills parse that row positionally** — `$10 seq_lag, $12 live_replicas`
+in `failover_bystander_drill.sh` and `failover_churn_drill.sh`. An absent field
+rendered blank under `{lag:<5}`, which collapses under awk's field splitting:
+`$10` shifts onto `live_replicas` and `$12` disappears. So the CLI now has
+**three** renderings, not two — a number; `none`, which is `human_unknown`
+turning the sentinel back for a widowed master; and **`n/a`** for a replica,
+which does not render the field at all. A column that disappears is not a
+narrower column.
+
+`failover_churn_drill.sh:218` happens to filter `$4=="master"` before reading
+`$10`, so it was never exposed; `failover_bystander_drill.sh:134` matches by
+ADDRESS and is. Both are safe with the column held.
+
+### The guard, in the file whose economy hid this
+
+`tools/flintinfo_numeric_drill.sh` gains a second seat. Its header argues **"A
+node in its DEFAULT state is the worst case ... one seat and no fleet:
+standalone, no replica, no TLS"** — correct for BUG-0095, and a **master** with
+no replica, so the sentinel was only ever pinned in the role where it means a
+fault. The new phase attaches a replica on 6429 and asserts the three are
+ABSENT, behind three positive controls, because *"the key is absent"* is the
+assertion that passes most loudly on an empty body, a truncated reply, or a
+seat that is not a replica at all:
+
+- the seat reports `role:replica`;
+- it still carries `latest_seq`, `last_applied`, `live_replicas`, `uptime_ms`,
+  `disk_free_pct` — so a truncated body fails rather than passes;
+- and **the master, now with a live replica, still renders all three**, with
+  `live_replicas == 1` asserted first so a replica that never attached cannot
+  make the widowed reading look like the healthy one.
+
+**And a FOURTH arm, added after the gate refuted the first cut**: demote the
+master while its replica is attached, and require that it *still* renders all
+three. It asserts `role:replica` and `live_replicas == 1` first, so it cannot
+pass against a build that never demoted or a replica that detached — without
+those it would go green against the very code it exists to catch.
+
+So the drill now covers all four states the fields have: standalone master
+(sentinel), plain replica (absent), master with a live replica (real numbers),
+and demoted master mid-drain (real numbers).
+
+**Verified by mutation, three times, and each mutant dies to a different
+phase:**
+
+| mutant | dies to |
+|---|---|
+| the omission never fires — the bug itself | the NEW replica phase: *"a replica still renders acked_seq:-1"* |
+| the fields are dropped EVERYWHERE — BUG-0095 reopened | **BUG-0095's ORIGINAL phase**: *"acked_seq= on a node with no live replica; expected -1"* |
+| keyed on the role alone — the first cut | the NEW demote arm: *"a DEMOTED master with a live replica omits acked_seq"* |
+
+Two are worth noting. The second says the pre-existing check is what defends
+against this fix reopening the bug it builds on. The third says this drill now
+catches, in forty seconds, what previously surfaced as a 30-second panic deep
+inside a rolling upgrade in a different drill.
+
+Seven unit tests cover `master_side_fields` directly, including that a
+caught-up master reports `0` rather than the sentinel, that `seq_lag` is the
+DIFFERENCE and not the cursor, and that a read-only *source* with no ack yet
+renders the sentinel rather than nothing — the collapse pointing the other way.
+
+**The drill also gained a cleanup trap**, which is not incidental: every `fail`
+exits immediately, so a red run left its seats behind and `fleet_guard` then
+refused the NEXT run with *"this box already has Flint processes outside …"*,
+all orphans at `ppid 1`. That reads as a broken environment rather than as the
+previous failure's litter. Found by mutation-testing this very file — two of
+three mutants left a seat and blocked the next one — and verified by running a
+mutant and confirming no seat and no data directory survive, while the logs do.
+
+### The first cut was keyed on the role, and every rolling upgrade broke
+
+Recorded because the reasoning was stated confidently and was wrong, and
+because what refuted it is a topology I had explicitly checked for and
+concluded did not exist.
+
+`flintsync` carries no read-only guard, so a node pointed at a replica IS
+served and registers in that replica's hub. I looked for somewhere that
+builds such a chain, found that `flintctl` starts `pair[0]` bare and gives
+the rest `--replica-of pair[0]` and that the control plane registers PAIRS,
+and wrote the boundary down as "not a topology this system builds".
+
+**It is built on every roll.** `controlled_failover` demotes the old master
+and then polls **that seat's** `seq_lag` until it reads 0 — only the demoted
+seat knows how far its replica has drained — so for the length of the drain a
+seat is read-only *with a live replica still attached and still acking*. I
+had walked `flintctl`'s spawn paths and the FLINTSYNC handler, and not the
+demote path, where a seat becomes a replica while keeping its replicas.
+
+Keyed on the role, that seat rendered nothing, the drain loop never saw
+`Some("0")`, and after 30 seconds:
+
+```
+thread 'main' panicked at crates/flint-ctl/src/main.rs:6028:9:
+replica never drained the demoted master 127.0.0.1:6502's tail
+```
+
+Caught by `build_read_failure` on the gate — everything else in `check` and
+all 140 drills passed. **The lesson is not "check more call sites"**; it is
+that "is a replica" and "has no replicas" are different predicates, and the
+fields are about the second. A master with zero replicas is still never
+omitted, because *that* is the widowed state BUG-0095 exists to keep visible.
+
+The presence of these fields can therefore change on one seat, at a demotion.
+That is a real transition and not a flapping series: a pair replica never
+acquires an outbound replica, and a master never loses the fields at all.
+
+Consumers re-walked: the controller folds a MISSING field into the same `None`
+as an unparseable one (`Node` is built with defaults and folded, and its
+`loading` arm already documents that tolerance for rolling upgrades);
+`flintctl`'s reconverge path reads the MASTER and already renders an absent
+field as `?`; the chaos harness reads `master_info` and prints `<absent>`; the
+ops agent's `info_field` yields `None`. `cold_start_roles_drill` polls
+`seq_lag` on port 7403, which is the seat that ACCEPTS the seed writes — a
+master. `controlled_failover` reads it off a seat that is read-only *and a
+replication source*, which is the case the final condition is built around.
+No consumer needed changing.
 
 ## Related
 
