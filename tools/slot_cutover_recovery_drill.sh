@@ -113,8 +113,17 @@ run_once() {
   SDIR=$(mktemp -d $FLINT_DRILL_ROOT/flint-rec-s.XXXXXX); DDIR=$(mktemp -d $FLINT_DRILL_ROOT/flint-rec-d.XXXXXX)
   $B --port $SPORT --engine rocks --data-dir "$SDIR" 2>"${FLEET_SCOPE}server.log" &
   $B --port $DPORT --engine rocks --data-dir "$DDIR" 2>"${FLEET_SCOPE}server2.log" &
-  fleet_wait_listen $SPORT $DPORT
-  sleep 0.8
+  # WAIT FOR READY, NOT FOR THE PORT (BUG-0132). fleet_wait_listen returns as
+  # soon as the socket accepts; a seat holding 150k keys then answers every
+  # data command with -LOADING while it replays its WAL. This was
+  # `fleet_wait_listen` plus a fixed `sleep` -- a delay standing in for an
+  # observable state, which is the same defect the KILL side of this drill had
+  # and which the phase rewrite removed there and left here. On 2026-09-12 it
+  # cost a CI run: 68,039 -LOADING replies, DBSIZE reading 1 of 150000
+  # mid-load, and "3 keys lost after recovery" reported against data that was
+  # present and simply not loaded yet.
+  fleet_wait_ready $SPORT
+  fleet_wait_ready $DPORT
 
   awk -v n="$KEYS" 'BEGIN{for(i=0;i<n;i++){k=sprintf("{mover}:key%06d",i);v=sprintf("val-%06d",i);printf "*3\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n",length(k),k,length(v),v}}' \
     | valkey-cli -p $SPORT --pipe >/dev/null
@@ -146,8 +155,9 @@ run_once() {
   # Restart both nodes on the same data dirs (the redeploy).
   $B --port $SPORT --engine rocks --data-dir "$SDIR" 2>"${FLEET_SCOPE}server3.log" &
   $B --port $DPORT --engine rocks --data-dir "$DDIR" 2>"${FLEET_SCOPE}server4.log" &
-  fleet_wait_listen $SPORT $DPORT
-  sleep 0.9
+  # ready, not listening -- see the note at the first restart (BUG-0132)
+  fleet_wait_ready $SPORT
+  fleet_wait_ready $DPORT
 
   # Observe the interrupted state from the durable records.
   local SM DM PHASE
@@ -249,8 +259,9 @@ test_half_done_flip() {
   SDIR=$(mktemp -d $FLINT_DRILL_ROOT/flint-rec-s.XXXXXX); DDIR=$(mktemp -d $FLINT_DRILL_ROOT/flint-rec-d.XXXXXX)
   $B --port $SPORT --engine rocks --data-dir "$SDIR" 2>"${FLEET_SCOPE}server5.log" &
   $B --port $DPORT --engine rocks --data-dir "$DDIR" 2>"${FLEET_SCOPE}server6.log" &
-  fleet_wait_listen $SPORT $DPORT
-  sleep 0.8
+  # ready, not listening -- see the note at the first restart (BUG-0132)
+  fleet_wait_ready $SPORT
+  fleet_wait_ready $DPORT
   awk 'BEGIN{for(i=0;i<2000;i++){k=sprintf("{mover}:key%06d",i);printf "*3\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$5\r\nvalue\r\n",length(k),k}}' \
     | valkey-cli -p $SPORT --pipe >/dev/null
   # Ship data to the dest (no cutover), then place the half-done-flip state:

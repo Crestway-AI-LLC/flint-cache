@@ -1,14 +1,17 @@
-# BUG-0132: slot recovery can hand ownership to a node that does not have the data (OPEN)
+# BUG-0132: slot recovery can hand ownership to a node that does not have the data (FIXED 2026-09-12 — confirmation pending)
 
-Status: **OPEN**, found 2026-09-10 · Severity: **medium — latent for the
-automated path, live for a deliberate one** (measured 2026-09-11, see
-"Is this reachable outside the drill?"). No bytes are known destroyed, but
-after an interrupted slot cutover a client can be redirected to a node that
-returns nothing for keys it durably acked. The write is on disk and
-unreachable, which is indistinguishable from loss at the client.
+Status: **FIXED 2026-09-12 — confirmation pending** · found 2026-09-10 ·
+Severity: **the CI failures were the drill's, not the product's** — see
+"2026-09-12 — the third occurrence, and the answer" at the end, which is the
+section to read first. The hazard this file also documents (recovery completing
+a flip on `reachable(dest)` rather than `has-the-data`) was real and was closed
+by BUG-0133's durability barrier; what remained after that was a drill that
+restarted a seat holding 150,000 keys and read "still loading" as "lost".
 
-**This is the bug keeping core `main` red**, and it is not BUG-0131's chaos
-break (fixed at `bbca61f`) nor the docs commits it was first attributed to.
+Two earlier readings in this file are superseded by that section and left in
+place deliberately: "Why this is not 'a flaky drill'" was right to refuse the
+hand-wave and wrong in its conclusion, and "ONLY SLOW HARDWARE SEES IT" was
+circling the answer without reaching it.
 
 ## What CI shows
 
@@ -456,3 +459,70 @@ Watching CI after landing an unrelated fix, rather than assuming the peer's
 chaos fix would turn `main` green. It did turn chaos green; `main` stayed red
 for a different reason, in a different job, that had already fired once and
 been attributed to the wrong commit.
+
+## 2026-09-12 — the third occurrence, and the answer
+
+`gate` on `ded3de0`, `slot_cutover_recovery` FAIL at 17.2s, GitHub runner at
+load 3.15 with three peer drills live. The phase rewrite did its job — the arm
+named itself — and the diagnostic added with it printed the discriminator:
+
+```
+[killed in phase flip] after restart: source=[] dest=[] -> completed pre-kill
+  MISSING key000001 on dest
+  MISSING key075000 on dest
+  MISSING key149999 on dest
+  WHERE: source DBSIZE=0 dest DBSIZE=1 (seeded 150000 to source)
+  FAIL: 3 keys lost after recovery
+```
+
+And the whole log carried **68,039 lines of `LOADING Flint is loading the
+dataset in memory`**, every one of them before that verdict.
+
+**That count is the answer.** A destination that had genuinely lost 149,999 of
+150,000 keys would finish loading instantly — you cannot spend 68,039 replies
+loading one key. The data was on the dest. The drill asked for it before the
+seat had finished replaying its WAL, got `-LOADING` from every data command,
+and reported an absence as a loss. `DBSIZE=1` is a partial count mid-load, not
+a dest with one key.
+
+**The cause is a fixed sleep, in this file's own drill, at the restart:**
+
+```bash
+$B --port $SPORT --engine rocks --data-dir "$SDIR" &
+$B --port $DPORT --engine rocks --data-dir "$DDIR" &
+fleet_wait_listen $SPORT $DPORT     # the socket accepts
+sleep 0.8                           # ...and then we guess
+```
+
+`fleet_wait_listen` returns when the port accepts a connection, which happens
+long before a seat with 150k keys is READY. `tools/lib/fleet.sh` already has
+the right waiter — `fleet_wait_ready`, whose header says it exists for "a node
+that refuses data commands with -LOADING" and which polls the seat's own
+`loading:1` field with a 120-second loud deadline. This drill never called it.
+
+**The uncomfortable part.** On 2026-09-11 this same drill was rewritten,
+recorded in the section above, to stop sampling *kill* phases by wall-clock and
+wait for the state it names. That rewrite fixed one side of the file's timing
+dependence and left the other side untouched: the kill became observed, the
+restart stayed a guess, three lines away. Same defect, same file, and it fired
+the next day.
+
+**Why only GitHub.** A runner needs more than 0.8s to replay 150k keys; the
+gate box does that work several times faster and was ready before the drill
+looked. Three CI failures, 26 EC2 reproduction attempts that could not fail —
+and the reason was never the product's behaviour on slow hardware, it was the
+*drill's* dependence on fast hardware. Jeff's framing (*correctness should be
+orthogonal to underlying hardware*) turns out to have applied to the test.
+
+**The fix.** `fleet_wait_ready` on both seats at all three restart sites, and
+the fixed sleeps deleted. Verified against a stub seat rather than argued:
+
+| the seat reports | wanted | got |
+|---|---|---|
+| `loading:1` | keeps waiting | still waiting at 4s (the old code proceeded at 0.8s) |
+| `loading:0` | proceeds | returned rc=0 immediately |
+
+**Confirmation is pending on a GitHub runner, and cannot come from the box.**
+The box has never reproduced this and still cannot: it is the machine that is
+fast enough to hide it. A green gate-box run proves only that the drill still
+passes where it always passed. The next CI run on this drill is the test.
