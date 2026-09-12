@@ -117,6 +117,11 @@ class _Conn:
         reader.start()
         flip = threading.Timer(max(0.0, start_counting_at - time.time()),
                                lambda: setattr(self, "counting", True))
+        # A Timer is a Thread, and a non-daemon one delays interpreter
+        # shutdown by whatever is left of its delay. Bounded here, unlike the
+        # loop-until-a-flag threads of BUG-0134 -- but a thread in tools/ is a
+        # daemon, with no exceptions to reason about.
+        flip.daemon = True
         flip.start()
         self._send_loop(stop_at)
         self.counting = False
@@ -148,7 +153,8 @@ def _warm_then_measure(ports, token, budget):
     conns = {p: _Conn(p, token, per_conn) for p in ports}
     start = time.time() + WARMUP
     stop = start + WINDOW
-    ts = [threading.Thread(target=c.run, args=(start, stop)) for c in conns.values()]
+    ts = [threading.Thread(target=c.run, args=(start, stop), daemon=True)
+          for c in conns.values()]
     [t.start() for t in ts]
     [t.join() for t in ts]
     return conns

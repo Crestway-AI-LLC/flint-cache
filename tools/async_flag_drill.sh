@@ -77,7 +77,7 @@ def worker():
             local += 1
     with lock: throttled[0] += local
     s.close()
-ts = [threading.Thread(target=worker) for _ in range(N_CONN)]
+ts = [threading.Thread(target=worker, daemon=True) for _ in range(N_CONN)]
 [t.start() for t in ts]; [t.join() for t in ts]
 s = socket.create_connection(("127.0.0.1", 7611), timeout=15); s.settimeout(15)
 s.sendall(resp(["AUTH", tok])); s.recv(64)

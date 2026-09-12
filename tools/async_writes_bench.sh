@@ -63,7 +63,7 @@ def run(port, keyfn):
                 lat.append(dt); break
         s.close()
         with lat_lock: all_lat.extend(lat)
-    ts=[threading.Thread(target=worker,args=(w,)) for w in range(CONN)]
+    ts=[threading.Thread(target=worker,args=(w,),daemon=True) for w in range(CONN)]
     t0=time.perf_counter()
     [t.start() for t in ts]; [t.join() for t in ts]
     wall=time.perf_counter()-t0

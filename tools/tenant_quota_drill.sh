@@ -123,9 +123,22 @@ g.sendall(resp(["AUTH","tok-glx"])); g.recv(64)
 # RTT assumption about the machine; the property under test is that a pinned
 # neighbour does not degrade an unquotad tenant, which is a RATIO.
 solo,solo_p99=measure(g,1.5,"solo")
-t=threading.Thread(target=acme_hammer); t.start()
-beside,beside_p99=measure(g,3,"beside")
-stop[0]=True; t.join()
+# THE STOP FLAG IS SET IN A `finally`, AND THE THREAD IS A DAEMON (BUG-0134).
+#
+# `measure` asserts. When that assertion fired on CI on 2026-09-12 it skipped
+# the statement that stops the hammer thread, so the load kept running; it was
+# not a daemon, so CPython's shutdown joined it forever. The drill printed its
+# traceback and then hung, and the gate job died at GitHub's 60-minute cap
+# having reported nothing at all -- for this drill or the 129 beside it.
+#
+# A check whose FAILURE cannot be reported is not a check. Both halves are
+# deliberate: the `finally` stops the load on every path, and `daemon=True` is
+# the backstop for an exception that escapes some path a later edit adds.
+t=threading.Thread(target=acme_hammer,daemon=True); t.start()
+try:
+    beside,beside_p99=measure(g,3,"beside")
+finally:
+    stop[0]=True; t.join(timeout=5)
 print(f"  globex: {solo:.0f} ops/s alone -> {beside:.0f} ops/s beside a pinned neighbor "
       f"({beside/solo*100:.0f}%), p99 {solo_p99:.2f} -> {beside_p99:.2f}ms")
 assert beside >= solo*0.5, f"unquotad tenant lost {100-beside/solo*100:.0f}% of its throughput to a quotad neighbor"

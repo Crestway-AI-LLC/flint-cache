@@ -89,7 +89,7 @@ def drive(tid):
     with lock:
         ok.extend(mine_ok); throttled.extend(mine_thr); other.extend(mine_other)
 
-ts = [threading.Thread(target=drive, args=(t,)) for t in range(THREADS)]
+ts = [threading.Thread(target=drive, args=(t,), daemon=True) for t in range(THREADS)]
 [t.start() for t in ts]; [t.join() for t in ts]
 
 # Assertion 3, checked here where the per-key verdict is still in hand.

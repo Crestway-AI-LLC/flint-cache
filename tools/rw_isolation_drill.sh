@@ -122,7 +122,11 @@ def storm():
         storm_count[0] += 32
     s.close()
 
-t = threading.Thread(target=storm)
+# DAEMON + `finally` (BUG-0134). The `assert lanes == "2"` below is meant to
+# fire; if it does, it must be REPORTED. A non-daemon storm thread looping on
+# `stop` turns that report into a permanent hang at interpreter shutdown --
+# the shape that cost a CI job 60 minutes of silence on 2026-09-12.
+t = threading.Thread(target=storm, daemon=True)
 t.start()
 time.sleep(0.5)  # storm warmed up
 

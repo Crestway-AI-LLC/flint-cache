@@ -819,9 +819,28 @@ assert_no_cross_drill_kill_patterns() {
 run_core_drills() {
   local d rc secs
   if [ "$GATE_JOBS" -le 1 ]; then
+    # THE SERIAL PATH IS DELIBERATELY UNCAPPED, and it is the one path
+    # gates_drill.sh forges (it forces FLINT_GATE_JOBS=1 and stubs step), so
+    # anything added here has to exist in a tree that holds only gates.sh.
+    # It also does not need the cap: it reports each drill as it finishes, so
+    # a hang is already attributable to the drill after the last PASS line.
+    # BUG-0134 was about the parallel path, which reports nothing until the
+    # whole batch returns.
     for d in $CORE; do step "$d" "drill-$d" bash "tools/${d}_drill.sh"; done
     return
   fi
+
+  # ONE CAP, TWO CALLERS: the ALONE loop below through step(), and the
+  # generated worker.sh. Sourced HERE rather than at the top of the file
+  # because the forged tree above has no tools/lib -- and a missing cap must
+  # refuse, not silently run uncapped.
+  . tools/lib/drill-timeout.sh || {
+    echo "GATES FAILED: tools/lib/drill-timeout.sh is missing, so drills would"
+    echo "      run with no per-drill cap. BUG-0134: one hung drill then costs"
+    echo "      the whole job with nothing reported. Refusing to run uncapped."
+    exit 1
+  }
+  echo "  per-drill cap: ${FLINT_DRILL_TIMEOUT_S}s (FLINT_DRILL_TIMEOUT_S)"
 
   # PREBUILD, ONCE. Every drill runs its own cargo build. Several of those
   # against one target/ relink target/release/flint-server between differing
@@ -848,7 +867,7 @@ run_core_drills() {
   done
   if [ -n "$excl" ]; then
     echo "  ==$(printf ' %s' $excl) run ALONE (they assert on shared disk state)"
-    for d_ in $excl; do step "$d_" "drill-$d_" bash "tools/${d_}_drill.sh"; done
+    for d_ in $excl; do step "$d_" "drill-$d_" capped_drill "$d_"; done
   fi
   CORE="$par"
   echo "   $(printf '%s\n' $CORE | grep -c .) drills, $GATE_JOBS at a time"
@@ -863,8 +882,14 @@ if date +%s%3N 2>/dev/null | grep -qE '^[0-9]{13}$'; then
 else
   _now_ms() { python3 -c 'import time;print(int(time.time()*1000))'; }
 fi
+# The same tools/lib/drill-timeout.sh gates.sh sourced: the cap a drill runs
+# under must not depend on which of the two paths started it.
+. tools/lib/drill-timeout.sh || {
+  echo "worker: tools/lib/drill-timeout.sh is missing" >&2
+  exit 125   # no .res written; the replay below reports the dead worker
+}
 d="$1"; log="$GATE_LOGS_DIR/drill-$d.log"; s=$(_now_ms)
-bash "tools/${d}_drill.sh" >"$log" 2>&1; rc=$?
+capped_drill "$d" >"$log" 2>&1; rc=$?
 printf '%s %s\n' "$rc" "$(( $(_now_ms) - s ))" > "$GATE_PAR_DIR/$d.res"
 WORKER
   chmod +x "$res/worker.sh"
@@ -1657,6 +1682,102 @@ assert_no_default_ports() {
 # checked mechanically: a dial with no budget, sitting directly above a
 # tighter reply timeout, is the shape. `_within` variants take a budget and
 # are exempt by construction.
+# A THREAD IN tools/ IS A DAEMON (BUG-0134).
+#
+# tenant_quota's isolation arm does `assert b"THROTTLED" not in b` while a
+# load thread runs, and clears that thread's stop flag on the line AFTER the
+# assertion. When the assertion fired on CI on 2026-09-12 the flag was never
+# set; the thread was not a daemon, so CPython's shutdown joined it forever.
+# The drill printed its traceback and hung. The job died at GitHub's
+# 60-minute cap having reported nothing -- not for this drill, and not for the
+# 129 that finished beside it, because the parallel batch only replays once
+# xargs returns.
+#
+# A check whose FAILURE CANNOT BE REPORTED is the same defect as a check that
+# cannot fail; this file already refuses four shapes of the latter. Two
+# instances of this one shipped besides tenant_quota's: async_writes' sixteen
+# storm threads and rw_isolation's, the second guarding an assertion written
+# to fire.
+#
+# daemon=True is checked and not try/finally, because this is the property
+# that makes the difference between a hang and a report, and it is the one a
+# regex can see. It costs nothing where the thread is joined anyway: daemon
+# governs interpreter SHUTDOWN, never join().
+_gate_nondaemon_threads() {   # <files...> -> "path:line\tsource" per offender, then COVERAGE n
+  python3 - "$@" <<'THREADPY'
+import re, sys
+THREAD = re.compile(r'threading\.Thread\s*\(')
+DAEMON = re.compile(r'daemon\s*=\s*True')
+seen = 0
+for path in sys.argv[1:]:
+    try:
+        lines = open(path, encoding='utf-8', errors='replace').read().split('\n')
+    except OSError:
+        continue
+    for i, line in enumerate(lines, 1):
+        if THREAD.search(line):
+            seen += 1
+            if not DAEMON.search(line):
+                print(f"{path}:{i}\t{line.strip()[:72]}")
+print(f"COVERAGE {seen}")
+THREADPY
+}
+
+assert_tools_threads_are_daemons() {
+  local probe out cov caught
+
+  # POSITIVE AND NEGATIVE CONTROL, on a planted file. A detector that matched
+  # nothing would certify the tree by reading none of it, and one that matched
+  # everything would be deleted by the first person it lied to.
+  probe=$(mktemp "${TMPDIR:-/tmp}/flint-thread-probe.XXXXXX") || {
+    echo "FAIL  the daemon-thread check could not write its control file"
+    FAILED="$FAILED daemon-thread-unrunnable"; return; }
+  #
+  # THE CONTROL LINES ARE ASSEMBLED, NOT WRITTEN. Spelled literally they are
+  # matched by the very regex below -- this function lives in a file it scans,
+  # and the first run of it reported ITSELF as the defect. Same trap, and the
+  # same fix, as the license-header needle.
+  printf 'x = threading.%s(target=f)\n' "Thread" > "$probe"
+  caught=$(_gate_nondaemon_threads "$probe" | grep -c "^$probe:1")
+  printf 'x = threading.%s(target=f, daemon=True)\n' "Thread" > "$probe"
+  cov=$(_gate_nondaemon_threads "$probe" | grep -c "^$probe:1")
+  rm -f "$probe"
+  if [ "$caught" != 1 ] || [ "$cov" != 0 ]; then
+    echo "FAIL  the daemon-thread check did not behave on its own controls"
+    echo "        (planted non-daemon caught: $caught want 1; compliant"
+    echo "        daemon flagged: $cov want 0). It cannot be trusted about"
+    echo "        the tree until it is right about the two lines it was"
+    echo "        handed."
+    FAILED="$FAILED daemon-thread-controls"
+    return
+  fi
+
+  out=$(_gate_nondaemon_threads tools/*.sh tools/lib/*.py tools/lib/*.sh) || {
+    echo "FAIL  the daemon-thread check could not run"
+    FAILED="$FAILED daemon-thread-unrunnable"; return; }
+  cov=$(printf '%s\n' "$out" | sed -n 's/^COVERAGE //p')
+  out=$(printf '%s\n' "$out" | grep -v '^COVERAGE ' || true)
+  if [ "${cov:-0}" -eq 0 ]; then
+    echo "FAIL  the daemon-thread check matched NO threads. A glob that stopped"
+    echo "        matching reads exactly like a clean tree."
+    FAILED="$FAILED daemon-thread-examined-nothing"
+    return
+  fi
+  if [ -n "$out" ]; then
+    echo "FAIL  these threads in tools/ are not daemons, so an exception on the"
+    echo "        main thread hangs at interpreter shutdown instead of failing:"
+    printf '%s\n' "$out" | while IFS="$(printf '\t')" read -r loc src; do
+      echo "        $loc"
+      echo "          $src"
+    done
+    echo "        Pass daemon=True. If the thread must be joined, join it --"
+    echo "        daemon changes shutdown, not join. BUG-0134 is the write-up."
+    FAILED="$FAILED nondaemon-thread"
+    return
+  fi
+  echo "  every thread in tools/ is a daemon ($cov thread(s))"
+}
+
 assert_dials_are_bounded() {
   local out
   out=$(python3 - <<'DIALPY'
@@ -3279,6 +3400,7 @@ if want check; then
   assert_no_port_overlap
   assert_no_cross_repo_ports
   assert_dials_are_bounded
+  assert_tools_threads_are_daemons
   assert_scripts_parse
   assert_no_scope_overlap
   assert_server_flags_are_read

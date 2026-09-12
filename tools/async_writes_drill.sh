@@ -74,7 +74,7 @@ def worker():
             while not b.endswith(b"\r\n"): b+=s.recv(64)
             if b"THROTTLED" not in b: break
     s.close()
-ts=[threading.Thread(target=worker) for _ in range(N_CONN)]
+ts=[threading.Thread(target=worker,daemon=True) for _ in range(N_CONN)]
 [t.start() for t in ts]; [t.join() for t in ts]
 s=socket.create_connection(("127.0.0.1",6995),timeout=10); s.settimeout(10)
 s.sendall(resp(["FLINTNS","acme"])); s.recv(64)
@@ -117,7 +117,7 @@ def worker(wid):
         if b"THROTTLED" in b: local+=1
     with lock: seen[0]+=local
     s.close()
-ts=[threading.Thread(target=worker,args=(w,)) for w in range(64)]
+ts=[threading.Thread(target=worker,args=(w,),daemon=True) for w in range(64)]
 [t.start() for t in ts]; [t.join() for t in ts]
 print(seen[0])
 PY
@@ -142,23 +142,30 @@ def storm():
             while not b.endswith(b"\r\n"): b+=s.recv(64)
         except Exception: break
         i+=1
-storms=[threading.Thread(target=storm) for _ in range(16)]
+# DAEMONS, AND THE STOP FLAG IN A `finally` (BUG-0134). Sixteen threads loop
+# until `stop[0]`, and everything between here and that assignment can raise:
+# a connect that times out, a recv that does. Non-daemon threads would then
+# be joined by CPython's shutdown forever -- the drill would hang instead of
+# failing, which is what tenant_quota did on CI for 58 minutes.
+storms=[threading.Thread(target=storm,daemon=True) for _ in range(16)]
 [t.start() for t in storms]
-# seed a read key
-s=socket.create_connection(("127.0.0.1",6995),timeout=10); s.settimeout(10)
-s.sendall(resp(["FLINTNS","acme"])); s.recv(64)
-s.sendall(resp(["SET","read:key","hello"]))
-b=b""
-while not b.endswith(b"\r\n"): b+=s.recv(64)
-# measure GET latency under the storm
-lat=[]
-for _ in range(300):
-    t0=time.perf_counter()
-    s.sendall(resp(["GET","read:key"]))
+try:
+    # seed a read key
+    s=socket.create_connection(("127.0.0.1",6995),timeout=10); s.settimeout(10)
+    s.sendall(resp(["FLINTNS","acme"])); s.recv(64)
+    s.sendall(resp(["SET","read:key","hello"]))
     b=b""
-    while not b.endswith(b"\r\n"): b+=s.recv(128)
-    lat.append((time.perf_counter()-t0)*1000)
-stop[0]=True; [t.join() for t in storms]
+    while not b.endswith(b"\r\n"): b+=s.recv(64)
+    # measure GET latency under the storm
+    lat=[]
+    for _ in range(300):
+        t0=time.perf_counter()
+        s.sendall(resp(["GET","read:key"]))
+        b=b""
+        while not b.endswith(b"\r\n"): b+=s.recv(128)
+        lat.append((time.perf_counter()-t0)*1000)
+finally:
+    stop[0]=True; [t.join(timeout=5) for t in storms]
 lat.sort()
 p50=lat[len(lat)//2]; p99=lat[int(len(lat)*0.99)]
 print(f"  GET under write storm: p50={p50:.2f}ms p99={p99:.2f}ms")
@@ -207,7 +214,7 @@ def worker():
             while not b.endswith(b"\r\n"): b+=s.recv(64)
             if b"THROTTLED" not in b: break
     s.close()
-ts=[threading.Thread(target=worker) for _ in range(6)]
+ts=[threading.Thread(target=worker,daemon=True) for _ in range(6)]
 [t.start() for t in ts]; [t.join() for t in ts]
 PY
 # Wait for the replica to drain the tail, then compare through FLINTNS.
