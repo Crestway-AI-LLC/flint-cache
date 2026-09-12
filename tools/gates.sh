@@ -816,6 +816,109 @@ assert_no_cross_drill_kill_patterns() {
   fi
 }
 
+# A KILL PATTERN NAMES ITS OWN FLEET (BUG-0136).
+#
+# assert_no_cross_drill_kill_patterns above already refuses a pattern whose
+# port is TRUNCATED, because "--port 757" is a substring match that reaches
+# 7571. It reads only patterns that contain `--port`, and the defect that
+# shipped contained no port at all:
+#
+#   pkill -9 -f "flint-controlplane --raft --node-id $LEADER "
+#
+# in THREE drills, each running a three-seat raft CP, each electing node 1. At
+# 4-way parallelism every one of them killed the others' node 1. It was
+# deterministic on the gate box and invisible for as long as the box ran the
+# drills one at a time. Only cp_kill_datapath checked pkill's exit status, so
+# only cp_kill_datapath ever said anything; the other two killed nothing,
+# found the leader a peer's kill had elected, and PASSED.
+#
+# A check aimed at one shape of a defect, blind to the shape in front of it,
+# is the thing this file exists to stop shipping. So: a pattern that names a
+# flint component must also name something that belongs to THIS drill -- a
+# port, or a path under FLINT_DRILL_ROOT. A pattern naming neither matches
+# every fleet on the box.
+assert_kill_patterns_name_their_own_fleet() {
+  # NOT IN A FORGED TREE. gates_drill.sh runs a COPY of this script in a
+  # directory holding nothing but tools/gates.sh, so "no patterns examined" is
+  # the correct answer there and the coverage guard below would call it a
+  # broken glob -- which is exactly what it did on its first real run, turning
+  # the drill's own positive control red.
+  _have_drill_files || return 0
+  local out
+  out=$(python3 - tools/*_drill.sh <<'KILLPY'
+import os, re, sys
+
+COMPONENT = re.compile(r'flint-(server|proxy|controlplane|controller|agent|vec)\b')
+# A port lives in the pattern as the flag, as the controller's --nodes list, or
+# as a variable whose NAME says port ($MPORT, $P1). Naming the port by
+# variable is as scoped as naming it literally -- the drill declared it either
+# way.
+PORTISH = re.compile(r'--port\b|--nodes\b|\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?')
+PORTVAR = re.compile(r'(PORT|^P[0-9]$)')
+# ASSEMBLED, not spelled. This heredoc sits inside $( ), and bash 3.2 scans
+# that body for quotes: an ODD number of apostrophes swallows the closing
+# paren and the whole file stops parsing. Same reason the bug-citation check
+# builds its backtick with chr(96).
+_D, _S = chr(34), chr(39)
+QUOTED = re.compile(_D + r'([^' + _D + r']*)' + _D + r'|' + _S + r'([^' + _S + r']*)' + _S)
+
+bad, seen = [], 0
+for path in sys.argv[1:]:
+    try:
+        lines = open(path, encoding='utf-8', errors='replace').read().split('\n')
+    except OSError:
+        continue
+    # Variables in THIS file that derive from the drill scratch root. A pattern
+    # mentioning one of them cannot reach another drill's fleet.
+    scope = set(re.findall(r'^([A-Za-z_][A-Za-z0-9_]*)=\$\{?FLINT_DRILL_ROOT', "\n".join(lines), re.M))
+    scope.add('FLEET_SCOPE')
+    for i, line in enumerate(lines, 1):
+        if line.lstrip().startswith('#') or 'pkill' not in line:
+            continue
+        quoted = [g for m in QUOTED.finditer(line) for g in m.groups() if g is not None]
+        if not quoted:
+            continue
+        pat = quoted[-1]          # the pattern is the last quoted word on the line
+        if not COMPONENT.search(pat):
+            continue              # not a seat kill (fleet_guard's orphan marker)
+        seen += 1
+        ok = bool(re.search(r'--port\b|--nodes\b', pat))
+        for v in re.findall(r'\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?', pat):
+            if PORTVAR.search(v) or v in scope:
+                ok = True
+        if not ok:
+            bad.append("%s:%d\t%s" % (path, i, pat[:64]))
+print("COVERAGE %d" % seen)
+for b in bad:
+    print(b)
+KILLPY
+) || { echo "FAIL  the kill-pattern scope check could not run"
+       FAILED="$FAILED kill-scope-unrunnable"; return; }
+
+  local cov
+  cov=$(printf '%s\n' "$out" | sed -n 's/^COVERAGE //p')
+  out=$(printf '%s\n' "$out" | grep -v '^COVERAGE ' || true)
+  if [ "${cov:-0}" -eq 0 ]; then
+    echo "FAIL  the kill-pattern scope check examined NO patterns -- a glob that"
+    echo "        stopped matching reads exactly like a clean tree."
+    FAILED="$FAILED kill-scope-examined-nothing"
+    return
+  fi
+  if [ -n "$out" ]; then
+    echo "FAIL  these kill patterns name a flint component but nothing that"
+    echo "        belongs to the drill, so they match every fleet on the box:"
+    printf '%s\n' "$out" | while IFS="$(printf '\t')" read -r loc pat; do
+      echo "        $loc"
+      echo "          \"$pat\""
+    done
+    echo "        Add a port the drill declares, or a path under its"
+    echo "        FLINT_DRILL_ROOT scope. BUG-0136 is the write-up."
+    FAILED="$FAILED kill-pattern-unscoped"
+    return
+  fi
+  echo "  every kill pattern names its own fleet ($cov seat-kill pattern(s))"
+}
+
 run_core_drills() {
   local d rc secs
   if [ "$GATE_JOBS" -le 1 ]; then
@@ -1724,6 +1827,7 @@ THREADPY
 }
 
 assert_tools_threads_are_daemons() {
+  _have_drill_files || return 0   # a forged tree has no tools/ to scan
   local probe out cov caught
 
   # POSITIVE AND NEGATIVE CONTROL, on a planted file. A detector that matched
@@ -3726,6 +3830,7 @@ if want drills; then
   assert_drill_build_is_checked
   assert_no_continuation_splice
   assert_no_cross_drill_kill_patterns
+  assert_kill_patterns_name_their_own_fleet
   # BOTH HALVES OF "UNATTRIBUTABLE SEAT", from opposite ends. The harness
   # attributes a seat by its fleet_init scope prefix OR by a declared port, so
   # a seat is invisible to the leak check when it matches neither. The port

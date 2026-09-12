@@ -143,7 +143,15 @@ echo "  CPSETSLOT alone triggered a push carrying the exception row"
 
 
 echo "== KILL the leader (node $LEADER)"
-pkill -9 -f "flint-controlplane --raft --node-id $LEADER "
+# SCOPED, AND THE KILL IS CHECKED (BUG-0136). This pattern named only
+# `--node-id $LEADER`, which every drill running a three-seat raft CP matches
+# -- and there are three. Worse than the cross-drill kill: this call site
+# ignored pkill's exit status, so when a PEER's kill got here first this drill
+# killed nothing, waited, found the new leader that peer's kill had caused,
+# and passed a test it never performed. A kill that killed nothing has to say
+# so.
+pkill -9 -f "flint-controlplane --raft --node-id $LEADER .*--state $D/" \
+  || { echo "FAIL: could not kill seat $LEADER — no CP process matched this drill's own state dir"; exit 1; }
 NEW=""
 for i in $(seq 1 40); do
   for p in 7501 7502 7503; do

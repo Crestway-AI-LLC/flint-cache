@@ -118,7 +118,17 @@ LOOP_PID=$!
 sleep 1.5
 
 echo "== kill -9 the CP LEADER (node $LEADER) while the tenant is reading and writing"
-pkill -9 -f "flint-controlplane --raft --node-id $LEADER " || { echo "FAIL: could not kill seat $LEADER"; exit 1; }
+# SCOPED TO THIS DRILL'S OWN STATE DIR (BUG-0136). The pattern was
+# `flint-controlplane --raft --node-id $LEADER ` and nothing else -- no port,
+# no path. Three drills spawn a three-seat raft CP and all three elect node 1,
+# so under the parallel gate each one's kill destroyed the others' node 1 as
+# well. This drill is the only one of the three that checked pkill's exit
+# status, so it is the only one that ever reported it: `FAIL: could not kill
+# seat 1`, deterministic at 4-way parallelism and green when run alone.
+# `--state $D/` is unique per drill because $D is under FLINT_DRILL_ROOT, and
+# this seat spawns with --node-id BEFORE --state.
+pkill -9 -f "flint-controlplane --raft --node-id $LEADER .*--state $D/" \
+  || { echo "FAIL: could not kill seat $LEADER — no CP process matched this drill's own state dir"; exit 1; }
 
 NEW=""
 for _ in $(seq 1 40); do

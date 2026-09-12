@@ -68,7 +68,10 @@ LEADER_ID=$(valkey-cli -p 7561 CPINFO 2>/dev/null | tr -d '\r' | grep '^leader:'
 [ -n "$LEADER_ID" ] || { echo "FAIL: no seat reports a leader"; exit 1; }
 # Match on the seat's unique STATE DIR, not on flag order: cp_seat_args
 # emits --state before --raft, so "--node-id N .*statedir" never matches.
-pkill -9 -f "flint-controlplane.*cp-state-n$LEADER_ID " \
+# SCOPED (BUG-0136). `cp-state-n<id>` is flintctl's own naming, so this
+# pattern was unique only because one drill uses it -- accident, not
+# construction. $D/state is where this drill's inventory puts it.
+pkill -9 -f "flint-controlplane.*$D/state/cp-state-n$LEADER_ID " \
   || { echo "FAIL: could not kill leader seat n$LEADER_ID"; exit 1; }
 echo "  killed leader seat n$LEADER_ID"
 sleep 2   # election
