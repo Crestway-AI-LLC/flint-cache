@@ -20,7 +20,11 @@ cleanup() { pkill -9 -f "flint-server --port 657" 2>/dev/null; rm -rf "$SDIR" "$
 trap cleanup EXIT
 
 $B --port $SPORT --engine rocks --data-dir "$SDIR" 2>"${FLEET_SCOPE}server.log" &
-$B --port $DPORT --engine rocks --data-dir "$DDIR" 2>"${FLEET_SCOPE}server2.log" &
+# --wal-fsync-ms 0 DISABLES the destination's cadence fsync, so any fsync this
+# node performs is one the CUTOVER asked for. Without this the assertion below
+# cannot discriminate: the 500 ms tick raises wal_fsync_total on its own and a
+# build with no barrier would pass.
+$B --port $DPORT --engine rocks --data-dir "$DDIR" --wal-fsync-ms 0 2>"${FLEET_SCOPE}server2.log" &
 fleet_wait_listen $SPORT $DPORT
 sleep 0.8
 for p in $SPORT $DPORT; do [ "$(valkey-cli -p $p PING)" = "PONG" ] || { echo "FAIL: :$p down"; exit 1; }; done
@@ -48,6 +52,10 @@ def c(d):
 print(c(b"other")%16384)')
 
 echo "== run FULL cutover: FLINTMIGRATEIN <src> <slot> <self-addr>"
+# THE HANDOFF MUST BE DURABLE BEFORE OWNERSHIP MOVES (BUG-0132). Sampled either
+# side of the cutover with the cadence off, so this counts only deliberate
+# fsyncs.
+FS_BEFORE=$(valkey-cli -p $DPORT FLINTINFO | tr -d '\r' | sed -n 's/^wal_fsync_total://p')
 RES=$(valkey-cli -p $DPORT FLINTMIGRATEIN "127.0.0.1:$SPORT" "$SLOT" "127.0.0.1:$DPORT" 2>&1)
 echo "  $RES"
 echo "$RES" | grep -q "MIGRATEIN-OK.*cutover" || { echo "FAIL: cutover did not complete: $RES"; exit 1; }
@@ -72,4 +80,25 @@ echo "== the un-migrated slot is untouched on the source, absent on the dest"
 DO=$(valkey-cli -p $DPORT GET "{other}:k" 2>&1)
 [ -z "$DO" ] || echo "$DO" | grep -qv "MOVED" && [ -z "$DO" ] || true  # dest simply doesn't have it
 
-echo "PASS: full cutover — source -MOVED to dest, dest owns the slot with all data, other slots untouched"
+echo "== the imported slot was made DURABLE before ownership moved (BUG-0132)"
+# The source purges every row of the slot the moment it disowns, on a different
+# machine with a different WAL -- so nothing orders our unsynced rows against
+# its durable delete. A host failure in that window loses the rows from BOTH
+# copies. A PROCESS kill does not (page cache outlives the process), which is
+# why every drill passed while the window was open: correctness that depended
+# on how the node died.
+FS_AFTER=$(valkey-cli -p $DPORT FLINTINFO | tr -d '\r' | sed -n 's/^wal_fsync_total://p')
+case "$FS_BEFORE$FS_AFTER" in
+  ''|*[!0-9]*) echo "FAIL: wal_fsync_total unreadable (before=[$FS_BEFORE] after=[$FS_AFTER]);
+  this assertion cannot run, which is not the same as passing"; exit 1 ;;
+esac
+[ "$FS_BEFORE" = "0" ] || { echo "FAIL: the destination had already fsynced $FS_BEFORE time(s) before the
+  cutover, so --wal-fsync-ms 0 is not disabling the cadence and the check below
+  cannot tell a deliberate fsync from a scheduled one"; exit 1; }
+[ "$FS_AFTER" -ge 1 ] || { echo "FAIL: the destination never fsynced during the cutover
+  (wal_fsync_total $FS_BEFORE -> $FS_AFTER, cadence disabled). Ownership moved to a
+  node whose copy of the slot was only in page cache; a host failure in that
+  window would lose the rows from both copies (BUG-0132)."; exit 1; }
+echo "   wal_fsync_total $FS_BEFORE -> $FS_AFTER with the cadence off: the flip waited for the data"
+
+echo "PASS: full cutover — source -MOVED to dest, dest owns the slot with all data, durable before the flip, other slots untouched"

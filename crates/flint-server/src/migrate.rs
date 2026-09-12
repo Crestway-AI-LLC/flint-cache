@@ -460,6 +460,50 @@ fn migrate_in(
                                     } else {
                                         // Step 5: flip dest-first, then source.
                                         manifest::clear_migration(kv.as_ref(), ns, slot);
+                                        // DURABILITY BARRIER AT THE HANDOFF.
+                                        //
+                                        // Everything pulled above landed via
+                                        // the ordinary `kv.put` path, which
+                                        // writes the WAL UNSYNCED -- correct
+                                        // for ordinary writes, where the loss
+                                        // window of a host failure is bounded
+                                        // by the `--wal-fsync-ms` cadence and
+                                        // replication covers the rest.
+                                        //
+                                        // A CUTOVER BREAKS THAT BOUND. The
+                                        // next call makes the SOURCE disown
+                                        // the slot and purge every row of it,
+                                        // on a different machine with a
+                                        // different WAL -- so nothing orders
+                                        // our unsynced rows against its
+                                        // durable purge. Lose this node to
+                                        // power, kernel or instance failure in
+                                        // that window and the rows are gone
+                                        // from BOTH copies: the source deleted
+                                        // them because we said we had them,
+                                        // and we had them only in page cache.
+                                        //
+                                        // A process kill survives it (the page
+                                        // cache outlives the process, which is
+                                        // why every drill passes), so this is
+                                        // correctness that depended on HOW the
+                                        // node died. One fsync per slot move
+                                        // removes the dependency.
+                                        //
+                                        // It also repairs recovery's
+                                        // `reachable(dest)` branch: that
+                                        // completes a flip onto a destination
+                                        // it has only pinged, which is sound
+                                        // exactly when a dest that reached
+                                        // this point has its rows on disk.
+                                        if let Err(e) = kv.flush_wal_sync() {
+                                            rollback();
+                                            return Value::Error(format!(
+                                                "ERR cutover refused: the imported slot could not be \
+                                                 made durable before handing ownership over ({e}) -- \
+                                                 the source still owns it and nothing was purged"
+                                            ));
+                                        }
                                         // A generous budget, retried. The
                                         // source does not reply until it has
                                         // purged every row of the slot, so
