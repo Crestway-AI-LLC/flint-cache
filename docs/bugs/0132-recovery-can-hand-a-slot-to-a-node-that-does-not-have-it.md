@@ -327,6 +327,57 @@ produced the field-notes entry above.
 from the same two `[delay N]` lines independently. Two derivations recorded as
 two rather than collapsed into one.)*
 
+## 2026-09-11 — reproduction attempted on EC2 and FAILED TO REPRODUCE, 26 runs
+
+Three controlled attempts on `c7i.large` (2 vCPU, the same core count as the
+GitHub runner), driving the drill directly rather than through the gate:
+
+| condition | runs | result |
+|---|---|---|
+| the drill alone | 12 | all pass |
+| cores SATURATED — 4 busy loops on 2 vCPU, load average 4.71 | 6 | all pass |
+| after the `conformance` stage, as the failing CI job does | 8 | all pass |
+| **total** | **26** | **26 pass** |
+
+**So two hypotheses are dead, and one of them was this file's.**
+
+**"Only slow hardware sees it" is not supported.** It was a reasonable reading
+of three data points — 2 vCPU fails twice, 4 vCPU passes, a laptop passes —
+and a fourth point breaks it: a 2 vCPU box passes twelve times running. Core
+count is not the discriminator.
+
+**Nor is contention.** The obvious rescue of the hardware reading is that CI
+runs the drill amid 140 others while the EC2 comparison ran it alone. Saturating
+both cores to a load average of 4.71 did not produce it either.
+
+**And `conformance` running first turned out to be a weak hypothesis once
+measured rather than assumed** — the whole stage is sub-second per arm
+(`PASS conformance rocks (RESP3) (0.4s)`), not the heavy prior workload the
+job name suggests. Disk was unchanged either side, 23% before and after.
+
+### What that leaves, and why the next step is to wait
+
+The remaining differences between a passing EC2 box and the failing runner are
+its **storage** and its **OS image** — neither of which is faithfully
+reproducible on EC2, and guessing at them costs a box per guess with no better
+prior than the three already spent.
+
+**The drill is instrumented and CI keeps the output.** `.github/workflows/gate.yml`
+uploads `/tmp/flint-gates` with 90-day retention, and the drill's stdout lands
+in `drill-slot_cutover_recovery.log` inside it. So the next failure carries the
+three-state phase, both `DBSIZE`s and both `FLINTMIGRATIONS` — which is the
+evidence this file has been missing since it was opened.
+
+**The kept data directories are NOT uploaded.** They sit in
+`$FLINT_DRILL_ROOT/flint-rec-*`, outside the artifact path, so they die with
+the runner. That is deliberate for now: the printed numbers should separate
+"dest never received the data" from "dest received it and lost some", and only
+if they do not is it worth paying artifact size on every failure.
+
+**Decision (Jeff, 2026-09-11): let CI answer it.** The failure is 2-in-6, so it
+should fire within a few pushes. Anyone tempted to reproduce this on EC2 first:
+the table above is why not.
+
 ## What is NOT established
 
 - **Whether any byte was lost.** Still unanswered, but no longer
