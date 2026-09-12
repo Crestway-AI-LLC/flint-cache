@@ -144,10 +144,31 @@ both checks added today now sit behind it. The repo's own self-test caught a
 defect in the check written to catch a defect, which is the argument for
 having it.
 
-## What this does not fix
+## The gap this came through, closed the same day
 
-`FLINT_GATE_JOBS` still is not forwarded by the gate-box launcher, so the box
-and CI still exercise different code paths for the drills. That is an ops-repo
-change and is recorded there, not here. Until it lands, a change to the
-parallel path needs `FLINT_GATE_CMD='FLINT_GATE_JOBS=4 tools/gates.sh drills'`
-named explicitly, which is how both runs above were done.
+This was written saying `FLINT_GATE_JOBS` was still not forwarded by the
+gate-box launcher, so the box and CI still ran different code paths and a
+change to the parallel path had to name
+`FLINT_GATE_CMD='FLINT_GATE_JOBS=4 tools/gates.sh drills'` explicitly — which
+is how the runs above were done. **That is fixed.** The launcher now reads the
+number out of this repo's `.github/workflows/gate.yml` and exports it, so a
+plain `run.sh drills` goes as wide as CI: verified with nothing set in the
+environment —
+
+```
+== run (public gate, in ~/flint): tools/gates.sh drills
+   drills at once: 4 (from CI (.github/workflows/gate.yml))
+== parallel: 4 drills at a time on 4 core(s) (1.00 drills/core)
+GATES PASSED — 135 steps
+```
+
+The number is **derived** rather than copied, because `gate.yml`'s own input
+documentation says it "lives in exactly one place" — it says that because a
+dispatch input once carried its own default of 6 while the env said something
+else, and a third copy in the launcher would have been the same defect a third
+time. An explicit `FLINT_GATE_JOBS` still wins, which is the rollback.
+
+The launcher lives in the ops repo, so the change and its reasoning are
+recorded there; this section exists because this file told readers the gap was
+open, and a write-up that describes a fixed defect as live is the failure mode
+its own index check was built to stop.
