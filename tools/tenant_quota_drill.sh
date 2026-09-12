@@ -107,22 +107,54 @@ stop=[False]
 def acme_hammer():
     pin(7911,"tok-acme",200,stop)
 def measure(sock, secs, tag):
-    lat=[]; n=0; t0=time.time()
+    # THE QUOTA'S OWN MESSAGE, NOT THE `THROTTLED` PREFIX (BUG-0135).
+    #
+    # This asserted `b"THROTTLED" not in b` and read any refusal as an
+    # isolation failure. The prefix is shared by about ten shed paths that
+    # have nothing to do with tenants -- min-replicas-to-write, widowed-grace,
+    # replication lag, WAL retention, the async write queue, full-sync slots,
+    # collection-read admission, the proxy's connection capacity, and
+    # --write-deadline-ms. The last of those is keyed on the NODE's own queue
+    # depth (inflight x cost) and is documented in flint-server as having
+    # fired on CI at 2017-2033 ms against measured peaks of 124-557 ms, on "a
+    # stalled disk, a descheduled runner". This drill starts its master with
+    # no shed knob disabled, and it runs four-wide on a 4-vCPU box.
+    #
+    # So the old assertion could not tell "my neighbour's quota stole my
+    # throughput", which is the defect it exists to catch, from "this node
+    # shed a write because its own queue was too deep", which is the product
+    # working. Only `ops/s quota exceeded` -- the proxy's per-tenant token
+    # bucket -- means the first thing.
+    #
+    # Other refusals are NOT ignored: they are counted, reported, and excluded
+    # from the accepted rate, because a shed write is not a served one and
+    # folding it into the throughput would hide exactly the degradation the
+    # ratio below is asserting on.
+    lat=[]; n=0; ok=0; shed={}; t0=time.time()
     while time.time()-t0 < secs:
         x=time.perf_counter()
-        sock.sendall(resp(["SET",f"g:{tag}:{n}","v"]))
+        sock.sendall(resp(["SET",f"g:{tag}:{n}","v"])); n+=1
         b=b""
         while not b.endswith(b"\r\n"): b+=sock.recv(128)
-        assert b"THROTTLED" not in b, "unquotad tenant got throttled"
-        lat.append((time.perf_counter()-x)*1000); n+=1
+        assert b"ops/s quota exceeded" not in b, (
+            "unquotad tenant got the QUOTA refusal, which is the isolation "
+            "claim breaking: " + b.decode(errors="replace").strip())
+        if b.startswith(b"-THROTTLED"):
+            why = b.decode(errors="replace").strip()[:96]
+            shed[why] = shed.get(why, 0) + 1
+            continue
+        ok += 1
+        lat.append((time.perf_counter()-x)*1000)
     lat.sort()
-    return n/secs, lat[int(len(lat)*0.99)]
+    # An all-shed window would have indexed an empty list; say so instead.
+    p99 = lat[int(len(lat)*0.99)] if lat else float("nan")
+    return ok/secs, p99, shed
 g=socket.create_connection(("127.0.0.1",7911),timeout=10); g.settimeout(10)
 g.sendall(resp(["AUTH","tok-glx"])); g.recv(64)
 # MEASURE THE BASELINE, don't assert an absolute. `n/3 > 1000` encodes a 1ms
 # RTT assumption about the machine; the property under test is that a pinned
 # neighbour does not degrade an unquotad tenant, which is a RATIO.
-solo,solo_p99=measure(g,1.5,"solo")
+solo,solo_p99,solo_shed=measure(g,1.5,"solo")
 # THE STOP FLAG IS SET IN A `finally`, AND THE THREAD IS A DAEMON (BUG-0134).
 #
 # `measure` asserts. When that assertion fired on CI on 2026-09-12 it skipped
@@ -136,11 +168,16 @@ solo,solo_p99=measure(g,1.5,"solo")
 # the backstop for an exception that escapes some path a later edit adds.
 t=threading.Thread(target=acme_hammer,daemon=True); t.start()
 try:
-    beside,beside_p99=measure(g,3,"beside")
+    beside,beside_p99,beside_shed=measure(g,3,"beside")
 finally:
     stop[0]=True; t.join(timeout=5)
 print(f"  globex: {solo:.0f} ops/s alone -> {beside:.0f} ops/s beside a pinned neighbor "
       f"({beside/solo*100:.0f}%), p99 {solo_p99:.2f} -> {beside_p99:.2f}ms")
+for _where, _shed in (("alone", solo_shed), ("beside", beside_shed)):
+    for _why, _cnt in sorted(_shed.items()):
+        # `EVIDENCE:` is surfaced by gates.sh even when the drill passes.
+        print(f"EVIDENCE: globex {_where}: {_cnt} write(s) shed by a NON-quota "
+              f"gate -- {_why}")
 assert beside >= solo*0.5, f"unquotad tenant lost {100-beside/solo*100:.0f}% of its throughput to a quotad neighbor"
 # LATENCY IS MEASURED AND REPORTED, AND DELIBERATELY NOT ASSERTED ON.
 # Measured 2026-09-05, and the numbers say latency is the wrong channel.

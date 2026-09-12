@@ -1,10 +1,10 @@
-# BUG-0135: an unquotad tenant was throttled while a pinned neighbour ran (OPEN)
+# BUG-0135: an unquotad tenant was throttled while a pinned neighbour ran (FIXED 2026-09-12 — confirmation pending)
 
-Status: **OPEN** — observed **once**, in CI, 2026-09-12 · Severity: **unknown
-and that is the point**. Either tenant isolation sheds an unquotad tenant's
-traffic under load, which would be a correctness property that depends on how
-fast the box is, or the drill's measurement is wrong. One log line does not
-decide it.
+Status: **FIXED 2026-09-12 — confirmation pending** · Severity: the defect is
+in the **drill**, not the product. The assertion could not tell the failure it
+existed to catch from the product working correctly, so it reported the second
+as the first. Read rather than reproduced, which is why confirmation is still
+pending: the next occurrence now prints which mechanism refused the write.
 
 **Not BUG-0134**, which is why the run hung rather than reported, and is
 fixed. **Not BUG-0132.** This file exists so the next occurrence is read as a
@@ -79,7 +79,89 @@ torn down. **Absence over the next few runs is not evidence** — the shape only
 appeared once in a hundred, and the two arms before it show the limiter
 working at the same moment.
 
-## What would close it
+## The answer: the assertion could not discriminate
+
+`assert b"THROTTLED" not in b` reads **any** refusal as an isolation failure.
+That prefix is shared by about ten shed paths in this product, and only one of
+them is per-tenant:
+
+| where | message | keyed on |
+|---|---|---|
+| `flint-proxy/src/main.rs:1207` | `THROTTLED ops/s quota exceeded` | **the tenant's token bucket** |
+| `flint-proxy/src/main.rs:156` | `proxy at connection capacity` | the proxy's connection count |
+| `flint-server/src/main.rs:4326` | `live replicas below min-replicas-to-write` | the seat's replicas |
+| `:4336` | `no live replica for longer than --widowed-grace-ms` | the seat's replicas |
+| `:4359` | `replication lag exceeds limit` | replication |
+| `:4383` | `replica too far behind the retained WAL` | WAL retention |
+| `:4430` | `write would wait ~Nms (inflight x cost), past --write-deadline-ms` | **the node's own queue depth** |
+| `:6553` | `full-sync slots busy` | migration slots |
+| `write_queue.rs:249,263,271` | `async write queue full / stalled` | the queue |
+| `flint-storage/src/admission.rs` | `collection read needs ~N bytes` | read admission |
+
+**The last-but-three is the one that matters here.** `--write-deadline-ms`
+sheds when `inflight x cost` exceeds the deadline — a property of how busy the
+*node* is, with no reference to which tenant sent the write. Its own comment in
+`flint-server` records that it has fired on CI at **2017-2033 ms against
+measured peaks of 124-557 ms**, and names the cause as a spike in one of its
+two terms: "compaction, a stalled disk, **a descheduled runner**".
+
+This drill starts its master with no shed knob disabled —
+
+```
+$B --port 6985 --engine rocks --data-dir "$D/m" 2>"${FLEET_SCOPE}server.log" &
+```
+
+— and the failing run was four drills wide on a 4-vCPU runner at load 3.24
+with nine seats live. That is the documented condition for that gate to fire.
+
+So the original question — product defect or measurement artifact — resolves
+to **the measurement**, though not in the way this file first guessed. The
+guess was that `recv` framing might mis-read a reply. The actual defect is that
+the assertion was never specific enough to support its own conclusion: a
+refusal arrived, and the drill said "isolation broke" when the product had
+said "my queue is too deep".
+
+## The fix
+
+Assert on the quota's **own message**, which is the only reply that means what
+the drill claims:
+
+```python
+assert b"ops/s quota exceeded" not in b, (
+    "unquotad tenant got the QUOTA refusal, which is the isolation "
+    "claim breaking: " + b.decode(errors="replace").strip())
+```
+
+Other refusals are **counted, reported and excluded from the accepted rate** —
+not ignored. A shed write is not a served one, so folding it into throughput
+would hide the very degradation the `beside >= solo*0.5` ratio asserts on, and
+each distinct reason is printed as `EVIDENCE:`, which `gates.sh` surfaces even
+when the drill passes. The old code would also have raised `IndexError` on an
+all-shed window; the p99 is `nan` there now and says so.
+
+Verified against both kinds of refusal:
+
+| stub reply | wanted | got |
+|---|---|---|
+| `+OK` | accepted, nothing shed | accepted, `shed={}` |
+| `THROTTLED ops/s quota exceeded` | **assertion fires** | fires, message names it |
+| `THROTTLED write would wait ~2033ms … --write-deadline-ms` | no assertion, counted as shed | no assertion, shed counted, excluded from the rate |
+
+## Why confirmation is still pending
+
+Nothing here proves the write-deadline gate is what fired on 2026-09-12. The
+log recorded the assertion's own text, not the reply, because the assertion
+never kept it — that is the same defect one layer down. What is established is
+that the claim the drill made was not supported by the evidence it collected,
+and that a tenant-agnostic mechanism known to fire under exactly those
+conditions was live in that fleet.
+
+**The next occurrence decides it**, and now arrives with the refusing
+mechanism named. If it ever prints `ops/s quota exceeded` against globex, that
+is a real isolation defect and this file should be reopened with that line in
+it.
+
+## What would have closed it, before the answer arrived
 
 Either of:
 
