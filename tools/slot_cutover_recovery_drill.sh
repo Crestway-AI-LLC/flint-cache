@@ -4,8 +4,15 @@
 # and the destination (a whole-cluster redeploy) mid-move, restart them, and
 # let the recovery controller reconcile from the durable manifest records.
 # After recovery: exactly one node owns the slot (source answers -MOVED to the
-# dest), the dest has every key, and no write was lost. Runs several times so
-# the kill lands at different phases (pull / freeze / flip).
+# dest), the dest has every key, and no write was lost.
+#
+# THE KILL LANDS AT AN OBSERVED PHASE (pull / freeze / flip), not after a sleep.
+# It used to sleep 0.3/0.5/0.7s and claim the same coverage, which a sleep
+# cannot deliver: which phase a fixed delay lands in depends on how fast the
+# machine copies the corpus, so one commit tested different things on different
+# hardware and the drill was itself the race (BUG-0132). Each arm now waits for
+# the state it names, with the source's copy throttled so that state is
+# reachable on any machine, and FAILS if it never arrives.
 set -u
 cd "$(dirname "$0")/.."
 . "$(dirname "$0")/lib/fleet.sh"
@@ -49,8 +56,58 @@ keep_dirs() {
   echo "  evidence KEPT (not deleted): source=$SDIR dest=$DDIR"
 }
 
+# INTERRUPT AT AN OBSERVED PHASE, NOT AT A WALL-CLOCK GUESS.
+#
+# This drill used to kill after `sleep 0.3 / 0.5 / 0.7` and its header claimed
+# that made the kill "land at different phases (pull / freeze / flip)". A sleep
+# does not select a phase, it guesses at one: which phase 0.5s lands in is a
+# property of how fast the machine copies 150k rows. So the same commit tested
+# different things on different hardware, and the drill was itself the race --
+# green 26 times on EC2 and red twice on a GitHub runner, with nothing in the
+# product changing between them (BUG-0132).
+#
+# Now each arm waits for the phase it names and fails if it never arrives.
+MIGRATE_RATE=1000000   # bytes/sec on the source's outbound copy
+
+# The corpus is ~4.5 MB, so the throttle above stretches the copy over several
+# seconds on ANY machine -- which is what makes a phase observable rather than
+# something a fast box can skip past between polls. It is a product knob
+# (FLINTCONFIG migrate-rate-bytes, hot-reloadable mid-copy), not a test hack.
+wait_for_phase() {   # $1 = pull | freeze | flip
+  local want="$1" i n
+  for i in $(seq 1 1200); do   # 60s at 0.05s
+    case "$want" in
+      pull)
+        # Mid-COPY, not merely "started": the Importing record lands before any
+        # row does, so importing-alone would kill an empty destination and call
+        # it a pull.
+        if valkey-cli -p $DPORT FLINTMIGRATIONS 2>/dev/null | grep -q importing; then
+          n=$(valkey-cli -p $DPORT DBSIZE 2>/dev/null)
+          case "$n" in ''|*[!0-9]*) ;; *) [ "$n" -gt 0 ] && [ "$n" -lt "$KEYS" ] && return 0 ;; esac
+        fi ;;
+      # NO `freeze` ARM, DELIBERATELY. The frozen window is unobservably short
+      # HERE: with no live writes there is no frozen tail to drain, so the
+      # source records `migrating` and the flip follows within the same
+      # millisecond. Racing for it caught the POST-FLIP state every time while
+      # labelling itself `freeze` -- an arm claiming a phase it did not reach,
+      # which is the defect this rewrite exists to remove, reintroduced one
+      # level up.
+      #
+      # The frozen state IS covered, deterministically, by
+      # `test_half_done_flip` below: it CONSTRUCTS source=Migrating with the
+      # dest holding the data via FLINTSLOTFREEZE, rather than hoping a kill
+      # lands inside a window that is not there. Constructing a state beats
+      # racing for it whenever the state can be constructed.
+      flip)
+        valkey-cli -p $SPORT GET "{mover}:key000000" 2>&1 | grep -q "MOVED $SLOT" && return 0 ;;
+    esac
+    sleep 0.05
+  done
+  return 1
+}
+
 run_once() {
-  local delay="$1"
+  local phase="$1"
   pkill -9 -f "flint-server --port 658" 2>/dev/null; fleet_kill controller; sleep 0.4
   local SDIR DDIR
   SDIR=$(mktemp -d $FLINT_DRILL_ROOT/flint-rec-s.XXXXXX); DDIR=$(mktemp -d $FLINT_DRILL_ROOT/flint-rec-d.XXXXXX)
@@ -62,10 +119,25 @@ run_once() {
   awk -v n="$KEYS" 'BEGIN{for(i=0;i<n;i++){k=sprintf("{mover}:key%06d",i);v=sprintf("val-%06d",i);printf "*3\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n",length(k),k,length(v),v}}' \
     | valkey-cli -p $SPORT --pipe >/dev/null
 
+  # Throttle the source's outbound copy so every phase below is reachable
+  # regardless of how fast this machine is.
+  valkey-cli -p $SPORT FLINTCONFIG migrate-rate-bytes $MIGRATE_RATE >/dev/null
+
   # Start the cutover in the background; it blocks until done.
   ( valkey-cli -p $DPORT FLINTMIGRATEIN "$SADDR" "$SLOT" "$DADDR" >/dev/null 2>&1 ) &
   local MIG=$!
-  sleep "$delay"
+  # WAIT FOR THE PHASE, and fail loudly if it never arrives. An arm that never
+  # reached the state it names did not test that interruption, and a pass there
+  # would certify nothing -- the same rule as ops OPS-0037.
+  if ! wait_for_phase "$phase"; then
+    echo "  FAIL: never observed phase '$phase' within 60s -- this arm did not
+  interrupt what it claims to, so neither its pass nor its failure means
+  anything. Source records=[$(valkey-cli -p $SPORT FLINTMIGRATIONS 2>/dev/null)]
+  dest records=[$(valkey-cli -p $DPORT FLINTMIGRATIONS 2>/dev/null)] dest
+  DBSIZE=$(valkey-cli -p $DPORT DBSIZE 2>/dev/null) of $KEYS"
+    kill -9 $MIG 2>/dev/null; wait $MIG 2>/dev/null
+    pkill -9 -f "flint-server --port 658" 2>/dev/null; keep_dirs; return 1
+  fi
   # WHOLE-CLUSTER KILL mid-move.
   pkill -9 -f "flint-server --port 658" 2>/dev/null
   kill -9 $MIG 2>/dev/null; wait $MIG 2>/dev/null
@@ -97,7 +169,7 @@ run_once() {
       *)               PHASE="no records, and source answers [$OWN] -- ownership indeterminate" ;;
     esac
   fi
-  echo "  [delay $delay] after restart: source=[$SM] dest=[$DM] -> $PHASE"
+  echo "  [killed in phase $phase] after restart: source=[$SM] dest=[$DM] -> $PHASE"
 
   # Recovery controller: reconciles from the manifests, no other input.
   "$CTLBIN" --recover-nodes "$SADDR,$DADDR" --id REC --poll-ms 200 2>>$FLINT_DRILL_ROOT/flint-rec.log &
@@ -161,7 +233,7 @@ run_once() {
   fi
   [ "$miss" = "0" ] || { echo "  FAIL: $miss keys lost after recovery"; pkill -9 -f "flint-server --port 658" 2>/dev/null; keep_dirs; return 1; }
 
-  echo "  [delay $delay] RESOLVED: dest owns all keys, source -MOVED, no split, no loss"
+  echo "  [killed in phase $phase] RESOLVED: dest owns all keys, source -MOVED, no split, no loss"
   pkill -9 -f "flint-server --port 658" 2>/dev/null; rm -rf "$SDIR" "$DDIR"
   return 0
 }
@@ -202,10 +274,10 @@ test_half_done_flip() {
 
 trap 'pkill -9 -f "flint-server --port 658" 2>/dev/null; fleet_kill controller' EXIT
 : > $FLINT_DRILL_ROOT/flint-rec.log
-echo "== slot {mover}=$SLOT, $KEYS keys; killing BOTH nodes mid-cutover (timing-based)"
+echo "== slot {mover}=$SLOT, $KEYS keys; killing BOTH nodes at each OBSERVED phase"
 FAILS=0
-for d in 0.3 0.5 0.7; do
-  run_once "$d" || FAILS=$((FAILS+1))
+for ph in pull flip; do
+  run_once "$ph" || FAILS=$((FAILS+1))
 done
 echo "== deterministic half-done-flip recovery"
 test_half_done_flip || FAILS=$((FAILS+1))

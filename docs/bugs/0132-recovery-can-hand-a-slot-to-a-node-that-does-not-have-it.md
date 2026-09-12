@@ -378,6 +378,65 @@ if they do not is it worth paying artifact size on every failure.
 should fire within a few pushes. Anyone tempted to reproduce this on EC2 first:
 the table above is why not.
 
+## 2026-09-11 — the drill was sampling phases by wall-clock, and now does not
+
+The three arms killed after `sleep 0.3 / 0.5 / 0.7`, and the header claimed
+that made the kill "land at different phases (pull / freeze / flip)". **A sleep
+does not select a phase, it guesses at one.** Which phase 0.5s lands in is a
+property of how fast the machine copies 150,000 rows — so one commit tested
+different things on different hardware, and *the drill was itself the race*.
+That fits every observation: 26 EC2 runs green, two GitHub runs red, and the
+phase line reading differently on different machines with no product change
+between them.
+
+**Each arm now waits for the state it names**, with the source's outbound copy
+throttled by `FLINTCONFIG migrate-rate-bytes` — a product knob, hot-reloadable
+mid-copy, already used by the rebalancer for the same pacing — so the state is
+reachable regardless of machine speed. An arm that never reaches its phase
+**fails**, printing both records and `dest DBSIZE of KEYS`, because an arm that
+did not interrupt what it claims certifies nothing (ops OPS-0037).
+
+Five consecutive local runs now classify identically:
+
+```
+INTERRUPTED mid-move | completed pre-kill (source already -MOVED)
+INTERRUPTED mid-move | completed pre-kill (source already -MOVED)
+... x5
+```
+
+### The `freeze` arm was dropped, and why that is not a coverage loss
+
+Racing for the frozen window caught the POST-FLIP state every time while
+labelling itself `freeze` — an arm claiming a phase it never reached, which is
+this file's own defect one level up. The window is genuinely near-zero *here*:
+with no live writes there is no frozen tail to drain, so the source records
+`migrating` and the flip follows within the same millisecond.
+
+**The frozen state is already covered deterministically** by
+`test_half_done_flip`, which CONSTRUCTS `source=Migrating` with the destination
+holding the data via `FLINTSLOTFREEZE` rather than hoping a kill lands inside a
+window that is not there. **Constructing a state beats racing for it whenever
+the state can be constructed** — and the racing version was strictly worse,
+because it also lied about what it had done.
+
+### What this does and does not settle
+
+**It removes the drill's contribution to the mystery.** From here a CI failure
+names a reproducible phase instead of a wall-clock coincidence, which is the
+difference between "2-in-6, unreproducible" and a state anyone can re-enter.
+
+**It does not explain the two observed failures.** The `flip` arm now
+deterministically produces exactly the state CI reported — `source=[] dest=[]`,
+source already `-MOVED`, recovery a no-op — and passes, locally and on the gate
+box. So either those failures were a state the old delays happened to reach and
+these two do not, or there is a product defect that does not fire every time
+even in this state. **This file stays OPEN on that question.**
+
+Verified by mutation: with the `pull` phase made unobservable the drill fails
+with *"never observed phase 'pull' within 60s"* and reports
+`DBSIZE=150000 of 150000`, which names the reason rather than leaving it to be
+inferred.
+
 ## What is NOT established
 
 - **Whether any byte was lost.** Still unanswered, but no longer
