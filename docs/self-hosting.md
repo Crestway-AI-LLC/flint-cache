@@ -377,8 +377,28 @@ base never leaves L0 and there is no LSM to measure.
 
 So on your seat the pairing **lowers** the level base, 256 → 64 MB, rather than
 raising it, and these ratios are evidence that the pairing works — not the size
-of the improvement to expect. The only stock-baseline run measured **+9.4%** on
-a bulk fill, at a value size that does not settle the comparison. BUG-0127.
+of the improvement to expect.
+
+**SETTLED 2026-09-14, and the number you should plan against is 1.49x, not
+2.6x.** `readtail-pairing` was run at **10 KB values** — the size behind the
+2.6x — with each arm building its own 96 GB tree from empty, both held 6x
+beyond RAM, and both arms verified from the engine's own LOG rather than from
+the environment handed to it:
+
+| 96 GB, 10 KB values | stock (`level_base=256 MB`, `bg_jobs=2`) | paired (`64 MB`, `4`) | change |
+|---|---|---|---|
+| ingest (bulk fill) | 59.1 MB/s | **88.2 MB/s** | **1.49x** |
+| steady write | 6,615 ops/s | **8,187 ops/s** | +23.8% |
+| steady read | 6,565 ops/s | **8,111 ops/s** | +23.6% |
+| write p99.9 | 60.7 ms | **24.6 ms** | −59% |
+| read p99.9 | 59.6 ms | **24.6 ms** | −59% |
+
+**The 2.6x is not wrong about the tuned side; the baseline was the part nothing
+deploys.** The paired arm here reproduces it almost exactly — 88.2 MB/s against
+the published 89.2 — so what changed is the thing it is measured *from*.
+Against a stock seat the pairing is worth **57% of the advertised figure**,
+which is still the largest single-knob gain on this page, and it improves the
+p99.9 tails on both paths by 59% while doing it. BUG-0127.
 
 If the disk is your constraint rather than the clock, raise
 `FLINT_LEVEL_BASE_MB=64` **alone**: 45.2 MB/s at **104 GB** resident, which is
@@ -413,6 +433,12 @@ reads — was about a comparison you do not face, since the pairing lowers your
 level base. The likely reason reads improve is the one that stops the writes
 stalling: draining L0 leaves a read fewer files to search. That is an
 inference; L0 counts were not captured.
+
+A second, independent datapoint on 2026-09-14 agrees from a different angle:
+`readtail-pairing` at **10 KB** under a **mixed read+write** load (the table
+above) put read p99.9 at 24.6 ms paired against 59.6 ms stock. The table in
+this paragraph is GET-only at 1 KiB; the two differ in workload and value size
+and land on the same sign.
 
 If your workload is read-sensitive, measure your own `GET` percentiles anyway.
 What is gone is any reason to treat the write gain as carrying an unpriced read
