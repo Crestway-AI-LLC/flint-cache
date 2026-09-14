@@ -62,9 +62,13 @@ lesson applied before it is paid for again.
 
 ## Not established
 
-- **Whether `verify`'s other rows have the same shape.** The proxy row is
-  fixed; the CP rows go through `cp_dial` since BUG-0139; the pair rows name
-  node addresses, which are not bind lines and were not examined here.
+- ~~Whether `verify`'s other rows have the same shape.~~ **Examined since,
+  and they are clean.** The proxy row is fixed and the CP rows go through
+  `cp_dial`; the pair rows report what they dialled — `down.push(addr.clone())`
+  pushes the address the probe used — so they are self-consistent. The
+  structural reason is worth keeping: a `pair` line has to carry real
+  addresses to distinguish its two members, so unlike a single `cp`,
+  `proxy` or `coproc` line it cannot degenerate to a wildcard.
 - The drill covers `inv.cp` and `inv.proxies`. `inv.coprocs` is the third
   bind-and-dial field and is [BUG-0140](0140-the-coproc-line-is-a-bind-address-handed-to-every-proxy.md);
   adding it here would flag a defect nobody has decided how to fix, so it is
