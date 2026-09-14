@@ -55,12 +55,14 @@ fleet_cp 7567 CPADDPAIR 127.0.0.1:6644
 # that surfaced three steps later as "AUTH failed" instead of here: a setup
 # whose failure cannot be reported is the same defect this suite keeps
 # cataloguing, one layer below the thing under test.
-ADD=$(fleet_cp 7567 CPADDTENANT acme tok-acme acme 2)
-case "$ADD" in OK*) ;; *) echo "FAIL: CPADDTENANT refused: $ADD"; exit 1 ;; esac
-echo "  $ADD"
+# fleet_cp ALREADY asserts the reply starts OK and exits with the command and
+# the reply when it does not -- it prints nothing on success. Capturing it to
+# check it myself got an empty string and failed on my own assertion, which is
+# the second time in this drill that guarding something already guarded is
+# what broke it.
+fleet_cp 7567 CPADDTENANT acme tok-acme acme 2
 # The near-cache is opt-in per tenant (D6) AND the proxy must have a TTL.
-CACHE=$(fleet_cp 7567 CPTENANTCACHE acme on)
-case "$CACHE" in OK*) ;; *) echo "FAIL: CPTENANTCACHE refused: $CACHE"; exit 1 ;; esac
+fleet_cp 7567 CPTENANTCACHE acme on
 for p in 6645 6646; do
   $PX --port $p --control-plane 127.0.0.1:7567 --advertise 127.0.0.1:$p \
       --cache-ttl-ms $TTL_MS 2>$FLINT_DRILL_ROOT/flint-ncx-px$p.log &

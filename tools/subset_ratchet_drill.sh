@@ -38,7 +38,13 @@ fleet_wait_listen 7560
 sleep 0.4
 
 cp_() { valkey-cli -p 7560 "$@"; }
-subset_of() { cp_ CPSUBSETS | awk -v t="$1" '$1==t{print $2}'; }
+# tr -d '\r' IS LOAD-BEARING. CPSUBSETS is a Bulk of CRLF-terminated lines,
+# so awk's last field carries a trailing CR -- and an address with a CR in it
+# makes the CP build `OK retired <addr>\r`, a RESP Simple string containing
+# CR, which is malformed. The first CPDELPROXY below takes field 1 and worked;
+# the second took the last field and failed with "Bad simple string value",
+# which names the reply and not the argument that poisoned it.
+subset_of() { cp_ CPSUBSETS | tr -d '\r' | awk -v t="$1" '$1==t{print $2}'; }
 count_of() { local s; s=$(subset_of "$1"); [ -z "$s" ] || [ "$s" = "-" ] && { echo 0; return; }; echo "$s" | tr ',' '\n' | grep -c .; }
 
 echo "== a fleet of three proxies, one tenant at the default k=2"
@@ -68,7 +74,8 @@ echo "  acme placed on [$BEFORE]"
 echo "== retire ONE of the tenant's own proxies"
 VICTIM=$(echo "$BEFORE" | cut -d, -f1)
 SURVIVOR=$(echo "$BEFORE" | cut -d, -f2)
-cp_ CPDELPROXY "$VICTIM" >/dev/null
+DEL1=$(cp_ CPDELPROXY "$VICTIM")
+case "$DEL1" in OK*) ;; *) echo "FAIL: CPDELPROXY refused: $DEL1"; exit 1 ;; esac
 sleep 0.5
 K1=$(count_of acme)
 [ "$K1" = "1" ] || { echo "FAIL: expected the subset to shrink to 1, got $K1"; cp_ CPSUBSETS | sed 's/^/  | /'; exit 1; }
@@ -78,7 +85,9 @@ echo "  acme is down to [$SURVIVOR] — the retired proxy was removed, correctly
 echo "== and nothing re-widens it, though a spare proxy is sitting right there"
 # A third proxy was registered and never used, so re-widening is POSSIBLE and
 # simply does not happen. Without that spare this assertion would be vacuous.
-SPARE=$(cp_ CPPROXIES | tr ' ' '\n' | grep -v "^$" | grep -vx "$SURVIVOR" | head -1)
+# CPPROXIES is COMMA-joined, not space-joined: splitting on spaces returned
+# the whole list and the "spare" named the survivor among others.
+SPARE=$(cp_ CPPROXIES | tr -d '\r' | tr ',' '\n' | grep -v "^$" | grep -vx "$SURVIVOR" | head -1)
 [ -n "$SPARE" ] || { echo "FAIL: no spare proxy in the fleet, so 'does not re-widen' is untestable here"; exit 1; }
 sleep 3
 K2=$(count_of acme)
@@ -93,7 +102,8 @@ fi
 echo "  still [$(subset_of acme)] after 3s, with $SPARE idle and eligible"
 
 echo "== the ratchet's terminus: retire the last one and the tenant is DRAINED"
-cp_ CPDELPROXY "$SURVIVOR" >/dev/null
+DEL=$(cp_ CPDELPROXY "$SURVIVOR")
+case "$DEL" in OK*) ;; *) echo "FAIL: CPDELPROXY refused: $DEL"; exit 1 ;; esac
 sleep 0.5
 K3=$(count_of acme)
 [ "$K3" = "0" ] || { echo "FAIL: expected an empty subset, got $K3"; exit 1; }
