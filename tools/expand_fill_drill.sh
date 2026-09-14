@@ -43,8 +43,12 @@ fleet_wait_listen $P0
 # would time out on a plan that was never possible.
 TAGS="xf0 xf1 xf2 xf3 xf4 xf5"
 PER=2000
+# awk-generated RESP through --pipe, the idiom rebalance_execute uses.
+# flint-server has no Lua: an EVAL here wrote nothing and the seed assertion
+# below was what said so.
 for t in $TAGS; do
-  valkey-cli -p $P0 EVAL "for i=1,$PER do redis.call('SET','{'..ARGV[1]..'}k'..i, ARGV[1]..':'..i) end return 1" 0 "$t" >/dev/null
+  awk -v tag="$t" -v n=$PER 'BEGIN{for(i=0;i<n;i++){k=sprintf("{%s}k%05d",tag,i);v=sprintf("%s:%05d",tag,i);printf "*3\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n",length(k),k,length(v),v}}' \
+    | valkey-cli -p $P0 --pipe >/dev/null
 done
 TOTAL=$(valkey-cli -p $P0 DBSIZE)
 echo "  $TOTAL keys on :$P0 across 6 tags"
@@ -96,14 +100,14 @@ echo "  :$P0 = $N0   :$P1 = $N1   (seeded $TOTAL)"
 echo "== the moved keys serve on the NEW owner, and the old one redirects"
 CHECKED=0
 for t in $TAGS; do
-  OWNER_REPLY=$(valkey-cli -p $P0 GET "{$t}k1" 2>&1)
+  OWNER_REPLY=$(valkey-cli -p $P0 GET "{$t}k00001" 2>&1)
   case "$OWNER_REPLY" in
     *MOVED*)
-      GOT=$(valkey-cli -p $P1 GET "{$t}k1")
-      [ "$GOT" = "$t:1" ] || { echo "FAIL: {$t}k1 moved but :$P1 serves '$GOT' (want '$t:1')"; exit 1; }
+      GOT=$(valkey-cli -p $P1 GET "{$t}k00001")
+      [ "$GOT" = "$t:00001" ] || { echo "FAIL: {$t}k00001 moved but :$P1 serves '$GOT' (want '$t:00001')"; exit 1; }
       CHECKED=$(( CHECKED + 1 )) ;;
-    "$t:1") ;;                       # still on the old owner, correct
-    *) echo "FAIL: {$t}k1 on :$P0 answered '$OWNER_REPLY'"; exit 1 ;;
+    "$t:00001") ;;                       # still on the old owner, correct
+    *) echo "FAIL: {$t}k00001 on :$P0 answered '$OWNER_REPLY'"; exit 1 ;;
   esac
 done
 [ "$CHECKED" -ge 1 ] || { echo "FAIL: no tag was redirected, so nothing was verified on the new owner"; exit 1; }

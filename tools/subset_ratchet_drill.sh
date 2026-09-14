@@ -47,8 +47,16 @@ echo "== a fleet of three proxies, one tenant at the default k=2"
 # them would read as a collision to anyone auditing the port map.
 for p in 7564 7565 7566; do cp_ CPADDPROXY "127.0.0.1:$p" >/dev/null; done
 cp_ CPADDPAIR 127.0.0.1:6999 >/dev/null
-ADD=$(cp_ CPADDTENANT acme tok-acme acme 1)
+# CPADDTENANT <name> <token> <ns> [k] -- the trailing number is the SUBSET
+# WIDTH, not a quota. Copying `1` from the drills that use it placed this
+# tenant on ONE proxy and the control below caught it, which is what the
+# control is for; asserting the reply here says so at the setup line instead.
+ADD=$(cp_ CPADDTENANT acme tok-acme acme 2)
 echo "  $ADD"
+case "$ADD" in
+  OK*) ;;
+  *) echo "FAIL: CPADDTENANT refused: $ADD"; exit 1 ;;
+esac
 
 # THE CONTROL. Everything below is satisfied by a tenant that started at 1,
 # so prove it started at k.

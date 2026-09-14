@@ -46,9 +46,21 @@ sleep 0.4
 fleet_cp 7567 CPADDPROXY 127.0.0.1:6645
 fleet_cp 7567 CPADDPROXY 127.0.0.1:6646
 fleet_cp 7567 CPADDPAIR 127.0.0.1:6644
-fleet_cp 7567 CPADDTENANT acme tok-acme acme 1 >/dev/null
+# k=2 so the tenant is placed on BOTH proxies. CPADDTENANT's trailing
+# argument is the subset width; `1` -- copied from the drills that use it --
+# put the tenant on one proxy and the OTHER answered WRONGPASS, which reads
+# as an auth problem and is a placement one.
+#
+# AND THE REPLIES ARE CHECKED. Discarding setup output to /dev/null is why
+# that surfaced three steps later as "AUTH failed" instead of here: a setup
+# whose failure cannot be reported is the same defect this suite keeps
+# cataloguing, one layer below the thing under test.
+ADD=$(fleet_cp 7567 CPADDTENANT acme tok-acme acme 2)
+case "$ADD" in OK*) ;; *) echo "FAIL: CPADDTENANT refused: $ADD"; exit 1 ;; esac
+echo "  $ADD"
 # The near-cache is opt-in per tenant (D6) AND the proxy must have a TTL.
-fleet_cp 7567 CPTENANTCACHE acme on >/dev/null
+CACHE=$(fleet_cp 7567 CPTENANTCACHE acme on)
+case "$CACHE" in OK*) ;; *) echo "FAIL: CPTENANTCACHE refused: $CACHE"; exit 1 ;; esac
 for p in 6645 6646; do
   $PX --port $p --control-plane 127.0.0.1:7567 --advertise 127.0.0.1:$p \
       --cache-ttl-ms $TTL_MS 2>$FLINT_DRILL_ROOT/flint-ncx-px$p.log &
