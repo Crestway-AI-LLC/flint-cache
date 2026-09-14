@@ -4052,16 +4052,25 @@ fn launch(inv: &Inventory, register: bool) {
             .unwrap_or_else(|e| format!("<{log} unreadable: {e}>"));
         match alive {
             Some(true) => panic!(
-                "control plane seat {seat} ({name}) did not answer PING in 10s,                  but its PROCESS IS RUNNING — it started and something is                  holding it. Not a slow start: 10s is ~370x the measured                  23-27ms spawn-to-PONG.\n  last of {log}:\n      {tail}"
+                "control plane seat {seat} ({name}) did not answer PING in 10s, but its \
+                 PROCESS IS RUNNING — it started and something is holding it. Not a slow \
+                 start: 10s is ~370x the measured 23-27ms spawn-to-PONG.\n  last of \
+                 {log}:\n  {tail}"
             ),
             Some(false) => panic!(
-                "control plane seat {seat} ({name}) did not answer PING in 10s and              NO PROCESS IS RUNNING — it exited or never execed, and this wait              was counting to ten against nothing.\n  last of {log}:\n      {tail}"
+                "control plane seat {seat} ({name}) did not answer PING in 10s and NO \
+                 PROCESS IS RUNNING — it exited or never execed, and this wait was counting \
+                 to ten against nothing.\n  last of {log}:\n  {tail}"
             ),
             // THE THIRD CAUSE. Naming either of the two above here would be a
             // guess with a fact's grammar, and the guess this code made was
             // the confident one.
             None => panic!(
-                "control plane seat {seat} ({name}) did not answer PING in 10s, and              WHETHER ANYTHING IS RUNNING THERE IS UNKNOWN — the host could not              be asked (see the line above). The seat may be wedged or may never              have started; this wait cannot tell, and neither can the log below              if the machine is unreachable.\n  last of {log}:\n      {tail}"
+                "control plane seat {seat} ({name}) did not answer PING in 10s, and WHETHER \
+                 ANYTHING IS RUNNING THERE IS UNKNOWN — the host could not be asked (see \
+                 the line above). The seat may be wedged or may never have started; this \
+                 wait cannot tell, and neither can the log below if the machine is \
+                 unreachable.\n  last of {log}:\n  {tail}"
             ),
         }
     }
@@ -8945,7 +8954,8 @@ mod ops_0027_tests {
         let x = expect_g("g1");
         assert!(
             scan(&[ev(10, "SelfFenced", "g1")], 50, Some(&x)).is_ok(),
-            "a fatal kind BEFORE the window must be skipped by the window, not              excused by the exemption -- if this fails the filter is broken"
+            "a fatal kind BEFORE the window must be skipped by the window, not excused \
+             by the exemption -- if this fails the filter is broken"
         );
     }
 
