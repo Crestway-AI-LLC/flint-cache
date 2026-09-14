@@ -219,6 +219,7 @@ ssh-user ec2-user           # the login user flintctl reaches other hosts as
 ssh-key /path/to/id         # optional: an identity file, if not your default
 ssh-sudo on                 # run the remote half under sudo (packaged installs)
 proxy-host 10.0.3.10        # positional with `proxy` lines — see below
+cp-host 10.0.1.5            # positional with `cp` lines — likewise a wildcard
 controller-host 10.0.1.10   # likewise, for `controller on`
 ```
 
@@ -235,10 +236,11 @@ flintctl: inventory places a seat on 10.0.1.10, which is not this machine,
   no way to reach
 ```
 
-**`proxy-host` and `controller-host` exist because those two addresses do not
-name a machine.** A proxy binds a wildcard (`proxy 0.0.0.0:7379`), so nothing
-in the address says where it runs; `proxy-host` supplies that, one line per
-`proxy` line, in the same order. `controller on` has no address at all.
+**`proxy-host`, `cp-host` and `controller-host` exist because those addresses
+do not name a machine.** A proxy binds a wildcard (`proxy 0.0.0.0:7379`), so
+nothing in the address says where it runs; `proxy-host` supplies that, one line
+per `proxy` line, in the same order. `cp-host` is the same, one line per `cp`
+line. `controller on` has no address at all.
 
 **A wildcard `proxy` line without one of them does not work**, and the failure
 is not a placement error — it is a certificate one. With no `proxy-host`,
@@ -256,6 +258,28 @@ which reads as a dead proxy. The proxy is fine; its log shows
 Either bind loopback (`proxy 127.0.0.1:7379`, what a single box wants) or keep
 the wildcard and add `proxy-host`. Both are verified; the wildcard alone is
 `BUG-0110`.
+
+**A wildcard `cp` line needs `cp-host` for the same reason, and the failure
+mode is worse.** The `cp` line is what the control plane BINDS, so a packaged
+single-host install writes `cp 0.0.0.0:7500` and is right to. But every seat is
+*told* that address — it is the seat's `--journal`, `--lease-cp`,
+`--control-plane` and `--commit-cp` — and a wildcard shipped to another machine
+points that seat at its **own** loopback, where there is no control plane at
+all. Unlike the proxy case there is no certificate error to read: the CP is
+simply absent, which looks exactly like one that is down.
+
+Since `BUG-0138`, `flintctl` refuses instead of spawning such a seat:
+
+```
+refusing to spawn node-7002 on 10.0.2.4: `--journal 0.0.0.0:7500` is a BIND
+  address. It names no machine, so that seat would dial its own loopback for a
+  control plane that runs on the orchestrator instead. Declare `cp-host <addr>`
+  in the inventory, positional with the `cp` lines, so remote seats are told
+  where the control plane actually is.
+```
+
+A single-host fleet is unaffected: the CP runs on the orchestrator, a local
+seat dialling its own loopback reaches it, and nothing is checked or changed.
 
 **`ssh-sudo on` for a packaged install**, and the reason is worth stating: on a
 packaged host `bins` and `statedir` are root-owned and the internal mesh key

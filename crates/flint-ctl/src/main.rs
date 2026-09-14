@@ -216,14 +216,22 @@ struct Inventory {
     /// root-only, so the login user cannot read `certs/int.key` or write
     /// `/var/lib/flint` without it.
     ssh_sudo: bool,
-    /// Which host runs proxies[i]. A proxy BINDS a wildcard (`0.0.0.0:7379`),
-    /// so unlike every other seat its address does not name its machine.
-    /// Positional with `proxy` lines; absent = local.
     /// This fleet is disposable — a chaos cluster that exists for one run.
     /// Only such a fleet may be mutated by a binary that is not a release
     /// build; see require_release_or_disposable.
     disposable: bool,
+    /// Which host runs proxies[i]. A proxy BINDS a wildcard (`0.0.0.0:7379`),
+    /// so unlike every other seat its address does not name its machine.
+    /// Positional with `proxy` lines; absent = local.
     proxy_hosts: Vec<String>,
+    /// Which host runs `cp[i]`. The CP BINDS the address its `cp` line names,
+    /// so a packaged single-host fleet writes the wildcard `0.0.0.0:7500` —
+    /// correct to bind, and no destination at all. Every seat is TOLD that
+    /// address (`--journal`, `--lease-cp`, `--control-plane`, `--commit-cp`),
+    /// so where the CP has its own machine this must name it or each seat
+    /// dials its own loopback. Positional with `cp` lines; absent = the `cp`
+    /// line as written. BUG-0138; `proxy_hosts` is the same key one role over.
+    cp_hosts: Vec<String>,
     /// Which host runs the controller. It has no address of its own — it
     /// dials the nodes rather than serving — so placement must be declared.
     controller_host: Option<String>,
@@ -398,6 +406,7 @@ fn parse_inventory(path: &str) -> Inventory {
             "ssh-key" => inv.ssh_key = Some(val.to_string()),
             "ssh-sudo" => inv.ssh_sudo = val == "on",
             "proxy-host" => inv.proxy_hosts.push(val.to_string()),
+            "cp-host" => inv.cp_hosts.push(val.to_string()),
             // `zone <host> <name>`. Malformed lines DIE rather than being
             // dropped: a silently-ignored zone line would leave verify
             // reporting anti-affinity it never checked.
@@ -548,7 +557,7 @@ fn admin_token(inv: &Inventory) -> Result<Option<String>, String> {
     debug_assert!(!inv.cp.is_empty(), "parse_inventory guarantees a cp line");
     static MEMO: std::sync::OnceLock<std::sync::Mutex<AdminTokenMemo>> = std::sync::OnceLock::new();
     let memo = MEMO.get_or_init(Default::default);
-    let key = inv.cp.join(",");
+    let key = cp_dial_all(inv);
     if let Ok(m) = memo.lock()
         && let Some(hit) = m.get(&key)
     {
@@ -755,6 +764,33 @@ fn proxy_down_help(inv: &Inventory, proxy: &str, dial: &str) -> String {
          \n  startup — check logs/proxy-*.log under the statedir.",
     );
     m
+}
+
+/// The address to DIAL for `cp[i]` — what a seat is TOLD to reach the control
+/// plane at, which is not what the CP binds.
+///
+/// `proxy_dial`'s rule one inventory key over, and for the same reason: a bind
+/// address is not a destination. The `cp` line is what the CP binds, so the
+/// packaged single-host fleet names `0.0.0.0:7500`; hand that to a seat on
+/// another machine and it dials its OWN loopback for a control plane that is
+/// not there. `cp-host` names the machine when the two differ. With none, the
+/// line is used as written — right for every co-located fleet, and byte for
+/// byte what shipped before BUG-0138.
+fn cp_dial(inv: &Inventory, i: usize) -> String {
+    match inv.cp_hosts.get(i) {
+        Some(host) => format!("{host}:{}", port_of(&inv.cp[i])),
+        None => inv.cp[i].clone(),
+    }
+}
+
+/// Every CP seat as a dial target, inventory order — the `--lease-cp` form.
+/// A renewer pinned to one seat fences the fleet when exactly that seat dies,
+/// so this stays a list; `cp_dial` is applied to each.
+fn cp_dial_all(inv: &Inventory) -> String {
+    (0..inv.cp.len())
+        .map(|i| cp_dial(inv, i))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn proxy_dial(inv: &Inventory, i: usize) -> String {
@@ -1614,6 +1650,52 @@ fn all_runners(inv: &Inventory) -> Vec<Runner> {
     out
 }
 
+/// BUG-0138. A wildcard is the right thing to BIND and names no machine to
+/// dial, so shipping one to another host points that seat at its OWN loopback
+/// — where the control plane is simply absent, which is indistinguishable
+/// from one that is down and says nothing at all. `proxy_dial` learned this
+/// on the `proxy` line (BUG-0110) and it cost the first 7-host run.
+///
+/// Only remote spawns are checked, and that is not a shortcut: a wildcard `cp`
+/// resolves `is_local_host` true, so the CP runs on the orchestrator and a
+/// LOCAL seat dialling its own loopback reaches it correctly. The wildcard is
+/// wrong exactly when it leaves the box, which is this call.
+/// The offending `(flag, seat)` if `args` would tell a seat to reach the
+/// control plane at an address that names no machine. Split out from the
+/// refusal so it can be tested without exiting the process.
+fn wildcard_cp_target(args: &[String]) -> Option<(String, String)> {
+    for w in args.windows(2) {
+        if !matches!(
+            w[0].as_str(),
+            "--journal" | "--lease-cp" | "--control-plane" | "--commit-cp"
+        ) {
+            continue;
+        }
+        // `--journal` is overloaded: the agent's is a FILE path. It has no
+        // colon, so host_of yields the path itself and never matches here.
+        for seat in w[1].split(',') {
+            let h = host_of(seat);
+            if h == "0.0.0.0" || h == "::" || h == "[::]" || h.is_empty() {
+                return Some((w[0].clone(), seat.to_string()));
+            }
+        }
+    }
+    None
+}
+
+fn refuse_wildcard_cp_target(name: &str, r: &Runner, args: &[String]) {
+    if let Some((flag, seat)) = wildcard_cp_target(args) {
+        die(&format!(
+            "refusing to spawn {name} on {}: `{flag} {seat}` is a BIND address.\n  \
+             It names no machine, so that seat would dial its own loopback for a\n  \
+             control plane that runs on the orchestrator instead. Declare\n  \
+             `cp-host <addr>` in the inventory, positional with the `cp` lines, so\n  \
+             remote seats are told where the control plane actually is.",
+            r.label()
+        ));
+    }
+}
+
 fn spawn_env(
     inv: &Inventory,
     r: &Runner,
@@ -1623,6 +1705,7 @@ fn spawn_env(
     envs: &[(String, String)],
 ) {
     if let Runner::Ssh { .. } = r {
+        refuse_wildcard_cp_target(name, r, args);
         let mut argv = vec![
             format!("{}/flintctl", inv.bins),
             "host-spawn".into(),
@@ -2714,7 +2797,7 @@ fn node_tuning_args(inv: &Inventory, replicated: bool) -> Vec<String> {
         // Every CP seat, not just the journal target: a renewer pinned to
         // one seat fences the fleet when exactly that seat dies (the
         // -LEADER redirect can only be followed from a seat that answers).
-        push("--lease-cp", inv.cp.join(","));
+        push("--lease-cp", cp_dial_all(inv));
     }
     if let Some(v) = inv.max_conns {
         push("--max-conns", v.to_string());
@@ -3227,7 +3310,7 @@ fn is_noauth_error(msg: &str) -> bool {
 
 fn start_pair_nodes(inv: &Inventory, pair: &[String], gi: usize) {
     let d = &inv.statedir;
-    let cp = &inv.cp[0];
+    let cp = cp_dial(inv, 0);
     let tls = tls_client(inv);
     // The fleet's OWN view of who is master outranks inventory order. After a
     // failover the promoted node is the file's pair[1]; starting the dead
@@ -3426,7 +3509,8 @@ fn call_cp(
     tls: &Option<Arc<flint_tls::ClientConfig>>,
     args: &[&str],
 ) -> std::io::Result<Value> {
-    let mut target = inv.cp[0].clone();
+    let seats: Vec<String> = (0..inv.cp.len()).map(|i| cp_dial(inv, i)).collect();
+    let mut target = seats[0].clone();
     let mut last: std::io::Result<Value> = Err(std::io::Error::other("unreached"));
     for attempt in 0..24 {
         // Patience on EVERY retry path, not only "no leader": right after a
@@ -3446,9 +3530,9 @@ fn call_cp(
             Ok(Value::Error(e)) if e.contains("no leader elected") => {}
             // A dead seat: rotate to the next one rather than giving up —
             // with a single seat this falls through and returns the error.
-            Err(_) if inv.cp.len() > 1 => {
-                let pos = inv.cp.iter().position(|a| *a == target).unwrap_or(0);
-                target = inv.cp[(pos + 1) % inv.cp.len()].clone();
+            Err(_) if seats.len() > 1 => {
+                let pos = seats.iter().position(|a| *a == target).unwrap_or(0);
+                target = seats[(pos + 1) % seats.len()].clone();
             }
             _ => return last,
         }
@@ -3613,7 +3697,7 @@ fn agent_args(inv: &Inventory) -> Option<Vec<String>> {
     let d = &inv.statedir;
     let mut args = vec![
         "--control-plane".to_string(),
-        inv.cp[0].clone(),
+        cp_dial(inv, 0),
         "--metrics-port".into(),
         port_of(agent).to_string(),
         // The host half of `agent <addr>` used to be parsed and dropped, so
@@ -3688,12 +3772,12 @@ fn controller_args(inv: &Inventory) -> Vec<String> {
         "--confirm".into(),
         inv.ctl_confirm.unwrap_or(3).to_string(),
         "--journal".into(),
-        inv.cp[0].clone(),
+        cp_dial(inv, 0),
         "--snapshot-root".into(),
         format!("{d}/snaps"),
         // Option B: cutovers commit ownership truth to the CP.
         "--commit-cp".into(),
-        inv.cp[0].clone(),
+        cp_dial(inv, 0),
     ];
     args.extend(internal_args(inv));
     args
@@ -5477,7 +5561,7 @@ fn add_replica(inv: &Inventory, inventory_path: &str, pair_ref: &str, new: &str)
         "--data-dir".into(),
         format!("{d}/node-{port}"),
         "--journal".into(),
-        inv.cp[0].clone(),
+        cp_dial(inv, 0),
         "--replica-of".into(),
         master.clone(),
     ];
@@ -5566,7 +5650,7 @@ fn swap_node(inv: &Inventory, inventory_path: &str, bad: &str, new: &str) {
         "--data-dir".into(),
         format!("{d}/node-{port}"),
         "--journal".into(),
-        inv.cp[0].clone(),
+        cp_dial(inv, 0),
         "--replica-of".into(),
         master.clone(),
     ];
@@ -6198,7 +6282,7 @@ fn roll_node(
         "--data-dir".into(),
         format!("{d}/node-{port}"),
         "--journal".into(),
-        inv.cp[0].clone(),
+        cp_dial(inv, 0),
         "--replica-of".into(),
         master.to_string(),
     ];
@@ -6764,7 +6848,7 @@ impl Roll {
     fn new(inv: &Inventory, target: &str) -> Self {
         Self {
             id: format!("{}-{target}", now_ms()),
-            cp: inv.cp[0].clone(),
+            cp: cp_dial(inv, 0),
             tls: tls_client(inv),
         }
     }
@@ -9601,6 +9685,103 @@ mod adr_0043_surface_tests {
         match surface_fresh(&inv, SINCE_LONG, NOW) {
             Ok(Surface::NotConfigured) => {}
             other => panic!("expected NotConfigured, got {:?}", other.err()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod cp_dial_tests {
+    use super::*;
+    use std::io::Write;
+
+    fn inv_from(body: &str, name: &str) -> Inventory {
+        let p = std::env::temp_dir().join(format!("flint-cpdial-{name}.flint"));
+        let mut f = std::fs::File::create(&p).expect("write inventory");
+        f.write_all(body.as_bytes()).expect("write inventory");
+        parse_inventory(p.to_str().expect("utf8 path"))
+    }
+
+    const SINGLE: &str = "statedir /var/lib/flint\nbins /opt/flint/bin\n\
+                          cp 0.0.0.0:7500\npair 10.0.0.1:7001,10.0.0.1:7002\n";
+
+    /// With no `cp-host` the line is used exactly as written. This is the
+    /// compatibility half of BUG-0138: every co-located fleet, which is every
+    /// fleet that exists today, must compose byte for byte what it did before.
+    #[test]
+    fn no_cp_host_is_the_line_verbatim() {
+        let inv = inv_from(SINGLE, "verbatim");
+        assert_eq!(cp_dial(&inv, 0), "0.0.0.0:7500");
+        assert_eq!(cp_dial_all(&inv), "0.0.0.0:7500");
+    }
+
+    /// `cp-host` names the machine and the PORT still comes from the `cp`
+    /// line, so the bind port and the dial port cannot drift apart.
+    #[test]
+    fn cp_host_substitutes_the_host_and_keeps_the_port() {
+        let inv = inv_from(&format!("{SINGLE}cp-host 10.0.0.9\n"), "substitute");
+        assert_eq!(cp_dial(&inv, 0), "10.0.0.9:7500");
+    }
+
+    /// Positional with the `cp` lines, like `proxy-host`, and a seat with no
+    /// `cp-host` of its own keeps its own line rather than borrowing another's.
+    #[test]
+    fn cp_host_is_positional_and_partial() {
+        let body = "statedir /var/lib/flint\nbins /opt/flint/bin\n\
+                    cp 0.0.0.0:7500\ncp 0.0.0.0:7501\ncp 10.0.0.3:7502\n\
+                    cp-host 10.0.0.1\ncp-host 10.0.0.2\n\
+                    pair 10.0.0.1:7001,10.0.0.1:7002\n";
+        let inv = inv_from(body, "positional");
+        assert_eq!(
+            cp_dial_all(&inv),
+            "10.0.0.1:7500,10.0.0.2:7501,10.0.0.3:7502"
+        );
+    }
+
+    fn argv(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// THE REGRESSION. A wildcard reaching a remote seat is what BUG-0138 is;
+    /// the check must see it through every flag that carries a CP address,
+    /// including one buried in a `--lease-cp` list.
+    #[test]
+    fn a_wildcard_cp_target_is_caught_on_every_flag() {
+        for flag in ["--journal", "--lease-cp", "--control-plane", "--commit-cp"] {
+            let a = argv(&["--port", "7002", flag, "0.0.0.0:7500", "--engine", "rocks"]);
+            assert_eq!(
+                wildcard_cp_target(&a),
+                Some((flag.to_string(), "0.0.0.0:7500".to_string())),
+                "{flag} carries a CP address and must be checked"
+            );
+        }
+        let listed = argv(&["--lease-cp", "10.0.0.1:7500,0.0.0.0:7501,10.0.0.3:7502"]);
+        assert_eq!(
+            wildcard_cp_target(&listed),
+            Some(("--lease-cp".into(), "0.0.0.0:7501".into())),
+            "a wildcard hiding mid-list still points a renewer at nothing"
+        );
+        assert_eq!(
+            wildcard_cp_target(&argv(&["--journal", "[::]:7500"])),
+            Some(("--journal".into(), "[::]:7500".into()))
+        );
+    }
+
+    /// The other half, and the reason the check can be trusted: it must not
+    /// fire on what a healthy remote spawn actually carries. `--journal` is
+    /// OVERLOADED — the agent's is a file path — and a resolved address, a
+    /// bare `--bind 0.0.0.0` (which is a bind and belongs on the wildcard),
+    /// and a lone trailing flag must all pass.
+    #[test]
+    fn resolved_targets_and_the_agents_file_journal_pass() {
+        for a in [
+            argv(&["--journal", "10.0.0.9:7500", "--lease-cp", "10.0.0.9:7500"]),
+            argv(&["--journal", "/var/lib/flint/shadow.jsonl"]),
+            argv(&["--port", "7002", "--bind", "0.0.0.0", "--engine", "rocks"]),
+            argv(&["--metrics-bind", "0.0.0.0:9464"]),
+            argv(&["--journal"]),
+            argv(&[]),
+        ] {
+            assert_eq!(wildcard_cp_target(&a), None, "false positive on {a:?}");
         }
     }
 }
