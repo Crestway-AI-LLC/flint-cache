@@ -5789,6 +5789,310 @@ fn scan_journal<'a>(
     Ok(())
 }
 
+/// How stale the operator-facing metric surface may be and still gate a roll.
+///
+/// The agent sweeps about once a second, so this is roughly fifteen sweeps.
+/// Deliberately not tight: this gate exists to catch a surface that has
+/// STOPPED, not to police jitter on a loaded box, and a flaky abort halfway
+/// through a fleet roll is worse than a generous window.
+const SURFACE_MAX_AGE_MS: u64 = 15_000;
+
+/// The shortest phase in which a sweep can be REQUIRED to have landed.
+///
+/// The agent sweeps about once a second, and `upgrade --soak-ms 500` is a real
+/// invocation -- canary_drill's `--nodes-only` step is one. Demanding a sweep
+/// inside a window shorter than the sweep interval would abort rolls whose
+/// surface is working perfectly, so below this floor the freshness budget is
+/// all there is, and `say_gates` says which of the two it got.
+const SURFACE_SWEEP_MS: u64 = 3_000;
+
+/// What the surface gate found — an enum so a fleet with NO surface cannot be
+/// rendered as a fleet whose surface passed.
+///
+/// This is not a `Result<(), String>` on purpose. An inventory with no `agent`
+/// line has no operator-facing surface, which is true of most drill fleets and
+/// is not a failure; reporting it as a clean gate would be precisely the
+/// "check that cannot fail" this repo keeps cataloguing. The caller has to
+/// name which of the two it got.
+#[derive(Debug)]
+enum Surface {
+    /// Present, carrying this fleet's seats, and fresh.
+    Verified {
+        age_ms: u64,
+        seats: usize,
+        /// A sweep COMPLETED inside this phase's own window -- the surface was
+        /// arriving while the phase ran, not merely present when it ended.
+        swept_in_window: bool,
+    },
+    /// No `agent` line in the inventory: there is nothing to gate on.
+    NotConfigured,
+}
+
+/// Surface gate (ADR-0043): the operator-facing metric surface is present,
+/// carries this fleet's own seats, and is fresh.
+///
+/// `journal_clean` above answers "is anything WRONG". This answers the
+/// question that gate cannot: "is anything ARRIVING". A blank surface passes
+/// a soak — nothing on it is red — and OPS-0198 is the local proof that the
+/// operator-facing surface can go blank while reading healthy. ADR-0041
+/// states the rule for a publisher; a gate is the same statement one step
+/// downstream.
+///
+/// WHY THE AGENT IS ALIVE AT EVERY GATE SITE. `upgrade` goes canary ->
+/// replicas -> masters -> `roll_edge`, and `roll_edge` is what rolls the
+/// agent. Every gate site is in the node phases, so the surface is stable
+/// across all of them. A gate site added AFTER `roll_edge` would be sampling
+/// a surface this roll is itself restarting, and would have to WAIT for it
+/// rather than refuse — do not copy this call there without that change.
+fn surface_fresh(inv: &Inventory, since_ms: u64, now: u64) -> Result<Surface, String> {
+    let Some(agent) = inv.agent.as_deref() else {
+        return Ok(Surface::NotConfigured);
+    };
+    let body = metrics_get(agent)?;
+    let seats: Vec<&str> = inv.pairs.iter().flatten().map(String::as_str).collect();
+    scan_surface(&body, &seats, since_ms, now, SURFACE_MAX_AGE_MS)
+}
+
+/// GET the exposition. Raw, because flintctl has no HTTP client and one
+/// scrape does not justify a dependency — the same reason `call_cp` speaks
+/// RESP by hand.
+///
+/// FAILS CLOSED, like the journal gate: a surface we cannot read is not a
+/// surface that is fine.
+fn metrics_get(addr: &str) -> Result<String, String> {
+    let refuse = |what: String| format!("{what} — refusing to roll without the surface gate");
+    let budget = Duration::from_secs(3);
+    // BOUNDED CONNECT, and `tools/gates.sh` was right to refuse the first
+    // version of this line. A bare `TcpStream::connect` has no timeout of its
+    // own, so an agent host that is blackholed rather than refusing -- a
+    // partition, a security-group change, a hung NIC -- parks this call for
+    // the kernel's SYN-retry budget, minutes, no matter what read timeout is
+    // set after it. That is BUG-0122/0123/0124's family, and here it would
+    // land as a GATE THAT HANGS A ROLL INSTEAD OF FAILING IT: the same shape
+    // as BUG-0134 one layer up, and the opposite of what this gate is for.
+    //
+    // `&None` because the agent's exposition is plain HTTP, so this returns
+    // `Stream::Plain` and negotiates no TLS.
+    let mut s = flint_tls::connect_within(addr, &None, budget)
+        .map_err(|e| refuse(format!("metric surface unreachable at {addr}: {e}")))?;
+    let _ = s.set_read_timeout(Some(budget));
+    let _ = s.set_write_timeout(Some(budget));
+    // `Connection: close` so the body ends at EOF; the agent sends it back
+    // and drops the stream, so there is no keep-alive to time out against.
+    s.write_all(
+        format!("GET /metrics HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n").as_bytes(),
+    )
+    .map_err(|e| {
+        refuse(format!(
+            "metric surface at {addr} accepted but would not take a request: {e}"
+        ))
+    })?;
+    let mut raw = String::new();
+    s.read_to_string(&mut raw).map_err(|e| {
+        refuse(format!(
+            "metric surface at {addr} answered nothing readable: {e}"
+        ))
+    })?;
+    let Some((head, body)) = raw.split_once("\r\n\r\n") else {
+        return Err(refuse(format!(
+            "metric surface at {addr} answered {} bytes with no header break",
+            raw.len()
+        )));
+    };
+    let status = head.lines().next().unwrap_or("");
+    if !status.starts_with("HTTP/1.1 200") {
+        return Err(refuse(format!(
+            "metric surface at {addr} answered {status:?}"
+        )));
+    }
+    Ok(body.to_string())
+}
+
+/// Read one gauge out of an exposition.
+///
+/// ANCHORED ON THE WHOLE NAME. `flint_agent_budget_used` is a prefix of
+/// `flint_agent_budget_used_by_kind`, so a bare `starts_with` reads the wrong
+/// series the day someone adds a longer name — the same way the drill's
+/// `build="v2"` count read 10 when a second series arrived carrying that
+/// label. A series is its name plus its labels, not a prefix of a line.
+fn gauge(body: &str, name: &str) -> Option<u64> {
+    body.lines().filter(|l| !l.starts_with('#')).find_map(|l| {
+        let rest = l.strip_prefix(name)?;
+        let v = rest.strip_prefix(' ')?;
+        v.trim().parse::<f64>().ok().map(|f| f as u64)
+    })
+}
+
+/// The surface gate's DECISION, split from its I/O the way `scan_journal` is
+/// split from `journal_clean`, so the whole refusal table is testable without
+/// a fleet, an agent or a clock.
+fn scan_surface(
+    body: &str,
+    seats: &[&str],
+    since_ms: u64,
+    now: u64,
+    max_age_ms: u64,
+) -> Result<Surface, String> {
+    if body.trim().is_empty() {
+        return Err(
+            "the metric surface answered 200 with an EMPTY body: the exporter is up and \
+             publishing nothing, which is the state a soak reads as healthy"
+                .into(),
+        );
+    }
+    // PRESENT AND ZERO, not "not 1". An exposition without this line is not
+    // this agent's surface — a truncated body, a different process on the
+    // port, a future rename — and treating a missing staleness flag as
+    // "not stale" is the whole error this gate exists to refuse.
+    match gauge(body, "flint_agent_sweep_stale") {
+        None => {
+            return Err(
+                "the metric surface carries no flint_agent_sweep_stale: it cannot say whether \
+                 what it is serving is current, so it cannot gate a roll"
+                    .into(),
+            );
+        }
+        Some(1) => {
+            return Err(
+                "the metric surface says flint_agent_sweep_stale 1: every series it is \
+                 serving is from an earlier sweep, because the current one could not reach \
+                 the control plane (OPS-0214)"
+                    .into(),
+            );
+        }
+        Some(_) => {}
+    }
+    // The agent OMITS this until a sweep has completed, rather than publishing
+    // a 0 that would read as 1970 (ADR-0041). Absent therefore means "no sweep
+    // has ever reached the fleet", which is a refusal and not an age.
+    let Some(at) = gauge(body, "flint_agent_sweep_completed_at_ms") else {
+        return Err(
+            "the metric surface carries no flint_agent_sweep_completed_at_ms: no sweep has \
+             ever reached the fleet, so there is nothing to be fresh"
+                .into(),
+        );
+    };
+    if at > now.saturating_add(max_age_ms) {
+        return Err(format!(
+            "the metric surface reports its last sweep at {at} ms, {} ms in the FUTURE against \
+             this host's clock ({now} ms) — a skew that large would make any staleness check \
+             pass forever",
+            at - now
+        ));
+    }
+    let age_ms = now.saturating_sub(at);
+    if age_ms > max_age_ms {
+        return Err(format!(
+            "the metric surface is {age_ms} ms stale (budget {max_age_ms} ms): it is still \
+             answering, and what it answers is from before this roll"
+        ));
+    }
+    // THIS FLEET'S OWN SEATS. `flint_node_up` is emitted for every node of
+    // every pair unconditionally -- unlike flint_node_build_info, which is
+    // omitted for a seat with no build and would therefore go quiet in
+    // exactly the case worth catching. Same discipline as staging-roll.sh:
+    // the series must be present under our dimension, not merely present.
+    let missing: Vec<&str> = seats
+        .iter()
+        .copied()
+        .filter(|a| !body.contains(&format!("flint_node_up{{node=\"{a}\"")))
+        .collect();
+    if !missing.is_empty() {
+        return Err(format!(
+            "the metric surface is fresh but does not carry {} of this fleet's {} seats \
+             ({}): it is describing a different fleet, has stopped describing part of this \
+             one, or spells these seats differently than the inventory does -- the agent \
+             reads them back from the control plane, which flintctl configured from this \
+             same file, so a spelling difference is itself worth knowing about",
+            missing.len(),
+            seats.len(),
+            missing.join(", ")
+        ));
+    }
+    // PRESENT ACROSS THE WINDOW, not merely present at the end of it. This is
+    // the clause the criterion actually asks for -- "verified present for the
+    // WHOLE soak" -- and freshness alone does not supply it: a surface that
+    // froze the instant the phase began still reads fresh under any budget
+    // wider than the phase, which every useful budget is.
+    //
+    // `since_ms` is when this phase began, in the same unix-ms clock the agent
+    // stamps its sweeps with, so a sweep completing at or after it is direct
+    // evidence the surface was arriving WHILE the phase ran.
+    //
+    // REQUIRED ONLY WHEN THE WINDOW COULD CONTAIN A SWEEP. See
+    // SURFACE_SWEEP_MS: a 500 ms phase cannot be asked for a sweep the agent
+    // was never going to make in it. Below the floor this degrades to the
+    // freshness check, and `say_gates` prints which one was obtained rather
+    // than letting the weaker reading pass for the stronger.
+    let window = now.saturating_sub(since_ms);
+    let swept_in_window = at >= since_ms;
+    if window >= SURFACE_SWEEP_MS && !swept_in_window {
+        return Err(format!(
+            "the metric surface is fresh but its last sweep completed at {at} ms, BEFORE \
+             this phase began at {since_ms} ms -- nothing arrived during the {window} ms \
+             the phase ran. \"Fresh\" here only means the budget is wider than the phase"
+        ));
+    }
+    Ok(Surface::Verified {
+        age_ms,
+        seats: seats.len(),
+        swept_in_window,
+    })
+}
+
+/// BOTH gates, in one call, so a gate site cannot be added with only one of
+/// them. That is not hypothetical tidiness: the journal gate has three call
+/// sites today and each one was written by hand, which is how a fourth would
+/// arrive missing the surface.
+///
+/// Returns the surface's verdict so the caller can SAY which gates ran.
+fn roll_gate(
+    inv: &Inventory,
+    since_ms: u64,
+    disallowed: &[&str],
+    expected: Option<&ExpectedTransition>,
+) -> Result<Surface, String> {
+    journal_clean(inv, since_ms, disallowed, expected)?;
+    // THE SAME WINDOW both gates judge. `since_ms` is when this phase began;
+    // the journal gate scans events at or after it, and the surface gate asks
+    // whether a sweep landed in it.
+    surface_fresh(inv, since_ms, now_ms())
+}
+
+/// One line saying what actually gated, printed at every site.
+///
+/// `NotConfigured` is LOUD. A fleet that quietly lost its `agent` line would
+/// otherwise roll on a gate that silently did nothing, and read afterwards
+/// exactly like a fleet whose surface was verified.
+fn say_gates(s: &Surface) {
+    match s {
+        Surface::Verified {
+            age_ms,
+            seats,
+            swept_in_window: true,
+        } => eprintln!(
+            "  gates clean: journal quiet, metric surface swept during this phase \
+             ({age_ms}ms old) carrying {seats} seat(s)"
+        ),
+        // SAID DIFFERENTLY ON PURPOSE. This is the weaker reading -- present
+        // and fresh, but the phase was too short to require a sweep inside it
+        // -- and a log that spelled both the same way would let the weaker one
+        // be read as the criterion being met.
+        Surface::Verified {
+            age_ms,
+            seats,
+            swept_in_window: false,
+        } => eprintln!(
+            "  gates clean: journal quiet, metric surface fresh ({age_ms}ms old) carrying \
+             {seats} seat(s) — phase shorter than a sweep, so no sweep was required in it"
+        ),
+        Surface::NotConfigured => eprintln!(
+            "  gates clean: journal quiet. NO SURFACE GATE — this inventory has no `agent` \
+             line, so ADR-0043's surface check did not run"
+        ),
+    }
+}
+
 /// What `roll_node` does when the seat is NOT an observed live replica.
 ///
 /// This was a `wipe: bool`, and the bool could not express the third case.
@@ -6719,16 +7023,18 @@ fn upgrade(inv: &Inventory, version_tag: Option<String>, soak_ms: u64, nodes_onl
     }
     eprintln!("  soaking {soak_ms}ms");
     std::thread::sleep(Duration::from_millis(soak_ms));
-    if let Err(e) = journal_clean(inv, t0, REPLICA_PHASE_DISALLOWED, None) {
-        eprintln!("== UPGRADE ABORTED at canary soak: {e}");
-        eprintln!("   canary stays on the new build (roll forward after diagnosis)");
-        if let Some(r) = &roll {
-            roll_abort(r, 3)
-        } else {
-            std::process::exit(3)
-        };
+    match roll_gate(inv, t0, REPLICA_PHASE_DISALLOWED, None) {
+        Ok(s) => say_gates(&s),
+        Err(e) => {
+            eprintln!("== UPGRADE ABORTED at canary soak: {e}");
+            eprintln!("   canary stays on the new build (roll forward after diagnosis)");
+            if let Some(r) = &roll {
+                roll_abort(r, 3)
+            } else {
+                std::process::exit(3)
+            };
+        }
     }
-    eprintln!("  soak clean: no unexpected transitions in the fleet journal");
 
     for (r, m) in replicas.iter().skip(1) {
         if already_on(r, &tls, &expect) {
@@ -6763,13 +7069,16 @@ fn upgrade(inv: &Inventory, version_tag: Option<String>, soak_ms: u64, nodes_onl
                 std::process::exit(3)
             };
         }
-        if let Err(e) = journal_clean(inv, t, REPLICA_PHASE_DISALLOWED, None) {
-            eprintln!("== UPGRADE ABORTED after {r}: {e}");
-            if let Some(r) = &roll {
-                roll_abort(r, 3)
-            } else {
-                std::process::exit(3)
-            };
+        match roll_gate(inv, t, REPLICA_PHASE_DISALLOWED, None) {
+            Ok(s) => say_gates(&s),
+            Err(e) => {
+                eprintln!("== UPGRADE ABORTED after {r}: {e}");
+                if let Some(r) = &roll {
+                    roll_abort(r, 3)
+                } else {
+                    std::process::exit(3)
+                };
+            }
         }
         if let Some(rl) = &roll {
             rl.converged(r);
@@ -6833,13 +7142,16 @@ fn upgrade(inv: &Inventory, version_tag: Option<String>, soak_ms: u64, nodes_onl
             kind: "Detected",
             subject: format!("g{i}"),
         };
-        if let Err(e) = journal_clean(inv, t, MASTER_PHASE_DISALLOWED, Some(&expected)) {
-            eprintln!("== UPGRADE ABORTED after pair {i} master roll: {e}");
-            if let Some(r) = &roll {
-                roll_abort(r, 3)
-            } else {
-                std::process::exit(3)
-            };
+        match roll_gate(inv, t, MASTER_PHASE_DISALLOWED, Some(&expected)) {
+            Ok(s) => say_gates(&s),
+            Err(e) => {
+                eprintln!("== UPGRADE ABORTED after pair {i} master roll: {e}");
+                if let Some(r) = &roll {
+                    roll_abort(r, 3)
+                } else {
+                    std::process::exit(3)
+                };
+            }
         }
         if let Some(rl) = &roll {
             rl.converged(old_master);
@@ -9088,5 +9400,207 @@ mod admin_token_tests {
             matches!(got, Err(ref e) if e.contains("CPADMINTOKEN")),
             "an unreachable CP must be an error naming the command, got {got:?}"
         );
+    }
+}
+
+/// ADR-0043's refusal table. The gate exists to tell "nothing is wrong" from
+/// "nothing is arriving", so every test below is a surface that a check
+/// looking only for red would have passed.
+#[cfg(test)]
+mod adr_0043_surface_tests {
+    use super::*;
+
+    const NOW: u64 = 1_700_000_000_000;
+    const BUDGET: u64 = 15_000;
+    /// A phase long enough that a sweep is REQUIRED to have landed inside it.
+    const SINCE_LONG: u64 = NOW - 10_000;
+    /// A phase shorter than the agent's sweep interval, where one is not.
+    const SINCE_SHORT: u64 = NOW - 2_000;
+
+    /// A healthy exposition: two seats up, a sweep that just completed.
+    fn healthy(at_ms: u64, stale: u8) -> String {
+        format!(
+            "# HELP flint_node_up whether the seat answered\n\
+             # TYPE flint_node_up gauge\n\
+             flint_node_up{{node=\"127.0.0.1:6920\",pair=\"0\"}} 1\n\
+             flint_node_up{{node=\"127.0.0.1:6921\",pair=\"0\"}} 1\n\
+             flint_agent_sweep_completed_at_ms {at_ms}\n\
+             flint_agent_sweep_stale {stale}\n"
+        )
+    }
+
+    fn seats() -> Vec<&'static str> {
+        vec!["127.0.0.1:6920", "127.0.0.1:6921"]
+    }
+
+    /// POSITIVE CONTROL. Every refusal below is satisfied by a function that
+    /// refuses everything, so one surface has to be allowed through.
+    #[test]
+    fn a_fresh_dimensioned_surface_gates() {
+        match scan_surface(&healthy(NOW - 900, 0), &seats(), SINCE_LONG, NOW, BUDGET) {
+            Ok(Surface::Verified {
+                age_ms,
+                seats,
+                swept_in_window,
+            }) => {
+                assert_eq!(age_ms, 900);
+                assert_eq!(seats, 2);
+                assert!(swept_in_window, "a sweep landed inside this phase");
+            }
+            other => panic!("refused a healthy surface: {:?}", other.err()),
+        }
+    }
+
+    /// THE CASE THE WHOLE ADR IS ABOUT. 200 OK, no red, nothing there.
+    #[test]
+    fn an_empty_body_is_not_a_quiet_fleet() {
+        let e = scan_surface("   \n", &seats(), SINCE_LONG, NOW, BUDGET)
+            .expect_err("empty body must refuse");
+        assert!(e.contains("EMPTY"), "{e}");
+    }
+
+    /// A missing staleness flag must not read as "not stale" -- that is the
+    /// absence-is-zero error one level up from what it guards.
+    #[test]
+    fn a_surface_that_cannot_say_whether_it_is_current_is_refused() {
+        let body = healthy(NOW - 900, 0).replace("flint_agent_sweep_stale 0\n", "");
+        let e = scan_surface(&body, &seats(), SINCE_LONG, NOW, BUDGET)
+            .expect_err("no stale flag must refuse");
+        assert!(e.contains("flint_agent_sweep_stale"), "{e}");
+    }
+
+    /// OPS-0214 exactly: the port answers, the body is last sweep's.
+    #[test]
+    fn a_surface_serving_an_earlier_sweep_is_refused() {
+        let e = scan_surface(&healthy(NOW - 900, 1), &seats(), SINCE_LONG, NOW, BUDGET)
+            .expect_err("stale=1 must refuse");
+        assert!(e.contains("earlier sweep"), "{e}");
+    }
+
+    /// The agent omits the timestamp until a sweep completes (ADR-0041), so
+    /// absent means "never reached the fleet", not "age zero".
+    #[test]
+    fn a_surface_that_has_never_swept_is_refused() {
+        let body = healthy(0, 0)
+            .lines()
+            .filter(|l| !l.starts_with("flint_agent_sweep_completed_at_ms"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let e = scan_surface(&body, &seats(), SINCE_LONG, NOW, BUDGET)
+            .expect_err("no sweep must refuse");
+        assert!(e.contains("no sweep has ever reached the fleet"), "{e}");
+    }
+
+    #[test]
+    fn a_surface_older_than_the_budget_is_refused() {
+        let e = scan_surface(
+            &healthy(NOW - BUDGET - 1, 0),
+            &seats(),
+            SINCE_LONG,
+            NOW,
+            BUDGET,
+        )
+        .expect_err("stale beyond budget must refuse");
+        assert!(e.contains("stale"), "{e}");
+    }
+
+    /// A clock skew large enough to make `now - at` underflow would make the
+    /// freshness check pass forever, which is a check that cannot fail.
+    #[test]
+    fn a_timestamp_in_the_future_is_refused_rather_than_read_as_fresh() {
+        let e = scan_surface(
+            &healthy(NOW + BUDGET + 1, 0),
+            &seats(),
+            SINCE_LONG,
+            NOW,
+            BUDGET,
+        )
+        .expect_err("a future sweep must refuse");
+        assert!(e.contains("FUTURE"), "{e}");
+    }
+
+    /// Fresh, current, and about somebody else's fleet -- or about half of
+    /// ours. The seat that vanished is the one worth naming.
+    #[test]
+    fn a_surface_missing_one_of_our_seats_is_refused_and_names_it() {
+        let body = healthy(NOW - 900, 0)
+            .replace("flint_node_up{node=\"127.0.0.1:6921\",pair=\"0\"} 1\n", "");
+        let e = scan_surface(&body, &seats(), SINCE_LONG, NOW, BUDGET)
+            .expect_err("a missing seat must refuse");
+        assert!(e.contains("127.0.0.1:6921"), "{e}");
+        assert!(
+            !e.contains("127.0.0.1:6920"),
+            "it named the seat that IS there: {e}"
+        );
+    }
+
+    /// A SERIES IS NOT A PREFIX OF A LINE. `flint_agent_budget_used` is a
+    /// prefix of `flint_agent_budget_used_by_kind`, and the drill's own
+    /// `build="v2"` count has gone stale twice from exactly this. If `gauge`
+    /// matched on prefix, the longer series' value would answer for the
+    /// shorter one.
+    #[test]
+    fn a_longer_series_name_does_not_answer_for_a_shorter_one() {
+        let body = format!(
+            "flint_agent_sweep_stale_seconds_total 99\n{}",
+            healthy(NOW - 900, 0)
+        );
+        match scan_surface(&body, &seats(), SINCE_LONG, NOW, BUDGET) {
+            Ok(Surface::Verified { .. }) => {}
+            other => panic!("a longer name was read as the flag: {:?}", other.err()),
+        }
+        assert_eq!(gauge(&body, "flint_agent_sweep_stale"), Some(0));
+    }
+
+    /// THE CLAUSE THE CRITERION ACTUALLY ASKS FOR. A surface that stopped the
+    /// instant the phase began is still "fresh" against any budget wider than
+    /// the phase -- and every useful budget is wider than the phase.
+    #[test]
+    fn a_surface_that_stopped_when_the_phase_began_is_refused_though_it_reads_fresh() {
+        let frozen = healthy(SINCE_LONG - 1, 0);
+        // It really is inside the freshness budget: this is not a staleness
+        // refusal wearing a different name.
+        const { assert!(NOW - (SINCE_LONG - 1) < BUDGET) };
+        let e = scan_surface(&frozen, &seats(), SINCE_LONG, NOW, BUDGET)
+            .expect_err("a surface that arrived nothing during the phase must refuse");
+        assert!(e.contains("BEFORE this phase began"), "{e}");
+    }
+
+    /// And the floor, without which `upgrade --soak-ms 500` would abort on a
+    /// surface that is working perfectly.
+    #[test]
+    fn a_phase_shorter_than_a_sweep_does_not_require_one_inside_it() {
+        match scan_surface(
+            &healthy(SINCE_SHORT - 500, 0),
+            &seats(),
+            SINCE_SHORT,
+            NOW,
+            BUDGET,
+        ) {
+            Ok(Surface::Verified {
+                swept_in_window, ..
+            }) => assert!(
+                !swept_in_window,
+                "no sweep landed in the window; it must not claim one did"
+            ),
+            other => panic!(
+                "a short phase must fall back to freshness: {:?}",
+                other.err()
+            ),
+        }
+    }
+
+    /// An inventory with no agent has no surface, and that must be a distinct
+    /// answer rather than a pass -- `say_gates` prints it loudly.
+    #[test]
+    fn no_agent_line_is_not_configured_rather_than_verified() {
+        let inv = Inventory {
+            agent: None,
+            ..Default::default()
+        };
+        match surface_fresh(&inv, SINCE_LONG, NOW) {
+            Ok(Surface::NotConfigured) => {}
+            other => panic!("expected NotConfigured, got {:?}", other.err()),
+        }
     }
 }
