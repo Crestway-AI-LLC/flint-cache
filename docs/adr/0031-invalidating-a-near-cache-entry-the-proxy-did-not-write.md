@@ -1,7 +1,29 @@
 # ADR-0031 — invalidating a near-cache entry this proxy did not write
 
-**Status:** **PROPOSED 2026-09-14.** The recommendation is mine and is the part
-to argue with.
+**Status:** **DECIDED 2026-09-14 (Jeff). Option B taken; A and A′ NOT built.**
+The ceiling drops 60 s -> **30 s**, the 5 s default is unchanged, and
+cross-proxy invalidation is deferred without a date.
+
+**His reasoning, which is the part worth keeping**: turning the near-cache on
+is an *informed opt-in to staleness* — D6 makes it opt-in per tenant for
+exactly that reason — so at the 5 s default the window is inside what a
+tenant accepted when it asked for a cache. 60 s was not: a minute of a stale
+entitlement or session is a bug report, and the ceiling exists to bind abuse
+rather than to license that.
+
+**A CORRECTION TO THIS FILE'S OWN COST ESTIMATE.** Fact 1 below says peer
+discovery needs a snapshot wire change. **It does not.** `CPSUBSETS` already
+returns `tenant -> proxies` and the proxy already polls the control plane, so
+discovery is one extra call per poll cycle and a cached map — an hour, no
+wire change, no rolling-upgrade hazard.
+
+**The real cost is the transport, and it is not the invalidation.** A proxy
+binds exactly ONE listener (`main.rs:4370`), the client edge, and it holds
+`admin_digests` — hashes, not plaintext — so it cannot authenticate to a
+peer even on the port it already has. Proxy-to-proxy therefore needs a new
+internal mTLS listener: a port, an inventory key, packaging, security-group
+rules and drills. That is a new operational surface, larger than the feature it
+would carry. Whoever revisits this should start there, not in `cache.rs`.
 
 **Scope:** what invalidates a proxy's near-cache entry when the write did not
 go through that proxy. Not whether the near-cache should exist (ADR-0005 D6),
@@ -96,6 +118,14 @@ having built anything. An interval like that is how a fix acquires a reputation.
 **B is worth taking anyway and immediately**, whatever is decided about A′: the
 ceiling is a number, and 60 s is a long time to serve a stale entitlement. It is
 not a substitute, because lowering a bound is not the same as invalidating.
+
+**TAKEN, and only B.** `DEFAULT_TTL_MAX_MS` is 30 s. The constant carries the
+reason in its own doc comment, because the number is a decision rather than a
+tuning parameter: **this bound IS the cross-client staleness window**, and a
+later reader moving it should know that is what they are moving. A test now
+asserts the DEFAULT ceiling clamps a tenant asking for an hour — previously
+only an explicitly-passed ceiling was covered, so a change to the constant
+failed nothing.
 
 ## Consequences
 

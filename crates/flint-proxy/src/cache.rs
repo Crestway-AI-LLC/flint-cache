@@ -77,12 +77,27 @@ impl Inner {
 /// The most a tenant may set its own near-cache TTL to, unless the operator
 /// says otherwise (`--cache-ttl-max-ms`).
 ///
-/// 60 s rather than unbounded: the TTL is the tenant's accepted staleness AND
-/// its residency in a shared byte budget, so an unbounded value is a way to
-/// occupy the cache at everyone else's expense. A minute is far past any
-/// repeat-read window a cache is for, so the ceiling binds abuse rather than
-/// use.
-pub const DEFAULT_TTL_MAX_MS: u64 = 60_000;
+/// Bounded rather than unbounded: the TTL is the tenant's accepted staleness
+/// AND its residency in a shared byte budget, so an unbounded value is a way
+/// to occupy the cache at everyone else's expense. The ceiling binds abuse
+/// rather than use.
+///
+/// **30 s, lowered from 60 s on 2026-09-14 (Jeff, ADR-0031).** The number is
+/// not arbitrary and it is not a fix. The cross-CLIENT window -- a write
+/// through one proxy is invisible at the tenant's other proxies until the TTL
+/// lapses -- is bounded by exactly this value, and cross-proxy invalidation
+/// was weighed and NOT built: a proxy binds one listener, holds only admin
+/// DIGESTS, and therefore has no authenticated way to reach a peer, so the
+/// feature's real cost is a new internal surface rather than the invalidation
+/// itself.
+///
+/// The reasoning for living with the window, which is the part worth keeping:
+/// **turning the near-cache on is an informed opt-in to staleness** (D6 makes
+/// it opt-in per tenant for exactly that reason), and at the 5 s DEFAULT the
+/// window is inside what a tenant accepted when it asked for a cache. 60 s was
+/// not -- a minute of a stale entitlement or session is a bug report -- and
+/// the ceiling existed to bind abuse, not to license that.
+pub const DEFAULT_TTL_MAX_MS: u64 = 30_000;
 
 pub struct ProxyCache {
     inner: Mutex<Inner>,
@@ -453,13 +468,33 @@ mod tests {
         assert_eq!(c.ttl_for(b"acme"), 10_000);
     }
 
+    /// THE DEFAULT CEILING ITSELF, which nothing covered: the test above it
+    /// passes an explicit ceiling to `with_ceiling`, so a change to the
+    /// constant `ProxyCache::new` uses would not have failed anything.
+    ///
+    /// Asserted as a PROPERTY rather than by comparing the constant to itself:
+    /// a tenant that asks for an hour gets the ceiling, whatever it is, and
+    /// the value is named here so that lowering it further is a deliberate
+    /// edit to a test that says why the number matters (ADR-0031: this bound
+    /// IS the cross-client staleness window).
+    #[test]
+    fn the_default_ceiling_clamps_a_tenant_that_asks_for_an_hour() {
+        let c = ProxyCache::new(5_000, 1 << 20);
+        assert_eq!(c.set_ns_ttl(b"acme", 3_600_000), DEFAULT_TTL_MAX_MS);
+        assert_eq!(c.ttl_for(b"acme"), 30_000, "the ceiling is 30s (ADR-0031)");
+    }
+
     /// THE OPERATOR'S KILL SWITCH OUTRANKS EVERY TENANT. A shared component
     /// has to be turn-off-able without negotiating with everyone on it.
     #[test]
     fn a_global_zero_disables_the_cache_for_a_tenant_that_set_its_own() {
         let c = ProxyCache::new(5_000, 1 << 20);
-        c.set_ns_ttl(b"acme", 30_000);
-        assert_eq!(c.ttl_for(b"acme"), 30_000);
+        // Clearly UNDER the ceiling. This was 30_000, which was comfortably
+        // under the old 60 s ceiling and sits exactly ON the 30 s one -- so
+        // the next reduction would have failed this test for a reason that
+        // has nothing to do with the kill switch it exists to check.
+        c.set_ns_ttl(b"acme", 9_000);
+        assert_eq!(c.ttl_for(b"acme"), 9_000);
         c.configure(0, 1 << 20);
         assert_eq!(c.ttl_for(b"acme"), 0, "the operator's 0 wins");
         c.put(b"acme", b"k", b"v");
