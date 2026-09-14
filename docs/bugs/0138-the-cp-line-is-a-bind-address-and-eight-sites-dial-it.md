@@ -119,6 +119,21 @@ port cannot drift apart. With no `cp-host` the line is used as written, which
 is byte for byte what shipped before: every fleet that exists today is
 co-located and composes exactly what it did.
 
+> **CORRECTED 2026-09-14, same day, by [BUG-0139](0139-cp-host-named-a-machine-that-placement-ignored.md).**
+> The paragraph below claimed eleven, and eleven is what a grep for
+> `inv.cp[0].clone()` and `inv.cp.join` returns. It is not the population.
+> `for seat in &inv.cp` and `inv.cp.iter().enumerate()` match neither, and
+> those are `status`, `status --json`, `verify`, `launch`, `upgrade`,
+> `roll_edge` and the proxy's own CP list — about a dozen more, most of them
+> dials. **Worse, `cp-host` was documented as naming the machine that RUNS
+> the seat and placement never read it**, so declaring it would have spawned
+> the CP on the orchestrator while telling every seat to dial elsewhere.
+> Nothing was live-affected — no inventory declares `cp-host` — but the fix
+> below was incomplete and the key it added did not work as written. The
+> irony is exact: this file's own diagnosis is *a population taken from a
+> convenient syntax rather than from the authority*, and its fix was scoped
+> by a grep.
+
 All eleven uses of `inv.cp` as a destination now go through it — the eight
 argv sites above, and the three that dial from inside flintctl
 (`admin_token`'s memo key, `call_cp`'s retry target, `Roll::new`'s record).

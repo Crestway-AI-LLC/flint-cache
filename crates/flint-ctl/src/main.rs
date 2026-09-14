@@ -1583,6 +1583,22 @@ fn proxy_runner(inv: &Inventory, i: usize) -> Runner {
     }
 }
 
+/// Which machine runs `cp[i]`.
+///
+/// BUG-0139. `cp-host` was added by BUG-0138 meaning *which host runs this
+/// seat*, and placement went on deriving the host from the `cp` line — which
+/// for the wildcard that made `cp-host` necessary always resolves LOCAL. So
+/// `cp 0.0.0.0:7500` plus `cp-host 10.0.0.9` spawned the CP on the
+/// orchestrator while telling every seat to dial 10.0.0.9: a key whose stated
+/// meaning the code did not honour. `proxy_runner` is the shape this should
+/// have had from the start.
+fn cp_runner(inv: &Inventory, i: usize) -> Runner {
+    match inv.cp_hosts.get(i) {
+        Some(h) => runner_for_host(inv, h),
+        None => runner_for(inv, &inv.cp[i]),
+    }
+}
+
 /// The controller serves nothing, so it has no address to derive from.
 fn controller_runner(inv: &Inventory) -> Runner {
     match &inv.controller_host {
@@ -1620,8 +1636,8 @@ fn all_runners(inv: &Inventory) -> Vec<Runner> {
     // seat 2 on a host with neither. The seat started (the spawn is by
     // inventory), which is precisely why the omission was silent until the
     // remote flintctl printed its usage banner.
-    for seat in &inv.cp {
-        push(runner_for(inv, seat));
+    for i in 0..inv.cp.len() {
+        push(cp_runner(inv, i));
     }
     for pair in &inv.pairs {
         for node in pair {
@@ -1660,6 +1676,13 @@ fn all_runners(inv: &Inventory) -> Vec<Runner> {
 /// resolves `is_local_host` true, so the CP runs on the orchestrator and a
 /// LOCAL seat dialling its own loopback reaches it correctly. The wildcard is
 /// wrong exactly when it leaves the box, which is this call.
+/// A host that names no machine: what a seat BINDS to serve every interface.
+/// Extracted so the spawn refusal and the status display cannot drift apart
+/// about what counts as one (BUG-0139).
+fn is_wildcard_host(h: &str) -> bool {
+    h == "0.0.0.0" || h == "::" || h == "[::]" || h.is_empty()
+}
+
 /// The offending `(flag, seat)` if `args` would tell a seat to reach the
 /// control plane at an address that names no machine. Split out from the
 /// refusal so it can be tested without exiting the process.
@@ -1674,8 +1697,7 @@ fn wildcard_cp_target(args: &[String]) -> Option<(String, String)> {
         // `--journal` is overloaded: the agent's is a FILE path. It has no
         // colon, so host_of yields the path itself and never matches here.
         for seat in w[1].split(',') {
-            let h = host_of(seat);
-            if h == "0.0.0.0" || h == "::" || h == "[::]" || h.is_empty() {
+            if is_wildcard_host(host_of(seat)) {
                 return Some((w[0].clone(), seat.to_string()));
             }
         }
@@ -3659,7 +3681,7 @@ fn proxy_args(inv: &Inventory, i: usize) -> Vec<String> {
         {
             let n = inv.cp.len();
             (0..n)
-                .map(|k| inv.cp[(i + k) % n].clone())
+                .map(|k| cp_dial(inv, (i + k) % n))
                 .collect::<Vec<_>>()
                 .join(",")
         },
@@ -3926,7 +3948,7 @@ fn launch(inv: &Inventory, register: bool) {
     // controller is worse: it has no port to lose, so the duplicate LIVES,
     // and the pair gets two supervisors.
     for i in 0..inv.cp.len() {
-        let seat = &inv.cp[i];
+        let seat = &cp_dial(inv, i);
         // Shared with roll_edge. Two spellings of a pidfile name is how the
         // roll came to stop a seat this never started.
         let name = cp_seat_name(inv, i);
@@ -3946,7 +3968,7 @@ fn launch(inv: &Inventory, register: bool) {
         // away. One seat spells it `cp-state` and cp_seat_state returns that,
         // so the single-node path is unchanged.
         if seat_alive(
-            &runner_for(inv, seat),
+            &cp_runner(inv, i),
             "flint-controlplane",
             &cp_seat_state(inv, i),
         ) {
@@ -3977,7 +3999,8 @@ fn launch(inv: &Inventory, register: bool) {
     // So say which case it is. `seat_alive` is the same check used above to
     // decide whether to respawn, and the seat's own stderr is the only place
     // the reason can be.
-    for (i, seat) in inv.cp.iter().enumerate() {
+    for i in 0..inv.cp.len() {
+        let seat = &cp_dial(inv, i);
         if wait_pong(seat, &tls, Duration::from_secs(10)) {
             continue;
         }
@@ -4406,9 +4429,10 @@ fn verify_checks(
     };
 
     head("== control plane");
-    for seat in &inv.cp {
-        let ok = matches!(call(seat, &tls, &["PING"]), Ok(Value::Simple(s)) if s == "PONG");
-        note(ok, "reachable", seat.clone());
+    for i in 0..inv.cp.len() {
+        let seat = cp_dial(inv, i);
+        let ok = matches!(call(&seat, &tls, &["PING"]), Ok(Value::Simple(s)) if s == "PONG");
+        note(ok, "reachable", seat);
     }
 
     head("== pairs: one master each, coherent epochs, one build");
@@ -4980,7 +5004,8 @@ fn status(inv: &Inventory) {
     // stamp, and `upgrade` rolls all five — so the tiers that CHANGE during
     // an upgrade were the tiers nothing could identify.
     let mut controller_rows: Vec<String> = Vec::new();
-    for seat in &inv.cp {
+    for i in 0..inv.cp.len() {
+        let seat = &cp_dial(inv, i);
         let ok = matches!(call(seat, &tls, &["PING"]), Ok(Value::Simple(s)) if s == "PONG");
         let build = match cpinfo_field(seat, &tls, "build:") {
             Ok(Some(b)) => flint_build::display(&b, env!("CARGO_PKG_VERSION")).to_string(),
@@ -5029,7 +5054,7 @@ fn status(inv: &Inventory) {
             }
         }
     }
-    for (i, proxy) in inv.proxies.iter().enumerate() {
+    for i in 0..inv.proxies.len() {
         // The proxy's client port is plaintext (frontend TLS is separate
         // from the internal mesh): probe it without the mesh cert.
         let up = proxy_up(inv, i);
@@ -5041,8 +5066,15 @@ fn status(inv: &Inventory) {
             Ok(None) => "-".into(),
             Err(e) => format!("<unreadable: {e}>"),
         };
+        // BUG-0139: this printed `inv.proxies[i]`, the BIND line, beside an
+        // up/DOWN that `proxy_up` had decided against `proxy_dial` — a
+        // different string. On the playground that meant reporting
+        // `0.0.0.0:7379 up` having actually probed `try.crestwayai.com:7379`,
+        // so the row named an address it never tested and hid the one that
+        // carries the tenant-facing DNS and cert.
         println!(
-            "proxy     {proxy}  {:<6} build {build}",
+            "proxy     {}  {:<6} build {build}",
+            proxy_dial(inv, i),
             if up { "up" } else { "DOWN" }
         );
     }
@@ -5062,7 +5094,17 @@ fn status(inv: &Inventory) {
     // metering/insights/automation) is not part of this repository; without
     // the binary the key simply has nothing to start.
     if let Some(agent) = &inv.agent {
-        println!("agent     metrics http://{agent}/metrics");
+        // BUG-0139: `http://0.0.0.0:9464/metrics` is not a URL anyone can
+        // open. A wildcard `agent` line also means the agent runs HERE —
+        // is_local_host is true for it, so agent_runner placed it on the
+        // orchestrator — which makes loopback both correct and reachable
+        // from wherever this status was run.
+        let shown = if is_wildcard_host(host_of(agent)) {
+            format!("127.0.0.1:{}", port_of(agent))
+        } else {
+            agent.clone()
+        };
+        println!("agent     metrics http://{shown}/metrics");
     }
 }
 
@@ -5143,7 +5185,8 @@ fn status_json(inv: &Inventory) {
     let mut controllers: Vec<String> = Vec::new();
     // Did any CP actually answer? Not "is one configured" — see below.
     let mut answered = false;
-    for (i, seat) in inv.cp.iter().enumerate() {
+    for i in 0..inv.cp.len() {
+        let seat = &cp_dial(inv, i);
         let up = matches!(call(seat, &tls, &["PING"]), Ok(Value::Simple(s)) if s == "PONG");
         let build = cpinfo_field(seat, &tls, "build:");
         let build_err = match &build {
@@ -5588,7 +5631,7 @@ fn add_replica(inv: &Inventory, inventory_path: &str, pair_ref: &str, new: &str)
     must(
         "CPSETPAIR",
         call(
-            &inv.cp[0],
+            &cp_dial(inv, 0),
             &tls,
             &["CPSETPAIR", &pair_idx.to_string(), &members.join(",")],
         ),
@@ -5682,7 +5725,7 @@ fn swap_node(inv: &Inventory, inventory_path: &str, bad: &str, new: &str) {
     must(
         "CPSETPAIR",
         call(
-            &inv.cp[0],
+            &cp_dial(inv, 0),
             &tls,
             &["CPSETPAIR", &pair_idx.to_string(), &new_members.join(",")],
         ),
@@ -6614,7 +6657,7 @@ fn migrate_slots(inv: &Inventory, ns: &str, range: &str, src: &str, dest: &str) 
                 // routes correctly until the row lands, and CPSETSLOT is
                 // idempotent to re-set.
                 match call(
-                    &inv.cp[0],
+                    &cp_dial(inv, 0),
                     &tls,
                     &["CPSETSLOT", ns, &slot.to_string(), &dest_master],
                 ) {
@@ -6732,7 +6775,7 @@ fn decommission_node(
     must(
         "CPSETPAIR",
         call(
-            &inv.cp[0],
+            &cp_dial(inv, 0),
             &tls,
             &["CPSETPAIR", &pair_idx.to_string(), &remaining.join(",")],
         ),
@@ -6992,11 +7035,11 @@ fn upgrade(inv: &Inventory, version_tag: Option<String>, soak_ms: u64, nodes_onl
                  master phase requires"
             );
             for i in 0..inv.cp.len() {
-                let seat = inv.cp[i].clone();
+                let seat = cp_dial(inv, i);
                 let name = cp_seat_name(inv, i);
                 if let Err(e) = stop_seat(
                     inv,
-                    &runner_for(inv, &seat),
+                    &cp_runner(inv, i),
                     &name,
                     "flint-controlplane",
                     &cp_seat_state(inv, i),
@@ -7011,7 +7054,7 @@ fn upgrade(inv: &Inventory, version_tag: Option<String>, soak_ms: u64, nodes_onl
                 }
                 spawn_env(
                     inv,
-                    &runner_for(inv, &seat),
+                    &cp_runner(inv, i),
                     &name,
                     "flint-controlplane",
                     &cp_seat_args(inv, i),
@@ -7387,11 +7430,11 @@ fn roll_edge(inv: &Inventory, envs: &[(String, String)], expect_build: &Option<S
     // instead of a control-plane outage. Each seat must answer AND report
     // the new build before the next one is touched.
     for i in 0..inv.cp.len() {
-        let seat = inv.cp[i].clone();
+        let seat = cp_dial(inv, i);
         let name = cp_seat_name(inv, i);
         if let Err(e) = stop_seat(
             inv,
-            &runner_for(inv, &seat),
+            &cp_runner(inv, i),
             &name,
             "flint-controlplane",
             &cp_seat_state(inv, i),
@@ -7401,7 +7444,7 @@ fn roll_edge(inv: &Inventory, envs: &[(String, String)], expect_build: &Option<S
         }
         spawn_env(
             inv,
-            &runner_for(inv, &seat),
+            &cp_runner(inv, i),
             &name,
             "flint-controlplane",
             &cp_seat_args(inv, i),
@@ -9735,6 +9778,45 @@ mod cp_dial_tests {
             cp_dial_all(&inv),
             "10.0.0.1:7500,10.0.0.2:7501,10.0.0.3:7502"
         );
+    }
+
+    /// THE REGRESSION for BUG-0139. `cp-host` states which machine runs the
+    /// seat, so PLACEMENT has to move with it. It did not: placement derived
+    /// the host from the `cp` line, and for the wildcard that makes `cp-host`
+    /// necessary in the first place that always resolves LOCAL. The result
+    /// was a key whose meaning the code did not honour — the CP spawned on
+    /// the orchestrator while every seat was told to dial somewhere else.
+    #[test]
+    fn cp_host_moves_placement_and_dial_together() {
+        let inv = inv_from(
+            &format!("{SINGLE}ssh-user ec2-user\ncp-host 10.0.0.9\n"),
+            "place",
+        );
+        assert_eq!(cp_dial(&inv, 0), "10.0.0.9:7500");
+        let r = cp_runner(&inv, 0);
+        assert!(
+            matches!(r, Runner::Ssh { .. }),
+            "cp-host names another machine, so the seat belongs there, not here; got {r:?}"
+        );
+    }
+
+    /// The compatibility half, and the reason the spawn refusal is safe to
+    /// apply only to remote spawns: with no `cp-host`, a wildcard `cp` still
+    /// places the seat on the orchestrator, where a loopback dial reaches it.
+    #[test]
+    fn a_wildcard_cp_with_no_cp_host_stays_local() {
+        let inv = inv_from(SINGLE, "stayslocal");
+        assert_eq!(cp_runner(&inv, 0), Runner::Local);
+    }
+
+    #[test]
+    fn wildcard_hosts_are_exactly_those_naming_no_machine() {
+        for h in ["0.0.0.0", "::", "[::]", ""] {
+            assert!(is_wildcard_host(h), "{h:?} names no machine");
+        }
+        for h in ["127.0.0.1", "10.0.0.9", "localhost", "try.crestwayai.com"] {
+            assert!(!is_wildcard_host(h), "{h:?} names a machine");
+        }
     }
 
     fn argv(v: &[&str]) -> Vec<String> {
