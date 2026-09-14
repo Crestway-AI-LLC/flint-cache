@@ -97,7 +97,7 @@ follows this one. They are kept rather than deleted, because what they said
 was true when this was written.
 
 - ~~No test asserts that a future dial site uses `cp_dial`.~~
-  **`tools/cp_dial_sites_drill.sh` now does**, as a source assertion beside
+  **`tools/bind_dial_sites_drill.sh` now does**, as a source assertion beside
   `kill_order`. Only `cp_dial`, `cp_dial_all`, `cp_runner` and
   `cp_seat_args` — the last because it BINDS — may read an element of
   `inv.cp`; collection-level uses are unrestricted. Verified against the tree

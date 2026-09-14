@@ -703,7 +703,13 @@ fn probe_target(inv: &Inventory, i: usize) -> String {
 /// public cert ends the investigation immediately.
 ///
 /// Exercised by `tools/edge_ca_trust_drill.sh`.
-fn proxy_down_help(inv: &Inventory, proxy: &str, dial: &str) -> String {
+fn proxy_down_help(inv: &Inventory, i: usize) -> String {
+    // Both spellings, derived here rather than passed in: this message is the
+    // one place the difference between them is the POINT, and a caller that
+    // has to hold the bind line to build it is a caller that can hand it
+    // somewhere else by mistake (BUG-0141).
+    let proxy = &inv.proxies[i];
+    let dial = proxy_dial(inv, i);
     let mut m = format!("proxy {proxy} (dialled at {dial}) never answered PROXYSTATS within 10s");
     if inv.client_tls {
         // The SAME derivation the dial used, not a second copy of it.
@@ -736,7 +742,7 @@ fn proxy_down_help(inv: &Inventory, proxy: &str, dial: &str) -> String {
     // Checked LAST and only on the dialled host, because it is the only cause
     // here that can be answered from a file rather than guessed at.
     if inv.client_tls {
-        let host = host_of(dial);
+        let host = host_of(&dial);
         match flint_tls::cert_sans(&format!("{}/certs/edge.crt", inv.statedir)) {
             Some(sans) if !sans.iter().any(|s| s == host) => {
                 m.push_str(&format!(
@@ -791,6 +797,27 @@ fn cp_dial_all(inv: &Inventory) -> String {
         .map(|i| cp_dial(inv, i))
         .collect::<Vec<_>>()
         .join(",")
+}
+
+/// The seat name for `proxies[i]` — pidfile, logs, `spawn` and `stop_seat`.
+///
+/// BUG-0141. This was spelled `format!("proxy-{}", port_of(proxy))` in four
+/// places, two of which are the spawn in `launch` and the stop in
+/// `roll_edge`. They agree today. `cp_seat_name` exists because the CP's two
+/// spellings did not, and its comment records what that cost: a stop that
+/// found nothing, reported the process already gone, and then failed
+/// `wait_port_free` because the real seat was alive and holding the port.
+fn proxy_seat_name(inv: &Inventory, i: usize) -> String {
+    format!("proxy-{}", proxy_port(inv, i))
+}
+
+/// The port `proxies[i]` listens on. A port is not an address and cannot
+/// misdirect anything, but reading it still means touching the line, so it
+/// lives here rather than being spelled out at each call site — which keeps
+/// `cp_dial_sites_drill.sh`'s exempt set to functions whose whole job is
+/// deriving something from the proxy line.
+fn proxy_port(inv: &Inventory, i: usize) -> u16 {
+    port_of(&inv.proxies[i])
 }
 
 fn proxy_dial(inv: &Inventory, i: usize) -> String {
@@ -4163,7 +4190,7 @@ fn launch(inv: &Inventory, register: bool) {
     }
 
     // 3. Routing plane.
-    for (i, proxy) in inv.proxies.iter().enumerate() {
+    for i in 0..inv.proxies.len() {
         // The inventory addr's HOST is the bind address (0.0.0.0 serves
         // external clients — the marketplace shape; 127.0.0.1 stays the
         // loopback default). The ADVERTISE address is what the proxy
@@ -4171,42 +4198,37 @@ fn launch(inv: &Inventory, register: bool) {
         // when declared, else the bind line — must match what bootstrap
         // registered.
         if proxy_up(inv, i) {
-            eprintln!("  proxy-{} already up", port_of(proxy));
+            eprintln!("  {} already up", proxy_seat_name(inv, i));
             continue;
         }
         // And again for the routing plane: PROXYSTATS goes unanswered while
         // the proxy is binding and pulling its first CP snapshot.
         if seat_alive(&proxy_runner(inv, i), "flint-proxy", &proxy_dial(inv, i)) {
             eprintln!(
-                "  proxy-{} STARTING (process up, not serving yet) — left alone",
-                port_of(proxy)
+                "  {} STARTING (process up, not serving yet) — left alone",
+                proxy_seat_name(inv, i)
             );
             continue;
         }
         spawn(
             inv,
             &proxy_runner(inv, i),
-            &format!("proxy-{}", port_of(proxy)),
+            &proxy_seat_name(inv, i),
             "flint-proxy",
             &proxy_args(inv, i),
         );
     }
 
-    for (i, proxy) in inv.proxies.iter().enumerate() {
+    for i in 0..inv.proxies.len() {
         // Liveness probe = PROXYSTATS (answered pre-auth); a CP-fed proxy
         // replies -NOAUTH to PING until a tenant authenticates. Plaintext:
         // the client port is not part of the internal mesh.
         let deadline = Instant::now() + Duration::from_secs(10);
-        let dial = proxy_dial(inv, i);
         loop {
             if proxy_up(inv, i) {
                 break;
             }
-            assert!(
-                Instant::now() < deadline,
-                "{}",
-                proxy_down_help(inv, proxy, &dial)
-            );
+            assert!(Instant::now() < deadline, "{}", proxy_down_help(inv, i));
             std::thread::sleep(Duration::from_millis(150));
         }
     }
@@ -4764,8 +4786,11 @@ fn verify_checks(
     }
 
     head("== proxies");
-    for (i, p) in inv.proxies.iter().enumerate() {
-        note(proxy_up(inv, i), "proxy up", p.clone());
+    // BUG-0141: this reported `inv.proxies[i]`, the BIND line, beside a
+    // `proxy_up` decided against `proxy_dial` — a different address. Same
+    // defect BUG-0139 fixed in the `status` row and did not look for here.
+    for i in 0..inv.proxies.len() {
+        note(proxy_up(inv, i), "proxy up", proxy_dial(inv, i));
     }
 
     // The CP's proxy registry must contain exactly the proxies this inventory
@@ -5338,7 +5363,7 @@ fn status_json(inv: &Inventory) {
     out.push_str("  ],\n");
 
     out.push_str("  \"proxies\": [\n");
-    for (i, proxy) in inv.proxies.iter().enumerate() {
+    for i in 0..inv.proxies.len() {
         // BUG-0083: `build: null` means the proxy named no build. A read
         // that failed carries `build_error` instead, so a consumer can tell
         // the two apart -- ADR-0014's status surface is parsed by things
@@ -5350,7 +5375,10 @@ fn status_json(inv: &Inventory) {
         };
         out.push_str(&format!(
             "    {{\"addr\": {}, \"up\": {}, \"build\": {}{build_err}}}{}\n",
-            json_str(proxy),
+            // BUG-0141: `addr` named the BIND line beside an `up` decided
+            // against proxy_dial. Machine-readable output makes that worse
+            // than the human row: a consumer cannot see the discrepancy.
+            json_str(&proxy_dial(inv, i)),
             proxy_up(inv, i),
             build
                 .ok()
@@ -7481,8 +7509,8 @@ fn roll_edge(inv: &Inventory, envs: &[(String, String)], expect_build: &Option<S
     }
 
     eprintln!("== proxies last (clients see one blip, over an already-new fleet)");
-    for (i, proxy) in inv.proxies.iter().enumerate() {
-        let seat = format!("proxy-{}", port_of(proxy));
+    for i in 0..inv.proxies.len() {
+        let seat = proxy_seat_name(inv, i);
         // Identity is the ADVERTISE address: it is what this proxy was
         // started with and is unique per proxy, so the match cannot stray
         // onto a sibling. Same definition as proxy_args uses, or the match
@@ -7494,7 +7522,7 @@ fn roll_edge(inv: &Inventory, envs: &[(String, String)], expect_build: &Option<S
             &seat,
             "flint-proxy",
             &ident,
-            Some(port_of(proxy)),
+            Some(proxy_port(inv, i)),
         ) {
             die_on(&seat, e);
         }

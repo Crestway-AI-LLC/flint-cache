@@ -45,7 +45,8 @@ one topology that would expose it, never writes the wildcard form.
 The pattern is established and this is a mechanical application of it:
 `coproc_dial(inv, i)` and a `coproc-host` key, `coproc_runner` honouring it,
 `families_arg` resolving through it, `coproc_args` keeping the literal
-because it binds. The `cp_dial_sites` drill's shape extends to it directly.
+because it binds. `tools/bind_dial_sites_drill.sh` extends to it directly: a third field with
+its own exempt set.
 
 **Not done here on purpose.** The vector co-processor is ADR-0017 v0.2 work
 with its own fleet story, and changing how proxies are told to reach it is
