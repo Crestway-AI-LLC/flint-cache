@@ -1,8 +1,26 @@
 # ADR-0030 — fleet growth and a tenant's proxy subset
 
-**Status:** **PROPOSED 2026-09-14.** The roadmap records "proxy scale-out for a
-live tenant" as blocked on this decision. Written because the blocker is real;
-the recommendation at the end is mine and is the part to argue with.
+**Status:** **ACCEPTED 2026-09-14 (Jeff)** — the recommendation below was taken,
+with one addition of his that changed where the repair lives: **every shrink is
+an operator action**. `DelProxy` is the only thing that removes a proxy from a
+tenant, and an operator triggers it, so the repair belongs at that moment with
+a human present rather than in a background sweeper that has to notice.
+
+**IMPLEMENTED the same day** in `registry.rs`'s `Mutation::DelProxy`: the hole
+is refilled to the subset's OWN width — deliberately not a stored `k`, because
+there is no stored `k` and the current width is the better answer anyway, so an
+operator who widened a whale by hand keeps that width instead of being silently
+reset. Members are taken from the shuffle-shard ideal so repaired tenants
+spread rather than piling onto whichever proxy sorts first, and an existing
+member is never moved: a retirement costs the connections on the retired proxy
+and no others. A fleet smaller than the width leaves the tenant short, which is
+correct — padding with a duplicate to reach the number would be worse.
+
+Six unit tests, four of which die to a refill that never runs; the two that do
+not are the control (retiring a proxy no tenant holds must change nothing) and
+the too-small-fleet case, whose subject is the no-duplicate property.
+`subset_ratchet_drill` pinned the defect first, went red when this landed, and
+now asserts the fixed behaviour — which is what it was written to do.
 
 **Scope:** what a change in proxy fleet membership does to `tenant.subset`.
 Not the saturation *signal* — that is the sibling question this shares with

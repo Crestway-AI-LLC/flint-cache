@@ -10,11 +10,17 @@
 # empty subset, which the control plane itself calls DRAINED and answers
 # -WRONGPASS from.
 #
-# THIS DRILL PINS THE CURRENT BEHAVIOUR ON PURPOSE. The "stays at 1" assertion
-# below is a defect being held still, not a property being protected: when
-# ADR-0030 is taken it goes RED and tells whoever took it to flip it, rather
-# than passing silently against a fleet that now re-widens. Same reason the
-# roll-record drill in flint-kv-ops asserts its old message.
+# THE RATCHET IS CLOSED (ADR-0030, taken 2026-09-14). This file pinned the
+# defect first and went RED when the fix landed, which is what it was written
+# to do; the assertions below are the flipped ones. `DelProxy` now refills the
+# hole it makes, to the subset's OWN width -- so an operator who widened a
+# whale by hand keeps that width -- taking members from the shuffle-shard
+# ideal so repaired tenants spread instead of piling onto one survivor, and
+# never moving a member it did not have to.
+#
+# Jeff, 2026-09-14: every shrink is an operator action, so the repair belongs
+# at the moment of the retirement, with a human present, rather than in a
+# background sweeper.
 #
 # REGISTRY-LEVEL, DELIBERATELY. No proxies are started and none are needed:
 # the defect is in the registry's mutation logic, CPADDPROXY registers an
@@ -71,43 +77,44 @@ K0=$(count_of acme)
 BEFORE=$(subset_of acme)
 echo "  acme placed on [$BEFORE]"
 
-echo "== retire ONE of the tenant's own proxies"
+echo "== retire ONE of the tenant's own proxies — the hole must be REFILLED"
 VICTIM=$(echo "$BEFORE" | cut -d, -f1)
 SURVIVOR=$(echo "$BEFORE" | cut -d, -f2)
 DEL1=$(cp_ CPDELPROXY "$VICTIM")
 case "$DEL1" in OK*) ;; *) echo "FAIL: CPDELPROXY refused: $DEL1"; exit 1 ;; esac
 sleep 0.5
 K1=$(count_of acme)
-[ "$K1" = "1" ] || { echo "FAIL: expected the subset to shrink to 1, got $K1"; cp_ CPSUBSETS | sed 's/^/  | /'; exit 1; }
-[ "$(subset_of acme)" = "$SURVIVOR" ] || { echo "FAIL: the survivor is not the proxy that was left: $(subset_of acme) vs $SURVIVOR"; exit 1; }
-echo "  acme is down to [$SURVIVOR] — the retired proxy was removed, correctly"
+AFTER=$(subset_of acme)
+[ "$K1" = "2" ] || {
+  echo "FAIL: the tenant is at $K1 after a retirement, not back at 2 — [$AFTER]"
+  echo "      ADR-0030: DelProxy refills the hole it makes. A tenant left"
+  echo "      narrow here is the ratchet, reopened."
+  cp_ CPSUBSETS | sed 's/^/  | /'; exit 1; }
+case ",$AFTER," in *",$VICTIM,"*) echo "FAIL: the retired proxy $VICTIM is still placed"; exit 1 ;; esac
+case ",$AFTER," in *",$SURVIVOR,"*) ;; *) echo "FAIL: the surviving member $SURVIVOR was MOVED, and need not have been: [$AFTER]"; exit 1 ;; esac
+echo "  acme is back to [$AFTER] — refilled from the spare, survivor untouched"
 
-echo "== and nothing re-widens it, though a spare proxy is sitting right there"
-# A third proxy was registered and never used, so re-widening is POSSIBLE and
-# simply does not happen. Without that spare this assertion would be vacuous.
-# CPPROXIES is COMMA-joined, not space-joined: splitting on spaces returned
-# the whole list and the "spare" named the survivor among others.
-SPARE=$(cp_ CPPROXIES | tr -d '\r' | tr ',' '\n' | grep -v "^$" | grep -vx "$SURVIVOR" | head -1)
-[ -n "$SPARE" ] || { echo "FAIL: no spare proxy in the fleet, so 'does not re-widen' is untestable here"; exit 1; }
-sleep 3
-K2=$(count_of acme)
-if [ "$K2" != "1" ]; then
-  echo "FAIL (AND THIS MAY BE GOOD NEWS): the subset moved to $K2 after the retirement."
-  echo "      This drill PINS the ADR-0030 ratchet — a tenant that loses a proxy"
-  echo "      stays shrunk. If something now re-widens it, that behaviour is the"
-  echo "      fix and THIS ASSERTION IS WHAT NEEDS UPDATING, not the fleet."
-  cp_ CPSUBSETS | sed 's/^/  | /'
-  exit 1
-fi
-echo "  still [$(subset_of acme)] after 3s, with $SPARE idle and eligible"
+echo "== a fleet too small to cover the width leaves it short, and does not duplicate"
+# Retire another of ITS OWN: two proxies are now gone, one remains, and the
+# tenant wants two. Short is the correct answer -- inventing a duplicate to
+# reach the number would be worse than being honest about the fleet.
+NEXT=$(echo "$AFTER" | cut -d, -f1)
+DEL2=$(cp_ CPDELPROXY "$NEXT")
+case "$DEL2" in OK*) ;; *) echo "FAIL: CPDELPROXY refused: $DEL2"; exit 1 ;; esac
+sleep 0.5
+K2=$(count_of acme); S2=$(subset_of acme)
+[ "$K2" = "1" ] || { echo "FAIL: one proxy left in the fleet but the tenant reports $K2 — [$S2]"; exit 1; }
+UNIQ=$(echo "$S2" | tr ',' '\n' | sort -u | grep -c .)
+[ "$UNIQ" = "1" ] || { echo "FAIL: the refill duplicated a proxy: [$S2]"; exit 1; }
+echo "  one proxy left, acme on [$S2] — short and honest rather than padded"
 
-echo "== the ratchet's terminus: retire the last one and the tenant is DRAINED"
-DEL=$(cp_ CPDELPROXY "$SURVIVOR")
-case "$DEL" in OK*) ;; *) echo "FAIL: CPDELPROXY refused: $DEL"; exit 1 ;; esac
+echo "== and a fleet with NO proxies cannot serve anyone"
+DEL3=$(cp_ CPDELPROXY "$S2")
+case "$DEL3" in OK*) ;; *) echo "FAIL: CPDELPROXY refused: $DEL3"; exit 1 ;; esac
 sleep 0.5
 K3=$(count_of acme)
-[ "$K3" = "0" ] || { echo "FAIL: expected an empty subset, got $K3"; exit 1; }
-echo "  acme now has NO proxies — the state the control plane answers -WRONGPASS from,"
-echo "  reached by attrition rather than by any decision about this tenant"
+[ "$K3" = "0" ] || { echo "FAIL: expected an empty subset on an empty fleet, got $K3"; exit 1; }
+echo "  acme has no proxies, because the FLEET has none — a state an operator"
+echo "  reached deliberately, not one attrition walked it into"
 
-echo "PASS: the subset shrank on retirement, stayed shrunk with a spare available, and reached empty — ADR-0030's ratchet, pinned"
+echo "PASS: a retirement refills the hole it makes, keeps the tenant's own width, moves no member it need not, and goes short only when the fleet is genuinely too small"

@@ -262,8 +262,61 @@ impl RegistryState {
                 // A retired proxy must not linger in any tenant's subset:
                 // leaving it there is the same trap one level down, and the
                 // tenant would keep a placement slot pointing at nothing.
+                //
+                // AND THE HOLE IS REFILLED (ADR-0030). Removing without
+                // replacing made fleet membership reach subsets in ONE
+                // direction -- the one that degrades. A tenant that lost a
+                // proxy ran narrower for good, repeated retirements walked it
+                // down to an empty subset, and an empty subset is a tenant
+                // answering -WRONGPASS everywhere: an outage reached by
+                // attrition rather than by any decision about that tenant.
+                // Nothing re-widened it but an operator noticing and running
+                // CPSETSUBSET.
+                //
+                // THE TARGET IS THE SUBSET'S OWN LENGTH BEFORE THE REMOVAL,
+                // and deliberately not a stored k -- there is no stored k, and
+                // the current width is the better answer anyway: an operator
+                // who widened this tenant by hand for whale isolation keeps
+                // that width instead of being silently reset to the default.
+                //
+                // EXISTING MEMBERS ARE NEVER MOVED. Only the hole is filled,
+                // so a retirement costs the connections on the retired proxy
+                // and no others. Re-sharding the whole subset would preserve
+                // the same isolation property and move live connections for
+                // tenants that had nothing wrong with them.
+                let proxies = &self.proxies;
                 for t in self.tenants.values_mut() {
+                    let want = t.subset.len();
                     t.subset.retain(|p| p != &a);
+                    if t.subset.len() == want {
+                        continue;
+                    }
+                    // The ideal placement over the fleet as it now stands.
+                    // Taking the members not already held keeps the
+                    // shuffle-shard SPREAD -- without it every repaired tenant
+                    // piles onto whichever proxy sorts first, which is the
+                    // isolation property inverted.
+                    for c in shuffle_shard(&t.name, proxies, want) {
+                        if t.subset.len() >= want {
+                            break;
+                        }
+                        if !t.subset.contains(&c) {
+                            t.subset.push(c);
+                        }
+                    }
+                    // The ideal set can overlap what is already held, so widen
+                    // the search rather than leave a tenant short on a fleet
+                    // that could cover it. A fleet SMALLER than `want` leaves
+                    // it short, correctly: there is nothing to fill from.
+                    for c in proxies {
+                        if t.subset.len() >= want {
+                            break;
+                        }
+                        if !t.subset.contains(c) {
+                            t.subset.push(c.clone());
+                        }
+                    }
+                    t.subset.sort();
                 }
             }
             Mutation::AddPair { nodes, range } => {
@@ -591,5 +644,167 @@ mod family_tests {
         let r: RegistryState = serde_json::from_str(json).expect("deserialize pre-family state");
         assert!(r.families.is_empty());
         assert_eq!(r.families_spec(), "");
+    }
+}
+
+/// ADR-0030's refill. Every test here is a state the ratchet used to reach
+/// and cannot any more; the LAST one is the control, because a refill that
+/// fires unconditionally would satisfy all the others and is a different bug.
+#[cfg(test)]
+mod adr_0030_refill_tests {
+    use super::*;
+
+    fn fleet(n: usize) -> RegistryState {
+        let mut r = RegistryState::default();
+        for i in 0..n {
+            r.apply(Mutation::AddProxy(format!("10.0.0.{i}:7379")));
+        }
+        r
+    }
+
+    fn with_tenant(r: &mut RegistryState, name: &str, k: usize) {
+        let subset = shuffle_shard(name, &r.proxies, k);
+        r.apply(Mutation::AddTenant {
+            name: name.to_string(),
+            token: format!("tok-{name}"),
+            ns: name.to_string(),
+            subset,
+        });
+    }
+
+    fn subset(r: &RegistryState, name: &str) -> Vec<String> {
+        r.tenants
+            .get(name)
+            .map(|t| t.subset.clone())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn a_retirement_refills_the_hole_it_makes() {
+        let mut r = fleet(4);
+        with_tenant(&mut r, "acme", 2);
+        let before = subset(&r, "acme");
+        assert_eq!(before.len(), 2);
+        r.apply(Mutation::DelProxy(before[0].clone()));
+        let after = subset(&r, "acme");
+        assert_eq!(
+            after.len(),
+            2,
+            "the tenant must come back to its width: {after:?}"
+        );
+        assert!(
+            !after.contains(&before[0]),
+            "the retired proxy is still placed"
+        );
+        assert!(
+            after.contains(&before[1]),
+            "the surviving member was moved, and need not have been"
+        );
+    }
+
+    /// The width that is restored is the tenant's OWN, not the default: an
+    /// operator who widened a whale by hand must not be silently narrowed.
+    #[test]
+    fn an_operator_widened_tenant_keeps_its_own_width() {
+        let mut r = fleet(5);
+        with_tenant(&mut r, "whale", 4);
+        let before = subset(&r, "whale");
+        assert_eq!(before.len(), 4);
+        r.apply(Mutation::DelProxy(before[2].clone()));
+        assert_eq!(
+            subset(&r, "whale").len(),
+            4,
+            "a hand-widened tenant was reset toward the default"
+        );
+    }
+
+    /// The terminus the ratchet used to reach. Retiring every proxy a tenant
+    /// holds, one at a time, must not walk it down to -WRONGPASS while the
+    /// fleet still has proxies to serve from.
+    #[test]
+    fn repeated_retirements_do_not_walk_a_tenant_to_empty() {
+        let mut r = fleet(5);
+        with_tenant(&mut r, "acme", 2);
+        for _ in 0..3 {
+            let s = subset(&r, "acme");
+            assert_eq!(s.len(), 2, "narrowed mid-sequence: {s:?}");
+            r.apply(Mutation::DelProxy(s[0].clone()));
+        }
+        let end = subset(&r, "acme");
+        assert_eq!(
+            end.len(),
+            2,
+            "walked down to {end:?} with proxies still in the fleet"
+        );
+    }
+
+    /// Refill SPREADS. Without the shuffle-shard step every repaired tenant
+    /// lands on whichever proxy sorts first, which is the isolation property
+    /// shuffle-sharding exists for, inverted.
+    #[test]
+    fn refill_does_not_pile_every_tenant_onto_one_survivor() {
+        let mut r = fleet(6);
+        for n in ["a", "b", "c", "d", "e", "f", "g", "h"] {
+            with_tenant(&mut r, n, 2);
+        }
+        let victim = r.proxies[0].clone();
+        r.apply(Mutation::DelProxy(victim.clone()));
+        let mut counts = std::collections::HashMap::new();
+        for t in r.tenants.values() {
+            assert!(!t.subset.contains(&victim));
+            // WIDTH FIRST, and it is what makes this test die to a refill that
+            // never runs. Without it the spread assertion holds vacuously --
+            // no tenant gains anything, so nothing piles anywhere, and the
+            // mutant reaches the same answer by a different path.
+            assert_eq!(
+                t.subset.len(),
+                2,
+                "{} was left narrow: {:?}",
+                t.name,
+                t.subset
+            );
+            for p in &t.subset {
+                *counts.entry(p.clone()).or_insert(0usize) += 1;
+            }
+        }
+        let max = counts.values().copied().max().unwrap_or(0);
+        let total: usize = counts.values().sum();
+        assert!(max < total, "every tenant landed on one proxy: {counts:?}");
+    }
+
+    /// A fleet smaller than the width leaves the tenant short, correctly --
+    /// there is nothing to fill from, and inventing a duplicate would be worse.
+    #[test]
+    fn a_fleet_too_small_leaves_it_short_rather_than_duplicating() {
+        let mut r = fleet(2);
+        with_tenant(&mut r, "acme", 2);
+        r.apply(Mutation::DelProxy(r.proxies[0].clone()));
+        let s = subset(&r, "acme");
+        assert_eq!(s.len(), 1, "expected one, got {s:?}");
+        let mut uniq = s.clone();
+        uniq.dedup();
+        assert_eq!(uniq.len(), s.len(), "the refill duplicated a proxy: {s:?}");
+    }
+
+    /// THE CONTROL. Everything above is satisfied by a refill that runs on
+    /// every mutation and re-widens tenants nobody touched. Retiring a proxy
+    /// NO tenant holds must leave every subset byte-identical.
+    #[test]
+    fn retiring_an_unused_proxy_changes_no_subset() {
+        let mut r = fleet(4);
+        with_tenant(&mut r, "acme", 2);
+        let before = subset(&r, "acme");
+        let spare = r
+            .proxies
+            .iter()
+            .find(|p| !before.contains(p))
+            .expect("a spare")
+            .clone();
+        r.apply(Mutation::DelProxy(spare));
+        assert_eq!(
+            subset(&r, "acme"),
+            before,
+            "an unrelated retirement moved a tenant"
+        );
     }
 }
