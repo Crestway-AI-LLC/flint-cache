@@ -92,10 +92,27 @@ pass.
 
 ## Not established
 
-- **No test asserts that a future dial site uses `cp_dial`.** The conversion
-  is complete as of this commit and nothing stops the next `for seat in
-  &inv.cp` from reintroducing it. A source-level check is possible and was
-  not written; the honest position is that this rests on review.
-- Whether any OTHER inventory key is read by one subsystem and ignored by
-  another. `cp` and `proxy` now agree; `agent` is audited; `controller-host`,
-  `backup-host` and the coproc lines are not.
+Both bullets that stood here have since been answered, in the commit that
+follows this one. They are kept rather than deleted, because what they said
+was true when this was written.
+
+- ~~No test asserts that a future dial site uses `cp_dial`.~~
+  **`tools/cp_dial_sites_drill.sh` now does**, as a source assertion beside
+  `kill_order`. Only `cp_dial`, `cp_dial_all`, `cp_runner` and
+  `cp_seat_args` — the last because it BINDS — may read an element of
+  `inv.cp`; collection-level uses are unrestricted. Verified against the tree
+  as it stood at BUG-0138, where it names all thirteen sites this bug fixed,
+  and carrying a positive control that injects `for seat in &inv.cp` into
+  `status()` and requires the scan to catch it.
+- ~~Whether any OTHER inventory key is read by one subsystem and ignored by
+  another.~~ **Swept, and the sweep is complete for address-bearing keys.**
+  `agent` is clean: its address is only dialled by flintctl itself, bound by
+  the agent, or used to route the agent's own placement from that same
+  string, so no path hands it to a different machine. `controller` is a
+  boolean with no address and `controller-host` is honoured by
+  `controller_runner`. `backup-to` is a path or `s3://` URL, not an address,
+  and `backup-host` is honoured. **`coproc` carries the same shape and is
+  filed as [BUG-0140](0140-the-coproc-line-is-a-bind-address-handed-to-every-proxy.md)**
+  — bind in `coproc_args`, dial in `families_arg` which hands it to every
+  proxy, and no `coproc-host`. It is latent: no generator emits a `coproc`
+  line at all, and its only writer resolves the host by hand.
