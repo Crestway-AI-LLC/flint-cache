@@ -1,4 +1,4 @@
-# BUG-0139 — the capacity loop's last step is unarmed on every fleet flintctl builds
+# BUG-0142 — the capacity loop's last step is unarmed on every fleet flintctl builds
 
 **Status:** OPEN — found 2026-09-14 while building `expand_fill_drill.sh`, the
 drill for the seam between `expand` and rebalancing. Not fixed here: arming it
