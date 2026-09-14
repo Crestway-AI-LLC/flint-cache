@@ -44,6 +44,81 @@ echo "== tenant on token v1: write + read work"
 [ "$(a tok-v1 GET k)" = "hello" ] || { echo "FAIL: v1 read"; exit 1; }
 echo "  v1 serves"
 
+echo "== hold a connection OPEN across the rotation (M3 exit: zero DROPPED connections)"
+# THE CLAUSE'S LETTER, which everything below this file already covered in
+# substance and not in form. M3's exit says "token rotation completes with
+# zero dropped connections". Every other assertion here calls `a()`, which is
+# a fresh `valkey-cli` process and therefore a fresh connection -- so they
+# prove AUTHENTICATION stays continuous across the rotation, which is the
+# valuable half, and say nothing about a connection that was already open.
+# Rewording the criterion to match the tooling was the alternative and was
+# refused: M3 is a CLOSED milestone, and editing a met exit to fit the drill
+# is how an exit stops meaning anything (ADR-0043 makes the same argument).
+#
+# A RAW SOCKET, not valkey-cli, and that is the whole point. A client that
+# reconnects on error would paper over exactly the failure being tested and
+# report a pass; this one holds one fd, never retries, and a server-side FIN
+# arrives as an empty read that its reader raises on.
+HELD=$FLINT_DRILL_ROOT/flint-rot-held
+rm -f "$HELD-ready" "$HELD-go" "$HELD-log"
+python3 - "$HELD" >"$HELD-log" 2>&1 <<'HELDPY' &
+import os, socket, sys, time
+root = sys.argv[1]
+def resp(*a):
+    return f"*{len(a)}\r\n".encode() + b"".join(f"${len(x)}\r\n{x}\r\n".encode() for x in a)
+def rd(s):
+    b = b""
+    while b"\r\n" not in b:
+        c = s.recv(4096)
+        if not c:
+            raise OSError("peer closed the connection")
+        b += c
+    return b
+s = socket.create_connection(("127.0.0.1", 6323), timeout=10)
+s.settimeout(10)
+s.sendall(resp("AUTH", "tok-v1")); rd(s)
+s.sendall(resp("GET", "k"))
+if b"hello" not in rd(s):
+    print("HELD-PRE-FAIL: the held connection did not serve BEFORE the rotation")
+    sys.exit(1)
+open(root + "-ready", "w").close()
+t0 = time.time()
+while not os.path.exists(root + "-go"):
+    if time.time() - t0 > 30:
+        print("HELD-TIMEOUT: the rotation never signalled")
+        sys.exit(1)
+    time.sleep(0.1)
+# THE ASSERTION. Same socket, no re-AUTH, after the rotation. A server-side
+# drop arrives here as an empty read, which `rd` raises on rather than
+# returning as a short reply.
+try:
+    s.sendall(resp("GET", "k")); r = rd(s)
+except OSError as e:
+    print(f"HELD-DROPPED: {e}")
+    sys.exit(1)
+if b"hello" not in r:
+    print(f"HELD-BAD-REPLY: {r[:60]!r}")
+    sys.exit(1)
+print("HELD-OK")
+# POSITIVE CONTROL. Everything above is satisfied by a checker that cannot
+# tell a live socket from a dead one, so kill this one and require the SAME
+# code path to report it. This proves the detector, not the product.
+s.close()
+try:
+    s.sendall(resp("GET", "k")); rd(s)
+    print("CONTROL-FAILED-TO-FAIL: a closed socket read as serving")
+    sys.exit(1)
+except OSError:
+    print("CONTROL-OK")
+HELDPY
+HELD_PID=$!
+for _ in $(seq 1 100); do [ -f "$HELD-ready" ] && break; sleep 0.1; done
+[ -f "$HELD-ready" ] || {
+  echo "FAIL: the held connection never authenticated BEFORE the rotation, so"
+  echo "      this arm would have tested nothing. Its output:"
+  sed 's/^/  | /' "$HELD-log" 2>/dev/null; kill "$HELD_PID" 2>/dev/null; exit 1; }
+echo "  one connection open and serving on tok-v1, held across what follows"
+
 echo "== rotate to v2: BOTH tokens authenticate (zero downtime)"
 R=$(valkey-cli -p 7550 CPROTATETOKEN acme tok-v2)
 echo "  $R"
@@ -52,6 +127,23 @@ sleep 1.2   # let the snapshot push carry the new token set
 [ "$(a tok-v2 GET k)" = "hello" ] || { echo "FAIL: NEW token v2 not accepted after rotate"; exit 1; }
 [ "$(a tok-v1 GET k)" = "hello" ] || { echo "FAIL: OLD token v1 stopped working (downtime!)"; exit 1; }
 echo "  v1 AND v2 both serve — no downtime"
+
+# THE HELD CONNECTION, now that the rotation has completed.
+touch "$HELD-go"
+wait "$HELD_PID" 2>/dev/null; HELD_RC=$?
+if [ "$HELD_RC" != 0 ] || ! grep -q "HELD-OK" "$HELD-log"; then
+  echo "FAIL: a connection established BEFORE the rotation did not survive it."
+  echo "      M3's exit says rotation completes with ZERO DROPPED CONNECTIONS;"
+  echo "      re-authenticating clients passing is not that claim."
+  sed 's/^/  | /' "$HELD-log" 2>/dev/null; exit 1
+fi
+grep -q "CONTROL-OK" "$HELD-log" || {
+  echo "FAIL: the held-connection check could not fail. Its own control -- close"
+  echo "      the socket and require the same read path to report it -- did not"
+  echo "      fire, so the PASS above describes the checker, not the product."
+  sed 's/^/  | /' "$HELD-log" 2>/dev/null; exit 1; }
+echo "  the pre-rotation connection served afterwards on the SAME socket, no re-AUTH"
+echo "  and its control confirms a dead socket would have been caught"
 
 echo "== per-version usage: proxy counts AUTHs per token"
 # Drive some traffic on each token, then read the counters.
