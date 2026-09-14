@@ -1888,13 +1888,35 @@ fn spawn(inv: &Inventory, r: &Runner, name: &str, bin: &str, args: &[String]) {
 /// deliberate: `upgrade` passes FLINT_BUILD_VERSION here and then asserts the
 /// seat reports it, so an inventory line that could override it would make
 /// that assertion prove nothing.
+/// The seat name for the pair node serving `port` — pidfile, log, and the
+/// ident every stop and liveness check matches on.
+///
+/// Spelled by hand in nine places before this, and its data dir in eight
+/// more. They agreed. `cp_seat_name` exists because the CP's two spellings
+/// did not, and its comment records the cost: a stop that found nothing,
+/// reported the process already gone, then failed `wait_port_free` because
+/// the real seat was alive and holding the port. `proxy_seat_name` (BUG-0141)
+/// applied that lesson to the proxy line; this is the last seat kind without
+/// one.
+fn node_seat_name(port: u16) -> String {
+    format!("node-{port}")
+}
+
+/// The data dir for that node. It is the seat name under the statedir, and
+/// saying so here is the point: the two were written out separately at every
+/// call site, so nothing tied the directory to the seat it belongs to. The
+/// CP deliberately differs (`cp` vs `cp-state`); a node's do not.
+fn node_data_dir(statedir: &str, port: u16) -> String {
+    format!("{statedir}/{}", node_seat_name(port))
+}
+
 fn spawn_node(inv: &Inventory, addr: &str, args: &[String], extra: &[(String, String)]) {
     let mut envs = inv.node_env.clone();
     envs.extend(extra.iter().cloned());
     spawn_env(
         inv,
         &runner_for(inv, addr),
-        &format!("node-{}", port_of(addr)),
+        &node_seat_name(port_of(addr)),
         "flint-server",
         args,
         &envs,
@@ -1938,22 +1960,23 @@ fn mark_reseed_node(inv: &Inventory, r: &Runner, port: u16, why: &str) -> Result
             format!("{}/flintctl", inv.bins),
             "host-mark-reseed".into(),
             inv.statedir.clone(),
-            format!("node-{port}"),
+            node_seat_name(port),
             why.to_string(),
         ];
         let out = r
             .output(&argv)
-            .map_err(|e| format!("mark-reseed node-{port} on {}: {e}", r.label()))?;
+            .map_err(|e| format!("mark-reseed {} on {}: {e}", node_seat_name(port), r.label()))?;
         if !out.status.success() {
             return Err(format!(
-                "mark-reseed node-{port} on {}: {}",
+                "mark-reseed {} on {}: {}",
+                node_seat_name(port),
                 r.label(),
                 String::from_utf8_lossy(&out.stderr).trim()
             ));
         }
         return Ok(());
     }
-    local_mark_reseed(&inv.statedir, &format!("node-{port}"), why)
+    local_mark_reseed(&inv.statedir, &node_seat_name(port), why)
 }
 
 /// Same name discipline as local_wipe_node: this runs as root over ssh, so a
@@ -3386,7 +3409,7 @@ fn start_pair_nodes(inv: &Inventory, pair: &[String], gi: usize) {
         // the one report that works when this flintctl and that seat are on
         // different machines.
         if let Some(role) = &roles[i] {
-            eprintln!("  node-{port} already up ({role})");
+            eprintln!("  {} already up ({role})", node_seat_name(port));
             continue;
         }
         // Below the dial there is still a real window: from exec until the
@@ -3411,9 +3434,12 @@ fn start_pair_nodes(inv: &Inventory, pair: &[String], gi: usize) {
         if seat_alive(
             &runner_for(inv, addr),
             "flint-server",
-            &format!("{d}/node-{port}"),
+            &node_data_dir(d, port),
         ) {
-            eprintln!("  node-{port} STARTING (process up, not serving yet) — left alone");
+            eprintln!(
+                "  {} STARTING (process up, not serving yet) — left alone",
+                node_seat_name(port)
+            );
             continue;
         }
         let replica_of = match &live_master {
@@ -3433,7 +3459,8 @@ fn start_pair_nodes(inv: &Inventory, pair: &[String], gi: usize) {
                     &format!("superseded copy rejoining the lineage held by {m}"),
                 ) {
                     die(&format!(
-                        "marking node-{port} for re-seed before rejoin: {e}"
+                        "marking {} for re-seed before rejoin: {e}",
+                        node_seat_name(port)
                     ));
                 }
                 Some(m.clone())
@@ -3450,7 +3477,7 @@ fn start_pair_nodes(inv: &Inventory, pair: &[String], gi: usize) {
             "--engine".into(),
             "rocks".into(),
             "--data-dir".into(),
-            format!("{d}/node-{port}"),
+            node_data_dir(d, port),
             "--journal".into(),
             cp.clone(),
         ];
@@ -3847,13 +3874,12 @@ fn backup_args(inv: &Inventory) -> Option<Vec<String>> {
         .map(|p| p.join(","))
         .collect::<Vec<_>>()
         .join(";");
-    let cp_state = if inv.cp.len() == 1 {
-        format!("{d}/cp-state")
-    } else {
-        // Multi-seat CP: the file is Raft-replicated; seat 1's copy is as
-        // legitimate as any, and the manifest records which one was taken.
-        format!("{d}/cp-state-n1")
-    };
+    // Seat 0's state dir, whatever it is called at this seat count —
+    // `cp_seat_state` owns that, and this had its own copy of the same
+    // if/else until 2026-09-14. Seat 1 by choice, not by accident: the file
+    // is Raft-replicated, so its copy is as legitimate as any, and the
+    // manifest records which one was taken.
+    let cp_state = cp_seat_state(inv, 0);
     let mut args = vec![
         "schedule".to_string(),
         "--pairs".into(),
@@ -5639,7 +5665,7 @@ fn add_replica(inv: &Inventory, inventory_path: &str, pair_ref: &str, new: &str)
         "--engine".into(),
         "rocks".into(),
         "--data-dir".into(),
-        format!("{d}/node-{port}"),
+        node_data_dir(d, port),
         "--journal".into(),
         cp_dial(inv, 0),
         "--replica-of".into(),
@@ -5728,7 +5754,7 @@ fn swap_node(inv: &Inventory, inventory_path: &str, bad: &str, new: &str) {
         "--engine".into(),
         "rocks".into(),
         "--data-dir".into(),
-        format!("{d}/node-{port}"),
+        node_data_dir(d, port),
         "--journal".into(),
         cp_dial(inv, 0),
         "--replica-of".into(),
@@ -5767,11 +5793,7 @@ fn swap_node(inv: &Inventory, inventory_path: &str, bad: &str, new: &str) {
             &["CPSETPAIR", &pair_idx.to_string(), &new_members.join(",")],
         ),
     );
-    kill_pidfile(
-        inv,
-        &runner_for(inv, bad),
-        &format!("node-{}", port_of(bad)),
-    );
+    kill_pidfile(inv, &runner_for(inv, bad), &node_seat_name(port_of(bad)));
 
     // Persist + reroll the controller onto the new membership.
     let raw = std::fs::read_to_string(inventory_path).expect("inventory");
@@ -6327,9 +6349,9 @@ fn roll_node(
     stop_seat(
         inv,
         &runner_for(inv, addr),
-        &format!("node-{port}"),
+        &node_seat_name(port),
         "flint-server",
-        &format!("{d}/node-{port}"),
+        &node_data_dir(d, port),
         Some(port),
     )?;
     if wipe {
@@ -6360,7 +6382,7 @@ fn roll_node(
         "--engine".into(),
         "rocks".into(),
         "--data-dir".into(),
-        format!("{d}/node-{port}"),
+        node_data_dir(d, port),
         "--journal".into(),
         cp_dial(inv, 0),
         "--replica-of".into(),
@@ -6819,11 +6841,7 @@ fn decommission_node(
     );
     eprintln!("  draining {drain_ms}ms for proxies to route off {addr} (still serving)");
     std::thread::sleep(Duration::from_millis(drain_ms));
-    kill_pidfile(
-        inv,
-        &runner_for(inv, addr),
-        &format!("node-{}", port_of(addr)),
-    );
+    kill_pidfile(inv, &runner_for(inv, addr), &node_seat_name(port_of(addr)));
     let raw = std::fs::read_to_string(inventory_path).expect("inventory");
     let updated = raw.replace(
         &format!("pair {}", members.join(",")),
@@ -8025,9 +8043,9 @@ fn main() {
             match stop_seat(
                 &inv,
                 &runner_for(&inv, addr),
-                &format!("node-{port}"),
+                &node_seat_name(port),
                 "flint-server",
-                &format!("{d}/node-{port}"),
+                &node_data_dir(d, port),
                 Some(port),
             ) {
                 Ok(()) => println!("killed {addr}"),
@@ -8051,9 +8069,9 @@ fn main() {
             match stall_seat(
                 &inv,
                 &runner_for(&inv, addr),
-                &format!("node-{port}"),
+                &node_seat_name(port),
                 "flint-server",
-                &format!("{d}/node-{port}"),
+                &node_data_dir(d, port),
                 ms,
             ) {
                 Ok(()) => println!("stalled {addr} for {ms}ms, resumed"),
