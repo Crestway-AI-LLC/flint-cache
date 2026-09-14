@@ -208,7 +208,7 @@ _gate_prune_runs 20
 # five other drills writing to it.
 CORE_EXCLUSIVE="${FLINT_CORE_EXCLUSIVE:-disk_pressure disk_selffill evictable_pressure}"
 
-CORE="${FLINT_CORE_ORDER:-kill_order bind_dial_sites restart repl kill_release failover proxy slot_migrate slot_map rebalance_execute expand_fill
+CORE="${FLINT_CORE_ORDER:-kill_order bind_dial_sites restart repl kill_release failover proxy slot_migrate slot_map rebalance_execute expand_fill subset_ratchet near_cache_cross_client
       bloom ns_escape coproc_cred coproc_channel coproc_family family_route family_route_cp coproc_forward coproc_budget coproc_exempt coproc_vec coproc_vec_tls coproc_vec_rebuild
       tenant_quota token_rotation cert_reload_fleet controlplane_ha cp_kill_datapath
       decommission config_file federation_plumbing disk_pressure disk_selffill evictable_pressure ingest_saturation ctl_error
