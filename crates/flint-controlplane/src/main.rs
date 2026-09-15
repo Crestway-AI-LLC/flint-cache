@@ -249,13 +249,29 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
             let Ok(mut st) = shared.state.lock() else {
                 return err("state lock");
             };
-            let Some(p) = st.pairs.get_mut(idx) else {
-                return err("no such pair index");
+            // Sorted, as CPADDPAIR is (BUG-0065's root fix): a repoint that
+            // wrote an unsorted vector would let a later CPADDPAIR of the same
+            // members past the `contains` dedupe as a second pair.
+            let (old, members) = {
+                let Some(p) = st.pairs.get_mut(idx) else {
+                    return err("no such pair index");
+                };
+                let mut members: Vec<String> = nodes.split(',').map(String::from).collect();
+                members.sort();
+                (std::mem::replace(p, members.clone()), members)
             };
-            *p = nodes.split(',').map(String::from).collect();
+            // BOTH copies. `st.leases` is the durable record and `lf.entries`
+            // is the fast mirror CPLEASE actually reads on its hot path, so
+            // migrating only the first leaves the single-node control plane
+            // answering out of a row this repoint made stale (BUG-0151).
+            crate::tenant::repoint_lease_row(&mut st.leases, &old, &members);
             match st.commit() {
                 Ok(_) => {}
                 Err(e) => return err(&format!("persist: {e}")),
+            }
+            drop(st);
+            if let Ok(mut lf) = shared.leases.lock() {
+                crate::tenant::repoint_lease_row(&mut lf.entries, &old, &members);
             }
             shared.changed.notify_all();
             ok()

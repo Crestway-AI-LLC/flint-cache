@@ -465,6 +465,34 @@ pub fn lease_row_index(rows: &[(Vec<String>, String, u64)], addr: &str) -> Optio
         .position(|(m, _, _)| m.iter().any(|x| x == addr))
 }
 
+/// Move a pair's lease row onto its new membership, for BOTH control planes.
+///
+/// BUG-0151: lease rows are found by [`lease_row_index`], which keys on the
+/// ADDRESS. `CPSETPAIR` replaced a pair's members and migrated nothing, so a
+/// member added by a repoint was unfindable: the next `CPFENCE` of that member
+/// matched no row and pushed a SECOND one, and `CPLEASE` — which answers OK
+/// when the FIRST row containing the caller names it as master — then answered
+/// OK to the displaced incumbent AND to the freshly fenced master at once.
+/// That is the state the fencing record exists to make impossible, and
+/// `tools/lease_after_repoint_drill.sh` reached it through the product with an
+/// ordinary sequence: register a pair, adopt a master, swap a member, promote
+/// the new one.
+///
+/// The row is located by any member it had BEFORE the change, which is the
+/// only handle that still works at that moment. Returns whether a row moved —
+/// a pair that never held one is the ordinary case, not a failure.
+pub fn repoint_lease_row(
+    rows: &mut [(Vec<String>, String, u64)],
+    old_members: &[String],
+    new_members: &[String],
+) -> bool {
+    let Some(i) = old_members.iter().find_map(|m| lease_row_index(rows, m)) else {
+        return false;
+    };
+    rows[i].0 = new_members.to_vec();
+    true
+}
+
 /// The `CPMYSTATUS` body (ADR-0014 D3), formatted once for both control planes.
 ///
 /// BUG-0148: this verb was dispatched ONLY by the single-node control plane.

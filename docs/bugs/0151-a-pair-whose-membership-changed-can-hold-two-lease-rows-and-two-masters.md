@@ -1,9 +1,9 @@
 # BUG-0151 — a pair whose membership changed can hold two lease rows, and answer OK to both masters
 
-**Status:** OPEN — found 2026-09-15 while fixing BUG-0150, by a test that
-failed for the right reason and then turned out to be asserting a property the
-product does not have on **either** control plane. Severity: high if reached —
-this is the fence not fencing.
+**Status:** **FIXED 2026-09-15** — and **REACHED THROUGH THE PRODUCT** before
+it was fixed. Filed the same day with the reachability explicitly unestablished;
+the drill written next settled it in the worse direction. This was the fence
+not fencing, on an ordinary operator sequence.
 
 ## What is established, and how
 
@@ -34,6 +34,10 @@ containing the caller names the caller as master, and `SUPERSEDED` otherwise:
 exists to make impossible.
 
 ## What is NOT established
+
+*Established later the same day, in the worse direction — see "Reached,
+then closed" below. This section is kept as written: it is the record of what
+was known at filing, and the reason the drill was written before the fix.*
 
 That the production flow reaches it. The sequence needs a `CPSETPAIR` that
 replaces a member, then a `CPFENCE` of the NEW member, then the OLD master
@@ -85,7 +89,17 @@ renewal that the bug requires.
 
 None of this is a sighting. It narrows where to point one.
 
-## Why it is not fixed here
+*Added after the above: a sighting followed within the hour, and it does not
+contradict this narrowing. The drill supplies the renewing incumbent directly —
+it asks `CPLEASE` for the displaced master, which is exactly what a
+partitioned-but-alive master does every ttl/3 — so it settles what the CONTROL
+PLANE does without needing a partition to produce it. Which deployment path
+holds that condition open is the question answered above, and the answer stands:
+not the operator path, not a killed master, but the controller against a master
+it cannot reach. A FLEET reproduction would still want a partition rather than a
+kill.*
+
+## Why it was not fixed at filing
 
 The fix is a design choice and it should be made deliberately:
 
@@ -107,3 +121,80 @@ told OK, not that a unit test agrees with itself.
 **Both control planes are equally affected.** This is not a raft/single-node
 divergence; it is a property of the containment key, which is the right key for
 what BUG-0065 was about and silent about membership that changes underneath it.
+
+## Reached, then closed
+
+`tools/lease_after_repoint_drill.sh` runs the sequence against a real control
+plane. Before the fix:
+
+```
+== control: the peer reads as superseded, so a refusal is observable here
+  127.0.0.1:6432 -> SUPERSEDED 127.0.0.1:6431
+== repoint: :6432 is replaced by :6433, then :6433 is promoted and fenced
+  OK fenced 127.0.0.1:6433 gen 1
+== the question: how many addresses does the CP call master?
+  127.0.0.1:6431 -> OK
+  127.0.0.1:6433 -> OK
+FAIL: 2 addresses hold the write lease for one pair at the same time.
+```
+
+After it, the displaced incumbent reads `SUPERSEDED 127.0.0.1:6433` and the
+fenced member holds the lease. **Red before, green after, on the product** —
+which is the strongest control this drill could have, and the reason it was
+written before the fix rather than alongside it.
+
+**The section above overstated nothing and understated the risk.** It said the
+composition "is reading the code, not a run". The run agreed with the reading.
+
+### Why no drill had ever been here
+
+Nothing in the suite exercised `CPSETPAIR` or `swap-node` at all — the grep
+that established that is two lines and was worth more than any amount of
+reasoning about whether the path was reachable. A verb with no drill is not a
+verb that works; it is a verb nobody has asked.
+
+The drill is CP-level on purpose. No servers are started: `CPADDPAIR` registers
+addresses rather than processes, and the whole question is the control plane's
+own bookkeeping. Starting three nodes would have added a failover's worth of
+timing to something deterministic.
+
+### The fix
+
+`tenant::repoint_lease_row` moves a pair's row onto its new membership, located
+by any member it had BEFORE the change — the only handle that still works at
+that moment. Called from `registry.rs`'s `Mutation::SetPair` and from
+`main.rs`'s `CPSETPAIR`, which needs it **twice**: `st.leases` is the durable
+record and `lf.entries` is the fast mirror `CPLEASE` actually reads, so
+migrating only the first would have left the single-node path answering out of
+the row the repoint had just made stale. That mirror is exactly the kind of
+second copy BUG-0146 is about, and it is why the drill was run against the
+product rather than trusted to a unit test.
+
+The option chosen was the second of the three this file listed. Pair-index keys
+remain the cleaner end state and still want the durable-format migration they
+always did; nothing here forecloses them.
+
+**A second gap the drill exposed on the way:** `CPADDPAIR` sorts a pair's
+members (BUG-0065's root fix, so `a,b` and `b,a` are one pair to the `contains`
+dedupe) and `CPSETPAIR` did not. A repoint could therefore write an unsorted
+vector that a later `CPADDPAIR` of the same members would not match,
+registering a duplicate pair — BUG-0065's root returning through a verb its fix
+never touched. Both paths now sort, in the handler rather than in `apply()`, so
+already-committed log entries replay unchanged.
+
+### On changing `apply()`
+
+Repointing inside `Mutation::SetPair` changes what the raft state machine does
+with a log entry, so two nodes at different versions replaying the same entry
+would diverge. ADR-0030's `DelProxy` refill set that precedent four days
+earlier and the same reasoning applies: it is a correctness fix, the divergence
+window is a rolling upgrade, and leaving the bug in place to preserve
+bit-compatibility with a wrong answer is the worse trade. Worth stating rather
+than discovering.
+
+Unit tests cover the raft path, which the drill cannot reach — it drives a
+single-node control plane, and that is the other implementation. Removing the
+`repoint_lease_row` call from `apply` fails
+`a_repoint_moves_the_lease_row_so_the_next_fence_finds_it`; the companion
+control, that a pair which never held a lease gains no row from a repoint,
+stays green under that mutation, as it should.

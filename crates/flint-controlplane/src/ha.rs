@@ -1006,7 +1006,14 @@ async fn handle_admin(ha: &Ha, args: &[Vec<u8>]) -> Value {
             ) else {
                 return Value::Error("ERR CPSETPAIR <idx> <a,b[,c]>".into());
             };
-            let nodes: Vec<String> = nodes.split(',').map(String::from).collect();
+            // SORTED, as CPADDPAIR is. BUG-0065's root fix canonicalises at
+            // registration so `a,b` and `b,a` are one pair to the `contains`
+            // dedupe; a repoint that wrote an unsorted vector put that back,
+            // because a later CPADDPAIR of the same members would not match it
+            // and would register a duplicate. Sorted in the HANDLER so apply()
+            // replays already-committed entries unchanged.
+            let mut nodes: Vec<String> = nodes.split(',').map(String::from).collect();
+            nodes.sort();
             match ha.propose(Mutation::SetPair { idx, nodes }).await {
                 Ok(v) => Value::Simple(format!("OK version {v}")),
                 Err(redir) => redirect(redir),

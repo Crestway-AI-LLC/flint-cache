@@ -302,7 +302,11 @@ impl RegistryState {
             }
             Mutation::SetPair { idx, nodes } => {
                 if let Some(p) = self.pairs.get_mut(idx) {
-                    *p = nodes;
+                    // The OLD membership is the only handle on this pair's
+                    // lease row once the vector is overwritten, so take it
+                    // before replacing (BUG-0151).
+                    let old = std::mem::replace(p, nodes.clone());
+                    crate::tenant::repoint_lease_row(&mut self.leases, &old, &nodes);
                 }
             }
             Mutation::AddTenant {
@@ -727,6 +731,67 @@ mod bug_0150_lease_key_tests {
         });
         let i = crate::tenant::lease_row_index(&r.leases, "b:2").expect("row via the peer");
         assert_eq!(r.leases[i].1, "a:1", "b:2 must not read itself as master");
+    }
+}
+
+/// BUG-0151 on the RAFT path, which `lease_after_repoint_drill` cannot reach:
+/// it drives a single-node control plane, and this is the other implementation.
+#[cfg(test)]
+mod bug_0151_repoint_tests {
+    use super::*;
+
+    #[test]
+    fn a_repoint_moves_the_lease_row_so_the_next_fence_finds_it() {
+        let mut r = RegistryState::default();
+        r.apply(Mutation::AddPair {
+            nodes: vec!["a:1".to_string(), "b:2".to_string()],
+            range: None,
+        });
+        r.apply(Mutation::LeaseAdopt {
+            addr: "a:1".to_string(),
+        });
+        // b:2 is replaced by c:3, then c:3 is promoted -- replace a failed
+        // replica, then lose the master.
+        r.apply(Mutation::SetPair {
+            idx: 0,
+            nodes: vec!["a:1".to_string(), "c:3".to_string()],
+        });
+        r.apply(Mutation::Fence {
+            addr: "c:3".to_string(),
+        });
+
+        assert_eq!(
+            r.leases.len(),
+            1,
+            "one pair, one row: a fence that could not find the repointed row \
+             pushed a second one and both answered OK: {:?}",
+            r.leases
+        );
+        // The displaced incumbent is STILL a member, so it still resolves a
+        // row -- and that row must name the new master, or CPLEASE hands it an
+        // OK it has no right to.
+        let i = crate::tenant::lease_row_index(&r.leases, "a:1")
+            .expect("a:1 is still a member and must resolve a row");
+        assert_eq!(
+            r.leases[i].1, "c:3",
+            "the displaced incumbent must read the fenced master, not itself"
+        );
+    }
+
+    /// The control: repointing must not invent a row for a pair that never
+    /// held one, which would make every pair look leased.
+    #[test]
+    fn a_pair_that_never_held_a_lease_gains_no_row_from_a_repoint() {
+        let mut r = RegistryState::default();
+        r.apply(Mutation::AddPair {
+            nodes: vec!["a:1".to_string(), "b:2".to_string()],
+            range: None,
+        });
+        r.apply(Mutation::SetPair {
+            idx: 0,
+            nodes: vec!["a:1".to_string(), "c:3".to_string()],
+        });
+        assert!(r.leases.is_empty(), "{:?}", r.leases);
     }
 }
 
