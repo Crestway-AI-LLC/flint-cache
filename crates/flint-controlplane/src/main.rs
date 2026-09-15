@@ -801,37 +801,15 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
                 .ok()
                 .and_then(|u| u.get(&t.name).copied())
                 .unwrap_or(0);
-            // `endpoint` is the tenant's OWN proxy subset — what they
-            // already dial, and what CPSNAPSHOT already tells them. Not a
-            // topology leak, and the distinction the ADR draws: their
-            // endpoint yes, node addresses and pair layout no. Nothing
-            // below reads any tenant but this one.
-            Value::Bulk(Some(
-                format!(
-                    "tenant:{}\r\nnamespace:{}\r\nendpoint:{}\r\n\
-                     quota_ops_per_sec:{}\r\nquota_max_bytes:{}\r\n\
-                     usage_bytes:{}\r\nover_quota:{}\r\n\
-                     replica_reads:{}\r\nlocal_cache:{}\r\nasync_writes:{}\r\n\
-                     federated:{}\r\nbuild:{}\r\n",
-                    t.name,
-                    t.ns,
-                    if t.subset.is_empty() {
-                        "-".to_string()
-                    } else {
-                        t.subset.join(",")
-                    },
-                    t.ops_per_sec,
-                    t.max_bytes,
-                    bytes,
-                    t.over_quota as u8,
-                    t.replica_reads as u8,
-                    t.local_cache as u8,
-                    t.async_writes as u8,
-                    t.federated as u8,
-                    build_version(),
-                )
-                .into_bytes(),
-            ))
+            // The BODY is `tenant::my_status_body`, shared with the raft
+            // dispatcher. It was inline here and NOWHERE in ha.rs, which is
+            // BUG-0148: a tenant on a replicated control plane got `unknown
+            // command` for the one command ADR-0014 gives them.
+            Value::Bulk(Some(crate::tenant::my_status_body(
+                t,
+                bytes,
+                &build_version(),
+            )))
         }
         // Tenant SELF-ROTATION (ADR-0006 D3): the CURRENT token is the
         // credential; the CP MINTS the successor (tenants never choose

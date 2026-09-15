@@ -443,6 +443,105 @@ pub fn refill_after_retire<'a>(
     }
 }
 
+/// The `CPMYSTATUS` body (ADR-0014 D3), formatted once for both control planes.
+///
+/// BUG-0148: this verb was dispatched ONLY by the single-node control plane.
+/// A tenant on a Raft control plane got `unknown command` for the one command
+/// ADR-0014 gives them to ask about themselves, and `tenant_status_drill`
+/// covers D3 on a single node, so nothing ever said so.
+///
+/// Hand-porting the body into `ha.rs` would have closed that gap and opened
+/// the one BUG-0146 is about -- two copies of a format, kept in step by hand,
+/// with the data agreeing so nothing reconciles the behaviour. So the body
+/// lives here and `build` is passed in, for the same reason
+/// [`refill_after_retire`] takes its shuffle: the caller owns what genuinely
+/// differs between the two paths, this owns what must not differ at all.
+pub fn my_status_body(t: &Tenant, usage_bytes: u64, build: &str) -> Vec<u8> {
+    // `endpoint` is the tenant's OWN proxy subset -- what they already dial,
+    // and what CPSNAPSHOT already tells them. Not a topology leak, and the
+    // distinction ADR-0014 draws: their endpoint yes, node addresses and pair
+    // layout no. Nothing here reads any tenant but this one.
+    format!(
+        "tenant:{}\r\nnamespace:{}\r\nendpoint:{}\r\n\
+         quota_ops_per_sec:{}\r\nquota_max_bytes:{}\r\n\
+         usage_bytes:{}\r\nover_quota:{}\r\n\
+         replica_reads:{}\r\nlocal_cache:{}\r\nasync_writes:{}\r\n\
+         federated:{}\r\nbuild:{}\r\n",
+        t.name,
+        t.ns,
+        if t.subset.is_empty() {
+            "-".to_string()
+        } else {
+            t.subset.join(",")
+        },
+        t.ops_per_sec,
+        t.max_bytes,
+        usage_bytes,
+        t.over_quota as u8,
+        t.replica_reads as u8,
+        t.local_cache as u8,
+        t.async_writes as u8,
+        t.federated as u8,
+        build,
+    )
+    .into_bytes()
+}
+
+#[cfg(test)]
+mod my_status_tests {
+    use super::*;
+
+    fn t() -> Tenant {
+        Tenant {
+            name: "acme".into(),
+            token: "sha256-of-the-real-token".into(),
+            ns: "acme".into(),
+            subset: vec!["10.0.0.1:9001".into(), "10.0.0.2:9001".into()],
+            ops_per_sec: 5000,
+            max_bytes: 1 << 30,
+            over_quota: true,
+            replica_reads: true,
+            ..Tenant::default()
+        }
+    }
+
+    #[test]
+    fn it_reports_this_tenants_own_fields_and_no_others() {
+        let body =
+            String::from_utf8(my_status_body(&t(), 4242, "v0.2.17")).expect("the body is ASCII");
+        for want in [
+            "tenant:acme",
+            "namespace:acme",
+            "endpoint:10.0.0.1:9001,10.0.0.2:9001",
+            "quota_ops_per_sec:5000",
+            "quota_max_bytes:1073741824",
+            "usage_bytes:4242",
+            "over_quota:1",
+            "replica_reads:1",
+            "local_cache:0",
+            "build:v0.2.17",
+        ] {
+            assert!(body.contains(want), "missing {want} in:\n{body}");
+        }
+        // The TOKEN DIGEST must never appear. It is on the struct, it is the
+        // credential, and a formatter that reads `t` has it in hand.
+        assert!(
+            !body.contains("sha256-of-the-real-token"),
+            "the token digest leaked:\n{body}"
+        );
+    }
+
+    #[test]
+    fn an_unplaced_tenant_reports_a_dash_rather_than_an_empty_field() {
+        // A tenant whose subset is empty is DRAINED, and `endpoint:` with
+        // nothing after it reads as a parse failure to whoever consumes this.
+        let mut t = t();
+        t.subset.clear();
+        let body = String::from_utf8(my_status_body(&t, 0, "v0")).expect("the body is ASCII");
+        assert!(body.contains("endpoint:-\r\n"), "{body}");
+    }
+}
+
 #[cfg(test)]
 mod refill_tests {
     use super::*;

@@ -83,6 +83,34 @@ done
 echo "  all nodes at version $V1"
 VER_BEFORE=$V1
 
+# BUG-0148: this verb was dispatched ONLY by the single-node control plane,
+# so a tenant on a raft fleet got `unknown command` for the one command
+# ADR-0014 D3 gives them to ask about themselves. tenant_status_drill covers
+# D3 completely -- on ONE node, without --raft. Two dispatchers, and every
+# check only ever met one of them.
+#
+# READ-ONLY, so no redirect is needed: any node answers from its own committed
+# registry. Asserted against the FOLLOWER deliberately, because a verb missing
+# from the raft dispatcher is missing from every node, and asking the leader
+# would leave that untested -- and placed AFTER the convergence proof above,
+# because a follower that has not yet applied the AddTenant answers WRONGPASS,
+# which would be a race in this drill rather than a finding about the product.
+echo "== a tenant can read its own status FROM A FOLLOWER (ADR-0014 D3 on raft)"
+MYS=$(valkey-cli -p 7502 CPMYSTATUS tok-acme 2>&1 | tr -d '\r')
+echo "$MYS" | grep -q "^tenant:acme$" || {
+  echo "FAIL: CPMYSTATUS on the raft path did not return this tenant: $MYS"; exit 1; }
+echo "$MYS" | grep -q "^namespace:acme$" || { echo "FAIL: no namespace: $MYS"; exit 1; }
+echo "$MYS" | grep -q "^endpoint:127.0.0.1:900" || { echo "FAIL: no endpoint: $MYS"; exit 1; }
+echo "$MYS" | grep -q "^build:" || { echo "FAIL: no build stamp: $MYS"; exit 1; }
+# The negative: a wrong token must be refused, not answered with someone
+# else's row. Same assertion tenant_status_drill makes single-node.
+BAD=$(valkey-cli -p 7502 CPMYSTATUS not-a-real-token 2>&1 | tr -d '\r')
+echo "$BAD" | grep -q "WRONGPASS" || {
+  echo "FAIL: an invalid token was not refused on the raft path: $BAD"; exit 1; }
+echo "  CPMYSTATUS answers on a follower; an invalid token gets WRONGPASS"
+
+
+
 echo "== R1 regression: an EXCEPTION-ONLY change must reach a CPWATCH subscriber"
 # Find the proxy in acme's subset (its CPSNAPSHOT carries the tenant).
 SERVED=""

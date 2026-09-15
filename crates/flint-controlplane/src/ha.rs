@@ -1043,6 +1043,38 @@ async fn handle_admin(ha: &Ha, args: &[Vec<u8>]) -> Value {
                 .into_bytes(),
             ))
         }
+        // ADR-0014 D3 on the raft path. BUG-0148: this arm did not exist,
+        // and `--raft` reaches a dispatcher that ends in
+        // `_ => ERR_UNKNOWN_CP_COMMAND`, so a tenant on a replicated control
+        // plane was told the command does not exist. Same token-digest
+        // lookup as CPMYUSAGE directly above -- no second authentication
+        // path -- and the body is shared with main.rs so the two control
+        // planes cannot come to answer this differently.
+        b"CPMYSTATUS" => {
+            let Some(token) = text(1) else {
+                return Value::Error("ERR CPMYSTATUS <token>".into());
+            };
+            let token = flint_tls::sha256_hex(token.as_bytes());
+            let reg = ha.store.registry().await;
+            let Some(t) = reg
+                .tenants
+                .values()
+                .find(|t| t.token == token || t.prev_token.as_deref() == Some(token.as_str()))
+            else {
+                return Value::Error("WRONGPASS invalid token".into());
+            };
+            let bytes = ha
+                .usage
+                .lock()
+                .ok()
+                .and_then(|u| u.get(&t.name).copied())
+                .unwrap_or(0);
+            Value::Bulk(Some(crate::tenant::my_status_body(
+                t,
+                bytes,
+                &crate::build_version(),
+            )))
+        }
         b"CPMYROTATE" => {
             let Some(token) = text(1) else {
                 return Value::Error("ERR CPMYROTATE <current-token>".into());

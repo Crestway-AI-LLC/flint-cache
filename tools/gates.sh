@@ -1978,6 +1978,89 @@ DIALPY
   echo "  every dial carries a budget ($1 dial(s) across $2 source file(s))"
 }
 
+assert_cp_verbs_agree_across_paths() {
+  # THE CONTROL PLANE HAS TWO DISPATCHERS, and the one most deployments run is
+  # not the one the unit tests reach. `main.rs` serves the single-node control
+  # plane by mutating `state::State` inline; `ha.rs` serves the Raft one by
+  # proposing a `Mutation`, and `--raft` enters through `run_raft` ->
+  # `ha::run_client`, which never touches `main.rs`'s dispatch at all. They
+  # share the `Tenant` struct and nothing else.
+  #
+  # BUG-0148 was one verb: `CPMYSTATUS` -- ADR-0014 D3, the one command a
+  # TENANT has to ask about itself -- dispatched in `main.rs` and absent from
+  # `ha.rs`, whose match ends at `_ => ERR_UNKNOWN_CP_COMMAND`. Its siblings
+  # CPMYUSAGE and CPMYCONFIG were in both, so it was a missed arm rather than
+  # a decision, and `tenant_status_drill` covers D3 completely on ONE node
+  # without --raft: every assertion it makes is true, about half the product.
+  #
+  # WHAT THIS CANNOT DO, said plainly because the number next door is the
+  # reason: it compares verb TABLES, not behaviour. BUG-0146 is a verb present
+  # in both arms where a fix landed in one -- six unit tests green, the product
+  # unchanged -- and no textual check reaches that. This catches the arm
+  # somebody forgot to ADD. Nothing here catches the arm somebody forgot to
+  # UPDATE.
+  local out
+  out=$(python3 - <<'CPVPY'
+import re, sys
+
+def arms(path):
+    try:
+        s = open(path, encoding="utf-8", errors="replace").read()
+    except OSError:
+        return None
+    # Match ARMS, not mentions: a leading-indent `b"CPX"` is the dispatch
+    # form in both files. Doc comments and error strings name verbs too, and
+    # counting those would have made the two sets agree by accident.
+    return set(re.findall(r'^\s+b"(CP[A-Z]+)"', s, re.M))
+
+m = arms("crates/flint-controlplane/src/main.rs")
+h = arms("crates/flint-controlplane/src/ha.rs")
+if m is None or h is None:
+    print("UNREADABLE")
+    sys.exit(0)
+if not m or not h:
+    # Either file restructured out from under the pattern. A check that finds
+    # no arms certifies both dispatchers by reading neither.
+    print("NOARMS %d %d" % (len(m), len(h)))
+    sys.exit(0)
+for v in sorted(m - h):
+    print("single-node only\t%s" % v)
+for v in sorted(h - m):
+    print("raft only\t%s" % v)
+print("COVERAGE %d %d" % (len(m), len(h)))
+CPVPY
+) || { echo "FAIL  the CP verb-parity check could not run"
+       FAILED="$FAILED cp-verb-parity-unrunnable"; return; }
+
+  case "$out" in
+    UNREADABLE*)
+      echo "FAIL  a control-plane dispatcher could not be read -- this check"
+      echo "        examined nothing, which is not the same as passing"
+      FAILED="$FAILED cp-verb-parity-unreadable"; return ;;
+    NOARMS*)
+      echo "FAIL  the verb-parity check matched NO dispatch arms ($out) --"
+      echo "        it certified both control planes by reading neither"
+      FAILED="$FAILED cp-verb-parity-examined-nothing"; return ;;
+  esac
+  local cov
+  cov=$(printf '%s\n' "$out" | sed -n 's/^COVERAGE //p')
+  out=$(printf '%s\n' "$out" | grep -v '^COVERAGE ' || true)
+  if [ -n "$out" ]; then
+    echo "FAIL  these control-plane verbs are dispatched by only ONE of the two"
+    echo "        paths, so the fleets that run the other get ERR unknown command:"
+    printf '%s\n' "$out" | while IFS="$(printf '\t')" read -r where verb; do
+      echo "        $verb -- $where"
+    done
+    echo "        Add the missing arm. If a verb is deliberately one-sided, it"
+    echo "        needs to be written down somewhere a reader will find it,"
+    echo "        not left as a difference between two 1500-line files."
+    FAILED="$FAILED cp-verb-one-sided"; return
+  fi
+  # shellcheck disable=SC2086
+  set -- $cov
+  echo "  both control-plane paths dispatch the same verbs ($1 single-node, $2 raft)"
+}
+
 assert_no_cross_repo_ports() {
   local ops="${FLINT_OPS:-../flint-cache}"
   if [ ! -d "$ops/tools" ]; then
@@ -3504,6 +3587,7 @@ if want check; then
   assert_no_port_overlap
   assert_no_cross_repo_ports
   assert_dials_are_bounded
+  assert_cp_verbs_agree_across_paths
   assert_tools_threads_are_daemons
   assert_scripts_parse
   assert_no_scope_overlap
