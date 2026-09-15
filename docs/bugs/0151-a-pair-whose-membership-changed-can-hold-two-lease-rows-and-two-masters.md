@@ -49,6 +49,42 @@ the common path is fine, not evidence this path is unreachable — the drill
 would have to fence a member added after the row was written, with the old
 master still renewing, to say anything about it.
 
+## Which path can reach it, from the ops side (added 2026-09-15)
+
+Read from the code, not run — the same standing as the section above, and
+offered because it **rules two paths out** rather than because it reproduces
+anything.
+
+**The operator path cannot reach it.** `flintctl`'s failover core demotes the
+old master FIRST, then drains, then commits `CPFENCE`, then promotes — its own
+comment says demote-first is what makes it lossless. A demoted master is not a
+renewing one, so `failover` and `upgrade` compose `CPSETPAIR` and `CPFENCE`
+without ever holding the third condition open.
+
+**A killed master cannot reach it either**, which is why the existing coverage
+misses. The ops drill `tools/flintctl_drill.sh` already runs two thirds of this
+sequence on every ops gate: `swap-node 9601 → 6914` at :77 issues the
+`CPSETPAIR`, and the controller promotes `6914` at :91. Between them, :84 is
+`kill -9` on the old master. A dead master renews nothing, so the drill
+composes the two operations the bug needs and then removes the condition that
+makes them dangerous. Deleting that `kill` does not fix it: the promotion in
+that drill happens *because* the master died.
+
+**What is left is the controller's automatic path against a master that is
+unreachable but alive.** `flint-controller` cannot demote first — it cannot
+reach the node — so it commits `CPFENCE` and promotes, and demotes the old
+master as a zombie only when it reappears (`main.rs:19`, `:50`). If that master
+is partitioned from the controller but still reaching the control plane, it is
+alive and renewing across the fence, which is exactly the state this file
+describes.
+
+So the drill that would settle it is a **partition**, not a kill: sever
+controller→master while leaving master→CP intact, after a `swap-node`. Every
+drill that touches this area kills or SIGSTOPs, and both of those stop the
+renewal that the bug requires.
+
+None of this is a sighting. It narrows where to point one.
+
 ## Why it is not fixed here
 
 The fix is a design choice and it should be made deliberately:
