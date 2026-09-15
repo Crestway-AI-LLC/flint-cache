@@ -57,11 +57,18 @@ print(" ".join(picked))')
 echo "== tags on pair-0 slots: $TAGS"
 
 echo "== seed via AUTHED proxy: alpha 4x3000=12000, beta same tags 4x1000=4000"
+# THROUGH fleet_load_resp (BUG-0147): a bare `--pipe >/dev/null` cannot say
+# why a seed was refused, and every count below reads the same on a refusal as
+# on a loss.
+_tr_alpha_gen() {
+  awk -v tag="$t" 'BEGIN{for(i=0;i<3000;i++){k=sprintf("{%s}:k%05d",tag,i);v=sprintf("alpha-%s-%05d",tag,i);printf "*3\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n",length(k),k,length(v),v}}'
+}
+_tr_beta_gen() {
+  awk -v tag="$t" 'BEGIN{for(i=0;i<1000;i++){k=sprintf("{%s}:k%05d",tag,i);v=sprintf("beta-%s-%05d",tag,i);printf "*3\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n",length(k),k,length(v),v}}'
+}
 for t in $TAGS; do
-  awk -v tag="$t" 'BEGIN{for(i=0;i<3000;i++){k=sprintf("{%s}:k%05d",tag,i);v=sprintf("alpha-%s-%05d",tag,i);printf "*3\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n",length(k),k,length(v),v}}' \
-    | valkey-cli -p 6668 -a tokA --no-auth-warning --pipe >/dev/null
-  awk -v tag="$t" 'BEGIN{for(i=0;i<1000;i++){k=sprintf("{%s}:k%05d",tag,i);v=sprintf("beta-%s-%05d",tag,i);printf "*3\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n",length(k),k,length(v),v}}' \
-    | valkey-cli -p 6668 -a tokB --no-auth-warning --pipe >/dev/null
+  fleet_load_resp 6668 _tr_alpha_gen 3000 "" tokA || exit 1
+  fleet_load_resp 6668 _tr_beta_gen 1000 "" tokB || exit 1
 done
 DA=$(valkey-cli -p 6668 -a tokA --no-auth-warning DBSIZE)
 DB=$(valkey-cli -p 6668 -a tokB --no-auth-warning DBSIZE)

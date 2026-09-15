@@ -74,9 +74,15 @@ fleet_wait_listen 6669
 sleep 1.2
 
 echo "== seed: 50 tenants x $KEYS_PER_TENANT keys through the authed proxy"
+# THROUGH fleet_load_resp (BUG-0147). Fifty seeds and only five spot-checked
+# DBSIZEs: a tenant whose seed was refused outright was, until now, most
+# likely to surface two screens later as a row-count mismatch nobody could
+# attribute.
+_m3_seed_gen() {
+  awk -v t="$i" -v n="$KEYS_PER_TENANT" 'BEGIN{for(j=0;j<n;j++){k=sprintf("data:%05d",j);v=sprintf("t%s-%05d",t,j);printf "*3\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n",length(k),k,length(v),v}}'
+}
 for i in $(seq -w 0 49); do
-  awk -v t="$i" -v n="$KEYS_PER_TENANT" 'BEGIN{for(j=0;j<n;j++){k=sprintf("data:%05d",j);v=sprintf("t%s-%05d",t,j);printf "*3\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n",length(k),k,length(v),v}}' \
-    | valkey-cli -p 6669 -a "tok$i" --no-auth-warning --pipe >/dev/null
+  fleet_load_resp 6669 _m3_seed_gen "$KEYS_PER_TENANT" "" "tok$i" || exit 1
 done
 # Spot-verify pack: 5 tenants' DBSIZE (all 50 checked in the final sweep).
 for i in 00 13 27 38 49; do

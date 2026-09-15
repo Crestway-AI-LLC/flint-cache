@@ -1,7 +1,8 @@
 # BUG-0147 — a drill seeds through a pipe that discards the rejection
 
-**Status:** OPEN — found 2026-09-14 when `migrate_slots` failed a gate and the
-message could not say why.
+**Status:** **FIXED 2026-09-15** — every foreground seed in the core drills now
+runs through `fleet_load_resp`, which reports the refusal. The BRING-UP
+question this bug also raised is deliberately still open; see the last section.
 
 ## The failure, and what it did not say
 
@@ -61,3 +62,59 @@ that decision needs the diagnostic first, which is the point.
 **Not fixed here**: this is someone else's drill, it is intermittent rather
 than broken, and changing a bring-up under a drill that is currently green
 most of the time deserves its own run rather than riding a control-plane fix.
+
+## What the fix turned out to be, which is not what this file proposed
+
+The section above says "keep `--pipe`'s output and assert it", and that was
+right about the mechanism and wrong about the work. **`tools/lib/fleet.sh`
+already had `fleet_load_resp`**, which captures the pipe, reads `errors:` and
+`replies:` off it, distinguishes a `-THROTTLED` shed from an error it does not
+recognise, fails on a short load, and fails loudly on a load that delivered
+nothing at all — "this is NOT shedding; it is a dead or unreachable seat".
+Five drills were already using it. It was written for BUG-0035 in August and
+has been the answer to this question the whole time.
+
+So the bug was not a missing capability. It was **fourteen call sites that
+bypassed the one implementation**, and the reason they could is worth naming:
+
+> `fleet_load_resp` built its own `valkey-cli` invocation and had no way to
+> pass a tenant token. Every drill that seeds THROUGH A PROXY — which is every
+> tenant-facing drill — therefore could not use it, and each one hand-rolled
+> `| valkey-cli ... --pipe >/dev/null` instead.
+
+One optional argument closed that. A helper that cannot do the thing its
+callers need is not neutral: it gets copied around, and the copies lose the
+parts that were the point. Every one of those fourteen sites kept the pipe and
+dropped the reporting.
+
+**The sites, all now routed:** `migrate_slots` (this bug's own),
+`decommission`, `fanout_timeout`, `expand_fill`, `m3_exit` (fifty tenants, of
+which five DBSIZEs were spot-checked), `rebalance_execute` (three),
+`reseed` (the deliberate WAL gap — where a shed shortens the gap the rest of
+the drill depends on, and was invisible), `scan`, `tenant_rebalance` (two),
+`slot_cutover_recovery` (two).
+
+Three `--pipe` sites are deliberately NOT routed, and are not oversights: two
+are backgrounded continuous load generators (`loaded_promote`, `slot_migrate`)
+rather than seeds with a reply count to check, and `roll_shed` already pipes
+the output into something that reads it.
+
+One further change in the same file: the `env [load]` note now prints ONCE per
+drill instead of once per call. `m3_exit` seeds fifty times in a loop, and
+fifty samples of what else is running on the box answer nothing the first one
+did not — while the sibling scan behind it is a `ps` walk, so they are not
+free either.
+
+## Still open, on purpose: the bring-up
+
+This bug had two halves and only one is fixed. The seed is still preceded by a
+`sleep` rather than a wait for the tenant to be live on the proxy, and that is
+the most likely cause of the original red gate. Fixing it now would mean
+changing a bring-up under an intermittent drill **in the same change that
+removes the only reason the next failure will be legible** — and the section
+above says why that order is wrong: the decision needs the diagnostic first.
+
+The next time `migrate_slots` goes red under a 4-wide gate, its log will say
+`errors: 2000, replies: 2000` or it will say the seed landed and the read was
+wrong. Those are opposite investigations, and until today the drill printed the
+same empty `()` for both.

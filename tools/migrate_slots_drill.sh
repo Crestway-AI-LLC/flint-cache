@@ -57,8 +57,17 @@ echo "== bootstrap one pair (owns all 16384 slots)"
 
 # {mig2} hashes to slot 8450. Seed 2000 keys all in that slot.
 echo "== seed 2000 keys in slot 8450 ({mig2})"
-awk 'BEGIN{for(i=0;i<2000;i++){k=sprintf("{mig2}:k%05d",i);v=sprintf("v%05d",i);printf "*3\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n",length(k),k,length(v),v}}' \
-  | valkey-cli -p 7235 -a tok-acme --no-auth-warning --pipe >/dev/null 2>&1
+# THROUGH fleet_load_resp, which is the fix for BUG-0147. This was a bare
+# `--pipe >/dev/null 2>&1`, so when the seed was refused under a 4-wide gate
+# the drill said `FAIL: seed not readable ()` -- an empty string where the
+# reason should have been. The loader reports the refusal and the reply count,
+# which is the difference between "the seed never landed" (a bring-up race in
+# this drill) and "the seed landed and the read is wrong" (data loss in the
+# product). Those are opposite investigations.
+_mig_seed_gen() {
+  awk 'BEGIN{for(i=0;i<2000;i++){k=sprintf("{mig2}:k%05d",i);v=sprintf("v%05d",i);printf "*3\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n",length(k),k,length(v),v}}'
+}
+fleet_load_resp 7235 _mig_seed_gen 2000 "" tok-acme || exit 1
 BEFORE=$($A GET '{mig2}:k00000')
 [ "$BEFORE" = "v00000" ] || { echo "FAIL: seed not readable ($BEFORE)"; exit 1; }
 echo "  seeded; sample {mig2}:k00000 = $BEFORE"

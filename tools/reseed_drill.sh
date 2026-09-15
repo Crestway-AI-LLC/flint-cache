@@ -185,10 +185,17 @@ echo "  marked copy verified against the master and rejoined warm, no re-seed"
 echo "== stage the purge: write past the replica, then drop the retained WAL"
 CURSOR=$(valkey-cli -p $RPORT FLINTINFO 2>/dev/null | tr -d '\r' | sed -n 's/^last_applied://p')
 pkill -9 -f "flint-server --port $RPORT"; sleep 0.5
-awk 'BEGIN { for (i = 0; i < 20000; i++) {
-  k = sprintf("gap:%06d", i); v = sprintf("v%06d", i)
-  printf "*3\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n", length(k), k, length(v), v } }' \
-  | valkey-cli -p $MPORT --pipe >/dev/null 2>&1
+# THROUGH fleet_load_resp (BUG-0147). This write is the WAL gap the rest of
+# the drill is about, so how much of it actually landed is not a detail: with
+# the replica killed the lag cap can shed, and a shed here shortens the gap
+# the purge below is supposed to open. The loader names sheds; the bare pipe
+# hid them.
+_gap_gen() {
+  awk 'BEGIN { for (i = 0; i < 20000; i++) {
+    k = sprintf("gap:%06d", i); v = sprintf("v%06d", i)
+    printf "*3\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n", length(k), k, length(v), v } }'
+}
+fleet_load_resp "$MPORT" _gap_gen 20000 || exit 1
 # Compaction rolls the live WAL and retires the old segments into archive/,
 # which is where retention expiry would eventually delete them. Deleting them
 # by hand is the same end state, minutes instead of an hour.

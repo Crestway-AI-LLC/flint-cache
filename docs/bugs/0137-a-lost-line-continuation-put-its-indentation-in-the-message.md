@@ -1,6 +1,22 @@
 # BUG-0137 — a lost line continuation put its indentation inside the message
 
-**Status:** OPEN — found 2026-09-14, not fixed here.
+**Status:** **FIXED 2026-09-14** (`5382773`) — the four literals are rewrapped
+with real continuations and the 17 runs of leaked indentation are gone. No
+behaviour change, no test change.
+
+**The record lagged the fix by a day, which is its own small lesson.** The code
+landed and this line still said "not fixed here", so the index row said OPEN
+about a bug that was closed. Nothing caught it: the gate's index check verifies
+that the ROW agrees with this FILE, and both agreed — on the wrong answer. A
+check that compares two records to each other cannot tell you either one has
+drifted from the code.
+
+**`flint-chaos/src/cluster.rs:551` and `:565` are deliberately still open**, and
+are the reason this file is not simply deleted. That class is `\n` followed by
+19-27 spaces in two `REFUSING TO RUN` messages, which renders as a deeply
+indented continuation rather than a garbled sentence, and the indent happens to
+match the source's own. Either intended or the same leak; whoever wrote it can
+settle it in a sentence, and nobody else should guess.
 
 Three `panic!` messages in `flintctl`'s control-plane bring-up wait carry runs
 of fourteen to eighteen literal spaces in the middle of a sentence. An operator

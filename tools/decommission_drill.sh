@@ -63,8 +63,12 @@ echo "== bootstrap a master+replica pair behind a proxy + controller"
 ./target/release/flintctl -f "$INV" tenant add acme tok-acme acme 1 >/dev/null 2>&1
 
 echo "== seed 5000 keys through the proxy"
-awk 'BEGIN{for(i=0;i<5000;i++){k=sprintf("k:%05d",i);v=sprintf("v-%05d",i);printf "*3\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n",length(k),k,length(v),v}}' \
-  | valkey-cli -p 7223 -a tok-acme --no-auth-warning --pipe >/dev/null 2>&1
+# THROUGH fleet_load_resp (BUG-0147): the DBSIZE assertion below catches a
+# seed that did not land, but cannot say WHY it did not.
+_decom_seed_gen() {
+  awk 'BEGIN{for(i=0;i<5000;i++){k=sprintf("k:%05d",i);v=sprintf("v-%05d",i);printf "*3\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n",length(k),k,length(v),v}}'
+}
+fleet_load_resp 7223 _decom_seed_gen 5000 "" tok-acme || exit 1
 SEED=$($A DBSIZE)
 [ "$SEED" = "5000" ] || { echo "FAIL: seed DBSIZE=$SEED (want 5000)"; exit 1; }
 echo "  seeded 5000"

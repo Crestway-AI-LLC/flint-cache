@@ -1359,7 +1359,7 @@ cli_int() {
 # "nothing was written" and "everything was refused" must not look alike.
 # $1 = port, $2 = name of a function writing the RESP stream to stdout.
 fleet_load_resp() {
-  # fleet_load_resp <port> <gen> [expected_replies] [max_shed]
+  # fleet_load_resp <port> <gen> [expected_replies] [max_shed] [token]
   #
   # ONE implementation of "a -THROTTLED is a refusal, not a loss". Both the
   # lag cap (BUG-0035) and the write deadline (BUG-0096) shed with the same
@@ -1372,16 +1372,38 @@ fleet_load_resp() {
   # condition under test there, not a fault. restart_drill and failover_drill
   # are durability drills where a shed is weather, and a rate that stops being
   # small is a finding; they pass a ceiling.
-  local port="$1" gen="$2" want_replies="${3:-}" max_shed="${4:-}"
-  local errs replies out summary nonshed
+  #
+  # `token` is OPTIONAL and exists because of BUG-0147. FOURTEEN seed sites
+  # across ten drills hand-rolled `| valkey-cli ... --pipe >/dev/null` instead
+  # of coming through here, and the reason the tenant-facing ones had,
+  # implicitly, was that this loader could only talk to an unauthenticated
+  # port -- it built its own valkey-cli line with no way to pass a token. What that cost was
+  # `FAIL: seed not readable ()` on a red gate -- an empty string standing in
+  # for every reason 2,000 writes might not have landed: the tenant not yet
+  # pushed to the proxy, an auth rejection, a -MOVED, a shed. Those are
+  # opposite investigations and the drill could not tell them apart. One
+  # argument is the whole fix, because everything that reports the refusal is
+  # already written here.
+  local port="$1" gen="$2" want_replies="${3:-}" max_shed="${4:-}" token="${5:-}"
+  local errs replies out summary nonshed auth=""
+  # Unquoted at the call below, like $gen: empty must expand to no argument.
+  # Spelled as an `if` rather than `[ ... ] && ...` because that form's exit
+  # status is the TEST's when the token is empty, and this library is sourced
+  # by drills running under `set -e`.
+  if [ -n "$token" ]; then auth="-a $token --no-auth-warning"; fi
   # The load phase is where the shed happens, and it can be minutes after
   # fleet_guard ran. Record here too, so a -THROTTLED count and the box that
   # produced it sit on adjacent lines.
-  fleet_env_note load
+  # ONCE PER DRILL, not once per call. m3_exit seeds fifty tenants in a loop,
+  # and fifty samples of "what else is on this box" answer nothing the first
+  # one did not -- while `_fleet_sibling` is a process scan, so they are not
+  # free either.
+  [ -n "${_FLEET_LOAD_NOTED:-}" ] || { fleet_env_note load; _FLEET_LOAD_NOTED=1; }
   out="$(mktemp "${FLINT_DRILL_ROOT:-/tmp}/flint-load.XXXXXX")"
   # `|| true`: --pipe exits non-zero when it counts errors, and under the
   # caller's `set -e`/`pipefail` that alone would abort the drill here.
-  { $gen | valkey-cli -p "$port" --pipe > "$out" 2>&1; } || true
+  # shellcheck disable=SC2086
+  { $gen | valkey-cli -p "$port" $auth --pipe > "$out" 2>&1; } || true
   summary=$(tail -1 "$out")
   errs=$(sed -n 's/.*errors: \([0-9][0-9]*\).*/\1/p' "$out" | tail -1)
   replies=$(sed -n 's/.*replies: \([0-9][0-9]*\).*/\1/p' "$out" | tail -1)

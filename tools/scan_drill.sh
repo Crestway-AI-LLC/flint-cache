@@ -52,8 +52,13 @@ echo "== bootstrap 2 pairs (slot space split) + two tenants + 500 keys"
   echo "FAIL: bootstrap"; tail -25 "$STATE-boot.log"; exit 1; }
 ./target/release/flintctl -f "$INV" tenant add acme tok-acme acme 1 >/dev/null 2>&1
 ./target/release/flintctl -f "$INV" tenant add beta tok-beta beta 1 >/dev/null 2>&1
-awk 'BEGIN{for(i=0;i<500;i++){k=sprintf("key:%04d",i);printf "*3\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$2\r\nvv\r\n",length(k),k}}' \
-  | valkey-cli -p 7679 -a tok-acme --no-auth-warning --pipe >/dev/null 2>&1
+# THROUGH fleet_load_resp (BUG-0147): a bare `--pipe >/dev/null` cannot say
+# why a seed was refused, and every count below reads the same on a refusal as
+# on a loss.
+_scan_seed_gen() {
+  awk 'BEGIN{for(i=0;i<500;i++){k=sprintf("key:%04d",i);printf "*3\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$2\r\nvv\r\n",length(k),k}}'
+}
+fleet_load_resp 7679 _scan_seed_gen 500 "" tok-acme || exit 1
 $B SET beta-only 1 >/dev/null
 [ "$($A DBSIZE)" = "500" ] || { echo "FAIL: seed ($($A DBSIZE))"; exit 1; }
 

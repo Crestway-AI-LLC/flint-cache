@@ -73,7 +73,10 @@ A="valkey-cli -p 7183 -a tok-acme --no-auth-warning"
 
 start_proxy ""
 echo "== seed $KEYS keys through the proxy (the scan needs something to scan)"
-python3 - "$KEYS" <<'PY' | valkey-cli -p 7183 -a tok-acme --no-auth-warning --pipe >/dev/null
+# THROUGH fleet_load_resp (BUG-0147): the DBSIZE check below asserts the count,
+# but the seed itself discarded every word --pipe had to say about a refusal.
+_fanout_seed_gen() {
+python3 - "$KEYS" <<'PY'
 import sys
 n = int(sys.argv[1])
 out = sys.stdout.buffer
@@ -85,6 +88,8 @@ for i in range(n):
         out.write(buf); del buf[:]
 out.write(buf); out.flush()
 PY
+}
+fleet_load_resp 7183 _fanout_seed_gen "$KEYS" "" tok-acme || exit 1
 
 echo "== baseline: DBSIZE succeeds on the default budget, and is MEASURABLY slow"
 T0=$(date +%s%N)

@@ -46,9 +46,14 @@ PER=2000
 # awk-generated RESP through --pipe, the idiom rebalance_execute uses.
 # flint-server has no Lua: an EVAL here wrote nothing and the seed assertion
 # below was what said so.
+# THROUGH fleet_load_resp (BUG-0147). The DBSIZE floor below is a real check
+# and it caught the EVAL mistake -- but it can only ever say "short", never
+# which of the six tags was refused or why.
+_xf_seed_gen() {
+  awk -v tag="$t" -v n=$PER 'BEGIN{for(i=0;i<n;i++){k=sprintf("{%s}k%05d",tag,i);v=sprintf("%s:%05d",tag,i);printf "*3\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n",length(k),k,length(v),v}}'
+}
 for t in $TAGS; do
-  awk -v tag="$t" -v n=$PER 'BEGIN{for(i=0;i<n;i++){k=sprintf("{%s}k%05d",tag,i);v=sprintf("%s:%05d",tag,i);printf "*3\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n",length(k),k,length(v),v}}' \
-    | valkey-cli -p $P0 --pipe >/dev/null
+  fleet_load_resp "$P0" _xf_seed_gen "$PER" || exit 1
 done
 TOTAL=$(valkey-cli -p $P0 DBSIZE)
 echo "  $TOTAL keys on :$P0 across 6 tags"

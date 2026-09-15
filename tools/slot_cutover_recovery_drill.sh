@@ -125,8 +125,12 @@ run_once() {
   fleet_wait_ready $SPORT
   fleet_wait_ready $DPORT
 
-  awk -v n="$KEYS" 'BEGIN{for(i=0;i<n;i++){k=sprintf("{mover}:key%06d",i);v=sprintf("val-%06d",i);printf "*3\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n",length(k),k,length(v),v}}' \
-    | valkey-cli -p $SPORT --pipe >/dev/null
+  # THROUGH fleet_load_resp (BUG-0147): a seed that was refused and a slot
+  # that failed to move are the same silence otherwise.
+  _scr_seed_gen() {
+    awk -v n="$KEYS" 'BEGIN{for(i=0;i<n;i++){k=sprintf("{mover}:key%06d",i);v=sprintf("val-%06d",i);printf "*3\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n",length(k),k,length(v),v}}'
+  }
+  fleet_load_resp "$SPORT" _scr_seed_gen "$KEYS" || exit 1
 
   # Throttle the source's outbound copy so every phase below is reachable
   # regardless of how fast this machine is.
@@ -262,8 +266,10 @@ test_half_done_flip() {
   # ready, not listening -- see the note at the first restart (BUG-0132)
   fleet_wait_ready $SPORT
   fleet_wait_ready $DPORT
-  awk 'BEGIN{for(i=0;i<2000;i++){k=sprintf("{mover}:key%06d",i);printf "*3\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$5\r\nvalue\r\n",length(k),k}}' \
-    | valkey-cli -p $SPORT --pipe >/dev/null
+  _scr_reseed_gen() {
+    awk 'BEGIN{for(i=0;i<2000;i++){k=sprintf("{mover}:key%06d",i);printf "*3\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$5\r\nvalue\r\n",length(k),k}}'
+  }
+  fleet_load_resp "$SPORT" _scr_reseed_gen 2000 || exit 1
   # Ship data to the dest (no cutover), then place the half-done-flip state:
   # dest owns (has the data, no record), source frozen Migrating to dest.
   valkey-cli -p $DPORT FLINTMIGRATEIN "$SADDR" "$SLOT" >/dev/null

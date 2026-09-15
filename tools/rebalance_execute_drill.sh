@@ -43,12 +43,20 @@ for p in $P0 $P1 $P2; do [ "$(valkey-cli -p $p PING)" = "PONG" ] || { echo "FAIL
 
 # g0 heavily loaded across 6 distinct hash-tag slots; g1/g2 lightly loaded.
 echo "== seed: g0 = 6 tags x 4000 keys = 24000; g1 = g2 = 2000"
+# THROUGH fleet_load_resp (BUG-0147): a bare `--pipe >/dev/null` cannot say
+# why a seed was refused, and every count below reads the same on a refusal as
+# on a loss.
+_rx_tag_gen() {
+  awk -v tag="$t" 'BEGIN{for(i=0;i<4000;i++){k=sprintf("{%s}:key%05d",tag,i);v=sprintf("%s-%05d",tag,i);printf "*3\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n",length(k),k,length(v),v}}'
+}
+_rx_light_gen() {
+  awk -v tag="$t" 'BEGIN{for(i=0;i<2000;i++){k=sprintf("{%s}:key%05d",tag,i);printf "*3\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$1\r\nv\r\n",length(k),k}}'
+}
 for t in mv0 mv1 mv2 mv3 mv4 mv5; do
-  awk -v tag="$t" 'BEGIN{for(i=0;i<4000;i++){k=sprintf("{%s}:key%05d",tag,i);v=sprintf("%s-%05d",tag,i);printf "*3\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n",length(k),k,length(v),v}}' \
-    | valkey-cli -p $P0 --pipe >/dev/null
+  fleet_load_resp "$P0" _rx_tag_gen 4000 || exit 1
 done
-awk 'BEGIN{for(i=0;i<2000;i++){k=sprintf("{g1}:key%05d",i);printf "*3\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$1\r\nv\r\n",length(k),k}}' | valkey-cli -p $P1 --pipe >/dev/null
-awk 'BEGIN{for(i=0;i<2000;i++){k=sprintf("{g2}:key%05d",i);printf "*3\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$1\r\nv\r\n",length(k),k}}' | valkey-cli -p $P2 --pipe >/dev/null
+t=g1; fleet_load_resp "$P1" _rx_light_gen 2000 || exit 1
+t=g2; fleet_load_resp "$P2" _rx_light_gen 2000 || exit 1
 T0=$(valkey-cli -p $P0 DBSIZE); T1=$(valkey-cli -p $P1 DBSIZE); T2=$(valkey-cli -p $P2 DBSIZE)
 TOTAL=$((T0+T1+T2))
 echo "  fills: g0=$T0 g1=$T1 g2=$T2 total=$TOTAL"
