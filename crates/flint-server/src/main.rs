@@ -8122,6 +8122,52 @@ mod accepted_flags {
             "the replica module no longer calls hard_exit at all — either the \
              WALGAP exit path is gone, or this scan is reading the wrong text"
         );
+
+        // CRATE-WIDE, because the property is. BUG-0048 is a plain exit racing
+        // RocksDB's static teardown, and a sibling module can do that exactly
+        // as well as this file can -- but every assertion above reads
+        // `include_str!("main.rs")` and nothing else.
+        //
+        // That narrowness is its own bug class, and flint-controlplane paid for
+        // it: BUG-0150 was a source-scanning guard reading one of two control
+        // planes for a property that spanned both, with its own forbidden
+        // literal sitting in the file it never opened, passing. There is no
+        // violation in these eight modules today -- which is the reason the
+        // expected count below is a flat zero rather than a number to raise,
+        // and the reason to write the scan now rather than after one appears.
+        for (name, whole) in [
+            ("commands.rs", include_str!("commands.rs")),
+            ("diskguard.rs", include_str!("diskguard.rs")),
+            ("heat.rs", include_str!("heat.rs")),
+            ("json_path.rs", include_str!("json_path.rs")),
+            ("migrate.rs", include_str!("migrate.rs")),
+            ("repl_hub.rs", include_str!("repl_hub.rs")),
+            ("write_lock.rs", include_str!("write_lock.rs")),
+            ("write_queue.rs", include_str!("write_queue.rs")),
+        ] {
+            let sib = whole
+                .split("\n#[cfg(test)]")
+                .next()
+                .expect("source is non-empty");
+            // CONTROL, same reason as the `hard_exit(` anchor above: a scan
+            // that read nothing reports exactly as a scan that found nothing.
+            // The files themselves are compile-enforced by `include_str!`; what
+            // is not is whether the cut left any production text behind.
+            assert!(
+                !sib.trim().is_empty(),
+                "{name}'s production half is empty after the #[cfg(test)] cut — \
+                 this scan read nothing, which is not the same as finding nothing"
+            );
+            assert_eq!(
+                sib.matches(needle).count(),
+                0,
+                "{name} calls std::process::exit directly. main.rs tolerates a \
+                 count above zero only for sites that run on the main thread \
+                 BEFORE the store is opened; a call out here cannot be shown to, \
+                 so it is BUG-0048's race with RocksDB's static teardown. Use \
+                 hard_exit."
+            );
+        }
     }
 
     /// ACCEPTED_FLAGS is written by hand; `arg()` call sites are added by

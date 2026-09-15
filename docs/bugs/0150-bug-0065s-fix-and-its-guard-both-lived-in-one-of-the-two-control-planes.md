@@ -78,3 +78,27 @@ the master that was just fenced in. Unmutated, 41 tests pass.
 See BUG-0151. Containment keys on the address being fenced, so it cannot find a
 row for a member that was not in the pair when the row was written — a hole
 both control planes share, and a different question from this one.
+
+## The same shape elsewhere, swept 2026-09-15
+
+Every source-scanning test in the workspace was checked against the question
+this bug asks — *does the scan read everywhere the property lives?*
+
+- `flint-ctl` is one file, so its scan is complete by construction.
+- `flint-server` has **nine** modules and four such tests. Three are safe for a
+  reason rather than by luck: two assert an ORDER between two specific
+  statements in one function, and `every_arg_call_site_is_listed` scans `arg()`
+  call sites, which exist only in `main.rs` (verified, not assumed).
+- The fourth, `plain_process_exit_stays_out_of_the_running_paths`, was the same
+  shape as this bug. BUG-0048 is a plain `std::process::exit` racing RocksDB's
+  static teardown, which a sibling module can do exactly as well as `main.rs`
+  can — and the scan read `include_str!("main.rs")` and nothing else.
+
+**There was no violation hiding behind it.** All eight siblings were clean, so
+this is the latent form of what BUG-0150 was the live form of. The scan now
+covers all eight, with a flat expected count of zero — `main.rs` tolerates its
+eight because they run on the main thread before the store is opened, and a
+call out in a module cannot be shown to — plus an emptiness control, because a
+scan that read nothing reports exactly as a scan that found nothing.
+
+Mutation-confirmed: a plain exit added to `heat.rs` fails the test by name.
