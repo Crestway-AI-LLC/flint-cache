@@ -443,6 +443,28 @@ pub fn refill_after_retire<'a>(
     }
 }
 
+/// THE one way a lease row is resolved, for BOTH control planes.
+///
+/// A row is `(pair members, master-of-record, generation)` and it is found by
+/// MEMBERSHIP CONTAINMENT: the first row whose members include `addr`.
+///
+/// BUG-0065: the fence wrote by member-vector EQUALITY while the renewal read
+/// by containment, so with two rows for one pair the fence updated one and the
+/// renewal read the other -- and a freshly promoted master was told it had
+/// been superseded by the peer it had just replaced. One key means the write
+/// and the read cannot land on different rows whatever the table holds; a
+/// duplicate becomes merely stale instead of contradictory.
+///
+/// BUG-0150: that fix, and the structural test that holds it shut, lived in
+/// `main.rs` -- and the test read `include_str!("main.rs")`, so the raft state
+/// machine kept resolving rows by equality with the forbidden literal sitting
+/// in a file the guard did not open. Hence this function is here, where both
+/// paths can reach it, rather than beside one of them.
+pub fn lease_row_index(rows: &[(Vec<String>, String, u64)], addr: &str) -> Option<usize> {
+    rows.iter()
+        .position(|(m, _, _)| m.iter().any(|x| x == addr))
+}
+
 /// The `CPMYSTATUS` body (ADR-0014 D3), formatted once for both control planes.
 ///
 /// BUG-0148: this verb was dispatched ONLY by the single-node control plane.

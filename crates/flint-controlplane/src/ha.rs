@@ -592,7 +592,17 @@ async fn handle_admin(ha: &Ha, args: &[Vec<u8>]) -> Value {
                 return Value::Error("ERR CPADDPAIR <a,b[,c]>".into());
             };
             let range = text(2).as_deref().and_then(crate::state::parse_range);
-            let pair = nodes.split(',').map(String::from).collect();
+            // CANONICALISE BEFORE PROPOSING, exactly as the single-node
+            // CPADDPAIR does. BUG-0065's root fix, missing here (BUG-0150):
+            // lease lookups are membership CONTAINMENT, so unsorted,
+            // `CPADDPAIR a,b` and `CPADDPAIR b,a` pass apply's `contains`
+            // dedupe as TWO pairs while every containment check reads them as
+            // one -- which is how a pair gets two lease rows in the first
+            // place. Sorted in the handler rather than in apply() so the state
+            // machine's behaviour on already-committed log entries is
+            // unchanged.
+            let mut pair: Vec<String> = nodes.split(',').map(String::from).collect();
+            pair.sort();
             match ha.propose(Mutation::AddPair { nodes: pair, range }).await {
                 Ok(_) => Value::Simple("OK".into()),
                 Err(l) => redirect(l),
@@ -716,8 +726,12 @@ async fn handle_admin(ha: &Ha, args: &[Vec<u8>]) -> Value {
             }
             let t0 = std::time::Instant::now();
             let reg = ha.store.registry().await;
-            if let Some((_, master, _)) = reg.leases.iter().find(|(m, _, _)| m.contains(&addr)) {
-                let master = master.clone();
+            // THE one key, shared with the fence's write in registry::apply and
+            // with the single-node path (BUG-0150). This read was already
+            // containment-shaped; going through the named function is what lets
+            // one structural test hold every site shut at once.
+            if let Some(i) = crate::tenant::lease_row_index(&reg.leases, &addr) {
+                let master = reg.leases[i].1.clone();
                 drop(reg);
                 if let Ok(mut m) = ha.lease_meter.lock() {
                     m.0 += 1;

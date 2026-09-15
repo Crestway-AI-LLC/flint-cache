@@ -1520,10 +1520,7 @@ fn build_version() -> String {
 /// Returning an INDEX rather than a reference is deliberate: the fence needs a
 /// mutable borrow of the same row it just located, and an index survives the
 /// borrow ending.
-fn lease_row_index(rows: &[(Vec<String>, String, u64)], addr: &str) -> Option<usize> {
-    rows.iter()
-        .position(|(m, _, _)| m.iter().any(|x| x == addr))
-}
+use crate::tenant::lease_row_index;
 
 fn main() -> std::io::Result<()> {
     // Before --raft dispatch: asking a binary what it is must not depend on
@@ -1882,31 +1879,57 @@ mod lease_row_key_tests {
     /// cannot reach from here.
     #[test]
     fn no_site_resolves_a_lease_row_by_member_vector_equality() {
-        // Only the PRODUCTION half: this test names the forbidden patterns as
-        // string literals, so scanning the whole file matches itself and fails
-        // for its own text. Found exactly that way on the first run.
-        let whole = include_str!("main.rs");
-        let src = whole.split("#[cfg(test)]").next().unwrap_or(whole);
-        for pat in [
-            "st.leases.iter_mut().find(",
-            "lf.entries.iter_mut().find(",
-            "lf.entries.iter().find(",
-            "m == &members",
+        // Only the PRODUCTION half of each file: this test names the forbidden
+        // patterns as string literals, so scanning a test module matches the
+        // test's own text. Found exactly that way on the first run.
+        //
+        // ALL FOUR control-plane sources, not just this one. The first version
+        // read `include_str!("main.rs")` alone, and BUG-0150 is what that cost:
+        // `m == &members` -- this test's OWN forbidden literal -- sat in
+        // registry.rs, twice, in the raft state machine, while this test
+        // passed. A guard that reads one of two implementations reports on the
+        // one that was already correct.
+        for (name, whole) in [
+            ("main.rs", include_str!("main.rs")),
+            ("registry.rs", include_str!("registry.rs")),
+            ("ha.rs", include_str!("ha.rs")),
+            ("state.rs", include_str!("state.rs")),
         ] {
+            let src = whole.split("#[cfg(test)]").next().unwrap_or(whole);
+            for pat in [
+                "m == &members",
+                ".leases.iter_mut().find(",
+                ".leases.iter().find(",
+                ".leases.iter().any(",
+                ".entries.iter_mut().find(",
+                ".entries.iter().find(",
+            ] {
+                assert!(
+                    !src.contains(pat),
+                    "{name} resolves a lease row by `{pat}` instead of \
+                     tenant::lease_row_index(); an asymmetry between the fence's \
+                     write key and the renewal's read key IS BUG-0065, and having it \
+                     in only one of the two control planes IS BUG-0150"
+                );
+            }
+        }
+        // And the one key is actually used by every path that resolves a row:
+        // three sites in the single-node dispatcher, both writes in the raft
+        // state machine, and the raft renewal read.
+        for (name, whole, least) in [
+            ("main.rs", include_str!("main.rs"), 3usize),
+            ("registry.rs", include_str!("registry.rs"), 2),
+            ("ha.rs", include_str!("ha.rs"), 1),
+        ] {
+            let src = whole.split("#[cfg(test)]").next().unwrap_or(whole);
+            let n = src.matches("lease_row_index(").count();
             assert!(
-                !src.contains(pat),
-                "a lease row is being resolved by `{pat}` instead of lease_row_index(); \
-                 that asymmetry between the fence's write key and the renewal's read key \
-                 IS BUG-0065"
+                n >= least,
+                "{name} references lease_row_index() {n} times, expected at least \
+                 {least} -- a site that stopped using the one key is the defect \
+                 returning, and this count is what noticed"
             );
         }
-        // And the one key is actually used by all three sites.
-        assert!(
-            src.matches("lease_row_index(").count() >= 4,
-            "expected the renewal read, both fence writes and the definition to \
-             reference lease_row_index; found {}",
-            src.matches("lease_row_index(").count()
-        );
     }
 
     /// The root fix: sorting at registration makes `a,b` and `b,a` one vector,

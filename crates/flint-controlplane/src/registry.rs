@@ -389,10 +389,18 @@ impl RegistryState {
                 // stay total, so an addr outside every pair is a no-op
                 // rather than a divergence.
                 if let Some(members) = self.pairs.iter().find(|p| p.contains(&addr)).cloned() {
-                    match self.leases.iter_mut().find(|(m, _, _)| m == &members) {
-                        Some(rec) => {
-                            rec.1 = addr.clone();
-                            rec.2 += 1;
+                    // BUG-0150: this resolved the row by member-vector EQUALITY
+                    // while ha.rs's CPLEASE renewal reads it by containment --
+                    // the exact asymmetry BUG-0065 closed in the single-node
+                    // path and never here. `members` is recomputed from
+                    // `self.pairs`, so any membership change (CPSETPAIR) left
+                    // the existing row unequal and pushed a SECOND row for the
+                    // same pair; the renewal's containment find then returned
+                    // whichever came first.
+                    match crate::tenant::lease_row_index(&self.leases, &addr) {
+                        Some(i) => {
+                            self.leases[i].1 = addr.clone();
+                            self.leases[i].2 += 1;
                         }
                         None => self.leases.push((members, addr.clone(), 1)),
                     }
@@ -404,8 +412,9 @@ impl RegistryState {
                 }
             }
             Mutation::LeaseAdopt { addr } => {
+                // Same one key as Fence above and as the renewal read (BUG-0150).
                 if let Some(members) = self.pairs.iter().find(|p| p.contains(&addr)).cloned()
-                    && !self.leases.iter().any(|(m, _, _)| m == &members)
+                    && crate::tenant::lease_row_index(&self.leases, &addr).is_none()
                 {
                     self.leases.push((members, addr, 0));
                 }
@@ -616,6 +625,108 @@ mod family_tests {
         let r: RegistryState = serde_json::from_str(json).expect("deserialize pre-family state");
         assert!(r.families.is_empty());
         assert_eq!(r.families_spec(), "");
+    }
+}
+
+/// BUG-0150: the lease-row key, on the RAFT path. `main.rs` was fixed for
+/// BUG-0065 and this file was not, so these are the states the equality key
+/// used to reach and cannot any more. The last one is the control: a key
+/// widened into "always find something" would satisfy the first two.
+#[cfg(test)]
+mod bug_0150_lease_key_tests {
+    use super::*;
+
+    fn pair_of(r: &mut RegistryState, nodes: &[&str]) {
+        r.apply(Mutation::AddPair {
+            nodes: nodes.iter().map(|s| s.to_string()).collect(),
+            range: None,
+        });
+    }
+
+    /// THE defect, behaviourally. TWO ROWS FOR ONE PAIR is the state BUG-0065
+    /// was about, and it is reachable here because the raft `AddPair` had no
+    /// canonicalisation: `a,b` and `b,a` both registered, so a row could be
+    /// keyed on one vector while the fence recomputes the other.
+    ///
+    /// Keyed by member-vector EQUALITY the fence cannot see that row, pushes a
+    /// SECOND one, and the renewal -- which reads by containment -- returns
+    /// whichever comes first. The fence writes one row and the renewal reads
+    /// the other: a freshly promoted master told it was superseded by the peer
+    /// it just replaced.
+    ///
+    /// Keyed by containment, both land on the same row whatever the table
+    /// holds, and a duplicate is merely stale instead of contradictory.
+    #[test]
+    fn a_fence_updates_the_same_row_the_renewal_reads() {
+        let mut r = RegistryState::default();
+        pair_of(&mut r, &["a:1", "b:2"]);
+        // A row keyed on the OTHER ordering -- what an un-canonicalised
+        // registration used to leave behind. b:2 is the master on record.
+        r.leases = vec![(
+            vec!["b:2".to_string(), "a:1".to_string()],
+            "b:2".to_string(),
+            3,
+        )];
+
+        r.apply(Mutation::Fence {
+            addr: "a:1".to_string(),
+        });
+
+        assert_eq!(
+            r.leases.len(),
+            1,
+            "the fence must UPDATE the row the renewal will read, not add a \
+             second one beside it: {:?}",
+            r.leases
+        );
+        let i = crate::tenant::lease_row_index(&r.leases, "a:1").expect("a row for a:1");
+        assert_eq!(
+            r.leases[i].1, "a:1",
+            "the row the renewal reads must name the freshly fenced master"
+        );
+        assert_eq!(
+            r.leases[i].2, 4,
+            "the generation advances on the row it found"
+        );
+    }
+
+    /// The other half of BUG-0065's fix, which was also missing here: the raft
+    /// handler now sorts before proposing, so `a,b` and `b,a` are one pair to
+    /// apply's `contains` dedupe as well as to every containment check. This
+    /// asserts what apply() does with the canonical form the handler sends.
+    #[test]
+    fn a_reordered_pair_does_not_register_twice() {
+        let mut r = RegistryState::default();
+        let mut ab = vec!["a:1".to_string(), "b:2".to_string()];
+        let mut ba = vec!["b:2".to_string(), "a:1".to_string()];
+        ab.sort();
+        ba.sort();
+        pair_of(&mut r, &["a:1", "b:2"]);
+        r.apply(Mutation::AddPair {
+            nodes: ba.clone(),
+            range: None,
+        });
+        assert_eq!(
+            r.pairs.len(),
+            1,
+            "canonicalised, the reordered pair is the same pair: {:?}",
+            r.pairs
+        );
+        assert_eq!(ab, ba);
+    }
+
+    /// A lease row is found by CONTAINMENT, and the demoted peer must still
+    /// read as superseded -- the assertion that would fail if the key were
+    /// widened into "always answer OK".
+    #[test]
+    fn the_demoted_peer_still_resolves_to_the_row_naming_the_new_master() {
+        let mut r = RegistryState::default();
+        pair_of(&mut r, &["a:1", "b:2"]);
+        r.apply(Mutation::Fence {
+            addr: "a:1".to_string(),
+        });
+        let i = crate::tenant::lease_row_index(&r.leases, "b:2").expect("row via the peer");
+        assert_eq!(r.leases[i].1, "a:1", "b:2 must not read itself as master");
     }
 }
 
