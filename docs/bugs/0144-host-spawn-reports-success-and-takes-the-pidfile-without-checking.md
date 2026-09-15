@@ -72,8 +72,23 @@ rather than done:
   unrelated process, which is why `pids_matching` matches the ident as a
   whole token rather than trusting a number. The guard has to ask *is a
   process with this pid AND this seat's ident alive*, and `local_spawn_env`
-  is not given the ident — `host-spawn` never receives one. Adding it is a
-  signature change across every spawn call site.
+  is not given the ident — `host-spawn` never receives one.
+
+  **Measured rather than estimated, because the first version of this bullet
+  said "a signature change across every spawn call site" and that conflates
+  two numbers.** `local_spawn_env` itself has **two** call sites: the local
+  branch of `spawn_env`, and the `host-spawn` handler. But the ident is
+  *caller* knowledge — `seat_alive`'s callers pass `cp_seat_state(inv, i)` or
+  the node's data dir — so threading it means touching `spawn_env`/`spawn`'s
+  **fourteen** callers, not two.
+
+  The cheaper alternatives were considered and do not work. Matching on `bin`
+  alone is what pid reuse defeats, and a box running many `flint-server`
+  processes is exactly where reuse lands on another one. Matching on the seat
+  NAME, which `local_spawn_env` already has, fails because the name is not
+  reliably in the argv: a node's is (`--data-dir …/node-7002`), the CP's is
+  not (`cp-n1` is not a substring of `cp-state-n1`), and a proxy's is not
+  (`proxy-7379` versus `--port 7379`).
 - **This is the path every roll takes.** A wrong refusal here fails an
   upgrade mid-fleet, which is worse than the race it prevents.
 
