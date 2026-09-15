@@ -373,11 +373,34 @@ echo "== arm E: a snapshot quarantined ABOVE the coming fence is reconsidered"
 # promotion below fences far lower, so the premise no longer holds.
 diverged_rejoin qe "unresumable-c999999-"
 wait_rejoin "$D/qe-a2.log"
-grep -q "rewound to" "$D/qe-a2.log" || {
-  echo "FAIL: arm E — a quarantined snapshot was not reconsidered under a LOWER fence."
-  echo "      This is BUG-0071: the re-seed holds the write gate shut for the whole"
-  echo "      transfer at min-replicas-to-write=1 (94.2 s measured)."
-  sed 's/^/    /' "$D/qe-a2.log"; exit 1; }
+# TWO STEPS, and this arm asserted on the second while reporting the first.
+# `rewound to` is only reached if the quarantined snapshot is BOTH reconsidered
+# AND resumable, so every failure of the resume was announced as "not
+# reconsidered" -- with BUG-0071 named as the cause. On 2026-09-15 that message
+# was printed over a log that said, four lines up, `candidate
+# unresumable-c999999-snap-...seq202-e0.1 clears the fence for epoch (0,1)
+# (202 <= 202)`: the reconsideration this arm exists to prove had WORKED, and
+# the rejoin then fell back to a full re-seed because the upstream WAL no
+# longer retained the span (`WALGAP ... the span needed for an incremental
+# rejoin is gone`). Those are different findings with different owners -- one
+# is the quarantine rule, the other is WAL retention against this drill's own
+# timing -- and a reader who believed the message would have investigated the
+# wrong one.
+if ! grep -q "rewound to" "$D/qe-a2.log"; then
+  if grep -q "clears the fence" "$D/qe-a2.log"; then
+    echo "FAIL: arm E — the quarantined snapshot WAS reconsidered and DID clear the"
+    echo "      fence, and the rejoin still did not rewind. The quarantine rule this"
+    echo "      arm covers is not what failed; the resume after it is:"
+    grep -E "cannot resume|full re-seed|WALGAP" "$D/qe-a2.log" | sed 's/^/        /'
+    echo "      Look at upstream WAL RETENTION and at this drill's timing, not at"
+    echo "      BUG-0071's quarantine reconsideration."
+  else
+    echo "FAIL: arm E — a quarantined snapshot was not reconsidered under a LOWER fence."
+    echo "      This is BUG-0071: the re-seed holds the write gate shut for the whole"
+    echo "      transfer at min-replicas-to-write=1 (94.2 s measured)."
+  fi
+  sed 's/^/    /' "$D/qe-a2.log"; exit 1
+fi
 grep -q "full sync: received" "$D/qe-a2.log" && { echo "FAIL: arm E transferred a checkpoint anyway"; exit 1; }
 echo "  reconsidered under a lower fence, rewound without a transfer"
 
