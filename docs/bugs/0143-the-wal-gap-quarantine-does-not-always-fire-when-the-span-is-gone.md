@@ -1,8 +1,46 @@
 # BUG-0143 — the WAL-gap quarantine does not always fire when the span is gone
 
-**Status:** OPEN — observed 2026-09-14 on the gate box, **2 of 3 consecutive
-runs**. Not mine and not investigated beyond what the drill reports; filed so
-the next full gate does not read a red `walgap_quarantine` as noise.
+**Status:** FIXED 2026-09-14 — **and the quarantine was never broken.** The
+drill was asserting something it had not established. Filed OPEN the same day,
+observed 2 of 3 consecutive runs on the gate box; everything below the fix
+section is the original report and is left as written.
+
+## The fix: the precondition was about B, not about A
+
+The drill proves that **B would refuse** cursor 604 if asked. It then judges
+**A** for not quarantining, in a message that asserts *"A really asked for
+it"* — which nothing had checked, and which is often false.
+
+The master does not tear down a stalled replica. Its per-replica send loop
+treats a write timeout as backpressure, not as a death (`main.rs`, the 50 ms
+`set_write_timeout` and its `WouldBlock | TimedOut` arm): it drains acks and
+retries, unbounded. So B holds A's link open for the entire `SIGSTOP`. On
+`SIGCONT`, A reads the batches already in flight, applies them **in order**,
+and never re-issues `FLINTSYNC` — so it never sees the WALGAP.
+
+**That outcome is correct.** A received every sequence. There is no gap for a
+quarantine to protect against, and the archive recycling is irrelevant to a
+replica that never has to re-request. The intermittency was whether the stall
+happened to break the link — which the drill does not control and never
+checked.
+
+**So the drill no longer resumes A. It kills it while it is still stopped.**
+A then never drains what is in flight, its persisted cursor stays at the
+purged value, and the restart must re-admit from there — the state under test,
+reached deterministically rather than by hoping. `SIGKILL` is not blockable
+and needs no scheduling, so a stopped process dies without running again.
+
+The failure message now distinguishes the two states before judging: if A did
+re-admit and still did not quarantine, that is the original, real assertion
+and it stands word for word; if A never re-admitted, the drill says the setup
+did not reach the state instead of blaming the fix.
+
+**What this does not change:** nothing in the product. No quarantine code was
+touched, because none of it was wrong. The three questions the original report
+listed as unestablished are answered by the mechanism above, except the last —
+ownership — which is now moot.
+
+---
 
 ## What happened
 

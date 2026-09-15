@@ -157,24 +157,65 @@ case "$PROBE" in
 esac
 echo "  the refusal describes the archive it refused from"
 
-kill -CONT "$APID" || { echo "FAIL: could not resume A"; exit 1; }
-echo "  A stalled at seq $CURSOR; B recycled past it"
+# BUG-0143. THE PRECONDITION ABOVE IS ABOUT B, NOT ABOUT A, and the gap
+# between those two is the whole bug this block used to report.
+#
+# What is proven above is that B would REFUSE cursor $CURSOR if asked. Whether
+# A asks is a separate question, and SIGCONT does not settle it: the master's
+# per-replica send loop treats a write timeout to a stalled replica as
+# backpressure, not as a death — it drains acks and retries, unbounded (the
+# 50 ms `set_write_timeout` and its `WouldBlock | TimedOut` arm in main.rs).
+# So B holds the link open across the whole SIGSTOP. On SIGCONT, A reads the
+# batches already in flight, applies them IN ORDER, and never re-issues
+# FLINTSYNC — so it never sees the WALGAP, and no quarantine fires.
+#
+# THAT OUTCOME IS CORRECT: A received every sequence, so there is no gap for a
+# quarantine to protect against, and the archive recycling is irrelevant to a
+# replica that never has to re-request. This block used to call it a product
+# defect, in a message asserting "A really asked for it" that nothing had
+# checked. It failed 2 of 3 gate runs and was filed as BUG-0143 against a fix
+# that was working.
+#
+# SO DO NOT RESUME A — KILL IT WHILE IT IS STILL STOPPED. It then never drains
+# what is in flight, its PERSISTED cursor stays at $CURSOR, and the restart
+# below must re-admit from there. That is the state under test, reached
+# deterministically instead of hoping the stall breaks the link. SIGKILL is
+# not blockable and does not require the process to be scheduled, so a stopped
+# process dies without ever running again.
+LINES_BEFORE=$(wc -l < "$D/a2.log")
+kill -KILL "$APID" 2>/dev/null
+for _ in $(seq 1 100); do kill -0 "$APID" 2>/dev/null || break; sleep 0.1; done
+kill -0 "$APID" 2>/dev/null && { echo "FAIL: A survived SIGKILL while stopped"; exit 1; }
+echo "  A killed at seq $CURSOR without draining; B recycled past it"
 
-echo "== A's tailer must hit WalPurged and QUARANTINE, not loop"
+echo "== A must re-admit from its persisted cursor, hit WalPurged, and QUARANTINE"
+$B --port 6412 --engine rocks --data-dir "$D/a" --replica-of 127.0.0.1:6413 \
+   --rewind-snaps "$D/snaps-a" >>"$D/a2.log" 2>&1 &
 ok=0
 for _ in $(seq 1 300); do
   grep -q "quarantine:" "$D/a2.log" && { ok=1; break; }
   sleep 0.1
 done
-[ "$ok" = 1 ] || {
-  echo "FAIL: no quarantine after the purge. A's log:"
+if [ "$ok" != 1 ]; then
+  # Which state was actually reached? A fresh admission logs "replicating
+  # from"; read only what A wrote AFTER the kill, so a line from the first
+  # attach cannot answer for this one.
+  REASKED=$(tail -n "+$((LINES_BEFORE + 1))" "$D/a2.log" | grep -c "replicating from" || true)
+  echo "FAIL: no quarantine after the purge. A's log since the kill:"
   tail -25 "$D/a2.log" | sed 's/^/    /'
-  echo "      The precondition was PROVEN above: B answered WALGAP for this"
-  echo "      cursor before A was resumed. So the span really is gone, A really"
-  echo "      asked for it, and the quarantine really did not fire. This is a"
-  echo "      finding about the fix, not about the drill."
+  if [ "${REASKED:-0}" -eq 0 ]; then
+    echo "      AND A never re-admitted ($REASKED new \"replicating from\" line(s))."
+    echo "      That is a SETUP failure, not a finding about the quarantine:"
+    echo "      the restarted A did not get as far as asking B for a span."
+  else
+    echo "      A re-admitted after the kill ($REASKED new admission(s)) and B"
+    echo "      answered WALGAP for that cursor above. So the span really is"
+    echo "      gone, A really asked for it, and the quarantine really did not"
+    echo "      fire. This is a finding about the fix, not about the drill."
+  fi
   exit 1
-}
+fi
+
 grep -q "FATAL:.*never resume" "$D/a2.log" || {
   echo "FAIL: quarantined without the WalPurged escalation — wrong trigger"; exit 1
 }
