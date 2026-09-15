@@ -3996,7 +3996,14 @@ GATE_SUBJECT="${FLINT_GATE_SUBJECT:-UNDECLARED (caller passed no FLINT_GATE_SUBJ
 echo
 if [ -n "$FAILED" ]; then
   echo "GATES FAILED:$FAILED"
-  echo "  subject: $GATE_SUBJECT"
+  # THE COUNT, ON THE FAILURE PATH TOO (OPS-0257). This line printed the
+  # subject and not $RAN_STEPS, while the PASSED banner below carries both --
+  # so the gate ledger, which parses the count out of the verdict, recorded
+  # null for every failing run in this lane: 28 of the 34 FAIL rows on record.
+  # The committed row could not separate "died at bring-up" from "145 of 146
+  # steps passed and one drill went red", and those call for opposite
+  # responses. RAN_STEPS is already in scope; only the printing was missing.
+  echo "  after $RAN_STEPS steps, subject: $GATE_SUBJECT"
   echo "  logs: $LOGS"
   # DUMP THE FAILING LOGS INLINE (docs/bugs/0021).
   #
