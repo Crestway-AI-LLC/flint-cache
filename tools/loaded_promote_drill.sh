@@ -50,6 +50,7 @@ RPORT=6957
 MDIR="$FLINT_DRILL_ROOT/flint-loadpromote/m"
 RDIR="$FLINT_DRILL_ROOT/flint-loadpromote/r"
 CTLLOG="$FLINT_DRILL_ROOT/flint-loadpromote-ctl.log"
+FEEDLOG="$FLINT_DRILL_ROOT/flint-loadpromote-feed.log"
 B=./target/release/flint-server
 # How long the controller may take to promote. Generous on purpose: the
 # assertion that matters is "it promotes AT ALL", not the millisecond count
@@ -98,7 +99,13 @@ for i in range(20000):
     k = b"load:%08d" % i
     out.write(b"*3\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$8\r\nvalue123\r\n" % (len(k), k))
 ' 2>/dev/null || break
-  done | valkey-cli -p "$MPORT" --pipe ) >/dev/null 2>&1 &
+  # KEEP WHAT THE FEEDER SAYS (BUG-0147). The sweep that routed the SEEDS
+  # through fleet_load_resp did not reach this one, because it is not a seed --
+  # it is the background load the drill exists to apply, and it runs detached.
+  # The control below already asks the right question, "is valkey-cli --pipe
+  # keeping up?", and had no way to answer it. A file rather than a variable
+  # because this is a background job.
+  done | valkey-cli -p "$MPORT" --pipe ) >"$FEEDLOG" 2>&1 &
 FEEDER=$!
 
 # THE POSITIVE CONTROL. Sample until we SEE a non-zero seq_lag; without this
@@ -113,7 +120,8 @@ for _ in $(seq 1 40); do
   esac
   sleep 0.25
 done
-[ -n "$SAW_LAG" ] || fail "seq_lag never left 0 — the writer is not loading the pair, so this drill would test nothing (is valkey-cli --pipe keeping up?)"
+[ -n "$SAW_LAG" ] || { echo "  the feeder reported: $(tr -d '\r' < "$FEEDLOG" 2>/dev/null | tail -3)"; \
+  fail "seq_lag never left 0 — the writer is not loading the pair, so this drill would test nothing (is valkey-cli --pipe keeping up?)"; }
 echo "  seq_lag observed non-zero under load (max seen ${MAXLAG}) — the regime is real"
 
 echo "== 2. start the controller INTO that load"

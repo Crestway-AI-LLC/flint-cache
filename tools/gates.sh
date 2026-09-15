@@ -3531,6 +3531,41 @@ assert_bootstrap_failures_say_why() {
   FAILED="$FAILED bootstrap-detail"
 }
 
+assert_pipe_output_is_kept() {
+  local drills bad n
+  drills=$(ls tools/*_drill.sh 2>/dev/null | wc -l | tr -d " ")
+  # TRI-STATE, the same as its neighbour: zero drills means this scan examined
+  # nothing, which is not the same as finding nothing wrong.
+  if [ "${drills:-0}" -eq 0 ]; then
+    echo "FAIL  no tools/*_drill.sh found -- this check examined nothing"
+    FAILED="$FAILED pipe-detail-unreadable"
+    return 0
+  fi
+  # BOTH streams, not one. `>/dev/null` alone still leaves stderr, where a
+  # refused connection lands; discarding both is what made a rejected write and
+  # a wrong read arrive as the same empty string (BUG-0147).
+  #
+  # COMMENTS EXCLUDED, and that is not a detail. BUG-0147's own fix quotes the
+  # broken form in a comment explaining what it replaced -- so a matcher that
+  # cannot tell code from prose refuses the very commit that fixed the bug,
+  # which is OPS-0232's lesson about a guard firing where it cannot matter.
+  bad=$(grep -n -- "--pipe[^|]*>/dev/null 2>&1" tools/*_drill.sh 2>/dev/null \
+        | grep -vE ":[0-9]+:[[:space:]]*#")
+  [ -z "$bad" ] && return 0
+  n=$(printf "%s\n" "$bad" | grep -c .)
+  echo "FAIL  $n drill line(s) discard --pipe output, so a refusal cannot say why:"
+  printf "%s\n" "$bad" | sed "s/^/        /"
+  echo "        valkey-cli --pipe reports 'errors: N' and the errors themselves."
+  echo "        For a SEED, route it through fleet_load_resp in tools/lib/fleet.sh,"
+  echo "        which is what BUG-0147's fix did across ten drills. For a"
+  echo "        background writer, redirect to a log the drill's own control"
+  echo "        reads, so 'is --pipe keeping up?' can be answered."
+  echo "        Without it, 'the write was refused' and 'the write landed and the"
+  echo "        read is wrong' are the same message, and they are opposite"
+  echo "        investigations."
+  FAILED="$FAILED pipe-detail"
+}
+
 assert_warm_covers_fleet_binaries() {
   local declared warmed missing b nd nw
   # `index()` rather than a /\];/ range: an escaped bracket is a regex escape
@@ -3601,6 +3636,7 @@ if want check; then
   assert_docs_only_cite_drills_that_run
   assert_warm_covers_fleet_binaries
   assert_bootstrap_failures_say_why
+  assert_pipe_output_is_kept
   report_toolchain_vs_pin
   step "fmt" fmt cargo fmt --all --check
   step "clippy (mem)" clippy-mem \

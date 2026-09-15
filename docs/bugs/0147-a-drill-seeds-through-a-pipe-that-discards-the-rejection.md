@@ -105,6 +105,37 @@ fifty samples of what else is running on the box answer nothing the first one
 did not — while the sibling scan behind it is a `ps` walk, so they are not
 free either.
 
+## The site the sweep did not reach, and a ratchet so the next one cannot hide
+
+The sweep above covered every **seed**. `loaded_promote_drill.sh:101` was not a
+seed and so was not in its population: it is the background load the drill
+exists to apply, piped into `--pipe` from a detached subshell with both streams
+discarded. Its own positive control already asked the right question —
+
+    fail "seq_lag never left 0 — the writer is not loading the pair ...
+          (is valkey-cli --pipe keeping up?)"
+
+— and had no way to answer it. The feeder now writes `$FEEDLOG`, and that
+control prints its last lines before failing. A file rather than a variable
+because the writer is a background job.
+
+**`assert_pipe_output_is_kept`** sits beside `assert_bootstrap_failures_say_why`
+— the check `b7b74a9` added when the same defect was swept out of 23 drills'
+bootstrap lines — and matches only the both-streams form, since `>/dev/null`
+alone still leaves stderr, where a refused connection lands. Tri-state like its
+neighbour: zero drills found is *examined nothing*, not clean.
+
+**It skips comment lines, and that is not a detail.** The fix above quotes the
+broken form in a comment explaining what it replaced, so a matcher that cannot
+tell code from prose refuses the very commit that fixed the bug. That is
+OPS-0232's lesson — a guard that fires where it cannot matter teaches people a
+switch to pass it with — and it was caught by running the guard against the fix
+commit before shipping it, not by reasoning about it.
+
+Verified both ways: against `432f561` it names `loaded_promote_drill.sh:101`
+and nothing else, and the comment at `migrate_slots_drill.sh:61` is not among
+its hits.
+
 ## Still open, on purpose: the bring-up
 
 This bug had two halves and only one is fixed. The seed is still preceded by a
