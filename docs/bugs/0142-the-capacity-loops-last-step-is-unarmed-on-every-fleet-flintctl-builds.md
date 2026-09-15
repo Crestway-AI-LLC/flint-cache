@@ -1,8 +1,24 @@
 # BUG-0142 — the capacity loop's last step is unarmed on every fleet flintctl builds
 
-**Status:** OPEN — found 2026-09-14 while building `expand_fill_drill.sh`, the
-drill for the seam between `expand` and rebalancing. Not fixed here: arming it
-is a decision, not a typo.
+**Status:** **FIXED 2026-09-14** — Jeff's call: arm it, **default off**, add the
+inventory key. Found while building `expand_fill_drill.sh`, the drill for the
+seam between `expand` and rebalancing.
+
+**A CORRECTION TO THIS FILE, found while fixing it.** The text below says the
+controller "plans rebalances and only logs them". It does **not plan at all**:
+the loop is `if cfg.rebalance_deadband > 0.0`, and `flintctl` passed no
+deadband either, so no plan was ever produced for `--rebalance-execute` to
+withhold. The bug was one knob larger than it was written up as.
+
+**The fix is two inventory keys**, `rebalance-deadband` and
+`rebalance-execute`, both absent by default so every inventory in the field
+produces exactly the argv it produced before. `rebalance-execute on` without a
+positive deadband is **refused**: it arms a loop that never produces a move,
+and the failure mode is silence — the fleet looks armed, the operator sees
+nothing happen, and no line anywhere says why. A deadband alone plans and logs,
+which is the honest first step for an operator who wants to see what the
+rebalancer would do. `capacity-model.md` now documents both and says they are
+off until asked.
 
 ## What is promised
 

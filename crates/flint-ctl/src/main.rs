@@ -133,6 +133,19 @@ struct Inventory {
     /// because a partial declaration reads as anti-affinity and is not one.
     zones: std::collections::HashMap<String, String>,
     agent: Option<String>,
+    /// Controller rebalancing (BUG-0142). BOTH are needed and the pair is the
+    /// point: `--rebalance-deadband` is what ENABLES the planner -- the
+    /// controller's loop is `if cfg.rebalance_deadband > 0.0` -- and
+    /// `--rebalance-execute` only decides whether the plan is carried out or
+    /// merely logged. `flintctl` passed neither, so a fleet built the
+    /// documented way never planned a rebalance at all, and
+    /// `capacity-model.md`'s "70% fill => expand => controller drains the
+    /// pressured pair" had no last step.
+    ///
+    /// Both default to OFF (Jeff, 2026-09-14), which preserves exactly the
+    /// behaviour every existing inventory has today.
+    rebalance_deadband: Option<f64>,
+    rebalance_execute: bool,
     /// Per-node storage capacity in bytes (capacity model, question 2);
     /// passed to the agent so it can compute fill + expansion ETAs.
     capacity_bytes: Option<u64>,
@@ -396,6 +409,8 @@ fn parse_inventory(path: &str) -> Inventory {
             "cache-max-bytes" => inv.cache_max_bytes = val.parse().ok(),
             "fanout-timeout-ms" => inv.fanout_timeout_ms = val.parse().ok(),
             "proxy-workers" => inv.proxy_workers = val.parse().ok(),
+            "rebalance-deadband" => inv.rebalance_deadband = val.parse().ok(),
+            "rebalance-execute" => inv.rebalance_execute = val == "on",
             "poll-ms" => inv.ctl_poll_ms = val.parse().ok(),
             "confirm" => inv.ctl_confirm = val.parse().ok(),
             "lease-ttl-ms" => inv.ctl_lease_ttl_ms = val.parse().ok(),
@@ -455,6 +470,18 @@ fn parse_inventory(path: &str) -> Inventory {
     assert!(
         !inv.pairs.is_empty(),
         "inventory needs at least one `pair a,b`"
+    );
+    // BUG-0142. `rebalance-execute on` with no deadband is an inventory that
+    // asks for rebalances to be CARRIED OUT by a planner that never runs --
+    // the controller's loop is `if cfg.rebalance_deadband > 0.0`, so a zero
+    // deadband means no plan is ever produced to execute. Refused rather than
+    // warned, because the failure is silence: the fleet would look armed, the
+    // operator would see no moves, and nothing anywhere would say why.
+    assert!(
+        !inv.rebalance_execute || inv.rebalance_deadband.unwrap_or(0.0) > 0.0,
+        "`rebalance-execute on` needs a positive `rebalance-deadband`: the \
+         deadband is what enables the planner, so executing without one arms \
+         a loop that never produces a move"
     );
     inv
 }
@@ -3855,6 +3882,14 @@ fn controller_args(inv: &Inventory) -> Vec<String> {
         "--commit-cp".into(),
         cp_dial(inv, 0),
     ];
+    // BUG-0142. Passed only when the inventory asks, so an inventory that says
+    // nothing gets exactly what it got before: no deadband, hence no planner.
+    if let Some(d) = inv.rebalance_deadband {
+        args.extend(["--rebalance-deadband".to_string(), d.to_string()]);
+    }
+    if inv.rebalance_execute {
+        args.push("--rebalance-execute".to_string());
+    }
     args.extend(internal_args(inv));
     args
 }
@@ -9921,5 +9956,53 @@ mod cp_dial_tests {
         ] {
             assert_eq!(wildcard_cp_target(&a), None, "false positive on {a:?}");
         }
+    }
+}
+
+/// BUG-0142: the capacity loop's last step, and the pair of knobs it needs.
+#[cfg(test)]
+mod bug_0142_rebalance_inventory_tests {
+    use super::*;
+
+    fn inv_with(deadband: Option<f64>, execute: bool) -> Inventory {
+        Inventory {
+            statedir: "/tmp/x".into(),
+            cp: vec!["127.0.0.1:7500".into()],
+            pairs: vec![vec!["127.0.0.1:7001".into(), "127.0.0.1:7002".into()]],
+            rebalance_deadband: deadband,
+            rebalance_execute: execute,
+            ..Default::default()
+        }
+    }
+
+    /// THE DEFAULT IS UNCHANGED BEHAVIOUR. An inventory that says nothing must
+    /// produce exactly the argv it produced before this key existed -- neither
+    /// flag -- because every fleet in the field is that inventory.
+    #[test]
+    fn an_inventory_that_says_nothing_passes_neither_flag() {
+        let a = controller_args(&inv_with(None, false));
+        assert!(!a.iter().any(|x| x == "--rebalance-deadband"), "{a:?}");
+        assert!(!a.iter().any(|x| x == "--rebalance-execute"), "{a:?}");
+    }
+
+    /// A deadband alone PLANS and does not execute -- the controller logs the
+    /// moves. That is a real configuration: it is how an operator looks at
+    /// what the rebalancer would do before letting it do it.
+    #[test]
+    fn a_deadband_alone_plans_without_executing() {
+        let a = controller_args(&inv_with(Some(0.2), false));
+        let i = a
+            .iter()
+            .position(|x| x == "--rebalance-deadband")
+            .expect("deadband");
+        assert_eq!(a[i + 1], "0.2");
+        assert!(!a.iter().any(|x| x == "--rebalance-execute"), "{a:?}");
+    }
+
+    #[test]
+    fn both_together_arm_the_loop() {
+        let a = controller_args(&inv_with(Some(0.2), true));
+        assert!(a.iter().any(|x| x == "--rebalance-deadband"), "{a:?}");
+        assert!(a.iter().any(|x| x == "--rebalance-execute"), "{a:?}");
     }
 }

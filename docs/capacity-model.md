@@ -145,7 +145,24 @@ write is lost).
 minimum set of moves to bring the group within the deadband, and — with
 `--rebalance-execute` — ships them a few slots per cycle, re-planning from
 fresh observations each time (convergence by small steps; the deadband stops
-the loop at balance). *What "load" means is a policy*, selected with
+the loop at balance).
+
+**BOTH ARE OFF UNTIL YOUR INVENTORY ASKS, and until 2026-09-14 there was no
+way to ask** (BUG-0142): `flintctl` passed neither flag, so the loop above
+described a fleet nobody was running — the controller never planned, and the
+expansion this section recommends was never followed by anything. Two
+inventory keys now carry them:
+
+```
+rebalance-deadband 0.2      # enables the PLANNER; absent or 0 = no planning
+rebalance-execute on        # carry the plan out rather than log it
+```
+
+`rebalance-execute on` without a positive `rebalance-deadband` is **refused**,
+because it arms a loop that never produces a move — the fleet would look armed
+and do nothing, with no line anywhere saying why. A deadband alone is a real
+configuration and a good first step: the controller plans and logs, so you can
+read what it *would* do before letting it. *What "load" means is a policy*, selected with
 `--balance-policy`:
 
   - **`size` (default, open stack).** Balance by data: a pair's load is the
