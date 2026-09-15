@@ -383,3 +383,115 @@ mod tests {
         }
     }
 }
+
+/// ADR-0030's refill, in ONE place because this control plane has two of
+/// everything else.
+///
+/// `CPDELPROXY` is implemented twice — `ha.rs` proposes a `Mutation::DelProxy`
+/// that lands in `registry::RegistryState::apply`, and `main.rs` mutates
+/// `state::State` inline for the single-node path. The first version of this
+/// fix went into the mutation only, so six unit tests passed and the live
+/// control plane did nothing: `subset_ratchet_drill` runs single-node and is
+/// what caught it. The tests exercised the TYPE; the drill exercised the
+/// PRODUCT.
+///
+/// `shuffle` is passed in because that function is duplicated as well
+/// (`state.rs` and `registry.rs` hold identical copies). Taking it as an
+/// argument keeps the refill single even while its input is not; unifying the
+/// two shuffles is a larger change and is filed rather than smuggled in here.
+pub fn refill_after_retire<'a>(
+    proxies: &[String],
+    tenants: impl Iterator<Item = &'a mut Tenant>,
+    retired: &str,
+    shuffle: fn(&str, &[String], usize) -> Vec<String>,
+) {
+    for t in tenants {
+        // The target is the subset's OWN width before the removal, not a
+        // stored k -- there is none, and the current width is the better
+        // answer anyway: an operator who widened a whale by hand keeps that
+        // width instead of being reset to the default.
+        let want = t.subset.len();
+        t.subset.retain(|p| p != retired);
+        if t.subset.len() == want {
+            continue;
+        }
+        // The ideal placement over the fleet as it now stands. Taking the
+        // members not already held keeps the shuffle-shard SPREAD -- without
+        // it every repaired tenant lands on whichever proxy sorts first,
+        // which is the isolation property inverted.
+        for c in shuffle(&t.name, proxies, want) {
+            if t.subset.len() >= want {
+                break;
+            }
+            if !t.subset.contains(&c) {
+                t.subset.push(c);
+            }
+        }
+        // The ideal set can overlap what is already held, so widen the search
+        // rather than leave a tenant short on a fleet that could cover it. A
+        // fleet SMALLER than `want` leaves it short, correctly: padding with a
+        // duplicate to reach the number would be worse.
+        for c in proxies {
+            if t.subset.len() >= want {
+                break;
+            }
+            if !t.subset.contains(c) {
+                t.subset.push(c.clone());
+            }
+        }
+        t.subset.sort();
+    }
+}
+
+#[cfg(test)]
+mod refill_tests {
+    use super::*;
+
+    fn tenant(name: &str, subset: &[&str]) -> Tenant {
+        Tenant {
+            name: name.to_string(),
+            subset: subset.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    /// THE TEST THAT WOULD HAVE CAUGHT THE REAL BUG. The refill is called from
+    /// two places with two different `shuffle_shard`s -- `registry.rs` has one
+    /// and `state.rs` has an identical copy -- and if those ever diverge the
+    /// raft and single-node control planes place tenants differently while
+    /// both look fine in isolation.
+    ///
+    /// Asserting they AGREE is the cheapest guard available without unifying
+    /// them, which is a larger change filed separately.
+    #[test]
+    fn both_shuffles_refill_a_retirement_identically() {
+        let proxies: Vec<String> = (0..5).map(|i| format!("10.0.0.{i}:7379")).collect();
+        for name in ["acme", "globex", "initech", "umbrella"] {
+            let mut a = tenant(name, &[&proxies[0], &proxies[1]]);
+            let mut b = a.clone();
+            let live: Vec<String> = proxies.iter().skip(1).cloned().collect();
+            refill_after_retire(
+                &live,
+                std::iter::once(&mut a),
+                &proxies[0],
+                crate::registry::shuffle_shard,
+            );
+            refill_after_retire(
+                &live,
+                std::iter::once(&mut b),
+                &proxies[0],
+                crate::state::shuffle_shard,
+            );
+            assert_eq!(
+                a.subset.len(),
+                2,
+                "{name} was left narrow by the registry shuffle"
+            );
+            assert_eq!(
+                a.subset, b.subset,
+                "the two control-plane paths placed {name} differently: {:?} vs {:?}",
+                a.subset, b.subset
+            );
+        }
+    }
+}

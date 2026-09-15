@@ -182,9 +182,20 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
             // A retired proxy must not linger in any tenant's subset: leaving
             // it there is the same trap one level down, and the tenant keeps
             // a placement slot pointing at nothing.
-            for t in st.tenants.values_mut() {
-                t.subset.retain(|p| p != &addr);
-            }
+            //
+            // AND THE HOLE IS REFILLED (ADR-0030), through the SAME helper the
+            // raft path uses. This arm and `registry.rs`'s `Mutation::DelProxy`
+            // are two implementations of one verb, and the first version of
+            // this fix went into the other one only -- six unit tests passed
+            // and this path, which is what `subset_ratchet_drill` exercises,
+            // did nothing at all.
+            let proxies = st.proxies.clone();
+            crate::tenant::refill_after_retire(
+                &proxies,
+                st.tenants.values_mut(),
+                &addr,
+                state::shuffle_shard,
+            );
             match st.commit() {
                 Ok(_) => {}
                 Err(e) => return err(&format!("persist: {e}")),

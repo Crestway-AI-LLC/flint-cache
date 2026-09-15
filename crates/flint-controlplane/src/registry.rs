@@ -284,40 +284,12 @@ impl RegistryState {
                 // and no others. Re-sharding the whole subset would preserve
                 // the same isolation property and move live connections for
                 // tenants that had nothing wrong with them.
-                let proxies = &self.proxies;
-                for t in self.tenants.values_mut() {
-                    let want = t.subset.len();
-                    t.subset.retain(|p| p != &a);
-                    if t.subset.len() == want {
-                        continue;
-                    }
-                    // The ideal placement over the fleet as it now stands.
-                    // Taking the members not already held keeps the
-                    // shuffle-shard SPREAD -- without it every repaired tenant
-                    // piles onto whichever proxy sorts first, which is the
-                    // isolation property inverted.
-                    for c in shuffle_shard(&t.name, proxies, want) {
-                        if t.subset.len() >= want {
-                            break;
-                        }
-                        if !t.subset.contains(&c) {
-                            t.subset.push(c);
-                        }
-                    }
-                    // The ideal set can overlap what is already held, so widen
-                    // the search rather than leave a tenant short on a fleet
-                    // that could cover it. A fleet SMALLER than `want` leaves
-                    // it short, correctly: there is nothing to fill from.
-                    for c in proxies {
-                        if t.subset.len() >= want {
-                            break;
-                        }
-                        if !t.subset.contains(c) {
-                            t.subset.push(c.clone());
-                        }
-                    }
-                    t.subset.sort();
-                }
+                crate::tenant::refill_after_retire(
+                    &self.proxies,
+                    self.tenants.values_mut(),
+                    &a,
+                    shuffle_shard,
+                );
             }
             Mutation::AddPair { nodes, range } => {
                 if !self.pairs.contains(&nodes) {
