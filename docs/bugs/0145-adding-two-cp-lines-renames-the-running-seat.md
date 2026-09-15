@@ -1,7 +1,8 @@
-# BUG-0145: adding two `cp` lines renames the running seat, and nothing notices (OPEN)
+# BUG-0145: adding two `cp` lines renames the running seat, and nothing notices (FIXED 2026-09-15)
 
-Status: **OPEN**, found 2026-09-14 · Severity: **medium** — needs a hand-edit
-to reach, and the hand-edit is the only interface there is: `flintctl` has no
+Status: **FIXED 2026-09-15** — the refusal; in-place growth itself remains
+unsupported and unbuilt · found 2026-09-14 · Severity: **medium** — needs a
+hand-edit to reach, and the hand-edit is the only interface there is: `flintctl` has no
 verb for growing a control plane, so editing the inventory is how you would
 do it. The edit looks additive. It is not: it silently changes the identity
 of the seat that is already running.
@@ -140,6 +141,50 @@ not just the name.
 Still not reproduced. Read from `cp_seat_args`, `cp_seat_name`,
 `cp_seat_state`, `launch`'s `seat_alive` call and `pids_in_ps`'s token
 matching.
+
+## What was done, 2026-09-15: (2), and only (2)
+
+Jeff's call, after the correction above ruled (1) out and left (3) as work
+nobody has asked for. `launch` now refuses the transition before anything is
+spawned:
+
+```
+flintctl: a single-seat control plane cannot be grown in place; its state is
+  not Raft state.
+  <statedir>/cp-state exists (single-seat format) and the inventory now names
+  3 cp seats.
+  ...
+```
+
+**At the top of `launch`, which is the one function both `bootstrap` and
+`start` pass through** — so the reboot path is covered, and that is the branch
+that mattered: `boot.sh` takes it, and there the old seat is already gone, so
+three Raft seats would come up empty while the fleet's ownership truth stayed
+orphaned in `cp-state`.
+
+**Before any spawn**, because after the first one the pidfile damage is done.
+
+**The reverse is refused too.** A Raft statedir under a one-seat inventory is
+the same asymmetry pointing the other way, and costs one more branch.
+
+**Both directories present is deliberately allowed.** That is a half-finished
+migration someone is in the middle of; guessing which half is live would be a
+worse answer than letting them proceed. The drill asserts that, so it stays a
+decision rather than becoming an oversight.
+
+### The check
+
+`tools/cp_growth_drill.sh`, registered in `CORE`. Six arms, and only two of
+them are the refusal — the other four are the bring-ups that must NOT be
+blocked, since a wrong refusal here stops every new Raft fleet and every
+reboot.
+
+Its first arm is a control on the drill itself. The first version of this test
+asserted on output that never got past the `disposable on` provenance gate:
+two arms "passed" against a refusal about build provenance rather than about
+CP growth. The control now fails the drill if that gate is what answered.
+
+Mutation-verified: with the refusal removed, the grow arm fails and names it.
 
 ## Not established
 

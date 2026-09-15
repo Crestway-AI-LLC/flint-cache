@@ -54,7 +54,10 @@ RULES = [
     # `/cp-state`, not `cp-state`: the CLI FLAG is `--cp-state`, and a flag
     # name is not a path. The first version of this rule flagged
     # `"--cp-state".into()` in backup_args, which is correct code.
-    (r'/cp-state',  {"cp_seat_state"},  "cp_seat_state(inv, i)"),
+    # cp_state_single / cp_state_raft OWN the two literals; cp_seat_state picks
+    # between them by seat count, and `launch` needs both independently of the
+    # count (BUG-0145), which is why the pair exists rather than one function.
+    (r'/cp-state',  {"cp_seat_state", "cp_state_single", "cp_state_raft"},  "cp_seat_state(inv, i)"),
     (r'"proxy-\{', {"proxy_seat_name"}, "proxy_seat_name(inv, i)"),
 ]
 FN = re.compile(r"^(?:pub )?(?:async )?fn ([A-Za-z_][A-Za-z_0-9]*)")

@@ -3660,13 +3660,26 @@ fn cp_seat_name(inv: &Inventory, i: usize) -> String {
     }
 }
 
+/// The single-seat CP state dir. ONE SPELLING, here, because `launch` has to
+/// ask whether it exists independently of what the inventory currently says —
+/// which `cp_seat_state` cannot answer, since its whole job is to follow the
+/// seat count (BUG-0145). `seat_names_drill` caught the hand-spelled copy.
+fn cp_state_single(statedir: &str) -> String {
+    format!("{statedir}/cp-state")
+}
+
+/// The Raft CP state dir for seat `i`. Same reason as `cp_state_single`.
+fn cp_state_raft(statedir: &str, i: usize) -> String {
+    format!("{statedir}/cp-state-n{}", i + 1)
+}
+
 /// The state dir for CP seat `i`, matching `cp_seat_args`.
 fn cp_seat_state(inv: &Inventory, i: usize) -> String {
     let d = &inv.statedir;
     if inv.cp.len() == 1 {
-        format!("{d}/cp-state")
+        cp_state_single(d)
     } else {
-        format!("{d}/cp-state-n{}", i + 1)
+        cp_state_raft(d, i)
     }
 }
 
@@ -3979,6 +3992,62 @@ fn start(inv: &Inventory) {
 }
 
 fn launch(inv: &Inventory, register: bool) {
+    // A SINGLE-SEAT CONTROL PLANE CANNOT BE GROWN IN PLACE (BUG-0145).
+    //
+    // `cp_seat_args` gives a lone seat no `--raft`, no `--node-id` and no
+    // `--peers` — there is no `else` on that branch. It is not a one-member
+    // Raft group that could accept joiners; it is a different mode, and
+    // `cp-state` holds a different FORMAT from `cp-state-n1`. So the two
+    // names are not two spellings of one directory, and editing one `cp` line
+    // into three is not a topology change this code can carry out.
+    //
+    // Nothing refused it. The count assert passes (1 or 3, and 3 is what you
+    // now have), `cp_seat_name` then looks for `cp-n1` where `cp` is running,
+    // finds nothing, and every step downstream behaves as though the seat
+    // were absent: a duplicate is spawned on the live seat's port, and
+    // BUG-0144 reports that as a successful start.
+    //
+    // THE EXPENSIVE BRANCH IS A REBOOT, which is the path `start` takes and
+    // the one `boot.sh` is documented to use. The old seat is gone, so three
+    // Raft seats come up with EMPTY state while the fleet's ownership truth —
+    // Option B commits cutovers to the CP — sits orphaned in `cp-state`.
+    //
+    // Checked HERE, at the top of the one function both `bootstrap` and
+    // `start` go through, and before anything is spawned: after the first
+    // spawn the pidfile damage is already done. The condition is knowable
+    // exactly, so the message says what is true rather than reporting a name
+    // mismatch and leaving the reader to work out why.
+    //
+    // Both present is NOT refused. That is a half-finished migration someone
+    // is in the middle of, and guessing which half is live would be a worse
+    // answer than letting them proceed.
+    {
+        let d = &inv.statedir;
+        let single_dir = cp_state_single(d);
+        let raft_dir = cp_state_raft(d, 0);
+        let single = std::path::Path::new(&single_dir).exists();
+        let raft = std::path::Path::new(&raft_dir).exists();
+        if inv.cp.len() > 1 && single && !raft {
+            die(&format!(
+                "a single-seat control plane cannot be grown in place; its state is not Raft state.\n  \
+                 {single_dir} exists (single-seat format) and the inventory now names {} cp seats.\n  \
+                 A lone seat runs with no --raft/--node-id/--peers, so cp-state and cp-state-n1 hold \
+                 different formats — the seats this would start cannot read what is there.\n  \
+                 Starting anyway would spawn a duplicate on the live seat's port, or, after a reboot, \
+                 bring up an empty Raft group while the fleet's ownership truth stays in cp-state.\n  \
+                 Stand up the Raft group on its own statedir and migrate, or put the inventory back to one `cp` line.",
+                inv.cp.len()
+            ));
+        }
+        if inv.cp.len() == 1 && raft && !single {
+            die(&format!(
+                "a Raft control plane cannot be shrunk in place; its state is not single-seat state.\n  \
+                 {raft_dir} exists (Raft format) and the inventory now names one cp seat.\n  \
+                 The same asymmetry in reverse: a lone seat would look for cp-state, find nothing, \
+                 and start empty beside a group that still holds the topology."
+            ));
+        }
+    }
     let d = &inv.statedir;
     for sub in ["logs", "pids", "snaps"] {
         std::fs::create_dir_all(format!("{d}/{sub}")).expect("statedir");
