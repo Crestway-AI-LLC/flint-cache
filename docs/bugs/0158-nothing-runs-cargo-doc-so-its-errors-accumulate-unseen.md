@@ -72,13 +72,29 @@ today.
 
 ## A number I got wrong earlier the same day
 
-I quoted **88 errors across seven crates** twice on 2026-09-16 — to Jeff and to
-the peer session cutting the release. The real figure on the tree at the time of
-writing is **99 across eight**. The first count came from an earlier commit and
-a cruder extraction (it counted only errors whose location line matched
-`--> crates/…/`, which misses every error that names its file elsewhere in the
-block). Nothing downstream depended on the figure — it was "not a cut blocker"
-either way — but the correction belongs here rather than nowhere.
+I said **"88 unresolved-link errors across seven crates"** twice on 2026-09-16 —
+to Jeff, and to the peer session cutting the release. Both halves are wrong, and
+the second half is the one that matters.
+
+**The count.** 88 came from an earlier commit and a cruder extraction: it
+counted only errors whose location line matched `--> crates/…/`, which misses
+every error naming its file elsewhere in the block. The figure on the tree as
+this was written is **99 across eight crates**.
+
+**The kind, which is worse.** Calling them all *unresolved-link* is not a
+rounding error, it is the wrong diagnosis. Only **32 of 99** are unresolved
+links. **54** are `unclosed HTML tag`, and that distinction is the whole
+character of this bug: 99 broken doc links would be 99 decisions, while 54
+unclosed tags are one convention and a sweep of backticks. I reported the
+dominant failure mode as the minority one, to two readers, one of whom was
+deciding whether it blocked a release.
+
+Nothing downstream moved on it — "not a cut blocker" was true under either
+reading — and the peer caught the discrepancy between my message and the commit
+title within the hour. **Their point is the reason this section exists:** a
+number that changes between the write-up and the title is something this repo
+notices later and cannot reconstruct. Reconstructing it needs the breakdown
+above, so the breakdown is above.
 
 ## What closing it would involve, in the order that makes sense
 
