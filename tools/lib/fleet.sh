@@ -253,16 +253,53 @@ _fleet_sibling_named() {
 # proceeds -- the outcome the sibling contract forbids, reached by another
 # road.
 #
-# LEFT AS IT IS ON PURPOSE, pending BUG-0155, and that is a decision rather
-# than an oversight. What replaces ppid -- a liveness probe, a lock with a
-# recorded start time as _fleet_live_peer_scopes already uses for peers, or
-# asking the owning suite -- spans two products, and the two failures are not
-# symmetric: permissive costs contention, strict costs a wedged box and a
-# hand-kill. What this change does remove is the claim: the comment now says
-# what the filter does instead of what it was hoped to do, and the refusal it
-# feeds no longer states an answer it does not have.
+# WHAT REPLACES ppid, and it does NOT span two products after all. That was the
+# reason this was left standing -- "a liveness probe, a lock with a recorded
+# start time as _fleet_live_peer_scopes already uses for peers, or asking the
+# owning suite" -- and the second of the three is already on disk: flint-kv's
+# own `drill_lib.sh` takes `$TMPDIR/flint-kv-drill.lock`, a DIRECTORY holding
+# the runner's pid, and tests it with `kill -0`. Its comment calls it "where a
+# live one holds its claim". Reading it asks the other product to change
+# nothing.
+#
+# So the test is "parented OR its suite holds its lock". Strictly more seats
+# than ppid alone, and it loses nothing BUG-0063 depends on: with no run in
+# progress an orphan still falls through to the activity check, so a corpse is
+# still stepped over without a human.
+#
+# WHAT IT DOES NOT FIX, stated because the two failures are not symmetric --
+# permissive costs contention, strict costs a wedged box and a hand-kill. A
+# SUPERVISED sibling with no drill lock still reads as a corpse. That cannot
+# happen on a box that runs these drills: flint-kv.service lives on KV fleet
+# nodes and nothing here runs there. If it ever can, the answer is
+# service-cgroup membership (/proc/PID/cgroup names the unit), which is
+# Linux-only and wants the care this file gives every check that exists on one
+# of its two platforms.
+
+# Where the sibling suite says a run of its own is in progress.
+#
+# Overridable so fleet_guard_drill can point it at a fixture. Creating or
+# removing the REAL path would corrupt a genuine flint-kv run sharing the box,
+# which is a drill doing the exact damage this guard exists to prevent.
+FLINT_SIBLING_LOCK="${FLINT_SIBLING_LOCK:-${TMPDIR:-/tmp}/flint-kv-drill.lock}"
+
+_fleet_sibling_suite_running() {
+  local pid
+  pid=$(cat "$FLINT_SIBLING_LOCK/pid" 2>/dev/null) || return 1
+  # THE HOLDER, NOT THE FILE. drill_lib.sh reclaims its own lock when the owner
+  # is gone, for the reason it records: a lock whose owner is gone "is not a
+  # lock, it is litter" and it blocked all seventeen of their drills until
+  # somebody removed it by hand. Reading existence rather than liveness here
+  # would import that failure into this guard.
+  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
+
 _fleet_sibling_named_live() {
-  _fleet_sibling_named | awk '$2 != 1'
+  if _fleet_sibling_suite_running; then
+    _fleet_sibling_named
+  else
+    _fleet_sibling_named | awk '$2 != 1'
+  fi
 }
 
 _fleet_sibling() {

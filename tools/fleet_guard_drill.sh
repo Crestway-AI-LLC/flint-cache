@@ -399,6 +399,58 @@ else
 fi
 reap_orphans; sleep 0.5
 
+echo "== H2) a sibling suite that says it is MID-RUN makes its orphan driven again"
+# BUG-0155. `ppid != 1` was the whole of "somebody is driving this", and ppid 1
+# is what a healthy daemon looks like -- flintctl never waits on a seat, and
+# flint-kv.service is Type=simple. The reachable gap is a sibling run still in
+# progress whose seat has been reparented, and the sibling suite answers it
+# itself: `drill_lib.sh` holds `$TMPDIR/flint-kv-drill.lock`, a directory with
+# the runner's pid in it.
+#
+# ASSERTED ON THE PREDICATE, not on a fleet_guard verdict. The verdict depends
+# on everything else on the box, which is the unscoped-census mistake case G
+# spent two write-ups on; `_fleet_sibling_named_live` is the thing that changed
+# and it can be asked directly.
+#
+# AND AGAINST A FIXTURE LOCK, NEVER THE REAL PATH. Creating or removing
+# $TMPDIR/flint-kv-drill.lock would corrupt a genuine flint-kv run sharing this
+# box -- a drill doing the exact damage fleet_guard exists to prevent.
+reap_orphans
+orphan_as flint-kvorphan-server
+sleep 1
+seat_in_ps "flint-kvorphan-server" \
+  || { echo "FAIL: the fake orphan is not in ps, so this case would prove nothing"; reap_orphans; exit 1; }
+H2LOCK="$FLINT_DRILL_ROOT/flint-guard-siblinglock"
+rm -rf "$H2LOCK"
+export FLINT_SIBLING_LOCK="$H2LOCK"
+
+# CONTROL FIRST: with no lock, an orphan is not driven. Without this the arm
+# below would pass against a predicate that calls everything driven.
+_fleet_sibling_named_live | grep -q 'flint-kvorphan-server' \
+  && { echo "FAIL: with no sibling lock at all, an orphan already counts as driven —"; \
+       echo "      the arm below would pass against a predicate that never says no"; \
+       unset FLINT_SIBLING_LOCK; reap_orphans; exit 1; }
+
+mkdir -p "$H2LOCK"; printf '%s\n' "$$" > "$H2LOCK/pid"   # this drill IS a live pid
+_fleet_sibling_named_live | grep -q 'flint-kvorphan-server' \
+  || { echo "FAIL: the sibling suite holds a live lock and its orphan still reads as"; \
+       echo "      a corpse. A run in progress is driving every binary it owns,"; \
+       echo "      whatever their ppid — BUG-0155."; \
+       unset FLINT_SIBLING_LOCK; rm -rf "$H2LOCK"; reap_orphans; exit 1; }
+
+# AND A DEAD HOLDER IS NOT A HOLDER, or the lock would be a blanket amnesty in
+# the other direction: litter left by a crashed run would block the box forever,
+# which is the failure `drill_lib.sh` reclaims its own lock for.
+DEADPID=$( bash -c 'echo $$' )
+printf '%s\n' "$DEADPID" > "$H2LOCK/pid"
+_fleet_sibling_named_live | grep -q 'flint-kvorphan-server' \
+  && { echo "FAIL: a lock whose owner (pid $DEADPID) is GONE still counted as a live"; \
+       echo "      run, so the lock is read for its existence rather than its holder"; \
+       unset FLINT_SIBLING_LOCK; rm -rf "$H2LOCK"; reap_orphans; exit 1; }
+echo "  a live holder makes the orphan driven; a dead one does not"
+unset FLINT_SIBLING_LOCK
+rm -rf "$H2LOCK"; reap_orphans; sleep 0.5
+
 echo "== I) NEGATIVE CONTROL: a LIVE sibling fleet must still refuse on sight"
 # If D were implemented as "idle siblings are fine", this arm fails: a sleeping
 # fake fleet is idle too, and was never the question. Arm B covers the busy

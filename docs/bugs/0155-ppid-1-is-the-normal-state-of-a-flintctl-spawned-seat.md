@@ -1,8 +1,9 @@
-# BUG-0155: `ppid 1` is the normal state of a healthy seat, so the orphan discriminator discriminates nothing (MESSAGE FIXED, DECISION OPEN)
+# BUG-0155: `ppid 1` is the normal state of a healthy seat, so the orphan discriminator discriminates nothing (FIXED 2026-09-16)
 
-Status: found 2026-09-15 · Severity: **medium**. **The message half is FIXED
-2026-09-16**; the decision half is **OPEN** and is a call for Jeff, not for me
-— see "Where this stands" at the end.
+Status: **FIXED 2026-09-16**, found 2026-09-15 · Severity: **medium**. Both
+halves, by two sessions: the message by the cache session, the decision here
+after Jeff made the call it was waiting on — see "The decision half, closed" at
+the end.
 
 The two halves were always separable, and they turned out to want opposite
 treatments. One is a message that asserts something false to an operator, and
@@ -164,7 +165,11 @@ had come from the foreign list and nothing had been measured.
   `_fleet_live_peer_scopes` already uses for peers, or asking the owning suite —
   is a design call that spans two products.
 
-## Where this stands
+## Where this stands (as of the message fix — superseded below)
+
+**Jeff's call, 2026-09-16, was "fix 0155".** What follows was the state before
+that, kept because its reasoning about the two asymmetric failures is what the
+fix had to respect. The decision half is closed in the section after it.
 
 **Fixed:** both refusal messages. Neither now states an answer it does not
 have. `_fleet_foreign`'s header says the ppid is raw data and not a verdict,
@@ -207,3 +212,68 @@ write-up, where I had read `ppid 1` as "the drill that started these has exited"
 and built a paragraph on it. It had not exited; its controller, control plane
 and proxy were in the same listing at a live ppid. The inference was wrong in my
 write-up for the same reason it is wrong in the code.
+
+## The decision half, closed 2026-09-16 — with two claims withdrawn
+
+**"It spans two products" was wrong, and that is what kept it open.** The three
+candidates listed above were *a liveness probe, a lock with a recorded start
+time as `_fleet_live_peer_scopes` already uses for peers, or asking the owning
+suite*. The second is **already on disk in the other product**: flint-kv's
+`drill_lib.sh` takes `$TMPDIR/flint-kv-drill.lock`, a directory holding the
+runner's `pid`, and tests it with `kill -0`. Its own comment calls it *"where a
+live one holds its claim"*. The answer was being published all along; nothing
+over there has to change. Found by reading the sibling's harness rather than
+reasoning from its unit file.
+
+**And the decision half was LATENT, not live.** This file argued a real flint-kv
+fleet under systemd sits at `ppid 1` and would be let through. The service type
+is right; the inference was too fast. `flint-kv.service` runs on **KV fleet
+nodes**, and nothing that calls `fleet_guard` runs there — so a supervised
+sibling and these drills cannot currently share a box, and the ppid test has not
+been wrong in production. The gap that IS reachable is narrower: a sibling run
+**still in progress** whose seat has been reparented.
+
+### What the code does
+
+`_fleet_sibling_named_live` is now *parented **OR** its suite holds its lock*.
+Strictly more seats than `ppid != 1` alone, and it loses nothing BUG-0063
+depends on: with no run in progress an orphan still falls through to the
+activity check, so a corpse is still stepped over without a human. That
+preserves the asymmetry the section above insists on — permissive costs
+contention, strict costs a wedged box and a hand-kill — because the only seats
+it newly refuses are ones a running suite has claimed.
+
+`_fleet_sibling_suite_running` reads the **holder**, not the file.
+`drill_lib.sh` reclaims its own lock when the owner is gone for the reason it
+records — a lock whose owner is gone *"is not a lock, it is litter"*, and it
+blocked all seventeen of their drills until a human removed it. Reading
+existence rather than liveness here would import that failure.
+
+The path is `FLINT_SIBLING_LOCK`, defaulted to the real one so nothing changes
+in production and overridable so the drill uses a fixture. Creating or removing
+the real path would corrupt a genuine flint-kv run sharing the box — a drill
+doing the exact damage this guard exists to prevent.
+
+### Drill: case H2
+
+*"a sibling suite that says it is MID-RUN makes its orphan driven again"* —
+spawn an orphan, confirm it in `ps`, then ask `_fleet_sibling_named_live`
+directly: with no lock it must say no, with a lock naming a live pid it must say
+yes, and with a lock naming a reaped pid it must say no again. That third check
+is not decoration: without it the lock would be a blanket amnesty in the other
+direction and litter from a crashed run would block the box forever.
+
+Asserted on the **predicate** rather than on a `fleet_guard` verdict, which
+anything else on the box can move — [BUG-0157](0157-case-g-judges-the-guard-against-an-empty-box.md)'s
+lesson applied while writing instead of after a red gate.
+
+**Mutation-verified**: with `_fleet_sibling_named_live` reverted to ppid alone,
+H2 fails on the live-holder arm with exactly the diagnostic it carries, and the
+cache session's arm J still passes on the merged tree.
+
+### Still true afterwards
+
+A supervised sibling fleet with **no** drill lock still reads as a corpse. Not
+reachable today; if it becomes so, the answer is service-cgroup membership
+(`/proc/PID/cgroup` names the unit), which is Linux-only and wants the care this
+file gives every check that exists on one of its two platforms.
