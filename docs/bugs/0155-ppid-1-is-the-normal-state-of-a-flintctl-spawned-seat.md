@@ -277,3 +277,34 @@ A supervised sibling fleet with **no** drill lock still reads as a corpse. Not
 reachable today; if it becomes so, the answer is service-cgroup membership
 (`/proc/PID/cgroup` names the unit), which is Linux-only and wants the care this
 file gives every check that exists on one of its two platforms.
+
+### The premise is now pinned to the repo it is about (2026-09-16)
+
+The fix above reads a path that belongs to another project —
+`${TMPDIR:-/tmp}/flint-kv-drill.lock`, which their `drill_lib.sh` takes with
+`mkdir`. **Nothing made that true.** It is a literal here describing a literal
+there, and if they rename or move it, `cat "$FLINT_SIBLING_LOCK/pid"` fails,
+`_fleet_sibling_suite_running` returns 1, and the guard falls back to ppid alone
+— this bug, restored without a word.
+
+**The drill cannot notice**, and must not be changed so it can. Case H2
+overrides `FLINT_SIBLING_LOCK` with a fixture because creating or removing the
+real lock would corrupt a genuine flint-kv run sharing the box — the exact
+damage the guard exists to prevent. So every arm stays green while the premise
+underneath them is false: a check whose failure cannot be attributed.
+
+`assert_sibling_lock_path_is_pinned` (gates.sh, in `document_assertions`) closes
+it statically, against their tree. It compares our default with their
+`DRILL_LOCK` **and** requires their file to still take it with `mkdir`, because
+a constant that still matches is worth nothing if the mechanism behind it is
+gone. It resolves the sibling from the **primary worktree** rather than `..`,
+since every drill change here is made in a linked worktree on the external SSD
+where `../flint-kv/core` is nothing — a plain `..` default would have skipped on
+the one machine that has a flint-kv checkout, which is a check that never fires
+while reporting honestly every time. Where there is genuinely no checkout it
+**skips loudly** and says the path is NOT pinned, the way
+`assert_no_cross_repo_ports` does.
+
+Driven red five ways: they rename the lock; they stop taking it with `mkdir`;
+they stop declaring it; we drop `FLINT_SIBLING_LOCK`; and — the one that is not
+a failure — no checkout at all, which skips and says so.

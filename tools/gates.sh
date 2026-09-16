@@ -2093,6 +2093,100 @@ CPVPY
   echo "  both control-plane paths dispatch the same verbs ($1 single-node, $2 raft)"
 }
 
+# A PREMISE ABOUT ANOTHER REPO, PINNED TO THAT REPO.
+#
+# `_fleet_sibling_suite_running` decides whether a sibling project's fleet
+# refuses ON SIGHT, and it decides it by reading a path that belongs to
+# flint-kv: `${TMPDIR:-/tmp}/flint-kv-drill.lock`, which their `drill_lib.sh`
+# takes with `mkdir` and reclaims when the holder is gone.
+#
+# NOTHING MADE THAT TRUE. It is a literal in our tree describing a literal in
+# theirs. Rename or move it over there and `cat "$FLINT_SIBLING_LOCK/pid"`
+# simply fails, the function returns 1, and the guard silently falls back to
+# ppid alone -- which is the defect BUG-0155 is about, restored without a word.
+#
+# AND fleet_guard_drill CANNOT NOTICE. Case H2 overrides FLINT_SIBLING_LOCK
+# with a fixture, and it MUST: creating or removing the real lock would corrupt
+# a genuine flint-kv run sharing the box, which is the exact damage the guard
+# exists to prevent. So every arm stays green while the premise underneath them
+# is false. That is a check whose failure cannot be attributed -- the shape this
+# suite has paid for repeatedly -- and the only place it can be caught is here,
+# statically, against their tree.
+#
+# BOTH HALVES ARE CHECKED, because a constant that still matches is worth
+# nothing if the mechanism behind it is gone. The path must agree AND
+# drill_lib.sh must still take it with mkdir.
+#
+# SKIPS LOUDLY when no flint-kv checkout sits beside this one. The gate box
+# syncs only this repo, so skipping is the COMMON case and must never read as a
+# pass -- same shape, and the same reason, as assert_no_cross_repo_ports.
+assert_sibling_lock_path_is_pinned() {
+  # RESOLVED FROM THE PRIMARY WORKTREE, not from `..`, and that is what makes
+  # this check run at all. Every drill change here is made in a linked worktree
+  # on the external SSD, where `../flint-kv/core` is nothing -- so a plain `..`
+  # default would SKIP on the one machine that HAS a flint-kv checkout, and the
+  # pin would be a check that never fires while reporting honestly every time.
+  # `git rev-parse --git-common-dir` names the primary tree's .git whichever
+  # worktree we are in; its grandparent is the directory the siblings share.
+  local kv primary
+  if [ -n "${FLINT_KV:-}" ]; then
+    kv="$FLINT_KV"
+  else
+    kv="../flint-kv/core"
+    if [ ! -f "$kv/tools/drill_lib.sh" ]; then
+      primary=$(cd "$(git rev-parse --git-common-dir 2>/dev/null)/.." 2>/dev/null && pwd)
+      [ -n "$primary" ] && kv="$primary/../flint-kv/core"
+    fi
+  fi
+  local theirs="$kv/tools/drill_lib.sh"
+  if [ ! -f "$theirs" ]; then
+    echo "  SKIP: no flint-kv checkout at $kv — the sibling lock path is NOT pinned"
+    return 0
+  fi
+  local ours_line ours their_line theirs_path
+  ours_line=$(grep -m1 '^FLINT_SIBLING_LOCK=' tools/lib/fleet.sh 2>/dev/null)
+  if [ -z "$ours_line" ]; then
+    echo "FAIL  tools/lib/fleet.sh no longer defines FLINT_SIBLING_LOCK, so this"
+    echo "        check compared nothing. If the sibling-lock mechanism was"
+    echo "        removed, remove this assertion in the same commit."
+    FAILED="$FAILED sibling-lock-unpinned"
+    return 0
+  fi
+  their_line=$(grep -m1 '^DRILL_LOCK=' "$theirs" 2>/dev/null)
+  if [ -z "$their_line" ]; then
+    echo "FAIL  $theirs no longer defines DRILL_LOCK."
+    echo "        _fleet_sibling_suite_running reads a lock that project has"
+    echo "        stopped declaring, so it can only ever return 1 and the guard"
+    echo "        is back to ppid alone (BUG-0155)."
+    FAILED="$FAILED sibling-lock-unpinned"
+    return 0
+  fi
+  # Our line carries the override wrapper; theirs does not. Compare the DEFAULT.
+  ours=$(printf '%s\n' "$ours_line" \
+    | sed -e 's/^FLINT_SIBLING_LOCK="\${FLINT_SIBLING_LOCK:-//' -e 's/}"$//')
+  theirs_path=$(printf '%s\n' "$their_line" | sed -e 's/^DRILL_LOCK="//' -e 's/"$//')
+  if [ "$ours" != "$theirs_path" ]; then
+    echo "FAIL  the sibling lock this guard reads is not the one flint-kv takes:"
+    echo "        fleet.sh default : $ours"
+    echo "        their drill_lib  : $theirs_path"
+    echo "        _fleet_sibling_suite_running would return 1 forever and the"
+    echo "        sibling guard would silently revert to ppid alone, with every"
+    echo "        arm of fleet_guard_drill still green (case H2 uses a fixture)."
+    FAILED="$FAILED sibling-lock-unpinned"
+    return 0
+  fi
+  if ! grep -q 'mkdir "\$DRILL_LOCK"' "$theirs" 2>/dev/null; then
+    echo "FAIL  flint-kv still declares DRILL_LOCK but no longer takes it with"
+    echo "        mkdir in $theirs."
+    echo "        The path agreeing is not the premise -- a live run HOLDING it"
+    echo "        is. If they moved to a different mechanism, this guard needs"
+    echo "        to read that one instead of a file nobody writes."
+    FAILED="$FAILED sibling-lock-unpinned"
+    return 0
+  fi
+  echo "  the sibling lock this guard reads is the one flint-kv takes ($ours)"
+}
+
 assert_no_cross_repo_ports() {
   local ops="${FLINT_OPS:-../flint-cache}"
   if [ ! -d "$ops/tools" ]; then
@@ -3695,6 +3789,7 @@ document_assertions() {
   assert_doc_inventories_are_runnable
   assert_no_port_overlap
   assert_no_cross_repo_ports
+  assert_sibling_lock_path_is_pinned
   assert_dials_are_bounded
   assert_cp_verbs_agree_across_paths
   assert_tools_threads_are_daemons
