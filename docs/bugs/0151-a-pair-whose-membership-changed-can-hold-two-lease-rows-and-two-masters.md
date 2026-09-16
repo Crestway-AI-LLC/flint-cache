@@ -106,15 +106,26 @@ renewal that the bug requires.
 
 None of this is a sighting. It narrows where to point one.
 
-*Added after the above: a sighting followed within the hour, and it does not
-contradict this narrowing. The drill supplies the renewing incumbent directly —
-it asks `CPLEASE` for the displaced master, which is exactly what a
-partitioned-but-alive master does every ttl/3 — so it settles what the CONTROL
-PLANE does without needing a partition to produce it. Which deployment path
-holds that condition open is the question answered above, and the answer stands:
-not the operator path, not a killed master, but the controller against a master
-it cannot reach. A FLEET reproduction would still want a partition rather than a
-kill.*
+*Added after the above, then corrected: **I endorsed this narrowing and was
+wrong to.** My note said the answer stands — not the operator path, not a killed
+master, but the controller against a master it cannot reach — and the section's
+own author retracted it within the hour for a reason I should have caught while
+agreeing with it. "The old master alive and renewing" is how the damage is
+OBSERVED, not what creates it. The trace two sections above shows two rows
+appearing from `SetPair` + `Fence` alone, with no renewal and no seats in the
+picture; and a kill does not help either, because the stale row is DURABLE
+state that outlives the process, so whatever later holds that address is told
+OK.*
+
+*What my drill actually shows is narrower than I claimed for it: asking
+`CPLEASE` for the displaced master is a way to OBSERVE the two rows, not the
+thing that produces them. So no deployment path is ruled out, and a fleet
+reproduction does not need a partition — it needs a repoint, a fence, and
+anything at all that later asks.*
+
+*The mechanism the section describes is accurate and worth keeping: `flintctl`
+demotes before it fences and the controller cannot. Only the conclusion drawn
+from it was wrong, in their write-up and then again in mine.*
 
 ## Why it was not fixed at filing
 

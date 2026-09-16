@@ -1,8 +1,22 @@
 # ADR-0032 — one implementation of every control-plane mutation
 
-**Status:** **PROPOSED 2026-09-15** — design only, no code. Written because
-BUG-0146 asked for one, and because the duplication it describes produced
-**four** defects in eight days, three of them in the last twenty-four hours.
+**Status:** **ACCEPTED 2026-09-15 (Jeff)** — candidate **A**, single-node runs
+the same state machine. Written because BUG-0146 asked for a design, and
+because the duplication it describes produced **five** defects in eight days,
+four of them in the last twenty-four hours.
+
+**One premise below was wrong, and is corrected here rather than quietly
+edited.** This ADR asked whether single-node is a supported deployment or a
+development convenience, and said "single-node is what most drills and every
+small deployment run". Jeff, 2026-09-15: **production control planes are three
+nodes at minimum.** So the single-node control plane is drills and development
+— supported, and not a production topology.
+
+**That strengthens A rather than weakening it.** If production never runs the
+single-node control plane, then every drill running against it exercises code
+production does not run — ADR-0030's failure as a standing condition rather
+than an accident. Unifying is what makes the drill suite mean something about
+the shipped control plane.
 
 **Scope:** the two implementations of every mutating control-plane verb, and
 the two durable formats underneath them. Not the Raft protocol, not whether
@@ -94,11 +108,12 @@ and BUG-0150's while leaving BUG-0151's third copy exactly where it is.
 **Over C**, because C is what we have been doing. It caught BUG-0148 and by
 construction cannot catch the other three.
 
-**Over D**, because single-node is what most drills and every small deployment
-run, and removing it is a product decision with a blast radius far larger than
-this refactor. If the answer to the open question below is "development
-convenience", D becomes the cheaper answer and most of this work disappears —
-which is why the question is asked before the work starts, not after.
+**Over D** — decided, see the status block. Single-node turned out to be
+drills and development rather than a deployment topology, which makes D cheaper
+than this ADR first allowed. It was still not taken: the drills that found
+ADR-0030's miss, BUG-0151 and BUG-0152 are all cheap deterministic single-CP
+runs, and requiring three Raft nodes in each would cost more than the
+duplication does.
 
 Staged, because the durable format is the real cost and it should move on its
 own:
@@ -136,8 +151,23 @@ plane. Under this change they exercise the same code the raft path runs, which
 is the point — but the Raft-specific drills (`controlplane_ha`, `ctl_cpha`,
 `cpha_roll`) stay, because the transport is what they are about.
 
-## The open question, for Jeff
+## The question this ADR asked, and its answer
 
-**Is single-node a supported deployment, or a development convenience?**
-Everything above assumes the former. If it is the latter, candidate D is
-cheaper than A and this ADR becomes a deletion plan instead of a refactor.
+**Was single-node a supported deployment, or a development convenience?**
+Answered 2026-09-15: supported, but not a production topology — production is
+three nodes at minimum. A was taken anyway, for the reason in the status block:
+the value of unifying goes UP when the un-unified path is the one every drill
+runs and no fleet does.
+
+## A fifth instance, found in this ADR's first hour
+
+BUG-0152: the single-node line format carried ten of `Tenant`'s twelve fields,
+so `CPTENANTASYNC on` and `CPTENANTFEDERATE on` reverted on a control-plane
+restart. **The direction is reversed** from BUG-0148 and BUG-0150 — here the
+Raft path is correct, because serde carries every field it is given, and the
+single-node path is wrong.
+
+That is worth more than another tally mark. Two implementations do not drift in
+a direction that can be predicted and watched; they drift. A reviewer who had
+learned from BUG-0148 and BUG-0150 to check the Raft path would have looked
+straight past this one.

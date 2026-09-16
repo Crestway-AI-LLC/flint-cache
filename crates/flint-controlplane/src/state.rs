@@ -296,6 +296,13 @@ impl State {
                         let ops_per_sec = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0);
                         let max_bytes = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0);
                         let over_quota = parts.next() == Some("1");
+                        // A file written before BUG-0152 ends here, and both
+                        // default to false -- which is exactly what it meant.
+                        // A file written after is read by an older binary that
+                        // simply stops asking. Appending is what makes the
+                        // format change need no migration in either direction.
+                        let federated = parts.next() == Some("1");
+                        let async_writes = parts.next() == Some("1");
                         s.tenants.insert(
                             name.to_string(),
                             Tenant {
@@ -309,10 +316,8 @@ impl State {
                                 ops_per_sec,
                                 max_bytes,
                                 over_quota,
-                                // Legacy line-format state predates the
-                                // flag; JSON state carries it (serde).
-                                federated: false,
-                                async_writes: false,
+                                federated,
+                                async_writes,
                             },
                         );
                     }
@@ -401,7 +406,7 @@ impl State {
                 t.subset.join(",")
             };
             out.push_str(&format!(
-                "tenant {} {} {} {subset} {} {} {} {} {} {}\n",
+                "tenant {} {} {} {subset} {} {} {} {} {} {} {} {}\n",
                 t.name,
                 t.token,
                 t.ns,
@@ -411,6 +416,14 @@ impl State {
                 t.ops_per_sec,
                 t.max_bytes,
                 t.over_quota as u8,
+                t.federated as u8,
+                t.async_writes as u8,
+                // APPENDED, and appended is the whole compatibility story
+                // (BUG-0152). These two were written nowhere and loaded as
+                // `false`, so `CPTENANTASYNC on` and `CPTENANTFEDERATE on`
+                // held until the control plane restarted and then silently
+                // reverted -- with the CP pushing the reverted configuration
+                // out to the proxies.
                 subset = subset
             ));
         }
@@ -665,6 +678,52 @@ mod tests {
         let f = fleet(2);
         assert_eq!(shuffle_shard("t", &f, 5).len(), 2);
         assert!(shuffle_shard("t", &[], 3).is_empty());
+    }
+
+    /// EVERY FIELD DISTINGUISHABLE FROM ITS DEFAULT, which is the whole
+    /// point. `state_roundtrips_through_disk` below sets every flag to
+    /// `false`, so it round-trips a record made entirely of the LOADER'S
+    /// DEFAULTS -- and a field the writer never emits loads as its default
+    /// and compares equal. That fixture cannot detect a dropped field, and
+    /// BUG-0152 is what it did not detect: `federated` and `async_writes`
+    /// were absent from the line format for as long as the format existed,
+    /// so `CPTENANTASYNC on` survived until the control plane restarted.
+    ///
+    /// Written as a WHOLE-STRUCT comparison rather than a list of asserts, so
+    /// a field added to `Tenant` later is covered without anybody
+    /// remembering to extend this.
+    #[test]
+    fn every_tenant_field_survives_the_line_format() {
+        let dir = TempDir::new("allfields");
+        let path = dir.0.join("state");
+        let want = Tenant {
+            name: "acme".into(),
+            token: "d".repeat(64),
+            ns: "acme-ns".into(),
+            subset: vec!["p1:7000".into(), "p2:7000".into()],
+            prev_token: Some("e".repeat(64)),
+            replica_reads: true,
+            local_cache: true,
+            federated: true,
+            async_writes: true,
+            ops_per_sec: 4242,
+            max_bytes: 1 << 31,
+            over_quota: true,
+        };
+
+        let mut s = State::load_or_new(path.clone());
+        s.proxies.push("p1:7000".into());
+        s.proxies.push("p2:7000".into());
+        s.tenants.insert(want.name.clone(), want.clone());
+        s.commit().expect("commit");
+
+        let back = State::load_or_new(path);
+        let got = back.tenants.get("acme").expect("the tenant reloads");
+        assert_eq!(
+            got, &want,
+            "a tenant field did not survive the line format -- a field absent \
+             from the writer loads as the loader's default, silently"
+        );
     }
 
     #[test]
