@@ -528,3 +528,16 @@ conformance corpus entry for any new command, validated against the Valkey
 oracle (or, for commands Valkey does not have, against the module that
 defines them — see [docs/adr/README.md](docs/adr/README.md) for how this
 repository relates to the managed plane).
+
+## Contact
+
+**Crestway AI LLC** — [crestwayai.com](https://crestwayai.com) ·
+[info@crestwayai.com](mailto:info@crestwayai.com)
+
+For the managed service, commercial licensing, or anything this repository's
+issue tracker is not the right place for.
+
+**Security reports do not come here.** Vulnerabilities go through GitHub's
+private reporting channel — see [SECURITY.md](SECURITY.md) — so a fix can ship
+before the details are public. Mailing them to a general inbox gives up that
+window.
