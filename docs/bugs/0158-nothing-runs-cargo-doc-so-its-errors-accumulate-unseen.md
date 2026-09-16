@@ -43,6 +43,14 @@ that are never closed. The convention is right and the markup is wrong: the fix
 is backticks, not different prose. That means the bulk of this is mechanical,
 which is worth knowing before anyone quotes 99 as a large number.
 
+**And the intended shape is already in the tree**, which is better evidence than
+the argument. `crates/flint-ctl/src/main.rs:2013` writes `` `/proc/<pid>/cmdline` ``
+backticked — written that way deliberately, because a bare `<pid>` trips this
+lint — and six other placeholder sites are already backticked the same way
+(`` `<statedir>/cp-state` ``, `` `<dir>.log` ``, `` `<tag>` ``, `` `<absent>` ``).
+So the sweep is mostly mechanical, and where it is not, the existing cases show
+what it should look like rather than leaving it to taste.
+
 ## The actual defect is that nothing runs it
 
 `tools/gates.sh` has no rustdoc step, in either group:
@@ -54,7 +62,16 @@ which is worth knowing before anyone quotes 99 as a large number.
 
 So `cargo doc` has never been a check that passes here. It is a check that does
 not run, which is a different thing and the reason the count could reach 99
-without anybody choosing that. **flint-kv gates the equivalent** and has paid
+without anybody choosing that.
+
+**The `docs` stage is not that check, and must not become it.** Reading "there
+is a `docs` stage now" beside "nothing runs `cargo doc`" invites the assumption
+that the first covers the second. It does not, by design: `docs` is 36 greps,
+awks and python scans, runs in about 12 seconds, and needs **no toolchain at
+all** — which is what lets it be run before every push and on any machine.
+Rustdoc needs the toolchain, so it belongs in `check`, beside fmt and clippy.
+Two stages, two premises; folding rustdoc into `docs` would cost that stage the
+property it was built for. **flint-kv gates the equivalent** and has paid
 for it twice: two of its gate runs died at step 4 of ~30 on `unresolved link`,
 leaving every later step unverified for the sake of a type name.
 
