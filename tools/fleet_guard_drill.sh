@@ -495,7 +495,13 @@ echo "$OUT" | grep -q "nobody is driving them" \
   && { echo "FAIL: the refusal still asserts nobody is driving seats a live lock owns:"; \
        echo "$OUT" | sed 's/^/    /'; reap_j; exit 1; }
 echo "  an orphaned seat under a live lock is reported as owned, by name"
-reap_j; PIDS=""; sleep 0.5
+# `cleanup` BEFORE `PIDS=""`, as every arm above does, and not `reap_j` alone.
+# reap_j kills the orphaned SEAT and drops the lock; the lock's OWNER is the
+# $PEER_LIFE_S sleep in $PIDS, and clearing the list without killing it first
+# leaves a 300-second process outliving the drill. Harmless in itself -- it is
+# a sleep, not a flint binary, so no guard sees it -- but a leaked process
+# walked out of the arm that exists to stop leaked processes being misread.
+reap_j; cleanup; PIDS=""; sleep 0.5
 
 echo "PASS: fleet_guard sees sibling projects' fleets, refuses without claiming ownership, proceeds past an ORPHANED one while still refusing a parented one, does not misread our own binaries, honours FORCE, disowns prefix scopes, tells a live peer drill from a foreign fleet, and attributes an out-of-scope seat to its live owner rather than to its ppid"
 
