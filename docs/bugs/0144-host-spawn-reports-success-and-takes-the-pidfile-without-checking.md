@@ -1,6 +1,6 @@
-# BUG-0144: `host-spawn` reports success, and takes the pidfile, without checking the child survived (OPEN)
+# BUG-0144: `host-spawn` reports success, and takes the pidfile, without checking the child survived (FIXED 2026-09-15)
 
-Status: **OPEN**, found 2026-09-14 · Severity: **medium** — not reachable
+Status: **FIXED 2026-09-15**, found 2026-09-14 · Severity: **medium** — not reachable
 through any caller that honours the primitive's contract, and reachable
 through a race that ops has filed (OPS-0250). What it leaves behind is worse
 than the wasted spawn: **a dead pid in the pidfile of a live seat**, after
@@ -107,3 +107,112 @@ proposed above is a second line of defence for an invariant this repo already
 holds and tests (`docs/bugs/0004`), not a new rule that existing drills would
 trip over. That removes one of the two objections to doing it; the signature
 change across every spawn call site remains.
+
+## Fixed 2026-09-15 — and the fourteen callers were not needed
+
+**The ident is not caller knowledge.** This file's own objection was that a
+sound guard needs *pid AND ident*, that `local_spawn_env` is never given an
+ident, and that supplying one means threading it through `spawn`/`spawn_env`'s
+**fourteen** call sites. That framing is what kept the bug filed rather than
+fixed, and it was wrong in one specific way: `local_spawn_env` already receives
+`statedir`, `bins`, `name`, `bin` and `args`, and **`{bins}/{bin}` plus `args`
+IS the seat's identity** — it is exactly the command line a previous spawn of
+this same seat would be running under. So the check reads
+`{statedir}/pids/{name}.pid` and asks for that pid's argv. **No signature
+changed and no call site was touched.**
+
+That also answers the objections this file raised against the cheaper
+alternatives, which were both about an identity weaker than the question:
+matching on `bin` alone is what pid reuse defeats, and matching on the seat NAME
+fails because the name is not reliably in the argv (`cp-n1` is not a substring
+of `cp-state-n1`). `argv[0]` has neither problem — it is `{bins}/{bin}`, the
+binary out of this install, and it is what the seat is about to be exec'd as.
+
+**And it is argv[0], not the whole argv, which is a correction to the first
+version of this fix.** Requiring the ARGUMENTS to match too reads like the
+stronger check and is the weaker one: it would have allowed exactly the
+collision OPS-0250 recorded, because the two actors repairing `node-7002`
+composed different argv for it — `--journal 0.0.0.0:7500` against `--journal
+172.31.64.94:7500` — having read two inventories that disagree (BUG-0138). A
+whole-argv check calls that a different seat and waves it through. Nothing
+legitimate reaches this primitive with a live process in the pidfile whatever
+its arguments, because `roll-node` and `upgrade` stop the seat first, `start`
+leaves a live one alone and `launch` skips one already up; so the arguments are
+DIAGNOSIS, not permission, and the refusal prints both lists and says when they
+diverge. A stale pid, or one the kernel has recycled onto an unrelated process,
+still does not match and still does not refuse — each has its own control in
+the drill.
+
+## The refusal alone does not close the race — OPS-0250's half
+
+Two actors that both CHECK before either WRITES still both pass. So the same
+change puts an exclusive lock on the seat, held across check-spawn-pidfile-write
+in `local_spawn_env` and across the whole of `local_stop_seat` — the two
+functions where `start`/`host-spawn` and `stop`/`host-stop-seat` respectively
+converge, so one implementation covers a local actor and one arriving over ssh.
+
+- **`flock(2)`, not a pid in a file**, because the kernel releases it when the
+  process exits: a flintctl killed mid-repair must not wedge the seat it was
+  repairing. The pid written into the lock file is diagnostic only, and the
+  comment on the type says so, so that nobody later turns it into the lock.
+- **Per seat, not per statedir.** The race is two actors on ONE seat; a
+  statedir-wide lock would serialise a bootstrap whose seats do not contend.
+- **`std::fs::File::try_lock`, so no new dependency.** The plan for this change
+  assumed `libc`, which `flint-chaos`, `flint-storage` and `flint-server`
+  already carry; it is not needed. `File::try_lock` has been stable since Rust
+  1.89 and the toolchain pin is 1.98, so the lock costs no new edge, no
+  `Cargo.lock` change and no licence review. Checked by compiling it, not by
+  remembering the signature — it returns `Result<(), TryLockError>`, not the
+  `io::Result<bool>` this was first written against.
+- **Failing open, deliberately, when the lock cannot EXIST** (no directory, a
+  filesystem without flock): this is a second line of defence on the path every
+  roll walks. A holder that will not let go inside 60s is the opposite case and
+  refuses — that is another actor actively working the seat.
+- **What is NOT locked, with the reason.** `local_stop_all` kills every pidfile
+  in the directory and the seven `kill_pidfile` calls that bypass `stop_seat`
+  are untouched: neither participates in the check-then-write sequence this
+  closes, and widening the lock to them is a change to `stop`'s behaviour that
+  wants its own argument.
+
+## The question this raised, and how it was kept falsifiable
+
+`ps -o args=` is a FORMATTED column and I could not establish from the outside
+whether it truncates on the gate box. That mattered a great deal to the first
+version of this fix, where a truncated argv could never match and the guard
+would have silently stopped guarding — a check that cannot fail, which is the
+worst outcome available here and the one no gate notices. Keying the identity on
+`argv[0]` removes that failure entirely, because argv[0] is at the FRONT of
+whatever a truncating reader returns.
+
+What truncation could still do is make the message LIE: a cut `running` list
+compares unequal to `wanted`, and the refusal would then announce an argument
+divergence that is not there and send the reader to BUG-0138 for a fault that
+does not exist. So `pid_argv` still reads `/proc/<pid>/cmdline` first — the
+whole argv, NUL-separated, with no width to be cut to — and falls back to `ps`
+only on a host without procfs, which today means this laptop. The drill gives a
+seat a data dir long enough to push its argv past 300 characters and requires an
+IDENTICAL duplicate to be refused **without** that claim, so a truncating reader
+fails the drill rather than quietly misdirecting every operator who hits the
+refusal.
+
+## Drill: `tools/spawn_duplicate_drill.sh`
+
+Eight arms, of which **three require a spawn to be ALLOWED** — a clean
+statedir, a pidfile naming a dead pid, and a pidfile naming a live `/bin/sleep`
+that is not this seat. A guard that refused everything would pass an arm that
+only looks for a non-zero exit, and those three are what make the refusal arms
+mean something. Of the refusals, one is the identical duplicate and one is the
+duplicate whose ARGUMENTS differ — the shape that actually happened, and the
+one the first version of this fix would have allowed. The lock is tested deterministically rather than by racing two
+spawns and hoping they overlap: an external holder takes the seat's lock with
+`fcntl.flock`, and `host-spawn` must be observed with no pidfile written and
+still running two seconds later, then must complete once the lock is released.
+`host-stop-seat` gets the same arm, because a stop landing inside someone
+else's spawn reaches the same corrupted state from the other side.
+
+## Still not established, and now it does not matter
+
+Whether `flint-server` exits on a bind conflict quickly enough to lose the race
+in the direction described. It was the open question here; the fix does not
+depend on the answer, because the guard refuses before either copy is started
+rather than adjudicating which one loses.

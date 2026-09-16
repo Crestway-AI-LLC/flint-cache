@@ -1886,6 +1886,190 @@ fn open_seat_log(statedir: &str, name: &str) -> std::fs::File {
         .expect("log file")
 }
 
+/// How long to wait for another actor to be finished with a seat before
+/// refusing to touch it.
+///
+/// Above every legitimate holder: `local_stop_seat` is the longest, and its own
+/// worst case is a 10s kill loop followed by a 15s port wait. A wait past this
+/// is not a slow stop, it is a stuck one.
+const SEAT_LOCK_BUDGET: Duration = Duration::from_secs(60);
+
+/// One seat's exclusive lock, held for exactly as long as this value lives.
+///
+/// `flock(2)`, through `File::try_lock`, so the lock belongs to the open file
+/// description and the KERNEL releases it when the process exits. That is the
+/// property a pid-in-a-file lock does not have, and it is the one that matters:
+/// a flintctl killed mid-repair must not wedge the seat it was repairing. The
+/// text written into the file is DIAGNOSTIC ONLY -- it says who to go and look
+/// at when a wait times out, and nothing reads it to decide whether the lock is
+/// held.
+///
+/// Scope is one seat rather than the whole statedir, because the race it closes
+/// is two actors repairing the SAME seat (OPS-0250); a statedir-wide lock would
+/// serialise a bootstrap whose seats do not contend at all.
+struct SeatLock {
+    /// Never read. Dropping it closes the fd, and closing the fd is what
+    /// releases the lock -- so this must be BOUND at the call site (`let _lock`)
+    /// and not discarded (`let _`), which would unlock immediately.
+    _file: std::fs::File,
+}
+
+/// Take `name`'s lock, waiting up to `budget` for whoever holds it.
+///
+/// `Ok(None)` means UNLOCKED AND PROCEEDING, and it is deliberate for the cases
+/// where the lock cannot exist at all -- no directory, a filesystem without
+/// flock. This is a second line of defence on the path every roll walks, and
+/// failing an upgrade because a lock file could not be created would be a worse
+/// outcome than the race it prevents. A holder that will not let go inside
+/// `budget` is a different thing entirely: that is another actor actively
+/// working this seat, which is exactly what must not be spawned into, so that
+/// returns Err.
+fn lock_seat(statedir: &str, name: &str, budget: Duration) -> Result<Option<SeatLock>, String> {
+    let dir = format!("{statedir}/locks");
+    // Created here rather than added to the lists that build a statedir
+    // skeleton: this is the only code that opens anything in it, so a fourth
+    // entry in those lists would be one more thing to keep in agreement for no
+    // gain. Deliberately NOT under pids/ -- `local_stop_all` walks every entry
+    // of that directory and reads each filename as a seat name.
+    let _ = std::fs::create_dir_all(&dir);
+    let path = format!("{dir}/{name}.lock");
+    let file = match std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)
+    {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("  [{name}] seat lock unavailable ({path}: {e}) -- PROCEEDING UNLOCKED");
+            return Ok(None);
+        }
+    };
+    let deadline = Instant::now() + budget;
+    loop {
+        match file.try_lock() {
+            Ok(()) => break,
+            Err(std::fs::TryLockError::WouldBlock) => {
+                if Instant::now() >= deadline {
+                    let held = std::fs::read_to_string(&path).unwrap_or_default();
+                    let held = held.trim().to_string();
+                    return Err(format!(
+                        "{name}: another flintctl has held this seat's lock for {}s{} -- \
+                         refusing to act on a seat someone else is repairing, because two \
+                         actors on one seat is what leaves a dead pid in the pidfile of a \
+                         live process (OPS-0250)",
+                        budget.as_secs(),
+                        if held.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" ({held})")
+                        }
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(std::fs::TryLockError::Error(e)) => {
+                eprintln!("  [{name}] seat lock unusable ({path}: {e}) -- PROCEEDING UNLOCKED");
+                return Ok(None);
+            }
+        }
+    }
+    let mut f = &file;
+    let _ = f.set_len(0);
+    let _ = write!(
+        f,
+        "flintctl pid {} since {}ms",
+        std::process::id(),
+        now_ms()
+    );
+    let _ = f.flush();
+    Ok(Some(SeatLock { _file: file }))
+}
+
+/// The argv a spawn of this seat WOULD run under.
+///
+/// `{bins}/{bin}` plus `args` IS the seat's identity -- it is precisely the
+/// command line a previous spawn of this same seat is running under. That is
+/// what makes the duplicate check below possible without an ident from the
+/// caller, which BUG-0144 measured as fourteen call sites, and which
+/// `host-spawn` is never given in the first place.
+///
+/// Tokenised through the same whitespace split `pid_argv` applies, so the two
+/// are comparable at all: `ps` reports a space-JOINED line and we cannot
+/// un-join it, so both sides are put in that shape rather than pretending they
+/// already match. An argument containing a space would split here and there
+/// alike; no fleet seat has one, and the only error it could cause is a false
+/// MATCH between two different argument vectors for the SAME seat name.
+fn spawn_argv(bins: &str, bin: &str, args: &[String]) -> Vec<String> {
+    format!("{bins}/{bin} {}", args.join(" "))
+        .split_whitespace()
+        .map(str::to_string)
+        .collect()
+}
+
+/// The argv of `pid`: `None` when there is no such process, when it is a zombie,
+/// or when the machine could not be asked.
+///
+/// `/proc/<pid>/cmdline` FIRST, and that is not a micro-optimisation. It is the
+/// whole argv, NUL-separated, with no column width for anything to be truncated
+/// to. `ps -o args=` is a FORMATTED column, and a truncated one would leave the
+/// comparison below unable to match anything -- a check that cannot fail, which
+/// is the worst of the outcomes available here. So procfs is the path the fleet
+/// takes, every seat of it running Linux, and `ps` is the fallback for a host
+/// without procfs, which today means this laptop. `spawn_duplicate_drill.sh`
+/// spawns a seat with a >300 character argv precisely so that a truncating
+/// reader fails the drill instead of silently passing every gate.
+fn pid_argv(pid: u32) -> Option<Vec<String>> {
+    let raw = match std::fs::read(format!("/proc/{pid}/cmdline")) {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).replace('\0', " "),
+        Err(_) => {
+            let out = Command::new("ps")
+                .args(["-p", &pid.to_string(), "-o", "args="])
+                .output()
+                .ok()?;
+            if !out.status.success() {
+                return None;
+            }
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        }
+    };
+    let argv: Vec<String> = raw.split_whitespace().map(str::to_string).collect();
+    (!argv.is_empty()).then_some(argv)
+}
+
+/// The live process `{statedir}/pids/{name}.pid` names, when it is one of OURS.
+///
+/// "Ours" is `argv[0] == {bins}/{bin}`: the same binary, out of the same install,
+/// recorded under this seat's pidfile. That is the identity, and the two things
+/// it is deliberately not are both mistakes this guard could have made:
+///
+/// - **Not the pid alone.** A pidfile outlives what it names and the kernel
+///   recycles the number, which is why `pids_matching` insists on an exact ident
+///   token rather than trusting a pid. A liveness-only guard would refuse a
+///   legitimate start every time a recycled pid happened to be alive.
+/// - **Not the WHOLE argv either**, which is where the first version of this went
+///   wrong. Requiring the arguments to match too would have allowed exactly the
+///   collision OPS-0250 recorded: on 2026-09-14 the two actors repairing
+///   `node-7002` composed DIFFERENT argv for it -- `--journal 0.0.0.0:7500`
+///   against `--journal 172.31.64.94:7500` -- because they read two inventories
+///   that disagree (BUG-0138). A check keyed on the whole argv would have called
+///   that a different seat and waved it through.
+///
+/// Nothing legitimate reaches this function with a live process in the pidfile,
+/// whatever its arguments: `roll-node` and `upgrade` stop the seat first, `start`
+/// leaves a live one alone, and `launch` skips a seat that is already up. So the
+/// arguments are diagnosis, not permission -- the caller reports both lists,
+/// because their DIFFERENCE is what names the cause.
+fn live_seat_process(statedir: &str, name: &str, argv0: &str) -> Option<(u32, Vec<String>)> {
+    let pid: u32 = std::fs::read_to_string(format!("{statedir}/pids/{name}.pid"))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    let running = pid_argv(pid)?;
+    (running.first().map(String::as_str) == Some(argv0)).then_some((pid, running))
+}
+
 /// Start one seat on THIS machine, recording its pid.
 fn local_spawn_env(
     statedir: &str,
@@ -1895,6 +2079,41 @@ fn local_spawn_env(
     args: &[String],
     envs: &[(String, String)],
 ) {
+    // TAKEN BEFORE THE CHECK AND HELD PAST THE PIDFILE WRITE, and that ordering
+    // is the fix rather than a detail of it. Checking and then writing without a
+    // lock IS the race: OPS-0250 saw the box's own supervise timer and a remote
+    // agent repair one seat 1.4s apart, and each would have passed a check the
+    // other had not yet invalidated.
+    let _lock = match lock_seat(statedir, name, SEAT_LOCK_BUDGET) {
+        Ok(lock) => lock,
+        Err(why) => die(&why),
+    };
+    let want = spawn_argv(bins, bin, args);
+    let argv0 = format!("{bins}/{bin}");
+    if let Some((pid, running)) = live_seat_process(statedir, name, &argv0) {
+        let differ = if running == want {
+            String::new()
+        } else {
+            "The two ARGUMENT LISTS DIFFER, which is what two inventories that \
+             disagree about one fleet look like -- that is the 2026-09-14 collision, \
+             and BUG-0138 is why it happened. Do not assume either list is the right \
+             one.\n  "
+                .to_string()
+        };
+        die(&format!(
+            "refusing to start {name}: pid {pid} is ALREADY running it.\n  \
+             running: {}\n  \
+             wanted:  {}\n  \
+             {differ}Every caller of this primitive is contracted to have stopped the \
+             seat first -- `roll-node` and `upgrade` stop it, `start` leaves a live one \
+             alone -- so a live copy here means two actors are repairing one seat. \
+             Starting a second would record ITS pid and then lose the port race, after \
+             which every stop through this pidfile aims at a corpse while the real seat \
+             keeps serving (BUG-0144).",
+            running.join(" "),
+            want.join(" ")
+        ));
+    }
     let mut log = open_seat_log(statedir, name);
     // A banner, because appending only helps if runs can be told apart.
     let _ = writeln!(
@@ -2341,6 +2560,11 @@ fn local_stop_seat(
     ident: &str,
     port: Option<u16>,
 ) -> Result<(), String> {
+    // The same lock a spawn takes, so a stop and a repair cannot interleave on
+    // one seat. Held across the kill, the convergence wait AND the port wait: a
+    // spawn landing between "gone from ps" and "port free" is exactly the
+    // duplicate this exists to prevent (OPS-0250).
+    let _lock = lock_seat(statedir, name, SEAT_LOCK_BUDGET)?;
     local_kill_pidfile(statedir, name);
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
