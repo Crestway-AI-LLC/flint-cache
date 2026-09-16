@@ -1736,9 +1736,17 @@ assert_bug_index_agrees() {
 }
 
 assert_no_default_ports() {
+  _have_drill_files || return 0
+  . tools/lib/drill-ports.sh || {
+    echo "GATES FAILED: tools/lib/drill-ports.sh is missing, but drill files are"
+    echo "      present, so the default-port check would examine nothing."
+    exit 1
+  }
   local hits
-  hits=$(grep -nE '^fleet_init .*[^0-9](7001|7002|7379|7500)([^0-9]|$)' \
-    tools/*_drill.sh 2>/dev/null || true)
+  # THROUGH THE LIBRARY (BUG-0156). Its own scan anchored at column 0 and did
+  # not join continuations, so an indented or wrapped `fleet_init 7001` -- the
+  # one thing this check exists to forbid -- was invisible to it.
+  hits=$(drill_fleet_init_lines | grep -E '[^0-9](7001|7002|7379|7500)([^0-9]|$)' || true)
   [ -z "$hits" ] && return 0
   echo "FAIL  drills claim the default cluster ports (7001/7002/7379/7500):"
   echo "$hits" | sed 's/^/        /'
@@ -2084,12 +2092,19 @@ assert_no_cross_repo_ports() {
     echo "  SKIP: no ops checkout at $ops — cross-repo port overlap NOT checked"
     return 0
   fi
+  . tools/lib/drill-ports.sh || {
+    echo "GATES FAILED: tools/lib/drill-ports.sh is missing, so the cross-repo"
+    echo "      port check would compare two empty sets and pass."
+    exit 1
+  }
   local shared
+  # THE LIBRARY ON BOTH SIDES (BUG-0156). The scan here saw neither repo's
+  # continuation-wrapped or indented declarations, and neither harness's own
+  # conformance ports -- this repo's 6388-6390 were never compared against ops
+  # at all.
   shared=$(comm -12 \
-    <(grep -h '^fleet_init' tools/*_drill.sh 2>/dev/null \
-      | awk '{for (i=3; i<=NF; i++) print $i}' | sort -u) \
-    <(grep -h '^fleet_init' "$ops"/tools/*_drill.sh 2>/dev/null \
-      | awk '{for (i=3; i<=NF; i++) print $i}' | sort -u))
+    <(drill_declared_ports | awk '{print $1}' | sort -u) \
+    <(drill_declared_ports "$ops/tools" | awk '{print $1}' | sort -u))
   if [ -z "$shared" ]; then
     echo "  no port is claimed by both this repo's drills and the ops repo's"
     return 0
@@ -2097,7 +2112,8 @@ assert_no_cross_repo_ports() {
   echo "FAIL  this repo's drills claim port(s) an ops drill already uses:"
   local p
   for p in $shared; do
-    echo "        $p: $(grep -l "^fleet_init.*[^0-9]$p\([^0-9]\|\$\)" tools/*_drill.sh "$ops"/tools/*_drill.sh 2>/dev/null | tr '\n' ' ')"
+    echo "        $p: $( { drill_declared_ports; drill_declared_ports "$ops/tools"; } \
+      | awk -v p="$p" '$1==p {printf "%s ", $2}')"
   done
   echo "        Pick a port free in BOTH repos. Checking only this one is how"
   echo "        6987 reached main (2026-09-07)."
@@ -2105,13 +2121,27 @@ assert_no_cross_repo_ports() {
 }
 
 assert_no_port_overlap() {
+  _have_drill_files || return 0
+  . tools/lib/drill-ports.sh || {
+    echo "GATES FAILED: tools/lib/drill-ports.sh is missing, but drill files are"
+    echo "      present, so the port-overlap check would examine nothing."
+    exit 1
+  }
   local dupes p
-  dupes=$(grep -h '^fleet_init' tools/*_drill.sh 2>/dev/null \
-    | awk '{for (i=3; i<=NF; i++) print $i}' | sort -n | uniq -d)
+  # THROUGH THE LIBRARY (BUG-0156). Its own scan was blind to the harness's
+  # conformance ports and to indented or wrapped declarations: 535 against the
+  # library's 538.
+  #
+  # THIS IS NOW PROVABLY REDUNDANT with assert_no_duplicate_drill_ports, which
+  # asks the same question on the same map and names the drills rather than the
+  # files. Left in place rather than deleted: removing a gate assertion is a
+  # call for whoever owns the suite, and two checks that read one function can
+  # no longer disagree, which was the defect.
+  dupes=$(drill_declared_ports | awk '{print $1}' | sort -n | uniq -d)
   [ -z "$dupes" ] && return 0
   echo "FAIL  two or more drills declare the same port(s):"
   for p in $dupes; do
-    echo "        $p: $(grep -l "^fleet_init.*[^0-9]$p\([^0-9]\|\$\)" tools/*_drill.sh | tr '\n' ' ')"
+    echo "        $p: $(drill_declared_ports | awk -v p="$p" '$1==p {printf "%s ", $2}')"
   done
   echo "        fleet_guard reads the other drill's seats as this drill's own."
   echo "        Give each drill a disjoint block."
@@ -2128,13 +2158,20 @@ assert_no_port_overlap() {
 # session reading this file for a different reason, which is the second time
 # today the check that was missing was the one nobody thought to write.
 assert_no_scope_overlap() {
+  _have_drill_files || return 0
+  . tools/lib/drill-ports.sh || {
+    echo "GATES FAILED: tools/lib/drill-ports.sh is missing, but drill files are"
+    echo "      present, so the scope-overlap check would examine nothing."
+    exit 1
+  }
   local dupes d
-  dupes=$(grep -h '^fleet_init' tools/*_drill.sh 2>/dev/null \
-    | awk '{print $2}' | sort | uniq -d)
+  # THROUGH THE LIBRARY (BUG-0156), for the same reason as the ports half: an
+  # indented or continuation-wrapped declaration was invisible to the scan here.
+  dupes=$(drill_declared_scopes | awk '{print $1}' | sort | uniq -d)
   [ -z "$dupes" ] && return 0
   echo "FAIL  two or more drills declare the same scope dir:"
   for d in $dupes; do
-    echo "        $d: $(grep -l "^fleet_init $(printf '%s' "$d" | sed 's/[][\.*^$/]/\\&/g') " tools/*_drill.sh | tr '\n' ' ')"
+    echo "        $d: $(drill_declared_scopes | awk -v s="$d" '$1==s {printf "%s ", $2}')"
   done
   echo "        scope is the other half of _fleet_ours's ownership test, so each"
   echo "        drill can select the other's seats and rm -rf its state."

@@ -31,6 +31,62 @@
 # default ports claimed and collide with every drill that legitimately uses
 # them. Requiring the line to BEGIN with fleet_init (indented or not) is what
 # separates a declaration from a mention of one.
+# _fleet_init_lines_in <file>  ->  "<lineno>:<joined declaration>"
+#
+# THE ONE PREPROCESSING STEP every fleet_init question needs, and the reason it
+# is a function rather than three greps: both details below are load-bearing,
+# each was learned from a real miss, and a hand-written scan gets them wrong
+# (BUG-0156 measured five consumers, three of which did).
+#
+#   - CONTINUATIONS ARE JOINED FIRST. Several drills wrap their argument list
+#     with a trailing backslash, and reading only the first physical line drops
+#     every port after the break -- an under-count that reads exactly like "no
+#     collision".
+#   - THE LINE MAY BE INDENTED, and it must BEGIN with fleet_init. Requiring
+#     column 0 misses an indented declaration; not anchoring at all reads a
+#     sibling check's own grep PATTERN as a declaration, which is how gates.sh
+#     was once reported as declaring 7001.
+_fleet_init_lines_in() {
+  sed -e :a -e '/\\$/N; s/\\\n//; ta' "$1" 2>/dev/null \
+    | grep -nE '^[[:space:]]*fleet_init '
+}
+
+# drill_fleet_init_lines [dir]  ->  "<file>:<lineno>:<joined declaration>"
+#
+# Same shape `grep -n` over the glob would print, so a check that wants to
+# report WHERE can use it directly.
+drill_fleet_init_lines() {
+  local dir="${1:-tools}" f
+  for f in "$dir"/*_drill.sh "$dir"/gates.sh; do
+    [ -f "$f" ] || continue
+    _fleet_init_lines_in "$f" | sed "s|^|$f:|"
+  done
+}
+
+# drill_declared_scopes [dir]  ->  lines of "<scope> <drill>"
+#
+# The OTHER half of `_fleet_ours`'s ownership test: it takes a pid if the ps
+# line carries the scope dir OR a declared port, so two drills sharing a scope
+# select each other's seats even with disjoint port blocks.
+#
+# DRILLS ONLY, and that difference from `drill_declared_ports` is deliberate
+# rather than an oversight: gates.sh declares `fleet_init "$CDIR"`, a variable,
+# so its scope has no literal to compare against another drill's literal.
+# `assert_declared_scopes_cover_data_dirs` resolves it and therefore reads the
+# lines itself.
+drill_declared_scopes() {
+  local dir="${1:-tools}" f d
+  for f in "$dir"/*_drill.sh; do
+    [ -f "$f" ] || continue
+    d=$(basename "$f" _drill.sh)
+    _fleet_init_lines_in "$f" \
+      | sed 's|^[0-9]*:||' \
+      | awk '{print $2}' \
+      | sort -u \
+      | while read -r s; do printf '%s %s\n' "$s" "$d"; done
+  done
+}
+
 drill_declared_ports() {
   local dir="${1:-tools}" f d
   for f in "$dir"/*_drill.sh "$dir"/gates.sh; do
@@ -39,8 +95,7 @@ drill_declared_ports() {
       *_drill.sh) d=$(basename "$f" _drill.sh) ;;
       *)          d=gates-conformance ;;
     esac
-    sed -e :a -e '/\\$/N; s/\\\n//; ta' "$f" 2>/dev/null \
-      | grep -E '^[[:space:]]*fleet_init ' \
+    _fleet_init_lines_in "$f" \
       | grep -oE 'fleet_init [^;&|]+' \
       | grep -oE '\b[0-9]{4,5}\b' \
       | sort -u \
