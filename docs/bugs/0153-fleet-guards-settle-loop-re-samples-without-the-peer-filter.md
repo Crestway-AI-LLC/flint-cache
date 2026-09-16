@@ -106,13 +106,26 @@ below, and both are somebody's decision rather than a defect I can settle.
 
 ## What this bug does NOT settle, deliberately
 
-**Whether drills should leave orphans at all.** `upgrade`'s 6845/6846 outlived
-it in both failures, and the guard's own comment says the flint-kv suite did the
-same twice in an hour on 2026-08-27. A suite that orphans seats is a separate
-question from a guard that misclassifies them once they exist, and the fix above
-is right whichever way that one is answered — which is why it is not waiting on
-it. An orphan will still, correctly, refuse the run after this fix; it will just
-refuse it for itself, naming itself, in under a second.
+**Whether drills leave orphans at all — and I no longer believe the evidence
+here says they do.** The first draft of this section said `upgrade`'s 6845/6846
+had outlived it, on the strength of `ppid 1`. That inference is wrong, and it is
+wrong for a reason written into `flintctl`: `local_spawn_env` spawns a seat and
+never waits on it — *"these are the fleet's long-lived daemons, and flintctl
+exits while they keep serving"* — so **every seat a `bootstrap` or a `start`
+brings up is reparented to init and shows `ppid 1` while perfectly healthy**. In
+the same listing, `upgrade`'s controller, control plane and proxy are at ppid
+1010994, alive. `ppid 1` separated nothing.
+
+That the guard *reports* on that inference — *"ALL n ARE ORPHANS (ppid 1):
+nobody is driving them"* — and that the same inference decides whether a sibling
+project's fleet refuses on sight, is filed separately as
+[BUG-0155](0155-ppid-1-is-the-normal-state-of-a-flintctl-spawned-seat.md). It is
+not this bug, and the fix above is right either way.
+
+What remains true is that seats from SOME source were present and did not clear,
+and that a foreign seat which does not clear correctly refuses the run. After
+this fix it will refuse for itself, naming itself, rather than dragging the live
+peers in with it.
 
 **And case G's exit-code assertion is global**, which with the orphans above is
 the actual cause of the flakiness: `[ "$RC" = 0 ]` can be moved by anything else
