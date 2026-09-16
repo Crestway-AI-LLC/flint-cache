@@ -84,6 +84,38 @@ one place that would have caught the clock.
 **Mutation-verified**: the injected kill that produced the false amnesty now
 produces the expiry message, and the drill is otherwise clean.
 
+## Corroborated independently, and the discrepancy is the interesting part
+
+The cache session fixed this in parallel, reached the same two findings, and
+dropped their version rather than push a competing fix to one arm. Three things
+from their account are worth keeping here.
+
+**They measured the pipeline at 2, this file says 1, and both are right.** The
+count depends on whether any ANCESTOR's command line also carries the pattern:
+run the measurement from a shell whose own argv contains the literal and you get
+the grep plus that ancestor. Assembling the pattern at runtime, so no ancestor
+can carry it, gives **1 from the pipeline and 0 from the snapshot** — and 1 is
+the number that matters, because it is the irreducible self-match that exists in
+the drill, where the pattern comes from a variable and the launcher is
+`bash tools/fleet_guard_drill.sh`. A measurement of a `ps` match is itself
+sensitive to how the measurement was launched, which is a small lesson of the
+same family as the bug.
+
+**A mutation test can survive a vacuous check.** They wrote the same
+`ps | grep` control into their own fix, mutation-tested it with a two-second
+seat, and it PASSED. It came apart only when they instrumented the arm instead
+of believing the mutant: a debug line reading `arm G elapsed 59s; server seat
+visible: 1` for a seat whose lifetime was two seconds. Stated generally, and it
+belongs beside the other verification notes: **a mutation test that a vacuous
+check survives looks exactly like a mutation test of a sound check that the
+mutation did not reach.** Both are a green run after an injected fault. Telling
+them apart needs the check's OWN answer printed, not the arm's verdict.
+
+**The vacuous idiom propagated by looking established.** Their copy came from
+arm F, read as the file's house style — which is how a bad shape spreads inside
+a file that is otherwise careful, and why all four call sites were converted here
+rather than only the one that failed.
+
 ## Not established
 
 **Whether the 2026-09-16 failure was an expiry or a real concurrent peer's lock
