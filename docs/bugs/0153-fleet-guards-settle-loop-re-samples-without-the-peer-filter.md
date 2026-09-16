@@ -1,6 +1,6 @@
-# BUG-0153: `fleet_guard`'s settle loop re-samples without the peer filter, so one orphan makes every live peer drill foreign (OPEN)
+# BUG-0153: `fleet_guard`'s settle loop re-samples without the peer filter, so one orphan makes every live peer drill foreign (FIXED 2026-09-15)
 
-Status: **OPEN**, found 2026-09-15 · Severity: **medium** — it does not corrupt
+Status: **FIXED 2026-09-15**, found 2026-09-15 · Severity: **medium** — it does not corrupt
 anything and it does not reach production; it reddens a green gate
 intermittently, which is worse than it sounds, because a suite that fails 2 runs
 in 4 for a reason nobody has named teaches everyone to re-run rather than to
@@ -134,3 +134,37 @@ Filed as 0153 because 0152 was taken. The peer pushed public `291c57b` at
 by reading `docs/bugs/` and `coordination.md`, where it was free, 28 minutes
 after it had stopped being free in the place that decides. The reservation is
 the pushed file, not the claim row.
+
+## Fixed 2026-09-15
+
+`fleet_guard` resolves the live peers **once**, before the first sample, and
+every sample is piped through `_fleet_drop_peer_lines "$peers"` — including the
+one inside the settle loop. With an empty peer list that function is the
+identity, so the filter is applied unconditionally and there is no second code
+path to keep in agreement with the first, which is what went wrong here.
+
+**Mutation-verified, and it reproduces the original output.** With the fix
+reverted, the new arm fails with the same self-contradiction the gate log shows:
+
+    (2 seat(s) belong to 1 live peer drill(s) in this suite -- not foreign)
+    REFUSING TO RUN: this box already has Flint processes outside …/flint-guard-drill
+        pid 61985 ppid 61697  flint-server --data-dir …/flint-guardpeer/d 60
+        pid 61986 ppid 61697  flint-controller --pairs 127.0.0.1:7788,127.0.0.1:7789 --id peerctl 60
+
+Those two are the arm's own peer fixture, named as foreign by the line under the
+line that says they are not. The reverted run also REFUSES, which is the verdict
+half: the dying seat cleared and the peers took its place.
+
+**The regression arm is in case G, and it is deliberately local.** A seat under
+a scope no lock covers, given a 3-second life so it is gone well inside the 15s
+settle budget, and then the assertion is that the guard's output does not NAME
+the peer's seats — not that it returned 0. `RC = 0` here would be moved by any
+stranger's orphan, which is the flakiness this bug started as and the
+unscoped-census mistake the next arm along already warns about. Both fixtures
+are checked in `ps` first, so an arm that finds no peer cannot pass by finding
+nothing to complain about.
+
+**Still open, and still not mine to settle**: whether drills should leave
+orphans at all, and case G's `RC = 0`. An orphan on the box will still fail case
+G after this fix — it will just fail it honestly, naming the orphan and nothing
+else.

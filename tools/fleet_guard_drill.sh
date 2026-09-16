@@ -148,6 +148,10 @@ cleanup; PIDS=""; sleep 0.5
 # exec -a sets argv[0], so the whole string becomes the command line as ps
 # renders it. Scope matching reads that line, so the fake has to have one.
 spawn_argv() { bash -c "exec -a \"$1\" sleep 60" & PIDS="$PIDS $!"; }
+# The same fake seat with a life span, for the one case that needs a seat to GO
+# on its own: fleet_guard's settle loop exists for seats on their way out, and
+# BUG-0153 is about what that loop samples while it waits.
+spawn_argv_for() { bash -c "exec -a \"$1\" sleep $2" & PIDS="$PIDS $!"; }
 
 echo "== F) a scope must not own a scope it is merely a PREFIX of"
 # fleet.sh decided ownership with `index(args, scope) > 0`, so flint-cpha
@@ -202,6 +206,38 @@ OUT=$( unset FLINT_DRILL_PARALLEL; fleet_guard 2>&1 ); RC=$?
 OUT=$(FLINT_DRILL_PARALLEL=1 fleet_guard 2>&1); RC=$?
 [ "$RC" = 0 ] \
   || { echo "FAIL: FLINT_DRILL_PARALLEL=1 still refused a live peer drill (exit $RC):"; echo "$OUT" | sed 's/^/    /'; rm -rf "$PEER.lock"; exit 1; }
+# BUG-0153: THE SECOND SAMPLE MUST MEAN WHAT THE FIRST ONE DID.
+#
+# fleet_guard samples the box twice -- here, and once a second while it waits
+# for a teardown to settle -- and only the first applied the peer filter. So one
+# seat that survived the first pass put the peers back into the population for
+# the whole of the settle loop, where they never clear because they are live.
+# That changed the VERDICT and not only the message: a live peer plus a seat
+# that was merely DYING refused a run that should have proceeded. It is also
+# why case G failed 2 runs in 4 on 2026-09-15 -- another drill's orphan was
+# enough to make this drill's own peer read as a foreign fleet.
+#
+# Reproduced with a seat under a scope no lock covers, so the first pass keeps
+# it, and a 3s life span so it is gone well inside the 15s settle budget.
+#
+# ASSERTED LOCALLY, NOT AS A GLOBAL VERDICT. `RC = 0` here would be moved by any
+# orphan anywhere on the box, which is the unscoped-census mistake the arm below
+# already warns about. The property is about WHO gets named: after the dying
+# seat goes, the peers must not take its place in the foreign list, whatever
+# else the box makes the guard decide.
+DYING="$FLINT_DRILL_ROOT/flint-guarddying"
+spawn_argv_for "flint-server --data-dir $DYING/d" 3
+sleep 1
+ps -eo args= | grep -q -- "--data-dir $DYING/d" \
+  || { echo "FAIL: the dying seat is not visible in ps -- this case would pass vacuously"; rm -rf "$PEER.lock"; exit 1; }
+ps -eo args= | grep -q -- "--data-dir $PEER/d" \
+  || { echo "FAIL: the PEER seat is not visible in ps -- an assertion that the peer is not named would pass because there is no peer"; rm -rf "$PEER.lock"; exit 1; }
+OUT=$(FLINT_DRILL_PARALLEL=1 fleet_guard 2>&1); RC=$?
+if printf '%s\n' "$OUT" | grep -q -- "--data-dir $PEER/d"; then
+  echo "FAIL: after a dying seat cleared, the guard listed the LIVE PEER's seat as out of scope (exit $RC). The settle loop re-derived the foreign set without the peer filter, so the peers came back and cannot clear -- BUG-0153:"
+  echo "$OUT" | sed 's/^/    /'; rm -rf "$PEER.lock"; exit 1
+fi
+echo "  a seat clearing during the settle does not make the live peers foreign"
 # ISOLATE THE PORTS KEY, DO NOT COUNT THE BOX.
 #
 # This asserted the message read "2 seat(s) belong to", which is only true on

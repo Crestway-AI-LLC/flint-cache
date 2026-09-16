@@ -779,33 +779,50 @@ PY
 }
 
 assert_no_cross_drill_kill_patterns() {
-  local d drill pat owner bad=""
-  local portmap="$LOGS/.portmap"
-  for drill in tools/*_drill.sh; do
-    [ -f "$drill" ] || continue
-    d=$(basename "$drill" _drill.sh)
-    sed -e :a -e '/\\$/N; s/\\\n//; ta' "$drill" 2>/dev/null \
-      | grep -oE 'fleet_init [^;&|]+' | grep -oE '\b[0-9]{4,5}\b' \
-      | while read -r port; do printf '%s %s\n' "$port" "$d"; done
-  done > "$portmap"
-  for drill in tools/*_drill.sh; do
-    [ -f "$drill" ] || continue
-    d=$(basename "$drill" _drill.sh)
-    # COMMENTS ARE NOT CALL SITES. controlplane_drill and lease_drill both
-    # quote the pattern they used to have, in a comment explaining why it was
-    # wrong. Matching those would fail the gate over the write-up of the fix
-    # rather than the defect -- a check that cannot tell a cure from a disease.
-    for pat in $(grep -v '^[[:space:]]*#' "$drill" 2>/dev/null \
-                 | grep -hoE 'pkill[^|]*"[^"]*--port [0-9]{1,5}"' \
-                 | grep -oE -- '--port [0-9]{1,5}' | awk '{print $2}' | sort -u); do
-      while read -r port owner; do
-        case "$port" in
-          "$pat"*) [ "$owner" != "$d" ] && bad="$bad
+  # NO DRILLS, NOTHING TO CHECK -- and this is the arm gates_drill.sh forges a
+  # tree for: only tools/gates.sh, no tools/lib. Sourcing the library there is
+  # a refusal about a tree that legitimately has no drills in it. Same guard
+  # and same reason as assert_no_duplicate_drill_ports; see _have_drill_files.
+  _have_drill_files || return 0
+  local d pat owner port bad="" n_pat n_port
+  # BOTH POPULATIONS FROM THE LIBRARY (BUG-0154). This rebuilt the port map
+  # inline, and the copy had already drifted from `drill_declared_ports`: it was
+  # unanchored, where the shared one anchors on `^fleet_init` after an
+  # unanchored match once read a sibling check's own regex as a declaration of
+  # 7001, and it did not scan gates.sh, whose conformance stage claims ports
+  # exactly as a drill does. So this check was asking its question against a map
+  # both looser and smaller than the one the duplicate check uses. The patterns
+  # move into the library for the other half of the same bug: tools/
+  # next-free-ports.sh could not see them, and suggested a port this check then
+  # refused.
+  . tools/lib/drill-ports.sh || {
+    echo "GATES FAILED: tools/lib/drill-ports.sh is missing, so the cross-drill"
+    echo "      kill-pattern check cannot read either population."
+    exit 1
+  }
+  local portmap="$LOGS/.portmap" patmap="$LOGS/.patmap"
+  drill_declared_ports > "$portmap"
+  drill_kill_prefixes  > "$patmap"
+  n_port=$(grep -c . "$portmap" || true)
+  n_pat=$(grep -c . "$patmap" || true)
+  # A COVERAGE REFUSAL, which every sibling check in this file has and this one
+  # did not: a grep that stops matching certifies every drill by reading none of
+  # them, and the result is indistinguishable from a clean tree.
+  if [ "${n_port:-0}" -eq 0 ] || [ "${n_pat:-0}" -eq 0 ]; then
+    echo "GATES FAILED: the cross-drill kill-pattern check examined ${n_pat:-0}"
+    echo "      pattern(s) over ${n_port:-0} declared port(s). Zero of either means"
+    echo "      the extractor stopped matching, not that the tree is clean."
+    FAILED="$FAILED kill-cross-examined-nothing"
+    return
+  fi
+  while read -r pat d; do
+    while read -r port owner; do
+      case "$port" in
+        "$pat"*) [ "$owner" != "$d" ] && bad="$bad
     $d: pattern '--port $pat' also matches port $port, declared by $owner" ;;
-        esac
-      done < "$portmap"
-    done
-  done
+      esac
+    done < "$portmap"
+  done < "$patmap"
   if [ -n "$bad" ]; then
     echo "GATES FAILED: a drill's kill pattern reaches another drill's ports:$bad"
     echo "      A truncated port in a pkill pattern is a substring match. It is"

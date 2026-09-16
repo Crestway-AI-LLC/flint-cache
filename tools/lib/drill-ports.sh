@@ -85,6 +85,39 @@ drill_declared_ports() {
 # the two gates failing for reasons neither could see.
 #
 # So the allocator RESERVES these and asserts nothing about them.
+# drill_kill_prefixes [dir]  ->  lines of "<prefix> <drill>"
+#
+# The SECOND population the gate refuses on, and the one `next-free-ports.sh`
+# did not know about (BUG-0154). A truncated port in a pkill pattern is a
+# SUBSTRING match: `pkill -f "flint-server --port 644"` reaches 6440-6449, so a
+# drill declaring 6442 is one parallel batch away from being SIGKILLed by a
+# stranger. `assert_no_cross_drill_kill_patterns` refuses that, and the
+# allocator has to avoid suggesting into it -- which is the same argument the
+# top of this file makes about `drill_declared_ports`, so it gets the same
+# treatment: one function, both callers.
+#
+# COMMENTS ARE NOT CALL SITES. `controlplane_drill` and `lease_drill` both quote
+# the pattern they used to have, inside the comment explaining why it was wrong.
+# Matching those would refuse the tree over the write-up of a fix rather than
+# over a defect -- a check that cannot tell a cure from a disease.
+#
+# The pattern is the LAST quoted word on the line, and only `--port NNN` forms
+# are returned: a pattern naming a path under the drill's own scratch root is
+# already scoped and reaches nobody.
+drill_kill_prefixes() {
+  local dir="${1:-tools}" f d
+  for f in "$dir"/*_drill.sh; do
+    [ -f "$f" ] || continue
+    d=$(basename "$f" _drill.sh)
+    grep -v '^[[:space:]]*#' "$f" 2>/dev/null \
+      | grep -hoE 'pkill[^|]*"[^"]*--port [0-9]{1,5}"' \
+      | grep -oE -- '--port [0-9]{1,5}' \
+      | awk '{print $2}' \
+      | sort -u \
+      | while read -r p; do printf '%s %s\n' "$p" "$d"; done
+  done
+}
+
 repo_bound_ports() {
   local root="${1:-.}"
   # COMMENTS STRIPPED FIRST, and that is not hygiene. The first version of this

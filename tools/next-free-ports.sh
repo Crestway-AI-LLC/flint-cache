@@ -45,6 +45,21 @@ case "$BASE" in ''|*[!0-9]*) echo "--base must be an integer, got '$BASE'" >&2; 
 CLAIMED=$( { drill_declared_ports | awk '{print $1}'; repo_bound_ports "$(dirname "$0")/.."; } | sort -un)
 is_claimed() { printf '%s\n' "$CLAIMED" | grep -qx "$1"; }
 
+# THE GATE REFUSES ON TWO POPULATIONS AND THIS KNEW ABOUT ONE (BUG-0154). A
+# truncated port in another drill's pkill pattern is a substring match, so
+# `--port 644` reaches every 644x -- and this helper offered 6442, which the
+# gate then refused. Twelve such prefixes exist, covering 640x, 644x, 648x and
+# the whole of 65xx, 66xx and 67xx, and the default base of 6300 walks straight
+# into them.
+KILLPFX=$(drill_kill_prefixes | awk '{print $1}' | sort -u)
+is_kill_reachable() {  # <port>
+  local pfx
+  for pfx in $KILLPFX; do
+    case "$1" in "$pfx"*) return 0 ;; esac
+  done
+  return 1
+}
+
 p="$BASE"
 while [ "$p" -le "$((MAX - N + 1))" ]; do
   ok=1
@@ -52,6 +67,8 @@ while [ "$p" -le "$((MAX - N + 1))" ]; do
     is_claimed "$((p + off))" && { ok=0; break; }
     # never suggest a port some drill relies on being DEAD
     drill_is_dead_port "$((p + off))" && { ok=0; break; }
+    # nor one another drill's truncated kill pattern reaches
+    is_kill_reachable "$((p + off))" && { ok=0; break; }
   done
   if [ "$ok" = 1 ]; then
     # SELF-CHECK: prove the answer against the same data the gate will use,
@@ -60,6 +77,9 @@ while [ "$p" -le "$((MAX - N + 1))" ]; do
     for off in $(seq 0 $((N - 1))); do
       if is_claimed "$((p + off))"; then
         echo "internal error: suggested $((p + off)) which IS claimed" >&2; exit 1
+      fi
+      if is_kill_reachable "$((p + off))"; then
+        echo "internal error: suggested $((p + off)), which another drill's kill pattern reaches" >&2; exit 1
       fi
     done
     for off in $(seq 0 $((N - 1))); do printf '%s ' "$((p + off))"; done

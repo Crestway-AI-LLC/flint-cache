@@ -1,6 +1,6 @@
-# BUG-0154: `next-free-ports.sh` suggests ports the gate's OTHER collision check rejects (OPEN)
+# BUG-0154: `next-free-ports.sh` suggests ports the gate's OTHER collision check rejects (FIXED 2026-09-15)
 
-Status: **OPEN**, found 2026-09-15 · Severity: **low** — it costs a gate cycle,
+Status: **FIXED 2026-09-15**, found 2026-09-15 · Severity: **low** — it costs a gate cycle,
 not correctness. It is filed because the helper's own file says, in its opening
 comment, that this must not happen.
 
@@ -82,3 +82,29 @@ Whether any of the twelve truncated patterns should simply be widened to full
 ports instead, which would shrink the excluded band to nothing. That is a change
 to twelve drills' teardown and belongs to whoever owns them; the allocator has
 to cope with the tree as it is either way.
+
+## Fixed 2026-09-15
+
+All three parts, as described above.
+
+- **`drill_kill_prefixes`** joins `drill_declared_ports` in
+  `tools/lib/drill-ports.sh`, emitting `<prefix> <drill>` and skipping comment
+  lines for the reason the gate's copy already gave: two drills quote the
+  pattern they used to have inside the comment explaining why it was wrong.
+- **`assert_no_cross_drill_kill_patterns` takes both populations from the
+  library.** Measured before changing it, because a stricter map can surface
+  violations that were previously invisible and fail the gate over somebody
+  else's pre-existing defect: under the anchored map including `gates.sh`,
+  **538 declared ports against 26 patterns, and no new violations**.
+- **`next-free-ports.sh` skips the whole reachable band**, inside the self-check
+  that already claimed to prove its answer against the gate's data. With
+  `--base 6442` — the port it offered this morning — it now answers 6453.
+- **And the check got the coverage refusal its siblings all have.** It had none:
+  a pattern extractor that silently stopped matching would have left it green
+  forever, which is precisely the failure class this repo files most often, and
+  it was sitting in the check that guards against a drill SIGKILLing a stranger.
+
+**Not done**, as filed: widening the twelve truncated patterns to full ports,
+which would shrink the excluded band to nothing. That is twelve drills' teardown
+and belongs to whoever owns them; the allocator copes with the tree as it is
+either way.

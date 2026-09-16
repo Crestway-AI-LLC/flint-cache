@@ -1006,32 +1006,40 @@ _fleet_drop_peer_lines() {  # <peer entries: scope|ports>   (stdin: seat lines)
 }
 
 fleet_guard() {
-  local foreign sibling
+  local foreign sibling raw peers="" peers_n before_n after_n
   # Before the decision, not after it: a refused run is exactly the run whose
   # environment someone will want to read later.
   fleet_env_note guard
-  foreign="$(_fleet_foreign)"
-  sibling="$(_fleet_sibling)"
   # A PEER DRILL FROM THIS SUITE IS NOT A FOREIGN FLEET. Only under
   # FLINT_DRILL_PARALLEL=1, which the gate sets when it runs the drills stage
   # with more than one job -- outside that, a second fleet on the box is still
   # refused exactly as before, because outside a parallel gate nobody should be
   # starting one. A sibling PROJECT (flint-kv) is never tolerated here: that is
   # contention, and it is not ours to reason about.
-  if [ -n "$foreign" ] && [ "${FLINT_DRILL_PARALLEL:-0}" = "1" ]; then
-    local peers peers_n before_n after_n
-    peers="$(_fleet_live_peer_scopes)"
-    if [ -n "$peers" ]; then
-      # `grep -c . || echo 0` prints TWO numbers when there is no match:
-      # grep emits its count of 0 AND exits 1, so the fallback fires too and
-      # the arithmetic sees "0\n0". Let grep report the count and swallow only
-      # its exit status.
-      before_n=$(printf '%s\n' "$foreign" | grep -c . || true)
-      foreign="$(printf '%s\n' "$foreign" | _fleet_drop_peer_lines "$peers")"
-      after_n=$(printf '%s\n' "$foreign" | grep -c . || true)
-      peers_n=$(( ${before_n:-0} - ${after_n:-0} ))
-      [ "$peers_n" -gt 0 ] && echo "  ($peers_n seat(s) belong to $(printf '%s\n' "$peers" | grep -c .) live peer drill(s) in this suite -- not foreign)"
-    fi
+  #
+  # RESOLVED ONCE, APPLIED TO EVERY SAMPLE (BUG-0153). This function samples the
+  # box twice -- here, and once a second while it waits for a teardown to settle
+  # -- and the two samples have to mean the same thing. They did not: the settle
+  # loop called `_fleet_foreign` directly, so one unfiltered seat surviving this
+  # pass put every live peer's seats back into the population, where they never
+  # clear because they are live. One orphan then refused the run over the peers
+  # after a pointless 15s wait, and a live peer plus a seat that was merely
+  # DYING refused a run that should have proceeded. `_fleet_drop_peer_lines`
+  # with an empty list is the identity, so the filter is applied unconditionally
+  # and there is no second code path to keep in agreement with this one.
+  [ "${FLINT_DRILL_PARALLEL:-0}" = "1" ] && peers="$(_fleet_live_peer_scopes)"
+  raw="$(_fleet_foreign)"
+  foreign="$(printf '%s\n' "$raw" | _fleet_drop_peer_lines "$peers")"
+  sibling="$(_fleet_sibling)"
+  if [ -n "$peers" ]; then
+    # `grep -c . || echo 0` prints TWO numbers when there is no match:
+    # grep emits its count of 0 AND exits 1, so the fallback fires too and
+    # the arithmetic sees "0\n0". Let grep report the count and swallow only
+    # its exit status.
+    before_n=$(printf '%s\n' "$raw" | grep -c . || true)
+    after_n=$(printf '%s\n' "$foreign" | grep -c . || true)
+    peers_n=$(( ${before_n:-0} - ${after_n:-0} ))
+    [ "$peers_n" -gt 0 ] && echo "  ($peers_n seat(s) belong to $(printf '%s\n' "$peers" | grep -c .) live peer drill(s) in this suite -- not foreign)"
   fi
   [ -z "$foreign" ] && [ -z "$sibling" ] && return 0
   if [ "${FLINT_DRILL_FORCE:-0}" = "1" ]; then
@@ -1064,7 +1072,10 @@ fleet_guard() {
     while [ -n "$foreign" ] && [ "$_fw" -lt "${FLINT_FOREIGN_SETTLE:-15}" ]; do
       sleep 1
       _fw=$(( _fw + 1 ))
-      foreign="$(_fleet_foreign)"
+      # THE SAME POPULATION as the first sample, peers and all -- see the
+      # comment at the top of this function. Re-deriving it raw here is
+      # BUG-0153.
+      foreign="$(_fleet_foreign | _fleet_drop_peer_lines "$peers")"
     done
     if [ -z "$foreign" ]; then
       echo "  out-of-scope seats exited during teardown (${_fw}s) — proceeding"
