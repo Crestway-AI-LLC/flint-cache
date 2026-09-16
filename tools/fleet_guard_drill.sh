@@ -423,7 +423,81 @@ echo "$OUT" | grep -q "flint-kv-server" \
 echo "  a quiet but PARENTED sibling fleet still refuses, by name — orphanhood, not idleness"
 cleanup; PIDS=""; sleep 0.5
 
-echo "PASS: fleet_guard sees sibling projects' fleets, refuses without claiming ownership, proceeds past an ORPHANED one while still refusing a parented one, does not misread our own binaries, honours FORCE, disowns prefix scopes, and tells a live peer drill from a foreign fleet"
+echo "== J) a foreign seat at ppid 1 that a LIVE drill owns must not be called abandoned"
+# BUG-0155. The refusal split the foreign list on `ppid == 1` and told the
+# operator that side would "never clear on their own; someone has to remove
+# them". ppid 1 is what a HEALTHY seat looks like: local_spawn_env starts the
+# fleet's daemons and never waits on them, flintctl exits within milliseconds,
+# and the kernel reparents every one of them to init. The split was never who
+# is driving the fleet -- it was which process happened to spawn each seat.
+#
+# So the fixture is the honest shape rather than the convenient one: a seat
+# whose parent is gone, under a scope whose fleet_init lock is HELD by a
+# process that is still running. Nothing about that seat is abandoned, and
+# ppid cannot see the difference. `spawn_argv_for` is deliberately NOT used --
+# it leaves the seat parented to this drill, which is the shape the old code
+# got right by accident and the reason no arm caught this.
+#
+# WITHOUT FLINT_DRILL_PARALLEL, deliberately. The flag governs the DECISION --
+# whether a peer's seats are tolerated at all -- and this arm is about the
+# DIAGNOSIS, which has to be true in the case where the guard still refuses.
+# Case F already pins that a peer seat refuses without the flag, so the
+# refusal here is the expected outcome and not the thing under test.
+JPEER="$FLINT_DRILL_ROOT/flint-guardj0155"
+# The pattern deliberately does NOT begin with "--": `pgrep -f -- "--data-dir x"`
+# is accepted here and is not portable to the gate box, and a pgrep that reads
+# its own pattern as options exits 2 -- which `|| true` and a `head -1` turn
+# into an empty pid and a vacuous arm. "data-dir <scope>/d" is just as unique.
+reap_j() { pkill -f "data-dir $JPEER/d" 2>/dev/null; rm -rf "$JPEER.lock"; true; }
+reap_j
+mkdir -p "$JPEER.lock"
+# The lock owner and the seat expire together, for the reason case G records:
+# a lock that outlives its own seats produces a false verdict, not a loud one.
+sleep "$PEER_LIFE_S" & JPID=$!; PIDS="$PIDS $JPID"
+printf '%s\n' "$JPID" > "$JPEER.lock/pid"
+ps -o lstart= -p "$JPID" > "$JPEER.lock/started" 2>/dev/null
+bash -c "( exec -a 'flint-server --data-dir $JPEER/d' sleep $PEER_LIFE_S & )"
+sleep 1
+seat_in_ps "--data-dir $JPEER/d" \
+  || { echo "FAIL: the owned-but-orphaned seat is not in ps -- this arm would pass vacuously"; reap_j; exit 1; }
+JSEAT=$(pgrep -f "data-dir $JPEER/d" | head -1)
+JPPID=$(ps -o ppid= -p "${JSEAT:-0}" 2>/dev/null | tr -d ' ')
+[ "$JPPID" = "1" ] \
+  || { echo "FAIL: the fixture seat has parent $JPPID, not 1, so it is not the shape"; \
+       echo "      a flintctl-spawned seat has and this arm is not testing BUG-0155"; \
+       reap_j; exit 1; }
+# And the lock must be LIVE, or 'no owner was named' would be the truth rather
+# than the defect -- the same vacuity case G's require_peer_seat exists for.
+_fleet_live_peer_scopes | grep -q "flint-guardj0155" \
+  || { echo "FAIL: the fixture's own lock does not read as live, so an assertion"; \
+       echo "      that the guard names its owner would fail for the fixture's reason"; \
+       reap_j; exit 1; }
+OUT=$( unset FLINT_DRILL_PARALLEL; FLINT_FOREIGN_SETTLE=1 fleet_guard 2>&1 ); RC=$?
+[ "$RC" = 1 ] \
+  || { echo "FAIL: a foreign seat did not refuse without FLINT_DRILL_PARALLEL (exit $RC),"; \
+       echo "      so there is no refusal message to judge and this arm tests nothing"; \
+       echo "$OUT" | sed 's/^/    /'; reap_j; exit 1; }
+# THE ASSERTION THAT CARRIES THIS ARM. Not "the false sentence is absent" --
+# that one is free once the branch is deleted, and it would also pass on a box
+# where some other seat happened to have a live parent. The guard has to say
+# the seat is owned, and name the run that owns it.
+echo "$OUT" | grep -q "held by a LIVE drill in this suite" \
+  || { echo "FAIL: the refusal did not attribute an owned seat to the live drill that"; \
+       echo "      owns it -- it is still deciding from ppid, which cannot know (BUG-0155):"; \
+       echo "$OUT" | sed 's/^/    /'; reap_j; exit 1; }
+echo "$OUT" | grep -q "Owner scope(s):.*flint-guardj0155" \
+  || { echo "FAIL: the refusal reported an owned seat but did not name the owner, so"; \
+       echo "      nobody can tell which run to wait for:"; \
+       echo "$OUT" | sed 's/^/    /'; reap_j; exit 1; }
+# The literal false claim, pinned cheaply. It cannot fire once a driven seat is
+# in the list, so it is a floor under the two asserts above, not a substitute.
+echo "$OUT" | grep -q "nobody is driving them" \
+  && { echo "FAIL: the refusal still asserts nobody is driving seats a live lock owns:"; \
+       echo "$OUT" | sed 's/^/    /'; reap_j; exit 1; }
+echo "  an orphaned seat under a live lock is reported as owned, by name"
+reap_j; PIDS=""; sleep 0.5
+
+echo "PASS: fleet_guard sees sibling projects' fleets, refuses without claiming ownership, proceeds past an ORPHANED one while still refusing a parented one, does not misread our own binaries, honours FORCE, disowns prefix scopes, tells a live peer drill from a foreign fleet, and attributes an out-of-scope seat to its live owner rather than to its ppid"
 
 # `[ test ] && echo` as the LAST command makes the script's exit status the
 # TEST's: when case A did run, the test is false, the echo is skipped, and the

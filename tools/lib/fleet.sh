@@ -231,23 +231,36 @@ _fleet_sibling_named() {
     }'
 }
 
-# Named sibling FLEETS that somebody is actually driving (ppid != 1).
+# Named sibling FLEETS that ppid says somebody is driving (ppid != 1) --
+# WHICH IS NOT THE SAME QUESTION. Read BUG-0155 before trusting this.
 #
-# BUG-0063. "A sibling project's fleet refuses on sight" is the contract, and
-# it is the right one -- a sleeping fake fleet is still a fleet, which is what
-# fleet_guard_drill asserts and what measuring contention for named binaries
-# would have destroyed. But the contract rests on a presumption: that a named
-# binary is a fleet SOMEONE IS RUNNING. An orphan is the case where that
-# presumption is false, and it is not rare -- the flint-kv suite left one
-# behind twice in one hour on 2026-08-27, each time blocking every drill on
-# the box until a human killed it by hand.
+# BUG-0063 is why it exists and that half is still right: "a sibling project's
+# fleet refuses on sight" is the contract -- a sleeping fake fleet is still a
+# fleet, which is what fleet_guard_drill asserts and what measuring contention
+# for named binaries would have destroyed. But the contract rests on a
+# presumption, that a named binary is a fleet SOMEONE IS RUNNING, and the
+# flint-kv suite left one behind twice in one hour on 2026-08-27, each time
+# blocking every drill on the box until a human killed it by hand.
 #
-# So orphanhood, NOT idleness, is the discriminator. A named sibling with a
-# live parent still refuses on sight, unmeasured, exactly as before. One at
-# ppid 1 falls through to the same activity check its own test binaries get,
-# which proceeds only if it is genuinely not contending and still refuses if
-# it is. The guard exists to prevent CONTENTION; a corpse at 0.0% CPU
-# contends for nothing, and waiting for it is waiting for nobody.
+# ppid was the cheap answer to "is anyone running this" and it is the WRONG
+# one, because ppid 1 is what a HEALTHY daemon looks like. Measured
+# 2026-09-16: a named sibling whose parent has exited is seen by
+# _fleet_sibling_named and NOT by this filter -- and that is the shape a REAL
+# sibling fleet has, not an exotic one. flint-kv ships as a systemd
+# Type=simple unit, whose parent IS pid 1 by definition, and every seat
+# flintctl spawns is reparented to init for the same reason ours are. So a
+# live but QUIET sibling fleet falls through to the activity check and
+# proceeds -- the outcome the sibling contract forbids, reached by another
+# road.
+#
+# LEFT AS IT IS ON PURPOSE, pending BUG-0155, and that is a decision rather
+# than an oversight. What replaces ppid -- a liveness probe, a lock with a
+# recorded start time as _fleet_live_peer_scopes already uses for peers, or
+# asking the owning suite -- spans two products, and the two failures are not
+# symmetric: permissive costs contention, strict costs a wedged box and a
+# hand-kill. What this change does remove is the claim: the comment now says
+# what the filter does instead of what it was hoped to do, and the refusal it
+# feeds no longer states an answer it does not have.
 _fleet_sibling_named_live() {
   _fleet_sibling_named | awk '$2 != 1'
 }
@@ -284,16 +297,22 @@ _fleet_sibling() {
 }
 
 # Fleet processes on this box that are NOT ours, as "pid argv" lines.
-# Emits "pid ppid argv". The PPID is the discriminator between a fleet
-# somebody is driving and a corpse nobody is: an orphan has been reparented
-# to init, so ppid 1 means whoever started it is gone.
 #
-# That distinction cost the ops session FIVE HOURS. They saw /tmp/flint-m3-67*
-# on the box, read it as "a peer is running their gate", and waited politely
-# three times. The processes were orphans from a leak in m3_exit and nobody
-# was driving them. One `ps -o ppid=` would have said so, and neither session
-# ran it in four separate inspections — so it belongs in the tool rather than
-# in anyone's head.
+# Emits "pid ppid argv". THE PPID IS RAW DATA AND NOT A VERDICT. It says the
+# parent exited, which is true of a leak and equally true of every healthy
+# seat flintctl spawns: local_spawn_env starts the fleet's daemons and never
+# waits on them, so the kernel reparents each one to init within milliseconds
+# (BUG-0155). Attribution is done in fleet_guard against the fleet_init lock,
+# which is a record rather than an inference.
+#
+# The question it exists to answer is real and cost the ops session FIVE HOURS.
+# They saw /tmp/flint-m3-67* on the box, read it as "a peer is running their
+# gate", and waited politely three times. Those really were a leak from m3_exit
+# and nobody was driving them — but what PROVES that is the absence of a live
+# lock over that scope, not the ppid. Reading the ppid as the answer is how the
+# same mistake was made in the other direction on 2026-09-15, when the refusal
+# told an operator that six of thirteen seats would never clear while three
+# seats of the SAME live fleet sat in the listing at a live parent.
 _fleet_foreign() {
   ps -eo pid=,ppid=,args= 2>/dev/null | awk -v scope="$FLEET_SCOPE" -v ports="$FLEET_PORTS" '
 
@@ -807,8 +826,9 @@ fleet_warm() {
 # partial cleanup would have looked clean while four were still running. That
 # happened: a `>40%` census reported 8 of 12 orphaned burners, honestly, and
 # acting on it would have produced a second corrupt gate behind a teardown
-# that looked verified. Filter on the INVARIANT -- ppid 1 plus a name you
-# recognise -- which does not move when the cohort does.
+# that looked verified. Filter on an INVARIANT -- a name you recognise -- which
+# does not move when the cohort does. NOT on ppid: it does not move either, but
+# it does not mean what it looks like (BUG-0155).
 # AVAILABLE MEMORY, because load average cannot see the failure that matters.
 #
 # A drill seat SIGKILLed in the middle of a run, with peer drills live, is what
@@ -1083,21 +1103,52 @@ fleet_guard() {
     fi
   fi
   if [ -n "$foreign" ]; then
-    local _orph _live
-    _orph=$(printf '%s\n' "$foreign" | awk '$2 == 1' | wc -l | tr -d ' ')
-    _live=$(printf '%s\n' "$foreign" | awk '$2 != 1' | wc -l | tr -d ' ')
+    # WHETHER WAITING HELPS IS A RECORD, NOT AN INFERENCE FROM ppid.
+    #
+    # This used to split the list on `ppid == 1` and tell the operator that
+    # side would "never clear on their own; someone has to remove them".
+    # BUG-0155: ppid 1 is what a healthy seat looks like, so the split was not
+    # who is driving the fleet, it was which process happened to spawn each
+    # seat. On 2026-09-15 it gave that advice about six of thirteen seats
+    # while three seats of the same, live, about-to-clean-up fleet sat in the
+    # listing beside them at a live parent.
+    #
+    # The fleet_init lock is the record ppid was standing in for, and it is
+    # read here WHATEVER FLINT_DRILL_PARALLEL says. The flag governs the
+    # DECISION to tolerate a peer; this is the DIAGNOSIS, and withholding a
+    # fact we hold would not make the refusal safer, only unattributable.
+    #
+    # IT PROVES ONE DIRECTION, and the message says exactly that much. A live
+    # lock PROVES a run owns those seats. Its absence proves nothing -- a seat
+    # brought up by `flintctl start` outside any drill never had one -- so the
+    # rest are reported as UNATTRIBUTED rather than as abandoned.
+    local _driven _unattr _total _lockrecs _rec _owners=""
+    _lockrecs="$(_fleet_live_peer_scopes)"
+    _total=$(printf '%s\n' "$foreign" | grep -c . || true)
+    _unattr=$(printf '%s\n' "$foreign" | _fleet_drop_peer_lines "$_lockrecs" | grep -c . || true)
+    _driven=$(( ${_total:-0} - ${_unattr:-0} ))
+    # NAME THE OWNERS THAT ACTUALLY MATCHED, not every live lock on the box.
+    # A lock whose drill owns nothing in this list is not why we are refusing,
+    # and printing it would send someone to wait on the wrong run.
+    for _rec in $_lockrecs; do
+      [ "$(printf '%s\n' "$foreign" | _fleet_drop_peer_lines "$_rec" | grep -c . || true)" \
+        -lt "${_total:-0}" ] && _owners="$_owners ${_rec%%|*}"
+    done
     echo "REFUSING TO RUN: this box already has Flint processes outside $FLEET_SCOPE"
     printf '%s\n' "$foreign" | awk '{ printf "    pid %-7s ppid %-7s %s\n", $1, $2, substr($0, index($0,$3), 100) }'
     echo "  A drill that killed those would destroy a fleet it does not own —"
     echo "  a live cluster, or another suite's nodes."
-    # Say whether WAITING can possibly help. An orphan has no parent left to
-    # finish and clear it, so "wait for the other session" is wrong advice.
-    if [ "$_live" = "0" ]; then
-      echo "  ALL $_orph ARE ORPHANS (ppid 1): nobody is driving them, so"
-      echo "  waiting will not clear this. Someone has to remove them."
-    elif [ "$_orph" != "0" ]; then
-      echo "  $_orph of $((_orph + _live)) are ORPHANS (ppid 1) — those will"
-      echo "  never clear on their own; the other $_live have a live parent."
+    if [ "$_driven" -gt 0 ]; then
+      echo "  $_driven of $_total are held by a LIVE drill in this suite: its"
+      echo "  fleet_init lock is taken and the owner is still running, so they"
+      echo "  WILL clear when it finishes. Owner scope(s):$_owners"
+    fi
+    if [ "$_unattr" -gt 0 ]; then
+      echo "  $_unattr of $_total have NO live fleet_init lock, so nothing in this"
+      echo "  suite is driving them. That is as far as this box can say -- they"
+      echo "  may be a leak, or a fleet started outside the drills. 'flintctl"
+      echo "  status' and the pids/ dir of their statedir tell those apart; ppid"
+      echo "  does not, because a healthy seat sits at ppid 1 (BUG-0155)."
     fi
   fi
   if [ -n "$sibling" ]; then
@@ -1109,25 +1160,25 @@ fleet_guard() {
     echo "  These are NOT ours and this suite will not touch them. Two fleets"
     echo "  sharing a box contend for CPU and disk, and the result shows up as"
     echo "  a flaky drill rather than as the collision it is."
-    # BUG-0063: say whether WAITING can help, the same question the foreign
-    # branch answers. Advising "wait for that run to finish" when there is no
-    # run and no parent is advice for something that cannot happen, and it
-    # cost two hand-kills in one hour before this line existed.
-    local _sorph _slive
-    _sorph=$(printf '%s\n' "$sibling" | awk '$2 == 1' | wc -l | tr -d ' ')
-    _slive=$(printf '%s\n' "$sibling" | awk '$2 != 1 && NF' | wc -l | tr -d ' ')
-    if [ "$_slive" = "0" ]; then
-      echo "  ALL $_sorph ARE ORPHANS (ppid 1) and they are CONTENDING -- no run"
-      echo "  is driving them, so waiting cannot clear this. They have to be"
-      echo "  removed from THAT project. (An idle orphan would not have stopped"
-      echo "  this run; these are burning CPU.)"
-    elif [ "$_sorph" != "0" ]; then
-      echo "  $_sorph of $((_sorph + _slive)) are ORPHANS (ppid 1) and will never clear"
-      echo "  on their own; only the other $_slive can finish. Wait for those, then"
-      echo "  remove the rest from their project."
-    else
-      echo "  Wait for that run to finish, or stop it from ITS project."
-    fi
+    # BUG-0063 asked the right question here -- can waiting help? -- and
+    # BUG-0155 is that the answer given was fabricated. It was `ppid == 1`,
+    # and a real sibling fleet is at ppid 1 ALWAYS: flint-kv ships as a
+    # systemd Type=simple unit whose parent is pid 1 by definition. So "ALL n
+    # ARE ORPHANS ... no run is driving them, so waiting cannot clear this"
+    # was stated with certainty about exactly the case where it is false, and
+    # the branch beside it asserted the seats were "burning CPU" even when the
+    # refusal had come from the foreign list and nothing had been measured.
+    #
+    # There is no lock to read on this side. fleet_init's locks are THIS
+    # suite's and a sibling project does not take them, so unlike the foreign
+    # branch above there is no record to fall back on. Naming the two places
+    # that do know is shorter than a wrong answer and can be acted on.
+    echo "  Whether a run is driving them cannot be decided from here: ppid 1 is"
+    echo "  the normal state of a systemd service and of every seat flintctl"
+    echo "  spawns, so it separates a leak from a live fleet in neither"
+    echo "  direction. Ask that project's session, or read its own run locks."
+    echo "  If it is a leak it has to be removed from THAT project -- this"
+    echo "  suite never signals another project's processes."
   fi
   echo "  Re-run with FLINT_DRILL_FORCE=1 if this box really is yours alone."
   exit 1

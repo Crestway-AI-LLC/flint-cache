@@ -1,4 +1,16 @@
-# BUG-0063: the sibling guard cannot see an orphan, so it tells you to wait forever (FIXED)
+# BUG-0063: the sibling guard cannot see an orphan, so it tells you to wait forever (FIXED; the ppid half SUPERSEDED)
+
+> **Superseded in part, 2026-09-16 — read
+> [BUG-0155](0155-ppid-1-is-the-normal-state-of-a-flintctl-spawned-seat.md)
+> before this.** The problem below is real and the fix's *shape* was right:
+> the refusal has to say whether waiting can help. The ANSWER it used — `ppid
+> == 1` — is not sound in either direction, because `ppid 1` is also what every
+> healthy seat looks like: `flintctl` spawns the fleet's daemons and exits, and
+> a systemd `Type=simple` unit is parented to pid 1 by definition. The code
+> quoted in this file no longer exists. On the foreign side the question is now
+> answered from the `fleet_init` lock, which is a record; on the sibling side
+> there is no record to read and the refusal says so rather than guessing. The
+> DECISION `_fleet_sibling_named_live` makes is still ppid-based and still open.
 
 **Found** 2026-08-27, blocking `tools/walgap_quarantine_drill.sh`. A
 `flint-kv-server` sat at **ppid 1, 0.0% CPU, for 44 minutes** and every drill
