@@ -94,6 +94,27 @@ GOT=$(echo $(ask 1 --base "$BASE"))
   want 6303. A port a script BINDS is as taken as one a drill declares."
 echo "   6302 bound by a non-drill script -> 6303"
 
+echo "== a port the ACCELERATOR subtree binds is not offered"
+# THE ROOT THIS FUNCTION WAS WRITTEN FOR, which the arm above does not reach.
+# `repo_bound_ports` read only `$root/s3-accelerator` until dcbb1a1 put tools/
+# beside it -- so the arm above exercises the NEW half and, without this one,
+# nothing exercises the old one. A refactor that dropped the original root would
+# pass this drill and return the allocator to handing out precisely what the
+# function exists to withhold: the collision that motivated it was
+# next-free-ports offering 6388-6390 for the conformance stage while the
+# accelerator's gate already held 6391 for its tier.
+#
+# An .xml file ON PURPOSE. That scan takes four extensions and the arm above
+# uses .sh, so this is also the only place the include list is shown to reach
+# past shell -- dropping `--include='*.xml'` is a one-word edit that nothing
+# else here would notice.
+mkdir -p "$T/s3-accelerator"
+printf '<tier><port>%s</port></tier>\n' 6303 > "$T/s3-accelerator/tier.xml"
+GOT=$(echo $(ask 1 --base "$BASE"))
+[ "$GOT" = 6304 ] || fail "with the accelerator subtree holding 6303, --base $BASE answered '$GOT',
+  want 6304. BOTH roots of repo_bound_ports have to be read, not just the newer."
+echo "   6303 held in the accelerator subtree -> 6304"
+
 echo "== a port another drill's TRUNCATED kill pattern reaches is not offered"
 # BUG-0154. `pkill -f "flint-server --port 630"` is a SUBSTRING match, so it
 # reaches every 630x. A drill placed there is one parallel batch away from being
