@@ -55,6 +55,23 @@ master still renewing, to say anything about it.
 
 ## Which path can reach it, from the ops side (added 2026-09-15)
 
+> **RETRACTED the same day, by the author of this section.** The reasoning
+> below rules two paths out on the grounds that they never hold "the old master
+> alive and renewing" open. That condition is how the damage is *observed*, not
+> what *creates* it: the `RegistryState` trace above shows two rows appearing
+> from `SetPair` + `Fence` alone, with no renewal involved and no seats in the
+> picture at all. So demote-first does not prevent the state — it only means
+> nobody is asking yet — and neither does a `kill -9`, since the stale row
+> outlives the process and anything that later holds that address is told OK.
+>
+> I took the three conditions from this file's own "what is NOT established"
+> and reasoned about how to satisfy the third, without checking whether it was
+> a creation condition or an observation one. **Both paths below do reach the
+> defective state.** The section is kept rather than deleted because the
+> mechanism it describes — `flintctl` demoting before it fences, the controller
+> being unable to — is accurate and worth knowing; only the "cannot reach it"
+> conclusion is wrong.
+
 Read from the code, not run — the same standing as the section above, and
 offered because it **rules two paths out** rather than because it reproduces
 anything.
