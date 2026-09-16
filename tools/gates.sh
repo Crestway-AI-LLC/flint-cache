@@ -18,6 +18,10 @@
 #   conformance  the compatibility oracle vs valkey, flint mem, flint rocks
 #   drills       the core drills (the CORE list below is the count)
 #   chaos        the two randomized chaos drills
+#   docs         the 34 static assertions alone -- every grep, awk and python
+#                scan over the tree, with no toolchain, no build and nothing
+#                started. Seconds on a laptop. OPT-IN, and a no-op when asked
+#                alongside another stage, which owns them as it always has.
 #   msrv         does the workspace build at the rust-version Cargo.toml
 #                declares? OPT-IN: valid as an argument, NOT in the default
 #                set, because it installs a second toolchain and downloads a
@@ -70,7 +74,10 @@ DEFAULT_STAGES="check conformance drills chaos"
 # CI already runs it per push (.github/workflows/msrv.yml). This is the local
 # and gate-box way to ask the same question, chiefly for the feature config
 # that workflow does not cover.
-OPT_IN_STAGES="msrv"
+# `docs` is here for a different reason from msrv: not because it is expensive
+# but because it is a SUBSET, and putting a subset in the default run would mean
+# asserting everything twice on every gate.
+OPT_IN_STAGES="msrv docs"
 ALL_STAGES="$DEFAULT_STAGES $OPT_IN_STAGES"
 want() { case " ${STAGES} " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
 
@@ -3664,8 +3671,21 @@ if want msrv; then
   step "msrv (declared)" msrv msrv_at_the_declaration
 fi
 
-if want check; then
-  echo "== gates: fmt, clippy, tests (both feature configs)"
+# THE STATIC ASSERTIONS, GROUPED SO A THIRD CALLER CAN HAVE THEM.
+#
+# Every one of these is a grep, an awk or a python scan over the tree: no
+# toolchain, no build, nothing started. `check` has always run the first group
+# and `drills` the second, and asking them meant asking for a stage that also
+# compiles the workspace or runs 139 drills. On 2026-09-15 that cost two gate
+# cycles on a box for answers worth seconds -- a ragged row in the bug index,
+# and a port the allocator suggested that the kill-pattern check refuses. The
+# ops repo has had a `docs` stage for weeks and its own note says the same
+# thing: twenty seconds, no box, no toolchain, run it before every push.
+#
+# GROUPED, NOT MOVED. Each stage still calls exactly what it called before, in
+# the same place, so a `check` run and a `drills` run are unchanged; `docs` is a
+# third caller of the same two lists rather than a fourth copy of them.
+document_assertions() {
   assert_no_default_ports
   assert_induced_controls_have_not_regressed
   assert_bug_index_agrees
@@ -3691,6 +3711,30 @@ if want check; then
   assert_warm_covers_fleet_binaries
   assert_bootstrap_failures_say_why
   assert_pipe_output_is_kept
+}
+
+# The second group: what `drills` asserts about drill SOURCE before it starts
+# anything. Static for the same reason the first group is --
+# `assert_drill_builds_keep_rocks` pipes literal cargo COMMAND LINES into its
+# own matcher rather than running one, which is worth saying because a grep for
+# "cargo" in this function says otherwise.
+drill_source_assertions() {
+  assert_drill_builds_keep_rocks
+  assert_drill_build_is_checked
+  assert_no_continuation_splice
+  assert_no_cross_drill_kill_patterns
+  assert_kill_patterns_name_their_own_fleet
+  assert_no_duplicate_drill_ports
+  assert_every_drill_accounted_for
+  assert_declared_scopes_cover_data_dirs
+  assert_gate_is_executable
+  assert_license_headers_are_this_repos
+  assert_no_used_path_overlap
+}
+
+if want check; then
+  echo "== gates: fmt, clippy, tests (both feature configs)"
+  document_assertions
   report_toolchain_vs_pin
   step "fmt" fmt cargo fmt --all --check
   step "clippy (mem)" clippy-mem \
@@ -3998,25 +4042,53 @@ assert_drill_builds_keep_rocks() {
   exit 1
 }
 
+if want docs; then
+  echo "== document and source assertions (no toolchain, no build)"
+  # EVERY assert_* IN THIS FILE MUST ALREADY BE DEFINED HERE.
+  #
+  # The first version of this stage sat above three of the definitions. bash
+  # ran those three as `command not found`, which sets $? and leaves FAILED
+  # empty -- so it printed DOCUMENT GATES PASSED having silently skipped them.
+  # A check that cannot fail, produced while adding a faster way to run the
+  # checks. Moving the block lower fixes today and not the next assertion
+  # somebody defines below it, so the position is asserted rather than trusted.
+  _undef=$(grep -oE '^assert_[a-z_]+\(\)' "$0" | tr -d '()' | sort -u \
+    | while read -r _fn; do declare -F "$_fn" >/dev/null 2>&1 || printf ' %s' "$_fn"; done)
+  if [ -n "$_undef" ]; then
+    echo "GATES FAILED: assertion(s) not yet defined where the docs stage runs:$_undef"
+    echo "      They would run as 'command not found', leave FAILED empty, and"
+    echo "      be reported as a pass. Move this block below their definitions."
+    exit 1
+  fi
+  document_assertions
+  drill_source_assertions
+  # ASKED ALONE, this is the whole run and it ends here -- before the
+  # RAN_STEPS guard below, which is right to refuse a stage list that executed
+  # no steps and wrong about this one.
+  #
+  # ASKED ALONGSIDE ANYTHING ELSE the block just runs and falls through, and
+  # `check` repeats its half: noise rather than a wrong answer. The test is for
+  # `docs` EXACTLY and not `want docs`, because a combination that silently
+  # skipped the real gate would be worse than having no stage at all.
+  if [ "$STAGES" = "docs" ]; then
+    if [ -n "$FAILED" ]; then
+      echo "DOCUMENT GATES FAILED:$FAILED"
+      exit 1
+    fi
+    echo "DOCUMENT GATES PASSED"
+    exit 0
+  fi
+fi
+
 if want drills; then
   echo "== core drills"
-  assert_drill_builds_keep_rocks
-  assert_drill_build_is_checked
-  assert_no_continuation_splice
-  assert_no_cross_drill_kill_patterns
-  assert_kill_patterns_name_their_own_fleet
-  # BOTH HALVES OF "UNATTRIBUTABLE SEAT", from opposite ends. The harness
-  # attributes a seat by its fleet_init scope prefix OR by a declared port, so
-  # a seat is invisible to the leak check when it matches neither. The port
-  # side and the dir side were written a day apart by different people; the
-  # zombie that broke the parallel gate had neither marker, which is why one
-  # of them alone would not have caught it.
-  assert_no_duplicate_drill_ports
-  assert_every_drill_accounted_for
-  assert_declared_scopes_cover_data_dirs
-  assert_gate_is_executable
-  assert_license_headers_are_this_repos
-  assert_no_used_path_overlap
+  # BOTH HALVES OF "UNATTRIBUTABLE SEAT" are in here, from opposite ends. The
+  # harness attributes a seat by its fleet_init scope prefix OR by a declared
+  # port, so a seat is invisible to the leak check when it matches neither. The
+  # port side and the dir side were written a day apart by different people;
+  # the zombie that broke the parallel gate had neither marker, which is why
+  # one of them alone would not have caught it.
+  drill_source_assertions
   LEAKCHECK=1
   run_core_drills
   LEAKCHECK=
