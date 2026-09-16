@@ -2134,13 +2134,28 @@ assert_sibling_lock_path_is_pinned() {
   else
     kv="../flint-kv/core"
     if [ ! -f "$kv/tools/drill_lib.sh" ]; then
-      primary=$(cd "$(git rev-parse --git-common-dir 2>/dev/null)/.." 2>/dev/null && pwd)
-      [ -n "$primary" ] && kv="$primary/../flint-kv/core"
+      # A FAILED `git` MUST NOT PRODUCE A PATH. Written as
+      # `cd "$(git rev-parse --git-common-dir)/.."`, an empty substitution makes
+      # that `cd "/.."`, which SUCCEEDS and returns `/` -- so a tree with no
+      # .git at all yielded `//../flint-kv/core`, a plausible-looking directory
+      # that can never exist. The gate box rsyncs the working tree without
+      # .git, so it printed exactly that on the first run of this check. The
+      # verdict was right (skip) and the reason it gave was fiction.
+      local common=""
+      common=$(git rev-parse --git-common-dir 2>/dev/null) || common=""
+      if [ -n "$common" ] && [ -d "$common" ]; then
+        primary=$(cd "$common/.." 2>/dev/null && pwd) || primary=""
+        if [ -n "$primary" ] && [ "$primary" != "/" ]; then
+          kv="$primary/../flint-kv/core"
+        fi
+      fi
     fi
   fi
   local theirs="$kv/tools/drill_lib.sh"
   if [ ! -f "$theirs" ]; then
     echo "  SKIP: no flint-kv checkout at $kv — the sibling lock path is NOT pinned"
+    echo "        (expected on a gate box, which syncs only this repo; on a"
+    echo "         machine with both checkouts this check does run)"
     return 0
   fi
   local ours_line ours their_line theirs_path

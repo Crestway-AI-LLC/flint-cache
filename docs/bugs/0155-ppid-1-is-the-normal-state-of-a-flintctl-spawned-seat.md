@@ -201,7 +201,13 @@ session's box and on another product's suite, so it is Jeff's call.
 
 **Also duplicated:** the ops repo carries its own implementation of the same
 message, with the same false claim stated more strongly (*"Kill them and
-re-run; there is no peer to be polite to"*). Tracked separately; a fix that
+re-run; there is no peer to be polite to"*). Fixed as
+**OPS-0258**, by me, immediately after this. (This sentence read *"tracked
+separately"* with no number beside it, and a second session took that as
+UNTRACKED: they went looking, found no bug file and no claim row because I had
+not pushed yet, and started the work — standing down only when my push landed.
+*Tracked separately* invites that; a number, or *I am fixing this next*, costs
+nothing. Their stand-down is in ops `docs/coordination.md`, 18:22.) A fix that
 landed in one of two implementations is BUG-0150's shape and this is not going
 to repeat it.
 
