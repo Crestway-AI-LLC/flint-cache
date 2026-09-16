@@ -253,6 +253,52 @@ impl State {
         let Ok(raw) = std::fs::read_to_string(&path) else {
             return s;
         };
+        // ADR-0032 STEP 2, THE READING HALF, SHIPPED A RELEASE AHEAD OF THE
+        // WRITING HALF -- WHICH IS THE WHOLE POINT OF IT BEING HERE ALONE.
+        //
+        // The single-node path persists the hand-written line format below;
+        // the Raft path persists `RegistryState` as serde JSON. ADR-0032
+        // collapses those onto one, and the write side is the irreversible
+        // move. What makes it safe to attempt is that every binary already in
+        // the field can read what the new writer will produce, and the only
+        // way to get there is to ship the reader on its own, first, with the
+        // writer untouched.
+        //
+        // THE DIRECTION THAT NEEDS THE LEAD TIME IS THE BACKWARD ONE. A new
+        // binary reading an old file has always worked and needs no ceremony.
+        // The case that bites is an OLD binary handed a file a NEWER one
+        // wrote: a rollback, a half-finished roll, or a drill fixture kept
+        // across a version bump. Ship reader and writer in one release and
+        // that is a one-way door.
+        //
+        // DETECTION IS THE LEADING BRACE, and it cannot collide. The line
+        // format's first line is always `version <n>`, and every keyword it
+        // accepts is lowercase ASCII, so nothing it has ever written begins
+        // with `{`.
+        if raw.trim_start().starts_with('{') {
+            match serde_json::from_str::<crate::registry::RegistryState>(&raw) {
+                Ok(reg) => {
+                    s.absorb_registry(reg);
+                    return s;
+                }
+                // REFUSING TO START IS THE SAFE DIRECTION, and falling through
+                // to the line parser is the unsafe one. That parser ignores
+                // every keyword it does not recognise, so a damaged registry
+                // would load as NO PAIRS AND NO TENANTS -- and the next
+                // commit() would persist that emptiness over the real file.
+                // An unreadable registry must stop the control plane, not be
+                // silently replaced by an empty one.
+                Err(e) => panic!(
+                    "flint-controlplane: {} is registry JSON that will not parse: {e}\n  \
+                     Refusing to start rather than load an EMPTY registry over it. The \
+                     line-format parser ignores unknown keywords, so continuing here \
+                     would read this file as no pairs and no tenants and the next commit \
+                     would write that back. Restore the file from a backup, or start \
+                     against a different --state path.",
+                    path.display()
+                ),
+            }
+        }
         for line in raw.lines() {
             let mut parts = line.split(' ');
             match parts.next() {
@@ -372,6 +418,62 @@ impl State {
             }
         }
         s
+    }
+
+    /// Take every durable field of a `RegistryState` into this `State`.
+    ///
+    /// DESTRUCTURED EXHAUSTIVELY, AND THAT IS THE LOAD-BEARING PART. Written
+    /// as eleven assignments, a twelfth field added to `RegistryState` later
+    /// would compile here and be silently dropped on every single-node load --
+    /// which is BUG-0152 exactly: two tenant flags were written nowhere, loaded
+    /// as `false`, and `CPTENANTASYNC on` held until the control plane
+    /// restarted and then reverted while the CP pushed the reversion out to
+    /// the proxies. A `let { .. } = r` with no rest pattern makes that a
+    /// COMPILE ERROR at the one place that has to know.
+    fn absorb_registry(&mut self, r: crate::registry::RegistryState) {
+        let crate::registry::RegistryState {
+            exceptions,
+            version,
+            proxies,
+            pairs,
+            mut ranges,
+            tenants,
+            admin_token,
+            admin_prev,
+            families,
+            leases,
+            promoted,
+        } = r;
+        // PADDED TO THE PAIR COUNT, because the two producers disagree about
+        // whether a range is optional. The line loader pushes exactly one
+        // entry per `pair` line, so `ranges.len() == pairs.len()` always holds
+        // on that path; `RegistryState::ranges` is `#[serde(default)]`, so a
+        // snapshot written before ranges existed arrives empty. Absorbing that
+        // as-is would give a `State` whose two vectors disagree in length --
+        // legal for `serialize()`, which uses `.get(i)`, and a trap for any
+        // future reader that zips them. Normalise here, where the difference
+        // is visible, rather than leaving it for that reader to discover.
+        if ranges.len() < pairs.len() {
+            ranges.resize(pairs.len(), None);
+        }
+        self.version = version;
+        self.proxies = proxies;
+        self.pairs = pairs;
+        self.ranges = ranges;
+        self.tenants = tenants;
+        self.exceptions = exceptions;
+        self.leases = leases;
+        self.admin_token = admin_token;
+        self.admin_prev = admin_prev;
+        self.families = families;
+        self.promoted = promoted;
+        // `controllers` is absent from BOTH durable formats and stays at its
+        // default, which is the same thing the line-format path does. It is a
+        // live report from processes that may not be running (see the field's
+        // own comment), so a cold control plane knowing nothing is correct --
+        // it learns within one heartbeat. ADR-0032 step 1 asks this question
+        // again when `RegistryState` becomes the single state type; the answer
+        // is recorded here so that step inherits it rather than re-deciding.
     }
 
     fn serialize(&self) -> String {
@@ -724,6 +826,193 @@ mod tests {
             "a tenant field did not survive the line format -- a field absent \
              from the writer loads as the loader's default, silently"
         );
+    }
+
+    // ADR-0032 step 2: the reader ships a release before the writer. These
+    // four pin both halves of that -- that the new format is readable NOW, and
+    // that nothing has started writing it yet.
+
+    fn a_full_registry() -> crate::registry::RegistryState {
+        // EVERY FIELD NON-DEFAULT, deliberately. A field left at its default
+        // is a field this test cannot tell from one the reader dropped --
+        // BUG-0152 passed every test it had for exactly that reason.
+        let mut tenants = BTreeMap::new();
+        tenants.insert(
+            "acme".to_string(),
+            Tenant {
+                name: "acme".into(),
+                token: "d".repeat(64),
+                ns: "acme-ns".into(),
+                subset: vec!["p1:7000".into(), "p2:7000".into()],
+                prev_token: Some("e".repeat(64)),
+                replica_reads: true,
+                local_cache: true,
+                federated: true,
+                async_writes: true,
+                ops_per_sec: 4242,
+                max_bytes: 1 << 31,
+                over_quota: true,
+            },
+        );
+        let mut families = BTreeMap::new();
+        families.insert(
+            "VEC".to_string(),
+            vec!["v1:7600".to_string(), "v2:7600".to_string()],
+        );
+        crate::registry::RegistryState {
+            version: 77,
+            proxies: vec!["p1:7000".into(), "p2:7000".into()],
+            pairs: vec![
+                vec!["a:7001".into(), "b:7001".into()],
+                vec!["c:7001".into(), "d:7001".into()],
+            ],
+            ranges: vec![Some((0, 8191)), Some((8192, 16383))],
+            tenants,
+            exceptions: vec![("acme-ns".to_string(), 10u16, 20u16, 1u16)],
+            leases: vec![(
+                vec!["a:7001".to_string(), "b:7001".to_string()],
+                "a:7001".to_string(),
+                9,
+            )],
+            admin_token: Some("plain-admin".into()),
+            admin_prev: Some("plain-prev".into()),
+            families,
+            // Not durable in either format; asserted absent below rather than
+            // left unsaid, because "it did not survive" and "nobody set it"
+            // look identical in a loaded struct.
+            promoted: Some(("a:7001".to_string(), 3)),
+        }
+    }
+
+    #[test]
+    fn every_registry_field_survives_the_json_reader() {
+        let dir = TempDir::new("jsonread");
+        let path = dir.0.join("state");
+        let want = a_full_registry();
+        std::fs::write(&path, serde_json::to_string(&want).expect("encode")).expect("write");
+
+        let got = State::load_or_new(path);
+
+        assert_eq!(got.version, want.version, "version");
+        assert_eq!(got.proxies, want.proxies, "proxies");
+        assert_eq!(got.pairs, want.pairs, "pairs");
+        assert_eq!(got.ranges, want.ranges, "ranges");
+        assert_eq!(got.tenants, want.tenants, "tenants");
+        assert_eq!(got.exceptions, want.exceptions, "exceptions");
+        assert_eq!(got.leases, want.leases, "leases");
+        assert_eq!(got.admin_token, want.admin_token, "admin_token");
+        assert_eq!(got.admin_prev, want.admin_prev, "admin_prev");
+        assert_eq!(got.families, want.families, "families");
+        assert_eq!(
+            got.promoted, None,
+            "promoted is #[serde(skip)] in RegistryState and not persisted by the \
+             line format either -- a loaded value would mean the durable formats \
+             disagree about what is a live wakeup and what is a durable fact"
+        );
+        assert!(
+            got.controllers.is_empty(),
+            "controllers is absent from both durable formats on purpose: a build \
+             stamp that outlived the process reporting it is a claim about a \
+             controller that may not be running"
+        );
+    }
+
+    #[test]
+    fn the_writer_has_not_moved_yet() {
+        // THE CONTROL FOR THE RELEASE BOUNDARY, and the reason it is a test
+        // rather than a note. This release ships READING both formats; the
+        // moment it also WRITES the new one, the door it exists to hold open
+        // has shut -- an older binary would meet JSON it cannot read, which is
+        // the case the staged rollout is for. Load JSON, commit, and the file
+        // on disk must be the line format still.
+        let dir = TempDir::new("writerfixed");
+        let path = dir.0.join("state");
+        std::fs::write(
+            &path,
+            serde_json::to_string(&a_full_registry()).expect("encode"),
+        )
+        .expect("write");
+
+        let mut s = State::load_or_new(path.clone());
+        s.commit().expect("commit");
+
+        let raw = std::fs::read_to_string(&path).expect("read back");
+        assert!(
+            raw.starts_with("version "),
+            "the single-node writer has started emitting something other than the \
+             line format. If that is ADR-0032 step 2 landing, it must not land in \
+             the same release as the tolerant reader -- see load_or_new. Got: {:?}",
+            raw.chars().take(60).collect::<String>()
+        );
+        // And the reader is still whole after the round trip through the old
+        // writer: a tolerant read that silently lost a field would leave a
+        // thinner file behind, which is the shape that destroys data quietly.
+        let back = State::load_or_new(path);
+        assert_eq!(back.pairs, a_full_registry().pairs, "pairs after rewrite");
+        assert_eq!(
+            back.tenants,
+            a_full_registry().tenants,
+            "tenants after rewrite"
+        );
+        assert_eq!(
+            back.leases,
+            a_full_registry().leases,
+            "leases after rewrite"
+        );
+        assert_eq!(
+            back.families,
+            a_full_registry().families,
+            "families after rewrite"
+        );
+    }
+
+    #[test]
+    fn a_registry_without_ranges_pads_to_the_pair_count() {
+        // A snapshot written before `ranges` existed arrives empty, and the
+        // line-format path always produces one entry per pair. Absorbing the
+        // difference is what stops a future reader that zips the two vectors
+        // from seeing a pair with no slot range at all.
+        let dir = TempDir::new("noranges");
+        let path = dir.0.join("state");
+        let mut reg = a_full_registry();
+        reg.ranges = Vec::new();
+        std::fs::write(&path, serde_json::to_string(&reg).expect("encode")).expect("write");
+
+        let got = State::load_or_new(path);
+        // THE POPULATION FIRST. `ranges.len() == pairs.len()` is satisfied by
+        // 0 == 0, which is what an EMPTY state gives -- so with the JSON reader
+        // deleted outright this assertion passed while reading nothing at all.
+        // Caught by mutating the branch away and watching this test stay green
+        // beside two that went red.
+        assert_eq!(
+            got.pairs.len(),
+            2,
+            "the registry did not load, so the length comparison below would \
+             compare 0 with 0 and pass without reading anything"
+        );
+        assert_eq!(
+            got.ranges.len(),
+            got.pairs.len(),
+            "a pre-ranges registry left the two vectors disagreeing in length"
+        );
+        assert!(
+            got.ranges.iter().all(|r| r.is_none()),
+            "padding must be `unranged`, which proxies answer with count-derived \
+             ranges -- inventing (0,0) would claim a pair owns nothing"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "will not parse")]
+    fn a_damaged_registry_refuses_rather_than_loading_empty() {
+        // The line parser ignores keywords it does not know, so falling
+        // through to it would read a damaged registry as no pairs and no
+        // tenants -- and the next commit() would write that back over the
+        // real file. The refusal is the point; this is the control for it.
+        let dir = TempDir::new("damaged");
+        let path = dir.0.join("state");
+        std::fs::write(&path, "{\"version\": 7, \"pairs\": [[\"a:7001\"],").expect("write");
+        let _ = State::load_or_new(path);
     }
 
     #[test]

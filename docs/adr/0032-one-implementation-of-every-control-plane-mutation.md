@@ -123,6 +123,8 @@ own:
    `controllers` explicitly here.
 2. **Persist `RegistryState` on the single-node path**, writing serde and
    reading either — one release of tolerant reading before the old writer goes.
+   **The READING half landed 2026-09-16** — see "Step 2's reader, shipped
+   alone" below. The writer is unchanged and a test holds it that way.
 3. **Dispatch builds `Mutation`.** The two dispatch functions stay, because the
    transports genuinely differ; what stops being duplicated is what each verb
    MEANS. The verb-parity guard already asserts the tables match.
@@ -144,6 +146,51 @@ This ADR does not change that trade, it concentrates it.
 **The single-node durable format changes**, and that is the one irreversible
 part. It wants its own release and its own gate, with a tolerant reader shipped
 first — which is why it is step 1 and 2 rather than folded into the rest.
+
+## Step 2's reader, shipped alone (2026-09-16)
+
+`State::load_or_new` now reads **either** format: serde JSON if the file begins
+with `{`, the hand-written line format otherwise. **The writer is untouched.**
+
+**Taken out of order on purpose.** The staging above puts the step-1 refactor
+first, and this went ahead of it because a release was being cut the same day.
+Step 1 is a refactor with no format consequence and can land any time; the
+reader is the piece with a deadline, because *"one release of tolerant reading
+before the old writer goes"* is only satisfied if the reader is in a release
+that has actually shipped. Missing that cut would have pushed step 2 a full
+release cycle, so the cheap half went in the cut and the expensive half waits.
+
+**The direction that needs the lead time is backward.** A new binary reading an
+old file has always worked. The case that bites is an OLD binary handed a file a
+NEWER one wrote — a rollback, a half-finished roll, a drill fixture kept across
+a version bump. That is why reader and writer cannot ship together.
+
+Four things it decides, each with a test that was driven red:
+
+- **The discriminator is the leading `{`**, which cannot collide: the line
+  format's first line is always `version <n>` and every keyword it accepts is
+  lowercase ASCII.
+- **A damaged registry refuses to start rather than loading empty.** Falling
+  through to the line parser was the tempting default and is the one direction
+  that destroys data: that parser ignores unknown keywords, so a corrupt file
+  reads as no pairs and no tenants, and the next `commit()` writes that back
+  over the real registry.
+- **`RegistryState` is destructured exhaustively.** A twelfth field added later
+  is a compile error at the conversion rather than a field silently dropped on
+  every single-node load — which is BUG-0152 exactly.
+- **`controllers` stays absent from both formats**, answering ahead of time the
+  question step 1 was told to decide explicitly. It is a live report from
+  processes that may not be running, so a cold control plane knowing nothing is
+  correct; it relearns within one heartbeat.
+
+`ranges` is padded to the pair count on absorb, because the line loader always
+writes one entry per pair while `RegistryState::ranges` is `#[serde(default)]`
+and a pre-ranges snapshot arrives empty.
+
+**The release boundary has its own test.** `the_writer_has_not_moved_yet` loads
+JSON, commits, and asserts the file on disk is still the line format. It fails
+the moment step 2's writer lands, which is the reminder that the writer must not
+share a release with the reader.
 
 **The drills keep pointing where they point.** `subset_ratchet` found ADR-0030's
 miss and `lease_after_repoint` found BUG-0151's, both against the single-node
