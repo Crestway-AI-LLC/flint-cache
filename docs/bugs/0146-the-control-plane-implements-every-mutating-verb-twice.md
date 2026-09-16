@@ -1,7 +1,23 @@
 # BUG-0146 — the control plane implements every mutating verb twice
 
 **Status:** OPEN — found 2026-09-14 by a fix that landed in one of the two and
-was reported green by six unit tests.
+was reported green by six unit tests. **The design this file asked for exists:
+[ADR-0032](../adr/0032-one-implementation-of-every-control-plane-mutation.md),
+ACCEPTED 2026-09-15 (Jeff) — candidate A, single-node runs the same state
+machine, staged so the durable-format change moves on its own.** This stays
+OPEN because the work is not done, not because the decision is outstanding.
+
+Three more instances landed between the filing and the decision, and they are
+the reason the ADR was taken rather than deferred again:
+
+- **BUG-0148** — `CPMYSTATUS` dispatched only by `main.rs`; eighteen days.
+- **BUG-0150** — BUG-0065's fix *and the structural guard holding it shut* both
+  only in `main.rs`, with the guard reading `include_str!("main.rs")` while its
+  own forbidden literal sat in `registry.rs`, twice.
+- **BUG-0152** — the single-node line format carried ten of `Tenant`'s twelve
+  fields. **Direction reversed**: here the Raft path is correct and single-node
+  is wrong, which is why "check the other path" is not a rule that can be
+  learned from the previous two.
 
 ## What happened
 
