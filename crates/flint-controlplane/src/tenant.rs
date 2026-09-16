@@ -268,6 +268,74 @@ pub fn valid_family_prefix(prefix: &str) -> bool {
 /// compare it for delta-suppression. Families with no endpoints are still
 /// emitted (`PREFIX=`): a registered-but-unreachable family answers
 /// `-COPROCUNAVAIL`, which is not the same as an unregistered one.
+/// The admin field a proxy receives: `"curdigest,prevdigest"`, either `-`.
+///
+/// DIGESTS, never the plaintext. The proxy VERIFIES a presented admin token by
+/// hash, exactly as it does tenant tokens (ADR-0006 D1); it never holds the
+/// secret it is checking. The control plane stores the admin token in the clear
+/// because our own components retrieve it, and that asymmetry is the whole
+/// reason this function exists rather than the field being sent as-is.
+///
+/// ONE IMPLEMENTATION, and it was two (ADR-0032 step 1). `State::admin_digests`
+/// and an identical closure inlined in `RegistryState::snapshot_for` produced
+/// the same string by the same method, in the two control-plane paths that
+/// ADR-0032 exists to unify. Nothing textual would have caught them drifting:
+/// a change to the hash, to the separator, or to the `-` sentinel in one is a
+/// wire-format change the other keeps answering the old way, and the proxy on
+/// the far side cannot tell which control plane it is talking to.
+pub fn admin_digests(cur: &Option<String>, prev: &Option<String>) -> String {
+    let d = |t: &Option<String>| {
+        t.as_deref()
+            .map(|s| flint_tls::sha256_hex(s.as_bytes()))
+            .unwrap_or_else(|| "-".into())
+    };
+    format!("{},{}", d(cur), d(prev))
+}
+
+/// The fields a snapshot is rendered from, borrowed from either state type.
+///
+/// A struct rather than nine positional arguments because the two longest are
+/// `admin_token` and `admin_prev`, both `&Option<String>`, adjacent, and
+/// swapping them is silent: the snapshot still renders, the digests are still
+/// digests, and a proxy accepts the PREVIOUS admin token as current for the
+/// whole rotation window. Named fields make that a compile error instead of a
+/// security regression nothing observes.
+pub struct SnapshotSource<'a> {
+    pub version: u64,
+    pub pairs: &'a [Vec<String>],
+    pub ranges: &'a [Option<(u16, u16)>],
+    pub tenants: &'a std::collections::BTreeMap<String, Tenant>,
+    pub exceptions: &'a [SlotRun],
+    pub admin_token: &'a Option<String>,
+    pub admin_prev: &'a Option<String>,
+    pub promoted: &'a Option<(String, u64)>,
+}
+
+/// The whole six-element snapshot a given proxy should see.
+///
+/// ADR-0032 step 1. `State::snapshot_for` and `RegistryState::snapshot_for`
+/// were separate assemblies of the same six elements, in the same order, from
+/// the same helpers -- identical except that one factored the admin digest out
+/// and the other inlined it. That is the ADR's subject exactly: a verb table
+/// catches an arm somebody forgot to ADD, and nothing catches an arm somebody
+/// forgot to UPDATE. Element ORDER is a wire contract with every proxy, so the
+/// expensive failure here is not a crash, it is two control planes that agree
+/// about what a snapshot contains and disagree about where element 4 is.
+pub fn snapshot_tuple(
+    src: SnapshotSource<'_>,
+    proxy: &str,
+) -> (u64, String, String, String, String, String) {
+    let (pairs, tenants) = snapshot_for(src.pairs, src.ranges, src.tenants.values(), proxy);
+    (
+        src.version,
+        pairs,
+        tenants,
+        admin_digests(src.admin_token, src.admin_prev),
+        exceptions_spec_for(src.exceptions, src.tenants.values(), proxy),
+        promote_hint(src.promoted),
+    )
+}
+
 pub fn families_spec(families: &std::collections::BTreeMap<String, Vec<String>>) -> String {
     families
         .iter()

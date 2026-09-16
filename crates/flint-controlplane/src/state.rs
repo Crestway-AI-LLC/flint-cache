@@ -561,29 +561,31 @@ impl State {
     /// filter is the blast-radius/security boundary: a proxy never holds
     /// tokens it does not serve).
     pub fn snapshot_for(&self, proxy: &str) -> (u64, String, String, String, String, String) {
-        let (pairs, tenants) =
-            crate::tenant::snapshot_for(&self.pairs, &self.ranges, self.tenants.values(), proxy);
-        (
-            self.version,
-            pairs,
-            tenants,
-            self.admin_digests(),
-            crate::tenant::exceptions_spec_for(&self.exceptions, self.tenants.values(), proxy),
-            crate::tenant::promote_hint(&self.promoted),
-        )
+        crate::tenant::snapshot_tuple(self.snapshot_source(), proxy)
     }
 
-    /// The admin field the proxy receives: "curdigest,prevdigest" (either
-    /// "-"). DIGESTS — the proxy verifies a presented admin token by hash,
-    /// exactly like tenant tokens (D1); it never holds the plaintext.
-    pub fn admin_digests(&self) -> String {
-        let d = |t: &Option<String>| {
-            t.as_deref()
-                .map(|s| flint_tls::sha256_hex(s.as_bytes()))
-                .unwrap_or_else(|| "-".into())
-        };
-        format!("{},{}", d(&self.admin_token), d(&self.admin_prev))
+    /// Borrow the fields a snapshot renders from. Kept beside the struct it
+    /// fills so that a field added to either state type is one edit, here,
+    /// rather than a silent omission in an assembly nobody re-reads.
+    fn snapshot_source(&self) -> crate::tenant::SnapshotSource<'_> {
+        crate::tenant::SnapshotSource {
+            version: self.version,
+            pairs: &self.pairs,
+            ranges: &self.ranges,
+            tenants: &self.tenants,
+            exceptions: &self.exceptions,
+            admin_token: &self.admin_token,
+            admin_prev: &self.admin_prev,
+            promoted: &self.promoted,
+        }
     }
+
+    // `admin_digests` used to live here as a method and is now
+    // `tenant::admin_digests`, called only through `snapshot_tuple`. A
+    // delegating wrapper was left behind first and clippy's `-D warnings`
+    // caught it as dead within the minute: the one caller was the assembly
+    // that moved. Left as a comment rather than a deprecated shim, because a
+    // shim nothing calls is the same dead code with a longer name.
 
     /// Record (ns, slot) -> pair_idx, replacing any previous owner row.
     pub fn set_exception(&mut self, ns: &str, slot: u16, pair: u16) {
@@ -1013,6 +1015,51 @@ mod tests {
         let path = dir.0.join("state");
         std::fs::write(&path, "{\"version\": 7, \"pairs\": [[\"a:7001\"],").expect("write");
         let _ = State::load_or_new(path);
+    }
+
+    #[test]
+    fn both_state_types_render_the_same_snapshot() {
+        // ADR-0032 step 1. `State::snapshot_for` and
+        // `RegistryState::snapshot_for` were separate assemblies of the same
+        // six elements and are now one; this is what stops them becoming two
+        // again. It is the ADR's own argument as a test: a verb table catches
+        // an arm somebody forgot to ADD, and nothing textual catches an arm
+        // somebody forgot to UPDATE.
+        //
+        // ELEMENT ORDER IS A WIRE CONTRACT with every proxy, so the tuple is
+        // compared whole rather than field by field — two control planes that
+        // agree on the contents and disagree on where element 4 sits is the
+        // expensive version of this failure, and a per-field assertion written
+        // in the same order as the bug would not see it.
+        let reg = a_full_registry();
+        let mut st = State::default();
+        st.absorb_registry(reg.clone());
+
+        // The subset must actually match, or both sides render an empty tenant
+        // list and agree about nothing — the vacuous pass this file has caught
+        // twice today.
+        let proxy = "p1:7000";
+        assert!(
+            reg.tenants
+                .values()
+                .any(|t| t.subset.iter().any(|s| s == proxy)),
+            "no tenant is served by {proxy}, so both renderers would return an \
+             empty tenant spec and this test would compare two blanks"
+        );
+
+        let from_state = st.snapshot_for(proxy);
+        let from_registry = reg.snapshot_for(proxy);
+        assert_eq!(
+            from_state, from_registry,
+            "the single-node and Raft control planes rendered different \
+             snapshots for the same registry -- a proxy cannot tell which \
+             control plane it is talking to, so these must be one implementation"
+        );
+        assert!(
+            !from_state.1.is_empty() && !from_state.2.is_empty(),
+            "pairs and tenants both rendered empty, so the comparison above \
+             held two blanks equal"
+        );
     }
 
     #[test]

@@ -467,22 +467,25 @@ impl RegistryState {
     /// The snapshot a given proxy should see: shared pair topology + ONLY
     /// the tenants whose subset includes it (the sub-group boundary).
     pub fn snapshot_for(&self, proxy: &str) -> (u64, String, String, String, String, String) {
-        let (pairs, tenants) =
-            crate::tenant::snapshot_for(&self.pairs, &self.ranges, self.tenants.values(), proxy);
-        let d = |t: &Option<String>| {
-            t.as_deref()
-                .map(|s| flint_tls::sha256_hex(s.as_bytes()))
-                .unwrap_or_else(|| "-".into())
-        };
-        let admin = format!("{},{}", d(&self.admin_token), d(&self.admin_prev));
-        (
-            self.version,
-            pairs,
-            tenants,
-            admin,
-            crate::tenant::exceptions_spec_for(&self.exceptions, self.tenants.values(), proxy),
-            crate::tenant::promote_hint(&self.promoted),
-        )
+        crate::tenant::snapshot_tuple(self.snapshot_source(), proxy)
+    }
+
+    /// Borrow the fields a snapshot renders from — the mirror of
+    /// `State::snapshot_source`, and the only place the two types still say the
+    /// same thing twice. Step 1 of ADR-0032 removes even this by making
+    /// `RegistryState` the single type; until then, both fill one struct and
+    /// call one renderer.
+    pub fn snapshot_source(&self) -> crate::tenant::SnapshotSource<'_> {
+        crate::tenant::SnapshotSource {
+            version: self.version,
+            pairs: &self.pairs,
+            ranges: &self.ranges,
+            tenants: &self.tenants,
+            exceptions: &self.exceptions,
+            admin_token: &self.admin_token,
+            admin_prev: &self.admin_prev,
+            promoted: &self.promoted,
+        }
     }
 }
 

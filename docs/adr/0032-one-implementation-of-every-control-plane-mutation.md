@@ -120,7 +120,8 @@ own:
 
 1. **`RegistryState` becomes the single state type.** `State` keeps only
    loading: read the hand-written format, produce a `RegistryState`. Decide
-   `controllers` explicitly here.
+   `controllers` explicitly here. **STARTED 2026-09-16** — see "Step 1, in
+   progress" below; the shared renderer is collapsed, the type swap is not.
 2. **Persist `RegistryState` on the single-node path**, writing serde and
    reading either — one release of tolerant reading before the old writer goes.
    **The READING half landed 2026-09-16** — see "Step 2's reader, shipped
@@ -146,6 +147,52 @@ This ADR does not change that trade, it concentrates it.
 **The single-node durable format changes**, and that is the one irreversible
 part. It wants its own release and its own gate, with a tolerant reader shipped
 first — which is why it is step 1 and 2 rather than folded into the rest.
+
+## Step 1, in progress (2026-09-16)
+
+Staged inside the step, because the type swap is 159 call sites in `main.rs`
+alone and the duplication it removes is worth removing before that lands rather
+than inside it.
+
+**Done: one renderer.** `State::snapshot_for` and `RegistryState::snapshot_for`
+were separate assemblies of the same six elements, from the same helpers, in the
+same order — identical except that one factored the admin digest into
+`admin_digests()` and the other inlined the closure. A third copy of the same
+defect class the ADR was written for, found while reading for step 1 rather than
+by a check.
+
+Both now fill one `tenant::SnapshotSource` and call one
+`tenant::snapshot_tuple`. `admin_digests` moved to `tenant.rs` with them.
+
+- **A struct, not nine positional arguments**, and that is not style. The two
+  longest arguments are `admin_token` and `admin_prev`, both
+  `&Option<String>`, adjacent, and swapping them is silent: the snapshot still
+  renders, the digests are still digests, and a proxy accepts the PREVIOUS
+  admin token as current for the whole rotation window. Named fields make that
+  a compile error instead of a security regression nothing observes.
+- **`both_state_types_render_the_same_snapshot`** is what stops them becoming
+  two again, and it compares the tuple WHOLE. Element order is a wire contract
+  with every proxy, so two control planes that agree on the contents and
+  disagree on where element 4 sits is the expensive version of this failure —
+  and a per-field assertion written in the same order as the bug would not see
+  it. Red on an admin-field swap and on a stale version, each killing only that
+  test.
+- **What that test cannot do**, stated so nobody reads it as more: it catches
+  DIVERGENCE, not a change to the shared renderer. Both sides move together
+  now, which is the point; the proxy's parser and the conformance suite are what
+  hold the format itself.
+- A delegating `State::admin_digests` wrapper was left behind for one minute
+  and clippy's `-D warnings` called it dead, correctly — its only caller was the
+  assembly that moved.
+
+**Not done: the type swap.** `RegistryState` is not yet the single type.
+`Shared { state: Mutex<State> }` and 159 `st.`/`state.` sites in `main.rs` are
+the bulk, and `controllers` still lives only on `State`. The answer for
+`controllers` is already recorded in `state.rs`'s `absorb_registry` — absent
+from both durable formats, a live report from processes that may not be
+running, so a cold control plane knowing nothing is correct — and step 1 should
+move it onto `RegistryState` with `#[serde(skip)]`, beside `promoted`, which is
+the same category.
 
 ## Step 2's reader, shipped alone (2026-09-16)
 
