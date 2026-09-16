@@ -140,8 +140,33 @@ repo_bound_ports() {
   # suggest anyway -- 6300..9999, matching next-free-ports.sh's own BASE..MAX.
   # A literal outside that window cannot be handed out, so it does not matter
   # whether it was a port at all.
-  grep -rhv '^[[:space:]]*#' "$root/s3-accelerator" \
-    --include='*.sh' --include='*.py' --include='*.java' --include='*.xml' 2>/dev/null \
+  #
+  # TWO ROOTS, AND THE SECOND WAS THE HOLE. This read only the accelerator
+  # subtree, so a port bound by a NON-DRILL script in tools/ was invisible to
+  # both halves of the allocator: `drill_declared_ports` reads `fleet_init`
+  # declarations, and drills are the only things that declare. Nine ports were
+  # in that gap -- among them 6391, which `redisbloom_compare.sh` binds as
+  # `PORT=${PORT:-6391}` and then starts a server on.
+  #
+  # Found 2026-09-15 the expensive way: the allocator offered 6391 for a new
+  # drill, and the only reason it was not taken is that a COMMENT in
+  # `flintinfo_numeric_drill.sh` -- prose, in another file, written by someone
+  # who had moved off that port -- said the 639x block was claimed. An
+  # allocator that is correct only when a reader happens to remember a comment
+  # elsewhere is not an allocator.
+  #
+  # `*_drill.sh` is excluded because `drill_declared_ports` already reads those
+  # precisely, from the declaration that is their contract. Everything else in
+  # tools/ gets the same blunt treatment as the accelerator, for the reason
+  # given above: measured, it reserves 30 numbers of which 16 are new, against
+  # ~3100 still free. Over-reserving stays free.
+  {
+    grep -rhv '^[[:space:]]*#' "$root/s3-accelerator" \
+      --include='*.sh' --include='*.py' --include='*.java' --include='*.xml' 2>/dev/null
+    find "$root/tools" -name '*_drill.sh' -prune -o \
+      \( -name '*.sh' -o -name '*.py' \) -print 2>/dev/null \
+      | xargs grep -hv '^[[:space:]]*#' 2>/dev/null
+  } \
     | grep -oE '\b[0-9]{4,5}\b' \
     | awk '$1 >= 6300 && $1 <= 9999' \
     | sort -un
