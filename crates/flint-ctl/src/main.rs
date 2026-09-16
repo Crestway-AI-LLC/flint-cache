@@ -483,6 +483,34 @@ fn parse_inventory(path: &str) -> Inventory {
          deadband is what enables the planner, so executing without one arms \
          a loop that never produces a move"
     );
+    // BUG-0140. A `coproc` address is used as BOTH a bind and a dial target,
+    // and a wildcard can only ever be the first. `coproc_args` derives the
+    // seat's listen host from it, while `families_arg` builds the routing
+    // table `VEC.=addr` that EVERY proxy is handed — so a proxy on another
+    // machine given `VEC.=0.0.0.0:7411` dials its own loopback for a
+    // co-processor that is not there, and `coproc_runner` resolves placement
+    // from the same string and calls it local.
+    //
+    // REFUSED RATHER THAN GIVEN A `coproc-host`, which is the choice this bug
+    // left open and Jeff settled. The key would be dead surface: no generator
+    // emits a `coproc` line at all — checked in render-inventory.sh and
+    // first-boot.sh — and the one writer that does, chaos-cluster/run.sh:653,
+    // already resolves the host by hand. A multi-host co-processor topology is
+    // ADR-0017 v0.2 work with its own fleet story; the key belongs beside that
+    // if it is ever wanted, not ahead of it.
+    //
+    // At parse time, not in coproc_args, because the dial half is the harmful
+    // one and it reaches proxies through families_arg whether or not this
+    // machine spawns a coproc seat.
+    for (fam, addr) in &inv.coprocs {
+        let host = addr.rsplit_once(':').map(|(h, _)| h).unwrap_or("");
+        assert!(
+            !is_wildcard_host(host),
+            "`coproc {fam} {addr}` names no machine: this address is handed to \
+             every proxy as a DIAL target, so a wildcard sends each of them to \
+             its own loopback. Give the co-processor's real address"
+        );
+    }
     inv
 }
 
@@ -1566,6 +1594,19 @@ fn coproc_seat(family: &str, addr: &str) -> String {
         family.trim_end_matches('.').to_ascii_lowercase(),
         port_of(addr)
     )
+}
+
+/// The family of co-processor `i`. Exists so callers never destructure
+/// `inv.coprocs[i]` themselves — the same rule `cp` and `proxies` already
+/// follow, and what `bind_dial_sites_drill` enforces once a field is listed.
+fn coproc_family(inv: &Inventory, i: usize) -> &str {
+    &inv.coprocs[i].0
+}
+
+/// The seat name for co-processor `i`. One spelling, here.
+fn coproc_seat_name(inv: &Inventory, i: usize) -> String {
+    let (family, addr) = &inv.coprocs[i];
+    coproc_seat(family, addr)
 }
 
 /// A co-processor seat's flags. It presents the SERVER-ONLY `coproc` leaf
@@ -4312,9 +4353,9 @@ fn launch(inv: &Inventory, register: bool) {
     // the seat is listening answers the tenant with a connection error, and
     // the family path has no retry of its own.
     for i in 0..inv.coprocs.len() {
-        let (family, addr) = &inv.coprocs[i];
-        let bin = coproc_bin(family).expect("inventory parse rejected unknown families");
-        let seat = coproc_seat(family, addr);
+        let bin =
+            coproc_bin(coproc_family(inv, i)).expect("inventory parse rejected unknown families");
+        let seat = coproc_seat_name(inv, i);
         if seat_alive(&coproc_runner(inv, i), bin, &seat) {
             eprintln!("  {seat} already up");
             continue;

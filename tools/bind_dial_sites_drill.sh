@@ -53,6 +53,20 @@ FIELDS = {
                 # The one message whose whole subject is the difference
                 # between the two forms: "proxy <bind> (dialled at <dial>)".
                 "proxy_down_help"},
+    # BUG-0140, the third field. Unlike cp and proxies this one has no dial
+    # helper and deliberately never will: a wildcard `coproc` address is
+    # REFUSED at parse time, because no generator writes the key and the only
+    # writer resolves the host itself. So the six exempt readers are, each for
+    # its own reason: parse_inventory, because reading the raw literal IS the
+    # refusal; coproc_args, which BINDS; families_arg, which dials an address
+    # the refusal has already guaranteed names a machine; coproc_runner, which
+    # resolves placement from it the way cp_runner and proxy_runner do; and
+    # coproc_seat_name and coproc_family, which exist so that launch never
+    # destructures the element itself -- the rule cp and proxies already
+    # follow. A SEVENTH reader is the signal that the refusal is no longer
+    # enough and the key is wanted after all.
+    "coprocs": {"coproc_args", "families_arg", "coproc_runner",
+                "parse_inventory", "coproc_seat_name", "coproc_family"},
 }
 FN = re.compile(r"^(?:pub )?(?:async )?fn ([A-Za-z_][A-Za-z_0-9]*)")
 
@@ -113,11 +127,16 @@ case "$RC" in
   1)
     echo "$OUT" | grep -v '^#'
     fail "the above read an ELEMENT of a BIND line outside the helpers that resolve it.
-  inv.cp and inv.proxies are what those seats bind, and a bind address names no
-  machine. To DIAL one use cp_dial/proxy_dial; to decide which machine runs it
-  use cp_runner/proxy_runner; to REPORT it beside a probe result, name what was
-  probed, which is the dial form. Only the seat's own bind arguments may take
-  the literal." ;;
+  inv.cp, inv.proxies and inv.coprocs are what those seats bind, and a bind
+  address names no machine. To DIAL a cp or a proxy use cp_dial/proxy_dial; to
+  decide which machine runs it use cp_runner/proxy_runner; to REPORT it beside a
+  probe result, name what was probed, which is the dial form. Only the seat's
+  own bind arguments may take the literal.
+  inv.coprocs has NO dial helper by design (BUG-0140): a wildcard coproc address
+  is refused at parse time instead, so the literal is safe to dial and what this
+  rule protects is the RULE -- a new reader means the refusal is no longer
+  enough and a coproc-host key is wanted after all. Say so in the exempt set
+  above, with the reason, rather than adding the reader quietly." ;;
   *) fail "the scan did not run to a verdict (rc=$RC):
 $OUT" ;;
 esac
@@ -139,4 +158,8 @@ control() {  # control <fn-signature-prefix> <injected line> <label>
 }
 control status "for seat in &inv.cp { let _ = seat; }" "inv.cp"
 control status "for p in &inv.proxies { let _ = p; }" "inv.proxies"
+# BUG-0140's field gets its own, because a rule with no control is a rule that
+# has not been shown to fail -- and this one was added last, when the exempt
+# set was being tuned and an over-broad entry would have gone unnoticed.
+control status "for c in &inv.coprocs { let _ = c; }" "inv.coprocs"
 echo "BIND/DIAL SITES DRILL PASSED"

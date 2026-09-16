@@ -1,6 +1,6 @@
-# BUG-0140: the `coproc` line is a bind address and every proxy is handed it as a dial target (OPEN)
+# BUG-0140: the `coproc` line is a bind address and every proxy is handed it as a dial target (FIXED 2026-09-15)
 
-Status: **OPEN**, found 2026-09-14 · Severity: **low** — the same shape as
+Status: **FIXED 2026-09-15** by refusal, found 2026-09-14 · Severity: **low** — the same shape as
 [BUG-0138](0138-the-cp-line-is-a-bind-address-and-eight-sites-dial-it.md),
 one key over again, but **latent**: nothing generates the wildcard form, so
 no fleet that exists today can be in this state. Filed because the pattern is
@@ -52,6 +52,55 @@ its own exempt set.
 with its own fleet story, and changing how proxies are told to reach it is
 worth doing beside that rather than as a fourth item in a bind/dial sweep.
 Nothing is at risk in the meantime.
+
+## What was done, 2026-09-15: refused, not keyed
+
+Jeff's call on the question this file left open. A wildcard `coproc` address is
+now refused at parse time:
+
+```
+`coproc VEC. 0.0.0.0:7411` names no machine: this address is handed to every
+proxy as a DIAL target, so a wildcard sends each of them to its own loopback.
+Give the co-processor's real address
+```
+
+**Refused rather than given a `coproc-host`**, because the key would be dead
+surface: no generator emits a `coproc` line — `render-inventory.sh` and
+`first-boot.sh` both checked — and `chaos-cluster/run.sh:653`, the only writer,
+resolves the host itself. A multi-host co-processor topology is ADR-0017 v0.2
+work with its own fleet story; if it ever wants the key, the key belongs beside
+it rather than three months ahead of it.
+
+**At parse time, not in `coproc_args`**, which is where this file proposed it.
+The dial half is the harmful one, and it reaches proxies through `families_arg`
+whether or not the local machine spawns a co-processor seat. Refusing where the
+inventory is read covers both.
+
+`0.0.0.0`, `[::]` and a bare `:port` are all refused; a real address is
+untouched, so `chaos-cluster` is unaffected.
+
+### The drill gained its third field, and that found one more thing
+
+`bind_dial_sites_drill.sh` now covers `coprocs` alongside `cp` and `proxies`.
+Listing the field immediately flagged `launch`, which destructured
+`&inv.coprocs[i]` directly to build a seat name — something neither of the
+other two fields does, because both go through helpers. So `coproc_family` and
+`coproc_seat_name` now own that read, and `launch` touches no element.
+
+The exempt set is the four functions that legitimately read the raw string:
+`coproc_args` (binds), `families_arg` (dials an address the refusal has already
+guaranteed), `coproc_runner` (placement), and `parse_inventory` (the refusal
+itself — checking the literal is the job).
+
+**A fourth reader appearing outside that set is the signal that the refusal is
+no longer enough and the key is wanted after all.** That is the useful property
+of fixing it this way rather than with a `coproc-host`: the next person who
+needs multi-host coprocs will be told by a drill rather than by a silent
+misroute.
+
+The field has its own positive control — an injected `for c in &inv.coprocs`
+must be caught — because a rule with no control has not been shown to fail, and
+this one was added while the exempt set was being tuned.
 
 ## Not established
 
