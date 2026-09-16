@@ -147,6 +147,28 @@ cleanup; PIDS=""; sleep 0.5
 # A process whose ARGV carries a path, which `spawn_as` cannot produce --
 # exec -a sets argv[0], so the whole string becomes the command line as ps
 # renders it. Scope matching reads that line, so the fake has to have one.
+# IS A PROCESS WITH THIS ARGV RUNNING? A SNAPSHOT, NOT A PIPELINE.
+#
+# `ps -eo args= | grep -q -- "$pat"` MATCHES ITS OWN GREP: the grep is running
+# while ps samples, and its argv contains the pattern. So the pipeline form
+# always finds at least one hit and can never report "gone" -- a check that
+# cannot fail, sitting in four places whose whole job is to prove a fixture
+# exists before something is asserted about it. Measured: a pattern matching
+# nothing real returns 1 from the pipeline and 0 from the snapshot.
+#
+# Taking the snapshot FIRST closes it, because the command substitution
+# completes before the grep is forked.
+# NO PIPE EITHER. `printf ... | grep -q` makes grep exit at the first hit and
+# leaves printf writing to a closed pipe, which prints "write error: Broken
+# pipe" on every call -- noise in a drill's output that reads like a fault.
+# A quoted case pattern is a LITERAL substring test, so it needs no subprocess
+# and cannot be confused by a bracket in a path.
+seat_in_ps() {   # seat_in_ps <argv substring>
+  local snapshot
+  snapshot=$(ps -eo args=)
+  case "$snapshot" in *"$1"*) return 0 ;; *) return 1 ;; esac
+}
+
 spawn_argv() { bash -c "exec -a \"$1\" sleep 60" & PIDS="$PIDS $!"; }
 # The same fake seat with a life span, for the one case that needs a seat to GO
 # on its own: fleet_guard's settle loop exists for seats on their way out, and
@@ -161,7 +183,7 @@ echo "== F) a scope must not own a scope it is merely a PREFIX of"
 PFX="$FLINT_DRILL_ROOT/flint-guardpfx"
 spawn_argv "flint-server --data-dir $PFX-ctl/d"
 sleep 1
-ps -eo args= | grep -q -- "--data-dir $PFX-ctl/d" \
+seat_in_ps "--data-dir $PFX-ctl/d" \
   || { echo "FAIL: the fake prefix seat is not visible in ps — this case would pass vacuously"; exit 1; }
 SAVED_SCOPE="$FLEET_SCOPE"; SAVED_PORTS="$FLEET_PORTS"
 FLEET_SCOPE="$PFX"; FLEET_PORTS=""
@@ -181,18 +203,53 @@ cleanup; PIDS=""; sleep 0.5
 echo "== G) a live PEER drill of this suite is not a foreign fleet (parallel only)"
 PEER="$FLINT_DRILL_ROOT/flint-guardpeer"
 rm -rf "$PEER.lock"; mkdir -p "$PEER.lock"
-sleep 300 & PEERPID=$!; PIDS="$PIDS $PEERPID"
+
+# THE FIXTURE IS A CLOCK, AND EVERY ARM IN THIS CASE DEPENDS ON IT.
+#
+# The peer is a `sleep`, and this case makes FIVE fleet_guard calls, each of
+# which can spend FLINT_FOREIGN_SETTLE (15s by default) waiting for a teardown
+# to clear. On a loaded 4-wide box that is over a minute, and the seats used to
+# be spawned with the shared `spawn_argv`, which gives them 60 seconds.
+#
+# When the fixture expires mid-case, every remaining arm reads an EMPTY BOX as a
+# verdict about the guard. The first reports "a peer seat did not refuse ... the
+# flag would be untested"; the last reports "tolerated a foreign seat anyway --
+# that is an amnesty, not a distinction". Both are descriptions of a sleep that
+# ended. The last one failed a real gate on 2026-09-16, and killing the fixture
+# immediately before it reproduces that message verbatim, exit 0, with nothing
+# foreign on the box at all.
+#
+# TWO FIXES, because either alone leaves half the defect. The lifetime is
+# derived from the budget it has to survive rather than being a round number,
+# and `require_peer_seat` asks before each arm so an expiry is reported AS an
+# expiry instead of as a guard that misbehaved.
+PEER_LIFE_S=$(( 20 * ${FLINT_FOREIGN_SETTLE:-15} ))
+require_peer_seat() {   # require_peer_seat <what the next assertion is about>
+  seat_in_ps "--data-dir $PEER/d" && return 0
+  echo "FAIL: the peer fixture's seat is GONE before '$1' could be asserted, so"
+  echo "      that arm would have judged fleet_guard against an empty box."
+  echo "      This is a WALL-CLOCK EXPIRY and not a defect in the guard: the"
+  echo "      fixture is a sleep with ${PEER_LIFE_S}s, and this case can spend"
+  echo "      ${FLINT_FOREIGN_SETTLE:-15}s per guard call waiting for a teardown."
+  echo "      Raise PEER_LIFE_S; do not read this as an amnesty."
+  rm -rf "$PEER.lock"; exit 1
+}
+
+# The lock's pid and the seats expire TOGETHER. They did not before -- the lock
+# outlived its own seats by four minutes, which is the state that produces a
+# false verdict rather than a loud one.
+sleep "$PEER_LIFE_S" & PEERPID=$!; PIDS="$PIDS $PEERPID"
 printf '%s\n' "$PEERPID" > "$PEER.lock/pid"
 ps -o lstart= -p "$PEERPID" > "$PEER.lock/started" 2>/dev/null
 printf '%s\n' "7788|7789" > "$PEER.lock/ports"
-spawn_argv "flint-server --data-dir $PEER/d"
+spawn_argv_for "flint-server --data-dir $PEER/d" "$PEER_LIFE_S"
 # A PEER SEAT THAT CARRIES NO PATH. A proxy or controller is started with
 # ports and no directory, and a drill keeps auxiliary state in a sibling
 # <scope>-state dir that the boundary rule deliberately does not call owned.
 # Matching peers on the scope path alone therefore misses most of a real
 # peer fleet: measured 2026-08-24, 9 of 24 seats matched and the gate refused
 # over the other 15. Ports are the second key, exactly as in _fleet_ours.
-spawn_argv "flint-controller --pairs 127.0.0.1:7788,127.0.0.1:7789 --id peerctl"
+spawn_argv_for "flint-controller --pairs 127.0.0.1:7788,127.0.0.1:7789 --id peerctl" "$PEER_LIFE_S"
 sleep 1
 # Without the flag it is foreign, exactly as before. If this does not refuse,
 # the case below proves nothing about the flag.
@@ -200,9 +257,11 @@ sleep 1
 # exec a binary -- it returned 127, which this assert read as "did not
 # refuse". The unset above already clears the ambient value; this makes
 # the arm say so at the point it matters.
+require_peer_seat "a peer seat refuses WITHOUT the flag"
 OUT=$( unset FLINT_DRILL_PARALLEL; fleet_guard 2>&1 ); RC=$?
 [ "$RC" = 1 ] \
   || { echo "FAIL: a peer seat did not refuse WITHOUT FLINT_DRILL_PARALLEL (exit $RC) — the flag would be untested"; rm -rf "$PEER.lock"; exit 1; }
+require_peer_seat "the flag tolerates a live peer"
 OUT=$(FLINT_DRILL_PARALLEL=1 fleet_guard 2>&1); RC=$?
 [ "$RC" = 0 ] \
   || { echo "FAIL: FLINT_DRILL_PARALLEL=1 still refused a live peer drill (exit $RC):"; echo "$OUT" | sed 's/^/    /'; rm -rf "$PEER.lock"; exit 1; }
@@ -228,9 +287,9 @@ OUT=$(FLINT_DRILL_PARALLEL=1 fleet_guard 2>&1); RC=$?
 DYING="$FLINT_DRILL_ROOT/flint-guarddying"
 spawn_argv_for "flint-server --data-dir $DYING/d" 3
 sleep 1
-ps -eo args= | grep -q -- "--data-dir $DYING/d" \
+seat_in_ps "--data-dir $DYING/d" \
   || { echo "FAIL: the dying seat is not visible in ps -- this case would pass vacuously"; rm -rf "$PEER.lock"; exit 1; }
-ps -eo args= | grep -q -- "--data-dir $PEER/d" \
+seat_in_ps "--data-dir $PEER/d" \
   || { echo "FAIL: the PEER seat is not visible in ps -- an assertion that the peer is not named would pass because there is no peer"; rm -rf "$PEER.lock"; exit 1; }
 OUT=$(FLINT_DRILL_PARALLEL=1 fleet_guard 2>&1); RC=$?
 if printf '%s\n' "$OUT" | grep -q -- "--data-dir $PEER/d"; then
@@ -248,6 +307,7 @@ echo "  a seat clearing during the settle does not make the live peers foreign"
 # for it. Ask the question locally instead: drop the ports the peer declared,
 # and the seat that had no path must become foreign again. Nothing else about
 # the box can move that answer.
+require_peer_seat "the ports key is what matched the path-less seat"
 rm -f "$PEER.lock/ports"
 OUT2=$(FLINT_DRILL_PARALLEL=1 fleet_guard 2>&1); RC2=$?
 [ "$RC2" = 1 ] \
@@ -256,6 +316,10 @@ printf '%s\n' "7788|7789" > "$PEER.lock/ports"
 # NEGATIVE CONTROL: no live lock behind the seat and it is foreign again,
 # flag or not. Otherwise the flag would be a blanket amnesty, which is what
 # FLINT_DRILL_FORCE already is.
+# THE ARM THAT FAILED A GATE, and the one this case could least afford to get
+# wrong: "the guard tolerated a foreign seat" and "there was no foreign seat
+# left to refuse" are the same exit 0 and the same message without this line.
+require_peer_seat "a seat with no live lock is foreign again"
 rm -rf "$PEER.lock"
 OUT=$(FLINT_DRILL_PARALLEL=1 fleet_guard 2>&1); RC=$?
 [ "$RC" = 1 ] \
