@@ -23,87 +23,26 @@ use std::path::PathBuf;
 
 pub use crate::tenant::Tenant;
 
-#[derive(Debug, Default)]
-pub struct State {
-    pub version: u64,
-    pub proxies: Vec<String>,
-    pub pairs: Vec<Vec<String>>,
-    /// Slot range owned by pairs[i] (level-1 routing state, design.md §2.2).
-    /// None = unranged (legacy registries / static mode): proxies fall back
-    /// to count-derived ranges. An EXPANSION pair joins with an empty range
-    /// (None here is "unranged", (0,0)-style empty is expressed by simply
-    /// never covering a slot): it owns nothing until migration moves slots,
-    /// so adding capacity can never re-route data that has not moved.
-    pub ranges: Vec<Option<(u16, u16)>>,
-    /// Keyed by tenant name (BTreeMap: deterministic serialization order).
-    pub tenants: BTreeMap<String, Tenant>,
-    /// Slot-ownership EXCEPTIONS (Option B): `(ns, slot, pair_idx)` rows
-    /// where ownership diverges from the pair's contiguous default range —
-    /// committed by the migration orchestrator at cutover. Sorted, unique
-    /// per (ns, slot). Pair INDEX, not address: routing then follows the
-    /// pair's failovers automatically. The CP is the durable truth;
-    /// proxy-learned -MOVED entries are only the bridge until this commits.
-    pub exceptions: Vec<crate::tenant::SlotRun>,
-    /// Master-of-record per pair (ADR-0018): `(members, master, gen)`. THE
-    /// fencing record — written by CPFENCE before any promotion and by
-    /// first-touch adoption, read (via the fast mirror in main.rs) by every
-    /// CPLEASE renewal. Durable because a CP restart that forgot a promotion
-    /// would let a healed old master adopt itself back while its successor
-    /// serves — the exact split-brain the lease exists to close.
-    pub leases: Vec<(Vec<String>, String, u64)>,
-    /// Fleet operator (admin) token, CURRENT (ADR-0006 D4). Stored PLAINTEXT
-    /// — unlike tenant tokens it is RETRIEVED by our own components (the
-    /// agent presents it to proxies over their token-auth front door), so it
-    /// cannot be one-way hashed; at rest it relies on volume encryption. The
-    /// DIGEST is what the proxies receive (they verify, never retrieve).
-    pub admin_token: Option<String>,
-    /// Previous admin token during a rotation window (both valid until the
-    /// agent's drop-on-adoption retires it).
-    pub admin_prev: Option<String>,
-    /// Co-processor command families (ADR-0010 D1): prefix -> endpoints.
-    /// Global; rendered into snapshot element 7 for every proxy. Persisted
-    /// (a `family` line) so a CP restart keeps the route table. BTreeMap for
-    /// deterministic serialization, like `tenants`.
-    pub families: BTreeMap<String, Vec<String>>,
-    /// Last promotion reported by the controller: (addr, generation). NOT
-    /// persisted and NOT routing authority — see tenant::promote_hint.
-    pub promoted: Option<(String, u64)>,
-    /// Build stamps the CONTROLLERS registered (ADR-0014 D1), keyed by the
-    /// identity they gave: `host:pid` -> (build, unix_ms of the report).
-    ///
-    /// The controller has no listener and must not gain one, so it cannot
-    /// be asked; it tells us instead, on startup and on every heartbeat.
-    /// NOT persisted, deliberately: a build stamp that outlived the process
-    /// that reported it would be a claim about a controller that may not be
-    /// running, which is the exact confusion this closes. A cold CP starts
-    /// knowing nothing and learns within one heartbeat.
-    ///
-    /// A MAP rather than one value because duplicate controllers are the
-    /// recorded failure — "a controller from a previous start survived two
-    /// upgrade cycles" — and one slot would have hidden the second one by
-    /// overwriting it, reproducing the bug in the surface built to find it.
-    pub controllers: BTreeMap<String, (String, u64)>,
-    path: Option<PathBuf>,
-}
+/// The control plane's state. ONE TYPE (ADR-0032 step 1).
+///
+/// This was a second struct carrying the same eleven fields as
+/// `registry::RegistryState`, with its own durable format, its own copy of the
+/// snapshot renderer and its own `shuffle_shard` — the duplication that ADR
+/// exists to remove. `State` is now the name the single-node path calls it by,
+/// and nothing more: an alias, so `use state::State` still reads naturally at
+/// the call sites that are about the single-node plane, while the type a
+/// mutation means something to is the same on both paths.
+///
+/// What still lives in THIS file is the hand-written line format — the reader,
+/// the writer and `commit` — because that is a property of the single-node
+/// deployment rather than of the state. ADR-0032 step 2 replaces it with serde
+/// and this file shrinks to nothing.
+pub use crate::registry::RegistryState as State;
 
 /// How long after its last report a controller is still believed present.
 /// Three heartbeats: one missed report is a scheduling hiccup, three is a
 /// process that is gone.
 pub const CONTROLLER_STALE_MS: u64 = 90_000;
-
-impl State {
-    /// The `controller:` lines for CPINFO — one per registered controller,
-    /// each carrying how long ago it last spoke, because "which build" and
-    /// "still running" are the same question for a seat with no listener.
-    ///
-    /// Renders STALE rather than dropping the row. A controller that
-    /// stopped reporting is the single most interesting thing this surface
-    /// can say, and hiding it would restore the silence that let an
-    /// orphaned controller survive two upgrade cycles.
-    pub fn controller_line(&self) -> String {
-        render_controllers(&self.controllers)
-    }
-}
 
 /// The controller registry, as a map from `<host:pid>` to `(build, last_seen_ms)`.
 ///
@@ -155,38 +94,21 @@ pub fn render_controllers(map: &Controllers) -> String {
     out
 }
 
-/// FNV-1a — a stable, dependency-free seed for deterministic subset
-/// assignment. NOT a security boundary (tokens are); just placement.
-fn fnv1a(data: &[u8]) -> u64 {
-    let mut h: u64 = 0xcbf29ce484222325;
-    for &b in data {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    h
-}
+// `fnv1a` went with it. It was this file's private seed for the placement
+// hash and had exactly one caller — the `shuffle_shard` copy above. Clippy's
+// `-D dead-code` named it within the minute, which is the second time today
+// that lint has found the tail of a move I thought was complete.
 
-/// Deterministic shuffle-shard: pick `k` distinct proxies for `name` from
-/// `fleet` (sorted first, so the choice is independent of registration
-/// order). Same tenant + same fleet => same subset on every node that ever
-/// computes it — no coordination needed for agreement.
-pub fn shuffle_shard(name: &str, fleet: &[String], k: usize) -> Vec<String> {
-    let mut sorted: Vec<&String> = fleet.iter().collect();
-    sorted.sort();
-    let k = k.min(sorted.len());
-    let mut picked = Vec::with_capacity(k);
-    let mut seed = fnv1a(name.as_bytes());
-    while picked.len() < k && !sorted.is_empty() {
-        // Splitmix-style step; uniform enough for placement.
-        seed = seed
-            .wrapping_add(0x9E3779B97F4A7C15)
-            .wrapping_mul(0xBF58476D1CE4E5B9);
-        let idx = (seed >> 33) as usize % sorted.len();
-        picked.push(sorted.remove(idx).clone());
-    }
-    picked.sort();
-    picked
-}
+/// Deterministic subset placement. ONE implementation, in `registry.rs`
+/// (ADR-0032).
+///
+/// There were two, byte-identical but for a comment, and they were reached by
+/// different callers: `main.rs` used this file's copy and `ha.rs` used the
+/// registry's, so the single-node and Raft planes placed tenants through two
+/// functions that merely happened to agree. Nothing would have reported them
+/// drifting — the ADR's own subject, and the reason this is re-exported rather
+/// than kept.
+pub use crate::registry::shuffle_shard;
 
 /// Parse "a-b" into a slot range; "-" (or anything malformed) is None.
 pub fn parse_range(raw: &str) -> Option<(u16, u16)> {
@@ -277,9 +199,31 @@ impl State {
         // with `{`.
         if raw.trim_start().starts_with('{') {
             match serde_json::from_str::<crate::registry::RegistryState>(&raw) {
-                Ok(reg) => {
-                    s.absorb_registry(reg);
-                    return s;
+                Ok(mut reg) => {
+                    // ONE TYPE, so there is nothing to convert (ADR-0032 step
+                    // 1): the file parses straight into the state. Only the two
+                    // things serde cannot carry are restored here.
+                    //
+                    // `path` is `#[serde(skip)]`, so a parsed state does not
+                    // know where it came from and `commit()` would silently
+                    // write nowhere. That is the dangerous direction — a
+                    // control plane that loads, mutates, reports success and
+                    // persists nothing — so it is restored before the value
+                    // escapes this function.
+                    reg.path = Some(path.clone());
+                    // RANGES PADDED TO THE PAIR COUNT, because the two
+                    // producers disagree about whether a range is optional.
+                    // The line loader below pushes exactly one entry per `pair`
+                    // line, so the vectors always match on that path;
+                    // `ranges` is `#[serde(default)]`, so a snapshot written
+                    // before ranges existed arrives empty. Leaving it would
+                    // give a state whose two vectors disagree in length —
+                    // legal for `serialize()`, which uses `.get(i)`, and a trap
+                    // for any future reader that zips them.
+                    if reg.ranges.len() < reg.pairs.len() {
+                        reg.ranges.resize(reg.pairs.len(), None);
+                    }
+                    return reg;
                 }
                 // REFUSING TO START IS THE SAFE DIRECTION, and falling through
                 // to the line parser is the unsafe one. That parser ignores
@@ -420,62 +364,6 @@ impl State {
         s
     }
 
-    /// Take every durable field of a `RegistryState` into this `State`.
-    ///
-    /// DESTRUCTURED EXHAUSTIVELY, AND THAT IS THE LOAD-BEARING PART. Written
-    /// as eleven assignments, a twelfth field added to `RegistryState` later
-    /// would compile here and be silently dropped on every single-node load --
-    /// which is BUG-0152 exactly: two tenant flags were written nowhere, loaded
-    /// as `false`, and `CPTENANTASYNC on` held until the control plane
-    /// restarted and then reverted while the CP pushed the reversion out to
-    /// the proxies. A `let { .. } = r` with no rest pattern makes that a
-    /// COMPILE ERROR at the one place that has to know.
-    fn absorb_registry(&mut self, r: crate::registry::RegistryState) {
-        let crate::registry::RegistryState {
-            exceptions,
-            version,
-            proxies,
-            pairs,
-            mut ranges,
-            tenants,
-            admin_token,
-            admin_prev,
-            families,
-            leases,
-            promoted,
-        } = r;
-        // PADDED TO THE PAIR COUNT, because the two producers disagree about
-        // whether a range is optional. The line loader pushes exactly one
-        // entry per `pair` line, so `ranges.len() == pairs.len()` always holds
-        // on that path; `RegistryState::ranges` is `#[serde(default)]`, so a
-        // snapshot written before ranges existed arrives empty. Absorbing that
-        // as-is would give a `State` whose two vectors disagree in length --
-        // legal for `serialize()`, which uses `.get(i)`, and a trap for any
-        // future reader that zips them. Normalise here, where the difference
-        // is visible, rather than leaving it for that reader to discover.
-        if ranges.len() < pairs.len() {
-            ranges.resize(pairs.len(), None);
-        }
-        self.version = version;
-        self.proxies = proxies;
-        self.pairs = pairs;
-        self.ranges = ranges;
-        self.tenants = tenants;
-        self.exceptions = exceptions;
-        self.leases = leases;
-        self.admin_token = admin_token;
-        self.admin_prev = admin_prev;
-        self.families = families;
-        self.promoted = promoted;
-        // `controllers` is absent from BOTH durable formats and stays at its
-        // default, which is the same thing the line-format path does. It is a
-        // live report from processes that may not be running (see the field's
-        // own comment), so a cold control plane knowing nothing is correct --
-        // it learns within one heartbeat. ADR-0032 step 1 asks this question
-        // again when `RegistryState` becomes the single state type; the answer
-        // is recorded here so that step inherits it rather than re-deciding.
-    }
-
     fn serialize(&self) -> String {
         let mut out = format!("version {}\n", self.version);
         if self.admin_token.is_some() || self.admin_prev.is_some() {
@@ -552,59 +440,12 @@ impl State {
         Ok(self.version)
     }
 
-    /// The snapshot a given proxy should see: the shared pair topology plus
-    /// ONLY the tenants whose subset includes it (or unassigned-subset
-    /// tenants never — no subset, no service). This filtering is the
-    /// blast-radius/security boundary: a proxy never holds tokens it does
-    /// not serve.
-    /// The snapshot a given proxy should see (shared renderer — the subset
-    /// filter is the blast-radius/security boundary: a proxy never holds
-    /// tokens it does not serve).
-    pub fn snapshot_for(&self, proxy: &str) -> (u64, String, String, String, String, String) {
-        crate::tenant::snapshot_tuple(self.snapshot_source(), proxy)
-    }
-
-    /// Borrow the fields a snapshot renders from. Kept beside the struct it
-    /// fills so that a field added to either state type is one edit, here,
-    /// rather than a silent omission in an assembly nobody re-reads.
-    fn snapshot_source(&self) -> crate::tenant::SnapshotSource<'_> {
-        crate::tenant::SnapshotSource {
-            version: self.version,
-            pairs: &self.pairs,
-            ranges: &self.ranges,
-            tenants: &self.tenants,
-            exceptions: &self.exceptions,
-            admin_token: &self.admin_token,
-            admin_prev: &self.admin_prev,
-            promoted: &self.promoted,
-        }
-    }
-
     // `admin_digests` used to live here as a method and is now
     // `tenant::admin_digests`, called only through `snapshot_tuple`. A
     // delegating wrapper was left behind first and clippy's `-D warnings`
     // caught it as dead within the minute: the one caller was the assembly
     // that moved. Left as a comment rather than a deprecated shim, because a
     // shim nothing calls is the same dead code with a longer name.
-
-    /// Record (ns, slot) -> pair_idx, replacing any previous owner row.
-    pub fn set_exception(&mut self, ns: &str, slot: u16, pair: u16) {
-        let n = self.pairs.len();
-        crate::tenant::set_slot_owner(&mut self.exceptions, ns, slot, pair, &self.ranges, n);
-    }
-
-    /// Retire (ns, slot) from the table (splits an interior hit).
-    pub fn clear_exception(&mut self, ns: &str, slot: u16) -> bool {
-        crate::tenant::clear_slot_owner(&mut self.exceptions, ns, slot)
-    }
-
-    /// The consolidation sweep: merge adjacent runs, drop redundant ones.
-    /// Returns the row count after.
-    pub fn consolidate(&mut self) -> usize {
-        let n = self.pairs.len();
-        crate::tenant::normalize(&mut self.exceptions, &self.ranges, n);
-        self.exceptions.len()
-    }
 }
 
 #[cfg(test)]
@@ -883,6 +724,21 @@ mod tests {
             // left unsaid, because "it did not survive" and "nobody set it"
             // look identical in a loaded struct.
             promoted: Some(("a:7001".to_string(), 3)),
+            // Same category as `promoted` since ADR-0032 step 1 moved it here:
+            // a live report from a process that may not be running. Set
+            // non-default so that "did not survive" is distinguishable below.
+            controllers: {
+                let mut c = std::collections::BTreeMap::new();
+                c.insert(
+                    "h1:42".to_string(),
+                    ("rc.73".to_string(), 1_700_000_000_u64),
+                );
+                c
+            },
+            // Deliberately None: the fixture is what a FILE holds, and a file
+            // cannot know where it lives. `load_or_new` restores it from its
+            // own argument, which the test below asserts.
+            path: None,
         }
     }
 
@@ -913,9 +769,22 @@ mod tests {
         );
         assert!(
             got.controllers.is_empty(),
-            "controllers is absent from both durable formats on purpose: a build \
-             stamp that outlived the process reporting it is a claim about a \
-             controller that may not be running"
+            "controllers is #[serde(skip)] on purpose: a build stamp that \
+             outlived the process reporting it is a claim about a controller \
+             that may not be running, so a cold control plane must start \
+             knowing nothing and relearn within one heartbeat"
+        );
+        // AND THE PATH MUST COME BACK, which is the one field whose absence is
+        // silent and expensive. It is #[serde(skip)], so a state parsed from
+        // JSON does not know where it came from -- and `commit()` with no path
+        // writes NOWHERE and still returns Ok. A control plane that loads,
+        // mutates, reports success and persists nothing is the failure this
+        // assertion exists for.
+        assert_eq!(
+            got.path.as_deref(),
+            Some(dir.0.join("state").as_path()),
+            "the loaded state does not know where it came from, so commit() \
+             would write nowhere and report success"
         );
     }
 
@@ -1017,51 +886,20 @@ mod tests {
         let _ = State::load_or_new(path);
     }
 
-    #[test]
-    fn both_state_types_render_the_same_snapshot() {
-        // ADR-0032 step 1. `State::snapshot_for` and
-        // `RegistryState::snapshot_for` were separate assemblies of the same
-        // six elements and are now one; this is what stops them becoming two
-        // again. It is the ADR's own argument as a test: a verb table catches
-        // an arm somebody forgot to ADD, and nothing textual catches an arm
-        // somebody forgot to UPDATE.
-        //
-        // ELEMENT ORDER IS A WIRE CONTRACT with every proxy, so the tuple is
-        // compared whole rather than field by field — two control planes that
-        // agree on the contents and disagree on where element 4 sits is the
-        // expensive version of this failure, and a per-field assertion written
-        // in the same order as the bug would not see it.
-        let reg = a_full_registry();
-        let mut st = State::default();
-        st.absorb_registry(reg.clone());
-
-        // The subset must actually match, or both sides render an empty tenant
-        // list and agree about nothing — the vacuous pass this file has caught
-        // twice today.
-        let proxy = "p1:7000";
-        assert!(
-            reg.tenants
-                .values()
-                .any(|t| t.subset.iter().any(|s| s == proxy)),
-            "no tenant is served by {proxy}, so both renderers would return an \
-             empty tenant spec and this test would compare two blanks"
-        );
-
-        let from_state = st.snapshot_for(proxy);
-        let from_registry = reg.snapshot_for(proxy);
-        assert_eq!(
-            from_state, from_registry,
-            "the single-node and Raft control planes rendered different \
-             snapshots for the same registry -- a proxy cannot tell which \
-             control plane it is talking to, so these must be one implementation"
-        );
-        assert!(
-            !from_state.1.is_empty() && !from_state.2.is_empty(),
-            "pairs and tenants both rendered empty, so the comparison above \
-             held two blanks equal"
-        );
-    }
-
+    // `both_state_types_render_the_same_snapshot` was here and is DELETED,
+    // deliberately, rather than carried forward green.
+    //
+    // It compared `State::snapshot_for` against `RegistryState::snapshot_for`
+    // and was the guard that stopped the two assemblies becoming two again.
+    // ADR-0032 step 1 made `State` an alias of `RegistryState`, so the test
+    // would now compare a value with ITSELF: it cannot fail, and it cannot fail
+    // for the best possible reason — the duplication it guarded is gone by
+    // construction. Left in place it would read as coverage and be none, which
+    // is the exact failure class this suite has spent the week removing.
+    //
+    // What replaced it is the type system. If the two ever diverge again it
+    // will be because somebody reintroduced a second struct, and that is a
+    // change nobody makes by accident.
     #[test]
     fn state_roundtrips_through_disk() {
         let dir = TempDir::new("roundtrip");

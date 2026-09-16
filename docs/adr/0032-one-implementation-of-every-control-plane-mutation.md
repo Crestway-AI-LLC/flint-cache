@@ -120,8 +120,7 @@ own:
 
 1. **`RegistryState` becomes the single state type.** `State` keeps only
    loading: read the hand-written format, produce a `RegistryState`. Decide
-   `controllers` explicitly here. **STARTED 2026-09-16** — see "Step 1, in
-   progress" below; the shared renderer is collapsed, the type swap is not.
+   `controllers` explicitly here. **DONE 2026-09-16** — see "Step 1" below.
 2. **Persist `RegistryState` on the single-node path**, writing serde and
    reading either — one release of tolerant reading before the old writer goes.
    **The READING half landed 2026-09-16** — see "Step 2's reader, shipped
@@ -131,6 +130,8 @@ own:
    MEANS. The verb-parity guard already asserts the tables match.
 4. **Delete the duplicate `shuffle_shard`**, and let the fast mirror be derived
    at one place from the applied state rather than maintained beside it.
+   **First half done 2026-09-16** with step 1, because unifying the types made
+   it a re-export; the fast mirror is untouched.
 
 ## Consequences
 
@@ -148,7 +149,7 @@ This ADR does not change that trade, it concentrates it.
 part. It wants its own release and its own gate, with a tolerant reader shipped
 first — which is why it is step 1 and 2 rather than folded into the rest.
 
-## Step 1, in progress (2026-09-16)
+## Step 1, done (2026-09-16)
 
 Staged inside the step, because the type swap is 159 call sites in `main.rs`
 alone and the duplication it removes is worth removing before that lands rather
@@ -185,14 +186,52 @@ Both now fill one `tenant::SnapshotSource` and call one
   and clippy's `-D warnings` called it dead, correctly — its only caller was the
   assembly that moved.
 
-**Not done: the type swap.** `RegistryState` is not yet the single type.
-`Shared { state: Mutex<State> }` and 159 `st.`/`state.` sites in `main.rs` are
-the bulk, and `controllers` still lives only on `State`. The answer for
-`controllers` is already recorded in `state.rs`'s `absorb_registry` — absent
-from both durable formats, a live report from processes that may not be
-running, so a cold control plane knowing nothing is correct — and step 1 should
-move it onto `RegistryState` with `#[serde(skip)]`, beside `promoted`, which is
-the same category.
+**Done: the type swap.** There is now **one state struct in the crate**.
+`RegistryState` is it; `State` is `pub use crate::registry::RegistryState as
+State`, so the call sites that are about the single-node plane still read
+naturally while the type a mutation means something to is the same on both
+paths.
+
+It was far smaller than "159 sites" suggested, and the measurement is worth
+keeping because it is what made the change safe to attempt: of those, 41 are
+`state.lock()` on the mutex and untouched, ~80 are **field accesses whose names
+were already identical on both structs**, and only 32 were method calls — 27 of
+them `commit()`.
+
+- **`controllers` moved onto `RegistryState` with `#[serde(skip)]`, beside
+  `promoted`**, which is the question this step was told to decide explicitly.
+  Same category: a live report from processes that may not be running, never
+  Rafted, because committing a heartbeat would wake every watching proxy to say
+  a controller said hello.
+- **`path` moved with it**, also `#[serde(skip)]`, and that is the one piece
+  worth arguing. It keeps `commit()` a method on the one state type, so its 27
+  call sites did not each have to learn where the file lives. Under Raft it is
+  `None` by construction and `commit()` is a no-op, because durability there is
+  the log's job. The alternative — a free function taking the path — would have
+  been purer and would have made this a 27-site rewrite instead of a
+  re-declaration.
+- **`state.rs` keeps only the hand-written line format**: `load_or_new`,
+  `serialize`, `commit`. That is a property of the single-node *deployment*, not
+  of the state, and step 2 deletes it.
+- **`absorb_registry` is gone** — with one type there is nothing to convert.
+  The tolerant reader now parses straight into the state and restores the two
+  things serde cannot carry: `path`, whose absence would make `commit()` write
+  nowhere and still return `Ok`, and the `ranges` padding.
+- **The duplicate `shuffle_shard` went too** (step 4's first half). The two
+  copies were byte-identical but for one comment, and were reached by different
+  callers — `main.rs` used `state`'s, `ha.rs` used `registry`'s — so the two
+  planes placed tenants through two functions that merely happened to agree.
+  Clippy then named `fnv1a` dead, the private seed whose only caller was the
+  copy that went.
+
+**And `both_state_types_render_the_same_snapshot` was DELETED rather than
+carried forward green.** It compared the two renderers and was the guard that
+stopped them diverging again; with one type it would compare a value with
+itself. It cannot fail, and it cannot fail for the best possible reason — the
+duplication is gone by construction — but a test that reads as coverage and is
+none is the failure class this work exists to remove. The comment where it stood
+says so. What replaced it is the type system: two renderers again requires
+somebody to reintroduce a second struct, which nobody does by accident.
 
 ## Step 2's reader, shipped alone (2026-09-16)
 

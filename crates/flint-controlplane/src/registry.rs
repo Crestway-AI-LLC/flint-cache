@@ -207,6 +207,35 @@ pub struct RegistryState {
     /// not a durable fact (tenant::promote_hint explains why that is safe).
     #[serde(skip)]
     pub promoted: Option<(String, u64)>,
+    /// Build stamps the CONTROLLERS registered (ADR-0014 D1), keyed by the
+    /// identity they gave: `host:pid` -> (build, unix_ms of the report).
+    ///
+    /// ADR-0032 step 1 asked where this lives and the answer is here, beside
+    /// `promoted`, for the same reason: both are live reports from processes
+    /// that may not be running, and neither is registry state. NEVER RAFTED —
+    /// a heartbeat is observability, and committing one would wake every
+    /// watching proxy because a controller said hello.
+    ///
+    /// A MAP rather than one value because duplicate controllers are the
+    /// recorded failure — "a controller from a previous start survived two
+    /// upgrade cycles" — and one slot would have hidden the second by
+    /// overwriting it, reproducing the bug in the surface built to find it.
+    #[serde(skip)]
+    pub controllers: std::collections::BTreeMap<String, (String, u64)>,
+    /// Where the SINGLE-NODE control plane persists this state, and `None`
+    /// everywhere else.
+    ///
+    /// Carried on the state rather than beside it so that `commit()` is a
+    /// method on the one state type and its 27 call sites did not each have to
+    /// learn where the file lives during ADR-0032 step 1. Under Raft this is
+    /// `None` by construction — `#[serde(skip)]`, so no snapshot or log entry
+    /// carries it — and `commit()` is then a no-op, because durability there is
+    /// the Raft log's job and not this struct's.
+    ///
+    /// Step 2 replaces the FORMAT this writes; it does not change who owns the
+    /// path.
+    #[serde(skip)]
+    pub(crate) path: Option<std::path::PathBuf>,
 }
 
 /// FNV-1a seed for deterministic subset placement (not a security
@@ -462,6 +491,30 @@ impl RegistryState {
     /// delta-suppression to compare views correctly.
     pub fn families_spec(&self) -> String {
         crate::tenant::families_spec(&self.families)
+    }
+
+    /// The controller registry as a line for `FLINTINFO`.
+    pub fn controller_line(&self) -> String {
+        crate::state::render_controllers(&self.controllers)
+    }
+
+    /// Record `(ns, slot) -> pair_idx`, replacing any previous owner row.
+    pub fn set_exception(&mut self, ns: &str, slot: u16, pair: u16) {
+        let n = self.pairs.len();
+        crate::tenant::set_slot_owner(&mut self.exceptions, ns, slot, pair, &self.ranges, n);
+    }
+
+    /// Retire `(ns, slot)` from the table (splits an interior hit).
+    pub fn clear_exception(&mut self, ns: &str, slot: u16) -> bool {
+        crate::tenant::clear_slot_owner(&mut self.exceptions, ns, slot)
+    }
+
+    /// The consolidation sweep: merge adjacent runs, drop redundant ones.
+    /// Returns the row count after.
+    pub fn consolidate(&mut self) -> usize {
+        let n = self.pairs.len();
+        crate::tenant::normalize(&mut self.exceptions, &self.ranges, n);
+        self.exceptions.len()
     }
 
     /// The snapshot a given proxy should see: shared pair topology + ONLY
