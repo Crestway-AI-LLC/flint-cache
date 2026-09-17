@@ -64,7 +64,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use flint_resp::{Decoded, Value, decode, encode};
-use state::{State, Tenant, shuffle_shard};
+use state::{State, shuffle_shard};
 
 fn arg(name: &str) -> Option<String> {
     std::env::args().skip_while(|a| a != name).nth(1)
