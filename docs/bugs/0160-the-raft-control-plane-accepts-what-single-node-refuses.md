@@ -1,7 +1,7 @@
-# BUG-0160: the Raft control plane accepts eleven verbs the single-node plane refuses, and only the refusals are drilled (OPEN)
+# BUG-0160: the Raft control plane accepts eleven verbs the single-node plane refuses, and only the refusals are drilled (FIXED 2026-09-17)
 
-Status: **OPEN**, found 2026-09-17 while converting the single-node dispatch for
-ADR-0032 step 3 · Severity: **medium** — nothing is corrupted and nothing is
+Status: **FIXED 2026-09-17**, found the same day while converting the
+single-node dispatch for ADR-0032 step 3 · Severity: **medium** — nothing is corrupted and nothing is
 lost, because every one of these commits is a no-op; the cost is that the
 production topology tells an operator **OK** for a typo, and the drill suite
 asserts a refusal only the drill topology implements.
@@ -101,29 +101,58 @@ Recorded so the fix can decide each one rather than find them again:
   `no such tenant` on single-node, and the reverse on Raft. That matters only
   when both are true, and then the error names a different fault.
 
-## The fix, and what it cannot promise
+## The fix
 
-Name each refusal once, the way step 3 did for slot coverage: `covers_slot` is
-asked by `CPCLEARSLOT` in `main.rs`, and `ha.rs` should ask the same function
-before proposing. Then add the same checks for tenants, proxies and pair indexes.
+**`Ha::leader_view()`** returns the registry as the LEADER has applied it, or the
+redirect to send instead. Every refusal in `ha.rs` asks it. A refusal claims that
+something does not exist, and a follower that has not applied the entry creating
+it makes that claim wrongly — telling an operator the tenant they added a moment
+ago is not there, which is worse than the no-op this bug is about. A follower
+redirects at `propose` anyway, so this costs it only the order of its two
+answers, and `propose` returning after the entry is APPLIED is what makes the
+leader's copy current for the caller's next command.
 
-**Ask the LEADER's registry, not whichever seat answered.** `ha.store.registry()`
-on a follower can be behind, and a refusal is a claim that something does not
-exist, so a lagging follower would refuse a tenant added a moment ago. That is
-worse than the no-op this bug is about. A follower redirects at `propose`
-anyway, so reading at the leader costs it nothing but the order of its answers.
-The arms that already refuse (`CPDELTENANT`, `CPROTATETOKEN`, `CPADDTENANT` and
-others) read the local copy today and have the same exposure.
+The eleven arms now refuse with single-node's own messages. `CPCLEARSLOT` asks
+`tenant::covers_slot`, the same function the single-node arm asks, so the two
+planes cannot come to disagree about what "covered" means.
 
-**On Raft the refusal is best-effort, and it should say so.** Read-then-propose
-has a window. A `CPDELTENANT` committed between the registry read and the
-proposal still produces a no-op commit and an `OK`. That is what happens today
-for every request, so the fix narrows the window from always to a race, and it
-does not close it. An atomic refusal would need the state machine to answer the
-proposal, and the log entry would then mean different things depending on what
-it found, which is the property step 3 exists to keep.
+**The eight arms that already refused** — `CPADDTENANT`, `CPDELTENANT`,
+`CPROTATETOKEN`, `CPSETSLOT`, `CPFENCE`, `CPMYROTATE`, `CPMYCONFIG`,
+`CPADMINROTATE` — read whichever seat answered and had exactly that exposure.
+They read the leader now too.
 
-**The test that should hold it** drives both dispatchers with the same unknown
-names and compares the replies. A textual check cannot see a missing `if`, as
-the parity guard's own comment says. The cheap form is `ctl_error_drill.sh` run
-a second time against a three-seat control plane.
+**It is best-effort, and stays so.** Read-then-propose narrows the window from
+always to a race: a `CPDELTENANT` committed between the read and the proposal
+still lands a no-op with an `OK`. An atomic refusal would need the state machine
+to answer the proposal, and then one log entry would mean different things
+depending on what it found — the property ADR-0032 step 3 exists to keep.
+
+**Left alone, decided rather than missed.** `CPADDPROXY`, `CPADDPAIR` and
+`CPADMINDROPPREV` still propose no-ops for something already registered: the
+version bump is suppressed by every watch loop, and skipping it would be the
+same read-then-propose race for nothing an operator can see. The `CPFENCE` and
+`CPPROMOTED` reply texts still differ between the planes, and nothing reads
+them. `CPROTATETOKEN`'s two checks stay in opposite orders, which matters only
+when both are true.
+
+## How it was verified
+
+`tools/ctl_cpha_drill.sh` gained the eleven assertions plus a control, and was
+run against a three-seat control plane:
+
+- **Before: 11 of 11 refusals missing** (the output above).
+- **After: 11 of 11 refused**, and the control passes — `tenant-quota`,
+  `CPTENANTOVERQUOTA`, `CPDROPPREV` and `CPSETSUBSET` still succeed for `acme`.
+  The rest of the drill still passes, including the leader kill and the mutation
+  that lands on the new leader, which is what would break if the leader read
+  were wrong.
+- **Two mutations kill it.** Deleting the `CPSETPAIR` guard reddens exactly that
+  line (`answered 'OK version 5'`) with the other ten still refusing. Making
+  `CPTENANTQUOTA`'s guard refuse every tenant leaves all eleven refusals passing
+  and is caught by the control instead — which is the check that the control is
+  not decorative.
+
+**The metering agent tolerates the new error**: `world::call` for
+`CPTENANTOVERQUOTA` (and `CPDROPPREV` in rotation) matches `Ok(Value::Simple(_))`
+and otherwise logs `[CP REJECTED]` and carries on, which is what it already did
+against a single-node plane.

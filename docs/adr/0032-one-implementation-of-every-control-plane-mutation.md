@@ -371,7 +371,9 @@ makes. `CPTENANTQUOTA`, `CPSETSUBSET`, `CPDELPROXY` and eight more propose
 unconditionally, commit a no-op, and reply `OK` for a name that does not exist.
 The one drill asserting those refusals runs one control-plane seat. Filed as
 **BUG-0160** rather than fixed here, because it is a change to what the
-production control plane answers and deserves its own gate.
+production control plane answers and deserves its own gate — and fixed there
+the same day, with the refusals reading the leader's registry rather than
+whichever seat answered.
 
 ## The question this ADR asked, and its answer
 

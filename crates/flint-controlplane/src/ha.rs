@@ -393,6 +393,29 @@ impl Ha {
             }
         }
     }
+
+    /// The registry as the LEADER has applied it, or where the leader is.
+    ///
+    /// FOR REFUSALS (BUG-0160). A refusal claims that something does not exist,
+    /// and a follower that has not yet applied the entry creating it makes that
+    /// claim wrongly: the operator is told the tenant they added a moment ago is
+    /// not there, which is worse than the no-op commit a missing refusal costs.
+    /// A follower redirects at `propose` anyway, so asking here changes only the
+    /// order of its two answers. `propose` returning after the entry is APPLIED
+    /// is what makes the leader's copy current for a caller's next command.
+    ///
+    /// WHAT IT CANNOT PROMISE: this is read-then-propose. A deletion committed
+    /// between the read and the proposal still lands the proposal as a no-op
+    /// with an OK. Closing that would need the state machine to answer the
+    /// proposal, and then one log entry would mean different things depending
+    /// on what it found -- the property ADR-0032 step 3 keeps.
+    pub async fn leader_view(&self) -> Result<crate::registry::RegistryState, Option<String>> {
+        let leader = self.raft.current_leader().await;
+        if leader != Some(self.node_id) {
+            return Err(leader.and_then(|id| self.client_addrs.get(&id).cloned()));
+        }
+        Ok(self.store.registry().await)
+    }
 }
 
 // --- Client-facing RESP server (admin + reads + CPWATCH) in raft mode ---
@@ -582,6 +605,11 @@ async fn handle_admin(ha: &Ha, args: &[Vec<u8>]) -> Value {
             let Some(addr) = text(1) else {
                 return Value::Error("ERR CPDELPROXY <addr>".into());
             };
+            match ha.leader_view().await {
+                Ok(reg) if reg.proxies.iter().any(|p| p == &addr) => {}
+                Ok(_) => return Value::Error(format!("ERR no such proxy {addr}")),
+                Err(l) => return redirect(l),
+            }
             match ha.propose(Mutation::DelProxy(addr.clone())).await {
                 Ok(_) => Value::Simple(format!("OK retired {addr}")),
                 Err(l) => redirect(l),
@@ -619,8 +647,12 @@ async fn handle_admin(ha: &Ha, args: &[Vec<u8>]) -> Value {
             // ADR-0006 D1: hash BEFORE proposing — the Raft log, snapshots,
             // and every follower store only the digest.
             let token = flint_tls::sha256_hex(token.as_bytes());
-            // Compute the subset from the current fleet (deterministic).
-            let reg = ha.store.registry().await;
+            // Compute the subset from the current fleet (deterministic), and
+            // refuse from the leader's copy, not a lagging follower's.
+            let reg = match ha.leader_view().await {
+                Ok(reg) => reg,
+                Err(l) => return redirect(l),
+            };
             if reg.tenants.contains_key(&name) {
                 return Value::Error("ERR tenant exists".into());
             }
@@ -646,7 +678,10 @@ async fn handle_admin(ha: &Ha, args: &[Vec<u8>]) -> Value {
             let Some(name) = text(1) else {
                 return Value::Error("ERR CPDELTENANT <name>".into());
             };
-            let reg = ha.store.registry().await;
+            let reg = match ha.leader_view().await {
+                Ok(reg) => reg,
+                Err(l) => return redirect(l),
+            };
             let Some(t) = reg.tenants.get(&name) else {
                 return Value::Error("ERR no such tenant".into());
             };
@@ -660,11 +695,18 @@ async fn handle_admin(ha: &Ha, args: &[Vec<u8>]) -> Value {
             let (Some(name), Some(subset)) = (text(1), text(2)) else {
                 return Value::Error("ERR CPSETSUBSET <name> <p1,p2|*|->".into());
             };
+            let reg = match ha.leader_view().await {
+                Ok(reg) => reg,
+                Err(l) => return redirect(l),
+            };
+            if !reg.tenants.contains_key(&name) {
+                return Value::Error("ERR no such tenant".into());
+            }
             // `*` = every registered proxy, `-` = NONE (drain). `-` reads
             // like "all" and means the opposite; see CPSETSUBSET's docs.
             let subset: Vec<String> = match subset.as_str() {
                 "-" => Vec::new(),
-                "*" => ha.store.registry().await.proxies.clone(),
+                "*" => reg.proxies.clone(),
                 list => list.split(',').map(String::from).collect(),
             };
             let placed = subset.len();
@@ -685,7 +727,10 @@ async fn handle_admin(ha: &Ha, args: &[Vec<u8>]) -> Value {
                 return Value::Error("ERR invalid token".into());
             }
             let new = flint_tls::sha256_hex(new.as_bytes());
-            let reg = ha.store.registry().await;
+            let reg = match ha.leader_view().await {
+                Ok(reg) => reg,
+                Err(l) => return redirect(l),
+            };
             if !reg.tenants.contains_key(&name) {
                 return Value::Error("ERR no such tenant".into());
             }
@@ -705,6 +750,11 @@ async fn handle_admin(ha: &Ha, args: &[Vec<u8>]) -> Value {
             let Some(name) = text(1) else {
                 return Value::Error("ERR CPDROPPREV <name>".into());
             };
+            match ha.leader_view().await {
+                Ok(reg) if reg.tenants.contains_key(&name) => {}
+                Ok(_) => return Value::Error("ERR no such tenant".into()),
+                Err(l) => return redirect(l),
+            }
             match ha.propose(Mutation::DropPrev { name }).await {
                 Ok(_) => Value::Simple("OK".into()),
                 Err(l) => redirect(l),
@@ -772,7 +822,10 @@ async fn handle_admin(ha: &Ha, args: &[Vec<u8>]) -> Value {
             let Some(addr) = text(1) else {
                 return Value::Error(ERR_CPFENCE_ARITY.into());
             };
-            let reg = ha.store.registry().await;
+            let reg = match ha.leader_view().await {
+                Ok(reg) => reg,
+                Err(l) => return redirect(l),
+            };
             let member = reg.pairs.iter().any(|p| p.contains(&addr));
             drop(reg);
             if !member {
@@ -806,6 +859,11 @@ async fn handle_admin(ha: &Ha, args: &[Vec<u8>]) -> Value {
                 "off" => false,
                 _ => return Value::Error("ERR CPTENANTREADS <name> <on|off>".into()),
             };
+            match ha.leader_view().await {
+                Ok(reg) if reg.tenants.contains_key(&name) => {}
+                Ok(_) => return Value::Error("ERR no such tenant".into()),
+                Err(l) => return redirect(l),
+            }
             match ha.propose(Mutation::SetReplicaReads { name, on }).await {
                 Ok(_) => Value::Simple("OK".into()),
                 Err(l) => redirect(l),
@@ -823,7 +881,10 @@ async fn handle_admin(ha: &Ha, args: &[Vec<u8>]) -> Value {
                 return Value::Error("ERR slot out of range".into());
             }
             let pair: Option<u16> = {
-                let reg = ha.store.registry().await;
+                let reg = match ha.leader_view().await {
+                    Ok(reg) => reg,
+                    Err(l) => return redirect(l),
+                };
                 owner
                     .parse::<u16>()
                     .ok()
@@ -850,6 +911,12 @@ async fn handle_admin(ha: &Ha, args: &[Vec<u8>]) -> Value {
             else {
                 return Value::Error("ERR CPCLEARSLOT <ns> <slot>".into());
             };
+            // The question single-node asks, through the same function.
+            match ha.leader_view().await {
+                Ok(reg) if crate::tenant::covers_slot(&reg.exceptions, &ns, slot) => {}
+                Ok(_) => return Value::Error("ERR no such exception".into()),
+                Err(l) => return redirect(l),
+            }
             match ha.propose(Mutation::ClearSlotOwner { ns, slot }).await {
                 Ok(_) => Value::Simple("OK".into()),
                 Err(l) => redirect(l),
@@ -882,6 +949,11 @@ async fn handle_admin(ha: &Ha, args: &[Vec<u8>]) -> Value {
                 "off" => false,
                 _ => return Value::Error("ERR CPTENANTASYNC <name> <on|off>".into()),
             };
+            match ha.leader_view().await {
+                Ok(reg) if reg.tenants.contains_key(&name) => {}
+                Ok(_) => return Value::Error("ERR no such tenant".into()),
+                Err(l) => return redirect(l),
+            }
             match ha.propose(Mutation::SetAsyncWrites { name, on }).await {
                 Ok(_) => Value::Simple("OK".into()),
                 Err(l) => redirect(l),
@@ -896,6 +968,11 @@ async fn handle_admin(ha: &Ha, args: &[Vec<u8>]) -> Value {
                 "off" => false,
                 _ => return Value::Error("ERR CPTENANTFEDERATE <name> <on|off>".into()),
             };
+            match ha.leader_view().await {
+                Ok(reg) if reg.tenants.contains_key(&name) => {}
+                Ok(_) => return Value::Error("ERR no such tenant".into()),
+                Err(l) => return redirect(l),
+            }
             match ha.propose(Mutation::SetFederated { name, on }).await {
                 Ok(_) => Value::Simple("OK".into()),
                 Err(l) => redirect(l),
@@ -910,6 +987,11 @@ async fn handle_admin(ha: &Ha, args: &[Vec<u8>]) -> Value {
                 "off" => false,
                 _ => return Value::Error("ERR CPTENANTCACHE <name> <on|off>".into()),
             };
+            match ha.leader_view().await {
+                Ok(reg) if reg.tenants.contains_key(&name) => {}
+                Ok(_) => return Value::Error("ERR no such tenant".into()),
+                Err(l) => return redirect(l),
+            }
             match ha.propose(Mutation::SetLocalCache { name, on }).await {
                 Ok(_) => Value::Simple("OK".into()),
                 Err(l) => redirect(l),
@@ -923,6 +1005,11 @@ async fn handle_admin(ha: &Ha, args: &[Vec<u8>]) -> Value {
             ) else {
                 return Value::Error("ERR CPTENANTQUOTA <name> <ops_per_sec> <max_bytes>".into());
             };
+            match ha.leader_view().await {
+                Ok(reg) if reg.tenants.contains_key(&name) => {}
+                Ok(_) => return Value::Error("ERR no such tenant".into()),
+                Err(l) => return redirect(l),
+            }
             match ha
                 .propose(Mutation::SetQuota {
                     name,
@@ -944,6 +1031,11 @@ async fn handle_admin(ha: &Ha, args: &[Vec<u8>]) -> Value {
                 "off" => false,
                 _ => return Value::Error("ERR CPTENANTOVERQUOTA <name> <on|off>".into()),
             };
+            match ha.leader_view().await {
+                Ok(reg) if reg.tenants.contains_key(&name) => {}
+                Ok(_) => return Value::Error("ERR no such tenant".into()),
+                Err(l) => return redirect(l),
+            }
             match ha.propose(Mutation::SetOverQuota { name, on }).await {
                 Ok(_) => Value::Simple("OK".into()),
                 Err(l) => redirect(l),
@@ -1012,6 +1104,11 @@ async fn handle_admin(ha: &Ha, args: &[Vec<u8>]) -> Value {
             // because a later CPADDPAIR of the same members would not match it
             // and would register a duplicate. Sorted in the HANDLER so apply()
             // replays already-committed entries unchanged.
+            match ha.leader_view().await {
+                Ok(reg) if idx < reg.pairs.len() => {}
+                Ok(_) => return Value::Error("ERR no such pair index".into()),
+                Err(l) => return redirect(l),
+            }
             let mut nodes: Vec<String> = nodes.split(',').map(String::from).collect();
             nodes.sort();
             match ha.propose(Mutation::SetPair { idx, nodes }).await {
@@ -1102,7 +1199,10 @@ async fn handle_admin(ha: &Ha, args: &[Vec<u8>]) -> Value {
             };
             let digest = flint_tls::sha256_hex(token.as_bytes());
             let name = {
-                let reg = ha.store.registry().await;
+                let reg = match ha.leader_view().await {
+                    Ok(reg) => reg,
+                    Err(l) => return redirect(l),
+                };
                 let Some(t) = reg.tenants.values().find(|t| t.token == digest) else {
                     return Value::Error(
                         "WRONGPASS invalid token (rotation needs the CURRENT token)".into(),
@@ -1150,7 +1250,10 @@ async fn handle_admin(ha: &Ha, args: &[Vec<u8>]) -> Value {
             };
             let name =
                 {
-                    let reg = ha.store.registry().await;
+                    let reg = match ha.leader_view().await {
+                        Ok(reg) => reg,
+                        Err(l) => return redirect(l),
+                    };
                     match reg.tenants.values().find(|t| {
                         t.token == token || t.prev_token.as_deref() == Some(token.as_str())
                     }) {
@@ -1207,7 +1310,10 @@ async fn handle_admin(ha: &Ha, args: &[Vec<u8>]) -> Value {
             }
         }
         b"CPADMINROTATE" => {
-            let reg = ha.store.registry().await;
+            let reg = match ha.leader_view().await {
+                Ok(reg) => reg,
+                Err(l) => return redirect(l),
+            };
             if reg.admin_prev.is_some() {
                 return Value::Error(
                     "ERR admin rotation in progress; previous token not yet retired".into(),
