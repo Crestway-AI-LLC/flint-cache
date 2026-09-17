@@ -78,6 +78,45 @@ kill -0 "$PID" 2>/dev/null && fail "pid $PID still alive after host-stop-seat"
   the refusal above proves nothing about the port and everything about the check"
 echo "   seat stopped, and the SAME check now passes on the SAME port"
 
+echo "== host-spawn --escaped: the re-run's marker is read, and never reaches the seat"
+# BUG-0161. A host-spawn inside a login session re-runs itself under systemd
+# with `--escaped` after the four positionals, so the re-run cannot re-run
+# again. The unit tests cover where the marker is inserted and every branch of
+# the decision; only a real spawn exercises the parser loop that must consume
+# it. Two ways that loop could be wrong, and each has its own assertion here.
+"$CTL" host-spawn "$S" "$BINS" node-e flint-server --escaped \
+  -- --port "$PORT" --engine rocks --data-dir "$S/node-e" >/dev/null 2>"$S/escaped.err" \
+  || fail "host-spawn --escaped exited non-zero: $(cat "$S/escaped.err")"
+EPID=$(cat "$S/pids/node-e.pid" 2>/dev/null) || fail "host-spawn --escaped wrote no pidfile"
+fleet_wait_listen "$PORT"
+# (1) Consumed, not forwarded. Placed after `--`, it would reach flint-server.
+case " $(ps -o args= -p "$EPID") " in
+  *" --escaped "*) fail "the seat's own argv carries --escaped: host-spawn passed its marker on to flint-server" ;;
+esac
+# (2) Actually parsed. Unprivileged inside a user slice, the two runs warn
+# DIFFERENTLY: a first run names the missing privilege, a re-run says it will
+# not re-run. Only a parsed marker produces the second, so the text is the
+# evidence. Anywhere else there is no warning to read, and that is shown.
+# `|| true` because this drill runs under `set -euo pipefail`: with no
+# /proc (macOS) or no v2 line, grep's non-zero status would be the
+# assignment's, and set -e would end the drill on a question it only asks.
+CG=$(grep -m1 '^0::' /proc/self/cgroup 2>/dev/null | cut -d: -f3- || true)
+case "$CG" in
+  /user.slice*)
+    if [ "$(id -u)" != 0 ]; then
+      grep -q "even after re-running under systemd" "$S/escaped.err" \
+        || fail "in $CG as uid $(id -u), --escaped did not produce the re-run's
+  warning, so the parser did not read it. It said: $(cat "$S/escaped.err")"
+      echo "   marker parsed (the re-run's warning, in $CG) and absent from the seat's argv"
+    else
+      echo "   marker absent from the seat's argv; parse not provable here: running as root in $CG"
+    fi ;;
+  *) echo "   marker absent from the seat's argv; parse not provable here: cgroup is '${CG:-none}', not a user slice" ;;
+esac
+"$CTL" host-stop-seat "$S" node-e flint-server "--port $PORT" "$PORT" >/dev/null \
+  || fail "host-stop-seat node-e exited non-zero"
+"$CTL" host-port-free "$PORT" 5000 >/dev/null 2>&1 || fail "$PORT still busy after node-e stopped"
+
 echo "== host-mark-reseed / host-wipe-node: the guards, not the happy path"
 # NAMED, not "some file appeared". The first draft globbed the directory and
 # matched `OPTIONS-000007`, a RocksDB file the spawned seat had already left

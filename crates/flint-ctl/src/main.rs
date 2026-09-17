@@ -1849,6 +1849,12 @@ fn spawn_env(
             err.trim()
         );
         eprintln!("  started {name} on {} ({})", r.label(), text.trim());
+        // What the host said on its way to succeeding. This was printed there
+        // and dropped here, so a seat lock taken UNLOCKED (BUG-0144) and a seat
+        // left to die with a login session (BUG-0161) both reached nobody.
+        for line in err.lines().filter(|l| !l.trim().is_empty()) {
+            eprintln!("    [{}] {}", r.label(), line.trim());
+        }
         return;
     }
     local_spawn_env(&inv.statedir, &inv.bins, name, bin, args, envs);
@@ -8054,6 +8060,168 @@ fn stop(inv: &Inventory) {
     }
 }
 
+/// What `host-spawn` should do about the login session it may be running in
+/// (BUG-0161).
+///
+/// A seat inherits the cgroup of whatever spawned it. The remote runner reaches
+/// a host over ssh and runs `sudo -n flintctl host-spawn`, so the seat lands in
+/// `user.slice/user-<uid>.slice/session-<n>.scope`: a login that ends with the
+/// ssh command, and one `loginctl terminate-session` (or a host configured with
+/// `KillUserProcesses=yes`) away from killing the seat. On 2026-09-17 the ops
+/// agent repaired the playground's replica exactly this way and left it in
+/// `session-8534.scope`, already `closing`.
+///
+/// `ctl.sh` solved this on 2026-08-09 for an operator running flintctl by hand,
+/// by handing the whole command to systemd. The remote path does not go through
+/// `ctl.sh`, so that fix reached the call site that prompted it and not the one
+/// the agent uses. It lives here, on the target, because every remote spawn
+/// passes through `host-spawn` whoever called it.
+#[derive(Debug, PartialEq)]
+enum SessionEscape {
+    /// Spawn in place: not inside a login session, not a cgroup host at all,
+    /// or not inside one any more.
+    Spawn,
+    /// Re-run this `host-spawn` under a transient systemd unit.
+    ReExec,
+    /// Inside a login session and unable to leave it. Spawn anyway, and say
+    /// where the seat will live and why it could not be moved.
+    Warn(String),
+}
+
+/// This process's cgroup path, from the text of `/proc/self/cgroup`. cgroup v2
+/// has one `0::<path>` line; a v1 or hybrid host lists a line per controller,
+/// and systemd's own hierarchy is the `name=systemd` one.
+fn own_cgroup(text: &str) -> Option<&str> {
+    let mut v1 = None;
+    for line in text.lines() {
+        let mut parts = line.splitn(3, ':');
+        let (Some(id), Some(ctl), Some(path)) = (parts.next(), parts.next(), parts.next()) else {
+            continue;
+        };
+        if id == "0" && ctl.is_empty() {
+            return Some(path);
+        }
+        if ctl == "name=systemd" {
+            v1 = Some(path);
+        }
+    }
+    v1
+}
+
+/// The EFFECTIVE uid: the second field of `/proc/self/status`'s `Uid:` line
+/// (real, effective, saved, filesystem). Under `sudo -n` the real uid is the
+/// ssh user's and the effective one is 0, so reading the first field would
+/// call every remote spawn unprivileged. Read rather than asked for, because
+/// this crate has no libc binding and the question only arises on Linux.
+fn effective_uid(status: &str) -> Option<u32> {
+    status
+        .lines()
+        .find_map(|l| l.strip_prefix("Uid:"))
+        .and_then(|rest| rest.split_whitespace().nth(1))
+        .and_then(|uid| uid.parse().ok())
+}
+
+fn on_path(bin: &str) -> bool {
+    std::env::var_os("PATH")
+        .is_some_and(|p| std::env::split_paths(&p).any(|d| d.join(bin).is_file()))
+}
+
+/// The decision, with no I/O in it, so every branch can be tested on any
+/// machine. `cgroup` is the text of `/proc/self/cgroup`, absent where there is
+/// none; `escaped` is true for the run that `host_spawn_under_systemd` started.
+fn session_escape(
+    cgroup: Option<&str>,
+    euid: Option<u32>,
+    systemd_booted: bool,
+    systemd_run_on_path: bool,
+    escaped: bool,
+) -> SessionEscape {
+    let Some(path) = cgroup.and_then(own_cgroup) else {
+        return SessionEscape::Spawn;
+    };
+    if !path.starts_with("/user.slice") {
+        return SessionEscape::Spawn;
+    }
+    if escaped {
+        // Re-run under systemd and STILL in a user slice. Spawning is the lesser
+        // harm: re-running again would recurse, each level holding a transient
+        // unit open under --wait.
+        return SessionEscape::Warn(format!(
+            "{path}, even after re-running under systemd; not re-running again"
+        ));
+    }
+    let why = if euid != Some(0) {
+        "not root, and only root can hand a unit to the system manager (inventory: `ssh-sudo on`)"
+    } else if !systemd_booted {
+        "systemd is not running on this host"
+    } else if !systemd_run_on_path {
+        "no systemd-run on PATH"
+    } else {
+        return SessionEscape::ReExec;
+    };
+    SessionEscape::Warn(format!("{path}: {why}"))
+}
+
+/// `host-spawn`'s own arguments with `--escaped` inserted after the four
+/// positionals, which is where its parser reads flags.
+fn escaped_argv(a: &[String]) -> Vec<String> {
+    let cut = a.len().min(4);
+    let mut argv = a[..cut].to_vec();
+    argv.push("--escaped".into());
+    argv.extend(a[cut..].iter().cloned());
+    argv
+}
+
+/// Run this `host-spawn` again under systemd, and exit with its status.
+///
+/// The flags are `ctl.sh`'s. Every roll of the playground has used them since
+/// 2026-08-09, and on the rc.73 roll they put all six seats under
+/// `system.slice`. `Type=oneshot` makes the unit complete when flintctl
+/// returns. `KillMode=process` makes completing it leave alone the seat it just
+/// started; without it, systemd kills the seat, which is the failure that cost
+/// a day on 2026-08-06. `--wait --pipe` hands the orchestrator the stdout and
+/// exit status it would otherwise have had, and `--quiet` keeps systemd-run's
+/// own status lines out of them.
+///
+/// `--escaped` marks the re-run so it cannot re-run again. It is an argument
+/// and not an environment variable because the seat inherits this process's
+/// environment. An older flintctl on the target skips it, as its parser
+/// already skips any flag it does not know before `--`.
+fn host_spawn_under_systemd(name: &str, a: &[String]) -> ! {
+    let me = std::env::current_exe().unwrap_or_else(|e| {
+        die(&format!(
+            "host-spawn: cannot find my own binary to re-run under systemd: {e}"
+        ))
+    });
+    let tag: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || "-_.".contains(c) {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let status = Command::new("systemd-run")
+        .arg(format!("--unit=flint-spawn-{tag}-{}", std::process::id()))
+        .arg(format!("--description=flintctl host-spawn {name}"))
+        .args([
+            "--property=Type=oneshot",
+            "--property=KillMode=process",
+            "--collect",
+            "--wait",
+            "--pipe",
+            "--quiet",
+        ])
+        .arg(me)
+        .arg("host-spawn")
+        .args(escaped_argv(a))
+        .status()
+        .unwrap_or_else(|e| die(&format!("host-spawn: systemd-run did not start: {e}")));
+    std::process::exit(status.code().unwrap_or(1))
+}
+
 /// The per-host half of the remote runner.
 ///
 /// These run ON the machine they are about, invoked over ssh by an
@@ -8083,9 +8251,14 @@ fn host_command(cmd: &str, a: &[String]) -> ! {
             );
             let mut envs = Vec::new();
             let mut args = Vec::new();
+            let mut escaped = false;
             let mut i = 4;
             while i < a.len() {
                 match a[i].as_str() {
+                    "--escaped" => {
+                        escaped = true;
+                        i += 1;
+                    }
                     "--env" => {
                         if let Some((k, v)) = a.get(i + 1).and_then(|kv| kv.split_once('=')) {
                             envs.push((k.to_string(), v.to_string()));
@@ -8097,6 +8270,21 @@ fn host_command(cmd: &str, a: &[String]) -> ! {
                         break;
                     }
                     _ => i += 1,
+                }
+            }
+            let cgroup = std::fs::read_to_string("/proc/self/cgroup").ok();
+            let status = std::fs::read_to_string("/proc/self/status").ok();
+            match session_escape(
+                cgroup.as_deref(),
+                status.as_deref().and_then(effective_uid),
+                std::path::Path::new("/run/systemd/system").is_dir(),
+                on_path("systemd-run"),
+                escaped,
+            ) {
+                SessionEscape::Spawn => {}
+                SessionEscape::ReExec => host_spawn_under_systemd(&name, a),
+                SessionEscape::Warn(why) => {
+                    eprintln!("  [{name}] WILL DIE WITH ITS LOGIN SESSION: {why} (BUG-0161)")
                 }
             }
             for sub in ["logs", "pids", "snaps"] {
@@ -10338,5 +10526,156 @@ mod bug_0142_rebalance_inventory_tests {
         let a = controller_args(&inv_with(Some(0.2), true));
         assert!(a.iter().any(|x| x == "--rebalance-deadband"), "{a:?}");
         assert!(a.iter().any(|x| x == "--rebalance-execute"), "{a:?}");
+    }
+}
+
+#[cfg(test)]
+mod session_escape_tests {
+    use super::*;
+
+    // Verbatim from the playground on 2026-09-17: the replica the ops agent
+    // repaired, and the same seat after `ctl.sh restart-node` moved it.
+    const IN_A_SESSION: &str = "0::/user.slice/user-1000.slice/session-8534.scope\n";
+    const UNDER_SYSTEMD: &str = "0::/system.slice/flint-ctl-3323467.service\n";
+    const V1_IN_A_SESSION: &str = "12:pids:/user.slice/user-1000.slice/session-3.scope\n\
+                                   1:name=systemd:/user.slice/user-1000.slice/session-3.scope\n";
+
+    fn warning(e: SessionEscape) -> String {
+        match e {
+            SessionEscape::Warn(w) => w,
+            other => panic!("expected a warning, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_playground_case_re_runs_under_systemd() {
+        assert_eq!(
+            session_escape(Some(IN_A_SESSION), Some(0), true, true, false),
+            SessionEscape::ReExec
+        );
+    }
+
+    #[test]
+    fn a_seat_already_under_systemd_spawns_in_place() {
+        // What makes the re-run terminate: systemd-run puts it here.
+        assert_eq!(
+            session_escape(Some(UNDER_SYSTEMD), Some(0), true, true, true),
+            SessionEscape::Spawn
+        );
+        assert_eq!(
+            session_escape(Some(UNDER_SYSTEMD), Some(0), true, true, false),
+            SessionEscape::Spawn
+        );
+    }
+
+    #[test]
+    fn a_host_with_no_cgroups_spawns_in_place() {
+        assert_eq!(
+            session_escape(None, None, false, false, false),
+            SessionEscape::Spawn
+        );
+    }
+
+    #[test]
+    fn unprivileged_in_a_session_warns_names_the_scope_and_the_remedy() {
+        let w = warning(session_escape(
+            Some(IN_A_SESSION),
+            Some(1000),
+            true,
+            true,
+            false,
+        ));
+        assert!(w.contains("session-8534.scope"), "{w}");
+        assert!(w.contains("ssh-sudo on"), "{w}");
+    }
+
+    #[test]
+    fn each_missing_precondition_is_named_rather_than_failing_the_spawn() {
+        let w = warning(session_escape(
+            Some(IN_A_SESSION),
+            Some(0),
+            false,
+            true,
+            false,
+        ));
+        assert!(w.contains("systemd is not running"), "{w}");
+        let w = warning(session_escape(
+            Some(IN_A_SESSION),
+            Some(0),
+            true,
+            false,
+            false,
+        ));
+        assert!(w.contains("no systemd-run"), "{w}");
+    }
+
+    #[test]
+    fn a_re_run_still_in_a_session_warns_instead_of_recursing() {
+        let w = warning(session_escape(
+            Some(IN_A_SESSION),
+            Some(0),
+            true,
+            true,
+            true,
+        ));
+        assert!(w.contains("not re-running again"), "{w}");
+    }
+
+    #[test]
+    fn a_v1_host_is_read_from_the_systemd_hierarchy_not_a_controller() {
+        assert_eq!(
+            own_cgroup(V1_IN_A_SESSION),
+            Some("/user.slice/user-1000.slice/session-3.scope")
+        );
+        assert_eq!(
+            session_escape(Some(V1_IN_A_SESSION), Some(0), true, true, false),
+            SessionEscape::ReExec
+        );
+    }
+
+    #[test]
+    fn a_malformed_cgroup_line_is_skipped_not_fatal() {
+        assert_eq!(
+            own_cgroup("garbage\n0::/user.slice/x.scope\n"),
+            Some("/user.slice/x.scope")
+        );
+    }
+
+    #[test]
+    fn under_sudo_the_effective_uid_is_root_though_the_real_one_is_not() {
+        // `sudo -n` from ec2-user: real 1000, effective 0. Reading the first
+        // field would call every remote spawn unprivileged and never escape.
+        assert_eq!(
+            effective_uid("Name:\tflintctl\nUid:\t1000\t0\t0\t0\n"),
+            Some(0)
+        );
+        assert_eq!(effective_uid("Uid:\t0\t1000\t1000\t1000\n"), Some(1000));
+        assert_eq!(effective_uid("Name:\tflintctl\n"), None);
+    }
+
+    #[test]
+    fn the_re_run_marks_itself_where_the_parser_reads_flags() {
+        let a: Vec<String> = [
+            "/s",
+            "/b",
+            "node-7001",
+            "flint-server",
+            "--env",
+            "K=V",
+            "--",
+            "--port",
+            "7001",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let v = escaped_argv(&a);
+        assert_eq!(
+            v[..5],
+            ["/s", "/b", "node-7001", "flint-server", "--escaped"]
+        );
+        assert_eq!(v[5..], a[4..]);
+        // A seat argument after `--` must never be taken for the marker.
+        assert_eq!(v.iter().filter(|x| *x == "--escaped").count(), 1);
     }
 }
