@@ -56,13 +56,32 @@ This is ADR-0032's premise one layer up. Production control planes are three
 nodes, the drills run one, and so the drill suite certifies a behaviour the
 shipped control plane does not have.
 
-## Confirmed in the code, not yet reproduced live
+## Reproduced live, all eleven
 
-Read in both dispatchers on 2026-09-17: the eleven Raft arms above go straight
-from argument parsing to `ha.propose`. **Not yet reproduced against a running
-three-node plane.** The reproduction is the assertions at `ctl_error_drill.sh`
-lines 90-92, run against an inventory with three `cp` lines. All three should
-fail.
+Against a three-seat control plane built from this commit's control plane
+(release, `rocks`; the only other change in that tree was the drill), the
+refusal assertions this bug's fix adds to `ctl_cpha_drill.sh` were run once with
+each failure counted instead of ending the run:
+
+```
+FAIL: flintctl tenant-reads ghost on exited 0 for a name that does not exist: OK
+FAIL: flintctl tenant-async ghost on exited 0 for a name that does not exist: OK
+FAIL: flintctl tenant-federate ghost on exited 0 for a name that does not exist: OK
+FAIL: flintctl tenant-cache ghost on exited 0 for a name that does not exist: OK
+FAIL: flintctl tenant-quota ghost 100 1000 exited 0 for a name that does not exist: OK
+FAIL: flintctl retire-proxy 127.0.0.1:1 exited 0 for a name that does not exist: OK retired 127.0.0.1:1
+FAIL: CPTENANTOVERQUOTA ghost on at the leader answered 'OK', want an ERR naming 'no such tenant'
+FAIL: CPSETSUBSET ghost 127.0.0.1:7861 at the leader answered 'OK subset = 1 proxy(ies)', want an ERR naming 'no such tenant'
+FAIL: CPDROPPREV ghost at the leader answered 'OK', want an ERR naming 'no such tenant'
+FAIL: CPCLEARSLOT acme 100 at the leader answered 'OK', want an ERR naming 'no such exception'
+FAIL: CPSETPAIR 7 127.0.0.1:6930,127.0.0.1:6931 at the leader answered 'OK version 15', want an ERR naming 'no such pair index'
+MEASURED: 11 of 11 refusals missing
+```
+
+Every reply is what the code read predicted, down to the text: `CPDELPROXY`
+says `OK retired`, `CPSETSUBSET` reports a placement for a tenant that does not
+exist, and `CPSETPAIR` hands back a new registry version for an index past the
+end.
 
 ## Also different, and not refusals
 
@@ -85,9 +104,16 @@ Recorded so the fix can decide each one rather than find them again:
 ## The fix, and what it cannot promise
 
 Name each refusal once, the way step 3 did for slot coverage: `covers_slot` is
-asked by `CPCLEARSLOT` in `main.rs`, and `ha.rs` should ask the same function of
-`ha.store.registry()` before proposing. Then add the same checks for tenants,
-proxies and pair indexes.
+asked by `CPCLEARSLOT` in `main.rs`, and `ha.rs` should ask the same function
+before proposing. Then add the same checks for tenants, proxies and pair indexes.
+
+**Ask the LEADER's registry, not whichever seat answered.** `ha.store.registry()`
+on a follower can be behind, and a refusal is a claim that something does not
+exist, so a lagging follower would refuse a tenant added a moment ago. That is
+worse than the no-op this bug is about. A follower redirects at `propose`
+anyway, so reading at the leader costs it nothing but the order of its answers.
+The arms that already refuse (`CPDELTENANT`, `CPROTATETOKEN`, `CPADDTENANT` and
+others) read the local copy today and have the same exposure.
 
 **On Raft the refusal is best-effort, and it should say so.** Read-then-propose
 has a window. A `CPDELTENANT` committed between the registry read and the
