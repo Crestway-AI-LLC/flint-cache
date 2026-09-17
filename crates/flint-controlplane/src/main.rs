@@ -104,6 +104,27 @@ struct LeaseFast {
     lat_idx: usize,
 }
 
+/// Re-derive the fast mirror from the applied state (ADR-0032 step 4).
+///
+/// THE MIRROR IS A COPY, NOT A SECOND LEDGER. Every mutating arm used to patch
+/// `lf.entries` in its own way beside the change it made to `st.leases` — a
+/// repoint here, a push there, an increment in the third — which is three
+/// chances to write the record and forget the cache, and BUG-0151 is what one
+/// of them cost: a repoint that updated the durable row while the control
+/// plane kept answering CPLEASE out of the stale one.
+///
+/// CALLED UNDER THE STATE LOCK, in the documented order (state -> leases), so
+/// two mutations cannot interleave and leave the mirror describing neither:
+/// whoever holds `state` decides what the mirror says next. A renewal takes
+/// only `leases` and never both, so the isolation that makes CPLEASE a fast
+/// path is unchanged — this copies a handful of rows while holding a lock the
+/// renewal path does not want.
+fn publish_lease_mirror(shared: &Shared, st: &State) {
+    if let Ok(mut lf) = shared.leases.lock() {
+        lf.entries = st.leases.clone();
+    }
+}
+
 impl LeaseFast {
     fn record_latency(&mut self, us: u32) {
         if self.lat_us.len() < 128 {
@@ -249,12 +270,13 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
             // Sorted, as CPADDPAIR is (BUG-0065's root fix): a repoint that
             // wrote an unsorted vector would let a later CPADDPAIR of the same
             // members past the `contains` dedupe as a second pair.
-            // READ `old` WITHOUT MUTATING, then let SetPair do the change.
-            // Replacing here to capture `old` and then applying would repoint
-            // twice, the second time from the new membership to itself.
-            let Some(old) = st.pairs.get(idx).cloned() else {
+            // THE INDEX IS CHECKED, NOTHING IS READ OUT. This used to clone
+            // the old membership so the fast mirror could be repointed from it
+            // by hand; the mirror is re-derived now (ADR-0032 step 4), and
+            // `SetPair` takes the old row's identity from the state itself.
+            if idx >= st.pairs.len() {
                 return err("no such pair index");
-            };
+            }
             let mut members: Vec<String> = nodes.split(',').map(String::from).collect();
             members.sort();
             st.apply_mutation(registry::Mutation::SetPair {
@@ -265,17 +287,12 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
                 Ok(_) => {}
                 Err(e) => return err(&format!("persist: {e}")),
             }
+            // The mirror is re-derived, not repointed a second time: BUG-0151
+            // was this arm updating `st.leases` and leaving `lf.entries`
+            // naming the old membership, and a copy cannot disagree with what
+            // it copies. `apply_mutation` still knows nothing about the cache.
+            publish_lease_mirror(shared, &st);
             drop(st);
-            // THE FAST MIRROR STAYS IN DISPATCH, and that is not an oversight.
-            // `st.leases` is the durable record and `lf.entries` is the cache
-            // CPLEASE reads on its hot path; repointing only the first leaves
-            // this control plane answering out of a row the repoint made stale
-            // (BUG-0151). A cache is not state, so `apply_mutation` must not
-            // know about it -- deriving it from the applied state instead of
-            // maintaining it beside them is ADR-0032 step 4.
-            if let Ok(mut lf) = shared.leases.lock() {
-                crate::tenant::repoint_lease_row(&mut lf.entries, &old, &members);
-            }
             shared.changed.notify_all();
             ok()
         }
@@ -1171,9 +1188,12 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
             let Ok(mut st) = shared.state.lock() else {
                 return err("state lock");
             };
-            let Some(members) = st.pairs.iter().find(|p| p.contains(&addr)).cloned() else {
+            // MEMBERSHIP IS THE GUARD, and only the guard: the row this arm
+            // used to clone out for the mirror is published from the applied
+            // state instead (ADR-0032 step 4).
+            if !st.pairs.iter().any(|p| p.contains(&addr)) {
                 return err("NOPAIR address is not a member of any registered pair");
-            };
+            }
             // A LOST ADOPTION RACE ENDS HERE. Two first touches for one pair
             // can both miss the fast mirror above, which is read under a
             // different lock, and the loser used to push a SECOND durable row
@@ -1197,9 +1217,11 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
                 st.leases.pop();
                 return err(&format!("persist: {e}"));
             }
+            publish_lease_mirror(shared, &st);
             drop(st);
             if let Ok(mut lf) = shared.leases.lock() {
-                lf.entries.push((members, addr.clone(), 0));
+                // The row itself came from the mirror publish above; this is
+                // the renewal COUNTER, which is telemetry and not state.
                 lf.renewals_total += 1;
             }
             Value::Simple("OK".into())
@@ -1217,9 +1239,12 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
             let Ok(mut st) = shared.state.lock() else {
                 return err("state lock");
             };
-            let Some(members) = st.pairs.iter().find(|p| p.contains(&addr)).cloned() else {
+            // MEMBERSHIP IS THE GUARD, and only the guard: the row this arm
+            // used to clone out for the mirror is published from the applied
+            // state instead (ADR-0032 step 4).
+            if !st.pairs.iter().any(|p| p.contains(&addr)) {
                 return err("NOPAIR address is not a member of any registered pair");
-            };
+            }
             // `Fence` resolves the row by CONTAINMENT, matching what CPLEASE
             // reads by. This arm once used member EQUALITY while the renewal
             // path found "the first entry whose members contain the caller" --
@@ -1244,19 +1269,12 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
             if let Err(e) = st.commit() {
                 return err(&format!("persist: {e}"));
             }
+            // The mirror is the durable rows, copied. The containment key
+            // that used to be spelled here as well is now asked once, inside
+            // `Fence` -- three agreeing spellings of one lookup was how
+            // BUG-0150 hid in the first place.
+            publish_lease_mirror(shared, &st);
             drop(st);
-            if let Ok(mut lf) = shared.leases.lock() {
-                // Same containment key as the durable row above and as the
-                // renewal read below it -- all three must agree or the mirror
-                // drifts from the record it mirrors.
-                match lease_row_index(&lf.entries, &addr) {
-                    Some(i) => {
-                        lf.entries[i].1 = addr.clone();
-                        lf.entries[i].2 = g;
-                    }
-                    None => lf.entries.push((members, addr.clone(), g)),
-                }
-            }
             shared.changed.notify_all();
             Value::Simple(format!("OK fenced {addr} gen {g}"))
         }
@@ -2076,6 +2094,47 @@ mod step3_dispatch_tests {
 
         // The winner asking inside the same window is answered from that row.
         assert_eq!(call(&sh, &["CPLEASE", "a:1"]), Value::Simple("OK".into()));
+    }
+
+    /// ADR-0032 STEP 4: THE MIRROR IS A COPY OF THE RECORD, after every verb
+    /// that touches a lease row. Asserted as equality with `st.leases` rather
+    /// than as a spelling of what each arm used to patch by hand -- BUG-0151
+    /// was precisely a patch that agreed with the record until it did not.
+    #[test]
+    fn every_lease_verb_leaves_the_mirror_equal_to_the_record() {
+        let sh = shared_with_one_pair();
+        let same = |what: &str| {
+            let st = sh.state.lock().expect("state lock");
+            let lf = sh.leases.lock().expect("lease lock");
+            assert_eq!(
+                lf.entries, st.leases,
+                "mirror diverged from the record after {what}"
+            );
+        };
+
+        // Adoption writes the first row.
+        assert_eq!(call(&sh, &["CPLEASE", "a:1"]), Value::Simple("OK".into()));
+        same("adoption");
+
+        // A fence bumps the generation and moves the master.
+        assert!(matches!(call(&sh, &["CPFENCE", "b:1"]), Value::Simple(_)));
+        same("a fence");
+
+        // A repoint replaces the membership the row is keyed by: the BUG-0151
+        // shape, where the durable row moved and the cache did not.
+        assert!(matches!(
+            call(&sh, &["CPSETPAIR", "0", "a:1,c:1"]),
+            Value::Simple(_)
+        ));
+        same("a repoint");
+        {
+            let st = sh.state.lock().expect("state lock");
+            assert_eq!(
+                st.leases[0].0,
+                vec!["a:1".to_string(), "c:1".to_string()],
+                "the repoint is what this asserts the mirror followed"
+            );
+        }
     }
 
     /// ONE BUMP PER FENCE, which is what Raft has always done. Single-node

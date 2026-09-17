@@ -133,7 +133,7 @@ own:
 4. **Delete the duplicate `shuffle_shard`**, and let the fast mirror be derived
    at one place from the applied state rather than maintained beside it.
    **First half done 2026-09-16** with step 1, because unifying the types made
-   it a re-export; the fast mirror is untouched.
+   it a re-export. **Second half done 2026-09-17** — see "Step 4" below.
 
 ## Consequences
 
@@ -374,6 +374,44 @@ The one drill asserting those refusals runs one control-plane seat. Filed as
 production control plane answers and deserves its own gate — and fixed there
 the same day, with the refusals reading the leader's registry rather than
 whichever seat answered.
+
+## Step 4, done (2026-09-17)
+
+**The fast mirror is now a copy of the applied state, taken in one place.**
+`publish_lease_mirror(shared, &st)` assigns `lf.entries = st.leases.clone()`,
+and the three arms that touch a lease row — `CPLEASE`'s adoption, `CPFENCE`,
+`CPSETPAIR` — call it instead of each patching the cache in its own shape: a
+repoint here, a push there, a generation written by hand in the third.
+
+**Why a copy rather than three correct patches.** The patches WERE correct,
+individually, and that is the point: BUG-0151 was one of them agreeing with the
+durable row until a repoint made it disagree, and nothing could report the
+drift because each arm was the only place that knew what it had written. A copy
+cannot disagree with what it copies.
+
+**Taken under the state lock**, in the documented order (state → leases). Two
+mutations therefore cannot interleave and leave the mirror describing neither:
+whoever holds `state` decides what the mirror says next. The alternative —
+publishing after dropping the state lock, as the old patches did — needs a
+version guard to stop an older copy landing last, and a guard is a second thing
+to get right.
+
+**The renewal path is untouched**, which is the property that matters:
+`CPLEASE` still takes only the lease lock on its hot path, and a renewal
+delayed past its TTL still fences a healthy master. This copies a handful of
+rows while holding a lock the renewal path never wants.
+
+**What the test asserts is the invariant, not the spelling.**
+`every_lease_verb_leaves_the_mirror_equal_to_the_record` runs an adoption, a
+fence and a repoint, and after each one compares `lf.entries` with `st.leases`
+whole. A test written as "the repoint moved the cached row too" would pass
+against three patches that agree today and say nothing about the next arm
+somebody adds.
+
+**Three bindings went with the patches**: `old` in `CPSETPAIR` and `members` in
+the two lease arms existed to feed the hand-written cache updates. They are now
+the checks they always were — an index in range, an address that belongs to a
+registered pair — with nothing read out of them.
 
 ## The question this ADR asked, and its answer
 
