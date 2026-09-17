@@ -69,7 +69,19 @@ echo "   busy port correctly refused"
 echo "== host-stop-seat: the seat goes, and the port comes back"
 "$CTL" host-stop-seat "$S" node-a flint-server "--port $PORT" "$PORT" >/dev/null \
   || fail "host-stop-seat exited non-zero"
-kill -0 "$PID" 2>/dev/null && fail "pid $PID still alive after host-stop-seat"
+# BUDGETED, not instantaneous (BUG-0164). `host-stop-seat` waits for the seat to
+# leave `ps` and for its port to come back; it does not wait for the pid to be
+# REAPED, and `kill -0` still succeeds for a process that has exited whose parent
+# has not reaped it. Asserting liveness the instant the verb returns cost a gate
+# run under the suite's 4-way parallel drills, with the verb exiting 0 -- so the
+# port was already free and the seat was not serving. The budget keeps what this
+# check is FOR, because a host-stop-seat that killed nothing leaves the pid alive
+# far past ten seconds, and drops the race. Same shape as batch_commit_failure.
+for _ in $(seq 1 50); do
+  kill -0 "$PID" 2>/dev/null || break
+  sleep 0.2
+done
+kill -0 "$PID" 2>/dev/null && fail "pid $PID still alive 10s after host-stop-seat"
 # POSITIVE CONTROL for the check above. Same port, same command, opposite
 # answer -- without this, "busy port refused" is also what a host-port-free
 # that refuses everything would print.
