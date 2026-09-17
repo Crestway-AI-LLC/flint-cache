@@ -61,6 +61,57 @@ sleep 1.5
   || { echo "FAIL: tenant not serving through the proxy"; exit 1; }
 echo "  tenant added and serving"
 
+echo "== an unknown name is REFUSED by the group, not committed as a no-op (BUG-0160)"
+# ctl_error_drill asserts these refusals against ONE control-plane seat, and
+# the Raft arms used to propose a no-op and reply OK instead -- so the suite
+# certified refusals the three-seat topology production runs did not make.
+# Asked through flintctl where it has a verb, and raw at the leader where not.
+LEADER_ID=$(valkey-cli -p 7561 CPINFO 2>/dev/null | tr -d '\r' | grep '^leader:' | cut -d: -f2)
+[ -n "$LEADER_ID" ] || { echo "FAIL: no seat reports a leader before the refusals"; exit 1; }
+LPORT=$((7560 + LEADER_ID))
+refused_ctl() {  # <want> <flintctl args...>: must exit non-zero AND say why
+  local want=$1 out rc; shift
+  out=$($CTL -f "$INV" "$@" 2>&1); rc=$?
+  [ "$rc" != "0" ] || { echo "FAIL: flintctl $* exited 0 for a name that does not exist: $out"; exit 1; }
+  case "$out" in
+    *"$want"*) echo "  refused: flintctl $*" ;;
+    *) echo "FAIL: flintctl $* failed, but not with '$want': $out"; exit 1 ;;
+  esac
+}
+refused_raw() {  # <want> <CP command...>, sent to the leader seat
+  local want=$1 out; shift
+  out=$(valkey-cli -p "$LPORT" "$@" 2>&1)
+  case "$out" in
+    *"ERR "*"$want"*) echo "  refused: $*" ;;   # with or without "(error) "
+    *) echo "FAIL: $* at the leader answered '$out', want an ERR naming '$want'"; exit 1 ;;
+  esac
+}
+refused_ctl "no such tenant" tenant-reads ghost on
+refused_ctl "no such tenant" tenant-async ghost on
+refused_ctl "no such tenant" tenant-federate ghost on
+refused_ctl "no such tenant" tenant-cache ghost on
+refused_ctl "no such tenant" tenant-quota ghost 100 1000
+refused_ctl "no such proxy" retire-proxy 127.0.0.1:1
+refused_raw "no such tenant" CPTENANTOVERQUOTA ghost on
+refused_raw "no such tenant" CPSETSUBSET ghost 127.0.0.1:7861
+refused_raw "no such tenant" CPDROPPREV ghost
+refused_raw "no such exception" CPCLEARSLOT acme 100
+refused_raw "no such pair index" CPSETPAIR 7 127.0.0.1:6930,127.0.0.1:6931
+# THE CONTROL. Every refusal above would also pass if these verbs now failed
+# for everyone, so the same verbs must still succeed for a name that exists.
+# `0 0` is "unlimited", so the control leaves acme exactly as it found it.
+$CTL -f "$INV" tenant-quota acme 0 0 >"$D/quota-ok.log" 2>&1 \
+  || { echo "FAIL: tenant-quota refused a tenant that exists"; cat "$D/quota-ok.log"; exit 1; }
+for cmd in "CPTENANTOVERQUOTA acme off" "CPDROPPREV acme" "CPSETSUBSET acme 127.0.0.1:7861"; do
+  # shellcheck disable=SC2086 -- word splitting is the point
+  out=$(valkey-cli -p "$LPORT" $cmd 2>&1)
+  case "$out" in
+    OK*) ;;
+    *) echo "FAIL: $cmd at the leader answered '$out' for a tenant that exists"; exit 1 ;;
+  esac
+done
+echo "  and the same verbs still succeed for acme"
+
 echo "== KILL THE LEADER: the next mutation must still land"
 # Find the leader by asking any seat; kill exactly that seat's process.
 LEADER_ID=$(valkey-cli -p 7561 CPINFO 2>/dev/null | tr -d '\r' | grep '^leader:' | cut -d: -f2)
