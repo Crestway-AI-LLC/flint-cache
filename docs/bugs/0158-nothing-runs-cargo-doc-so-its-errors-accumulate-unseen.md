@@ -1,4 +1,4 @@
-# BUG-0158: nothing runs `cargo doc`, so 99 rustdoc errors accumulated unseen (OPEN)
+# BUG-0158: nothing runs `cargo doc`, so 108 rustdoc errors accumulated unseen (OPEN)
 
 Status: **OPEN**, found 2026-09-16 while gating an unrelated change · Severity:
 **low-medium** — not a product defect and not a release blocker: the bundle is
@@ -9,25 +9,42 @@ allowed.
 ## Measured
 
 ```
-RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
-  exit 101, 99 errors
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --keep-going
+  exit 101, 108 errors        (2026-09-17, on c9c1dc5)
 ```
 
 | kind | count |
 |---|---|
-| unclosed HTML tag | 54 |
-| unresolved link | 32 |
-| could not document | 8 |
+| unclosed HTML tag | 55 |
+| unresolved link | 36 |
+| could not document | 11 |
 | public documentation links to a private item | 3 |
 | unknown disambiguator | 2 |
+| could not parse code block as Rust | 1 |
 
-Across **8 crates and 13 source files**: `flint-controlplane` (24 references),
-`flint-server` (17), `flint-proxy` (14), `flint-ctl` (14), `flint-journal` (10),
-`flint-controller` (6), `flint-vec` (3), `flint-chaos` (3).
+**`--keep-going` IS THE MEASUREMENT, and its absence is a trap this write-up
+fell into.** Cargo stops scheduling new crates after the first failure
+(`build failed, waiting for other jobs to finish`), so the same command without
+that flag reports **4 errors** and names one crate — `flint-chaos`, whichever
+happens to fail first. The original figure here, 99 across 8 crates and 13
+files, came from a run counted a different way and is superseded: the number to
+quote is the one a single reproducible command prints, and the command has to
+be the one that reads every crate.
+
+Re-measured on 2026-09-17 after a day of unrelated commits, which is also why
+the count moved: a doc comment written anywhere in the workspace adds to it,
+and nothing reports that at the time.
+
+Across **9 crates**, by the `--> crates/<name>` line rustdoc prints:
+`flint-controlplane` (20), `flint-ctl` (5), `flint-journal` (4), `flint-proxy`
+(3), `flint-chaos` (3), and one each in `flint-storage`, `flint-server`,
+`flint-exporter` and `flint-conformance`. The unresolved-link errors point at a
+line without that prefix, so the per-crate figures are a floor rather than a
+census.
 
 ## The dominant kind has one cause, and it is our own house style
 
-54 of 99 are `unclosed HTML tag`, and they come from **placeholder syntax in doc
+55 of 108 are `unclosed HTML tag`, and they come from **placeholder syntax in doc
 comments**. `state.rs`'s module header documents the durable format the way the
 format is written:
 
