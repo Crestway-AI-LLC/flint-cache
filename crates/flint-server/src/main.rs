@@ -1665,7 +1665,7 @@ fn cp_lease_renew(target: &str, me: &str) -> LeaseRenewal {
     }
 }
 
-/// Fleet-journal target (--journal <cp-addr>) and this node's own address,
+/// Fleet-journal target (--journal `<cp-addr>`) and this node's own address,
 /// for role-transition events. Reporting is best-effort and detached — a
 /// transition never waits on (or fails because of) the journal.
 static JOURNAL_TARGET: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();

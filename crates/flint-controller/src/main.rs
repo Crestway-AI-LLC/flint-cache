@@ -170,7 +170,7 @@ fn internal_connect(addr: &str) -> std::io::Result<flint_tls::Stream> {
     )
 }
 
-/// Fleet-journal target (--journal <cp-addr>). Best-effort, detached: the
+/// Fleet-journal target (--journal `<cp-addr>`). Best-effort, detached: the
 /// control loop's decisions never wait on the journal.
 static JOURNAL_TARGET: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
 
@@ -618,7 +618,7 @@ struct Config {
     /// convergence happens over several observe→plan→move cycles.
     max_slots_per_cycle: usize,
     /// Control plane to COMMIT slot-ownership truth to after each
-    /// successful cutover (Option B: CPSETSLOT <ns> <slot> <new-owner>).
+    /// successful cutover (Option B: CPSETSLOT `<ns>` `<slot>` `<new-owner>`).
     /// None = no CP (static drills): proxies learn via -MOVED as before.
     commit_cp: Option<String>,
     /// Nodes to run MIGRATION RECOVERY over (separate from failover, since
@@ -627,7 +627,7 @@ struct Config {
     recover_nodes: Vec<String>,
     /// Snapshot root directory (any mounted path; S3 via mount/sync on the
     /// same layout). Enables BOTH the schedule (periodic FLINTSNAPSHOT on
-    /// each managed master into <root>/<pair-label>/) and disaster restore
+    /// each managed master into `<root>`/`<pair-label>`/) and disaster restore
     /// (whole-pair loss -> spawn a spare seeded from LATEST, which asserts
     /// mastership in a bumped generation).
     snapshot_root: Option<String>,

@@ -30,7 +30,7 @@ pub fn is_write_command(name: &[u8]) -> bool {
 
 /// The single key a command addresses (its slot-determining key), or None
 /// for commands that don't target one key. v0 commands all place their key at
-/// args[1]; FLINT* admin/replication commands are intercepted before this, so
+/// `args[1]`; FLINT* admin/replication commands are intercepted before this, so
 /// only the no-key data/util commands need excluding. Used to check per-slot
 /// ownership and answer -MOVED after a migration (rocks builds only).
 #[cfg_attr(not(feature = "rocks"), allow(dead_code))]
@@ -215,7 +215,7 @@ impl<'a> Dispatcher<'a> {
 
     /// True when any key argument of this command exceeds the key cap.
     /// Key positions mirror `command_key`: v0 commands take their key at
-    /// args[1]; DEL/EXISTS are all-keys; MSET keys sit at odd indices.
+    /// `args[1]`; DEL/EXISTS are all-keys; MSET keys sit at odd indices.
     /// Enforced for reads and writes alike — an oversized key must never
     /// reach the envelope builders (their length frame is 2 bytes).
     fn has_oversized_key(&self, name_upper: &[u8], args: &[Vec<u8>]) -> bool {
@@ -1153,7 +1153,7 @@ impl<'a> Dispatcher<'a> {
         }
     }
 
-    /// ZRANGEBYSCORE / ZREVRANGEBYSCORE key min max [WITHSCORES]
+    /// ZRANGEBYSCORE / ZREVRANGEBYSCORE key min max `[WITHSCORES]`
     /// [LIMIT offset count]. The reversed form takes (max, min).
     fn cmd_zrangebyscore(&self, args: &[Vec<u8>], name: &str, rev: bool) -> Value {
         if args.len() < 4 {
@@ -1263,7 +1263,7 @@ impl<'a> Dispatcher<'a> {
         )
     }
 
-    /// COPY source destination [REPLACE]. Same slot only, for the reason
+    /// COPY source destination `[REPLACE]`. Same slot only, for the reason
     /// the set operations are: the destination is written into this node's
     /// local rows, so a destination in a slot this node does not own would
     /// be stored where nothing will ever read it and COPY would return 1
@@ -1320,7 +1320,7 @@ impl<'a> Dispatcher<'a> {
     /// SINTERSTORE / SUNIONSTORE / SDIFFSTORE dst key [key ...].
     ///
     /// No numkeys here, unlike the sorted-set forms — the destination is
-    /// args[1] and everything after it is a source.
+    /// `args[1]` and everything after it is a source.
     ///
     /// AND UNLIKE THEM, A SORTED SET IS NOT A LEGAL INPUT: ZUNIONSTORE
     /// accepts a plain set at score 1, but the set commands answer
@@ -1631,7 +1631,7 @@ impl<'a> Dispatcher<'a> {
         )
     }
 
-    /// ZPOPMIN/ZPOPMAX key [count].
+    /// ZPOPMIN/ZPOPMAX key `[count]`.
     ///
     /// Whether a COUNT was written changes the reply's shape, not just its
     /// length: without one the reply is a single flat `[member, score]`,
@@ -1856,7 +1856,7 @@ impl<'a> Dispatcher<'a> {
         }
     }
 
-    /// JSON.GET key [path] — the value at the path, serialized. A missing
+    /// JSON.GET key `[path]` — the value at the path, serialized. A missing
     /// KEY is nil in either dialect; a missing PATH is `[]` under JSONPath
     /// and an error under the legacy dialect.
     fn cmd_json_get(&self, args: &[Vec<u8>]) -> Value {
@@ -1874,7 +1874,7 @@ impl<'a> Dispatcher<'a> {
         Self::json_doc_matches(&path, found, PATH_MISSING)
     }
 
-    /// JSON.DEL key [path] — root path deletes the key; a sub-path removes
+    /// JSON.DEL key `[path]` — root path deletes the key; a sub-path removes
     /// that member/element. Returns the number of paths deleted (0 or 1).
     fn cmd_json_del(&self, args: &[Vec<u8>]) -> Value {
         if args.len() < 2 || args.len() > 3 {
@@ -1904,7 +1904,7 @@ impl<'a> Dispatcher<'a> {
         }
     }
 
-    /// JSON.TYPE key [path] — Redis's type vocabulary for the value at the
+    /// JSON.TYPE key `[path]` — Redis's type vocabulary for the value at the
     /// path. Nil when the KEY is absent (either dialect).
     fn cmd_json_type(&self, args: &[Vec<u8>]) -> Value {
         if args.len() < 2 || args.len() > 3 {
@@ -1941,7 +1941,7 @@ impl<'a> Dispatcher<'a> {
         ))
     }
 
-    /// BF.RESERVE key error_rate capacity [EXPANSION n] [NONSCALING]
+    /// BF.RESERVE key error_rate capacity `[EXPANSION` `n]` `[NONSCALING]`
     ///
     /// Note the argument order — error rate BEFORE capacity, which is
     /// RedisBloom's and reads backwards to most people. Kept because the
@@ -2068,8 +2068,8 @@ impl<'a> Dispatcher<'a> {
         ]))
     }
 
-    /// BF.INSERT key [CAPACITY n] [ERROR e] [EXPANSION n] [NOCREATE]
-    /// [NONSCALING] ITEMS item [item ...]
+    /// BF.INSERT key `[CAPACITY` `n]` `[ERROR` `e]` `[EXPANSION` `n]` `[NOCREATE]`
+    /// `[NONSCALING]` ITEMS item `[item` `...]`
     ///
     /// Reserve-if-absent and add, in one round trip. The options bind only
     /// when the filter is CREATED here; against an existing filter they are
@@ -2254,7 +2254,7 @@ impl<'a> Dispatcher<'a> {
         }
     }
 
-    /// JSON.ARRLEN key [path] — length of the array at the path.
+    /// JSON.ARRLEN key `[path]` — length of the array at the path.
     fn cmd_json_arrlen(&self, args: &[Vec<u8>]) -> Value {
         if args.len() < 2 || args.len() > 3 {
             return arity_err("json.arrlen");
@@ -2444,7 +2444,7 @@ impl<'a> Dispatcher<'a> {
         ]))
     }
 
-    /// HSCAN/SSCAN/ZSCAN key cursor [MATCH pat] [COUNT n] [NOVALUES].
+    /// HSCAN/SSCAN/ZSCAN key cursor `[MATCH` `pat]` `[COUNT` `n]` `[NOVALUES]`.
     /// Our collections materialize from ONE prefix scan, so every scan is a
     /// single-shot iteration: ignore the cursor's value, return the whole
     /// (filtered) collection, answer cursor "0" — exactly Redis's behavior
@@ -2532,7 +2532,7 @@ impl<'a> Dispatcher<'a> {
         ]))
     }
 
-    /// SPOP key [count]. Without count: single bulk (or nil). With count:
+    /// SPOP key `[count]`. Without count: single bulk (or nil). With count:
     /// an array — count 0 is the empty array, negative is an error.
     fn cmd_spop(&self, args: &[Vec<u8>]) -> Value {
         match args.len() {
@@ -2551,7 +2551,7 @@ impl<'a> Dispatcher<'a> {
         }
     }
 
-    /// SRANDMEMBER key [count]. Without count: single bulk (or nil). With
+    /// SRANDMEMBER key `[count]`. Without count: single bulk (or nil). With
     /// count: array — positive is distinct-clamped, negative repeats.
     fn cmd_srandmember(&self, args: &[Vec<u8>]) -> Value {
         match args.len() {

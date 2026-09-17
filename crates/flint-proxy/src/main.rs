@@ -28,7 +28,7 @@
 //! the first request routes to the default owner and relearns from -MOVED.
 //!
 //! Tenancy: --tenants "token=ns,..." enables token auth. Clients AUTH
-//! <token> (or AUTH <user> <token>); the proxy maps the token to the
+//! `<token>` (or AUTH `<user>` `<token>`); the proxy maps the token to the
 //! tenant's namespace and pins every backend connection to it with a
 //! FLINTNS handshake, so all data commands, DBSIZE, and FLUSHALL are
 //! tenant-scoped on the nodes. Pre-auth commands get -NOAUTH; bad tokens
@@ -207,7 +207,7 @@ struct HotEntry {
 /// (ns, key) -> HotEntry.
 type HotKeyMap = HashMap<(Vec<u8>, Vec<u8>), HotEntry>;
 
-/// A tenant's grant, decoded from the snapshot's "token=ns#flags[@rate]"
+/// A tenant's grant, decoded from the snapshot's `"token=ns#flags[@rate]"`
 /// entry: opt-ins (D7 replica reads, D6 near-cache), the M5 quota state
 /// ('q' = over storage quota; rate = this proxy's ops/s share), and the
 /// namespace everything is scoped to.
@@ -386,7 +386,7 @@ struct Routing {
     pairs: Vec<Vec<String>>,
     /// Current master address per pair (None until discovered).
     masters: Vec<Option<String>>,
-    /// Slot range owned by pairs[i], pushed by the control plane (level-1
+    /// Slot range owned by `pairs[i]`, pushed by the control plane (level-1
     /// routing state). Empty/None entries fall back to count-derived ranges
     /// (static --pairs mode, legacy registries). An expansion pair arrives
     /// with NO range: capacity joins without re-routing unmigrated slots.
@@ -527,11 +527,11 @@ struct Topology {
     /// Admin-token DIGESTS (ADR-0006 D1/D4): current + optionally previous
     /// during a rotation window. Non-empty => the operator surface
     /// (PROXYSTATS, all-tenant hot-key/latency, PROXYAUTHCOUNT, mutating
-    /// PROXYCACHE) requires AUTH <admin-token>. Set from a static
+    /// PROXYCACHE) requires AUTH `<admin-token>`. Set from a static
     /// --admin-token (hashed at parse) OR pushed by the CP snapshot, so it
     /// rotates without a proxy restart. Empty => open surface (dev).
     admin_digests: RwLock<Vec<String>>,
-    /// Last promotion hint applied ("<addr>|<gen>"). Compared for
+    /// Last promotion hint applied (`"<addr>|<gen>"`). Compared for
     /// INEQUALITY — see apply_promote_hint.
     last_promote_hint: RwLock<String>,
     /// Single-use channel tokens (ADR-0010 D2): token -> grant. Populated by
@@ -1475,7 +1475,7 @@ impl Backends {
     }
 }
 
-/// The key a command routes by (mirrors the server's command_key): args[1]
+/// The key a command routes by (mirrors the server's command_key): `args[1]`
 /// unless the command addresses no key. Multi-key commands route by their
 /// FIRST key in v0 (scatter-gather is a follow-on).
 fn route_key(args: &[Vec<u8>]) -> Option<&[u8]> {
@@ -1506,7 +1506,7 @@ fn route_key(args: &[Vec<u8>]) -> Option<&[u8]> {
 /// arrives already nested: peel that layer off and re-mark it, so the
 /// client's own dialect decides whether it goes back on. JSON.NUMINCRBY's
 /// dialects differ in reply KIND, so the RESP2 spelling is rebuilt from the
-/// RESP3 array (the array holds the matches; args[2] says which spelling the
+/// RESP3 array (the array holds the matches; `args[2]` says which spelling the
 /// caller expects).
 ///
 /// A free function rather than a closure inside `forward` because the
@@ -1912,7 +1912,7 @@ enum AuthStep {
     ChannelOpen { deadline: Instant, budget: u64 },
 }
 
-/// Redis-shaped auth gate. AUTH <token> or AUTH <user> <token> (the user is
+/// Redis-shaped auth gate. AUTH `<token>` or AUTH `<user>` `<token>` (the user is
 /// ignored; the token alone identifies the tenant). Before auth, everything
 /// except AUTH/QUIT gets -NOAUTH. A successful AUTH fixes the connection's
 /// namespace; re-AUTH to a different tenant is rejected (reconnect instead)

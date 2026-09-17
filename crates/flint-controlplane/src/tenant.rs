@@ -61,7 +61,7 @@ pub struct Tenant {
 }
 
 impl Tenant {
-    /// The snapshot flag suffix the proxy parses: "#<flags>[@<rate>]" —
+    /// The snapshot flag suffix the proxy parses: `"#<flags>[@<rate>]"` —
     /// flags 'r' (replica reads), 'c' (near-cache), 'q' (over storage
     /// quota), 'f' (federated, ADR-0007), 'a' (async write queue, ADR-0005
     /// D4); `rate` = this tenant's PER-PROXY

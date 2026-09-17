@@ -95,7 +95,7 @@ pub enum EventKind {
     /// for this before declaring an operation complete.
     Supervised,
     /// The metering loop flipped a tenant's storage-quota verdict (M5).
-    /// detail carries "on <used>/<cap>" or "off <used>/<cap>".
+    /// detail carries `"on <used>/<cap>"` or `"off <used>/<cap>"`.
     QuotaVerdict,
     /// Tier 2: the agent EXECUTED an allowlisted catalog action (M5).
     /// detail carries the exact command run.
@@ -112,13 +112,13 @@ pub enum EventKind {
     /// "before -> after". No-op sweeps are not journaled.
     SlotsConsolidated,
     /// The disk headroom guard began shedding writes on this node
-    /// (ADR-0013 D3). detail carries "free <bytes> of <bytes>". This is the
+    /// (ADR-0013 D3). detail carries `"free <bytes> of <bytes>"`. This is the
     /// edge an external GC policy daemon triggers on — Flint never evicts,
     /// so reclaiming space from here is the operator's (or their tooling's)
     /// move.
     DiskShed,
     /// The guard cleared (with hysteresis) and writes resumed.
-    /// detail carries "free <bytes> of <bytes>".
+    /// detail carries `"free <bytes> of <bytes>"`.
     DiskResumed,
     /// Tier-1 (OPS-ADR-0029): a tier READ something from the catalog of
     /// evidence it is armed for. `subject` is the evidence key
@@ -164,7 +164,7 @@ pub enum EventKind {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Event {
     pub at_ms: u64,
-    /// Who reports: "controller:<id>", "node:<addr>", "agent:shadow".
+    /// Who reports: `"controller:<id>"`, `"node:<addr>"`, "agent:shadow".
     pub actor: String,
     pub kind: EventKind,
     /// What the event is about (a node address, a pair label, an action key).

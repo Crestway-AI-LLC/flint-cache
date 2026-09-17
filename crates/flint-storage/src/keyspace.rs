@@ -90,7 +90,7 @@ impl<'a> Keyspace<'a> {
         live
     }
 
-    /// COPY src dst [REPLACE], within one slot. False = nothing copied:
+    /// COPY src dst `[REPLACE]`, within one slot. False = nothing copied:
     /// either the source is absent or the destination exists without
     /// REPLACE. The TTL travels with the value, as in Redis.
     ///

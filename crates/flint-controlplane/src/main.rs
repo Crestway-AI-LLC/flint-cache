@@ -17,13 +17,13 @@
 //! (design.md §2.1): a proxy never holds tokens it does not serve.
 //!
 //! Admin API (RESP):
-//!   CPADDPROXY <addr>                       register a fleet member
-//!   CPDELPROXY <addr>                       retire a registration (and drop
+//!   `CPADDPROXY <addr>`                     register a fleet member
+//!   `CPDELPROXY <addr>`                     retire a registration (and drop
 //!                                           it from every tenant subset)
-//!   CPADDPAIR <a,b[,c]>                     register a replica set
-//!   CPADDTENANT <name> <token> <ns> [k]     add tenant; subset = shuffle
+//!   `CPADDPAIR <a,b[,c]>`                   register a replica set
+//!   `CPADDTENANT <name> <token> <ns> [k]`   add tenant; subset = shuffle
 //!                                           shard of k (default 2) proxies
-//!   CPSETSUBSET <name> <p1,p2|*|->          override subset: an explicit
+//!   `CPSETSUBSET <name> <p1,p2|*|->`        override subset: an explicit
 //!                                           list, `*` = every registered
 //!                                           proxy, `-` = NONE (drain). The
 //!                                           reply says which, because `-`
@@ -34,14 +34,14 @@
 //!   CPINFO                                  build, registry version, counts,
 //!                                           and the controllers that have
 //!                                           registered (ADR-0014 D1)
-//!   CPCONTROLLER <host:pid> <build>         a controller announcing itself;
+//!   `CPCONTROLLER <host:pid> <build>`       a controller announcing itself;
 //!                                           it has no listener, so this is
 //!                                           the only way its build reaches
 //!                                           `status` without ssh
-//!   CPMYSTATUS <token>                      TENANT-scoped self-view: quota,
+//!   `CPMYSTATUS <token>`                    TENANT-scoped self-view: quota,
 //!                                           usage, flags, own endpoint,
 //!                                           service build (ADR-0014 D3)
-//!   CPSNAPSHOT <proxy-addr>                 one-shot filtered snapshot
+//!   `CPSNAPSHOT <proxy-addr>`               one-shot filtered snapshot
 //!   CPSUBSETS                               list tenant -> proxy subset
 //!                                           (names and addresses; no tokens)
 //!
@@ -1373,7 +1373,7 @@ fn snapshot_frame(
     ]))
 }
 
-/// CPWATCH <proxy-addr> <last-version>: hijack the connection and push a
+/// CPWATCH `<proxy-addr>` `<last-version>`: hijack the connection and push a
 /// filtered snapshot whenever the version advances past what the proxy has
 /// ACKed. Push -> ACK -> wait-for-change -> push...
 fn watch(

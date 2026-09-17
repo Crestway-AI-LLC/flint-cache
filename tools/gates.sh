@@ -3881,7 +3881,7 @@ drill_source_assertions() {
 }
 
 if want check; then
-  echo "== gates: fmt, clippy, tests (both feature configs)"
+  echo "== gates: fmt, clippy, rustdoc, tests (both feature configs)"
   document_assertions
   report_toolchain_vs_pin
   step "fmt" fmt cargo fmt --all --check
@@ -3889,6 +3889,15 @@ if want check; then
     cargo clippy --workspace --all-targets --keep-going -- -D warnings
   step "clippy (rocks)" clippy-rocks \
     cargo clippy --workspace --all-targets --features flint-server/rocks,flint-backup/rocks --keep-going -- -D warnings
+  # BUG-0158: NOTHING RAN RUSTDOC, so 108 errors accumulated where no check
+  # was looking. The dominant cause was house style -- `CPADDPROXY <addr>` in a
+  # `//!` header is an unclosed HTML tag to rustdoc, `pairs[i]` an intra-doc
+  # link -- which is exactly the kind of debt that only appears when someone
+  # finally runs the command. `--keep-going` is not optional here: without it
+  # cargo stops scheduling after the first failing crate and reports a handful,
+  # which is how the original count was under-read as 99.
+  step "doc" doc \
+    env RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --keep-going
   step "test (mem)" test-mem cargo test --workspace
   step "test (rocks)" test-rocks cargo test --workspace --features flint-server/rocks,flint-backup/rocks
   step "licences" licences licence_check

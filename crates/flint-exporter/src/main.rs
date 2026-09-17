@@ -14,7 +14,7 @@
 //!     --node 127.0.0.1:7001 --node 127.0.0.1:7002 \
 //!     --proxy 127.0.0.1:7379 \
 //!     [--ca certs/ca.crt --cert certs/int.crt --key certs/int.key] \
-//!     [--admin-token <tok>]        # if the proxy admin surface is gated
+//!     `[--admin-token <tok>]`      # if the proxy admin surface is gated
 //!
 //! Omit --ca/--cert/--key for a plaintext (dev) fleet.
 

@@ -10,7 +10,7 @@
 
 use flint_slot::crc16;
 
-/// "flint|<key>|<seq>|<crc>" — self-identifying so misrouting and tearing
+/// `"flint|<key>|<seq>|<crc>"` — self-identifying so misrouting and tearing
 /// are provable, not guessed.
 pub fn value_for(key: &str, seq: u64) -> String {
     let crc = crc16(format!("{key}|{seq}").as_bytes());

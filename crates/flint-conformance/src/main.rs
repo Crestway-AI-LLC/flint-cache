@@ -23,9 +23,10 @@
 //! was found by hand-writing RESP to the playground edge — precisely the job
 //! this binary exists to do, and could not.
 //!
-//!     flint-conformance --target try.example.com:7379 \
-//!         --tls --ca /etc/pki/tls/certs/ca-bundle.crt \
-//!         --auth <tenant>:<token> --yes-flushall
+//! Run it as `flint-conformance --target try.example.com:7379 --tls --ca
+//! /etc/pki/tls/certs/ca-bundle.crt --auth <tenant>:<token> --yes-flushall`.
+//! Set apart, that block was an INDENTED doc block, which rustdoc compiles as
+//! Rust and fails on -- the same trap BUG-0162 hit.
 //!
 //! `--yes-flushall` is mandatory with `--auth` and is not a formality: every
 //! case starts by FLUSHALL-ing to get a clean keyspace, which through a proxy

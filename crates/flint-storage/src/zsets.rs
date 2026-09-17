@@ -341,7 +341,7 @@ impl<'a> ZSetStore<'a> {
     }
 
     /// ZRANGEBYSCORE / ZREVRANGEBYSCORE: members whose score is in
-    /// [min,max] (bounds may be exclusive), optionally reversed, then
+    /// `[min,max]` (bounds may be exclusive), optionally reversed, then
     /// LIMIT offset/count applied. Ascending output unless `rev`.
     #[allow(clippy::too_many_arguments)]
     pub fn zrange_by_score(
@@ -488,7 +488,7 @@ impl<'a> ZSetStore<'a> {
         self.zrem(slot, key, &doomed)
     }
 
-    /// ZCOUNT: members with score in [min,max].
+    /// ZCOUNT: members with score in `[min,max]`.
     pub fn zcount(
         &self,
         slot: u16,
@@ -552,7 +552,7 @@ impl<'a> ZSetStore<'a> {
         Ok(popped)
     }
 
-    /// ZREMRANGEBYSCORE: remove members with score in [min,max]; count.
+    /// ZREMRANGEBYSCORE: remove members with score in `[min,max]`; count.
     pub fn zremrangebyscore(
         &self,
         slot: u16,
@@ -569,7 +569,7 @@ impl<'a> ZSetStore<'a> {
         self.zrem(slot, key, &doomed)
     }
 
-    /// ZREMRANGEBYRANK: remove members in the [start,stop] rank window
+    /// ZREMRANGEBYRANK: remove members in the `[start,stop]` rank window
     /// (negatives from the end); count.
     pub fn zremrangebyrank(
         &self,

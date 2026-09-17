@@ -6,11 +6,11 @@
 //!   flintctl -f cluster.flint bootstrap    certs -> CP -> registry -> nodes
 //!                                          -> proxies -> controller -> agent
 //!   flintctl -f cluster.flint status       roles/lag/liveness table
-//!   flintctl -f cluster.flint tenant add <name> <token> <ns> [k]
-//!   flintctl -f cluster.flint expand <a,b[,c]>      new pair + reroll ctl
-//!   flintctl -f cluster.flint swap-node <bad> <new> fresh replica + CPSETPAIR
-//!   flintctl -f cluster.flint failover <node>       graceful master handoff
-//!   flintctl -f cluster.flint decommission-node <a> drop one member from a pair
+//!   flintctl -f cluster.flint tenant add `<name>` `<token>` `<ns>` `[k]`
+//!   `flintctl -f cluster.flint expand <a,b[,c]>`    new pair + reroll ctl
+//!   flintctl -f cluster.flint swap-node `<bad>` `<new>` fresh replica + CPSETPAIR
+//!   `flintctl -f cluster.flint failover <node>`     graceful master handoff
+//!   flintctl -f cluster.flint decommission-node `<a>` drop one member from a pair
 //!   flintctl -f cluster.flint stop          kill everything it started
 //!
 //! Inventory (line-based, # comments):
@@ -233,7 +233,7 @@ struct Inventory {
     /// Only such a fleet may be mutated by a binary that is not a release
     /// build; see require_release_or_disposable.
     disposable: bool,
-    /// Which host runs proxies[i]. A proxy BINDS a wildcard (`0.0.0.0:7379`),
+    /// Which host runs `proxies[i]`. A proxy BINDS a wildcard (`0.0.0.0:7379`),
     /// so unlike every other seat its address does not name its machine.
     /// Positional with `proxy` lines; absent = local.
     proxy_hosts: Vec<String>,
@@ -3847,15 +3847,15 @@ fn start_pair_nodes(inv: &Inventory, pair: &[String], gi: usize) {
 
 /// After a COLD start, check that inventory order was actually right.
 ///
-/// The loop above falls back to position when nothing is up: pair[0] is
+/// The loop above falls back to position when nothing is up: `pair[0]` is
 /// started bare and the rest get `--replica-of pair[0]`. If the pair last
 /// failed over, the durable roles are the reverse of that — and a node's
 /// manifest outranks the flag, correctly, because a flag must never be able
 /// to demote a master holding the newest data. The two safety rules compose
 /// into a fleet that replicates nothing:
 ///
-///   pair[0], durable replica, started bare  -> replica of NOBODY
-///   pair[1], durable master, given the flag -> "ignoring --replica-of"
+///   `pair[0]`, durable replica, started bare  -> replica of NOBODY
+///   `pair[1]`, durable master, given the flag -> "ignoring --replica-of"
 ///
 /// and `status` looks structurally fine — both up, roles coherent, epochs
 /// agreed. Only `live_replicas 0` gives it away. Seen on the playground:
@@ -3863,7 +3863,7 @@ fn start_pair_nodes(inv: &Inventory, pair: &[String], gi: usize) {
 /// replication and no error, on a fleet that had failed over weeks earlier.
 ///
 /// So once the seats are serving, ask them who is master and repair if the
-/// answer is not pair[0]. Costs one extra probe on the common path, where
+/// answer is not `pair[0]`. Costs one extra probe on the common path, where
 /// the assumption holds and nothing is rolled.
 fn reconcile_cold_start(
     inv: &Inventory,

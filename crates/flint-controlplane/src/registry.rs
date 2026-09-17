@@ -178,7 +178,7 @@ pub struct RegistryState {
     pub version: u64,
     pub proxies: Vec<String>,
     pub pairs: Vec<Vec<String>>,
-    /// Slot range owned by pairs[i] (level-1 routing state); None =
+    /// Slot range owned by `pairs[i]` (level-1 routing state); None =
     /// unranged (legacy) — proxies fall back to count-derived ranges.
     #[serde(default)]
     pub ranges: Vec<Option<(u16, u16)>>,

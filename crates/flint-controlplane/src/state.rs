@@ -12,10 +12,10 @@
 //!
 //! Serialized format (line-based, space-delimited — namespaces and addrs
 //! are validated space-free):
-//!   version <n>
-//!   proxy <addr>
-//!   pair <addr,addr[,addr]>
-//!   tenant <name> <token> <ns> <proxyaddr,proxyaddr|->
+//!   version `<n>`
+//!   proxy `<addr>`
+//!   pair `<addr,addr[,addr]>`
+//!   tenant `<name>` `<token>` `<ns>` `<proxyaddr,proxyaddr|->`
 
 use std::collections::BTreeMap;
 use std::io::Write;

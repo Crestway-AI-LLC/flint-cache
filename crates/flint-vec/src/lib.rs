@@ -315,7 +315,7 @@ fn flat_search(
 /// The durable side of a write: what the co-processor must do over the channel
 /// so the vectors survive a crash (ADR-0017 D2). Performed by the networked
 /// layer BEFORE the matching [`Apply`] touches the index. Keys live under a
-/// reserved co-processor prefix in the tenant namespace ([`durable_key`]).
+/// reserved co-processor prefix in the tenant namespace (`durable_key`).
 #[derive(Debug, PartialEq)]
 pub enum Persist {
     /// `ttl_ms` mirrors the row's expiry onto the data-plane key itself, so the
@@ -531,7 +531,7 @@ fn parse_vector(bytes: &[u8]) -> Result<Vec<f32>, String> {
     Ok(out)
 }
 
-/// Inverse of [`durable_key`]: split a co-processor key into `(kind, set, id)`,
+/// Inverse of `durable_key`: split a co-processor key into `(kind, set, id)`,
 /// or `None` for any key not under [`KEY_PREFIX`] (a foreign key the rebuild
 /// scan skips). `id` is empty for a config key. Used by the cold-start rebuild
 /// to reconstruct the index from the durable rows (ADR-0017 D3).
@@ -552,7 +552,7 @@ pub fn parse_durable_key(key: &[u8]) -> Option<(u8, Vec<u8>, Vec<u8>)> {
 /// expiry in ms since epoch)`. See [`decode_vec_row`].
 pub type DecodedVecRow = (Vec<f32>, Option<Vec<u8>>, Option<u64>);
 
-/// Inverse of [`encode_vec_row`]: `(vector, optional meta, optional expiry-ms)`
+/// Inverse of `encode_vec_row`: `(vector, optional meta, optional expiry-ms)`
 /// from a durable vector value. A leading `@<ms>` + 0x1e is the optional expiry
 /// header; its absence is a no-TTL v0.1 row.
 pub fn decode_vec_row(val: &[u8]) -> Result<DecodedVecRow, String> {

@@ -3,7 +3,8 @@
 //!
 //! # What this replaces and why
 //!
-//! [`crate::pool`] shares each backend connection between every proxy thread
+//! `crate::pool` — removed with ADR-0021 stage 2 (36412e2e), which is why this
+//! is not a link — shared each backend connection between every proxy thread
 //! routing to that node. Measured on a fleet 2026-08-17, that is where the
 //! design falls over — everything degrades in the ratio
 //! `proxy threads / pooled connections`, which is 1 at 8 clients and 8 at 64:

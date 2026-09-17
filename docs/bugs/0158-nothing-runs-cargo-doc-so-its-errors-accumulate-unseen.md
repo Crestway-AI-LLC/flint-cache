@@ -1,6 +1,6 @@
-# BUG-0158: nothing runs `cargo doc`, so 108 rustdoc errors accumulated unseen (OPEN)
+# BUG-0158: nothing runs `cargo doc`, so 108 rustdoc errors accumulated unseen (FIXED 2026-09-17)
 
-Status: **OPEN**, found 2026-09-16 while gating an unrelated change · Severity:
+Status: **FIXED 2026-09-17**, found 2026-09-16 while gating an unrelated change · Severity:
 **low-medium** — not a product defect and not a release blocker: the bundle is
 14 binaries and carries no rustdoc. What it is, is a check this repo does not
 have, in a repo whose sibling gates the same check, plus the debt that absence
@@ -144,3 +144,40 @@ above, so the breakdown is above.
 Not started. Filed rather than fixed because it was found while gating something
 else, and a doc sweep inside an unrelated change is how an unrelated change
 stops being reviewable.
+
+## Fixed
+
+**Both halves, because either alone rots.** The 108 errors are gone and
+`cargo doc` now runs in the gate's `check` stage, so the count cannot climb
+again where nothing is looking:
+
+```
+step "doc" doc \
+  env RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --keep-going
+```
+
+**69 lines, three shapes.** 64 were the house-style placeholders and were
+rewritten mechanically from rustdoc's own `file:line` list, then read as a diff:
+
+- **usage TABLE rows** (`CPADDPROXY <addr>` and a description column) take the
+  whole command span in backticks, with two spaces removed from the padding so
+  the description column stays where the table had it. Backticking each
+  placeholder separately would have shifted every row by a different amount and
+  left the table ragged.
+- **prose** takes the placeholder alone: `pairs[i]`, `--journal <cp-addr>`.
+- **quoted formats** take the whole quote: `"flint|<key>|<seq>|<crc>"`.
+
+**Five were not style and needed deciding**, which is the reason this was not a
+single `sed`:
+
+- `crates/flint-proxy/src/apool.rs` linked `crate::pool`, a module DELETED in
+  `36412e2e` (ADR-0021 stage 2). The prose is still true and the link was not:
+  it now names the module as removed, and says why it is not a link.
+- three `flint-vec` doc comments linked private helpers (`durable_key`,
+  `encode_vec_row`) from public items. The text was right; the link is what
+  rustdoc refuses, so they are plain code spans now.
+- `crates/flint-conformance/src/main.rs` had an INDENTED block in `//!`, which
+  rustdoc compiles as Rust — the trap BUG-0162 hit the same day. It is prose
+  with inline backticks now, like the rest of this repo.
+
+**Measured after: `exit 0`, zero errors.**
