@@ -111,12 +111,28 @@ runner anyway, which never takes this branch.
   on this Mac: old form exit 2, new form (`|| true`) exit 0 with an empty
   cgroup.
 
+## Measured, on a box kept after the gate
+
+The bare gate passed at 161 steps. With the box kept, the placement was
+measured rather than inferred — one machine, one binary, one login session:
+
+    my shell           0::/user.slice/user-1000.slice/session-21.scope
+    (a) unprivileged   0::/user.slice/user-1000.slice/session-21.scope   (warns, stays)
+    (b) as root        0::/system.slice/flint-spawn-node-r-290167.service
+        and the unit   flint-spawn-node-r-290167.service "flintctl host-spawn node-r"
+
+(b) is the ops agent's path, because the remote runner runs `sudo -n`.
+
+The same run also shows both halves executed rather than skipping, which a
+green verdict alone would not: `host_verbs_drill` took the warning branch in
+`/user.slice/.../session-12.scope` and read the marker back from it, and all
+ten unit tests ran in both feature configs.
+
 ## Not claimed
 
-That the re-run places a seat under `system.slice` on the playground. That is
-`systemd-run`'s behaviour with flags proven there since 2026-08-09, not
-something this change has yet demonstrated on that box. The next remote spawn
-there is the first observation of it, and its cgroup is the thing to read.
+That this has happened on the PLAYGROUND. The box above is an AL2023 gate box —
+the same family, not that machine. The next remote spawn there is the first
+observation of it, and its cgroup is the thing to read.
 
 Also recorded, and not fixed here: `sudo` already journals `host-spawn`'s full
 argv, `--env` values included. Those values are storage tuning and
