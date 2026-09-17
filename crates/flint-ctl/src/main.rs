@@ -1223,6 +1223,54 @@ fn cpinfo_controllers(
     )
 }
 
+/// One `controller:` row, as `state::render_controllers` writes it and
+/// `cpinfo_controllers` hands it back with the prefix already stripped:
+/// `<host>:<pid> build=<build> live|STALE last_seen_ms_ago=<n>`.
+struct ControllerRow {
+    id: String,
+    build: String,
+    live: bool,
+    age_ms: u64,
+}
+
+/// Parse one row, or `None` when it is not the shape above.
+///
+/// The caller must not read `None` as "no controller": a row this build cannot
+/// parse is a row the CP DID return, and reporting that as an absent
+/// controller would be BUG-0159 rebuilt one level down — the two states that
+/// look alike collapsed into the reassuring one.
+fn parse_controller_row(row: &str) -> Option<ControllerRow> {
+    let mut fields = row.split_whitespace();
+    let id = fields.next()?.to_string();
+    let (mut build, mut live, mut age_ms) = (None, None, None);
+    for f in fields {
+        if let Some(b) = f.strip_prefix("build=") {
+            build = Some(b.to_string());
+        } else if let Some(a) = f.strip_prefix("last_seen_ms_ago=") {
+            age_ms = a.parse::<u64>().ok();
+        } else if f == "live" || f == "STALE" {
+            live = Some(f == "live");
+        }
+    }
+    Some(ControllerRow {
+        id,
+        build: build?,
+        live: live?,
+        age_ms: age_ms?,
+    })
+}
+
+/// How long `verify` waits for a controller to register before calling it
+/// absent (BUG-0159).
+///
+/// MUST EXCEED the controller's own `REGISTER_EVERY`, which is 30s in
+/// `crates/flint-controller/src/main.rs`: the CP holds the registry in a
+/// `#[serde(skip)]` map, so a control plane that restarted knows of no
+/// controller until the next tick, and `verify_after` runs in exactly that
+/// window. `gates.sh` asserts the two numbers still agree, because a budget
+/// that silently falls under the interval turns every roll red.
+const CONTROLLER_REGISTER_WINDOW: Duration = Duration::from_secs(45);
+
 /// How many fleet-journal lines the status document carries. The HEAD, not
 /// the journal: this is a snapshot taken beside the fleet's configuration,
 /// and a caller who wants history has `CPJOURNALREAD` directly.
@@ -5081,6 +5129,140 @@ fn verify_checks(
         "single build across the fleet",
         format!("{builds:?}"),
     );
+
+    // BUG-0159: THE ONE COMPONENT THIS COMMAND COULD NOT SEE THE ABSENCE OF.
+    // Everything else here is probed by dialling it; the controller has no
+    // listener by design, so the only evidence it is running is the row it
+    // pushes to the CP. Until this section `verify` never asked, so a fleet
+    // with pairs up, a reachable CP and NO controller answered every question
+    // correctly and passed — while nothing would promote a replica when a
+    // master died. Observed on the playground: `status` said
+    // `controller NONE REPORTING` and `verify` said OK, and both were right.
+    head("== controller (reported by the CP, never probed)");
+    if !inv.controller {
+        note(
+            true,
+            "not declared",
+            "this inventory runs no controller, so no master is promoted automatically".into(),
+        );
+    } else {
+        // THREE STATES, AND COLLAPSING THEM IS THE TRAP. `None` from every
+        // seat means nothing could be ASKED; `Some([])` means a CP answered
+        // and knows of none. They are not the same fact, and only one is a
+        // controller problem.
+        //
+        // AN EMPTY ANSWER IS WAITED OUT RATHER THAN BELIEVED, because
+        // `verify_after` runs seconds after `upgrade`, `expand`, `swap` and
+        // `roll` — exactly when "asked, and none yet" is both true and
+        // meaningless. A CP that just restarted holds no rows at all until
+        // the controller's next tick.
+        let deadline = Instant::now() + CONTROLLER_REGISTER_WINDOW;
+        let mut answered;
+        let mut raw = Vec::<String>::new();
+        loop {
+            answered = false;
+            raw.clear();
+            for i in 0..inv.cp.len() {
+                if let Some(rows) = cpinfo_controllers(&cp_dial(inv, i), &tls) {
+                    answered = true;
+                    raw.extend(rows);
+                }
+            }
+            let live_yet = raw
+                .iter()
+                .filter_map(|r| parse_controller_row(r))
+                .any(|r| r.live);
+            if live_yet || Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_secs(2));
+        }
+        let parsed: Vec<ControllerRow> =
+            raw.iter().filter_map(|r| parse_controller_row(r)).collect();
+        let live: Vec<&ControllerRow> = parsed.iter().filter(|r| r.live).collect();
+        let waited = CONTROLLER_REGISTER_WINDOW.as_secs();
+        if !answered {
+            note(
+                false,
+                "controller state is unknown",
+                "no control plane answered, so this says nothing either way — the reachability \
+                 failure above is the finding, not an absent controller"
+                    .into(),
+            );
+        } else if parsed.is_empty() && !raw.is_empty() {
+            note(
+                false,
+                "controller rows are readable",
+                format!(
+                    "the CP answered with {} row(s) this build cannot parse: {raw:?}",
+                    raw.len()
+                ),
+            );
+        } else if parsed.is_empty() {
+            note(
+                false,
+                "a controller is registered",
+                format!(
+                    "no controller registered with any control plane in {waited}s — this fleet \
+                     does NOT fail over: a dead master stays dead until an operator promotes one"
+                ),
+            );
+        } else if live.is_empty() {
+            let newest = parsed.iter().map(|r| r.age_ms).min().unwrap_or(0) / 1000;
+            note(
+                false,
+                "a controller is reporting",
+                format!(
+                    "{} row(s) and every one is STALE, the newest {newest}s ago — a controller \
+                     registered and stopped, which is the same outage as none at all",
+                    parsed.len()
+                ),
+            );
+        } else {
+            note(
+                true,
+                "a controller is reporting",
+                format!("{} ({}s ago)", live[0].id, live[0].age_ms / 1000),
+            );
+            // A ROLL LEAVES A SECOND LIVE ROW, so this is reported and not
+            // failed. Rows are keyed by `host:pid`, and the REPLACED
+            // controller's row stays `live` for CONTROLLER_STALE_MS (90s)
+            // after its process is gone. Two live rows minutes apart is the
+            // duplicate-controller condition the map exists to reveal; two
+            // live rows seconds after a roll is just the roll.
+            if live.len() > 1 && loud {
+                println!(
+                    "  --   {} live rows ({}). After a roll the replaced controller's row stays \
+                     live for 90s; if this persists, two controllers supervise one fleet.",
+                    live.len(),
+                    live.iter()
+                        .map(|r| r.id.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+            // The controller rolls with the fleet and reports its build
+            // through the same `flint_build::version` the nodes do, so the
+            // strings are comparable. Skipped when no node answered, because
+            // then the fleet set is empty and every build "mismatches".
+            if !builds.is_empty() {
+                let stale_build: Vec<String> = live
+                    .iter()
+                    .filter(|r| !builds.contains(&r.build))
+                    .map(|r| format!("{}={}", r.id, r.build))
+                    .collect();
+                note(
+                    stale_build.is_empty(),
+                    "controller build matches the fleet",
+                    if stale_build.is_empty() {
+                        live[0].build.clone()
+                    } else {
+                        format!("{stale_build:?} against the fleet's {builds:?}")
+                    },
+                );
+            }
+        }
+    }
 
     // The inventory's declared `capacity` against the disk each node actually
     // has. Nodes already report disk_total_bytes (the headroom guard samples

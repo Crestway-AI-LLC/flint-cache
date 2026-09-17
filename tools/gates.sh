@@ -232,7 +232,7 @@ CORE="${FLINT_CORE_ORDER:-kill_order bind_dial_sites seat_names restart repl kil
       scan slot_cutover slot_cutover_recovery slot_moved snapshot_restore
       tenant tenant_rebalance tenant_remove token_hash
       write_deadline fullsync_rate edge_reroute rewind_rejoin wal_headroom wal_budget evictable_ns evictable_agree min_replicas_survivable roll_shed proxy_chain
-      walgap_quarantine three_member_repoint pipeline_nodelay batch_commit_failure build_read_failure cp_watch_idle reattach_node induced_ratchet collection_admission wal_window flintinfo_numeric host_verbs start_first_member_down}"
+      walgap_quarantine three_member_repoint pipeline_nodelay batch_commit_failure build_read_failure cp_watch_idle reattach_node induced_ratchet collection_admission wal_window flintinfo_numeric host_verbs start_first_member_down verify_controller}"
 CHAOS="chaos proxy_chaos chaos_unreadable hotkey_chaos"
 
 # DELIBERATELY OUT, with the reason. An absence with no reason beside it is
@@ -2120,6 +2120,43 @@ CPVPY
 # SKIPS LOUDLY when no flint-kv checkout sits beside this one. The gate box
 # syncs only this repo, so skipping is the COMMON case and must never read as a
 # pass -- same shape, and the same reason, as assert_no_cross_repo_ports.
+assert_verify_waits_out_registration() {
+  # BUG-0159. `verify`'s controller check waits CONTROLLER_REGISTER_WINDOW for a
+  # row to appear before calling the controller absent, and the controller
+  # announces itself every REGISTER_EVERY. The two constants live in different
+  # crates with nothing linking them: let the window fall to or under the
+  # interval and `verify_after` reddens after every roll, on fleets that are
+  # perfectly healthy -- the false alarm the window exists to prevent.
+  #
+  # Both numbers are READ. A grep that stops matching fails this check rather
+  # than passing it, because "the constant is gone" and "the constants agree"
+  # produce the same empty output otherwise.
+  local win_line every_line win every
+  win_line=$(grep -m1 'const CONTROLLER_REGISTER_WINDOW' crates/flint-ctl/src/main.rs 2>/dev/null)
+  every_line=$(grep -m1 'const REGISTER_EVERY' crates/flint-controller/src/main.rs 2>/dev/null)
+  win=$(printf '%s' "$win_line" | sed -n 's/.*from_secs(\([0-9][0-9]*\)).*/\1/p')
+  every=$(printf '%s' "$every_line" | sed -n 's/.*from_secs(\([0-9][0-9]*\)).*/\1/p')
+  if [ -z "$win" ] || [ -z "$every" ]; then
+    echo "FAIL  the verify/controller registration budgets could not both be read:"
+    echo "        flint-ctl CONTROLLER_REGISTER_WINDOW : ${win:-<not found>}"
+    echo "        flint-controller REGISTER_EVERY      : ${every:-<not found>}"
+    echo "        If either was renamed or removed, this check must be taught the"
+    echo "        new name in the same commit -- an unreadable constant is not an"
+    echo "        agreeing one."
+    FAILED="$FAILED verify-register-window"
+    return 0
+  fi
+  if [ "$win" -le "$every" ]; then
+    echo "FAIL  verify waits ${win}s for a controller row while the controller"
+    echo "        registers every ${every}s, so a control plane that restarted"
+    echo "        can still know of no controller when the wait expires and"
+    echo "        verify_after reddens a healthy roll (BUG-0159)."
+    FAILED="$FAILED verify-register-window"
+    return 0
+  fi
+  echo "  verify waits ${win}s for a controller row, past the controller's ${every}s registration tick"
+}
+
 assert_sibling_lock_path_is_pinned() {
   # RESOLVED FROM THE PRIMARY WORKTREE, not from `..`, and that is what makes
   # this check run at all. Every drill change here is made in a linked worktree
@@ -3805,6 +3842,7 @@ document_assertions() {
   assert_no_port_overlap
   assert_no_cross_repo_ports
   assert_sibling_lock_path_is_pinned
+  assert_verify_waits_out_registration
   assert_dials_are_bounded
   assert_cp_verbs_agree_across_paths
   assert_tools_threads_are_daemons
