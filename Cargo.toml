@@ -50,17 +50,26 @@ edition = "2024"
 # instead of an opaque edition error — the first thing a self-hoster on RHEL or
 # Debian stable would have hit.
 #
-# The number is 1.88 because that is what the DEPENDENCIES need, not the
+# The number was 1.88 because that is what the DEPENDENCIES needed, not the
 # edition: edition 2024 needs 1.85, and 1.85 was declared here for five months
 # while hdrhistogram, time and validit all required 1.88. cargo refuses at
 # RESOLUTION, so our own code had never once been compiled at the version
-# published as the minimum (BUG-0039).
+# published as the minimum (BUG-0039). It is 1.89 now for the opposite reason
+# -- OUR code, not the dependencies -- which is the note below.
 #
 # It is now checked rather than decorative, in two places that both READ this
 # line rather than restating it: `.github/workflows/msrv.yml` on every push,
 # and `tools/gates.sh msrv`, which adds the `rocks` feature config the workflow
 # does not build. Raise or lower this and both follow.
-rust-version = "1.88"
+#
+# RAISED TO 1.89 ON 2026-09-17 (BUG-0166) because `flint-ctl`'s seat lock uses
+# `File::try_lock`, stable in 1.89 -- so the workspace had stopped building at
+# its own declared floor, and CI's msrv leg had been red for two days while
+# every gate stayed green, because the gate's default run excludes that stage
+# by design. The declaration was raised rather than the lock rewritten: the
+# lock is what stops two flintctl processes spawning one seat twice
+# (BUG-0144 / OPS-0250), and 1.89 shipped in August 2025.
+rust-version = "1.89"
 license = "Elastic-2.0"
 repository = "https://github.com/Crestway-AI-LLC/flint-cache"
 # These crates are the product, not libraries for crates.io. Elastic-2.0 is

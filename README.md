@@ -367,7 +367,7 @@ those from the
 [Releases page](https://github.com/Crestway-AI-LLC/flint-cache/releases/latest)
 and skip this section entirely ([docs/self-hosting.md](docs/self-hosting.md)).
 
-- **Rust 1.88 or newer** — the `rust-version` in `Cargo.toml`, which is what
+- **Rust 1.89 or newer** — the `rust-version` in `Cargo.toml`, which is what
   the dependency set needs rather than what the edition does. `rustup`
   recommended; several distro
   toolchains are older and will refuse to build.
