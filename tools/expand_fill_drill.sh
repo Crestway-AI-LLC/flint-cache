@@ -62,7 +62,12 @@ echo "  $TOTAL keys on :$P0 across 6 tags"
 echo "== expand: a second pair joins holding NOTHING"
 d1="$FLINT_DRILL_ROOT/flint-xf-$P1"; rm -rf "$d1"
 $B --port $P1 --engine rocks --data-dir "$d1" 2>>"${FLEET_SCOPE}server.log" &
-fleet_wait_listen $P1
+# READY, NOT MERELY BOUND (BUG-0165). Since #176 a node binds and answers from
+# inside its load, so DBSIZE below can come back `-LOADING Flint is loading the
+# dataset in memory` -- which lands in EMPTY as a string and fails the control
+# that is supposed to prove the pair starts at zero. That is what reddened a
+# gate run: a harness race reported as "the joining pair is not empty".
+fleet_wait_ping $P1
 # THE CONTROL FOR THE WHOLE DRILL. "The new pair ended up with keys" is
 # satisfied by a pair that always had them, so prove it starts at zero.
 EMPTY=$(valkey-cli -p $P1 DBSIZE)
