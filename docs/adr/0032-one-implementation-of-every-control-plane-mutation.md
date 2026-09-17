@@ -128,6 +128,8 @@ own:
 3. **Dispatch builds `Mutation`.** The two dispatch functions stay, because the
    transports genuinely differ; what stops being duplicated is what each verb
    MEANS. The verb-parity guard already asserts the tables match.
+   **DONE 2026-09-17** — see "Step 3" below. It left the verbs' REFUSALS in two
+   places, and eleven of them disagree (BUG-0160).
 4. **Delete the duplicate `shuffle_shard`**, and let the fast mirror be derived
    at one place from the applied state rather than maintained beside it.
    **First half done 2026-09-16** with step 1, because unifying the types made
@@ -137,7 +139,10 @@ own:
 
 **`apply()` becomes the only place a mutation means anything**, which is what
 makes a single unit test authoritative about the product — the thing ADR-0030
-discovered it was not.
+discovered it was not. (Step 3 split it: the meaning is `apply_mutation`, and
+`apply` is that plus the Raft path's version bump. A unit test of an arm is
+authoritative about what a verb DOES on both paths, and says nothing about what
+either path refuses.)
 
 **Mixed-version replay is already a live consideration and gets no worse.**
 ADR-0030's refill and BUG-0151's repoint both changed what `apply` does with a
@@ -283,6 +288,90 @@ miss and `lease_after_repoint` found BUG-0151's, both against the single-node
 plane. Under this change they exercise the same code the raft path runs, which
 is the point — but the Raft-specific drills (`controlplane_ha`, `ctl_cpha`,
 `cpha_roll`) stay, because the transport is what they are about.
+
+## Step 3, done (2026-09-17)
+
+**Every mutation in `main.rs` now goes through `RegistryState::apply_mutation`**:
+27 dispatch arms and the first-boot admin-token seed, 28 sites. None of them
+writes a registry field directly any more.
+
+**`apply` was split first, because the two paths disagree about who owns the
+version.** Under Raft the log's ordering defines it, so `apply` bumps. On the
+single-node path persistence defines it, so `commit()` bumps. Calling `apply`
+from single-node dispatch would have bumped every verb twice. So
+`apply_mutation` is the match and nothing else: no version, no persistence, no
+wakeup. `apply` is the version bump plus that call, and it is still the Raft
+path's only entry.
+
+**The rule each arm followed: dispatch keeps the DECISION, the mutation takes
+the CHANGE.** What to refuse, and whether anything happens at all, stays in the
+handler. What happening means is the mutation's. Most arms converted
+mechanically. These did not, and each is why the rule is worded that way:
+
+- **`CPDELPROXY` is where ADR-0030 lived.** The retire-and-refill had two
+  copies, and the first version of that fix landed in only one of them. It now
+  has one copy.
+- **`CPSETPAIR` reads `old` without mutating.** The handler used
+  `mem::replace` to capture the old membership. Doing that and then applying
+  `SetPair` would repoint the lease row twice, the second time from the new
+  membership to itself.
+- **`CPCLEARSLOT` asks before it applies.** The refusal (`no such exception`)
+  used to come from `clear_slot_owner`'s return value. A mutation cannot hand
+  one back, because a log entry cannot mean different things depending on what
+  it found. So coverage became `tenant::covers_slot`, and `clear_slot_owner`
+  stopped returning anything. Both use one private `run_covers`, so the question
+  the handler asks and the rows the mutation removes cannot disagree.
+- **`CPADDPROXY`, `CPADDPAIR` and `CPADMINDROPPREV` keep their condition.**
+  Applying unconditionally would be correct, because every mutation is total.
+  It would also commit, bump the version and wake every watch loop for a no-op.
+- **`CPMYROTATE` and `CPMYCONFIG` resolve the tenant by MAP KEY**, since that is
+  what the mutation looks it up by. They used to edit the entry the token lookup
+  matched.
+
+**Two single-node behaviours changed**, and each has a test at the command
+surface in `main.rs` (`step3_dispatch_tests`):
+
+- **A lost lease-adoption race answers from the winning row.** Two first
+  touches for one pair can both miss the fast mirror, which is read under a
+  different lock. The loser then took the state lock and pushed a SECOND durable
+  row behind the winner's. `LeaseAdopt` refuses to. So a straight conversion
+  would have committed and mirrored a row the mutation never wrote, and the
+  mirror would have drifted from its record. The loser now gets `OK` or
+  `SUPERSEDED <master>` from the existing row, which is what the fast path would
+  have said a moment later. Found by making dispatch agree with the mutation,
+  not observed in a run.
+- **`CPFENCE` bumps the version once.** Single-node bumped it twice:
+  `commit()`, and then an explicit increment to publish a promotion hint that was
+  set after the commit. `Fence` sets the hint before the commit, so that second
+  bump had nothing left to publish. Raft has always bumped once for this verb.
+  Both callers, the controller and flintctl, check only for a `+` reply, and the
+  bump's job is waking `CPWATCH`.
+
+**`CPPROMOTED` is the one verb whose bump dispatch still owns.** It never
+commits, because the hint is deliberately not durable, so no `commit()` exists
+to bump for it.
+
+**Deleted: `set_exception`, `clear_exception` and `consolidate`.** Step 1 put
+them on the unified type so the single-node dispatch compiled unchanged. After
+step 3 their only caller was a test, and a second route to one change is what
+this step removes. The test now drives `apply_mutation`.
+
+**What stays in dispatch, on purpose:**
+
+- **The `Shared::leases` fast mirror** (`CPSETPAIR`, `CPFENCE`, `CPLEASE`). A
+  cache is not state, so `apply_mutation` must not know about it. Deriving it
+  from applied state is step 4's second half.
+- **`CPLEASE`'s `leases.pop()` after a failed commit.** It undoes a change that
+  persistence refused. It is not a verb.
+- **`CPCONTROLLER` and `CPTENANTUSAGE`**, which were never registry state.
+
+**What step 3 did not unify: refusals.** Comparing the two dispatchers arm by
+arm for this step found that on Raft, eleven verbs skip the refusal single-node
+makes. `CPTENANTQUOTA`, `CPSETSUBSET`, `CPDELPROXY` and eight more propose
+unconditionally, commit a no-op, and reply `OK` for a name that does not exist.
+The one drill asserting those refusals runs one control-plane seat. Filed as
+**BUG-0160** rather than fixed here, because it is a change to what the
+production control plane answers and deserves its own gate.
 
 ## The question this ADR asked, and its answer
 

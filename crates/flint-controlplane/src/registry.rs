@@ -270,9 +270,30 @@ pub fn shuffle_shard(name: &str, fleet: &[String], k: usize) -> Vec<String> {
 }
 
 impl RegistryState {
+    /// Apply a mutation, and bump the version because the LOG's ordering is
+    /// what defines it. The Raft path's entry point.
     pub fn apply(&mut self, m: Mutation) {
         self.version += 1;
+        self.apply_mutation(m);
+    }
 
+    /// WHAT A VERB MEANS, and nothing else: no version, no persistence, no
+    /// wakeup. ADR-0032 step 3.
+    ///
+    /// The two dispatch functions stay, because the transports genuinely
+    /// differ — one answers a client on the socket and the other proposes to a
+    /// log — and so does WHO OWNS THE VERSION. Under Raft the log's ordering
+    /// defines it, so `apply` bumps. On the single-node path persistence
+    /// defines it, so `commit()` bumps and dispatch calls THIS function. Fold
+    /// those together and every single-node verb bumps twice, which the
+    /// snapshot-push protocol keys on and no test would obviously catch.
+    ///
+    /// What stops being duplicated is the middle: the inline mutations in
+    /// `main.rs` that meant the same thing as these arms and could drift from
+    /// them -- 28 sites, each now a single call to this function. ADR-0030 is what that drift costs — a refill landing in this
+    /// function alone, six green unit tests, and the path the drill actually
+    /// exercises doing nothing at all.
+    pub fn apply_mutation(&mut self, m: Mutation) {
         match m {
             Mutation::Promoted { addr } => {
                 // Monotonic per CP process. Compared for INEQUALITY by the
@@ -498,24 +519,12 @@ impl RegistryState {
         crate::state::render_controllers(&self.controllers)
     }
 
-    /// Record `(ns, slot) -> pair_idx`, replacing any previous owner row.
-    pub fn set_exception(&mut self, ns: &str, slot: u16, pair: u16) {
-        let n = self.pairs.len();
-        crate::tenant::set_slot_owner(&mut self.exceptions, ns, slot, pair, &self.ranges, n);
-    }
-
-    /// Retire `(ns, slot)` from the table (splits an interior hit).
-    pub fn clear_exception(&mut self, ns: &str, slot: u16) -> bool {
-        crate::tenant::clear_slot_owner(&mut self.exceptions, ns, slot)
-    }
-
-    /// The consolidation sweep: merge adjacent runs, drop redundant ones.
-    /// Returns the row count after.
-    pub fn consolidate(&mut self) -> usize {
-        let n = self.pairs.len();
-        crate::tenant::normalize(&mut self.exceptions, &self.ranges, n);
-        self.exceptions.len()
-    }
+    // `set_exception`, `clear_exception` and `consolidate` lived here for one
+    // step: ADR-0032 step 1 gave them to this type so the single-node dispatch
+    // compiled unchanged, and step 3 moved that dispatch onto
+    // `SetSlotOwner`/`ClearSlotOwner`/`ConsolidateSlots`, which call the same
+    // three tenant.rs functions. A second route to one change is the thing the
+    // step removes, so they went rather than staying for their test.
 
     /// The snapshot a given proxy should see: shared pair topology + ONLY
     /// the tenants whose subset includes it (the sub-group boundary).
@@ -523,11 +532,9 @@ impl RegistryState {
         crate::tenant::snapshot_tuple(self.snapshot_source(), proxy)
     }
 
-    /// Borrow the fields a snapshot renders from — the mirror of
-    /// `State::snapshot_source`, and the only place the two types still say the
-    /// same thing twice. Step 1 of ADR-0032 removes even this by making
-    /// `RegistryState` the single type; until then, both fill one struct and
-    /// call one renderer.
+    /// Borrow the fields a snapshot renders from. Once one of two copies that
+    /// filled this struct for the same renderer; since ADR-0032 step 1 made
+    /// `State` an alias of this type, it is the only one.
     pub fn snapshot_source(&self) -> crate::tenant::SnapshotSource<'_> {
         crate::tenant::SnapshotSource {
             version: self.version,

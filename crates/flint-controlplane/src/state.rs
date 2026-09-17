@@ -537,6 +537,7 @@ mod tests {
 
     #[test]
     fn exceptions_are_subset_filtered_per_proxy() {
+        use crate::registry::Mutation;
         let dir = TempDir::new("exc");
         let mut s = State::load_or_new(dir.0.join("state"));
         s.proxies = vec!["p1".into(), "p2".into()];
@@ -561,28 +562,44 @@ mod tests {
                 },
             );
         }
+        // Through `apply_mutation`, as CPSETSLOT, CPCLEARSLOT and CPCONSOLIDATE
+        // now are (ADR-0032 step 3): the helpers this test used to call were a
+        // second route to the same change, and it had no other caller left.
+        let set = |s: &mut State, ns: &str, slot: u16, pair: u16| {
+            s.apply_mutation(Mutation::SetSlotOwner {
+                ns: ns.into(),
+                slot,
+                pair,
+            })
+        };
         // Slots 100/200: default owner is pair 0 (count-derived) — pointing
         // them at pair 1 is a real exception.
-        s.set_exception("acme", 100, 1);
-        s.set_exception("bravo", 200, 1);
+        set(&mut s, "acme", 100, 1);
+        set(&mut s, "bravo", 200, 1);
         let (_, _, _, _, exc1, _) = s.snapshot_for("p1");
         let (_, _, _, _, exc2, _) = s.snapshot_for("p2");
         // Each proxy sees ONLY its served tenants' rows (R4 boundary).
         assert_eq!(exc1, "acme:100:1");
         assert_eq!(exc2, "bravo:200:1");
         // Adjacent same-pair commits COMPRESS into one run row.
-        s.set_exception("acme", 101, 1);
-        s.set_exception("acme", 102, 1);
+        set(&mut s, "acme", 101, 1);
+        set(&mut s, "acme", 102, 1);
         let (_, _, _, _, exc1, _) = s.snapshot_for("p1");
         assert_eq!(exc1, "acme:100-102:1");
         assert_eq!(s.exceptions.len(), 2, "one acme run + one bravo single");
-        // An interior clear SPLITS the run.
-        assert!(s.clear_exception("acme", 101));
+        // An interior clear SPLITS the run. Coverage is asked first, as the
+        // CPCLEARSLOT arm asks it before refusing, and asked again after.
+        assert!(crate::tenant::covers_slot(&s.exceptions, "acme", 101));
+        s.apply_mutation(Mutation::ClearSlotOwner {
+            ns: "acme".into(),
+            slot: 101,
+        });
+        assert!(!crate::tenant::covers_slot(&s.exceptions, "acme", 101));
         let (_, _, _, _, exc1, _) = s.snapshot_for("p1");
         assert_eq!(exc1, "acme:100:1;acme:102:1");
         // Committing a move BACK to the default owner self-retires the row
         // (the safe alternative to CPCLEARSLOT).
-        s.set_exception("acme", 100, 0);
+        set(&mut s, "acme", 100, 0);
         let (_, _, _, _, exc1, _) = s.snapshot_for("p1");
         assert_eq!(exc1, "acme:102:1");
         // Runs survive the line-format round-trip.
@@ -595,9 +612,10 @@ mod tests {
                 ("bravo".to_string(), 200, 200, 1)
             ]
         );
-        // consolidate() reports the surviving row count.
+        // The sweep keeps both surviving rows: the count CPCONSOLIDATE replies.
         let mut s = r;
-        assert_eq!(s.consolidate(), 2);
+        s.apply_mutation(Mutation::ConsolidateSlots);
+        assert_eq!(s.exceptions.len(), 2);
     }
 
     #[test]

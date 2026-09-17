@@ -167,17 +167,37 @@ pub fn set_slot_owner(
     normalize(runs, ranges, pair_count);
 }
 
+/// Whether one run covers `ns`'s `slot`: the single definition of coverage,
+/// which `covers_slot` asks of a table and `clear_slot_owner` of each row.
+fn run_covers((n, lo, hi, _): &SlotRun, ns: &str, slot: u16) -> bool {
+    n == ns && (*lo..=*hi).contains(&slot)
+}
+
+/// Whether any run gives `ns`'s `slot` an owner other than its pair's default.
+///
+/// Split out so that `clear_slot_owner` and the dispatch arm that must REFUSE
+/// when nothing covers the slot ask the same question (ADR-0032 step 3). The
+/// mutation cannot answer it — `Mutation::ClearSlotOwner` returns nothing, by
+/// design, because a Raft entry's meaning cannot depend on what it found — so
+/// the alternative was a second copy of this predicate inline in `main.rs`,
+/// which is the duplication the step exists to remove.
+pub fn covers_slot(runs: &[SlotRun], ns: &str, slot: u16) -> bool {
+    runs.iter().any(|run| run_covers(run, ns, slot))
+}
+
 /// Remove `slot` from any run covering it (splitting when interior).
-/// Returns whether anything covered it.
-pub fn clear_slot_owner(runs: &mut Vec<SlotRun>, ns: &str, slot: u16) -> bool {
-    let mut hit = false;
+///
+/// Returns nothing, for the reason `covers_slot` exists: whether anything was
+/// covered is a question for the caller to ask BEFORE applying, not an answer
+/// a replicated mutation can hand back.
+pub fn clear_slot_owner(runs: &mut Vec<SlotRun>, ns: &str, slot: u16) {
     let mut out: Vec<SlotRun> = Vec::with_capacity(runs.len() + 1);
-    for (n, lo, hi, p) in runs.drain(..) {
-        if n != ns || slot < lo || slot > hi {
-            out.push((n, lo, hi, p));
+    for run in runs.drain(..) {
+        if !run_covers(&run, ns, slot) {
+            out.push(run);
             continue;
         }
-        hit = true;
+        let (n, lo, hi, p) = run;
         if lo < slot {
             out.push((n.clone(), lo, slot - 1, p));
         }
@@ -186,7 +206,6 @@ pub fn clear_slot_owner(runs: &mut Vec<SlotRun>, ns: &str, slot: u16) -> bool {
         }
     }
     *runs = out;
-    hit
 }
 
 /// The consolidation sweep (also applied on every mutation): sort, merge

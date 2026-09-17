@@ -158,8 +158,12 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
             let Ok(mut st) = shared.state.lock() else {
                 return err("state lock");
             };
+            // THE CONDITION STAYS IN DISPATCH, the change does not. Calling
+            // apply_mutation unconditionally would be correct -- AddProxy
+            // re-checks containment -- and would still commit, bump the
+            // version and wake every proxy's watch loop for a no-op.
             if !st.proxies.contains(&addr) {
-                st.proxies.push(addr);
+                st.apply_mutation(registry::Mutation::AddProxy(addr));
                 match st.commit() {
                     Ok(_) => {}
                     Err(e) => return err(&format!("persist: {e}")),
@@ -178,24 +182,18 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
             if !st.proxies.iter().any(|p| p == &addr) {
                 return err(&format!("no such proxy {addr}"));
             };
-            st.proxies.retain(|p| p != &addr);
-            // A retired proxy must not linger in any tenant's subset: leaving
-            // it there is the same trap one level down, and the tenant keeps
-            // a placement slot pointing at nothing.
+            // ADR-0030 LIVED HERE, and this is the line that closes it. The
+            // retire-and-refill was two implementations of one verb: the first
+            // version of that fix went into `Mutation::DelProxy` alone, six
+            // unit tests passed, and THIS path -- the one
+            // `subset_ratchet_drill` exercises -- did nothing at all. Both were
+            // then maintained side by side, agreeing, with nothing able to
+            // report them drifting again.
             //
-            // AND THE HOLE IS REFILLED (ADR-0030), through the SAME helper the
-            // raft path uses. This arm and `registry.rs`'s `Mutation::DelProxy`
-            // are two implementations of one verb, and the first version of
-            // this fix went into the other one only -- six unit tests passed
-            // and this path, which is what `subset_ratchet_drill` exercises,
-            // did nothing at all.
-            let proxies = st.proxies.clone();
-            crate::tenant::refill_after_retire(
-                &proxies,
-                st.tenants.values_mut(),
-                &addr,
-                state::shuffle_shard,
-            );
+            // Now there is one. A retired proxy must not linger in any
+            // tenant's subset and the hole it leaves must be refilled, and
+            // what that sentence means is `Mutation::DelProxy`.
+            st.apply_mutation(registry::Mutation::DelProxy(addr.clone()));
             match st.commit() {
                 Ok(_) => {}
                 Err(e) => return err(&format!("persist: {e}")),
@@ -223,12 +221,11 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
             let Ok(mut st) = shared.state.lock() else {
                 return err("state lock");
             };
+            // Same shape as CPADDPROXY: the dedupe decides whether anything
+            // happens, `AddPair` decides what happening means -- including
+            // padding `ranges` so the two vectors stay the same length.
             if !st.pairs.contains(&pair) {
-                st.pairs.push(pair);
-                while st.ranges.len() < st.pairs.len() - 1 {
-                    st.ranges.push(None);
-                }
-                st.ranges.push(range);
+                st.apply_mutation(registry::Mutation::AddPair { nodes: pair, range });
                 match st.commit() {
                     Ok(_) => {}
                     Err(e) => return err(&format!("persist: {e}")),
@@ -252,24 +249,30 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
             // Sorted, as CPADDPAIR is (BUG-0065's root fix): a repoint that
             // wrote an unsorted vector would let a later CPADDPAIR of the same
             // members past the `contains` dedupe as a second pair.
-            let (old, members) = {
-                let Some(p) = st.pairs.get_mut(idx) else {
-                    return err("no such pair index");
-                };
-                let mut members: Vec<String> = nodes.split(',').map(String::from).collect();
-                members.sort();
-                (std::mem::replace(p, members.clone()), members)
+            // READ `old` WITHOUT MUTATING, then let SetPair do the change.
+            // Replacing here to capture `old` and then applying would repoint
+            // twice, the second time from the new membership to itself.
+            let Some(old) = st.pairs.get(idx).cloned() else {
+                return err("no such pair index");
             };
-            // BOTH copies. `st.leases` is the durable record and `lf.entries`
-            // is the fast mirror CPLEASE actually reads on its hot path, so
-            // migrating only the first leaves the single-node control plane
-            // answering out of a row this repoint made stale (BUG-0151).
-            crate::tenant::repoint_lease_row(&mut st.leases, &old, &members);
+            let mut members: Vec<String> = nodes.split(',').map(String::from).collect();
+            members.sort();
+            st.apply_mutation(registry::Mutation::SetPair {
+                idx,
+                nodes: members.clone(),
+            });
             match st.commit() {
                 Ok(_) => {}
                 Err(e) => return err(&format!("persist: {e}")),
             }
             drop(st);
+            // THE FAST MIRROR STAYS IN DISPATCH, and that is not an oversight.
+            // `st.leases` is the durable record and `lf.entries` is the cache
+            // CPLEASE reads on its hot path; repointing only the first leaves
+            // this control plane answering out of a row the repoint made stale
+            // (BUG-0151). A cache is not state, so `apply_mutation` must not
+            // know about it -- deriving it from the applied state instead of
+            // maintaining it beside them is ADR-0032 step 4.
             if let Ok(mut lf) = shared.leases.lock() {
                 crate::tenant::repoint_lease_row(&mut lf.entries, &old, &members);
             }
@@ -298,23 +301,16 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
             }
             let subset = shuffle_shard(&name, &st.proxies, k);
             let reply = format!("OK tenant {name} ns {ns} subset [{}]", subset.join(","));
-            st.tenants.insert(
-                name.clone(),
-                Tenant {
-                    name,
-                    token,
-                    ns,
-                    subset,
-                    prev_token: None,
-                    replica_reads: false,
-                    local_cache: false,
-                    federated: false,
-                    async_writes: false,
-                    ops_per_sec: 0,
-                    max_bytes: 0,
-                    over_quota: false,
-                },
-            );
+            // The eleven field defaults were written out here AND in
+            // `Mutation::AddTenant`. Two literals of "what a new tenant is" is
+            // how BUG-0152's pair of flags came to be written in one place and
+            // not the other.
+            st.apply_mutation(registry::Mutation::AddTenant {
+                name,
+                token,
+                ns,
+                subset,
+            });
             match st.commit() {
                 Ok(_) => {}
                 Err(e) => return err(&format!("persist: {e}")),
@@ -334,11 +330,13 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
             let Ok(mut st) = shared.state.lock() else {
                 return err("state lock");
             };
-            let Some(t) = st.tenants.remove(&name) else {
+            // Read the namespace WITHOUT removing: the reply needs it, and
+            // `DelTenant` is what decides that removing a tenant also retires
+            // its namespace's slot-map exception rows.
+            let Some(ns) = st.tenants.get(&name).map(|t| t.ns.clone()) else {
                 return err("no such tenant");
             };
-            let ns = t.ns.clone();
-            st.exceptions.retain(|(e_ns, _, _, _)| e_ns != &ns);
+            st.apply_mutation(registry::Mutation::DelTenant { name: name.clone() });
             match st.commit() {
                 Ok(_) => {}
                 Err(e) => return err(&format!("persist: {e}")),
@@ -358,15 +356,19 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
                 return err("state lock");
             };
             let all: Vec<String> = st.proxies.clone();
-            let Some(t) = st.tenants.get_mut(&name) else {
+            if !st.tenants.contains_key(&name) {
                 return err("no such tenant");
-            };
-            t.subset = match subset.as_str() {
+            }
+            // Resolving the `-` / `*` / list spelling is DISPATCH's job: it is
+            // the wire syntax this transport accepts, and the Raft path never
+            // sees it. What the resolved list MEANS is SetSubset.
+            let subset: Vec<String> = match subset.as_str() {
                 "-" => Vec::new(),
                 "*" => all,
                 list => list.split(',').map(String::from).collect(),
             };
-            let placed = t.subset.len();
+            let placed = subset.len();
+            st.apply_mutation(registry::Mutation::SetSubset { name, subset });
             match st.commit() {
                 Ok(_) => {}
                 Err(e) => return err(&format!("persist: {e}")),
@@ -409,7 +411,7 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
             let Some(pair) = pair.filter(|p| (*p as usize) < st.pairs.len()) else {
                 return err("owner is neither a pair index nor a member address");
             };
-            st.set_exception(&ns, slot, pair);
+            st.apply_mutation(registry::Mutation::SetSlotOwner { ns, slot, pair });
             match st.commit() {
                 Ok(_) => {}
                 Err(e) => return err(&format!("persist: {e}")),
@@ -433,9 +435,15 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
             let Ok(mut st) = shared.state.lock() else {
                 return err("state lock");
             };
-            if !st.clear_exception(&ns, slot) {
+            // ASK FIRST, THEN APPLY. The refusal is this transport's --
+            // a client that cleared nothing deserves an error, while a Raft
+            // entry cannot mean different things depending on what it found --
+            // so the predicate lives in tenant.rs and both callers use it
+            // rather than main.rs keeping a second copy of the coverage test.
+            if !crate::tenant::covers_slot(&st.exceptions, &ns, slot) {
                 return err("no such exception");
             }
+            st.apply_mutation(registry::Mutation::ClearSlotOwner { ns, slot });
             match st.commit() {
                 Ok(_) => {}
                 Err(e) => return err(&format!("persist: {e}")),
@@ -464,7 +472,8 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
             let Ok(mut st) = shared.state.lock() else {
                 return err("state lock");
             };
-            let rows = st.consolidate();
+            st.apply_mutation(registry::Mutation::ConsolidateSlots);
+            let rows = st.exceptions.len();
             match st.commit() {
                 Ok(_) => {}
                 Err(e) => return err(&format!("persist: {e}")),
@@ -490,10 +499,10 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
             let Ok(mut st) = shared.state.lock() else {
                 return err("state lock");
             };
-            let Some(t) = st.tenants.get_mut(&name) else {
+            if !st.tenants.contains_key(&name) {
                 return err("no such tenant");
-            };
-            t.async_writes = on;
+            }
+            st.apply_mutation(registry::Mutation::SetAsyncWrites { name, on });
             match st.commit() {
                 Ok(_) => {}
                 Err(e) => return err(&format!("persist: {e}")),
@@ -513,10 +522,10 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
             let Ok(mut st) = shared.state.lock() else {
                 return err("state lock");
             };
-            let Some(t) = st.tenants.get_mut(&name) else {
+            if !st.tenants.contains_key(&name) {
                 return err("no such tenant");
-            };
-            t.federated = on;
+            }
+            st.apply_mutation(registry::Mutation::SetFederated { name, on });
             match st.commit() {
                 Ok(_) => {}
                 Err(e) => return err(&format!("persist: {e}")),
@@ -538,10 +547,10 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
             let Ok(mut st) = shared.state.lock() else {
                 return err("state lock");
             };
-            let Some(t) = st.tenants.get_mut(&name) else {
+            if !st.tenants.contains_key(&name) {
                 return err("no such tenant");
-            };
-            t.replica_reads = on;
+            }
+            st.apply_mutation(registry::Mutation::SetReplicaReads { name, on });
             match st.commit() {
                 Ok(_) => {}
                 Err(e) => return err(&format!("persist: {e}")),
@@ -565,10 +574,10 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
             let Ok(mut st) = shared.state.lock() else {
                 return err("state lock");
             };
-            let Some(t) = st.tenants.get_mut(&name) else {
+            if !st.tenants.contains_key(&name) {
                 return err("no such tenant");
-            };
-            t.local_cache = on;
+            }
+            st.apply_mutation(registry::Mutation::SetLocalCache { name, on });
             match st.commit() {
                 Ok(_) => {}
                 Err(e) => return err(&format!("persist: {e}")),
@@ -590,11 +599,14 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
             let Ok(mut st) = shared.state.lock() else {
                 return err("state lock");
             };
-            let Some(t) = st.tenants.get_mut(&name) else {
+            if !st.tenants.contains_key(&name) {
                 return err("no such tenant");
-            };
-            t.ops_per_sec = ops;
-            t.max_bytes = bytes;
+            }
+            st.apply_mutation(registry::Mutation::SetQuota {
+                name,
+                ops_per_sec: ops,
+                max_bytes: bytes,
+            });
             match st.commit() {
                 Ok(_) => {}
                 Err(e) => return err(&format!("persist: {e}")),
@@ -627,7 +639,7 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
             let Ok(mut st) = shared.state.lock() else {
                 return err("state lock");
             };
-            st.families.insert(prefix, endpoints);
+            st.apply_mutation(registry::Mutation::SetFamily { prefix, endpoints });
             match st.commit() {
                 Ok(_) => {}
                 Err(e) => return err(&format!("persist: {e}")),
@@ -642,7 +654,9 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
             let Ok(mut st) = shared.state.lock() else {
                 return err("state lock");
             };
-            st.families.remove(&prefix.to_ascii_uppercase());
+            st.apply_mutation(registry::Mutation::ClearFamily {
+                prefix: prefix.to_ascii_uppercase(),
+            });
             match st.commit() {
                 Ok(_) => {}
                 Err(e) => return err(&format!("persist: {e}")),
@@ -676,10 +690,10 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
             let Ok(mut st) = shared.state.lock() else {
                 return err("state lock");
             };
-            let Some(t) = st.tenants.get_mut(&name) else {
+            if !st.tenants.contains_key(&name) {
                 return err("no such tenant");
-            };
-            t.over_quota = on;
+            }
+            st.apply_mutation(registry::Mutation::SetOverQuota { name, on });
             match st.commit() {
                 Ok(_) => {}
                 Err(e) => return err(&format!("persist: {e}")),
@@ -705,10 +719,10 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
             {
                 return err("token already in use");
             }
-            let Some(t) = st.tenants.get_mut(&name) else {
+            if !st.tenants.contains_key(&name) {
                 return err("no such tenant");
-            };
-            t.prev_token = Some(std::mem::replace(&mut t.token, new));
+            }
+            st.apply_mutation(registry::Mutation::RotateToken { name, new });
             match st.commit() {
                 Ok(_) => {}
                 Err(e) => return err(&format!("persist: {e}")),
@@ -723,10 +737,10 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
             let Ok(mut st) = shared.state.lock() else {
                 return err("state lock");
             };
-            let Some(t) = st.tenants.get_mut(&name) else {
+            if !st.tenants.contains_key(&name) {
                 return err("no such tenant");
-            };
-            t.prev_token = None;
+            }
+            st.apply_mutation(registry::Mutation::DropPrev { name });
             match st.commit() {
                 Ok(_) => {}
                 Err(e) => return err(&format!("persist: {e}")),
@@ -842,7 +856,9 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
             let Ok(mut st) = shared.state.lock() else {
                 return err("state lock");
             };
-            let Some(t) = st.tenants.values_mut().find(|t| t.token == digest) else {
+            // The MAP KEY, not `t.name`: `RotateToken` finds its tenant by
+            // key, and the entry this lookup matched is the one to rotate.
+            let Some((name, t)) = st.tenants.iter().find(|(_, t)| t.token == digest) else {
                 return Value::Error(
                     "WRONGPASS invalid token (rotation needs the CURRENT token)".into(),
                 );
@@ -850,9 +866,13 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
             if t.prev_token.is_some() {
                 return err("rotation in progress; previous token not yet drained");
             }
+            let name = name.clone();
             let new_plain = flint_tls::mint_token();
             let new_digest = flint_tls::sha256_hex(new_plain.as_bytes());
-            t.prev_token = Some(std::mem::replace(&mut t.token, new_digest));
+            st.apply_mutation(registry::Mutation::RotateToken {
+                name,
+                new: new_digest,
+            });
             match st.commit() {
                 Ok(_) => {}
                 Err(e) => return err(&format!("persist: {e}")),
@@ -881,21 +901,23 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
             let Ok(mut st) = shared.state.lock() else {
                 return err("state lock");
             };
-            let Some(t) = st
+            let Some(name) = st
                 .tenants
-                .values_mut()
-                .find(|t| t.token == token || t.prev_token.as_deref() == Some(token.as_str()))
+                .iter()
+                .find(|(_, t)| t.token == token || t.prev_token.as_deref() == Some(token.as_str()))
+                .map(|(name, _)| name.clone())
             else {
                 return Value::Error("WRONGPASS invalid token".into());
             };
-            match setting.as_str() {
-                "replica-reads" => t.replica_reads = on,
-                "near-cache" => t.local_cache = on,
+            let mutation = match setting.as_str() {
+                "replica-reads" => registry::Mutation::SetReplicaReads { name, on },
+                "near-cache" => registry::Mutation::SetLocalCache { name, on },
                 // The tenant's OWN latency trade (ADR-0005 D4): coalesce
                 // its batchable writes through the node queue.
-                "async-writes" => t.async_writes = on,
+                "async-writes" => registry::Mutation::SetAsyncWrites { name, on },
                 _ => return err("unknown setting (replica-reads|near-cache|async-writes)"),
-            }
+            };
+            st.apply_mutation(mutation);
             match st.commit() {
                 Ok(_) => {}
                 Err(e) => return err(&format!("persist: {e}")),
@@ -957,8 +979,11 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
                 return err("admin rotation in progress; previous token not yet retired");
             }
             let new_plain = flint_tls::mint_token();
-            st.admin_prev = st.admin_token.take();
-            st.admin_token = Some(new_plain.clone());
+            let prev = st.admin_token.clone();
+            st.apply_mutation(registry::Mutation::SetAdmin {
+                token: Some(new_plain.clone()),
+                prev,
+            });
             match st.commit() {
                 Ok(_) => {}
                 Err(e) => return err(&format!("persist: {e}")),
@@ -978,7 +1003,11 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
             let Ok(mut st) = shared.state.lock() else {
                 return err("state lock");
             };
-            if st.admin_prev.take().is_some() {
+            // The condition stays here, as in CPADDPROXY: dropping a prev
+            // that is not there must not commit, bump or wake anyone.
+            if st.admin_prev.is_some() {
+                let token = st.admin_token.clone();
+                st.apply_mutation(registry::Mutation::SetAdmin { token, prev: None });
                 match st.commit() {
                     Ok(_) => {}
                     Err(e) => return err(&format!("persist: {e}")),
@@ -1145,7 +1174,25 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
             let Some(members) = st.pairs.iter().find(|p| p.contains(&addr)).cloned() else {
                 return err("NOPAIR address is not a member of any registered pair");
             };
-            st.leases.push((members.clone(), addr.clone(), 0));
+            // A LOST ADOPTION RACE ENDS HERE. Two first touches for one pair
+            // can both miss the fast mirror above, which is read under a
+            // different lock, and the loser used to push a SECOND durable row
+            // behind the winner's. `LeaseAdopt` refuses to, so dispatch must
+            // not commit, or mirror, a row the mutation did not write: answer
+            // from the record that won, as the fast path would a moment later.
+            if let Some(i) = lease_row_index(&st.leases, &addr) {
+                let master = st.leases[i].1.clone();
+                drop(st);
+                if let Ok(mut lf) = shared.leases.lock() {
+                    lf.renewals_total += 1;
+                }
+                return if master == addr {
+                    Value::Simple("OK".into())
+                } else {
+                    Value::Error(format!("SUPERSEDED {master}"))
+                };
+            }
+            st.apply_mutation(registry::Mutation::LeaseAdopt { addr: addr.clone() });
             if let Err(e) = st.commit() {
                 st.leases.pop();
                 return err(&format!("persist: {e}"));
@@ -1173,30 +1220,30 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
             let Some(members) = st.pairs.iter().find(|p| p.contains(&addr)).cloned() else {
                 return err("NOPAIR address is not a member of any registered pair");
             };
-            // CONTAINMENT, matching what CPLEASE reads by. This was member
-            // EQUALITY while the renewal path finds "the first entry whose
-            // members contain the caller" -- so with two rows for one pair the
-            // fence updated one and the renewal read the other, and a freshly
-            // promoted master was told it had been superseded by the peer it
-            // had just replaced (BUG-0065). Symmetric keys mean the write and
-            // the read cannot land on different rows, whatever is in the table.
-            let g = match lease_row_index(&st.leases, &addr) {
-                Some(i) => {
-                    st.leases[i].1 = addr.clone();
-                    st.leases[i].2 += 1;
-                    st.leases[i].2
-                }
-                None => {
-                    st.leases.push((members.clone(), addr.clone(), 1));
-                    1
-                }
+            // `Fence` resolves the row by CONTAINMENT, matching what CPLEASE
+            // reads by. This arm once used member EQUALITY while the renewal
+            // path found "the first entry whose members contain the caller" --
+            // so with two rows for one pair the fence updated one and the
+            // renewal read the other, and a freshly promoted master was told
+            // it had been superseded by the peer it had just replaced
+            // (BUG-0065). Symmetric keys mean the write and the read cannot
+            // land on different rows, whatever is in the table.
+            st.apply_mutation(registry::Mutation::Fence { addr: addr.clone() });
+            // READ THE GENERATION BACK rather than predicting it: the mirror
+            // below must carry what the record now says, and `Fence` is what
+            // decides that. Membership was checked under this same lock, so a
+            // missing row is unreachable -- and still an error, not a panic
+            // that would poison the state lock for every later request.
+            let Some(g) = lease_row_index(&st.leases, &addr).map(|i| st.leases[i].2) else {
+                return err("fence recorded no lease row");
             };
+            // ONE bump, from commit(), where there used to be two. `Fence`
+            // sets the promoted hint the second bump existed to publish, and
+            // the Raft path has always bumped once for this verb; every caller
+            // relies only on the bump waking proxies parked in CPWATCH.
             if let Err(e) = st.commit() {
                 return err(&format!("persist: {e}"));
             }
-            let next = st.promoted.as_ref().map_or(1, |(_, n)| n + 1);
-            st.promoted = Some((addr.clone(), next));
-            st.version += 1;
             drop(st);
             if let Ok(mut lf) = shared.leases.lock() {
                 // Same containment key as the durable row above and as the
@@ -1225,10 +1272,11 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
             let Ok(mut st) = shared.state.lock() else {
                 return err("state lock");
             };
-            let next = st.promoted.as_ref().map_or(1, |(_, g)| g + 1);
-            st.promoted = Some((addr.clone(), next));
+            st.apply_mutation(registry::Mutation::Promoted { addr: addr.clone() });
+            let next = st.promoted.as_ref().map_or(0, |(_, g)| *g);
             // Bump the version so watch() stops waiting. No commit(): the
-            // hint is deliberately not durable (tenant::promote_hint).
+            // hint is deliberately not durable (tenant::promote_hint), so
+            // this is the one verb whose bump dispatch owns directly.
             st.version += 1;
             drop(st);
             shared.changed.notify_all();
@@ -1561,7 +1609,11 @@ fn main() -> std::io::Result<()> {
     if state.admin_token.is_none()
         && let Some(t) = arg("--admin-token")
     {
-        state.admin_token = Some(t);
+        let prev = state.admin_prev.clone();
+        state.apply_mutation(registry::Mutation::SetAdmin {
+            token: Some(t),
+            prev,
+        });
         let _ = state.commit();
     }
     eprintln!(
@@ -1959,5 +2011,97 @@ mod lease_row_key_tests {
         ab.sort();
         ba.sort();
         assert_eq!(ab, ba, "sorted, CPADDPAIR's contains-dedupe sees one pair");
+    }
+}
+
+/// ADR-0032 step 3 changed what two single-node verbs do, and both changes are
+/// in what DISPATCH decides around a mutation rather than in the mutation, so
+/// they are held here at the command surface and not in `apply_mutation`'s
+/// unit tests.
+#[cfg(test)]
+mod step3_dispatch_tests {
+    use super::*;
+
+    fn pair() -> Vec<String> {
+        vec!["a:1".to_string(), "b:1".to_string()]
+    }
+
+    fn shared_with_one_pair() -> Shared {
+        let st = State {
+            pairs: vec![pair()],
+            ..Default::default()
+        };
+        Shared {
+            state: Mutex::new(st),
+            changed: Condvar::new(),
+            journal_path: String::new(),
+            usage: Mutex::new(std::collections::HashMap::new()),
+            leases: Mutex::new(LeaseFast::default()),
+        }
+    }
+
+    fn call(sh: &Shared, args: &[&str]) -> Value {
+        let a: Vec<Vec<u8>> = args.iter().map(|s| s.as_bytes().to_vec()).collect();
+        handle(sh, &a)
+    }
+
+    /// THE LOST ADOPTION RACE, set up directly rather than raced: the winner's
+    /// row is durable and its mirror push has not landed, which is the window a
+    /// second first touch for the same pair falls into. The loser used to push
+    /// a second durable row; `LeaseAdopt` will not, so dispatch must not commit
+    /// or mirror one either.
+    #[test]
+    fn a_lost_adoption_answers_from_the_winning_row() {
+        let sh = shared_with_one_pair();
+        let before = {
+            let mut st = sh.state.lock().expect("state lock");
+            st.leases.push((pair(), "a:1".to_string(), 0));
+            st.version
+        };
+
+        assert_eq!(
+            call(&sh, &["CPLEASE", "b:1"]),
+            Value::Error("SUPERSEDED a:1".into()),
+            "the loser is told who won"
+        );
+        {
+            let st = sh.state.lock().expect("state lock");
+            assert_eq!(st.leases.len(), 1, "no second durable row for one pair");
+            assert_eq!(st.version, before, "nothing written, so nothing committed");
+        }
+        assert!(
+            sh.leases.lock().expect("lease lock").entries.is_empty(),
+            "nothing mirrored that the record does not hold"
+        );
+
+        // The winner asking inside the same window is answered from that row.
+        assert_eq!(call(&sh, &["CPLEASE", "a:1"]), Value::Simple("OK".into()));
+    }
+
+    /// ONE BUMP PER FENCE, which is what Raft has always done. Single-node
+    /// bumped twice: `commit()`, then an explicit increment to publish a hint
+    /// that was set after the commit. `Fence` sets the hint before it, so the
+    /// one bump publishes both the record and the hint.
+    #[test]
+    fn a_fence_bumps_the_version_once_and_carries_its_hint() {
+        let sh = shared_with_one_pair();
+        let before = sh.state.lock().expect("state lock").version;
+
+        assert_eq!(
+            call(&sh, &["CPFENCE", "b:1"]),
+            Value::Simple("OK fenced b:1 gen 1".into())
+        );
+        let want = vec![(pair(), "b:1".to_string(), 1)];
+        {
+            let st = sh.state.lock().expect("state lock");
+            assert_eq!(st.version, before + 1, "one bump, from commit()");
+            assert_eq!(st.promoted, Some(("b:1".to_string(), 1)));
+            assert_eq!(st.leases, want);
+        }
+        assert_eq!(
+            sh.leases.lock().expect("lease lock").entries,
+            want,
+            "the mirror carries the generation the record holds"
+        );
     }
 }
