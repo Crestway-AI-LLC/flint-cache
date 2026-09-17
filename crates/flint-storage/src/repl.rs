@@ -147,6 +147,64 @@ impl WriteBatchIterator for OpCollector {
 /// stays in the tens of MB; the caller's poll loop supplies continuation.
 pub const REPL_TAIL_BUDGET_BYTES: usize = 4 * 1024 * 1024;
 
+/// How often a WAL walk is retried when a file vanishes under it, and the
+/// pause between attempts. Two retries bound the cost at 100ms, paid only on
+/// the failure itself, on a path that took minutes of single-copy exposure
+/// when it gave up instead (BUG-0162).
+const WAL_WALK_RETRIES: u32 = 2;
+const WAL_WALK_RETRY_PAUSE: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// RocksDB's wording when a WAL file is deleted while a walk is listing and
+/// stat'ing them. Matched on the message because the crate hands back an
+/// opaque error with no kind to switch on: `IO error: No such file or
+/// directory: while stat a file for size: .../archive/163477.log`.
+///
+/// Inline rather than set apart, because rustdoc compiles an INDENTED block in
+/// a doc comment as Rust and the gate's doctests went red trying to parse that
+/// message as a statement. There is no fenced doc block anywhere in these
+/// crates, and this is why.
+fn wal_file_vanished(msg: &str) -> bool {
+    msg.contains("No such file or directory")
+}
+
+/// Runs a WAL walk, retrying it while a file vanishes underneath (BUG-0162).
+///
+/// A walk lists the WAL files, archive included, and stats each one. The
+/// archive is pruned on a TTL, so its oldest file can be deleted between the
+/// listing and the stat. Every caller mapped that error to `WalGap`, which is
+/// the RIGHT verdict for a cursor the WAL genuinely cannot reach -- BUG-0085's
+/// control turns on this very message meaning recycling -- and the wrong one
+/// for a file that merely went away underneath. The replica is then told
+/// `this link can never resume`, exits, and demands a re-seed.
+///
+/// Measured on the playground: three times between 2026-09-11 and 2026-09-17,
+/// each costing single-copy exposure until something restarted the replica.
+/// The last named a segment at the pruning edge while the archive's newest was
+/// 0s old and the replica's own cursor was about 20 minutes behind -- so the
+/// span it needed was retained, and the walk failed on a neighbour.
+///
+/// The message cannot separate the two, so asking again does: a file that
+/// vanished under one walk is absent from the next listing, while a cursor
+/// that is genuinely unreachable stays unreachable and still ends as a gap,
+/// here or in the coverage checks that follow. **A retry can only turn a
+/// transient failure into a success; it cannot turn a real gap into a pass**,
+/// which is what keeps this safe in the direction that matters.
+fn retrying_walk<T>(mut walk: impl FnMut() -> Result<T, String>) -> Result<T, String> {
+    let mut attempts = 0u32;
+    loop {
+        match walk() {
+            Ok(v) => return Ok(v),
+            Err(msg) => {
+                attempts += 1;
+                if attempts > WAL_WALK_RETRIES || !wal_file_vanished(&msg) {
+                    return Err(msg);
+                }
+                std::thread::sleep(WAL_WALK_RETRY_PAUSE);
+            }
+        }
+    }
+}
+
 impl RocksKv {
     /// Master side: every op after `last_applied`, grouped per WAL batch.
     /// Sequence-idempotent per the module contract.
@@ -177,10 +235,12 @@ impl RocksKv {
         if latest <= last_applied {
             return Ok(Vec::new());
         }
-        let iter = self
-            .db()
-            .get_updates_since(last_applied)
-            .map_err(|e| ReplError::WalGap(e.to_string()))?;
+        let iter = retrying_walk(|| {
+            self.db()
+                .get_updates_since(last_applied)
+                .map_err(|e| e.to_string())
+        })
+        .map_err(ReplError::WalGap)?;
         let mut out = Vec::new();
         let mut bytes = 0usize;
         // Which of the two ways the loop can end actually happened. A short
@@ -456,10 +516,9 @@ impl RocksKv {
         // claim "the first match found is THE first match". If it does not
         // hold we started too late and say so, and the caller walks from 0.
         let scan = |from: u64, verify_start: bool| -> Result<ScanOutcome, ReplError> {
-            let iter = self
-                .db()
-                .get_updates_since(from)
-                .map_err(|e| ReplError::WalGap(e.to_string()))?;
+            let iter =
+                retrying_walk(|| self.db().get_updates_since(from).map_err(|e| e.to_string()))
+                    .map_err(ReplError::WalGap)?;
             let mut checked = !verify_start;
             for item in iter {
                 let (first_seq, batch) = item.map_err(|e| ReplError::Storage(e.to_string()))?;
@@ -538,10 +597,8 @@ impl RocksKv {
     /// ops above the cursor, so applying it is idempotent with whatever the
     /// replica already has and leaves it on a real batch end.
     fn batch_covering(&self, cursor: u64) -> Result<Option<ReplBatch>, ReplError> {
-        let iter = self
-            .db()
-            .get_updates_since(0)
-            .map_err(|e| ReplError::WalGap(e.to_string()))?;
+        let iter = retrying_walk(|| self.db().get_updates_since(0).map_err(|e| e.to_string()))
+            .map_err(ReplError::WalGap)?;
         for item in iter {
             let (first_seq, batch) = item.map_err(|e| ReplError::Storage(e.to_string()))?;
             if first_seq > cursor {
@@ -602,7 +659,10 @@ impl RocksKv {
     /// cursor this cannot classify is exactly the case `updates_since` now
     /// handles on the read side.
     fn snap_to_batch_end(&self, seq: u64) -> Option<u64> {
-        let iter = self.db().get_updates_since(0).ok()?;
+        // Best-effort, and still retried: a vanished file here returns None,
+        // and None quietly leaves the caller's cursor where it was (BUG-0162).
+        let iter =
+            retrying_walk(|| self.db().get_updates_since(0).map_err(|e| e.to_string())).ok()?;
         for item in iter {
             let (first_seq, batch) = item.ok()?;
             if first_seq > seq {
@@ -2176,5 +2236,84 @@ mod walgap_shortread {
              and docs/bugs/0082 needs revisiting rather than this test relaxing. \
              (WAL reaches {latest}.)"
         );
+    }
+}
+
+#[cfg(test)]
+mod wal_walk_retry_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    // Verbatim from the playground, 2026-09-17, the one that killed the
+    // replica and demanded a re-seed.
+    const VANISHED: &str = "IO error: No such file or directory: while stat a file for size: \
+                            /var/lib/flint/node-7002/archive/163477.log: No such file or directory";
+
+    #[test]
+    fn the_playground_message_is_recognised_and_others_are_not() {
+        assert!(wal_file_vanished(VANISHED));
+        assert!(!wal_file_vanished("Corruption: block checksum mismatch"));
+        assert!(!wal_file_vanished(
+            "no apply batch reaching upstream seq 215175004 is retained in this WAL"
+        ));
+    }
+
+    #[test]
+    fn a_walk_that_works_is_not_retried() {
+        let calls = Cell::new(0);
+        let got = retrying_walk(|| {
+            calls.set(calls.get() + 1);
+            Ok::<_, String>(7)
+        });
+        assert_eq!(got, Ok(7));
+        assert_eq!(calls.get(), 1, "a succeeding walk must be asked once");
+    }
+
+    #[test]
+    fn a_file_that_vanishes_once_is_asked_again_and_succeeds() {
+        // The whole point: this is the playground's case, and it ends in a
+        // served walk rather than a replica told the link can never resume.
+        let calls = Cell::new(0);
+        let got = retrying_walk(|| {
+            calls.set(calls.get() + 1);
+            if calls.get() == 1 {
+                Err(VANISHED.to_string())
+            } else {
+                Ok(42)
+            }
+        });
+        assert_eq!(got, Ok(42));
+        assert_eq!(calls.get(), 2);
+    }
+
+    #[test]
+    fn a_cursor_that_is_really_gone_still_ends_as_an_error() {
+        // A retry must not turn a real gap into a pass. When the file stays
+        // missing the walk still fails, and the caller still maps it to
+        // WalGap -- just later, and having made sure.
+        let calls = Cell::new(0);
+        let got = retrying_walk(|| {
+            calls.set(calls.get() + 1);
+            Err::<(), _>(VANISHED.to_string())
+        });
+        assert!(got.is_err());
+        assert_eq!(
+            calls.get() as u32,
+            WAL_WALK_RETRIES + 1,
+            "the walk must be tried once and then retried WAL_WALK_RETRIES times"
+        );
+    }
+
+    #[test]
+    fn an_error_that_is_not_a_vanished_file_is_not_retried_at_all() {
+        // Corruption is not transient, and retrying it would only delay the
+        // report by the pause.
+        let calls = Cell::new(0);
+        let got = retrying_walk(|| {
+            calls.set(calls.get() + 1);
+            Err::<(), _>("Corruption: block checksum mismatch".to_string())
+        });
+        assert!(got.is_err());
+        assert_eq!(calls.get(), 1);
     }
 }
