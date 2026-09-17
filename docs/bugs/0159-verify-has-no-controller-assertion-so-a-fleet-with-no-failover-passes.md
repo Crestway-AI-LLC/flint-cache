@@ -1,7 +1,7 @@
-# BUG-0159: `verify` has no controller assertion, so a fleet with no failover passes it (OPEN)
+# BUG-0159: `verify` has no controller assertion, so a fleet with no failover passes it (FIXED 2026-09-17)
 
-Status: **OPEN**, found 2026-09-16 by the peer session immediately after the
-rc.73 roll; the code half confirmed here the same hour · Severity: **medium-high
+Status: **FIXED 2026-09-17**, found 2026-09-16 by the peer session immediately
+after the rc.73 roll; the code half confirmed here the same hour · Severity: **medium-high
 as a verification gap, not as a defect** — nothing is broken, and that is the
 problem: the command the runbooks and the release checklist use to say *the
 fleet is healthy* cannot see the component whose absence turns one node death
@@ -74,7 +74,57 @@ makes from failure detection — so mid-roll the newest `PROMOTED` line names th
 *other* node. That reads as a disagreement between the controller's log and
 `status` and is not one. Also the peer's, from the same roll.
 
-## Sketch, not a decision
+## The fix
+
+A `== controller` section in `verify_checks`, and the difficulty was never the
+assertion — it was not reddening every roll with it.
+
+**An empty answer is waited out, not believed.** The CP holds the controller
+registry in memory (`#[serde(skip)]`), so a control plane that restarted knows
+of no controller until the next 30s tick, and `verify_after` runs inside
+exactly that window. `CONTROLLER_REGISTER_WINDOW` (45s) is how long verify
+waits for a row before calling the controller absent, and `gates.sh` asserts it
+stays above the controller's own `REGISTER_EVERY` — the two constants live in
+different crates with nothing else linking them, and a window that fell under
+the interval would redden healthy rolls.
+
+**The three states stay apart**, because collapsing them is what the sketch
+warned about:
+
+| state | what verify says |
+|---|---|
+| no CP answered | controller state is unknown — and the reachability failure above is the finding |
+| rows exist, none parse | the rows are unreadable, named as such, not an absent controller |
+| asked, none in 45s | FAIL, naming the consequence: this fleet does not fail over |
+| rows exist, all STALE | FAIL — it registered once and stopped, the same outage as none |
+| a live row | ok, and its build is compared against the fleet's |
+
+**Two live rows are reported, not failed.** Rows are keyed `host:pid`, and a
+replaced controller's row stays `live` for `CONTROLLER_STALE_MS` (90s) after its
+process is gone — so a roll legitimately shows two, and failing on that would
+have been the same false alarm one level along.
+
+## How it was verified
+
+`tools/verify_controller_drill.sh`, three arms, where arms 2 and 3 differ by a
+single fact — whether the controller process is alive — with the same
+inventory, the same CP restart and the same empty registry:
+
+1. live controller → verify passes and names it
+2. registry cleared, **controller alive** → verify still passes, having waited
+   the window out. This is the false alarm a roll would otherwise get.
+3. registry cleared, **controller killed** → verify FAILS, names the controller
+   and states the consequence
+
+**Two mutations kill it**, run against the drill rather than argued:
+
+- `CONTROLLER_REGISTER_WINDOW` cut to 5s, below the controller's 30s tick →
+  **arm 2 fails** (`verify refused a fleet whose controller is alive`), and the
+  new `gates.sh` assertion fails independently.
+- the absent-controller branch turned into a pass → **arm 3 fails**
+  (`verify PASSED a fleet with no controller`).
+
+## The sketch this was fixed from, kept
 
 An assertion that a controller is registered AND its last report is younger than
 some multiple of its heartbeat interval, with the *not yet registered* case
@@ -83,5 +133,7 @@ constant picked here. `cpinfo_controllers` already returns the three states this
 needs, including the one that means "the CP could not be asked", which must not
 read as "no controller".
 
-Filed rather than fixed: found during someone else's rollout, and the threshold
-is a measurement question that deserves its own change.
+Filed rather than fixed at the time: found during someone else's rollout, and
+the threshold is a measurement question that deserved its own change. The
+threshold it asked for turned out to be the controller's own `REGISTER_EVERY`,
+read from the source and asserted by the gate rather than picked here.
