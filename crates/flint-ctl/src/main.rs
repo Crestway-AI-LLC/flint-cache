@@ -11365,11 +11365,16 @@ mod cp_state_floor_tests {
 mod started_line_tests {
     use super::started_line;
 
-    /// `supervise.sh`, exactly:
+    /// `supervise.sh`, exactly, as OPS-0275 left it:
     ///     _pid="${_line##*(pid }"   # longest prefix through the last "(pid "
     ///     _pid="${_pid%%)*}"        # longest suffix from the FIRST ')'
-    ///     _pid="${_pid//[^0-9]/}"
-    fn supervisor_reads_pid(line: &str) -> String {
+    ///     case "$_pid" in '' | *[!0-9]*) UNREADABLE ;; esac
+    ///
+    /// `None` models that refusal. The parse used to end
+    /// `_pid="${_pid//[^0-9]/}"`, and removing that scrub is what OPS-0275
+    /// changed; the control below records what the scrub did to a mis-ordered
+    /// line, because that is why the ordering is not a matter of taste.
+    fn supervisor_reads_pid(line: &str) -> Option<String> {
         let after = match line.rfind("(pid ") {
             Some(i) => &line[i + "(pid ".len()..],
             None => line,
@@ -11378,34 +11383,48 @@ mod started_line_tests {
             Some(i) => &after[..i],
             None => after,
         };
-        upto.chars().filter(char::is_ascii_digit).collect()
+        if upto.is_empty() || !upto.chars().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        Some(upto.to_string())
     }
 
     #[test]
     fn the_supervisor_can_still_read_the_pid() {
         let l = started_line("node-7001", 12345, Some("v0.1.0-rc.74".into()));
-        assert_eq!(supervisor_reads_pid(&l), "12345", "{l}");
+        assert_eq!(supervisor_reads_pid(&l).as_deref(), Some("12345"), "{l}");
         let u = started_line("cp", 987, None);
-        assert_eq!(supervisor_reads_pid(&u), "987", "{u}");
+        assert_eq!(supervisor_reads_pid(&u).as_deref(), Some("987"), "{u}");
     }
 
     #[test]
     fn the_broken_ordering_really_would_have_broken_it() {
-        // THE CONTROL. Without this the test above would pass against a format
+        // THE CONTROL. Without it the test above would pass against a format
         // that had never been at risk. Putting the build INSIDE the parens is
-        // the obvious way to write this line, and it yields a pid made of
-        // digits scavenged from the version -- one that does not exist, in the
-        // journal read after a seat was restarted.
+        // the obvious way to write this line, and the supervisor then reads
+        // "12345, build v0.1.0-rc.74" where it expects a pid.
         let naive = "  started node-7001 (pid 12345, build v0.1.0-rc.74)";
-        let got = supervisor_reads_pid(naive);
-        assert_ne!(got, "12345", "the naive ordering was supposed to break");
         assert_eq!(
-            got,
-            "12345010, 74"
-                .chars()
-                .filter(char::is_ascii_digit)
-                .collect::<String>()
+            supervisor_reads_pid(naive),
+            None,
+            "the naive ordering was supposed to be unreadable"
         );
+
+        // WHAT IT USED TO COST, kept because it is the reason the ordering
+        // still matters. Until OPS-0275 the parse ended `${_pid//[^0-9]/}`,
+        // which scrubbed that same string into ten plausible digits instead of
+        // visible garbage. `kill -0` fails on it, so the supervisor printed
+        // `<- ALREADY GONE` against a seat that was ALIVE, in the tick right
+        // after a restart -- exactly when that output is read to decide
+        // whether the restart worked. Measured under bash by the cache session
+        // against both orderings. OPS-0275 removed the scrub and counts an
+        // unreadable pid separately from a dead one, so a mis-ordered line now
+        // costs a liveness check rather than a confident wrong answer.
+        let scrubbed: String = "12345, build v0.1.0-rc.74"
+            .chars()
+            .filter(char::is_ascii_digit)
+            .collect();
+        assert_eq!(scrubbed, "1234501074");
     }
 
     #[test]
