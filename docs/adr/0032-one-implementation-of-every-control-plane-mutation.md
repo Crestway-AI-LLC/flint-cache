@@ -468,9 +468,21 @@ about: it has no JSON path at all, its `load_or_new` starts from
 `Default::default()`, and a JSON file's keys are quoted and indented, so not
 even `version` collides with `Some("version")`.
 
-**The floor is not live until a release carries this writer.** rc.73 was the
-newest tag when the writer landed, so nothing could cross it that day; it binds
-from the first release cut afterwards, which is **v0.1.0-rc.74**.
+**The floor is LIVE as of 2026-09-19.** rc.73 was the newest tag when the
+writer landed, so nothing could cross it that day; it binds from the first
+release carrying the writer, and **v0.1.0-rc.74 was published and signed at
+05:39:28Z** — non-draft, bundle and manifest each with a `.minisig`, verified
+against the published key. From here, never re-roll a single-node control
+plane below rc.73.
+
+**And this is what RETIRES the constraint this ADR was written against, rather
+than deferring it.** The rule was that the writer must not land until the
+release carrying the tolerant reader had ACTUALLY shipped — not been tagged,
+shipped — and that no test could establish it. rc.73 satisfied that for the
+writer; rc.74 now closes the pair in the field, so both halves of the split are
+out and the sequencing obligation is discharged. What survives it is not an
+obligation but a floor, and the floor is enforced in `roll-fleet.sh`
+(OPS-0265) and unenforced in `flintctl upgrade` (public BUG-0167).
 
 **OPS-0259's staging window is fine for this**, which is worth saying because
 it was the obvious worry: a seat that dies mid-stage comes back on the new
