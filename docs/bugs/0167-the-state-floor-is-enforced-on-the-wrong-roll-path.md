@@ -44,6 +44,33 @@ So after the first release carrying the writer, `push-bins <rc.72 bundle>`
 followed by `upgrade --version-tag v0.1.0-rc.72` puts a pre-reader control
 plane in front of a JSON state file with nothing objecting.
 
+## The negative claim, with its own reproduction
+
+"Nothing in that path checks the format" is the dangerous kind of claim: a
+negative nobody disproves. So it is reproducible here rather than asserted.
+
+    git show origin/main:crates/flint-ctl/src/main.rs > /tmp/ctlmain.rs
+    grep -nE "rc\.73|STATE_FLOOR|state_format|ALLOW_CP_FORMAT|cp-state|format_break" /tmp/ctlmain.rs
+
+Twenty hits, and every one of them is something else:
+
+- **`cp-state` (13 hits) is about PATH SPELLING, not content** — a lone seat
+  uses `<statedir>/cp-state` and a Raft group `<statedir>/cp-state-n<i>`, which
+  is what `cp_seat_state` exists to get right. None of them opens the file.
+- **`format_break` (3) is the manifest refusal** at 9096/9104 plus one doc
+  comment.
+- **`rc.73` (1)** is a comment about where seats were put during that roll.
+- **`STATE_FLOOR`, `state_format`, `ALLOW_CP_FORMAT`: zero.**
+
+Independently re-derived by the peer session against the same file, which is
+why it is written down once here instead of twice in two transcripts.
+
+**One thing that grep makes easier rather than harder.** `cp_seat_state`
+already computes the control plane's state path, correctly for both the lone
+and Raft spellings, and `upgrade` already runs where that file is. So fix (1)
+below needs no new path logic and no ssh — it needs a read, a first byte, and a
+version comparison.
+
 ## Why `format_break` does not already cover this
 
 It is the obvious candidate and it does not fit. `upgrade --manifest` reads
