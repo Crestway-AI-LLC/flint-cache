@@ -14,6 +14,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --keep-going -- -D warnings
+      # The mem half of the pair added to check-rocks (BUG-0168).
+      # cfg(not(feature = "rocks")) items only exist in this configuration.
+      - run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
       - run: cargo test --workspace
   # The rocks engine is the production configuration; without this leg the
   # entire cfg(feature = "rocks") surface (replication, full sync, the async

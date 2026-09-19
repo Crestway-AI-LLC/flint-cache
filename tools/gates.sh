@@ -3896,8 +3896,22 @@ if want check; then
   # finally runs the command. `--keep-going` is not optional here: without it
   # cargo stops scheduling after the first failing crate and reports a handful,
   # which is how the original count was under-read as 99.
-  step "doc" doc \
+  # TWO LEGS, for the same reason clippy and test have two (BUG-0168). This
+  # was ONE step without the rocks features until 2026-09-19, and nineteen
+  # rustdoc errors sat behind it on a green main -- every one of them in
+  # cfg(feature = "rocks") code, which this step was not compiling. A check
+  # that covers a subset reads exactly like a check that covers everything,
+  # and this one had been green for months while the surface it omitted
+  # accumulated a broken intra-doc link and eighteen doc comments whose
+  # <placeholder> prose rustdoc reads as unclosed HTML.
+  #
+  # The mem leg is not redundant: cfg(not(feature = "rocks")) items exist and
+  # a rocks-only run would stop covering them, which is this bug inverted.
+  step "doc (mem)" doc-mem \
     env RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --keep-going
+  step "doc (rocks)" doc-rocks \
+    env RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --keep-going \
+    --features flint-server/rocks,flint-backup/rocks
   step "test (mem)" test-mem cargo test --workspace
   step "test (rocks)" test-rocks cargo test --workspace --features flint-server/rocks,flint-backup/rocks
   step "licences" licences licence_check
