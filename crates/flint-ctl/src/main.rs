@@ -1861,6 +1861,47 @@ fn refuse_wildcard_cp_target(name: &str, r: &Runner, args: &[String]) {
     }
 }
 
+/// The line that says a seat started, as one string so the format is testable.
+///
+/// THE BUILD GOES AFTER THE CLOSING PAREN, deliberately. `supervise.sh` reads
+/// the pid out of this line with `${_line##*(pid }` and then `%%)*`, so
+/// anything added INSIDE the parentheses is swept into the pid and stripped to
+/// a run of digits taken from the VERSION -- a pid that does not exist,
+/// reported as one that does, in the journal an operator reads after a seat
+/// was restarted. The suffix keeps `(pid N)` exactly where that expansion
+/// expects it, and `the_supervisor_can_still_read_the_pid` holds the contract
+/// from this side with the broken ordering as its control.
+fn started_line(name: &str, pid: u32, build: Option<String>) -> String {
+    format!(
+        "  started {name} (pid {pid}) build {}",
+        build.as_deref().unwrap_or("unknown")
+    )
+}
+
+/// What build a staged binary reports, for the line that says a seat started
+/// (OPS-0259 candidate 3).
+///
+/// A seat is spawned from the inventory's bins dir, and during a roll that dir
+/// can hold a version the rest of the fleet is not running -- so a seat that
+/// died at the wrong moment comes back one version ahead of its peers. The
+/// roll now declares its window and the supervisor stands aside for it, but
+/// that only stops the supervisor CREATING the state. If anything else
+/// produces it, "one seat is a version ahead" left no trace at all, and that
+/// is its own defect.
+///
+/// `None` means the binary would not say, which is reported as `unknown`
+/// rather than omitted: silence is the thing this exists to remove, and a
+/// binary too old to answer is itself worth seeing in the journal.
+fn spawned_build(bins: &str, bin: &str) -> Option<String> {
+    std::process::Command::new(format!("{bins}/{bin}"))
+        .arg("--build-version")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 fn spawn_env(
     inv: &Inventory,
     r: &Runner,
@@ -2200,7 +2241,10 @@ fn local_spawn_env(
         child.id().to_string(),
     )
     .expect("pidfile");
-    eprintln!("  started {name} (pid {})", child.id());
+    eprintln!(
+        "{}",
+        started_line(name, child.id(), spawned_build(bins, bin))
+    );
 }
 
 fn spawn(inv: &Inventory, r: &Runner, name: &str, bin: &str, args: &[String]) {
@@ -11312,5 +11356,74 @@ mod cp_state_floor_tests {
         // moves, the runbook and roll-fleet.sh have to move with it -- the
         // ops gate asserts those agree, and this is the copy it compares to.
         assert_eq!(CP_STATE_FLOOR, "v0.1.0-rc.73");
+    }
+}
+
+/// OPS-0259 candidate 3: a seat that starts says which build it started, and
+/// saying so must not break the supervisor that reads the same line.
+#[cfg(test)]
+mod started_line_tests {
+    use super::started_line;
+
+    /// `supervise.sh`, exactly:
+    ///     _pid="${_line##*(pid }"   # longest prefix through the last "(pid "
+    ///     _pid="${_pid%%)*}"        # longest suffix from the FIRST ')'
+    ///     _pid="${_pid//[^0-9]/}"
+    fn supervisor_reads_pid(line: &str) -> String {
+        let after = match line.rfind("(pid ") {
+            Some(i) => &line[i + "(pid ".len()..],
+            None => line,
+        };
+        let upto = match after.find(')') {
+            Some(i) => &after[..i],
+            None => after,
+        };
+        upto.chars().filter(char::is_ascii_digit).collect()
+    }
+
+    #[test]
+    fn the_supervisor_can_still_read_the_pid() {
+        let l = started_line("node-7001", 12345, Some("v0.1.0-rc.74".into()));
+        assert_eq!(supervisor_reads_pid(&l), "12345", "{l}");
+        let u = started_line("cp", 987, None);
+        assert_eq!(supervisor_reads_pid(&u), "987", "{u}");
+    }
+
+    #[test]
+    fn the_broken_ordering_really_would_have_broken_it() {
+        // THE CONTROL. Without this the test above would pass against a format
+        // that had never been at risk. Putting the build INSIDE the parens is
+        // the obvious way to write this line, and it yields a pid made of
+        // digits scavenged from the version -- one that does not exist, in the
+        // journal read after a seat was restarted.
+        let naive = "  started node-7001 (pid 12345, build v0.1.0-rc.74)";
+        let got = supervisor_reads_pid(naive);
+        assert_ne!(got, "12345", "the naive ordering was supposed to break");
+        assert_eq!(
+            got,
+            "12345010, 74"
+                .chars()
+                .filter(char::is_ascii_digit)
+                .collect::<String>()
+        );
+    }
+
+    #[test]
+    fn a_binary_that_will_not_say_is_reported_as_unknown_not_omitted() {
+        // Silence is what this change exists to remove, so an unanswered
+        // binary is still a line that says something.
+        let l = started_line("cp", 1, None);
+        assert!(l.ends_with("build unknown"), "{l}");
+        assert!(l.contains("(pid 1)"), "{l}");
+    }
+
+    #[test]
+    fn the_line_still_matches_what_the_supervisor_counts_and_greps() {
+        // supervise.sh counts with `grep -c '^  started '` and start_guard_drill
+        // greps for `started node-<port>`; both are prefix/substring matches
+        // that the suffix must not disturb.
+        let l = started_line("node-7002", 42, Some("v0.1.0-rc.74".into()));
+        assert!(l.starts_with("  started "), "{l}");
+        assert!(l.contains("started node-7002"), "{l}");
     }
 }
