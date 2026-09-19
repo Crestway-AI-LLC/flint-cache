@@ -456,6 +456,123 @@ fn quarantine_unresumable(snaps_dir: &str, cursor: u64) -> usize {
     n
 }
 
+/// How much older than the archive's reach a snapshot may be and still be kept.
+/// TWO, not one: `archive_span()` reports what THIS node's archive holds now,
+/// and the tail a rewind needs comes from the MASTER's. Same TTL policy, so the
+/// local figure is a fair proxy — but only a proxy, and the margin is what pays
+/// for that.
+#[cfg(feature = "rocks")]
+const SNAP_RETAIN_REACH_MULTIPLE: u64 = 2;
+
+/// Never retain less than this regardless of what the archive reports. A short
+/// archive is not evidence that old snapshots are useless: a freshly started
+/// box, an idle one, or a directory that has just rotated all report a small
+/// reach, and without a floor any of them would authorise a deep prune.
+#[cfg(feature = "rocks")]
+const SNAP_RETAIN_FLOOR_S: u64 = 24 * 60 * 60;
+
+/// And never delete the newest this many, whatever their age — 24h at one per
+/// 30s. This covers the case the age floor cannot: a clock that steps FORWARD
+/// makes every entry look ancient at once, and an age rule alone would empty
+/// the directory in a single pass.
+#[cfg(feature = "rocks")]
+const SNAP_RETAIN_MIN_COUNT: usize = 2_880;
+
+/// Delete snapshots older than the WAL archive can reach (BUG-0163).
+///
+/// A rewind is only worth anything if the node can then TAIL FORWARD from the
+/// restored snapshot, and that tail comes from the master's WAL archive, which
+/// is TTL-pruned — about 12 hours on the playground. Restoring to a snapshot
+/// older than the archive's reach lands directly in the gap BUG-0162 is about,
+/// so it buys nothing at any epoch. Nothing had ever deleted one: the oldest on
+/// the playground was from the hour the box was born, 158,443 entries and 138 GB
+/// against 142 GB used.
+///
+/// **IT DELETES BY AGE, NOT BY NAME, AND THAT IS THE WHOLE REASON IT IS SAFE.**
+/// The tempting fix is the `unresumable-` half — 54% of the pile, 74 GB, and
+/// already labelled useless. It is wrong. BUG-0071 re-admits a quarantined
+/// snapshot when the master's fence for its epoch drops BELOW the cursor it was
+/// disqualified against, so no snapshot can be declared permanently useless by
+/// reading its name; `try_rewind` carries them on purpose for exactly that.
+/// Age makes no such judgement, and a quarantined snapshot past the archive's
+/// reach cannot tail forward either — so one rule covers both halves without
+/// anyone deciding which snapshots are worthless.
+///
+/// **EVERY UNKNOWN MEANS KEEP.** An unreadable archive directory, an archive
+/// holding no segments, no readable mtime on any segment, an unreadable
+/// snapshot root, an entry whose own mtime will not read: each ends in "prune
+/// nothing" or "skip this entry", never in a deletion. That asymmetry is
+/// deliberate and is not a general preference for caution — the cost of keeping
+/// too much is disk, and the bug measured ~100 days of headroom; the cost of
+/// deleting too much is recovery options during precisely the incident these
+/// exist for.
+///
+/// Returns how many were removed, and the reason when that is zero.
+#[cfg(feature = "rocks")]
+fn prune_snapshots(
+    root: &std::path::Path,
+    span: Option<flint_storage::rocks::ArchiveSpan>,
+    keep: &str,
+    // Taken as an argument rather than read from the constant so a test can
+    // exercise the floor with three directories instead of 2,881. The one
+    // production call site passes SNAP_RETAIN_MIN_COUNT.
+    min_count: usize,
+) -> (usize, &'static str) {
+    let Some(span) = span else {
+        return (0, "archive directory could not be read");
+    };
+    if span.segments == 0 {
+        return (0, "archive holds no segments, so its reach is unknown");
+    }
+    let Some(reach) = span.oldest_age_s else {
+        return (0, "no archive segment has a readable mtime");
+    };
+    let cutoff_s = (reach * SNAP_RETAIN_REACH_MULTIPLE).max(SNAP_RETAIN_FLOOR_S);
+
+    let Ok(rd) = std::fs::read_dir(root) else {
+        return (0, "snapshot root could not be read");
+    };
+    let now = std::time::SystemTime::now();
+    // (age, path). An entry whose mtime will not read is omitted entirely, so
+    // it is never a deletion candidate AND never counts toward the floor.
+    let mut aged: Vec<(u64, std::path::PathBuf)> = Vec::new();
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if !(name.starts_with("snap-") || name.starts_with(UNRESUMABLE_PREFIX)) {
+            continue; // LATEST, LATEST.tmp, anything else this does not own
+        }
+        if name == keep {
+            continue; // what LATEST points at, whatever its age
+        }
+        let Ok(age) = e
+            .metadata()
+            .and_then(|m| m.modified())
+            .and_then(|t| now.duration_since(t).map_err(std::io::Error::other))
+        else {
+            continue;
+        };
+        aged.push((age.as_secs(), e.path()));
+    }
+    // Newest first, then hold back the count floor before any age test.
+    aged.sort_by_key(|(age, _)| *age);
+    if aged.len() <= min_count {
+        return (0, "fewer snapshots held than the floor keeps");
+    }
+    let mut removed = 0usize;
+    for (age, path) in aged.drain(min_count..) {
+        if age <= cutoff_s {
+            continue;
+        }
+        match std::fs::remove_dir_all(&path) {
+            Ok(()) => removed += 1,
+            // Best effort: a snapshot that will not delete is disk, not
+            // correctness, and stopping here would leave the rest forever.
+            Err(err) => eprintln!("prune: removing {}: {err}", path.display()),
+        }
+    }
+    (removed, "nothing older than the cutoff")
+}
+
 /// Ask `target` whether a copy at (`cursor`, `epoch`) can resume tailing its
 /// lineage — the exact FLINTSYNC handshake the tailer would send, dropped
 /// after the first reply. The master runs its full admission logic (fence
@@ -6513,7 +6630,19 @@ fn flintsnapshot(rocks: &Option<RocksHandle>, args: &[Vec<u8>]) -> Value {
     {
         return Value::Error(format!("ERR LATEST repoint: {e}"));
     }
-    eprintln!("snapshot {id} written to {}", root.display());
+    // BUG-0163: prune AFTER the repoint, so a fresh snapshot exists and LATEST
+    // already names it before anything old is removed. Reported on the line
+    // that was already printed once per snapshot rather than a new one — this
+    // runs every 30s, and a line a minute saying all is well is a line nobody
+    // reads. The zero case still says WHY, because "nothing was ever deleted"
+    // reporting nothing is how this bug went unseen for two months.
+    let (pruned, why) = prune_snapshots(root, kv.archive_span(), &id, SNAP_RETAIN_MIN_COUNT);
+    let prune_note = if pruned > 0 {
+        format!("pruned {pruned} past the archive's reach")
+    } else {
+        format!("pruned 0: {why}")
+    };
+    eprintln!("snapshot {id} written to {} ({prune_note})", root.display());
     Value::Simple(format!("OK {id}"))
 }
 
@@ -8894,6 +9023,167 @@ mod quarantine_tests {
             quarantine_unresumable(d.to_str().expect("test setup"), 1),
             0
         );
+    }
+
+    // ---- BUG-0163: pruning snapshots past the archive's reach --------------
+
+    use flint_storage::rocks::ArchiveSpan;
+
+    /// Backdate a path's mtime. `libc` is already a dependency of this crate;
+    /// std has no setter.
+    fn age_to(p: &std::path::Path, secs: u64) {
+        use std::os::unix::ffi::OsStrExt;
+        let when = std::time::SystemTime::now() - std::time::Duration::from_secs(secs);
+        let t = when
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("after the epoch");
+        let tv = libc::timeval {
+            tv_sec: t.as_secs() as libc::time_t,
+            tv_usec: 0,
+        };
+        let times = [tv, tv];
+        let c = std::ffi::CString::new(p.as_os_str().as_bytes()).expect("path has no NUL");
+        let rc = unsafe { libc::utimes(c.as_ptr(), times.as_ptr()) };
+        assert_eq!(rc, 0, "utimes failed for {}", p.display());
+    }
+
+    /// A 12h reach, which is what the playground measured.
+    fn reach_12h() -> Option<ArchiveSpan> {
+        Some(ArchiveSpan {
+            segments: 4,
+            oldest_age_s: Some(43_200),
+            newest_age_s: Some(30),
+        })
+    }
+
+    fn held(dir: &std::path::Path) -> usize {
+        std::fs::read_dir(dir).expect("read").flatten().count()
+    }
+
+    #[test]
+    fn a_snapshot_past_the_archive_reach_is_removed() {
+        let d = scratch("prune-old");
+        let old = touch_snap(&d, 1, 100, 0, 7);
+        age_to(&d.join(&old), 200_000); // well past the 24h cutoff
+        let (n, _) = prune_snapshots(&d, reach_12h(), "none", 0);
+        assert_eq!(n, 1, "a snapshot older than the reach must go");
+        assert_eq!(held(&d), 0);
+    }
+
+    #[test]
+    fn a_fresh_snapshot_is_kept() {
+        let d = scratch("prune-fresh");
+        touch_snap(&d, 2, 200, 0, 7);
+        let (n, why) = prune_snapshots(&d, reach_12h(), "none", 0);
+        assert_eq!(n, 0, "a just-written snapshot must survive ({why})");
+        assert_eq!(held(&d), 1);
+    }
+
+    /// THE POINT OF THE RULE. `unresumable-` is 54% of the pile on the
+    /// playground and the bug's own warning is that deleting it BY NAME removes
+    /// recovery options, because BUG-0071 lets the fence reconsider one. Age
+    /// makes no such judgement: past the reach it cannot tail forward either,
+    /// so the same rule reaches it without anyone calling it useless.
+    #[test]
+    fn a_quarantined_snapshot_is_pruned_by_age_not_spared_by_name() {
+        let d = scratch("prune-quarantined");
+        let q = format!("{UNRESUMABLE_PREFIX}c500-snap-1-seq100-e0.7");
+        std::fs::create_dir_all(d.join(&q)).expect("quarantined dir");
+        let fresh_q = format!("{UNRESUMABLE_PREFIX}c500-snap-2-seq200-e0.7");
+        std::fs::create_dir_all(d.join(&fresh_q)).expect("fresh quarantined dir");
+        age_to(&d.join(&q), 200_000);
+        let (n, _) = prune_snapshots(&d, reach_12h(), "none", 0);
+        assert_eq!(n, 1, "the OLD quarantined snapshot must be pruned");
+        assert!(
+            d.join(&fresh_q).exists(),
+            "a quarantined snapshot within the reach must survive: name is not the test, age is"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_archive_prunes_nothing() {
+        let d = scratch("prune-noarchive");
+        let old = touch_snap(&d, 3, 300, 0, 7);
+        age_to(&d.join(&old), 200_000);
+        let (n, why) = prune_snapshots(&d, None, "none", 0);
+        assert_eq!(n, 0, "an unreadable archive must authorise no deletion");
+        assert_eq!(why, "archive directory could not be read");
+        assert_eq!(held(&d), 1);
+    }
+
+    #[test]
+    fn an_empty_archive_prunes_nothing() {
+        let d = scratch("prune-emptyarchive");
+        let old = touch_snap(&d, 4, 400, 0, 7);
+        age_to(&d.join(&old), 200_000);
+        let span = Some(ArchiveSpan {
+            segments: 0,
+            oldest_age_s: None,
+            newest_age_s: None,
+        });
+        let (n, why) = prune_snapshots(&d, span, "none", 0);
+        assert_eq!(n, 0, "an empty archive states no reach, so nothing may go");
+        assert_eq!(why, "archive holds no segments, so its reach is unknown");
+    }
+
+    /// Segments counted but no mtime readable — `archive_span_at` reports this
+    /// distinctly rather than inventing a span, and so must this.
+    #[test]
+    fn an_archive_with_no_readable_mtime_prunes_nothing() {
+        let d = scratch("prune-nomtime");
+        let old = touch_snap(&d, 5, 500, 0, 7);
+        age_to(&d.join(&old), 200_000);
+        let span = Some(ArchiveSpan {
+            segments: 3,
+            oldest_age_s: None,
+            newest_age_s: None,
+        });
+        let (n, why) = prune_snapshots(&d, span, "none", 0);
+        assert_eq!(n, 0);
+        assert_eq!(why, "no archive segment has a readable mtime");
+    }
+
+    #[test]
+    fn the_latest_target_survives_any_age() {
+        let d = scratch("prune-latest");
+        let keep = touch_snap(&d, 6, 600, 0, 7);
+        age_to(&d.join(&keep), 999_999);
+        let (n, _) = prune_snapshots(&d, reach_12h(), &keep, 0);
+        assert_eq!(n, 0, "what LATEST names must never be removed");
+        assert!(d.join(&keep).exists());
+    }
+
+    #[test]
+    fn non_snapshot_entries_are_untouched() {
+        let d = scratch("prune-foreign");
+        std::fs::write(d.join("LATEST"), b"snap-9-seq900").expect("LATEST");
+        std::fs::write(d.join("LATEST.tmp"), b"x").expect("tmp");
+        age_to(&d.join("LATEST"), 999_999);
+        age_to(&d.join("LATEST.tmp"), 999_999);
+        let (n, _) = prune_snapshots(&d, reach_12h(), "none", 0);
+        assert_eq!(n, 0, "this function owns snap-* and unresumable-* only");
+        assert!(d.join("LATEST").exists() && d.join("LATEST.tmp").exists());
+    }
+
+    /// The count floor covers what the age floor cannot: a clock stepping
+    /// FORWARD makes every entry look ancient at once, and an age rule alone
+    /// would empty the directory in one pass.
+    #[test]
+    fn the_count_floor_holds_regardless_of_age() {
+        let d = scratch("prune-floor");
+        for i in 0..3u64 {
+            let n = touch_snap(&d, i, 100 + i, 0, 7);
+            age_to(&d.join(&n), 500_000 + i); // all far past the cutoff
+        }
+        let (n, why) = prune_snapshots(&d, reach_12h(), "none", 3);
+        assert_eq!(n, 0, "the floor must hold when count == floor ({why})");
+        assert_eq!(held(&d), 3);
+        // One more than the floor, and exactly one may go: the oldest.
+        let extra = touch_snap(&d, 99, 999, 0, 7);
+        age_to(&d.join(&extra), 500_010);
+        let (n, _) = prune_snapshots(&d, reach_12h(), "none", 3);
+        assert_eq!(n, 1, "with floor+1 held, exactly the oldest is removed");
+        assert_eq!(held(&d), 3);
     }
 }
 

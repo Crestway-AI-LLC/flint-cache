@@ -1,6 +1,8 @@
-# BUG-0163: rewind snapshots are never pruned (OPEN)
+# BUG-0163: rewind snapshots are never pruned (FIXED 2026-09-19)
 
-Status: **OPEN**, found in the 24-hour ops-agent review Jeff ordered · Severity:
+Status: **FIXED 2026-09-19.** Filed OPEN 2026-09-17 with the rule proposed and
+deliberately unimplemented; Jeff took the decision on 2026-09-19 and it is
+implemented below. · Severity:
 **medium, and certain.** Nothing is broken today and about 100 days of headroom
 remain. The growth is unbounded and nothing anywhere deletes a snapshot, so the
 end state is not in doubt — only the date.
@@ -61,11 +63,47 @@ reach at runtime rather than hardcoding it.** Twelve hours at one per 30s is
 about 1,440 snapshots; even a generous margin leaves a ~98% reduction against
 the 158,443 held.
 
-It is not implemented here. It deletes recovery state irreversibly on the
-strength of a rule evaluated at runtime, and a mistake in it removes options
-during exactly the incident the snapshots exist for. That is a decision to take
-deliberately, not inside a bug fix, and the ~100 days of headroom means nothing
-is forced.
+It was not implemented when this was filed. It deletes recovery state
+irreversibly on the strength of a rule evaluated at runtime, and a mistake in it
+removes options during exactly the incident the snapshots exist for. That is a
+decision to take deliberately, not inside a bug fix, and the ~100 days of
+headroom meant nothing was forced.
+
+## Implemented 2026-09-19, on Jeff's decision
+
+`prune_snapshots` in `crates/flint-server/src/main.rs`, called from
+`FLINTSNAPSHOT` after the `LATEST` repoint — so a fresh snapshot exists and
+`LATEST` already names it before anything old is removed.
+
+**Cutoff: `max(2 x observed reach, 24h)`.** The reach comes from
+`Store::archive_span()`, which reads THIS node's archive; the tail a rewind
+needs comes from the master's. Same TTL policy, so it is a fair proxy — the
+factor of two is what pays for it being only a proxy.
+
+**It deletes by AGE, never by NAME, and that is the whole reason it is safe.**
+The section above is the argument against the tempting fix, and it still holds:
+nothing here reads `unresumable-` and concludes anything. A quarantined snapshot
+inside the reach survives; one past it does not, on the same test as any other.
+
+**Every unknown keeps.** Unreadable archive directory, archive with no segments,
+no readable mtime, unreadable snapshot root, an entry whose own mtime will not
+read — each ends in "prune nothing" or "skip this entry". The asymmetry is
+priced: keeping too much costs disk, with ~100 days of headroom measured;
+deleting too much costs recovery options during the incident these exist for.
+
+**Two floors, because the age rule alone is not enough.** A 24h minimum, so a
+short archive — a fresh box, an idle one, a just-rotated directory — cannot
+authorise a deep prune. And a count floor of 2,880 kept regardless of age,
+which covers what the age rule cannot: a clock stepping FORWARD makes every
+entry look ancient at once, and age alone would empty the directory in one pass.
+
+**Nine tests, four mutations, each killed by exactly one.** Removing the
+unreadable-archive guard, the `LATEST` exemption, the by-age (not by-name)
+match, or the count floor each fails precisely its own test and leaves the other
+sixteen in the module green.
+
+Expected effect on the playground: 158,443 entries against a 24h cutoff at one
+per 30s leaves order 2,880 — the ~98% reduction this section predicted.
 
 ## Checked and ruled out: this is not a failover-latency problem
 
