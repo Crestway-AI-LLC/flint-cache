@@ -3426,16 +3426,64 @@ fn push_certs(inv: &Inventory) {
     }
 }
 
-/// `flintctl push-bins <tarball>`: stage a release bundle into every host's
-/// bins dir.
+/// The side path `push-bins --stage` unpacks into (OPS-0259).
 ///
-/// `upgrade` rolls whatever is staged; it does not fetch. On a single host
+/// Unpacking straight into `bins` ARMS the new binaries at the moment it
+/// stages them. `supervise.sh` restarts a dead seat through `flintctl start`,
+/// which spawns from the inventory's `bins`, so from the instant staging lands
+/// a seat that dies comes back one version ahead of the fleet -- one of N,
+/// with nothing recording it.
+///
+/// THE WINDOW IS NOT THE ROLL. It is every check BETWEEN staging and the roll,
+/// and in `roll-fleet.sh` five of those can abort: the lease take, the unit
+/// exec-bit check, the control-plane state-format guard, the packaging tag
+/// check and the pre-roll read. An abort leaves `bins` ahead of the fleet
+/// INDEFINITELY, not for the length of a roll.
+///
+/// What a side path actually buys is separating USING the new binaries from
+/// ARMING them, which is the defect underneath the window. BUG-0128's pre-roll
+/// check has to run the new flintctl -- "against the binary that will do the
+/// rolling" -- and without a side path the only way to run it is to install it
+/// where the supervisor spawns from. The two acts are one act.
+fn staged_bins(bins: &str) -> String {
+    format!("{bins}.next")
+}
+
+/// Where the swap parks the outgoing dir, for the width of one rename.
+///
+/// DELIBERATELY NOT `bins.rc<N>`, and that is a safety property rather than a
+/// naming preference. `roll-fleet.sh` leaves no `bin.rc<previous>` behind, the
+/// playground runbook says so, and OPS-0264 is why it matters: swapping a
+/// directory back bypasses the state-format floor that `roll-fleet.sh`
+/// enforces, and once ADR-0032 step 2's writer has shipped, a control plane
+/// rolled below that floor reads its registry as empty and commits the empty
+/// one back. A version-named copy left by every roll would put that one `mv`
+/// away, and `prune-rollbacks.sh` globs exactly `bin.rc*` -- so it would be
+/// curated by a tool that knows nothing about the floor.
+///
+/// The name is therefore fixed rather than versioned, exists only between the
+/// two renames, and is removed on the way out. Rollback stays what the runbook
+/// says it is: re-roll the previous tag, through the checks.
+fn displaced_bins(bins: &str) -> String {
+    format!("{bins}.prev")
+}
+
+/// `flintctl push-bins <tarball> [--stage]`: stage a release bundle into every
+/// host's bins dir, or -- with `--stage` -- into the side path beside it.
+///
+/// `upgrade` rolls whatever is at `bins`; it does not fetch. On a single host
 /// that staging is a manual `tar x`, and this is the same act for a fleet.
+/// THE DEFAULT IS UNCHANGED on purpose: `docs/self-hosting.md` documents the
+/// manual unpack into `bins`, and a `push-bins` that quietly stopped writing
+/// there would turn every existing caller's next `upgrade` into a silent
+/// re-roll of the version already running.
 ///
 /// Note the ordering hazard it inherits: the orchestrator's OWN flintctl is
 /// among the binaries replaced, so a release that fixes a bug in the roll path
 /// cannot roll itself out with the broken one. Unpack first, then upgrade.
-fn push_bins(inv: &Inventory, tarball: &str) {
+/// `--stage` does not weaken that -- it MOVES it, to `activate-bins`, which is
+/// the last thing a roll does before it rolls.
+fn push_bins(inv: &Inventory, tarball: &str, dest: &str) {
     assert!(
         std::path::Path::new(tarball).exists(),
         "no such bundle: {tarball}"
@@ -3458,15 +3506,28 @@ fn push_bins(inv: &Inventory, tarball: &str) {
         } else {
             tarball.to_string()
         };
+        // The side path does not exist until the first staged roll, and tar
+        // will not create it. Harmless for the default destination, which is
+        // the dir this command has always written into.
+        let mk = vec!["mkdir".to_string(), "-p".to_string(), dest.to_string()];
+        match r.output(&mk) {
+            Ok(out) if out.status.success() => {}
+            Ok(out) => die(&format!(
+                "creating {dest} on {}: {}",
+                r.label(),
+                String::from_utf8_lossy(&out.stderr).trim()
+            )),
+            Err(e) => die(&format!("creating {dest} on {}: {e}", r.label())),
+        }
         let argv = vec![
             "tar".to_string(),
             "xzf".to_string(),
             src,
             "-C".to_string(),
-            inv.bins.clone(),
+            dest.to_string(),
         ];
         match r.output(&argv) {
-            Ok(out) if out.status.success() => eprintln!("  bins -> {}", r.label()),
+            Ok(out) if out.status.success() => eprintln!("  {dest} -> {}", r.label()),
             Ok(out) => die(&format!(
                 "unpacking on {}: {}",
                 r.label(),
@@ -3475,6 +3536,166 @@ fn push_bins(inv: &Inventory, tarball: &str) {
             Err(e) => die(&format!("unpacking on {}: {e}", r.label())),
         }
     }
+}
+
+/// The swap, as one command per host rather than three round trips.
+///
+/// Positional arguments, never interpolated: `$1` bins, `$2` staged, `$3`
+/// displaced. An inventory path reaches this from a file an operator edits.
+///
+/// THE RECOVERY ARM IS FOR A PREVIOUS RUN, not this one. If a swap died
+/// between the two renames, `bins` does not exist and the real binaries are
+/// sitting in the displaced dir -- so a blind `rm -rf "$3"` here would destroy
+/// the only copy on the box. It restores instead, which also makes the command
+/// idempotent in the direction that matters.
+///
+/// AND IT RUNS FIRST, ahead of the two refusals. Written the other way round
+/// -- refuse, then recover -- a host whose swap was interrupted and whose
+/// staged dir has since gone stays a host with NO bins dir at all, and the
+/// supervisor there can spawn nothing. Recovering is free and correct whether
+/// or not this run can go on to arm anything, so the command leaves the box in
+/// the best state it can reach before deciding whether it can do its job.
+///
+/// THE CARRY-OVER LOOP IS NOT HOUSEKEEPING; IT IS WHY THIS IS SAFE AT ALL.
+/// `tar x` into the bins dir OVERWRITES BUT NEVER DELETES, and deployments
+/// depend on that: the playground's `/opt/flint/bin` holds 21 files of which
+/// **7 are not in any bundle** -- `lego` and `le-deploy` renew the edge cert,
+/// `playground-reaper` and `playground-approve` are the ExecStart of live
+/// units. A directory swap is a REPLACEMENT, so a swap that did not carry
+/// them over would delete them, and the first sign would be units failing
+/// 203/EXEC and a cert that stops renewing. The runbook's staging assert --
+/// "nothing present before is missing after" -- is the exact property this
+/// preserves, and it is preserved deliberately rather than inherited.
+///
+/// The staged copy always wins: only names ABSENT from it are carried. A loop
+/// that copied unconditionally would overwrite the new binaries with the old
+/// ones and roll nothing, which is the failure this is one character away
+/// from and the reason the test below has a control for it.
+const SWAP_BINS_SH: &str = r#"
+set -e
+if [ ! -d "$1" ] && [ -d "$3" ]; then
+  echo "$1 is missing and $3 exists: an earlier swap died between renames; restoring" >&2
+  mv "$3" "$1"
+fi
+[ -d "$2" ] || { echo "no staged bins at $2" >&2; exit 1; }
+[ -d "$1" ] || { echo "no bins dir at $1" >&2; exit 1; }
+for p in "$1"/* "$1"/.[!.]* "$1"/..?*; do
+  [ -e "$p" ] || [ -L "$p" ] || continue
+  f=${p##*/}
+  if [ ! -e "$2/$f" ] && [ ! -L "$2/$f" ]; then
+    cp -R -p "$p" "$2/$f"
+  fi
+done
+rm -rf "$3"
+mv "$1" "$3"
+if ! mv "$2" "$1"; then
+  mv "$3" "$1"
+  echo "could not move $2 onto $1; $1 restored unchanged" >&2
+  exit 1
+fi
+rm -rf "$3"
+"#;
+
+/// `flintctl activate-bins [--version-tag <tag>]`: swap the staged bins into
+/// place on every host, the last act before a roll.
+///
+/// This is the half of OPS-0259 that `push-bins --stage` makes possible. The
+/// staged dir is USABLE from the moment it lands -- the roll's pre-roll checks
+/// run `<bins>.next/flintctl` -- and becomes ARMED only here, immediately
+/// before `upgrade` rolls the seats that will run it. Everything that can
+/// abort a roll has already had its say by then, so an abort leaves the side
+/// path inert instead of leaving the supervisor holding a version the fleet is
+/// not running.
+///
+/// IT ASKS THE STAGED BINARY, not `--version-tag`. The tag is a label the
+/// operator typed; the binary is what the fleet will run. Same reasoning as
+/// `assert_cp_can_read_its_state`, and the same reason it is worth doing at
+/// all: this is the last point where a wrong bundle costs nothing.
+///
+/// VERIFY EVERY HOST BEFORE MOVING ANY OF THEM. The failure worth ordering
+/// against is the likely one -- a host that was never staged, or staged from a
+/// different bundle -- and it is entirely knowable before the first rename. A
+/// fleet half-swapped over THAT would be this command's own doing. A fleet
+/// half-swapped because the fourth host's disk went read-only is not something
+/// any ordering prevents, so the swap loop names the hosts it has already
+/// armed rather than pretending the set is atomic.
+fn activate_bins(inv: &Inventory, want: Option<&str>) {
+    let next = staged_bins(&inv.bins);
+    let prev = displaced_bins(&inv.bins);
+    let runners = all_runners(inv);
+
+    for r in &runners {
+        let argv = vec![format!("{next}/flintctl"), "--build-version".to_string()];
+        let got = match r.output(&argv) {
+            Ok(out) if out.status.success() => {
+                String::from_utf8_lossy(&out.stdout).trim().to_string()
+            }
+            Ok(out) => die(&format!(
+                "no usable staged flintctl at {next} on {}: {} — run push-bins --stage first",
+                r.label(),
+                String::from_utf8_lossy(&out.stderr).trim()
+            )),
+            Err(e) => die(&format!("asking {next}/flintctl on {}: {e}", r.label())),
+        };
+        match want {
+            Some(tag) if got != tag => die(&format!(
+                "staged flintctl at {next} on {} reports {got}, not {tag} — refusing to \
+                 arm a build this roll did not ask for",
+                r.label()
+            )),
+            _ => eprintln!("  staged {got} on {}", r.label()),
+        }
+    }
+
+    let mut armed: Vec<String> = Vec::new();
+    for r in &runners {
+        let argv = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            SWAP_BINS_SH.to_string(),
+            "sh".to_string(),
+            inv.bins.clone(),
+            next.clone(),
+            prev.clone(),
+        ];
+        match r.output(&argv) {
+            Ok(out) if out.status.success() => {
+                eprintln!("  armed {} on {}", inv.bins, r.label());
+                armed.push(r.label());
+            }
+            Ok(out) => die(&format!(
+                "arming {} on {}: {}{}",
+                inv.bins,
+                r.label(),
+                String::from_utf8_lossy(&out.stderr).trim(),
+                partial(&armed)
+            )),
+            Err(e) => die(&format!(
+                "arming {} on {}: {e}{}",
+                inv.bins,
+                r.label(),
+                partial(&armed)
+            )),
+        }
+    }
+}
+
+/// Name the hosts already armed when a swap fails part-way.
+///
+/// A bare failure here reads as "nothing happened", and the fleet it leaves is
+/// the one thing the operator most needs told: some hosts spawn the new build
+/// and the rest spawn the old one, which is precisely OPS-0259's state made
+/// permanent. Saying which is the difference between a recovery and a search.
+fn partial(armed: &[String]) -> String {
+    if armed.is_empty() {
+        return String::new();
+    }
+    format!(
+        "\n  ALREADY ARMED, and still armed: {}\n  \
+         Those hosts will spawn the staged build; the rest will not. Re-run \
+         activate-bins once the cause is fixed — it is idempotent per host.",
+        armed.join(", ")
+    )
 }
 
 /// (Re-)sign the LEAF certs — the mesh cert (int) and the edge cert — from
@@ -8805,6 +9026,7 @@ const MUTATING: &[&str] = &[
     "reload",
     "upgrade",
     "push-bins",
+    "activate-bins",
     "kill-node",
     "stall-node",
     "restart-node",
@@ -8945,7 +9167,8 @@ Tenants      tenant add|remove  tenant-quota  tenant-reads  tenant-cache
              tenant-async  tenant-federate
 Edge         retire-proxy  proxy-cache
 Secrets      rotate-certs  rotate-admin
-Releases     push-bins <tarball>  upgrade --version-tag <tag>
+Releases     push-bins <tarball> [--stage]  activate-bins [--version-tag <tag>]
+             upgrade --version-tag <tag>
 Config       reload            (edit the inventory; pushes hot knobs, no restart)
 
 A minimal inventory:
@@ -9103,8 +9326,25 @@ fn main() {
             }
         }
         "push-bins" => {
-            let tarball = rest.first().expect("usage: push-bins <bundle.tar.gz>");
-            push_bins(&inv, tarball);
+            let stage = rest.iter().any(|a| a == "--stage");
+            let tarball = rest
+                .iter()
+                .find(|a| !a.starts_with("--"))
+                .expect("usage: push-bins <bundle.tar.gz> [--stage]");
+            let dest = if stage {
+                staged_bins(&inv.bins)
+            } else {
+                inv.bins.clone()
+            };
+            push_bins(&inv, tarball, &dest);
+        }
+        "activate-bins" => {
+            let want = rest
+                .iter()
+                .position(|a| a == "--version-tag")
+                .and_then(|i| rest.get(i + 1))
+                .cloned();
+            activate_bins(&inv, want.as_deref());
         }
         "status" => {
             if rest.iter().any(|a| a == "--json") {
@@ -11361,6 +11601,282 @@ mod cp_state_floor_tests {
 
 /// OPS-0259 candidate 3: a seat that starts says which build it started, and
 /// saying so must not break the supervisor that reads the same line.
+#[cfg(test)]
+mod side_path_tests {
+    use super::*;
+
+    /// Run SWAP_BINS_SH exactly as `activate_bins` runs it.
+    fn swap(bins: &str, next: &str, prev: &str) -> std::process::Output {
+        std::process::Command::new("sh")
+            .args(["-c", SWAP_BINS_SH, "sh", bins, next, prev])
+            .output()
+            .expect("sh")
+    }
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("flint-swap-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).expect("scratch");
+        d
+    }
+
+    fn plant(dir: &std::path::Path, name: &str, body: &str) -> String {
+        let p = dir.join(name);
+        std::fs::create_dir_all(&p).expect("mkdir");
+        std::fs::write(p.join("flintctl"), body).expect("write");
+        p.to_string_lossy().to_string()
+    }
+
+    fn marker(path: &str) -> Option<String> {
+        std::fs::read_to_string(std::path::Path::new(path).join("flintctl")).ok()
+    }
+
+    #[test]
+    fn stage_and_displace_sit_beside_the_bins_dir() {
+        assert_eq!(staged_bins("/opt/flint/bin"), "/opt/flint/bin.next");
+        assert_eq!(displaced_bins("/opt/flint/bin"), "/opt/flint/bin.prev");
+        // A relative bins dir is what every test inventory and the quickstart
+        // use, and the side path has to land beside it rather than at a root.
+        assert_eq!(staged_bins("./target/release"), "./target/release.next");
+    }
+
+    /// THE CONTROL THAT MATTERS, and it is about a name.
+    ///
+    /// `prune-rollbacks.sh` selects rollback copies with `ls -d "$DIR/$NAME".rc*`
+    /// and reconstructs them as `$NAME.rc$v`. Nothing in this repository can
+    /// run that script, so this asserts the property the script depends on:
+    /// the displaced dir must not look like a rollback copy.
+    ///
+    /// Why it is a safety property rather than tidiness: OPS-0264. A
+    /// version-named directory left behind by every roll makes rolling back
+    /// one `mv` away, and that path skips the state-format floor
+    /// `roll-fleet.sh` enforces — which, once ADR-0032 step 2's writer has
+    /// shipped, is the difference between a rollback and an emptied registry.
+    #[test]
+    fn the_displaced_dir_is_not_a_rollback_copy() {
+        let d = displaced_bins("/opt/flint/bin");
+        assert!(
+            !d.starts_with("/opt/flint/bin.rc"),
+            "{d} would be swept up by prune-rollbacks.sh's bin.rc* glob"
+        );
+        // And it is not version-named at all, so it cannot accumulate one per
+        // roll and cannot be mistaken for a copy of any particular release.
+        for tag in ["v0.1.0-rc.74", "rc74", "74"] {
+            assert!(!d.contains(tag), "{d} names a version ({tag})");
+        }
+    }
+
+    #[test]
+    fn the_swap_arms_the_staged_dir_and_keeps_nothing() {
+        let d = scratch("ok");
+        let bins = plant(&d, "bin", "OLD");
+        let next = plant(&d, "bin.next", "NEW");
+        let prev = d.join("bin.prev").to_string_lossy().to_string();
+
+        let out = swap(&bins, &next, &prev);
+        assert!(
+            out.status.success(),
+            "{:?}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(marker(&bins).as_deref(), Some("NEW"));
+        assert!(!std::path::Path::new(&next).exists(), "staged dir survived");
+        // No copy kept: the whole point of the fixed name.
+        assert!(
+            !std::path::Path::new(&prev).exists(),
+            "a rollback copy was left behind"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn nothing_staged_leaves_the_live_bins_untouched() {
+        let d = scratch("nostage");
+        let bins = plant(&d, "bin", "OLD");
+        let next = d.join("bin.next").to_string_lossy().to_string();
+        let prev = d.join("bin.prev").to_string_lossy().to_string();
+
+        let out = swap(&bins, &next, &prev);
+        assert!(!out.status.success(), "a missing stage must not succeed");
+        assert!(String::from_utf8_lossy(&out.stderr).contains("no staged bins"));
+        assert_eq!(marker(&bins).as_deref(), Some("OLD"), "the live bins moved");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The arm that exists for a PREVIOUS run, not this one.
+    ///
+    /// A swap killed between its two renames leaves no `bins` and the real
+    /// binaries in the displaced dir. A blind `rm -rf "$3"` at the top — the
+    /// obvious way to clear stale residue — would destroy the only copy on the
+    /// box, turning a recoverable interruption into a host with no binaries.
+    #[test]
+    fn a_swap_that_died_between_renames_is_restored_not_deleted() {
+        let d = scratch("recover");
+        // The exact state a kill between `mv bin bin.prev` and `mv bin.next bin`
+        // leaves: no bins, the old binaries parked, the new ones still staged.
+        let prev = plant(&d, "bin.prev", "OLD");
+        let next = plant(&d, "bin.next", "NEW");
+        let bins = d.join("bin").to_string_lossy().to_string();
+        assert!(!std::path::Path::new(&bins).exists());
+
+        let out = swap(&bins, &next, &prev);
+        assert!(
+            out.status.success(),
+            "{:?}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(String::from_utf8_lossy(&out.stderr).contains("restoring"));
+        assert_eq!(
+            marker(&bins).as_deref(),
+            Some("NEW"),
+            "the swap did not complete"
+        );
+        assert!(!std::path::Path::new(&prev).exists());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The same interruption with NOTHING staged, which is what fixes the
+    /// ORDER of the two arms.
+    ///
+    /// This run cannot arm anything and must fail. The question is what it
+    /// leaves behind: written as "refuse, then recover" the box keeps no bins
+    /// dir at all and its supervisor can spawn nothing, which is a worse state
+    /// than the interrupted swap started from. Recovering first costs nothing
+    /// and is right either way.
+    #[test]
+    fn the_restore_runs_before_the_staged_check_can_abort() {
+        let d = scratch("recover-nostage");
+        let prev = plant(&d, "bin.prev", "OLD");
+        let next = d.join("bin.next").to_string_lossy().to_string();
+        let bins = d.join("bin").to_string_lossy().to_string();
+
+        let out = swap(&bins, &next, &prev);
+        assert!(!out.status.success(), "there is nothing to arm");
+        assert!(String::from_utf8_lossy(&out.stderr).contains("no staged bins"));
+        // THE POINT: it failed, and the box still has its binaries where the
+        // supervisor looks for them.
+        assert_eq!(
+            marker(&bins).as_deref(),
+            Some("OLD"),
+            "the box was left with no bins dir"
+        );
+        assert!(
+            !std::path::Path::new(&prev).exists(),
+            "the displaced dir was left behind"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_stale_displaced_dir_does_not_block_a_normal_swap() {
+        let d = scratch("stale");
+        let bins = plant(&d, "bin", "OLD");
+        let next = plant(&d, "bin.next", "NEW");
+        let prev = plant(&d, "bin.prev", "RUBBISH");
+
+        let out = swap(&bins, &next, &prev);
+        assert!(
+            out.status.success(),
+            "{:?}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(marker(&bins).as_deref(), Some("NEW"));
+        assert!(!std::path::Path::new(&prev).exists());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// THE DEFECT THAT WOULD HAVE TAKEN THE PLAYGROUND DOWN.
+    ///
+    /// `tar x` into the bins dir overwrites but never deletes, and that is not
+    /// an accident of tar -- deployments rely on it. The playground's
+    /// `/opt/flint/bin` holds 21 files of which 7 come from no bundle:
+    /// `lego` and `le-deploy` renew the edge certificate, `playground-reaper`
+    /// and `playground-approve` are the ExecStart targets of live units. A
+    /// directory swap REPLACES rather than merges, so the obvious
+    /// implementation deletes all seven, and the first sign is units dying
+    /// 203/EXEC and a certificate that quietly stops renewing.
+    #[test]
+    fn the_swap_keeps_files_the_bundle_does_not_ship() {
+        let d = scratch("carry");
+        let bins = plant(&d, "bin", "OLD");
+        let next = plant(&d, "bin.next", "NEW");
+        let prev = d.join("bin.prev").to_string_lossy().to_string();
+        // The live extras, by name, so a reader sees what is at stake.
+        for extra in ["lego", "le-deploy", "playground-reaper", "flintctl.rc69"] {
+            std::fs::write(std::path::Path::new(&bins).join(extra), extra).expect("extra");
+        }
+        // And a directory, because `le-deploy` is not the only shape a bins
+        // dir holds and `cp` needs to be told to recurse.
+        let sub = std::path::Path::new(&bins).join("hooks");
+        std::fs::create_dir_all(&sub).expect("subdir");
+        std::fs::write(sub.join("renew.sh"), "hook").expect("hook");
+
+        let out = swap(&bins, &next, &prev);
+        assert!(
+            out.status.success(),
+            "{:?}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        for extra in ["lego", "le-deploy", "playground-reaper", "flintctl.rc69"] {
+            let p = std::path::Path::new(&bins).join(extra);
+            assert!(p.exists(), "{extra} was deleted by the swap");
+            assert_eq!(std::fs::read_to_string(&p).expect("read extra"), extra);
+        }
+        assert!(
+            std::path::Path::new(&bins).join("hooks/renew.sh").exists(),
+            "a directory the bundle does not ship was not carried over"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// THE CONTROL FOR THAT CARRY-OVER, and it is the one that matters.
+    ///
+    /// A loop that copied unconditionally rather than only the absent names
+    /// would put the OLD binaries back over the new ones. Every assertion
+    /// above would still pass -- the extras survive either way -- and the
+    /// roll would install the version it was replacing while reporting
+    /// success.
+    #[test]
+    fn the_staged_copy_wins_over_the_one_it_replaces() {
+        let d = scratch("carry-control");
+        let bins = plant(&d, "bin", "OLD");
+        let next = plant(&d, "bin.next", "NEW");
+        let prev = d.join("bin.prev").to_string_lossy().to_string();
+        // A name present in BOTH, which is every binary in the bundle.
+        std::fs::write(std::path::Path::new(&bins).join("flint-server"), "OLD").expect("w");
+        std::fs::write(std::path::Path::new(&next).join("flint-server"), "NEW").expect("w");
+
+        let out = swap(&bins, &next, &prev);
+        assert!(
+            out.status.success(),
+            "{:?}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            marker(&bins).as_deref(),
+            Some("NEW"),
+            "flintctl was rolled back"
+        );
+        assert_eq!(
+            std::fs::read_to_string(std::path::Path::new(&bins).join("flint-server"))
+                .expect("read flint-server"),
+            "NEW",
+            "the carry-over overwrote a staged binary with the one it replaces"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// `activate-bins` changes a fleet, so a source build must not be able to
+    /// run it against a real inventory. Forgetting this is silent: the verb
+    /// works, and the guard that was supposed to stop it simply is not there.
+    #[test]
+    fn activate_bins_is_a_mutating_verb() {
+        assert!(MUTATING.contains(&"activate-bins"));
+        assert!(MUTATING.contains(&"push-bins"), "the control");
+    }
+}
+
 #[cfg(test)]
 mod started_line_tests {
     use super::started_line;
