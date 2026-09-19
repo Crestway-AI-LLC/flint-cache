@@ -5529,7 +5529,7 @@ fn flintnsrestore(_rocks: &Option<RocksHandle>, _args: &[Vec<u8>]) -> Value {
     Value::Error("ERR FLINTNSRESTORE requires a build with --features rocks".into())
 }
 
-/// FLINTPROMOTE <generation> <counter>: epoch-fenced promotion of a
+/// `FLINTPROMOTE <generation> <counter>`: epoch-fenced promotion of a
 /// replica to master. The epoch must strictly exceed the stored role
 /// epoch (manifest fencing) — a stale promoter gets -FENCED with the
 /// current epoch. On success: role persisted first, then the tailer is
@@ -5759,7 +5759,7 @@ fn flintfollow(_ro: &Arc<AtomicBool>, _rocks: &Option<RocksHandle>, _args: &[Vec
     Value::Error("ERR FLINTFOLLOW requires a build with --features rocks".into())
 }
 
-/// FLINTFENCE <generation> <counter>: answer with the branch-point bound for
+/// `FLINTFENCE <generation> <counter>`: answer with the branch-point bound for
 /// a copy from that epoch (see manifest::promo_fence_bound for the safety
 /// argument). Integer = resume is safe from any seq <= it; nil = cannot
 /// vouch, re-seed. An epoch at or above this node's own claim is bounded by
@@ -5805,7 +5805,7 @@ fn flintfence(_rocks: &Option<RocksHandle>, _args: &[Vec<u8>]) -> Value {
     Value::Error("ERR FLINTFENCE requires a build with --features rocks".into())
 }
 
-/// FLINTDEMOTE <generation> <counter>: epoch-fenced fencing of a (possibly
+/// `FLINTDEMOTE <generation> <counter>`: epoch-fenced fencing of a (possibly
 /// stale, possibly returning) master. The counterpart of FLINTPROMOTE and
 /// the tool the trio (or an operator) uses to silence a zombie: a killed
 /// master restarted on its old data dir still holds role:Master durably and
@@ -6587,7 +6587,7 @@ fn flintsync(
     result
 }
 
-/// FLINTSNAPSHOT <root>: checkpoint into <root>/<id>, repoint <root>/LATEST.
+/// `FLINTSNAPSHOT <root>`: checkpoint into `<root>/<id>`, repoint `<root>/LATEST`.
 /// The id embeds time + latest sequence, so ordering and staleness are
 /// readable from the name alone.
 #[cfg(feature = "rocks")]

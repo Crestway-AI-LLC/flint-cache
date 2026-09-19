@@ -228,7 +228,8 @@ impl RocksKv {
     /// resident set frozen at whatever loaded first.
     ///
     /// `None` MEANS "I COULD NOT ANSWER", on the same contract as
-    /// [`write_stall`] and for a sharper reason here. Folding an unanswerable
+    /// [`Self::write_stall`] and for a sharper reason here. Folding an
+    /// unanswerable
     /// property into `0` would silently return `ns_bytes` alone — the
     /// undercount this function exists to remove — and it would do it in the
     /// reassuring direction, reporting a namespace as having room while it

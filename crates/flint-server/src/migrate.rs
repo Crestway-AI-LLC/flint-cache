@@ -699,7 +699,7 @@ fn classify_source_phase(rows: &[Value], slot: u16, ns: &[u8]) -> SourcePhase {
     SourcePhase::NoRecord
 }
 
-/// FLINTMIGRATEIN <src host:port> <slot> [<self advertise addr>]. With the
+/// `FLINTMIGRATEIN <src host:port> <slot> [<self advertise addr>]`. With the
 /// self address it performs the full cutover (freeze/drain/flip); without it,
 /// only ships the data (no ownership change).
 #[cfg(feature = "rocks")]
@@ -775,7 +775,7 @@ fn set_slot_phase(
     )
 }
 
-/// FLINTSLOTMOVED <slot> <host:port>: terminal cutover on the source — durable
+/// `FLINTSLOTMOVED <slot> <host:port>`: terminal cutover on the source — durable
 /// Moved override so this node answers -MOVED for the slot.
 #[cfg(feature = "rocks")]
 pub(crate) fn flintslotmoved(
@@ -847,7 +847,7 @@ pub(crate) fn flintslotmoved(
     Value::Error("ERR FLINTSLOTMOVED requires a build with --features rocks".into())
 }
 
-/// FLINTSLOTFREEZE <slot> <dest>: mark the slot Migrating so the source sheds
+/// `FLINTSLOTFREEZE <slot> <dest>`: mark the slot Migrating so the source sheds
 /// writes to it (-TRYAGAIN) while the destination drains the final tail.
 #[cfg(feature = "rocks")]
 pub(crate) fn flintslotfreeze(
@@ -1002,7 +1002,7 @@ pub(crate) fn flintmigrations(_rocks: &Option<RocksHandle>, _args: &[Vec<u8>]) -
     Value::Error("ERR FLINTMIGRATIONS requires a build with --features rocks".into())
 }
 
-/// FLINTSLOTABORT <slot>: clear an in-flight record (rollback/unfreeze).
+/// `FLINTSLOTABORT <slot>`: clear an in-flight record (rollback/unfreeze).
 /// Refuses a terminal Moved override — settled ownership is not aborted.
 #[cfg(feature = "rocks")]
 pub(crate) fn flintslotabort(rocks: &Option<RocksHandle>, args: &[Vec<u8>]) -> Value {
