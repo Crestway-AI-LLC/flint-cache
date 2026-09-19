@@ -124,7 +124,8 @@ own:
 2. **Persist `RegistryState` on the single-node path**, writing serde and
    reading either — one release of tolerant reading before the old writer goes.
    **The READING half landed 2026-09-16** — see "Step 2's reader, shipped
-   alone" below. The writer is unchanged and a test holds it that way.
+   alone" below. **The WRITER is written and gated but NOT pushed** (2026-09-18)
+   — see "Step 2's writer" below for the two conditions it is waiting on.
 3. **Dispatch builds `Mutation`.** The two dispatch functions stay, because the
    transports genuinely differ; what stops being duplicated is what each verb
    MEANS. The verb-parity guard already asserts the tables match.
@@ -412,6 +413,54 @@ somebody adds.
 the two lease arms existed to feed the hand-written cache updates. They are now
 the checks they always were — an index in range, an address that belongs to a
 registered pair — with nothing read out of them.
+
+## Step 2's writer, written and held (2026-09-18)
+
+`commit()` encodes the registry with serde instead of the hand-written line
+format. The line PARSER stays — every state file written before the upgrade is
+in that format, and it migrates on the first commit after, not at load.
+
+**Held, not pushed, on two conditions that are not the code's to satisfy:**
+
+1. **Jeff's word.** The ADR is accepted and the release condition below is met,
+   but the format change is the irreversible part of this work and the peer
+   relayed a go-ahead for the *type swap*, which is a different step. An
+   inherited reading of somebody else's sentence is not an approval for this
+   one.
+2. **The playground's rollback copy.** `/opt/flint/bin.rc72` is what the
+   runbook rolls back to, and **rc.72 has no tolerant reader** — it would meet
+   JSON it cannot parse. The staged rollout's premise is that the reader ships
+   first, and it did, in rc.73; the rollback copy is the one place still
+   holding a binary from before it. Refresh it to rc.73 (or later) before the
+   release carrying this writer rolls.
+
+**OPS-0259's staging window is fine for this**, which is worth saying because
+it was the obvious worry: a seat that dies mid-stage comes back on the new
+binary, so an rc.74 CP would write JSON while the rest of the fleet is rc.73 —
+and rc.73 reads JSON. The window bites on the rollback path, not the roll.
+
+**What the change is, in full:** `serialize()` is gone and `encode()` is
+`serde_json::to_string_pretty`. Pretty on purpose: the line format's one real
+virtue was that an operator could `cat` it mid-incident, the registry is small,
+and compact JSON would save bytes nobody is short of.
+
+**A guarantee that was quietly format-shaped, found by moving the writer.**
+ADR-0006 D1 says the control plane holds token DIGESTS, never plaintext — and
+that migration lived inside the LINE parser as a closure. Under the new writer
+a state file is JSON, and the JSON path had no such rule: `digestify` is now a
+module-level function both readers call, so the guarantee is a property of
+`load_or_new` rather than of whichever format the file happened to be in. The
+admin token is deliberately exempt: it is plaintext by design, because the
+agent retrieves it and the proxies get only its digest.
+
+**The test that held the boundary shut is now the test that it opened
+deliberately.** `the_writer_has_not_moved_yet` became
+`the_writer_has_moved_and_an_old_file_migrates_on_first_commit`: write the OLD
+format (with the real former writer, kept as a test fixture so the sample
+cannot drift from what the reader must accept), load, commit, and assert the
+file is JSON and that every field survived. Plus a direct control that a
+plaintext token is digested on load *from either format*, so the new invariant
+is not held up only by a round-trip test that happened to notice.
 
 ## The question this ADR asked, and its answer
 

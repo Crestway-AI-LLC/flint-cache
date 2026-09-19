@@ -166,6 +166,26 @@ pub fn dns_zone<'a>(
     out
 }
 
+/// ADR-0006 D1: the control plane holds tenant token DIGESTS, never plaintext.
+///
+/// A token that is not already 64 hex characters is from before that boundary
+/// existed, and is hashed ON LOAD — one way, once. Applied by BOTH readers
+/// since ADR-0032 step 2 moved the writer: the guarantee is "what `load_or_new`
+/// returns never carries a plaintext tenant token", and which format the file
+/// happened to be written in is not something that guarantee should depend on.
+/// It was a closure inside the line parser, so the JSON path silently did not
+/// have it, and the round-trip test caught that the hour the writer moved.
+///
+/// NOT the admin token, which is plaintext by design: the agent retrieves it
+/// and the proxies are given only its digest.
+fn digestify(t: String) -> String {
+    if t.len() == 64 && t.bytes().all(|b| b.is_ascii_hexdigit()) {
+        t
+    } else {
+        flint_tls::sha256_hex(t.as_bytes())
+    }
+}
+
 impl State {
     pub fn load_or_new(path: PathBuf) -> Self {
         let mut s = State {
@@ -211,6 +231,11 @@ impl State {
                     // persists nothing — so it is restored before the value
                     // escapes this function.
                     reg.path = Some(path.clone());
+                    // ADR-0006 D1, on this path as well — see `digestify`.
+                    for t in reg.tenants.values_mut() {
+                        t.token = digestify(std::mem::take(&mut t.token));
+                        t.prev_token = t.prev_token.take().map(digestify);
+                    }
                     // RANGES PADDED TO THE PAIR COUNT, because the two
                     // producers disagree about whether a range is optional.
                     // The line loader below pushes exactly one entry per `pair`
@@ -272,15 +297,6 @@ impl State {
                         let prev_token = parts
                             .next()
                             .and_then(|p| if p == "-" { None } else { Some(p.to_string()) });
-                        // ADR-0006 D1 migration: a plaintext-era token (not
-                        // a 64-hex digest) is hashed ON LOAD — one-way, once.
-                        let digestify = |t: String| {
-                            if t.len() == 64 && t.bytes().all(|b| b.is_ascii_hexdigit()) {
-                                t
-                            } else {
-                                flint_tls::sha256_hex(t.as_bytes())
-                            }
-                        };
                         let replica_reads = parts.next() == Some("1");
                         let local_cache = parts.next() == Some("1");
                         let ops_per_sec = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0);
@@ -364,63 +380,25 @@ impl State {
         s
     }
 
-    fn serialize(&self) -> String {
-        let mut out = format!("version {}\n", self.version);
-        if self.admin_token.is_some() || self.admin_prev.is_some() {
-            out.push_str(&format!(
-                "admin {} {}\n",
-                self.admin_token.as_deref().unwrap_or("-"),
-                self.admin_prev.as_deref().unwrap_or("-")
-            ));
-        }
-        for p in &self.proxies {
-            out.push_str(&format!("proxy {p}\n"));
-        }
-        for (i, pair) in self.pairs.iter().enumerate() {
-            let range = match self.ranges.get(i).copied().flatten() {
-                Some((a, b)) => format!("{a}-{b}"),
-                None => "-".to_string(),
-            };
-            out.push_str(&format!("pair {} {range}\n", pair.join(",")));
-        }
-        for (members, master, g) in &self.leases {
-            out.push_str(&format!("lease {} {master} {g}\n", members.join(",")));
-        }
-        for (ns, lo, hi, pair) in &self.exceptions {
-            out.push_str(&format!("exc {ns} {lo} {hi} {pair}\n"));
-        }
-        for t in self.tenants.values() {
-            let subset = if t.subset.is_empty() {
-                "-".to_string()
-            } else {
-                t.subset.join(",")
-            };
-            out.push_str(&format!(
-                "tenant {} {} {} {subset} {} {} {} {} {} {} {} {}\n",
-                t.name,
-                t.token,
-                t.ns,
-                t.prev_token.as_deref().unwrap_or("-"),
-                t.replica_reads as u8,
-                t.local_cache as u8,
-                t.ops_per_sec,
-                t.max_bytes,
-                t.over_quota as u8,
-                t.federated as u8,
-                t.async_writes as u8,
-                // APPENDED, and appended is the whole compatibility story
-                // (BUG-0152). These two were written nowhere and loaded as
-                // `false`, so `CPTENANTASYNC on` and `CPTENANTFEDERATE on`
-                // held until the control plane restarted and then silently
-                // reverted -- with the CP pushing the reverted configuration
-                // out to the proxies.
-                subset = subset
-            ));
-        }
-        for (prefix, addrs) in &self.families {
-            out.push_str(&format!("family {prefix} {}\n", addrs.join(",")));
-        }
-        out
+    /// Encode the registry for the single-node durable file (ADR-0032 step 2).
+    ///
+    /// **Serde, as of 2026-09-18.** The hand-written line format this replaced
+    /// carried ten of `Tenant`'s twelve fields, so `CPTENANTASYNC on` and
+    /// `CPTENANTFEDERATE on` reverted on a control-plane restart (BUG-0152).
+    /// A format that lists its fields by hand is a format that forgets one;
+    /// serde cannot, and the exhaustive destructure in `load_or_new` makes a
+    /// thirteenth field a compile error rather than a silent loss.
+    ///
+    /// **Pretty, deliberately.** The line format's one real virtue was that an
+    /// operator could `cat` it during an incident, and the registry is small --
+    /// proxies, pairs, tenants. Compact JSON would save bytes nobody is short
+    /// of and cost the one property the old format had.
+    ///
+    /// **The reader still accepts both**, and must for at least one release
+    /// after this one: a file written before today is the line format, and it
+    /// migrates on the first commit after the upgrade, not at load.
+    fn encode(&self) -> std::io::Result<String> {
+        serde_json::to_string_pretty(self).map_err(std::io::Error::other)
     }
 
     /// Bump the version and persist atomically (temp + fsync + rename).
@@ -432,7 +410,7 @@ impl State {
             let tmp = path.with_extension("tmp");
             {
                 let mut f = std::fs::File::create(&tmp)?;
-                f.write_all(self.serialize().as_bytes())?;
+                f.write_all(self.encode()?.as_bytes())?;
                 f.sync_all()?;
             }
             std::fs::rename(&tmp, path)?;
@@ -693,6 +671,74 @@ mod tests {
     // four pin both halves of that -- that the new format is readable NOW, and
     // that nothing has started writing it yet.
 
+    /// The OLD single-node writer, kept as a test fixture after ADR-0032
+    /// step 2 replaced it (2026-09-18).
+    ///
+    /// The reader still has to accept this format -- every state file written
+    /// before the upgrade is in it, and it migrates on the first commit after.
+    /// Producing those files with the real former writer, rather than a
+    /// hand-typed sample, is what stops the fixture drifting into a format
+    /// nothing ever wrote: the sample would keep passing while the reader
+    /// stopped matching reality.
+    fn line_format(st: &crate::registry::RegistryState) -> String {
+        let mut out = format!("version {}\n", st.version);
+        if st.admin_token.is_some() || st.admin_prev.is_some() {
+            out.push_str(&format!(
+                "admin {} {}\n",
+                st.admin_token.as_deref().unwrap_or("-"),
+                st.admin_prev.as_deref().unwrap_or("-")
+            ));
+        }
+        for p in &st.proxies {
+            out.push_str(&format!("proxy {p}\n"));
+        }
+        for (i, pair) in st.pairs.iter().enumerate() {
+            let range = match st.ranges.get(i).copied().flatten() {
+                Some((a, b)) => format!("{a}-{b}"),
+                None => "-".to_string(),
+            };
+            out.push_str(&format!("pair {} {range}\n", pair.join(",")));
+        }
+        for (members, master, g) in &st.leases {
+            out.push_str(&format!("lease {} {master} {g}\n", members.join(",")));
+        }
+        for (ns, lo, hi, pair) in &st.exceptions {
+            out.push_str(&format!("exc {ns} {lo} {hi} {pair}\n"));
+        }
+        for t in st.tenants.values() {
+            let subset = if t.subset.is_empty() {
+                "-".to_string()
+            } else {
+                t.subset.join(",")
+            };
+            out.push_str(&format!(
+                "tenant {} {} {} {subset} {} {} {} {} {} {} {} {}\n",
+                t.name,
+                t.token,
+                t.ns,
+                t.prev_token.as_deref().unwrap_or("-"),
+                t.replica_reads as u8,
+                t.local_cache as u8,
+                t.ops_per_sec,
+                t.max_bytes,
+                t.over_quota as u8,
+                t.federated as u8,
+                t.async_writes as u8,
+                // APPENDED, and appended is the whole compatibility story
+                // (BUG-0152). These two were written nowhere and loaded as
+                // `false`, so `CPTENANTASYNC on` and `CPTENANTFEDERATE on`
+                // held until the control plane restarted and then silently
+                // reverted -- with the CP pushing the reverted configuration
+                // out to the proxies.
+                subset = subset
+            ));
+        }
+        for (prefix, addrs) in &st.families {
+            out.push_str(&format!("family {prefix} {}\n", addrs.join(",")));
+        }
+        out
+    }
+
     fn a_full_registry() -> crate::registry::RegistryState {
         // EVERY FIELD NON-DEFAULT, deliberately. A field left at its default
         // is a field this test cannot tell from one the reader dropped --
@@ -807,52 +853,95 @@ mod tests {
     }
 
     #[test]
-    fn the_writer_has_not_moved_yet() {
-        // THE CONTROL FOR THE RELEASE BOUNDARY, and the reason it is a test
-        // rather than a note. This release ships READING both formats; the
-        // moment it also WRITES the new one, the door it exists to hold open
-        // has shut -- an older binary would meet JSON it cannot read, which is
-        // the case the staged rollout is for. Load JSON, commit, and the file
-        // on disk must be the line format still.
-        let dir = TempDir::new("writerfixed");
+    fn a_plaintext_token_is_digested_on_load_from_either_format() {
+        // THE GUARANTEE IS ABOUT `load_or_new`, NOT ABOUT A FORMAT. ADR-0006
+        // D1 says the control plane holds digests; until the writer moved
+        // (ADR-0032 step 2) that was enforced in the line parser alone, so the
+        // JSON path had no such rule and nothing said so -- the round-trip
+        // test only caught it because the writer changed underneath it.
+        //
+        // Both directions are asserted here, with the SAME token, so a future
+        // reader cannot satisfy one and drop the other.
+        let want = flint_tls::sha256_hex(b"plain-token");
+
+        let dir = TempDir::new("digestify");
+        let json = dir.0.join("as-json");
+        let mut reg = a_full_registry();
+        for t in reg.tenants.values_mut() {
+            t.token = "plain-token".to_string();
+            t.prev_token = Some("plain-token".to_string());
+        }
+        std::fs::write(&json, serde_json::to_string(&reg).expect("encode")).expect("write");
+        let from_json = State::load_or_new(json);
+        for t in from_json.tenants.values() {
+            assert_eq!(t.token, want, "JSON: token digested on load");
+            assert_eq!(
+                t.prev_token.as_deref(),
+                Some(want.as_str()),
+                "JSON: previous token digested on load"
+            );
+        }
+
+        let lines = dir.0.join("as-lines");
+        std::fs::write(&lines, line_format(&reg)).expect("write");
+        let from_lines = State::load_or_new(lines);
+        for t in from_lines.tenants.values() {
+            assert_eq!(t.token, want, "line format: token digested on load");
+        }
+    }
+
+    #[test]
+    fn the_writer_has_moved_and_an_old_file_migrates_on_first_commit() {
+        // THE RELEASE BOUNDARY, CROSSED ON PURPOSE (ADR-0032 step 2). Until
+        // 2026-09-18 this test asserted the opposite -- that `commit()` still
+        // emitted the line format -- because the tolerant reader had to ship
+        // one release AHEAD of the writer, and no test can see whether that
+        // release actually went out. rc.73 shipped and was rolled, so the
+        // door it held open has been closed deliberately rather than by
+        // somebody not noticing it was there.
+        //
+        // What this asserts now is the migration, which is the part that can
+        // still go wrong: an OLD file on disk, one commit, and every field is
+        // still there afterwards.
+        let dir = TempDir::new("writermoved");
         let path = dir.0.join("state");
-        std::fs::write(
-            &path,
-            serde_json::to_string(&a_full_registry()).expect("encode"),
-        )
-        .expect("write");
+
+        // Written by the OLD writer: the line format, produced here rather
+        // than by a fixture string so the test cannot drift from what the
+        // reader has to accept.
+        let before = a_full_registry();
+        std::fs::write(&path, line_format(&before)).expect("write the old format");
 
         let mut s = State::load_or_new(path.clone());
         s.commit().expect("commit");
 
         let raw = std::fs::read_to_string(&path).expect("read back");
         assert!(
-            raw.starts_with("version "),
-            "the single-node writer has started emitting something other than the \
-             line format. If that is ADR-0032 step 2 landing, it must not land in \
-             the same release as the tolerant reader -- see load_or_new. Got: {:?}",
+            raw.starts_with('{'),
+            "the first commit after the upgrade must rewrite the file as JSON, \
+             which is what `load_or_new`'s leading-brace discriminator reads. Got: {:?}",
             raw.chars().take(60).collect::<String>()
         );
-        // And the reader is still whole after the round trip through the old
-        // writer: a tolerant read that silently lost a field would leave a
-        // thinner file behind, which is the shape that destroys data quietly.
+
+        // EVERY FIELD, across the format change. The line format lost two of
+        // Tenant's twelve (BUG-0152); a migration that lost one would leave a
+        // thinner file and nothing would say so.
         let back = State::load_or_new(path);
-        assert_eq!(back.pairs, a_full_registry().pairs, "pairs after rewrite");
+        assert_eq!(back.pairs, before.pairs, "pairs across the migration");
+        assert_eq!(back.ranges, before.ranges, "ranges across the migration");
+        assert_eq!(back.tenants, before.tenants, "tenants across the migration");
+        assert_eq!(back.proxies, before.proxies, "proxies across the migration");
+        assert_eq!(back.leases, before.leases, "leases across the migration");
         assert_eq!(
-            back.tenants,
-            a_full_registry().tenants,
-            "tenants after rewrite"
+            back.families, before.families,
+            "families across the migration"
         );
         assert_eq!(
-            back.leases,
-            a_full_registry().leases,
-            "leases after rewrite"
+            back.exceptions, before.exceptions,
+            "exceptions across the migration"
         );
-        assert_eq!(
-            back.families,
-            a_full_registry().families,
-            "families after rewrite"
-        );
+        assert_eq!(back.admin_token, before.admin_token, "admin token");
+        assert_eq!(back.admin_prev, before.admin_prev, "previous admin token");
     }
 
     #[test]
