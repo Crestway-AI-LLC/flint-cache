@@ -124,8 +124,8 @@ own:
 2. **Persist `RegistryState` on the single-node path**, writing serde and
    reading either — one release of tolerant reading before the old writer goes.
    **The READING half landed 2026-09-16** — see "Step 2's reader, shipped
-   alone" below. **The WRITER is written and gated but NOT pushed** (2026-09-18)
-   — see "Step 2's writer" below for the two conditions it is waiting on.
+   alone" below. **The WRITER landed 2026-09-18** as `2548286`, once both of
+   the conditions it was held on were met — see "Step 2's writer" below.
 3. **Dispatch builds `Mutation`.** The two dispatch functions stay, because the
    transports genuinely differ; what stops being duplicated is what each verb
    MEANS. The verb-parity guard already asserts the tables match.
@@ -414,13 +414,17 @@ the two lease arms existed to feed the hand-written cache updates. They are now
 the checks they always were — an index in range, an address that belongs to a
 registered pair — with nothing read out of them.
 
-## Step 2's writer, written and held (2026-09-18)
+## Step 2's writer, held and then landed (2026-09-18)
 
 `commit()` encodes the registry with serde instead of the hand-written line
 format. The line PARSER stays — every state file written before the upgrade is
 in that format, and it migrates on the first commit after, not at load.
 
-**Held, not pushed, on two conditions that are not the code's to satisfy:**
+**It was held, not pushed, on two conditions that were not the code's to
+satisfy. Both were met on 2026-09-18 and it landed as `2548286`** — `ci`,
+`gate` and `msrv` all green. The conditions are kept below rather than deleted,
+because what a change waited for is the part of this that is worth reading
+later:
 
 1. **Jeff's word.** The ADR is accepted and the release condition below is met,
    but the format change is the irreversible part of this work and the peer
@@ -442,6 +446,31 @@ in that format, and it migrates on the first commit after, not at load.
    `commit()` writes that back over the real registry. Tracked as **OPS-0264**,
    which puts the floor in the runbook's rollback section and the release
    checklist.
+
+**How both conditions were met, 2026-09-18.** Condition 1: Jeff said
+“push the writer” — directly, about this step, which is what the condition
+asked for and what an inherited reading of a sentence about the type swap
+could not supply. Condition 2: the floor is now written down AND enforced.
+**OPS-0264** states it once in the playground runbook's rollback section, with
+`docs/releasing.md` pointing at it from beside the rc.67 floor; **OPS-0265**
+makes `roll-fleet.sh` refuse a roll below rc.73 onto a JSON state file before
+it copies anything, with `FLINT_ROLL_ALLOW_CP_FORMAT=1` as a loud override,
+because the person rolling back at 2am is not reading either page.
+
+Two things measured while writing those up, both of which belong here because
+they narrow this ADR's own claims. **A Raft control plane was never at risk**:
+`raft.rs` never references `state::State` or `load_or_new`, and its `Store` has
+persisted serde JSON since it was written, so this step changes only the
+single-node `State::commit` path and the floor is a single-node rule. An
+over-broad floor would refuse a recovery that was always safe. And **the
+silent-empty load is confirmed on v0.1.0-rc.72 itself** rather than reasoned
+about: it has no JSON path at all, its `load_or_new` starts from
+`Default::default()`, and a JSON file's keys are quoted and indented, so not
+even `version` collides with `Some("version")`.
+
+**The floor is not live until a release carries this writer.** rc.73 was the
+newest tag when the writer landed, so nothing could cross it that day; it binds
+from the first release cut afterwards, which is **v0.1.0-rc.74**.
 
 **OPS-0259's staging window is fine for this**, which is worth saying because
 it was the obvious worry: a seat that dies mid-stage comes back on the new
