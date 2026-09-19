@@ -35,7 +35,10 @@ trap cleanup EXIT
 echo "== the cluster before expansion: ONE pair holding everything"
 d0="$FLINT_DRILL_ROOT/flint-xf-$P0"; rm -rf "$d0"
 $B --port $P0 --engine rocks --data-dir "$d0" 2>"${FLEET_SCOPE}server.log" &
-fleet_wait_listen $P0
+# PONG STOPPED MEANING READY at #176, so the check below cannot stand in for
+# one: it passes from inside the load, and the 12,000-key seed that follows
+# would meet -LOADING. `fleet_wait_ping` is the predicate that waits for both.
+fleet_wait_ping $P0
 [ "$(valkey-cli -p $P0 PING)" = "PONG" ] || { echo "FAIL: :$P0 down"; exit 1; }
 
 # Six hash-tag slots so the planner has something to divide. One tag cannot

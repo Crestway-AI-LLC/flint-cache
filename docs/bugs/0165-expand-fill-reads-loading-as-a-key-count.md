@@ -40,22 +40,43 @@ field, a fixed sleep". This is the fifth: a bind, followed by a data command.
 `fleet_wait_ping $P1`, the ready predicate, in place of `fleet_wait_listen`.
 One line, in the drill, because the library is already correct.
 
-## The sweep, recorded rather than performed
+## The sweep: the census, and the three that were the same defect
 
-Twenty-four other `fleet_wait_listen` sites across the drills are followed
-within a few lines by a data command or a fixed sleep. **None of them has been
-measured failing**, and they are not being rewritten here: a blanket conversion
-would also hit `loading_visible`, which has to catch a replica *while* it
-reports `loading:1` and whose whole subject the ready-wait would delete.
+**Corrected 2026-09-18. The first version of this section said "twenty-four
+other sites" and that was an undercount presented as a census** — it came from
+a grep that looked six lines ahead and skipped anything with a ready-wait in
+view. Counted properly, `fleet_wait_listen` has **163 call sites**, classified
+by the first non-comment line after them:
 
-They are listed here so the next occurrence is recognised as a family rather
-than diagnosed from scratch:
+| what follows the bind | sites |
+|---|---|
+| a fixed `sleep` | 86 |
+| something else (a second spawn, a log wait, a function definition) | 40 |
+| a ready-wait already (`fleet_wait_ping`, `fleet_wait_log`) | 28 |
+| a data command straight away | 9 |
 
-`backup`, `controller`, `failover` (x4), `internal_mtls` (x3), `lease` (x2),
-`loaded_promote` (x2), `min_replicas`, `promote_notice`, `proxy_backpressure`
-(x2), `read_under_stall`, `rw_isolation`, `slot_moved`, `tenant`,
-`txn_failure`, `widowed_grace` (x2).
+**Three of the nine were this bug again** and are fixed here: `backup_s3` and
+`backup_schedule` each pipe a corpus (300 and 100 `SET`s) into a freshly
+spawned rocks node, with only `tail -1` looking at the reply — a `-LOADING`
+refusal there is a short corpus and a confusing failure two assertions later.
+`expand_fill`'s FIRST node had the same gap as the joining pair this bug was
+filed for; its `PING == PONG` check cannot stand in for readiness, because
+since #176 PONG is exactly what a loading node answers.
 
-The ones that pair a bind with a fixed sleep are the interesting half: they
-pass because the sleep happens to cover the load window on an unloaded box,
-which is a property of the box rather than of the drill.
+**The other six are not defects.** Four are `PING` loops against a proxy or
+`flint-vec`, which have no loading state — `fleet_ready`'s own comment says a
+server that does not implement `FLINTINFO` is ready as soon as it answers.
+`coproc_exempt` and `family_route_cp` define a shell variable on the next line
+and wait properly before using it.
+
+**`loaded_promote` is deliberately left alone**, for the reason
+`loading_visible` is: a drill whose subject is promotion *while loading* needs
+the window a ready-wait would close. Converting it would be the same mistake as
+a check that cannot fail, wearing the opposite hat.
+
+**The 86 fixed sleeps stay, and stay recorded.** None has been measured
+failing. Each is a bind followed by a number somebody chose, which is a
+property of the box rather than of the drill — the honest description is that
+they are unproven, not that they are wrong, and rewriting 86 drills on a
+hypothesis is how a green suite becomes an unfamiliar one.
+

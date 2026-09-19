@@ -57,7 +57,11 @@ rm -rf "$D"; mkdir -p "$D"
 echo "== a single-pair fleet with a known corpus"
 $B --port 6946 --engine rocks --data-dir "$D/m" 2>"$D/m.log" &
 disown
-fleet_wait_listen 6946
+# READY, not merely bound (BUG-0165): a node answers from inside its load
+# since #176, and these SETs would come back -LOADING with only `tail -1`
+# looking at them -- a short corpus, and the backup assertions downstream
+# reading as the failure.
+fleet_wait_ping 6946
 for i in $(seq 1 300); do printf 'SET s3k:%04d val-%04d\r\n' "$i" "$i"; done \
   | valkey-cli -p 6946 --pipe 2>&1 | tail -1
 printf 'cp-state-stand-in\n' >"$D/cp-state"

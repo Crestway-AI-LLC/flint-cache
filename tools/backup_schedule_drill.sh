@@ -37,7 +37,8 @@ rm -rf "$D"; mkdir -p "$D"
 echo "== a single-pair fleet with a corpus"
 $B --port 6944 --engine rocks --data-dir "$D/m" 2>"$D/m.log" &
 disown
-fleet_wait_listen 6944
+# READY, not merely bound (BUG-0165). Same shape as backup_s3.
+fleet_wait_ping 6944
 for i in $(seq 1 100); do printf 'SET sk:%03d v%03d\r\n' "$i" "$i"; done \
   | valkey-cli -p 6944 --pipe 2>&1 | tail -1
 printf 'cp\n' >"$D/cp-state"
