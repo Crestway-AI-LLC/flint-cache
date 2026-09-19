@@ -176,6 +176,97 @@ This does not confirm or refute the hypothesis — it makes the next attempt
 scoreable. The verdict rules stand as written above: CONFIRMED, FALSIFIED, or
 INCONCLUSIVE, and only the middle one kills it.
 
+## 2026-09-19 — the fill rig can now answer, and two local runs bound where
+
+### The instrument
+
+`flint-bench`'s `phase_fill` printed **one number** — total keys over total
+seconds. That is the shape that made the 3 GB run unscoreable: degradation
+WITHIN a pass is invisible by construction, and it read no engine properties
+at all, so `write_stopped: 0` could not be told from an instrument that was
+never exercised.
+
+It now samples every 2 seconds and prints a per-interval table: interval
+throughput, `rocksdb.num-files-at-level0`,
+`rocksdb.estimate-pending-compaction-bytes`, `rocksdb.is-write-stopped` and
+`rocksdb.actual-delayed-write-rate` — the same property strings
+`flint-storage/src/rocks.rs` reads for FLINTINFO, so a run here and a run
+against a server answer with the same numbers. A property the engine will not
+answer prints `-`, never `0`.
+
+Time-based sampling, not every N keys, because under a stall the key rate is
+exactly what collapses — key-based sampling would sample the interesting
+region least often.
+
+**Phases cannot be joined.** `report_fill` is handed one phase's samples and
+has no way to see another. That is the structural form of the lesson from the
+verdict this bug nearly published, where a script appended a refill's rates to
+the fill's and compared across the join.
+
+### The criterion still silently falsified, and now does not
+
+The three-way rule above was written because the two-way one "silently
+acquits". Implementing it exposed that it still silently **kills**: a 3 GB
+fill dropped 55% from warm-up alone, never took L0 above 3 of 20, and scored
+**FALSIFIED** — on a run that never entered the regime. BUG-0022 predicted
+precisely this shape ("its three-way criterion collapses to 'hypothesis dead'
+on every run"), and the rule as written has no clause requiring the run to
+have entered the regime for the FALSIFIED arm either.
+
+So the arm now requires it: **FALSIFIED needs L0 at least half way to the
+slowdown trigger, AND a collapse, AND no stall.** A collapse with L0 flat at
+the bottom is a different workload from the one the hypothesis is about, and
+is reported as INCONCLUSIVE with that reason stated. The same 3 GB fill now
+reads:
+
+    INCONCLUSIVE — throughput collapsed, but L0 never rose past 3 of 20, so
+    compaction was never under pressure and this collapse is a different
+    workload from the one the hypothesis is about
+
+**And every verdict prints the threshold it turned on**, because two of the
+three outcomes hinge on one arbitrary number and a run can land next to it —
+the 25 GB run below measured 59% of the opening quarter, which is INCONCLUSIVE
+at a 50% line and FALSIFIED at a 65% one.
+
+### Two local runs, and what they bound
+
+Both on this laptop's external SSD, rocks engine, single-threaded fill:
+
+| run | keys x value | on disk | wall | first->last quarter | max L0 | stall | verdict |
+|---|---|---|---|---|---|---|---|
+| A | 6 M x 4 KB | 23 GB | 87 s | 55 390 -> 82 745 /s (**+49%**) | **3** of 20 | none | INCONCLUSIVE |
+| B | 25 M x 1 KB | 24 GB | 116 s | 274 607 -> 162 349 /s (**-41%**) | **3** of 20 | none | INCONCLUSIVE |
+
+Run B reproduces the shape of the 3 GB measurement (-37% there, -41% here)
+and confirms its reading: the cost is compaction **work**, not compaction
+**stalling**. Run A, at a quarter of the key rate, does not degrade at all —
+it speeds up as the write path warms.
+
+**The bound worth having: L0 never left 3.** Four times the flush rate did not
+move it, and the slowdown trigger is 20. On this hardware, with the same
+default `max_background_jobs = 2` the bug is about, compaction keeps up
+completely at 24 GB. "Did not stall" here means "never came close", and that is
+now visible rather than inferred.
+
+### What this does NOT do
+
+**It is not the decision run, and this hardware cannot be it.**
+`flint-bench`'s own header says macOS numbers are not representative —
+different fsync semantics, desktop SSD — and the decision belongs on an EC2
+i4i/r7gd with local NVMe. What changed is that the decision run is now one
+command and scoreable.
+
+**The fill is single-threaded.** The original observation was a 32-minute
+pipelined ingest; one writer cannot generate the concurrency a real bulk load
+does, and that is a second reason this rig may not reach the regime. Raising it
+is a candidate for whoever takes the decision run, not something these numbers
+settle.
+
+**Nothing has been tuned.** `max_background_jobs`, the write buffers and the
+rate limiter are still at RocksDB defaults, exactly as the "Then" section
+requires — every value to be justified against a measured stall, and no stall
+has been measured yet.
+
 ## Then
 
 Raise `max_background_jobs` toward the core count, size the write buffers for
