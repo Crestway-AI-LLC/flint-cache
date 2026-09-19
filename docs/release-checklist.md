@@ -7,7 +7,17 @@ stage). Running it yourself before tagging is still the rule — a tag is
 cut from a working tree, not from a green pull request — but the drills
 and chaos are no longer a thing anyone has to remember.
 
-Three CI-specific notes:
+Four CI-specific notes:
+
+- **There are THREE workflows and the gate box runs two of them.**
+  `gate.yml`, `ci.yml` and `msrv.yml` — the last builds the workspace at the
+  `rust-version` `Cargo.toml` declares. `tools/gates.sh`'s default run is
+  *every stage but msrv*, deliberately, because CI runs that one per push — so
+  a green gate-box run is silent about the MSRV by construction. **Read all
+  three legs for the commit you are tagging**: `gh run list --commit <sha>`.
+  This note is BUG-0166: `msrv` failed on every push for two days, across five
+  pushes by two sessions, sitting beside `ci success` and `gate success`, and
+  what found it was somebody reading CI for an unrelated reason.
 
 - **`FLINT_GATE_STRICT=1` makes a skipped drill a failed one.** Locally a
   skip is right (no `mkfs.ext4` on macOS). In CI it is not: a drill that
@@ -58,6 +68,7 @@ here is the reason at the top of this file.
 
     cargo fmt --all --check
     cargo clippy --workspace --all-targets -- -D warnings
+    RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --keep-going
     cargo test --workspace
     cargo clippy --workspace --all-targets --features flint-server/rocks,flint-backup/rocks -- -D warnings
     cargo test --workspace --features flint-server/rocks,flint-backup/rocks
