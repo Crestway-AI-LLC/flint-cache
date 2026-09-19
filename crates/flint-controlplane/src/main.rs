@@ -1611,6 +1611,27 @@ fn main() -> std::io::Result<()> {
         println!("{}", build_version());
         return Ok(());
     }
+    // WHAT THIS BINARY CAN READ, ASKED DIRECTLY (BUG-0167).
+    //
+    // A roller about to put this binary in front of an existing state file
+    // needs to know whether it can read it. Before this flag the only way to
+    // ask was to compare the build version against a floor -- which works for
+    // a release, whose tag is baked in, and not for anything else: a locally
+    // built control plane reports the crate version `0.0.1`, which cannot be
+    // ordered against `v0.1.0-rc.73` at all, so every developer build and
+    // every drill read as "cannot tell" and was refused.
+    //
+    // Answering for itself removes the guess for every binary that has this
+    // flag. It cannot remove it for the ones that do not -- a compatibility
+    // floor about OLDER binaries has to be asserted from outside them, since
+    // rc.72 will never answer anything -- but it does mean the next format
+    // change needs no new constant anywhere.
+    if std::env::args().any(|a| a == "--state-formats") {
+        // Space-separated, one line, oldest first. `line` is the hand-written
+        // format every release before rc.73 wrote; `json` is ADR-0032 step 2.
+        println!("line json");
+        return Ok(());
+    }
     let port: u16 = arg("--port").and_then(|p| p.parse().ok()).unwrap_or(7500);
     let path = arg("--state").unwrap_or_else(|| "./flint-cp-state".into());
 

@@ -1,6 +1,6 @@
-# BUG-0167: the control-plane state floor is enforced on the roll path nobody is told to use, and not on the one the release notes give them (OPEN)
+# BUG-0167: the control-plane state floor is enforced on the roll path nobody is told to use, and not on the one the release notes give them (FIXED 2026-09-19)
 
-Status: **OPEN**, found 2026-09-18 while writing OPS-0265 · Severity: **low
+Status: **FIXED 2026-09-19**, found 2026-09-18 while writing OPS-0265 · Severity: **low
 until a fleet rolls back two steps, high the once it does** — the outcome is a
 control plane that comes up empty and overwrites the real registry, not an
 error.
@@ -87,7 +87,82 @@ runbook"*. Two reasons that is the wrong instrument here:
    declaring it would force `--allow-format-break` on ordinary rolls and train
    operators to pass it, which is worse than not having it.
 
-## Candidate fixes, none chosen
+## Fixed 2026-09-19
+
+`flintctl upgrade` now refuses to put a control plane in front of a state file
+it may not be able to read, before a seat is touched and before the roll record
+exists — a refusal has to leave the fleet and the journal exactly as they were.
+
+**The cost sits on the dangerous path only.** A fleet whose state file is still
+the line format reads one byte and returns. The check engages only once a
+writer-carrying build has committed, and only for a single-node control plane,
+because `raft.rs` never references `state::State`.
+
+### Which candidate, and a correction to this file's own reasoning
+
+The filing called (2) — make the state file self-describing so the roller needs
+no version constant — the one that stops this recurring. **That was wrong about
+this hazard, and the correction is the useful part.** The thing being guarded
+against is an OLD binary. Nothing added to the state file changes what rc.72
+does with it; that binary will never look. A self-describing file only moves
+where the REFUSER learns the requirement, and every file already migrated by
+rc.74 lacks the field anyway.
+
+Generally: **a compatibility floor about older binaries cannot be derived from
+those binaries. It has to be asserted from outside them.**
+
+### What can be derived, and now is
+
+The version comparison was the whole check for about an hour, and running the
+drills killed it. A control plane built from source reports the crate version
+`0.0.1`, which cannot be ordered against `v0.1.0-rc.73` at all — so it read as
+"cannot tell", and the guard refused. **Every developer build and every drill
+would have been blocked**; `upgrade_drill.sh` failed on exactly that, which is
+the whole reason the drills get run before the push.
+
+So the binary answers for itself. `flint-controlplane --state-formats` prints
+`line json`, and the guard asks that FIRST:
+
+- it answers and lists `json` → proceed, whatever its version says;
+- it answers and does not → refuse, on its own word, whatever its version says;
+- it does not answer → fall back to the version against the floor.
+
+That ordering is what makes the constant shrink rather than spread. The
+fallback governs only binaries that predate the flag — which are exactly the
+ones whose release tags parse — and **the next format change needs no new
+constant anywhere**, which is what candidate (2) was reaching for and could not
+get by itself.
+
+### The refusal, and the way out
+
+`FLINT_ROLL_ALLOW_CP_FORMAT=1` overrides it and prints what is being accepted,
+the same name and meaning as the `roll-fleet.sh` guard, so an operator learns
+one thing rather than two. The refusal names the file, what the staged binary
+said about itself, the floor, and the fact that the older binary does not
+reject the file but empties it.
+
+### Tested
+
+Thirteen unit tests over the decision matrix and its two inputs, and the
+decision is split out from the action precisely so the matrix can be exercised
+— the action ends in `process::exit`, and a decision nobody can run is how a
+guard ends up refusing the wrong half. Seven mutations, each killed by the test
+written for it: the comparison made lexical, an unorderable build treated as
+safe, an older build allowed through, a missing build version treated as safe,
+a missing state file read as not-JSON, the floor moved, and the guard made
+over-broad so a line-format file is refused too.
+
+Six drills that drive `upgrade` were run before the push — `upgrade`,
+`cpha_roll`, `edge_roll`, `roll_shed`, `promote_notice`, `build_read_failure`,
+`admin_gated_proxy` — which is the check that found the over-refusal above.
+
+## What is still open
+
+**The three copies of the floor.** The runbook, `roll-fleet.sh` and
+`CP_STATE_FLOOR` all name rc.73. They cannot be collapsed for the reason above,
+so the ops gate asserts they AGREE instead.
+
+## Candidate fixes as filed, kept for the reasoning
 
 1. **Port the OPS-0265 check into `upgrade`.** flintctl already runs where the
    file is, so it needs no ssh: read the CP's `--state` file, and refuse to

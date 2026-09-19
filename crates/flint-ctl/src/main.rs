@@ -7575,7 +7575,204 @@ fn roll_abort(roll: &Roll, code: i32) -> ! {
     std::process::exit(code)
 }
 
+/// The oldest release whose control plane can read a JSON state file.
+///
+/// ADR-0032 splits the format change across two releases so the READER ships a
+/// release ahead of the WRITER. v0.1.0-rc.73 carries the tolerant reader; the
+/// writer shipped in v0.1.0-rc.74. Every binary older than the floor has only
+/// the line parser, and that parser does not FAIL on JSON -- its outer `match`
+/// ends in a catch-all, a JSON file matches no arm, and the load succeeds with
+/// an EMPTY registry which the next commit writes over the real one.
+///
+/// WHY THIS IS A CONSTANT AND NOT DERIVED, which is worth stating because the
+/// obvious objection is that the same fact now lives in three places (the
+/// playground runbook, `roll-fleet.sh`, and here). The check is a claim about
+/// what an OLD binary can do, and an old binary cannot be asked: rc.72 has no
+/// flag that reports its format support, and nothing we add to the state file
+/// changes what it does with one. A backward compatibility floor has to be
+/// asserted from outside the binaries it describes. What CAN be done about the
+/// three copies is make them agree, and the ops gate asserts exactly that.
+const CP_STATE_FLOOR: &str = "v0.1.0-rc.73";
+
+/// Order two `vX.Y.Z[-rc.N]` tags. `None` when either cannot be parsed, which
+/// callers must treat as "cannot tell" rather than as either answer.
+///
+/// NEVER a string comparison: "v0.1.0-rc.9" sorts ABOVE "v0.1.0-rc.73"
+/// lexically, and single-digit tags are exactly what an emergency rollback
+/// reaches for. A release with no `-rc.` suffix outranks every rc of the same
+/// version, which is what an rc SERIES means.
+fn version_at_or_above(v: &str, floor: &str) -> Option<bool> {
+    fn parse(s: &str) -> Option<(u64, u64, u64, u64)> {
+        let s = s.strip_prefix('v')?;
+        let (core, rc) = match s.split_once("-rc.") {
+            Some((c, r)) => (c, r.parse::<u64>().ok()?),
+            // No rc suffix is the final release, which is above every rc of
+            // the same version.
+            None => (s, u64::MAX),
+        };
+        let mut it = core.split('.');
+        let a = it.next()?.parse::<u64>().ok()?;
+        let b = it.next()?.parse::<u64>().ok()?;
+        let c = it.next()?.parse::<u64>().ok()?;
+        if it.next().is_some() {
+            return None;
+        }
+        Some((a, b, c, rc))
+    }
+    Some(parse(v)? >= parse(floor)?)
+}
+
+/// Does this path hold a serde-JSON registry rather than the old line format?
+///
+/// One byte is enough and is what the ops-side guard reads: `encode()` writes
+/// `serde_json::to_string_pretty`, which always opens with `{`. `None` means
+/// there is no file, which is not the same as "not JSON" -- a control plane
+/// that has never committed has nothing to lose, and the caller says so.
+fn cp_state_is_json(path: &str) -> Option<bool> {
+    let bytes = std::fs::read(path).ok()?;
+    Some(bytes.iter().find(|b| !b.is_ascii_whitespace()) == Some(&b'{'))
+}
+
+/// What to do about the control plane's state file, given the two facts the
+/// caller can gather. Separated from the doing so the MATRIX is testable: the
+/// action ends in `process::exit`, and a decision nobody can exercise is how a
+/// guard ends up refusing the wrong half.
+#[derive(Debug, PartialEq, Eq)]
+enum CpStateDecision {
+    /// Nothing to protect: not single-node, no state file, or still the line
+    /// format. The common case, and it must stay free.
+    Proceed,
+    /// The file is JSON and the staged binary cannot be shown to read it.
+    Refuse(String),
+}
+
+/// `is_json` is `None` when there is no file at all -- which is NOT the same
+/// as "not JSON": a control plane that has never committed has nothing to
+/// lose. `staged` is what the staged binary says its build is, `None` when it
+/// would not say.
+fn cp_state_decide(
+    is_json: Option<bool>,
+    staged: Option<&str>,
+    formats: Option<&str>,
+) -> CpStateDecision {
+    if is_json != Some(true) {
+        return CpStateDecision::Proceed;
+    }
+    // ASK BEFORE GUESSING. A binary that answers `--state-formats` has told us
+    // what it can read, which settles the question for every build that has
+    // the flag -- including locally built ones, whose version is the crate's
+    // `0.0.1` and orders against nothing. The version comparison below is the
+    // fallback for binaries that predate the flag, and those are exactly the
+    // ones whose release tags DO parse.
+    if let Some(f) = formats {
+        if f.split_whitespace().any(|w| w == "json") {
+            return CpStateDecision::Proceed;
+        }
+        return CpStateDecision::Refuse(
+            "a build that reports it cannot read the json state format".to_string(),
+        );
+    }
+    match staged {
+        Some(v) => match version_at_or_above(v, CP_STATE_FLOOR) {
+            Some(true) => CpStateDecision::Proceed,
+            Some(false) => CpStateDecision::Refuse(format!("{v}, which is below {CP_STATE_FLOOR}")),
+            // Cannot be ordered against the floor. A guard that cannot tell
+            // must not claim either answer -- below the floor the file is
+            // destroyed silently, so the unproven case refuses.
+            None => CpStateDecision::Refuse(format!(
+                "{v}, which this cannot order against {CP_STATE_FLOOR}"
+            )),
+        },
+        None => CpStateDecision::Refuse(
+            "unreadable (the staged control plane did not report a build version)".to_string(),
+        ),
+    }
+}
+
+/// REFUSE TO PUT A PRE-FLOOR CONTROL PLANE IN FRONT OF A JSON STATE FILE
+/// (BUG-0167).
+///
+/// `roll-fleet.sh` has guarded this since OPS-0265, and that covers the
+/// playground because that is how it is rolled. It does NOT cover this path --
+/// which is the one every release's notes hand operators, verbatim: unpack
+/// into the inventory's bins dir, then
+/// `flintctl -f <inventory> upgrade --manifest manifest.json --version-tag <tag>`
+/// -- nor `ctl.sh upgrade` on the box, which comes through here too.
+///
+/// (The command is backticked because rustdoc reads a bare `<inventory>` as an
+/// HTML tag and `-D warnings` makes that an error. It cost this change a gate.)
+///
+/// THE COST SITS ON THE DANGEROUS PATH ONLY. A fleet whose state file is still
+/// the line format reads one byte and returns; there is nothing to protect
+/// yet. The check engages only once a writer-carrying build has committed.
+///
+/// SINGLE-NODE ONLY, AND THAT NEGATIVE IS LOAD-BEARING. `raft.rs` never
+/// references `state::State` or `load_or_new` and its store has persisted
+/// serde JSON since it was written, so an HA control plane was never at risk.
+/// Refusing one would block a recovery that was always safe.
+///
+/// IT ASKS THE STAGED BINARY, not `--version-tag`. The tag is a label the
+/// operator typed; the binary is what will run. That is the same reasoning the
+/// build-stamp assertion below already applies -- while flintctl was the only
+/// source of the stamp, asserting the value it had just injected proved
+/// nothing about which binary was staged.
+fn assert_cp_can_read_its_state(inv: &Inventory) {
+    if inv.cp.len() != 1 {
+        return;
+    }
+    let path = cp_state_single(&inv.statedir);
+    let is_json = cp_state_is_json(&path);
+    // Only pay for the execs once the file is one we would refuse over.
+    let bin = format!("{}/flint-controlplane", inv.bins);
+    let ask = |flag: &str| -> Option<String> {
+        std::process::Command::new(&bin)
+            .arg(flag)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
+    let (formats, staged) = if is_json == Some(true) {
+        // A binary that predates the flag exits non-zero or prints nothing,
+        // and `ask` turns both into None -- which is the fallback, not an
+        // answer. An older binary that ignores unknown flags and starts
+        // serving cannot happen here: it would not exit, and `output()`
+        // waits, which is why the flag is handled before any listener binds.
+        (ask("--state-formats"), ask("--build-version"))
+    } else {
+        (None, None)
+    };
+
+    let what = match cp_state_decide(is_json, staged.as_deref(), formats.as_deref()) {
+        CpStateDecision::Proceed => return,
+        CpStateDecision::Refuse(what) => what,
+    };
+
+    if std::env::var("FLINT_ROLL_ALLOW_CP_FORMAT").as_deref() == Ok("1") {
+        eprintln!("== WARNING: rolling anyway (FLINT_ROLL_ALLOW_CP_FORMAT=1)");
+        eprintln!("   {path} is JSON and the staged control plane is {what}.");
+        eprintln!("   If it cannot read that file it will load an EMPTY registry and");
+        eprintln!("   overwrite it on the next commit. Convert the file back to the");
+        eprintln!("   line format BEFORE that binary starts.");
+        return;
+    }
+    eprintln!("== UPGRADE REFUSED: the staged control plane may not be able to read");
+    eprintln!("   {path}, which is already JSON.");
+    eprintln!("   staged binary: {what}");
+    eprintln!("   A control plane older than {CP_STATE_FLOOR} does not reject that file --");
+    eprintln!("   it loads an EMPTY registry, comes up looking healthy, and the next");
+    eprintln!("   commit writes that over the real one (ADR-0032, BUG-0167).");
+    eprintln!("   Roll a build at or after {CP_STATE_FLOOR}, or convert the state file back");
+    eprintln!("   to the line format by hand first -- there is no tool for that -- then:");
+    eprintln!("   FLINT_ROLL_ALLOW_CP_FORMAT=1 flintctl ... upgrade ...");
+    std::process::exit(2);
+}
+
 fn upgrade(inv: &Inventory, version_tag: Option<String>, soak_ms: u64, nodes_only: bool) {
+    // FIRST, before a seat is touched and before the roll record exists: a
+    // refusal here must leave the fleet and the journal exactly as they were.
+    assert_cp_can_read_its_state(inv);
     let tls = tls_client(inv);
     // Kept for binaries built before the tag was compiled in: release builds
     // now bake FLINT_RELEASE_TAG, which OUTRANKS this variable, so on a
@@ -10859,5 +11056,261 @@ mod session_escape_tests {
         assert_eq!(v[5..], a[4..]);
         // A seat argument after `--` must never be taken for the marker.
         assert_eq!(v.iter().filter(|x| *x == "--escaped").count(), 1);
+    }
+}
+
+/// BUG-0167: the ordering and the format probe behind the upgrade refusal.
+///
+/// The refusal itself ends in `process::exit`, so what is tested here is the
+/// two questions it asks. They are the parts that can be wrong quietly: an
+/// ordering that inverts, and a probe that calls a missing file "not JSON".
+#[cfg(test)]
+mod cp_state_floor_tests {
+    use super::{
+        CP_STATE_FLOOR, CpStateDecision, cp_state_decide, cp_state_is_json, version_at_or_above,
+    };
+
+    fn refused(d: &CpStateDecision) -> bool {
+        matches!(d, CpStateDecision::Refuse(_))
+    }
+
+    #[test]
+    fn a_binary_that_states_it_reads_json_settles_it_without_a_version() {
+        // THE CASE THAT BROKE EVERY LOCAL BUILD. A control plane built from
+        // source reports the crate version `0.0.1`, which orders against
+        // nothing -- so before the flag existed this read as "cannot tell"
+        // and refused, which would have blocked every drill and every
+        // developer. Asking the binary settles it, whatever its version says.
+        assert_eq!(
+            cp_state_decide(Some(true), Some("0.0.1"), Some("line json")),
+            CpStateDecision::Proceed
+        );
+        assert_eq!(
+            cp_state_decide(Some(true), None, Some("line json")),
+            CpStateDecision::Proceed
+        );
+        // And the answer OUTRANKS a version that would have been refused:
+        // what the binary says it can do is better evidence than its tag.
+        assert_eq!(
+            cp_state_decide(Some(true), Some("v0.1.0-rc.72"), Some("line json")),
+            CpStateDecision::Proceed
+        );
+    }
+
+    #[test]
+    fn a_binary_that_states_it_cannot_read_json_is_refused_on_its_own_word() {
+        let d = cp_state_decide(Some(true), Some("v0.9.9-rc.1"), Some("line"));
+        assert!(refused(&d), "{d:?}");
+        // Even though its version is far above the floor: the flag is the
+        // better evidence in both directions, or it is not evidence at all.
+        assert!(matches!(
+            cp_state_decide(Some(true), Some("v9.0.0"), Some("line")),
+            CpStateDecision::Refuse(_)
+        ));
+    }
+
+    #[test]
+    fn no_answer_falls_back_to_the_version_rather_than_to_a_guess() {
+        // A binary predating the flag says nothing, and those are exactly the
+        // ones whose release tags parse -- so the fallback is the version.
+        assert_eq!(
+            cp_state_decide(Some(true), Some("v0.1.0-rc.74"), None),
+            CpStateDecision::Proceed
+        );
+        assert!(refused(&cp_state_decide(
+            Some(true),
+            Some("v0.1.0-rc.72"),
+            None
+        )));
+    }
+
+    #[test]
+    fn a_line_format_file_or_none_at_all_costs_nothing() {
+        // The common case, and the one that must stay free: a fleet that has
+        // not migrated has nothing to protect, whatever is staged.
+        assert_eq!(
+            cp_state_decide(Some(false), None, None),
+            CpStateDecision::Proceed
+        );
+        assert_eq!(
+            cp_state_decide(Some(false), Some("v0.1.0-rc.1"), None),
+            CpStateDecision::Proceed
+        );
+        assert_eq!(cp_state_decide(None, None, None), CpStateDecision::Proceed);
+        assert_eq!(
+            cp_state_decide(None, Some("v0.1.0-rc.1"), None),
+            CpStateDecision::Proceed
+        );
+    }
+
+    #[test]
+    fn json_plus_a_build_at_or_above_the_floor_rolls() {
+        // THE ARM THAT MATTERS MOST. A guard that blocks the fixed release is
+        // worse than the bug it closes.
+        assert_eq!(
+            cp_state_decide(Some(true), Some(CP_STATE_FLOOR), None),
+            CpStateDecision::Proceed
+        );
+        assert_eq!(
+            cp_state_decide(Some(true), Some("v0.1.0-rc.74"), None),
+            CpStateDecision::Proceed
+        );
+        assert_eq!(
+            cp_state_decide(Some(true), Some("v0.2.0"), None),
+            CpStateDecision::Proceed
+        );
+    }
+
+    #[test]
+    fn json_plus_an_older_build_is_refused_and_says_which() {
+        let d = cp_state_decide(Some(true), Some("v0.1.0-rc.72"), None);
+        assert!(refused(&d), "{d:?}");
+        match d {
+            CpStateDecision::Refuse(w) => {
+                assert!(w.contains("v0.1.0-rc.72"), "names the build: {w}");
+                assert!(w.contains(CP_STATE_FLOOR), "names the floor: {w}");
+            }
+            _ => unreachable!(),
+        }
+        // And the single-digit trap, through the decision rather than the
+        // comparison, so a special case in one cannot hide it in the other.
+        assert!(refused(&cp_state_decide(
+            Some(true),
+            Some("v0.1.0-rc.9"),
+            None
+        )));
+    }
+
+    #[test]
+    fn json_plus_a_build_it_cannot_order_refuses_rather_than_guessing() {
+        // Below the floor the file is destroyed silently, so "cannot tell"
+        // has to refuse. A skip needs positive evidence of what it skips.
+        assert!(refused(&cp_state_decide(Some(true), None, None)));
+        assert!(refused(&cp_state_decide(Some(true), Some("unknown"), None)));
+        assert!(refused(&cp_state_decide(Some(true), Some(""), None)));
+    }
+
+    #[test]
+    fn a_single_digit_rc_is_below_a_two_digit_one() {
+        // THE TRAP THIS EXISTS FOR. As strings "v0.1.0-rc.9" sorts ABOVE
+        // "v0.1.0-rc.73", and single-digit tags are what an emergency
+        // rollback reaches for -- so a lexical compare would wave through
+        // exactly the roll this refuses.
+        assert_eq!(
+            version_at_or_above("v0.1.0-rc.9", CP_STATE_FLOOR),
+            Some(false)
+        );
+        assert_eq!(
+            version_at_or_above("v0.1.0-rc.72", CP_STATE_FLOOR),
+            Some(false)
+        );
+        assert!(
+            !"v0.1.0-rc.9".lt(CP_STATE_FLOOR),
+            "the string compare really does invert; that is the point"
+        );
+    }
+
+    #[test]
+    fn the_floor_itself_and_everything_above_it_passes() {
+        // A guard that blocks the fixed release is worse than the bug: it
+        // gets met by deleting the guard, at 2am, by someone who needs it.
+        assert_eq!(
+            version_at_or_above(CP_STATE_FLOOR, CP_STATE_FLOOR),
+            Some(true)
+        );
+        assert_eq!(
+            version_at_or_above("v0.1.0-rc.74", CP_STATE_FLOOR),
+            Some(true)
+        );
+        assert_eq!(
+            version_at_or_above("v0.1.0-rc.100", CP_STATE_FLOOR),
+            Some(true)
+        );
+        assert_eq!(
+            version_at_or_above("v0.2.0-rc.1", CP_STATE_FLOOR),
+            Some(true)
+        );
+        assert_eq!(
+            version_at_or_above("v1.0.0-rc.1", CP_STATE_FLOOR),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn a_final_release_outranks_every_rc_of_its_own_version() {
+        // What an rc SERIES means: v0.1.0 is the release those rcs led to.
+        assert_eq!(version_at_or_above("v0.1.0", "v0.1.0-rc.73"), Some(true));
+        assert_eq!(version_at_or_above("v0.1.0-rc.73", "v0.1.0"), Some(false));
+        assert_eq!(version_at_or_above("v0.1.0", "v0.1.0"), Some(true));
+    }
+
+    #[test]
+    fn unparseable_is_cannot_tell_and_never_an_answer() {
+        // The caller refuses on None. Returning `false` here would be a
+        // refusal for the wrong reason; returning `true` would wave through
+        // a build nobody has ordered. Neither is an answer this can give.
+        assert_eq!(version_at_or_above("", CP_STATE_FLOOR), None);
+        assert_eq!(version_at_or_above("unknown", CP_STATE_FLOOR), None);
+        assert_eq!(
+            version_at_or_above("0.1.0-rc.73", CP_STATE_FLOOR),
+            None,
+            "no leading v"
+        );
+        assert_eq!(
+            version_at_or_above("v0.1-rc.73", CP_STATE_FLOOR),
+            None,
+            "not three parts"
+        );
+        assert_eq!(
+            version_at_or_above("v0.1.0.1-rc.73", CP_STATE_FLOOR),
+            None,
+            "four parts"
+        );
+        assert_eq!(
+            version_at_or_above("v0.1.0-rc.x", CP_STATE_FLOOR),
+            None,
+            "rc is not a number"
+        );
+    }
+
+    #[test]
+    fn the_probe_tells_json_from_the_line_format_and_from_absence() {
+        let d = std::env::temp_dir().join(format!("flint-0167-{}", std::process::id()));
+        std::fs::create_dir_all(&d).expect("temp dir for the probe fixture");
+        let p = d.join("cp-state");
+        let path = p.to_string_lossy().to_string();
+
+        // Absent is NOT "not JSON": a control plane that has never committed
+        // has nothing to lose, and the caller distinguishes them.
+        let _ = std::fs::remove_file(&p);
+        assert_eq!(cp_state_is_json(&path), None);
+
+        std::fs::write(&p, "version 42\nproxy 127.0.0.1:7500\n")
+            .expect("write the line-format fixture");
+        assert_eq!(cp_state_is_json(&path), Some(false));
+
+        std::fs::write(&p, "{\n  \"version\": 42\n}\n").expect("write the json fixture");
+        assert_eq!(cp_state_is_json(&path), Some(true));
+
+        // `to_string_pretty` does not indent the opening brace, but a file
+        // that has been through anything else might.
+        std::fs::write(&p, "\n  {\"version\": 42}\n").expect("write the indented json fixture");
+        assert_eq!(cp_state_is_json(&path), Some(true));
+
+        // Empty is not JSON, and must not panic on the first byte.
+        std::fs::write(&p, "").expect("write the empty fixture");
+        assert_eq!(cp_state_is_json(&path), Some(false));
+
+        std::fs::remove_dir_all(&d).expect("clean up the probe fixture");
+    }
+
+    #[test]
+    fn the_floor_is_the_release_that_carried_the_tolerant_reader() {
+        // Pinned deliberately. This constant is a claim about which releases
+        // can read a JSON state file, and it is asserted from outside the
+        // binaries it describes because an old binary cannot be asked. If it
+        // moves, the runbook and roll-fleet.sh have to move with it -- the
+        // ops gate asserts those agree, and this is the copy it compares to.
+        assert_eq!(CP_STATE_FLOOR, "v0.1.0-rc.73");
     }
 }
