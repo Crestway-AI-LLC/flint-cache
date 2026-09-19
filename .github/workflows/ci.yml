@@ -36,4 +36,19 @@ jobs:
         with:
           key: rocks
       - run: cargo clippy --workspace --all-targets --features flint-server/rocks,flint-backup/rocks --keep-going -- -D warnings
+      # NOTHING RAN cargo doc FOR THIS REPO UNTIL 2026-09-19, and nineteen
+      # errors had accumulated behind that on a green main: one genuinely
+      # broken intra-doc link, and eighteen command signatures written as
+      # prose -- `FLINTSNAPSHOT <root>` -- where rustdoc reads <root> as an
+      # unclosed HTML tag. They were invisible because neither these
+      # workflows nor the gate box documented anything.
+      #
+      # IT RUNS IN THE ROCKS JOB because that surface is a superset: the
+      # cfg(feature = "rocks") code carries doc comments the mem-config job
+      # never compiles, and the broken link that started this was in one.
+      #
+      # If this leg reddens on a doc comment you just wrote, the usual cause
+      # is a <placeholder> in prose. Wrap the signature in backticks -- it
+      # reads the same and rustdoc stops parsing it as markup.
+      - run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --features flint-server/rocks,flint-backup/rocks
       - run: cargo test --workspace --features flint-server/rocks,flint-backup/rocks
