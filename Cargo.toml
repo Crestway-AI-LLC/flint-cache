@@ -69,6 +69,10 @@ edition = "2024"
 # by design. The declaration was raised rather than the lock rewritten: the
 # lock is what stops two flintctl processes spawning one seat twice
 # (BUG-0144 / OPS-0250), and 1.89 shipped in August 2025.
+#
+# RATIFIED BY JEFF 2026-09-18, after the fact and on the question as put: keep
+# 1.89, or revert to 1.88 and rewrite the lock. The floor moved by accident
+# when the lock landed; it stands by decision now.
 rust-version = "1.89"
 license = "Elastic-2.0"
 repository = "https://github.com/Crestway-AI-LLC/flint-cache"

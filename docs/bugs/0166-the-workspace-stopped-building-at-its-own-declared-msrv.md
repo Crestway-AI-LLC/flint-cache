@@ -1,7 +1,8 @@
 # BUG-0166: the workspace stopped building at its own declared MSRV, and only a CI leg nobody reads said so (FIXED 2026-09-17)
 
-Status: **FIXED 2026-09-17**, found the same day while reading CI after an
-unrelated push · Severity: **low for the fleet, medium for the claim** — nothing
+Status: **FIXED 2026-09-17**; the raised floor **ratified by Jeff 2026-09-18**
+on the question as put — keep 1.89, or revert to 1.88 and rewrite the lock.
+Found while reading CI after an unrelated push · Severity: **low for the fleet, medium for the claim** — nothing
 we ship is affected (the bundle is 14 binaries built at 1.98), but README and
 `docs/self-hosting.md` both told a self-hoster that Rust 1.88 was enough, and
 for two days it was not.
