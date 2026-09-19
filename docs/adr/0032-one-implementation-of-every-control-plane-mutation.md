@@ -427,12 +427,21 @@ in that format, and it migrates on the first commit after, not at load.
    relayed a go-ahead for the *type swap*, which is a different step. An
    inherited reading of somebody else's sentence is not an approval for this
    one.
-2. **The playground's rollback copy.** `/opt/flint/bin.rc72` is what the
-   runbook rolls back to, and **rc.72 has no tolerant reader** — it would meet
-   JSON it cannot parse. The staged rollout's premise is that the reader ships
-   first, and it did, in rc.73; the rollback copy is the one place still
-   holding a binary from before it. Refresh it to rc.73 (or later) before the
-   release carrying this writer rolls.
+2. **The rollback FLOOR, which is a tag rule and not a file on the box.**
+   Corrected here: I first wrote that `/opt/flint/bin.rc72` is what the runbook
+   rolls back to. It is not. `roll-fleet.sh` keeps no copy of the outgoing
+   `/opt/flint/bin`, the `bin.rc*` directories are residue from hand-rolls, and
+   the runbook's rollback section exists precisely to stop somebody assuming
+   one is there — rollback is **re-rolling the previous tag**.
+
+   So the condition is about which tag: after this writer ships, never re-roll
+   below the release that first carried the tolerant reader (rc.73). **A
+   pre-rc.73 binary does not refuse the file — it empties it.** That parser's
+   `match` ends in `_ => {}`, so every line of a JSON state file is ignored,
+   the load succeeds with no proxies, no pairs and no tenants, and the next
+   `commit()` writes that back over the real registry. Tracked as **OPS-0264**,
+   which puts the floor in the runbook's rollback section and the release
+   checklist.
 
 **OPS-0259's staging window is fine for this**, which is worth saying because
 it was the obvious worry: a seat that dies mid-stage comes back on the new
