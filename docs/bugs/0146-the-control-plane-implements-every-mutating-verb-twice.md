@@ -105,6 +105,47 @@ anything between parse and `apply`/`propose` that the other arm must do
 identically? That is the remaining work, and it is a reading task with a
 decidable answer, not a design question.
 
+### That audit, first pass (2026-09-19)
+
+Run over all **42 verbs both dispatchers serve**, comparing each arm's
+*argument-transformation profile* — the set of rules it applies to an argument
+before the mutation is built: canonicalise, uppercase, split, trim, drop-empty,
+hash, mint, shuffle, on/off decode, range-bound, prefix-validate, lease-row
+key. Deliberately NOT control flow, because `state.lock()` against
+`leader_view().await` is the transport and is different by design.
+
+**40 of 42 profiles are identical. Both differences are explained and neither
+is a defect:**
+
+- **`CPFENCE` replies differently.** Single-node answers `OK fenced <addr> gen
+  <g>`, reading the generation back out of the lease row; Raft answers `OK
+  fenced <addr>`. Nothing consumes it: the controller's only test of that
+  reply is `matches!(reply, Ok(Value::Simple(_)))`, so the generation is
+  diagnostic. Recorded rather than fixed.
+- **`CPSNAPSHOT` was an instrument artifact.** It is the last arm in
+  `main.rs`, so the extractor ran past it into the trailing function
+  definitions.
+
+### What this pass does NOT establish, which is the important half
+
+It compares the PRESENCE of a transform in each arm. It does not check that
+two arms apply the same transform **to the same argument in the same way** —
+both could call `to_ascii_uppercase` on different variables and read as
+identical. So it rules out the coarse shape (a rule in one arm and absent from
+the other, which is BUG-0150's shape and was BUG-0169's) and says nothing about
+the fine one.
+
+**The first version of the instrument produced a false negative**, which is why
+that limit is stated rather than assumed. It stripped lines beginning `let
+Some(` as parse boilerplate — and `CPSETSLOT`'s pair-index range check is
+written exactly that way, so the audit reported the two arms as differing when
+they do not. A tool built to find a rule present in one arm and missing from
+the other was hiding rules. Checked by reading both arms, not by trusting it.
+
+So: the coarse class is closed on this evidence and the fine class is untested.
+A second pass would have to compare arms by reading, and 42 is a small enough
+number that this is a bounded job rather than an open-ended one.
+
 ## The part worth acting on first
 
 **A unit test against `RegistryState` proves nothing about a single-node
