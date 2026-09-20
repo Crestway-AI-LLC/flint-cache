@@ -172,18 +172,46 @@ run_once() {
   # serves), and those are opposite facts that this line rendered identically
   # -- then the verdict text asserted one of them. Ask source who owns the slot
   # rather than inferring it from an absence (BUG-0132, ops OPS-0037).
-  local OWN
+  local OWN CLASS
   if [ -n "$SM" ] || [ -n "$DM" ]; then
-    PHASE="INTERRUPTED mid-move"
+    CLASS=interrupted; PHASE="INTERRUPTED mid-move"
   else
     OWN=$(valkey-cli -p $SPORT GET "{mover}:key000000" 2>&1)
     case "$OWN" in
-      *"MOVED $SLOT"*) PHASE="completed pre-kill (source already -MOVED; recovery is a no-op)" ;;
-      val-*)           PHASE="NEVER STARTED (source still owns and serves the slot)" ;;
-      *)               PHASE="no records, and source answers [$OWN] -- ownership indeterminate" ;;
+      *"MOVED $SLOT"*) CLASS=completed
+                       PHASE="completed pre-kill (source already -MOVED; recovery is a no-op)" ;;
+      val-*)           CLASS=never-started
+                       PHASE="NEVER STARTED (source still owns and serves the slot)" ;;
+      *)               CLASS=indeterminate
+                       PHASE="no records, and source answers [$OWN] -- ownership indeterminate" ;;
     esac
   fi
   echo "  [killed in phase $phase] after restart: source=[$SM] dest=[$DM] -> $PHASE"
+  SEEN="$SEEN $CLASS"
+
+  # THE CLASSIFICATION IS FOUR-WAY AND THE ASSERTION BELOW WAS ONE-WAY
+  # (BUG-0170). That mismatch is what reddened main on a markdown-only commit:
+  # the kill can land before the move is DURABLE, the records are then empty on
+  # both nodes, the source rightly still owns the slot -- and the code below
+  # waited 30s for a resolution that cannot come and printed "move not resolved
+  # after recovery", which reads as a product defect.
+  #
+  # This is BUG-0132's class one layer up. That fix made the OBSERVATION
+  # three-state, on the stated grounds that "completed" and "never started" are
+  # opposite facts rendered identically; it left the ASSERTION two-state, so
+  # the drill went on to assert one of them regardless.
+  #
+  # Each outcome now gets the post-condition that belongs to it.
+  if [ "$CLASS" = indeterminate ]; then
+    echo "  FAIL: no migration records and the source answers neither a value nor"
+    echo "        -MOVED [$OWN] -- ownership cannot be established, so neither"
+    echo "        post-condition below can be asserted honestly"
+    pkill -9 -f "flint-server --port 658" 2>/dev/null; keep_dirs; return 1
+  fi
+  if [ "$CLASS" = never-started ]; then
+    assert_never_started "$phase"
+    return $?
+  fi
 
   # Recovery controller: reconciles from the manifests, no other input.
   "$CTLBIN" --recover-nodes "$SADDR,$DADDR" --id REC --poll-ms 200 2>>$FLINT_DRILL_ROOT/flint-rec.log &
@@ -252,6 +280,131 @@ run_once() {
   return 0
 }
 
+# THE SAFE OUTCOME, when the kill landed before the move was durable.
+#
+# Nothing was recorded, so there is nothing for the recovery controller to
+# reconcile from and the move simply did not happen: the source still owns the
+# slot and holds every key, the dest holds none of it, and an operator would
+# re-issue the move. No loss and no split -- which is what this drill exists to
+# prove, and it is as true here as it is after a resolved recovery.
+#
+# IT STILL RUNS THE RECOVERY CONTROLLER, deliberately. Skipping it would leave
+# the interesting question unasked; running it asserts the stronger property,
+# that recovery does not FABRICATE a move from an empty manifest.
+#
+# The checks come BEFORE any write to the dest. The resolution loop this
+# replaces polls `SET` against the dest up to 150 times, so by the time it gave
+# up it had itself put key000000 there -- a drill that had gone on to ask "does
+# the dest hold the slot" would have been reading its own writes.
+assert_never_started() {
+  local phase="$1" i sr sw dr dn miss=0 k
+
+  "$CTLBIN" --recover-nodes "$SADDR,$DADDR" --id REC --poll-ms 200 2>>$FLINT_DRILL_ROOT/flint-rec.log &
+  local CTL=$!
+  # Long enough for the controller to complete several poll cycles and prove it
+  # has nothing to act on. Shorter than the 30s the resolution loop burned.
+  sleep 2
+  kill -9 $CTL 2>/dev/null
+
+  # The source still owns: it serves reads AND accepts writes for the slot.
+  sr=$(valkey-cli -p $SPORT GET "{mover}:key000000" 2>&1)
+  [ "$sr" = "val-000000" ] || {
+    echo "  FAIL: recovery moved a slot no manifest recorded (source read='$sr')"
+    pkill -9 -f "flint-server --port 658" 2>/dev/null; keep_dirs; return 1; }
+  sw=$(valkey-cli -p $SPORT SET "{mover}:key000001" val-000001 2>&1)
+  [ "$sw" = "OK" ] || {
+    echo "  FAIL: source owns the slot but refuses writes for it: $sw"
+    pkill -9 -f "flint-server --port 658" 2>/dev/null; keep_dirs; return 1; }
+
+  # WHAT THE DEST HOLDS IS REPORTED, NOT ASSERTED, and that restraint is the
+  # point rather than a shortcut.
+  #
+  # `wait_for_phase pull` waits for the dest to report an `importing` record
+  # AND to hold 0 < rows < KEYS. So at kill time the dest had both, and this
+  # branch is reached only when the record is GONE after the restart. Whether
+  # the ROWS also went is a separate question that nothing here has observed:
+  # asserting "the dest is empty" would be a guess, and a wrong guess turns
+  # one misreporting drill into another.
+  #
+  # It is not a split either way. A split is two nodes each answering as OWNER,
+  # and a dest with no migration record makes no ownership claim -- rows left
+  # behind are ORPHANED, which is a different fault with a different fix. That
+  # question is raised in BUG-0170's write-up rather than decided here.
+  dr=$(valkey-cli -p $DPORT GET "{mover}:key000000" 2>&1)
+  dn=$(valkey-cli -p $DPORT DBSIZE 2>&1)
+  if [ -n "$dr" ]; then
+    echo "     dest still holds copied rows (DBSIZE=$dn, key000000='$dr') with NO"
+    echo "     migration record -- orphaned, not served, and not a split. See BUG-0170."
+  else
+    echo "     dest holds nothing of the slot (DBSIZE=$dn)."
+  fi
+
+  # No loss: every sampled key is still on the owner, which here is the source.
+  for k in 000000 075000 149999; do
+    [ "$(valkey-cli -p $SPORT GET "{mover}:key$k")" = "val-$k" ] || {
+      echo "  MISSING key$k on source"; miss=$((miss+1)); }
+  done
+  [ "$miss" = "0" ] || {
+    echo "  FAIL: $miss keys lost -- the move never started, so the source should"
+    echo "        still hold everything it was seeded with"
+    echo "  WHERE: source DBSIZE=$(valkey-cli -p $SPORT DBSIZE) dest DBSIZE=$(valkey-cli -p $DPORT DBSIZE) (seeded $KEYS to source)"
+    pkill -9 -f "flint-server --port 658" 2>/dev/null; keep_dirs; return 1; }
+
+  local how="killed in phase $phase"
+  [ "$phase" = constructed ] && how="constructed"
+  echo "  [$how] NEVER STARTED and stayed that way: source owns and"
+  echo "     serves every key, dest holds none, recovery invented nothing. No split, no loss."
+  echo "     NOTE: this arm did NOT exercise recovery -- the kill beat durability."
+  pkill -9 -f "flint-server --port 658" 2>/dev/null; rm -rf "$SDIR" "$DDIR"
+  return 0
+}
+
+# CONSTRUCT the never-started outcome, because racing for it is what made this
+# drill flaky in the first place.
+#
+# `assert_never_started` above runs only when a kill beats durability, which is
+# roughly one run in ten -- so shipping it on the strength of the raced path
+# would mean shipping a branch that had never executed, which is the shape of
+# defect this whole bug is about. The drill already makes this argument for the
+# frozen window: "constructing a state beats racing for it whenever the state
+# can be constructed."
+#
+# The state is trivial to build: two nodes, the corpus on the source, and no
+# migration ever issued. That is exactly what the raced arm finds after a kill
+# that beat the records -- empty manifests on both, source owning and serving.
+test_never_started_is_safe() {
+  pkill -9 -f "flint-server --port 658" 2>/dev/null; fleet_kill controller; sleep 0.4
+  SDIR=$(mktemp -d $FLINT_DRILL_ROOT/flint-rec-s.XXXXXX); DDIR=$(mktemp -d $FLINT_DRILL_ROOT/flint-rec-d.XXXXXX)
+  $B --port $SPORT --engine rocks --data-dir "$SDIR" 2>"${FLEET_SCOPE}server7.log" &
+  $B --port $DPORT --engine rocks --data-dir "$DDIR" 2>"${FLEET_SCOPE}server8.log" &
+  fleet_wait_ready $SPORT
+  fleet_wait_ready $DPORT
+
+  # A small corpus: this arm asserts ownership and the absence of loss, neither
+  # of which needs 150k keys, and the sampled keys must exist.
+  local n=2000 k
+  _nvs_seed_gen() {
+    awk -v n="$n" 'BEGIN{for(i=0;i<n;i++){k=sprintf("{mover}:key%06d",i);v=sprintf("val-%06d",i);printf "*3\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n",length(k),k,length(v),v}}'
+  }
+  fleet_load_resp "$SPORT" _nvs_seed_gen "$n" || return 1
+  for k in 000000 075000 149999; do
+    valkey-cli -p $SPORT SET "{mover}:key$k" "val-$k" >/dev/null
+  done
+
+  # The precondition this arm claims, asserted rather than assumed: no
+  # migration records anywhere. If a previous arm leaked one, everything below
+  # would be testing a different state under this name.
+  local SM DM
+  SM=$(valkey-cli -p $SPORT FLINTMIGRATIONS 2>/dev/null)
+  DM=$(valkey-cli -p $DPORT FLINTMIGRATIONS 2>/dev/null)
+  [ -z "$SM" ] && [ -z "$DM" ] || {
+    echo "  FAIL: constructed never-started state is not clean (source=[$SM] dest=[$DM])"
+    pkill -9 -f "flint-server --port 658" 2>/dev/null; keep_dirs; return 1; }
+
+  echo "  [constructed never-started] no migration ever issued; source owns the slot"
+  assert_never_started "constructed"
+}
+
 # Deterministically exercise the OTHER recovery branch — a flip interrupted
 # between "dest owns" and "source disowned" (source Migrating, dest already
 # owns). Timing-based kills rarely land in this sub-100ms window, so we
@@ -293,9 +446,26 @@ trap 'pkill -9 -f "flint-server --port 658" 2>/dev/null; fleet_kill controller' 
 : > $FLINT_DRILL_ROOT/flint-rec.log
 echo "== slot {mover}=$SLOT, $KEYS keys; killing BOTH nodes at each OBSERVED phase"
 FAILS=0
+SEEN=""
 for ph in pull flip; do
   run_once "$ph" || FAILS=$((FAILS+1))
 done
+# A RUN WHERE EVERY KILL BEAT DURABILITY PROVED NOTHING ABOUT RECOVERY
+# (BUG-0170). Each `never-started` arm is a legitimate pass, and a run made
+# ENTIRELY of them is a green verdict over a recovery path that never ran --
+# the same shape as a check that matches no files. The half-done-flip case
+# below is constructed rather than raced, so it always exercises one branch;
+# this asserts the RACED arms reached the recovery code at least once.
+case "$SEEN" in
+  *interrupted*|*completed*) ;;
+  *) echo "FAIL: no raced arm reached recovery this run (classes:$SEEN) --"
+     echo "      every kill landed before the move was durable, so the"
+     echo "      interrupted-recovery path was never exercised. Green here"
+     echo "      would certify it by running none of it."
+     FAILS=$((FAILS+1)) ;;
+esac
+echo "== deterministic never-started safety"
+test_never_started_is_safe || FAILS=$((FAILS+1))
 echo "== deterministic half-done-flip recovery"
 test_half_done_flip || FAILS=$((FAILS+1))
 [ "$FAILS" = "0" ] || { echo "FAIL: $FAILS recovery runs failed"; exit 1; }
