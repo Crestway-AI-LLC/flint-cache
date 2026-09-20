@@ -2239,8 +2239,88 @@ assert_sibling_lock_path_is_pinned() {
   echo "  the sibling lock this guard reads is the one flint-kv takes ($ours)"
 }
 
+# Where the ops checkout is, resolved the way assert_sibling_lock_path_is_pinned
+# above already resolves flint-kv -- and for the reason its comment gives:
+# every change here is made in a LINKED WORKTREE on the external SSD, where a
+# plain `..` is nothing, so the bare default made this check skip on precisely
+# the machines that have both repos. FLINT_OPS overrides; otherwise the primary
+# worktree's parent, because `git rev-parse --git-common-dir` names the primary
+# tree's .git whichever worktree we are in.
+#
+# A FAILED `git` MUST NOT PRODUCE A PATH, the same trap that function records:
+# an empty substitution turns `cd "$(...)/.."` into `cd "/.."`, which SUCCEEDS
+# and yields `/`.
+_ops_checkout() {
+  local ops common primary
+  if [ -n "${FLINT_OPS:-}" ]; then
+    printf '%s' "$FLINT_OPS"
+    return 0
+  fi
+  ops="../flint-cache"
+  if [ ! -d "$ops/tools" ]; then
+    common=$(git rev-parse --git-common-dir 2>/dev/null) || common=""
+    if [ -n "$common" ] && [ -d "$common" ]; then
+      primary=$(cd "$common/.." 2>/dev/null && pwd) || primary=""
+      if [ -n "$primary" ] && [ "$primary" != "/" ] && [ -d "$primary/../flint-cache/tools" ]; then
+        ops="$primary/../flint-cache"
+      fi
+    fi
+  fi
+  printf '%s' "$ops"
+}
+
+# The ops drills AS OF ITS origin/main, materialised into a temp dir so the
+# existing drill_declared_ports can read them unchanged.
+#
+# THE REF, NOT THE TREE, AND THE ORDER OF THESE TWO FIXES IS THE WHOLE POINT.
+# Making the resolution work while still reading the tree is WORSE than the
+# skip it replaces: measured 2026-09-20, the checkout the resolution finds is
+# ~/dev/flint-cache at 1295 commits behind, and comparing against its TREE
+# reports an overlap on 7461-7463 -- which is ops OPS-0271, fixed on
+# 2026-09-19 by moving the fleet drill to 7485-7488. Against its origin/main
+# the overlap is empty, and 0 ops drills on that ref claim 7461-3 today. So
+# resolving without reading the ref would have turned a silent gap into a red
+# public gate blaming the ops repo for a bug closed two days earlier.
+#
+# Prints the provenance on line 1 and the temp dir on line 2; the caller
+# removes the dir.
+_ops_drills_at_ref() {  # <ops-dir>
+  local d=$1 t f
+  t=$(mktemp -d) || { printf 'unreadable\n\n'; return 1; }
+  local listed
+  listed=$(git -C "$d" ls-tree -r --name-only origin/main tools/ 2>/dev/null | grep '_drill\.sh$')
+  if [ -n "$listed" ]; then
+    mkdir -p "$t/tools"
+    # `while read`, not `for f in $listed`: the unquoted form depends on the
+    # shell's word-splitting, and a probe of this function run under zsh
+    # treated the whole newline-joined list as ONE filename and reported zero
+    # ops ports. gates.sh is bash so the real path was fine, but a function
+    # whose correctness depends on which shell sourced it is one measurement
+    # away from a confident wrong answer.
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      git -C "$d" show "origin/main:$f" > "$t/$f" 2>/dev/null
+    done <<< "$listed"
+    # $t/tools, NOT $t: drill_declared_ports takes the directory CONTAINING the
+    # drills, and the tree branch below returns "$d/tools". Returning the temp
+    # ROOT here made the two branches disagree, so the ref path compared against
+    # an EMPTY set and reported "no port is claimed" every time -- a false pass
+    # produced by the fix itself, caught by the coverage-kept control below.
+    printf 'origin/main\n%s\n' "$t/tools"
+    return 0
+  fi
+  rm -rf "$t"
+  if [ -d "$d/tools" ]; then
+    printf 'working-tree\n%s\n' "$d/tools"
+    return 0
+  fi
+  printf 'unreadable\n\n'
+  return 1
+}
+
 assert_no_cross_repo_ports() {
-  local ops="${FLINT_OPS:-../flint-cache}"
+  local ops prov opsdir cleanup=""
+  ops=$(_ops_checkout)
   if [ ! -d "$ops/tools" ]; then
     echo "  SKIP: no ops checkout at $ops — cross-repo port overlap NOT checked"
     return 0
@@ -2250,6 +2330,69 @@ assert_no_cross_repo_ports() {
     echo "      port check would compare two empty sets and pass."
     exit 1
   }
+  # CONTROLS, because every arm of this check is an ABSENCE and BUG-0156
+  # already had to widen it once for reading too little. A fixture ops repo
+  # whose TREE claims a port this repo uses and whose origin/main does not --
+  # which is the 7461-7463 situation exactly: ops OPS-0271 moved the fleet
+  # drill to 7485-7488 on 2026-09-19, and a checkout 1295 commits behind still
+  # shows the old claim.
+  local cfx cport cprov cdir
+  cport=$(drill_declared_ports | awk 'NR==1 {print $1}')
+  cfx=$(mktemp -d) || {
+    echo "FAIL  no temp dir for the cross-repo port control"
+    FAILED="$FAILED cross-repo-ports-control"
+    return 0
+  }
+  mkdir -p "$cfx/ops/tools"
+  printf 'fleet_init a/b 65001\n' > "$cfx/ops/tools/fixture_drill.sh"
+  if git -C "$cfx/ops" init -q 2>/dev/null \
+     && git -C "$cfx/ops" add -A 2>/dev/null \
+     && git -C "$cfx/ops" -c user.email=d@d.invalid -c user.name=d commit -qm fx 2>/dev/null \
+     && git -C "$cfx/ops" update-ref refs/remotes/origin/main HEAD 2>/dev/null; then
+    # the TREE now claims one of OUR ports; the ref still does not
+    printf 'fleet_init a/b %s\n' "$cport" > "$cfx/ops/tools/fixture_drill.sh"
+    cprov=$(_ops_drills_at_ref "$cfx/ops" | head -1)
+    cdir=$(_ops_drills_at_ref "$cfx/ops" | sed -n 2p)
+    if [ "$cprov" != origin/main ]; then
+      echo "FAIL  the ops read did not prefer origin/main over the working tree"
+      FAILED="$FAILED cross-repo-ports-control"; rm -rf "$cfx"; return 0
+    fi
+    if [ -n "$(comm -12 <(drill_declared_ports | awk '{print $1}' | sort -u) \
+                        <(drill_declared_ports "$cdir" | awk '{print $1}' | sort -u))" ]; then
+      echo "FAIL  a port claimed only in the ops WORKING TREE was reported as a"
+      echo "        collision -- that is the 7461-7463 shape, where a checkout"
+      echo "        1295 commits behind still shows a claim OPS-0271 removed"
+      FAILED="$FAILED cross-repo-ports-control"; rm -rf "$(dirname "$cdir")" "$cfx"; return 0
+    fi
+    rm -rf "$(dirname "$cdir")"
+    # COVERAGE KEPT: the same port ON THE REF must still be found.
+    git -C "$cfx/ops" add -A >/dev/null 2>&1
+    git -C "$cfx/ops" -c user.email=d@d.invalid -c user.name=d commit -qm collide >/dev/null 2>&1
+    git -C "$cfx/ops" update-ref refs/remotes/origin/main HEAD 2>/dev/null
+    cdir=$(_ops_drills_at_ref "$cfx/ops" | sed -n 2p)
+    if [ -z "$(comm -12 <(drill_declared_ports | awk '{print $1}' | sort -u) \
+                        <(drill_declared_ports "$cdir" | awk '{print $1}' | sort -u))" ]; then
+      echo "FAIL  a port claimed on the ops ref was NOT reported -- the fix"
+      echo "        traded the stale-tree false alarm for no coverage at all"
+      FAILED="$FAILED cross-repo-ports-control"; rm -rf "$(dirname "$cdir")" "$cfx"; return 0
+    fi
+    rm -rf "$(dirname "$cdir")"
+    echo "  control: the ops ref is read, not its tree, and a real overlap is still found"
+  else
+    echo "  note: no usable git for the cross-repo port control, so it did not run"
+  fi
+  rm -rf "$cfx"
+
+  local at
+  at=$(_ops_drills_at_ref "$ops")
+  prov=$(printf '%s\n' "$at" | head -1)
+  opsdir=$(printf '%s\n' "$at" | sed -n 2p)
+  if [ "$prov" = unreadable ] || [ -z "$opsdir" ]; then
+    echo "  SKIP: $ops has no readable tools/*_drill.sh — cross-repo port overlap NOT checked"
+    return 0
+  fi
+  # the dir returned is <temp>/tools, so the thing to remove is its parent
+  [ "$prov" = origin/main ] && cleanup="$(dirname "$opsdir")"
   local shared
   # THE LIBRARY ON BOTH SIDES (BUG-0156). The scan here saw neither repo's
   # continuation-wrapped or indented declarations, and neither harness's own
@@ -2257,15 +2400,16 @@ assert_no_cross_repo_ports() {
   # at all.
   shared=$(comm -12 \
     <(drill_declared_ports | awk '{print $1}' | sort -u) \
-    <(drill_declared_ports "$ops/tools" | awk '{print $1}' | sort -u))
+    <(drill_declared_ports "$opsdir" | awk '{print $1}' | sort -u))
   if [ -z "$shared" ]; then
-    echo "  no port is claimed by both this repo's drills and the ops repo's"
+    echo "  no port is claimed by both this repo's drills and the ops repo's ($ops, $prov)"
+    [ -n "$cleanup" ] && rm -rf "$cleanup"
     return 0
   fi
   echo "FAIL  this repo's drills claim port(s) an ops drill already uses:"
   local p
   for p in $shared; do
-    echo "        $p: $( { drill_declared_ports; drill_declared_ports "$ops/tools"; } \
+    echo "        $p: $( { drill_declared_ports; drill_declared_ports "$opsdir"; } \
       | awk -v p="$p" '$1==p {printf "%s ", $2}')"
   done
   echo "        Pick a port free in BOTH repos. Checking only this one is how"
