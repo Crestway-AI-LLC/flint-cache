@@ -64,7 +64,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use flint_resp::{Decoded, Value, decode, encode};
-use state::{State, shuffle_shard};
+use state::{State, canonical_members, clean, shuffle_shard};
 
 fn arg(name: &str) -> Option<String> {
     std::env::args().skip_while(|a| a != name).nth(1)
@@ -152,14 +152,6 @@ fn err(msg: &str) -> Value {
     Value::Error(format!("ERR {msg}"))
 }
 
-/// Validate the space-free tokens the line format depends on.
-fn clean(s: &str) -> bool {
-    !s.is_empty()
-        && s.len() <= 128
-        && s.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b':' | b','))
-}
-
 fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
     let cmd = args
         .first()
@@ -223,22 +215,13 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
             Value::Simple(format!("OK retired {addr}"))
         }
         b"CPADDPAIR" => {
-            let Some(nodes) = text(1).filter(|a| clean(a)) else {
+            let Some(pair) = text(1).as_deref().and_then(canonical_members) else {
                 return err("CPADDPAIR <a,b[,c]> [start-end|-]");
             };
             // Optional slot range: level-1 routing state. "-" (or absent) =
             // unranged; an EXPANSION pair should pass "-" so joining adds
             // capacity without re-routing unmigrated slots.
             let range = text(2).as_deref().and_then(state::parse_range);
-            // SORTED, because the dedupe below is vector EQUALITY and the
-            // lease lookups are membership CONTAINMENT. Unsorted, `CPADDPAIR
-            // a,b` and `CPADDPAIR b,a` are two pairs to the equality check and
-            // one pair to every containment check -- which is how a lease row
-            // written by one key can be read through another (BUG-0065).
-            // Canonicalising here makes the existing `contains` dedupe do what
-            // it already reads as doing.
-            let mut pair: Vec<String> = nodes.split(',').map(String::from).collect();
-            pair.sort();
             let Ok(mut st) = shared.state.lock() else {
                 return err("state lock");
             };
@@ -260,16 +243,13 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
         b"CPSETPAIR" => {
             let (Some(idx), Some(nodes)) = (
                 text(1).and_then(|v| v.parse::<usize>().ok()),
-                text(2).filter(|a| clean(a)),
+                text(2).as_deref().and_then(canonical_members),
             ) else {
                 return err("CPSETPAIR <idx> <a,b[,c]>");
             };
             let Ok(mut st) = shared.state.lock() else {
                 return err("state lock");
             };
-            // Sorted, as CPADDPAIR is (BUG-0065's root fix): a repoint that
-            // wrote an unsorted vector would let a later CPADDPAIR of the same
-            // members past the `contains` dedupe as a second pair.
             // THE INDEX IS CHECKED, NOTHING IS READ OUT. This used to clone
             // the old membership so the fast mirror could be repointed from it
             // by hand; the mirror is re-derived now (ADR-0032 step 4), and
@@ -277,12 +257,7 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
             if idx >= st.pairs.len() {
                 return err("no such pair index");
             }
-            let mut members: Vec<String> = nodes.split(',').map(String::from).collect();
-            members.sort();
-            st.apply_mutation(registry::Mutation::SetPair {
-                idx,
-                nodes: members.clone(),
-            });
+            st.apply_mutation(registry::Mutation::SetPair { idx, nodes });
             match st.commit() {
                 Ok(_) => {}
                 Err(e) => return err(&format!("persist: {e}")),
@@ -1913,7 +1888,7 @@ mod cpjournalread_filter_tests {
 
 #[cfg(test)]
 mod lease_row_key_tests {
-    use super::lease_row_index;
+    use super::{canonical_members, lease_row_index};
 
     fn row(members: &[&str], master: &str, generation: u64) -> (Vec<String>, String, u64) {
         (
@@ -2042,14 +2017,121 @@ mod lease_row_key_tests {
     /// The root fix: sorting at registration makes `a,b` and `b,a` one vector,
     /// so CPADDPAIR's `contains` dedupe rejects the second and no duplicate is
     /// ever created. Without the sort these compare unequal and both are kept.
+    ///
+    /// IT CALLS `canonical_members` NOW (BUG-0169). It used to sort two
+    /// vectors itself and assert that sorting works, which is true of `sort`
+    /// and says nothing about the control plane — the shape BUG-0146 is about,
+    /// where six unit tests passed against the type while the product did
+    /// nothing. The function under test is the one the dispatchers call.
     #[test]
     fn canonicalising_registration_collapses_reordered_pairs() {
-        let mut ab: Vec<String> = "a:1,b:2".split(',').map(String::from).collect();
-        let mut ba: Vec<String> = "b:2,a:1".split(',').map(String::from).collect();
-        assert_ne!(ab, ba, "unsorted, these are two different pairs");
-        ab.sort();
-        ba.sort();
-        assert_eq!(ab, ba, "sorted, CPADDPAIR's contains-dedupe sees one pair");
+        let ab = canonical_members("a:1,b:2").expect("valid membership");
+        let ba = canonical_members("b:2,a:1").expect("valid membership");
+        assert_eq!(
+            ab, ba,
+            "canonicalised, CPADDPAIR's contains-dedupe sees one pair"
+        );
+        // The control: without canonicalisation these ARE two different
+        // vectors, which is the whole reason the function exists.
+        let raw_ab: Vec<String> = "a:1,b:2".split(',').map(String::from).collect();
+        let raw_ba: Vec<String> = "b:2,a:1".split(',').map(String::from).collect();
+        assert_ne!(raw_ab, raw_ba, "unsorted, these are two different pairs");
+    }
+
+    /// `canonical_members` must reject exactly what the four call sites
+    /// rejected before BUG-0169 moved the parse into it — no more.
+    ///
+    /// Widening the validation here would be a change to what the control
+    /// plane answers, smuggled in behind a deduplication. `a,,b` parses to an
+    /// empty member today and is accepted; that may well be worth refusing,
+    /// and refusing it is not this change.
+    #[test]
+    fn canonical_members_accepts_and_refuses_what_clean_did() {
+        assert!(canonical_members("").is_none(), "empty");
+        assert!(canonical_members("a b").is_none(), "space");
+        assert!(canonical_members(&"x".repeat(129)).is_none(), "over 128");
+        assert_eq!(
+            canonical_members("10.0.0.2:7001,10.0.0.1:7001"),
+            Some(vec![
+                "10.0.0.1:7001".to_string(),
+                "10.0.0.2:7001".to_string()
+            ])
+        );
+        // Unchanged behaviour, asserted so a later widening is a DECISION
+        // rather than a side effect: an empty member survives, as it did.
+        assert_eq!(
+            canonical_members("a,,b"),
+            Some(vec!["".to_string(), "a".to_string(), "b".to_string()]),
+            "this is what the four sites did; changing it is its own bug"
+        );
+    }
+
+    /// BUG-0169's structural half, in the style of the lease-row guard above:
+    /// the invariant has ONE home and the dispatchers must not grow another.
+    ///
+    /// Before this, `main.rs` and `ha.rs` each wrote out `split(',')` then
+    /// `.sort()` at `CPADDPAIR` and `CPSETPAIR` — four copies of BUG-0065's
+    /// rule under four separate paragraphs re-deriving it. They agreed
+    /// whenever anyone looked, and nothing made them: **BUG-0150 was `ha.rs`'s
+    /// CPADDPAIR missing the sort that `main.rs` had**, found by a drill
+    /// rather than by any of this.
+    ///
+    /// Both directions, because either alone certifies the wrong thing. The
+    /// COUNT catches an arm that stopped canonicalising (BUG-0150's shape).
+    /// The ABSENCE catches an arm that started doing it by hand again, which
+    /// is how the copies appeared in the first place and which a count would
+    /// read as healthy.
+    #[test]
+    fn membership_is_canonicalised_in_one_place_only() {
+        for (name, whole, least) in [
+            ("main.rs", include_str!("main.rs"), 2usize),
+            ("ha.rs", include_str!("ha.rs"), 2),
+        ] {
+            // Production half only: this test names its own patterns, so
+            // scanning the test module matches the test's own text.
+            let src = whole.split("#[cfg(test)]").next().unwrap_or(whole);
+            // COMMENTS STRIPPED BEFORE COUNTING, and both halves of that
+            // sentence were learned by mutation.
+            //
+            // Counting the raw source passed a mutant that removed ha.rs's
+            // CPADDPAIR call: a comment I had written two edits earlier, on
+            // the line the call used to occupy, naming the function to explain
+            // why the sort was gone, held the count at the threshold. The
+            // guard read the explanation of the thing instead of the thing —
+            // the trap `assert_cp_verbs_agree_across_paths` names in gates.sh.
+            //
+            // Requiring a `(` instead then failed on the CLEAN tree: the call
+            // is `and_then(canonical_members)`, a function reference with no
+            // paren of its own. A pattern narrow enough to exclude prose was
+            // narrow enough to exclude the real call.
+            let code: String = src
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let n = code.matches("canonical_members").count();
+            assert!(
+                n >= least,
+                "{name} calls canonical_members() {n} times, expected at least \
+                 {least} (CPADDPAIR and CPSETPAIR) -- an arm that stopped \
+                 canonicalising IS BUG-0150"
+            );
+            assert!(
+                !code.contains(".sort()"),
+                "{name} sorts in the dispatcher. Pair membership is \
+                 canonicalised by state::canonical_members and nowhere else; a \
+                 second copy here is what BUG-0169 removed, and the copies \
+                 agreed right up until BUG-0150"
+            );
+        }
+        // The control for the ABSENCE arm: it must be able to see a sort. A
+        // pattern that matched nothing would certify both files by reading
+        // neither, which is the failure the NOARMS arm of the verb-parity
+        // check exists for.
+        assert!(
+            "let mut v: Vec<u8> = vec![]; v.sort();".contains(".sort()"),
+            "the forbidden pattern cannot match a sort, so its absence proves nothing"
+        );
     }
 }
 

@@ -111,6 +111,50 @@ pub fn render_controllers(map: &Controllers) -> String {
 pub use crate::registry::shuffle_shard;
 
 /// Parse "a-b" into a slot range; "-" (or anything malformed) is None.
+/// Validate the space-free tokens the line format depends on.
+///
+/// Both dispatchers used to carry a byte-identical private copy of this
+/// (`main.rs` and `ha.rs`). It is here because [`canonical_members`] needs it
+/// and both call that.
+pub fn clean(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 128
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b':' | b','))
+}
+
+/// BUG-0065's invariant, in ONE place: pair membership is canonical.
+///
+/// The dedupe that decides whether a registration is new is vector EQUALITY,
+/// and every lease lookup is membership CONTAINMENT. Unsorted, `CPADDPAIR a,b`
+/// and `CPADDPAIR b,a` are TWO pairs to the dedupe and ONE pair to every
+/// containment check — which is how a lease row written under one key is read
+/// through another.
+///
+/// IT BELONGS IN THE HANDLER LAYER, NOT IN `apply()`, and that is load-bearing
+/// rather than incidental: canonicalising inside the state machine would
+/// change how already-committed log entries replay. So the invariant is owned
+/// by whoever BUILDS the mutation — and there are four such places, two
+/// dispatchers times `CPADDPAIR` and `CPSETPAIR`. Before BUG-0169 all four
+/// wrote out `split(',')` then `.sort()` under four separate paragraphs
+/// re-deriving the paragraph above.
+///
+/// THE HISTORY IS WHY THIS IS ONE FUNCTION. Two of those four sites have
+/// already been the site of a miss: BUG-0150 was `ha.rs`'s `CPADDPAIR`
+/// lacking the sort that `main.rs`'s had, and BUG-0151 was the `CPSETPAIR`
+/// path. The copies agreed when anyone looked, and nothing made them.
+///
+/// Rejects exactly what the four sites rejected — no more, so that this is a
+/// deduplication and not a change to what the control plane answers.
+pub fn canonical_members(raw: &str) -> Option<Vec<String>> {
+    if !clean(raw) {
+        return None;
+    }
+    let mut members: Vec<String> = raw.split(',').map(String::from).collect();
+    members.sort();
+    Some(members)
+}
+
 pub fn parse_range(raw: &str) -> Option<(u16, u16)> {
     let (a, b) = raw.split_once('-')?;
     Some((a.trim().parse().ok()?, b.trim().parse().ok()?))

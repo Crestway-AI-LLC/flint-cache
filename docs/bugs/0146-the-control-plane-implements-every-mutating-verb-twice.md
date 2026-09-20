@@ -70,6 +70,41 @@ copies diverging.
 plane's structure, it touches every mutating verb, and it deserves its own
 design and its own gate rather than being smuggled in behind a subset fix.
 
+## Where this actually stands, measured 2026-09-19
+
+ADR-0032 reports steps 1-4 done, and this file still said "the work is not
+done". Both can be true, so here is what was checked rather than recalled:
+
+**Single now:**
+
+- **The meaning of every mutation.** `main.rs`'s single-node arms call
+  `st.apply_mutation(registry::Mutation::…)` — the same state machine `ha.rs`
+  proposes into. The original defect (a fix landing in `Mutation::DelProxy`
+  while the single-node arm did nothing) cannot recur in `apply`, because
+  there is one `apply`.
+- **The verb tables**, guarded by `assert_cp_verbs_agree_across_paths`
+  (`tools/gates.sh:2013`), 44 and 44 today. It catches an arm somebody forgot
+  to ADD — BUG-0148's shape — and says in its own source that it cannot catch
+  one somebody forgot to UPDATE.
+- **The refusals**, split out as BUG-0160 and fixed there.
+- **Membership canonicalisation**, as of
+  [BUG-0169](0169-pair-membership-is-canonicalised-in-four-hand-written-places.md):
+  BUG-0065's rule was a `.sort()` written out at four sites, two of which had
+  already been the site of a miss (BUG-0150, BUG-0151). Now one function.
+
+**Still two, and not yet judged:** each dispatcher owns its own parse, its own
+liveness check (`state.lock()` against `leader_view().await`) and its own reply
+string. Some of that is inherent — one is a local mutex and the other is a
+Raft proposal, which is what candidate A chose. What has NOT been established
+is that none of it still carries a *semantic* rule the other must mirror by
+hand. BUG-0169 found one such rule by reading two verbs; there are forty-four.
+
+**So this stays OPEN, and the reason is now specific rather than general.**
+Closing it needs a per-verb audit asking one question of each arm: does it do
+anything between parse and `apply`/`propose` that the other arm must do
+identically? That is the remaining work, and it is a reading task with a
+decidable answer, not a design question.
+
 ## The part worth acting on first
 
 **A unit test against `RegistryState` proves nothing about a single-node

@@ -28,6 +28,7 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 use crate::raft::{NodeId, Request, Store, TypeConfig};
 use crate::registry::Mutation;
+use crate::state::clean;
 
 pub type CpRaft = Raft<TypeConfig>;
 
@@ -569,13 +570,6 @@ async fn client_conn<S: AsyncRead + AsyncWrite + Unpin>(
     }
 }
 
-fn clean(s: &str) -> bool {
-    !s.is_empty()
-        && s.len() <= 128
-        && s.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b':' | b','))
-}
-
 async fn handle_admin(ha: &Ha, args: &[Vec<u8>]) -> Value {
     let cmd = args
         .first()
@@ -616,21 +610,15 @@ async fn handle_admin(ha: &Ha, args: &[Vec<u8>]) -> Value {
             }
         }
         b"CPADDPAIR" => {
-            let Some(nodes) = text(1).filter(|a| clean(a)) else {
+            let Some(pair) = text(1).as_deref().and_then(crate::state::canonical_members) else {
                 return Value::Error("ERR CPADDPAIR <a,b[,c]>".into());
             };
             let range = text(2).as_deref().and_then(crate::state::parse_range);
-            // CANONICALISE BEFORE PROPOSING, exactly as the single-node
-            // CPADDPAIR does. BUG-0065's root fix, missing here (BUG-0150):
-            // lease lookups are membership CONTAINMENT, so unsorted,
-            // `CPADDPAIR a,b` and `CPADDPAIR b,a` pass apply's `contains`
-            // dedupe as TWO pairs while every containment check reads them as
-            // one -- which is how a pair gets two lease rows in the first
-            // place. Sorted in the handler rather than in apply() so the state
-            // machine's behaviour on already-committed log entries is
-            // unchanged.
-            let mut pair: Vec<String> = nodes.split(',').map(String::from).collect();
-            pair.sort();
+            // Membership is canonicalised by `state::canonical_members`
+            // above, which is BUG-0065's invariant and carries its reasoning.
+            // It was written out here by hand until BUG-0169, and this site is
+            // why that mattered: BUG-0150 was this arm missing the sort that
+            // the single-node arm had.
             match ha.propose(Mutation::AddPair { nodes: pair, range }).await {
                 Ok(_) => Value::Simple("OK".into()),
                 Err(l) => redirect(l),
@@ -1094,23 +1082,15 @@ async fn handle_admin(ha: &Ha, args: &[Vec<u8>]) -> Value {
         b"CPSETPAIR" => {
             let (Some(idx), Some(nodes)) = (
                 text(1).and_then(|v| v.parse::<usize>().ok()),
-                text(2).filter(|a| clean(a)),
+                text(2).as_deref().and_then(crate::state::canonical_members),
             ) else {
                 return Value::Error("ERR CPSETPAIR <idx> <a,b[,c]>".into());
             };
-            // SORTED, as CPADDPAIR is. BUG-0065's root fix canonicalises at
-            // registration so `a,b` and `b,a` are one pair to the `contains`
-            // dedupe; a repoint that wrote an unsorted vector put that back,
-            // because a later CPADDPAIR of the same members would not match it
-            // and would register a duplicate. Sorted in the HANDLER so apply()
-            // replays already-committed entries unchanged.
             match ha.leader_view().await {
                 Ok(reg) if idx < reg.pairs.len() => {}
                 Ok(_) => return Value::Error("ERR no such pair index".into()),
                 Err(l) => return redirect(l),
             }
-            let mut nodes: Vec<String> = nodes.split(',').map(String::from).collect();
-            nodes.sort();
             match ha.propose(Mutation::SetPair { idx, nodes }).await {
                 Ok(v) => Value::Simple(format!("OK version {v}")),
                 Err(redir) => redirect(redir),
