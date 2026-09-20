@@ -347,7 +347,7 @@ assert_never_started() {
   [ "$miss" = "0" ] || {
     echo "  FAIL: $miss keys lost -- the move never started, so the source should"
     echo "        still hold everything it was seeded with"
-    echo "  WHERE: source DBSIZE=$(valkey-cli -p $SPORT DBSIZE) dest DBSIZE=$(valkey-cli -p $DPORT DBSIZE) (seeded $KEYS to source)"
+    echo "  WHERE: source DBSIZE=$(valkey-cli -p $SPORT DBSIZE) dest DBSIZE=$(valkey-cli -p $DPORT DBSIZE) (seeded ${SEEDED:-$KEYS} to source)"
     pkill -9 -f "flint-server --port 658" 2>/dev/null; keep_dirs; return 1; }
 
   local how="killed in phase $phase"
@@ -387,6 +387,7 @@ test_never_started_is_safe() {
     awk -v n="$n" 'BEGIN{for(i=0;i<n;i++){k=sprintf("{mover}:key%06d",i);v=sprintf("val-%06d",i);printf "*3\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n",length(k),k,length(v),v}}'
   }
   fleet_load_resp "$SPORT" _nvs_seed_gen "$n" || return 1
+  SEEDED=$n
   for k in 000000 075000 149999; do
     valkey-cli -p $SPORT SET "{mover}:key$k" "val-$k" >/dev/null
   done
