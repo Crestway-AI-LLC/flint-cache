@@ -179,11 +179,48 @@ not on the Raft one. Filed and fixed as
 [BUG-0171](0171-cpdeltenant-clears-the-usage-row-on-one-control-plane-and-not-the-other.md),
 direction single-node-correct/Raft-wrong.
 
-**This file stays OPEN.** Three passes have each closed a class and found the
-next one outside it: apply is shared, verbs are guarded, constructions agree,
-and the side effects beside them are guarded for exactly one map. The lease
-mirror, the controller registry and the journal have the same exposure and no
-check. What is now established is a method rather than a conclusion.
+### The third pass (2026-09-20): the other non-registry state
+
+The paragraph this replaces said the lease mirror, the controller registry and
+the journal had the same exposure as the `usage` map and no check. Measured,
+they do not — and the reasons differ, which is why "same exposure" was the
+wrong shorthand:
+
+| state | single-node | raft | verdict |
+|---|---|---|---|
+| `usage` | `insert`, `remove` | `insert`, `remove` | symmetric since BUG-0171, and guarded |
+| `controllers` | `record_controller` into `st.controllers` | `record_controller` into `ha.controllers` | same writer, same renderer (`controller_line` is a one-line wrapper around `render_controllers`), `#[serde(skip)]` on both so neither persists |
+| journal | `append_line`, `parse_kinds_arg`, `tail_kinds` | the same three | symmetric |
+| leases | fast mirror + a `pop()` compensation | registry state | **different by design, not drift** |
+
+**The lease difference is the one worth stating.** ADR-0018 gives the
+single-node plane a mirror under its own lock so `CPLEASE` never queues behind
+a snapshot being serialised; on Raft the rows ARE registry state. So there is
+no shared structure to compare, and the `leases.pop()` after a failed commit —
+which ADR-0032 already flagged as "not a verb" — has no Raft analogue because
+a failed *propose* applies nothing to compensate for. An audit keyed on the
+field name would have reported an asymmetry; the asymmetry is the design.
+
+### Where that leaves this file
+
+Everything it asked for has been done. The meaning of every mutation is
+single, the verb tables are guarded, the refusals were unified as BUG-0160,
+the constructions agree across all 43 arms, and the side effects beside them
+have been measured — one defect found and fixed, the rest clean with reasons.
+
+**What is NOT established is that no further class exists**, and three passes
+each found one outside the previous one's scope, so that is a live caution
+rather than a formality. The honest statement: this bug's stated work is
+complete, and keeping it open now records a suspicion rather than a task.
+Closing it is a record-keeping decision — worth taking deliberately, because
+the classes below were each invisible until someone pointed a different
+question at the same two files:
+
+1. the apply path (ADR-0032)
+2. the verb tables (`assert_cp_verbs_agree_across_paths`)
+3. the refusals (BUG-0160)
+4. the mutation constructions (pass 2)
+5. the side effects beside them (pass 3, BUG-0171)
 
 ## The part worth acting on first
 
