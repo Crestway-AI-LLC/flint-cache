@@ -179,11 +179,20 @@ to the public repo, with the same checks the CI job used to run: tests
 on both workspaces against the exact bits shipped, and an assert that
 the build stamp LANDED, by asking `flint-server --build-version` and
 `flintctl --build-version` rather than trusting the build.
-Deploying is then one command (or the ops portal's Canary-upgrade
-button): download, verify the sha256, unpack into the inventory's bins
-dir, and
+Deploying is then two commands (or the ops portal's Canary-upgrade
+button): download, verify the sha256, unpack into `<bins>.next` BESIDE
+the inventory's bins dir, and
 
+    <bins>.next/flintctl -f <inventory> activate-bins --version-tag <tag>
     flintctl -f <inventory> upgrade --manifest manifest.json --version-tag <tag>
+
+Unpacking straight over the bins dir still works and is what every
+release up to and including v0.1.0-rc.74 said. The side path is what keeps anything
+that restarts a seat — a supervise timer, systemd — from bringing it
+back one version ahead of the fleet while the roll is in flight, since
+`upgrade` is not the only thing that spawns from those binaries
+(OPS-0259/OPS-0276). `activate-bins` is run from the bundle just
+unpacked, so there is no chicken-and-egg on the first upgrade.
 
 — canary replica first, soak against the fleet journal, remaining
 replicas, masters last via controlled failover; any unexpected journal

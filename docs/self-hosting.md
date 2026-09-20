@@ -662,6 +662,59 @@ Pair it with an alert on `flintctl verify`, which reports a pair serving from
 one copy as `SINGLE-COPY`. A restarter with nothing watching it will happily
 restart a seat that exits again every minute, and you want to know that.
 
+**This timer and a release roll interact, and you have to stage around it.**
+`push-bins` (or a manual `tar x`) unpacks a bundle into the bins dir, and
+`upgrade` then rolls the seats one at a time. Between those two the bins dir
+holds the new build while every running seat holds the old one — and this timer
+restarts a dead seat by spawning from the bins dir. **A seat that dies in
+between comes back one version ahead of the rest of the fleet, and nothing
+records that it happened.**
+
+The window is not the one minute of the timer, and it is not the roll. It is
+every check that runs *between* staging and the roll, and any of them can
+abort: if one does, the bins dir stays ahead of the fleet until somebody
+notices.
+
+Stage to a side path instead, and arm it last:
+
+```
+# unpack beside the bins dir, not over it — nothing spawns from <bins>.next
+flintctl -f <inventory> push-bins flint-<tag>-linux-x86_64.tar.gz --stage
+
+# the new binaries are now USABLE without being ARMED: run whatever checks you
+# want against <bins>.next/flintctl, including the one below
+
+# arm them, as the last act before the roll
+<bins>.next/flintctl -f <inventory> activate-bins --version-tag <tag>
+
+flintctl -f <inventory> upgrade --version-tag <tag>
+```
+
+`activate-bins` verifies the staged binary on every host before renaming on any
+of them, then swaps `<bins>.next` into place. **Run it from the staged copy**,
+as shown: that is what lets a fleet adopt this at all, since the flintctl
+installed on the box is whatever the last roll put there and only `--stage` has
+to be understood by it.
+
+**Anything you put in the bins dir yourself survives the swap.** A directory
+swap is a replacement, so `activate-bins` copies every name the staged bundle
+does not supply into it before renaming — a certificate-renewal client, a cron
+helper, a script some unit's `ExecStart` points at. The staged copy always
+wins, so this never puts an old binary back over a new one. It is still worth
+knowing which files those are on your own box: they are the ones no upgrade
+will ever update.
+
+**The first time, unpack by hand.** `--stage` is a flag on the flintctl
+already installed on the box, and on the upgrade that first brings it there
+that copy does not have it yet. `mkdir <bins>.next && tar xzf <bundle> -C
+<bins>.next` does the same thing, and `activate-bins` comes from the bundle you
+just unpacked rather than from the old binary — so only this one step is
+manual, once.
+
+Plain `push-bins <tarball>` and a manual `tar x` over the bins dir are
+unchanged and still correct — for a first install there is no running fleet to
+be ahead of.
+
 **Verify it for real.** A reboot path that has never been rebooted is a
 guess. Reboot the box, then check `systemctl status flint`, `flintctl -f
 /opt/flint/cluster.flint status` for the expected roles, and read a key you
