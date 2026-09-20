@@ -2140,6 +2140,65 @@ mod lease_row_key_tests {
 /// they are held here at the command surface and not in `apply_mutation`'s
 /// unit tests.
 #[cfg(test)]
+mod dispatcher_side_effect_tests {
+    /// BUG-0171. THE MUTATION IS SHARED; THE SIDE EFFECTS BESIDE IT ARE NOT.
+    ///
+    /// ADR-0032 made both dispatchers apply the same `Mutation`, and
+    /// `assert_cp_verbs_agree_across_paths` guards that both serve the same
+    /// verbs. Neither reaches what an arm does to state that is NOT registry
+    /// state -- and the `usage` map is exactly that: per-node, in memory,
+    /// keyed by tenant name, and untouched by any mutation.
+    ///
+    /// `CPDELTENANT` cleared it on the single-node path and not on the Raft
+    /// one, so on a Raft control plane the map only ever grew and a tenant
+    /// re-created under a deleted name read the old byte count until the next
+    /// `CPTENANTUSAGE` report. Single-node correct, Raft wrong -- BUG-0152's
+    /// direction, which BUG-0146 says cannot be learned from BUG-0148 and
+    /// BUG-0150.
+    ///
+    /// THE INVARIANT, NOT THE INSTANCE. Asserting "ha.rs calls usage.remove"
+    /// would pin the one call this bug fixed and say nothing about the next
+    /// map, so this asserts the two dispatchers perform the same SET of
+    /// operations on it.
+    #[test]
+    fn both_dispatchers_mutate_the_usage_map_the_same_way() {
+        // Comments name calls too: a `usage.remove(` in prose would make the
+        // sets agree on the strength of an explanation, which is how
+        // BUG-0169's count guard first passed a mutant.
+        fn ops(src: &str) -> Vec<&'static str> {
+            let c: String = src
+                .split("#[cfg(test)]")
+                .next()
+                .unwrap_or(src)
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            ["usage.insert(", "usage.remove(", "usage.clear("]
+                .iter()
+                .filter(|op| c.contains(*op))
+                .copied()
+                .collect()
+        }
+        let m = ops(include_str!("main.rs"));
+        let h = ops(include_str!("ha.rs"));
+        // The control first: a pattern matching nothing would certify both
+        // files by reading neither, and both dispatchers DO write this map.
+        assert!(
+            !m.is_empty() && !h.is_empty(),
+            "no usage-map operations found in either dispatcher (main={m:?} ha={h:?}) \
+             -- the patterns moved, and this check examined nothing"
+        );
+        assert_eq!(
+            m, h,
+            "the dispatchers do different things to the usage map: main={m:?} ha={h:?}. \
+             That map is not registry state, so no Mutation reconciles them -- \
+             an operation in one arm and not the other is BUG-0171"
+        );
+    }
+}
+
+#[cfg(test)]
 mod step3_dispatch_tests {
     use super::*;
 

@@ -146,6 +146,45 @@ So: the coarse class is closed on this evidence and the fine class is untested.
 A second pass would have to compare arms by reading, and 42 is a small enough
 number that this is a bounded job rather than an open-ended one.
 
+### Correction to the paragraph above (2026-09-20)
+
+**It ran over 42 of 43 verbs, not all of them.** The extractor required an arm
+to be written `b"CPX" => {`, and `ha.rs`'s `CPCONSOLIDATE` is written
+`=> match ha.propose(...)` — an expression, not a block. That arm was invisible
+to the pass, AND its text was swallowed by the arm above it, which then
+reported a mutation the previous verb does not construct. A coverage claim of
+"all 42 verbs both dispatchers serve" was therefore true of a set the tool had
+defined for itself.
+
+Re-run with every arm form matched, the final arm bounded at the match's
+catch-all, and comments stripped: **43 of 43 common, and 0 constructing a
+different set of mutations.** `CPCONSOLIDATE` checked by hand — both count rows
+after applying, and `propose` returns after the entry is APPLIED, which
+`leader_view`'s own comment states.
+
+### The second pass (2026-09-20), and what it found
+
+Comparing the construction EXPRESSIONS argument by argument across all 43:
+seven differ textually and all seven are equivalent — variable naming
+(`addr` vs `a`), field-init shorthand (`name: name` vs `name`), and
+inline-versus-prebound reads of the same field (`st.admin_token` bound first
+vs `reg.admin_token` inline). Verified by reading each, not by normalising
+them away.
+
+**So the mutation-construction path is clean, and the fine class turned out to
+live somewhere the question was not pointed.** The arms also perform SIDE
+EFFECTS on state that is not registry state and that no mutation reconciles —
+and `CPDELTENANT` clears the tenant's `usage` row on the single-node path and
+not on the Raft one. Filed and fixed as
+[BUG-0171](0171-cpdeltenant-clears-the-usage-row-on-one-control-plane-and-not-the-other.md),
+direction single-node-correct/Raft-wrong.
+
+**This file stays OPEN.** Three passes have each closed a class and found the
+next one outside it: apply is shared, verbs are guarded, constructions agree,
+and the side effects beside them are guarded for exactly one map. The lease
+mirror, the controller registry and the journal have the same exposure and no
+check. What is now established is a method rather than a conclusion.
+
 ## The part worth acting on first
 
 **A unit test against `RegistryState` proves nothing about a single-node

@@ -674,8 +674,20 @@ async fn handle_admin(ha: &Ha, args: &[Vec<u8>]) -> Value {
                 return Value::Error("ERR no such tenant".into());
             };
             let reply = format!("OK removed {name} ns {}", t.ns);
-            match ha.propose(Mutation::DelTenant { name }).await {
-                Ok(_) => Value::Simple(reply),
+            match ha.propose(Mutation::DelTenant { name: name.clone() }).await {
+                Ok(_) => {
+                    // DROP THE USAGE ROW, as the single-node arm has always
+                    // done (BUG-0171). The map is keyed by tenant NAME and is
+                    // not registry state, so nothing in the mutation clears
+                    // it: leaving the row means it grows with every deletion,
+                    // and a tenant RE-CREATED under the same name reads the
+                    // deleted one's byte count until the next CPTENANTUSAGE
+                    // report overwrites it.
+                    if let Ok(mut usage) = ha.usage.lock() {
+                        usage.remove(&name);
+                    }
+                    Value::Simple(reply)
+                }
                 Err(l) => redirect(l),
             }
         }
