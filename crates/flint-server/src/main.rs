@@ -3207,6 +3207,24 @@ fn main() -> std::io::Result<()> {
     // announced itself ready while a second loop was still answering
     // `-LOADING` from the same socket would be a worse signal than the closed
     // port this replaced.
+    //
+    // FLINT_TEST_HOLD_LOADING_MS holds this node in LOADING for that long
+    // before it serves (BUG-0174), so a consumer that mistakes the loading
+    // state for a decided one can be caught DETERMINISTICALLY. The loading
+    // acceptor is still running here, so for the whole hold FLINTINFO keeps
+    // answering `role:loading` and `loading:1` — exactly the window a real
+    // dataset produces on its own and a 200-key drill never does. Without
+    // this, whether that window was hit depended on how fast a runner loaded
+    // 200 keys, which is how `reconcile_cold_start` bailing on it went
+    // unnoticed for six weeks. Test-only, like FLINT_BATCH_COMMIT_FAIL:
+    // unset, it costs one env lookup at startup and nothing else.
+    if let Some(ms) = std::env::var("FLINT_TEST_HOLD_LOADING_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        eprintln!("flint-server holding LOADING for {ms} ms (FLINT_TEST_HOLD_LOADING_MS)");
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+    }
     LOADING.store(false, Ordering::SeqCst);
     let _ = loading_acceptor.join();
     listener.set_nonblocking(false)?;

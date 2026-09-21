@@ -282,6 +282,11 @@ const SEAT_ENV_NAMES: &[&str] = &[
     "FLINT_ROCKS_STATS",
     "FLINT_STATS_DUMP_SEC",
     "FLINT_SUBCOMPACTIONS",
+    // Test-only (BUG-0174): holds a node in LOADING so `cold_start_roles`
+    // exercises the cold-start race every run. Listed because a seat reads
+    // it — omitting it failed `node_env_names_match_the_seat` on the first
+    // gate, and would have made flintctl warn about a real knob.
+    "FLINT_TEST_HOLD_LOADING_MS",
     "FLINT_WRITE_BUFFER_MB",
 ];
 
@@ -4139,26 +4144,70 @@ fn reconcile_cold_start(
     if !was_cold || pair.len() < 2 {
         return;
     }
-    // A member that boots into a full sync is alive and not yet serving, so
-    // give the probe the same budget the rest of `start` gives a seat.
-    let mut roles: Vec<Option<String>> = Vec::new();
-    for _ in 0..40 {
-        roles = pair.iter().map(|a| info_field(a, tls, "role:")).collect();
-        if roles.iter().all(Option::is_some) {
-            break;
+    // WAIT UNTIL EVERY MEMBER IS SERVING, NOT MERELY ANSWERING (BUG-0174).
+    //
+    // This used to poll `role:` and stop as soon as every member returned
+    // SOMETHING. But a node answers FLINTINFO from inside its load (#176)
+    // with `role:loading` and `loading:1`, and `Some("loading")` satisfied
+    // that exit. So a master still loading its dataset read as "no master",
+    // this function gave up, and the pair was left exactly as the comment
+    // above describes: `pair[0]` a replica of NOBODY, `status` healthy, one
+    // copy. The controller could not rescue it — decision-only, it picks
+    // the legitimate master, and there was one. It went unnoticed because
+    // `cold_start_roles` seeds 200 keys, which load before the probe; a real
+    // dataset does not, so production hit this on cold starts of failed-over
+    // pairs that the drill almost never did.
+    //
+    // `wait_pong` is the existing readiness test and keys on `loading:1`,
+    // which the server names as the field every consumer keys on — and it
+    // already reads a pre-#176 node (no such field) as ready, so a rolling
+    // upgrade is unaffected. The budget is `node_ready_budget`: the comment
+    // here always said "the same budget the rest of `start` gives a seat",
+    // while the loop hardcoded 10 s against start's 15 s. Now it is the same.
+    let budget = node_ready_budget(inv);
+    let mut unready: Vec<&String> = Vec::new();
+    for a in pair {
+        if !wait_pong(a, tls, budget) {
+            unready.push(a);
         }
-        std::thread::sleep(Duration::from_millis(250));
     }
+    if !unready.is_empty() {
+        // Not ready inside the budget: the roles are not decided, so neither
+        // is the master, and re-seeding against a guess could wipe the member
+        // holding the newest data. Refuse — but SAY what that leaves.
+        eprintln!(
+            "  WARNING: {} still loading after {}s, so the pair's master cannot be decided and it is NOT being repaired.",
+            unready
+                .iter()
+                .map(|a| a.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+            budget.as_secs()
+        );
+        eprintln!(
+            "           If this pair had failed over, it may now be replicating NOTHING while `status` shows it healthy — check `live_replicas`, and raise `node-ready-s` for a large dataset."
+        );
+        return;
+    }
+    let roles: Vec<Option<String>> = pair.iter().map(|a| info_field(a, tls, "role:")).collect();
     let Some(master) = pair
         .iter()
         .zip(&roles)
         .find(|(_, r)| r.as_deref() == Some("master"))
         .map(|(a, _)| a.clone())
     else {
-        // No master anywhere is a different failure — the controller's to
-        // resolve, and re-seeding blind against no lineage would be worse
-        // than leaving it visible.
-        eprintln!("  pair has no reachable master after cold start — left for the controller");
+        // Every member is serving and none is master: a genuine absence of
+        // lineage, not a load still in progress. Re-seeding blind against no
+        // lineage would be worse than leaving it visible — so leave it, but
+        // make it visible. This used to say "left for the controller", which
+        // was not true: a decision-only controller attaches nobody. It also
+        // does not claim that NOTHING will repair it: an armed ops agent
+        // detects this state from the master's `live_replicas:0` and pages, and
+        // arming `ReattachReplica` would make it repair it. That is another
+        // component's configuration, so this says only what `start` knows.
+        eprintln!(
+            "  WARNING: every member of the pair is serving and none is master after cold start — the pair is NOT replicating, and `start` is not repairing it."
+        );
         return;
     };
     if master == pair[0] {

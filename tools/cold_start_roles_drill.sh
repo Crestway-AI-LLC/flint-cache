@@ -161,7 +161,23 @@ sleep 2
 rm -f $FLINT_DRILL_ROOT/flint-coldrole.verify
 
 echo "== now the real cold start"
-$CTL start > $FLINT_DRILL_ROOT/flint-coldrole.out 2>&1
+# HOLD EVERY NODE IN LOADING FOR 6 s (BUG-0174), so this is the case a real
+# dataset produces rather than the case 200 keys happen to produce.
+#
+# `start` probes the pair's roles immediately after spawning it (a 700 ms
+# pause, then `reconcile_cold_start`), and 200 keys usually finish loading
+# inside that pause — so the master nearly always read `master` and the
+# drill passed 25 runs in a row on main. When it did not (a loaded runner),
+# the master read `role:loading`, the old probe took that as a decided role,
+# found no master, gave up, and left the replica attached to nobody: the two
+# failures on the rc.75 release gate, and BUG-0064's two before them.
+#
+# Holding the load makes that window CERTAIN instead of a function of runner
+# speed. 6 s is long enough that the probe always lands inside it and well
+# inside `node_ready_budget` (15 s), so a correct probe waits it out and a
+# broken one fails every time. The negative control for this lives in
+# BUG-0174: revert the probe and this drill must go red on every run.
+FLINT_TEST_HOLD_LOADING_MS=6000 $CTL start > $FLINT_DRILL_ROOT/flint-coldrole.out 2>&1
 # The sleep gives `start` a moment to get going; it is NOT the readiness
 # check, and on a loaded runner it never was. Same trap one form over: a
 # duration that used to be enough is not an answer from the thing being

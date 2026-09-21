@@ -1,7 +1,10 @@
-# BUG-0064: `cold_start_roles` cannot say whether the replica was loading or absent
+# BUG-0064: `cold_start_roles` cannot say whether the replica was loading or absent (FIXED 2026-09-21)
 
-Status: **OPEN in its original half; the release-blocking half is FIXED
-2026-09-04.** Found 2026-08-27 while confirming BUG-0014 had not fired.
+Status: **FIXED 2026-09-21, both halves.** The release-blocking half was fixed
+2026-09-04; the original half was answered by the instrumented firing it was
+waiting for, on the v0.1.0-rc.75 release gate, and the answer is
+[BUG-0174](0174-reconcile-cold-start-gives-up-while-the-master-is-still-loading.md).
+See the closing section. Found 2026-08-27 while confirming BUG-0014 had not fired.
 
 - FIXED: the verify-after-topology race that reddened the **rc.68 release
   gate** in `decommission` (`f9c194d` waits for what `verify` asserts rather
@@ -1036,3 +1039,28 @@ proportionally less than the first 150 — it is to find what landed between
 08-27 and 09-06 that could plausibly have closed the window, and the honest
 note is that nobody has looked. Until then this is a bug with a bound and no
 mechanism, which is worth less than it looks and more than an empty file.
+
+## Closed 2026-09-21 — the instrumented firing arrived, and it was neither of the two cases
+
+The open half asked which of two faults `cold_start_roles` was seeing, and said
+only the next firing could answer. It fired twice, on the v0.1.0-rc.75 release
+gate, with the instrument in place:
+
+    seat 127.0.0.1:7403: role=replica loading=0 live_replicas=0
+    seat 127.0.0.1:7404: role=master  loading=0 live_replicas=0
+
+**The instrument worked, and it ruled out the benign case**: the replica was
+not still loading. But the dichotomy was framed around the wrong member. The
+replica loaded fine and did not attach because **nothing told it to** — the
+MASTER was still loading when `flintctl start`'s cold-start fixup probed it,
+the probe took `role:loading` for a decided role, found no master, and gave up.
+That is [BUG-0174](0174-reconcile-cold-start-gives-up-while-the-master-is-still-loading.md),
+a product defect, and it is the same lesson this bug names — *a role is decided,
+not merely present* — missed in a third place.
+
+**The deeper complaint here is resolved too.** This bug existed because
+`cold_start_roles` could only fail when a runner happened to load 200 keys
+slowly, so its evidence was a function of machine speed. The drill now holds
+every node in LOADING for 6 s (`FLINT_TEST_HOLD_LOADING_MS`), so the race is
+certain on every run. Measured: with the old probe it fails 3 of 3, with the fix
+it passes 3 of 3, on the EC2 gate box, with only the probe differing.
