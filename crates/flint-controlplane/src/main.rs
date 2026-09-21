@@ -1167,7 +1167,9 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
             // used to clone out for the mirror is published from the applied
             // state instead (ADR-0032 step 4).
             if !st.pairs.iter().any(|p| p.contains(&addr)) {
-                return err("NOPAIR address is not a member of any registered pair");
+                return Value::Error(
+                    "NOPAIR address is not a member of any registered pair".into(),
+                );
             }
             // A LOST ADOPTION RACE ENDS HERE. Two first touches for one pair
             // can both miss the fast mirror above, which is read under a
@@ -1218,7 +1220,9 @@ fn handle(shared: &Shared, args: &[Vec<u8>]) -> Value {
             // used to clone out for the mirror is published from the applied
             // state instead (ADR-0032 step 4).
             if !st.pairs.iter().any(|p| p.contains(&addr)) {
-                return err("NOPAIR address is not a member of any registered pair");
+                return Value::Error(
+                    "NOPAIR address is not a member of any registered pair".into(),
+                );
             }
             // `Fence` resolves the row by CONTAINMENT, matching what CPLEASE
             // reads by. This arm once used member EQUALITY while the renewal
@@ -2132,6 +2136,140 @@ mod lease_row_key_tests {
             "let mut v: Vec<u8> = vec![]; v.sort();".contains(".sort()"),
             "the forbidden pattern cannot match a sort, so its absence proves nothing"
         );
+    }
+
+    /// BUG-0173. `err()` prepends `ERR `, so it is for the `ERR` class of
+    /// replies and nothing else. A message that already starts with its own
+    /// all-caps code — `NOPAIR`, `WRONGPASS`, `SUPERSEDED`, `LEADER` — comes
+    /// out as `-ERR NOPAIR …`, which demotes the code to message text and
+    /// disagrees with `ha.rs`, where the same refusals are written bare.
+    /// That is exactly what happened: both single-node NOPAIR sites said
+    /// `err("NOPAIR …")` while Raft said `Value::Error("NOPAIR …")`, so the
+    /// same condition had two wire spellings depending on topology.
+    ///
+    /// SCOPE IS CHECKED, NOT ASSUMED. Scanning `main.rs` alone is complete
+    /// only while `err()` exists nowhere else — BUG-0150's guard read
+    /// `include_str!("main.rs")` while the literal it forbade sat in another
+    /// file. So this asserts that too.
+    #[test]
+    fn err_is_not_given_a_message_that_carries_its_own_code() {
+        let ha = include_str!("ha.rs");
+        let ha_code = ha.split("#[cfg(test)]").next().unwrap_or(ha);
+        assert!(
+            !ha_code.contains("err(\""),
+            "ha.rs has grown an err() call -- this guard scans main.rs only, \
+             and that is complete only while the helper lives in one file"
+        );
+
+        let whole = include_str!("main.rs");
+        let src = whole.split("#[cfg(test)]").next().unwrap_or(whole);
+        // Comments stripped: a comment quoting `err("NOPAIR …")` to explain
+        // this rule is prose, and a guard that reads its own explanation is
+        // the trap the membership guard above documents at length.
+        let code: String = src
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let offenders = coded_err_calls(&code);
+        assert!(
+            offenders.is_empty(),
+            "err() prepends `ERR `, so these hand a coded error a second \
+             prefix and disagree with ha.rs: {offenders:?}. Return \
+             Value::Error(\"CODE …\".into()) directly instead."
+        );
+
+        // THE CONTROL. Without it this passes for a detector that finds
+        // nothing -- which is the failure class BUG-0146 is a record of.
+        let planted = "return err(\"NOPAIR address is not a member of any pair\");";
+        assert_eq!(
+            coded_err_calls(planted),
+            vec!["NOPAIR".to_string()],
+            "the detector no longer sees the defect it was written for"
+        );
+        // And it must NOT fire on an ordinary lowercase message.
+        assert!(
+            coded_err_calls("return err(\"state lock\");").is_empty(),
+            "the detector fires on ordinary messages -- widened past its rule"
+        );
+    }
+
+    /// The first word of every `err("…")` message whose code is one `ha.rs`
+    /// emits BARE. The code set is derived from the other dispatcher rather
+    /// than guessed from syntax: a first attempt flagged any all-caps first
+    /// word and fired on forty usage messages — `err("CPADDPROXY <addr>")`
+    /// is correct, because `ha.rs` says `ERR CPADDPROXY <addr>` too. The
+    /// defect is only ever a DISAGREEMENT, so only the other path can say
+    /// which codes are bare.
+    fn coded_err_calls(code: &str) -> Vec<String> {
+        coded_err_calls_against(code, &bare_codes_in_ha())
+    }
+
+    /// Codes `ha.rs` writes without an `ERR ` prefix — the authority for
+    /// which words are protocol codes rather than echoed verb names.
+    fn bare_codes_in_ha() -> Vec<String> {
+        let ha = include_str!("ha.rs");
+        let src = ha.split("#[cfg(test)]").next().unwrap_or(ha);
+        let code: String = src
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut out: Vec<String> = Vec::new();
+        for (i, _) in code.match_indices("Value::Error(") {
+            let rest = &code[i + "Value::Error(".len()..];
+            let rest = rest.trim_start();
+            let rest = rest.strip_prefix("format!(").unwrap_or(rest).trim_start();
+            let Some(open) = rest.find('"') else { continue };
+            if rest[..open].trim() != "" {
+                continue;
+            }
+            let Some(close) = rest[open + 1..].find('"') else {
+                continue;
+            };
+            let first = rest[open + 1..open + 1 + close]
+                .split_whitespace()
+                .next()
+                .unwrap_or("");
+            if first != "ERR"
+                && first.len() >= 2
+                && first
+                    .chars()
+                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+                && !out.contains(&first.to_string())
+            {
+                out.push(first.to_string());
+            }
+        }
+        out
+    }
+
+    fn coded_err_calls_against(code: &str, codes: &[String]) -> Vec<String> {
+        let mut out = Vec::new();
+        for (i, _) in code.match_indices("err(") {
+            // `err(` also matches the tail of other identifiers.
+            let before = code[..i].chars().next_back().unwrap_or(' ');
+            if before.is_alphanumeric() || before == '_' {
+                continue;
+            }
+            let rest = &code[i + 4..];
+            let rest = rest.strip_prefix('&').unwrap_or(rest);
+            let rest = rest.strip_prefix("format!(").unwrap_or(rest);
+            let Some(open) = rest.find('"') else { continue };
+            if rest[..open].trim() != "" {
+                continue;
+            }
+            let Some(close) = rest[open + 1..].find('"') else {
+                continue;
+            };
+            let msg = &rest[open + 1..open + 1 + close];
+            let first = msg.split_whitespace().next().unwrap_or("");
+            if codes.iter().any(|c| c == first) {
+                out.push(first.to_string());
+            }
+        }
+        out
     }
 }
 

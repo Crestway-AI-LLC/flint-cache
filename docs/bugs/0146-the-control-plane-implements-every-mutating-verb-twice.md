@@ -6,6 +6,13 @@ was reported green by six unit tests. **The design this file asked for exists:
 ACCEPTED 2026-09-15 (Jeff) — candidate A, single-node runs the same state
 machine, staged so the durable-format change moves on its own.** This stays
 OPEN because the work is not done, not because the decision is outstanding.
+**CORRECTED 2026-09-21: that sentence is stale and outlived its truth.** All
+four ADR-0032 steps are done, and *Where that leaves this file* below says so:
+the stated work is complete and what keeps this open is a suspicion, so
+closing it **is** a record-keeping decision. The stale sentence had a measured
+cost — it was read in isolation on 2026-09-21 and used to tell Jeff the close
+was not his call, contradicting a correct earlier statement. A status block is
+the first thing anybody reads and the last thing anybody updates.
 
 Three more instances landed between the filing and the decision, and they are
 the reason the ADR was taken rather than deferred again:
@@ -221,6 +228,30 @@ question at the same two files:
 3. the refusals (BUG-0160)
 4. the mutation constructions (pass 2)
 5. the side effects beside them (pass 3, BUG-0171)
+6. **the reply vocabulary (pass 4, 2026-09-21,
+   [BUG-0173](0173-only-one-control-plane-has-a-reply-vocabulary.md))** — and
+   it found a live divergence, so the caution above was not a formality.
+
+### The fourth pass (2026-09-21): what each arm SAYS, not what it computes
+
+The three passes before this compared what the arms *do*. None compared what
+they *reply*. `main.rs` has `ok()` and `err()`, one definition each, and
+`err()` prepends `ERR `. **`ha.rs` has neither** — 77 `Value::Error` and 20
+`Value::Simple("OK")` sites written out by hand. The `ERR ` rule is therefore
+automatic on one path and copied on the other, which is this file's whole
+subject.
+
+It had already diverged: both single-node `NOPAIR` sites said
+`err("NOPAIR …")`, giving `-ERR NOPAIR …`, while Raft gave `-NOPAIR …`. Raft
+is right — `NOPAIR` is a code like the `LEADER`/`SUPERSEDED`/`WRONGPASS`
+written bare beside it. Fixed, with a guard whose code set is derived from
+`ha.rs` rather than guessed from syntax, because a first attempt that flagged
+any all-caps first word fired on forty correct usage messages.
+
+**So a fourth question found a fourth class, which is the argument this file
+has been making since its second pass.** What that means for closing it is
+still a record-keeping decision and still Jeff's; the difference is that "no
+further class exists" is now disproven once more rather than merely unproven.
 
 ## The part worth acting on first
 
