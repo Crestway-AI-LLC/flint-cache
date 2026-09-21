@@ -98,7 +98,7 @@ Whether a re-seed is the COMMON failover path or a minority one is not
 established: this soak's other cycles tailed incrementally
 (`tailing incrementally instead of a full re-seed`, epochs 0.5 / 0.7 / 0.8), so
 the distribution is bimodal and its shape is unmeasured. Cycle 3 is one sample.
-That number decides whether the published RTO should quote the re-seed case.
+That number decides whether the published RTO should quote the re-seed case. **2026-09-21: still zero, now across 42 rejoins** — a bound on the rarity rather than the ratio, which for this question may be the more useful answer. See *The soak run* below.
 
 ## The ratio, measured 2026-08-29 — and why it is still not the answer
 
@@ -122,7 +122,7 @@ one interval. This bug is about a SUPERSEDED copy, where snapshots exist and
 every one of them is on the wrong side of the branch point. That case appears
 **zero** times in the collected set.
 
-**2. The collection cannot see the cycles that matter.** In
+**2. The collection cannot see the cycles that matter.** *(FIXED 2026-08-29 by OPS-0082's `collect_failed_cycle`, the same day this was written, and first shown to work on 2026-09-21 — see* The soak run *below: cycle 9 FAILED and still contributed 2 boot decisions and 6 rejoin events. The paragraph stands as the reason the fix was needed.)* In
 `scale-cluster/run.sh` every failure branch ends in `die`, and
 `collect_boot_decisions` / `collect_rejoin_events` are called after them, on the
 path where a cycle "already earned its verdict". So a cycle that FAILS never
@@ -528,3 +528,87 @@ This removes the cause of the observed 94.2 s outage. It does not answer whether
 a re-seeding replica should hold the write path shut at all — the Flint KV
 session's accept-but-don't-count design, recorded above, is the input for that
 and it is a separate change.
+
+## The soak run, 2026-09-21 — 9 more rejoins, and still no re-seed of this kind
+
+Approved by Jeff to answer the question above: *is a re-seed the common
+failover path or a minority one?* `scale-cluster/run.sh --pairs 1
+--soak-mins 240`, 5 × `i4i.large`, 20 GB rolling window, one kill every 12
+minutes.
+
+**The cadence was left at the default 12 minutes on purpose.** A shorter
+interval buys more samples per hour and would have biased the answer: the
+interval decides how far behind the rejoining node is, which is what decides
+incremental-tail against full re-seed. It would also have made the new data
+incomparable with the 33 decisions already collected. Twenty comparable
+samples beat forty biased ones.
+
+**It ran 9 cycles and died on the ninth**, then tore itself down — teardown
+`VERIFIED` by the harness and confirmed independently with
+`describe-instances`. ~2.2 h and about **$1.90**, against a 4.75 h / $4.10
+estimate, because it stopped early.
+
+### The measurement
+
+| | this run | pooled with the earlier 33 |
+|---|---|---|
+| rejoins observed | 9 | 42 |
+| tailed incrementally | **9** | 37 |
+| full re-seed, COLD START (no snapshot dir) | 0 | 5 |
+| **full re-seed, superseded copy — this bug's case** | **0** | **0** |
+
+Every one of the nine rewound to a snapshot that cleared the fence and tailed.
+Cycle 9 — the one that failed — did too: `seq 95310617 <= fence 95310617`,
+epoch `(0,19)`.
+
+**So the case this bug is about has now gone unobserved across 42 rejoins.**
+That is not the ratio the Open section asked for; it is a bound on the
+rarity, and for the question that ratio was meant to decide — *should the
+published RTO quote the re-seed case?* — a bound may be the more useful
+answer. It is still not a measurement of a distribution, and this file should
+not start describing it as one.
+
+### Why cycle 9 failed, which is NOT established
+
+`flint-chaos` panicked:
+
+> iter 1: edge served fewer than 50 writes in 10000ms x2 after the kill
+> (0 since) — the proxy never recovered, OR this run never reached it
+
+Zero writes through the edge for twenty-odd seconds after a kill is **the
+right shape for this bug** — writes held shut on rejoin is what it is about —
+and that is exactly why a shape is not enough. The panic text is disjunctive,
+and the harness's own failover-timeline diagnostic says the captured slice is
+*"consistent BOTH with a pre-kill panic AND with a kill whose summary line
+never printed"*. The run's own stdout shows the panic and does not separate
+them either. **Recorded as unexplained, not as an instance.**
+
+It is also worth stating plainly that the rejoin on that cycle **tailed
+incrementally**, so whatever held the edge shut, it was not the 94.2 s
+re-seed this bug measured.
+
+### What the run did settle about the instrument
+
+The Open section above says the collection *"cannot see the cycles that
+matter"*, because every failure branch ends in `die` before
+`collect_boot_decisions` runs — and a re-seed that holds writes shut is
+exactly a cycle that fails. **That was fixed on 2026-08-29 by OPS-0082**
+(`collect_failed_cycle`), the same day the sentence was written, and this run
+is the first evidence it works: cycle 9 **failed**, and contributed 2 boot
+decisions and 6 rejoin events. The blind spot is closed, so the 42 above
+include the failing cycle rather than excluding it.
+
+### A correction to the first count taken from this run
+
+The first pass over the boot-decision log reported **"full re-seed: 9"**. It
+was wrong, and wrong in the way this repository keeps rediscovering: the
+decision line reads
+
+    rewound to …: tailing incrementally instead of a full re-seed
+
+so both phrases sit on one line, and `grep -c` for each counted the same nine
+lines twice — once under the decision and once under its negation. **A phrase
+that only ever appears inside its own negation cannot be counted by matching
+it.** The number that stands came from taking the text after the final colon,
+with a control: *show every line that is not "tailing incrementally"*, which
+returns nothing.
