@@ -287,6 +287,10 @@ const SEAT_ENV_NAMES: &[&str] = &[
     // it — omitting it failed `node_env_names_match_the_seat` on the first
     // gate, and would have made flintctl warn about a real knob.
     "FLINT_TEST_HOLD_LOADING_MS",
+    // Test-only (BUG-0175): holds a master's FLINTSYNC-OK past the replica's
+    // 500 ms heartbeat, so `rewind_ack_space` exercises the pre-accept path
+    // every run. Listed for the same reason as the knob above.
+    "FLINT_TEST_DELAY_SYNC_OK_MS",
     "FLINT_WRITE_BUFFER_MB",
 ];
 

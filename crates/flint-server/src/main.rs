@@ -1308,6 +1308,15 @@ static WRITES_SHED_LAG: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 static WRITES_SHED_QUORUM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static WRITES_SHED_WIDOWED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static WRITES_SHED_HEADROOM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// ACKs a replica sent BELOW the cursor this master served it, ignored rather
+/// than recorded (BUG-0175). A healthy replica never sends one: it acks its
+/// applied position, which starts at the served cursor. Nonzero means a
+/// replica acked in a sequence space this node does not use -- the rewound
+/// copy's pre-adoption cursor, from a build before the replica-side fix -- and
+/// recorded, that one number read as the whole space offset of lag and fed
+/// the WAL-headroom shed gate. Rocks-only, like both of its uses.
+#[cfg(feature = "rocks")]
+static ACKS_BELOW_CURSOR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// DELAYED, not refused — the soft band's sleep. Counted apart from the shed
 /// because the two say opposite things about the same node: a run that is all
 /// delay is backpressure doing its job, while one that jumps straight to shed
@@ -6001,7 +6010,7 @@ fn flintinfo(
     let compaction = rocks.as_ref().and_then(|kv| kv.compaction_pressure());
     let mem_sample = flint_storage::mem::sample();
     let info = format!(
-        "role:{}\r\nloading:0\r\nrole_epoch:{role_epoch}\r\nbuild:{build}\r\nsst_bytes:{sst}\r\nlatest_seq:{latest}\r\nlast_applied:{last_applied}\r\n{msa}wal_headroom_seq:{whs}\r\nwal_min_acked_seq:{wma}\r\nwal_headroom_shed_seq:{whl}\r\nwal_bytes_per_seq:{wbps}\r\nwal_archive_mb:{wamb}\r\nwal_archive_src:{wasrc}\r\nlive_replicas:{}\r\n{mlag}lag_ms_max:{lmx}\r\nlag_max_gap:{lmg}\r\nlag_soft_ms:{soft}\r\nlag_hard_ms:{hard}\r\nmin_replicas_to_write:{minr}\r\nwidowed_grace_ms:{wgm}\r\nwidowed_shed:{wsh}\r\nfullsync_active:{fsa}\r\nfullsync_max:{fsm}\r\nasync_write_queue:{aqd}\r\nwrite_deadline_ms:{wdm}\r\nwrite_inflight:{wif}\r\nwrite_service_us:{wsu}\r\nwrite_cost_us:{wcu}\r\nwrite_wait_est_ms:{wwe}\r\nwrite_wait_peak_ms:{wwp}\r\nwrite_wait_peak_inflight:{wwpi}\r\nwrite_wait_peak_cost_us:{wwps}\r\nwrites_shed_deadline:{wsd}\r\nwrites_shed_lag:{wsl}\r\nwrites_shed_quorum:{wsq}\r\nwrites_shed_widowed:{wswd}\r\nwrites_shed_headroom:{wshr}\r\nwrites_delayed_soft:{wdsf}\r\nwal_fsync_ms:{wfm}\r\nwal_fsync_total:{wft}\r\ncert_days_remaining:{cdr}\r\nactive_conns:{ac}\r\nmax_conns:{mc}\r\nconns_shed_total:{cs}\r\nwrite_stopped:{wst}\r\ndelayed_write_rate:{dwr}\r\nwrite_stall_readable:{wsr}\r\nl0_files:{l0f}\r\npending_compaction_bytes:{pcb}\r\ncompaction_readable:{cr}\r\ndisk_free_bytes:{dfb}\r\ndisk_total_bytes:{dtb}\r\ndisk_free_pct:{dfp}\r\ndisk_verdict:{dv}\r\ndisk_unknown_samples:{dus}\r\nmem_avail_bytes:{mab}\r\nmem_total_bytes:{mtb}\r\nmem_avail_pct:{map}\r\nmem_src:{msrc}\r\nevictable_ns:{ens}\r\nevictable_ns_agree:{ensa}\r\nevictable_ns_bytes:{ensb}\r\nreclaim_active:{rca}\r\nreclaim_target_free_bytes:{rctf}\r\nevict:{evm}\r\ncollection_read_budget_pct:{crbp}\r\ncollection_read_in_flight_bytes:{crif}\r\ncollection_read_mode:{crm}\r\ncollection_read_refused:{crr}\r\ncollection_read_would_refuse:{crwr}\r\ncollection_read_unmeasured:{cru}\r\ngc_swept_expired:{gse}\r\ngc_swept_orphans:{gso}\r\nuptime_ms:{upms}\r\n{lrs}",
+        "role:{}\r\nloading:0\r\nrole_epoch:{role_epoch}\r\nbuild:{build}\r\nsst_bytes:{sst}\r\nlatest_seq:{latest}\r\nlast_applied:{last_applied}\r\n{msa}wal_headroom_seq:{whs}\r\nwal_min_acked_seq:{wma}\r\nwal_headroom_shed_seq:{whl}\r\nwal_bytes_per_seq:{wbps}\r\nwal_archive_mb:{wamb}\r\nwal_archive_src:{wasrc}\r\nlive_replicas:{}\r\n{mlag}lag_ms_max:{lmx}\r\nlag_max_gap:{lmg}\r\nlag_soft_ms:{soft}\r\nlag_hard_ms:{hard}\r\nmin_replicas_to_write:{minr}\r\nwidowed_grace_ms:{wgm}\r\nwidowed_shed:{wsh}\r\nfullsync_active:{fsa}\r\nfullsync_max:{fsm}\r\nasync_write_queue:{aqd}\r\nwrite_deadline_ms:{wdm}\r\nwrite_inflight:{wif}\r\nwrite_service_us:{wsu}\r\nwrite_cost_us:{wcu}\r\nwrite_wait_est_ms:{wwe}\r\nwrite_wait_peak_ms:{wwp}\r\nwrite_wait_peak_inflight:{wwpi}\r\nwrite_wait_peak_cost_us:{wwps}\r\nwrites_shed_deadline:{wsd}\r\nwrites_shed_lag:{wsl}\r\nwrites_shed_quorum:{wsq}\r\nwrites_shed_widowed:{wswd}\r\nwrites_shed_headroom:{wshr}\r\nacks_below_cursor:{abc}\r\nwrites_delayed_soft:{wdsf}\r\nwal_fsync_ms:{wfm}\r\nwal_fsync_total:{wft}\r\ncert_days_remaining:{cdr}\r\nactive_conns:{ac}\r\nmax_conns:{mc}\r\nconns_shed_total:{cs}\r\nwrite_stopped:{wst}\r\ndelayed_write_rate:{dwr}\r\nwrite_stall_readable:{wsr}\r\nl0_files:{l0f}\r\npending_compaction_bytes:{pcb}\r\ncompaction_readable:{cr}\r\ndisk_free_bytes:{dfb}\r\ndisk_total_bytes:{dtb}\r\ndisk_free_pct:{dfp}\r\ndisk_verdict:{dv}\r\ndisk_unknown_samples:{dus}\r\nmem_avail_bytes:{mab}\r\nmem_total_bytes:{mtb}\r\nmem_avail_pct:{map}\r\nmem_src:{msrc}\r\nevictable_ns:{ens}\r\nevictable_ns_agree:{ensa}\r\nevictable_ns_bytes:{ensb}\r\nreclaim_active:{rca}\r\nreclaim_target_free_bytes:{rctf}\r\nevict:{evm}\r\ncollection_read_budget_pct:{crbp}\r\ncollection_read_in_flight_bytes:{crif}\r\ncollection_read_mode:{crm}\r\ncollection_read_refused:{crr}\r\ncollection_read_would_refuse:{crwr}\r\ncollection_read_unmeasured:{cru}\r\ngc_swept_expired:{gse}\r\ngc_swept_orphans:{gso}\r\nuptime_ms:{upms}\r\n{lrs}",
         if read_only { "replica" } else { "master" },
         hub.live_replica_count(now),
         soft = hub.lag_soft_ms(),
@@ -6079,6 +6088,7 @@ fn flintinfo(
         wsq = WRITES_SHED_QUORUM.load(Ordering::Relaxed),
         wswd = WRITES_SHED_WIDOWED.load(Ordering::Relaxed),
         wshr = WRITES_SHED_HEADROOM.load(Ordering::Relaxed),
+        abc = ACKS_BELOW_CURSOR.load(Ordering::Relaxed),
         wdsf = WRITES_DELAYED_SOFT.load(Ordering::Relaxed),
         lmx = LAG_MS_MAX.load(Ordering::Relaxed),
         lmg = LAG_MAX_GAP.load(Ordering::Relaxed),
@@ -6274,6 +6284,7 @@ fn drain_acks(
     ack_buf: &mut Vec<u8>,
     hub: &Arc<ReplHub>,
     replica_id: u64,
+    served_from: u64,
 ) -> std::io::Result<bool> {
     let mut chunk = [0u8; 4096];
     loop {
@@ -6283,9 +6294,23 @@ fn drain_acks(
                 if let Value::Array(Some(items)) = frame
                     && let [Value::Bulk(Some(tag)), Value::Bulk(Some(raw))] = items.as_slice()
                     && tag.eq_ignore_ascii_case(b"ACK")
-                    && let Some(seq) = std::str::from_utf8(raw).ok().and_then(|s| s.parse().ok())
+                    && let Some(seq) = std::str::from_utf8(raw)
+                        .ok()
+                        .and_then(|s| s.parse::<u64>().ok())
                 {
-                    hub.record_ack(replica_id, seq, flint_storage::strings::system_clock());
+                    // BUG-0175: an ack below the cursor we served is in the
+                    // OTHER sequence space -- a rewound replica's pre-adoption
+                    // cursor. Recorded, it is the replica's first ack, so
+                    // `seq_lag` and the WAL-headroom shed gate read the whole
+                    // space offset as lag until the next one (3,041,753 on the
+                    // playground at rc.76; up to 21,384,102 before). A
+                    // replica acks its applied position, which starts AT the
+                    // served cursor, so nothing legitimate is ever below it.
+                    if seq < served_from {
+                        ACKS_BELOW_CURSOR.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        hub.record_ack(replica_id, seq, flint_storage::strings::system_clock());
+                    }
                 }
             }
             // drain_read, NOT read: the plain read on a TLS stream flushes
@@ -6448,6 +6473,17 @@ fn flintsync(
         );
         return stream.write_all(&out);
     }
+    // FLINT_TEST_DELAY_SYNC_OK_MS holds the accept past the replica's 500 ms
+    // heartbeat, so a drill can make BUG-0175's second path -- a heartbeat
+    // sent before the OK is read -- certain instead of a matter of how long
+    // the translation and retention probe above take on this disk. Unset in
+    // production: nothing ships with it and absent means no delay.
+    if let Some(ms) = std::env::var("FLINT_TEST_DELAY_SYNC_OK_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+    }
     let mut out = Vec::new();
     // The OK carries this node's role epoch so an accepted lower-epoch
     // replica can ADOPT it durably: its next reconnect then presents the
@@ -6470,6 +6506,9 @@ fn flintsync(
     let mut idle = false;
     let mut last_keepalive = std::time::Instant::now();
     eprintln!("replica connected, streaming from seq {cursor}");
+    // The floor drain_acks holds acks to. `cursor` itself advances as batches
+    // are served, so the value it had here is kept apart (BUG-0175).
+    let served_from = cursor;
     let replica_id = hub.register_replica();
     let mut ack_buf: Vec<u8> = Vec::new();
     let result: std::io::Result<()> = (|| {
@@ -6479,7 +6518,7 @@ fn flintsync(
             } else {
                 1
             })))?;
-            if !drain_acks(&mut stream, &mut ack_buf, hub, replica_id)? {
+            if !drain_acks(&mut stream, &mut ack_buf, hub, replica_id, served_from)? {
                 return Ok(());
             }
             hub.record_sample(kv.latest_seq(), flint_storage::strings::system_clock());
@@ -6536,7 +6575,13 @@ fn flintsync(
                                 if e.kind() == std::io::ErrorKind::WouldBlock
                                     || e.kind() == std::io::ErrorKind::TimedOut =>
                             {
-                                if !drain_acks(&mut stream, &mut ack_buf, hub, replica_id)? {
+                                if !drain_acks(
+                                    &mut stream,
+                                    &mut ack_buf,
+                                    hub,
+                                    replica_id,
+                                    served_from,
+                                )? {
                                     return Ok(());
                                 }
                             }
@@ -7066,6 +7111,13 @@ mod replica {
         // after applied batches would make a healthy idle pair look dead
         // after the liveness window.
         let mut last_ack_sent = std::time::Instant::now();
+        // BUG-0175: no ACK until the master has ACCEPTED us. Until the
+        // FLINTSYNC-OK is read, `kv.last_applied()` is the cursor we asked
+        // with -- on a rewind, a number in the OLD master's sequence space --
+        // and the heartbeat below fires on a clock, not on the handshake. A
+        // translation plus retention probe slower than 500 ms put that number
+        // on the wire first.
+        let mut accepted = false;
         // Applied but not yet told to the master. One ACK per WAL batch meant
         // a 30-byte write() per batch — 3626 of them per shipped cycle — and
         // the master spent 21ms of every 80ms cycle BLOCKED in read() draining
@@ -7090,7 +7142,7 @@ mod replica {
         // check that skips when an ACK was recently sent.
         let mut pending_ack: Option<u64> = None;
         loop {
-            if last_ack_sent.elapsed() >= std::time::Duration::from_millis(500) {
+            if accepted && last_ack_sent.elapsed() >= std::time::Duration::from_millis(500) {
                 out.clear();
                 encode(
                     &Value::Array(Some(vec![
@@ -7166,11 +7218,20 @@ mod replica {
                                     );
                                 }
                             }
+                            // BUG-0175: ack where we ARE, in the master's space.
+                            // This sent `cursor` -- the number we asked with,
+                            // captured before the handshake -- which on a
+                            // rewind attach is in the OLD master's space, and
+                            // it was the first ack the master recorded for
+                            // this connection. After the adoption above,
+                            // `last_applied` is the translated cursor; on a
+                            // keepalive it is also fresher than `cursor`.
+                            accepted = true;
                             out.clear();
                             encode(
                                 &Value::Array(Some(vec![
                                     Value::Bulk(Some(b"ACK".to_vec())),
-                                    Value::Bulk(Some(cursor.to_string().into_bytes())),
+                                    Value::Bulk(Some(kv.last_applied().to_string().into_bytes())),
                                 ])),
                                 &mut out,
                             );

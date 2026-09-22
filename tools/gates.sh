@@ -231,7 +231,7 @@ CORE="${FLINT_CORE_ORDER:-kill_order bind_dial_sites seat_names restart repl kil
       proxy_cache proxy_tls read_under_stall replica_reads replica_stale_fence rw_isolation
       scan slot_cutover slot_cutover_recovery slot_moved snapshot_restore
       tenant tenant_rebalance tenant_remove token_hash
-      write_deadline fullsync_rate edge_reroute rewind_rejoin wal_headroom wal_budget evictable_ns evictable_agree min_replicas_survivable roll_shed proxy_chain
+      write_deadline fullsync_rate edge_reroute rewind_rejoin rewind_ack_space wal_headroom wal_budget evictable_ns evictable_agree min_replicas_survivable roll_shed proxy_chain
       walgap_quarantine three_member_repoint pipeline_nodelay batch_commit_failure build_read_failure cp_watch_idle reattach_node induced_ratchet collection_admission wal_window flintinfo_numeric host_verbs start_first_member_down verify_controller}"
 CHAOS="chaos proxy_chaos chaos_unreadable hotkey_chaos"
 
