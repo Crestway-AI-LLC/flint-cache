@@ -62,7 +62,9 @@ trap cleanup EXIT
 # name, a verdict word, a list, or a pair -- none of them is a quantity, and
 # none can be plotted. Adding to this list must be a decision: it is the only
 # way to make this check ignore a field.
-STRINGS="role role_epoch build wal_archive_src disk_verdict mem_src \
+# `replica_of` (OPS-0313) is an address, or `-` on a master and on a replica
+# that follows nothing.
+STRINGS="role role_epoch replica_of build wal_archive_src disk_verdict mem_src \
 evictable_ns evictable_ns_bytes evict collection_read_mode"
 
 cargo build --release -q -p flint-server --features rocks || fail "build"

@@ -1020,6 +1020,33 @@ struct ReplicaLink {
 #[cfg_attr(not(feature = "rocks"), allow(dead_code))]
 static REPLICA_LINK: std::sync::OnceLock<Arc<ReplicaLink>> = std::sync::OnceLock::new();
 
+/// FLINTINFO's `replica_of:` line: the address this replica's tail follows,
+/// or `-` when it follows nothing (OPS-0313).
+///
+/// WHY IT IS PUBLISHED. A replica with `live_replicas:0` on its master reads
+/// the same from outside whether it is reconnecting (it will heal by itself
+/// in about a second) or was started with no master at all -- BUG-0174's
+/// "replica of nobody", which never heals. The ops agent used to tell them
+/// apart with a timer. This line lets it tell them apart by asking: a replica
+/// that follows this pair's master is reconnecting, and one that follows
+/// nobody, or another node, needs a warm re-attach.
+///
+/// THE LIVE VALUE, not `--replica-of`: FLINTFOLLOW re-points the link at
+/// runtime (BUG-0076), and a field that kept reporting the startup address
+/// would say "reconnecting to the right master" about a replica following the
+/// wrong one. A MASTER reports `-` whatever link it once had, because it
+/// follows nothing now.
+#[cfg_attr(not(feature = "rocks"), allow(dead_code))]
+fn replica_of_line(read_only: bool, link: Option<&ReplicaLink>) -> String {
+    let target = if read_only {
+        link.and_then(|l| l.target.lock().ok().map(|t| t.trim().to_string()))
+            .filter(|t| !t.is_empty())
+    } else {
+        None
+    };
+    format!("replica_of:{}\r\n", target.as_deref().unwrap_or("-"))
+}
+
 /// The WAL archive budget this node opened with, in MB.
 ///
 /// Written where the engine is opened and read where the shed gate is
@@ -6009,8 +6036,9 @@ fn flintinfo(
     let write_stall = rocks.as_ref().and_then(|kv| kv.write_stall());
     let compaction = rocks.as_ref().and_then(|kv| kv.compaction_pressure());
     let mem_sample = flint_storage::mem::sample();
+    let rof = replica_of_line(read_only, REPLICA_LINK.get().map(|l| l.as_ref()));
     let info = format!(
-        "role:{}\r\nloading:0\r\nrole_epoch:{role_epoch}\r\nbuild:{build}\r\nsst_bytes:{sst}\r\nlatest_seq:{latest}\r\nlast_applied:{last_applied}\r\n{msa}wal_headroom_seq:{whs}\r\nwal_min_acked_seq:{wma}\r\nwal_headroom_shed_seq:{whl}\r\nwal_bytes_per_seq:{wbps}\r\nwal_archive_mb:{wamb}\r\nwal_archive_src:{wasrc}\r\nlive_replicas:{}\r\n{mlag}lag_ms_max:{lmx}\r\nlag_max_gap:{lmg}\r\nlag_soft_ms:{soft}\r\nlag_hard_ms:{hard}\r\nmin_replicas_to_write:{minr}\r\nwidowed_grace_ms:{wgm}\r\nwidowed_shed:{wsh}\r\nfullsync_active:{fsa}\r\nfullsync_max:{fsm}\r\nasync_write_queue:{aqd}\r\nwrite_deadline_ms:{wdm}\r\nwrite_inflight:{wif}\r\nwrite_service_us:{wsu}\r\nwrite_cost_us:{wcu}\r\nwrite_wait_est_ms:{wwe}\r\nwrite_wait_peak_ms:{wwp}\r\nwrite_wait_peak_inflight:{wwpi}\r\nwrite_wait_peak_cost_us:{wwps}\r\nwrites_shed_deadline:{wsd}\r\nwrites_shed_lag:{wsl}\r\nwrites_shed_quorum:{wsq}\r\nwrites_shed_widowed:{wswd}\r\nwrites_shed_headroom:{wshr}\r\nacks_below_cursor:{abc}\r\nwrites_delayed_soft:{wdsf}\r\nwal_fsync_ms:{wfm}\r\nwal_fsync_total:{wft}\r\ncert_days_remaining:{cdr}\r\nactive_conns:{ac}\r\nmax_conns:{mc}\r\nconns_shed_total:{cs}\r\nwrite_stopped:{wst}\r\ndelayed_write_rate:{dwr}\r\nwrite_stall_readable:{wsr}\r\nl0_files:{l0f}\r\npending_compaction_bytes:{pcb}\r\ncompaction_readable:{cr}\r\ndisk_free_bytes:{dfb}\r\ndisk_total_bytes:{dtb}\r\ndisk_free_pct:{dfp}\r\ndisk_verdict:{dv}\r\ndisk_unknown_samples:{dus}\r\nmem_avail_bytes:{mab}\r\nmem_total_bytes:{mtb}\r\nmem_avail_pct:{map}\r\nmem_src:{msrc}\r\nevictable_ns:{ens}\r\nevictable_ns_agree:{ensa}\r\nevictable_ns_bytes:{ensb}\r\nreclaim_active:{rca}\r\nreclaim_target_free_bytes:{rctf}\r\nevict:{evm}\r\ncollection_read_budget_pct:{crbp}\r\ncollection_read_in_flight_bytes:{crif}\r\ncollection_read_mode:{crm}\r\ncollection_read_refused:{crr}\r\ncollection_read_would_refuse:{crwr}\r\ncollection_read_unmeasured:{cru}\r\ngc_swept_expired:{gse}\r\ngc_swept_orphans:{gso}\r\nuptime_ms:{upms}\r\n{lrs}",
+        "role:{}\r\nloading:0\r\nrole_epoch:{role_epoch}\r\n{rof}build:{build}\r\nsst_bytes:{sst}\r\nlatest_seq:{latest}\r\nlast_applied:{last_applied}\r\n{msa}wal_headroom_seq:{whs}\r\nwal_min_acked_seq:{wma}\r\nwal_headroom_shed_seq:{whl}\r\nwal_bytes_per_seq:{wbps}\r\nwal_archive_mb:{wamb}\r\nwal_archive_src:{wasrc}\r\nlive_replicas:{}\r\n{mlag}lag_ms_max:{lmx}\r\nlag_max_gap:{lmg}\r\nlag_soft_ms:{soft}\r\nlag_hard_ms:{hard}\r\nmin_replicas_to_write:{minr}\r\nwidowed_grace_ms:{wgm}\r\nwidowed_shed:{wsh}\r\nfullsync_active:{fsa}\r\nfullsync_max:{fsm}\r\nasync_write_queue:{aqd}\r\nwrite_deadline_ms:{wdm}\r\nwrite_inflight:{wif}\r\nwrite_service_us:{wsu}\r\nwrite_cost_us:{wcu}\r\nwrite_wait_est_ms:{wwe}\r\nwrite_wait_peak_ms:{wwp}\r\nwrite_wait_peak_inflight:{wwpi}\r\nwrite_wait_peak_cost_us:{wwps}\r\nwrites_shed_deadline:{wsd}\r\nwrites_shed_lag:{wsl}\r\nwrites_shed_quorum:{wsq}\r\nwrites_shed_widowed:{wswd}\r\nwrites_shed_headroom:{wshr}\r\nacks_below_cursor:{abc}\r\nwrites_delayed_soft:{wdsf}\r\nwal_fsync_ms:{wfm}\r\nwal_fsync_total:{wft}\r\ncert_days_remaining:{cdr}\r\nactive_conns:{ac}\r\nmax_conns:{mc}\r\nconns_shed_total:{cs}\r\nwrite_stopped:{wst}\r\ndelayed_write_rate:{dwr}\r\nwrite_stall_readable:{wsr}\r\nl0_files:{l0f}\r\npending_compaction_bytes:{pcb}\r\ncompaction_readable:{cr}\r\ndisk_free_bytes:{dfb}\r\ndisk_total_bytes:{dtb}\r\ndisk_free_pct:{dfp}\r\ndisk_verdict:{dv}\r\ndisk_unknown_samples:{dus}\r\nmem_avail_bytes:{mab}\r\nmem_total_bytes:{mtb}\r\nmem_avail_pct:{map}\r\nmem_src:{msrc}\r\nevictable_ns:{ens}\r\nevictable_ns_agree:{ensa}\r\nevictable_ns_bytes:{ensb}\r\nreclaim_active:{rca}\r\nreclaim_target_free_bytes:{rctf}\r\nevict:{evm}\r\ncollection_read_budget_pct:{crbp}\r\ncollection_read_in_flight_bytes:{crif}\r\ncollection_read_mode:{crm}\r\ncollection_read_refused:{crr}\r\ncollection_read_would_refuse:{crwr}\r\ncollection_read_unmeasured:{cru}\r\ngc_swept_expired:{gse}\r\ngc_swept_orphans:{gso}\r\nuptime_ms:{upms}\r\n{lrs}",
         if read_only { "replica" } else { "master" },
         hub.live_replica_count(now),
         soft = hub.lag_soft_ms(),
@@ -7390,6 +7418,59 @@ mod replica {
 /// The packing module up there only escapes because it is written
 /// `#[cfg(all(test, feature = "rocks"))]`, which does not match the needle --
 /// an accident, not a design.
+#[cfg(test)]
+mod replica_of_tests {
+    use super::{ReplicaLink, replica_of_line};
+    use std::sync::atomic::AtomicBool;
+
+    fn link(target: &str) -> ReplicaLink {
+        ReplicaLink {
+            target: std::sync::Mutex::new(target.to_string()),
+            repoint: AtomicBool::new(false),
+        }
+    }
+
+    /// A replica reports the address its tail follows, which is what tells a
+    /// reconnecting replica from one that cannot heal (OPS-0313).
+    #[test]
+    fn a_replica_reports_the_master_its_tail_follows() {
+        let l = link("10.0.0.5:7001");
+        assert_eq!(
+            replica_of_line(true, Some(&l)),
+            "replica_of:10.0.0.5:7001\r\n"
+        );
+    }
+
+    /// FLINTFOLLOW writes the target, and the line must follow it: the
+    /// startup address is not the answer after a re-point.
+    #[test]
+    fn a_re_point_changes_what_it_reports() {
+        let l = link("10.0.0.5:7001");
+        *l.target.lock().expect("target lock") = "10.0.0.6:7001".to_string();
+        assert_eq!(
+            replica_of_line(true, Some(&l)),
+            "replica_of:10.0.0.6:7001\r\n"
+        );
+    }
+
+    /// BUG-0174's replica of nobody: no link at all. `-`, never empty, so a
+    /// reader can tell "follows nothing" from "field absent" (an older build).
+    #[test]
+    fn a_replica_with_no_link_follows_nobody() {
+        assert_eq!(replica_of_line(true, None), "replica_of:-\r\n");
+        assert_eq!(replica_of_line(true, Some(&link(""))), "replica_of:-\r\n");
+    }
+
+    /// A promoted node keeps the link it started with; it follows nothing now.
+    #[test]
+    fn a_master_follows_nobody_whatever_link_it_once_had() {
+        assert_eq!(
+            replica_of_line(false, Some(&link("10.0.0.5:7001"))),
+            "replica_of:-\r\n"
+        );
+    }
+}
+
 #[cfg(test)]
 mod write_projection_tests {
     use super::{marginal_cost_us, projected_wait_ms};

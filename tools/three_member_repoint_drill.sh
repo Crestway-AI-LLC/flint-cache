@@ -59,6 +59,10 @@ $CTL -f "$INV" bootstrap >"$D-boot.log" 2>&1 || {
   echo "FAIL: bootstrap"; tail -25 "$D-boot.log"; exit 1; }
 
 master_of() { $CTL -f "$INV" status 2>/dev/null | awk '/ master /{print $3; exit}'; }
+# OPS-0313: FLINTINFO's `replica_of:`, what a member's tail follows NOW.
+C="$D/state/certs"
+rof() { valkey-cli -p "${1##*:}" --tls --cacert "$C/ca.crt" --cert "$C/int.crt" --key "$C/int.key" FLINTINFO 2>/dev/null | tr -d '\r' | sed -n 's/^replica_of://p'; }
+MEMBERS="127.0.0.1:7466 127.0.0.1:7467 127.0.0.1:7468"
 live_of()   { $CTL -f "$INV" status 2>/dev/null | awk -v a="$1" '$3==a{for(i=1;i<=NF;i++) if($i=="live_replicas") print $(i+1)}'; }
 
 # The fixture itself must be a three-member pair with both replicas streaming,
@@ -68,6 +72,13 @@ for _ in $(seq 1 60); do [ "$(live_of "$M0")" = 2 ] && break; sleep 0.5; done
 [ "$(live_of "$M0")" = 2 ] \
   || { echo "FAIL: fixture — $M0 never had 2 live replicas (got '$(live_of "$M0")')"; exit 1; }
 echo "  fixture OK: master $M0 with 2 live replicas"
+# OPS-0313, BEFORE: the master follows nobody, and each replica follows it.
+[ "$(rof "$M0")" = "-" ] || { echo "FAIL: master $M0 reports replica_of '$(rof "$M0")', want '-'"; exit 1; }
+for m in $MEMBERS; do
+  [ "$m" = "$M0" ] && continue
+  [ "$(rof "$m")" = "$M0" ] || { echo "FAIL: replica $m reports replica_of '$(rof "$m")', want $M0"; exit 1; }
+done
+echo "  replica_of: master '-', both replicas $M0"
 
 echo "== kill the master; the controller promotes ONE survivor, leaving one untouched"
 $CTL -f "$INV" kill-node "$M0" >/dev/null 2>&1 || { echo "FAIL: kill-node"; exit 1; }
@@ -85,6 +96,15 @@ if [ "$OK" != 1 ]; then
   exit 1
 fi
 echo "  PASS: the untouched survivor re-pointed at $M1 without a restart"
+# OPS-0313, AFTER: the field reports the LIVE target. FLINTFOLLOW moved the
+# survivor's link with no restart, so a field that kept --replica-of would
+# still say $M0 here -- "reconnecting to the right master" about a replica
+# whose master is dead.
+S=""; for m in $MEMBERS; do [ "$m" != "$M0" ] && [ "$m" != "$M1" ] && S=$m; done
+[ -n "$S" ] || { echo "FAIL: could not name the untouched survivor"; exit 1; }
+[ "$(rof "$S")" = "$M1" ] || { echo "FAIL: survivor $S reports replica_of '$(rof "$S")' after the re-point, want $M1"; exit 1; }
+[ "$(rof "$M1")" = "-" ] || { echo "FAIL: promoted $M1 reports replica_of '$(rof "$M1")', want '-' (a master follows nobody)"; exit 1; }
+echo "  replica_of: survivor $S now $M1 (FLINTFOLLOW, no restart); promoted $M1 '-'"
 
 # And the pair returns to full strength once the dead seat comes back.
 $CTL -f "$INV" restart-node "$M0" >/dev/null 2>&1 || { echo "FAIL: restart-node"; exit 1; }
