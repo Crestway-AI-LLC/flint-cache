@@ -13,7 +13,7 @@
 # answer. `tools/gates.sh` before tagging; the checklist stays as the
 # explanation of why each step exists.
 #
-# Usage: tools/gates.sh [stage ...]     (default: every stage but msrv)
+# Usage: tools/gates.sh [stage ...]     (default: every stage but the opt-in msrv and docs)
 #   check        fmt + clippy + tests, both feature configs
 #   conformance  the compatibility oracle vs valkey, flint mem, flint rocks
 #   drills       the core drills (the CORE list below is the count)

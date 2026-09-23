@@ -148,7 +148,7 @@ fill target.
 
 | environment | minimum | notes |
 |---|---|---|
-| **Dev / test** | **1 machine** | everything co-located; a single-node pair (master only, no replica) is fine — no failover, but full functionality. This is the marketplace single-VM shape. |
+| **Dev / test** | **1 machine** | everything co-located; a single-node pair (master only, no replica) is fine — no failover, but full functionality. |
 | **Minimum production** | **2 storage machines** (a master+replica pair on **separate hosts**) + the control components | separate hosts so one machine's loss never takes both copies. The CP, proxy, and controller are lightweight and may co-locate on the storage hosts or a small third box. Gives real failover. |
 | **Recommended production** | the pair on 2 hosts + **≥ 2 proxies** + **3-node Raft control plane** + **1 controller** | 2+ proxies so a proxy loss is invisible (stateless subset failover); 3-node CP for control-plane HA; add pairs to scale capacity. |
 

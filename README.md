@@ -362,8 +362,9 @@ processes, not mocks.
 ## Prerequisites
 
 Only if you are building from source. **Tagged releases publish Linux x86_64
-binaries plus a `manifest.json` with the sha256** — for a deployment, download
-those from the
+binaries plus a `manifest.json` with the sha256, both signed with minisign**
+([docs/release-signing.md](docs/release-signing.md)) — for a deployment,
+download those from the
 [Releases page](https://github.com/Crestway-AI-LLC/flint-cache/releases/latest)
 and skip this section entirely ([docs/self-hosting.md](docs/self-hosting.md)).
 
@@ -404,8 +405,8 @@ so is the point — see [below](#disposable-and-unstamped-builds) for why the
 same fact makes `flintctl` refuse to mutate a fleet it does not consider
 throwaway.
 
-Then `tools/quickstart.sh down` (keep the data) or
-`purge` (delete it). Deliberately a pair rather than a single node, so
+Then `tools/quickstart.sh status` (what `flintctl` sees), `down` (keep the
+data) or `purge` (delete it). Deliberately a pair rather than a single node, so
 `tools/quickstart.sh failover` can SIGKILL the master and let you watch the
 controller promote the replica — with a replicated witness key proving the
 data came through.
@@ -488,9 +489,12 @@ Stages run individually too — `tools/gates.sh check`, `conformance`, `drills`,
 | `drills` | the core drills — real processes, no mocks. The `CORE` list in `tools/gates.sh` is the count; enumerating it here only drifts (it read 20 while the gate ran 39). |
 | `chaos` | the two randomized kill-and-verify drills |
 | `msrv` | **opt-in** — builds the workspace at the `rust-version` this repo declares, in both feature configurations. Valid as an argument, absent from the no-argument run above: it installs a second toolchain to answer a question that only changes when the declaration or the dependency set does. Needs `rustup`. |
+| `docs` | **opt-in** — the document and drill-source assertions alone, in seconds, with no toolchain and no build. A subset of `check`, which is why the no-argument run leaves it out: it would assert the same things twice. |
 
-Logs land in `$FLINT_GATE_LOGS` (default `/tmp/flint-gates`), one file per
-step, kept whether it passed or failed. `conformance` needs a local Valkey to
+Logs land in `$FLINT_GATE_LOGS` (default `$FLINT_DRILL_ROOT/flint-gates`, or
+`/tmp/flint-gates` when that is unset): one directory per run and one file per
+step, kept whether the step passed or failed. The newest 20 runs are retained,
+and `latest` points at the most recent. `conformance` needs a local Valkey to
 compare against; `drills` need `valkey-cli`.
 
 That script *is* the release gate — [docs/release-checklist.md](docs/release-checklist.md)

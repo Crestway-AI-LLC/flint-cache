@@ -8,6 +8,12 @@ Start here if you are deploying Flint:
 - `tenant-guide.md` — what to hand an application team connecting to it.
 - `failover.md` — the failure model: planned handoff, crash, partition,
   and why split-brain is impossible.
+- `security.md` — what Flint protects in transit and at rest, and what your
+  platform has to supply.
+- `slo.md` — the service levels Flint guarantees, each measured by a harness
+  in this repository with the command to reproduce it.
+- `space-reclaim.md` — Flint never evicts; how to bring your own cleanup
+  policy for when the disk fills.
 
 Reference:
 
@@ -15,6 +21,8 @@ Reference:
   and what is excluded by design.
 - `release-checklist.md` — the pre-release ritual: gates, conformance,
   drills, chaos.
+- `release-signing.md` — how every release is signed with minisign, and how
+  to verify a download against a key you have pinned.
 - `runbooks/ca-rotation.md` — the one certificate operation that is a
   supervised runbook rather than automation.
 - `architecture.md` — the three planes, and a normal write/read traced

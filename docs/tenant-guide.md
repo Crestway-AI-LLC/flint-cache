@@ -13,12 +13,15 @@ connect — and nothing you have to manage:
    dials; the proxy hides every node, failover, and migration behind it.
 2. **Token** — your credential. You present it with `AUTH`. Treat it like
    a password (it is stored only as a hash on our side).
-3. **CA certificate** — a small `flint-ca.crt` file your client uses to
-   verify the TLS connection to the endpoint.
-4. **Your limits** — a rate quota (**ops/second**) and a **storage cap**
-   (bytes), both visible live in the console. Typical starting grant:
-   e.g. *50,000 ops/s, 50 GB* — your actual numbers are on your welcome
-   page.
+3. **Trust for the TLS connection** — on the Crestway managed service the
+   endpoint presents a **publicly trusted certificate**, so your client's
+   ordinary CA store verifies it and there is nothing to download. On a
+   self-hosted fleet running client TLS, your operator gives you the fleet's
+   CA certificate instead (a small `flint-ca.crt`; `flintctl` writes it to
+   `<statedir>/certs/ca.crt`), and your client verifies against that.
+4. **Your limits** — a rate quota (**ops/second**) and, where your plan sets
+   one, a **storage cap** (bytes), both visible live in the console. On a
+   self-hosted fleet your operator sets them.
 
 **About your namespace.** Your keys live in their own isolated keyspace —
 invisible to every other tenant, by construction — but you never type the
@@ -44,10 +47,14 @@ configure either way.
 
 ### Sample code
 
+These connect to the managed service, whose certificate is publicly trusted.
+For a self-hosted fleet running client TLS, add the fleet's CA — the one-line
+change for each client is at the end of this section.
+
 **redis-cli / valkey-cli**
 
 ```sh
-redis-cli -h <endpoint> -p <port> --tls --cacert flint-ca.crt -a <token>
+redis-cli -h <endpoint> -p <port> --tls -a <token>
 > SET user:42 "hello"
 OK
 > GET user:42
@@ -62,7 +69,7 @@ import redis
 r = redis.Redis(
     host="<endpoint>", port=<port>,
     password="<token>",
-    ssl=True, ssl_ca_certs="flint-ca.crt",
+    ssl=True,
 )
 r.set("user:42", "hello")          # in the write-ahead log before this returns
 print(r.get("user:42"))            # b"hello"
@@ -72,12 +79,11 @@ print(r.get("user:42"))            # b"hello"
 
 ```js
 const Redis = require("ioredis");
-const fs = require("fs");
 
 const r = new Redis({
   host: "<endpoint>", port: <port>,
   password: "<token>",
-  tls: { ca: fs.readFileSync("flint-ca.crt") },
+  tls: {},
 });
 await r.set("user:42", "hello");
 console.log(await r.get("user:42")); // "hello"
@@ -87,19 +93,27 @@ console.log(await r.get("user:42")); // "hello"
 
 ```go
 import (
-    "context"; "crypto/tls"; "crypto/x509"; "os"
+    "context"; "crypto/tls"
     "github.com/redis/go-redis/v9"
 )
 
-ca, _ := os.ReadFile("flint-ca.crt")
-pool := x509.NewCertPool(); pool.AppendCertsFromPEM(ca)
 rdb := redis.NewClient(&redis.Options{
     Addr:      "<endpoint>:<port>",
     Password:  "<token>",
-    TLSConfig: &tls.Config{RootCAs: pool},
+    TLSConfig: &tls.Config{ServerName: "<endpoint>"},
 })
 rdb.Set(context.Background(), "user:42", "hello", 0)
 ```
+
+**On a self-hosted fleet with client TLS**, verify against the CA your
+operator gave you rather than the system store:
+
+| client | change |
+|---|---|
+| redis-cli / valkey-cli | add `--cacert flint-ca.crt` |
+| redis-py | add `ssl_ca_certs="flint-ca.crt"` |
+| ioredis | `tls: { ca: fs.readFileSync("flint-ca.crt") }` |
+| go-redis | load the file into an `x509.CertPool` and set `RootCAs` in the `tls.Config` |
 
 Everything after connecting is ordinary Redis. Failovers are absorbed: if
 a storage node dies mid-request the proxy retries against the promoted
