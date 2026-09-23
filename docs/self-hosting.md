@@ -1245,9 +1245,9 @@ serves non-AWS deployments and anyone who prefers not to run an LB.
 (cross-AZ aware), and place each pair's master and replica in *different*
 AZs so an AZ loss is survivable — the topology the capacity model assumes.
 
-**Not the entry SKU.** The single-VM marketplace shape runs one proxy on
-the instance; adding an NLB there is pure cost. The NLB is the multi-VM
-production template (the follow-on to the single-VM CloudFormation stack).
+**Not for a single-VM deployment.** A one-machine fleet runs one proxy on
+that machine, so an NLB in front of it is pure cost. The NLB earns its place
+once there are several proxies to spread load and failure across.
 
 ## See also
 

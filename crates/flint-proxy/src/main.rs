@@ -4365,7 +4365,7 @@ fn main() -> std::io::Result<()> {
         .unwrap_or(DEFAULT_MAX_CONNS);
 
     // --bind: the listener address. Loopback by default; 0.0.0.0 for a
-    // front door serving external clients (the marketplace single-VM shape).
+    // front door serving clients on other machines.
     let bind = arg("--bind").unwrap_or_else(|| "127.0.0.1".into());
     let listener = std::net::TcpListener::bind((bind.as_str(), port))?;
 

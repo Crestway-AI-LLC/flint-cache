@@ -448,7 +448,7 @@ control plane suppresses no-op pushes, and the operator/agent re-adds a
 proxy (or an autoscaling group replaces the instance). Until then, the
 tenant's other subset proxies carry the load.
 
-**The single-VM shape.** The marketplace entry SKU runs one proxy on the
+**The single-VM shape.** A one-machine deployment runs one proxy on the
 instance, so a proxy failure there is an *instance* failure — recovered by
 replacing the instance (an ASG or a fresh launch), after which the fleet
 bootstraps back and the proxy rejoins with a cold-start snapshot. The
