@@ -17,7 +17,7 @@
 
 use rocksdb::{WriteBatch, WriteBatchIterator};
 
-use crate::rocks::RocksKv;
+use crate::rocks::{Counted, ENGINE_WRITERS, RocksKv};
 
 /// Marker row holding the replica's last applied master sequence number.
 /// Lives outside the user envelope space (user rows start with 'M'/'S'/'Z').
@@ -425,6 +425,9 @@ impl RocksKv {
             }
         }
         wb.put(REPL_STATE_KEY, batch.last_seq.to_be_bytes());
+        // A replica's write path is this apply (OPS-0314): counted like a
+        // master's commit, through the index put below.
+        let _w = Counted::enter(&ENGINE_WRITERS);
         self.db()
             .write(wb)
             .map_err(|e| ReplError::Storage(e.to_string()))?;
@@ -648,6 +651,7 @@ impl RocksKv {
     /// key.
     pub fn set_last_applied(&self, seq: u64) -> Result<(), ReplError> {
         let snapped = self.snap_to_batch_end(seq).unwrap_or(seq);
+        let _w = Counted::enter(&ENGINE_WRITERS);
         self.db()
             .put(REPL_STATE_KEY, snapped.to_be_bytes())
             .map_err(|e| ReplError::Storage(e.to_string()))

@@ -2086,7 +2086,7 @@ fn auth_step(
         // all — so a half-completed edge roll looked exactly like a
         // finished one.
         let info = format!(
-            "build:{build}\r\nactive:{}\r\nconns_total:{}\r\nshed_total:{}\r\nauth_ok_total:{}\r\nauth_fail_total:{}\r\nadmin_denied_total:{}\r\ncommands_total:{}\r\ncommands_read_total:{}\r\ncommands_write_total:{}\r\nhotkey_sample_rate:{}\r\ncache_ttl_ms:{cache_ttl}\r\ncache_max_bytes:{cache_max}\r\ncache_hits_total:{cache_hits}\r\ncache_misses_total:{cache_misses}\r\ncache_entries:{cache_entries}\r\ncache_bytes:{cache_bytes}\r\nmoved_learned_total:{moved_learned}\r\nquota_throttled_total:{quota_throttled}\r\nquota_write_shed_total:{quota_write_shed}\r\npool_lanes:{pool_lanes}\r\npool_batches_total:{pool_batches}\r\npool_commands_total:{pool_commands}\r\npool_batch_mean:{pool_batch_mean:.2}\r\npool_inflight_max:{pool_inflight_max}\r\npool_dial_failures_total:{pool_dials}\r\ncert_days_remaining:{cdr}\r\n",
+            "build:{build}\r\nactive:{}\r\nconns_total:{}\r\nshed_total:{}\r\nauth_ok_total:{}\r\nauth_fail_total:{}\r\nadmin_denied_total:{}\r\ncommands_total:{}\r\ncommands_read_total:{}\r\ncommands_write_total:{}\r\nhotkey_sample_rate:{}\r\ncache_ttl_ms:{cache_ttl}\r\ncache_max_bytes:{cache_max}\r\ncache_hits_total:{cache_hits}\r\ncache_misses_total:{cache_misses}\r\ncache_entries:{cache_entries}\r\ncache_bytes:{cache_bytes}\r\nmoved_learned_total:{moved_learned}\r\nquota_throttled_total:{quota_throttled}\r\nquota_write_shed_total:{quota_write_shed}\r\npool_lanes:{pool_lanes}\r\npool_batches_total:{pool_batches}\r\npool_commands_total:{pool_commands}\r\npool_batch_mean:{pool_batch_mean:.2}\r\npool_inflight_max:{pool_inflight_max}\r\npool_dial_failures_total:{pool_dials}\r\ncert_days_remaining:{cdr}\r\ncpu_time_us:{cpu}\r\ncpu_cores:{cores}\r\n",
             topo.stat_active.load(Ordering::Relaxed),
             load(&topo.stat_conns_total),
             load(&topo.stat_shed_total),
@@ -2112,6 +2112,12 @@ fn auth_step(
                 // drops non-numerics, so `flint_proxy_cert_days_remaining`
                 // used to vanish exactly when there was no readable cert.
                 .unwrap_or(flint_tls::CERT_DAYS_UNKNOWN),
+            // OPS-0314. The proxy runs its work on parallel threads, so
+            // idle capacity here is idle CPU: measured, it read 0.91-1.00
+            // of its cores at the read plateau. Cumulative; a consumer
+            // divides deltas. `-1` = unknown, never idle.
+            cpu = flint_build::process::cpu_time_us().map_or(-1, |v| v as i64),
+            cores = flint_build::process::cpu_cores().map_or(-1, |v| v as i64),
         );
         return AuthStep::Reply(Value::Bulk(Some(info.into_bytes())));
     }

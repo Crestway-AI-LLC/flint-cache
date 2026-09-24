@@ -1194,6 +1194,51 @@ const DEFAULT_FULLSYNC_RATE_BYTES: u64 = 64 * 1024 * 1024;
 /// deadline of capacity on work it then discards, which is the worst of both:
 /// the client waits AND the node is busy not serving anyone else.
 static WRITE_INFLIGHT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How much of the time the engine's write path had work (OPS-0314). A
+/// thread reads `flint_storage::rocks::ENGINE_WRITERS` every millisecond:
+/// `engine_write_samples` counts the readings and `engine_write_busy_samples`
+/// the ones that found a write inside the engine.
+/// Both are cumulative, like every counter FLINTINFO reports, so the busy
+/// FRACTION of an interval is the ratio of their deltas; a consumer takes two
+/// readings.
+///
+/// A GAUGE, NOT A HEADROOM VERDICT. Writes sent straight to a seat plateaued
+/// with this at 0.91-0.97; writes through the proxy plateaued with it at 0.38,
+/// because each backend connection's writes commit together and the batches
+/// grow with load. See `flint_storage::rocks::ENGINE_WRITERS`.
+///
+/// Sampled rather than timed per write, because a timer puts two clock reads
+/// on every write and the question is only whether anyone was in there. The
+/// readings do not depend on the writers, so the ratio is unbiased whatever
+/// the sleep's real granularity. The cost is one thread waking about a
+/// thousand times a second, on rocks builds only.
+#[cfg(feature = "rocks")]
+static ENGINE_WRITE_SAMPLES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "rocks")]
+static ENGINE_WRITE_BUSY_SAMPLES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// One reading of the engine's write path. The total is bumped BEFORE the
+/// busy count, both with Release, and [`engine_write_samples`] loads busy
+/// first with Acquire: a reader therefore never sees more busy readings than
+/// readings, which would be a fraction above 1.0.
+#[cfg(feature = "rocks")]
+fn sample_engine_writers() {
+    let busy = flint_storage::rocks::ENGINE_WRITERS.load(Ordering::Relaxed) > 0;
+    ENGINE_WRITE_SAMPLES.fetch_add(1, Ordering::Release);
+    if busy {
+        ENGINE_WRITE_BUSY_SAMPLES.fetch_add(1, Ordering::Release);
+    }
+}
+
+/// `(busy, total)` readings so far. See [`sample_engine_writers`].
+#[cfg(feature = "rocks")]
+fn engine_write_samples() -> (u64, u64) {
+    let busy = ENGINE_WRITE_BUSY_SAMPLES.load(Ordering::Acquire);
+    (busy, ENGINE_WRITE_SAMPLES.load(Ordering::Acquire))
+}
+
 static WRITE_SERVICE_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Per-write MARGINAL cost, which is what a projection may multiply by.
@@ -3029,6 +3074,18 @@ fn main() -> std::io::Result<()> {
     // Only when the threshold was DERIVED. `--wal-headroom-seq` and
     // `FLINTCONFIG wal-headroom-seq` both clear HEADROOM_AUTO, because an
     // operator who names a number has overridden the policy.
+    // OPS-0314: the engine write path's busy fraction. See
+    // ENGINE_WRITE_SAMPLES.
+    #[cfg(feature = "rocks")]
+    if rocks.is_some() {
+        std::thread::spawn(|| {
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                sample_engine_writers();
+            }
+        });
+    }
+
     #[cfg(feature = "rocks")]
     if let Some(rk) = rocks.clone() {
         let hub_re = Arc::clone(&hub);
@@ -6037,8 +6094,10 @@ fn flintinfo(
     let compaction = rocks.as_ref().and_then(|kv| kv.compaction_pressure());
     let mem_sample = flint_storage::mem::sample();
     let rof = replica_of_line(read_only, REPLICA_LINK.get().map(|l| l.as_ref()));
+    // One read of the pair, so the two describe the same moment.
+    let ews_ewb = engine_write_samples();
     let info = format!(
-        "role:{}\r\nloading:0\r\nrole_epoch:{role_epoch}\r\n{rof}build:{build}\r\nsst_bytes:{sst}\r\nlatest_seq:{latest}\r\nlast_applied:{last_applied}\r\n{msa}wal_headroom_seq:{whs}\r\nwal_min_acked_seq:{wma}\r\nwal_headroom_shed_seq:{whl}\r\nwal_bytes_per_seq:{wbps}\r\nwal_archive_mb:{wamb}\r\nwal_archive_src:{wasrc}\r\nlive_replicas:{}\r\n{mlag}lag_ms_max:{lmx}\r\nlag_max_gap:{lmg}\r\nlag_soft_ms:{soft}\r\nlag_hard_ms:{hard}\r\nmin_replicas_to_write:{minr}\r\nwidowed_grace_ms:{wgm}\r\nwidowed_shed:{wsh}\r\nfullsync_active:{fsa}\r\nfullsync_max:{fsm}\r\nasync_write_queue:{aqd}\r\nwrite_deadline_ms:{wdm}\r\nwrite_inflight:{wif}\r\nwrite_service_us:{wsu}\r\nwrite_cost_us:{wcu}\r\nwrite_wait_est_ms:{wwe}\r\nwrite_wait_peak_ms:{wwp}\r\nwrite_wait_peak_inflight:{wwpi}\r\nwrite_wait_peak_cost_us:{wwps}\r\nwrites_shed_deadline:{wsd}\r\nwrites_shed_lag:{wsl}\r\nwrites_shed_quorum:{wsq}\r\nwrites_shed_widowed:{wswd}\r\nwrites_shed_headroom:{wshr}\r\nacks_below_cursor:{abc}\r\nwrites_delayed_soft:{wdsf}\r\nwal_fsync_ms:{wfm}\r\nwal_fsync_total:{wft}\r\ncert_days_remaining:{cdr}\r\nactive_conns:{ac}\r\nmax_conns:{mc}\r\nconns_shed_total:{cs}\r\nwrite_stopped:{wst}\r\ndelayed_write_rate:{dwr}\r\nwrite_stall_readable:{wsr}\r\nl0_files:{l0f}\r\npending_compaction_bytes:{pcb}\r\ncompaction_readable:{cr}\r\ndisk_free_bytes:{dfb}\r\ndisk_total_bytes:{dtb}\r\ndisk_free_pct:{dfp}\r\ndisk_verdict:{dv}\r\ndisk_unknown_samples:{dus}\r\nmem_avail_bytes:{mab}\r\nmem_total_bytes:{mtb}\r\nmem_avail_pct:{map}\r\nmem_src:{msrc}\r\nevictable_ns:{ens}\r\nevictable_ns_agree:{ensa}\r\nevictable_ns_bytes:{ensb}\r\nreclaim_active:{rca}\r\nreclaim_target_free_bytes:{rctf}\r\nevict:{evm}\r\ncollection_read_budget_pct:{crbp}\r\ncollection_read_in_flight_bytes:{crif}\r\ncollection_read_mode:{crm}\r\ncollection_read_refused:{crr}\r\ncollection_read_would_refuse:{crwr}\r\ncollection_read_unmeasured:{cru}\r\ngc_swept_expired:{gse}\r\ngc_swept_orphans:{gso}\r\nuptime_ms:{upms}\r\n{lrs}",
+        "role:{}\r\nloading:0\r\nrole_epoch:{role_epoch}\r\n{rof}build:{build}\r\nsst_bytes:{sst}\r\nlatest_seq:{latest}\r\nlast_applied:{last_applied}\r\n{msa}wal_headroom_seq:{whs}\r\nwal_min_acked_seq:{wma}\r\nwal_headroom_shed_seq:{whl}\r\nwal_bytes_per_seq:{wbps}\r\nwal_archive_mb:{wamb}\r\nwal_archive_src:{wasrc}\r\nlive_replicas:{}\r\n{mlag}lag_ms_max:{lmx}\r\nlag_max_gap:{lmg}\r\nlag_soft_ms:{soft}\r\nlag_hard_ms:{hard}\r\nmin_replicas_to_write:{minr}\r\nwidowed_grace_ms:{wgm}\r\nwidowed_shed:{wsh}\r\nfullsync_active:{fsa}\r\nfullsync_max:{fsm}\r\nasync_write_queue:{aqd}\r\nwrite_deadline_ms:{wdm}\r\nwrite_inflight:{wif}\r\nwrite_service_us:{wsu}\r\nwrite_cost_us:{wcu}\r\nwrite_wait_est_ms:{wwe}\r\nwrite_wait_peak_ms:{wwp}\r\nwrite_wait_peak_inflight:{wwpi}\r\nwrite_wait_peak_cost_us:{wwps}\r\nwrites_shed_deadline:{wsd}\r\nwrites_shed_lag:{wsl}\r\nwrites_shed_quorum:{wsq}\r\nwrites_shed_widowed:{wswd}\r\nwrites_shed_headroom:{wshr}\r\nacks_below_cursor:{abc}\r\nwrites_delayed_soft:{wdsf}\r\nwal_fsync_ms:{wfm}\r\nwal_fsync_total:{wft}\r\ncert_days_remaining:{cdr}\r\nactive_conns:{ac}\r\nmax_conns:{mc}\r\nconns_shed_total:{cs}\r\nwrite_stopped:{wst}\r\ndelayed_write_rate:{dwr}\r\nwrite_stall_readable:{wsr}\r\nl0_files:{l0f}\r\npending_compaction_bytes:{pcb}\r\ncompaction_readable:{cr}\r\ndisk_free_bytes:{dfb}\r\ndisk_total_bytes:{dtb}\r\ndisk_free_pct:{dfp}\r\ndisk_verdict:{dv}\r\ndisk_unknown_samples:{dus}\r\nmem_avail_bytes:{mab}\r\nmem_total_bytes:{mtb}\r\nmem_avail_pct:{map}\r\nmem_src:{msrc}\r\nevictable_ns:{ens}\r\nevictable_ns_agree:{ensa}\r\nevictable_ns_bytes:{ensb}\r\nreclaim_active:{rca}\r\nreclaim_target_free_bytes:{rctf}\r\nevict:{evm}\r\ncollection_read_budget_pct:{crbp}\r\ncollection_read_in_flight_bytes:{crif}\r\ncollection_read_mode:{crm}\r\ncollection_read_refused:{crr}\r\ncollection_read_would_refuse:{crwr}\r\ncollection_read_unmeasured:{cru}\r\ngc_swept_expired:{gse}\r\ngc_swept_orphans:{gso}\r\nengine_write_busy_samples:{ewb}\r\nengine_write_samples:{ews}\r\ncpu_time_us:{cpu}\r\ncpu_cores:{cores}\r\nuptime_ms:{upms}\r\n{lrs}",
         if read_only { "replica" } else { "master" },
         hub.live_replica_count(now),
         soft = hub.lag_soft_ms(),
@@ -6200,6 +6259,16 @@ fn flintinfo(
         gse = GC_EXPIRED_TOTAL.load(Ordering::Relaxed),
         upms = heat::process_uptime_ms(),
         gso = GC_ORPHANS_TOTAL.load(Ordering::Relaxed),
+        // OPS-0314: what this seat has left, as facts a
+        // consumer divides. The write path's busy readings, and this process's
+        // CPU against the cores it may use. `-1` where the platform will not
+        // say, which must not read as idle.
+        ewb = ews_ewb.0,
+        ews = ews_ewb.1,
+        cpu = flint_build::process::cpu_time_us()
+            .map_or_else(|| UNKNOWN_NUMERIC.into(), |v| v.to_string()),
+        cores = flint_build::process::cpu_cores()
+            .map_or_else(|| UNKNOWN_NUMERIC.into(), |v| v.to_string()),
         // BUG-0082. TWO FIELDS OR NONE, and ABSENT when this process has not
         // reseeded — not a sentinel.
         //

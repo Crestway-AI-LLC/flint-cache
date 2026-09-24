@@ -771,7 +771,8 @@ the metrics source you build on:
   refuses every data command with `-LOADING`.
 - **`PROXYSTATS`** on each proxy: connections, command/read/write totals,
   cache hit/miss/entries/bytes, `moved_learned_total`, quota sheds,
-  `cert_days_remaining`. **`PROXYLATENCY`** gives per-lane read/write
+  `cert_days_remaining`, and its CPU (`cpu_time_us`, `cpu_cores`, below).
+  **`PROXYLATENCY`** gives per-lane read/write
   histograms.
 
 The open stack ships a reference exporter, **`flint-exporter`**, that polls
@@ -864,6 +865,43 @@ the two counters, any sustained increase is the thing itself; for the mode, a
 value you have stopped intending. They exist because "I could not look" and
 "I looked and did nothing" and "there is nothing wrong" produce
 identical-looking dashboards, and only the last is good news.
+
+### Is a component out of rate headroom?
+
+Four cumulative counters, published so a consumer can answer "how much of
+the time was this busy?" by dividing two readings' deltas:
+
+| field | where | busy fraction over an interval |
+|---|---|---|
+| `cpu_time_us`, `cpu_cores` | `FLINTINFO` and `PROXYSTATS` | `rate(cpu_time_us) / 1e6 / cpu_cores` |
+| `engine_write_busy_samples`, `engine_write_samples` | `FLINTINFO` (rocks) | `rate(busy) / rate(samples)` |
+
+`cpu_cores` is the cores the process may use, which follows CPU affinity and
+cgroup quotas: a seat pinned to two cores of a 32-core host reports 2. The
+engine pair comes from a thread that looks every millisecond to see whether a
+write is inside the engine. Both CPU fields read `-1` where the platform
+will not say.
+
+**What the fractions showed on a real pair** (c7i.2xlarge and c7i.8xlarge,
+`memtier_benchmark` through the proxy, one vCPU per physical core):
+
+- **Reads saturate the proxy.** Its CPU read 0.91-1.00 from the throughput
+  plateau onwards, and about 0.4 at light load. This is the signal to add
+  proxies.
+- **Writes sent straight to a seat saturate the engine write path** at
+  0.91-0.97, against 0.2 at light load.
+- **Writes through the proxy, the normal path, show in neither.** Each
+  backend connection carries many clients, and the server commits what one
+  connection delivers as one engine write. As load rises, the batches get
+  bigger instead of the engine getting busier: the engine path read 0.85 at
+  about half the plateau and 0.38 at it. That path's plateau shows up as p99
+  rising while throughput stays flat, or as `writes_shed_lag` moving once the
+  replica can no longer keep up.
+
+So `engine_write_busy_samples` is not an alert on its own: a group-commit
+engine can be busy nearly all the time and still take more load in bigger
+batches. And a CPU fraction under-reads a process that shares its cores with
+something else, because it counts only this process's time.
 
 ## 3b. Disk headroom
 

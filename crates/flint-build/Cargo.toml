@@ -9,5 +9,10 @@ edition = "2024"
 license.workspace = true
 publish = false
 
+[dependencies]
+# `process::cpu_time_us` (OPS-0314): getrusage. Already in the lockfile, via
+# flint-server and flint-storage.
+libc = "0.2"
+
 [lints]
 workspace = true

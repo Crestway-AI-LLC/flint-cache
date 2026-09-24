@@ -115,6 +115,96 @@ pub fn display<'a>(reported: &'a str, crate_version: &str) -> &'a str {
     }
 }
 
+/// What this PROCESS is consuming, measured by itself (OPS-0314).
+///
+/// "Is this component out of headroom?" was answered for bytes and never for
+/// rate. For a process whose work runs on parallel threads, idle capacity is
+/// idle CPU, so each process publishes two cumulative facts and a consumer
+/// divides deltas: the busy fraction over an interval is the growth of
+/// `cpu_time_us` divided by the interval's wall time times `cpu_cores`.
+///
+/// Measured on real pairs, that is the proxy's read ceiling: it read 0.91-1.00
+/// at the read plateau and about 0.4 at light load. It does not show the
+/// proxied WRITE plateau, where no process or thread reached 1.0. And it
+/// under-reads a process that shares its cores, since it counts only this
+/// process's time.
+///
+/// In this crate because every Flint binary depends on it and nothing else is
+/// shared by both the proxy and the server: one implementation of the
+/// measurement, not two copies drifting apart.
+pub mod process {
+    /// Cumulative user plus system CPU this process has used, in microseconds.
+    /// `None` where the platform will not say. A consumer must read that as
+    /// UNKNOWN, never as zero, because zero reads as idle.
+    pub fn cpu_time_us() -> Option<u64> {
+        #[cfg(unix)]
+        {
+            // SAFETY: `getrusage` only writes into the struct we pass, which
+            // is a zeroed, properly aligned `rusage` owned by this frame, and
+            // RUSAGE_SELF is a valid `who` on every unix libc.
+            let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+            let rc = unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) };
+            if rc != 0 {
+                return None;
+            }
+            let us = |t: libc::timeval| {
+                (t.tv_sec.max(0) as u64)
+                    .saturating_mul(1_000_000)
+                    .saturating_add(t.tv_usec.max(0) as u64)
+            };
+            Some(us(ru.ru_utime).saturating_add(us(ru.ru_stime)))
+        }
+        #[cfg(not(unix))]
+        {
+            None
+        }
+    }
+
+    /// How many cores this process may run on. `available_parallelism`
+    /// honours CPU affinity and cgroup quotas, so a seat pinned to two cores
+    /// of an eight-core host reports 2. That is the denominator the busy
+    /// fraction needs; the host's total would make a pinned, saturated seat
+    /// read 25% busy. Asked on every call, so a seat pinned after it started
+    /// reports the pinning. `None` = unknown.
+    pub fn cpu_cores() -> Option<u64> {
+        std::thread::available_parallelism()
+            .ok()
+            .map(|n| n.get() as u64)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// Burning CPU must MOVE the counter: a counter that reads a constant
+        /// passes every "is it a number" check and measures nothing.
+        #[cfg(unix)]
+        #[test]
+        fn cpu_time_moves_when_this_process_works() {
+            let before = cpu_time_us().expect("getrusage answers on unix");
+            let start = std::time::Instant::now();
+            let mut x = 0u64;
+            while start.elapsed() < std::time::Duration::from_millis(60) {
+                x = std::hint::black_box(x.wrapping_mul(6364136223846793005).wrapping_add(1));
+            }
+            let after = cpu_time_us().expect("getrusage answers on unix");
+            assert!(after > before, "60 ms of work moved cpu_time_us by nothing");
+            // A floor, not a rate: a loaded CI box may give this thread far
+            // less than 60 ms of CPU in 60 ms of wall time.
+            assert!(
+                after - before >= 1_000,
+                "60 ms of busy work measured as {} us",
+                after - before
+            );
+        }
+
+        #[test]
+        fn cores_are_known_and_positive() {
+            assert!(cpu_cores().is_some_and(|n| n >= 1));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

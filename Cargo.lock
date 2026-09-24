@@ -529,6 +529,9 @@ dependencies = [
 [[package]]
 name = "flint-build"
 version = "0.0.1"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "flint-chaos"

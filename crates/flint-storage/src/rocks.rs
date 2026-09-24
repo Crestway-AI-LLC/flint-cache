@@ -14,6 +14,44 @@ use rocksdb::{BlockBasedIndexType, BlockBasedOptions, Cache, DB, Options, WriteB
 
 use crate::Kv;
 
+/// How many threads are inside an engine WRITE right now (OPS-0314).
+///
+/// A sampler in the server reads this every millisecond and counts how often
+/// it is non-zero: the fraction of wall time the engine had a write in hand.
+///
+/// WHAT THAT FRACTION DOES AND DOES NOT MEAN, measured on real pairs: writes
+/// sent straight to a seat plateaued with it at 0.91-0.97, against 0.2 at
+/// light load. Writes through the proxy plateaued with it at 0.38, having read
+/// 0.85 at half the load, because the server commits what one backend
+/// connection delivers as ONE engine write and the batches grow with load. So
+/// it is a gauge of the engine, not a verdict on the pair's headroom: a
+/// group-commit engine can be busy nearly all the time and still take more.
+///
+/// One relaxed increment and one decrement per engine write, through
+/// `Counted`, at every write the engine takes: the master's commits here and
+/// a replica's batch apply in `repl.rs`. A write that bypassed the guard would
+/// make a saturated path read idle, so a test counts the write calls in both
+/// files against the guards.
+pub static ENGINE_WRITERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Holds one unit of `counter` for as long as it lives, and gives it back on
+/// every exit, a panic's unwind included. A unit that leaked would make an
+/// idle path read busy forever.
+pub(crate) struct Counted<'a>(&'a std::sync::atomic::AtomicU64);
+
+impl<'a> Counted<'a> {
+    pub(crate) fn enter(counter: &'a std::sync::atomic::AtomicU64) -> Self {
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Counted(counter)
+    }
+}
+
+impl Drop for Counted<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// RocksDB-backed `Kv` over the default column family.
 ///
 /// v0: single CF, default options. The real engine opens the CF layout
@@ -121,6 +159,7 @@ impl RocksKv {
                 None => wb.delete(k),
             }
         }
+        let _w = Counted::enter(&ENGINE_WRITERS);
         self.db.write(wb)
     }
 
@@ -754,6 +793,7 @@ impl Kv for RocksKv {
 
     fn put(&self, key: &[u8], value: &[u8]) {
         self.observe_record((key.len() + value.len()) as u64);
+        let _w = Counted::enter(&ENGINE_WRITERS);
         let _ = self.db.put(key, value);
     }
 
@@ -762,6 +802,7 @@ impl Kv for RocksKv {
         // just to throw it away.
         let existed = self.db.get_pinned(key).ok().flatten().is_some();
         self.observe_record(key.len() as u64);
+        let _w = Counted::enter(&ENGINE_WRITERS);
         let _ = self.db.delete(key);
         existed
     }
@@ -824,12 +865,14 @@ impl Kv for RocksKv {
             batch.delete(k);
             pending += 1;
             if pending == CHUNK {
+                let _w = Counted::enter(&ENGINE_WRITERS);
                 let _ = self.db.write(std::mem::take(&mut batch));
                 pending = 0;
             }
             true
         });
         if pending > 0 {
+            let _w = Counted::enter(&ENGINE_WRITERS);
             let _ = self.db.write(batch);
         }
     }
@@ -895,6 +938,86 @@ pub fn archive_span_at(dir: &Path) -> Option<ArchiveSpan> {
         oldest_age_s: oldest,
         newest_age_s: newest,
     })
+}
+
+#[cfg(test)]
+mod engine_writers_tests {
+    use super::Counted;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Counted while it lives, released after -- on a panic's unwind too.
+    #[test]
+    fn a_write_is_counted_while_it_runs_and_released_on_every_exit() {
+        let c = AtomicU64::new(0);
+        {
+            let _a = Counted::enter(&c);
+            let _b = Counted::enter(&c);
+            assert_eq!(c.load(Ordering::Relaxed), 2);
+        }
+        assert_eq!(c.load(Ordering::Relaxed), 0);
+        let r = std::panic::catch_unwind(|| {
+            let _w = Counted::enter(&c);
+            panic!("a write that fails mid-flight");
+        });
+        assert!(r.is_err());
+        assert_eq!(c.load(Ordering::Relaxed), 0, "the unwind leaked a unit");
+    }
+
+    /// Every engine write the product takes goes through the guard, checked
+    /// per FUNCTION: no write call may come before a guard in its body.
+    /// Asserted by source, because a concurrent test can hold the global
+    /// non-zero and a sampled read would prove nothing about any one write.
+    /// Comments are dropped and whitespace removed, so a call split across
+    /// lines is still seen.
+    #[test]
+    fn every_engine_write_site_is_guarded() {
+        const GUARD: &str = "Counted::enter(&ENGINE_WRITERS)";
+        for (file, src) in [
+            ("rocks.rs", include_str!("rocks.rs")),
+            ("repl.rs", include_str!("repl.rs")),
+        ] {
+            let product = &src[..src.find("#[cfg(test)]").expect("a test module")];
+            // Split into functions at each `fn` item line, then flatten.
+            let mut bodies: Vec<String> = vec![String::new()];
+            for line in product.lines() {
+                let t = line.trim_start();
+                if t.starts_with("fn ")
+                    || t.starts_with("pub fn ")
+                    || t.starts_with("pub(crate) fn ")
+                {
+                    bodies.push(String::new());
+                }
+                let code = line.split("//").next().unwrap_or("");
+                bodies
+                    .last_mut()
+                    .expect("seeded")
+                    .extend(code.split_whitespace());
+            }
+            let mut writes = 0;
+            for body in &bodies {
+                let first_write = [".write(", ".put(", ".delete("]
+                    .iter()
+                    .flat_map(|c| [format!("self.db{c}"), format!("self.db(){c}")])
+                    .filter_map(|pat| {
+                        writes += body.matches(&pat).count();
+                        body.find(&pat)
+                    })
+                    .min();
+                if let Some(at) = first_write {
+                    assert!(
+                        body[..at].contains(GUARD),
+                        "{file}: an engine write with no guard before it, in {} -- a write the \
+                         guard does not see makes a saturated write path read idle",
+                        &body[..body.len().min(60)]
+                    );
+                }
+            }
+            assert!(
+                writes >= 2,
+                "{file}: found {writes} engine writes -- the scan broke"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
