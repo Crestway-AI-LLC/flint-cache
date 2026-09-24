@@ -9,8 +9,22 @@ Status: **FIXED 2026-09-10** · found 2026-09-01 · Severity: medium-high — a
 pair dropped to one copy on every rejoin that took this path, and it did not
 self-heal. Both halves are now closed: the silent short read that let a master
 vouch for a span it had walked past, and the livelock that discarded the
-FATAL's own remedy on every restart. **No fleet has run the fix yet** — see the
-2026-09-10 section for the one log line that will say it is working.
+FATAL's own remedy on every restart. **Both are running on the playground**,
+read from its node logs on 2026-09-24 (the line the two "No fleet has run this"
+paragraphs below were waiting for, found):
+
+- the livelock fix fired on 2026-09-14 at 17:28:12Z. After a
+  `FATAL: WALGAP full sync required`, the next start logged `warm rejoin
+  already failed at seq 240382952 on this copy; not asking 172.31.64.94:7001
+  to vouch for it again`. It then rewound to a local snapshot and tailed
+  incrementally, where the old build would have rejoined at the same cursor.
+- the demotion fix: `demote: replication cursor reset to this copy's own seq N`
+  appears five times across both seats, most recently at the rc.77 roll. Each
+  rejoin that followed was a rewind, not a refusal. It was not the warm
+  rejoin the paragraph below predicted, because a roll marks every ex-master
+  for re-seed, and the marker takes the rewind path.
+
+This Status said no fleet had run the fix for two weeks after one had.
 
 ## What happens
 

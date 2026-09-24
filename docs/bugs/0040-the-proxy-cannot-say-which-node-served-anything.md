@@ -1,8 +1,12 @@
 # BUG-0040 — the proxy cannot say which node served anything
 
-**Status:** FIXED 2026-08-21, both halves, landed but NOT YET DEPLOYED —
-it reaches the fleet on the next release. Found while designing a
-pre-termination safety gate that turned out to be unbuildable without it.
+**Status:** FIXED 2026-08-21, both halves, **and on the fleet**: first
+released in v0.1.0-rc.62, and on 2026-09-24 the playground's operations agent,
+running rc.77, exported
+`flint_proxy_pool_node_commands_total{proxy="try.crestwayai.com:7379",node="172.31.64.94:7001"} 3488510`.
+This line said the fix was waiting for the next release for a month after
+that release. Found while designing a pre-termination safety gate that turned
+out to be unbuildable without it.
 
     proxy  8cf94e7  per-backend counters + PROXYBACKENDS
     agent  ce48e96  polls it, exports flint_proxy_pool_node_commands_total{proxy,node}
