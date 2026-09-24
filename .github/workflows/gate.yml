@@ -262,10 +262,21 @@ jobs:
             exit 1
           }
 
+      # go-redis is one of the tenant guide's samples (BUG-0176). Pinned here
+      # rather than trusted to the runner image, so an image change cannot
+      # silently turn the go-redis check into a SKIP.
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: false
+
       - name: Client libraries for client_compat_drill
         # The drill installs these itself when missing, into exactly these
         # paths (tools/client_compat_drill.sh: VENV=/tmp/flint-compat-venv,
-        # NODE_DIR=/tmp/flint-compat-node). Doing it here as a NAMED step is
+        # NODE_DIR=/tmp/flint-compat-node, GO_DIR=/tmp/flint-compat-go).
+        # ioredis and go-redis are the tenant guide's other two samples
+        # (BUG-0176: ioredis's default ready check never passed, and nothing
+        # ran it). Doing it here as a NAMED step is
         # purely for diagnosis: an npm registry hiccup then reads as "client
         # libraries" failing rather than as "client_compat failed", which is a
         # different investigation.
@@ -281,7 +292,11 @@ jobs:
           mkdir -p /tmp/flint-compat-node
           cd /tmp/flint-compat-node
           npm init -y >/dev/null
-          npm install --no-fund --no-audit --silent redis
+          npm install --no-fund --no-audit --silent redis ioredis
+          mkdir -p /tmp/flint-compat-go
+          cd /tmp/flint-compat-go
+          go mod init flintcompat >/dev/null 2>&1
+          go get github.com/redis/go-redis/v9
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2

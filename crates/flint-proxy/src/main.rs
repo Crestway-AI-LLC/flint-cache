@@ -3766,6 +3766,52 @@ async fn scan_forward(
     ]))
 }
 
+/// `INFO [section ...]`, answered by the proxy itself (BUG-0176).
+///
+/// ioredis, the Node client the tenant guide shows, sends `INFO` before its
+/// first command by default (`enableReadyCheck`) and treats any error but
+/// NOPERM as fatal: it disconnects and tries again, forever. `INFO` used to be
+/// forwarded to pair 0's master, which does not implement it, so the guide's
+/// own sample never connected. Measured with ioredis 5.11.1.
+///
+/// Built here and not asked of a seat, because the proxy is the tenant
+/// boundary: a seat's figures are shared by every tenant on its pair, and the
+/// fleet-wide counters are the operator's (`PROXYSTATS`).
+///
+/// Minimal on purpose. `loading:0` is the field ioredis reads, and it is true
+/// by construction: a proxy that answers is serving. Redis's field names where
+/// Redis has one, `flint_` where it does not; clients parse by name.
+/// `redis_version` is deliberately absent: advertising a version is a claim
+/// about the whole command surface, which is a product decision, not a field.
+///
+/// Sections follow Redis: none, `default`, `all` or `everything` means every
+/// section; otherwise only the ones named, case-insensitively, and a name this
+/// proxy does not have contributes nothing rather than an error.
+fn info_reply(sections: &[Vec<u8>], version: &str) -> Value {
+    let all: [(&str, String); 2] = [
+        (
+            "server",
+            format!("# Server\r\nredis_mode:standalone\r\nflint_version:{version}\r\n"),
+        ),
+        ("persistence", "# Persistence\r\nloading:0\r\n".to_string()),
+    ];
+    let wanted: Vec<String> = sections
+        .iter()
+        .map(|s| String::from_utf8_lossy(s).to_ascii_lowercase())
+        .collect();
+    let every = wanted.is_empty()
+        || wanted
+            .iter()
+            .any(|w| matches!(w.as_str(), "default" | "all" | "everything"));
+    let body = all
+        .iter()
+        .filter(|(name, _)| every || wanted.iter().any(|w| w == name))
+        .map(|(_, text)| text.as_str())
+        .collect::<Vec<_>>()
+        .join("\r\n");
+    Value::Bulk(Some(body.into_bytes()))
+}
+
 async fn handle(
     topo: &Arc<Topology>,
     backends: &mut Backends,
@@ -3788,6 +3834,8 @@ async fn handle(
         },
         b"ECHO" if args.len() == 2 => Value::Bulk(Some(args[1].clone())),
         b"QUIT" => Value::Simple("OK".into()),
+        // Answered HERE, never forwarded: see `info_reply` (BUG-0176).
+        b"INFO" => info_reply(&args[1..], &build_version()),
         // The data-plane admin surface stays internal; the proxy is the
         // tenant boundary.
         _ if upper.starts_with(b"FLINT") => {
@@ -4580,6 +4628,64 @@ mod prefetch_tests {
 
         // Unknown verbs earn the node's own error on the ordinary path.
         assert!(!may_stage(&["NOTACOMMAND", "k"], false));
+    }
+}
+
+#[cfg(test)]
+mod info_tests {
+    use super::{Value, info_reply};
+
+    fn text(v: Value) -> String {
+        match v {
+            Value::Bulk(Some(b)) => String::from_utf8(b).expect("utf-8"),
+            other => panic!("INFO must be a bulk string, got {other:?}"),
+        }
+    }
+
+    /// BUG-0176: ioredis's ready check reads `loading`, and anything but `0`
+    /// makes it wait; an error makes it reconnect forever.
+    #[test]
+    fn bare_info_says_loading_0_and_names_the_build() {
+        let t = text(info_reply(&[], "v9.9.9"));
+        assert!(t.contains("\r\nloading:0\r\n"), "{t:?}");
+        assert!(t.contains("flint_version:v9.9.9\r\n"), "{t:?}");
+        assert!(t.starts_with("# Server\r\n"), "{t:?}");
+        // Every line is a header, blank, or field:value -- what every
+        // client's parser splits on.
+        for line in t.split("\r\n") {
+            assert!(
+                line.is_empty() || line.starts_with("# ") || line.contains(':'),
+                "unparseable line {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sections_filter_case_insensitively_and_unknown_is_empty_not_an_error() {
+        let only = |names: &[&str]| {
+            let args: Vec<Vec<u8>> = names.iter().map(|n| n.as_bytes().to_vec()).collect();
+            text(info_reply(&args, "v"))
+        };
+        assert_eq!(only(&["Persistence"]), "# Persistence\r\nloading:0\r\n");
+        assert!(!only(&["server"]).contains("loading"));
+        assert_eq!(
+            only(&["keyspace"]),
+            "",
+            "Redis answers an unknown section with nothing"
+        );
+        for every in ["all", "EVERYTHING", "default"] {
+            let t = only(&[every]);
+            assert!(
+                t.contains("# Server") && t.contains("# Persistence"),
+                "{every}: {t:?}"
+            );
+        }
+    }
+
+    /// No version claim: see `info_reply`.
+    #[test]
+    fn no_redis_version_is_advertised() {
+        assert!(!text(info_reply(&[], "v")).contains("redis_version"));
     }
 }
 

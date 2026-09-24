@@ -236,6 +236,10 @@ print("\nall client checks passed")
 PY
 RC=$?
 [ $RC -eq 0 ] || { echo "FAIL: redis-py client compatibility"; exit 1; }
+# What RAN, for the verdict line. A client that skipped must not appear in a
+# sentence saying it connected (BUG-0176: the first version of that line named
+# go-redis on a box that had no Go).
+RAN="redis-py"; SKIPPED=""
 
 # ---------------------------------------------------------------------------
 # node-redis. The second client worth gating on, and NOT redundant with
@@ -248,14 +252,16 @@ RC=$?
 NODE=${FLINT_COMPAT_NODE:-$(command -v node || true)}
 if [ -z "$NODE" ]; then
   echo "== node-redis: SKIP (no node on PATH)"
+  SKIPPED="$SKIPPED node-redis ioredis"
 else
   NODE_DIR=${FLINT_COMPAT_NODE_DIR:-$FLINT_DRILL_ROOT/flint-compat-node}
   mkdir -p "$NODE_DIR"
-  if [ ! -d "$NODE_DIR/node_modules/redis" ]; then
-    (cd "$NODE_DIR" && npm init -y >/dev/null 2>&1 && npm install redis --silent >/dev/null 2>&1)
+  if [ ! -d "$NODE_DIR/node_modules/redis" ] || [ ! -d "$NODE_DIR/node_modules/ioredis" ]; then
+    (cd "$NODE_DIR" && npm init -y >/dev/null 2>&1 && npm install redis ioredis --silent >/dev/null 2>&1)
   fi
   if [ ! -d "$NODE_DIR/node_modules/redis" ]; then
     echo "== node-redis: SKIP (could not install; offline?)"
+    SKIPPED="$SKIPPED node-redis"
   else
     echo "== client: node-redis $("$NODE" -e "console.log(require('$NODE_DIR/node_modules/redis/package.json').version)")"
     cat > "$NODE_DIR/suite.mjs" <<'JS'
@@ -367,7 +373,139 @@ console.log('\nall client checks passed');
 JS
     (cd "$NODE_DIR" && FLINT_URL="redis://127.0.0.1:$PORT" FLINT_TOKEN=tok-acme "$NODE" suite.mjs)
     [ $? -eq 0 ] || { echo "FAIL: node-redis client compatibility"; exit 1; }
+    RAN="$RAN, node-redis"
+  fi
+
+  # -------------------------------------------------------------------------
+  # ioredis, CONSTRUCTED EXACTLY AS docs/tenant-guide.md SHOWS IT (BUG-0176).
+  # Its default `enableReadyCheck` sends INFO before the first command and
+  # treats any error but NOPERM as fatal: disconnect, retry, forever. INFO was
+  # unknown everywhere, so the guide's own sample never connected, and nothing
+  # ran it. Defaults are the point here; do not add options to make it pass.
+  # -------------------------------------------------------------------------
+  if [ ! -d "$NODE_DIR/node_modules/ioredis" ]; then
+    echo "== ioredis: SKIP (could not install; offline?)"
+    SKIPPED="$SKIPPED ioredis"
+  else
+    echo "== client: ioredis $("$NODE" -e "console.log(require('$NODE_DIR/node_modules/ioredis/package.json').version)")"
+    cat > "$NODE_DIR/ioredis.js" <<'JS'
+const Redis = require("ioredis");
+const port = Number(process.env.FLINT_PORT);
+const fails = [];
+const say = (ok, name, note) => {
+  console.log(`  ${ok ? "ok " : "FAIL"} ${name}${note ? "  " + note : ""}`);
+  if (!ok) fails.push(name);
+};
+// The guide's constructor, minus `tls: {}` (this cluster's edge is plaintext).
+const r = new Redis({ host: "127.0.0.1", port, password: process.env.FLINT_TOKEN });
+let lastError = "";
+r.on("error", (e) => { lastError = e.message; });
+(async () => {
+  const ready = await Promise.race([
+    new Promise((res) => r.once("ready", () => res(true))),
+    new Promise((res) => setTimeout(() => res(false), 10000)),
+  ]);
+  say(ready, "becomes ready with the default ready check (INFO)",
+      ready ? "" : `status ${r.status}; last error: ${lastError || "none"}`);
+  if (!ready) { r.disconnect(); process.exit(1); }
+  try {
+    await r.set("io:k", "hello");
+    const got = await r.get("io:k");
+    say(got === "hello", "set/get", got === "hello" ? "" : `got ${JSON.stringify(got)}`);
+  } catch (e) { say(false, "set/get", e.message); }
+  try {
+    const info = await r.info();
+    say(/\r\nloading:0\r\n/.test(info), "INFO carries loading:0", JSON.stringify(info.slice(0, 80)));
+  } catch (e) { say(false, "INFO carries loading:0", e.message); }
+  try {
+    await r.del("io:h"); await r.hset("io:h", { f1: "v1", f2: "v2" });
+    const h = await r.hgetall("io:h");
+    const ok = h.f1 === "v1" && h.f2 === "v2" && Object.keys(h).length === 2;
+    say(ok, "HGETALL is an object", ok ? "" : JSON.stringify(h));
+  } catch (e) { say(false, "HGETALL is an object", e.message); }
+  r.disconnect();
+  if (fails.length) {
+    console.log(`\nFAIL: ${fails.length} client-visible problem(s): ${fails.join(", ")}`);
+    process.exit(1);
+  }
+  console.log("\nall ioredis checks passed");
+})();
+JS
+    (cd "$NODE_DIR" && FLINT_PORT=$PORT FLINT_TOKEN=tok-acme "$NODE" ioredis.js)
+    [ $? -eq 0 ] || { echo "FAIL: ioredis client compatibility (the tenant guide's sample)"; exit 1; }
+    RAN="$RAN, ioredis (default ready check)"
   fi
 fi
 
-echo "PASS: client compatibility — the default redis-py and node-redis clients (RESP3, credentials inside HELLO) connect, serve, and get their own native types back; sync, async, pooled, pipelined, and JSON; excluded commands fail honestly"
+# ---------------------------------------------------------------------------
+# go-redis v9, the guide's third sample, with its default options: RESP3 via
+# HELLO, then CLIENT SETINFO, which Flint does not implement and go-redis is
+# expected to tolerate. Measured working on 2026-09-24 (v9.22.0); gated so it
+# stays that way.
+# ---------------------------------------------------------------------------
+GO=${FLINT_COMPAT_GO:-$(command -v go || true)}
+if [ -z "$GO" ]; then
+  echo "== go-redis: SKIP (no go on PATH)"
+  SKIPPED="$SKIPPED go-redis"
+else
+  GO_DIR=${FLINT_COMPAT_GO_DIR:-$FLINT_DRILL_ROOT/flint-compat-go}
+  mkdir -p "$GO_DIR"
+  cat > "$GO_DIR/main.go" <<'GOSRC'
+package main
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"time"
+
+	"github.com/redis/go-redis/v9"
+)
+
+func main() {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	rdb := redis.NewClient(&redis.Options{Addr: os.Getenv("FLINT_ADDR"), Password: os.Getenv("FLINT_TOKEN")})
+	fails := 0
+	say := func(ok bool, name string, err error) {
+		mark, note := "ok ", ""
+		if !ok {
+			mark, fails = "FAIL", fails+1
+			if err != nil {
+				note = "  " + err.Error()
+			}
+		}
+		fmt.Printf("  %s %s%s\n", mark, name, note)
+	}
+	err := rdb.Set(ctx, "go:k", "hello", 0).Err()
+	say(err == nil, "connect + set (default options)", err)
+	v, err := rdb.Get(ctx, "go:k").Result()
+	say(err == nil && v == "hello", "get", err)
+	rdb.Del(ctx, "go:h")
+	rdb.HSet(ctx, "go:h", "f1", "v1", "f2", "v2")
+	h, err := rdb.HGetAll(ctx, "go:h").Result()
+	say(err == nil && len(h) == 2 && h["f1"] == "v1" && h["f2"] == "v2", "HGETALL is a map", err)
+	if fails > 0 {
+		fmt.Printf("\nFAIL: %d client-visible problem(s)\n", fails)
+		os.Exit(1)
+	}
+	fmt.Println("\nall go-redis checks passed")
+}
+GOSRC
+  if [ ! -f "$GO_DIR/go.sum" ]; then
+    (cd "$GO_DIR" && { [ -f go.mod ] || "$GO" mod init flintcompat >/dev/null 2>&1; } \
+      && "$GO" get github.com/redis/go-redis/v9 >/dev/null 2>&1)
+  fi
+  if [ ! -f "$GO_DIR/go.sum" ]; then
+    echo "== go-redis: SKIP (could not fetch the module; offline?)"
+    SKIPPED="$SKIPPED go-redis"
+  else
+    echo "== client: go-redis $(sed -n 's/.*go-redis\/v9 \(v[0-9.]*\).*/\1/p' "$GO_DIR/go.mod" | head -1)"
+    (cd "$GO_DIR" && FLINT_ADDR=127.0.0.1:$PORT FLINT_TOKEN=tok-acme "$GO" run .)
+    [ $? -eq 0 ] || { echo "FAIL: go-redis client compatibility"; exit 1; }
+    RAN="$RAN, go-redis"
+  fi
+fi
+
+[ -z "$SKIPPED" ] || echo "SKIP: client(s) not checked:$SKIPPED"
+echo "PASS: client compatibility — $RAN, each with its default options, connect, serve, and get their own native types back; excluded commands fail honestly"

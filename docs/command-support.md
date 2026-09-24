@@ -446,14 +446,26 @@ the write; ours says why.
 
 ## Introspection and admin commands are absent
 
-`INFO`, `CONFIG` and `SHUTDOWN` are not implemented, by any component. They
-answer `ERR unknown command`, the same as `KEYS`:
+`CONFIG` and `SHUTDOWN` are not implemented, by any component, and neither is
+`INFO` at a seat. They answer `ERR unknown command`, the same as `KEYS`:
 
     PING             -> PONG
-    INFO             -> ERR unknown command 'INFO'
-    INFO server      -> ERR unknown command 'INFO SERVER'
     CONFIG RESETSTAT -> ERR unknown command 'CONFIG RESETSTAT'
     SHUTDOWN NOSAVE  -> ERR unknown command 'SHUTDOWN NOSAVE'
+
+**`INFO` through the proxy answers, minimally** (BUG-0176). Clients send it on
+their own: ioredis, by default, sends `INFO` before its first command and treats
+an error as fatal, so until this it could not connect at all. The proxy
+answers it itself rather than asking a seat, because a seat's figures are
+shared by every tenant on its pair:
+
+    INFO             -> # Server / redis_mode:standalone / flint_version:<build>
+                        # Persistence / loading:0
+    INFO persistence -> just that section; an unknown section is empty, as in Redis
+
+There is no `redis_version` field. Advertising one would be a claim about the
+whole command surface, and Flint implements the commands listed above, not a
+Redis release. A client that insists on a version will not find one.
 
 Use **`FLINTINFO`** where you would reach for `INFO`. It is a flat
 `field:value` list covering what a client or an operator actually needs from a
@@ -525,10 +537,12 @@ Both `flint-server` and `flint-proxy` carry a `NO_KEY` list that includes
 question only: can a routing slot be derived from argument 1.** It says nothing
 about whether any component implements the command.
 
-Reading `INFO` in the proxy's `NO_KEY` list and concluding the proxy handles it
-is a natural inference and a wrong one. A keyless command is *forwarded* — to
-pair 0's master — which then returns the same `ERR unknown command`. So these
-commands fail identically through the proxy as against a bare seat.
+Reading `CLUSTER` in the proxy's `NO_KEY` list and concluding the proxy handles
+it is a natural inference and a wrong one. A keyless command is *forwarded* —
+to pair 0's master — which then returns the same `ERR unknown command`. So these
+commands fail identically through the proxy as against a bare seat. (`INFO` was
+this section's example until BUG-0176; the proxy now answers it before routing
+is ever asked, which the list still does not say either.)
 
 If you are deciding whether Flint implements something, the list to consult is
 **Supported** above, or simply send it to a server and read the reply. Someone
