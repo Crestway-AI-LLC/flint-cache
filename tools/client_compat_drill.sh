@@ -245,6 +245,22 @@ def cross_slot_txn():
         raise AssertionError("a transaction deleting keys in two slots was not refused")
     assert r.exists("a", "b") == 2, "the refused transaction deleted something"
 check("a transaction refuses a cross-slot DEL at queue time", cross_slot_txn)
+def cross_slot_mset_txn():
+    # BUG-0181: MSET checks its own slots, but only at EXEC, where a refusal
+    # is one element of the reply and everything queued beside it applies.
+    # It must be refused when QUEUED, so the SET before it never lands.
+    r.delete("a")
+    p = r.pipeline(transaction=True)
+    p.set("a", "1")
+    p.mset({"a": "2", "b": "3"})
+    try:
+        p.execute()
+    except redis.ResponseError as e:
+        assert "don't hash to the same slot" in str(e), f"refused, but not as CROSSSLOT: {e}"
+    else:
+        raise AssertionError("a transaction with a cross-slot MSET was not refused")
+    assert r.get("a") is None, "the SET queued beside a refused MSET applied"
+check("a cross-slot MSET poisons its whole transaction", cross_slot_mset_txn)
 
 print("== MGET across slots (ADR-0048)")
 # The proxy splits an MGET per slot and puts the values back in order. `a`

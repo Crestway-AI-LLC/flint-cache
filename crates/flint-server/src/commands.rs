@@ -79,6 +79,16 @@ pub const DEFAULT_NS: &[u8] = b"0";
 /// verdict against the real one, and reusing the dispatcher means there is
 /// no second table of ~90 arities to drift out of step the first time an
 /// arm changes. The probe cannot affect anything: its store is discarded.
+///
+/// A command's own CROSSSLOT refusal is the same kind of verdict (BUG-0181).
+/// Whether MSET, MGET, the set operations, ZUNIONSTORE, COPY or RENAME span
+/// slots depends on their keys alone, and every arm checks it before reading
+/// the store. It used to be left to EXEC, where it is a runtime error: the
+/// transaction was queued on the command's FIRST key, the command failed as
+/// one element of EXEC's reply, and everything queued around it applied,
+/// although `command-support.md` promises a cross-slot key poisons the
+/// transaction. `DEL`, `UNLINK` and `EXISTS` check no slot of their own; the
+/// queue step walks their keys itself (BUG-0179).
 pub fn queue_time_error(args: &[Vec<u8>]) -> Option<Value> {
     let probe = flint_storage::MemKv::new();
     let reply = Dispatcher::new(&probe, crate::commands::probe_clock).dispatch(args);
@@ -88,7 +98,8 @@ pub fn queue_time_error(args: &[Vec<u8>]) -> Option<Value> {
         // our own output, not parsing someone else's.
         Value::Error(e)
             if e.starts_with("ERR unknown command")
-                || e.starts_with("ERR wrong number of arguments") =>
+                || e.starts_with("ERR wrong number of arguments")
+                || e.starts_with("CROSSSLOT") =>
         {
             Some(reply)
         }
@@ -2931,6 +2942,43 @@ mod tests {
     fn call(kv: &MemKv, parts: &[&[u8]]) -> Value {
         let d = Dispatcher::new(kv, system_clock);
         d.dispatch(&parts.iter().map(|p| p.to_vec()).collect::<Vec<_>>())
+    }
+
+    /// BUG-0181: every multi-key command that refuses cross-slot keys does
+    /// so at QUEUE time, so the refusal poisons the transaction instead of
+    /// failing alone at EXEC. `a` is slot 15495, `b` 3300.
+    #[test]
+    fn a_commands_own_crossslot_is_a_queue_time_error() {
+        let q = |parts: &[&str]| {
+            queue_time_error(
+                &parts
+                    .iter()
+                    .map(|p| p.as_bytes().to_vec())
+                    .collect::<Vec<_>>(),
+            )
+        };
+        for c in [
+            &["MSET", "a", "1", "b", "2"][..],
+            &["MGET", "a", "b"],
+            &["SINTER", "a", "b"],
+            &["SUNIONSTORE", "a", "b"],
+            &["ZUNIONSTORE", "a", "1", "b"],
+            &["COPY", "a", "b"],
+            &["RENAME", "a", "b"],
+        ] {
+            assert!(
+                matches!(q(c), Some(Value::Error(ref e)) if e.starts_with("CROSSSLOT")),
+                "{c:?} spans slots and must be refused when queued, got {:?}",
+                q(c)
+            );
+        }
+        // Colocated, the same commands queue.
+        assert_eq!(q(&["MSET", "{u}a", "1", "{u}b", "2"]), None);
+        assert_eq!(q(&["MGET", "{u}a", "{u}b"]), None);
+        assert_eq!(q(&["RENAME", "{u}a", "{u}b"]), None);
+        // DEL, UNLINK and EXISTS check no slot of their own: the queue step
+        // walks their keys (BUG-0179), not this probe.
+        assert_eq!(q(&["DEL", "a", "b"]), None);
     }
 
     /// The bytes a client on `proto` actually receives. Comparing wire

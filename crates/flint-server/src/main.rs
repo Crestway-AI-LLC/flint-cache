@@ -8067,6 +8067,41 @@ mod serve_tests {
         addr
     }
 
+    /// BUG-0181, over the wire: a cross-slot MSET after a SET is refused when
+    /// queued and poisons the transaction, so the SET never applies. It used
+    /// to queue on its first key, fail alone inside EXEC's reply, and let the
+    /// SET through: the partial apply a queue-time refusal exists to prevent.
+    #[test]
+    fn a_cross_slot_mset_in_multi_poisons_the_whole_transaction() {
+        let addr = spawn_server();
+        let mut s = connect(addr);
+        let mut p = Vec::new();
+        for c in [
+            &["MULTI"][..],
+            &["SET", "a", "1"],
+            &["MSET", "a", "2", "b", "3"],
+            &["EXEC"],
+            &["GET", "a"],
+        ] {
+            let parts = c.iter().map(|x| Value::Bulk(Some(x.as_bytes().to_vec())));
+            encode(&Value::Array(Some(parts.collect())), &mut p);
+        }
+        s.write_all(&p).expect("send");
+        let f = read_frames(&mut s, 5);
+        assert_eq!(f[1], Value::Simple("QUEUED".into()), "SET a");
+        assert!(
+            matches!(&f[2], Value::Error(e) if e.starts_with("CROSSSLOT")),
+            "MSET across slots must be refused when queued, got {:?}",
+            f[2]
+        );
+        assert!(
+            matches!(&f[3], Value::Error(e) if e.starts_with("EXECABORT")),
+            "EXEC must abort a poisoned transaction, got {:?}",
+            f[3]
+        );
+        assert_eq!(f[4], Value::Bulk(None), "the SET queued before it applied");
+    }
+
     fn connect(addr: std::net::SocketAddr) -> TcpStream {
         let s = TcpStream::connect(addr).expect("connect");
         s.set_read_timeout(Some(std::time::Duration::from_secs(10)))
