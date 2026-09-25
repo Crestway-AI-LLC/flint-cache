@@ -52,7 +52,7 @@ Three corollaries, each measured rather than assumed:
 
 **Strings / keyspace**: `GET` · `SET` (plain) · `MSET` · `SETRANGE`
 (absolute offset) · `GETSET` · `DEL` · `UNLINK` · `EXISTS` · `TYPE` ·
-`FLUSHALL` · `PERSIST` · `COPY … REPLACE`
+`FLUSHALL` · `FLUSHDB` · `PERSIST` · `COPY … REPLACE`
 
 **Absolute expiry**: `SETEX` · `SET … EXAT`/`PXAT` · `EXPIREAT` ·
 `PEXPIREAT` · `GETEX EXAT`/`PXAT`/`PERSIST`

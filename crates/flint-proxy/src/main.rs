@@ -1485,6 +1485,7 @@ fn route_key(args: &[Vec<u8>]) -> Option<&[u8]> {
         b"ECHO",
         b"DBSIZE",
         b"FLUSHALL",
+        b"FLUSHDB",
         b"COMMAND",
         b"CLUSTER",
         b"INFO",
@@ -3251,6 +3252,7 @@ fn prefetchable(args: &[Vec<u8>], name: &[u8], replica_reads: bool) -> bool {
                 | b"SCAN"
                 | b"DBSIZE"
                 | b"FLUSHALL"
+                | b"FLUSHDB"
                 | b"MULTI"
                 | b"EXEC"
                 | b"DISCARD"
@@ -3598,7 +3600,7 @@ fn cache_writeback(
                     topo.cache.invalidate(ns, k);
                 }
             }
-            b"FLUSHALL" => topo.cache.invalidate_ns(ns),
+            b"FLUSHALL" | b"FLUSHDB" => topo.cache.invalidate_ns(ns),
             _ => {
                 if let Some(k) = args.get(1) {
                     topo.cache.invalidate(ns, k);
@@ -3859,7 +3861,8 @@ async fn handle(
             })
             .await
         }
-        b"FLUSHALL" => {
+        // FLUSHDB is FLUSHALL: one database per tenant (BUG-0178).
+        b"FLUSHALL" | b"FLUSHDB" => {
             fan_out(topo, backends, raw, |replies| {
                 for r in replies {
                     if !matches!(&r, Value::Simple(s) if s == "OK") {
@@ -4584,6 +4587,7 @@ mod prefetch_tests {
             vec!["SCAN", "0"],
             vec!["DBSIZE"],
             vec!["FLUSHALL"],
+            vec!["FLUSHDB"],
             vec!["PING"],
             vec!["ECHO", "x"],
             vec!["QUIT"],

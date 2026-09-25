@@ -26,7 +26,14 @@
 pub fn reduces_space(name: &[u8]) -> bool {
     matches!(
         name.to_ascii_uppercase().as_slice(),
-        b"DEL" | b"UNLINK" | b"FLUSHALL" | b"EXPIRE" | b"PEXPIRE" | b"EXPIREAT" | b"PEXPIREAT"
+        b"DEL"
+            | b"UNLINK"
+            | b"FLUSHALL"
+            | b"FLUSHDB"
+            | b"EXPIRE"
+            | b"PEXPIRE"
+            | b"EXPIREAT"
+            | b"PEXPIREAT"
     )
 }
 
@@ -72,6 +79,7 @@ pub fn is_write_command(name: &[u8]) -> bool {
             | b"APPEND"
             | b"SETRANGE"
             | b"FLUSHALL"
+            | b"FLUSHDB"
             | b"HSET"
             | b"HDEL"
             | b"HINCRBY"

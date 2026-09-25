@@ -37,7 +37,9 @@ on-demand rather than in CI, because it needs a module you have to compile.
 
 **Connection / server**: PING, ECHO, AUTH (at the proxy), COMMAND,
 SELECT (index 0 only), HELLO, QUIT (at the proxy — see below), DBSIZE,
-FLUSHALL (both scoped to the tenant namespace).
+FLUSHALL, FLUSHDB (all three scoped to the tenant namespace; a tenant has one
+database, so FLUSHDB and FLUSHALL clear the same keys), INFO (at the proxy —
+see below).
 
 > **QUIT is answered by the proxy, and by a seat that is still LOADING. A
 > READY seat answers `ERR unknown command 'QUIT'`.** Clients connect through

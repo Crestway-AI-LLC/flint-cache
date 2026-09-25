@@ -220,6 +220,15 @@ def txn():
     assert r.get("{ct}:log") == "debit"
 check("MULTI/EXEC/WATCH (same slot)", txn)
 
+print("== the cache-store clear() path")
+# BUG-0178: FLUSHDB was unknown, so Django's cache.clear() raised and Rails'
+# RedisCacheStore#clear swallowed the error and cleared nothing.
+def flushdb():
+    r.set("fdb:a", "v"); r.set("fdb:b", "v")
+    assert r.flushdb() is True, "flushdb did not answer OK"
+    assert r.dbsize() == 0, f"{r.dbsize()} keys survived FLUSHDB"
+check("FLUSHDB empties the tenant's keyspace", flushdb)
+
 print("== commands we exclude by design still fail HONESTLY")
 check("SUBSCRIBE", lambda: r.pubsub().subscribe("c") or r.execute_command("SUBSCRIBE", "c"),
       expect_unsupported=True)

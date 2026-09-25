@@ -2087,6 +2087,24 @@ fn corpus() -> Vec<Case> {
                 s(&[b"DBSIZE"], Expect::Int(0)),
             ],
         },
+        // BUG-0178: FLUSHDB was an unknown command, so framework cache
+        // stores' clear() failed (Django raised; Rails swallowed it and
+        // cleared nothing). The EFFECT is asserted, for the reason the case
+        // above gives, and the ASYNC form Redis also accepts.
+        Case {
+            family: "connection",
+            name: "flushdb empties the keyspace, sync and async",
+            steps: vec![
+                s(&[b"SET", b"fd1", b"v"], Expect::Ok),
+                s(&[b"SADD", b"fd2", b"m"], Expect::Int(1)),
+                s(&[b"FLUSHDB"], Expect::Ok),
+                s(&[b"GET", b"fd1"], Expect::Nil),
+                s(&[b"EXISTS", b"fd2"], Expect::Int(0)),
+                s(&[b"SET", b"fd3", b"v"], Expect::Ok),
+                s(&[b"FLUSHDB", b"ASYNC"], Expect::Ok),
+                s(&[b"DBSIZE"], Expect::Int(0)),
+            ],
+        },
         Case {
             family: "flint",
             name: "flintinfo reports the fields operators read",

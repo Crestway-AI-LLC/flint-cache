@@ -41,6 +41,7 @@ pub fn command_key(args: &[Vec<u8>]) -> Option<&[u8]> {
         b"ECHO",
         b"DBSIZE",
         b"FLUSHALL",
+        b"FLUSHDB",
         b"COMMAND",
         b"CLUSTER",
         b"INFO",
@@ -221,8 +222,8 @@ impl<'a> Dispatcher<'a> {
     fn has_oversized_key(&self, name_upper: &[u8], args: &[Vec<u8>]) -> bool {
         let max = self.limits.effective_max_key() as usize;
         match name_upper {
-            b"PING" | b"ECHO" | b"DBSIZE" | b"FLUSHALL" | b"COMMAND" | b"CLUSTER" | b"INFO"
-            | b"SELECT" | b"QUIT" | b"HELLO" | b"SCAN" => false,
+            b"PING" | b"ECHO" | b"DBSIZE" | b"FLUSHALL" | b"FLUSHDB" | b"COMMAND" | b"CLUSTER"
+            | b"INFO" | b"SELECT" | b"QUIT" | b"HELLO" | b"SCAN" => false,
             b"DEL" | b"EXISTS" => args[1..].iter().any(|k| k.len() > max),
             b"MSET" => args[1..].iter().step_by(2).any(|k| k.len() > max),
             _ => args.get(1).is_some_and(|k| k.len() > max),
@@ -913,7 +914,12 @@ impl<'a> Dispatcher<'a> {
                 );
                 Value::Integer(live)
             }
-            b"FLUSHALL" => {
+            // FLUSHDB IS FLUSHALL (BUG-0178). A tenant has one database --
+            // SELECT accepts 0 only -- so "this database" and "every
+            // database" are the same set. It was an unknown command, which
+            // made Django's cache.clear() raise and Rails' RedisCacheStore
+            // #clear silently do nothing (its error handler swallows it).
+            b"FLUSHALL" | b"FLUSHDB" => {
                 // Namespace-scoped: a tenant flushing its cache must never
                 // touch another tenant's rows (kv.clear() would). Chunked
                 // collect-then-delete keeps memory bounded on huge tenants.
