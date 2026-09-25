@@ -263,6 +263,33 @@ fn warm_rejoin_failed_at(dir: &std::path::Path) -> Option<u64> {
 #[cfg(feature = "rocks")]
 static LAST_RESEED: std::sync::Mutex<Option<(String, u64)>> = std::sync::Mutex::new(None);
 
+/// WHICH WAY THE REJOIN WENT, beside why the copy was marked (BUG-0177).
+///
+/// The reason alone cannot tell the operations agent what a marked seat COST.
+/// flintctl marks every ex-master on a roll, and the same "superseded copy
+/// rejoining the lineage" reason precedes a sub-second local rewind and a
+/// full re-seed that moves the dataset with the master's write gates shut
+/// (BUG-0071's ~90 s) alike. So the agent raised the same insight for both,
+/// for a day after every roll. The value is set where the decision is made:
+///
+/// * `warm` -- the marked copy was verified as-is; nothing moved.
+/// * `rewound` -- restored from a local snapshot the master vouched for.
+/// * `full_sync` -- discarded and re-seeded from a checkpoint over the wire.
+/// * `lineage` -- no upstream to rejoin: this node is the lineage (a start
+///   with no `--replica-of`, or a promotion), and the marker was only cleared.
+///
+/// Reset to None whenever a new reason is recorded: a new marker is a new
+/// episode, and the last one's path must not be reported as this one's.
+#[cfg(feature = "rocks")]
+static LAST_RESEED_PATH: std::sync::Mutex<Option<&'static str>> = std::sync::Mutex::new(None);
+
+#[cfg(feature = "rocks")]
+fn remember_reseed_path(path: &'static str) {
+    if let Ok(mut slot) = LAST_RESEED_PATH.lock() {
+        *slot = Some(path);
+    }
+}
+
 /// Read the marker into [`LAST_RESEED`] before something destroys it.
 ///
 /// Called from both destroyers — `clear_needs_reseed` and the wipe path — and
@@ -294,11 +321,18 @@ fn remember_reseed_reason(dir: &std::path::Path) {
     if let Ok(mut slot) = LAST_RESEED.lock() {
         *slot = Some((why, at_ms));
     }
+    // A new reason starts a new episode; its path is not known until the
+    // rejoin decides it (BUG-0177).
+    if let Ok(mut slot) = LAST_RESEED_PATH.lock() {
+        *slot = None;
+    }
 }
 
-/// Drop the marker — this copy is authoritative again.
+/// Drop the marker — this copy is authoritative again. True when there was
+/// one to drop, so a caller recording what that meant (BUG-0177) does not
+/// relabel an earlier episode when nothing was cleared.
 #[cfg(feature = "rocks")]
-fn clear_needs_reseed(dir: &std::path::Path) {
+fn clear_needs_reseed(dir: &std::path::Path) -> bool {
     let marker = dir.join(NEEDS_RESEED);
     if marker.exists() {
         remember_reseed_reason(dir);
@@ -307,7 +341,9 @@ fn clear_needs_reseed(dir: &std::path::Path) {
         } else {
             eprintln!("cleared {NEEDS_RESEED}: this node is the lineage now");
         }
+        return true;
     }
+    false
 }
 
 /// One RESP request/response over the internal mesh — enough protocol for
@@ -2246,6 +2282,7 @@ fn main() -> std::io::Result<()> {
                                             &format!("warm rejoin at seq {cursor}"),
                                         );
                                         warm = true;
+                                        remember_reseed_path("warm");
                                     }
                                     Err(e) => eprintln!(
                                         "marked copy refused by {target} ({e}); trying a rewind"
@@ -2269,8 +2306,12 @@ fn main() -> std::io::Result<()> {
                         && let Some(snaps) = arg("--rewind-snaps")
                     {
                         rewound = try_rewind(&dir_path, &snaps, target);
+                        if rewound {
+                            remember_reseed_path("rewound");
+                        }
                     }
                     if !rewound {
+                        remember_reseed_path("full_sync");
                         eprintln!(
                             "{NEEDS_RESEED} present: this copy cannot be continued ({why}) — \
                              discarding it and re-seeding from a checkpoint"
@@ -2287,6 +2328,7 @@ fn main() -> std::io::Result<()> {
                     }
                 } else {
                     clear_needs_reseed(&dir_path);
+                    remember_reseed_path("lineage");
                 }
             }
             let fresh = !dir_path.join("CURRENT").exists();
@@ -5726,7 +5768,9 @@ fn flintpromote(
             // earlier demotion describes a position nobody follows any more,
             // and leaving it would make a later start-as-replica throw away
             // the very history everyone else is now descended from.
-            clear_needs_reseed(kv.path());
+            if clear_needs_reseed(kv.path()) {
+                remember_reseed_path("lineage");
+            }
             eprintln!("promoted to master at role epoch {epoch}");
             journal_event(
                 flint_journal::EventKind::Promoted,
@@ -6303,11 +6347,17 @@ fn last_reseed_fields() -> String {
     // field. `mark_needs_reseed`'s callers pass formatted prose today, which
     // is why this is a guard rather than a theory about their contents.
     let why = why.replace(['\r', '\n'], " ");
-    if *at_ms == 0 {
+    let mut out = if *at_ms == 0 {
         format!("last_reseed_reason:{why}\r\n")
     } else {
         format!("last_reseed_reason:{why}\r\nlast_reseed_at_ms:{at_ms}\r\n")
+    };
+    // Absent until the rejoin decides, like the timestamp when it is unknown:
+    // a field present means it happened (BUG-0177).
+    if let Some(path) = LAST_RESEED_PATH.lock().ok().and_then(|p| *p) {
+        out.push_str(&format!("last_reseed_path:{path}\r\n"));
     }
+    out
 }
 
 #[cfg(not(feature = "rocks"))]
@@ -7638,6 +7688,7 @@ mod last_reseed_tests {
 
     fn reset() {
         *LAST_RESEED.lock().expect("lock") = None;
+        *LAST_RESEED_PATH.lock().expect("lock") = None;
     }
 
     /// THE WHOLE POINT (BUG-0082): the reason outlives the file. Recovery
@@ -7777,6 +7828,114 @@ mod last_reseed_tests {
         assert!(
             lines[0].contains("role:master"),
             "the injected text should survive INSIDE the reason: {out:?}"
+        );
+    }
+
+    /// BUG-0177: the path is ABSENT until the rejoin decides it. Recording the
+    /// reason is the first thing the marked boot does, and a path reported at
+    /// that moment would be a guess.
+    #[test]
+    fn the_path_is_absent_until_the_rejoin_decides() {
+        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        reset();
+        let d = fresh("undecided");
+        mark_needs_reseed(&d, "superseded copy rejoining the lineage held by m:1");
+        remember_reseed_reason(&d);
+        let out = last_reseed_fields();
+        assert!(out.contains("last_reseed_reason:"), "{out:?}");
+        assert!(
+            !out.contains("last_reseed_path"),
+            "a path before any decision: {out:?}"
+        );
+    }
+
+    /// Each decided path is reported as recorded, on its own line after the
+    /// reason -- so the agent can tell a sub-second rewind from a full re-seed.
+    #[test]
+    fn each_decided_path_is_reported() {
+        for path in ["warm", "rewound", "full_sync", "lineage"] {
+            let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+            reset();
+            let d = fresh(&format!("path-{path}"));
+            mark_needs_reseed(&d, "superseded copy rejoining the lineage held by m:1");
+            remember_reseed_reason(&d);
+            remember_reseed_path(path);
+            let out = last_reseed_fields();
+            let last = out.lines().rfind(|l| !l.trim().is_empty()).unwrap_or("");
+            assert_eq!(last, format!("last_reseed_path:{path}"), "{out:?}");
+        }
+    }
+
+    /// A new marker is a new episode: its path is unknown until decided, and
+    /// the previous episode's must not be reported beside the new reason. A
+    /// full_sync from last week read next to today's reason is exactly the
+    /// false signal this field exists to remove.
+    #[test]
+    fn a_new_reason_forgets_the_last_episodes_path() {
+        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        reset();
+        let d = fresh("episodes");
+        mark_needs_reseed(&d, "first episode");
+        remember_reseed_reason(&d);
+        remember_reseed_path("full_sync");
+        mark_needs_reseed(&d, "second episode");
+        remember_reseed_reason(&d);
+        let out = last_reseed_fields();
+        assert!(out.contains("second episode"), "{out:?}");
+        assert!(
+            !out.contains("last_reseed_path"),
+            "the first episode's path leaked: {out:?}"
+        );
+    }
+
+    /// The promotion path records `lineage` only when a marker was actually
+    /// cleared; otherwise it would relabel an earlier episode it never saw.
+    #[test]
+    fn clearing_nothing_says_so() {
+        let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        reset();
+        let d = fresh("clearnothing");
+        assert!(
+            !clear_needs_reseed(&d),
+            "cleared a marker that was not there"
+        );
+        mark_needs_reseed(&d, "x");
+        assert!(
+            clear_needs_reseed(&d),
+            "did not report the marker it cleared"
+        );
+    }
+
+    /// THE WIRING, by the source -- the same weak instrument, used for the same
+    /// reason as `the_wipe_path_captures_before_it_destroys`: the rejoin block
+    /// is unreachable from a unit test. Searched in PRODUCTION code only,
+    /// cut at the first test module, because `include_str!` carries this
+    /// test's own literals and a search of the whole file matches ITSELF --
+    /// BUG-0082's first version passed with both call sites deleted that way.
+    #[test]
+    fn every_rejoin_outcome_records_its_path() {
+        let full = include_str!("main.rs");
+        let src = &full[..full.find("#[cfg(test)]").expect("a test module")];
+        let at = |needle: &str| {
+            src.find(needle)
+                .unwrap_or_else(|| panic!("{needle:?} is gone from production code (BUG-0177)"))
+        };
+        assert!(at("warm = true;") < at("remember_reseed_path(\"warm\")"));
+        assert!(at("rewound = try_rewind(") < at("remember_reseed_path(\"rewound\")"));
+        assert!(at("if !rewound {") < at("remember_reseed_path(\"full_sync\")"));
+        assert!(
+            at("remember_reseed_path(\"full_sync\")")
+                < at("match std::fs::remove_dir_all(&dir_path)"),
+            "full_sync must be recorded before the copy is discarded"
+        );
+        assert_eq!(
+            src.matches("remember_reseed_path(\"lineage\")").count(),
+            2,
+            "a start with no upstream and a promotion both record lineage"
+        );
+        assert!(
+            src.contains("if clear_needs_reseed(kv.path()) {\n                remember_reseed_path(\"lineage\")"),
+            "promotion must record lineage only when it cleared a marker"
         );
     }
 
