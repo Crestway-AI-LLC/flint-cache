@@ -41,3 +41,7 @@ The same survey found Rails' `read_multi` and Django's `get_many`/`set_many`
 refused with `CROSSSLOT`, even on a single-pair fleet. Cross-slot multi-key
 commands are **excluded by design** (`docs/command-support.md`), so changing
 that is a design decision, not this fix.
+
+Decided 2026-09-25 as ADR-0048: the proxy now splits `MGET` per slot, so
+`read_multi` works, and `client_compat_drill` gates it. Django's `set_many` is
+a transaction and stays refused across slots.

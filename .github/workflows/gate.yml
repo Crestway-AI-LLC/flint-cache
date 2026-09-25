@@ -270,10 +270,18 @@ jobs:
           go-version: stable
           cache: false
 
+      # Rails' RedisCacheStore is gated in the same drill (ADR-0048: its
+      # read_multi read every cross-slot key as a miss). Pinned for the same
+      # reason as Go.
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.3'
+
       - name: Client libraries for client_compat_drill
         # The drill installs these itself when missing, into exactly these
         # paths (tools/client_compat_drill.sh: VENV=/tmp/flint-compat-venv,
-        # NODE_DIR=/tmp/flint-compat-node, GO_DIR=/tmp/flint-compat-go).
+        # NODE_DIR=/tmp/flint-compat-node, GO_DIR=/tmp/flint-compat-go,
+        # RB_HOME=/tmp/flint-compat-ruby).
         # ioredis and go-redis are the tenant guide's other two samples
         # (BUG-0176: ioredis's default ready check never passed, and nothing
         # ran it). Doing it here as a NAMED step is
@@ -297,6 +305,7 @@ jobs:
           cd /tmp/flint-compat-go
           go mod init flintcompat >/dev/null 2>&1
           go get github.com/redis/go-redis/v9
+          GEM_HOME=/tmp/flint-compat-ruby gem install --no-document activesupport redis
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2

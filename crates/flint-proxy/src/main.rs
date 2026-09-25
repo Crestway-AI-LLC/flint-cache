@@ -1480,7 +1480,8 @@ impl Backends {
 /// unless the command addresses no key. Multi-key commands route by their
 /// FIRST key in v0 (scatter-gather is a follow-on). `DEL`, `UNLINK` and
 /// `EXISTS` with several keys never reach here whole: `split_by_owner`
-/// (BUG-0179).
+/// (BUG-0179). Nor does an `MGET` whose keys span slots: `split_mget`
+/// (ADR-0048).
 fn route_key(args: &[Vec<u8>]) -> Option<&[u8]> {
     let name = args.first()?;
     const NO_KEY: &[&[u8]] = &[
@@ -3271,6 +3272,12 @@ fn prefetchable(args: &[Vec<u8>], name: &[u8], replica_reads: bool) -> bool {
     if matches!(upper.as_slice(), b"DEL" | b"UNLINK" | b"EXISTS") && args.len() > 2 {
         return false;
     }
+    // Likewise an MGET whose keys span slots (ADR-0048): `handle` splits it
+    // per slot. Staged whole, its first key's node would refuse it with
+    // CROSSSLOT.
+    if upper.as_slice() == b"MGET" && spans_slots(&args[1..]) {
+        return false;
+    }
     // A D7 replica read resolves its target differently and falls back to the
     // master when a replica errors. Left on the ordinary path: the fallback
     // is worth more than the batching.
@@ -3886,6 +3893,151 @@ async fn split_by_owner(
     Value::Integer(total)
 }
 
+/// Do these keys hash to more than one slot?
+fn spans_slots(keys: &[Vec<u8>]) -> bool {
+    let mut slots = keys.iter().map(|k| slot_for_key(k));
+    let first = slots.next();
+    slots.any(|s| Some(s) != first)
+}
+
+/// Group an MGET's keys by hash slot, in first-seen order. Each group holds
+/// the POSITIONS of its keys in the caller's command, so every value can go
+/// back where it was asked for, and a key named twice is asked for twice.
+fn group_by_slot(keys: &[Vec<u8>]) -> Vec<(u16, Vec<usize>)> {
+    let mut index: HashMap<u16, usize> = HashMap::new();
+    let mut groups: Vec<(u16, Vec<usize>)> = Vec::new();
+    for (i, k) in keys.iter().enumerate() {
+        let slot = slot_for_key(k);
+        let g = *index.entry(slot).or_insert_with(|| {
+            groups.push((slot, Vec::new()));
+            groups.len() - 1
+        });
+        groups[g].1.push(i);
+    }
+    groups
+}
+
+/// Put the per-slot replies of a split MGET back in the caller's order.
+///
+/// Every group must answer with exactly one value per key it was asked for.
+/// Anything else, an error above all, is the answer to the whole call: a
+/// pair that could not be read must fail the MGET, not leave holes that the
+/// caller would read as nil, which is to say as a cache miss.
+fn assemble_mget(n: usize, groups: &[(u16, Vec<usize>)], replies: Vec<Value>) -> Value {
+    let mut out: Vec<Option<Value>> = Vec::with_capacity(n);
+    out.resize_with(n, || None);
+    for ((_, positions), reply) in groups.iter().zip(replies) {
+        match reply {
+            Value::Array(Some(items)) if items.len() == positions.len() => {
+                for (&p, v) in positions.iter().zip(items) {
+                    out[p] = Some(v);
+                }
+            }
+            Value::Error(e) => return Value::Error(e),
+            other => {
+                return Value::Error(format!(
+                    "ERR split MGET: a backend answered {other:?} for {} keys",
+                    positions.len()
+                ));
+            }
+        }
+    }
+    match out.into_iter().collect::<Option<Vec<Value>>>() {
+        Some(values) => Value::Array(Some(values)),
+        None => Value::Error("ERR split MGET: a key was left unanswered".into()),
+    }
+}
+
+/// An `MGET` whose keys hash to more than one slot (ADR-0048).
+///
+/// The server refuses those with CROSSSLOT (BUG-0053), and it is right to: a
+/// node asked for a key it does not hold answers nil. But Flint presents one
+/// standalone server, so no client knows to colocate its keys, and a framework
+/// cache store's multi-read (Rails' `read_multi`) was refused on every call and
+/// silently read as all misses.
+///
+/// So the proxy sends one MGET per slot, each of which the node still checks,
+/// and puts the values back in the caller's order. Keys in one slot take the
+/// unchanged path. The per-slot MGETs are staged on each pair's read-lane
+/// connection and flushed once per connection, as `prefetch_run` does, so a
+/// read over many slots costs about one round trip per pair rather than one
+/// per slot; each reply is collected through `forward_collect`, which hands
+/// MOVED, a dead connection or a failover to `forward`. A replica-reading
+/// tenant's groups go through `forward` one at a time instead, keeping its
+/// fall-back to the master.
+///
+/// What the caller gives up is the single snapshot: a reader racing an MSET
+/// can see some slots before it and some after, as with a Redis Cluster
+/// client splitting the same call. MSET itself is NOT split: its atomicity is
+/// its contract. A transaction never reaches here (`transaction_step` runs
+/// first), so a queued MGET is still refused across slots.
+async fn split_mget(
+    topo: &Arc<Topology>,
+    backends: &mut Backends,
+    ns: &[u8],
+    args: &[Vec<u8>],
+    raw: &[u8],
+    read_replica: bool,
+) -> Value {
+    let keys = &args[1..];
+    let groups = group_by_slot(keys);
+    if groups.len() <= 1 {
+        return forward(topo, backends, ns, args, raw, read_replica).await;
+    }
+    let subs: Vec<(Vec<Vec<u8>>, Vec<u8>)> = groups
+        .iter()
+        .map(|(_, positions)| {
+            let mut sub = Vec::with_capacity(positions.len() + 1);
+            sub.push(args[0].clone());
+            sub.extend(positions.iter().map(|&p| keys[p].clone()));
+            let parts: Vec<&[u8]> = sub.iter().map(|p| p.as_slice()).collect();
+            let frame = encode_cmd(&parts);
+            (sub, frame)
+        })
+        .collect();
+    let mut replies = Vec::with_capacity(subs.len());
+    if read_replica {
+        for (sub, frame) in &subs {
+            replies.push(forward(topo, backends, ns, sub, frame, true).await);
+        }
+        return assemble_mget(keys.len(), &groups, replies);
+    }
+    // Stage a prefix: a slot with no known master, or a connection that
+    // cannot be had, ends it, and the rest go through `forward` one at a time
+    // with its full rediscovery budget.
+    let mut leases: HashMap<String, Rc<apool::AsyncConn>> = HashMap::new();
+    let mut staged = Vec::with_capacity(subs.len());
+    for ((slot, _), (_, frame)) in groups.iter().zip(&subs) {
+        let Some(addr) = topo.route(ns, *slot) else {
+            break;
+        };
+        let conn = match leases.get(&addr) {
+            Some(c) => c.clone(),
+            None => match backends.lease(&addr, apool::Lane::Read).await {
+                Ok(c) => leases.entry(addr.clone()).or_insert(c).clone(),
+                Err(_) => break,
+            },
+        };
+        match conn.stage(frame) {
+            Ok(rx) => staged.push((rx, addr)),
+            Err(_) => break,
+        }
+    }
+    for conn in leases.values() {
+        let _ = conn.flush().await;
+    }
+    // Collected in staging order, every one of them, before any reply is
+    // judged: an error in one group must not strand the tickets behind it.
+    let n_staged = staged.len();
+    for ((rx, addr), (sub, frame)) in staged.into_iter().zip(&subs) {
+        replies.push(forward_collect(topo, backends, ns, sub, frame, rx, addr).await);
+    }
+    for (sub, frame) in &subs[n_staged..] {
+        replies.push(forward(topo, backends, ns, sub, frame, false).await);
+    }
+    assemble_mget(keys.len(), &groups, replies)
+}
+
 async fn handle(
     topo: &Arc<Topology>,
     backends: &mut Backends,
@@ -3924,6 +4076,9 @@ async fn handle(
         b"DEL" | b"UNLINK" | b"EXISTS" if args.len() > 2 => {
             split_by_owner(topo, backends, ns, args, raw, read_replica).await
         }
+        // An MGET across slots: one MGET per slot, reassembled in the
+        // caller's order (ADR-0048). See `split_mget`.
+        b"MGET" if args.len() > 2 => split_mget(topo, backends, ns, args, raw, read_replica).await,
         // Group-wide aggregates fan out.
         b"DBSIZE" => {
             fan_out(topo, backends, raw, |replies| {
@@ -4668,6 +4823,7 @@ mod prefetch_tests {
             vec!["DEL", "a", "b"],
             vec!["EXISTS", "a", "b"],
             vec!["UNLINK", "a", "b"],
+            vec!["MGET", "a", "b"],
             vec!["PING"],
             vec!["ECHO", "x"],
             vec!["QUIT"],
@@ -4710,6 +4866,11 @@ mod prefetch_tests {
         // No routable key: those go to pair 0 by a separate rule.
         assert!(!may_stage(&["MGET"], false));
 
+        // An MGET within one slot is ordinary keyed traffic and still stages;
+        // only one that `split_mget` would split is held back (ADR-0048).
+        assert!(may_stage(&["MGET", "k"], false));
+        assert!(may_stage(&["MGET", "{u}a", "{u}b"], false));
+
         // Unknown verbs earn the node's own error on the ordinary path.
         assert!(!may_stage(&["NOTACOMMAND", "k"], false));
     }
@@ -4717,7 +4878,7 @@ mod prefetch_tests {
 
 #[cfg(test)]
 mod split_tests {
-    use super::group_by_owner;
+    use super::{Value, assemble_mget, group_by_owner, group_by_slot, spans_slots};
 
     fn keys(ks: &[&str]) -> Vec<Vec<u8>> {
         ks.iter().map(|k| k.as_bytes().to_vec()).collect()
@@ -4749,6 +4910,86 @@ mod split_tests {
         let g = group_by_owner(&keys(&["a", "b"]), |k| (k == b"a").then(|| "A".to_string()));
         assert_eq!(g.len(), 2);
         assert_eq!(g[1], (None, keys(&["b"])));
+    }
+
+    fn bulk(v: &str) -> Value {
+        Value::Bulk(Some(v.as_bytes().to_vec()))
+    }
+
+    /// ADR-0048: `a` (slot 15495) and `b` (slot 3300) are two slots, on the
+    /// two pairs of a two-pair fleet; a hash tag makes one slot of any keys.
+    #[test]
+    fn spans_slots_is_about_slots_not_names() {
+        assert!(spans_slots(&keys(&["a", "b"])));
+        assert!(!spans_slots(&keys(&["{u}a", "{u}b"])));
+        assert!(!spans_slots(&keys(&["a", "a"])));
+        assert!(!spans_slots(&keys(&["a"])));
+    }
+
+    /// Groups hold POSITIONS, in first-seen order, and a repeated key is
+    /// asked for as often as the caller asked.
+    #[test]
+    fn group_by_slot_keeps_positions() {
+        let g = group_by_slot(&keys(&["a", "b", "a", "{u}x", "{u}y"]));
+        assert_eq!(g.len(), 3);
+        assert_eq!(g[0], (15495, vec![0, 2]));
+        assert_eq!(g[1], (3300, vec![1]));
+        assert_eq!(g[2].1, vec![3, 4]);
+    }
+
+    /// Values go back where they were asked for; a missing key is nil in its
+    /// own position, not shifted into another's.
+    #[test]
+    fn assemble_puts_each_value_back_in_place() {
+        let g = group_by_slot(&keys(&["a", "b", "a", "c"]));
+        // a=15495, b=3300, c=7365: three groups.
+        let replies = vec![
+            Value::Array(Some(vec![bulk("A"), bulk("A")])),
+            Value::Array(Some(vec![Value::Bulk(None)])),
+            Value::Array(Some(vec![bulk("C")])),
+        ];
+        assert_eq!(
+            assemble_mget(4, &g, replies),
+            Value::Array(Some(vec![
+                bulk("A"),
+                Value::Bulk(None),
+                bulk("A"),
+                bulk("C")
+            ]))
+        );
+    }
+
+    /// A pair that cannot be read fails the whole MGET. Answering nil for its
+    /// keys would read as a cache miss, the silent failure ADR-0048 exists to
+    /// end.
+    #[test]
+    fn an_error_from_one_slot_fails_the_call() {
+        let g = group_by_slot(&keys(&["a", "b"]));
+        let replies = vec![
+            Value::Array(Some(vec![bulk("A")])),
+            Value::Error("ERR no reachable master for this slot".into()),
+        ];
+        assert_eq!(
+            assemble_mget(2, &g, replies),
+            Value::Error("ERR no reachable master for this slot".into())
+        );
+    }
+
+    /// A reply of the wrong length, or not an array, is refused rather than
+    /// padded: nothing may be filled in as nil.
+    #[test]
+    fn a_short_or_odd_reply_is_refused() {
+        let g = group_by_slot(&keys(&["a", "a", "b"]));
+        let short = vec![
+            Value::Array(Some(vec![bulk("A")])),
+            Value::Array(Some(vec![bulk("B")])),
+        ];
+        assert!(matches!(assemble_mget(3, &g, short), Value::Error(_)));
+        let odd = vec![
+            Value::Simple("OK".into()),
+            Value::Array(Some(vec![bulk("B")])),
+        ];
+        assert!(matches!(assemble_mget(3, &g, odd), Value::Error(_)));
     }
 }
 

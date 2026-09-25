@@ -41,7 +41,8 @@ cluster. node-redis and go-redis send their own unimplemented handshake
   Persistence section (`loading:0`, the field ioredis reads). Sections filter
   as in Redis, and an unknown section is empty, not an error.
 - **No `redis_version`.** Advertising a version is a claim about the whole
-  command surface, and that is a product decision, not a field. A client
+  command surface, and that is a product decision, not a field. (Decided
+  2026-09-25: it stays out.) A client
   that insists on a version is not helped by this fix. Spring Boot's Redis
   health check is not one: it reads `INFO server` and reports the version as
   `unknown` when the field is absent (`DataRedisHealth.up`, read 2026-09-24),

@@ -246,6 +246,49 @@ def cross_slot_txn():
     assert r.exists("a", "b") == 2, "the refused transaction deleted something"
 check("a transaction refuses a cross-slot DEL at queue time", cross_slot_txn)
 
+print("== MGET across slots (ADR-0048)")
+# The proxy splits an MGET per slot and puts the values back in order. `a`
+# (15495) is on one pair, `b` (3300) and `c` (7365) on the other, in two
+# slots. Before ADR-0048 this was refused with CROSSSLOT, and Rails'
+# read_multi swallowed the refusal and read every key as a miss.
+def cross_slot_mget():
+    r.delete("mg:none")
+    r.set("a", "va"); r.set("b", "vb"); r.set("c", "vc")
+    got = r.mget("a", "mg:none", "b", "c", "a")
+    assert got == ["va", None, "vb", "vc", "va"], f"MGET -> {got!r}"
+    # Many slots on both pairs: every value in its own position.
+    ks = [f"mg:{i}" for i in range(200)]
+    for k in ks:
+        r.set(k, k.upper())
+    got = r.mget(ks)
+    assert got == [k.upper() for k in ks], "a 200-key MGET came back out of order"
+check("MGET answers every key in order, across slots and pairs", cross_slot_mget)
+def mget_in_a_pipeline():
+    # The GET ahead of the MGET may be staged (prefetched); the MGET ends
+    # that run and is split. Each reply must still be the right one.
+    r.set("a", "va"); r.set("b", "vb")
+    p = r.pipeline(transaction=False)
+    p.get("a"); p.mget("a", "b"); p.get("b")
+    got = p.execute()
+    assert got == ["va", ["va", "vb"], "vb"], f"pipeline -> {got!r}"
+check("MGET across slots inside a pipeline", mget_in_a_pipeline)
+def still_refused():
+    # What ADR-0048 does NOT change: MSET stays atomic, so it is refused
+    # across slots rather than split; and a transaction is not split either.
+    r.set("a", "va"); r.set("b", "vb")
+    for name, attempt in (
+        ("MSET", lambda: r.mset({"a": "x", "b": "x"})),
+        ("MGET in MULTI", lambda: r.pipeline(transaction=True).mget("a", "b").execute()),
+    ):
+        try:
+            attempt()
+        except redis.ResponseError as e:
+            assert "don't hash to the same slot" in str(e), f"{name} refused, but not as CROSSSLOT: {e}"
+        else:
+            raise AssertionError(f"{name} across slots was not refused")
+    assert r.mget("a", "b") == ["va", "vb"], "the refused MSET wrote something"
+check("MSET and a transaction are still refused across slots", still_refused)
+
 print("== the cache-store clear() path")
 # BUG-0178: FLUSHDB was unknown, so Django's cache.clear() raised and Rails'
 # RedisCacheStore#clear swallowed the error and cleared nothing.
@@ -397,6 +440,10 @@ await check('MULTI/EXEC (same slot)', async () => {
   if (!Array.isArray(got) || got.length !== 2) throw new Error(`exec -> ${JSON.stringify(got)}`);
   if (await c.get('{nrt}:a') !== '1') throw new Error('txn write missing');
 });
+await check('MGET across slots (ADR-0048)', async () => {
+  await c.set('a', 'va'); await c.set('b', 'vb'); await c.del('nr:none');
+  eq(await c.mGet(['a', 'nr:none', 'b']), ['va', null, 'vb'], 'mGet');
+});
 await check('BLPOP', async () => { await c.blPop('nr:nolist', 1); }, true);
 await check('KEYS', async () => { await c.keys('*'); }, true);
 await c.quit();
@@ -539,6 +586,76 @@ GOSRC
     (cd "$GO_DIR" && FLINT_ADDR=127.0.0.1:$PORT FLINT_TOKEN=tok-acme "$GO" run .)
     [ $? -eq 0 ] || { echo "FAIL: go-redis client compatibility"; exit 1; }
     RAN="$RAN, go-redis"
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# Rails' RedisCacheStore (ADR-0048). A framework store rather than a client
+# library, and gated for one reason: its read_multi sends MGET over whatever
+# slots the app's keys fall in, and its error handler turned the CROSSSLOT
+# refusal into {}. Every multi-read was a miss, and nothing said so. The
+# handler here only RECORDS what the store swallows, so that failure shape is
+# visible: anything swallowed is a FAIL. Default options otherwise.
+# ---------------------------------------------------------------------------
+RUBY=${FLINT_COMPAT_RUBY:-$(command -v ruby || true)}
+if [ -z "$RUBY" ]; then
+  echo "== rails cache store: SKIP (no ruby on PATH)"
+  SKIPPED="$SKIPPED rails-cache-store"
+else
+  RB_HOME=${FLINT_COMPAT_GEM_HOME:-$FLINT_DRILL_ROOT/flint-compat-ruby}
+  # GEM_HOME only. Setting GEM_PATH too hides the system gems, and gem install
+  # does not copy a dependency the system already satisfies (the distro's
+  # bigdecimal, say), so the store would install and then fail to load.
+  rb_ready() { GEM_HOME="$RB_HOME" "$RUBY" -e 'require "active_support"; require "redis"' >/dev/null 2>&1; }
+  if ! rb_ready; then
+    GEM_HOME="$RB_HOME" "$(dirname "$RUBY")/gem" install --no-document --silent activesupport redis >/dev/null 2>&1
+  fi
+  if ! rb_ready; then
+    echo "== rails cache store: SKIP (could not install activesupport and redis; offline?)"
+    SKIPPED="$SKIPPED rails-cache-store"
+  else
+    mkdir -p "$RB_HOME"
+    cat > "$RB_HOME/store.rb" <<'RUBYSRC'
+require "active_support"
+require "active_support/cache"
+require "redis"
+
+puts "== client: activesupport #{ActiveSupport.version} redis-rb #{Redis::VERSION}"
+fails = []
+check = lambda do |name, ok, note = ""|
+  puts "  #{ok ? 'ok  ' : 'FAIL'} #{name}#{ok ? '' : "  #{note}"}"
+  fails << name unless ok
+end
+# x and y are two slots on one pair; a and b are on the two pairs.
+keys = %w[x y a b c]
+[nil, "app"].each do |namespace|
+  swallowed = []
+  store = ActiveSupport::Cache::RedisCacheStore.new(
+    url: "redis://127.0.0.1:#{ENV.fetch('FLINT_PORT')}",
+    password: ENV.fetch("FLINT_TOKEN"),
+    namespace: namespace,
+    error_handler: ->(method:, returning:, exception:) { swallowed << "#{method}: #{exception.message}" }
+  )
+  label = namespace ? "namespace #{namespace}" : "no namespace"
+  data = keys.to_h { |k| [k, "v-#{k}"] }
+  store.delete("rb:missing")
+  store.write_multi(data)
+  got = store.read_multi(*keys)
+  check.("read_multi across slots (#{label})", got == data, got.inspect)
+  got = store.fetch_multi(*keys, "rb:missing") { |k| "computed-#{k}" }
+  want = data.merge("rb:missing" => "computed-rb:missing")
+  check.("fetch_multi computes only the miss (#{label})", got == want, got.inspect)
+  check.("nothing swallowed by the error handler (#{label})", swallowed.empty?, swallowed.join("; "))
+end
+if fails.any?
+  puts "\nFAIL: #{fails.size} client-visible problem(s): #{fails.join(', ')}"
+  exit 1
+end
+puts "\nall rails cache store checks passed"
+RUBYSRC
+    GEM_HOME="$RB_HOME" FLINT_PORT=$PORT FLINT_TOKEN=tok-acme "$RUBY" "$RB_HOME/store.rb"
+    [ $? -eq 0 ] || { echo "FAIL: rails cache store compatibility"; exit 1; }
+    RAN="$RAN, rails-cache-store"
   fi
 fi
 

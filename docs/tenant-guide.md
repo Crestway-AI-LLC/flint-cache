@@ -224,6 +224,8 @@ it by construction.
 Strings (SET/GET/SETNX/SETEX/MSET/INCR/DECR/INCRBY/DECRBY/APPEND),
 hashes, sets, sorted sets, lists, TTLs (EXPIRE/PEXPIRE/TTL/PERSIST),
 DEL/UNLINK/EXISTS/TYPE, DBSIZE/FLUSHALL (scoped to your namespace).
-Conformance is validated against Valkey continuously. Not in v0:
-pub/sub, streams, Lua, MULTI/EXEC, blocking commands, cross-slot
-multi-key operations (multi-key commands route by their first key).
+Conformance is validated against Valkey continuously. Transactions
+(MULTI/EXEC/WATCH) work when every key shares a slot (ADR-0012). Not in
+v0: pub/sub, streams, Lua, blocking commands, and cross-slot multi-key
+operations, except `MGET`, `DEL`, `UNLINK` and `EXISTS`, which the proxy
+splits per slot or per pair (`docs/command-support.md`).

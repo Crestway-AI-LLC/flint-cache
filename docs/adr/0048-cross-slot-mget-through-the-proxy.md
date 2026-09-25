@@ -1,6 +1,7 @@
 # ADR-0048: Cross-slot MGET through the proxy
 
-Status: **PROPOSED 2026-09-25, for Jeff's decision.** Nothing is built.
+Status: **ACCEPTED 2026-09-25: option B**, as recommended (Jeff). Built in
+`flint-proxy` (`split_mget`); see "As built" at the end.
 
 > Numbering: shared across the public and ops repositories, as ADR-0012's note
 > explains. 0047 is the ops agent's rate-headroom record.
@@ -63,7 +64,7 @@ Django's `set_many` stays refused. Its fix is on the application side (a
 `KEY_FUNCTION` that colocates, at the price of one hot slot), and
 `command-support.md` should say so beside the rule.
 
-## Verification (if accepted)
+## Verification
 
 - A conformance case can't cover this: the oracle is a standalone Valkey with
   no slots. So it is a drill on a two-pair fleet: `MGET` over keys in several
@@ -73,3 +74,27 @@ Django's `set_many` stays refused. Its fix is on the application side (a
   anything is claimed about it.
 - The staging exclusion, as for BUG-0179: a split command must never be staged
   whole.
+
+## As built
+
+- `handle` sends an `MGET` whose keys span slots to `split_mget`; keys in one
+  slot take the unchanged path. The prefetch pass never stages one
+  (`prefetchable`), because staged whole it would be refused.
+- One `MGET` per slot, staged on each pair's read-lane connection and flushed
+  once per connection, so a read over many slots costs about one round trip
+  per pair. Each reply is collected through `forward_collect`, which hands
+  MOVED, a dead connection or a failover to `forward`, so the split adds no
+  retry logic of its own. A replica-reading tenant's groups go through
+  `forward` one at a time, keeping the fall-back to the master.
+- `assemble_mget` puts values back by position. A group that answers with an
+  error, or with anything but one value per key, is the answer to the whole
+  call: nothing is ever filled in as nil (unit tests in `split_tests`).
+- `client_compat_drill` gates it on a two-pair fleet: redis-py (order, a
+  missing key, a repeated key, 200 keys, inside a pipeline) and node-redis,
+  plus **Rails' `RedisCacheStore`** (`read_multi` and `fetch_multi`, with and
+  without a namespace, failing if its error handler swallows anything). The
+  same drill asserts what did not change: `MSET` and a transaction are still
+  refused across slots.
+- A pair going down mid-call is covered at the unit level (an error from one
+  group fails the call); no drill kills a pair under a split `MGET`.
+- Django's `get_many` is not claimed here; it was never measured on its own.

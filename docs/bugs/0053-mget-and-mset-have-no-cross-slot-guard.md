@@ -47,6 +47,8 @@ onto a node that does not own the slot.
 and `forward` derives the single slot from it. So a multi-key command is
 shipped whole to one pair's master, whatever the remaining keys hash to. The
 proxy has no `MGET` case at all; its only mention is a `may_stage` test.
+(Since ADR-0048, 2026-09-25, it has one: `split_mget` sends one `MGET` per
+slot, each still refused by the node if it spans slots. `MSET` is unchanged.)
 
 That is by design (`main.rs:40`: "v0 scope, deliberately deferred: ...
 cross-slot"), which is precisely why the node-side refusal was written. `MGET`

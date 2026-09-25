@@ -83,6 +83,12 @@ transaction is confined to one slot by ADR-0012 D1, which puts it on exactly
 one pair. So there is no multi-pair invariant a client could ever have
 observed, and none a backup can violate.
 
+> Amended 2026-09-25. Since BUG-0179 and ADR-0048 the proxy splits a
+> multi-key `DEL`, `UNLINK`, `EXISTS` or `MGET` whose keys span pairs. The
+> conclusion stands: a split is one command per slot or pair, with no step
+> that is atomic across them, so it still gives a client no multi-pair
+> invariant to observe.
+
 **The trigger to revisit is cross-PAIR atomicity, and only that.** This
 record first argued the point by citing `MULTI`/`EXEC`/`WATCH` as excluded by
 design, which was true when it was written and stopped being true when

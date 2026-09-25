@@ -444,6 +444,17 @@ the write; ours says why.
   does not give is a single atomic step across pairs: a reader racing a
   multi-pair `DEL` can see one pair's keys gone before another's. Inside a
   transaction they are same-slot like every other command.
+  **`MGET` is the other exception** (ADR-0048): through the proxy it takes keys
+  in any slots, the proxy sends one `MGET` per slot, and the values come back
+  in the order asked. What it gives up is the single snapshot: a reader racing
+  an `MSET` can see some slots before it and some after. A pair that cannot be
+  read fails the whole call; it is never answered as nil. **`MSET` is not
+  split**, because its atomicity is its contract, and nothing inside a
+  transaction is split. So a framework cache store whose multi-write is a
+  transaction (Django's `set_many`: `MULTI`, `MSET`, `EXPIRE`s, `EXEC`) is
+  still refused across slots. Either write those keys one at a time, or give
+  the cache a `KEY_FUNCTION` that puts one hash tag on every key, which puts
+  that whole cache in one slot, on one pair.
   Also **pub/sub**, **streams**, **blocking
   commands** (BLPOP, BLMOVE …), **KEYS/RANDOMKEY**, and **EVAL/EVALSHA**.
   These conflict with slot-sharded multi-tenancy or reintroduce the
