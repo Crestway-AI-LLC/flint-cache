@@ -226,7 +226,7 @@ CORE="${FLINT_CORE_ORDER:-kill_order bind_dial_sites seat_names restart repl kil
       build_stamp config_drift tenant_status proxy_conformance edge_roll
       cpha_roll admin_gated_proxy edge_ca_trust chaos_edge_tls
       cert_rotate control_tls controller_ha controller_managed controller_slow_master controller_stall
-      controller_multipair controlplane cp_growth cp_publish failover_bystander failover_churn gates port_allocator internal_mtls json lease lease_after_repoint cp_restart_tenant_flags
+      controller_multipair controlplane cp_growth cp_publish failover_bystander failover_churn gates bug_state_markers port_allocator internal_mtls json lease lease_after_repoint cp_restart_tenant_flags
       fanout_timeout loaded_promote loading_visible m3_exit migrate_slots min_replicas node_tls proxy_backpressure
       proxy_cache proxy_tls read_under_stall replica_reads replica_stale_fence rw_isolation
       scan slot_cutover slot_cutover_recovery slot_moved snapshot_restore
@@ -1378,8 +1378,14 @@ assert_bug_titles_agree_with_status() {
   local out
   out=$(python3 - <<'BTPY'
 import glob, os, re, sys
+# DONE AND BUILT ARE CLOSED (BUG-0180). The ops repo's index opens thirteen
+# Status lines with DONE and two with BUILT, and neither word was in its copy
+# of this list, so a row said OPEN for a month over a deployed fix (ops
+# OPS-0324). This index uses neither today; the two repos share one
+# convention, so they share one vocabulary. The same tuple is in the other bug
+# check in this file; change both.
 CLOSED = ("FIXED", "RESOLVED", "CLOSED", "SHIPPED", "RETRACTED", "SUBSUMED",
-          "WONTFIX")
+          "WONTFIX", "DONE", "BUILT")
 bad = []
 n = 0
 compared = 0
@@ -1493,8 +1499,14 @@ assert_bug_index_markers_agree_with_status() {
   local out
   out=$(python3 - <<'BIMPY'
 import glob, os, re, sys
+# DONE AND BUILT ARE CLOSED (BUG-0180). The ops repo's index opens thirteen
+# Status lines with DONE and two with BUILT, and neither word was in its copy
+# of this list, so a row said OPEN for a month over a deployed fix (ops
+# OPS-0324). This index uses neither today; the two repos share one
+# convention, so they share one vocabulary. The same tuple is in the other bug
+# check in this file; change both.
 CLOSED = ("FIXED", "RESOLVED", "CLOSED", "SHIPPED", "RETRACTED", "SUBSUMED",
-          "WONTFIX")
+          "WONTFIX", "DONE", "BUILT")
 try:
     idx = open("docs/bugs/README.md", encoding="utf-8", errors="replace").read()
 except OSError:
@@ -1511,11 +1523,19 @@ except OSError:
 # write-up's H1 for the files that carry their state there instead of on a
 # Status line. One grammar, so a marker legible in one place is legible in the
 # other.
+# OPEN BY ITS WORD, NOT BY EQUALITY (BUG-0180). The closed words match by
+# prefix, so "(FIXED; ...)" was a marker and "(OPEN, ...)" was not: BUG-0050's
+# row ended "(OPEN, mechanism confirmed)" over a write-up that says FIXED, and
+# the check read the row's earlier FIXED as its marker.
+def is_open_word(w):
+    return w.rstrip(";,.:") == "OPEN"
+
+
 def state_marker(text):
     found = None
     for g in re.findall(r"\(([^)]*)\)", text):
         w = g.upper().split()
-        if w and (w[0] == "OPEN" or any(w[0].startswith(c) for c in CLOSED)):
+        if w and (is_open_word(w[0]) or any(w[0].startswith(c) for c in CLOSED)):
             found = g.upper()
     return found
 
@@ -1618,7 +1638,7 @@ for f in sorted(glob.glob("docs/bugs/[0-9][0-9][0-9][0-9]-*.md")):
     words = row.split()
     if not words:
         continue
-    if words[0] == "OPEN" and first.startswith(CLOSED):
+    if is_open_word(words[0]) and first.startswith(CLOSED):
         bad.append((os.path.basename(f), row, src, st))
     elif any(words[0].startswith(c) for c in CLOSED) and first == "OPEN":
         bad.append((os.path.basename(f), row, src, st))
