@@ -3,8 +3,12 @@
 Status: **ACCEPTED 2026-09-25: option B**, as recommended (Jeff). Built in
 `flint-proxy` (`split_mget`); see "As built" at the end.
 
-> Numbering: shared across the public and ops repositories, as ADR-0012's note
-> explains. 0047 is the ops agent's rate-headroom record.
+> Numbering: this record took 0048 on the belief that the public and ops
+> repositories share one sequence. They do not: each numbers its own
+> (README.md, "Each repository numbers its own ADRs"), and the public
+> sequence stood at 0032. The number is kept rather than changed, because it
+> was already cited when the mistake was found; 0033 to 0047 are unused, and
+> the next public ADR is 0049.
 
 ## Context
 
