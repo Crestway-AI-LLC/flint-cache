@@ -477,6 +477,23 @@ fn corpus() -> Vec<Case> {
         },
         Case {
             family: "hashes",
+            name: "hmset sets fields and answers OK",
+            // BUG-0182: HMSET was unknown, and Spring Session and ASP.NET
+            // Core's IDistributedCache write every entry with it.
+            steps: vec![
+                s(&[b"HMSET", b"hm1", b"a", b"1", b"b", b"2"], Expect::Ok),
+                s(&[b"HMSET", b"hm1", b"a", b"9"], Expect::Ok),
+                s(&[b"HGET", b"hm1", b"a"], Expect::Str(b"9")),
+                s(&[b"HLEN", b"hm1"], Expect::Int(2)),
+                s(&[b"HMSET", b"hm1", b"a"], Expect::AnyError),
+                s(&[b"HMSET", b"hm1"], Expect::AnyError),
+                s(&[b"SET", b"hm2", b"x"], Expect::Ok),
+                s(&[b"HMSET", b"hm2", b"f", b"v"], Expect::AnyError),
+                s(&[b"GET", b"hm2"], Expect::Str(b"x")),
+            ],
+        },
+        Case {
+            family: "hashes",
             name: "hdel to empty removes the key",
             steps: vec![
                 s(&[b"HSET", b"h2", b"a", b"1", b"b", b"2"], Expect::Int(2)),

@@ -57,7 +57,7 @@ Three corollaries, each measured rather than assumed:
 **Absolute expiry**: `SETEX` · `SET … EXAT`/`PXAT` · `EXPIREAT` ·
 `PEXPIREAT` · `GETEX EXAT`/`PXAT`/`PERSIST`
 
-**Collections**: `HSET` · `HDEL` · `SADD` · `SREM` · `ZADD` · `ZREM` ·
+**Collections**: `HSET` · `HMSET` · `HDEL` · `SADD` · `SREM` · `ZADD` · `ZREM` ·
 `LSET` (absolute index, absolute value) · `LREM key 0 m` ·
 `ZREMRANGEBYSCORE` · `ZREMRANGEBYLEX` · the `STORE` variants
 (`ZUNIONSTORE`, `ZINTERSTORE`, `SINTERSTORE`, `SUNIONSTORE`, `SDIFFSTORE`),

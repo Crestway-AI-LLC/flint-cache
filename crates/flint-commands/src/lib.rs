@@ -81,6 +81,7 @@ pub fn is_write_command(name: &[u8]) -> bool {
             | b"FLUSHALL"
             | b"FLUSHDB"
             | b"HSET"
+            | b"HMSET"
             | b"HDEL"
             | b"HINCRBY"
             | b"SADD"

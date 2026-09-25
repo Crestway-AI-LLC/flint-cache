@@ -459,7 +459,14 @@ impl<'a> Dispatcher<'a> {
             }
 
             // hashes
-            b"HSET" => self.cmd_hset(args),
+            b"HSET" => self.cmd_hset(args, "hset"),
+            // HMSET is HSET answering +OK (BUG-0182). Deprecated upstream since
+            // Redis 4.0 and still what Spring Session and ASP.NET Core's
+            // IDistributedCache write every entry with.
+            b"HMSET" => match self.cmd_hset(args, "hmset") {
+                Value::Integer(_) => Value::Simple("OK".into()),
+                other => other,
+            },
             b"HSETNX" => exact(args, 4, "hsetnx", |a| {
                 reply(
                     self.hashes.hsetnx(slot_for_key(&a[1]), &a[1], &a[2], &a[3]),
@@ -1087,9 +1094,9 @@ impl<'a> Dispatcher<'a> {
         }
     }
 
-    fn cmd_hset(&self, args: &[Vec<u8>]) -> Value {
+    fn cmd_hset(&self, args: &[Vec<u8>], name: &str) -> Value {
         if args.len() < 4 || !args.len().is_multiple_of(2) {
-            return arity_err("hset");
+            return arity_err(name);
         }
         let pairs: Vec<(Vec<u8>, Vec<u8>)> = args[2..]
             .chunks(2)
@@ -3621,6 +3628,24 @@ mod tests {
         assert_eq!(call(&s, &[b"EXISTS", b"h", b"str"]), Value::Integer(2));
         assert_eq!(call(&s, &[b"EXPIRE", b"h", b"100"]), Value::Integer(1));
         assert_eq!(call(&s, &[b"DEL", b"h", b"str"]), Value::Integer(2));
+    }
+
+    /// BUG-0182: HMSET is HSET answering +OK, and its errors name it.
+    #[test]
+    fn hmset_writes_like_hset_and_answers_ok() {
+        let s = MemKv::new();
+        assert_eq!(
+            call(&s, &[b"HMSET", b"h", b"a", b"1", b"b", b"2"]),
+            Value::Simple("OK".into())
+        );
+        assert_eq!(
+            call(&s, &[b"HGET", b"h", b"b"]),
+            Value::Bulk(Some(b"2".to_vec()))
+        );
+        assert_eq!(
+            call(&s, &[b"HMSET", b"h", b"a"]),
+            Value::Error("ERR wrong number of arguments for 'hmset' command".into())
+        );
     }
 
     #[test]
