@@ -438,6 +438,12 @@ the write; ours says why.
   command. A multi-key command whose keys share a slot is fair game and
   several are supported (SINTER, ZUNIONSTORE, COPY); it is scattering one
   request across slots that is excluded. Colocate with a hash tag.
+  **`DEL`, `UNLINK` and `EXISTS` are the exception** (BUG-0179): each key is
+  answered on its own, so through the proxy they take keys in any slots, split
+  by the pair that owns them, and the counts are summed. The one thing a split
+  does not give is a single atomic step across pairs: a reader racing a
+  multi-pair `DEL` can see one pair's keys gone before another's. Inside a
+  transaction they are same-slot like every other command.
   Also **pub/sub**, **streams**, **blocking
   commands** (BLPOP, BLMOVE …), **KEYS/RANDOMKEY**, and **EVAL/EVALSHA**.
   These conflict with slot-sharded multi-tenancy or reintroduce the

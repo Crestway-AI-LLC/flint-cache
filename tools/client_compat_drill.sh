@@ -220,6 +220,32 @@ def txn():
     assert r.get("{ct}:log") == "debit"
 check("MULTI/EXEC/WATCH (same slot)", txn)
 
+print("== multi-key deletes across the two pairs (BUG-0179)")
+# `a` is slot 15495 and `b` slot 3300: the two pairs' halves of the range. A
+# DEL or EXISTS naming both used to be forwarded whole to `a`'s pair, which
+# answered for `a` alone -- DEL said 1 and `b` survived.
+def cross_pair_del():
+    r.set("a", "1"); r.set("b", "1")
+    assert r.exists("a", "b") == 2, f"EXISTS a b -> {r.exists('a', 'b')}"
+    assert r.delete("a", "b") == 2, "DEL a b did not count both"
+    assert r.get("b") is None, "DEL a b left b behind"
+    assert r.exists("a", "b") == 0
+check("DEL and EXISTS count every key, across pairs", cross_pair_del)
+def cross_slot_txn():
+    r.set("a", "1"); r.set("b", "1")
+    p = r.pipeline(transaction=True)
+    p.delete("a", "b")
+    try:
+        p.execute()
+    except redis.ResponseError as e:
+        # redis-py turns the CROSSSLOT prefix into ClusterCrossSlotError and
+        # drops it from the message, so match the server's own words.
+        assert "don't hash to the same slot" in str(e), f"refused, but not as CROSSSLOT: {e}"
+    else:
+        raise AssertionError("a transaction deleting keys in two slots was not refused")
+    assert r.exists("a", "b") == 2, "the refused transaction deleted something"
+check("a transaction refuses a cross-slot DEL at queue time", cross_slot_txn)
+
 print("== the cache-store clear() path")
 # BUG-0178: FLUSHDB was unknown, so Django's cache.clear() raised and Rails'
 # RedisCacheStore#clear swallowed the error and cleared nothing.

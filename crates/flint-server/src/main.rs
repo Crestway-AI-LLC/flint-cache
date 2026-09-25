@@ -4357,7 +4357,21 @@ fn transaction_control(
         txn.poisoned = true;
         return Some(e);
     }
-    if let Some(key) = commands::command_key(args) {
+    // EVERY key DEL / UNLINK / EXISTS names, not only the first (BUG-0179).
+    // Unlike MGET or MSET they check no slot of their own at EXEC, so a key
+    // in another slot was queued, and skipped silently when that slot lived
+    // on another pair. The docs already promised this refusal: "a later
+    // command naming a key elsewhere is refused with CROSSSLOT at QUEUE time".
+    let upper = args
+        .first()
+        .map(|n| n.to_ascii_uppercase())
+        .unwrap_or_default();
+    let keys: Vec<&[u8]> = if matches!(upper.as_slice(), b"DEL" | b"UNLINK" | b"EXISTS") {
+        args[1..].iter().map(|k| k.as_slice()).collect()
+    } else {
+        commands::command_key(args).into_iter().collect()
+    };
+    for key in keys {
         let slot = flint_slot::slot_for_key(key);
         match txn.slot {
             None => txn.slot = Some(slot),

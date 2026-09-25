@@ -38,7 +38,8 @@
 //! -MOVED must never reroute tenant B, whose rows did not move.
 //!
 //! Still deferred, and this list is now short: cross-slot scatter-gather
-//! (multi-key commands route by their FIRST key — see `key_of`) and hot-key
+//! (multi-key commands route by their FIRST key — see `route_key` — except
+//! `DEL`, `UNLINK` and `EXISTS`, split by pair since BUG-0179) and hot-key
 //! ABSORPTION. The sketch that finds hot keys ships and is read by
 //! PROXYHOTKEYS, the exporter and the agent; what is absent is anything that
 //! changes routing because of one, and the sketch "never toggles behavior"
@@ -1477,7 +1478,9 @@ impl Backends {
 
 /// The key a command routes by (mirrors the server's command_key): `args[1]`
 /// unless the command addresses no key. Multi-key commands route by their
-/// FIRST key in v0 (scatter-gather is a follow-on).
+/// FIRST key in v0 (scatter-gather is a follow-on). `DEL`, `UNLINK` and
+/// `EXISTS` with several keys never reach here whole: `split_by_owner`
+/// (BUG-0179).
 fn route_key(args: &[Vec<u8>]) -> Option<&[u8]> {
     let name = args.first()?;
     const NO_KEY: &[&[u8]] = &[
@@ -3262,6 +3265,12 @@ fn prefetchable(args: &[Vec<u8>], name: &[u8], replica_reads: bool) -> bool {
     {
         return false;
     }
+    // Multi-key DEL / UNLINK / EXISTS may have to be SPLIT across pairs
+    // (BUG-0179), which only `handle` does. Staged, the whole command would
+    // go to its first key's pair, the bug this exists to fix.
+    if matches!(upper.as_slice(), b"DEL" | b"UNLINK" | b"EXISTS") && args.len() > 2 {
+        return false;
+    }
     // A D7 replica read resolves its target differently and falls back to the
     // master when a replica errors. Left on the ordinary path: the fallback
     // is worth more than the batching.
@@ -3814,6 +3823,69 @@ fn info_reply(sections: &[Vec<u8>], version: &str) -> Value {
     Value::Bulk(Some(body.into_bytes()))
 }
 
+/// Group `keys` by the master each routes to, in first-seen order. Pure, so
+/// the grouping is a unit test; `route` is `Topology::route` in production.
+fn group_by_owner(
+    keys: &[Vec<u8>],
+    route: impl Fn(&[u8]) -> Option<String>,
+) -> Vec<(Option<String>, Vec<Vec<u8>>)> {
+    let mut groups: Vec<(Option<String>, Vec<Vec<u8>>)> = Vec::new();
+    for k in keys {
+        let owner = route(k);
+        match groups.iter_mut().find(|(o, _)| *o == owner) {
+            Some((_, ks)) => ks.push(k.clone()),
+            None => groups.push((owner, vec![k.clone()])),
+        }
+    }
+    groups
+}
+
+/// A multi-key `DEL`, `UNLINK` or `EXISTS` whose keys live on more than one
+/// pair (BUG-0179).
+///
+/// These were forwarded whole to the FIRST key's pair, like every multi-key
+/// command. Unlike MGET and MSET (BUG-0053), the server checks no slot for
+/// them, so the other pair's keys were answered by a node that does not hold
+/// them: `DEL a b` deleted `a`, left `b`, and said 1; `EXISTS a b` said 1.
+/// The near-cache had already dropped `b`, so the next `GET b` fetched the
+/// value the caller had just deleted. Framework cache stores invalidate this
+/// way (`delete_many`, `delete_multi`).
+///
+/// Split rather than refused. Refusing would break every single-pair fleet,
+/// where these have always answered correctly, and the three are per key: a
+/// count summed over pairs is the count. Keys on one pair (every single-pair
+/// fleet, and any colocated set) take the unchanged path. What a split cannot
+/// give is ONE atomic step across pairs: a reader racing a split `DEL` can
+/// see one pair's keys gone and another's not yet, as with a Redis Cluster
+/// client splitting the same call. An error from any pair is returned as-is;
+/// groups sent before it have taken effect.
+async fn split_by_owner(
+    topo: &Arc<Topology>,
+    backends: &mut Backends,
+    ns: &[u8],
+    args: &[Vec<u8>],
+    raw: &[u8],
+    read_replica: bool,
+) -> Value {
+    let groups = group_by_owner(&args[1..], |k| topo.route(ns, slot_for_key(k)));
+    if groups.len() <= 1 {
+        return forward(topo, backends, ns, args, raw, read_replica).await;
+    }
+    let mut total = 0i64;
+    for (_, keys) in groups {
+        let mut sub = Vec::with_capacity(keys.len() + 1);
+        sub.push(args[0].clone());
+        sub.extend(keys);
+        let parts: Vec<&[u8]> = sub.iter().map(|p| p.as_slice()).collect();
+        let frame = encode_cmd(&parts);
+        match forward(topo, backends, ns, &sub, &frame, read_replica).await {
+            Value::Integer(n) => total += n,
+            other => return other,
+        }
+    }
+    Value::Integer(total)
+}
+
 async fn handle(
     topo: &Arc<Topology>,
     backends: &mut Backends,
@@ -3847,6 +3919,11 @@ async fn handle(
         // master, in pair order. Never the replica-read path (a node's
         // cursor state lives on the node that minted it).
         b"SCAN" => scan_forward(topo, backends, ns, args).await,
+        // Multi-key DEL / UNLINK / EXISTS: split by owning pair when the
+        // keys span more than one (BUG-0179). See `split_by_owner`.
+        b"DEL" | b"UNLINK" | b"EXISTS" if args.len() > 2 => {
+            split_by_owner(topo, backends, ns, args, raw, read_replica).await
+        }
         // Group-wide aggregates fan out.
         b"DBSIZE" => {
             fan_out(topo, backends, raw, |replies| {
@@ -4588,6 +4665,9 @@ mod prefetch_tests {
             vec!["DBSIZE"],
             vec!["FLUSHALL"],
             vec!["FLUSHDB"],
+            vec!["DEL", "a", "b"],
+            vec!["EXISTS", "a", "b"],
+            vec!["UNLINK", "a", "b"],
             vec!["PING"],
             vec!["ECHO", "x"],
             vec!["QUIT"],
@@ -4632,6 +4712,43 @@ mod prefetch_tests {
 
         // Unknown verbs earn the node's own error on the ordinary path.
         assert!(!may_stage(&["NOTACOMMAND", "k"], false));
+    }
+}
+
+#[cfg(test)]
+mod split_tests {
+    use super::group_by_owner;
+
+    fn keys(ks: &[&str]) -> Vec<Vec<u8>> {
+        ks.iter().map(|k| k.as_bytes().to_vec()).collect()
+    }
+
+    /// BUG-0179: keys on two pairs make two groups, in first-seen order,
+    /// each holding every key that pair owns.
+    #[test]
+    fn keys_on_two_pairs_make_two_groups() {
+        let route = |k: &[u8]| Some(if k.starts_with(b"x") { "A" } else { "B" }.to_string());
+        let g = group_by_owner(&keys(&["x1", "y1", "x2", "y2"]), route);
+        assert_eq!(g.len(), 2);
+        assert_eq!(g[0], (Some("A".to_string()), keys(&["x1", "x2"])));
+        assert_eq!(g[1], (Some("B".to_string()), keys(&["y1", "y2"])));
+    }
+
+    /// One owner is one group: the caller forwards the ORIGINAL command.
+    #[test]
+    fn keys_on_one_pair_are_one_group() {
+        let g = group_by_owner(&keys(&["a", "b", "c"]), |_| Some("A".to_string()));
+        assert_eq!(g.len(), 1);
+        assert_eq!(g[0].1.len(), 3);
+    }
+
+    /// A key whose master is not known yet is its own group, left to
+    /// `forward`'s rediscovery, never silently dropped.
+    #[test]
+    fn an_unrouted_key_is_kept() {
+        let g = group_by_owner(&keys(&["a", "b"]), |k| (k == b"a").then(|| "A".to_string()));
+        assert_eq!(g.len(), 2);
+        assert_eq!(g[1], (None, keys(&["b"])));
     }
 }
 

@@ -139,6 +139,10 @@ consumer that happens to be defended against it by its own design.
 
 ## Open question this fix does NOT answer: DEL, EXISTS, UNLINK
 
+> **Settled 2026-09-24 by BUG-0179: they were not guarded.** Probed live on a
+> two-pair fleet, `DEL a b` across pairs said 1 and left `b` behind. The proxy
+> now splits them by owning pair; see that write-up.
+
 Those are multi-key too and would carry the same hazard — a key on another pair
 silently absent from the count. I have not established whether they are
 guarded. A quick grep suggested "no", but it matched `has_oversized_key`'s
