@@ -314,6 +314,20 @@ def flushdb():
     assert r.dbsize() == 0, f"{r.dbsize()} keys survived FLUSHDB"
 check("FLUSHDB empties the tenant's keyspace", flushdb)
 
+print("== a connection name (BUG-0183)")
+# CLIENT was unknown, and redis-py treats a failed CLIENT SETNAME as fatal:
+# with client_name set, no connection could be made, in either protocol.
+def named():
+    for proto in (2, 3):
+        n = redis.Redis(host="127.0.0.1", port=PORT, password=PW, decode_responses=True,
+                        protocol=proto, client_name="compat")
+        n.set("cn:k", "v")
+        assert n.get("cn:k") == "v", f"RESP{proto}: get after connecting"
+        assert n.client_getname() == "compat", f"RESP{proto}: GETNAME -> {n.client_getname()!r}"
+        assert isinstance(n.client_id(), int)
+        n.close()
+check("client_name set: connects, and CLIENT GETNAME reads it back", named)
+
 print("== commands we exclude by design still fail HONESTLY")
 check("SUBSCRIBE", lambda: r.pubsub().subscribe("c") or r.execute_command("SUBSCRIBE", "c"),
       expect_unsupported=True)
@@ -456,6 +470,15 @@ await check('MULTI/EXEC (same slot)', async () => {
   if (!Array.isArray(got) || got.length !== 2) throw new Error(`exec -> ${JSON.stringify(got)}`);
   if (await c.get('{nrt}:a') !== '1') throw new Error('txn write missing');
 });
+await check('name set: connects, and CLIENT GETNAME reads it back (BUG-0183)', async () => {
+  // node-redis sends CLIENT SETNAME while connecting and never finished
+  // connecting when it was refused.
+  const n = createClient({ url: process.env.FLINT_URL, password: process.env.FLINT_TOKEN, name: 'compat' });
+  n.on('error', () => {});
+  await Promise.race([n.connect(), new Promise((_, rej) => setTimeout(() => rej(new Error('connect did not finish in 8 s')), 8000))]);
+  eq(await n.clientGetName(), 'compat', 'clientGetName');
+  await n.quit();
+});
 await check('MGET across slots (ADR-0048)', async () => {
   await c.set('a', 'va'); await c.set('b', 'vb'); await c.del('nr:none');
   eq(await c.mGet(['a', 'nr:none', 'b']), ['va', null, 'vb'], 'mGet');
@@ -537,8 +560,8 @@ fi
 
 # ---------------------------------------------------------------------------
 # go-redis v9, the guide's third sample, with its default options: RESP3 via
-# HELLO, then CLIENT SETINFO, which Flint does not implement and go-redis is
-# expected to tolerate. Measured working on 2026-09-24 (v9.22.0); gated so it
+# HELLO, then CLIENT SETINFO, which the proxy answers since BUG-0183 (and
+# go-redis tolerates a refusal of). Measured working on 2026-09-24 (v9.22.0); gated so it
 # stays that way.
 # ---------------------------------------------------------------------------
 GO=${FLINT_COMPAT_GO:-$(command -v go || true)}
@@ -583,6 +606,12 @@ func main() {
 	rdb.HSet(ctx, "go:h", "f1", "v1", "f2", "v2")
 	h, err := rdb.HGetAll(ctx, "go:h").Result()
 	say(err == nil && len(h) == 2 && h["f1"] == "v1" && h["f2"] == "v2", "HGETALL is a map", err)
+	// BUG-0183: go-redis sends CLIENT SETNAME while connecting, and a
+	// refusal failed every command.
+	named := redis.NewClient(&redis.Options{Addr: os.Getenv("FLINT_ADDR"), Password: os.Getenv("FLINT_TOKEN"), ClientName: "compat"})
+	nm, err := named.ClientGetName(ctx).Result()
+	say(err == nil && nm == "compat", "ClientName set: connects, and CLIENT GETNAME reads it back", err)
+	named.Close()
 	if fails > 0 {
 		fmt.Printf("\nFAIL: %d client-visible problem(s)\n", fails)
 		os.Exit(1)

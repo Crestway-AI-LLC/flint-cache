@@ -494,6 +494,15 @@ shared by every tenant on its pair:
                         # Persistence / loading:0
     INFO persistence -> just that section; an unknown section is empty, as in Redis
 
+**`CLIENT` through the proxy answers for your own connection** (BUG-0183):
+`SETNAME`, `GETNAME`, `ID`, `SETINFO` and `INFO`. A name given in
+`HELLO ... SETNAME` is the same name. redis-py (`client_name=`), go-redis
+(`ClientName`) and node-redis (`name`) send `CLIENT SETNAME` while
+connecting and fail when it is refused. `CLIENT LIST`, `KILL`, `PAUSE` and
+the other subcommands are refused with upstream's "unknown subcommand": a
+connection list at the proxy would show other tenants. Ids are per proxy
+process.
+
 There is no `redis_version` field. Advertising one would be a claim about the
 whole command surface, and Flint implements the commands listed above, not a
 Redis release. A client that insists on a version will not find one.

@@ -68,7 +68,7 @@ mod latency;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -2448,6 +2448,8 @@ async fn serve_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
     // on this connection feeds the sketch, keeping the mutex off the
     // common path.
     let mut hotkey_tick: u32 = 0;
+    // What `CLIENT` reports about this connection (BUG-0183).
+    let mut client = ClientConn::new();
     let mut buf: Vec<u8> = Vec::with_capacity(16 * 1024);
     let mut chunk = [0u8; 16 * 1024];
     let mut out: Vec<u8> = Vec::with_capacity(4 * 1024);
@@ -2667,6 +2669,18 @@ async fn serve_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
                         channel_budget = Some(budget);
                         Value::Simple("OK".into())
                     }
+                    // CLIENT is about this connection to the proxy, so the
+                    // proxy answers it (BUG-0183). Inside MULTI it takes
+                    // the transaction's path, so EXEC's reply stays aligned
+                    // with what the client queued.
+                    AuthStep::Proceed(_)
+                        if !txn.open
+                            && args
+                                .first()
+                                .is_some_and(|n| n.eq_ignore_ascii_case(b"CLIENT")) =>
+                    {
+                        client.command(args, proto)
+                    }
                     AuthStep::Proceed(ns) => {
                         data_command(
                             &topo,
@@ -2685,6 +2699,17 @@ async fn serve_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
                     }
                 }
             };
+            // A HELLO that succeeded may have named the connection.
+            if !matches!(reply, Value::Error(_))
+                && args
+                    .first()
+                    .is_some_and(|n| n.eq_ignore_ascii_case(b"HELLO"))
+                && let Ok(req) = flint_resp::parse_hello(args)
+                && let Some(name) = req.setname
+                && valid_client_attr(&name)
+            {
+                client.name = (!name.is_empty()).then_some(name);
+            }
             // Record into this tenant's read/write histogram — data
             // commands only (the D1 classifier; AUTH/PROXY* are
             // neither), and only once a namespace is bound.
@@ -3828,6 +3853,117 @@ fn info_reply(sections: &[Vec<u8>], version: &str) -> Value {
         .collect::<Vec<_>>()
         .join("\r\n");
     Value::Bulk(Some(body.into_bytes()))
+}
+
+/// The id the next client connection is given (`CLIENT ID`). Per proxy
+/// process, as upstream's is per server.
+static NEXT_CLIENT_ID: AtomicU64 = AtomicU64::new(1);
+
+/// One client connection as `CLIENT` reports it (BUG-0183).
+///
+/// `CLIENT` was unknown, and three mainstream clients treat that as fatal
+/// when they are configured with a connection name: redis-py's
+/// `client_name=` and go-redis's `ClientName` fail on `CLIENT SETNAME`, and
+/// node-redis's `name` never finishes connecting. The proxy answers for the
+/// caller's OWN connection only. `CLIENT LIST`, `KILL`, `PAUSE` and the rest
+/// stay unavailable: a connection list at the proxy would show other
+/// tenants.
+struct ClientConn {
+    id: u64,
+    name: Option<Vec<u8>>,
+    lib_name: Option<Vec<u8>>,
+    lib_ver: Option<Vec<u8>>,
+}
+
+/// Upstream's rule for a client name or library attribute: printable ASCII
+/// with no space.
+fn valid_client_attr(v: &[u8]) -> bool {
+    v.iter().all(|&b| (b'!'..=b'~').contains(&b))
+}
+
+impl ClientConn {
+    fn new() -> Self {
+        Self {
+            id: NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed),
+            name: None,
+            lib_name: None,
+            lib_ver: None,
+        }
+    }
+
+    /// `CLIENT <subcommand> ...`, `args[0]` being `CLIENT`.
+    fn command(&mut self, args: &[Vec<u8>], proto: flint_resp::Proto) -> Value {
+        let sub = args
+            .get(1)
+            .map(|s| s.to_ascii_uppercase())
+            .unwrap_or_default();
+        let arity = |name: &str| {
+            Value::Error(format!(
+                "ERR wrong number of arguments for 'client|{name}' command"
+            ))
+        };
+        let text = |v: &Option<Vec<u8>>| {
+            String::from_utf8_lossy(v.as_deref().unwrap_or_default()).into_owned()
+        };
+        match sub.as_slice() {
+            b"SETNAME" if args.len() == 3 => {
+                if !valid_client_attr(&args[2]) {
+                    return Value::Error(
+                        "ERR Client names cannot contain spaces, newlines or special characters."
+                            .into(),
+                    );
+                }
+                // An empty name clears it, as upstream.
+                self.name = (!args[2].is_empty()).then(|| args[2].clone());
+                Value::Simple("OK".into())
+            }
+            b"SETNAME" => arity("setname"),
+            b"GETNAME" if args.len() == 2 => Value::Bulk(self.name.clone()),
+            b"GETNAME" => arity("getname"),
+            b"ID" if args.len() == 2 => Value::Integer(self.id as i64),
+            b"ID" => arity("id"),
+            b"SETINFO" if args.len() == 4 => {
+                let attr = args[2].to_ascii_uppercase();
+                let slot = match attr.as_slice() {
+                    b"LIB-NAME" => &mut self.lib_name,
+                    b"LIB-VER" => &mut self.lib_ver,
+                    _ => {
+                        return Value::Error(format!(
+                            "ERR Unrecognized option '{}'",
+                            String::from_utf8_lossy(&args[2])
+                        ));
+                    }
+                };
+                if !valid_client_attr(&args[3]) {
+                    return Value::Error(format!(
+                        "ERR {} cannot contain spaces, newlines or special characters.",
+                        String::from_utf8_lossy(&args[2]).to_ascii_lowercase()
+                    ));
+                }
+                *slot = (!args[3].is_empty()).then(|| args[3].clone());
+                Value::Simple("OK".into())
+            }
+            b"SETINFO" => arity("setinfo"),
+            // Upstream's line, reduced to the fields that are about this
+            // connection and true at the proxy.
+            b"INFO" if args.len() == 2 => Value::Bulk(Some(
+                format!(
+                    "id={} name={} db=0 resp={} lib-name={} lib-ver={}\n",
+                    self.id,
+                    text(&self.name),
+                    proto.version(),
+                    text(&self.lib_name),
+                    text(&self.lib_ver),
+                )
+                .into_bytes(),
+            )),
+            b"INFO" => arity("info"),
+            _ => Value::Error(format!(
+                "ERR unknown subcommand '{}'. Try CLIENT HELP.",
+                String::from_utf8_lossy(args.get(1).map(|s| s.as_slice()).unwrap_or_default())
+            )),
+        }
+    }
 }
 
 /// Group `keys` by the master each routes to, in first-seen order. Pure, so
@@ -4990,6 +5126,91 @@ mod split_tests {
             Value::Array(Some(vec![bulk("B")])),
         ];
         assert!(matches!(assemble_mget(3, &g, odd), Value::Error(_)));
+    }
+}
+
+#[cfg(test)]
+mod client_tests {
+    use super::{ClientConn, Value};
+    use flint_resp::Proto;
+
+    fn cmd(c: &mut ClientConn, parts: &[&str]) -> Value {
+        let args: Vec<Vec<u8>> = parts.iter().map(|p| p.as_bytes().to_vec()).collect();
+        c.command(&args, Proto::Resp2)
+    }
+
+    /// BUG-0183: what redis-py, go-redis and node-redis send when they are
+    /// given a connection name, and read back.
+    #[test]
+    fn setname_getname_round_trip_and_an_empty_name_clears() {
+        let mut c = ClientConn::new();
+        assert_eq!(cmd(&mut c, &["CLIENT", "GETNAME"]), Value::Bulk(None));
+        assert_eq!(
+            cmd(&mut c, &["client", "setname", "myapp"]),
+            Value::Simple("OK".into())
+        );
+        assert_eq!(
+            cmd(&mut c, &["CLIENT", "GETNAME"]),
+            Value::Bulk(Some(b"myapp".to_vec()))
+        );
+        assert_eq!(
+            cmd(&mut c, &["CLIENT", "SETNAME", ""]),
+            Value::Simple("OK".into())
+        );
+        assert_eq!(cmd(&mut c, &["CLIENT", "GETNAME"]), Value::Bulk(None));
+    }
+
+    /// Upstream's validation and errors, so a client that handles Redis's
+    /// replies handles these.
+    #[test]
+    fn invalid_names_and_unknown_subcommands_are_refused_as_upstream() {
+        let mut c = ClientConn::new();
+        assert!(
+            matches!(cmd(&mut c, &["CLIENT", "SETNAME", "my app"]), Value::Error(e) if e.contains("cannot contain spaces"))
+        );
+        assert_eq!(
+            cmd(&mut c, &["CLIENT", "GETNAME"]),
+            Value::Bulk(None),
+            "a refused name is not kept"
+        );
+        assert!(
+            matches!(cmd(&mut c, &["CLIENT", "SETNAME"]), Value::Error(e) if e.contains("'client|setname'"))
+        );
+        assert!(
+            matches!(cmd(&mut c, &["CLIENT", "LIST"]), Value::Error(e) if e.starts_with("ERR unknown subcommand 'LIST'"))
+        );
+        assert!(
+            matches!(cmd(&mut c, &["CLIENT", "SETINFO", "LIB-FOO", "x"]), Value::Error(e) if e.contains("Unrecognized option"))
+        );
+        assert_eq!(
+            cmd(&mut c, &["CLIENT", "SETINFO", "lib-name", "redis-py"]),
+            Value::Simple("OK".into())
+        );
+    }
+
+    /// Ids are distinct per connection, and INFO reports this one.
+    #[test]
+    fn id_is_per_connection_and_info_describes_this_one() {
+        let mut a = ClientConn::new();
+        let mut b = ClientConn::new();
+        assert_ne!(
+            cmd(&mut a, &["CLIENT", "ID"]),
+            cmd(&mut b, &["CLIENT", "ID"])
+        );
+        cmd(&mut a, &["CLIENT", "SETNAME", "svc"]);
+        cmd(&mut a, &["CLIENT", "SETINFO", "LIB-VER", "7.0.1"]);
+        let Value::Bulk(Some(info)) = cmd(&mut a, &["CLIENT", "INFO"]) else {
+            panic!("CLIENT INFO must be a bulk string");
+        };
+        let info = String::from_utf8(info).expect("utf-8");
+        assert!(
+            info.starts_with(&format!("id={} name=svc db=0 resp=2 ", a.id)),
+            "{info:?}"
+        );
+        assert!(
+            info.contains("lib-ver=7.0.1") && info.ends_with('\n'),
+            "{info:?}"
+        );
     }
 }
 

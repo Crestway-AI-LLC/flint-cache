@@ -201,6 +201,9 @@ pub struct HelloRequest {
     pub proto: Option<Proto>,
     /// Credentials carried inline: `(username, password)`.
     pub auth: Option<(Vec<u8>, Vec<u8>)>,
+    /// `SETNAME`'s connection name. The proxy keeps it for `CLIENT GETNAME`
+    /// (BUG-0183); a seat has no use for it.
+    pub setname: Option<Vec<u8>>,
 }
 
 /// Why a `HELLO` could not be honored. Both map to specific errors Redis
@@ -243,10 +246,12 @@ pub fn parse_hello(args: &[Vec<u8>]) -> Result<HelloRequest, HelloError> {
                 req.auth = Some((args[i + 1].clone(), args[i + 2].clone()));
                 i += 3;
             }
-            // SETNAME is accepted and ignored: it names the connection for
-            // an operator's benefit, and refusing it would fail clients
-            // that always send it.
-            b"SETNAME" if i + 1 < args.len() => i += 2,
+            // SETNAME names the connection for an operator's benefit.
+            // Refusing it would fail clients that always send it.
+            b"SETNAME" if i + 1 < args.len() => {
+                req.setname = Some(args[i + 1].clone());
+                i += 2;
+            }
             _ => return Err(HelloError::Syntax),
         }
     }
@@ -917,6 +922,7 @@ mod tests {
             Ok(HelloRequest {
                 proto: Some(Proto::Resp3),
                 auth: Some((b"default".to_vec(), b"tok".to_vec())),
+                setname: None,
             })
         );
         // Bare HELLO asks about the server without changing the dialect.
@@ -931,6 +937,13 @@ mod tests {
                 .expect("setname")
                 .proto,
             Some(Proto::Resp3)
+        );
+        // BUG-0183: the name is kept, for the proxy's CLIENT GETNAME.
+        assert_eq!(
+            parse_hello(&a(&["HELLO", "3", "SETNAME", "app"]))
+                .expect("setname")
+                .setname,
+            Some(b"app".to_vec())
         );
         assert_eq!(
             parse_hello(&a(&["HELLO", "3", "AUTH", "u", "p", "SETNAME", "app"]))
