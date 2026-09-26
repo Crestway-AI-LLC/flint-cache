@@ -304,6 +304,26 @@ pub const MAX_BULK_LEN: usize = 512 * 1024 * 1024;
 /// Largest accepted array element count (Redis caps multibulk at 1M).
 pub const MAX_ARRAY_LEN: usize = 1024 * 1024;
 
+/// The text of a simple string or error: ONE line on the wire (BUG-0184).
+///
+/// An error can carry a client's own bytes: the unknown-command reply
+/// echoes the arguments, and a Lua script sent with `EVAL` is usually many
+/// lines. A raw LF inside the line is not a terminator to every parser:
+/// redis-py's reads to the first LF, finds no CR before it, and waits for more
+/// bytes that never come, so django-redis's `incr` hung until its socket
+/// timeout instead of failing at once. Upstream replaces CR and LF in an
+/// error with spaces before sending it; so does this, for simple strings too.
+fn push_line(out: &mut Vec<u8>, s: &str) {
+    if s.bytes().any(|b| b == b'\r' || b == b'\n') {
+        out.extend(
+            s.bytes()
+                .map(|b| if b == b'\r' || b == b'\n' { b' ' } else { b }),
+        );
+    } else {
+        out.extend_from_slice(s.as_bytes());
+    }
+}
+
 /// Encode for RESP2 — the default for every internal hop (proxy→backend
 /// admin calls, controller, control plane), which never negotiates HELLO.
 pub fn encode(value: &Value, out: &mut Vec<u8>) {
@@ -388,12 +408,12 @@ pub fn encode_proto(value: &Value, proto: Proto, out: &mut Vec<u8>) {
         }
         Value::Simple(s) => {
             out.push(b'+');
-            out.extend_from_slice(s.as_bytes());
+            push_line(out, s);
             out.extend_from_slice(b"\r\n");
         }
         Value::Error(s) => {
             out.push(b'-');
-            out.extend_from_slice(s.as_bytes());
+            push_line(out, s);
             out.extend_from_slice(b"\r\n");
         }
         Value::Integer(i) => {
@@ -906,6 +926,36 @@ mod tests {
         );
         // A truncated null is NeedMore, not a silent accept.
         assert_eq!(decode(b"_"), Ok(Decoded::NeedMore));
+    }
+
+    /// BUG-0184: an error or simple string carrying CR or LF (an echoed
+    /// multi-line Lua script) goes out as ONE line, with each replaced by a
+    /// space as upstream does, in both protocols.
+    #[test]
+    fn an_error_is_one_line_whatever_it_echoes() {
+        for proto in [Proto::Resp2, Proto::Resp3] {
+            let mut out = Vec::new();
+            encode_proto(
+                &Value::Error(
+                    "ERR unknown command 'EVAL', with args beginning with: '\n  local x\r\n' "
+                        .into(),
+                ),
+                proto,
+                &mut out,
+            );
+            assert_eq!(
+                out,
+                b"-ERR unknown command 'EVAL', with args beginning with: '   local x  ' \r\n"
+                    .to_vec()
+            );
+            let mut ok = Vec::new();
+            encode_proto(&Value::Simple("a\nb".into()), proto, &mut ok);
+            assert_eq!(ok, b"+a b\r\n".to_vec());
+        }
+        // The common case is untouched.
+        let mut out = Vec::new();
+        encode(&Value::Error("ERR plain".into()), &mut out);
+        assert_eq!(out, b"-ERR plain\r\n".to_vec());
     }
 
     /// The exact frame redis-py 8 opens every connection with, and the

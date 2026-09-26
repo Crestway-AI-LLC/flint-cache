@@ -328,6 +328,23 @@ def named():
         n.close()
 check("client_name set: connects, and CLIENT GETNAME reads it back", named)
 
+print("== an error that echoes a multi-line argument (BUG-0184)")
+# The unknown-command error echoes the arguments, and an EVAL script is many
+# lines. A raw LF inside the error line made redis-py wait for a CRLF that
+# never came: django-redis's incr hung until its socket timeout.
+def multiline_error():
+    t = redis.Redis(host="127.0.0.1", port=PORT, password=PW, decode_responses=True,
+                    protocol=3, socket_timeout=5)
+    try:
+        t.execute_command("EVAL", "local x = 1\nreturn x", 0)
+    except redis.ResponseError as e:
+        assert "unknown command" in str(e), f"not the unknown-command error: {e}"
+    else:
+        raise AssertionError("EVAL was answered; this check needs an error that echoes it")
+    assert t.ping() is True, "the connection was unusable after the error"
+    t.close()
+check("an error echoing a multi-line argument arrives at once, and the connection lives", multiline_error)
+
 print("== commands we exclude by design still fail HONESTLY")
 check("SUBSCRIBE", lambda: r.pubsub().subscribe("c") or r.execute_command("SUBSCRIBE", "c"),
       expect_unsupported=True)
