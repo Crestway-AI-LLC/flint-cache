@@ -338,18 +338,62 @@ def multiline_error():
     try:
         t.execute_command("EVAL", "local x = 1\nreturn x", 0)
     except redis.ResponseError as e:
-        assert "unknown command" in str(e), f"not the unknown-command error: {e}"
+        # Since ADR-0050 an unrecognised script is refused with its own
+        # message rather than as an unknown command; what matters here is that
+        # the refusal arrives at once and the connection survives it.
+        assert "Flint runs no Lua" in str(e), f"not the unrecognised-script refusal: {e}"
     else:
-        raise AssertionError("EVAL was answered; this check needs an error that echoes it")
+        raise AssertionError("an unrecognised script was answered")
     assert t.ping() is True, "the connection was unusable after the error"
     t.close()
 check("an error echoing a multi-line argument arrives at once, and the connection lives", multiline_error)
+
+print("== recognised Lua scripts and KEYS (ADR-0050)")
+# redis-py's Lock sends three Lua scripts. Flint runs no Lua, so a lock could
+# be taken and never released: it only expired. They are recognised now and
+# run natively. Two locks, on the two pairs, through the whole life.
+def lock_life():
+    from redis.exceptions import LockNotOwnedError
+    for name in ("a", "b"):
+        r.delete(name)  # earlier checks leave plain values under these names
+        lk = r.lock(name, timeout=10)
+        assert lk.acquire(blocking=False), f"{name}: acquire"
+        assert lk.extend(5), f"{name}: extend (add)"
+        assert lk.extend(20, replace_ttl=True), f"{name}: extend (replace)"
+        assert 15000 < r.pttl(name) <= 20000, f"{name}: the replaced TTL, {r.pttl(name)}"
+        assert lk.reacquire(), f"{name}: reacquire"
+        lk.release()
+        assert not r.exists(name), f"{name}: release left the key"
+        # Someone else's token cannot release it.
+        mine = r.lock(name, timeout=10)
+        assert mine.acquire(blocking=False)
+        theirs = r.lock(name, timeout=10)
+        theirs.local.token = b"not-the-token"
+        try:
+            theirs.release()
+        except LockNotOwnedError:
+            pass
+        else:
+            raise AssertionError(f"{name}: released with the wrong token")
+        assert r.exists(name), f"{name}: the wrong token deleted the lock"
+        mine.release()
+check("redis-py Lock: acquire, extend, reacquire, release, across pairs", lock_life)
+def keys_everywhere():
+    # Keys on both pairs under one prefix; KEYS answers every one, and only
+    # those, from SCAN at the proxy.
+    names = [f"kp:{i}" for i in range(50)]
+    for n in names:
+        r.set(n, "v")
+    r.set("kq:other", "v")
+    got = sorted(r.keys("kp:*"))
+    assert got == sorted(names), f"KEYS kp:* -> {len(got)} keys"
+    assert r.keys("kp:nomatch*") == [], "no match is an empty list"
+check("KEYS answers every matching key, on both pairs", keys_everywhere)
 
 print("== commands we exclude by design still fail HONESTLY")
 check("SUBSCRIBE", lambda: r.pubsub().subscribe("c") or r.execute_command("SUBSCRIBE", "c"),
       expect_unsupported=True)
 check("BLPOP", lambda: r.blpop("nolist", timeout=1), expect_unsupported=True)
-check("KEYS", lambda: r.keys("*"), expect_unsupported=True)
 
 def _fail():
     raise AssertionError("unexpected value")
@@ -501,7 +545,10 @@ await check('MGET across slots (ADR-0048)', async () => {
   eq(await c.mGet(['a', 'nr:none', 'b']), ['va', null, 'vb'], 'mGet');
 });
 await check('BLPOP', async () => { await c.blPop('nr:nolist', 1); }, true);
-await check('KEYS', async () => { await c.keys('*'); }, true);
+await check('KEYS (ADR-0050)', async () => {
+  await c.set('nrk:1', 'v'); await c.set('nrk:2', 'v');
+  eq((await c.keys('nrk:*')).sort(), ['nrk:1', 'nrk:2'], 'keys');
+});
 await c.quit();
 if (fails.length) {
   console.log(`\nFAIL: ${fails.length} client-visible problem(s): ${fails.join(', ')}`);

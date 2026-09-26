@@ -163,6 +163,14 @@ pub fn sha256_hex(data: &[u8]) -> String {
     digest.as_ref().iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// SHA-1 of `data`, lowercase hex: how Redis names a Lua script, and so how
+/// `EVALSHA` and `SCRIPT LOAD` name the scripts Flint recognises (ADR-0050).
+/// An identifier, never a security check.
+pub fn sha1_hex(data: &[u8]) -> String {
+    let digest = ring::digest::digest(&ring::digest::SHA1_FOR_LEGACY_USE_ONLY, data);
+    digest.as_ref().iter().map(|b| format!("{b:02x}")).collect()
+}
+
 /// SHA-256 of everything `r` yields, lowercase hex, in bounded memory.
 ///
 /// The one-shot form above takes a slice, which is right for a token and

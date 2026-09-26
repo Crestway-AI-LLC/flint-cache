@@ -88,6 +88,7 @@ CONCLUSION is wrong, which is the hazard in the next table, not this one.
 | `COPY` (without `REPLACE`) | Returns 0 on the retry: the copy exists, and the caller is told it does not. |
 | `RENAME` `RENAMENX` | The retry answers `ERR no such key` — the source moved on the first attempt. The rename SUCCEEDED and the caller sees an error. |
 | `BF.RESERVE` | The retry answers `ERR item exists`, same shape: created, reported as failed. |
+| `EVAL` `EVALSHA` (the recognised scripts, ADR-0050) | Each is what it wraps. A lock release that succeeded answers 0 on the retry, so the caller is told it did not hold the lock; an extend that adds to the TTL adds twice; django-redis's `incr` double-counts. |
 | `EXPIRE` `PEXPIRE` `SET … EX/PX` `GETEX EX/PX` (relative TTL) | Retry recomputes from a later clock, extending the TTL. Use the absolute `EXPIREAT`/`PEXPIREAT`/`EXAT`/`PXAT` forms for retry safety. |
 
 Note the shape shared by the last five rows: **the write landed and the retry

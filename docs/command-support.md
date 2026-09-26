@@ -468,17 +468,33 @@ the write; ours says why.
   the cache a `KEY_FUNCTION` that puts one hash tag on every key, which puts
   that whole cache in one slot, on one pair.
   Also **pub/sub**, **streams**, **blocking
-  commands** (BLPOP, BLMOVE …), **KEYS/RANDOMKEY**, and **EVAL/EVALSHA**.
+  commands** (BLPOP, BLMOVE …), **RANDOMKEY**, and **Lua** beyond the five
+  recognised scripts below.
   These conflict with slot-sharded multi-tenancy or reintroduce the
   single-threaded bottlenecks Flint exists to avoid. Common patterns they
   serve are covered by first-class commands instead; if you need one of
   these, open an issue describing the workload — patterns with broad
   demand get first-class implementations.
 
+- **Lua: five recognised scripts, and no Lua** (ADR-0050). `EVAL` and
+  `EVALSHA` run the scripts redis-py's `Lock` sends (release, extend,
+  reacquire) and the two django-redis's `incr` sends, natively and atomically:
+  each reads its one key and writes it at most once, under that key's write
+  lock. They are recognised by SHA1, as Redis names scripts, and are
+  byte-identical across redis-py 4.5.5 to 7.0.1 and django-redis 5.2.0 to
+  6.0.0. `SCRIPT LOAD`, `EXISTS` and `FLUSH` answer for them. Any other
+  script is refused ("Flint runs no Lua"), and `EVALSHA` of an unknown SHA
+  answers `NOSCRIPT`, which sends a client to `SCRIPT LOAD`, which refuses.
+- **`KEYS` through the proxy** (ADR-0050), answered from `SCAN` over every
+  master of your pairs: no node runs a `KEYS`, so nothing blocks, and what a
+  call costs is one pass of your keyspace. A reply of more than 100,000 keys
+  is refused with an error naming `SCAN`. Flask-Caching's `clear()` and
+  Spring's `RedisCacheManager` send it. A seat does not answer `KEYS`.
+
 ## Introspection and admin commands are absent
 
 `CONFIG` and `SHUTDOWN` are not implemented, by any component, and neither is
-`INFO` at a seat. They answer `ERR unknown command`, the same as `KEYS`:
+`INFO` at a seat. They answer `ERR unknown command`:
 
     PING             -> PONG
     CONFIG RESETSTAT -> ERR unknown command 'CONFIG RESETSTAT'

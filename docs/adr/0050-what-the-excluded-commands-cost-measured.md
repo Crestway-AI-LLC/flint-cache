@@ -1,6 +1,7 @@
 # ADR-0050: What the excluded commands cost, measured, and the two worth revisiting
 
-Status: **PROPOSED 2026-09-26, for Jeff's decision.** Nothing is built.
+Status: **ACCEPTED 2026-09-26** (Jeff): Lua option C, `KEYS` option B,
+decision 3 as recommended. Built; see "As built" at the end.
 
 ## Context
 
@@ -45,8 +46,9 @@ a long script holds its slot's writers for its whole run.
 
 **C. Recognise the handful of scripts that matter, and run them natively.**
 redis-py's `Lock` sends three scripts (release, extend, reacquire), fixed text
-in its source; django-redis's `incr` sends one. (How long each text has been
-unchanged across versions is not yet checked; C degrades safely either way.) The proxy or seat
+in its source; django-redis's `incr` sends two (one checks the key exists).
+Read from the published wheels: all five are byte-identical across redis-py
+4.5.5 to 7.0.1, sync and asyncio, and django-redis 5.2.0 to 6.0.0. The proxy or seat
 matches the script by its SHA1 (for `EVALSHA`) or its exact text (for `EVAL`)
 and does what it does, atomically, as a native command. Any other script is
 refused as today. If a library changes its script, it falls back to today's
@@ -83,10 +85,35 @@ and `MSET`'s is atomicity, as ADR-0048 and ADR-0049 concluded for `MSET` and
 know that the caller does not rely on the atomicity it asked for. The tenant
 guide's Frameworks section names each measured call and its alternative.
 
-## Verification (if accepted)
+## Verification
 
 - C: `client_compat_drill` takes, releases, extends and re-takes a redis-py
   `Lock` across both pairs, and django-redis's `incr` runs natively under
   concurrent increments with none lost.
 - `KEYS`: a proxy conformance case (pattern, empty match, the cap), and
   Flask-Caching's and Spring's `clear()` in the drill.
+
+## As built
+
+- **Scripts** (`flint-server`, `KnownScript`): `EVAL` hashes the text and
+  `EVALSHA` takes the SHA; the five SHAs map to native code that does what the
+  Lua does. Each reads its one key and writes it at most once, and runs inside
+  the ordinary single-command dispatch under that key's exclusive write lock,
+  because `command_key` now names `KEYS[1]` (`flint_commands::eval_keys`), as
+  do the proxy's routing and near-cache invalidation. `SCRIPT LOAD`, `EXISTS`
+  and `FLUSH` answer for the five; anything else is refused, and an unknown
+  `EVALSHA` answers `NOSCRIPT`. SHA1 comes from `ring`, already a dependency
+  (`flint_tls::sha1_hex`).
+- **`KEYS`** (`flint-proxy`, `keys_forward`): `SCAN cursor MATCH pattern COUNT
+  1000` to the end on every master, capped at 100,000 keys. A master that
+  cannot be reached fails the call.
+- **Verified**: unit tests of every script path (including that each text
+  hashes to its table entry); a conformance case running the exact texts, so
+  the Valkey oracle executes them as Lua and Flint natively, and the two must
+  agree; `client_compat_drill` runs a redis-py `Lock` through its whole life
+  on both pairs, a wrong token refused, and `KEYS` over keys on both pairs from
+  redis-py and node-redis.
+- The docs gate's command-coverage check read method-local `match` arms after
+  the dispatch table as commands (it scanned to the end of the file), and
+  reported `SCRIPT`'s subcommands as ungated commands. It now stops where the
+  dispatch `match` closes; the dispatched set otherwise is unchanged (130).

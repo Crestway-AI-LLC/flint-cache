@@ -44,4 +44,5 @@ Re-measured with the fix: django-redis's `incr` gets the error at once and
 falls back to its own read-modify-write (`EXISTS`, `TTL`, `GET`, `SET`), so it
 answers (`incr -> 2`). That fallback is not atomic, and two concurrent
 increments can lose one. That is Lua's absence, which is by design and a
-separate question, not this fix.
+separate question, not this fix. (Since ADR-0050 its script is recognised and
+runs natively and atomically.)

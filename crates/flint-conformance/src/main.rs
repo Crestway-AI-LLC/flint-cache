@@ -119,6 +119,17 @@ fn cmd(parts: &[&[u8]]) -> Vec<Vec<u8>> {
 /// three divergences we chose on purpose (see docs/command-support.md).
 /// Run it whenever these cases change; a green run there is what lets us
 /// say "matches RedisJSON" rather than "matches the contract we wrote".
+/// The Lua scripts Flint recognises (ADR-0050), byte for byte as redis-py's
+/// `Lock` and django-redis's `incr` send them. The oracle runs them as Lua; a
+/// Flint target runs them natively, and the two must agree.
+const DJANGO_INCR_CHECKED: &[u8] = "\n                    local exists = redis.call('EXISTS', KEYS[1])\n                    if (exists == 1) then\n                        return redis.call('INCRBY', KEYS[1], ARGV[1])\n                    else return false end\n                    ".as_bytes();
+const DJANGO_INCR: &[u8] =
+    "\n                    return redis.call('INCRBY', KEYS[1], ARGV[1])\n                    "
+        .as_bytes();
+const LOCK_RELEASE: &[u8] = "\n        local token = redis.call('get', KEYS[1])\n        if not token or token ~= ARGV[1] then\n            return 0\n        end\n        redis.call('del', KEYS[1])\n        return 1\n    ".as_bytes();
+const LOCK_EXTEND: &[u8] = "\n        local token = redis.call('get', KEYS[1])\n        if not token or token ~= ARGV[1] then\n            return 0\n        end\n        local expiration = redis.call('pttl', KEYS[1])\n        if not expiration then\n            expiration = 0\n        end\n        if expiration < 0 then\n            return 0\n        end\n\n        local newttl = ARGV[2]\n        if ARGV[3] == \"0\" then\n            newttl = ARGV[2] + expiration\n        end\n        redis.call('pexpire', KEYS[1], newttl)\n        return 1\n    ".as_bytes();
+const LOCK_REACQUIRE: &[u8] = "\n        local token = redis.call('get', KEYS[1])\n        if not token or token ~= ARGV[1] then\n            return 0\n        end\n        redis.call('pexpire', KEYS[1], ARGV[2])\n        return 1\n    ".as_bytes();
+
 fn flint_only(family: &str) -> bool {
     matches!(family, "json" | "bloom")
 }
@@ -473,6 +484,69 @@ fn corpus() -> Vec<Case> {
                 s(&[b"HLEN", b"h1"], Expect::Int(3)),
                 s(&[b"HEXISTS", b"h1", b"b"], Expect::Int(1)),
                 s(&[b"HEXISTS", b"h1", b"zz"], Expect::Int(0)),
+            ],
+        },
+        Case {
+            family: "scripting",
+            name: "the recognised lock and incr scripts do what their Lua does",
+            steps: vec![
+                s(&[b"SET", b"lk", b"tok", b"PX", b"10000"], Expect::Ok),
+                s(
+                    &[b"EVAL", LOCK_RELEASE, b"1", b"lk", b"other"],
+                    Expect::Int(0),
+                ),
+                s(
+                    &[b"EVAL", LOCK_EXTEND, b"1", b"lk", b"tok", b"5000", b"0"],
+                    Expect::Int(1),
+                ),
+                s(&[b"PTTL", b"lk"], Expect::IntRange(10_001, 15_000)),
+                s(
+                    &[b"EVAL", LOCK_EXTEND, b"1", b"lk", b"tok", b"3000", b"1"],
+                    Expect::Int(1),
+                ),
+                s(&[b"PTTL", b"lk"], Expect::IntRange(1, 3_000)),
+                s(
+                    &[b"EVAL", LOCK_REACQUIRE, b"1", b"lk", b"tok", b"8000"],
+                    Expect::Int(1),
+                ),
+                s(
+                    &[b"EVAL", LOCK_REACQUIRE, b"1", b"lk", b"other", b"8000"],
+                    Expect::Int(0),
+                ),
+                s(
+                    &[b"EVAL", LOCK_RELEASE, b"1", b"lk", b"tok"],
+                    Expect::Int(1),
+                ),
+                s(&[b"EXISTS", b"lk"], Expect::Int(0)),
+                s(&[b"SET", b"lk2", b"tok"], Expect::Ok),
+                s(
+                    &[b"EVAL", LOCK_EXTEND, b"1", b"lk2", b"tok", b"5000", b"0"],
+                    Expect::Int(0),
+                ),
+                s(
+                    &[b"EVAL", DJANGO_INCR_CHECKED, b"1", b"dn", b"1"],
+                    Expect::Nil,
+                ),
+                s(&[b"SET", b"dn", b"5"], Expect::Ok),
+                s(
+                    &[b"EVAL", DJANGO_INCR_CHECKED, b"1", b"dn", b"2"],
+                    Expect::Int(7),
+                ),
+                s(&[b"EVAL", DJANGO_INCR, b"1", b"dm", b"3"], Expect::Int(3)),
+                s(
+                    &[b"SCRIPT", b"LOAD", LOCK_RELEASE],
+                    Expect::Str(b"c3f8721cbb97f72bc19e972846bd7aaf91901658"),
+                ),
+                s(
+                    &[
+                        b"EVALSHA",
+                        b"c3f8721cbb97f72bc19e972846bd7aaf91901658",
+                        b"1",
+                        b"lk3",
+                        b"tok",
+                    ],
+                    Expect::Int(0),
+                ),
             ],
         },
         Case {

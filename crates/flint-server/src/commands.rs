@@ -48,11 +48,82 @@ pub fn command_key(args: &[Vec<u8>]) -> Option<&[u8]> {
         b"SELECT",
         b"QUIT",
         b"HELLO",
+        b"SCRIPT",
+        b"KEYS",
     ];
     if NO_KEY.iter().any(|c| name.eq_ignore_ascii_case(c)) {
         return None;
     }
+    // A script's key is KEYS[1], not the script (ADR-0050): it is what the
+    // write lock, the slot owner and a transaction's slot are taken from.
+    if name.eq_ignore_ascii_case(b"EVAL") || name.eq_ignore_ascii_case(b"EVALSHA") {
+        return flint_commands::eval_keys(args)
+            .and_then(|k| k.first())
+            .map(|k| k.as_slice());
+    }
     args.get(1).map(|k| k.as_slice())
+}
+
+/// The Lua scripts Flint recognises and runs natively, by the SHA1 Redis
+/// names them by (ADR-0050). Flint runs no Lua. These five are what redis-py's
+/// `Lock` and django-redis's `incr` send, byte-identical across redis-py
+/// 4.5.5 to 7.0.1 (sync and asyncio) and django-redis 5.2.0 to 6.0.0, as read
+/// from their published wheels. Any other script is refused, as before.
+///
+/// Each reads its one key and writes it at most once, so run inside the
+/// ordinary single-command dispatch, under the key's exclusive write lock
+/// (`command_key` names `KEYS[1]`), it is atomic against every other writer of
+/// that key, which is what the script's author relied on Lua for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KnownScript {
+    /// redis-py `Lock.release`: delete the key if it still holds our token.
+    LockRelease,
+    /// redis-py `Lock.extend`: add to, or replace, the TTL if it still holds
+    /// our token and has one.
+    LockExtend,
+    /// redis-py `Lock.reacquire`: reset the TTL if it still holds our token.
+    LockReacquire,
+    /// django-redis `incr`: INCRBY if the key exists, else nil.
+    DjangoIncrChecked,
+    /// django-redis `incr(..., ignore_key_check=True)`: plain INCRBY.
+    DjangoIncr,
+}
+
+const KNOWN_SCRIPTS: &[(&str, KnownScript)] = &[
+    (
+        "c3f8721cbb97f72bc19e972846bd7aaf91901658",
+        KnownScript::LockRelease,
+    ),
+    (
+        "a4e8783852e6b949f9ef3a97212805108459a890",
+        KnownScript::LockExtend,
+    ),
+    (
+        "1cac51482acf5858da00f6d685d68f886cd6b6b2",
+        KnownScript::LockReacquire,
+    ),
+    (
+        "f4a7da3e5d8ea3b46642af08427151cae0190400",
+        KnownScript::DjangoIncrChecked,
+    ),
+    (
+        "4d15273b16b10c15e1d9202cbe93c959ab7d250b",
+        KnownScript::DjangoIncr,
+    ),
+];
+
+fn known_script(sha: &str) -> Option<KnownScript> {
+    KNOWN_SCRIPTS
+        .iter()
+        .find(|(s, _)| s.eq_ignore_ascii_case(sha))
+        .map(|(_, k)| *k)
+}
+
+/// The reply for a script Flint does not recognise.
+fn script_unsupported() -> Value {
+    err(
+        "ERR Flint runs no Lua: only the scripts of redis-py's Lock and django-redis's incr are recognised (ADR-0050)",
+    )
 }
 
 /// The default namespace: unauthenticated/direct connections and every
@@ -463,6 +534,8 @@ impl<'a> Dispatcher<'a> {
             // HMSET is HSET answering +OK (BUG-0182). Deprecated upstream since
             // Redis 4.0 and still what Spring Session and ASP.NET Core's
             // IDistributedCache write every entry with.
+            b"EVAL" | b"EVALSHA" => self.cmd_eval(args),
+            b"SCRIPT" => self.cmd_script(args),
             b"HMSET" => match self.cmd_hset(args, "hmset") {
                 Value::Integer(_) => Value::Simple("OK".into()),
                 other => other,
@@ -1106,6 +1179,146 @@ impl<'a> Dispatcher<'a> {
             self.hashes.hset(slot_for_key(&args[1]), &args[1], &pairs),
             |n| Value::Integer(n as i64),
         )
+    }
+
+    /// `EVAL script numkeys key.. arg..` and `EVALSHA sha1 numkeys ...`, for
+    /// the recognised scripts only (ADR-0050). The numkeys rules and errors
+    /// are upstream's; an unrecognised `EVALSHA` answers NOSCRIPT, which is
+    /// what makes a client fall back to `SCRIPT LOAD`, which then refuses.
+    fn cmd_eval(&self, args: &[Vec<u8>]) -> Value {
+        let is_sha = args[0].eq_ignore_ascii_case(b"EVALSHA");
+        let name = if is_sha { "evalsha" } else { "eval" };
+        if args.len() < 3 {
+            return arity_err(name);
+        }
+        let Ok(n) = parse_i64(&args[2]) else {
+            return err("ERR value is not an integer or out of range");
+        };
+        if n < 0 {
+            return err("ERR Number of keys can't be negative");
+        }
+        if n as usize > args.len() - 3 {
+            return err("ERR Number of keys can't be greater than number of args");
+        }
+        let (keys, argv) = args[3..].split_at(n as usize);
+        let sha = if is_sha {
+            String::from_utf8_lossy(&args[1]).to_ascii_lowercase()
+        } else {
+            flint_tls::sha1_hex(&args[1])
+        };
+        let Some(script) = known_script(&sha) else {
+            return if is_sha {
+                err("NOSCRIPT No matching script. Please use EVAL.")
+            } else {
+                script_unsupported()
+            };
+        };
+        let (Some(key), 1) = (keys.first(), keys.len()) else {
+            return err("ERR a recognised script names exactly one key");
+        };
+        let arg = |i: usize| argv.get(i).map(|a| a.as_slice()).unwrap_or_default();
+        let call =
+            |parts: &[&[u8]]| self.dispatch(&parts.iter().map(|p| p.to_vec()).collect::<Vec<_>>());
+        // `local token = redis.call('get', KEYS[1]); if not token or token ~=
+        // ARGV[1] then return 0 end`, shared by the three lock scripts. A
+        // GET error (WRONGTYPE) is the script's error, as it would be in Lua.
+        let holds_token = || -> Result<bool, Value> {
+            match call(&[b"GET", key]) {
+                Value::Bulk(Some(v)) => Ok(v == arg(0)),
+                Value::Bulk(None) => Ok(false),
+                e @ Value::Error(_) => Err(e),
+                other => Err(Value::Error(format!("ERR unexpected GET reply {other:?}"))),
+            }
+        };
+        match script {
+            KnownScript::LockRelease => match holds_token() {
+                Ok(true) => {
+                    let _ = call(&[b"DEL", key]);
+                    Value::Integer(1)
+                }
+                Ok(false) => Value::Integer(0),
+                Err(e) => e,
+            },
+            KnownScript::LockReacquire => match holds_token() {
+                Ok(true) => match call(&[b"PEXPIRE", key, arg(1)]) {
+                    e @ Value::Error(_) => e,
+                    _ => Value::Integer(1),
+                },
+                Ok(false) => Value::Integer(0),
+                Err(e) => e,
+            },
+            KnownScript::LockExtend => match holds_token() {
+                Ok(true) => {
+                    let pttl = match call(&[b"PTTL", key]) {
+                        Value::Integer(t) => t,
+                        e => return e,
+                    };
+                    if pttl < 0 {
+                        return Value::Integer(0);
+                    }
+                    // ARGV[3] == "0": add to the TTL left; else replace it.
+                    // Lua's `ARGV[2] + expiration` fails on a non-number.
+                    let newttl = if arg(2) == b"0" {
+                        match parse_i64(arg(1)) {
+                            Ok(add) => add.saturating_add(pttl).to_string().into_bytes(),
+                            Err(_) => return err("ERR the lock's additional time is not a number"),
+                        }
+                    } else {
+                        arg(1).to_vec()
+                    };
+                    match call(&[b"PEXPIRE", key, &newttl]) {
+                        e @ Value::Error(_) => e,
+                        _ => Value::Integer(1),
+                    }
+                }
+                Ok(false) => Value::Integer(0),
+                Err(e) => e,
+            },
+            KnownScript::DjangoIncrChecked => match call(&[b"EXISTS", key]) {
+                Value::Integer(1) => call(&[b"INCRBY", key, arg(0)]),
+                // `else return false end`: Lua false is a nil reply.
+                Value::Integer(_) => Value::Bulk(None),
+                e => e,
+            },
+            KnownScript::DjangoIncr => call(&[b"INCRBY", key, arg(0)]),
+        }
+    }
+
+    /// `SCRIPT LOAD | EXISTS | FLUSH | KILL` over the recognised scripts.
+    fn cmd_script(&self, args: &[Vec<u8>]) -> Value {
+        let sub = args
+            .get(1)
+            .map(|s| s.to_ascii_uppercase())
+            .unwrap_or_default();
+        match sub.as_slice() {
+            b"LOAD" if args.len() == 3 => {
+                let sha = flint_tls::sha1_hex(&args[2]);
+                if known_script(&sha).is_some() {
+                    Value::Bulk(Some(sha.into_bytes()))
+                } else {
+                    script_unsupported()
+                }
+            }
+            b"EXISTS" if args.len() >= 3 => Value::Array(Some(
+                args[2..]
+                    .iter()
+                    .map(|s| {
+                        Value::Integer(known_script(&String::from_utf8_lossy(s)).is_some() as i64)
+                    })
+                    .collect(),
+            )),
+            // Nothing is cached, so there is nothing to flush.
+            b"FLUSH" if args.len() <= 3 => Value::Simple("OK".into()),
+            b"KILL" if args.len() == 2 => err("NOTBUSY No scripts in execution right now."),
+            b"LOAD" | b"EXISTS" | b"FLUSH" | b"KILL" => err(&format!(
+                "ERR wrong number of arguments for 'script|{}' command",
+                String::from_utf8_lossy(&sub).to_lowercase()
+            )),
+            _ => err(&format!(
+                "ERR unknown subcommand '{}'. Try SCRIPT HELP.",
+                String::from_utf8_lossy(args.get(1).map(|s| s.as_slice()).unwrap_or_default())
+            )),
+        }
     }
 
     fn cmd_zadd(&self, args: &[Vec<u8>]) -> Value {
@@ -3628,6 +3841,186 @@ mod tests {
         assert_eq!(call(&s, &[b"EXISTS", b"h", b"str"]), Value::Integer(2));
         assert_eq!(call(&s, &[b"EXPIRE", b"h", b"100"]), Value::Integer(1));
         assert_eq!(call(&s, &[b"DEL", b"h", b"str"]), Value::Integer(2));
+    }
+
+    /// ADR-0050: the five recognised texts, exactly as the libraries send
+    /// them. Each must hash to its table entry, or recognition is silently off.
+    const DJANGO_INCR_CHECKED: &str = "\n                    local exists = redis.call('EXISTS', KEYS[1])\n                    if (exists == 1) then\n                        return redis.call('INCRBY', KEYS[1], ARGV[1])\n                    else return false end\n                    ";
+    const DJANGO_INCR: &str =
+        "\n                    return redis.call('INCRBY', KEYS[1], ARGV[1])\n                    ";
+    const LOCK_RELEASE: &str = "\n        local token = redis.call('get', KEYS[1])\n        if not token or token ~= ARGV[1] then\n            return 0\n        end\n        redis.call('del', KEYS[1])\n        return 1\n    ";
+    const LOCK_EXTEND: &str = "\n        local token = redis.call('get', KEYS[1])\n        if not token or token ~= ARGV[1] then\n            return 0\n        end\n        local expiration = redis.call('pttl', KEYS[1])\n        if not expiration then\n            expiration = 0\n        end\n        if expiration < 0 then\n            return 0\n        end\n\n        local newttl = ARGV[2]\n        if ARGV[3] == \"0\" then\n            newttl = ARGV[2] + expiration\n        end\n        redis.call('pexpire', KEYS[1], newttl)\n        return 1\n    ";
+    const LOCK_REACQUIRE: &str = "\n        local token = redis.call('get', KEYS[1])\n        if not token or token ~= ARGV[1] then\n            return 0\n        end\n        redis.call('pexpire', KEYS[1], ARGV[2])\n        return 1\n    ";
+
+    fn ev(s: &MemKv, parts: &[&str]) -> Value {
+        call(s, &parts.iter().map(|p| p.as_bytes()).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn the_recognised_texts_hash_to_their_table_entries() {
+        for (text, want) in [
+            (LOCK_RELEASE, KnownScript::LockRelease),
+            (LOCK_EXTEND, KnownScript::LockExtend),
+            (LOCK_REACQUIRE, KnownScript::LockReacquire),
+            (DJANGO_INCR_CHECKED, KnownScript::DjangoIncrChecked),
+            (DJANGO_INCR, KnownScript::DjangoIncr),
+        ] {
+            assert_eq!(
+                known_script(&flint_tls::sha1_hex(text.as_bytes())),
+                Some(want)
+            );
+        }
+    }
+
+    /// redis-py's Lock, end to end: release only with the token, extend by
+    /// adding and by replacing, reacquire, and each refused without the token.
+    #[test]
+    fn lock_scripts_do_what_the_lua_does() {
+        let s = MemKv::new();
+        assert_eq!(
+            ev(&s, &["SET", "lk", "tok", "PX", "10000"]),
+            Value::Simple("OK".into())
+        );
+        assert_eq!(
+            ev(&s, &["EVAL", LOCK_RELEASE, "1", "lk", "other"]),
+            Value::Integer(0)
+        );
+        assert_eq!(
+            ev(&s, &["EVAL", LOCK_EXTEND, "1", "lk", "tok", "5000", "0"]),
+            Value::Integer(1)
+        );
+        let Value::Integer(t) = ev(&s, &["PTTL", "lk"]) else {
+            panic!()
+        };
+        assert!(t > 10_000 && t <= 15_000, "added: {t}");
+        assert_eq!(
+            ev(&s, &["EVAL", LOCK_EXTEND, "1", "lk", "tok", "3000", "1"]),
+            Value::Integer(1)
+        );
+        let Value::Integer(t) = ev(&s, &["PTTL", "lk"]) else {
+            panic!()
+        };
+        assert!(t > 2_000 && t <= 3_000, "replaced: {t}");
+        assert_eq!(
+            ev(&s, &["EVAL", LOCK_REACQUIRE, "1", "lk", "tok", "8000"]),
+            Value::Integer(1)
+        );
+        assert_eq!(
+            ev(&s, &["EVAL", LOCK_REACQUIRE, "1", "lk", "other", "8000"]),
+            Value::Integer(0)
+        );
+        assert_eq!(
+            ev(
+                &s,
+                &[
+                    "EVALSHA",
+                    "C3F8721CBB97F72BC19E972846BD7AAF91901658",
+                    "1",
+                    "lk",
+                    "tok"
+                ]
+            ),
+            Value::Integer(1),
+            "EVALSHA, any case"
+        );
+        assert_eq!(ev(&s, &["EXISTS", "lk"]), Value::Integer(0));
+        assert_eq!(
+            ev(&s, &["EVAL", LOCK_RELEASE, "1", "lk", "tok"]),
+            Value::Integer(0),
+            "already gone"
+        );
+        // A lock with no TTL cannot be extended (the script's `expiration < 0`).
+        ev(&s, &["SET", "lk2", "tok"]);
+        assert_eq!(
+            ev(&s, &["EVAL", LOCK_EXTEND, "1", "lk2", "tok", "5000", "0"]),
+            Value::Integer(0)
+        );
+    }
+
+    #[test]
+    fn django_incr_scripts_do_what_the_lua_does() {
+        let s = MemKv::new();
+        assert_eq!(
+            ev(&s, &["EVAL", DJANGO_INCR_CHECKED, "1", "n", "1"]),
+            Value::Bulk(None),
+            "missing: nil"
+        );
+        ev(&s, &["SET", "n", "5"]);
+        assert_eq!(
+            ev(&s, &["EVAL", DJANGO_INCR_CHECKED, "1", "n", "2"]),
+            Value::Integer(7)
+        );
+        assert_eq!(
+            ev(&s, &["EVAL", DJANGO_INCR, "1", "m", "3"]),
+            Value::Integer(3)
+        );
+        ev(&s, &["SET", "t", "x"]);
+        assert!(matches!(
+            ev(&s, &["EVAL", DJANGO_INCR_CHECKED, "1", "t", "1"]),
+            Value::Error(_)
+        ));
+    }
+
+    /// Anything else is refused as before; NOSCRIPT for an unknown SHA, which
+    /// sends a client to SCRIPT LOAD, which refuses; upstream's numkeys errors.
+    #[test]
+    fn other_scripts_and_malformed_calls_are_refused() {
+        let s = MemKv::new();
+        assert!(
+            matches!(ev(&s, &["EVAL", "return 1", "0"]), Value::Error(e) if e.contains("Flint runs no Lua"))
+        );
+        assert!(
+            matches!(ev(&s, &["EVALSHA", "0123456789012345678901234567890123456789", "0"]), Value::Error(e) if e.starts_with("NOSCRIPT"))
+        );
+        assert!(
+            matches!(ev(&s, &["SCRIPT", "LOAD", "return 1"]), Value::Error(e) if e.contains("Flint runs no Lua"))
+        );
+        assert_eq!(
+            ev(&s, &["SCRIPT", "LOAD", LOCK_RELEASE]),
+            Value::Bulk(Some(b"c3f8721cbb97f72bc19e972846bd7aaf91901658".to_vec()))
+        );
+        assert_eq!(
+            ev(
+                &s,
+                &[
+                    "SCRIPT",
+                    "EXISTS",
+                    "c3f8721cbb97f72bc19e972846bd7aaf91901658",
+                    "abc"
+                ]
+            ),
+            Value::Array(Some(vec![Value::Integer(1), Value::Integer(0)]))
+        );
+        assert_eq!(ev(&s, &["SCRIPT", "FLUSH"]), Value::Simple("OK".into()));
+        assert!(
+            matches!(ev(&s, &["EVAL", LOCK_RELEASE, "-1"]), Value::Error(e) if e.contains("negative"))
+        );
+        assert!(
+            matches!(ev(&s, &["EVAL", LOCK_RELEASE, "3", "a"]), Value::Error(e) if e.contains("greater than"))
+        );
+        assert!(
+            matches!(ev(&s, &["EVAL", LOCK_RELEASE, "x"]), Value::Error(e) if e.contains("not an integer"))
+        );
+        assert!(
+            matches!(ev(&s, &["EVAL", LOCK_RELEASE]), Value::Error(e) if e.contains("wrong number"))
+        );
+    }
+
+    /// The key a script routes, locks and is owned by is `KEYS[1]`.
+    #[test]
+    fn a_scripts_key_is_keys_1() {
+        let a = |p: &[&str]| p.iter().map(|x| x.as_bytes().to_vec()).collect::<Vec<_>>();
+        assert_eq!(
+            command_key(&a(&["EVAL", "return 1", "1", "k", "v"])),
+            Some(&b"k"[..])
+        );
+        assert_eq!(
+            command_key(&a(&["evalsha", "abc", "2", "k1", "k2"])),
+            Some(&b"k1"[..])
+        );
+        assert_eq!(command_key(&a(&["EVAL", "return 1", "0"])), None);
+        assert_eq!(command_key(&a(&["SCRIPT", "LOAD", "x"])), None);
+        assert_eq!(command_key(&a(&["KEYS", "*"])), None);
     }
 
     /// BUG-0182: HMSET is HSET answering +OK, and its errors name it.

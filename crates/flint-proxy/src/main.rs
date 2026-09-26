@@ -1496,9 +1496,17 @@ fn route_key(args: &[Vec<u8>]) -> Option<&[u8]> {
         b"SELECT",
         b"QUIT",
         b"HELLO",
+        b"SCRIPT",
+        b"KEYS",
     ];
     if NO_KEY.iter().any(|c| name.eq_ignore_ascii_case(c)) {
         return None;
+    }
+    // A script routes by KEYS[1], not by its text (ADR-0050).
+    if name.eq_ignore_ascii_case(b"EVAL") || name.eq_ignore_ascii_case(b"EVALSHA") {
+        return flint_commands::eval_keys(args)
+            .and_then(|k| k.first())
+            .map(|k| k.as_slice());
     }
     args.get(1).map(|k| k.as_slice())
 }
@@ -3279,6 +3287,7 @@ fn prefetchable(args: &[Vec<u8>], name: &[u8], replica_reads: bool) -> bool {
                 | b"ECHO"
                 | b"QUIT"
                 | b"SCAN"
+                | b"KEYS"
                 | b"DBSIZE"
                 | b"FLUSHALL"
                 | b"FLUSHDB"
@@ -3615,6 +3624,12 @@ fn cache_writeback(
                     topo.cache.invalidate(ns, k);
                 }
             }
+            // A recognised script writes its KEYS, never its text (ADR-0050).
+            b"EVAL" | b"EVALSHA" => {
+                for k in flint_commands::eval_keys(args).unwrap_or_default() {
+                    topo.cache.invalidate(ns, k);
+                }
+            }
             // MSET k1 v1 k2 v2 ...: EVERY written key (odd indices) must
             // drop, or a cached later key would keep serving its old value
             // through this proxy — the read-your-own-writes contract.
@@ -3681,6 +3696,79 @@ fn pscan_cursors() -> &'static Mutex<HashMap<u64, ProxyScanCursor>> {
 /// is rewritten per hop. Failover mid-scan invalidates the session (the
 /// dead master held its cursor state): the client gets "ERR invalid
 /// cursor" and restarts — Redis's weak scan guarantee, stated honestly.
+/// The largest `KEYS` reply the proxy assembles (ADR-0050). Past it the call
+/// is refused with an error naming SCAN, so one pattern cannot hold a whole
+/// keyspace in the proxy's memory.
+const KEYS_REPLY_CAP: usize = 100_000;
+
+/// `KEYS pattern`, answered from `SCAN` (ADR-0050).
+///
+/// Excluded until then because upstream's KEYS blocks a single-threaded
+/// server for its whole run. Here no node runs a KEYS: each master of the
+/// tenant's pairs is walked with `SCAN cursor MATCH pattern COUNT 1000` to its
+/// end, on this client's own slow-path connection, as `scan_forward` walks it
+/// one page at a time. What it costs is one pass of the tenant's keyspace per
+/// call. Frameworks send it to clear a namespace (Flask-Caching's `clear()`,
+/// Spring's `RedisCacheManager` on its default settings), and a tenant's
+/// keyspace is exactly that.
+///
+/// A master that cannot be reached fails the call: an answer missing a
+/// pair's keys would read as those keys not existing.
+async fn keys_forward(
+    topo: &Arc<Topology>,
+    backends: &mut Backends,
+    _ns: &[u8],
+    args: &[Vec<u8>],
+) -> Value {
+    if args.len() != 2 {
+        return Value::Error("ERR wrong number of arguments for 'keys' command".into());
+    }
+    let mut masters: Vec<Option<String>> = Vec::new();
+    for view in &topo.clusters {
+        match view.routing.read() {
+            Ok(r) => masters.extend(r.masters.clone()),
+            Err(_) => return Value::Error("ERR topology lock".into()),
+        }
+    }
+    let mut out: Vec<Value> = Vec::new();
+    for master in masters {
+        let Some(master) = master else {
+            return Value::Error("ERR a pair has no reachable master".into());
+        };
+        let mut cursor = b"0".to_vec();
+        loop {
+            let parts: Vec<&[u8]> = vec![b"SCAN", &cursor, b"MATCH", &args[1], b"COUNT", b"1000"];
+            let frame = encode_cmd(&parts);
+            let reply = match backends.call_slow(&master, &frame).await {
+                Ok(v) => v,
+                Err(e) => return Value::Error(format!("ERR keys: scan of {master}: {e}")),
+            };
+            let (next, keys) = match reply {
+                Value::Array(Some(mut p)) if p.len() == 2 => {
+                    let keys = p.pop().unwrap_or(Value::Array(Some(Vec::new())));
+                    match (p.pop(), keys) {
+                        (Some(Value::Bulk(Some(c))), Value::Array(Some(k))) => (c, k),
+                        _ => return Value::Error("ERR keys: scan reply shape".into()),
+                    }
+                }
+                Value::Error(e) => return Value::Error(e),
+                other => return Value::Error(format!("ERR keys: scan reply shape: {other:?}")),
+            };
+            out.extend(keys);
+            if out.len() > KEYS_REPLY_CAP {
+                return Value::Error(format!(
+                    "ERR KEYS matched more than {KEYS_REPLY_CAP} keys; use SCAN to walk them"
+                ));
+            }
+            if next == b"0" {
+                break;
+            }
+            cursor = next;
+        }
+    }
+    Value::Array(Some(out))
+}
+
 async fn scan_forward(
     topo: &Arc<Topology>,
     backends: &mut Backends,
@@ -4207,6 +4295,9 @@ async fn handle(
         // master, in pair order. Never the replica-read path (a node's
         // cursor state lives on the node that minted it).
         b"SCAN" => scan_forward(topo, backends, ns, args).await,
+        // KEYS, answered from SCAN over every master (ADR-0050). See
+        // `keys_forward`.
+        b"KEYS" => keys_forward(topo, backends, ns, args).await,
         // Multi-key DEL / UNLINK / EXISTS: split by owning pair when the
         // keys span more than one (BUG-0179). See `split_by_owner`.
         b"DEL" | b"UNLINK" | b"EXISTS" if args.len() > 2 => {
@@ -4953,6 +5044,7 @@ mod prefetch_tests {
         // Answered by `handle` or fanned out by it — never reach `forward`.
         for c in [
             vec!["SCAN", "0"],
+            vec!["KEYS", "*"],
             vec!["DBSIZE"],
             vec!["FLUSHALL"],
             vec!["FLUSHDB"],
@@ -5001,6 +5093,26 @@ mod prefetch_tests {
 
         // No routable key: those go to pair 0 by a separate rule.
         assert!(!may_stage(&["MGET"], false));
+
+        // A script stages by KEYS[1], like any keyed write (ADR-0050).
+        assert!(may_stage(
+            &[
+                "EVALSHA",
+                "c3f8721cbb97f72bc19e972846bd7aaf91901658",
+                "1",
+                "k",
+                "t"
+            ],
+            false
+        ));
+        assert_eq!(
+            route_key(&["EVAL", "return 1", "1", "k"].map(|p| p.as_bytes().to_vec())),
+            Some(&b"k"[..])
+        );
+        assert_eq!(
+            route_key(&["SCRIPT", "LOAD", "x"].map(|p| p.as_bytes().to_vec())),
+            None
+        );
 
         // An MGET within one slot is ordinary keyed traffic and still stages;
         // only one that `split_mget` would split is held back (ADR-0048).

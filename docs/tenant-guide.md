@@ -226,15 +226,23 @@ hashes, sets, sorted sets, lists, TTLs (EXPIRE/PEXPIRE/TTL/PERSIST),
 DEL/UNLINK/EXISTS/TYPE, DBSIZE/FLUSHALL (scoped to your namespace).
 Conformance is validated against Valkey continuously. Transactions
 (MULTI/EXEC/WATCH) work when every key shares a slot (ADR-0012). Not in
-v0: pub/sub, streams, Lua, blocking commands, and cross-slot multi-key
+v0: pub/sub, streams, blocking commands, Lua (beyond five recognised scripts:
+redis-py's `Lock` and django-redis's `incr`), and cross-slot multi-key
 operations, except `MGET`, `DEL`, `UNLINK` and `EXISTS`, which the proxy
-splits per slot or per pair (`docs/command-support.md`).
+splits per slot or per pair. `KEYS` is answered at the proxy, up to 100,000
+keys (`docs/command-support.md`, ADR-0050).
 
 ### Frameworks
 
 Measured through the proxy with each framework's default settings.
 
 - **Rails** `RedisCacheStore`: works, `read_multi` included (ADR-0048).
+- **redis-py** `Lock` (and so django-redis's `cache.lock()`): works, acquire
+  to release (ADR-0050).
+- **django-redis**: `incr` works, atomically; `set_many` and `delete_pattern`
+  across slots are transactions and are refused, as below.
+- **Flask-Caching** and **Spring** `RedisCacheManager`: `clear()` works
+  (ADR-0050).
 - **Django** `RedisCache`: `set_many` across slots is a transaction and is
   refused. Write those keys one at a time, or colocate them with a
   `KEY_FUNCTION` that adds one hash tag (every key then in one slot).
