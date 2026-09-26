@@ -2779,10 +2779,12 @@ fn main() -> std::io::Result<()> {
 
     // WATCH's modification tracking (ADR-0012 D5). Wrapped around the store
     // HERE, once, before anything clones it — so the GC sweeper, the
-    // read-path lazy expiry, a transaction's commit and the async queue's
-    // commit are all covered by construction. Wrapping at the command layer
-    // instead would miss every one of those, and a missed modification is a
-    // lost update.
+    // read-path lazy expiry and every inline write are covered by
+    // construction. Wrapping at the command layer instead would miss those,
+    // and a missed modification is a lost update. NOT covered: a buffered run
+    // (a transaction, a pipelined batch, the async queue, a script) commits
+    // through `RocksKv::apply_writes` underneath this wrapper, so each bumps
+    // by hand (`commit_watched`; BUG-0080, BUG-0186).
     let watch = Arc::new(flint_storage::watch::WatchTable::new());
     let store: Arc<dyn Kv> = Arc::new(flint_storage::watch::WatchedKv::new(
         store,
@@ -3818,11 +3820,8 @@ fn commit_pending(
     // transaction that might have committed, which WATCH permits -- it is
     // optimistic. A MISSED bump commits one that must abort, which it does
     // not.
-    for (k, _) in &ops {
-        watch.bump(k);
-    }
     let n = replies.len();
-    let out = match commit_ops(store, rocks, &ops) {
+    let out = match commit_watched(store, rocks, watch, &ops) {
         Ok(()) => replies,
         Err(e) => (0..n)
             .map(|_| Value::Error(format!("ERR batch commit failed: {e}")))
@@ -4343,6 +4342,7 @@ fn transaction_control(
                 hub,
                 limits,
                 conn_ns,
+                watch,
                 txn,
             ));
         }
@@ -4736,6 +4736,7 @@ fn exec_transaction(
     hub: &ReplHub,
     limits: commands::Limits,
     conn_ns: &[u8],
+    watch: &flint_storage::watch::WatchTable,
     txn: Txn,
 ) -> Value {
     if txn.queued.is_empty() {
@@ -4788,11 +4789,33 @@ fn exec_transaction(
     }
     let ops = batching.into_ops();
     if !ops.is_empty()
-        && let Err(e) = commit_ops(store, rocks, &ops)
+        && let Err(e) = commit_watched(store, rocks, watch, &ops)
     {
         return Value::Error(format!("ERR transaction commit failed: {e}"));
     }
     Value::Array(Some(replies))
+}
+
+/// Commit a buffered run of writes, recording each key against WATCH first.
+///
+/// `WatchedKv` bumps a key's watch version on put and delete, which is how a
+/// write breaks another connection's WATCH. A buffered run commits through
+/// `commit_ops`, and on rocks that is `RocksKv::apply_writes` DIRECTLY,
+/// underneath the wrapper, so without these bumps the watcher never sees the
+/// change and its EXEC commits over it (BUG-0080 for the pipelined path,
+/// BUG-0186 for transactions). Bumped BEFORE the commit: a spurious bump can
+/// only abort a transaction WATCH permits to abort, and a missed one commits
+/// one it must not.
+fn commit_watched(
+    store: &dyn Kv,
+    rocks: &Option<RocksHandle>,
+    watch: &flint_storage::watch::WatchTable,
+    ops: &[(Vec<u8>, Option<Vec<u8>>)],
+) -> Result<(), String> {
+    for (k, _) in ops {
+        watch.bump(k);
+    }
+    commit_ops(store, rocks, ops)
 }
 
 /// Commit a transaction's buffered mutations.
@@ -8211,6 +8234,112 @@ mod serve_tests {
             }
         });
         (addr, out)
+    }
+
+    /// A rocks seat built the way `main` builds one: ONE watch table shared by
+    /// every connection, and the store wrapped in `WatchedKv` around it.
+    /// `spawn_rocks_server` gives each connection its own table and an
+    /// unwrapped store, so no test through it can see one connection's write
+    /// break another's WATCH.
+    #[cfg(feature = "rocks")]
+    fn spawn_watched_rocks_server() -> (std::net::SocketAddr, std::path::PathBuf) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "flint-watch-test-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let kv = Arc::new(flint_storage::rocks::RocksKv::open(&dir).expect("open rocks"));
+        let watch = Arc::new(flint_storage::watch::WatchTable::new());
+        let store: Arc<dyn Kv> = Arc::new(flint_storage::watch::WatchedKv::new(
+            Arc::clone(&kv) as Arc<dyn Kv>,
+            Arc::clone(&watch),
+        ));
+        let out = dir.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { continue };
+                let (kv, store, watch) = (Arc::clone(&kv), Arc::clone(&store), Arc::clone(&watch));
+                std::thread::spawn(move || {
+                    let _ = serve(
+                        flint_tls::Stream::Plain(stream),
+                        &*store,
+                        &Arc::new(AtomicBool::new(false)),
+                        &Arc::new(AtomicBool::new(false)),
+                        &Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                        Some(kv),
+                        &Arc::new(ReplHub::default()),
+                        &Arc::new(AtomicBool::new(false)),
+                        commands::Limits::default(),
+                        None,
+                        &watch,
+                    );
+                });
+            }
+        });
+        (addr, out)
+    }
+
+    /// Send one command and read its reply.
+    #[cfg(feature = "rocks")]
+    fn roundtrip(s: &mut TcpStream, parts: &[&str]) -> Value {
+        let mut p = Vec::new();
+        let v = parts
+            .iter()
+            .map(|x| Value::Bulk(Some(x.as_bytes().to_vec())));
+        encode(&Value::Array(Some(v.collect())), &mut p);
+        s.write_all(&p).expect("send");
+        read_frames(s, 1).remove(0)
+    }
+
+    /// BUG-0186: another connection's MULTI/EXEC must break a WATCH, on the
+    /// engine that ships. A transaction commits its buffer through
+    /// `RocksKv::apply_writes`, underneath the `WatchedKv` wrapper that bumps
+    /// watch versions, and bumped nothing itself: the watcher's EXEC answered
+    /// `[OK]` and overwrote the other transaction's write. A plain SET, and
+    /// the mem engine, were always right.
+    #[cfg(feature = "rocks")]
+    #[test]
+    fn another_connections_transaction_breaks_a_watch() {
+        let _serial = crate::write_lock::test_serial();
+        let (addr, _dir) = spawn_watched_rocks_server();
+        let (mut a, mut b) = (connect(addr), connect(addr));
+        assert_eq!(
+            roundtrip(&mut a, &["SET", "{w}k", "1"]),
+            Value::Simple("OK".into())
+        );
+        assert_eq!(
+            roundtrip(&mut a, &["WATCH", "{w}k"]),
+            Value::Simple("OK".into())
+        );
+        assert_eq!(roundtrip(&mut b, &["MULTI"]), Value::Simple("OK".into()));
+        assert_eq!(
+            roundtrip(&mut b, &["SET", "{w}k", "2"]),
+            Value::Simple("QUEUED".into())
+        );
+        assert_eq!(
+            roundtrip(&mut b, &["EXEC"]),
+            Value::Array(Some(vec![Value::Simple("OK".into())]))
+        );
+        assert_eq!(roundtrip(&mut a, &["MULTI"]), Value::Simple("OK".into()));
+        assert_eq!(
+            roundtrip(&mut a, &["SET", "{w}k", "3"]),
+            Value::Simple("QUEUED".into())
+        );
+        assert_eq!(
+            roundtrip(&mut a, &["EXEC"]),
+            Value::Array(None),
+            "the watched key changed under a transaction on another connection, \
+             so EXEC must abort"
+        );
+        assert_eq!(
+            roundtrip(&mut a, &["GET", "{w}k"]),
+            Value::Bulk(Some(b"2".to_vec())),
+            "the other connection's write must survive"
+        );
     }
 
     #[cfg(feature = "rocks")]
