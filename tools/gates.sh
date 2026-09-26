@@ -3480,11 +3480,19 @@ if anchor is None:
     print("NOANCHOR")
     sys.exit(0)
 
-indent = (len(src[anchor]) - len(src[anchor].lstrip())) + 4
+anchor_indent = len(src[anchor]) - len(src[anchor].lstrip())
+indent = anchor_indent + 4
 arm = re.compile(r'^ {%d}(\| )?b"' % indent)
 cont = re.compile(r"^ {%d}\| " % indent)
+# THE DISPATCH MATCH ENDS WHERE IT CLOSES, at the anchor's own indentation.
+# The scan used to run to the end of the file, so any later method with its
+# own `b"..."` arms at the same depth read as dispatched commands: ADR-0050's
+# `SCRIPT LOAD | FLUSH | KILL` subcommands were reported as ungated commands.
+close = " " * anchor_indent + "}"
 dispatched, buf = set(), []
 for line in src[anchor + 1 :]:
+    if line.rstrip() == close:
+        break
     if arm.match(line) or (buf and cont.match(line)):
         buf.append(line)
         if "=>" in line:
