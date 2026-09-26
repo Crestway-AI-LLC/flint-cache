@@ -39,3 +39,9 @@ Covered by a `flint-resp` unit test (red with the replacement removed) and by
 `client_compat_drill`: redis-py sends a multi-line `EVAL` with a 5 s socket
 timeout, must get `unknown command` at once, and its connection must still
 answer `PING`.
+
+Re-measured with the fix: django-redis's `incr` gets the error at once and
+falls back to its own read-modify-write (`EXISTS`, `TTL`, `GET`, `SET`), so it
+answers (`incr -> 2`). That fallback is not atomic, and two concurrent
+increments can lose one. That is Lua's absence, which is by design and a
+separate question, not this fix.
