@@ -5,6 +5,9 @@ decision 3 as recommended. Built; see "As built" at the end. **Amended
 2026-09-26**: the lock libraries' scripts join the recognised set, and
 `python-redis-lock` is recorded as unsupportable; see the amendment. **Amended
 again 2026-09-26**: node `rate-limit-redis` 6.x's two scripts join the set.
+**Superseded for Lua by ADR-0051** (accepted the same day): scripts now run
+in an embedded Lua, and the recognised-script table below is removed. Its
+`KEYS` decision stands.
 
 ## Context
 

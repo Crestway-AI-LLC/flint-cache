@@ -22,6 +22,9 @@ flint-journal = { path = "../flint-journal" }
 # JSON document type: parsing/path resolution live in the command layer
 # (storage stores opaque bytes). Already in the tree via flint-journal.
 serde_json = { version = "1", features = ["preserve_order"] }
+# Lua scripting (ADR-0051): PUC-Rio Lua 5.1, the interpreter Redis and Valkey
+# embed, built from source so no system Lua is involved. MIT, as is lua-src.
+mlua = { version = "0.12", default-features = false, features = ["lua51", "vendored"] }
 
 [lints]
 workspace = true

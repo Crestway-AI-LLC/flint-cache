@@ -50,179 +50,20 @@ pub fn command_key(args: &[Vec<u8>]) -> Option<&[u8]> {
         b"HELLO",
         b"SCRIPT",
         b"KEYS",
+        b"TIME",
     ];
     if NO_KEY.iter().any(|c| name.eq_ignore_ascii_case(c)) {
         return None;
     }
-    // A script's key is KEYS[1], not the script (ADR-0050): it is what the
-    // write lock, the slot owner and a transaction's slot are taken from.
+    // A script's key is KEYS[1], not the script (ADR-0050, ADR-0051): it is
+    // what the write lock, the slot owner and a transaction's slot are taken
+    // from. Every key a script declares shares its slot, or it is refused.
     if name.eq_ignore_ascii_case(b"EVAL") || name.eq_ignore_ascii_case(b"EVALSHA") {
         return flint_commands::eval_keys(args)
             .and_then(|k| k.first())
             .map(|k| k.as_slice());
     }
     args.get(1).map(|k| k.as_slice())
-}
-
-/// The Lua scripts Flint recognises and runs natively, by the SHA1 Redis
-/// names them by (ADR-0050). Flint runs no Lua. The first five are what
-/// redis-py's `Lock` and django-redis's `incr` send, byte-identical across
-/// redis-py 4.5.5 to 7.0.1 (sync and asyncio) and django-redis 5.2.0 to 6.0.0,
-/// as read from their published wheels. The rest are the lock scripts of node
-/// `redlock` 4.2.0 and 5.0.0-beta, Go `redsync` v4.0.0 to v4.18.0 and Ruby
-/// `redlock` 2.1.0, and the rate limiter scripts of node `rate-limit-redis`
-/// 6.x, captured on the wire and checked against the published packages
-/// (ADR-0050's amendments). Any other script is refused, as before.
-///
-/// Each reads its one key and writes it at most once, so run inside the
-/// ordinary single-command dispatch, under the key's exclusive write lock
-/// (`command_key` names `KEYS[1]`), it is atomic against every other writer of
-/// that key, which is what the script's author relied on Lua for.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum KnownScript {
-    /// redis-py `Lock.release`: delete the key if it still holds our token.
-    LockRelease,
-    /// redis-py `Lock.extend`: add to, or replace, the TTL if it still holds
-    /// our token and has one.
-    LockExtend,
-    /// redis-py `Lock.reacquire`: reset the TTL if it still holds our token.
-    LockReacquire,
-    /// django-redis `incr`: INCRBY if the key exists, else nil.
-    DjangoIncrChecked,
-    /// django-redis `incr(..., ignore_key_check=True)`: plain INCRBY.
-    DjangoIncr,
-    /// node `redlock` acquire: SET PX unless the key exists; 1, else 0.
-    RedlockAcquire,
-    /// node `redlock` extend: SET PX if it holds our token; 1, else 0.
-    RedlockExtend,
-    /// node `redlock` release: delete if it holds our token; 1, else 0.
-    RedlockRelease,
-    /// `redsync` extend: PEXPIRE's reply if it holds our token, else 0.
-    RedsyncExtend,
-    /// `redsync` extend under `WithSetNXOnExtend`: as `RedsyncExtend`, but a
-    /// lock that is gone is taken again with SET NX PX (1), and one held by
-    /// another answers 0.
-    RedsyncExtendSetNx,
-    /// `redsync` release from v4.12.0: DEL's reply if it holds our token, -1
-    /// if the key is gone, else 0.
-    RedsyncRelease,
-    /// `redsync` release before v4.12.0, and Ruby `redlock` unlock: DEL's
-    /// reply if it holds our token, else 0.
-    DelIfHeld,
-    /// Ruby `redlock` lock: SET PX if the key is absent and `ARGV[3]` is "yes",
-    /// or if it holds our token; SET's reply, else nil.
-    RedlockRbLock,
-    /// `[GET, PTTL]`: Ruby `redlock`'s TTL lookup, and `rate-limit-redis`'s
-    /// get.
-    GetAndPttl,
-    /// `rate-limit-redis` 6.x increment: a new window (PTTL <= 0) is SET to 1
-    /// with the window as its PX and answers `[1, window]`; otherwise INCR,
-    /// answering `[hits, pttl]`.
-    RateLimitRedisIncr,
-}
-
-const KNOWN_SCRIPTS: &[(&str, KnownScript)] = &[
-    (
-        "c3f8721cbb97f72bc19e972846bd7aaf91901658",
-        KnownScript::LockRelease,
-    ),
-    (
-        "a4e8783852e6b949f9ef3a97212805108459a890",
-        KnownScript::LockExtend,
-    ),
-    (
-        "1cac51482acf5858da00f6d685d68f886cd6b6b2",
-        KnownScript::LockReacquire,
-    ),
-    (
-        "f4a7da3e5d8ea3b46642af08427151cae0190400",
-        KnownScript::DjangoIncrChecked,
-    ),
-    (
-        "4d15273b16b10c15e1d9202cbe93c959ab7d250b",
-        KnownScript::DjangoIncr,
-    ),
-    // node redlock 4.2.0, then 5.0.0-beta.1 and beta.2 (npm's `latest`):
-    // the same three scripts, indented differently.
-    (
-        "e5a322e2634ef59a516e8ea150cb085afafee684",
-        KnownScript::RedlockAcquire,
-    ),
-    (
-        "ce46f80993d5dac20dd066eb301a4e37994bdbed",
-        KnownScript::RedlockExtend,
-    ),
-    (
-        "0f0f23b9048b36752b5be114f357ba083449f908",
-        KnownScript::RedlockRelease,
-    ),
-    (
-        "96da70f7716f27d278a5218544df37fd8b0a5e4c",
-        KnownScript::RedlockAcquire,
-    ),
-    (
-        "aed6f382e410db8ba7926d4e5e9aab410bf2a78a",
-        KnownScript::RedlockExtend,
-    ),
-    (
-        "e4612211c9f8f51c257e26e056b0a654b3187242",
-        KnownScript::RedlockRelease,
-    ),
-    // redsync v4.0.0 to v4.18.0.
-    (
-        "d75bb8b5bd13532ddedd17762e772346e39b321e",
-        KnownScript::RedsyncExtend,
-    ),
-    (
-        "b6b55c439e02c6f52ffb8be7ec8c0d0ac816ea79",
-        KnownScript::RedsyncExtendSetNx,
-    ),
-    (
-        "e950836ed1e694540c503ef9972b8de518044d3b",
-        KnownScript::RedsyncRelease,
-    ),
-    (
-        "00583931c4e4d483f6233879c133c71ed5393f9d",
-        KnownScript::DelIfHeld,
-    ),
-    // Ruby redlock 2.1.0.
-    (
-        "ceb2b2062e40c51a2b3963fd078bc71f11bdc65c",
-        KnownScript::RedlockRbLock,
-    ),
-    (
-        "8e4905cee18e7c3188d10f2b8b170e403baed34f",
-        KnownScript::DelIfHeld,
-    ),
-    (
-        "78d2ca48a6dc9ef6892059792a3a0c5237733d64",
-        KnownScript::GetAndPttl,
-    ),
-    // node rate-limit-redis 6.0.0 and 6.0.1 (increment), and 4.1.0 on (get).
-    // Its 4.x and 5.0.0 increments write twice (INCR, then PEXPIRE) and are
-    // not recognised (ADR-0051).
-    (
-        "895b92e1712734e1b464999be23953485475357b",
-        KnownScript::RateLimitRedisIncr,
-    ),
-    (
-        "6aeb97ed6086dcdeafdc6fda3999a0d0e38ec96a",
-        KnownScript::GetAndPttl,
-    ),
-];
-
-fn known_script(sha: &str) -> Option<KnownScript> {
-    KNOWN_SCRIPTS
-        .iter()
-        .find(|(s, _)| s.eq_ignore_ascii_case(sha))
-        .map(|(_, k)| *k)
-}
-
-/// The reply for a script Flint does not recognise.
-fn script_unsupported() -> Value {
-    err(
-        "ERR Flint runs no Lua: only the lock and incr scripts of the libraries its command-support page names are recognised (ADR-0050)",
-    )
 }
 
 /// The default namespace: unauthenticated/direct connections and every
@@ -260,6 +101,20 @@ pub const DEFAULT_NS: &[u8] = b"0";
 /// transaction. `DEL`, `UNLINK` and `EXISTS` check no slot of their own; the
 /// queue step walks their keys itself (BUG-0179).
 pub fn queue_time_error(args: &[Vec<u8>]) -> Option<Value> {
+    // A script is checked, never run: probing it would run tenant code at
+    // queue time. Its arity and its keys' slots are what a queued command's
+    // verdict rests on, as for any other (ADR-0051).
+    if let Some(name) = args.first()
+        && (name.eq_ignore_ascii_case(b"EVAL") || name.eq_ignore_ascii_case(b"EVALSHA"))
+    {
+        if args.len() < 3 {
+            return Some(arity_err(
+                &String::from_utf8_lossy(name).to_ascii_lowercase(),
+            ));
+        }
+        let keys = flint_commands::eval_keys(args)?;
+        return Dispatcher::crossslot(keys.first()?, &keys[1..]);
+    }
     let probe = flint_storage::MemKv::new();
     let reply = Dispatcher::new(&probe, crate::commands::probe_clock).dispatch(args);
     match &reply {
@@ -319,6 +174,8 @@ pub struct Limits {
     /// structural ceiling (`flint_storage::MAX_KEY_BYTES`); 0 means
     /// "ceiling only".
     pub max_key_bytes: u64,
+    /// A Lua script's time and memory (ADR-0051).
+    pub script: crate::script::ScriptLimits,
 }
 
 impl Default for Limits {
@@ -326,6 +183,7 @@ impl Default for Limits {
         Self {
             max_value_bytes: flint_storage::DEFAULT_MAX_VALUE_BYTES,
             max_key_bytes: flint_storage::DEFAULT_MAX_KEY_BYTES,
+            script: crate::script::ScriptLimits::default(),
         }
     }
 }
@@ -634,6 +492,16 @@ impl<'a> Dispatcher<'a> {
             // Redis 4.0 and still what Spring Session and ASP.NET Core's
             // IDistributedCache write every entry with.
             b"EVAL" | b"EVALSHA" => self.cmd_eval(args),
+            b"TIME" => exact(args, 1, "time", |_| {
+                let us = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_micros())
+                    .unwrap_or(0);
+                Value::Array(Some(vec![
+                    Value::Bulk(Some((us / 1_000_000).to_string().into_bytes())),
+                    Value::Bulk(Some((us % 1_000_000).to_string().into_bytes())),
+                ]))
+            }),
             b"SCRIPT" => self.cmd_script(args),
             b"HMSET" => match self.cmd_hset(args, "hmset") {
                 Value::Integer(_) => Value::Simple("OK".into()),
@@ -1280,10 +1148,20 @@ impl<'a> Dispatcher<'a> {
         )
     }
 
-    /// `EVAL script numkeys key.. arg..` and `EVALSHA sha1 numkeys ...`, for
-    /// the recognised scripts only (ADR-0050). The numkeys rules and errors
-    /// are upstream's; an unrecognised `EVALSHA` answers NOSCRIPT, which is
-    /// what makes a client fall back to `SCRIPT LOAD`, which then refuses.
+    /// `EVAL script numkeys key.. arg..` and `EVALSHA sha1 numkeys ...`
+    /// (ADR-0051): the script runs in the sandboxed Lua of `crate::script`.
+    ///
+    /// Its writes buffer on a `BatchingKv` over this dispatcher's store and
+    /// reach it only if the script ends normally, so a script that fails, or
+    /// runs past its limits, leaves nothing behind. Each `redis.call` runs on
+    /// its own overlay of that buffer behind a `KeyGuard`: a command that
+    /// reaches a key the script did not declare is refused and its overlay
+    /// discarded, so even a `pcall`ed refusal changes nothing.
+    ///
+    /// Atomicity against other writers is the caller's lock (`main` locks
+    /// the declared keys, as it does any write's); crash atomicity is the
+    /// caller's commit of this dispatcher's own store, which `main` makes a
+    /// `BatchingKv` committed as one batch.
     fn cmd_eval(&self, args: &[Vec<u8>]) -> Value {
         let is_sha = args[0].eq_ignore_ascii_case(b"EVALSHA");
         let name = if is_sha { "evalsha" } else { "eval" };
@@ -1300,229 +1178,104 @@ impl<'a> Dispatcher<'a> {
             return err("ERR Number of keys can't be greater than number of args");
         }
         let (keys, argv) = args[3..].split_at(n as usize);
+        let text = if is_sha {
+            let sha = String::from_utf8_lossy(&args[1]).to_ascii_lowercase();
+            match crate::script::lookup(&self.ns, &sha) {
+                Some(t) => t,
+                None => return err("NOSCRIPT No matching script."),
+            }
+        } else {
+            args[1].clone()
+        };
+        if let Some(first) = keys.first()
+            && let Some(refusal) = Self::crossslot(first, &keys[1..])
+        {
+            return refusal;
+        }
+        let declared: std::collections::HashSet<Vec<u8>> = keys.iter().cloned().collect();
+        let buffer = flint_storage::batch::BatchingKv::new(self.kv);
+        let call = |cmd: &[Vec<u8>]| -> Value {
+            let overlay = flint_storage::batch::BatchingKv::new(&buffer);
+            let (reply, strayed) = {
+                let guard = crate::script::KeyGuard::new(&overlay, &self.ns, &declared);
+                let reply = Dispatcher::with_limits(&guard, self.clock, self.limits, &self.ns)
+                    .dispatch(cmd);
+                (reply, guard.strayed())
+            };
+            if let Some(stray) = strayed {
+                return stray.refusal();
+            }
+            for (k, v) in overlay.into_ops() {
+                match v {
+                    Some(v) => buffer.put(&k, &v),
+                    None => {
+                        buffer.delete(&k);
+                    }
+                }
+            }
+            reply
+        };
         let sha = if is_sha {
             String::from_utf8_lossy(&args[1]).to_ascii_lowercase()
         } else {
-            flint_tls::sha1_hex(&args[1])
+            flint_tls::sha1_hex(&text)
         };
-        let Some(script) = known_script(&sha) else {
-            return if is_sha {
-                err("NOSCRIPT No matching script. Please use EVAL.")
-            } else {
-                script_unsupported()
-            };
-        };
-        let (Some(key), 1) = (keys.first(), keys.len()) else {
-            return err("ERR a recognised script names exactly one key");
-        };
-        let arg = |i: usize| argv.get(i).map(|a| a.as_slice()).unwrap_or_default();
-        let call =
-            |parts: &[&[u8]]| self.dispatch(&parts.iter().map(|p| p.to_vec()).collect::<Vec<_>>());
-        // `redis.call('get', KEYS[1]) == ARGV[1]`, which every lock script
-        // asks. A GET error (WRONGTYPE) is the script's error, as it would be
-        // in Lua; a missing ARGV[1] is Lua's nil, which no value equals.
-        let holds_token = || -> Result<bool, Value> {
-            match call(&[b"GET", key]) {
-                Value::Bulk(Some(v)) => Ok(argv.first().is_some_and(|a| *a == v)),
-                Value::Bulk(None) => Ok(false),
-                e @ Value::Error(_) => Err(e),
-                other => Err(Value::Error(format!("ERR unexpected GET reply {other:?}"))),
-            }
-        };
-        match script {
-            KnownScript::LockRelease => match holds_token() {
-                Ok(true) => {
-                    let _ = call(&[b"DEL", key]);
-                    Value::Integer(1)
-                }
-                Ok(false) => Value::Integer(0),
-                Err(e) => e,
-            },
-            KnownScript::LockReacquire => match holds_token() {
-                Ok(true) => match call(&[b"PEXPIRE", key, arg(1)]) {
-                    e @ Value::Error(_) => e,
-                    _ => Value::Integer(1),
-                },
-                Ok(false) => Value::Integer(0),
-                Err(e) => e,
-            },
-            KnownScript::LockExtend => match holds_token() {
-                Ok(true) => {
-                    let pttl = match call(&[b"PTTL", key]) {
-                        Value::Integer(t) => t,
-                        e => return e,
-                    };
-                    if pttl < 0 {
-                        return Value::Integer(0);
-                    }
-                    // ARGV[3] == "0": add to the TTL left; else replace it.
-                    // Lua's `ARGV[2] + expiration` fails on a non-number.
-                    let newttl = if arg(2) == b"0" {
-                        match parse_i64(arg(1)) {
-                            Ok(add) => add.saturating_add(pttl).to_string().into_bytes(),
-                            Err(_) => return err("ERR the lock's additional time is not a number"),
-                        }
-                    } else {
-                        arg(1).to_vec()
-                    };
-                    match call(&[b"PEXPIRE", key, &newttl]) {
-                        e @ Value::Error(_) => e,
-                        _ => Value::Integer(1),
-                    }
-                }
-                Ok(false) => Value::Integer(0),
-                Err(e) => e,
-            },
-            KnownScript::DjangoIncrChecked => match call(&[b"EXISTS", key]) {
-                Value::Integer(1) => call(&[b"INCRBY", key, arg(0)]),
-                // `else return false end`: Lua false is a nil reply.
-                Value::Integer(_) => Value::Bulk(None),
-                e => e,
-            },
-            KnownScript::DjangoIncr => call(&[b"INCRBY", key, arg(0)]),
-            // Script errors raised by `redis.call` are returned as they are;
-            // a reply the script returns (`return redis.call(...)`) is passed
-            // through whatever it is.
-            KnownScript::RedlockAcquire => match call(&[b"EXISTS", key]) {
-                Value::Integer(1) => Value::Integer(0),
-                Value::Integer(_) => match call(&[b"SET", key, arg(0), b"PX", arg(1)]) {
-                    e @ Value::Error(_) => e,
-                    _ => Value::Integer(1),
-                },
-                e => e,
-            },
-            KnownScript::RedlockExtend => match holds_token() {
-                Ok(true) => match call(&[b"SET", key, arg(0), b"PX", arg(1)]) {
-                    e @ Value::Error(_) => e,
-                    _ => Value::Integer(1),
-                },
-                Ok(false) => Value::Integer(0),
-                Err(e) => e,
-            },
-            // `redis.pcall("del", key)`: DEL's own error, were there one, is
-            // swallowed and the key still counted.
-            KnownScript::RedlockRelease => match holds_token() {
-                Ok(true) => {
-                    let _ = call(&[b"DEL", key]);
-                    Value::Integer(1)
-                }
-                Ok(false) => Value::Integer(0),
-                Err(e) => e,
-            },
-            KnownScript::RedsyncExtend => match holds_token() {
-                Ok(true) => call(&[b"PEXPIRE", key, arg(1)]),
-                Ok(false) => Value::Integer(0),
-                Err(e) => e,
-            },
-            // `GET == ARGV[1]` then PEXPIRE, `elseif SET .. NX` (a reply of
-            // OK is truthy, nil is false) then 1, else 0.
-            KnownScript::RedsyncExtendSetNx => match holds_token() {
-                Ok(true) => call(&[b"PEXPIRE", key, arg(1)]),
-                Ok(false) => match call(&[b"SET", key, arg(0), b"PX", arg(1), b"NX"]) {
-                    e @ Value::Error(_) => e,
-                    Value::Bulk(None) => Value::Integer(0),
-                    _ => Value::Integer(1),
-                },
-                Err(e) => e,
-            },
-            KnownScript::RedsyncRelease => match call(&[b"GET", key]) {
-                Value::Bulk(Some(v)) if argv.first().is_some_and(|a| *a == v) => {
-                    call(&[b"DEL", key])
-                }
-                Value::Bulk(Some(_)) => Value::Integer(0),
-                Value::Bulk(None) => Value::Integer(-1),
-                e => e,
-            },
-            // `(EXISTS == 0 and ARGV[3] == "yes") or GET == ARGV[1]`, in
-            // Lua's order: the GET runs only when the first clause is false.
-            // Falling off the end of the script returns nil.
-            KnownScript::RedlockRbLock => {
-                let fresh = match call(&[b"EXISTS", key]) {
-                    Value::Integer(n) => n == 0 && argv.get(2).is_some_and(|a| a == b"yes"),
-                    e => return e,
-                };
-                let take = fresh
-                    || match holds_token() {
-                        Ok(held) => held,
-                        Err(e) => return e,
-                    };
-                if take {
-                    call(&[b"SET", key, arg(0), b"PX", arg(1)])
-                } else {
-                    Value::Bulk(None)
-                }
-            }
-            KnownScript::DelIfHeld => match holds_token() {
-                Ok(true) => call(&[b"DEL", key]),
-                Ok(false) => Value::Integer(0),
-                Err(e) => e,
-            },
-            // `{ GET, PTTL }`: a missing key's GET is Lua false, which a
-            // table carries through as a nil element.
-            KnownScript::GetAndPttl => match call(&[b"GET", key]) {
-                e @ Value::Error(_) => e,
-                v => match call(&[b"PTTL", key]) {
-                    e @ Value::Error(_) => e,
-                    t => Value::Array(Some(vec![v, t])),
-                },
-            },
-            // `local windowMs = tonumber(ARGV[1])` is read only on the SET
-            // path, as in the Lua, where a window that is not a whole number
-            // is SET's error. The library sends `windowMs.toString()`; a
-            // number Lua would read and Rust would not ("6e4", hex) is
-            // refused here rather than guessed at.
-            KnownScript::RateLimitRedisIncr => match call(&[b"PTTL", key]) {
-                Value::Integer(t) if t <= 0 => {
-                    let Ok(window) = parse_i64(arg(0).trim_ascii()) else {
-                        return err("ERR value is not an integer or out of range");
-                    };
-                    match call(&[b"SET", key, b"1", b"PX", window.to_string().as_bytes()]) {
-                        e @ Value::Error(_) => e,
-                        _ => Value::Array(Some(vec![Value::Integer(1), Value::Integer(window)])),
-                    }
-                }
-                Value::Integer(t) => match call(&[b"INCR", key]) {
-                    e @ Value::Error(_) => e,
-                    hits => Value::Array(Some(vec![hits, Value::Integer(t)])),
-                },
-                e => e,
-            },
+        let out = crate::script::run(&self.ns, &sha, &text, keys, argv, self.limits.script, &call);
+        if out.compiled && !is_sha {
+            crate::script::remember(&self.ns, &sha, &text);
         }
+        if out.commit {
+            for (k, v) in buffer.into_ops() {
+                match v {
+                    Some(v) => self.kv.put(&k, &v),
+                    None => {
+                        self.kv.delete(&k);
+                    }
+                }
+            }
+        }
+        out.reply
     }
 
-    /// `SCRIPT LOAD | EXISTS | FLUSH | KILL` over the recognised scripts.
+    /// `SCRIPT LOAD | EXISTS | FLUSH | KILL`, over this namespace's scripts.
     fn cmd_script(&self, args: &[Vec<u8>]) -> Value {
-        let sub = args
-            .get(1)
-            .map(|s| s.to_ascii_uppercase())
-            .unwrap_or_default();
-        match sub.as_slice() {
-            b"LOAD" if args.len() == 3 => {
-                let sha = flint_tls::sha1_hex(&args[2]);
-                if known_script(&sha).is_some() {
+        let Some(sub) = args.get(1) else {
+            return arity_err("script");
+        };
+        match sub.to_ascii_uppercase().as_slice() {
+            b"LOAD" if args.len() == 3 => match crate::script::compile_check(&args[2]) {
+                Ok(()) => {
+                    let sha = flint_tls::sha1_hex(&args[2]);
+                    crate::script::remember(&self.ns, &sha, &args[2]);
                     Value::Bulk(Some(sha.into_bytes()))
-                } else {
-                    script_unsupported()
                 }
-            }
+                Err(e) => e,
+            },
             b"EXISTS" if args.len() >= 3 => Value::Array(Some(
                 args[2..]
                     .iter()
                     .map(|s| {
-                        Value::Integer(known_script(&String::from_utf8_lossy(s)).is_some() as i64)
+                        let sha = String::from_utf8_lossy(s).to_ascii_lowercase();
+                        Value::Integer(crate::script::lookup(&self.ns, &sha).is_some() as i64)
                     })
                     .collect(),
             )),
-            // Nothing is cached, so there is nothing to flush.
-            b"FLUSH" if args.len() <= 3 => Value::Simple("OK".into()),
+            b"FLUSH"
+                if args.len() == 2
+                    || (args.len() == 3
+                        && (args[2].eq_ignore_ascii_case(b"ASYNC")
+                            || args[2].eq_ignore_ascii_case(b"SYNC"))) =>
+            {
+                crate::script::flush(&self.ns);
+                Value::Simple("OK".into())
+            }
+            // A script is stopped by its time limit, not by SCRIPT KILL, and
+            // none outlives the command that runs it.
             b"KILL" if args.len() == 2 => err("NOTBUSY No scripts in execution right now."),
-            b"LOAD" | b"EXISTS" | b"FLUSH" | b"KILL" => err(&format!(
-                "ERR wrong number of arguments for 'script|{}' command",
-                String::from_utf8_lossy(&sub).to_lowercase()
-            )),
+            b"LOAD" | b"EXISTS" | b"FLUSH" | b"KILL" => arity_err("script"),
             _ => err(&format!(
                 "ERR unknown subcommand '{}'. Try SCRIPT HELP.",
-                String::from_utf8_lossy(args.get(1).map(|s| s.as_slice()).unwrap_or_default())
+                String::from_utf8_lossy(sub)
             )),
         }
     }
@@ -4177,44 +3930,41 @@ mod tests {
         call(s, &parts.iter().map(|p| p.as_bytes()).collect::<Vec<_>>())
     }
 
+    /// Every library script this file exercises compiles in the sandbox,
+    /// the two-write and two-key ones that ADR-0050's table could not run
+    /// included: `SCRIPT LOAD` answers each text's own SHA1.
     #[test]
-    fn the_recognised_texts_hash_to_their_table_entries() {
-        for (text, want) in [
-            (LOCK_RELEASE, KnownScript::LockRelease),
-            (LOCK_EXTEND, KnownScript::LockExtend),
-            (LOCK_REACQUIRE, KnownScript::LockReacquire),
-            (DJANGO_INCR_CHECKED, KnownScript::DjangoIncrChecked),
-            (DJANGO_INCR, KnownScript::DjangoIncr),
-            (REDLOCK_ACQUIRE, KnownScript::RedlockAcquire),
-            (REDLOCK_EXTEND, KnownScript::RedlockExtend),
-            (REDLOCK_RELEASE, KnownScript::RedlockRelease),
-            (REDSYNC_EXTEND, KnownScript::RedsyncExtend),
-            (REDSYNC_RELEASE, KnownScript::RedsyncRelease),
-            (REDLOCK_RB_LOCK, KnownScript::RedlockRbLock),
-            (REDLOCK_RB_UNLOCK, KnownScript::DelIfHeld),
-            (REDLOCK5_ACQUIRE, KnownScript::RedlockAcquire),
-            (REDLOCK5_EXTEND, KnownScript::RedlockExtend),
-            (REDLOCK5_RELEASE, KnownScript::RedlockRelease),
-            (REDSYNC_RELEASE_BEFORE_4_12, KnownScript::DelIfHeld),
-            (REDSYNC_EXTEND_SETNX, KnownScript::RedsyncExtendSetNx),
-            (REDLOCK_RB_INFO, KnownScript::GetAndPttl),
-            (RATE_LIMIT_REDIS_INCR, KnownScript::RateLimitRedisIncr),
-            (RATE_LIMIT_REDIS_GET, KnownScript::GetAndPttl),
-        ] {
-            assert_eq!(
-                known_script(&flint_tls::sha1_hex(text.as_bytes())),
-                Some(want)
-            );
-        }
-        // python-redis-lock's scripts are not recognised: each is sent with
-        // two keys, and its release writes both (ADR-0050's amendment). Nor
-        // is rate-limit-redis 5.0.0's increment: INCR, then PEXPIRE.
+    fn every_library_script_compiles() {
+        let s = MemKv::new();
         for text in [
+            LOCK_RELEASE,
+            LOCK_EXTEND,
+            LOCK_REACQUIRE,
+            DJANGO_INCR_CHECKED,
+            DJANGO_INCR,
+            REDLOCK_ACQUIRE,
+            REDLOCK_EXTEND,
+            REDLOCK_RELEASE,
+            REDSYNC_EXTEND,
+            REDSYNC_RELEASE,
+            REDLOCK_RB_LOCK,
+            REDLOCK_RB_UNLOCK,
+            REDLOCK_RB_INFO,
+            REDLOCK5_ACQUIRE,
+            REDLOCK5_EXTEND,
+            REDLOCK5_RELEASE,
+            REDSYNC_RELEASE_BEFORE_4_12,
+            REDSYNC_EXTEND_SETNX,
+            RATE_LIMIT_REDIS_INCR,
+            RATE_LIMIT_REDIS_GET,
+            RATE_LIMIT_REDIS_5_INCR,
             PY_REDIS_LOCK_EXTEND,
             PY_REDIS_LOCK_RELEASE,
-            RATE_LIMIT_REDIS_5_INCR,
         ] {
-            assert_eq!(known_script(&flint_tls::sha1_hex(text.as_bytes())), None);
+            assert_eq!(
+                ev(&s, &["SCRIPT", "LOAD", text]),
+                Value::Bulk(Some(flint_tls::sha1_hex(text.as_bytes()).into_bytes()))
+            );
         }
     }
 
@@ -4584,6 +4334,8 @@ mod tests {
             ev(&s, &["EVAL", LOCK_REACQUIRE, "1", "lk", "other", "8000"]),
             Value::Integer(0)
         );
+        // EVALSHA of a loaded script, its SHA in any case.
+        ev(&s, &["SCRIPT", "LOAD", LOCK_RELEASE]);
         assert_eq!(
             ev(
                 &s,
@@ -4636,49 +4388,323 @@ mod tests {
         ));
     }
 
-    /// Anything else is refused as before; NOSCRIPT for an unknown SHA, which
-    /// sends a client to SCRIPT LOAD, which refuses; upstream's numkeys errors.
+    /// A dispatcher in its own namespace, with its own script limits: the
+    /// script cache is per namespace and process-wide, and a test that
+    /// flushes it must not flush another test's.
+    fn ev_in(s: &MemKv, ns: &str, limits: Limits, parts: &[&str]) -> Value {
+        let args: Vec<Vec<u8>> = parts.iter().map(|p| p.as_bytes().to_vec()).collect();
+        Dispatcher::with_limits(
+            s,
+            flint_storage::strings::system_clock,
+            limits,
+            ns.as_bytes(),
+        )
+        .dispatch(&args)
+    }
+
+    /// python-redis-lock's scripts name two keys, the lock and its signal
+    /// list. With a hash tag in the lock's name they share a slot and run
+    /// whole, release's four writes included; without one they are two slots
+    /// and refused, as any cross-slot script is.
     #[test]
-    fn other_scripts_and_malformed_calls_are_refused() {
+    fn python_redis_lock_scripts_run_when_their_keys_share_a_slot() {
         let s = MemKv::new();
-        assert!(
-            matches!(ev(&s, &["EVAL", "return 1", "0"]), Value::Error(e) if e.contains("Flint runs no Lua"))
-        );
-        assert!(
-            matches!(ev(&s, &["EVALSHA", "0123456789012345678901234567890123456789", "0"]), Value::Error(e) if e.starts_with("NOSCRIPT"))
-        );
-        assert!(
-            matches!(ev(&s, &["SCRIPT", "LOAD", "return 1"]), Value::Error(e) if e.contains("Flint runs no Lua"))
-        );
-        assert_eq!(
-            ev(&s, &["SCRIPT", "LOAD", LOCK_RELEASE]),
-            Value::Bulk(Some(b"c3f8721cbb97f72bc19e972846bd7aaf91901658".to_vec()))
-        );
+        assert!(matches!(
+            ev(&s, &["EVAL", PY_REDIS_LOCK_RELEASE, "2", "lock:x", "lock-signal:x", "tok", "100"]),
+            Value::Error(e) if e.starts_with("CROSSSLOT")
+        ));
+        ev(&s, &["SET", "lock:{x}", "tok", "EX", "10"]);
         assert_eq!(
             ev(
                 &s,
                 &[
-                    "SCRIPT",
-                    "EXISTS",
-                    "c3f8721cbb97f72bc19e972846bd7aaf91901658",
-                    "abc"
+                    "EVAL",
+                    PY_REDIS_LOCK_EXTEND,
+                    "2",
+                    "lock:{x}",
+                    "lock-signal:{x}",
+                    "tok",
+                    "60"
                 ]
             ),
+            Value::Integer(0)
+        );
+        assert!(pttl(&s, "lock:{x}") > 50_000);
+        assert_eq!(
+            ev(
+                &s,
+                &[
+                    "EVAL",
+                    PY_REDIS_LOCK_RELEASE,
+                    "2",
+                    "lock:{x}",
+                    "lock-signal:{x}",
+                    "tok",
+                    "100"
+                ]
+            ),
+            Value::Integer(0)
+        );
+        assert_eq!(ev(&s, &["EXISTS", "lock:{x}"]), Value::Integer(0));
+        assert_eq!(ev(&s, &["LLEN", "lock-signal:{x}"]), Value::Integer(1));
+        assert!(pttl(&s, "lock-signal:{x}") > 0);
+    }
+
+    /// `SCRIPT` and `EVALSHA` over a namespace's cache, and upstream's
+    /// numkeys errors.
+    #[test]
+    fn script_commands_and_malformed_calls() {
+        let s = MemKv::new();
+        let ev = |parts: &[&str]| ev_in(&s, "script-cmds", Limits::default(), parts);
+        assert_eq!(ev(&["EVAL", "return 1", "0"]), Value::Integer(1));
+        assert_eq!(
+            ev(&["EVALSHA", "0123456789012345678901234567890123456789", "0"]),
+            Value::Error("NOSCRIPT No matching script.".into())
+        );
+        let sha = "e0e1f9fabfc9d4800c877a703b823ac0578ff8db";
+        assert_eq!(
+            ev(&["SCRIPT", "LOAD", "return 1"]),
+            Value::Bulk(Some(sha.into()))
+        );
+        assert_eq!(
+            ev(&["SCRIPT", "EXISTS", sha, "abc"]),
             Value::Array(Some(vec![Value::Integer(1), Value::Integer(0)]))
         );
-        assert_eq!(ev(&s, &["SCRIPT", "FLUSH"]), Value::Simple("OK".into()));
-        assert!(
-            matches!(ev(&s, &["EVAL", LOCK_RELEASE, "-1"]), Value::Error(e) if e.contains("negative"))
+        assert_eq!(ev(&["EVALSHA", sha, "0"]), Value::Integer(1));
+        // EVAL caches what it runs, as Redis does.
+        ev(&["EVAL", "return 2", "0"]);
+        assert_eq!(
+            ev(&["EVALSHA", &flint_tls::sha1_hex(b"return 2"), "0"]),
+            Value::Integer(2)
+        );
+        // Another namespace sees none of it.
+        assert_eq!(
+            ev_in(
+                &s,
+                "script-other",
+                Limits::default(),
+                &["SCRIPT", "EXISTS", sha]
+            ),
+            Value::Array(Some(vec![Value::Integer(0)]))
+        );
+        assert_eq!(
+            ev(&["SCRIPT", "FLUSH", "ASYNC"]),
+            Value::Simple("OK".into())
+        );
+        assert_eq!(
+            ev(&["SCRIPT", "EXISTS", sha]),
+            Value::Array(Some(vec![Value::Integer(0)]))
         );
         assert!(
-            matches!(ev(&s, &["EVAL", LOCK_RELEASE, "3", "a"]), Value::Error(e) if e.contains("greater than"))
+            matches!(ev(&["SCRIPT", "LOAD", "return ("]), Value::Error(e)
+            if e == "ERR Error compiling script (new function): user_script:1: unexpected symbol near '<eof>'")
+        );
+        assert_eq!(
+            ev(&["SCRIPT", "KILL"]),
+            Value::Error("NOTBUSY No scripts in execution right now.".into())
         );
         assert!(
-            matches!(ev(&s, &["EVAL", LOCK_RELEASE, "x"]), Value::Error(e) if e.contains("not an integer"))
+            matches!(ev(&["SCRIPT", "BOGUS"]), Value::Error(e) if e.contains("unknown subcommand"))
         );
         assert!(
-            matches!(ev(&s, &["EVAL", LOCK_RELEASE]), Value::Error(e) if e.contains("wrong number"))
+            matches!(ev(&["EVAL", LOCK_RELEASE, "-1"]), Value::Error(e) if e.contains("negative"))
         );
+        assert!(
+            matches!(ev(&["EVAL", LOCK_RELEASE, "3", "a"]), Value::Error(e) if e.contains("greater than"))
+        );
+        assert!(
+            matches!(ev(&["EVAL", LOCK_RELEASE, "x"]), Value::Error(e) if e.contains("not an integer"))
+        );
+        assert!(
+            matches!(ev(&["EVAL", LOCK_RELEASE]), Value::Error(e) if e.contains("wrong number"))
+        );
+    }
+
+    /// ADR-0051's sandbox: past the time limit a script is stopped wherever
+    /// it hides (a `pcall`, an `xpcall`, a coroutine the script made), past
+    /// the memory limit likewise, and in every case nothing it wrote is kept.
+    #[test]
+    fn a_script_is_stopped_at_its_limits_and_keeps_nothing() {
+        let s = MemKv::new();
+        let limits = Limits {
+            script: crate::script::ScriptLimits {
+                time: std::time::Duration::from_millis(20),
+                ..Default::default()
+            },
+            ..Limits::default()
+        };
+        let ev = |parts: &[&str]| ev_in(&s, "script-limits", limits, parts);
+        for body in [
+            "while true do end",
+            "while true do pcall(function() while true do end end) end",
+            "while true do xpcall(function() while true do end end, function(e) return e end) end",
+            "coroutine.resume(coroutine.create(function() while true do end end))",
+            "coroutine.wrap(function() while true do end end)()",
+        ] {
+            let text = format!("redis.call('set', KEYS[1], 'x') {body}");
+            let started = std::time::Instant::now();
+            let reply = ev(&["EVAL", &text, "1", "{l}k"]);
+            assert!(
+                matches!(&reply, Value::Error(e) if e.contains("time limit of 20 ms")),
+                "{body}: {reply:?}"
+            );
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(2),
+                "{body}"
+            );
+            assert_eq!(
+                ev(&["EXISTS", "{l}k"]),
+                Value::Integer(0),
+                "{body} kept a write"
+            );
+        }
+        let reply = ev(&[
+            "EVAL",
+            "redis.call('set', KEYS[1], 'x') return #string.rep('x', 2^30)",
+            "1",
+            "{l}m",
+        ]);
+        assert!(
+            matches!(&reply, Value::Error(e) if e.contains("memory limit")),
+            "{reply:?}"
+        );
+        assert_eq!(ev(&["EXISTS", "{l}m"]), Value::Integer(0));
+    }
+
+    /// An uncaught error discards the script's writes; an error REPLY is a
+    /// value, and they are kept (ADR-0051: Redis keeps them in both cases).
+    #[test]
+    fn a_failed_script_keeps_nothing_and_an_error_reply_keeps_all() {
+        let s = MemKv::new();
+        assert!(matches!(
+            ev(&s, &["EVAL", "redis.call('set', KEYS[1], 'x') error('then failed')", "1", "rb"]),
+            Value::Error(e) if e == "ERR user_script:1: then failed script: on @user_script:1."
+        ));
+        assert_eq!(ev(&s, &["EXISTS", "rb"]), Value::Integer(0));
+        assert_eq!(
+            ev(
+                &s,
+                &[
+                    "EVAL",
+                    "redis.call('set', KEYS[1], 'x') return redis.error_reply('MY no')",
+                    "1",
+                    "ok"
+                ]
+            ),
+            Value::Error("MY no".into())
+        );
+        assert_eq!(ev(&s, &["GET", "ok"]), Value::Bulk(Some(b"x".to_vec())));
+    }
+
+    /// A script touches only its declared keys, all in one slot. A command
+    /// that reaches past them is refused and has no effect, even caught.
+    #[test]
+    fn a_script_touches_only_the_keys_it_declares() {
+        let s = MemKv::new();
+        assert!(matches!(
+            ev(&s, &["EVAL", "return 1", "2", "a", "b"]),
+            Value::Error(e) if e.starts_with("CROSSSLOT")
+        ));
+        assert_eq!(
+            ev(&s, &["EVAL", "return #KEYS", "2", "{t}a", "{t}b"]),
+            Value::Integer(2)
+        );
+        assert!(matches!(
+            ev(&s, &["EVAL", "return redis.call('get', 'other')", "1", "{t}a"]),
+            Value::Error(e) if e.contains("access key 'other'") && e.ends_with("script: on @user_script:1.")
+        ));
+        // Caught, the refused RENAME still did nothing: its source stays.
+        assert!(matches!(
+            ev(&s, &["EVAL", "redis.call('set', KEYS[1], 'v') return redis.pcall('rename', KEYS[1], '{t}zz')", "1", "{t}r"]),
+            Value::Error(e) if e.contains("access key '{t}zz'")
+        ));
+        assert_eq!(ev(&s, &["GET", "{t}r"]), Value::Bulk(Some(b"v".to_vec())));
+        assert_eq!(ev(&s, &["EXISTS", "{t}zz"]), Value::Integer(0));
+        for cmd in ["dbsize", "flushall", "scan"] {
+            let text = format!(
+                "return redis.call('{cmd}'{})",
+                if cmd == "scan" { ", '0'" } else { "" }
+            );
+            assert!(
+                matches!(ev(&s, &["EVAL", &text, "1", "{t}a"]), Value::Error(e) if e.contains("whole keyspace")),
+                "{cmd}"
+            );
+        }
+        assert!(matches!(
+            ev(&s, &["EVAL", "return redis.call('eval', 'return 1', '0')", "0"]),
+            Value::Error(e) if e.starts_with("ERR This command is not allowed from script")
+        ));
+    }
+
+    /// The sandbox: text only, no loaders, read-only globals.
+    #[test]
+    fn the_sandbox_loads_text_only_and_protects_its_globals() {
+        let s = MemKv::new();
+        assert!(matches!(
+            ev(&s, &["EVAL", "\x1bLua\x51\x00", "0"]),
+            Value::Error(e) if e.contains("attempt to load a binary chunk")
+        ));
+        for name in [
+            "load",
+            "loadstring",
+            "dofile",
+            "loadfile",
+            "require",
+            "os",
+            "io",
+            "debug",
+            "package",
+            "setfenv",
+            "getfenv",
+            "print",
+        ] {
+            assert!(
+                matches!(ev(&s, &["EVAL", &format!("return type({name})"), "0"]), Value::Error(e)
+                    if e.contains(&format!("nonexistent global variable '{name}'"))),
+                "{name}"
+            );
+        }
+        assert!(matches!(
+            ev(&s, &["EVAL", "x = 1", "0"]),
+            Value::Error(e) if e == "ERR user_script:1: Attempt to modify a readonly table script: on @user_script:1."
+        ));
+        assert!(matches!(
+            ev(&s, &["EVAL", "setmetatable(_G, nil)", "0"]),
+            Value::Error(_)
+        ));
+        assert_eq!(
+            ev(&s, &["EVAL", "return redis.sha1hex('abc')", "0"]),
+            Value::Bulk(Some(b"a9993e364706816aba3e25717850c26c9cd0d89d".to_vec()))
+        );
+    }
+
+    /// A Lua number handed to `redis.call` is spelled as Valkey 9.1 spells
+    /// it (measured): integers within half of i64's range, else fpconv.
+    #[test]
+    fn a_lua_number_argument_is_spelled_as_valkey_spells_it() {
+        for (n, want) in [
+            (0.1, "0.1"),
+            (60000.0, "60000"),
+            (1e17, "100000000000000000"),
+            (4.5e18, "4500000000000000000"),
+            (5e18, "5e+18"),
+            (1e21, "1e+21"),
+            (1e-7, "1e-7"),
+            (1.0 / 3.0, "0.3333333333333333"),
+            (123456789.12345679, "1.2345678912345679e+8"),
+            (-2.5e300, "-2.5e+300"),
+            (-0.0, "0"),
+            (1.5, "1.5"),
+            (0.000123, "0.000123"),
+            (f64::INFINITY, "inf"),
+            (f64::NEG_INFINITY, "-inf"),
+        ] {
+            assert_eq!(
+                String::from_utf8(crate::script::lua_number_arg(n)).expect("ascii"),
+                want,
+                "{n}"
+            );
+        }
     }
 
     /// The key a script routes, locks and is owned by is `KEYS[1]`.

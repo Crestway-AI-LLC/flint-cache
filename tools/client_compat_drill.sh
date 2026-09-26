@@ -329,29 +329,33 @@ def named():
 check("client_name set: connects, and CLIENT GETNAME reads it back", named)
 
 print("== an error that echoes a multi-line argument (BUG-0184)")
-# The unknown-command error echoes the arguments, and an EVAL script is many
+# The unknown-command error echoes the arguments, and an argument can span
 # lines. A raw LF inside the error line made redis-py wait for a CRLF that
-# never came: django-redis's incr hung until its socket timeout.
+# never came: django-redis's incr hung until its socket timeout, when its
+# multi-line EVAL was still an unknown command. A script's own error can
+# carry a newline too.
 def multiline_error():
     t = redis.Redis(host="127.0.0.1", port=PORT, password=PW, decode_responses=True,
                     protocol=3, socket_timeout=5)
-    try:
-        t.execute_command("EVAL", "local x = 1\nreturn x", 0)
-    except redis.ResponseError as e:
-        # Since ADR-0050 an unrecognised script is refused with its own
-        # message rather than as an unknown command; what matters here is that
-        # the refusal arrives at once and the connection survives it.
-        assert "Flint runs no Lua" in str(e), f"not the unrecognised-script refusal: {e}"
-    else:
-        raise AssertionError("an unrecognised script was answered")
-    assert t.ping() is True, "the connection was unusable after the error"
+    for cmd, want in (
+        (("NOSUCHCMD", "local x = 1\nreturn x"), "unknown command"),
+        (("EVAL", "error('one\\ntwo')", 0), "one"),
+    ):
+        try:
+            t.execute_command(*cmd)
+        except redis.ResponseError as e:
+            assert want in str(e), f"{cmd[0]}: not the expected error: {e}"
+        else:
+            raise AssertionError(f"{cmd[0]} was answered")
+        assert t.ping() is True, "the connection was unusable after the error"
     t.close()
 check("an error echoing a multi-line argument arrives at once, and the connection lives", multiline_error)
 
-print("== recognised Lua scripts and KEYS (ADR-0050)")
-# redis-py's Lock sends three Lua scripts. Flint runs no Lua, so a lock could
-# be taken and never released: it only expired. They are recognised now and
-# run natively. Two locks, on the two pairs, through the whole life.
+print("== Lua scripts (ADR-0051) and KEYS (ADR-0050)")
+# redis-py's Lock sends three Lua scripts, by EVALSHA after one SCRIPT LOAD:
+# the load lands on pair 0 and the lock on either pair, so this is also the
+# proxy's script cache turning each EVALSHA into the EVAL it stands for.
+# Two locks, on the two pairs, through the whole life.
 def lock_life():
     from redis.exceptions import LockNotOwnedError
     for name in ("a", "b"):
@@ -424,6 +428,87 @@ RC=$?
 RAN="redis-py"; SKIPPED=""
 
 # ---------------------------------------------------------------------------
+# Python rate limiting and python-redis-lock (ADR-0051). Their scripts write
+# more than once, or name two keys, which only running Lua serves: `limits`
+# (what Flask-Limiter and SlowAPI store in) with all three strategies, and
+# python-redis-lock with a hash-tagged name, so its lock and signal list
+# share a slot. In a venv of their own: `limits` brings dependencies the
+# redis-py venv lacks.
+# ---------------------------------------------------------------------------
+LIM_VENV=${FLINT_COMPAT_LIMITS_VENV:-$FLINT_DRILL_ROOT/flint-compat-limits}
+lim_ready() { "$LIM_VENV/bin/python" -c 'import limits, redis_lock' >/dev/null 2>&1; }
+if ! lim_ready; then
+  LIM_BASE=""
+  for cand in python3.14 python3.13 python3.12 python3.11 python3; do
+    command -v "$cand" >/dev/null && { LIM_BASE=$(command -v "$cand"); break; }
+  done
+  [ -n "$LIM_BASE" ] && "$LIM_BASE" -m venv "$LIM_VENV" >/dev/null 2>&1 \
+    && "$LIM_VENV/bin/pip" install -q "limits>=4,<5" "python-redis-lock==4.0.1" redis >/dev/null 2>&1
+fi
+if ! lim_ready; then
+  echo "== python rate limiting: SKIP (could not install limits and python-redis-lock; offline?)"
+  SKIPPED="$SKIPPED limits python-redis-lock"
+else
+  PORT=$PORT "$LIM_VENV/bin/python" - <<'PYL'
+import os, sys
+import limits, redis, redis_lock
+from limits import parse
+from limits.storage import storage_from_string
+from limits.strategies import (FixedWindowRateLimiter, MovingWindowRateLimiter,
+                               SlidingWindowCounterRateLimiter)
+PORT = int(os.environ["PORT"]); PW = "tok-acme"
+print(f"== client: limits {limits.__version__}, python-redis-lock {getattr(redis_lock, '__version__', '?')}")
+fails = []
+def check(name, fn):
+    try:
+        fn(); ok, note = True, ""
+    except Exception as e:
+        ok, note = False, f"{type(e).__name__}: {e}"
+    print(f"  {'ok ' if ok else 'FAIL'} {name}{'  ' + note if note else ''}")
+    if not ok:
+        fails.append(name)
+store = storage_from_string(f"redis://:{PW}@127.0.0.1:{PORT}", socket_timeout=5)
+def strategy(cls, name):
+    def run():
+        lim, item = cls(store), parse("3/minute")
+        for who in ("a", "b"):
+            lim.clear(item, "compat", name, who)
+            hits = [lim.hit(item, "compat", name, who) for _ in range(4)]
+            assert hits == [True, True, True, False], f"{who}: {hits}"
+            assert lim.test(item, "compat", name, who) is False, f"{who}: test"
+            stats = lim.get_window_stats(item, "compat", name, who)
+            assert stats.remaining == 0, f"{who}: {stats}"
+            lim.clear(item, "compat", name, who)
+    return run
+for cls, name in ((FixedWindowRateLimiter, "fixed"), (MovingWindowRateLimiter, "moving"),
+                  (SlidingWindowCounterRateLimiter, "sliding")):
+    check(f"limits {name} window: admits 3, refuses the 4th", strategy(cls, name))
+def pylock():
+    r = redis.Redis(host="127.0.0.1", port=PORT, password=PW, socket_timeout=5)
+    for name in ("{a}job", "{b}job"):
+        r.delete(f"lock:{name}", f"lock-signal:{name}")
+        mine = redis_lock.Lock(r, name, expire=10)
+        assert mine.acquire(blocking=False), f"{name}: acquire"
+        theirs = redis_lock.Lock(r, name, expire=10)
+        assert theirs.acquire(blocking=False) is False, f"{name}: a second holder"
+        mine.extend(30)
+        assert 25 <= r.ttl(f"lock:{name}") <= 30, f"{name}: extend"
+        mine.release()
+        assert not r.exists(f"lock:{name}"), f"{name}: release"
+        assert theirs.acquire(blocking=False), f"{name}: free after release"
+        theirs.release()
+    r.close()
+check("python-redis-lock, hash-tagged name: acquire, extend, release, re-take", pylock)
+if fails:
+    print(f"\nFAIL: {len(fails)} client-visible problem(s): {', '.join(fails)}")
+    sys.exit(1)
+print("\nall python rate limiting checks passed")
+PYL
+  [ $? -eq 0 ] || { echo "FAIL: python rate limiting / python-redis-lock"; exit 1; }
+  RAN="$RAN, limits (Flask-Limiter), python-redis-lock"
+fi
+
+# ---------------------------------------------------------------------------
 # node-redis. The second client worth gating on, and NOT redundant with
 # redis-py: the two post-process replies differently, so each catches
 # failures the other hides. JSON.NUMINCRBY is the standing example — redis-py
@@ -434,7 +519,7 @@ RAN="redis-py"; SKIPPED=""
 NODE=${FLINT_COMPAT_NODE:-$(command -v node || true)}
 if [ -z "$NODE" ]; then
   echo "== node-redis: SKIP (no node on PATH)"
-  SKIPPED="$SKIPPED node-redis ioredis node-redlock rate-limit-redis"
+  SKIPPED="$SKIPPED node-redis ioredis node-redlock rate-limit-redis rate-limiter-flexible"
 else
   NODE_DIR=${FLINT_COMPAT_NODE_DIR:-$FLINT_DRILL_ROOT/flint-compat-node}
   mkdir -p "$NODE_DIR"
@@ -764,6 +849,54 @@ JS
     [ $? -eq 0 ] || { echo "FAIL: rate-limit-redis compatibility"; exit 1; }
     RAN="$RAN, rate-limit-redis"
   fi
+
+  # -------------------------------------------------------------------------
+  # rate-limiter-flexible (ADR-0051), on ioredis: its consume is one script
+  # that writes up to three times.
+  # -------------------------------------------------------------------------
+  if [ -d "$NODE_DIR/node_modules/ioredis" ] && [ ! -d "$NODE_DIR/node_modules/rate-limiter-flexible" ]; then
+    (cd "$NODE_DIR" && npm install rate-limiter-flexible@11 --silent >/dev/null 2>&1)
+  fi
+  if [ ! -d "$NODE_DIR/node_modules/rate-limiter-flexible" ]; then
+    echo "== rate-limiter-flexible: SKIP (could not install; offline?)"
+    SKIPPED="$SKIPPED rate-limiter-flexible"
+  else
+    echo "== client: rate-limiter-flexible $("$NODE" -e "console.log(JSON.parse(require('fs').readFileSync('$NODE_DIR/node_modules/rate-limiter-flexible/package.json','utf8')).version)"), on ioredis"
+    cat > "$NODE_DIR/flexible.js" <<'JS'
+const Redis = require("ioredis");
+const { RateLimiterRedis } = require("rate-limiter-flexible");
+const fails = [];
+const say = (ok, name, note) => {
+  console.log(`  ${ok ? "ok " : "FAIL"} ${name}${note && !ok ? "  " + note : ""}`);
+  if (!ok) fails.push(name);
+};
+const r = new Redis({ host: "127.0.0.1", port: Number(process.env.FLINT_PORT), password: process.env.FLINT_TOKEN });
+(async () => {
+  const rl = new RateLimiterRedis({ storeClient: r, points: 3, duration: 60, keyPrefix: "rlf" });
+  for (const k of ["a", "b"]) {
+    try {
+      await rl.delete(k);
+      const got = [];
+      for (let i = 0; i < 4; i++) {
+        try { got.push((await rl.consume(k)).remainingPoints); }
+        catch (e) { got.push(e instanceof Error ? `error ${e.message}` : `refused ${e.msBeforeNext > 0}`); }
+      }
+      say(JSON.stringify(got) === '[2,1,0,"refused true"]', `${k}: admits 3, refuses the 4th`, JSON.stringify(got));
+      await rl.delete(k);
+    } catch (e) { say(false, `${k}: consume`, e.message); }
+  }
+  r.disconnect();
+  if (fails.length) {
+    console.log(`\nFAIL: ${fails.length} client-visible problem(s): ${fails.join(", ")}`);
+    process.exit(1);
+  }
+  console.log("\nall rate-limiter-flexible checks passed");
+})();
+JS
+    (cd "$NODE_DIR" && FLINT_PORT=$PORT FLINT_TOKEN=tok-acme "$NODE" flexible.js)
+    [ $? -eq 0 ] || { echo "FAIL: rate-limiter-flexible compatibility"; exit 1; }
+    RAN="$RAN, rate-limiter-flexible"
+  fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -775,7 +908,7 @@ fi
 GO=${FLINT_COMPAT_GO:-$(command -v go || true)}
 if [ -z "$GO" ]; then
   echo "== go-redis: SKIP (no go on PATH)"
-  SKIPPED="$SKIPPED go-redis redsync"
+  SKIPPED="$SKIPPED go-redis redsync redis_rate"
 else
   GO_DIR=${FLINT_COMPAT_GO_DIR:-$FLINT_DRILL_ROOT/flint-compat-go}
   mkdir -p "$GO_DIR"
@@ -926,6 +1059,77 @@ GOSRC
     (cd "$RS_DIR" && FLINT_ADDR=127.0.0.1:$PORT FLINT_TOKEN=tok-acme "$GO" run .)
     [ $? -eq 0 ] || { echo "FAIL: redsync compatibility"; exit 1; }
     RAN="$RAN, redsync"
+  fi
+
+  # -------------------------------------------------------------------------
+  # redis_rate v10 (ADR-0051), on go-redis v9: GCRA in one script that reads
+  # TIME and computes in floating point, in its own module.
+  # -------------------------------------------------------------------------
+  RR_DIR=${FLINT_COMPAT_REDIS_RATE_DIR:-$FLINT_DRILL_ROOT/flint-compat-redis-rate}
+  mkdir -p "$RR_DIR"
+  cat > "$RR_DIR/main.go" <<'GOSRC'
+package main
+
+import (
+	"context"
+	"fmt"
+	"os"
+
+	"github.com/go-redis/redis_rate/v10"
+	"github.com/redis/go-redis/v9"
+)
+
+func main() {
+	ctx := context.Background()
+	rdb := redis.NewClient(&redis.Options{Addr: os.Getenv("FLINT_ADDR"), Password: os.Getenv("FLINT_TOKEN")})
+	limiter := redis_rate.NewLimiter(rdb)
+	fails := 0
+	say := func(ok bool, name string, note string) {
+		mark := "ok "
+		if !ok {
+			mark, fails = "FAIL", fails+1
+		} else {
+			note = ""
+		}
+		fmt.Printf("  %s %s%s\n", mark, name, note)
+	}
+	for _, k := range []string{"a", "b"} {
+		limiter.Reset(ctx, k)
+		var got []int
+		for i := 0; i < 4; i++ {
+			res, err := limiter.Allow(ctx, k, redis_rate.PerMinute(3))
+			if err != nil {
+				say(false, k+": Allow", "  "+err.Error())
+				break
+			}
+			got = append(got, res.Allowed)
+		}
+		say(fmt.Sprint(got) == "[1 1 1 0]", k+": Allow admits 3, refuses the 4th", fmt.Sprintf("  %v", got))
+		limiter.Reset(ctx, k)
+		res, err := limiter.AllowAtMost(ctx, k, redis_rate.PerMinute(3), 2)
+		say(err == nil && res.Allowed == 2, k+": AllowAtMost(2) admits 2", fmt.Sprintf("  %v %v", res, err))
+		limiter.Reset(ctx, k)
+	}
+	if fails > 0 {
+		fmt.Printf("\nFAIL: %d client-visible problem(s)\n", fails)
+		os.Exit(1)
+	}
+	fmt.Println("\nall redis_rate checks passed")
+}
+GOSRC
+  if [ ! -f "$RR_DIR/go.sum" ]; then
+    (cd "$RR_DIR" && { [ -f go.mod ] || "$GO" mod init flintcompatredisrate >/dev/null 2>&1; } \
+      && "$GO" get github.com/go-redis/redis_rate/v10 github.com/redis/go-redis/v9 >/dev/null 2>&1 \
+      && "$GO" mod tidy >/dev/null 2>&1)
+  fi
+  if [ ! -f "$RR_DIR/go.sum" ]; then
+    echo "== redis_rate: SKIP (could not fetch the module; offline?)"
+    SKIPPED="$SKIPPED redis_rate"
+  else
+    echo "== client: redis_rate $(sed -n 's/.*go-redis\/redis_rate\/v10 \(v[0-9.]*\).*/\1/p' "$RR_DIR/go.mod" | head -1), on go-redis v9"
+    (cd "$RR_DIR" && FLINT_ADDR=127.0.0.1:$PORT FLINT_TOKEN=tok-acme "$GO" run .)
+    [ $? -eq 0 ] || { echo "FAIL: redis_rate compatibility"; exit 1; }
+    RAN="$RAN, redis_rate"
   fi
 fi
 

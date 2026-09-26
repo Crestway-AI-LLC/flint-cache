@@ -11,6 +11,8 @@
 //! every consumer (a replica rejects them, the slot gate freezes them, a
 //! future replica-read router keeps them on the master).
 
+pub mod scripts;
+
 /// True when `name` can only SHRINK the keyspace.
 ///
 /// The one class of write that must stay allowed when the system is refusing
@@ -122,13 +124,10 @@ pub fn is_write_command(name: &[u8]) -> bool {
     )
 }
 
-/// True for commands a replica may serve / a replica-read router may move
-/// off the master. NOT simply `!is_write_command`: unknown or admin
-/// commands are neither reads nor writes and must stay on the master, so
-/// the read set is explicit too.
 /// The keys an `EVAL` or `EVALSHA` names (`KEYS[...]`), or `None` when the
-/// command is neither or its key count is malformed (ADR-0050). A script's
-/// key is what it routes, locks and is owned by; `args[1]` is the script.
+/// command is neither or its key count is malformed (ADR-0050, ADR-0051).
+/// A script's keys are what it routes by, locks, and may touch; `args[1]`
+/// is the script.
 pub fn eval_keys(args: &[Vec<u8>]) -> Option<&[Vec<u8>]> {
     let name = args.first()?;
     if !name.eq_ignore_ascii_case(b"EVAL") && !name.eq_ignore_ascii_case(b"EVALSHA") {
@@ -138,10 +137,15 @@ pub fn eval_keys(args: &[Vec<u8>]) -> Option<&[Vec<u8>]> {
     args.get(3..3usize.checked_add(n)?)
 }
 
+/// True for commands a replica may serve / a replica-read router may move
+/// off the master. NOT simply `!is_write_command`: unknown or admin
+/// commands are neither reads nor writes and must stay on the master, so
+/// the read set is explicit too.
 pub fn is_read_command(name: &[u8]) -> bool {
     matches!(
         name.to_ascii_uppercase().as_slice(),
         b"GET"
+            | b"TIME"
             | b"FLINTKEYSIZE"
             | b"FLINTKEYSTAMP"
             | b"MGET"

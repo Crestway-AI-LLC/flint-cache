@@ -57,6 +57,12 @@ enum Expect {
     Str(&'static [u8]),   // $len\r\n<bytes>
     Bytes(Vec<u8>),       // like Str, for computed payloads
     AnyError,             // -...
+    /// An error with exactly this text: a script's errors carry Valkey's
+    /// wording and the line they were raised on (ADR-0051).
+    Err(&'static str),
+    /// Any bulk string: a value that depends on the clock (`TIME`, a rate
+    /// limiter's reset time) where only its kind is agreed.
+    AnyBulk,
     /// Exact array, in order (HMGET etc. where order is defined).
     Arr(Vec<Expect>),
     /// Flat field/value reply compared as an unordered map (HGETALL —
@@ -145,12 +151,26 @@ const REDLOCK_RB_INFO: &[u8] =
 const REDLOCK5_ACQUIRE: &[u8] = "\n  -- Return 0 if an entry already exists.\n  for i, key in ipairs(KEYS) do\n    if redis.call(\"exists\", key) == 1 then\n      return 0\n    end\n  end\n\n  -- Create an entry for each provided key.\n  for i, key in ipairs(KEYS) do\n    redis.call(\"set\", key, ARGV[1], \"PX\", ARGV[2])\n  end\n\n  -- Return the number of entries added.\n  return #KEYS\n".as_bytes();
 const REDSYNC_RELEASE_BEFORE_4_12: &[u8] = "\n\tif redis.call(\"GET\", KEYS[1]) == ARGV[1] then\n\t\treturn redis.call(\"DEL\", KEYS[1])\n\telse\n\t\treturn 0\n\tend\n".as_bytes();
 const REDSYNC_EXTEND_SETNX: &[u8] = "\n\tif redis.call(\"GET\", KEYS[1]) == ARGV[1] then\n\t\treturn redis.call(\"PEXPIRE\", KEYS[1], ARGV[2])\n\telseif redis.call(\"SET\", KEYS[1], ARGV[1], \"PX\", ARGV[2], \"NX\") then\n\t\treturn 1\n\telse\n\t\treturn 0\n\tend\n".as_bytes();
+// ADR-0051: the rate limiters' scripts, as captured on the wire from Python
+// `limits` 4.2, Go `redis_rate` v10, node `rate-limiter-flexible` 11.2.1 and
+// `rate-limit-redis` 5.0.0. Each writes more than once, or computes on TIME.
+const LIMITS_FIXED: &[u8] = "local current\nlocal amount = tonumber(ARGV[2])\ncurrent = redis.call(\"incrby\", KEYS[1], amount)\n\nif tonumber(current) == amount then\n    redis.call(\"expire\", KEYS[1], ARGV[1])\nend\n\nreturn current\n".as_bytes();
+const LIMITS_MOVING: &[u8] = "local timestamp = tonumber(ARGV[1])\nlocal limit = tonumber(ARGV[2])\nlocal expiry = tonumber(ARGV[3])\nlocal amount = tonumber(ARGV[4])\n\nif amount > limit then\n    return false\nend\n\nlocal entry = redis.call('lindex', KEYS[1], limit - amount)\n\nif entry and tonumber(entry) >= timestamp - expiry then\n    return false\nend\n\nfor i = 1, amount do\n    redis.call('lpush', KEYS[1], timestamp)\nend\n\nredis.call('ltrim', KEYS[1], 0, limit - 1)\nredis.call('expire', KEYS[1], expiry)\n\nreturn true\n".as_bytes();
+const LIMITS_MOVING_STATS: &[u8] = "local items = redis.call('lrange', KEYS[1], 0, tonumber(ARGV[2]))\nlocal expiry = tonumber(ARGV[1])\nlocal a = 0\nlocal oldest = nil\n\nfor idx=1,#items do\n    if tonumber(items[idx]) >= expiry then\n        a = a + 1\n\n        local value = tonumber(items[idx])\n        if oldest == nil or value < oldest then\n            oldest = value\n        end\n    else\n        break\n    end\nend\n\nif oldest then\n    return {tostring(oldest), a}\nend".as_bytes();
+const LIMITS_SLIDING: &[u8] = "-- Time is in milliseconds in this script: TTL, expiry...\n\nlocal limit = tonumber(ARGV[1])\nlocal expiry = tonumber(ARGV[2]) * 1000\nlocal amount = tonumber(ARGV[3])\n\nif amount > limit then\n    return false\nend\n\nlocal current_ttl = tonumber(redis.call('pttl', KEYS[2]))\n\nif current_ttl > 0 and current_ttl < expiry then\n    -- Current window expired, shift it to the previous window\n    redis.call('rename', KEYS[2], KEYS[1])\n    redis.call('set', KEYS[2], 0, 'PX', current_ttl + expiry)\nend\n\nlocal previous_count = tonumber(redis.call('get', KEYS[1])) or 0\nlocal previous_ttl = tonumber(redis.call('pttl', KEYS[1])) or 0\nlocal current_count = tonumber(redis.call('get', KEYS[2])) or 0\ncurrent_ttl = tonumber(redis.call('pttl', KEYS[2])) or 0\n\n-- If the values don't exist yet, consider the TTL is 0\nif previous_ttl <= 0 then\n    previous_ttl = 0\nend\nif current_ttl <= 0 then\n    current_ttl = 0\nend\nlocal weighted_count = math.floor(previous_count * previous_ttl / expiry) + current_count\n\nif (weighted_count + amount) > limit then\n    return false\nend\n\n-- If the current counter exists, increase its value\nif redis.call('exists', KEYS[2]) == 1 then\n    redis.call('incrby', KEYS[2], amount)\nelse\n    -- Otherwise, set the value with twice the expiry time\n    redis.call('set', KEYS[2], amount, 'PX', expiry * 2)\nend\n\nreturn true\n".as_bytes();
+const LIMITS_SLIDING_STATS: &[u8] = "local expiry = tonumber(ARGV[1]) * 1000\nlocal previous_count = redis.call('get', KEYS[1])\nlocal previous_ttl = redis.call('pttl', KEYS[1])\nlocal current_count = redis.call('get', KEYS[2])\nlocal current_ttl = redis.call('pttl', KEYS[2])\n\nif current_ttl > 0 and current_ttl < expiry then\n    -- Current window expired, shift it to the previous window\n    redis.call('rename', KEYS[2], KEYS[1])\n    redis.call('set', KEYS[2], 0, 'PX', current_ttl + expiry)\n    previous_count = redis.call('get', KEYS[1])\n    previous_ttl = redis.call('pttl', KEYS[1])\n    current_count = redis.call('get', KEYS[2])\n    current_ttl = redis.call('pttl', KEYS[2])\nend\n\nreturn {previous_count, previous_ttl, current_count, current_ttl}\n".as_bytes();
+const REDIS_RATE_ALLOW: &[u8] = "\n-- this script has side-effects, so it requires replicate commands mode\nredis.replicate_commands()\n\nlocal rate_limit_key = KEYS[1]\nlocal burst = ARGV[1]\nlocal rate = ARGV[2]\nlocal period = ARGV[3]\nlocal cost = tonumber(ARGV[4])\n\nlocal emission_interval = period / rate\nlocal increment = emission_interval * cost\nlocal burst_offset = emission_interval * burst\n\n-- redis returns time as an array containing two integers: seconds of the epoch\n-- time (10 digits) and microseconds (6 digits). for convenience we need to\n-- convert them to a floating point number. the resulting number is 16 digits,\n-- bordering on the limits of a 64-bit double-precision floating point number.\n-- adjust the epoch to be relative to Jan 1, 2017 00:00:00 GMT to avoid floating\n-- point problems. this approach is good until \"now\" is 2,483,228,799 (Wed, 09\n-- Sep 2048 01:46:39 GMT), when the adjusted value is 16 digits.\nlocal jan_1_2017 = 1483228800\nlocal now = redis.call(\"TIME\")\nnow = (now[1] - jan_1_2017) + (now[2] / 1000000)\n\nlocal tat = redis.call(\"GET\", rate_limit_key)\n\nif not tat then\n  tat = now\nelse\n  tat = tonumber(tat)\nend\n\ntat = math.max(tat, now)\n\nlocal new_tat = tat + increment\nlocal allow_at = new_tat - burst_offset\n\nlocal diff = now - allow_at\nlocal remaining = diff / emission_interval\n\nif remaining < 0 then\n  local reset_after = tat - now\n  local retry_after = diff * -1\n  return {\n    0, -- allowed\n    0, -- remaining\n    tostring(retry_after),\n    tostring(reset_after),\n  }\nend\n\nlocal reset_after = new_tat - now\nif reset_after > 0 then\n  redis.call(\"SET\", rate_limit_key, new_tat, \"EX\", math.ceil(reset_after))\nend\nlocal retry_after = -1\nreturn {cost, remaining, tostring(retry_after), tostring(reset_after)}\n".as_bytes();
+const REDIS_RATE_ALLOW_AT_MOST: &[u8] = "\n-- this script has side-effects, so it requires replicate commands mode\nredis.replicate_commands()\n\nlocal rate_limit_key = KEYS[1]\nlocal burst = ARGV[1]\nlocal rate = ARGV[2]\nlocal period = ARGV[3]\nlocal cost = tonumber(ARGV[4])\n\nlocal emission_interval = period / rate\nlocal burst_offset = emission_interval * burst\n\n-- redis returns time as an array containing two integers: seconds of the epoch\n-- time (10 digits) and microseconds (6 digits). for convenience we need to\n-- convert them to a floating point number. the resulting number is 16 digits,\n-- bordering on the limits of a 64-bit double-precision floating point number.\n-- adjust the epoch to be relative to Jan 1, 2017 00:00:00 GMT to avoid floating\n-- point problems. this approach is good until \"now\" is 2,483,228,799 (Wed, 09\n-- Sep 2048 01:46:39 GMT), when the adjusted value is 16 digits.\nlocal jan_1_2017 = 1483228800\nlocal now = redis.call(\"TIME\")\nnow = (now[1] - jan_1_2017) + (now[2] / 1000000)\n\nlocal tat = redis.call(\"GET\", rate_limit_key)\n\nif not tat then\n  tat = now\nelse\n  tat = tonumber(tat)\nend\n\ntat = math.max(tat, now)\n\nlocal diff = now - (tat - burst_offset)\nlocal remaining = diff / emission_interval\n\nif remaining < 1 then\n  local reset_after = tat - now\n  local retry_after = emission_interval - diff\n  return {\n    0, -- allowed\n    0, -- remaining\n    tostring(retry_after),\n    tostring(reset_after),\n  }\nend\n\nif remaining < cost then\n  cost = remaining\n  remaining = 0\nelse\n  remaining = remaining - cost\nend\n\nlocal increment = emission_interval * cost\nlocal new_tat = tat + increment\n\nlocal reset_after = new_tat - now\nif reset_after > 0 then\n  redis.call(\"SET\", rate_limit_key, new_tat, \"EX\", math.ceil(reset_after))\nend\n\nreturn {\n  cost,\n  remaining,\n  tostring(-1),\n  tostring(reset_after),\n}\n".as_bytes();
+const RATE_LIMITER_FLEXIBLE: &[u8] = "redis.call('set', KEYS[1], 0, 'EX', ARGV[2], 'NX') local consumed = redis.call('incrby', KEYS[1], ARGV[1]) local ttl = redis.call('pttl', KEYS[1]) if ttl == -1 then   redis.call('expire', KEYS[1], ARGV[2])   ttl = 1000 * ARGV[2] end return {consumed, ttl} ".as_bytes();
+const RATE_LIMIT_REDIS_5_INCR: &[u8] = "local windowMs = tonumber(ARGV[2])\nlocal resetOnChange = ARGV[1] == \"1\"\nlocal timeToExpire = redis.call(\"PTTL\", KEYS[1])\nif timeToExpire <= 0 then\nredis.call(\"SET\", KEYS[1], 1, \"PX\", windowMs)\nreturn { 1, windowMs }\nend\nlocal totalHits = redis.call(\"INCR\", KEYS[1])\nif resetOnChange then\nredis.call(\"PEXPIRE\", KEYS[1], windowMs)\ntimeToExpire = windowMs\nend\nreturn { totalHits, timeToExpire }".as_bytes();
 // node rate-limit-redis 6.0.1, as sent (the source strips each line's indent).
 const RATE_LIMIT_REDIS_INCR: &[u8] = "local windowMs = tonumber(ARGV[1])\nlocal timeToExpire = redis.call(\"PTTL\", KEYS[1])\nif timeToExpire <= 0 then\nredis.call(\"SET\", KEYS[1], 1, \"PX\", windowMs)\nreturn { 1, windowMs }\nend\nlocal totalHits = redis.call(\"INCR\", KEYS[1])        \nreturn { totalHits, timeToExpire }".as_bytes();
 const RATE_LIMIT_REDIS_GET: &[u8] = "local totalHits = redis.call(\"GET\", KEYS[1])\nlocal timeToExpire = redis.call(\"PTTL\", KEYS[1])\nreturn { totalHits, timeToExpire }".as_bytes();
 
 fn flint_only(family: &str) -> bool {
-    matches!(family, "json" | "bloom")
+    // "sandbox": what Flint does around a script that Valkey does not (the
+    // time limit, declared keys, all-or-nothing writes), ADR-0051.
+    matches!(family, "json" | "bloom" | "sandbox")
 }
 
 /// Families only a Flint SEAT can answer, which is a different question from
@@ -784,6 +804,151 @@ fn corpus() -> Vec<Case> {
                     Expect::AnyError,
                 ),
                 s(&[b"EXISTS", b"rlr-new"], Expect::Int(0)),
+            ],
+        },
+        Case {
+            family: "lua",
+            name: "a script's return value converts as redis converts it",
+            steps: vec![
+                s(&[b"EVAL", "return 3.99".as_bytes(), b"0"], Expect::Int(3)),
+                s(&[b"EVAL", "return -0.5".as_bytes(), b"0"], Expect::Int(0)),
+                s(&[b"EVAL", "return {1,2,nil,4}".as_bytes(), b"0"], Expect::Arr(vec![Expect::Int(1), Expect::Int(2)])),
+                s(&[b"EVAL", "return true".as_bytes(), b"0"], Expect::Int(1)),
+                s(&[b"EVAL", "return false".as_bytes(), b"0"], Expect::Nil),
+                s(&[b"EVAL", "return nil".as_bytes(), b"0"], Expect::Nil),
+                s(&[b"EVAL", "return {ok='FINE'}".as_bytes(), b"0"], Expect::Simple("FINE")),
+                s(&[b"EVAL", "return {err='E1 x'}".as_bytes(), b"0"], Expect::Err("E1 x")),
+                s(&[b"EVAL", "return {1, 'two', {ok='x'}, {err='E y'}}".as_bytes(), b"0"], Expect::Arr(vec![Expect::Int(1), Expect::Str(b"two"), Expect::Simple("x"), Expect::Err("E y")])),
+                s(&[b"EVAL", "return {1, {2, {3}}}".as_bytes(), b"0"], Expect::Arr(vec![Expect::Int(1), Expect::Arr(vec![Expect::Int(2), Expect::Arr(vec![Expect::Int(3)])])])),
+                s(&[b"EVAL", "local t = {}; t[1] = 1; t[3] = 3; return t".as_bytes(), b"0"], Expect::Arr(vec![Expect::Int(1)])),
+                s(&[b"EVAL", "return {n=1}".as_bytes(), b"0"], Expect::Arr(vec![])),
+                s(&[b"EVAL", "return 7".as_bytes(), b"0"], Expect::Int(7)),
+                s(&[b"EVAL", "return '7'".as_bytes(), b"0"], Expect::Str(b"7")),
+                s(&[b"EVAL", "return #KEYS .. ' ' .. #ARGV".as_bytes(), b"2", b"{lc}a", b"{lc}b", b"c"], Expect::Str(b"2 1")),
+                s(&[b"HSET", b"{lc}h", b"a", b"1"], Expect::Int(1)),
+                s(&[b"EVAL", "return redis.call('hgetall', KEYS[1])".as_bytes(), b"1", b"{lc}h"], Expect::Arr(vec![Expect::Str(b"a"), Expect::Str(b"1")])),
+                s(&[b"EVAL", "return redis.call('set', KEYS[1], 'v')".as_bytes(), b"1", b"{lc}k"], Expect::Ok),
+                s(&[b"EVAL", "return type(redis.call('set', KEYS[1], 'v'))".as_bytes(), b"1", b"{lc}k"], Expect::Str(b"table")),
+                s(&[b"EVAL", "return type(redis.call('get', KEYS[1]))".as_bytes(), b"1", b"{lc}none"], Expect::Str(b"boolean")),
+                s(&[b"EVAL", "return redis.call('zadd', KEYS[1], 1.5, 'm')".as_bytes(), b"1", b"{lc}z"], Expect::Int(1)),
+                s(&[b"EVAL", "return redis.call('zrange', KEYS[1], 0, -1, 'withscores')".as_bytes(), b"1", b"{lc}z"], Expect::Arr(vec![Expect::Str(b"m"), Expect::Str(b"1.5")])),
+                s(&[b"EVAL", "return redis.call('incrbyfloat', KEYS[1], '1.5')".as_bytes(), b"1", b"{lc}f"], Expect::Str(b"1.5")),
+            ],
+        },
+        Case {
+            family: "lua",
+            name: "a script's errors carry valkey's text and the line they were raised on",
+            steps: vec![
+                s(&[b"SET", b"{le}s", b"abc"], Expect::Ok),
+                s(&[b"EVAL", "return redis.call('incr', KEYS[1])".as_bytes(), b"1", b"{le}s"], Expect::Err("ERR value is not an integer or out of range script: on @user_script:1.")),
+                s(&[b"EVAL", "\nlocal a = 1\nreturn redis.call('incr', KEYS[1])".as_bytes(), b"1", b"{le}s"], Expect::Err("ERR value is not an integer or out of range script: on @user_script:3.")),
+                s(&[b"EVAL", "local function f() return redis.call('incr', KEYS[1]) end\nreturn f()".as_bytes(), b"1", b"{le}s"], Expect::Err("ERR value is not an integer or out of range script: on @user_script:1.")),
+                s(&[b"EVAL", "error('boom')".as_bytes(), b"0"], Expect::Err("ERR user_script:1: boom script: on @user_script:1.")),
+                s(&[b"EVAL", "error({err='TBL boom'})".as_bytes(), b"0"], Expect::Err("TBL boom script: on @user_script:1.")),
+                s(&[b"EVAL", "error(nil)".as_bytes(), b"0"], Expect::Err("ERR nil script: on @user_script:1.")),
+                s(&[b"EVAL", "error({1,2})".as_bytes(), b"0"], Expect::Err("ERR unknown error script: on @user_script:1.")),
+                s(&[b"EVAL", "error({err=5})".as_bytes(), b"0"], Expect::Err("5 script: on @user_script:1.")),
+                s(&[b"EVAL", "return redis.error_reply('MYERR x')".as_bytes(), b"0"], Expect::Err("MYERR x")),
+                s(&[b"EVAL", "return redis.error_reply('no code')".as_bytes(), b"0"], Expect::Err("no code")),
+                s(&[b"EVAL", "x = 1".as_bytes(), b"0"], Expect::Err("ERR user_script:1: Attempt to modify a readonly table script: on @user_script:1.")),
+                s(&[b"EVAL", "return y".as_bytes(), b"0"], Expect::Err("ERR user_script:1: Script attempted to access nonexistent global variable 'y' script: on @user_script:1.")),
+                s(&[b"EVAL", "return redis.call('nosuch')".as_bytes(), b"0"], Expect::Err("ERR Unknown command called from script script: on @user_script:1.")),
+                s(&[b"EVAL", "return redis.call('get')".as_bytes(), b"0"], Expect::Err("ERR Wrong number of args calling command from script script: on @user_script:1.")),
+                s(&[b"EVAL", "return redis.call()".as_bytes(), b"0"], Expect::Err("ERR Please specify at least one argument for this call script: on @user_script:1.")),
+                s(&[b"EVAL", "return redis.call('get', {})".as_bytes(), b"0"], Expect::Err("ERR Command arguments must be strings or integers script: on @user_script:1.")),
+                s(&[b"EVAL", "return redis.pcall('incr', KEYS[1])".as_bytes(), b"1", b"{le}s"], Expect::Err("ERR value is not an integer or out of range")),
+                s(&[b"EVAL", "return (".as_bytes(), b"0"], Expect::Err("ERR Error compiling script (new function): user_script:1: unexpected symbol near '<eof>'")),
+                s(&[b"EVAL", "local r = redis.pcall('incr', KEYS[1]) return type(r) .. ':' .. tostring(r.err)".as_bytes(), b"1", b"{le}s"], Expect::Str(b"table:ERR value is not an integer or out of range")),
+                s(&[b"EVAL", "local ok, e = pcall(redis.call, 'incr', KEYS[1]) return type(e) .. ':' .. e".as_bytes(), b"1", b"{le}s"], Expect::Str(b"string:ERR value is not an integer or out of range")),
+            ],
+        },
+        Case {
+            family: "lua",
+            name: "a lua number reaches redis.call as valkey spells it",
+            steps: vec![
+                s(&[b"EVAL", "redis.call('set', KEYS[1], 0.1) return redis.call('get', KEYS[1])".as_bytes(), b"1", b"{ln}n"], Expect::Str(b"0.1")),
+                s(&[b"EVAL", "redis.call('set', KEYS[1], 1e21) return redis.call('get', KEYS[1])".as_bytes(), b"1", b"{ln}n"], Expect::Str(b"1e+21")),
+                s(&[b"EVAL", "redis.call('set', KEYS[1], 60000) return redis.call('get', KEYS[1])".as_bytes(), b"1", b"{ln}n"], Expect::Str(b"60000")),
+                s(&[b"EVAL", "redis.call('set', KEYS[1], 1/3) return redis.call('get', KEYS[1])".as_bytes(), b"1", b"{ln}n"], Expect::Str(b"0.3333333333333333")),
+                s(&[b"EVAL", "redis.call('set', KEYS[1], 123456789.123456789) return redis.call('get', KEYS[1])".as_bytes(), b"1", b"{ln}n"], Expect::Str(b"1.2345678912345679e+8")),
+                s(&[b"EVAL", "redis.call('set', KEYS[1], 1e-7) return redis.call('get', KEYS[1])".as_bytes(), b"1", b"{ln}n"], Expect::Str(b"1e-7")),
+                s(&[b"EVAL", "redis.call('set', KEYS[1], -2.5e300) return redis.call('get', KEYS[1])".as_bytes(), b"1", b"{ln}n"], Expect::Str(b"-2.5e+300")),
+                s(&[b"EVAL", "redis.call('set', KEYS[1], 1e17) return redis.call('get', KEYS[1])".as_bytes(), b"1", b"{ln}n"], Expect::Str(b"100000000000000000")),
+                s(&[b"EVAL", "redis.call('set', KEYS[1], 5e18) return redis.call('get', KEYS[1])".as_bytes(), b"1", b"{ln}n"], Expect::Str(b"5e+18")),
+                s(&[b"EVAL", "redis.call('set', KEYS[1], -0.0) return redis.call('get', KEYS[1])".as_bytes(), b"1", b"{ln}n"], Expect::Str(b"0")),
+                s(&[b"EVAL", "redis.call('set', KEYS[1], 0.000123) return redis.call('get', KEYS[1])".as_bytes(), b"1", b"{ln}n"], Expect::Str(b"0.000123")),
+                s(&[b"EVAL", "redis.call('set', KEYS[1], 1.5) return redis.call('get', KEYS[1])".as_bytes(), b"1", b"{ln}n"], Expect::Str(b"1.5")),
+                s(&[b"EVAL", "return tostring(1/3)".as_bytes(), b"0"], Expect::Str(b"0.33333333333333")),
+            ],
+        },
+        Case {
+            family: "lua",
+            name: "redis helpers and the script cache",
+            steps: vec![
+                s(&[b"EVAL", "return redis.sha1hex('abc')".as_bytes(), b"0"], Expect::Str(b"a9993e364706816aba3e25717850c26c9cd0d89d")),
+                s(&[b"EVAL", "return redis.status_reply('PONG')".as_bytes(), b"0"], Expect::Simple("PONG")),
+                s(&[b"EVAL", "return redis.log(redis.LOG_WARNING, 'x')".as_bytes(), b"0"], Expect::Nil),
+                s(&[b"EVAL", "return redis.REPL_ALL".as_bytes(), b"0"], Expect::Int(3)),
+                s(&[b"EVAL", "return redis.replicate_commands()".as_bytes(), b"0"], Expect::Int(1)),
+                s(&[b"EVAL", "return redis.setresp(2)".as_bytes(), b"0"], Expect::Nil),
+                s(&[b"EVAL", "return redis.call('ping')".as_bytes(), b"0"], Expect::Simple("PONG")),
+                s(&[b"EVAL", "return #redis.call('time')".as_bytes(), b"0"], Expect::Int(2)),
+                s(&[b"SCRIPT", b"FLUSH"], Expect::Ok),
+                s(&[b"SCRIPT", b"LOAD", b"return 1"], Expect::Str(b"e0e1f9fabfc9d4800c877a703b823ac0578ff8db")),
+                s(&[b"SCRIPT", b"EXISTS", b"e0e1f9fabfc9d4800c877a703b823ac0578ff8db", b"0000000000000000000000000000000000000000"], Expect::Arr(vec![Expect::Int(1), Expect::Int(0)])),
+                s(&[b"EVALSHA", b"e0e1f9fabfc9d4800c877a703b823ac0578ff8db", b"0"], Expect::Int(1)),
+                s(&[b"EVALSHA", b"E0E1F9FABFC9D4800C877A703B823AC0578FF8DB", b"1", b"{lh}a"], Expect::Int(1)),
+                s(&[b"EVAL", b"return 2", b"1", b"{lh}b"], Expect::Int(2)),
+                s(&[b"EVALSHA", b"7f923f79fe76194c868d7e1d0820de36700eb649", b"1", b"{lh}c"], Expect::Int(2)),
+                s(&[b"SCRIPT", b"FLUSH", b"ASYNC"], Expect::Ok),
+                s(&[b"EVALSHA", b"e0e1f9fabfc9d4800c877a703b823ac0578ff8db", b"0"], Expect::Err("NOSCRIPT No matching script.")),
+                s(&[b"SCRIPT", b"LOAD", b"return ("], Expect::Err("ERR Error compiling script (new function): user_script:1: unexpected symbol near '<eof>'")),
+                s(&[b"SCRIPT", b"KILL"], Expect::Err("NOTBUSY No scripts in execution right now.")),
+                s(&[b"TIME"], Expect::Arr(vec![Expect::AnyBulk, Expect::AnyBulk])),
+            ],
+        },
+        Case {
+            family: "scripting",
+            name: "the rate limiters' scripts do what their lua does",
+            steps: vec![
+                s(&[b"EVAL", LIMITS_FIXED, b"1", b"{rl}fixed", b"60", b"1"], Expect::Int(1)),
+                s(&[b"EVAL", LIMITS_FIXED, b"1", b"{rl}fixed", b"60", b"1"], Expect::Int(2)),
+                s(&[b"TTL", b"{rl}fixed"], Expect::IntRange(55, 60)),
+                s(&[b"EVAL", LIMITS_MOVING, b"1", b"{rl}mv", b"1000", b"2", b"60", b"1"], Expect::Int(1)),
+                s(&[b"EVAL", LIMITS_MOVING, b"1", b"{rl}mv", b"1001", b"2", b"60", b"1"], Expect::Int(1)),
+                s(&[b"EVAL", LIMITS_MOVING, b"1", b"{rl}mv", b"1002", b"2", b"60", b"1"], Expect::Nil),
+                s(&[b"LRANGE", b"{rl}mv", b"0", b"-1"], Expect::Arr(vec![Expect::Str(b"1001"), Expect::Str(b"1000")])),
+                s(&[b"EVAL", LIMITS_MOVING_STATS, b"1", b"{rl}mv", b"900", b"2"], Expect::Arr(vec![Expect::Str(b"1000"), Expect::Int(2)])),
+                s(&[b"EVAL", LIMITS_SLIDING, b"2", b"{rl}sl", b"{rl}sl/-1", b"3", b"60", b"1"], Expect::Int(1)),
+                s(&[b"EVAL", LIMITS_SLIDING, b"2", b"{rl}sl", b"{rl}sl/-1", b"3", b"60", b"1"], Expect::Int(1)),
+                s(&[b"EVAL", LIMITS_SLIDING, b"2", b"{rl}sl", b"{rl}sl/-1", b"3", b"60", b"1"], Expect::Int(1)),
+                s(&[b"EVAL", LIMITS_SLIDING, b"2", b"{rl}sl", b"{rl}sl/-1", b"3", b"60", b"1"], Expect::Nil),
+                s(&[b"EVAL", LIMITS_SLIDING_STATS, b"2", b"{rl}sl", b"{rl}sl/-1", b"60"], Expect::Arr(vec![Expect::Nil, Expect::Int(-2), Expect::Str(b"3"), Expect::IntRange(110_000, 120_000)])),
+                s(&[b"EVAL", RATE_LIMITER_FLEXIBLE, b"1", b"{rl}f", b"1", b"60"], Expect::Arr(vec![Expect::Int(1), Expect::IntRange(55_000, 60_000)])),
+                s(&[b"EVAL", RATE_LIMITER_FLEXIBLE, b"1", b"{rl}f", b"1", b"60"], Expect::Arr(vec![Expect::Int(2), Expect::IntRange(55_000, 60_000)])),
+                s(&[b"EVAL", REDIS_RATE_ALLOW, b"1", b"{rl}g", b"3", b"3", b"60", b"1"], Expect::Arr(vec![Expect::Int(1), Expect::IntRange(0, 2), Expect::Str(b"-1"), Expect::AnyBulk])),
+                s(&[b"EVAL", REDIS_RATE_ALLOW, b"1", b"{rl}g", b"3", b"3", b"60", b"1"], Expect::Arr(vec![Expect::Int(1), Expect::IntRange(0, 2), Expect::Str(b"-1"), Expect::AnyBulk])),
+                s(&[b"EVAL", REDIS_RATE_ALLOW, b"1", b"{rl}g", b"3", b"3", b"60", b"1"], Expect::Arr(vec![Expect::Int(1), Expect::IntRange(0, 2), Expect::Str(b"-1"), Expect::AnyBulk])),
+                s(&[b"EVAL", REDIS_RATE_ALLOW, b"1", b"{rl}g", b"3", b"3", b"60", b"1"], Expect::Arr(vec![Expect::Int(0), Expect::Int(0), Expect::AnyBulk, Expect::AnyBulk])),
+                s(&[b"EVAL", REDIS_RATE_ALLOW_AT_MOST, b"1", b"{rl}g2", b"3", b"3", b"60", b"2"], Expect::Arr(vec![Expect::Int(2), Expect::IntRange(0, 1), Expect::Str(b"-1"), Expect::AnyBulk])),
+                s(&[b"EVAL", RATE_LIMIT_REDIS_5_INCR, b"1", b"{rl}r5", b"0", b"60000"], Expect::Arr(vec![Expect::Int(1), Expect::Int(60000)])),
+                s(&[b"EVAL", RATE_LIMIT_REDIS_5_INCR, b"1", b"{rl}r5", b"1", b"60000"], Expect::Arr(vec![Expect::Int(2), Expect::Int(60000)])),
+            ],
+        },
+        Case {
+            family: "sandbox",
+            name: "a script is limited, touches only its keys, and fails whole",
+            steps: vec![
+                s(&[b"EVAL", "while true do end".as_bytes(), b"0"], Expect::AnyError),
+                s(&[b"EVAL", "return 1".as_bytes(), b"2", b"a", b"b"], Expect::AnyError),
+                s(&[b"EVAL", "return redis.call('get', 'other')".as_bytes(), b"1", b"{sb}a"], Expect::AnyError),
+                s(&[b"EVAL", "redis.call('set', KEYS[1], 'x') error('then failed')".as_bytes(), b"1", b"{sb}rb"], Expect::AnyError),
+                s(&[b"EXISTS", b"{sb}rb"], Expect::Int(0)),
+                s(&[b"EVAL", "redis.call('set', KEYS[1], 'x') while true do end".as_bytes(), b"1", b"{sb}rt"], Expect::AnyError),
+                s(&[b"EXISTS", b"{sb}rt"], Expect::Int(0)),
+                s(&[b"EVAL", "return redis.call('dbsize')".as_bytes(), b"1", b"{sb}a"], Expect::AnyError),
+                s(&[b"EVAL", "return type(loadstring)".as_bytes(), b"0"], Expect::AnyError),
+                s(&[b"EVAL", "return redis.call('eval', 'return 1', '0')".as_bytes(), b"0"], Expect::AnyError),
             ],
         },
         Case {
@@ -3614,6 +3779,8 @@ fn matches(expect: &Expect, got: &Value, proto: Proto) -> bool {
         Expect::Str(s) => *got == Value::Bulk(Some(s.to_vec())),
         Expect::Bytes(b) => *got == Value::Bulk(Some(b.clone())),
         Expect::AnyError => matches!(got, Value::Error(_)),
+        Expect::Err(t) => matches!(got, Value::Error(e) if e == t),
+        Expect::AnyBulk => matches!(got, Value::Bulk(Some(_))),
         Expect::AnyArray => matches!(got, Value::Array(Some(_))),
         Expect::StrContains(s) => matches!(
             got,

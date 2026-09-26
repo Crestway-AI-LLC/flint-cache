@@ -16,6 +16,7 @@ mod heat;
 mod json_path;
 mod migrate;
 mod repl_hub;
+mod script;
 mod write_lock;
 mod write_queue;
 
@@ -89,6 +90,8 @@ const ACCEPTED_FLAGS: &[&str] = &[
     "--replica-read-stale-ms",
     "--restore-from",
     "--rewind-snaps",
+    "--script-memory-limit-mb",
+    "--script-time-limit-ms",
     "--wal-fsync-ms",
     "--wal-headroom-seq",
     "--wal-size-limit-mb",
@@ -2882,6 +2885,18 @@ fn main() -> std::io::Result<()> {
         max_key_bytes: arg("--max-key-bytes")
             .and_then(|v| v.parse().ok())
             .unwrap_or(flint_storage::DEFAULT_MAX_KEY_BYTES),
+        // A Lua script's limits (ADR-0051): past either it is stopped and
+        // nothing it wrote is kept.
+        script: script::ScriptLimits {
+            time: arg("--script-time-limit-ms")
+                .and_then(|v| v.parse().ok())
+                .map(std::time::Duration::from_millis)
+                .unwrap_or(script::DEFAULT_TIME_LIMIT),
+            memory_bytes: arg("--script-memory-limit-mb")
+                .and_then(|v| v.parse::<usize>().ok())
+                .map(|mb| mb << 20)
+                .unwrap_or(script::DEFAULT_MEMORY_LIMIT),
+        },
     };
     if limits.max_value_bytes != flint_storage::DEFAULT_MAX_VALUE_BYTES {
         eprintln!(
@@ -5623,9 +5638,20 @@ fn execute(
             .first()
             .map(|n| n.to_ascii_uppercase())
             .unwrap_or_default();
+        // A script locks what it declares (ADR-0051): one key, that key's
+        // stripe; several, every writer, as any multi-key write does; none,
+        // nothing, because a script that declares no key can write none.
+        let script = name == b"EVAL" || name == b"EVALSHA";
+        let script_keys = if script {
+            flint_commands::eval_keys(args).map_or(0, |k| k.len())
+        } else {
+            0
+        };
         let multi = (name == b"MSET" && args.len() > 3)
-            || ((name == b"DEL" || name == b"UNLINK") && args.len() > 2);
+            || ((name == b"DEL" || name == b"UNLINK") && args.len() > 2)
+            || script_keys > 1;
         match (multi, commands::command_key(args)) {
+            (false, None) if script => None,
             // ADR-0027: a PURE write reads nothing, so it excludes the
             // read-modify-write writers of its key but not other pure writes.
             (false, Some(k)) if is_pure_write(&name, args) => {
@@ -5659,6 +5685,32 @@ fn execute(
         )
         .dispatch(args)
     } else {
+        // A script's writes commit as ONE batch (ADR-0051), as a
+        // transaction's do: `cmd_eval` hands its writes to this buffer only
+        // when the script ends normally, and the buffer reaches the engine
+        // as one WriteBatch -- all of them or, on a crash, none. Its keys
+        // were locked above.
+        if batch_kv.is_none()
+            && args.first().is_some_and(|n| {
+                n.eq_ignore_ascii_case(b"EVAL") || n.eq_ignore_ascii_case(b"EVALSHA")
+            })
+        {
+            let batching = flint_storage::batch::BatchingKv::new(store);
+            let reply = Dispatcher::with_limits(
+                &batching,
+                flint_storage::strings::system_clock,
+                limits,
+                conn_ns,
+            )
+            .dispatch(args);
+            let ops = batching.into_ops();
+            if !ops.is_empty()
+                && let Err(e) = commit_watched(store, rocks, watch, &ops)
+            {
+                return Value::Error(format!("ERR script commit failed: {e}"));
+            }
+            return reply;
+        }
         // The batch's BatchingKv when one is accumulating, the real store
         // otherwise. BatchingKv overlays reads and scans, so this command
         // still computes its exact reply against everything the run has

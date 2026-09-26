@@ -35,7 +35,7 @@ on-demand rather than in CI, because it needs a module you have to compile.
 
 ## Supported
 
-**Connection / server**: PING, ECHO, AUTH (at the proxy), COMMAND,
+**Connection / server**: PING, ECHO, AUTH (at the proxy), COMMAND, TIME,
 SELECT (index 0 only), HELLO, QUIT (at the proxy — see below), DBSIZE,
 FLUSHALL, FLUSHDB (all three scoped to the tenant namespace; a tenant has one
 database, so FLUSHDB and FLUSHALL clear the same keys), INFO (at the proxy —
@@ -99,6 +99,9 @@ PERSIST, COPY (REPLACE, DB 0), RENAME, RENAMENX.
 >   sessions stay spread across the fleet, and the old id is dead after login.
 
 **Transactions**: MULTI, EXEC, DISCARD, WATCH, UNWATCH (same-slot).
+
+**Scripting**: EVAL, EVALSHA, SCRIPT (LOAD, EXISTS, FLUSH, KILL): Lua 5.1,
+single-slot, all or nothing. See "Lua scripts" below (ADR-0051).
 
 > **What a Flint transaction guarantees, and what it does not.** Three
 > promises, all of them real: every command's writes land in ONE engine
@@ -444,6 +447,59 @@ the write; ours says why.
   connection to a namespace before any command travels on it, and a loading
   node refuses that pin, so it stays out of the routing path entirely.
 
+## Lua scripts (ADR-0051)
+
+`EVAL` and `EVALSHA` run a script in PUC-Rio Lua 5.1, the interpreter Redis
+and Valkey embed, so a script means what it means there: its replies, its
+errors (with the line they were raised on), and how a Lua number is spelled
+when a script hands it to `redis.call` are Valkey's, checked against Valkey
+by the conformance corpus. What Flint adds is the frame around a script:
+
+- **One slot, declared keys.** Every key in `KEYS` must hash to one slot
+  (use a hash tag, `{user1}:a`, to colocate them), and a `redis.call` may
+  touch only those keys: one that reaches another key, or the whole keyspace
+  (`DBSIZE`, `SCAN`, `FLUSHALL`), is refused, and whatever it did is undone,
+  even when the script catches the refusal with `pcall`. This is Redis
+  Cluster's rule, enforced rather than advised: it is what lets a script run
+  on the one pair that owns its keys, atomically.
+- **All or nothing.** A script's writes commit as one batch, as a
+  transaction's do: all of them or, after a crash, none. **A script that
+  fails keeps none of its writes**, where Redis keeps those made before the
+  failure: an uncaught error, the time limit and the memory limit all
+  discard them. A script that *returns* an error (`redis.error_reply`) has
+  succeeded, and its writes are kept.
+- **Limits.** A script is stopped at 50 ms of run time or 64 MiB of Lua
+  memory (`--script-time-limit-ms`, `--script-memory-limit-mb` on the seat),
+  and answers an error saying which; nothing it wrote is kept. The time
+  limit stops a loop wherever it hides, in a `pcall`, an `xpcall` or a
+  coroutine. `SCRIPT KILL` answers `NOTBUSY`: the limit does its job, and a
+  script holds its keys' write locks only while it runs.
+- **The sandbox.** The base, `table`, `string` and `math` libraries, and
+  `redis`: `call`, `pcall`, `error_reply`, `status_reply`, `sha1hex`, `log`
+  (a no-op), `setresp(2)`, `replicate_commands`, `set_repl`. **Not
+  available:** `load`, `loadstring`, `dofile`, `loadfile`, `require`, `os`,
+  `io`, `debug`, `setfenv`, `getfenv`, `print`, and the `cjson`, `cmsgpack`,
+  `bit` and `struct` libraries Redis also loads; a script that uses one fails
+  with "nonexistent global variable". Globals and the libraries are
+  read-only, and a script's text compiles as text, never as bytecode.
+  `redis.setresp(3)` is refused: a script sees replies in RESP2's shapes.
+- **`EVALSHA` through the proxy.** The proxy keeps each tenant's script
+  texts (from `EVAL` and `SCRIPT LOAD`) and forwards an `EVALSHA` it knows as
+  the `EVAL` it stands for, so a script loaded once runs on either pair; one
+  it does not know answers `NOSCRIPT`, and every client library then sends
+  the text. The cache is bounded (1,000 scripts and 8 MiB per tenant), and
+  per proxy: a client that reconnects to another proxy reloads on its first
+  `NOSCRIPT`, as it would after a Redis restart.
+
+Measured with each library's defaults (`client_compat_drill`): redis-py's
+`Lock`, django-redis, node `redlock`, Go `redsync`, Ruby `redlock`, Python
+`limits` (so Flask-Limiter and SlowAPI) in all three strategies, Go
+`redis_rate`, node `rate-limiter-flexible` and `rate-limit-redis`, and
+`python-redis-lock` when the lock's name carries a hash tag (its scripts
+name the lock and a signal list, which must then share a slot; its
+*blocking* acquire waits with `BLPOP`, which Flint does not serve, so use
+`acquire(blocking=False)` or a timeout loop).
+
 ## Excluded by design
 
 - **Cross-slot multi-key commands** — the *cross-slot* form, not the
@@ -468,45 +524,15 @@ the write; ours says why.
   the cache a `KEY_FUNCTION` that puts one hash tag on every key, which puts
   that whole cache in one slot, on one pair.
   Also **pub/sub**, **streams**, **blocking
-  commands** (BLPOP, BLMOVE …), **RANDOMKEY**, and **Lua** beyond the
-  recognised scripts below.
+  commands** (BLPOP, BLMOVE …), **RANDOMKEY**, and **`EVAL_RO`,
+  `EVALSHA_RO`, `FUNCTION` and `FCALL`** (Redis 7's read-only scripts and
+  functions; `EVAL` and `EVALSHA` are supported, see "Lua scripts").
   These conflict with slot-sharded multi-tenancy or reintroduce the
   single-threaded bottlenecks Flint exists to avoid. Common patterns they
   serve are covered by first-class commands instead; if you need one of
   these, open an issue describing the workload — patterns with broad
   demand get first-class implementations.
 
-- **Lua: the scripts of six libraries, recognised, and no Lua** (ADR-0050).
-  `EVAL` and `EVALSHA` run these natively and atomically, recognised by SHA1
-  as Redis names scripts:
-
-  | library | scripts | versions |
-  |---|---|---|
-  | redis-py `Lock` (and django-redis's `cache.lock()`) | release, extend, reacquire | 4.5.5 to 7.0.1 |
-  | django-redis `incr` | both forms | 5.2.0 to 6.0.0 |
-  | node `redlock` | acquire, extend, release | 4.2.0, 5.0.0-beta.1 and beta.2 |
-  | Go `redsync` | extend (with or without `WithSetNXOnExtend`), release | v4.0.0 to v4.18.0 |
-  | Ruby `redlock` | lock, unlock, the TTL lookup behind `locked?` | 2.1.0 |
-  | node `rate-limit-redis` (express-rate-limit's Redis store) | increment, get | 6.0.0 and 6.0.1 (its get from 4.1.0) |
-
-  Each reads its one key and writes it at most once, under that key's write
-  lock, so it is as atomic as the Lua it stands for. A script that names more
-  than one key is refused, which includes a node `redlock` lock over several
-  resources at once. `SCRIPT LOAD`, `EXISTS` and `FLUSH` answer for the
-  recognised scripts. Any other script is refused ("Flint runs no Lua"), and
-  `EVALSHA` of an unknown SHA answers `NOSCRIPT`, which sends a client to
-  `SCRIPT LOAD`, which refuses. Versions outside the table were not checked:
-  one whose text differs is refused like any other script, never run as
-  something else. `rate-limit-redis` before 6.0.0 increments with two writes
-  (`INCR`, then `PEXPIRE`), which this rule excludes; use 6.x.
-- **Rate limiters that write more than once per script are refused**:
-  Python `limits` (Flask-Limiter, SlowAPI), Go `redis_rate` and node
-  `rate-limiter-flexible`. Running them is ADR-0051, a proposal.
-- **`python-redis-lock` does not work**, and recognising its scripts would
-  not change that: every call names two keys in different slots (the lock and
-  a signal list), its release writes both, and a blocking acquire waits on
-  the list with `BLPOP`. It takes a lock and cannot release it. Use redis-py's
-  own `Lock`, above.
 - **`KEYS` through the proxy** (ADR-0050), answered from `SCAN` over every
   master of your pairs: no node runs a `KEYS`, so nothing blocks, and what a
   call costs is one pass of your keyspace. A reply of more than 100,000 keys

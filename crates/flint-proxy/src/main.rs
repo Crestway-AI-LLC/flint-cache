@@ -1498,11 +1498,13 @@ fn route_key(args: &[Vec<u8>]) -> Option<&[u8]> {
         b"HELLO",
         b"SCRIPT",
         b"KEYS",
+        b"TIME",
     ];
     if NO_KEY.iter().any(|c| name.eq_ignore_ascii_case(c)) {
         return None;
     }
-    // A script routes by KEYS[1], not by its text (ADR-0050).
+    // A script routes by KEYS[1], not by its text (ADR-0050, ADR-0051). A
+    // script that declares no key goes to pair 0, as any keyless command.
     if name.eq_ignore_ascii_case(b"EVAL") || name.eq_ignore_ascii_case(b"EVALSHA") {
         return flint_commands::eval_keys(args)
             .and_then(|k| k.first())
@@ -3296,6 +3298,13 @@ fn prefetchable(args: &[Vec<u8>], name: &[u8], replica_reads: bool) -> bool {
                 | b"DISCARD"
                 | b"WATCH"
                 | b"UNWATCH"
+                // Scripts: `data_command` turns an EVALSHA into an EVAL from
+                // this proxy's cache and remembers every EVAL's text
+                // (ADR-0051). Staged, an EVALSHA would reach a seat that may
+                // never have seen the script.
+                | b"EVAL"
+                | b"EVALSHA"
+                | b"SCRIPT"
         )
     {
         return false;
@@ -3492,6 +3501,48 @@ async fn data_command(
         cache_writeback(topo, ns, args, &reply, local_cache, cacheable);
         return reply;
     }
+    // Scripts (ADR-0051). A script runs on the pair that owns its keys, and
+    // a seat knows only the scripts it has run, so the proxy keeps each
+    // tenant's texts: an EVALSHA it knows is forwarded as the EVAL it
+    // stands for, one it does not answers NOSCRIPT (every client then sends
+    // the text), and SCRIPT EXISTS / FLUSH / KILL answer from here.
+    let name = args
+        .first()
+        .map(|n| n.to_ascii_uppercase())
+        .unwrap_or_default();
+    let translated: Option<(Vec<Vec<u8>>, Vec<u8>)> = match name.as_slice() {
+        b"EVALSHA" if args.len() >= 3 => {
+            let sha = String::from_utf8_lossy(&args[1]).to_ascii_lowercase();
+            let Some(text) = SCRIPTS.lookup(ns, &sha) else {
+                return Value::Error("NOSCRIPT No matching script.".into());
+            };
+            let mut eval = args.to_vec();
+            eval[0] = b"EVAL".to_vec();
+            eval[1] = text;
+            let frame = encode_cmd(&eval.iter().map(Vec::as_slice).collect::<Vec<_>>());
+            Some((eval, frame))
+        }
+        b"EVAL" if args.len() >= 3 => {
+            SCRIPTS.remember(ns, &flint_tls::sha1_hex(&args[1]), &args[1]);
+            None
+        }
+        b"SCRIPT" if !txn.open => {
+            let b = backends.get_or_insert_with(|| {
+                Backends::new(
+                    ns.to_vec(),
+                    topo.backend_tls.clone(),
+                    async_writes,
+                    topo.fanout_timeout,
+                )
+            });
+            return script_command(topo, b, ns, args, raw).await;
+        }
+        _ => None,
+    };
+    let (args, raw) = match &translated {
+        Some((a, f)) => (a.as_slice(), f.as_slice()),
+        None => (args, raw),
+    };
     let is_write = args
         .first()
         .is_some_and(|n| flint_commands::is_write_command(n));
@@ -3589,6 +3640,60 @@ async fn data_command(
     let reply = handle(topo, b, ns, args, raw, read_replica).await;
     cache_writeback(topo, ns, args, &reply, local_cache, cacheable);
     reply
+}
+
+/// Each tenant's Lua script texts, by SHA1 (ADR-0051). Bounded per tenant
+/// and in all (`flint_commands::scripts`); past a bound the oldest go, and
+/// the client resends one it needs.
+static SCRIPTS: flint_commands::scripts::ScriptCache = flint_commands::scripts::ScriptCache::new();
+
+/// `SCRIPT`, outside a transaction, over this tenant's texts. LOAD must
+/// know the text compiles, which only a seat can say, so it is forwarded
+/// (to pair 0, as any keyless command) and remembered when it does.
+async fn script_command(
+    topo: &Arc<Topology>,
+    backends: &mut Backends,
+    ns: &[u8],
+    args: &[Vec<u8>],
+    raw: &[u8],
+) -> Value {
+    let sub = args
+        .get(1)
+        .map(|s| s.to_ascii_uppercase())
+        .unwrap_or_default();
+    match sub.as_slice() {
+        b"LOAD" if args.len() == 3 => {
+            let reply = forward(topo, backends, ns, args, raw, false).await;
+            if let Value::Bulk(Some(sha)) = &reply {
+                SCRIPTS.remember(ns, &String::from_utf8_lossy(sha), &args[2]);
+            }
+            reply
+        }
+        b"EXISTS" if args.len() >= 3 => Value::Array(Some(
+            args[2..]
+                .iter()
+                .map(|s| {
+                    let sha = String::from_utf8_lossy(s).to_ascii_lowercase();
+                    Value::Integer(SCRIPTS.lookup(ns, &sha).is_some() as i64)
+                })
+                .collect(),
+        )),
+        b"FLUSH"
+            if args.len() == 2
+                || (args.len() == 3
+                    && (args[2].eq_ignore_ascii_case(b"ASYNC")
+                        || args[2].eq_ignore_ascii_case(b"SYNC"))) =>
+        {
+            SCRIPTS.flush(ns);
+            Value::Simple("OK".into())
+        }
+        // A script is stopped by its seat's time limit, never by SCRIPT KILL.
+        b"KILL" if args.len() == 2 => {
+            Value::Error("NOTBUSY No scripts in execution right now.".into())
+        }
+        // Arity and unknown subcommands: the seat's own replies.
+        _ => forward(topo, backends, ns, args, raw, false).await,
+    }
 }
 
 /// Cache write-back for one completed data command: store a fresh GET reply,
@@ -5094,17 +5199,22 @@ mod prefetch_tests {
         // No routable key: those go to pair 0 by a separate rule.
         assert!(!may_stage(&["MGET"], false));
 
-        // A script stages by KEYS[1], like any keyed write (ADR-0050).
-        assert!(may_stage(
+        // Scripts never stage (ADR-0051): `data_command` turns an EVALSHA
+        // into an EVAL from this proxy's cache, and remembers every EVAL.
+        // Staged raw, an EVALSHA would reach a seat that never saw the text.
+        for script in [
             &[
                 "EVALSHA",
                 "c3f8721cbb97f72bc19e972846bd7aaf91901658",
                 "1",
                 "k",
-                "t"
-            ],
-            false
-        ));
+                "t",
+            ][..],
+            &["EVAL", "return 1", "1", "k"],
+            &["SCRIPT", "LOAD", "return 1"],
+        ] {
+            assert!(!may_stage(script, false), "{script:?}");
+        }
         assert_eq!(
             route_key(&["EVAL", "return 1", "1", "k"].map(|p| p.as_bytes().to_vec())),
             Some(&b"k"[..])
