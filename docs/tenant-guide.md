@@ -226,8 +226,9 @@ hashes, sets, sorted sets, lists, TTLs (EXPIRE/PEXPIRE/TTL/PERSIST),
 DEL/UNLINK/EXISTS/TYPE, DBSIZE/FLUSHALL (scoped to your namespace).
 Conformance is validated against Valkey continuously. Transactions
 (MULTI/EXEC/WATCH) work when every key shares a slot (ADR-0012). Not in
-v0: pub/sub, streams, blocking commands, Lua (beyond five recognised scripts:
-redis-py's `Lock` and django-redis's `incr`), and cross-slot multi-key
+v0: pub/sub, streams, blocking commands, Lua (beyond the recognised scripts
+of redis-py's `Lock`, django-redis's `incr`, and the node, Go and Ruby
+Redlock libraries), and cross-slot multi-key
 operations, except `MGET`, `DEL`, `UNLINK` and `EXISTS`, which the proxy
 splits per slot or per pair. `KEYS` is answered at the proxy, up to 100,000
 keys (`docs/command-support.md`, ADR-0050).
@@ -239,6 +240,10 @@ Measured through the proxy with each framework's default settings.
 - **Rails** `RedisCacheStore`: works, `read_multi` included (ADR-0048).
 - **redis-py** `Lock` (and so django-redis's `cache.lock()`): works, acquire
   to release (ADR-0050).
+- **Lock libraries**: node `redlock` 4.2.0 and 5.0.0-beta, Go `redsync` v4
+  and Ruby `redlock` 2.1.0 work, one resource per lock (ADR-0050).
+  `python-redis-lock` does not: it cannot release a lock on Flint. Use
+  redis-py's `Lock`.
 - **django-redis**: `incr` works, atomically; `set_many` and `delete_pattern`
   across slots are transactions and are refused, as below.
 - **Flask-Caching** and **Spring** `RedisCacheManager`: `clear()` works

@@ -421,7 +421,7 @@ RAN="redis-py"; SKIPPED=""
 NODE=${FLINT_COMPAT_NODE:-$(command -v node || true)}
 if [ -z "$NODE" ]; then
   echo "== node-redis: SKIP (no node on PATH)"
-  SKIPPED="$SKIPPED node-redis ioredis"
+  SKIPPED="$SKIPPED node-redis ioredis node-redlock"
 else
   NODE_DIR=${FLINT_COMPAT_NODE_DIR:-$FLINT_DRILL_ROOT/flint-compat-node}
   mkdir -p "$NODE_DIR"
@@ -620,6 +620,72 @@ JS
     [ $? -eq 0 ] || { echo "FAIL: ioredis client compatibility (the tenant guide's sample)"; exit 1; }
     RAN="$RAN, ioredis (default ready check)"
   fi
+
+  # -------------------------------------------------------------------------
+  # node redlock (ADR-0050's amendment). Its acquire, extend and release are
+  # Lua scripts, so before they were recognised no lock could be taken at
+  # all. 4.2.0 is the last stable release; 5.0.0-beta.2 is what npm's
+  # `latest` tag installs. Both, on ioredis, on both pairs.
+  # -------------------------------------------------------------------------
+  if [ -d "$NODE_DIR/node_modules/ioredis" ] && [ ! -d "$NODE_DIR/node_modules/redlock5" ]; then
+    (cd "$NODE_DIR" && npm install redlock4@npm:redlock@4.2.0 redlock5@npm:redlock@5.0.0-beta.2 --silent >/dev/null 2>&1)
+  fi
+  if [ ! -d "$NODE_DIR/node_modules/redlock4" ] || [ ! -d "$NODE_DIR/node_modules/redlock5" ]; then
+    echo "== node redlock: SKIP (could not install; offline?)"
+    SKIPPED="$SKIPPED node-redlock"
+  else
+    echo "== client: node redlock 4.2.0 and 5.0.0-beta.2, on ioredis"
+    cat > "$NODE_DIR/redlock.js" <<'JS'
+const Redis = require("ioredis");
+const port = Number(process.env.FLINT_PORT);
+const fails = [];
+const say = (ok, name, note) => {
+  console.log(`  ${ok ? "ok " : "FAIL"} ${name}${note && !ok ? "  " + note : ""}`);
+  if (!ok) fails.push(name);
+};
+const r = new Redis({ host: "127.0.0.1", port, password: process.env.FLINT_TOKEN });
+// The two majors name the calls differently: lock/unlock, acquire/release.
+const apis = {
+  redlock4: { take: (rl, k, ms) => rl.lock(k, ms), drop: (l) => l.unlock() },
+  redlock5: { take: (rl, k, ms) => rl.acquire([k], ms), drop: (l) => l.release() },
+};
+(async () => {
+  for (const [mod, api] of Object.entries(apis)) {
+    const m = require(mod);
+    const rl = new (m.default || m)([r], { retryCount: 0 });
+    // a and b are on the two pairs.
+    for (const k of ["a", "b"]) {
+      const what = `${mod} ${k}`;
+      try {
+        await r.del(k);
+        const lock = await api.take(rl, k, 10000);
+        let second = true;
+        try { await api.take(rl, k, 10000); } catch (_) { second = false; }
+        say(!second, `${what}: a second holder is refused`);
+        const longer = await lock.extend(30000);
+        const t = await r.pttl(k);
+        say(t > 20000, `${what}: extend`, `pttl ${t}`);
+        await api.drop(longer);
+        const left = await r.exists(k);
+        say(left === 0, `${what}: release removes the lock`, `exists ${left}`);
+        const again = await api.take(rl, k, 10000);
+        await api.drop(again);
+        say(true, `${what}: taken again after release`);
+      } catch (e) { say(false, `${what}: lock life`, e.message); }
+    }
+  }
+  r.disconnect();
+  if (fails.length) {
+    console.log(`\nFAIL: ${fails.length} client-visible problem(s): ${fails.join(", ")}`);
+    process.exit(1);
+  }
+  console.log("\nall node redlock checks passed");
+})();
+JS
+    (cd "$NODE_DIR" && FLINT_PORT=$PORT FLINT_TOKEN=tok-acme "$NODE" redlock.js)
+    [ $? -eq 0 ] || { echo "FAIL: node redlock compatibility"; exit 1; }
+    RAN="$RAN, node redlock"
+  fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -631,7 +697,7 @@ fi
 GO=${FLINT_COMPAT_GO:-$(command -v go || true)}
 if [ -z "$GO" ]; then
   echo "== go-redis: SKIP (no go on PATH)"
-  SKIPPED="$SKIPPED go-redis"
+  SKIPPED="$SKIPPED go-redis redsync"
 else
   GO_DIR=${FLINT_COMPAT_GO_DIR:-$FLINT_DRILL_ROOT/flint-compat-go}
   mkdir -p "$GO_DIR"
@@ -696,6 +762,93 @@ GOSRC
     [ $? -eq 0 ] || { echo "FAIL: go-redis client compatibility"; exit 1; }
     RAN="$RAN, go-redis"
   fi
+
+  # -------------------------------------------------------------------------
+  # redsync v4 (ADR-0050's amendment), on go-redis v9, in its own module so a
+  # failed fetch here cannot skip go-redis above. Its lock is SET NX; its
+  # extend and release are Lua, so before they were recognised a lock could
+  # be taken and never released. Also its `WithSetNXOnExtend` extend, and the
+  # release of a lock already gone, which v4.12.0 on reports as expired.
+  # -------------------------------------------------------------------------
+  RS_DIR=${FLINT_COMPAT_REDSYNC_DIR:-$FLINT_DRILL_ROOT/flint-compat-redsync}
+  mkdir -p "$RS_DIR"
+  cat > "$RS_DIR/main.go" <<'GOSRC'
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"time"
+
+	"github.com/go-redsync/redsync/v4"
+	"github.com/go-redsync/redsync/v4/redis/goredis/v9"
+	goredislib "github.com/redis/go-redis/v9"
+)
+
+func main() {
+	ctx := context.Background()
+	client := goredislib.NewClient(&goredislib.Options{Addr: os.Getenv("FLINT_ADDR"), Password: os.Getenv("FLINT_TOKEN")})
+	rs := redsync.New(goredis.NewPool(client))
+	fails := 0
+	say := func(ok bool, name string, err error) {
+		mark, note := "ok ", ""
+		if !ok {
+			mark, fails = "FAIL", fails+1
+			if err != nil {
+				note = "  " + err.Error()
+			}
+		}
+		fmt.Printf("  %s %s%s\n", mark, name, note)
+	}
+	// a and b are on the two pairs.
+	for _, k := range []string{"a", "b"} {
+		client.Del(ctx, k)
+		m := rs.NewMutex(k, redsync.WithTries(1), redsync.WithExpiry(10*time.Second))
+		err := m.Lock()
+		say(err == nil, k+": lock", err)
+		err = rs.NewMutex(k, redsync.WithTries(1)).Lock()
+		say(err != nil, k+": a second holder is refused", nil)
+		ok, err := m.Extend()
+		say(ok && err == nil, k+": extend", err)
+		ok, err = m.Unlock()
+		say(ok && err == nil, k+": unlock", err)
+		n, err := client.Exists(ctx, k).Result()
+		say(err == nil && n == 0, k+": unlock removes the lock", err)
+		_, err = m.Unlock()
+		say(errors.Is(err, redsync.ErrLockAlreadyExpired), k+": a second unlock reports the lock expired", err)
+		s := rs.NewMutex(k, redsync.WithTries(1), redsync.WithSetNXOnExtend())
+		err = s.Lock()
+		say(err == nil, k+": lock (WithSetNXOnExtend)", err)
+		client.Del(ctx, k)
+		ok, err = s.Extend()
+		held, _ := client.Exists(ctx, k).Result()
+		say(ok && err == nil && held == 1, k+": extend retakes a lock that expired (WithSetNXOnExtend)", err)
+		ok, err = s.Unlock()
+		say(ok && err == nil, k+": unlock (WithSetNXOnExtend)", err)
+	}
+	if fails > 0 {
+		fmt.Printf("\nFAIL: %d client-visible problem(s)\n", fails)
+		os.Exit(1)
+	}
+	fmt.Println("\nall redsync checks passed")
+}
+GOSRC
+  if [ ! -f "$RS_DIR/go.sum" ]; then
+    (cd "$RS_DIR" && { [ -f go.mod ] || "$GO" mod init flintcompatredsync >/dev/null 2>&1; } \
+      && "$GO" get github.com/go-redsync/redsync/v4@v4.18.0 github.com/redis/go-redis/v9 >/dev/null 2>&1 \
+      && "$GO" mod tidy >/dev/null 2>&1)
+  fi
+  if [ ! -f "$RS_DIR/go.sum" ]; then
+    echo "== redsync: SKIP (could not fetch the module; offline?)"
+    SKIPPED="$SKIPPED redsync"
+  else
+    echo "== client: redsync $(sed -n 's/.*go-redsync\/redsync\/v4 \(v[0-9.]*\).*/\1/p' "$RS_DIR/go.mod" | head -1), on go-redis v9"
+    (cd "$RS_DIR" && FLINT_ADDR=127.0.0.1:$PORT FLINT_TOKEN=tok-acme "$GO" run .)
+    [ $? -eq 0 ] || { echo "FAIL: redsync compatibility"; exit 1; }
+    RAN="$RAN, redsync"
+  fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -709,7 +862,7 @@ fi
 RUBY=${FLINT_COMPAT_RUBY:-$(command -v ruby || true)}
 if [ -z "$RUBY" ]; then
   echo "== rails cache store: SKIP (no ruby on PATH)"
-  SKIPPED="$SKIPPED rails-cache-store"
+  SKIPPED="$SKIPPED rails-cache-store redlock-rb"
 else
   RB_HOME=${FLINT_COMPAT_GEM_HOME:-$FLINT_DRILL_ROOT/flint-compat-ruby}
   # GEM_HOME only. Setting GEM_PATH too hides the system gems, and gem install
@@ -765,6 +918,66 @@ RUBYSRC
     GEM_HOME="$RB_HOME" FLINT_PORT=$PORT FLINT_TOKEN=tok-acme "$RUBY" "$RB_HOME/store.rb"
     [ $? -eq 0 ] || { echo "FAIL: rails cache store compatibility"; exit 1; }
     RAN="$RAN, rails-cache-store"
+  fi
+
+  # -------------------------------------------------------------------------
+  # Ruby redlock 2.1.0 (ADR-0050's amendment). Every lock, extend and unlock
+  # is a Lua script, and `locked?` another, so before they were recognised no
+  # lock could be taken. Pinned: its scripts are what Flint recognises.
+  # -------------------------------------------------------------------------
+  rl_ready() { GEM_HOME="$RB_HOME" "$RUBY" -e 'gem "redlock", "2.1.0"; require "redlock"' >/dev/null 2>&1; }
+  if ! rl_ready; then
+    GEM_HOME="$RB_HOME" "$(dirname "$RUBY")/gem" install --no-document --silent redlock -v 2.1.0 >/dev/null 2>&1
+  fi
+  if ! rl_ready; then
+    echo "== redlock-rb: SKIP (could not install redlock 2.1.0; offline?)"
+    SKIPPED="$SKIPPED redlock-rb"
+  else
+    mkdir -p "$RB_HOME"
+    cat > "$RB_HOME/redlock.rb" <<'RUBYSRC'
+gem "redlock", "2.1.0"
+require "redlock"
+# redlock autoloads its client, and with it redis-client, on first use.
+require "redis-client"
+
+puts "== client: redlock-rb #{Redlock::VERSION}, on redis-client #{RedisClient::VERSION}"
+fails = []
+check = lambda do |name, ok, note = ""|
+  puts "  #{ok ? 'ok  ' : 'FAIL'} #{name}#{ok ? '' : "  #{note}"}"
+  fails << name unless ok
+end
+url = "redis://:#{ENV.fetch('FLINT_TOKEN')}@127.0.0.1:#{ENV.fetch('FLINT_PORT')}"
+rc = RedisClient.new(url: url)
+lm = Redlock::Client.new([url], retry_count: 0)
+# a and b are on the two pairs.
+%w[a b].each do |k|
+  begin
+    rc.call("DEL", k)
+    info = lm.lock(k, 10_000)
+    check.("#{k}: lock", info.is_a?(Hash), info.inspect)
+    check.("#{k}: a second holder is refused", lm.lock(k, 10_000) == false)
+    ext = lm.lock(k, 30_000, extend: info, extend_only_if_locked: true)
+    check.("#{k}: extend", ext.is_a?(Hash) && rc.call("PTTL", k) > 20_000, ext.inspect)
+    ttl = lm.get_remaining_ttl_for_lock(ext).to_i
+    check.("#{k}: locked? and the remaining TTL", lm.locked?(k) && ttl > 20_000, "ttl #{ttl}")
+    lm.unlock(ext)
+    check.("#{k}: unlock removes the lock", rc.call("EXISTS", k) == 0)
+    check.("#{k}: not locked? after unlock", !lm.locked?(k))
+    check.("#{k}: extend_only_if_locked does not take a free lock",
+           lm.lock(k, 10_000, extend: ext, extend_only_if_locked: true) == false)
+  rescue => e
+    check.("#{k}: lock life", false, "#{e.class}: #{e.message[0, 200]}")
+  end
+end
+if fails.any?
+  puts "\nFAIL: #{fails.size} client-visible problem(s): #{fails.join(', ')}"
+  exit 1
+end
+puts "\nall redlock-rb checks passed"
+RUBYSRC
+    GEM_HOME="$RB_HOME" FLINT_PORT=$PORT FLINT_TOKEN=tok-acme "$RUBY" "$RB_HOME/redlock.rb"
+    [ $? -eq 0 ] || { echo "FAIL: redlock-rb compatibility"; exit 1; }
+    RAN="$RAN, redlock-rb"
   fi
 fi
 

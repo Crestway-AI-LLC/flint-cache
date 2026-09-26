@@ -119,8 +119,8 @@ fn cmd(parts: &[&[u8]]) -> Vec<Vec<u8>> {
 /// three divergences we chose on purpose (see docs/command-support.md).
 /// Run it whenever these cases change; a green run there is what lets us
 /// say "matches RedisJSON" rather than "matches the contract we wrote".
-/// The Lua scripts Flint recognises (ADR-0050), byte for byte as redis-py's
-/// `Lock` and django-redis's `incr` send them. The oracle runs them as Lua; a
+/// The Lua scripts Flint recognises (ADR-0050), byte for byte as the
+/// libraries send them. The oracle runs them as Lua; a
 /// Flint target runs them natively, and the two must agree.
 const DJANGO_INCR_CHECKED: &[u8] = "\n                    local exists = redis.call('EXISTS', KEYS[1])\n                    if (exists == 1) then\n                        return redis.call('INCRBY', KEYS[1], ARGV[1])\n                    else return false end\n                    ".as_bytes();
 const DJANGO_INCR: &[u8] =
@@ -129,6 +129,22 @@ const DJANGO_INCR: &[u8] =
 const LOCK_RELEASE: &[u8] = "\n        local token = redis.call('get', KEYS[1])\n        if not token or token ~= ARGV[1] then\n            return 0\n        end\n        redis.call('del', KEYS[1])\n        return 1\n    ".as_bytes();
 const LOCK_EXTEND: &[u8] = "\n        local token = redis.call('get', KEYS[1])\n        if not token or token ~= ARGV[1] then\n            return 0\n        end\n        local expiration = redis.call('pttl', KEYS[1])\n        if not expiration then\n            expiration = 0\n        end\n        if expiration < 0 then\n            return 0\n        end\n\n        local newttl = ARGV[2]\n        if ARGV[3] == \"0\" then\n            newttl = ARGV[2] + expiration\n        end\n        redis.call('pexpire', KEYS[1], newttl)\n        return 1\n    ".as_bytes();
 const LOCK_REACQUIRE: &[u8] = "\n        local token = redis.call('get', KEYS[1])\n        if not token or token ~= ARGV[1] then\n            return 0\n        end\n        redis.call('pexpire', KEYS[1], ARGV[2])\n        return 1\n    ".as_bytes();
+// ADR-0050's amendment: the lock scripts of node redlock 4.2.0, redsync
+// v4.13.0 and Ruby redlock 2.1.0, as captured on the wire.
+const REDLOCK_ACQUIRE: &[u8] = "\n\t-- Return 0 if an entry already exists.\n\tfor i, key in ipairs(KEYS) do\n\t\tif redis.call(\"exists\", key) == 1 then\n\t\t\treturn 0\n\t\tend\n\tend\n\n\t-- Create an entry for each provided key.\n\tfor i, key in ipairs(KEYS) do\n\t\tredis.call(\"set\", key, ARGV[1], \"PX\", ARGV[2])\n\tend\n\n\t-- Return the number of entries added.\n\treturn #KEYS\n".as_bytes();
+const REDLOCK_EXTEND: &[u8] = "\n\t-- Return 0 if an entry exists with a *different* lock value.\n\tfor i, key in ipairs(KEYS) do\n\t\tif redis.call(\"get\", key) ~= ARGV[1] then\n\t\t\treturn 0\n\t\tend\n\tend\n\n\t-- Update the entry for each provided key.\n\tfor i, key in ipairs(KEYS) do\n\t\tredis.call(\"set\", key, ARGV[1], \"PX\", ARGV[2])\n\tend\n\n\t-- Return the number of entries updated.\n\treturn #KEYS\n".as_bytes();
+const REDLOCK_RELEASE: &[u8] = "\n\tlocal count = 0\n\tfor i, key in ipairs(KEYS) do\n\t\t-- Only remove entries for *this* lock value.\n\t\tif redis.call(\"get\", key) == ARGV[1] then\n\t\t\tredis.pcall(\"del\", key)\n\t\t\tcount = count + 1\n\t\tend\n\tend\n\n\t-- Return the number of entries removed.\n\treturn count\n".as_bytes();
+const REDSYNC_EXTEND: &[u8] = "\n\tif redis.call(\"GET\", KEYS[1]) == ARGV[1] then\n\t\treturn redis.call(\"PEXPIRE\", KEYS[1], ARGV[2])\n\telse\n\t\treturn 0\n\tend\n".as_bytes();
+const REDSYNC_RELEASE: &[u8] = "\n\tlocal val = redis.call(\"GET\", KEYS[1])\n\tif val == ARGV[1] then\n\t\treturn redis.call(\"DEL\", KEYS[1])\n\telseif val == false then\n\t\treturn -1\n\telse\n\t\treturn 0\n\tend\n".as_bytes();
+const REDLOCK_RB_LOCK: &[u8] = "      if (redis.call(\"exists\", KEYS[1]) == 0 and ARGV[3] == \"yes\") or redis.call(\"get\", KEYS[1]) == ARGV[1] then\n        return redis.call(\"set\", KEYS[1], ARGV[1], \"PX\", ARGV[2])\n      end\n".as_bytes();
+const REDLOCK_RB_UNLOCK: &[u8] = "      if redis.call(\"get\",KEYS[1]) == ARGV[1] then\n        return redis.call(\"del\",KEYS[1])\n      else\n        return 0\n      end\n".as_bytes();
+const REDLOCK_RB_INFO: &[u8] =
+    "      return { redis.call(\"get\", KEYS[1]), redis.call(\"pttl\", KEYS[1]) }\n".as_bytes();
+// And from the published packages: node redlock 5.0.0-beta.2's acquire, and
+// redsync's release before v4.12.0 and its `WithSetNXOnExtend` extend.
+const REDLOCK5_ACQUIRE: &[u8] = "\n  -- Return 0 if an entry already exists.\n  for i, key in ipairs(KEYS) do\n    if redis.call(\"exists\", key) == 1 then\n      return 0\n    end\n  end\n\n  -- Create an entry for each provided key.\n  for i, key in ipairs(KEYS) do\n    redis.call(\"set\", key, ARGV[1], \"PX\", ARGV[2])\n  end\n\n  -- Return the number of entries added.\n  return #KEYS\n".as_bytes();
+const REDSYNC_RELEASE_BEFORE_4_12: &[u8] = "\n\tif redis.call(\"GET\", KEYS[1]) == ARGV[1] then\n\t\treturn redis.call(\"DEL\", KEYS[1])\n\telse\n\t\treturn 0\n\tend\n".as_bytes();
+const REDSYNC_EXTEND_SETNX: &[u8] = "\n\tif redis.call(\"GET\", KEYS[1]) == ARGV[1] then\n\t\treturn redis.call(\"PEXPIRE\", KEYS[1], ARGV[2])\n\telseif redis.call(\"SET\", KEYS[1], ARGV[1], \"PX\", ARGV[2], \"NX\") then\n\t\treturn 1\n\telse\n\t\treturn 0\n\tend\n".as_bytes();
 
 fn flint_only(family: &str) -> bool {
     matches!(family, "json" | "bloom")
@@ -546,6 +562,153 @@ fn corpus() -> Vec<Case> {
                         b"tok",
                     ],
                     Expect::Int(0),
+                ),
+            ],
+        },
+        Case {
+            family: "scripting",
+            name: "the recognised lock-library scripts do what their Lua does",
+            steps: vec![
+                // node redlock: acquire when absent, extend and release with
+                // the token.
+                s(
+                    &[b"EVAL", REDLOCK_ACQUIRE, b"1", b"rl", b"tok", b"10000"],
+                    Expect::Int(1),
+                ),
+                s(&[b"PTTL", b"rl"], Expect::IntRange(9_000, 10_000)),
+                s(
+                    &[b"EVAL", REDLOCK_ACQUIRE, b"1", b"rl", b"x", b"10000"],
+                    Expect::Int(0),
+                ),
+                s(
+                    &[b"EVAL", REDLOCK_EXTEND, b"1", b"rl", b"x", b"30000"],
+                    Expect::Int(0),
+                ),
+                s(
+                    &[b"EVAL", REDLOCK_EXTEND, b"1", b"rl", b"tok", b"30000"],
+                    Expect::Int(1),
+                ),
+                s(&[b"PTTL", b"rl"], Expect::IntRange(20_001, 30_000)),
+                s(
+                    &[b"EVAL", REDLOCK_RELEASE, b"1", b"rl", b"x"],
+                    Expect::Int(0),
+                ),
+                s(
+                    &[b"EVAL", REDLOCK_RELEASE, b"1", b"rl", b"tok"],
+                    Expect::Int(1),
+                ),
+                s(&[b"EXISTS", b"rl"], Expect::Int(0)),
+                s(
+                    &[b"EVAL", REDLOCK5_ACQUIRE, b"1", b"rl", b"tok", b"10000"],
+                    Expect::Int(1),
+                ),
+                s(
+                    &[b"EVAL", REDLOCK5_ACQUIRE, b"1", b"rl", b"x", b"10000"],
+                    Expect::Int(0),
+                ),
+                // redsync: PEXPIRE's and DEL's replies, and -1 when gone.
+                s(&[b"SET", b"rs", b"tok", b"PX", b"8000"], Expect::Ok),
+                s(
+                    &[b"EVAL", REDSYNC_EXTEND, b"1", b"rs", b"x", b"30000"],
+                    Expect::Int(0),
+                ),
+                s(
+                    &[b"EVAL", REDSYNC_EXTEND, b"1", b"rs", b"tok", b"30000"],
+                    Expect::Int(1),
+                ),
+                s(
+                    &[b"EVAL", REDSYNC_RELEASE, b"1", b"rs", b"x"],
+                    Expect::Int(0),
+                ),
+                s(
+                    &[b"EVAL", REDSYNC_RELEASE, b"1", b"rs", b"tok"],
+                    Expect::Int(1),
+                ),
+                s(
+                    &[b"EVAL", REDSYNC_RELEASE, b"1", b"rs", b"tok"],
+                    Expect::Int(-1),
+                ),
+                s(
+                    &[b"EVAL", REDSYNC_RELEASE_BEFORE_4_12, b"1", b"rs", b"tok"],
+                    Expect::Int(0),
+                ),
+                s(
+                    &[b"EVAL", REDSYNC_EXTEND_SETNX, b"1", b"rs", b"tok", b"30000"],
+                    Expect::Int(1),
+                ),
+                s(&[b"PTTL", b"rs"], Expect::IntRange(20_001, 30_000)),
+                s(
+                    &[b"EVAL", REDSYNC_EXTEND_SETNX, b"1", b"rs", b"x", b"30000"],
+                    Expect::Int(0),
+                ),
+                s(
+                    &[b"EVAL", REDSYNC_RELEASE_BEFORE_4_12, b"1", b"rs", b"tok"],
+                    Expect::Int(1),
+                ),
+                // Ruby redlock: OK or nil, and info's [value, pttl].
+                s(
+                    &[
+                        b"EVAL",
+                        REDLOCK_RB_LOCK,
+                        b"1",
+                        b"rb",
+                        b"tok",
+                        b"10000",
+                        b"no",
+                    ],
+                    Expect::Nil,
+                ),
+                s(
+                    &[
+                        b"EVAL",
+                        REDLOCK_RB_LOCK,
+                        b"1",
+                        b"rb",
+                        b"tok",
+                        b"10000",
+                        b"yes",
+                    ],
+                    Expect::Ok,
+                ),
+                s(
+                    &[
+                        b"EVAL",
+                        REDLOCK_RB_LOCK,
+                        b"1",
+                        b"rb",
+                        b"x",
+                        b"10000",
+                        b"yes",
+                    ],
+                    Expect::Nil,
+                ),
+                s(
+                    &[
+                        b"EVAL",
+                        REDLOCK_RB_LOCK,
+                        b"1",
+                        b"rb",
+                        b"tok",
+                        b"30000",
+                        b"no",
+                    ],
+                    Expect::Ok,
+                ),
+                s(
+                    &[b"EVAL", REDLOCK_RB_INFO, b"1", b"rb"],
+                    Expect::Arr(vec![Expect::Str(b"tok"), Expect::IntRange(20_001, 30_000)]),
+                ),
+                s(
+                    &[b"EVAL", REDLOCK_RB_UNLOCK, b"1", b"rb", b"x"],
+                    Expect::Int(0),
+                ),
+                s(
+                    &[b"EVAL", REDLOCK_RB_UNLOCK, b"1", b"rb", b"tok"],
+                    Expect::Int(1),
+                ),
+                s(
+                    &[b"EVAL", REDLOCK_RB_INFO, b"1", b"rb"],
+                    Expect::Arr(vec![Expect::Nil, Expect::Int(-2)]),
                 ),
             ],
         },

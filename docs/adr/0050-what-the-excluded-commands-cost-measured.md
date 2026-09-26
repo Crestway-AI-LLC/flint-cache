@@ -1,7 +1,9 @@
 # ADR-0050: What the excluded commands cost, measured, and the two worth revisiting
 
 Status: **ACCEPTED 2026-09-26** (Jeff): Lua option C, `KEYS` option B,
-decision 3 as recommended. Built; see "As built" at the end.
+decision 3 as recommended. Built; see "As built" at the end. **Amended
+2026-09-26**: the lock libraries' scripts join the recognised set, and
+`python-redis-lock` is recorded as unsupportable; see the amendment.
 
 ## Context
 
@@ -117,3 +119,55 @@ guide's Frameworks section names each measured call and its alternative.
   the dispatch table as commands (it scanned to the end of the file), and
   reported `SCRIPT`'s subcommands as ungated commands. It now stops where the
   dispatch `match` closes; the dispatched set otherwise is unchanged (130).
+
+## Amendment 2026-09-26: the lock libraries
+
+Option C recognised what redis-py and django-redis send. The other common
+lock libraries were then measured the same way: through the proxy, on a
+two-pair fleet on a gate box, each on its defaults, with a plain Valkey as
+the control (every library worked there).
+
+| library | on Flint, before this amendment |
+|---|---|
+| node `redlock` 4.2.0, on ioredis | no lock can be taken: its acquire is a script |
+| Go `redsync` v4.13.0, on go-redis v9 | locks (`SET NX`), but unlock fails: a lock is never released, it only expires |
+| Ruby `redlock` 2.1.0 | no lock can be taken |
+| `python-redis-lock` 4.0.1 | acquires (`SET NX`); extend and release fail |
+
+**Recognised**, on option C's terms (each script reads its one key and writes
+it at most once, so under the key's write lock it is as atomic as its Lua):
+
+- node `redlock`'s acquire, extend and release, as 4.2.0 sends them and as
+  5.0.0-beta.1 and beta.2 do (the same Lua, indented differently).
+  5.0.0-beta.2 is what npm's `latest` tag installs, so it is what a new
+  project gets. 4.0.0 and 4.1.0 send other texts and stay refused.
+- `redsync`'s extend (unchanged v4.0.0 to v4.18.0), its `WithSetNXOnExtend`
+  extend (v4.12.0 on), and both of its releases: v4.12.0 on answers -1 for a
+  lock already gone, which redsync reports as `ErrLockAlreadyExpired`, and
+  before that the same compare-and-delete as Ruby `redlock`'s unlock.
+- Ruby `redlock` 2.1.0's lock, unlock and TTL lookup (`locked?`,
+  `get_remaining_ttl_for_lock`). The lookup answers `[value, pttl]`; for a
+  missing key the value is nil, as Lua's `false` in a table is.
+
+Each text was captured on the wire and checked against the published package
+(npm tarballs, the Go module proxy for every v4 tag, the gem), so the SHAs
+are the ones those versions send. node `redlock` can lock several resources
+in one call, one key each; that is a write to several slots and is refused,
+as a transaction across slots is (ADR-0012).
+
+**Not recognised: `python-redis-lock`.** Every call, extend included, names
+two keys, `lock:NAME` and `lock-signal:NAME`, which fall in different slots;
+its release writes both, four writes; and a blocking acquire waits on the
+signal list with `BLPOP`, which Flint does not serve. No choice of recognised
+scripts makes it work, and recognising its extend alone would leave a library
+that takes locks and then fails to release them. The tenant guide sends its
+users to redis-py's `Lock`.
+
+**Verification**: unit tests of every new path, including that each text
+hashes to its table entry and that python-redis-lock's two do not; a
+conformance case running the exact texts, so the Valkey oracle executes them
+as Lua and Flint natively; and `client_compat_drill` takes, extends, releases
+and re-takes a lock on both pairs with node `redlock` 4.2.0 and 5.0.0-beta.2,
+`redsync` v4.18.0 (with and without `WithSetNXOnExtend`, and a second unlock
+reporting the lock expired) and Ruby `redlock` 2.1.0, each refusing a second
+holder.

@@ -468,7 +468,7 @@ the write; ours says why.
   the cache a `KEY_FUNCTION` that puts one hash tag on every key, which puts
   that whole cache in one slot, on one pair.
   Also **pub/sub**, **streams**, **blocking
-  commands** (BLPOP, BLMOVE …), **RANDOMKEY**, and **Lua** beyond the five
+  commands** (BLPOP, BLMOVE …), **RANDOMKEY**, and **Lua** beyond the
   recognised scripts below.
   These conflict with slot-sharded multi-tenancy or reintroduce the
   single-threaded bottlenecks Flint exists to avoid. Common patterns they
@@ -476,15 +476,32 @@ the write; ours says why.
   these, open an issue describing the workload — patterns with broad
   demand get first-class implementations.
 
-- **Lua: five recognised scripts, and no Lua** (ADR-0050). `EVAL` and
-  `EVALSHA` run the scripts redis-py's `Lock` sends (release, extend,
-  reacquire) and the two django-redis's `incr` sends, natively and atomically:
-  each reads its one key and writes it at most once, under that key's write
-  lock. They are recognised by SHA1, as Redis names scripts, and are
-  byte-identical across redis-py 4.5.5 to 7.0.1 and django-redis 5.2.0 to
-  6.0.0. `SCRIPT LOAD`, `EXISTS` and `FLUSH` answer for them. Any other
-  script is refused ("Flint runs no Lua"), and `EVALSHA` of an unknown SHA
-  answers `NOSCRIPT`, which sends a client to `SCRIPT LOAD`, which refuses.
+- **Lua: the scripts of five libraries, recognised, and no Lua** (ADR-0050).
+  `EVAL` and `EVALSHA` run these natively and atomically, recognised by SHA1
+  as Redis names scripts:
+
+  | library | scripts | versions |
+  |---|---|---|
+  | redis-py `Lock` (and django-redis's `cache.lock()`) | release, extend, reacquire | 4.5.5 to 7.0.1 |
+  | django-redis `incr` | both forms | 5.2.0 to 6.0.0 |
+  | node `redlock` | acquire, extend, release | 4.2.0, 5.0.0-beta.1 and beta.2 |
+  | Go `redsync` | extend (with or without `WithSetNXOnExtend`), release | v4.0.0 to v4.18.0 |
+  | Ruby `redlock` | lock, unlock, the TTL lookup behind `locked?` | 2.1.0 |
+
+  Each reads its one key and writes it at most once, under that key's write
+  lock, so it is as atomic as the Lua it stands for. A script that names more
+  than one key is refused, which includes a node `redlock` lock over several
+  resources at once. `SCRIPT LOAD`, `EXISTS` and `FLUSH` answer for the
+  recognised scripts. Any other script is refused ("Flint runs no Lua"), and
+  `EVALSHA` of an unknown SHA answers `NOSCRIPT`, which sends a client to
+  `SCRIPT LOAD`, which refuses. Versions outside the table were not checked:
+  one whose text differs is refused like any other script, never run as
+  something else.
+- **`python-redis-lock` does not work**, and recognising its scripts would
+  not change that: every call names two keys in different slots (the lock and
+  a signal list), its release writes both, and a blocking acquire waits on
+  the list with `BLPOP`. It takes a lock and cannot release it. Use redis-py's
+  own `Lock`, above.
 - **`KEYS` through the proxy** (ADR-0050), answered from `SCAN` over every
   master of your pairs: no node runs a `KEYS`, so nothing blocks, and what a
   call costs is one pass of your keyspace. A reply of more than 100,000 keys

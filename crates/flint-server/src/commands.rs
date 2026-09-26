@@ -65,10 +65,13 @@ pub fn command_key(args: &[Vec<u8>]) -> Option<&[u8]> {
 }
 
 /// The Lua scripts Flint recognises and runs natively, by the SHA1 Redis
-/// names them by (ADR-0050). Flint runs no Lua. These five are what redis-py's
-/// `Lock` and django-redis's `incr` send, byte-identical across redis-py
-/// 4.5.5 to 7.0.1 (sync and asyncio) and django-redis 5.2.0 to 6.0.0, as read
-/// from their published wheels. Any other script is refused, as before.
+/// names them by (ADR-0050). Flint runs no Lua. The first five are what
+/// redis-py's `Lock` and django-redis's `incr` send, byte-identical across
+/// redis-py 4.5.5 to 7.0.1 (sync and asyncio) and django-redis 5.2.0 to 6.0.0,
+/// as read from their published wheels. The rest are the lock scripts of node
+/// `redlock` 4.2.0 and 5.0.0-beta, Go `redsync` v4.0.0 to v4.18.0 and Ruby
+/// `redlock` 2.1.0, captured on the wire and checked against the published
+/// packages (ADR-0050's amendment). Any other script is refused, as before.
 ///
 /// Each reads its one key and writes it at most once, so run inside the
 /// ordinary single-command dispatch, under the key's exclusive write lock
@@ -87,6 +90,29 @@ enum KnownScript {
     DjangoIncrChecked,
     /// django-redis `incr(..., ignore_key_check=True)`: plain INCRBY.
     DjangoIncr,
+    /// node `redlock` acquire: SET PX unless the key exists; 1, else 0.
+    RedlockAcquire,
+    /// node `redlock` extend: SET PX if it holds our token; 1, else 0.
+    RedlockExtend,
+    /// node `redlock` release: delete if it holds our token; 1, else 0.
+    RedlockRelease,
+    /// `redsync` extend: PEXPIRE's reply if it holds our token, else 0.
+    RedsyncExtend,
+    /// `redsync` extend under `WithSetNXOnExtend`: as `RedsyncExtend`, but a
+    /// lock that is gone is taken again with SET NX PX (1), and one held by
+    /// another answers 0.
+    RedsyncExtendSetNx,
+    /// `redsync` release from v4.12.0: DEL's reply if it holds our token, -1
+    /// if the key is gone, else 0.
+    RedsyncRelease,
+    /// `redsync` release before v4.12.0, and Ruby `redlock` unlock: DEL's
+    /// reply if it holds our token, else 0.
+    DelIfHeld,
+    /// Ruby `redlock` lock: SET PX if the key is absent and `ARGV[3]` is "yes",
+    /// or if it holds our token; SET's reply, else nil.
+    RedlockRbLock,
+    /// Ruby `redlock` info: `[GET, PTTL]`.
+    RedlockRbInfo,
 }
 
 const KNOWN_SCRIPTS: &[(&str, KnownScript)] = &[
@@ -110,6 +136,62 @@ const KNOWN_SCRIPTS: &[(&str, KnownScript)] = &[
         "4d15273b16b10c15e1d9202cbe93c959ab7d250b",
         KnownScript::DjangoIncr,
     ),
+    // node redlock 4.2.0, then 5.0.0-beta.1 and beta.2 (npm's `latest`):
+    // the same three scripts, indented differently.
+    (
+        "e5a322e2634ef59a516e8ea150cb085afafee684",
+        KnownScript::RedlockAcquire,
+    ),
+    (
+        "ce46f80993d5dac20dd066eb301a4e37994bdbed",
+        KnownScript::RedlockExtend,
+    ),
+    (
+        "0f0f23b9048b36752b5be114f357ba083449f908",
+        KnownScript::RedlockRelease,
+    ),
+    (
+        "96da70f7716f27d278a5218544df37fd8b0a5e4c",
+        KnownScript::RedlockAcquire,
+    ),
+    (
+        "aed6f382e410db8ba7926d4e5e9aab410bf2a78a",
+        KnownScript::RedlockExtend,
+    ),
+    (
+        "e4612211c9f8f51c257e26e056b0a654b3187242",
+        KnownScript::RedlockRelease,
+    ),
+    // redsync v4.0.0 to v4.18.0.
+    (
+        "d75bb8b5bd13532ddedd17762e772346e39b321e",
+        KnownScript::RedsyncExtend,
+    ),
+    (
+        "b6b55c439e02c6f52ffb8be7ec8c0d0ac816ea79",
+        KnownScript::RedsyncExtendSetNx,
+    ),
+    (
+        "e950836ed1e694540c503ef9972b8de518044d3b",
+        KnownScript::RedsyncRelease,
+    ),
+    (
+        "00583931c4e4d483f6233879c133c71ed5393f9d",
+        KnownScript::DelIfHeld,
+    ),
+    // Ruby redlock 2.1.0.
+    (
+        "ceb2b2062e40c51a2b3963fd078bc71f11bdc65c",
+        KnownScript::RedlockRbLock,
+    ),
+    (
+        "8e4905cee18e7c3188d10f2b8b170e403baed34f",
+        KnownScript::DelIfHeld,
+    ),
+    (
+        "78d2ca48a6dc9ef6892059792a3a0c5237733d64",
+        KnownScript::RedlockRbInfo,
+    ),
 ];
 
 fn known_script(sha: &str) -> Option<KnownScript> {
@@ -122,7 +204,7 @@ fn known_script(sha: &str) -> Option<KnownScript> {
 /// The reply for a script Flint does not recognise.
 fn script_unsupported() -> Value {
     err(
-        "ERR Flint runs no Lua: only the scripts of redis-py's Lock and django-redis's incr are recognised (ADR-0050)",
+        "ERR Flint runs no Lua: only the lock and incr scripts of the libraries its command-support page names are recognised (ADR-0050)",
     )
 }
 
@@ -1219,12 +1301,12 @@ impl<'a> Dispatcher<'a> {
         let arg = |i: usize| argv.get(i).map(|a| a.as_slice()).unwrap_or_default();
         let call =
             |parts: &[&[u8]]| self.dispatch(&parts.iter().map(|p| p.to_vec()).collect::<Vec<_>>());
-        // `local token = redis.call('get', KEYS[1]); if not token or token ~=
-        // ARGV[1] then return 0 end`, shared by the three lock scripts. A
-        // GET error (WRONGTYPE) is the script's error, as it would be in Lua.
+        // `redis.call('get', KEYS[1]) == ARGV[1]`, which every lock script
+        // asks. A GET error (WRONGTYPE) is the script's error, as it would be
+        // in Lua; a missing ARGV[1] is Lua's nil, which no value equals.
         let holds_token = || -> Result<bool, Value> {
             match call(&[b"GET", key]) {
-                Value::Bulk(Some(v)) => Ok(v == arg(0)),
+                Value::Bulk(Some(v)) => Ok(argv.first().is_some_and(|a| *a == v)),
                 Value::Bulk(None) => Ok(false),
                 e @ Value::Error(_) => Err(e),
                 other => Err(Value::Error(format!("ERR unexpected GET reply {other:?}"))),
@@ -1281,6 +1363,92 @@ impl<'a> Dispatcher<'a> {
                 e => e,
             },
             KnownScript::DjangoIncr => call(&[b"INCRBY", key, arg(0)]),
+            // Script errors raised by `redis.call` are returned as they are;
+            // a reply the script returns (`return redis.call(...)`) is passed
+            // through whatever it is.
+            KnownScript::RedlockAcquire => match call(&[b"EXISTS", key]) {
+                Value::Integer(1) => Value::Integer(0),
+                Value::Integer(_) => match call(&[b"SET", key, arg(0), b"PX", arg(1)]) {
+                    e @ Value::Error(_) => e,
+                    _ => Value::Integer(1),
+                },
+                e => e,
+            },
+            KnownScript::RedlockExtend => match holds_token() {
+                Ok(true) => match call(&[b"SET", key, arg(0), b"PX", arg(1)]) {
+                    e @ Value::Error(_) => e,
+                    _ => Value::Integer(1),
+                },
+                Ok(false) => Value::Integer(0),
+                Err(e) => e,
+            },
+            // `redis.pcall("del", key)`: DEL's own error, were there one, is
+            // swallowed and the key still counted.
+            KnownScript::RedlockRelease => match holds_token() {
+                Ok(true) => {
+                    let _ = call(&[b"DEL", key]);
+                    Value::Integer(1)
+                }
+                Ok(false) => Value::Integer(0),
+                Err(e) => e,
+            },
+            KnownScript::RedsyncExtend => match holds_token() {
+                Ok(true) => call(&[b"PEXPIRE", key, arg(1)]),
+                Ok(false) => Value::Integer(0),
+                Err(e) => e,
+            },
+            // `GET == ARGV[1]` then PEXPIRE, `elseif SET .. NX` (a reply of
+            // OK is truthy, nil is false) then 1, else 0.
+            KnownScript::RedsyncExtendSetNx => match holds_token() {
+                Ok(true) => call(&[b"PEXPIRE", key, arg(1)]),
+                Ok(false) => match call(&[b"SET", key, arg(0), b"PX", arg(1), b"NX"]) {
+                    e @ Value::Error(_) => e,
+                    Value::Bulk(None) => Value::Integer(0),
+                    _ => Value::Integer(1),
+                },
+                Err(e) => e,
+            },
+            KnownScript::RedsyncRelease => match call(&[b"GET", key]) {
+                Value::Bulk(Some(v)) if argv.first().is_some_and(|a| *a == v) => {
+                    call(&[b"DEL", key])
+                }
+                Value::Bulk(Some(_)) => Value::Integer(0),
+                Value::Bulk(None) => Value::Integer(-1),
+                e => e,
+            },
+            // `(EXISTS == 0 and ARGV[3] == "yes") or GET == ARGV[1]`, in
+            // Lua's order: the GET runs only when the first clause is false.
+            // Falling off the end of the script returns nil.
+            KnownScript::RedlockRbLock => {
+                let fresh = match call(&[b"EXISTS", key]) {
+                    Value::Integer(n) => n == 0 && argv.get(2).is_some_and(|a| a == b"yes"),
+                    e => return e,
+                };
+                let take = fresh
+                    || match holds_token() {
+                        Ok(held) => held,
+                        Err(e) => return e,
+                    };
+                if take {
+                    call(&[b"SET", key, arg(0), b"PX", arg(1)])
+                } else {
+                    Value::Bulk(None)
+                }
+            }
+            KnownScript::DelIfHeld => match holds_token() {
+                Ok(true) => call(&[b"DEL", key]),
+                Ok(false) => Value::Integer(0),
+                Err(e) => e,
+            },
+            // `{ GET, PTTL }`: a missing key's GET is Lua false, which a
+            // table carries through as a nil element.
+            KnownScript::RedlockRbInfo => match call(&[b"GET", key]) {
+                e @ Value::Error(_) => e,
+                v => match call(&[b"PTTL", key]) {
+                    e @ Value::Error(_) => e,
+                    t => Value::Array(Some(vec![v, t])),
+                },
+            },
         }
     }
 
@@ -3843,7 +4011,7 @@ mod tests {
         assert_eq!(call(&s, &[b"DEL", b"h", b"str"]), Value::Integer(2));
     }
 
-    /// ADR-0050: the five recognised texts, exactly as the libraries send
+    /// ADR-0050: the recognised texts, exactly as the libraries send
     /// them. Each must hash to its table entry, or recognition is silently off.
     const DJANGO_INCR_CHECKED: &str = "\n                    local exists = redis.call('EXISTS', KEYS[1])\n                    if (exists == 1) then\n                        return redis.call('INCRBY', KEYS[1], ARGV[1])\n                    else return false end\n                    ";
     const DJANGO_INCR: &str =
@@ -3851,6 +4019,26 @@ mod tests {
     const LOCK_RELEASE: &str = "\n        local token = redis.call('get', KEYS[1])\n        if not token or token ~= ARGV[1] then\n            return 0\n        end\n        redis.call('del', KEYS[1])\n        return 1\n    ";
     const LOCK_EXTEND: &str = "\n        local token = redis.call('get', KEYS[1])\n        if not token or token ~= ARGV[1] then\n            return 0\n        end\n        local expiration = redis.call('pttl', KEYS[1])\n        if not expiration then\n            expiration = 0\n        end\n        if expiration < 0 then\n            return 0\n        end\n\n        local newttl = ARGV[2]\n        if ARGV[3] == \"0\" then\n            newttl = ARGV[2] + expiration\n        end\n        redis.call('pexpire', KEYS[1], newttl)\n        return 1\n    ";
     const LOCK_REACQUIRE: &str = "\n        local token = redis.call('get', KEYS[1])\n        if not token or token ~= ARGV[1] then\n            return 0\n        end\n        redis.call('pexpire', KEYS[1], ARGV[2])\n        return 1\n    ";
+    // The amendment's, as node redlock 4.2.0, redsync v4.13.0 and Ruby
+    // redlock 2.1.0 sent them, and python-redis-lock 4.0.1's two it refuses.
+    const REDLOCK_ACQUIRE: &str = "\n\t-- Return 0 if an entry already exists.\n\tfor i, key in ipairs(KEYS) do\n\t\tif redis.call(\"exists\", key) == 1 then\n\t\t\treturn 0\n\t\tend\n\tend\n\n\t-- Create an entry for each provided key.\n\tfor i, key in ipairs(KEYS) do\n\t\tredis.call(\"set\", key, ARGV[1], \"PX\", ARGV[2])\n\tend\n\n\t-- Return the number of entries added.\n\treturn #KEYS\n";
+    const REDLOCK_EXTEND: &str = "\n\t-- Return 0 if an entry exists with a *different* lock value.\n\tfor i, key in ipairs(KEYS) do\n\t\tif redis.call(\"get\", key) ~= ARGV[1] then\n\t\t\treturn 0\n\t\tend\n\tend\n\n\t-- Update the entry for each provided key.\n\tfor i, key in ipairs(KEYS) do\n\t\tredis.call(\"set\", key, ARGV[1], \"PX\", ARGV[2])\n\tend\n\n\t-- Return the number of entries updated.\n\treturn #KEYS\n";
+    const REDLOCK_RELEASE: &str = "\n\tlocal count = 0\n\tfor i, key in ipairs(KEYS) do\n\t\t-- Only remove entries for *this* lock value.\n\t\tif redis.call(\"get\", key) == ARGV[1] then\n\t\t\tredis.pcall(\"del\", key)\n\t\t\tcount = count + 1\n\t\tend\n\tend\n\n\t-- Return the number of entries removed.\n\treturn count\n";
+    const REDSYNC_EXTEND: &str = "\n\tif redis.call(\"GET\", KEYS[1]) == ARGV[1] then\n\t\treturn redis.call(\"PEXPIRE\", KEYS[1], ARGV[2])\n\telse\n\t\treturn 0\n\tend\n";
+    const REDSYNC_RELEASE: &str = "\n\tlocal val = redis.call(\"GET\", KEYS[1])\n\tif val == ARGV[1] then\n\t\treturn redis.call(\"DEL\", KEYS[1])\n\telseif val == false then\n\t\treturn -1\n\telse\n\t\treturn 0\n\tend\n";
+    const REDLOCK_RB_LOCK: &str = "      if (redis.call(\"exists\", KEYS[1]) == 0 and ARGV[3] == \"yes\") or redis.call(\"get\", KEYS[1]) == ARGV[1] then\n        return redis.call(\"set\", KEYS[1], ARGV[1], \"PX\", ARGV[2])\n      end\n";
+    const REDLOCK_RB_UNLOCK: &str = "      if redis.call(\"get\",KEYS[1]) == ARGV[1] then\n        return redis.call(\"del\",KEYS[1])\n      else\n        return 0\n      end\n";
+    const REDLOCK_RB_INFO: &str =
+        "      return { redis.call(\"get\", KEYS[1]), redis.call(\"pttl\", KEYS[1]) }\n";
+    const PY_REDIS_LOCK_EXTEND: &str = "\n    if redis.call(\"get\", KEYS[1]) ~= ARGV[1] then\n        return 1\n    elseif redis.call(\"ttl\", KEYS[1]) < 0 then\n        return 2\n    else\n        redis.call(\"expire\", KEYS[1], ARGV[2])\n        return 0\n    end\n";
+    const PY_REDIS_LOCK_RELEASE: &str = "\n    if redis.call(\"get\", KEYS[1]) ~= ARGV[1] then\n        return 1\n    else\n        redis.call(\"del\", KEYS[2])\n        redis.call(\"lpush\", KEYS[2], 1)\n        redis.call(\"pexpire\", KEYS[2], ARGV[2])\n        redis.call(\"del\", KEYS[1])\n        return 0\n    end\n";
+    // Read from the published packages: node redlock 5.0.0-beta.2, and
+    // redsync's release before v4.12.0 and its `WithSetNXOnExtend` extend.
+    const REDLOCK5_ACQUIRE: &str = "\n  -- Return 0 if an entry already exists.\n  for i, key in ipairs(KEYS) do\n    if redis.call(\"exists\", key) == 1 then\n      return 0\n    end\n  end\n\n  -- Create an entry for each provided key.\n  for i, key in ipairs(KEYS) do\n    redis.call(\"set\", key, ARGV[1], \"PX\", ARGV[2])\n  end\n\n  -- Return the number of entries added.\n  return #KEYS\n";
+    const REDLOCK5_EXTEND: &str = "\n  -- Return 0 if an entry exists with a *different* lock value.\n  for i, key in ipairs(KEYS) do\n    if redis.call(\"get\", key) ~= ARGV[1] then\n      return 0\n    end\n  end\n\n  -- Update the entry for each provided key.\n  for i, key in ipairs(KEYS) do\n    redis.call(\"set\", key, ARGV[1], \"PX\", ARGV[2])\n  end\n\n  -- Return the number of entries updated.\n  return #KEYS\n";
+    const REDLOCK5_RELEASE: &str = "\n  local count = 0\n  for i, key in ipairs(KEYS) do\n    -- Only remove entries for *this* lock value.\n    if redis.call(\"get\", key) == ARGV[1] then\n      redis.pcall(\"del\", key)\n      count = count + 1\n    end\n  end\n\n  -- Return the number of entries removed.\n  return count\n";
+    const REDSYNC_RELEASE_BEFORE_4_12: &str = "\n\tif redis.call(\"GET\", KEYS[1]) == ARGV[1] then\n\t\treturn redis.call(\"DEL\", KEYS[1])\n\telse\n\t\treturn 0\n\tend\n";
+    const REDSYNC_EXTEND_SETNX: &str = "\n\tif redis.call(\"GET\", KEYS[1]) == ARGV[1] then\n\t\treturn redis.call(\"PEXPIRE\", KEYS[1], ARGV[2])\n\telseif redis.call(\"SET\", KEYS[1], ARGV[1], \"PX\", ARGV[2], \"NX\") then\n\t\treturn 1\n\telse\n\t\treturn 0\n\tend\n";
 
     fn ev(s: &MemKv, parts: &[&str]) -> Value {
         call(s, &parts.iter().map(|p| p.as_bytes()).collect::<Vec<_>>())
@@ -3864,12 +4052,244 @@ mod tests {
             (LOCK_REACQUIRE, KnownScript::LockReacquire),
             (DJANGO_INCR_CHECKED, KnownScript::DjangoIncrChecked),
             (DJANGO_INCR, KnownScript::DjangoIncr),
+            (REDLOCK_ACQUIRE, KnownScript::RedlockAcquire),
+            (REDLOCK_EXTEND, KnownScript::RedlockExtend),
+            (REDLOCK_RELEASE, KnownScript::RedlockRelease),
+            (REDSYNC_EXTEND, KnownScript::RedsyncExtend),
+            (REDSYNC_RELEASE, KnownScript::RedsyncRelease),
+            (REDLOCK_RB_LOCK, KnownScript::RedlockRbLock),
+            (REDLOCK_RB_UNLOCK, KnownScript::DelIfHeld),
+            (REDLOCK5_ACQUIRE, KnownScript::RedlockAcquire),
+            (REDLOCK5_EXTEND, KnownScript::RedlockExtend),
+            (REDLOCK5_RELEASE, KnownScript::RedlockRelease),
+            (REDSYNC_RELEASE_BEFORE_4_12, KnownScript::DelIfHeld),
+            (REDSYNC_EXTEND_SETNX, KnownScript::RedsyncExtendSetNx),
+            (REDLOCK_RB_INFO, KnownScript::RedlockRbInfo),
         ] {
             assert_eq!(
                 known_script(&flint_tls::sha1_hex(text.as_bytes())),
                 Some(want)
             );
         }
+        // python-redis-lock's scripts are not recognised: each is sent with
+        // two keys, and its release writes both (ADR-0050's amendment).
+        for text in [PY_REDIS_LOCK_EXTEND, PY_REDIS_LOCK_RELEASE] {
+            assert_eq!(known_script(&flint_tls::sha1_hex(text.as_bytes())), None);
+        }
+    }
+
+    fn pttl(s: &MemKv, k: &str) -> i64 {
+        let Value::Integer(t) = ev(s, &["PTTL", k]) else {
+            panic!("PTTL {k}")
+        };
+        t
+    }
+
+    /// node redlock 4.2.0 and 5.0.0-beta: acquire only when absent, extend
+    /// and release only with the token, each answering 1 or 0.
+    #[test]
+    fn node_redlock_scripts_do_what_the_lua_does() {
+        for texts in [
+            (REDLOCK_ACQUIRE, REDLOCK_EXTEND, REDLOCK_RELEASE),
+            (REDLOCK5_ACQUIRE, REDLOCK5_EXTEND, REDLOCK5_RELEASE),
+        ] {
+            node_redlock_life(texts);
+        }
+    }
+
+    fn node_redlock_life((acquire, extend, release): (&str, &str, &str)) {
+        let s = MemKv::new();
+        assert_eq!(
+            ev(&s, &["EVAL", acquire, "1", "r", "tok", "10000"]),
+            Value::Integer(1)
+        );
+        assert!((9_000..=10_000).contains(&pttl(&s, "r")));
+        assert_eq!(
+            ev(&s, &["EVAL", acquire, "1", "r", "other", "10000"]),
+            Value::Integer(0),
+            "held"
+        );
+        assert_eq!(
+            ev(&s, &["EVAL", extend, "1", "r", "other", "30000"]),
+            Value::Integer(0)
+        );
+        assert_eq!(
+            ev(&s, &["EVAL", extend, "1", "r", "tok", "30000"]),
+            Value::Integer(1)
+        );
+        assert!(pttl(&s, "r") > 20_000, "extended");
+        assert_eq!(
+            ev(&s, &["EVAL", extend, "1", "gone", "tok", "30000"]),
+            Value::Integer(0),
+            "a missing lock is not extended"
+        );
+        assert_eq!(ev(&s, &["EXISTS", "gone"]), Value::Integer(0));
+        assert_eq!(
+            ev(&s, &["EVAL", release, "1", "r", "other"]),
+            Value::Integer(0)
+        );
+        assert_eq!(
+            ev(&s, &["EVAL", release, "1", "r", "tok"]),
+            Value::Integer(1)
+        );
+        assert_eq!(ev(&s, &["EXISTS", "r"]), Value::Integer(0));
+        // A bad TTL is SET's error, as `redis.call` raises it.
+        assert!(matches!(
+            ev(&s, &["EVAL", acquire, "1", "r", "tok", "soon"]),
+            Value::Error(_)
+        ));
+        assert_eq!(ev(&s, &["EXISTS", "r"]), Value::Integer(0));
+    }
+
+    /// redsync v4.13.0: extend answers PEXPIRE's reply, release DEL's, and a
+    /// release of a lock that is gone answers -1.
+    #[test]
+    fn redsync_scripts_do_what_the_lua_does() {
+        let s = MemKv::new();
+        ev(&s, &["SET", "m", "tok", "PX", "8000"]);
+        assert_eq!(
+            ev(&s, &["EVAL", REDSYNC_EXTEND, "1", "m", "other", "30000"]),
+            Value::Integer(0)
+        );
+        assert_eq!(
+            ev(&s, &["EVAL", REDSYNC_EXTEND, "1", "m", "tok", "30000"]),
+            Value::Integer(1)
+        );
+        assert!(pttl(&s, "m") > 20_000);
+        assert_eq!(
+            ev(&s, &["EVAL", REDSYNC_RELEASE, "1", "m", "other"]),
+            Value::Integer(0)
+        );
+        assert_eq!(
+            ev(&s, &["EVAL", REDSYNC_RELEASE, "1", "m", "tok"]),
+            Value::Integer(1)
+        );
+        assert_eq!(
+            ev(&s, &["EVAL", REDSYNC_RELEASE, "1", "m", "tok"]),
+            Value::Integer(-1),
+            "gone"
+        );
+        ev(&s, &["HSET", "h", "f", "v"]);
+        assert!(
+            matches!(ev(&s, &["EVAL", REDSYNC_RELEASE, "1", "h", "tok"]), Value::Error(e) if e.starts_with("WRONGTYPE"))
+        );
+        // Before v4.12.0 a release of a lock that is gone answered 0.
+        ev(&s, &["SET", "o", "tok"]);
+        assert_eq!(
+            ev(
+                &s,
+                &["EVAL", REDSYNC_RELEASE_BEFORE_4_12, "1", "o", "other"]
+            ),
+            Value::Integer(0)
+        );
+        assert_eq!(
+            ev(&s, &["EVAL", REDSYNC_RELEASE_BEFORE_4_12, "1", "o", "tok"]),
+            Value::Integer(1)
+        );
+        assert_eq!(
+            ev(&s, &["EVAL", REDSYNC_RELEASE_BEFORE_4_12, "1", "o", "tok"]),
+            Value::Integer(0)
+        );
+    }
+
+    /// redsync's `WithSetNXOnExtend`: an extend of a lock that expired takes
+    /// it again, and one held by another answers 0 and leaves it alone.
+    #[test]
+    fn redsync_setnx_extend_does_what_the_lua_does() {
+        let s = MemKv::new();
+        assert_eq!(
+            ev(
+                &s,
+                &["EVAL", REDSYNC_EXTEND_SETNX, "1", "x", "tok", "30000"]
+            ),
+            Value::Integer(1),
+            "gone: taken again"
+        );
+        assert_eq!(ev(&s, &["GET", "x"]), Value::Bulk(Some(b"tok".to_vec())));
+        assert!(pttl(&s, "x") > 20_000);
+        assert_eq!(
+            ev(
+                &s,
+                &["EVAL", REDSYNC_EXTEND_SETNX, "1", "x", "tok", "50000"]
+            ),
+            Value::Integer(1),
+            "held: extended"
+        );
+        assert!(pttl(&s, "x") > 40_000);
+        assert_eq!(
+            ev(
+                &s,
+                &["EVAL", REDSYNC_EXTEND_SETNX, "1", "x", "other", "90000"]
+            ),
+            Value::Integer(0),
+            "held by another"
+        );
+        assert_eq!(ev(&s, &["GET", "x"]), Value::Bulk(Some(b"tok".to_vec())));
+        assert!(pttl(&s, "x") <= 50_000);
+    }
+
+    /// Ruby redlock: lock takes an absent key only when `ARGV[3]` is "yes",
+    /// re-takes its own, answers OK or nil; unlock answers DEL's reply; info
+    /// answers `[value, pttl]`, with a nil value for a missing key.
+    #[test]
+    fn ruby_redlock_scripts_do_what_the_lua_does() {
+        let s = MemKv::new();
+        assert_eq!(
+            ev(
+                &s,
+                &["EVAL", REDLOCK_RB_LOCK, "1", "q", "tok", "10000", "no"]
+            ),
+            Value::Bulk(None),
+            "absent, but new locks not allowed"
+        );
+        assert_eq!(ev(&s, &["EXISTS", "q"]), Value::Integer(0));
+        assert_eq!(
+            ev(
+                &s,
+                &["EVAL", REDLOCK_RB_LOCK, "1", "q", "tok", "10000", "yes"]
+            ),
+            Value::Simple("OK".into())
+        );
+        assert_eq!(
+            ev(
+                &s,
+                &["EVAL", REDLOCK_RB_LOCK, "1", "q", "other", "10000", "yes"]
+            ),
+            Value::Bulk(None),
+            "held by another"
+        );
+        assert_eq!(
+            ev(
+                &s,
+                &["EVAL", REDLOCK_RB_LOCK, "1", "q", "tok", "30000", "no"]
+            ),
+            Value::Simple("OK".into()),
+            "our own, extended"
+        );
+        assert!(pttl(&s, "q") > 20_000);
+        let Value::Array(Some(info)) = ev(&s, &["EVAL", REDLOCK_RB_INFO, "1", "q"]) else {
+            panic!("info")
+        };
+        assert_eq!(info[0], Value::Bulk(Some(b"tok".to_vec())));
+        assert!(matches!(info[1], Value::Integer(t) if t > 20_000));
+        assert_eq!(
+            ev(&s, &["EVAL", REDLOCK_RB_UNLOCK, "1", "q", "other"]),
+            Value::Integer(0)
+        );
+        assert_eq!(
+            ev(&s, &["EVAL", REDLOCK_RB_UNLOCK, "1", "q", "tok"]),
+            Value::Integer(1)
+        );
+        assert_eq!(
+            ev(&s, &["EVAL", REDLOCK_RB_INFO, "1", "q"]),
+            Value::Array(Some(vec![Value::Bulk(None), Value::Integer(-2)]))
+        );
+        // The GET runs only when the first clause is false: an absent key
+        // with "yes" never reaches it, a held hash does and raises.
+        ev(&s, &["HSET", "h", "f", "v"]);
+        assert!(
+            matches!(ev(&s, &["EVAL", REDLOCK_RB_LOCK, "1", "h", "tok", "10000", "yes"]), Value::Error(e) if e.starts_with("WRONGTYPE"))
+        );
     }
 
     /// redis-py's Lock, end to end: release only with the token, extend by
