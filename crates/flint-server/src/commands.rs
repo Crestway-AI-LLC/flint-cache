@@ -543,6 +543,24 @@ impl<'a> Dispatcher<'a> {
                 ),
                 Err(_) => err("ERR value is not an integer or out of range"),
             }),
+            b"HINCRBYFLOAT" => exact(args, 4, "hincrbyfloat", |a| match parse_f64(&a[3]) {
+                // Valkey refuses an infinite increment up front here, where
+                // INCRBYFLOAT lets the sum refuse it.
+                Ok(delta) if delta.is_infinite() => err("ERR value is NaN or Infinity"),
+                Ok(delta) => {
+                    match self
+                        .hashes
+                        .hincr_by_float(slot_for_key(&a[1]), &a[1], &a[2], delta)
+                    {
+                        Ok(repr) => Value::Bulk(Some(repr)),
+                        // Valkey names the hash value here, where INCRBYFLOAT
+                        // says "value".
+                        Err(StoreError::NotFloat) => err("ERR hash value is not a float"),
+                        Err(e) => store_err(e),
+                    }
+                }
+                Err(_) => err("ERR value is not a valid float"),
+            }),
             b"HLEN" => exact(args, 2, "hlen", |a| {
                 reply(self.hashes.hlen(slot_for_key(&a[1]), &a[1]), |n| {
                     Value::Integer(n as i64)
@@ -726,6 +744,29 @@ impl<'a> Dispatcher<'a> {
                     |n| Value::Integer(n as i64),
                 )
             }
+            b"LMOVE" => {
+                if args.len() != 5 {
+                    return arity_err("lmove");
+                }
+                let side = |a: &[u8]| {
+                    if a.eq_ignore_ascii_case(b"LEFT") {
+                        Some(true)
+                    } else if a.eq_ignore_ascii_case(b"RIGHT") {
+                        Some(false)
+                    } else {
+                        None
+                    }
+                };
+                match (side(&args[3]), side(&args[4])) {
+                    (Some(from_left), Some(to_left)) => {
+                        self.cmd_lmove(&args[1], &args[2], from_left, to_left)
+                    }
+                    _ => err("ERR syntax error"),
+                }
+            }
+            b"RPOPLPUSH" => exact(args, 3, "rpoplpush", |a| {
+                self.cmd_lmove(&a[1], &a[2], false, true)
+            }),
             b"LPOP" | b"RPOP" => exact(args, 2, "lpop", |a| {
                 let left = name.eq_ignore_ascii_case(b"LPOP");
                 reply(
@@ -1131,6 +1172,48 @@ impl<'a> Dispatcher<'a> {
                 None => Value::Bulk(None),
             },
             Err(e) => store_err(e),
+        }
+    }
+
+    /// LMOVE / RPOPLPUSH (BUG-0187): pop from one end of `src`, push onto
+    /// one end of `dst`, answer the element. Both keys in one slot. Valkey's
+    /// order of checks: a missing source answers nil whatever `dst` is, then
+    /// the source's type, then the destination's, all before anything moves.
+    /// The destination is a second key, so `main` locks every writer for it,
+    /// as for any multi-key write (BUG-0188).
+    fn cmd_lmove(&self, src: &[u8], dst: &[u8], from_left: bool, to_left: bool) -> Value {
+        if let Some(refusal) = Self::crossslot(src, std::slice::from_ref(&dst.to_vec())) {
+            return refusal;
+        }
+        let slot = slot_for_key(src);
+        match self.lists.llen(slot, src) {
+            Ok(0) => return Value::Bulk(None),
+            Ok(_) => {}
+            Err(e) => return store_err(e),
+        }
+        if src != dst
+            && let Err(e) = self.lists.llen(slot, dst)
+        {
+            return store_err(e);
+        }
+        let v = match self.lists.pop(slot, src, from_left) {
+            Ok(Some(v)) => v,
+            Ok(None) => return Value::Bulk(None),
+            Err(e) => return store_err(e),
+        };
+        match self
+            .lists
+            .push(slot, dst, std::slice::from_ref(&v), to_left)
+        {
+            Ok(_) => Value::Bulk(Some(v)),
+            Err(e) => {
+                // The one refusal left is the value cap on `dst`: put the
+                // element back where it came from, so a refusal moves nothing.
+                let _ = self
+                    .lists
+                    .push(slot, src, std::slice::from_ref(&v), from_left);
+                store_err(e)
+            }
         }
     }
 
@@ -3111,7 +3194,20 @@ fn fmt_score(s: f64) -> Vec<u8> {
 fn parse_f64(raw: &[u8]) -> Result<f64, ()> {
     let s = std::str::from_utf8(raw).map_err(|_| ())?;
     let v: f64 = s.parse().map_err(|_| ())?;
-    if v.is_nan() { Err(()) } else { Ok(v) }
+    // Rust rounds a spelling past f64's range to infinity ("1e400") or to
+    // zero ("1e-400") where strtod reports ERANGE, which Valkey answers as
+    // not a float. Only a spelled-out infinity or zero may parse as one.
+    let unsigned = s.trim_start_matches(['+', '-']).to_ascii_lowercase();
+    let spelled_inf = unsigned == "inf" || unsigned == "infinity";
+    let spelled_zero = || {
+        let mantissa = unsigned.split('e').next().unwrap_or_default();
+        !mantissa.bytes().any(|b| matches!(b, b'1'..=b'9'))
+    };
+    if v.is_nan() || (v.is_infinite() && !spelled_inf) || (v == 0.0 && !spelled_zero()) {
+        Err(())
+    } else {
+        Ok(v)
+    }
 }
 
 fn parse_i64(raw: &[u8]) -> Result<i64, ()> {
@@ -5016,6 +5112,72 @@ mod tests {
                      which is the silent-wrong-answer this guard exists to stop: {other:?}"
                 ),
             }
+        }
+    }
+
+    /// BUG-0187: a move between lists on two slots would pop from one node
+    /// and push onto a list this node does not own. It is refused, and the
+    /// refusal moves nothing.
+    #[test]
+    fn a_cross_slot_list_move_is_refused_and_moves_nothing() {
+        assert_ne!(
+            slot_for_key(b"alpha"),
+            slot_for_key(b"beta"),
+            "stale corpus: these keys no longer land in different slots"
+        );
+        let s = MemKv::new();
+        call(&s, &[b"RPUSH", b"alpha", b"a", b"b"]);
+        for cmd in [
+            &[&b"LMOVE"[..], b"alpha", b"beta", b"LEFT", b"RIGHT"][..],
+            &[&b"RPOPLPUSH"[..], b"alpha", b"beta"][..],
+        ] {
+            let name = String::from_utf8_lossy(cmd[0]).into_owned();
+            match call(&s, cmd) {
+                Value::Error(e) => assert!(
+                    e.starts_with("CROSSSLOT") && e.contains("alpha") && e.contains("beta"),
+                    "{name}: expected a CROSSSLOT refusal naming both keys, got {e}"
+                ),
+                other => panic!("{name}: moved across slots instead of refusing: {other:?}"),
+            }
+        }
+        assert_eq!(call(&s, &[b"LLEN", b"alpha"]), Value::Integer(2));
+    }
+
+    /// Valkey refuses a float spelled past a double's range (strtod's
+    /// ERANGE), where Rust's parser rounds it to infinity or zero. A score
+    /// of `1e400` was stored as inf.
+    #[test]
+    fn a_float_spelled_past_the_range_of_a_double_is_not_a_float() {
+        for bad in [
+            &b"1e400"[..],
+            b"-1e400",
+            b"1e-400",
+            b"-1e-400",
+            b"nan",
+            b"0x10",
+            b"",
+        ] {
+            assert!(
+                parse_f64(bad).is_err(),
+                "{} must not parse",
+                String::from_utf8_lossy(bad)
+            );
+        }
+        for (good, want) in [
+            (&b"inf"[..], f64::INFINITY),
+            (b"-Infinity", f64::NEG_INFINITY),
+            (b"+INF", f64::INFINITY),
+            (b"0", 0.0),
+            (b"-0.000e-400", 0.0),
+            (b"1e-310", 1e-310),
+            (b"1.5e2", 150.0),
+        ] {
+            assert_eq!(
+                parse_f64(good),
+                Ok(want),
+                "{} must parse",
+                String::from_utf8_lossy(good)
+            );
         }
     }
 

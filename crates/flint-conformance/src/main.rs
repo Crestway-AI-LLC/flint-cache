@@ -952,6 +952,68 @@ fn corpus() -> Vec<Case> {
             ],
         },
         Case {
+            family: "lists",
+            name: "lmove and rpoplpush move one element between lists",
+            // BUG-0187: both were unknown; asynq and BullMQ move every job
+            // with RPOPLPUSH, rq with LMOVE.
+            steps: vec![
+                s(&[b"RPUSH", b"{lm}s", b"a", b"b", b"c"], Expect::Int(3)),
+                s(&[b"LMOVE", b"{lm}s", b"{lm}d", b"RIGHT", b"LEFT"], Expect::Str(b"c")),
+                s(&[b"LMOVE", b"{lm}s", b"{lm}d", b"left", b"right"], Expect::Str(b"a")),
+                s(
+                    &[b"LRANGE", b"{lm}d", b"0", b"-1"],
+                    Expect::Arr(vec![Expect::Str(b"c"), Expect::Str(b"a")]),
+                ),
+                s(&[b"RPOPLPUSH", b"{lm}s", b"{lm}d"], Expect::Str(b"b")),
+                s(
+                    &[b"LRANGE", b"{lm}d", b"0", b"-1"],
+                    Expect::Arr(vec![Expect::Str(b"b"), Expect::Str(b"c"), Expect::Str(b"a")]),
+                ),
+                s(&[b"EXISTS", b"{lm}s"], Expect::Int(0)),
+                s(&[b"RPOPLPUSH", b"{lm}s", b"{lm}d"], Expect::Nil),
+                // One list: a rotation.
+                s(&[b"RPOPLPUSH", b"{lm}d", b"{lm}d"], Expect::Str(b"a")),
+                s(
+                    &[b"LRANGE", b"{lm}d", b"0", b"-1"],
+                    Expect::Arr(vec![Expect::Str(b"a"), Expect::Str(b"b"), Expect::Str(b"c")]),
+                ),
+                s(&[b"LMOVE", b"{lm}d", b"{lm}d", b"LEFT", b"RIGHT"], Expect::Str(b"a")),
+                s(
+                    &[b"LRANGE", b"{lm}d", b"0", b"-1"],
+                    Expect::Arr(vec![Expect::Str(b"b"), Expect::Str(b"c"), Expect::Str(b"a")]),
+                ),
+                // A destination of another type is refused before anything
+                // moves; a missing source answers nil whatever the destination.
+                s(&[b"SET", b"{lm}str", b"x"], Expect::Ok),
+                s(&[b"LMOVE", b"{lm}d", b"{lm}str", b"LEFT", b"LEFT"], Expect::AnyError),
+                s(&[b"LLEN", b"{lm}d"], Expect::Int(3)),
+                s(&[b"LMOVE", b"{lm}none", b"{lm}str", b"LEFT", b"LEFT"], Expect::Nil),
+                s(&[b"RPOPLPUSH", b"{lm}str", b"{lm}d"], Expect::AnyError),
+                s(&[b"LMOVE", b"{lm}d", b"{lm}d", b"UP", b"LEFT"], Expect::AnyError),
+                s(&[b"LMOVE", b"{lm}d", b"{lm}d"], Expect::AnyError),
+            ],
+        },
+        Case {
+            family: "hashes",
+            name: "hincrbyfloat adds to a field and answers the new value",
+            // BUG-0187: unknown before; rq keeps a job's timings with it.
+            steps: vec![
+                s(&[b"HINCRBYFLOAT", b"{hf}h", b"f", b"10.5"], Expect::Str(b"10.5")),
+                s(&[b"HINCRBYFLOAT", b"{hf}h", b"f", b"0.25"], Expect::Str(b"10.75")),
+                s(&[b"HINCRBYFLOAT", b"{hf}h", b"f", b"-0.75"], Expect::Str(b"10")),
+                s(&[b"HINCRBYFLOAT", b"{hf}h", b"f", b"5.0e3"], Expect::Str(b"5010")),
+                s(&[b"HGET", b"{hf}h", b"f"], Expect::Str(b"5010")),
+                s(&[b"HSET", b"{hf}h", b"g", b"abc"], Expect::Int(1)),
+                s(&[b"HINCRBYFLOAT", b"{hf}h", b"g", b"1"], Expect::Err("ERR hash value is not a float")),
+                s(&[b"HINCRBYFLOAT", b"{hf}h", b"f", b"x"], Expect::Err("ERR value is not a valid float")),
+                s(&[b"HINCRBYFLOAT", b"{hf}h", b"f", b"inf"], Expect::Err("ERR value is NaN or Infinity")),
+                s(&[b"HINCRBYFLOAT", b"{hf}h", b"f", b"-inf"], Expect::Err("ERR value is NaN or Infinity")),
+                s(&[b"HINCRBYFLOAT", b"{hf}h", b"f"], Expect::AnyError),
+                s(&[b"SET", b"{hf}s", b"1"], Expect::Ok),
+                s(&[b"HINCRBYFLOAT", b"{hf}s", b"f", b"1"], Expect::AnyError),
+            ],
+        },
+        Case {
             family: "hashes",
             name: "hmset sets fields and answers OK",
             // BUG-0182: HMSET was unknown, and Spring Session and ASP.NET
@@ -2356,6 +2418,33 @@ fn corpus() -> Vec<Case> {
                         Expect::Str(b"c"),
                         Expect::Str(b"d"),
                         Expect::Str(b"e"),
+                    ]),
+                ),
+            ],
+        },
+        Case {
+            family: "zsets",
+            name: "a score spelled past a double's range is not a float",
+            // strtod reports ERANGE for these and Valkey refuses them; Rust's
+            // parser rounded them to inf and 0 and stored the member. Scores
+            // parse as a double on every platform, unlike INCRBYFLOAT's long
+            // double, so the reference answer does not depend on the oracle.
+            steps: vec![
+                s(&[b"ZADD", b"zr", b"1e400", b"m"], Expect::Err("ERR value is not a valid float")),
+                s(&[b"ZADD", b"zr", b"-1e400", b"m"], Expect::Err("ERR value is not a valid float")),
+                s(&[b"ZADD", b"zr", b"1e-400", b"m"], Expect::Err("ERR value is not a valid float")),
+                s(&[b"ZINCRBY", b"zr", b"1e400", b"m"], Expect::Err("ERR value is not a valid float")),
+                s(&[b"EXISTS", b"zr"], Expect::Int(0)),
+                s(&[b"ZADD", b"zr", b"0.000e-400", b"zero", b"inf", b"top", b"-Infinity", b"bottom"], Expect::Int(3)),
+                s(
+                    &[b"ZRANGE", b"zr", b"0", b"-1", b"WITHSCORES"],
+                    Expect::Arr(vec![
+                        Expect::Str(b"bottom"),
+                        Expect::Str(b"-inf"),
+                        Expect::Str(b"zero"),
+                        Expect::Str(b"0"),
+                        Expect::Str(b"top"),
+                        Expect::Str(b"inf"),
                     ]),
                 ),
             ],

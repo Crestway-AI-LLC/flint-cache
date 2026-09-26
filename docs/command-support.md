@@ -178,7 +178,7 @@ APPEND, STRLEN, GETRANGE, SETRANGE, INCR, DECR, INCRBY, DECRBY,
 INCRBYFLOAT.
 
 **Hashes**: HSET, HMSET, HSETNX, HGET, HMGET, HGETALL, HKEYS, HVALS, HDEL, HLEN,
-HEXISTS, HINCRBY, HSTRLEN, HSCAN (MATCH, COUNT, NOVALUES).
+HEXISTS, HINCRBY, HINCRBYFLOAT, HSTRLEN, HSCAN (MATCH, COUNT, NOVALUES).
 
 > HKEYS and HVALS were implemented and served from the first release and
 > were missing from this list until 2026-09-05, so the matrix under-reported
@@ -204,7 +204,12 @@ SINTERSTORE, SUNIONSTORE, SDIFFSTORE.
 > not ours.
 
 **Lists**: LPUSH, RPUSH, LPOP, RPOP, LLEN, LRANGE, LINDEX, LSET, LTRIM,
-LREM, LINSERT, LPOS (RANK, COUNT, MAXLEN).
+LREM, LINSERT, LPOS (RANK, COUNT, MAXLEN), LMOVE, RPOPLPUSH.
+
+> LMOVE and RPOPLPUSH are **same-slot only**, like the set operations:
+> colocate source and destination with a hash tag or the move is refused
+> with `CROSSSLOT`. Their blocking forms, BLMOVE and BRPOPLPUSH, are not
+> served.
 
 **Sorted sets**: ZADD, ZSCORE, ZMSCORE, ZINCRBY, ZREM, ZCARD, ZRANGE,
 ZREVRANGE, ZRANGEBYSCORE, ZREVRANGEBYSCORE (WITHSCORES, LIMIT, exclusive
@@ -335,7 +340,7 @@ a `dict`, a `set`, and a `float` without post-processing. RESP2 keeps the
 flattened spellings it always had, byte for byte.
 
 Worth knowing because the obvious guess is wrong: `HSCAN`/`SSCAN`/`ZSCAN`,
-`SRANDMEMBER`, `SMISMEMBER`, `SCAN`, `LPOS`, and `INCRBYFLOAT` are
+`SRANDMEMBER`, `SMISMEMBER`, `SCAN`, `LPOS`, `INCRBYFLOAT`, and `HINCRBYFLOAT` are
 identical in both protocols — scan cursors still carry string scores. The
 shapes here were captured off the wire from a real Redis 8.2 rather than
 read off a spec, and `flint-conformance --proto 3` runs the whole corpus
@@ -425,7 +430,8 @@ the write; ours says why.
   subkey envelope frames key length in two bytes) or set `0` for the
   ceiling alone. Values stay at Redis's own 512 MB
   (`--max-value-bytes`).
-- **INCRBYFLOAT** formats like Redis (`%.17f`, trailing zeros trimmed).
+- **INCRBYFLOAT** and **HINCRBYFLOAT** format like Redis (`%.17f`,
+  trailing zeros trimmed).
 - **Expiry is lazy + swept**: an expired key reads as missing immediately;
   physical reclamation is background.
 - **Cluster is invisible**: clients never see `-MOVED`/`-ASK`; the proxy

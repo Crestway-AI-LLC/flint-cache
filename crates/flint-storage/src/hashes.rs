@@ -191,6 +191,33 @@ impl<'a> HashStore<'a> {
         Ok(next)
     }
 
+    /// HINCRBYFLOAT: the field must hold a float string; creates key/field
+    /// at 0. Returns the stored representation, spelled as INCRBYFLOAT
+    /// spells it (`strings::fmt_float_human`).
+    pub fn hincr_by_float(
+        &self,
+        slot: u16,
+        key: &[u8],
+        field: &[u8],
+        delta: f64,
+    ) -> Result<Vec<u8>, StoreError> {
+        let current = match self.hget(slot, key, field)? {
+            None => 0f64,
+            Some(raw) => std::str::from_utf8(&raw)
+                .ok()
+                .and_then(|s| s.parse::<f64>().ok())
+                .filter(|v| !v.is_nan())
+                .ok_or(StoreError::NotFloat)?,
+        };
+        let next = current + delta;
+        if !next.is_finite() {
+            return Err(StoreError::NanOrInfinity);
+        }
+        let repr = crate::strings::fmt_float_human(next);
+        self.hset(slot, key, &[(field.to_vec(), repr.clone())])?;
+        Ok(repr)
+    }
+
     pub fn hlen(&self, slot: u16, key: &[u8]) -> Result<u64, StoreError> {
         Ok(self.read_meta(slot, key)?.map_or(0, |m| m.size as u64))
     }

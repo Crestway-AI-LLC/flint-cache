@@ -4900,6 +4900,28 @@ fn apply_inline(store: &dyn Kv, ops: &[(Vec<u8>, Option<Vec<u8>>)]) {
     }
 }
 
+/// Whether a write must exclude EVERY writer rather than its key's: any write
+/// to more than one key, as `write_lock` requires. `command_key` names one
+/// key, and a second key written under only the first's stripe can
+/// interleave with that second key's own writers: a RENAME of a hash could
+/// leave the destination with the wrong field count and a lost value
+/// (BUG-0188). `name` is upper-cased.
+///
+/// - MSET of more than one pair; DEL / UNLINK of more than one key;
+/// - RENAME, RENAMENX, COPY, LMOVE, RPOPLPUSH, when source and destination
+///   differ (the same key is one key);
+/// - a script declaring more than one key (ADR-0051).
+fn locks_every_writer(name: &[u8], args: &[Vec<u8>]) -> bool {
+    let two_keys = || args.len() > 2 && args[1] != args[2];
+    match name {
+        b"MSET" => args.len() > 3,
+        b"DEL" | b"UNLINK" => args.len() > 2,
+        b"RENAME" | b"RENAMENX" | b"COPY" | b"LMOVE" | b"RPOPLPUSH" => two_keys(),
+        b"EVAL" | b"EVALSHA" => flint_commands::eval_keys(args).is_some_and(|k| k.len() > 1),
+        _ => false,
+    }
+}
+
 /// A write that reads NOTHING, and may therefore take its stripe in shared
 /// mode (ADR-0027).
 ///
@@ -5638,19 +5660,9 @@ fn execute(
             .first()
             .map(|n| n.to_ascii_uppercase())
             .unwrap_or_default();
-        // A script locks what it declares (ADR-0051): one key, that key's
-        // stripe; several, every writer, as any multi-key write does; none,
-        // nothing, because a script that declares no key can write none.
+        // A script that declares no key can write none (ADR-0051).
         let script = name == b"EVAL" || name == b"EVALSHA";
-        let script_keys = if script {
-            flint_commands::eval_keys(args).map_or(0, |k| k.len())
-        } else {
-            0
-        };
-        let multi = (name == b"MSET" && args.len() > 3)
-            || ((name == b"DEL" || name == b"UNLINK") && args.len() > 2)
-            || script_keys > 1;
-        match (multi, commands::command_key(args)) {
+        match (locks_every_writer(&name, args), commands::command_key(args)) {
             (false, None) if script => None,
             // ADR-0027: a PURE write reads nothing, so it excludes the
             // read-modify-write writers of its key but not other pure writes.
@@ -9979,6 +9991,54 @@ mod probe_verdict_tests {
             classify_probe(Ok(Value::Integer(7))),
             ProbeVerdict::Refused(_)
         ));
+    }
+}
+
+/// BUG-0188: every write to more than one key excludes every writer.
+#[cfg(test)]
+mod every_writer_predicate {
+    use super::locks_every_writer;
+
+    fn a(parts: &[&str]) -> (Vec<u8>, Vec<Vec<u8>>) {
+        let args: Vec<Vec<u8>> = parts.iter().map(|p| p.as_bytes().to_vec()).collect();
+        (args[0].to_ascii_uppercase(), args)
+    }
+
+    #[test]
+    fn two_key_writes_lock_every_writer() {
+        for parts in [
+            &["RENAME", "{t}a", "{t}b"][..],
+            &["RENAMENX", "{t}a", "{t}b"],
+            &["COPY", "{t}a", "{t}b"],
+            &["COPY", "{t}a", "{t}b", "REPLACE"],
+            &["LMOVE", "{t}a", "{t}b", "LEFT", "RIGHT"],
+            &["RPOPLPUSH", "{t}a", "{t}b"],
+            &["MSET", "a", "1", "b", "2"],
+            &["DEL", "a", "b"],
+            &["UNLINK", "a", "b"],
+            &["EVAL", "return 1", "2", "{t}a", "{t}b"],
+        ] {
+            let (name, args) = a(parts);
+            assert!(locks_every_writer(&name, &args), "{parts:?}");
+        }
+    }
+
+    #[test]
+    fn one_key_writes_lock_their_key() {
+        for parts in [
+            &["RENAME", "a", "a"][..],
+            &["RPOPLPUSH", "q", "q"],
+            &["LMOVE", "q", "q", "RIGHT", "LEFT"],
+            &["MSET", "a", "1"],
+            &["DEL", "a"],
+            &["SET", "a", "1"],
+            &["HSET", "h", "f", "v"],
+            &["EVAL", "return 1", "1", "a"],
+            &["EVAL", "return 1", "0"],
+        ] {
+            let (name, args) = a(parts);
+            assert!(!locks_every_writer(&name, &args), "{parts:?}");
+        }
     }
 }
 

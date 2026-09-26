@@ -77,11 +77,12 @@ CONCLUSION is wrong, which is the hazard in the next table, not this one.
 
 | Command | Hazard on retry |
 |---|---|
-| `INCR` `DECR` `INCRBY` `DECRBY` `INCRBYFLOAT` `HINCRBY` `ZINCRBY` `JSON.NUMINCRBY` | Double-counts. |
+| `INCR` `DECR` `INCRBY` `DECRBY` `INCRBYFLOAT` `HINCRBY` `HINCRBYFLOAT` `ZINCRBY` `JSON.NUMINCRBY` | Double-counts. |
 | `APPEND` `JSON.ARRAPPEND` | Double-appends. |
 | `LPUSH` `RPUSH` | Double-pushes. |
 | `LINSERT` | Double-inserts: `a b` becomes `a x x b`. |
 | `LPOP` `RPOP` `SPOP` `ZPOPMIN` `ZPOPMAX` | Destroys an EXTRA element — silent data loss. `SPOP` on `{a,b,c}` returns `c`, then the retry returns `b` and two members are gone. |
+| `LMOVE` `RPOPLPUSH` | Moves an EXTRA element. A worker taking one job from a queue takes two, and the reply names only the second, so the first sits in the destination list unclaimed. On one list (a rotation) it rotates twice. |
 | `LTRIM` `ZREMRANGEBYRANK` `LREM key <n≠0> m` | Position- or count-addressed, so the retry cuts a DIFFERENT set. `LTRIM 1 2` twice on `a b c d` leaves `c`. Also silent data loss. |
 | `SET … NX` `SETNX` `HSETNX` | If the first succeeded but the ack was lost, the retry sees the key present and returns 0/nil, so the caller wrongly believes it failed. The classic lock hazard. |
 | `GETDEL` | The first returns the value and the retry returns nil, so a retrying reader loses the only copy it was handed. |

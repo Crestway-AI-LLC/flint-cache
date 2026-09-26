@@ -374,7 +374,7 @@ impl<'a> StringStore<'a> {
 /// aarch64 `long double` IS `double`, so f64 reproduces the reference
 /// output bit-for-bit on this platform class — the conformance oracle
 /// referees.
-fn fmt_float_human(x: f64) -> Vec<u8> {
+pub fn fmt_float_human(x: f64) -> Vec<u8> {
     let mut s = format!("{x:.17}");
     if s.contains('.') {
         while s.ends_with('0') {
