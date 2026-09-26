@@ -229,3 +229,20 @@ Conformance is validated against Valkey continuously. Transactions
 v0: pub/sub, streams, Lua, blocking commands, and cross-slot multi-key
 operations, except `MGET`, `DEL`, `UNLINK` and `EXISTS`, which the proxy
 splits per slot or per pair (`docs/command-support.md`).
+
+### Frameworks
+
+Measured through the proxy with each framework's default settings.
+
+- **Rails** `RedisCacheStore`: works, `read_multi` included (ADR-0048).
+- **Django** `RedisCache`: `set_many` across slots is a transaction and is
+  refused. Write those keys one at a time, or colocate them with a
+  `KEY_FUNCTION` that adds one hash tag (every key then in one slot).
+  Everything else measured works, `get_many` across slots included
+  (ADR-0048).
+- **ASP.NET Core** `IDistributedCache`
+  (Microsoft.Extensions.Caching.StackExchangeRedis): use 9.0 or later. 8.0
+  writes with Lua, which Flint does not run.
+- **Spring Session**: set `spring.session.redis.namespace={spring}:session`
+  or use Spring Security's `migrateSession`, or login fails on a cross-slot
+  `RENAME` (`docs/command-support.md`, ADR-0049).

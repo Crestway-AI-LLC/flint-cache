@@ -85,6 +85,18 @@ DB 0), RENAME, RENAMENX.
 > path. Flint's subkey rows embed the user key, so there is no pointer to
 > re-aim: renaming a collection costs what copying it costs. Strings and
 > JSON documents are O(1), since their metadata row *is* the value.
+>
+> **Spring Session** renames its session key at every login
+> (`changeSessionId`, which is Spring Security's default protection against
+> session fixation). Old id and new id are in different slots, so the rename
+> is refused and the login fails (ADR-0049). Either configuration below,
+> both measured on Flint, makes login work:
+>
+> - `spring.session.redis.namespace={spring}:session`: one hash tag, so every
+>   session key is in one slot. Every session then lives on one pair.
+> - `sessionFixation(f -> f.migrateSession())` in Spring Security: a new
+>   session with the old one's attributes, and the old one deleted. No rename,
+>   sessions stay spread across the fleet, and the old id is dead after login.
 
 **Transactions**: MULTI, EXEC, DISCARD, WATCH, UNWATCH (same-slot).
 

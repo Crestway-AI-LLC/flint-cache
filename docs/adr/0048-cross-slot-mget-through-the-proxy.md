@@ -101,4 +101,6 @@ Django's `set_many` stays refused. Its fix is on the application side (a
   refused across slots.
 - A pair going down mid-call is covered at the unit level (an error from one
   group fails the call); no drill kills a pair under a split `MGET`.
-- Django's `get_many` is not claimed here; it was never measured on its own.
+- Django's `get_many`, measured 2026-09-25 (Django 4.2, default settings,
+  two-pair fleet): answers every key across slots, and leaves out a missing
+  one, as it does on Redis.

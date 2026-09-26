@@ -40,4 +40,6 @@ Spring Session's `changeSessionId`, which Spring Security calls at every login
 to prevent session fixation, sends `RENAME` from the old session key to the
 new one. They are in different slots, so it is refused with `CROSSSLOT`, and
 a login through Spring Session fails. Cross-slot `RENAME` is excluded by
-design, so changing that is a design decision: ADR-0049.
+design, and ADR-0049 (accepted the same day) keeps it so: its contract is
+atomicity. Two configurations, both measured, make login work, and
+`command-support.md` and the tenant guide name them.
