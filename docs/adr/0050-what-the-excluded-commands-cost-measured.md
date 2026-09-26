@@ -3,7 +3,8 @@
 Status: **ACCEPTED 2026-09-26** (Jeff): Lua option C, `KEYS` option B,
 decision 3 as recommended. Built; see "As built" at the end. **Amended
 2026-09-26**: the lock libraries' scripts join the recognised set, and
-`python-redis-lock` is recorded as unsupportable; see the amendment.
+`python-redis-lock` is recorded as unsupportable; see the amendment. **Amended
+again 2026-09-26**: node `rate-limit-redis` 6.x's two scripts join the set.
 
 ## Context
 
@@ -171,3 +172,26 @@ and re-takes a lock on both pairs with node `redlock` 4.2.0 and 5.0.0-beta.2,
 `redsync` v4.18.0 (with and without `WithSetNXOnExtend`, and a second unlock
 reporting the lock expired) and Ruby `redlock` 2.1.0, each refusing a second
 holder.
+
+## Amendment 2026-09-26: `rate-limit-redis` 6.x
+
+Rate limiters were measured next (ADR-0051 records them all). One of them
+fits this record's condition and fails in a way that cannot wait for that
+one: node `rate-limit-redis` 6.0.1, express-rate-limit's Redis store, loads
+its two scripts with `SCRIPT LOAD` when the store is constructed, and on
+Flint the refusal became an unhandled promise rejection, which **ends the
+Node process** at startup.
+
+Its increment reads the key's `PTTL`; a new window (`PTTL <= 0`) is `SET` to
+1 with the window as its `PX`, answering `[1, window]`, and a live one is
+`INCR`ed, answering `[hits, pttl]`: one key, one write. Its get answers
+`[GET, PTTL]`, the same as Ruby `redlock`'s TTL lookup, and shares its
+handler. The increment text is 6.0.0's and 6.0.1's (the source strips each
+line's indent before hashing, so the SHA is of the stripped text); the get
+is unchanged from 4.1.0. The increments of 4.0.0 to 5.0.0 are `INCR` then
+`PEXPIRE`, two writes, and stay refused: a seat that stopped between them
+would leave a counter with no expiry, a client blocked for good.
+
+Verified as the others are: unit tests, a conformance case the Valkey oracle
+runs as Lua, and `client_compat_drill` counting hits through the store on
+both pairs, with no unhandled rejection.

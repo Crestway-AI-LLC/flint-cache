@@ -65,8 +65,8 @@ see below).
 > the namespace, which the proxy pins per connection.
 
 **Keyspace**: DEL, UNLINK, EXISTS, TYPE, EXPIRE, PEXPIRE, EXPIREAT,
-PEXPIREAT, TTL, PTTL, EXPIRETIME, PEXPIRETIME, PERSIST, COPY (REPLACE,
-DB 0), RENAME, RENAMENX.
+PEXPIREAT (each with NX, XX, GT, LT), TTL, PTTL, EXPIRETIME, PEXPIRETIME,
+PERSIST, COPY (REPLACE, DB 0), RENAME, RENAMENX.
 
 > COPY is **same-slot only**, for the same reason as the set operations: the
 > destination is written into the node's local rows, so a destination in a
@@ -476,7 +476,7 @@ the write; ours says why.
   these, open an issue describing the workload — patterns with broad
   demand get first-class implementations.
 
-- **Lua: the scripts of five libraries, recognised, and no Lua** (ADR-0050).
+- **Lua: the scripts of six libraries, recognised, and no Lua** (ADR-0050).
   `EVAL` and `EVALSHA` run these natively and atomically, recognised by SHA1
   as Redis names scripts:
 
@@ -487,6 +487,7 @@ the write; ours says why.
   | node `redlock` | acquire, extend, release | 4.2.0, 5.0.0-beta.1 and beta.2 |
   | Go `redsync` | extend (with or without `WithSetNXOnExtend`), release | v4.0.0 to v4.18.0 |
   | Ruby `redlock` | lock, unlock, the TTL lookup behind `locked?` | 2.1.0 |
+  | node `rate-limit-redis` (express-rate-limit's Redis store) | increment, get | 6.0.0 and 6.0.1 (its get from 4.1.0) |
 
   Each reads its one key and writes it at most once, under that key's write
   lock, so it is as atomic as the Lua it stands for. A script that names more
@@ -496,7 +497,11 @@ the write; ours says why.
   `EVALSHA` of an unknown SHA answers `NOSCRIPT`, which sends a client to
   `SCRIPT LOAD`, which refuses. Versions outside the table were not checked:
   one whose text differs is refused like any other script, never run as
-  something else.
+  something else. `rate-limit-redis` before 6.0.0 increments with two writes
+  (`INCR`, then `PEXPIRE`), which this rule excludes; use 6.x.
+- **Rate limiters that write more than once per script are refused**:
+  Python `limits` (Flask-Limiter, SlowAPI), Go `redis_rate` and node
+  `rate-limiter-flexible`. Running them is ADR-0051, a proposal.
 - **`python-redis-lock` does not work**, and recognising its scripts would
   not change that: every call names two keys in different slots (the lock and
   a signal list), its release writes both, and a blocking acquire waits on

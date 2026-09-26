@@ -70,8 +70,9 @@ pub fn command_key(args: &[Vec<u8>]) -> Option<&[u8]> {
 /// redis-py 4.5.5 to 7.0.1 (sync and asyncio) and django-redis 5.2.0 to 6.0.0,
 /// as read from their published wheels. The rest are the lock scripts of node
 /// `redlock` 4.2.0 and 5.0.0-beta, Go `redsync` v4.0.0 to v4.18.0 and Ruby
-/// `redlock` 2.1.0, captured on the wire and checked against the published
-/// packages (ADR-0050's amendment). Any other script is refused, as before.
+/// `redlock` 2.1.0, and the rate limiter scripts of node `rate-limit-redis`
+/// 6.x, captured on the wire and checked against the published packages
+/// (ADR-0050's amendments). Any other script is refused, as before.
 ///
 /// Each reads its one key and writes it at most once, so run inside the
 /// ordinary single-command dispatch, under the key's exclusive write lock
@@ -111,8 +112,13 @@ enum KnownScript {
     /// Ruby `redlock` lock: SET PX if the key is absent and `ARGV[3]` is "yes",
     /// or if it holds our token; SET's reply, else nil.
     RedlockRbLock,
-    /// Ruby `redlock` info: `[GET, PTTL]`.
-    RedlockRbInfo,
+    /// `[GET, PTTL]`: Ruby `redlock`'s TTL lookup, and `rate-limit-redis`'s
+    /// get.
+    GetAndPttl,
+    /// `rate-limit-redis` 6.x increment: a new window (PTTL <= 0) is SET to 1
+    /// with the window as its PX and answers `[1, window]`; otherwise INCR,
+    /// answering `[hits, pttl]`.
+    RateLimitRedisIncr,
 }
 
 const KNOWN_SCRIPTS: &[(&str, KnownScript)] = &[
@@ -190,7 +196,18 @@ const KNOWN_SCRIPTS: &[(&str, KnownScript)] = &[
     ),
     (
         "78d2ca48a6dc9ef6892059792a3a0c5237733d64",
-        KnownScript::RedlockRbInfo,
+        KnownScript::GetAndPttl,
+    ),
+    // node rate-limit-redis 6.0.0 and 6.0.1 (increment), and 4.1.0 on (get).
+    // Its 4.x and 5.0.0 increments write twice (INCR, then PEXPIRE) and are
+    // not recognised (ADR-0051).
+    (
+        "895b92e1712734e1b464999be23953485475357b",
+        KnownScript::RateLimitRedisIncr,
+    ),
+    (
+        "6aeb97ed6086dcdeafdc6fda3999a0d0e38ec96a",
+        KnownScript::GetAndPttl,
     ),
 ];
 
@@ -1442,12 +1459,33 @@ impl<'a> Dispatcher<'a> {
             },
             // `{ GET, PTTL }`: a missing key's GET is Lua false, which a
             // table carries through as a nil element.
-            KnownScript::RedlockRbInfo => match call(&[b"GET", key]) {
+            KnownScript::GetAndPttl => match call(&[b"GET", key]) {
                 e @ Value::Error(_) => e,
                 v => match call(&[b"PTTL", key]) {
                     e @ Value::Error(_) => e,
                     t => Value::Array(Some(vec![v, t])),
                 },
+            },
+            // `local windowMs = tonumber(ARGV[1])` is read only on the SET
+            // path, as in the Lua, where a window that is not a whole number
+            // is SET's error. The library sends `windowMs.toString()`; a
+            // number Lua would read and Rust would not ("6e4", hex) is
+            // refused here rather than guessed at.
+            KnownScript::RateLimitRedisIncr => match call(&[b"PTTL", key]) {
+                Value::Integer(t) if t <= 0 => {
+                    let Ok(window) = parse_i64(arg(0).trim_ascii()) else {
+                        return err("ERR value is not an integer or out of range");
+                    };
+                    match call(&[b"SET", key, b"1", b"PX", window.to_string().as_bytes()]) {
+                        e @ Value::Error(_) => e,
+                        _ => Value::Array(Some(vec![Value::Integer(1), Value::Integer(window)])),
+                    }
+                }
+                Value::Integer(t) => match call(&[b"INCR", key]) {
+                    e @ Value::Error(_) => e,
+                    hits => Value::Array(Some(vec![hits, Value::Integer(t)])),
+                },
+                e => e,
             },
         }
     }
@@ -3038,29 +3076,63 @@ impl<'a> Dispatcher<'a> {
     }
 
     fn cmd_expire(&self, args: &[Vec<u8>], name: &str, unit_ms: u64) -> Value {
-        exact(args, 3, name, |a| match parse_i64(&a[2]) {
+        if args.len() < 3 {
+            return arity_err(name);
+        }
+        let cond = match ExpireCond::parse(&args[3..]) {
+            Ok(c) => c,
+            Err(e) => return e,
+        };
+        match parse_i64(&args[2]) {
             Ok(n) => {
                 let delta = n.saturating_mul(unit_ms as i64);
+                let now = (self.clock)();
+                let when = (now as i64).saturating_add(delta);
                 let at = if delta <= 0 {
                     1 // already in the past → delete-on-touch semantics
                 } else {
-                    ((self.clock)()).saturating_add(delta as u64)
+                    now.saturating_add(delta as u64)
                 };
-                Value::Integer(self.keyspace.expire_at(slot_for_key(&a[1]), &a[1], at) as i64)
+                self.expire_if(&args[1], cond, when, at)
             }
             Err(_) => err("ERR value is not an integer or out of range"),
-        })
+        }
     }
 
     /// EXPIREAT/PEXPIREAT: the argument is an ABSOLUTE instant (s or ms).
     fn cmd_expire_at(&self, args: &[Vec<u8>], name: &str, unit_ms: u64) -> Value {
-        exact(args, 3, name, |a| match parse_i64(&a[2]) {
+        if args.len() < 3 {
+            return arity_err(name);
+        }
+        let cond = match ExpireCond::parse(&args[3..]) {
+            Ok(c) => c,
+            Err(e) => return e,
+        };
+        match parse_i64(&args[2]) {
             Ok(n) => {
-                let at = (n.saturating_mul(unit_ms as i64)).max(1) as u64;
-                Value::Integer(self.keyspace.expire_at(slot_for_key(&a[1]), &a[1], at) as i64)
+                let when = n.saturating_mul(unit_ms as i64);
+                self.expire_if(&args[1], cond, when, when.max(1) as u64)
             }
             Err(_) => err("ERR value is not an integer or out of range"),
-        })
+        }
+    }
+
+    /// Set `key` to expire at `at` if `cond` holds, comparing the requested
+    /// instant `when` (which may be in the past) against the key's current
+    /// expiry, as Redis does. 1 if the expiry was set (or the key deleted by
+    /// a past one), 0 if the key is missing or the condition failed. The read
+    /// and the write are one step: EXPIRE is not a pure write, so it holds
+    /// the key's exclusive lock.
+    fn expire_if(&self, key: &[u8], cond: ExpireCond, when: i64, at: u64) -> Value {
+        let slot = slot_for_key(key);
+        if cond != ExpireCond::default() {
+            match self.keyspace.expire_time_ms(slot, key) {
+                None => return Value::Integer(0),
+                Some(current) if !cond.holds(current, when) => return Value::Integer(0),
+                Some(_) => {}
+            }
+        }
+        Value::Integer(self.keyspace.expire_at(slot, key, at) as i64)
     }
 
     /// EXPIRETIME/PEXPIRETIME: the ABSOLUTE expiry (s or ms); -1 no expiry,
@@ -3311,6 +3383,62 @@ const NO_SUCH_KEY: &str = "ERR could not perform this operation on a key that do
 
 fn err(msg: &str) -> Value {
     Value::Error(msg.into())
+}
+
+/// The conditions Redis 7 added to EXPIRE, PEXPIRE, EXPIREAT and PEXPIREAT:
+/// set the expiry only if the key has none (NX), has one (XX), or the new
+/// one is later (GT) or earlier (LT) than the current. A key with no expiry
+/// counts as expiring never, so GT never applies to it and LT always does.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ExpireCond {
+    nx: bool,
+    xx: bool,
+    gt: bool,
+    lt: bool,
+}
+
+impl ExpireCond {
+    /// The options after the time, with upstream's errors and precedence:
+    /// an unknown option first, then the incompatible pairs.
+    fn parse(opts: &[Vec<u8>]) -> Result<Self, Value> {
+        let mut c = Self::default();
+        for o in opts {
+            match o.to_ascii_uppercase().as_slice() {
+                b"NX" => c.nx = true,
+                b"XX" => c.xx = true,
+                b"GT" => c.gt = true,
+                b"LT" => c.lt = true,
+                _ => {
+                    return Err(err(&format!(
+                        "ERR Unsupported option {}",
+                        String::from_utf8_lossy(o)
+                    )));
+                }
+            }
+        }
+        if c.nx && (c.xx || c.gt || c.lt) {
+            return Err(err(
+                "ERR NX and XX, GT or LT options at the same time are not compatible",
+            ));
+        }
+        if c.gt && c.lt {
+            return Err(err(
+                "ERR GT and LT options at the same time are not compatible",
+            ));
+        }
+        Ok(c)
+    }
+
+    /// Whether the new expiry `when` (absolute ms) may replace `current`
+    /// (absolute ms; 0 is no expiry, as the keyspace stores it).
+    fn holds(self, current: u64, when: i64) -> bool {
+        let persistent = current == 0;
+        let current = i64::try_from(current).unwrap_or(i64::MAX);
+        !(self.nx && !persistent
+            || self.xx && persistent
+            || self.gt && (persistent || when <= current)
+            || self.lt && !persistent && when >= current)
+    }
 }
 
 fn arity_err(cmd: &str) -> Value {
@@ -4039,6 +4167,11 @@ mod tests {
     const REDLOCK5_RELEASE: &str = "\n  local count = 0\n  for i, key in ipairs(KEYS) do\n    -- Only remove entries for *this* lock value.\n    if redis.call(\"get\", key) == ARGV[1] then\n      redis.pcall(\"del\", key)\n      count = count + 1\n    end\n  end\n\n  -- Return the number of entries removed.\n  return count\n";
     const REDSYNC_RELEASE_BEFORE_4_12: &str = "\n\tif redis.call(\"GET\", KEYS[1]) == ARGV[1] then\n\t\treturn redis.call(\"DEL\", KEYS[1])\n\telse\n\t\treturn 0\n\tend\n";
     const REDSYNC_EXTEND_SETNX: &str = "\n\tif redis.call(\"GET\", KEYS[1]) == ARGV[1] then\n\t\treturn redis.call(\"PEXPIRE\", KEYS[1], ARGV[2])\n\telseif redis.call(\"SET\", KEYS[1], ARGV[1], \"PX\", ARGV[2], \"NX\") then\n\t\treturn 1\n\telse\n\t\treturn 0\n\tend\n";
+    // node rate-limit-redis 6.0.1, as sent (the source strips each line's
+    // indent), and 5.0.0's increment, which writes twice and is refused.
+    const RATE_LIMIT_REDIS_INCR: &str = "local windowMs = tonumber(ARGV[1])\nlocal timeToExpire = redis.call(\"PTTL\", KEYS[1])\nif timeToExpire <= 0 then\nredis.call(\"SET\", KEYS[1], 1, \"PX\", windowMs)\nreturn { 1, windowMs }\nend\nlocal totalHits = redis.call(\"INCR\", KEYS[1])        \nreturn { totalHits, timeToExpire }";
+    const RATE_LIMIT_REDIS_GET: &str = "local totalHits = redis.call(\"GET\", KEYS[1])\nlocal timeToExpire = redis.call(\"PTTL\", KEYS[1])\nreturn { totalHits, timeToExpire }";
+    const RATE_LIMIT_REDIS_5_INCR: &str = "local windowMs = tonumber(ARGV[2])\nlocal resetOnChange = ARGV[1] == \"1\"\nlocal timeToExpire = redis.call(\"PTTL\", KEYS[1])\nif timeToExpire <= 0 then\nredis.call(\"SET\", KEYS[1], 1, \"PX\", windowMs)\nreturn { 1, windowMs }\nend\nlocal totalHits = redis.call(\"INCR\", KEYS[1])\nif resetOnChange then\nredis.call(\"PEXPIRE\", KEYS[1], windowMs)\ntimeToExpire = windowMs\nend\nreturn { totalHits, timeToExpire }";
 
     fn ev(s: &MemKv, parts: &[&str]) -> Value {
         call(s, &parts.iter().map(|p| p.as_bytes()).collect::<Vec<_>>())
@@ -4064,7 +4197,9 @@ mod tests {
             (REDLOCK5_RELEASE, KnownScript::RedlockRelease),
             (REDSYNC_RELEASE_BEFORE_4_12, KnownScript::DelIfHeld),
             (REDSYNC_EXTEND_SETNX, KnownScript::RedsyncExtendSetNx),
-            (REDLOCK_RB_INFO, KnownScript::RedlockRbInfo),
+            (REDLOCK_RB_INFO, KnownScript::GetAndPttl),
+            (RATE_LIMIT_REDIS_INCR, KnownScript::RateLimitRedisIncr),
+            (RATE_LIMIT_REDIS_GET, KnownScript::GetAndPttl),
         ] {
             assert_eq!(
                 known_script(&flint_tls::sha1_hex(text.as_bytes())),
@@ -4072,8 +4207,13 @@ mod tests {
             );
         }
         // python-redis-lock's scripts are not recognised: each is sent with
-        // two keys, and its release writes both (ADR-0050's amendment).
-        for text in [PY_REDIS_LOCK_EXTEND, PY_REDIS_LOCK_RELEASE] {
+        // two keys, and its release writes both (ADR-0050's amendment). Nor
+        // is rate-limit-redis 5.0.0's increment: INCR, then PEXPIRE.
+        for text in [
+            PY_REDIS_LOCK_EXTEND,
+            PY_REDIS_LOCK_RELEASE,
+            RATE_LIMIT_REDIS_5_INCR,
+        ] {
             assert_eq!(known_script(&flint_tls::sha1_hex(text.as_bytes())), None);
         }
     }
@@ -4290,6 +4430,121 @@ mod tests {
         assert!(
             matches!(ev(&s, &["EVAL", REDLOCK_RB_LOCK, "1", "h", "tok", "10000", "yes"]), Value::Error(e) if e.starts_with("WRONGTYPE"))
         );
+    }
+
+    /// rate-limit-redis 6.x: a new window is SET with the window as its TTL
+    /// and answers `[1, window]`; a live one counts up and answers the TTL
+    /// left; the get answers `[hits, pttl]`, a nil count for no window.
+    #[test]
+    fn rate_limit_redis_scripts_do_what_the_lua_does() {
+        let s = MemKv::new();
+        let hit = |s: &MemKv| ev(s, &["EVAL", RATE_LIMIT_REDIS_INCR, "1", "rl:ip", "60000"]);
+        assert_eq!(
+            hit(&s),
+            Value::Array(Some(vec![Value::Integer(1), Value::Integer(60000)]))
+        );
+        assert!((59_000..=60_000).contains(&pttl(&s, "rl:ip")));
+        let Value::Array(Some(second)) = hit(&s) else {
+            panic!("second hit")
+        };
+        assert_eq!(second[0], Value::Integer(2));
+        assert!(matches!(second[1], Value::Integer(t) if (59_000..=60_000).contains(&t)));
+        let Value::Array(Some(got)) = ev(&s, &["EVAL", RATE_LIMIT_REDIS_GET, "1", "rl:ip"]) else {
+            panic!("get")
+        };
+        assert_eq!(got[0], Value::Bulk(Some(b"2".to_vec())));
+        assert_eq!(
+            ev(&s, &["EVAL", RATE_LIMIT_REDIS_GET, "1", "rl:none"]),
+            Value::Array(Some(vec![Value::Bulk(None), Value::Integer(-2)]))
+        );
+        // A key with no TTL is a new window, as `PTTL <= 0` makes it.
+        ev(&s, &["SET", "rl:bare", "7"]);
+        assert_eq!(
+            ev(&s, &["EVAL", RATE_LIMIT_REDIS_INCR, "1", "rl:bare", "1000"]),
+            Value::Array(Some(vec![Value::Integer(1), Value::Integer(1000)]))
+        );
+        // The window is read only when a window is opened, as in the Lua:
+        // a live window counts whatever it is sent.
+        let Value::Array(Some(live)) =
+            ev(&s, &["EVAL", RATE_LIMIT_REDIS_INCR, "1", "rl:ip", "soon"])
+        else {
+            panic!("live")
+        };
+        assert_eq!(live[0], Value::Integer(3));
+        assert!(matches!(
+            ev(&s, &["EVAL", RATE_LIMIT_REDIS_INCR, "1", "rl:new", "1.5"]),
+            Value::Error(_)
+        ));
+        assert_eq!(ev(&s, &["EXISTS", "rl:new"]), Value::Integer(0));
+    }
+
+    /// Redis 7's EXPIRE conditions (BUG-0185), on all four commands: a key
+    /// with no expiry counts as never expiring, a missing key answers 0, and
+    /// the options are checked before the number, with upstream's errors.
+    #[test]
+    fn expire_conditions_do_what_redis_7_does() {
+        let s = MemKv::new();
+        let int = Value::Integer;
+        let ttl = |s: &MemKv, k: &str| {
+            let Value::Integer(t) = ev(s, &["TTL", k]) else {
+                panic!("TTL {k}")
+            };
+            t
+        };
+        ev(&s, &["SET", "k", "v"]);
+        assert_eq!(ev(&s, &["EXPIRE", "k", "100", "XX"]), int(0), "no TTL: XX");
+        assert_eq!(
+            ev(&s, &["EXPIRE", "k", "100", "GT"]),
+            int(0),
+            "no TTL is never: GT"
+        );
+        assert_eq!(ttl(&s, "k"), -1);
+        assert_eq!(ev(&s, &["EXPIRE", "k", "100", "NX"]), int(1));
+        assert_eq!(
+            ev(&s, &["EXPIRE", "k", "200", "NX"]),
+            int(0),
+            "has a TTL: NX"
+        );
+        assert_eq!(ev(&s, &["EXPIRE", "k", "50", "GT"]), int(0));
+        assert!((99..=100).contains(&ttl(&s, "k")));
+        assert_eq!(ev(&s, &["EXPIRE", "k", "200", "gt"]), int(1), "any case");
+        assert!((199..=200).contains(&ttl(&s, "k")));
+        assert_eq!(ev(&s, &["EXPIRE", "k", "300", "LT"]), int(0));
+        assert_eq!(ev(&s, &["PEXPIRE", "k", "50000", "XX", "LT"]), int(1));
+        assert!((49..=50).contains(&ttl(&s, "k")));
+        // LT applies to a key with no expiry.
+        ev(&s, &["SET", "p", "v"]);
+        assert_eq!(ev(&s, &["EXPIRE", "p", "100", "LT"]), int(1));
+        // The absolute forms carry them too.
+        ev(&s, &["SET", "a", "v"]);
+        assert_eq!(ev(&s, &["EXPIREAT", "a", "9999999999", "NX"]), int(1));
+        assert_eq!(ev(&s, &["EXPIREAT", "a", "9999999998", "GT"]), int(0));
+        assert_eq!(ev(&s, &["PEXPIREAT", "a", "9999999999500", "GT"]), int(1));
+        assert_eq!(ev(&s, &["PEXPIRETIME", "a"]), int(9_999_999_999_500));
+        assert_eq!(ev(&s, &["EXPIRE", "nokey", "10", "NX"]), int(0), "missing");
+        // A past expiry that meets its condition deletes, as one without does.
+        ev(&s, &["SET", "d", "v"]);
+        assert_eq!(ev(&s, &["EXPIRE", "d", "-1", "LT"]), int(1));
+        assert_eq!(ev(&s, &["EXISTS", "d"]), int(0));
+        let refused = |parts: &[&str], why: &str| {
+            assert!(
+                matches!(ev(&s, parts), Value::Error(ref e) if e.contains(why)),
+                "{parts:?}: {:?}",
+                ev(&s, parts)
+            );
+        };
+        refused(&["EXPIRE", "k", "10", "NX", "XX"], "NX and XX, GT or LT");
+        refused(&["EXPIRE", "k", "10", "NX", "GT"], "NX and XX, GT or LT");
+        refused(&["EXPIRE", "k", "10", "GT", "LT"], "GT and LT options");
+        refused(&["EXPIRE", "k", "10", "BOGUS"], "Unsupported option BOGUS");
+        refused(
+            &["EXPIRE", "k", "soon", "BOGUS"],
+            "Unsupported option BOGUS",
+        );
+        refused(&["EXPIRE", "k", "soon", "NX"], "not an integer");
+        refused(&["EXPIRE", "k"], "wrong number");
+        refused(&["EXPIREAT", "k"], "wrong number");
+        assert!((49..=50).contains(&ttl(&s, "k")), "no refusal touched it");
     }
 
     /// redis-py's Lock, end to end: release only with the token, extend by

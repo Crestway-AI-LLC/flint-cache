@@ -389,6 +389,19 @@ def keys_everywhere():
     assert got == sorted(names), f"KEYS kp:* -> {len(got)} keys"
     assert r.keys("kp:nomatch*") == [], "no match is an empty list"
 check("KEYS answers every matching key, on both pairs", keys_everywhere)
+def expire_conditions():
+    # BUG-0185: Redis 7's NX, XX, GT and LT were an arity error. Rails sends
+    # EXPIRE ... NX to any server reporting Redis 7; redis-py sends them all.
+    r.set("ex:k", "v")
+    assert r.expire("ex:k", 100, xx=True) is False, "XX without a TTL"
+    assert r.expire("ex:k", 100, nx=True) is True, "NX without a TTL"
+    assert r.expire("ex:k", 200, nx=True) is False, "NX with a TTL"
+    assert r.expire("ex:k", 50, gt=True) is False, "GT to an earlier time"
+    assert r.pexpire("ex:k", 300000, gt=True) is True, "GT to a later time"
+    assert r.expireat("ex:k", 9999999999, lt=True) is False, "LT to a later time"
+    assert 295 <= r.ttl("ex:k") <= 300, f"TTL {r.ttl('ex:k')}"
+    r.delete("ex:k")
+check("EXPIRE's Redis 7 conditions NX, XX, GT, LT", expire_conditions)
 
 print("== commands we exclude by design still fail HONESTLY")
 check("SUBSCRIBE", lambda: r.pubsub().subscribe("c") or r.execute_command("SUBSCRIBE", "c"),
@@ -421,7 +434,7 @@ RAN="redis-py"; SKIPPED=""
 NODE=${FLINT_COMPAT_NODE:-$(command -v node || true)}
 if [ -z "$NODE" ]; then
   echo "== node-redis: SKIP (no node on PATH)"
-  SKIPPED="$SKIPPED node-redis ioredis node-redlock"
+  SKIPPED="$SKIPPED node-redis ioredis node-redlock rate-limit-redis"
 else
   NODE_DIR=${FLINT_COMPAT_NODE_DIR:-$FLINT_DRILL_ROOT/flint-compat-node}
   mkdir -p "$NODE_DIR"
@@ -630,6 +643,9 @@ JS
   if [ -d "$NODE_DIR/node_modules/ioredis" ] && [ ! -d "$NODE_DIR/node_modules/redlock5" ]; then
     (cd "$NODE_DIR" && npm install redlock4@npm:redlock@4.2.0 redlock5@npm:redlock@5.0.0-beta.2 --silent >/dev/null 2>&1)
   fi
+  if [ -d "$NODE_DIR/node_modules/redis" ] && [ ! -d "$NODE_DIR/node_modules/rate-limit-redis" ]; then
+    (cd "$NODE_DIR" && npm install rate-limit-redis@6.0.1 express-rate-limit@8 --silent >/dev/null 2>&1)
+  fi
   if [ ! -d "$NODE_DIR/node_modules/redlock4" ] || [ ! -d "$NODE_DIR/node_modules/redlock5" ]; then
     echo "== node redlock: SKIP (could not install; offline?)"
     SKIPPED="$SKIPPED node-redlock"
@@ -685,6 +701,68 @@ JS
     (cd "$NODE_DIR" && FLINT_PORT=$PORT FLINT_TOKEN=tok-acme "$NODE" redlock.js)
     [ $? -eq 0 ] || { echo "FAIL: node redlock compatibility"; exit 1; }
     RAN="$RAN, node redlock"
+  fi
+
+  # -------------------------------------------------------------------------
+  # rate-limit-redis 6.0.1, express-rate-limit's Redis store (ADR-0050's
+  # second amendment). It loads its scripts when constructed, and on Flint
+  # the refusal was an unhandled rejection that ENDED THE PROCESS. So the
+  # check is also that no rejection goes unhandled, on node-redis, keys on
+  # both pairs.
+  # -------------------------------------------------------------------------
+  if [ ! -d "$NODE_DIR/node_modules/rate-limit-redis" ]; then
+    echo "== rate-limit-redis: SKIP (could not install; offline?)"
+    SKIPPED="$SKIPPED rate-limit-redis"
+  else
+    echo "== client: rate-limit-redis $("$NODE" -e "console.log(JSON.parse(require('fs').readFileSync('$NODE_DIR/node_modules/rate-limit-redis/package.json','utf8')).version)"), on node-redis"
+    cat > "$NODE_DIR/ratelimit.mjs" <<'JS'
+import { createClient } from 'redis';
+import { RedisStore } from 'rate-limit-redis';
+const fails = [];
+const say = (ok, name, note) => {
+  console.log(`  ${ok ? "ok " : "FAIL"} ${name}${note && !ok ? "  " + note : ""}`);
+  if (!ok) fails.push(name);
+};
+const unhandled = [];
+process.on("unhandledRejection", (e) => unhandled.push(String(e?.message ?? e)));
+const c = createClient({ socket: { host: "127.0.0.1", port: Number(process.env.FLINT_PORT) },
+                         password: process.env.FLINT_TOKEN });
+await c.connect();
+// An empty prefix, so the keys are a and b, which are on the two pairs.
+const store = new RedisStore({ sendCommand: (...args) => c.sendCommand(args), prefix: "" });
+store.init({ windowMs: 60000 });
+for (const k of ["a", "b"]) {
+  try {
+    await c.del(k);
+    const hits = [];
+    let reset;
+    for (let i = 0; i < 3; i++) {
+      const r = await store.increment(k);
+      hits.push(r.totalHits);
+      reset = r.resetTime;
+    }
+    say(JSON.stringify(hits) === "[1,2,3]", `${k}: increment counts`, JSON.stringify(hits));
+    const left = reset.getTime() - Date.now();
+    say(left > 55000 && left <= 60000, `${k}: the window's reset time`, `${left} ms`);
+    await store.decrement(k);
+    const got = await store.get(k);
+    say(got?.totalHits === 2, `${k}: decrement, then get`, JSON.stringify(got));
+    await store.resetKey(k);
+    say((await c.exists(k)) === 0, `${k}: resetKey removes the window`);
+  } catch (e) { say(false, `${k}: store`, e.message); }
+}
+await new Promise((res) => setTimeout(res, 200));
+say(unhandled.length === 0, "no unhandled rejection (the refusal used to end the process)", unhandled.join("; "));
+await c.quit();
+if (fails.length) {
+  console.log(`\nFAIL: ${fails.length} client-visible problem(s): ${fails.join(", ")}`);
+  process.exit(1);
+}
+console.log("\nall rate-limit-redis checks passed");
+JS
+    (cd "$NODE_DIR" && FLINT_PORT=$PORT FLINT_TOKEN=tok-acme "$NODE" ratelimit.mjs)
+    [ $? -eq 0 ] || { echo "FAIL: rate-limit-redis compatibility"; exit 1; }
+    RAN="$RAN, rate-limit-redis"
   fi
 fi
 

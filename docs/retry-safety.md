@@ -55,7 +55,7 @@ Three corollaries, each measured rather than assumed:
 `FLUSHALL` · `FLUSHDB` · `PERSIST` · `COPY … REPLACE`
 
 **Absolute expiry**: `SETEX` · `SET … EXAT`/`PXAT` · `EXPIREAT` ·
-`PEXPIREAT` · `GETEX EXAT`/`PXAT`/`PERSIST`
+`PEXPIREAT` (plain, or `XX`) · `GETEX EXAT`/`PXAT`/`PERSIST`
 
 **Collections**: `HSET` · `HMSET` · `HDEL` · `SADD` · `SREM` · `ZADD` · `ZREM` ·
 `LSET` (absolute index, absolute value) · `LREM key 0 m` ·
@@ -89,6 +89,7 @@ CONCLUSION is wrong, which is the hazard in the next table, not this one.
 | `RENAME` `RENAMENX` | The retry answers `ERR no such key` — the source moved on the first attempt. The rename SUCCEEDED and the caller sees an error. |
 | `BF.RESERVE` | The retry answers `ERR item exists`, same shape: created, reported as failed. |
 | `EVAL` `EVALSHA` (the recognised scripts, ADR-0050) | Each is what it wraps. A lock release that succeeded answers 0 on the retry (redsync's answers -1, "already expired"), so the caller is told it did not hold the lock; a node `redlock` acquire that succeeded answers 0, the `SET NX` hazard: the caller is told someone else holds it; an extend that adds to the TTL adds twice; django-redis's `incr` double-counts. |
+| `EXPIRE` `PEXPIRE` `EXPIREAT` `PEXPIREAT` with `NX`, `GT` or `LT` | The retry meets the expiry the first call set: `NX` finds one, and `GT` and `LT` find the new instant no later, or no earlier, than itself. It answers 0: the expiry was set, and the caller is told it was not. |
 | `EXPIRE` `PEXPIRE` `SET … EX/PX` `GETEX EX/PX` (relative TTL) | Retry recomputes from a later clock, extending the TTL. Use the absolute `EXPIREAT`/`PEXPIREAT`/`EXAT`/`PXAT` forms for retry safety. |
 
 Note the shape shared by the last five rows: **the write landed and the retry

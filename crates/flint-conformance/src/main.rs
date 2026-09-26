@@ -145,6 +145,9 @@ const REDLOCK_RB_INFO: &[u8] =
 const REDLOCK5_ACQUIRE: &[u8] = "\n  -- Return 0 if an entry already exists.\n  for i, key in ipairs(KEYS) do\n    if redis.call(\"exists\", key) == 1 then\n      return 0\n    end\n  end\n\n  -- Create an entry for each provided key.\n  for i, key in ipairs(KEYS) do\n    redis.call(\"set\", key, ARGV[1], \"PX\", ARGV[2])\n  end\n\n  -- Return the number of entries added.\n  return #KEYS\n".as_bytes();
 const REDSYNC_RELEASE_BEFORE_4_12: &[u8] = "\n\tif redis.call(\"GET\", KEYS[1]) == ARGV[1] then\n\t\treturn redis.call(\"DEL\", KEYS[1])\n\telse\n\t\treturn 0\n\tend\n".as_bytes();
 const REDSYNC_EXTEND_SETNX: &[u8] = "\n\tif redis.call(\"GET\", KEYS[1]) == ARGV[1] then\n\t\treturn redis.call(\"PEXPIRE\", KEYS[1], ARGV[2])\n\telseif redis.call(\"SET\", KEYS[1], ARGV[1], \"PX\", ARGV[2], \"NX\") then\n\t\treturn 1\n\telse\n\t\treturn 0\n\tend\n".as_bytes();
+// node rate-limit-redis 6.0.1, as sent (the source strips each line's indent).
+const RATE_LIMIT_REDIS_INCR: &[u8] = "local windowMs = tonumber(ARGV[1])\nlocal timeToExpire = redis.call(\"PTTL\", KEYS[1])\nif timeToExpire <= 0 then\nredis.call(\"SET\", KEYS[1], 1, \"PX\", windowMs)\nreturn { 1, windowMs }\nend\nlocal totalHits = redis.call(\"INCR\", KEYS[1])        \nreturn { totalHits, timeToExpire }".as_bytes();
+const RATE_LIMIT_REDIS_GET: &[u8] = "local totalHits = redis.call(\"GET\", KEYS[1])\nlocal timeToExpire = redis.call(\"PTTL\", KEYS[1])\nreturn { totalHits, timeToExpire }".as_bytes();
 
 fn flint_only(family: &str) -> bool {
     matches!(family, "json" | "bloom")
@@ -357,6 +360,44 @@ fn corpus() -> Vec<Case> {
                 s(&[b"PERSIST", b"t1"], Expect::Int(1)),
                 s(&[b"TTL", b"t1"], Expect::Int(-1)),
                 s(&[b"PERSIST", b"t1"], Expect::Int(0)),
+            ],
+        },
+        Case {
+            family: "ttl",
+            name: "expire conditions nx xx gt lt (redis 7)",
+            // BUG-0185: every option was an arity error.
+            steps: vec![
+                s(&[b"SET", b"ec", b"v"], Expect::Ok),
+                s(&[b"EXPIRE", b"ec", b"100", b"XX"], Expect::Int(0)),
+                s(&[b"EXPIRE", b"ec", b"100", b"GT"], Expect::Int(0)),
+                s(&[b"TTL", b"ec"], Expect::Int(-1)),
+                s(&[b"EXPIRE", b"ec", b"100", b"NX"], Expect::Int(1)),
+                s(&[b"EXPIRE", b"ec", b"200", b"NX"], Expect::Int(0)),
+                s(&[b"EXPIRE", b"ec", b"50", b"GT"], Expect::Int(0)),
+                s(&[b"TTL", b"ec"], Expect::IntRange(95, 100)),
+                s(&[b"EXPIRE", b"ec", b"200", b"gt"], Expect::Int(1)),
+                s(&[b"TTL", b"ec"], Expect::IntRange(195, 200)),
+                s(&[b"EXPIRE", b"ec", b"300", b"LT"], Expect::Int(0)),
+                s(&[b"PEXPIRE", b"ec", b"50000", b"XX", b"LT"], Expect::Int(1)),
+                s(&[b"TTL", b"ec"], Expect::IntRange(45, 50)),
+                s(&[b"SET", b"ep", b"v"], Expect::Ok),
+                s(&[b"EXPIRE", b"ep", b"100", b"LT"], Expect::Int(1)),
+                s(&[b"SET", b"ea", b"v"], Expect::Ok),
+                s(&[b"EXPIREAT", b"ea", b"9999999999", b"NX"], Expect::Int(1)),
+                s(&[b"EXPIREAT", b"ea", b"9999999998", b"GT"], Expect::Int(0)),
+                s(
+                    &[b"PEXPIREAT", b"ea", b"9999999999500", b"GT"],
+                    Expect::Int(1),
+                ),
+                s(&[b"PEXPIRETIME", b"ea"], Expect::Int(9_999_999_999_500)),
+                s(&[b"EXPIRE", b"enone", b"10", b"NX"], Expect::Int(0)),
+                s(&[b"SET", b"ed", b"v"], Expect::Ok),
+                s(&[b"EXPIRE", b"ed", b"-1", b"LT"], Expect::Int(1)),
+                s(&[b"EXISTS", b"ed"], Expect::Int(0)),
+                s(&[b"EXPIRE", b"ec", b"10", b"NX", b"XX"], Expect::AnyError),
+                s(&[b"EXPIRE", b"ec", b"10", b"GT", b"LT"], Expect::AnyError),
+                s(&[b"EXPIRE", b"ec", b"10", b"BOGUS"], Expect::AnyError),
+                s(&[b"TTL", b"ec"], Expect::IntRange(45, 50)),
             ],
         },
         Case {
@@ -710,6 +751,39 @@ fn corpus() -> Vec<Case> {
                     &[b"EVAL", REDLOCK_RB_INFO, b"1", b"rb"],
                     Expect::Arr(vec![Expect::Nil, Expect::Int(-2)]),
                 ),
+            ],
+        },
+        Case {
+            family: "scripting",
+            name: "the recognised rate-limit-redis scripts do what their Lua does",
+            steps: vec![
+                s(
+                    &[b"EVAL", RATE_LIMIT_REDIS_INCR, b"1", b"rlr", b"60000"],
+                    Expect::Arr(vec![Expect::Int(1), Expect::Int(60000)]),
+                ),
+                s(&[b"PTTL", b"rlr"], Expect::IntRange(55_000, 60_000)),
+                s(
+                    &[b"EVAL", RATE_LIMIT_REDIS_INCR, b"1", b"rlr", b"60000"],
+                    Expect::Arr(vec![Expect::Int(2), Expect::IntRange(55_000, 60_000)]),
+                ),
+                s(
+                    &[b"EVAL", RATE_LIMIT_REDIS_GET, b"1", b"rlr"],
+                    Expect::Arr(vec![Expect::Str(b"2"), Expect::IntRange(55_000, 60_000)]),
+                ),
+                s(
+                    &[b"EVAL", RATE_LIMIT_REDIS_GET, b"1", b"rlr-none"],
+                    Expect::Arr(vec![Expect::Nil, Expect::Int(-2)]),
+                ),
+                s(&[b"SET", b"rlr-bare", b"7"], Expect::Ok),
+                s(
+                    &[b"EVAL", RATE_LIMIT_REDIS_INCR, b"1", b"rlr-bare", b"1000"],
+                    Expect::Arr(vec![Expect::Int(1), Expect::Int(1000)]),
+                ),
+                s(
+                    &[b"EVAL", RATE_LIMIT_REDIS_INCR, b"1", b"rlr-new", b"1.5"],
+                    Expect::AnyError,
+                ),
+                s(&[b"EXISTS", b"rlr-new"], Expect::Int(0)),
             ],
         },
         Case {

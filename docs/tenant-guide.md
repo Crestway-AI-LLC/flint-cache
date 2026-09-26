@@ -227,8 +227,8 @@ DEL/UNLINK/EXISTS/TYPE, DBSIZE/FLUSHALL (scoped to your namespace).
 Conformance is validated against Valkey continuously. Transactions
 (MULTI/EXEC/WATCH) work when every key shares a slot (ADR-0012). Not in
 v0: pub/sub, streams, blocking commands, Lua (beyond the recognised scripts
-of redis-py's `Lock`, django-redis's `incr`, and the node, Go and Ruby
-Redlock libraries), and cross-slot multi-key
+of redis-py's `Lock`, django-redis's `incr`, the node, Go and Ruby Redlock
+libraries, and express-rate-limit's Redis store), and cross-slot multi-key
 operations, except `MGET`, `DEL`, `UNLINK` and `EXISTS`, which the proxy
 splits per slot or per pair. `KEYS` is answered at the proxy, up to 100,000
 keys (`docs/command-support.md`, ADR-0050).
@@ -244,6 +244,11 @@ Measured through the proxy with each framework's default settings.
   and Ruby `redlock` 2.1.0 work, one resource per lock (ADR-0050).
   `python-redis-lock` does not: it cannot release a lock on Flint. Use
   redis-py's `Lock`.
+- **Rate limiters**: Rack::Attack over Rails' `RedisCacheStore` works, and
+  node `rate-limit-redis` 6.x (express-rate-limit's Redis store) works
+  (ADR-0050). Python `limits` (so Flask-Limiter and SlowAPI), Go
+  `redis_rate` and node `rate-limiter-flexible` do not: their scripts write
+  more than once, which Flint does not run today (ADR-0051, proposed).
 - **django-redis**: `incr` works, atomically; `set_many` and `delete_pattern`
   across slots are transactions and are refused, as below.
 - **Flask-Caching** and **Spring** `RedisCacheManager`: `clear()` works
