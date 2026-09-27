@@ -91,11 +91,33 @@ pub struct Store {
 }
 
 impl Store {
+    /// Open the store at `path`. No file is a new node. A file that cannot
+    /// be read or will not parse stops the node (BUG-0191): it used to load
+    /// as no vote, no log and no registry, and the node ran on as though it
+    /// were new -- which is what a truncated write, or a record from a newer
+    /// release read after a rollback, turned a real control plane into. The
+    /// single-node loader (`State::load_or_new`) refuses for the same reason.
     pub fn open(path: PathBuf) -> Arc<Self> {
-        let inner: Persisted = std::fs::read(&path)
-            .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or_default();
+        let inner: Persisted = match std::fs::read(&path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Persisted::default(),
+            Err(e) => panic!(
+                "flint-controlplane: cannot read the Raft store {}: {e}\n  \
+                 Refusing to start rather than run as a new, EMPTY node.",
+                path.display()
+            ),
+            Ok(bytes) => match serde_json::from_slice(&bytes) {
+                Ok(p) => p,
+                Err(e) => panic!(
+                    "flint-controlplane: the Raft store {} will not parse: {e}\n  \
+                     Refusing to start rather than run as a new, EMPTY node, which is \
+                     what this used to do. A file a newer release wrote (a rollback) \
+                     or a damaged one both land here. Restore it from a backup, or run \
+                     the release that wrote it. Do not simply start this node on an \
+                     empty store: a Raft node that forgets its vote can vote twice.",
+                    path.display()
+                ),
+            },
+        };
         Arc::new(Self {
             path,
             inner: Mutex::new(inner),
@@ -268,5 +290,74 @@ impl RaftStorage<TypeConfig> for Arc<Store> {
             meta: s.meta,
             snapshot: Box::new(Cursor::new(s.data)),
         }))
+    }
+}
+
+#[cfg(test)]
+mod open_tests {
+    use super::*;
+
+    /// A fresh directory per test, removed when dropped.
+    struct Dir(PathBuf);
+    impl Drop for Dir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    fn dir(tag: &str) -> Dir {
+        let p = std::env::temp_dir().join(format!(
+            "flint-raft-open-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).expect("temp dir");
+        Dir(p)
+    }
+
+    fn version(store: &Store) -> u64 {
+        store.inner.try_lock().expect("unlocked").registry.version
+    }
+
+    /// No file is a new node, and a file this build wrote loads as written.
+    #[test]
+    fn a_missing_store_is_a_new_node_and_a_written_one_loads() {
+        let d = dir("roundtrip");
+        let path = d.0.join("state");
+        assert_eq!(
+            version(&Store::open(path.clone())),
+            0,
+            "a missing file is a new node"
+        );
+        let mut p = Persisted::default();
+        p.registry.version = 7;
+        std::fs::write(&path, serde_json::to_vec(&p).expect("encode")).expect("write");
+        assert_eq!(version(&Store::open(path)), 7);
+    }
+
+    /// BUG-0191: a store file that will not parse -- a truncated write, or
+    /// one holding a record from a newer release after a rollback -- loaded
+    /// as NO vote, NO log and NO registry, and the node ran on as though it
+    /// were new. The single-node loader refuses to start on the same
+    /// condition (`State::load_or_new`); so does this now.
+    #[test]
+    fn a_store_that_will_not_parse_stops_the_node_rather_than_loading_empty() {
+        let d = dir("damaged");
+        let path = d.0.join("state");
+        let mut p = Persisted::default();
+        p.registry.version = 7;
+        let bytes = serde_json::to_vec(&p).expect("encode");
+        for damaged in [
+            &bytes[..bytes.len() / 2],
+            b"{\"vote\":\"UnknownFromANewerRelease\"}",
+        ] {
+            std::fs::write(&path, damaged).expect("write");
+            let opened = std::panic::catch_unwind(|| Store::open(path.clone()));
+            assert!(
+                opened.is_err(),
+                "a store that will not parse loaded (as registry version {}) instead of stopping",
+                opened.map(|s| version(&s)).unwrap_or_default()
+            );
+        }
     }
 }
