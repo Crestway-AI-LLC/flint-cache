@@ -299,14 +299,16 @@ Then document the queue libraries as unsupported, by name.
     0 of 6,000 races lost data. With the lock taken out and the key simply
     allowed: 118 and 111 of 3,000 lost all 50 fields.
 
-**Re-measured** through the proxy on a gate box, the same probe as the
-Context, against this stage before BUG-0189 was fixed:
+**Re-measured** through the proxy on a gate box with the same probe as the
+Context: first against this stage before BUG-0189 was fixed, then at
+`460454c`, which fixes it, with BullMQ also run on its documented cluster
+prefix:
 
 | library | before | after stage 1 |
 |---|---|---|
 | asynq 0.26 | processes nothing | **works**: enqueues, and the server processes the job. Task cancellation still needs D5 |
 | rq 2.8.0 | refused at enqueue (no `redis_version`) | past the version check; refused at enqueue by a **cross-slot transaction** |
-| BullMQ 6.3.9 | refuses to start (no `redis_version`) | past the version check; failed `add` on BUG-0189, now fixed. Its next blocker is to be measured |
+| BullMQ 6.3.9 | refuses to start (no `redis_version`) | past the version check; failed `add` on BUG-0189, now fixed. After that, on its default prefix `bull`, `add` is refused with `CROSSSLOT` (`bull:probe:wait` and `bull:probe:paused` are in different slots). On `prefix: '{bull}'`, the setting BullMQ documents for Redis Cluster, it reaches its script and stops at `cmsgpack`: D3, stage 4 |
 | Sidekiq 8.1.7 | cannot fetch (`BRPOP`) | unchanged: stage 2 |
 | Celery 5.6.3 | worker fails to start | unchanged: stages 2 and 3 |
 
