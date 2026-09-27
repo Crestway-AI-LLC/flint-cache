@@ -4191,8 +4191,13 @@ const REDIS_COMPAT_VERSION: &str = "7.2.4";
 /// Sections follow Redis: none, `default`, `all` or `everything` means every
 /// section; otherwise only the ones named, case-insensitively, and a name this
 /// proxy does not have contributes nothing rather than an error.
-fn info_reply(sections: &[Vec<u8>], version: &str) -> Value {
-    let all: [(&str, String); 2] = [
+///
+/// `maxmemory_policy`, in the memory section, is `policy` (BUG-0192): what
+/// `eviction_policy` learned from the tenant's seat. Sidekiq reads it and
+/// warns that its data will be evicted unless it says `noeviction`. When the
+/// seat could not say, the section is left out rather than guessed.
+fn info_reply(sections: &[Vec<u8>], version: &str, policy: Option<&str>) -> Value {
+    let mut all: Vec<(&str, String)> = vec![
         (
             "server",
             format!(
@@ -4202,21 +4207,65 @@ fn info_reply(sections: &[Vec<u8>], version: &str) -> Value {
         ),
         ("persistence", "# Persistence\r\nloading:0\r\n".to_string()),
     ];
-    let wanted: Vec<String> = sections
-        .iter()
-        .map(|s| String::from_utf8_lossy(s).to_ascii_lowercase())
-        .collect();
-    let every = wanted.is_empty()
-        || wanted
-            .iter()
-            .any(|w| matches!(w.as_str(), "default" | "all" | "everything"));
+    if let Some(policy) = policy {
+        all.push((
+            "memory",
+            format!("# Memory\r\nmaxmemory_policy:{policy}\r\n"),
+        ));
+    }
     let body = all
         .iter()
-        .filter(|(name, _)| every || wanted.iter().any(|w| w == name))
+        .filter(|(name, _)| info_wants(sections, name))
         .map(|(_, text)| text.as_str())
         .collect::<Vec<_>>()
         .join("\r\n");
     Value::Bulk(Some(body.into_bytes()))
+}
+
+/// Whether `INFO sections...` asks for the section `name`.
+fn info_wants(sections: &[Vec<u8>], name: &str) -> bool {
+    sections.is_empty()
+        || sections.iter().any(|s| {
+            let s = String::from_utf8_lossy(s).to_ascii_lowercase();
+            matches!(s.as_str(), "default" | "all" | "everything") || s == name
+        })
+}
+
+/// This tenant's `maxmemory_policy` (BUG-0192). Flint evicts nothing from a
+/// namespace unless its seats declare it evictable, so the answer is
+/// `noeviction` unless the master of the tenant's pair lists the namespace in
+/// its `evictable_ns`. An evictable one is `allkeys-lru`: any of its keys may
+/// go, and that is the nearest name Redis has for Flint's S3-FIFO evictor.
+/// `None` when that master does not answer, or does not say.
+async fn eviction_policy(
+    topo: &Topology,
+    backends: &mut Backends,
+    ns: &[u8],
+) -> Option<&'static str> {
+    let master = topo.keyless_route(ns)?;
+    let mut out = Vec::new();
+    encode(
+        &Value::Array(Some(vec![Value::Bulk(Some(b"FLINTINFO".to_vec()))])),
+        &mut out,
+    );
+    let Ok(Value::Bulk(Some(raw))) = backends.call(&master, &out, apool::Lane::Read).await else {
+        return None;
+    };
+    policy_from_flintinfo(&raw, ns)
+}
+
+/// `eviction_policy`'s reading of a seat's FLINTINFO.
+fn policy_from_flintinfo(raw: &[u8], ns: &[u8]) -> Option<&'static str> {
+    let text = String::from_utf8_lossy(raw);
+    let listed = text
+        .split(['\r', '\n'])
+        .find_map(|l| l.strip_prefix("evictable_ns:"))?;
+    let evictable = listed.split(',').any(|n| n.as_bytes() == ns);
+    Some(if evictable {
+        "allkeys-lru"
+    } else {
+        "noeviction"
+    })
 }
 
 /// The id the next client connection is given (`CLIENT ID`). Per proxy
@@ -4702,8 +4751,17 @@ async fn handle(
         },
         b"ECHO" if args.len() == 2 => Value::Bulk(Some(args[1].clone())),
         b"QUIT" => Value::Simple("OK".into()),
-        // Answered HERE, never forwarded: see `info_reply` (BUG-0176).
-        b"INFO" => info_reply(&args[1..], &build_version()),
+        // Answered HERE, never forwarded: see `info_reply` (BUG-0176). Its
+        // one per-tenant field is asked of the tenant's own seat, and only
+        // when the section holding it is wanted (BUG-0192).
+        b"INFO" => {
+            let policy = if info_wants(&args[1..], "memory") {
+                eviction_policy(topo, backends, ns).await
+            } else {
+                None
+            };
+            info_reply(&args[1..], &build_version(), policy)
+        }
         // The data-plane admin surface stays internal; the proxy is the
         // tenant boundary.
         _ if upper.starts_with(b"FLINT") => {
@@ -5757,7 +5815,7 @@ mod client_tests {
 
 #[cfg(test)]
 mod info_tests {
-    use super::{Value, info_reply};
+    use super::{Value, info_reply, info_wants, policy_from_flintinfo};
 
     fn text(v: Value) -> String {
         match v {
@@ -5770,7 +5828,7 @@ mod info_tests {
     /// makes it wait; an error makes it reconnect forever.
     #[test]
     fn bare_info_says_loading_0_and_names_the_build() {
-        let t = text(info_reply(&[], "v9.9.9"));
+        let t = text(info_reply(&[], "v9.9.9", None));
         assert!(t.contains("\r\nloading:0\r\n"), "{t:?}");
         assert!(t.contains("flint_version:v9.9.9\r\n"), "{t:?}");
         assert!(t.starts_with("# Server\r\n"), "{t:?}");
@@ -5788,7 +5846,7 @@ mod info_tests {
     fn sections_filter_case_insensitively_and_unknown_is_empty_not_an_error() {
         let only = |names: &[&str]| {
             let args: Vec<Vec<u8>> = names.iter().map(|n| n.as_bytes().to_vec()).collect();
-            text(info_reply(&args, "v"))
+            text(info_reply(&args, "v", None))
         };
         assert_eq!(only(&["Persistence"]), "# Persistence\r\nloading:0\r\n");
         assert!(!only(&["server"]).contains("loading"));
@@ -5811,9 +5869,29 @@ mod info_tests {
     /// without it; BullMQ reads it and refuses anything below 5.0.0.
     #[test]
     fn the_server_section_reports_valkeys_redis_version_and_flints_own() {
-        let t = text(info_reply(&[b"server".to_vec()], "v"));
+        let t = text(info_reply(&[b"server".to_vec()], "v", None));
         assert!(t.contains("\r\nredis_version:7.2.4\r\n"), "{t:?}");
         assert!(t.contains("\r\nflint_version:v\r\n"), "{t:?}");
+    }
+
+    /// BUG-0192: Sidekiq warns that its data will be evicted unless
+    /// `maxmemory_policy` says `noeviction`. It is the tenant's seat that
+    /// knows, and a seat that does not say leaves the section out.
+    #[test]
+    fn maxmemory_policy_is_the_tenants_own_and_never_a_guess() {
+        let info = b"role:master\r\nevictable_ns:cache,thumbs\r\nuptime_ms:5\r\n";
+        assert_eq!(policy_from_flintinfo(info, b"jobs"), Some("noeviction"));
+        assert_eq!(policy_from_flintinfo(info, b"cache"), Some("allkeys-lru"));
+        assert_eq!(policy_from_flintinfo(info, b"cach"), Some("noeviction"));
+        let none = b"role:master\r\nevictable_ns:\r\n";
+        assert_eq!(policy_from_flintinfo(none, b"jobs"), Some("noeviction"));
+        assert_eq!(policy_from_flintinfo(b"role:master\r\n", b"jobs"), None);
+        let t = text(info_reply(&[b"memory".to_vec()], "v", Some("noeviction")));
+        assert_eq!(t, "# Memory\r\nmaxmemory_policy:noeviction\r\n");
+        assert!(text(info_reply(&[], "v", Some("noeviction"))).contains("# Memory"));
+        assert_eq!(text(info_reply(&[b"memory".to_vec()], "v", None)), "");
+        assert!(!info_wants(&[b"server".to_vec()], "memory"));
+        assert!(info_wants(&[b"ALL".to_vec()], "memory"));
     }
 }
 

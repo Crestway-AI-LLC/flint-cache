@@ -367,6 +367,211 @@ impl<'a> StringStore<'a> {
         self.kv.put(&self.meta_key(slot, key), &meta.encode());
         Ok(len)
     }
+
+    /// BITFIELD (BUG-0192): run `ops` in order over the string as a bit
+    /// array, bit 0 being the high bit of the first byte, and answer one
+    /// reply per operation: `None` for a write refused by `OVERFLOW FAIL`.
+    ///
+    /// Valkey's shape, measured by the conformance corpus: reads past the
+    /// end read zeros; with any write among `ops` the string is first grown
+    /// with zeros to cover the highest bit written, creating the key if it
+    /// was missing, even when every write is then refused by `FAIL`; with
+    /// none, nothing is created. The TTL is kept, as by `SETRANGE`.
+    pub fn bitfield(
+        &self,
+        slot: u16,
+        key: &[u8],
+        ops: &[BitfieldOp],
+    ) -> Result<Vec<Option<i64>>, StoreError> {
+        let existing = self.read_live(slot, key)?;
+        let highest = ops
+            .iter()
+            .filter(|op| !matches!(op.kind, BitfieldKind::Get))
+            .map(|op| op.offset + u64::from(op.bits) - 1)
+            .max();
+        let Some(highest) = highest else {
+            let payload = existing.map(|m| m.payload).unwrap_or_default();
+            return Ok(ops.iter().map(|op| Some(op.read(&payload))).collect());
+        };
+        let need = (highest >> 3) + 1;
+        if need > self.max_value_bytes {
+            return Err(StoreError::ValueTooLarge);
+        }
+        let (mut payload, expire_ms, mut dirty) = match existing {
+            None => (Vec::new(), 0, true),
+            Some(m) => (m.payload, m.expire_ms, false),
+        };
+        if (payload.len() as u64) < need {
+            payload.resize(need as usize, 0);
+            dirty = true;
+        }
+        let mut replies = Vec::with_capacity(ops.len());
+        for op in ops {
+            let reply = match op.kind {
+                BitfieldKind::Get => Some(op.read(&payload)),
+                BitfieldKind::Set(value, overflow) | BitfieldKind::IncrBy(value, overflow) => {
+                    let incr = matches!(op.kind, BitfieldKind::IncrBy(..));
+                    let old = op.read(&payload);
+                    let (new, overflowed) = if op.signed {
+                        let (from, by) = if incr { (old, value) } else { (value, 0) };
+                        match signed_overflow(from, by, op.bits, overflow) {
+                            Some(limit) => (limit, true),
+                            None => (from.wrapping_add(by), false),
+                        }
+                    } else {
+                        let (from, by) = if incr {
+                            (old as u64, value)
+                        } else {
+                            (value as u64, 0)
+                        };
+                        match unsigned_overflow(from, by, op.bits, overflow) {
+                            Some(limit) => (limit as i64, true),
+                            None => (from.wrapping_add(by as u64) as i64, false),
+                        }
+                    };
+                    if overflowed && overflow == BitfieldOverflow::Fail {
+                        None
+                    } else {
+                        write_bits(&mut payload, op.offset, op.bits, new as u64);
+                        dirty |= op.read(&payload) != old;
+                        Some(if incr { new } else { old })
+                    }
+                }
+            };
+            replies.push(reply);
+        }
+        if dirty {
+            let meta = StringMeta::new(payload, expire_ms, (self.clock)());
+            self.kv.put(&self.meta_key(slot, key), &meta.encode());
+        }
+        Ok(replies)
+    }
+}
+
+/// What `OVERFLOW` sets for the `SET` and `INCRBY` after it (BUG-0192).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BitfieldOverflow {
+    /// Modular arithmetic, two's complement for a signed field.
+    Wrap,
+    /// Clamp to the field's minimum or maximum.
+    Sat,
+    /// Refuse the write, and answer nil for it.
+    Fail,
+}
+
+/// One `BITFIELD` operation's verb and argument.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BitfieldKind {
+    Get,
+    /// The value to store; the reply is the field's previous value.
+    Set(i64, BitfieldOverflow),
+    /// The increment; the reply is the field's new value.
+    IncrBy(i64, BitfieldOverflow),
+}
+
+/// One `BITFIELD` operation on a field of `bits` bits at bit `offset`:
+/// `i1`..`i64` when `signed`, `u1`..`u63` when not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BitfieldOp {
+    pub signed: bool,
+    pub bits: u32,
+    pub offset: u64,
+    pub kind: BitfieldKind,
+}
+
+impl BitfieldOp {
+    /// The field's value in `payload`, sign-extended when signed. Bits past
+    /// the end of `payload` read as zero.
+    fn read(&self, payload: &[u8]) -> i64 {
+        let mut v = 0u64;
+        for i in 0..u64::from(self.bits) {
+            let bit = self.offset + i;
+            let byte = payload.get((bit >> 3) as usize).copied().unwrap_or(0);
+            v = (v << 1) | u64::from((byte >> (7 - (bit & 7))) & 1);
+        }
+        if self.signed && self.bits < 64 && v & (1 << (self.bits - 1)) != 0 {
+            v |= u64::MAX << self.bits;
+        }
+        v as i64
+    }
+}
+
+/// Store the low `bits` bits of `value` at bit `offset`; `payload` already
+/// covers them.
+fn write_bits(payload: &mut [u8], offset: u64, bits: u32, value: u64) {
+    for i in 0..u64::from(bits) {
+        let bit = offset + i;
+        let set = (value >> (u64::from(bits) - 1 - i)) & 1 == 1;
+        let mask = 1u8 << (7 - (bit & 7));
+        let byte = &mut payload[(bit >> 3) as usize];
+        if set {
+            *byte |= mask;
+        } else {
+            *byte &= !mask;
+        }
+    }
+}
+
+/// Valkey's `checkSignedBitfieldOverflow`: `None` when `value + incr` fits
+/// an `i<bits>`, else the value `overflow` stores instead (unused for
+/// `Fail`). Its arithmetic, wrapping where C's would.
+fn signed_overflow(value: i64, incr: i64, bits: u32, overflow: BitfieldOverflow) -> Option<i64> {
+    let max: i64 = if bits == 64 {
+        i64::MAX
+    } else {
+        (1i64 << (bits - 1)) - 1
+    };
+    let min = -max - 1;
+    let max_incr = (max as u64).wrapping_sub(value as u64) as i64;
+    let min_incr = min.wrapping_sub(value);
+    let wrapped = || {
+        let mut c = (value as u64).wrapping_add(incr as u64);
+        if bits < 64 {
+            let mask = u64::MAX << bits;
+            if c & (1u64 << (bits - 1)) != 0 {
+                c |= mask;
+            } else {
+                c &= !mask;
+            }
+        }
+        c as i64
+    };
+    let limit = |bound: i64| match overflow {
+        BitfieldOverflow::Wrap => wrapped(),
+        BitfieldOverflow::Sat => bound,
+        BitfieldOverflow::Fail => 0,
+    };
+    if value > max || (bits != 64 && incr > max_incr) || (value >= 0 && incr > 0 && incr > max_incr)
+    {
+        Some(limit(max))
+    } else if value < min
+        || (bits != 64 && incr < min_incr)
+        || (value < 0 && incr < 0 && incr < min_incr)
+    {
+        Some(limit(min))
+    } else {
+        None
+    }
+}
+
+/// Valkey's `checkUnsignedBitfieldOverflow`, as `signed_overflow` is its
+/// signed twin. `bits` is at most 63.
+fn unsigned_overflow(value: u64, incr: i64, bits: u32, overflow: BitfieldOverflow) -> Option<u64> {
+    let max = (1u64 << bits) - 1;
+    let max_incr = max.wrapping_sub(value) as i64;
+    let min_incr = value.wrapping_neg() as i64;
+    let limit = |bound: u64| match overflow {
+        BitfieldOverflow::Wrap => value.wrapping_add(incr as u64) & !(u64::MAX << bits),
+        BitfieldOverflow::Sat => bound,
+        BitfieldOverflow::Fail => 0,
+    };
+    if value > max || (incr > 0 && incr > max_incr) {
+        Some(limit(max))
+    } else if incr < 0 && incr < min_incr {
+        Some(limit(0))
+    } else {
+        None
+    }
 }
 
 /// Redis's LD_STR_HUMAN float shape: fixed `%.17f`, then trim trailing
@@ -614,6 +819,63 @@ mod tests {
         assert_eq!(s.getrange(1, b"k", 9, 2), Ok(vec![]));
         assert_eq!(s.getrange(1, b"k", 50, 60), Ok(vec![]));
         assert_eq!(s.getrange(1, b"missing", 0, -1), Ok(vec![]));
+    }
+
+    /// BUG-0192: Valkey's overflow arithmetic at the edges, where a port of
+    /// C to Rust goes wrong: `i64` and `u63` limits, wrap, saturation and
+    /// refusal, and the value cap on what a write grows the string to.
+    #[test]
+    fn bitfield_overflows_as_valkey_does_at_every_edge() {
+        use BitfieldKind::{Get, IncrBy, Set};
+        use BitfieldOverflow::{Fail, Sat, Wrap};
+        test_clock!(NOW, now, 1_000_000);
+        let kv = MemKv::new();
+        let s = StringStore::new(&kv, b"t", now);
+        let op = |signed, bits, offset, kind| BitfieldOp {
+            signed,
+            bits,
+            offset,
+            kind,
+        };
+        let run = |ops: &[BitfieldOp]| s.bitfield(1, b"k", ops).expect("bitfield");
+        assert_eq!(
+            run(&[
+                op(true, 64, 0, Set(i64::MAX, Wrap)),
+                op(true, 64, 0, IncrBy(1, Wrap)),
+                op(true, 64, 0, IncrBy(-1, Sat)),
+                op(true, 64, 0, IncrBy(-1, Fail)),
+            ]),
+            vec![Some(0), Some(i64::MIN), Some(i64::MIN), None]
+        );
+        // A u63 read over the i64 above: its top 63 bits, so 1 << 62.
+        let umax = i64::MAX;
+        assert_eq!(
+            run(&[
+                op(false, 63, 0, Set(umax, Wrap)),
+                op(false, 63, 0, IncrBy(1, Wrap)),
+                op(false, 63, 0, IncrBy(-1, Sat)),
+                op(false, 63, 0, IncrBy(5, Fail)),
+                op(false, 63, 0, Get),
+            ]),
+            vec![Some(1 << 62), Some(0), Some(0), Some(5), Some(5)]
+        );
+        assert_eq!(
+            run(&[
+                op(true, 3, 70, Set(3, Wrap)),
+                op(true, 3, 70, IncrBy(1, Wrap)),
+                op(true, 3, 70, IncrBy(-9, Sat)),
+                op(false, 1, 70, Get),
+            ]),
+            vec![Some(0), Some(-4), Some(-4), Some(1)]
+        );
+        // Growth is bounded by the value cap before anything is written.
+        let capped = StringStore::with_max_value_bytes(&kv, b"t", now, 8);
+        let far = [op(false, 8, 64, Set(1, Wrap))];
+        assert_eq!(
+            capped.bitfield(1, b"c", &far),
+            Err(StoreError::ValueTooLarge)
+        );
+        assert_eq!(capped.get(1, b"c"), Ok(None));
     }
 
     #[test]

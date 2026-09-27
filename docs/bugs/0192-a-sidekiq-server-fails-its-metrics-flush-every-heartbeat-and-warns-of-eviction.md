@@ -1,6 +1,7 @@
-# BUG-0192: a Sidekiq server fails its metrics flush on every heartbeat, and warns of eviction (OPEN)
+# BUG-0192: a Sidekiq server fails its metrics flush on every heartbeat, and warns of eviction (FIXED 2026-09-27)
 
-**Status:** OPEN, found 2026-09-27. To be fixed after ADR-0053 ships.
+**Status:** **FIXED 2026-09-27**. Not in v0.1.0-rc.77: it ships with the next
+release.
 **Severity:** low: jobs run and the heartbeat registers the process. What
 fails is Sidekiq's execution metrics, and an operator reading the server's
 log sees an exception every beat and a warning that is not true.
@@ -28,13 +29,27 @@ every beat. The Metrics page of Sidekiq's web UI then has no data.
 Flint evicts nothing unless a namespace opts in, so for most tenants this is
 false, and it tells an operator to change a setting that does not exist.
 
-## What a fix needs
+## The fix
 
-- `BITFIELD` with what Sidekiq sends: `INCRBY` on unsigned fields at `#n`
-  offsets, `OVERFLOW SAT`; and, since a command half-served is a trap, the
-  rest of the command (`GET`, `SET`, `WRAP`, `FAIL`, signed types) checked
-  against Valkey, with `BITFIELD_RO`.
-- `maxmemory_policy` in the proxy's INFO: `noeviction` for a tenant whose
-  namespace is not evictable, and the policy an evictable one gets.
-- `client_compat_drill` fails on a lifecycle exception in the server's log,
-  which it now passes over.
+- **`BITFIELD` and `BITFIELD_RO`, whole**, not only what Sidekiq sends,
+  since a command half-served is a trap: `GET`, `SET` and `INCRBY` on
+  `i1`-`i64` and `u1`-`u63` fields at bit or `#n` offsets, and
+  `OVERFLOW WRAP`, `SAT` and `FAIL`. The overflow arithmetic is Valkey's
+  (`checkSignedBitfieldOverflow` and its unsigned twin), ported with
+  wrapping operations where C's wrap, and pinned at the `i64` and `u63`
+  edges by a unit test. One read and at most one write per command.
+  - **Valkey's edges, taken from Valkey.** A new conformance case, 37
+    steps, passes against Valkey 9.1 and against Flint, in RESP2 and RESP3.
+    It covers Sidekiq's exact command, each overflow mode at both ends of
+    both signs, fields that straddle bytes, and reads past the end, which
+    read zeros and create nothing. A write refused by `FAIL` still grows the
+    string, as Valkey's does. The TTL is kept, and every error has Valkey's
+    text in Valkey's order.
+- **`maxmemory_policy` in the proxy's INFO**, in a memory section. The proxy
+  asks the master of the tenant's own pair (`FLINTINFO`'s `evictable_ns`)
+  only when that section is wanted. The answer is `noeviction` unless the
+  namespace is declared evictable, and then `allkeys-lru`. A seat that
+  cannot be asked leaves the section out rather than a guess in it.
+- **`client_compat_drill`**: the Sidekiq server's heartbeat must now flush
+  the job's metrics (its histogram and its per-minute totals both appear),
+  its log must hold no failed lifecycle event, and no eviction warning.

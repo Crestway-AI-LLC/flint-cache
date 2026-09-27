@@ -324,6 +324,136 @@ fn corpus() -> Vec<Case> {
             ],
         },
         Case {
+            family: "strings",
+            name: "bitfield (BUG-0192)",
+            steps: vec![
+                // Unsigned: WRAP by default, then SAT, then FAIL.
+                s(
+                    &[b"BITFIELD", b"bf1", b"SET", b"u8", b"0", b"255", b"GET", b"u8", b"0"],
+                    Expect::Arr(vec![Expect::Int(0), Expect::Int(255)]),
+                ),
+                s(
+                    &[b"BITFIELD", b"bf1", b"INCRBY", b"u8", b"0", b"10"],
+                    Expect::Arr(vec![Expect::Int(9)]),
+                ),
+                s(
+                    &[b"BITFIELD", b"bf1", b"OVERFLOW", b"SAT", b"INCRBY", b"u8", b"0", b"300"],
+                    Expect::Arr(vec![Expect::Int(255)]),
+                ),
+                s(
+                    &[b"BITFIELD", b"bf1", b"OVERFLOW", b"FAIL", b"INCRBY", b"u8", b"0", b"1"],
+                    Expect::Arr(vec![Expect::Nil]),
+                ),
+                s(&[b"GET", b"bf1"], Expect::Str(b"\xff")),
+                s(
+                    &[b"BITFIELD_RO", b"bf1", b"GET", b"u8", b"0", b"GET", b"i8", b"0"],
+                    Expect::Arr(vec![Expect::Int(255), Expect::Int(-1)]),
+                ),
+                // Signed: two's complement WRAP, and SAT at both ends.
+                s(
+                    &[b"BITFIELD", b"bf2", b"SET", b"i8", b"0", b"-128", b"INCRBY", b"i8", b"0", b"-1"],
+                    Expect::Arr(vec![Expect::Int(0), Expect::Int(127)]),
+                ),
+                s(
+                    &[
+                        b"BITFIELD", b"bf2", b"OVERFLOW", b"SAT", b"INCRBY", b"i8", b"0", b"200",
+                        b"INCRBY", b"i8", b"0", b"-300",
+                    ],
+                    Expect::Arr(vec![Expect::Int(127), Expect::Int(-128)]),
+                ),
+                s(
+                    &[
+                        b"BITFIELD", b"bf7", b"SET", b"i64", b"0", b"9223372036854775807",
+                        b"INCRBY", b"i64", b"0", b"1",
+                    ],
+                    Expect::Arr(vec![Expect::Int(0), Expect::Int(i64::MIN)]),
+                ),
+                // An out-of-range SET: WRAP keeps the low bits, FAIL refuses.
+                s(
+                    &[b"BITFIELD", b"bf3", b"SET", b"u8", b"0", b"-1", b"GET", b"u8", b"0"],
+                    Expect::Arr(vec![Expect::Int(0), Expect::Int(255)]),
+                ),
+                s(
+                    &[b"BITFIELD", b"bf3", b"OVERFLOW", b"FAIL", b"SET", b"u2", b"0", b"7", b"GET", b"u8", b"0"],
+                    Expect::Arr(vec![Expect::Nil, Expect::Int(255)]),
+                ),
+                // `#n` offsets count in fields; fields straddle bytes.
+                s(
+                    &[
+                        b"BITFIELD", b"bf4", b"SET", b"u4", b"#1", b"15", b"GET", b"u4", b"#0",
+                        b"GET", b"u8", b"0", b"SET", b"u12", b"4", b"4095", b"GET", b"u16", b"0",
+                    ],
+                    Expect::Arr(vec![
+                        Expect::Int(0),
+                        Expect::Int(0),
+                        Expect::Int(15),
+                        Expect::Int(3840),
+                        Expect::Int(4095),
+                    ]),
+                ),
+                // Sidekiq's metrics flush, as it sends it.
+                s(
+                    &[
+                        b"BITFIELD", b"h|Job-1", b"OVERFLOW", b"SAT", b"INCRBY", b"u16", b"#0", b"1",
+                        b"INCRBY", b"u16", b"#3", b"5",
+                    ],
+                    Expect::Arr(vec![Expect::Int(1), Expect::Int(5)]),
+                ),
+                s(&[b"STRLEN", b"h|Job-1"], Expect::Int(8)),
+                // Reads past the end read zeros and create nothing; a write
+                // refused by FAIL still grows the string, as Valkey's does.
+                s(
+                    &[b"BITFIELD", b"bf5", b"GET", b"u8", b"100"],
+                    Expect::Arr(vec![Expect::Int(0)]),
+                ),
+                s(&[b"EXISTS", b"bf5"], Expect::Int(0)),
+                s(&[b"BITFIELD", b"bf5"], Expect::Arr(vec![])),
+                s(
+                    &[b"BITFIELD", b"bf6", b"OVERFLOW", b"FAIL", b"INCRBY", b"u2", b"8", b"9"],
+                    Expect::Arr(vec![Expect::Nil]),
+                ),
+                s(&[b"STRLEN", b"bf6"], Expect::Int(2)),
+                // In place: the TTL survives.
+                s(&[b"SETEX", b"bft", b"100", b"a"], Expect::Ok),
+                s(
+                    &[b"BITFIELD", b"bft", b"SET", b"u8", b"0", b"66"],
+                    Expect::Arr(vec![Expect::Int(97)]),
+                ),
+                s(&[b"TTL", b"bft"], Expect::IntRange(95, 100)),
+                s(&[b"GET", b"bft"], Expect::Str(b"B")),
+                // Errors, each with Valkey's text.
+                s(&[b"BITFIELD", b"bf1", b"GET", b"u64", b"0"], Expect::Err("ERR Invalid bitfield type. Use something like i16 u8. Note that u64 is not supported but i64 is.")),
+                s(&[b"BITFIELD", b"bf1", b"GET", b"i65", b"0"], Expect::Err("ERR Invalid bitfield type. Use something like i16 u8. Note that u64 is not supported but i64 is.")),
+                s(&[b"BITFIELD", b"bf1", b"GET", b"u0", b"0"], Expect::Err("ERR Invalid bitfield type. Use something like i16 u8. Note that u64 is not supported but i64 is.")),
+                s(
+                    &[b"BITFIELD", b"bf1", b"GET", b"u8", b"-1"],
+                    Expect::Err("ERR bit offset is not an integer or out of range"),
+                ),
+                s(
+                    &[b"BITFIELD", b"bf1", b"GET", b"u8", b"4294967296000"],
+                    Expect::Err("ERR bit offset is not an integer or out of range"),
+                ),
+                s(
+                    &[b"BITFIELD", b"bf1", b"OVERFLOW", b"NOPE"],
+                    Expect::Err("ERR Invalid OVERFLOW type specified"),
+                ),
+                s(&[b"BITFIELD", b"bf1", b"FROB"], Expect::Err("ERR syntax error")),
+                s(&[b"BITFIELD", b"bf1", b"GET", b"u8"], Expect::Err("ERR syntax error")),
+                s(
+                    &[b"BITFIELD", b"bf1", b"SET", b"u8", b"0", b"x"],
+                    Expect::Err("ERR value is not an integer or out of range"),
+                ),
+                s(
+                    &[b"BITFIELD_RO", b"bf1", b"SET", b"u8", b"0", b"1"],
+                    Expect::Err("ERR BITFIELD_RO only supports the GET subcommand"),
+                ),
+                s(&[b"GET", b"bf1"], Expect::Str(b"\xff")),
+                s(&[b"LPUSH", b"bfl", b"a"], Expect::Int(1)),
+                s(&[b"BITFIELD", b"bfl", b"GET", b"u8", b"0"], Expect::AnyError),
+                s(&[b"BITFIELD"], Expect::AnyError),
+            ],
+        },
+        Case {
             family: "keyspace",
             name: "del returns removal count",
             steps: vec![

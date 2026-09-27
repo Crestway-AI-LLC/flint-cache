@@ -184,7 +184,9 @@ through the proxy across all shard pairs as one cursor stream (redis-cli
 **Strings**: SET (NX, XX, EX, PX, EXAT, PXAT, KEEPTTL, GET), SETNX, SETEX,
 GET, GETDEL, GETEX (EX, PX, EXAT, PXAT, PERSIST), GETSET, MSET, MGET,
 APPEND, STRLEN, GETRANGE, SETRANGE, INCR, DECR, INCRBY, DECRBY,
-INCRBYFLOAT.
+INCRBYFLOAT, BITFIELD (GET, SET, INCRBY, OVERFLOW WRAP/SAT/FAIL, `i1`-`i64`
+and `u1`-`u63`, `#n` offsets), BITFIELD_RO (BUG-0192). The other bit
+commands (SETBIT, GETBIT, BITCOUNT, BITPOS, BITOP) are not served yet.
 
 **Hashes**: HSET, HMSET, HSETNX, HGET, HMGET, HGETALL, HKEYS, HVALS, HDEL, HLEN,
 HEXISTS, HINCRBY, HINCRBYFLOAT, HSTRLEN, HSCAN (MATCH, COUNT, NOVALUES).
@@ -621,7 +623,15 @@ shared by every tenant on its pair:
 
     INFO             -> # Server / redis_version:7.2.4 / redis_mode:standalone / flint_version:<build>
                         # Persistence / loading:0
+                        # Memory / maxmemory_policy:noeviction
     INFO persistence -> just that section; an unknown section is empty, as in Redis
+
+`maxmemory_policy` is your namespace's, asked of your pair's master when
+the memory section is wanted (BUG-0192): `noeviction` unless the operator
+declared your namespace evictable, and then `allkeys-lru`, the nearest
+Redis name for Flint's evictor, which may remove any of your keys. Sidekiq
+warns that its data will be evicted unless it reads `noeviction`. When the
+seat cannot be asked, the memory section is left out, not guessed.
 
 **`CLIENT` through the proxy answers for your own connection** (BUG-0183):
 `SETNAME`, `GETNAME`, `ID`, `SETINFO` and `INFO`. A name given in

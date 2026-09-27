@@ -78,6 +78,7 @@ CONCLUSION is wrong, which is the hazard in the next table, not this one.
 | Command | Hazard on retry |
 |---|---|
 | `INCR` `DECR` `INCRBY` `DECRBY` `INCRBYFLOAT` `HINCRBY` `HINCRBYFLOAT` `ZINCRBY` `JSON.NUMINCRBY` | Double-counts. |
+| `BITFIELD` with `INCRBY` | Double-counts, as `INCRBY` does; Sidekiq's metrics flush is this shape. A `BITFIELD` of only `GET` and `SET` converges, but a retried `SET` answers the value the first attempt wrote, not the one before it. |
 | `APPEND` `JSON.ARRAPPEND` | Double-appends. |
 | `LPUSH` `RPUSH` | Double-pushes. |
 | `LINSERT` | Double-inserts: `a b` becomes `a x x b`. |

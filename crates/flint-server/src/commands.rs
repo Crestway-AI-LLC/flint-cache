@@ -16,7 +16,10 @@ use flint_storage::json::JsonStore;
 use flint_storage::keyspace::{Keyspace, RenameOutcome, Ttl};
 use flint_storage::lists::{ListStore, LsetOutcome};
 use flint_storage::sets::SetStore;
-use flint_storage::strings::{Clock, SetExpiry, SetOptions, SetOutcome, StoreError, StringStore};
+use flint_storage::strings::{
+    BitfieldKind, BitfieldOp, BitfieldOverflow, Clock, SetExpiry, SetOptions, SetOutcome,
+    StoreError, StringStore,
+};
 use flint_storage::zsets::{LexBound, ScoreBound, ZSetStore};
 
 /// True for commands that mutate the keyspace (rejected on replicas).
@@ -476,6 +479,8 @@ impl<'a> Dispatcher<'a> {
                     _ => err("ERR value is not an integer or out of range"),
                 }
             }),
+            b"BITFIELD" => self.cmd_bitfield(args, "bitfield", false),
+            b"BITFIELD_RO" => self.cmd_bitfield(args, "bitfield_ro", true),
             b"SETRANGE" => exact(args, 4, "setrange", |a| match parse_i64(&a[2]) {
                 Ok(off) if off >= 0 => reply(
                     self.strings
@@ -1252,6 +1257,109 @@ impl<'a> Dispatcher<'a> {
                 Some(v) => Value::Bulk(v),
                 None => Value::Bulk(None),
             },
+            Err(e) => store_err(e),
+        }
+    }
+
+    /// `BITFIELD key [GET type offset] [OVERFLOW WRAP|SAT|FAIL]
+    /// [SET type offset value] [INCRBY type offset increment] ...` and
+    /// `BITFIELD_RO key [GET type offset] ...` (BUG-0192). Every operation is
+    /// parsed before any runs, with Valkey's errors in Valkey's order; the
+    /// storage layer runs them (`StringStore::bitfield`).
+    fn cmd_bitfield(&self, args: &[Vec<u8>], name: &str, read_only: bool) -> Value {
+        const BAD_TYPE: &str = "ERR Invalid bitfield type. Use something like i16 u8. \
+                                Note that u64 is not supported but i64 is.";
+        const BAD_OFFSET: &str = "ERR bit offset is not an integer or out of range";
+        // Valkey bounds an offset by proto-max-bulk-len, 512 MiB; the value
+        // cap of this seat then bounds what a write may grow the string to.
+        const MAX_OFFSET_BYTES: i64 = 512 * 1024 * 1024;
+        if args.len() < 2 {
+            return arity_err(name);
+        }
+        let field_type = |raw: &[u8]| -> Option<(bool, u32)> {
+            let (&first, digits) = raw.split_first()?;
+            let signed = match first {
+                b'i' => true,
+                b'u' => false,
+                _ => return None,
+            };
+            let bits = u32::try_from(parse_i64(digits).ok()?).ok()?;
+            let max = if signed { 64 } else { 63 };
+            (1..=max).contains(&bits).then_some((signed, bits))
+        };
+        let field_offset = |raw: &[u8], bits: u32| -> Option<u64> {
+            let (hash, digits) = match raw.split_first() {
+                Some((b'#', rest)) => (true, rest),
+                _ => (false, raw),
+            };
+            let n = parse_i64(digits).ok()?;
+            let n = if hash {
+                n.checked_mul(i64::from(bits))?
+            } else {
+                n
+            };
+            (n >= 0 && (n >> 3) < MAX_OFFSET_BYTES).then_some(n as u64)
+        };
+        let mut ops = Vec::new();
+        let mut overflow = BitfieldOverflow::Wrap;
+        let mut i = 2;
+        while i < args.len() {
+            let rest = args.len() - i - 1;
+            let verb = args[i].to_ascii_uppercase();
+            let takes_value = match verb.as_slice() {
+                b"GET" if rest >= 2 => false,
+                b"SET" | b"INCRBY" if rest >= 3 => true,
+                b"OVERFLOW" if rest >= 1 => {
+                    overflow = match args[i + 1].to_ascii_uppercase().as_slice() {
+                        b"WRAP" => BitfieldOverflow::Wrap,
+                        b"SAT" => BitfieldOverflow::Sat,
+                        b"FAIL" => BitfieldOverflow::Fail,
+                        _ => return err("ERR Invalid OVERFLOW type specified"),
+                    };
+                    i += 2;
+                    continue;
+                }
+                _ => return err("ERR syntax error"),
+            };
+            let Some((signed, bits)) = field_type(&args[i + 1]) else {
+                return err(BAD_TYPE);
+            };
+            let Some(offset) = field_offset(&args[i + 2], bits) else {
+                return err(BAD_OFFSET);
+            };
+            let kind = if takes_value {
+                let Ok(v) = parse_i64(&args[i + 3]) else {
+                    return err("ERR value is not an integer or out of range");
+                };
+                if verb.as_slice() == b"SET" {
+                    BitfieldKind::Set(v, overflow)
+                } else {
+                    BitfieldKind::IncrBy(v, overflow)
+                }
+            } else {
+                BitfieldKind::Get
+            };
+            ops.push(BitfieldOp {
+                signed,
+                bits,
+                offset,
+                kind,
+            });
+            i += if takes_value { 4 } else { 3 };
+        }
+        if read_only && ops.iter().any(|op| op.kind != BitfieldKind::Get) {
+            return err("ERR BITFIELD_RO only supports the GET subcommand");
+        }
+        match self
+            .strings
+            .bitfield(slot_for_key(&args[1]), &args[1], &ops)
+        {
+            Ok(replies) => Value::Array(Some(
+                replies
+                    .into_iter()
+                    .map(|r| r.map_or(Value::Bulk(None), Value::Integer))
+                    .collect(),
+            )),
             Err(e) => store_err(e),
         }
     }

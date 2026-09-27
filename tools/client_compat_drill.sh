@@ -1705,11 +1705,26 @@ begin
     procs = Sidekiq::ProcessSet.new.size
     break if done && procs > 0
   end
+  # A heartbeat, every 10 s, flushes the job's metrics: a histogram written
+  # with BITFIELD, then per-minute totals. BUG-0192: the BITFIELD failed, so
+  # neither was written, and every beat logged the exception.
+  metrics = false
+  80.times do
+    metrics = Sidekiq.redis { |c| c.call("KEYS", "h|DoneJob*").any? && c.call("KEYS", "j|*").any? }
+    break if metrics
+    sleep 0.25
+  end
   Process.kill("TERM", pid)
   Process.wait(pid)
-  errors = File.readlines(log).grep(/ERROR|WARN/).first(3).map { |l| l.strip[0, 200] }
+  lines = File.readlines(log)
+  errors = lines.grep(/ERROR|WARN/).first(3).map { |l| l.strip[0, 200] }
   check.("the server runs a job", done, errors.inspect)
   check.("its heartbeat registers the process", procs > 0, "#{procs} process(es); #{errors.inspect}")
+  check.("its heartbeat flushes the job's metrics", metrics, errors.inspect)
+  failed = lines.grep(/Exception during Sidekiq lifecycle event/).first(2).map { |l| l.strip[0, 240] }
+  check.("no lifecycle event fails", failed.empty?, failed.inspect)
+  evict = lines.grep(/will evict Sidekiq data/).first
+  check.("no warning that its data will be evicted", evict.nil?, evict.to_s.strip)
 rescue => e
   check.("sidekiq server", false, "#{e.class}: #{e.message[0, 200]}")
 end
