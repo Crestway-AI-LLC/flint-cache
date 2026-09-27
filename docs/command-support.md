@@ -119,7 +119,10 @@ single-slot, all or nothing. See "Lua scripts" below (ADR-0051).
 >
 > Same-slot, like every other multi-key command: the slot is taken from the
 > first key queued, and a later command naming a key elsewhere is refused
-> with `CROSSSLOT` at QUEUE time, which also poisons the transaction.
+> with `CROSSSLOT` at QUEUE time, which also poisons the transaction. Through
+> the proxy a key on another pair is refused with `EXECABORT` instead, since
+> no node could queue it; the transaction stays open, every later command
+> answers `QUEUED`, and EXEC applies nothing (BUG-0190).
 >
 > Queue-time errors — an unknown command, a wrong argument count, a
 > cross-slot key — poison the transaction, and EXEC then returns
@@ -204,12 +207,12 @@ SINTERSTORE, SUNIONSTORE, SDIFFSTORE.
 > not ours.
 
 **Lists**: LPUSH, RPUSH, LPOP, RPOP, LLEN, LRANGE, LINDEX, LSET, LTRIM,
-LREM, LINSERT, LPOS (RANK, COUNT, MAXLEN), LMOVE, RPOPLPUSH.
+LREM, LINSERT, LPOS (RANK, COUNT, MAXLEN), LMOVE, RPOPLPUSH, BLPOP, BRPOP,
+BLMOVE, BRPOPLPUSH (see "Blocking commands").
 
 > LMOVE and RPOPLPUSH are **same-slot only**, like the set operations:
 > colocate source and destination with a hash tag or the move is refused
-> with `CROSSSLOT`. Their blocking forms, BLMOVE and BRPOPLPUSH, are not
-> served.
+> with `CROSSSLOT`. So are their blocking forms, BLMOVE and BRPOPLPUSH.
 
 **Sorted sets**: ZADD, ZSCORE, ZMSCORE, ZINCRBY, ZREM, ZCARD, ZRANGE,
 ZREVRANGE, ZRANGEBYSCORE, ZREVRANGEBYSCORE (WITHSCORES, LIMIT, exclusive
@@ -217,7 +220,7 @@ bounds, ±inf), ZRANGEBYLEX, ZREVRANGEBYLEX (LIMIT, exclusive bounds,
 `-`/`+`), ZLEXCOUNT, ZREMRANGEBYLEX (exclusive bounds, `-`/`+`; no LIMIT,
 as upstream), ZRANK, ZREVRANK, ZCOUNT, ZPOPMIN, ZPOPMAX, ZREMRANGEBYSCORE,
 ZREMRANGEBYRANK, ZSCAN (MATCH, COUNT), ZUNIONSTORE, ZINTERSTORE (WEIGHTS,
-AGGREGATE SUM/MIN/MAX).
+AGGREGATE SUM/MIN/MAX), BZPOPMIN, BZPOPMAX (see "Blocking commands").
 
 > ZUNIONSTORE / ZINTERSTORE are **same-slot only**, and the rule covers the
 > destination as well as the inputs — these write, so a destination in an
@@ -509,9 +512,49 @@ Measured with each library's defaults (`client_compat_drill`): redis-py's
 `limits` (so Flask-Limiter and SlowAPI) in all three strategies, Go
 `redis_rate`, node `rate-limiter-flexible` and `rate-limit-redis`, and
 `python-redis-lock` when the lock's name carries a hash tag (its scripts
-name the lock and a signal list, which must then share a slot; its
-*blocking* acquire waits with `BLPOP`, which Flint does not serve, so use
-`acquire(blocking=False)` or a timeout loop).
+name the lock and a signal list, which must then share a slot), its blocking
+acquire included.
+
+## Blocking commands (ADR-0052)
+
+`BLPOP`, `BRPOP`, `BLMOVE`, `BRPOPLPUSH`, `BZPOPMIN` and `BZPOPMAX` block
+as in Redis: the reply is the first element any of the keys yields, in the
+order they are given, or a null array at the timeout (`0` waits for ever).
+The keys of `BLPOP`, `BRPOP` and the sorted-set pops need not share a slot:
+the order is a priority across pairs, which is what Sidekiq's
+`BRPOP critical default low` relies on. `BLMOVE` and `BRPOPLPUSH` need their
+two keys in one slot, as `LMOVE` does.
+
+The wait happens at the proxy, never on a seat, so a blocked client holds no
+seat connection or thread. The proxy tries each key in turn and, finding
+nothing, waits before trying again, 1 ms at first and doubling to 20 ms.
+What that means:
+
+- **An element is taken within about 20 ms of arriving.** Measured through a
+  local proxy, from a push to a blocked `BRPOP`'s reply: 13 ms at the median,
+  24 ms at most over 60 pushes. Redis wakes a blocked client at once.
+- **An idle blocked client costs about 44 attempts a second per key** at its
+  seat (measured), so a Sidekiq process with 5 threads on one queue costs
+  about 220 a second while idle.
+- **Blocked clients are not served in arrival order.** When several wait on
+  one key, the one whose next attempt comes first takes the element. Redis
+  serves the longest waiter first.
+- **A client that disconnects while blocked takes nothing afterwards.** A pop
+  already on its way to a seat when the client leaves completes, and that
+  element is lost with the connection, as a Redis reply to a closed socket
+  is. `BLMOVE` into a processing list is the pattern that loses nothing.
+- **Inside `MULTI` or a script a blocking pop does not wait**, as in Redis:
+  it answers what is there now, or a null.
+- **A seat answers these commands without waiting**, in every context, and
+  only a client of the proxy blocks. A seat's `BLMOVE` or `BRPOPLPUSH` that
+  finds nothing answers the null bulk that Redis gives inside `MULTI`, where
+  the proxy answers a null array at the timeout as Redis does.
+
+Commands a client pipelines behind a blocked pop run after it answers, in
+order, as in Redis. A blocking pop is charged once against the tenant's
+ops/s quota however long it waits, and its time is not counted in the
+tenant's latency histogram, where a two-second `BRPOP` would read as a
+two-second write.
 
 ## Excluded by design
 
@@ -536,8 +579,8 @@ name the lock and a signal list, which must then share a slot; its
   still refused across slots. Either write those keys one at a time, or give
   the cache a `KEY_FUNCTION` that puts one hash tag on every key, which puts
   that whole cache in one slot, on one pair.
-  Also **pub/sub**, **streams**, **blocking
-  commands** (BLPOP, BLMOVE …), **RANDOMKEY**, and **`EVAL_RO`,
+  Also **pub/sub** and **streams** (both planned, ADR-0052),
+  **RANDOMKEY**, and **`EVAL_RO`,
   `EVALSHA_RO`, `FUNCTION` and `FCALL`** (Redis 7's read-only scripts and
   functions; `EVAL` and `EVALSHA` are supported, see "Lua scripts").
   These conflict with slot-sharded multi-tenancy or reintroduce the

@@ -321,3 +321,56 @@ across pairs would need a commit protocol between them. rq's expected stage
 transactions across slots, at least across slots on one pair. That is a
 decision of its own, to be brought back as its own record, measured, rather
 than folded into this one.
+
+### Stage 2: D4, blocking pops, by the proxy polling (2026-09-27)
+
+- **At the seat** (`commands.rs`): `BLPOP`, `BRPOP`, `BZPOPMIN`,
+  `BZPOPMAX`, `BLMOVE` and `BRPOPLPUSH`, never waiting. Each answers what is
+  there now, as Redis does inside `MULTI` or a script, with Valkey's reply
+  shapes and its errors for a bad timeout (checked on the raw wire, both
+  protocols). The multi-key pops exclude every writer, as a two-key write
+  does (BUG-0188).
+- **At the proxy** (`blocking_pop`): a round is one attempt per key, in the
+  caller's order, each on the pair that owns that key, so the order is a
+  priority across pairs, which Sidekiq relies on. The first element wins.
+  Between rounds the proxy waits, 1 ms and doubling to 20 ms; at the timeout
+  it answers a null array.
+  - **Watching the client.** Only the wait watches the client's socket
+    (`ClientWatch`), never an attempt in flight, so a pop a seat has made is
+    never abandoned half-answered. A client that disconnects while blocked
+    takes nothing afterwards.
+  - **Pipelined commands** behind a pop are kept and run after it, in order.
+  - **Inside `MULTI`**, a pop is queued like any command and does not wait.
+    EXEC's reply tells a null array from a null bulk per queued pop, which
+    RESP3 alone cannot.
+  - **Accounting.** A pop is charged once against quota, never staged by
+    the prefetch pass, and kept out of the latency histogram.
+- **Measured.**
+  - An element pushed to a blocked `BRPOP` was taken 13 ms after the push at
+    the median, and 24 ms at most, over 60 pushes (local debug build). In
+    the gate box's drill, 13 and 15 ms.
+  - An idle blocked client cost about 44 attempts a second per key at its
+    seat, counted by a relay in front of the seat: 223 in 5 s on one key,
+    660 in 5 s on three.
+- **Found by this stage's probe: BUG-0190.** A transaction the proxy
+  aborted mid-queue was forgotten, so the commands behind it applied outside
+  any transaction. rq's enqueue surfaced it. It now stays open and doomed,
+  as a Redis transaction does after a queue-time error.
+
+**Re-measured** on a gate box after this stage:
+
+| library | after stage 2 |
+|---|---|
+| Sidekiq 8.1.7 | **push and fetch work**: `client_compat_drill` checks strict queue order across pairs, a job pushed while the fetcher waits, and an empty fetch that waits its 2 s. `Sidekiq::Queue#clear` is refused: it is a `MULTI` over `queue:<name>` and the `queues` set, which are in two slots |
+| asynq 0.26 | works, as after stage 1 |
+| rq 2.8.0 | refused at enqueue by its transaction across slots, now whole: nothing applies (BUG-0190) |
+| BullMQ 6.3.9 | on `{bull}`, stops at `cmsgpack` (stage 4), as after stage 1 |
+| Celery 5.6.3 | its worker still fails to start, now on a transaction across slots: kombu reads the lengths of a queue's priority lists (`celery`, `celery3`, `celery6`, `celery9`) in one `MULTI`, which is refused as `CROSSSLOT` before any pub/sub is reached |
+
+**Transactions across slots are the next blocker**, and the stages above do
+not remove it. rq's enqueue, Celery's queue-length read and Sidekiq's
+`Queue#clear` are each one `MULTI` over keys without a shared hash tag. The
+libraries cannot be told to add one, and ADR-0012 serves a transaction in one
+slot. That is a decision of its own, and comes to Jeff as its own record,
+measured, before stages 3 and 4. Pub/sub (stage 3) would not by itself make
+Celery work.

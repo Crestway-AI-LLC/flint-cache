@@ -2416,7 +2416,7 @@ ttl_max_ms:{}
     }
 }
 
-async fn serve_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
+async fn serve_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send>(
     mut stream: S,
     topo: Arc<Topology>,
 ) -> std::io::Result<()> {
@@ -2466,6 +2466,9 @@ async fn serve_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
     // Every complete command in the current read, decoded once. Reused across
     // reads so a pipelining client does not re-allocate it per batch.
     let mut cmds: Vec<(Vec<Vec<u8>>, Vec<u8>)> = Vec::new();
+    // Bytes arrived while a blocking pop waited (`ClientWatch`), so the next
+    // pass decodes before it reads.
+    let mut read_ahead = false;
     loop {
         let mut consumed = 0;
         out.clear();
@@ -2692,6 +2695,13 @@ async fn serve_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
                         client.command(args, proto)
                     }
                     AuthStep::Proceed(ns) => {
+                        // A blocking pop waits here, watching this client's
+                        // socket: see `ClientWatch`.
+                        let mut watch = ClientWatch {
+                            stream: &mut stream,
+                            buf: &mut buf,
+                            read_ahead: &mut read_ahead,
+                        };
                         data_command(
                             &topo,
                             &mut backends,
@@ -2704,6 +2714,7 @@ async fn serve_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
                             async_writes,
                             channel_deadline.is_some(),
                             prefetch,
+                            &mut watch,
                         )
                         .await
                     }
@@ -2723,8 +2734,13 @@ async fn serve_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
             // Record into this tenant's read/write histogram — data
             // commands only (the D1 classifier; AUTH/PROXY* are
             // neither), and only once a namespace is bound.
+            //
+            // Not a blocking pop: its time is mostly the wait the client
+            // asked for, and a two-second `BRPOP` would read as a
+            // two-second write.
             if let Some(ns) = authed_ns.as_deref()
                 && let Some(name) = args.first()
+                && !flint_commands::is_blocking_command(name)
             {
                 let is_write = flint_commands::is_write_command(name);
                 if is_write || flint_commands::is_read_command(name) {
@@ -2760,6 +2776,11 @@ async fn serve_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
             if !out.is_empty() {
                 stream.write_all(&out).await?;
             }
+        }
+        // A client that pipelined behind a blocking pop may now be waiting
+        // for those replies and send nothing more: decode what it sent.
+        if std::mem::take(&mut read_ahead) {
+            continue;
         }
         let n = stream.read(&mut chunk).await?;
         if n == 0 {
@@ -2803,6 +2824,15 @@ struct ProxyTxn {
     /// MULTI has been forwarded to `addr`. Deferred because the proxy
     /// cannot know which backend to open it on until a key appears.
     opened: bool,
+    /// One entry per command the backend QUEUED: whether that command's
+    /// null is a null ARRAY. RESP3 has one null, so EXEC's reply cannot say
+    /// which it was; this does (see the EXEC arm).
+    null_arrays: Vec<bool>,
+    /// The transaction was aborted while the client still has it open
+    /// (BUG-0190). Its backend connection is gone, and with it the queue;
+    /// until EXEC or DISCARD, every command answers QUEUED and none runs,
+    /// as Redis does after a command fails to queue.
+    doomed: bool,
 }
 
 impl ProxyTxn {
@@ -2810,6 +2840,8 @@ impl ProxyTxn {
         self.open = false;
         self.addr = None;
         self.opened = false;
+        self.null_arrays.clear();
+        self.doomed = false;
     }
 }
 
@@ -2822,7 +2854,14 @@ fn abort_txn(backends: &mut Backends, txn: &mut ProxyTxn, why: &str) -> Value {
     if let Some(addr) = txn.addr.clone() {
         backends.drop_conn(&addr);
     }
+    // BUG-0190: a transaction the client has open STAYS open, doomed. This
+    // used to reset it, so the client's next commands -- which every client
+    // library has already pipelined behind MULTI -- ran outside any
+    // transaction and applied, and its EXEC answered "EXEC without MULTI".
+    let open = txn.open;
     txn.reset();
+    txn.open = open;
+    txn.doomed = open;
     Value::Error(format!(
         "EXECABORT Transaction discarded: {why}. Retry the transaction."
     ))
@@ -2886,6 +2925,23 @@ async fn transaction_step(
     raw: &[u8],
 ) -> Option<Value> {
     let name = args.first()?.to_ascii_uppercase();
+    // An aborted transaction the client still has open (BUG-0190): nothing
+    // reaches a backend until the client ends it, and EXEC applies nothing.
+    if txn.doomed {
+        return Some(match name.as_slice() {
+            b"EXEC" => {
+                txn.reset();
+                Value::Error("EXECABORT Transaction discarded because of previous errors.".into())
+            }
+            b"DISCARD" => {
+                txn.reset();
+                Value::Simple("OK".into())
+            }
+            b"MULTI" => Value::Error("ERR Command 'multi' not allowed inside a transaction".into()),
+            b"WATCH" => Value::Error("ERR Command 'watch' not allowed inside a transaction".into()),
+            _ => Value::Simple("QUEUED".into()),
+        });
+    }
     // Where a command must go, if it names a key at all.
     let routed = route_key(args)
         .map(slot_for_key)
@@ -3002,6 +3058,22 @@ async fn transaction_step(
                     // and nowhere else. Array(None) still encodes to `_` for
                     // a RESP3 client, so this costs that path nothing.
                     Ok(Value::Null) => Value::Array(None),
+                    // The same loss inside the reply: a queued BLPOP,
+                    // BRPOP, BZPOPMIN or BZPOPMAX that found nothing
+                    // answers a null array, which RESP3 also sends as `_`
+                    // (ADR-0052 D4).
+                    Ok(Value::Array(Some(items))) if items.len() == ended.null_arrays.len() => {
+                        Value::Array(Some(
+                            items
+                                .into_iter()
+                                .zip(&ended.null_arrays)
+                                .map(|(v, &array)| match v {
+                                    Value::Null if array => Value::Array(None),
+                                    other => other,
+                                })
+                                .collect(),
+                        ))
+                    }
                     Ok(v) => v,
                     Err(why) => abort_txn(backends, &mut ended, &why),
                 }),
@@ -3047,7 +3119,15 @@ async fn transaction_step(
                 }
             }
             match call_pinned(backends, &addr, raw).await {
-                Ok(v) => Some(v),
+                Ok(v) => {
+                    if matches!(&v, Value::Simple(q) if q == "QUEUED") {
+                        txn.null_arrays.push(matches!(
+                            name.as_slice(),
+                            b"BLPOP" | b"BRPOP" | b"BZPOPMIN" | b"BZPOPMAX"
+                        ));
+                    }
+                    Some(v)
+                }
                 Err(why) => Some(abort_txn(backends, txn, &why)),
             }
         }
@@ -3305,6 +3385,15 @@ fn prefetchable(args: &[Vec<u8>], name: &[u8], replica_reads: bool) -> bool {
                 | b"EVAL"
                 | b"EVALSHA"
                 | b"SCRIPT"
+                // The blocking pops: `handle` makes the client wait
+                // (ADR-0052 D4). Staged, a seat would answer the
+                // non-blocking form at once.
+                | b"BLPOP"
+                | b"BRPOP"
+                | b"BZPOPMIN"
+                | b"BZPOPMAX"
+                | b"BLMOVE"
+                | b"BRPOPLPUSH"
         )
     {
         return false;
@@ -3474,6 +3563,7 @@ async fn data_command(
     async_writes: bool,
     is_channel: bool,
     prefetch: Prefetch,
+    idle: &mut dyn Idle,
 ) -> Value {
     // Decisions the prefetch pass already took are final — re-running the
     // quota gate here would charge the tenant's bucket twice for one command.
@@ -3637,7 +3727,7 @@ async fn data_command(
             topo.fanout_timeout,
         )
     });
-    let reply = handle(topo, b, ns, args, raw, read_replica).await;
+    let reply = handle(topo, b, ns, args, raw, read_replica, idle).await;
     cache_writeback(topo, ns, args, &reply, local_cache, cacheable);
     reply
 }
@@ -3759,7 +3849,7 @@ fn cache_writeback(
             // leaves the other answering from before the rename, so a
             // cached source would resurrect a key that is now gone. LMOVE
             // and RPOPLPUSH change both keys too.
-            b"RENAME" | b"RENAMENX" | b"LMOVE" | b"RPOPLPUSH" => {
+            b"RENAME" | b"RENAMENX" | b"LMOVE" | b"RPOPLPUSH" | b"BLMOVE" | b"BRPOPLPUSH" => {
                 for k in args[1..].iter().take(2) {
                     topo.cache.invalidate(ns, k);
                 }
@@ -4381,6 +4471,147 @@ async fn split_mget(
     assemble_mget(keys.len(), &groups, replies)
 }
 
+/// How a blocking pop waits between rounds (ADR-0052 D4).
+trait Idle {
+    /// Wait for up to `d`. False when the client has gone: the pop ends
+    /// then, rather than take an element for no one.
+    fn wait(&mut self, d: Duration) -> std::pin::Pin<Box<dyn Future<Output = bool> + Send + '_>>;
+}
+
+/// The client connection's own waiter: the wait races a read of the
+/// client's socket. End of stream means the client left. Bytes mean it
+/// pipelined behind the pop; they are kept for the connection loop, which
+/// decodes them once the pop has answered (`read_ahead`), as Redis runs
+/// them after the blocked command.
+///
+/// Only the WAIT watches the socket, never an attempt in flight, so a pop a
+/// seat has already made is never abandoned mid-reply.
+struct ClientWatch<'a, S> {
+    stream: &'a mut S,
+    buf: &'a mut Vec<u8>,
+    read_ahead: &'a mut bool,
+}
+
+impl<S: tokio::io::AsyncRead + Unpin + Send> Idle for ClientWatch<'_, S> {
+    fn wait(&mut self, d: Duration) -> std::pin::Pin<Box<dyn Future<Output = bool> + Send + '_>> {
+        Box::pin(async move {
+            let until = tokio::time::Instant::now() + d;
+            let mut chunk = [0u8; 4096];
+            loop {
+                // Past the query buffer's bound, stop reading: the client
+                // has its reply to wait for before it may send more.
+                if self.buf.len() >= MAX_QUERY_BUF {
+                    tokio::time::sleep_until(until).await;
+                    return true;
+                }
+                tokio::select! {
+                    _ = tokio::time::sleep_until(until) => return true,
+                    got = self.stream.read(&mut chunk) => match got {
+                        Ok(0) | Err(_) => return false,
+                        Ok(n) => {
+                            self.buf.extend_from_slice(&chunk[..n]);
+                            *self.read_ahead = true;
+                        }
+                    },
+                }
+            }
+        })
+    }
+}
+
+/// A plain timer, for a caller with no client socket to watch.
+#[cfg(test)]
+struct Sleep;
+
+#[cfg(test)]
+impl Idle for Sleep {
+    fn wait(&mut self, d: Duration) -> std::pin::Pin<Box<dyn Future<Output = bool> + Send + '_>> {
+        Box::pin(async move {
+            tokio::time::sleep(d).await;
+            true
+        })
+    }
+}
+
+/// The first wait between rounds of a blocking pop, and the most a wait
+/// grows to (ADR-0052 D4). A wait doubles from the first to the cap, so an
+/// element pushed to an idle queue is taken within about `BLOCK_POLL_MAX`,
+/// and an idle blocked client costs one attempt per key per `BLOCK_POLL_MAX`.
+const BLOCK_POLL_FIRST: Duration = Duration::from_millis(1);
+const BLOCK_POLL_MAX: Duration = Duration::from_millis(20);
+
+/// `BLPOP`, `BRPOP`, `BZPOPMIN`, `BZPOPMAX`, `BLMOVE`, `BRPOPLPUSH`: the
+/// client waits here, at the proxy, and no seat ever holds a connection or
+/// a thread for it (ADR-0052 D4).
+///
+/// A round is one attempt per key, in the caller's order, each the command's
+/// non-blocking form for that one key on the pair that owns it, as a seat
+/// answers it inside `MULTI`. The first element any key yields is the reply,
+/// so the keys' order is a priority, as in Redis (Sidekiq's
+/// `BRPOP critical default low`), and keys on different pairs need no hash
+/// tag. A move has one source and is one attempt; the seat refuses a
+/// cross-slot one. The first round's attempts carry the command's own
+/// timeout, so the seat checks the arguments and any error returns at once.
+///
+/// Between rounds the wait doubles from `BLOCK_POLL_FIRST` to
+/// `BLOCK_POLL_MAX`. At the timeout, or when the client leaves, the reply is
+/// a null array, which is what Redis answers at a timeout. What polling does
+/// not give: blocked clients are not served first come, first served, and
+/// an element is taken up to one wait after it arrives.
+async fn blocking_pop(
+    topo: &Arc<Topology>,
+    backends: &mut Backends,
+    ns: &[u8],
+    args: &[Vec<u8>],
+    raw: &[u8],
+    idle: &mut dyn Idle,
+) -> Value {
+    let name = args[0].to_ascii_uppercase();
+    let moves = matches!(name.as_slice(), b"BLMOVE" | b"BRPOPLPUSH");
+    let attempts: Vec<(Vec<Vec<u8>>, Vec<u8>)> = if moves || args.len() <= 3 {
+        vec![(args.to_vec(), raw.to_vec())]
+    } else {
+        let timeout = &args[args.len() - 1];
+        args[1..args.len() - 1]
+            .iter()
+            .map(|k| {
+                let one = vec![args[0].clone(), k.clone(), timeout.clone()];
+                let frame = encode_cmd(&one.iter().map(Vec::as_slice).collect::<Vec<_>>());
+                (one, frame)
+            })
+            .collect()
+    };
+    let started = Instant::now();
+    let mut delay = BLOCK_POLL_FIRST;
+    loop {
+        for (one, frame) in &attempts {
+            match forward(topo, backends, ns, one, frame, false).await {
+                Value::Null | Value::Array(None) | Value::Bulk(None) => {}
+                other => return other,
+            }
+        }
+        // Every attempt missed, so the seat accepted the arguments and the
+        // timeout parses; 0 waits for ever.
+        let secs = args
+            .last()
+            .and_then(|t| std::str::from_utf8(t).ok())
+            .and_then(|t| t.parse::<f64>().ok())
+            .unwrap_or(0.0);
+        let mut wait = delay;
+        if secs > 0.0 {
+            let left = secs - started.elapsed().as_secs_f64();
+            if left <= 0.0 {
+                return Value::Array(None);
+            }
+            wait = wait.min(Duration::from_secs_f64(left.min(1.0)));
+        }
+        if !idle.wait(wait).await {
+            return Value::Array(None);
+        }
+        delay = (delay * 2).min(BLOCK_POLL_MAX);
+    }
+}
+
 async fn handle(
     topo: &Arc<Topology>,
     backends: &mut Backends,
@@ -4388,6 +4619,7 @@ async fn handle(
     args: &[Vec<u8>],
     raw: &[u8],
     read_replica: bool,
+    idle: &mut dyn Idle,
 ) -> Value {
     let Some(name) = args.first() else {
         return Value::Error("ERR empty command".into());
@@ -4425,6 +4657,11 @@ async fn handle(
         // An MGET across slots: one MGET per slot, reassembled in the
         // caller's order (ADR-0048). See `split_mget`.
         b"MGET" if args.len() > 2 => split_mget(topo, backends, ns, args, raw, read_replica).await,
+        // The blocking pops wait here, not on a seat (ADR-0052 D4). See
+        // `blocking_pop`.
+        _ if flint_commands::is_blocking_command(&upper) => {
+            blocking_pop(topo, backends, ns, args, raw, idle).await
+        }
         // Group-wide aggregates fan out.
         b"DBSIZE" => {
             fan_out(topo, backends, raw, |replies| {
@@ -5775,6 +6012,7 @@ mod route_tests {
             false,
             true,
             Prefetch::None,
+            &mut Sleep,
         )
         .await;
         match on_channel {
@@ -5805,6 +6043,7 @@ mod route_tests {
             false,
             false,
             Prefetch::None,
+            &mut Sleep,
         )
         .await;
         match on_client {

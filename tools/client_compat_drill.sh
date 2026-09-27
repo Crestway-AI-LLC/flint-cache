@@ -261,6 +261,25 @@ def cross_slot_mset_txn():
         raise AssertionError("a transaction with a cross-slot MSET was not refused")
     assert r.get("a") is None, "the SET queued beside a refused MSET applied"
 check("a cross-slot MSET poisons its whole transaction", cross_slot_mset_txn)
+def cross_pair_txn():
+    # BUG-0190: a transaction whose keys reach a second PAIR is aborted by
+    # the proxy, which then forgot it: the commands the client had
+    # pipelined behind the failing one ran outside any transaction and
+    # applied, and EXEC answered "EXEC without MULTI". rq's enqueue found it.
+    r.delete("a", "b", "c")
+    p = r.pipeline(transaction=True)
+    p.set("a", "1")
+    p.set("b", "2")
+    p.set("c", "3")
+    try:
+        p.execute()
+    except redis.ResponseError as e:
+        assert "EXECABORT" in str(e) or "different shard" in str(e), f"refused, but how: {e}"
+    else:
+        raise AssertionError("a transaction across two pairs was not refused")
+    assert r.mget(["a", "b", "c"]) == [None, None, None], "part of an aborted transaction applied"
+    assert r.set("c", "after") and r.get("c") == "after", "the connection is usable afterwards"
+check("a transaction across pairs applies nothing, and the connection recovers", cross_pair_txn)
 
 print("== MGET across slots (ADR-0048)")
 # The proxy splits an MGET per slot and puts the values back in order. `a`
@@ -407,10 +426,84 @@ def expire_conditions():
     r.delete("ex:k")
 check("EXPIRE's Redis 7 conditions NX, XX, GT, LT", expire_conditions)
 
+print("== blocking pops wait at the proxy (ADR-0052 D4)")
+import socket, threading, time
+r2 = redis.Redis(host="127.0.0.1", port=PORT, password=PW, decode_responses=True, protocol=3)
+def wire(cmds, settle=0.0, between=0.0):
+    """The raw replies to cmds, sent on one authenticated RESP2 connection."""
+    s = socket.create_connection(("127.0.0.1", PORT)); s.settimeout(5)
+    enc = lambda p: b"*%d\r\n" % len(p) + b"".join(b"$%d\r\n%s\r\n" % (len(x), x.encode()) for x in p)
+    s.sendall(enc(["AUTH", PW])); time.sleep(0.1); s.recv(1024)
+    for i, c in enumerate(cmds):
+        s.sendall(enc(c))
+        if between and i < len(cmds) - 1:
+            time.sleep(between)
+    time.sleep(settle); s.settimeout(0.5); out = b""
+    try:
+        while True:
+            d = s.recv(65536)
+            if not d:
+                break
+            out += d
+    except socket.timeout:
+        pass
+    s.close()
+    return out
+def pops_time_out():
+    r.delete("a", "b")
+    t = time.time(); got = r.brpop(["a", "b"], timeout=0.3); el = time.time() - t
+    assert got is None and 0.29 <= el < 2, f"{got!r} after {el:.2f}s"
+    assert wire([["BLPOP", "a", "0.05"]], 0.3) == b"*-1\r\n", "a timeout is a null array"
+check("a timeout answers nil, after the timeout", pops_time_out)
+def served_by_a_push():
+    # a and b are on the two pairs: the waiter is served whichever one the
+    # element lands on, with no hash tag between them.
+    for key in ("a", "b"):
+        r.delete("a", "b"); got = {}
+        th = threading.Thread(target=lambda: got.update(v=r.brpop(["a", "b"], timeout=0), t=time.time()), daemon=True)
+        th.start(); time.sleep(0.3); pushed = time.time(); r2.lpush(key, "v"); th.join(10)
+        assert got.get("v") == [key, "v"], f"{key}: {got.get('v')!r}"
+        print(f"      {key}: taken {1000 * (got['t'] - pushed):.0f} ms after the push")
+check("a waiter is served by another connection's push, on either pair", served_by_a_push)
+def priority():
+    r.delete("a", "b"); r.lpush("a", "1"); r.lpush("b", "2")
+    assert r.brpop(["b", "a"], timeout=0) == ["b", "2"]
+    assert r.brpop(["b", "a"], timeout=0) == ["a", "1"]
+check("the keys' order is a priority, across pairs", priority)
+def every_form():
+    r.delete("{q}l", "{q}d", "{q}z"); r.rpush("{q}l", "p", "q", "s")
+    assert r.blpop(["{q}l"], 0) == ["{q}l", "p"]
+    assert r.blmove("{q}l", "{q}d", 0, "RIGHT", "LEFT") == "s"
+    assert r.brpoplpush("{q}l", "{q}d", 0) == "q"
+    r.zadd("{q}z", {"m": 1.5, "n": 2})
+    assert r.bzpopmin(["{q}z"], 0) == ["{q}z", "m", 1.5], "bzpopmin"
+    assert r.bzpopmax(["{q}z"], 0) == ["{q}z", "n", 2.0], "bzpopmax"
+    assert wire([["ZADD", "{q}z", "1.5", "w"], ["BZPOPMIN", "{q}z", "0"]], 0.3) == \
+        b":1\r\n*3\r\n$4\r\n{q}z\r\n$1\r\nw\r\n$3\r\n1.5\r\n", "RESP2 wire"
+check("BLPOP, BLMOVE, BRPOPLPUSH, BZPOPMIN, BZPOPMAX", every_form)
+def a_client_that_left():
+    r.delete("gone")
+    s = socket.create_connection(("127.0.0.1", PORT))
+    s.sendall(b"*2\r\n$4\r\nAUTH\r\n$%d\r\n%s\r\n" % (len(PW), PW.encode()))
+    time.sleep(0.1); s.recv(64)
+    s.sendall(b"*3\r\n$5\r\nBLPOP\r\n$4\r\ngone\r\n$1\r\n0\r\n"); time.sleep(0.2); s.close()
+    time.sleep(0.2); r2.lpush("gone", "v"); time.sleep(0.5)
+    assert r.llen("gone") == 1, "a client that left took the element"
+check("a client that left mid-wait takes nothing", a_client_that_left)
+def behind_a_pop():
+    r.delete("pz")
+    assert wire([["BLPOP", "pz", "0.2"], ["PING"]], 0.6) == b"*-1\r\n+PONG\r\n", "sent together"
+    assert wire([["BLPOP", "pz", "0.3"], ["PING"]], 0.8, between=0.1) == b"*-1\r\n+PONG\r\n", "sent while it waits"
+check("commands pipelined behind a pop answer after it, in order", behind_a_pop)
+def in_multi():
+    r.delete("{m}l")
+    assert wire([["MULTI"], ["BLPOP", "{m}l", "0"], ["BLMOVE", "{m}l", "{m}l", "LEFT", "LEFT", "0"], ["EXEC"]], 0.5) == \
+        b"+OK\r\n+QUEUED\r\n+QUEUED\r\n*2\r\n*-1\r\n$-1\r\n"
+check("inside MULTI a pop does not wait, and answers as Redis does", in_multi)
+
 print("== commands we exclude by design still fail HONESTLY")
 check("SUBSCRIBE", lambda: r.pubsub().subscribe("c") or r.execute_command("SUBSCRIBE", "c"),
       expect_unsupported=True)
-check("BLPOP", lambda: r.blpop("nolist", timeout=1), expect_unsupported=True)
 
 def _fail():
     raise AssertionError("unexpected value")
@@ -499,6 +592,26 @@ def pylock():
         theirs.release()
     r.close()
 check("python-redis-lock, hash-tagged name: acquire, extend, release, re-take", pylock)
+def pylock_blocking():
+    # A blocking acquire waits with BLPOP on the lock's signal list, which
+    # the holder's release pushes to (ADR-0052 D4).
+    import threading, time
+    r = redis.Redis(host="127.0.0.1", port=PORT, password=PW, socket_timeout=10)
+    for name in ("{a}wait", "{b}wait"):
+        r.delete(f"lock:{name}", f"lock-signal:{name}")
+        mine = redis_lock.Lock(r, name, expire=30)
+        assert mine.acquire(blocking=False), f"{name}: acquire"
+        got = {}
+        def wait():
+            t = time.time()
+            got["ok"] = redis_lock.Lock(r, name, expire=30).acquire(blocking=True, timeout=10)
+            got["s"] = time.time() - t
+        th = threading.Thread(target=wait, daemon=True); th.start()
+        time.sleep(0.3); mine.release(); th.join(15)
+        assert got.get("ok") is True and got["s"] < 2, f"{name}: {got}"
+        r.delete(f"lock:{name}", f"lock-signal:{name}")
+    r.close()
+check("python-redis-lock: a blocking acquire takes the lock when it is released", pylock_blocking)
 if fails:
     print(f"\nFAIL: {len(fails)} client-visible problem(s): {', '.join(fails)}")
     sys.exit(1)
@@ -642,7 +755,16 @@ await check('MGET across slots (ADR-0048)', async () => {
   await c.set('a', 'va'); await c.set('b', 'vb'); await c.del('nr:none');
   eq(await c.mGet(['a', 'nr:none', 'b']), ['va', null, 'vb'], 'mGet');
 });
-await check('BLPOP', async () => { await c.blPop('nr:nolist', 1); }, true);
+await check('BLPOP waits at the proxy, and pops (ADR-0052)', async () => {
+  await c.del('nr:bl');
+  const t = Date.now();
+  eq(await c.blPop('nr:bl', 0.2), null, 'a timeout is null');
+  if (Date.now() - t < 190) throw new Error(`answered after ${Date.now() - t} ms, before its timeout`);
+  await c.rPush('nr:bl', 'x');
+  const got = await c.blPop('nr:bl', 0);
+  eq(got && got.key, 'nr:bl', 'key');
+  eq(got && got.element, 'x', 'element');
+});
 await check('KEYS (ADR-0050)', async () => {
   await c.set('nrk:1', 'v'); await c.set('nrk:2', 'v');
   eq((await c.keys('nrk:*')).sort(), ['nrk:1', 'nrk:2'], 'keys');
@@ -908,7 +1030,7 @@ fi
 GO=${FLINT_COMPAT_GO:-$(command -v go || true)}
 if [ -z "$GO" ]; then
   echo "== go-redis: SKIP (no go on PATH)"
-  SKIPPED="$SKIPPED go-redis redsync redis_rate"
+  SKIPPED="$SKIPPED go-redis redsync redis_rate asynq"
 else
   GO_DIR=${FLINT_COMPAT_GO_DIR:-$FLINT_DRILL_ROOT/flint-compat-go}
   mkdir -p "$GO_DIR"
@@ -1131,6 +1253,84 @@ GOSRC
     [ $? -eq 0 ] || { echo "FAIL: redis_rate compatibility"; exit 1; }
     RAN="$RAN, redis_rate"
   fi
+
+  # -------------------------------------------------------------------------
+  # asynq v0.26 (ADR-0052). Its dequeue script writes the task's hash under
+  # a key built from ARGV and the popped id, in the queue's hash tag: a key
+  # in the declared slot that KEYS does not name (D2).
+  # -------------------------------------------------------------------------
+  AQ_DIR=${FLINT_COMPAT_ASYNQ_DIR:-$FLINT_DRILL_ROOT/flint-compat-asynq}
+  mkdir -p "$AQ_DIR"
+  cat > "$AQ_DIR/main.go" <<'GOSRC'
+package main
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"sync/atomic"
+	"time"
+
+	"github.com/hibiken/asynq"
+)
+
+func main() {
+	opt := asynq.RedisClientOpt{Addr: os.Getenv("FLINT_ADDR"), Password: os.Getenv("FLINT_TOKEN")}
+	client := asynq.NewClient(opt)
+	defer client.Close()
+	fails := 0
+	say := func(ok bool, name string, note string) {
+		mark := "ok "
+		if !ok {
+			mark, fails = "FAIL", fails+1
+		} else {
+			note = ""
+		}
+		fmt.Printf("  %s %s%s\n", mark, name, note)
+	}
+	const n = 3
+	for i := 0; i < n; i++ {
+		_, err := client.Enqueue(asynq.NewTask("compat", []byte{byte(i)}))
+		say(err == nil, fmt.Sprintf("enqueue %d", i), fmt.Sprintf("  %v", err))
+	}
+	var done int32
+	srv := asynq.NewServer(opt, asynq.Config{Concurrency: 2, LogLevel: asynq.FatalLevel})
+	mux := asynq.NewServeMux()
+	mux.HandleFunc("compat", func(ctx context.Context, t *asynq.Task) error {
+		atomic.AddInt32(&done, 1)
+		return nil
+	})
+	if err := srv.Start(mux); err != nil {
+		say(false, "server start", "  "+err.Error())
+	} else {
+		for i := 0; i < 100 && atomic.LoadInt32(&done) < n; i++ {
+			time.Sleep(100 * time.Millisecond)
+		}
+		srv.Shutdown()
+		say(atomic.LoadInt32(&done) == n, fmt.Sprintf("the server processes all %d", n),
+			fmt.Sprintf("  processed %d", atomic.LoadInt32(&done)))
+	}
+	if fails > 0 {
+		fmt.Printf("\nFAIL: %d client-visible problem(s)\n", fails)
+		os.Exit(1)
+	}
+	fmt.Println("\nall asynq checks passed")
+}
+GOSRC
+  if [ ! -f "$AQ_DIR/go.sum" ]; then
+    (cd "$AQ_DIR" && { [ -f go.mod ] || "$GO" mod init flintcompatasynq >/dev/null 2>&1; } \
+      && "$GO" get github.com/hibiken/asynq@v0.26.0 >/dev/null 2>&1 \
+      && "$GO" mod tidy >/dev/null 2>&1)
+  fi
+  if [ ! -f "$AQ_DIR/go.sum" ]; then
+    echo "== asynq: SKIP (could not fetch the module; offline?)"
+    SKIPPED="$SKIPPED asynq"
+  else
+    echo "== client: asynq $(sed -n 's/.*hibiken\/asynq \(v[0-9.]*\).*/\1/p' "$AQ_DIR/go.mod" | head -1)"
+    (cd "$AQ_DIR" && FLINT_ADDR=127.0.0.1:$PORT FLINT_TOKEN=tok-acme "$GO" run .)
+    [ $? -eq 0 ] || { echo "FAIL: asynq compatibility"; exit 1; }
+    RAN="$RAN, asynq"
+  fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -1144,7 +1344,7 @@ fi
 RUBY=${FLINT_COMPAT_RUBY:-$(command -v ruby || true)}
 if [ -z "$RUBY" ]; then
   echo "== rails cache store: SKIP (no ruby on PATH)"
-  SKIPPED="$SKIPPED rails-cache-store redlock-rb"
+  SKIPPED="$SKIPPED rails-cache-store redlock-rb sidekiq"
 else
   RB_HOME=${FLINT_COMPAT_GEM_HOME:-$FLINT_DRILL_ROOT/flint-compat-ruby}
   # GEM_HOME only. Setting GEM_PATH too hides the system gems, and gem install
@@ -1260,6 +1460,70 @@ RUBYSRC
     GEM_HOME="$RB_HOME" FLINT_PORT=$PORT FLINT_TOKEN=tok-acme "$RUBY" "$RB_HOME/redlock.rb"
     [ $? -eq 0 ] || { echo "FAIL: redlock-rb compatibility"; exit 1; }
     RAN="$RAN, redlock-rb"
+  fi
+
+  # -------------------------------------------------------------------------
+  # Sidekiq 8 (ADR-0052). Its client pushes with LPUSH; its fetcher takes a
+  # job with `BRPOP queue:... 2`, which waits at the proxy. Queue keys carry
+  # no hash tag, so strict queue order is a priority across pairs.
+  # -------------------------------------------------------------------------
+  sk_ready() { GEM_HOME="$RB_HOME" "$RUBY" -e 'gem "sidekiq", "8.1.7"; require "sidekiq"' >/dev/null 2>&1; }
+  if ! sk_ready; then
+    GEM_HOME="$RB_HOME" "$(dirname "$RUBY")/gem" install --no-document --silent sidekiq -v 8.1.7 >/dev/null 2>&1
+  fi
+  if ! sk_ready; then
+    echo "== sidekiq: SKIP (could not install sidekiq 8.1.7; offline?)"
+    SKIPPED="$SKIPPED sidekiq"
+  else
+    cat > "$RB_HOME/sidekiq_check.rb" <<'RUBYSRC'
+gem "sidekiq", "8.1.7"
+require "sidekiq"
+require "sidekiq/api"
+require "sidekiq/fetch"
+
+puts "== client: sidekiq #{Sidekiq::VERSION}"
+fails = []
+check = lambda do |name, ok, note = ""|
+  puts "  #{ok ? 'ok  ' : 'FAIL'} #{name}#{ok ? '' : "  #{note}"}"
+  fails << name unless ok
+end
+url = "redis://:#{ENV.fetch('FLINT_TOKEN')}@127.0.0.1:#{ENV.fetch('FLINT_PORT')}"
+Sidekiq.configure_client { |c| c.redis = { url: url } }
+Sidekiq.configure_server { |c| c.redis = { url: url } }
+class CompatJob; include Sidekiq::Job; def perform(x); end; end
+begin
+  # A plain DEL, which the proxy splits by pair. Queue#clear is a MULTI
+  # over queue:<name> and the "queues" set, two slots (ADR-0052 as built).
+  Sidekiq.redis { |c| c.call("DEL", "queue:critical", "queue:default") }
+  cap = Sidekiq.default_configuration.default_capsule
+  cap.queues = %w[critical default]
+  fetch = Sidekiq::BasicFetch.new(cap)
+  CompatJob.set(queue: "default").perform_async(1)
+  CompatJob.set(queue: "critical").perform_async(2)
+  first, second = fetch.retrieve_work, fetch.retrieve_work
+  check.("fetch takes queues in strict order", first&.queue_name == "critical" && second&.queue_name == "default",
+         [first&.queue_name, second&.queue_name].inspect)
+  taken = nil
+  waiter = Thread.new { taken = fetch.retrieve_work }
+  sleep 0.5
+  CompatJob.set(queue: "default").perform_async(3)
+  waiter.join(5)
+  check.("a job pushed while the fetcher waits is taken", taken&.queue_name == "default", taken.inspect)
+  t = Time.now
+  idle = fetch.retrieve_work
+  check.("an empty fetch waits its 2 s and returns nothing", idle.nil? && Time.now - t >= 1.9, "#{idle.inspect} after #{Time.now - t}")
+rescue => e
+  check.("sidekiq push and fetch", false, "#{e.class}: #{e.message[0, 200]}")
+end
+if fails.any?
+  puts "\nFAIL: #{fails.size} client-visible problem(s): #{fails.join(', ')}"
+  exit 1
+end
+puts "\nall sidekiq checks passed"
+RUBYSRC
+    GEM_HOME="$RB_HOME" FLINT_PORT=$PORT FLINT_TOKEN=tok-acme "$RUBY" "$RB_HOME/sidekiq_check.rb"
+    [ $? -eq 0 ] || { echo "FAIL: sidekiq compatibility"; exit 1; }
+    RAN="$RAN, sidekiq"
   fi
 fi
 

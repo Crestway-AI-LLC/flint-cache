@@ -799,6 +799,38 @@ impl<'a> Dispatcher<'a> {
             b"RPOPLPUSH" => exact(args, 3, "rpoplpush", |a| {
                 self.cmd_lmove(&a[1], &a[2], false, true)
             }),
+            // ADR-0052 D4: the blocking pops, never waiting. See `cmd_bpop`.
+            b"BLMOVE" => {
+                if args.len() != 6 {
+                    return arity_err("blmove");
+                }
+                let side = |a: &[u8]| {
+                    if a.eq_ignore_ascii_case(b"LEFT") {
+                        Some(true)
+                    } else if a.eq_ignore_ascii_case(b"RIGHT") {
+                        Some(false)
+                    } else {
+                        None
+                    }
+                };
+                let (Some(from_left), Some(to_left)) = (side(&args[3]), side(&args[4])) else {
+                    return err("ERR syntax error");
+                };
+                match parse_block_timeout(&args[5]) {
+                    Ok(_) => self.cmd_lmove(&args[1], &args[2], from_left, to_left),
+                    Err(e) => e,
+                }
+            }
+            b"BRPOPLPUSH" => exact(args, 4, "brpoplpush", |a| {
+                match parse_block_timeout(&a[3]) {
+                    Ok(_) => self.cmd_lmove(&a[1], &a[2], false, true),
+                    Err(e) => e,
+                }
+            }),
+            b"BLPOP" => self.cmd_bpop(args, "blpop", false, false),
+            b"BRPOP" => self.cmd_bpop(args, "brpop", false, true),
+            b"BZPOPMIN" => self.cmd_bpop(args, "bzpopmin", true, false),
+            b"BZPOPMAX" => self.cmd_bpop(args, "bzpopmax", true, true),
             b"LPOP" | b"RPOP" => exact(args, 2, "lpop", |a| {
                 let left = name.eq_ignore_ascii_case(b"LPOP");
                 reply(
@@ -1247,6 +1279,58 @@ impl<'a> Dispatcher<'a> {
                 store_err(e)
             }
         }
+    }
+
+    /// `BLPOP` / `BRPOP` / `BZPOPMIN` / `BZPOPMAX key [key ...] timeout`,
+    /// without waiting (ADR-0052 D4): the first key in order that holds an
+    /// element answers `[key, element]` (`[key, member, score]` for a sorted
+    /// set), and none answers a null array. That is what Redis does inside
+    /// `MULTI` or a script, where a command may not block.
+    ///
+    /// A seat never waits. Through the proxy a client does: the proxy runs
+    /// this form one key at a time, in the caller's order, until one answers
+    /// or the timeout passes. `end` is the right end of a list, or the
+    /// highest score.
+    fn cmd_bpop(&self, args: &[Vec<u8>], name: &str, zset: bool, end: bool) -> Value {
+        if args.len() < 3 {
+            return arity_err(name);
+        }
+        if let Err(e) = parse_block_timeout(&args[args.len() - 1]) {
+            return e;
+        }
+        let keys = &args[1..args.len() - 1];
+        if let Some(refusal) = Self::crossslot(&keys[0], &keys[1..]) {
+            return refusal;
+        }
+        for k in keys {
+            let slot = slot_for_key(k);
+            if zset {
+                match self.zsets.zpop(slot, k, 1, end) {
+                    Ok(popped) => {
+                        if let Some((member, score)) = popped.into_iter().next() {
+                            return Value::Array(Some(vec![
+                                Value::Bulk(Some(k.clone())),
+                                Value::Bulk(Some(member)),
+                                Value::Double(score),
+                            ]));
+                        }
+                    }
+                    Err(e) => return store_err(e),
+                }
+            } else {
+                match self.lists.pop(slot, k, !end) {
+                    Ok(Some(v)) => {
+                        return Value::Array(Some(vec![
+                            Value::Bulk(Some(k.clone())),
+                            Value::Bulk(Some(v)),
+                        ]));
+                    }
+                    Ok(None) => {}
+                    Err(e) => return store_err(e),
+                }
+            }
+        }
+        Value::Array(None)
     }
 
     fn cmd_hset(&self, args: &[Vec<u8>], name: &str) -> Value {
@@ -3256,6 +3340,22 @@ fn parse_f64(raw: &[u8]) -> Result<f64, ()> {
     } else {
         Ok(v)
     }
+}
+
+/// A blocking command's timeout, in seconds, checked as Valkey checks it:
+/// not a float (NaN, or a spelling past a double's range), negative, or so
+/// large that its milliseconds overflow a signed 64-bit count.
+fn parse_block_timeout(raw: &[u8]) -> Result<f64, Value> {
+    let Ok(secs) = parse_f64(raw) else {
+        return Err(err("ERR timeout is not a float or out of range"));
+    };
+    if secs < 0.0 {
+        return Err(err("ERR timeout is negative"));
+    }
+    if secs * 1000.0 > i64::MAX as f64 {
+        return Err(err("ERR timeout is out of range"));
+    }
+    Ok(secs)
 }
 
 fn parse_i64(raw: &[u8]) -> Result<i64, ()> {

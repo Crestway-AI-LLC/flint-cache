@@ -190,8 +190,9 @@ to a build? [Releases](https://github.com/Crestway-AI-LLC/flint-cache/releases/l
    served on its own thread against a shared store with no global lock, so
    concurrent commands actually run at the same time and a higher-core box
    is faster rather than merely larger — the reason the excluded commands
-   (blocking, whole-keyspace, cross-slot) stay excluded is that they would
-   put that bottleneck back. Tenancy is enforced rather than agreed: a
+   (whole-keyspace, cross-slot) stay excluded is that they would put that
+   bottleneck back, and why a blocking pop waits at the proxy, where it
+   holds no seat thread (ADR-0052). Tenancy is enforced rather than agreed: a
    token maps to an isolated keyspace at the proxy, so clients use ordinary
    key names with nothing to prefix, and a bug in one tenant's key naming
    cannot reach another's data. Each tenant carries an ops/second quota and

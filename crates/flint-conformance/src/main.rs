@@ -1094,6 +1094,67 @@ fn corpus() -> Vec<Case> {
             ],
         },
         Case {
+            family: "lists",
+            name: "blocking list pops answer at once when an element is there",
+            // ADR-0052 D4. A seat never waits: through the proxy a client
+            // does. A short timeout on empty keys gives the same null array
+            // from Valkey (after the wait) and from a seat (at once). A
+            // BLMOVE or BRPOPLPUSH timeout is not here: outside MULTI Valkey
+            // answers a null array and a seat the null bulk of its
+            // non-blocking form, which is what the proxy turns into the null
+            // array.
+            steps: vec![
+                s(&[b"BLPOP", b"{bl}a", b"0.01"], Expect::NilArray),
+                s(&[b"BRPOP", b"{bl}a", b"{bl}b", b"0.01"], Expect::NilArray),
+                s(&[b"RPUSH", b"{bl}b", b"x", b"y"], Expect::Int(2)),
+                s(
+                    &[b"BLPOP", b"{bl}a", b"{bl}b", b"0"],
+                    Expect::Arr(vec![Expect::Str(b"{bl}b"), Expect::Str(b"x")]),
+                ),
+                s(
+                    &[b"BRPOP", b"{bl}a", b"{bl}b", b"0"],
+                    Expect::Arr(vec![Expect::Str(b"{bl}b"), Expect::Str(b"y")]),
+                ),
+                s(&[b"RPUSH", b"{bl}a", b"p", b"q"], Expect::Int(2)),
+                s(&[b"BRPOPLPUSH", b"{bl}a", b"{bl}d", b"0"], Expect::Str(b"q")),
+                s(&[b"BLMOVE", b"{bl}a", b"{bl}d", b"LEFT", b"LEFT", b"0"], Expect::Str(b"p")),
+                s(
+                    &[b"LRANGE", b"{bl}d", b"0", b"-1"],
+                    Expect::Arr(vec![Expect::Str(b"p"), Expect::Str(b"q")]),
+                ),
+                s(&[b"BLPOP", b"{bl}a", b"-1"], Expect::Err("ERR timeout is negative")),
+                s(&[b"BLPOP", b"{bl}a", b"abc"], Expect::Err("ERR timeout is not a float or out of range")),
+                s(&[b"BLPOP", b"{bl}a", b"nan"], Expect::Err("ERR timeout is not a float or out of range")),
+                s(&[b"BLPOP", b"{bl}a", b"inf"], Expect::Err("ERR timeout is out of range")),
+                s(&[b"BLPOP", b"{bl}a"], Expect::AnyError),
+                s(&[b"BLMOVE", b"{bl}a", b"{bl}d", b"UP", b"LEFT", b"0"], Expect::Err("ERR syntax error")),
+                s(&[b"BRPOPLPUSH", b"{bl}a", b"0"], Expect::AnyError),
+                s(&[b"SET", b"{bl}s", b"v"], Expect::Ok),
+                s(&[b"BLPOP", b"{bl}s", b"0"], Expect::AnyError),
+                s(&[b"BLMOVE", b"{bl}s", b"{bl}d", b"LEFT", b"LEFT", b"0"], Expect::AnyError),
+            ],
+        },
+        Case {
+            family: "zsets",
+            name: "blocking sorted-set pops answer at once when a member is there",
+            // ADR-0052 D4; see the list case.
+            steps: vec![
+                s(&[b"BZPOPMIN", b"{bz}a", b"0.01"], Expect::NilArray),
+                s(&[b"ZADD", b"{bz}z", b"1.5", b"m", b"2", b"n", b"3", b"o"], Expect::Int(3)),
+                s(
+                    &[b"BZPOPMIN", b"{bz}a", b"{bz}z", b"0"],
+                    Expect::Arr(vec![Expect::Str(b"{bz}z"), Expect::Str(b"m"), Expect::Str(b"1.5")]),
+                ),
+                s(
+                    &[b"BZPOPMAX", b"{bz}z", b"0"],
+                    Expect::Arr(vec![Expect::Str(b"{bz}z"), Expect::Str(b"o"), Expect::Str(b"3")]),
+                ),
+                s(&[b"BZPOPMAX", b"{bz}z", b"-0.5"], Expect::Err("ERR timeout is negative")),
+                s(&[b"SET", b"{bz}s", b"v"], Expect::Ok),
+                s(&[b"BZPOPMIN", b"{bz}s", b"0"], Expect::AnyError),
+            ],
+        },
+        Case {
             family: "hashes",
             name: "hincrbyfloat adds to a field and answers the new value",
             // BUG-0187: unknown before; rq keeps a job's timings with it.
@@ -1709,6 +1770,28 @@ fn corpus() -> Vec<Case> {
                         b"{rn}Z2",
                     ],
                     Expect::Int(7),
+                ),
+            ],
+        },
+        Case {
+            family: "transactions",
+            name: "a blocking pop inside multi does not wait",
+            // ADR-0052 D4: as in Redis, and the null kinds are Redis's: an
+            // array for BLPOP and BZPOPMIN, a bulk for BLMOVE and
+            // BRPOPLPUSH.
+            steps: vec![
+                s(&[b"MULTI"], Expect::Ok),
+                s(&[b"BLPOP", b"{bt}l", b"0"], Expect::Simple("QUEUED")),
+                s(&[b"BZPOPMIN", b"{bt}z", b"0"], Expect::Simple("QUEUED")),
+                s(&[b"BLMOVE", b"{bt}l", b"{bt}d", b"LEFT", b"RIGHT", b"0"], Expect::Simple("QUEUED")),
+                s(&[b"BRPOPLPUSH", b"{bt}l", b"{bt}d", b"0"], Expect::Simple("QUEUED")),
+                s(
+                    &[b"EXEC"],
+                    Expect::Arr(vec![Expect::NilArray, Expect::NilArray, Expect::Nil, Expect::Nil]),
+                ),
+                s(
+                    &[b"EVAL", "return redis.call('blpop', KEYS[1], 0)".as_bytes(), b"1", b"{bt}l"],
+                    Expect::Nil,
                 ),
             ],
         },
@@ -3977,7 +4060,19 @@ fn matches(expect: &Expect, got: &Value, proto: Proto) -> bool {
         ),
         Expect::Arr(items) => match got {
             Value::Array(Some(vals)) if vals.len() == items.len() => {
-                items.iter().zip(vals).all(|(e, v)| matches(e, v, proto))
+                items.iter().zip(vals).all(|(e, v)| {
+                    // A null NESTED in a RESP3 reply was downgraded to `$-1`
+                    // by `normalize`, which cannot know that RESP2 would
+                    // have spelled this one `*-1`: an EXEC reply holding a
+                    // BLPOP that found nothing (ADR-0052 D4). Under RESP3
+                    // it was the one null, so a nested null array takes it.
+                    // Only here: a top-level `$-1` to a RESP3 client is a
+                    // protocol violation and stays refused.
+                    (proto == Proto::Resp3
+                        && matches!(e, Expect::NilArray)
+                        && *v == Value::Bulk(None))
+                        || matches(e, v, proto)
+                })
             }
             _ => false,
         },
@@ -4286,6 +4381,23 @@ mod tests {
             Proto::Resp3
         ));
         assert!(!matches(&Expect::Nil, &Value::Array(None), Proto::Resp3));
+    }
+
+    /// Nested, a RESP3 null reaches the matcher already downgraded to `$-1`,
+    /// so a nested null array takes it under RESP3 (an EXEC reply holding a
+    /// BLPOP that found nothing, ADR-0052). Under RESP2 the crossing stays
+    /// refused, and at the top level both dialects stay as they were.
+    #[test]
+    fn a_nested_null_array_takes_the_downgraded_resp3_null_only() {
+        let want = Expect::Arr(vec![Expect::NilArray]);
+        let nested = Value::Array(Some(vec![Value::Bulk(None)]));
+        assert!(matches(&want, &nested, Proto::Resp3));
+        assert!(!matches(&want, &nested, Proto::Resp2));
+        assert!(!matches(
+            &Expect::NilArray,
+            &Value::Bulk(None),
+            Proto::Resp3
+        ));
     }
 
     /// Relaxing the null must not turn into relaxing anything else — a

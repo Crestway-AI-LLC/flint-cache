@@ -39,6 +39,16 @@ pub fn reduces_space(name: &[u8]) -> bool {
     )
 }
 
+/// The blocking pops (ADR-0052 D4). A seat answers each without waiting, as
+/// Redis does inside `MULTI` or a script; the proxy makes a client wait, by
+/// running that form until one answers or the timeout passes.
+pub fn is_blocking_command(name: &[u8]) -> bool {
+    matches!(
+        name.to_ascii_uppercase().as_slice(),
+        b"BLPOP" | b"BRPOP" | b"BZPOPMIN" | b"BZPOPMAX" | b"BLMOVE" | b"BRPOPLPUSH"
+    )
+}
+
 /// True when `name` mutates the keyspace.
 pub fn is_write_command(name: &[u8]) -> bool {
     matches!(
@@ -60,6 +70,12 @@ pub fn is_write_command(name: &[u8]) -> bool {
             | b"RENAMENX"
             | b"LMOVE"
             | b"RPOPLPUSH"
+            | b"BLMOVE"
+            | b"BRPOPLPUSH"
+            | b"BLPOP"
+            | b"BRPOP"
+            | b"BZPOPMIN"
+            | b"BZPOPMAX"
             | b"HINCRBYFLOAT"
             | b"DEL"
             | b"EXPIRE"
