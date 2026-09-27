@@ -2893,6 +2893,9 @@ struct ProxyTxn {
     /// until EXEC or DISCARD, every command answers QUEUED and none runs,
     /// as Redis does after a command fails to queue.
     doomed: bool,
+    /// The write commands the transaction has queued, kept only for a
+    /// near-cache tenant: EXEC invalidates what they name (BUG-0193).
+    writes: Vec<Vec<Vec<u8>>>,
 }
 
 impl ProxyTxn {
@@ -2902,6 +2905,7 @@ impl ProxyTxn {
         self.opened = false;
         self.null_arrays.clear();
         self.doomed = false;
+        self.writes.clear();
     }
 }
 
@@ -3758,7 +3762,34 @@ async fn data_command(
             )
             .placed(topo.placed_pair(ns).is_some())
         });
+        // BUG-0193: a queued write reaches no `cache_writeback`, so EXEC
+        // drops what the transaction's writes name, whatever EXEC answered.
+        // A key dropped needlessly costs one miss; one kept serves this
+        // tenant a value it has overwritten, through the proxy it wrote by.
+        let caching = local_cache && topo.cache.enabled();
+        let exec = args
+            .first()
+            .is_some_and(|n| n.eq_ignore_ascii_case(b"EXEC"));
+        let written = if exec {
+            std::mem::take(&mut txn.writes)
+        } else {
+            Vec::new()
+        };
         if let Some(reply) = transaction_step(topo, b, txn, ns, args, raw).await {
+            if caching
+                && txn.open
+                && matches!(&reply, Value::Simple(s) if s == "QUEUED")
+                && args
+                    .first()
+                    .is_some_and(|n| flint_commands::is_write_command(n))
+            {
+                txn.writes.push(args.to_vec());
+            }
+            if caching {
+                for w in &written {
+                    cache_invalidate_written(topo, ns, w);
+                }
+            }
             return reply;
         }
     }
@@ -3874,58 +3905,64 @@ fn cache_writeback(
             .first()
             .is_some_and(|n| flint_commands::is_write_command(n))
     {
-        match args[0].to_ascii_uppercase().as_slice() {
-            b"DEL" | b"UNLINK" => {
-                for k in &args[1..] {
-                    topo.cache.invalidate(ns, k);
-                }
+        cache_invalidate_written(topo, ns, args);
+    }
+}
+
+/// Drop this proxy's near-cache entries for what the write `args` changed:
+/// each key it writes, or more when it cannot say which. Also run at EXEC
+/// for every write the transaction queued (BUG-0193).
+fn cache_invalidate_written(topo: &Topology, ns: &[u8], args: &[Vec<u8>]) {
+    match args[0].to_ascii_uppercase().as_slice() {
+        b"DEL" | b"UNLINK" => {
+            for k in &args[1..] {
+                topo.cache.invalidate(ns, k);
             }
-            // A script writes keys in its KEYS' slot, never its text, and
-            // not only the keys it declared (ADR-0052 D2): every entry of
-            // that slot goes. A script that declares none may write none.
-            b"EVAL" | b"EVALSHA" => {
-                if topo.placed_pair(ns).is_some() {
-                    // A placed tenant's script may write any key it has, in
-                    // any slot (ADR-0053).
-                    topo.cache.invalidate_ns(ns);
-                } else if let Some(first) =
-                    flint_commands::eval_keys(args).unwrap_or_default().first()
-                {
-                    topo.cache.invalidate_slot(ns, slot_for_key(first));
-                }
+        }
+        // A script writes keys in its KEYS' slot, never its text, and
+        // not only the keys it declared (ADR-0052 D2): every entry of
+        // that slot goes. A script that declares none may write none.
+        b"EVAL" | b"EVALSHA" => {
+            if topo.placed_pair(ns).is_some() {
+                // A placed tenant's script may write any key it has, in
+                // any slot (ADR-0053).
+                topo.cache.invalidate_ns(ns);
+            } else if let Some(first) = flint_commands::eval_keys(args).unwrap_or_default().first()
+            {
+                topo.cache.invalidate_slot(ns, slot_for_key(first));
             }
-            // MSET k1 v1 k2 v2 ...: EVERY written key (odd indices) must
-            // drop, or a cached later key would keep serving its old value
-            // through this proxy — the read-your-own-writes contract.
-            b"MSET" => {
-                for k in args[1..].iter().step_by(2) {
-                    topo.cache.invalidate(ns, k);
-                }
+        }
+        // MSET k1 v1 k2 v2 ...: EVERY written key (odd indices) must
+        // drop, or a cached later key would keep serving its old value
+        // through this proxy — the read-your-own-writes contract.
+        b"MSET" => {
+            for k in args[1..].iter().step_by(2) {
+                topo.cache.invalidate(ns, k);
             }
-            // COPY src dst [REPLACE]: the DESTINATION is the key that
-            // changed. The default arm below drops args[1], which for COPY
-            // is the SOURCE — nothing wrote it, while a cached destination
-            // would go on serving its pre-copy value through this proxy.
-            b"COPY" => {
-                if let Some(k) = args.get(2) {
-                    topo.cache.invalidate(ns, k);
-                }
+        }
+        // COPY src dst [REPLACE]: the DESTINATION is the key that
+        // changed. The default arm below drops args[1], which for COPY
+        // is the SOURCE — nothing wrote it, while a cached destination
+        // would go on serving its pre-copy value through this proxy.
+        b"COPY" => {
+            if let Some(k) = args.get(2) {
+                topo.cache.invalidate(ns, k);
             }
-            // RENAME / RENAMENX: BOTH keys change — the source ceases to
-            // exist and the destination takes its value. Dropping only one
-            // leaves the other answering from before the rename, so a
-            // cached source would resurrect a key that is now gone. LMOVE
-            // and RPOPLPUSH change both keys too.
-            b"RENAME" | b"RENAMENX" | b"LMOVE" | b"RPOPLPUSH" | b"BLMOVE" | b"BRPOPLPUSH" => {
-                for k in args[1..].iter().take(2) {
-                    topo.cache.invalidate(ns, k);
-                }
+        }
+        // RENAME / RENAMENX: BOTH keys change — the source ceases to
+        // exist and the destination takes its value. Dropping only one
+        // leaves the other answering from before the rename, so a
+        // cached source would resurrect a key that is now gone. LMOVE
+        // and RPOPLPUSH change both keys too.
+        b"RENAME" | b"RENAMENX" | b"LMOVE" | b"RPOPLPUSH" | b"BLMOVE" | b"BRPOPLPUSH" => {
+            for k in args[1..].iter().take(2) {
+                topo.cache.invalidate(ns, k);
             }
-            b"FLUSHALL" | b"FLUSHDB" => topo.cache.invalidate_ns(ns),
-            _ => {
-                if let Some(k) = args.get(1) {
-                    topo.cache.invalidate(ns, k);
-                }
+        }
+        b"FLUSHALL" | b"FLUSHDB" => topo.cache.invalidate_ns(ns),
+        _ => {
+            if let Some(k) = args.get(1) {
+                topo.cache.invalidate(ns, k);
             }
         }
     }

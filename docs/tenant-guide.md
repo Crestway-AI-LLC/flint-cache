@@ -192,7 +192,8 @@ what you asked, because your operator sets a ceiling (`ttl_max_ms` above) and
 a request over it is clamped rather than refused. `PROXYCACHE` with no
 argument reads your current value. Your operator can still disable the cache
 fleet-wide, which outranks anything set here. Your own writes through one proxy connection always read
-back fresh regardless of any opt-in.
+back fresh regardless of any opt-in, the writes of a `MULTI`...`EXEC` included
+(BUG-0193).
 
 ## Seeing your numbers
 

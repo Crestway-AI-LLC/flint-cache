@@ -117,4 +117,18 @@ AFTER=$(p2 GET ncx)
 [ "$AFTER" = "v2" ] || { echo "FAIL: B still sees '$AFTER' after the TTL lapsed — the bound the contract rests on does not hold"; exit 1; }
 echo "  B sees v2 once the TTL lapses"
 
-echo "PASS: read-your-own-writes holds through one proxy, the cross-client window is real and is bounded by the TTL"
+echo "== a transaction's writes are read back fresh through the proxy that ran it (BUG-0193)"
+# Two keys in one slot, both cached by proxy 1; one transaction overwrites
+# one and deletes the other. EXEC used to invalidate nothing, so both went on
+# answering from the cache until the TTL.
+[ "$(p1 SET '{ncx}a' a1)" = "OK" ] && [ "$(p1 SET '{ncx}b' b1)" = "OK" ] || { echo "FAIL: seed {ncx}a/b"; exit 1; }
+[ "$(p1 GET '{ncx}a')" = "a1" ] && [ "$(p1 GET '{ncx}b')" = "b1" ] || { echo "FAIL: cache {ncx}a/b through proxy 1"; exit 1; }
+OUT=$(printf 'MULTI\nSET {ncx}a a2\nDEL {ncx}b\nEXEC\n' | valkey-cli -p 6645 -a tok-acme --no-auth-warning 2>&1 | tr '\n' ' ')
+case "$OUT" in *ERR*|*EXECABORT*) echo "FAIL: the transaction was refused: $OUT"; exit 1 ;; esac
+A2=$(p1 GET '{ncx}a'); B2=$(p1 GET '{ncx}b')
+[ "$A2" = "a2" ] && [ -z "$B2" ] || {
+  echo "FAIL: after EXEC proxy 1 answers {ncx}a='$A2' {ncx}b='$B2' (want a2 and nil):"
+  echo "      the transaction's writes did not invalidate its own proxy's cache"; exit 1; }
+echo "  {ncx}a reads a2 and {ncx}b is gone, straight after EXEC"
+
+echo "PASS: read-your-own-writes holds through one proxy, a transaction's included; the cross-client window is real and is bounded by the TTL"
