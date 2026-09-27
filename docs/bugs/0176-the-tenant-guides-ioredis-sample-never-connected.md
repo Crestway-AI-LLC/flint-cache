@@ -42,7 +42,9 @@ cluster. node-redis and go-redis send their own unimplemented handshake
   as in Redis, and an unknown section is empty, not an error.
 - **No `redis_version`.** Advertising a version is a claim about the whole
   command surface, and that is a product decision, not a field. (Decided
-  2026-09-25: it stays out.) A client
+  2026-09-25: it stays out. **Reversed 2026-09-27 by ADR-0052 D1**: `INFO`
+  reports `redis_version:7.2.4`, as Valkey does, because rq and BullMQ
+  refuse to run without it.) A client
   that insists on a version is not helped by this fix. Spring Boot's Redis
   health check is not one: it reads `INFO server` and reports the version as
   `unknown` when the field is absent (`DataRedisHealth.up`, read 2026-09-24),

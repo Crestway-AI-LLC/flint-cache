@@ -21,7 +21,8 @@ than the current one). Measured on a gate box, 2026-09-26: Rails 8.1's
 Rack::Attack calls on every throttled request, sends `INCRBY` then
 `EXPIRE key 60 NX` to a server whose `INFO` reports Redis 7 or later, as it
 did to Valkey. On Flint it takes an older path (`TTL`, then `EXPIRE`) only
-because Flint's `INFO` reports no version (ADR-0048). redis-py's
+because Flint's `INFO` reported no version (it reports 7.2.4 since
+ADR-0052). redis-py's
 `expire(..., nx=True)` and its siblings send the same forms directly.
 
 ## The fix

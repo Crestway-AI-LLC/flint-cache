@@ -181,8 +181,21 @@ pub fn stripe_for(ns: &[u8], key: &[u8]) -> usize {
     stripe_of(&buf)
 }
 
+/// How many times `lock_all` has been called. Test-only, for the same reason
+/// as `global_acquires`: a script's re-run under every writer (ADR-0052) is
+/// asserted by counting, not by timing.
+#[cfg(test)]
+static ALL_ACQUIRES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(test)]
+pub(crate) fn all_acquires() -> u64 {
+    ALL_ACQUIRES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Exclude EVERY writer (multi-key/keyless writes; queue batches).
 pub fn lock_all() -> WriteGuard {
+    #[cfg(test)]
+    ALL_ACQUIRES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     WriteGuard::All(GLOBAL.write().unwrap_or_else(|e| e.into_inner()))
 }
 

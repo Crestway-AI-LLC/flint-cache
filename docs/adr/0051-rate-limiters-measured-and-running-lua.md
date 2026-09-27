@@ -1,7 +1,9 @@
 # ADR-0051: Rate limiters on Flint, measured, and running Lua
 
 Status: **ACCEPTED 2026-09-26** (Jeff: "go with your recommendation on
-ADR-0051"): option B. Built; see "As built" at the end.
+ADR-0051"): option B. Built; see "As built" at the end. **Amended
+2026-09-27 by ADR-0052 D2**: a script may touch any key in its declared
+keys' slot, not only the declared keys.
 
 ## Context
 
@@ -24,7 +26,8 @@ Valkey as the control (every library below worked there):
 | Go `redis_rate` v10 (GCRA), `Allow` and `AllowAtMost` | every call refused | `TIME`, then floating-point arithmetic, then one `SET EX` |
 | node `rate-limiter-flexible` 11.2.1, `RateLimiterRedis` on ioredis | refused: its script is not recognised | `SET NX EX`, `INCRBY`, `PTTL`, and `EXPIRE` when there is no TTL: up to three writes |
 | node `rate-limit-redis` 6.0.1 (express-rate-limit 8.7.0) | **the process crashes**: the store loads its scripts when constructed, and the refusal is an unhandled rejection | `PTTL`, then `SET PX` on a new window or `INCR`: one write. Fits ADR-0050, and is now recognised there |
-| Rack::Attack 6.8.0 over Rails 8.1 `RedisCacheStore` | **works** | no Lua: `INCRBY`, then `TTL` and `EXPIRE`. (On a server whose `INFO` reports Redis 7 it sends `EXPIRE ... NX` instead; Flint's `INFO` reports no version, so Rails takes the older path.) |
+| Rack::Attack 6.8.0 over Rails 8.1 `RedisCacheStore` | **works** | no Lua: `INCRBY`, then `TTL` and `EXPIRE`. (On a server whose `INFO` reports Redis 7 it sends `EXPIRE ... NX` instead; Flint's `INFO` reports no version, so Rails takes the older path. Since
+ADR-0052 it reports 7.2.4, and `EXPIRE ... NX` is served: BUG-0185.) |
 
 All but Rack::Attack are Lua. `rate-limit-redis` 6.x fits ADR-0050's
 condition, and because its failure was a crash rather than a refusal, its two
@@ -81,6 +84,8 @@ means on Redis, formatting included, with no port to get wrong. As built:
   which is Redis Cluster's rule; the seat takes their write locks in sorted
   order before running, and a `redis.call` on any other key is refused with
   an error naming the rule. (Every measured library declares its keys.)
+  *Amended by ADR-0052 D2: any key in their slot, as Redis Cluster allows;
+  asynq writes keys it builds.*
 - **Sandbox**: chunks load as text only (no bytecode, the historical escape
   route); `load`, `loadstring`, `dofile`, `loadfile`, `require`, `os`, `io`,
   `debug` and `package` are absent; globals are read-only, as in Redis. A
@@ -149,7 +154,9 @@ limiters is the fallback, with rate limiting otherwise documented as a gap.
   is not a declared key's. A refused call's overlay is discarded, so a
   `pcall`ed `RENAME` to an undeclared key leaves its source where it was.
   The check needs no table of which argument of which command is a key, and
-  a row it cannot attribute is refused.
+  a row it cannot attribute is refused. *Since ADR-0052 D2 the guard allows
+  any key in the declared keys' slot; one it did not declare stops the
+  script, which runs again under the lock over every writer.*
 - **The sandbox** is as proposed, with three findings. (1) mlua's
   per-thread hook removes itself from a coroutine the script creates (it
   looks the callback up by thread and finds none), so a coroutine ran with

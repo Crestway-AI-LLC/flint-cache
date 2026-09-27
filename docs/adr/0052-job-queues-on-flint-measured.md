@@ -1,8 +1,10 @@
 # ADR-0052: Job queues on Flint, measured
 
-Status: **PROPOSED 2026-09-26, for Jeff's decision.** Nothing in it is built.
-The three plain commands the measurement found missing (`LMOVE`, `RPOPLPUSH`,
-`HINCRBYFLOAT`) were ordinary gaps and are fixed as BUG-0187.
+Status: **ACCEPTED 2026-09-27** (Jeff: "go with your recommendation on
+ADR-0052"): Flint serves job queues, in the four stages below. Stage 1 (D1
+and D2) is built; see "As built" at the end. The three plain commands the
+measurement found missing (`LMOVE`, `RPOPLPUSH`, `HINCRBYFLOAT`) were
+ordinary gaps and are fixed as BUG-0187.
 
 ## Context
 
@@ -248,3 +250,72 @@ Then document the queue libraries as unsupported, by name.
   moving a hash into an undeclared key while another connection writes it),
   0 lost out of thousands, as for `RENAME`.
 - Each library that passes joins `client_compat_drill`.
+
+## As built
+
+### Stage 1: D1 and D2 (2026-09-27)
+
+- **D1** (`flint-proxy`): the proxy's `INFO` reports
+  `redis_version:7.2.4` in its server section, beside `flint_version`.
+- **D2** (`flint-server`, `script.rs` and `commands.rs`):
+  - **The guard.** `KeyGuard` knows the declared keys' slot and whether its
+    caller holds the lock over every writer. A row of a declared key is
+    allowed, as before. A row of another key in that slot is allowed under
+    the lock over every writer. Without that lock it is
+    `Stray::NeedsEveryWriter`. A key in another slot, the keyspace, and any
+    key of a script that declared none are refused, as before.
+  - **Abandoning a script.** `NeedsEveryWriter` makes the command answer
+    `Abandon` instead of a reply. The script stops where it stands, through
+    the same path that makes the time limit uncatchable, so `pcall` cannot
+    keep it going. Its buffer is dropped, and the dispatcher reports
+    `wants_every_writer`. The Lua state stays reusable, because the stop is
+    an ordinary Lua error.
+  - **The re-run.** `execute` runs the script again from the start under
+    `lock_all`. It drops the key's stripe first: `lock_all` waits for every
+    reader of the global lock, this thread's included, so assigning the new
+    guard over the old one would build the new one first and wait forever.
+    A transaction already holds `lock_all`, so a script inside `EXEC` runs
+    once.
+- **The proxy's near-cache** (`cache.rs`): a script may now write keys the
+  proxy never sees named, which would have broken read-your-own-writes
+  through one proxy. So a script drops every cached entry of its tenant in
+  its slot. The cost is O(1): each entry already carries a monotonic insert
+  generation, the slot records the current one as its floor, and `get`
+  treats an entry at or below its slot's floor as absent.
+- **Found by this stage's probe: BUG-0189.** The seat's key-size cap read a
+  script's text as its key, so any script over 4 KiB was refused. Through
+  the proxy that included `EVALSHA`. BullMQ's scripts are over 4 KiB.
+- **Verified.**
+  - Unit tests: abandoning a script, caught or not, with nothing written;
+    the same script run under the lock; another slot still refused;
+    asynq's dequeue script verbatim.
+  - A wire test counting `lock_all`: fails with the re-run's lock removed.
+  - Conformance cases on the Valkey oracle: a built key, inside `pcall`,
+    inside `MULTI`, asynq's dequeue on asynq's own keys, and a
+    5,000-byte script.
+  - The concurrency the lock exists for, measured on a release build (mem
+    engine): a script renaming a 50-field hash onto an undeclared key while
+    another connection wrote that key. With the re-run under the lock:
+    0 of 6,000 races lost data. With the lock taken out and the key simply
+    allowed: 118 and 111 of 3,000 lost all 50 fields.
+
+**Re-measured** through the proxy on a gate box, the same probe as the
+Context, against this stage before BUG-0189 was fixed:
+
+| library | before | after stage 1 |
+|---|---|---|
+| asynq 0.26 | processes nothing | **works**: enqueues, and the server processes the job. Task cancellation still needs D5 |
+| rq 2.8.0 | refused at enqueue (no `redis_version`) | past the version check; refused at enqueue by a **cross-slot transaction** |
+| BullMQ 6.3.9 | refuses to start (no `redis_version`) | past the version check; failed `add` on BUG-0189, now fixed. Its next blocker is to be measured |
+| Sidekiq 8.1.7 | cannot fetch (`BRPOP`) | unchanged: stage 2 |
+| Celery 5.6.3 | worker fails to start | unchanged: stages 2 and 3 |
+
+**rq needs something this record did not plan.** Its enqueue is one
+`MULTI`/`EXEC` that writes the job's hash, the queue's list and the set of
+queues. Those are three keys without a shared hash tag, so they are in three
+slots. ADR-0012 serves transactions in one slot, because a transaction
+across pairs would need a commit protocol between them. rq's expected stage
+("D6 ... rq keeps results") is therefore not enough. Serving rq means
+transactions across slots, at least across slots on one pair. That is a
+decision of its own, to be brought back as its own record, measured, rather
+than folded into this one.

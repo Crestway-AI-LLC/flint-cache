@@ -3729,10 +3729,12 @@ fn cache_writeback(
                     topo.cache.invalidate(ns, k);
                 }
             }
-            // A recognised script writes its KEYS, never its text (ADR-0050).
+            // A script writes keys in its KEYS' slot, never its text, and
+            // not only the keys it declared (ADR-0052 D2): every entry of
+            // that slot goes. A script that declares none may write none.
             b"EVAL" | b"EVALSHA" => {
-                for k in flint_commands::eval_keys(args).unwrap_or_default() {
-                    topo.cache.invalidate(ns, k);
+                if let Some(first) = flint_commands::eval_keys(args).unwrap_or_default().first() {
+                    topo.cache.invalidate_slot(ns, slot_for_key(first));
                 }
             }
             // MSET k1 v1 k2 v2 ...: EVERY written key (odd indices) must
@@ -4003,6 +4005,11 @@ async fn scan_forward(
     ]))
 }
 
+/// The Redis version `INFO` reports, as Valkey 9.1 reports it: the last Redis
+/// release Valkey forked from, frozen there so that clients gating features
+/// on it keep working (ADR-0052 D1).
+const REDIS_COMPAT_VERSION: &str = "7.2.4";
+
 /// `INFO [section ...]`, answered by the proxy itself (BUG-0176).
 ///
 /// ioredis, the Node client the tenant guide shows, sends `INFO` before its
@@ -4018,8 +4025,11 @@ async fn scan_forward(
 /// Minimal on purpose. `loading:0` is the field ioredis reads, and it is true
 /// by construction: a proxy that answers is serving. Redis's field names where
 /// Redis has one, `flint_` where it does not; clients parse by name.
-/// `redis_version` is deliberately absent: advertising a version is a claim
-/// about the whole command surface, which is a product decision, not a field.
+///
+/// `redis_version` is `REDIS_COMPAT_VERSION`, the value Valkey reports
+/// (ADR-0052 D1): the version clients gate features on. rq refuses to enqueue
+/// and BullMQ to start without one. It is not a promise of every command of
+/// that release: `docs/command-support.md` lists what Flint serves.
 ///
 /// Sections follow Redis: none, `default`, `all` or `everything` means every
 /// section; otherwise only the ones named, case-insensitively, and a name this
@@ -4028,7 +4038,10 @@ fn info_reply(sections: &[Vec<u8>], version: &str) -> Value {
     let all: [(&str, String); 2] = [
         (
             "server",
-            format!("# Server\r\nredis_mode:standalone\r\nflint_version:{version}\r\n"),
+            format!(
+                "# Server\r\nredis_version:{REDIS_COMPAT_VERSION}\r\nredis_mode:standalone\r\n\
+                 flint_version:{version}\r\n"
+            ),
         ),
         ("persistence", "# Persistence\r\nloading:0\r\n".to_string()),
     ];
@@ -5488,10 +5501,14 @@ mod info_tests {
         }
     }
 
-    /// No version claim: see `info_reply`.
+    /// ADR-0052 D1: the version Valkey reports, in the server section, and
+    /// Flint's own beside it. rq reads `redis_version` from `INFO` and fails
+    /// without it; BullMQ reads it and refuses anything below 5.0.0.
     #[test]
-    fn no_redis_version_is_advertised() {
-        assert!(!text(info_reply(&[], "v")).contains("redis_version"));
+    fn the_server_section_reports_valkeys_redis_version_and_flints_own() {
+        let t = text(info_reply(&[b"server".to_vec()], "v"));
+        assert!(t.contains("\r\nredis_version:7.2.4\r\n"), "{t:?}");
+        assert!(t.contains("\r\nflint_version:v\r\n"), "{t:?}");
     }
 }
 

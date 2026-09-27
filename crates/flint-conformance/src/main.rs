@@ -150,6 +150,10 @@ const REDLOCK_RB_INFO: &[u8] =
 // redsync's release before v4.12.0 and its `WithSetNXOnExtend` extend.
 const REDLOCK5_ACQUIRE: &[u8] = "\n  -- Return 0 if an entry already exists.\n  for i, key in ipairs(KEYS) do\n    if redis.call(\"exists\", key) == 1 then\n      return 0\n    end\n  end\n\n  -- Create an entry for each provided key.\n  for i, key in ipairs(KEYS) do\n    redis.call(\"set\", key, ARGV[1], \"PX\", ARGV[2])\n  end\n\n  -- Return the number of entries added.\n  return #KEYS\n".as_bytes();
 const REDSYNC_RELEASE_BEFORE_4_12: &[u8] = "\n\tif redis.call(\"GET\", KEYS[1]) == ARGV[1] then\n\t\treturn redis.call(\"DEL\", KEYS[1])\n\telse\n\t\treturn 0\n\tend\n".as_bytes();
+/// asynq 0.26's `dequeueCmd` (internal/rdb/rdb.go), verbatim: the task's
+/// key is built from ARGV and the popped id, in the queue's hash tag but not
+/// in KEYS (ADR-0052 D2).
+const ASYNQ_DEQUEUE: &[u8] = "\nif redis.call(\"EXISTS\", KEYS[2]) == 0 then\n\tlocal id = redis.call(\"RPOPLPUSH\", KEYS[1], KEYS[3])\n\tif id then\n\t\tlocal key = ARGV[2] .. id\n\t\tredis.call(\"HSET\", key, \"state\", \"active\")\n\t\tredis.call(\"HDEL\", key, \"pending_since\")\n\t\tredis.call(\"ZADD\", KEYS[4], ARGV[1], id)\n\t\treturn redis.call(\"HGET\", key, \"msg\")\n\tend\nend\nreturn nil".as_bytes();
 const REDSYNC_EXTEND_SETNX: &[u8] = "\n\tif redis.call(\"GET\", KEYS[1]) == ARGV[1] then\n\t\treturn redis.call(\"PEXPIRE\", KEYS[1], ARGV[2])\n\telseif redis.call(\"SET\", KEYS[1], ARGV[1], \"PX\", ARGV[2], \"NX\") then\n\t\treturn 1\n\telse\n\t\treturn 0\n\tend\n".as_bytes();
 // ADR-0051: the rate limiters' scripts, as captured on the wire from Python
 // `limits` 4.2, Go `redis_rate` v10, node `rate-limiter-flexible` 11.2.1 and
@@ -936,8 +940,97 @@ fn corpus() -> Vec<Case> {
             ],
         },
         Case {
+            family: "scripting",
+            name: "a script may touch a key it builds, in the slot of its keys",
+            // ADR-0052 D2: Redis Cluster's rule. Flint runs such a script
+            // again holding every writer; the answer is the same.
+            steps: vec![
+                s(
+                    &[
+                        b"EVAL",
+                        "redis.call('set', KEYS[1], 'a') redis.call('set', KEYS[1] .. ':u', ARGV[1]) \
+                         return redis.call('get', KEYS[1] .. ':u')"
+                            .as_bytes(),
+                        b"1",
+                        b"{us}k",
+                        b"v",
+                    ],
+                    Expect::Str(b"v"),
+                ),
+                s(&[b"MGET", b"{us}k", b"{us}k:u"], Expect::Arr(vec![Expect::Str(b"a"), Expect::Str(b"v")])),
+                // BUG-0189: a script longer than the key cap (BullMQ's are).
+                s(
+                    &[
+                        b"EVAL",
+                        format!("return redis.call('get', KEYS[1] .. ':u') -- {}", "x".repeat(5000)).as_bytes(),
+                        b"1",
+                        b"{us}k",
+                    ],
+                    Expect::Str(b"v"),
+                ),
+                // Reached inside pcall, as a caught call would be.
+                s(
+                    &[
+                        b"EVAL",
+                        "local ok = redis.pcall('incr', KEYS[1] .. ':n') return redis.call('get', KEYS[1] .. ':n')"
+                            .as_bytes(),
+                        b"1",
+                        b"{us}k",
+                    ],
+                    Expect::Str(b"1"),
+                ),
+                // Inside a transaction, which already excludes every writer.
+                s(&[b"MULTI"], Expect::Ok),
+                s(
+                    &[b"EVAL", "return redis.call('incr', KEYS[1] .. ':n')".as_bytes(), b"1", b"{us}k"],
+                    Expect::Simple("QUEUED"),
+                ),
+                s(&[b"EXEC"], Expect::Arr(vec![Expect::Int(2)])),
+                // asynq's dequeue, on asynq's own keys.
+                s(&[b"RPUSH", b"asynq:{q}:pending", b"id1"], Expect::Int(1)),
+                s(
+                    &[b"HSET", b"asynq:{q}:t:id1", b"msg", b"hello", b"state", b"pending", b"pending_since", b"1"],
+                    Expect::Int(3),
+                ),
+                s(
+                    &[
+                        b"EVAL",
+                        ASYNQ_DEQUEUE,
+                        b"4",
+                        b"asynq:{q}:pending",
+                        b"asynq:{q}:paused",
+                        b"asynq:{q}:active",
+                        b"asynq:{q}:lease",
+                        b"1000",
+                        b"asynq:{q}:t:",
+                    ],
+                    Expect::Str(b"hello"),
+                ),
+                s(
+                    &[b"HGETALL", b"asynq:{q}:t:id1"],
+                    Expect::UnorderedPairs(vec![(b"msg", b"hello"), (b"state", b"active")]),
+                ),
+                s(&[b"LRANGE", b"asynq:{q}:active", b"0", b"-1"], Expect::Arr(vec![Expect::Str(b"id1")])),
+                s(&[b"ZRANGE", b"asynq:{q}:lease", b"0", b"-1"], Expect::Arr(vec![Expect::Str(b"id1")])),
+                s(
+                    &[
+                        b"EVAL",
+                        ASYNQ_DEQUEUE,
+                        b"4",
+                        b"asynq:{q}:pending",
+                        b"asynq:{q}:paused",
+                        b"asynq:{q}:active",
+                        b"asynq:{q}:lease",
+                        b"1000",
+                        b"asynq:{q}:t:",
+                    ],
+                    Expect::Nil,
+                ),
+            ],
+        },
+        Case {
             family: "sandbox",
-            name: "a script is limited, touches only its keys, and fails whole",
+            name: "a script is limited, touches only its slot, and fails whole",
             steps: vec![
                 s(&[b"EVAL", "while true do end".as_bytes(), b"0"], Expect::AnyError),
                 s(&[b"EVAL", "return 1".as_bytes(), b"2", b"a", b"b"], Expect::AnyError),
@@ -946,6 +1039,13 @@ fn corpus() -> Vec<Case> {
                 s(&[b"EXISTS", b"{sb}rb"], Expect::Int(0)),
                 s(&[b"EVAL", "redis.call('set', KEYS[1], 'x') while true do end".as_bytes(), b"1", b"{sb}rt"], Expect::AnyError),
                 s(&[b"EXISTS", b"{sb}rt"], Expect::Int(0)),
+                // A key it built, in its slot, is discarded with the rest
+                // (Valkey keeps a failed script's writes; ADR-0051 does not).
+                s(
+                    &[b"EVAL", "redis.call('set', KEYS[1] .. ':f', 'x') error('then failed')".as_bytes(), b"1", b"{sb}k"],
+                    Expect::AnyError,
+                ),
+                s(&[b"EXISTS", b"{sb}k:f"], Expect::Int(0)),
                 s(&[b"EVAL", "return redis.call('dbsize')".as_bytes(), b"1", b"{sb}a"], Expect::AnyError),
                 s(&[b"EVAL", "return type(loadstring)".as_bytes(), b"0"], Expect::AnyError),
                 s(&[b"EVAL", "return redis.call('eval', 'return 1', '0')".as_bytes(), b"0"], Expect::AnyError),

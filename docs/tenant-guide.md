@@ -226,9 +226,9 @@ hashes, sets, sorted sets, lists, TTLs (EXPIRE/PEXPIRE/TTL/PERSIST),
 DEL/UNLINK/EXISTS/TYPE, DBSIZE/FLUSHALL (scoped to your namespace).
 Conformance is validated against Valkey continuously. Transactions
 (MULTI/EXEC/WATCH) work when every key shares a slot (ADR-0012), and so do
-Lua scripts (`EVAL`, `EVALSHA`): every key a script touches must be in its
-`KEYS` and share a slot, a script is stopped at 50 ms, and one that fails
-keeps none of its writes (ADR-0051). Not in v0: pub/sub, streams, blocking
+Lua scripts (`EVAL`, `EVALSHA`): every key a script touches must be in the
+slot of its `KEYS`, a script is stopped at 50 ms, and one that fails keeps
+none of its writes (ADR-0051, ADR-0052). Not in v0: pub/sub, streams, blocking
 commands, and cross-slot multi-key
 operations, except `MGET`, `DEL`, `UNLINK` and `EXISTS`, which the proxy
 splits per slot or per pair. `KEYS` is answered at the proxy, up to 100,000

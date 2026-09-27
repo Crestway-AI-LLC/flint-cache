@@ -47,6 +47,10 @@ struct Inner {
     /// Resident bytes per namespace — the fairness accounting.
     ns_bytes: HashMap<Vec<u8>, usize>,
     generation: u64,
+    /// Per namespace, per slot: the insert generation at or below which an
+    /// entry in that slot is stale, and when that was recorded
+    /// (`invalidate_slot`).
+    slot_floors: HashMap<Vec<u8>, HashMap<u16, (u64, Instant)>>,
 }
 
 impl Inner {
@@ -249,13 +253,19 @@ impl ProxyCache {
         let now = Instant::now();
         let mut inner = self.inner.lock().ok()?;
         if let Some(e) = inner.map.get(&c) {
-            if e.expires_at > now {
+            let below_floor = inner.slot_floors.get(ns).is_some_and(|floors| {
+                floors
+                    .get(&flint_slot::slot_for_key(key))
+                    .is_some_and(|(floor, _)| e.generation <= *floor)
+            });
+            if e.expires_at > now && !below_floor {
                 let val = e.val.clone();
                 drop(inner);
                 self.hits.fetch_add(1, Ordering::Relaxed);
                 return Some(val);
             }
-            // Expired: reclaim now rather than waiting for FIFO churn.
+            // Expired, or its slot was invalidated after it was cached:
+            // reclaim now rather than waiting for FIFO churn.
             inner.remove(&c);
         }
         drop(inner);
@@ -313,6 +323,33 @@ impl ProxyCache {
         }
     }
 
+    /// Drop every entry of `ns` in `slot`: a script ran through this proxy,
+    /// and it may have written any key in its declared keys' slot, not only
+    /// the declared ones (ADR-0052 D2). The proxy cannot know which, and a
+    /// stale entry would break read-your-own-writes through one proxy.
+    ///
+    /// O(1): it records the current insert generation as the slot's floor,
+    /// and `get` treats an entry at or below its slot's floor as absent. A
+    /// namespace that never ran a script has no floors, so its `get`s do not
+    /// compute a slot.
+    pub fn invalidate_slot(&self, ns: &[u8], slot: u16) {
+        if !self.enabled() {
+            return;
+        }
+        let ttl_max = std::time::Duration::from_millis(self.ttl_max_ms.load(Ordering::Relaxed));
+        let now = Instant::now();
+        if let Ok(mut inner) = self.inner.lock() {
+            let floor = inner.generation;
+            let floors = inner.slot_floors.entry(ns.to_vec()).or_default();
+            floors.insert(slot, (floor, now));
+            // Bounded: a floor older than the longest TTL a tenant may have
+            // covers only entries that have expired anyway.
+            if floors.len() > 1024 {
+                floors.retain(|_, (_, at)| now.duration_since(*at) <= ttl_max);
+            }
+        }
+    }
+
     /// Drop every entry in `ns` (FLUSHALL through this proxy).
     pub fn invalidate_ns(&self, ns: &[u8]) {
         if !self.enabled() {
@@ -331,6 +368,7 @@ impl ProxyCache {
             for k in doomed {
                 inner.remove(&k);
             }
+            inner.slot_floors.remove(ns);
         }
     }
 
@@ -416,6 +454,28 @@ mod tests {
         assert_eq!((entries, bytes), (0, 0));
         c.put(b"acme", b"k", b"v");
         assert_eq!(c.get(b"acme", b"k"), None);
+    }
+
+    /// ADR-0052 D2: a script may write any key in its slot, so a script
+    /// through this proxy drops every cached entry of that tenant in that
+    /// slot, and nothing else; a value cached afterwards is served.
+    #[test]
+    fn invalidating_a_slot_drops_that_tenants_entries_in_it_and_no_others() {
+        let slot = flint_slot::slot_for_key(b"{q}a");
+        assert_eq!(slot, flint_slot::slot_for_key(b"{q}b"));
+        assert_ne!(slot, flint_slot::slot_for_key(b"other"));
+        let c = ProxyCache::new(60_000, 1 << 20);
+        for k in [&b"{q}a"[..], b"{q}b", b"other"] {
+            c.put(b"acme", k, b"old");
+        }
+        c.put(b"globex", b"{q}a", b"theirs");
+        c.invalidate_slot(b"acme", slot);
+        assert_eq!(c.get(b"acme", b"{q}a"), None);
+        assert_eq!(c.get(b"acme", b"{q}b"), None);
+        assert_eq!(c.get(b"acme", b"other").as_deref(), Some(&b"old"[..]));
+        assert_eq!(c.get(b"globex", b"{q}a").as_deref(), Some(&b"theirs"[..]));
+        c.put(b"acme", b"{q}a", b"new");
+        assert_eq!(c.get(b"acme", b"{q}a").as_deref(), Some(&b"new"[..]));
     }
 
     #[test]

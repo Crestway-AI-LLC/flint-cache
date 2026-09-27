@@ -4798,6 +4798,8 @@ fn exec_transaction(
                     limits,
                     conn_ns,
                 )
+                // `_all` above: a script here may touch any key in its slot.
+                .holding_every_writer(true)
                 .dispatch(cmd),
             );
         }
@@ -5680,7 +5682,7 @@ fn execute(
     // Acquiring GLOBAL.read() again per key is the deadlock this design was
     // corrected for -- writer-preferring RwLock blocks the second acquisition
     // behind a lock_all() that is waiting on the batch itself.
-    let _write_guard = write_guard;
+    let mut write_guard = write_guard;
     // On a replica, wrap the store so lazy-expiry deletes buried in read
     // paths become no-ops: a replica must not write to its own store (that
     // would diverge it from the master); the master's replicated DELETE and
@@ -5707,14 +5709,35 @@ fn execute(
                 n.eq_ignore_ascii_case(b"EVAL") || n.eq_ignore_ascii_case(b"EVALSHA")
             })
         {
-            let batching = flint_storage::batch::BatchingKv::new(store);
-            let reply = Dispatcher::with_limits(
-                &batching,
-                flint_storage::strings::system_clock,
-                limits,
-                conn_ns,
-            )
-            .dispatch(args);
+            let mut every_writer = matches!(write_guard, Some(write_lock::WriteGuard::All(_)));
+            let (batching, reply) = loop {
+                let batching = flint_storage::batch::BatchingKv::new(store);
+                let d = Dispatcher::with_limits(
+                    &batching,
+                    flint_storage::strings::system_clock,
+                    limits,
+                    conn_ns,
+                )
+                .holding_every_writer(every_writer);
+                let reply = d.dispatch(args);
+                if !d.wants_every_writer() || every_writer {
+                    drop(d);
+                    break (batching, reply);
+                }
+                // ADR-0052: the script reached a key in its slot that it did
+                // not declare, which its keys' stripe does not cover. Its
+                // attempt wrote nothing (the buffer is dropped here), so run
+                // it again from the start holding every writer. The stripe
+                // goes FIRST: `lock_all` waits for every GLOBAL reader, this
+                // thread's included, so taking it while still holding the
+                // stripe would wait forever. (`write_guard = Some(lock_all())`
+                // would do exactly that: the new value is built before the
+                // old one is dropped.)
+                drop(d);
+                drop(write_guard.take());
+                write_guard = Some(write_lock::lock_all());
+                every_writer = true;
+            };
             let ops = batching.into_ops();
             if !ops.is_empty()
                 && let Err(e) = commit_watched(store, rocks, watch, &ops)
@@ -8187,6 +8210,48 @@ mod serve_tests {
             f[3]
         );
         assert_eq!(f[4], Value::Bulk(None), "the SET queued before it applied");
+    }
+
+    /// ADR-0052 D2, over the wire: a script that reaches a key in its slot
+    /// which it did not declare is answered, and to answer it the seat took
+    /// the lock over every writer. Counted, not timed, for the reason
+    /// `a_batch_takes_the_global_lock_once_not_once_per_key` gives. Only the
+    /// lower bound is asserted: a test elsewhere may take the lock too.
+    /// Without the re-run's `lock_all` the script still answers, and a
+    /// concurrent writer of the undeclared key could interleave with it
+    /// (measured: 111 and 118 of 3,000 races lost a renamed hash).
+    #[test]
+    fn a_script_reaching_past_its_keys_runs_again_under_every_writer() {
+        let _serial = crate::write_lock::test_serial();
+        let addr = spawn_server();
+        let mut s = connect(addr);
+        let mut p = Vec::new();
+        let script = "redis.call('set', KEYS[1], 'a') redis.call('set', '{t}u', 'b') \
+                      return redis.call('get', '{t}u')";
+        for c in [
+            &["EVAL", script, "1", "{t}k"][..],
+            &["MGET", "{t}k", "{t}u"],
+        ] {
+            let parts = c.iter().map(|x| Value::Bulk(Some(x.as_bytes().to_vec())));
+            encode(&Value::Array(Some(parts.collect())), &mut p);
+        }
+        let before = crate::write_lock::all_acquires();
+        s.write_all(&p).expect("send");
+        let f = read_frames(&mut s, 2);
+        let taken = crate::write_lock::all_acquires() - before;
+        assert_eq!(f[0], Value::Bulk(Some(b"b".to_vec())));
+        assert_eq!(
+            f[1],
+            Value::Array(Some(vec![
+                Value::Bulk(Some(b"a".to_vec())),
+                Value::Bulk(Some(b"b".to_vec()))
+            ])),
+            "the re-run's writes, once each"
+        );
+        assert!(
+            taken >= 1,
+            "the script touched an undeclared key without the lock over every writer"
+        );
     }
 
     fn connect(addr: std::net::SocketAddr) -> TcpStream {

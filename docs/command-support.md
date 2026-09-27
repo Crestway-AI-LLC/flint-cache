@@ -461,13 +461,20 @@ errors (with the line they were raised on), and how a Lua number is spelled
 when a script hands it to `redis.call` are Valkey's, checked against Valkey
 by the conformance corpus. What Flint adds is the frame around a script:
 
-- **One slot, declared keys.** Every key in `KEYS` must hash to one slot
-  (use a hash tag, `{user1}:a`, to colocate them), and a `redis.call` may
-  touch only those keys: one that reaches another key, or the whole keyspace
-  (`DBSIZE`, `SCAN`, `FLUSHALL`), is refused, and whatever it did is undone,
-  even when the script catches the refusal with `pcall`. This is Redis
-  Cluster's rule, enforced rather than advised: it is what lets a script run
-  on the one pair that owns its keys, atomically.
+- **One slot.** Every key in `KEYS` must hash to one slot (use a hash tag,
+  `{user1}:a`, to colocate them), and a `redis.call` may touch any key in
+  that slot, including one the script builds rather than declares
+  (`ARGV[2] .. id`, as asynq builds its task keys). A call that reaches a key
+  in another slot, or the whole keyspace (`DBSIZE`, `SCAN`, `FLUSHALL`), is
+  refused, and whatever it did is undone, even when the script catches the
+  refusal with `pcall`. A script that declares no keys may touch none. This
+  is Redis Cluster's rule, enforced rather than advised: it is what lets a
+  script run on the one pair that owns its slot, atomically (ADR-0052).
+  A script that touches only its `KEYS` locks only them. One that reaches
+  another key in the slot is stopped there, with nothing kept, and run again
+  from the start holding the lock over every writer on its seat, because
+  that key's own writers are not excluded otherwise: it costs one wasted
+  attempt and a moment in which the seat's other writes wait.
 - **All or nothing.** A script's writes commit as one batch, as a
   transaction's do: all of them or, after a crash, none. **A script that
   fails keeps none of its writes**, where Redis keeps those made before the
@@ -560,7 +567,7 @@ an error as fatal, so until this it could not connect at all. The proxy
 answers it itself rather than asking a seat, because a seat's figures are
 shared by every tenant on its pair:
 
-    INFO             -> # Server / redis_mode:standalone / flint_version:<build>
+    INFO             -> # Server / redis_version:7.2.4 / redis_mode:standalone / flint_version:<build>
                         # Persistence / loading:0
     INFO persistence -> just that section; an unknown section is empty, as in Redis
 
@@ -573,9 +580,10 @@ the other subcommands are refused with upstream's "unknown subcommand": a
 connection list at the proxy would show other tenants. Ids are per proxy
 process.
 
-There is no `redis_version` field. Advertising one would be a claim about the
-whole command surface, and Flint implements the commands listed above, not a
-Redis release. A client that insists on a version will not find one.
+`redis_version` is 7.2.4, the value Valkey reports (ADR-0052). Clients choose
+their code paths by it, and rq and BullMQ refuse to run without one. It is
+not a promise of every Redis 7.2 command: Flint implements the commands
+listed above. `flint_version` is Flint's own.
 
 Use **`FLINTINFO`** where you would reach for `INFO`. It is a flat
 `field:value` list covering what a client or an operator actually needs from a

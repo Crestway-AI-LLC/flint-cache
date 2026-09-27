@@ -36,6 +36,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use flint_resp::{Value, fmt_double};
+use flint_slot::slot_for_key;
 use flint_storage::Kv;
 use mlua::chunk::ChunkMode;
 use mlua::{
@@ -78,7 +79,22 @@ pub struct Outcome {
     pub commit: bool,
     /// True when the text compiled, which is when Redis caches it.
     pub compiled: bool,
+    /// True when a command answered `Abandon`: the script was stopped where
+    /// it stood, nothing it wrote may be kept, and the caller runs it again
+    /// from the start (ADR-0052).
+    pub abandoned: bool,
 }
+
+/// What `call` answers instead of a reply when the script must not go on:
+/// a command reached a key the caller's lock does not cover (ADR-0052). The
+/// script is stopped as the time limit stops one, so no `pcall` can catch
+/// it, and its state stays reusable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Abandon;
+
+/// What runs one command for `redis.call` and `redis.pcall`: its reply, or
+/// `Abandon`. It owns the key guard and the per-call buffer.
+pub type Call<'a> = dyn Fn(&[Vec<u8>]) -> Result<Value, Abandon> + 'a;
 
 /// Commands a script may not call, with Valkey's reply. Transactions, the
 /// scripting commands themselves (no recursion), and connection state.
@@ -193,6 +209,9 @@ struct Engine {
     failure: Rc<RefCell<Option<String>>>,
     pending: Rc<RefCell<Option<String>>>,
     dead: Rc<Cell<bool>>,
+    /// Set when a command answered `Abandon`. Stops the script as `dead`
+    /// does, but the state is sound: the stop is an ordinary Lua error.
+    abandon: Rc<Cell<bool>>,
     compiled: HashMap<String, Function>,
     uses: u32,
 }
@@ -223,6 +242,7 @@ impl Engine {
         // here, to the handler (uncaught) or to the `pcall` wrapper (caught).
         let pending: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
         let dead = Rc::new(Cell::new(false));
+        let abandon = Rc::new(Cell::new(false));
 
         // The error handler: Valkey's shape. It runs where the error was
         // raised, so the stack still shows the script's line. A string error
@@ -258,7 +278,8 @@ impl Engine {
         };
         let is_dead = {
             let dead = Rc::clone(&dead);
-            lua.create_function(move |_, ()| Ok(dead.get()))?
+            let abandon = Rc::clone(&abandon);
+            lua.create_function(move |_, ()| Ok(dead.get() || abandon.get()))?
         };
 
         let redis = lua.create_table()?;
@@ -296,6 +317,7 @@ impl Engine {
             failure,
             pending,
             dead,
+            abandon,
             compiled: HashMap::new(),
             uses: 0,
         })
@@ -325,7 +347,7 @@ pub fn run(
     keys: &[Vec<u8>],
     argv: &[Vec<u8>],
     limits: ScriptLimits,
-    call: &dyn Fn(&[Vec<u8>]) -> Value,
+    call: &Call<'_>,
 ) -> Outcome {
     let taken = ENGINES.with(|e| {
         let mut e = e.borrow_mut();
@@ -342,6 +364,7 @@ pub fn run(
                     reply: internal(e),
                     commit: false,
                     compiled: false,
+                    abandoned: false,
                 };
             }
         },
@@ -354,6 +377,7 @@ pub fn run(
                 reply,
                 commit: false,
                 compiled: false,
+                abandoned: false,
             };
         }
     };
@@ -363,6 +387,7 @@ pub fn run(
             reply: internal(e),
             commit: false,
             compiled: true,
+            abandoned: false,
         },
     };
     engine.uses += 1;
@@ -393,12 +418,13 @@ fn execute(
     keys: &[Vec<u8>],
     argv: &[Vec<u8>],
     limits: ScriptLimits,
-    call: &dyn Fn(&[Vec<u8>]) -> Value,
+    call: &Call<'_>,
 ) -> mlua::Result<Outcome> {
     let lua = &engine.lua;
     engine.failure.borrow_mut().take();
     engine.pending.borrow_mut().take();
     engine.dead.set(false);
+    engine.abandon.set(false);
     // A script may have stopped the collector; garbage from earlier scripts
     // must not count against this one's memory, and Lua 5.1 collects
     // nothing on its own when an allocation fails.
@@ -429,12 +455,15 @@ fn execute(
     // callback is the state's, whichever thread runs it.
     {
         let dead = Rc::clone(&engine.dead);
+        let abandon = Rc::clone(&engine.abandon);
         let started = Instant::now();
         let limit = limits.time;
         lua.set_global_hook(
             HookTriggers::new().every_nth_instruction(HOOK_EVERY),
             move |_, _| {
-                if dead.get() || started.elapsed() > limit {
+                if abandon.get() {
+                    Err(mlua::Error::runtime("the script was abandoned"))
+                } else if dead.get() || started.elapsed() > limit {
                     dead.set(true);
                     Err(mlua::Error::runtime("the script's time limit"))
                 } else {
@@ -445,11 +474,13 @@ fn execute(
     }
 
     let result = lua.scope(|scope| {
-        let rawcall = scope.create_function(|lua, args: MultiValue| redis_call(lua, args, call))?;
+        let abandon = &engine.abandon;
+        let rawcall =
+            scope.create_function(|lua, args: MultiValue| redis_call(lua, args, call, abandon))?;
         let raising = {
             let pending = Rc::clone(&engine.pending);
             scope.create_function(move |lua, args: MultiValue| {
-                let reply = redis_call(lua, args, call)?;
+                let reply = redis_call(lua, args, call, abandon)?;
                 if let LuaValue::Table(t) = &reply
                     && let LuaValue::String(e) = t.raw_get::<LuaValue>("err")?
                 {
@@ -469,11 +500,22 @@ fn execute(
     engine.redis.raw_set("call", LuaValue::Nil)?;
     engine.redis.raw_set("pcall", LuaValue::Nil)?;
     let (ok, reply) = result?;
+    // Before `ok`: a script that caught the stop with `pcall` and then
+    // returned is still stopped, and its reply is not the one it would give.
+    if engine.abandon.get() {
+        return Ok(Outcome {
+            reply: Value::Error("ERR the script was abandoned, to run again".into()),
+            commit: false,
+            compiled: true,
+            abandoned: true,
+        });
+    }
     if ok {
         return Ok(Outcome {
             reply: reply.unwrap_or(Value::Bulk(None)),
             commit: true,
             compiled: true,
+            abandoned: false,
         });
     }
     let reply = if engine.dead.get() {
@@ -498,6 +540,7 @@ fn execute(
         reply,
         commit: false,
         compiled: true,
+        abandoned: false,
     })
 }
 
@@ -611,7 +654,8 @@ fn script_line(lua: &Lua) -> String {
 fn redis_call(
     lua: &Lua,
     args: MultiValue,
-    call: &dyn Fn(&[Vec<u8>]) -> Value,
+    call: &Call<'_>,
+    abandon: &Cell<bool>,
 ) -> mlua::Result<LuaValue> {
     if args.is_empty() {
         return err_table(
@@ -633,7 +677,11 @@ fn redis_call(
     if denied(&parts[0].to_ascii_uppercase()) {
         return err_table(lua, "ERR This command is not allowed from script");
     }
-    let reply = match call(&parts) {
+    let Ok(reply) = call(&parts) else {
+        abandon.set(true);
+        return Err(mlua::Error::runtime("the script was abandoned"));
+    };
+    let reply = match reply {
         // Our own texts (commands.rs), so matching them is matching our own
         // output: the script-side wording is Valkey's.
         Value::Error(e) if e.starts_with("ERR unknown command") => {
@@ -854,8 +902,17 @@ fn row_owner(k: &[u8]) -> Option<(&[u8], &[u8])> {
 }
 
 /// The store a script's commands see: every row they read or write must
-/// belong to a key the script declared. A command that reaches past them
-/// is recorded, and the caller discards everything it did.
+/// belong to a key in the slot of the keys the script declared, which is
+/// Redis Cluster's rule (ADR-0052; ADR-0051 required the declared keys
+/// themselves). A command that reaches past them is recorded, and the caller
+/// discards everything it did.
+///
+/// A declared key is covered by the write lock the caller took for the
+/// script. An undeclared one in the same slot is not, unless the caller holds
+/// the lock over every writer (`every_writer`): without it, a writer of that
+/// key could interleave with the script, the race of BUG-0188. So without
+/// it, reaching one is `Stray::NeedsEveryWriter`, which abandons the script
+/// for the caller to run again under that lock.
 ///
 /// The check is at the row, not the command, so it needs no table of which
 /// argument of which command is a key: whatever a command touches is what
@@ -864,14 +921,22 @@ pub struct KeyGuard<'a> {
     under: &'a dyn Kv,
     ns: &'a [u8],
     declared: &'a HashSet<Vec<u8>>,
+    /// The declared keys' slot; `None` when the script declared none, and
+    /// then it may touch no key at all.
+    slot: Option<u16>,
+    every_writer: bool,
     strayed: Mutex<Option<Stray>>,
 }
 
 /// What a script's command reached past its keys for.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Stray {
-    /// A key it did not declare.
+    /// A key in another slot, or any key of a script that declared none.
     Key(Vec<u8>),
+    /// A key in the declared keys' slot that they do not include, while the
+    /// caller holds only their locks. Not a refusal: the script is abandoned
+    /// and run again holding the lock over every writer.
+    NeedsEveryWriter(Vec<u8>),
     /// Rows no one key owns: a command over the keyspace (`DBSIZE`, `SCAN`,
     /// `FLUSHALL`) or anything else a script has no business in.
     Keyspace,
@@ -882,13 +947,22 @@ impl Stray {
     pub fn refusal(&self) -> Value {
         match self {
             Stray::Key(k) => Value::Error(format!(
-                "ERR Script attempted to access key '{}', which it did not declare in KEYS: \
-                 a Flint script may touch only the keys it is passed (ADR-0051)",
+                "ERR Script attempted to access key '{}', which is not in the slot of its KEYS: \
+                 a Flint script may touch only keys in the slot of the keys it is passed \
+                 (ADR-0052)",
+                String::from_utf8_lossy(k)
+            )),
+            // Reached only by a caller that cannot run the script again
+            // (`Dispatcher::wants_every_writer`); `main` always can.
+            Stray::NeedsEveryWriter(k) => Value::Error(format!(
+                "ERR Script attempted to access key '{}', outside its KEYS, which needs the lock \
+                 over every writer and could not take it (ADR-0052)",
                 String::from_utf8_lossy(k)
             )),
             Stray::Keyspace => Value::Error(
                 "ERR Script attempted a command over the whole keyspace: \
-                 a Flint script may touch only the keys it is passed (ADR-0051)"
+                 a Flint script may touch only keys in the slot of the keys it is passed \
+                 (ADR-0052)"
                     .into(),
             ),
         }
@@ -896,11 +970,20 @@ impl Stray {
 }
 
 impl<'a> KeyGuard<'a> {
-    pub fn new(under: &'a dyn Kv, ns: &'a [u8], declared: &'a HashSet<Vec<u8>>) -> Self {
+    /// `every_writer`: whether the caller holds the lock that excludes every
+    /// writer, rather than the declared keys' own.
+    pub fn new(
+        under: &'a dyn Kv,
+        ns: &'a [u8],
+        declared: &'a HashSet<Vec<u8>>,
+        every_writer: bool,
+    ) -> Self {
         Self {
             under,
             ns,
             declared,
+            slot: declared.iter().next().map(|k| slot_for_key(k)),
+            every_writer,
             strayed: Mutex::new(None),
         }
     }
@@ -916,8 +999,21 @@ impl<'a> KeyGuard<'a> {
     fn allows(&self, row: &[u8]) -> bool {
         match row_owner(row) {
             Some((ns, key)) if ns == self.ns && self.declared.contains(key) => true,
+            Some((ns, key))
+                if ns == self.ns
+                    && !key.is_empty()
+                    && self.every_writer
+                    && Some(slot_for_key(key)) == self.slot =>
+            {
+                true
+            }
             other => {
                 let stray = match other {
+                    Some((ns, k))
+                        if ns == self.ns && !k.is_empty() && Some(slot_for_key(k)) == self.slot =>
+                    {
+                        Stray::NeedsEveryWriter(k.to_vec())
+                    }
                     Some((_, k)) if !k.is_empty() => Stray::Key(k.to_vec()),
                     _ => Stray::Keyspace,
                 };
@@ -1036,7 +1132,7 @@ mod cost_probe {
             let _ = compile(&lua, b"return redis.call('incr', KEYS[1])").expect("probe");
         }
         eprintln!("compile script:    {:?}/call", t.elapsed() / n);
-        let call = |_: &[Vec<u8>]| Value::Integer(1);
+        let call = |_: &[Vec<u8>]| Ok(Value::Integer(1));
         let text = b"return redis.call('incr', KEYS[1])";
         let sha = flint_tls::sha1_hex(text);
         let t = Instant::now();

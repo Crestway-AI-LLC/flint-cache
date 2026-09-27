@@ -211,6 +211,12 @@ pub struct Dispatcher<'a> {
     clock: Clock,
     limits: Limits,
     ns: Vec<u8>,
+    /// Whether the caller holds the write lock over every writer, so a
+    /// script may touch keys in its slot that it did not declare (ADR-0052).
+    every_writer: bool,
+    /// Set when a script was abandoned because it reached such a key while
+    /// the caller held only its declared keys' locks.
+    wants_every_writer: std::cell::Cell<bool>,
 }
 
 impl<'a> Dispatcher<'a> {
@@ -239,7 +245,25 @@ impl<'a> Dispatcher<'a> {
             clock,
             limits,
             ns: ns.to_vec(),
+            every_writer: false,
+            wants_every_writer: std::cell::Cell::new(false),
         }
+    }
+
+    /// Tell the dispatcher that its caller holds the lock over every writer
+    /// (`write_lock::lock_all`), as a transaction always does.
+    pub fn holding_every_writer(mut self, yes: bool) -> Self {
+        self.every_writer = yes;
+        self
+    }
+
+    /// True when a script this dispatcher ran must run again holding the
+    /// lock over every writer: it reached a key outside its `KEYS`, in their
+    /// slot (ADR-0052). Its reply was an error and nothing it wrote reached
+    /// the store; the caller discards that reply and runs the command again
+    /// under `lock_all`, with `holding_every_writer(true)`.
+    pub fn wants_every_writer(&self) -> bool {
+        self.wants_every_writer.get()
     }
 
     /// `cf | ns_len | ns` — the prefix bounding this namespace's rows in one
@@ -265,6 +289,14 @@ impl<'a> Dispatcher<'a> {
             | b"INFO" | b"SELECT" | b"QUIT" | b"HELLO" | b"SCAN" => false,
             b"DEL" | b"EXISTS" => args[1..].iter().any(|k| k.len() > max),
             b"MSET" => args[1..].iter().step_by(2).any(|k| k.len() > max),
+            // BUG-0189: `args[1]` is the script's text (or its SHA1), not a
+            // key, and a text past the cap was refused as one: BullMQ's
+            // scripts are larger than 4 KiB. The declared keys are checked
+            // here; a key a script builds is checked when its call dispatches.
+            b"EVAL" | b"EVALSHA" => {
+                flint_commands::eval_keys(args).is_some_and(|ks| ks.iter().any(|k| k.len() > max))
+            }
+            b"SCRIPT" => false,
             _ => args.get(1).is_some_and(|k| k.len() > max),
         }
     }
@@ -1238,13 +1270,15 @@ impl<'a> Dispatcher<'a> {
     /// reach it only if the script ends normally, so a script that fails, or
     /// runs past its limits, leaves nothing behind. Each `redis.call` runs on
     /// its own overlay of that buffer behind a `KeyGuard`: a command that
-    /// reaches a key the script did not declare is refused and its overlay
-    /// discarded, so even a `pcall`ed refusal changes nothing.
+    /// reaches a key outside the declared keys' slot is refused and its
+    /// overlay discarded, so even a `pcall`ed refusal changes nothing.
     ///
     /// Atomicity against other writers is the caller's lock (`main` locks
     /// the declared keys, as it does any write's); crash atomicity is the
     /// caller's commit of this dispatcher's own store, which `main` makes a
-    /// `BatchingKv` committed as one batch.
+    /// `BatchingKv` committed as one batch. A key in the slot but not
+    /// declared is not under that lock, so reaching one without the lock
+    /// over every writer abandons the script (`wants_every_writer`).
     fn cmd_eval(&self, args: &[Vec<u8>]) -> Value {
         let is_sha = args[0].eq_ignore_ascii_case(b"EVALSHA");
         let name = if is_sha { "evalsha" } else { "eval" };
@@ -1277,16 +1311,23 @@ impl<'a> Dispatcher<'a> {
         }
         let declared: std::collections::HashSet<Vec<u8>> = keys.iter().cloned().collect();
         let buffer = flint_storage::batch::BatchingKv::new(self.kv);
-        let call = |cmd: &[Vec<u8>]| -> Value {
+        let needs: std::cell::RefCell<Option<crate::script::Stray>> = Default::default();
+        let call = |cmd: &[Vec<u8>]| -> Result<Value, crate::script::Abandon> {
             let overlay = flint_storage::batch::BatchingKv::new(&buffer);
             let (reply, strayed) = {
-                let guard = crate::script::KeyGuard::new(&overlay, &self.ns, &declared);
+                let guard =
+                    crate::script::KeyGuard::new(&overlay, &self.ns, &declared, self.every_writer);
                 let reply = Dispatcher::with_limits(&guard, self.clock, self.limits, &self.ns)
                     .dispatch(cmd);
                 (reply, guard.strayed())
             };
-            if let Some(stray) = strayed {
-                return stray.refusal();
+            match strayed {
+                Some(stray @ crate::script::Stray::NeedsEveryWriter(_)) => {
+                    *needs.borrow_mut() = Some(stray);
+                    return Err(crate::script::Abandon);
+                }
+                Some(stray) => return Ok(stray.refusal()),
+                None => {}
             }
             for (k, v) in overlay.into_ops() {
                 match v {
@@ -1296,7 +1337,7 @@ impl<'a> Dispatcher<'a> {
                     }
                 }
             }
-            reply
+            Ok(reply)
         };
         let sha = if is_sha {
             String::from_utf8_lossy(&args[1]).to_ascii_lowercase()
@@ -1306,6 +1347,13 @@ impl<'a> Dispatcher<'a> {
         let out = crate::script::run(&self.ns, &sha, &text, keys, argv, self.limits.script, &call);
         if out.compiled && !is_sha {
             crate::script::remember(&self.ns, &sha, &text);
+        }
+        if out.abandoned {
+            self.wants_every_writer.set(true);
+            return match needs.into_inner() {
+                Some(stray) => stray.refusal(),
+                None => out.reply,
+            };
         }
         if out.commit {
             for (k, v) in buffer.into_ops() {
@@ -4692,10 +4740,12 @@ mod tests {
         assert_eq!(ev(&s, &["GET", "ok"]), Value::Bulk(Some(b"x".to_vec())));
     }
 
-    /// A script touches only its declared keys, all in one slot. A command
-    /// that reaches past them is refused and has no effect, even caught.
+    /// A script touches only keys in its declared keys' slot. A command
+    /// that reaches past it is refused and has no effect, even caught.
     #[test]
-    fn a_script_touches_only_the_keys_it_declares() {
+    fn a_script_touches_only_keys_in_the_slot_it_declares() {
+        assert_ne!(slot_for_key(b"{t}a"), slot_for_key(b"other"));
+        assert_ne!(slot_for_key(b"{t}r"), slot_for_key(b"zz"));
         let s = MemKv::new();
         assert!(matches!(
             ev(&s, &["EVAL", "return 1", "2", "a", "b"]),
@@ -4707,15 +4757,24 @@ mod tests {
         );
         assert!(matches!(
             ev(&s, &["EVAL", "return redis.call('get', 'other')", "1", "{t}a"]),
-            Value::Error(e) if e.contains("access key 'other'") && e.ends_with("script: on @user_script:1.")
+            Value::Error(e) if e.contains("access key 'other'") && e.contains("not in the slot")
+                && e.ends_with("script: on @user_script:1.")
         ));
-        // Caught, the refused RENAME still did nothing: its source stays.
+        // Caught, the refused DEL still did nothing: the declared key it
+        // deleted before reaching the other one stays. (DEL takes keys in
+        // any slots; RENAME would refuse `zz` itself, as CROSSSLOT.)
+        ev(&s, &["SET", "zz", "z"]);
         assert!(matches!(
-            ev(&s, &["EVAL", "redis.call('set', KEYS[1], 'v') return redis.pcall('rename', KEYS[1], '{t}zz')", "1", "{t}r"]),
-            Value::Error(e) if e.contains("access key '{t}zz'")
+            ev(&s, &["EVAL", "redis.call('set', KEYS[1], 'v') return redis.pcall('del', KEYS[1], 'zz')", "1", "{t}r"]),
+            Value::Error(e) if e.contains("access key 'zz'")
         ));
         assert_eq!(ev(&s, &["GET", "{t}r"]), Value::Bulk(Some(b"v".to_vec())));
-        assert_eq!(ev(&s, &["EXISTS", "{t}zz"]), Value::Integer(0));
+        assert_eq!(ev(&s, &["GET", "zz"]), Value::Bulk(Some(b"z".to_vec())));
+        // A script that declares no keys has no slot, and may touch none.
+        assert!(matches!(
+            ev(&s, &["EVAL", "return redis.call('get', '{t}a')", "0"]),
+            Value::Error(e) if e.contains("access key '{t}a'")
+        ));
         for cmd in ["dbsize", "flushall", "scan"] {
             let text = format!(
                 "return redis.call('{cmd}'{})",
@@ -4730,6 +4789,164 @@ mod tests {
             ev(&s, &["EVAL", "return redis.call('eval', 'return 1', '0')", "0"]),
             Value::Error(e) if e.starts_with("ERR This command is not allowed from script")
         ));
+    }
+
+    /// ADR-0052 D2: a key in the declared keys' slot that they do not
+    /// include. Holding only the declared keys' locks, the script is
+    /// abandoned where it stands, even inside `pcall`, with nothing written,
+    /// and the dispatcher asks for the lock over every writer. Holding that
+    /// lock, the same script runs.
+    #[test]
+    fn an_undeclared_key_in_the_slot_runs_only_holding_every_writer() {
+        assert_eq!(slot_for_key(b"{t}k"), slot_for_key(b"{t}u"));
+        let s = MemKv::new();
+        let parts = |v: &[&str]| v.iter().map(|p| p.as_bytes().to_vec()).collect::<Vec<_>>();
+        let plain = "redis.call('set', KEYS[1], 'a') redis.call('set', '{t}u', 'b') return 1";
+        let caught = "redis.call('set', KEYS[1], 'a') \
+                      local ok = redis.pcall('set', '{t}u', 'b') return 'caught'";
+        for text in [plain, caught] {
+            let d = Dispatcher::new(&s, system_clock);
+            let reply = d.dispatch(&parts(&["EVAL", text, "1", "{t}k"]));
+            assert!(d.wants_every_writer(), "{text}: {reply:?}");
+            assert!(
+                matches!(&reply, Value::Error(e) if e.contains("'{t}u'") && e.contains("every writer")),
+                "{text}: {reply:?}"
+            );
+            assert_eq!(
+                ev(&s, &["EXISTS", "{t}k", "{t}u"]),
+                Value::Integer(0),
+                "{text}"
+            );
+        }
+        let d = Dispatcher::new(&s, system_clock).holding_every_writer(true);
+        assert_eq!(
+            d.dispatch(&parts(&["EVAL", plain, "1", "{t}k"])),
+            Value::Integer(1)
+        );
+        assert!(!d.wants_every_writer());
+        assert_eq!(ev(&s, &["GET", "{t}u"]), Value::Bulk(Some(b"b".to_vec())));
+        // Holding every writer widens the slot, not the keyspace.
+        let d = Dispatcher::new(&s, system_clock).holding_every_writer(true);
+        let reply = d.dispatch(&parts(&[
+            "EVAL",
+            "return redis.call('get', 'other')",
+            "1",
+            "{t}k",
+        ]));
+        assert!(
+            matches!(&reply, Value::Error(e) if e.contains("not in the slot")),
+            "{reply:?}"
+        );
+        assert!(!d.wants_every_writer());
+        // A script that stays inside its KEYS never asks.
+        let d = Dispatcher::new(&s, system_clock);
+        assert_eq!(
+            d.dispatch(&parts(&[
+                "EVAL",
+                "return redis.call('incr', KEYS[1] .. '')",
+                "1",
+                "{t}n"
+            ])),
+            Value::Integer(1)
+        );
+        assert!(!d.wants_every_writer());
+    }
+
+    /// BUG-0189: the key cap reads a script's KEYS, not its text. BullMQ's
+    /// scripts run past 4 KiB and were refused as an oversized key.
+    #[test]
+    fn a_long_script_is_not_an_oversized_key_but_its_keys_are_checked() {
+        let s = MemKv::new();
+        let max = flint_storage::DEFAULT_MAX_KEY_BYTES as usize;
+        let text = format!(
+            "return redis.call('incr', KEYS[1]) -- {}",
+            "x".repeat(max + 1)
+        );
+        assert_eq!(ev(&s, &["EVAL", &text, "1", "{t}n"]), Value::Integer(1));
+        let long_key = "k".repeat(max + 1);
+        assert!(matches!(
+            ev(&s, &["EVAL", "return 1", "1", &long_key]),
+            Value::Error(e) if e.contains("max-key-bytes")
+        ));
+        // A key the script builds past the cap is refused at its call.
+        assert!(matches!(
+            ev(&s, &["EVAL", "return redis.call('get', KEYS[1] .. string.rep('k', ARGV[1]))", "1", "{t}n", &max.to_string()]),
+            Value::Error(e) if e.contains("max-key-bytes")
+        ));
+    }
+
+    /// asynq 0.26's dequeue script, as measured in ADR-0052: it pops a task
+    /// id and then writes the task's hash under a key built from ARGV and
+    /// that id. Run holding every writer, as `main` re-runs it.
+    #[test]
+    fn asynqs_dequeue_script_runs_holding_every_writer() {
+        const DEQUEUE: &str = r#"
+if redis.call("EXISTS", KEYS[2]) == 0 then
+	local id = redis.call("RPOPLPUSH", KEYS[1], KEYS[3])
+	if id then
+		local key = ARGV[2] .. id
+		redis.call("HSET", key, "state", "active")
+		redis.call("HDEL", key, "pending_since")
+		redis.call("ZADD", KEYS[4], ARGV[1], id)
+		return redis.call("HGET", key, "msg")
+	end
+end
+return nil"#;
+        let s = MemKv::new();
+        ev(&s, &["RPUSH", "asynq:{q}:pending", "id1"]);
+        ev(
+            &s,
+            &[
+                "HSET",
+                "asynq:{q}:t:id1",
+                "msg",
+                "hello",
+                "state",
+                "pending",
+                "pending_since",
+                "1",
+            ],
+        );
+        let args: Vec<Vec<u8>> = [
+            "EVAL",
+            DEQUEUE,
+            "4",
+            "asynq:{q}:pending",
+            "asynq:{q}:paused",
+            "asynq:{q}:active",
+            "asynq:{q}:lease",
+            "1000",
+            "asynq:{q}:t:",
+        ]
+        .iter()
+        .map(|p| p.as_bytes().to_vec())
+        .collect();
+        let d = Dispatcher::new(&s, system_clock);
+        assert!(matches!(d.dispatch(&args), Value::Error(_)));
+        assert!(d.wants_every_writer());
+        assert_eq!(
+            ev(&s, &["LLEN", "asynq:{q}:pending"]),
+            Value::Integer(1),
+            "abandoned: nothing moved"
+        );
+        let d = Dispatcher::new(&s, system_clock).holding_every_writer(true);
+        assert_eq!(d.dispatch(&args), Value::Bulk(Some(b"hello".to_vec())));
+        assert_eq!(
+            ev(&s, &["HGET", "asynq:{q}:t:id1", "state"]),
+            Value::Bulk(Some(b"active".to_vec()))
+        );
+        assert_eq!(
+            ev(&s, &["HEXISTS", "asynq:{q}:t:id1", "pending_since"]),
+            Value::Integer(0)
+        );
+        assert_eq!(
+            ev(&s, &["LRANGE", "asynq:{q}:active", "0", "-1"]),
+            Value::Array(Some(vec![Value::Bulk(Some(b"id1".to_vec()))]))
+        );
+        assert_eq!(
+            ev(&s, &["ZSCORE", "asynq:{q}:lease", "id1"]),
+            Value::Double(1000.0)
+        );
     }
 
     /// The sandbox: text only, no loaders, read-only globals.
